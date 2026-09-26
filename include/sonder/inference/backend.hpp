@@ -39,7 +39,6 @@ enum class Capability : std::uint32_t {
     deterministic = 1u << 14,  // identical inputs + seed => identical output
     remote_process = 1u << 15, // execution happens in another process/server
     token_logits = 1u << 16,   // exposes per-step logits (open_token_stream); Sonder samples
-    chat = 1u << 17,           // multi-turn chat with the model's own template (BackendModel::chat)
 };
 
 // Vocabulary index as produced by a backend tokenizer.
@@ -64,6 +63,9 @@ struct ModelDescriptor {
     std::string quantization;  // e.g. "Q4_K_M"
     std::uint64_t size_bytes = 0;
     std::uint64_t context_length = 0;  // 0 when unknown
+    // False when load_model() only fetched metadata and the weights are not
+    // resident (e.g. Ollama loads lazily on first request).
+    bool resident = true;
 };
 
 struct ModelLoadOptions {
@@ -80,18 +82,6 @@ struct GenerateRequest {
 struct TokenChunk {
     std::string_view text;
     std::uint64_t index = 0;  // 0-based chunk index within the request
-};
-
-// One turn of a chat conversation.
-struct ChatMessage {
-    std::string role;     // "system" | "user" | "assistant" | "tool"
-    std::string content;
-};
-
-struct ChatRequest {
-    std::string request_id;
-    std::vector<ChatMessage> messages;
-    SamplingConfig sampling;
 };
 
 enum class StopReason { none, max_tokens, stop_sequence, end_of_sequence, cancelled, callback, error };
@@ -149,16 +139,6 @@ public:
     virtual Result<std::unique_ptr<TokenStream>> open_token_stream(const GenerateRequest& request) {
         (void)request;
         return Status(ErrorCode::unsupported, "backend does not expose token logits");
-    }
-    // Optional (Capability::chat): streaming multi-turn chat. The backend
-    // applies the model's chat template. Same streaming, cancellation and
-    // stats contract as generate().
-    virtual Result<GenerateStats> chat(const ChatRequest& request, const CancellationToken& cancel,
-                                       const TokenCallback& on_chunk) {
-        (void)request;
-        (void)cancel;
-        (void)on_chunk;
-        return Status(ErrorCode::unsupported, "backend does not support chat");
     }
 };
 

@@ -12,9 +12,6 @@ SamplingConfig SamplingConfig::greedy(std::int32_t max_tokens, std::uint64_t see
     c.top_k = 0;
     c.min_p = 0.0f;
     c.repeat_penalty = 1.0f;
-    c.typical_p = 1.0f;
-    c.frequency_penalty = 0.0f;
-    c.presence_penalty = 0.0f;
     c.seed = seed;
     c.max_tokens = max_tokens;
     return c;
@@ -39,34 +36,6 @@ Status validate(const SamplingConfig& c) {
     }
     if (!std::isfinite(c.repeat_penalty) || c.repeat_penalty <= 0.0f || c.repeat_penalty > 10.0f) {
         return invalid("repeat_penalty must be within (0, 10]");
-    }
-    if (!std::isfinite(c.typical_p) || c.typical_p <= 0.0f || c.typical_p > 1.0f) {
-        return invalid("typical_p must be within (0, 1]");
-    }
-    if (!std::isfinite(c.frequency_penalty) || c.frequency_penalty < -2.0f || c.frequency_penalty > 2.0f) {
-        return invalid("frequency_penalty must be within [-2, 2]");
-    }
-    if (!std::isfinite(c.presence_penalty) || c.presence_penalty < -2.0f || c.presence_penalty > 2.0f) {
-        return invalid("presence_penalty must be within [-2, 2]");
-    }
-    if (c.penalty_last_n < -1 || c.penalty_last_n > SamplingConfig::kMaxPenaltyWindow) {
-        return invalid("penalty_last_n must be -1 (whole context), 0 (off) or within [1, " +
-                       std::to_string(SamplingConfig::kMaxPenaltyWindow) + "]");
-    }
-    if (c.logit_bias.size() > SamplingConfig::kMaxLogitBias) {
-        return invalid("at most " + std::to_string(SamplingConfig::kMaxLogitBias) + " logit_bias entries allowed");
-    }
-    for (const auto& b : c.logit_bias) {
-        if (b.token < 0) {
-            return invalid("logit_bias token ids must be >= 0");
-        }
-        if (std::isnan(b.bias) || (std::isinf(b.bias) && b.bias > 0.0f)) {
-            return invalid("logit_bias values must be finite or -infinity");
-        }
-    }
-    if (c.num_ctx != 0 && (c.num_ctx < 16 || c.num_ctx > SamplingConfig::kMaxContextTokens)) {
-        return invalid("num_ctx must be 0 (backend default) or within [16, " +
-                       std::to_string(SamplingConfig::kMaxContextTokens) + "]");
     }
     if (c.max_tokens < 1 || c.max_tokens > SamplingConfig::kMaxTokensLimit) {
         return invalid("max_tokens must be within [1, " + std::to_string(SamplingConfig::kMaxTokensLimit) + "]");

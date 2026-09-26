@@ -23,6 +23,9 @@ struct MockBackendOptions {
     // sampler chain over a small fixed vocabulary (the mock's word list plus
     // an end-of-sequence token) using deterministic pseudo-logits.
     bool token_logits = false;
+    // Test hook (token_logits only): every logit is -infinity, as if the
+    // request's policy had banned the whole vocabulary.
+    bool ban_all_tokens = false;
 };
 inline constexpr const char* kMockBackendName = "mock";
 std::shared_ptr<Backend> make_mock_backend(MockBackendOptions options = {});

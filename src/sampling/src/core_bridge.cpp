@@ -12,14 +12,6 @@ SamplerConfig from_core(const sonder::inference::SamplingConfig& core) {
     c.top_k = core.top_k;
     c.min_p = core.min_p;
     c.repeat_penalty = core.repeat_penalty;
-    c.typical_p = core.typical_p;
-    c.frequency_penalty = core.frequency_penalty;
-    c.presence_penalty = core.presence_penalty;
-    c.penalty_last_n = core.penalty_last_n;
-    c.logit_bias.reserve(core.logit_bias.size());
-    for (const auto& b : core.logit_bias) {
-        c.logit_bias.push_back(LogitBias{b.token, b.bias});
-    }
     c.seed = core.seed;
     c.stop_sequences = core.stop;
     return c;

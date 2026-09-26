@@ -14,13 +14,11 @@
 
 namespace sonder::inference::sampling {
 
-/// Map the core config onto a SamplerConfig. Every shared field is copied
-/// (temperature, top_p, top_k, min_p, typical_p, the repeat/frequency/presence
-/// penalties and their window, logit bias, seed, stop sequences). Fields the
-/// core does not carry keep the chain's llama.cpp-compatible defaults
-/// (min_keep, stop tokens, llama.cpp stage order). temperature == 0 selects
-/// the greedy selector. `max_tokens` and `num_ctx` are generation-loop
-/// concerns and are not part of the chain.
+/// Map the core config onto a SamplerConfig. Fields the core does not carry
+/// keep the chain's llama.cpp-compatible defaults (typical_p = 1,
+/// frequency/presence = 0, penalty_last_n = 64, llama.cpp stage order).
+/// temperature == 0 selects the greedy selector. `max_tokens` is a
+/// generation-loop concern and is not part of the chain.
 [[nodiscard]] SamplerConfig from_core(const sonder::inference::SamplingConfig& core);
 
 /// Convert a ValidationResult into the core Status type
