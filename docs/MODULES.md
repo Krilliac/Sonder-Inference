@@ -8,7 +8,7 @@ needs to edit root files.
 
 | Module directory | Owner branch | Status on main |
 | --- | --- | --- |
-| `src/cache/` | `feat/kv-cache` | reserved |
+| `src/cache/` | `feat/kv-cache` | merged (PR #4, 34 tests) — notes: `docs/integration/kv-cache.md`; scheduler adapter in `src/engine/kv_capacity_adapter.hpp` |
 | `src/scheduler/` | `feat/scheduler` | merged (PR #2, 33 tests) — notes: `docs/integration/scheduler.md` |
 | `src/sampling/` | `feat/sampling` | merged (PR #3, 90 tests; headers under `sonder/sampling/`) — notes: `docs/integration/sampling.md`; core keeps `SamplingConfig` + validation |
 | `src/backends/llamacpp/` | `feat/llamacpp-backend` | reserved (license review required first) |
