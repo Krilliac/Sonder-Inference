@@ -15,12 +15,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(SONDER_BUILD_TESTS "Build the Sonder Inference test suite" ${PROJECT_IS_TOP_LEVEL})
 option(SONDER_BUILD_CLI "Build the sonder-infer CLI" ${PROJECT_IS_TOP_LEVEL})
 option(SONDER_WARNINGS_AS_ERRORS "Treat compiler warnings as errors for Sonder targets" OFF)
-# Direct llama.cpp/GGML backend: deferred (see docs/LICENSE_REVIEW.md). The
-# option is reserved so presets and CI stay stable when it lands.
-option(SONDER_WITH_LLAMA_CPP "Build the direct llama.cpp backend (not implemented yet)" OFF)
-if(SONDER_WITH_LLAMA_CPP)
-    message(FATAL_ERROR "SONDER_WITH_LLAMA_CPP is reserved; the llama.cpp backend is not implemented yet.")
-endif()
+# Direct llama.cpp/GGML backend (src/backends/llamacpp). OFF by default: when ON,
+# llama.cpp is fetched at a pinned tag and compiled (CPU; accelerators via GGML_*).
+option(SONDER_WITH_LLAMA_CPP "Build the direct llama.cpp backend" OFF)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(SonderWarnings)

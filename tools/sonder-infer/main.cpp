@@ -19,6 +19,9 @@
 #if defined(SONDER_HAS_BENCH)
 #include "sonder/inference/benchmark.hpp"
 #endif
+#if defined(SONDER_HAS_LLAMACPP_BACKEND)
+#include "sonder/inference/backends/llamacpp.hpp"
+#endif
 
 namespace si = sonder::inference;
 
@@ -37,6 +40,7 @@ Usage:
 Backends:
   mock     deterministic MOCK backend for tests only (no inference performed)
   ollama   Ollama compatibility adapter (module; default http://127.0.0.1:11434)
+  llamacpp direct llama.cpp backend (module; build with SONDER_WITH_LLAMA_CPP=ON; --model is a GGUF path)
 
 Generation options:
   --max-tokens N        (default 128)
@@ -179,6 +183,10 @@ bool build_engine(const Args& a, Runtime& rt) {
         oo.base_url = *url;
     }
     rt.engine->register_backend(si::make_ollama_backend(oo));
+#endif
+#if defined(SONDER_HAS_LLAMACPP_BACKEND)
+    // Direct llama.cpp backend: --model takes a GGUF path.
+    rt.engine->register_backend(si::make_llamacpp_backend());
 #endif
     return true;
 }
