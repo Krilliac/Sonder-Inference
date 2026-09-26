@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -37,7 +38,12 @@ enum class Capability : std::uint32_t {
     embeddings = 1u << 13,
     deterministic = 1u << 14,  // identical inputs + seed => identical output
     remote_process = 1u << 15, // execution happens in another process/server
+    token_logits = 1u << 16,   // exposes per-step logits (open_token_stream); Sonder samples
+    chat = 1u << 17,           // multi-turn chat with the model's own template (BackendModel::chat)
 };
+
+// Vocabulary index as produced by a backend tokenizer.
+using TokenId = std::int32_t;
 
 struct BackendCapabilities {
     std::uint32_t bits = 0;
@@ -76,6 +82,18 @@ struct TokenChunk {
     std::uint64_t index = 0;  // 0-based chunk index within the request
 };
 
+// One turn of a chat conversation.
+struct ChatMessage {
+    std::string role;     // "system" | "user" | "assistant" | "tool"
+    std::string content;
+};
+
+struct ChatRequest {
+    std::string request_id;
+    std::vector<ChatMessage> messages;
+    SamplingConfig sampling;
+};
+
 enum class StopReason { none, max_tokens, stop_sequence, end_of_sequence, cancelled, callback, error };
 const char* to_string(StopReason reason) noexcept;
 
@@ -93,6 +111,24 @@ struct GenerateStats {
 // Return false to stop generation early (StopReason::callback).
 using TokenCallback = std::function<bool(const TokenChunk&)>;
 
+// Token-level decode loop for backends that advertise Capability::token_logits.
+// Sonder owns sampling: it asks for the next logits, samples a token with its
+// own sampler chain (src/sampling) and commits it with accept().
+class TokenStream {
+public:
+    virtual ~TokenStream() = default;
+    [[nodiscard]] virtual std::size_t vocab_size() const = 0;
+    // Prompt tokens as the backend tokenized them (after prefill).
+    [[nodiscard]] virtual const std::vector<TokenId>& prompt_tokens() const = 0;
+    // Logits for the next position (size == vocab_size()). The span stays
+    // valid until the next call on this stream.
+    virtual Result<std::span<const float>> next_logits(const CancellationToken& cancel) = 0;
+    // Commits `token` as the next generated token and returns its text piece.
+    virtual Status accept(TokenId token, std::string& piece) = 0;
+    // True for end-of-generation tokens (EOS/EOT).
+    [[nodiscard]] virtual bool is_end_of_generation(TokenId token) const = 0;
+};
+
 class BackendModel {
 public:
     virtual ~BackendModel() = default;
@@ -102,6 +138,28 @@ public:
     // ErrorCode::cancelled promptly once it trips.
     virtual Result<GenerateStats> generate(const GenerateRequest& request, const CancellationToken& cancel,
                                            const TokenCallback& on_chunk) = 0;
+    // Optional (Capability::tokenization): exact prompt tokenization. The engine
+    // falls back to an approximate accounting tokenizer when unsupported.
+    virtual Result<std::vector<TokenId>> tokenize(std::string_view text) {
+        (void)text;
+        return Status(ErrorCode::unsupported, "backend does not expose tokenization");
+    }
+    // Optional (Capability::token_logits): open a token-level decode loop for
+    // `request` (prompt prefilled). Sonder samples from the returned logits.
+    virtual Result<std::unique_ptr<TokenStream>> open_token_stream(const GenerateRequest& request) {
+        (void)request;
+        return Status(ErrorCode::unsupported, "backend does not expose token logits");
+    }
+    // Optional (Capability::chat): streaming multi-turn chat. The backend
+    // applies the model's chat template. Same streaming, cancellation and
+    // stats contract as generate().
+    virtual Result<GenerateStats> chat(const ChatRequest& request, const CancellationToken& cancel,
+                                       const TokenCallback& on_chunk) {
+        (void)request;
+        (void)cancel;
+        (void)on_chunk;
+        return Status(ErrorCode::unsupported, "backend does not support chat");
+    }
 };
 
 class Backend {
