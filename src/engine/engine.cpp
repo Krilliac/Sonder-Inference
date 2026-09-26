@@ -2,6 +2,8 @@
 
 #include <chrono>
 
+#include "engine/request_runtime.hpp"
+
 namespace sonder::inference {
 
 #ifndef SONDER_INFERENCE_VERSION
@@ -28,6 +30,21 @@ Engine::Engine(EngineOptions options)
                                   {"platform", host_platform()},
                                   {"device_count", devices_.size()}},
                      TelemetryLevel::metrics);
+    runtime_ = detail::make_request_runtime(options_.scheduling, *telemetry_, ctx);
+    if (runtime_) {
+        const auto& so = options_.scheduling;
+        telemetry_->emit("scheduler.configured", ctx,
+                         json::Object{{"kv_block_size_tokens", so.kv_block_size_tokens},
+                                      {"kv_num_blocks", so.kv_num_blocks},
+                                      {"prefix_caching", so.prefix_caching},
+                                      {"max_running_sequences", so.max_running_sequences},
+                                      {"max_step_sequences", so.max_step_sequences},
+                                      {"max_step_tokens", so.max_step_tokens},
+                                      {"prefill_chunk_tokens", so.prefill_chunk_tokens},
+                                      {"admission_watermark_blocks", so.admission_watermark_blocks},
+                                      {"max_requeue_count", so.max_requeue_count}},
+                         TelemetryLevel::metrics);
+    }
     if (options_.sample_devices_on_start) {
         for (const auto& d : devices_) {
             auto dctx = ctx;
@@ -44,6 +61,8 @@ Engine::Engine(EngineOptions options)
 }
 
 Engine::~Engine() {
+    // Stop the scheduler thread first; it emits telemetry and references models.
+    runtime_.reset();
     {
         std::lock_guard<std::mutex> lock(mutex_);
         models_.clear();
@@ -52,6 +71,8 @@ Engine::~Engine() {
     telemetry_->emit("engine.stopped", engine_context(), json::Object{}, TelemetryLevel::metrics);
     telemetry_->shutdown();
 }
+
+KvUsage Engine::kv_usage() const { return runtime_ ? runtime_->kv_usage() : KvUsage{}; }
 
 TelemetryContext Engine::engine_context() const {
     TelemetryContext ctx;
