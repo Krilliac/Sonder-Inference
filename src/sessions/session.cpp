@@ -52,13 +52,7 @@ json::Value sampling_json(const SamplingConfig& s) {
                    {"top_p", s.top_p},
                    {"top_k", s.top_k},
                    {"min_p", s.min_p},
-                   {"typical_p", s.typical_p},
                    {"repeat_penalty", s.repeat_penalty},
-                   {"frequency_penalty", s.frequency_penalty},
-                   {"presence_penalty", s.presence_penalty},
-                   {"penalty_last_n", s.penalty_last_n},
-                   {"logit_bias_entries", s.logit_bias.size()},
-                   {"num_ctx", s.num_ctx},
                    {"seed", s.seed},
                    {"max_tokens", s.max_tokens}};
     return o;
@@ -97,6 +91,7 @@ Session::Session(Engine& engine, std::shared_ptr<Model> model, SessionOptions op
                                           {"backend", model_->backend_name()},
                                           {"priority", options_.priority},
                                           {"workload", to_string(options_.workload)},
+                                          {"text_capture", engine_.telemetry().options().capture_text ? "on" : "off"},
                                           {"sampling", sampling_json(options_.sampling)}},
                              TelemetryLevel::metrics);
 }
@@ -121,7 +116,9 @@ std::uint64_t Session::requests_started() const {
 TelemetryContext Session::telemetry_context(const std::optional<std::string>& request_id) const {
     TelemetryContext ctx;
     ctx.session_id = options_.session_id;
-    ctx.run_id = options_.run_id;
+    // Defaults to the engine id so session/request events group with the
+    // engine's own events (Observatory run grouping).
+    ctx.run_id = options_.run_id.value_or(engine_.engine_id());
     ctx.request_id = request_id;
     ctx.agent_id = options_.agent_id;
     ctx.task_id = options_.task_id;
@@ -161,7 +158,7 @@ namespace {
 
 // Token-level decode loop with Sonder's sampler chain (Capability::token_logits).
 // NoViableCandidates maps to invalid_argument: it only happens when the
-// request's own policy (logit_bias bans, penalties, constraints) excludes every
+// request's own policy (bias/penalties/constraints) excludes every
 // token, so retrying the same request cannot succeed. EmptyLogits is a backend
 // fault (backend_error).
 template <class Gate, class Produced, class Deliver>
@@ -190,8 +187,7 @@ Result<GenerateStats> run_sonder_sampling(TokenStream& stream, const SamplingCon
                               {"selector", config.temperature == 0.0f ? "greedy" : "distribution"},
                               {"stages", std::move(stages)},
                               {"seed", config.seed},
-                              {"vocab_size", stream.vocab_size()},
-                              {"logit_bias_entries", config.logit_bias.size()}},
+                              {"vocab_size", stream.vocab_size()}},
                  TelemetryLevel::metrics);
     }
 
@@ -218,7 +214,7 @@ Result<GenerateStats> run_sonder_sampling(TokenStream& stream, const SamplingCon
                                   {"error_code", to_string(code)},
                                   {"position", i}},
                      TelemetryLevel::metrics);
-            return Status(code, no_viable ? "sampling failed: no viable candidates (logit_bias, penalties or "
+            return Status(code, no_viable ? "sampling failed: no viable candidates (bias, penalties or "
                                             "constraints excluded every token)"
                                           : "sampling failed: backend returned empty logits");
         }
@@ -346,8 +342,8 @@ Result<GenerationResult> Session::generate(const std::string& prompt, const Toke
             spec.exact_tokens = false;
         }
         spec.max_new_tokens = static_cast<std::uint32_t>(sampling.max_tokens);
-        const std::uint64_t ctx_limit = sampling.num_ctx > 0 ? static_cast<std::uint64_t>(sampling.num_ctx)
-                                                             : model_->descriptor().context_length;
+        // TODO(sampling-config): prefer SamplingConfig::num_ctx once it exists.
+        const std::uint64_t ctx_limit = model_->descriptor().context_length;
         spec.context_limit = static_cast<std::uint32_t>(std::min<std::uint64_t>(ctx_limit, 0xFFFFFFFFull));
         spec.fingerprint = model_fingerprint(*model_);
         result.scheduling.accounted_prompt_tokens = spec.prompt_tokens.size();
@@ -390,8 +386,14 @@ Result<GenerationResult> Session::generate(const std::string& prompt, const Toke
                                {"bytes", chunk.text.size()},
                                {"elapsed_ms", ms_between(t_start, now)}};
             if (token_id) {
+                // Sonder-sampled: exactly one token per event.
+                attrs.set("unit", "token");
+                attrs.set("count", 1);
                 attrs.set("token_id", *token_id);
                 attrs.set("probability", probability);
+            } else {
+                // Backend-streamed chunk: token count per chunk is unknown.
+                attrs.set("unit", "chunk");
             }
             if (capture_text) {
                 attrs.set("text", std::string(chunk.text));
@@ -502,6 +504,16 @@ Result<GenerationResult> Session::generate(const std::string& prompt, const Toke
     }
 
     if (outcome == RequestOutcome::completed) {
+        json::Object pre{{"prompt_tokens", result.stats.prompt_tokens},
+                         {"token_counts_from_backend", result.stats.token_counts_from_backend},
+                         {"ttft_ms", result.ttft_ms}};
+        if (result.stats.prompt_eval_ns > 0) {
+            pre.set("backend_prompt_eval_ms", static_cast<double>(result.stats.prompt_eval_ns) / 1e6);
+        }
+        if (result.scheduling.scheduled) {
+            pre.set("reused_prompt_tokens", result.scheduling.reused_prompt_tokens);
+        }
+        bus.emit("inference.prefill.completed", ctx, std::move(pre), TelemetryLevel::metrics);
         const double decode_ms = have_first ? ms_between(t_first, t_end) : 0.0;
         json::Object dec{{"completion_tokens", result.stats.completion_tokens},
                          {"chunks", delivered},
