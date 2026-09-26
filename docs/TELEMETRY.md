@@ -175,6 +175,25 @@ different threads are ordered by `sequence`, not by `mono_ns`.
 | 10 | `mono_ns` range | documented (above); base unchanged |
 | 11 | KV and scheduler names | done: names above are settled; `occupancy`, `avoided_prefill_tokens`, `batch_size`, `queue_ms` added |
 
+## Live transport (not implemented)
+
+Sonder Inference writes telemetry to sinks (JSONL file, memory, custom
+`TelemetrySink`) and does not serve it over the network yet. If it ever
+serves a live stream, it follows the resume contract proposed by Observatory's
+live client (Sonder-Observatory PR #13):
+
+- Endpoints `/ws` (WebSocket), `/sse` (Server-Sent Events) and `/ndjson`
+  (streamed HTTP), each carrying the envelopes above unchanged.
+- Resume point: SSE and HTTP clients send a `Last-Event-ID` header;
+  WebSocket clients pass `?last_event_id=` on the URL. The value is an
+  `event_id` from this stream, so the server can resume after
+  `<instance_id>-<sequence>`. What to do with an id from a different
+  `instance_id` (the producer restarted) is still to be agreed with
+  Observatory before this is built.
+- SSE frames set `id:` to the envelope's `event_id`.
+
+A different contract would need to be documented here first.
+
 ## Not emitted yet
 
 `inference.prefill.started`, `inference.speculation.*`, `context.*`,
