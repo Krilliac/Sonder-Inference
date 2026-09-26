@@ -8,6 +8,12 @@
 #include <mutex>
 #include <string>
 
+#if defined(SONDER_HAS_TLS)
+#  include <memory>
+
+#  include "tls_stream.hpp"
+#endif
+
 #if defined(_WIN32)
 #  ifndef WIN32_LEAN_AND_MEAN
 #    define WIN32_LEAN_AND_MEAN
@@ -47,8 +53,15 @@ Result<Url> parse_url(std::string_view text) {
     url.scheme = std::string(text.substr(0, scheme_end));
     std::transform(url.scheme.begin(), url.scheme.end(), url.scheme.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+#if defined(SONDER_HAS_TLS)
+    if (url.scheme == "https") {
+        url.port = 443;
+    } else
+#endif
     if (url.scheme != "http") {
-        return Status(ErrorCode::unsupported, "only http:// URLs are supported (got " + url.scheme + "://)");
+        return Status(ErrorCode::unsupported,
+                      "only http:// URLs are supported (got " + url.scheme + "://)" +
+                          (url.scheme == "https" ? "; https:// needs a build with SONDER_WITH_TLS=ON" : ""));
     }
     std::string_view rest = text.substr(scheme_end + 3);
     const auto path_start = rest.find('/');
@@ -398,6 +411,25 @@ Result<HttpResponseInfo> http_request(const HttpRequest& request, const std::fun
         return connected.status();
     }
     Socket sock = std::move(connected).value();
+#if defined(SONDER_HAS_TLS)
+    std::unique_ptr<TlsStream> tls;  // destroyed before sock (declared after it)
+    if (request.use_tls) {
+        auto session = tls_connect(static_cast<NativeSocket>(sock.get()), request.host, request.port, request.tls,
+                                   deadline, cancel);
+        if (!session.ok()) {
+            return session.status();
+        }
+        tls = std::move(session).value();
+    }
+    auto send_bytes = [&](std::string_view data) {
+        return tls ? tls->write_all(data, deadline, cancel) : send_all(sock.get(), data, deadline, cancel);
+    };
+#else
+    if (request.use_tls) {
+        return Status(ErrorCode::unsupported, "TLS requested but this build has no SONDER_WITH_TLS support");
+    }
+    auto send_bytes = [&](std::string_view data) { return send_all(sock.get(), data, deadline, cancel); };
+#endif
 
     std::string host_header = request.host.find(':') != std::string::npos ? "[" + request.host + "]" : request.host;
     std::string head = request.method + " " + request.target + " HTTP/1.1\r\n";
@@ -408,11 +440,11 @@ Result<HttpResponseInfo> http_request(const HttpRequest& request, const std::fun
         head += "Content-Length: " + std::to_string(request.body.size()) + "\r\n";
     }
     head += "\r\n";
-    if (auto st = send_all(sock.get(), head, deadline, cancel); !st.ok()) {
+    if (auto st = send_bytes(head); !st.ok()) {
         return st;
     }
     if (!request.body.empty()) {
-        if (auto st = send_all(sock.get(), request.body, deadline, cancel); !st.ok()) {
+        if (auto st = send_bytes(request.body); !st.ok()) {
             return st;
         }
     }
@@ -446,16 +478,28 @@ Result<HttpResponseInfo> http_request(const HttpRequest& request, const std::fun
     };
 
     while (true) {
+        long long n = 0;
         if (info.stopped_by_callback) {
             return info;
         }
         if (headers_done && ((chunked && decoder.done()) || (has_length && body_received >= content_length))) {
             return info;
         }
-        if (auto st = wait_socket(sock.get(), false, deadline, cancel); !st.ok()) {
-            return st;
+#if defined(SONDER_HAS_TLS)
+        if (tls) {
+            auto got = tls->read_some(buf, sizeof(buf), deadline, cancel);
+            if (!got.ok()) {
+                return got.status();
+            }
+            n = static_cast<long long>(got.value());
+        } else
+#endif
+        {
+            if (auto st = wait_socket(sock.get(), false, deadline, cancel); !st.ok()) {
+                return st;
+            }
+            n = static_cast<long long>(::recv(sock.get(), buf, static_cast<int>(sizeof(buf)), 0));
         }
-        const auto n = ::recv(sock.get(), buf, static_cast<int>(sizeof(buf)), 0);
         if (n < 0) {
             if (would_block(last_socket_error())) {
                 continue;
