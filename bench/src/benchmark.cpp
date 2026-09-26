@@ -30,6 +30,11 @@ std::string fnv1a_hex(std::string_view s) {
     return buf;
 }
 
+// Expanded prompt text limits (filler repeats are multiplied into every
+// fan-out child, so a tiny corpus could otherwise expand to many GB).
+constexpr std::size_t kMaxPromptBytes = 16u << 20;   // one prompt incl. all children
+constexpr std::size_t kMaxCorpusBytes = 64u << 20;   // whole corpus after expansion
+
 std::string str_or(const json::Value& v, std::string_view key, std::string fallback = {}) {
     const json::Value* f = v.find(key);
     return (f != nullptr && f->is_string()) ? f->as_string() : fallback;
@@ -70,17 +75,24 @@ Result<Corpus> parse_corpus(std::string_view json_text) {
     if (!prompts || !prompts->is_array() || prompts->as_array().empty()) {
         return Status(ErrorCode::invalid_argument, "corpus needs a non-empty prompts array");
     }
+    std::size_t corpus_bytes = 0;
     for (const auto& p : prompts->as_array()) {
         Prompt pr;
         pr.id = str_or(p, "id");
         pr.workload = str_or(p, "workload", "interactive_chat");
-        pr.max_tokens = static_cast<std::int32_t>(p.find("max_tokens") ? p.find("max_tokens")->as_int(64) : 64);
         if (pr.id.empty()) {
             return Status(ErrorCode::invalid_argument, "every prompt needs non-empty id and prompt");
         }
-        if (pr.max_tokens < 1 || pr.max_tokens > SamplingConfig::kMaxTokensLimit) {
+        // Range-check the 64-bit value before narrowing (4294967297 must not become 1).
+        const std::int64_t max_tokens = p.find("max_tokens") ? p.find("max_tokens")->as_int(64) : 64;
+        if (max_tokens < 1 || max_tokens > SamplingConfig::kMaxTokensLimit) {
             return Status(ErrorCode::invalid_argument, "prompt " + pr.id + " has invalid max_tokens");
         }
+        pr.max_tokens = static_cast<std::int32_t>(max_tokens);
+        const auto too_large = [&] {
+            return Status(ErrorCode::invalid_argument,
+                          "prompt " + pr.id + " expands beyond the corpus size limit (16 MiB per prompt, 64 MiB total)");
+        };
 
         // Prefix = shared_prefix + repeated filler context.
         std::string prefix = str_or(p, "shared_prefix");
@@ -95,6 +107,9 @@ Result<Corpus> parse_corpus(std::string_view json_text) {
                 return Status(ErrorCode::invalid_argument, "prompt " + pr.id + " has invalid context.repeat");
             }
             for (std::int64_t i = 0; i < repeat; ++i) {
+                if (prefix.size() + 2 + it->second.size() > kMaxPromptBytes) {
+                    return too_large();
+                }
                 if (!prefix.empty()) prefix += "\n\n";
                 prefix += it->second;
             }
@@ -105,11 +120,28 @@ Result<Corpus> parse_corpus(std::string_view json_text) {
             return prefix + "\n\n" + tail;
         };
 
+        // Size of with_prefix(tail) without building it.
+        const auto expanded_size = [&](std::size_t tail) {
+            if (prefix.empty()) return tail;
+            if (tail == 0) return prefix.size();
+            return prefix.size() + 2 + tail;
+        };
+        std::size_t prompt_bytes = 0;
         if (const json::Value* children = p.find("children"); children && !children->as_array().empty()) {
             for (const auto& c : children->as_array()) {
                 if (c.as_string().empty()) {
                     return Status(ErrorCode::invalid_argument, "prompt " + pr.id + " has an empty child prompt");
                 }
+                prompt_bytes += expanded_size(c.as_string().size());
+                if (prompt_bytes > kMaxPromptBytes) {
+                    return too_large();
+                }
+            }
+            prompt_bytes += expanded_size(str_or(p, "prompt").size());
+            if (prompt_bytes > kMaxPromptBytes || corpus_bytes + prompt_bytes > kMaxCorpusBytes) {
+                return too_large();
+            }
+            for (const auto& c : children->as_array()) {
                 pr.children.push_back(with_prefix(c.as_string()));
             }
             pr.shared_prefix_bytes = prefix.size();
@@ -119,8 +151,13 @@ Result<Corpus> parse_corpus(std::string_view json_text) {
             if (text.empty()) {
                 return Status(ErrorCode::invalid_argument, "every prompt needs non-empty id and prompt");
             }
+            prompt_bytes = expanded_size(text.size());
+            if (prompt_bytes > kMaxPromptBytes || corpus_bytes + prompt_bytes > kMaxCorpusBytes) {
+                return too_large();
+            }
             pr.prompt = with_prefix(text);
         }
+        corpus_bytes += prompt_bytes;
         corpus.prompts.push_back(std::move(pr));
     }
     return corpus;

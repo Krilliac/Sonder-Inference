@@ -186,4 +186,66 @@ TEST_CASE("markdown summary and result files") {
     CHECK(slurp(mp) == md);
     std::filesystem::remove_all(dir);
 }
+
+// Regression tests for docs/integration/hardening.md B2, B3 and markdown
+// escaping. Repro inputs also live in fuzz/corpus/bench_corpus.
+
+TEST_CASE("max_tokens is range-checked before narrowing (B2)") {
+    const auto corpus_with = [](const std::string& max_tokens) {
+        return bench::parse_corpus(R"({"schema":"sonder.inference.corpus/1","prompts":[{"id":"p","prompt":"x","max_tokens":)" +
+                                   max_tokens + "}]}");
+    };
+    CHECK_FALSE(corpus_with("4294967297").ok());  // used to wrap to 1
+    CHECK_FALSE(corpus_with("4294967360").ok());  // used to wrap to 64
+    CHECK_FALSE(corpus_with("-4294967295").ok());
+    CHECK_FALSE(corpus_with("0").ok());
+    auto ok = corpus_with("64");
+    REQUIRE(ok.ok());
+    CHECK(ok.value().prompts[0].max_tokens == 64);
+}
+
+TEST_CASE("corpus expansion is capped (B3)") {
+    const std::string filler(1000, 'x');
+    std::string kids;
+    for (int i = 0; i < 20; ++i) kids += std::string(i ? "," : "") + "\"k\"";
+    // 1.2 KB of JSON that used to expand to ~210 MB of prompt text.
+    const std::string bomb = R"({"schema":"sonder.inference.corpus/1","fillers":{"f":")" + filler +
+                             R"("},"prompts":[{"id":"p","context":{"filler":"f","repeat":10000},"children":[)" + kids +
+                             "]}]}";
+    auto r = bench::parse_corpus(bomb);
+    REQUIRE_FALSE(r.ok());
+    CHECK(r.status().code() == ErrorCode::invalid_argument);
+    CHECK(r.status().message().find("size limit") != std::string::npos);
+
+    // A single 10 MB prefix is fine; copying it into two children is not.
+    const std::string single = R"({"schema":"sonder.inference.corpus/1","fillers":{"f":")" + filler +
+                               R"("},"prompts":[{"id":"p","prompt":"q","context":{"filler":"f","repeat":10000}}]})";
+    CHECK(bench::parse_corpus(single).ok());
+    const std::string two = R"({"schema":"sonder.inference.corpus/1","fillers":{"f":")" + filler +
+                            R"("},"prompts":[{"id":"p","context":{"filler":"f","repeat":10000},"children":["a","b"]}]})";
+    CHECK_FALSE(bench::parse_corpus(two).ok());
+
+    // Total across prompts is capped too (7 x ~10 MB > 64 MiB).
+    std::string many = R"({"schema":"sonder.inference.corpus/1","fillers":{"f":")" + filler + R"("},"prompts":[)";
+    for (int i = 0; i < 7; ++i) {
+        many += std::string(i ? "," : "") + R"({"id":"p)" + std::to_string(i) +
+                R"(","prompt":"q","context":{"filler":"f","repeat":10000}})";
+    }
+    many += "]}";
+    CHECK_FALSE(bench::parse_corpus(many).ok());
+}
+
+TEST_CASE("render_markdown escapes table-breaking characters") {
+    auto doc = json::parse(
+        R"({"backend":{"name":"mock"},"model":{"name":"evil|model\nnext"},"label":"a\\b|c",)"
+        R"("summary":{"measured_requests":1,"ttft_ms":{"n":1,"p50":1e300,"p95":2.0}}})");
+    REQUIRE(doc.ok());
+    const std::string md = bench::render_markdown(doc.value());
+    CHECK(md.find("evil\\|model next") != std::string::npos);
+    CHECK(md.find("| Label | a\\\\b\\|c |") != std::string::npos);
+    CHECK(md.find("evil|model") == std::string::npos);
+    CHECK(md.find("1.0e+300") != std::string::npos);  // not a truncated 301-digit number
+    // The file stem still uses the raw value, made filesystem-safe.
+    CHECK(bench::default_result_stem(doc.value()) == "undated-mock-evil_model_next--");
+}
 }
