@@ -334,7 +334,12 @@ TEST_CASE("producer role and synthetic flag (additive envelope fields)") {
     plain.add_sink(sink);
     const json::Object env = plain.make_envelope("x.y", ctx_s(), json::Object{}, 0);
     CHECK(env.find("producer")->find("role")->as_string() == "inference");
-    CHECK_FALSE(env.find("producer")->find("synthetic")->as_bool());
+    // Unknown by default: the field is absent, never a false claim.
+    CHECK(env.find("producer")->find("synthetic") == nullptr);
+
+    opts.synthetic = false;
+    TelemetryBus real(opts);
+    CHECK_FALSE(real.make_envelope("x.y", ctx_s(), json::Object{}, 0).find("producer")->find("synthetic")->as_bool());
 
     opts.synthetic = true;
     opts.role = "";
@@ -383,6 +388,22 @@ TEST_CASE("sinks receive each envelope's sequence through write_event") {
     memory.write_event(7, "{\"a\":1}");
     REQUIRE(memory.lines().size() == 1);
     CHECK(memory.lines()[0] == "{\"a\":1}");
+}
+
+TEST_CASE("an engine running the mock backend never labels its events synthetic:false") {
+    // Hosts that do not set TelemetryOptions::synthetic (CLI, C ABI, bench)
+    // must not claim mock output is real.
+    sonder_test::Harness h;
+    auto session = h.session(SamplingConfig::greedy(4));
+    REQUIRE(session);
+    REQUIRE(session->generate("synthetic label").ok());
+    session->close();
+    const auto events = h.events();
+    REQUIRE_FALSE(events.empty());
+    for (const auto& e : events) {
+        const json::Value* synthetic = e.find("producer")->find("synthetic");
+        CHECK_MESSAGE((synthetic == nullptr || synthetic->as_bool()), e.find("event_type")->as_string());
+    }
 }
 
 TEST_CASE("engine.started carries the server listener when one is set") {

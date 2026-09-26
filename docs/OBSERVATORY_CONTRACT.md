@@ -104,8 +104,9 @@ Emitted today:
 Envelope additions (compatible with v1, `additionalProperties` allowed):
 `producer.instance_id`, `sampling.level` = the event's own level, and
 `run_id` defaulting to the engine id. Ecosystem contract v1 adds
-`producer.role` (`inference`) and `producer.synthetic` (true only with the
-MOCK backend), `request.queued.kind = "chat"`, and `parent_request_id` on the
+`producer.role` (`inference`) and an optional `producer.synthetic` (true
+with the MOCK backend under `serve`, false for a real backend there, absent
+when the host does not know), `request.queued.kind = "chat"`, and `parent_request_id` on the
 request lifecycle events. See TELEMETRY.md for the Observatory change-request
 status.
 

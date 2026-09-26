@@ -89,9 +89,11 @@ struct TelemetryOptions {
     // Envelope producer.role (additive field, contract sonder.observatory.event/1).
     // Empty omits the field.
     std::string role = "inference";
-    // Envelope producer.synthetic: true only when the events describe
-    // synthetic work (the MOCK backend). Always emitted as a boolean.
-    bool synthetic = false;
+    // Envelope producer.synthetic: true when the events describe synthetic
+    // work (the MOCK backend), false when the host knows they do not.
+    // Unset (the default) omits the field, meaning "unknown": hosts that do
+    // not decide it (the CLI, the C ABI, bench) never claim real output.
+    std::optional<bool> synthetic;
     // Minimum spacing between live telemetry.dropped reports while running.
     // The first drop is reported as soon as the writer catches up; a final
     // report is emitted at shutdown if anything is still unreported.
