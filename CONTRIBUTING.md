@@ -1,12 +1,23 @@
 # Contributing
 
-This repository is in the scaffold phase. Read [scaffold status](docs/SCAFFOLD.md)
-and [repository instructions](AGENTS.md) first. Documentation and structure can
-be reviewed now; implementation requires a subsequent task.
+Read [repository instructions](AGENTS.md), the [roadmap](docs/ROADMAP.md), and
+[design decisions](docs/DESIGN_DECISIONS.md) first.
 
-No language toolchain, dependency install, build command, or test runner is
-configured yet. Validate local Markdown links and run `git diff --check`.
-There is no runnable product or runtime test suite at this stage.
+## Build and test
 
-Keep commits focused and use DCO sign-off (`git commit -s`). Project licensing
-must be settled before importing third-party source or publishing packages.
+- Windows: `powershell -NoProfile -File scripts\build.ps1 -Preset msvc-debug -Test`
+- Linux/macOS: `cmake --preset linux-debug && cmake --build --preset linux-debug && ctest --preset linux-debug`
+
+CI runs the `ci-windows` and `ci-linux` presets (warnings as errors). Tests
+must pass without network services or model weights; live Ollama checks are
+opt-in via `SONDER_TEST_OLLAMA_MODEL` (and optionally `SONDER_TEST_OLLAMA_URL`).
+
+## Rules
+
+- Keep commits focused and use DCO sign-off (`git commit -s`).
+- Run `git diff --check`; follow `.editorconfig` and `.gitattributes`.
+- The C ABI (`include/sonder_inference.h`) is append-only.
+- Project licensing must be settled before publishing packages. Third-party
+  code requires a record in [LICENSE_REVIEW](docs/LICENSE_REVIEW.md) before it
+  is fetched, vendored, or linked.
+- Never commit model weights, secrets, or large generated outputs.

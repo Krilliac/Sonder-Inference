@@ -15,3 +15,6 @@
 - [Scaffold status](SCAFFOLD.md)
 - [Proposed ecosystem boundaries](BOUNDARIES.md)
 - [Contract workspace](contracts/README.md)
+- [Build, quickstart, and status](../README.md#build-and-test)
+- [C ABI header](../include/sonder_inference.h)
+- [Modules and parallel work streams](MODULES.md)
