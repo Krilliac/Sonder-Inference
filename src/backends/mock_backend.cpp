@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <thread>
 
 #include "engine/accounting_tokens.hpp"
@@ -95,6 +96,9 @@ public:
         }
         const auto natural = static_cast<std::uint64_t>(std::max<std::int32_t>(1, options_.default_completion_tokens));
         logits_[kVocabularySize] = position_ + 1 >= natural ? 16.0f : -8.0f;
+        if (options_.ban_all_tokens) {
+            std::fill(logits_.begin(), logits_.end(), -std::numeric_limits<float>::infinity());
+        }
         return std::span<const float>(logits_);
     }
 
@@ -137,23 +141,6 @@ public:
             return Status(ErrorCode::unsupported, "mock backend created without token_logits");
         }
         return std::unique_ptr<TokenStream>(std::make_unique<MockTokenStream>(request, descriptor_.name, options_));
-    }
-
-    // Chat flattens the turns with a fixed template, then runs generate():
-    // deterministic, and different conversations give different output.
-    Result<GenerateStats> chat(const ChatRequest& request, const CancellationToken& cancel,
-                               const TokenCallback& on_chunk) override {
-        if (request.messages.empty()) {
-            return Status(ErrorCode::invalid_argument, "chat request has no messages");
-        }
-        GenerateRequest flat;
-        flat.request_id = request.request_id;
-        flat.sampling = request.sampling;
-        for (const auto& m : request.messages) {
-            flat.prompt += "<|" + m.role + "|> " + m.content + "\n";
-        }
-        flat.prompt += "<|assistant|>";
-        return generate(flat, cancel, on_chunk);
     }
 
     Result<GenerateStats> generate(const GenerateRequest& request, const CancellationToken& cancel,
@@ -246,7 +233,7 @@ public:
     }
     BackendCapabilities capabilities() const override {
         BackendCapabilities c;
-        c.add(Capability::tokenization).add(Capability::streaming).add(Capability::deterministic).add(Capability::chat);
+        c.add(Capability::tokenization).add(Capability::streaming).add(Capability::deterministic);
         if (options_.token_logits) {
             c.add(Capability::token_logits);
         }
