@@ -2,6 +2,7 @@
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 
 #include <cmath>
+#include <limits>
 
 namespace sonder::backends::llamacpp {
 
@@ -55,8 +56,19 @@ Status Validate(const SamplingParams& params) {
     if (!std::isfinite(params.repeat_penalty) || params.repeat_penalty <= 0.0F) {
         return Status::Error(ErrorCode::kInvalidArgument, "repeat_penalty must be finite and > 0");
     }
-    if (params.repeat_last_n < 0) {
-        return Status::Error(ErrorCode::kInvalidArgument, "repeat_last_n must be >= 0");
+    if (params.repeat_last_n < -1) {
+        return Status::Error(ErrorCode::kInvalidArgument, "repeat_last_n must be >= -1");
+    }
+    if (!std::isfinite(params.presence_penalty) || !std::isfinite(params.frequency_penalty)) {
+        return Status::Error(ErrorCode::kInvalidArgument, "presence/frequency penalties must be finite");
+    }
+    if (!std::isfinite(params.typical_p) || params.typical_p <= 0.0F) {
+        return Status::Error(ErrorCode::kInvalidArgument, "typical_p must be finite and > 0");
+    }
+    for (const auto& entry : params.logit_bias) {
+        if (std::isnan(entry.second) || entry.second == std::numeric_limits<float>::infinity()) {
+            return Status::Error(ErrorCode::kInvalidArgument, "logit_bias values must be finite or -inf");
+        }
     }
     return Status::Ok();
 }

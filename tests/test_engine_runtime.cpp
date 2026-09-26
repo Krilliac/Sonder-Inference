@@ -471,6 +471,29 @@ TEST_CASE("concurrent requests with a common prefix share blocks") {
     CHECK(rig.engine->kv_usage().pinned_blocks == 0);
 }
 
+TEST_CASE("num_ctx narrows the scheduling context and new sampling fields are reported") {
+    Rig rig({}, {});
+    auto s = SamplingConfig::greedy(4);
+    s.num_ctx = 512;
+    s.typical_p = 0.95f;
+    s.presence_penalty = 0.5f;
+    auto r = rig.session(s)->generate("hello");
+    REQUIRE(r.ok());
+    auto enq = rig.events_of("scheduler.enqueued");
+    REQUIRE(enq.size() == 1);
+    CHECK(attr_int(enq[0], "context_limit") == 512);
+    auto created = rig.events_of("session.created");
+    REQUIRE(created.size() == 1);
+    const auto* sampling = created[0].find("attributes")->find("sampling");
+    REQUIRE(sampling);
+    CHECK(sampling->find("num_ctx")->as_int() == 512);
+    CHECK(sampling->find("typical_p")->as_double() == doctest::Approx(0.95));
+    CHECK(sampling->find("presence_penalty")->as_double() == doctest::Approx(0.5));
+    CHECK(sampling->find("frequency_penalty")->as_double() == doctest::Approx(0.0));
+    CHECK(sampling->find("repeat_last_n")->as_int() == 64);
+    CHECK(sampling->find("logit_bias_count")->as_int() == 0);
+}
+
 TEST_CASE("workload class is reported and higher classes are scheduled") {
     Rig rig({}, {});
     auto s = rig.session(SamplingConfig::greedy(4), WorkloadClass::interactive_user);

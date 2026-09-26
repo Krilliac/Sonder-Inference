@@ -57,30 +57,30 @@ the same `SamplerConfig` as before.
 - `logit_bias == NULL` with `logit_bias_count > 0` is rejected with
   `SONDER_ERROR_INVALID_ARGUMENT`.
 
-## For the integrator (not done here, outside this branch's files)
+## Integrator follow-ups (status)
 
-1. **Engine/session wiring**: when the session builds a sampler chain, use
-   `sampling::make_chain(core_config, constraint, vocab_size)`. It already
-   carries the new fields, and passing `vocab_size` range-checks
-   `logit_bias` token ids. `num_ctx` is not a chain concern: the engine
-   should pass it to the backend's context setup (llama.cpp `n_ctx`); Ollama
-   gets it through the request options.
-2. **Telemetry**: `session.cpp::sampling_json` still records only the old
-   fields. Suggested additions: `typical_p`, `repeat_last_n`,
-   `presence_penalty`, `frequency_penalty`, `num_ctx`, `logit_bias_count`.
-3. **llama.cpp adapter**: `ToLlamaSampling` (`llamacpp_internal.hpp`) does
-   not map the new fields yet. `SamplingParams::repeat_last_n` exists and
-   `llama_sampler_init_penalties` already takes frequency/presence (currently
-   passed `0.0F`); typical_p and logit_bias have llama.cpp samplers too.
-4. **CLI / bench**: `tools/sonder-infer` has no flags for the new fields, and
-   `bench/src/benchmark.cpp` does not record them in reports.
-5. **Ollama + logit_bias**: the adapter silently drops `logit_bias` because
-   Ollama's native API has no equivalent. If silent dropping is not wanted,
-   the Ollama backend could reject non-empty `logit_bias` with
-   `ErrorCode::unsupported`. That is a backend-level decision and is left open.
-6. `docs/integration/sampling.md` says the core does not carry typical_p,
-   penalties or logit_bias. That is now out of date; this file supersedes that
-   paragraph.
+1. **Session chain**: done. Sessions call
+   `sampling::make_chain(config, nullptr, vocab_size)`, so the new fields
+   apply and `logit_bias` ids are range-checked. `num_ctx` narrows the
+   scheduler's context limit (`scheduler.enqueued.context_limit`).
+2. **Telemetry**: done. The `sampling` object on `session.created` and
+   `request.started` adds `typical_p`, `repeat_last_n`, `presence_penalty`,
+   `frequency_penalty`, `logit_bias_count` and `num_ctx`
+   (docs/TELEMETRY.md).
+3. **llama.cpp adapter**: done. `ToLlamaSampling` maps every new field.
+   The wrapper chain is logit bias, penalties (repeat/frequency/presence;
+   `repeat_last_n = -1` means the whole context), top-k, typical, top-p,
+   min-p, temperature, selector. Bias ids outside the vocab are rejected.
+   The context is fixed at load, so a `num_ctx` larger than the loaded
+   context is rejected with `invalid_argument`. A smaller one is honoured
+   through the engine's scheduling limit.
+4. **CLI / bench flags**: to do after `feat/chat-cli` (PR #10) merges,
+   because that PR changes the same CLI files.
+5. **Ollama + logit_bias**: decided. The Ollama backend **rejects** a
+   non-empty `logit_bias` with `ErrorCode::invalid_argument` and sends
+   nothing to the server. It no longer drops the field silently.
+   `sampling_to_options()` still omits it.
+6. `docs/integration/sampling.md`: updated.
 
 ## Verification (local, Linux)
 

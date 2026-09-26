@@ -34,6 +34,12 @@ inline sonder::backends::llamacpp::SamplingParams ToLlamaSampling(const Sampling
     p.top_p = c.top_p;
     p.min_p = c.min_p;
     p.repeat_penalty = c.repeat_penalty;
+    p.repeat_last_n = c.repeat_last_n;
+    p.presence_penalty = c.presence_penalty;
+    p.frequency_penalty = c.frequency_penalty;
+    p.typical_p = c.typical_p;
+    p.logit_bias.reserve(c.logit_bias.size());
+    for (const auto& b : c.logit_bias) p.logit_bias.emplace_back(b.token, b.bias);
     if (c.seed.has_value()) {
         // llama.cpp seeds are 32-bit and 0xFFFFFFFF means "random": fold the
         // 64-bit seed and avoid the sentinel so explicit seeds stay reproducible.

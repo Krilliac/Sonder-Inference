@@ -82,9 +82,12 @@ Types used below: `int` (JSON integer), `num` (JSON number), `str`,
 | `request.completed` / `request.cancelled` / `request.failed` | metrics | `outcome`, `stop_reason` str; `prompt_tokens`, `completion_tokens`, `chunks` int; `token_counts_from_backend` bool; `ttft_ms`, `total_ms` num; `scheduled` bool; `sampler` str. When `scheduled`: `queue_ms` num, `preemptions` int, `accounted_prompt_tokens` int, `reused_prompt_tokens` int. `cancelled` optionally adds `cancel_latency_ms` num. `failed` adds `error_code`, `error` str |
 
 `sampling` objects hold `temperature`, `top_k`, `top_p`, `min_p`,
-`repeat_penalty`, `max_tokens` and `seed` (int or null). New
-`SamplingConfig` fields will be added here as optional attributes when they
-land.
+`repeat_penalty`, `typical_p`, `repeat_last_n`, `presence_penalty`,
+`frequency_penalty`, `logit_bias_count` (int; the biases themselves are not
+recorded), `num_ctx` (int, 0 = model default), `max_tokens` and `seed` (int
+or null). The fields after `repeat_penalty` were added with
+`feat/sampling-config`; consumers of older streams must treat them as
+optional.
 
 `workload` values, highest scheduling class first: `interactive_user`,
 `owner_orchestrator`, `critic_verification`, `implementation_worker`
