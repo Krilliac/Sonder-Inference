@@ -80,25 +80,34 @@ RFC 3339 UTC `wall_time`, steady-clock `mono_ns`, `producer`
 ids `session_id`, `run_id`, `request_id`, `agent_id`, `task_id`,
 `model_instance_id`, `device_id` (null when unknown).
 
+The full event list, with every attribute and the stability rules, is in
+[TELEMETRY.md](TELEMETRY.md). Sonder Observatory's `docs/telemetry-schema.md`
+is written from it.
+
 Emitted today:
 
-| Event | Level | Notes |
-| --- | --- | --- |
-| `model.load.started` / `model.load.completed` | metrics | duration, format, quantization |
-| `model.unload` | metrics | outstanding references |
-| `request.queued` / `request.started` | metrics | kind, priority, sampling |
-| `request.completed` / `request.cancelled` / `request.failed` | metrics | tokens, TTFT, total latency, stop reason, cancel latency, error code |
-| `inference.decode.started` | metrics | at first streamed chunk, with TTFT |
-| `inference.decode.completed` | metrics | wall decode time, backend eval time and tokens/s when reported |
-| `inference.token.generated` | standard | per streamed chunk: index, bytes, elapsed; text only with `capture_text` |
-| `device.memory.sample` | metrics | CPU/RAM at engine start |
+- Lifecycle: `model.load.started/completed/failed`, `model.unload`, and
+  `request.queued/started/completed/failed/cancelled`.
+- Execution: `inference.prefill.completed`,
+  `inference.decode.started/completed`, and `inference.token.generated`.
+- Cache: `kv.allocated/reused/evicted/pressure` and `kv.freed` (logical KV;
+  engine wiring, ADR-016).
+- Scheduler: `scheduler.enqueued/admitted/preempted/rejected`,
+  `scheduler.prefill.chunk/completed`, `scheduler.batch.formed/completed`,
+  and `scheduler.configured`.
+- Sampling: `sampling.configured` and `sampling.failed`.
+- Device: `device.memory.sample` (CPU/RAM at engine start and every
+  `device_sample_interval`, default 10 s).
+- Other (ADR-012): `engine.started/stopped`, `backend.registered`,
+  `session.created/closed`, and `telemetry.dropped` (live and final).
 
-Additional event types (not in the list above, recorded here per ADR-012):
-`engine.started`, `engine.stopped`, `backend.registered`, `session.created`,
-`session.closed`, `model.load.failed`, and `telemetry.dropped` (final drop
-count). Engine-scoped events use the engine id as `session_id`.
+Envelope additions (compatible with v1, `additionalProperties` allowed):
+`producer.instance_id`, `sampling.level` = the event's own level, and
+`run_id` defaulting to the engine id. See TELEMETRY.md for the Observatory
+change-request status.
 
-Not emitted yet: prefill chunk events, speculation, context/KV, scheduler,
-device transfer, and deep backend events. For the Ollama adapter, streamed
-chunks approximate tokens; authoritative counts come from the backend's final
-`eval_count` (`token_counts_from_backend: true`).
+Not emitted yet: `inference.prefill.started`, speculation, `context.*`,
+`kv.moved/quantized`, `device.compute.sample`, device transfer, and deep
+backend events. For the Ollama adapter, streamed chunks approximate tokens;
+authoritative counts come from the backend's final `eval_count`
+(`token_counts_from_backend: true`).

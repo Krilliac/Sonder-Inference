@@ -220,8 +220,8 @@ TEST_CASE("telemetry: emit_timing_events maps load/prefill/decode") {
     bus.flush();
     auto lines = sink->lines();
     REQUIRE(lines.size() == 5u);
-    CHECK(lines[0].find("model.load.completed") != std::string::npos);
-    CHECK(lines[1].find("inference.prefill.completed") != std::string::npos);
-    CHECK(lines[2].find("inference.decode.completed") != std::string::npos);
+    CHECK(lines[0].find("backend.model.load.reported") != std::string::npos);
+    CHECK(lines[1].find("backend.timing.prefill") != std::string::npos);
+    CHECK(lines[2].find("backend.timing.decode") != std::string::npos);
     CHECK(lines[2].find("req-1") != std::string::npos);
 }

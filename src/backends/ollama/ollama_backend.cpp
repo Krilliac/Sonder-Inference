@@ -156,6 +156,7 @@ public:
         ModelDescriptor d;
         d.name = options.model;
         d.backend = kOllamaBackendName;
+        d.resident = false;  // metadata only (/api/show); Ollama loads weights lazily
         if (const json::Value* det = show.value().find("details"); det != nullptr) {
             auto s = [&](std::string_view k) {
                 const json::Value* v = det->find(k);

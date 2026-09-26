@@ -154,3 +154,64 @@ is compatible with Apache-2.0 as long as the MIT notices are kept (they are
 in `NOTICE`). History: PR #7 first adopted MIT from a survey of Krilliac's
 repositories; this revision supersedes it. See
 [LICENSE_REVIEW.md](LICENSE_REVIEW.md#project-license).
+
+## ADR-016 — Engine-owned request runtime (scheduler + logical KV)
+
+**Date:** 2026-09-26. **Status:** accepted.
+
+**Decision:** When the cache and scheduler modules are built, the `Engine`
+owns a request runtime. It is a coordinator thread that drives
+`scheduler::Scheduler` over `cache::KvCacheManager`, getting capacity through
+`KvCacheCapacityAdapter`. Sessions submit requests and wait for a per-token
+grant before each token. The runtime is on by default
+(`EngineOptions::scheduling.enabled`) and does nothing in a core-only build.
+Preemption uses recompute mode, and the adapter's release hook frees the
+preempted sequence synchronously.
+
+**Reason:** makes batching, admission, preemption and prefix reuse
+observable and testable with the mock backend now, without waiting for a
+native backend with KV control. Output is unchanged by scheduling.
+
+**Constraints:** KV is logical until backends expose KV control. The token
+gate is lockstep per step. See
+[integration/engine-wiring.md](integration/engine-wiring.md).
+
+## ADR-017 — NoViableCandidates maps to `invalid_argument`
+
+**Date:** 2026-09-26. **Status:** accepted.
+
+**Decision:** When Sonder's sampler chain finds no viable candidate, the
+request fails with `ErrorCode::invalid_argument`. Empty backend logits are
+`backend_error`.
+
+**Reason:** with valid logits, only the request's own policy (bias,
+penalties or constraints) can exclude every token, so retrying cannot help. That is a
+caller error, not a backend or availability failure.
+
+## ADR-018 — Sampling module keeps `sonder/sampling/` include path
+
+**Date:** 2026-09-26. **Status:** accepted.
+
+**Decision:** The sampling module's public headers stay at
+`src/sampling/include/sonder/sampling/`, an exception to the
+`sonder/inference/<module>/` convention. New modules follow the convention.
+
+**Reason:** moving would touch 39 include lines in 25 files for no functional
+gain. If the public include set is frozen for 1.0, it can be done
+mechanically with forwarding headers.
+
+## ADR-019 — Telemetry stream identity and per-event level
+
+**Date:** 2026-09-26. **Status:** accepted.
+
+**Decision:** Every envelope carries `producer.instance_id` (the telemetry
+bus id), and `event_id` is `<instance_id>-<sequence>` by contract.
+`sampling.level` is the level the event was emitted at. `run_id` defaults to
+the engine id. The Ollama timing helper uses `backend.*` names so it never
+duplicates the session's `inference.*` events.
+
+**Reason:** Observatory change requests (its `docs/telemetry-schema.md` @
+f5e3ff5): one counter numbers all of an engine's events, so gap detection
+must key on the bus instance, and consumers need to know what a lower level
+would drop. All additions are compatible with envelope v1. Full status in
+[TELEMETRY.md](TELEMETRY.md).

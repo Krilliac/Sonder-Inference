@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <thread>
 
+#include "engine/accounting_tokens.hpp"
 #include "sonder/inference/backends.hpp"
 
 namespace sonder::inference {
@@ -59,11 +61,87 @@ bool cancellable_sleep(std::chrono::microseconds d, const CancellationToken& can
     return !cancel.cancelled();
 }
 
+// Token-level mock: vocabulary = kVocabulary plus an end-of-sequence token.
+// Logits are a pure function of (prompt, model, position, previous token), so
+// the output depends only on the engine's sampler and seed.
+class MockTokenStream final : public TokenStream {
+public:
+    static constexpr TokenId kEos = static_cast<TokenId>(kVocabularySize);
+
+    MockTokenStream(const GenerateRequest& request, const std::string& model_name, MockBackendOptions options)
+        : prompt_(detail::accounting_tokenize(request.prompt)),
+          state_(fnv1a(request.prompt) ^ fnv1a(model_name)),
+          options_(options),
+          logits_(kVocabularySize + 1, 0.0f) {}
+
+    std::size_t vocab_size() const override { return logits_.size(); }
+    const std::vector<TokenId>& prompt_tokens() const override { return prompt_; }
+
+    Result<std::span<const float>> next_logits(const CancellationToken& cancel) override {
+        if (cancel.cancelled()) {
+            return Status(ErrorCode::cancelled, "cancelled by caller");
+        }
+        if (options_.token_delay.count() > 0 && !cancellable_sleep(options_.token_delay, cancel)) {
+            return Status(ErrorCode::cancelled, "cancelled by caller");
+        }
+        if (options_.fail_after_tokens >= 0 && position_ == static_cast<std::uint64_t>(options_.fail_after_tokens)) {
+            return Status(ErrorCode::backend_error,
+                          "mock backend injected failure at token " + std::to_string(position_));
+        }
+        const std::uint64_t step = splitmix64(state_ + position_ * 0x9E37ull);
+        for (std::size_t i = 0; i < kVocabularySize; ++i) {
+            const std::uint64_t r = splitmix64(step ^ (static_cast<std::uint64_t>(i) * 0xD6E8FEB86659FD93ull));
+            // Uniform in [-4, 4).
+            logits_[i] = static_cast<float>(static_cast<double>(r >> 40) / static_cast<double>(1ull << 24) * 8.0 - 4.0);
+        }
+        const auto natural = static_cast<std::uint64_t>(std::max<std::int32_t>(1, options_.default_completion_tokens));
+        logits_[kVocabularySize] = position_ + 1 >= natural ? 16.0f : -8.0f;
+        if (options_.ban_all_tokens) {
+            std::fill(logits_.begin(), logits_.end(), -std::numeric_limits<float>::infinity());
+        }
+        return std::span<const float>(logits_);
+    }
+
+    Status accept(TokenId token, std::string& piece) override {
+        if (token < 0 || static_cast<std::size_t>(token) >= logits_.size()) {
+            return Status(ErrorCode::invalid_argument, "token id out of range: " + std::to_string(token));
+        }
+        piece.clear();
+        if (token != kEos) {
+            if (position_ > 0) {
+                piece.push_back(' ');
+            }
+            piece += kVocabulary[static_cast<std::size_t>(token)];
+        }
+        state_ = splitmix64(state_ ^ (static_cast<std::uint64_t>(token) + 1));
+        ++position_;
+        return Status::success();
+    }
+
+    bool is_end_of_generation(TokenId token) const override { return token == kEos; }
+
+private:
+    std::vector<TokenId> prompt_;
+    std::uint64_t state_;
+    MockBackendOptions options_;
+    std::vector<float> logits_;
+    std::uint64_t position_ = 0;
+};
+
 class MockModel final : public BackendModel {
 public:
     MockModel(ModelDescriptor d, MockBackendOptions o) : descriptor_(std::move(d)), options_(o) {}
 
     const ModelDescriptor& descriptor() const override { return descriptor_; }
+
+    Result<std::vector<TokenId>> tokenize(std::string_view text) override { return detail::accounting_tokenize(text); }
+
+    Result<std::unique_ptr<TokenStream>> open_token_stream(const GenerateRequest& request) override {
+        if (!options_.token_logits) {
+            return Status(ErrorCode::unsupported, "mock backend created without token_logits");
+        }
+        return std::unique_ptr<TokenStream>(std::make_unique<MockTokenStream>(request, descriptor_.name, options_));
+    }
 
     Result<GenerateStats> generate(const GenerateRequest& request, const CancellationToken& cancel,
                                    const TokenCallback& on_chunk) override {
@@ -156,6 +234,9 @@ public:
     BackendCapabilities capabilities() const override {
         BackendCapabilities c;
         c.add(Capability::tokenization).add(Capability::streaming).add(Capability::deterministic);
+        if (options_.token_logits) {
+            c.add(Capability::token_logits);
+        }
         return c;
     }
     Result<std::string> probe() override { return std::string("mock-1"); }

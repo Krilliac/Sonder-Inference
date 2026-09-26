@@ -5,6 +5,7 @@
 #include <fstream>
 #include <mutex>
 #include <set>
+#include <thread>
 
 #include "test_helpers.hpp"
 
@@ -213,4 +214,107 @@ TEST_CASE("level parsing") {
     CHECK_FALSE(parse_telemetry_level("verbose").has_value());
     CHECK(std::string(to_string(TelemetryLevel::metrics)) == "metrics");
 }
+}
+
+TEST_CASE("Observatory requests: stream identity, run grouping, capture policy, per-event level") {
+    sonder_test::Harness h({}, TelemetryLevel::standard, true);
+    auto session = h.session(SamplingConfig::greedy(4));
+    REQUIRE(session->generate("observatory").ok());
+    session->close();
+    const std::string engine_id = h.engine->engine_id();
+    const std::string instance = h.engine->telemetry().instance_id();
+    for (const auto& e : h.events()) {
+        const auto* producer = e.find("producer");
+        REQUIRE(producer->find("instance_id"));
+        CHECK(producer->find("instance_id")->as_string() == instance);
+        CHECK(e.find("event_id")->as_string() == instance + "-" + std::to_string(e.find("sequence")->as_int()));
+        const std::string type = e.find("event_type")->as_string();
+        // Every engine, session and request event carries the engine id as run_id.
+        REQUIRE(e.find("run_id")->is_string());
+        CHECK(e.find("run_id")->as_string() == engine_id);
+        const std::string level = e.find("sampling")->find("level")->as_string();
+        if (type == "inference.token.generated" || type == "scheduler.batch.formed") {
+            CHECK(level == "standard");
+        } else if (type.rfind("request.", 0) == 0 || type.rfind("session.", 0) == 0 ||
+                   type.rfind("engine.", 0) == 0 || type.rfind("model.", 0) == 0) {
+            CHECK(level == "metrics");
+        }
+    }
+    auto started = h.events_of("engine.started");
+    REQUIRE(started.size() == 1);
+    CHECK(started[0].find("attributes")->find("text_capture")->as_string() == "on");
+    auto created = h.events_of("session.created");
+    REQUIRE(created.size() == 1);
+    CHECK(created[0].find("attributes")->find("text_capture")->as_string() == "on");
+    auto loaded = h.events_of("model.load.completed");
+    REQUIRE(loaded.size() == 1);
+    CHECK(loaded[0].find("attributes")->find("resident")->as_bool());
+    auto prefill = h.events_of("inference.prefill.completed");
+    REQUIRE(prefill.size() == 1);
+    CHECK(prefill[0].find("attributes")->find("prompt_tokens")->as_int() >= 1);
+    for (const auto& e : h.events_of("inference.token.generated")) {
+        CHECK(e.find("attributes")->find("unit")->as_string() == "chunk");
+    }
+}
+
+TEST_CASE("an explicit run_id is kept") {
+    sonder_test::Harness h;
+    SessionOptions so;
+    so.run_id = "run-explicit";
+    auto s = h.engine->create_session(h.model, so);
+    REQUIRE(s.ok());
+    REQUIRE(s.value()->generate("hi").ok());
+    for (const auto& e : h.events_of("request.completed")) {
+        CHECK(e.find("run_id")->as_string() == "run-explicit");
+    }
+}
+
+TEST_CASE("devices are sampled periodically") {
+    auto sink = std::make_shared<MemoryTelemetrySink>();
+    EngineOptions eo;
+    eo.telemetry_sinks.push_back(sink);
+    eo.sample_devices_on_start = false;
+    eo.device_sample_interval = std::chrono::milliseconds(10);
+    std::size_t samples = 0;
+    {
+        Engine engine(std::move(eo));
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            engine.telemetry().flush();
+            samples = 0;
+            for (const auto& l : sink->lines()) {
+                if (l.find("\"device.memory.sample\"") != std::string::npos) ++samples;
+            }
+            if (samples >= 2 * engine.devices().size() && samples > 0) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    CHECK(samples >= 2);
+}
+
+TEST_CASE("drops are reported while running, not only at shutdown") {
+    auto gate = std::make_shared<GateSink>();
+    TelemetryOptions opts;
+    opts.queue_capacity = 2;
+    opts.drop_report_interval = std::chrono::milliseconds(0);
+    TelemetryBus bus(opts);
+    bus.add_sink(gate);
+    TelemetryContext ctx;
+    ctx.session_id = "sess-test";
+    for (int i = 0; i < 20; ++i) (void)bus.emit("test.event", ctx, json::Object{{"i", i}});
+    REQUIRE(bus.dropped_events() > 0);
+    gate->open();
+    bus.flush();  // writer drains, sees the drops and queues a live report
+    bus.flush();
+    bool live = false;
+    for (const auto& l : gate->lines()) {
+        auto v = json::parse(l);
+        REQUIRE(v.ok());
+        if (v.value().find("event_type")->as_string() == "telemetry.dropped") {
+            CHECK_FALSE(v.value().find("attributes")->find("final")->as_bool());
+            live = true;
+        }
+    }
+    CHECK(live);
+    bus.shutdown();
 }

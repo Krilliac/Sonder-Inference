@@ -164,7 +164,8 @@ bool TelemetryBus::enabled(TelemetryLevel level) const noexcept {
 }
 
 json::Object TelemetryBus::make_envelope(std::string_view event_type, const TelemetryContext& context,
-                                         json::Object attributes, std::uint64_t sequence) const {
+                                         json::Object attributes, std::uint64_t sequence,
+                                         TelemetryLevel level) const {
     json::Object env;
     env.set("schema", std::string(kObservatorySchema));
     env.set("event_id", instance_id_ + "-" + std::to_string(sequence));
@@ -181,8 +182,9 @@ json::Object TelemetryBus::make_envelope(std::string_view event_type, const Tele
     env.set("device_id", context.device_id);
     env.set("producer", json::Object{{"name", options_.producer_name},
                                      {"version", version_string()},
-                                     {"node_id", options_.node_id}});
-    env.set("sampling", json::Object{{"level", to_string(options_.level)}, {"sampled", true}});
+                                     {"node_id", options_.node_id},
+                                     {"instance_id", instance_id_}});
+    env.set("sampling", json::Object{{"level", to_string(level)}, {"sampled", true}});
     env.set("attributes", std::move(attributes));
     return env;
 }
@@ -201,7 +203,7 @@ bool TelemetryBus::emit(std::string_view event_type, const TelemetryContext& con
         return false;
     }
     const std::uint64_t seq = next_sequence_++;
-    queue_.push_back(json::Value(make_envelope(event_type, context, std::move(attributes), seq)).dump());
+    queue_.push_back(json::Value(make_envelope(event_type, context, std::move(attributes), seq, level)).dump());
     ++enqueued_count_;
     emitted_.fetch_add(1, std::memory_order_relaxed);
     lock.unlock();
@@ -230,9 +232,33 @@ void TelemetryBus::writer_loop() {
         }
         lock.lock();
         written_sequence_ += batch.size();
+        // Live drop reporting: first drop immediately, then rate limited.
+        if (!stopping_ && dropped_.load() > reported_dropped_ && options_.level != TelemetryLevel::off) {
+            const auto now = std::chrono::steady_clock::now();
+            if (reported_dropped_ == 0 || now - last_drop_report_ >= options_.drop_report_interval) {
+                enqueue_drop_report_locked(false);
+            }
+        }
         drained_cv_.notify_all();
     }
     drained_cv_.notify_all();
+}
+
+void TelemetryBus::enqueue_drop_report_locked(bool final_report) {
+    const std::uint64_t dropped = dropped_.load();
+    TelemetryContext ctx;
+    ctx.session_id = instance_id_;
+    const std::uint64_t seq = next_sequence_++;
+    queue_.push_back(json::Value(make_envelope("telemetry.dropped", ctx,
+                                               json::Object{{"dropped_events", dropped},
+                                                            {"emitted_events", emitted_.load()},
+                                                            {"queue_capacity", options_.queue_capacity},
+                                                            {"final", final_report}},
+                                               seq, TelemetryLevel::metrics))
+                         .dump());
+    ++enqueued_count_;
+    reported_dropped_ = dropped;
+    last_drop_report_ = std::chrono::steady_clock::now();
 }
 
 void TelemetryBus::flush() {
@@ -247,20 +273,10 @@ void TelemetryBus::shutdown() {
         if (stopped_ || stopping_) {
             return;
         }
-        const std::uint64_t dropped = dropped_.load();
-        if (dropped > 0 && !sinks_.empty() && options_.level != TelemetryLevel::off) {
-            // Final accounting event; bypasses the capacity limit on purpose.
-            TelemetryContext ctx;
-            ctx.session_id = instance_id_;
-            const std::uint64_t seq = next_sequence_++;
-            queue_.push_back(
-                json::Value(make_envelope("telemetry.dropped", ctx,
-                                          json::Object{{"dropped_events", dropped},
-                                                       {"emitted_events", emitted_.load()},
-                                                       {"queue_capacity", options_.queue_capacity}},
-                                          seq))
-                    .dump());
-            ++enqueued_count_;
+        if (dropped_.load() > reported_dropped_ && !sinks_.empty() && options_.level != TelemetryLevel::off) {
+            // Final accounting event for drops not reported live yet;
+            // bypasses the capacity limit on purpose.
+            enqueue_drop_report_locked(true);
         }
         stopping_ = true;
     }

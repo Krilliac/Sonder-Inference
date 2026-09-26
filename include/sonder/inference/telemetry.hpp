@@ -8,6 +8,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -76,6 +77,10 @@ struct TelemetryOptions {
     bool capture_text = false;
     std::string producer_name = "sonder-inference";
     std::string node_id;  // defaults to host name
+    // Minimum spacing between live telemetry.dropped reports while running.
+    // The first drop is reported as soon as the writer catches up; a final
+    // report is emitted at shutdown if anything is still unreported.
+    std::chrono::milliseconds drop_report_interval{1000};
 };
 
 class TelemetryBus {
@@ -105,12 +110,20 @@ public:
     [[nodiscard]] std::uint64_t emitted_events() const noexcept { return emitted_.load(); }
     [[nodiscard]] std::uint64_t dropped_events() const noexcept { return dropped_.load(); }
 
+    // Stream identity: event_id is "<instance_id>-<sequence>" and
+    // producer.instance_id carries the same value (docs/TELEMETRY.md).
+    [[nodiscard]] const std::string& instance_id() const noexcept { return instance_id_; }
+
     // Builds an envelope without queueing it (exposed for tests/tools).
+    // sampling.level is the level the event was emitted at.
     json::Object make_envelope(std::string_view event_type, const TelemetryContext& context,
-                               json::Object attributes, std::uint64_t sequence) const;
+                               json::Object attributes, std::uint64_t sequence,
+                               TelemetryLevel level = TelemetryLevel::metrics) const;
 
 private:
     void writer_loop();
+    // Queues a telemetry.dropped report (bypasses the capacity limit). Lock held.
+    void enqueue_drop_report_locked(bool final_report);
 
     TelemetryOptions options_;
     std::string instance_id_;
@@ -127,12 +140,16 @@ private:
     bool stopped_ = false;
     std::atomic<std::uint64_t> emitted_{0};
     std::atomic<std::uint64_t> dropped_{0};
+    std::uint64_t reported_dropped_ = 0;
+    std::chrono::steady_clock::time_point last_drop_report_{};
     std::thread writer_;
 };
 
 // RFC 3339 UTC timestamp with millisecond precision, e.g. 2026-09-26T08:01:02.345Z.
 std::string utc_timestamp_now();
-// Monotonic nanoseconds (steady clock).
+// Monotonic nanoseconds (steady clock; epoch is platform-defined, usually
+// boot). Envelope mono_ns uses this value; see docs/TELEMETRY.md for the
+// 2^53 precision note.
 std::uint64_t monotonic_ns() noexcept;
 // Random-ish unique identifier with a prefix, e.g. "req-4f1c...".
 std::string make_id(std::string_view prefix);
