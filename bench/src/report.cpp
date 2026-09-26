@@ -20,17 +20,40 @@ const json::Value* path(const json::Value& v, std::initializer_list<std::string_
     return cur;
 }
 
-std::string text(const json::Value& v, std::initializer_list<std::string_view> keys) {
+std::string raw_text(const json::Value& v, std::initializer_list<std::string_view> keys) {
     const json::Value* f = path(v, keys);
     if (f == nullptr || f->is_null()) return "-";
     if (f->is_string()) return f->as_string().empty() ? "-" : f->as_string();
     return f->dump();
 }
 
+// Makes a value safe inside a Markdown table cell or heading: '|' would end
+// the cell, a line break would end the row, and a backslash could escape the
+// next character, so escape/flatten them.
+std::string md(std::string s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+            case '|': out += "\\|"; break;
+            case '\\': out += "\\\\"; break;
+            case '\n':
+            case '\r': out.push_back(' '); break;
+            default: out.push_back(c);
+        }
+    }
+    return out;
+}
+
+std::string text(const json::Value& v, std::initializer_list<std::string_view> keys) {
+    return md(raw_text(v, keys));
+}
+
 std::string num(double x, int prec = 1) {
     if (!std::isfinite(x)) return "-";
     char buf[64];
-    std::snprintf(buf, sizeof buf, "%.*f", prec, x);
+    // Fixed notation for huge values would not fit (1e300 has 301 digits).
+    std::snprintf(buf, sizeof buf, std::fabs(x) < 1e15 ? "%.*f" : "%.*e", prec, x);
     return buf;
 }
 
@@ -140,10 +163,10 @@ std::string render_markdown(const json::Value& r) {
 }
 
 std::string default_result_stem(const json::Value& r) {
-    std::string date = text(r, {"created_at"});
+    std::string date = raw_text(r, {"created_at"});
     date = date.size() >= 10 ? date.substr(0, 10) : std::string("undated");
-    return safe(date) + "-" + safe(text(r, {"backend", "name"})) + "-" + safe(text(r, {"model", "name"})) + "-" +
-           safe(text(r, {"corpus", "name"}));
+    return safe(date) + "-" + safe(raw_text(r, {"backend", "name"})) + "-" + safe(raw_text(r, {"model", "name"})) +
+           "-" + safe(raw_text(r, {"corpus", "name"}));
 }
 
 Status write_results(const json::Value& r, const std::string& dir, const std::string& stem, std::string* json_path,

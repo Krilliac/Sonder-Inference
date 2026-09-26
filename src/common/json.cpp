@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 
 namespace sonder::inference::json {
 
@@ -46,6 +47,31 @@ Value* Object::find(std::string_view key) {
         }
     }
     return nullptr;
+}
+
+Object Object::from_members(std::vector<Member> members) {
+    Object out;
+    constexpr std::size_t kLinearThreshold = 16;
+    if (members.size() <= kLinearThreshold) {
+        out.members_.reserve(members.size());
+        for (auto& m : members) {
+            out.set(std::move(m.first), std::move(m.second));
+        }
+        return out;
+    }
+    // Reserve up front so the keys (and the string_views into them) never move.
+    out.members_.reserve(members.size());
+    std::unordered_map<std::string_view, std::size_t> index;
+    index.reserve(members.size());
+    for (auto& m : members) {
+        if (auto it = index.find(m.first); it != index.end()) {
+            out.members_[it->second].second = std::move(m.second);
+            continue;
+        }
+        out.members_.emplace_back(std::move(m.first), std::move(m.second));
+        index.emplace(out.members_.back().first, out.members_.size() - 1);
+    }
+    return out;
 }
 
 void Object::set(std::string key, Value value) {
@@ -135,9 +161,42 @@ const Value* Value::find(std::string_view key) const {
     return nullptr;
 }
 
+namespace {
+// Length of the well-formed UTF-8 sequence starting at s[i] (lead byte >= 0x80),
+// or 0 if it is ill-formed (Unicode Table 3-7: no overlongs, no surrogates,
+// nothing above U+10FFFF, no truncation).
+std::size_t utf8_sequence_length(std::string_view s, std::size_t i) {
+    const auto b0 = static_cast<unsigned char>(s[i]);
+    std::size_t n = 0;
+    unsigned char lo = 0x80, hi = 0xBF;  // allowed range of the second byte
+    if (b0 >= 0xC2 && b0 <= 0xDF) {
+        n = 2;
+    } else if (b0 >= 0xE0 && b0 <= 0xEF) {
+        n = 3;
+        if (b0 == 0xE0) lo = 0xA0;
+        if (b0 == 0xED) hi = 0x9F;
+    } else if (b0 >= 0xF0 && b0 <= 0xF4) {
+        n = 4;
+        if (b0 == 0xF0) lo = 0x90;
+        if (b0 == 0xF4) hi = 0x8F;
+    } else {
+        return 0;
+    }
+    if (i + n > s.size()) return 0;
+    const auto b1 = static_cast<unsigned char>(s[i + 1]);
+    if (b1 < lo || b1 > hi) return 0;
+    for (std::size_t k = 2; k < n; ++k) {
+        const auto b = static_cast<unsigned char>(s[i + k]);
+        if (b < 0x80 || b > 0xBF) return 0;
+    }
+    return n;
+}
+}  // namespace
+
 void append_escaped(std::string& out, std::string_view s) {
     out.push_back('"');
-    for (const char ch : s) {
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        const char ch = s[i];
         const auto c = static_cast<unsigned char>(ch);
         switch (c) {
             case '"': out += "\\\""; break;
@@ -152,8 +211,16 @@ void append_escaped(std::string& out, std::string_view s) {
                     char buf[8];
                     std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c));
                     out += buf;
-                } else {
+                } else if (c < 0x80) {
                     out.push_back(ch);
+                } else {
+                    const std::size_t n = utf8_sequence_length(s, i);
+                    if (n == 0) {
+                        out += "\xEF\xBF\xBD";  // U+FFFD for one ill-formed byte
+                    } else {
+                        out.append(s.substr(i, n));
+                        i += n - 1;
+                    }
                 }
         }
     }
@@ -334,11 +401,13 @@ private:
 
     bool parse_object(Value& out, int depth) {
         ++pos_;  // {
-        Object obj;
+        // Collect members first and deduplicate once at the end:
+        // Object::set() per member would make parsing O(n^2) in the key count.
+        std::vector<Member> members;
         skip_ws();
         if (pos_ < text_.size() && text_[pos_] == '}') {
             ++pos_;
-            out = Value(std::move(obj));
+            out = Value(Object{});
             return true;
         }
         while (true) {
@@ -352,7 +421,7 @@ private:
             skip_ws();
             Value v;
             if (!parse_value(v, depth + 1)) return false;
-            obj.set(std::move(key), std::move(v));
+            members.emplace_back(std::move(key), std::move(v));
             skip_ws();
             if (pos_ >= text_.size()) { error_ = "unterminated object"; return false; }
             if (text_[pos_] == ',') { ++pos_; continue; }
@@ -360,7 +429,7 @@ private:
             error_ = "expected ',' or '}'";
             return false;
         }
-        out = Value(std::move(obj));
+        out = Value(Object::from_members(std::move(members)));
         return true;
     }
 
@@ -402,6 +471,19 @@ private:
             const char c = text_[pos_++];
             if (c == '"') return true;
             if (static_cast<unsigned char>(c) < 0x20) { error_ = "control character in string"; return false; }
+            if (static_cast<unsigned char>(c) >= 0x80) {
+                // Raw non-ASCII: keep well-formed UTF-8, replace each ill-formed
+                // byte with U+FFFD so parsed strings are always valid UTF-8
+                // (and parse(dump(v)) is a fixed point).
+                const std::size_t n = utf8_sequence_length(text_, pos_ - 1);
+                if (n == 0) {
+                    out += "\xEF\xBF\xBD";
+                } else {
+                    out.append(text_.substr(pos_ - 1, n));
+                    pos_ += n - 1;
+                }
+                continue;
+            }
             if (c != '\\') { out.push_back(c); continue; }
             if (pos_ >= text_.size()) break;
             const char e = text_[pos_++];
@@ -425,7 +507,10 @@ private:
                             if (lo >= 0xDC00 && lo <= 0xDFFF) {
                                 cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                             } else {
+                                // Unpaired high surrogate: replace it alone and
+                                // re-read the following escape on its own.
                                 cp = 0xFFFD;
+                                pos_ -= 6;
                             }
                         } else {
                             cp = 0xFFFD;
@@ -482,6 +567,7 @@ private:
         char* end = nullptr;
         const double d = std::strtod(token.c_str(), &end);
         if (end != token.c_str() + token.size()) { error_ = "invalid number"; return false; }
+        if (!std::isfinite(d)) { error_ = "number out of range"; return false; }
         out = Value(d);
         return true;
     }
