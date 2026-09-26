@@ -114,7 +114,7 @@ Native code is justified when:
 | --- | --- | --- |
 | `mock` | implemented; **tests only**, performs no inference | tokenization, streaming, deterministic |
 | `ollama` | implemented; loopback HTTP, streaming, cancellable | streaming, remote_process |
-| llama.cpp/GGML | not started; `SONDER_WITH_LLAMA_CPP` reserved (OFF) | - |
+| `llamacpp` | implemented, optional (`SONDER_WITH_LLAMA_CPP=ON`, pinned b11195); CPU by default, GPU via `GGML_*` | tokenization, streaming, batched_prefill, deterministic |
 
 The interface lives in `include/sonder/inference/backend.hpp`. Capabilities
 are a bitset (`Capability`), matching the list above plus `deterministic`

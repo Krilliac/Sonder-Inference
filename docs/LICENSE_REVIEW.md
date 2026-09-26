@@ -47,15 +47,36 @@ No license conclusions from the initial broad web sweep are considered authorita
 - approved: yes (test-only)
 
 ### llama.cpp / GGML
-- repository: https://github.com/ggml-org/llama.cpp
-- revision/tag: not pinned yet
-- evaluated: 2026-09-26 (preliminary)
-- license: MIT at `master` (Copyright (c) 2023-2026 The ggml authors); must be re-read at the adopted revision together with vendored subcomponents
-- intended use: first direct native backend (ADR-003)
-- linkage/process boundary: planned static or shared linking behind the `SONDER_WITH_LLAMA_CPP` CMake option (reserved, OFF, currently a configure error)
-- notices required: to be determined at adoption
-- security/maintenance notes: fast-moving API; pin a tag and wrap it behind the backend interface
-- approved: **no** (deferred; nothing is fetched, vendored, or linked yet)
+- repository: https://github.com/ggml-org/llama.cpp (ggml vendored in-tree under `ggml/`)
+- revision/tag: `b11195` (commit `d834d44e643681f7b046a22d357335f6f4ff6107`); fetched by
+  CMake FetchContent from the GitHub tag tarball, SHA-256
+  `d9818b7786c8a3b063bac7eb7dc8710e275638f1e288e206720c9e22e7ca216a`
+- evaluated: 2026-09-26
+- license: MIT ("Copyright (c) 2023-2026 The ggml authors"), top-level `LICENSE` at that tag;
+  ggml has no separate license file in-tree (covered by the same MIT license)
+- intended use: first native execution backend (`src/backends/llamacpp`), optional,
+  `SONDER_WITH_LLAMA_CPP=OFF` by default
+- linkage/process boundary: in-process static linking of `llama` and `ggml` (+ ggml-cpu)
+  libraries built from source; no llama.cpp code copied into this repository
+- subdependencies: only the `llama`, `ggml`, `ggml-base` and `ggml-cpu` archives are built
+  and linked (`llama` links only `ggml`). llama.cpp's `vendor/` (nlohmann/json MIT,
+  miniaudio, stb, sheredom, hash libs; cpp-httplib skipped) is configured but not
+  compiled into or linked with those archives, with
+  `LLAMA_BUILD_COMMON/TOOLS/SERVER/EXAMPLES/TESTS=OFF` and `LLAMA_OPENSSL=OFF`. ggml uses the toolchain's OpenMP
+  runtime when available (libgomp: GPL-3.0 with GCC Runtime Library Exception; MSVC vcomp:
+  Visual C++ redistributable terms); set `GGML_OPENMP=OFF` to avoid it. Optional accelerator
+  backends (CUDA, Vulkan, Metal, ...) are off unless enabled and bring their SDK terms
+- notices required: include the llama.cpp MIT license text and copyright notice in any binary
+  distribution that contains the statically linked libraries
+- model weights: separate from engine licensing; no weights are committed. Test models are
+  supplied at runtime via `SONDER_TEST_GGUF` and carry their own licenses (the tinyllamas
+  stories models used for local verification come from karpathy/llama2.c, MIT)
+- security/maintenance notes: fast-moving upstream (tagged builds several times a day); pin is
+  bumped deliberately by changing tag + SHA-256 together in `src/backends/llamacpp/CMakeLists.txt`.
+  GGUF files are untrusted input parsed by llama.cpp; load only trusted model files.
+  GitHub tag tarballs are pinned by hash; if GitHub regenerates an archive the hash check fails
+  closed (update hash after verifying the tag commit)
+- approved: pending lead/Nate sign-off
 
 ### Ollama (process boundary only)
 - repository: https://github.com/ollama/ollama
