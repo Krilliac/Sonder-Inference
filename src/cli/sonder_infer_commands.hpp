@@ -36,8 +36,8 @@ inline OptionGroup ollama_options() {
     return {"Ollama",
             {{"ollama-url", OptionKind::value, "URL", "Ollama base URL (default http://127.0.0.1:11434)"},
              {"ollama-allow-remote", OptionKind::flag, "",
-              "allow a non-loopback Ollama host (warns; remote hosts need https://,\n"
-              "which needs a SONDER_WITH_TLS=ON build)"}}};
+              "allow a non-loopback Ollama host, https:// only (warns;\n"
+              "plain http:// is refused; https:// needs SONDER_WITH_TLS=ON)"}}};
 }
 
 inline OptionGroup backend_options() {
@@ -47,8 +47,8 @@ inline OptionGroup backend_options() {
               "model id (env SONDER_INFER_MODEL; the mock backend defaults to 'mock')"},
              {"ollama-url", OptionKind::value, "URL", "Ollama base URL (env SONDER_OLLAMA_URL, then OLLAMA_HOST)"},
              {"ollama-allow-remote", OptionKind::flag, "",
-              "allow a non-loopback Ollama host (warns; remote hosts need https://,\n"
-              "which needs a SONDER_WITH_TLS=ON build)"},
+              "allow a non-loopback Ollama host, https:// only (warns;\n"
+              "plain http:// is refused; https:// needs SONDER_WITH_TLS=ON)"},
              {"mock-delay-ms", OptionKind::value, "N", "mock backend per-token delay, 0 to 60000 (default 0)"}}};
 }
 
@@ -87,7 +87,10 @@ inline OptionGroup correlation_options() {
               "interactive_user | owner_orchestrator | critic_verification |\n"
               "implementation_worker | research_worker | background_indexing |\n"
               "maintenance (default implementation_worker)"},
-             {"priority", OptionKind::value, "N", "-16 to 16; positive runs sooner within the class (default 0)"}}};
+             {"priority", OptionKind::value, "N",
+              "-16 to 16 (default 0); effective rank = class rank - N\n"
+              "(classes rank 0-6 in the order above; lower runs sooner),\n"
+              "so N can move a request past other classes"}}};
 }
 
 inline OptionGroup stats_output_options() {

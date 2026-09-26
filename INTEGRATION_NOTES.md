@@ -153,12 +153,34 @@ merging, because the dispatch now exists:
 
 - `sonder-bench` keeps exit codes 3 (backend unreachable, load failed) and 4
   (`--require-idle` refused) rather than 1; see docs/CLI.md.
-- `--ollama-allow-remote` cannot reach a remote host in the default build:
-  plain `http://` to non-loopback hosts is refused and `https://` needs
+- `--ollama-allow-remote` and plain HTTP: the Ollama client
+  (`src/backends/ollama/ollama_client.cpp` `make_request()`) checks only the
+  host once `allow_remote` is set, so on its own it would send prompts over
+  plain `http://` to a remote host. The CLI now refuses that combination with
+  exit 2 for every command (`resolve_backend()`, and a pre-check in
+  `cmd_serve()` before `serve_main()` runs), using
+  `cli::is_plain_http_remote()` (unit-tested against `net::parse_url()` and
+  `net::is_loopback_host()`). Direct library users of
+  `OllamaBackendOptions::allow_remote` or `BackendSetup` are not covered.
+  Owners of the Ollama module and `src/server` should decide whether
+  `make_request()` (or `make_backend()`) enforces "https:// only for remote
+  hosts" itself; both are outside this lane. `https://` needs
   `SONDER_WITH_TLS=ON`, which root CMake does not include
-  (`cmake/SonderTls.cmake` is not wired). The flag warns and is documented as
-  such.
-- The Windows paths of the CLI (`_isatty`, CRLF output in the CTest driver)
-  are written for MSVC but were not run in the Linux container; the
-  `ci-windows` job must pass. The `serve` part of the CI smoke runs on Linux
+  (`cmake/SonderTls.cmake` is not wired), so the default build cannot reach a
+  remote host at all.
+- `serve` keeps its own parser (`src/server/src/serve_main.cpp`; this lane
+  used its one allowed edit for the shared unknown-option wording). Its other
+  errors have no `serve:` prefix and its numeric errors do not echo the bad
+  value (`--port must be an integer from 0 to 65535`). `--help` now wins for
+  `serve` as for the other commands because `cmd_serve()` checks for it
+  first. Aligning the remaining messages is left to the server module's
+  owner; docs/CLI.md "Option syntax" records the difference.
+- `run_chat_repl()` keeps its signature but forwards to `run_chat_session()`,
+  so it inherits that loop's commands and EOF handling: unknown `/word`
+  lines are rejected instead of sent, commands match on the first word
+  (`/exit now` exits), and EOF with a pending prompt prints a newline.
+- The Windows paths of the CLI (`_isatty`, enabling
+  `ENABLE_VIRTUAL_TERMINAL_PROCESSING` for colored REPL labels, CRLF output
+  in the CTest driver) are written for MSVC but were not run in the Linux
+  container; the `ci-windows` job must pass. The `serve` part of the CI smoke runs on Linux
   only (signal delivery from Git Bash to a native process is not reliable).

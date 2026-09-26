@@ -17,9 +17,11 @@
 #include "cli/cli_spec.hpp"
 #include "cli/cli_values.hpp"
 #include "cli/sonder_infer_commands.hpp"
+#include "net/http_client.hpp"
 #include "sonder/inference.hpp"
 
 using namespace sonder::inference;
+namespace net = sonder::inference::net;
 namespace cli = sonder::cli;
 
 namespace {
@@ -267,7 +269,15 @@ TEST_CASE("cli values: checked numbers") {
     CHECK(d == doctest::Approx(0.7));
     CHECK(cli::parse_number("temperature", "-2", -inf, inf, d, error));
     CHECK(cli::parse_number("temperature", "1e-3", -inf, inf, d, error));
-    for (const char* bad : {"", "abc", "0.5x", " 1", "nan", "inf", "-inf", "1e999"}) {
+    CHECK(cli::parse_number("temperature", ".5", -inf, inf, d, error));
+    CHECK(d == doctest::Approx(0.5));
+    CHECK(cli::parse_number("temperature", "5.", -inf, inf, d, error));
+    CHECK(cli::parse_number("temperature", "2E+1", -inf, inf, d, error));
+    CHECK(d == doctest::Approx(20.0));
+    // Only plain decimal syntax: no leading '+' (parse_integer rejects it
+    // too), no hex floats, no bare dot or dangling exponent.
+    for (const char* bad : {"", "abc", "0.5x", " 1", "1 ", "nan", "inf", "-inf", "1e999", "+0.5", "+1", "0x0.8p0",
+                            "0X1", "-0x1p-1", ".", "-", "1e", "1e+", "e5", "--1", "1.2.3"}) {
         CAPTURE(bad);
         CHECK_FALSE(cli::parse_number("top-p", bad, -inf, inf, d, error));
         CHECK(error == "invalid value '" + std::string(bad) + "' for --top-p (expected a number)");
@@ -427,6 +437,34 @@ TEST_CASE("cli env: OLLAMA_HOST forms, shared and local implementations agree") 
         CHECK(shared.backend == local.backend);
         CHECK(shared.model == local.model);
         CHECK(shared.ollama_url == local.ollama_url);
+    }
+}
+
+TEST_CASE("cli env: --ollama-allow-remote refuses plain http to remote hosts") {
+    CHECK(cli::is_plain_http_remote("http://192.0.2.1:11434"));
+    CHECK(cli::is_plain_http_remote("http://192.0.2.1"));
+    CHECK(cli::is_plain_http_remote("HTTP://ollama.example:11434/base"));
+    CHECK(cli::is_plain_http_remote("http://[2001:db8::1]:11434"));
+    CHECK(cli::is_plain_http_remote("http://LOCALHOST:11434"));  // the client's loopback test is case-sensitive
+    CHECK(cli::is_plain_http_remote("http://0.0.0.0:11434"));
+    CHECK_FALSE(cli::is_plain_http_remote("https://ollama.example"));
+    CHECK_FALSE(cli::is_plain_http_remote("http://127.0.0.1:11434"));
+    CHECK_FALSE(cli::is_plain_http_remote("http://127.1.2.3"));
+    CHECK_FALSE(cli::is_plain_http_remote("http://localhost:11434/"));
+    CHECK_FALSE(cli::is_plain_http_remote("http://[::1]:11434"));
+    CHECK_FALSE(cli::is_plain_http_remote(""));
+    CHECK_FALSE(cli::is_plain_http_remote("192.0.2.1:11434"));  // no scheme: the client rejects it
+    CHECK_FALSE(cli::is_plain_http_remote("http://"));
+    CHECK_FALSE(cli::is_plain_http_remote("http://[::1"));
+    // Agrees with the Ollama client's own URL parser and loopback test for
+    // every http:// URL the client accepts.
+    for (const char* url : {"http://192.0.2.1:11434", "http://ollama.example/x/", "http://[2001:db8::1]:1",
+                            "http://LOCALHOST", "http://127.0.0.1:11434", "http://localhost", "http://[::1]:11434",
+                            "http://127.9.9.9:80/api", "HTTP://10.0.0.1", "http://0.0.0.0"}) {
+        CAPTURE(url);
+        auto parsed = net::parse_url(url);
+        REQUIRE(parsed.ok());
+        CHECK(cli::is_plain_http_remote(url) == !net::is_loopback_host(parsed.value().host));
     }
 }
 

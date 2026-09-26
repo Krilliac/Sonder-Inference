@@ -134,10 +134,16 @@ The CLI reference is now [docs/CLI.md](../CLI.md). Changes to `chat`:
   `/stats` (session totals and the last turn's stats), `//text` to send a
   leading `/`, and rejects any other `/word` without sending it. Role labels
   (`you> `, `assistant> `) appear on a terminal, colored only when stdout is
-  a terminal and `NO_COLOR` is unset. With piped stdin there is no input
+  a terminal that takes ANSI sequences (on Windows the CLI switches on
+  virtual-terminal processing and leaves colors off if that fails) and
+  `NO_COLOR` is unset. With piped stdin there is no input
   prompt, and the output never ends in a dangling prompt. A cancelled turn
   (Ctrl-C) drops the user message and the partial reply; the REPL continues.
-  `run_chat_repl()` keeps its signature and behaviour for existing callers.
+  `run_chat_repl()` keeps its signature, but it now forwards to
+  `run_chat_session()`, so its commands and EOF handling follow that loop:
+  a `/word` line other than the known commands is rejected instead of sent,
+  commands match on the first word (`/exit now` exits), and EOF with a
+  pending prompt prints a newline.
 - **Stats.** One-shot chat prints
   `[sonder-infer] chat native=no messages=4 outcome=completed stop=... ` by
   default; `--stats json` prints one JSON object instead, and the REPL prints

@@ -24,7 +24,8 @@ The HTTP server started by `sonder-infer serve` has its own reference:
 | `help` | `help` prints the overview; `help <command>` prints that command's options and examples. |
 
 `sonder-infer <command> --help` (or `-h`) is the same as `help <command>`
-and wins over any other argument on the line. A bare `sonder-infer` prints the
+and wins over any other argument on the line (for `serve` too: the CLI checks
+for `--help` before handing the arguments to the server's parser). A bare `sonder-infer` prints the
 short command list on stderr and exits 2; so does an unknown command, with a
 did-you-mean suggestion (`genrate` → `generate`).
 
@@ -41,9 +42,16 @@ did-you-mean suggestion (`genrate` → `generate`).
   substitutions or adjacent transpositions):
   `error: generate: unknown option --max-token (did you mean --max-tokens?)`.
 - Positional arguments are rejected (`help <command>` is the only one).
-- Numbers are parsed strictly: the whole value must be a decimal number (no
-  whitespace, no trailing characters, no `inf`/`nan`), and errors name the
-  flag and the value: `invalid value 'abc' for --top-p (expected a number)`.
+- `serve` keeps its own argument parser (`src/server/src/serve_main.cpp`,
+  owned by the server module). It shares the unknown-option wording and
+  did-you-mean suggestion, but its other errors have no `serve:` prefix and
+  its numeric errors state the valid range without echoing the bad value
+  (`--port must be an integer from 0 to 65535`).
+- Numbers are parsed strictly: the whole value must be a plain decimal
+  number, optionally with a leading `-` and an exponent (`0.5`, `-2`, `.5`,
+  `1e-3`). There is no leading `+`, no whitespace, no trailing characters, no
+  hex (`0x0.8p0`) and no `inf`/`nan`. Errors name the flag and the value:
+  `invalid value 'abc' for --top-p (expected a number)`.
   Semantic ranges of sampling values are then checked by `validate()` (for
   example temperature in [0, 10]). Explicit CLI ranges:
 
@@ -92,8 +100,13 @@ continues and exits 0, or 1 if any turn failed. `serve` exits 0 after a clean
 drain on SIGINT/SIGTERM (a second signal exits at once), 1 on a runtime error
 such as a port in use, and 2 on a usage error.
 
-These codes are enforced by the `sonder.cli.*` CTest cases
-(`tests/CMakeLists.txt`, driver `tests/cli_expect.cmake`).
+The `sonder.cli.*` CTest cases (`tests/CMakeLists.txt`, driver
+`tests/cli_expect.cmake`) check the exact exit code of each command they run:
+0, 1 and 2 across the commands, and 130 for `generate` interrupted with
+SIGINT (`sonder.cli.generate_sigint_exit_130`, POSIX only). The mapping of a
+cancelled request to 130 is also unit-tested (`exit_code_for()`). `backends`
+exiting 1 when no backend is available has no CTest case: every build
+includes the mock backend, so that state cannot be produced.
 
 ## Backends
 
@@ -112,10 +125,17 @@ These codes are enforced by the `sonder.cli.*` CTest cases
   `SONDER_WITH_LLAMA_CPP=ON`; `--model` is a GGUF path.
 
 `--ollama-allow-remote` maps to `OllamaBackendOptions::allow_remote` and
-always prints a warning (also with `--quiet`). Plain `http://` to a
-non-loopback host is still refused, and `https://` needs a
-`SONDER_WITH_TLS=ON` build, which the default build does not wire in. In the
-default build the flag therefore cannot reach a remote host.
+always prints a warning (also with `--quiet`). Prompts and replies never
+travel unencrypted to a remote host: the CLI refuses the flag with exit 2
+when the Ollama URL (from `--ollama-url`, `SONDER_OLLAMA_URL` or
+`OLLAMA_HOST`) is plain `http://` to a non-loopback host, for every command
+including `serve`:
+`error: models: --ollama-allow-remote refuses plain http:// to a non-loopback host ('http://192.0.2.1:11434'); use https:// ...`.
+The Ollama client itself only checks the host once `allow_remote` is set, so
+this refusal lives in the CLI (`cli::is_plain_http_remote()`, tested against
+the client's own URL parser). `https://` needs a `SONDER_WITH_TLS=ON` build,
+which the default build does not wire in; in the default build the flag
+therefore cannot reach a remote host.
 
 ## generate
 
@@ -151,7 +171,9 @@ Interactive (no `--messages`): every non-empty stdin line is a user message.
 
 On a terminal the REPL shows role labels (`you> ` before input, `assistant> `
 before each reply). They are colored only when stdout is a terminal, `NO_COLOR`
-is unset and `TERM` is not `dumb`. With piped stdin there is no input prompt,
+is unset and `TERM` is not `dumb`; on Windows the CLI also switches on
+virtual-terminal processing for the console and leaves colors off if that
+fails. With piped stdin there is no input prompt,
 so stdout carries only the replies, one per line; the output always ends with
 a newline, never with a dangling prompt.
 
@@ -183,7 +205,7 @@ interleave mid-line (stderr is written line by line under one lock).
 | `--agent-id ID` | `SessionOptions::agent_id`, the envelope `agent_id` |
 | `--task-id ID` | `SessionOptions::task_id`, the envelope `task_id` |
 | `--workload CLASS` | `SessionOptions::workload`: `interactive_user`, `owner_orchestrator`, `critic_verification`, `implementation_worker` (default), `research_worker`, `background_indexing`, `maintenance` |
-| `--priority N` | `SessionOptions::priority`, -16 to 16 (positive runs sooner within the class) |
+| `--priority N` | `SessionOptions::priority`, -16 to 16. The scheduler uses effective rank = class rank - N (classes rank 0 to 6 in the order listed above; lower runs sooner), so N is not confined to the class: `--workload maintenance --priority 16` gives rank -10 and runs ahead of `interactive_user` work. |
 
 IDs use the same format as the serve API's `X-Sonder-*` headers:
 `[A-Za-z0-9._:-]{1,128}`. `request.queued` carries `workload` and `priority`

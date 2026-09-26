@@ -14,6 +14,8 @@
 // tests/test_cli_spec.cpp checks that both agree.
 #pragma once
 
+#include <cctype>
+#include <cstddef>
 #include <cstdlib>
 #include <functional>
 #include <optional>
@@ -113,6 +115,37 @@ inline EnvDefaults read_env_defaults(const EnvLookup& lookup = {}) {
 #else
     return detail::read_env_defaults_local(lookup);
 #endif
+}
+
+// --ollama-allow-remote policy: prompts never travel over plain HTTP to a
+// remote host. True when `url` is an http:// URL (scheme case-insensitive)
+// whose host is not loopback; https:// and loopback hosts return false.
+// Host extraction and the loopback rule mirror the Ollama client
+// (net::parse_url() and net::is_loopback_host() in src/net/http_client.cpp):
+// "localhost", "::1" and any host starting with "127.". URLs the client
+// rejects anyway (no scheme, no host, an unterminated IPv6 literal) return
+// false so the client's own error is reported.
+// tests/test_cli_spec.cpp checks this agrees with the client's functions.
+inline bool is_plain_http_remote(std::string_view url) {
+    const auto scheme_end = url.find("://");
+    if (scheme_end == std::string_view::npos || scheme_end != 4) return false;
+    for (std::size_t i = 0; i < 4; ++i) {
+        const char c = static_cast<char>(std::tolower(static_cast<unsigned char>(url[i])));
+        if (c != "http"[i]) return false;
+    }
+    std::string_view authority = url.substr(scheme_end + 3);
+    authority = authority.substr(0, authority.find('/'));
+    std::string_view host;
+    if (!authority.empty() && authority.front() == '[') {
+        const auto close = authority.find(']');
+        if (close == std::string_view::npos) return false;  // the client rejects it
+        host = authority.substr(1, close - 1);
+    } else {
+        host = authority.substr(0, authority.rfind(':'));
+    }
+    if (host.empty()) return false;  // the client rejects it ("URL has no host")
+    const bool loopback = host == "localhost" || host == "::1" || host.rfind("127.", 0) == 0;
+    return !loopback;
 }
 
 // Colored REPL labels: only on a terminal, never when NO_COLOR is set to a

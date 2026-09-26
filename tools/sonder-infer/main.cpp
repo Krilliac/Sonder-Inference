@@ -14,6 +14,7 @@
 #include <optional>
 #include <streambuf>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -46,6 +47,19 @@
 #endif
 #if defined(SONDER_HAS_BENCH)
 #include "sonder/inference/benchmark.hpp"
+#endif
+// After the Sonder headers, so Windows macros cannot reach them.
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
 #endif
 
 namespace si = sonder::inference;
@@ -130,27 +144,46 @@ bool stdout_is_terminal() {
 #endif
 }
 
+// ANSI colors need a terminal that interprets escape sequences. Windows
+// consoles (conhost) do so only with ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+// which is switched on here; if that fails, colors stay off.
+bool stdout_supports_ansi() {
+#if defined(_WIN32)
+    const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (out == nullptr || out == INVALID_HANDLE_VALUE) return false;
+    DWORD mode = 0;
+    if (GetConsoleMode(out, &mode) == 0) return false;
+    if ((mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0) return true;
+    return SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
+#else
+    return true;
+#endif
+}
+
 bool is_mock_backend(std::string_view name) { return name == si::kMockBackendName; }
 
 // ---------------------------------------------------------------------------
-// Ctrl-C: the signal handler only sets a lock-free flag (async-signal-safe); a
-// watcher thread turns it into a cancel callback (Session::cancel()).
+// Ctrl-C: the signal handler only sets a lock-free atomic flag
+// (async-signal-safe, and no data race with the watcher thread); a watcher
+// thread turns it into a cancel callback (Session::cancel()). The flag stays
+// latched for the watcher's lifetime (one request or chat turn) and the
+// callback is repeated on every poll: Session::cancel() is a no-op until the
+// request is active, so a Ctrl-C that arrives just before the request starts
+// still cancels it. Repeated cancels of the same request are harmless.
 // ---------------------------------------------------------------------------
-volatile std::sig_atomic_t g_interrupted = 0;
+std::atomic<int> g_interrupted{0};
+static_assert(std::atomic<int>::is_always_lock_free, "the Ctrl-C flag must be lock-free");
 
-extern "C" void on_sigint(int) { g_interrupted = 1; }
+extern "C" void on_sigint(int) { g_interrupted.store(1); }
 
 class InterruptWatcher {
 public:
     explicit InterruptWatcher(std::function<void()> on_interrupt) : on_interrupt_(std::move(on_interrupt)) {
-        g_interrupted = 0;
+        g_interrupted.store(0);
         std::signal(SIGINT, on_sigint);
         thread_ = std::thread([this] {
             while (!done_.load()) {
-                if (g_interrupted != 0) {
-                    on_interrupt_();
-                    g_interrupted = 0;
-                }
+                if (g_interrupted.load() != 0) on_interrupt_();
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
         });
@@ -238,6 +271,15 @@ bool check_backend_name(std::string_view command, const std::string& name, int& 
     return false;
 }
 
+// --ollama-allow-remote never permits plain HTTP: prompts and replies would
+// cross the network unencrypted. A remote Ollama host must use https://.
+bool check_ollama_remote_url(std::string_view command, const std::string& url, int& rc) {
+    if (!cli::is_plain_http_remote(url)) return true;
+    rc = usage_error(command, "--ollama-allow-remote refuses plain http:// to a non-loopback host ('" + url +
+                                  "'); use https:// (needs a SONDER_WITH_TLS=ON build)");
+    return false;
+}
+
 // Resolves --backend/--model/--ollama-url from flags, then the environment.
 bool resolve_backend(std::string_view command, const Args& a, const cli::EnvDefaults& env, bool need_backend,
                      bool need_model, BackendChoice& out, int& rc) {
@@ -272,9 +314,10 @@ bool resolve_backend(std::string_view command, const Args& a, const cli::EnvDefa
         }
     }
     if (out.ollama_allow_remote) {
+        if (!check_ollama_remote_url(command, out.ollama_url, rc)) return false;
         // Security-relevant: printed even with --quiet.
-        err() << "warning: --ollama-allow-remote: prompts may go to a non-loopback Ollama host; plain http:// "
-                 "to such hosts is still refused and https:// needs a SONDER_WITH_TLS=ON build\n";
+        err() << "warning: --ollama-allow-remote: prompts may go to a non-loopback Ollama host (https:// only, "
+                 "which needs a SONDER_WITH_TLS=ON build)\n";
     }
     return true;
 }
@@ -795,7 +838,7 @@ int cmd_chat(const Args& a, const cli::EnvDefaults& env) {
     ro.system = system;
     ro.user_prompt = interactive ? "you> " : "";
     ro.assistant_label = interactive || terminal_out ? "assistant> " : "";
-    ro.color = cli::color_enabled(terminal_out);
+    ro.color = cli::color_enabled(terminal_out) && stdout_supports_ansi();
     ro.stats = stats_mode;
     return cli::run_chat_session(std::cin, std::cout, err(), ro, turn);
 }
@@ -867,8 +910,43 @@ int cmd_bench(const Args& a, const cli::EnvDefaults& env) {
 }
 #endif
 
+bool wants_help(const std::vector<std::string>& args) {
+    for (const auto& a : args) {
+        if (a == "--help" || a == "-h") return true;
+    }
+    return false;
+}
+
+#if defined(SONDER_HAS_SERVER)
+// The --ollama-allow-remote plain-HTTP refusal for serve, checked before
+// serve_main() runs (src/server is outside this lane). Serve's parser takes
+// "--ollama-url URL" and "--ollama-url=URL"; the environment fills in the
+// URL as it does for serve (backend_env_defaults()).
+bool serve_ollama_remote_ok(const std::vector<std::string>& args, int& rc) {
+    bool allow_remote = false;
+    std::optional<std::string> url;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string& arg = args[i];
+        if (arg == "--ollama-allow-remote") {
+            allow_remote = true;
+        } else if (arg == "--ollama-url" && i + 1 < args.size()) {
+            url = args[++i];
+        } else if (arg.rfind("--ollama-url=", 0) == 0) {
+            url = arg.substr(std::string_view("--ollama-url=").size());
+        }
+    }
+    if (!allow_remote) return true;
+    if (!url) url = cli::read_env_defaults().ollama_url;
+    return check_ollama_remote_url("serve", url.value_or(""), rc);
+}
+#endif
+
 int cmd_serve(const std::vector<std::string>& args) {
 #if defined(SONDER_HAS_SERVER)
+    // --help wins over any other argument, as for the other commands.
+    if (wants_help(args)) return si::server::serve_main({"--help"}, std::cout, std::cerr);
+    int rc = cli::kExitOk;
+    if (!serve_ollama_remote_ok(args, rc)) return rc;
     return si::server::serve_main(args, std::cout, std::cerr);
 #else
     (void)args;
@@ -898,13 +976,6 @@ int cmd_help(const std::vector<std::string>& args) {
     if (auto s = cli::suggest(name, cli::command_names())) message += " (did you mean '" + *s + "'?)";
     err() << "error: help: " << message << "\n\n" << cli::short_usage();
     return cli::kExitUsage;
-}
-
-bool wants_help(const std::vector<std::string>& args) {
-    for (const auto& a : args) {
-        if (a == "--help" || a == "-h") return true;
-    }
-    return false;
 }
 
 }  // namespace

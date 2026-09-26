@@ -5,7 +5,8 @@
 #
 # Variables:
 #   EXPECT_RC            required exit code (e.g. 0, 1, 2)
-#   STDIN_FILE           file fed to stdin (default: empty stdin)
+#   STDIN_FILE           file fed to stdin (default: an empty file, so the
+#                        child never inherits ctest's stdin)
 #   STDOUT_REGEX         stdout must match (CMake regex)
 #   STDERR_REGEX         stderr must match
 #   STDOUT_NOT_REGEX     stdout must not match
@@ -18,6 +19,10 @@
 #                        removed before the run so stale output never passes
 #   JSONL_FILE_REGEX     JSONL_FILE content must match
 #   JSONL_FILE_REGEX2    second pattern JSONL_FILE content must match
+#   JSONL_FILE_COUNT_REGEX, JSONL_FILE_COUNT
+#                        JSONL_FILE must contain exactly JSONL_FILE_COUNT
+#                        matches of JSONL_FILE_COUNT_REGEX (the pattern must
+#                        not match a ';')
 #
 # In every *_REGEX value the two characters "\n" stand for a newline (CMake
 # regular expressions have no newline escape), so "[^\n]*" stays on one line.
@@ -45,23 +50,32 @@ endif()
 if(JSONL_FILE)
     file(REMOVE "${JSONL_FILE}")
 endif()
-foreach(var STDOUT_REGEX STDERR_REGEX STDOUT_NOT_REGEX STDERR_NOT_REGEX JSONL_FILE_REGEX JSONL_FILE_REGEX2)
+foreach(var STDOUT_REGEX STDERR_REGEX STDOUT_NOT_REGEX STDERR_NOT_REGEX JSONL_FILE_REGEX JSONL_FILE_REGEX2
+            JSONL_FILE_COUNT_REGEX)
     if(DEFINED ${var})
         string(REPLACE "\\n" "\n" ${var} "${${var}}")
     endif()
 endforeach()
 
-set(input_args)
-if(STDIN_FILE)
-    set(input_args INPUT_FILE "${STDIN_FILE}")
+# execute_process() inherits this process's stdin unless INPUT_FILE is set;
+# a unique empty file keeps parallel tests independent.
+set(empty_stdin)
+if(NOT STDIN_FILE)
+    string(RANDOM LENGTH 16 token)
+    set(empty_stdin "${CMAKE_CURRENT_BINARY_DIR}/cli_expect_stdin_${token}.txt")
+    file(WRITE "${empty_stdin}" "")
+    set(STDIN_FILE "${empty_stdin}")
 endif()
 execute_process(
     COMMAND ${command}
-    ${input_args}
+    INPUT_FILE "${STDIN_FILE}"
     RESULT_VARIABLE rc
     OUTPUT_VARIABLE out
     ERROR_VARIABLE err
     TIMEOUT 60)
+if(empty_stdin)
+    file(REMOVE "${empty_stdin}")
+endif()
 
 # Windows text-mode streams write CRLF; patterns are written for LF.
 string(REPLACE "\r\n" "\n" out "${out}")
@@ -168,6 +182,13 @@ if(JSONL_FILE)
         endif()
         if(DEFINED JSONL_FILE_REGEX2 AND NOT jsonl MATCHES "${JSONL_FILE_REGEX2}")
             fail("${JSONL_FILE} does not match '${JSONL_FILE_REGEX2}'")
+        endif()
+        if(DEFINED JSONL_FILE_COUNT_REGEX)
+            string(REGEX MATCHALL "${JSONL_FILE_COUNT_REGEX}" matches "${jsonl}")
+            list(LENGTH matches match_count)
+            if(NOT match_count EQUAL "${JSONL_FILE_COUNT}")
+                fail("${JSONL_FILE} has ${match_count} matches of '${JSONL_FILE_COUNT_REGEX}', expected ${JSONL_FILE_COUNT}")
+            endif()
         endif()
     endif()
 endif()

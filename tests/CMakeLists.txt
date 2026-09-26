@@ -43,21 +43,22 @@ if(SONDER_BUILD_CLI)
     # sonder_cli_test(<name> RC <code> COMMAND <exe> <args>... [ENV VAR=value...]
     #                 [STDIN file] [STDOUT_REGEX re] [STDERR_REGEX re] [STDOUT_NOT_REGEX re]
     #                 [STDERR_NOT_REGEX re] [STDOUT_JSON] [STDERR_JSON] [STDERR_JSONL]
-    #                 [JSONL_FILE path [JSONL_FILE_REGEX re] [JSONL_FILE_REGEX2 re]])
+    #                 [JSONL_FILE path [JSONL_FILE_REGEX re] [JSONL_FILE_REGEX2 re]
+    #                  [JSONL_FILE_COUNT_REGEX re JSONL_FILE_COUNT n]])
     # Runs the command through cli_expect.cmake, which checks the exact exit
     # code (docs/CLI.md "Exit codes") and the output. The Sonder environment
     # defaults are cleared unless ENV sets them, so a developer's shell never
     # changes the result.
     function(sonder_cli_test name)
         cmake_parse_arguments(T "STDOUT_JSON;STDERR_JSON;STDERR_JSONL"
-            "RC;STDIN;STDOUT_REGEX;STDERR_REGEX;STDOUT_NOT_REGEX;STDERR_NOT_REGEX;JSONL_FILE;JSONL_FILE_REGEX;JSONL_FILE_REGEX2"
+            "RC;STDIN;STDOUT_REGEX;STDERR_REGEX;STDOUT_NOT_REGEX;STDERR_NOT_REGEX;JSONL_FILE;JSONL_FILE_REGEX;JSONL_FILE_REGEX2;JSONL_FILE_COUNT_REGEX;JSONL_FILE_COUNT"
             "ENV;COMMAND" ${ARGN})
         set(defs "-DEXPECT_RC=${T_RC}")
         if(T_STDIN)
             list(APPEND defs "-DSTDIN_FILE=${T_STDIN}")
         endif()
         foreach(var STDOUT_REGEX STDERR_REGEX STDOUT_NOT_REGEX STDERR_NOT_REGEX JSONL_FILE JSONL_FILE_REGEX
-                    JSONL_FILE_REGEX2)
+                    JSONL_FILE_REGEX2 JSONL_FILE_COUNT_REGEX JSONL_FILE_COUNT)
             if(DEFINED T_${var})
                 list(APPEND defs "-D${var}=${T_${var}}")
             endif()
@@ -244,6 +245,33 @@ if(SONDER_BUILD_CLI)
             ENV OLLAMA_HOST=127.0.0.1:9 COMMAND ${infer} backends --ollama-url http://127.0.0.1:8)
         sonder_cli_test(ollama_unreachable_hint RC 1 STDERR_REGEX "hint: Ollama is not reachable"
             COMMAND ${infer} models --backend ollama --ollama-url http://127.0.0.1:9)
+        # --ollama-allow-remote never permits plain http:// to a remote host
+        # (192.0.2.1 is TEST-NET-1; the check fires before any connection).
+        sonder_cli_test(ollama_remote_plain_http RC 2
+            STDERR_REGEX "--ollama-allow-remote refuses plain http:// to a non-loopback host"
+            COMMAND ${infer} models --backend ollama --ollama-url http://192.0.2.1:11434 --ollama-allow-remote)
+        sonder_cli_test(ollama_remote_plain_http_env RC 2 STDERR_REGEX "refuses plain http://"
+            ENV OLLAMA_HOST=192.0.2.1:11434 COMMAND ${infer} models --backend ollama --ollama-allow-remote)
+        # A loopback URL is still allowed with the flag (warning, then the
+        # usual unreachable error).
+        sonder_cli_test(ollama_allow_remote_loopback RC 1
+            STDERR_REGEX "warning: --ollama-allow-remote.*https:// only.*hint: Ollama is not reachable"
+            COMMAND ${infer} models --backend ollama --ollama-url http://127.0.0.1:9 --ollama-allow-remote)
+    endif()
+    sonder_cli_test(allow_remote_plain_http_any_backend RC 2 STDERR_REGEX "error: generate: --ollama-allow-remote refuses"
+        COMMAND ${infer} generate ${mock} --prompt hi --ollama-url http://192.0.2.1 --ollama-allow-remote)
+
+    # --- Ctrl-C: exit 130 (POSIX shells only; SIGINT from a script) -----------
+    # The stats line proves the handler cancelled the request: a process
+    # killed by the default SIGINT action would also show status 130.
+    if(UNIX)
+        add_test(NAME sonder.cli.generate_sigint_exit_130
+            COMMAND sh -c "\"$1\" generate --backend mock --model mock:tiny --prompt hi --max-tokens 16 \
+--mock-delay-ms 500 >/dev/null 2>\"$2\" & p=$!; sleep 1; kill -INT $p; wait $p; rc=$?; \
+test $rc -eq 130 || { echo \"exit $rc, expected 130\"; exit 1; }; \
+grep -q 'outcome=cancelled' \"$2\" || { echo 'no outcome=cancelled stats line'; cat \"$2\"; exit 1; }"
+                sh $<TARGET_FILE:sonder-infer> "${CMAKE_CURRENT_BINARY_DIR}/cli-sigint.err")
+        set_tests_properties(sonder.cli.generate_sigint_exit_130 PROPERTIES TIMEOUT 60)
     endif()
 
     # --- Chat through Session::chat (request telemetry) ---------------------
@@ -252,12 +280,16 @@ if(SONDER_BUILD_CLI)
         JSONL_FILE_REGEX "\"event_type\":\"request.queued\"[^\\n]*\"attributes\":\\{\"kind\":\"chat\""
         JSONL_FILE_REGEX2 "\"event_type\":\"request.completed\""
         COMMAND ${infer} chat ${mock} --messages "${chat_fixture}" --telemetry "${CMAKE_CURRENT_BINARY_DIR}/cli-chat.jsonl")
+    # The fixture sends two turns ("hello sonder" and "//not a command", sent
+    # as "/not a command"), then /exit; the "never sent" line after /exit
+    # would be a third request.completed. Piped stdin gets no prompt, so the
+    # dangling-prompt fix is covered by tests/test_cli_repl.cpp.
     sonder_cli_test(chat_repl RC 0 STDIN "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/chat_repl_input.txt"
         STDOUT_REGEX "turns=1 failed=0 cancelled=0.*/stats +last turn and session totals"
-        STDOUT_NOT_REGEX "never sent|> $"
         JSONL_FILE "${CMAKE_CURRENT_BINARY_DIR}/cli-chat-repl.jsonl"
         JSONL_FILE_REGEX "\"event_type\":\"request.queued\"[^\\n]*\"kind\":\"chat\""
         JSONL_FILE_REGEX2 "\"event_type\":\"request.completed\""
+        JSONL_FILE_COUNT_REGEX "\"event_type\":\"request.completed\"" JSONL_FILE_COUNT 2
         COMMAND ${infer} chat ${mock} --telemetry "${CMAKE_CURRENT_BINARY_DIR}/cli-chat-repl.jsonl")
     sonder_cli_test(chat_repl_stats_json RC 0 STDIN "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/chat_repl_input.txt"
         STDERR_JSONL STDERR_REGEX "\"turn\":2"
@@ -297,6 +329,13 @@ if(SONDER_BUILD_CLI)
             COMMAND ${infer} serve --backend mock --port 99999)
         sonder_cli_test(serve_remote_needs_token RC 2 STDERR_REGEX "token"
             COMMAND ${infer} serve --backend mock --host 0.0.0.0 --port 0)
+        sonder_cli_test(serve_help_wins RC 0 STDOUT_REGEX "sonder-infer serve - local HTTP API"
+            COMMAND ${infer} serve --bogus --help)
+        sonder_cli_test(serve_remote_plain_http RC 2 STDERR_REGEX "error: serve: --ollama-allow-remote refuses plain http://"
+            COMMAND ${infer} serve --backend mock --port 0 --ollama-url=http://192.0.2.1 --ollama-allow-remote)
+        sonder_cli_test(serve_remote_plain_http_env RC 2 STDERR_REGEX "refuses plain http://"
+            ENV SONDER_OLLAMA_URL=http://ollama.example:11434
+            COMMAND ${infer} serve --backend mock --port 0 --ollama-allow-remote)
     else()
         sonder_cli_test(serve_not_built RC 2 STDERR_REGEX "does not include the server module"
             COMMAND ${infer} serve --backend mock)

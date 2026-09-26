@@ -62,6 +62,30 @@ inline std::string range_text(long long min, long long max) {
 inline std::string invalid_value(std::string_view flag, std::string_view text, const std::string& expected) {
     return "invalid value '" + std::string(text) + "' for --" + std::string(flag) + " (expected " + expected + ")";
 }
+
+// Plain decimal number syntax: -?(digits[.digits*] | .digits)([eE][+-]?digits)?
+// No leading '+', no whitespace, no hex floats, no inf/nan.
+inline bool is_decimal_number(std::string_view t) noexcept {
+    std::size_t i = 0;
+    const auto digits = [&] {
+        const std::size_t start = i;
+        while (i < t.size() && t[i] >= '0' && t[i] <= '9') ++i;
+        return i - start;
+    };
+    if (i < t.size() && t[i] == '-') ++i;
+    std::size_t mantissa = digits();
+    if (i < t.size() && t[i] == '.') {
+        ++i;
+        mantissa += digits();
+    }
+    if (mantissa == 0) return false;
+    if (i < t.size() && (t[i] == 'e' || t[i] == 'E')) {
+        ++i;
+        if (i < t.size() && (t[i] == '+' || t[i] == '-')) ++i;
+        if (digits() == 0) return false;
+    }
+    return i == t.size();
+}
 }  // namespace detail
 
 // Parses a decimal integer in [min, max]. The whole text must be consumed;
@@ -103,8 +127,9 @@ inline bool parse_u64(std::string_view flag, std::string_view text, std::uint64_
     return true;
 }
 
-// Parses a finite decimal number in [min, max] ("C" locale). Rejects empty
-// text, whitespace, trailing characters, inf and nan.
+// Parses a finite decimal number in [min, max] ("C" locale). Only plain
+// decimal syntax is accepted (detail::is_decimal_number): no empty text,
+// whitespace, trailing characters, leading '+', hex floats, inf or nan.
 inline bool parse_number(std::string_view flag, std::string_view text, double min, double max, double& out,
                          std::string& error) {
     const std::string s(text);
@@ -114,7 +139,7 @@ inline bool parse_number(std::string_view flag, std::string_view text, double mi
         os << "a number from " << min << " to " << max;
         return os.str();
     };
-    if (s.empty() || std::isspace(static_cast<unsigned char>(s.front())) != 0) {
+    if (!detail::is_decimal_number(s)) {
         error = detail::invalid_value(flag, text, expected());
         return false;
     }
