@@ -71,6 +71,9 @@ public:
         if (Status st = validate_chat_messages(request.messages); !st.ok()) {
             return st;
         }
+        if (!request.sampling.logit_bias.empty()) {
+            return Status(ErrorCode::invalid_argument, "the ollama backend does not support logit_bias");
+        }
         ollama::ChatParams params;
         params.model = descriptor_.name;
         params.messages = request.messages;

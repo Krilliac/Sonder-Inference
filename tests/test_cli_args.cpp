@@ -3,6 +3,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <cmath>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -183,4 +184,23 @@ TEST_CASE("cli: interactive chat loop with the mock backend ends cleanly at EOF"
     // Two replies, each followed by a newline.
     const std::string s = out.str();
     CHECK(std::count(s.begin(), s.end(), '\n') == 2);
+}
+
+TEST_CASE("cli: --logit-bias parsing") {
+    std::vector<TokenLogitBias> out;
+    std::string error;
+    REQUIRE(cli::parse_logit_bias("42:-100,7:2.5,3:-inf", out, error));
+    REQUIRE(out.size() == 3u);
+    CHECK(out[0].token == 42);
+    CHECK(out[0].bias == doctest::Approx(-100.0f));
+    CHECK(out[1].token == 7);
+    CHECK(out[1].bias == doctest::Approx(2.5f));
+    CHECK(out[2].token == 3);
+    CHECK(std::isinf(out[2].bias));
+    CHECK(out[2].bias < 0.0f);
+    for (const char* bad : {"", "42", ":1", "42:", "x:1", "4x:1", "1:y", "1:2,", "1:2,,3:4"}) {
+        CAPTURE(bad);
+        CHECK_FALSE(cli::parse_logit_bias(bad, out, error));
+        CHECK_FALSE(error.empty());
+    }
 }
