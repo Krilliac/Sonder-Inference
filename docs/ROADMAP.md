@@ -15,7 +15,7 @@
 ## Phase 1 — direct native inference path
 
 - [x] Engine / Device / Model / Session abstractions (CPU inventory only; GPU discovery pending)
-- [ ] llama.cpp/GGML backend
+- [x] llama.cpp/GGML backend (optional build, `SONDER_WITH_LLAMA_CPP=ON`; license sign-off pending)
 - [ ] tokenizer + prompt processing
 - [x] streaming decode (session API; via mock and Ollama backends; native backend pending)
 - [ ] sampling parity (sampling config + validation done; parity checks need a native backend)
@@ -28,14 +28,14 @@ Gate: correctness + reliability parity for selected models.
 
 ## Phase 2 — Sonder-owned cache and scheduler
 
-- [ ] block/page logical KV manager
-- [ ] continuous batching
-- [ ] chunked prefill
-- [ ] prefix reuse
-- [ ] session fork/share
-- [ ] cache pressure/eviction
-- [ ] workload priorities
-- [ ] preemption
+- [x] block/page logical KV manager (`src/cache`, PR #4; not yet driven by the engine)
+- [x] continuous batching (policy: `src/scheduler`, PR #2; engine wiring pending)
+- [x] chunked prefill (policy: `src/scheduler`; engine wiring pending)
+- [x] prefix reuse (logical, fingerprinted: `src/cache`; backend KV reuse pending)
+- [x] session fork/share (logical fork + copy-on-write in `src/cache`; session API wiring pending)
+- [x] cache pressure/eviction (watermarks, priority-aware/LRU eviction in `src/cache`)
+- [x] workload priorities (7 classes, aging, starvation guard in `src/scheduler`)
+- [x] preemption (policy; recompute vs swap decision, swap is a stub)
 - [ ] adapter lifecycle
 
 Gate: measurable win on agent fan-out/long-context workloads without interactive-latency regression.
