@@ -8,10 +8,12 @@
 #include <fstream>
 #include <functional>
 #include <istream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <ostream>
 #include <set>
+#include <stdexcept>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -75,6 +77,53 @@ inline std::optional<Args> parse_args(int argc, const char* const* argv, std::st
         }
     }
     return a;
+}
+
+// --logit-bias value: comma-separated TOKEN:BIAS pairs, e.g. "42:-100,7:2.5".
+// BIAS may be "-inf" to ban a token. Range checks (token >= 0, unique tokens,
+// bias in [-100, 100] or -inf) are left to si::validate().
+inline bool parse_logit_bias(std::string_view text, std::vector<si::TokenLogitBias>& out, std::string& error) {
+    out.clear();
+    std::size_t pos = 0;
+    while (pos <= text.size()) {
+        const std::size_t comma = text.find(',', pos);
+        const std::string_view item =
+            text.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
+        const std::size_t colon = item.find(':');
+        if (item.empty() || colon == std::string_view::npos || colon == 0 || colon + 1 == item.size()) {
+            error = "invalid --logit-bias entry '" + std::string(item) + "' (expected TOKEN:BIAS)";
+            return false;
+        }
+        const std::string token_text(item.substr(0, colon));
+        const std::string bias_text(item.substr(colon + 1));
+        si::TokenLogitBias b;
+        try {
+            std::size_t used = 0;
+            const long long token = std::stoll(token_text, &used);
+            if (used != token_text.size() || token < std::numeric_limits<std::int32_t>::min() ||
+                token > std::numeric_limits<std::int32_t>::max()) {
+                throw std::invalid_argument("token");
+            }
+            b.token = static_cast<std::int32_t>(token);
+            if (bias_text == "-inf") {
+                b.bias = -std::numeric_limits<float>::infinity();
+            } else {
+                b.bias = std::stof(bias_text, &used);
+                if (used != bias_text.size()) {
+                    throw std::invalid_argument("bias");
+                }
+            }
+        } catch (const std::exception&) {
+            error = "invalid --logit-bias entry '" + std::string(item) + "' (expected TOKEN:BIAS)";
+            return false;
+        }
+        out.push_back(b);
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        pos = comma + 1;
+    }
+    return true;
 }
 
 // Chat message file: either a JSON array of {"role", "content"} objects or an

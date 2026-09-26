@@ -119,6 +119,44 @@ public:
     [[nodiscard]] virtual bool is_end_of_generation(TokenId token) const = 0;
 };
 
+// ---------------------------------------------------------------------------
+// Chat. A conversation is an ordered list of (role, content) messages. Roles
+// follow the common convention: "system", "user", "assistant", "tool".
+// Backends with a native chat API (Ollama /api/chat) or a model chat template
+// (llama.cpp GGUF metadata) override BackendModel::chat(); everything else
+// inherits the default, which flattens the conversation with
+// format_chat_prompt() and calls generate().
+// ---------------------------------------------------------------------------
+struct ChatMessage {
+    std::string role;
+    std::string content;
+};
+
+struct ChatRequest {
+    std::string request_id;
+    std::vector<ChatMessage> messages;
+    SamplingConfig sampling;
+};
+
+// True for "system", "user", "assistant" and "tool".
+[[nodiscard]] bool is_known_chat_role(std::string_view role) noexcept;
+
+// invalid_argument when the list is empty, a role is unknown, or the final
+// message is not from "user" or "tool" (there would be nothing to answer).
+Status validate_chat_messages(const std::vector<ChatMessage>& messages);
+
+// Backend-neutral prompt used by the default BackendModel::chat():
+//
+//   System: <system content>\n\n
+//   User: <user content>\n\n
+//   Assistant: <assistant content>\n\n
+//   ...
+//   Assistant:
+//
+// Role labels are capitalised; unknown roles are emitted verbatim. The
+// trailing "Assistant:" cue asks the model to produce the next reply.
+[[nodiscard]] std::string format_chat_prompt(const std::vector<ChatMessage>& messages);
+
 class BackendModel {
 public:
     virtual ~BackendModel() = default;
@@ -140,6 +178,18 @@ public:
         (void)request;
         return Status(ErrorCode::unsupported, "backend does not expose token logits");
     }
+
+    // Synchronous streaming chat completion: streams the assistant reply to
+    // the last message. Same cancellation and callback contract as
+    // generate(). The default validates the messages, formats them with
+    // format_chat_prompt() and delegates to generate(), so every backend
+    // supports chat without extra work.
+    virtual Result<GenerateStats> chat(const ChatRequest& request, const CancellationToken& cancel,
+                                       const TokenCallback& on_chunk);
+
+    // True when chat() uses a backend-native chat API or model chat template
+    // instead of the generic format_chat_prompt() fallback.
+    [[nodiscard]] virtual bool has_native_chat() const { return false; }
 };
 
 class Backend {
