@@ -5,6 +5,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -13,6 +14,9 @@
 
 #include "sonder/inference.hpp"
 #include "sonder_inference.h"
+// Header-only CLI helpers (argument parsing, chat files, chat loop); shared
+// with tests/test_cli_args.cpp.
+#include "../../src/cli/cli_args.hpp"
 #if defined(SONDER_HAS_OLLAMA_BACKEND)
 #include "sonder/inference/backends/ollama.hpp"
 #endif
@@ -35,7 +39,8 @@ Usage:
   sonder-infer backends [--ollama-url URL]
   sonder-infer models   --backend NAME [--ollama-url URL]
   sonder-infer generate --backend NAME --model MODEL --prompt TEXT [options]
-  sonder-infer bench    --backend NAME --model MODEL --corpus FILE --out FILE [options]
+  sonder-infer chat     --backend NAME --model MODEL [--messages FILE] [--system TEXT] [options]
+  sonder-infer bench    --backend NAME --model MODEL --corpus FILE --out FILE [--markdown] [options]
 
 Backends:
   mock     deterministic MOCK backend for tests only (no inference performed)
@@ -47,6 +52,11 @@ Generation options:
   --temperature F       (default 0 = greedy)
   --top-p F  --top-k N  --min-p F  --repeat-penalty F
   --seed N              (default 42)
+  --typical-p F         (default 1 = off)
+  --repeat-last-n N     penalty window (default 64; -1 = whole context, 0 = off)
+  --presence-penalty F  --frequency-penalty F   (default 0 = off, range [-2, 2])
+  --num-ctx N           context window request (default 0 = model default)
+  --logit-bias LIST     TOKEN:BIAS[,TOKEN:BIAS...]; BIAS may be -inf (not supported by ollama)
   --stop TEXT           (repeatable)
 
 Telemetry options (Observatory envelope v1, JSONL):
@@ -54,75 +64,44 @@ Telemetry options (Observatory envelope v1, JSONL):
   --telemetry-level L   off|metrics|standard|deep (default standard)
   --capture-text        include generated text in token events
 
+Chat options:
+  --messages FILE       one-shot: answer the conversation in FILE (JSON array of
+                        {"role","content"} or {"messages":[...]}) and exit.
+                        Without it, chat reads user lines from stdin
+                        interactively (/reset clears history, /exit quits).
+  --system TEXT         system prompt (ignored if the conversation has one)
+
 Bench options:
   --warmup N            warmup runs per prompt (default 1)
   --runs N              measured runs per prompt (default 3)
   --label TEXT          free-form label stored in results
+  --markdown            also print the markdown summary to stdout and write it
+                        next to --out (same name, .md extension)
 
 Other:
   --ollama-url URL      Ollama base URL (loopback only)
   --mock-delay-ms N     per-token delay for the mock backend
 )";
 
-struct Args {
-    std::string command;
-    std::map<std::string, std::string> values;
-    std::vector<std::string> stops;
-    bool capture_text = false;
-
-    [[nodiscard]] std::optional<std::string> get(const std::string& key) const {
-        auto it = values.find(key);
-        if (it == values.end()) return std::nullopt;
-        return it->second;
-    }
-};
-
-std::optional<Args> parse_args(int argc, char** argv, std::string& error) {
-    Args a;
-    if (argc < 2) {
-        error = "missing command";
-        return std::nullopt;
-    }
-    a.command = argv[1];
-    for (int i = 2; i < argc; ++i) {
-        std::string key = argv[i];
-        if (key == "--capture-text") {
-            a.capture_text = true;
-            continue;
-        }
-        if (key.rfind("--", 0) != 0) {
-            error = "unexpected argument: " + key;
-            return std::nullopt;
-        }
-        if (i + 1 >= argc) {
-            error = "missing value for " + key;
-            return std::nullopt;
-        }
-        std::string value = argv[++i];
-        if (key == "--stop") {
-            a.stops.push_back(value);
-        } else {
-            a.values[key.substr(2)] = value;
-        }
-    }
-    return a;
-}
+using sonder::cli::Args;
+using sonder::cli::parse_args;
 
 // The signal handler only sets a lock-free flag (async-signal-safe); a
-// watcher thread turns it into Session::cancel().
+// watcher thread turns it into a cancel callback (Session::cancel() or a
+// CancellationSource for chat turns).
 volatile std::sig_atomic_t g_interrupted = 0;
 
 extern "C" void on_sigint(int) { g_interrupted = 1; }
 
 class InterruptWatcher {
 public:
-    explicit InterruptWatcher(si::Session& session) : session_(session) {
+    explicit InterruptWatcher(std::function<void()> on_interrupt) : on_interrupt_(std::move(on_interrupt)) {
         g_interrupted = 0;
         std::signal(SIGINT, on_sigint);
         thread_ = std::thread([this] {
             while (!done_.load()) {
                 if (g_interrupted != 0) {
-                    session_.cancel();
+                    on_interrupt_();
                     g_interrupted = 0;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -138,7 +117,7 @@ public:
     InterruptWatcher& operator=(const InterruptWatcher&) = delete;
 
 private:
-    si::Session& session_;
+    std::function<void()> on_interrupt_;
     std::atomic<bool> done_{false};
     std::thread thread_;
 };
@@ -149,7 +128,7 @@ struct Runtime {
 
 bool build_engine(const Args& a, Runtime& rt) {
     si::EngineOptions eo;
-    eo.telemetry.capture_text = a.capture_text;
+    eo.telemetry.capture_text = a.has("capture-text");
     const std::string level_text = a.get("telemetry-level").value_or("standard");
     auto level = si::parse_telemetry_level(level_text);
     if (!level) {
@@ -201,9 +180,21 @@ bool sampling_from_args(const Args& a, si::SamplingConfig& s) {
         if (auto v = a.get("min-p")) s.min_p = std::stof(*v);
         if (auto v = a.get("repeat-penalty")) s.repeat_penalty = std::stof(*v);
         if (auto v = a.get("seed")) s.seed = std::stoull(*v);
+        if (auto v = a.get("typical-p")) s.typical_p = std::stof(*v);
+        if (auto v = a.get("repeat-last-n")) s.repeat_last_n = std::stoi(*v);
+        if (auto v = a.get("presence-penalty")) s.presence_penalty = std::stof(*v);
+        if (auto v = a.get("frequency-penalty")) s.frequency_penalty = std::stof(*v);
+        if (auto v = a.get("num-ctx")) s.num_ctx = std::stoi(*v);
     } catch (const std::exception&) {
         std::cerr << "error: invalid numeric option\n";
         return false;
+    }
+    if (auto v = a.get("logit-bias")) {
+        std::string error;
+        if (!sonder::cli::parse_logit_bias(*v, s.logit_bias, error)) {
+            std::cerr << "error: " << error << "\n";
+            return false;
+        }
     }
     s.stop = a.stops;
     if (auto st = si::validate(s); !st.ok()) {
@@ -294,7 +285,8 @@ int cmd_generate(const Args& a, Runtime& rt) {
     }
     si::Result<si::GenerationResult> res = si::Status(si::ErrorCode::internal, "not run");
     {
-        InterruptWatcher watcher(*session.value());
+        si::Session& s = *session.value();
+        InterruptWatcher watcher([&s] { s.cancel(); });
         res = session.value()->generate(*prompt, [](const si::TokenChunk& c) {
             std::cout.write(c.text.data(), static_cast<std::streamsize>(c.text.size()));
             std::cout.flush();
@@ -311,6 +303,64 @@ int cmd_generate(const Args& a, Runtime& rt) {
               << " prompt_tokens=" << r.stats.prompt_tokens << " completion_tokens=" << r.stats.completion_tokens
               << " ttft_ms=" << r.ttft_ms << " total_ms=" << r.total_ms << "\n";
     return r.outcome == si::RequestOutcome::completed ? 0 : 130;
+}
+
+// Chat goes straight to BackendModel::chat() (native chat on ollama and
+// llamacpp, generic prompt formatting elsewhere). Session has no chat entry
+// point yet, so chat turns do not emit Observatory session telemetry; see
+// docs/integration/chat-cli.md.
+int cmd_chat(const Args& a, Runtime& rt) {
+    si::SamplingConfig sampling;
+    if (!sampling_from_args(a, sampling)) return 2;
+    std::vector<si::ChatMessage> file_messages;
+    const auto messages_path = a.get("messages");
+    if (messages_path) {
+        auto loaded = sonder::cli::load_chat_messages(*messages_path);
+        if (!loaded.ok()) {
+            std::cerr << "error: " << loaded.status().to_string() << "\n";
+            return 2;
+        }
+        file_messages = std::move(loaded.value());
+    }
+    const std::string system = a.get("system").value_or("");
+    auto model = load(a, rt);
+    if (!model) return 1;
+    si::BackendModel& backend_model = model->backend_model();
+    std::uint64_t turn_no = 0;
+
+    auto turn = [&](const std::vector<si::ChatMessage>& history) -> si::Result<sonder::cli::ChatTurnResult> {
+        si::CancellationSource source;
+        InterruptWatcher watcher([&source] { source.cancel(); });
+        return sonder::cli::run_chat_turn(backend_model, history, sampling, source.token(), std::cout,
+                                          "chat-" + std::to_string(++turn_no));
+    };
+
+    if (messages_path) {
+        sonder::cli::apply_system_prompt(file_messages, system);
+        auto res = turn(file_messages);
+        std::cout << "\n";
+        if (!res.ok()) {
+            std::cerr << "error: " << res.status().to_string() << "\n";
+            return res.status().code() == si::ErrorCode::cancelled ? 130 : 1;
+        }
+        const auto& st = res.value().stats;
+        std::cerr << "[sonder-infer] chat native=" << (backend_model.has_native_chat() ? "yes" : "no")
+                  << " messages=" << file_messages.size() << " stop=" << si::to_string(st.stop_reason)
+                  << " prompt_tokens=" << st.prompt_tokens << " completion_tokens=" << st.completion_tokens << "\n";
+        return 0;
+    }
+
+    std::cerr << "[sonder-infer] chat with " << model->descriptor().name << " on " << model->backend_name()
+              << (backend_model.has_native_chat() ? " (native chat)" : " (generic prompt format)")
+              << "; /reset clears history, /exit or EOF quits\n";
+    sonder::cli::ChatReplOptions ro;
+    ro.system = system;
+    return sonder::cli::run_chat_repl(std::cin, std::cout, std::cerr, ro,
+                                      [&](const std::vector<si::ChatMessage>& history) -> si::Result<std::string> {
+                                          auto res = turn(history);
+                                          if (!res.ok()) return res.status();
+                                          return std::move(res.value().text);
+                                      });
 }
 
 #if defined(SONDER_HAS_BENCH)
@@ -340,6 +390,23 @@ int cmd_bench(const Args& a, Runtime& rt) {
         return 1;
     }
     out << si::json::Value(doc).dump() << "\n";
+    out.close();
+    if (a.has("markdown")) {
+        const std::string markdown = si::bench::render_markdown(si::json::Value(doc));
+        std::string md_path = *out_path;
+        if (md_path.size() > 5 && md_path.compare(md_path.size() - 5, 5, ".json") == 0) {
+            md_path.resize(md_path.size() - 5);
+        }
+        md_path += ".md";
+        std::ofstream md(md_path, std::ios::binary | std::ios::trunc);
+        if (!md) {
+            std::cerr << "error: cannot write " << md_path << "\n";
+            return 1;
+        }
+        md << markdown;
+        std::cout << markdown;
+        std::cerr << "[bench] wrote " << md_path << "\n";
+    }
     const auto* summary = doc.find("summary");
     std::cerr << "[bench] wrote " << *out_path << " summary=" << (summary ? summary->dump() : "{}") << "\n";
     const auto* failures = summary ? summary->find("failures") : nullptr;
@@ -373,6 +440,7 @@ int main(int argc, char** argv) {
     if (cmd == "backends") return cmd_backends(rt);
     if (cmd == "models") return cmd_models(*args, rt);
     if (cmd == "generate") return cmd_generate(*args, rt);
+    if (cmd == "chat") return cmd_chat(*args, rt);
     if (cmd == "bench") {
 #if defined(SONDER_HAS_BENCH)
         return cmd_bench(*args, rt);

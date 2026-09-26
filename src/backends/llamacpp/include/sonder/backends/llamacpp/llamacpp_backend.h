@@ -149,6 +149,13 @@ struct TelemetryEvent {
 
 using TelemetrySink = std::function<void(const TelemetryEvent&)>;
 
+// One chat message for chat-template formatting (role: system, user,
+// assistant, tool).
+struct ChatTurn {
+    std::string role;
+    std::string content;
+};
+
 // Backend capabilities advertised to the core (see docs/BACKENDS.md).
 struct Capabilities {
     bool tokenization = true;
@@ -182,9 +189,25 @@ public:
     [[nodiscard]] bool IsLoaded() const noexcept;
     [[nodiscard]] ModelInfo GetModelInfo() const;
 
-    Status Tokenize(std::string_view text, bool add_special, std::vector<Token>& out) const;
+    // parse_special: treat control-token text (e.g. "<|im_start|>") as the
+    // special token rather than plain text; needed for chat-templated prompts.
+    Status Tokenize(std::string_view text, bool add_special, std::vector<Token>& out,
+                    bool parse_special = false) const;
     Status TokenToPiece(Token token, std::string& out) const;
     [[nodiscard]] bool IsEndOfGeneration(Token token) const;
+
+    // Chat template stored in the GGUF metadata (tokenizer.chat_template), or
+    // empty when the model has none / nothing is loaded.
+    [[nodiscard]] std::string ChatTemplate() const;
+    // Formats `messages` with the model's chat template (llama.cpp's built-in
+    // template matcher, not a Jinja engine). kInvalidArgument when the model
+    // has no template or llama.cpp does not recognise it; callers fall back
+    // to a generic prompt format in that case.
+    Status ApplyChatTemplate(const std::vector<ChatTurn>& messages, bool add_assistant, std::string& out) const;
+    // Same, with an explicit template: a Jinja template string or a built-in
+    // name such as "chatml", "llama3", "mistral-v7". Needs no loaded model.
+    static Status FormatChat(std::string_view chat_template, const std::vector<ChatTurn>& messages,
+                             bool add_assistant, std::string& out);
 
     GenerateResult Generate(const GenerateRequest& request, const TokenCallback& on_token,
                             const CancelPredicate& should_cancel = {});

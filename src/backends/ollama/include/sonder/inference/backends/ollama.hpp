@@ -130,10 +130,8 @@ private:
     Status error_;
 };
 
-struct ChatMessage {
-    std::string role;  // system | user | assistant | tool
-    std::string content;
-};
+// Same type as the core chat message (role: system | user | assistant | tool).
+using ChatMessage = sonder::inference::ChatMessage;
 
 struct GenerateParams {
     std::string model;
