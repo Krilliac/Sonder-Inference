@@ -11,7 +11,8 @@
 // Available when the build defines SONDER_HAS_OLLAMA_BACKEND. Transport is the
 // core internal HTTP client (src/net), which is plain HTTP; non-loopback hosts
 // are refused unless allow_remote is set (policy: never plain-HTTP remote
-// workers). TLS endpoints are not supported yet.
+// workers). https:// endpoints need a SONDER_WITH_TLS=ON build (see
+// OllamaTlsOptions and docs/integration/tls.md).
 #pragma once
 
 #include <chrono>
@@ -32,10 +33,22 @@
 
 namespace sonder::inference {
 
+// TLS settings for an https:// base_url. Honoured only by builds configured
+// with SONDER_WITH_TLS=ON; otherwise https:// returns ErrorCode::unsupported.
+// Semantics match net::TlsOptions (src/net/tls.hpp, docs/integration/tls.md).
+struct OllamaTlsOptions {
+    std::string ca_bundle_path;         // PEM CA bundle; empty = system trust store
+    std::string pinned_sha256;          // leaf certificate SHA-256 fingerprint (hex)
+    std::string pinned_cert_path;       // PEM file with the expected leaf certificate
+    bool insecure_skip_verify = false;  // DANGEROUS: no verification (warns on stderr)
+    std::string server_name;            // SNI / verification name override
+    std::chrono::milliseconds handshake_timeout{10000};
+};
+
 // ---------------------------------------------------------------------------
 // Ollama compatibility backend (docs/BACKENDS.md, "Backend 0"). Talks to an
-// Ollama server over plain HTTP. Loopback only unless allow_remote is set;
-// remote workers should sit behind TLS, which this adapter does not speak.
+// Ollama server over plain HTTP, or https:// in SONDER_WITH_TLS=ON builds.
+// Loopback only unless allow_remote is set (also for https://).
 // ---------------------------------------------------------------------------
 struct OllamaBackendOptions {
     std::string base_url = "http://127.0.0.1:11434";
@@ -47,6 +60,8 @@ struct OllamaBackendOptions {
     // Also deliver reasoning ("thinking") text to Backend token callbacks.
     // Off by default, so TTFT measures the first *content* token.
     bool emit_thinking_chunks = false;
+    // Used when base_url is https:// (non-loopback hosts still need allow_remote).
+    OllamaTlsOptions tls;
 };
 inline constexpr const char* kOllamaBackendName = "ollama";
 std::shared_ptr<Backend> make_ollama_backend(OllamaBackendOptions options = {});

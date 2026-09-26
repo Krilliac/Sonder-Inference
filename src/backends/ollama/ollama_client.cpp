@@ -99,15 +99,17 @@ Result<net::HttpRequest> make_request(const OllamaConfig& config, std::string me
         return url.status();
     }
     const net::Url& u = url.value();
-    if (u.scheme != "http") {
+    const bool https = u.scheme == "https";  // parse_url accepts it only in SONDER_HAS_TLS builds
+    if (u.scheme != "http" && !https) {
         return Status(ErrorCode::unsupported,
                       "ollama: only http:// endpoints are supported by the internal client (got '" + u.scheme +
                           "'); front TLS workers with a local proxy");
     }
     if (!config.allow_remote && !net::is_loopback_host(u.host)) {
         return Status(ErrorCode::invalid_argument,
-                      "ollama: refusing plain HTTP to non-loopback host '" + u.host +
-                          "' (set allow_remote to override)");
+                      std::string(https ? "ollama: refusing non-loopback host '"
+                                        : "ollama: refusing plain HTTP to non-loopback host '") +
+                          u.host + "' (set allow_remote to override)");
     }
     net::HttpRequest req;
     req.method = std::move(method);
@@ -118,6 +120,15 @@ Result<net::HttpRequest> make_request(const OllamaConfig& config, std::string me
     req.content_type = "application/json";
     req.connect_timeout = config.connect_timeout;
     req.total_timeout = config.request_timeout;
+    if (https) {
+        req.use_tls = true;
+        req.tls.ca_bundle_path = config.tls.ca_bundle_path;
+        req.tls.pinned_sha256 = config.tls.pinned_sha256;
+        req.tls.pinned_cert_path = config.tls.pinned_cert_path;
+        req.tls.insecure_skip_verify = config.tls.insecure_skip_verify;
+        req.tls.server_name = config.tls.server_name;
+        req.tls.handshake_timeout = config.tls.handshake_timeout;
+    }
     return req;
 }
 
