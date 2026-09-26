@@ -46,6 +46,7 @@ add_library(sonder_inference
     src/telemetry/telemetry.cpp
     src/sessions/session.cpp
     src/engine/engine.cpp
+    src/engine/request_runtime.cpp
     src/engine/c_api.cpp
     src/backends/backend.cpp
     src/backends/mock_backend.cpp
