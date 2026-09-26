@@ -13,6 +13,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -23,6 +24,7 @@
 #  include <unistd.h>
 #endif
 
+#include "cli/cli_spec.hpp"
 #include "sonder/inference/backend_setup.hpp"
 #include "sonder/inference/json.hpp"
 #include "sonder/inference/server.hpp"
@@ -150,7 +152,13 @@ bool parse(const std::vector<std::string>& args, ParsedArgs& out, std::string& e
         }
         const auto it = std::find_if(spec().begin(), spec().end(), [&](const auto& s) { return s.first == key; });
         if (it == spec().end()) {
-            error = "unknown option --" + key;
+            // Same wording and did-you-mean suggestion as the other
+            // sonder-infer commands (src/cli/cli_spec.hpp).
+            std::vector<std::string_view> names;
+            for (const auto& entry : spec()) {
+                names.emplace_back(entry.first);
+            }
+            error = sonder::cli::unknown_option_message(key, names);
             return false;
         }
         if (it->second == Kind::flag) {

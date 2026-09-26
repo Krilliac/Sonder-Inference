@@ -1,0 +1,6 @@
+hello sonder
+/stats
+/help
+//not a command
+/exit
+never sent
