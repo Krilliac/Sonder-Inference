@@ -9,6 +9,7 @@ sonder_add_module_tests(core
     test_telemetry.cpp
     test_c_api.cpp
     test_kv_capacity_adapter.cpp
+    test_engine_runtime.cpp
 )
 
 # Proves sonder_inference.h is valid C and the ABI is usable from C.
