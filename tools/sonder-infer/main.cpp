@@ -52,6 +52,11 @@ Generation options:
   --temperature F       (default 0 = greedy)
   --top-p F  --top-k N  --min-p F  --repeat-penalty F
   --seed N              (default 42)
+  --typical-p F         (default 1 = off)
+  --repeat-last-n N     penalty window (default 64; -1 = whole context, 0 = off)
+  --presence-penalty F  --frequency-penalty F   (default 0 = off, range [-2, 2])
+  --num-ctx N           context window request (default 0 = model default)
+  --logit-bias LIST     TOKEN:BIAS[,TOKEN:BIAS...]; BIAS may be -inf (not supported by ollama)
   --stop TEXT           (repeatable)
 
 Telemetry options (Observatory envelope v1, JSONL):
@@ -175,9 +180,21 @@ bool sampling_from_args(const Args& a, si::SamplingConfig& s) {
         if (auto v = a.get("min-p")) s.min_p = std::stof(*v);
         if (auto v = a.get("repeat-penalty")) s.repeat_penalty = std::stof(*v);
         if (auto v = a.get("seed")) s.seed = std::stoull(*v);
+        if (auto v = a.get("typical-p")) s.typical_p = std::stof(*v);
+        if (auto v = a.get("repeat-last-n")) s.repeat_last_n = std::stoi(*v);
+        if (auto v = a.get("presence-penalty")) s.presence_penalty = std::stof(*v);
+        if (auto v = a.get("frequency-penalty")) s.frequency_penalty = std::stof(*v);
+        if (auto v = a.get("num-ctx")) s.num_ctx = std::stoi(*v);
     } catch (const std::exception&) {
         std::cerr << "error: invalid numeric option\n";
         return false;
+    }
+    if (auto v = a.get("logit-bias")) {
+        std::string error;
+        if (!sonder::cli::parse_logit_bias(*v, s.logit_bias, error)) {
+            std::cerr << "error: " << error << "\n";
+            return false;
+        }
     }
     s.stop = a.stops;
     if (auto st = si::validate(s); !st.ok()) {
