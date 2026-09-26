@@ -78,6 +78,17 @@ No license conclusions from the initial broad web sweep are considered authorita
   closed (update hash after verifying the tag commit)
 - approved: pending lead/Nate sign-off
 
+### cpp-httplib
+- repository: https://github.com/yhirose/cpp-httplib
+- revision/tag: v0.58.0 (single `httplib.h`, SHA-256 `aa14e7e7bd2703694e0a6b6855af3b8c406102ab1fc56ac905fe33619b31faa5`)
+- evaluated: 2026-09-26
+- license: MIT
+- intended use: in-process fake Ollama HTTP server for `src/backends/ollama` tests only
+- linkage/process boundary: header-only, compiled into `sonder_ollama_tests` only; never linked into `sonder_inference`
+- notices required: MIT notice (inside the header); not redistributed
+- security/maintenance notes: fetched by CMake FetchContent from a pinned URL with `URL_HASH` in `src/backends/ollama/tests/CMakeLists.txt`
+- approved: yes (test-only, same terms as doctest); final sign-off with Nate alongside llama.cpp
+
 ### Ollama (process boundary only)
 - repository: https://github.com/ollama/ollama
 - revision/tag: whatever server the user runs locally
