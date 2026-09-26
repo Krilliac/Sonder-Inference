@@ -1,0 +1,4 @@
+g{"response":"a","done":false}
+
+  
+{"response":"b","done":true,"done_reason":"length","eval_count":2,"eval_duration":1000,"prompt_eval_count":3,"prompt_eval_duration":10}

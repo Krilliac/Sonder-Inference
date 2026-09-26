@@ -1,0 +1,167 @@
+name: hardening
+
+# Sanitizer and fuzzing lanes (docs/integration/hardening.md).
+# Separate from ci.yml so the MSVC/GCC build matrix stays untouched.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: "Seconds to run each fuzzer"
+        required: false
+        default: "60"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hardening-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CC: clang-18
+  CXX: clang++-18
+  # Doctest and the test-only cpp-httplib are fetched by CMake; nothing else.
+  CMAKE_BUILD_PARALLEL_LEVEL: 4
+
+jobs:
+  # Blocking. Whole tree (library, CLI, all module tests) under ASan + UBSan.
+  asan-ubsan:
+    name: linux clang ASan+UBSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1:check_initialization_order=1:abort_on_error=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang-18 libclang-rt-18-dev
+
+      # Ubuntu 24.04 kernels use 32 bits of mmap ASLR entropy, which older
+      # sanitizer runtimes cannot map around ("unexpected memory mapping").
+      - name: Reduce ASLR entropy for sanitizers
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: >
+          cmake -S . -B build/asan -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DSONDER_BUILD_TESTS=ON -DSONDER_BUILD_CLI=ON -DSONDER_WARNINGS_AS_ERRORS=ON
+          "-DCMAKE_C_FLAGS=-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+          "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+          "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined"
+
+      - name: Build
+        run: cmake --build build/asan
+
+      - name: Test
+        run: ctest --test-dir build/asan --output-on-failure -j 4
+
+      - name: CLI smoke under sanitizers
+        run: |
+          build/asan/sonder-infer version
+          build/asan/sonder-infer generate --backend mock --model mock:tiny --prompt "asan smoke" --max-tokens 8 --telemetry telemetry.jsonl
+          test -s telemetry.jsonl
+
+  # Blocking. Data races in the telemetry writer, scheduler, cancellation and
+  # bench fan-out. Passed 5/5 repeated local runs with no reports.
+  tsan:
+    name: linux clang TSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1:history_size=4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang-18 libclang-rt-18-dev
+
+      - name: Reduce ASLR entropy for sanitizers
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: >
+          cmake -S . -B build/tsan -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DSONDER_BUILD_TESTS=ON -DSONDER_BUILD_CLI=ON -DSONDER_WARNINGS_AS_ERRORS=ON
+          "-DCMAKE_C_FLAGS=-fsanitize=thread -fno-omit-frame-pointer"
+          "-DCMAKE_CXX_FLAGS=-fsanitize=thread -fno-omit-frame-pointer"
+          "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread"
+
+      - name: Build
+        run: cmake --build build/tsan
+
+      - name: Test
+        run: ctest --test-dir build/tsan --output-on-failure -j 4
+
+  # Blocking. Builds fuzz/ standalone (no root CMakeLists.txt change needed),
+  # replays the checked-in seed corpora, then fuzzes each target for a short
+  # time. Any crash leaves a reproducer in the uploaded artifact.
+  fuzz:
+    name: libFuzzer (short run)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || '60' }}
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang-18 libclang-rt-18-dev
+
+      - name: Reduce ASLR entropy for sanitizers
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: cmake -S fuzz -B build/fuzz -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build
+        run: cmake --build build/fuzz
+
+      - name: Replay seed corpora
+        run: cmake --build build/fuzz --target fuzz-regress
+
+      - name: Fuzz each target
+        run: |
+          set -u
+          status=0
+          mkdir -p build/fuzz/work
+          for exe in build/fuzz/sonder_fuzz_*; do
+            name=${exe##*/sonder_fuzz_}
+            mkdir -p "build/fuzz/work/$name"
+            echo "::group::fuzz $name (${FUZZ_SECONDS}s)"
+            if ! "$exe" -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -max_len=65536 \
+                 -print_final_stats=1 -artifact_prefix="build/fuzz/work/crash-$name-" \
+                 "build/fuzz/work/$name" "fuzz/corpus/$name"; then
+              echo "::error::fuzzer $name found a failure (see artifact fuzz-artifacts)"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $status
+
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: |
+            build/fuzz/work/crash-*
+            build/fuzz/work/leak-*
+            build/fuzz/work/timeout-*
+            build/fuzz/work/oom-*
+          if-no-files-found: ignore
+          retention-days: 14
