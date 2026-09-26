@@ -133,13 +133,91 @@ See `docs/RESEARCH_CATALOG.md` and `docs/RESEARCH_SOURCES.md`.
 - `docs/OBSERVATORY_CONTRACT.md`
 - `docs/DESIGN_DECISIONS.md`
 - `docs/ROADMAP.md`
+- `docs/LICENSE_REVIEW.md`
+- `docs/SCAFFOLD.md`
 
 ## Status
 
-Research/architecture foundation. No upstream project should be copied or linked as a dependency until its current license and compatibility are verified.
+Implementation has started (2026-09-26). The first slice provides:
+
+- C++20 engine core: `Engine`, `Device` (CPU inventory), `Model` handle,
+  `Session`, `Backend` interface with capability advertisement,
+  `SamplingConfig` validation, cooperative cancellation, `Status`/`Result`.
+- Stable C ABI: [`include/sonder_inference.h`](include/sonder_inference.h).
+- Backends: a deterministic **mock** backend (tests only, performs no
+  inference) and an **Ollama** compatibility adapter (loopback HTTP, streaming,
+  cancellable).
+- Observatory telemetry: JSONL events in the `sonder.observatory.event/1`
+  envelope with a bounded, non-blocking queue.
+- `sonder-infer` CLI and a benchmark harness skeleton.
+- doctest + CTest suite; GitHub Actions on Windows and Linux.
+
+The direct llama.cpp/GGML backend is **not** implemented yet. See
+[ROADMAP](docs/ROADMAP.md) for exact status. No upstream project is copied or
+linked until its license is verified and recorded in
+[LICENSE_REVIEW](docs/LICENSE_REVIEW.md).
+
+## Build and test
+
+Requirements: CMake 3.21+, Ninja, and a C++20 compiler (MSVC 2022+, GCC 11+,
+or Clang 14+). The first configure downloads doctest for the tests (pinned
+hash).
+
+Windows (MSVC + Ninja; the script enters a VS developer environment):
+
+```powershell
+powershell -NoProfile -File scripts\build.ps1 -Preset msvc-debug -Test
+```
+
+Linux/macOS:
+
+```bash
+cmake --preset linux-debug
+cmake --build --preset linux-debug
+ctest --preset linux-debug
+```
+
+Presets: `msvc-debug`, `msvc-release`, `linux-debug`, `linux-release`, plus
+`ci-windows`/`ci-linux` (warnings as errors). Build output goes to
+`build/<preset>/`.
+
+## Quickstart
+
+```bash
+# Inventory and backends
+build/linux-debug/sonder-infer devices
+build/linux-debug/sonder-infer backends
+
+# Mock backend (deterministic, no model needed) with telemetry
+build/linux-debug/sonder-infer generate --backend mock --model mock:tiny \
+    --prompt "hello sonder" --max-tokens 16 --telemetry events.jsonl
+
+# Local Ollama (http://127.0.0.1:11434) with a model you already pulled
+build/linux-debug/sonder-infer models --backend ollama
+build/linux-debug/sonder-infer generate --backend ollama --model qwen3:0.6b \
+    --prompt "Say hi" --max-tokens 32 --telemetry events.jsonl
+
+# Benchmark harness
+build/linux-debug/sonder-infer bench --backend ollama --model qwen3:0.6b \
+    --corpus bench/corpus/smoke.json --out results.json --warmup 1 --runs 3
+```
+
+`Ctrl-C` during `generate` cancels the in-flight request and emits a
+`request.cancelled` event with the observed cancel latency.
+
+## Layout
+
+- `include/sonder/inference/` public C++ API; `include/sonder_inference.h` C ABI
+- `src/` implementation (see [src/README.md](src/README.md))
+- `tools/sonder-infer/` CLI
+- `tests/` doctest suite and CTest CLI checks
+- `bench/corpus/` prompt corpora; `bench/results/` small reviewed snapshots
+- `cmake/`, `CMakePresets.json`, `scripts/build.ps1` build tooling
+- Optional modules (`src/cache`, `src/scheduler`, `src/sampling`,
+  `src/backends/llamacpp`, `src/backends/ollama`, `bench`) are auto-included
+  when present; see [docs/MODULES.md](docs/MODULES.md)
 
 ## Local scaffold
 
-Directory placeholders and repository conventions are now present. See
-[scaffold status](docs/SCAFFOLD.md) and [source workspace](src/README.md).
-There is no implementation, build system, or test suite yet.
+The original scaffold notes are kept in [scaffold status](docs/SCAFFOLD.md),
+now updated for the implementation layout.

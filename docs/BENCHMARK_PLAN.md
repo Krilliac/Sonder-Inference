@@ -123,3 +123,26 @@ Promotion requires:
 - observability present
 - fallback path
 - documented hardware/model support
+
+## Harness (v0.1)
+
+`sonder-infer bench` runs a corpus (`sonder.inference.corpus/1`, e.g.
+[`bench/corpus/smoke.json`](../bench/corpus/smoke.json)) against one backend and
+model and writes a `sonder.inference.bench/1` results document:
+
+```bash
+sonder-infer bench --backend ollama --model <model> \
+    --corpus bench/corpus/smoke.json --out results.json --warmup 1 --runs 3
+```
+
+Recorded per the hygiene list: engine version and commit, host platform and
+CPU/RAM, backend name and version, model name/format/family/parameter
+size/quantization, sampling (greedy, seed 42 by default), warmup/measured
+runs, concurrency (1), and cache state (not controlled yet). Per-run rows carry
+TTFT, total latency, prompt/completion tokens, decode and prompt tokens/s (with
+the source of the number), and stop reason. The summary gives
+n/mean/p50/p95/min/max.
+
+Limitations: concurrency 1 only; smoke corpus is not representative; no
+GPU/VRAM sampling; mock-backend numbers are meaningless by design. Small
+reviewed snapshots go in [`bench/results/`](../bench/results/).
