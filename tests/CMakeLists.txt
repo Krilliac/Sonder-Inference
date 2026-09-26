@@ -30,7 +30,10 @@ if(SONDER_BUILD_CLI)
                 --max-tokens 8 --telemetry "${CMAKE_CURRENT_BINARY_DIR}/cli-generate.jsonl")
     add_test(NAME sonder.cli.rejects_bad_sampling
         COMMAND sonder-infer generate --backend mock --model mock:tiny --prompt x --temperature -1)
-    set_tests_properties(sonder.cli.rejects_bad_sampling PROPERTIES WILL_FAIL TRUE)
+    # Negative tests match the error text instead of WILL_FAIL, so a crash or
+    # sanitizer abort cannot count as a pass (docs/integration/hardening.md).
+    set_tests_properties(sonder.cli.rejects_bad_sampling PROPERTIES
+        PASS_REGULAR_EXPRESSION "temperature must be finite")
     set_tests_properties(sonder.cli.version sonder.cli.devices sonder.cli.generate_mock
         sonder.cli.rejects_bad_sampling PROPERTIES TIMEOUT 60)
 
@@ -45,8 +48,12 @@ if(SONDER_BUILD_CLI)
         COMMAND sonder-infer generate --backend mock --model mock:tiny --prompt x --logit-bias oops)
     add_test(NAME sonder.cli.rejects_bad_typical_p
         COMMAND sonder-infer generate --backend mock --model mock:tiny --prompt x --typical-p 0)
-    set_tests_properties(sonder.cli.rejects_bad_logit_bias sonder.cli.rejects_malformed_logit_bias
-        sonder.cli.rejects_bad_typical_p PROPERTIES WILL_FAIL TRUE)
+    set_tests_properties(sonder.cli.rejects_bad_logit_bias PROPERTIES
+        PASS_REGULAR_EXPRESSION "logit_bias values must be within")
+    set_tests_properties(sonder.cli.rejects_malformed_logit_bias PROPERTIES
+        PASS_REGULAR_EXPRESSION "invalid --logit-bias entry 'oops'")
+    set_tests_properties(sonder.cli.rejects_bad_typical_p PROPERTIES
+        PASS_REGULAR_EXPRESSION "typical_p must be within")
     set_tests_properties(sonder.cli.generate_sampling_flags sonder.cli.rejects_bad_logit_bias
         sonder.cli.rejects_malformed_logit_bias sonder.cli.rejects_bad_typical_p PROPERTIES TIMEOUT 60)
 
@@ -61,8 +68,10 @@ if(SONDER_BUILD_CLI)
                 --messages "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/chat_messages_bad_role.json")
     add_test(NAME sonder.cli.chat_rejects_missing_file
         COMMAND sonder-infer chat --backend mock --model mock:tiny --messages "${CMAKE_CURRENT_BINARY_DIR}/absent.json")
-    set_tests_properties(sonder.cli.chat_rejects_bad_role sonder.cli.chat_rejects_missing_file
-        PROPERTIES WILL_FAIL TRUE)
+    set_tests_properties(sonder.cli.chat_rejects_bad_role PROPERTIES
+        PASS_REGULAR_EXPRESSION "unknown role")
+    set_tests_properties(sonder.cli.chat_rejects_missing_file PROPERTIES
+        PASS_REGULAR_EXPRESSION "messages: cannot open")
     set_tests_properties(sonder.cli.chat_messages_mock sonder.cli.chat_rejects_bad_role
         sonder.cli.chat_rejects_missing_file PROPERTIES TIMEOUT 60)
 
