@@ -9,7 +9,7 @@ needs to edit root files.
 | Module directory | Owner branch | Status on main |
 | --- | --- | --- |
 | `src/cache/` | `feat/kv-cache` | reserved |
-| `src/scheduler/` | `feat/scheduler` | reserved |
+| `src/scheduler/` | `feat/scheduler` | merged (PR #2, 33 tests) — notes: `docs/integration/scheduler.md` |
 | `src/sampling/` | `feat/sampling` | reserved (core keeps `SamplingConfig` + validation in `src/engine/sampling_config.cpp`) |
 | `src/backends/llamacpp/` | `feat/llamacpp-backend` | reserved (license review required first) |
 | `src/backends/ollama/` | `feat/ollama-bench` | initial adapter landed with the foundation |
