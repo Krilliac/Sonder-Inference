@@ -23,11 +23,14 @@ records the layout and what remains undecided.
 - Test framework: doctest via FetchContent, test-only (ADR-014).
 - CI jobs: configure/build/test on Windows (MSVC) and Linux.
 - Project license: Apache-2.0 (ADR-015, [LICENSE](../LICENSE), [NOTICE](../NOTICE)).
+- Transport between Sonder Runtime and Inference: local HTTP served by
+  `sonder-infer serve`, OpenAI-compatible subset plus Sonder extensions, with
+  live telemetry over SSE/NDJSON on the same listener (ADR-020,
+  [SERVER.md](SERVER.md)).
 
 ## Still undecided
 
-Transport between Sonder Runtime and Inference (in-process C ABI vs. local
-RPC), package/distribution model, and the first supported model/quantization
+Package/distribution model and the first supported model/quantization
 matrix. Directory
 ownership remains provisional; module work streams are listed in
 [MODULES.md](MODULES.md).
@@ -36,7 +39,7 @@ ownership remains provisional; module work streams are listed in
 
 1. Pin and license-review a llama.cpp revision; implement the direct backend
    behind `SONDER_WITH_LLAMA_CPP`.
-2. Agree the Runtime integration boundary and first supported use case.
+2. Agree the first supported Runtime use case on the ADR-020 boundary.
 3. Define the first model/quantization matrix and extend the benchmark corpus
    to the workload families in [BENCHMARK_PLAN.md](BENCHMARK_PLAN.md).
 4. Start the Phase 2 scheduler and logical KV manager.

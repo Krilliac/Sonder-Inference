@@ -34,7 +34,7 @@ Each line of the JSONL stream is one object:
 | `session_id` | string | engine id (`engine-…`) for engine-scoped events, session id (`sess-…`) for session and request events, bus instance id (`tel-…`) for `telemetry.dropped` |
 | `run_id` | string or null | the host's `SessionOptions::run_id`; **defaults to the engine id** on engine, session, request, scheduler and KV events, so one engine's events group as one run. Null only on `telemetry.dropped` |
 | `request_id`, `agent_id`, `task_id`, `model_instance_id`, `device_id` | string or null | correlation ids; null when unknown |
-| `producer` | object | `name` (`sonder-inference`), `version`, `node_id` (host name), `instance_id` (`tel-…`, one per telemetry bus) |
+| `producer` | object | `name` (`sonder-inference`), `version`, `node_id` (host name), `instance_id` (`tel-…`, one per telemetry bus), `role` (`inference`; additive, from `TelemetryOptions::role`), `synthetic` bool (additive; true only when the events describe synthetic work, i.e. `sonder-infer serve` with the MOCK backend; `TelemetryOptions::synthetic`) |
 | `sampling` | object | `level`: the level **this event was emitted at** (`metrics` / `standard` / `deep`), so a consumer knows what a lower setting would drop; `sampled`: always true |
 | `attributes` | object | per event, listed below |
 
@@ -44,11 +44,17 @@ its events, engine, session and request alike, from a single counter.
 `<instance_id>-<sequence>`. Consumers key gap detection on
 `producer.instance_id`, not on `session_id`.
 
-**`mono_ns` precision.** `mono_ns` is `std::chrono::steady_clock` since its
-platform epoch (boot on Linux and Windows). It is only comparable within one
-producer. Values pass 2^53 after about 104 days of uptime; a JavaScript
-consumer parsing it as a double then loses sub-microsecond precision. Order
-events by `sequence`, and use `mono_ns` differences for durations.
+**`mono_ns` clock.** `mono_ns` is `std::chrono::steady_clock` since its
+platform epoch (boot on Linux and Windows). On Linux that is
+`CLOCK_MONOTONIC`, the same clock as Python's `time.monotonic_ns()`, so
+producers **on the same Linux host** (Sonder Runtime and Sonder Inference)
+can be merged by `mono_ns` (ecosystem contract v1, section 6.1). Across hosts,
+and on macOS or Windows where the libraries may use different clocks (after
+sleep, or Python before 3.13 on Windows), `mono_ns` values are not
+comparable; within one producer always order by `sequence`. Values pass 2^53
+after about 104 days of uptime; a JavaScript consumer parsing it as a double
+then loses sub-microsecond precision. Use `mono_ns` differences for
+durations.
 
 Levels: `metrics` events are always recorded when telemetry is enabled.
 `standard` adds per-token and per-step detail. `off` records nothing.
@@ -60,7 +66,7 @@ Types used below: `int` (JSON integer), `num` (JSON number), `str`,
 
 | Event | Level | Attributes |
 | --- | --- | --- |
-| `engine.started` | metrics | `version` str, `commit` str, `platform` str, `device_count` int, `text_capture` str (`on` / `off`) |
+| `engine.started` | metrics | `version` str, `commit` str, `platform` str, `device_count` int, `text_capture` str (`on` / `off`); optional `server` obj `{host` str, `port` int, `api_version` int`}` when the engine is hosted by `sonder-infer serve` (`EngineOptions::server`) |
 | `engine.stopped` | metrics | none |
 | `scheduler.configured` | metrics | emitted once at engine start when scheduling is active: `kv_block_size_tokens` int, `kv_num_blocks` int, `prefix_caching` bool, `max_running_sequences` int, `max_step_sequences` int, `max_step_tokens` int, `prefill_chunk_tokens` int, `admission_watermark_blocks` int, `max_requeue_count` int |
 | `device.memory.sample` | metrics | at start (`sample_devices_on_start`) and every `EngineOptions::device_sample_interval` (default 10 s, 0 disables): `kind` str, `name` str, `logical_cores` int, `total_bytes` int, `available_bytes` int; optional `used_bytes` int. Host memory only; no backend reports VRAM yet |
@@ -77,9 +83,14 @@ Types used below: `int` (JSON integer), `num` (JSON number), `str`,
 | --- | --- | --- |
 | `session.created` | metrics | `model`, `backend` str; `priority` int; `workload` str (see below); `text_capture` str (`on` / `off`); `sampling` obj |
 | `session.closed` | metrics | `requests` int |
-| `request.queued` | metrics | `kind` str (`generate`), `priority` int, `workload` str, `prompt_bytes` int |
-| `request.started` | metrics | `kind` str, `sampling` obj, `scheduled` bool, `sampler` str (`sonder` or `backend`) |
-| `request.completed` / `request.cancelled` / `request.failed` | metrics | `outcome`, `stop_reason` str; `prompt_tokens`, `completion_tokens`, `chunks` int; `token_counts_from_backend` bool; `ttft_ms`, `total_ms` num; `scheduled` bool; `sampler` str. When `scheduled`: `queue_ms` num, `preemptions` int, `accounted_prompt_tokens` int, `reused_prompt_tokens` int. `cancelled` optionally adds `cancel_latency_ms` num. `failed` adds `error_code`, `error` str |
+| `request.queued` | metrics | `kind` str (`generate` from `Session::generate`, `chat` from `Session::chat`), `priority` int, `workload` str, `prompt_bytes` int (for chat: the generic formatted prompt); `chat` adds `messages` int |
+| `request.started` | metrics | `kind` str, `sampling` obj, `scheduled` bool, `sampler` str (`sonder` or `backend`); `chat` adds `chat_template` str (`native`: the backend's chat API or model template received the messages; `generic`: `format_chat_prompt()`) |
+| `request.completed` / `request.cancelled` / `request.failed` | metrics | `outcome`, `stop_reason` str; `prompt_tokens`, `completion_tokens`, `chunks` int; `token_counts_from_backend` bool; `ttft_ms`, `total_ms` num; `scheduled` bool; `sampler` str. When `scheduled`: `queue_ms` num, `preemptions` int, `accounted_prompt_tokens` int, `reused_prompt_tokens` int. `cancelled` optionally adds `cancel_latency_ms` num. `failed` adds `error_code`, `error` str, and `scheduler_rejected` bool (true) when the scheduler refused the request before any backend work |
+
+All five request lifecycle events carry the optional `parent_request_id` str
+when the caller set `RequestOptions::parent_request_id` (for `sonder-infer
+serve`: the `X-Sonder-Parent-Request-Id` header, i.e. the Sonder Runtime turn
+id). The envelope `request_id` is always the engine's own id.
 
 `sampling` objects hold `temperature`, `top_k`, `top_p`, `min_p`,
 `repeat_penalty`, `typical_p`, `repeat_last_n`, `presence_penalty`,
@@ -162,6 +173,14 @@ Engine-scoped `scheduler.batch.*`, `kv.evicted`, `kv.pressure`,
 `device.memory.sample` and `telemetry.dropped` are interleaved. Events from
 different threads are ordered by `sequence`, not by `mono_ns`.
 
+## Envelope additions for the ecosystem contract (v1)
+
+Additive within `/1`: `producer.role` and `producer.synthetic`;
+`request.queued.kind = "chat"` and `request.started.chat_template`;
+`parent_request_id` on the request lifecycle events;
+`request.failed.scheduler_rejected`; `engine.started.server`. Discovery
+advertises this vocabulary as `vocabularies: {"sonder.inference.events": 1}`.
+
 ## Observatory change requests (Observatory `docs/telemetry-schema.md` @ f5e3ff5)
 
 | # | Request | Status |
@@ -178,24 +197,42 @@ different threads are ordered by `sequence`, not by `mono_ns`.
 | 10 | `mono_ns` range | documented (above); base unchanged |
 | 11 | KV and scheduler names | done: names above are settled; `occupancy`, `avoided_prefill_tokens`, `batch_size`, `queue_ms` added |
 
-## Live transport (not implemented)
+## Live transport (`sonder-infer serve`)
 
-Sonder Inference writes telemetry to sinks (JSONL file, memory, custom
-`TelemetrySink`) and does not serve it over the network yet. If it ever
-serves a live stream, it follows the resume contract proposed by Observatory's
-live client (Sonder-Observatory PR #13):
+`sonder-infer serve` (module `src/server`, ADR-020) serves this stream live
+over HTTP. [SERVER.md](SERVER.md) is the reference; the transport contract
+itself is Observatory's (`protocol/producer-discovery.schema.json`,
+`docs/TELEMETRY_PROTOCOL.md`) and ecosystem contract v1 sections 5.1 to 5.4.
 
-- Endpoints `/ws` (WebSocket), `/sse` (Server-Sent Events) and `/ndjson`
-  (streamed HTTP), each carrying the envelopes above unchanged.
-- Resume point: SSE and HTTP clients send a `Last-Event-ID` header;
-  WebSocket clients pass `?last_event_id=` on the URL. The value is an
-  `event_id` from this stream, so the server can resume after
-  `<instance_id>-<sequence>`. What to do with an id from a different
-  `instance_id` (the producer restarted) is still to be agreed with
-  Observatory before this is built.
-- SSE frames set `id:` to the envelope's `event_id`.
-
-A different contract would need to be documented here first.
+- Discovery: `GET /.well-known/sonder-telemetry` (`sonder.telemetry.producer/1`)
+  names the streams, the resume window and the auth mode.
+- `GET /v1/telemetry/sse` (Server-Sent Events) and `GET /v1/telemetry/ndjson`
+  (one envelope per line) carry the envelopes above unchanged.
+  `GET /v1/telemetry` picks the format from `?format=sse|ndjson`, then
+  `Accept`. There is no WebSocket endpoint in v1.
+- SSE framing: the first write is `retry: 2000`; each event is
+  `id: <event_id>` then `data: <envelope>` then a blank line, with no
+  `event:` field. Idle streams get a `: keepalive` comment (NDJSON: a blank
+  line) every 15 s.
+- Resume: the `Last-Event-ID` header wins over `?last_event_id=`. The id is
+  split at its last `-` into instance and sequence.
+  - Same instance and still retained: replay from the next sequence, then
+    live.
+  - Same instance but older than the retained window: an SSE comment
+    `: resume-gap <from>-<to>` names the missing range, then the whole window
+    is replayed.
+  - Unknown or different instance (**the producer restarted**; this settles
+    the open question recorded here earlier), a malformed id, or no id:
+    replay the whole retained window, then live.
+  - `?since=now`: live only.
+- Backpressure: the server keeps a ring of the last `--telemetry-buffer`
+  events (default 8192) and a bounded queue per subscriber (at most 8
+  subscribers; the ninth gets 429). A subscriber that falls behind loses its
+  oldest undelivered events. That loss is visible as a sequence gap, is
+  announced to that subscriber only (SSE comment `: dropped <n>`), and is
+  counted as `subscriber_dropped_events` in health and discovery. It is
+  **not** reported as `telemetry.dropped`, which keeps meaning bus-queue drops
+  shared by every consumer. Emission never waits for a subscriber.
 
 ## Not emitted yet
 
