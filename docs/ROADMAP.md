@@ -6,23 +6,23 @@
 - [x] seed architecture
 - [x] define scheduler/KV/backend direction
 - [x] define Observatory contract
-- [ ] define C/C++/Rust API boundary
-- [ ] choose implementation language for engine core
-- [ ] establish benchmark harness
+- [x] define C/C++/Rust API boundary (C++20 API + stable C ABI `sonder_inference.h`; Rust binds the C ABI; ADR-011)
+- [x] choose implementation language for engine core (C++20 + CMake presets; ADR-011)
+- [x] establish benchmark harness (skeleton: `sonder-infer bench`, smoke corpus, results schema `sonder.inference.bench/1`, concurrency 1 only)
 - [ ] snapshot Ollama baseline
 - [ ] define first supported model/quantization matrix
 
 ## Phase 1 — direct native inference path
 
-- [ ] Engine / Device / Model / Session abstractions
+- [x] Engine / Device / Model / Session abstractions (CPU inventory only; GPU discovery pending)
 - [ ] llama.cpp/GGML backend
 - [ ] tokenizer + prompt processing
-- [ ] streaming decode
-- [ ] sampling parity
-- [ ] cancellation
-- [ ] model load/unload
-- [ ] telemetry
-- [ ] side-by-side Ollama adapter
+- [x] streaming decode (session API; via mock and Ollama backends; native backend pending)
+- [ ] sampling parity (sampling config + validation done; parity checks need a native backend)
+- [x] cancellation (cooperative tokens; session cancel/close; Ctrl-C in CLI; cancel latency reported)
+- [ ] model load/unload (engine registry + telemetry done; native residency pending)
+- [x] telemetry (Observatory envelope v1 JSONL; lifecycle, request, decode, token, device, drop accounting)
+- [x] side-by-side Ollama adapter (loopback HTTP, streaming, cancellation)
 
 Gate: correctness + reliability parity for selected models.
 
