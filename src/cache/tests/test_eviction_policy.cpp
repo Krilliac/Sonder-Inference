@@ -1,4 +1,7 @@
 #include "sonder/inference/cache/eviction_policy.hpp"
+
+#include <ostream>  // doctest stringifies std::string_view; MSVC needs the full definition
+
 #include <doctest/doctest.h>
 
 using namespace sonder::inference::cache;

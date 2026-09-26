@@ -1,14 +1,16 @@
 #include "sonder/inference/cache/kv_cache_manager.hpp"
-#include <doctest/doctest.h>
 
 #include <algorithm>
 #include <map>
 #include <numeric>
+#include <ostream>  // doctest stringifies std::string_view; MSVC needs the full definition
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <doctest/doctest.h>
 
 using namespace sonder::inference::cache;
 using sonder::inference::ErrorCode;
