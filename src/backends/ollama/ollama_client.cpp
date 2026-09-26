@@ -4,6 +4,7 @@
 #include <string>
 #include <utility>
 
+#include "backends/ollama/ollama_protocol.hpp"
 #include "net/http_client.hpp"
 #include "sonder/inference/backends/ollama.hpp"
 
@@ -35,7 +36,9 @@ std::int64_t int_field(const json::Value& v, std::string_view key) {
     if (f == nullptr || !f->is_number()) {
         return 0;
     }
-    return f->is_integer() ? f->as_int() : static_cast<std::int64_t>(f->as_double());
+    // as_int() truncates in-range doubles and returns 0 for out-of-range ones;
+    // a raw static_cast of e.g. 5e65 is undefined behaviour.
+    return f->as_int(0);
 }
 
 std::string trim(std::string s) {
@@ -187,6 +190,24 @@ json::Object sampling_to_options(const SamplingConfig& s) {
     o.set("top_k", s.top_k);
     o.set("min_p", static_cast<double>(s.min_p));
     o.set("repeat_penalty", static_cast<double>(s.repeat_penalty));
+    // Newer SamplingConfig fields are only sent when they differ from their
+    // disabled/default value, so a default config produces the same options
+    // object as before. logit_bias has no Ollama option and is not forwarded.
+    if (s.num_ctx > 0) {
+        o.set("num_ctx", s.num_ctx);
+    }
+    if (s.repeat_last_n != SamplingConfig{}.repeat_last_n) {
+        o.set("repeat_last_n", s.repeat_last_n);
+    }
+    if (s.presence_penalty != 0.0f) {
+        o.set("presence_penalty", static_cast<double>(s.presence_penalty));
+    }
+    if (s.frequency_penalty != 0.0f) {
+        o.set("frequency_penalty", static_cast<double>(s.frequency_penalty));
+    }
+    if (s.typical_p != 1.0f) {
+        o.set("typical_p", static_cast<double>(s.typical_p));
+    }
     if (s.seed) {
         // Ollama takes a signed 64-bit seed.
         o.set("seed", static_cast<std::int64_t>(*s.seed & 0x7FFFFFFFFFFFFFFFull));
@@ -236,12 +257,16 @@ bool StreamDecoder::feed(std::string_view bytes) {
     if (!error_.ok()) {
         return false;
     }
-    constexpr std::size_t kMaxLine = 16u << 20;
+    // One NDJSON chunk is small; the largest legitimate line is the final
+    // /api/generate chunk carrying the deprecated "context" token array
+    // (~7 bytes per token, so ~1 MiB at 128k context). 4 MiB leaves headroom
+    // while bounding memory and parse time for a misbehaving server.
+    constexpr std::size_t kMaxLine = kMaxNdjsonLineBytes;
     while (!bytes.empty()) {
         const auto nl = bytes.find('\n');
         if (nl == std::string_view::npos) {
             if (buffer_.size() + bytes.size() > kMaxLine) {
-                error_ = Status(ErrorCode::protocol_error, "ollama: NDJSON line exceeds 16 MiB");
+                error_ = Status(ErrorCode::protocol_error, "ollama: NDJSON line exceeds 4 MiB");
                 return false;
             }
             buffer_.append(bytes);

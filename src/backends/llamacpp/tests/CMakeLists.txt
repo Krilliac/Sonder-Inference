@@ -10,6 +10,7 @@ sonder_add_module_tests(llamacpp
     test_llamacpp_util.cpp
     test_llamacpp_nomodel.cpp
     test_llamacpp_adapter.cpp
+    test_llamacpp_chat.cpp
 )
 if(TARGET sonder_llamacpp_tests)
     target_link_libraries(sonder_llamacpp_tests PRIVATE sonder_backend_llamacpp)

@@ -58,22 +58,66 @@ public:
     Result<GenerateStats> generate(const GenerateRequest& request, const CancellationToken& cancel,
                                    const TokenCallback& on_chunk) override {
         if (Status v = validate(request.sampling); !v.ok()) return v;
+        // The llama.cpp context size is fixed at load (ModelLoadOptions::context_length).
+        // A smaller num_ctx is honoured by the engine's scheduling limit; a larger one
+        // cannot be served without reloading.
+        if (request.sampling.num_ctx > 0 && desc_.context_length > 0 &&
+            static_cast<std::uint64_t>(request.sampling.num_ctx) > desc_.context_length) {
+            return Status(ErrorCode::invalid_argument,
+                          "num_ctx " + std::to_string(request.sampling.num_ctx) +
+                              " exceeds the loaded llama.cpp context (" + std::to_string(desc_.context_length) +
+                              "); reload with a larger context_length");
+        }
         // One llama_context per model: serialize requests on it.
         std::lock_guard<std::mutex> lock(mutex_);
+        return run(request.prompt, /*templated=*/false, request.sampling, cancel, on_chunk);
+    }
+
+    // Chat through the GGUF chat template (llama_chat_apply_template). Models
+    // without a template, or with one llama.cpp does not recognise, use the
+    // generic BackendModel::chat() prompt format instead.
+    Result<GenerateStats> chat(const ChatRequest& request, const CancellationToken& cancel,
+                               const TokenCallback& on_chunk) override {
+        if (Status v = validate_chat_messages(request.messages); !v.ok()) return v;
+        if (Status v = validate(request.sampling); !v.ok()) return v;
+        std::vector<lc::ChatTurn> turns;
+        turns.reserve(request.messages.size());
+        for (const auto& m : request.messages) turns.push_back(lc::ChatTurn{m.role, m.content});
+        std::unique_lock<std::mutex> lock(mutex_);
+        std::string prompt;
+        if (!runtime_.ApplyChatTemplate(turns, /*add_assistant=*/true, prompt).ok()) {
+            lock.unlock();
+            return BackendModel::chat(request, cancel, on_chunk);
+        }
+        return run(prompt, /*templated=*/true, request.sampling, cancel, on_chunk);
+    }
+
+    [[nodiscard]] bool has_native_chat() const override {
+        std::string ignored;
+        std::lock_guard<std::mutex> lock(mutex_);
+        return runtime_.ApplyChatTemplate({lc::ChatTurn{"user", "x"}}, true, ignored).ok();
+    }
+
+private:
+    // Caller holds mutex_. `templated` prompts come from the model's chat
+    // template and contain control-token text that must parse as specials.
+    Result<GenerateStats> run(const std::string& prompt, bool templated, const SamplingConfig& sampling,
+                              const CancellationToken& cancel, const TokenCallback& on_chunk) {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
 
         lc::GenerateRequest req;
-        if (lc::Status s = runtime_.Tokenize(request.prompt, /*add_special=*/true, req.prompt); !s.ok()) {
+        if (lc::Status s = runtime_.Tokenize(prompt, /*add_special=*/true, req.prompt, /*parse_special=*/templated);
+            !s.ok()) {
             return ToStatus(s);
         }
         if (req.prompt.empty()) return Status(ErrorCode::invalid_argument, "prompt produced no tokens");
-        req.max_new_tokens = request.sampling.max_tokens;
-        req.sampling = ToLlamaSampling(request.sampling);
+        req.max_new_tokens = sampling.max_tokens;
+        req.sampling = ToLlamaSampling(sampling);
 
         GenerateStats stats;
         stats.load_ns = load_ns_;
         stats.token_counts_from_backend = true;
-        StopSequenceFilter stop(request.sampling.stop);
+        StopSequenceFilter stop(sampling.stop);
         bool callback_stopped = false;
 
         auto deliver = [&](std::string_view text) {
@@ -117,11 +161,10 @@ public:
         return stats;
     }
 
-private:
     ModelDescriptor desc_;
     lc::LlamaCppBackend runtime_;
     std::uint64_t load_ns_ = 0;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
 };
 
 class LlamaCppCoreBackend final : public Backend {

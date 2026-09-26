@@ -25,15 +25,28 @@ No root CMake, preset, CI, or core files were touched.
 | `top_p` | `top_p` | core forbids 0; the chain allows it (keeps `min_keep`) |
 | `top_k` | `top_k` | 0 = disabled in both |
 | `min_p` | `min_p` | |
-| `repeat_penalty` | `repeat_penalty` | window = `penalty_last_n` (64, llama.cpp default) |
+| `repeat_penalty` | `repeat_penalty` | |
+| `repeat_last_n` | `penalty_last_n` | default 64 (llama.cpp/Ollama); -1 = whole context, 0 = off |
+| `presence_penalty` | `presence_penalty` | |
+| `frequency_penalty` | `frequency_penalty` | |
+| `typical_p` | `typical_p` | 1 = off |
+| `logit_bias` | `logit_bias` | token ids range-checked against the vocab by `make_chain` |
+| `num_ctx` | — | backend context request, not a sampler (see below) |
 | `seed` | `seed` | unset means an entropy seed at build time |
 | `stop` | `stop_sequences` | drive `StopSequenceMatcher` from the generation loop |
 | `max_tokens` | — | generation-loop concern, not a sampler |
 
-Fields the core does not carry yet keep their disabled defaults: `typical_p`,
-`frequency_penalty`, `presence_penalty`, `logit_bias`, `stop_tokens`, `min_keep`
-and `stage_order`. Suggested follow-up for the lead: either add these to the core
-config and C ABI, or let sessions hold a `SamplerConfig` directly.
+Since PR #9 (`feat/sampling-config`) the core `SamplingConfig` and the C ABI
+carry `typical_p`, `repeat_last_n`, `presence_penalty`, `frequency_penalty`,
+`logit_bias` and `num_ctx`; see
+[sampling-config.md](sampling-config.md). Only `stop_tokens`, `min_keep` and
+`stage_order` still keep their chain defaults. Sessions build the chain with
+`make_chain(config, nullptr, vocab_size)`. How each backend handles the fields:
+the Sonder chain applies all of them; llama.cpp maps them onto its own
+samplers (`ToLlamaSampling`); Ollama forwards all but `logit_bias`, which it
+rejects with `invalid_argument` because its API has no equivalent. `num_ctx`
+narrows the engine's scheduling context; Ollama receives it as an option;
+llama.cpp rejects a value larger than the context it was loaded with.
 
 `make_chain(core, constraint, vocab)` runs the core `validate()`, then the chain
 validation, then builds the chain. It returns `Result<SamplerChain>` carrying

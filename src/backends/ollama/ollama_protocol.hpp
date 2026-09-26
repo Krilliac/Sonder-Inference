@@ -1,6 +1,7 @@
 // Ollama wire-format helpers (internal; unit-tested without a server).
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <string_view>
 
@@ -8,6 +9,10 @@
 #include "sonder/inference/json.hpp"
 
 namespace sonder::inference::ollama {
+
+// Longest NDJSON line StreamDecoder accepts before failing with
+// protocol_error (see StreamDecoder::feed).
+inline constexpr std::size_t kMaxNdjsonLineBytes = 4u << 20;
 
 // Body for POST /api/generate with stream=true and sampling mapped to options.
 json::Object build_generate_body(const std::string& model, const GenerateRequest& request,

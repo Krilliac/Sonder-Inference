@@ -1,0 +1,1 @@
+{"backend":{"name":"mock"},"model":{"name":"evil|model\nnext"},"label":"a\\b|c","summary":{"measured_requests":1,"ttft_ms":{"n":1,"p50":1e300,"p95":2.0}}}

@@ -1,0 +1,3 @@
+token.generated
+sess
+{"text":"\uD800\u0041","k":"\uDC00"}

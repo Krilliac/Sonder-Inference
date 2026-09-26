@@ -1,0 +1,2 @@
+# Seed inputs are byte-exact fuzz inputs: never normalize line endings.
+* -text

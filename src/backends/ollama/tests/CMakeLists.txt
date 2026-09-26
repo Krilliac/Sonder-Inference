@@ -4,7 +4,8 @@ sonder_add_module_tests(ollama
     test_ollama_adapter.cpp
     ollama_decoder_tests.cpp
     ollama_client_tests.cpp
-    ollama_backend_tests.cpp)
+    ollama_backend_tests.cpp
+    ollama_chat_tests.cpp)
 
 if(TARGET sonder_ollama_tests)
     # cpp-httplib (MIT) is used ONLY by tests, to host the fake server. It is

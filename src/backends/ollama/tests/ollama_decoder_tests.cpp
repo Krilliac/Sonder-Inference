@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "backends/ollama/ollama_protocol.hpp"
 #include "test_support.hpp"
 
 using namespace sonder::inference;
@@ -93,6 +94,52 @@ TEST_CASE("decoder: callback stop") {
     CHECK(d.result().text == "The sky");
 }
 
+TEST_CASE("request bodies: default sampling options are unchanged") {
+    const json::Object opts = sampling_to_options(SamplingConfig{});
+    CHECK(opts.size() == 6u);  // temperature, top_p, top_k, min_p, repeat_penalty, num_predict
+    CHECK_FALSE(opts.contains("num_ctx"));
+    CHECK_FALSE(opts.contains("repeat_last_n"));
+    CHECK_FALSE(opts.contains("presence_penalty"));
+    CHECK_FALSE(opts.contains("frequency_penalty"));
+    CHECK_FALSE(opts.contains("typical_p"));
+    CHECK_FALSE(opts.contains("logit_bias"));
+    CHECK_FALSE(opts.contains("seed"));
+    CHECK(json::Value(sampling_to_options(SamplingConfig::greedy(8, 1))).dump() ==
+          R"({"temperature":0.0,"top_p":1.0,"top_k":0,"min_p":0.0,"repeat_penalty":1.0,"seed":1,"num_predict":8})");
+}
+
+TEST_CASE("request bodies: num_ctx and penalties reach Ollama options") {
+    SamplingConfig s = SamplingConfig::greedy(32, 3);
+    s.num_ctx = 8192;
+    s.repeat_last_n = 128;
+    s.presence_penalty = 0.5f;
+    s.frequency_penalty = -0.25f;
+    s.typical_p = 0.9f;
+    s.repeat_penalty = 1.15f;
+    s.logit_bias = {{42, 5.0f}};
+    const json::Object opts = sampling_to_options(s);
+    REQUIRE(opts.contains("num_ctx"));
+    CHECK(opts.find("num_ctx")->as_int() == 8192);
+    CHECK(opts.find("repeat_last_n")->as_int() == 128);
+    CHECK(opts.find("presence_penalty")->as_double() == doctest::Approx(0.5));
+    CHECK(opts.find("frequency_penalty")->as_double() == doctest::Approx(-0.25));
+    CHECK(opts.find("typical_p")->as_double() == doctest::Approx(0.9));
+    CHECK(opts.find("repeat_penalty")->as_double() == doctest::Approx(1.15));
+    CHECK_FALSE(opts.contains("logit_bias"));  // no Ollama equivalent
+
+    GenerateParams g;
+    g.model = "m";
+    g.prompt = "p";
+    g.options = opts;
+    const json::Value body = build_generate_body(g);
+    CHECK(body.find("options")->find("num_ctx")->as_int() == 8192);
+
+    // repeat_last_n = 0 (window off) differs from the default and is sent.
+    s = SamplingConfig{};
+    s.repeat_last_n = 0;
+    CHECK(sampling_to_options(s).find("repeat_last_n")->as_int() == 0);
+}
+
 TEST_CASE("request bodies: sampling mapping and options") {
     SamplingConfig s = SamplingConfig::greedy(64, 7);
     s.stop = {"</s>"};
@@ -174,8 +221,64 @@ TEST_CASE("telemetry: emit_timing_events maps load/prefill/decode") {
     bus.flush();
     auto lines = sink->lines();
     REQUIRE(lines.size() == 5u);
-    CHECK(lines[0].find("model.load.completed") != std::string::npos);
-    CHECK(lines[1].find("inference.prefill.completed") != std::string::npos);
-    CHECK(lines[2].find("inference.decode.completed") != std::string::npos);
+    CHECK(lines[0].find("backend.model.load.reported") != std::string::npos);
+    CHECK(lines[1].find("backend.timing.prefill") != std::string::npos);
+    CHECK(lines[2].find("backend.timing.decode") != std::string::npos);
     CHECK(lines[2].find("req-1") != std::string::npos);
+}
+
+// Regression tests for docs/integration/hardening.md B6 and the line cap.
+// Repro inputs also live in fuzz/corpus/ollama_stream.
+
+TEST_CASE("parse_stream_line agrees with StreamDecoder (B6)") {
+    struct Case {
+        const char* line;
+        bool ok;
+        ErrorCode code;
+    };
+    const Case cases[] = {
+        {"[1,2]", false, ErrorCode::protocol_error},
+        {"\"text\"", false, ErrorCode::protocol_error},
+        {"42", false, ErrorCode::protocol_error},
+        {"{\"error\":null,\"response\":\"a\"}", true, ErrorCode::ok},
+        {"{\"error\":\"boom\"}", false, ErrorCode::backend_error},
+        {"{\"response\":\"a\"", false, ErrorCode::protocol_error},
+    };
+    for (const auto& c : cases) {
+        CAPTURE(c.line);
+        GenerateStats stats;
+        auto r = parse_stream_line(c.line, stats);
+        CHECK(r.ok() == c.ok);
+        StreamDecoder d(StreamKind::generate, {});
+        CHECK(d.feed(std::string(c.line) + "\n") == c.ok);
+        if (!c.ok) {
+            CHECK(r.status().code() == c.code);
+            CHECK(d.error().code() == c.code);
+        }
+    }
+    GenerateStats stats;
+    auto r = parse_stream_line("{\"error\":null,\"response\":\"a\"}", stats);
+    REQUIRE(r.ok());
+    CHECK(r.value().piece == "a");
+}
+
+TEST_CASE("decoder: lines longer than the cap are rejected") {
+    StreamDecoder d(StreamKind::generate, {});
+    const std::string chunk(1u << 20, ' ');
+    bool ok = true;
+    for (std::size_t sent = 0; ok && sent <= kMaxNdjsonLineBytes; sent += chunk.size()) {
+        ok = d.feed(chunk);
+    }
+    CHECK_FALSE(ok);
+    CHECK(d.error().code() == ErrorCode::protocol_error);
+    CHECK(d.error().message().find("4 MiB") != std::string::npos);
+
+    // A large but legal final chunk (big "context" array) still decodes.
+    std::string line = "{\"response\":\"\",\"done\":true,\"context\":[";
+    for (int i = 0; i < 150000; ++i) line += (i ? ",123456" : "123456");
+    line += "]}\n";
+    REQUIRE(line.size() < kMaxNdjsonLineBytes);
+    StreamDecoder big(StreamKind::generate, {});
+    CHECK(big.feed(line));
+    CHECK(big.finish().ok());
 }

@@ -26,7 +26,12 @@ Result<StreamLine> parse_stream_line(std::string_view line, GenerateStats& stats
         return Status(ErrorCode::protocol_error, "ollama: malformed NDJSON line: " + parsed.status().message());
     }
     const json::Value& v = parsed.value();
-    if (const json::Value* err = v.find("error")) {
+    // Same rules as StreamDecoder::on_line: each line must be an object, and
+    // only a non-null "error" field is a server-side error.
+    if (!v.is_object()) {
+        return Status(ErrorCode::protocol_error, "ollama: malformed NDJSON line: expected a JSON object");
+    }
+    if (const json::Value* err = v.find("error"); err != nullptr && !err->is_null()) {
         return Status(ErrorCode::backend_error, "ollama: " + (err->is_string() ? err->as_string() : err->dump()));
     }
     if (const json::Value* r = v.find("response")) {

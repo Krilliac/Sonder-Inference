@@ -1,3 +1,7 @@
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -72,4 +76,108 @@ TEST_CASE("seeded core config samples reproducibly through make_chain") {
     for (int i = 0; i < 64; ++i) {
         CHECK_EQ(a.value().sample(logits).token, b.value().sample(logits).token);
     }
+}
+
+TEST_CASE("from_core maps typical_p, penalties and logit bias") {
+    core::SamplingConfig in;
+    in.typical_p = 0.8f;
+    in.repeat_last_n = -1;
+    in.presence_penalty = 0.4f;
+    in.frequency_penalty = -0.3f;
+    in.logit_bias = {{7, 2.0f}, {2, -std::numeric_limits<float>::infinity()}};
+    in.num_ctx = 4096;  // backend option; no chain equivalent
+    const SamplerConfig out = from_core(in);
+    CHECK_NEAR(out.typical_p, 0.8, 1e-6);
+    CHECK_EQ(out.penalty_last_n, -1);
+    CHECK_NEAR(out.presence_penalty, 0.4, 1e-6);
+    CHECK_NEAR(out.frequency_penalty, -0.3, 1e-6);
+    REQUIRE_EQ(out.logit_bias.size(), 2u);
+    CHECK_EQ(out.logit_bias[0].token, 7);
+    CHECK_NEAR(out.logit_bias[0].bias, 2.0, 0.0);
+    CHECK_EQ(out.logit_bias[1].token, 2);
+    CHECK(std::isinf(out.logit_bias[1].bias));
+    CHECK(validate(out).ok());
+}
+
+TEST_CASE("default core config maps exactly as before the new fields") {
+    const SamplerConfig out = from_core(core::SamplingConfig{});
+    CHECK_NEAR(out.typical_p, 1.0, 0.0);
+    CHECK_EQ(out.penalty_last_n, 64);
+    CHECK_NEAR(out.presence_penalty, 0.0, 0.0);
+    CHECK_NEAR(out.frequency_penalty, 0.0, 0.0);
+    CHECK(out.logit_bias.empty());
+    CHECK_EQ(out.min_keep, 0);
+    CHECK(out.stage_order == default_stage_order());
+}
+
+TEST_CASE("logit bias from the core config steers the chain") {
+    core::SamplingConfig in = core::SamplingConfig::greedy();
+    in.logit_bias = {{0, 10.0f}, {1, -std::numeric_limits<float>::infinity()}};
+    auto chain = make_chain(in);
+    REQUIRE(chain.ok());
+    // Token 1 is banned; token 0 gets +10 and wins over token 2.
+    CHECK_EQ(chain.value().sample(std::vector<float>{0.0f, 5.0f, 3.0f}).token, 0);
+}
+
+TEST_CASE("core penalties change which token the chain picks") {
+    core::SamplingConfig in = core::SamplingConfig::greedy();
+    in.presence_penalty = 2.0f;
+    auto chain = make_chain(in);
+    REQUIRE(chain.ok());
+    const std::vector<float> logits = {1.0f, 2.0f, 0.0f};
+    auto first = chain.value().sample(logits);
+    REQUIRE(first.ok());
+    CHECK_EQ(first.token, 1);
+    chain.value().accept(first.token);
+    // 2.0 - presence 2.0 = 0.0 < 1.0, so token 0 now wins.
+    CHECK_EQ(chain.value().sample(logits).token, 0);
+}
+
+TEST_CASE("make_chain rejects invalid new core fields and out-of-vocab bias") {
+    core::SamplingConfig bad;
+    bad.frequency_penalty = 5.0f;
+    auto r = make_chain(bad);
+    CHECK(r.status().code() == core::ErrorCode::invalid_argument);
+    CHECK(r.status().message().find("frequency_penalty") != std::string::npos);
+
+    core::SamplingConfig oov;
+    oov.logit_bias = {{100, 1.0f}};
+    auto r2 = make_chain(oov, nullptr, std::size_t{8});
+    CHECK(r2.status().code() == core::ErrorCode::invalid_argument);
+    CHECK(r2.status().message().find("logit_bias") != std::string::npos);
+}
+
+TEST_CASE("seeded runs with every new field set stay deterministic") {
+    core::SamplingConfig in;
+    in.seed = 1234;
+    in.temperature = 1.0f;
+    in.top_k = 0;
+    in.top_p = 1.0f;
+    in.typical_p = 0.95f;
+    in.repeat_last_n = 16;
+    in.presence_penalty = 0.3f;
+    in.frequency_penalty = 0.2f;
+    in.logit_bias = {{3, 1.5f}, {6, -2.0f}};
+    in.num_ctx = 2048;
+    auto run = [&] {
+        auto chain = make_chain(in);
+        REQUIRE(chain.ok());
+        const std::vector<float> logits = {1.0f, 2.0f, 0.5f, 1.5f, -1.0f, 0.0f, 2.2f, 1.1f, 0.3f, 0.9f};
+        std::vector<TokenId> out;
+        for (int i = 0; i < 128; ++i) {
+            const auto res = chain.value().sample(logits);
+            REQUIRE(res.ok());
+            chain.value().accept(res.token);
+            out.push_back(res.token);
+        }
+        return out;
+    };
+    const auto a = run();
+    const auto b = run();
+    CHECK(a == b);
+    // The draw is not degenerate: penalties spread picks over several tokens.
+    std::vector<TokenId> distinct(a);
+    std::sort(distinct.begin(), distinct.end());
+    distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
+    CHECK(distinct.size() > 2u);
 }
