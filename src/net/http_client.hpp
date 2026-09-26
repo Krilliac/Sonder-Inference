@@ -1,5 +1,6 @@
-// Minimal blocking HTTP/1.1 client (internal). Plain HTTP only; intended for
-// loopback control-plane traffic such as a local Ollama server. Supports
+// Minimal blocking HTTP/1.1 client (internal). Plain HTTP, plus https:// when
+// built with SONDER_WITH_TLS=ON (see tls.hpp); intended for control-plane
+// traffic such as an Ollama server. Supports
 // Content-Length, chunked transfer encoding, and read-until-close bodies,
 // streaming the decoded body to a callback while polling a cancellation token.
 #pragma once
@@ -12,16 +13,19 @@
 
 #include "sonder/inference/cancellation.hpp"
 #include "sonder/inference/error.hpp"
+#include "tls.hpp"
 
 namespace sonder::inference::net {
 
 struct Url {
     std::string scheme;
     std::string host;
-    std::uint16_t port = 80;
+    std::uint16_t port = 80;  // 443 for https:// without an explicit port
     std::string path = "/";  // base path, no trailing slash except root
 };
 
+// Accepts http:// and, only when SONDER_HAS_TLS is defined, https://; other
+// schemes (and https:// in non-TLS builds) return ErrorCode::unsupported.
 Result<Url> parse_url(std::string_view text);
 bool is_loopback_host(std::string_view host);
 
@@ -63,6 +67,10 @@ struct HttpRequest {
     std::string content_type = "application/json";
     std::chrono::milliseconds connect_timeout{3000};
     std::chrono::milliseconds total_timeout{300000};
+    // TLS (https). Requires SONDER_HAS_TLS; otherwise the request fails with
+    // ErrorCode::unsupported before anything is sent.
+    bool use_tls = false;
+    TlsOptions tls;
     // Invoked once with the HTTP status code, before any body bytes.
     std::function<void(int)> on_status;
 };
