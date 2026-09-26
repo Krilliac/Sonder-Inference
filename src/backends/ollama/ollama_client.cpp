@@ -176,6 +176,24 @@ json::Object sampling_to_options(const SamplingConfig& s) {
     o.set("top_k", s.top_k);
     o.set("min_p", static_cast<double>(s.min_p));
     o.set("repeat_penalty", static_cast<double>(s.repeat_penalty));
+    // Newer SamplingConfig fields are only sent when they differ from their
+    // disabled/default value, so a default config produces the same options
+    // object as before. logit_bias has no Ollama option and is not forwarded.
+    if (s.num_ctx > 0) {
+        o.set("num_ctx", s.num_ctx);
+    }
+    if (s.repeat_last_n != SamplingConfig{}.repeat_last_n) {
+        o.set("repeat_last_n", s.repeat_last_n);
+    }
+    if (s.presence_penalty != 0.0f) {
+        o.set("presence_penalty", static_cast<double>(s.presence_penalty));
+    }
+    if (s.frequency_penalty != 0.0f) {
+        o.set("frequency_penalty", static_cast<double>(s.frequency_penalty));
+    }
+    if (s.typical_p != 1.0f) {
+        o.set("typical_p", static_cast<double>(s.typical_p));
+    }
     if (s.seed) {
         // Ollama takes a signed 64-bit seed.
         o.set("seed", static_cast<std::int64_t>(*s.seed & 0x7FFFFFFFFFFFFFFFull));

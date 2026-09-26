@@ -75,6 +75,12 @@ typedef struct sonder_engine_options {
     int32_t capture_text;               /* nonzero: include token text in events */
 } sonder_engine_options;
 
+/* One additive logit bias entry (see sonder_sampling_config.logit_bias). */
+typedef struct sonder_logit_bias {
+    int32_t token;  /* vocabulary index, >= 0 */
+    float bias;     /* within [-100, 100], or -INFINITY to ban the token */
+} sonder_logit_bias;
+
 typedef struct sonder_sampling_config {
     uint32_t struct_size;  /* sizeof(sonder_sampling_config) */
     float temperature;
@@ -85,6 +91,20 @@ typedef struct sonder_sampling_config {
     int32_t has_seed;
     uint64_t seed;
     int32_t max_tokens;
+    /* ---- Appended fields (still ABI version 1). The library reads them only
+     * when struct_size >= sizeof(sonder_sampling_config) of this header;
+     * callers built against the original layout (struct_size ending after
+     * max_tokens) keep working and get the defaults below. Initialise with
+     * sonder_sampling_config_init(). ---- */
+    float typical_p;          /* (0, 1]; 1 disables */
+    float presence_penalty;   /* [-2, 2]; 0 disables */
+    float frequency_penalty;  /* [-2, 2]; 0 disables */
+    int32_t repeat_last_n;    /* penalty window: -1 whole context, 0 off, default 64 */
+    int32_t num_ctx;          /* context window request; 0 = backend default */
+    /* Borrowed for the duration of the call only (copied by the library).
+     * May be NULL when logit_bias_count is 0. */
+    const sonder_logit_bias* logit_bias;
+    size_t logit_bias_count;
 } sonder_sampling_config;
 
 typedef struct sonder_generation_stats {
