@@ -11,3 +11,7 @@
 - [Design decisions](DESIGN_DECISIONS.md)
 - [Roadmap](ROADMAP.md)
 - [Upstream license review process](LICENSE_REVIEW.md)
+
+- [Scaffold status](SCAFFOLD.md)
+- [Proposed ecosystem boundaries](BOUNDARIES.md)
+- [Contract workspace](contracts/README.md)
