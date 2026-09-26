@@ -56,7 +56,7 @@ Gate: measurable win on agent fan-out/long-context workloads without interactive
 - [ ] whole-request placement
 - [ ] remote workers
 - [ ] transfer-cost model
-- [ ] remote cache/session transport
+- [ ] remote cache movement where justified
 - [ ] background workload offload
 - [ ] fault/reconnect semantics
 
