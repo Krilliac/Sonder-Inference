@@ -18,20 +18,20 @@
 - [x] llama.cpp/GGML backend (optional build, `SONDER_WITH_LLAMA_CPP=ON`; license approved 2026-09-26)
 - [ ] tokenizer + prompt processing
 - [x] streaming decode (session API; via mock and Ollama backends; native backend pending)
-- [ ] sampling parity (sampling config + validation done; parity checks need a native backend)
+- [ ] sampling parity (sampling config + validation done; Sonder sampler applied for `token_logits` backends; new fields in `feat/sampling-config`; parity checks need a native backend)
 - [x] cancellation (cooperative tokens; session cancel/close; Ctrl-C in CLI; cancel latency reported)
 - [ ] model load/unload (engine registry + telemetry done; native residency pending)
-- [x] telemetry (Observatory envelope v1 JSONL; lifecycle, request, decode, token, device, drop accounting)
+- [x] telemetry (Observatory envelope v1 JSONL; lifecycle, request, decode, token, device, scheduler, KV, sampling, drop accounting; see `docs/TELEMETRY.md`)
 - [x] side-by-side Ollama adapter (loopback HTTP, streaming, cancellation)
 
 Gate: correctness + reliability parity for selected models.
 
 ## Phase 2 — Sonder-owned cache and scheduler
 
-- [x] block/page logical KV manager (`src/cache`, PR #4; not yet driven by the engine)
-- [x] continuous batching (policy: `src/scheduler`, PR #2; engine wiring pending)
-- [x] chunked prefill (policy: `src/scheduler`; engine wiring pending)
-- [x] prefix reuse (logical, fingerprinted: `src/cache`; backend KV reuse pending)
+- [x] block/page logical KV manager (`src/cache`, PR #4; driven by the engine request runtime, ADR-016)
+- [x] continuous batching (policy: `src/scheduler`, PR #2; wired into Engine/Session)
+- [x] chunked prefill (policy: `src/scheduler`; wired, logical KV accounting)
+- [x] prefix reuse (logical, fingerprinted: `src/cache`; shared across concurrent requests by the engine; backend KV reuse pending)
 - [x] session fork/share (logical fork + copy-on-write in `src/cache`; session API wiring pending)
 - [x] cache pressure/eviction (watermarks, priority-aware/LRU eviction in `src/cache`)
 - [x] workload priorities (7 classes, aging, starvation guard in `src/scheduler`)
