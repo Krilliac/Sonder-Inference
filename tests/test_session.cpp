@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <set>
@@ -94,10 +95,17 @@ TEST_CASE("emits correlated lifecycle events in order") {
     const std::string rid = r.value().request_id;
 
     std::vector<std::string> types;
+    std::vector<std::string> all_types;
     for (const auto& e : h.events()) {
         const json::Value* req = e.find("request_id");
         if (req && req->as_string() == rid) {
-            types.push_back(e.find("event_type")->as_string());
+            const std::string type = e.find("event_type")->as_string();
+            all_types.push_back(type);
+            // Scheduler/KV/prefill events are covered by test_engine_runtime.cpp.
+            if (type.rfind("request.", 0) == 0 || type.rfind("inference.decode.", 0) == 0 ||
+                type == "inference.token.generated") {
+                types.push_back(type);
+            }
             CHECK(e.find("session_id")->as_string() == session->id());
             CHECK(e.find("model_instance_id")->as_string() == h.model->instance_id());
             CHECK(e.find("device_id")->as_string() == "cpu:0");
@@ -108,6 +116,17 @@ TEST_CASE("emits correlated lifecycle events in order") {
         "inference.token.generated", "inference.token.generated", "inference.token.generated",
         "inference.token.generated", "inference.decode.completed", "request.completed"};
     CHECK(types == expected);
+    if (h.engine->scheduling_active()) {
+        auto pos = [&](const std::string& t) {
+            return std::find(all_types.begin(), all_types.end(), t) - all_types.begin();
+        };
+        const auto n = static_cast<std::ptrdiff_t>(all_types.size());
+        REQUIRE(pos("scheduler.enqueued") < n);
+        CHECK(pos("scheduler.enqueued") < pos("scheduler.admitted"));
+        CHECK(pos("scheduler.admitted") < pos("scheduler.prefill.completed"));
+        CHECK(pos("scheduler.prefill.completed") < pos("inference.decode.started"));
+        CHECK(pos("kv.freed") < pos("request.completed"));
+    }
 
     auto done = h.events_of("request.completed");
     REQUIRE(done.size() == 1);

@@ -1,6 +1,7 @@
 // Core-interface adapter tests (no model weights needed).
 #include <doctest/doctest.h>
 
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -61,6 +62,41 @@ TEST_CASE("llamacpp adapter: sampling config mapping") {
     CHECK(ToLlamaSampling(c).seed != 0xFFFFFFFFu);
     c.seed = 0x0000000100000002ull;
     CHECK(ToLlamaSampling(c).seed == 3u);
+}
+
+TEST_CASE("llamacpp adapter: new sampling fields are mapped and validated") {
+    SamplingConfig c;
+    auto d = ToLlamaSampling(c);
+    CHECK(d.repeat_last_n == 64);
+    CHECK(d.presence_penalty == 0.0f);
+    CHECK(d.frequency_penalty == 0.0f);
+    CHECK(d.typical_p == 1.0f);
+    CHECK(d.logit_bias.empty());
+
+    c.repeat_last_n = -1;
+    c.presence_penalty = 0.5f;
+    c.frequency_penalty = -0.25f;
+    c.typical_p = 0.9f;
+    c.logit_bias = {{7, 2.5f}, {9, -std::numeric_limits<float>::infinity()}};
+    auto p = ToLlamaSampling(c);
+    CHECK(p.repeat_last_n == -1);
+    CHECK(p.presence_penalty == 0.5f);
+    CHECK(p.frequency_penalty == -0.25f);
+    CHECK(p.typical_p == doctest::Approx(0.9f));
+    REQUIRE(p.logit_bias.size() == 2u);
+    CHECK(p.logit_bias[0].first == 7);
+    CHECK(p.logit_bias[0].second == 2.5f);
+    CHECK(p.logit_bias[1].second == -std::numeric_limits<float>::infinity());
+    CHECK(sonder::backends::llamacpp::Validate(p).ok());
+
+    p.repeat_last_n = -2;
+    CHECK_FALSE(sonder::backends::llamacpp::Validate(p).ok());
+    p.repeat_last_n = 64;
+    p.typical_p = 0.0f;
+    CHECK_FALSE(sonder::backends::llamacpp::Validate(p).ok());
+    p.typical_p = 1.0f;
+    p.logit_bias = {{1, std::numeric_limits<float>::quiet_NaN()}};
+    CHECK_FALSE(sonder::backends::llamacpp::Validate(p).ok());
 }
 
 TEST_CASE("llamacpp adapter: backend identity, capabilities, probe") {

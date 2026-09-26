@@ -130,10 +130,8 @@ private:
     Status error_;
 };
 
-struct ChatMessage {
-    std::string role;  // system | user | assistant | tool
-    std::string content;
-};
+// Same type as the core chat message (role: system | user | assistant | tool).
+using ChatMessage = sonder::inference::ChatMessage;
 
 struct GenerateParams {
     std::string model;
@@ -211,8 +209,10 @@ private:
 // Telemetry: flat attributes for an Ollama request (only fields the server
 // actually reported; nothing is synthesized).
 json::Object timing_attributes(const OllamaTimings& timings);
-// Emits model.load.completed (when load_duration > 0),
-// inference.prefill.completed and inference.decode.completed. Returns the
+// Emits backend.model.load.reported (when load_duration > 0; Ollama reports
+// it even for warm models, so it is not a residency transition),
+// backend.timing.prefill and backend.timing.decode. The names are distinct
+// from the session's inference.* events so nothing is duplicated. Returns the
 // number of events accepted by the bus.
 int emit_timing_events(TelemetryBus& bus, const TelemetryContext& context, const OllamaTimings& timings,
                        std::string_view model);

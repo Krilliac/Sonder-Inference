@@ -64,17 +64,29 @@ struct SamplerDeleter {
 };
 using SamplerPtr = std::unique_ptr<llama_sampler, SamplerDeleter>;
 
-SamplerPtr MakeSampler(const SamplingParams& p, int32_t n_vocab) {
+// Order follows llama.cpp's common sampler: logit bias, penalties, top-k,
+// typical, top-p, min-p, temperature, then the selector.
+SamplerPtr MakeSampler(const SamplingParams& p, int32_t n_vocab, int32_t n_ctx) {
     SamplerPtr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
-    if (p.repeat_penalty != 1.0F && p.repeat_last_n > 0) {
-        llama_sampler_chain_add(chain.get(),
-                                llama_sampler_init_penalties(n_vocab, p.repeat_last_n, p.repeat_penalty, 0.0F, 0.0F));
+    if (!p.logit_bias.empty()) {
+        std::vector<llama_logit_bias> bias;
+        bias.reserve(p.logit_bias.size());
+        for (const auto& [token, value] : p.logit_bias) bias.push_back(llama_logit_bias{token, value});
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_logit_bias(n_vocab, static_cast<int32_t>(bias.size()),
+                                                                           bias.data()));
+    }
+    const int32_t last_n = p.repeat_last_n < 0 ? n_ctx : p.repeat_last_n;
+    const bool penalties = p.repeat_penalty != 1.0F || p.presence_penalty != 0.0F || p.frequency_penalty != 0.0F;
+    if (penalties && last_n > 0) {
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_penalties(n_vocab, last_n, p.repeat_penalty,
+                                                                          p.frequency_penalty, p.presence_penalty));
     }
     if (p.temperature <= 0.0F) {
         llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());
         return chain;
     }
     if (p.top_k > 0) llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(p.top_k));
+    if (p.typical_p < 1.0F) llama_sampler_chain_add(chain.get(), llama_sampler_init_typical(p.typical_p, 1));
     if (p.top_p < 1.0F) llama_sampler_chain_add(chain.get(), llama_sampler_init_top_p(p.top_p, 1));
     if (p.min_p > 0.0F) llama_sampler_chain_add(chain.get(), llama_sampler_init_min_p(p.min_p, 1));
     llama_sampler_chain_add(chain.get(), llama_sampler_init_temp(p.temperature));
@@ -234,7 +246,8 @@ ModelInfo LlamaCppBackend::GetModelInfo() const {
     return info;
 }
 
-Status LlamaCppBackend::Tokenize(std::string_view text, bool add_special, std::vector<Token>& out) const {
+Status LlamaCppBackend::Tokenize(std::string_view text, bool add_special, std::vector<Token>& out,
+                                 bool parse_special) const {
     out.clear();
     if (!IsLoaded()) return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
     if (text.size() > static_cast<std::size_t>(INT32_MAX)) {
@@ -244,11 +257,11 @@ Status LlamaCppBackend::Tokenize(std::string_view text, bool add_special, std::v
     // Upper bound: one token per byte plus BOS/EOS.
     out.resize(static_cast<std::size_t>(len) + 2);
     int32_t n = llama_tokenize(impl_->vocab, text.data(), len, out.data(),
-                               static_cast<int32_t>(out.size()), add_special, /*parse_special=*/false);
+                               static_cast<int32_t>(out.size()), add_special, parse_special);
     if (n < 0 && n != INT32_MIN) {
         out.resize(static_cast<std::size_t>(-n));
         n = llama_tokenize(impl_->vocab, text.data(), len, out.data(),
-                           static_cast<int32_t>(out.size()), add_special, false);
+                           static_cast<int32_t>(out.size()), add_special, parse_special);
     }
     if (n < 0) {
         out.clear();
@@ -284,6 +297,50 @@ bool LlamaCppBackend::IsEndOfGeneration(Token token) const {
     return IsLoaded() && llama_vocab_is_eog(impl_->vocab, token);
 }
 
+std::string LlamaCppBackend::ChatTemplate() const {
+    if (!IsLoaded()) return {};
+    const char* tmpl = llama_model_chat_template(impl_->model, /*name=*/nullptr);
+    return tmpl != nullptr ? std::string(tmpl) : std::string();
+}
+
+Status LlamaCppBackend::ApplyChatTemplate(const std::vector<ChatTurn>& messages, bool add_assistant,
+                                          std::string& out) const {
+    out.clear();
+    if (!IsLoaded()) return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
+    const std::string tmpl = ChatTemplate();
+    if (tmpl.empty()) return Status::Error(ErrorCode::kInvalidArgument, "model has no chat template");
+    return FormatChat(tmpl, messages, add_assistant, out);
+}
+
+Status LlamaCppBackend::FormatChat(std::string_view chat_template, const std::vector<ChatTurn>& messages,
+                                   bool add_assistant, std::string& out) {
+    out.clear();
+    if (chat_template.empty()) return Status::Error(ErrorCode::kInvalidArgument, "empty chat template");
+    if (messages.empty()) return Status::Error(ErrorCode::kInvalidArgument, "no chat messages");
+    const std::string tmpl(chat_template);
+    std::vector<llama_chat_message> chat;
+    chat.reserve(messages.size());
+    std::size_t total = 0;
+    for (const auto& m : messages) {
+        chat.push_back(llama_chat_message{m.role.c_str(), m.content.c_str()});
+        total += m.role.size() + m.content.size();
+    }
+    if (total > static_cast<std::size_t>(INT32_MAX / 4)) {
+        return Status::Error(ErrorCode::kInvalidArgument, "chat too long");
+    }
+    std::vector<char> buf(total * 2 + 256);
+    int32_t n = llama_chat_apply_template(tmpl.c_str(), chat.data(), chat.size(), add_assistant, buf.data(),
+                                          static_cast<int32_t>(buf.size()));
+    if (n > static_cast<int32_t>(buf.size())) {
+        buf.resize(static_cast<std::size_t>(n));
+        n = llama_chat_apply_template(tmpl.c_str(), chat.data(), chat.size(), add_assistant, buf.data(),
+                                      static_cast<int32_t>(buf.size()));
+    }
+    if (n < 0) return Status::Error(ErrorCode::kInvalidArgument, "chat template not supported by llama.cpp");
+    out.assign(buf.data(), static_cast<std::size_t>(n));
+    return Status::Ok();
+}
+
 void LlamaCppBackend::SetTelemetrySink(TelemetrySink sink) { impl_->telemetry = std::move(sink); }
 
 GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const TokenCallback& on_token,
@@ -304,6 +361,11 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
     const int32_t n_vocab = llama_vocab_n_tokens(impl_->vocab);
     for (Token t : request.prompt) {
         if (t < 0 || t >= n_vocab) return fail(ErrorCode::kInvalidArgument, "prompt token out of range");
+    }
+    for (const auto& entry : request.sampling.logit_bias) {
+        if (entry.first < 0 || entry.first >= n_vocab) {
+            return fail(ErrorCode::kInvalidArgument, "logit_bias token out of range");
+        }
     }
 
     llama_context* ctx = impl_->ctx;
@@ -356,7 +418,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
     impl_->Emit(TelemetryKind::kPrefillDone, result.prompt_tokens, result.prefill_ms);
 
     // ---- Streaming decode ----
-    SamplerPtr sampler = MakeSampler(request.sampling, n_vocab);
+    SamplerPtr sampler = MakeSampler(request.sampling, n_vocab, static_cast<int32_t>(n_ctx));
     Utf8StreamBuffer utf8;
     int64_t pos = n_past + n_prompt;
     const auto decode_start = Clock::now();

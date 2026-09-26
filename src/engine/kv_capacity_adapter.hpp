@@ -12,6 +12,10 @@
 // - release() drops the reservation only. Sequence lifetime (add_sequence,
 //   free_sequence, fork) stays with the engine, so KV can outlive a
 //   reservation, e.g. for prefix reuse after completion.
+// - An optional release hook lets the engine free the request's sequence
+//   synchronously inside release(). The scheduler preempts victims one at a
+//   time and re-reads free_blocks() after each release, so blocks must
+//   become reusable immediately or it would preempt every running request.
 // - Prefix-cache hits are not discounted; reservations are worst case.
 //
 // Only available when both modules are built.
@@ -20,6 +24,8 @@
 #if defined(SONDER_HAS_KV_CACHE) && defined(SONDER_HAS_SCHEDULER)
 
 #include <algorithm>
+#include <functional>
+#include <utility>
 #include <unordered_map>
 
 #include "sonder/inference/cache/kv_cache_manager.hpp"
@@ -51,7 +57,15 @@ public:
         held_[id] += blocks;
         return true;
     }
-    void release(scheduler::RequestId id) override { held_.erase(id); }
+    void release(scheduler::RequestId id) override {
+        held_.erase(id);
+        if (release_hook_) {
+            release_hook_(id);
+        }
+    }
+    /// Called after a reservation is dropped (preemption, completion, failure,
+    /// cancellation). Runs on the scheduler's caller thread.
+    void set_release_hook(std::function<void(scheduler::RequestId)> hook) { release_hook_ = std::move(hook); }
     [[nodiscard]] scheduler::BlockCount blocks_held(
         scheduler::RequestId id) const noexcept override {
         const auto it = held_.find(id);
@@ -72,6 +86,7 @@ public:
 private:
     cache::KvCacheManager& manager_;
     std::unordered_map<scheduler::RequestId, scheduler::BlockCount> held_;
+    std::function<void(scheduler::RequestId)> release_hook_;
 };
 
 }  // namespace sonder::inference

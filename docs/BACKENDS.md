@@ -112,10 +112,21 @@ Native code is justified when:
 
 | Backend | Status | Capabilities advertised |
 | --- | --- | --- |
-| `mock` | implemented; **tests only**, performs no inference | tokenization, streaming, deterministic |
+| `mock` | implemented; **tests only**, performs no inference | tokenization, streaming, deterministic; token_logits when `MockBackendOptions::token_logits` |
 | `ollama` | implemented; loopback HTTP, streaming, cancellable | streaming, remote_process |
 | `llamacpp` | implemented, optional (`SONDER_WITH_LLAMA_CPP=ON`, pinned b11195); CPU by default, GPU via `GGML_*` | tokenization, streaming, batched_prefill, deterministic |
 
 The interface lives in `include/sonder/inference/backend.hpp`. Capabilities
-are a bitset (`Capability`), matching the list above plus `deterministic`
-and `remote_process`.
+are a bitset (`Capability`), matching the list above plus `deterministic`,
+`remote_process`, `token_logits` (the backend exposes per-step logits via
+`BackendModel::open_token_stream()` and Sonder samples with its own chain; see
+[integration/engine-wiring.md](integration/engine-wiring.md)).
+`ModelDescriptor::resident` is false when `load_model()` only fetched
+metadata (Ollama); telemetry reports it on `model.load.completed`.
+
+Sampling fields per backend: the Sonder chain (backends with `token_logits`)
+and llama.cpp apply every `SamplingConfig` field. Ollama forwards all of them
+as request options except `logit_bias`. A request with a non-empty
+`logit_bias` fails with `invalid_argument` on Ollama. llama.cpp rejects a
+`num_ctx` larger than the context it was loaded with. See
+[integration/sampling-config.md](integration/sampling-config.md).

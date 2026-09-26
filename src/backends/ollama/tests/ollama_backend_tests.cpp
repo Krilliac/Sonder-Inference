@@ -109,3 +109,20 @@ TEST_CASE("backend: callback stop and cancellation") {
     });
     CHECK(cancelled.status().code() == ErrorCode::cancelled);
 }
+
+TEST_CASE("backend: logit_bias is rejected, not silently dropped") {
+    FakeOllamaServer srv;
+    srv.set_show("llama3.2:3b", fixture("show.json"));
+    auto be = make_ollama_backend(config_for(srv));
+    auto m = be->load_model({"llama3.2:3b", "cpu:0"});
+    REQUIRE(m.ok());
+    GenerateRequest req;
+    req.prompt = "hi";
+    req.sampling = SamplingConfig::greedy(8, 1);
+    req.sampling.logit_bias = {{42, 5.0f}};
+    auto st = m.value()->generate(req, {}, {});
+    REQUIRE_FALSE(st.ok());
+    CHECK(st.status().code() == ErrorCode::invalid_argument);
+    CHECK(st.status().message().find("logit_bias") != std::string::npos);
+    CHECK(srv.last_generate_body().empty());  // nothing was sent
+}
