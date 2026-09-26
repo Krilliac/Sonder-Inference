@@ -1,8 +1,16 @@
 #include "sonder/inference/session.hpp"
 
 #include <chrono>
+#include <utility>
 
+#include "engine/accounting_tokens.hpp"
+#include "engine/request_runtime.hpp"
 #include "sonder/inference/engine.hpp"
+
+#if defined(SONDER_HAS_SAMPLER_CHAIN)
+#include "sonder/sampling/core_bridge.hpp"
+#include "sonder/sampling/stop.hpp"
+#endif
 
 namespace sonder::inference {
 
@@ -11,6 +19,19 @@ const char* to_string(SessionState state) noexcept {
         case SessionState::idle: return "idle";
         case SessionState::running: return "running";
         case SessionState::closed: return "closed";
+    }
+    return "unknown";
+}
+
+const char* to_string(WorkloadClass workload) noexcept {
+    switch (workload) {
+        case WorkloadClass::interactive_user: return "interactive_user";
+        case WorkloadClass::owner_orchestrator: return "owner_orchestrator";
+        case WorkloadClass::critic_verification: return "critic_verification";
+        case WorkloadClass::implementation_worker: return "implementation_worker";
+        case WorkloadClass::research_worker: return "research_worker";
+        case WorkloadClass::background_indexing: return "background_indexing";
+        case WorkloadClass::maintenance: return "maintenance";
     }
     return "unknown";
 }
@@ -27,10 +48,41 @@ const char* to_string(RequestOutcome outcome) noexcept {
 
 namespace {
 json::Value sampling_json(const SamplingConfig& s) {
-    json::Object o{{"temperature", s.temperature}, {"top_p", s.top_p},     {"top_k", s.top_k},
-                   {"min_p", s.min_p},             {"repeat_penalty", s.repeat_penalty},
-                   {"seed", s.seed},               {"max_tokens", s.max_tokens}};
+    json::Object o{{"temperature", s.temperature},
+                   {"top_p", s.top_p},
+                   {"top_k", s.top_k},
+                   {"min_p", s.min_p},
+                   {"typical_p", s.typical_p},
+                   {"repeat_penalty", s.repeat_penalty},
+                   {"frequency_penalty", s.frequency_penalty},
+                   {"presence_penalty", s.presence_penalty},
+                   {"penalty_last_n", s.penalty_last_n},
+                   {"logit_bias_entries", s.logit_bias.size()},
+                   {"num_ctx", s.num_ctx},
+                   {"seed", s.seed},
+                   {"max_tokens", s.max_tokens}};
     return o;
+}
+
+// Compatibility fingerprint for prefix sharing: requests may share cached KV
+// only for the same backend model (name, format, family, quantization).
+std::uint64_t model_fingerprint(const Model& m) {
+    std::uint64_t h = 1469598103934665603ull;
+    auto mix = [&](const std::string& part) {
+        for (const char c : part) {
+            h ^= static_cast<unsigned char>(c);
+            h *= 1099511628211ull;
+        }
+        h ^= 0xFFu;
+        h *= 1099511628211ull;
+    };
+    const auto& d = m.descriptor();
+    mix(m.backend_name());
+    mix(d.name);
+    mix(d.format);
+    mix(d.family);
+    mix(d.quantization);
+    return h;
 }
 
 double ms_between(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
@@ -44,6 +96,7 @@ Session::Session(Engine& engine, std::shared_ptr<Model> model, SessionOptions op
                              json::Object{{"model", model_->descriptor().name},
                                           {"backend", model_->backend_name()},
                                           {"priority", options_.priority},
+                                          {"workload", to_string(options_.workload)},
                                           {"sampling", sampling_json(options_.sampling)}},
                              TelemetryLevel::metrics);
 }
@@ -103,6 +156,114 @@ void Session::close() {
                              json::Object{{"requests", requests_started()}}, TelemetryLevel::metrics);
 }
 
+#if defined(SONDER_HAS_SAMPLER_CHAIN)
+namespace {
+
+// Token-level decode loop with Sonder's sampler chain (Capability::token_logits).
+// NoViableCandidates maps to invalid_argument: it only happens when the
+// request's own policy (logit_bias bans, penalties, constraints) excludes every
+// token, so retrying the same request cannot succeed. EmptyLogits is a backend
+// fault (backend_error).
+template <class Gate, class Produced, class Deliver>
+Result<GenerateStats> run_sonder_sampling(TokenStream& stream, const SamplingConfig& config,
+                                          const CancellationToken& cancel, TelemetryBus& bus,
+                                          const TelemetryContext& ctx, const Gate& gate, const Produced& produced,
+                                          const Deliver& deliver) {
+    namespace smp = sampling;
+    GenerateStats stats;
+    stats.prompt_tokens = stream.prompt_tokens().size();
+    stats.token_counts_from_backend = true;
+
+    auto built = smp::make_chain(config, nullptr, stream.vocab_size());
+    if (!built.ok()) {
+        return built.status();
+    }
+    smp::SamplerChain& chain = built.value();
+    chain.accept_prompt(stream.prompt_tokens());
+    {
+        json::Array stages;
+        for (const auto name : chain.stage_names()) {
+            stages.emplace_back(std::string(name));
+        }
+        bus.emit("sampling.configured", ctx,
+                 json::Object{{"sampler", "sonder"},
+                              {"selector", config.temperature == 0.0f ? "greedy" : "distribution"},
+                              {"stages", std::move(stages)},
+                              {"seed", config.seed},
+                              {"vocab_size", stream.vocab_size()},
+                              {"logit_bias_entries", config.logit_bias.size()}},
+                 TelemetryLevel::metrics);
+    }
+
+    smp::StopSequenceMatcher stop(config.stop);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (std::int32_t i = 0; i < config.max_tokens; ++i) {
+        if (cancel.cancelled()) {
+            return Status(ErrorCode::cancelled, "cancelled by caller");
+        }
+        if (!gate()) {
+            stats.stop_reason = StopReason::callback;
+            return stats;
+        }
+        auto logits = stream.next_logits(cancel);
+        if (!logits.ok()) {
+            return logits.status();
+        }
+        const smp::SampleResult sampled = chain.sample(logits.value());
+        if (!sampled.ok()) {
+            const bool no_viable = sampled.status == smp::SampleStatus::NoViableCandidates;
+            const ErrorCode code = no_viable ? ErrorCode::invalid_argument : ErrorCode::backend_error;
+            bus.emit("sampling.failed", ctx,
+                     json::Object{{"status", no_viable ? "no_viable_candidates" : "empty_logits"},
+                                  {"error_code", to_string(code)},
+                                  {"position", i}},
+                     TelemetryLevel::metrics);
+            return Status(code, no_viable ? "sampling failed: no viable candidates (logit_bias, penalties or "
+                                            "constraints excluded every token)"
+                                          : "sampling failed: backend returned empty logits");
+        }
+        chain.accept(sampled.token);
+        produced(sampled.token);
+        if (stream.is_end_of_generation(sampled.token) || chain.is_stop_token(sampled.token)) {
+            stats.stop_reason = StopReason::end_of_sequence;
+            break;
+        }
+        std::string piece;
+        if (Status st = stream.accept(sampled.token, piece); !st.ok()) {
+            return st;
+        }
+        ++stats.completion_tokens;
+        const smp::StopCheck check = stop.feed(piece);
+        if (!check.emit.empty()) {
+            const TokenChunk chunk{check.emit, stats.chunks++};
+            if (!deliver(chunk, sampled.token, sampled.probability)) {
+                stats.stop_reason = StopReason::callback;
+                break;
+            }
+        }
+        if (check.stopped) {
+            stats.stop_reason = StopReason::stop_sequence;
+            break;
+        }
+    }
+    if (stats.stop_reason == StopReason::none) {
+        stats.stop_reason = StopReason::max_tokens;
+    }
+    if (stats.stop_reason == StopReason::max_tokens || stats.stop_reason == StopReason::end_of_sequence) {
+        const std::string rest = stop.flush();
+        if (!rest.empty()) {
+            const TokenChunk chunk{rest, stats.chunks++};
+            (void)deliver(chunk, std::nullopt, 0.0f);
+        }
+    }
+    stats.eval_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    return stats;
+}
+
+}  // namespace
+#endif
+
 Result<GenerationResult> Session::generate(const std::string& prompt, const TokenCallback& on_chunk,
                                            const std::optional<SamplingConfig>& sampling_override) {
     const SamplingConfig sampling = sampling_override.value_or(options_.sampling);
@@ -134,21 +295,86 @@ Result<GenerationResult> Session::generate(const std::string& prompt, const Toke
     const auto ctx = telemetry_context(request.request_id);
     const bool emit_tokens = bus.enabled(TelemetryLevel::standard);
     const bool capture_text = bus.options().capture_text;
+    BackendModel& backend_model = model_->backend_model();
 
     bus.emit("request.queued", ctx,
-             json::Object{{"kind", "generate"}, {"priority", options_.priority}, {"prompt_bytes", prompt.size()}},
+             json::Object{{"kind", "generate"},
+                          {"priority", options_.priority},
+                          {"workload", to_string(options_.workload)},
+                          {"prompt_bytes", prompt.size()}},
              TelemetryLevel::metrics);
     const auto t_start = std::chrono::steady_clock::now();
-    bus.emit("request.started", ctx, json::Object{{"kind", "generate"}, {"sampling", sampling_json(sampling)}},
-             TelemetryLevel::metrics);
 
     GenerationResult result;
     result.request_id = request.request_id;
+    Status failure;
+    bool pre_failed = false;
+
+    // Sampling path: Sonder's sampler chain when the backend exposes logits.
+    std::unique_ptr<TokenStream> stream;
+#if defined(SONDER_HAS_SAMPLER_CHAIN)
+    if (const auto backend = engine_.find_backend(model_->backend_name());
+        backend && backend->capabilities().has(Capability::token_logits)) {
+        auto opened = backend_model.open_token_stream(request);
+        if (opened.ok()) {
+            stream = std::move(opened).value();
+        } else {
+            failure = opened.status();
+            pre_failed = true;
+        }
+    }
+#endif
+    result.scheduling.sonder_sampled = stream != nullptr;
+
+    // Scheduling: the request enters the scheduler queue and holds KV blocks.
+    detail::RequestRuntime* runtime = engine_.request_runtime();
+    std::optional<std::uint64_t> sched_id;
+    if (runtime != nullptr && !pre_failed) {
+        detail::RuntimeRequestSpec spec;
+        spec.context = ctx;
+        spec.workload = options_.workload;
+        spec.priority = options_.priority;
+        if (stream) {
+            spec.prompt_tokens = stream->prompt_tokens();
+            spec.exact_tokens = true;
+        } else if (auto tk = backend_model.tokenize(prompt); tk.ok() && !tk.value().empty()) {
+            spec.prompt_tokens = std::move(tk).value();
+            spec.exact_tokens = true;
+        }
+        if (spec.prompt_tokens.empty()) {
+            spec.prompt_tokens = detail::accounting_tokenize(prompt);
+            spec.exact_tokens = false;
+        }
+        spec.max_new_tokens = static_cast<std::uint32_t>(sampling.max_tokens);
+        const std::uint64_t ctx_limit = sampling.num_ctx > 0 ? static_cast<std::uint64_t>(sampling.num_ctx)
+                                                             : model_->descriptor().context_length;
+        spec.context_limit = static_cast<std::uint32_t>(std::min<std::uint64_t>(ctx_limit, 0xFFFFFFFFull));
+        spec.fingerprint = model_fingerprint(*model_);
+        result.scheduling.accounted_prompt_tokens = spec.prompt_tokens.size();
+        result.scheduling.exact_prompt_tokens = spec.exact_tokens;
+        auto submitted = runtime->submit(std::move(spec));
+        if (submitted.ok()) {
+            sched_id = submitted.value();
+            result.scheduling.scheduled = true;
+        } else {
+            failure = submitted.status();
+            pre_failed = true;
+        }
+    }
+
+    bus.emit("request.started", ctx,
+             json::Object{{"kind", "generate"},
+                          {"sampling", sampling_json(sampling)},
+                          {"scheduled", sched_id.has_value()},
+                          {"sampler", stream ? "sonder" : "backend"}},
+             TelemetryLevel::metrics);
+
     std::chrono::steady_clock::time_point t_first{};
     bool have_first = false;
     std::uint64_t delivered = 0;
 
-    const TokenCallback wrapped = [&](const TokenChunk& chunk) -> bool {
+    // Telemetry + user callback for one visible chunk (not gated).
+    const auto deliver = [&](const TokenChunk& chunk, std::optional<TokenId> token_id, float probability) -> bool {
         const auto now = std::chrono::steady_clock::now();
         if (!have_first) {
             have_first = true;
@@ -163,6 +389,10 @@ Result<GenerationResult> Session::generate(const std::string& prompt, const Toke
             json::Object attrs{{"index", chunk.index},
                                {"bytes", chunk.text.size()},
                                {"elapsed_ms", ms_between(t_start, now)}};
+            if (token_id) {
+                attrs.set("token_id", *token_id);
+                attrs.set("probability", probability);
+            }
             if (capture_text) {
                 attrs.set("text", std::string(chunk.text));
             }
@@ -174,7 +404,43 @@ Result<GenerationResult> Session::generate(const std::string& prompt, const Toke
         return true;
     };
 
-    auto generated = model_->backend_model().generate(request, token, wrapped);
+    // Scheduler gate: every generated token waits for a grant.
+    std::optional<Status> gate_failure;
+    const auto gate = [&]() -> bool {
+        if (!sched_id) {
+            return true;
+        }
+        Status st = runtime->acquire_token(*sched_id, token);
+        if (st.ok()) {
+            return true;
+        }
+        if (st.code() != ErrorCode::cancelled) {
+            gate_failure = std::move(st);
+        }
+        return false;
+    };
+    const auto produced = [&](TokenId t) {
+        if (sched_id) {
+            runtime->token_produced(*sched_id, t);
+        }
+    };
+
+    Result<GenerateStats> generated = GenerateStats{};
+    if (pre_failed) {
+        generated = failure;
+    } else if (stream) {
+#if defined(SONDER_HAS_SAMPLER_CHAIN)
+        generated = run_sonder_sampling(*stream, sampling, token, bus, ctx, gate, produced, deliver);
+#endif
+    } else {
+        generated = backend_model.generate(request, token, [&](const TokenChunk& chunk) -> bool {
+            if (!gate()) {
+                return false;
+            }
+            produced(detail::accounting_chunk_token(chunk.text));
+            return deliver(chunk, std::nullopt, 0.0f);
+        });
+    }
     const auto t_end = std::chrono::steady_clock::now();
     result.total_ms = ms_between(t_start, t_end);
 
@@ -182,8 +448,13 @@ Result<GenerationResult> Session::generate(const std::string& prompt, const Toke
         token.cancelled() || (!generated.ok() && generated.status().code() == ErrorCode::cancelled);
 
     RequestOutcome outcome = RequestOutcome::completed;
-    Status failure;
-    if (was_cancelled) {
+    if (gate_failure && !token.cancelled()) {
+        outcome = RequestOutcome::failed;
+        failure = *gate_failure;
+        if (generated.ok()) {
+            result.stats = generated.value();
+        }
+    } else if (was_cancelled) {
         outcome = RequestOutcome::cancelled;
         if (generated.ok()) {
             result.stats = generated.value();
@@ -203,6 +474,13 @@ Result<GenerationResult> Session::generate(const std::string& prompt, const Toke
     }
     result.outcome = outcome;
 
+    if (sched_id) {
+        const detail::RuntimeRequestSummary sched = runtime->finish(*sched_id, outcome);
+        result.scheduling.preemptions = sched.preemptions;
+        result.scheduling.queue_ms = sched.queue_ms;
+        result.scheduling.reused_prompt_tokens = sched.reused_prompt_tokens;
+    }
+
     const std::uint64_t cancel_ns = cancel_requested_ns_.load();
     const std::uint64_t now_ns = monotonic_ns();
 
@@ -213,7 +491,15 @@ Result<GenerationResult> Session::generate(const std::string& prompt, const Toke
                          {"chunks", delivered},
                          {"token_counts_from_backend", result.stats.token_counts_from_backend},
                          {"ttft_ms", result.ttft_ms},
-                         {"total_ms", result.total_ms}};
+                         {"total_ms", result.total_ms},
+                         {"scheduled", result.scheduling.scheduled},
+                         {"sampler", result.scheduling.sonder_sampled ? "sonder" : "backend"}};
+    if (result.scheduling.scheduled) {
+        summary.set("queue_ms", result.scheduling.queue_ms);
+        summary.set("preemptions", result.scheduling.preemptions);
+        summary.set("accounted_prompt_tokens", result.scheduling.accounted_prompt_tokens);
+        summary.set("reused_prompt_tokens", result.scheduling.reused_prompt_tokens);
+    }
 
     if (outcome == RequestOutcome::completed) {
         const double decode_ms = have_first ? ms_between(t_first, t_end) : 0.0;
