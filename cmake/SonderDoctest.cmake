@@ -19,6 +19,10 @@ FetchContent_MakeAvailable(doctest)
 if(NOT TARGET sonder_doctest)
     add_library(sonder_doctest INTERFACE)
     target_include_directories(sonder_doctest SYSTEM INTERFACE "${doctest_SOURCE_DIR}")
+    # Use real <ostream>/<string> instead of doctest's std forward declarations;
+    # MSVC 14.5x rejects the forward-declared basic_ostream once <string_view>
+    # is parsed afterwards (C2027 in __msvc_string_view.hpp).
+    target_compile_definitions(sonder_doctest INTERFACE DOCTEST_CONFIG_USE_STD_HEADERS)
 endif()
 include("${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake")
 

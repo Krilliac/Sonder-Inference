@@ -1,6 +1,11 @@
 # Devices
 
-Planned responsibility: Capability discovery and inference placement policy.
+Responsibility: Capability discovery and inference placement policy.
 
-Reserved directory only. No implementation, public API, or dependency is defined.
+Implemented: `device.cpp` reports the host CPU (brand string, logical cores,
+total/available RAM) on Windows, Linux, and macOS, plus host platform/name.
+
+Deferred: GPU/NPU discovery (expected via backend capability probing) and the
+placement planner.
+
 See [source workspace](../README.md).
