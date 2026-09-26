@@ -137,15 +137,20 @@ a pinned version and SHA-256, used by the test executable only, and never
 vendored into the repository or linked into the library. Tests are registered
 with CTest per test case. See [LICENSE_REVIEW.md](LICENSE_REVIEW.md#doctest).
 
-## ADR-015 — Project license: MIT
+## ADR-015 — Project license: Apache-2.0
 
-**Date:** 2026-09-26. **Status:** accepted (Nate: "any license will do,
-whatever is best/matched my other repos").
+**Date:** 2026-09-26. **Status:** accepted (revised the same day: Nate
+overrode the initial MIT choice with Apache-2.0).
 
-**Decision:** Sonder Inference is released under the MIT License (root
-`LICENSE`, Copyright (c) 2026 Krilliac).
+**Decision:** Sonder Inference is licensed under the Apache License, Version
+2.0. The root `LICENSE` holds the full standard text. `NOTICE` reads
+"Sonder-Inference, Copyright 2026 Nate Witkowski" and credits the fetched MIT
+third-party code (llama.cpp b11195, cpp-httplib v0.58.0 test-only, doctest
+test-only).
 
-**Reason:** MIT is the license most of Krilliac's other repositories use (see
-the survey in [LICENSE_REVIEW.md](LICENSE_REVIEW.md#project-license)); the same
-rule is applied to Sonder-Observatory. All adopted dependencies are MIT, so no
-dependency constrains the choice.
+**Reason:** Nate's explicit choice. It adds an express patent grant and a
+NOTICE convention for attribution. All adopted dependencies are MIT, which
+is compatible with Apache-2.0 as long as the MIT notices are kept (they are
+in `NOTICE`). History: PR #7 first adopted MIT from a survey of Krilliac's
+repositories; this revision supersedes it. See
+[LICENSE_REVIEW.md](LICENSE_REVIEW.md#project-license).
