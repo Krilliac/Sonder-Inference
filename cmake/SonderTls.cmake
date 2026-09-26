@@ -11,6 +11,9 @@
 # With SONDER_WITH_TLS=OFF this file only declares the options: no sources,
 # no definitions, no dependencies, and https:// stays ErrorCode::unsupported.
 
+# Safe to include twice (root include + CI helper SonderTlsDeferred.cmake).
+include_guard(GLOBAL)
+
 option(SONDER_WITH_TLS "Enable TLS (https://) in the internal HTTP client" OFF)
 set(SONDER_TLS_BACKEND "auto" CACHE STRING "TLS backend when SONDER_WITH_TLS=ON: auto, openssl or schannel")
 set_property(CACHE SONDER_TLS_BACKEND PROPERTY STRINGS auto openssl schannel)
@@ -58,5 +61,10 @@ message(STATUS "Sonder TLS: ON (backend: ${_sonder_tls_backend})")
 # Loopback TLS tests (tests/tls). The in-test server and certificate
 # generation use OpenSSL, also when the client backend is Schannel.
 if(SONDER_BUILD_TESTS AND EXISTS "${PROJECT_SOURCE_DIR}/tests/tls/CMakeLists.txt")
-    add_subdirectory("${PROJECT_SOURCE_DIR}/tests/tls" "${PROJECT_BINARY_DIR}/tests/tls")
+    if(_SONDER_TLS_DEFERRED)
+        # Via cmake/SonderTlsDeferred.cmake: no add_subdirectory() allowed here.
+        include("${PROJECT_SOURCE_DIR}/tests/tls/CMakeLists.txt")
+    else()
+        add_subdirectory("${PROJECT_SOURCE_DIR}/tests/tls" "${PROJECT_BINARY_DIR}/tests/tls")
+    endif()
 endif()
