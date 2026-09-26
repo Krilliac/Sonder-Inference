@@ -50,10 +50,44 @@ jobs:
       - name: CLI smoke (mock backend + telemetry)
         shell: bash
         run: |
+          set -euo pipefail
           exe=build/${{ matrix.preset }}/sonder-infer
           "$exe" version
+          "$exe" version --json
           "$exe" generate --backend mock --model mock:tiny --prompt "ci smoke" --max-tokens 8 --telemetry telemetry.jsonl
           test -s telemetry.jsonl
+          # One-shot chat runs through Session::chat and emits request telemetry.
+          "$exe" chat --backend mock --model mock:tiny --messages tests/fixtures/chat_messages.json --telemetry chat.jsonl
+          grep -q '"event_type":"request.queued".*"attributes":{"kind":"chat"' chat.jsonl
+          grep -q '"event_type":"request.completed"' chat.jsonl
+          # Every telemetry line carries the Observatory envelope schema.
+          for f in telemetry.jsonl chat.jsonl; do
+            if grep -v -e '^{"schema":"sonder.observatory.event/1",' -e '^[[:space:]]*$' "$f"; then
+              echo "$f: line without schema sonder.observatory.event/1" >&2
+              exit 1
+            fi
+          done
+          # Documented exit codes (docs/CLI.md): 2 for usage errors.
+          rc=0; "$exe" generate --backend mock --model mock:tiny --prompt x --bogus 1 || rc=$?
+          test "$rc" -eq 2
+          rc=0; "$exe" || rc=$?
+          test "$rc" -eq 2
+          # serve: listen on an ephemeral port, answer health, drain on SIGINT.
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            ready="$RUNNER_TEMP/infer.ready.json"
+            "$exe" serve --backend mock --port 0 --ready-file "$ready" 2> serve.log &
+            pid=$!
+            for _ in $(seq 100); do [ -s "$ready" ] && break; sleep 0.1; done
+            url=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["url"])' "$ready")
+            for _ in $(seq 100); do
+              if curl -fsS "$url/v1/sonder/health" > health.json 2>/dev/null; then break; fi
+              sleep 0.1
+            done
+            grep -q '"status":"ready"' health.json
+            kill -INT "$pid"
+            wait "$pid"
+            test ! -e "$ready"
+          fi
 
   # Optional MSVC build of the llama.cpp backend (SONDER_WITH_LLAMA_CPP=ON).
   # Non-blocking for now: failures are reported but do not fail the workflow.

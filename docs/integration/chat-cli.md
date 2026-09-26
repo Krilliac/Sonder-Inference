@@ -61,6 +61,9 @@ Additions only; existing backends compile unchanged.
 
 ## Integrator follow-ups (not done here; they touch lead-owned files)
 
+Follow-up 1 is resolved: `Session::chat` landed with eco/inf-serve and the
+CLI uses it since eco/inf-cli-ux (see [Update](#update-ecoinf-cli-ux) below).
+
 1. **Session/Engine chat.** The CLI calls `Model::backend_model().chat()`
    directly because `Session` has no chat entry point. Chat turns therefore
    emit no Observatory session/request telemetry, and `--telemetry` only
@@ -83,8 +86,8 @@ sampling follow-ups. Conflicts were additive (`backend.hpp`: `TokenStream`,
 - Sampling flags for the new `SamplingConfig` fields on `generate`, `chat`
   and `bench` (see `sonder-infer --help` and
   [sampling-config.md](sampling-config.md)); bench results record them.
-- Follow-up 1 (Session/Engine chat) is still open: `chat` bypasses the
-  scheduler and emits no request telemetry.
+- Follow-up 1 (Session/Engine chat) was still open at that point; it is
+  resolved by the update below.
 
 ## Tests
 
@@ -113,3 +116,38 @@ is clean and 273/273 pass. With `SONDER_WITH_LLAMA_CPP=ON` (b11195): 294/294
 pass, and the integration test was skipped. A manual run of `sonder-infer chat
 --backend llamacpp` with `stories15M-q4_0.gguf` (no chat template) exercised
 the generic fallback. MSVC was not built locally; CI covers it.
+
+## Update: eco/inf-cli-ux
+
+The CLI reference is now [docs/CLI.md](../CLI.md). Changes to `chat`:
+
+- **Chat through the session.** When the library defines
+  `SONDER_HAS_SESSION_CHAT`, every turn (one-shot and REPL) runs through
+  `Session::chat` on one session per invocation. Chat therefore goes through
+  the engine scheduler and KV accounting, and `--telemetry` records
+  `request.queued` (`attributes.kind = "chat"`), `request.started`, the decode
+  events and `request.completed`/`cancelled`/`failed`. The correlation flags
+  (`--run-id`, `--agent-id`, `--task-id`, `--workload`, `--priority`) set the
+  session metadata. Without `SONDER_HAS_SESSION_CHAT` the old direct
+  `BackendModel::chat()` path is kept (no request telemetry).
+- **REPL.** `run_chat_session()` (`src/cli/cli_args.hpp`) adds `/help`,
+  `/stats` (session totals and the last turn's stats), `//text` to send a
+  leading `/`, and rejects any other `/word` without sending it. Role labels
+  (`you> `, `assistant> `) appear on a terminal, colored only when stdout is
+  a terminal and `NO_COLOR` is unset. With piped stdin there is no input
+  prompt, and the output never ends in a dangling prompt. A cancelled turn
+  (Ctrl-C) drops the user message and the partial reply; the REPL continues.
+  `run_chat_repl()` keeps its signature and behaviour for existing callers.
+- **Stats.** One-shot chat prints
+  `[sonder-infer] chat native=no messages=4 outcome=completed stop=... ` by
+  default; `--stats json` prints one JSON object instead, and the REPL prints
+  per-turn stats only with `--stats text|json`.
+- **Exit codes.** An unreadable or invalid `--messages` file exits 2, a
+  backend failure 1, a cancelled one-shot turn 130.
+
+Tests: `tests/test_cli_repl.cpp` (`sonder.core.cli repl: *`) covers the REPL
+commands, labels and colors, per-turn stats, failed and cancelled turns, and
+turns through `Session::chat` emitting `kind = "chat"` request telemetry. The
+CTest cases `sonder.cli.chat_telemetry`, `sonder.cli.chat_repl`,
+`sonder.cli.chat_repl_stats_json` and `sonder.cli.chat_correlation` run the
+binary.

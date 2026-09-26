@@ -85,3 +85,80 @@ ABI stays at 1. No new dependency.
   runtime (see docs/SERVER.md, Errors). If the runtime starts setting
   sequence fingerprints or stops clamping `max_new_tokens`, add an HTTP test
   for it.
+
+# Integration notes: `eco/inf-cli-ux` (CLI UX and serve/chat dispatch)
+
+Branch `eco/inf-cli-ux` builds on `eco/inf-serve`. Lane files:
+`tools/sonder-infer/main.cpp`, `src/cli/**` (new header-only
+`cli_spec.hpp`, `cli_values.hpp`, `cli_env.hpp`,
+`sonder_infer_commands.hpp`), `bench/tools/sonder_bench.cpp`,
+`tests/test_cli_*.cpp`, `tests/CMakeLists.txt`, the CLI smoke step of
+`.github/workflows/ci.yml`, `README.md`, `docs/CLI.md` (new) and
+`docs/integration/chat-cli.md`.
+
+## Wiring
+
+- `sonder-infer serve ...` calls
+  `sonder::inference::server::serve_main(args_after_serve, std::cout,
+  std::cerr)` under `SONDER_HAS_SERVER`; `help serve` calls it with
+  `--help`. Without the module, `serve` exits 2 with a clear message.
+- `sonder-infer chat` runs every turn through `Session::chat` under
+  `SONDER_HAS_SESSION_CHAT` (request telemetry with `kind = "chat"`).
+- Backends are built with the shared `make_backend()` and the environment is
+  read with `backend_env_defaults()` (`sonder/inference/backend_setup.hpp`)
+  when `SONDER_HAS_SERVER` is defined, so `serve` and the other commands
+  agree; `src/cli/cli_env.hpp` holds an equivalent fallback for builds
+  without the module, and `tests/test_cli_spec.cpp` checks both agree.
+
+## Changes outside the lane's file list
+
+1. `src/server/src/serve_main.cpp` (the one narrow edit of serve's argument
+   parser that the contract review allows): an unknown option now uses
+   `sonder::cli::unknown_option_message()`, e.g.
+   `unknown option --prot (did you mean --port?)`. The table and all other
+   behaviour are unchanged.
+2. `bench/include/sonder/inference/benchmark.hpp` and
+   `bench/src/benchmark.cpp` (module `bench`, additive): `bench::Options`
+   gains `run_id`, `agent_id`, `task_id`, `workload` and `priority`, applied
+   to every benchmark session, so `sonder-infer bench` can honour the
+   correlation flags (lane scope item 6). `run_id` still defaults to
+   `label`.
+3. `tests/cli_expect.cmake` (new CTest driver for the exact-exit-code CLI
+   smoke tests) and `tests/fixtures/chat_repl_input.txt` (REPL input).
+
+## Stale statements in docs owned by `eco/inf-serve` (not edited here)
+
+The lane may not edit these files; the integrator should update them when
+merging, because the dispatch now exists:
+
+- `docs/SERVER.md` lines 3-9: drop "The `sonder-infer serve` command line is
+  not dispatched yet ... prints `unknown command serve` ...".
+- `docs/SERVER.md` "Running it", the paragraph starting "The `serve`
+  subcommand is to be dispatched by the CLI": the CLI dispatches it
+  (`tools/sonder-infer/main.cpp`).
+- `docs/SERVER.md` "Open questions" 1-3: (1) serve keeps its table parser
+  but shares the unknown-option wording and suggestions with
+  `src/cli/cli_spec.hpp`; (2) the CLI now uses `make_backend()` and
+  `backend_env_defaults()`; (3) the `ci.yml` CLI smoke step now starts
+  `serve --port 0 --ready-file`, polls health and sends SIGINT (Linux job).
+  The hardening workflow's ASan job has no serve smoke yet (`.github/**`
+  outside the CLI smoke step is not in this lane).
+- `docs/ROADMAP.md` Phase 1: tick "`sonder-infer serve` command-line
+  dispatch".
+- The "Left for other lanes" list above: the CLI dispatch, the shared
+  backend factory, the `ci.yml` smoke and the `docs/CLI.md`/`README.md`
+  items are done on this branch.
+
+## Open questions
+
+- `sonder-bench` keeps exit codes 3 (backend unreachable, load failed) and 4
+  (`--require-idle` refused) rather than 1; see docs/CLI.md.
+- `--ollama-allow-remote` cannot reach a remote host in the default build:
+  plain `http://` to non-loopback hosts is refused and `https://` needs
+  `SONDER_WITH_TLS=ON`, which root CMake does not include
+  (`cmake/SonderTls.cmake` is not wired). The flag warns and is documented as
+  such.
+- The Windows paths of the CLI (`_isatty`, CRLF output in the CTest driver)
+  are written for MSVC but were not run in the Linux container; the
+  `ci-windows` job must pass. The `serve` part of the CI smoke runs on Linux
+  only (signal delivery from Git Bash to a native process is not reliable).
