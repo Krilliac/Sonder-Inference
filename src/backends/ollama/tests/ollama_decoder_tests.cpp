@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "backends/ollama/ollama_protocol.hpp"
 #include "test_support.hpp"
 
 using namespace sonder::inference;
@@ -224,4 +225,60 @@ TEST_CASE("telemetry: emit_timing_events maps load/prefill/decode") {
     CHECK(lines[1].find("backend.timing.prefill") != std::string::npos);
     CHECK(lines[2].find("backend.timing.decode") != std::string::npos);
     CHECK(lines[2].find("req-1") != std::string::npos);
+}
+
+// Regression tests for docs/integration/hardening.md B6 and the line cap.
+// Repro inputs also live in fuzz/corpus/ollama_stream.
+
+TEST_CASE("parse_stream_line agrees with StreamDecoder (B6)") {
+    struct Case {
+        const char* line;
+        bool ok;
+        ErrorCode code;
+    };
+    const Case cases[] = {
+        {"[1,2]", false, ErrorCode::protocol_error},
+        {"\"text\"", false, ErrorCode::protocol_error},
+        {"42", false, ErrorCode::protocol_error},
+        {"{\"error\":null,\"response\":\"a\"}", true, ErrorCode::ok},
+        {"{\"error\":\"boom\"}", false, ErrorCode::backend_error},
+        {"{\"response\":\"a\"", false, ErrorCode::protocol_error},
+    };
+    for (const auto& c : cases) {
+        CAPTURE(c.line);
+        GenerateStats stats;
+        auto r = parse_stream_line(c.line, stats);
+        CHECK(r.ok() == c.ok);
+        StreamDecoder d(StreamKind::generate, {});
+        CHECK(d.feed(std::string(c.line) + "\n") == c.ok);
+        if (!c.ok) {
+            CHECK(r.status().code() == c.code);
+            CHECK(d.error().code() == c.code);
+        }
+    }
+    GenerateStats stats;
+    auto r = parse_stream_line("{\"error\":null,\"response\":\"a\"}", stats);
+    REQUIRE(r.ok());
+    CHECK(r.value().piece == "a");
+}
+
+TEST_CASE("decoder: lines longer than the cap are rejected") {
+    StreamDecoder d(StreamKind::generate, {});
+    const std::string chunk(1u << 20, ' ');
+    bool ok = true;
+    for (std::size_t sent = 0; ok && sent <= kMaxNdjsonLineBytes; sent += chunk.size()) {
+        ok = d.feed(chunk);
+    }
+    CHECK_FALSE(ok);
+    CHECK(d.error().code() == ErrorCode::protocol_error);
+    CHECK(d.error().message().find("4 MiB") != std::string::npos);
+
+    // A large but legal final chunk (big "context" array) still decodes.
+    std::string line = "{\"response\":\"\",\"done\":true,\"context\":[";
+    for (int i = 0; i < 150000; ++i) line += (i ? ",123456" : "123456");
+    line += "]}\n";
+    REQUIRE(line.size() < kMaxNdjsonLineBytes);
+    StreamDecoder big(StreamKind::generate, {});
+    CHECK(big.feed(line));
+    CHECK(big.finish().ok());
 }

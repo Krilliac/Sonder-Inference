@@ -24,6 +24,10 @@ class Object {
 public:
     Object() = default;
     Object(std::initializer_list<Member> members);
+    // Builds an object from members in O(n) expected time. Duplicate keys keep
+    // the position of the first occurrence and the value of the last (same
+    // result as calling set() for each member in order). Used by the parser.
+    static Object from_members(std::vector<Member> members);
 
     Value& operator[](std::string_view key);  // insert-or-get
     [[nodiscard]] const Value* find(std::string_view key) const;
@@ -96,9 +100,15 @@ private:
 };
 
 // Parses exactly one JSON document (surrounding whitespace allowed).
+// Objects parse in linear time. Numbers that overflow a double (e.g. 1e999)
+// are rejected. An unpaired UTF-16 surrogate escape and each byte of an
+// ill-formed raw UTF-8 sequence decode to U+FFFD, so parsed strings are always
+// valid UTF-8.
 Result<Value> parse(std::string_view text);
 
-// Appends a JSON string literal (with quotes) for `s` to `out`.
+// Appends a JSON string literal (with quotes) for `s` to `out`. Output is
+// always valid UTF-8: each byte of an ill-formed UTF-8 sequence in `s` is
+// replaced by U+FFFD (emitted as the raw UTF-8 bytes EF BF BD).
 void append_escaped(std::string& out, std::string_view s);
 
 }  // namespace sonder::inference::json
