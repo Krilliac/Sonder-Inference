@@ -58,7 +58,11 @@ struct SamplingParams {
     float top_p = 0.95F;       // >= 1 disables
     float min_p = 0.0F;        // <= 0 disables
     float repeat_penalty = 1.0F;       // 1 disables
-    std::int32_t repeat_last_n = 64;   // window for repeat_penalty
+    std::int32_t repeat_last_n = 64;   // penalty window; 0 disables, -1 = whole context
+    float presence_penalty = 0.0F;     // 0 disables
+    float frequency_penalty = 0.0F;    // 0 disables
+    float typical_p = 1.0F;            // >= 1 disables
+    std::vector<std::pair<Token, float>> logit_bias;  // token -> additive bias (-inf bans)
     std::uint32_t seed = 0xC0FFEEU;    // 0xFFFFFFFF = random
 };
 
