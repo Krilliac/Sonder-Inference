@@ -53,6 +53,12 @@ json::Value sampling_json(const SamplingConfig& s) {
                    {"top_k", s.top_k},
                    {"min_p", s.min_p},
                    {"repeat_penalty", s.repeat_penalty},
+                   {"typical_p", s.typical_p},
+                   {"repeat_last_n", s.repeat_last_n},
+                   {"presence_penalty", s.presence_penalty},
+                   {"frequency_penalty", s.frequency_penalty},
+                   {"logit_bias_count", static_cast<std::int64_t>(s.logit_bias.size())},
+                   {"num_ctx", s.num_ctx},
                    {"seed", s.seed},
                    {"max_tokens", s.max_tokens}};
     return o;
@@ -342,8 +348,12 @@ Result<GenerationResult> Session::generate(const std::string& prompt, const Toke
             spec.exact_tokens = false;
         }
         spec.max_new_tokens = static_cast<std::uint32_t>(sampling.max_tokens);
-        // TODO(sampling-config): prefer SamplingConfig::num_ctx once it exists.
-        const std::uint64_t ctx_limit = model_->descriptor().context_length;
+        // A requested num_ctx narrows the model's context window (0 = model default).
+        std::uint64_t ctx_limit = model_->descriptor().context_length;
+        if (sampling.num_ctx > 0) {
+            const auto requested = static_cast<std::uint64_t>(sampling.num_ctx);
+            ctx_limit = ctx_limit == 0 ? requested : std::min(ctx_limit, requested);
+        }
         spec.context_limit = static_cast<std::uint32_t>(std::min<std::uint64_t>(ctx_limit, 0xFFFFFFFFull));
         spec.fingerprint = model_fingerprint(*model_);
         result.scheduling.accounted_prompt_tokens = spec.prompt_tokens.size();
