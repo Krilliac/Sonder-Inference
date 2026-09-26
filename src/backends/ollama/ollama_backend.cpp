@@ -61,35 +61,59 @@ public:
         params.model = descriptor_.name;
         params.prompt = request.prompt;
         params.options = ollama::sampling_to_options(request.sampling);
+        return run(cancel, on_chunk, [&](const ollama::ChunkCallback& cb) { return client_->generate(params, cb, cancel); });
+    }
 
+    // Native chat through POST /api/chat: the server applies the model's own
+    // chat template, so no client-side prompt formatting is involved.
+    Result<GenerateStats> chat(const ChatRequest& request, const CancellationToken& cancel,
+                               const TokenCallback& on_chunk) override {
+        if (Status st = validate_chat_messages(request.messages); !st.ok()) {
+            return st;
+        }
+        if (!request.sampling.logit_bias.empty()) {
+            return Status(ErrorCode::invalid_argument, "the ollama backend does not support logit_bias");
+        }
+        ollama::ChatParams params;
+        params.model = descriptor_.name;
+        params.messages = request.messages;
+        params.options = ollama::sampling_to_options(request.sampling);
+        return run(cancel, on_chunk, [&](const ollama::ChunkCallback& cb) { return client_->chat(params, cb, cancel); });
+    }
+
+    bool has_native_chat() const override { return true; }
+
+private:
+    // Shared streaming path for /api/generate and /api/chat: maps Ollama
+    // stream chunks onto TokenCallback and the final chunk onto GenerateStats.
+    template <class Call>
+    Result<GenerateStats> run(const CancellationToken& cancel, const TokenCallback& on_chunk, Call&& call) {
         const bool emit_thinking = client_->config().emit_thinking_chunks;
         std::uint64_t index = 0;
         bool stopped_by_callback = false;
-        auto res = client_->generate(
-            params,
-            [&](const StreamChunk& c) {
-                if (cancel.cancelled()) {
-                    return false;
+        const ollama::ChunkCallback cb = [&](const StreamChunk& c) {
+            if (cancel.cancelled()) {
+                return false;
+            }
+            if (!on_chunk) {
+                return true;
+            }
+            auto deliver = [&](std::string_view text) {
+                if (text.empty() || stopped_by_callback) {
+                    return;
                 }
-                if (!on_chunk) {
-                    return true;
+                if (!on_chunk(TokenChunk{text, index})) {
+                    stopped_by_callback = true;
                 }
-                auto deliver = [&](std::string_view text) {
-                    if (text.empty() || stopped_by_callback) {
-                        return;
-                    }
-                    if (!on_chunk(TokenChunk{text, index})) {
-                        stopped_by_callback = true;
-                    }
-                    ++index;
-                };
-                if (emit_thinking) {
-                    deliver(c.thinking);
-                }
-                deliver(c.content);
-                return !stopped_by_callback;
-            },
-            cancel);
+                ++index;
+            };
+            if (emit_thinking) {
+                deliver(c.thinking);
+            }
+            deliver(c.content);
+            return !stopped_by_callback;
+        };
+        Result<StreamResult> res = call(cb);
         if (cancel.cancelled()) {
             return Status(ErrorCode::cancelled, "ollama: request cancelled");
         }
@@ -114,7 +138,6 @@ public:
         return stats;
     }
 
-private:
     std::shared_ptr<const OllamaClient> client_;
     ModelDescriptor descriptor_;
 };

@@ -475,6 +475,12 @@ json::Object run(Engine& engine, const std::shared_ptr<Model>& model, const Corp
                                      {"top_k", s.top_k},
                                      {"min_p", s.min_p},
                                      {"repeat_penalty", s.repeat_penalty},
+                                     {"typical_p", s.typical_p},
+                                     {"repeat_last_n", s.repeat_last_n},
+                                     {"presence_penalty", s.presence_penalty},
+                                     {"frequency_penalty", s.frequency_penalty},
+                                     {"logit_bias_count", static_cast<std::int64_t>(s.logit_bias.size())},
+                                     {"num_ctx", s.num_ctx},
                                      {"seed", s.seed},
                                      {"max_tokens", "per-prompt"}});
     doc.set("config", json::Object{{"warmup_runs", options.warmup_runs},

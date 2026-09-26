@@ -246,7 +246,8 @@ ModelInfo LlamaCppBackend::GetModelInfo() const {
     return info;
 }
 
-Status LlamaCppBackend::Tokenize(std::string_view text, bool add_special, std::vector<Token>& out) const {
+Status LlamaCppBackend::Tokenize(std::string_view text, bool add_special, std::vector<Token>& out,
+                                 bool parse_special) const {
     out.clear();
     if (!IsLoaded()) return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
     if (text.size() > static_cast<std::size_t>(INT32_MAX)) {
@@ -256,11 +257,11 @@ Status LlamaCppBackend::Tokenize(std::string_view text, bool add_special, std::v
     // Upper bound: one token per byte plus BOS/EOS.
     out.resize(static_cast<std::size_t>(len) + 2);
     int32_t n = llama_tokenize(impl_->vocab, text.data(), len, out.data(),
-                               static_cast<int32_t>(out.size()), add_special, /*parse_special=*/false);
+                               static_cast<int32_t>(out.size()), add_special, parse_special);
     if (n < 0 && n != INT32_MIN) {
         out.resize(static_cast<std::size_t>(-n));
         n = llama_tokenize(impl_->vocab, text.data(), len, out.data(),
-                           static_cast<int32_t>(out.size()), add_special, false);
+                           static_cast<int32_t>(out.size()), add_special, parse_special);
     }
     if (n < 0) {
         out.clear();
@@ -294,6 +295,50 @@ Status LlamaCppBackend::TokenToPiece(Token token, std::string& out) const {
 
 bool LlamaCppBackend::IsEndOfGeneration(Token token) const {
     return IsLoaded() && llama_vocab_is_eog(impl_->vocab, token);
+}
+
+std::string LlamaCppBackend::ChatTemplate() const {
+    if (!IsLoaded()) return {};
+    const char* tmpl = llama_model_chat_template(impl_->model, /*name=*/nullptr);
+    return tmpl != nullptr ? std::string(tmpl) : std::string();
+}
+
+Status LlamaCppBackend::ApplyChatTemplate(const std::vector<ChatTurn>& messages, bool add_assistant,
+                                          std::string& out) const {
+    out.clear();
+    if (!IsLoaded()) return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
+    const std::string tmpl = ChatTemplate();
+    if (tmpl.empty()) return Status::Error(ErrorCode::kInvalidArgument, "model has no chat template");
+    return FormatChat(tmpl, messages, add_assistant, out);
+}
+
+Status LlamaCppBackend::FormatChat(std::string_view chat_template, const std::vector<ChatTurn>& messages,
+                                   bool add_assistant, std::string& out) {
+    out.clear();
+    if (chat_template.empty()) return Status::Error(ErrorCode::kInvalidArgument, "empty chat template");
+    if (messages.empty()) return Status::Error(ErrorCode::kInvalidArgument, "no chat messages");
+    const std::string tmpl(chat_template);
+    std::vector<llama_chat_message> chat;
+    chat.reserve(messages.size());
+    std::size_t total = 0;
+    for (const auto& m : messages) {
+        chat.push_back(llama_chat_message{m.role.c_str(), m.content.c_str()});
+        total += m.role.size() + m.content.size();
+    }
+    if (total > static_cast<std::size_t>(INT32_MAX / 4)) {
+        return Status::Error(ErrorCode::kInvalidArgument, "chat too long");
+    }
+    std::vector<char> buf(total * 2 + 256);
+    int32_t n = llama_chat_apply_template(tmpl.c_str(), chat.data(), chat.size(), add_assistant, buf.data(),
+                                          static_cast<int32_t>(buf.size()));
+    if (n > static_cast<int32_t>(buf.size())) {
+        buf.resize(static_cast<std::size_t>(n));
+        n = llama_chat_apply_template(tmpl.c_str(), chat.data(), chat.size(), add_assistant, buf.data(),
+                                      static_cast<int32_t>(buf.size()));
+    }
+    if (n < 0) return Status::Error(ErrorCode::kInvalidArgument, "chat template not supported by llama.cpp");
+    out.assign(buf.data(), static_cast<std::size_t>(n));
+    return Status::Ok();
 }
 
 void LlamaCppBackend::SetTelemetrySink(TelemetrySink sink) { impl_->telemetry = std::move(sink); }
