@@ -152,10 +152,10 @@ Implementation has started (2026-09-26). The first slice provides:
 - `sonder-infer` CLI and a benchmark harness skeleton.
 - doctest + CTest suite; GitHub Actions on Windows and Linux.
 
-The direct llama.cpp/GGML backend is **not** implemented yet. See
-[ROADMAP](docs/ROADMAP.md) for exact status. No upstream project is copied or
-linked until its license is verified and recorded in
-[LICENSE_REVIEW](docs/LICENSE_REVIEW.md).
+An optional direct llama.cpp/GGML backend is available with
+`SONDER_WITH_LLAMA_CPP=ON` (off by default). See [ROADMAP](docs/ROADMAP.md)
+for exact status. No upstream project is copied or linked until its license is
+verified and recorded in [LICENSE_REVIEW](docs/LICENSE_REVIEW.md).
 
 ## Build and test
 
@@ -221,3 +221,11 @@ build/linux-debug/sonder-infer bench --backend ollama --model qwen3:0.6b \
 
 The original scaffold notes are kept in [scaffold status](docs/SCAFFOLD.md),
 now updated for the implementation layout.
+
+## License
+
+Sonder Inference is released under the [MIT License](LICENSE)
+(Copyright (c) 2026 Krilliac). Third-party dependencies keep their own
+licenses; each is recorded in [LICENSE_REVIEW](docs/LICENSE_REVIEW.md). All
+currently adopted dependencies (llama.cpp/GGML, doctest, cpp-httplib) are MIT
+and compatible with the project license.

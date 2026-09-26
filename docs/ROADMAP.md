@@ -15,7 +15,7 @@
 ## Phase 1 — direct native inference path
 
 - [x] Engine / Device / Model / Session abstractions (CPU inventory only; GPU discovery pending)
-- [x] llama.cpp/GGML backend (optional build, `SONDER_WITH_LLAMA_CPP=ON`; license sign-off pending)
+- [x] llama.cpp/GGML backend (optional build, `SONDER_WITH_LLAMA_CPP=ON`; license approved 2026-09-26)
 - [ ] tokenizer + prompt processing
 - [x] streaming decode (session API; via mock and Ollama backends; native backend pending)
 - [ ] sampling parity (sampling config + validation done; parity checks need a native backend)
@@ -56,7 +56,7 @@ Gate: measurable win on agent fan-out/long-context workloads without interactive
 - [ ] whole-request placement
 - [ ] remote workers
 - [ ] transfer-cost model
-- [ ] remote cache movement where justified
+- [ ] remote cache/session transport
 - [ ] background workload offload
 - [ ] fault/reconnect semantics
 

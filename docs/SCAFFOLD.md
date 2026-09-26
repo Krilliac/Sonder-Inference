@@ -22,12 +22,13 @@ records the layout and what remains undecided.
 - Telemetry format: Observatory envelope v1 JSONL (ADR-012).
 - Test framework: doctest via FetchContent, test-only (ADR-014).
 - CI jobs: configure/build/test on Windows (MSVC) and Linux.
+- Project license: MIT (ADR-015, [LICENSE](../LICENSE)).
 
 ## Still undecided
 
-Project license, transport between Sonder Runtime and Inference (in-process C
-ABI vs. local RPC), package/distribution model, first supported
-model/quantization matrix, and the llama.cpp revision to adopt. Directory
+Transport between Sonder Runtime and Inference (in-process C ABI vs. local
+RPC), package/distribution model, and the first supported model/quantization
+matrix. Directory
 ownership remains provisional; module work streams are listed in
 [MODULES.md](MODULES.md).
 

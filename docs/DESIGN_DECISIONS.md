@@ -136,3 +136,16 @@ implement.
 a pinned version and SHA-256, used by the test executable only, and never
 vendored into the repository or linked into the library. Tests are registered
 with CTest per test case. See [LICENSE_REVIEW.md](LICENSE_REVIEW.md#doctest).
+
+## ADR-015 — Project license: MIT
+
+**Date:** 2026-09-26. **Status:** accepted (Nate: "any license will do,
+whatever is best/matched my other repos").
+
+**Decision:** Sonder Inference is released under the MIT License (root
+`LICENSE`, Copyright (c) 2026 Krilliac).
+
+**Reason:** MIT is the license most of Krilliac's other repositories use (see
+the survey in [LICENSE_REVIEW.md](LICENSE_REVIEW.md#project-license)); the same
+rule is applied to Sonder-Observatory. All adopted dependencies are MIT, so no
+dependency constrains the choice.
