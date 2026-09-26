@@ -52,6 +52,11 @@ public:
 
     Result<GenerateStats> generate(const GenerateRequest& request, const CancellationToken& cancel,
                                    const TokenCallback& on_chunk) override {
+        // Ollama's API has no logit bias option. Refuse instead of silently
+        // sampling without it.
+        if (!request.sampling.logit_bias.empty()) {
+            return Status(ErrorCode::invalid_argument, "the ollama backend does not support logit_bias");
+        }
         ollama::GenerateParams params;
         params.model = descriptor_.name;
         params.prompt = request.prompt;
