@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <string_view>
@@ -65,6 +66,14 @@ struct Options {
     // Stop issuing new requests after this many seconds (0 = unlimited). The
     // document then carries "truncated_by_budget": true.
     double budget_seconds = 0.0;
+    // Session metadata applied to every request (envelope run_id, agent_id,
+    // task_id; scheduler workload class and priority). run_id defaults to
+    // `label` when unset.
+    std::optional<std::string> run_id;
+    std::optional<std::string> agent_id;
+    std::optional<std::string> task_id;
+    WorkloadClass workload = WorkloadClass::implementation_worker;
+    int priority = 0;
 };
 
 // Runs every prompt through fresh sessions on `model` and returns a results

@@ -135,6 +135,8 @@ See `docs/RESEARCH_CATALOG.md` and `docs/RESEARCH_SOURCES.md`.
 - `docs/ROADMAP.md`
 - `docs/LICENSE_REVIEW.md`
 - `docs/SCAFFOLD.md`
+- `docs/CLI.md`
+- `docs/SERVER.md`
 
 ## Status
 
@@ -184,32 +186,55 @@ Presets: `msvc-debug`, `msvc-release`, `linux-debug`, `linux-release`, plus
 ## Quickstart
 
 ```bash
-# Inventory and backends
-build/linux-debug/sonder-infer devices
-build/linux-debug/sonder-infer backends
+B=build/linux-debug
+# Commands, options, environment and exit codes (reference: docs/CLI.md)
+$B/sonder-infer help
+$B/sonder-infer help generate
 
-# Mock backend (deterministic, no model needed) with telemetry
-build/linux-debug/sonder-infer generate --backend mock --model mock:tiny \
+# Inventory and backends (--json for machine-readable output)
+$B/sonder-infer devices
+$B/sonder-infer backends --json
+
+# Mock backend (deterministic, no model needed; tests only, never a
+# quality or performance signal) with telemetry
+$B/sonder-infer generate --backend mock --model mock:tiny \
     --prompt "hello sonder" --max-tokens 16 --telemetry events.jsonl
 
-# Local Ollama (http://127.0.0.1:11434) with a model you already pulled
-build/linux-debug/sonder-infer models --backend ollama
-build/linux-debug/sonder-infer generate --backend ollama --model qwen3:0.6b \
+# Environment defaults (flags win); one JSON stats line on stderr
+SONDER_INFER_BACKEND=mock SONDER_INFER_MODEL=mock:tiny \
+    $B/sonder-infer generate --prompt hi --quiet --stats json
+
+# Chat: interactive REPL (/help, /stats, /reset, /exit), or one-shot
+$B/sonder-infer chat --backend mock --model mock:tiny --telemetry chat.jsonl
+$B/sonder-infer chat --backend mock --model mock:tiny --messages tests/fixtures/chat_messages.json
+
+# Local Ollama (http://127.0.0.1:11434, or OLLAMA_HOST) with a model you already pulled
+$B/sonder-infer models --backend ollama
+$B/sonder-infer generate --backend ollama --model qwen3:0.6b \
     --prompt "Say hi" --max-tokens 32 --telemetry events.jsonl
 
+# Local HTTP API (OpenAI-compatible subset) and live telemetry for
+# Sonder Runtime and Observatory; see docs/SERVER.md
+$B/sonder-infer serve --backend mock --port 11437
+curl -fsS http://127.0.0.1:11437/v1/sonder/health
+
 # Benchmark harness
-build/linux-debug/sonder-infer bench --backend ollama --model qwen3:0.6b \
+$B/sonder-infer bench --backend ollama --model qwen3:0.6b \
     --corpus bench/corpus/smoke.json --out results.json --warmup 1 --runs 3
 ```
 
-`Ctrl-C` during `generate` cancels the in-flight request and emits a
-`request.cancelled` event with the observed cancel latency.
+`Ctrl-C` during `generate` cancels the in-flight request, emits a
+`request.cancelled` event with the observed cancel latency, and exits 130.
+Exit codes: 0 ok, 1 runtime or backend failure, 2 usage error, 130 cancelled
+([CLI reference](docs/CLI.md)). `sonder-infer serve` is documented in
+[SERVER.md](docs/SERVER.md).
 
 ## Layout
 
 - `include/sonder/inference/` public C++ API; `include/sonder_inference.h` C ABI
 - `src/` implementation (see [src/README.md](src/README.md))
-- `tools/sonder-infer/` CLI
+- `tools/sonder-infer/` CLI ([reference](docs/CLI.md)); `src/cli/` its
+  header-only option specs and helpers
 - `tests/` doctest suite and CTest CLI checks
 - `bench/corpus/` prompt corpora; `bench/results/` small reviewed snapshots
 - `cmake/`, `CMakePresets.json`, `scripts/build.ps1` build tooling

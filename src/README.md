@@ -8,7 +8,7 @@ Ownership remains provisional. Optional areas are modules; see
 
 - `engine/`: `Engine` (device inventory, backend and model registries, session
   factory) and the C ABI implementation.
-- `sessions/`: Generation sessions and request lifecycle.
+- `sessions/`: Generation sessions and request lifecycle (`Session::generate` and `Session::chat`).
 - `scheduler/`: Inference admission, priorities, batching, and preemption (reserved).
 - `cache/`: Logical context and KV cache ownership and accounting (reserved).
 - `models/`: Model and adapter lifecycle and residency (handle only so far).
@@ -18,3 +18,4 @@ Ownership remains provisional. Optional areas are modules; see
 - `telemetry/`: Bounded inference events for external observers.
 - `common/`: Error types and the small JSON value type.
 - `net/`: Minimal internal HTTP/1.1 client used by the Ollama adapter.
+- `server/`: `sonder-infer serve` (module, `SONDER_HAS_SERVER`): in-house HTTP/1.1 server with the OpenAI-compatible chat subset, health, models, backend identity and live telemetry (SSE/NDJSON); shared backend factory. See [docs/SERVER.md](../docs/SERVER.md).

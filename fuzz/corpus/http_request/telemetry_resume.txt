@@ -1,0 +1,5 @@
+GET /v1/telemetry/sse?last_event_id=tel-0123456789abcdef-41&since=now HTTP/1.1
+Host: localhost
+Last-Event-ID: tel-0123456789abcdef-40
+Accept: text/event-stream
+

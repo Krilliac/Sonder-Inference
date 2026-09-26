@@ -18,7 +18,15 @@ viewer remains a separate process; its renderer must not enter the inference
 critical path. Preserve the existing Ollama compatibility path until the
 inference roadmap's replacement gates pass.
 
-These are architectural roles, not a claim that the proposed integrations are
+Runtime reaches Inference over local HTTP served by `sonder-infer serve`
+(ADR-020, [SERVER.md](SERVER.md)): an OpenAI-compatible chat subset plus
+health, models and backend identity. Observatory connects to each producer
+directly: Inference serves its own live telemetry (SSE/NDJSON, discovery at
+`/.well-known/sonder-telemetry`), and Runtime does not relay it. Correlation
+across producers uses the Runtime turn id, sent as `X-Sonder-Run-Id` and
+`X-Sonder-Parent-Request-Id`.
+
+These are architectural roles, not a claim that every proposed integration is
 implemented. Protocol package ownership, compatibility policy, and deployment
 details still require agreement. No Runtime code is extracted by this scaffold.
 There is no separate Orchestrator dependency.
