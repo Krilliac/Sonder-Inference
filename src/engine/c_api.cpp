@@ -1,6 +1,7 @@
 // C ABI implementation (include/sonder_inference.h).
 #include "sonder_inference.h"
 
+#include <cstddef>
 #include <exception>
 #include <memory>
 #include <string>
@@ -44,6 +45,44 @@ sonder_status ok() {
     return SONDER_OK;
 }
 
+// Original (first) layout of sonder_sampling_config. Callers compiled against
+// it pass struct_size == sizeof(sonder_sampling_config_v1); the appended
+// fields are only read when struct_size covers the whole current struct.
+struct sonder_sampling_config_v1 {
+    uint32_t struct_size;
+    float temperature;
+    float top_p;
+    int32_t top_k;
+    float min_p;
+    float repeat_penalty;
+    int32_t has_seed;
+    uint64_t seed;
+    int32_t max_tokens;
+};
+static_assert(offsetof(sonder_sampling_config, seed) == offsetof(sonder_sampling_config_v1, seed));
+static_assert(offsetof(sonder_sampling_config, max_tokens) == offsetof(sonder_sampling_config_v1, max_tokens));
+static_assert(sizeof(sonder_sampling_config) > sizeof(sonder_sampling_config_v1));
+
+constexpr std::size_t kSamplingConfigMinSize = sizeof(sonder_sampling_config_v1);
+
+bool has_extended_sampling_fields(const sonder_sampling_config& c) {
+    return c.struct_size >= sizeof(sonder_sampling_config);
+}
+
+// Returns an error message, or nullptr when `c` can be converted.
+const char* check_c_sampling(const sonder_sampling_config& c) {
+    if (c.struct_size < kSamplingConfigMinSize) {
+        return "sonder_sampling_config.struct_size too small";
+    }
+    if (has_extended_sampling_fields(c) && c.logit_bias_count > 0 && c.logit_bias == nullptr) {
+        return "sonder_sampling_config.logit_bias is null but logit_bias_count > 0";
+    }
+    if (has_extended_sampling_fields(c) && c.logit_bias_count > SamplingConfig::kMaxLogitBiasEntries) {
+        return "sonder_sampling_config.logit_bias_count exceeds the maximum";
+    }
+    return nullptr;
+}
+
 SamplingConfig from_c(const sonder_sampling_config& c) {
     SamplingConfig s;
     s.temperature = c.temperature;
@@ -55,6 +94,17 @@ SamplingConfig from_c(const sonder_sampling_config& c) {
         s.seed = c.seed;
     }
     s.max_tokens = c.max_tokens;
+    if (has_extended_sampling_fields(c)) {
+        s.typical_p = c.typical_p;
+        s.presence_penalty = c.presence_penalty;
+        s.frequency_penalty = c.frequency_penalty;
+        s.repeat_last_n = c.repeat_last_n;
+        s.num_ctx = c.num_ctx;
+        s.logit_bias.reserve(c.logit_bias_count);
+        for (std::size_t i = 0; i < c.logit_bias_count; ++i) {
+            s.logit_bias.push_back(TokenLogitBias{c.logit_bias[i].token, c.logit_bias[i].bias});
+        }
+    }
     return s;
 }
 
@@ -188,6 +238,13 @@ void sonder_sampling_config_init(sonder_sampling_config* config) {
     config->has_seed = 0;
     config->seed = 0;
     config->max_tokens = d.max_tokens;
+    config->typical_p = d.typical_p;
+    config->presence_penalty = d.presence_penalty;
+    config->frequency_penalty = d.frequency_penalty;
+    config->repeat_last_n = d.repeat_last_n;
+    config->num_ctx = d.num_ctx;
+    config->logit_bias = nullptr;
+    config->logit_bias_count = 0;
 }
 
 sonder_status sonder_sampling_config_validate(const sonder_sampling_config* config) {
@@ -195,8 +252,8 @@ sonder_status sonder_sampling_config_validate(const sonder_sampling_config* conf
         if (!config) {
             return fail(SONDER_ERROR_INVALID_ARGUMENT, "config is null");
         }
-        if (config->struct_size < sizeof(sonder_sampling_config)) {
-            return fail(SONDER_ERROR_INVALID_ARGUMENT, "sonder_sampling_config.struct_size too small");
+        if (const char* err = check_c_sampling(*config)) {
+            return fail(SONDER_ERROR_INVALID_ARGUMENT, err);
         }
         auto st = validate(from_c(*config));
         return st.ok() ? ok() : fail(st);
@@ -212,8 +269,8 @@ sonder_status sonder_session_create(sonder_engine* engine, sonder_model* model, 
         *out_session = nullptr;
         SessionOptions so;
         if (sampling) {
-            if (sampling->struct_size < sizeof(sonder_sampling_config)) {
-                return fail(SONDER_ERROR_INVALID_ARGUMENT, "sonder_sampling_config.struct_size too small");
+            if (const char* err = check_c_sampling(*sampling)) {
+                return fail(SONDER_ERROR_INVALID_ARGUMENT, err);
             }
             so.sampling = from_c(*sampling);
         }
