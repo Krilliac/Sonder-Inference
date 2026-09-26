@@ -66,6 +66,18 @@ FetchContent_Declare(llamacpp
 )
 FetchContent_MakeAvailable(llamacpp)
 
+# llama.cpp itself is written against C++17. The root project sets
+# CMAKE_CXX_STANDARD 20, and under MSVC C++20 char8_t makes u8"" literals in
+# llama-chat.cpp incompatible with const char*. Build the upstream llama
+# target as C++17; Sonder's own targets stay C++20.
+foreach(sonder_llamacpp_upstream_target IN ITEMS llama)
+    if(TARGET ${sonder_llamacpp_upstream_target})
+        set_target_properties(${sonder_llamacpp_upstream_target} PROPERTIES
+            CXX_STANDARD 17
+            CXX_STANDARD_REQUIRED ON)
+    endif()
+endforeach()
+
 add_library(sonder_backend_llamacpp STATIC
     llamacpp_backend.cpp
     llamacpp_util.cpp
