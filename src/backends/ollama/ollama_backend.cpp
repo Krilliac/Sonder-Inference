@@ -1,308 +1,196 @@
-// Ollama compatibility backend ("Backend 0", docs/BACKENDS.md).
-#include <chrono>
+// Backend adapter: exposes OllamaClient through the core Backend interface.
+#include <memory>
+#include <string>
+#include <utility>
 
-#include "net/http_client.hpp"
-#include "ollama_protocol.hpp"
 #include "sonder/inference/backends/ollama.hpp"
 
 namespace sonder::inference {
 
-namespace ollama {
-
-json::Object build_generate_body(const std::string& model, const GenerateRequest& request,
-                                 const std::string& keep_alive) {
-    const SamplingConfig& s = request.sampling;
-    json::Object options{{"temperature", s.temperature},
-                         {"top_p", s.top_p},
-                         {"top_k", s.top_k},
-                         {"min_p", s.min_p},
-                         {"repeat_penalty", s.repeat_penalty},
-                         {"num_predict", s.max_tokens}};
-    if (s.seed) {
-        options.set("seed", static_cast<std::int64_t>(*s.seed & 0x7FFFFFFFFFFFFFFFull));
-    }
-    if (!s.stop.empty()) {
-        json::Array stop;
-        for (const auto& st : s.stop) {
-            stop.emplace_back(st);
-        }
-        options.set("stop", std::move(stop));
-    }
-    json::Object body{{"model", model}, {"prompt", request.prompt}, {"stream", true}, {"options", std::move(options)}};
-    if (!keep_alive.empty()) {
-        body.set("keep_alive", keep_alive);
-    }
-    return body;
-}
-
-Result<StreamLine> parse_stream_line(std::string_view line, GenerateStats& stats) {
-    StreamLine out;
-    if (line.find_first_not_of(" \t\r") == std::string_view::npos) {
-        return out;
-    }
-    auto parsed = json::parse(line);
-    if (!parsed.ok()) {
-        return parsed.status();
-    }
-    const json::Value& v = parsed.value();
-    if (const json::Value* err = v.find("error")) {
-        return Status(ErrorCode::backend_error, "ollama: " + err->as_string());
-    }
-    if (const json::Value* r = v.find("response")) {
-        out.piece = r->as_string();
-    }
-    if (const json::Value* d = v.find("done")) {
-        out.done = d->as_bool();
-    }
-    if (out.done) {
-        auto u64 = [&](const char* key) -> std::uint64_t {
-            const json::Value* f = v.find(key);
-            const auto n = f ? f->as_int(0) : 0;
-            return n > 0 ? static_cast<std::uint64_t>(n) : 0;
-        };
-        if (v.find("eval_count") || v.find("prompt_eval_count")) {
-            stats.token_counts_from_backend = true;
-        }
-        stats.prompt_tokens = u64("prompt_eval_count");
-        stats.completion_tokens = u64("eval_count");
-        stats.load_ns = u64("load_duration");
-        stats.prompt_eval_ns = u64("prompt_eval_duration");
-        stats.eval_ns = u64("eval_duration");
-        const json::Value* reason = v.find("done_reason");
-        const std::string r = reason ? reason->as_string() : std::string();
-        if (r == "length") {
-            stats.stop_reason = StopReason::max_tokens;
-        } else {
-            stats.stop_reason = StopReason::end_of_sequence;
-        }
-    }
-    return out;
-}
-
-ModelDescriptor descriptor_from_tag(const json::Value& entry) {
-    ModelDescriptor d;
-    d.name = entry.find("name") ? entry.find("name")->as_string() : std::string();
-    if (d.name.empty() && entry.find("model")) {
-        d.name = entry.find("model")->as_string();
-    }
-    d.backend = kOllamaBackendName;
-    if (const json::Value* size = entry.find("size")) {
-        const auto n = size->as_int(0);
-        d.size_bytes = n > 0 ? static_cast<std::uint64_t>(n) : 0;
-    }
-    if (const json::Value* details = entry.find("details")) {
-        auto str = [&](const char* key) {
-            const json::Value* f = details->find(key);
-            return f ? f->as_string() : std::string();
-        };
-        d.format = str("format");
-        d.family = str("family");
-        d.parameter_size = str("parameter_size");
-        d.quantization = str("quantization_level");
-    }
-    return d;
-}
-
-}  // namespace ollama
+using ollama::OllamaClient;
+using ollama::OllamaModelInfo;
+using ollama::StreamChunk;
+using ollama::StreamResult;
 
 namespace {
 
-Status error_from_http(int http_status, const std::string& body) {
-    std::string message = "HTTP " + std::to_string(http_status);
-    if (auto parsed = json::parse(body); parsed.ok()) {
-        if (const json::Value* e = parsed.value().find("error")) {
-            message += ": " + e->as_string();
+std::uint64_t to_u64(std::int64_t v) { return v > 0 ? static_cast<std::uint64_t>(v) : 0u; }
+
+StopReason map_done_reason(const std::string& reason) {
+    if (reason == "length") {
+        return StopReason::max_tokens;
+    }
+    if (reason == "stop") {
+        return StopReason::end_of_sequence;
+    }
+    return StopReason::none;
+}
+
+std::uint64_t context_length_from_show(const json::Value& show) {
+    const json::Value* info = show.find("model_info");
+    if (info == nullptr || !info->is_object()) {
+        return 0;
+    }
+    std::string arch;
+    if (const json::Value* a = info->find("general.architecture"); a != nullptr && a->is_string()) {
+        arch = a->as_string();
+    }
+    if (!arch.empty()) {
+        if (const json::Value* c = info->find(arch + ".context_length"); c != nullptr && c->is_number()) {
+            return to_u64(c->as_int());
         }
     }
-    const ErrorCode code = http_status == 404 ? ErrorCode::not_found : ErrorCode::backend_error;
-    return Status(code, "ollama " + message);
+    return 0;
 }
 
 class OllamaModel final : public BackendModel {
 public:
-    OllamaModel(ModelDescriptor d, net::Url url, OllamaBackendOptions options)
-        : descriptor_(std::move(d)), url_(std::move(url)), options_(std::move(options)) {}
+    OllamaModel(std::shared_ptr<const OllamaClient> client, ModelDescriptor descriptor)
+        : client_(std::move(client)), descriptor_(std::move(descriptor)) {}
 
     const ModelDescriptor& descriptor() const override { return descriptor_; }
 
     Result<GenerateStats> generate(const GenerateRequest& request, const CancellationToken& cancel,
                                    const TokenCallback& on_chunk) override {
-        net::HttpRequest http;
-        http.method = "POST";
-        http.host = url_.host;
-        http.port = url_.port;
-        http.target = (url_.path == "/" ? std::string() : url_.path) + "/api/generate";
-        http.body = json::Value(ollama::build_generate_body(descriptor_.name, request, options_.keep_alive)).dump();
-        http.connect_timeout = options_.connect_timeout;
-        http.total_timeout = options_.request_timeout;
+        ollama::GenerateParams params;
+        params.model = descriptor_.name;
+        params.prompt = request.prompt;
+        params.options = ollama::sampling_to_options(request.sampling);
 
-        GenerateStats stats;
-        Status stream_error;
+        const bool emit_thinking = client_->config().emit_thinking_chunks;
+        std::uint64_t index = 0;
         bool stopped_by_callback = false;
-        bool saw_done = false;
-        std::string error_body;
-        int http_status = 0;
-        net::LineSplitter lines;
-
-        auto on_line = [&](std::string_view line) -> bool {
-            if (http_status != 200) {
-                error_body.append(line);
-                return true;
-            }
-            auto parsed = ollama::parse_stream_line(line, stats);
-            if (!parsed.ok()) {
-                stream_error = parsed.status();
-                return false;
-            }
-            const auto& sl = parsed.value();
-            if (!sl.piece.empty()) {
-                const TokenChunk chunk{sl.piece, stats.chunks++};
-                if (on_chunk && !on_chunk(chunk)) {
-                    stopped_by_callback = true;
+        auto res = client_->generate(
+            params,
+            [&](const StreamChunk& c) {
+                if (cancel.cancelled()) {
                     return false;
                 }
-            }
-            if (sl.done) {
-                saw_done = true;
-                return false;
-            }
-            return true;
-        };
-
-        http.on_status = [&](int code) { http_status = code; };
-        auto res = net::http_request(
-            http, [&](std::string_view data) { return lines.feed(data, on_line); }, cancel);
+                if (!on_chunk) {
+                    return true;
+                }
+                auto deliver = [&](std::string_view text) {
+                    if (text.empty() || stopped_by_callback) {
+                        return;
+                    }
+                    if (!on_chunk(TokenChunk{text, index})) {
+                        stopped_by_callback = true;
+                    }
+                    ++index;
+                };
+                if (emit_thinking) {
+                    deliver(c.thinking);
+                }
+                deliver(c.content);
+                return !stopped_by_callback;
+            },
+            cancel);
+        if (cancel.cancelled()) {
+            return Status(ErrorCode::cancelled, "ollama: request cancelled");
+        }
         if (!res.ok()) {
-            if (cancel.cancelled() || res.status().code() == ErrorCode::cancelled) {
-                return Status(ErrorCode::cancelled, "cancelled by caller");
-            }
             return res.status();
         }
-        if (res.value().status != 200) {
-            lines.finish(on_line);
-            return error_from_http(res.value().status, error_body);
+        const StreamResult& r = res.value();
+        GenerateStats stats;
+        stats.chunks = index;
+        if (r.timings.has_server_timings) {
+            stats.prompt_tokens = to_u64(r.timings.prompt_eval_count);
+            stats.completion_tokens = to_u64(r.timings.eval_count);
+            stats.load_ns = to_u64(r.timings.load_duration_ns);
+            stats.prompt_eval_ns = to_u64(r.timings.prompt_eval_duration_ns);
+            stats.eval_ns = to_u64(r.timings.eval_duration_ns);
+            stats.token_counts_from_backend = true;
+        } else {
+            stats.completion_tokens = static_cast<std::uint64_t>(r.timings.content_chunks);
         }
-        if (!stream_error.ok()) {
-            return stream_error;
-        }
-        if (!saw_done && !stopped_by_callback) {
-            lines.finish(on_line);
-            if (!stream_error.ok()) {
-                return stream_error;
-            }
-        }
-        if (stopped_by_callback) {
-            stats.stop_reason = StopReason::callback;
-        } else if (!saw_done) {
-            return Status(ErrorCode::protocol_error, "ollama stream ended without done=true");
-        }
-        if (!stats.token_counts_from_backend) {
-            stats.completion_tokens = stats.chunks;
-        }
+        stats.stop_reason = (stopped_by_callback || r.stopped_by_callback) ? StopReason::callback
+                                                                           : map_done_reason(r.done_reason);
         return stats;
     }
 
 private:
+    std::shared_ptr<const OllamaClient> client_;
     ModelDescriptor descriptor_;
-    net::Url url_;
-    OllamaBackendOptions options_;
 };
 
 class OllamaBackend final : public Backend {
 public:
-    explicit OllamaBackend(OllamaBackendOptions options) : options_(std::move(options)) {
-        auto parsed = net::parse_url(options_.base_url);
-        if (!parsed.ok()) {
-            config_ = parsed.status();
-            return;
-        }
-        url_ = parsed.value();
-        if (!options_.allow_remote && !net::is_loopback_host(url_.host)) {
-            config_ = Status(ErrorCode::invalid_argument,
-                             "ollama backend refuses non-loopback host '" + url_.host +
-                                 "' over plain HTTP (set allow_remote to override)");
-        }
-    }
+    explicit OllamaBackend(OllamaBackendOptions config) : client_(std::make_shared<OllamaClient>(std::move(config))) {}
 
     std::string name() const override { return kOllamaBackendName; }
-    std::string description() const override { return "Ollama compatibility adapter at " + options_.base_url; }
+    std::string description() const override {
+        return "Ollama compatibility adapter at " + client_->config().base_url;
+    }
     BackendCapabilities capabilities() const override {
-        BackendCapabilities c;
-        c.add(Capability::streaming).add(Capability::remote_process);
-        return c;
+        BackendCapabilities caps;
+        caps.add(Capability::streaming).add(Capability::remote_process);
+        return caps;
     }
 
-    Result<std::string> probe() override {
-        std::string body;
-        auto res = get("/api/version", body);
-        if (!res.ok()) {
-            return res.status();
-        }
-        auto parsed = json::parse(body);
-        if (!parsed.ok()) {
-            return parsed.status();
-        }
-        const json::Value* v = parsed.value().find("version");
-        return v ? v->as_string() : std::string("unknown");
-    }
+    Result<std::string> probe() override { return client_->version(); }
 
     Result<std::vector<ModelDescriptor>> list_models() override {
-        std::string body;
-        auto res = get("/api/tags", body);
-        if (!res.ok()) {
-            return res.status();
-        }
-        auto parsed = json::parse(body);
-        if (!parsed.ok()) {
-            return parsed.status();
+        auto models = client_->list_models();
+        if (!models.ok()) {
+            return models.status();
         }
         std::vector<ModelDescriptor> out;
-        if (const json::Value* models = parsed.value().find("models")) {
-            for (const auto& entry : models->as_array()) {
-                out.push_back(ollama::descriptor_from_tag(entry));
-            }
+        out.reserve(models.value().size());
+        for (const auto& m : models.value()) {
+            out.push_back(to_descriptor(m));
         }
         return out;
     }
 
     Result<std::shared_ptr<BackendModel>> load_model(const ModelLoadOptions& options) override {
-        auto models = list_models();
-        if (!models.ok()) {
-            return models.status();
+        if (options.model.empty()) {
+            return Status(ErrorCode::invalid_argument, "ollama: model name is required");
         }
-        for (const auto& d : models.value()) {
-            if (d.name == options.model || d.name == options.model + ":latest") {
-                return std::shared_ptr<BackendModel>(std::make_shared<OllamaModel>(d, url_, options_));
+        // Ollama loads weights lazily on first request; here we only verify
+        // the model exists and capture its metadata. No pulls are performed.
+        auto show = client_->show_model(options.model);
+        if (!show.ok()) {
+            return show.status();
+        }
+        ModelDescriptor d;
+        d.name = options.model;
+        d.backend = kOllamaBackendName;
+        if (const json::Value* det = show.value().find("details"); det != nullptr) {
+            auto s = [&](std::string_view k) {
+                const json::Value* v = det->find(k);
+                return (v != nullptr && v->is_string()) ? v->as_string() : std::string();
+            };
+            d.format = s("format");
+            d.family = s("family");
+            d.parameter_size = s("parameter_size");
+            d.quantization = s("quantization_level");
+        }
+        d.context_length = context_length_from_show(show.value());
+        if (auto models = client_->list_models(); models.ok()) {
+            for (const auto& m : models.value()) {
+                if (m.name == options.model || m.name == options.model + ":latest") {
+                    d.size_bytes = m.size_bytes;
+                }
             }
         }
-        return Status(ErrorCode::not_found, "ollama has no model named " + options.model);
+        return std::shared_ptr<BackendModel>(std::make_shared<OllamaModel>(client_, std::move(d)));
     }
 
 private:
-    Result<int> get(const std::string& path, std::string& body) {
-        if (!config_.ok()) {
-            return config_;
-        }
-        net::HttpRequest http;
-        http.method = "GET";
-        http.host = url_.host;
-        http.port = url_.port;
-        http.target = (url_.path == "/" ? std::string() : url_.path) + path;
-        http.connect_timeout = options_.connect_timeout;
-        http.total_timeout = std::chrono::milliseconds(15000);
-        auto res = net::http_request_buffered(http, body);
-        if (!res.ok()) {
-            return res.status();
-        }
-        if (res.value().status != 200) {
-            return error_from_http(res.value().status, body);
-        }
-        return res.value().status;
+    static ModelDescriptor to_descriptor(const OllamaModelInfo& m) {
+        ModelDescriptor d;
+        d.name = m.name;
+        d.backend = kOllamaBackendName;
+        d.format = m.format;
+        d.family = m.family;
+        d.parameter_size = m.parameter_size;
+        d.quantization = m.quantization_level;
+        d.size_bytes = m.size_bytes;
+        return d;
     }
 
-    OllamaBackendOptions options_;
-    net::Url url_;
-    Status config_;
+    std::shared_ptr<OllamaClient> client_;
 };
 
 }  // namespace

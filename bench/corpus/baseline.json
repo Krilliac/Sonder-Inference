@@ -1,0 +1,55 @@
+{
+  "schema": "sonder.inference.corpus/1",
+  "name": "baseline",
+  "version": "2026-09-26.1",
+  "description": "Baseline corpus for docs/BENCHMARK_PLAN.md: interactive chat, coding, long-context prefill, and agent fan-out with a shared prefix. Long-context prompts are sized to stay under a 4096-token default context window. Bump 'version' whenever prompts change; results record the corpus hash.",
+  "fillers": {
+    "project_context": "Project context. The Sonder runtime coordinates agents, tools, and budgets on a single workstation, while Sonder Inference owns model lifecycle, batching, KV cache policy, device placement, and backend execution. Requests arrive as sessions with a stable session id, a run id, and per-request ids. Each request carries sampling settings, a token budget, and an optional priority. The scheduler admits requests into prefill or decode phases, forms batches, and may preempt background work to protect interactive latency. Telemetry is emitted as versioned JSON events to a bounded queue and never blocks token generation. The Ollama adapter remains the compatibility and fallback path until native backends pass correctness and reliability gates."
+  },
+  "prompts": [
+    {
+      "id": "short-fact",
+      "workload": "interactive_chat",
+      "prompt": "In two sentences, explain why the sky appears blue during the day.",
+      "max_tokens": 64
+    },
+    {
+      "id": "short-code",
+      "workload": "coding",
+      "prompt": "Write a C++20 function `std::vector<int> primes_below(int n)` using the sieve of Eratosthenes. Return only the code.",
+      "max_tokens": 192
+    },
+    {
+      "id": "medium-reasoning",
+      "workload": "interactive_chat",
+      "prompt": "A service handles 40 requests per second with a mean latency of 250 ms. Using Little's law, estimate the average number of requests in flight, then list three ways to reduce tail latency. Answer as a short numbered list.",
+      "max_tokens": 160
+    },
+    {
+      "id": "long-context-summary",
+      "workload": "long_context",
+      "context": {
+        "filler": "project_context",
+        "repeat": 16
+      },
+      "prompt": "Using only the project context above, summarize the division of responsibilities between the runtime and the inference engine in five bullet points.",
+      "max_tokens": 128
+    },
+    {
+      "id": "agent-fanout-4",
+      "workload": "agent_fanout",
+      "context": {
+        "filler": "project_context",
+        "repeat": 4
+      },
+      "shared_prefix": "You are one of several worker agents. Read the shared project context and complete only your assigned task in at most three sentences.",
+      "children": [
+        "Task: name the component that owns KV cache policy.",
+        "Task: explain why telemetry must never block token generation.",
+        "Task: describe when background work may be preempted.",
+        "Task: state what must happen before the Ollama adapter can be retired."
+      ],
+      "max_tokens": 64
+    }
+  ]
+}
