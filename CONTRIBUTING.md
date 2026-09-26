@@ -17,8 +17,9 @@ opt-in via `SONDER_TEST_OLLAMA_MODEL` (and optionally `SONDER_TEST_OLLAMA_URL`).
 - Keep commits focused and use DCO sign-off (`git commit -s`).
 - Run `git diff --check`; follow `.editorconfig` and `.gitattributes`.
 - The C ABI (`include/sonder_inference.h`) is append-only.
-- The project is MIT licensed ([LICENSE](LICENSE)); contributions are accepted
-  under the same license. Third-party code requires a record in
-  [LICENSE_REVIEW](docs/LICENSE_REVIEW.md) before it is fetched, vendored, or
-  linked.
+- The project is licensed under Apache-2.0 ([LICENSE](LICENSE),
+  [NOTICE](NOTICE)); contributions are accepted under the same license
+  (Apache-2.0 section 5). Third-party code requires a record in
+  [LICENSE_REVIEW](docs/LICENSE_REVIEW.md) (and its notice in `NOTICE`) before
+  it is fetched, vendored, or linked.
 - Never commit model weights, secrets, or large generated outputs.

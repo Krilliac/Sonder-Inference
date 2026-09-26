@@ -1,0 +1,52 @@
+Sonder-Inference
+Copyright 2026 Nate Witkowski
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This repository does not vendor third-party source code. The following
+third-party components are fetched at build time, at pinned revisions with
+checked SHA-256 hashes, and remain under their own licenses. Distributions
+that include their code must keep the notices below.
+
+------------------------------------------------------------------------------
+llama.cpp / GGML  (optional backend, SONDER_WITH_LLAMA_CPP=ON; statically
+linked into sonder_inference when enabled)
+  https://github.com/ggml-org/llama.cpp  tag b11195
+  (commit d834d44e643681f7b046a22d357335f6f4ff6107)
+  License: MIT
+  Copyright (c) 2023-2026 The ggml authors
+
+------------------------------------------------------------------------------
+cpp-httplib  (test-only: fake Ollama server in src/backends/ollama tests;
+never linked into sonder_inference)
+  https://github.com/yhirose/cpp-httplib  tag v0.58.0
+  License: MIT
+  Copyright (c) 2017 yhirose
+
+------------------------------------------------------------------------------
+doctest  (test-only: unit-test framework; never linked into sonder_inference)
+  https://github.com/doctest/doctest  tag v2.5.3
+  License: MIT
+  Copyright (c) 2016-2023 Viktor Kirilov
+
+------------------------------------------------------------------------------
+MIT License text (applies to the components above, with their respective
+copyright lines):
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
