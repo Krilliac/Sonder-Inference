@@ -11,7 +11,8 @@
 //   * the serialized envelope is exactly one line (JSONL framing);
 //   * it re-parses as an object carrying the schema, event_type, session_id
 //     ("unscoped" when empty) and attributes byte-identical to the input's
-//     serialization;
+//     serialization (string fields are compared against their own JSON
+//     round-trip, since the serializer replaces ill-formed UTF-8 with U+FFFD);
 //   * valid UTF-8 in -> valid UTF-8 out.
 #include <cstddef>
 #include <cstdint>
@@ -35,6 +36,14 @@ TelemetryBus& bus() {
         return o;
     }());
     return instance;
+}
+
+// What a string looks like after one serialize/parse cycle. Identity for
+// valid UTF-8; ill-formed bytes become U+FFFD once the json layer sanitizes.
+std::string round_trip(const std::string& s) {
+    auto back = json::parse(json::Value(s).dump());
+    SONDER_FUZZ_CHECK(back.ok() && back.value().is_string());
+    return back.value().as_string();
 }
 
 }  // namespace
@@ -83,10 +92,10 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     const json::Value& env = back.value();
     SONDER_FUZZ_CHECK(env.is_object());
     SONDER_FUZZ_CHECK(env.find("schema") && env.find("schema")->as_string() == kObservatorySchema);
-    SONDER_FUZZ_CHECK(env.find("event_type") && env.find("event_type")->as_string() == event_type);
+    SONDER_FUZZ_CHECK(env.find("event_type") && env.find("event_type")->as_string() == round_trip(event_type));
     SONDER_FUZZ_CHECK(env.find("sequence") && env.find("sequence")->as_int() == 42);
     const std::string expected_session = ctx.session_id.empty() ? std::string("unscoped") : ctx.session_id;
-    SONDER_FUZZ_CHECK(env.find("session_id") && env.find("session_id")->as_string() == expected_session);
+    SONDER_FUZZ_CHECK(env.find("session_id") && env.find("session_id")->as_string() == round_trip(expected_session));
     SONDER_FUZZ_CHECK(env.find("attributes") && env.find("attributes")->dump() == attributes_json);
     if (input_utf8) {
         SONDER_FUZZ_CHECK(sonder_fuzz::is_valid_utf8(line));
