@@ -10,7 +10,7 @@ needs to edit root files.
 | --- | --- | --- |
 | `src/cache/` | `feat/kv-cache` | reserved |
 | `src/scheduler/` | `feat/scheduler` | merged (PR #2, 33 tests) — notes: `docs/integration/scheduler.md` |
-| `src/sampling/` | `feat/sampling` | reserved (core keeps `SamplingConfig` + validation in `src/engine/sampling_config.cpp`) |
+| `src/sampling/` | `feat/sampling` | merged (PR #3, 90 tests; headers under `sonder/sampling/`) — notes: `docs/integration/sampling.md`; core keeps `SamplingConfig` + validation |
 | `src/backends/llamacpp/` | `feat/llamacpp-backend` | reserved (license review required first) |
 | `src/backends/ollama/` | `feat/ollama-bench` | initial adapter landed with the foundation |
 | `bench/` | `feat/ollama-bench` | harness skeleton + smoke corpus landed with the foundation |
