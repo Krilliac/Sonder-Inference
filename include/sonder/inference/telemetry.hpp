@@ -19,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "sonder/inference/json.hpp"
@@ -50,6 +51,14 @@ class TelemetrySink {
 public:
     virtual ~TelemetrySink() = default;
     virtual void write(std::string_view json_line) = 0;
+    // Same as write(), plus the envelope's stream sequence number (the
+    // "<instance_id>-<sequence>" suffix of event_id). Sinks that index events
+    // by sequence (the live telemetry hub of `sonder-infer serve`) override
+    // it; the default forwards to write(). Called on the writer thread.
+    virtual void write_event(std::uint64_t sequence, std::string_view json_line) {
+        (void)sequence;
+        write(json_line);
+    }
     virtual void flush() {}
 };
 
@@ -77,6 +86,12 @@ struct TelemetryOptions {
     bool capture_text = false;
     std::string producer_name = "sonder-inference";
     std::string node_id;  // defaults to host name
+    // Envelope producer.role (additive field, contract sonder.observatory.event/1).
+    // Empty omits the field.
+    std::string role = "inference";
+    // Envelope producer.synthetic: true only when the events describe
+    // synthetic work (the MOCK backend). Always emitted as a boolean.
+    bool synthetic = false;
     // Minimum spacing between live telemetry.dropped reports while running.
     // The first drop is reported as soon as the writer catches up; a final
     // report is emitted at shutdown if anything is still unreported.
@@ -132,7 +147,8 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::condition_variable drained_cv_;
-    std::deque<std::string> queue_;
+    // (sequence, serialized envelope) in emission order.
+    std::deque<std::pair<std::uint64_t, std::string>> queue_;
     std::uint64_t next_sequence_ = 0;
     std::uint64_t written_sequence_ = 0;  // count of lines handed to sinks
     std::uint64_t enqueued_count_ = 0;

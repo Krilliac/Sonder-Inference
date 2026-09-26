@@ -318,3 +318,93 @@ TEST_CASE("drops are reported while running, not only at shutdown") {
     CHECK(live);
     bus.shutdown();
 }
+
+namespace {
+TelemetryContext ctx_s() {
+    TelemetryContext c;
+    c.session_id = "s";
+    return c;
+}
+}  // namespace
+
+TEST_CASE("producer role and synthetic flag (additive envelope fields)") {
+    auto sink = std::make_shared<MemoryTelemetrySink>();
+    TelemetryOptions opts;
+    TelemetryBus plain(opts);
+    plain.add_sink(sink);
+    const json::Object env = plain.make_envelope("x.y", ctx_s(), json::Object{}, 0);
+    CHECK(env.find("producer")->find("role")->as_string() == "inference");
+    CHECK_FALSE(env.find("producer")->find("synthetic")->as_bool());
+
+    opts.synthetic = true;
+    opts.role = "";
+    TelemetryBus synthetic(opts);
+    const json::Object env2 = synthetic.make_envelope("x.y", ctx_s(), json::Object{}, 0);
+    CHECK(env2.find("producer")->find("role") == nullptr);
+    CHECK(env2.find("producer")->find("synthetic")->as_bool());
+}
+
+namespace {
+class SequenceSink final : public TelemetrySink {
+public:
+    void write(std::string_view) override { ++plain_writes; }
+    void write_event(std::uint64_t sequence, std::string_view line) override {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto v = json::parse(line);
+        if (v.ok()) {
+            pairs.emplace_back(sequence, static_cast<std::uint64_t>(v.value().find("sequence")->as_int()));
+        }
+    }
+    std::mutex mutex;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> pairs;
+    int plain_writes = 0;
+};
+}  // namespace
+
+TEST_CASE("sinks receive each envelope's sequence through write_event") {
+    auto sink = std::make_shared<SequenceSink>();
+    {
+        TelemetryBus bus;
+        bus.add_sink(sink);
+        for (int i = 0; i < 20; ++i) {
+            bus.emit("test.event", ctx_s(), json::Object{{"i", i}});
+        }
+        bus.flush();
+    }
+    std::lock_guard<std::mutex> lock(sink->mutex);
+    REQUIRE(sink->pairs.size() == 20);
+    for (std::size_t i = 0; i < sink->pairs.size(); ++i) {
+        CHECK(sink->pairs[i].first == i);
+        CHECK(sink->pairs[i].second == i);
+    }
+    CHECK(sink->plain_writes == 0);
+    // The default write_event forwards to write().
+    MemoryTelemetrySink memory;
+    memory.write_event(7, "{\"a\":1}");
+    REQUIRE(memory.lines().size() == 1);
+    CHECK(memory.lines()[0] == "{\"a\":1}");
+}
+
+TEST_CASE("engine.started carries the server listener when one is set") {
+    auto sink = std::make_shared<MemoryTelemetrySink>();
+    EngineOptions eo;
+    eo.telemetry_sinks.push_back(sink);
+    eo.server = EngineServerInfo{"127.0.0.1", 18437, 1};
+    {
+        Engine engine(std::move(eo));
+        engine.telemetry().flush();
+    }
+    bool found = false;
+    for (const auto& line : sink->lines()) {
+        auto v = json::parse(line);
+        REQUIRE(v.ok());
+        if (v.value().find("event_type")->as_string() != "engine.started") continue;
+        found = true;
+        const json::Value* server = v.value().find("attributes")->find("server");
+        REQUIRE(server != nullptr);
+        CHECK(server->find("host")->as_string() == "127.0.0.1");
+        CHECK(server->find("port")->as_int() == 18437);
+        CHECK(server->find("api_version")->as_int() == 1);
+    }
+    CHECK(found);
+}

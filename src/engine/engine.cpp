@@ -24,13 +24,17 @@ Engine::Engine(EngineOptions options)
     }
     options_.telemetry_sinks.clear();
     auto ctx = engine_context();
-    telemetry_->emit("engine.started", ctx,
-                     json::Object{{"version", version_string()},
-                                  {"commit", build_commit()},
-                                  {"platform", host_platform()},
-                                  {"device_count", devices_.size()},
-                                  {"text_capture", options_.telemetry.capture_text ? "on" : "off"}},
-                     TelemetryLevel::metrics);
+    json::Object started{{"version", version_string()},
+                         {"commit", build_commit()},
+                         {"platform", host_platform()},
+                         {"device_count", devices_.size()},
+                         {"text_capture", options_.telemetry.capture_text ? "on" : "off"}};
+    if (options_.server) {
+        started.set("server", json::Object{{"host", options_.server->host},
+                                           {"port", options_.server->port},
+                                           {"api_version", options_.server->api_version}});
+    }
+    telemetry_->emit("engine.started", ctx, std::move(started), TelemetryLevel::metrics);
     runtime_ = detail::make_request_runtime(options_.scheduling, *telemetry_, ctx);
     if (runtime_) {
         const auto& so = options_.scheduling;
