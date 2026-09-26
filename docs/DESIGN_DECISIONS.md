@@ -218,7 +218,9 @@ would drop. All additions are compatible with envelope v1. Full status in
 
 ## ADR-020 — Local HTTP boundary with Sonder Runtime (`sonder-infer serve`)
 
-**Date:** 2026-09-26. **Status:** accepted (ecosystem integration contract v1).
+**Date:** 2026-09-26. **Status:** proposed, awaiting owner sign-off
+(ecosystem integration contract v1; the contract review asks for sign-off
+by the owners of all three repositories before this is marked accepted).
 
 **Decision:** Sonder Runtime reaches Sonder Inference over local HTTP served
 by `sonder-infer serve` (module `src/server`, `SONDER_HAS_SERVER`), not

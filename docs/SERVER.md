@@ -1,6 +1,12 @@
 # `sonder-infer serve`: local HTTP API and live telemetry
 
-Status: implemented in module `src/server` (`SONDER_HAS_SERVER`), ADR-020.
+Status: implemented in module `src/server` (`SONDER_HAS_SERVER`), ADR-020
+(proposed, awaiting owner sign-off). **The `sonder-infer serve` command line
+is not dispatched yet:** `tools/sonder-infer` belongs to the inf-cli-ux lane,
+and until that lands `sonder-infer serve …` prints `unknown command serve`.
+Today the server is reachable in process through `serve_main()` and `Server`
+(see [Running it](#running-it)); the `sonder-infer serve` examples below
+describe the command once the CLI dispatches it.
 This page is the authoritative reference for the Inference HTTP API v1
 (`api_version` 1, paths under `/v1`). It implements sections 2, 5 (Inference
 side), 6.1 and 7.1 of the Sonder ecosystem integration contract v1
@@ -25,12 +31,14 @@ sonder-infer serve --backend ollama --model llama3.2:3b --model qwen2.5:7b
 sonder-infer serve --backend llamacpp --model-dir ~/models --model tiny.gguf
 ```
 
-The `serve` subcommand is dispatched by the CLI (`tools/sonder-infer`), which
-calls `sonder::inference::server::serve_main(args, out, err)` from
+The `serve` subcommand is to be dispatched by the CLI (`tools/sonder-infer`,
+pending in the inf-cli-ux lane), which calls
+`sonder::inference::server::serve_main(args, out, err)` from
 `<sonder/inference/server.hpp>`; see [INTEGRATION_NOTES.md](../INTEGRATION_NOTES.md)
 for the CLI wiring. Embedding hosts can run the same server in process with
 `sonder::inference::server::Server` (`ServerOptions`, `start()`, `port()`,
-`stop()`).
+`stop()`); `ServerOptions::backend_instance` accepts a backend the host built
+itself.
 
 ### Options
 
@@ -38,22 +46,22 @@ for the CLI wiring. Embedding hosts can run the same server in process with
 | --- | --- | --- |
 | `--host HOST` | `127.0.0.1` | A non-loopback host requires `--token-file` (exit 2 otherwise). |
 | `--port N` | `11437` | `0` picks an ephemeral port; the ready file and banner show it. |
-| `--backend mock\|ollama\|llamacpp` | env `SONDER_INFER_BACKEND` | Required. |
+| `--backend mock\|ollama\|llamacpp` | env `SONDER_INFER_BACKEND` | Required. A backend this build does not include is a usage error (exit 2), checked before anything binds. |
 | `--model ID` (repeatable) | env `SONDER_INFER_MODEL` | The first model is the default and also answers to `default`. The mock backend serves `mock` when no model is given; other backends require a model (the error points to `sonder-infer models --backend X`). |
 | `--ollama-url URL` | env `SONDER_OLLAMA_URL`, then `OLLAMA_HOST` | `OLLAMA_HOST` values such as `0.0.0.0` or `host:port` are normalised (wildcards become `127.0.0.1`, the port defaults to 11434). |
 | `--ollama-allow-remote` | off | Allows a non-loopback Ollama host. Remote hosts also need `https://`, which needs a `SONDER_WITH_TLS=ON` build; the default build does not wire TLS, so remote Ollama is unusable in v1. |
 | `--model-dir DIR` (repeatable) | none | llama.cpp model directories. |
 | `--token-file PATH` | none | Bearer token (one line). Read once, kept in memory, never logged. A warning is printed when the file is readable by group or others. |
-| `--cors-origin ORIGIN` (repeatable) | none | Exact-match browser origin, allowed on every route. |
+| `--cors-origin ORIGIN` (repeatable) | none | Exact-match browser origin, allowed on every route. Must be a serialized origin as browsers send it: lowercase `scheme://host[:port]`, no path, trailing slash, query or wildcard (exit 2 otherwise). |
 | `--no-default-cors` | off | Drops the default origin list. |
 | `--telemetry-level off\|metrics\|standard\|deep` | `standard` | |
 | `--telemetry-buffer N` | `8192` | Retained events for resume (1 to 1048576). |
 | `--telemetry PATH` | none | Also write JSONL to `PATH` (`-` for stderr). |
 | `--capture-text` | off | Include generated text in token events. Requires `--token-file`. |
-| `--max-connections N` | `64` | |
+| `--max-connections N` | `64` | A warning is printed when it plus 32 exceeds the open-file limit (`ulimit -n`). |
 | `--max-body-bytes N` | `4194304` | |
 | `--shutdown-grace-ms N` | `5000` | |
-| `--ready-file PATH` | none | Written atomically once the socket listens: `{"url","pid","instance_id","api_version":1}`. |
+| `--ready-file PATH` | none | Written atomically once the socket **listens** (models may still be loading: poll health for 200): `{"url","pid","instance_id","api_version":1}`. Removed when `serve` returns, after a failed start as well as after a clean shutdown. A process killed outright (second signal, SIGKILL) leaves it behind: check that `pid` is alive. |
 | `--mock-delay-ms N` | `0` | Mock per-token delay. |
 | `--log-format text\|json` | `text` | Banner, access log and diagnostics on stderr. |
 
@@ -61,7 +69,10 @@ for the CLI wiring. Embedding hosts can run the same server in process with
 clean shutdown, 1 on a runtime error (for example the port is in use; the
 message suggests `--port 0`), 2 on a usage error.
 
-The startup banner (stderr) lists the listen URL and auth mode, the CORS
+As soon as the socket listens, stderr shows `listening on <url>` (for a
+wildcard bind: `listening on 0.0.0.0:PORT (all interfaces; local URL
+http://127.0.0.1:PORT)`) and `loading models on <backend>: …`. Once the models
+are loaded, the banner (`ready on <url>`) lists the auth mode, the CORS
 origins, the backend and models, and the discovery, SSE and NDJSON URLs. With
 the mock backend it adds `MOCK BACKEND - synthetic output, not a quality or
 performance signal`. The access log writes one line per request: time,
@@ -76,7 +87,17 @@ with status 499.
 `server {host, port, api_version}`), starts accepting (health reports
 `starting`, other routes answer 503 `not_ready`), writes the ready file,
 registers the backend and loads the models, then reports `ready`. A model
-that fails to load stops the server with exit 1.
+that fails to load stops the server with exit 1. No lock is held across
+backend I/O, so health keeps answering 503 `starting` while a model loads
+(an Ollama `/api/show` that hangs, for example).
+
+A shutdown request while models load abandons the start after the backend
+call in progress returns (the backend's own timeout bounds it; for Ollama
+metadata calls that is at most 60 s), then drains as below and exits 0.
+Health reports `draining` meanwhile. The first SIGINT/SIGTERM restores the
+default signal action, so a second one exits immediately at any point.
+`Server::stop()` is safe from any thread, also while `start()` runs; `start()`
+then returns `cancelled`.
 
 On SIGINT or SIGTERM (or `request_shutdown()`):
 
@@ -134,27 +155,55 @@ and `Access-Control-Max-Age: 600` (plus
 | Condition | Response |
 | --- | --- |
 | Request line plus headers over 16 KiB, or more than 64 headers | 431 |
-| Malformed request line or header, obsolete line folding, conflicting `Content-Length`, `Content-Length` with `Transfer-Encoding` | 400 `malformed_request` |
+| Malformed request line or header, obsolete line folding, conflicting `Content-Length`, `Content-Length` with `Transfer-Encoding`, more than one `Host` header (RFC 9112 section 3.2) | 400 `malformed_request` |
 | HTTP version other than 1.x | 505 |
 | `POST` without `Content-Length`, or with a chunked body | 411 `length_required` |
 | Body over `--max-body-bytes` (checked before reading it) | 413 `payload_too_large` |
 | Headers or body not received within 10 s | 408 `request_timeout` |
 | More than `--max-connections` open connections | 503 `overloaded`, `Retry-After: 1` |
+| The process is out of file descriptors (`EMFILE`) | 503 `overloaded` ("out of file descriptors") through a reserved descriptor; logged once per episode; the accept loop backs off instead of spinning |
+| `Expect` other than `100-continue` | 417 `expectation_failed` (`param` `Expect`) |
+
+`Expect: 100-continue` (curl sends it for bodies of 1 MiB and more) is
+answered with `HTTP/1.1 100 Continue` once the request has passed every check
+that does not need the body (Host, CORS, auth, route, 411, 413); a request
+that fails one of them gets its error instead. HTTP/1.0 requests have
+`Expect` ignored.
+
+When the server answers before reading the whole request (401, 403, 404,
+405, 411, 413, 417, 400/431 parse errors, 408), it half-closes and keeps
+reading and discarding the rest of the request for up to 2 s and 16 MiB
+(lingering close) before closing. Clients that write the whole body before
+reading the reply (Python `urllib`) therefore receive the error instead of a
+connection reset. The connection-cap 503 is sent from the accept thread and
+lingers only 10 ms, so a client that sends a large body into a full server
+may still see a reset there.
 
 ### Errors
 
 Shape: `{"error": {"message", "type", "code", "param"}, "sonder": {"api_version": 1}}`.
 `param` names the offending field or header when there is one, else `null`.
 
+How session failures map (`map_session_failure`): messages are validated
+before the session runs (400 `invalid_messages`, `param` `messages`); a prompt
+that can never fit the engine's KV pool is also 400 `invalid_messages`; a
+sampler with no viable token is 400 `invalid_sampling`; a backend that refuses
+a field ("… does not support logit_bias", as the Ollama backend does) is 400
+`unsupported_parameter` with that field as `param`; any other refusal is 400
+`invalid_request`. The 429 scheduler path is kept for forward compatibility
+but is unreachable today: the request runtime clamps `max_new_tokens` to the
+KV capacity and sets no sequence fingerprint, so the scheduler can only
+reject with `never_fits` or `invalid_request`, both caller errors (400).
+
 | Status | `type` | `code` |
 | --- | --- | --- |
-| 400 | `invalid_request_error` | `invalid_json`, `invalid_messages`, `unsupported_parameter`, `invalid_sampling`, `invalid_correlation_header`, `malformed_request`, `invalid_request` (bad `format` query) |
+| 400 | `invalid_request_error` | `invalid_json`, `invalid_messages`, `unsupported_parameter`, `invalid_sampling`, `invalid_correlation_header`, `malformed_request`, `invalid_request` (bad `format` query, or the engine or backend refused a request parameter without naming it) |
 | 401 | `authentication_error` | `unauthorized` |
 | 403 | `permission_error` | `forbidden_origin`, `forbidden_host` |
 | 404 | `not_found_error` | `model_not_found`, `not_found` |
 | 405 | `invalid_request_error` | `method_not_allowed` (with `Allow`) |
-| 408 / 411 / 413 / 431 / 505 | `invalid_request_error` | `request_timeout` / `length_required` / `payload_too_large` / `request_header_fields_too_large` / `http_version_not_supported` |
-| 429 | `rate_limit_error` | `overloaded` (engine scheduler rejection before execution, or the telemetry subscriber cap), `Retry-After: 1` |
+| 408 / 411 / 413 / 417 / 431 / 505 | `invalid_request_error` | `request_timeout` / `length_required` / `payload_too_large` / `expectation_failed` / `request_header_fields_too_large` / `http_version_not_supported` |
+| 429 | `rate_limit_error` | `overloaded` (the telemetry subscriber cap; also reserved for an engine scheduler rejection before execution, which the current request runtime cannot produce, see below), `Retry-After: 1` |
 | 500 | `server_error` | `internal_error` |
 | 501 | `not_implemented_error` | `not_implemented` |
 | 503 | `service_unavailable` | `not_ready`: returned only before admission, nothing executed, safe to send elsewhere. `backend_unavailable`: the backend failed while executing, not safe to replay. `overloaded`: connection cap |
@@ -175,7 +224,10 @@ Shape: `{"error": {"message", "type", "code", "param"}, "sonder": {"api_version"
  "sonder":{"api_version":1}}
 ```
 
-`backends[].available` comes from the backend's `probe()`, cached for 2 s.
+`backends[].available` and `version` come from the backend's `probe()`, run
+once before `ready` and then every 2 s by a background refresher: health and
+identity only read that cache and never wait on the backend (a hung Ollama
+cannot stall them).
 `telemetry.emitted` and `telemetry.dropped` are the bus counters;
 `subscriber_dropped_events` counts events lost by slow live subscribers.
 
@@ -371,9 +423,15 @@ loopback ports with the mock backend and a raw-socket client: response
 shapes, every error code, auth, the Host check, CORS, request limits, the
 connection and subscriber caps, chat (streaming and not), correlation
 headers in envelopes, disconnect cancellation, SSE and NDJSON framing,
-heartbeats, resume, backpressure, and `serve_main` (help, usage errors, ready
-file, port in use, graceful shutdown). No network services or weights are
-needed. `fuzz/fuzz_http_request.cpp` fuzzes the request head parser and the
+heartbeats, resume, backpressure (NDJSON counters and the SSE `: dropped <n>`
+comment with its matching sequence gap), 503 `not_ready` during a drain,
+lingering close for clients that send the whole body first, `Expect:
+100-continue`, duplicate `Host` headers, descriptor exhaustion (503 through
+the reserve descriptor, no CPU spin), a backend whose `probe()` and
+`load_model()` block (health stays responsive; `stop()` during `start()`),
+and `serve_main` (help, usage errors, ready file written and removed, port in
+use, wildcard-bind banner, graceful shutdown). No network services or weights
+are needed. `fuzz/fuzz_http_request.cpp` fuzzes the request head parser and the
 chat request mapper.
 
 ## Deviations from the contract text
