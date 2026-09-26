@@ -18,10 +18,12 @@ Cancellation: `CancellationToken` is polled by the core HTTP client while
 waiting on I/O and per chunk; a tripped token returns `ErrorCode::cancelled`.
 A callback returning `false` stops the stream and keeps the partial result.
 
-Transport policy: the core client is plain HTTP only. Non-loopback hosts are
-refused unless `OllamaBackendOptions::allow_remote` is set, and `https://`
-returns `unsupported`. (Node1's TLS worker needs a TLS-capable transport; see
-INTEGRATION_NOTES.md.)
+Transport policy: non-loopback hosts are refused unless
+`OllamaBackendOptions::allow_remote` is set (for http and https alike).
+`https://` works only in builds configured with `-DSONDER_WITH_TLS=ON`
+(OpenSSL on Linux/macOS, Schannel on Windows) and is configured through
+`OllamaBackendOptions::tls`; in the default TLS-off build it returns
+`unsupported`. See docs/integration/tls.md.
 
 Tests (`tests/`) use recorded NDJSON fixtures and an in-process fake Ollama
 server; no live Ollama is needed.

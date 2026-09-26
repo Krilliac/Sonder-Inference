@@ -104,6 +104,17 @@ foreach(module_dir IN LISTS SONDER_MODULE_DIRS)
     endif()
 endforeach()
 
+# Optional TLS for the internal HTTP client (docs/integration/tls.md).
+# SONDER_WITH_TLS defaults to OFF: nothing is compiled or linked then.
+include(SonderTls)
+
+# Optional in-tree libFuzzer targets (docs/integration/hardening.md). CI
+# builds fuzz/ standalone instead, so this stays OFF by default.
+option(SONDER_BUILD_FUZZERS "Build fuzz/ targets (Clang/libFuzzer)" OFF)
+if(SONDER_BUILD_FUZZERS)
+    add_subdirectory(fuzz)
+endif()
+
 if(SONDER_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     add_subdirectory(tests)
 endif()
