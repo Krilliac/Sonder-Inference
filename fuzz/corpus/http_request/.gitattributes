@@ -1,0 +1,3 @@
+# HTTP seeds contain CRLF line endings on purpose (byte-exact wire input):
+# treat them as binary so diffs and `git diff --check` leave them alone.
+* -text -diff
