@@ -23,7 +23,11 @@ TEST_CASE("parses base URLs") {
     auto w = net::parse_url("http://[::1]:8080");
     REQUIRE(w.ok());
     CHECK(w.value().host == "::1");
+#if defined(SONDER_HAS_TLS)
+    CHECK(net::parse_url("https://127.0.0.1").value().port == 443);
+#else
     CHECK(net::parse_url("https://127.0.0.1").status().code() == ErrorCode::unsupported);
+#endif
     CHECK_FALSE(net::parse_url("127.0.0.1:11434").ok());
     CHECK_FALSE(net::parse_url("http://host:99999").ok());
     CHECK(net::is_loopback_host("127.0.0.1"));
