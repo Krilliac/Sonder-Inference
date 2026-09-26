@@ -137,3 +137,9 @@ See `docs/RESEARCH_CATALOG.md` and `docs/RESEARCH_SOURCES.md`.
 ## Status
 
 Research/architecture foundation. No upstream project should be copied or linked as a dependency until its current license and compatibility are verified.
+
+## Local scaffold
+
+Directory placeholders and repository conventions are now present. See
+[scaffold status](docs/SCAFFOLD.md) and [source workspace](src/README.md).
+There is no implementation, build system, or test suite yet.
