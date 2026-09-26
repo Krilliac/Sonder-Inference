@@ -311,6 +311,7 @@ private:
             const auto s = cache_.stats();
             bus_.emit("kv.pressure", engine_ctx_,
                       json::Object{{"level", kvc::to_string(*pressure_pending_)},
+                                   {"occupancy", s.utilization},
                                    {"utilization", s.utilization},
                                    {"pinned_blocks", s.pinned_blocks},
                                    {"total_blocks", s.total_blocks}},
@@ -398,6 +399,7 @@ private:
                                    {"kv_tokens", ev.kv_tokens},
                                    {"beneficiary_scheduler_request_id", ev.beneficiary},
                                    {"preemptions", r->summary.preemptions},
+                                   {"queue_ms", r->summary.queue_ms},
                                    {"failed", ev.failed}},
                       TelemetryLevel::metrics);
             if (ev.failed) {
@@ -440,11 +442,12 @@ private:
                     bus_.emit("kv.reused", r->ctx,
                               json::Object{{"scheduler_request_id", w.id},
                                            {"tokens", ar.tokens_reused},
+                                           {"avoided_prefill_tokens", ar.tokens_reused},
                                            {"blocks", ar.blocks_reused},
                                            {"recompute", recompute}},
                               TelemetryLevel::metrics);
                 }
-                bus_.emit("inference.prefill.chunk", r->ctx,
+                bus_.emit("scheduler.prefill.chunk", r->ctx,
                           json::Object{{"scheduler_request_id", w.id},
                                        {"step", plan.step_index},
                                        {"tokens", w.num_tokens},
@@ -457,7 +460,7 @@ private:
                     if (!recompute) {
                         r->summary.reused_prompt_tokens = r->admission_reused;
                     }
-                    bus_.emit("inference.prefill.completed", r->ctx,
+                    bus_.emit("scheduler.prefill.completed", r->ctx,
                               json::Object{{"scheduler_request_id", w.id},
                                            {"context_tokens", r->cached_tokens},
                                            {"prompt_tokens", r->prompt_tokens},
@@ -476,6 +479,7 @@ private:
         if (!plan.empty() || !plan.preempted.empty()) {
             bus_.emit("scheduler.batch.formed", engine_ctx_,
                       json::Object{{"step", plan.step_index},
+                                   {"batch_size", plan.work.size()},
                                    {"sequences", plan.work.size()},
                                    {"prefill_tokens", plan.prefill_tokens},
                                    {"decode_tokens", plan.decode_tokens},
