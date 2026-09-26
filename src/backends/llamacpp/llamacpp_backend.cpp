@@ -64,17 +64,29 @@ struct SamplerDeleter {
 };
 using SamplerPtr = std::unique_ptr<llama_sampler, SamplerDeleter>;
 
-SamplerPtr MakeSampler(const SamplingParams& p, int32_t n_vocab) {
+// Order follows llama.cpp's common sampler: logit bias, penalties, top-k,
+// typical, top-p, min-p, temperature, then the selector.
+SamplerPtr MakeSampler(const SamplingParams& p, int32_t n_vocab, int32_t n_ctx) {
     SamplerPtr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
-    if (p.repeat_penalty != 1.0F && p.repeat_last_n > 0) {
-        llama_sampler_chain_add(chain.get(),
-                                llama_sampler_init_penalties(n_vocab, p.repeat_last_n, p.repeat_penalty, 0.0F, 0.0F));
+    if (!p.logit_bias.empty()) {
+        std::vector<llama_logit_bias> bias;
+        bias.reserve(p.logit_bias.size());
+        for (const auto& [token, value] : p.logit_bias) bias.push_back(llama_logit_bias{token, value});
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_logit_bias(n_vocab, static_cast<int32_t>(bias.size()),
+                                                                           bias.data()));
+    }
+    const int32_t last_n = p.repeat_last_n < 0 ? n_ctx : p.repeat_last_n;
+    const bool penalties = p.repeat_penalty != 1.0F || p.presence_penalty != 0.0F || p.frequency_penalty != 0.0F;
+    if (penalties && last_n > 0) {
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_penalties(n_vocab, last_n, p.repeat_penalty,
+                                                                          p.frequency_penalty, p.presence_penalty));
     }
     if (p.temperature <= 0.0F) {
         llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());
         return chain;
     }
     if (p.top_k > 0) llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(p.top_k));
+    if (p.typical_p < 1.0F) llama_sampler_chain_add(chain.get(), llama_sampler_init_typical(p.typical_p, 1));
     if (p.top_p < 1.0F) llama_sampler_chain_add(chain.get(), llama_sampler_init_top_p(p.top_p, 1));
     if (p.min_p > 0.0F) llama_sampler_chain_add(chain.get(), llama_sampler_init_min_p(p.min_p, 1));
     llama_sampler_chain_add(chain.get(), llama_sampler_init_temp(p.temperature));
@@ -350,6 +362,11 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
     for (Token t : request.prompt) {
         if (t < 0 || t >= n_vocab) return fail(ErrorCode::kInvalidArgument, "prompt token out of range");
     }
+    for (const auto& entry : request.sampling.logit_bias) {
+        if (entry.first < 0 || entry.first >= n_vocab) {
+            return fail(ErrorCode::kInvalidArgument, "logit_bias token out of range");
+        }
+    }
 
     llama_context* ctx = impl_->ctx;
     llama_memory_t mem = llama_get_memory(ctx);
@@ -401,7 +418,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
     impl_->Emit(TelemetryKind::kPrefillDone, result.prompt_tokens, result.prefill_ms);
 
     // ---- Streaming decode ----
-    SamplerPtr sampler = MakeSampler(request.sampling, n_vocab);
+    SamplerPtr sampler = MakeSampler(request.sampling, n_vocab, static_cast<int32_t>(n_ctx));
     Utf8StreamBuffer utf8;
     int64_t pos = n_past + n_prompt;
     const auto decode_start = Clock::now();

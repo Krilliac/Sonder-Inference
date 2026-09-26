@@ -43,14 +43,14 @@ int emit_timing_events(TelemetryBus& bus, const TelemetryContext& ctx, const Oll
     if (t.load_duration_ns > 0) {
         json::Object a = base();
         a.set("load_duration_ns", t.load_duration_ns);
-        accepted += bus.emit("model.load.completed", ctx, std::move(a)) ? 1 : 0;
+        accepted += bus.emit("backend.model.load.reported", ctx, std::move(a)) ? 1 : 0;
     }
     if (t.prompt_eval_count > 0 || t.prompt_eval_duration_ns > 0) {
         json::Object a = base();
         a.set("prompt_eval_count", t.prompt_eval_count);
         a.set("prompt_eval_duration_ns", t.prompt_eval_duration_ns);
         a.set("prompt_tokens_per_sec", t.prompt_tokens_per_sec());
-        accepted += bus.emit("inference.prefill.completed", ctx, std::move(a)) ? 1 : 0;
+        accepted += bus.emit("backend.timing.prefill", ctx, std::move(a)) ? 1 : 0;
     }
     if (t.eval_count > 0 || t.eval_duration_ns > 0) {
         json::Object a = base();
@@ -60,7 +60,7 @@ int emit_timing_events(TelemetryBus& bus, const TelemetryContext& ctx, const Oll
         if (t.ttft_ms >= 0) {
             a.set("ttft_ms", t.ttft_ms);
         }
-        accepted += bus.emit("inference.decode.completed", ctx, std::move(a)) ? 1 : 0;
+        accepted += bus.emit("backend.timing.decode", ctx, std::move(a)) ? 1 : 0;
     }
     return accepted;
 }

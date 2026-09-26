@@ -23,6 +23,7 @@ std::vector<std::string> BackendCapabilities::names() const {
         {Capability::embeddings, "embeddings"},
         {Capability::deterministic, "deterministic"},
         {Capability::remote_process, "remote_process"},
+        {Capability::token_logits, "token_logits"},
     };
     std::vector<std::string> out;
     for (const auto& [cap, name] : kNames) {

@@ -19,8 +19,21 @@ namespace sonder::inference {
 enum class SessionState { idle, running, closed };
 enum class RequestOutcome { none, completed, cancelled, failed };
 
+// Workload classes (docs/SCHEDULER.md), most to least latency-sensitive.
+// The numeric value is the scheduler's default priority rank (lower = sooner).
+enum class WorkloadClass {
+    interactive_user = 0,
+    owner_orchestrator = 1,
+    critic_verification = 2,
+    implementation_worker = 3,
+    research_worker = 4,
+    background_indexing = 5,
+    maintenance = 6,
+};
+
 const char* to_string(SessionState state) noexcept;
 const char* to_string(RequestOutcome outcome) noexcept;
+const char* to_string(WorkloadClass workload) noexcept;
 
 struct SessionOptions {
     std::string session_id;  // generated when empty
@@ -28,7 +41,22 @@ struct SessionOptions {
     std::optional<std::string> agent_id;
     std::optional<std::string> task_id;
     SamplingConfig sampling;
-    int priority = 0;  // recorded for the future scheduler; not yet enforced
+    // Scheduling metadata (used when the engine schedules requests).
+    WorkloadClass workload = WorkloadClass::implementation_worker;
+    // Adjusts the class rank: effective rank = class rank - priority, so a
+    // positive priority is more urgent. 0 keeps the class default.
+    int priority = 0;
+};
+
+// How the engine scheduled a request (all zero when scheduling is inactive).
+struct SchedulingInfo {
+    bool scheduled = false;              // went through scheduler + KV cache
+    std::uint64_t accounted_prompt_tokens = 0;  // tokens used for KV accounting
+    bool exact_prompt_tokens = false;    // true when the backend tokenized the prompt
+    std::uint64_t reused_prompt_tokens = 0;     // prompt tokens served by the prefix cache
+    std::uint32_t preemptions = 0;
+    double queue_ms = 0.0;               // submit -> first admission
+    bool sonder_sampled = false;         // sampled by Sonder's sampler chain (token_logits)
 };
 
 struct GenerationResult {
@@ -38,6 +66,7 @@ struct GenerationResult {
     RequestOutcome outcome = RequestOutcome::none;
     double ttft_ms = -1.0;   // -1 when no chunk was produced
     double total_ms = 0.0;
+    SchedulingInfo scheduling;
 };
 
 class Engine;

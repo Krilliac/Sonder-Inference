@@ -58,6 +58,16 @@ public:
     Result<GenerateStats> generate(const GenerateRequest& request, const CancellationToken& cancel,
                                    const TokenCallback& on_chunk) override {
         if (Status v = validate(request.sampling); !v.ok()) return v;
+        // The llama.cpp context size is fixed at load (ModelLoadOptions::context_length).
+        // A smaller num_ctx is honoured by the engine's scheduling limit; a larger one
+        // cannot be served without reloading.
+        if (request.sampling.num_ctx > 0 && desc_.context_length > 0 &&
+            static_cast<std::uint64_t>(request.sampling.num_ctx) > desc_.context_length) {
+            return Status(ErrorCode::invalid_argument,
+                          "num_ctx " + std::to_string(request.sampling.num_ctx) +
+                              " exceeds the loaded llama.cpp context (" + std::to_string(desc_.context_length) +
+                              "); reload with a larger context_length");
+        }
         // One llama_context per model: serialize requests on it.
         std::lock_guard<std::mutex> lock(mutex_);
         return run(request.prompt, /*templated=*/false, request.sampling, cancel, on_chunk);

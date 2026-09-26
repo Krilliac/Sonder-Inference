@@ -19,6 +19,13 @@ struct MockBackendOptions {
     std::chrono::microseconds token_delay{0};  // artificial per-token latency
     std::int32_t default_completion_tokens = 16; // natural EOS point
     std::int32_t fail_after_tokens = -1;         // >= 0 injects a backend error
+    // Advertise Capability::token_logits: the engine then samples with its own
+    // sampler chain over a small fixed vocabulary (the mock's word list plus
+    // an end-of-sequence token) using deterministic pseudo-logits.
+    bool token_logits = false;
+    // Test hook (token_logits only): every logit is -infinity, as if the
+    // request's policy had banned the whole vocabulary.
+    bool ban_all_tokens = false;
 };
 inline constexpr const char* kMockBackendName = "mock";
 std::shared_ptr<Backend> make_mock_backend(MockBackendOptions options = {});
