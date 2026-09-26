@@ -58,9 +58,9 @@ without the hook one pressure event would preempt every running request.
   rejected with `invalid_argument` (`scheduler.rejected`, `never_fits`).
 - A request preempted more than `max_requeue_count` times fails with
   `unavailable` (`scheduler.preempted` with `failed: true`).
-- `max_new_tokens` is clamped to the model's `context_length` and to the
-  pool. Once `SamplingConfig::num_ctx` lands (`feat/sampling-config`), the
-  session will prefer it (marked `TODO(sampling-config)` in `session.cpp`).
+- `max_new_tokens` is clamped to the context limit and to the pool. The
+  context limit is the model's `context_length`, narrowed by
+  `SamplingConfig::num_ctx` when that is set.
 
 ### Priority
 
