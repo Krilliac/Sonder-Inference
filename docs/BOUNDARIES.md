@@ -1,24 +1,27 @@
-# Proposed repository boundaries
+# Sonder repository boundaries
 
-Status: planning notes for the scaffold, not an approved extraction or API.
+The ecosystem consists of three repositories:
 
-| Repository | Intended responsibility |
+| Repository | Responsibility |
 | --- | --- |
-| Sonder Orchestrator | Goal/task planning, dependency coordination, bounded dispatch, budgets, and task-level recovery. |
-| Sonder Runtime | Existing tool execution and host integration; any extraction or compatibility adapter is future work. |
-| Sonder Inference | Model/session lifecycle, inference scheduling and batching, KV/context management, device policy, and backend execution. |
-| Sonder Observatory | External observation and visualization of telemetry. |
+| [Sonder Runtime](https://github.com/Krilliac/Sonder-runtime) | Agent/task orchestration, tool execution, routing, budgets, and host integration. |
+| [Sonder Inference](https://github.com/Krilliac/Sonder-Inference) | Proposed inference engine: model/session lifecycle, batching, KV/context management, device policy, and backend execution. |
+| [Sonder Observatory](https://github.com/Krilliac/Sonder-Observatory) | Proposed telemetry consumer: live visualization, recordings, replay, inspection, and diagnostics. |
 
-Task scheduling and inference scheduling are separate concerns: Orchestrator
-coordinates tasks, while Inference controls admission and token execution within
-its own resource limits. Neither repository imports the other's private state.
-Observatory must not become a dependency of inference's critical execution path.
+Runtime coordinates tasks and requests inference. Inference owns execution and
+its resource limits. Runtime and Inference emit versioned telemetry that
+Observatory consumes and correlates. Observatory does not own orchestration or
+inference state, and generation must work when it is absent or disconnected.
 
-The exact Runtime/Orchestrator split, calls between components, language choices,
-transport, shared contracts, persistence, and deployment topology remain open.
-No code or live configuration is migrated by this scaffold. Retain the existing
-Ollama compatibility path until the inference roadmap's replacement gates pass.
+Producer instrumentation belongs with the runtime that owns the state. The
+viewer remains a separate process; its renderer must not enter the inference
+critical path. Preserve the existing Ollama compatibility path until the
+inference roadmap's replacement gates pass.
 
-References: [Sonder Runtime](https://github.com/Krilliac/Sonder-runtime),
-[Sonder Inference](https://github.com/Krilliac/Sonder-Inference), and
-[Sonder Observatory](https://github.com/Krilliac/Sonder-Observatory).
+These are architectural roles, not a claim that the proposed integrations are
+implemented. Protocol package ownership, compatibility policy, and deployment
+details still require agreement. No Runtime code is extracted by this scaffold.
+There is no separate Orchestrator dependency.
+
+See Observatory's [architecture](https://github.com/Krilliac/Sonder-Observatory/blob/main/docs/ARCHITECTURE.md)
+and [integration design](https://github.com/Krilliac/Sonder-Observatory/blob/main/docs/INTEGRATION.md).
