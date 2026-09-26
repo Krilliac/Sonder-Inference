@@ -1,0 +1,25 @@
+{
+  "schema": "sonder.inference.corpus/1",
+  "name": "smoke",
+  "description": "Tiny interactive-chat smoke corpus for harness bring-up. Not representative; see docs/BENCHMARK_PLAN.md for the full workload families.",
+  "prompts": [
+    {
+      "id": "chat-short",
+      "workload": "interactive_chat",
+      "prompt": "In one sentence, what is a KV cache in LLM inference?",
+      "max_tokens": 64
+    },
+    {
+      "id": "chat-medium",
+      "workload": "interactive_chat",
+      "prompt": "Explain the difference between prefill and decode phases of transformer inference, and why continuous batching helps throughput. Keep it under 120 words.",
+      "max_tokens": 128
+    },
+    {
+      "id": "coding-short",
+      "workload": "coding",
+      "prompt": "Write a C++20 function that returns the p95 of a std::vector<double> using linear interpolation. Code only.",
+      "max_tokens": 160
+    }
+  ]
+}

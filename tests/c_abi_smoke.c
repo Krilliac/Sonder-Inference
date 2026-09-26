@@ -1,0 +1,45 @@
+/* Compiled as C11: proves sonder_inference.h is a valid C header. */
+#include <stdio.h>
+#include <string.h>
+
+#include "sonder_inference.h"
+
+static int count_tokens(void* user_data, const char* text, size_t length) {
+    (void)text;
+    (void)length;
+    ++*(int*)user_data;
+    return 0;
+}
+
+int main(void) {
+    sonder_engine_options options;
+    sonder_engine* engine = NULL;
+    sonder_model* model = NULL;
+    sonder_session* session = NULL;
+    sonder_sampling_config sampling;
+    sonder_generation_stats stats;
+    int tokens = 0;
+
+    if (sonder_abi_version() != SONDER_ABI_VERSION) return 1;
+    sonder_engine_options_init(&options);
+    options.telemetry_level = SONDER_TELEMETRY_OFF;
+    if (sonder_engine_create(&options, &engine) != SONDER_OK) return 2;
+    if (sonder_engine_register_mock_backend(engine) != SONDER_OK) return 3;
+    if (sonder_model_load(engine, "mock", "mock:tiny", &model) != SONDER_OK) return 4;
+    sonder_sampling_config_init(&sampling);
+    sampling.temperature = 0.0f;
+    sampling.max_tokens = 4;
+    if (sonder_session_create(engine, model, &sampling, &session) != SONDER_OK) return 5;
+    memset(&stats, 0, sizeof(stats));
+    stats.struct_size = sizeof(stats);
+    if (sonder_session_generate(session, "c smoke", count_tokens, &tokens, &stats) != SONDER_OK) {
+        fprintf(stderr, "generate failed: %s\n", sonder_last_error_message());
+        return 6;
+    }
+    if (tokens != 4 || stats.completion_tokens != 4 || stats.outcome != SONDER_OUTCOME_COMPLETED) return 7;
+    sonder_session_destroy(session);
+    sonder_model_release(model);
+    sonder_engine_destroy(engine);
+    printf("c abi smoke ok (%d tokens)\n", tokens);
+    return 0;
+}

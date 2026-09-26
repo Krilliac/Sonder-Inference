@@ -107,3 +107,15 @@ Native code is justified when:
 3. the improvement survives representative workloads;
 4. correctness matches reference output within defined tolerance;
 5. fallback remains available.
+
+## Implementation status (v0.1)
+
+| Backend | Status | Capabilities advertised |
+| --- | --- | --- |
+| `mock` | implemented; **tests only**, performs no inference | tokenization, streaming, deterministic |
+| `ollama` | implemented; loopback HTTP, streaming, cancellable | streaming, remote_process |
+| llama.cpp/GGML | not started; `SONDER_WITH_LLAMA_CPP` reserved (OFF) | - |
+
+The interface lives in `include/sonder/inference/backend.hpp`. Capabilities
+are a bitset (`Capability`), matching the list above plus `deterministic`
+and `remote_process`.

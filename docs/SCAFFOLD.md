@@ -1,29 +1,41 @@
 # Scaffold status
 
-Created 2026-09-26. **Documentation and structure only.**
+Created 2026-09-26 as documentation and structure only. **Superseded the same
+day by the first implementation slice** at the owner's request; this page now
+records the layout and what remains undecided.
 
 ## Included
 
-- [Source ownership placeholders](../src/README.md).
-- [Future test location](../tests/README.md).
+- [Source ownership](../src/README.md) with implemented modules.
+- [Test suite](../tests/README.md) (doctest + CTest).
 - [Contract workspace](contracts/README.md).
 - [Proposed ecosystem boundaries](BOUNDARIES.md).
+- Build system: CMake presets (`CMakePresets.json`), `cmake/`, `scripts/build.ps1`.
+- CI: `.github/workflows/ci.yml` (windows-latest + ubuntu-latest).
+- CLI: `tools/sonder-infer/`. Benchmark corpora and snapshots: `bench/`.
 - Repository editing conventions and contribution instructions.
 
-## Deliberately undecided
+## Decided since the scaffold
 
-Implementation language, build/package system, public API, transport, dependency
-versions, license, CI jobs, and deployment model. Existing architecture documents
-remain the reference for previously recorded decisions; this scaffold adds no
-new runtime promises.
+- Implementation language and build system: C++20 + CMake presets (ADR-011).
+- API boundary: public C++ headers plus a stable C ABI (ADR-011).
+- Telemetry format: Observatory envelope v1 JSONL (ADR-012).
+- Test framework: doctest via FetchContent, test-only (ADR-014).
+- CI jobs: configure/build/test on Windows (MSVC) and Linux.
 
-There are no runnable commands, source implementations, mocked services, backend
-bindings, model downloads, or runtime tests. Directory names are provisional.
+## Still undecided
+
+Project license, transport between Sonder Runtime and Inference (in-process C
+ABI vs. local RPC), package/distribution model, first supported
+model/quantization matrix, and the llama.cpp revision to adopt. Directory
+ownership remains provisional; module work streams are listed in
+[MODULES.md](MODULES.md).
 
 ## Next design work
 
-1. Agree repository ownership and the integration boundary with Sonder Runtime.
-2. Choose the first supported use case and write its acceptance criteria.
-3. Resolve language/toolchain and project/upstream licensing.
-4. Review API, lifecycle, cancellation, error, authorization, and budget semantics.
-5. Request implementation of a bounded first slice, then add meaningful CI/tests.
+1. Pin and license-review a llama.cpp revision; implement the direct backend
+   behind `SONDER_WITH_LLAMA_CPP`.
+2. Agree the Runtime integration boundary and first supported use case.
+3. Define the first model/quantization matrix and extend the benchmark corpus
+   to the workload families in [BENCHMARK_PLAN.md](BENCHMARK_PLAN.md).
+4. Start the Phase 2 scheduler and logical KV manager.

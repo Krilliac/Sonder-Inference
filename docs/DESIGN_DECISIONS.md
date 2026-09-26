@@ -66,3 +66,73 @@ Before code reuse:
 - maintenance status
 - security review
 - benchmark/correctness validation
+
+## ADR-011 — Engine core in C++20 with CMake presets and a stable C ABI
+
+**Date:** 2026-09-26. **Status:** accepted (decided by the owner's chief of staff; owner requested implementation).
+
+**Decision:** implement the engine core in C++20, built with CMake presets
+(MSVC + Ninja on Windows, GCC/Clang + Ninja elsewhere). The public C++ API
+lives in `include/sonder/inference/`. A separate, stable C ABI
+(`include/sonder_inference.h`) is the boundary for Rust, Python, C#, and other
+bindings.
+
+**Reason:**
+- llama.cpp/GGML (ADR-003) is C/C++; embedding it directly avoids an FFI layer
+  on the hottest path.
+- The owner is a C++ engine developer; the codebase should match the team's
+  strongest toolchain.
+- A C ABI (opaque handles, `struct_size`-versioned structs, append-only status
+  codes, thread-local error text) gives future Rust or managed bindings a
+  stable surface without freezing the C++ API.
+
+**Consequences:**
+- C++ types never cross the C ABI; `SONDER_ABI_VERSION` increments on any
+  incompatible change.
+- Rust is not excluded: a Rust front end or components can bind the C ABI later.
+- No exceptions cross the C ABI; C++ API errors use `Status`/`Result<T>`.
+
+## ADR-012 — Telemetry uses the Observatory envelope v1 directly
+
+**Date:** 2026-09-26. **Status:** accepted.
+
+**Decision:** every event is emitted as one JSON object per line conforming to
+`sonder.observatory.event/1`
+([schema](https://github.com/Krilliac/Sonder-Observatory/blob/main/protocol/observatory-events.schema.json)).
+Emission goes through a bounded queue drained by a writer thread; overflow is
+dropped and counted, and a final `telemetry.dropped` event reports the count.
+
+**Details:**
+- Engine-level events (engine, device, backend, model lifecycle) use the engine
+  id as `session_id`, because the envelope requires a session on every event.
+- Levels: `metrics` (lifecycle and request summaries), `standard` (adds
+  per-chunk `inference.token.generated`), `deep` (reserved for backend
+  layer/operator events when a backend exposes them).
+- Token text is excluded unless explicitly enabled (`capture_text`), keeping
+  raw-text capture independent from structural events.
+- Additional event types beyond the contract list are documented in
+  [OBSERVATORY_CONTRACT.md](OBSERVATORY_CONTRACT.md#implementation-status-v01).
+
+## ADR-013 — Minimal in-house HTTP/JSON for the Ollama adapter
+
+**Date:** 2026-09-26. **Status:** accepted (revisit when TLS or HTTP/2 is needed).
+
+**Decision:** the Ollama adapter uses a small internal HTTP/1.1 client
+(Content-Length, chunked, streaming, cancellable) and a small JSON value type
+rather than third-party libraries.
+
+**Reason:** keeps the library dependency-free while licensing (ADR-010) and
+package policy are unsettled; the surface needed is tiny.
+
+**Constraints:** plain HTTP only; loopback hosts only unless `allow_remote` is
+set explicitly. Remote workers belong behind TLS, which this adapter does not
+implement.
+
+## ADR-014 — Test framework: doctest fetched at configure time
+
+**Date:** 2026-09-26. **Status:** accepted.
+
+**Decision:** unit tests use doctest (MIT), downloaded by CMake FetchContent at
+a pinned version and SHA-256, used by the test executable only, and never
+vendored into the repository or linked into the library. Tests are registered
+with CTest per test case. See [LICENSE_REVIEW.md](LICENSE_REVIEW.md#doctest).
