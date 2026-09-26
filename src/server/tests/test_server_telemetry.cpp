@@ -4,6 +4,7 @@
 // requests keep completing.
 #include <doctest/doctest.h>
 
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -331,4 +332,97 @@ TEST_CASE("backpressure: a stalled subscriber loses events (counted) while chats
     const auto disc = get(f.port, "/.well-known/sonder-telemetry").json();
     CHECK(disc.find("stats")->find("subscriber_dropped_events")->as_int() > 0);
     stalled.close();
+}
+
+TEST_CASE("backpressure: a stalled SSE subscriber sees ': dropped N' and a matching sequence gap") {
+    auto o = Fixture::defaults();
+    o.subscriber_queue = 8;
+    o.write_stall_timeout = std::chrono::milliseconds(20000);
+    Fixture f(o);
+    Conn stalled(f.port, 4096);
+    stalled.send(build_request("GET", "/v1/telemetry/sse?since=now", f.port));
+    std::string acc;
+    REQUIRE(stalled.read_until(acc, "retry: 2000"));
+    // Something is delivered before the reader stalls.
+    REQUIRE(post(f.port, "/v1/chat/completions", chat_body(R"(,"max_tokens":1)")).status == 200);
+    REQUIRE(stalled.read_until(acc, "\ndata: "));
+    const auto dropped_so_far = [&] {
+        return get(f.port, "/v1/sonder/health").json().find("telemetry")->find("subscriber_dropped_events")->as_int();
+    };
+    // Losses that happen from here on fall between delivered events (flush
+    // first: the bus reaches the hub asynchronously).
+    f.server->engine()->telemetry().flush();
+    const std::int64_t baseline = dropped_so_far();
+    for (int i = 0; i < 3000; ++i) {
+        (void)post(f.port, "/v1/chat/completions", chat_body(R"(,"max_tokens":16)"));
+        if (dropped_so_far() > baseline && i > 5) break;
+    }
+    REQUIRE(dropped_so_far() > baseline);
+    // Now read: the per-subscriber loss is reported in-band as a comment,
+    // never as a telemetry.dropped event on the shared stream.
+    const std::size_t mark = acc.size();
+    REQUIRE_MESSAGE(eventually([&] {
+        std::string more;
+        (void)stalled.read_until(more, ": dropped ", std::chrono::milliseconds(200));
+        acc += more;
+        return acc.find(": dropped ", mark) != std::string::npos;
+    }, std::chrono::milliseconds(20000)),
+                    "stream closed: " << stalled.closed() << ", bytes read: " << acc.size());
+    const std::size_t at = acc.rfind(": dropped ");
+    // Read on until an event after the (last) dropped comment is complete.
+    REQUIRE(eventually([&] {
+        std::string more;
+        (void)stalled.read_until(more, "\n\n", std::chrono::milliseconds(200));
+        acc += more;
+        const std::size_t next = acc.find("id: ", at);
+        return next != std::string::npos && acc.find("\n\n", next) != std::string::npos;
+    }, std::chrono::milliseconds(10000)));
+    // Walk the stream: every sequence gap is announced by ': dropped N'
+    // comments that add up to exactly the gap, and there are no other gaps.
+    std::uint64_t pending = 0;
+    std::optional<std::uint64_t> last;
+    int announced_gaps = 0;
+    std::size_t pos = 0;
+    while (pos < acc.size()) {
+        const std::size_t eol = acc.find('\n', pos);
+        if (eol == std::string::npos) break;
+        const std::string line = acc.substr(pos, eol - pos);
+        pos = eol + 1;
+        if (line.rfind(": dropped ", 0) == 0) {
+            pending += std::stoull(line.substr(10));
+        } else if (line.rfind("id: ", 0) == 0) {
+            const std::uint64_t seq = std::stoull(line.substr(line.rfind('-') + 1));
+            if (last) {
+                CHECK(seq - *last - 1 == pending);
+                if (pending > 0) ++announced_gaps;
+            }
+            last = seq;
+            pending = 0;
+        }
+    }
+    CHECK(announced_gaps > 0);
+    CHECK(acc.find("\"telemetry.dropped\"") == std::string::npos);
+    stalled.close();
+}
+
+TEST_CASE("drain: a chat that arrives after shutdown began gets 503 not_ready (nothing executed)") {
+    Fixture f;
+    const std::string body = chat_body(R"(,"max_tokens":2)");
+    // The head is read before shutdown; the body arrives during the drain.
+    Conn c(f.port);
+    c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+           "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::thread stopper([&] { f.server->stop(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    c.send(body);
+    const Reply r = parse_reply(c.read_all(std::chrono::milliseconds(5000)));
+    stopper.join();
+    CHECK(r.status == 503);
+    const json::Value doc = r.json();
+    const json::Value* err = doc.find("error");
+    REQUIRE(err != nullptr);
+    CHECK(err->find("code")->as_string() == "not_ready");
+    CHECK(err->find("message")->as_string().find("safe to send elsewhere") != std::string::npos);
+    CHECK(f.of_type("request.queued").empty());
 }

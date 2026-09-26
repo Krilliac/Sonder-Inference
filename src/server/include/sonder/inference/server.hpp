@@ -45,9 +45,13 @@ struct ServerOptions {
 
     // Execution backend and the model ids served on it. The first model is
     // the default and also answers to the alias "default". With the mock
-    // backend an empty list serves the model "mock".
+    // backend an empty list serves the model "mock". `backend.backend` must
+    // name a backend compiled into this build (available_backend_names()).
     BackendSetup backend;
     std::vector<std::string> models;
+    // Embedding hosts and tests: a backend built by the caller, used instead
+    // of make_backend(backend). Its name() decides the synthetic label.
+    std::shared_ptr<Backend> backend_instance;
 
     // Bearer token required on every route except CORS preflight. Never
     // logged. Empty = no authentication (loopback binds only).
@@ -83,8 +87,10 @@ struct ServerOptions {
 };
 
 // Checks option combinations that the server refuses to start with
-// (non-loopback bind without a token, --capture-text without a token, empty
-// model ids, zero limits). Returns invalid_argument naming the option.
+// (non-loopback bind without a token, --capture-text without a token, a
+// backend this build does not have, empty model ids, zero limits, a
+// --cors-origin that is not a serialized origin). Returns invalid_argument
+// naming the option.
 Status validate_options(const ServerOptions& options);
 
 class Server {
@@ -97,16 +103,21 @@ public:
     // Binds the socket, builds the engine (engine.started carries the listen
     // address), starts accepting (health reports "starting"), registers the
     // backend and loads the models, then reports "ready". `on_listening`
-    // runs once the socket accepts connections, before models load.
-    // Errors: invalid_argument (options), unavailable (address in use or
-    // bind failure), and model load errors.
+    // runs once the socket accepts connections, before models load. No lock
+    // is held across backend I/O: health answers 503 "starting" while a
+    // model loads. Errors: invalid_argument (options), unavailable (address
+    // in use or bind failure), model load errors, and cancelled when stop()
+    // ran before start() finished.
     Status start(const std::function<void()>& on_listening = {});
 
     // Graceful drain (docs/SERVER.md "Shutdown"): health turns 503 draining,
     // the listener closes, in-flight requests get `shutdown_grace` to finish
     // and are then cancelled, the engine stops (engine.stopped and a final
     // telemetry.dropped if needed), and telemetry streams end after
-    // delivering what they hold. Idempotent and safe from any thread.
+    // delivering what they hold. Idempotent and safe from any thread,
+    // including while start() runs (also from its on_listening callback):
+    // start() then returns cancelled after the startup step in progress,
+    // whose backend call (a model load, for example) stop() waits for.
     void stop();
     // Blocks until stop() has completed.
     void wait();

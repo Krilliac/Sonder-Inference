@@ -37,7 +37,16 @@ namespace {
 std::atomic<int> g_shutdown{0};
 static_assert(std::atomic<int>::is_always_lock_free, "shutdown flag must be lock-free");
 
-extern "C" void on_shutdown_signal(int) { g_shutdown.store(1); }
+// The first SIGINT/SIGTERM asks for a graceful drain; the handler then
+// restores the default action, so a second one terminates at once (for
+// example while a model load or a drain is stuck on the backend).
+extern "C" void on_shutdown_signal(int sig) {
+    g_shutdown.store(1);
+    std::signal(sig, SIG_DFL);
+#if !defined(_WIN32)
+    std::signal(sig == SIGINT ? SIGTERM : SIGINT, SIG_DFL);
+#endif
+}
 
 constexpr const char* kServeUsage = R"(sonder-infer serve - local HTTP API and live telemetry (docs/SERVER.md)
 
@@ -54,6 +63,8 @@ Server:
   --max-body-bytes N      request body limit (default 4194304)
   --shutdown-grace-ms N   time in-flight requests get on shutdown (default 5000)
   --ready-file PATH       write {"url","pid","instance_id","api_version"} once listening
+                          (models may still be loading: poll /v1/sonder/health for
+                          200); removed again when the server exits
   --log-format text|json  access log and diagnostics on stderr (default text)
 
 Backend:
@@ -74,8 +85,8 @@ Telemetry (Observatory envelope v1; live at /v1/telemetry/sse and /v1/telemetry/
   --telemetry PATH        also write JSONL to PATH ('-' for stderr)
   --capture-text          include generated text in token events (requires --token-file)
 
-Exit status: 0 after a clean shutdown (SIGINT/SIGTERM), 1 on a runtime error
-(e.g. port in use), 2 on a usage error.
+Exit status: 0 after a clean shutdown (SIGINT/SIGTERM; a second signal exits
+at once), 1 on a runtime error (e.g. port in use), 2 on a usage error.
 )";
 
 enum class Kind { value, repeat, flag };
@@ -243,6 +254,18 @@ struct SignalGuard {
     SignalGuard& operator=(const SignalGuard&) = delete;
 };
 
+// Removes the ready file when serve_main() returns (error or shutdown), so
+// discovery never points at a dead server.
+struct ReadyFileGuard {
+    std::string path;
+    bool written = false;
+    ~ReadyFileGuard() {
+        if (written) {
+            std::remove(path.c_str());
+        }
+    }
+};
+
 bool write_ready_file(const std::string& path, const std::string& content, std::string& error) {
     const std::string tmp = path + ".tmp";
     {
@@ -393,23 +416,81 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
     }
 
     const std::string ready_path = a.get("ready-file").value_or("");
+    std::string models;
+    for (std::size_t i = 0; i < o.models.size(); ++i) {
+        models += (i ? ", " : "") + o.models[i] + (i == 0 ? " (default)" : "");
+    }
+    if (models.empty()) {
+        models = "mock (default)";
+    }
+    const bool mock = is_synthetic_backend(o.backend.backend);
     Server server(o);
     std::string ready_error;
+    ReadyFileGuard ready_file{ready_path};
     SignalGuard signals;
-    Status started = server.start([&] {
+    // Where the socket is bound, and the URL local clients use. They differ
+    // for wildcard binds (0.0.0.0 / ::), which serve every interface.
+    const auto bind_text = [&] {
+        const std::string h = o.host.find(':') != std::string::npos && o.host.front() != '[' ? "[" + o.host + "]"
+                                                                                              : o.host;
+        return h + ":" + std::to_string(server.port());
+    };
+    const bool wildcard = o.host == "0.0.0.0" || o.host == "::" || o.host == "[::]";
+    const auto on_listening = [&] {
+        const std::string base = server.url();
+        if (json_log) {
+            log->line(json::Value(json::Object{{"time", utc_timestamp_now()},
+                                               {"level", "info"},
+                                               {"message", "listening"},
+                                               {"url", base},
+                                               {"bind", bind_text()},
+                                               {"api_version", kApiVersion},
+                                               {"backend", o.backend.backend},
+                                               {"models", models},
+                                               {"status", "loading models"}})
+                          .dump());
+        } else {
+            log->line("sonder-infer serve: listening on " +
+                      (wildcard ? bind_text() + " (all interfaces; local URL " + base + ")" : base) +
+                      " (api_version " + std::to_string(kApiVersion) + ")");
+            log->line("sonder-infer serve: loading models on " + o.backend.backend + ": " + models +
+                      " (health reports 503 starting until they are loaded)");
+        }
         if (ready_path.empty()) {
             return;
         }
-        const json::Object doc{{"url", server.url()},
+        const json::Object doc{{"url", base},
                                {"pid", current_pid()},
                                {"instance_id", server.instance_id()},
                                {"api_version", kApiVersion}};
-        (void)write_ready_file(ready_path, json::Value(doc).dump(), ready_error);
+        ready_file.written = write_ready_file(ready_path, json::Value(doc).dump(), ready_error);
+    };
+    // start() blocks while models load; a shutdown request (signal or hook)
+    // meanwhile stops the server, which abandons the start after the backend
+    // call in progress returns.
+    std::atomic<bool> start_done{false};
+    std::thread startup_watch([&] {
+        while (!start_done.load() && g_shutdown.load() == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (!start_done.load()) {
+            diag("info", "shutdown requested while starting; waiting for the backend call in progress to return "
+                         "(send the signal again to exit immediately)");
+            server.stop();
+        }
     });
+    Status started = server.start(on_listening);
+    start_done.store(true);
+    startup_watch.join();
     if (!ready_error.empty()) {
         diag("error", ready_error);
         server.stop();
         return 1;
+    }
+    if (!started.ok() && started.code() == ErrorCode::cancelled && g_shutdown.load() != 0) {
+        server.stop();
+        diag("info", "stopped before the models finished loading");
+        return 0;
     }
     if (!started.ok()) {
         std::string message = started.message();
@@ -420,25 +501,18 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
         return 1;
     }
 
-    // Startup banner.
+    // Startup banner (the server is ready).
     const std::string base = server.url();
     std::vector<std::string> origins = o.cors_origins;
-    std::string models;
-    for (std::size_t i = 0; i < o.models.size(); ++i) {
-        models += (i ? ", " : "") + o.models[i] + (i == 0 ? " (default)" : "");
-    }
-    if (models.empty()) {
-        models = "mock (default)";
-    }
-    const bool mock = is_synthetic_backend(o.backend.backend);
     if (json_log) {
         json::Array origin_list;
         for (const auto& s : origins) origin_list.emplace_back(s);
         log->line(json::Value(json::Object{
                                   {"time", utc_timestamp_now()},
                                   {"level", "info"},
-                                  {"message", "listening"},
+                                  {"message", "ready"},
                                   {"url", base},
+                                  {"bind", bind_text()},
                                   {"api_version", kApiVersion},
                                   {"auth", o.token.empty() ? "none" : "bearer"},
                                   {"cors_origins", std::move(origin_list)},
@@ -454,7 +528,7 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
     } else {
         std::string cors;
         for (const auto& s : origins) cors += (cors.empty() ? "" : ", ") + s;
-        log->line("sonder-infer serve: listening on " + base + " (api_version " + std::to_string(kApiVersion) + ")");
+        log->line("sonder-infer serve: ready on " + base + (wildcard ? " (bound to " + bind_text() + ")" : ""));
         log->line("  auth:      " + std::string(o.token.empty() ? "none (loopback only)" : "bearer token required"));
         log->line("  cors:      " + (cors.empty() ? std::string("no explicit origins") : cors) +
                   (o.default_cors ? "; default Observatory origins for GET routes" : "; defaults disabled"));

@@ -78,17 +78,20 @@ TEST_CASE("serve_main: usage errors exit 2") {
              {"--backend", "mock", "--token-file", (temp_path("missing")).string()},
              {"--backend", "ollama"},
              {"--backend", "mock", "--model", "default"},
-             {"--backend", "vllm", "--model", "x"},
+             // Unknown backends are usage errors, caught before anything binds.
+             {"--backend", "vllm", "--model", "x", "--port", "0"},
+             {"--backend", "mock", "--cors-origin", "http://127.0.0.1:4173/", "--port", "0"},
          }) {
         CAPTURE(args.back());
-        const int rc = run(args, out, err);
-        if (args.front() == "--backend" && args[1] == "vllm") {
-            // Unknown backends fail when the server starts building them.
-            CHECK(rc == 1);
-        } else {
-            CHECK(rc == 2);
-            CHECK(err.find("error:") != std::string::npos);
-        }
+        CHECK(run(args, out, err) == 2);
+        CHECK(err.find("error:") != std::string::npos);
+    }
+    {
+        const auto ready = temp_path("never-ready.json");
+        CHECK(run({"--backend", "vllm", "--model", "x", "--port", "0", "--ready-file", ready.string()}, out, err) ==
+              2);
+        CHECK(err.find("unknown or unavailable backend 'vllm'") != std::string::npos);
+        CHECK_FALSE(fs::exists(ready));
     }
     std::error_code ec;
     fs::remove(token, ec);
@@ -155,7 +158,63 @@ TEST_CASE("serve_main: ready file, banner, access log and graceful shutdown via 
     // Never bodies or header values.
     CHECK(text.find("hello sonder") == std::string::npos);
     CHECK(read_file(events).find("\"engine.stopped\"") != std::string::npos);
+    // The listening line comes before models load; "ready" after.
+    const auto loading = text.find("loading models on mock: mock:tiny (default)");
+    CHECK(loading != std::string::npos);
+    CHECK(text.find("ready on " + url) != std::string::npos);
+    CHECK(loading < text.find("ready on " + url));
+    // Discovery must never point at a stopped server.
+    CHECK_FALSE(fs::exists(ready));
     std::error_code ec;
-    fs::remove(ready, ec);
     fs::remove(events, ec);
+}
+
+TEST_CASE("serve_main: a failed start removes the ready file and exits 1") {
+    // The mock backend refuses ids that do not start with "mock", after the
+    // socket is listening and the ready file is written.
+    const auto ready = temp_path("ready-fail.json");
+    std::string out;
+    std::string err;
+    const int rc = run({"--backend", "mock", "--model", "mock:tiny", "--model", "not-a-mock-model", "--port", "0",
+                        "--ready-file", ready.string()},
+                       out, err);
+    CHECK(err.find("cannot load model 'not-a-mock-model'") != std::string::npos);
+    CHECK(rc == 1);
+    CHECK(err.find("listening on http://127.0.0.1:") != std::string::npos);
+    CHECK_FALSE(fs::exists(ready));
+}
+
+TEST_CASE("serve_main: a wildcard bind names the bind address and the local URL") {
+    const auto ready = temp_path("ready-any.json");
+    const auto token = temp_path("token-any");
+    {
+        std::ofstream(token) << "tok-any\n";
+    }
+    fs::permissions(token, fs::perms::owner_read | fs::perms::owner_write);
+    std::ostringstream out;
+    std::string err_text;
+    std::promise<int> done;
+    auto finished = done.get_future();
+    std::thread runner([&] {
+        std::ostringstream local_err;
+        const int rc = srv::serve_main({"--backend", "mock", "--host", "0.0.0.0", "--port", "0", "--token-file",
+                                        token.string(), "--ready-file", ready.string()},
+                                       out, local_err);
+        err_text = local_err.str();
+        done.set_value(rc);
+    });
+    REQUIRE(eventually([&] { return fs::exists(ready); }, std::chrono::milliseconds(10000)));
+    auto doc = json::parse(read_file(ready));
+    REQUIRE(doc.ok());
+    const std::string url = doc.value().find("url")->as_string();
+    const std::string port = url.substr(url.rfind(':') + 1);
+    srv::request_shutdown();
+    REQUIRE(finished.wait_for(std::chrono::seconds(20)) == std::future_status::ready);
+    CHECK(finished.get() == 0);
+    runner.join();
+    CHECK(err_text.find("listening on 0.0.0.0:" + port + " (all interfaces; local URL " + url + ")") !=
+          std::string::npos);
+    CHECK_FALSE(fs::exists(ready));
+    std::error_code ec;
+    fs::remove(token, ec);
 }

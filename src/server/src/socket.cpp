@@ -20,6 +20,7 @@
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <poll.h>
+#  include <sys/resource.h>
 #  include <sys/socket.h>
 #  include <sys/types.h>
 #  include <unistd.h>
@@ -236,19 +237,103 @@ WaitResult wait_socket(native_socket s, bool for_write, std::chrono::millisecond
     }
 }
 
-Socket accept_client(const Socket& listener) {
+Accepted accept_client(const Socket& listener) {
     sockaddr_storage addr{};
     socklen_t len = sizeof(addr);
     const auto s = ::accept(raw(listener.get()), reinterpret_cast<sockaddr*>(&addr), &len);
+    Accepted out;
     Socket client(static_cast<native_socket>(s));
     if (!client.valid()) {
-        return Socket();
+        const int err = last_error();
+        out.native_error = err;
+#if defined(_WIN32)
+        if (err == WSAEMFILE || err == WSAENOBUFS) {
+            out.status = AcceptStatus::out_of_descriptors;
+        } else if (would_block(err) || err == WSAECONNRESET) {
+            out.status = AcceptStatus::none_pending;
+        } else {
+            out.status = AcceptStatus::failed;
+        }
+#else
+        if (err == EMFILE || err == ENFILE) {
+            out.status = AcceptStatus::out_of_descriptors;
+        } else if (would_block(err) || err == ECONNABORTED || err == EPROTO || err == EPERM) {
+            // Empty backlog, or one connection that died before accept():
+            // nothing to back off from.
+            out.status = AcceptStatus::none_pending;
+        } else {
+            out.status = AcceptStatus::failed;
+        }
+#endif
+        return out;
     }
     set_nonblocking(client.get());
     no_sigpipe(client.get());
     int one = 1;
     setsockopt(raw(client.get()), IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
-    return client;
+    out.socket = std::move(client);
+    out.status = AcceptStatus::accepted;
+    return out;
+}
+
+#if defined(_WIN32)
+ReserveDescriptor::ReserveDescriptor() noexcept = default;
+ReserveDescriptor::~ReserveDescriptor() = default;
+bool ReserveDescriptor::held() const noexcept { return false; }
+void ReserveDescriptor::release() noexcept {}
+bool ReserveDescriptor::acquire() noexcept { return false; }
+#else
+ReserveDescriptor::ReserveDescriptor() noexcept = default;
+ReserveDescriptor::~ReserveDescriptor() { release(); }
+bool ReserveDescriptor::held() const noexcept { return fd_ >= 0; }
+void ReserveDescriptor::release() noexcept {
+    if (fd_ >= 0) {
+        ::close(fd_);
+        fd_ = -1;
+    }
+}
+bool ReserveDescriptor::acquire() noexcept {
+    if (fd_ < 0) {
+        fd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    }
+    return fd_ >= 0;
+}
+#endif
+
+void drain_input(native_socket s, std::uint64_t max_bytes, std::chrono::milliseconds max_time,
+                 std::chrono::milliseconds idle, const std::atomic<bool>* stop) {
+    const auto deadline = std::chrono::steady_clock::now() + max_time;
+    std::uint64_t drained = 0;
+    char buf[16384];
+    while (drained < max_bytes) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return;
+        }
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        if (wait_socket(s, false, std::min(left, idle), stop) != WaitResult::ready) {
+            return;  // idle, stopped or error
+        }
+        const long long n = recv_some(s, buf, sizeof(buf));
+        if (n == 0 || n == -1) {
+            return;
+        }
+        if (n > 0) {
+            drained += static_cast<std::uint64_t>(n);
+        }
+    }
+}
+
+std::uint64_t descriptor_limit() noexcept {
+#if defined(_WIN32)
+    return 0;
+#else
+    rlimit rl{};
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0 || rl.rlim_cur == RLIM_INFINITY) {
+        return 0;
+    }
+    return static_cast<std::uint64_t>(rl.rlim_cur);
+#endif
 }
 
 long long recv_some(native_socket s, char* buf, std::size_t len) {

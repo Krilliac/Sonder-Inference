@@ -70,8 +70,12 @@ std::variant<Correlation, ApiError> parse_correlation(const RequestHead& head);
 std::optional<WorkloadClass> parse_workload(std::string_view name) noexcept;
 
 // Maps a failed Session request to an API error: scheduler rejections before
-// execution -> 429 overloaded (Retry-After 1); invalid_argument -> 400
-// (invalid_sampling / invalid_messages); not_found -> 404 model_not_found;
+// execution -> 429 overloaded (Retry-After 1), except a prompt that can
+// never fit the KV pool -> 400 invalid_messages; other invalid_argument ->
+// 400 invalid_sampling ("sampling failed ..."), unsupported_parameter with
+// the field ("... does not support <field>", a backend refusal) or
+// invalid_request (messages are validated before the session runs);
+// not_found -> 404 model_not_found;
 // unsupported -> 400 unsupported_parameter; backend-side failures -> 503
 // backend_unavailable (executed, not safe to replay); anything else -> 500.
 ApiError map_session_failure(const Status& status, bool scheduler_rejected);

@@ -25,6 +25,8 @@
 #  endif
 #  include <winsock2.h>
 #else
+#  include <arpa/inet.h>
+#  include <netinet/in.h>
 #  include <sys/socket.h>
 #endif
 
@@ -92,6 +94,22 @@ public:
         auto c = det::connect_tcp("127.0.0.1", port, std::chrono::milliseconds(3000));
         REQUIRE_MESSAGE(c.ok(), c.status().to_string());
         sock_ = std::move(c.value());
+    }
+    // A connection whose receive buffer is limited to `receive_buffer` bytes
+    // from the start (set before connect, so the TCP window is negotiated
+    // for it; shrinking it later can stall the peer on zero-window probes).
+    Conn(std::uint16_t port, int receive_buffer) {
+        det::Socket s(static_cast<det::native_socket>(::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)));
+        REQUIRE(s.valid());
+        setsockopt(static_cast<decltype(::socket(0, 0, 0))>(s.get()), SOL_SOCKET, SO_RCVBUF,
+                   reinterpret_cast<const char*>(&receive_buffer), sizeof(receive_buffer));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        REQUIRE(::connect(static_cast<decltype(::socket(0, 0, 0))>(s.get()), reinterpret_cast<const sockaddr*>(&addr),
+                          sizeof(addr)) == 0);
+        sock_ = std::move(s);
     }
     void send(const std::string& data) {
         auto st = det::send_all(sock_.get(), data, std::chrono::milliseconds(5000), nullptr);

@@ -47,7 +47,8 @@ struct ParseResult {
 // Enforces kMaxHeadBytes (431) and kMaxHeaders (431); rejects obsolete line
 // folding, whitespace before the colon, invalid token characters, non
 // origin-form targets, conflicting Content-Length values and a
-// Content-Length combined with Transfer-Encoding (400); non-1.x versions
+// Content-Length combined with Transfer-Encoding and more than one Host
+// header (400); non-1.x versions
 // (505).
 ParseResult parse_request_head(std::string_view buffer, RequestHead& out);
 

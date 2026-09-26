@@ -75,6 +75,9 @@ TEST_CASE("http: incomplete, malformed and oversized heads") {
     CHECK(status_of("POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n") == 400);
     CHECK(status_of("POST / HTTP/1.1\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n") == 400);
     CHECK(status_of("GET / HTTP/1.1\r\nA: b\x01\r\n\r\n") == 400);
+    // RFC 9112 section 3.2: more than one Host line is a 400, in any order.
+    CHECK(status_of("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nHost: evil.com\r\n\r\n") == 400);
+    CHECK(status_of("GET / HTTP/1.1\r\nHost: evil.com\r\nX: y\r\nhost: 127.0.0.1\r\n\r\n") == 400);
 
     std::string many = "GET / HTTP/1.1\r\n";
     for (int i = 0; i < 65; ++i) many += "H" + std::to_string(i) + ": v\r\n";
@@ -243,7 +246,22 @@ TEST_CASE("openai: session failures map to API errors") {
     CHECK(rejected.status == 429);
     CHECK(rejected.code == "overloaded");
     CHECK(rejected.retry_after == std::optional<int>(1));
-    CHECK(map_session_failure(Status(ErrorCode::invalid_argument, "prompt needs 9 KV tokens"), true).status == 400);
+    const ApiError never_fits = map_session_failure(Status(ErrorCode::invalid_argument, "prompt needs 9 KV tokens"), true);
+    CHECK(never_fits.status == 400);
+    CHECK(never_fits.code == "invalid_messages");
+    CHECK(never_fits.param == std::optional<std::string>("messages"));
+    // Backend refusals of a request field are not blamed on the messages.
+    const ApiError bias = map_session_failure(
+        Status(ErrorCode::invalid_argument, "the ollama backend does not support logit_bias"), false);
+    CHECK(bias.status == 400);
+    CHECK(bias.code == "unsupported_parameter");
+    CHECK(bias.param == std::optional<std::string>("logit_bias"));
+    const ApiError other = map_session_failure(Status(ErrorCode::invalid_argument, "temperature out of range"), false);
+    CHECK(other.status == 400);
+    CHECK(other.code == "invalid_request");
+    CHECK_FALSE(other.param.has_value());
+    CHECK(map_session_failure(Status(ErrorCode::invalid_argument, "backend does not support 42!"), false).code ==
+          "invalid_request");
     CHECK(map_session_failure(Status(ErrorCode::invalid_argument, "sampling failed: x"), false).code ==
           "invalid_sampling");
     CHECK(map_session_failure(Status(ErrorCode::not_found, "x"), false).code == "model_not_found");
@@ -442,4 +460,31 @@ TEST_CASE("options: refused combinations") {
     o.models = {"a"};
     o.cors_origins = {"*"};
     CHECK_FALSE(srv::validate_options(o).ok());
+    // Only origins a browser can send match: scheme://host[:port], lowercase.
+    for (const char* bad : {"http://127.0.0.1:4173/", "http://127.0.0.1:4173/app", "HTTP://127.0.0.1:4173",
+                            "http://Localhost:5173", "null", "127.0.0.1:4173", "http://", "http://a b",
+                            "http://127.0.0.1:", "http://127.0.0.1:12x", "http://u@127.0.0.1", "http://h?x=1",
+                            "http://[::1", "http://[]:80", "http://a,http://b"}) {
+        CAPTURE(bad);
+        o.cors_origins = {bad};
+        CHECK(srv::validate_options(o).code() == ErrorCode::invalid_argument);
+    }
+    for (const char* good : {"http://127.0.0.1:4173", "https://observatory.example", "tauri://localhost",
+                             "http://tauri.localhost", "http://[::1]:5173"}) {
+        CAPTURE(good);
+        o.cors_origins = {good};
+        CHECK(srv::validate_options(o).ok());
+    }
+    o.cors_origins.clear();
+    // A backend this build does not have is a usage error, not a runtime one.
+    o.backend.backend = "vllm";
+    const Status unknown = srv::validate_options(o);
+    CHECK(unknown.code() == ErrorCode::invalid_argument);
+    CHECK(unknown.message().find("vllm") != std::string::npos);
+    CHECK(unknown.message().find("mock") != std::string::npos);
+    // A caller-built backend replaces the name check.
+    o.backend.backend.clear();
+    o.backend_instance = sonder::inference::make_mock_backend();
+    o.models.clear();
+    CHECK(srv::validate_options(o).ok());
 }

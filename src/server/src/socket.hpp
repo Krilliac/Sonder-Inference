@@ -63,8 +63,55 @@ enum class WaitResult { ready, timeout, stopped, error };
 WaitResult wait_socket(native_socket s, bool for_write, std::chrono::milliseconds timeout,
                        const std::atomic<bool>* stop);
 
-// Non-blocking accept. Returns an invalid Socket when nothing is pending.
-Socket accept_client(const Socket& listener);
+enum class AcceptStatus {
+    accepted,
+    none_pending,        // nothing left in the backlog (EAGAIN) or a transient per-connection failure
+    out_of_descriptors,  // EMFILE / ENFILE (WSAEMFILE): the process or system is out of descriptors
+    failed,              // any other error (ENOBUFS, ENOMEM, ...): back off before retrying
+};
+
+struct Accepted {
+    Socket socket;  // valid only when status == accepted
+    AcceptStatus status = AcceptStatus::none_pending;
+    int native_error = 0;
+};
+
+// Non-blocking accept. Distinguishes an empty backlog from resource errors so
+// the accept loop can back off instead of spinning on a listener that stays
+// readable while the backlog cannot be accepted.
+Accepted accept_client(const Socket& listener);
+
+// Descriptor held in reserve (POSIX: /dev/null) so that, when accept() fails
+// with EMFILE, one descriptor can be released to accept and answer the
+// oldest pending connection instead of leaving the backlog stuck. No-op on
+// Windows, where descriptor exhaustion is not per-process. Starts empty;
+// call acquire().
+class ReserveDescriptor {
+public:
+    ReserveDescriptor() noexcept;
+    ~ReserveDescriptor();
+    ReserveDescriptor(const ReserveDescriptor&) = delete;
+    ReserveDescriptor& operator=(const ReserveDescriptor&) = delete;
+    [[nodiscard]] bool held() const noexcept;
+    void release() noexcept;
+    // Re-acquires the descriptor; false when none is available yet.
+    bool acquire() noexcept;
+
+private:
+    int fd_ = -1;
+};
+
+// Lingering close: after the response has been sent and the write side shut
+// down, reads and discards what the client is still sending (at most
+// `max_bytes`, for at most `max_time`, stopping early after `idle` without
+// data, on EOF, on error, or when `*stop` becomes true). A client that
+// writes its whole request body before reading the response (Python urllib,
+// for example) otherwise gets a TCP reset instead of an early 401/413 reply.
+void drain_input(native_socket s, std::uint64_t max_bytes, std::chrono::milliseconds max_time,
+                 std::chrono::milliseconds idle, const std::atomic<bool>* stop);
+
+// Soft limit on open descriptors (RLIMIT_NOFILE); 0 when unknown or unlimited.
+std::uint64_t descriptor_limit() noexcept;
 
 // > 0 bytes read, 0 orderly close, -1 error, -2 would block.
 long long recv_some(native_socket s, char* buf, std::size_t len);

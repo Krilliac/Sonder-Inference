@@ -166,6 +166,10 @@ ParseResult parse_request_head(std::string_view buffer, RequestHead& out) {
             out.content_length = n;
         } else if (key == "transfer-encoding") {
             out.has_transfer_encoding = true;
+        } else if (key == "host" && out.header("host") != nullptr) {
+            // RFC 9112 section 3.2: more than one Host line is a 400, never
+            // "first one wins" (the Host check would otherwise be bypassable).
+            return fail(400, "more than one Host header");
         }
         out.headers.emplace_back(std::move(key), std::string(value));
     }
@@ -240,6 +244,7 @@ const char* reason_phrase(int status) noexcept {
         case 408: return "Request Timeout";
         case 411: return "Length Required";
         case 413: return "Content Too Large";
+        case 417: return "Expectation Failed";
         case 429: return "Too Many Requests";
         case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";

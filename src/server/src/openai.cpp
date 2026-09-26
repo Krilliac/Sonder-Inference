@@ -358,6 +358,31 @@ json::Object timings_json(const GenerationResult& result) {
     return t;
 }
 
+namespace {
+
+// "... does not support <field>" from a backend refusing a request field
+// (for example "the ollama backend does not support logit_bias"). Returns
+// the field when it is a plain identifier.
+std::optional<std::string> unsupported_field(std::string_view message) {
+    constexpr std::string_view kMarker = "does not support ";
+    const std::size_t at = message.find(kMarker);
+    if (at == std::string_view::npos) {
+        return std::nullopt;
+    }
+    std::string_view rest = message.substr(at + kMarker.size());
+    std::size_t n = 0;
+    while (n < rest.size() && ((rest[n] >= 'a' && rest[n] <= 'z') || (rest[n] >= '0' && rest[n] <= '9') ||
+                               rest[n] == '_')) {
+        ++n;
+    }
+    if (n == 0 || (n < rest.size() && rest[n] != ' ' && rest[n] != ';' && rest[n] != ',' && rest[n] != '.')) {
+        return std::nullopt;
+    }
+    return std::string(rest.substr(0, n));
+}
+
+}  // namespace
+
 ApiError map_session_failure(const Status& st, bool scheduler_rejected) {
     if (scheduler_rejected && st.code() != ErrorCode::invalid_argument) {
         ApiError e = make_error(429, "overloaded", "the engine scheduler rejected the request: " + st.message());
@@ -366,10 +391,19 @@ ApiError map_session_failure(const Status& st, bool scheduler_rejected) {
     }
     switch (st.code()) {
         case ErrorCode::invalid_argument:
+            if (scheduler_rejected) {
+                // The prompt can never fit the engine's KV pool.
+                return make_error(400, "invalid_messages", st.message(), "messages");
+            }
             if (st.message().rfind("sampling failed", 0) == 0) {
                 return make_error(400, "invalid_sampling", st.message());
             }
-            return make_error(400, "invalid_messages", st.message(), "messages");
+            // parse_chat_request() already validated the messages, so this is
+            // the engine or backend refusing a request parameter.
+            if (auto field = unsupported_field(st.message())) {
+                return make_error(400, "unsupported_parameter", st.message(), *field);
+            }
+            return make_error(400, "invalid_request", "the backend refused the request: " + st.message());
         case ErrorCode::not_found: return make_error(404, "model_not_found", st.message(), "model");
         case ErrorCode::unsupported: return make_error(400, "unsupported_parameter", st.message());
         case ErrorCode::unavailable:

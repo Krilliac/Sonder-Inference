@@ -77,6 +77,76 @@ RouteInfo lookup_route(std::string_view path) {
     return {};
 }
 
+// A serialized origin as browsers send it in the Origin header (RFC 6454
+// section 6.2): lowercase scheme "://" lowercase host, an optional numeric
+// port, and nothing else (no path, query, fragment, userinfo or trailing
+// slash). "null" and wildcards are refused: they would match too much.
+bool is_serialized_origin(std::string_view origin) {
+    const std::size_t sep = origin.find("://");
+    if (sep == std::string_view::npos || sep == 0) {
+        return false;
+    }
+    const std::string_view scheme = origin.substr(0, sep);
+    if (!(scheme.front() >= 'a' && scheme.front() <= 'z')) {
+        return false;
+    }
+    for (const char c : scheme) {
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.')) {
+            return false;
+        }
+    }
+    std::string_view rest = origin.substr(sep + 3);
+    std::string_view host = rest;
+    std::string_view port;
+    if (!rest.empty() && rest.front() == '[') {
+        const std::size_t close = rest.find(']');
+        if (close == std::string_view::npos || close == 1) {
+            return false;
+        }
+        host = rest.substr(0, close + 1);
+        const std::string_view after = rest.substr(close + 1);
+        if (!after.empty()) {
+            if (after.front() != ':') {
+                return false;
+            }
+            port = after.substr(1);
+            if (port.empty()) {
+                return false;
+            }
+        }
+        for (const char c : host.substr(1, host.size() - 2)) {
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || c == ':' || c == '.')) {
+                return false;
+            }
+        }
+    } else {
+        if (const std::size_t colon = rest.find(':'); colon != std::string_view::npos) {
+            host = rest.substr(0, colon);
+            port = rest.substr(colon + 1);
+            if (port.empty()) {
+                return false;
+            }
+        }
+        if (host.empty()) {
+            return false;
+        }
+        for (const char c : host) {
+            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_')) {
+                return false;
+            }
+        }
+    }
+    if (port.size() > 5) {
+        return false;
+    }
+    for (const char c : port) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool is_loopback_bind(std::string_view host) {
     if (host.size() > 2 && host.front() == '[' && host.back() == ']') {
         host = host.substr(1, host.size() - 2);
@@ -115,7 +185,35 @@ struct Exchange {
     std::string path = "-";
     int status = 0;
     Headers cors;  // set once the Origin is known to be allowed
+    // Request bytes the client may still be sending when the response goes
+    // out (an unread body): the connection lingers to drain them.
+    std::uint64_t unread_input = 0;
 };
+
+// Backend reachability, refreshed off the request path (health and identity
+// only read it). Shared with the refresher thread, which may outlive the
+// Server when a probe is stuck in backend I/O at shutdown.
+struct ProbeCache {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool stop = false;
+    bool exited = false;
+    bool valid = false;
+    bool ok = false;
+    std::string version;
+};
+
+// How often the refresher re-probes the backend.
+constexpr std::chrono::seconds kProbeInterval{2};
+// Lingering close bounds (see drain_input): enough for a body the server
+// refused with 401/403/413 to finish arriving on a local link.
+constexpr std::uint64_t kLingerMaxBytes = 16u * 1024u * 1024u;
+constexpr std::uint64_t kLingerUnknownLength = 1024u * 1024u;
+constexpr std::chrono::milliseconds kLingerMaxTime{2000};
+constexpr std::chrono::milliseconds kLingerIdle{500};
+// Descriptors the process needs beyond one per connection (listener,
+// telemetry file, backend clients, stdio, ...), for the RLIMIT_NOFILE check.
+constexpr std::uint64_t kDescriptorHeadroom = 32;
 
 }  // namespace
 
@@ -128,6 +226,9 @@ struct Server::Impl {
     std::atomic<State> state{State::starting};
 
     Socket listener;
+    // Spare descriptor for answering connections at EMFILE (accept thread
+    // only after start; acquired before that thread exists).
+    ReserveDescriptor reserve;
     std::uint16_t bound_port = 0;
     std::string url;
     bool loopback = true;
@@ -144,17 +245,24 @@ struct Server::Impl {
     mutable std::mutex models_mu;
     std::vector<ServedModel> served;
 
-    // Backend probe cache (health must stay cheap).
-    std::mutex probe_mu;
-    std::chrono::steady_clock::time_point probe_at{};
-    bool probe_valid = false;
-    bool probe_ok = false;
-    std::string probe_version;
+    // Backend probe cache (health must stay cheap: it never does backend I/O).
+    std::shared_ptr<ProbeCache> probe = std::make_shared<ProbeCache>();
+    std::thread probe_thread;
 
     std::atomic<bool> stopping{false};   // listener closing; idle reads end
     std::atomic<bool> hard_stop{false};  // abort writes and streams
     std::thread accept_thread;
-    bool started = false;
+    std::atomic<bool> started{false};
+
+    // Startup steps (bind, backend construction, each model load) run one at
+    // a time. stop() sets cancel_start and waits for the step in progress
+    // (bounded by the backend's own timeouts); start() checks cancel_start
+    // before every step. Engine and backend locks are never held across
+    // backend I/O, so health keeps answering "starting" meanwhile.
+    std::mutex startup_mu;
+    std::condition_variable startup_cv;
+    bool cancel_start = false;
+    bool in_step = false;
 
     std::mutex conns_mu;
     std::vector<std::pair<std::thread, std::shared_ptr<ConnFlags>>> conns;
@@ -271,28 +379,59 @@ struct Server::Impl {
         return std::nullopt;
     }
 
-    // Probes the backend at most once every 2 s.
-    void backend_status(bool& available, std::string& version) {
-        std::shared_ptr<Backend> b;
-        {
-            std::lock_guard<std::mutex> lock(engine_mu);
-            b = backend;
-        }
-        if (!b) {
-            available = false;
+    // Last probe result (refreshed every kProbeInterval by probe_thread).
+    // Never blocks on the backend.
+    void backend_status(bool& available, std::string& version) const {
+        std::lock_guard<std::mutex> lock(probe->mu);
+        available = probe->valid && probe->ok;
+        version = probe->ok ? probe->version : std::string();
+    }
+
+    static void store_probe(ProbeCache& cache, const Result<std::string>& probed) {
+        std::lock_guard<std::mutex> lock(cache.mu);
+        cache.valid = true;
+        cache.ok = probed.ok();
+        cache.version = probed.ok() ? probed.value() : std::string();
+    }
+
+    void start_probe_refresher(std::shared_ptr<Backend> b) {
+        probe_thread = std::thread([cache = probe, b = std::move(b)] {
+            std::unique_lock<std::mutex> lock(cache->mu);
+            while (!cache->stop) {
+                cache->cv.wait_for(lock, kProbeInterval, [&] { return cache->stop; });
+                if (cache->stop) {
+                    break;
+                }
+                lock.unlock();
+                const Result<std::string> probed = b->probe();
+                store_probe(*cache, probed);
+                lock.lock();
+            }
+            cache->exited = true;
+            cache->cv.notify_all();
+        });
+    }
+
+    // Stops the refresher. A probe stuck in backend I/O is not waited for
+    // beyond `patience`: the thread only holds shared state and the backend,
+    // so it is detached and finishes on its own when the backend call returns.
+    void stop_probe_refresher(std::chrono::milliseconds patience) {
+        if (!probe_thread.joinable()) {
             return;
         }
-        std::lock_guard<std::mutex> lock(probe_mu);
-        const auto now = std::chrono::steady_clock::now();
-        if (!probe_valid || now - probe_at >= std::chrono::seconds(2)) {
-            auto probed = b->probe();
-            probe_ok = probed.ok();
-            probe_version = probed.ok() ? probed.value() : std::string();
-            probe_at = now;
-            probe_valid = true;
+        bool exited = false;
+        {
+            std::unique_lock<std::mutex> lock(probe->mu);
+            probe->stop = true;
+            probe->cv.notify_all();
+            exited = probe->cv.wait_for(lock, patience, [this] { return probe->exited; });
         }
-        available = probe_ok;
-        version = probe_version;
+        if (exited) {
+            probe_thread.join();
+        } else {
+            log_message("warning", "backend probe still blocked in backend I/O at shutdown; not waiting for it");
+            probe_thread.detach();
+        }
     }
 
     std::string absolute(std::string_view path) const { return url + std::string(path); }
@@ -773,6 +912,8 @@ struct Server::Impl {
                 const char* code = pr.status == 431   ? "request_header_fields_too_large"
                                    : pr.status == 505 ? "http_version_not_supported"
                                                       : "malformed_request";
+                // Whatever else the client sends is unread: linger briefly.
+                ex.unread_input = kLingerUnknownLength;
                 send_error(ex, make_error(pr.status, code, pr.message));
                 return false;
             }
@@ -828,9 +969,22 @@ struct Server::Impl {
             if (n > 0) {
                 const std::size_t want = static_cast<std::size_t>(length) - body.size();
                 body.append(chunk, std::min<std::size_t>(want, static_cast<std::size_t>(n)));
+                ex.unread_input = length - body.size();
             }
         }
+        ex.unread_input = 0;
         return true;
+    }
+
+    // Lingering close (see drain_input): answer first, then let a client
+    // that is still sending its request body finish, so it reads the
+    // response instead of a connection reset.
+    void linger(const Exchange& ex) const {
+        if (ex.unread_input == 0) {
+            return;
+        }
+        drain_input(ex.sock, std::min<std::uint64_t>(ex.unread_input, kLingerMaxBytes), kLingerMaxTime,
+                    kLingerIdle, &hard_stop);
     }
 
     void serve_connection(Socket sock, ConnFlags& flags) {
@@ -844,15 +998,25 @@ struct Server::Impl {
         if (!read_head(ex, buffer, head, head_bytes)) {
             if (ex.status != 0) {
                 access_log(ex);
+                sock.shutdown_write();
+                linger(ex);
             }
             return;
         }
         ex.method = head.method;
         ex.path = head.path;
+        // Until read_body() consumes it, the declared body counts as unread.
+        const std::uint64_t buffered = buffer.size() - head_bytes;
+        if (head.has_transfer_encoding) {
+            ex.unread_input = kLingerUnknownLength;
+        } else if (head.content_length && *head.content_length > buffered) {
+            ex.unread_input = *head.content_length - buffered;
+        }
         dispatch(ex, head, buffer, head_bytes, flags);
         access_log(ex);
         // Let the peer read everything before the socket closes.
         sock.shutdown_write();
+        linger(ex);
     }
 
     void dispatch(Exchange& ex, const RequestHead& head, std::string& buffer, std::size_t head_bytes,
@@ -923,6 +1087,20 @@ struct Server::Impl {
                        Headers{{"Allow", std::string(route.method) + ", OPTIONS"}});
             return;
         }
+        // Expect (RFC 9110 section 10.1.1): only 100-continue is supported;
+        // HTTP/1.0 requests must have it ignored.
+        bool send_continue = false;
+        if (const std::string* expect = head.header("expect"); expect != nullptr && head.minor_version >= 1) {
+            std::string e = *expect;
+            std::transform(e.begin(), e.end(), e.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (e != "100-continue") {
+                send_error(ex, make_error(417, "expectation_failed",
+                                          "only \"Expect: 100-continue\" is supported", "Expect"));
+                return;
+            }
+            send_continue = true;
+        }
         std::string body;
         if (head.method == "POST") {
             if (head.has_transfer_encoding || !head.content_length) {
@@ -933,6 +1111,11 @@ struct Server::Impl {
             if (*head.content_length > opts.max_body_bytes) {
                 send_error(ex, make_error(413, "payload_too_large",
                                           "request body exceeds " + std::to_string(opts.max_body_bytes) + " bytes"));
+                return;
+            }
+            // The request passed every check that does not need the body:
+            // tell a waiting client (curl waits 1 s otherwise) to send it.
+            if (send_continue && ex.unread_input > 0 && !send_raw(ex, "HTTP/1.1 100 Continue\r\n\r\n")) {
                 return;
             }
             if (!read_body(ex, buffer, head_bytes, *head.content_length, body)) {
@@ -975,13 +1158,14 @@ struct Server::Impl {
         }
     }
 
-    void reject_overloaded(Socket client) {
+    // Runs on the accept thread, so it never waits long: the reply is small,
+    // and the lingering drain is limited to what arrives within a few ms.
+    void reject_overloaded(Socket client, const std::string& reason) {
         Exchange ex;
         ex.sock = client.get();
         ex.started = std::chrono::steady_clock::now();
         ex.request_id = make_id("http");
-        ApiError e = make_error(503, "overloaded",
-                                "connection limit reached (" + std::to_string(opts.max_connections) + ")");
+        ApiError e = make_error(503, "overloaded", reason);
         e.retry_after = 1;
         Headers h = base_headers(ex, "application/json");
         h.emplace_back("Retry-After", "1");
@@ -991,9 +1175,20 @@ struct Server::Impl {
         ex.status = 503;
         access_log(ex);
         client.shutdown_write();
+        drain_input(ex.sock, 64u * 1024u, std::chrono::milliseconds(10), std::chrono::milliseconds(10), &hard_stop);
+    }
+
+    // Sleeps `d` on the accept thread, waking early when stopping.
+    void backoff(std::chrono::milliseconds d) const {
+        const auto deadline = std::chrono::steady_clock::now() + d;
+        while (!stopping.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
     }
 
     void accept_loop() {
+        bool exhausted_reported = false;
+        bool failure_reported = false;
         while (!stopping.load()) {
             const auto w = wait_socket(listener.get(), false, std::chrono::milliseconds(100), &stopping);
             reap_finished();
@@ -1001,12 +1196,52 @@ struct Server::Impl {
                 continue;
             }
             for (;;) {
-                Socket client = accept_client(listener);
-                if (!client.valid()) {
+                Accepted a = accept_client(listener);
+                if (a.status == AcceptStatus::none_pending) {
                     break;
                 }
+                if (a.status == AcceptStatus::out_of_descriptors) {
+                    // The listener stays readable while the backlog cannot be
+                    // accepted: without this the loop would spin on the CPU.
+                    if (!exhausted_reported) {
+                        exhausted_reported = true;
+                        log_message("warning",
+                                    "out of file descriptors (accept failed, errno " + std::to_string(a.native_error) +
+                                        "); answering new connections with 503 overloaded until descriptors free up. "
+                                        "Raise the limit (ulimit -n) or lower --max-connections");
+                    }
+                    // Another thread may have used the slot the reserve
+                    // was released for; take it back first when possible.
+                    if (reserve.held() || reserve.acquire()) {
+                        reserve.release();
+                        Accepted spare = accept_client(listener);
+                        if (spare.status == AcceptStatus::accepted) {
+                            reject_overloaded(std::move(spare.socket), "out of file descriptors");
+                        }
+                        const bool reacquired = reserve.acquire();
+                        if (spare.status == AcceptStatus::accepted && reacquired) {
+                            continue;  // answer the rest of the backlog the same way
+                        }
+                    }
+                    backoff(std::chrono::milliseconds(50));
+                    break;
+                }
+                if (a.status == AcceptStatus::failed) {
+                    if (!failure_reported) {
+                        failure_reported = true;
+                        log_message("warning", "accept failed (errno " + std::to_string(a.native_error) +
+                                                   "); backing off");
+                    }
+                    backoff(std::chrono::milliseconds(50));
+                    break;
+                }
+                exhausted_reported = false;
+                failure_reported = false;
+                (void)reserve.acquire();
+                Socket client = std::move(a.socket);
                 if (active.load() >= opts.max_connections) {
-                    reject_overloaded(std::move(client));
+                    reject_overloaded(std::move(client),
+                                      "connection limit reached (" + std::to_string(opts.max_connections) + ")");
                     continue;
                 }
                 auto flags = std::make_shared<ConnFlags>();
@@ -1030,13 +1265,41 @@ struct Server::Impl {
 
     // ------------------------------------------------------------- start
 
-    Status start(const std::function<void()>& on_listening) {
-        if (started) {
-            return Status(ErrorCode::invalid_state, "server already started");
+    // Enters a startup step unless stop() has begun. Returns false when the
+    // start must be abandoned.
+    bool begin_step() {
+        std::lock_guard<std::mutex> lock(startup_mu);
+        if (cancel_start) {
+            return false;
         }
-        if (Status st = validate_options(opts); !st.ok()) {
-            return st;
+        in_step = true;
+        return true;
+    }
+
+    void end_step() {
+        {
+            std::lock_guard<std::mutex> lock(startup_mu);
+            in_step = false;
         }
+        startup_cv.notify_all();
+    }
+
+    struct StepGuard {
+        Impl& impl;
+        ~StepGuard() { impl.end_step(); }
+    };
+
+    static Status cancelled_start() {
+        return Status(ErrorCode::cancelled, "the server was stopped while starting");
+    }
+
+    Engine* engine_ptr() const {
+        std::lock_guard<std::mutex> lock(engine_mu);
+        return engine.get();
+    }
+
+    // Step 1: bind, build the engine, start accepting.
+    Status open_listener() {
         bool in_use = false;
         auto listened = listen_tcp(opts.host, opts.port, in_use);
         if (!listened.ok()) {
@@ -1057,7 +1320,7 @@ struct Server::Impl {
         }
         url = "http://" + host + ":" + std::to_string(bound_port);
 
-        synthetic = is_synthetic_backend(opts.backend.backend);
+        synthetic = is_synthetic_backend(opts.backend_instance ? opts.backend_instance->name() : opts.backend.backend);
         hub = std::make_shared<LiveTelemetryHub>(opts.telemetry_buffer, opts.max_subscribers, opts.subscriber_queue);
         EngineOptions eo;
         eo.telemetry.level = opts.telemetry_level;
@@ -1078,44 +1341,99 @@ struct Server::Impl {
         }
         hub->set_instance_id(instance_id);
         started_at = std::chrono::steady_clock::now();
-        started = true;
+        if (const std::uint64_t limit = descriptor_limit();
+            limit != 0 && opts.max_connections + kDescriptorHeadroom > limit) {
+            log_message("warning", "--max-connections " + std::to_string(opts.max_connections) +
+                                       " plus headroom exceeds the open-file limit (" + std::to_string(limit) +
+                                       "); connections beyond it get 503 overloaded. Raise ulimit -n or lower "
+                                       "--max-connections");
+        }
+        {
+            std::lock_guard<std::mutex> lock(startup_mu);
+            started.store(true);
+        }
+#if !defined(_WIN32)
+        if (!reserve.acquire()) {
+            log_message("warning", "cannot reserve a spare descriptor; at the open-file limit new connections wait "
+                                   "in the backlog instead of getting 503");
+        }
+#endif
         accept_thread = std::thread([this] { accept_loop(); });
+        return Status::success();
+    }
+
+    Status start(const std::function<void()>& on_listening) {
+        if (started.load()) {
+            return Status(ErrorCode::invalid_state, "server already started");
+        }
+        if (Status st = validate_options(opts); !st.ok()) {
+            return st;
+        }
+        if (!begin_step()) {
+            return cancelled_start();
+        }
+        {
+            StepGuard step{*this};
+            if (Status st = open_listener(); !st.ok()) {
+                return st;
+            }
+        }
         if (on_listening) {
             on_listening();
         }
 
-        auto made = make_backend(opts.backend);
-        if (!made.ok()) {
-            return made.status();
+        std::shared_ptr<Backend> made;
+        {
+            if (!begin_step()) {
+                return cancelled_start();
+            }
+            StepGuard step{*this};
+            if (opts.backend_instance) {
+                made = opts.backend_instance;
+            } else {
+                auto built = make_backend(opts.backend);
+                if (!built.ok()) {
+                    return built.status();
+                }
+                made = built.value();
+            }
+            if (Status st = engine_ptr()->register_backend(made); !st.ok()) {
+                return st;
+            }
+            std::lock_guard<std::mutex> lock(engine_mu);
+            backend = made;
         }
         std::vector<std::string> ids = opts.models;
         if (ids.empty()) {
             ids.emplace_back("mock");
         }
-        {
-            std::lock_guard<std::mutex> lock(engine_mu);
-            if (Status st = engine->register_backend(made.value()); !st.ok()) {
-                return st;
-            }
-            backend = made.value();
-        }
+        const std::string backend_name = made->name();
         for (std::size_t i = 0; i < ids.size(); ++i) {
+            if (!begin_step()) {
+                return cancelled_start();
+            }
+            StepGuard step{*this};
             ModelLoadOptions lo;
             lo.model = ids[i];
-            Result<std::shared_ptr<Model>> loaded = Status(ErrorCode::internal, "engine stopped");
-            {
-                std::lock_guard<std::mutex> lock(engine_mu);
-                if (engine) {
-                    loaded = engine->load_model(backend->name(), lo);
-                }
-            }
+            // No lock held: the load may block on backend I/O while health
+            // keeps answering 503 "starting". stop() waits for this step.
+            Result<std::shared_ptr<Model>> loaded = engine_ptr()->load_model(backend_name, lo);
             if (!loaded.ok()) {
-                return Status(loaded.status().code(),
-                              "cannot load model '" + ids[i] + "' on " + backend->name() + ": " +
-                                  loaded.status().message());
+                return Status(loaded.status().code(), "cannot load model '" + ids[i] + "' on " + backend_name + ": " +
+                                                          loaded.status().message());
             }
             std::lock_guard<std::mutex> lock(models_mu);
-            served.push_back(ServedModel{ids[i], backend->name(), i == 0, loaded.value()});
+            served.push_back(ServedModel{ids[i], backend_name, i == 0, loaded.value()});
+        }
+        {
+            if (!begin_step()) {
+                return cancelled_start();
+            }
+            StepGuard step{*this};
+            // First reachability result before "ready"; later ones come from
+            // the refresher so health never waits on the backend.
+            store_probe(*probe, made->probe());
+            start_probe_refresher(made);
         }
         State expected = State::starting;
         state.compare_exchange_strong(expected, State::ready);
@@ -1144,14 +1462,24 @@ struct Server::Impl {
     }
 
     void do_stop() {
-        if (!started) {
+        // 0. Abandon a start() in progress: health reports draining at once,
+        // and the startup step running now (a model load, say) is the last.
+        state.store(State::draining);
+        bool was_started = false;
+        {
+            std::unique_lock<std::mutex> lock(startup_mu);
+            cancel_start = true;
+            startup_cv.wait(lock, [this] { return !in_step; });
+            was_started = started.load();
+        }
+        if (!was_started) {
+            state.store(State::stopped);
             std::lock_guard<std::mutex> lock(stopped_mu);
             stopped = true;
             stopped_cv.notify_all();
             return;
         }
-        // 1. Health reports draining; new chats get 503 not_ready.
-        state.store(State::draining);
+        // 1. New chats get 503 not_ready.
         // 2. Stop accepting.
         stopping.store(true);
         if (accept_thread.joinable()) {
@@ -1172,6 +1500,7 @@ struct Server::Impl {
                        std::chrono::steady_clock::time_point::max());
         }
         // 4. engine.stopped (and a final telemetry.dropped) reach the hub.
+        stop_probe_refresher(std::max(opts.shutdown_grace, std::chrono::milliseconds(100)));
         {
             std::lock_guard<std::mutex> models_lock(models_mu);
             served.clear();
@@ -1221,13 +1550,25 @@ Status validate_options(const ServerOptions& o) {
     if (o.capture_text && o.token.empty()) {
         return Status(ErrorCode::invalid_argument, "--capture-text exports generated text and requires --token-file");
     }
-    if (o.backend.backend.empty()) {
-        return Status(ErrorCode::invalid_argument, "--backend is required (mock, ollama or llamacpp)");
+    const std::string backend_name = o.backend_instance ? o.backend_instance->name() : o.backend.backend;
+    if (!o.backend_instance) {
+        const std::vector<std::string> names = available_backend_names();
+        std::string list;
+        for (const auto& n : names) {
+            list += (list.empty() ? "" : ", ") + n;
+        }
+        if (o.backend.backend.empty()) {
+            return Status(ErrorCode::invalid_argument, "--backend is required (this build has: " + list + ")");
+        }
+        if (std::find(names.begin(), names.end(), o.backend.backend) == names.end()) {
+            return Status(ErrorCode::invalid_argument,
+                          "unknown or unavailable backend '" + o.backend.backend + "' (this build has: " + list + ")");
+        }
     }
-    if (o.models.empty() && !is_synthetic_backend(o.backend.backend)) {
-        return Status(ErrorCode::invalid_argument, "--model is required for backend " + o.backend.backend +
+    if (o.models.empty() && !is_synthetic_backend(backend_name)) {
+        return Status(ErrorCode::invalid_argument, "--model is required for backend " + backend_name +
                                                        " (list models with `sonder-infer models --backend " +
-                                                       o.backend.backend + "`)");
+                                                       backend_name + "`)");
     }
     for (std::size_t i = 0; i < o.models.size(); ++i) {
         if (o.models[i].empty()) {
@@ -1247,9 +1588,11 @@ Status validate_options(const ServerOptions& o) {
                       "--max-connections, --max-body-bytes and --telemetry-buffer must be positive");
     }
     for (const auto& origin : o.cors_origins) {
-        if (origin.empty() || origin == "*" || origin.find_first_of(" \t\r\n,") != std::string::npos) {
+        if (!is_serialized_origin(origin)) {
             return Status(ErrorCode::invalid_argument,
-                          "--cors-origin takes one exact origin such as http://127.0.0.1:4173 (no wildcards)");
+                          "--cors-origin '" + origin +
+                              "' is not an origin a browser sends: use scheme://host[:port] in lowercase, with no "
+                              "path, trailing slash or wildcard (for example http://127.0.0.1:4173)");
         }
     }
     return Status::success();
@@ -1261,7 +1604,7 @@ Server::~Server() { stop(); }
 
 Status Server::start(const std::function<void()>& on_listening) {
     Status st = impl_->start(on_listening);
-    if (!st.ok() && impl_->started) {
+    if (!st.ok() && impl_->started.load()) {
         stop();
     }
     return st;

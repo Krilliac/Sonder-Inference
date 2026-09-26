@@ -3,8 +3,21 @@
 // headers, auth, the Host check, CORS, request limits and the connection cap.
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
+
+#if defined(__linux__)
+#  include <arpa/inet.h>
+#  include <dirent.h>
+#  include <fcntl.h>
+#  include <netinet/in.h>
+#  include <sys/resource.h>
+#  include <unistd.h>
+#  include <sys/time.h>
+#endif
 
 #include "server_test_support.hpp"
 
@@ -305,3 +318,192 @@ TEST_CASE("bind: a port in use is reported as unavailable") {
     CHECK(st.code() == si::ErrorCode::unavailable);
     CHECK(st.message().find("in use") != std::string::npos);
 }
+
+TEST_CASE("host check: duplicate Host headers are a 400 in either order") {
+    Fixture f;
+    const std::string port = std::to_string(f.port);
+    for (const auto& pair : std::vector<std::pair<std::string, std::string>>{
+             {"127.0.0.1:" + port, "evil.example"}, {"evil.example", "127.0.0.1:" + port}}) {
+        const Reply r = roundtrip(f.port, build_request("GET", "/v1/sonder/health", f.port,
+                                                        {{"Host", pair.first}, {"Host", pair.second}},
+                                                        std::nullopt, /*host_header=*/false));
+        check_error(r, 400, "invalid_request_error", "malformed_request");
+    }
+}
+
+TEST_CASE("lingering close: a client that sends its whole body first still reads 413 and 401") {
+    // Python urllib (Runtime's transport) writes the full request before it
+    // reads: without a lingering close the early reply is lost to a reset.
+    auto o = Fixture::defaults();
+    o.max_body_bytes = 100000;
+    o.token = "secret-token";
+    Fixture f(o);
+    const std::string big(2 * 1024 * 1024, 'x');
+    const auto send_all_then_read = [&](const std::vector<std::pair<std::string, std::string>>& headers) {
+        Conn c(f.port);
+        c.send(build_request("POST", "/v1/chat/completions", f.port, headers, big));  // REQUIREs a full write
+        Reply r = parse_reply(c.read_all());
+        return r;
+    };
+    for (int i = 0; i < 3; ++i) {
+        check_error(send_all_then_read({{"Authorization", "Bearer secret-token"}}), 413, "invalid_request_error",
+                    "payload_too_large");
+        check_error(send_all_then_read({}), 401, "authentication_error", "unauthorized");
+    }
+    CHECK(get(f.port, "/v1/sonder/health", {{"Authorization", "Bearer secret-token"}}).status == 200);
+}
+
+TEST_CASE("expect: 100-continue is answered before the body is read; other expectations get 417") {
+    Fixture f;
+    const std::string body = chat_body(R"(,"max_tokens":2)");
+    {
+        Conn c(f.port);
+        c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+               "Expect: 100-continue\r\nContent-Length: " +
+               std::to_string(body.size()) + "\r\n\r\n");
+        std::string acc;
+        // curl waits 1 s for this before sending the body anyway.
+        const auto t0 = std::chrono::steady_clock::now();
+        REQUIRE(c.read_until(acc, "\r\n\r\n", std::chrono::milliseconds(900)));
+        CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(900));
+        CHECK(acc == "HTTP/1.1 100 Continue\r\n\r\n");
+        c.send(body);
+        const Reply r = parse_reply(c.read_all());
+        CHECK(r.status == 200);
+        CHECK(r.json().find("object")->as_string() == "chat.completion");
+    }
+    {
+        // A request that fails a pre-body check gets its error, never 100.
+        auto o = Fixture::defaults();
+        o.max_body_bytes = 16;
+        Fixture small(o);
+        Conn c(small.port);
+        c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nExpect: 100-continue\r\n"
+               "Content-Length: 1000\r\n\r\n");
+        const std::string got = c.read_all(std::chrono::milliseconds(5000));
+        CHECK(got.find("100 Continue") == std::string::npos);
+        CHECK(parse_reply(got).status == 413);
+    }
+    check_error(post(f.port, "/v1/chat/completions", body, {{"Expect", "fancy-feature"}}), 417,
+                "invalid_request_error", "expectation_failed");
+    check_error(get(f.port, "/v1/sonder/health", {{"Expect", "fancy-feature"}}), 417, "invalid_request_error",
+                "expectation_failed");
+    // HTTP/1.0 requests have Expect ignored (RFC 9110 section 10.1.1).
+    const Reply old = roundtrip(f.port, "GET /v1/sonder/health HTTP/1.0\r\nHost: 127.0.0.1\r\nExpect: x\r\n\r\n");
+    CHECK(old.status == 200);
+}
+
+#if defined(__linux__)
+namespace {
+
+std::size_t open_descriptors() {
+    std::size_t n = 0;
+    if (DIR* d = opendir("/proc/self/fd")) {
+        while (readdir(d) != nullptr) ++n;
+        closedir(d);
+    }
+    return n;  // includes ".", ".." and the directory's own descriptor
+}
+
+double cpu_seconds() {
+    rusage ru{};
+    getrusage(RUSAGE_SELF, &ru);
+    return static_cast<double>(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) +
+           static_cast<double>(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
+}
+
+struct NoFileLimit {
+    rlimit saved{};
+    bool active = false;
+    explicit NoFileLimit(rlim_t soft) {
+        if (getrlimit(RLIMIT_NOFILE, &saved) != 0) return;
+        rlimit lowered = saved;
+        lowered.rlim_cur = std::min<rlim_t>(soft, saved.rlim_max);
+        active = setrlimit(RLIMIT_NOFILE, &lowered) == 0;
+    }
+    ~NoFileLimit() {
+        if (active) setrlimit(RLIMIT_NOFILE, &saved);
+    }
+};
+
+}  // namespace
+
+TEST_CASE("descriptor exhaustion: the accept loop answers 503 and does not spin") {
+    auto o = Fixture::defaults();
+    o.max_connections = 1000;
+    o.read_timeout = std::chrono::milliseconds(30000);  // idle connections keep their descriptors
+    std::vector<std::string> log_lines;
+    std::mutex log_mu;
+    o.log = [&](const std::string& line) {
+        std::lock_guard<std::mutex> lock(log_mu);
+        log_lines.push_back(line);
+    };
+    Fixture f(o);
+    std::vector<det::Socket> clients;
+    std::vector<int> fillers;
+    std::size_t filled = 0;
+    int connected = 0;
+    int answered = 0;
+    double idle_cpu = 0.0;
+    {
+        // Client sockets are created first, so connecting them later needs no
+        // descriptor: the connections then wait in the backlog while the
+        // server's accept() fails with EMFILE.
+        for (int i = 0; i < 3; ++i) {
+            det::Socket c(::socket(AF_INET, SOCK_STREAM, 0));
+            REQUIRE(c.valid());
+            clients.push_back(std::move(c));
+        }
+        NoFileLimit limit(static_cast<rlim_t>(open_descriptors() + 64));
+        REQUIRE(limit.active);
+        // No doctest assertions while the process is out of descriptors:
+        // UBSan's vptr check needs a pipe() and would report false errors.
+        // Results are recorded here and checked once descriptors are back.
+        for (;;) {
+            const int fd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+            if (fd < 0) break;
+            fillers.push_back(fd);
+        }
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(f.port);
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        for (auto& c : clients) {
+            if (::connect(c.get(), reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0) ++connected;
+        }
+        // Each is answered 503 through the reserve descriptor instead of
+        // sitting in the backlog while the accept loop spins.
+        for (auto& c : clients) {
+            std::string got;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            char buf[4096];
+            while (got.find("\r\n\r\n") == std::string::npos && std::chrono::steady_clock::now() < deadline) {
+                if (det::wait_socket(c.get(), false, std::chrono::milliseconds(50), nullptr) != det::WaitResult::ready) {
+                    continue;
+                }
+                const long long n = det::recv_some(c.get(), buf, sizeof(buf));
+                if (n <= 0 && n != -2) break;
+                if (n > 0) got.append(buf, static_cast<std::size_t>(n));
+            }
+            if (got.rfind("HTTP/1.1 503 ", 0) == 0) ++answered;
+        }
+        // With the process at its limit, the server must stay idle.
+        const double cpu0 = cpu_seconds();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        idle_cpu = cpu_seconds() - cpu0;
+        clients.clear();
+        filled = fillers.size();
+        for (const int fd : fillers) ::close(fd);
+    }
+    CHECK(filled >= 8);
+    CHECK(connected == 3);
+    CHECK(answered == 3);
+    CHECK_MESSAGE(idle_cpu < 0.3, "CPU seconds used while idle at the descriptor limit: " << idle_cpu);
+    // Descriptors are back: the server recovers.
+    CHECK(eventually([&] { return get(f.port, "/v1/sonder/health").status == 200; }));
+    std::lock_guard<std::mutex> lock(log_mu);
+    bool warned = false;
+    for (const auto& l : log_lines) warned = warned || l.find("out of file descriptors") != std::string::npos;
+    CHECK(warned);
+}
+#endif
