@@ -1,0 +1,1 @@
+{"schema": "sonder.inference.corpus/1", "name": "f", "fillers": {"lorem": "lorem ipsum"}, "prompts": [{"id": "fan", "workload": "agent_fanout", "shared_prefix": "shared", "context": {"filler": "lorem", "repeat": 3}, "children": ["a", "b"], "max_tokens": 8}, {"id": "p", "prompt": "hi", "max_tokens": 1}]}
