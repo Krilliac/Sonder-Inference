@@ -28,7 +28,8 @@ Engine::Engine(EngineOptions options)
                      json::Object{{"version", version_string()},
                                   {"commit", build_commit()},
                                   {"platform", host_platform()},
-                                  {"device_count", devices_.size()}},
+                                  {"device_count", devices_.size()},
+                                  {"text_capture", options_.telemetry.capture_text ? "on" : "off"}},
                      TelemetryLevel::metrics);
     runtime_ = detail::make_request_runtime(options_.scheduling, *telemetry_, ctx);
     if (runtime_) {
@@ -46,21 +47,47 @@ Engine::Engine(EngineOptions options)
                          TelemetryLevel::metrics);
     }
     if (options_.sample_devices_on_start) {
-        for (const auto& d : devices_) {
-            auto dctx = ctx;
-            dctx.device_id = d.id;
-            telemetry_->emit("device.memory.sample", dctx,
-                             json::Object{{"kind", to_string(d.kind)},
-                                          {"name", d.name},
-                                          {"logical_cores", d.logical_cores},
-                                          {"total_bytes", d.total_memory_bytes},
-                                          {"available_bytes", d.available_memory_bytes}},
-                             TelemetryLevel::metrics);
+        sample_devices(devices_);
+    }
+    if (options_.device_sample_interval.count() > 0) {
+        sampler_ = std::thread([this] { device_sampler_loop(); });
+    }
+}
+
+void Engine::sample_devices(const std::vector<DeviceInfo>& devices) {
+    for (const auto& d : devices) {
+        auto dctx = engine_context();
+        dctx.device_id = d.id;
+        json::Object attrs{{"kind", to_string(d.kind)},
+                           {"name", d.name},
+                           {"logical_cores", d.logical_cores},
+                           {"total_bytes", d.total_memory_bytes},
+                           {"available_bytes", d.available_memory_bytes}};
+        if (d.total_memory_bytes >= d.available_memory_bytes && d.total_memory_bytes > 0) {
+            attrs.set("used_bytes", d.total_memory_bytes - d.available_memory_bytes);
         }
+        telemetry_->emit("device.memory.sample", dctx, std::move(attrs), TelemetryLevel::metrics);
+    }
+}
+
+void Engine::device_sampler_loop() {
+    std::unique_lock<std::mutex> lock(sampler_mutex_);
+    while (!sampler_cv_.wait_for(lock, options_.device_sample_interval, [this] { return sampler_stop_; })) {
+        lock.unlock();
+        sample_devices(enumerate_devices());  // re-reads available memory
+        lock.lock();
     }
 }
 
 Engine::~Engine() {
+    {
+        std::lock_guard<std::mutex> lock(sampler_mutex_);
+        sampler_stop_ = true;
+    }
+    sampler_cv_.notify_all();
+    if (sampler_.joinable()) {
+        sampler_.join();
+    }
     // Stop the scheduler thread first; it emits telemetry and references models.
     runtime_.reset();
     {
@@ -77,6 +104,7 @@ KvUsage Engine::kv_usage() const { return runtime_ ? runtime_->kv_usage() : KvUs
 TelemetryContext Engine::engine_context() const {
     TelemetryContext ctx;
     ctx.session_id = engine_id_;
+    ctx.run_id = engine_id_;
     return ctx;
 }
 
@@ -153,6 +181,7 @@ Result<std::shared_ptr<Model>> Engine::load_model(const std::string& backend_nam
                                   {"parameter_size", d.parameter_size},
                                   {"quantization", d.quantization},
                                   {"size_bytes", d.size_bytes},
+                                  {"resident", d.resident},
                                   {"duration_ms", ms}},
                      TelemetryLevel::metrics);
     {

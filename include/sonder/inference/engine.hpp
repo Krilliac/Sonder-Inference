@@ -2,10 +2,13 @@
 // registry, sessions, telemetry).
 #pragma once
 
+#include <chrono>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "sonder/inference/backend.hpp"
@@ -67,6 +70,8 @@ struct EngineOptions {
     std::vector<std::shared_ptr<TelemetrySink>> telemetry_sinks;
     // Emit a device.memory.sample for each device at startup.
     bool sample_devices_on_start = true;
+    // Periodic device.memory.sample for every device (0 disables).
+    std::chrono::milliseconds device_sample_interval{10000};
     SchedulingOptions scheduling;
 };
 
@@ -93,7 +98,7 @@ public:
 
     Result<std::shared_ptr<Session>> create_session(const std::shared_ptr<Model>& model, SessionOptions options = {});
 
-    // Engine-scope telemetry context (session_id = engine id).
+    // Engine-scope telemetry context (session_id = run_id = engine id).
     [[nodiscard]] TelemetryContext engine_context() const;
 
     // True when requests go through the scheduler and the logical KV cache.
@@ -104,6 +109,9 @@ public:
     [[nodiscard]] detail::RequestRuntime* request_runtime() noexcept { return runtime_.get(); }
 
 private:
+    void sample_devices(const std::vector<DeviceInfo>& devices);
+    void device_sampler_loop();
+
     EngineOptions options_;
     std::string engine_id_;
     std::unique_ptr<TelemetryBus> telemetry_;
@@ -114,6 +122,11 @@ private:
     std::map<std::string, std::shared_ptr<Model>> models_;
     // Declared last: stopped before the telemetry bus and registries go away.
     std::unique_ptr<detail::RequestRuntime> runtime_;
+    // Periodic device sampler.
+    std::mutex sampler_mutex_;
+    std::condition_variable sampler_cv_;
+    bool sampler_stop_ = false;
+    std::thread sampler_;
 };
 
 }  // namespace sonder::inference
