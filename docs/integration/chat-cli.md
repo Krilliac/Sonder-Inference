@@ -71,6 +71,21 @@ Additions only; existing backends compile unchanged.
 3. README/docs CLI usage could mention `chat` and `--markdown` (only this
    notes file was edited).
 
+## Integration on main
+
+Merged after `feat/sampling-config` (#9), the engine wiring (#11) and the
+sampling follow-ups. Conflicts were additive (`backend.hpp`: `TokenStream`,
+`tokenize()`, `open_token_stream()` next to the chat API;
+`tests/CMakeLists.txt`). Added during integration:
+
+- Ollama `chat()` rejects a non-empty `logit_bias` with `invalid_argument`,
+  like `generate()`.
+- Sampling flags for the new `SamplingConfig` fields on `generate`, `chat`
+  and `bench` (see `sonder-infer --help` and
+  [sampling-config.md](sampling-config.md)); bench results record them.
+- Follow-up 1 (Session/Engine chat) is still open: `chat` bypasses the
+  scheduler and emits no request telemetry.
+
 ## Tests
 
 - `tests/test_chat.cpp` (`sonder.core.chat.*`, 6 cases): role validation,

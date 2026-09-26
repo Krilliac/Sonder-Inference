@@ -74,11 +74,16 @@ the same `SamplerConfig` as before.
    The context is fixed at load, so a `num_ctx` larger than the loaded
    context is rejected with `invalid_argument`. A smaller one is honoured
    through the engine's scheduling limit.
-4. **CLI / bench flags**: to do after `feat/chat-cli` (PR #10) merges,
-   because that PR changes the same CLI files.
+4. **CLI / bench flags**: done (landed with the `feat/chat-cli` integration).
+   `generate`, `chat` and `bench` accept `--typical-p`, `--repeat-last-n`,
+   `--presence-penalty`, `--frequency-penalty`, `--num-ctx` and
+   `--logit-bias TOKEN:BIAS[,TOKEN:BIAS...]` (BIAS may be `-inf`). Bench
+   result files record the new fields under `sampling` (`logit_bias_count`
+   instead of the biases).
 5. **Ollama + logit_bias**: decided. The Ollama backend **rejects** a
    non-empty `logit_bias` with `ErrorCode::invalid_argument` and sends
-   nothing to the server. It no longer drops the field silently.
+   nothing to the server. It no longer drops the field silently. This
+   applies to both `generate` and native `chat` (`/api/chat`).
    `sampling_to_options()` still omits it.
 6. `docs/integration/sampling.md`: updated.
 

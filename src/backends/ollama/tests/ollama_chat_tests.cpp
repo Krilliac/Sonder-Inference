@@ -151,3 +151,20 @@ TEST_CASE("backend chat: stalled stream is cancellable") {
     CHECK(st.status().code() == ErrorCode::cancelled);
     CHECK(text == "Hello");
 }
+
+TEST_CASE("backend chat: logit_bias is rejected, not silently dropped") {
+    FakeOllamaServer srv;
+    StreamScript s;
+    s.body = fixture("chat_stream.ndjson");
+    srv.set_chat(s);
+    auto m = load(srv, config_for(srv));
+    const int before = srv.request_count();
+    ChatRequest req;
+    req.messages = {{"user", "hi"}};
+    req.sampling.logit_bias = {{42, 5.0f}};
+    auto st = m->chat(req, {}, {});
+    REQUIRE_FALSE(st.ok());
+    CHECK(st.status().code() == ErrorCode::invalid_argument);
+    CHECK(st.status().message().find("logit_bias") != std::string::npos);
+    CHECK(srv.request_count() == before);  // nothing was sent
+}
