@@ -18,21 +18,23 @@ For research papers, implement concepts from the paper/design independently unle
 
 ## Project license
 
-Sonder Inference is licensed under the **MIT License** (root [`LICENSE`](../LICENSE),
-Copyright (c) 2026 Krilliac), decided 2026-09-26 (ADR-015).
+Sonder Inference is licensed under the **Apache License, Version 2.0** (root
+[`LICENSE`](../LICENSE) with the full standard text, plus [`NOTICE`](../NOTICE):
+"Sonder-Inference, Copyright 2026 Nate Witkowski"). Decided 2026-09-26
+(ADR-015, revised).
 
-- Rule applied (Nate: "any license will do, whatever matches my other repos"): use
-  the license most of Krilliac's other repositories use; MIT if none or a tie.
-- Survey (2026-09-26, GitHub search for root license files across the 27 other
-  Krilliac repositories): MIT in DuetOS, Lightforge, BrowserGame, SparkTemplates, plus
-  ReSymbol (dual MIT/Apache-2.0); Apache-2.0 in Sonder-runtime and
-  OmegaStrain-Reimplementation (plus ReSymbol); GPL-3.0 in Blackice-Server;
-  custom licenses in SparkEngine and smellslikenapalm; no root license in the
-  rest. MIT is the plurality (5 vs 3 counting the dual-licensed repo for both).
-- Compatibility: every adopted dependency (llama.cpp/GGML, doctest, cpp-httplib)
-  is MIT, which permits use, modification, static linking and redistribution under
-  an MIT project provided the upstream copyright and permission notices are
-  preserved in distributions that contain their code.
+- Decision: Nate chose Apache-2.0 directly on 2026-09-26. This replaces the
+  earlier MIT choice (PR #7), which came from a survey of Krilliac's other
+  repositories. That survey no longer applies.
+- Compatibility: every adopted dependency is MIT (llama.cpp/GGML b11195,
+  cpp-httplib v0.58.0, doctest v2.5.3). MIT code may be used, modified,
+  statically linked and redistributed inside an Apache-2.0 project as long as
+  the MIT copyright and permission notice is kept. `NOTICE` carries those
+  notices for llama.cpp/GGML, cpp-httplib and doctest. MIT adds no conditions
+  beyond Apache-2.0's, so the combined work can be distributed under
+  Apache-2.0 with the MIT notices attached.
+- Patent terms: Apache-2.0 section 3 grants a patent license from
+  contributors. MIT dependencies neither add nor remove patent terms.
 
 ## Dependency record template
 
@@ -94,8 +96,8 @@ No license conclusions from the initial broad web sweep are considered authorita
   GGUF files are untrusted input parsed by llama.cpp; load only trusted model files.
   GitHub tag tarballs are pinned by hash; if GitHub regenerates an archive the hash check fails
   closed (update hash after verifying the tag commit)
-- approved: yes, approved by Nate on 2026-09-26 (MIT, compatible with the project's MIT license;
-  keep the notice requirement above)
+- approved: yes, approved by Nate on 2026-09-26 (MIT, compatible with the project's Apache-2.0
+  license; notice kept in `NOTICE`)
 
 ### cpp-httplib
 - repository: https://github.com/yhirose/cpp-httplib
@@ -106,7 +108,8 @@ No license conclusions from the initial broad web sweep are considered authorita
 - linkage/process boundary: header-only, compiled into `sonder_ollama_tests` only; never linked into `sonder_inference`
 - notices required: MIT notice (inside the header); not redistributed
 - security/maintenance notes: fetched by CMake FetchContent from a pinned URL with `URL_HASH` in `src/backends/ollama/tests/CMakeLists.txt`
-- approved: yes (test-only), approved by Nate on 2026-09-26 (MIT, compatible with the project's MIT license)
+- approved: yes (test-only), approved by Nate on 2026-09-26 (MIT, compatible with the project's
+  Apache-2.0 license; notice kept in `NOTICE`)
 
 ### Ollama (process boundary only)
 - repository: https://github.com/ollama/ollama

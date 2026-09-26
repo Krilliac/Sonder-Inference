@@ -224,8 +224,11 @@ now updated for the implementation layout.
 
 ## License
 
-Sonder Inference is released under the [MIT License](LICENSE)
-(Copyright (c) 2026 Krilliac). Third-party dependencies keep their own
-licenses; each is recorded in [LICENSE_REVIEW](docs/LICENSE_REVIEW.md). All
-currently adopted dependencies (llama.cpp/GGML, doctest, cpp-httplib) are MIT
-and compatible with the project license.
+Sonder Inference is licensed under the [Apache License, Version 2.0](LICENSE)
+(Copyright 2026 Nate Witkowski). See [NOTICE](NOTICE) for attribution.
+Third-party dependencies keep their own licenses, and each one is recorded in
+[LICENSE_REVIEW](docs/LICENSE_REVIEW.md). All currently adopted dependencies
+are MIT: llama.cpp/GGML b11195 (optional backend), cpp-httplib v0.58.0
+(test-only) and doctest (test-only). MIT is compatible with Apache-2.0.
+llama.cpp and cpp-httplib were approved by Nate on 2026-09-26, and their
+notices are kept in `NOTICE`.

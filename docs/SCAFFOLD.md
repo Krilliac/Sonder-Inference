@@ -22,7 +22,7 @@ records the layout and what remains undecided.
 - Telemetry format: Observatory envelope v1 JSONL (ADR-012).
 - Test framework: doctest via FetchContent, test-only (ADR-014).
 - CI jobs: configure/build/test on Windows (MSVC) and Linux.
-- Project license: MIT (ADR-015, [LICENSE](../LICENSE)).
+- Project license: Apache-2.0 (ADR-015, [LICENSE](../LICENSE), [NOTICE](../NOTICE)).
 
 ## Still undecided
 
