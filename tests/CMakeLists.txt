@@ -87,7 +87,7 @@ if(SONDER_BUILD_CLI)
         COMMAND sonder-infer generate --backend mock --model mock:tiny --prompt "hello sonder"
                 --max-tokens 8 --telemetry "${CMAKE_CURRENT_BINARY_DIR}/cli-generate.jsonl")
     set_tests_properties(sonder.cli.version sonder.cli.devices sonder.cli.generate_mock PROPERTIES TIMEOUT 60)
-    sonder_cli_test(rejects_bad_sampling RC 2 STDERR_REGEX "temperature"
+    sonder_cli_test(rejects_bad_sampling RC 2 STDERR_REGEX "temperature must be finite"
         COMMAND ${infer} generate ${mock} --prompt x --temperature -1)
 
     # Sampling flags added with feat/sampling-config.
@@ -96,11 +96,11 @@ if(SONDER_BUILD_CLI)
                 --typical-p 0.9 --repeat-last-n -1 --presence-penalty 0.5 --frequency-penalty 0.25
                 --num-ctx 512 --logit-bias "1:-inf,2:1.5")
     set_tests_properties(sonder.cli.generate_sampling_flags PROPERTIES TIMEOUT 60)
-    sonder_cli_test(rejects_bad_logit_bias RC 2 STDERR_REGEX "logit"
+    sonder_cli_test(rejects_bad_logit_bias RC 2 STDERR_REGEX "logit_bias values must be within"
         COMMAND ${infer} generate ${mock} --prompt x --logit-bias 1:500)
     sonder_cli_test(rejects_malformed_logit_bias RC 2 STDERR_REGEX "invalid --logit-bias entry 'oops'"
         COMMAND ${infer} generate ${mock} --prompt x --logit-bias oops)
-    sonder_cli_test(rejects_bad_typical_p RC 2 STDERR_REGEX "typical"
+    sonder_cli_test(rejects_bad_typical_p RC 2 STDERR_REGEX "typical_p must be within"
         COMMAND ${infer} generate ${mock} --prompt x --typical-p 0)
 
     # `sonder-infer chat` (docs/integration/chat-cli.md).
@@ -108,9 +108,9 @@ if(SONDER_BUILD_CLI)
         COMMAND sonder-infer chat --backend mock --model mock:tiny --max-tokens 6 --messages "${chat_fixture}")
     set_tests_properties(sonder.cli.chat_messages_mock PROPERTIES TIMEOUT 60
         PASS_REGULAR_EXPRESSION "chat native=no messages=4 outcome=completed stop=max_tokens")
-    sonder_cli_test(chat_rejects_bad_role RC 2 STDERR_REGEX "role"
+    sonder_cli_test(chat_rejects_bad_role RC 2 STDERR_REGEX "unknown role"
         COMMAND ${infer} chat ${mock} --messages "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/chat_messages_bad_role.json")
-    sonder_cli_test(chat_rejects_missing_file RC 2 STDERR_REGEX "cannot open"
+    sonder_cli_test(chat_rejects_missing_file RC 2 STDERR_REGEX "messages: cannot open"
         COMMAND ${infer} chat ${mock} --messages "${CMAKE_CURRENT_BINARY_DIR}/absent.json")
 
     if(TARGET sonder-bench)

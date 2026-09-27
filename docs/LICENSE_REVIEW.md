@@ -111,6 +111,17 @@ No license conclusions from the initial broad web sweep are considered authorita
 - approved: yes (test-only), approved by Nate on 2026-09-26 (MIT, compatible with the project's
   Apache-2.0 license; notice kept in `NOTICE`)
 
+### OpenSSL (optional TLS, system library)
+- repository: https://github.com/openssl/openssl
+- revision/tag: the system library, 1.1.1 or newer. CI pins what it links: the `ubuntu-24.04` image's libssl-dev (OpenSSL 3.0.x) for tls-linux, and Chocolatey `openssl` 4.0.2 for the Windows in-test server
+- evaluated: 2026-09-26
+- license: Apache License 2.0 for OpenSSL 3.x and 4.x; OpenSSL 1.1.1 uses the OpenSSL/SSLeay dual license
+- intended use: TLS for the internal HTTP client (`src/net/tls_openssl.cpp`) so the Ollama backend can reach `https://` nodes
+- linkage/process boundary: dynamic link to the system library, only when `SONDER_WITH_TLS=ON` with the openssl backend (default on Linux/macOS); the default build (TLS OFF) compiles and links nothing. Nothing is vendored or fetched. On Windows the TLS backend is Schannel (crypt32/secur32/bcrypt, OS components); OpenSSL is used there only by the loopback test server in `tests/tls`
+- notices required: none for dynamic linking to the system library; nothing is redistributed
+- security/maintenance notes: security updates come from the OS package; certificate verification, pinning and the `insecure_skip_verify` warning are documented in `docs/integration/tls.md`
+- approved: yes, approved by Nate on 2026-09-26 (dynamic link to the system library, OFF by default; CI revisions pinned as above)
+
 ### Ollama (process boundary only)
 - repository: https://github.com/ollama/ollama
 - revision/tag: whatever server the user runs locally

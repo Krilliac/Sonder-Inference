@@ -70,6 +70,10 @@ still pass); GCC standalone-engine build + replay.
 
 ## What the lead must wire
 
+> **Status on main:** done. The root `CMakeLists.txt` declares
+> `SONDER_BUILD_FUZZERS` (OFF) and adds `fuzz/` when it is ON; CI keeps
+> building `fuzz/` standalone.
+
 1. Root `CMakeLists.txt`, **after** the `SONDER_MODULE_DIRS` loop (the fuzz
    targets need the bench and ollama module sources in `sonder_inference`):
 
@@ -90,7 +94,12 @@ still pass); GCC standalone-engine build + replay.
    shape, update the matching fuzz target's invariants (they compile against
    `ollama.hpp`, `ollama_protocol.hpp`, `benchmark.hpp`, `telemetry.hpp`).
 
-## Bugs found (not fixed here: `src/` is owned by other workers)
+## Bugs found (all fixed in #15)
+
+> **Status on main:** B1-B6 are all **fixed** by #15 (feat/parser-fixes, main
+> `23e0865`), together with the `int_field` UB found by
+> `sonder_fuzz_ollama_stream`. The first hardening run on the merged tree hit
+> that UB again before #15 landed; the repro inputs are in `fuzz/corpus/`.
 
 Sanitizers (ASan, UBSan, LSan, TSan) and 5 x 60 s of fuzzing found **no memory
 errors, UB, leaks or data races**. Targeted probing of the same parsers found
@@ -172,7 +181,11 @@ Two Ollama line parsers with different rules:
 **Fix:** make `parse_stream_line` reject non-objects and ignore
 `"error": null`, or implement it on top of the decoder's `on_line` logic.
 
-### Minor observations (no fix required now)
+### Minor observations
+
+All three are addressed on main: the first two by #15 (`1e999` is rejected as
+"number out of range"; Markdown cells are escaped), the third by the
+integration follow-up after #13.
 
 * JSON numbers outside double range (`1e999`) parse to `inf` and serialize
   as `null`, so `parse(dump(x))` changes type. Consider rejecting them in the
@@ -183,6 +196,8 @@ Two Ollama line parsers with different rules:
   a sanitizer abort in that path would also "pass". Checked manually: it exits
   2 with the expected message and no sanitizer report. Prefer
   `PASS_REGULAR_EXPRESSION "temperature must be"` over `WILL_FAIL`.
+  **Done on main:** all CLI negative tests now use
+  `PASS_REGULAR_EXPRESSION` on the error text instead of `WILL_FAIL`.
 
 ## Local run summary (box, clang 19.1.7, 4 build jobs)
 

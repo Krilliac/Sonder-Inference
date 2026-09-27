@@ -74,15 +74,15 @@ rank.
 When the backend advertises `Capability::token_logits`,
 `BackendModel::open_token_stream()` returns a `TokenStream`. The session then
 builds a `sampling::SamplerChain` from the request's `SamplingConfig` via
-`core_bridge::make_chain`, and samples every token with it (repeat penalty,
-top-k, top-p, min-p, temperature, then greedy or seeded selection; the other
-chain stages keep their disabled defaults until `feat/sampling-config` maps
-them). It also applies `StopSequenceMatcher`. Output is deterministic for a
-given seed and does not depend on scheduling or batching
-(`tests/test_engine_runtime.cpp`). Backends without `token_logits` (Ollama,
-llama.cpp today) receive `SamplingConfig` and sample themselves.
-`request.started.sampler` and `SchedulingInfo::sonder_sampled` show which path
-ran.
+`core_bridge::make_chain`, and samples every token with it (logit bias,
+repeat/presence/frequency penalties over `repeat_last_n`, top-k, typical-p,
+top-p, min-p, temperature, then greedy or seeded selection; every
+`SamplingConfig` field is mapped since #9, see sampling-config.md). It also
+applies `StopSequenceMatcher`. Output is deterministic for a given seed and
+does not depend on scheduling or batching (`tests/test_engine_runtime.cpp`).
+Backends without `token_logits` (Ollama, llama.cpp today) receive
+`SamplingConfig` and sample themselves. `request.started.sampler` and
+`SchedulingInfo::sonder_sampled` show which path ran.
 
 The mock backend exposes `token_logits` when
 `MockBackendOptions::token_logits` is set. It then has 24 words plus EOS
