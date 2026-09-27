@@ -15,8 +15,12 @@
 #  include <fcntl.h>
 #  include <netinet/in.h>
 #  include <sys/resource.h>
+#  include <sys/syscall.h>
 #  include <unistd.h>
 #  include <sys/time.h>
+
+#  include <cstdlib>
+#  include <fstream>
 #endif
 
 #include "server_test_support.hpp"
@@ -433,6 +437,37 @@ double cpu_seconds() {
            static_cast<double>(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
 }
 
+// Waits (bounded) until every other thread of the process is blocked in the
+// kernel (state S or D in /proc/self/task/<tid>/stat). A thread can only
+// block after its start-up code has run, and clang's UBSan vptr check on
+// std::thread's state object runs in that start-up code. If a server or
+// engine thread is first scheduled inside the descriptor-exhaustion window,
+// that check cannot create its pipe() and reports a false "invalid vptr".
+void wait_for_other_threads_blocked(std::chrono::milliseconds limit = std::chrono::milliseconds(2000)) {
+    const long self = static_cast<long>(::syscall(SYS_gettid));
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    for (;;) {
+        bool all_blocked = true;
+        if (DIR* d = opendir("/proc/self/task")) {
+            while (dirent* e = readdir(d)) {
+                if (e->d_name[0] == '.' || std::atol(e->d_name) == self) continue;
+                std::ifstream stat(std::string("/proc/self/task/") + e->d_name + "/stat");
+                std::string line;
+                std::getline(stat, line);
+                const auto paren = line.rfind(')');
+                const char state = (paren != std::string::npos && paren + 2 < line.size()) ? line[paren + 2] : '?';
+                if (state != 'S' && state != 'D') {
+                    all_blocked = false;
+                    break;
+                }
+            }
+            closedir(d);
+        }
+        if (all_blocked || std::chrono::steady_clock::now() >= deadline) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
 struct NoFileLimit {
     rlimit saved{};
     bool active = false;
@@ -475,6 +510,7 @@ TEST_CASE("descriptor exhaustion: the accept loop answers 503 and does not spin"
             REQUIRE(c.valid());
             clients.push_back(std::move(c));
         }
+        wait_for_other_threads_blocked();
         NoFileLimit limit(static_cast<rlim_t>(open_descriptors() + 64));
         REQUIRE(limit.active);
         // No doctest assertions while the process is out of descriptors:
