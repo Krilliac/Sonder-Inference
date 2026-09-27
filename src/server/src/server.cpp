@@ -21,6 +21,7 @@
 #include "openai.hpp"
 #include "socket.hpp"
 #include "test_hooks.hpp"
+#include "../../common/loopback.hpp"
 #include "sonder/inference/engine.hpp"
 #include "sonder/inference/json.hpp"
 #include "sonder_inference.h"
@@ -149,12 +150,10 @@ bool is_serialized_origin(std::string_view origin) {
     return true;
 }
 
-bool is_loopback_bind(std::string_view host) {
-    if (host.size() > 2 && host.front() == '[' && host.back() == ']') {
-        host = host.substr(1, host.size() - 2);
-    }
-    return host == "localhost" || host == "::1" || host.rfind("127.", 0) == 0;
-}
+// A bind that can only be reached from this machine. Literal addresses only
+// (plus "localhost"): a DNS name starting with "127." may resolve to a LAN
+// address, and such a bind must require a token like any other.
+bool is_loopback_bind(std::string_view host) { return sonder::inference::detail::is_loopback_literal(host); }
 
 double seconds_since(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();

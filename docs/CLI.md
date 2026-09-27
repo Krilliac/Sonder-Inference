@@ -128,7 +128,8 @@ includes the mock backend, so that state cannot be produced.
 always prints a warning (also with `--quiet`). Prompts and replies never
 travel unencrypted to a remote host: the CLI refuses the flag with exit 2
 when the Ollama URL (from `--ollama-url`, `SONDER_OLLAMA_URL` or
-`OLLAMA_HOST`) is plain `http://` to a non-loopback host, for every command
+`OLLAMA_HOST`) is plain `http://` to a non-loopback host (loopback: `localhost`,
+`::1`, or an IPv4 literal in 127.0.0.0/8; a DNS name starting with `127.` is remote), for every command
 including `serve`:
 `error: models: --ollama-allow-remote refuses plain http:// to a non-loopback host ('http://192.0.2.1:11434'); use https:// ...`.
 The Ollama client itself only checks the host once `allow_remote` is set, so
