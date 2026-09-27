@@ -180,10 +180,17 @@ json::Object TelemetryBus::make_envelope(std::string_view event_type, const Tele
     env.set("task_id", context.task_id);
     env.set("model_instance_id", context.model_instance_id);
     env.set("device_id", context.device_id);
-    env.set("producer", json::Object{{"name", options_.producer_name},
-                                     {"version", version_string()},
-                                     {"node_id", options_.node_id},
-                                     {"instance_id", instance_id_}});
+    json::Object producer{{"name", options_.producer_name},
+                          {"version", version_string()},
+                          {"node_id", options_.node_id},
+                          {"instance_id", instance_id_}};
+    if (!options_.role.empty()) {
+        producer.set("role", options_.role);
+    }
+    if (options_.synthetic) {
+        producer.set("synthetic", *options_.synthetic);
+    }
+    env.set("producer", std::move(producer));
     env.set("sampling", json::Object{{"level", to_string(level)}, {"sampled", true}});
     env.set("attributes", std::move(attributes));
     return env;
@@ -203,7 +210,7 @@ bool TelemetryBus::emit(std::string_view event_type, const TelemetryContext& con
         return false;
     }
     const std::uint64_t seq = next_sequence_++;
-    queue_.push_back(json::Value(make_envelope(event_type, context, std::move(attributes), seq, level)).dump());
+    queue_.emplace_back(seq, json::Value(make_envelope(event_type, context, std::move(attributes), seq, level)).dump());
     ++enqueued_count_;
     emitted_.fetch_add(1, std::memory_order_relaxed);
     lock.unlock();
@@ -218,13 +225,13 @@ void TelemetryBus::writer_loop() {
         if (queue_.empty() && stopping_) {
             break;
         }
-        std::deque<std::string> batch;
+        std::deque<std::pair<std::uint64_t, std::string>> batch;
         batch.swap(queue_);
         auto sinks = sinks_;
         lock.unlock();
-        for (const auto& line : batch) {
+        for (const auto& [sequence, line] : batch) {
             for (const auto& sink : sinks) {
-                sink->write(line);
+                sink->write_event(sequence, line);
             }
         }
         for (const auto& sink : sinks) {
@@ -249,7 +256,7 @@ void TelemetryBus::enqueue_drop_report_locked(bool final_report) {
     TelemetryContext ctx;
     ctx.session_id = instance_id_;
     const std::uint64_t seq = next_sequence_++;
-    queue_.push_back(json::Value(make_envelope("telemetry.dropped", ctx,
+    queue_.emplace_back(seq, json::Value(make_envelope("telemetry.dropped", ctx,
                                                json::Object{{"dropped_events", dropped},
                                                             {"emitted_events", emitted_.load()},
                                                             {"queue_capacity", options_.queue_capacity},

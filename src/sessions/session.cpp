@@ -266,14 +266,39 @@ Result<GenerateStats> run_sonder_sampling(TokenStream& stream, const SamplingCon
 }  // namespace
 #endif
 
+bool Session::last_scheduler_rejected() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_scheduler_rejected_;
+}
+
 Result<GenerationResult> Session::generate(const std::string& prompt, const TokenCallback& on_chunk,
-                                           const std::optional<SamplingConfig>& sampling_override) {
+                                           const std::optional<SamplingConfig>& sampling_override,
+                                           const RequestOptions& request_options) {
+    return run_request("generate", prompt, nullptr, on_chunk, sampling_override, request_options);
+}
+
+Result<GenerationResult> Session::chat(const std::vector<ChatMessage>& messages, const TokenCallback& on_chunk,
+                                       const std::optional<SamplingConfig>& sampling_override,
+                                       const RequestOptions& request_options) {
+    if (Status st = validate_chat_messages(messages); !st.ok()) {
+        return st;
+    }
+    return run_request("chat", format_chat_prompt(messages), &messages, on_chunk, sampling_override,
+                       request_options);
+}
+
+Result<GenerationResult> Session::run_request(const char* kind, const std::string& prompt,
+                                              const std::vector<ChatMessage>* messages, const TokenCallback& on_chunk,
+                                              const std::optional<SamplingConfig>& sampling_override,
+                                              const RequestOptions& request_options) {
     const SamplingConfig sampling = sampling_override.value_or(options_.sampling);
     if (auto st = validate(sampling); !st.ok()) {
         return st;
     }
     GenerateRequest request;
-    request.request_id = make_id("req");
+    request.request_id = request_options.request_id && !request_options.request_id->empty()
+                             ? *request_options.request_id
+                             : make_id("req");
     request.prompt = prompt;
     request.sampling = sampling;
 
@@ -298,25 +323,40 @@ Result<GenerationResult> Session::generate(const std::string& prompt, const Toke
     const bool emit_tokens = bus.enabled(TelemetryLevel::standard);
     const bool capture_text = bus.options().capture_text;
     BackendModel& backend_model = model_->backend_model();
+    // Chat with a backend-native template bypasses the generic prompt (and
+    // therefore Sonder's token-level sampler, which works on that prompt).
+    const bool native_chat = messages != nullptr && backend_model.has_native_chat();
+    const auto& parent = request_options.parent_request_id;
+    const auto with_parent = [&parent](json::Object attrs) {
+        if (parent) {
+            attrs.set("parent_request_id", *parent);
+        }
+        return attrs;
+    };
 
-    bus.emit("request.queued", ctx,
-             json::Object{{"kind", "generate"},
-                          {"priority", options_.priority},
-                          {"workload", to_string(options_.workload)},
-                          {"prompt_bytes", prompt.size()}},
-             TelemetryLevel::metrics);
+    {
+        json::Object queued{{"kind", kind},
+                            {"priority", options_.priority},
+                            {"workload", to_string(options_.workload)},
+                            {"prompt_bytes", prompt.size()}};
+        if (messages != nullptr) {
+            queued.set("messages", messages->size());
+        }
+        bus.emit("request.queued", ctx, with_parent(std::move(queued)), TelemetryLevel::metrics);
+    }
     const auto t_start = std::chrono::steady_clock::now();
 
     GenerationResult result;
     result.request_id = request.request_id;
     Status failure;
     bool pre_failed = false;
+    bool scheduler_rejected = false;
 
     // Sampling path: Sonder's sampler chain when the backend exposes logits.
     std::unique_ptr<TokenStream> stream;
 #if defined(SONDER_HAS_SAMPLER_CHAIN)
     if (const auto backend = engine_.find_backend(model_->backend_name());
-        backend && backend->capabilities().has(Capability::token_logits)) {
+        !native_chat && backend && backend->capabilities().has(Capability::token_logits)) {
         auto opened = backend_model.open_token_stream(request);
         if (opened.ok()) {
             stream = std::move(opened).value();
@@ -339,9 +379,14 @@ Result<GenerationResult> Session::generate(const std::string& prompt, const Toke
         if (stream) {
             spec.prompt_tokens = stream->prompt_tokens();
             spec.exact_tokens = true;
-        } else if (auto tk = backend_model.tokenize(prompt); tk.ok() && !tk.value().empty()) {
-            spec.prompt_tokens = std::move(tk).value();
-            spec.exact_tokens = true;
+        } else if (!native_chat) {
+            // Exact only for the prompt the backend actually receives: a native
+            // chat template differs from the generic prompt, so native chat is
+            // accounted approximately below.
+            if (auto tk = backend_model.tokenize(prompt); tk.ok() && !tk.value().empty()) {
+                spec.prompt_tokens = std::move(tk).value();
+                spec.exact_tokens = true;
+            }
         }
         if (spec.prompt_tokens.empty()) {
             spec.prompt_tokens = detail::accounting_tokenize(prompt);
@@ -365,15 +410,20 @@ Result<GenerationResult> Session::generate(const std::string& prompt, const Toke
         } else {
             failure = submitted.status();
             pre_failed = true;
+            scheduler_rejected = true;
         }
     }
 
-    bus.emit("request.started", ctx,
-             json::Object{{"kind", "generate"},
-                          {"sampling", sampling_json(sampling)},
-                          {"scheduled", sched_id.has_value()},
-                          {"sampler", stream ? "sonder" : "backend"}},
-             TelemetryLevel::metrics);
+    {
+        json::Object started{{"kind", kind},
+                             {"sampling", sampling_json(sampling)},
+                             {"scheduled", sched_id.has_value()},
+                             {"sampler", stream ? "sonder" : "backend"}};
+        if (messages != nullptr) {
+            started.set("chat_template", native_chat ? "native" : "generic");
+        }
+        bus.emit("request.started", ctx, with_parent(std::move(started)), TelemetryLevel::metrics);
+    }
 
     std::chrono::steady_clock::time_point t_first{};
     bool have_first = false;
@@ -445,13 +495,22 @@ Result<GenerationResult> Session::generate(const std::string& prompt, const Toke
         generated = run_sonder_sampling(*stream, sampling, token, bus, ctx, gate, produced, deliver);
 #endif
     } else {
-        generated = backend_model.generate(request, token, [&](const TokenChunk& chunk) -> bool {
+        const auto gated = [&](const TokenChunk& chunk) -> bool {
             if (!gate()) {
                 return false;
             }
             produced(detail::accounting_chunk_token(chunk.text));
             return deliver(chunk, std::nullopt, 0.0f);
-        });
+        };
+        if (native_chat) {
+            ChatRequest chat_request;
+            chat_request.request_id = request.request_id;
+            chat_request.messages = *messages;
+            chat_request.sampling = sampling;
+            generated = backend_model.chat(chat_request, token, gated);
+        } else {
+            generated = backend_model.generate(request, token, gated);
+        }
     }
     const auto t_end = std::chrono::steady_clock::now();
     result.total_ms = ms_between(t_start, t_end);
@@ -537,22 +596,26 @@ Result<GenerationResult> Session::generate(const std::string& prompt, const Toke
             dec.set("backend_prompt_eval_ms", static_cast<double>(result.stats.prompt_eval_ns) / 1e6);
         }
         bus.emit("inference.decode.completed", ctx, std::move(dec), TelemetryLevel::metrics);
-        bus.emit("request.completed", ctx, std::move(summary), TelemetryLevel::metrics);
+        bus.emit("request.completed", ctx, with_parent(std::move(summary)), TelemetryLevel::metrics);
     } else if (outcome == RequestOutcome::cancelled) {
         if (cancel_ns != 0 && now_ns >= cancel_ns) {
             summary.set("cancel_latency_ms", static_cast<double>(now_ns - cancel_ns) / 1e6);
         }
-        bus.emit("request.cancelled", ctx, std::move(summary), TelemetryLevel::metrics);
+        bus.emit("request.cancelled", ctx, with_parent(std::move(summary)), TelemetryLevel::metrics);
     } else {
         summary.set("error_code", to_string(failure.code()));
         summary.set("error", failure.message());
-        bus.emit("request.failed", ctx, std::move(summary), TelemetryLevel::metrics);
+        if (scheduler_rejected) {
+            summary.set("scheduler_rejected", true);
+        }
+        bus.emit("request.failed", ctx, with_parent(std::move(summary)), TelemetryLevel::metrics);
     }
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
         active_cancel_.reset();
         last_outcome_ = outcome;
+        last_scheduler_rejected_ = outcome == RequestOutcome::failed && scheduler_rejected;
         if (state_ == SessionState::running) {
             state_ = SessionState::idle;
         }

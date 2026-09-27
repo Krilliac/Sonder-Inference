@@ -7,11 +7,16 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "sonder/inference/backend.hpp"
 #include "sonder/inference/cancellation.hpp"
 #include "sonder/inference/model.hpp"
 #include "sonder/inference/telemetry.hpp"
+
+// Session::chat() exists (runs chat through the request runtime and emits
+// session telemetry with request.queued.kind = "chat").
+#define SONDER_HAS_SESSION_CHAT 1
 
 namespace sonder::inference {
 
@@ -59,6 +64,19 @@ struct SchedulingInfo {
     bool sonder_sampled = false;         // sampled by Sonder's sampler chain (token_logits)
 };
 
+// Per-request options that are not part of the session's configuration.
+struct RequestOptions {
+    // Engine-side request id (envelope request_id). Generated ("req-...") when
+    // unset; a caller that supplies one must keep it unique, e.g. from
+    // make_id("req"), so it can reference the request before it finishes.
+    std::optional<std::string> request_id;
+    // Caller-side request that caused this one (e.g. a Sonder Runtime turn id).
+    // Emitted as attributes.parent_request_id on request.queued, started,
+    // completed, cancelled and failed. The envelope request_id stays the
+    // engine-generated id.
+    std::optional<std::string> parent_request_id;
+};
+
 struct GenerationResult {
     std::string request_id;
     std::string text;
@@ -90,7 +108,24 @@ public:
     // outcome == cancelled (not an error). Errors: invalid_argument (bad
     // sampling), invalid_state (closed or already running), backend errors.
     Result<GenerationResult> generate(const std::string& prompt, const TokenCallback& on_chunk = {},
-                                      const std::optional<SamplingConfig>& sampling_override = std::nullopt);
+                                      const std::optional<SamplingConfig>& sampling_override = std::nullopt,
+                                      const RequestOptions& request_options = {});
+
+    // Chat completion: answers the last message of `messages` through the same
+    // request runtime (scheduler, KV accounting, sampler) and telemetry as
+    // generate(), with request.queued.kind = "chat". Backends with a native
+    // chat API or model chat template (BackendModel::has_native_chat()) get the
+    // messages as-is; otherwise the conversation is flattened with
+    // format_chat_prompt() and generated like a prompt (Sonder's sampler chain
+    // applies on token_logits backends). Errors as generate(), plus
+    // invalid_argument for invalid messages (validate_chat_messages()).
+    Result<GenerationResult> chat(const std::vector<ChatMessage>& messages, const TokenCallback& on_chunk = {},
+                                  const std::optional<SamplingConfig>& sampling_override = std::nullopt,
+                                  const RequestOptions& request_options = {});
+
+    // True when the last request failed because the engine scheduler rejected
+    // it before any backend work started (nothing executed).
+    [[nodiscard]] bool last_scheduler_rejected() const;
 
     // Cancels the in-flight request, if any. Safe from any thread, including
     // from inside the chunk callback. No effect on future requests.
@@ -101,6 +136,11 @@ public:
     [[nodiscard]] TelemetryContext telemetry_context(const std::optional<std::string>& request_id = std::nullopt) const;
 
 private:
+    Result<GenerationResult> run_request(const char* kind, const std::string& prompt,
+                                         const std::vector<ChatMessage>* messages, const TokenCallback& on_chunk,
+                                         const std::optional<SamplingConfig>& sampling_override,
+                                         const RequestOptions& request_options);
+
     Engine& engine_;
     std::shared_ptr<Model> model_;
     SessionOptions options_;
@@ -108,6 +148,7 @@ private:
     mutable std::mutex mutex_;
     SessionState state_ = SessionState::idle;
     RequestOutcome last_outcome_ = RequestOutcome::none;
+    bool last_scheduler_rejected_ = false;
     std::optional<CancellationSource> active_cancel_;
     std::uint64_t requests_started_ = 0;
     std::atomic<std::uint64_t> cancel_requested_ns_{0};

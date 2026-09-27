@@ -96,6 +96,7 @@ set(SONDER_MODULE_DIRS
     src/sampling
     src/backends/llamacpp
     src/backends/ollama
+    src/server
     bench)
 foreach(module_dir IN LISTS SONDER_MODULE_DIRS)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${module_dir}/CMakeLists.txt")

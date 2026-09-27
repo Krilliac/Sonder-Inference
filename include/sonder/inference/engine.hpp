@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -64,8 +65,18 @@ namespace detail {
 class RequestRuntime;
 }
 
+// Network listener that hosts the engine (`sonder-infer serve`). When set,
+// engine.started carries it as attributes.server {host, port, api_version}.
+struct EngineServerInfo {
+    std::string host;
+    std::uint16_t port = 0;
+    int api_version = 1;
+};
+
 struct EngineOptions {
     TelemetryOptions telemetry;
+    // Optional: reported on engine.started (docs/TELEMETRY.md).
+    std::optional<EngineServerInfo> server;
     // Attached before any engine event is emitted.
     std::vector<std::shared_ptr<TelemetrySink>> telemetry_sinks;
     // Emit a device.memory.sample for each device at startup.

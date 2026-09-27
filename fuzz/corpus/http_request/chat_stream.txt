@@ -1,0 +1,8 @@
+POST /v1/chat/completions HTTP/1.1
+Host: 127.0.0.1:11437
+Content-Type: application/json
+Content-Length: 142
+X-Sonder-Run-Id: rt-1
+X-Sonder-Priority: -3
+
+{"model":"default","messages":[{"role":"user","content":"hi"}],"stream":true,"stop":["x"],"logit_bias":{"5":-1},"max_completion_tokens":8}
