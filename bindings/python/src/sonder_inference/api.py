@@ -63,6 +63,16 @@ def _int32(name: str, v: int) -> int:
     return v
 
 
+def _cstr(name: str, v: str) -> bytes:
+    """Encode a str for a ``const char*`` parameter. The C side stops at the
+    first NUL, so an embedded one would silently truncate the value."""
+    if not isinstance(v, str):
+        raise TypeError(f"{name} must be a str, got {type(v).__name__}")
+    if "\0" in v:
+        raise ValueError(f"{name} contains an embedded NUL character")
+    return v.encode("utf-8")
+
+
 def _float(name: str, v: float) -> float:
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         raise TypeError(f"{name} must be a number, got {type(v).__name__}")
@@ -280,7 +290,7 @@ class Engine(_Handle):
         lib.cdll.sonder_engine_options_init(ctypes.byref(opts))
         if telemetry_level is not None:
             opts.telemetry_level = int(TelemetryLevel(telemetry_level))
-        path_bytes = telemetry_jsonl_path.encode("utf-8") if telemetry_jsonl_path else None
+        path_bytes = _cstr("telemetry_jsonl_path", telemetry_jsonl_path) if telemetry_jsonl_path else None
         opts.telemetry_jsonl_path = path_bytes
         opts.capture_text = 1 if capture_text else 0
         out = ctypes.c_void_p()
@@ -301,13 +311,14 @@ class Engine(_Handle):
         _check(self._lib, self._lib.cdll.sonder_engine_register_mock_backend(self._handle()))
 
     def register_ollama_backend(self, base_url: Optional[str] = None) -> None:
-        url = base_url.encode("utf-8") if base_url else None
+        url = _cstr("base_url", base_url) if base_url else None
         _check(self._lib, self._lib.cdll.sonder_engine_register_ollama_backend(self._handle(), url))
 
     def load_model(self, backend: str, model: str) -> "Model":
+        backend_b, model_b = _cstr("backend", backend), _cstr("model", model)
         out = ctypes.c_void_p()
         _check(self._lib, self._lib.cdll.sonder_model_load(
-            self._handle(), backend.encode("utf-8"), model.encode("utf-8"), ctypes.byref(out)))
+            self._handle(), backend_b, model_b, ctypes.byref(out)))
         m = Model(self, out.value)  # type: ignore[arg-type]
         self._children.add(m)
         return m
@@ -367,6 +378,7 @@ class Session(_Handle):
         generation and is re-raised here.
         """
         lib = self._lib
+        prompt_b = _cstr("prompt", prompt)
         handle = self._handle()
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         parts: list[str] = []
@@ -391,7 +403,7 @@ class Session(_Handle):
         c_callback = S.TOKEN_CALLBACK(trampoline)
         stats = S.CGenerationStats()
         stats.struct_size = ctypes.sizeof(S.CGenerationStats)
-        rc = lib.cdll.sonder_session_generate(handle, prompt.encode("utf-8"), c_callback, None,
+        rc = lib.cdll.sonder_session_generate(handle, prompt_b, c_callback, None,
                                               ctypes.byref(stats))
         if error:
             raise error[0]
@@ -407,6 +419,7 @@ class Session(_Handle):
     def stream(self, prompt: str) -> "TokenStream":
         """Iterate over chunks as they are produced (generation runs on a
         worker thread). Closing the stream early cancels the request."""
+        _cstr("prompt", prompt)  # fail here, not later on the worker thread
         return TokenStream(self, prompt)
 
     def cancel(self) -> None:

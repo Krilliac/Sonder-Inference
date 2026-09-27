@@ -181,6 +181,24 @@ def test_model_from_other_engine_rejected(engine):
                 engine.create_session(m)
 
 
+def test_embedded_nul_rejected_for_every_c_string(engine, model, tmp_path):
+    # c_char_p stops at the first NUL, so these would be silently truncated.
+    with engine.create_session(model, si.SamplingConfig.greedy(3)) as s:
+        with pytest.raises(ValueError, match="NUL"):
+            s.generate("visible\0hidden")
+        with pytest.raises(ValueError, match="NUL"):
+            s.stream("visible\0hidden")
+        assert s.generate("still usable").completed
+    with pytest.raises(ValueError, match="NUL"):
+        engine.load_model("mock", "mock:tiny\0evil")
+    with pytest.raises(ValueError, match="NUL"):
+        engine.load_model("mo\0ck", "mock:tiny")
+    with pytest.raises(ValueError, match="NUL"):
+        engine.register_ollama_backend("http://127.0.0.1:1\0/x")
+    with pytest.raises(ValueError, match="NUL"):
+        si.Engine(telemetry_jsonl_path=str(tmp_path / "t.jsonl") + "\0.txt")
+
+
 def test_telemetry_file(tmp_path):
     path = tmp_path / "telemetry.jsonl"
     with si.Engine(telemetry_level=si.TelemetryLevel.STANDARD, telemetry_jsonl_path=str(path)) as e:
