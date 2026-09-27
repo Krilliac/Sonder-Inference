@@ -2,6 +2,7 @@
 #include "sonder_inference.h"
 
 #include <cstddef>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <string>
@@ -14,13 +15,19 @@
 
 using namespace sonder::inference;
 
+// The engine is shared: every session handle holds a reference, because a
+// Session keeps a plain Engine& and uses the engine's telemetry bus and
+// request runtime until it is destroyed. sonder_engine_destroy() therefore
+// only drops the caller's reference; the engine stops when the last session
+// handle is destroyed (or at once when there are none).
 struct sonder_engine {
-    std::unique_ptr<Engine> engine;
+    std::shared_ptr<Engine> engine;
 };
 struct sonder_model {
     std::shared_ptr<Model> model;
 };
 struct sonder_session {
+    std::shared_ptr<Engine> engine;  // declared first: destroyed after `session`
     std::shared_ptr<Session> session;
 };
 
@@ -162,7 +169,7 @@ sonder_status sonder_engine_create(const sonder_engine_options* options, sonder_
             }
         }
         auto handle = std::make_unique<sonder_engine>();
-        handle->engine = std::make_unique<Engine>(std::move(eo));
+        handle->engine = std::make_shared<Engine>(std::move(eo));
         *out_engine = handle.release();
         return ok();
     });
@@ -223,28 +230,46 @@ sonder_status sonder_model_load(sonder_engine* engine, const char* backend_name,
 
 void sonder_model_release(sonder_model* model) { delete model; }
 
-void sonder_sampling_config_init(sonder_sampling_config* config) {
-    if (!config) {
+// Writes the defaults into the first `size` bytes the caller owns. The whole
+// current struct only when `size` covers it; otherwise the original layout,
+// with struct_size saying so (the appended fields then read as defaults).
+// Smaller than the original layout: nothing is written.
+void sonder_sampling_config_init_sized(sonder_sampling_config* config, size_t size) {
+    if (!config || size < kSamplingConfigMinSize) {
         return;
     }
     const SamplingConfig d;
-    *config = sonder_sampling_config{};
-    config->struct_size = sizeof(sonder_sampling_config);
-    config->temperature = d.temperature;
-    config->top_p = d.top_p;
-    config->top_k = d.top_k;
-    config->min_p = d.min_p;
-    config->repeat_penalty = d.repeat_penalty;
-    config->has_seed = 0;
-    config->seed = 0;
-    config->max_tokens = d.max_tokens;
-    config->typical_p = d.typical_p;
-    config->presence_penalty = d.presence_penalty;
-    config->frequency_penalty = d.frequency_penalty;
-    config->repeat_last_n = d.repeat_last_n;
-    config->num_ctx = d.num_ctx;
-    config->logit_bias = nullptr;
-    config->logit_bias_count = 0;
+    sonder_sampling_config full{};
+    full.struct_size = sizeof(sonder_sampling_config);
+    full.temperature = d.temperature;
+    full.top_p = d.top_p;
+    full.top_k = d.top_k;
+    full.min_p = d.min_p;
+    full.repeat_penalty = d.repeat_penalty;
+    full.has_seed = 0;
+    full.seed = 0;
+    full.max_tokens = d.max_tokens;
+    full.typical_p = d.typical_p;
+    full.presence_penalty = d.presence_penalty;
+    full.frequency_penalty = d.frequency_penalty;
+    full.repeat_last_n = d.repeat_last_n;
+    full.num_ctx = d.num_ctx;
+    full.logit_bias = nullptr;
+    full.logit_bias_count = 0;
+    if (size >= sizeof(sonder_sampling_config)) {
+        *config = full;
+        return;
+    }
+    full.struct_size = static_cast<uint32_t>(kSamplingConfigMinSize);
+    std::memcpy(config, &full, kSamplingConfigMinSize);
+}
+
+// The exported symbol that binaries built against the original header call
+// on their original-layout allocation: it must never write past that layout.
+// Current callers reach sonder_sampling_config_init_sized() through the
+// header macro instead. (Parenthesised name: the header defines a macro.)
+void(sonder_sampling_config_init)(sonder_sampling_config* config) {
+    sonder_sampling_config_init_sized(config, kSamplingConfigMinSize);
 }
 
 sonder_status sonder_sampling_config_validate(const sonder_sampling_config* config) {
@@ -278,7 +303,7 @@ sonder_status sonder_session_create(sonder_engine* engine, sonder_model* model, 
         if (!created.ok()) {
             return fail(created.status());
         }
-        *out_session = new sonder_session{std::move(created).value()};
+        *out_session = new sonder_session{engine->engine, std::move(created).value()};
         return ok();
     });
 }

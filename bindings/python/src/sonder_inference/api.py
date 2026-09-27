@@ -138,7 +138,7 @@ class SamplingConfig:
         """
         lib = library or get_library()
         c = S.CSamplingConfig()
-        lib.cdll.sonder_sampling_config_init(ctypes.byref(c))
+        lib.init_sampling(c)
         cfg = cls(temperature=c.temperature, top_p=c.top_p, top_k=c.top_k, min_p=c.min_p,
                   repeat_penalty=c.repeat_penalty, seed=None, max_tokens=c.max_tokens)
         if lib.supports_extended_sampling:
@@ -159,7 +159,7 @@ class SamplingConfig:
         """Marshal into the C struct. Chooses struct_size by library support
         unless ``struct_size`` is given (tests use this to act as an old caller)."""
         c = S.CSamplingConfig()
-        lib.cdll.sonder_sampling_config_init(ctypes.byref(c))
+        lib.init_sampling(c)
         if struct_size is None:
             if lib.supports_extended_sampling:
                 struct_size = S.SAMPLING_CONFIG_SIZE

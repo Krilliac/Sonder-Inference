@@ -73,6 +73,9 @@ struct Req {
     std::uint32_t pending = 0;  // grants not yet produced
     bool done = false;          // session finished; no more tokens will come
     bool passthrough = false;   // scheduler completed it; later tokens are not gated
+    // Missed a step deadline with a grant outstanding (pending > 0). Left out
+    // of the step barrier, and not granted again, until it produces that token.
+    bool lagging = false;
     std::optional<Status> failure;
     bool in_cache = false;
     std::size_t cached_tokens = 0;
@@ -88,7 +91,8 @@ public:
           engine_ctx_(std::move(engine_context)),
           cache_(make_cache_config(options)),
           adapter_(cache_),
-          scheduler_(make_scheduler_config(options), clock_, adapter_) {
+          scheduler_(make_scheduler_config(options), clock_, adapter_),
+          stall_timeout_(std::max<std::uint32_t>(1, options.step_stall_timeout_ms)) {
         cache_.set_event_listener([this](const kvc::CacheEvent& e) { on_cache_event(e); });
         // Free a request's sequence the moment the scheduler drops its
         // reservation so preemption sees the blocks come back (recompute).
@@ -111,7 +115,7 @@ public:
         }
     }
 
-    Result<std::uint64_t> submit(RuntimeRequestSpec spec) override {
+    Result<RuntimeSubmission> submit(RuntimeRequestSpec spec) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (spec.prompt_tokens.empty()) {
             return Status(ErrorCode::invalid_argument, "request has no prompt tokens");
@@ -131,6 +135,14 @@ public:
             return Status(ErrorCode::invalid_argument, "prompt needs " + std::to_string(prompt + 1) +
                                                            " KV tokens but the engine KV pool holds " +
                                                            std::to_string(capacity));
+        }
+        if (spec.exact_tokens && spec.context_limit > 0 && prompt >= spec.context_limit) {
+            bus_.emit("scheduler.rejected", spec.context,
+                      json::Object{{"scheduler_request_id", id},
+                                   {"reason", "invalid_request"},
+                                   {"prompt_tokens", prompt}},
+                      TelemetryLevel::metrics);
+            return Status(ErrorCode::invalid_argument, "prompt leaves no room for generation in the context window");
         }
         std::uint64_t max_new = std::max<std::uint32_t>(1, spec.max_new_tokens);
         if (spec.context_limit > 0) {
@@ -182,7 +194,7 @@ public:
         reqs_.emplace(id, std::move(r));
         ++generation_;
         cv_.notify_all();
-        return static_cast<std::uint64_t>(id);
+        return RuntimeSubmission{static_cast<std::uint64_t>(id), static_cast<std::uint32_t>(max_new)};
     }
 
     Status acquire_token(std::uint64_t id, const CancellationToken& cancel) override {
@@ -226,6 +238,9 @@ public:
             if (r.pending > 0) {
                 --r.pending;
             }
+            if (r.pending == 0) {
+                r.lagging = false;
+            }
             ++generation_;
         }
         cv_.notify_all();
@@ -258,11 +273,17 @@ public:
             summary = r.summary;
             if (terminal) {
                 reqs_.erase(it);
+                (void)scheduler_.forget(id);
             }
             ++generation_;
         }
         cv_.notify_all();
         return summary;
+    }
+
+    std::size_t tracked_requests() const override {
+        std::lock_guard<std::mutex> lock(mu_);
+        return std::max(reqs_.size(), scheduler_.tracked());
     }
 
     KvUsage kv_usage() const override {
@@ -378,12 +399,22 @@ private:
         return true;
     }
 
+    // At most one grant is outstanding per request: a request still owing a
+    // token from an earlier step (lagging) is not granted another.
     void grant(Req& r) {
+        if (r.pending > 0) {
+            r.lagging = true;
+            return;
+        }
         ++r.credits;
         ++r.pending;
     }
 
-    void apply_plan(const sch::StepPlan& plan) {
+    // Returns the ids of planned requests that were lagging when the plan was
+    // applied: their work is not executed (no KV append, no grant) until they
+    // produce the token they already owe.
+    std::vector<sch::RequestId> apply_plan(const sch::StepPlan& plan) {
+        std::vector<sch::RequestId> lagging;
         const sch::TimeUs now = clock_.now();
         for (const sch::PreemptionEvent& ev : plan.preempted) {
             Req* r = find(ev.id);
@@ -429,6 +460,10 @@ private:
         for (const sch::ScheduledWork& w : plan.work) {
             Req* r = find(w.id);
             if (r == nullptr || r->done || r->failure) {
+                continue;
+            }
+            if (r->lagging) {
+                lagging.push_back(w.id);
                 continue;
             }
             kvc::AppendResult ar;
@@ -488,12 +523,13 @@ private:
                                    {"running", scheduler_.running().size()}},
                           TelemetryLevel::standard);
         }
+        return lagging;
     }
 
     bool step_consumed(const sch::StepPlan& plan) {
         for (const sch::ScheduledWork& w : plan.work) {
             const Req* r = find(w.id);
-            if (r == nullptr || r->done || r->failure || r->passthrough) {
+            if (r == nullptr || r->done || r->failure || r->passthrough || r->lagging) {
                 continue;
             }
             if (r->pending > 0) {
@@ -524,6 +560,7 @@ private:
             if (r.done) {
                 free_cache(r, "completed");
                 reqs_.erase(it);
+                (void)scheduler_.forget(id);
             }
         };
         for (const auto& w : plan.work) settle(w.id);
@@ -548,7 +585,7 @@ private:
             release_reason_ = "preempted";
             const sch::StepPlan plan = scheduler_.plan_step();
             release_reason_ = "completed";
-            apply_plan(plan);
+            const std::vector<sch::RequestId> lagging = apply_plan(plan);
             if (plan.empty()) {
                 scheduler_.complete_step(plan);
                 post_step(plan, started);
@@ -563,15 +600,55 @@ private:
                 continue;
             }
             cv_.notify_all();
-            cv_.wait(lock, [&] { return stopping_ || step_consumed(plan); });
+            // Bounded barrier: wait for this step's grants, but never longer
+            // than the stall timeout. A step whose planned requests are all
+            // still catching up on earlier grants has nothing to wait for but
+            // their progress (or a submit/finish), so it sleeps until then
+            // instead of spinning.
+            const bool anything_runnable = std::any_of(plan.work.begin(), plan.work.end(), [&](const auto& w) {
+                const Req* r = find(w.id);
+                return r == nullptr || !r->lagging;
+            });
+            if (anything_runnable) {
+                const auto deadline = std::chrono::steady_clock::now() + stall_timeout_;
+                cv_.wait_until(lock, deadline, [&] { return stopping_ || step_consumed(plan); });
+            } else {
+                const std::uint64_t seen = generation_;
+                cv_.wait(lock, [&] { return stopping_ || generation_ != seen; });
+            }
             if (stopping_) {
                 break;
             }
             sch::StepOutcome outcome;
             for (const auto& w : plan.work) {
-                const Req* r = find(w.id);
+                Req* r = find(w.id);
                 if (r == nullptr || r->done) {
                     outcome.finished_early.push_back(w.id);
+                    continue;
+                }
+                if (r->failure || r->passthrough) {
+                    continue;
+                }
+                const bool was_lagging = std::find(lagging.begin(), lagging.end(), w.id) != lagging.end();
+                if (r->pending > 0) {
+                    // Missed the deadline (or still owes an earlier token):
+                    // the work did not happen this step.
+                    outcome.stalled.push_back(w.id);
+                    if (!r->lagging) {
+                        r->lagging = true;
+                        bus_.emit("scheduler.stalled", r->ctx,
+                                  json::Object{{"scheduler_request_id", w.id},
+                                               {"step", plan.step_index},
+                                               {"phase", w.phase == sch::Phase::Prefill ? "prefill" : "decode"},
+                                               {"timeout_ms", static_cast<std::uint64_t>(stall_timeout_.count())}},
+                                  TelemetryLevel::metrics);
+                    }
+                } else if (was_lagging) {
+                    // Caught up during this step: the token it produced is
+                    // this step's work. Account its KV now (append skips
+                    // anything already accounted).
+                    kvc::AppendResult ar;
+                    (void)append(*r, w.context_offset, w.phase == sch::Phase::Prefill ? w.num_tokens : 1, ar);
                 }
             }
             scheduler_.complete_step(plan, outcome);
@@ -597,6 +674,7 @@ private:
     std::size_t evicted_pending_ = 0;
     std::optional<kvc::PressureLevel> pressure_pending_;
     const char* release_reason_ = "completed";  // kv.freed reason for the release hook
+    std::chrono::milliseconds stall_timeout_;
     bool stopping_ = false;
     std::thread thread_;
 };

@@ -46,6 +46,9 @@ std::string str_or(const json::Value& v, std::string_view key, std::string fallb
 // Corpus
 
 Result<Corpus> parse_corpus(std::string_view json_text) {
+    if (json_text.size() > kMaxCorpusFileBytes) {
+        return Status(ErrorCode::invalid_argument, "corpus is too large (over 64 MiB of JSON)");
+    }
     auto parsed = json::parse(json_text);
     if (!parsed.ok()) {
         return parsed.status();
@@ -168,9 +171,25 @@ Result<Corpus> load_corpus(const std::string& path) {
     if (!in) {
         return Status(ErrorCode::io_error, "cannot open corpus: " + path);
     }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return parse_corpus(ss.str());
+    // Bound the read before allocating: the file size is checked first, and
+    // the read itself stops one byte past the limit (a file that grows while
+    // being read, or a size the stream cannot report).
+    in.seekg(0, std::ios::end);
+    const std::streamoff size = in.tellg();
+    if (size > static_cast<std::streamoff>(kMaxCorpusFileBytes)) {
+        return Status(ErrorCode::invalid_argument, "corpus is too large (over 64 MiB): " + path);
+    }
+    in.clear();
+    in.seekg(0, std::ios::beg);
+    std::string text;
+    char buf[64 * 1024];
+    while (in.read(buf, sizeof(buf)) || in.gcount() > 0) {
+        text.append(buf, static_cast<std::size_t>(in.gcount()));
+        if (text.size() > kMaxCorpusFileBytes) {
+            return Status(ErrorCode::invalid_argument, "corpus is too large (over 64 MiB): " + path);
+        }
+    }
+    return parse_corpus(text);
 }
 
 double percentile(std::vector<double> values, double p) {

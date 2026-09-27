@@ -446,6 +446,19 @@ TEST_CASE("options: refused combinations") {
     CHECK(srv::validate_options(o).code() == ErrorCode::invalid_argument);
     o.token = "t";
     CHECK(srv::validate_options(o).ok());
+    // A DNS name that only looks like loopback may resolve to a LAN address:
+    // it needs a token like any other non-loopback bind.
+    o.token.clear();
+    for (const char* host : {"127.0.0.1.attacker.example", "127.evil", "127.0.0.1.", "127.0.0.01", "127.1"}) {
+        CAPTURE(host);
+        o.host = host;
+        CHECK(srv::validate_options(o).code() == ErrorCode::invalid_argument);
+    }
+    for (const char* host : {"127.0.0.1", "127.9.8.7", "localhost", "::1", "[::1]"}) {
+        CAPTURE(host);
+        o.host = host;
+        CHECK(srv::validate_options(o).ok());
+    }
     o.host = "127.0.0.1";
     o.token.clear();
     o.capture_text = true;

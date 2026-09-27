@@ -450,6 +450,9 @@ TEST_CASE("cli env: --ollama-allow-remote refuses plain http to remote hosts") {
     CHECK_FALSE(cli::is_plain_http_remote("https://ollama.example"));
     CHECK_FALSE(cli::is_plain_http_remote("http://127.0.0.1:11434"));
     CHECK_FALSE(cli::is_plain_http_remote("http://127.1.2.3"));
+    // Only IPv4 literals in 127/8 are loopback, not DNS names starting "127.".
+    CHECK(cli::is_plain_http_remote("http://127.0.0.1.attacker.example:11434"));
+    CHECK(cli::is_plain_http_remote("http://127.evil/"));
     CHECK_FALSE(cli::is_plain_http_remote("http://localhost:11434/"));
     CHECK_FALSE(cli::is_plain_http_remote("http://[::1]:11434"));
     CHECK_FALSE(cli::is_plain_http_remote(""));
@@ -460,7 +463,8 @@ TEST_CASE("cli env: --ollama-allow-remote refuses plain http to remote hosts") {
     // every http:// URL the client accepts.
     for (const char* url : {"http://192.0.2.1:11434", "http://ollama.example/x/", "http://[2001:db8::1]:1",
                             "http://LOCALHOST", "http://127.0.0.1:11434", "http://localhost", "http://[::1]:11434",
-                            "http://127.9.9.9:80/api", "HTTP://10.0.0.1", "http://0.0.0.0"}) {
+                            "http://127.9.9.9:80/api", "HTTP://10.0.0.1", "http://0.0.0.0",
+                            "http://127.0.0.1.attacker.example"}) {
         CAPTURE(url);
         auto parsed = net::parse_url(url);
         REQUIRE(parsed.ok());

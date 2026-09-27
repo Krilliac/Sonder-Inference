@@ -8,6 +8,8 @@
 #include <mutex>
 #include <string>
 
+#include "../common/loopback.hpp"
+
 #if defined(SONDER_HAS_TLS)
 #  include <memory>
 
@@ -118,10 +120,9 @@ Result<Url> parse_url(std::string_view text) {
 }
 
 bool is_loopback_host(std::string_view host) {
-    if (host == "localhost" || host == "::1") {
-        return true;
-    }
-    return host.rfind("127.", 0) == 0;
+    // Only names that cannot resolve off this machine (common/loopback.hpp):
+    // a DNS name such as "127.0.0.1.attacker.example" is remote.
+    return sonder::inference::detail::is_loopback_literal(host);
 }
 
 // --------------------------------------------------------- ChunkedDecoder

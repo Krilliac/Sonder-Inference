@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <unordered_map>
 
 namespace sonder::inference::json {
@@ -109,12 +110,33 @@ std::int64_t Value::as_int(std::int64_t fallback) const noexcept {
     return fallback;
 }
 
+std::uint64_t Value::as_uint(std::uint64_t fallback) const noexcept {
+    if (const auto* u = std::get_if<std::uint64_t>(&data_)) {
+        return *u;
+    }
+    if (const auto* i = std::get_if<std::int64_t>(&data_)) {
+        return *i >= 0 ? static_cast<std::uint64_t>(*i) : fallback;
+    }
+    if (const auto* d = std::get_if<double>(&data_)) {
+        // 2^64 is the first out-of-range double. UINT64_MAX itself rounds
+        // to 2^64 as a double, so an inclusive comparison is unsafe.
+        const double kUpperExclusive = std::ldexp(1.0, std::numeric_limits<std::uint64_t>::digits);
+        if (std::isfinite(*d) && *d >= 0.0 && *d < kUpperExclusive) {
+            return static_cast<std::uint64_t>(*d);
+        }
+    }
+    return fallback;
+}
+
 double Value::as_double(double fallback) const noexcept {
     if (const auto* d = std::get_if<double>(&data_)) {
         return *d;
     }
     if (const auto* i = std::get_if<std::int64_t>(&data_)) {
         return static_cast<double>(*i);
+    }
+    if (const auto* u = std::get_if<std::uint64_t>(&data_)) {
+        return static_cast<double>(*u);
     }
     return fallback;
 }
@@ -250,7 +272,9 @@ void Value::dump_to(std::string& out) const {
         case Type::boolean: out += std::get<bool>(data_) ? "true" : "false"; break;
         case Type::integer: {
             char buf[24];
-            auto res = std::to_chars(buf, buf + sizeof(buf), std::get<std::int64_t>(data_));
+            const auto res = data_.index() == kBigUnsigned
+                                 ? std::to_chars(buf, buf + sizeof(buf), std::get<std::uint64_t>(data_))
+                                 : std::to_chars(buf, buf + sizeof(buf), std::get<std::int64_t>(data_));
             out.append(buf, static_cast<std::size_t>(res.ptr - buf));
             break;
         }
@@ -562,7 +586,14 @@ private:
                 out = Value(i);
                 return true;
             }
-            // Out of int64 range: fall through to double.
+            // Above INT64_MAX but within uint64: keep it exact.
+            std::uint64_t u = 0;
+            auto ures = std::from_chars(token.data(), token.data() + token.size(), u);
+            if (ures.ec == std::errc() && ures.ptr == token.data() + token.size()) {
+                out = Value(static_cast<unsigned long long>(u));
+                return true;
+            }
+            // Out of integer range: fall through to double.
         }
         char* end = nullptr;
         const double d = std::strtod(token.c_str(), &end);

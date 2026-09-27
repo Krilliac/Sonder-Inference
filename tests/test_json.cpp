@@ -1,7 +1,10 @@
 #include <doctest/doctest.h>
 
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 
 #include "sonder/inference/json.hpp"
@@ -27,6 +30,44 @@ TEST_CASE("distinguishes integers from doubles") {
     CHECK(v.value().find("e")->as_double() == doctest::Approx(1000.0));
     CHECK(v.value().find("n")->as_int() == -4);
     CHECK(json::Value(3.0).dump() == "3.0");
+}
+
+TEST_CASE("unsigned 64-bit values above INT64_MAX are exact, never negative") {
+    constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
+    const json::Value v(kMax);
+    CHECK(v.is_integer());
+    CHECK(v.dump() == "18446744073709551615");
+    CHECK(json::Value(std::uint64_t{9223372036854775808ull}).dump() == "9223372036854775808");
+    CHECK(json::Value(std::optional<std::uint64_t>(kMax)).dump() == "18446744073709551615");
+    // Values that fit int64 keep the signed representation.
+    CHECK(json::Value(std::uint64_t{42}).dump() == "42");
+    CHECK(json::Value(std::uint64_t{42}).as_int() == 42);
+    // Not representable as int64: the fallback, not a wrapped value.
+    CHECK(v.as_int(-7) == -7);
+    CHECK(v.as_uint() == kMax);
+    CHECK(v.as_double() == doctest::Approx(1.8446744073709552e19));
+    // Parsing keeps it an exact integer, so it round-trips.
+    auto parsed = json::parse("{\"seed\":18446744073709551615}");
+    REQUIRE(parsed.ok());
+    const json::Value* seed = parsed.value().find("seed");
+    REQUIRE(seed != nullptr);
+    CHECK(seed->is_integer());
+    CHECK(seed->as_uint() == kMax);
+    CHECK(parsed.value().dump() == "{\"seed\":18446744073709551615}");
+    CHECK(json::Value(std::int64_t{-5}).as_uint(9) == 9);
+}
+
+TEST_CASE("floating JSON numbers convert throughout the uint64 range") {
+    auto parsed = json::parse("1.82e19");
+    REQUIRE(parsed.ok());
+    CHECK(parsed.value().type() == json::Type::number);
+    CHECK(parsed.value().as_uint(7) == 18200000000000000000ull);
+
+    constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
+    const double upper_exclusive = static_cast<double>(kMax);
+    CHECK(json::Value(std::nextafter(upper_exclusive, 0.0)).as_uint(7) == kMax - 2047);
+    CHECK(json::Value(upper_exclusive).as_uint(7) == 7);
+    CHECK(json::Value(-1.0).as_uint(7) == 7);
 }
 
 TEST_CASE("escapes and unescapes strings") {

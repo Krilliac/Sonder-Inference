@@ -8,6 +8,7 @@
 #include <ctime>
 #include <mutex>
 #include <set>
+#include <system_error>
 #include <string>
 #include <thread>
 #include <utility>
@@ -19,6 +20,8 @@
 #include "live_hub.hpp"
 #include "openai.hpp"
 #include "socket.hpp"
+#include "test_hooks.hpp"
+#include "../../common/loopback.hpp"
 #include "sonder/inference/engine.hpp"
 #include "sonder/inference/json.hpp"
 #include "sonder_inference.h"
@@ -147,12 +150,10 @@ bool is_serialized_origin(std::string_view origin) {
     return true;
 }
 
-bool is_loopback_bind(std::string_view host) {
-    if (host.size() > 2 && host.front() == '[' && host.back() == ']') {
-        host = host.substr(1, host.size() - 2);
-    }
-    return host == "localhost" || host == "::1" || host.rfind("127.", 0) == 0;
-}
+// A bind that can only be reached from this machine. Literal addresses only
+// (plus "localhost"): a DNS name starting with "127." may resolve to a LAN
+// address, and such a bind must require a token like any other.
+bool is_loopback_bind(std::string_view host) { return sonder::inference::detail::is_loopback_literal(host); }
 
 double seconds_since(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
@@ -174,7 +175,18 @@ struct ServedModel {
 struct ConnFlags {
     std::atomic<bool> done{false};
     std::atomic<bool> streaming{false};  // telemetry stream: no engine access
+    // Still reading the request head: nothing authenticated has happened yet,
+    // so the connection may be evicted when the server is at its limit.
+    std::atomic<bool> in_head{true};
+    std::atomic<bool> evict{false};  // set by the accept thread; read_head gives up
+    std::chrono::steady_clock::time_point accepted_at = std::chrono::steady_clock::now();
 };
+
+// A connection still sending its request head after this long may be evicted
+// to make room for a new one when every slot is taken. Legitimate clients send
+// their head in milliseconds; one that dribbles it cannot hold a slot against
+// fresh clients (slowloris).
+constexpr std::chrono::milliseconds kEvictableHeadAge{500};
 
 // One request/response exchange on a connection.
 struct Exchange {
@@ -764,19 +776,64 @@ struct Server::Impl {
         std::condition_variable watch_cv;
         bool watch_done = false;
         std::atomic<bool> disconnected{false};
-        std::thread watcher([&] {
-            std::unique_lock<std::mutex> lock(watch_mu);
-            while (!watch_done) {
-                lock.unlock();
-                if (peer_gone(ex.sock)) {
-                    disconnected.store(true);
-                    session->cancel();
-                    return;
-                }
-                lock.lock();
-                watch_cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return watch_done; });
+        std::thread watcher;
+        // Stops and joins the watcher and leaves `inflight` on every exit,
+        // including an exception out of the chat call: a joinable std::thread
+        // destroyed during unwinding would call std::terminate.
+        bool left_inflight = false;
+        const auto end_request = [&] {
+            {
+                std::lock_guard<std::mutex> lock(watch_mu);
+                watch_done = true;
             }
-        });
+            watch_cv.notify_all();
+            if (watcher.joinable()) {
+                watcher.join();
+            }
+            if (!left_inflight) {
+                left_inflight = true;
+                {
+                    std::lock_guard<std::mutex> lock(inflight_mu);
+                    inflight.erase(session);
+                }
+                inflight_cv.notify_all();
+            }
+        };
+        struct EndRequestGuard {
+            const decltype(end_request)& end;
+            ~EndRequestGuard() { end(); }
+        } end_guard{end_request};
+        try {
+            if (detail::take_watcher_spawn_failure()) {
+                throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+                                        "test hook: watcher thread creation refused");
+            }
+            watcher = std::thread([&] {
+                std::unique_lock<std::mutex> lock(watch_mu);
+                while (!watch_done) {
+                    lock.unlock();
+                    if (peer_gone(ex.sock)) {
+                        disconnected.store(true);
+                        session->cancel();
+                        return;
+                    }
+                    lock.lock();
+                    watch_cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return watch_done; });
+                }
+            });
+        } catch (const std::system_error&) {
+            // The OS refused a thread (thread or memory limits). Nothing ran:
+            // answer 503 for this request instead of taking the server down.
+            end_request();
+            session->close();
+            log_message("warning", "cannot start a request thread; chat request refused (503)");
+            ApiError e = make_error(503, "overloaded",
+                                    "sonder-inference cannot start a request thread right now; nothing was executed, "
+                                    "retry later");
+            e.retry_after = 1;
+            send_error(ex, e);
+            return;
+        }
 
         bool headers_sent = false;
         bool write_failed = false;
@@ -829,18 +886,8 @@ struct Server::Impl {
         }
 
         auto result = session->chat(job.messages, on_chunk, job.sampling, ro);
-        {
-            std::lock_guard<std::mutex> lock(watch_mu);
-            watch_done = true;
-        }
-        watch_cv.notify_all();
-        watcher.join();
+        end_request();
         const bool rejected = session->last_scheduler_rejected();
-        {
-            std::lock_guard<std::mutex> lock(inflight_mu);
-            inflight.erase(session);
-        }
-        inflight_cv.notify_all();
 
         if (disconnected.load() || write_failed) {
             ex.status = 499;  // client closed the request (access log only)
@@ -899,7 +946,8 @@ struct Server::Impl {
 
     // Reads until the head is complete. Returns false when an error response
     // was sent or the connection should just close.
-    bool read_head(Exchange& ex, std::string& buffer, RequestHead& head, std::size_t& head_bytes) {
+    bool read_head(Exchange& ex, std::string& buffer, RequestHead& head, std::size_t& head_bytes,
+                   const ConnFlags& flags) {
         const auto deadline = ex.started + opts.read_timeout;
         char chunk[4096];
         for (;;) {
@@ -917,13 +965,22 @@ struct Server::Impl {
                 send_error(ex, make_error(pr.status, code, pr.message));
                 return false;
             }
+            if (flags.evict.load()) {
+                // Evicted to make room for a new connection (at the limit).
+                send_error(ex, make_error(408, "request_timeout",
+                                          "request headers not received in time (the server is at its connection "
+                                          "limit)"));
+                return false;
+            }
             const auto now = std::chrono::steady_clock::now();
-            const auto w = now >= deadline
-                               ? WaitResult::timeout
-                               : wait_socket(ex.sock, false,
-                                             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now),
-                                             &stopping);
+            // Short slices so an eviction takes effect promptly.
+            const auto slice = std::min(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now),
+                                        std::chrono::milliseconds(50));
+            const auto w = now >= deadline ? WaitResult::timeout : wait_socket(ex.sock, false, slice, &stopping);
             if (w == WaitResult::timeout) {
+                if (std::chrono::steady_clock::now() < deadline) {
+                    continue;
+                }
                 send_error(ex, make_error(408, "request_timeout", "request headers not received in time"));
                 return false;
             }
@@ -995,7 +1052,9 @@ struct Server::Impl {
         std::string buffer;
         RequestHead head;
         std::size_t head_bytes = 0;
-        if (!read_head(ex, buffer, head, head_bytes)) {
+        const bool head_ok = read_head(ex, buffer, head, head_bytes, flags);
+        flags.in_head.store(false);
+        if (!head_ok) {
             if (ex.status != 0) {
                 access_log(ex);
                 sock.shutdown_write();
@@ -1140,6 +1199,44 @@ struct Server::Impl {
 
     // ------------------------------------------------------------ accept
 
+    // At the connection limit: makes room by evicting the oldest connection
+    // that is still sending its request head after kEvictableHeadAge. Evicted
+    // connections leave within one 50 ms wait slice; until then they may take
+    // the process over the limit, never by more than the limit itself.
+    // Connections past their head (authorized work, streams) are never
+    // evicted. Returns true when the new connection may be served.
+    bool evict_slow_head() {
+        std::lock_guard<std::mutex> lock(conns_mu);
+        std::size_t evicting = 0;
+        ConnFlags* oldest = nullptr;
+        const auto now = std::chrono::steady_clock::now();
+        for (const auto& [conn_thread, flags] : conns) {
+            (void)conn_thread;
+            if (flags->done.load()) {
+                continue;
+            }
+            if (flags->evict.load()) {
+                ++evicting;
+                continue;
+            }
+            if (flags->in_head.load() && now - flags->accepted_at >= kEvictableHeadAge &&
+                (oldest == nullptr || flags->accepted_at < oldest->accepted_at)) {
+                oldest = flags.get();
+            }
+        }
+        if (evicting >= opts.max_connections) {
+            return false;
+        }
+        if (active.load() < opts.max_connections + evicting) {
+            return true;  // an eviction already in progress frees this slot
+        }
+        if (oldest == nullptr) {
+            return false;
+        }
+        oldest->evict.store(true);
+        return true;
+    }
+
     void reap_finished() {
         std::vector<std::thread> finished;
         {
@@ -1245,7 +1342,7 @@ struct Server::Impl {
                 failure_reported = false;
                 (void)reserve.acquire();
                 Socket client = std::move(a.socket);
-                if (active.load() >= opts.max_connections) {
+                if (active.load() >= opts.max_connections && !evict_slow_head()) {
                     reject_overloaded(std::move(client),
                                       "connection limit reached (" + std::to_string(opts.max_connections) + ")");
                     continue;
@@ -1254,7 +1351,16 @@ struct Server::Impl {
                 active.fetch_add(1);
                 try {
                     std::thread t([this, flags, s = std::move(client)]() mutable {
-                        serve_connection(std::move(s), *flags);
+                        // Nothing may escape a thread entry point (std::terminate
+                        // would take every in-flight request down): one failed
+                        // request only closes its own connection.
+                        try {
+                            serve_connection(std::move(s), *flags);
+                        } catch (const std::exception& e) {
+                            log_message("error", std::string("request failed with an exception: ") + e.what());
+                        } catch (...) {
+                            log_message("error", "request failed with an unknown exception");
+                        }
                         active.fetch_sub(1);
                         flags->done.store(true);
                     });

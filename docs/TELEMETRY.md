@@ -68,7 +68,7 @@ Types used below: `int` (JSON integer), `num` (JSON number), `str`,
 | --- | --- | --- |
 | `engine.started` | metrics | `version` str, `commit` str, `platform` str, `device_count` int, `text_capture` str (`on` / `off`); optional `server` obj `{host` str, `port` int, `api_version` int`}` when the engine is hosted by `sonder-infer serve` (`EngineOptions::server`) |
 | `engine.stopped` | metrics | none |
-| `scheduler.configured` | metrics | emitted once at engine start when scheduling is active: `kv_block_size_tokens` int, `kv_num_blocks` int, `prefix_caching` bool, `max_running_sequences` int, `max_step_sequences` int, `max_step_tokens` int, `prefill_chunk_tokens` int, `admission_watermark_blocks` int, `max_requeue_count` int |
+| `scheduler.configured` | metrics | emitted once at engine start when scheduling is active: `kv_block_size_tokens` int, `kv_num_blocks` int, `prefix_caching` bool, `max_running_sequences` int, `max_step_sequences` int, `max_step_tokens` int, `prefill_chunk_tokens` int, `admission_watermark_blocks` int, `max_requeue_count` int, `step_stall_timeout_ms` int |
 | `device.memory.sample` | metrics | at start (`sample_devices_on_start`) and every `EngineOptions::device_sample_interval` (default 10 s, 0 disables): `kind` str, `name` str, `logical_cores` int, `total_bytes` int, `available_bytes` int; optional `used_bytes` int. Host memory only; no backend reports VRAM yet |
 | `backend.registered` | metrics | `backend` str, `description` str, `capabilities` arr of str |
 | `model.load.started` | metrics | `backend` str, `model` str |
@@ -144,6 +144,7 @@ correlation id on every per-request event.
 | `scheduler.preempted` | metrics | `scheduler_request_id` int, `reason` str (`kv_pressure` / `priority_admission`), `mode` str (`recompute`), `kv_tokens` int, `beneficiary_scheduler_request_id` int, `preemptions` int, `queue_ms` num (first admission wait), `failed` bool (requeue limit exceeded) |
 | `scheduler.prefill.chunk` | standard | `scheduler_request_id` int, `step` int, `tokens` int, `context_offset` int, `reused_tokens` int, `completes_prefill` bool, `recompute` bool |
 | `scheduler.prefill.completed` | metrics | the scheduler finished planning the prompt (the grant for the first token): `scheduler_request_id` int, `context_tokens` int, `prompt_tokens` int, `reused_tokens` int, `recompute` bool |
+| `scheduler.stalled` | metrics | a granted request did not produce its token within `step_stall_timeout_ms` (a backend still thinking or loading, or a session blocked writing to a slow client); it leaves the step barrier until it produces that token, so the other requests keep running: `scheduler_request_id` int, `step` int, `phase` str (`prefill` / `decode`), `timeout_ms` int |
 | `scheduler.batch.formed` | standard | `step` int, `batch_size` int, `sequences` int (same value, kept for compatibility), `prefill_tokens` int, `decode_tokens` int, `admitted` int, `preempted` int, `running` int |
 | `scheduler.batch.completed` | standard | `step` int, `duration_ms` num, `finished` int |
 

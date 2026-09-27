@@ -50,6 +50,11 @@ struct SchedulerConfig {
     /// the actual movement.
     bool enable_swap = false;
     TokenCount swap_min_tokens = 1024;
+
+    // ---- Statistics ----
+    /// Inter-token gaps retained per workload class for SchedulerStats (the
+    /// most recent ones; a ring). Bounds memory in a long-running engine.
+    std::uint32_t latency_sample_window = 4096;
 };
 
 }  // namespace sonder::inference::scheduler

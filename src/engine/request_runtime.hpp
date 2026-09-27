@@ -4,11 +4,16 @@
 // Model: sessions run their backend call on their own thread; the runtime's
 // coordinator thread plans iteration-level steps with the scheduler and gates
 // every generated token on a scheduler grant (the chunk that completes a
-// prefill, or one decode slot). KV blocks are appended to the cache as the
+// prefill, or one decode slot). A step waits for its grants for at most
+// SchedulingOptions::step_stall_timeout_ms: a request that has not produced
+// its token by then (a backend still thinking or loading, or a session
+// blocked writing to a slow client) is left out of the barrier until it
+// catches up, so it can never freeze the other requests. KV blocks are appended to the cache as the
 // scheduler plans prefill/decode work, and freed when the request ends or is
 // preempted (recompute). See docs/integration/engine-wiring.md.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -33,6 +38,14 @@ struct RuntimeRequestSpec {
     std::uint64_t fingerprint = 0;    // model compatibility (prefix sharing)
 };
 
+struct RuntimeSubmission {
+    std::uint64_t id = 0;
+    // Tokens the request may generate: max_new_tokens clamped to the context
+    // limit and to the KV pool, minus the prompt. Callers cap generation to
+    // this so a smaller num_ctx (or the pool size) is actually honoured.
+    std::uint32_t max_new_tokens = 1;
+};
+
 struct RuntimeRequestSummary {
     std::uint32_t preemptions = 0;
     std::uint64_t reused_prompt_tokens = 0;
@@ -45,7 +58,7 @@ public:
 
     // Registers a request. Errors: invalid_argument (can never fit the KV
     // pool / invalid), internal.
-    virtual Result<std::uint64_t> submit(RuntimeRequestSpec spec) = 0;
+    virtual Result<RuntimeSubmission> submit(RuntimeRequestSpec spec) = 0;
     // Blocks until the scheduler grants the next token. Returns cancelled
     // when `cancel` trips while waiting, unavailable when the request was
     // failed by the scheduler (requeue limit, KV exhaustion) or on shutdown.
@@ -56,6 +69,9 @@ public:
     virtual RuntimeRequestSummary finish(std::uint64_t id, RequestOutcome outcome) = 0;
 
     [[nodiscard]] virtual KvUsage kv_usage() const = 0;
+    // Requests the runtime and its scheduler still hold state for. Returns to
+    // zero once every submitted request has finished (no per-request leak).
+    [[nodiscard]] virtual std::size_t tracked_requests() const = 0;
 };
 
 // Returns null when scheduling is disabled or the modules are not built.
