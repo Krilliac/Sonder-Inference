@@ -552,3 +552,76 @@ TEST_CASE("fixed_kv_capacity_all_or_nothing") {
     CHECK_EQ(blocks_for_tokens(33, 16), 3u);
     CHECK_EQ(blocks_for_tokens(32, 16), 2u);
 }
+
+TEST_CASE("forget_drops_terminal_requests_only") {
+    SimClock clock;
+    FixedKvCapacity kv(100, 16);
+    Scheduler sched(SchedulerConfig{}, clock, kv);
+    CHECK(sched.submit(spec(1, WorkloadClass::InteractiveUser, 16, 2)).accepted);
+    CHECK(sched.submit(spec(2, WorkloadClass::InteractiveUser, 16, 50)).accepted);
+    CHECK_EQ(sched.tracked(), 2u);
+    CHECK_FALSE(sched.forget(1));  // still running
+    step(sched, clock);
+    step(sched, clock);
+    REQUIRE(sched.state(1) == RequestState::Completed);
+    CHECK(sched.forget(1));
+    CHECK_FALSE(sched.forget(1));  // already gone
+    CHECK_FALSE(sched.state(1).has_value());
+    CHECK_EQ(sched.tracked(), 1u);
+    CHECK(sched.cancel(2));
+    CHECK(sched.forget(2));
+    CHECK_EQ(sched.tracked(), 0u);
+    CHECK_FALSE(sched.forget(99));
+    // Counters survive forgetting.
+    CHECK_EQ(sched.stats().per_class[index_of(WorkloadClass::InteractiveUser)].completed, 1u);
+    CHECK(sched.idle());
+}
+
+TEST_CASE("inter_token_samples_are_bounded_by_the_window") {
+    SchedulerConfig cfg;
+    cfg.latency_sample_window = 8;
+    SimClock clock;
+    FixedKvCapacity kv(1000, 16);
+    Scheduler sched(cfg, clock, kv);
+    CHECK(sched.submit(spec(1, WorkloadClass::InteractiveUser, 16, 100)).accepted);
+    step(sched, clock, 1000);  // prefill + first token
+    for (TimeUs i = 1; i < 100; ++i) {
+        step(sched, clock, i);  // gaps 1..99
+    }
+    REQUIRE(sched.state(1) == RequestState::Completed);
+    const auto& c = sched.stats().per_class[index_of(WorkloadClass::InteractiveUser)];
+    CHECK_EQ(c.inter_token.count, 8u);
+    CHECK_EQ(c.inter_token.min, 92);  // only the most recent gaps are kept
+    CHECK_EQ(c.inter_token.max, 99);
+}
+
+TEST_CASE("stalled_work_is_not_accounted_and_is_planned_again") {
+    SimClock clock;
+    FixedKvCapacity kv(100, 16);
+    Scheduler sched(SchedulerConfig{}, clock, kv);
+    CHECK(sched.submit(spec(1, WorkloadClass::InteractiveUser, 16, 4)).accepted);
+    StepOutcome stalled;
+    stalled.stalled.push_back(1);
+    const StepPlan first = step(sched, clock, 1000, stalled);
+    const ScheduledWork* w = find_work(first, 1);
+    REQUIRE(w != nullptr);
+    CHECK(w->completes_prefill);
+    CHECK(sched.state(1) == RequestState::Prefill);  // prefill not accounted
+    CHECK_EQ(sched.timeline(1)->generated_tokens, 0u);
+    const StepPlan again = step(sched, clock);
+    w = find_work(again, 1);
+    REQUIRE(w != nullptr);
+    CHECK(w->phase == Phase::Prefill);
+    CHECK_EQ(w->context_offset, 0u);
+    CHECK(w->completes_prefill);
+    CHECK(sched.state(1) == RequestState::Decode);
+    CHECK_EQ(sched.timeline(1)->generated_tokens, 1u);
+    const StepPlan decode = step(sched, clock, 1000, stalled);
+    w = find_work(decode, 1);
+    REQUIRE(w != nullptr);
+    CHECK(w->phase == Phase::Decode);
+    CHECK_EQ(sched.timeline(1)->generated_tokens, 1u);  // stalled decode: no token
+    const StepPlan retry = step(sched, clock);
+    CHECK_EQ(find_work(retry, 1)->context_offset, w->context_offset);
+    CHECK_EQ(sched.timeline(1)->generated_tokens, 2u);
+}

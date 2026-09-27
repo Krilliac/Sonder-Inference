@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
@@ -503,6 +504,199 @@ TEST_CASE("workload class is reported and higher classes are scheduled") {
     auto created = rig.events_of("session.created");
     REQUIRE_FALSE(created.empty());
     CHECK(attr_str(created.back(), "workload") == "interactive_user");
+}
+
+// --- Stalled requests must not freeze the lock-step scheduler -------------
+
+// A streaming backend (no token logits, like Ollama) whose model "thinks"
+// before its first visible chunk: it emits nothing for `think` and then
+// streams `tokens` chunks. The thinking phase is exactly what a reasoning
+// model, a cold weight load or Ollama queueing looks like to the engine.
+class ThinkingModel final : public BackendModel {
+public:
+    ThinkingModel(std::chrono::milliseconds think, int tokens) : think_(think), tokens_(tokens) {
+        desc_.name = "thinker";
+        desc_.backend = "thinker";
+        desc_.format = "test";
+    }
+    const ModelDescriptor& descriptor() const override { return desc_; }
+    Result<GenerateStats> generate(const GenerateRequest&, const CancellationToken& cancel,
+                                   const TokenCallback& on_chunk) override {
+        const auto until = std::chrono::steady_clock::now() + think_;
+        while (std::chrono::steady_clock::now() < until) {
+            if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled");
+            std::this_thread::sleep_for(1ms);
+        }
+        GenerateStats st;
+        for (int i = 0; i < tokens_; ++i) {
+            const std::string text = " t" + std::to_string(i);
+            if (!on_chunk(TokenChunk{text, st.chunks++})) {
+                st.stop_reason = StopReason::callback;
+                return st;
+            }
+            ++st.completion_tokens;
+        }
+        st.stop_reason = StopReason::end_of_sequence;
+        return st;
+    }
+
+private:
+    ModelDescriptor desc_;
+    std::chrono::milliseconds think_;
+    int tokens_;
+};
+
+class ThinkingBackend final : public Backend {
+public:
+    explicit ThinkingBackend(std::chrono::milliseconds think) : think_(think) {}
+    std::string name() const override { return "thinker"; }
+    std::string description() const override { return "test backend that thinks before streaming"; }
+    BackendCapabilities capabilities() const override {
+        BackendCapabilities c;
+        c.add(Capability::streaming);
+        return c;
+    }
+    Result<std::string> probe() override { return std::string("test"); }
+    Result<std::vector<ModelDescriptor>> list_models() override { return std::vector<ModelDescriptor>{}; }
+    Result<std::shared_ptr<BackendModel>> load_model(const ModelLoadOptions&) override {
+        return std::shared_ptr<BackendModel>(std::make_shared<ThinkingModel>(think_, 4));
+    }
+
+private:
+    std::chrono::milliseconds think_;
+};
+
+TEST_CASE("a backend thinking before its first chunk does not freeze other requests") {
+    MockBackendOptions mock;
+    mock.token_delay = 1ms;
+    mock.default_completion_tokens = 12;
+    Rig rig(mock, {});
+    REQUIRE(rig.model);
+    REQUIRE(rig.engine->register_backend(std::make_shared<ThinkingBackend>(3000ms)).ok());
+    ModelLoadOptions lo;
+    lo.model = "thinker";
+    auto thinker = rig.engine->load_model("thinker", lo);
+    REQUIRE(thinker.ok());
+    SessionOptions so;
+    so.sampling = SamplingConfig::greedy(32);
+    auto slow = rig.engine->create_session(thinker.value(), so);
+    REQUIRE(slow.ok());
+
+    std::optional<Result<GenerationResult>> slow_result;
+    std::thread tb([&] { slow_result.emplace(slow.value()->generate("think hard")); });
+    // The thinker holds a grant it cannot use until its first chunk.
+    REQUIRE(wait_for([&] { return !rig.events_of("scheduler.prefill.completed").empty(); }));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    auto fast = rig.session()->generate("quick question");
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    REQUIRE(fast.ok());
+    CHECK(fast.value().outcome == RequestOutcome::completed);
+    CHECK(fast.value().stats.completion_tokens == 12);
+    // Before the fix the fast request waited for the whole thinking phase.
+    CHECK(elapsed < 2000ms);
+    tb.join();
+    REQUIRE(slow_result->ok());
+    CHECK(slow_result->value().outcome == RequestOutcome::completed);
+    CHECK(slow_result->value().text == " t0 t1 t2 t3");
+    CHECK_FALSE(rig.events_of("scheduler.stalled").empty());
+    auto u = rig.engine->kv_usage();
+    CHECK(u.pinned_blocks == 0);
+    CHECK(u.sequences == 0);
+}
+
+TEST_CASE("a session blocked in its chunk callback (slow client) does not freeze other requests") {
+    MockBackendOptions mock;
+    mock.token_delay = 1ms;
+    mock.default_completion_tokens = 12;
+    Rig rig(mock, {});
+    REQUIRE(rig.model);
+
+    std::atomic<bool> blocked{false};
+    std::optional<Result<GenerationResult>> slow_result;
+    std::thread tb([&] {
+        int chunks = 0;
+        slow_result.emplace(rig.session()->generate("slow reader", [&](const TokenChunk&) {
+            if (++chunks == 2) {
+                blocked.store(true);
+                std::this_thread::sleep_for(3000ms);  // a client that stopped reading
+            }
+            return true;
+        }));
+    });
+    REQUIRE(wait_for([&] { return blocked.load(); }));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    auto fast = rig.session()->generate("fast reader");
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    REQUIRE(fast.ok());
+    CHECK(fast.value().outcome == RequestOutcome::completed);
+    CHECK(fast.value().stats.completion_tokens == 12);
+    CHECK(elapsed < 2000ms);
+    tb.join();
+    REQUIRE(slow_result->ok());
+    CHECK(slow_result->value().outcome == RequestOutcome::completed);
+    CHECK(slow_result->value().stats.completion_tokens == 12);
+    auto u = rig.engine->kv_usage();
+    CHECK(u.pinned_blocks == 0);
+    CHECK(u.sequences == 0);
+}
+
+// --- The context/KV budget caps generation ---------------------------------
+
+TEST_CASE("num_ctx caps generation length on the sampler-chain path") {
+    MockBackendOptions mock;
+    mock.token_logits = true;
+    mock.default_completion_tokens = 1000;  // no natural stop within the test
+    Rig rig(mock, {});
+    REQUIRE(rig.model);
+    auto s = SamplingConfig::greedy(64);
+    s.num_ctx = 12;
+    auto r = rig.session(s)->generate("one two three four five six seven");
+    REQUIRE(r.ok());
+    const auto& g = r.value();
+    REQUIRE(g.scheduling.exact_prompt_tokens);
+    const auto prompt = g.scheduling.accounted_prompt_tokens;
+    REQUIRE(prompt < 12);
+    CHECK(g.stats.completion_tokens <= 12 - prompt);
+    CHECK(g.stats.completion_tokens > 0);
+    CHECK(g.stats.stop_reason == StopReason::max_tokens);
+}
+
+TEST_CASE("num_ctx caps generation length on the backend-streamed path") {
+    MockBackendOptions mock;
+    mock.default_completion_tokens = 1000;
+    Rig rig(mock, {});
+    REQUIRE(rig.model);
+    auto s = SamplingConfig::greedy(64);
+    s.num_ctx = 12;
+    auto r = rig.session(s)->generate("one two three four five six seven");
+    REQUIRE(r.ok());
+    const auto& g = r.value();
+    REQUIRE(g.scheduling.exact_prompt_tokens);
+    const auto prompt = g.scheduling.accounted_prompt_tokens;
+    REQUIRE(prompt < 12);
+    CHECK(g.stats.completion_tokens <= 12 - prompt);
+    CHECK(g.stats.completion_tokens > 0);
+}
+
+TEST_CASE("the KV pool size caps generation length") {
+    MockBackendOptions mock;
+    mock.token_logits = true;
+    mock.default_completion_tokens = 1000;
+    SchedulingOptions sched;
+    sched.kv_block_size_tokens = 4;
+    sched.kv_num_blocks = 6;  // 24 tokens
+    sched.admission_watermark_blocks = 0;
+    Rig rig(mock, sched);
+    REQUIRE(rig.model);
+    auto r = rig.session(SamplingConfig::greedy(200))->generate("one two three four five");
+    REQUIRE(r.ok());
+    const auto& g = r.value();
+    const auto prompt = g.scheduling.accounted_prompt_tokens;
+    REQUIRE(prompt < 24);
+    CHECK(g.stats.completion_tokens <= 24 - prompt);
+    CHECK(g.stats.completion_tokens > 0);
 }
 
 #else

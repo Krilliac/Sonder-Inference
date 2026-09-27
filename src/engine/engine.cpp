@@ -47,7 +47,8 @@ Engine::Engine(EngineOptions options)
                                       {"max_step_tokens", so.max_step_tokens},
                                       {"prefill_chunk_tokens", so.prefill_chunk_tokens},
                                       {"admission_watermark_blocks", so.admission_watermark_blocks},
-                                      {"max_requeue_count", so.max_requeue_count}},
+                                      {"max_requeue_count", so.max_requeue_count},
+                                      {"step_stall_timeout_ms", so.step_stall_timeout_ms}},
                          TelemetryLevel::metrics);
     }
     if (options_.sample_devices_on_start) {

@@ -1,5 +1,6 @@
 #include "sonder/inference/session.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <utility>
 
@@ -291,7 +292,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                                               const std::vector<ChatMessage>* messages, const TokenCallback& on_chunk,
                                               const std::optional<SamplingConfig>& sampling_override,
                                               const RequestOptions& request_options) {
-    const SamplingConfig sampling = sampling_override.value_or(options_.sampling);
+    SamplingConfig sampling = sampling_override.value_or(options_.sampling);
     if (auto st = validate(sampling); !st.ok()) {
         return st;
     }
@@ -403,10 +404,22 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         spec.fingerprint = model_fingerprint(*model_);
         result.scheduling.accounted_prompt_tokens = spec.prompt_tokens.size();
         result.scheduling.exact_prompt_tokens = spec.exact_tokens;
+        const bool exact = spec.exact_tokens;
         auto submitted = runtime->submit(std::move(spec));
         if (submitted.ok()) {
-            sched_id = submitted.value();
+            sched_id = submitted.value().id;
             result.scheduling.scheduled = true;
+            // The runtime clamps the budget to the context window (num_ctx)
+            // and the KV pool. Generation honours it: past it the scheduler
+            // stops gating, so nothing else would stop the request short of
+            // max_tokens. Only with exact prompt tokens; an approximate count
+            // must not truncate a reply the backend itself would allow.
+            const auto budget = static_cast<std::int32_t>(
+                std::min<std::uint32_t>(submitted.value().max_new_tokens, 0x7FFFFFFFu));
+            if (exact && budget > 0 && budget < sampling.max_tokens) {
+                sampling.max_tokens = budget;
+                request.sampling.max_tokens = budget;
+            }
         } else {
             failure = submitted.status();
             pre_failed = true;

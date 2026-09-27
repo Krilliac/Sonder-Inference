@@ -32,9 +32,19 @@ thread that repeats:
    request that completes prefill, or gets a decode slot, receives one token
    credit.
 3. Wait until every granted token has been produced, or its request has
-   finished or failed.
+   finished or failed, for at most `SchedulingOptions::step_stall_timeout_ms`
+   (default 250 ms). A request that misses the deadline (a backend still
+   thinking before its first chunk, a cold model load, a session blocked
+   writing to a slow client) is reported as stalled (`scheduler.stalled`): it
+   gets no new grant and is left out of later barriers until it produces the
+   token it owes, so it can never freeze the other requests. A step in which
+   every planned request is stalled sleeps until one of them makes progress.
 4. `complete_step()`. Requests that finished early (EOS, stop sequence,
-   cancel) are reported as `finished_early`.
+   cancel) are reported as `finished_early`; stalled work is reported as
+   `stalled` and is not accounted (planned again next step). Finished requests
+   are then dropped from the scheduler (`Scheduler::forget`), and inter-token
+   latency samples are a bounded ring (`SchedulerConfig::latency_sample_window`),
+   so a long-running engine holds state only for live requests.
 
 Capacity comes only from the adapter: the scheduler sees free blocks as
 "cache free + evictable − outstanding reservations". The adapter's release
@@ -60,7 +70,12 @@ without the hook one pressure event would preempt every running request.
   `unavailable` (`scheduler.preempted` with `failed: true`).
 - `max_new_tokens` is clamped to the context limit and to the pool. The
   context limit is the model's `context_length`, narrowed by
-  `SamplingConfig::num_ctx` when that is set.
+  `SamplingConfig::num_ctx` when that is set. When the prompt tokens are exact
+  (sampler-chain path, or a backend that tokenizes), the session caps
+  generation at that budget (`SamplingConfig::max_tokens` for the backend
+  call and the sampler loop), so the reply stops with `max_tokens` instead of
+  running on ungated. With an approximate prompt count the backend's own
+  context handling applies.
 
 ### Priority
 

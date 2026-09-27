@@ -44,6 +44,12 @@ struct SchedulingOptions {
     // A request preempted more than this many times fails (ErrorCode::unavailable).
     std::uint32_t max_requeue_count = 8;
     bool enable_priority_preemption = true;
+    // Longest a scheduling step waits for a granted request to produce its
+    // token (0 = 1 ms). A request that misses it is left out of the step
+    // barrier until it produces the token, so one stalled request (a
+    // reasoning model thinking, a cold model load, a session blocked on a
+    // slow client) delays the others by at most this much.
+    std::uint32_t step_stall_timeout_ms = 250;
 };
 
 // Snapshot of the engine's logical KV pool (all zero when inactive).

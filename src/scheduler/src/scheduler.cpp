@@ -86,6 +86,15 @@ bool Scheduler::cancel(RequestId id) {
     return true;
 }
 
+bool Scheduler::forget(RequestId id) {
+    auto it = seqs_.find(id);
+    if (it == seqs_.end() || !is_terminal(it->second.state)) {
+        return false;
+    }
+    seqs_.erase(it);
+    return true;
+}
+
 // ---------------------------------------------------------------- ordering
 
 int Scheduler::running_rank(const Sequence& s) const noexcept { return s.base_rank; }
@@ -228,7 +237,18 @@ void Scheduler::emit_token(Sequence& s, TimeUs now) {
     } else if (s.last_token_time >= 0) {
         const TimeUs gap = now - s.last_token_time;
         s.tl.max_inter_token_gap = std::max(s.tl.max_inter_token_gap, gap);
-        inter_token_samples_[index_of(s.spec.workload)].push_back(gap);
+        const auto cls = index_of(s.spec.workload);
+        auto& samples = inter_token_samples_[cls];
+        const std::size_t window = config_.latency_sample_window;
+        if (window == 0) {
+            // Statistics disabled: keep nothing.
+        } else if (samples.size() < window) {
+            samples.push_back(gap);
+        } else {
+            std::size_t& next = inter_token_next_[cls];
+            samples[next % window] = gap;
+            next = (next + 1) % window;
+        }
     }
     s.last_token_time = now;
 }
@@ -467,6 +487,9 @@ void Scheduler::complete_step(const StepPlan& plan, const StepOutcome& outcome) 
         Sequence& s = it->second;
         // Cancelled (or otherwise finished) after planning: ignore the result.
         if (s.state != RequestState::Prefill && s.state != RequestState::Decode) continue;
+        if (std::find(outcome.stalled.begin(), outcome.stalled.end(), w.id) != outcome.stalled.end()) {
+            continue;  // not executed this step; planned again next step
+        }
 
         if (w.phase == Phase::Prefill) {
             counters_.prefill_tokens += w.num_tokens;
