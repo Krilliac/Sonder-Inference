@@ -1,5 +1,10 @@
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <cstdio>
+#include <fstream>
+#include <string>
+
 #include "sonder/inference/benchmark.hpp"
 #include "test_helpers.hpp"
 
@@ -21,6 +26,30 @@ TEST_CASE("corpus validation") {
         R"({"schema":"sonder.inference.corpus/1","name":"t","prompts":[{"id":"a","prompt":"hi","max_tokens":4}]})");
     REQUIRE(ok.ok());
     CHECK(ok.value().prompts.at(0).max_tokens == 4);
+}
+
+TEST_CASE("an oversized corpus file is refused before it is read") {
+    const std::string path = "bench-oversized-corpus.json";
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        REQUIRE(out);
+        // Valid JSON of limit + 1 bytes: '{' then spaces then '}'.
+        std::string chunk(1u << 20, ' ');
+        out.put('{');
+        std::size_t left = bench::kMaxCorpusFileBytes - 1;
+        while (left > 0) {
+            const std::size_t n = std::min(left, chunk.size());
+            out.write(chunk.data(), static_cast<std::streamsize>(n));
+            left -= n;
+        }
+        out.put('}');
+    }
+    auto c = bench::load_corpus(path);
+    std::remove(path.c_str());
+    REQUIRE_FALSE(c.ok());
+    CHECK(c.status().code() == ErrorCode::invalid_argument);
+    CHECK(c.status().message().find("too large") != std::string::npos);
+    CHECK_FALSE(bench::parse_corpus(std::string(bench::kMaxCorpusFileBytes + 1, ' ')).ok());
 }
 
 TEST_CASE("repository smoke corpus loads") {
