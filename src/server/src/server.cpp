@@ -8,6 +8,7 @@
 #include <ctime>
 #include <mutex>
 #include <set>
+#include <system_error>
 #include <string>
 #include <thread>
 #include <utility>
@@ -19,6 +20,7 @@
 #include "live_hub.hpp"
 #include "openai.hpp"
 #include "socket.hpp"
+#include "test_hooks.hpp"
 #include "sonder/inference/engine.hpp"
 #include "sonder/inference/json.hpp"
 #include "sonder_inference.h"
@@ -764,19 +766,64 @@ struct Server::Impl {
         std::condition_variable watch_cv;
         bool watch_done = false;
         std::atomic<bool> disconnected{false};
-        std::thread watcher([&] {
-            std::unique_lock<std::mutex> lock(watch_mu);
-            while (!watch_done) {
-                lock.unlock();
-                if (peer_gone(ex.sock)) {
-                    disconnected.store(true);
-                    session->cancel();
-                    return;
-                }
-                lock.lock();
-                watch_cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return watch_done; });
+        std::thread watcher;
+        // Stops and joins the watcher and leaves `inflight` on every exit,
+        // including an exception out of the chat call: a joinable std::thread
+        // destroyed during unwinding would call std::terminate.
+        bool left_inflight = false;
+        const auto end_request = [&] {
+            {
+                std::lock_guard<std::mutex> lock(watch_mu);
+                watch_done = true;
             }
-        });
+            watch_cv.notify_all();
+            if (watcher.joinable()) {
+                watcher.join();
+            }
+            if (!left_inflight) {
+                left_inflight = true;
+                {
+                    std::lock_guard<std::mutex> lock(inflight_mu);
+                    inflight.erase(session);
+                }
+                inflight_cv.notify_all();
+            }
+        };
+        struct EndRequestGuard {
+            const decltype(end_request)& end;
+            ~EndRequestGuard() { end(); }
+        } end_guard{end_request};
+        try {
+            if (detail::take_watcher_spawn_failure()) {
+                throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+                                        "test hook: watcher thread creation refused");
+            }
+            watcher = std::thread([&] {
+                std::unique_lock<std::mutex> lock(watch_mu);
+                while (!watch_done) {
+                    lock.unlock();
+                    if (peer_gone(ex.sock)) {
+                        disconnected.store(true);
+                        session->cancel();
+                        return;
+                    }
+                    lock.lock();
+                    watch_cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return watch_done; });
+                }
+            });
+        } catch (const std::system_error&) {
+            // The OS refused a thread (thread or memory limits). Nothing ran:
+            // answer 503 for this request instead of taking the server down.
+            end_request();
+            session->close();
+            log_message("warning", "cannot start a request thread; chat request refused (503)");
+            ApiError e = make_error(503, "overloaded",
+                                    "sonder-inference cannot start a request thread right now; nothing was executed, "
+                                    "retry later");
+            e.retry_after = 1;
+            send_error(ex, e);
+            return;
+        }
 
         bool headers_sent = false;
         bool write_failed = false;
@@ -829,18 +876,8 @@ struct Server::Impl {
         }
 
         auto result = session->chat(job.messages, on_chunk, job.sampling, ro);
-        {
-            std::lock_guard<std::mutex> lock(watch_mu);
-            watch_done = true;
-        }
-        watch_cv.notify_all();
-        watcher.join();
+        end_request();
         const bool rejected = session->last_scheduler_rejected();
-        {
-            std::lock_guard<std::mutex> lock(inflight_mu);
-            inflight.erase(session);
-        }
-        inflight_cv.notify_all();
 
         if (disconnected.load() || write_failed) {
             ex.status = 499;  // client closed the request (access log only)
@@ -1254,7 +1291,16 @@ struct Server::Impl {
                 active.fetch_add(1);
                 try {
                     std::thread t([this, flags, s = std::move(client)]() mutable {
-                        serve_connection(std::move(s), *flags);
+                        // Nothing may escape a thread entry point (std::terminate
+                        // would take every in-flight request down): one failed
+                        // request only closes its own connection.
+                        try {
+                            serve_connection(std::move(s), *flags);
+                        } catch (const std::exception& e) {
+                            log_message("error", std::string("request failed with an exception: ") + e.what());
+                        } catch (...) {
+                            log_message("error", "request failed with an unknown exception");
+                        }
                         active.fetch_sub(1);
                         flags->done.store(true);
                     });
