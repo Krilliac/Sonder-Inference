@@ -111,8 +111,10 @@ include(SonderTls)
 
 # Optional in-tree libFuzzer targets (docs/integration/hardening.md). CI
 # builds fuzz/ standalone instead, so this stays OFF by default.
+# In standalone mode (`cmake -S fuzz`) fuzz/ is the top-level project and
+# already adds this directory; adding fuzz/ again from here would recurse.
 option(SONDER_BUILD_FUZZERS "Build fuzz/ targets (Clang/libFuzzer)" OFF)
-if(SONDER_BUILD_FUZZERS)
+if(SONDER_BUILD_FUZZERS AND NOT CMAKE_SOURCE_DIR STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}/fuzz")
     add_subdirectory(fuzz)
 endif()
 

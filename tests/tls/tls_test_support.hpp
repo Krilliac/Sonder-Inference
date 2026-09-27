@@ -102,10 +102,15 @@ inline CertPtr make_cert(EVP_PKEY* subject_key, const char* cn, X509* issuer, EV
     X509_gmtime_adj(X509_getm_notBefore(cert.get()), -3600);
     X509_gmtime_adj(X509_getm_notAfter(cert.get()), 24 * 3600);
     X509_set_pubkey(cert.get(), subject_key);
-    X509_NAME* name = X509_get_subject_name(cert.get());
-    X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC, reinterpret_cast<const unsigned char*>("Sonder TLS test"), -1,
-                               -1, 0);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char*>(cn), -1, -1, 0);
+    // Build the subject separately: OpenSSL 4 returns a const X509_NAME* from
+    // X509_get_subject_name, so it can no longer be edited in place.
+    std::unique_ptr<X509_NAME, void (*)(X509_NAME*)> name(X509_NAME_new(), X509_NAME_free);
+    check(name != nullptr, "X509_NAME_new");
+    X509_NAME_add_entry_by_txt(name.get(), "O", MBSTRING_ASC,
+                               reinterpret_cast<const unsigned char*>("Sonder TLS test"), -1, -1, 0);
+    X509_NAME_add_entry_by_txt(name.get(), "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char*>(cn), -1, -1,
+                               0);
+    check(X509_set_subject_name(cert.get(), name.get()) == 1, "X509_set_subject_name");
     X509* iss = issuer != nullptr ? issuer : cert.get();
     X509_set_issuer_name(cert.get(), X509_get_subject_name(iss));
     if (is_ca) {
