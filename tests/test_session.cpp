@@ -12,6 +12,27 @@ using namespace sonder::inference;
 using namespace std::chrono_literals;
 
 TEST_SUITE("session") {
+TEST_CASE("telemetry records a 64-bit seed above INT64_MAX exactly") {
+    sonder_test::Harness h({}, TelemetryLevel::metrics);
+    REQUIRE(h.model);
+    auto sampling = SamplingConfig::greedy(4);
+    sampling.seed = 18446744073709551615ull;
+    auto session = h.session(sampling);
+    REQUIRE(session);
+    REQUIRE(session->generate("seeded").ok());
+    h.engine->telemetry().flush();
+    int seen = 0;
+    for (const auto& line : h.sink->lines()) {
+        if (line.find("\"event_type\":\"session.created\"") != std::string::npos ||
+            line.find("\"event_type\":\"request.started\"") != std::string::npos) {
+            CHECK(line.find("\"seed\":18446744073709551615") != std::string::npos);
+            CHECK(line.find("\"seed\":-") == std::string::npos);
+            ++seen;
+        }
+    }
+    CHECK(seen == 2);
+}
+
 TEST_CASE("lifecycle: idle -> running -> idle -> closed") {
     sonder_test::Harness h;
     REQUIRE(h.model);
