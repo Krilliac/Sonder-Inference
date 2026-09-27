@@ -21,7 +21,7 @@ jobs:
           - os: windows-latest
             preset: ci-windows
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
@@ -100,7 +100,7 @@ jobs:
       LLAMACPP_TAG: b11195
       LLAMACPP_SHA256: d9818b7786c8a3b063bac7eb7dc8710e275638f1e288e206720c9e22e7ca216a
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: MSVC developer environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -113,7 +113,7 @@ jobs:
 
       - name: Cache llama.cpp source
         id: llamacpp-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/llamacpp-src
           key: llamacpp-src-${{ env.LLAMACPP_TAG }}-${{ env.LLAMACPP_SHA256 }}
@@ -151,7 +151,7 @@ jobs:
     # recorded in docs/LICENSE_REVIEW.md.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Ninja + OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev
@@ -172,7 +172,7 @@ jobs:
     runs-on: windows-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: MSVC developer environment
         uses: ilammy/msvc-dev-cmd@v1
