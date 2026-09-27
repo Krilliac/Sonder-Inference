@@ -1,12 +1,9 @@
 # `sonder-infer serve`: local HTTP API and live telemetry
 
 Status: implemented in module `src/server` (`SONDER_HAS_SERVER`), ADR-020
-(proposed, awaiting owner sign-off). **The `sonder-infer serve` command line
-is not dispatched yet:** `tools/sonder-infer` belongs to the inf-cli-ux lane,
-and until that lands `sonder-infer serve …` prints `unknown command serve`.
-Today the server is reachable in process through `serve_main()` and `Server`
-(see [Running it](#running-it)); the `sonder-infer serve` examples below
-describe the command once the CLI dispatches it.
+(proposed, awaiting owner sign-off). `sonder-infer serve …` runs the server
+(see [Running it](#running-it)); a build without the server module answers
+`serve` with an error saying so.
 This page is the authoritative reference for the Inference HTTP API v1
 (`api_version` 1, paths under `/v1`). It implements sections 2, 5 (Inference
 side), 6.1 and 7.1 of the Sonder ecosystem integration contract v1
@@ -31,11 +28,10 @@ sonder-infer serve --backend ollama --model llama3.2:3b --model qwen2.5:7b
 sonder-infer serve --backend llamacpp --model-dir ~/models --model tiny.gguf
 ```
 
-The `serve` subcommand is to be dispatched by the CLI (`tools/sonder-infer`,
-pending in the inf-cli-ux lane), which calls
+The CLI (`tools/sonder-infer`) dispatches the `serve` subcommand to
 `sonder::inference::server::serve_main(args, out, err)` from
-`<sonder/inference/server.hpp>`; see [INTEGRATION_NOTES.md](../INTEGRATION_NOTES.md)
-for the CLI wiring. Embedding hosts can run the same server in process with
+`<sonder/inference/server.hpp>`, and builds its backends through the same
+shared `make_backend()` factory. Embedding hosts can run the same server in process with
 `sonder::inference::server::Server` (`ServerOptions`, `start()`, `port()`,
 `stop()`); `ServerOptions::backend_instance` accepts a backend the host built
 itself.
@@ -161,6 +157,7 @@ and `Access-Control-Max-Age: 600` (plus
 | Body over `--max-body-bytes` (checked before reading it) | 413 `payload_too_large` |
 | Headers or body not received within 10 s | 408 `request_timeout` |
 | More than `--max-connections` open connections | 503 `overloaded`, `Retry-After: 1` |
+| The OS refuses to start a chat request's disconnect-watcher thread (thread or memory limits) | 503 `overloaded`, `Retry-After: 1`; nothing was executed and only that request fails |
 | The process is out of file descriptors (`EMFILE`) | 503 `overloaded` ("out of file descriptors") through a reserved descriptor; logged once per episode; the accept loop backs off instead of spinning |
 | `Expect` other than `100-continue` | 417 `expectation_failed` (`param` `Expect`) |
 
@@ -469,14 +466,7 @@ Recorded rather than invented (AGENTS.md):
    `inf-cli-ux` lane, so `serve_main` has its own table-driven parser (strict
    numeric checks, `--key=value`, repeatable `--model`, `--model-dir` and
    `--cors-origin`). Folding both into one parser is left to `inf-cli-ux`.
-2. **Shared backend construction.** `sonder/inference/backend_setup.hpp`
-   (`make_backend`, `backend_env_defaults`, `normalize_ollama_host`) is the
-   shared factory; `tools/sonder-infer/main.cpp` still builds backends itself
-   until the CLI lane adopts it.
-3. **CI smoke for `serve`.** `.github/**` is outside this lane: a job that
-   starts `serve --port 0 --ready-file`, curls health and sends SIGINT should
-   be added by the integrator (see INTEGRATION_NOTES.md).
-4. **Windows.** The Winsock paths mirror `src/net/http_client.cpp` but cannot
+2. **Windows. The Winsock paths mirror `src/net/http_client.cpp` but cannot
    be run in the Linux container; the `ci-windows` job must pass before merge.
-5. **Producers on different hosts.** `mono_ns` merging is same-host (Linux)
+3. **Producers on different hosts.** `mono_ns` merging is same-host (Linux)
    only; cross-host clock alignment is a non-goal for v1.
