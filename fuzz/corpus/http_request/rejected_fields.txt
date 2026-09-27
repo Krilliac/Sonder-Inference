@@ -1,0 +1,5 @@
+POST /v1/chat/completions HTTP/1.1
+Host: 127.0.0.1
+Content-Length: 60
+
+{"messages":[{"role":"user","content":[1]}],"tools":[],"n":2}

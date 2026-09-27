@@ -215,3 +215,40 @@ f5e3ff5): one counter numbers all of an engine's events, so gap detection
 must key on the bus instance, and consumers need to know what a lower level
 would drop. All additions are compatible with envelope v1. Full status in
 [TELEMETRY.md](TELEMETRY.md).
+
+## ADR-020 — Local HTTP boundary with Sonder Runtime (`sonder-infer serve`)
+
+**Date:** 2026-09-26. **Status:** proposed, awaiting owner sign-off
+(ecosystem integration contract v1; the contract review asks for sign-off
+by the owners of all three repositories before this is marked accepted).
+
+**Decision:** Sonder Runtime reaches Sonder Inference over local HTTP served
+by `sonder-infer serve` (module `src/server`, `SONDER_HAS_SERVER`), not
+in-process through the C ABI. The API is an OpenAI-compatible subset plus
+Sonder extensions (health, models, backend identity), versioned as
+`api_version` 1 under `/v1` ([SERVER.md](SERVER.md)). The same listener
+serves live Observatory telemetry as Server-Sent Events and NDJSON with a
+`/.well-known/sonder-telemetry` discovery document. The server is written
+in-house over POSIX sockets and Winsock, like the ADR-013 client.
+
+**Reasons:** a native crash must not take down the Python runtime; one
+listener serves both inference and live telemetry; Runtime already has an
+OpenAI-compatible transport to reuse; and no third-party server code is
+approved (ADR-010, LICENSE_REVIEW.md; cpp-httplib stays test-only).
+
+**Constraints:**
+
+- Loopback by default; a non-loopback bind needs a bearer token. There is no
+  TLS server in v1: remote use needs a TLS-terminating proxy.
+- No WebSocket in v1: browsers cannot send `Authorization` on a WebSocket
+  handshake, and SSE/NDJSON avoid in-house WebSocket framing.
+- Inference never emulates the Ollama API and never presents itself as
+  Ollama.
+- The C ABI is untouched (`SONDER_ABI_VERSION` stays 1). Chat, session
+  metadata and a telemetry callback in the C ABI remain follow-ups.
+- Telemetry stays off the critical path: the live hub is a `TelemetrySink`
+  on the bus writer thread with a bounded ring and bounded per-subscriber
+  queues (drop-oldest, counted).
+
+This resolves the transport item that [SCAFFOLD.md](SCAFFOLD.md) listed as
+undecided.

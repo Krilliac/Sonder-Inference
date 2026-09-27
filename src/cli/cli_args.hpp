@@ -1,10 +1,12 @@
 // sonder-infer CLI helpers: argument parsing, chat message files, and the
 // interactive chat loop. Header-only so the CLI (tools/sonder-infer) and the
 // unit tests (tests/test_cli_args.cpp) share one implementation without a new
-// library target.
+// library target. Per-command option specs live in cli_spec.hpp, checked
+// values and stats in cli_values.hpp (docs/CLI.md).
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <fstream>
 #include <functional>
 #include <istream>
@@ -17,6 +19,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "sonder/inference/backend.hpp"
@@ -24,14 +27,19 @@
 #include "sonder/inference/error.hpp"
 #include "sonder/inference/json.hpp"
 
+#include "cli_spec.hpp"
+#include "cli_values.hpp"
+
 namespace sonder::cli {
 
 namespace si = sonder::inference;
 
-// Options that take no value. Everything else starting with "--" consumes
-// the next argument as its value.
+// Generic parse_args() only: options that take no value. Everything else
+// starting with "--" consumes the next argument as its value. The sonder-infer
+// commands use per-command specs instead (parse_command_args()).
 inline bool is_boolean_flag(std::string_view key) noexcept {
-    return key == "--capture-text" || key == "--markdown";
+    return key == "--capture-text" || key == "--markdown" || key == "--json" || key == "--quiet" ||
+           key == "--ollama-allow-remote";
 }
 
 struct Args {
@@ -39,6 +47,8 @@ struct Args {
     std::map<std::string, std::string> values;  // "--key value" (key without dashes)
     std::vector<std::string> stops;             // repeatable --stop
     std::set<std::string> flags;                // boolean flags (without dashes)
+    std::map<std::string, std::vector<std::string>> lists;  // other repeatable options, in order
+    bool help = false;                          // -h / --help (parse_command_args only)
 
     [[nodiscard]] std::optional<std::string> get(const std::string& key) const {
         auto it = values.find(key);
@@ -46,6 +56,11 @@ struct Args {
         return it->second;
     }
     [[nodiscard]] bool has(const std::string& flag) const { return flags.count(flag) != 0; }
+    [[nodiscard]] std::vector<std::string> all(const std::string& key) const {
+        if (key == "stop") return stops;
+        auto it = lists.find(key);
+        return it == lists.end() ? std::vector<std::string>{} : it->second;
+    }
 };
 
 inline std::optional<Args> parse_args(int argc, const char* const* argv, std::string& error) {
@@ -74,6 +89,31 @@ inline std::optional<Args> parse_args(int argc, const char* const* argv, std::st
             a.stops.push_back(std::move(value));
         } else {
             a.values[key.substr(2)] = std::move(value);
+        }
+    }
+    return a;
+}
+
+// Spec-driven parsing for one command: `args` excludes the program name and
+// the command word. Unknown options fail with a did-you-mean suggestion
+// (cli_spec.hpp); --stop fills `stops`, other repeatable options `lists`.
+// `error` is not prefixed with the command name.
+inline std::optional<Args> parse_command_args(const CommandSpec& spec, const std::vector<std::string>& args,
+                                              std::string& error) {
+    ParsedCommand parsed;
+    if (!parse_command(spec, args, parsed, error)) {
+        return std::nullopt;
+    }
+    Args a;
+    a.command = std::string(spec.name);
+    a.values = std::move(parsed.values);
+    a.flags = std::move(parsed.flags);
+    a.help = parsed.help;
+    for (auto& [key, list] : parsed.lists) {
+        if (key == "stop") {
+            a.stops = std::move(list);
+        } else {
+            a.lists[key] = std::move(list);
         }
     }
     return a;
@@ -208,48 +248,143 @@ inline si::Result<ChatTurnResult> run_chat_turn(si::BackendModel& model, const s
 // One assistant turn over the full history; returns the reply text.
 using ChatTurnFn = std::function<si::Result<std::string>(const std::vector<si::ChatMessage>& history)>;
 
+// One assistant turn with its statistics (run_chat_session()).
+struct ChatTurnReport {
+    std::string text;
+    RequestStats stats;
+    bool cancelled = false;  // the turn was cancelled (Ctrl-C); partial text is discarded
+};
+using ChatReportTurnFn = std::function<si::Result<ChatTurnReport>(const std::vector<si::ChatMessage>& history)>;
+
 struct ChatReplOptions {
-    std::string system;           // optional system prompt
+    std::string system;              // optional system prompt
     std::string user_prompt = "> ";  // printed before each user line (empty = none)
+    std::string assistant_label;     // printed before each reply (empty = none)
+    bool color = false;              // ANSI-color the prompt and label
+    StatsMode stats = StatsMode::none;  // per-turn stats line on `err`
 };
 
+inline constexpr std::string_view kChatReplHelp =
+    "commands:\n"
+    "  /help          this list\n"
+    "  /stats         last turn and session totals\n"
+    "  /reset         clear the history (the system prompt stays)\n"
+    "  /exit, /quit   end the chat (EOF also ends it)\n"
+    "  //text         send \"/text\" as a message\n"
+    "Ctrl-C cancels the current turn.\n";
+
+namespace repl_detail {
+inline std::string paint(const std::string& text, const char* ansi, bool color) {
+    return color ? std::string(ansi) + text + "\x1b[0m" : text;
+}
+}  // namespace repl_detail
+
 // Interactive chat: each non-empty input line is a user message; the reply is
-// produced by `turn` and appended to the history. Commands: /exit, /quit,
-// /reset (clear history, keep the system prompt). Ends at EOF. Returns 0, or
-// 1 when any turn failed (the failed user message is dropped from history).
-inline int run_chat_repl(std::istream& in, std::ostream& out, std::ostream& err, const ChatReplOptions& options,
-                         const ChatTurnFn& turn) {
+// produced by `turn`, streamed by it to `out`, and appended to the history.
+// Commands: see kChatReplHelp; any other line starting with a single '/' is
+// rejected (not sent). A failed turn drops the user message from history; a
+// cancelled turn drops it and the partial reply. Ends at EOF or /exit without
+// leaving a dangling prompt. Returns 0, or 1 when any turn failed.
+inline int run_chat_session(std::istream& in, std::ostream& out, std::ostream& err, const ChatReplOptions& options,
+                            const ChatReportTurnFn& turn) {
     std::vector<si::ChatMessage> history;
     apply_system_prompt(history, options.system);
     const std::size_t base = history.size();
     int rc = 0;
+    std::uint64_t turns = 0, failed = 0, cancelled = 0, prompt_tokens = 0, completion_tokens = 0;
+    std::optional<RequestStats> last;
     std::string line;
     for (;;) {
+        bool prompt_pending = false;
         if (!options.user_prompt.empty()) {
-            out << options.user_prompt;
+            out << repl_detail::paint(options.user_prompt, "\x1b[1;36m", options.color);
             out.flush();
+            prompt_pending = true;
         }
-        if (!std::getline(in, line)) break;
+        if (!std::getline(in, line)) {
+            if (prompt_pending) {
+                out << "\n";
+                out.flush();
+            }
+            break;
+        }
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.find_first_not_of(" \t") == std::string::npos) continue;
-        if (line == "/exit" || line == "/quit") break;
-        if (line == "/reset") {
-            history.resize(base);
-            out << "[history cleared]\n";
+        std::string message = line;
+        if (line.rfind("//", 0) == 0) {
+            message = line.substr(1);
+        } else if (line.front() == '/') {
+            const std::string command = line.substr(0, line.find_first_of(" \t"));
+            if (command == "/exit" || command == "/quit") break;
+            if (command == "/reset") {
+                history.resize(base);
+                out << "[history cleared]\n";
+            } else if (command == "/help") {
+                out << kChatReplHelp;
+            } else if (command == "/stats") {
+                out << "turns=" << turns << " failed=" << failed << " cancelled=" << cancelled
+                    << " prompt_tokens=" << prompt_tokens << " completion_tokens=" << completion_tokens << "\n";
+                if (last) {
+                    out << "last: " << format_stats_text(*last) << "\n";
+                } else {
+                    out << "last: no completed turn yet\n";
+                }
+            } else {
+                err << "unknown command " << command << " (/help lists commands; start with // to send a leading /)\n";
+            }
+            out.flush();
             continue;
         }
-        history.push_back(si::ChatMessage{"user", line});
+        history.push_back(si::ChatMessage{"user", message});
+        if (!options.assistant_label.empty()) {
+            out << repl_detail::paint(options.assistant_label, "\x1b[1;32m", options.color);
+            out.flush();
+        }
         auto reply = turn(history);
         out << "\n";
+        out.flush();
         if (!reply.ok()) {
             err << "error: " << reply.status().to_string() << "\n";
             history.pop_back();
+            ++failed;
             rc = 1;
             continue;
         }
-        history.push_back(si::ChatMessage{"assistant", reply.value()});
+        if (reply.value().cancelled) {
+            err << "[turn cancelled]\n";
+            history.pop_back();
+            ++cancelled;
+            continue;
+        }
+        ++turns;
+        RequestStats st = reply.value().stats;
+        st.turn = turns;
+        prompt_tokens += st.prompt_tokens;
+        completion_tokens += st.completion_tokens;
+        if (options.stats == StatsMode::text) {
+            err << format_stats_text(st) << "\n";
+        } else if (options.stats == StatsMode::json) {
+            err << format_stats_json(st) << "\n";
+        }
+        err.flush();
+        last = std::move(st);
+        history.push_back(si::ChatMessage{"assistant", std::move(reply.value().text)});
     }
     return rc;
+}
+
+// Text-only variant (no stats); same commands and behaviour.
+inline int run_chat_repl(std::istream& in, std::ostream& out, std::ostream& err, const ChatReplOptions& options,
+                         const ChatTurnFn& turn) {
+    return run_chat_session(in, out, err, options,
+                            [&turn](const std::vector<si::ChatMessage>& history) -> si::Result<ChatTurnReport> {
+                                auto text = turn(history);
+                                if (!text.ok()) return text.status();
+                                ChatTurnReport report;
+                                report.text = std::move(text.value());
+                                report.stats.command = "chat";
+                                return report;
+                            });
 }
 
 }  // namespace sonder::cli

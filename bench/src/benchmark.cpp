@@ -227,7 +227,12 @@ json::Object execute(Engine& engine, const std::shared_ptr<Model>& model, const 
     sampling.max_tokens = prompt.max_tokens;
     SessionOptions so;
     so.sampling = sampling;
-    so.run_id = options.label.empty() ? std::optional<std::string>() : options.label;
+    so.run_id = options.run_id ? options.run_id
+                               : (options.label.empty() ? std::optional<std::string>() : options.label);
+    so.agent_id = options.agent_id;
+    so.task_id = options.task_id;
+    so.workload = options.workload;
+    so.priority = options.priority;
     json::Object row{{"prompt_id", prompt.id}, {"workload", prompt.workload}, {"iteration", iteration},
                      {"warmup", warmup}};
     if (child >= 0) {
