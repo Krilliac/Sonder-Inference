@@ -15,8 +15,14 @@
 #  include <fcntl.h>
 #  include <netinet/in.h>
 #  include <sys/resource.h>
+#  include <sys/syscall.h>
 #  include <unistd.h>
 #  include <sys/time.h>
+
+#  include <cstdlib>
+#  include <fstream>
+#  include <map>
+#  include <optional>
 #endif
 
 #include "server_test_support.hpp"
@@ -433,6 +439,65 @@ double cpu_seconds() {
            static_cast<double>(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
 }
 
+// Every other thread's context-switch count, or nothing if any of them is not
+// blocked in the kernel (State S or D in /proc/self/task/<tid>/status).
+std::optional<std::map<long, long long>> blocked_thread_switches(long self) {
+    std::map<long, long long> switches;
+    DIR* d = opendir("/proc/self/task");
+    if (d == nullptr) return std::nullopt;
+    bool all_blocked = true;
+    while (dirent* e = readdir(d)) {
+        if (e->d_name[0] == '.') continue;
+        const long tid = std::atol(e->d_name);
+        if (tid == self) continue;
+        std::ifstream status(std::string("/proc/self/task/") + e->d_name + "/status");
+        std::string line;
+        char state = '?';
+        long long count = 0;
+        while (std::getline(status, line)) {
+            if (line.rfind("State:", 0) == 0) {
+                const auto pos = line.find_first_not_of(" \t", 6);
+                state = pos == std::string::npos ? '?' : line[pos];
+            } else if (line.rfind("voluntary_ctxt_switches:", 0) == 0 ||
+                       line.rfind("nonvoluntary_ctxt_switches:", 0) == 0) {
+                count += std::atoll(line.c_str() + line.find(':') + 1);
+            }
+        }
+        if (state != 'S' && state != 'D') {
+            all_blocked = false;
+            break;
+        }
+        switches[tid] = count;
+    }
+    closedir(d);
+    if (!all_blocked) return std::nullopt;
+    return switches;
+}
+
+// Waits (bounded) until every other thread of the process is parked: blocked
+// in the kernel with an unchanged context-switch count over several samples.
+// clang's UBSan vptr check on std::thread's state object runs in the new
+// thread's start-up code; if a server or engine thread first runs inside the
+// descriptor-exhaustion window, that check cannot create its pipe() and
+// reports a false "invalid vptr". One blocked snapshot is not enough: under
+// ASan a new thread also waits (state S) for its creator before its start-up
+// code, so the counts must stay still too. Returns false if the bound expired.
+bool wait_for_other_threads_parked(std::chrono::milliseconds limit = std::chrono::milliseconds(2000)) {
+    constexpr int kStableSamples = 3;
+    const long self = static_cast<long>(::syscall(SYS_gettid));
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    std::optional<std::map<long, long long>> previous;
+    int stable = 0;
+    for (;;) {
+        auto current = blocked_thread_switches(self);
+        stable = (current && previous && *current == *previous) ? stable + 1 : 0;
+        if (stable + 1 >= kStableSamples) return true;
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        previous = std::move(current);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
 struct NoFileLimit {
     rlimit saved{};
     bool active = false;
@@ -475,6 +540,15 @@ TEST_CASE("descriptor exhaustion: the accept loop answers 503 and does not spin"
             REQUIRE(c.valid());
             clients.push_back(std::move(c));
         }
+        // The telemetry writer can look blocked (state S) while it is briefly
+        // waiting mid-batch on the start-up events; drain it first so it is
+        // idle on its queue rather than still working when the window opens.
+        f.server->engine()->telemetry().flush();
+        // Not a failure: an expired bound only loses the protection against
+        // the UBSan false positive. Reported before the window, so a run that
+        // then aborts inside it still says why.
+        WARN_MESSAGE(wait_for_other_threads_parked(),
+                     "background threads were not all parked within 2 s before the descriptor window");
         NoFileLimit limit(static_cast<rlim_t>(open_descriptors() + 64));
         REQUIRE(limit.active);
         // No doctest assertions while the process is out of descriptors:
