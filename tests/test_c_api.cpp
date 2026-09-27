@@ -1,7 +1,10 @@
 #include <doctest/doctest.h>
 
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <limits>
+#include <sstream>
 #include <string>
 
 #include "sonder_inference.h"
@@ -163,6 +166,50 @@ TEST_CASE("mock generation end to end") {
     CHECK(session2 == nullptr);
     sonder_model_release(model2);
     sonder_engine_destroy(engine);
+}
+
+TEST_CASE("destroying the engine before its sessions is safe (sessions keep the engine alive)") {
+    const std::string path = "c_abi_engine_first.jsonl";
+    std::remove(path.c_str());
+    sonder_engine_options eo;
+    sonder_engine_options_init(&eo);
+    eo.telemetry_level = SONDER_TELEMETRY_METRICS;
+    eo.telemetry_jsonl_path = path.c_str();
+    sonder_engine* engine = nullptr;
+    REQUIRE(sonder_engine_create(&eo, &engine) == SONDER_OK);
+    REQUIRE(sonder_engine_register_mock_backend(engine) == SONDER_OK);
+    sonder_model* model = nullptr;
+    REQUIRE(sonder_model_load(engine, "mock", "mock:tiny", &model) == SONDER_OK);
+    sonder_sampling_config cfg;
+    sonder_sampling_config_init(&cfg);
+    cfg.temperature = 0.0f;
+    cfg.max_tokens = 4;
+    sonder_session* session = nullptr;
+    REQUIRE(sonder_session_create(engine, model, &cfg, &session) == SONDER_OK);
+    sonder_model_release(model);
+
+    // The order the header never forbade: engine first, then its session.
+    sonder_engine_destroy(engine);
+    Count count;
+    sonder_generation_stats stats{};
+    stats.struct_size = sizeof(stats);
+    CHECK(sonder_session_generate(session, "still usable", on_token, &count, &stats) == SONDER_OK);
+    CHECK(stats.outcome == SONDER_OUTCOME_COMPLETED);
+    CHECK(count.chunks == 4);
+    sonder_session_destroy(session);
+
+    // The session closed on a live engine, and the engine stopped after it.
+    std::ifstream in(path);
+    std::stringstream buf;
+    buf << in.rdbuf();
+    const std::string log = buf.str();
+    const auto closed = log.find("\"event_type\":\"session.closed\"");
+    const auto stopped = log.find("\"event_type\":\"engine.stopped\"");
+    CHECK(closed != std::string::npos);
+    CHECK(stopped != std::string::npos);
+    CHECK(closed < stopped);
+    in.close();
+    std::remove(path.c_str());
 }
 
 TEST_CASE("null arguments are rejected") {

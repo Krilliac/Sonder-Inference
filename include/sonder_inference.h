@@ -127,6 +127,8 @@ SONDER_API const char* sonder_last_error_message(void);
 
 SONDER_API void sonder_engine_options_init(sonder_engine_options* options);
 SONDER_API sonder_status sonder_engine_create(const sonder_engine_options* options, sonder_engine** out_engine);
+/* Releases the caller's handle. The engine stops now, or when its last
+ * session handle is destroyed if sessions remain. */
 SONDER_API void sonder_engine_destroy(sonder_engine* engine);
 SONDER_API size_t sonder_engine_device_count(const sonder_engine* engine);
 
@@ -143,7 +145,10 @@ SONDER_API void sonder_model_release(sonder_model* model);
 SONDER_API void sonder_sampling_config_init(sonder_sampling_config* config);
 SONDER_API sonder_status sonder_sampling_config_validate(const sonder_sampling_config* config);
 
-/* sampling may be NULL for defaults. The session keeps the model alive. */
+/* sampling may be NULL for defaults. The session keeps the model and the
+ * engine alive: sonder_engine_destroy() may run before sonder_session_destroy()
+ * (or while a generate call is in progress on another thread); the engine then
+ * stops when its last session is destroyed. */
 SONDER_API sonder_status sonder_session_create(sonder_engine* engine, sonder_model* model,
                                                const sonder_sampling_config* sampling,
                                                sonder_session** out_session);

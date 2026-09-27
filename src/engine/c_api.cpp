@@ -14,13 +14,19 @@
 
 using namespace sonder::inference;
 
+// The engine is shared: every session handle holds a reference, because a
+// Session keeps a plain Engine& and uses the engine's telemetry bus and
+// request runtime until it is destroyed. sonder_engine_destroy() therefore
+// only drops the caller's reference; the engine stops when the last session
+// handle is destroyed (or at once when there are none).
 struct sonder_engine {
-    std::unique_ptr<Engine> engine;
+    std::shared_ptr<Engine> engine;
 };
 struct sonder_model {
     std::shared_ptr<Model> model;
 };
 struct sonder_session {
+    std::shared_ptr<Engine> engine;  // declared first: destroyed after `session`
     std::shared_ptr<Session> session;
 };
 
@@ -162,7 +168,7 @@ sonder_status sonder_engine_create(const sonder_engine_options* options, sonder_
             }
         }
         auto handle = std::make_unique<sonder_engine>();
-        handle->engine = std::make_unique<Engine>(std::move(eo));
+        handle->engine = std::make_shared<Engine>(std::move(eo));
         *out_engine = handle.release();
         return ok();
     });
@@ -278,7 +284,7 @@ sonder_status sonder_session_create(sonder_engine* engine, sonder_model* model, 
         if (!created.ok()) {
             return fail(created.status());
         }
-        *out_session = new sonder_session{std::move(created).value()};
+        *out_session = new sonder_session{engine->engine, std::move(created).value()};
         return ok();
     });
 }
