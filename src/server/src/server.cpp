@@ -1159,7 +1159,13 @@ struct Server::Impl {
     }
 
     // Runs on the accept thread, so it never waits long: the reply is small,
-    // and the lingering drain is limited to what arrives within a few ms.
+    // and the lingering drain is bounded. The reply usually goes out before
+    // the request arrives, so the drain must outlast the client's connect
+    // latency: closing first makes the late request draw an RST, and Windows
+    // then discards the 503 still unread on the client side. On Windows that
+    // latency is often one scheduler tick (~15.6 ms). A client that reads the
+    // reply and closes ends the drain at once; only a silent one costs the
+    // full idle window.
     void reject_overloaded(Socket client, const std::string& reason) {
         Exchange ex;
         ex.sock = client.get();
@@ -1175,7 +1181,7 @@ struct Server::Impl {
         ex.status = 503;
         access_log(ex);
         client.shutdown_write();
-        drain_input(ex.sock, 64u * 1024u, std::chrono::milliseconds(10), std::chrono::milliseconds(10), &hard_stop);
+        drain_input(ex.sock, 64u * 1024u, std::chrono::milliseconds(200), std::chrono::milliseconds(100), &hard_stop);
     }
 
     // Sleeps `d` on the accept thread, waking early when stopping.

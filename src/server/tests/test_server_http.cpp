@@ -289,6 +289,27 @@ TEST_CASE("capacity: connections over --max-connections get 503 overloaded") {
     CHECK(eventually([&] { return get(f.port, "/v1/sonder/health").status == 200; }));
 }
 
+TEST_CASE("capacity: a client that sends its request late still reads the 503") {
+    // The accept thread answers before the request arrives. On Windows a
+    // non-blocking connect often completes one scheduler tick (~15.6 ms)
+    // late, so the request lands after the reply; if the server has already
+    // closed by then, the request draws an RST and Windows discards the 503
+    // still unread in the client's receive buffer.
+    auto o = Fixture::defaults();
+    o.max_connections = 1;
+    Fixture f(o);
+    Conn stream(f.port);
+    stream.send(build_request("GET", "/v1/telemetry/sse?since=now", f.port));
+    std::string acc;
+    REQUIRE(stream.read_until(acc, "retry: 2000"));
+    Conn late(f.port);
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    late.send(build_request("GET", "/v1/sonder/health", f.port));
+    const Reply over = parse_reply(late.read_all(std::chrono::milliseconds(5000)));
+    check_error(over, 503, "service_unavailable", "overloaded");
+    stream.close();
+}
+
 TEST_CASE("startup: health reports starting and requests get 503 not_ready before models load") {
     auto o = Fixture::defaults();
     srv::Server server(o);

@@ -175,9 +175,12 @@ When the server answers before reading the whole request (401, 403, 404,
 reading and discarding the rest of the request for up to 2 s and 16 MiB
 (lingering close) before closing. Clients that write the whole body before
 reading the reply (Python `urllib`) therefore receive the error instead of a
-connection reset. The connection-cap 503 is sent from the accept thread and
-lingers only 10 ms, so a client that sends a large body into a full server
-may still see a reset there.
+connection reset. The connection-cap 503 is sent from the accept thread,
+usually before the request arrives, and lingers for up to 200 ms (ending
+early after 100 ms without input, or as soon as the client closes). That
+covers a client whose connect completes a Windows scheduler tick late, but a
+client that sends a large body into a full server may still see a reset
+there.
 
 ### Errors
 
