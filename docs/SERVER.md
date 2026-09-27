@@ -40,7 +40,7 @@ itself.
 
 | Option | Default | Notes |
 | --- | --- | --- |
-| `--host HOST` | `127.0.0.1` | A non-loopback host requires `--token-file` (exit 2 otherwise). |
+| `--host HOST` | `127.0.0.1` | A non-loopback host requires `--token-file` (exit 2 otherwise). Loopback means `localhost`, `::1` / `[::1]` or an IPv4 literal in 127.0.0.0/8; a DNS name that merely starts with `127.` is not loopback. |
 | `--port N` | `11437` | `0` picks an ephemeral port; the ready file and banner show it. |
 | `--backend mock\|ollama\|llamacpp` | env `SONDER_INFER_BACKEND` | Required. A backend this build does not include is a usage error (exit 2), checked before anything binds. |
 | `--model ID` (repeatable) | env `SONDER_INFER_MODEL` | The first model is the default and also answers to `default`. The mock backend serves `mock` when no model is given; other backends require a model (the error points to `sonder-infer models --backend X`). |
@@ -156,6 +156,7 @@ and `Access-Control-Max-Age: 600` (plus
 | `POST` without `Content-Length`, or with a chunked body | 411 `length_required` |
 | Body over `--max-body-bytes` (checked before reading it) | 413 `payload_too_large` |
 | Headers or body not received within 10 s | 408 `request_timeout` |
+| At `--max-connections`, a new connection arrives while another has spent 500 ms or more without completing its request head | The oldest such connection gets 408 `request_timeout` and the new one is served (slow clients cannot hold every slot). Connections past their head are never evicted. |
 | More than `--max-connections` open connections | 503 `overloaded`, `Retry-After: 1` |
 | The OS refuses to start a chat request's disconnect-watcher thread (thread or memory limits) | 503 `overloaded`, `Retry-After: 1`; nothing was executed and only that request fails |
 | The process is out of file descriptors (`EMFILE`) | 503 `overloaded` ("out of file descriptors") through a reserved descriptor; logged once per episode; the accept loop backs off instead of spinning |

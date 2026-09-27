@@ -175,7 +175,18 @@ struct ServedModel {
 struct ConnFlags {
     std::atomic<bool> done{false};
     std::atomic<bool> streaming{false};  // telemetry stream: no engine access
+    // Still reading the request head: nothing authenticated has happened yet,
+    // so the connection may be evicted when the server is at its limit.
+    std::atomic<bool> in_head{true};
+    std::atomic<bool> evict{false};  // set by the accept thread; read_head gives up
+    std::chrono::steady_clock::time_point accepted_at = std::chrono::steady_clock::now();
 };
+
+// A connection still sending its request head after this long may be evicted
+// to make room for a new one when every slot is taken. Legitimate clients send
+// their head in milliseconds; one that dribbles it cannot hold a slot against
+// fresh clients (slowloris).
+constexpr std::chrono::milliseconds kEvictableHeadAge{500};
 
 // One request/response exchange on a connection.
 struct Exchange {
@@ -935,7 +946,8 @@ struct Server::Impl {
 
     // Reads until the head is complete. Returns false when an error response
     // was sent or the connection should just close.
-    bool read_head(Exchange& ex, std::string& buffer, RequestHead& head, std::size_t& head_bytes) {
+    bool read_head(Exchange& ex, std::string& buffer, RequestHead& head, std::size_t& head_bytes,
+                   const ConnFlags& flags) {
         const auto deadline = ex.started + opts.read_timeout;
         char chunk[4096];
         for (;;) {
@@ -953,13 +965,22 @@ struct Server::Impl {
                 send_error(ex, make_error(pr.status, code, pr.message));
                 return false;
             }
+            if (flags.evict.load()) {
+                // Evicted to make room for a new connection (at the limit).
+                send_error(ex, make_error(408, "request_timeout",
+                                          "request headers not received in time (the server is at its connection "
+                                          "limit)"));
+                return false;
+            }
             const auto now = std::chrono::steady_clock::now();
-            const auto w = now >= deadline
-                               ? WaitResult::timeout
-                               : wait_socket(ex.sock, false,
-                                             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now),
-                                             &stopping);
+            // Short slices so an eviction takes effect promptly.
+            const auto slice = std::min(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now),
+                                        std::chrono::milliseconds(50));
+            const auto w = now >= deadline ? WaitResult::timeout : wait_socket(ex.sock, false, slice, &stopping);
             if (w == WaitResult::timeout) {
+                if (std::chrono::steady_clock::now() < deadline) {
+                    continue;
+                }
                 send_error(ex, make_error(408, "request_timeout", "request headers not received in time"));
                 return false;
             }
@@ -1031,7 +1052,9 @@ struct Server::Impl {
         std::string buffer;
         RequestHead head;
         std::size_t head_bytes = 0;
-        if (!read_head(ex, buffer, head, head_bytes)) {
+        const bool head_ok = read_head(ex, buffer, head, head_bytes, flags);
+        flags.in_head.store(false);
+        if (!head_ok) {
             if (ex.status != 0) {
                 access_log(ex);
                 sock.shutdown_write();
@@ -1176,6 +1199,44 @@ struct Server::Impl {
 
     // ------------------------------------------------------------ accept
 
+    // At the connection limit: makes room by evicting the oldest connection
+    // that is still sending its request head after kEvictableHeadAge. Evicted
+    // connections leave within one 50 ms wait slice; until then they may take
+    // the process over the limit, never by more than the limit itself.
+    // Connections past their head (authorized work, streams) are never
+    // evicted. Returns true when the new connection may be served.
+    bool evict_slow_head() {
+        std::lock_guard<std::mutex> lock(conns_mu);
+        std::size_t evicting = 0;
+        ConnFlags* oldest = nullptr;
+        const auto now = std::chrono::steady_clock::now();
+        for (const auto& [conn_thread, flags] : conns) {
+            (void)conn_thread;
+            if (flags->done.load()) {
+                continue;
+            }
+            if (flags->evict.load()) {
+                ++evicting;
+                continue;
+            }
+            if (flags->in_head.load() && now - flags->accepted_at >= kEvictableHeadAge &&
+                (oldest == nullptr || flags->accepted_at < oldest->accepted_at)) {
+                oldest = flags.get();
+            }
+        }
+        if (evicting >= opts.max_connections) {
+            return false;
+        }
+        if (active.load() < opts.max_connections + evicting) {
+            return true;  // an eviction already in progress frees this slot
+        }
+        if (oldest == nullptr) {
+            return false;
+        }
+        oldest->evict.store(true);
+        return true;
+    }
+
     void reap_finished() {
         std::vector<std::thread> finished;
         {
@@ -1281,7 +1342,7 @@ struct Server::Impl {
                 failure_reported = false;
                 (void)reserve.acquire();
                 Socket client = std::move(a.socket);
-                if (active.load() >= opts.max_connections) {
+                if (active.load() >= opts.max_connections && !evict_slow_head()) {
                     reject_overloaded(std::move(client),
                                       "connection limit reached (" + std::to_string(opts.max_connections) + ")");
                     continue;
