@@ -1,0 +1,15 @@
+version: 2
+# Only GitHub Actions: the library has no package dependencies (the Python
+# bindings declare none), and llama.cpp is pinned deliberately by tag +
+# SHA-256 in src/backends/llamacpp/CMakeLists.txt after a license review
+# (docs/LICENSE_REVIEW.md), so it is bumped by hand, not by Dependabot.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
