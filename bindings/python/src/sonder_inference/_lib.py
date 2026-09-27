@@ -83,6 +83,8 @@ def _declare(lib: ctypes.CDLL) -> None:
     fn("sonder_model_release", None, c.c_void_p)
 
     fn("sonder_sampling_config_init", None, c.POINTER(S.CSamplingConfig))
+    if hasattr(lib, "sonder_sampling_config_init_sized"):
+        fn("sonder_sampling_config_init_sized", None, c.POINTER(S.CSamplingConfig), c.c_size_t)
     fn("sonder_sampling_config_validate", status, c.POINTER(S.CSamplingConfig))
 
     fn("sonder_session_create", status, c.c_void_p, c.c_void_p, c.POINTER(S.CSamplingConfig),
@@ -111,6 +113,16 @@ class Library:
     def version(self) -> str:
         return (self.cdll.sonder_version_string() or b"").decode("utf-8", "replace")
 
+    def init_sampling(self, cfg: "S.CSamplingConfig") -> None:
+        """Library defaults into ``cfg``. Uses the sized initializer when the
+        library has it: the original ``sonder_sampling_config_init`` symbol
+        only initialises the original layout (it cannot know the caller's
+        allocation size), so the appended fields would stay zero."""
+        if self.has_symbol("sonder_sampling_config_init_sized"):
+            self.cdll.sonder_sampling_config_init_sized(ctypes.byref(cfg), ctypes.sizeof(cfg))
+        else:
+            self.cdll.sonder_sampling_config_init(ctypes.byref(cfg))
+
     def has_symbol(self, name: str) -> bool:
         try:
             getattr(self.cdll, name)
@@ -128,7 +140,7 @@ class Library:
         """
         if self._extended_sampling is None:
             cfg = S.CSamplingConfig()
-            self.cdll.sonder_sampling_config_init(ctypes.byref(cfg))
+            self.init_sampling(cfg)
             cfg.struct_size = ctypes.sizeof(S.CSamplingConfig)
             cfg.typical_p = 0.0  # invalid when read
             rc = self.cdll.sonder_sampling_config_validate(ctypes.byref(cfg))

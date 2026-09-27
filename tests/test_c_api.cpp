@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -91,6 +92,56 @@ TEST_CASE("callers built against the original sampling layout still work") {
     CHECK(sonder_sampling_config_validate(&cfg) == SONDER_OK);
     cfg.struct_size = sizeof(LegacySamplingConfig) - 1;
     CHECK(sonder_sampling_config_validate(&cfg) == SONDER_ERROR_INVALID_ARGUMENT);
+}
+
+TEST_CASE("init on an original-layout allocation never writes past it") {
+    // A caller built against the original header allocates only the legacy
+    // layout and calls the exported initializer (not the header macro).
+    struct LegacySamplingConfig {
+        uint32_t struct_size;
+        float temperature;
+        float top_p;
+        int32_t top_k;
+        float min_p;
+        float repeat_penalty;
+        int32_t has_seed;
+        uint64_t seed;
+        int32_t max_tokens;
+    };
+    constexpr std::size_t kLegacy = sizeof(LegacySamplingConfig);
+    static_assert(kLegacy < sizeof(sonder_sampling_config));
+    alignas(sonder_sampling_config) unsigned char buf[sizeof(sonder_sampling_config) + 16];
+    std::memset(buf, 0xA5, sizeof(buf));
+    (sonder_sampling_config_init)(reinterpret_cast<sonder_sampling_config*>(buf));
+    for (std::size_t i = kLegacy; i < sizeof(buf); ++i) {
+        CAPTURE(i);
+        REQUIRE(buf[i] == 0xA5);  // adjacent memory untouched
+    }
+    LegacySamplingConfig legacy;
+    std::memcpy(&legacy, buf, kLegacy);
+    CHECK(legacy.struct_size == kLegacy);
+    CHECK(legacy.max_tokens > 0);
+    CHECK(legacy.has_seed == 0);
+    // The legacy-sized config is usable as is.
+    CHECK(sonder_sampling_config_validate(reinterpret_cast<const sonder_sampling_config*>(buf)) == SONDER_OK);
+
+    // The sized initializer writes exactly what the caller owns.
+    std::memset(buf, 0xA5, sizeof(buf));
+    sonder_sampling_config_init_sized(reinterpret_cast<sonder_sampling_config*>(buf), kLegacy);
+    for (std::size_t i = kLegacy; i < sizeof(buf); ++i) {
+        CAPTURE(i);
+        REQUIRE(buf[i] == 0xA5);
+    }
+    std::memset(buf, 0xA5, sizeof(buf));
+    sonder_sampling_config_init_sized(reinterpret_cast<sonder_sampling_config*>(buf), kLegacy - 1);
+    CHECK(buf[0] == 0xA5);  // too small to hold even the original layout: untouched
+    // Through the header (current callers) the whole current struct is set.
+    sonder_sampling_config cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    sonder_sampling_config_init(&cfg);
+    CHECK(cfg.struct_size == sizeof(sonder_sampling_config));
+    CHECK(cfg.typical_p == doctest::Approx(1.0f));
+    CHECK(cfg.repeat_last_n == 64);
 }
 
 namespace {

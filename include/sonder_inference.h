@@ -142,7 +142,18 @@ SONDER_API sonder_status sonder_model_load(sonder_engine* engine, const char* ba
                                            sonder_model** out_model);
 SONDER_API void sonder_model_release(sonder_model* model);
 
+/* Fills `config` with the library defaults, writing at most `size` bytes
+ * (pass sizeof(*config)). A size covering this header's struct sets every
+ * field and struct_size = sizeof(sonder_sampling_config); a size covering only
+ * the original layout (fields up to max_tokens) sets those and a matching
+ * struct_size; anything smaller is left untouched. */
+SONDER_API void sonder_sampling_config_init_sized(sonder_sampling_config* config, size_t size);
+/* Original entry point, kept for binaries built against the original header:
+ * it initialises only the original layout (it cannot know how much the caller
+ * allocated). Source that includes this header calls the sized form through
+ * the macro below, so it still gets every field. */
 SONDER_API void sonder_sampling_config_init(sonder_sampling_config* config);
+#define sonder_sampling_config_init(config) sonder_sampling_config_init_sized((config), sizeof(*(config)))
 SONDER_API sonder_status sonder_sampling_config_validate(const sonder_sampling_config* config);
 
 /* sampling may be NULL for defaults. The session keeps the model and the
