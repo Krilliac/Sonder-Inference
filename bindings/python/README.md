@@ -57,7 +57,8 @@ with si.Engine(telemetry_level=si.TelemetryLevel.OFF) as engine:
   `outcome == Outcome.CANCELLED`; it does not raise.
 - `SamplingConfig` fields default to `None`, which means "use the library
   default" (the defaults come from `sonder_sampling_config_init`).
-  `SamplingConfig.defaults()` returns them all filled in. `validate()` asks the
+  `SamplingConfig.defaults()` returns them all filled in (the appended fields
+  stay `None` on a library that predates them). `validate()` asks the
   library to check the config.
 - Errors map onto `SonderError` subclasses, one per `sonder_status`. Each also
   subclasses the natural builtin: `InvalidArgumentError(ValueError)`,
@@ -67,6 +68,14 @@ with si.Engine(telemetry_level=si.TelemetryLevel.OFF) as engine:
   and handles are also released at garbage collection. Closing an engine
   closes its sessions and models first. A session keeps its model alive in C,
   so a model may be closed before the sessions created from it.
+- `close()` is thread-safe. Closing a session (or its engine) while
+  `generate()`/`stream()` runs on another thread cancels that request and
+  destroys the C handle only after the call returns; any call on a closed
+  handle raises `InvalidStateError`. Calling `close()` from inside the
+  session's own token callback raises `InvalidStateError`; return `False` or
+  call `cancel()` there instead.
+- Strings passed to the C ABI (prompt, backend, model, paths, URLs) must not
+  contain NUL characters; they raise `ValueError` instead of being truncated.
 
 ## Struct versioning
 

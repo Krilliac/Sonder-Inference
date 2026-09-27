@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import codecs
+import contextlib
 import ctypes
 import enum
 import queue
@@ -243,28 +244,94 @@ class ChatMessage:
 
 
 class _Handle:
-    """Owns one C handle; close() is idempotent and also runs at GC."""
+    """Owns one C handle; close() is idempotent, thread-safe and also runs at GC.
+
+    The C destroy functions free the handle immediately, so destroying it
+    while another thread is inside a C call on it is a use-after-free.
+    Every C call therefore runs inside :meth:`_use`, and :meth:`close`
+    marks the handle closed (new calls raise :class:`InvalidStateError`),
+    interrupts in-flight calls (:meth:`_interrupt`) and destroys only once
+    they have all returned.
+    """
 
     _destroy_fn = ""
+    _INTERRUPT_INTERVAL_S = 0.05
 
     def __init__(self, lib: Library, ptr: int) -> None:
         self._lib = lib
         self._ptr: Optional[int] = ptr
+        self._cond = threading.Condition()
+        self._closing = False
+        self._active: dict[int, int] = {}  # thread ident -> nesting depth of in-flight calls
+        self._destroy_lock = threading.Lock()
         self._finalizer = weakref.finalize(self, getattr(lib.cdll, self._destroy_fn), ctypes.c_void_p(ptr))
 
     @property
     def closed(self) -> bool:
-        return self._ptr is None
+        return self._closing
 
-    def _handle(self) -> ctypes.c_void_p:
-        if self._ptr is None:
-            raise InvalidStateError(f"{type(self).__name__} is closed")
-        return ctypes.c_void_p(self._ptr)
+    @contextlib.contextmanager
+    def _use(self) -> Iterator[ctypes.c_void_p]:
+        """Hold the handle open for the duration of one C call."""
+        tid = threading.get_ident()
+        with self._cond:
+            if self._closing:
+                raise InvalidStateError(f"{type(self).__name__} is closed")
+            self._active[tid] = self._active.get(tid, 0) + 1
+            ptr = self._ptr
+        try:
+            yield ctypes.c_void_p(ptr)
+        finally:
+            with self._cond:
+                if self._active[tid] == 1:
+                    del self._active[tid]
+                else:
+                    self._active[tid] -= 1
+                self._cond.notify_all()
+
+    def _in_own_call(self) -> bool:
+        with self._cond:
+            return threading.get_ident() in self._active
+
+    def _interrupt(self, handle: ctypes.c_void_p) -> None:
+        """Ask in-flight calls to return early (called while they still hold the handle)."""
+
+    def _check_not_reentrant(self) -> None:
+        if self._in_own_call():
+            raise InvalidStateError(
+                f"{type(self).__name__}.close() called from inside one of its own calls "
+                "(e.g. a token callback); return False from the callback or call cancel() instead")
+
+    def _begin_close(self) -> bool:
+        """Refuse new calls. Returns False if the handle was already closing."""
+        with self._cond:
+            first = not self._closing
+            self._closing = True
+            return first
+
+    def _drain(self) -> None:
+        """Interrupt and wait until no call is in flight on this handle."""
+        handle = ctypes.c_void_p(self._ptr)
+        while True:
+            with self._cond:
+                if not self._active:
+                    return
+            self._interrupt(handle)  # the handle is still valid: nothing is destroyed yet
+            with self._cond:
+                if self._active:
+                    self._cond.wait(self._INTERRUPT_INTERVAL_S)
+
+    def _destroy(self) -> None:
+        # Concurrent closers all block here until the one destroy completes.
+        with self._destroy_lock:
+            self._finalizer()
+            self._ptr = None
 
     def close(self) -> None:
-        if self._ptr is not None:
-            self._ptr = None
-            self._finalizer()
+        self._check_not_reentrant()
+        self._begin_close()
+        self._drain()
+        self._destroy()
 
     def __enter__(self):
         return self
@@ -273,7 +340,8 @@ class _Handle:
         self.close()
 
     def __repr__(self) -> str:
-        state = "closed" if self._ptr is None else hex(self._ptr)
+        ptr = self._ptr
+        state = "closed" if self._closing or ptr is None else hex(ptr)
         return f"<{type(self).__name__} {state}>"
 
 
@@ -304,23 +372,27 @@ class Engine(_Handle):
 
     @property
     def device_count(self) -> int:
-        return int(self._lib.cdll.sonder_engine_device_count(self._handle()))
+        with self._use() as h:
+            return int(self._lib.cdll.sonder_engine_device_count(h))
 
     def register_mock_backend(self) -> None:
         """Register the deterministic MOCK backend ("mock"). Tests only."""
-        _check(self._lib, self._lib.cdll.sonder_engine_register_mock_backend(self._handle()))
+        with self._use() as h:
+            _check(self._lib, self._lib.cdll.sonder_engine_register_mock_backend(h))
 
     def register_ollama_backend(self, base_url: Optional[str] = None) -> None:
         url = _cstr("base_url", base_url) if base_url else None
-        _check(self._lib, self._lib.cdll.sonder_engine_register_ollama_backend(self._handle(), url))
+        with self._use() as h:
+            _check(self._lib, self._lib.cdll.sonder_engine_register_ollama_backend(h, url))
 
     def load_model(self, backend: str, model: str) -> "Model":
         backend_b, model_b = _cstr("backend", backend), _cstr("model", model)
         out = ctypes.c_void_p()
-        _check(self._lib, self._lib.cdll.sonder_model_load(
-            self._handle(), backend_b, model_b, ctypes.byref(out)))
-        m = Model(self, out.value)  # type: ignore[arg-type]
-        self._children.add(m)
+        with self._use() as h:
+            _check(self._lib, self._lib.cdll.sonder_model_load(h, backend_b, model_b, ctypes.byref(out)))
+            # Registered before the call is released, so close() cannot miss it.
+            m = Model(self, out.value)  # type: ignore[arg-type]
+            self._children.add(m)
         return m
 
     def create_session(self, model: "Model", sampling: Optional[SamplingConfig] = None) -> "Session":
@@ -328,24 +400,31 @@ class Engine(_Handle):
             raise InvalidArgumentError("model belongs to a different engine")
         marshalled = sampling._to_c(self._lib) if sampling is not None else None
         out = ctypes.c_void_p()
-        _check(self._lib, self._lib.cdll.sonder_session_create(
-            self._handle(), model._handle(),
-            ctypes.byref(marshalled.struct) if marshalled else None, ctypes.byref(out)))
-        s = Session(self, model, out.value, sampling)  # type: ignore[arg-type]
-        self._children.add(s)
+        with self._use() as h, model._use() as mh:
+            _check(self._lib, self._lib.cdll.sonder_session_create(
+                h, mh, ctypes.byref(marshalled.struct) if marshalled else None, ctypes.byref(out)))
+            s = Session(self, model, out.value, sampling)  # type: ignore[arg-type]
+            self._children.add(s)
         return s
 
     def close(self) -> None:
-        if self._ptr is None:
-            return
-        # Sessions before models before the engine.
         children = list(self._children)
+        self._check_not_reentrant()
+        for child in children:
+            child._check_not_reentrant()
+        self._begin_close()
+        # No new engine calls can start; wait for load_model/create_session in
+        # flight so every child they create is registered before we snapshot.
+        self._drain()
+        children = list(self._children)
+        # Sessions (cancelling and waiting for their in-flight calls) before
+        # models before the engine.
         for child in children:
             if isinstance(child, Session):
                 child.close()
         for child in children:
             child.close()
-        super().close()
+        self._destroy()
 
 
 class Model(_Handle):
@@ -379,7 +458,6 @@ class Session(_Handle):
         """
         lib = self._lib
         prompt_b = _cstr("prompt", prompt)
-        handle = self._handle()
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         parts: list[str] = []
         error: list[BaseException] = []
@@ -403,8 +481,11 @@ class Session(_Handle):
         c_callback = S.TOKEN_CALLBACK(trampoline)
         stats = S.CGenerationStats()
         stats.struct_size = ctypes.sizeof(S.CGenerationStats)
-        rc = lib.cdll.sonder_session_generate(handle, prompt_b, c_callback, None,
-                                              ctypes.byref(stats))
+        # close() on another thread cancels this call and destroys the C
+        # session only after it returns (see _Handle).
+        with self._use() as handle:
+            rc = lib.cdll.sonder_session_generate(handle, prompt_b, c_callback, None,
+                                                  ctypes.byref(stats))
         if error:
             raise error[0]
         _check(lib, rc)
@@ -420,11 +501,26 @@ class Session(_Handle):
         """Iterate over chunks as they are produced (generation runs on a
         worker thread). Closing the stream early cancels the request."""
         _cstr("prompt", prompt)  # fail here, not later on the worker thread
+        if self.closed:
+            raise InvalidStateError("Session is closed")
         return TokenStream(self, prompt)
 
     def cancel(self) -> None:
         """Cancel the in-flight request (thread-safe; no-op when idle)."""
-        _check(self._lib, self._lib.cdll.sonder_session_cancel(self._handle()))
+        with self._use() as h:
+            _check(self._lib, self._lib.cdll.sonder_session_cancel(h))
+
+    def _interrupt(self, handle: ctypes.c_void_p) -> None:
+        # Thread-safe in the C ABI; repeated by _drain() until the in-flight
+        # call returns, which also covers a call that had not yet started
+        # its request when the first cancel arrived.
+        self._lib.cdll.sonder_session_cancel(handle)
+
+    def close(self) -> None:
+        """Close the session. A generate()/stream() running on another thread
+        is cancelled, and the C session is destroyed only after it returns.
+        Idempotent and thread-safe; later calls raise InvalidStateError."""
+        super().close()
 
     def chat(self, messages: Iterable[Union[ChatMessage, Mapping[str, str]]],
              on_token: Optional[TokenCallback] = None) -> GenerationResult:
