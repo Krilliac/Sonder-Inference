@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -275,6 +276,26 @@ TEST_CASE("prompt larger than the KV pool is rejected up front") {
     CHECK(r.status().code() == ErrorCode::invalid_argument);
     CHECK(rig.events_of("scheduler.rejected").size() == 1);
     CHECK(rig.engine->kv_usage().sequences == 0);
+}
+
+TEST_CASE("an exact prompt that fills num_ctx is rejected before generation") {
+    for (bool token_logits : {false, true}) {
+        MockBackendOptions mock;
+        mock.token_logits = token_logits;
+        Rig rig(mock, {});
+        REQUIRE(rig.model);
+        auto sampling = SamplingConfig::greedy(8);
+        sampling.num_ctx = 4;
+        // The mock tokenizer adds one BOS token: these prompts count as 4
+        // and 11 tokens, respectively.
+        for (const auto& prompt : {words(3, "ctx"), words(10, "ctx")}) {
+            auto result = rig.session(sampling)->generate(prompt);
+            REQUIRE_FALSE(result.ok());
+            CHECK(result.status().code() == ErrorCode::invalid_argument);
+        }
+        CHECK(rig.events_of("scheduler.rejected").size() == 2);
+        CHECK(rig.engine->kv_usage().sequences == 0);
+    }
 }
 
 #if defined(SONDER_HAS_SAMPLER_CHAIN)

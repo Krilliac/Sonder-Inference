@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <unordered_map>
 
 namespace sonder::inference::json {
@@ -117,7 +118,10 @@ std::uint64_t Value::as_uint(std::uint64_t fallback) const noexcept {
         return *i >= 0 ? static_cast<std::uint64_t>(*i) : fallback;
     }
     if (const auto* d = std::get_if<double>(&data_)) {
-        if (std::isfinite(*d) && *d >= 0.0 && *d <= 1.8e19) {
+        // 2^64 is the first out-of-range double. UINT64_MAX itself rounds
+        // to 2^64 as a double, so an inclusive comparison is unsafe.
+        const double kUpperExclusive = std::ldexp(1.0, std::numeric_limits<std::uint64_t>::digits);
+        if (std::isfinite(*d) && *d >= 0.0 && *d < kUpperExclusive) {
             return static_cast<std::uint64_t>(*d);
         }
     }

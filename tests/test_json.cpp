@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -54,6 +55,19 @@ TEST_CASE("unsigned 64-bit values above INT64_MAX are exact, never negative") {
     CHECK(seed->as_uint() == kMax);
     CHECK(parsed.value().dump() == "{\"seed\":18446744073709551615}");
     CHECK(json::Value(std::int64_t{-5}).as_uint(9) == 9);
+}
+
+TEST_CASE("floating JSON numbers convert throughout the uint64 range") {
+    auto parsed = json::parse("1.82e19");
+    REQUIRE(parsed.ok());
+    CHECK(parsed.value().type() == json::Type::number);
+    CHECK(parsed.value().as_uint(7) == 18200000000000000000ull);
+
+    constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
+    const double upper_exclusive = static_cast<double>(kMax);
+    CHECK(json::Value(std::nextafter(upper_exclusive, 0.0)).as_uint(7) == kMax - 2047);
+    CHECK(json::Value(upper_exclusive).as_uint(7) == 7);
+    CHECK(json::Value(-1.0).as_uint(7) == 7);
 }
 
 TEST_CASE("escapes and unescapes strings") {

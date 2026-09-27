@@ -136,6 +136,14 @@ public:
                                                            " KV tokens but the engine KV pool holds " +
                                                            std::to_string(capacity));
         }
+        if (spec.exact_tokens && spec.context_limit > 0 && prompt >= spec.context_limit) {
+            bus_.emit("scheduler.rejected", spec.context,
+                      json::Object{{"scheduler_request_id", id},
+                                   {"reason", "invalid_request"},
+                                   {"prompt_tokens", prompt}},
+                      TelemetryLevel::metrics);
+            return Status(ErrorCode::invalid_argument, "prompt leaves no room for generation in the context window");
+        }
         std::uint64_t max_new = std::max<std::uint32_t>(1, spec.max_new_tokens);
         if (spec.context_limit > 0) {
             max_new = std::min<std::uint64_t>(max_new, spec.context_limit > prompt ? spec.context_limit - prompt : 1);
