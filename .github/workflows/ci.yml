@@ -146,8 +146,10 @@ jobs:
   # TLS ON (SONDER_WITH_TLS=ON) with the system OpenSSL; runs tests/tls
   # (loopback server, test-time PKI). See docs/integration/tls.md.
   tls-linux:
-    name: ubuntu-latest (TLS, OpenSSL)
-    runs-on: ubuntu-latest
+    name: ubuntu-24.04 (TLS, OpenSSL)
+    # Pinned image: its libssl-dev (OpenSSL 3.0.x) is the reviewed revision
+    # recorded in docs/LICENSE_REVIEW.md.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -183,7 +185,8 @@ jobs:
 
       - name: OpenSSL for the in-test TLS server only
         shell: pwsh
-        run: choco install openssl -y --no-progress
+        # Pinned to the reviewed revision (docs/LICENSE_REVIEW.md).
+        run: choco install openssl --version=4.0.2 -y --no-progress
 
       - name: Configure
         shell: pwsh
