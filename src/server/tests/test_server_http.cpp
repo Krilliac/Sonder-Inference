@@ -510,6 +510,10 @@ TEST_CASE("descriptor exhaustion: the accept loop answers 503 and does not spin"
             REQUIRE(c.valid());
             clients.push_back(std::move(c));
         }
+        // The telemetry writer can look blocked (state S) while it is briefly
+        // waiting mid-batch on the start-up events; drain it first so it is
+        // idle on its queue rather than still working when the window opens.
+        f.server->engine()->telemetry().flush();
         wait_for_other_threads_blocked();
         NoFileLimit limit(static_cast<rlim_t>(open_descriptors() + 64));
         REQUIRE(limit.active);
