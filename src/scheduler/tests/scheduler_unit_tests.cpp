@@ -589,7 +589,9 @@ TEST_CASE("inter_token_samples_are_bounded_by_the_window") {
         step(sched, clock, i);  // gaps 1..99
     }
     REQUIRE(sched.state(1) == RequestState::Completed);
-    const auto& c = sched.stats().per_class[index_of(WorkloadClass::InteractiveUser)];
+    // stats() returns a snapshot by value: keep it alive, then refer into it.
+    const SchedulerStats stats = sched.stats();
+    const auto& c = stats.per_class[index_of(WorkloadClass::InteractiveUser)];
     CHECK_EQ(c.inter_token.count, 8u);
     CHECK_EQ(c.inter_token.min, 92);  // only the most recent gaps are kept
     CHECK_EQ(c.inter_token.max, 99);
