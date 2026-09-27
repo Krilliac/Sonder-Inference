@@ -17,7 +17,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: hardening-${{ github.ref }}
+  group: hardening-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
