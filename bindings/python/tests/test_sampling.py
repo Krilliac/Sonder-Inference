@@ -1,3 +1,4 @@
+import ctypes
 import math
 
 import pytest
@@ -95,6 +96,30 @@ def test_old_library_rejects_extended_fields_client_side(lib, monkeypatch):
     assert c.struct_size == S.SAMPLING_CONFIG_V1_SIZE
     with pytest.raises(si.UnsupportedError, match="predates"):
         si.SamplingConfig(num_ctx=1024)._to_c(lib)
+
+
+def test_defaults_from_pre_extension_library_leave_appended_fields_unset(lib, monkeypatch):
+    # A pre-extension ABI-v1 library's init writes only the original prefix,
+    # leaving the appended fields zeroed (typical_p=0.0 is invalid).
+    # (typical_p sits inside the V1 struct's tail padding, so the old
+    # library's `*config = {}` zeroes it.)
+    real_init = lib.cdll.sonder_sampling_config_init
+    tail = S.CSamplingConfig.typical_p.offset
+
+    def old_init(ptr):
+        real_init(ptr)
+        c = ptr._obj
+        ctypes.memset(ctypes.addressof(c) + tail, 0, ctypes.sizeof(c) - tail)
+        c.struct_size = S.SAMPLING_CONFIG_V1_SIZE
+
+    monkeypatch.setattr(lib.cdll, "sonder_sampling_config_init", old_init)
+    monkeypatch.setattr(lib, "_extended_sampling", False)
+    d = si.SamplingConfig.defaults(lib)
+    assert d.temperature == pytest.approx(0.8) and d.top_k == 40
+    for name in ("typical_p", "presence_penalty", "frequency_penalty", "repeat_last_n", "num_ctx"):
+        assert getattr(d, name) is None, name
+    assert not d.uses_extended_fields()
+    d.validate(lib)  # must not raise UnsupportedError
 
 
 def test_to_dict_and_replace():

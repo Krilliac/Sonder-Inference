@@ -118,15 +118,25 @@ class SamplingConfig:
 
     @classmethod
     def defaults(cls, library: Optional[Library] = None) -> "SamplingConfig":
-        """The library's defaults, every field filled in."""
+        """The library's defaults, every supported field filled in.
+
+        Against a library that predates the appended fields (see
+        ``Library.supports_extended_sampling``) those fields stay ``None``:
+        its init never wrote them, and setting them would make the config
+        unusable with that library.
+        """
         lib = library or get_library()
         c = S.CSamplingConfig()
         lib.cdll.sonder_sampling_config_init(ctypes.byref(c))
-        return cls(temperature=c.temperature, top_p=c.top_p, top_k=c.top_k, min_p=c.min_p,
-                   repeat_penalty=c.repeat_penalty, seed=None, max_tokens=c.max_tokens,
-                   typical_p=c.typical_p, presence_penalty=c.presence_penalty,
-                   frequency_penalty=c.frequency_penalty, repeat_last_n=c.repeat_last_n,
-                   num_ctx=c.num_ctx, logit_bias=None)
+        cfg = cls(temperature=c.temperature, top_p=c.top_p, top_k=c.top_k, min_p=c.min_p,
+                  repeat_penalty=c.repeat_penalty, seed=None, max_tokens=c.max_tokens)
+        if lib.supports_extended_sampling:
+            cfg.typical_p = c.typical_p
+            cfg.presence_penalty = c.presence_penalty
+            cfg.frequency_penalty = c.frequency_penalty
+            cfg.repeat_last_n = c.repeat_last_n
+            cfg.num_ctx = c.num_ctx
+        return cfg
 
     def replace(self, **changes: Any) -> "SamplingConfig":
         return replace(self, **changes)
