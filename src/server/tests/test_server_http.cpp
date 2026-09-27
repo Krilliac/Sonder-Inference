@@ -531,7 +531,6 @@ TEST_CASE("descriptor exhaustion: the accept loop answers 503 and does not spin"
     int connected = 0;
     int answered = 0;
     double idle_cpu = 0.0;
-    bool threads_parked = false;
     {
         // Client sockets are created first, so connecting them later needs no
         // descriptor: the connections then wait in the backlog while the
@@ -545,7 +544,11 @@ TEST_CASE("descriptor exhaustion: the accept loop answers 503 and does not spin"
         // waiting mid-batch on the start-up events; drain it first so it is
         // idle on its queue rather than still working when the window opens.
         f.server->engine()->telemetry().flush();
-        threads_parked = wait_for_other_threads_parked();
+        // Not a failure: an expired bound only loses the protection against
+        // the UBSan false positive. Reported before the window, so a run that
+        // then aborts inside it still says why.
+        WARN_MESSAGE(wait_for_other_threads_parked(),
+                     "background threads were not all parked within 2 s before the descriptor window");
         NoFileLimit limit(static_cast<rlim_t>(open_descriptors() + 64));
         REQUIRE(limit.active);
         // No doctest assertions while the process is out of descriptors:
@@ -587,9 +590,6 @@ TEST_CASE("descriptor exhaustion: the accept loop answers 503 and does not spin"
         filled = fillers.size();
         for (const int fd : fillers) ::close(fd);
     }
-    // Not a failure: without it the test only loses its protection against
-    // the UBSan false positive, so say so instead of passing silently.
-    WARN_MESSAGE(threads_parked, "background threads were not all parked within 2 s before the descriptor window");
     CHECK(filled >= 8);
     CHECK(connected == 3);
     CHECK(answered == 3);
