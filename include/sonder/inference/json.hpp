@@ -3,6 +3,7 @@
 // emitted envelopes are stable and diffable.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <optional>
@@ -55,8 +56,15 @@ public:
     Value(long i) : data_(static_cast<std::int64_t>(i)) {}     // NOLINT
     Value(long long i) : data_(static_cast<std::int64_t>(i)) {}  // NOLINT
     Value(unsigned i) : data_(static_cast<std::int64_t>(i)) {}   // NOLINT
-    Value(unsigned long i) : data_(static_cast<std::int64_t>(i)) {}  // NOLINT
-    Value(unsigned long long i) : data_(static_cast<std::int64_t>(i)) {}  // NOLINT
+    // Unsigned values above INT64_MAX are kept exactly (never wrapped negative).
+    Value(unsigned long i) : Value(static_cast<unsigned long long>(i)) {}  // NOLINT
+    Value(unsigned long long i) {                                          // NOLINT
+        if (i <= static_cast<unsigned long long>(INT64_MAX)) {
+            data_ = static_cast<std::int64_t>(i);
+        } else {
+            data_ = static_cast<std::uint64_t>(i);
+        }
+    }
     Value(double d) : data_(d) {}                              // NOLINT
     Value(float d) : data_(static_cast<double>(d)) {}          // NOLINT
     Value(const char* s) : data_(std::string(s)) {}            // NOLINT
@@ -71,7 +79,10 @@ public:
         }
     }
 
-    [[nodiscard]] Type type() const noexcept { return static_cast<Type>(data_.index()); }
+    // Integers above INT64_MAX are stored separately but are still integers.
+    [[nodiscard]] Type type() const noexcept {
+        return data_.index() == kBigUnsigned ? Type::integer : static_cast<Type>(data_.index());
+    }
     [[nodiscard]] bool is_null() const noexcept { return type() == Type::null; }
     [[nodiscard]] bool is_bool() const noexcept { return type() == Type::boolean; }
     [[nodiscard]] bool is_integer() const noexcept { return type() == Type::integer; }
@@ -81,7 +92,10 @@ public:
     [[nodiscard]] bool is_object() const noexcept { return type() == Type::object; }
 
     [[nodiscard]] bool as_bool(bool fallback = false) const noexcept;
+    // An integer above INT64_MAX is out of range: returns `fallback`.
     [[nodiscard]] std::int64_t as_int(std::int64_t fallback = 0) const noexcept;
+    // Non-negative integers up to UINT64_MAX; `fallback` otherwise.
+    [[nodiscard]] std::uint64_t as_uint(std::uint64_t fallback = 0) const noexcept;
     [[nodiscard]] double as_double(double fallback = 0.0) const noexcept;
     [[nodiscard]] const std::string& as_string() const;  // empty string if not a string
     [[nodiscard]] const Array& as_array() const;         // empty array if not an array
@@ -96,7 +110,9 @@ public:
     void dump_to(std::string& out) const;
 
 private:
-    std::variant<std::nullptr_t, bool, std::int64_t, double, std::string, Array, Object> data_{nullptr};
+    // Alternatives 0..6 follow Type; the last holds integers above INT64_MAX.
+    static constexpr std::size_t kBigUnsigned = 7;
+    std::variant<std::nullptr_t, bool, std::int64_t, double, std::string, Array, Object, std::uint64_t> data_{nullptr};
 };
 
 // Parses exactly one JSON document (surrounding whitespace allowed).

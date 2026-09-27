@@ -24,6 +24,7 @@
 
 #if defined(SONDER_HAS_SERVER)
 #include "sonder/inference/backend_setup.hpp"
+#include "../common/loopback.hpp"
 #endif
 
 namespace sonder::cli {
@@ -122,7 +123,8 @@ inline EnvDefaults read_env_defaults(const EnvLookup& lookup = {}) {
 // whose host is not loopback; https:// and loopback hosts return false.
 // Host extraction and the loopback rule mirror the Ollama client
 // (net::parse_url() and net::is_loopback_host() in src/net/http_client.cpp):
-// "localhost", "::1" and any host starting with "127.". URLs the client
+// "localhost", "::1" and IPv4 literals in 127.0.0.0/8 (src/common/loopback.hpp;
+// a DNS name that merely starts with "127." is remote). URLs the client
 // rejects anyway (no scheme, no host, an unterminated IPv6 literal) return
 // false so the client's own error is reported.
 // tests/test_cli_spec.cpp checks this agrees with the client's functions.
@@ -144,7 +146,7 @@ inline bool is_plain_http_remote(std::string_view url) {
         host = authority.substr(0, authority.rfind(':'));
     }
     if (host.empty()) return false;  // the client rejects it ("URL has no host")
-    const bool loopback = host == "localhost" || host == "::1" || host.rfind("127.", 0) == 0;
+    const bool loopback = sonder::inference::detail::is_loopback_literal(host);
     return !loopback;
 }
 

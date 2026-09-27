@@ -10,6 +10,7 @@ sonder_add_module_tests(core
     test_c_api.cpp
     test_kv_capacity_adapter.cpp
     test_engine_runtime.cpp
+    test_runtime_tracking.cpp
     test_chat.cpp
     test_cli_args.cpp
     test_cli_spec.cpp

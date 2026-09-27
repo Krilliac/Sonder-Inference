@@ -127,6 +127,8 @@ SONDER_API const char* sonder_last_error_message(void);
 
 SONDER_API void sonder_engine_options_init(sonder_engine_options* options);
 SONDER_API sonder_status sonder_engine_create(const sonder_engine_options* options, sonder_engine** out_engine);
+/* Releases the caller's handle. The engine stops now, or when its last
+ * session handle is destroyed if sessions remain. */
 SONDER_API void sonder_engine_destroy(sonder_engine* engine);
 SONDER_API size_t sonder_engine_device_count(const sonder_engine* engine);
 
@@ -140,10 +142,24 @@ SONDER_API sonder_status sonder_model_load(sonder_engine* engine, const char* ba
                                            sonder_model** out_model);
 SONDER_API void sonder_model_release(sonder_model* model);
 
+/* Fills `config` with the library defaults, writing at most `size` bytes
+ * (pass sizeof(*config)). A size covering this header's struct sets every
+ * field and struct_size = sizeof(sonder_sampling_config); a size covering only
+ * the original layout (fields up to max_tokens) sets those and a matching
+ * struct_size; anything smaller is left untouched. */
+SONDER_API void sonder_sampling_config_init_sized(sonder_sampling_config* config, size_t size);
+/* Original entry point, kept for binaries built against the original header:
+ * it initialises only the original layout (it cannot know how much the caller
+ * allocated). Source that includes this header calls the sized form through
+ * the macro below, so it still gets every field. */
 SONDER_API void sonder_sampling_config_init(sonder_sampling_config* config);
+#define sonder_sampling_config_init(config) sonder_sampling_config_init_sized((config), sizeof(*(config)))
 SONDER_API sonder_status sonder_sampling_config_validate(const sonder_sampling_config* config);
 
-/* sampling may be NULL for defaults. The session keeps the model alive. */
+/* sampling may be NULL for defaults. The session keeps the model and the
+ * engine alive: sonder_engine_destroy() may run before sonder_session_destroy()
+ * (or while a generate call is in progress on another thread); the engine then
+ * stops when its last session is destroyed. */
 SONDER_API sonder_status sonder_session_create(sonder_engine* engine, sonder_model* model,
                                                const sonder_sampling_config* sampling,
                                                sonder_session** out_session);

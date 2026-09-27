@@ -99,20 +99,18 @@ def test_old_library_rejects_extended_fields_client_side(lib, monkeypatch):
 
 
 def test_defaults_from_pre_extension_library_leave_appended_fields_unset(lib, monkeypatch):
-    # A pre-extension ABI-v1 library's init writes only the original prefix,
-    # leaving the appended fields zeroed (typical_p=0.0 is invalid).
-    # (typical_p sits inside the V1 struct's tail padding, so the old
-    # library's `*config = {}` zeroes it.)
+    # A pre-extension ABI-v1 library's init writes only the original prefix
+    # and leaves the appended fields as they were. The original
+    # sonder_sampling_config_init symbol of a current library does the same
+    # (it cannot know the caller's allocation), so it stands in for one here,
+    # over a struct pre-filled with garbage.
     real_init = lib.cdll.sonder_sampling_config_init
-    tail = S.CSamplingConfig.typical_p.offset
 
-    def old_init(ptr):
-        real_init(ptr)
-        c = ptr._obj
-        ctypes.memset(ctypes.addressof(c) + tail, 0, ctypes.sizeof(c) - tail)
-        c.struct_size = S.SAMPLING_CONFIG_V1_SIZE
+    def old_init(c):
+        ctypes.memset(ctypes.addressof(c), 0x5A, ctypes.sizeof(c))
+        real_init(ctypes.byref(c))
 
-    monkeypatch.setattr(lib.cdll, "sonder_sampling_config_init", old_init)
+    monkeypatch.setattr(lib, "init_sampling", old_init)
     monkeypatch.setattr(lib, "_extended_sampling", False)
     d = si.SamplingConfig.defaults(lib)
     assert d.temperature == pytest.approx(0.8) and d.top_k == 40

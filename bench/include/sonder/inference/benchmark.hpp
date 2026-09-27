@@ -8,6 +8,7 @@
 // results document into a human-readable summary.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -52,6 +53,9 @@ struct Corpus {
     std::string fnv1a;  // hex hash of the corpus bytes (provenance)
     std::vector<Prompt> prompts;
 };
+
+// Largest corpus JSON accepted (checked before reading or parsing it).
+inline constexpr std::size_t kMaxCorpusFileBytes = 64u << 20;
 
 Result<Corpus> parse_corpus(std::string_view json_text);
 Result<Corpus> load_corpus(const std::string& path);

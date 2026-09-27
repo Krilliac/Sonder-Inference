@@ -65,6 +65,11 @@ struct StepPlan {
 struct StepOutcome {
     /// Sequences that emitted an end-of-sequence token this step.
     std::vector<RequestId> finished_early;
+    /// Sequences that did not execute their planned work this step (the
+    /// backend had not produced the token yet when the engine closed the
+    /// step). Their work is not accounted: no prefill progress, no KV growth,
+    /// no token. The next plan schedules them again.
+    std::vector<RequestId> stalled;
 };
 
 struct SubmitResult {
@@ -85,6 +90,16 @@ public:
     /// Cancel a queued or running request, releasing its KV immediately.
     /// Returns false for unknown, terminal, or non-cancellable requests.
     bool cancel(RequestId id);
+
+    /// Drop a terminal request's bookkeeping (sequence, timeline). Engines
+    /// that run indefinitely call this once they no longer need the request,
+    /// so memory stays bounded by live requests. Returns false for unknown or
+    /// non-terminal requests. Counters in stats() are unaffected; per-request
+    /// latency summaries then cover only requests not yet forgotten.
+    bool forget(RequestId id);
+
+    /// Requests currently tracked (live plus terminal, not yet forgotten).
+    [[nodiscard]] std::size_t tracked() const noexcept { return seqs_.size(); }
 
     /// Plan the next engine step. Throws std::logic_error if a plan is in flight.
     [[nodiscard]] StepPlan plan_step();
@@ -171,7 +186,9 @@ private:
 
     // Live counters.
     SchedulerStats counters_;
+    // Most recent inter-token gaps per class (ring of latency_sample_window).
     PerClass<std::vector<TimeUs>> inter_token_samples_{};
+    PerClass<std::size_t> inter_token_next_{};
 };
 
 }  // namespace sonder::inference::scheduler

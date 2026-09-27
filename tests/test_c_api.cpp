@@ -1,7 +1,11 @@
 #include <doctest/doctest.h>
 
+#include <cstddef>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <limits>
+#include <sstream>
 #include <string>
 
 #include "sonder_inference.h"
@@ -90,6 +94,56 @@ TEST_CASE("callers built against the original sampling layout still work") {
     CHECK(sonder_sampling_config_validate(&cfg) == SONDER_ERROR_INVALID_ARGUMENT);
 }
 
+TEST_CASE("init on an original-layout allocation never writes past it") {
+    // A caller built against the original header allocates only the legacy
+    // layout and calls the exported initializer (not the header macro).
+    struct LegacySamplingConfig {
+        uint32_t struct_size;
+        float temperature;
+        float top_p;
+        int32_t top_k;
+        float min_p;
+        float repeat_penalty;
+        int32_t has_seed;
+        uint64_t seed;
+        int32_t max_tokens;
+    };
+    constexpr std::size_t kLegacy = sizeof(LegacySamplingConfig);
+    static_assert(kLegacy < sizeof(sonder_sampling_config));
+    alignas(sonder_sampling_config) unsigned char buf[sizeof(sonder_sampling_config) + 16];
+    std::memset(buf, 0xA5, sizeof(buf));
+    (sonder_sampling_config_init)(reinterpret_cast<sonder_sampling_config*>(buf));
+    for (std::size_t i = kLegacy; i < sizeof(buf); ++i) {
+        CAPTURE(i);
+        REQUIRE(buf[i] == 0xA5);  // adjacent memory untouched
+    }
+    LegacySamplingConfig legacy;
+    std::memcpy(&legacy, buf, kLegacy);
+    CHECK(legacy.struct_size == kLegacy);
+    CHECK(legacy.max_tokens > 0);
+    CHECK(legacy.has_seed == 0);
+    // The legacy-sized config is usable as is.
+    CHECK(sonder_sampling_config_validate(reinterpret_cast<const sonder_sampling_config*>(buf)) == SONDER_OK);
+
+    // The sized initializer writes exactly what the caller owns.
+    std::memset(buf, 0xA5, sizeof(buf));
+    sonder_sampling_config_init_sized(reinterpret_cast<sonder_sampling_config*>(buf), kLegacy);
+    for (std::size_t i = kLegacy; i < sizeof(buf); ++i) {
+        CAPTURE(i);
+        REQUIRE(buf[i] == 0xA5);
+    }
+    std::memset(buf, 0xA5, sizeof(buf));
+    sonder_sampling_config_init_sized(reinterpret_cast<sonder_sampling_config*>(buf), kLegacy - 1);
+    CHECK(buf[0] == 0xA5);  // too small to hold even the original layout: untouched
+    // Through the header (current callers) the whole current struct is set.
+    sonder_sampling_config cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    sonder_sampling_config_init(&cfg);
+    CHECK(cfg.struct_size == sizeof(sonder_sampling_config));
+    CHECK(cfg.typical_p == doctest::Approx(1.0f));
+    CHECK(cfg.repeat_last_n == 64);
+}
+
 namespace {
 struct Count {
     int chunks = 0;
@@ -163,6 +217,50 @@ TEST_CASE("mock generation end to end") {
     CHECK(session2 == nullptr);
     sonder_model_release(model2);
     sonder_engine_destroy(engine);
+}
+
+TEST_CASE("destroying the engine before its sessions is safe (sessions keep the engine alive)") {
+    const std::string path = "c_abi_engine_first.jsonl";
+    std::remove(path.c_str());
+    sonder_engine_options eo;
+    sonder_engine_options_init(&eo);
+    eo.telemetry_level = SONDER_TELEMETRY_METRICS;
+    eo.telemetry_jsonl_path = path.c_str();
+    sonder_engine* engine = nullptr;
+    REQUIRE(sonder_engine_create(&eo, &engine) == SONDER_OK);
+    REQUIRE(sonder_engine_register_mock_backend(engine) == SONDER_OK);
+    sonder_model* model = nullptr;
+    REQUIRE(sonder_model_load(engine, "mock", "mock:tiny", &model) == SONDER_OK);
+    sonder_sampling_config cfg;
+    sonder_sampling_config_init(&cfg);
+    cfg.temperature = 0.0f;
+    cfg.max_tokens = 4;
+    sonder_session* session = nullptr;
+    REQUIRE(sonder_session_create(engine, model, &cfg, &session) == SONDER_OK);
+    sonder_model_release(model);
+
+    // The order the header never forbade: engine first, then its session.
+    sonder_engine_destroy(engine);
+    Count count;
+    sonder_generation_stats stats{};
+    stats.struct_size = sizeof(stats);
+    CHECK(sonder_session_generate(session, "still usable", on_token, &count, &stats) == SONDER_OK);
+    CHECK(stats.outcome == SONDER_OUTCOME_COMPLETED);
+    CHECK(count.chunks == 4);
+    sonder_session_destroy(session);
+
+    // The session closed on a live engine, and the engine stopped after it.
+    std::ifstream in(path);
+    std::stringstream buf;
+    buf << in.rdbuf();
+    const std::string log = buf.str();
+    const auto closed = log.find("\"event_type\":\"session.closed\"");
+    const auto stopped = log.find("\"event_type\":\"engine.stopped\"");
+    CHECK(closed != std::string::npos);
+    CHECK(stopped != std::string::npos);
+    CHECK(closed < stopped);
+    in.close();
+    std::remove(path.c_str());
 }
 
 TEST_CASE("null arguments are rejected") {
