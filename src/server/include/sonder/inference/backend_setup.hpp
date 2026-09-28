@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "sonder/inference/backend.hpp"
@@ -27,6 +28,13 @@ struct BackendSetup {
     bool ollama_allow_remote = false;
     // llama.cpp: directories scanned for *.gguf files.
     std::vector<std::string> model_dirs;
+    // llama.cpp: layers offloaded for gpu:* devices (-1 = all) and context
+    // length (0 = model training context); unset keeps the backend defaults.
+    std::optional<std::int32_t> llamacpp_gpu_layers;
+    std::optional<std::uint32_t> llamacpp_context_length;
+    // llama.cpp: tensor placement overrides, "PATTERN=DEVICE" each
+    // (see parse_tensor_override). Applied in order; first match wins.
+    std::vector<std::string> llamacpp_tensor_overrides;
     // MOCK backend: artificial per-token latency.
     std::chrono::microseconds mock_token_delay{0};
     // MOCK backend: >= 0 injects a backend error after that many tokens
@@ -53,6 +61,14 @@ BackendEnvDefaults backend_env_defaults(const EnvLookup& lookup = {});
 // "0.0.0.0") into a base URL. A wildcard bind address maps to 127.0.0.1 and
 // a missing port to 11434.
 std::string normalize_ollama_host(std::string_view value);
+
+// Splits "PATTERN=DEVICE" at the last '=' (patterns may contain '=').
+// Errors: invalid_argument when either side is empty or '=' is missing.
+Result<std::pair<std::string, std::string>> parse_tensor_override(std::string_view spec);
+
+// Pattern for MoE expert weights (llama.cpp's --cpu-moe); `--moe-experts cpu`
+// adds "<this>=cpu" ahead of any explicit --tensor-override.
+inline constexpr const char* kMoeExpertTensorOverridePattern = R"(\.ffn_(up|down|gate)_(ch|)exps)";
 
 // Backends compiled into this build, in a stable order ("mock" first).
 std::vector<std::string> available_backend_names();

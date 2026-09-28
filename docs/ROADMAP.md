@@ -51,6 +51,8 @@ Gate: measurable win on agent fan-out/long-context workloads without interactive
 - [ ] adaptive speculation policy
 - [ ] CPU KV spill
 - [ ] cache quantization where supported
+- [x] tensor placement overrides (MoE experts in RAM; `docs/PLACEMENT.md` step 1)
+- [ ] per-model placement planner from GGUF metadata (`docs/PLACEMENT.md` step 2)
 - [ ] optional disk tier
 - [ ] model residency manager
 - [ ] warm/cold adapter/model policy

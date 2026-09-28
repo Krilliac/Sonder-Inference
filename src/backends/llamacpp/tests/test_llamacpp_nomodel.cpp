@@ -1,5 +1,6 @@
 // Backend tests that need llama.cpp linked but no model weights. Tokenization
 // uses llama.cpp's bundled vocab-only GGUF fixtures (tokenizer metadata only).
+#include <regex>
 #include <string>
 #include <vector>
 
@@ -107,4 +108,35 @@ TEST_CASE("llamacpp wrapper: vocab-only GGUF tokenizes and detokenizes") {
     be.Unload();
     CHECK(!be.IsLoaded());
     CHECK(unloaded == 1);
+}
+
+TEST_CASE("llamacpp wrapper: tensor overrides are validated before any load") {
+    CHECK(LlamaCppBackend::ResolveTensorOverrides({}).ok());
+    std::vector<void*> buffers;
+    CHECK(LlamaCppBackend::ResolveTensorOverrides({{kMoeExpertTensorPattern, "cpu"}}, &buffers).ok());
+    CHECK(buffers.size() == 1);
+    CHECK(buffers.front() != nullptr);
+    CHECK(LlamaCppBackend::ResolveTensorOverrides({{"x", "CPU"}}).ok());  // device name is case-insensitive for cpu
+    CHECK(LlamaCppBackend::ResolveTensorOverrides({{"", "cpu"}}).code == ErrorCode::kInvalidArgument);
+    CHECK(LlamaCppBackend::ResolveTensorOverrides({{"(unclosed", "cpu"}}).code == ErrorCode::kInvalidArgument);
+    CHECK(LlamaCppBackend::ResolveTensorOverrides({{"x", "NoSuchDevice9"}}).code == ErrorCode::kInvalidArgument);
+
+    // Load reports a bad override even when the model path does not exist.
+    LlamaCppBackend be;
+    LoadOptions opts;
+    opts.model_path = "this/file/does/not/exist.gguf";
+    opts.tensor_overrides = {{"x", "NoSuchDevice9"}};
+    CHECK(be.Load(opts).code == ErrorCode::kInvalidArgument);
+}
+
+TEST_CASE("llamacpp wrapper: the MoE expert pattern matches expert tensors only") {
+    const std::regex re(kMoeExpertTensorPattern);
+    CHECK(std::regex_search("blk.3.ffn_up_exps.weight", re));
+    CHECK(std::regex_search("blk.12.ffn_down_exps.weight", re));
+    CHECK(std::regex_search("blk.0.ffn_gate_exps.weight", re));
+    CHECK(std::regex_search("blk.7.ffn_up_chexps.weight", re));
+    CHECK_FALSE(std::regex_search("blk.3.ffn_up.weight", re));        // dense FFN
+    CHECK_FALSE(std::regex_search("blk.3.ffn_up_shexp.weight", re));  // shared expert stays on GPU
+    CHECK_FALSE(std::regex_search("blk.3.attn_q.weight", re));
+    CHECK_FALSE(std::regex_search("blk.3.ffn_gate_inp.weight", re));  // router
 }

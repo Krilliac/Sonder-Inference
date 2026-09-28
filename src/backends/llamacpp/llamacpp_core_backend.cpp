@@ -220,6 +220,9 @@ public:
         lo.n_ctx = options_.context_length;
         lo.n_batch = options_.batch_size;
         lo.n_threads = options_.threads;
+        for (const auto& [pattern, device] : options_.tensor_overrides) {
+            lo.tensor_overrides.push_back({pattern, device});
+        }
         const std::string_view dev = options.device_id;
         if (dev.empty() || dev.rfind("cpu", 0) == 0) {
             lo.n_gpu_layers = 0;

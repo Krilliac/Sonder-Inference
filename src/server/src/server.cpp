@@ -1527,6 +1527,7 @@ struct Server::Impl {
             StepGuard step{*this};
             ModelLoadOptions lo;
             lo.model = ids[i];
+            lo.device_id = opts.device;
             // No lock held: the load may block on backend I/O while health
             // keeps answering 503 "starting". stop() waits for this step.
             Result<std::shared_ptr<Model>> loaded = engine_ptr()->load_model(backend_name, lo);
