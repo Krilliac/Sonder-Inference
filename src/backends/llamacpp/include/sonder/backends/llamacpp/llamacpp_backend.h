@@ -42,6 +42,21 @@ struct Status {
 
 [[nodiscard]] std::string_view ToString(ErrorCode code) noexcept;
 
+// Places weight tensors whose name matches `pattern` (ECMAScript regex, matched
+// anywhere in the name as llama.cpp does) in `device`'s memory instead of the
+// default layer placement. `device` is "cpu" or a llama.cpp device name such
+// as "Vulkan0" or "CUDA0" (see EnumerateDevices). First match wins.
+struct TensorOverride {
+    std::string pattern;
+    std::string device;
+};
+
+// MoE expert weights (llama.cpp's --cpu-moe): keep them in system RAM while
+// attention and shared weights stay on the GPU. For MoE models larger than
+// VRAM this beats offloading whole layers, since only a few experts run per
+// token.
+inline constexpr const char* kMoeExpertTensorPattern = R"(\.ffn_(up|down|gate)_(ch|)exps)";
+
 struct LoadOptions {
     std::string model_path;       // GGUF file
     std::uint32_t n_ctx = 2048;   // 0 = model training context
@@ -50,6 +65,7 @@ struct LoadOptions {
     std::int32_t n_gpu_layers = 0;  // CPU-only by default; -1 = offload all
     bool vocab_only = false;      // tokenizer metadata only, no weights
     bool use_mmap = true;
+    std::vector<TensorOverride> tensor_overrides;  // applied in order
 };
 
 struct SamplingParams {
@@ -182,6 +198,11 @@ public:
     [[nodiscard]] static Capabilities GetCapabilities() noexcept { return {}; }
     // Devices ggml can see in this build (CPU always; CUDA/Vulkan/Metal when compiled in).
     [[nodiscard]] static std::vector<DeviceInfo> EnumerateDevices();
+    // Checks each override (non-empty valid regex, device present in this
+    // build). On success, `buffer_types` (if non-null) receives one opaque
+    // ggml buffer type per override, in order. Needs no model file.
+    [[nodiscard]] static Status ResolveTensorOverrides(const std::vector<TensorOverride>& overrides,
+                                                       std::vector<void*>* buffer_types = nullptr);
     [[nodiscard]] static std::string SystemInfo();
 
     Status Load(const LoadOptions& options);

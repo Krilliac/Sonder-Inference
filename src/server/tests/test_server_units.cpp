@@ -501,3 +501,19 @@ TEST_CASE("options: refused combinations") {
     o.models.clear();
     CHECK(srv::validate_options(o).ok());
 }
+
+TEST_CASE("backend setup: tensor overrides parse as PATTERN=DEVICE") {
+    auto ok = parse_tensor_override("ffn_.*_exps=cpu");
+    REQUIRE(ok);
+    CHECK(ok.value().first == "ffn_.*_exps");
+    CHECK(ok.value().second == "cpu");
+    // Split at the last '=' so a pattern may itself contain '='.
+    auto eq = parse_tensor_override("a=b=Vulkan0");
+    REQUIRE(eq);
+    CHECK(eq.value().first == "a=b");
+    CHECK(eq.value().second == "Vulkan0");
+    CHECK_FALSE(parse_tensor_override("no-device"));
+    CHECK_FALSE(parse_tensor_override("=cpu"));
+    CHECK_FALSE(parse_tensor_override("pattern="));
+    CHECK(parse_tensor_override("=cpu").status().code() == ErrorCode::invalid_argument);
+}

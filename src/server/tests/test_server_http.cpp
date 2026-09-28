@@ -602,3 +602,22 @@ TEST_CASE("descriptor exhaustion: the accept loop answers 503 and does not spin"
     CHECK(warned);
 }
 #endif
+
+TEST_CASE("serve: models keep the default device unless --device is given") {
+    {
+        Fixture f;  // no device set
+        auto loaded = f.of_type("model.load.completed");
+        REQUIRE_FALSE(loaded.empty());
+        const auto* device = loaded.front().find("device_id");
+        REQUIRE(device != nullptr);
+        CHECK(device->as_string() == "cpu:0");
+    }
+    {
+        auto o = Fixture::defaults();
+        o.device = "cpu:0";
+        Fixture f(std::move(o));
+        auto loaded = f.of_type("model.load.completed");
+        REQUIRE_FALSE(loaded.empty());
+        CHECK(loaded.front().find("device_id")->as_string() == "cpu:0");
+    }
+}

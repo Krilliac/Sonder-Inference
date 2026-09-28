@@ -23,3 +23,8 @@ SONDER_TEST_GGUF=/path/to/model.gguf ctest --test-dir build/linux-release -R lla
 CPU is the default device. GPU offload works when llama.cpp is configured with
 an accelerator (`-DGGML_CUDA=ON`, `-DGGML_VULKAN=ON`, ...) and the model is loaded
 with a `gpu:*` device id. Never commit model weights.
+
+Tensor placement: `LoadOptions::tensor_overrides` (and `serve --moe-experts cpu` /
+`--tensor-override PATTERN=DEVICE`) place matching weight tensors on a chosen
+device, e.g. MoE expert weights in system RAM while attention stays on the GPU.
+See `docs/PLACEMENT.md`.

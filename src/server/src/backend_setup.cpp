@@ -83,6 +83,15 @@ std::string normalize_ollama_host(std::string_view value) {
     return scheme + "://" + host + ":" + port + path;
 }
 
+Result<std::pair<std::string, std::string>> parse_tensor_override(std::string_view spec) {
+    const std::size_t eq = spec.rfind('=');
+    if (eq == std::string_view::npos || eq == 0 || eq + 1 >= spec.size()) {
+        return Status(ErrorCode::invalid_argument,
+                      "tensor override must be PATTERN=DEVICE (e.g. ffn_.*_exps=cpu): " + std::string(spec));
+    }
+    return std::make_pair(std::string(spec.substr(0, eq)), std::string(spec.substr(eq + 1)));
+}
+
 std::vector<std::string> available_backend_names() {
     std::vector<std::string> names{kMockBackendName};
 #if defined(SONDER_HAS_OLLAMA_BACKEND)
@@ -119,6 +128,13 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
 #if defined(SONDER_HAS_LLAMACPP_BACKEND)
         LlamaCppBackendOptions lo;
         lo.model_dirs = setup.model_dirs;
+        if (setup.llamacpp_gpu_layers) lo.gpu_layers = *setup.llamacpp_gpu_layers;
+        if (setup.llamacpp_context_length) lo.context_length = *setup.llamacpp_context_length;
+        for (const std::string& spec : setup.llamacpp_tensor_overrides) {
+            auto parsed = parse_tensor_override(spec);
+            if (!parsed) return parsed.status();
+            lo.tensor_overrides.push_back(std::move(parsed).value());
+        }
         return make_llamacpp_backend(lo);
 #else
         return Status(ErrorCode::unsupported,

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <climits>
 #include <cstdint>
@@ -10,6 +11,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
+#include <regex>
+#include <string>
 #include <system_error>
 #include <utility>
 
@@ -169,9 +172,50 @@ LlamaCppBackend::~LlamaCppBackend() = default;
 LlamaCppBackend::LlamaCppBackend(LlamaCppBackend&&) noexcept = default;
 LlamaCppBackend& LlamaCppBackend::operator=(LlamaCppBackend&&) noexcept = default;
 
+Status LlamaCppBackend::ResolveTensorOverrides(const std::vector<TensorOverride>& overrides,
+                                               std::vector<void*>* buffer_types) {
+    EnsureBackendInitialized();
+    if (buffer_types != nullptr) buffer_types->clear();
+    if (overrides.size() > llama_max_tensor_buft_overrides()) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "too many tensor overrides (llama.cpp accepts " +
+                                 std::to_string(llama_max_tensor_buft_overrides()) + ")");
+    }
+    for (const TensorOverride& o : overrides) {
+        if (o.pattern.empty()) {
+            return Status::Error(ErrorCode::kInvalidArgument, "tensor override pattern is empty");
+        }
+        try {
+            (void)std::regex(o.pattern);
+        } catch (const std::regex_error&) {
+            return Status::Error(ErrorCode::kInvalidArgument, "tensor override pattern is not a valid regex: " + o.pattern);
+        }
+        ggml_backend_dev_t dev = nullptr;
+        std::string lower = o.device;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (lower == "cpu") {
+            dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        } else if (!o.device.empty()) {
+            dev = ggml_backend_dev_by_name(o.device.c_str());
+        }
+        ggml_backend_buffer_type_t buft = dev != nullptr ? ggml_backend_dev_buffer_type(dev) : nullptr;
+        if (buft == nullptr) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "tensor override device '" + o.device + "' is not available in this build");
+        }
+        if (buffer_types != nullptr) buffer_types->push_back(buft);
+    }
+    return Status::Ok();
+}
+
 Status LlamaCppBackend::Load(const LoadOptions& options) {
     if (options.model_path.empty()) {
         return Status::Error(ErrorCode::kInvalidArgument, "model_path is empty");
+    }
+    // Validate placement before touching the file so a bad flag fails fast.
+    std::vector<void*> override_buffers;
+    if (Status s = ResolveTensorOverrides(options.tensor_overrides, &override_buffers); !s.ok()) {
+        return s;
     }
     std::error_code ec;
     const std::filesystem::path fs_path(std::u8string(options.model_path.begin(), options.model_path.end()));
@@ -190,6 +234,17 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
     mp.n_gpu_layers = options.n_gpu_layers;
     mp.vocab_only = options.vocab_only;
     if (!options.use_mmap) mp.load_mode = LLAMA_LOAD_MODE_NONE;
+    // Null-terminated list; patterns point into `options`, which outlives the load.
+    std::vector<llama_model_tensor_buft_override> overrides;
+    if (!options.tensor_overrides.empty()) {
+        overrides.reserve(options.tensor_overrides.size() + 1);
+        for (std::size_t i = 0; i < options.tensor_overrides.size(); ++i) {
+            overrides.push_back({options.tensor_overrides[i].pattern.c_str(),
+                                 static_cast<ggml_backend_buffer_type_t>(override_buffers[i])});
+        }
+        overrides.push_back({nullptr, nullptr});
+        mp.tensor_buft_overrides = overrides.data();
+    }
 
     llama_model* model = llama_model_load_from_file(options.model_path.c_str(), mp);
     if (model == nullptr) {

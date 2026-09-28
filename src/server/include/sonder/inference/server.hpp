@@ -49,6 +49,9 @@ struct ServerOptions {
     // name a backend compiled into this build (available_backend_names()).
     BackendSetup backend;
     std::vector<std::string> models;
+    // Device every model is loaded on (e.g. "gpu:0" for llama.cpp GPU
+    // offload); empty uses the backend default (CPU for llama.cpp).
+    std::string device;
     // Embedding hosts and tests: a backend built by the caller, used instead
     // of make_backend(backend). Its name() decides the synthetic label.
     std::shared_ptr<Backend> backend_instance;

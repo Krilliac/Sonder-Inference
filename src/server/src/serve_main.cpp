@@ -79,6 +79,15 @@ Backend:
   --ollama-allow-remote   allow a non-loopback Ollama host (needs https, i.e. a
                           SONDER_WITH_TLS=ON build)
   --model-dir DIR         llama.cpp: directory with *.gguf files (repeatable)
+  --device ID             device to load models on (llama.cpp: gpu:0 offloads to
+                          the GPU; default cpu)
+  --gpu-layers N          llama.cpp: layers offloaded to the GPU (-1 = all, default)
+  --context-length N      llama.cpp: context length (0 = model training context)
+  --moe-experts WHERE     llama.cpp: cpu keeps MoE expert weights in system RAM
+                          while attention stays on the GPU; gpu (default) leaves
+                          placement to --gpu-layers
+  --tensor-override P=D   llama.cpp: place tensors matching regex P on device D
+                          (cpu, or a llama.cpp device such as Vulkan0); repeatable
   --mock-delay-ms N       mock backend per-token delay
 
 Telemetry (Observatory envelope v1; live at /v1/telemetry/sse and /v1/telemetry/ndjson):
@@ -105,6 +114,9 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"max-connections", Kind::value}, {"max-body-bytes", Kind::value},
         {"shutdown-grace-ms", Kind::value}, {"ready-file", Kind::value},
         {"mock-delay-ms", Kind::value},  {"log-format", Kind::value},
+        {"gpu-layers", Kind::value},     {"context-length", Kind::value},
+        {"device", Kind::value},
+        {"moe-experts", Kind::value},    {"tensor-override", Kind::repeat},
     };
     return kSpec;
 }
@@ -332,12 +344,37 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
         return usage_error("--backend is required (mock, ollama or llamacpp; or set SONDER_INFER_BACKEND)");
     }
     o.models = a.all("model");
+    o.device = a.get("device").value_or("");
     if (o.models.empty() && env.model) {
         o.models.push_back(*env.model);
     }
     o.backend.ollama_url = a.get("ollama-url").value_or(env.ollama_url.value_or(""));
     o.backend.ollama_allow_remote = a.flags.count("ollama-allow-remote") != 0;
     o.backend.model_dirs = a.all("model-dir");
+    if (auto v = a.get("gpu-layers")) {
+        if (*v == "-1") {
+            o.backend.llamacpp_gpu_layers = -1;
+        } else if (!parse_uint(*v, 100000, n)) {
+            return usage_error("--gpu-layers must be -1 or a non-negative integer");
+        } else {
+            o.backend.llamacpp_gpu_layers = static_cast<std::int32_t>(n);
+        }
+    }
+    if (auto v = a.get("context-length")) {
+        if (!parse_uint(*v, 1u << 22, n)) return usage_error("--context-length must be an integer from 0 to 4194304");
+        o.backend.llamacpp_context_length = static_cast<std::uint32_t>(n);
+    }
+    if (auto v = a.get("moe-experts")) {
+        if (*v == "cpu") {
+            o.backend.llamacpp_tensor_overrides.push_back(std::string(kMoeExpertTensorOverridePattern) + "=cpu");
+        } else if (*v != "gpu") {
+            return usage_error("--moe-experts must be cpu or gpu");
+        }
+    }
+    for (const std::string& spec : a.all("tensor-override")) {
+        if (auto parsed = parse_tensor_override(spec); !parsed) return usage_error(parsed.status().message());
+        o.backend.llamacpp_tensor_overrides.push_back(spec);
+    }
     if (auto v = a.get("mock-delay-ms")) {
         if (!parse_uint(*v, 60000, n)) return usage_error("--mock-delay-ms must be an integer from 0 to 60000");
         o.backend.mock_token_delay = std::chrono::milliseconds(n);

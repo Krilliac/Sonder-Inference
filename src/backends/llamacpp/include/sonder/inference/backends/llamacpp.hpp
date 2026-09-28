@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "sonder/inference/backend.hpp"
@@ -24,6 +25,10 @@ struct LlamaCppBackendOptions {
     std::int32_t threads = 0;             // 0 = llama.cpp default
     // Layers offloaded for "gpu:*" device ids (-1 = all). "cpu:*" always uses 0.
     std::int32_t gpu_layers = -1;
+    // Tensor placement overrides as (regex pattern, device) pairs, e.g.
+    // {"\.ffn_(up|down|gate)_(ch|)exps", "cpu"} keeps MoE experts in RAM.
+    // Device is "cpu" or a llama.cpp device name ("Vulkan0", "CUDA0").
+    std::vector<std::pair<std::string, std::string>> tensor_overrides;
 };
 
 std::shared_ptr<Backend> make_llamacpp_backend(LlamaCppBackendOptions options = {});

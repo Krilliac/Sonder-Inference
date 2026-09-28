@@ -35,7 +35,7 @@ did-you-mean suggestion (`genrate` → `generate`).
   option takes exactly one: `--max-tokens 8` or `--max-tokens=8`. A value may
   start with dashes when it is the separate next argument (`--prompt --x`).
 - Repeatable options (`--stop`, and for `serve` `--model`, `--model-dir`,
-  `--cors-origin`) may be given several times. Any other option given twice is
+  `--cors-origin`, `--tensor-override`) may be given several times. Any other option given twice is
   a usage error.
 - An unknown option is a usage error naming the command, with a suggestion
   when a declared option is at most two edits away (insertions, deletions,
