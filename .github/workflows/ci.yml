@@ -168,6 +168,13 @@ jobs:
       - name: Build
         run: cmake --build --preset ci-linux
 
+      # A TLS lane that silently registers no TLS tests would still pass.
+      - name: TLS tests are registered
+        run: |
+          n=$(ctest --preset ci-linux -N | grep -c 'sonder\.tls\.' || true)
+          echo "sonder.tls.* tests: $n"
+          test "$n" -ge 14
+
       - name: Test
         run: ctest --preset ci-linux
 
@@ -200,6 +207,25 @@ jobs:
 
       - name: Build
         run: cmake --build --preset ci-windows
+
+      # The Schannel build must not pull in OpenSSL (it is test-server only).
+      - name: sonder-infer does not import OpenSSL
+        shell: pwsh
+        run: |
+          $exe = 'build\ci-windows\sonder-infer.exe'
+          if (-not (Test-Path $exe)) { throw "$exe not found" }
+          $deps = dumpbin /dependents $exe | Out-String
+          Write-Host $deps
+          if ($deps -notmatch 'Image has the following dependencies') { throw 'dumpbin produced no dependency list' }
+          if ($deps -match 'libssl|libcrypto') { throw 'sonder-infer.exe imports OpenSSL; the Schannel build must not' }
+
+      # A TLS lane that silently registers no TLS tests would still pass.
+      - name: TLS tests are registered
+        shell: pwsh
+        run: |
+          $n = @(ctest --preset ci-windows -N | Select-String 'sonder\.tls\.').Count
+          Write-Host "sonder.tls.* tests: $n"
+          if ($n -lt 14) { throw "expected >= 14 sonder.tls.* tests, found $n" }
 
       - name: Test
         shell: pwsh

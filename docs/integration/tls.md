@@ -16,7 +16,7 @@ node over TLS (for example Node1 at `https://10.77.0.2:8443`).
     Windows with `-DSONDER_TLS_BACKEND=openssl`.
 - No code is vendored or fetched. cpp-httplib is not used by the library.
 
-## What the lead needs to wire
+## Wiring (done in #18; kept for reference)
 
 1. **Root `CMakeLists.txt`**: add one line after the optional-module
    `foreach` loop and before `add_subdirectory(tests)`:
@@ -32,59 +32,16 @@ node over TLS (for example Node1 at `https://10.77.0.2:8443`).
    root changes. Until this line is added, the branch builds exactly like
    main does, because the new files are not compiled.
 
-2. **CI**: the existing jobs stay as they are and need no OpenSSL, since TLS
-   is OFF. To test TLS ON, add these jobs:
+2. **CI** (done in #18): `.github/workflows/ci.yml` has two TLS-ON jobs
+   next to the default TLS-OFF ones, which need no OpenSSL:
+   - `tls-linux` (ubuntu-24.04, system libssl-dev, OpenSSL backend).
+   - `tls-windows` (MSVC, Schannel backend), still `continue-on-error`.
+     It installs OpenSSL 4.0.2 only for the loopback test server and the
+     test-time certificate generation in `tests/tls`, and it checks with
+     `dumpbin /dependents` that `sonder-infer.exe` does not import OpenSSL.
 
-   ```yaml
-   tls-linux:
-     name: ubuntu-latest (TLS, OpenSSL)
-     runs-on: ubuntu-latest
-     steps:
-       - uses: actions/checkout@v4
-       - name: Install Ninja + OpenSSL headers
-         run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev
-       - name: Configure
-         run: cmake --preset ci-linux -DSONDER_WITH_TLS=ON
-       - name: Build
-         run: cmake --build --preset ci-linux
-       - name: Test
-         run: ctest --preset ci-linux
-
-   tls-windows:
-     name: windows-latest (TLS, Schannel)
-     runs-on: windows-latest
-     continue-on-error: true   # make blocking once it has been green on MSVC
-     steps:
-       - uses: actions/checkout@v4
-       - uses: ilammy/msvc-dev-cmd@v1
-         with:
-           arch: x64
-       - name: Ensure Ninja
-         shell: pwsh
-         run: if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
-       - name: OpenSSL for the in-test TLS server only
-         shell: pwsh
-         run: choco install openssl -y --no-progress
-       - name: Configure
-         shell: pwsh
-         run: cmake --preset ci-windows -DSONDER_WITH_TLS=ON "-DOPENSSL_ROOT_DIR=C:/Program Files/OpenSSL"
-       - name: Build
-         run: cmake --build --preset ci-windows
-       - name: Test
-         shell: pwsh
-         run: |
-           $env:PATH = "C:\Program Files\OpenSSL\bin;$env:PATH"
-           ctest --preset ci-windows
-   ```
-
-   The Windows client uses Schannel, but the loopback test server and the
-   test-time certificate generation in `tests/tls` use OpenSSL. That is why
-   the Windows job installs OpenSSL even though the library does not link it.
-   The Schannel path was checked locally with a MinGW-w64 cross build run
-   under Wine (all tests pass), but it has not yet been built with MSVC.
-   That is why the job is `continue-on-error` at first. If you prefer presets,
-   add `ci-linux-tls` / `ci-windows-tls` presets that inherit the CI presets
-   with `SONDER_WITH_TLS=ON`.
+   Both jobs fail if fewer than 14 `sonder.tls.*` tests are registered, so
+   a TLS lane that quietly stops building the TLS tests cannot pass.
 
 3. **`docs/LICENSE_REVIEW.md`** (AGENTS.md: no upstream library linked
    before its license is recorded). Proposed entry: *OpenSSL 3.x, Apache
