@@ -140,6 +140,26 @@ TEST_CASE("supervisor timeout stops child") {
     CHECK(state->children.front()->stops.load() >= 1);
 }
 
+TEST_CASE("supervisor readiness timeout waits for the monitor to stop a slow-probed child") {
+    // Deterministic form of a CI race: the health probe outlives start()'s own
+    // deadline, so start() must wait for the monitor to stop the child and
+    // publish its failure instead of returning while the child still runs.
+    auto state = std::make_shared<LaunchState>();
+    auto o = base_options();
+    o.readiness_timeout = std::chrono::milliseconds(15);
+    o.health_check = [](std::uint16_t, std::chrono::milliseconds) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        return false;
+    };
+    Supervisor s(o, std::make_unique<FakeLauncher>(state));
+    const auto r = s.start();
+    CHECK_FALSE(r.ok());
+    CHECK(r.status().code() == ErrorCode::timeout);
+    REQUIRE(state->children.size() == 1);
+    CHECK(state->children.front()->stops.load() >= 1);
+    CHECK_FALSE(state->children.front()->alive.load());
+}
+
 TEST_CASE("supervisor crash retries twice, caps backoff, then exhausts") {
     auto state = std::make_shared<LaunchState>();
     auto o = base_options();
