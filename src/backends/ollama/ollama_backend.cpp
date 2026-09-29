@@ -43,6 +43,25 @@ std::uint64_t context_length_from_show(const json::Value& show) {
     return 0;
 }
 
+// Classifies attention-only / hybrid / recurrent from /api/show model_info
+// (e.g. Qwen3.8 reports qwen35.ssm.* next to qwen35.attention.*), so the
+// cache limits prefix reuse to checkpoints for hybrid and recurrent models.
+ModelArchitecture architecture_from_show(const json::Value& show) {
+    ModelMetadata metadata;
+    const json::Value* info = show.find("model_info");
+    if (info == nullptr || !info->is_object()) {
+        return ModelArchitecture::attention_only;
+    }
+    for (const auto& [key, value] : info->as_object()) {
+        if (value.is_string()) {
+            metadata.emplace_back(key, value.as_string());
+        } else if (value.is_number() || value.is_bool()) {
+            metadata.emplace_back(key, value.dump());
+        }
+    }
+    return classify_model_architecture(metadata);
+}
+
 class OllamaModel final : public BackendModel {
 public:
     OllamaModel(std::shared_ptr<const OllamaClient> client, ModelDescriptor descriptor)
@@ -204,6 +223,7 @@ public:
             d.quantization = s("quantization_level");
         }
         d.context_length = context_length_from_show(show.value());
+        d.architecture = architecture_from_show(show.value());
         if (auto models = client_->list_models(); models.ok()) {
             for (const auto& m : models.value()) {
                 if (m.name == options.model || m.name == options.model + ":latest") {

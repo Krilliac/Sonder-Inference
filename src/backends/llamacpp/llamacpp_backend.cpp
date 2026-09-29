@@ -55,7 +55,7 @@ sonder::inference::ModelArchitecture ReadModelArchitecture(const llama_model* mo
         std::string key;
         for (int attempt = 0; attempt != 3; ++attempt) {
             key.assign(capacity, '\0');
-            const int32_t n = llama_model_meta_key(model, i, key.data(), key.size());
+            const int32_t n = llama_model_meta_key_by_index(model, i, key.data(), key.size());
             if (n < 0) {
                 key.clear();
                 break;
