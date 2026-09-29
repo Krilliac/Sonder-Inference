@@ -123,7 +123,8 @@ TEST_CASE("request bodies: num_ctx and penalties reach Ollama options") {
     CHECK(opts.find("repeat_last_n")->as_int() == 128);
     CHECK(opts.find("presence_penalty")->as_double() == doctest::Approx(0.5));
     CHECK(opts.find("frequency_penalty")->as_double() == doctest::Approx(-0.25));
-    CHECK(opts.find("typical_p")->as_double() == doctest::Approx(0.9));
+    // Ollama 0.34.1+ rejects any request that sets typical_p, so it is never sent.
+    CHECK_FALSE(opts.contains("typical_p"));
     CHECK(opts.find("repeat_penalty")->as_double() == doctest::Approx(1.15));
     CHECK_FALSE(opts.contains("logit_bias"));  // no Ollama equivalent
 
@@ -179,6 +180,43 @@ TEST_CASE("request bodies: sampling mapping and options") {
     json::Value cb = build_chat_body(c);
     CHECK(cb.find("messages")->as_array().size() == 2u);
     CHECK(cb.find("think")->as_bool(true) == false);
+}
+
+TEST_CASE("request bodies: explicit_only sends only the fields the caller set") {
+    SamplingConfig s;  // struct defaults: temperature 0.8, repeat_penalty 1.1, ...
+    s.explicit_only = true;
+    s.max_tokens = 16;
+    json::Object opts = sampling_to_options(s);
+    // Nothing set explicitly: the model's own (GGUF) defaults apply.
+    CHECK_FALSE(opts.contains("temperature"));
+    CHECK_FALSE(opts.contains("top_p"));
+    CHECK_FALSE(opts.contains("top_k"));
+    CHECK_FALSE(opts.contains("min_p"));
+    CHECK_FALSE(opts.contains("repeat_penalty"));
+    CHECK(opts.find("num_predict")->as_int() == 16);
+
+    s.temperature = 0.8f;  // equal to the struct default, but explicitly set
+    s.repeat_last_n = 64;  // equal to the default window, but explicitly set
+    s.explicit_fields = SamplingConfig::kTemperature | SamplingConfig::kRepeatLastN;
+    opts = sampling_to_options(s);
+    CHECK(opts.find("temperature")->as_double() == doctest::Approx(0.8));
+    CHECK(opts.find("repeat_last_n")->as_int() == 64);
+    CHECK_FALSE(opts.contains("repeat_penalty"));
+    CHECK_FALSE(opts.contains("presence_penalty"));
+}
+
+TEST_CASE("decoder: prompt_eval_cached_count is parsed and reported") {
+    OllamaTimings t;
+    apply_server_timings(json::parse(R"({"prompt_eval_count":35,"prompt_eval_cached_count":34,"eval_count":4})").value(),
+                         t);
+    CHECK(t.has_server_timings);
+    CHECK(t.prompt_eval_count == 35);
+    CHECK(t.prompt_eval_cached_count == 34);
+    CHECK(timing_attributes(t).find("prompt_eval_cached_count")->as_int() == 34);
+
+    OllamaTimings old;  // servers before 0.33.3 omit the field
+    apply_server_timings(json::parse(R"({"prompt_eval_count":35})").value(), old);
+    CHECK(old.prompt_eval_cached_count == 0);
 }
 
 TEST_CASE("telemetry: timing attributes only include server-reported fields") {

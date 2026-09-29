@@ -178,6 +178,7 @@ void apply_server_timings(const json::Value& j, OllamaTimings& t) {
     t.total_duration_ns = int_field(j, "total_duration");
     t.load_duration_ns = int_field(j, "load_duration");
     t.prompt_eval_count = int_field(j, "prompt_eval_count");
+    t.prompt_eval_cached_count = int_field(j, "prompt_eval_cached_count");
     t.prompt_eval_duration_ns = int_field(j, "prompt_eval_duration");
     t.eval_count = int_field(j, "eval_count");
     t.eval_duration_ns = int_field(j, "eval_duration");
@@ -185,28 +186,42 @@ void apply_server_timings(const json::Value& j, OllamaTimings& t) {
 
 json::Object sampling_to_options(const SamplingConfig& s) {
     json::Object o;
-    o.set("temperature", static_cast<double>(s.temperature));
-    o.set("top_p", static_cast<double>(s.top_p));
-    o.set("top_k", s.top_k);
-    o.set("min_p", static_cast<double>(s.min_p));
-    o.set("repeat_penalty", static_cast<double>(s.repeat_penalty));
+    // With explicit_only, a field goes out only when the caller set it, so
+    // Ollama keeps the model's own defaults (from the GGUF) for the rest.
+    // Otherwise the classic sampler fields are always sent.
+    const auto send = [&](SamplingConfig::Field f) { return !s.explicit_only || s.is_explicit(f); };
+    if (send(SamplingConfig::kTemperature)) {
+        o.set("temperature", static_cast<double>(s.temperature));
+    }
+    if (send(SamplingConfig::kTopP)) {
+        o.set("top_p", static_cast<double>(s.top_p));
+    }
+    if (send(SamplingConfig::kTopK)) {
+        o.set("top_k", s.top_k);
+    }
+    if (send(SamplingConfig::kMinP)) {
+        o.set("min_p", static_cast<double>(s.min_p));
+    }
+    if (send(SamplingConfig::kRepeatPenalty)) {
+        o.set("repeat_penalty", static_cast<double>(s.repeat_penalty));
+    }
     // Newer SamplingConfig fields are only sent when they differ from their
     // disabled/default value, so a default config produces the same options
     // object as before. logit_bias has no Ollama option and is not forwarded.
+    // typical_p is not forwarded either: Ollama 0.34.1 dropped it and rejects
+    // any request that sets it ("typical_p is no longer supported").
     if (s.num_ctx > 0) {
         o.set("num_ctx", s.num_ctx);
     }
-    if (s.repeat_last_n != SamplingConfig{}.repeat_last_n) {
+    if (s.explicit_only ? s.is_explicit(SamplingConfig::kRepeatLastN)
+                        : s.repeat_last_n != SamplingConfig{}.repeat_last_n) {
         o.set("repeat_last_n", s.repeat_last_n);
     }
-    if (s.presence_penalty != 0.0f) {
+    if (s.explicit_only ? s.is_explicit(SamplingConfig::kPresencePenalty) : s.presence_penalty != 0.0f) {
         o.set("presence_penalty", static_cast<double>(s.presence_penalty));
     }
-    if (s.frequency_penalty != 0.0f) {
+    if (s.explicit_only ? s.is_explicit(SamplingConfig::kFrequencyPenalty) : s.frequency_penalty != 0.0f) {
         o.set("frequency_penalty", static_cast<double>(s.frequency_penalty));
-    }
-    if (s.typical_p != 1.0f) {
-        o.set("typical_p", static_cast<double>(s.typical_p));
     }
     if (s.seed) {
         // Ollama takes a signed 64-bit seed.

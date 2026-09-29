@@ -89,24 +89,41 @@ std::optional<ApiError> read_int(const json::Object& body, const char* key, std:
 }
 
 std::optional<ApiError> read_sampling(const json::Object& body, SamplingConfig& s) {
-    for (const auto& [key, target] : std::initializer_list<std::pair<const char*, float*>>{
-             {"temperature", &s.temperature},
-             {"top_p", &s.top_p},
-             {"min_p", &s.min_p},
-             {"typical_p", &s.typical_p},
-             {"presence_penalty", &s.presence_penalty},
-             {"frequency_penalty", &s.frequency_penalty},
-             {"repeat_penalty", &s.repeat_penalty}}) {
-        if (auto e = read_float(body, key, *target)) {
+    // Record which sampler fields the request set, so a backend with per-model
+    // defaults (Ollama) sends only those and leaves the rest to the model.
+    s.explicit_only = true;
+    struct FloatField {
+        const char* key;
+        float* target;
+        std::uint32_t flag;  // 0 = not tracked
+    };
+    for (const auto& f : std::initializer_list<FloatField>{
+             {"temperature", &s.temperature, SamplingConfig::kTemperature},
+             {"top_p", &s.top_p, SamplingConfig::kTopP},
+             {"min_p", &s.min_p, SamplingConfig::kMinP},
+             {"typical_p", &s.typical_p, 0},
+             {"presence_penalty", &s.presence_penalty, SamplingConfig::kPresencePenalty},
+             {"frequency_penalty", &s.frequency_penalty, SamplingConfig::kFrequencyPenalty},
+             {"repeat_penalty", &s.repeat_penalty, SamplingConfig::kRepeatPenalty}}) {
+        if (auto e = read_float(body, f.key, *f.target)) {
             return e;
+        }
+        if (f.flag != 0 && present(body.find(f.key))) {
+            s.explicit_fields |= f.flag;
         }
     }
     std::int64_t n = 0;
     bool set = false;
     if (auto e = read_int(body, "top_k", 0, 100000, n, set)) return e;
-    if (set) s.top_k = static_cast<std::int32_t>(n);
+    if (set) {
+        s.top_k = static_cast<std::int32_t>(n);
+        s.explicit_fields |= SamplingConfig::kTopK;
+    }
     if (auto e = read_int(body, "repeat_last_n", -1, SamplingConfig::kMaxContextLimit, n, set)) return e;
-    if (set) s.repeat_last_n = static_cast<std::int32_t>(n);
+    if (set) {
+        s.repeat_last_n = static_cast<std::int32_t>(n);
+        s.explicit_fields |= SamplingConfig::kRepeatLastN;
+    }
     if (auto e = read_int(body, "num_ctx", 0, SamplingConfig::kMaxContextLimit, n, set)) return e;
     if (set) s.num_ctx = static_cast<std::int32_t>(n);
     if (auto e = read_int(body, "seed", 0, std::numeric_limits<std::int64_t>::max(), n, set)) return e;

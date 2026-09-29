@@ -11,6 +11,7 @@ json::Object timing_attributes(const OllamaTimings& t) {
         a.set("total_duration_ns", t.total_duration_ns);
         a.set("load_duration_ns", t.load_duration_ns);
         a.set("prompt_eval_count", t.prompt_eval_count);
+        a.set("prompt_eval_cached_count", t.prompt_eval_cached_count);
         a.set("prompt_eval_duration_ns", t.prompt_eval_duration_ns);
         a.set("eval_count", t.eval_count);
         a.set("eval_duration_ns", t.eval_duration_ns);
@@ -48,6 +49,7 @@ int emit_timing_events(TelemetryBus& bus, const TelemetryContext& ctx, const Oll
     if (t.prompt_eval_count > 0 || t.prompt_eval_duration_ns > 0) {
         json::Object a = base();
         a.set("prompt_eval_count", t.prompt_eval_count);
+        a.set("prompt_eval_cached_count", t.prompt_eval_cached_count);
         a.set("prompt_eval_duration_ns", t.prompt_eval_duration_ns);
         a.set("prompt_tokens_per_sec", t.prompt_tokens_per_sec());
         accepted += bus.emit("backend.timing.prefill", ctx, std::move(a)) ? 1 : 0;

@@ -117,7 +117,9 @@ The Ollama timing helper (`ollama::emit_timing_events`) never reuses these
 names. It emits `backend.model.load.reported` (`backend`, `model`,
 `load_duration_ns` int; Ollama reports a load time even for a warm model, so
 this is not a residency transition), `backend.timing.prefill` (`backend`,
-`model`, `prompt_eval_count` int, `prompt_eval_duration_ns` int,
+`model`, `prompt_eval_count` int, `prompt_eval_cached_count` int (prompt
+tokens served from Ollama's prompt cache; 0 before Ollama 0.33.3),
+`prompt_eval_duration_ns` int,
 `prompt_tokens_per_sec` num) and `backend.timing.decode` (`backend`,
 `model`, `eval_count` int, `eval_duration_ns` int, `decode_tokens_per_sec`
 num, optional `ttft_ms` num). The engine does not call it yet.

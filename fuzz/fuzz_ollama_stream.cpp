@@ -62,6 +62,7 @@ Outcome run_chunked(StreamKind kind, std::string_view body, std::uint32_t seed) 
 bool same_timings(const OllamaTimings& a, const OllamaTimings& b) {
     return a.has_server_timings == b.has_server_timings && a.total_duration_ns == b.total_duration_ns &&
            a.load_duration_ns == b.load_duration_ns && a.prompt_eval_count == b.prompt_eval_count &&
+           a.prompt_eval_cached_count == b.prompt_eval_cached_count &&
            a.prompt_eval_duration_ns == b.prompt_eval_duration_ns && a.eval_count == b.eval_count &&
            a.eval_duration_ns == b.eval_duration_ns && a.content_chunks == b.content_chunks;
 }

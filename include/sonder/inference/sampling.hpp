@@ -51,6 +51,25 @@ struct SamplingConfig {
     // Stop sequences (each non-empty, at most kMaxStopSequences).
     std::vector<std::string> stop;
 
+    // Which sampler fields the caller set explicitly. C++ only (not in the C ABI).
+    // When `explicit_only` is true, a backend that has its own per-model defaults
+    // (Ollama applies the GGUF's) sends only the fields flagged here, so unset
+    // fields keep the model's defaults instead of this struct's. Backends that
+    // sample natively ignore it and use the values above.
+    enum Field : std::uint32_t {
+        kTemperature = 1u << 0,
+        kTopP = 1u << 1,
+        kTopK = 1u << 2,
+        kMinP = 1u << 3,
+        kRepeatPenalty = 1u << 4,
+        kRepeatLastN = 1u << 5,
+        kPresencePenalty = 1u << 6,
+        kFrequencyPenalty = 1u << 7,
+    };
+    bool explicit_only = false;
+    std::uint32_t explicit_fields = 0;
+    bool is_explicit(Field f) const noexcept { return (explicit_fields & f) != 0; }
+
     static constexpr std::int32_t kMaxTokensLimit = 1 << 20;
     static constexpr std::size_t kMaxStopSequences = 16;
     static constexpr std::size_t kMaxStopSequenceBytes = 256;
