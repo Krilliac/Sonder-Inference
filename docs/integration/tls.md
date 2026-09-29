@@ -35,7 +35,7 @@ node over TLS (for example Node1 at `https://10.77.0.2:8443`).
 2. **CI** (done in #18): `.github/workflows/ci.yml` has two TLS-ON jobs
    next to the default TLS-OFF ones, which need no OpenSSL:
    - `tls-linux` (ubuntu-24.04, system libssl-dev, OpenSSL backend).
-   - `tls-windows` (MSVC, Schannel backend), still `continue-on-error`.
+   - `tls-windows` (MSVC, Schannel backend), a required check.
      It installs OpenSSL 4.0.2 only for the loopback test server and the
      test-time certificate generation in `tests/tls`, and it checks with
      `dumpbin /dependents` that `sonder-infer.exe` does not import OpenSSL.

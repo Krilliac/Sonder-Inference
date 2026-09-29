@@ -181,9 +181,8 @@ jobs:
   # TLS ON with Schannel. Non-blocking until it has been green on MSVC.
   # OpenSSL is installed only for the in-test server and PKI generation.
   tls-windows:
-    name: windows-latest (TLS, Schannel, optional)
+    name: windows-latest (TLS, Schannel)
     runs-on: windows-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
 
