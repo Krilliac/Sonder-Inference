@@ -232,10 +232,15 @@ The following is enforced in code; details are in
 - The Ollama client connects only to loopback hosts unless remote access is
   allowed (`--ollama-allow-remote`), and the CLI refuses plain `http://` to a
   non-loopback host. `https://` requires a `SONDER_WITH_TLS=ON` build.
-- With TLS enabled, the client verifies the certificate chain and host name
-  against the system trust store or a configured CA bundle, and supports
-  SHA-256 fingerprint or certificate pinning. Disabling verification prints a
-  warning on every handshake.
+- With TLS enabled, the client has three verification modes
+  (`src/net/tls.hpp`):
+  - default: the chain is verified against the system trust store, or only
+    against a configured CA bundle, and the certificate must match the host
+    name; a configured pin must also match;
+  - pin-only (a SHA-256 fingerprint or certificate pin and no CA bundle): the
+    leaf certificate must match the pin; chain and host name are not checked;
+  - insecure skip-verify: no chain or host-name checks and a warning on every
+    handshake; a configured pin is still enforced.
 
 ## Project layout
 
