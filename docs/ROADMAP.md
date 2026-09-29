@@ -24,7 +24,7 @@
 - [x] telemetry (Observatory envelope v1 JSONL; lifecycle, request, decode, token, device, scheduler, KV, sampling, drop accounting; see `docs/TELEMETRY.md`)
 - [x] side-by-side Ollama adapter (loopback HTTP, streaming, cancellation)
 - [x] local HTTP API for Sonder Runtime (module `src/server`: `serve_main()` and `Server`; OpenAI-compatible chat subset through `Session::chat`, health, models, backend identity; ADR-020 proposed, `docs/SERVER.md`)
-- [ ] `sonder-infer serve` command-line dispatch (pending in the CLI lane; until then the server runs in process through `serve_main()`/`Server`)
+- [x] `sonder-infer serve` command-line dispatch (`src/cli/sonder_infer_commands.hpp`; exercised in CI by the Linux smoke step, which starts `serve --backend mock --port 0 --ready-file` and drains it on SIGINT)
 - [x] live telemetry transport: SSE and NDJSON with discovery, resume and per-subscriber backpressure (`docs/TELEMETRY.md`)
 - [ ] C ABI additions for chat, session metadata and a telemetry callback (follow-up to ADR-020)
 - [ ] backend identity for Ollama (tokenizer digest not measurable) and llama.cpp (GGUF hashing)
