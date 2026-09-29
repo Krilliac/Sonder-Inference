@@ -10,6 +10,7 @@ sonder_module_sources(
     src/identity.cpp
     src/live_hub.cpp
     src/openai.cpp
+    src/residency.cpp
     src/serve_main.cpp
     src/server.cpp
     src/sha256.cpp
@@ -24,7 +25,8 @@ sonder_add_module_tests(server
     tests/test_server_telemetry.cpp
     tests/test_server_lifecycle.cpp
     tests/test_serve_main.cpp
-    tests/test_server_faults.cpp)
+    tests/test_server_faults.cpp
+    tests/test_server_residency.cpp)
 if(TARGET sonder_server_tests)
     target_include_directories(sonder_server_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()

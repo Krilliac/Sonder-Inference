@@ -81,6 +81,13 @@ Backend:
   --model-dir DIR         llama.cpp: directory with *.gguf files (repeatable)
   --device ID             device to load models on (llama.cpp: gpu:0 offloads to
                           the GPU; default cpu)
+  --lazy-models           register models at startup and load each on its first
+                          request (default: load every model before ready)
+  --model-idle-ttl S      unload a model no request has used for S seconds; the
+                          next request loads it again (default 0 = never)
+  --max-resident-models N keep at most N models loaded, evicting the least recently
+                          used idle one (default 0 = no cap; in-flight requests
+                          always keep their model)
   --gpu-layers N          llama.cpp: layers offloaded to the GPU (-1 = all, default)
   --context-length N      llama.cpp: context length (0 = model training context)
   --moe-experts WHERE     llama.cpp: cpu keeps MoE expert weights in system RAM
@@ -116,6 +123,8 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"mock-delay-ms", Kind::value},  {"log-format", Kind::value},
         {"gpu-layers", Kind::value},     {"context-length", Kind::value},
         {"device", Kind::value},
+        {"lazy-models", Kind::flag},     {"model-idle-ttl", Kind::value},
+        {"max-resident-models", Kind::value},
         {"moe-experts", Kind::value},    {"tensor-override", Kind::repeat},
     };
     return kSpec;
@@ -375,6 +384,17 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
         if (auto parsed = parse_tensor_override(spec); !parsed) return usage_error(parsed.status().message());
         o.backend.llamacpp_tensor_overrides.push_back(spec);
     }
+    o.lazy_models = a.flags.count("lazy-models") != 0;
+    if (auto v = a.get("model-idle-ttl")) {
+        if (!parse_uint(*v, 30u * 24u * 3600u, n)) {
+            return usage_error("--model-idle-ttl must be a number of seconds from 0 to 2592000");
+        }
+        o.model_idle_ttl = std::chrono::seconds(n);
+    }
+    if (auto v = a.get("max-resident-models")) {
+        if (!parse_uint(*v, 4096, n)) return usage_error("--max-resident-models must be an integer from 0 to 4096");
+        o.max_resident_models = static_cast<std::size_t>(n);
+    }
     if (auto v = a.get("mock-delay-ms")) {
         if (!parse_uint(*v, 60000, n)) return usage_error("--mock-delay-ms must be an integer from 0 to 60000");
         o.backend.mock_token_delay = std::chrono::milliseconds(n);
@@ -469,6 +489,18 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
         models = "mock (default)";
     }
     const bool mock = is_synthetic_backend(o.backend.backend);
+    // Residency summary for the banner; empty with the defaults, which keep
+    // the banner exactly as it was before these options existed.
+    std::string residency;
+    if (o.lazy_models || o.model_idle_ttl.count() > 0 || o.max_resident_models > 0) {
+        residency = std::string(o.lazy_models ? "lazy" : "eager") + ", idle TTL " +
+                    (o.model_idle_ttl.count() > 0
+                         ? std::to_string(std::chrono::duration_cast<std::chrono::seconds>(o.model_idle_ttl).count()) +
+                               " s"
+                         : std::string("off")) +
+                    ", max resident " +
+                    (o.max_resident_models > 0 ? std::to_string(o.max_resident_models) : std::string("unlimited"));
+    }
     Server server(o);
     std::string ready_error;
     ReadyFileGuard ready_file{ready_path};
@@ -492,14 +524,19 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
                                                {"api_version", kApiVersion},
                                                {"backend", o.backend.backend},
                                                {"models", models},
-                                               {"status", "loading models"}})
+                                               {"status", o.lazy_models ? "registering models" : "loading models"}})
                           .dump());
         } else {
             log->line("sonder-infer serve: listening on " +
                       (wildcard ? bind_text() + " (all interfaces; local URL " + base + ")" : base) +
                       " (api_version " + std::to_string(kApiVersion) + ")");
-            log->line("sonder-infer serve: loading models on " + o.backend.backend + ": " + models +
-                      " (health reports 503 starting until they are loaded)");
+            if (o.lazy_models) {
+                log->line("sonder-infer serve: registering models on " + o.backend.backend + ": " + models +
+                          " (lazy residency: each model loads on its first request)");
+            } else {
+                log->line("sonder-infer serve: loading models on " + o.backend.backend + ": " + models +
+                          " (health reports 503 starting until they are loaded)");
+            }
         }
         if (ready_path.empty()) {
             return;
@@ -552,7 +589,7 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
     if (json_log) {
         json::Array origin_list;
         for (const auto& s : origins) origin_list.emplace_back(s);
-        log->line(json::Value(json::Object{
+        json::Object ready_doc{
                                   {"time", utc_timestamp_now()},
                                   {"level", "info"},
                                   {"message", "ready"},
@@ -568,8 +605,11 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
                                   {"discovery_url", base + "/.well-known/sonder-telemetry"},
                                   {"sse_url", base + "/v1/telemetry/sse"},
                                   {"ndjson_url", base + "/v1/telemetry/ndjson"},
-                                  {"synthetic", mock}})
-                      .dump());
+                                  {"synthetic", mock}};
+        if (!residency.empty()) {
+            ready_doc.set("residency", residency);
+        }
+        log->line(json::Value(std::move(ready_doc)).dump());
     } else {
         std::string cors;
         for (const auto& s : origins) cors += (cors.empty() ? "" : ", ") + s;
@@ -578,6 +618,9 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
         log->line("  cors:      " + (cors.empty() ? std::string("no explicit origins") : cors) +
                   (o.default_cors ? "; default Observatory origins for GET routes" : "; defaults disabled"));
         log->line("  backend:   " + o.backend.backend + "; models: " + models);
+        if (!residency.empty()) {
+            log->line("  residency: " + residency);
+        }
         log->line("  telemetry: level " + std::string(to_string(o.telemetry_level)) + ", discovery " + base +
                   "/.well-known/sonder-telemetry, sse " + base + "/v1/telemetry/sse, ndjson " + base +
                   "/v1/telemetry/ndjson");

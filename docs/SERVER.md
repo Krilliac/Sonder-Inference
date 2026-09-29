@@ -59,6 +59,9 @@ itself.
 | `--shutdown-grace-ms N` | `5000` | |
 | `--ready-file PATH` | none | Written atomically once the socket **listens** (models may still be loading: poll health for 200): `{"url","pid","instance_id","api_version":1}`. Removed when `serve` returns, after a failed start as well as after a clean shutdown. A process killed outright (second signal, SIGKILL) leaves it behind: check that `pid` is alive. |
 | `--mock-delay-ms N` | `0` | Mock per-token delay. |
+| `--lazy-models` | off | Register the models at startup and load each on its first request (see [Model residency](#model-residency)). |
+| `--model-idle-ttl S` | `0` (never) | Unload a model no request has used for `S` seconds (0 to 2592000); the next request loads it again. |
+| `--max-resident-models N` | `0` (no cap) | Keep at most `N` models loaded (0 to 4096), evicting the least recently used idle one. |
 | `--log-format text\|json` | `text` | Banner, access log and diagnostics on stderr. |
 
 `--key=value` is accepted as well as `--key value`. Exit status: 0 after a
@@ -86,6 +89,35 @@ registers the backend and loads the models, then reports `ready`. A model
 that fails to load stops the server with exit 1. No lock is held across
 backend I/O, so health keeps answering 503 `starting` while a model loads
 (an Ollama `/api/show` that hangs, for example).
+
+### Model residency
+
+By default every `--model` loads during `start()`, before `ready`, and stays
+loaded until shutdown, exactly as before these options existed. Three
+options change that; none is on unless the operator sets it:
+
+- `--lazy-models` registers the models at startup (id, backend, default flag;
+  no backend I/O) and reports `ready` at once. Each model loads on its first
+  chat request; concurrent first requests wait for the same load instead of
+  starting their own. A model that cannot load fails the requests that
+  needed it (404 `model_not_found` when the backend does not know it, 503
+  `not_ready` otherwise; nothing was executed) instead of failing the
+  start. `/v1/models` and `/v1/sonder/identity` never load a model: identity
+  for a model that has never loaded is `null` with a `reason`.
+- `--model-idle-ttl S` unloads a model once no request has used it for `S`
+  seconds (`model.evicted` with `reason: "idle_ttl"`, then `model.unload`).
+  The next request loads it again.
+- `--max-resident-models N` keeps at most `N` models loaded: loading another
+  evicts the least recently used idle one first (`reason: "max_resident"`).
+  Without `--lazy-models`, only the first `N` models load during start.
+
+A request in flight pins its model from before the load until the response
+is finished: an idle TTL or the cap never unloads a pinned model. The cap is
+therefore soft: pinned models alone can exceed it until they are released.
+Health reports the state of each model and the totals (see below); the
+residency options add a `residency:` line to the text banner and a
+`residency` field to the JSON `ready` log line (both omitted with the
+defaults).
 
 A shutdown request while models load abandons the start after the backend
 call in progress returns (the backend's own timeout bounds it; for Ollama
@@ -219,7 +251,10 @@ reject with `never_fits` or `invalid_request`, both caller errors (400).
 {"status":"ready","api_version":1,"version":"0.1.0","commit":"912503a…","abi_version":1,
  "instance_id":"tel-…","node_id":"host","uptime_s":12.5,"synthetic":true,"auth_required":false,
  "backends":[{"name":"mock","available":true,"capabilities":["tokenization","streaming","deterministic"],"version":"mock-1"}],
- "models":[{"id":"mock:tiny","backend":"mock","default":true}],
+ "models":[{"id":"mock:tiny","backend":"mock","default":true,"state":"resident","resident":true,"in_flight":0,
+            "loads":1,"load_failures":0,"evictions":0,"idle_s":3.2,"model_instance_id":"…"}],
+ "residency":{"mode":"eager","idle_ttl_s":null,"max_resident":null,"registered":1,"resident":1,"loading":0,
+              "loads":1,"load_failures":0,"evictions":0},
  "telemetry":{"level":"standard","subscribers":0,"retained":42,"capacity":8192,"emitted":42,"dropped":0,
               "subscriber_dropped_events":0},
  "sonder":{"api_version":1}}
@@ -231,6 +266,15 @@ identity only read that cache and never wait on the backend (a hung Ollama
 cannot stall them).
 `telemetry.emitted` and `telemetry.dropped` are the bus counters;
 `subscriber_dropped_events` counts events lost by slow live subscribers.
+
+Model residency fields (additive; see [Model residency](#model-residency)):
+`models[].state` is `unloaded`, `loading` or `resident`; `in_flight` counts
+the requests pinning the model (including those waiting for its load);
+`loads`, `load_failures` and `evictions` are cumulative; `idle_s` is the time
+since the last request finished (null while pinned or not resident);
+`model_instance_id` is null unless resident. `residency.mode` is `eager` or
+`lazy`, `idle_ttl_s` and `max_resident` are null when off, and the counters
+are totals over all models.
 
 ### `GET /v1/models`
 
@@ -430,6 +474,9 @@ lingering close for clients that send the whole body first, `Expect:
 100-continue`, duplicate `Host` headers, descriptor exhaustion (503 through
 the reserve descriptor, no CPU spin), a backend whose `probe()` and
 `load_model()` block (health stays responsive; `stop()` during `start()`),
+model residency (defaults load everything before ready and never unload;
+lazy loading on first use; one load for concurrent first requests; idle-TTL
+eviction and reload; a pinned model outlives the TTL; the max-resident cap),
 and `serve_main` (help, usage errors, ready file written and removed, port in
 use, wildcard-bind banner, graceful shutdown). No network services or weights
 are needed. `fuzz/fuzz_http_request.cpp` fuzzes the request head parser and the

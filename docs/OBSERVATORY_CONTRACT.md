@@ -86,7 +86,8 @@ is written from it.
 
 Emitted today:
 
-- Lifecycle: `model.load.started/completed/failed`, `model.unload`, and
+- Lifecycle: `model.load.started/completed/failed`, `model.unload`,
+  `model.evicted` (`sonder-infer serve` residency options only), and
   `request.queued/started/completed/failed/cancelled`.
 - Execution: `inference.prefill.completed`,
   `inference.decode.started/completed`, and `inference.token.generated`.

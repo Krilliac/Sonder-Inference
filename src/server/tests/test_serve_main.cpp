@@ -81,6 +81,10 @@ TEST_CASE("serve_main: usage errors exit 2") {
              // Unknown backends are usage errors, caught before anything binds.
              {"--backend", "vllm", "--model", "x", "--port", "0"},
              {"--backend", "mock", "--cors-origin", "http://127.0.0.1:4173/", "--port", "0"},
+             {"--backend", "mock", "--model-idle-ttl", "-1"},
+             {"--backend", "mock", "--model-idle-ttl", "2592001"},
+             {"--backend", "mock", "--max-resident-models", "x"},
+             {"--backend", "mock", "--lazy-models=1"},
          }) {
         CAPTURE(args.back());
         CHECK(run(args, out, err) == 2);
