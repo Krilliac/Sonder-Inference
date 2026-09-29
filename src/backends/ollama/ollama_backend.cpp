@@ -57,6 +57,10 @@ public:
         if (!request.sampling.logit_bias.empty()) {
             return Status(ErrorCode::invalid_argument, "the ollama backend does not support logit_bias");
         }
+        // Ollama 0.34.1 removed typical_p and rejects requests that set it.
+        if (request.sampling.typical_p != 1.0f) {
+            return Status(ErrorCode::invalid_argument, "the ollama backend does not support typical_p");
+        }
         ollama::GenerateParams params;
         params.model = descriptor_.name;
         params.prompt = request.prompt;
@@ -73,6 +77,10 @@ public:
         }
         if (!request.sampling.logit_bias.empty()) {
             return Status(ErrorCode::invalid_argument, "the ollama backend does not support logit_bias");
+        }
+        // Ollama 0.34.1 removed typical_p and rejects requests that set it.
+        if (request.sampling.typical_p != 1.0f) {
+            return Status(ErrorCode::invalid_argument, "the ollama backend does not support typical_p");
         }
         ollama::ChatParams params;
         params.model = descriptor_.name;

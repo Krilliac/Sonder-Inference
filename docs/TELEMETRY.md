@@ -96,7 +96,10 @@ id). The envelope `request_id` is always the engine's own id.
 `repeat_penalty`, `typical_p`, `repeat_last_n`, `presence_penalty`,
 `frequency_penalty`, `logit_bias_count` (int; the biases themselves are not
 recorded), `num_ctx` (int, 0 = model default), `max_tokens` and `seed` (int
-or null). The fields after `repeat_penalty` were added with
+or null), plus `explicit_only` bool. When `explicit_only` is true (requests
+from the OpenAI-compatible server), a sampler field the caller did not set is
+null: a model-default backend such as Ollama applied the model's own value.
+The fields after `repeat_penalty` were added with
 `feat/sampling-config`; consumers of older streams must treat them as
 optional.
 
@@ -117,7 +120,9 @@ The Ollama timing helper (`ollama::emit_timing_events`) never reuses these
 names. It emits `backend.model.load.reported` (`backend`, `model`,
 `load_duration_ns` int; Ollama reports a load time even for a warm model, so
 this is not a residency transition), `backend.timing.prefill` (`backend`,
-`model`, `prompt_eval_count` int, `prompt_eval_duration_ns` int,
+`model`, `prompt_eval_count` int, `prompt_eval_cached_count` int (prompt
+tokens served from Ollama's prompt cache; 0 before Ollama 0.33.3),
+`prompt_eval_duration_ns` int,
 `prompt_tokens_per_sec` num) and `backend.timing.decode` (`backend`,
 `model`, `eval_count` int, `eval_duration_ns` int, `decode_tokens_per_sec`
 num, optional `ttft_ms` num). The engine does not call it yet.

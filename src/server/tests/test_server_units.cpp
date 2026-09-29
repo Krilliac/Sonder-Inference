@@ -145,11 +145,24 @@ TEST_CASE("openai: request mapping and Sonder extensions") {
     CHECK(job.sampling.num_ctx == 2048);
     CHECK(job.sampling.typical_p == doctest::Approx(0.8));
     CHECK(job.sampling.repeat_last_n == -1);
+    CHECK(job.sampling.explicit_only);
+    CHECK(job.sampling.is_explicit(SamplingConfig::kTemperature));
+    CHECK(job.sampling.is_explicit(SamplingConfig::kTopK));
+    CHECK(job.sampling.is_explicit(SamplingConfig::kRepeatPenalty));
+    CHECK(job.sampling.is_explicit(SamplingConfig::kRepeatLastN));
 
     const auto minimal = parse_chat_request(R"({"messages":[{"role":"user","content":"hi"}]})");
     REQUIRE(std::holds_alternative<ChatJob>(minimal));
     CHECK(std::get<ChatJob>(minimal).model == "default");
     CHECK(std::get<ChatJob>(minimal).sampling.max_tokens == kDefaultMaxTokens);
+    // No sampler field in the request: a model-default backend keeps its own.
+    CHECK(std::get<ChatJob>(minimal).sampling.explicit_only);
+    CHECK(std::get<ChatJob>(minimal).sampling.explicit_fields == 0u);
+
+    const auto only_temp =
+        parse_chat_request(R"({"messages":[{"role":"user","content":"hi"}],"temperature":0.2,"top_p":null})");
+    REQUIRE(std::holds_alternative<ChatJob>(only_temp));
+    CHECK(std::get<ChatJob>(only_temp).sampling.explicit_fields == SamplingConfig::kTemperature);
     CHECK_FALSE(std::get<ChatJob>(minimal).stream);
 
     const auto both = parse_chat_request(

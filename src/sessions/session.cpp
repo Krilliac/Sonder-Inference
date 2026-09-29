@@ -49,15 +49,22 @@ const char* to_string(RequestOutcome outcome) noexcept {
 
 namespace {
 json::Value sampling_json(const SamplingConfig& s) {
-    json::Object o{{"temperature", s.temperature},
-                   {"top_p", s.top_p},
-                   {"top_k", s.top_k},
-                   {"min_p", s.min_p},
-                   {"repeat_penalty", s.repeat_penalty},
+    // With explicit_only, a field the caller did not set was never sent to a
+    // model-default backend, so it is recorded as null ("model default"),
+    // not as this struct's placeholder value.
+    const auto field = [&](SamplingConfig::Field f, json::Value v) {
+        return (!s.explicit_only || s.is_explicit(f)) ? std::move(v) : json::Value(nullptr);
+    };
+    json::Object o{{"temperature", field(SamplingConfig::kTemperature, s.temperature)},
+                   {"top_p", field(SamplingConfig::kTopP, s.top_p)},
+                   {"top_k", field(SamplingConfig::kTopK, s.top_k)},
+                   {"min_p", field(SamplingConfig::kMinP, s.min_p)},
+                   {"repeat_penalty", field(SamplingConfig::kRepeatPenalty, s.repeat_penalty)},
                    {"typical_p", s.typical_p},
-                   {"repeat_last_n", s.repeat_last_n},
-                   {"presence_penalty", s.presence_penalty},
-                   {"frequency_penalty", s.frequency_penalty},
+                   {"repeat_last_n", field(SamplingConfig::kRepeatLastN, s.repeat_last_n)},
+                   {"presence_penalty", field(SamplingConfig::kPresencePenalty, s.presence_penalty)},
+                   {"frequency_penalty", field(SamplingConfig::kFrequencyPenalty, s.frequency_penalty)},
+                   {"explicit_only", s.explicit_only},
                    {"logit_bias_count", static_cast<std::int64_t>(s.logit_bias.size())},
                    {"num_ctx", s.num_ctx},
                    {"seed", s.seed},

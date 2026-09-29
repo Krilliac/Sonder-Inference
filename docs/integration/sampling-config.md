@@ -20,7 +20,7 @@ exposes them in the C ABI. No root CMake, presets, CI, `engine.cpp` or
 
 | field | default | valid range | chain (`SamplerConfig`) | Ollama option |
 | --- | --- | --- | --- | --- |
-| `typical_p` | `1.0` (off) | (0, 1] | `typical_p` | `typical_p` (sent when != 1) |
+| `typical_p` | `1.0` (off) | (0, 1] | `typical_p` | rejected with `invalid_argument` when != 1 (Ollama 0.34.1+ removed it) |
 | `repeat_last_n` | `64` | -1 (whole ctx), 0 (off), [1, 2^24] | `penalty_last_n` | `repeat_last_n` (sent when != 64) |
 | `presence_penalty` | `0.0` (off) | [-2, 2] | `presence_penalty` | `presence_penalty` (sent when != 0) |
 | `frequency_penalty` | `0.0` (off) | [-2, 2] | `frequency_penalty` | `frequency_penalty` (sent when != 0) |
@@ -28,6 +28,13 @@ exposes them in the C ABI. No root CMake, presets, CI, `engine.cpp` or
 | `num_ctx` | `0` (backend default) | 0 or [1, 2^24] | none (not a sampler stage) | `num_ctx` (sent when > 0) |
 
 `repeat_penalty` already existed (default 1.1, (0, 10]) and is unchanged.
+
+`explicit_only` / `explicit_fields` (C++ only, not in the C ABI) record which
+sampler fields a caller set. The OpenAI-compatible server sets them from the
+request body. When `explicit_only` is true, the Ollama adapter sends only the
+flagged fields, so Ollama applies the model's own defaults (from the GGUF) to
+the rest instead of this struct's. Other callers leave `explicit_only` false and
+keep the previous behaviour.
 `repeat_last_n = 64` equals what `from_core()` hard-coded before and the
 Ollama/llama.cpp default, so the chain and Ollama behave as before.
 
