@@ -19,7 +19,9 @@ inline constexpr std::string_view kBackendNote =
     "(no inference; never a quality or performance signal). It serves the model names\n"
     "'mock' and 'mock:<anything>' and stops after about 16 tokens by design.\n"
     "ollama talks to a local Ollama server; llamacpp (SONDER_WITH_LLAMA_CPP=ON builds)\n"
-    "takes a GGUF path as --model.";
+    "takes a GGUF path as --model; llamaserver supervises or attaches to an\n"
+    "OpenAI-compatible llama-server upstream. Unset sampling options on llamaserver\n"
+    "use upstream defaults (the defaults listed in Sampling apply to other backends).";
 
 inline constexpr std::string_view kEnvNote =
     "Environment (flags win): SONDER_INFER_BACKEND (--backend), SONDER_INFER_MODEL\n"
@@ -40,16 +42,30 @@ inline OptionGroup ollama_options() {
               "plain http:// is refused; https:// needs SONDER_WITH_TLS=ON)"}}};
 }
 
+inline OptionGroup llamaserver_options() {
+    return {"Llama-server",
+            {{"llamaserver-config", OptionKind::value, "PATH", "JSON config (attach or spawn)"},
+             {"llamaserver-url", OptionKind::value, "URL", "attach URL (default http://127.0.0.1:8080)"},
+             {"llamaserver-mode", OptionKind::value, "MODE", "attach or spawn"},
+             {"llamaserver-executable", OptionKind::value, "PATH", "llama-server executable for spawn"},
+             {"llamaserver-arg", OptionKind::repeat, "ARG", "spawn argument, one argv entry per occurrence"}}};
+}
+
 inline OptionGroup backend_options() {
     return {"Backend",
-            {{"backend", OptionKind::value, "NAME", "mock | ollama | llamacpp (env SONDER_INFER_BACKEND)"},
+            {{"backend", OptionKind::value, "NAME", "mock | ollama | llamacpp | llamaserver (env SONDER_INFER_BACKEND)"},
              {"model", OptionKind::value, "MODEL",
               "model id (env SONDER_INFER_MODEL; the mock backend defaults to 'mock')"},
              {"ollama-url", OptionKind::value, "URL", "Ollama base URL (env SONDER_OLLAMA_URL, then OLLAMA_HOST)"},
              {"ollama-allow-remote", OptionKind::flag, "",
               "allow a non-loopback Ollama host, https:// only (warns;\n"
               "plain http:// is refused; https:// needs SONDER_WITH_TLS=ON)"},
-             {"mock-delay-ms", OptionKind::value, "N", "mock backend per-token delay, 0 to 60000 (default 0)"}}};
+             {"mock-delay-ms", OptionKind::value, "N", "mock backend per-token delay, 0 to 60000 (default 0)"},
+             {"llamaserver-config", OptionKind::value, "PATH", "llamaserver JSON config (attach or spawn)"},
+             {"llamaserver-url", OptionKind::value, "URL", "llamaserver attach URL (default http://127.0.0.1:8080)"},
+             {"llamaserver-mode", OptionKind::value, "MODE", "llamaserver mode: attach or spawn"},
+             {"llamaserver-executable", OptionKind::value, "PATH", "llama-server executable for spawn mode"},
+             {"llamaserver-arg", OptionKind::repeat, "ARG", "repeatable spawn argument passed verbatim"}}};
 }
 
 inline OptionGroup sampling_options() {
@@ -133,7 +149,7 @@ inline const CommandSpec& backends_command() {
         "backends",
         "probe the backends in this build",
         {"backends [--json] [--ollama-url URL]"},
-        {output_json(), ollama_options()},
+        {output_json(), ollama_options(), llamaserver_options()},
         {kBackendNote, kEnvNote,
          "Exits 1 when no backend is available (an unreachable Ollama alone does not fail\n"
          "the command while the mock backend is available).",
@@ -149,9 +165,9 @@ inline const CommandSpec& models_command() {
         "list the models a backend can serve",
         {"models --backend NAME [--json] [--ollama-url URL]"},
         {{"Backend",
-          {{"backend", OptionKind::value, "NAME", "mock | ollama | llamacpp (env SONDER_INFER_BACKEND)"}}},
+          {{"backend", OptionKind::value, "NAME", "mock | ollama | llamacpp | llamaserver (env SONDER_INFER_BACKEND)"}}},
          output_json(),
-         ollama_options()},
+         ollama_options(), llamaserver_options()},
         {kBackendNote, kEnvNote, kExitNote},
         {"models --backend mock --json", "models --backend ollama"}};
     return spec;
@@ -241,7 +257,7 @@ inline const CommandSpec& bench_command() {
 inline const CommandSpec& serve_command() {
     static const CommandSpec spec{"serve",
                                   "local HTTP API (OpenAI-compatible subset) and live telemetry (docs/SERVER.md)",
-                                  {"serve --backend mock|ollama|llamacpp [--model ID]... [options]"},
+                                  {"serve --backend mock|ollama|llamacpp|llamaserver [--model ID]... [options]"},
                                   {},
                                   {},
                                   {"serve --backend mock --port 11437"}};

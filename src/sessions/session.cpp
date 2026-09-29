@@ -48,6 +48,21 @@ const char* to_string(RequestOutcome outcome) noexcept {
 }
 
 namespace {
+// These are backend observations. Keep their names distinct from Sonder's
+// logical reused_prompt_tokens, which do not prove physical KV reuse.
+void backend_observations(json::Object& attrs, const GenerateStats& stats) {
+    if (stats.cached_tokens) attrs.set("backend_cached_tokens", *stats.cached_tokens);
+    if (stats.draft_tokens) attrs.set("backend_draft_tokens", *stats.draft_tokens);
+    if (stats.draft_accepted_tokens) attrs.set("backend_draft_accepted_tokens", *stats.draft_accepted_tokens);
+    if (stats.draft_tokens && *stats.draft_tokens > 0 && stats.draft_accepted_tokens) {
+        attrs.set("backend_draft_acceptance_ratio",
+                  static_cast<double>(*stats.draft_accepted_tokens) / static_cast<double>(*stats.draft_tokens));
+    }
+    if (stats.predicted_tokens_per_second) {
+        attrs.set("backend_predicted_tokens_per_second", *stats.predicted_tokens_per_second);
+    }
+}
+
 json::Value sampling_json(const SamplingConfig& s) {
     // With explicit_only, a field the caller did not set was never sent to a
     // model-default backend, so it is recorded as null ("model default"),
@@ -585,6 +600,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                          {"total_ms", result.total_ms},
                          {"scheduled", result.scheduling.scheduled},
                          {"sampler", result.scheduling.sonder_sampled ? "sonder" : "backend"}};
+    backend_observations(summary, result.stats);
     if (result.scheduling.scheduled) {
         summary.set("queue_ms", result.scheduling.queue_ms);
         summary.set("preemptions", result.scheduling.preemptions);
@@ -596,6 +612,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         json::Object pre{{"prompt_tokens", result.stats.prompt_tokens},
                          {"token_counts_from_backend", result.stats.token_counts_from_backend},
                          {"ttft_ms", result.ttft_ms}};
+        if (result.stats.cached_tokens) pre.set("backend_cached_tokens", *result.stats.cached_tokens);
         if (result.stats.prompt_eval_ns > 0) {
             pre.set("backend_prompt_eval_ms", static_cast<double>(result.stats.prompt_eval_ns) / 1e6);
         }
@@ -607,6 +624,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         json::Object dec{{"completion_tokens", result.stats.completion_tokens},
                          {"chunks", delivered},
                          {"decode_wall_ms", decode_ms}};
+        backend_observations(dec, result.stats);
         if (result.stats.eval_ns > 0) {
             dec.set("backend_eval_ms", static_cast<double>(result.stats.eval_ns) / 1e6);
             dec.set("backend_tokens_per_sec",

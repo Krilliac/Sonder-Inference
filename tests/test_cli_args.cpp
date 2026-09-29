@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "cli/cli_args.hpp"
+#include "cli/sonder_infer_commands.hpp"
 #include "test_helpers.hpp"
 
 using namespace sonder::inference;
@@ -41,6 +42,20 @@ TEST_CASE("cli: parse chat subcommand with values, stops and flags") {
     CHECK(a->stops[1] == "\n\n");
     CHECK(a->has("capture-text"));
     CHECK_FALSE(a->has("markdown"));
+}
+
+TEST_CASE("cli: parse llamaserver configuration options and verbatim repeatable args") {
+    std::string error;
+    auto a = cli::parse_command_args(cli::generate_command(),
+                    {"--backend", "llamaserver", "--llamaserver-config", "server.json",
+                     "--llamaserver-mode", "spawn", "--llamaserver-executable", "llama-server.exe",
+                     "--llamaserver-arg", "--spec-type", "--llamaserver-arg", "draft-mtp",
+                     "--llamaserver-arg", "--spec-draft-n-max", "--llamaserver-arg", "3"}, error);
+    REQUIRE_MESSAGE(a.has_value(), error);
+    CHECK(a->get("backend") == std::optional<std::string>("llamaserver"));
+    CHECK(a->get("llamaserver-config") == std::optional<std::string>("server.json"));
+    CHECK(a->get("llamaserver-mode") == std::optional<std::string>("spawn"));
+    CHECK(a->all("llamaserver-arg") == std::vector<std::string>{"--spec-type", "draft-mtp", "--spec-draft-n-max", "3"});
 }
 
 TEST_CASE("cli: bench --markdown is a boolean flag anywhere in the list") {
