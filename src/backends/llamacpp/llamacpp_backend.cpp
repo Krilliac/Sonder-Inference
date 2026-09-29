@@ -15,6 +15,7 @@
 #include <string>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include "ggml-backend.h"
 #include "llama.h"
@@ -27,6 +28,60 @@ namespace sonder::backends::llamacpp {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+std::string ReadModelMetadataValue(const llama_model* model, const char* key) {
+    std::size_t capacity = 256;
+    for (int attempt = 0; attempt != 3; ++attempt) {
+        std::string value(capacity, '\0');
+        const int32_t n = llama_model_meta_val_str(model, key, value.data(), value.size());
+        if (n < 0) return {};
+        if (static_cast<std::size_t>(n) < value.size()) {
+            value.resize(static_cast<std::size_t>(n));
+            return value;
+        }
+        capacity = static_cast<std::size_t>(n) + 1;
+    }
+    return {};
+}
+
+sonder::inference::ModelArchitecture ReadModelArchitecture(const llama_model* model) {
+    sonder::inference::ModelMetadata metadata;
+    const std::string architecture = ReadModelMetadataValue(model, "general.architecture");
+    if (!architecture.empty()) metadata.emplace_back("general.architecture", architecture);
+    const int32_t count = llama_model_meta_count(model);
+    if (count <= 0) return sonder::inference::classify_model_architecture(metadata);
+    for (int32_t i = 0; i < count; ++i) {
+        std::size_t capacity = 256;
+        std::string key;
+        for (int attempt = 0; attempt != 3; ++attempt) {
+            key.assign(capacity, '\0');
+            const int32_t n = llama_model_meta_key(model, i, key.data(), key.size());
+            if (n < 0) {
+                key.clear();
+                break;
+            }
+            if (static_cast<std::size_t>(n) < key.size()) {
+                key.resize(static_cast<std::size_t>(n));
+                break;
+            }
+            capacity = static_cast<std::size_t>(n) + 1;
+        }
+        if (key.empty() || key == "general.architecture") continue;
+        const std::string lower_key = sonder::inference::detail::lower_copy(key);
+        const bool relevant = lower_key.find("deltanet") != std::string::npos ||
+                              lower_key.find(".ssm_") != std::string::npos ||
+                              lower_key.find(".ssm.") != std::string::npos ||
+                              lower_key.find("_ssm") != std::string::npos ||
+                              lower_key.find("recurrent") != std::string::npos ||
+                              lower_key.find("attention") != std::string::npos ||
+                              lower_key.find(".attn") != std::string::npos;
+        if (relevant) {
+            const std::string value = ReadModelMetadataValue(model, key.c_str());
+            metadata.emplace_back(std::move(key), value);
+        }
+    }
+    return sonder::inference::classify_model_architecture(metadata);
+}
 
 double MsSince(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
@@ -108,6 +163,7 @@ struct LlamaCppBackend::Impl {
     // Consulted by llama.cpp's abort callback during long llama_decode calls.
     const CancelPredicate* active_cancel = nullptr;
     std::atomic<bool> abort_requested{false};
+    sonder::inference::ModelArchitecture architecture = sonder::inference::ModelArchitecture::attention_only;
 
     ~Impl() { Release(); }
 
@@ -253,6 +309,7 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
     impl_->model = model;
     impl_->vocab = llama_model_get_vocab(model);
     impl_->options = options;
+    impl_->architecture = ReadModelArchitecture(model);
 
     if (!options.vocab_only) {
         llama_context_params cp = llama_context_default_params();
@@ -298,6 +355,7 @@ ModelInfo LlamaCppBackend::GetModelInfo() const {
     info.n_params = llama_model_n_params(impl_->model);
     info.n_vocab = llama_vocab_n_tokens(impl_->vocab);
     info.n_ctx = impl_->ctx != nullptr ? llama_n_ctx(impl_->ctx) : 0;
+    info.architecture = impl_->architecture;
     return info;
 }
 

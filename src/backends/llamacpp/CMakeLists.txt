@@ -85,6 +85,7 @@ add_library(sonder_backend_llamacpp STATIC
 add_library(sonder::backend_llamacpp ALIAS sonder_backend_llamacpp)
 target_include_directories(sonder_backend_llamacpp
     PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+           "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
 )
 target_compile_features(sonder_backend_llamacpp PUBLIC cxx_std_20)
 # llama.h stays private: nothing outside this directory sees llama.cpp types.

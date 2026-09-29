@@ -63,6 +63,37 @@ struct Rig {
     }
 };
 
+// Test-only descriptor override: preserves the mock's execution behaviour while
+// exercising the same model -> Session -> scheduler path as native backends.
+class ArchitectureModel final : public BackendModel {
+public:
+    ArchitectureModel(std::shared_ptr<Model> wrapped, ModelArchitecture architecture, bool native_chat)
+        : wrapped_(std::move(wrapped)), descriptor_(wrapped_->descriptor()), native_chat_(native_chat) {
+        descriptor_.architecture = architecture;
+    }
+    const ModelDescriptor& descriptor() const override { return descriptor_; }
+    Result<GenerateStats> generate(const GenerateRequest& request, const CancellationToken& cancel,
+                                  const TokenCallback& callback) override {
+        return wrapped_->backend_model().generate(request, cancel, callback);
+    }
+    Result<std::vector<TokenId>> tokenize(std::string_view text) override {
+        return wrapped_->backend_model().tokenize(text);
+    }
+    Result<std::unique_ptr<TokenStream>> open_token_stream(const GenerateRequest& request) override {
+        return wrapped_->backend_model().open_token_stream(request);
+    }
+    Result<GenerateStats> chat(const ChatRequest& request, const CancellationToken& cancel,
+                              const TokenCallback& callback) override {
+        return wrapped_->backend_model().chat(request, cancel, callback);
+    }
+    bool has_native_chat() const override { return native_chat_; }
+
+private:
+    std::shared_ptr<Model> wrapped_;
+    ModelDescriptor descriptor_;
+    bool native_chat_;
+};
+
 [[maybe_unused]] std::string attr_str(const json::Value& e, const char* key) {
     const auto* a = e.find("attributes");
     const auto* v = a ? a->find(key) : nullptr;
@@ -129,6 +160,54 @@ TEST_CASE("scheduling is active by default and can be disabled") {
     auto res = r2.session()->generate("hello");
     REQUIRE(res.ok());
     CHECK_FALSE(res.value().scheduling.scheduled);
+}
+
+TEST_CASE("architecture reaches prefix accounting across generation and both chat routes") {
+    // 3 architectures x 2 execution modes x 3 entry routes. No backend can
+    // register physical state checkpoints yet, so recurrent reuse must be zero.
+    for (const auto architecture : {ModelArchitecture::attention_only, ModelArchitecture::hybrid,
+                                   ModelArchitecture::recurrent}) {
+        for (const bool token_logits : {false, true}) {
+            for (const int route : {0, 1, 2}) {  // generate, generic chat, native chat
+                CAPTURE(architecture);
+                CAPTURE(token_logits);
+                CAPTURE(route);
+                MockBackendOptions mock;
+                mock.token_logits = token_logits;
+                SchedulingOptions sched;
+                sched.kv_block_size_tokens = 4;
+                sched.prefill_chunk_tokens = 4;
+                Rig rig(mock, sched);
+                REQUIRE(rig.model);
+                auto impl = std::make_shared<ArchitectureModel>(rig.model, architecture, route == 2);
+                rig.model = std::make_shared<Model>("architecture-fixture", kMockBackendName, "cpu:0", impl);
+                const std::string prompt = words(15, "architecture");
+                const std::vector<ChatMessage> messages{{"user", prompt}};
+                auto run = [&] {
+                    auto session = rig.session(SamplingConfig::greedy(2));
+                    if (route == 0) return session->generate(prompt);
+                    return session->chat(messages);
+                };
+                const auto first = run();
+                const auto second = run();
+                REQUIRE(first.ok());
+                REQUIRE(second.ok());
+                CHECK(first->text == second->text);
+                CHECK(second->scheduling.scheduled);
+                CHECK(second->scheduling.accounted_prompt_tokens == first->scheduling.accounted_prompt_tokens);
+                if (architecture == ModelArchitecture::attention_only) {
+                    CHECK(second->scheduling.reused_prompt_tokens ==
+                          (second->scheduling.accounted_prompt_tokens / 4) * 4);
+                } else {
+                    CHECK(first->scheduling.reused_prompt_tokens == 0);
+                    CHECK(second->scheduling.reused_prompt_tokens == 0);
+                    CHECK(rig.events_of("kv.reused").empty());
+                }
+                CHECK(rig.engine->kv_usage().sequences == 0);
+                CHECK(rig.engine->kv_usage().pinned_blocks == 0);
+            }
+        }
+    }
 }
 
 TEST_CASE("concurrent sessions are batched and produce the unscheduled output") {

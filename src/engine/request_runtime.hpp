@@ -36,6 +36,7 @@ struct RuntimeRequestSpec {
     std::uint32_t max_new_tokens = 1;
     std::uint32_t context_limit = 0;  // 0 = unknown
     std::uint64_t fingerprint = 0;    // model compatibility (prefix sharing)
+    ModelArchitecture architecture = ModelArchitecture::attention_only;
 };
 
 struct RuntimeSubmission {

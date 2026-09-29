@@ -67,6 +67,7 @@ struct Req {
     std::vector<kvc::TokenId> tokens;  // prompt + produced tokens
     std::size_t prompt_tokens = 0;
     kvc::CacheFingerprint fingerprint{};
+    ModelArchitecture architecture = ModelArchitecture::attention_only;
     kvc::Priority cache_priority = 0;
     sch::TimeUs submitted_at = 0;
     std::uint32_t credits = 0;  // grants not yet acquired by the session
@@ -180,6 +181,7 @@ public:
         r.tokens = std::move(spec.prompt_tokens);
         r.prompt_tokens = r.tokens.size();
         r.fingerprint = kvc::CacheFingerprint{spec.fingerprint};
+        r.architecture = spec.architecture;
         r.cache_priority = static_cast<kvc::Priority>(std::clamp(6 - rank, 0, 255));
         r.submitted_at = clock_.now();
         bus_.emit("scheduler.enqueued", r.ctx,
@@ -368,6 +370,7 @@ private:
             kvc::SequenceOptions so;
             so.fingerprint = r.fingerprint;
             so.priority = r.cache_priority;
+            so.architecture = r.architecture;
             if (Status st = cache_.add_sequence(r.id, so); !st.ok()) {
                 fail(r, Status(ErrorCode::internal, "KV cache: " + st.message()));
                 return false;
