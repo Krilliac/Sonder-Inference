@@ -126,3 +126,20 @@ TEST_CASE("backend: logit_bias is rejected, not silently dropped") {
     CHECK(st.status().message().find("logit_bias") != std::string::npos);
     CHECK(srv.last_generate_body().empty());  // nothing was sent
 }
+
+TEST_CASE("backend: typical_p is rejected, not silently dropped") {
+    FakeOllamaServer srv;
+    srv.set_show("llama3.2:3b", fixture("show.json"));
+    auto be = make_ollama_backend(config_for(srv));
+    auto m = be->load_model({"llama3.2:3b", "cpu:0"});
+    REQUIRE(m.ok());
+    GenerateRequest req;
+    req.prompt = "hi";
+    req.sampling = SamplingConfig::greedy(8, 1);
+    req.sampling.typical_p = 0.9f;
+    auto st = m.value()->generate(req, {}, {});
+    REQUIRE_FALSE(st.ok());
+    CHECK(st.status().code() == ErrorCode::invalid_argument);
+    CHECK(st.status().message().find("typical_p") != std::string::npos);
+    CHECK(srv.last_generate_body().empty());
+}

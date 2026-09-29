@@ -20,7 +20,7 @@ exposes them in the C ABI. No root CMake, presets, CI, `engine.cpp` or
 
 | field | default | valid range | chain (`SamplerConfig`) | Ollama option |
 | --- | --- | --- | --- | --- |
-| `typical_p` | `1.0` (off) | (0, 1] | `typical_p` | not forwarded (Ollama 0.34.1+ rejects it) |
+| `typical_p` | `1.0` (off) | (0, 1] | `typical_p` | rejected with `invalid_argument` when != 1 (Ollama 0.34.1+ removed it) |
 | `repeat_last_n` | `64` | -1 (whole ctx), 0 (off), [1, 2^24] | `penalty_last_n` | `repeat_last_n` (sent when != 64) |
 | `presence_penalty` | `0.0` (off) | [-2, 2] | `presence_penalty` | `presence_penalty` (sent when != 0) |
 | `frequency_penalty` | `0.0` (off) | [-2, 2] | `frequency_penalty` | `frequency_penalty` (sent when != 0) |
