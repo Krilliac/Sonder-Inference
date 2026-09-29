@@ -31,7 +31,8 @@ class ProcessLauncher {
 };
 
 // The production launcher uses CreateProcessW/Job Objects on Windows and a
-// process group on POSIX. Tests can inject a launcher without creating a child.
+// process group with a parent-liveness pipe watcher on POSIX (Linux/macOS).
+// Tests can inject a launcher without creating a child.
 std::unique_ptr<ProcessLauncher> make_process_launcher();
 
 Status validate_process_arguments(const std::vector<std::string> &arguments);

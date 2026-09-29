@@ -7,6 +7,16 @@
 #include <mutex>
 #include <thread>
 
+#if !defined(_WIN32)
+#include <cerrno>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 using namespace sonder::inference;
 using namespace sonder::inference::llamaserver;
 namespace {
@@ -249,3 +259,207 @@ TEST_CASE("argument validation rejects NUL and host or port overrides") {
     CHECK_FALSE(validate_process_arguments({std::string("--model\0hidden", 13)}).ok());
     CHECK(validate_process_arguments({"-p", "prompt"}).ok());
 }
+
+#if !defined(_WIN32)
+namespace {
+std::string temporary_pid_file() {
+    char path[] = "/tmp/sonder-llamaserver-pid-XXXXXX";
+    const int fd = mkstemp(path);
+    if (fd < 0)
+        return {};
+    close(fd);
+    unlink(path);
+    return path;
+}
+
+bool read_pid(const std::string &path, pid_t &pid) {
+    std::ifstream input(path);
+    long value = 0;
+    if (!(input >> value) || value <= 0)
+        return false;
+    pid = static_cast<pid_t>(value);
+    return true;
+}
+
+bool wait_for_pid_file(const std::string &path, pid_t &pid, std::chrono::milliseconds timeout) {
+    const auto until = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < until) {
+        if (read_pid(path, pid))
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return read_pid(path, pid);
+}
+
+struct PidFileCleanup {
+    std::vector<std::string> paths;
+    ~PidFileCleanup() {
+        for (const auto &path : paths)
+            unlink(path.c_str());
+    }
+};
+
+bool process_gone(pid_t pid) {
+    if (kill(pid, 0) != 0)
+        return errno == ESRCH;
+
+    // A killed, reparented child can briefly remain as a zombie while init
+    // (or launchd) reaps it. It no longer owns model/GPU resources, so accept
+    // that state as gone while still rejecting a live process.
+    char command[64]{};
+    std::snprintf(command, sizeof(command), "ps -o state= -p %ld", static_cast<long>(pid));
+    FILE *pipe = popen(command, "r");
+    if (!pipe)
+        return false;
+    char state[16]{};
+    const bool zombie =
+        std::fgets(state, sizeof(state), pipe) != nullptr && (state[0] == 'Z' || state[1] == 'Z');
+    (void)pclose(pipe);
+    return zombie;
+}
+
+bool wait_for_exit(pid_t pid, int &status, std::chrono::milliseconds timeout) {
+    const auto until = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        const pid_t result = waitpid(pid, &status, WNOHANG);
+        if (result == pid)
+            return true;
+        if (result < 0 && errno != EINTR && errno != ECHILD)
+            return false;
+        if (std::chrono::steady_clock::now() >= until)
+            return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+}
+
+void helper_spawn_long_running_children(const std::string &first_file, const std::string &second_file,
+                                        const std::string &ready_file) {
+    std::unique_ptr<Process> first;
+    std::unique_ptr<Process> second;
+    std::thread launcher([&] {
+        ProcessSpec first_spec;
+        first_spec.executable = "/bin/sh";
+        first_spec.arguments = {"-c", "trap '' TERM; echo $$ > '" + first_file + "'; while :; do :; done"};
+        first_spec.port = 1;
+        first_spec.shutdown_timeout = std::chrono::seconds(30);
+        auto first_result = make_process_launcher()->start(first_spec);
+        if (!first_result.ok())
+            return;
+        first = std::move(first_result.value());
+
+        ProcessSpec second_spec = first_spec;
+        second_spec.arguments = {"-c", "trap '' TERM; echo $$ > '" + second_file + "'; while :; do :; done"};
+        auto second_result = make_process_launcher()->start(second_spec);
+        if (second_result.ok())
+            second = std::move(second_result.value());
+    });
+    launcher.join();
+    if (!first || !second)
+        _exit(111);
+    // Publish readiness only after the launching thread has exited. A
+    // thread-bound PDEATHSIG implementation must not pass this regression.
+    {
+        std::ofstream ready(ready_file);
+        ready << getpid() << '\n';
+    }
+    for (;;) {
+        pause();
+    }
+}
+} // namespace
+
+TEST_CASE("POSIX child is gone when launcher parent is SIGKILLed") {
+    PidFileCleanup files;
+    const auto first_file = temporary_pid_file();
+    const auto second_file = temporary_pid_file();
+    const auto ready_file = temporary_pid_file();
+    REQUIRE_FALSE(first_file.empty());
+    REQUIRE_FALSE(second_file.empty());
+    REQUIRE_FALSE(ready_file.empty());
+    files.paths = {first_file, second_file, ready_file};
+
+    const pid_t helper = fork();
+    REQUIRE(helper >= 0);
+    if (helper == 0)
+        helper_spawn_long_running_children(first_file, second_file, ready_file);
+
+    pid_t first_child = -1;
+    pid_t second_child = -1;
+    pid_t ready_parent = -1;
+    const bool started = wait_for_pid_file(ready_file, ready_parent, std::chrono::seconds(3)) &&
+                         wait_for_pid_file(first_file, first_child, std::chrono::seconds(2)) &&
+                         wait_for_pid_file(second_file, second_child, std::chrono::seconds(2));
+    CHECK(started);
+    if (started) {
+        CHECK(ready_parent == helper);
+        CHECK_FALSE(process_gone(first_child));
+        CHECK_FALSE(process_gone(second_child));
+        CHECK(kill(helper, SIGKILL) == 0);
+        int status = 0;
+        CHECK(wait_for_exit(helper, status, std::chrono::seconds(2)));
+        CHECK(WIFSIGNALED(status));
+
+        bool first_gone = false;
+        bool second_gone = false;
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < until) {
+            first_gone = first_gone || process_gone(first_child);
+            second_gone = second_gone || process_gone(second_child);
+            if (first_gone && second_gone)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        CHECK(first_gone);
+        CHECK(second_gone);
+        if (!first_gone) {
+            const pid_t group = getpgid(first_child);
+            if (group > 0 && group != getpgrp())
+                kill(-group, SIGKILL);
+            else
+                kill(first_child, SIGKILL);
+        }
+        if (!second_gone) {
+            const pid_t group = getpgid(second_child);
+            if (group > 0 && group != getpgrp())
+                kill(-group, SIGKILL);
+            else
+                kill(second_child, SIGKILL);
+        }
+    } else {
+        kill(helper, SIGKILL);
+        int status = 0;
+        (void)wait_for_exit(helper, status, std::chrono::seconds(2));
+        // Also clean up partial startup when running against a broken
+        // launcher; do not leave a busy fake server behind after a failure.
+        if (read_pid(first_file, first_child) && !process_gone(first_child))
+            kill(first_child, SIGKILL);
+        if (read_pid(second_file, second_child) && !process_gone(second_child))
+            kill(second_child, SIGKILL);
+    }
+}
+
+TEST_CASE("POSIX SIGTERM shutdown returns when child exits") {
+    PidFileCleanup files;
+    const auto pid_file = temporary_pid_file();
+    REQUIRE_FALSE(pid_file.empty());
+    files.paths.push_back(pid_file);
+    ProcessSpec spec;
+    spec.executable = "/bin/sh";
+    spec.arguments = {"-c", "trap 'exit 0' TERM; echo $$ > '" + pid_file + "'; while :; do :; done"};
+    spec.port = 1;
+    spec.shutdown_timeout = std::chrono::seconds(2);
+    auto result = make_process_launcher()->start(spec);
+    REQUIRE_MESSAGE(result.ok(), result.status().to_string());
+    auto process = std::move(result.value());
+    pid_t child = -1;
+    CHECK(wait_for_pid_file(pid_file, child, std::chrono::seconds(1)));
+
+    const auto started = std::chrono::steady_clock::now();
+    process->stop(std::chrono::seconds(2));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(elapsed < std::chrono::milliseconds(500));
+    CHECK_FALSE(process->running());
+    if (child > 0)
+        CHECK(process_gone(child));
+}
+#endif

@@ -17,7 +17,14 @@
 #else
 #include <cerrno>
 #include <csignal>
+#include <fcntl.h>
+#include <mutex>
+#include <pthread.h>
 #include <spawn.h>
+#include <sys/resource.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -168,12 +175,94 @@ class WindowsLauncher final : public ProcessLauncher {
     }
 };
 #else
+struct Pipe {
+    int read_fd = -1;
+    int write_fd = -1;
+    ~Pipe() {
+        if (read_fd >= 0)
+            close(read_fd);
+        if (write_fd >= 0)
+            close(write_fd);
+    }
+    bool open() {
+        int fds[2];
+#if defined(__linux__)
+        if (pipe2(fds, O_CLOEXEC) != 0)
+            return false;
+#else
+        if (pipe(fds) != 0)
+            return false;
+#endif
+        read_fd = fds[0];
+        write_fd = fds[1];
+        return fcntl(read_fd, F_SETFD, FD_CLOEXEC) == 0 && fcntl(write_fd, F_SETFD, FD_CLOEXEC) == 0;
+    }
+};
+
+// Only async-signal-safe operations are allowed in the forked watcher. In
+// particular, never use C++ allocation, locks, logging or exit() here.
+[[noreturn]] void watch_parent(int lifetime_fd, int ready_fd, int fd_limit) {
+    const pid_t group = getpid();
+    if (setpgid(0, 0) != 0)
+        _exit(1);
+    // Do not retain sockets, files, or another launcher's liveness writer. The
+    // latter would keep that server alive after the real parent disappeared.
+    for (int fd = 0; fd < fd_limit; ++fd) {
+        if (fd != lifetime_fd && fd != ready_fd)
+            close(fd);
+    }
+    const char ready = 'R';
+    ssize_t n;
+    do {
+        n = write(ready_fd, &ready, 1);
+    } while (n < 0 && errno == EINTR);
+    close(ready_fd);
+    if (n == 1) {
+        char byte;
+        do {
+            n = read(lifetime_fd, &byte, 1);
+        } while (n > 0 || (n < 0 && errno == EINTR));
+    }
+    // EOF is kernel-delivered even after a crash or SIGKILL. Use SIGKILL so a
+    // server ignoring SIGTERM cannot keep model/GPU resources indefinitely.
+    kill(-group, SIGKILL);
+    _exit(0);
+}
+
+bool owns_child(pid_t pid) {
+    siginfo_t info{};
+    int rc;
+    do {
+        rc = waitid(P_PID, static_cast<id_t>(pid), &info, WEXITED | WNOHANG | WNOWAIT);
+    } while (rc < 0 && errno == EINTR);
+    return rc == 0;
+}
+
+void reap_child(pid_t pid) {
+    if (pid > 0) {
+        while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
+        }
+    }
+}
+
 class PosixProcess final : public Process {
   public:
-    PosixProcess(pid_t pid, std::chrono::milliseconds timeout) : pid_(pid), timeout_(timeout) {}
+    explicit PosixProcess(std::chrono::milliseconds timeout) : timeout_(timeout) {}
+    void adopt_watcher(pid_t watcher, int lifetime_fd) {
+        watcher_ = watcher;
+        lifetime_fd_ = lifetime_fd;
+    }
+    void adopt_server(pid_t pid) { pid_ = pid; }
     ~PosixProcess() override { stop(timeout_); }
     bool running() const override {
         if (pid_ <= 0)
+            return false;
+        siginfo_t watcher_info{};
+        int rc;
+        do {
+            rc = waitid(P_PID, static_cast<id_t>(watcher_), &watcher_info, WEXITED | WNOHANG | WNOWAIT);
+        } while (rc < 0 && errno == EINTR);
+        if (rc != 0 || watcher_info.si_pid != 0)
             return false;
         siginfo_t info{};
         if (waitid(P_PID, static_cast<id_t>(pid_), &info, WEXITED | WNOHANG | WNOWAIT) != 0) {
@@ -184,31 +273,52 @@ class PosixProcess final : public Process {
         return info.si_pid == 0;
     }
     void stop(std::chrono::milliseconds timeout) override {
-        (void)running(); // checks ownership without reaping
-        if (pid_ <= 0)
+        if (watcher_ <= 0)
             return;
-        kill(-pid_, SIGTERM);
-        const auto until = std::chrono::steady_clock::now() + timeout;
-        while (std::chrono::steady_clock::now() < until) {
-            siginfo_t info{};
-            if (waitid(P_PID, static_cast<id_t>(pid_), &info, WEXITED | WNOHANG | WNOWAIT) != 0 &&
-                errno == ECHILD) {
-                pid_ = -1;
-                return; // ownership lost; do not signal a potentially recycled group
+        // The watcher PID reserves the server PGID even after the server has
+        // been reaped. If another reaper took the watcher, do not signal a
+        // potentially recycled group ID.
+        if (owns_child(watcher_)) {
+            kill(-watcher_, SIGTERM);
+            const auto until =
+                std::chrono::steady_clock::now() + (pid_ > 0 ? timeout : std::chrono::milliseconds(0));
+            for (;;) {
+                if (pid_ > 0) {
+                    const auto reaped = waitpid(pid_, nullptr, WNOHANG);
+                    if (reaped == pid_ || (reaped < 0 && errno == ECHILD))
+                        pid_ = -1;
+                }
+                // Reap the exited server first: a zombie still makes kill(0)
+                // report that its group exists. Descendants get the remaining
+                // grace period, but an empty group needs no further delay.
+                if (kill(-watcher_, 0) < 0 && errno == ESRCH)
+                    break;
+                if (std::chrono::steady_clock::now() >= until)
+                    break;
+                std::this_thread::sleep_for(std::min(std::chrono::milliseconds(20),
+                                                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                         until - std::chrono::steady_clock::now())));
             }
-            // Give descendants the grace period even if the leader exited.
-            std::this_thread::sleep_for(
-                std::min(std::chrono::milliseconds(20), std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                            until - std::chrono::steady_clock::now())));
+            kill(-watcher_, SIGKILL);
+        } else if (pid_ > 0 && owns_child(pid_)) {
+            // A foreign reaper took the watchdog. The owned server can still
+            // be stopped safely, but we no longer own the numeric group ID.
+            kill(pid_, SIGKILL);
         }
-        kill(-pid_, SIGKILL);
-        while (waitpid(pid_, nullptr, 0) < 0 && errno == EINTR) {
+        if (lifetime_fd_ >= 0) {
+            close(lifetime_fd_);
+            lifetime_fd_ = -1;
         }
+        reap_child(pid_);
+        reap_child(watcher_);
         pid_ = -1;
+        watcher_ = -1;
     }
 
   private:
     mutable pid_t pid_ = -1;
+    pid_t watcher_ = -1;
+    int lifetime_fd_ = -1;
     std::chrono::milliseconds timeout_;
 };
 
@@ -230,11 +340,62 @@ class PosixLauncher final : public ProcessLauncher {
         for (auto &arg : args)
             argv.push_back(arg.data());
         argv.push_back(nullptr);
+
+        // Establish the watchdog BEFORE spawning the server, so there is no
+        // parent-death window between launching the server and arming cleanup.
+        // A pipe works on Linux and macOS and follows process lifetime, unlike
+        // Linux PR_SET_PDEATHSIG, which follows the creating THREAD's lifetime.
+        int fd_limit = 0;
+#if defined(__APPLE__)
+        // macOS commonly reports an unlimited hard rlimit. The kernel's
+        // per-process ceiling supplies a finite bound even in that case.
+        std::size_t limit_size = sizeof(fd_limit);
+        if (sysctlbyname("kern.maxfilesperproc", &fd_limit, &limit_size, nullptr, 0) != 0 || fd_limit <= 0)
+            return Status(ErrorCode::io_error, "cannot determine watcher descriptor limit");
+#else
+        struct rlimit limit{};
+        if (getrlimit(RLIMIT_NOFILE, &limit) != 0 || limit.rlim_max == RLIM_INFINITY ||
+            limit.rlim_max > static_cast<rlim_t>(std::numeric_limits<int>::max()))
+            return Status(ErrorCode::io_error, "cannot determine watcher descriptor limit");
+        fd_limit = static_cast<int>(limit.rlim_max);
+#endif
+        // Serialize this launcher's pipe()+fcntl() fallback on macOS with
+        // other launches, so they cannot exec an as-yet inheritable writer.
+        static std::mutex launch_mutex;
+        const std::lock_guard lock(launch_mutex);
+        Pipe lifetime, ready;
+        if (!lifetime.open() || !ready.open())
+            return Status(ErrorCode::io_error, "watcher pipe creation failed");
+        auto process = std::make_unique<PosixProcess>(spec.shutdown_timeout);
+        sigset_t blocked, previous;
+        sigfillset(&blocked);
+        // Block before fork so no inherited handler can run in the watcher.
+        // The server is spawned after restoring the caller's signal mask.
+        if (pthread_sigmask(SIG_SETMASK, &blocked, &previous) != 0)
+            return Status(ErrorCode::io_error, "watcher signal mask failed");
+        const pid_t watcher = fork();
+        if (watcher == 0)
+            watch_parent(lifetime.read_fd, ready.write_fd, fd_limit);
+        const int mask_rc = pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+        if (watcher < 0)
+            return Status(ErrorCode::unavailable, "watcher fork failed");
+        process->adopt_watcher(watcher, lifetime.write_fd);
+        lifetime.write_fd = -1;
+        close(ready.write_fd);
+        ready.write_fd = -1;
+        char reply = 0;
+        ssize_t received;
+        do {
+            received = read(ready.read_fd, &reply, 1);
+        } while (received < 0 && errno == EINTR);
+        if (received != 1 || reply != 'R' || mask_rc != 0)
+            return Status(ErrorCode::io_error, "watcher startup failed");
+
         posix_spawnattr_t attr{};
         if (posix_spawnattr_init(&attr) != 0)
             return Status(ErrorCode::io_error, "posix_spawnattr_init failed");
         if (posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP) != 0 ||
-            posix_spawnattr_setpgroup(&attr, 0) != 0) {
+            posix_spawnattr_setpgroup(&attr, watcher) != 0) {
             posix_spawnattr_destroy(&attr);
             return Status(ErrorCode::io_error, "posix_spawn process group configuration failed");
         }
@@ -243,7 +404,13 @@ class PosixLauncher final : public ProcessLauncher {
         posix_spawnattr_destroy(&attr);
         if (rc != 0)
             return Status(ErrorCode::unavailable, "posix_spawnp failed");
-        return std::unique_ptr<Process>(new PosixProcess(pid, spec.shutdown_timeout));
+        process->adopt_server(pid);
+        // The server now holds the group open. Move the watcher out so it
+        // survives SIGTERM during normal shutdown and does not keep an empty
+        // server group alive. Its unreaped PID still prevents PGID reuse.
+        if (setpgid(watcher, getpgrp()) != 0)
+            return Status(ErrorCode::io_error, "watcher group detachment failed");
+        return std::unique_ptr<Process>(std::move(process));
     }
 };
 #endif
