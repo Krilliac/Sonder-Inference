@@ -64,6 +64,7 @@ Gate: measurable win on agent fan-out/long-context workloads without interactive
 - [ ] CPU KV spill
 - [ ] cache quantization where supported
 - [x] tensor placement overrides (MoE experts in RAM; `docs/PLACEMENT.md` step 1)
+- [x] llama.cpp KV cache types (K and V separately), flash attention mode and micro-batch size as backend/`serve` options; defaults unchanged, no automatic policy yet (`docs/PLACEMENT.md`, "KV cache types")
 - [ ] per-model placement planner from GGUF metadata (`docs/PLACEMENT.md` step 2)
 - [ ] optional disk tier
 - [ ] model residency manager

@@ -28,6 +28,27 @@ std::optional<std::string> non_empty(std::optional<std::string> v) {
     }
     return v;
 }
+
+#if defined(SONDER_HAS_LLAMACPP_BACKEND)
+Result<LlamaCppBackendOptions> llamacpp_options(const BackendSetup& setup) {
+    LlamaCppBackendOptions lo;
+    lo.model_dirs = setup.model_dirs;
+    if (setup.llamacpp_gpu_layers) lo.gpu_layers = *setup.llamacpp_gpu_layers;
+    if (setup.llamacpp_context_length) lo.context_length = *setup.llamacpp_context_length;
+    if (setup.llamacpp_batch_size) lo.batch_size = *setup.llamacpp_batch_size;
+    if (setup.llamacpp_ubatch_size) lo.ubatch_size = *setup.llamacpp_ubatch_size;
+    if (setup.llamacpp_kv_cache_type_k) lo.kv_cache_type_k = *setup.llamacpp_kv_cache_type_k;
+    if (setup.llamacpp_kv_cache_type_v) lo.kv_cache_type_v = *setup.llamacpp_kv_cache_type_v;
+    if (setup.llamacpp_flash_attention) lo.flash_attention = *setup.llamacpp_flash_attention;
+    for (const std::string& spec : setup.llamacpp_tensor_overrides) {
+        auto parsed = parse_tensor_override(spec);
+        if (!parsed) return parsed.status();
+        lo.tensor_overrides.push_back(std::move(parsed).value());
+    }
+    if (Status st = validate_llamacpp_options(lo); !st.ok()) return st;
+    return lo;
+}
+#endif
 }  // namespace
 
 BackendEnvDefaults backend_env_defaults(const EnvLookup& lookup) {
@@ -287,16 +308,9 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
     }
     if (setup.backend == "llamacpp") {
 #if defined(SONDER_HAS_LLAMACPP_BACKEND)
-        LlamaCppBackendOptions lo;
-        lo.model_dirs = setup.model_dirs;
-        if (setup.llamacpp_gpu_layers) lo.gpu_layers = *setup.llamacpp_gpu_layers;
-        if (setup.llamacpp_context_length) lo.context_length = *setup.llamacpp_context_length;
-        for (const std::string& spec : setup.llamacpp_tensor_overrides) {
-            auto parsed = parse_tensor_override(spec);
-            if (!parsed) return parsed.status();
-            lo.tensor_overrides.push_back(std::move(parsed).value());
-        }
-        return make_llamacpp_backend(lo);
+        auto lo = llamacpp_options(setup);
+        if (!lo) return lo.status();
+        return make_llamacpp_backend(std::move(lo).value());
 #else
         return Status(ErrorCode::unsupported,
                       "this build does not include the llamacpp backend (configure with SONDER_WITH_LLAMA_CPP=ON)");
@@ -359,6 +373,18 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
     }
     return Status(ErrorCode::invalid_argument,
                   "unknown backend '" + setup.backend + "' (expected mock, ollama, llamacpp or llamaserver)");
+}
+
+Status validate_backend_setup(const BackendSetup& setup) {
+#if defined(SONDER_HAS_LLAMACPP_BACKEND)
+    if (setup.backend == kLlamaCppBackendName) {
+        auto lo = llamacpp_options(setup);
+        return lo ? Status::success() : lo.status();
+    }
+#else
+    (void)setup;
+#endif
+    return Status::success();
 }
 
 }  // namespace sonder::inference

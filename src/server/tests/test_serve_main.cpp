@@ -155,6 +155,49 @@ TEST_CASE("serve_main: usage errors exit 2") {
     fs::remove(token, ec);
 }
 
+TEST_CASE("serve_main: llama.cpp KV cache, flash attention and batch flags") {
+    std::string out;
+    std::string err;
+    CHECK(run({"--help"}, out, err) == 0);
+    for (const char* flag : {"--batch-size", "--ubatch-size", "--cache-type-k", "--cache-type-v", "--flash-attn"}) {
+        CAPTURE(flag);
+        CHECK(out.find(flag) != std::string::npos);
+    }
+    // Numeric flags are range-checked while parsing.
+    for (const auto& args : std::vector<std::vector<std::string>>{
+             {"--backend", "llamacpp", "--model", "x", "--batch-size", "0"},
+             {"--backend", "llamacpp", "--model", "x", "--batch-size", "12x"},
+             {"--backend", "llamacpp", "--model", "x", "--ubatch-size", "0"},
+             {"--backend", "llamacpp", "--model", "x", "--ubatch-size", "5000000"},
+         }) {
+        CAPTURE(args.back());
+        CHECK(run(args, out, err) == 2);
+        CHECK(err.find("error:") != std::string::npos);
+    }
+    // Bad values and combinations are usage errors before anything binds.
+    for (const auto& args : std::vector<std::vector<std::string>>{
+             {"--backend", "llamacpp", "--model", "x", "--port", "0", "--cache-type-v", "q4_0", "--flash-attn", "off"},
+             {"--backend", "llamacpp", "--model", "x", "--port", "0", "--cache-type-k", "q4_k"},
+             {"--backend", "llamacpp", "--model", "x", "--port", "0", "--flash-attn", "maybe"},
+             {"--backend", "llamacpp", "--model", "x", "--port", "0", "--batch-size", "256", "--ubatch-size", "512"},
+         }) {
+        CAPTURE(args.back());
+        CHECK(run(args, out, err) == 2);
+        CHECK(err.find("error:") != std::string::npos);
+    }
+#if defined(SONDER_HAS_LLAMACPP_BACKEND)
+    CHECK(run({"--backend", "llamacpp", "--model", "x", "--port", "0", "--cache-type-v", "q8_0", "--flash-attn",
+               "off"},
+              out, err) == 2);
+    CHECK(err.find("requires flash attention") != std::string::npos);
+    CHECK(run({"--backend", "llamacpp", "--model", "x", "--port", "0", "--cache-type-k", "q4_k"}, out, err) == 2);
+    CHECK(err.find("unknown K cache type 'q4_k'") != std::string::npos);
+    CHECK(run({"--backend", "llamacpp", "--model", "x", "--port", "0", "--batch-size", "256", "--ubatch-size", "512"},
+              out, err) == 2);
+    CHECK(err.find("n_ubatch (512) must be <= n_batch (256)") != std::string::npos);
+#endif
+}
+
 TEST_CASE("serve_main: ready file, banner, access log and graceful shutdown via the hook") {
     const auto ready = temp_path("ready.json");
     const auto events = temp_path("events.jsonl");
