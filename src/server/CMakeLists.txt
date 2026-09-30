@@ -5,7 +5,9 @@
 # Observatory telemetry streams (SSE and NDJSON). Reference: docs/SERVER.md.
 # Sources compile into sonder_inference; consumers test SONDER_HAS_SERVER.
 sonder_module_sources(
+    src/anthropic.cpp
     src/backend_setup.cpp
+    src/chat_handler.cpp
     src/http.cpp
     src/identity.cpp
     src/live_hub.cpp
@@ -22,6 +24,8 @@ sonder_module_include_directories(include)
 sonder_module_define(SONDER_HAS_SERVER)
 
 sonder_add_module_tests(server
+    tests/test_server_anthropic_units.cpp
+    tests/test_server_anthropic_http.cpp
     tests/test_server_units.cpp
     tests/test_server_http.cpp
     tests/test_server_chat.cpp

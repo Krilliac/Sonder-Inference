@@ -335,7 +335,7 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         return response_body;
     }
     Result<GenerateStats> stream(std::string_view path, std::string body, const CancellationToken &cancel,
-                                 const TokenCallback &callback, bool chat);
+                                 const TokenCallback &callback, bool chat, bool separate_reasoning = false);
 
     // Served context and slot count: GET /props once per upstream instance
     // (endpoint, plus the launch argv in spawn mode, so a restart or an
@@ -474,7 +474,8 @@ class LlamaServerModel final : public BackendModel {
         llamaserver::SlotAffinity::Lease lease;
         auto body = llamaserver::build_chat_body(descriptor_.name, request, backend_->options().grammar,
                                                  backend_->extras(props, request.session_key, lease));
-        return backend_->stream("/v1/chat/completions", body.dump(), cancel, callback, true);
+        return backend_->stream("/v1/chat/completions", body.dump(), cancel, callback, true,
+                               request.separate_reasoning);
     }
 
   private:
@@ -507,7 +508,8 @@ Result<std::shared_ptr<BackendModel>> LlamaServerBackendImpl::load_model(const M
 
 Result<GenerateStats> LlamaServerBackendImpl::stream(std::string_view path, std::string body,
                                                      const CancellationToken &cancel,
-                                                     const TokenCallback &callback, bool chat) {
+                                                     const TokenCallback &callback, bool chat,
+                                                     bool separate_reasoning) {
     auto prepared = prepare("POST", path, std::move(body), cancel);
     if (!prepared.ok())
         return prepared.status();
@@ -604,6 +606,7 @@ Result<GenerateStats> LlamaServerBackendImpl::stream(std::string_view path, std:
                 stats.token_counts_from_backend = true;
         }
         std::string piece;
+        std::string reasoning;
         std::string reason;
         if (native) {
             if (const auto *content = object.find("content")) {
@@ -644,15 +647,29 @@ Result<GenerateStats> LlamaServerBackendImpl::stream(std::string_view path, std:
             }
             if (!choices->as_array().empty()) {
                 const auto &choice = choices->as_array().front();
-                const auto *content =
-                    chat ? (choice.find("delta") ? choice.find("delta")->find("content") : nullptr)
-                         : choice.find("text");
+                const json::Value *delta = chat ? choice.find("delta") : nullptr;
+                const auto *content = chat ? (delta ? delta->find("content") : nullptr) : choice.find("text");
                 if (content && !content->is_null()) {
                     if (!content->is_string()) {
                         error = protocol_error("completion content must be text");
                         return false;
                     }
                     piece = content->as_string();
+                }
+                if (separate_reasoning && delta && delta->is_object()) {
+                    // llama-server's OpenAI-compatible reasoning extension is
+                    // emitted as reasoning_content. Accept reasoning as a
+                    // compatibility fallback used by some upstream builds.
+                    const auto *value = delta->find("reasoning_content");
+                    if (!value)
+                        value = delta->find("reasoning");
+                    if (value && !value->is_null()) {
+                        if (!value->is_string()) {
+                            error = protocol_error("reasoning content must be text");
+                            return false;
+                        }
+                        reasoning = value->as_string();
+                    }
                 }
                 if (const auto *finish = choice.find("finish_reason"); finish && !finish->is_null()) {
                     if (!finish->is_string()) {
@@ -679,10 +696,10 @@ Result<GenerateStats> LlamaServerBackendImpl::stream(std::string_view path, std:
             }
             stats.stop_reason = mapped;
         }
-        if (!piece.empty()) {
+        if (!piece.empty() || !reasoning.empty()) {
             ++observed_chunks;
             if (callback) {
-                const bool keep = callback(TokenChunk{piece, stats.chunks});
+                const bool keep = callback(TokenChunk{piece, stats.chunks, reasoning});
                 ++stats.chunks;
                 if (!keep) {
                     stopped = true;
