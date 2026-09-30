@@ -162,7 +162,7 @@ TEST_CASE("residency unit: concurrent first acquires share one load") {
     CHECK(s[0].loads == 1);
 }
 
-TEST_CASE("residency unit: a failed load fails every joined request once, the next acquire retries") {
+TEST_CASE("residency unit: a failed load fails every joined request once and the next acquire retries") {
     std::atomic<int> calls{0};
     auto gate = std::make_shared<Gate>();
     gate->close();
@@ -243,7 +243,7 @@ TEST_CASE("residency unit: defaults never evict") {
     CHECK(em.loads.load() == 2);
 }
 
-TEST_CASE("residency unit: max-resident evicts the least recently used unpinned model; pinned ones stay") {
+TEST_CASE("residency unit: max-resident evicts the least recently used unpinned model and keeps pinned ones") {
     EngineModels em;
     std::vector<std::string> evicted;
     auto r = std::make_shared<det::ModelResidency>(
@@ -287,7 +287,7 @@ TEST_CASE("residency unit: the sweeper thread evicts after the TTL") {
     r->stop_sweeper();
 }
 
-TEST_CASE("residency unit: an evicted model reads unloaded only after its release, and a reload waits for it") {
+TEST_CASE("residency unit: an evicted model reads unloaded only after its release and a reload waits for it") {
     EngineModels em;
     Gate evict_gate;
     evict_gate.close();
@@ -374,7 +374,7 @@ TEST_CASE("residency: eager start still fails when a model cannot load") {
     server.stop();
 }
 
-TEST_CASE("residency: lazy models load on first request, not at start") {
+TEST_CASE("residency: lazy models load on first request and not at start") {
     auto backend = std::make_shared<CountingBackend>();
     auto o = counting_options(backend);
     o.models = {"mock:a", "mock:b"};
@@ -441,7 +441,7 @@ TEST_CASE("residency: concurrent first requests on a lazy model load it once") {
     CHECK(f.of_type("model.load.started").size() == 1);
 }
 
-TEST_CASE("residency: a lazy model that cannot load fails its requests, not the server") {
+TEST_CASE("residency: a lazy model that cannot load fails its requests and not the server") {
     auto o = Fixture::defaults();
     o.models = {"mock:tiny", "not-a-mock-model"};
     o.lazy_models = true;
