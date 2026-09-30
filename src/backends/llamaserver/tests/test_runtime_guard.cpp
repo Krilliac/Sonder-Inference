@@ -46,8 +46,8 @@ const char *const kNextnLines[] = {
 };
 const char *const kQuietLines[] = {
     "0.01.674.000 W model has unused tensor blk.64.attn_norm.weight (size = 20480 bytes) -- ignoring",
-    "0.01.204.049 W srv  llama_server: security: no API key is set and CORS allows all origins (see "
-    "https://github.com/ggml-org/llama.cpp/pull/25655)",
+    ("0.01.204.049 W srv  llama_server: security: no API key is set and CORS allows all origins (see "
+     "https://github.com/ggml-org/llama.cpp/pull/25655)"),
     "1.34.364.127 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 81920, kv_unified = 'false'",
 };
 
