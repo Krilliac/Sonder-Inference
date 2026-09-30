@@ -20,7 +20,7 @@
 namespace sonder::inference {
 
 struct BackendSetup {
-    std::string backend;  // "mock", "ollama" or "llamacpp"
+    std::string backend;  // "mock", "ollama", "llamacpp" or "llamaserver"
     // Ollama base URL; empty uses the backend default (http://127.0.0.1:11434).
     std::string ollama_url;
     // Allow a non-loopback Ollama host. Remote hosts also need https://, which
@@ -40,6 +40,32 @@ struct BackendSetup {
     // MOCK backend: >= 0 injects a backend error after that many tokens
     // (failure-path tests; MockBackendOptions::fail_after_tokens).
     std::int32_t mock_fail_after_tokens = -1;
+
+    // External llama-server configuration. These fields deliberately mirror
+    // the JSON schema so the server and CLI share one loader without exposing
+    // the optional backend header in the always-built server module.
+    std::string llamaserver_config;
+    std::string llamaserver_mode;  // attach (default) or spawn
+    std::string llamaserver_url;
+    std::string llamaserver_executable;
+    std::vector<std::string> llamaserver_args;
+    bool llamaserver_allow_remote = false;
+    bool llamaserver_native_completion = true;
+    std::string llamaserver_grammar;
+    std::uint64_t llamaserver_connect_timeout_ms = 3000;
+    std::uint64_t llamaserver_request_timeout_ms = 300000;
+    std::uint64_t llamaserver_startup_timeout_ms = 60000;
+    std::uint64_t llamaserver_poll_interval_ms = 50;
+    std::uint64_t llamaserver_shutdown_timeout_ms = 2000;
+    std::uint64_t llamaserver_restart_backoff_ms = 100;
+    std::uint64_t llamaserver_max_restart_backoff_ms = 2000;
+    std::uint64_t llamaserver_max_restarts = 3;
+    std::string llamaserver_ca_bundle_path;
+    std::string llamaserver_pinned_sha256;
+    std::string llamaserver_pinned_cert_path;
+    bool llamaserver_insecure_skip_verify = false;
+    std::string llamaserver_server_name;
+    std::uint64_t llamaserver_handshake_timeout_ms = 10000;
 };
 
 // Values taken from the environment when the matching option is absent:
@@ -65,6 +91,10 @@ std::string normalize_ollama_host(std::string_view value);
 // Splits "PATTERN=DEVICE" at the last '=' (patterns may contain '=').
 // Errors: invalid_argument when either side is empty or '=' is missing.
 Result<std::pair<std::string, std::string>> parse_tensor_override(std::string_view spec);
+
+// Loads the strict llamaserver JSON object into setup. Unknown keys and
+// malformed types are rejected before any executable is started.
+Status load_llamaserver_config(const std::string& path, BackendSetup& setup);
 
 // Pattern for MoE expert weights (llama.cpp's --cpu-moe); `--moe-experts cpu`
 // adds "<this>=cpu" ahead of any explicit --tensor-override.

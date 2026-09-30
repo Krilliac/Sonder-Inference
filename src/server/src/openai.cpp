@@ -101,7 +101,7 @@ std::optional<ApiError> read_sampling(const json::Object& body, SamplingConfig& 
              {"temperature", &s.temperature, SamplingConfig::kTemperature},
              {"top_p", &s.top_p, SamplingConfig::kTopP},
              {"min_p", &s.min_p, SamplingConfig::kMinP},
-             {"typical_p", &s.typical_p, 0},
+             {"typical_p", &s.typical_p, SamplingConfig::kTypicalP},
              {"presence_penalty", &s.presence_penalty, SamplingConfig::kPresencePenalty},
              {"frequency_penalty", &s.frequency_penalty, SamplingConfig::kFrequencyPenalty},
              {"repeat_penalty", &s.repeat_penalty, SamplingConfig::kRepeatPenalty}}) {
@@ -125,16 +125,29 @@ std::optional<ApiError> read_sampling(const json::Object& body, SamplingConfig& 
         s.explicit_fields |= SamplingConfig::kRepeatLastN;
     }
     if (auto e = read_int(body, "num_ctx", 0, SamplingConfig::kMaxContextLimit, n, set)) return e;
-    if (set) s.num_ctx = static_cast<std::int32_t>(n);
+    if (set) {
+        s.num_ctx = static_cast<std::int32_t>(n);
+        s.explicit_fields |= SamplingConfig::kNumCtx;
+    }
     if (auto e = read_int(body, "seed", 0, std::numeric_limits<std::int64_t>::max(), n, set)) return e;
-    if (set) s.seed = static_cast<std::uint64_t>(n);
+    if (set) {
+        s.seed = static_cast<std::uint64_t>(n);
+        s.explicit_fields |= SamplingConfig::kSeed;
+    }
     if (auto e = read_int(body, "max_tokens", 1, SamplingConfig::kMaxTokensLimit, n, set)) return e;
-    if (set) s.max_tokens = static_cast<std::int32_t>(n);
+    if (set) {
+        s.max_tokens = static_cast<std::int32_t>(n);
+        s.explicit_fields |= SamplingConfig::kMaxTokens;
+    }
     // The newer OpenAI name wins when both are present.
     if (auto e = read_int(body, "max_completion_tokens", 1, SamplingConfig::kMaxTokensLimit, n, set)) return e;
-    if (set) s.max_tokens = static_cast<std::int32_t>(n);
+    if (set) {
+        s.max_tokens = static_cast<std::int32_t>(n);
+        s.explicit_fields |= SamplingConfig::kMaxTokens;
+    }
 
     if (const json::Value* stop = body.find("stop"); present(stop)) {
+        s.explicit_fields |= SamplingConfig::kStop;
         s.stop.clear();
         if (stop->is_string()) {
             s.stop.push_back(stop->as_string());
@@ -157,6 +170,7 @@ std::optional<ApiError> read_sampling(const json::Object& body, SamplingConfig& 
         if (!bias->is_object()) {
             return bad("invalid_sampling", "logit_bias must be an object of token id to bias", "logit_bias");
         }
+        s.explicit_fields |= SamplingConfig::kLogitBias;
         s.logit_bias.clear();
         for (const auto& [key, value] : bias->as_object()) {
             if (key.empty() || key.size() > 10 ||

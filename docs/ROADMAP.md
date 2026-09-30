@@ -50,7 +50,9 @@ Gate: measurable win on agent fan-out/long-context workloads without interactive
 
 ## Phase 3 — speculation + memory hierarchy
 
-- [ ] draft/ngram/backend speculation interfaces
+- [x] external backend speculation via [`llamaserver`](integration/llama-server.md)
+  (passes MTP/DFlash/n-gram configuration to llama-server; reports upstream
+  draft acceptance and cache reuse; Sonder-owned adaptive policy remains below)
 - [ ] adaptive speculation policy
 - [ ] CPU KV spill
 - [ ] cache quantization where supported

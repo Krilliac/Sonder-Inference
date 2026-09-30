@@ -5,6 +5,9 @@
 
 #include <cmath>
 #include <cstdint>
+#include <chrono>
+#include <fstream>
+#include <filesystem>
 #include <limits>
 #include <map>
 #include <optional>
@@ -19,6 +22,9 @@
 #include "cli/sonder_infer_commands.hpp"
 #include "net/http_client.hpp"
 #include "sonder/inference.hpp"
+#if defined(SONDER_HAS_SERVER)
+#include "sonder/inference/backend_setup.hpp"
+#endif
 
 using namespace sonder::inference;
 namespace net = sonder::inference::net;
@@ -73,6 +79,42 @@ TEST_CASE("cli spec: edit distance and suggestions") {
     CHECK(cli::unknown_option_message("max-token", names) == "unknown option --max-token (did you mean --max-tokens?)");
     CHECK(cli::unknown_option_message("bogus", names) == "unknown option --bogus");
 }
+
+#if defined(SONDER_HAS_SERVER)
+TEST_CASE("llamaserver config: strict spawn schema preserves argv and rejects malformed values") {
+    const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto path = std::filesystem::current_path() /
+                      ("sonder-llamaserver-cli-test-" + std::to_string(unique) + ".json");
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::error_code ec; std::filesystem::remove(path, ec); }
+    } cleanup{path};
+    const auto write = [&](const std::string& body) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << body;
+    };
+    sonder::inference::BackendSetup setup;
+    write(R"({"mode":"spawn","executable":"llama-server.exe","args":["--model","m.gguf","--spec-type","draft-mtp","--spec-draft-n-max","3"],"startup_timeout_ms":1234,"allow_remote":false})");
+    auto status = sonder::inference::load_llamaserver_config(path.string(), setup);
+    REQUIRE_MESSAGE(status.ok(), status.to_string());
+    CHECK(setup.llamaserver_mode == "spawn");
+    CHECK(setup.llamaserver_executable == "llama-server.exe");
+    CHECK(setup.llamaserver_args == std::vector<std::string>{"--model", "m.gguf", "--spec-type", "draft-mtp", "--spec-draft-n-max", "3"});
+    CHECK(setup.llamaserver_startup_timeout_ms == 1234);
+    write(R"({"base_url":"http://127.0.0.1:8080"})");
+    sonder::inference::BackendSetup attach;
+    REQUIRE(sonder::inference::load_llamaserver_config(path.string(), attach).ok());
+    CHECK(attach.llamaserver_mode.empty());  // empty means the backend default: attach
+    for (const auto& body : {R"({"bogus":1})", R"({"allow_remote":"false"})", R"({"startup_timeout_ms":-1})",
+                             R"({"startup_timeout_ms":0})", R"({"mode":"bogus"})", R"({"mode":""})",
+                             R"({"args":[1]})", R"({"max_restarts":1001})", R"({"restart_backoff_ms":20,"max_restart_backoff_ms":10})",
+                             R"({"tls":{"handshake_timeout_ms":0}})", R"({"executable":"bad\u0000path"})"}) {
+        write(body);
+        sonder::inference::BackendSetup invalid;
+        CHECK_FALSE(sonder::inference::load_llamaserver_config(path.string(), invalid).ok());
+    }
+}
+#endif
 
 TEST_CASE("cli spec: parse_command accepts values, inline values, repeats, flags and help") {
     cli::ParsedCommand p;
@@ -198,6 +240,14 @@ TEST_CASE("cli commands: table integrity and help content") {
         CHECK(help.find("about 16 tokens") != std::string::npos);
         CHECK(help.find("130 cancelled") != std::string::npos);
         CHECK(help.find("SONDER_INFER_BACKEND") != std::string::npos);
+    }
+    for (const auto* c : {&cli::generate_command(), &cli::chat_command(), &cli::bench_command()}) {
+        CAPTURE(c->name);
+        for (const char* option : {"llamaserver-config", "llamaserver-mode", "llamaserver-url",
+                                   "llamaserver-executable", "llamaserver-arg"}) {
+            CAPTURE(option);
+            CHECK(c->find(option) != nullptr);
+        }
     }
     // Correlation, output and JSON flags per command.
     for (const auto* c : {&cli::generate_command(), &cli::chat_command(), &cli::bench_command()}) {

@@ -65,6 +65,12 @@ struct SamplingConfig {
         kRepeatLastN = 1u << 5,
         kPresencePenalty = 1u << 6,
         kFrequencyPenalty = 1u << 7,
+        kTypicalP = 1u << 8,
+        kSeed = 1u << 9,
+        kMaxTokens = 1u << 10,
+        kStop = 1u << 11,
+        kLogitBias = 1u << 12,
+        kNumCtx = 1u << 13,
     };
     bool explicit_only = false;
     std::uint32_t explicit_fields = 0;
