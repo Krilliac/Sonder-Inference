@@ -5,11 +5,14 @@
 # Observatory telemetry streams (SSE and NDJSON). Reference: docs/SERVER.md.
 # Sources compile into sonder_inference; consumers test SONDER_HAS_SERVER.
 sonder_module_sources(
+    src/anthropic.cpp
     src/backend_setup.cpp
+    src/chat_handler.cpp
     src/http.cpp
     src/identity.cpp
     src/live_hub.cpp
     src/openai.cpp
+    src/priority_admission.cpp
     src/residency.cpp
     src/request_path.cpp
     src/serve_main.cpp
@@ -21,6 +24,8 @@ sonder_module_include_directories(include)
 sonder_module_define(SONDER_HAS_SERVER)
 
 sonder_add_module_tests(server
+    tests/test_server_anthropic_units.cpp
+    tests/test_server_anthropic_http.cpp
     tests/test_server_units.cpp
     tests/test_server_http.cpp
     tests/test_server_chat.cpp
@@ -30,7 +35,10 @@ sonder_add_module_tests(server
     tests/test_server_faults.cpp
     tests/test_server_residency.cpp
     tests/test_server_runtime.cpp
-    tests/test_server_request_path.cpp)
+    tests/test_server_request_path.cpp
+    tests/test_priority_parsing.cpp
+    tests/test_priority_admission.cpp
+    tests/test_server_priority.cpp)
 if(TARGET sonder_server_tests)
     target_include_directories(sonder_server_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()

@@ -184,14 +184,20 @@ public:
             if (!request.sampling.stop.empty()) {
                 const std::string combined = emitted + piece;
                 std::size_t earliest = std::string::npos;
+                const std::string* matched = nullptr;
                 for (const auto& s : request.sampling.stop) {
                     const auto p = combined.find(s);
-                    if (p != std::string::npos) {
+                    if (p != std::string::npos &&
+                        (p < earliest || (p == earliest && matched && s.size() > matched->size()))) {
                         earliest = std::min(earliest, p);
+                        matched = &s;
                     }
                 }
                 if (earliest != std::string::npos) {
                     hit_stop = true;
+                    if (matched) {
+                        stats.matched_stop = *matched;
+                    }
                     piece = earliest > emitted.size() ? combined.substr(emitted.size(), earliest - emitted.size())
                                                       : std::string();
                 }

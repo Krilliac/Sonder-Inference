@@ -250,6 +250,7 @@ const char* reason_phrase(int status) noexcept {
         case 500: return "Internal Server Error";
         case 501: return "Not Implemented";
         case 503: return "Service Unavailable";
+        case 504: return "Gateway Timeout";
         case 505: return "HTTP Version Not Supported";
         default: return "Unknown";
     }

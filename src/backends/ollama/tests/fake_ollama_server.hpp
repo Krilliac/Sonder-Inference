@@ -37,6 +37,9 @@ struct StreamScript {
   int status = 200;
   std::size_t chunk_bytes = 0;   // 0 = write whole body at once
   std::chrono::milliseconds delay_per_chunk{0};
+  // Delay the first response bytes. This models a slow prefill where the
+  // upstream has accepted the request but has not produced a chunk yet.
+  std::chrono::milliseconds initial_delay{0};
   // After writing `stall_after_bytes`, keep the connection open (sending blank
   // keepalive lines) until the client goes away or `stall_max` elapses.
   std::size_t stall_after_bytes = 0;
@@ -82,21 +85,42 @@ class FakeOllamaServer {
       }
       res.set_chunked_content_provider(
           s.content_type, [this, s](std::size_t, httplib::DataSink& sink) {
+            if (s.initial_delay.count() > 0) {
+              std::this_thread::sleep_for(s.initial_delay);
+            }
             const std::size_t step = s.chunk_bytes == 0 ? s.body.size() : s.chunk_bytes;
             std::size_t off = 0;
             const std::size_t limit = s.stall_after_bytes ? std::min(s.stall_after_bytes, s.body.size())
                                                           : s.body.size();
             while (off < limit) {
               const std::size_t n = std::min(step, limit - off);
-              if (!sink.write(s.body.data() + off, n)) return false;
+              if (!sink.write(s.body.data() + off, n)) {
+                disconnects_.fetch_add(1);
+                return false;
+              }
               off += n;
               if (s.delay_per_chunk.count() > 0) std::this_thread::sleep_for(s.delay_per_chunk);
+            }
+            if (s.initial_delay.count() > 0 && !s.stall_after_bytes) {
+              // Keep probing after the delayed first write so tests observe
+              // the peer's close even when the payload fit the kernel buffer.
+              for (int i = 0; i < 100; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                if (!sink.write("\n", 1)) {
+                  disconnects_.fetch_add(1);
+                  return false;
+                }
+              }
+              return false;
             }
             if (s.stall_after_bytes) {
               const auto deadline = std::chrono::steady_clock::now() + s.stall_max;
               while (!stopping_ && std::chrono::steady_clock::now() < deadline) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                if (!sink.write("\n", 1)) return false;
+                if (!sink.write("\n", 1)) {
+                  disconnects_.fetch_add(1);
+                  return false;
+                }
               }
               return false;  // never completes normally
             }
@@ -134,6 +158,7 @@ class FakeOllamaServer {
   std::string last_chat_body() { std::lock_guard<std::mutex> l(mu_); return last_chat_body_; }
   std::string last_show_body() { std::lock_guard<std::mutex> l(mu_); return last_show_body_; }
   int request_count() { std::lock_guard<std::mutex> l(mu_); return request_count_; }
+  int disconnects() const { return disconnects_.load(); }
 
  private:
   httplib::Server svr_;
@@ -148,6 +173,7 @@ class FakeOllamaServer {
   std::string show_;
   std::string last_generate_body_, last_chat_body_, last_show_body_;
   int request_count_ = 0;
+  std::atomic<int> disconnects_{0};
 };
 
 }  // namespace sonder_test
