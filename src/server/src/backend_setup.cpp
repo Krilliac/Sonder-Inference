@@ -8,6 +8,7 @@
 
 #include "sonder/inference/backends.hpp"
 #include "sonder/inference/json.hpp"
+#include "warmup_config.hpp"
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
 #include "sonder/inference/backends/llamaserver.hpp"
 #endif
@@ -119,7 +120,7 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
             "native_completion", "grammar", "connect_timeout_ms", "request_timeout_ms", "startup_timeout_ms",
             "poll_interval_ms", "shutdown_timeout_ms", "restart_backoff_ms", "max_restart_backoff_ms",
             "max_restarts", "tls", "spill_guard", "log_file", "kv_pairing_check", "context_length",
-            "slot_affinity"};
+            "slot_affinity", "warmup"};
         for (auto k : known) if (k == key) return false;
         return true;
     };
@@ -241,6 +242,9 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
             setup.llamaserver_fit_step_factor = v->as_double();
         }
     }
+    if (const auto* warmup = object.find("warmup")) {
+        if (auto st = detail::parse_warmup_config(*warmup, setup); !st.ok()) return st;
+    }
     setup.llamaserver_config = path;
     destination = std::move(setup);
     return {};
@@ -341,6 +345,12 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
         lo.diagnostics.kv_pairing_check = setup.llamaserver_kv_pairing_check;
         lo.context_length = setup.llamaserver_context_length;
         lo.slot_affinity = setup.llamaserver_slot_affinity;
+        lo.warmup.messages_file = setup.llamaserver_warmup_messages_file;
+        lo.warmup.chat_template_kwargs = setup.llamaserver_warmup_chat_template_kwargs;
+        lo.warmup.all_slots = setup.llamaserver_warmup_all_slots;
+        lo.warmup.slots = setup.llamaserver_warmup_slots;
+        lo.warmup.on_restart = setup.llamaserver_warmup_on_restart;
+        lo.warmup.max_prefix_chars = setup.llamaserver_warmup_max_prefix_chars;
         std::shared_ptr<Backend> backend = make_llamaserver_backend(std::move(lo));
         return backend;
 #else

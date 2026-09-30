@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "net/http_client.hpp"
+#include "prefix_warmup.hpp"
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -252,6 +253,8 @@ void Supervisor::monitor() {
                     if (result.ok() && !shutdown_.cancelled()) {
                         const auto verdict = guard_after_ready(*child);
                         if (verdict.action == GuardAction::refuse) {
+                            if (options_.warmup)
+                                options_.warmup->stop();
                             child->stop(options_.shutdown_timeout);
                             fail(verdict.status);
                             return;
@@ -260,6 +263,8 @@ void Supervisor::monitor() {
                             // Relaunch with a smaller context. This neither uses
                             // the crash-restart budget nor waits for its backoff;
                             // refits are bounded by spill_guard.max_attempts.
+                            if (options_.warmup)
+                                options_.warmup->stop();
                             child->stop(options_.shutdown_timeout);
                             std::lock_guard lock(mutex_);
                             arguments_ = with_context_size(arguments_, verdict.next_ctx);
@@ -269,6 +274,8 @@ void Supervisor::monitor() {
                             port_ = 0;
                             state_ = State::starting;
                             wake_.notify_all();
+                            // The next monitor iteration starts a fresh
+                            // warm-up after the replacement is ready.
                             continue;
                         }
                         {
@@ -278,6 +285,8 @@ void Supervisor::monitor() {
                             failure_ = Status::success();
                             wake_.notify_all();
                         }
+                        if (options_.warmup && !shutdown_.cancelled())
+                            options_.warmup->start("http://127.0.0.1:" + std::to_string(spec.port));
                         auto next_sample = Clock::now() + options_.spill_guard.sample_interval;
                         while (!shutdown_.cancelled() && child->running()) {
                             pause(options_.health_poll_interval);
@@ -288,6 +297,8 @@ void Supervisor::monitor() {
                         }
                         result = Status(ErrorCode::unavailable, "llamaserver: child exited");
                     }
+                    if (options_.warmup)
+                        options_.warmup->stop();
                     {
                         std::lock_guard lock(mutex_);
                         port_ = 0;
@@ -321,9 +332,13 @@ void Supervisor::monitor() {
             }
         }
     } catch (const std::exception &e) {
+        if (options_.warmup)
+            options_.warmup->stop();
         fail(Status(ErrorCode::internal, std::string("llamaserver: supervisor failure: ") + e.what()));
         return;
     } catch (...) {
+        if (options_.warmup)
+            options_.warmup->stop();
         fail(Status(ErrorCode::internal, "llamaserver: supervisor failure"));
         return;
     }
@@ -476,6 +491,8 @@ void Supervisor::stop() {
         shutdown_.cancel();
         wake_.notify_all();
     }
+    if (options_.warmup)
+        options_.warmup->stop();
     if (monitor_thread_.joinable())
         monitor_thread_.join();
     std::lock_guard lock(mutex_);
