@@ -25,4 +25,10 @@ struct IdentityResult {
 // `backend_version` is the backend's probe() result when it succeeded.
 IdentityResult backend_identity(const Model& model, const std::optional<std::string>& backend_version);
 
+// Same, from a backend name and the model descriptor. `descriptor` is null
+// when the model has not been loaded yet (lazy residency); backends whose
+// identity needs the descriptor then report null with a reason.
+IdentityResult backend_identity(const std::string& backend, const std::string& model_id,
+                                const ModelDescriptor* descriptor, const std::optional<std::string>& backend_version);
+
 }  // namespace sonder::inference::server::detail
