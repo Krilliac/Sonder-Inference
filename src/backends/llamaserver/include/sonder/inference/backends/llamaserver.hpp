@@ -63,6 +63,18 @@ struct LlamaServerDiagnosticsOptions {
     bool kv_pairing_check = true;
 };
 
+// Optional prefix replay. Template kwargs MUST match real requests, including
+// thinking settings; changing them can invalidate the prefix from token zero.
+struct LlamaServerWarmupOptions {
+    std::string messages_file;  // empty disables warm-up
+    json::Object chat_template_kwargs;
+    bool all_slots = true;
+    std::vector<std::uint32_t> slots;
+    bool on_restart = true;
+    // UTF-8 bytes, including JSON syntax; bounded before parsing/allocation.
+    std::size_t max_prefix_chars = 262144;
+};
+
 struct LlamaServerBackendOptions {
     LlamaServerMode mode = LlamaServerMode::attach;
     std::string base_url = "http://127.0.0.1:8080";
@@ -96,6 +108,7 @@ struct LlamaServerBackendOptions {
     // Spawn mode only. Reported through Backend::runtime_status().
     LlamaServerSpillGuardOptions spill_guard;
     LlamaServerDiagnosticsOptions diagnostics;
+    LlamaServerWarmupOptions warmup;
 };
 
 // Slot snapshots are upstream-owned files, not portable Sonder KV blocks.

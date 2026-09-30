@@ -17,6 +17,8 @@
 
 namespace sonder::inference::llamaserver {
 
+class PrefixWarmup;
+
 struct SupervisorOptions {
     std::string executable;
     std::vector<std::string> arguments;
@@ -40,6 +42,8 @@ struct SupervisorOptions {
     std::string log_file;
     // Warn up front about FlashAttention with mismatched K/V cache types.
     bool kv_pairing_check = true;
+    // Optional best-effort prefix replay, started after each accepted child.
+    std::shared_ptr<PrefixWarmup> warmup;
 };
 
 class Supervisor {

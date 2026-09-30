@@ -23,7 +23,7 @@ namespace sonder::inference {
 struct BackendWarning {
     std::string code;
     std::string severity = "warning";  // "warning" or "info"
-    std::string source;                // "config", "log" or "gpu_probe"
+    std::string source;                // "config", "log", "gpu_probe" or "warmup"
     std::string message;
     std::vector<std::pair<std::string, std::string>> details;  // ordered key/value facts
     std::uint64_t count = 1;           // occurrences folded into this warning
@@ -53,16 +53,35 @@ struct ContextFitStatus {
     std::string outcome;  // "not_needed", "fitted", "refused", "floor_reached" or "exhausted"
 };
 
+struct BackendWarmupSlotStatus {
+    std::uint32_t id_slot = 0;
+    std::string status;  // pending, warming, complete, error or cancelled
+    // Unknown counters remain null; prompt_tokens includes reused tokens.
+    std::optional<std::uint64_t> prompt_tokens;
+    std::optional<std::uint64_t> cache_n;
+    double milliseconds = 0;
+    std::string error;  // sanitized; never upstream bodies or prefix text
+};
+
+struct BackendWarmupStatus {
+    std::uint64_t generation = 0;  // incremented per accepted upstream start
+    std::string status;  // pending, warming, complete, error, cancelled or skipped
+    std::vector<BackendWarmupSlotStatus> slots;
+};
+
 struct BackendRuntimeStatus {
     GpuMemoryStatus gpu_memory;
     ContextFitStatus context;
     std::vector<BackendWarning> warnings;
+    std::optional<BackendWarmupStatus> warmup;  // absent when disabled
 };
 
 // Stable JSON shape shared by /v1/sonder/health, /v1/models and telemetry:
-// {"gpu_memory":{...},"context":{...},"warnings":[...]}.
+// {"gpu_memory":{...},"context":{...},"warnings":[...]} plus optional "warmup".
 [[nodiscard]] json::Object to_json(const BackendRuntimeStatus& status);
 [[nodiscard]] json::Object to_json(const GpuMemoryStatus& status);
 [[nodiscard]] json::Object to_json(const BackendWarning& warning);
+[[nodiscard]] json::Object to_json(const BackendWarmupSlotStatus& slot);
+[[nodiscard]] json::Object to_json(const BackendWarmupStatus& status);
 
 }  // namespace sonder::inference

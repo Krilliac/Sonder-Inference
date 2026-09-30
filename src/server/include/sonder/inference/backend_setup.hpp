@@ -5,6 +5,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -16,6 +17,7 @@
 
 #include "sonder/inference/backend.hpp"
 #include "sonder/inference/error.hpp"
+#include "sonder/inference/json.hpp"
 
 namespace sonder::inference {
 
@@ -83,6 +85,15 @@ struct BackendSetup {
     // "slot_affinity" (id_slot pinning; docs/integration/llama-server.md).
     std::uint64_t llamaserver_context_length = 0;
     bool llamaserver_slot_affinity = true;
+    // Optional llama-server prefix warm-up. Kept here as mirrors so the
+    // always-built server/CLI setup loader does not depend on the optional
+    // llamaserver backend header.
+    std::string llamaserver_warmup_messages_file;
+    json::Object llamaserver_warmup_chat_template_kwargs;
+    bool llamaserver_warmup_all_slots = true;
+    std::vector<std::uint32_t> llamaserver_warmup_slots;
+    bool llamaserver_warmup_on_restart = true;
+    std::size_t llamaserver_warmup_max_prefix_chars = 262144;
 };
 
 // Values taken from the environment when the matching option is absent:
