@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -42,16 +43,35 @@ class FakeLlamaServer {
                           "application/json");
         });
         auto stream = [this](const httplib::Request &req, httplib::Response &r) {
+            const bool nonstream = req.body.find(R"("stream":false)") != std::string::npos ||
+                                   req.body.find(R"("stream": false)") != std::string::npos;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                last_body_ = req.body;
+                bodies_.push_back(req.body);
+                if (nonstream)
+                    nonstream_bodies_.push_back(req.body);
+            }
+            changed_.notify_all();
+            if (nonstream) {
+                std::unique_lock lock(mu_);
+                changed_.wait(lock, [this] { return !hold_nonstream_; });
+            }
             std::lock_guard<std::mutex> lock(mu_);
-            last_body_ = req.body;
-            bodies_.push_back(req.body);
             r.status = status_;
             if (status_ != 200) {
-                r.set_content(body_, "text/event-stream");
+                r.set_content(body_, nonstream ? "application/json" : "text/event-stream");
                 return;
             }
             const auto payload = body_;
             const auto initial_delay = initial_delay_;
+            if (nonstream) {
+                r.set_content(nonstream_body_.empty() ?
+                                  R"({"choices":[{"finish_reason":"stop"}],"timings":{"prompt_n":3,"cache_n":9}})" :
+                                  nonstream_body_,
+                              "application/json");
+                return;
+            }
             r.set_chunked_content_provider("text/event-stream",
                                            [this, payload, initial_delay](std::size_t, httplib::DataSink &sink) {
                                                if (initial_delay.count() > 0)
@@ -100,6 +120,13 @@ class FakeLlamaServer {
         svr_.wait_until_ready();
     }
     ~FakeLlamaServer() {
+        stop();
+    }
+    void stop() {
+        // Release a held nonstream handler before asking httplib to stop and
+        // joining its listener thread; otherwise a cancellation test can
+        // leave the handler waiting forever while the destructor joins.
+        hold_nonstream(false);
         svr_.stop();
         if (thread_.joinable())
             thread_.join();
@@ -116,6 +143,10 @@ class FakeLlamaServer {
     void set_initial_delay(std::chrono::milliseconds delay) {
         std::lock_guard<std::mutex> lock(mu_);
         initial_delay_ = delay;
+    }
+    void set_nonstream_body(std::string body) {
+        std::lock_guard<std::mutex> lock(mu_);
+        nonstream_body_ = std::move(body);
     }
     std::string last_body() const {
         std::lock_guard<std::mutex> lock(mu_);
@@ -143,6 +174,21 @@ class FakeLlamaServer {
     }
     unsigned health_requests() const { return health_requests_.load(); }
     unsigned disconnects() const { return disconnects_.load(); }
+    std::vector<std::string> nonstream_bodies() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return nonstream_bodies_;
+    }
+    void hold_nonstream(bool hold = true) {
+        std::lock_guard<std::mutex> lock(mu_);
+        hold_nonstream_ = hold;
+        if (!hold)
+            changed_.notify_all();
+    }
+    bool wait_for_nonstream(std::size_t count) const {
+        std::unique_lock lock(mu_);
+        return changed_.wait_for(lock, std::chrono::seconds(3),
+                                 [&] { return nonstream_bodies_.size() >= count; });
+    }
 
   private:
     httplib::Server svr_;
@@ -150,8 +196,12 @@ class FakeLlamaServer {
     int port_ = 0;
     mutable std::mutex mu_;
     std::string body_;
+    std::string nonstream_body_;
     std::string last_body_;
     std::vector<std::string> bodies_;
+    std::vector<std::string> nonstream_bodies_;
+    mutable std::condition_variable changed_;
+    bool hold_nonstream_ = false;
     std::string props_;
     unsigned props_requests_ = 0;
     std::string last_slot_;

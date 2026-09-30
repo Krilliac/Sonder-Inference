@@ -208,6 +208,8 @@ Status validate_spill_guard(const SpillGuardOptions &o) {
         return invalid("threshold must be in (0, 1 TiB]");
     if (o.baseline_bytes > 1024ull * 1024 * kMiB)
         return invalid("baseline must be at most 1 TiB");
+    if (o.baseline_bytes_per_1k_ctx > 1024ull * kMiB)
+        return invalid("baseline growth per 1k context must be at most 1 GiB");
     if (o.sample_interval.count() < 100 || o.sample_interval > std::chrono::hours(1))
         return invalid("sample interval must be in [100 ms, 1 h]");
     if (!std::isfinite(o.step_factor) || o.step_factor <= 0.0 || o.step_factor >= 1.0)
@@ -221,8 +223,20 @@ Status validate_spill_guard(const SpillGuardOptions &o) {
     return {};
 }
 
-bool is_spilled(const GpuMemorySample &sample, const SpillGuardOptions &options) {
-    const auto limit = saturating_add(options.baseline_bytes, options.threshold_bytes);
+std::uint64_t effective_baseline(const SpillGuardOptions &options, std::optional<std::uint64_t> ctx) {
+    if (!ctx || options.baseline_bytes_per_1k_ctx == 0)
+        return options.baseline_bytes;
+    const std::uint64_t blocks = *ctx / 1024;
+    const std::uint64_t growth =
+        blocks != 0 && options.baseline_bytes_per_1k_ctx > std::numeric_limits<std::uint64_t>::max() / blocks
+            ? std::numeric_limits<std::uint64_t>::max()
+            : options.baseline_bytes_per_1k_ctx * blocks;
+    return saturating_add(options.baseline_bytes, growth);
+}
+
+bool is_spilled(const GpuMemorySample &sample, const SpillGuardOptions &options,
+                std::optional<std::uint64_t> ctx) {
+    const auto limit = saturating_add(effective_baseline(options, ctx), options.threshold_bytes);
     return sample.shared_bytes > limit;
 }
 

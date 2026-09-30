@@ -169,6 +169,7 @@ private:
     // already emitted, per backend name.
     std::map<std::string, std::uint64_t> runtime_samples_seen_;
     std::map<std::string, std::vector<std::string>> runtime_warnings_seen_;
+    std::map<std::string, std::pair<std::uint64_t, std::vector<std::uint32_t>>> runtime_warmups_seen_;
     std::thread sampler_;
 };
 

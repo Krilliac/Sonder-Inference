@@ -5,6 +5,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -16,6 +17,7 @@
 
 #include "sonder/inference/backend.hpp"
 #include "sonder/inference/error.hpp"
+#include "sonder/inference/json.hpp"
 
 namespace sonder::inference {
 
@@ -72,6 +74,7 @@ struct BackendSetup {
     std::string llamaserver_spill_policy = "warn";  // warn, refuse or auto_fit
     std::uint64_t llamaserver_spill_threshold_mib = 256;
     std::uint64_t llamaserver_spill_baseline_mib = 0;
+    std::uint64_t llamaserver_spill_baseline_per_1k_ctx_mib = 0;
     std::uint64_t llamaserver_spill_sample_interval_ms = 5000;
     double llamaserver_fit_step_factor = 0.85;
     std::uint64_t llamaserver_fit_step_align = 1024;
@@ -83,6 +86,15 @@ struct BackendSetup {
     // "slot_affinity" (id_slot pinning; docs/integration/llama-server.md).
     std::uint64_t llamaserver_context_length = 0;
     bool llamaserver_slot_affinity = true;
+    // Optional llama-server prefix warm-up. Kept here as mirrors so the
+    // always-built server/CLI setup loader does not depend on the optional
+    // llamaserver backend header.
+    std::string llamaserver_warmup_messages_file;
+    json::Object llamaserver_warmup_chat_template_kwargs;
+    bool llamaserver_warmup_all_slots = true;
+    std::vector<std::uint32_t> llamaserver_warmup_slots;
+    bool llamaserver_warmup_on_restart = true;
+    std::size_t llamaserver_warmup_max_prefix_chars = 262144;
 };
 
 // Values taken from the environment when the matching option is absent:

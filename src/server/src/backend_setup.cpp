@@ -8,6 +8,7 @@
 
 #include "sonder/inference/backends.hpp"
 #include "sonder/inference/json.hpp"
+#include "warmup_config.hpp"
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
 #include "sonder/inference/backends/llamaserver.hpp"
 #endif
@@ -119,7 +120,7 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
             "native_completion", "grammar", "connect_timeout_ms", "request_timeout_ms", "startup_timeout_ms",
             "poll_interval_ms", "shutdown_timeout_ms", "restart_backoff_ms", "max_restart_backoff_ms",
             "max_restarts", "tls", "spill_guard", "log_file", "kv_pairing_check", "context_length",
-            "slot_affinity"};
+            "slot_affinity", "warmup"};
         for (auto k : known) if (k == key) return false;
         return true;
     };
@@ -207,7 +208,7 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
     }
     if (const auto* guard = object.find("spill_guard")) {
         if (!guard->is_object()) return Status(ErrorCode::invalid_argument, "llamaserver config: 'spill_guard' must be an object");
-        static constexpr std::string_view guard_keys[] = {"enabled", "policy", "threshold_mib", "baseline_mib",
+        static constexpr std::string_view guard_keys[] = {"enabled", "policy", "threshold_mib", "baseline_mib", "baseline_per_1k_ctx_mib",
             "sample_interval_ms", "fit_step_factor", "fit_step_align", "fit_min_ctx", "fit_max_attempts"};
         for (const auto& member : guard->as_object()) {
             if (std::find(std::begin(guard_keys), std::end(guard_keys), member.first) == std::end(guard_keys))
@@ -231,6 +232,7 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
         };
         if (auto st = uint_in("threshold_mib", 1, 1048576, setup.llamaserver_spill_threshold_mib, "an integer in [1, 1048576]"); !st.ok()) return st;
         if (auto st = uint_in("baseline_mib", 0, 1048576, setup.llamaserver_spill_baseline_mib, "an integer in [0, 1048576]"); !st.ok()) return st;
+        if (auto st = uint_in("baseline_per_1k_ctx_mib", 0, 1024, setup.llamaserver_spill_baseline_per_1k_ctx_mib, "an integer in [0, 1024]"); !st.ok()) return st;
         if (auto st = uint_in("sample_interval_ms", 100, 3600000, setup.llamaserver_spill_sample_interval_ms, "an integer in [100, 3600000]"); !st.ok()) return st;
         if (auto st = uint_in("fit_step_align", 1, 1048576, setup.llamaserver_fit_step_align, "an integer in [1, 1048576]"); !st.ok()) return st;
         if (auto st = uint_in("fit_min_ctx", 1, 4294967296ull, setup.llamaserver_fit_min_ctx, "an integer in [1, 4294967296]"); !st.ok()) return st;
@@ -239,6 +241,9 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
             if (!v->is_number() || !(v->as_double() > 0.0 && v->as_double() < 1.0)) return bad("fit_step_factor", "a number in (0, 1)");
             setup.llamaserver_fit_step_factor = v->as_double();
         }
+    }
+    if (const auto* warmup = object.find("warmup")) {
+        if (auto st = detail::parse_warmup_config(*warmup, setup); !st.ok()) return st;
     }
     setup.llamaserver_config = path;
     destination = std::move(setup);
@@ -328,6 +333,9 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
             return Status(ErrorCode::invalid_argument, "llamaserver spill threshold/baseline must be at most 1048576 MiB");
         lo.spill_guard.threshold_bytes = setup.llamaserver_spill_threshold_mib * 1024ull * 1024ull;
         lo.spill_guard.baseline_bytes = setup.llamaserver_spill_baseline_mib * 1024ull * 1024ull;
+        if (setup.llamaserver_spill_baseline_per_1k_ctx_mib > 1024)
+            return Status(ErrorCode::invalid_argument, "llamaserver spill baseline growth must be at most 1024 MiB per 1k ctx");
+        lo.spill_guard.baseline_bytes_per_1k_ctx = setup.llamaserver_spill_baseline_per_1k_ctx_mib * 1024ull * 1024ull;
         lo.spill_guard.sample_interval = std::chrono::milliseconds(setup.llamaserver_spill_sample_interval_ms);
         lo.spill_guard.fit_step_factor = setup.llamaserver_fit_step_factor;
         lo.spill_guard.fit_step_align = setup.llamaserver_fit_step_align;
@@ -337,6 +345,12 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
         lo.diagnostics.kv_pairing_check = setup.llamaserver_kv_pairing_check;
         lo.context_length = setup.llamaserver_context_length;
         lo.slot_affinity = setup.llamaserver_slot_affinity;
+        lo.warmup.messages_file = setup.llamaserver_warmup_messages_file;
+        lo.warmup.chat_template_kwargs = setup.llamaserver_warmup_chat_template_kwargs;
+        lo.warmup.all_slots = setup.llamaserver_warmup_all_slots;
+        lo.warmup.slots = setup.llamaserver_warmup_slots;
+        lo.warmup.on_restart = setup.llamaserver_warmup_on_restart;
+        lo.warmup.max_prefix_chars = setup.llamaserver_warmup_max_prefix_chars;
         std::shared_ptr<Backend> backend = make_llamaserver_backend(std::move(lo));
         return backend;
 #else

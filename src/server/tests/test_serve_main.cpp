@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "server_test_support.hpp"
+#include "sonder/inference/backend_setup.hpp"
 
 using namespace server_test;
 namespace json = sonder::inference::json;
@@ -55,6 +56,55 @@ TEST_CASE("serve_main: --help prints usage and exits 0") {
     CHECK(out.find("--cors-origin") != std::string::npos);
     CHECK(out.find("--backend-capacity") != std::string::npos);
     CHECK(out.find("--priority-admission auto|on|off") != std::string::npos);
+    CHECK(out.find("--warmup-file") != std::string::npos);
+}
+
+TEST_CASE("llamaserver config: parses and validates warmup settings") {
+    const auto config = temp_path("warmup.json");
+    std::ofstream(config) << R"({
+      "warmup": {
+        "messages_file": "prefix.json",
+        "chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"},
+        "slots": [2, 7], "on_restart": false, "max_prefix_chars": 4096
+      }
+    })";
+    sonder::inference::BackendSetup setup;
+    REQUIRE(sonder::inference::load_llamaserver_config(config.string(), setup).ok());
+    CHECK(setup.llamaserver_warmup_messages_file == "prefix.json");
+    CHECK_FALSE(setup.llamaserver_warmup_all_slots);
+    REQUIRE(setup.llamaserver_warmup_slots.size() == 2);
+    CHECK(setup.llamaserver_warmup_slots[0] == 2);
+    CHECK(setup.llamaserver_warmup_slots[1] == 7);
+    CHECK_FALSE(setup.llamaserver_warmup_on_restart);
+    CHECK(setup.llamaserver_warmup_max_prefix_chars == 4096);
+    REQUIRE(setup.llamaserver_warmup_chat_template_kwargs.find("enable_thinking") != nullptr);
+    CHECK_FALSE(setup.llamaserver_warmup_chat_template_kwargs.find("enable_thinking")->as_bool(true));
+    std::error_code ec;
+    fs::remove(config, ec);
+}
+
+TEST_CASE("llamaserver config: rejects malformed warmup settings") {
+    const std::vector<std::string> documents = {
+        R"({"warmup": {"slots": [1, 1]}})",
+        R"({"warmup": {"slots": [1024]}})",
+        R"({"warmup": {"slots": "some"}})",
+        R"({"warmup": {"max_prefix_chars": 0}})",
+        R"({"warmup": {"unknown": true}})"};
+    for (std::size_t i = 0; i < documents.size(); ++i) {
+        const auto config = temp_path("bad-warmup-" + std::to_string(i) + ".json");
+        std::ofstream(config) << documents[i];
+        sonder::inference::BackendSetup setup;
+        CHECK_FALSE(sonder::inference::load_llamaserver_config(config.string(), setup).ok());
+        std::error_code ec;
+        fs::remove(config, ec);
+    }
+}
+
+TEST_CASE("serve_main: --warmup-file is llamaserver-only") {
+    std::string out;
+    std::string err;
+    CHECK(run({"--backend", "mock", "--warmup-file", "prefix.json"}, out, err) == 2);
+    CHECK(err.find("requires --backend llamaserver") != std::string::npos);
 }
 
 TEST_CASE("serve_main: usage errors exit 2") {
@@ -85,6 +135,10 @@ TEST_CASE("serve_main: usage errors exit 2") {
              // Unknown backends are usage errors, caught before anything binds.
              {"--backend", "vllm", "--model", "x", "--port", "0"},
              {"--backend", "mock", "--cors-origin", "http://127.0.0.1:4173/", "--port", "0"},
+             {"--backend", "mock", "--model-idle-ttl", "-1"},
+             {"--backend", "mock", "--model-idle-ttl", "2592001"},
+             {"--backend", "mock", "--max-resident-models", "x"},
+             {"--backend", "mock", "--lazy-models=1"},
          }) {
         CAPTURE(args.back());
         CHECK(run(args, out, err) == 2);
