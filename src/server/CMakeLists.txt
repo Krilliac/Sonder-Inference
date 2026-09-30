@@ -11,6 +11,7 @@ sonder_module_sources(
     src/live_hub.cpp
     src/openai.cpp
     src/request_path.cpp
+    src/residency_config.cpp
     src/serve_main.cpp
     src/server.cpp
     src/sha256.cpp
@@ -28,6 +29,7 @@ sonder_add_module_tests(server
     tests/test_serve_main.cpp
     tests/test_server_faults.cpp
     tests/test_server_runtime.cpp
+    tests/test_residency_config.cpp
     tests/test_server_request_path.cpp)
 if(TARGET sonder_server_tests)
     target_include_directories(sonder_server_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

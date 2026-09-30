@@ -58,12 +58,16 @@ si::BackendRuntimeStatus spilled_status() {
     s.gpu_memory.spill_threshold_bytes = 256ull << 20;
     s.gpu_memory.spilled = true;
     s.gpu_memory.samples = 1;
+    s.gpu_memory.residency = si::GpuResidencyStatus{false, true, 15266ull << 20, 2889ull << 20, 0, "warn"};
     s.context.policy = "warn";
     s.context.configured_ctx = 100096;
     s.context.fitted_ctx = 100096;
     s.context.outcome = "not_needed";
     s.warnings.push_back(si::BackendWarning{"kv_kernel_f16_fallback", "warning", "log", "converted to f16",
                                             {{"k_type", "q8_0"}, {"v_type", "q5_1"}}, 1});
+    s.warnings.push_back(si::BackendWarning{"vram_evicted", "warning", "gpu_probe", "dedicated residency dropped",
+                                            {{"peak_dedicated_bytes", std::to_string(15266ull << 20)},
+                                             {"observed_dedicated_bytes", std::to_string(2889ull << 20)}}, 1});
     return s;
 }
 
@@ -107,11 +111,14 @@ TEST_CASE("runtime: health and models add the backend's runtime status") {
     CHECK(runtime->find("gpu_memory")->find("shared_bytes")->as_uint() == (388ull << 20));
     CHECK(runtime->find("gpu_memory")->find("dedicated_bytes")->as_uint() == (15266ull << 20));
     CHECK(runtime->find("gpu_memory")->find("spilled")->as_bool());
+    CHECK(runtime->find("gpu_memory")->find("residency")->find("vram_evicted")->as_bool());
+    CHECK(runtime->find("gpu_memory")->find("residency")->find("peak_dedicated_bytes")->as_uint() == (15266ull << 20));
     CHECK(runtime->find("context")->find("fitted_ctx")->as_uint() == 100096u);
     const auto& warnings = runtime->find("warnings")->as_array();
-    REQUIRE(warnings.size() == 1);
+    REQUIRE(warnings.size() == 2);
     CHECK(warnings[0].find("code")->as_string() == "kv_kernel_f16_fallback");
     CHECK(warnings[0].find("details")->find("v_type")->as_string() == "q5_1");
+    CHECK(warnings[1].find("code")->as_string() == "vram_evicted");
 
     const json::Value m = get(f.port, "/v1/models").json();
     const auto& ext = *m.find("data")->as_array().at(0).find("sonder");
@@ -156,7 +163,7 @@ TEST_CASE("runtime: the engine sampler emits GPU samples and each warning once")
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         collect();
         CHECK(samples.size() == 1);
-        CHECK(warnings.size() == 1);
+        CHECK(warnings.size() == 2);
         // A new sample and a new warning are emitted once each.
         auto next = spilled_status();
         next.gpu_memory.samples = 2;
@@ -164,7 +171,7 @@ TEST_CASE("runtime: the engine sampler emits GPU samples and each warning once")
         backend->set(next);
         REQUIRE(eventually([&] {
             collect();
-            return samples.size() == 2 && warnings.size() == 2;
+            return samples.size() == 2 && warnings.size() == 3;
         }));
     }
     const auto* attrs = samples.at(0).find("attributes");
@@ -172,9 +179,10 @@ TEST_CASE("runtime: the engine sampler emits GPU samples and each warning once")
     CHECK(attrs->find("backend")->as_string() == "mock");
     CHECK(attrs->find("shared_bytes")->as_uint() == (388ull << 20));
     CHECK(attrs->find("spilled")->as_bool());
+    CHECK(attrs->find("residency")->find("vram_evicted")->as_bool());
     CHECK(attrs->find("fitted_ctx")->as_uint() == 100096u);
     CHECK(attrs->find("fit_outcome")->as_string() == "not_needed");
-    const auto* w = warnings.at(1).find("attributes");
+    const auto* w = warnings.at(2).find("attributes");
     REQUIRE(w != nullptr);
     CHECK(w->find("code")->as_string() == "vram_spill");
     CHECK(w->find("backend")->as_string() == "mock");
@@ -314,12 +322,32 @@ TEST_CASE("runtime: llamaserver config accepts spill_guard, log_file and kv_pair
     CHECK(setup.llamaserver_log_file == "ls.log");
     CHECK_FALSE(setup.llamaserver_kv_pairing_check);
 
+    write(R"({"mode":"spawn","executable":"llama-server","spill_guard":{"residency":{"enabled":true,"expect_gpu":true,"min_dedicated_mib":512,"consecutive_samples":4,"eviction_fraction":0.3,"eviction_mib":2048,"on_eviction":"restart","max_eviction_restarts":2}}})");
+    si::BackendSetup residency;
+    REQUIRE(si::load_llamaserver_config(path.string(), residency).ok());
+    CHECK(residency.llamaserver_residency.enabled);
+    CHECK(residency.llamaserver_residency.expect_gpu);
+    CHECK(residency.llamaserver_residency.min_dedicated_mib == 512);
+    CHECK(residency.llamaserver_residency.consecutive_samples == 4);
+    CHECK(residency.llamaserver_residency.eviction_fraction == doctest::Approx(0.3));
+    CHECK(residency.llamaserver_residency.eviction_mib == 2048);
+    CHECK(residency.llamaserver_residency.on_eviction == "restart");
+    CHECK(residency.llamaserver_residency.max_eviction_restarts == 2);
+
     for (const auto* body : {R"({"spill_guard":{"policy":"fit"}})", R"({"spill_guard":{"bogus":1}})",
                              R"({"spill_guard":[]})", R"({"spill_guard":{"threshold_mib":0}})",
                              R"({"spill_guard":{"fit_step_factor":1}})", R"({"spill_guard":{"fit_max_attempts":33}})",
                              R"({"spill_guard":{"sample_interval_ms":5}})", R"({"spill_guard":{"enabled":"yes"}})",
                              R"({"spill_guard":{"baseline_per_1k_ctx_mib":1025}})",
                              R"({"spill_guard":{"baseline_per_1k_ctx_mib":-1}})",
+                             R"({"spill_guard":{"residency":{"bogus":1}}})",
+                             R"({"spill_guard":{"residency":{"min_dedicated_mib":0}}})",
+                             R"({"spill_guard":{"residency":{"consecutive_samples":1001}}})",
+                             R"({"spill_guard":{"residency":{"eviction_fraction":1.1}}})",
+                             R"({"spill_guard":{"residency":{"eviction_mib":1048577}}})",
+                             R"({"spill_guard":{"residency":{"on_eviction":"refuse"}}})",
+                             R"({"spill_guard":{"residency":{"max_eviction_restarts":33}}})",
+                             R"({"spill_guard":{"residency":{"eviction_fraction":0,"eviction_mib":0}}})",
                              R"({"log_file":7})", R"({"kv_pairing_check":"on"})"}) {
         write(body);
         si::BackendSetup invalid;

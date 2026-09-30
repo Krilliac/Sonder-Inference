@@ -1,4 +1,5 @@
 #include "gpu_memory.hpp"
+#include "gpu_residency.hpp"
 
 #include <cmath>
 #include <limits>
@@ -220,6 +221,8 @@ Status validate_spill_guard(const SpillGuardOptions &o) {
         return invalid("minimum context must be in [1, 2^32]");
     if (o.max_attempts == 0 || o.max_attempts > 32)
         return invalid("max fit attempts must be in [1, 32]");
+    if (o.residency.enabled)
+        return validate_residency_guard(o.residency);
     return {};
 }
 

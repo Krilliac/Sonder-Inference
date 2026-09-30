@@ -54,6 +54,7 @@ llamaserver::SpillGuardOptions spill_guard_options(const LlamaServerSpillGuardOp
     g.step_align = o.fit_step_align;
     g.min_ctx = o.fit_min_ctx;
     g.max_attempts = o.fit_max_attempts;
+    g.residency = o.residency;
     return g;
 }
 
@@ -290,8 +291,9 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         return "http://127.0.0.1:" + std::to_string(port.value());
     }
     Result<net::HttpRequest> prepare(std::string_view method, std::string_view path, std::string body,
-                                     const CancellationToken &cancel) {
-        auto base = endpoint(cancel);
+                                     const CancellationToken &cancel, std::uint16_t leased_port = 0) {
+        auto base = leased_port != 0 ? Result<std::string>("http://127.0.0.1:" + std::to_string(leased_port))
+                                     : endpoint(cancel);
         if (!base.ok())
             return base.status();
         auto url = net::parse_url(base.value());
@@ -315,7 +317,10 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         return request;
     }
     Result<std::string> request(std::string_view method, std::string_view path, std::string body) {
-        auto prepared = prepare(method, path, std::move(body), {});
+        auto activity = acquire_request({});
+        if (!activity.ok())
+            return activity.status();
+        auto prepared = prepare(method, path, std::move(body), {}, activity->port());
         if (!prepared.ok())
             return prepared.status();
         std::string response_body;
@@ -383,9 +388,17 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
     }
 
   private:
+    Result<llamaserver::Supervisor::RequestLease> acquire_request(const CancellationToken &cancel) {
+        if (supervisor_)
+            return supervisor_->acquire_request(cancel);
+        return llamaserver::Supervisor::RequestLease{};
+    }
     llamaserver::ServerProps fetch_props(const CancellationToken &cancel) {
         llamaserver::ServerProps props;
-        auto prepared = prepare("GET", "/props", {}, cancel);
+        auto activity = acquire_request(cancel);
+        if (!activity.ok())
+            return props;
+        auto prepared = prepare("GET", "/props", {}, cancel, activity->port());
         if (!prepared.ok())
             return props;
         prepared->total_timeout = std::min(options_.request_timeout, std::chrono::milliseconds(30000));
@@ -501,7 +514,10 @@ Result<std::shared_ptr<BackendModel>> LlamaServerBackendImpl::load_model(const M
 Result<GenerateStats> LlamaServerBackendImpl::stream(std::string_view path, std::string body,
                                                      const CancellationToken &cancel,
                                                      const TokenCallback &callback, bool chat) {
-    auto prepared = prepare("POST", path, std::move(body), cancel);
+    auto activity = acquire_request(cancel);
+    if (!activity.ok())
+        return activity.status();
+    auto prepared = prepare("POST", path, std::move(body), cancel, activity->port());
     if (!prepared.ok())
         return prepared.status();
     auto request = std::move(prepared.value());

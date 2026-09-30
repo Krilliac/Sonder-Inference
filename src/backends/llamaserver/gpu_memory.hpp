@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "sonder/inference/error.hpp"
+#include "sonder/inference/backends/llamaserver_residency.hpp"
 
 namespace sonder::inference::llamaserver {
 
@@ -102,6 +103,7 @@ struct SpillGuardOptions {
     std::uint64_t step_align = 1024;
     std::uint64_t min_ctx = 8192;
     std::size_t max_attempts = 4;
+    LlamaServerResidencyGuardOptions residency;
 };
 
 Status validate_spill_guard(const SpillGuardOptions &options);
