@@ -10,6 +10,7 @@ sonder_module_sources(
     src/identity.cpp
     src/live_hub.cpp
     src/openai.cpp
+    src/residency.cpp
     src/request_path.cpp
     src/residency_config.cpp
     src/serve_main.cpp
@@ -28,6 +29,7 @@ sonder_add_module_tests(server
     tests/test_server_lifecycle.cpp
     tests/test_serve_main.cpp
     tests/test_server_faults.cpp
+    tests/test_server_residency.cpp
     tests/test_server_runtime.cpp
     tests/test_residency_config.cpp
     tests/test_server_request_path.cpp)
