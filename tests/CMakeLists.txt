@@ -27,6 +27,12 @@ set_target_properties(sonder_c_abi_smoke PROPERTIES LINKER_LANGUAGE CXX)
 add_test(NAME sonder.c_abi_smoke COMMAND sonder_c_abi_smoke)
 set_tests_properties(sonder.c_abi_smoke PROPERTIES TIMEOUT 60)
 
+# A ';' in a doctest TEST_CASE name makes CTest split it into two entries that
+# match nothing, so the test silently never runs (see cmake/CheckTestNames.cmake).
+add_test(NAME sonder.meta.test_names_have_no_semicolons
+    COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${PROJECT_SOURCE_DIR} -P ${PROJECT_SOURCE_DIR}/cmake/CheckTestNames.cmake)
+set_tests_properties(sonder.meta.test_names_have_no_semicolons PROPERTIES TIMEOUT 60)
+
 if(SONDER_BUILD_CLI)
     # Optional modules compiled into this build (their feature macros).
     get_target_property(sonder_defs sonder_inference INTERFACE_COMPILE_DEFINITIONS)
