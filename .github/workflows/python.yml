@@ -95,3 +95,10 @@ jobs:
         env:
           SONDER_INFERENCE_LIB_DIR: ${{ github.workspace }}/native
         run: python -m pytest -v
+
+      # Stdlib-only HTTP bench harness (bench/http): metric math, SSE parsing
+      # and full CLI runs against an in-process fake server. pytest exits 5
+      # when it collects no tests, so an empty run cannot pass.
+      - name: Run bench/http harness tests
+        shell: bash
+        run: python -m pytest -v -p no:cacheprovider bench/http/tests

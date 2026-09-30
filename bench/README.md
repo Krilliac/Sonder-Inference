@@ -13,6 +13,11 @@ backends share one code path, and Session telemetry is emitted as usual.
   and adds a time budget, prompt filtering, `--require-idle`, and a telemetry
   file option.
 
+For benchmarking a server over HTTP (raw `llama-server`, `sonder-infer
+serve`, Sonder Runtime `/v1`), with cached-token, inter-token-latency,
+concurrency, long-context recall and GPU-spill measurements, see
+[`bench/http/`](http/README.md).
+
 Run from the repository root:
 
 ```
