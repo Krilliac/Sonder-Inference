@@ -143,7 +143,7 @@ TEST_CASE("residency unit: concurrent first acquires share one load") {
     std::atomic<int> ok{0};
     std::vector<std::thread> threads;
     for (int i = 0; i < kThreads; ++i) {
-        threads.emplace_back([&] {
+        threads.emplace_back([&, i] {
             auto pin = r->acquire(i % 2 == 0 ? "mock:tiny" : "default");
             if (pin.ok() && pin.value().model()) ++ok;
         });
