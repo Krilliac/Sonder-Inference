@@ -81,6 +81,7 @@ struct OllamaTimings {
     // Prompt tokens served from the server's prompt cache (Ollama 0.33.3+);
     // 0 when absent. The direct measure of prefix-cache reuse.
     std::int64_t prompt_eval_cached_count = 0;
+    bool has_prompt_eval_cached_count = false;  // the field was present
     std::int64_t prompt_eval_duration_ns = 0;
     std::int64_t eval_count = 0;
     std::int64_t eval_duration_ns = 0;

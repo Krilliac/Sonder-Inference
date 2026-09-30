@@ -1,0 +1,16 @@
+{
+ "schema": "sonder.bench.http.scenarios/1",
+ "description": "Smoke-sized set that fits a 32k-context server. Copy and edit; unknown keys are ignored.",
+ "defaults": {"max_tokens": 48, "temperature": 0, "seed": 42},
+ "scenarios": [
+  {"name": "agent-stable", "kind": "agent_session", "turns": 4, "system_tokens": 4000, "tools": 12,
+   "turn_tokens": 300, "volatile_top": false, "tools_mode": "system"},
+  {"name": "agent-volatile-top", "kind": "agent_session", "turns": 4, "system_tokens": 4000, "tools": 12,
+   "turn_tokens": 300, "volatile_top": true},
+  {"name": "fanout-sweep", "kind": "concurrency_sweep", "levels": [1, 2, 4, 8], "waves": 1,
+   "shared_prefix_tokens": 1500, "max_tokens": 32},
+  {"name": "long-context", "kind": "long_context", "sizes": [8192, 16384, 28672], "depths": [0.1, 0.5, 0.9],
+   "max_tokens": 64, "api": "chat"},
+  {"name": "repeat-prompt", "kind": "repeat_prompt", "prompt_tokens": 6000, "repeats": 3, "max_tokens": 16}
+ ]
+}

@@ -1,5 +1,6 @@
 #include "sonder/inference/engine.hpp"
 
+#include <algorithm>
 #include <chrono>
 
 #include "engine/request_runtime.hpp"
@@ -15,6 +16,15 @@ namespace sonder::inference {
 
 const char* version_string() noexcept { return SONDER_INFERENCE_VERSION; }
 const char* build_commit() noexcept { return SONDER_INFERENCE_GIT_COMMIT; }
+
+const char* to_string(SchedulerMode mode) noexcept {
+    switch (mode) {
+        case SchedulerMode::automatic: return "automatic";
+        case SchedulerMode::gate: return "gate";
+        case SchedulerMode::account: return "account";
+    }
+    return "unknown";
+}
 
 Engine::Engine(EngineOptions options)
     : options_(std::move(options)), engine_id_(make_id("engine")),
@@ -39,7 +49,8 @@ Engine::Engine(EngineOptions options)
     if (runtime_) {
         const auto& so = options_.scheduling;
         telemetry_->emit("scheduler.configured", ctx,
-                         json::Object{{"kv_block_size_tokens", so.kv_block_size_tokens},
+                         json::Object{{"mode", to_string(so.mode)},
+                                      {"kv_block_size_tokens", so.kv_block_size_tokens},
                                       {"kv_num_blocks", so.kv_num_blocks},
                                       {"prefix_caching", so.prefix_caching},
                                       {"max_running_sequences", so.max_running_sequences},
@@ -75,11 +86,53 @@ void Engine::sample_devices(const std::vector<DeviceInfo>& devices) {
     }
 }
 
+void Engine::sample_backend_runtime() {
+    std::vector<std::shared_ptr<Backend>> backends;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& kv : backends_) {
+            backends.push_back(kv.second);
+        }
+    }
+    for (const auto& backend : backends) {
+        const auto status = backend->runtime_status();  // cheap snapshot
+        if (!status) {
+            continue;
+        }
+        const std::string name = backend->name();
+        const auto& gpu = status->gpu_memory;
+        auto& seen = runtime_samples_seen_[name];
+        if (gpu.status == "ok" && gpu.samples != seen) {
+            seen = gpu.samples;
+            json::Object attrs = to_json(gpu);
+            attrs.set("backend", name);
+            attrs.set("fitted_ctx", json::Value(status->context.fitted_ctx));  // null when unknown
+            attrs.set("fit_outcome", status->context.outcome);
+            telemetry_->emit("backend.gpu_memory.sample", engine_context(), std::move(attrs), TelemetryLevel::metrics);
+        }
+        auto& emitted = runtime_warnings_seen_[name];
+        for (const auto& w : status->warnings) {
+            std::string key = w.code + '\n' + w.source + '\n' + w.message;
+            if (std::find(emitted.begin(), emitted.end(), key) != emitted.end()) {
+                continue;
+            }
+            if (emitted.size() >= 256) {
+                break;  // bounded: a backend cannot grow this without limit
+            }
+            emitted.push_back(std::move(key));
+            json::Object attrs = to_json(w);
+            attrs.set("backend", name);
+            telemetry_->emit("backend.warning", engine_context(), std::move(attrs), TelemetryLevel::metrics);
+        }
+    }
+}
+
 void Engine::device_sampler_loop() {
     std::unique_lock<std::mutex> lock(sampler_mutex_);
     while (!sampler_cv_.wait_for(lock, options_.device_sample_interval, [this] { return sampler_stop_; })) {
         lock.unlock();
         sample_devices(enumerate_devices());  // re-reads available memory
+        sample_backend_runtime();
         lock.lock();
     }
 }

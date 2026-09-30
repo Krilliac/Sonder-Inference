@@ -11,6 +11,7 @@ const char* residency_state_name(ResidencyState state) noexcept {
         case ResidencyState::unloaded: return "unloaded";
         case ResidencyState::loading: return "loading";
         case ResidencyState::resident: return "resident";
+        case ResidencyState::unloading: return "unloading";
     }
     return "unloaded";
 }
@@ -115,6 +116,11 @@ Result<ModelResidency::Pin> ModelResidency::acquire(const std::string& id_or_ali
             sweep_cv_.notify_all();
             return failed;
         }
+        if (e.state == ResidencyState::unloading) {
+            // Wait until the evicted handle is released, then load anew.
+            load_cv_.wait(lock, [&] { return entries_[i].state != ResidencyState::unloading; });
+            continue;
+        }
         if (e.state == ResidencyState::loading) {
             // Join the load in progress instead of starting another.
             joined = e.load_generation;
@@ -197,7 +203,8 @@ void ModelResidency::collect_over_cap_locked(std::size_t keep, std::optional<std
         if (except && *except == i) {
             continue;
         }
-        if (entries_[i].state != ResidencyState::unloaded) {
+        // An unloading model is already on its way out: not counted.
+        if (entries_[i].state == ResidencyState::resident || entries_[i].state == ResidencyState::loading) {
             ++count;
         }
     }
@@ -225,10 +232,11 @@ Eviction ModelResidency::evict_locked(Entry& e, const char* reason, Clock::time_
     ev.id = e.id;
     ev.backend = e.backend;
     ev.model = std::move(e.model);
+    ev.index = static_cast<std::size_t>(&e - entries_.data());
     ev.reason = reason;
     ev.idle_ms = std::max(0.0, std::chrono::duration<double, std::milli>(now - e.last_used).count());
     e.model.reset();
-    e.state = ResidencyState::unloaded;
+    e.state = ResidencyState::unloading;  // unloaded once run_evictions() released it
     ++e.evictions;
     ++total_evictions_;
     return ev;
@@ -236,14 +244,21 @@ Eviction ModelResidency::evict_locked(Entry& e, const char* reason, Clock::time_
 
 void ModelResidency::run_evictions(std::vector<Eviction>& evictions) noexcept {
     for (auto& ev : evictions) {
-        if (!evictor_) {
-            continue;
+        if (evictor_) {
+            try {
+                evictor_(ev);
+            } catch (...) {
+                // Eviction bookkeeping already happened; the handle drops below.
+            }
         }
-        try {
-            evictor_(ev);
-        } catch (...) {
-            // Eviction bookkeeping already happened; the handle drops below.
+        ev.model.reset();
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (ev.index < entries_.size() && entries_[ev.index].state == ResidencyState::unloading) {
+                entries_[ev.index].state = ResidencyState::unloaded;
+            }
         }
+        load_cv_.notify_all();
     }
 }
 
@@ -352,6 +367,8 @@ ResidencyTotals ModelResidency::totals() const {
             ++t.resident;
         } else if (e.state == ResidencyState::loading) {
             ++t.loading;
+        } else if (e.state == ResidencyState::unloading) {
+            ++t.unloading;
         }
     }
     t.loads = total_loads_;

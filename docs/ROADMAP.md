@@ -53,6 +53,10 @@ Gate: measurable win on agent fan-out/long-context workloads without interactive
 - [x] external backend speculation via [`llamaserver`](integration/llama-server.md)
   (passes MTP/DFlash/n-gram configuration to llama-server; reports upstream
   draft acceptance and cache reuse; Sonder-owned adaptive policy remains below)
+- [x] llamaserver VRAM-spill guard (per-process PDH shared/dedicated usage on
+  Windows; warn / refuse / bounded `auto_fit` context step-down), KV cache
+  pairing check and llama-server log diagnostics, surfaced additively on
+  health, `/v1/models` and telemetry ([vram-spill](integration/vram-spill.md))
 - [ ] adaptive speculation policy
 - [ ] CPU KV spill
 - [ ] cache quantization where supported

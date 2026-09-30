@@ -14,6 +14,8 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace sonder_test {
 class FakeLlamaServer {
@@ -24,6 +26,16 @@ class FakeLlamaServer {
             r.set_content(r.status == 200 ? R"({"status":"ok"})" : R"({"error":"Loading model"})",
                           "application/json");
         });
+        // Absent (404) until set_props(): generic OpenAI upstreams have none.
+        svr_.Get("/props", [this](const httplib::Request &, httplib::Response &r) {
+            std::lock_guard<std::mutex> lock(mu_);
+            ++props_requests_;
+            if (props_.empty()) {
+                r.status = 404;
+                return;
+            }
+            r.set_content(props_, "application/json");
+        });
         svr_.Get("/v1/models", [](const httplib::Request &, httplib::Response &r) {
             r.set_content(R"({"object":"list","data":[{"id":"fake-model","object":"model"}]})",
                           "application/json");
@@ -31,6 +43,7 @@ class FakeLlamaServer {
         auto stream = [this](const httplib::Request &req, httplib::Response &r) {
             std::lock_guard<std::mutex> lock(mu_);
             last_body_ = req.body;
+            bodies_.push_back(req.body);
             r.status = status_;
             if (status_ != 200) {
                 r.set_content(body_, "text/event-stream");
@@ -83,6 +96,18 @@ class FakeLlamaServer {
         std::lock_guard<std::mutex> lock(mu_);
         return last_body_;
     }
+    std::vector<std::string> bodies() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return bodies_;
+    }
+    void set_props(std::string props) {
+        std::lock_guard<std::mutex> lock(mu_);
+        props_ = std::move(props);
+    }
+    unsigned props_requests() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return props_requests_;
+    }
     std::string last_slot() const {
         std::lock_guard<std::mutex> lock(mu_);
         return last_slot_;
@@ -100,6 +125,9 @@ class FakeLlamaServer {
     mutable std::mutex mu_;
     std::string body_;
     std::string last_body_;
+    std::vector<std::string> bodies_;
+    std::string props_;
+    unsigned props_requests_ = 0;
     std::string last_slot_;
     std::string last_slot_body_;
     int status_ = 200;

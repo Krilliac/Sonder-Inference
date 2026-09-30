@@ -280,9 +280,51 @@ TEST_CASE("residency unit: the sweeper thread evicts after the TTL") {
     REQUIRE(r->add("mock:tiny", "mock", true));
     r->start_sweeper();
     CHECK(r->acquire("mock:tiny").ok());
-    CHECK(eventually([&] { return evicted.load() == 1; }, std::chrono::milliseconds(3000)));
-    CHECK(r->snapshot()[0].state == det::ResidencyState::unloaded);
+    // `unloaded` is reported only once the evictor has returned.
+    CHECK(eventually([&] { return r->snapshot()[0].state == det::ResidencyState::unloaded; },
+                     std::chrono::milliseconds(3000)));
+    CHECK(evicted.load() == 1);
     r->stop_sweeper();
+}
+
+TEST_CASE("residency unit: an evicted model reads unloaded only after its release, and a reload waits for it") {
+    EngineModels em;
+    Gate evict_gate;
+    evict_gate.close();
+    std::shared_ptr<det::ModelResidency> r;
+    std::atomic<int> seen_state{-1};
+    r = std::make_shared<det::ModelResidency>(
+        det::ResidencyConfig{std::chrono::milliseconds(1), 0}, [&](const std::string& id) { return em.load(id); },
+        [&](det::Eviction&) {
+            seen_state = static_cast<int>(r->snapshot()[0].state);
+            evict_gate.pass();  // the old handle is still being released
+        });
+    REQUIRE(r->add("mock:tiny", "mock", true));
+    REQUIRE(r->acquire("mock:tiny").ok());  // loaded, then released
+    const auto much_later = det::ModelResidency::Clock::now() + std::chrono::hours(1);
+    std::thread sweeper([&] { (void)r->sweep(much_later); });
+    REQUIRE(evict_gate.wait_for_waiter(std::chrono::milliseconds(3000)));
+    CHECK(seen_state.load() == static_cast<int>(det::ResidencyState::unloading));
+    CHECK(r->snapshot()[0].state == det::ResidencyState::unloading);
+    CHECK(r->totals().unloading == 1);
+    CHECK(r->totals().resident == 0);
+    std::atomic<bool> reloaded{false};
+    std::thread reloader([&] {
+        auto pin = r->acquire("mock:tiny");
+        reloaded = pin.ok();
+    });
+    REQUIRE(eventually([&] { return r->snapshot()[0].pins == 1; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    // No second copy while the old one is still being released.
+    CHECK(em.loads.load() == 1);
+    CHECK_FALSE(reloaded.load());
+    evict_gate.open();
+    sweeper.join();
+    reloader.join();
+    CHECK(reloaded.load());
+    CHECK(em.loads.load() == 2);
+    CHECK(r->snapshot()[0].state == det::ResidencyState::resident);
+    CHECK(r->totals().unloading == 0);
 }
 
 // ------------------------------------------------------------ server
@@ -421,6 +463,8 @@ TEST_CASE("residency: an idle TTL unloads the model and the next request reloads
     CHECK(backend->loads.load() == 1);  // eager by default
     const json::Value h = get(f.port, "/v1/sonder/health").json();
     CHECK(h.find("residency")->find("idle_ttl_s")->as_double() == doctest::Approx(0.15));
+    // `unloaded` is reported only after model.evicted and model.unload were
+    // emitted and the old handle released, so no wait is needed below.
     REQUIRE(eventually([&] { return model_state(f.port, "mock:tiny") == "unloaded"; }));
     const auto evicted = f.of_type("model.evicted");
     REQUIRE(evicted.size() == 1);

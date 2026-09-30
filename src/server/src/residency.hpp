@@ -34,9 +34,13 @@
 
 namespace sonder::inference::server::detail {
 
-enum class ResidencyState { unloaded, loading, resident };
+// `unloading`: evicted, and the evictor is still releasing the old handle
+// (telemetry, engine unload). The model reports `unloaded` only once that has
+// finished, and a request for it waits for the release before loading it
+// again, so an old and a new copy are never held at the same time.
+enum class ResidencyState { unloaded, loading, resident, unloading };
 
-// "unloaded", "loading", "resident".
+// "unloaded", "loading", "resident", "unloading".
 const char* residency_state_name(ResidencyState state) noexcept;
 
 struct ResidencyConfig {
@@ -56,6 +60,7 @@ struct Eviction {
     std::string id;
     std::string backend;
     std::shared_ptr<Model> model;
+    std::size_t index = 0;  // entry index, to mark it unloaded afterwards
     const char* reason = kEvictIdleTtl;
     double idle_ms = 0.0;
 };
@@ -77,6 +82,7 @@ struct ResidencyTotals {
     std::size_t registered = 0;
     std::size_t resident = 0;
     std::size_t loading = 0;
+    std::size_t unloading = 0;
     std::uint64_t loads = 0;
     std::uint64_t load_failures = 0;
     std::uint64_t evictions = 0;
@@ -88,7 +94,8 @@ public:
     // Loads model `id`. Called without any residency lock held.
     using Loader = std::function<Result<std::shared_ptr<Model>>(const std::string& id)>;
     // Releases an evicted model (engine unload, telemetry). Called without any
-    // residency lock held, after the model was marked unloaded. It may take
+    // residency lock held, while the model is marked unloading; it becomes
+    // unloaded when this returns. It may take
     // (move out) `model`, so that the residency's reference is gone before
     // the engine unloads it.
     using Evictor = std::function<void(Eviction&)>;

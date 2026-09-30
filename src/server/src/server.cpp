@@ -19,6 +19,7 @@
 #include "identity.hpp"
 #include "live_hub.hpp"
 #include "openai.hpp"
+#include "request_path.hpp"
 #include "residency.hpp"
 #include "socket.hpp"
 #include "test_hooks.hpp"
@@ -477,6 +478,7 @@ struct Server::Impl {
             {"registered", t.registered},
             {"resident", t.resident},
             {"loading", t.loading},
+            {"unloading", t.unloading},
             {"loads", t.loads},
             {"load_failures", t.load_failures},
             {"evictions", t.evictions}};
@@ -579,6 +581,11 @@ struct Server::Impl {
                 if (!version.empty()) {
                     entry.set("version", version);
                 }
+                // Additive: only backends that report runtime observations
+                // (e.g. a spawned llama-server) get this field.
+                if (const auto runtime = b->runtime_status()) {
+                    entry.set("runtime", to_json(*runtime));
+                }
                 backends.emplace_back(std::move(entry));
             }
         }
@@ -632,13 +639,25 @@ struct Server::Impl {
         if (!require_ready(ex)) {
             return;
         }
+        std::shared_ptr<Backend> b;
+        {
+            std::lock_guard<std::mutex> lock(engine_mu);
+            b = backend;
+        }
+        const std::optional<BackendRuntimeStatus> runtime = b ? b->runtime_status() : std::nullopt;
         json::Array data;
         for (const auto& m : residency->snapshot()) {
+            json::Object ext{{"backend", m.backend}, {"default", m.is_default}, {"synthetic", synthetic}};
+            // Additive: context fit, GPU memory and warnings of the backend
+            // process serving this model, when the backend reports them. This
+            // describes the backend process, not the model handle, so it is
+            // reported whatever the model's residency state (a lazy or
+            // evicted model is still served by that process).
+            if (runtime && b->name() == m.backend) {
+                ext.set("runtime", to_json(*runtime));
+            }
             data.emplace_back(json::Object{
-                {"id", m.id},
-                {"object", "model"},
-                {"owned_by", "sonder-inference"},
-                {"sonder", json::Object{{"backend", m.backend}, {"default", m.is_default}, {"synthetic", synthetic}}}});
+                {"id", m.id}, {"object", "model"}, {"owned_by", "sonder-inference"}, {"sonder", std::move(ext)}});
         }
         send_json(ex, 200, json::Object{{"object", "list"}, {"data", std::move(data)}, {"sonder", sonder_meta()}});
     }
@@ -879,6 +898,9 @@ struct Server::Impl {
         RequestOptions ro;
         ro.request_id = make_id("req");
         ro.parent_request_id = corr.parent_request_id;
+        ro.session_key = chat_session_key(job, corr);
+        ro.thinking = job.thinking;
+        const std::vector<std::string> warnings = apply_thinking_pins(opts, ro.thinking);
         const std::string completion_id = "chatcmpl-" + *ro.request_id;
         // X-Sonder-Request-Id and the access log carry the engine request id.
         ex.request_id = *ro.request_id;
@@ -1024,6 +1046,9 @@ struct Server::Impl {
                           {"backend", pin.backend()},
                           {"synthetic", synthetic},
                           {"token_counts_from_backend", r.stats.token_counts_from_backend}};
+        if (!warnings.empty()) {
+            meta.set("warnings", json::Array(warnings.begin(), warnings.end()));
+        }
         session->close();
         if (!job.stream) {
             json::Object doc{
@@ -1558,6 +1583,7 @@ struct Server::Impl {
             eo.telemetry_sinks.push_back(s);
         }
         eo.server = EngineServerInfo{opts.host, bound_port, kApiVersion};
+        apply_scheduling(opts, eo.scheduling);
         {
             std::lock_guard<std::mutex> lock(engine_mu);
             engine = std::make_unique<Engine>(std::move(eo));
@@ -1829,7 +1855,7 @@ Status validate_options(const ServerOptions& o) {
                               "path, trailing slash or wildcard (for example http://127.0.0.1:4173)");
         }
     }
-    return Status::success();
+    return validate_request_path_options(o);
 }
 
 Server::Server(ServerOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {}

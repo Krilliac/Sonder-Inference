@@ -1,7 +1,9 @@
 #include "sonder/inference/backend_setup.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 
 #include "sonder/inference/backends.hpp"
@@ -116,7 +118,8 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
         static constexpr std::string_view known[] = {"mode", "base_url", "executable", "args", "allow_remote",
             "native_completion", "grammar", "connect_timeout_ms", "request_timeout_ms", "startup_timeout_ms",
             "poll_interval_ms", "shutdown_timeout_ms", "restart_backoff_ms", "max_restart_backoff_ms",
-            "max_restarts", "tls"};
+            "max_restarts", "tls", "spill_guard", "log_file", "kv_pairing_check", "context_length",
+            "slot_affinity"};
         for (auto k : known) if (k == key) return false;
         return true;
     };
@@ -191,6 +194,51 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
         if (const auto* v = tls->find("server_name")) { if (!v->is_string()) return Status(ErrorCode::invalid_argument, "tls.server_name must be a string"); setup.llamaserver_server_name = v->as_string(); }
         if (const auto* v = tls->find("insecure_skip_verify")) { if (!v->is_bool()) return Status(ErrorCode::invalid_argument, "tls.insecure_skip_verify must be boolean"); setup.llamaserver_insecure_skip_verify = v->as_bool(); }
         if (const auto* v = tls->find("handshake_timeout_ms")) { if (!v->is_integer() || v->as_int(-1) < 0 || v->as_uint() > 3600000 || v->as_uint() == 0) return Status(ErrorCode::invalid_argument, "tls.handshake_timeout_ms must be an integer in [1, 3600000]"); setup.llamaserver_handshake_timeout_ms = v->as_uint(); }
+    }
+    if (auto st = string_field("log_file", setup.llamaserver_log_file); !st.ok()) return st;
+    if (setup.llamaserver_log_file.find('\0') != std::string::npos)
+        return Status(ErrorCode::invalid_argument, "llamaserver config: log_file must not contain NUL");
+    if (auto st = bool_field("kv_pairing_check", setup.llamaserver_kv_pairing_check); !st.ok()) return st;
+    if (auto st = bool_field("slot_affinity", setup.llamaserver_slot_affinity); !st.ok()) return st;
+    if (const auto* v = object.find("context_length")) {
+        if (!v->is_integer() || v->as_int(-1) < 0 || v->as_uint() > 4294967296ull)
+            return Status(ErrorCode::invalid_argument, "llamaserver config: 'context_length' must be an integer in [0, 4294967296]");
+        setup.llamaserver_context_length = v->as_uint();
+    }
+    if (const auto* guard = object.find("spill_guard")) {
+        if (!guard->is_object()) return Status(ErrorCode::invalid_argument, "llamaserver config: 'spill_guard' must be an object");
+        static constexpr std::string_view guard_keys[] = {"enabled", "policy", "threshold_mib", "baseline_mib",
+            "sample_interval_ms", "fit_step_factor", "fit_step_align", "fit_min_ctx", "fit_max_attempts"};
+        for (const auto& member : guard->as_object()) {
+            if (std::find(std::begin(guard_keys), std::end(guard_keys), member.first) == std::end(guard_keys))
+                return Status(ErrorCode::invalid_argument, "llamaserver config: unknown spill_guard field '" + member.first + "'");
+        }
+        const auto bad = [](const char* key, const char* range) {
+            return Status(ErrorCode::invalid_argument, std::string("llamaserver config: spill_guard.") + key + " must be " + range);
+        };
+        if (const auto* v = guard->find("enabled")) { if (!v->is_bool()) return bad("enabled", "boolean"); setup.llamaserver_spill_guard = v->as_bool(); }
+        if (const auto* v = guard->find("policy")) {
+            if (!v->is_string() || (v->as_string() != "warn" && v->as_string() != "refuse" && v->as_string() != "auto_fit"))
+                return bad("policy", "warn, refuse or auto_fit");
+            setup.llamaserver_spill_policy = v->as_string();
+        }
+        const auto uint_in = [&](const char* key, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out, const char* range) -> Status {
+            if (const auto* v = guard->find(key)) {
+                if (!v->is_integer() || v->as_int(-1) < 0 || v->as_uint() < lo || v->as_uint() > hi) return bad(key, range);
+                out = v->as_uint();
+            }
+            return {};
+        };
+        if (auto st = uint_in("threshold_mib", 1, 1048576, setup.llamaserver_spill_threshold_mib, "an integer in [1, 1048576]"); !st.ok()) return st;
+        if (auto st = uint_in("baseline_mib", 0, 1048576, setup.llamaserver_spill_baseline_mib, "an integer in [0, 1048576]"); !st.ok()) return st;
+        if (auto st = uint_in("sample_interval_ms", 100, 3600000, setup.llamaserver_spill_sample_interval_ms, "an integer in [100, 3600000]"); !st.ok()) return st;
+        if (auto st = uint_in("fit_step_align", 1, 1048576, setup.llamaserver_fit_step_align, "an integer in [1, 1048576]"); !st.ok()) return st;
+        if (auto st = uint_in("fit_min_ctx", 1, 4294967296ull, setup.llamaserver_fit_min_ctx, "an integer in [1, 4294967296]"); !st.ok()) return st;
+        if (auto st = uint_in("fit_max_attempts", 1, 32, setup.llamaserver_fit_max_attempts, "an integer in [1, 32]"); !st.ok()) return st;
+        if (const auto* v = guard->find("fit_step_factor")) {
+            if (!v->is_number() || !(v->as_double() > 0.0 && v->as_double() < 1.0)) return bad("fit_step_factor", "a number in (0, 1)");
+            setup.llamaserver_fit_step_factor = v->as_double();
+        }
     }
     setup.llamaserver_config = path;
     destination = std::move(setup);
@@ -271,6 +319,24 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
         lo.tls.ca_bundle_path = setup.llamaserver_ca_bundle_path; lo.tls.pinned_sha256 = setup.llamaserver_pinned_sha256;
         lo.tls.pinned_cert_path = setup.llamaserver_pinned_cert_path; lo.tls.insecure_skip_verify = setup.llamaserver_insecure_skip_verify;
         lo.tls.server_name = setup.llamaserver_server_name; lo.tls.handshake_timeout = std::chrono::milliseconds(setup.llamaserver_handshake_timeout_ms);
+        lo.spill_guard.enabled = setup.llamaserver_spill_guard;
+        if (setup.llamaserver_spill_policy == "warn") lo.spill_guard.policy = LlamaServerSpillPolicy::warn;
+        else if (setup.llamaserver_spill_policy == "refuse") lo.spill_guard.policy = LlamaServerSpillPolicy::refuse;
+        else if (setup.llamaserver_spill_policy == "auto_fit") lo.spill_guard.policy = LlamaServerSpillPolicy::auto_fit;
+        else return Status(ErrorCode::invalid_argument, "llamaserver spill policy must be warn, refuse or auto_fit");
+        if (setup.llamaserver_spill_threshold_mib > 1048576 || setup.llamaserver_spill_baseline_mib > 1048576)
+            return Status(ErrorCode::invalid_argument, "llamaserver spill threshold/baseline must be at most 1048576 MiB");
+        lo.spill_guard.threshold_bytes = setup.llamaserver_spill_threshold_mib * 1024ull * 1024ull;
+        lo.spill_guard.baseline_bytes = setup.llamaserver_spill_baseline_mib * 1024ull * 1024ull;
+        lo.spill_guard.sample_interval = std::chrono::milliseconds(setup.llamaserver_spill_sample_interval_ms);
+        lo.spill_guard.fit_step_factor = setup.llamaserver_fit_step_factor;
+        lo.spill_guard.fit_step_align = setup.llamaserver_fit_step_align;
+        lo.spill_guard.fit_min_ctx = setup.llamaserver_fit_min_ctx;
+        lo.spill_guard.fit_max_attempts = static_cast<std::size_t>(setup.llamaserver_fit_max_attempts);
+        lo.diagnostics.log_file = setup.llamaserver_log_file;
+        lo.diagnostics.kv_pairing_check = setup.llamaserver_kv_pairing_check;
+        lo.context_length = setup.llamaserver_context_length;
+        lo.slot_affinity = setup.llamaserver_slot_affinity;
         std::shared_ptr<Backend> backend = make_llamaserver_backend(std::move(lo));
         return backend;
 #else

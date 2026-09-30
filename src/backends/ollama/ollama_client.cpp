@@ -179,6 +179,7 @@ void apply_server_timings(const json::Value& j, OllamaTimings& t) {
     t.load_duration_ns = int_field(j, "load_duration");
     t.prompt_eval_count = int_field(j, "prompt_eval_count");
     t.prompt_eval_cached_count = int_field(j, "prompt_eval_cached_count");
+    t.has_prompt_eval_cached_count = j.find("prompt_eval_cached_count") != nullptr;
     t.prompt_eval_duration_ns = int_field(j, "prompt_eval_duration");
     t.eval_count = int_field(j, "eval_count");
     t.eval_duration_ns = int_field(j, "eval_duration");

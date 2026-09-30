@@ -212,11 +212,13 @@ TEST_CASE("decoder: prompt_eval_cached_count is parsed and reported") {
     CHECK(t.has_server_timings);
     CHECK(t.prompt_eval_count == 35);
     CHECK(t.prompt_eval_cached_count == 34);
+    CHECK(t.has_prompt_eval_cached_count);
     CHECK(timing_attributes(t).find("prompt_eval_cached_count")->as_int() == 34);
 
     OllamaTimings old;  // servers before 0.33.3 omit the field
     apply_server_timings(json::parse(R"({"prompt_eval_count":35})").value(), old);
     CHECK(old.prompt_eval_cached_count == 0);
+    CHECK_FALSE(old.has_prompt_eval_cached_count);
 }
 
 TEST_CASE("telemetry: timing attributes only include server-reported fields") {

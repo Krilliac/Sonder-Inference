@@ -42,6 +42,11 @@ expansion. Model placement, context, chat templates and speculative execution
 belong to the child. See the installed version's `llama-server --help` and
 the [upstream server reference](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md).
 
+Spawned children are also checked for VRAM spill (Windows PDH counters) and
+K/V cache types without a FlashAttention kernel, and their log can be scanned
+for performance warnings; see [VRAM spill and KV kernel pairing](vram-spill.md)
+for the `spill_guard`, `log_file` and `kv_pairing_check` keys.
+
 The first upstream operation starts the child on `127.0.0.1` at a free port
 and waits for `/health`. A background monitor restarts crashed children with
 capped exponential backoff and a finite restart budget. In-flight requests
@@ -88,8 +93,20 @@ Parsers set `explicit_fields_only` to honor the presence markers exclusively,
 so their own local defaults (including the HTTP server's token budget) are
 not forwarded as user choices. Other backends ignore both presence fields.
 
-Configure context size in the child arguments, not `SamplingConfig::num_ctx`;
-llama-server has no equivalent per-request context resize. A non-empty
+Configure context size in the child arguments (`--ctx-size`); llama-server
+has no per-request context resize. After readiness the backend reads
+`GET /props` once per upstream instance (again after a restart or an
+`auto_fit` relaunch) and caches the served per-slot context
+(`default_generation_settings.n_ctx`) and slot count (`total_slots`); the
+model descriptor's `context_length` reports it. A request `num_ctx` up to the
+served context is accepted as a no-op (the engine narrows its own
+accounting; nothing is sent upstream), so Sonder Runtime bridged turns, which
+always carry a positive `num_ctx`, work. A larger `num_ctx` fails before
+anything is streamed with `invalid_argument` naming both numbers (`num_ctx
+65536 exceeds the served context 32768 ...`; HTTP 400). An upstream without
+`/props` (a generic OpenAI server) uses the config's `context_length`; when
+neither is known `num_ctx` is accepted unenforced and the upstream keeps its
+own window. A non-empty
 `grammar` string in the backend config is sent as GBNF to the upstream.
 Structured tool calls are not represented by Sonder's text-only backend
 interface. A `length` finish reason maps to `StopReason::max_tokens`.
@@ -106,6 +123,36 @@ a positive draft count), and `backend_predicted_tokens_per_second` on
 request/decode summaries; prefill events also include backend cached tokens.
 These observations are distinct from the scheduler's logical
 `reused_prompt_tokens`. They do not establish a performance or quality gain.
+
+## Prompt cache and slot affinity
+
+llama-server keeps one KV cache per slot and reuses a prompt prefix only in
+the slot that last processed it; on hybrid models (Qwen3.x) reuse reaches
+back only to a checkpoint, so landing on the wrong slot means a full re-read
+(about 2 minutes for 100k tokens, against 0.13 s for a 121k-token reuse).
+In native mode (`native_completion`, the default) every request sends
+`"cache_prompt": true`, and with `slot_affinity` (default true; JSON
+`"slot_affinity"`) a chat's `ChatRequest::session_key` is pinned to one slot
+with `id_slot`:
+
+- The server fills `session_key` from `prompt_cache_key`, else from
+  `X-Sonder-Run-Id` / `X-Sonder-Agent-Id` (`run=<id>;agent=<id>`), so each
+  agent of a run keeps its own slot. No key: no `id_slot` (llama-server picks
+  an idle slot by prompt similarity, as before).
+- A known key keeps its slot, even while its previous turn still runs.
+- A new key takes the lowest slot no key owns, else the slot of the least
+  recently used key whose slot is idle. When every slot is owned and busy the
+  request is not pinned. The map holds one key per slot (at most 1024).
+- With one slot (`total_slots` 1) every keyed chat uses slot 0; with an
+  unknown slot count nothing is pinned.
+
+Generic OpenAI mode (`native_completion: false`) sends neither field, since
+strict OpenAI-compatible servers reject unknown parameters. Raw completions
+(`generate`) send `cache_prompt` but carry no conversation key.
+
+Thinking controls (`ChatRequest::thinking`) are sent as
+`chat_template_kwargs: {"enable_thinking", "reasoning_effort"}` only when set;
+see [SERVER.md](../SERVER.md#thinking-control) for pinning them server-wide.
 
 ## Slot save and restore
 
@@ -145,7 +192,8 @@ nor a new route on Sonder's HTTP server or C ABI.
   the same local user.
 
 Other configuration keys are `connect_timeout_ms`, `request_timeout_ms`,
-`poll_interval_ms`, and `shutdown_timeout_ms`. Durations are bounded positive
+`poll_interval_ms`, `shutdown_timeout_ms`, `context_length` (served context
+when there is no `/props`; 0 = unknown) and `slot_affinity` (boolean). Durations are bounded positive
 milliseconds (at most one hour in JSON); `max_restarts: 0` disables restarts.
 `max_restarts` is at most 1000 and the initial backoff cannot exceed its cap.
 Unknown keys and invalid

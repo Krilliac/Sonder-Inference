@@ -105,6 +105,8 @@ public:
         params.model = descriptor_.name;
         params.messages = request.messages;
         params.options = ollama::sampling_to_options(request.sampling);
+        // Ollama's own switch; reasoning_effort has no portable Ollama field.
+        params.think = request.thinking.enable_thinking;
         return run(cancel, on_chunk, [&](const ollama::ChunkCallback& cb) { return client_->chat(params, cb, cancel); });
     }
 
@@ -157,6 +159,9 @@ private:
             stats.prompt_eval_ns = to_u64(r.timings.prompt_eval_duration_ns);
             stats.eval_ns = to_u64(r.timings.eval_duration_ns);
             stats.token_counts_from_backend = true;
+            if (r.timings.has_prompt_eval_cached_count) {
+                stats.cached_tokens = to_u64(r.timings.prompt_eval_cached_count);
+            }
         } else {
             stats.completion_tokens = static_cast<std::uint64_t>(r.timings.content_chunks);
         }

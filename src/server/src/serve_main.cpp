@@ -29,6 +29,7 @@
 #include "sonder/inference/json.hpp"
 #include "sonder/inference/server.hpp"
 #include "sonder/inference/telemetry.hpp"
+#include "request_path.hpp"
 
 namespace sonder::inference::server {
 
@@ -136,7 +137,12 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"max-resident-models", Kind::value},
         {"moe-experts", Kind::value},    {"tensor-override", Kind::repeat},
     };
-    return kSpec;
+    static const std::vector<std::pair<std::string, Kind>> kAll = [] {
+        auto all = kSpec;
+        for (const char* flag : detail::kRequestPathFlags) all.emplace_back(flag, Kind::value);
+        return all;
+    }();
+    return kAll;
 }
 
 struct ParsedArgs {
@@ -344,7 +350,7 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
         return usage_error(error);
     }
     if (a.help) {
-        out << kServeUsage;
+        out << kServeUsage << '\n' << detail::kRequestPathUsage;
         out.flush();
         return 0;
     }
@@ -421,6 +427,9 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
     if (auto v = a.get("max-resident-models")) {
         if (!parse_uint(*v, 4096, n)) return usage_error("--max-resident-models must be an integer from 0 to 4096");
         o.max_resident_models = static_cast<std::size_t>(n);
+    }
+    if (Status st = detail::parse_request_path_flags([&a](const std::string& k) { return a.get(k); }, o); !st.ok()) {
+        return usage_error(st.message());
     }
     if (auto v = a.get("mock-delay-ms")) {
         if (!parse_uint(*v, 60000, n)) return usage_error("--mock-delay-ms must be an integer from 0 to 60000");

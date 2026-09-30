@@ -36,6 +36,7 @@ inline constexpr int kApiVersion = 1;
 inline constexpr std::uint16_t kDefaultPort = 11437;
 
 enum class LogFormat { text, json };
+enum class SchedulerPolicy { automatic, gate, account, off };
 
 struct ServerOptions {
     // Listen address. Non-loopback binds require `token`.
@@ -105,6 +106,16 @@ struct ServerOptions {
     // in flight can exceed it until they finish. With eager loading only the
     // first N models load during start(). 0 = no cap.
     std::size_t max_resident_models = 0;
+    // Request path (docs/SERVER.md "Scheduling" and "Thinking control").
+    // --scheduler: automatic gates in-process backends per token and only
+    // admits/accounts remote-process ones (llamaserver, ollama); off disables
+    // the engine scheduler. --kv-pool-tokens: logical KV pool (0 = 65,536).
+    SchedulerPolicy scheduler = SchedulerPolicy::automatic;
+    std::uint64_t kv_pool_tokens = 0;
+    // --pin-enable-thinking / --pin-reasoning-effort: forwarded on every chat
+    // request; a conflicting request value is overridden with a warning.
+    std::optional<bool> pin_enable_thinking;
+    std::optional<std::string> pin_reasoning_effort;
 };
 
 // Checks option combinations that the server refuses to start with

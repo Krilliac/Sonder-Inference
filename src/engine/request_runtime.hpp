@@ -37,6 +37,11 @@ struct RuntimeRequestSpec {
     std::uint32_t context_limit = 0;  // 0 = unknown
     std::uint64_t fingerprint = 0;    // model compatibility (prefix sharing)
     ModelArchitecture architecture = ModelArchitecture::attention_only;
+    // false (SchedulerMode::account): the request is admitted and its prompt
+    // accounted, then leaves the scheduler at the end of its logical prefill;
+    // the session acquires one admission grant and streams without per-chunk
+    // grants. A prompt larger than the KV pool is bypassed, not rejected.
+    bool gated = true;
 };
 
 struct RuntimeSubmission {
@@ -45,6 +50,9 @@ struct RuntimeSubmission {
     // limit and to the KV pool, minus the prompt. Callers cap generation to
     // this so a smaller num_ctx (or the pool size) is actually honoured.
     std::uint32_t max_new_tokens = 1;
+    // Ungated only: the prompt exceeds the KV pool, so nothing was scheduled
+    // (id is 0) and the request runs unscheduled (scheduler.bypassed).
+    bool bypassed = false;
 };
 
 struct RuntimeRequestSummary {

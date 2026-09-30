@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -26,12 +28,32 @@ struct Timings {
     std::uint64_t eval_ns = 0;
 };
 
+// llama.cpp-only request fields (never sent to a generic OpenAI upstream).
+struct RequestExtras {
+    bool cache_prompt = false;             // "cache_prompt": true
+    std::optional<std::uint32_t> id_slot;  // "id_slot": pinned slot
+};
+
+// GET /props: the per-slot context (default_generation_settings.n_ctx, or a
+// top-level n_ctx) and the slot count (total_slots). 0 = not reported.
+struct ServerProps {
+    std::uint64_t n_ctx = 0;
+    std::uint32_t total_slots = 0;
+};
+
 json::Value build_completion_body(const std::string &model, const GenerateRequest &request,
-                                  bool native_completion, std::string_view grammar = {});
+                                  bool native_completion, std::string_view grammar = {},
+                                  const RequestExtras &extras = {});
+// Also forwards request.thinking as chat_template_kwargs when set.
 json::Value build_chat_body(const std::string &model, const ChatRequest &request,
-                            std::string_view grammar = {});
+                            std::string_view grammar = {}, const RequestExtras &extras = {});
 Status parse_timings(const json::Value &value, Timings &out);
+Status parse_props(const json::Value &value, ServerProps &out);
 StopReason map_finish_reason(std::string_view reason);
-Status validate_sampling(const SamplingConfig &sampling);
+// num_ctx is a server property on llama-server: a value up to the served
+// per-slot context is a no-op (the engine narrows its own accounting), a
+// larger one is refused naming both numbers. served_ctx 0 = unknown, and
+// then num_ctx is accepted unenforced (the upstream keeps its own window).
+Status validate_sampling(const SamplingConfig &sampling, std::uint64_t served_ctx = 0);
 
 } // namespace sonder::inference::llamaserver

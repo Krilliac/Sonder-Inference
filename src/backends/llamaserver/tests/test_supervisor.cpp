@@ -1,5 +1,6 @@
 #include "../process.hpp"
 #include "../supervisor.hpp"
+#include "fake_process.hpp"
 #include "fake_server.hpp"
 #include <atomic>
 #include <condition_variable>
@@ -19,67 +20,7 @@
 
 using namespace sonder::inference;
 using namespace sonder::inference::llamaserver;
-namespace {
-struct ChildState {
-    std::atomic<bool> alive{true};
-    std::atomic<unsigned> stops{0};
-};
-struct LaunchState {
-    mutable std::mutex mutex;
-    std::condition_variable changed;
-    std::vector<std::shared_ptr<ChildState>> children;
-    std::vector<std::chrono::steady_clock::time_point> starts;
-    std::vector<ProcessSpec> specs;
-};
-class FakeProcess final : public Process {
-  public:
-    explicit FakeProcess(std::shared_ptr<ChildState> state) : state_(std::move(state)) {}
-    bool running() const override { return state_->alive.load(std::memory_order_acquire); }
-    void stop(std::chrono::milliseconds) override {
-        state_->stops.fetch_add(1);
-        state_->alive.store(false);
-    }
-
-  private:
-    std::shared_ptr<ChildState> state_;
-};
-class FakeLauncher final : public ProcessLauncher {
-  public:
-    explicit FakeLauncher(std::shared_ptr<LaunchState> state) : state_(std::move(state)) {}
-    Result<std::unique_ptr<Process>> start(const ProcessSpec &spec) override {
-        auto child = std::make_shared<ChildState>();
-        {
-            std::lock_guard lock(state_->mutex);
-            state_->children.push_back(child);
-            state_->starts.push_back(std::chrono::steady_clock::now());
-            state_->specs.push_back(spec);
-        }
-        state_->changed.notify_all();
-        return std::unique_ptr<Process>(new FakeProcess(std::move(child)));
-    }
-
-  private:
-    std::shared_ptr<LaunchState> state_;
-};
-bool wait_for_starts(const std::shared_ptr<LaunchState> &state, std::size_t n) {
-    std::unique_lock lock(state->mutex);
-    return state->changed.wait_for(lock, std::chrono::seconds(3), [&] { return state->starts.size() >= n; });
-}
-std::shared_ptr<ChildState> child_at(const std::shared_ptr<LaunchState> &state, std::size_t index) {
-    std::lock_guard lock(state->mutex);
-    return state->children.at(index);
-}
-SupervisorOptions base_options() {
-    SupervisorOptions o;
-    o.executable = "fake-llama-server";
-    o.arguments = {"--model", "model.gguf", "--spec-type", "draft-mtp"};
-    o.readiness_timeout = std::chrono::milliseconds(2000);
-    o.health_poll_interval = std::chrono::milliseconds(2);
-    o.restart_initial_backoff = std::chrono::milliseconds(5);
-    o.restart_max_backoff = std::chrono::milliseconds(8);
-    return o;
-}
-} // namespace
+using namespace sonder_test;
 
 TEST_CASE("supervisor polls readiness false false true and appends loopback binding") {
     auto state = std::make_shared<LaunchState>();

@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <limits>
+#include <mutex>
 #include <utility>
 
 #include "llamaserver_protocol.hpp"
 #include "net/http_client.hpp"
+#include "slot_affinity.hpp"
 #include "supervisor.hpp"
 
 namespace sonder::inference {
@@ -27,6 +29,32 @@ Status status_for_http(int code) {
     return {ErrorCode::backend_error, message};
 }
 
+llamaserver::SpillGuardOptions spill_guard_options(const LlamaServerSpillGuardOptions &o) {
+    llamaserver::SpillGuardOptions g;
+    g.enabled = o.enabled;
+    // An out-of-range enum value stays invalid and is rejected by validate_spill_guard.
+    g.policy = static_cast<llamaserver::SpillPolicy>(-1);
+    switch (o.policy) {
+    case LlamaServerSpillPolicy::warn:
+        g.policy = llamaserver::SpillPolicy::warn;
+        break;
+    case LlamaServerSpillPolicy::refuse:
+        g.policy = llamaserver::SpillPolicy::refuse;
+        break;
+    case LlamaServerSpillPolicy::auto_fit:
+        g.policy = llamaserver::SpillPolicy::auto_fit;
+        break;
+    }
+    g.threshold_bytes = o.threshold_bytes;
+    g.baseline_bytes = o.baseline_bytes;
+    g.sample_interval = o.sample_interval;
+    g.step_factor = o.fit_step_factor;
+    g.step_align = o.fit_step_align;
+    g.min_ctx = o.fit_min_ctx;
+    g.max_attempts = o.fit_max_attempts;
+    return g;
+}
+
 Status validate_options(const LlamaServerBackendOptions &options) {
     const auto duration_ok = [](std::chrono::milliseconds ms) {
         return ms.count() > 0 && ms <= std::chrono::hours(24);
@@ -40,9 +68,21 @@ Status validate_options(const LlamaServerBackendOptions &options) {
     if (options.max_restarts > 1000 || options.restart_backoff > options.max_restart_backoff) {
         return {ErrorCode::invalid_argument, "llamaserver: invalid restart policy"};
     }
+    if (options.context_length > (std::uint64_t{1} << 32))
+        return {ErrorCode::invalid_argument, "llamaserver: context_length must be at most 4294967296"};
     if (options.mode == LlamaServerMode::spawn) {
         if (options.executable.empty() || options.executable.find('\0') != std::string::npos) {
             return {ErrorCode::invalid_argument, "llamaserver: spawn needs an executable path"};
+        }
+        if (options.diagnostics.log_file.find('\0') != std::string::npos)
+            return {ErrorCode::invalid_argument, "llamaserver: log file path contains NUL"};
+        if (options.spill_guard.enabled) {
+            if (auto st = llamaserver::validate_spill_guard(spill_guard_options(options.spill_guard)); !st.ok())
+                return st;
+            if (options.spill_guard.policy == LlamaServerSpillPolicy::auto_fit &&
+                !llamaserver::find_context_size(options.args))
+                return {ErrorCode::invalid_argument,
+                        "llamaserver: spill_guard.policy=auto_fit needs an explicit --ctx-size/-c argument"};
         }
         return llamaserver::validate_process_arguments(options.args);
     }
@@ -152,6 +192,9 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             s.restart_max_backoff = options_.max_restart_backoff;
             s.shutdown_timeout = options_.shutdown_timeout;
             s.max_restarts = options_.max_restarts;
+            s.spill_guard = spill_guard_options(options_.spill_guard);
+            s.log_file = options_.diagnostics.log_file;
+            s.kv_pairing_check = options_.diagnostics.kv_pairing_check;
             supervisor_ = std::make_unique<llamaserver::Supervisor>(std::move(s));
         }
     }
@@ -207,21 +250,32 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         return slot_action(slot, filename, "restore");
     }
     const LlamaServerBackendOptions &options() const { return options_; }
+    // Spawn mode only: attach mode has no child to measure, so it reports
+    // nothing and its responses stay unchanged.
+    std::optional<BackendRuntimeStatus> runtime_status() const override {
+        if (!supervisor_)
+            return std::nullopt;
+        return supervisor_->runtime_status();
+    }
 
-    Result<net::HttpRequest> prepare(std::string_view method, std::string_view path, std::string body,
-                                     const CancellationToken &cancel) {
+    Result<std::string> endpoint(const CancellationToken &cancel) {
         if (!validation_.ok())
             return validation_;
         if (cancel.cancelled())
             return Status(ErrorCode::cancelled, "llamaserver: request cancelled");
-        std::string endpoint = options_.base_url;
-        if (supervisor_) {
-            auto port = supervisor_->start(cancel);
-            if (!port.ok())
-                return port.status();
-            endpoint = "http://127.0.0.1:" + std::to_string(port.value());
-        }
-        auto url = net::parse_url(endpoint);
+        if (!supervisor_)
+            return options_.base_url;
+        auto port = supervisor_->start(cancel);
+        if (!port.ok())
+            return port.status();
+        return "http://127.0.0.1:" + std::to_string(port.value());
+    }
+    Result<net::HttpRequest> prepare(std::string_view method, std::string_view path, std::string body,
+                                     const CancellationToken &cancel) {
+        auto base = endpoint(cancel);
+        if (!base.ok())
+            return base.status();
+        auto url = net::parse_url(base.value());
         if (!url.ok())
             return url.status();
         net::HttpRequest request;
@@ -257,7 +311,73 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
     Result<GenerateStats> stream(std::string_view path, std::string body, const CancellationToken &cancel,
                                  const TokenCallback &callback, bool chat);
 
+    // Served context and slot count: GET /props once per upstream instance
+    // (endpoint, plus the launch argv in spawn mode, so a restart or an
+    // auto_fit relaunch re-reads it). A missing or malformed /props caches
+    // "unknown" (0) for that instance; options.context_length fills in n_ctx.
+    llamaserver::ServerProps served_props(const CancellationToken &cancel) {
+        auto ep = endpoint(cancel);
+        llamaserver::ServerProps props;
+        if (ep.ok()) {
+            std::string key = ep.value();
+            if (supervisor_) {
+                for (const auto &arg : supervisor_->launch_arguments()) {
+                    key += '\n';
+                    key += arg;
+                }
+            }
+            bool cached = false;
+            {
+                std::lock_guard<std::mutex> lock(props_mutex_);
+                if (props_fetched_ && props_key_ == key) {
+                    props = props_;
+                    cached = true;
+                }
+            }
+            if (!cached) {
+                props = fetch_props(cancel);
+                if (!cancel.cancelled()) {
+                    std::lock_guard<std::mutex> lock(props_mutex_);
+                    props_ = props;
+                    props_key_ = std::move(key);
+                    props_fetched_ = true;
+                }
+            }
+        }
+        if (props.n_ctx == 0)
+            props.n_ctx = options_.context_length;
+        return props;
+    }
+    // Request fields only llama.cpp understands; generic OpenAI mode gets none.
+    llamaserver::RequestExtras extras(const llamaserver::ServerProps &props, std::string_view session_key,
+                                      llamaserver::SlotAffinity::Lease &lease) {
+        llamaserver::RequestExtras e;
+        if (!options_.native_completion)
+            return e;
+        e.cache_prompt = true;
+        if (options_.slot_affinity) {
+            lease = slots_.acquire(session_key, props.total_slots);
+            e.id_slot = lease.slot();
+        }
+        return e;
+    }
+
   private:
+    llamaserver::ServerProps fetch_props(const CancellationToken &cancel) {
+        llamaserver::ServerProps props;
+        auto prepared = prepare("GET", "/props", {}, cancel);
+        if (!prepared.ok())
+            return props;
+        prepared->total_timeout = std::min(options_.request_timeout, std::chrono::milliseconds(30000));
+        std::string body;
+        const auto response = net::http_request_buffered(prepared.value(), body, cancel, 1024 * 1024);
+        if (!response.ok() || response->status != 200)
+            return props;
+        auto parsed = json::parse(body);
+        if (!parsed.ok() || !llamaserver::parse_props(parsed.value(), props).ok())
+            return {};
+        return props;
+    }
     Status slot_action(std::uint32_t slot, const std::string &filename, std::string_view action) {
         if (!validation_.ok())
             return validation_;
@@ -285,6 +405,11 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
     LlamaServerBackendOptions options_;
     Status validation_;
     std::unique_ptr<llamaserver::Supervisor> supervisor_;
+    std::mutex props_mutex_;
+    bool props_fetched_ = false;
+    std::string props_key_;
+    llamaserver::ServerProps props_;
+    llamaserver::SlotAffinity slots_;
 };
 
 class LlamaServerModel final : public BackendModel {
@@ -295,11 +420,16 @@ class LlamaServerModel final : public BackendModel {
     bool has_native_chat() const override { return true; }
     Result<GenerateStats> generate(const GenerateRequest &request, const CancellationToken &cancel,
                                    const TokenCallback &callback) override {
-        if (auto status = llamaserver::validate_sampling(request.sampling); !status.ok())
+        if (auto status = validate(request.sampling); !status.ok())
+            return status;
+        const auto props = backend_->served_props(cancel);
+        if (auto status = llamaserver::validate_sampling(request.sampling, props.n_ctx); !status.ok())
             return status;
         const bool native = backend_->options().native_completion;
+        llamaserver::SlotAffinity::Lease lease;
         auto body = llamaserver::build_completion_body(descriptor_.name, request, native,
-                                                       backend_->options().grammar);
+                                                       backend_->options().grammar,
+                                                       backend_->extras(props, {}, lease));
         return backend_->stream(native ? "/completion" : "/v1/completions", body.dump(), cancel, callback,
                                 false);
     }
@@ -307,9 +437,15 @@ class LlamaServerModel final : public BackendModel {
                                const TokenCallback &callback) override {
         if (auto status = validate_chat_messages(request.messages); !status.ok())
             return status;
-        if (auto status = llamaserver::validate_sampling(request.sampling); !status.ok())
+        if (auto status = validate(request.sampling); !status.ok())
             return status;
-        auto body = llamaserver::build_chat_body(descriptor_.name, request, backend_->options().grammar);
+        const auto props = backend_->served_props(cancel);
+        if (auto status = llamaserver::validate_sampling(request.sampling, props.n_ctx); !status.ok())
+            return status;
+        // The lease keeps the slot marked busy until the stream ends.
+        llamaserver::SlotAffinity::Lease lease;
+        auto body = llamaserver::build_chat_body(descriptor_.name, request, backend_->options().grammar,
+                                                 backend_->extras(props, request.session_key, lease));
         return backend_->stream("/v1/chat/completions", body.dump(), cancel, callback, true);
     }
 
@@ -330,8 +466,12 @@ Result<std::shared_ptr<BackendModel>> LlamaServerBackendImpl::load_model(const M
         return models.status();
     for (const auto &model : models.value()) {
         if (model.name == options.model) {
+            // Readiness is proven: read the served context and slot count now,
+            // so the first request does not pay for it.
+            ModelDescriptor descriptor = model;
+            descriptor.context_length = served_props({}).n_ctx;
             return std::shared_ptr<BackendModel>(
-                std::make_shared<LlamaServerModel>(shared_from_this(), model));
+                std::make_shared<LlamaServerModel>(shared_from_this(), std::move(descriptor)));
         }
     }
     return Status(ErrorCode::not_found, "llamaserver: model is not advertised by upstream");

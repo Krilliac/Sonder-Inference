@@ -24,6 +24,45 @@ struct LlamaServerTlsOptions {
     std::chrono::milliseconds handshake_timeout{10000};
 };
 
+// VRAM-spill guard for a spawned child (docs/integration/vram-spill.md).
+// On Windows a llama-server run with `--fit off` that overflows VRAM keeps
+// running from shared system memory, 2-15x slower, and nvidia-smi does not
+// show it. The guard reads the child's PDH `GPU Process Memory` counters
+// after readiness and every `sample_interval`; other platforms report
+// "unsupported" and are never refused or refitted.
+enum class LlamaServerSpillPolicy {
+    warn,     // report only (default; startup behaviour is unchanged)
+    refuse,   // fail startup with the measured numbers
+    auto_fit  // relaunch with a smaller --ctx-size until not spilled (bounded)
+};
+
+struct LlamaServerSpillGuardOptions {
+    bool enabled = true;
+    LlamaServerSpillPolicy policy = LlamaServerSpillPolicy::warn;
+    // Spilled when shared usage > baseline_bytes + threshold_bytes. Measured on
+    // an RTX 5070 Ti: 148-198 MiB shared when clean, 292 MiB-2.1 GB spilled.
+    std::uint64_t threshold_bytes = 256ull * 1024 * 1024;
+    std::uint64_t baseline_bytes = 0;
+    std::chrono::milliseconds sample_interval{5000};
+    // auto_fit: ctx -> align_down(ctx * fit_step_factor, fit_step_align),
+    // at least one alignment step smaller, never below fit_min_ctx, and at
+    // most fit_max_attempts relaunches. Requires --ctx-size/-c in args.
+    double fit_step_factor = 0.85;
+    std::uint64_t fit_step_align = 1024;
+    std::uint64_t fit_min_ctx = 8192;
+    std::size_t fit_max_attempts = 4;
+};
+
+struct LlamaServerDiagnosticsOptions {
+    // Child log scanned for performance warnings (FlashAttention K/V f16
+    // conversion, ignored nextn/MTP tensors, CPU fallback). Appended as
+    // "--log-file <path>" unless args already contain --log-file, which is
+    // then read instead. Empty and no --log-file: no log diagnostics.
+    std::string log_file;
+    // Warn when FlashAttention may run with mismatched K/V cache types.
+    bool kv_pairing_check = true;
+};
+
 struct LlamaServerBackendOptions {
     LlamaServerMode mode = LlamaServerMode::attach;
     std::string base_url = "http://127.0.0.1:8080";
@@ -45,6 +84,18 @@ struct LlamaServerBackendOptions {
     // providing /v1/completions. Chat always uses /v1/chat/completions.
     bool native_completion = true;
     std::string grammar; // optional upstream GBNF grammar; never synthesized
+    // Served per-slot context, used when the upstream has no GET /props (a
+    // generic OpenAI server). /props n_ctx wins when present. 0 = unknown.
+    // Requests may set num_ctx up to it (a no-op); larger values are refused.
+    std::uint64_t context_length = 0;
+    // Native mode (llama.cpp) always sends "cache_prompt": true, and with
+    // slot_affinity pins ChatRequest::session_key to one llama-server slot
+    // ("id_slot", slot count from /props total_slots). Generic OpenAI mode
+    // (native_completion = false) sends neither llama.cpp-only field.
+    bool slot_affinity = true;
+    // Spawn mode only. Reported through Backend::runtime_status().
+    LlamaServerSpillGuardOptions spill_guard;
+    LlamaServerDiagnosticsOptions diagnostics;
 };
 
 // Slot snapshots are upstream-owned files, not portable Sonder KV blocks.

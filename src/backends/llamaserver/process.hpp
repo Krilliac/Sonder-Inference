@@ -22,6 +22,9 @@ class Process {
     virtual ~Process() = default;
     virtual bool running() const = 0;
     virtual void stop(std::chrono::milliseconds timeout = std::chrono::milliseconds{2000}) = 0;
+    // OS process id of the server (not a watcher), or 0 when unknown. Used
+    // only for per-process diagnostics such as GPU memory counters.
+    [[nodiscard]] virtual std::uint32_t pid() const { return 0; }
 };
 
 class ProcessLauncher {

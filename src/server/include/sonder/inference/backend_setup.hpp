@@ -66,6 +66,23 @@ struct BackendSetup {
     bool llamaserver_insecure_skip_verify = false;
     std::string llamaserver_server_name;
     std::uint64_t llamaserver_handshake_timeout_ms = 10000;
+    // Spawn-mode runtime diagnostics (JSON "spill_guard", "log_file",
+    // "kv_pairing_check"; docs/integration/vram-spill.md).
+    bool llamaserver_spill_guard = true;
+    std::string llamaserver_spill_policy = "warn";  // warn, refuse or auto_fit
+    std::uint64_t llamaserver_spill_threshold_mib = 256;
+    std::uint64_t llamaserver_spill_baseline_mib = 0;
+    std::uint64_t llamaserver_spill_sample_interval_ms = 5000;
+    double llamaserver_fit_step_factor = 0.85;
+    std::uint64_t llamaserver_fit_step_align = 1024;
+    std::uint64_t llamaserver_fit_min_ctx = 8192;
+    std::uint64_t llamaserver_fit_max_attempts = 4;
+    std::string llamaserver_log_file;
+    bool llamaserver_kv_pairing_check = true;
+    // JSON "context_length" (served context when /props is unavailable) and
+    // "slot_affinity" (id_slot pinning; docs/integration/llama-server.md).
+    std::uint64_t llamaserver_context_length = 0;
+    bool llamaserver_slot_affinity = true;
 };
 
 // Values taken from the environment when the matching option is absent:
