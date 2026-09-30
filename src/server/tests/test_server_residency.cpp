@@ -206,8 +206,8 @@ TEST_CASE("residency unit: a pinned model is never evicted by the idle TTL") {
     REQUIRE(r->add("mock:tiny", "mock", true));
     auto pinned = r->acquire("mock:tiny");
     REQUIRE(pinned.ok());
-    const auto far = det::ModelResidency::Clock::now() + std::chrono::hours(1);
-    CHECK(r->sweep(far) == 0);
+    const auto much_later = det::ModelResidency::Clock::now() + std::chrono::hours(1);
+    CHECK(r->sweep(much_later) == 0);
     CHECK(r->snapshot()[0].state == det::ResidencyState::resident);
     CHECK(evicted.empty());
     {
@@ -215,7 +215,7 @@ TEST_CASE("residency unit: a pinned model is never evicted by the idle TTL") {
         CHECK(r->snapshot()[0].pins == 1);
     }  // released
     CHECK(r->snapshot()[0].pins == 0);
-    CHECK(r->sweep(far) == 1);
+    CHECK(r->sweep(much_later) == 1);
     CHECK(r->snapshot()[0].state == det::ResidencyState::unloaded);
     REQUIRE(evicted.size() == 1);
     CHECK(evicted[0] == "mock:tiny:idle_ttl");

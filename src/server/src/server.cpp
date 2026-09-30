@@ -393,6 +393,11 @@ struct Server::Impl {
         if (e == nullptr || backend_name.empty()) {
             return Status(ErrorCode::unavailable, "the engine is not running");
         }
+        // A lazy load that would start after stop() began only delays the
+        // shutdown: refuse it (503 not_ready, safe to retry elsewhere).
+        if (stopping.load()) {
+            return Status(ErrorCode::unavailable, "sonder-inference is draining");
+        }
         ModelLoadOptions lo;
         lo.model = id;
         // Keep ModelLoadOptions' default device unless --device was given.
@@ -410,7 +415,7 @@ struct Server::Impl {
         if (!ev.model) {
             return;
         }
-        const std::string instance_id = ev.model->instance_id();
+        const std::string model_instance = ev.model->instance_id();
         const std::string device_id = ev.model->device_id();
         ev.model.reset();
         Engine* e = engine_ptr();
@@ -418,7 +423,7 @@ struct Server::Impl {
             return;
         }
         TelemetryContext ctx = e->engine_context();
-        ctx.model_instance_id = instance_id;
+        ctx.model_instance_id = model_instance;
         if (!device_id.empty()) {
             ctx.device_id = device_id;
         }
@@ -428,7 +433,7 @@ struct Server::Impl {
                                          {"reason", std::string(ev.reason)},
                                          {"idle_ms", ev.idle_ms}},
                             TelemetryLevel::metrics);
-        (void)e->unload_model(instance_id);
+        (void)e->unload_model(model_instance);
         log_message("info", "unloaded model '" + ev.id + "' (" + ev.reason + ")");
     }
 
