@@ -5,6 +5,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -27,6 +28,7 @@
 #include "cli/cli_spec.hpp"
 #include "sonder/inference/backend_setup.hpp"
 #include "sonder/inference/json.hpp"
+#include "sonder/inference/launch_profile.hpp"
 #include "sonder/inference/server.hpp"
 #include "sonder/inference/telemetry.hpp"
 #include "request_path.hpp"
@@ -97,6 +99,14 @@ Backend:
   --llamaserver-arg ARG     repeatable spawn argument (passed verbatim)
   --llamaserver-mode MODE   attach or spawn
 
+Launch profiles (docs/integration/launch-profiles.md):
+  --profiles PATH         JSON file of typed per-model launch profiles
+  --profile NAME          serve that profile: it selects the backend and the model
+                          (served under NAME) and sets every serving option
+  --vram-budget-mib N     VRAM budget for the fit check (default: the profile's
+                          vram_budget_mib, else device memory - 1536 MiB)
+  --allow-overcommit      start even when the estimate exceeds the budget
+
 Telemetry (Observatory envelope v1; live at /v1/telemetry/sse and /v1/telemetry/ndjson):
   --telemetry-level L     off|metrics|standard|deep (default standard)
   --telemetry-buffer N    retained events for resume (default 8192)
@@ -127,6 +137,8 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"gpu-layers", Kind::value},     {"context-length", Kind::value},
         {"device", Kind::value},
         {"moe-experts", Kind::value},    {"tensor-override", Kind::repeat},
+        {"profiles", Kind::value},       {"profile", Kind::value},
+        {"vram-budget-mib", Kind::value}, {"allow-overcommit", Kind::flag},
     };
     static const std::vector<std::pair<std::string, Kind>> kAll = [] {
         auto all = kSpec;
@@ -323,6 +335,115 @@ bool write_ready_file(const std::string& path, const std::string& content, std::
     return true;
 }
 
+std::uint64_t file_bytes(const std::string& path) {
+    if (path.empty()) return 0;
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    return ec ? 0 : static_cast<std::uint64_t>(size);
+}
+
+std::string mib_text(std::uint64_t bytes) { return std::to_string((bytes + (1u << 20) - 1) >> 20); }
+
+// Builds the `sonder.profiles` catalog, binds the active profile into `o`, and
+// runs the VRAM fit check for it. On refusal, `refusal` holds the message.
+json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const LaunchProfile& active,
+                            ServerOptions& o, std::optional<std::uint64_t> budget_flag, bool allow_overcommit,
+                            std::vector<std::string>& notes, std::string& refusal) {
+    std::optional<std::uint64_t> detected;
+    bool detection_done = false;
+    const auto budget_for = [&](const LaunchProfile& p) -> std::optional<std::uint64_t> {
+        if (p.vram_budget_mib) return p.vram_budget_mib;
+        if (budget_flag) return budget_flag;
+        if (!detection_done) {
+            detected = detect_device_vram_mib();
+            detection_done = true;
+        }
+        if (detected && *detected > kDefaultVramReserveMib) return *detected - kDefaultVramReserveMib;
+        return std::nullopt;
+    };
+    // llamaserver offloads by default (--n-gpu-layers auto); the llamacpp
+    // backend only on a gpu:* device.
+    const auto offloads = [&](const LaunchProfile& p) {
+        if (p.n_gpu_layers && *p.n_gpu_layers == 0) return false;
+        if (p.backend == kLaunchProfileBackendLlamaCpp) return &p == &active && o.device.rfind("gpu:", 0) == 0;
+        return true;
+    };
+    json::Array catalog;
+    for (const auto& p : profiles) {
+        const bool is_active = &p == &active;
+        std::optional<VramEstimate> estimate;
+        std::string estimate_error;
+        std::optional<std::uint64_t> budget;
+        if (offloads(p)) {
+            budget = budget_for(p);
+            auto info = read_gguf_model_info(p.model);  // header only
+            if (info.ok()) {
+                estimate = estimate_vram(info.value(), p,
+                                         VramEstimateInputs{file_bytes(p.mmproj),
+                                                            p.speculative ? file_bytes(p.speculative->draft_model) : 0});
+            } else {
+                estimate_error = info.status().message();
+            }
+        }
+        json::Object meta = launch_profile_metadata(p, estimate, budget);
+        if (!estimate_error.empty()) meta.set("estimate_error", estimate_error);
+        meta.set("served", is_active);
+        catalog.emplace_back(meta);
+        if (!is_active) continue;
+
+        ModelProfileBinding binding;
+        binding.model = p.name;
+        binding.load_name = p.backend == kLaunchProfileBackendLlamaCpp ? p.model : p.name;
+        binding.sampling_defaults = p.sampling;
+        binding.metadata = std::move(meta);
+        o.profile_bindings.push_back(std::move(binding));
+        if (!offloads(p)) {
+            notes.push_back("launch profile '" + p.name + "': no GPU offload; VRAM fit check skipped");
+            continue;
+        }
+        // With --fit on (llama-server's default) and no fixed layer count,
+        // llama-server sizes the offload itself; the estimate only informs.
+        const bool upstream_fits =
+            p.backend == kLaunchProfileBackendLlamaServer && p.fit.value_or(true) && !p.n_gpu_layers;
+        if (!estimate) {
+            if (!allow_overcommit && !upstream_fits) {
+                refusal = "launch profile '" + p.name + "': cannot estimate VRAM (" + estimate_error +
+                          "); fix the model path or pass --allow-overcommit";
+                return catalog;
+            }
+            notes.push_back("launch profile '" + p.name + "': VRAM estimate unavailable (" + estimate_error + ")");
+            continue;
+        }
+        const VramEstimate& e = *estimate;
+        std::string summary = "launch profile '" + p.name + "': estimated VRAM " + std::to_string(e.total_mib()) +
+                              " MiB (weights " + mib_text(e.weights_bytes) + ", KV " + mib_text(e.kv_bytes) + " = " +
+                              std::to_string(e.attention_layers) + " attention layers x " +
+                              std::to_string(e.context) + " tokens x " + std::to_string(e.sequences) +
+                              " sequence(s), recurrent " + mib_text(e.recurrent_bytes) + ", compute " +
+                              mib_text(e.compute_bytes) + ")";
+        if (budget) summary += " vs budget " + std::to_string(*budget) + " MiB";
+        for (const auto& note : e.notes) summary += "; " + note;
+        if (upstream_fits) {
+            summary += " (llama-server --fit sizes the offload)";
+        } else if (!budget) {
+            if (!allow_overcommit) {
+                refusal = summary + "; cannot detect the device's VRAM: set vram_budget_mib in the profile or "
+                                    "--vram-budget-mib, or pass --allow-overcommit";
+                return catalog;
+            }
+        } else if (e.total_mib() > *budget) {
+            if (!allow_overcommit) {
+                refusal = summary + ": does not fit; lower ctx_size or n_gpu_layers, use a smaller KV cache type, "
+                                    "raise the budget, or pass --allow-overcommit";
+                return catalog;
+            }
+            summary += " (over budget; --allow-overcommit)";
+        }
+        notes.push_back(summary);
+    }
+    return catalog;
+}
+
 }  // namespace
 
 void request_shutdown() noexcept { g_shutdown.store(1); }
@@ -354,11 +475,45 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
         if (!parse_uint(*v, 65535, n)) return usage_error("--port must be an integer from 0 to 65535");
         o.port = static_cast<std::uint16_t>(n);
     }
-    o.backend.backend = a.get("backend").value_or(env.backend.value_or(""));
+    // Launch profile: it names the backend and the one model it serves.
+    std::vector<LaunchProfile> profiles;
+    const LaunchProfile* profile = nullptr;
+    if (auto path = a.get("profiles")) {
+        auto loaded = load_launch_profiles(*path);
+        if (!loaded.ok()) return usage_error(loaded.status().message());
+        profiles = std::move(loaded).value();
+    }
+    if (auto name = a.get("profile")) {
+        if (profiles.empty()) return usage_error("--profile needs --profiles FILE");
+        profile = find_launch_profile(profiles, *name);
+        if (!profile) return usage_error("no launch profile named '" + *name + "' in --profiles");
+    } else if (!profiles.empty()) {
+        return usage_error("--profiles needs --profile NAME (the profile to serve)");
+    } else if (a.get("vram-budget-mib") || a.flags.count("allow-overcommit") != 0) {
+        return usage_error("--vram-budget-mib and --allow-overcommit apply to --profile only");
+    }
+    if (profile) {
+        if (auto b = a.get("backend"); b && *b != profile->backend) {
+            return usage_error("--backend " + *b + " conflicts with launch profile '" + profile->name + "' (backend " +
+                               profile->backend + ")");
+        }
+        for (const auto& m : a.all("model")) {
+            if (m != profile->name) {
+                return usage_error("--model " + m + " conflicts with launch profile '" + profile->name +
+                                   "' (it serves the model as " + profile->name + ")");
+            }
+        }
+        for (const char* flag : {"gpu-layers", "context-length", "llamaserver-arg", "llamaserver-url"}) {
+            if (a.get(flag)) {
+                return usage_error(std::string("--") + flag + " conflicts with --profile (set the profile's typed fields)");
+            }
+        }
+    }
+    o.backend.backend = profile ? profile->backend : a.get("backend").value_or(env.backend.value_or(""));
     if (o.backend.backend.empty()) {
         return usage_error("--backend is required (mock, ollama, llamacpp or llamaserver; or set SONDER_INFER_BACKEND)");
     }
-    o.models = a.all("model");
+    o.models = profile ? std::vector<std::string>{profile->name} : a.all("model");
     o.device = a.get("device").value_or("");
     if (o.models.empty() && env.model) {
         o.models.push_back(*env.model);
@@ -372,6 +527,20 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
     if (auto v = a.get("llamaserver-url")) o.backend.llamaserver_url = *v;
     if (auto v = a.get("llamaserver-executable")) o.backend.llamaserver_executable = *v;
     if (!a.all("llamaserver-arg").empty()) o.backend.llamaserver_args = a.all("llamaserver-arg");
+    if (profile && profile->backend == kLaunchProfileBackendLlamaServer) {
+        if (o.backend.llamaserver_mode.empty()) o.backend.llamaserver_mode = "spawn";
+        if (o.backend.llamaserver_mode != "spawn") {
+            return usage_error("launch profile '" + profile->name + "' needs llamaserver spawn mode (attach cannot "
+                               "apply its settings)");
+        }
+        if (!o.backend.llamaserver_args.empty()) {
+            return usage_error("launch profile '" + profile->name + "': move the llamaserver config 'args' into the "
+                               "profile's typed fields or extra_args");
+        }
+        auto argv = llamaserver_arguments(*profile);
+        if (!argv.ok()) return usage_error(argv.status().message());
+        o.backend.llamaserver_args = std::move(argv).value();
+    }
     if (o.backend.backend == "llamaserver") {
         if (o.backend.llamaserver_mode == "spawn") {
             if (o.backend.llamaserver_executable.empty()) return usage_error("--llamaserver-executable is required in spawn mode");
@@ -410,6 +579,21 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
     }
     if (Status st = detail::parse_request_path_flags([&a](const std::string& k) { return a.get(k); }, o); !st.ok()) {
         return usage_error(st.message());
+    }
+    if (profile && profile->backend == kLaunchProfileBackendLlamaCpp) {
+        if (Status st = apply_llamacpp_profile(*profile, o.backend, o.device); !st.ok()) return usage_error(st.message());
+    }
+    std::optional<std::uint64_t> budget_flag;
+    if (auto v = a.get("vram-budget-mib")) {
+        if (!parse_uint(*v, 1u << 24, n) || n == 0) return usage_error("--vram-budget-mib must be from 1 to 16777216");
+        budget_flag = n;
+    }
+    std::vector<std::string> profile_notes;
+    if (profile) {
+        std::string refusal;
+        o.profile_catalog = profile_catalog(profiles, *profile, o, budget_flag,
+                                            a.flags.count("allow-overcommit") != 0, profile_notes, refusal);
+        if (!refusal.empty()) return usage_error(refusal);
     }
     if (auto v = a.get("mock-delay-ms")) {
         if (!parse_uint(*v, 60000, n)) return usage_error("--mock-delay-ms must be an integer from 0 to 60000");
@@ -490,6 +674,9 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
             log->line(std::string("sonder-infer serve: ") + level + ": " + message);
         }
     };
+    for (const auto& note : profile_notes) {
+        diag("info", note);
+    }
     if (!o.token.empty() && o.host != "127.0.0.1" && o.host != "localhost" && o.host != "::1" &&
         o.host != "[::1]" && o.host.rfind("127.", 0) != 0) {
         diag("warning", "listening on a non-loopback address without TLS: the bearer token and all traffic travel "

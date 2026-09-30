@@ -250,6 +250,12 @@ unchanged.
 `sonder.runtime` is added to a model only when its backend reports runtime
 status (same object as `backends[].runtime` in health).
 
+With `--profile`, the served model's `sonder` object also carries `profile`
+(context length, cache types, backend, capabilities, estimated VRAM), and the
+top-level `sonder` object lists every profile of the file as `profiles`. Both
+are additive and absent without a profile; see
+[launch profiles](integration/launch-profiles.md).
+
 ### `GET /v1/sonder/identity[?model=ID]`
 
 ```json

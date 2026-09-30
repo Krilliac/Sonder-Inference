@@ -184,3 +184,28 @@ merging, because the dispatch now exists:
   in the CTest driver) are written for MSVC but were not run in the Linux
   container; the `ci-windows` job must pass. The `serve` part of the CI smoke runs on Linux
   only (signal delivery from Git Bash to a native process is not reliable).
+
+# Integration notes: `feat/launch-profiles` (typed launch profiles)
+
+Everything lives in the server module (`src/server`); see
+[docs/integration/launch-profiles.md](docs/integration/launch-profiles.md).
+
+- **KV-cache lane interplay** (`feat/kv-cache-types-flash-attn-ubatch`). A
+  llamacpp profile's `batch_size`, `ubatch_size`, `cache_type_k`,
+  `cache_type_v` and `flash_attn` map onto that lane's `BackendSetup` fields
+  (`llamacpp_batch_size`, `llamacpp_ubatch_size`, `llamacpp_kv_cache_type_k`,
+  `llamacpp_kv_cache_type_v`, `llamacpp_flash_attention`) with the same value
+  names. This branch does not add those fields; a C++20 `requires` check
+  (`kLlamaCppContextOptionsAvailable` in `launch_profile.hpp`) enables the
+  mapping when they exist and otherwise rejects the fields with "not
+  supported by the llamacpp backend; use llamaserver". Either merge order
+  compiles without conflict; the direct-backend test follows the flag.
+- `threads`/`threads_batch` are rejected for llamacpp profiles although
+  `LlamaCppBackendOptions::threads` exists, because `BackendSetup` has no
+  field for it and adding one here would collide with the KV-cache lane's
+  rewrite of `make_backend`. A follow-up can plumb it.
+- `ServerOptions` gains `profile_bindings` and `profile_catalog` (additive;
+  empty keeps every code path unchanged). `/v1/models` gains
+  `data[].sonder.profile` and `sonder.profiles` only when a profile is served.
+- Windows VRAM detection uses DXGI (`dxgi.lib` via `#pragma comment`, MSVC
+  only); other platforms need `vram_budget_mib` or `--vram-budget-mib`.

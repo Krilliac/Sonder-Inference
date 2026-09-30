@@ -169,6 +169,9 @@ struct ServedModel {
     std::string backend;
     bool is_default = false;
     std::shared_ptr<Model> model;
+    // Launch profile binding (empty without one).
+    SamplingDefaults sampling_defaults;
+    std::optional<json::Object> profile;
 };
 
 // Per-connection bookkeeping shared between the accept loop and the
@@ -563,10 +566,17 @@ struct Server::Impl {
             if (runtime && b->name() == m.backend) {
                 ext.set("runtime", to_json(*runtime));
             }
+            if (m.profile) {
+                ext.set("profile", *m.profile);
+            }
             data.emplace_back(json::Object{
                 {"id", m.id}, {"object", "model"}, {"owned_by", "sonder-inference"}, {"sonder", std::move(ext)}});
         }
-        send_json(ex, 200, json::Object{{"object", "list"}, {"data", std::move(data)}, {"sonder", sonder_meta()}});
+        json::Object meta = sonder_meta();
+        if (!opts.profile_catalog.empty()) {
+            meta.set("profiles", opts.profile_catalog);
+        }
+        send_json(ex, 200, json::Object{{"object", "list"}, {"data", std::move(data)}, {"sonder", std::move(meta)}});
     }
 
     void handle_identity(Exchange& ex, const RequestHead& head) {
@@ -735,7 +745,7 @@ struct Server::Impl {
             send_error(ex, *e);
             return;
         }
-        const ChatJob job = std::move(std::get<ChatJob>(job_v));
+        ChatJob job = std::move(std::get<ChatJob>(job_v));
         if (!require_ready(ex)) {
             return;
         }
@@ -744,6 +754,8 @@ struct Server::Impl {
             send_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
             return;
         }
+        // Launch profile defaults fill only the fields the request left unset.
+        apply_sampling_defaults(served_model->sampling_defaults, job.sampling);
 
         SessionOptions so;
         so.sampling = job.sampling;
@@ -1547,8 +1559,12 @@ struct Server::Impl {
                 return cancelled_start();
             }
             StepGuard step{*this};
+            const ModelProfileBinding* binding = nullptr;
+            for (const auto& b : opts.profile_bindings) {
+                if (b.model == ids[i]) binding = &b;
+            }
             ModelLoadOptions lo;
-            lo.model = ids[i];
+            lo.model = binding && !binding->load_name.empty() ? binding->load_name : ids[i];
             // Keep ModelLoadOptions' default device unless --device was given.
             if (!opts.device.empty()) lo.device_id = opts.device;
             // No lock held: the load may block on backend I/O while health
@@ -1559,7 +1575,12 @@ struct Server::Impl {
                                                           loaded.status().message());
             }
             std::lock_guard<std::mutex> lock(models_mu);
-            served.push_back(ServedModel{ids[i], backend_name, i == 0, loaded.value()});
+            ServedModel entry{ids[i], backend_name, i == 0, loaded.value(), {}, std::nullopt};
+            if (binding) {
+                entry.sampling_defaults = binding->sampling_defaults;
+                entry.profile = binding->metadata;
+            }
+            served.push_back(std::move(entry));
         }
         {
             if (!begin_step()) {
@@ -1716,6 +1737,17 @@ Status validate_options(const ServerOptions& o) {
         for (std::size_t j = 0; j < i; ++j) {
             if (o.models[j] == o.models[i]) {
                 return Status(ErrorCode::invalid_argument, "--model " + o.models[i] + " is given twice");
+            }
+        }
+    }
+    for (std::size_t i = 0; i < o.profile_bindings.size(); ++i) {
+        const auto& b = o.profile_bindings[i];
+        if (std::find(o.models.begin(), o.models.end(), b.model) == o.models.end()) {
+            return Status(ErrorCode::invalid_argument, "launch profile '" + b.model + "' is not a served --model");
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            if (o.profile_bindings[j].model == b.model) {
+                return Status(ErrorCode::invalid_argument, "launch profile '" + b.model + "' is bound twice");
             }
         }
     }

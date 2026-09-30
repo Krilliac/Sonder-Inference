@@ -48,7 +48,10 @@ from real runs.
 
 ## Step 2 — per-model placement profiles (design)
 
-Today the operator picks overrides per `serve` invocation. The next step is a
+Today the operator picks overrides per `serve` invocation. [Launch profiles](integration/launch-profiles.md)
+now read the GGUF header for a VRAM fit estimate (weights of the offloaded
+blocks, hybrid-aware KV bytes per token, recurrent state, compute), but do not
+choose a placement. The next step is a
 placement profile per model, derived from the GGUF metadata:
 
 | Field | Source |
