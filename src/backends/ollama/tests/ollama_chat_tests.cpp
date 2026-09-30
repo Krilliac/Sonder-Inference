@@ -170,7 +170,7 @@ TEST_CASE("backend chat: logit_bias is rejected, not silently dropped") {
     CHECK(srv.request_count() == before);  // nothing was sent
 }
 
-TEST_CASE("backend chat: thinking control becomes think; cached prompt tokens reach the stats") {
+TEST_CASE("backend chat: thinking control becomes think and cached prompt tokens reach the stats") {
     FakeOllamaServer srv;
     StreamScript s;
     s.body = R"({"model":"qwen3:8b","message":{"role":"assistant","content":"ok"},"done":false})" "\n"

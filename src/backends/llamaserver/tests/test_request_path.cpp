@@ -94,7 +94,7 @@ TEST_SUITE("llamaserver_request_path") {
         CHECK(llamaserver::validate_sampling(s, 0).ok());
     }
 
-    TEST_CASE("a bridged chat with num_ctx within the served context streams; a larger one fails before the stream") {
+    TEST_CASE("a bridged chat with num_ctx within the served context streams and a larger one fails before the stream") {
         sonder_test::FakeLlamaServer server;
         server.set_props(R"({"default_generation_settings":{"n_ctx":32768},"total_slots":1})");
         server.set_body(kChatStream);
@@ -134,7 +134,7 @@ TEST_SUITE("llamaserver_request_path") {
         CHECK(model->chat(req, {}, {}).status().code() == ErrorCode::invalid_argument);
     }
 
-    TEST_CASE("native requests always send cache_prompt; keyed chats are pinned to slots") {
+    TEST_CASE("native requests always send cache_prompt and keyed chats are pinned to slots") {
         sonder_test::FakeLlamaServer server;
         server.set_props(R"({"default_generation_settings":{"n_ctx":8192},"total_slots":3})");
         server.set_body(kPlainChatStream);
