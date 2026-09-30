@@ -1,4 +1,5 @@
 #include "log_diagnostics.hpp"
+#include "utf8_path.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -374,7 +375,7 @@ void LogDiagnostics::line(std::string_view text) {
 Status LogTail::poll(LogDiagnostics &sink, std::size_t max_bytes) {
     if (path_.empty() || max_bytes == 0)
         return {};
-    std::ifstream in(path_, std::ios::binary);
+    std::ifstream in(utf8_ ? utf8_path(path_) : std::filesystem::path(path_), std::ios::binary);
     if (!in)
         return Status(ErrorCode::not_found, "llamaserver: cannot open log file");
     in.seekg(0, std::ios::end);

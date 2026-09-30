@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "sonder/inference/error.hpp"
@@ -15,6 +16,10 @@ struct ProcessSpec {
     std::vector<std::string> arguments;
     std::uint16_t port = 0;
     std::chrono::milliseconds shutdown_timeout{2000};
+    // Child-only overrides; empty preserves the existing inherited environment.
+    std::vector<std::pair<std::string, std::string>> environment;
+    // Optional stdout+stderr capture, used by calibration/help probing. No shell.
+    std::string output_file;
 };
 
 class Process {
@@ -39,5 +44,6 @@ class ProcessLauncher {
 std::unique_ptr<ProcessLauncher> make_process_launcher();
 
 Status validate_process_arguments(const std::vector<std::string> &arguments);
+Status validate_process_environment(const std::vector<std::pair<std::string, std::string>> &environment);
 
 } // namespace sonder::inference::llamaserver

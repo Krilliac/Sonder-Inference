@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "sonder/inference/backend.hpp"
@@ -114,6 +115,8 @@ struct LlamaServerBackendOptions {
     // Spawn mode only. Reported through Backend::runtime_status().
     LlamaServerSpillGuardOptions spill_guard;
     LlamaServerDiagnosticsOptions diagnostics;
+    // Additive child-only environment overrides; empty inherits unchanged.
+    std::vector<std::pair<std::string, std::string>> environment;
     LlamaServerWarmupOptions warmup;
 };
 

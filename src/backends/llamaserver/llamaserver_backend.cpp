@@ -189,6 +189,7 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             warmup_ = std::make_shared<llamaserver::PrefixWarmup>(options_);
         if (validation_.ok() && options_.mode == LlamaServerMode::spawn) {
             llamaserver::SupervisorOptions s;
+            s.environment = options_.environment;
             s.executable = options_.executable;
             s.arguments = options_.args;
             s.readiness_timeout = options_.startup_timeout;

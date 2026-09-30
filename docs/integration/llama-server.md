@@ -261,6 +261,15 @@ milliseconds (at most one hour in JSON); `max_restarts: 0` disables restarts.
 Unknown keys and invalid
 types are rejected so misspelled settings do not silently select defaults.
 
+## Calibration output
+
+[`sonder-infer tune`](tune.md) writes a directly loadable spawn configuration.
+The additive `env` object supplies child-only string environment overrides;
+when absent, environment inheritance is unchanged. The optional `results`
+object is inert calibration provenance with schema `sonder.inference.tune/1`;
+it is accepted only alongside an explicit spawn configuration. Other unknown
+top-level fields remain errors. No existing spawn/attach defaults change.
+
 ## Tests
 
 `sonder.llamaserver.*` is registered with CTest. Fake HTTP upstreams exercise

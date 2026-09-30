@@ -239,7 +239,8 @@ void Supervisor::monitor() {
             if (!selected.ok()) {
                 result = selected.status();
             } else {
-                ProcessSpec spec{options_.executable, launch_arguments(), selected.value(), options_.shutdown_timeout};
+                ProcessSpec spec{options_.executable, launch_arguments(), selected.value(), options_.shutdown_timeout,
+                                 options_.environment, options_.output_file};
                 spec.arguments.insert(spec.arguments.end(),
                                       {"--host", "127.0.0.1", "--port", std::to_string(spec.port)});
                 if (shutdown_.cancelled())

@@ -107,6 +107,7 @@ struct BackendSetup {
     // "slot_affinity" (id_slot pinning; docs/integration/llama-server.md).
     std::uint64_t llamaserver_context_length = 0;
     bool llamaserver_slot_affinity = true;
+    std::vector<std::pair<std::string, std::string>> llamaserver_environment;
     // Optional llama-server prefix warm-up. Kept here as mirrors so the
     // always-built server/CLI setup loader does not depend on the optional
     // llamaserver backend header.
