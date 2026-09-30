@@ -107,7 +107,8 @@ public:
         params.options = ollama::sampling_to_options(request.sampling);
         // Ollama's own switch; reasoning_effort has no portable Ollama field.
         params.think = request.thinking.enable_thinking;
-        return run(cancel, on_chunk, [&](const ollama::ChunkCallback& cb) { return client_->chat(params, cb, cancel); });
+        return run(cancel, on_chunk, [&](const ollama::ChunkCallback& cb) { return client_->chat(params, cb, cancel); },
+                   request.separate_reasoning);
     }
 
     bool has_native_chat() const override { return true; }
@@ -116,7 +117,8 @@ private:
     // Shared streaming path for /api/generate and /api/chat: maps Ollama
     // stream chunks onto TokenCallback and the final chunk onto GenerateStats.
     template <class Call>
-    Result<GenerateStats> run(const CancellationToken& cancel, const TokenCallback& on_chunk, Call&& call) {
+    Result<GenerateStats> run(const CancellationToken& cancel, const TokenCallback& on_chunk, Call&& call,
+                              bool separate_reasoning = false) {
         const bool emit_thinking = client_->config().emit_thinking_chunks;
         std::uint64_t index = 0;
         bool stopped_by_callback = false;
@@ -127,19 +129,26 @@ private:
             if (!on_chunk) {
                 return true;
             }
-            auto deliver = [&](std::string_view text) {
-                if (text.empty() || stopped_by_callback) {
+            auto deliver = [&](std::string_view text, std::string_view reasoning = {}) {
+                if ((text.empty() && reasoning.empty()) || stopped_by_callback) {
                     return;
                 }
-                if (!on_chunk(TokenChunk{text, index})) {
+                if (!on_chunk(TokenChunk{text, index, reasoning})) {
                     stopped_by_callback = true;
                 }
                 ++index;
             };
-            if (emit_thinking) {
-                deliver(c.thinking);
+            if (separate_reasoning) {
+                // Anthropic-compatible callers need thinking kept out of the
+                // visible text stream. The old emit_thinking_chunks behavior
+                // remains unchanged when this opt-in is false.
+                deliver(c.content, c.thinking);
+            } else {
+                if (emit_thinking) {
+                    deliver(c.thinking);
+                }
+                deliver(c.content);
             }
-            deliver(c.content);
             return !stopped_by_callback;
         };
         Result<StreamResult> res = call(cb);

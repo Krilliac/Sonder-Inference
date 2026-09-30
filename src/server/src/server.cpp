@@ -5,7 +5,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
-#include <ctime>
 #include <mutex>
 #include <set>
 #include <system_error>
@@ -15,6 +14,8 @@
 #include <variant>
 #include <vector>
 
+#include "anthropic.hpp"
+#include "chat_handler.hpp"
 #include "http.hpp"
 #include "identity.hpp"
 #include "live_hub.hpp"
@@ -23,7 +24,6 @@
 #include "request_path.hpp"
 #include "residency.hpp"
 #include "socket.hpp"
-#include "test_hooks.hpp"
 #include "../../common/loopback.hpp"
 #include "sonder/inference/engine.hpp"
 #include "sonder/inference/json.hpp"
@@ -64,7 +64,7 @@ const char* state_name(State s) noexcept {
     return "draining";
 }
 
-enum class Route { none, health, models, identity, chat, embeddings, discovery, telemetry, telemetry_sse, telemetry_ndjson };
+enum class Route { none, health, models, identity, chat, messages, embeddings, discovery, telemetry, telemetry_sse, telemetry_ndjson };
 
 struct RouteInfo {
     Route route = Route::none;
@@ -76,6 +76,7 @@ RouteInfo lookup_route(std::string_view path) {
     if (path == "/v1/models") return {Route::models, "GET"};
     if (path == "/v1/sonder/identity") return {Route::identity, "GET"};
     if (path == "/v1/chat/completions") return {Route::chat, "POST"};
+    if (path == "/v1/messages") return {Route::messages, "POST"};
     if (path == "/v1/embeddings") return {Route::embeddings, "POST"};
     if (path == "/.well-known/sonder-telemetry") return {Route::discovery, "GET"};
     if (path == "/v1/telemetry") return {Route::telemetry, "GET"};
@@ -161,10 +162,6 @@ bool is_loopback_bind(std::string_view host) { return sonder::inference::detail:
 
 double seconds_since(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
-}
-
-std::int64_t unix_seconds() {
-    return static_cast<std::int64_t>(std::time(nullptr));
 }
 
 // Per-connection bookkeeping shared between the accept loop and the
@@ -374,7 +371,7 @@ struct Server::Impl {
         if (error.status == 401) {
             extra.emplace_back("WWW-Authenticate", "Bearer");
         }
-        send_json(ex, error.status, error_body(error), extra);
+        send_json(ex, error.status, ex.path == "/v1/messages" ? anthropic_error_body(error) : error_body(error), extra);
     }
 
     // ------------------------------------------------------------ helpers
@@ -837,25 +834,20 @@ struct Server::Impl {
         hub->unsubscribe(sub);
     }
 
-    void handle_chat(Exchange& ex, const RequestHead& head, const std::string& body) {
+    void handle_chat(Exchange& ex, const RequestHead& head, const std::string& body,
+                     ChatProtocol protocol = ChatProtocol::openai) {
         auto corr_v = parse_correlation(head);
         if (auto* e = std::get_if<ApiError>(&corr_v)) {
             send_error(ex, *e);
             return;
         }
         const Correlation corr = std::get<Correlation>(corr_v);
-        auto job_v = parse_chat_request(body);
+        auto job_v = protocol == ChatProtocol::anthropic ? parse_messages_request(body) : parse_chat_request(body);
         if (auto* e = std::get_if<ApiError>(&job_v)) {
             send_error(ex, *e);
             return;
         }
         const ChatJob job = std::move(std::get<ChatJob>(job_v));
-        const RequestPriority priority = corr.priority_class.value_or(
-            job.priority_class.value_or(RequestPriority::interactive));
-        const auto deadline_ms = corr.deadline_ms ? corr.deadline_ms : job.deadline_ms;
-        const auto deadline = deadline_ms
-            ? ex.started + std::chrono::milliseconds(static_cast<std::int64_t>(*deadline_ms))
-            : std::chrono::steady_clock::time_point::max();
         if (!require_ready(ex)) {
             return;
         }
@@ -908,243 +900,27 @@ struct Server::Impl {
             inflight.insert(session);
         }
 
-        RequestOptions ro;
-        ro.request_id = make_id("req");
-        ro.parent_request_id = corr.parent_request_id;
-        ro.session_key = chat_session_key(job, corr);
-        ro.thinking = job.thinking;
-        const std::vector<std::string> warnings = apply_thinking_pins(opts, ro.thinking);
-        ro.priority_class = priority;
-        ro.preserve_numeric_priority = corr.numeric_priority;
-        if (deadline_ms) ro.deadline = deadline;
-        std::atomic<bool> backend_started{false};
-        const std::string completion_id = "chatcmpl-" + *ro.request_id;
-        // X-Sonder-Request-Id and the access log carry the engine request id.
-        ex.request_id = *ro.request_id;
-        const std::int64_t created_at = unix_seconds();
-
-        // Client disconnect cancels the request (request.cancelled).
-        std::mutex watch_mu;
-        std::condition_variable watch_cv;
-        bool watch_done = false;
-        std::atomic<bool> disconnected{false};
-        ro.on_backend_start = [&] {
-            if (disconnected.load() || hard_stop.load() || std::chrono::steady_clock::now() >= deadline) {
-                session->cancel();
-                return;
-            }
-            backend_started.store(true);
-        };
-        std::shared_ptr<PriorityAdmission::Ticket> ticket;
-        std::thread watcher;
-        // Stops and joins the watcher and leaves `inflight` on every exit,
-        // including an exception out of the chat call: a joinable std::thread
-        // destroyed during unwinding would call std::terminate.
-        bool left_inflight = false;
-        const auto end_request = [&] {
-            if (ticket) ticket->release();
-            {
-                std::lock_guard<std::mutex> lock(watch_mu);
-                watch_done = true;
-            }
-            watch_cv.notify_all();
-            if (watcher.joinable()) {
-                watcher.join();
-            }
-            if (!left_inflight) {
-                left_inflight = true;
+        ChatExchange exchange{
+            opts, ex.sock, ex.request_id, ex.status, synthetic,
+            ex.started, admission, hard_stop, engine_ptr()->telemetry(),
+            [&] {
                 {
                     std::lock_guard<std::mutex> lock(inflight_mu);
                     inflight.erase(session);
                 }
                 inflight_cv.notify_all();
-            }
-        };
-        struct EndRequestGuard {
-            const decltype(end_request)& end;
-            ~EndRequestGuard() { end(); }
-        } end_guard{end_request};
-        try {
-            if (detail::take_watcher_spawn_failure()) {
-                throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
-                                        "test hook: watcher thread creation refused");
-            }
-            watcher = std::thread([&] {
-                std::unique_lock<std::mutex> lock(watch_mu);
-                while (!watch_done) {
-                    lock.unlock();
-                    if (peer_gone(ex.sock)) {
-                        disconnected.store(true);
-                        session->cancel();
-                    }
-                    if (std::chrono::steady_clock::now() >= deadline) session->cancel();
-                    lock.lock();
-                    watch_cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return watch_done; });
-                }
-            });
-        } catch (const std::system_error&) {
-            // The OS refused a thread (thread or memory limits). Nothing ran:
-            // answer 503 for this request instead of taking the server down.
-            end_request();
-            session->close();
-            log_message("warning", "cannot start a request thread; chat request refused (503)");
-            ApiError e = make_error(503, "overloaded",
-                                    "sonder-inference cannot start a request thread right now; nothing was executed, "
-                                    "retry later");
-            e.retry_after = 1;
-            send_error(ex, e);
-            return;
-        }
-
-        if (priority_admission_enabled(opts)) {
-            ticket = admission.enqueue(priority, [&] {
-                return disconnected.load() || session->state() == SessionState::closed || hard_stop.load();
-            }, deadline);
-            if (ticket->outcome() != PriorityAdmission::Outcome::admitted) {
-                json::Object attrs{{"kind", "chat"},
-                                   {"priority_class", to_string(priority)},
-                                   {"admission", json::Object{{"priority", to_string(priority)},
-                                                               {"queue_ms", ticket->queue_ms()}}},
-                                   {"error_code", ticket->outcome() == PriorityAdmission::Outcome::full
-                                                      ? "overloaded"
-                                                      : ticket->outcome() == PriorityAdmission::Outcome::expired
-                                                      ? "deadline_exceeded" : "cancelled"},
-                                   {"backend_started", false}};
-                if (ro.parent_request_id) attrs.set("parent_request_id", *ro.parent_request_id);
-                engine_ptr()->telemetry().emit(disconnected.load() ? "request.cancelled" : "request.failed",
-                                               session->telemetry_context(ro.request_id), std::move(attrs),
-                                               TelemetryLevel::metrics);
-                end_request();
-                if (disconnected.load()) {
-                    ex.status = 499;
-                } else {
-                    ApiError error = ticket->outcome() == PriorityAdmission::Outcome::expired
-                        ? make_error(504, "deadline_exceeded", "request deadline expired while queued; nothing was executed")
-                        : ticket->outcome() == PriorityAdmission::Outcome::full
-                        ? make_error(429, "overloaded", "request priority queue is full; nothing was executed")
-                        : make_error(503, "not_ready", "request cancelled while queued; nothing was executed");
-                    if (error.status == 429) error.retry_after = 1;
-                    send_error(ex, error);
-                }
-                session->close();
-                return;
-            }
-            ro.admission = ticket;
-        }
-
-        bool headers_sent = false;
-        bool write_failed = false;
-        const auto chunk_object = [&](json::Object delta, json::Value finish) {
-            return json::Object{{"id", completion_id},
-                                {"object", "chat.completion.chunk"},
-                                {"created", created_at},
-                                {"model", pin.id()},
-                                {"choices", json::Array{json::Object{{"index", 0},
-                                                                     {"delta", std::move(delta)},
-                                                                     {"finish_reason", std::move(finish)}}}}};
-        };
-        const auto send_event = [&](const json::Object& obj) {
-            if (write_failed) {
-                return false;
-            }
-            std::string frame = "data: ";
-            frame += json::Value(obj).dump();
-            frame += "\n\n";
-            if (!send_raw(ex, frame)) {
-                write_failed = true;
-            }
-            return !write_failed;
-        };
-        const auto ensure_stream_head = [&]() {
-            if (headers_sent) {
-                return !write_failed;
-            }
-            headers_sent = true;
-            ex.status = 200;
-            Headers h = base_headers(ex, "text/event-stream; charset=utf-8");
-            h.emplace_back("X-Accel-Buffering", "no");
-            if (!send_raw(ex, format_head(200, h))) {
-                write_failed = true;
-                return false;
-            }
-            return send_event(chunk_object(json::Object{{"role", "assistant"}, {"content", ""}}, nullptr));
-        };
-
-        TokenCallback on_chunk;
-        if (job.stream) {
-            on_chunk = [&](const TokenChunk& chunk) {
-                if (!ensure_stream_head() ||
-                    !send_event(chunk_object(json::Object{{"content", std::string(chunk.text)}}, nullptr))) {
-                    session->cancel();
-                    return false;
-                }
-                return true;
-            };
-        }
-
-        auto result = session->chat(job.messages, on_chunk, job.sampling, ro);
-        end_request();
-        const bool rejected = session->last_scheduler_rejected();
-
-        if (disconnected.load() || write_failed) {
-            ex.status = 499;  // client closed the request (access log only)
-            session->close();
-            return;
-        }
-        if (deadline_ms && !backend_started.load() && std::chrono::steady_clock::now() >= deadline) {
-            session->close();
-            send_error(ex, make_error(504, "deadline_exceeded", "request deadline expired while queued; nothing was executed"));
-            return;
-        }
-        if (!result.ok()) {
-            session->close();
-            const ApiError e = map_session_failure(result.status(), rejected);
-            if (headers_sent) {
-                (void)send_event(error_body(e));
-            } else {
-                send_error(ex, e);
-            }
-            return;
-        }
-        const GenerationResult& r = result.value();
-        json::Object meta{{"api_version", kApiVersion},
-                          {"request_id", r.request_id},
-                          {"session_id", session->id()},
-                          {"backend", pin.backend()},
-                          {"synthetic", synthetic},
-                          {"token_counts_from_backend", r.stats.token_counts_from_backend}};
-        if (!warnings.empty()) {
-            meta.set("warnings", json::Array(warnings.begin(), warnings.end()));
-        }
-        session->close();
-        if (!job.stream) {
-            json::Object doc{
-                {"id", completion_id},
-                {"object", "chat.completion"},
-                {"created", created_at},
-                {"model", pin.id()},
-                {"choices",
-                 json::Array{json::Object{{"index", 0},
-                                          {"message", json::Object{{"role", "assistant"}, {"content", r.text}}},
-                                          {"finish_reason", finish_reason(r)}}}},
-                {"usage", usage_json(r)},
-                {"timings", timings_json(r)},
-                {"sonder", std::move(meta)}};
-            send_json(ex, 200, doc);
-            return;
-        }
-        if (!ensure_stream_head()) {
-            return;
-        }
-        json::Object last = chunk_object(json::Object{}, finish_reason(r));
-        if (job.include_usage) {
-            last.set("usage", usage_json(r));
-        }
-        last.set("timings", timings_json(r));
-        last.set("sonder", std::move(meta));
-        if (send_event(last)) {
-            (void)send_raw(ex, "data: [DONE]\n\n");
-        }
+            },
+            [&](std::string_view data) { return send_raw(ex, data); },
+            [&] {
+                ex.status = 200;
+                Headers h = base_headers(ex, "text/event-stream; charset=utf-8");
+                h.emplace_back("X-Accel-Buffering", "no");
+                return send_raw(ex, format_head(200, h));
+            },
+            [&](int status, const json::Object& doc) { send_json(ex, status, doc); },
+            [&](const ApiError& error) { send_error(ex, error); },
+            [&] { log_message("warning", "cannot start a request thread; chat request refused (503)"); }};
+        execute_chat(exchange, job, corr, pin.id(), pin.backend(), session, protocol);
     }
 
     // --------------------------------------------------------- connection
@@ -1162,6 +938,8 @@ struct Server::Impl {
                 return true;
             }
             if (pr.state == ParseState::error) {
+                // Header parsing may already have identified this endpoint.
+                if (head.path == "/v1/messages") ex.path = head.path;
                 const char* code = pr.status == 431   ? "request_header_fields_too_large"
                                    : pr.status == 505 ? "http_version_not_supported"
                                                       : "malformed_request";
@@ -1318,7 +1096,8 @@ struct Server::Impl {
         if (preflight) {
             Headers h = base_headers(ex, "");
             h.emplace_back("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            h.emplace_back("Access-Control-Allow-Headers", kAllowHeaders);
+            h.emplace_back("Access-Control-Allow-Headers", route.route == Route::messages
+                ? std::string(kAllowHeaders) + ", X-Api-Key, Anthropic-Version, Anthropic-Beta" : kAllowHeaders);
             h.emplace_back("Access-Control-Max-Age", "600");
             if (origin != nullptr && head.header("access-control-request-private-network") != nullptr) {
                 h.emplace_back("Access-Control-Allow-Private-Network", "true");
@@ -1337,8 +1116,13 @@ struct Server::Impl {
                                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
                 ok = scheme == "bearer " && constant_time_equals(std::string_view(*auth).substr(7), opts.token);
             }
+            if (!ok && route.route == Route::messages) {
+                const std::string* key = head.header("x-api-key");
+                ok = key != nullptr && constant_time_equals(*key, opts.token);
+            }
             if (!ok) {
-                send_error(ex, make_error(401, "unauthorized", "a valid bearer token is required"));
+                send_error(ex, make_error(401, "unauthorized", route.route == Route::messages
+                    ? "a valid bearer token or x-api-key is required" : "a valid bearer token is required"));
                 return;
             }
         }
@@ -1391,6 +1175,7 @@ struct Server::Impl {
             case Route::models: handle_models(ex); break;
             case Route::identity: handle_identity(ex, head); break;
             case Route::chat: handle_chat(ex, head, body); break;
+            case Route::messages: handle_chat(ex, head, body, ChatProtocol::anthropic); break;
             case Route::embeddings:
                 send_error(ex, make_error(501, "not_implemented", "embeddings are not implemented by sonder-inference"));
                 break;
