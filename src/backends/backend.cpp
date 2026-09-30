@@ -123,11 +123,14 @@ json::Object to_json(const BackendWarning& w) {
 
 json::Object to_json(const BackendRuntimeStatus& status) {
     const auto& c = status.context;
-    json::Object context{{"policy", c.policy},
-                         {"configured_ctx", c.configured_ctx ? json::Value(*c.configured_ctx) : json::Value()},
-                         {"fitted_ctx", c.fitted_ctx ? json::Value(*c.fitted_ctx) : json::Value()},
-                         {"fit_attempts", c.fit_attempts},
-                         {"outcome", c.outcome}};
+    // Built with set() and the optional constructor (null when unset): a
+    // conditional-operator temporary here trips GCC 13 -Wmaybe-uninitialized.
+    json::Object context;
+    context.set("policy", c.policy);
+    context.set("configured_ctx", json::Value(c.configured_ctx));
+    context.set("fitted_ctx", json::Value(c.fitted_ctx));
+    context.set("fit_attempts", c.fit_attempts);
+    context.set("outcome", c.outcome);
     json::Array warnings;
     for (const auto& w : status.warnings) {
         warnings.emplace_back(to_json(w));

@@ -96,7 +96,7 @@ void Engine::sample_backend_runtime() {
             seen = gpu.samples;
             json::Object attrs = to_json(gpu);
             attrs.set("backend", name);
-            attrs.set("fitted_ctx", status->context.fitted_ctx ? json::Value(*status->context.fitted_ctx) : json::Value());
+            attrs.set("fitted_ctx", json::Value(status->context.fitted_ctx));  // null when unknown
             attrs.set("fit_outcome", status->context.outcome);
             telemetry_->emit("backend.gpu_memory.sample", engine_context(), std::move(attrs), TelemetryLevel::metrics);
         }
