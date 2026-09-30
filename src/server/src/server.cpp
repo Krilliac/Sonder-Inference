@@ -1685,6 +1685,9 @@ Status validate_options(const ServerOptions& o) {
             return Status(ErrorCode::invalid_argument,
                           "unknown or unavailable backend '" + o.backend.backend + "' (this build has: " + list + ")");
         }
+        if (Status st = validate_backend_setup(o.backend); !st.ok()) {
+            return st;
+        }
     }
     if (o.models.empty() && !is_synthetic_backend(backend_name)) {
         return Status(ErrorCode::invalid_argument, "--model is required for backend " + backend_name +

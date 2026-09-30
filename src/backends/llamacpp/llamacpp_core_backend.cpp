@@ -41,6 +41,30 @@ Status ToStatus(const lc::Status& s) { return s.ok() ? Status::success() : Statu
 
 std::uint64_t MsToNs(double ms) { return ms > 0.0 ? static_cast<std::uint64_t>(ms * 1e6) : 0; }
 
+// Copies the context options into `lo` and validates them with the wrapper's
+// ValidateContextOptions (the same check Load() runs).
+Status ApplyContextOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo) {
+    lo.n_ctx = o.context_length;
+    lo.n_batch = o.batch_size;
+    lo.n_ubatch = o.ubatch_size;
+    lo.n_threads = o.threads;
+    if (!lc::ParseKvCacheType(o.kv_cache_type_k, lo.type_k)) {
+        return Status(ErrorCode::invalid_argument,
+                      "unknown K cache type '" + o.kv_cache_type_k +
+                          "' (expected f16, f32, bf16, q8_0, q5_1, q5_0, q4_1, q4_0 or iq4_nl)");
+    }
+    if (!lc::ParseKvCacheType(o.kv_cache_type_v, lo.type_v)) {
+        return Status(ErrorCode::invalid_argument,
+                      "unknown V cache type '" + o.kv_cache_type_v +
+                          "' (expected f16, f32, bf16, q8_0, q5_1, q5_0, q4_1, q4_0 or iq4_nl)");
+    }
+    if (!lc::ParseFlashAttention(o.flash_attention, lo.flash_attn)) {
+        return Status(ErrorCode::invalid_argument,
+                      "unknown flash attention mode '" + o.flash_attention + "' (expected auto, on or off)");
+    }
+    return ToStatus(lc::ValidateContextOptions(lo));
+}
+
 bool IsGguf(const fs::path& p) {
     std::string ext = PathToUtf8(p.extension());
     std::transform(ext.begin(), ext.end(), ext.begin(),
@@ -222,9 +246,7 @@ public:
 
         lc::LoadOptions lo;
         lo.model_path = path;
-        lo.n_ctx = options_.context_length;
-        lo.n_batch = options_.batch_size;
-        lo.n_threads = options_.threads;
+        if (Status s = ApplyContextOptions(options_, lo); !s.ok()) return s;
         for (const auto& [pattern, device] : options_.tensor_overrides) {
             lo.tensor_overrides.push_back({pattern, device});
         }
@@ -285,6 +307,11 @@ private:
 };
 
 }  // namespace
+
+Status validate_llamacpp_options(const LlamaCppBackendOptions& options) {
+    lc::LoadOptions lo;
+    return ApplyContextOptions(options, lo);
+}
 
 std::shared_ptr<Backend> make_llamacpp_backend(LlamaCppBackendOptions options) {
     return std::make_shared<LlamaCppCoreBackend>(std::move(options));
