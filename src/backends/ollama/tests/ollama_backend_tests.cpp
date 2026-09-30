@@ -29,7 +29,7 @@ TEST_CASE("backend: capabilities, probe, list_models") {
     CHECK(models->at(0).quantization == "Q4_K_M");
 }
 
-TEST_CASE("backend: load_model uses /api/show metadata; missing model fails") {
+TEST_CASE("backend: load_model uses /api/show metadata, missing model fails") {
     FakeOllamaServer srv;
     srv.set_tags(fixture("tags.json"));
     srv.set_show("llama3.2:3b", fixture("show.json"));
