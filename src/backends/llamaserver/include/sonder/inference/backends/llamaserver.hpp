@@ -43,6 +43,9 @@ struct LlamaServerSpillGuardOptions {
     // an RTX 5070 Ti: 148-198 MiB shared when clean, 292 MiB-2.1 GB spilled.
     std::uint64_t threshold_bytes = 256ull * 1024 * 1024;
     std::uint64_t baseline_bytes = 0;
+    // Added to the baseline per 1,024 tokens of --ctx-size (0 = fixed). Clean
+    // shared usage grows ~1 MiB/1k ctx, ~2 MiB/1k ctx with MTP speculation.
+    std::uint64_t baseline_bytes_per_1k_ctx = 0;
     std::chrono::milliseconds sample_interval{5000};
     // auto_fit: ctx -> align_down(ctx * fit_step_factor, fit_step_align),
     // at least one alignment step smaller, never below fit_min_ctx, and at
@@ -61,6 +64,18 @@ struct LlamaServerDiagnosticsOptions {
     std::string log_file;
     // Warn when FlashAttention may run with mismatched K/V cache types.
     bool kv_pairing_check = true;
+};
+
+// Optional prefix replay. Template kwargs MUST match real requests, including
+// thinking settings; changing them can invalidate the prefix from token zero.
+struct LlamaServerWarmupOptions {
+    std::string messages_file;  // empty disables warm-up
+    json::Object chat_template_kwargs;
+    bool all_slots = true;
+    std::vector<std::uint32_t> slots;
+    bool on_restart = true;
+    // UTF-8 bytes, including JSON syntax; bounded before parsing/allocation.
+    std::size_t max_prefix_chars = 262144;
 };
 
 struct LlamaServerBackendOptions {
@@ -96,6 +111,7 @@ struct LlamaServerBackendOptions {
     // Spawn mode only. Reported through Backend::runtime_status().
     LlamaServerSpillGuardOptions spill_guard;
     LlamaServerDiagnosticsOptions diagnostics;
+    LlamaServerWarmupOptions warmup;
 };
 
 // Slot snapshots are upstream-owned files, not portable Sonder KV blocks.

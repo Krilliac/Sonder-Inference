@@ -180,6 +180,95 @@ TEST_CASE("runtime: the engine sampler emits GPU samples and each warning once")
     CHECK(w->find("backend")->as_string() == "mock");
 }
 
+TEST_CASE("runtime: warm-up status is additive on health, models, and telemetry") {
+    auto backend = std::make_shared<RuntimeBackend>();
+    auto status = spilled_status();
+    si::BackendWarmupStatus warmup;
+    warmup.generation = 7;
+    warmup.status = "complete";
+    warmup.slots.push_back(si::BackendWarmupSlotStatus{2u, "complete", 123u, 117u, 42.5, ""});
+    status.warmup = warmup;
+    backend->set(status);
+
+    auto o = Fixture::defaults();
+    o.backend.backend.clear();
+    o.backend_instance = backend;
+    Fixture f(o);
+
+    const auto health = get(f.port, "/v1/sonder/health").json();
+    const auto *runtime = health.find("backends")->as_array().at(0).find("runtime");
+    REQUIRE(runtime);
+    const auto *health_warmup = runtime->find("warmup");
+    REQUIRE(health_warmup);
+    CHECK(health_warmup->find("generation")->as_uint() == 7);
+    CHECK(health_warmup->find("status")->as_string() == "complete");
+    REQUIRE(health_warmup->find("slots")->is_array());
+    REQUIRE(health_warmup->find("slots")->as_array().size() == 1);
+    const auto &slot = health_warmup->find("slots")->as_array().front();
+    CHECK(slot.find("id_slot")->as_uint() == 2);
+    CHECK(slot.find("prompt_tokens")->as_uint() == 123);
+    CHECK(slot.find("cache_n")->as_uint() == 117);
+    CHECK(slot.find("milliseconds")->as_double() == doctest::Approx(42.5));
+
+    const auto models = get(f.port, "/v1/models").json();
+    const auto *model_runtime = models.find("data")->as_array().at(0).find("sonder")->find("runtime");
+    REQUIRE(model_runtime);
+    CHECK(model_runtime->find("warmup")->dump() == health_warmup->dump());
+
+    auto sink = std::make_shared<si::MemoryTelemetrySink>();
+    si::EngineOptions eo;
+    eo.telemetry_sinks.push_back(sink);
+    eo.sample_devices_on_start = false;
+    eo.device_sample_interval = std::chrono::milliseconds(20);
+    {
+        si::Engine engine(eo);
+        REQUIRE(engine.register_backend(backend).ok());
+        REQUIRE(eventually([&] {
+            engine.telemetry().flush();
+            std::size_t warmup_events = 0;
+            for (const auto &line : sink->lines()) {
+                auto event = json::parse(line);
+                if (!event.ok() || event->find("event_type")->as_string() != "backend.warmup")
+                    continue;
+                ++warmup_events;
+                const auto *attrs = event->find("attributes");
+                if (!attrs || attrs->find("backend")->as_string() != "mock" ||
+                    attrs->find("generation")->as_uint() != 7)
+                    return false;
+            }
+            return warmup_events == 1;
+        }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        engine.telemetry().flush();
+        const auto lines = sink->lines();
+        CHECK(std::count_if(lines.begin(), lines.end(), [](const std::string &line) {
+                  const auto event = json::parse(line);
+                  return event.ok() && event->find("event_type")->as_string() == "backend.warmup";
+              }) == 1);
+        status.warmup->generation = 8;
+        status.warmup->slots.front().cache_n = 0;
+        backend->set(status);
+        REQUIRE(eventually([&] {
+            engine.telemetry().flush();
+            std::size_t count = 0;
+            bool restarted = false;
+            for (const auto& line : sink->lines()) {
+                const auto event = json::parse(line);
+                if (!event.ok() || event->find("event_type")->as_string() != "backend.warmup") continue;
+                ++count;
+                const auto* attrs = event->find("attributes");
+                if (attrs->find("generation")->as_uint() == 8) {
+                    restarted = attrs->find("id_slot")->as_uint() == 2 &&
+                                attrs->find("prompt_tokens")->as_uint() == 123 &&
+                                attrs->find("cache_n")->as_uint() == 0 &&
+                                attrs->find("milliseconds")->as_double() == 42.5;
+                }
+            }
+            return count == 2 && restarted;
+        }));
+    }
+}
+
 TEST_CASE("runtime: llamaserver config accepts spill_guard, log_file and kv_pairing_check strictly") {
     const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto path = std::filesystem::temp_directory_path() /
@@ -202,12 +291,13 @@ TEST_CASE("runtime: llamaserver config accepts spill_guard, log_file and kv_pair
     CHECK(defaults.llamaserver_spill_guard);
     CHECK(defaults.llamaserver_spill_policy == "warn");
     CHECK(defaults.llamaserver_spill_threshold_mib == 256);
+    CHECK(defaults.llamaserver_spill_baseline_per_1k_ctx_mib == 0);
     CHECK(defaults.llamaserver_log_file.empty());
     CHECK(defaults.llamaserver_kv_pairing_check);
 
     write(R"({"mode":"spawn","executable":"llama-server","args":["-c","100096"],"log_file":"ls.log",)"
           R"("kv_pairing_check":false,"spill_guard":{"enabled":true,"policy":"auto_fit","threshold_mib":300,)"
-          R"("baseline_mib":10,"sample_interval_ms":2000,"fit_step_factor":0.8,"fit_step_align":512,)"
+          R"("baseline_mib":10,"baseline_per_1k_ctx_mib":2,"sample_interval_ms":2000,"fit_step_factor":0.8,"fit_step_align":512,)"
           R"("fit_min_ctx":16384,"fit_max_attempts":3}})");
     si::BackendSetup setup;
     auto status = si::load_llamaserver_config(path.string(), setup);
@@ -215,6 +305,7 @@ TEST_CASE("runtime: llamaserver config accepts spill_guard, log_file and kv_pair
     CHECK(setup.llamaserver_spill_policy == "auto_fit");
     CHECK(setup.llamaserver_spill_threshold_mib == 300);
     CHECK(setup.llamaserver_spill_baseline_mib == 10);
+    CHECK(setup.llamaserver_spill_baseline_per_1k_ctx_mib == 2);
     CHECK(setup.llamaserver_spill_sample_interval_ms == 2000);
     CHECK(setup.llamaserver_fit_step_factor == doctest::Approx(0.8));
     CHECK(setup.llamaserver_fit_step_align == 512);
@@ -227,6 +318,8 @@ TEST_CASE("runtime: llamaserver config accepts spill_guard, log_file and kv_pair
                              R"({"spill_guard":[]})", R"({"spill_guard":{"threshold_mib":0}})",
                              R"({"spill_guard":{"fit_step_factor":1}})", R"({"spill_guard":{"fit_max_attempts":33}})",
                              R"({"spill_guard":{"sample_interval_ms":5}})", R"({"spill_guard":{"enabled":"yes"}})",
+                             R"({"spill_guard":{"baseline_per_1k_ctx_mib":1025}})",
+                             R"({"spill_guard":{"baseline_per_1k_ctx_mib":-1}})",
                              R"({"log_file":7})", R"({"kv_pairing_check":"on"})"}) {
         write(body);
         si::BackendSetup invalid;

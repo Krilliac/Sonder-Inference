@@ -218,6 +218,40 @@ TEST_CASE("spill classification uses the measured clean and spilled samples") {
     CHECK_FALSE(spilled(1u << 20)); // saturating limit
 }
 
+TEST_CASE("spill baseline can grow with context for MTP profiles") {
+    // MTP (--spec-type draft-mtp) raises the clean line: measured 2026-09-30
+    // on the RTX 5070 Ti at about 126 MiB + 2 MiB per 1k ctx, +40 MiB after
+    // the first prompt (about 310 MiB at 73,728), and runs 33+ MiB above that
+    // line were already slower. A fixed 0 + 256 MiB limit calls that clean run
+    // spilled, which under auto_fit would shrink the context for nothing.
+    GpuMemorySample s;
+    s.shared_bytes = 310 * MiB;
+    SpillGuardOptions fixed; // defaults
+    CHECK(is_spilled(s, fixed, 73728u));
+    CHECK(effective_baseline(fixed, 73728u) == 0);
+
+    SpillGuardOptions o;
+    o.baseline_bytes = 166 * MiB;           // 126 + 40
+    o.baseline_bytes_per_1k_ctx = 2 * MiB;  // + 2 MiB per 1,024 tokens
+    o.threshold_bytes = 32 * MiB;
+    CHECK(effective_baseline(o, 73728u) == (166 + 144) * MiB);
+    CHECK_FALSE(is_spilled(s, o, 73728u));  // clean MTP line
+    s.shared_bytes = 342 * MiB;
+    CHECK_FALSE(is_spilled(s, o, 73728u));  // exactly baseline + threshold
+    s.shared_bytes = 343 * MiB;
+    CHECK(is_spilled(s, o, 73728u));        // mild spill
+    // Unknown context: the fixed baseline applies (no growth term).
+    CHECK(effective_baseline(o, std::nullopt) == 166 * MiB);
+    CHECK(is_spilled(s, o));
+    // The growth term saturates instead of wrapping.
+    o.baseline_bytes_per_1k_ctx = 1024 * MiB;
+    CHECK(effective_baseline(o, std::numeric_limits<std::uint64_t>::max()) ==
+          std::numeric_limits<std::uint64_t>::max());
+    CHECK(validate_spill_guard(o).ok());
+    o.baseline_bytes_per_1k_ctx = 1024 * MiB + 1;
+    CHECK_FALSE(validate_spill_guard(o).ok());
+}
+
 TEST_CASE("auto_fit context steps are aligned, strictly decreasing and floored") {
     SpillGuardOptions o;
     CHECK(next_fit_context(100096, o) == 84992u);

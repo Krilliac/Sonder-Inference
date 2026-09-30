@@ -103,6 +103,7 @@ Backend:
   --llamaserver-executable PATH  spawn executable
   --llamaserver-arg ARG     repeatable spawn argument (passed verbatim)
   --llamaserver-mode MODE   attach or spawn
+  --warmup-file PATH         llamaserver prefix messages JSON (requires --backend llamaserver)
 
 Telemetry (Observatory envelope v1; live at /v1/telemetry/sse and /v1/telemetry/ndjson):
   --telemetry-level L     off|metrics|standard|deep (default standard)
@@ -131,6 +132,7 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"llamaserver-config", Kind::value}, {"llamaserver-url", Kind::value},
         {"llamaserver-executable", Kind::value}, {"llamaserver-arg", Kind::repeat},
         {"llamaserver-mode", Kind::value},
+        {"warmup-file", Kind::value},
         {"gpu-layers", Kind::value},     {"context-length", Kind::value},
         {"device", Kind::value},
         {"lazy-models", Kind::flag},     {"model-idle-ttl", Kind::value},
@@ -381,6 +383,11 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
     if (auto v = a.get("llamaserver-url")) o.backend.llamaserver_url = *v;
     if (auto v = a.get("llamaserver-executable")) o.backend.llamaserver_executable = *v;
     if (!a.all("llamaserver-arg").empty()) o.backend.llamaserver_args = a.all("llamaserver-arg");
+    if (auto v = a.get("warmup-file")) {
+        if (o.backend.backend != "llamaserver")
+            return usage_error("--warmup-file requires --backend llamaserver");
+        o.backend.llamaserver_warmup_messages_file = *v;
+    }
     if (o.backend.backend == "llamaserver") {
         if (o.backend.llamaserver_mode == "spawn") {
             if (o.backend.llamaserver_executable.empty()) return usage_error("--llamaserver-executable is required in spawn mode");

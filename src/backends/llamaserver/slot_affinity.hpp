@@ -54,7 +54,11 @@ class SlotAffinity {
 
     // Slot for `key` among `n_slots` upstream slots. No slot (and no busy
     // mark) for an empty key or an unknown slot count (0).
-    [[nodiscard]] Lease acquire(std::string_view key, std::uint32_t n_slots);
+    // New keys may prefer slots whose prefix was warmed by the backend. The
+    // preference is advisory: existing ownership and busy-slot rules still
+    // win, and an empty list preserves the historical selection policy.
+    [[nodiscard]] Lease acquire(std::string_view key, std::uint32_t n_slots,
+                                const std::vector<std::uint32_t> &preferred_slots = {});
 
     // Test observation: the slot a key currently owns.
     [[nodiscard]] std::optional<std::uint32_t> owned_slot(std::string_view key) const;

@@ -6,6 +6,7 @@ sonder_module_sources(
     llamaserver_protocol.cpp
     log_diagnostics.cpp
     process.cpp
+    prefix_warmup.cpp
     slot_affinity.cpp
     supervisor.cpp)
 sonder_module_include_directories(include)

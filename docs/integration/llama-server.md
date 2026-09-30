@@ -140,7 +140,8 @@ with `id_slot`:
   agent of a run keeps its own slot. No key: no `id_slot` (llama-server picks
   an idle slot by prompt similarity, as before).
 - A known key keeps its slot, even while its previous turn still runs.
-- A new key takes the lowest slot no key owns, else the slot of the least
+- A new key prefers a successfully warmed slot no key owns (when warm-up is
+  enabled), then takes the lowest slot no key owns, else the slot of the least
   recently used key whose slot is idle. When every slot is owned and busy the
   request is not pinned. The map holds one key per slot (at most 1024).
 - With one slot (`total_slots` 1) every keyed chat uses slot 0; with an
@@ -153,6 +154,67 @@ strict OpenAI-compatible servers reject unknown parameters. Raw completions
 Thinking controls (`ChatRequest::thinking`) are sent as
 `chat_template_kwargs: {"enable_thinking", "reasoning_effort"}` only when set;
 see [SERVER.md](../SERVER.md#thinking-control) for pinning them server-wide.
+
+## Slot prefix warm-up
+
+The llamaserver backend can replay a stable system prompt into selected slots
+after `/health` becomes ready. This is disabled by default. Configure it in the
+llamaserver JSON (or override only the messages path with
+`sonder-infer serve --warmup-file PATH --backend llamaserver`):
+
+```json
+{
+  "warmup": {
+    "messages_file": "D:/config/agent-prefix.json",
+    "chat_template_kwargs": {"enable_thinking": false},
+    "slots": "all",
+    "on_restart": true,
+    "max_prefix_chars": 262144
+  }
+}
+```
+
+`messages_file` contains a JSON array of chat messages, usually one `system`
+message and any stable tools text. Warm-up is available only for native
+llama-server chat mode (`native_completion: true`); generic OpenAI mode reports
+a warning and sends no warm-up request. Warm-up requests use the native chat route,
+`cache_prompt: true`, `max_tokens: 1`, and an explicit `id_slot`; generated
+output is discarded. `slots` may be `"all"` or a unique array of slot ids.
+Warm-up runs in the background after readiness and, for spawn mode when
+`on_restart` is true, after a supervisor restart or accepted `auto_fit`
+relaunch. Attach mode performs the startup warm-up only; it cannot observe or
+react to an external server restart. It never delays readiness or blocks the
+request path. A missing or malformed messages file is a warning and disables
+that attempt; it is not a fatal backend error.
+
+**The `chat_template_kwargs` must match the effective kwargs used by real
+requests, including thinking and server pin settings.** A mismatch changes the
+rendered prefix from its first token and defeats reuse. The file is bounded by
+`max_prefix_chars` (UTF-8 bytes including JSON syntax) before parsing.
+Its default is 262,144 and its allowed range is 1 through 16,777,216. Relative
+paths resolve against the host process's working directory. `slots` defaults
+to `"all"`, `on_restart` defaults to true, and `slots: []` requests no replays.
+There is one attempt per selected slot per accepted start, with at most 1,024
+slots. Each request uses the configured backend timeouts and shutdown cancels
+the worker. Requests arriving while warm-up runs continue normally; llama-server
+queues requests for a busy slot. Children immediately replaced by the spill
+guard are not warmed; the final accepted child is.
+
+Health and model responses add `runtime.warmup` only when warm-up is configured.
+It contains a `generation`, a `status` (including `warming`), and per-slot
+`id_slot`, `status`, `prompt_tokens`, `cache_n`, and `milliseconds`. Prompt
+tokens include cached tokens; `cache_n` describes reuse during the warm-up
+itself, not the next real turn. Unreported counters are null. Failed slots
+also have a sanitized `error`, and runtime warnings never include prefix text
+or upstream response bodies. The engine runtime sampler emits `backend.warmup`
+for observed terminal slot results, with the same slot fields plus `backend`
+and `generation`; it uses the existing telemetry level and sampling interval.
+
+On hybrid attention/DeltaNet models, llama.cpp currently does not persist the
+recurrent checkpoints in slot save files, so slot save/restore cannot provide
+this warm state (see [llama.cpp issue #28194](https://github.com/ggml-org/llama.cpp/issues/28194)).
+Warm-up deliberately re-runs the prefix in each target slot after every
+relevant restart instead.
 
 ## Slot save and restore
 
