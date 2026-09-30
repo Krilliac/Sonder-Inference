@@ -370,6 +370,15 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
     const bool unified = p.kv_unified.value_or(!p.parallel.has_value());
     const std::uint32_t slots = p.parallel.value_or(1);
     e.sequences = unified ? 1 : slots;
+    // --ctx-size is the total KV size. A non-unified cache splits it into one
+    // stream per sequence of n_ctx_seq = pad(n_ctx / n_seq_max, 256) cells
+    // (llama_context's constructor, llama.cpp b11195), so the pool is
+    // n_ctx_seq x parallel, not ctx x parallel. Unified: one pool of ctx.
+    std::uint64_t ctx_per_sequence = ctx;
+    if (e.sequences > 1) {
+        ctx_per_sequence = (ctx / e.sequences + 255) / 256 * 256;
+    }
+    e.context_per_sequence = ctx_per_sequence;
 
     const double bk = kv_cache_type_bytes(p.cache_type_k.value_or("f16"));
     const double bv = kv_cache_type_bytes(p.cache_type_v.value_or("f16"));
@@ -388,7 +397,8 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
     }
     if (all) e.weights_bytes += m.output_bytes;
     e.kv_bytes_per_token = static_cast<std::uint64_t>(kv_per_token + 0.5);
-    e.kv_bytes = static_cast<std::uint64_t>(kv_per_token * static_cast<double>(ctx) * e.sequences + 0.5);
+    e.kv_bytes =
+        static_cast<std::uint64_t>(kv_per_token * static_cast<double>(ctx_per_sequence) * e.sequences + 0.5);
 
     if (!p.mmproj.empty() && p.mmproj_offload.value_or(true)) {
         e.weights_bytes += inputs.mmproj_bytes;

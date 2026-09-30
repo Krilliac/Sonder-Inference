@@ -231,6 +231,28 @@ constexpr std::chrono::milliseconds kLingerIdle{500};
 // telemetry file, backend clients, stdio, ...), for the RLIMIT_NOFILE check.
 constexpr std::uint64_t kDescriptorHeadroom = 32;
 
+// A launch profile's `context_length` is the configured --ctx-size. When the
+// backend reports that the running process uses a different context (the
+// llamaserver spill guard's auto_fit relaunches with a smaller --ctx-size),
+// the served profile reports the running value as `context_length` and keeps
+// the configured one as `configured_context_length`. `estimated_vram_mib`
+// stays the estimate for the configured context. Unchanged otherwise.
+json::Object profile_with_runtime_context(json::Object profile, const std::optional<BackendRuntimeStatus>& runtime) {
+    if (!runtime || !runtime->context.fitted_ctx) {
+        return profile;
+    }
+    const json::Value* configured = profile.find("context_length");
+    const std::uint64_t fitted = *runtime->context.fitted_ctx;
+    if (configured != nullptr && configured->is_integer() &&
+        static_cast<std::uint64_t>(configured->as_int()) == fitted) {
+        return profile;
+    }
+    const json::Value configured_value = configured != nullptr ? *configured : json::Value();
+    profile.set("context_length", json::Value(fitted));
+    profile.set("configured_context_length", configured_value);
+    return profile;
+}
+
 }  // namespace
 
 // ============================================================ Server::Impl
@@ -567,14 +589,25 @@ struct Server::Impl {
                 ext.set("runtime", to_json(*runtime));
             }
             if (m.profile) {
-                ext.set("profile", *m.profile);
+                const bool own_runtime = b && b->name() == m.backend;
+                ext.set("profile", profile_with_runtime_context(
+                                       *m.profile, own_runtime ? runtime : std::optional<BackendRuntimeStatus>{}));
             }
             data.emplace_back(json::Object{
                 {"id", m.id}, {"object", "model"}, {"owned_by", "sonder-inference"}, {"sonder", std::move(ext)}});
         }
         json::Object meta = sonder_meta();
         if (!opts.profile_catalog.empty()) {
-            meta.set("profiles", opts.profile_catalog);
+            json::Array catalog;
+            for (const auto& entry : opts.profile_catalog) {
+                const json::Value* is_served = entry.find("served");
+                if (entry.is_object() && is_served != nullptr && is_served->is_bool() && is_served->as_bool()) {
+                    catalog.emplace_back(profile_with_runtime_context(entry.as_object(), runtime));
+                } else {
+                    catalog.push_back(entry);
+                }
+            }
+            meta.set("profiles", std::move(catalog));
         }
         send_json(ex, 200, json::Object{{"object", "list"}, {"data", std::move(data)}, {"sonder", std::move(meta)}});
     }

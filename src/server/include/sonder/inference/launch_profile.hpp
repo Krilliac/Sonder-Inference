@@ -193,14 +193,15 @@ Result<GgufModelInfo> parse_gguf_model_info(std::string_view header_bytes);
 
 struct VramEstimate {
     std::uint64_t weights_bytes = 0;    // offloaded blocks (+ output) + mmproj/draft when offloaded
-    std::uint64_t kv_bytes = 0;         // attention layers on the GPU x ctx x sequences
+    std::uint64_t kv_bytes = 0;         // attention layers on the GPU x context_per_sequence x sequences
     std::uint64_t recurrent_bytes = 0;  // recurrent state of GPU blocks x sequences
     std::uint64_t compute_bytes = 0;    // compute buffers and runtime allowance
     std::uint64_t total_bytes = 0;
     std::uint32_t gpu_layers = 0;
     std::uint32_t attention_layers = 0;  // attention layers whose KV is on the GPU
     std::uint64_t kv_bytes_per_token = 0;
-    std::uint64_t context = 0;
+    std::uint64_t context = 0;               // total context (--ctx-size, padded to 256)
+    std::uint64_t context_per_sequence = 0;  // context when unified; else pad(context / sequences, 256)
     std::uint32_t sequences = 1;
     std::vector<std::string> notes;  // what the estimate does not cover
 
@@ -218,8 +219,10 @@ struct VramEstimateInputs {
 //            plus output tensors when every block is offloaded; MTP (nextn)
 //            blocks only when speculative types include draft-mtp
 //   KV       sum over GPU attention layers of n_kv_heads x (key_length x
-//            bytes(k) + value_length x bytes(v)) x ctx x sequences, where
-//            sequences = parallel unless kv_unified (the pool is ctx total)
+//            bytes(k) + value_length x bytes(v)) x ctx_seq x sequences:
+//            kv_unified gives one pool of ctx (sequences 1); otherwise
+//            sequences = parallel and ctx_seq = pad(ctx / parallel, 256),
+//            as llama.cpp splits --ctx-size across the per-sequence streams
 //   compute  n_vocab x ubatch x 4 (logits) + 4 x n_embd x ubatch x 4
 //            + 256 MiB runtime allowance
 // ctx 0 or unset uses <arch>.context_length. Hybrid models count only their
@@ -233,8 +236,10 @@ VramEstimate estimate_vram(const GgufModelInfo& model, const LaunchProfile& prof
 std::optional<std::uint64_t> detect_device_vram_mib();
 
 // `sonder.profile` metadata for /v1/models (additive): backend, context
-// length, parallel, cache types, flash attention, capabilities, estimated
-// VRAM and budget. Unknown values are null.
+// length, parallel, cache types, flash attention, capabilities (usable
+// through Sonder's endpoint), upstream_capabilities (supported by the
+// upstream server, possibly not yet forwarded by Sonder), estimated VRAM and
+// budget. Unknown values are null.
 json::Object launch_profile_metadata(const LaunchProfile& profile, const std::optional<VramEstimate>& estimate,
                                      std::optional<std::uint64_t> budget_mib);
 

@@ -90,6 +90,17 @@ default budget (device memory minus 1.5 GiB = 14,767 MiB). It only fits
 while the desktop uses less than about 0.8 GB of VRAM. The default budget
 would refuse it; see [VRAM fit check](#vram-fit-check).
 
+**This configuration is at the spill edge.** The 388 MiB of shared memory
+above is more than the llamaserver spill guard's 256 MiB threshold, so the
+guard reports this run as spilled. The [VRAM spill](vram-spill.md) benchmark
+ran the same q8_0/q5_1 setup at 100,096 and measured 15.9 tok/s short
+decode, against 50.0 tok/s for q5_1/q5_1 at the same context, which did not
+spill. The spawned llama-server also gets a `kv_type_mismatch` warning from
+the KV pairing check, because q8_0/q5_1 has no FlashAttention vector kernel
+in a default CUDA build and runs converted to f16. See
+[Spill guard and KV pairing check](#spill-guard-and-kv-pairing-check) for the
+variant that fits and the budget that matches the measured spill line.
+
 ## The community IQ4_XS profile
 
 The community configuration for the UD-IQ4_XS file (14.25 GB) adds a vision
@@ -185,7 +196,15 @@ Rules checked at load time (`invalid_argument`, before anything starts):
   `--`, `--api-key`, `--api-key-file`, `--ssl-key-file`, `--ssl-cert-file`,
   download flags (`-hf`, `--hf-repo`, `--hf-file`, `--hf-token`,
   `--model-url`, `--docker-repo`, `--mmproj-url`, `--hf-repo-draft`,
-  `--spec-draft-hf`), or `--models-dir`/`--models-preset`. The spawn-mode loopback
+  `--spec-draft-hf`), or `--models-dir`/`--models-preset`. They may not
+  turn on llama-server's agent tools, MCP or local file serving either:
+  `--tools` (which includes `exec_shell_command` and `write_file`),
+  `--tools-runtime`, `--mcp-servers-config`, `--mcp-servers-json`,
+  `-ag`/`--agent`, `--ui-mcp-proxy`/`--webui-mcp-proxy`, `--path` and
+  `--media-path`. Their `--no-*` forms are allowed. Profiles are meant to be
+  copied from shared configurations, so a profile file must not be able to
+  switch on shell execution in the child. (`--llamaserver-arg` without a
+  profile is an operator flag and is not filtered this way.) The spawn-mode loopback
   rules still apply: the child only ever listens on 127.0.0.1. Any spelling
   of a flag that a typed field owns (for example `-c`, `--ctx-size=`,
   `--temp`, `-ngl`) is refused with the field to use instead.
@@ -222,10 +241,14 @@ and compares it with a budget:
   `speculative.types` has `draft-mtp`, because llama.cpp skips them
   otherwise. The mmproj and draft files count when offloaded.
 - **KV** = sum over GPU attention layers of n_kv_heads × (key_length ×
-  bytes(K) + value_length × bytes(V)) × ctx × sequences. Bytes per value
+  bytes(K) + value_length × bytes(V)) × ctx_seq × sequences. Bytes per value
   come from ggml's block layouts: f16 2, q8_0 1.0625, q5_1 0.75, q4_0 0.5625.
-  ctx is padded to 256. sequences = `parallel`, unless `kv_unified` (the
-  default when `parallel` is unset), which gives one pool of ctx tokens.
+  ctx is padded to 256. With `kv_unified` (the default when `parallel` is
+  unset) there is one pool: sequences = 1 and ctx_seq = ctx. Without it,
+  sequences = `parallel` and ctx_seq = ctx / `parallel` padded to 256,
+  because `--ctx-size` is the total and llama.cpp splits it into one stream
+  per sequence (`n_ctx_seq` in `llama_context`). Either way the KV holds
+  about ctx tokens in total; `parallel` does not multiply it.
   **Hybrid models count attention layers only.** They are found from
   per-block `head_count_kv` arrays, then `attn_k` tensors, then
   `full_attention_interval`, using the architecture classification in `model_architecture.hpp`.
@@ -303,17 +326,88 @@ field appears.
 {"object":"list","data":[{"id":"qwen3.8-27b-q3-100k","object":"model","owned_by":"sonder-inference",
   "sonder":{"backend":"llamaserver","default":true,"synthetic":false,
     "profile":{"name":"qwen3.8-27b-q3-100k","backend":"llamaserver","context_length":100096,"parallel":1,
-      "cache_type_k":"q8_0","cache_type_v":"q5_1","flash_attn":"on","capabilities":["tools"],
+      "cache_type_k":"q8_0","cache_type_v":"q5_1","flash_attn":"on",
+      "capabilities":[],"upstream_capabilities":["tools"],
       "estimated_vram_mib":15437,"vram_budget_mib":15600,"served":true}}}],
  "sonder":{"api_version":1,"profiles":[{"name":"qwen3.8-27b-q3-100k","...":"...","served":true}]}}
 ```
 
-`capabilities` holds `vision` when `mmproj` is set and `speculative` when
-speculative types other than `none` are set. It holds `tools` for
-llamaserver profiles with jinja on (llama-server's default). That describes
-the upstream's template support: Sonder's `/v1/chat/completions` does not
-forward tool definitions yet. `estimated_vram_mib` is null when no estimate
-was possible, and `estimate_error` then says why.
+`capabilities` lists only what a request to this Sonder endpoint can use:
+`speculative` when speculative types other than `none` are set (it is
+transparent to the caller). `upstream_capabilities` lists what the upstream
+llama-server supports: `vision` when `mmproj` is set, `tools` for llamaserver
+profiles with jinja on (llama-server's default), and `speculative`. Sonder's
+`/v1/chat/completions` rejects `tools`, `tool_choice`, `functions` and
+non-string message content (image parts) with `unsupported_parameter`, so
+`vision` and `tools` are not in `capabilities` until Sonder forwards them. A
+consumer that reads `capabilities` never builds a request Sonder refuses.
+`estimated_vram_mib` is null when no estimate was possible, and
+`estimate_error` then says why.
+
+`context_length` is the profile's `ctx_size`, unless the backend reports
+that the running process uses a different context. The llamaserver spill
+guard's `auto_fit` policy relaunches llama-server with a smaller
+`--ctx-size` when it spills. Then `context_length` (in `sonder.profile` and
+in the served entry of `sonder.profiles`) is the running context, and
+`configured_context_length` holds the profile's value. `estimated_vram_mib`
+stays the estimate for the configured context. The backend's own
+`sonder.runtime` object (context fit, GPU memory, warnings) sits beside
+`sonder.profile` on the same entry, unchanged.
+
+## Spill guard and KV pairing check
+
+The spawned llama-server runs under the llamaserver backend's
+[spill guard and KV pairing check](vram-spill.md). A profile does not change
+either. Configure them in the `--llamaserver-config` file (`spill_guard`,
+`kv_pairing_check`, `log_file`); only `args` is refused there with
+`--profile`.
+
+- **KV pairing.** A profile with different `cache_type_k` and
+  `cache_type_v` (such as the measured q8_0/q5_1) gets a `kv_type_mismatch`
+  warning in `sonder.runtime.warnings`, and q5_1/q5_1 gets
+  `kv_type_no_vector_kernel`. Both are converted to f16 inside
+  FlashAttention in a default CUDA build. The profile still loads; the
+  warning is advice, not a refusal.
+- **`auto_fit`.** It can shrink the context of a profile's llama-server at
+  run time. `/v1/models` then reports the running context (see above). The
+  fit check at startup still judged the configured context.
+- **Spill threshold vs fit budget.** The guard calls a process spilled when
+  its shared GPU memory exceeds the baseline plus 256 MiB. The fit check
+  compares the estimate with dedicated memory only. The measured 100k run
+  held 388 MiB shared, so by the guard's rule it spilled. Against dedicated
+  plus shared (15,654 MiB) the estimate of 15,437 MiB is 1.4 % low.
+
+The VRAM spill benchmark measured seven Q3_K_XL configurations with the
+per-process counters. The estimates below apply this estimator to them.
+Only the KV term depends on the context and the cache types, so each one is
+the measured profile's 15,437 MiB with its KV term replaced.
+
+| K/V | ctx | estimate | measured dedicated | shared | spilled |
+|---|---|---|---|---|---|
+| q5_1/q5_1 | 100,096 | 14,948 MiB | 14,966 MiB | 198 MiB | no |
+| q8_0/q5_1 | 91,904 | 15,205 MiB | 15,184 MiB | 190 MiB | no |
+| q8_0/q5_1 | 96,000 | 15,321 MiB | 15,222 MiB | 292 MiB | yes |
+| q5_1/q5_1 | 116,480 | 15,332 MiB | 15,302 MiB | 342 MiB | yes |
+| q8_0/q8_0 | 83,712 | 15,382 MiB | 15,320 MiB | 182 MiB | no |
+| q8_0/q5_1 | 100,096 | 15,437 MiB | 15,266 MiB | 388 MiB | yes |
+| q8_0/q8_0 | 87,808 | 15,518 MiB | 15,314 MiB | 348 MiB | yes |
+
+Dedicated usage stops near 15.2-15.3 GB, and the overflow goes to shared
+memory. Every spilled run has an estimate of 15,321 MiB or more. So on this
+card, **`vram_budget_mib: 15300`** refuses every spilled configuration. It
+also refuses q8_0/q8_0 at 83,712, which did not spill. The 15,600 in the
+measured profile accepts three spilled configurations, including that
+profile itself. For 100k context on 16 GB, the configuration that measured
+clean is q5_1/q5_1:
+
+```json
+{"name": "qwen3.8-27b-q3-100k-q51", "...": "same as the measured profile",
+ "cache_type_k": "q5_1", "cache_type_v": "q5_1", "vram_budget_mib": 15300}
+```
+
+It measured 50.0 tok/s short decode and 44.3 tok/s at an 8k prompt. It
+still gets the `kv_type_no_vector_kernel` advice. The benchmark measured
+little conversion cost at 8k, and did not measure it at long prompts.
 
 ## Trade-offs
 
@@ -326,7 +420,10 @@ was possible, and `estimate_error` then says why.
   dependent and have not been measured here. This llama-server build warns
   that it has no FlashAttention vector kernel for the `q8_0-q5_1` pair and
   converts to f16 in that path (`GGML_CUDA_FA_QUANTS`). The measured decode
-  speeds already include that cost.
+  speeds already include that cost. The KV pairing check reports it as
+  `kv_type_mismatch`. q5_1/q5_1 at the same context uses 489 MiB less and
+  did not spill; see [Spill guard and KV pairing
+  check](#spill-guard-and-kv-pairing-check).
 - **Checkpoints vs RAM.** Hybrid models cannot trim their recurrent state,
   so prefix reuse needs context checkpoints. `ctx_checkpoints` limits how
   many a slot keeps (llama-server's default is 32), and
@@ -379,6 +476,8 @@ llama-server needed:
   MTP and partial offload
 - sampling defaults reaching the backend
 - the additive `/v1/models` fields, and their absence without a profile
+- endpoint vs upstream capabilities, and a context reduced at run time
+  (`auto_fit`) replacing `context_length` next to the backend's `runtime`
 - `serve` refusals
 
 Set `SONDER_TEST_GGUF` to a GGUF file, or to a copy of its header, to print

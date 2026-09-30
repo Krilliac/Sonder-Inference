@@ -253,7 +253,10 @@ status (same object as `backends[].runtime` in health).
 With `--profile`, the served model's `sonder` object also carries `profile`
 (context length, cache types, backend, capabilities, estimated VRAM), and the
 top-level `sonder` object lists every profile of the file as `profiles`. Both
-are additive and absent without a profile; see
+are additive and absent without a profile. `context_length` follows a
+context the backend reduced at run time (`configured_context_length` then
+keeps the profile's), and `capabilities` lists only what this endpoint
+accepts (`upstream_capabilities` has the upstream's `vision`/`tools`); see
 [launch profiles](integration/launch-profiles.md).
 
 ### `GET /v1/sonder/identity[?model=ID]`

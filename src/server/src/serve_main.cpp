@@ -418,7 +418,7 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const La
         std::string summary = "launch profile '" + p.name + "': estimated VRAM " + std::to_string(e.total_mib()) +
                               " MiB (weights " + mib_text(e.weights_bytes) + ", KV " + mib_text(e.kv_bytes) + " = " +
                               std::to_string(e.attention_layers) + " attention layers x " +
-                              std::to_string(e.context) + " tokens x " + std::to_string(e.sequences) +
+                              std::to_string(e.context_per_sequence) + " tokens x " + std::to_string(e.sequences) +
                               " sequence(s), recurrent " + mib_text(e.recurrent_bytes) + ", compute " +
                               mib_text(e.compute_bytes) + ")";
         if (budget) summary += " vs budget " + std::to_string(*budget) + " MiB";

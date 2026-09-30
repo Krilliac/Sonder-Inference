@@ -85,6 +85,15 @@ constexpr std::string_view kForbiddenFlags[] = {
     "--models-dir", "--models-preset",
 };
 
+// llama-server features that run tools, reach MCP servers or read/serve local
+// files (the `--help` of each says "do not enable in untrusted environments"
+// or serves a directory). A profile is data that is meant to be shared, so it
+// may not switch them on; the `--no-*` spellings stay allowed.
+constexpr std::string_view kUnsafeFeatureFlags[] = {
+    "--tools", "--tools-runtime", "--mcp-servers-config", "--mcp-servers-json", "-ag", "--agent",
+    "--ui-mcp-proxy", "--webui-mcp-proxy", "--path", "--media-path",
+};
+
 Status check_extra_args(const LaunchProfile& p) {
     if (p.extra_args.size() > kMaxExtraArgs) return bad(where_of(p), "extra_args has more than 256 entries");
     for (const auto& arg : p.extra_args) {
@@ -96,6 +105,13 @@ Status check_extra_args(const LaunchProfile& p) {
                 return bad(where_of(p), "extra_args must not contain " + std::string(flag) +
                                             " (the supervisor owns host and port; credentials and downloads are "
                                             "not passed to llama-server)");
+            }
+        }
+        for (auto f : kUnsafeFeatureFlags) {
+            if (flag == f) {
+                return bad(where_of(p), "extra_args must not contain " + std::string(flag) +
+                                            " (llama-server's agent tools, MCP and local file serving cannot be "
+                                            "enabled from a launch profile)");
             }
         }
         for (const auto& [f, field] : kTypedFlags) {
@@ -538,13 +554,25 @@ void apply_sampling_defaults(const SamplingDefaults& d, SamplingConfig& s) {
 
 json::Object launch_profile_metadata(const LaunchProfile& p, const std::optional<VramEstimate>& estimate,
                                      std::optional<std::uint64_t> budget_mib) {
+    // `capabilities` lists only what a request to this Sonder endpoint can
+    // use. Speculative decoding is transparent to the caller. `vision` and
+    // `tools` are what the upstream llama-server supports (an mmproj; jinja
+    // templates, on by default), but Sonder's /v1/chat/completions rejects
+    // tool definitions and non-string message content with
+    // unsupported_parameter, so they are listed as `upstream_capabilities`
+    // only. A consumer that reads `capabilities` never sends a request that
+    // Sonder refuses.
     json::Array capabilities;
-    if (!p.mmproj.empty()) capabilities.emplace_back("vision");
-    // llama-server's jinja templates (on by default) handle tool calls at the
-    // upstream; Sonder's chat route does not forward tool definitions.
-    if (p.backend == kLaunchProfileBackendLlamaServer && p.jinja.value_or(true)) capabilities.emplace_back("tools");
+    json::Array upstream_capabilities;
+    if (!p.mmproj.empty()) upstream_capabilities.emplace_back("vision");
+    if (p.backend == kLaunchProfileBackendLlamaServer && p.jinja.value_or(true)) {
+        upstream_capabilities.emplace_back("tools");
+    }
     const bool speculative = p.speculative && !(p.speculative->types.size() == 1 && p.speculative->types[0] == "none");
-    if (speculative) capabilities.emplace_back("speculative");
+    if (speculative) {
+        capabilities.emplace_back("speculative");
+        upstream_capabilities.emplace_back("speculative");
+    }
     json::Object o{{"name", p.name},
                    {"backend", p.backend},
                    {"context_length", p.ctx_size && *p.ctx_size > 0 ? json::Value(*p.ctx_size) : json::Value()},
@@ -552,7 +580,8 @@ json::Object launch_profile_metadata(const LaunchProfile& p, const std::optional
                    {"cache_type_k", p.cache_type_k.value_or("f16")},
                    {"cache_type_v", p.cache_type_v.value_or("f16")},
                    {"flash_attn", p.flash_attn.value_or("auto")},
-                   {"capabilities", std::move(capabilities)}};
+                   {"capabilities", std::move(capabilities)},
+                   {"upstream_capabilities", std::move(upstream_capabilities)}};
     if (speculative) {
         json::Array types;
         for (const auto& t : p.speculative->types) types.emplace_back(t);

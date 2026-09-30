@@ -176,6 +176,23 @@ TEST_CASE("launch profile: extra_args refuse host and port and credentials and d
     CHECK(ok.extra_args == std::vector<std::string>{"--no-warmup", "--override-kv", "a=int:1"});
 }
 
+TEST_CASE("launch profile: extra_args refuse llama-server agent tools, MCP and file serving") {
+    const auto with = [](const std::string& arg) {
+        return R"({"name":"p","backend":"llamaserver","model":"m.gguf","extra_args":[)" + arg + "]}";
+    };
+    for (const char* unsafe :
+         {R"("--tools","all")", R"("--tools=exec_shell_command")", R"("--tools-runtime","ssh:host")",
+          R"("--mcp-servers-config","m.json")", R"("--mcp-servers-json","{}")", R"("-ag")", R"("--agent")",
+          R"("--ui-mcp-proxy")", R"("--webui-mcp-proxy")", R"("--path","C:/")", R"("--media-path","D:/")"}) {
+        CAPTURE(unsafe);
+        CHECK(contains(parse_error(with(unsafe)), "agent tools, MCP and local file serving"));
+    }
+    // The disabling spellings stay allowed.
+    const LaunchProfile ok =
+        parse_single(with(R"("--no-agent","-no-ag","--no-ui-mcp-proxy","--no-webui-mcp-proxy")"));
+    CHECK(ok.extra_args.size() == 4u);
+}
+
 TEST_CASE("launch profile: file-level validation") {
     const auto error = [](const std::string& text) {
         auto doc = json::parse(text);
@@ -600,11 +617,24 @@ TEST_CASE("VRAM estimate: parallel sequences and unified KV and MTP and partial 
     LaunchProfile p = parse_single(kMeasuredProfile);
     const si::VramEstimate one = si::estimate_vram(m, p);
 
-    p.parallel = 2;  // kv_unified false: one ctx-sized KV per sequence
+    // kv_unified false: llama.cpp splits --ctx-size into one stream per
+    // sequence of pad(ctx / parallel, 256) cells, so the KV stays about ctx
+    // in total (100096 / 2 = 50048 -> 50176). Recurrent state is per sequence.
+    p.parallel = 2;
     const si::VramEstimate two = si::estimate_vram(m, p);
     CHECK(two.sequences == 2u);
-    CHECK(two.kv_bytes == 2 * one.kv_bytes);
+    CHECK(two.context == 100096u);
+    CHECK(two.context_per_sequence == 50176u);
+    CHECK(two.kv_bytes == 29696ull * 50176ull * 2);
+    CHECK(two.kv_bytes < 2 * one.kv_bytes);  // not ctx x parallel
     CHECK(two.recurrent_bytes == 2 * one.recurrent_bytes);
+    p.parallel = 4;  // 100096 / 4 = 25024 -> 25088
+    const si::VramEstimate four = si::estimate_vram(m, p);
+    CHECK(four.context_per_sequence == 25088u);
+    CHECK(four.kv_bytes == 29696ull * 25088ull * 4);
+    CHECK(four.recurrent_bytes == 4 * one.recurrent_bytes);
+    CHECK(one.context_per_sequence == 100096u);
+    p.parallel = 2;
 
     p.kv_unified = true;  // one shared pool of ctx tokens
     const si::VramEstimate unified = si::estimate_vram(m, p);
@@ -704,8 +734,11 @@ public:
         std::vector<si::SamplingConfig> sampling;
     };
     std::shared_ptr<Log> log = std::make_shared<Log>();
+    // Set before the server starts; reported through runtime_status().
+    std::optional<si::BackendRuntimeStatus> runtime;
 
     [[nodiscard]] std::string name() const override { return inner_->name(); }
+    [[nodiscard]] std::optional<si::BackendRuntimeStatus> runtime_status() const override { return runtime; }
     [[nodiscard]] std::string description() const override { return "mock that records requests"; }
     [[nodiscard]] si::BackendCapabilities capabilities() const override {
         si::BackendCapabilities c;
@@ -802,9 +835,13 @@ TEST_CASE("models: launch profile metadata is additive and sampling defaults rea
     CHECK(prof->find("flash_attn")->as_string() == "on");
     CHECK(prof->find("estimated_vram_mib")->as_int() == 15000);
     CHECK(prof->find("vram_budget_mib")->as_int() == 15500);
-    const auto& caps = prof->find("capabilities")->as_array();
-    REQUIRE(caps.size() == 1);
-    CHECK(caps[0].as_string() == "tools");  // no mmproj, no speculative
+    // Sonder's chat route rejects tool definitions: "tools" is an upstream
+    // capability only, never an endpoint capability.
+    CHECK(prof->find("capabilities")->as_array().empty());  // no speculative
+    const auto& upstream = prof->find("upstream_capabilities")->as_array();
+    REQUIRE(upstream.size() == 1);
+    CHECK(upstream[0].as_string() == "tools");  // no mmproj
+    CHECK(prof->find("configured_context_length") == nullptr);  // no runtime context fit
     CHECK(data[1].find("sonder")->find("profile") == nullptr);
     const auto& profiles = doc.find("sonder")->find("profiles")->as_array();
     REQUIRE(profiles.size() == 1);
@@ -836,6 +873,111 @@ TEST_CASE("models: launch profile metadata is additive and sampling defaults rea
     CHECK_FALSE(plain.is_explicit(si::SamplingConfig::kTemperature));
     CHECK_FALSE(plain.is_explicit(si::SamplingConfig::kTopK));
     CHECK(plain.top_k == si::SamplingConfig{}.top_k);
+}
+
+TEST_CASE("launch profile metadata: endpoint vs upstream capabilities") {
+    LaunchProfile p = parse_single(R"({"name":"v","backend":"llamaserver","model":"m.gguf","mmproj":"mm.gguf",
+        "speculative":{"types":["draft-mtp"]}})");
+    json::Object meta = si::launch_profile_metadata(p, std::nullopt, std::nullopt);
+    const auto& caps = meta.find("capabilities")->as_array();
+    REQUIRE(caps.size() == 1);
+    CHECK(caps[0].as_string() == "speculative");
+    const auto& upstream = meta.find("upstream_capabilities")->as_array();
+    REQUIRE(upstream.size() == 3);
+    CHECK(upstream[0].as_string() == "vision");
+    CHECK(upstream[1].as_string() == "tools");
+    CHECK(upstream[2].as_string() == "speculative");
+    CHECK(meta.find("estimated_vram_mib")->is_null());
+    p.jinja = false;
+    p.speculative.reset();
+    meta = si::launch_profile_metadata(p, std::nullopt, std::nullopt);
+    CHECK(meta.find("capabilities")->as_array().empty());
+    const auto& vision_only = meta.find("upstream_capabilities")->as_array();
+    REQUIRE(vision_only.size() == 1);
+    CHECK(vision_only[0].as_string() == "vision");
+}
+
+namespace {
+
+// A server with one launch-profile model on a backend that reports `rt`.
+struct RuntimeProfileFixture {
+    std::shared_ptr<RecordingBackend> backend = std::make_shared<RecordingBackend>();
+    std::unique_ptr<Fixture> fixture;
+
+    explicit RuntimeProfileFixture(const si::BackendRuntimeStatus& rt) {
+        backend->runtime = rt;  // before the server starts
+        auto o = Fixture::defaults();
+        o.backend.backend.clear();
+        o.backend_instance = backend;
+        o.models = {"qwen-profile"};
+        LaunchProfile p = parse_single(kMeasuredProfile);
+        p.name = "qwen-profile";
+        si::VramEstimate estimate;
+        estimate.total_bytes = 15000ull << 20;
+        srv::ModelProfileBinding binding;
+        binding.model = "qwen-profile";
+        binding.load_name = "mock:weights.gguf";
+        binding.metadata = si::launch_profile_metadata(p, estimate, 15500);
+        o.profile_bindings.push_back(binding);
+        json::Object served_entry = binding.metadata;
+        served_entry.set("served", true);
+        o.profile_catalog.emplace_back(served_entry);
+        json::Object other_entry = binding.metadata;
+        other_entry.set("name", "other");
+        other_entry.set("served", false);
+        o.profile_catalog.emplace_back(other_entry);
+        fixture = std::make_unique<Fixture>(o);
+    }
+};
+
+}  // namespace
+
+TEST_CASE("models: a context reduced at run time (spill guard auto_fit) replaces the profile's context_length") {
+    si::BackendRuntimeStatus rt;
+    rt.context.policy = "auto_fit";
+    rt.context.configured_ctx = 100096;
+    rt.context.fitted_ctx = 84992;
+    rt.context.fit_attempts = 1;
+    rt.context.outcome = "fitted";
+    RuntimeProfileFixture f(rt);
+
+    const Reply r = get(f.fixture->port, "/v1/models");
+    REQUIRE(r.status == 200);
+    const json::Value doc = r.json();
+    const auto& data = doc.find("data")->as_array();
+    REQUIRE(data.size() == 1);
+    const json::Value* ext = data[0].find("sonder");
+    const json::Value* prof = ext->find("profile");
+    REQUIRE(prof != nullptr);
+    CHECK(prof->find("context_length")->as_int() == 84992);
+    CHECK(prof->find("configured_context_length")->as_int() == 100096);
+    CHECK(prof->find("estimated_vram_mib")->as_int() == 15000);  // for the configured context
+    // The runtime object from the backend sits beside the profile, unchanged.
+    REQUIRE(ext->find("runtime") != nullptr);
+    CHECK(ext->find("runtime")->find("context")->find("fitted_ctx")->as_int() == 84992);
+    const auto& profiles = doc.find("sonder")->find("profiles")->as_array();
+    REQUIRE(profiles.size() == 2);
+    CHECK(profiles[0].find("context_length")->as_int() == 84992);
+    CHECK(profiles[0].find("configured_context_length")->as_int() == 100096);
+    // Only the served profile runs with the fitted context.
+    CHECK(profiles[1].find("context_length")->as_int() == 100096);
+    CHECK(profiles[1].find("configured_context_length") == nullptr);
+}
+
+TEST_CASE("models: a runtime context equal to the profile's leaves the profile unchanged") {
+    si::BackendRuntimeStatus rt;
+    rt.context.policy = "warn";
+    rt.context.configured_ctx = 100096;
+    rt.context.fitted_ctx = 100096;
+    rt.context.outcome = "not_needed";
+    RuntimeProfileFixture f(rt);
+    const Reply r = get(f.fixture->port, "/v1/models");
+    REQUIRE(r.status == 200);
+    const json::Value doc = r.json();
+    const json::Value* prof = doc.find("data")->as_array().at(0).find("sonder")->find("profile");
+    REQUIRE(prof != nullptr);
+    CHECK(prof->find("context_length")->as_int() == 100096);
+    CHECK(prof->find("configured_context_length") == nullptr);
 }
 
 TEST_CASE("models: without launch profiles the response has no profile fields") {

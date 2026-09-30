@@ -209,3 +209,11 @@ Everything lives in the server module (`src/server`); see
   `data[].sonder.profile` and `sonder.profiles` only when a profile is served.
 - Windows VRAM detection uses DXGI (`dxgi.lib` via `#pragma comment`, MSVC
   only); other platforms need `vram_budget_mib` or `--vram-budget-mib`.
+- **Runtime status interplay** (#35, VRAM-spill guard). Rebased onto it:
+  `data[].sonder` carries `runtime` (from #35, when the backend reports it)
+  and `profile` (from this branch) side by side. When the running context
+  differs from the profile's (spill guard `auto_fit`), the served profile's
+  `context_length` is the running value and `configured_context_length` the
+  profile's. `capabilities` lists only what Sonder's endpoint accepts;
+  `vision`/`tools` are in `upstream_capabilities` because
+  `/v1/chat/completions` rejects tool definitions and image content.
