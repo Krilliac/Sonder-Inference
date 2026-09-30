@@ -73,7 +73,7 @@ TEST_CASE("streams deterministic output") {
     CHECK(other.text != a.text);
 }
 
-TEST_CASE("greedy ignores the seed; sampling honours it") {
+TEST_CASE("greedy ignores the seed, sampling honours it") {
     auto m = load_mock();
     CHECK(run(*m, "p", SamplingConfig::greedy(12, 1)).text == run(*m, "p", SamplingConfig::greedy(12, 2)).text);
     SamplingConfig s1 = SamplingConfig::greedy(12, 1);
