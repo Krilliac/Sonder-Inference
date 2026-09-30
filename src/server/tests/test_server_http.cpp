@@ -381,7 +381,7 @@ TEST_CASE("lingering close: a client that sends its whole body first still reads
     CHECK(get(f.port, "/v1/sonder/health", {{"Authorization", "Bearer secret-token"}}).status == 200);
 }
 
-TEST_CASE("expect: 100-continue is answered before the body is read; other expectations get 417") {
+TEST_CASE("expect: 100-continue is answered before the body is read, other expectations get 417") {
     Fixture f;
     const std::string body = chat_body(R"(,"max_tokens":2)");
     {
