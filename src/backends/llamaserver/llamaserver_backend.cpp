@@ -7,6 +7,7 @@
 
 #include "llamaserver_protocol.hpp"
 #include "net/http_client.hpp"
+#include "prefix_warmup.hpp"
 #include "slot_affinity.hpp"
 #include "supervisor.hpp"
 
@@ -183,6 +184,8 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
   public:
     explicit LlamaServerBackendImpl(LlamaServerBackendOptions options)
         : options_(std::move(options)), validation_(validate_options(options_)) {
+        if (validation_.ok() && !options_.warmup.messages_file.empty())
+            warmup_ = std::make_shared<llamaserver::PrefixWarmup>(options_);
         if (validation_.ok() && options_.mode == LlamaServerMode::spawn) {
             llamaserver::SupervisorOptions s;
             s.environment = options_.environment;
@@ -197,8 +200,17 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             s.spill_guard = spill_guard_options(options_.spill_guard);
             s.log_file = options_.diagnostics.log_file;
             s.kv_pairing_check = options_.diagnostics.kv_pairing_check;
+            s.warmup = warmup_;
             supervisor_ = std::make_unique<llamaserver::Supervisor>(std::move(s));
         }
+        if (validation_.ok() && warmup_ && options_.mode == LlamaServerMode::attach)
+            warmup_->start(options_.base_url, true);
+    }
+    ~LlamaServerBackendImpl() override {
+        if (supervisor_)
+            supervisor_->stop();
+        if (warmup_)
+            warmup_->stop();
     }
     std::string name() const override { return kLlamaServerBackendName; }
     std::string description() const override {
@@ -252,12 +264,18 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         return slot_action(slot, filename, "restore");
     }
     const LlamaServerBackendOptions &options() const { return options_; }
-    // Spawn mode only: attach mode has no child to measure, so it reports
-    // nothing and its responses stay unchanged.
+    // Spawn mode contributes child diagnostics; attach mode contributes only
+    // configured warm-up status, preserving nullopt when warm-up is disabled.
     std::optional<BackendRuntimeStatus> runtime_status() const override {
-        if (!supervisor_)
+        if (!supervisor_ && !warmup_)
             return std::nullopt;
-        return supervisor_->runtime_status();
+        auto status = supervisor_ ? supervisor_->runtime_status() : BackendRuntimeStatus{};
+        if (warmup_) {
+            status.warmup = warmup_->status();
+            const auto warnings = warmup_->warnings();
+            status.warnings.insert(status.warnings.end(), warnings.begin(), warnings.end());
+        }
+        return status;
     }
 
     Result<std::string> endpoint(const CancellationToken &cancel) {
@@ -358,7 +376,8 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             return e;
         e.cache_prompt = true;
         if (options_.slot_affinity) {
-            lease = slots_.acquire(session_key, props.total_slots);
+            lease = slots_.acquire(session_key, props.total_slots,
+                                   warmup_ ? warmup_->warmed_slots() : std::vector<std::uint32_t>{});
             e.id_slot = lease.slot();
         }
         return e;
@@ -412,6 +431,7 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
     std::string props_key_;
     llamaserver::ServerProps props_;
     llamaserver::SlotAffinity slots_;
+    std::shared_ptr<llamaserver::PrefixWarmup> warmup_;
 };
 
 class LlamaServerModel final : public BackendModel {

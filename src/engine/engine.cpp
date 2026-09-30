@@ -100,6 +100,23 @@ void Engine::sample_backend_runtime() {
             continue;
         }
         const std::string name = backend->name();
+        if (status->warmup) {
+            const auto& warmup = *status->warmup;
+            auto& [generation, slots] = runtime_warmups_seen_[name];
+            if (generation != warmup.generation) {
+                generation = warmup.generation;
+                slots.clear();
+            }
+            for (const auto& slot : warmup.slots) {
+                if (slot.status != "complete" && slot.status != "error" && slot.status != "cancelled") continue;
+                if (std::find(slots.begin(), slots.end(), slot.id_slot) != slots.end() || slots.size() >= 1024) continue;
+                slots.push_back(slot.id_slot);
+                auto attrs = to_json(slot);
+                attrs.set("backend", name);
+                attrs.set("generation", generation);
+                telemetry_->emit("backend.warmup", engine_context(), std::move(attrs), TelemetryLevel::metrics);
+            }
+        }
         const auto& gpu = status->gpu_memory;
         auto& seen = runtime_samples_seen_[name];
         if (gpu.status == "ok" && gpu.samples != seen) {

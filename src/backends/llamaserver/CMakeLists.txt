@@ -7,6 +7,7 @@ sonder_module_sources(
     log_diagnostics.cpp
     process.cpp
     process_options.cpp
+    prefix_warmup.cpp
     slot_affinity.cpp
     supervisor.cpp
     tune.cpp

@@ -57,6 +57,8 @@ Gate: measurable win on agent fan-out/long-context workloads without interactive
   Windows; warn / refuse / bounded `auto_fit` context step-down), KV cache
   pairing check and llama-server log diagnostics, surfaced additively on
   health, `/v1/models` and telemetry ([vram-spill](integration/vram-spill.md))
+- [x] llamaserver slot prefix warm-up after readiness and supervised restart
+  (bounded, per-slot, cancellable; `docs/integration/llama-server.md`)
 - [ ] adaptive speculation policy
 - [x] `sonder-infer tune`: bounded llama-server calibration, PDH spill qualification,
   per-profile context margin, and spawn-config output with two recommendations

@@ -17,6 +17,8 @@
 
 namespace sonder::inference::llamaserver {
 
+class PrefixWarmup;
+
 struct SupervisorOptions {
     std::string executable;
     std::vector<std::string> arguments;
@@ -42,6 +44,8 @@ struct SupervisorOptions {
     bool kv_pairing_check = true;
     std::vector<std::pair<std::string, std::string>> environment;
     std::string output_file;
+    // Optional best-effort prefix replay, started after each accepted child.
+    std::shared_ptr<PrefixWarmup> warmup;
 };
 
 class Supervisor {
