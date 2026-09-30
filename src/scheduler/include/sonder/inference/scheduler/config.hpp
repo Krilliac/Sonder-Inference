@@ -7,6 +7,10 @@
 namespace sonder::inference::scheduler {
 
 struct SchedulerConfig {
+    /// Hosted strict admission: rank by explicit class and FIFO within class.
+    /// Aging, lookahead bypass and priority preemption are disabled by the
+    /// runtime when this mode is selected.
+    bool strict_priority_admission = false;
     // ---- Per-step budgets (continuous batching) ----
     /// Maximum tokens (prefill + decode) processed in one engine step.
     TokenCount max_step_tokens = 2048;

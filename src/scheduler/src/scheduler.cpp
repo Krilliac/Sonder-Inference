@@ -105,10 +105,11 @@ bool Scheduler::running_better(const Sequence& a, const Sequence& b) const noexc
 }
 
 bool Scheduler::is_starving(const Sequence& s, TimeUs now) const noexcept {
-    return now - s.enqueued_at >= config_.starvation_threshold_us;
+    return !config_.strict_priority_admission && now - s.enqueued_at >= config_.starvation_threshold_us;
 }
 
 int Scheduler::waiting_rank(const Sequence& s, TimeUs now) const noexcept {
+    if (config_.strict_priority_admission) return s.base_rank;
     if (is_starving(s, now)) return kStarvingRank;
     const TimeUs age = std::max<TimeUs>(0, now - s.enqueued_at);
     const auto boost = static_cast<int>(
@@ -124,6 +125,9 @@ std::vector<RequestId> Scheduler::sorted_waiting(TimeUs now) const {
         const int ra = waiting_rank(sa, now);
         const int rb = waiting_rank(sb, now);
         if (ra != rb) return ra < rb;
+        if (config_.strict_priority_admission) {
+            return sa.spec.admission_order.value_or(sa.submit_order) < sb.spec.admission_order.value_or(sb.submit_order);
+        }
         if (sa.base_rank != sb.base_rank) return sa.base_rank < sb.base_rank;
         if (sa.enqueued_at != sb.enqueued_at) return sa.enqueued_at < sb.enqueued_at;
         return sa.submit_order < sb.submit_order;
@@ -351,7 +355,7 @@ void Scheduler::schedule_prefill(StepPlan& plan, Budget& budget) {
 
 bool Scheduler::try_priority_preemption(StepPlan& plan, Budget& budget, const Sequence& cand,
                                         BlockCount need, TimeUs now) {
-    if (!config_.enable_priority_preemption) return false;
+    if (config_.strict_priority_admission || !config_.enable_priority_preemption) return false;
     const int cand_rank = cand.base_rank;
     auto order = sorted_running_best_first();
     std::vector<RequestId> victims;
@@ -381,20 +385,34 @@ void Scheduler::admit(StepPlan& plan, Budget& budget, TimeUs now) {
         auto it = seqs_.find(id);
         if (it == seqs_.end() || is_terminal(it->second.state)) continue;
         Sequence& s = it->second;
+        if (s.spec.admission_ready && !s.spec.admission_ready()) continue;
 
         const bool resumes_decode = s.swapped && s.prefill_done == s.prefill_target;
         if (!resumes_decode && budget.prefill_tokens == 0) break;
 
         // Reserve the whole (re)prefill context up front; decode growth is
         // reserved block-by-block, protected by the admission watermark.
-        const TokenCount ctx = s.swapped ? std::max(s.kv_tokens, s.prefill_target) : s.prefill_target;
+        const TokenCount ctx = config_.strict_priority_admission
+                                   ? static_cast<TokenCount>(s.spec.prompt_tokens + s.spec.max_new_tokens)
+                                   : (s.swapped ? std::max(s.kv_tokens, s.prefill_target) : s.prefill_target);
         const BlockCount need = blocks_for_tokens(ctx, bs);
-        const BlockCount watermark = running_.empty() ? 0 : config_.admission_watermark_blocks;
+        const BlockCount watermark = config_.strict_priority_admission
+                                         ? 0
+                                         : (running_.empty() ? 0 : config_.admission_watermark_blocks);
         bool fits = kv_.free_blocks() >= need + watermark;
         if (!fits && try_priority_preemption(plan, budget, s, need, now)) {
             fits = kv_.free_blocks() >= need + (running_.empty() ? 0 : watermark);
         }
-        if (fits && !kv_.try_reserve(id, need)) fits = false;
+        if (fits && kv_.try_reserve(id, need)) {
+            if (s.spec.try_admit && !s.spec.try_admit()) {
+                kv_.release(id);
+                // A class at its concurrency cap must not stall another
+                // eligible class. The admission ticket enforces global order.
+                continue;
+            }
+        } else if (fits) {
+            fits = false;
+        }
 
         if (!fits) {
             if (!head_blocked) {
@@ -403,7 +421,7 @@ void Scheduler::admit(StepPlan& plan, Budget& budget, TimeUs now) {
                 // Never bypass a starving or top-urgency request.
                 if (is_starving(s, now) || s.base_rank <= 0) break;
             }
-            if (++bypassed > config_.admission_lookahead) break;
+            if (config_.strict_priority_admission || ++bypassed > config_.admission_lookahead) break;
             continue;
         }
 

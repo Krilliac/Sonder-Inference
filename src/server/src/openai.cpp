@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <limits>
+#include <string_view>
 
 #include "sonder/inference/server.hpp"
 
@@ -44,6 +45,67 @@ ApiError bad(std::string code, std::string message, std::optional<std::string> p
 }
 
 bool present(const json::Value* v) { return v != nullptr && !v->is_null(); }
+
+std::optional<RequestPriority> parse_request_priority_impl(std::string_view value) noexcept {
+    if (value == "interactive") return RequestPriority::interactive;
+    if (value == "subagent") return RequestPriority::subagent;
+    if (value == "background") return RequestPriority::background;
+    return std::nullopt;
+}
+
+// Preserve the original X-Sonder-Priority wire contract.  This parser is
+// intentionally separate from the class-name parser: numeric values carry
+// the scheduler/telemetry integer, while class names only select admission.
+std::optional<int> parse_numeric_priority_impl(std::string_view value) noexcept {
+    bool negative = false;
+    if (!value.empty() && (value.front() == '-' || value.front() == '+')) {
+        negative = value.front() == '-';
+        value.remove_prefix(1);
+    }
+    if (value.empty() || value.size() > 2 || value.find_first_not_of("0123456789") != std::string_view::npos) {
+        return std::nullopt;
+    }
+    int parsed = 0;
+    for (const char ch : value) parsed = parsed * 10 + (ch - '0');
+    parsed = negative ? -parsed : parsed;
+    if (parsed < -16 || parsed > 16) return std::nullopt;
+    return parsed;
+}
+
+bool looks_numeric_priority(std::string_view value) noexcept {
+    if (!value.empty() && (value.front() == '-' || value.front() == '+')) value.remove_prefix(1);
+    return !value.empty() && value.find_first_not_of("0123456789") == std::string_view::npos;
+}
+
+std::optional<std::uint64_t> parse_deadline_ms_impl(const json::Value& value) noexcept {
+    if (value.is_integer()) {
+        const auto n = value.as_uint(std::numeric_limits<std::uint64_t>::max());
+        if (n == 0 || n > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) return std::nullopt;
+        return n;
+    }
+    if (value.is_number() && std::isfinite(value.as_double()) && value.as_double() > 0.0 &&
+        std::floor(value.as_double()) == value.as_double() &&
+        value.as_double() <= static_cast<double>(std::numeric_limits<std::int32_t>::max())) {
+        return static_cast<std::uint64_t>(value.as_double());
+    }
+    return std::nullopt;
+}
+
+std::optional<ApiError> read_request_hints(const json::Object& body, ChatJob& job) {
+    if (const json::Value* p = body.find("priority")) {
+        if (!p->is_string() || !parse_request_priority_impl(p->as_string())) {
+            return bad("invalid_request", "priority must be interactive, subagent or background", "priority");
+        }
+        job.priority_class = parse_request_priority_impl(p->as_string());
+    }
+    if (const json::Value* d = body.find("deadline_ms")) {
+        job.deadline_ms = parse_deadline_ms_impl(*d);
+        if (!job.deadline_ms) {
+            return bad("invalid_request", "deadline_ms must be a positive integer", "deadline_ms");
+        }
+    }
+    return std::nullopt;
+}
 
 // Numeric field as float; error when it is not a finite number.
 std::optional<ApiError> read_float(const json::Object& body, const char* key, float& out) {
@@ -249,6 +311,14 @@ std::optional<ApiError> read_chat_extensions(const json::Object& body, ChatJob& 
 
 }  // namespace
 
+std::optional<RequestPriority> parse_request_priority(std::string_view value) noexcept {
+    return parse_request_priority_impl(value);
+}
+
+std::optional<std::uint64_t> parse_deadline_ms(const json::Value& value) noexcept {
+    return parse_deadline_ms_impl(value);
+}
+
 std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body_text) {
     auto parsed = json::parse(body_text);
     if (!parsed.ok()) {
@@ -328,8 +398,8 @@ std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body_text) {
     if (Status st = validate_chat_messages(job.messages); !st.ok()) {
         return bad("invalid_messages", st.message(), "messages");
     }
-
-    if (auto e = read_chat_extensions(body, job)) {
+    if (auto e = read_chat_extensions(body, job)) return *e;
+    if (auto e = read_request_hints(body, job)) {
         return *e;
     }
 
@@ -357,6 +427,11 @@ std::optional<WorkloadClass> parse_workload(std::string_view name) noexcept {
 }
 
 std::variant<Correlation, ApiError> parse_correlation(const RequestHead& head) {
+    for (const auto* name : {"x-sonder-priority", "x-sonder-deadline-ms"}) {
+        std::size_t count = 0;
+        for (const auto& field : head.headers) if (field.first == name) ++count;
+        if (count > 1) return bad("invalid_correlation_header", std::string(name) + " must occur once", name);
+    }
     Correlation c;
     const auto id_header = [&head](const char* lower, const char* display,
                                    std::optional<std::string>& out) -> std::optional<ApiError> {
@@ -386,23 +461,39 @@ std::variant<Correlation, ApiError> parse_correlation(const RequestHead& head) {
         c.workload = *parsed;
     }
     if (const std::string* p = head.header("x-sonder-priority")) {
-        std::string_view text = *p;
-        bool negative = false;
-        if (!text.empty() && (text.front() == '-' || text.front() == '+')) {
-            negative = text.front() == '-';
-            text.remove_prefix(1);
-        }
-        if (text.empty() || text.size() > 2 || text.find_first_not_of("0123456789") != std::string_view::npos) {
+        if (const auto numeric = parse_numeric_priority_impl(*p)) {
+            c.priority = *numeric;
+            c.numeric_priority = true;
+            c.priority_class = RequestPriority::interactive;
+        } else if (looks_numeric_priority(*p)) {
             return bad("invalid_correlation_header", "X-Sonder-Priority must be an integer from -16 to 16",
                        "X-Sonder-Priority");
-        }
-        int v = std::stoi(std::string(text));
-        v = negative ? -v : v;
-        if (v < -16 || v > 16) {
-            return bad("invalid_correlation_header", "X-Sonder-Priority must be an integer from -16 to 16",
+        } else if (const auto class_name = parse_request_priority(*p)) {
+            c.priority_class = *class_name;
+        } else {
+            return bad("invalid_correlation_header",
+                       "X-Sonder-Priority must be an integer from -16 to 16 or interactive, subagent or background",
                        "X-Sonder-Priority");
         }
-        c.priority = v;
+    }
+    if (const std::string* d = head.header("x-sonder-deadline-ms")) {
+        // Header parsing is deliberately strict decimal text; avoid floating
+        // point conversion so uint64_t boundaries remain unambiguous.
+        if (d->empty() || d->find_first_not_of("0123456789") != std::string::npos || d->size() > 20) {
+            return bad("invalid_correlation_header", "X-Sonder-Deadline-Ms must be a positive integer", "X-Sonder-Deadline-Ms");
+        }
+        std::uint64_t n = 0;
+        for (char ch : *d) {
+            const auto digit = static_cast<unsigned>(ch - '0');
+            if (n > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
+                return bad("invalid_correlation_header", "X-Sonder-Deadline-Ms is out of range", "X-Sonder-Deadline-Ms");
+            }
+            n = n * 10 + digit;
+        }
+        if (n == 0 || n > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+            return bad("invalid_correlation_header", "X-Sonder-Deadline-Ms must be a positive integer within 32-bit milliseconds", "X-Sonder-Deadline-Ms");
+        }
+        c.deadline_ms = n;
     }
     return c;
 }

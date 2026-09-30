@@ -19,6 +19,7 @@
 #include "identity.hpp"
 #include "live_hub.hpp"
 #include "openai.hpp"
+#include "priority_admission.hpp"
 #include "request_path.hpp"
 #include "residency.hpp"
 #include "socket.hpp"
@@ -47,7 +48,8 @@ const std::vector<std::string>& default_origins() {
 
 constexpr const char* kAllowHeaders =
     "Accept, Authorization, Cache-Control, Content-Type, Last-Event-ID, X-Sonder-Run-Id, "
-    "X-Sonder-Parent-Request-Id, X-Sonder-Agent-Id, X-Sonder-Task-Id, X-Sonder-Workload, X-Sonder-Priority";
+    "X-Sonder-Parent-Request-Id, X-Sonder-Agent-Id, X-Sonder-Task-Id, X-Sonder-Workload, X-Sonder-Priority, "
+    "X-Sonder-Deadline-Ms";
 constexpr const char* kExposeHeaders = "X-Sonder-Inference-Api, X-Sonder-Request-Id, Retry-After";
 
 enum class State { starting, ready, draining, stopped };
@@ -285,6 +287,7 @@ struct Server::Impl {
     std::mutex inflight_mu;
     std::condition_variable inflight_cv;
     std::set<std::shared_ptr<Session>> inflight;
+    PriorityAdmission admission;
 
     std::once_flag stop_once;
     std::mutex stopped_mu;
@@ -600,6 +603,7 @@ struct Server::Impl {
                 dropped = engine->telemetry().dropped_events();
             }
         }
+        const auto queued = admission.queued();
         json::Object body{{"status", state_name(s)},
                           {"api_version", kApiVersion},
                           {"version", version_string()},
@@ -612,6 +616,9 @@ struct Server::Impl {
                           {"auth_required", !opts.token.empty()},
                           {"backends", std::move(backends)},
                           {"models", std::move(models)},
+                          {"queued_by_class", json::Object{{"interactive", queued[0]},
+                                                           {"subagent", queued[1]},
+                                                           {"background", queued[2]}}},
                           {"residency", residency_summary()},
                           {"telemetry", json::Object{{"level", to_string(opts.telemetry_level)},
                                                      {"subscribers", hs.subscribers},
@@ -843,6 +850,12 @@ struct Server::Impl {
             return;
         }
         const ChatJob job = std::move(std::get<ChatJob>(job_v));
+        const RequestPriority priority = corr.priority_class.value_or(
+            job.priority_class.value_or(RequestPriority::interactive));
+        const auto deadline_ms = corr.deadline_ms ? corr.deadline_ms : job.deadline_ms;
+        const auto deadline = deadline_ms
+            ? ex.started + std::chrono::milliseconds(static_cast<std::int64_t>(*deadline_ms))
+            : std::chrono::steady_clock::time_point::max();
         if (!require_ready(ex)) {
             return;
         }
@@ -901,6 +914,10 @@ struct Server::Impl {
         ro.session_key = chat_session_key(job, corr);
         ro.thinking = job.thinking;
         const std::vector<std::string> warnings = apply_thinking_pins(opts, ro.thinking);
+        ro.priority_class = priority;
+        ro.preserve_numeric_priority = corr.numeric_priority;
+        if (deadline_ms) ro.deadline = deadline;
+        std::atomic<bool> backend_started{false};
         const std::string completion_id = "chatcmpl-" + *ro.request_id;
         // X-Sonder-Request-Id and the access log carry the engine request id.
         ex.request_id = *ro.request_id;
@@ -911,12 +928,21 @@ struct Server::Impl {
         std::condition_variable watch_cv;
         bool watch_done = false;
         std::atomic<bool> disconnected{false};
+        ro.on_backend_start = [&] {
+            if (disconnected.load() || hard_stop.load() || std::chrono::steady_clock::now() >= deadline) {
+                session->cancel();
+                return;
+            }
+            backend_started.store(true);
+        };
+        std::shared_ptr<PriorityAdmission::Ticket> ticket;
         std::thread watcher;
         // Stops and joins the watcher and leaves `inflight` on every exit,
         // including an exception out of the chat call: a joinable std::thread
         // destroyed during unwinding would call std::terminate.
         bool left_inflight = false;
         const auto end_request = [&] {
+            if (ticket) ticket->release();
             {
                 std::lock_guard<std::mutex> lock(watch_mu);
                 watch_done = true;
@@ -950,8 +976,8 @@ struct Server::Impl {
                     if (peer_gone(ex.sock)) {
                         disconnected.store(true);
                         session->cancel();
-                        return;
                     }
+                    if (std::chrono::steady_clock::now() >= deadline) session->cancel();
                     lock.lock();
                     watch_cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return watch_done; });
                 }
@@ -968,6 +994,42 @@ struct Server::Impl {
             e.retry_after = 1;
             send_error(ex, e);
             return;
+        }
+
+        if (priority_admission_enabled(opts)) {
+            ticket = admission.enqueue(priority, [&] {
+                return disconnected.load() || session->state() == SessionState::closed || hard_stop.load();
+            }, deadline);
+            if (ticket->outcome() != PriorityAdmission::Outcome::admitted) {
+                json::Object attrs{{"kind", "chat"},
+                                   {"priority_class", to_string(priority)},
+                                   {"admission", json::Object{{"priority", to_string(priority)},
+                                                               {"queue_ms", ticket->queue_ms()}}},
+                                   {"error_code", ticket->outcome() == PriorityAdmission::Outcome::full
+                                                      ? "overloaded"
+                                                      : ticket->outcome() == PriorityAdmission::Outcome::expired
+                                                      ? "deadline_exceeded" : "cancelled"},
+                                   {"backend_started", false}};
+                if (ro.parent_request_id) attrs.set("parent_request_id", *ro.parent_request_id);
+                engine_ptr()->telemetry().emit(disconnected.load() ? "request.cancelled" : "request.failed",
+                                               session->telemetry_context(ro.request_id), std::move(attrs),
+                                               TelemetryLevel::metrics);
+                end_request();
+                if (disconnected.load()) {
+                    ex.status = 499;
+                } else {
+                    ApiError error = ticket->outcome() == PriorityAdmission::Outcome::expired
+                        ? make_error(504, "deadline_exceeded", "request deadline expired while queued; nothing was executed")
+                        : ticket->outcome() == PriorityAdmission::Outcome::full
+                        ? make_error(429, "overloaded", "request priority queue is full; nothing was executed")
+                        : make_error(503, "not_ready", "request cancelled while queued; nothing was executed");
+                    if (error.status == 429) error.retry_after = 1;
+                    send_error(ex, error);
+                }
+                session->close();
+                return;
+            }
+            ro.admission = ticket;
         }
 
         bool headers_sent = false;
@@ -1027,6 +1089,11 @@ struct Server::Impl {
         if (disconnected.load() || write_failed) {
             ex.status = 499;  // client closed the request (access log only)
             session->close();
+            return;
+        }
+        if (deadline_ms && !backend_started.load() && std::chrono::steady_clock::now() >= deadline) {
+            session->close();
+            send_error(ex, make_error(504, "deadline_exceeded", "request deadline expired while queued; nothing was executed"));
             return;
         }
         if (!result.ok()) {
@@ -1584,6 +1651,9 @@ struct Server::Impl {
         }
         eo.server = EngineServerInfo{opts.host, bound_port, kApiVersion};
         apply_scheduling(opts, eo.scheduling);
+        // Preserve the origin scheduler's default ordering unless the
+        // operator actually enabled the server-side priority policy.
+        eo.scheduling.strict_priority_admission = priority_admission_enabled(opts);
         {
             std::lock_guard<std::mutex> lock(engine_mu);
             engine = std::make_unique<Engine>(std::move(eo));
@@ -1691,6 +1761,15 @@ struct Server::Impl {
             start_probe_refresher(made);
             // Idle-TTL evictions (no thread unless --model-idle-ttl is set).
             residency->start_sweeper();
+        }
+        // A backend that does not advertise slots is intentionally left
+        // ungated.  In particular, remote backends may already run multiple
+        // requests (for example Ollama NUM_PARALLEL or a worker pool).
+        if (priority_admission_enabled(opts)) {
+            const std::size_t capacity = opts.backend_capacity != 0 ? opts.backend_capacity
+                                                                   : made->max_concurrent_requests();
+            admission.configure(capacity, opts.max_concurrent_subagent, opts.max_concurrent_background,
+                                opts.max_queue_per_class);
         }
         State expected = State::starting;
         state.compare_exchange_strong(expected, State::ready);

@@ -233,6 +233,16 @@ TEST_CASE("openai: correlation headers") {
     CHECK(c.parent_request_id == std::optional<std::string>("turn:42"));
     CHECK(c.workload == WorkloadClass::maintenance);
     CHECK(c.priority == -16);
+    CHECK(c.priority_class == RequestPriority::interactive);
+
+    for (const auto* value : {"interactive", "subagent", "background"}) {
+        RequestHead class_head;
+        class_head.headers = {{"x-sonder-priority", value}};
+        const auto class_result = parse_correlation(class_head);
+        REQUIRE(std::holds_alternative<Correlation>(class_result));
+        CHECK(std::get<Correlation>(class_result).priority == 0);
+        CHECK(std::get<Correlation>(class_result).priority_class == parse_request_priority(value));
+    }
 
     RequestHead none;
     const auto defaults = parse_correlation(none);
@@ -244,6 +254,7 @@ TEST_CASE("openai: correlation headers") {
              {"x-sonder-agent-id", std::string(129, 'a')},
              {"x-sonder-workload", "urgent"},
              {"x-sonder-priority", "17"},
+             {"x-sonder-priority", "backgroundx"},
              {"x-sonder-priority", "1.5"},
              {"x-sonder-priority", ""}}) {
         RequestHead bad;

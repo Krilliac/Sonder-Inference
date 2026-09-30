@@ -17,7 +17,9 @@ namespace sonder::inference::server::detail {
 
 // Flags parsed by parse_request_path_flags() (all take a value).
 inline constexpr const char* kRequestPathFlags[] = {"scheduler", "kv-pool-tokens", "pin-enable-thinking",
-                                                    "pin-reasoning-effort"};
+                                                    "pin-reasoning-effort", "max-concurrent-subagent",
+                                                    "max-concurrent-background", "max-queue-per-class",
+                                                    "backend-capacity", "priority-admission"};
 
 // Usage lines for the flags above.
 inline constexpr const char* kRequestPathUsage =
@@ -29,7 +31,15 @@ inline constexpr const char* kRequestPathUsage =
     "  --pin-enable-thinking on|off  send chat_template_kwargs.enable_thinking (llama-server)\n"
     "                          / think (ollama) on every chat request; a request that\n"
     "                          asks otherwise is overridden and warned (sonder.warnings)\n"
-    "  --pin-reasoning-effort E  same for chat_template_kwargs.reasoning_effort\n";
+    "  --pin-reasoning-effort E  same for chat_template_kwargs.reasoning_effort\n"
+    "  --max-concurrent-subagent N  cap running subagent requests (0 = unlimited)\n"
+    "  --max-concurrent-background N  cap running background requests (0 = unlimited)\n"
+    "  --max-queue-per-class N  cap queued requests in each class (0 = unlimited)\n"
+    "  --backend-capacity N  explicit request capacity when admission is enabled\n"
+    "                          (0 = backend-reported; unknown stays ungated)\n"
+    "  --priority-admission auto|on|off  class/capacity admission policy (default auto)\n"
+    "                          auto enables only with a nonzero class or queue cap\n"
+    "                          on enables explicitly; off bypasses all admission caps\n";
 
 using FlagLookup = std::function<std::optional<std::string>(const std::string& name)>;
 
@@ -41,6 +51,10 @@ Status validate_request_path_options(const ServerOptions& o);
 
 // --scheduler and --kv-pool-tokens onto the engine's scheduling options.
 void apply_scheduling(const ServerOptions& o, SchedulingOptions& scheduling);
+
+// Whether the class admission layer is enabled before backend discovery.
+// Automatic mode is deliberately opt-in through explicit class/queue caps.
+[[nodiscard]] bool priority_admission_enabled(const ServerOptions& o);
 
 // Conversation key for backend cache affinity: prompt_cache_key when given,
 // else "run=<X-Sonder-Run-Id>;agent=<X-Sonder-Agent-Id>" (either part may
