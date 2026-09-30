@@ -44,6 +44,9 @@ class Supervisor {
   private:
     enum class State { idle, starting, ready, backoff, failed, stopped };
     Status wait_ready(Process &child, std::uint16_t port);
+    Result<std::uint16_t> settle_after_deadline(std::unique_lock<std::mutex> &lock,
+                                                const CancellationToken &cancel,
+                                                std::chrono::steady_clock::time_point deadline);
     bool pause(std::chrono::milliseconds duration);
     void monitor();
     void fail(Status status);

@@ -111,9 +111,28 @@ Result<std::uint16_t> Supervisor::start(const CancellationToken &cancel) {
         if (state_ == State::failed)
             return failure_;
         if (Clock::now() >= deadline)
-            return Status(ErrorCode::timeout, "llamaserver: readiness wait timed out");
+            return settle_after_deadline(lock, cancel, deadline);
         wake_.wait_until(lock, std::min(deadline, Clock::now() + Milliseconds(10)));
     }
+}
+
+Result<std::uint16_t> Supervisor::settle_after_deadline(std::unique_lock<std::mutex> &lock,
+                                                        const CancellationToken &cancel,
+                                                        Clock::time_point deadline) {
+    // The monitor may still be inside a health probe (up to one 250 ms budget)
+    // or stopping the child. Give it a bounded grace to publish its outcome so
+    // a timed-out start() never returns while the child is still running.
+    const auto grace_end = deadline + Milliseconds(250) + options_.shutdown_timeout;
+    while (state_ != State::ready && state_ != State::failed && !cancel.cancelled() &&
+           !shutdown_.cancelled() && Clock::now() < grace_end)
+        wake_.wait_until(lock, std::min(grace_end, Clock::now() + Milliseconds(10)));
+    if (state_ == State::ready)
+        return port_;
+    if (state_ == State::failed)
+        return failure_;
+    if (cancel.cancelled() || shutdown_.cancelled())
+        return Status(ErrorCode::cancelled, "llamaserver: readiness wait cancelled");
+    return Status(ErrorCode::timeout, "llamaserver: readiness wait timed out");
 }
 
 bool Supervisor::pause(Milliseconds duration) {
