@@ -185,6 +185,7 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         : options_(std::move(options)), validation_(validate_options(options_)) {
         if (validation_.ok() && options_.mode == LlamaServerMode::spawn) {
             llamaserver::SupervisorOptions s;
+            s.environment = options_.environment;
             s.executable = options_.executable;
             s.arguments = options_.args;
             s.readiness_timeout = options_.startup_timeout;

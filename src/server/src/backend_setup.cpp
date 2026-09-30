@@ -1,4 +1,5 @@
 #include "sonder/inference/backend_setup.hpp"
+#include "llamaserver_config_extensions.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -119,13 +120,14 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
             "native_completion", "grammar", "connect_timeout_ms", "request_timeout_ms", "startup_timeout_ms",
             "poll_interval_ms", "shutdown_timeout_ms", "restart_backoff_ms", "max_restart_backoff_ms",
             "max_restarts", "tls", "spill_guard", "log_file", "kv_pairing_check", "context_length",
-            "slot_affinity"};
+            "slot_affinity", "env", "results"};
         for (auto k : known) if (k == key) return false;
         return true;
     };
     for (const auto& member : object) {
         if (unknown(member.first)) return Status(ErrorCode::invalid_argument, "llamaserver config: unknown field '" + member.first + "'");
     }
+    if (auto st = load_llamaserver_extensions(object, setup.llamaserver_environment); !st.ok()) return st;
     const auto string_field = [&](const char* key, std::string& out) -> Status {
         if (const auto* v = object.find(key)) {
             if (!v->is_string()) return Status(ErrorCode::invalid_argument, std::string("llamaserver config: '") + key + "' must be a string");
@@ -301,6 +303,7 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
     if (setup.backend == "llamaserver") {
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
         LlamaServerBackendOptions lo;
+        lo.environment = setup.llamaserver_environment;
         if (!setup.llamaserver_mode.empty()) {
             if (setup.llamaserver_mode == "attach") lo.mode = LlamaServerMode::attach;
             else if (setup.llamaserver_mode == "spawn") lo.mode = LlamaServerMode::spawn;

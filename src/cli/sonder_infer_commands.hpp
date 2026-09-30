@@ -264,6 +264,26 @@ inline const CommandSpec& serve_command() {
     return spec;
 }
 
+inline const CommandSpec& tune_command() {
+    static const CommandSpec spec{"tune", "calibrate a non-spilling llama-server spawn profile (uses the GPU)",
+        {"tune --executable PATH --model GGUF [options]"},
+        {{"Calibration", {
+            {"executable", OptionKind::value, "PATH", "trusted llama-server executable"},
+            {"model", OptionKind::value, "GGUF", "local single-file model"},
+            {"mmproj", OptionKind::value, "PATH", "optional multimodal projector"},
+            {"out", OptionKind::value, "PATH", "spawn configuration and results (default tuned.json)"},
+            {"budget-minutes", OptionKind::value, "N", "wall-clock work budget, 0.1 to 1440 (default 20)"},
+            {"grid", OptionKind::value, "JSON", "inline grid JSON or a JSON file path (also @PATH)"},
+            {"env", OptionKind::repeat, "KEY=VALUE", "child-only environment override"},
+            {"thorough", OptionKind::flag, "", "also prefill near the candidate context"},
+            {"dry-run", OptionKind::flag, "", "print search space; no child, GPU probe or output file"}}}},
+        {"Close other GPU applications before calibrating. Windows PDH counters are required for a live run.\n"
+         "MTP requires both GGUF nextn tensors and executable --help support. See docs/integration/tune.md.",
+         commands_detail::kExitNote},
+        {"tune --executable llama-server.exe --model model.gguf --budget-minutes 20 --out tuned.json"}};
+    return spec;
+}
+
 inline const CommandSpec& help_command() {
     static const CommandSpec spec{"help",
                                   "show help for a command",
@@ -278,7 +298,7 @@ inline const CommandSpec& help_command() {
 inline const std::vector<const CommandSpec*>& all_commands() {
     static const std::vector<const CommandSpec*> list{&generate_command(), &chat_command(),     &serve_command(),
                                                       &bench_command(),    &models_command(),   &backends_command(),
-                                                      &devices_command(),  &version_command(),  &help_command()};
+                                                      &devices_command(),  &version_command(),  &tune_command(), &help_command()};
     return list;
 }
 

@@ -84,6 +84,7 @@ struct BackendSetup {
     // "slot_affinity" (id_slot pinning; docs/integration/llama-server.md).
     std::uint64_t llamaserver_context_length = 0;
     bool llamaserver_slot_affinity = true;
+    std::vector<std::pair<std::string, std::string>> llamaserver_environment;
 };
 
 // Values taken from the environment when the matching option is absent:

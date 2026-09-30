@@ -17,6 +17,7 @@ The HTTP server started by `sonder-infer serve` has its own reference:
 | `chat` | Chat with a model: one-shot from a messages file, or an interactive REPL on stdin. |
 | `serve` | Local HTTP API (OpenAI-compatible subset) and live telemetry; see [SERVER.md](SERVER.md). |
 | `bench` | Run the benchmark harness over a corpus and write JSON results (plus markdown with `--markdown`). |
+| `tune` | Calibrate a llama-server spawn profile within a time budget; see [calibration](integration/tune.md). |
 | `models` | List the models a backend can serve. |
 | `backends` | Probe the backends compiled into this build. |
 | `devices` | List host devices (CPU and memory inventory). |

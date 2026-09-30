@@ -58,6 +58,9 @@ Gate: measurable win on agent fan-out/long-context workloads without interactive
   pairing check and llama-server log diagnostics, surfaced additively on
   health, `/v1/models` and telemetry ([vram-spill](integration/vram-spill.md))
 - [ ] adaptive speculation policy
+- [x] `sonder-infer tune`: bounded llama-server calibration, PDH spill qualification,
+  per-profile context margin, and spawn-config output with two recommendations
+  ([usage and qualification limits](integration/tune.md)); live performance validation pending
 - [ ] CPU KV spill
 - [ ] cache quantization where supported
 - [x] tensor placement overrides (MoE experts in RAM; `docs/PLACEMENT.md` step 1)

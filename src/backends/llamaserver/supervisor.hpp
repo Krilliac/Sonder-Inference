@@ -40,6 +40,8 @@ struct SupervisorOptions {
     std::string log_file;
     // Warn up front about FlashAttention with mismatched K/V cache types.
     bool kv_pairing_check = true;
+    std::vector<std::pair<std::string, std::string>> environment;
+    std::string output_file;
 };
 
 class Supervisor {
