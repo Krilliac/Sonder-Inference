@@ -202,12 +202,13 @@ TEST_CASE("runtime: llamaserver config accepts spill_guard, log_file and kv_pair
     CHECK(defaults.llamaserver_spill_guard);
     CHECK(defaults.llamaserver_spill_policy == "warn");
     CHECK(defaults.llamaserver_spill_threshold_mib == 256);
+    CHECK(defaults.llamaserver_spill_baseline_per_1k_ctx_mib == 0);
     CHECK(defaults.llamaserver_log_file.empty());
     CHECK(defaults.llamaserver_kv_pairing_check);
 
     write(R"({"mode":"spawn","executable":"llama-server","args":["-c","100096"],"log_file":"ls.log",)"
           R"("kv_pairing_check":false,"spill_guard":{"enabled":true,"policy":"auto_fit","threshold_mib":300,)"
-          R"("baseline_mib":10,"sample_interval_ms":2000,"fit_step_factor":0.8,"fit_step_align":512,)"
+          R"("baseline_mib":10,"baseline_per_1k_ctx_mib":2,"sample_interval_ms":2000,"fit_step_factor":0.8,"fit_step_align":512,)"
           R"("fit_min_ctx":16384,"fit_max_attempts":3}})");
     si::BackendSetup setup;
     auto status = si::load_llamaserver_config(path.string(), setup);
@@ -215,6 +216,7 @@ TEST_CASE("runtime: llamaserver config accepts spill_guard, log_file and kv_pair
     CHECK(setup.llamaserver_spill_policy == "auto_fit");
     CHECK(setup.llamaserver_spill_threshold_mib == 300);
     CHECK(setup.llamaserver_spill_baseline_mib == 10);
+    CHECK(setup.llamaserver_spill_baseline_per_1k_ctx_mib == 2);
     CHECK(setup.llamaserver_spill_sample_interval_ms == 2000);
     CHECK(setup.llamaserver_fit_step_factor == doctest::Approx(0.8));
     CHECK(setup.llamaserver_fit_step_align == 512);
@@ -227,6 +229,8 @@ TEST_CASE("runtime: llamaserver config accepts spill_guard, log_file and kv_pair
                              R"({"spill_guard":[]})", R"({"spill_guard":{"threshold_mib":0}})",
                              R"({"spill_guard":{"fit_step_factor":1}})", R"({"spill_guard":{"fit_max_attempts":33}})",
                              R"({"spill_guard":{"sample_interval_ms":5}})", R"({"spill_guard":{"enabled":"yes"}})",
+                             R"({"spill_guard":{"baseline_per_1k_ctx_mib":1025}})",
+                             R"({"spill_guard":{"baseline_per_1k_ctx_mib":-1}})",
                              R"({"log_file":7})", R"({"kv_pairing_check":"on"})"}) {
         write(body);
         si::BackendSetup invalid;
