@@ -43,6 +43,9 @@ struct LlamaServerSpillGuardOptions {
     // an RTX 5070 Ti: 148-198 MiB shared when clean, 292 MiB-2.1 GB spilled.
     std::uint64_t threshold_bytes = 256ull * 1024 * 1024;
     std::uint64_t baseline_bytes = 0;
+    // Added to the baseline per 1,024 tokens of --ctx-size (0 = fixed). Clean
+    // shared usage grows ~1 MiB/1k ctx, ~2 MiB/1k ctx with MTP speculation.
+    std::uint64_t baseline_bytes_per_1k_ctx = 0;
     std::chrono::milliseconds sample_interval{5000};
     // auto_fit: ctx -> align_down(ctx * fit_step_factor, fit_step_align),
     // at least one alignment step smaller, never below fit_min_ctx, and at
