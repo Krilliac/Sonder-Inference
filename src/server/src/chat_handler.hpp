@@ -32,6 +32,8 @@ struct ChatExchange {
     std::function<void()> watcher_failure;
 };
 
+// The caller holds the model's residency pin through this synchronous call
+// (including response writes), and destroys the session before releasing it.
 void execute_chat(ChatExchange& exchange, const ChatJob& job, const Correlation& correlation,
                   const std::string& model, const std::string& backend,
                   const std::shared_ptr<Session>& session, ChatProtocol protocol);

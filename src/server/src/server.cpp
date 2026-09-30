@@ -21,6 +21,7 @@
 #include "live_hub.hpp"
 #include "openai.hpp"
 #include "request_path.hpp"
+#include "residency.hpp"
 #include "socket.hpp"
 #include "../../common/loopback.hpp"
 #include "sonder/inference/engine.hpp"
@@ -161,13 +162,6 @@ double seconds_since(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
 
-struct ServedModel {
-    std::string id;
-    std::string backend;
-    bool is_default = false;
-    std::shared_ptr<Model> model;
-};
-
 // Per-connection bookkeeping shared between the accept loop and the
 // connection thread.
 struct ConnFlags {
@@ -230,7 +224,12 @@ constexpr std::uint64_t kDescriptorHeadroom = 32;
 // ============================================================ Server::Impl
 
 struct Server::Impl {
-    explicit Impl(ServerOptions o) : opts(std::move(o)) {}
+    explicit Impl(ServerOptions o) : opts(std::move(o)) {
+        residency = std::make_shared<ModelResidency>(
+            ResidencyConfig{opts.model_idle_ttl, opts.max_resident_models},
+            [this](const std::string& id) { return load_served_model(id); },
+            [this](Eviction& ev) { on_model_evicted(ev); });
+    }
 
     ServerOptions opts;
     std::atomic<State> state{State::starting};
@@ -252,8 +251,10 @@ struct Server::Impl {
     mutable std::mutex engine_mu;
     std::unique_ptr<Engine> engine;
     std::shared_ptr<Backend> backend;
-    mutable std::mutex models_mu;
-    std::vector<ServedModel> served;
+    // Served models: registered during start(), loaded eagerly (default) or
+    // on first use, pinned by in-flight requests, optionally evicted when
+    // idle (docs/SERVER.md "Model residency").
+    std::shared_ptr<ModelResidency> residency;
 
     // Backend probe cache (health must stay cheap: it never does backend I/O).
     std::shared_ptr<ProbeCache> probe = std::make_shared<ProbeCache>();
@@ -374,19 +375,110 @@ struct Server::Impl {
 
     json::Object sonder_meta() const { return json::Object{{"api_version", kApiVersion}}; }
 
-    std::vector<ServedModel> served_snapshot() const {
-        std::lock_guard<std::mutex> lock(models_mu);
-        return served;
-    }
+    // ------------------------------------------------------ model residency
 
-    std::optional<ServedModel> resolve_model(const std::string& id) const {
-        std::lock_guard<std::mutex> lock(models_mu);
-        for (const auto& m : served) {
-            if (m.id == id || (id == "default" && m.is_default)) {
-                return m;
+    // Loads a served model on the engine (residency loader; no lock held).
+    Result<std::shared_ptr<Model>> load_served_model(const std::string& id) {
+        Engine* e = nullptr;
+        std::string backend_name;
+        {
+            std::lock_guard<std::mutex> lock(engine_mu);
+            e = engine.get();
+            if (backend) {
+                backend_name = backend->name();
             }
         }
-        return std::nullopt;
+        if (e == nullptr || backend_name.empty()) {
+            return Status(ErrorCode::unavailable, "the engine is not running");
+        }
+        // A lazy load that would start after stop() began only delays the
+        // shutdown: refuse it (503 not_ready, safe to retry elsewhere).
+        if (stopping.load()) {
+            return Status(ErrorCode::unavailable, "sonder-inference is draining");
+        }
+        ModelLoadOptions lo;
+        lo.model = id;
+        // Keep ModelLoadOptions' default device unless --device was given.
+        if (!opts.device.empty()) lo.device_id = opts.device;
+        return e->load_model(backend_name, lo);
+    }
+
+    // Residency evictor: `model.evicted`, then the engine's `model.unload`.
+    // The residency's reference is dropped first, so `model.unload` reports
+    // the references still held elsewhere (none: evicted models are never
+    // pinned) and the backend model is freed inside unload_model() without
+    // any server lock held. Every eviction source (request threads and the
+    // sweeper) has finished before stop() destroys the engine.
+    void on_model_evicted(Eviction& ev) {
+        if (!ev.model) {
+            return;
+        }
+        const std::string model_instance = ev.model->instance_id();
+        const std::string device_id = ev.model->device_id();
+        ev.model.reset();
+        Engine* e = engine_ptr();
+        if (e == nullptr) {
+            return;
+        }
+        TelemetryContext ctx = e->engine_context();
+        ctx.model_instance_id = model_instance;
+        if (!device_id.empty()) {
+            ctx.device_id = device_id;
+        }
+        e->telemetry().emit("model.evicted", ctx,
+                            json::Object{{"backend", ev.backend},
+                                         {"model", ev.id},
+                                         {"reason", std::string(ev.reason)},
+                                         {"idle_ms", ev.idle_ms}},
+                            TelemetryLevel::metrics);
+        (void)e->unload_model(model_instance);
+        log_message("info", "unloaded model '" + ev.id + "' (" + ev.reason + ")");
+    }
+
+    // A lazy load that failed before anything executed.
+    static ApiError load_failure_error(const std::string& id, const Status& st) {
+        if (st.code() == ErrorCode::not_found) {
+            return make_error(404, "model_not_found", "cannot load model '" + id + "': " + st.message(), "model");
+        }
+        return make_error(503, "not_ready",
+                          "cannot load model '" + id + "': " + st.message() +
+                              "; nothing was executed, the request is safe to send elsewhere");
+    }
+
+    json::Array health_models() const {
+        json::Array models;
+        for (const auto& m : residency->snapshot()) {
+            json::Object entry{{"id", m.id}, {"backend", m.backend}, {"default", m.is_default}};
+            // Additive residency fields (docs/SERVER.md "Model residency").
+            entry.set("state", residency_state_name(m.state));
+            entry.set("resident", m.state == ResidencyState::resident);
+            entry.set("in_flight", m.pins);
+            entry.set("loads", m.loads);
+            entry.set("load_failures", m.load_failures);
+            entry.set("evictions", m.evictions);
+            entry.set("idle_s", m.idle_s ? json::Value(*m.idle_s) : json::Value(nullptr));
+            entry.set("model_instance_id",
+                      m.model_instance_id.empty() ? json::Value(nullptr) : json::Value(m.model_instance_id));
+            models.emplace_back(std::move(entry));
+        }
+        return models;
+    }
+
+    json::Object residency_summary() const {
+        const ResidencyTotals t = residency->totals();
+        const ResidencyConfig& c = residency->config();
+        return json::Object{
+            {"mode", opts.lazy_models ? "lazy" : "eager"},
+            {"idle_ttl_s", c.idle_ttl.count() > 0 ? json::Value(std::chrono::duration<double>(c.idle_ttl).count())
+                                                  : json::Value(nullptr)},
+            {"max_resident", c.max_resident > 0 ? json::Value(c.max_resident) : json::Value(nullptr)},
+            {"registered", t.registered},
+            {"resident", t.resident},
+            {"loading", t.loading},
+            {"unloading", t.unloading},
+            {"loads", t.loads},
+            {"load_failures", t.load_failures},
+            {"evictions", t.evictions}};
     }
 
     // Last probe result (refreshed every kProbeInterval by probe_thread).
@@ -494,10 +586,7 @@ struct Server::Impl {
                 backends.emplace_back(std::move(entry));
             }
         }
-        json::Array models;
-        for (const auto& m : served_snapshot()) {
-            models.emplace_back(json::Object{{"id", m.id}, {"backend", m.backend}, {"default", m.is_default}});
-        }
+        json::Array models = health_models();
         const HubStats hs = hub->stats();
         std::uint64_t emitted = 0;
         std::uint64_t dropped = 0;
@@ -520,6 +609,7 @@ struct Server::Impl {
                           {"auth_required", !opts.token.empty()},
                           {"backends", std::move(backends)},
                           {"models", std::move(models)},
+                          {"residency", residency_summary()},
                           {"telemetry", json::Object{{"level", to_string(opts.telemetry_level)},
                                                      {"subscribers", hs.subscribers},
                                                      {"retained", hs.retained},
@@ -553,10 +643,13 @@ struct Server::Impl {
         }
         const std::optional<BackendRuntimeStatus> runtime = b ? b->runtime_status() : std::nullopt;
         json::Array data;
-        for (const auto& m : served_snapshot()) {
+        for (const auto& m : residency->snapshot()) {
             json::Object ext{{"backend", m.backend}, {"default", m.is_default}, {"synthetic", synthetic}};
             // Additive: context fit, GPU memory and warnings of the backend
-            // process serving this model, when the backend reports them.
+            // process serving this model, when the backend reports them. This
+            // describes the backend process, not the model handle, so it is
+            // reported whatever the model's residency state (a lazy or
+            // evicted model is still served by that process).
             if (runtime && b->name() == m.backend) {
                 ext.set("runtime", to_json(*runtime));
             }
@@ -576,19 +669,33 @@ struct Server::Impl {
                 wanted = *m;
             }
         }
-        const auto served_model = resolve_model(wanted);
-        if (!served_model) {
+        const auto served_id = residency->resolve(wanted);
+        if (!served_id) {
             send_error(ex, make_error(404, "model_not_found", "model '" + wanted + "' is not served", "model"));
             return;
         }
         bool available = false;
         std::string version;
         backend_status(available, version);
-        const IdentityResult id =
-            backend_identity(*served_model->model, available ? std::optional<std::string>(version) : std::nullopt);
+        const std::optional<std::string> probed = available ? std::optional<std::string>(version) : std::nullopt;
+        // Identity never loads a model (no backend I/O here): a model that is
+        // not resident reports the descriptor of its last load, if any.
+        IdentityResult id;
+        if (const std::shared_ptr<Model> model = residency->resident_model(*served_id)) {
+            id = backend_identity(*model, probed);
+        } else {
+            std::string backend_name;
+            for (const auto& m : residency->snapshot()) {
+                if (m.id == *served_id) {
+                    backend_name = m.backend;
+                }
+            }
+            const std::optional<ModelDescriptor> last = residency->last_descriptor(*served_id);
+            id = backend_identity(backend_name, *served_id, last ? &*last : nullptr, probed);
+        }
         send_json(ex, 200,
                   json::Object{{"schema", "sonder.inference.identity/1"},
-                               {"model", served_model->id},
+                               {"model", *served_id},
                                {"synthetic", synthetic},
                                {"backend_identity", id.backend_identity},
                                {"reason", id.reason},
@@ -737,11 +844,21 @@ struct Server::Impl {
         if (!require_ready(ex)) {
             return;
         }
-        const auto served_model = resolve_model(job.model);
-        if (!served_model) {
+        const auto served_id = residency->resolve(job.model);
+        if (!served_id) {
             send_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
             return;
         }
+        // Pins the model for the whole request (never evicted meanwhile);
+        // loads it first when it is not resident (lazy residency, or evicted
+        // after its idle TTL). Released after the response, when the session
+        // (declared later, destroyed earlier) is gone.
+        auto pinned = residency->acquire(*served_id);
+        if (!pinned.ok()) {
+            send_error(ex, load_failure_error(*served_id, pinned.status()));
+            return;
+        }
+        const ModelResidency::Pin pin = std::move(pinned).value();
 
         SessionOptions so;
         so.sampling = job.sampling;
@@ -757,7 +874,7 @@ struct Server::Impl {
                 send_error(ex, make_error(503, "not_ready", "sonder-inference is draining"));
                 return;
             }
-            auto created = engine->create_session(served_model->model, so);
+            auto created = engine->create_session(pin.model(), so);
             if (!created.ok()) {
                 send_error(ex, map_session_failure(created.status(), false));
                 return;
@@ -795,7 +912,7 @@ struct Server::Impl {
             [&](int status, const json::Object& doc) { send_json(ex, status, doc); },
             [&](const ApiError& error) { send_error(ex, error); },
             [&] { log_message("warning", "cannot start a request thread; chat request refused (503)"); }};
-        execute_chat(exchange, job, corr, served_model->id, served_model->backend, session, protocol);
+        execute_chat(exchange, job, corr, pin.id(), pin.backend(), session, protocol);
     }
 
     // --------------------------------------------------------- connection
@@ -1391,19 +1508,21 @@ struct Server::Impl {
                 return cancelled_start();
             }
             StepGuard step{*this};
-            ModelLoadOptions lo;
-            lo.model = ids[i];
-            // Keep ModelLoadOptions' default device unless --device was given.
-            if (!opts.device.empty()) lo.device_id = opts.device;
+            // Registration is bookkeeping only (no backend I/O).
+            (void)residency->add(ids[i], backend_name, i == 0);
+            // Lazy residency loads on first use; eager (the default) loads
+            // every model now, or the first --max-resident-models of them.
+            if (opts.lazy_models || (opts.max_resident_models != 0 && i >= opts.max_resident_models)) {
+                continue;
+            }
             // No lock held: the load may block on backend I/O while health
             // keeps answering 503 "starting". stop() waits for this step.
-            Result<std::shared_ptr<Model>> loaded = engine_ptr()->load_model(backend_name, lo);
+            // The pin is released at once: the model stays resident.
+            auto loaded = residency->acquire(ids[i]);
             if (!loaded.ok()) {
                 return Status(loaded.status().code(), "cannot load model '" + ids[i] + "' on " + backend_name + ": " +
                                                           loaded.status().message());
             }
-            std::lock_guard<std::mutex> lock(models_mu);
-            served.push_back(ServedModel{ids[i], backend_name, i == 0, loaded.value()});
         }
         {
             if (!begin_step()) {
@@ -1414,6 +1533,8 @@ struct Server::Impl {
             // the refresher so health never waits on the backend.
             store_probe(*probe, made->probe());
             start_probe_refresher(made);
+            // Idle-TTL evictions (no thread unless --model-idle-ttl is set).
+            residency->start_sweeper();
         }
         State expected = State::starting;
         state.compare_exchange_strong(expected, State::ready);
@@ -1481,10 +1602,10 @@ struct Server::Impl {
         }
         // 4. engine.stopped (and a final telemetry.dropped) reach the hub.
         stop_probe_refresher(std::max(opts.shutdown_grace, std::chrono::milliseconds(100)));
-        {
-            std::lock_guard<std::mutex> models_lock(models_mu);
-            served.clear();
-        }
+        // No evictions after this point; the handles go with the engine
+        // (shutdown emits no model.unload, as before lazy residency).
+        residency->stop_sweeper();
+        residency->clear();
         std::unique_ptr<Engine> doomed;
         {
             std::lock_guard<std::mutex> lock(engine_mu);
@@ -1566,6 +1687,9 @@ Status validate_options(const ServerOptions& o) {
     if (o.max_connections == 0 || o.max_body_bytes == 0 || o.telemetry_buffer == 0 || o.max_subscribers == 0) {
         return Status(ErrorCode::invalid_argument,
                       "--max-connections, --max-body-bytes and --telemetry-buffer must be positive");
+    }
+    if (o.model_idle_ttl.count() < 0) {
+        return Status(ErrorCode::invalid_argument, "--model-idle-ttl must not be negative");
     }
     for (const auto& origin : o.cors_origins) {
         if (!is_serialized_origin(origin)) {

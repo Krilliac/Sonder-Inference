@@ -77,6 +77,7 @@ Types used below: `int` (JSON integer), `num` (JSON number), `str`,
 | `model.load.completed` | metrics | `backend`, `model`, `format`, `family`, `parameter_size`, `quantization` str; `size_bytes` int; `resident` bool (false when only metadata was fetched, e.g. Ollama `/api/show`; the weights load on first request); `duration_ms` num |
 | `model.load.failed` | metrics | `backend`, `model` str; `duration_ms` num; `error_code`, `error` str |
 | `model.unload` | metrics | `backend`, `model` str; `outstanding_references` int |
+| `model.evicted` | metrics | `sonder-infer serve` model residency only (`--model-idle-ttl`, `--max-resident-models`; never with the defaults): `backend`, `model` str; `reason` str (`idle_ttl` or `max_resident`); `idle_ms` num (time since the model's last request finished). Always followed by `model.unload` for the same `model_instance_id` |
 | `telemetry.dropped` | metrics (bypasses the queue limit) | `dropped_events` int (cumulative), `emitted_events` int, `queue_capacity` int, `final` bool. Emitted as soon as the writer catches up after the first drop, then at most once per `TelemetryOptions::drop_report_interval` (default 1 s) while drops continue, and once at shutdown (`final: true`) if drops are still unreported |
 
 ## Sessions and requests

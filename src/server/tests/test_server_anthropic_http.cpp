@@ -2,17 +2,115 @@
 // the deterministic mock backend.
 #include <doctest/doctest.h>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include "server_test_support.hpp"
+#include "sonder/inference/backends.hpp"
 #include "src/test_hooks.hpp"
 
 using namespace server_test;
 namespace json = sonder::inference::json;
 
 namespace {
+
+class FirstChunkGate {
+public:
+    void reached(bool delivered) {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            reached_ = true;
+            delivered_ = delivered;
+        }
+        cv_.notify_all();
+    }
+    bool wait_for_reached(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mu_);
+        return cv_.wait_for(lock, timeout, [&] { return reached_; });
+    }
+    bool delivered() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return delivered_;
+    }
+    void wait_for_release() {
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [&] { return released_; });
+    }
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            released_ = true;
+        }
+        cv_.notify_all();
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    bool reached_ = false;
+    bool delivered_ = false;
+    bool released_ = false;
+};
+
+class GatedModel final : public si::BackendModel {
+public:
+    GatedModel(std::shared_ptr<si::BackendModel> inner, std::shared_ptr<FirstChunkGate> gate)
+        : inner_(std::move(inner)), gate_(std::move(gate)) {}
+
+    const si::ModelDescriptor& descriptor() const override { return inner_->descriptor(); }
+    si::Result<si::GenerateStats> generate(const si::GenerateRequest& request,
+                                           const si::CancellationToken& cancel,
+                                           const si::TokenCallback& on_chunk) override {
+        bool first = true;
+        return inner_->generate(request, cancel, [&](const si::TokenChunk& chunk) {
+            const bool accepted = !on_chunk || on_chunk(chunk);
+            if (first) {
+                first = false;
+                gate_->reached(accepted);
+                gate_->wait_for_release();
+            }
+            return accepted;
+        });
+    }
+    si::Result<std::vector<si::TokenId>> tokenize(std::string_view text) override {
+        return inner_->tokenize(text);
+    }
+
+private:
+    std::shared_ptr<si::BackendModel> inner_;
+    std::shared_ptr<FirstChunkGate> gate_;
+};
+
+class GatedBackend final : public si::Backend {
+public:
+    explicit GatedBackend(std::shared_ptr<FirstChunkGate> gate)
+        : inner_(si::make_mock_backend()), gate_(std::move(gate)) {}
+
+    std::atomic<int> loads{0};
+
+    std::string name() const override { return inner_->name(); }
+    std::string description() const override { return "gated mock backend"; }
+    si::BackendCapabilities capabilities() const override { return inner_->capabilities(); }
+    si::Result<std::string> probe() override { return inner_->probe(); }
+    si::Result<std::vector<si::ModelDescriptor>> list_models() override { return inner_->list_models(); }
+    si::Result<std::shared_ptr<si::BackendModel>> load_model(const si::ModelLoadOptions& options) override {
+        ++loads;
+        auto loaded = inner_->load_model(options);
+        if (!loaded.ok() || options.model != "mock:a") return loaded;
+        return std::shared_ptr<si::BackendModel>(std::make_shared<GatedModel>(loaded.value(), gate_));
+    }
+
+private:
+    std::shared_ptr<si::Backend> inner_;
+    std::shared_ptr<FirstChunkGate> gate_;
+};
 
 std::string messages_body(const std::string& extra = "") {
     return R"({"model":"default","max_tokens":6,"messages":[{"role":"user","content":"hello sonder"}])" +
@@ -292,4 +390,80 @@ TEST_CASE("anthropic messages: watcher refusal and malformed headers use endpoin
     check_anthropic_error(roundtrip(f.port, "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
                                             "Host: localhost\r\nContent-Length: 0\r\n\r\n"),
                           400, "invalid_request_error", "Host");
+}
+
+TEST_CASE("anthropic messages: a streaming lazy request pins its model during competing eviction") {
+    auto gate = std::make_shared<FirstChunkGate>();
+    auto backend = std::make_shared<GatedBackend>(gate);
+    auto options = Fixture::defaults();
+    options.models = {"mock:a", "mock:b"};
+    options.lazy_models = true;
+    options.max_resident_models = 1;
+    options.backend.backend.clear();
+    options.backend_instance = backend;
+    Fixture f(options);
+    CHECK(backend->loads.load() == 0);
+
+    Conn stream(f.port);
+    const std::string request_body =
+        R"({"model":"mock:a","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hold this request"}]})";
+    struct GateCleanup {
+        FirstChunkGate& gate;
+        ~GateCleanup() { gate.release(); }
+    } cleanup{*gate};
+    stream.send(build_request("POST", "/v1/messages", f.port, {}, request_body));
+
+    REQUIRE(gate->wait_for_reached(std::chrono::milliseconds(5000)));
+    CHECK(gate->delivered());  // the first Anthropic SSE delta was written before the gate closed
+    std::string wire;
+    REQUIRE(stream.read_until(wire, "event: content_block_delta\n"));
+    const auto pinned_health = get(f.port, "/v1/sonder/health").json();
+    bool pinned = false;
+    for (const auto& model : pinned_health.find("models")->as_array()) {
+        if (model.find("id")->as_string() == "mock:a") {
+            pinned = model.find("state")->as_string() == "resident" && model.find("in_flight")->as_int() > 0;
+            CHECK(model.find("in_flight")->as_int() == 1);
+            CHECK(model.find("loads")->as_int() == 1);
+        }
+    }
+    REQUIRE(pinned);
+
+    const Reply competing = post(
+        f.port, "/v1/messages",
+        R"({"model":"mock:b","max_tokens":1,"messages":[{"role":"user","content":"load the competitor"}]})");
+    CHECK_MESSAGE(competing.status == 200, competing.body);
+    // The soft cap must not unload the model held by the streaming request.
+    const auto during = get(f.port, "/v1/sonder/health").json();
+    for (const auto& model : during.find("models")->as_array()) {
+        if (model.find("id")->as_string() == "mock:a")
+            CHECK(model.find("state")->as_string() == "resident");
+    }
+    for (const auto& eviction : f.of_type("model.evicted")) {
+        CHECK(eviction.find("attributes")->find("model")->as_string() != "mock:a");
+    }
+
+    gate->release();
+    wire += stream.read_all();
+    const Reply completed = parse_reply(wire);
+    REQUIRE_MESSAGE(completed.status == 200, completed.body);
+    CHECK(stream.closed());
+    const auto frames = sse_events(completed.body);
+    REQUIRE_FALSE(frames.empty());
+    CHECK(frames.back().name == "message_stop");
+    // A is now unpinned; loading B again forces the cap to evict A.
+    const Reply reload_competing = post(
+        f.port, "/v1/messages",
+        R"({"model":"mock:b","max_tokens":1,"messages":[{"role":"user","content":"reload the competitor"}]})");
+    REQUIRE_MESSAGE(reload_competing.status == 200, reload_competing.body);
+    CHECK(eventually([&] {
+        const auto health = get(f.port, "/v1/sonder/health").json();
+        for (const auto& model : health.find("models")->as_array()) {
+            if (model.find("id")->as_string() == "mock:a")
+                return model.find("state")->as_string() == "unloaded";
+        }
+        return false;
+    }));
+    for (const auto& unload : f.of_type("model.unload")) {
+        CHECK(unload.find("attributes")->find("outstanding_references")->as_int() == 0);
+    }
 }

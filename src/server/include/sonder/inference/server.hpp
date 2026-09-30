@@ -89,6 +89,23 @@ struct ServerOptions {
     std::function<void(const std::string& line)> log;
     LogFormat log_format = LogFormat::text;
 
+    // Model residency (docs/SERVER.md "Model residency"). The defaults keep
+    // the behaviour from before these options existed: every model loads
+    // during start() and stays loaded until stop().
+    //
+    // Register the models during start() without loading them (no backend
+    // I/O) and load each on its first request. Concurrent first requests
+    // share one load. A model that cannot load then fails its requests (404
+    // model_not_found or 503 not_ready) instead of the start.
+    bool lazy_models = false;
+    // Unload a model once no request has used it for this long; the next
+    // request loads it again. A request in flight pins its model. 0 = never.
+    std::chrono::milliseconds model_idle_ttl{0};
+    // Keep at most this many models loaded, evicting the least recently used
+    // unpinned one first. Soft: pinned models are never evicted, so requests
+    // in flight can exceed it until they finish. With eager loading only the
+    // first N models load during start(). 0 = no cap.
+    std::size_t max_resident_models = 0;
     // Request path (docs/SERVER.md "Scheduling" and "Thinking control").
     // --scheduler: automatic gates in-process backends per token and only
     // admits/accounts remote-process ones (llamaserver, ollama); off disables
@@ -117,7 +134,9 @@ public:
 
     // Binds the socket, builds the engine (engine.started carries the listen
     // address), starts accepting (health reports "starting"), registers the
-    // backend and loads the models, then reports "ready". `on_listening`
+    // backend and the models and loads them (all of them unless
+    // `lazy_models` or `max_resident_models` says otherwise), then reports
+    // "ready". `on_listening`
     // runs once the socket accepts connections, before models load. No lock
     // is held across backend I/O: health answers 503 "starting" while a
     // model loads. Errors: invalid_argument (options), unavailable (address
