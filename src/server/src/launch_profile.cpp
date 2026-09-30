@@ -94,6 +94,27 @@ constexpr std::string_view kUnsafeFeatureFlags[] = {
     "--ui-mcp-proxy", "--webui-mcp-proxy", "--path", "--media-path",
 };
 
+// llama-server flags that write prompts or logs to an arbitrary local path.
+// A shared profile must not be able to record user prompts to disk.
+// `-lcd`/`--lookup-cache-dynamic` is an n-gram cache that generation updates,
+// so it records prompt/response text too. `--slot-save-path` stays allowed on
+// purpose: docs/integration/llama-server.md tells operators to pass it.
+constexpr std::string_view kDiskWriteFlags[] = {
+    "--log-file", "--log-prompts-dir", "-lcd", "--lookup-cache-dynamic",
+};
+
+// llama-server's built-in model presets (`--gpt-oss-20b-default`,
+// `--fim-qwen-7b-spec`, `--spec-default`, ...). Each one swaps in its own model
+// and settings, overriding the typed fields, and most "can download weights
+// from the internet". Every `--*-default` / `--*-spec` spelling is refused, so
+// presets added upstream later are covered too.
+bool is_model_preset_flag(std::string_view flag) {
+    const auto ends_with = [&](std::string_view suffix) {
+        return flag.size() > suffix.size() && flag.substr(flag.size() - suffix.size()) == suffix;
+    };
+    return flag.rfind("--", 0) == 0 && (ends_with("-default") || ends_with("-spec"));
+}
+
 Status check_extra_args(const LaunchProfile& p) {
     if (p.extra_args.size() > kMaxExtraArgs) return bad(where_of(p), "extra_args has more than 256 entries");
     for (const auto& arg : p.extra_args) {
@@ -105,6 +126,18 @@ Status check_extra_args(const LaunchProfile& p) {
                 return bad(where_of(p), "extra_args must not contain " + std::string(flag) +
                                             " (the supervisor owns host and port; credentials and downloads are "
                                             "not passed to llama-server)");
+            }
+        }
+        if (is_model_preset_flag(flag)) {
+            return bad(where_of(p), "extra_args must not contain " + std::string(flag) +
+                                        " (llama-server's built-in model presets replace the profile's model and can "
+                                        "download weights; set the typed fields instead)");
+        }
+        for (auto f : kDiskWriteFlags) {
+            if (flag == f) {
+                return bad(where_of(p), "extra_args must not contain " + std::string(flag) +
+                                            " (a launch profile cannot make llama-server write logs or prompts to "
+                                            "disk)");
             }
         }
         for (auto f : kUnsafeFeatureFlags) {

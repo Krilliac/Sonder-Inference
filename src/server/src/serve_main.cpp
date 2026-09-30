@@ -372,7 +372,8 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const La
     for (const auto& p : profiles) {
         const bool is_active = &p == &active;
         std::optional<VramEstimate> estimate;
-        std::string estimate_error;
+        std::string estimate_error;         // for the operator's log and refusal (includes the path)
+        std::string public_estimate_error;  // for /v1/models (path redacted)
         std::optional<std::uint64_t> budget;
         if (offloads(p)) {
             budget = budget_for(p);
@@ -383,10 +384,11 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const La
                                                             p.speculative ? file_bytes(p.speculative->draft_model) : 0});
             } else {
                 estimate_error = info.status().message();
+                public_estimate_error = redact_model_path(info.status(), p.model);
             }
         }
         json::Object meta = launch_profile_metadata(p, estimate, budget);
-        if (!estimate_error.empty()) meta.set("estimate_error", estimate_error);
+        if (!public_estimate_error.empty()) meta.set("estimate_error", public_estimate_error);
         meta.set("served", is_active);
         catalog.emplace_back(meta);
         if (!is_active) continue;

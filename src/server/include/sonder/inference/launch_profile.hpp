@@ -190,6 +190,10 @@ struct GgufModelInfo {
 // io_error, invalid_argument for a malformed or truncated header.
 Result<GgufModelInfo> read_gguf_model_info(const std::string& path);
 Result<GgufModelInfo> parse_gguf_model_info(std::string_view header_bytes);
+// `error` (from read_gguf_model_info(path)) with every occurrence of `path`
+// replaced by "<model path>", for client-visible metadata such as
+// /v1/models `estimate_error`; local filesystem paths stay in operator logs.
+std::string redact_model_path(const Status& error, const std::string& path);
 
 struct VramEstimate {
     std::uint64_t weights_bytes = 0;    // offloaded blocks (+ output) + mmproj/draft when offloaded

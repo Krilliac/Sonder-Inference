@@ -193,6 +193,32 @@ TEST_CASE("launch profile: extra_args refuse llama-server agent tools, MCP and f
     CHECK(ok.extra_args.size() == 4u);
 }
 
+TEST_CASE("launch profile: extra_args refuse model presets and prompt/log files") {
+    const auto with = [](const std::string& arg) {
+        return R"({"name":"p","backend":"llamaserver","model":"m.gguf","extra_args":[)" + arg + "]}";
+    };
+    // Every preset listed by `llama-server --help`; each can download weights.
+    for (const char* preset :
+         {R"("--embd-gemma-default")", R"("--fim-qwen-1.5b-default")", R"("--fim-qwen-3b-default")",
+          R"("--fim-qwen-7b-default")", R"("--fim-qwen-7b-spec")", R"("--fim-qwen-14b-spec")",
+          R"("--fim-qwen-30b-default")", R"("--gpt-oss-20b-default")", R"("--gpt-oss-120b-default")",
+          R"("--vision-gemma-4b-default")", R"("--vision-gemma-12b-default")", R"("--spec-default")",
+          R"("--some-future-model-default")"}) {
+        CAPTURE(preset);
+        CHECK(contains(parse_error(with(preset)), "built-in model presets"));
+    }
+    for (const char* writer : {R"("--log-file","C:/x.log")", R"("--log-file=x.log")",
+                               R"("--log-prompts-dir","D:/prompts")", R"("--log-prompts-dir=p")",
+                               R"("-lcd","C:/ngram.bin")", R"("--lookup-cache-dynamic","ngram.bin")",
+                               R"("--lookup-cache-dynamic=ngram.bin")"}) {
+        CAPTURE(writer);
+        CHECK(contains(parse_error(with(writer)), "write logs or prompts to disk"));
+    }
+    // Flags that merely contain "default"/"spec" elsewhere stay allowed.
+    const LaunchProfile ok = parse_single(with(R"("--spec-draft-n-min","2","--log-disable","--no-warmup")"));
+    CHECK(ok.extra_args.size() == 4u);
+}
+
 TEST_CASE("launch profile: file-level validation") {
     const auto error = [](const std::string& text) {
         auto doc = json::parse(text);
@@ -555,6 +581,31 @@ TEST_CASE("GGUF reader: malformed and truncated headers are rejected") {
     out_of_range.tensor("blk.7.x", {32}, 0);
     CHECK(contains(si::parse_gguf_model_info(out_of_range.finish(1, 2)).status().message(), "unknown block"));
     CHECK(si::read_gguf_model_info("definitely-missing-model.gguf").status().code() == si::ErrorCode::not_found);
+}
+
+TEST_CASE("gguf: client-visible read errors do not carry the model path") {
+    const std::string missing = "C:/Users/someone/models/secret-dir/missing.gguf";
+    const auto status = si::read_gguf_model_info(missing).status();
+    REQUIRE(contains(status.message(), missing));  // the operator log keeps the path
+    const std::string redacted = si::redact_model_path(status, missing);
+    CHECK_FALSE(contains(redacted, "secret-dir"));
+    CHECK(contains(redacted, "<model path>"));
+
+    // A malformed header appends the path too.
+    const auto dir = std::filesystem::temp_directory_path() / si::make_id("sonder-gguf-redact");
+    std::filesystem::create_directories(dir);
+    const std::string bad = (dir / "not-a-model.gguf").string();
+    {
+        std::ofstream out(bad, std::ios::binary);
+        out << "not a gguf";
+    }
+    const auto bad_status = si::read_gguf_model_info(bad).status();
+    REQUIRE(contains(bad_status.message(), bad));
+    const std::string bad_redacted = si::redact_model_path(bad_status, bad);
+    CHECK_FALSE(contains(bad_redacted, dir.string()));
+    CHECK(contains(bad_redacted, "not a GGUF file (<model path>)"));
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }
 
 // ------------------------------------------------------------------ estimate

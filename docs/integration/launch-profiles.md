@@ -196,7 +196,14 @@ Rules checked at load time (`invalid_argument`, before anything starts):
   `--`, `--api-key`, `--api-key-file`, `--ssl-key-file`, `--ssl-cert-file`,
   download flags (`-hf`, `--hf-repo`, `--hf-file`, `--hf-token`,
   `--model-url`, `--docker-repo`, `--mmproj-url`, `--hf-repo-draft`,
-  `--spec-draft-hf`), or `--models-dir`/`--models-preset`. They may not
+  `--spec-draft-hf`), llama-server's built-in model presets (every
+  `--*-default` and `--*-spec` flag, such as `--gpt-oss-20b-default`,
+  `--fim-qwen-7b-spec` and `--spec-default`: they replace the profile's model
+  and settings and can download weights), `--log-file`,
+  `--log-prompts-dir` and `-lcd`/`--lookup-cache-dynamic` (a shared profile
+  must not record prompts to disk; `--slot-save-path` stays allowed, see
+  llama-server.md),
+  or `--models-dir`/`--models-preset`. They may not
   turn on llama-server's agent tools, MCP or local file serving either:
   `--tools` (which includes `exec_shell_command` and `write_file`),
   `--tools-runtime`, `--mcp-servers-config`, `--mcp-servers-json`,
@@ -342,7 +349,9 @@ non-string message content (image parts) with `unsupported_parameter`, so
 `vision` and `tools` are not in `capabilities` until Sonder forwards them. A
 consumer that reads `capabilities` never builds a request Sonder refuses.
 `estimated_vram_mib` is null when no estimate was possible, and
-`estimate_error` then says why.
+`estimate_error` then says why. The model's filesystem path is replaced by
+`<model path>` there; the full message, with the path, goes to the
+operator's log.
 
 `context_length` is the profile's `ctx_size`, unless the backend reports
 that the running process uses a different context. The llamaserver spill

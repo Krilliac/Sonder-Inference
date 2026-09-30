@@ -8,6 +8,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <type_traits>
 
 #include "sonder/inference/launch_profile.hpp"
@@ -337,6 +338,16 @@ Result<GgufModelInfo> read_gguf_model_info(const std::string& path) {
     auto info = parse(in);
     if (!info.ok()) return Status(info.status().code(), info.status().message() + " (" + path + ")");
     return info;
+}
+
+std::string redact_model_path(const Status& error, const std::string& path) {
+    std::string text = error.message();
+    if (path.empty()) return text;
+    static constexpr std::string_view kPlaceholder = "<model path>";
+    for (std::size_t at = text.find(path); at != std::string::npos; at = text.find(path, at + kPlaceholder.size())) {
+        text.replace(at, path.size(), kPlaceholder);
+    }
+    return text;
 }
 
 VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const VramEstimateInputs& inputs) {
