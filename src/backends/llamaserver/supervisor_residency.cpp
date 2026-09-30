@@ -12,14 +12,14 @@ Supervisor::RequestLease::~RequestLease() {
 }
 
 Supervisor::RequestLease::RequestLease(RequestLease &&other) noexcept
-    : activity_(std::move(other.activity_)), port_(std::exchange(other.port_, 0)) {}
+    : activity_(std::move(other.activity_)), port_(std::exchange(other.port_, std::uint16_t{0})) {}
 
 Supervisor::RequestLease &Supervisor::RequestLease::operator=(RequestLease &&other) noexcept {
     if (this != &other) {
         if (activity_)
             activity_->fetch_sub(1);
         activity_ = std::move(other.activity_);
-        port_ = std::exchange(other.port_, 0);
+        port_ = std::exchange(other.port_, std::uint16_t{0});
     }
     return *this;
 }
