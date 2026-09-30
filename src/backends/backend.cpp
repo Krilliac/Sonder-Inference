@@ -121,6 +121,20 @@ json::Object to_json(const BackendWarning& w) {
                         {"message", w.message}, {"details", std::move(details)}, {"count", w.count}};
 }
 
+json::Object to_json(const BackendWarmupSlotStatus& slot) {
+    json::Object out{{"id_slot", slot.id_slot}, {"status", slot.status},
+                     {"prompt_tokens", json::Value(slot.prompt_tokens)},
+                     {"cache_n", json::Value(slot.cache_n)}, {"milliseconds", slot.milliseconds}};
+    if (!slot.error.empty()) out.set("error", slot.error);
+    return out;
+}
+
+json::Object to_json(const BackendWarmupStatus& status) {
+    json::Array slots;
+    for (const auto& slot : status.slots) slots.emplace_back(to_json(slot));
+    return json::Object{{"generation", status.generation}, {"status", status.status}, {"slots", std::move(slots)}};
+}
+
 json::Object to_json(const BackendRuntimeStatus& status) {
     const auto& c = status.context;
     // Built with set() and the optional constructor (null when unset): a
@@ -135,9 +149,11 @@ json::Object to_json(const BackendRuntimeStatus& status) {
     for (const auto& w : status.warnings) {
         warnings.emplace_back(to_json(w));
     }
-    return json::Object{{"gpu_memory", to_json(status.gpu_memory)},
-                        {"context", std::move(context)},
-                        {"warnings", std::move(warnings)}};
+    json::Object out{{"gpu_memory", to_json(status.gpu_memory)},
+                     {"context", std::move(context)},
+                     {"warnings", std::move(warnings)}};
+    if (status.warmup) out.set("warmup", to_json(*status.warmup));
+    return out;
 }
 
 }  // namespace sonder::inference

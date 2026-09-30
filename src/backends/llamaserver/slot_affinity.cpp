@@ -51,7 +51,8 @@ void SlotAffinity::assign(const std::string &key, std::uint32_t slot) {
     by_key_[key] = Entry{slot, lru_.begin()};
 }
 
-SlotAffinity::Lease SlotAffinity::acquire(std::string_view key_view, std::uint32_t n_slots) {
+SlotAffinity::Lease SlotAffinity::acquire(std::string_view key_view, std::uint32_t n_slots,
+                                          const std::vector<std::uint32_t> &preferred_slots) {
     Lease lease;
     if (key_view.empty() || n_slots == 0)
         return lease;
@@ -68,6 +69,16 @@ SlotAffinity::Lease SlotAffinity::acquire(std::string_view key_view, std::uint32
         assign(key, 0);
         chosen = 0;
     } else {
+        // Warmed slots are preferred for a new session, because using one
+        // avoids immediately discarding the prefix populated by warm-up.
+        // Keep this advisory: malformed/out-of-range entries and owned slots
+        // are ignored, then the historical lowest-unowned policy applies.
+        for (const auto slot : preferred_slots) {
+            if (slot < n_slots && !slots_[slot].owned) {
+                chosen = slot;
+                break;
+            }
+        }
         for (std::uint32_t i = 0; i < n_slots && !chosen; ++i) {
             if (!slots_[i].owned)
                 chosen = i;

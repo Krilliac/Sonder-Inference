@@ -16,7 +16,8 @@ sonder_module_sources(
     src/serve_main.cpp
     src/server.cpp
     src/sha256.cpp
-    src/socket.cpp)
+    src/socket.cpp
+    src/warmup_config.cpp)
 sonder_module_include_directories(include)
 sonder_module_define(SONDER_HAS_SERVER)
 

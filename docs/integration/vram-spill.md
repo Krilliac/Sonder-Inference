@@ -60,7 +60,9 @@ child's `\GPU Process Memory(pid_<PID>_*)\Dedicated Usage` and
 It samples again every `sample_interval_ms`. Sampling runs on the
 supervisor's monitor thread and never on a request path.
 
-The child counts as **spilled** when `shared > baseline_mib + threshold_mib`.
+The child counts as **spilled** when `shared > baseline + threshold_mib`,
+where `baseline = baseline_mib + baseline_per_1k_ctx_mib × (--ctx-size / 1024)`.
+`baseline_per_1k_ctx_mib` defaults to 0 (a fixed baseline).
 
 - The default threshold is **256 MiB** above a baseline of **0**. In the Q3
   runs, the largest clean sample was 198 MiB and the smallest spilled sample
@@ -74,6 +76,18 @@ The child counts as **spilled** when `shared > baseline_mib + threshold_mib`.
   model loads already contains any spill that happened during the load, so
   it cannot serve as its own baseline. Raise `baseline_mib` if your
   configuration keeps more pinned host memory when it is clean.
+- **MTP speculation raises the clean line.** With `--spec-type draft-mtp
+  --spec-draft-n-max 2` (Q3_K_XL, q4_0/q4_0 KV), the clean shared usage
+  measured 2026-09-30 was about 126 MiB + 2 MiB per 1k ctx, plus about
+  40 MiB after the first prompt: roughly 310 MiB at 73,728, already above
+  the default 256 MiB limit. Runs 33 MiB or more above that line were
+  slower. For such a profile use `"baseline_mib": 166,
+  "baseline_per_1k_ctx_mib": 2, "threshold_mib": 32`. Otherwise `auto_fit`
+  shrinks the context of a healthy child. Without speculation the clean
+  line grows about 1 MiB per 1k ctx, which the default 256 MiB threshold
+  already absorbs up to about 140k.
+- `shared_baseline_bytes` in the runtime status and telemetry reports the
+  effective baseline at the child's current `--ctx-size`.
 
 | policy | on a spilled child after readiness |
 |---|---|
@@ -158,6 +172,7 @@ the default.
     "policy": "warn",
     "threshold_mib": 256,
     "baseline_mib": 0,
+    "baseline_per_1k_ctx_mib": 0,
     "sample_interval_ms": 5000,
     "fit_step_factor": 0.85,
     "fit_step_align": 1024,
