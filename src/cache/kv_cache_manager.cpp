@@ -40,8 +40,12 @@ KvCacheManager::KvCacheManager(KvCacheConfig config, std::unique_ptr<EvictionPol
 // --- hashing / index ---------------------------------------------------------
 
 std::uint64_t KvCacheManager::chain_hash(std::uint64_t parent, const CacheFingerprint& fp,
-                                         std::span<const TokenId> tokens) const noexcept {
+                                         std::span<const TokenId> tokens,
+                                         ModelArchitecture architecture) const noexcept {
     std::uint64_t h = mix64(parent ^ mix64(fp.value ^ 0x5bd1e9955bd1e995ULL));
+    if (architecture != ModelArchitecture::attention_only) {
+        h = mix64(h ^ mix64(static_cast<std::uint8_t>(architecture)));
+    }
     for (const TokenId t : tokens) {
         h = mix64(h ^ static_cast<std::uint32_t>(t));
     }
@@ -55,12 +59,14 @@ std::uint64_t KvCacheManager::prev_hash(const Sequence& seq, std::size_t block_i
 
 std::optional<BlockId> KvCacheManager::lookup(std::uint64_t hash, std::uint64_t parent,
                                               const CacheFingerprint& fp,
-                                              std::span<const TokenId> tokens) const {
+                                              std::span<const TokenId> tokens,
+                                              ModelArchitecture architecture) const {
     const auto it = prefix_index_.find(hash);
     if (it == prefix_index_.end()) return std::nullopt;
     const Block& blk = blocks_[it->second];
     // Correctness beats hit rate: verify everything we can, not just the hash.
-    if (blk.parent_hash != parent || !(blk.fingerprint == fp) || blk.tokens.size() != tokens.size() ||
+    if (blk.parent_hash != parent || !(blk.fingerprint == fp) || blk.architecture != architecture ||
+        blk.tokens.size() != tokens.size() ||
         !std::equal(tokens.begin(), tokens.end(), blk.tokens.begin())) {
         return std::nullopt;
     }
@@ -80,7 +86,8 @@ void KvCacheManager::finalize_block(Sequence& seq, std::size_t block_index) {
     Block& blk = blocks_[b];
     blk.parent_hash = prev_hash(seq, block_index);
     blk.fingerprint = seq.options.fingerprint;
-    blk.hash = chain_hash(blk.parent_hash, blk.fingerprint, blk.tokens);
+    blk.architecture = seq.options.architecture;
+    blk.hash = chain_hash(blk.parent_hash, blk.fingerprint, blk.tokens, blk.architecture);
     blk.has_hash = true;
     blk.depth = static_cast<std::uint32_t>(block_index);
     if (config_.enable_prefix_caching && !prefix_index_.contains(blk.hash)) {
@@ -92,6 +99,7 @@ void KvCacheManager::finalize_block(Sequence& seq, std::size_t block_index) {
 // --- block pool --------------------------------------------------------------
 
 void KvCacheManager::reset_block(BlockId b) {
+    remove_checkpoints_for_block(b);
     Block& blk = blocks_[b];
     blk.tokens.clear();
     blk.has_hash = false;
@@ -102,6 +110,7 @@ void KvCacheManager::reset_block(BlockId b) {
     blk.depth = 0;
     blk.priority = 0;
     blk.fingerprint = {};
+    blk.architecture = ModelArchitecture::attention_only;
 }
 
 BlockId KvCacheManager::allocate_block(SequenceId owner) {
@@ -162,12 +171,23 @@ void KvCacheManager::ensure_tail_writable(SequenceId id, Sequence& seq, AppendRe
     const std::size_t k = seq.num_tokens % config_.block_size_tokens;
     const BlockId b = seq.blocks.back();
     Block& blk = blocks_[b];
-    if (blk.ref_count > 1) {
+    if (blk.ref_count > 1 || (seq.options.architecture != ModelArchitecture::attention_only &&
+                              checkpoint_uses_block(b))) {
         const BlockId nb = allocate_block(id);  // availability pre-checked by caller
         Block& nblk = blocks_[nb];
         nblk.tokens.assign(blk.tokens.begin(), blk.tokens.begin() + static_cast<std::ptrdiff_t>(k));
         nblk.fingerprint = seq.options.fingerprint;
         acquire(nb, seq);
+        // A non-indexed tail will be released below. Preserve checkpoints whose
+        // entire prefix survives the copy by moving their lineage reference.
+        if (!blk.registered && blk.ref_count == 1) {
+            for (auto& cp : checkpoints_) {
+                for (std::size_t index = 0; index < cp.blocks.size(); ++index) {
+                    if (cp.blocks[index] == b &&
+                        cp.state.position - index * config_.block_size_tokens <= k) cp.blocks[index] = nb;
+                }
+            }
+        }
         release(b, seq.options.priority);
         seq.blocks.back() = nb;
         pending_copies_.push_back({b, nb, static_cast<std::uint32_t>(k)});
@@ -190,10 +210,87 @@ Status KvCacheManager::add_sequence(SequenceId id, const SequenceOptions& option
     if (sequences_.contains(id)) {
         return Status(ErrorCode::invalid_state, "sequence " + seq_str(id) + " already exists");
     }
+    // Owner IDs may be recycled, but old backend state must not be attributed
+    // to the new owner incarnation.
+    for (std::size_t i = checkpoints_.size(); i > 0; --i) {
+        if (checkpoints_[i - 1].state.owner == id) erase_checkpoint(i - 1);
+    }
     Sequence seq;
     seq.options = options;
     sequences_.emplace(id, std::move(seq));
     return Status::success();
+}
+
+Status KvCacheManager::save_checkpoint(SequenceId id, std::size_t position,
+                                       std::uint64_t state_size) {
+    const auto it = sequences_.find(id);
+    if (it == sequences_.end()) return Status(ErrorCode::not_found, "unknown sequence " + seq_str(id));
+    const Sequence& seq = it->second;
+    if (seq.options.architecture == ModelArchitecture::attention_only || position == 0 ||
+        position > seq.num_tokens) {
+        return Status(ErrorCode::invalid_argument, "invalid recurrent checkpoint position or architecture");
+    }
+    if (state_size == 0 || config_.max_checkpoints == 0 || state_size > config_.max_checkpoint_bytes) {
+        return Status(ErrorCode::invalid_argument, "checkpoint exceeds configured capacity");
+    }
+    Checkpoint saved;
+    saved.state = {position, state_size, id};
+    saved.fingerprint = seq.options.fingerprint;
+    saved.architecture = seq.options.architecture;
+    saved.blocks.assign(seq.blocks.begin(), seq.blocks.begin() +
+                        static_cast<std::ptrdiff_t>(blocks_for_tokens(position)));
+    // Validate before mutating accounting. Subtraction keeps UINT64_MAX budgets safe.
+    for (std::size_t i = checkpoints_.size(); i > 0; --i) {
+        if (checkpoints_[i - 1].state.owner == id && checkpoints_[i - 1].state.position == position) {
+            erase_checkpoint(i - 1);
+        }
+    }
+    std::uint64_t total = 0;
+    for (const auto& cp : checkpoints_) total += cp.state.state_size;
+    while (!checkpoints_.empty() &&
+           (total > config_.max_checkpoint_bytes - state_size || checkpoints_.size() >= config_.max_checkpoints)) {
+        const auto victim = std::min_element(checkpoints_.begin(), checkpoints_.end(),
+                                            [](const Checkpoint& a, const Checkpoint& b) {
+                                                return a.last_use < b.last_use;
+                                            });
+        total -= victim->state.state_size;
+        erase_checkpoint(static_cast<std::size_t>(victim - checkpoints_.begin()));
+    }
+    saved.last_use = ++clock_;
+    checkpoints_.push_back(std::move(saved));
+    return Status::success();
+}
+
+Status KvCacheManager::remove_checkpoint(SequenceId id, std::size_t position) {
+    for (std::size_t i = 0; i < checkpoints_.size(); ++i) {
+        if (checkpoints_[i].state.owner == id && checkpoints_[i].state.position == position) {
+            erase_checkpoint(i);
+            return Status::success();
+        }
+    }
+    return Status(ErrorCode::not_found, "checkpoint not found");
+}
+
+std::vector<TokenId> KvCacheManager::sequence_tokens(const Sequence& seq) const {
+    std::vector<TokenId> tokens;
+    tokens.reserve(seq.num_tokens);
+    for (const BlockId b : seq.blocks) {
+        const auto& block = blocks_[b].tokens;
+        const auto take = std::min(seq.num_tokens - tokens.size(), block.size());
+        tokens.insert(tokens.end(), block.begin(), block.begin() + static_cast<std::ptrdiff_t>(take));
+    }
+    return tokens;
+}
+
+std::optional<RecurrentStateCheckpoint> KvCacheManager::checkpoint_at(SequenceId id,
+                                                                     std::size_t position) const {
+    const auto it = sequences_.find(id);
+    if (it == sequences_.end() || position > it->second.num_tokens) return std::nullopt;
+    const auto& seq = it->second;
+    const auto tokens = sequence_tokens(seq);
+    const auto cp = find_checkpoint(seq.options.fingerprint, seq.options.architecture, tokens, position);
+    if (!cp || checkpoints_[*cp].state.position != position) return std::nullopt;
+    return checkpoints_[*cp].state;
 }
 
 Status KvCacheManager::fork_sequence(SequenceId parent, SequenceId child,
@@ -204,6 +301,16 @@ Status KvCacheManager::fork_sequence(SequenceId parent, SequenceId child,
     }
     if (sequences_.contains(child)) {
         return Status(ErrorCode::invalid_state, "sequence " + seq_str(child) + " already exists");
+    }
+    if (pit->second.options.architecture != ModelArchitecture::attention_only && pit->second.num_tokens != 0) {
+        const auto state = checkpoint_at(parent, pit->second.num_tokens);
+        if (!state || state->owner == child) {
+            return Status(ErrorCode::invalid_state, "recurrent fork requires an exact saved checkpoint");
+        }
+    }
+    // Discard state left by an earlier incarnation of the child ID.
+    for (std::size_t i = checkpoints_.size(); i > 0; --i) {
+        if (checkpoints_[i - 1].state.owner == child) erase_checkpoint(i - 1);
     }
     Sequence copy = pit->second;
     if (child_priority) copy.options.priority = *child_priority;
@@ -235,6 +342,32 @@ Status KvCacheManager::append_tokens(SequenceId id, std::span<const TokenId> tok
     }
 
     const std::size_t bs = config_.block_size_tokens;
+    std::size_t recurrent_limit = 0;
+    std::optional<RecurrentStateCheckpoint> selected;
+    // No checkpoint scan or growing prefix copy on attention/decode paths.
+    if (seq.options.architecture != ModelArchitecture::attention_only &&
+        config_.enable_prefix_caching && seq.prefix_streak && n >= bs) {
+        auto combined = sequence_tokens(seq);
+        combined.insert(combined.end(), tokens.begin(), tokens.end());
+        const auto raw = match_blocks(seq.options.fingerprint, combined, seq.options.architecture);
+        const auto cp = find_checkpoint(seq.options.fingerprint, seq.options.architecture, combined, raw);
+        if (cp && checkpoints_[*cp].state.position > seq.num_tokens) {
+            recurrent_limit = checkpoints_[*cp].state.position;
+            selected = checkpoints_[*cp].state;
+            // Restoring inside a block may need an additional COW block to
+            // preserve the saved lineage. Fall back to recompute if the
+            // worst-case reservation has no room for it.
+            if (recurrent_limit % bs != 0 && need == available_blocks()) {
+                recurrent_limit = 0;
+                selected.reset();
+            } else {
+                checkpoints_[*cp].last_use = ++clock_;
+            }
+        }
+        const auto usable = std::max(seq.num_tokens, recurrent_limit);
+        result.tokens_checkpoint_limited = raw > usable ? raw - usable : 0;
+        counters_.checkpoint_limited_tokens += result.tokens_checkpoint_limited;
+    }
     std::size_t i = 0;
     while (i < n) {
         const std::size_t k = seq.num_tokens % bs;
@@ -256,19 +389,25 @@ Status KvCacheManager::append_tokens(SequenceId id, std::span<const TokenId> tok
         if (config_.enable_prefix_caching && seq.prefix_streak && remaining >= bs) {
             const auto chunk = tokens.subspan(i, bs);
             const std::uint64_t parent = prev_hash(seq, seq.blocks.size());
-            const std::uint64_t h = chain_hash(parent, seq.options.fingerprint, chunk);
-            if (const auto hit = lookup(h, parent, seq.options.fingerprint, chunk)) {
-                acquire(*hit, seq);
-                seq.blocks.push_back(*hit);
-                seq.num_tokens += bs;
-                seq.cached_prefix += bs;
-                i += bs;
-                ++result.blocks_reused;
-                result.tokens_reused += bs;
-                ++counters_.prefix_hit_blocks;
-                counters_.avoided_prefill_tokens += bs;
-                emit({CacheEvent::Kind::reused, id, *hit, kInvalidBlock, PressureLevel::normal});
-                continue;
+            const std::uint64_t h = chain_hash(parent, seq.options.fingerprint, chunk, seq.options.architecture);
+            if (seq.options.architecture == ModelArchitecture::attention_only ||
+                recurrent_limit > seq.num_tokens) {
+                if (const auto hit = lookup(h, parent, seq.options.fingerprint, chunk,
+                                            seq.options.architecture)) {
+                    const auto take = seq.options.architecture == ModelArchitecture::attention_only
+                                          ? bs : std::min(bs, recurrent_limit - seq.num_tokens);
+                    acquire(*hit, seq);
+                    seq.blocks.push_back(*hit);
+                    seq.num_tokens += take;
+                    seq.cached_prefix += take;
+                    i += take;
+                    ++result.blocks_reused;
+                    result.tokens_reused += take;
+                    ++counters_.prefix_hit_blocks;
+                    counters_.avoided_prefill_tokens += take;
+                    emit({CacheEvent::Kind::reused, id, *hit, kInvalidBlock, PressureLevel::normal});
+                    continue;
+                }
             }
             ++counters_.prefix_miss_lookups;
         }
@@ -287,6 +426,10 @@ Status KvCacheManager::append_tokens(SequenceId id, std::span<const TokenId> tok
         ++result.blocks_allocated;
         if (take == bs) finalize_block(seq, seq.blocks.size() - 1);
     }
+    if (selected && result.tokens_reused > 0) {
+        result.checkpoint = selected;
+        counters_.checkpoint_reused_tokens += result.tokens_reused;
+    }
     result.tokens_appended = n;
     if (out) *out = result;
     update_pressure();
@@ -302,10 +445,20 @@ Status KvCacheManager::truncate(SequenceId id, std::size_t new_length) {
     if (new_length > seq.num_tokens) {
         return Status(ErrorCode::invalid_argument, "truncate beyond sequence length");
     }
+    if (new_length == seq.num_tokens) return Status::success();
+    if (seq.options.architecture != ModelArchitecture::attention_only && new_length != 0 &&
+        !checkpoint_at(id, new_length)) {
+        return Status(ErrorCode::invalid_argument, "recurrent truncate requires an exact saved checkpoint");
+    }
     const std::size_t keep = blocks_for_tokens(new_length);
     while (seq.blocks.size() > keep) {
         release(seq.blocks.back(), seq.options.priority);
         seq.blocks.pop_back();
+    }
+    for (std::size_t i = checkpoints_.size(); i > 0; --i) {
+        if (checkpoints_[i - 1].state.owner == id && checkpoints_[i - 1].state.position > new_length) {
+            erase_checkpoint(i - 1);
+        }
     }
     seq.num_tokens = new_length;
     seq.cached_prefix = std::min(seq.cached_prefix, new_length);
@@ -366,20 +519,28 @@ std::span<const TokenId> KvCacheManager::block_tokens(BlockId block) const noexc
     return blocks_[block].tokens;
 }
 
-std::size_t KvCacheManager::match_prefix(const CacheFingerprint& fingerprint,
-                                         std::span<const TokenId> tokens) const {
+std::size_t KvCacheManager::match_blocks(const CacheFingerprint& fingerprint,
+                                         std::span<const TokenId> tokens, ModelArchitecture architecture) const {
     if (!config_.enable_prefix_caching) return 0;
     const std::size_t bs = config_.block_size_tokens;
     std::uint64_t parent = 0;
     std::size_t matched = 0;
-    while (matched + bs <= tokens.size()) {
+    while (tokens.size() - matched >= bs) {
         const auto chunk = tokens.subspan(matched, bs);
-        const std::uint64_t h = chain_hash(parent, fingerprint, chunk);
-        if (!lookup(h, parent, fingerprint, chunk)) break;
+        const auto h = chain_hash(parent, fingerprint, chunk, architecture);
+        if (!lookup(h, parent, fingerprint, chunk, architecture)) break;
         parent = h;
         matched += bs;
     }
     return matched;
+}
+
+std::size_t KvCacheManager::match_prefix(const CacheFingerprint& fingerprint,
+                                         std::span<const TokenId> tokens, ModelArchitecture architecture) const {
+    const auto raw = match_blocks(fingerprint, tokens, architecture);
+    if (architecture == ModelArchitecture::attention_only) return raw;
+    const auto cp = find_checkpoint(fingerprint, architecture, tokens, raw);
+    return cp ? checkpoints_[*cp].state.position : 0;
 }
 
 std::size_t KvCacheManager::blocks_for_tokens(std::size_t n) const noexcept {
@@ -398,7 +559,9 @@ std::size_t KvCacheManager::blocks_needed(SequenceId id, std::size_t n) const no
     std::size_t room = 0;
     if (k != 0) {
         room = bs - k;
-        if (blocks_[seq.blocks.back()].ref_count > 1) need += 1;  // copy-on-write
+        if (blocks_[seq.blocks.back()].ref_count > 1 ||
+            (seq.options.architecture != ModelArchitecture::attention_only &&
+             checkpoint_uses_block(seq.blocks.back()))) need += 1;  // copy-on-write
     }
     const std::size_t rest = n > room ? n - room : 0;
     return need + blocks_for_tokens(rest);
@@ -434,6 +597,8 @@ KvCacheStats KvCacheManager::stats() const {
     s.bytes_per_block = config_.bytes_per_token * config_.block_size_tokens;
     s.pinned_bytes = s.bytes_per_block * s.pinned_blocks;
     s.cached_bytes = s.bytes_per_block * s.cached_blocks;
+    s.checkpoints = checkpoints_.size();
+    for (const auto& cp : checkpoints_) s.checkpoint_bytes += cp.state.state_size;
     s.utilization = s.total_blocks == 0 ? 0.0
                                         : static_cast<double>(s.pinned_blocks) / static_cast<double>(s.total_blocks);
     s.pressure = pressure();
@@ -458,6 +623,7 @@ std::size_t KvCacheManager::clear_cached() {
         emit({CacheEvent::Kind::evicted, 0, b, kInvalidBlock, PressureLevel::normal});
         ++n;
     }
+    while (!checkpoints_.empty()) erase_checkpoint(checkpoints_.size() - 1);
     update_pressure();
     return n;
 }
@@ -474,8 +640,66 @@ void KvCacheManager::update_pressure() {
     }
 }
 
+std::optional<std::size_t> KvCacheManager::find_checkpoint(const CacheFingerprint& fingerprint,
+                                                          ModelArchitecture architecture,
+                                                          std::span<const TokenId> tokens,
+                                                          std::size_t limit) const {
+    std::optional<std::size_t> best;
+    for (std::size_t i = 0; i < checkpoints_.size(); ++i) {
+        const auto& cp = checkpoints_[i];
+        if (cp.fingerprint != fingerprint || cp.architecture != architecture || cp.state.position > limit ||
+            cp.state.position > tokens.size() || (best && cp.state.position <= checkpoints_[*best].state.position)) {
+            continue;
+        }
+        std::size_t matched = 0;
+        for (const auto b : cp.blocks) {
+            const auto& block = blocks_[b].tokens;
+            const auto take = std::min(cp.state.position - matched, block.size());
+            if (!std::equal(block.begin(), block.begin() + static_cast<std::ptrdiff_t>(take),
+                            tokens.begin() + static_cast<std::ptrdiff_t>(matched))) break;
+            matched += take;
+        }
+        if (matched == cp.state.position) best = i;
+    }
+    return best;
+}
+
+bool KvCacheManager::checkpoint_uses_block(BlockId block) const noexcept {
+    return std::any_of(checkpoints_.begin(), checkpoints_.end(), [block](const Checkpoint& cp) {
+        return std::find(cp.blocks.begin(), cp.blocks.end(), block) != cp.blocks.end();
+    });
+}
+
+void KvCacheManager::erase_checkpoint(std::size_t index) {
+    const auto state = checkpoints_[index].state;
+    checkpoints_.erase(checkpoints_.begin() + static_cast<std::ptrdiff_t>(index));
+    ++counters_.checkpoint_evictions;
+    emit({CacheEvent::Kind::checkpoint_evicted, state.owner, kInvalidBlock, kInvalidBlock,
+          PressureLevel::normal, state});
+}
+
+void KvCacheManager::remove_checkpoints_for_block(BlockId block) {
+    for (std::size_t i = checkpoints_.size(); i > 0; --i) {
+        const auto& refs = checkpoints_[i - 1].blocks;
+        if (std::find(refs.begin(), refs.end(), block) != refs.end()) erase_checkpoint(i - 1);
+    }
+}
+
 bool KvCacheManager::validate() const {
     const std::size_t bs = config_.block_size_tokens;
+    if (checkpoints_.size() > config_.max_checkpoints) return false;
+    std::uint64_t bytes = 0;
+    for (const auto& cp : checkpoints_) {
+        if (cp.state.state_size == 0 || cp.state.state_size > config_.max_checkpoint_bytes - bytes ||
+            cp.state.position == 0 || cp.architecture == ModelArchitecture::attention_only ||
+            cp.blocks.size() != blocks_for_tokens(cp.state.position)) return false;
+        bytes += cp.state.state_size;
+        std::size_t remaining = cp.state.position;
+        for (const auto b : cp.blocks) {
+            if (b >= blocks_.size() || blocks_[b].tokens.size() < std::min(remaining, bs)) return false;
+            remaining -= std::min(remaining, bs);
+        }
+    }
     std::vector<std::uint32_t> refs(blocks_.size(), 0);
     for (const auto& [id, seq] : sequences_) {
         if (seq.blocks.size() != blocks_for_tokens(seq.num_tokens)) return false;

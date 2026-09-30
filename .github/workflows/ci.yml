@@ -178,11 +178,22 @@ jobs:
       - name: Test
         run: ctest --preset ci-linux
 
-  # TLS ON with Schannel. Non-blocking until it has been green on MSVC.
-  # OpenSSL is installed only for the in-test server and PKI generation.
+  # TLS ON with Schannel (required check).
+  # OpenSSL is built only for the in-test server and PKI generation: from the
+  # official openssl/openssl GitHub release tarball, pinned by SHA-256
+  # (docs/LICENSE_REVIEW.md), and the install is cached under that hash. The
+  # release assets are never deleted, so a vendor dropping old installers
+  # (slproweb removed Win64OpenSSL-4_0_2.exe, which broke `choco install
+  # openssl --version=4.0.2`) cannot break this job; a cache miss only costs
+  # a rebuild. Bump OPENSSL_VERSION and OPENSSL_SHA256 together.
   tls-windows:
     name: windows-latest (TLS, Schannel)
     runs-on: windows-latest
+    env:
+      OPENSSL_VERSION: 4.0.3
+      OPENSSL_SHA256: 325b5c806167c13b40b1ffeadfe0248197c00eccc4cf123ec1e28d2d2fd216d9
+      OPENSSL_CONFIG: VC-WIN64A no-asm no-apps no-tests no-docs no-makedepend
+      OPENSSL_PREFIX: C:\sonder-openssl
     steps:
       - uses: actions/checkout@v7
 
@@ -195,14 +206,76 @@ jobs:
         shell: pwsh
         run: if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
 
-      - name: OpenSSL for the in-test TLS server only
+      - name: Cache OpenSSL (in-test TLS server only)
+        id: openssl-cache
+        uses: actions/cache@v6
+        with:
+          path: C:\sonder-openssl
+          # Bump the trailing revision when OPENSSL_CONFIG or the prefix changes.
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ env.OPENSSL_SHA256 }}-vc-win64a-r1
+
+      - name: Build OpenSSL from the pinned source (in-test TLS server only)
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
         shell: pwsh
-        # Pinned to the reviewed revision (docs/LICENSE_REVIEW.md).
-        run: choco install openssl --version=4.0.2 -y --no-progress
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tmp = Join-Path $env:RUNNER_TEMP "openssl-$env:OPENSSL_VERSION.tar.gz"
+          Invoke-WebRequest -Uri "https://github.com/openssl/openssl/releases/download/openssl-$env:OPENSSL_VERSION/openssl-$env:OPENSSL_VERSION.tar.gz" -OutFile $tmp
+          $hash = (Get-FileHash -Algorithm SHA256 $tmp).Hash.ToLower()
+          if ($hash -ne $env:OPENSSL_SHA256) { throw "OpenSSL tarball hash mismatch: $hash" }
+          tar -xzf $tmp -C $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) { throw "tar failed ($LASTEXITCODE)" }
+          Set-Location (Join-Path $env:RUNNER_TEMP "openssl-$env:OPENSSL_VERSION")
+          # OpenSSL needs a native Windows perl (the runner's Strawberry Perl),
+          # not the MSYS perl that ships with Git.
+          $perl = 'C:\Strawberry\perl\bin\perl.exe'
+          if (-not (Test-Path $perl)) { $perl = (Get-Command perl.exe).Source }
+          & $perl -v | Select-Object -First 2
+          & $perl Configure @($env:OPENSSL_CONFIG -split ' ') "--prefix=$env:OPENSSL_PREFIX" "--openssldir=$env:OPENSSL_PREFIX\ssl"
+          if ($LASTEXITCODE -ne 0) { throw "OpenSSL Configure failed ($LASTEXITCODE)" }
+          nmake /nologo
+          if ($LASTEXITCODE -ne 0) { throw "OpenSSL build failed ($LASTEXITCODE)" }
+          nmake /nologo install_sw
+          if ($LASTEXITCODE -ne 0) { throw "OpenSSL install failed ($LASTEXITCODE)" }
+
+      # A stale or partial cache must not pass silently.
+      - name: OpenSSL install is the pinned version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $h = Join-Path $env:OPENSSL_PREFIX 'include\openssl\opensslv.h'
+          if (-not (Test-Path $h)) { throw "$h not found" }
+          $v = Select-String -Path $h -Pattern '^#\s*define OPENSSL_VERSION_TEXT'
+          Write-Host $v.Line
+          if ($v.Line -notmatch [regex]::Escape("OpenSSL $env:OPENSSL_VERSION ")) { throw "expected OpenSSL $env:OPENSSL_VERSION" }
+          foreach ($f in 'lib\libssl.lib', 'lib\libcrypto.lib') {
+            if (-not (Test-Path (Join-Path $env:OPENSSL_PREFIX $f))) { throw "$f missing" }
+          }
+          $dlls = @(Get-ChildItem (Join-Path $env:OPENSSL_PREFIX 'bin') -Filter 'lib*.dll' | ForEach-Object Name)
+          Write-Host "DLLs: $($dlls -join ', ')"
+          if (-not ($dlls -match '^libssl-') -or -not ($dlls -match '^libcrypto-')) { throw 'OpenSSL DLLs missing' }
+          # doctest discovery runs sonder_tls_tests.exe at build time, so the
+          # DLLs must be on PATH for Build as well as Test (Chocolatey used to
+          # put them on the machine PATH).
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:OPENSSL_PREFIX 'bin')
 
       - name: Configure
         shell: pwsh
-        run: cmake --preset ci-windows -DSONDER_WITH_TLS=ON "-DOPENSSL_ROOT_DIR=C:/Program Files/OpenSSL"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:OPENSSL_PREFIX -replace '\\','/'
+          cmake --preset ci-windows -DSONDER_WITH_TLS=ON "-DOPENSSL_ROOT_DIR=$root"
+          if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }
+          # find_package(OpenSSL) must have picked the pinned build, not
+          # another copy on the image.
+          $cache = Get-Content 'build\ci-windows\CMakeCache.txt'
+          $found = $cache | Select-String '^(OPENSSL_INCLUDE_DIR|LIB_EAY_RELEASE|SSL_EAY_RELEASE|OPENSSL_SSL_LIBRARY|OPENSSL_CRYPTO_LIBRARY)[:=]'
+          $found | ForEach-Object { Write-Host $_.Line }
+          if (@($found).Count -eq 0) { throw 'no OpenSSL entries in CMakeCache.txt' }
+          foreach ($l in $found) {
+            $p = ($l.Line -split '=', 2)[1]
+            if ($p -and $p -notlike "$root*") { throw "OpenSSL resolved outside $root : $($l.Line)" }
+          }
 
       - name: Build
         run: cmake --build --preset ci-windows
@@ -228,6 +301,4 @@ jobs:
 
       - name: Test
         shell: pwsh
-        run: |
-          $env:PATH = "C:\Program Files\OpenSSL\bin;$env:PATH"
-          ctest --preset ci-windows
+        run: ctest --preset ci-windows

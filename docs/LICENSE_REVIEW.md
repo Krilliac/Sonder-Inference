@@ -113,13 +113,13 @@ No license conclusions from the initial broad web sweep are considered authorita
 
 ### OpenSSL (optional TLS, system library)
 - repository: https://github.com/openssl/openssl
-- revision/tag: the system library, 1.1.1 or newer. CI pins what it links: the `ubuntu-24.04` image's libssl-dev (OpenSSL 3.0.x) for tls-linux, and Chocolatey `openssl` 4.0.2 for the Windows in-test server
-- evaluated: 2026-09-26
+- revision/tag: the system library, 1.1.1 or newer. CI pins what it links: the `ubuntu-24.04` image's libssl-dev (OpenSSL 3.0.x) for tls-linux, and, for the Windows in-test server only, OpenSSL 4.0.3 built in CI from the official release tarball `https://github.com/openssl/openssl/releases/download/openssl-4.0.3/openssl-4.0.3.tar.gz`, SHA-256 `325b5c806167c13b40b1ffeadfe0248197c00eccc4cf123ec1e28d2d2fd216d9` (matches the `.sha256` published with the GitHub release and on openssl.org). Until 2026-09-29 this was Chocolatey `openssl` 4.0.2, which broke when slproweb.com deleted the 4.0.2 installer the package downloads
+- evaluated: 2026-09-26; Windows CI source re-evaluated 2026-09-29 (4.0.3 tarball: `LICENSE.txt` is the Apache License 2.0, `VERSION.dat` 4.0.3)
 - license: Apache License 2.0 for OpenSSL 3.x and 4.x; OpenSSL 1.1.1 uses the OpenSSL/SSLeay dual license
 - intended use: TLS for the internal HTTP client (`src/net/tls_openssl.cpp`) so the Ollama backend can reach `https://` nodes
 - linkage/process boundary: dynamic link to the system library, only when `SONDER_WITH_TLS=ON` with the openssl backend (default on Linux/macOS); the default build (TLS OFF) compiles and links nothing. Nothing is vendored or fetched. On Windows the TLS backend is Schannel (crypt32/secur32/bcrypt, OS components); OpenSSL is used there only by the loopback test server in `tests/tls`
 - notices required: none for dynamic linking to the system library; nothing is redistributed
-- security/maintenance notes: security updates come from the OS package; certificate verification, pinning and the `insecure_skip_verify` warning are documented in `docs/integration/tls.md`
+- security/maintenance notes: security updates come from the OS package. The Windows CI build (`tls-windows` in `.github/workflows/ci.yml`) downloads the tarball above, refuses it unless the SHA-256 matches, builds it with MSVC (`VC-WIN64A no-asm no-apps no-tests no-docs`) and caches the install under that hash; to move it, bump `OPENSSL_VERSION` and `OPENSSL_SHA256` together after checking the new release's hash and license. Certificate verification, pinning and the `insecure_skip_verify` warning are documented in `docs/integration/tls.md`
 - approved: yes, approved by Nate on 2026-09-26 (dynamic link to the system library, OFF by default; CI revisions pinned as above)
 
 ### Ollama (process boundary only)
