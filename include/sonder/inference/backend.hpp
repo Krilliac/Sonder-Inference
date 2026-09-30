@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -98,6 +99,12 @@ struct GenerateStats {
     std::uint64_t eval_ns = 0;             // backend-reported, 0 when unknown
     bool token_counts_from_backend = false;
     StopReason stop_reason = StopReason::none;
+    // Optional upstream observations, not Sonder's logical scheduler cache.
+    // Absence means the upstream did not report the counter (zero is valid).
+    std::optional<std::uint64_t> cached_tokens;
+    std::optional<std::uint64_t> draft_tokens;
+    std::optional<std::uint64_t> draft_accepted_tokens;
+    std::optional<double> predicted_tokens_per_second;
 };
 
 // Return false to stop generation early (StopReason::callback).

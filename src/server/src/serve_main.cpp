@@ -53,7 +53,7 @@ extern "C" void on_shutdown_signal(int sig) {
 constexpr const char* kServeUsage = R"(sonder-infer serve - local HTTP API and live telemetry (docs/SERVER.md)
 
 Usage:
-  sonder-infer serve --backend mock|ollama|llamacpp [--model ID]... [options]
+  sonder-infer serve --backend mock|ollama|llamacpp|llamaserver [--model ID]... [options]
 
 Server:
   --host HOST             listen address (default 127.0.0.1; non-loopback needs --token-file)
@@ -70,7 +70,8 @@ Server:
   --log-format text|json  access log and diagnostics on stderr (default text)
 
 Backend:
-  --backend NAME          mock (synthetic, tests only), ollama, llamacpp
+  --backend NAME          mock (synthetic, tests only), ollama, llamacpp,
+                          llamaserver (external llama-server or OpenAI upstream)
                           (env SONDER_INFER_BACKEND)
   --model ID              model to serve (repeatable; the first is the default and
                           answers to "default"; env SONDER_INFER_MODEL). The mock
@@ -96,6 +97,11 @@ Backend:
   --tensor-override P=D   llama.cpp: place tensors matching regex P on device D
                           (cpu, or a llama.cpp device such as Vulkan0); repeatable
   --mock-delay-ms N       mock backend per-token delay
+  --llamaserver-config PATH  JSON config (mode, URL/executable, args, TLS and timeouts)
+  --llamaserver-url URL     attach upstream URL (default http://127.0.0.1:8080)
+  --llamaserver-executable PATH  spawn executable
+  --llamaserver-arg ARG     repeatable spawn argument (passed verbatim)
+  --llamaserver-mode MODE   attach or spawn
 
 Telemetry (Observatory envelope v1; live at /v1/telemetry/sse and /v1/telemetry/ndjson):
   --telemetry-level L     off|metrics|standard|deep (default standard)
@@ -121,6 +127,9 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"max-connections", Kind::value}, {"max-body-bytes", Kind::value},
         {"shutdown-grace-ms", Kind::value}, {"ready-file", Kind::value},
         {"mock-delay-ms", Kind::value},  {"log-format", Kind::value},
+        {"llamaserver-config", Kind::value}, {"llamaserver-url", Kind::value},
+        {"llamaserver-executable", Kind::value}, {"llamaserver-arg", Kind::repeat},
+        {"llamaserver-mode", Kind::value},
         {"gpu-layers", Kind::value},     {"context-length", Kind::value},
         {"device", Kind::value},
         {"lazy-models", Kind::flag},     {"model-idle-ttl", Kind::value},
@@ -350,7 +359,7 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
     }
     o.backend.backend = a.get("backend").value_or(env.backend.value_or(""));
     if (o.backend.backend.empty()) {
-        return usage_error("--backend is required (mock, ollama or llamacpp; or set SONDER_INFER_BACKEND)");
+        return usage_error("--backend is required (mock, ollama, llamacpp or llamaserver; or set SONDER_INFER_BACKEND)");
     }
     o.models = a.all("model");
     o.device = a.get("device").value_or("");
@@ -359,6 +368,24 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
     }
     o.backend.ollama_url = a.get("ollama-url").value_or(env.ollama_url.value_or(""));
     o.backend.ollama_allow_remote = a.flags.count("ollama-allow-remote") != 0;
+    if (auto path = a.get("llamaserver-config")) {
+        if (auto st = load_llamaserver_config(*path, o.backend); !st.ok()) return usage_error(st.message());
+    }
+    if (auto v = a.get("llamaserver-mode")) o.backend.llamaserver_mode = *v;
+    if (auto v = a.get("llamaserver-url")) o.backend.llamaserver_url = *v;
+    if (auto v = a.get("llamaserver-executable")) o.backend.llamaserver_executable = *v;
+    if (!a.all("llamaserver-arg").empty()) o.backend.llamaserver_args = a.all("llamaserver-arg");
+    if (o.backend.backend == "llamaserver") {
+        if (o.backend.llamaserver_mode == "spawn") {
+            if (o.backend.llamaserver_executable.empty()) return usage_error("--llamaserver-executable is required in spawn mode");
+            for (const auto& arg : o.backend.llamaserver_args) {
+                if (arg == "--host" || arg.rfind("--host=", 0) == 0 || arg == "--port" || arg.rfind("--port=", 0) == 0)
+                    return usage_error("llamaserver spawn args must not override --host or --port");
+            }
+        } else if (!o.backend.llamaserver_mode.empty() && o.backend.llamaserver_mode != "attach") {
+            return usage_error("--llamaserver-mode must be attach or spawn");
+        }
+    }
     o.backend.model_dirs = a.all("model-dir");
     if (auto v = a.get("gpu-layers")) {
         if (*v == "-1") {

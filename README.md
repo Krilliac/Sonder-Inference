@@ -29,6 +29,9 @@ Version 0.1.0 (`CMakeLists.txt`). Design notes and plans are in
     cancellation ([src/backends/ollama](src/backends/ollama/README.md)).
   - `llamacpp`: direct llama.cpp/GGML backend, built only with
     `SONDER_WITH_LLAMA_CPP=ON` ([docs/integration/llamacpp.md](docs/integration/llamacpp.md)).
+  - `llamaserver`: supervised external llama-server, or an existing compatible
+    HTTP upstream; no llama.cpp linkage
+    ([docs/integration/llama-server.md](docs/integration/llama-server.md)).
 - **Scheduler** ([src/scheduler](src/scheduler/README.md)): priority queue,
   continuous batching, chunked prefill, admission and preemption policy.
 - **KV cache manager** ([src/cache](src/cache/README.md)): logical block

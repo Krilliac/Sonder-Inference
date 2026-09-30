@@ -222,7 +222,7 @@ void report_error(std::string_view command, const si::Status& status, const std:
 // ---------------------------------------------------------------------------
 // Backends
 // ---------------------------------------------------------------------------
-constexpr std::string_view kKnownBackends[] = {"mock", "ollama", "llamacpp"};
+constexpr std::string_view kKnownBackends[] = {"mock", "ollama", "llamacpp", "llamaserver"};
 
 std::vector<std::string> compiled_backends() {
 #if defined(SONDER_HAS_SERVER)
@@ -235,6 +235,9 @@ std::vector<std::string> compiled_backends() {
 #if defined(SONDER_HAS_LLAMACPP_BACKEND)
     names.emplace_back("llamacpp");
 #endif
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+    names.emplace_back("llamaserver");
+#endif
     return names;
 #endif
 }
@@ -245,6 +248,11 @@ struct BackendChoice {
     std::string ollama_url;
     bool ollama_allow_remote = false;
     std::chrono::microseconds mock_delay{0};
+    std::string llamaserver_config;
+    std::string llamaserver_url;
+    std::string llamaserver_executable;
+    std::string llamaserver_mode;
+    std::vector<std::string> llamaserver_args;
 };
 
 // Checks a backend name: unknown names and backends missing from this build
@@ -287,6 +295,11 @@ bool resolve_backend(std::string_view command, const Args& a, const cli::EnvDefa
     out.model = a.get("model").value_or(env.model.value_or(""));
     out.ollama_url = a.get("ollama-url").value_or(env.ollama_url.value_or(""));
     out.ollama_allow_remote = a.has("ollama-allow-remote");
+    out.llamaserver_config = a.get("llamaserver-config").value_or("");
+    out.llamaserver_url = a.get("llamaserver-url").value_or("");
+    out.llamaserver_executable = a.get("llamaserver-executable").value_or("");
+    out.llamaserver_mode = a.get("llamaserver-mode").value_or("");
+    out.llamaserver_args = a.all("llamaserver-arg");
     if (auto v = a.get("mock-delay-ms")) {
         int ms = 0;
         std::string error;
@@ -331,6 +344,22 @@ void register_backends(si::Engine& engine, const BackendChoice& choice) {
         setup.ollama_url = choice.ollama_url;
         setup.ollama_allow_remote = choice.ollama_allow_remote;
         setup.mock_token_delay = choice.mock_delay;
+        setup.llamaserver_config = choice.llamaserver_config;
+        setup.llamaserver_url = choice.llamaserver_url;
+        setup.llamaserver_executable = choice.llamaserver_executable;
+        setup.llamaserver_mode = choice.llamaserver_mode;
+        setup.llamaserver_args = choice.llamaserver_args;
+        if (name == "llamaserver" && !setup.llamaserver_config.empty()) {
+            if (auto st = si::load_llamaserver_config(setup.llamaserver_config, setup); !st.ok()) {
+                err() << "warning: backend " << name << " config unavailable: " << st.to_string() << "\n";
+                continue;
+            }
+            // Explicit CLI values override the file.
+            if (!choice.llamaserver_url.empty()) setup.llamaserver_url = choice.llamaserver_url;
+            if (!choice.llamaserver_executable.empty()) setup.llamaserver_executable = choice.llamaserver_executable;
+            if (!choice.llamaserver_mode.empty()) setup.llamaserver_mode = choice.llamaserver_mode;
+            if (!choice.llamaserver_args.empty()) setup.llamaserver_args = choice.llamaserver_args;
+        }
         auto backend = si::make_backend(setup);
         if (backend.ok()) {
             (void)engine.register_backend(std::move(backend.value()));
@@ -393,19 +422,45 @@ bool build_engine(std::string_view command, const Args& a, bool with_telemetry, 
 // ---------------------------------------------------------------------------
 // Option values
 // ---------------------------------------------------------------------------
-bool sampling_from_args(const Args& a, si::SamplingConfig& s, std::string& error) {
-    s = si::SamplingConfig::greedy(128, 42);
+bool sampling_from_args(const Args& a, si::SamplingConfig& s, std::string& error, bool upstream_defaults = false) {
+    s = upstream_defaults ? si::SamplingConfig{} : si::SamplingConfig::greedy(128, 42);
+    s.explicit_only = upstream_defaults;
+    const auto mark = [&s](const char* flag) {
+        static const std::pair<const char*, si::SamplingConfig::Field> kFlags[] = {
+            {"max-tokens", si::SamplingConfig::kMaxTokens},
+            {"temperature", si::SamplingConfig::kTemperature},
+            {"top-p", si::SamplingConfig::kTopP},
+            {"top-k", si::SamplingConfig::kTopK},
+            {"min-p", si::SamplingConfig::kMinP},
+            {"repeat-penalty", si::SamplingConfig::kRepeatPenalty},
+            {"typical-p", si::SamplingConfig::kTypicalP},
+            {"repeat-last-n", si::SamplingConfig::kRepeatLastN},
+            {"presence-penalty", si::SamplingConfig::kPresencePenalty},
+            {"frequency-penalty", si::SamplingConfig::kFrequencyPenalty},
+            {"num-ctx", si::SamplingConfig::kNumCtx},
+            {"seed", si::SamplingConfig::kSeed},
+            {"logit-bias", si::SamplingConfig::kLogitBias},
+            {"stop", si::SamplingConfig::kStop},
+        };
+        for (const auto& [name, field] : kFlags) {
+            if (std::string_view(name) == flag) s.explicit_fields |= field;
+        }
+    };
     constexpr int kIntMax = std::numeric_limits<int>::max();
     const auto int_opt = [&](const char* flag, int min, auto& out) {
         if (auto v = a.get(flag)) {
             int value = 0;
             if (!cli::parse_integer<int>(flag, *v, min, kIntMax, value, error)) return false;
             out = static_cast<std::remove_reference_t<decltype(out)>>(value);
+            mark(flag);
         }
         return true;
     };
     const auto float_opt = [&](const char* flag, float& out) {
-        if (auto v = a.get(flag)) return cli::parse_float(flag, *v, out, error);
+        if (auto v = a.get(flag)) {
+            if (!cli::parse_float(flag, *v, out, error)) return false;
+            mark(flag);
+        }
         return true;
     };
     if (!int_opt("max-tokens", 1, s.max_tokens) || !float_opt("temperature", s.temperature) ||
@@ -419,11 +474,14 @@ bool sampling_from_args(const Args& a, si::SamplingConfig& s, std::string& error
         std::uint64_t seed = 0;
         if (!cli::parse_u64("seed", *v, seed, error)) return false;
         s.seed = seed;
+        mark("seed");
     }
     if (auto v = a.get("logit-bias")) {
         if (!cli::parse_logit_bias(*v, s.logit_bias, error)) return false;
+        mark("logit-bias");
     }
     s.stop = a.stops;
+    if (!s.stop.empty()) mark("stop");
     if (auto st = si::validate(s); !st.ok()) {
         error = st.message();
         return false;
@@ -678,7 +736,8 @@ bool prepare_request(std::string_view command, const Args& a, const cli::EnvDefa
                      RequestSetup& setup, const std::function<bool(int&)>& read_inputs, int& rc) {
     if (!resolve_backend(command, a, env, true, true, setup.choice, rc)) return false;
     std::string error;
-    if (!sampling_from_args(a, setup.sampling, error) || !session_meta_from_args(a, setup.meta, error)) {
+    if (!sampling_from_args(a, setup.sampling, error, setup.choice.backend == "llamaserver") ||
+        !session_meta_from_args(a, setup.meta, error)) {
         rc = usage_error(command, error);
         return false;
     }
