@@ -55,7 +55,8 @@ placement profile per model, derived from the GGUF metadata:
 |---|---|
 | total weight bytes, per tensor class (attention, dense FFN, experts, shared, embeddings) | GGUF tensor table |
 | experts per layer / experts used per token | `*.expert_count`, `*.expert_used_count` |
-| KV bytes per token at a given context | layer count × head dims × dtype |
+| KV bytes per token at a given context | attention-layer count × KV head dims × dtype (exclude recurrent layers) |
+| recurrent-state checkpoint bytes | backend-reported state size per saved position, budgeted separately from token-indexed KV |
 
 A planner then chooses the cheapest placement that fits. It fills VRAM in
 priority order: hot shared weights, then KV cache for the requested context,

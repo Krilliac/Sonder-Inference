@@ -44,6 +44,22 @@ TEST_CASE("backend: load_model uses /api/show metadata; missing model fails") {
     CHECK(d.size_bytes == 2019393189u);
     CHECK(be->load_model({"absent:1b", "cpu:0"}).status().code() == ErrorCode::not_found);
     CHECK(be->load_model({"", "cpu:0"}).status().code() == ErrorCode::invalid_argument);
+    CHECK(d.architecture == ModelArchitecture::attention_only);
+}
+
+TEST_CASE("backend: load_model classifies a hybrid model from /api/show model_info") {
+    // Shape of Ollama 0.34 /api/show for Qwen3.8-27B (Gated DeltaNet hybrid).
+    FakeOllamaServer srv;
+    srv.set_show("qwen3.8:27b",
+                 R"({"details":{"format":"gguf","family":"qwen35"},"model_info":{)"
+                 R"("general.architecture":"qwen35","qwen35.context_length":262144,)"
+                 R"("qwen35.attention.head_count":24,"qwen35.attention.head_count_kv":4,)"
+                 R"("qwen35.full_attention_interval":4,"qwen35.ssm.conv_kernel":4,)"
+                 R"("qwen35.ssm.state_size":128,"qwen35.ssm.inner_size":6144}})");
+    auto be = make_ollama_backend(config_for(srv));
+    auto m = be->load_model({"qwen3.8:27b", "cpu:0"});
+    REQUIRE_MESSAGE(m.ok(), m.status().to_string());
+    CHECK(m.value()->descriptor().architecture == ModelArchitecture::hybrid);
 }
 
 TEST_CASE("backend: generate maps chunks and GenerateStats") {

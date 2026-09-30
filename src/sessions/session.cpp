@@ -424,6 +424,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         }
         spec.context_limit = static_cast<std::uint32_t>(std::min<std::uint64_t>(ctx_limit, 0xFFFFFFFFull));
         spec.fingerprint = model_fingerprint(*model_);
+        spec.architecture = model_->descriptor().architecture;
         result.scheduling.accounted_prompt_tokens = spec.prompt_tokens.size();
         result.scheduling.exact_prompt_tokens = spec.exact_tokens;
         const bool exact = spec.exact_tokens;

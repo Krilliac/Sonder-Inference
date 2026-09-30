@@ -5,6 +5,7 @@ sonder_add_module_tests(core
     test_sampling.cpp
     test_cancellation.cpp
     test_mock_backend.cpp
+    test_model_architecture.cpp
     test_session.cpp
     test_telemetry.cpp
     test_c_api.cpp

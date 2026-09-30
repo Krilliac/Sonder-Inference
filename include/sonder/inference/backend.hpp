@@ -16,6 +16,7 @@
 
 #include "sonder/inference/cancellation.hpp"
 #include "sonder/inference/error.hpp"
+#include "sonder/inference/model_architecture.hpp"
 #include "sonder/inference/sampling.hpp"
 
 namespace sonder::inference {
@@ -67,6 +68,7 @@ struct ModelDescriptor {
     // False when load_model() only fetched metadata and the weights are not
     // resident (e.g. Ollama loads lazily on first request).
     bool resident = true;
+    ModelArchitecture architecture = ModelArchitecture::attention_only;
 };
 
 struct ModelLoadOptions {

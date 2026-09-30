@@ -16,6 +16,8 @@
 #include <utility>
 #include <vector>
 
+#include "sonder/inference/model_architecture.hpp"
+
 namespace sonder::backends::llamacpp {
 
 using Token = std::int32_t;
@@ -146,6 +148,8 @@ struct ModelInfo {
     std::uint64_t n_params = 0;
     std::int32_t n_vocab = 0;
     std::uint32_t n_ctx = 0;  // context actually allocated (0 when vocab_only)
+    sonder::inference::ModelArchitecture architecture =
+        sonder::inference::ModelArchitecture::attention_only;
 };
 
 enum class TelemetryKind {
