@@ -107,6 +107,8 @@ TEST_CASE("truncates at stop sequences") {
     s.stop = {" " + w2};
     const auto cut = run(*m, "stop test", s);
     CHECK(cut.stats.stop_reason == StopReason::stop_sequence);
+    REQUIRE(cut.stats.matched_stop.has_value());
+    CHECK(*cut.stats.matched_stop == " " + w2);
     CHECK(cut.text.find(" " + w2) == std::string::npos);
     CHECK(full.text.rfind(cut.text, 0) == 0);  // prefix of the full output
 }

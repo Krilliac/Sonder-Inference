@@ -79,6 +79,9 @@ struct RequestOptions {
     // ChatRequest::thinking); ignored by generate() and the generic template.
     std::string session_key;
     ThinkingOptions thinking;
+    // Backend-native chat may return reasoning separately for protocols that
+    // expose it (for example Anthropic-compatible responses).
+    bool separate_reasoning = false;
 };
 
 struct GenerationResult {
@@ -89,6 +92,7 @@ struct GenerationResult {
     double ttft_ms = -1.0;   // -1 when no chunk was produced
     double total_ms = 0.0;
     SchedulingInfo scheduling;
+    std::string reasoning{};
 };
 
 class Engine;

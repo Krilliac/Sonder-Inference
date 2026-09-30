@@ -86,6 +86,10 @@ struct GenerateRequest {
 struct TokenChunk {
     std::string_view text;
     std::uint64_t index = 0;  // 0-based chunk index within the request
+    // Optional reasoning/thinking text. Backends populate this only when the
+    // caller explicitly requests separate reasoning; legacy callers continue
+    // to receive text-only chunks.
+    std::string_view reasoning{};
 };
 
 enum class StopReason { none, max_tokens, stop_sequence, end_of_sequence, cancelled, callback, error };
@@ -106,6 +110,9 @@ struct GenerateStats {
     std::optional<std::uint64_t> draft_tokens;
     std::optional<std::uint64_t> draft_accepted_tokens;
     std::optional<double> predicted_tokens_per_second;
+    // The exact configured stop sequence, when the backend/sampler identified
+    // it. A finish reason alone is not sufficient to populate this field.
+    std::optional<std::string> matched_stop = std::nullopt;
 };
 
 // Return false to stop generation early (StopReason::callback).
@@ -162,6 +169,9 @@ struct ChatRequest {
     // one llama-server slot). Empty = no affinity.
     std::string session_key;
     ThinkingOptions thinking;
+    // Request reasoning as a separate stream from visible assistant text.
+    // False preserves the historical text-only callback contract.
+    bool separate_reasoning = false;
 };
 
 // True for "system", "user", "assistant" and "tool".

@@ -14,6 +14,7 @@ sonder_add_module_tests(core
     test_scheduler_modes.cpp
     test_runtime_tracking.cpp
     test_chat.cpp
+    test_session_reasoning.cpp
     test_cli_args.cpp
     test_cli_spec.cpp
     test_cli_repl.cpp

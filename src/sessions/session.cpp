@@ -268,6 +268,9 @@ Result<GenerateStats> run_sonder_sampling(TokenStream& stream, const SamplingCon
         }
         if (check.stopped) {
             stats.stop_reason = StopReason::stop_sequence;
+            if (check.stop_index < config.stop.size()) {
+                stats.matched_stop = config.stop[check.stop_index];
+            }
             break;
         }
     }
@@ -488,7 +491,12 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
             bus.emit("inference.decode.started", ctx, json::Object{{"ttft_ms", result.ttft_ms}},
                      TelemetryLevel::metrics);
         }
-        result.text.append(chunk.text.data(), chunk.text.size());
+        if (!chunk.text.empty()) {
+            result.text.append(chunk.text.data(), chunk.text.size());
+        }
+        if (!chunk.reasoning.empty()) {
+            result.reasoning.append(chunk.reasoning.data(), chunk.reasoning.size());
+        }
         ++delivered;
         if (emit_tokens) {
             json::Object attrs{{"index", chunk.index},
@@ -574,6 +582,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
             chat_request.sampling = sampling;
             chat_request.session_key = request_options.session_key;
             chat_request.thinking = request_options.thinking;
+            chat_request.separate_reasoning = request_options.separate_reasoning;
             generated = backend_model.chat(chat_request, token, on_backend_chunk);
         } else {
             generated = backend_model.generate(request, token, on_backend_chunk);

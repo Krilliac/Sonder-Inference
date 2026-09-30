@@ -155,6 +155,11 @@ private:
                 break;
             default: stats.stop_reason = StopReason::error; break;
         }
+        if (stats.stop_reason == StopReason::stop_sequence) {
+            if (const auto matched = stop.matched_stop()) {
+                stats.matched_stop = std::string(*matched);
+            }
+        }
         if (stats.stop_reason != StopReason::stop_sequence && stats.stop_reason != StopReason::callback) {
             deliver(stop.Flush());
         }
