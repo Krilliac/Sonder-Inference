@@ -3,12 +3,15 @@
 // this layer owns cancellation, callbacks and protocol response framing.
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
 
 #include "openai.hpp"
+#include "priority_admission.hpp"
 #include "socket.hpp"
 #include "sonder/inference/server.hpp"
 
@@ -24,6 +27,10 @@ struct ChatExchange {
     std::string& request_id;
     int& status;
     bool synthetic;
+    std::chrono::steady_clock::time_point started;
+    PriorityAdmission& admission;
+    const std::atomic<bool>& hard_stop;
+    TelemetryBus& telemetry;
     std::function<void()> leave_inflight;
     std::function<bool(std::string_view)> write;
     std::function<bool()> start_stream;

@@ -226,6 +226,13 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             c.add(Capability::speculative_decode).add(Capability::prefix_reuse);
         return c;
     }
+    // /props is fetched during model discovery and cached per upstream
+    // instance.  Admission may use this snapshot without issuing network I/O
+    // from a const query; zero means that the upstream did not report slots.
+    std::size_t max_concurrent_requests() const override {
+        std::lock_guard<std::mutex> lock(props_mutex_);
+        return props_fetched_ ? static_cast<std::size_t>(props_.total_slots) : 0;
+    }
     Result<std::string> probe() override {
         auto models = list_models();
         if (!models.ok())
@@ -425,7 +432,7 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
     LlamaServerBackendOptions options_;
     Status validation_;
     std::unique_ptr<llamaserver::Supervisor> supervisor_;
-    std::mutex props_mutex_;
+    mutable std::mutex props_mutex_;
     bool props_fetched_ = false;
     std::string props_key_;
     llamaserver::ServerProps props_;

@@ -57,6 +57,36 @@ std::vector<json::Value> events(const std::string& frames) {
 }
 } // namespace
 
+TEST_CASE("anthropic request: scheduling hints share chat priority and deadline validation") {
+    const auto defaults = parse_ok(request());
+    CHECK_FALSE(defaults.priority_class);
+    CHECK_FALSE(defaults.deadline_ms);
+    for (const auto priority : {RequestPriority::interactive, RequestPriority::subagent,
+                               RequestPriority::background}) {
+        auto body = request();
+        body.set("priority", to_string(priority));
+        body.set("deadline_ms", 1234);
+        const auto job = parse_ok(body);
+        CHECK(job.priority_class == priority);
+        CHECK(job.deadline_ms == 1234);
+    }
+    for (const json::Value& value : {json::Value(nullptr), json::Value(0), json::Value("urgent"),
+                                    json::Value("Interactive")}) {
+        auto body = request();
+        body.set("priority", value);
+        rejected(body, "priority");
+    }
+    for (const json::Value& value : {json::Value(nullptr), json::Value(0), json::Value(-1),
+                                    json::Value(1.5), json::Value("25"), json::Value(2147483648ULL)}) {
+        auto body = request();
+        body.set("deadline_ms", value);
+        rejected(body, "deadline_ms");
+    }
+    auto body = request();
+    body.set("deadline_ms", 2147483647.0);
+    CHECK(parse_ok(body).deadline_ms == 2147483647ULL);
+}
+
 TEST_CASE("anthropic request: strings, blocks, roles, defaults and sampler fields") {
     const auto plain = parse_ok(request());
     CHECK(plain.model == "default");

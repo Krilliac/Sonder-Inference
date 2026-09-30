@@ -243,6 +243,9 @@ public:
     // safe to call from any thread. nullopt (the default) means the backend
     // reports nothing, and hosts then add no runtime fields to their output.
     [[nodiscard]] virtual std::optional<BackendRuntimeStatus> runtime_status() const { return std::nullopt; }
+    // Cheap, thread-safe snapshot of simultaneous generation slots. Zero means
+    // unknown; HTTP hosts use this to keep waiting work out of upstream queues.
+    [[nodiscard]] virtual std::size_t max_concurrent_requests() const { return 0; }
 };
 
 }  // namespace sonder::inference

@@ -67,6 +67,11 @@ itself.
 | `--kv-pool-tokens N` | `65536` | Logical KV pool size in tokens (16 to 16777216, rounded up to 16-token blocks). |
 | `--pin-enable-thinking on\|off` | none | Sent as `chat_template_kwargs.enable_thinking` (llama-server) / `think` (ollama) on every chat request. See [Thinking control](#thinking-control). |
 | `--pin-reasoning-effort E` | none | Same for `chat_template_kwargs.reasoning_effort` (1 to 64 of `[A-Za-z0-9._-]`). |
+| `--max-concurrent-subagent N` | unlimited (`0`) | Maximum running `subagent` requests; `0` preserves today's unlimited behavior. |
+| `--max-concurrent-background N` | unlimited (`0`) | Maximum running `background` requests; `0` preserves today's unlimited behavior. |
+| `--max-queue-per-class N` | unlimited (`0`) | Maximum queued requests for each priority class; over-capacity requests receive 429 with `Retry-After: 1`. |
+| `--priority-admission auto\|on\|off` | `auto` | Enable class-ordered admission. `auto` enables it only when a nonzero class concurrency or queue cap is configured; `on` always enables it; `off` bypasses it, including configured caps. |
+| `--backend-capacity N` | `0` | Explicit concurrent backend-request limit when priority admission is enabled. `0` uses the backend's advertised capacity; an unknown capacity stays ungated. This flag alone does not enable admission. |
 
 `--key=value` is accepted as well as `--key value`. Exit status: 0 after a
 clean shutdown, 1 on a runtime error (for example the port is in use; the
@@ -180,7 +185,8 @@ The preflight (`OPTIONS`) answers 204 with
 `Access-Control-Allow-Methods: GET, POST, OPTIONS`,
 `Access-Control-Allow-Headers: Accept, Authorization, Cache-Control,
 Content-Type, Last-Event-ID, X-Sonder-Run-Id, X-Sonder-Parent-Request-Id,
-X-Sonder-Agent-Id, X-Sonder-Task-Id, X-Sonder-Workload, X-Sonder-Priority`
+X-Sonder-Agent-Id, X-Sonder-Task-Id, X-Sonder-Workload, X-Sonder-Priority,
+X-Sonder-Deadline-Ms`
 and `Access-Control-Max-Age: 600` (plus
 `Access-Control-Allow-Private-Network: true` when the browser asks for it).
 
@@ -196,6 +202,8 @@ and `Access-Control-Max-Age: 600` (plus
 | Headers or body not received within 10 s | 408 `request_timeout` |
 | At `--max-connections`, a new connection arrives while another has spent 500 ms or more without completing its request head | The oldest such connection gets 408 `request_timeout` and the new one is served (slow clients cannot hold every slot). Connections past their head are never evicted. |
 | More than `--max-connections` open connections | 503 `overloaded`, `Retry-After: 1` |
+| Priority-class queue is full (`--max-queue-per-class`) | 429 `overloaded`, `Retry-After: 1` |
+| A queued request reaches its `deadline_ms` before upstream admission | 504 `deadline_exceeded`; no backend request was made |
 | The OS refuses to start a chat request's disconnect-watcher thread (thread or memory limits) | 503 `overloaded`, `Retry-After: 1`; nothing was executed and only that request fails |
 | The process is out of file descriptors (`EMFILE`) | 503 `overloaded` ("out of file descriptors") through a reserved descriptor; logged once per episode; the accept loop backs off instead of spinning |
 | `Expect` other than `100-continue` | 417 `expectation_failed` (`param` `Expect`) |
@@ -259,6 +267,7 @@ reject with `never_fits` or `invalid_request`, both caller errors (400).
  "backends":[{"name":"mock","available":true,"capabilities":["tokenization","streaming","deterministic"],"version":"mock-1"}],
  "models":[{"id":"mock:tiny","backend":"mock","default":true,"state":"resident","resident":true,"in_flight":0,
             "loads":1,"load_failures":0,"evictions":0,"idle_s":3.2,"model_instance_id":"…"}],
+ "queued_by_class":{"interactive":0,"subagent":0,"background":0},
  "residency":{"mode":"eager","idle_ttl_s":null,"max_resident":null,"registered":1,"resident":1,"loading":0,
               "unloading":0,"loads":1,"load_failures":0,"evictions":0},
  "telemetry":{"level":"standard","subscribers":0,"retained":42,"capacity":8192,"emitted":42,"dropped":0,
@@ -346,6 +355,23 @@ from `user` or `tool`), `stream`, `stream_options.include_usage`,
 `SamplingConfig`'s (temperature 0.8, top_p 0.95, top_k 40, repeat_penalty
 1.1).
 
+Scheduling fields are additive: `priority` is `interactive` (default),
+`subagent`, or `background`; `deadline_ms` is a positive integer no greater
+than `INT32_MAX`, measured from connection arrival. The corresponding headers
+are `X-Sonder-Priority` and `X-Sonder-Deadline-Ms`; when both a header and body
+field are present, both are validated and the header wins. `X-Sonder-Priority`
+also accepts the existing integer range -16 to 16: it keeps its scheduler
+priority and integer `request.queued.attributes.priority` telemetry, and selects
+the `interactive` admission class even when the body names another class. A
+class-name header selects that admission class and leaves the numeric scheduler
+priority at its default, zero. Invalid integers or unknown class names return
+400 `invalid_correlation_header`. Request hints alone do not enable server-wide
+priority admission; deadlines are enforced independently of admission mode.
+Numeric headers retain the scheduler rank `workload rank - priority`, including
+explicit zero, even with priority admission enabled. Class/FIFO admission still
+controls entry to the backend; numeric values do not move a request ahead of an
+earlier request in the same admission class.
+
 Request-path extensions (all optional; see the sections below):
 
 - `prompt_cache_key` (OpenAI; a 1-256 byte string): conversation key for
@@ -405,7 +431,10 @@ arrives as one `data: {"error": …}` event and the stream ends without
 `[DONE]`.
 
 A client disconnect (detected while generating, streaming or not) cancels the
-session: the request ends with `request.cancelled`.
+session and propagates cancellation to the upstream backend. A running
+non-streaming request returns the normal cancellation response; a running
+stream ends with its normal partial `cancelled` finish. A queued request that
+reaches its deadline returns 504 before upstream execution.
 
 #### Scheduling
 
@@ -415,9 +444,12 @@ How it is paced depends on the backend (`SchedulerMode`,
 
 - `gate` (in-process backends under `automatic`: mock, llamacpp): each
   generated chunk waits for a scheduler grant, and KV is accounted for the
-  prompt and the output. Unchanged from earlier releases.
+  prompt and the output. When priority admission is enabled, hosted requests
+  also wait before the backend call and reserve full logical prompt/output
+  capacity up front to avoid preempting a running request. With default server
+  options the existing incremental KV and scheduling policy is unchanged.
 - `account` (remote-process backends under `automatic`: llamaserver,
-  ollama): the request is admitted in priority order and its prompt is
+  ollama): the request is admitted by the engine scheduler and its prompt is
   accounted (prefix reuse, `queue_ms`), then the backend streams with no
   per-chunk grant. The upstream owns the real KV cache and batching, so a
   prompt larger than the logical pool (`--kv-pool-tokens`, 65,536 tokens by
@@ -427,6 +459,40 @@ How it is paced depends on the backend (`SchedulerMode`,
 `--scheduler gate` forces per-chunk gating everywhere (the old behaviour for
 remote backends, including the 400 for a prompt over the pool) and
 `--scheduler account` forces admission-only accounting everywhere.
+
+Priority admission is opt-in. `--priority-admission auto` (the default) enables
+it only when `--max-concurrent-subagent`, `--max-concurrent-background`, or
+`--max-queue-per-class` is nonzero. `on` explicitly enables it; `off` bypasses
+the priority queue and its caps. Without caps, default `auto` preserves the
+existing concurrency and engine scheduling policy for both known and unknown
+backend capacities. It creates no admission tickets, and `queued_by_class`
+stays zero. Per-request priority or deadline hints do not switch it on.
+
+When enabled, admission applies in every scheduler mode, including `off`.
+A single ticket joins backend-slot/class eligibility with logical KV admission.
+A request waiting for KV holds no backend slot, and queue caps and the
+`queued_by_class` health gauge include that wait. Eligible requests are selected
+by class (`interactive` > `subagent` > `background`) and FIFO within a class,
+including when prompt preparation finishes out of order. Running requests are
+not preempted. A class at its concurrency cap does not block another eligible
+class. All class and queue caps default to zero/unlimited.
+
+With admission enabled, `--backend-capacity N` supplies an explicit capacity.
+Its default, zero, uses the backend's advertised `max_concurrent_requests`
+(llama-server reports cached `/props.total_slots`). If neither source supplies
+a capacity, Sonder adds no backend-capacity limit; the upstream keeps its own
+parallelism, and separately configured class/queue caps still apply. No capacity
+of one or engine running limit is substituted for unknown capacity. Existing
+engine scheduler limits remain independent. For an unknown-capacity backend,
+use `--priority-admission on --backend-capacity 2` to opt into a two-request
+limit. A capacity flag alone does not activate `auto`.
+
+Deadlines are positive integers up to 2,147,483,647 milliseconds measured on a
+monotonic clock from connection arrival (including body read time). `null`,
+booleans, negative values and fractional values are invalid. The disconnect
+watcher polls every 20 ms; once running, deadline expiry uses the same
+cooperative cancellation as disconnect. Upstream HTTP reads also poll their
+cancellation token, including a silent prefill, then close the connection.
 
 #### Prompt cache affinity
 
@@ -461,7 +527,8 @@ Correlation request headers (all optional; values must match
 | `X-Sonder-Parent-Request-Id` | `attributes.parent_request_id` on `request.queued`, `started`, `completed`, `cancelled` and `failed`. |
 | `X-Sonder-Agent-Id`, `X-Sonder-Task-Id` | Envelope `agent_id`, `task_id`. |
 | `X-Sonder-Workload` | One of the 7 workload classes; default `interactive_user`. |
-| `X-Sonder-Priority` | Integer from -16 to 16. |
+| `X-Sonder-Priority` | Integer from -16 to 16 (existing scheduler priority and integer telemetry; admission class `interactive`), or `interactive`, `subagent`, or `background` (class selection). Header wins over body `priority`; no hint defaults to numeric `0` and class `interactive`. |
+| `X-Sonder-Deadline-Ms` | Positive integer up to `INT32_MAX`, measured from connection arrival; a queued request past it returns 504. |
 
 The envelope `request_id` is always Inference's own id (`req-…`), also
 returned as `sonder.request_id`, in the completion id and in

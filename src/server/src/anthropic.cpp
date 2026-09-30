@@ -177,6 +177,16 @@ std::variant<ChatJob, ApiError> parse_messages_request(std::string_view body_tex
     }
     if (Status st = validate_chat_messages(out.messages); !st.ok())
         return bad("invalid_messages", st.message(), "messages");
+    if (const auto* p = body.find("priority")) {
+        if (!p->is_string() || !parse_request_priority(p->as_string()))
+            return bad("invalid_request", "priority must be interactive, subagent or background", "priority");
+        out.priority_class = parse_request_priority(p->as_string());
+    }
+    if (const auto* d = body.find("deadline_ms")) {
+        out.deadline_ms = parse_deadline_ms(*d);
+        if (!out.deadline_ms)
+            return bad("invalid_request", "deadline_ms must be a positive integer", "deadline_ms");
+    }
     if (auto e = number(body, "temperature", out.sampling.temperature))
         return *e;
     if (present(body.find("temperature")))

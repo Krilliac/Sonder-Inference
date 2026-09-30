@@ -392,6 +392,117 @@ TEST_CASE("anthropic messages: watcher refusal and malformed headers use endpoin
                           400, "invalid_request_error", "Host");
 }
 
+TEST_CASE("anthropic messages: priority class and queued deadline are enforced") {
+    // Mirrors #42's queued-deadline test through native chat, so bypassing
+    // prepare_backend on the separate-reasoning branch is observable.
+    struct NativeModel final : si::BackendModel {
+        si::ModelDescriptor description;
+        FirstChunkGate gate;
+        std::atomic<int> starts{0};
+        std::atomic<int> separate_reasoning_starts{0};
+        NativeModel() {
+            description.name = "priority:test";
+            description.backend = "priority-test";
+            description.context_length = 2048;
+        }
+        const si::ModelDescriptor& descriptor() const override { return description; }
+        bool has_native_chat() const override { return true; }
+        si::Result<si::GenerateStats> generate(const si::GenerateRequest&, const si::CancellationToken&,
+                                              const si::TokenCallback&) override {
+            return si::Status(si::ErrorCode::internal, "this test requires native chat");
+        }
+        si::Result<si::GenerateStats> chat(const si::ChatRequest& request, const si::CancellationToken&,
+                                          const si::TokenCallback& callback) override {
+            const bool first = starts.fetch_add(1) == 0;
+            if (request.separate_reasoning) ++separate_reasoning_starts;
+            const bool delivered = !callback || callback(si::TokenChunk{"answer", 0, "thought"});
+            if (first) {
+                gate.reached(delivered);
+                gate.wait_for_release();
+            }
+            si::GenerateStats stats;
+            stats.chunks = 1;
+            stats.completion_tokens = 1;
+            stats.stop_reason = si::StopReason::end_of_sequence;
+            return stats;
+        }
+    };
+    struct NativeBackend final : si::Backend {
+        std::shared_ptr<NativeModel> model = std::make_shared<NativeModel>();
+        std::string name() const override { return "priority-test"; }
+        std::string description() const override { return "native priority/deadline test backend"; }
+        si::BackendCapabilities capabilities() const override {
+            return si::BackendCapabilities{}.add(si::Capability::streaming);
+        }
+        si::Result<std::string> probe() override { return std::string("test"); }
+        si::Result<std::vector<si::ModelDescriptor>> list_models() override {
+            return std::vector<si::ModelDescriptor>{model->descriptor()};
+        }
+        si::Result<std::shared_ptr<si::BackendModel>> load_model(const si::ModelLoadOptions&) override {
+            return std::static_pointer_cast<si::BackendModel>(model);
+        }
+    };
+    for (const auto policy : {srv::SchedulerPolicy::gate, srv::SchedulerPolicy::account,
+                              srv::SchedulerPolicy::off}) {
+        for (const bool header_override : {false, true}) {
+            CAPTURE(static_cast<int>(policy));
+            CAPTURE(header_override);
+            auto backend = std::make_shared<NativeBackend>();
+            auto options = Fixture::defaults();
+            options.models = {"priority:test"};
+            options.backend.backend.clear();
+            options.backend_instance = backend;
+            options.scheduler = policy;
+            options.backend_capacity = 1;
+            options.priority_admission = srv::PriorityAdmissionPolicy::on;
+            Fixture f(options);
+            struct GateCleanup {
+                FirstChunkGate& gate;
+                ~GateCleanup() { gate.release(); }
+            } cleanup{backend->model->gate};
+
+            Conn first(f.port);
+            first.send(build_request("POST", "/v1/messages", f.port, {}, messages_body(R"(,"stream":true)")));
+            std::string first_wire;
+            REQUIRE(first.read_until(first_wire, "event: content_block_delta\n"));
+            REQUIRE(backend->model->gate.wait_for_reached(std::chrono::milliseconds(5000)));
+
+            Conn queued(f.port);
+            const std::vector<std::pair<std::string, std::string>> headers = header_override
+                ? std::vector<std::pair<std::string, std::string>>{{"X-Sonder-Priority", "interactive"},
+                                                                 {"X-Sonder-Deadline-Ms", "1000"}}
+                : std::vector<std::pair<std::string, std::string>>{};
+            queued.send(build_request("POST", "/v1/messages", f.port, headers,
+                messages_body(header_override ? R"(,"priority":"background","deadline_ms":60000)"
+                                              : R"(,"priority":"background","deadline_ms":1000)")));
+            REQUIRE(eventually([&] {
+                const auto health = get(f.port, "/v1/sonder/health").json();
+                const auto* counts = health.find("queued_by_class");
+                return counts != nullptr && counts->find("interactive")->as_uint() == (header_override ? 1u : 0u) &&
+                       counts->find("background")->as_uint() == (header_override ? 0u : 1u);
+            }));
+            const Reply expired = parse_reply(queued.read_all());
+            check_anthropic_error(expired, 504, "invalid_request_error", "deadline");
+            CHECK(queued.closed());
+            CHECK(backend->model->starts.load() == 1);
+            CHECK(backend->model->separate_reasoning_starts.load() == 1);
+            const auto health = get(f.port, "/v1/sonder/health").json();
+            CHECK(health.find("queued_by_class")->find("interactive")->as_uint() == 0);
+            CHECK(health.find("queued_by_class")->find("background")->as_uint() == 0);
+
+            backend->model->gate.release();
+            first_wire += first.read_all();
+            const Reply completed = parse_reply(first_wire);
+            REQUIRE_MESSAGE(completed.status == 200, completed.body);
+            CHECK(completed.body.find("event: message_stop\n") != std::string::npos);
+            CHECK(first.closed());
+            CHECK(post(f.port, "/v1/messages", messages_body(R"(,"priority":"background")")).status == 200);
+            CHECK(backend->model->starts.load() == 2);
+            CHECK(backend->model->separate_reasoning_starts.load() == 2);
+        }
+    }
+}
+
 TEST_CASE("anthropic messages: a streaming lazy request pins its model during competing eviction") {
     auto gate = std::make_shared<FirstChunkGate>();
     auto backend = std::make_shared<GatedBackend>(gate);

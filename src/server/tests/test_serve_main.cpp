@@ -54,6 +54,8 @@ TEST_CASE("serve_main: --help prints usage and exits 0") {
     CHECK(out.find("sonder-infer serve") != std::string::npos);
     CHECK(out.find("--ready-file") != std::string::npos);
     CHECK(out.find("--cors-origin") != std::string::npos);
+    CHECK(out.find("--backend-capacity") != std::string::npos);
+    CHECK(out.find("--priority-admission auto|on|off") != std::string::npos);
     CHECK(out.find("--warmup-file") != std::string::npos);
 }
 
@@ -125,6 +127,8 @@ TEST_CASE("serve_main: usage errors exit 2") {
              {"--backend", "mock", "--log-format", "xml"},
              {"--backend", "mock", "--no-default-cors=1"},
              {"--backend", "mock", "--host", "a", "--host", "b"},
+             {"--backend", "mock", "--backend-capacity", "not-a-number"},
+             {"--backend", "mock", "--priority-admission", "sometimes"},
              {"--backend", "mock", "--token-file", (temp_path("missing")).string()},
              {"--backend", "ollama"},
              {"--backend", "mock", "--model", "default"},

@@ -20,6 +20,7 @@
 #include "identity.hpp"
 #include "live_hub.hpp"
 #include "openai.hpp"
+#include "priority_admission.hpp"
 #include "request_path.hpp"
 #include "residency.hpp"
 #include "socket.hpp"
@@ -47,7 +48,8 @@ const std::vector<std::string>& default_origins() {
 
 constexpr const char* kAllowHeaders =
     "Accept, Authorization, Cache-Control, Content-Type, Last-Event-ID, X-Sonder-Run-Id, "
-    "X-Sonder-Parent-Request-Id, X-Sonder-Agent-Id, X-Sonder-Task-Id, X-Sonder-Workload, X-Sonder-Priority";
+    "X-Sonder-Parent-Request-Id, X-Sonder-Agent-Id, X-Sonder-Task-Id, X-Sonder-Workload, X-Sonder-Priority, "
+    "X-Sonder-Deadline-Ms";
 constexpr const char* kExposeHeaders = "X-Sonder-Inference-Api, X-Sonder-Request-Id, Retry-After";
 
 enum class State { starting, ready, draining, stopped };
@@ -282,6 +284,7 @@ struct Server::Impl {
     std::mutex inflight_mu;
     std::condition_variable inflight_cv;
     std::set<std::shared_ptr<Session>> inflight;
+    PriorityAdmission admission;
 
     std::once_flag stop_once;
     std::mutex stopped_mu;
@@ -597,6 +600,7 @@ struct Server::Impl {
                 dropped = engine->telemetry().dropped_events();
             }
         }
+        const auto queued = admission.queued();
         json::Object body{{"status", state_name(s)},
                           {"api_version", kApiVersion},
                           {"version", version_string()},
@@ -609,6 +613,9 @@ struct Server::Impl {
                           {"auth_required", !opts.token.empty()},
                           {"backends", std::move(backends)},
                           {"models", std::move(models)},
+                          {"queued_by_class", json::Object{{"interactive", queued[0]},
+                                                           {"subagent", queued[1]},
+                                                           {"background", queued[2]}}},
                           {"residency", residency_summary()},
                           {"telemetry", json::Object{{"level", to_string(opts.telemetry_level)},
                                                      {"subscribers", hs.subscribers},
@@ -895,6 +902,7 @@ struct Server::Impl {
 
         ChatExchange exchange{
             opts, ex.sock, ex.request_id, ex.status, synthetic,
+            ex.started, admission, hard_stop, engine_ptr()->telemetry(),
             [&] {
                 {
                     std::lock_guard<std::mutex> lock(inflight_mu);
@@ -1428,6 +1436,9 @@ struct Server::Impl {
         }
         eo.server = EngineServerInfo{opts.host, bound_port, kApiVersion};
         apply_scheduling(opts, eo.scheduling);
+        // Preserve the origin scheduler's default ordering unless the
+        // operator actually enabled the server-side priority policy.
+        eo.scheduling.strict_priority_admission = priority_admission_enabled(opts);
         {
             std::lock_guard<std::mutex> lock(engine_mu);
             engine = std::make_unique<Engine>(std::move(eo));
@@ -1535,6 +1546,15 @@ struct Server::Impl {
             start_probe_refresher(made);
             // Idle-TTL evictions (no thread unless --model-idle-ttl is set).
             residency->start_sweeper();
+        }
+        // A backend that does not advertise slots is intentionally left
+        // ungated.  In particular, remote backends may already run multiple
+        // requests (for example Ollama NUM_PARALLEL or a worker pool).
+        if (priority_admission_enabled(opts)) {
+            const std::size_t capacity = opts.backend_capacity != 0 ? opts.backend_capacity
+                                                                   : made->max_concurrent_requests();
+            admission.configure(capacity, opts.max_concurrent_subagent, opts.max_concurrent_background,
+                                opts.max_queue_per_class);
         }
         State expected = State::starting;
         state.compare_exchange_strong(expected, State::ready);

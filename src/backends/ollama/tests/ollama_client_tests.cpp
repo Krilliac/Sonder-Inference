@@ -138,7 +138,8 @@ TEST_CASE("client: cancellation from another thread aborts a stalled stream") {
     CancellationSource source;
     std::atomic<bool> first{false};
     std::thread canceller([&] {
-        while (!first) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!first && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -156,6 +157,34 @@ TEST_CASE("client: cancellation from another thread aborts a stalled stream") {
     canceller.join();
     CHECK(r.status().code() == ErrorCode::cancelled);
     CHECK(elapsed < std::chrono::milliseconds(2500));
+}
+
+TEST_CASE("client: cancellation during upstream prefill closes the response") {
+    FakeOllamaServer srv;
+    StreamScript s;
+    s.body = fixture("generate_stream.ndjson");
+    s.chunk_bytes = 1;
+    s.initial_delay = std::chrono::milliseconds(300);
+    srv.set_generate(s);
+    OllamaClient cli(config_for(srv));
+    GenerateParams p;
+    p.model = "m";
+    CancellationSource source;
+    std::thread canceller([&] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (srv.request_count() == 0 && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        source.cancel();
+    });
+    auto r = cli.generate(p, {}, source.token());
+    canceller.join();
+    REQUIRE(srv.request_count() > 0);
+    REQUIRE(r.status().code() == ErrorCode::cancelled);
+    // The provider wakes after its simulated prefill and must observe that
+    // the client's socket was closed by the cancelled HTTP request.
+    for (int i = 0; i < 100 && srv.disconnects() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(srv.disconnects() > 0);
 }
 
 TEST_CASE("client: pre-cancelled token never sends a request") {

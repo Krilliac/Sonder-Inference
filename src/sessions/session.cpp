@@ -359,6 +359,14 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         }
         return attrs;
     };
+    const auto with_admission = [&](json::Object attrs, double queue_ms = 0.0) {
+        if (request_options.priority_class) {
+            attrs.set("priority_class", to_string(*request_options.priority_class));
+            attrs.set("admission", json::Object{{"priority", to_string(*request_options.priority_class)},
+                                                   {"queue_ms", queue_ms}});
+        }
+        return attrs;
+    };
 
     {
         json::Object queued{{"kind", kind},
@@ -368,12 +376,15 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         if (messages != nullptr) {
             queued.set("messages", messages->size());
         }
-        bus.emit("request.queued", ctx, with_parent(std::move(queued)), TelemetryLevel::metrics);
+        bus.emit("request.queued", ctx,
+                 with_parent(with_admission(std::move(queued), request_options.admission_queue_ms)),
+                 TelemetryLevel::metrics);
     }
     const auto t_start = std::chrono::steady_clock::now();
 
     GenerationResult result;
     result.request_id = request.request_id;
+    result.scheduling.queue_ms = request_options.admission_queue_ms;
     Status failure;
     bool pre_failed = false;
     bool scheduler_rejected = false;
@@ -381,8 +392,11 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     // Sampling path: Sonder's sampler chain when the backend exposes logits.
     std::unique_ptr<TokenStream> stream;
     const auto backend = engine_.find_backend(model_->backend_name());
+    const bool defer_stream_open = engine_.scheduling_options().strict_priority_admission &&
+                                   !native_chat && backend &&
+                                   backend->capabilities().has(Capability::token_logits);
 #if defined(SONDER_HAS_SAMPLER_CHAIN)
-    if (!native_chat && backend && backend->capabilities().has(Capability::token_logits)) {
+    if (!defer_stream_open && !native_chat && backend && backend->capabilities().has(Capability::token_logits)) {
         auto opened = backend_model.open_token_stream(request);
         if (opened.ok()) {
             stream = std::move(opened).value();
@@ -407,6 +421,9 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         spec.context = ctx;
         spec.workload = options_.workload;
         spec.priority = options_.priority;
+        spec.priority_class = request_options.priority_class;
+        spec.preserve_numeric_priority = request_options.preserve_numeric_priority;
+        spec.admission = request_options.admission;
         if (stream) {
             spec.prompt_tokens = stream->prompt_tokens();
             spec.exact_tokens = true;
@@ -467,14 +484,16 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         json::Object started{{"kind", kind},
                              {"sampling", sampling_json(sampling)},
                              {"scheduled", sched_id.has_value()},
-                             {"sampler", stream ? "sonder" : "backend"}};
+                             {"sampler", (stream || defer_stream_open) ? "sonder" : "backend"}};
         if (sched_id) {
             started.set("scheduler_mode", gated ? "gate" : "account");
         }
         if (messages != nullptr) {
             started.set("chat_template", native_chat ? "native" : "generic");
         }
-        bus.emit("request.started", ctx, with_parent(std::move(started)), TelemetryLevel::metrics);
+        bus.emit("request.started", ctx,
+                 with_parent(with_admission(std::move(started), request_options.admission_queue_ms)),
+                 TelemetryLevel::metrics);
     }
 
     std::chrono::steady_clock::time_point t_first{};
@@ -526,15 +545,25 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     // Scheduler gate: every generated token waits for a grant (gated), or
     // the request waits once for admission (ungated, before the backend call).
     std::optional<Status> gate_failure;
-    const auto admit = [&]() -> bool {
-        Status st = runtime->acquire_token(*sched_id, token);
-        if (st.ok()) {
-            return true;
+    const auto prepare_backend = [&]() -> Status {
+        // Library callers retain the old per-chunk gate unless they explicitly
+        // enable strict admission. Account mode always waits once up front.
+        if (sched_id && (!gated || engine_.scheduling_options().strict_priority_admission)) {
+            Status st = gated ? runtime->admit_backend(*sched_id, token, request_options.deadline)
+                              : runtime->acquire_token(*sched_id, token, request_options.deadline);
+            if (!st.ok()) return st;
+        } else if (!sched_id && request_options.admission) {
+            Status st = request_options.admission->wait(token);
+            if (!st.ok()) return st;
         }
-        if (st.code() != ErrorCode::cancelled) {
-            gate_failure = std::move(st);
-        }
-        return false;
+        if (request_options.deadline && std::chrono::steady_clock::now() >= *request_options.deadline)
+            return Status(ErrorCode::timeout, "request deadline exceeded before backend start");
+        if (token.cancelled()) return Status(ErrorCode::cancelled, "cancelled before backend start");
+        if (request_options.on_backend_start) request_options.on_backend_start();
+        // The host can notice a disconnect at the exact start boundary and
+        // cancel here, even if its earlier cancel raced session initialization.
+        if (token.cancelled()) return Status(ErrorCode::cancelled, "cancelled before backend start");
+        return Status::success();
     };
     const auto gate = [&]() -> bool {
         if (!sched_id || !gated) {
@@ -556,36 +585,46 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     };
 
     Result<GenerateStats> generated = GenerateStats{};
-    if (pre_failed) {
-        generated = failure;
-    } else if (sched_id && !gated && !admit()) {
-        generated = gate_failure ? *gate_failure : Status(ErrorCode::cancelled, "cancelled while waiting for admission");
-    } else if (stream) {
-#if defined(SONDER_HAS_SAMPLER_CHAIN)
-        generated = run_sonder_sampling(*stream, sampling, token, bus, ctx, gate, produced, deliver);
-#endif
+    Status prepared = pre_failed ? failure : prepare_backend();
+    if (!prepared.ok()) {
+        generated = prepared;
     } else {
-        const auto on_backend_chunk = [&](const TokenChunk& chunk) -> bool {
-            if (!gated || !sched_id) {
-                return deliver(chunk, std::nullopt, 0.0f);
+#if defined(SONDER_HAS_SAMPLER_CHAIN)
+        if (defer_stream_open) {
+            auto opened = backend_model.open_token_stream(request);
+            if (opened.ok()) {
+                stream = std::move(opened).value();
+                result.scheduling.sonder_sampled = true;
+            } else {
+                prepared = opened.status();
             }
-            if (!gate()) {
-                return false;
-            }
-            produced(detail::accounting_chunk_token(chunk.text));
-            return deliver(chunk, std::nullopt, 0.0f);
-        };
-        if (native_chat) {
-            ChatRequest chat_request;
-            chat_request.request_id = request.request_id;
-            chat_request.messages = *messages;
-            chat_request.sampling = sampling;
-            chat_request.session_key = request_options.session_key;
-            chat_request.thinking = request_options.thinking;
-            chat_request.separate_reasoning = request_options.separate_reasoning;
-            generated = backend_model.chat(chat_request, token, on_backend_chunk);
+        }
+#endif
+        if (!prepared.ok()) {
+            generated = prepared;
+        } else if (stream) {
+#if defined(SONDER_HAS_SAMPLER_CHAIN)
+            generated = run_sonder_sampling(*stream, sampling, token, bus, ctx, gate, produced, deliver);
+#endif
         } else {
-            generated = backend_model.generate(request, token, on_backend_chunk);
+            const auto on_backend_chunk = [&](const TokenChunk& chunk) -> bool {
+                if (!gated || !sched_id) return deliver(chunk, std::nullopt, 0.0f);
+                if (!gate()) return false;
+                produced(detail::accounting_chunk_token(chunk.text));
+                return deliver(chunk, std::nullopt, 0.0f);
+            };
+            if (native_chat) {
+                ChatRequest chat_request;
+                chat_request.request_id = request.request_id;
+                chat_request.messages = *messages;
+                chat_request.sampling = sampling;
+                chat_request.session_key = request_options.session_key;
+                chat_request.thinking = request_options.thinking;
+                chat_request.separate_reasoning = request_options.separate_reasoning;
+                generated = backend_model.chat(chat_request, token, on_backend_chunk);
+            } else {
+                generated = backend_model.generate(request, token, on_backend_chunk);
+            }
         }
     }
     const auto t_end = std::chrono::steady_clock::now();
@@ -624,9 +663,11 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     if (sched_id) {
         const detail::RuntimeRequestSummary sched = runtime->finish(*sched_id, outcome);
         result.scheduling.preemptions = sched.preemptions;
-        result.scheduling.queue_ms = sched.queue_ms;
+        result.scheduling.queue_ms = request_options.admission_queue_ms + sched.queue_ms;
         result.scheduling.reused_prompt_tokens = sched.reused_prompt_tokens;
     }
+
+    if (request_options.admission) result.scheduling.queue_ms = request_options.admission->queue_ms();
 
     const std::uint64_t cancel_ns = cancel_requested_ns_.load();
     const std::uint64_t now_ns = monotonic_ns();
@@ -647,6 +688,11 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         summary.set("preemptions", result.scheduling.preemptions);
         summary.set("accounted_prompt_tokens", result.scheduling.accounted_prompt_tokens);
         summary.set("reused_prompt_tokens", result.scheduling.reused_prompt_tokens);
+    }
+    if (request_options.priority_class) {
+        summary.set("priority_class", to_string(*request_options.priority_class));
+        summary.set("admission", json::Object{{"priority", to_string(*request_options.priority_class)},
+                                                {"queue_ms", result.scheduling.queue_ms}});
     }
 
     if (outcome == RequestOutcome::completed) {

@@ -1,7 +1,9 @@
 #include <doctest/doctest.h>
 
+#include <chrono>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../llamaserver_protocol.hpp"
@@ -38,6 +40,20 @@ TEST_SUITE("llamaserver_backend") {
         CHECK(z.prompt_present);
         CHECK_FALSE(z.cache_present);
         CHECK_FALSE(z.draft_present);
+    }
+
+    TEST_CASE("cached /props slot count supplies admission capacity without rereading") {
+        sonder_test::FakeLlamaServer server;
+        server.set_props(R"({"default_generation_settings":{"n_ctx":1024},"total_slots":2})");
+        LlamaServerBackendOptions options;
+        options.base_url = server.url();
+        auto backend = make_llamaserver_backend(options);
+        CHECK(backend->max_concurrent_requests() == 0);
+        auto model = backend->load_model({"fake-model", "cpu:0"});
+        REQUIRE(model.ok());
+        const auto props_reads = server.props_requests();
+        CHECK(backend->max_concurrent_requests() == 2);
+        CHECK(server.props_requests() == props_reads);
     }
 
     TEST_CASE("sampling emits only explicitly selected values") {
@@ -310,6 +326,34 @@ TEST_SUITE("llamaserver_backend") {
         source.cancel();
         CHECK(m.value()->generate(GenerateRequest{"", "x", {}}, source.token(), {}).status().code() ==
               ErrorCode::cancelled);
+    }
+
+    TEST_CASE("cancellation during upstream prefill closes the response") {
+        sonder_test::FakeLlamaServer server;
+        server.set_body("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n");
+        server.set_initial_delay(std::chrono::milliseconds(300));
+        LlamaServerBackendOptions o;
+        o.base_url = server.url();
+        o.native_completion = false;
+        auto b = make_llamaserver_backend(o);
+        auto m = b->load_model({"fake-model", "cpu:0"});
+        REQUIRE(m.ok());
+        GenerateRequest q;
+        q.prompt = "x";
+        CancellationSource source;
+        std::thread canceller([&] {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (server.bodies().empty() && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            source.cancel();
+        });
+        auto result = m.value()->generate(q, source.token(), {});
+        canceller.join();
+        REQUIRE(!server.bodies().empty());
+        REQUIRE(result.status().code() == ErrorCode::cancelled);
+        for (int i = 0; i < 100 && server.disconnects() == 0; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        CHECK(server.disconnects() > 0);
     }
 
     TEST_CASE("malformed trailing and oversized SSE frames fail closed") {

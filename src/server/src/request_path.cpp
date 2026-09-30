@@ -1,6 +1,7 @@
 #include "request_path.hpp"
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
 
@@ -25,6 +26,19 @@ bool effort_ok(const std::string& v) {
 }
 
 Status invalid(std::string message) { return Status(ErrorCode::invalid_argument, std::move(message)); }
+
+std::optional<std::size_t> nonnegative_size(const std::string& text) {
+    if (text.empty() || text.size() > 20 || text.find_first_not_of("0123456789") != std::string::npos) {
+        return std::nullopt;
+    }
+    std::size_t value = 0;
+    for (const char ch : text) {
+        const auto digit = static_cast<std::size_t>(ch - '0');
+        if (value > (std::numeric_limits<std::size_t>::max() - digit) / 10) return std::nullopt;
+        value = value * 10 + digit;
+    }
+    return value;
+}
 
 const char* on_off(bool v) { return v ? "on" : "off"; }
 
@@ -67,6 +81,31 @@ Status parse_request_path_flags(const FlagLookup& get, ServerOptions& o) {
     if (auto v = get("pin-reasoning-effort")) {
         o.pin_reasoning_effort = *v;
     }
+    for (const auto& entry : {std::pair{"max-concurrent-subagent", &o.max_concurrent_subagent},
+                              std::pair{"max-concurrent-background", &o.max_concurrent_background},
+                              std::pair{"max-queue-per-class", &o.max_queue_per_class}}) {
+        if (auto v = get(entry.first)) {
+            const auto n = nonnegative_size(*v);
+            if (!n) return invalid(std::string("--") + entry.first + " must be a non-negative integer");
+            *entry.second = *n;
+        }
+    }
+    if (auto v = get("backend-capacity")) {
+        const auto n = nonnegative_size(*v);
+        if (!n) return invalid("--backend-capacity must be a non-negative integer");
+        o.backend_capacity = *n;
+    }
+    if (auto v = get("priority-admission")) {
+        if (*v == "auto") {
+            o.priority_admission = PriorityAdmissionPolicy::automatic;
+        } else if (*v == "on") {
+            o.priority_admission = PriorityAdmissionPolicy::on;
+        } else if (*v == "off") {
+            o.priority_admission = PriorityAdmissionPolicy::off;
+        } else {
+            return invalid("--priority-admission must be auto, on or off");
+        }
+    }
     return validate_request_path_options(o);
 }
 
@@ -91,6 +130,12 @@ void apply_scheduling(const ServerOptions& o, SchedulingOptions& scheduling) {
         const std::uint64_t block = scheduling.kv_block_size_tokens == 0 ? 1 : scheduling.kv_block_size_tokens;
         scheduling.kv_num_blocks = static_cast<std::uint32_t>((o.kv_pool_tokens + block - 1) / block);
     }
+}
+
+bool priority_admission_enabled(const ServerOptions& o) {
+    if (o.priority_admission == PriorityAdmissionPolicy::on) return true;
+    if (o.priority_admission == PriorityAdmissionPolicy::off) return false;
+    return o.max_concurrent_subagent != 0 || o.max_concurrent_background != 0 || o.max_queue_per_class != 0;
 }
 
 std::string chat_session_key(const ChatJob& job, const Correlation& correlation) {

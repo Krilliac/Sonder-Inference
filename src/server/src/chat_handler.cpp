@@ -21,6 +21,12 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
                   const std::string& backend, const std::shared_ptr<Session>& session,
                   ChatProtocol protocol) {
     const bool anthropic = protocol == ChatProtocol::anthropic;
+    const RequestPriority priority = corr.priority_class.value_or(
+        job.priority_class.value_or(RequestPriority::interactive));
+    const auto deadline_ms = corr.deadline_ms ? corr.deadline_ms : job.deadline_ms;
+    const auto deadline = deadline_ms
+        ? ex.started + std::chrono::milliseconds(static_cast<std::int64_t>(*deadline_ms))
+        : std::chrono::steady_clock::time_point::max();
     RequestOptions ro;
     ro.request_id = make_id("req");
     ro.parent_request_id = corr.parent_request_id;
@@ -28,6 +34,10 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     ro.thinking = job.thinking;
     ro.separate_reasoning = anthropic;
     const std::vector<std::string> warnings = apply_thinking_pins(ex.options, ro.thinking);
+    ro.priority_class = priority;
+    ro.preserve_numeric_priority = corr.numeric_priority;
+    if (deadline_ms) ro.deadline = deadline;
+    std::atomic<bool> backend_started{false};
     const std::string completion_id = (anthropic ? "msg_" : "chatcmpl-") + *ro.request_id;
     // X-Sonder-Request-Id and the access log carry the engine request id.
     ex.request_id = *ro.request_id;
@@ -38,12 +48,21 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     std::condition_variable watch_cv;
     bool watch_done = false;
     std::atomic<bool> disconnected{false};
+    ro.on_backend_start = [&] {
+        if (disconnected.load() || ex.hard_stop.load() || std::chrono::steady_clock::now() >= deadline) {
+            session->cancel();
+            return;
+        }
+        backend_started.store(true);
+    };
+    std::shared_ptr<PriorityAdmission::Ticket> ticket;
     std::thread watcher;
     // Stops and joins the watcher and leaves `inflight` on every exit,
     // including an exception out of the chat call: a joinable std::thread
     // destroyed during unwinding would call std::terminate.
     bool left_inflight = false;
     const auto end_request = [&] {
+        if (ticket) ticket->release();
         {
             std::lock_guard<std::mutex> lock(watch_mu);
             watch_done = true;
@@ -73,8 +92,8 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
                 if (peer_gone(ex.socket)) {
                     disconnected.store(true);
                     session->cancel();
-                    return;
                 }
+                if (std::chrono::steady_clock::now() >= deadline) session->cancel();
                 lock.lock();
                 watch_cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return watch_done; });
             }
@@ -92,6 +111,42 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
         e.retry_after = 1;
         ex.send_error(e);
         return;
+    }
+
+    if (priority_admission_enabled(ex.options)) {
+        ticket = ex.admission.enqueue(priority, [&] {
+            return disconnected.load() || session->state() == SessionState::closed || ex.hard_stop.load();
+        }, deadline);
+        if (ticket->outcome() != PriorityAdmission::Outcome::admitted) {
+            json::Object attrs{{"kind", "chat"},
+                               {"priority_class", to_string(priority)},
+                               {"admission", json::Object{{"priority", to_string(priority)},
+                                                           {"queue_ms", ticket->queue_ms()}}},
+                               {"error_code", ticket->outcome() == PriorityAdmission::Outcome::full
+                                                  ? "overloaded"
+                                                  : ticket->outcome() == PriorityAdmission::Outcome::expired
+                                                  ? "deadline_exceeded" : "cancelled"},
+                               {"backend_started", false}};
+            if (ro.parent_request_id) attrs.set("parent_request_id", *ro.parent_request_id);
+            ex.telemetry.emit(disconnected.load() ? "request.cancelled" : "request.failed",
+                              session->telemetry_context(ro.request_id), std::move(attrs),
+                              TelemetryLevel::metrics);
+            end_request();
+            if (disconnected.load()) {
+                ex.status = 499;
+            } else {
+                ApiError error = ticket->outcome() == PriorityAdmission::Outcome::expired
+                    ? make_error(504, "deadline_exceeded", "request deadline expired while queued; nothing was executed")
+                    : ticket->outcome() == PriorityAdmission::Outcome::full
+                    ? make_error(429, "overloaded", "request priority queue is full; nothing was executed")
+                    : make_error(503, "not_ready", "request cancelled while queued; nothing was executed");
+                if (error.status == 429) error.retry_after = 1;
+                ex.send_error(error);
+            }
+            session->close();
+            return;
+        }
+        ro.admission = ticket;
     }
 
     AnthropicStream messages_stream(completion_id, model);
@@ -151,6 +206,11 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     if (disconnected.load() || write_failed) {
         ex.status = 499; // client closed the request (access log only)
         session->close();
+        return;
+    }
+    if (deadline_ms && !backend_started.load() && std::chrono::steady_clock::now() >= deadline) {
+        session->close();
+        ex.send_error(make_error(504, "deadline_exceeded", "request deadline expired while queued; nothing was executed"));
         return;
     }
     if (!result.ok()) {
