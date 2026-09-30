@@ -254,6 +254,10 @@ jobs:
           $dlls = @(Get-ChildItem (Join-Path $env:OPENSSL_PREFIX 'bin') -Filter 'lib*.dll' | ForEach-Object Name)
           Write-Host "DLLs: $($dlls -join ', ')"
           if (-not ($dlls -match '^libssl-') -or -not ($dlls -match '^libcrypto-')) { throw 'OpenSSL DLLs missing' }
+          # doctest discovery runs sonder_tls_tests.exe at build time, so the
+          # DLLs must be on PATH for Build as well as Test (Chocolatey used to
+          # put them on the machine PATH).
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:OPENSSL_PREFIX 'bin')
 
       - name: Configure
         shell: pwsh
@@ -297,6 +301,4 @@ jobs:
 
       - name: Test
         shell: pwsh
-        run: |
-          $env:PATH = "$env:OPENSSL_PREFIX\bin;$env:PATH"
-          ctest --preset ci-windows
+        run: ctest --preset ci-windows
