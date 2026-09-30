@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -50,13 +51,33 @@ class FakeLlamaServer {
                 return;
             }
             const auto payload = body_;
+            const auto initial_delay = initial_delay_;
             r.set_chunked_content_provider("text/event-stream",
-                                           [payload](std::size_t, httplib::DataSink &sink) {
+                                           [this, payload, initial_delay](std::size_t, httplib::DataSink &sink) {
+                                               if (initial_delay.count() > 0)
+                                                   std::this_thread::sleep_for(initial_delay);
                                                const std::size_t step = payload.size() > 4096 ? 4093 : 7;
                                                for (std::size_t i = 0; i < payload.size(); i += step) {
                                                    const auto n = std::min(step, payload.size() - i);
-                                                   if (!sink.write(payload.data() + i, n))
+                                                   if (!sink.write(payload.data() + i, n)) {
+                                                       disconnects_.fetch_add(1);
                                                        return false;
+                                                   }
+                                               }
+                                               if (initial_delay.count() > 0) {
+                                                   // Probe after the delayed
+                                                   // first write; a tiny fake
+                                                   // response can otherwise be
+                                                   // buffered after the peer
+                                                   // has already closed.
+                                                   for (int i = 0; i < 100; ++i) {
+                                                       std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                                                       if (!sink.write("\n", 1)) {
+                                                           disconnects_.fetch_add(1);
+                                                           return false;
+                                                       }
+                                                   }
+                                                   return false;
                                                }
                                                sink.done();
                                                return true;
@@ -92,6 +113,10 @@ class FakeLlamaServer {
         std::lock_guard<std::mutex> lock(mu_);
         status_ = status;
     }
+    void set_initial_delay(std::chrono::milliseconds delay) {
+        std::lock_guard<std::mutex> lock(mu_);
+        initial_delay_ = delay;
+    }
     std::string last_body() const {
         std::lock_guard<std::mutex> lock(mu_);
         return last_body_;
@@ -117,6 +142,7 @@ class FakeLlamaServer {
         return last_slot_body_;
     }
     unsigned health_requests() const { return health_requests_.load(); }
+    unsigned disconnects() const { return disconnects_.load(); }
 
   private:
     httplib::Server svr_;
@@ -131,6 +157,8 @@ class FakeLlamaServer {
     std::string last_slot_;
     std::string last_slot_body_;
     int status_ = 200;
+    std::chrono::milliseconds initial_delay_{0};
     std::atomic<unsigned> health_requests_{0};
+    std::atomic<unsigned> disconnects_{0};
 };
 } // namespace sonder_test

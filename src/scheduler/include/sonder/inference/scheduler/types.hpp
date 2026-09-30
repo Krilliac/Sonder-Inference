@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <functional>
 
 namespace sonder::inference::scheduler {
 
@@ -101,6 +102,12 @@ struct RequestSpec {
     /// refused unless allow_duplicate is set.
     std::string sequence_fingerprint;
     bool allow_duplicate = false;
+    // Optional host admission constraints. ready is non-reserving; try_admit
+    // runs after a successful KV reservation and must not block or throw.
+    // order preserves the host FIFO when prompt preparation finishes out of order.
+    std::function<bool()> try_admit;
+    std::function<bool()> admission_ready;
+    std::optional<std::uint64_t> admission_order;
 };
 
 /// Per-class counters container.

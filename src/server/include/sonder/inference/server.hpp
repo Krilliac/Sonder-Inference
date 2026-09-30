@@ -37,6 +37,9 @@ inline constexpr std::uint16_t kDefaultPort = 11437;
 
 enum class LogFormat { text, json };
 enum class SchedulerPolicy { automatic, gate, account, off };
+// Controls the server-side class/capacity admission layer. `automatic` only
+// enables it when an explicit class or queue cap is configured.
+enum class PriorityAdmissionPolicy { automatic, on, off };
 
 struct ServerOptions {
     // Listen address. Non-loopback binds require `token`.
@@ -99,6 +102,16 @@ struct ServerOptions {
     // request; a conflicting request value is overridden with a warning.
     std::optional<bool> pin_enable_thinking;
     std::optional<std::string> pin_reasoning_effort;
+
+    // Request-class admission limits, applied only when priority admission is
+    // enabled. Zero means unlimited; engine scheduling is independent.
+    std::size_t max_concurrent_subagent = 0;
+    std::size_t max_concurrent_background = 0;
+    std::size_t max_queue_per_class = 0;
+    // 0 uses the backend's advertised capacity; unknown stays ungated.
+    // A nonzero override applies only when priority admission is enabled.
+    std::size_t backend_capacity = 0;
+    PriorityAdmissionPolicy priority_admission = PriorityAdmissionPolicy::automatic;
 };
 
 // Checks option combinations that the server refuses to start with

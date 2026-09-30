@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <map>
 #include <mutex>
+#include <limits>
 #include <optional>
 #include <span>
 #include <thread>
@@ -46,6 +47,7 @@ kvc::KvCacheConfig make_cache_config(const SchedulingOptions& o) {
 
 sch::SchedulerConfig make_scheduler_config(const SchedulingOptions& o) {
     sch::SchedulerConfig c;
+    c.strict_priority_admission = o.strict_priority_admission;
     c.max_running_sequences = at_least_one(o.max_running_sequences);
     c.max_step_sequences = at_least_one(o.max_step_sequences);
     c.max_step_tokens = at_least_one(o.max_step_tokens);
@@ -54,6 +56,12 @@ sch::SchedulerConfig make_scheduler_config(const SchedulingOptions& o) {
     c.admission_watermark_blocks = o.admission_watermark_blocks;
     c.max_requeue_count = o.max_requeue_count;
     c.enable_priority_preemption = o.enable_priority_preemption;
+    if (o.strict_priority_admission) {
+        c.admission_lookahead = 0;
+        c.aging_interval_us = std::numeric_limits<sch::TimeUs>::max();
+        c.starvation_threshold_us = std::numeric_limits<sch::TimeUs>::max();
+        c.enable_priority_preemption = false;
+    }
     return c;
 }
 
@@ -82,6 +90,7 @@ struct Req {
     std::size_t cached_tokens = 0;
     std::uint64_t admission_reused = 0;
     bool admitted_once = false;
+    std::shared_ptr<RequestAdmission> admission;
     // false: one admission grant at the end of the logical prefill, then the
     // session streams without grants (SchedulerMode::account).
     bool gated = true;
@@ -96,7 +105,8 @@ public:
           cache_(make_cache_config(options)),
           adapter_(cache_),
           scheduler_(make_scheduler_config(options), clock_, adapter_),
-          stall_timeout_(std::max<std::uint32_t>(1, options.step_stall_timeout_ms)) {
+          stall_timeout_(std::max<std::uint32_t>(1, options.step_stall_timeout_ms)),
+          strict_priority_(options.strict_priority_admission) {
         cache_.set_event_listener([this](const kvc::CacheEvent& e) { on_cache_event(e); });
         // Free a request's sequence the moment the scheduler drops its
         // reservation so preemption sees the blocks come back (recompute).
@@ -177,11 +187,19 @@ public:
             max_new = std::max<std::uint64_t>(1, std::min<std::uint64_t>(max_new, capacity - prompt));
         }
 
-        const int rank = static_cast<int>(spec.workload) - spec.priority;
+        int rank = static_cast<int>(spec.workload) - spec.priority;
+        // Numeric HTTP headers retain the legacy scheduler rank, including
+        // explicit zero. Their host ticket still enforces interactive FIFO.
+        if (strict_priority_ && !spec.preserve_numeric_priority) {
+            // Hosted requests have three explicit classes. Missing metadata
+            // is deliberately interactive, matching the server default.
+            rank = spec.priority_class == RequestPriority::background ? 2
+                  : spec.priority_class == RequestPriority::subagent ? 1 : 0;
+        }
         sch::RequestSpec rs;
         rs.id = id;
         rs.workload = static_cast<sch::WorkloadClass>(static_cast<int>(spec.workload));
-        if (spec.priority != 0) {
+        if (strict_priority_ || spec.priority != 0) {
             rs.priority_override = rank;
         }
         rs.task_id = spec.context.task_id.value_or("");
@@ -190,6 +208,11 @@ public:
         // i.e. at the end of its logical prefill (admission + prompt KV).
         rs.max_new_tokens = static_cast<sch::TokenCount>(spec.gated ? max_new : 1);
         rs.cancellable = true;
+        if (spec.admission) {
+            rs.try_admit = [admission = spec.admission] { return admission->try_acquire(); };
+            rs.admission_ready = [admission = spec.admission] { return admission->ready(); };
+            rs.admission_order = spec.admission->order();
+        }
         const sch::SubmitResult submitted = scheduler_.submit(rs);
         if (!submitted.accepted) {
             bus_.emit("scheduler.rejected", spec.context,
@@ -213,6 +236,7 @@ public:
         r.cache_priority = static_cast<kvc::Priority>(std::clamp(6 - rank, 0, 255));
         r.submitted_at = clock_.now();
         r.gated = spec.gated;
+        r.admission = std::move(spec.admission);
         bus_.emit("scheduler.enqueued", r.ctx,
                   json::Object{{"scheduler_request_id", id},
                                {"workload", str(sch::to_string(rs.workload))},
@@ -232,31 +256,37 @@ public:
         return submission;
     }
 
-    Status acquire_token(std::uint64_t id, const CancellationToken& cancel) override {
+    Status acquire_token(std::uint64_t id, const CancellationToken& cancel,
+                         std::optional<std::chrono::steady_clock::time_point> deadline) override {
+        return wait_for_grant(id, cancel, deadline, true);
+    }
+
+    Status admit_backend(std::uint64_t id, const CancellationToken& cancel,
+                         std::optional<std::chrono::steady_clock::time_point> deadline) override {
+        return wait_for_grant(id, cancel, deadline, false);
+    }
+
+    // The first backend admission and later token gates share the same wait.
+    // Only the initial admission has a deadline argument: running deadlines
+    // cancel through the session's token, preserving partial-result semantics.
+    Status wait_for_grant(std::uint64_t id, const CancellationToken& cancel,
+                          std::optional<std::chrono::steady_clock::time_point> deadline, bool consume) {
         std::unique_lock<std::mutex> lock(mu_);
         for (;;) {
             auto it = reqs_.find(id);
-            if (it == reqs_.end()) {
-                return Status(ErrorCode::internal, "unknown scheduled request");
-            }
+            if (it == reqs_.end()) return Status(ErrorCode::internal, "unknown scheduled request");
             Req& r = it->second;
-            if (r.failure) {
-                return *r.failure;
+            if (r.failure) return *r.failure;
+            if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled while waiting for the scheduler");
+            if (deadline && std::chrono::steady_clock::now() >= *deadline) {
+                return Status(ErrorCode::timeout, "request deadline exceeded while waiting for admission");
             }
-            if (r.passthrough) {
-                return Status::success();
-            }
+            if (r.passthrough) return Status::success();
             if (r.credits > 0) {
-                --r.credits;
+                if (consume) --r.credits;
                 return Status::success();
             }
-            if (cancel.cancelled()) {
-                return Status(ErrorCode::cancelled, "cancelled while waiting for the scheduler");
-            }
-            if (stopping_) {
-                return Status(ErrorCode::unavailable, "engine is shutting down");
-            }
-            // Cancellation is cooperative (token polled), grants are notified.
+            if (stopping_) return Status(ErrorCode::unavailable, "engine is shutting down");
             cv_.wait_for(lock, std::chrono::milliseconds(2));
         }
     }
@@ -482,7 +512,7 @@ private:
             const double queue_ms = ms_since(r->submitted_at, now);
             if (!r->admitted_once) {
                 r->admitted_once = true;
-                r->summary.queue_ms = queue_ms;
+                r->summary.queue_ms = r->admission ? r->admission->queue_ms() : queue_ms;
             }
             r->admission_reused = 0;
             bus_.emit("scheduler.admitted", r->ctx,
@@ -616,6 +646,24 @@ private:
         }
     }
 
+    void wait_for_progress(std::unique_lock<std::mutex>& lock) {
+        const std::uint64_t seen = generation_;
+        const auto changed = [&] { return stopping_ || generation_ != seen; };
+        const bool host_waiting = std::any_of(reqs_.begin(), reqs_.end(), [](const auto& entry) {
+            const Req& r = entry.second;
+            return r.admission && !r.admitted_once && !r.done && !r.failure;
+        });
+        if (host_waiting) {
+            // Host permits outlive finish(): releasing one signals the host's
+            // condition variable, not this runtime's generation counter. Also
+            // recheck when a queued host ticket is removed without an engine
+            // event. Keep the legacy event-only wait for unticketed requests.
+            cv_.wait_for(lock, std::chrono::milliseconds(20), changed);
+        } else {
+            cv_.wait(lock, changed);
+        }
+    }
+
     void loop() {
         std::unique_lock<std::mutex> lock(mu_);
         while (!stopping_) {
@@ -635,10 +683,9 @@ private:
                 if (!plan.preempted.empty() || !plan.admitted.empty() || !plan.failed.empty()) {
                     continue;  // state changed; plan again
                 }
-                // Nothing runnable (e.g. admission blocked on KV): wait for a
-                // submit, a finish or produced tokens to change the picture.
-                const std::uint64_t seen = generation_;
-                cv_.wait(lock, [&] { return stopping_ || generation_ != seen; });
+                // Nothing runnable: either engine progress or a host permit
+                // becoming available can make the next plan runnable.
+                wait_for_progress(lock);
                 continue;
             }
             cv_.notify_all();
@@ -655,8 +702,7 @@ private:
                 const auto deadline = std::chrono::steady_clock::now() + stall_timeout_;
                 cv_.wait_until(lock, deadline, [&] { return stopping_ || step_consumed(plan); });
             } else {
-                const std::uint64_t seen = generation_;
-                cv_.wait(lock, [&] { return stopping_ || generation_ != seen; });
+                wait_for_progress(lock);
             }
             if (stopping_) {
                 break;
@@ -717,6 +763,7 @@ private:
     std::optional<kvc::PressureLevel> pressure_pending_;
     const char* release_reason_ = "completed";  // kv.freed reason for the release hook
     std::chrono::milliseconds stall_timeout_;
+    bool strict_priority_ = false;
     bool stopping_ = false;
     std::thread thread_;
 };

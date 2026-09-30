@@ -10,6 +10,7 @@
 #include "sonder/inference/error.hpp"
 #include "sonder/inference/json.hpp"
 #include "sonder/inference/model.hpp"
+#include "sonder/inference/request_priority.hpp"
 #include "sonder/inference/sampling.hpp"
 #include "sonder/inference/session.hpp"
 #include "sonder/inference/telemetry.hpp"

@@ -3,6 +3,7 @@
 // in telemetry envelopes, and cancellation on client disconnect.
 #include <doctest/doctest.h>
 
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -224,6 +225,87 @@ TEST_CASE("chat: correlation headers land in telemetry envelopes") {
     }
     CHECK(seen);
 }
+
+TEST_CASE("chat: priority header forms preserve numeric telemetry and override body class") {
+    Fixture f;
+    const auto queued_for = [&](const std::string& body,
+                                const std::vector<std::pair<std::string, std::string>>& headers) {
+        const Reply reply = post(f.port, "/v1/chat/completions", body, headers);
+        if (reply.status != 200) return std::optional<json::Value>{};
+        const std::string request_id = reply.json().find("sonder")->find("request_id")->as_string();
+        for (const auto& event : f.of_type("request.queued")) {
+            if (event.find("request_id")->as_string() != request_id) continue;
+            return std::optional<json::Value>(*event.find("attributes"));
+        }
+        return std::optional<json::Value>{};
+    };
+
+    // Legacy numeric headers retain the integer scheduler/telemetry value,
+    // while the header's interactive admission class wins over the body.
+    for (const auto* value : {"-16", "0", "+5", "+16"}) {
+        const auto numeric = queued_for(chat_body(R"(,"priority":"background","max_tokens":2)"),
+                                        {{"X-Sonder-Priority", value}});
+        REQUIRE(numeric.has_value());
+        CHECK(numeric->find("priority")->as_int() == std::stoi(value));
+        CHECK(numeric->find("priority_class")->as_string() == "interactive");
+        CHECK(numeric->find("admission")->find("priority")->as_string() == "interactive");
+    }
+
+    // Named headers select admission directly and do not invent a numeric
+    // scheduler priority; the body class is overridden by the header.
+    for (const auto* value : {"interactive", "subagent", "background"}) {
+        const auto named = queued_for(chat_body(R"(,"priority":"background","max_tokens":2)"),
+                                      {{"X-Sonder-Priority", value}});
+        REQUIRE(named.has_value());
+        CHECK(named->find("priority")->as_int() == 0);
+        CHECK(named->find("priority_class")->as_string() == value);
+        CHECK(named->find("admission")->find("priority")->as_string() == value);
+    }
+
+    const auto body_only = queued_for(chat_body(R"(,"priority":"background","max_tokens":2)"), {});
+    REQUIRE(body_only.has_value());
+    CHECK(body_only->find("priority_class")->as_string() == "background");
+    const auto no_hints = queued_for(chat_body(R"(,"max_tokens":2)"), {});
+    REQUIRE(no_hints.has_value());
+    CHECK(no_hints->find("priority_class")->as_string() == "interactive");
+
+    CHECK(post(f.port, "/v1/chat/completions", chat_body(R"(,"priority":"unknown")"),
+               {{"X-Sonder-Priority", "interactive"}})
+              .status == 400);
+    CHECK(post(f.port, "/v1/chat/completions", chat_body(R"(,"priority":"background")"),
+               {{"X-Sonder-Priority", "unknown"}})
+              .status == 400);
+}
+
+#if defined(SONDER_HAS_SCHEDULER) && defined(SONDER_HAS_KV_CACHE)
+TEST_CASE("chat: numeric header retains its workload-based scheduler rank with admission enabled or disabled") {
+    for (int policy = 0; policy < 4; ++policy) {
+        auto options = Fixture::defaults();
+        if (policy == 1) options.priority_admission = srv::PriorityAdmissionPolicy::on;
+        if (policy == 2) options.max_concurrent_background = 1;  // auto enabled by a cap
+        if (policy == 3) {
+            options.priority_admission = srv::PriorityAdmissionPolicy::off;
+            options.max_concurrent_background = 1;
+        }
+        Fixture fixture(std::move(options));
+        for (const auto* value : {"-16", "0", "+16"}) {
+            const Reply reply = post(fixture.port, "/v1/chat/completions",
+                                     chat_body(R"(,"priority":"background","max_tokens":2)"),
+                                     {{"X-Sonder-Priority", value}, {"X-Sonder-Workload", "maintenance"}});
+            REQUIRE(reply.status == 200);
+            const std::string id = reply.json().find("sonder")->find("request_id")->as_string();
+            bool found = false;
+            for (const auto& event : fixture.of_type("scheduler.enqueued")) {
+                if (event.find("request_id")->as_string() != id) continue;
+                found = true;
+                CHECK(event.find("attributes")->find("priority_rank")->as_int() ==
+                      static_cast<int>(si::WorkloadClass::maintenance) - std::stoi(value));
+            }
+            CHECK(found);
+        }
+    }
+}
+#endif
 
 TEST_CASE("chat: a client disconnect cancels the request (request.cancelled)") {
     auto o = Fixture::defaults();

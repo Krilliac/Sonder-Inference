@@ -85,9 +85,21 @@ Types used below: `int` (JSON integer), `num` (JSON number), `str`,
 | --- | --- | --- |
 | `session.created` | metrics | `model`, `backend` str; `priority` int; `workload` str (see below); `text_capture` str (`on` / `off`); `sampling` obj |
 | `session.closed` | metrics | `requests` int |
-| `request.queued` | metrics | `kind` str (`generate` from `Session::generate`, `chat` from `Session::chat`), `priority` int, `workload` str, `prompt_bytes` int (for chat: the generic formatted prompt); `chat` adds `messages` int |
+| `request.queued` | metrics | `kind` str (`generate` from `Session::generate`, `chat` from `Session::chat`), `priority` int (legacy scheduler rank, preserved), `priority_class` str (`interactive`, `subagent`, `background`), `workload` str, `prompt_bytes` int (for chat: the generic formatted prompt); `chat` adds `messages` int |
 | `request.started` | metrics | `kind` str, `sampling` obj, `scheduled` bool, `sampler` str (`sonder` or `backend`); when scheduled, `scheduler_mode` str (`gate`: per-chunk grants; `account`: admission and prompt accounting only); `chat` adds `chat_template` str (`native`: the backend's chat API or model template received the messages; `generic`: `format_chat_prompt()`) |
-| `request.completed` / `request.cancelled` / `request.failed` | metrics | `outcome`, `stop_reason` str; `prompt_tokens`, `completion_tokens`, `chunks` int; `token_counts_from_backend` bool; `ttft_ms`, `total_ms` num; `scheduled` bool; `sampler` str. When `scheduled`: `queue_ms` num, `preemptions` int, `accounted_prompt_tokens` int, `reused_prompt_tokens` int. `cancelled` optionally adds `cancel_latency_ms` num. `failed` adds `error_code`, `error` str, and `scheduler_rejected` bool (true) when the scheduler refused the request before any backend work |
+| `request.completed` / `request.cancelled` / `request.failed` | metrics | `outcome`, `stop_reason` str; `prompt_tokens`, `completion_tokens`, `chunks` int; `token_counts_from_backend` bool; `ttft_ms`, `total_ms` num; `scheduled` bool; `sampler` str. For hosted requests: additive `priority_class` str and `admission` obj with `priority` str and `queue_ms` num. When scheduled: the existing `queue_ms`, `preemptions`, `accounted_prompt_tokens`, and `reused_prompt_tokens` remain. `cancelled` optionally adds `cancel_latency_ms` num. `failed` adds `error_code`, `error` str, and `scheduler_rejected` bool (true) when the scheduler refused the request before any backend work |
+
+Hosted request admission fields are additive: the historical numeric
+`request.queued.attributes.priority` remains unchanged. Class names live in
+`priority_class` and `admission.priority` (`interactive`, `subagent`,
+`background`). `admission.queue_ms` is the measured wait as of the event;
+terminal events include the full queue wait, including logical KV admission,
+without double-counting scheduler time. It remains available with scheduling
+off or an oversized account-mode prompt that bypasses the logical pool.
+A queue refusal before a session request begins emits `request.failed` with
+`backend_started: false`, `error_code`, class, queue time and correlation.
+Health exposes `queued_by_class` as instantaneous counts from these tickets.
+There is no separate Prometheus metrics endpoint.
 
 All five request lifecycle events carry the optional `parent_request_id` str
 when the caller set `RequestOptions::parent_request_id` (for `sonder-infer
@@ -189,7 +201,9 @@ Additive within `/1`: `producer.role` and `producer.synthetic`;
 `parent_request_id` on the request lifecycle events;
 `request.failed.scheduler_rejected`; `engine.started.server`;
 `scheduler.configured.mode`, `request.started.scheduler_mode`,
-`scheduler.enqueued.gated` and `scheduler.bypassed`. Discovery
+`scheduler.enqueued.gated`, `scheduler.bypassed`, request `priority_class`,
+request `admission.priority`, request `admission.queue_ms`, and the server
+health `queued_by_class` gauge. Discovery
 advertises this vocabulary as `vocabularies: {"sonder.inference.events": 1}`.
 
 ## Observatory change requests (Observatory `docs/telemetry-schema.md` @ f5e3ff5)

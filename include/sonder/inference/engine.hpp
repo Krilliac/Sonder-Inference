@@ -64,6 +64,10 @@ struct SchedulingOptions {
     // reasoning model thinking, a cold model load, a session blocked on a
     // slow client) delays the others by at most this much.
     std::uint32_t step_stall_timeout_ms = 250;
+    // Hosted server opt-in. When enabled, admission uses strict
+    // interactive > subagent > background ordering without aging, lookahead,
+    // or urgency preemption. Legacy library scheduling remains unchanged.
+    bool strict_priority_admission = false;
 };
 
 // Snapshot of the engine's logical KV pool (all zero when inactive).
