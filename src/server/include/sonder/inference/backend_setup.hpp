@@ -79,6 +79,10 @@ struct BackendSetup {
     std::uint64_t llamaserver_fit_max_attempts = 4;
     std::string llamaserver_log_file;
     bool llamaserver_kv_pairing_check = true;
+    // JSON "context_length" (served context when /props is unavailable) and
+    // "slot_affinity" (id_slot pinning; docs/integration/llama-server.md).
+    std::uint64_t llamaserver_context_length = 0;
+    bool llamaserver_slot_affinity = true;
 };
 
 // Values taken from the environment when the matching option is absent:

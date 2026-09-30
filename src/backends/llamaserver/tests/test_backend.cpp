@@ -354,8 +354,9 @@ TEST_SUITE("llamaserver_backend") {
         CHECK(r.status().code() == ErrorCode::backend_error);
     }
 
-    TEST_CASE("unsupported request configuration fails before network") {
+    TEST_CASE("num_ctx beyond the served context fails before the completion request") {
         sonder_test::FakeLlamaServer server;
+        server.set_props(R"({"default_generation_settings":{"n_ctx":1024},"total_slots":1})");
         LlamaServerBackendOptions o;
         o.base_url = server.url();
         auto b = make_llamaserver_backend(o);
@@ -366,7 +367,8 @@ TEST_SUITE("llamaserver_backend") {
         GenerateRequest q;
         q.prompt = "x";
         q.sampling.num_ctx = 2048;
-        CHECK(m.value()->generate(q, {}, {}).status().code() == ErrorCode::unsupported);
+        const auto r = m.value()->generate(q, {}, {});
+        CHECK(r.status().code() == ErrorCode::invalid_argument);
         CHECK(server.last_body().empty());
     }
 

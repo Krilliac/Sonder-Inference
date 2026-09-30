@@ -25,11 +25,25 @@ const char* version_string() noexcept;
 // Git commit the library was configured from, or "unknown".
 const char* build_commit() noexcept;
 
+// How a scheduled request is paced (docs/integration/engine-wiring.md).
+//   gate:      every generated chunk waits for a scheduler grant, and KV is
+//              accounted for prompt and output (continuous batching of an
+//              in-process backend).
+//   account:   admission, priority and logical prefix accounting of the
+//              prompt, then the backend streams without per-chunk waits. A
+//              prompt larger than the logical KV pool runs unscheduled
+//              instead of being rejected (the real KV lives upstream).
+//   automatic: gate for in-process backends, account for backends that
+//              declare Capability::remote_process (llamaserver, ollama).
+enum class SchedulerMode { automatic, gate, account };
+const char* to_string(SchedulerMode mode) noexcept;
+
 // Request scheduling and logical KV accounting. Effective only when the
 // scheduler (src/scheduler) and KV-cache (src/cache) modules are built; see
 // Engine::scheduling_active().
 struct SchedulingOptions {
     bool enabled = true;
+    SchedulerMode mode = SchedulerMode::automatic;
     // Logical KV pool: kv_num_blocks blocks of kv_block_size_tokens tokens.
     std::uint32_t kv_block_size_tokens = 16;
     std::uint32_t kv_num_blocks = 4096;
@@ -120,6 +134,7 @@ public:
 
     // True when requests go through the scheduler and the logical KV cache.
     [[nodiscard]] bool scheduling_active() const noexcept { return runtime_ != nullptr; }
+    [[nodiscard]] const SchedulingOptions& scheduling_options() const noexcept { return options_.scheduling; }
     [[nodiscard]] KvUsage kv_usage() const;
 
     // Internal: request runtime used by Session (null when inactive).

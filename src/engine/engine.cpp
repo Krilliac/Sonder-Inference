@@ -17,6 +17,15 @@ namespace sonder::inference {
 const char* version_string() noexcept { return SONDER_INFERENCE_VERSION; }
 const char* build_commit() noexcept { return SONDER_INFERENCE_GIT_COMMIT; }
 
+const char* to_string(SchedulerMode mode) noexcept {
+    switch (mode) {
+        case SchedulerMode::automatic: return "automatic";
+        case SchedulerMode::gate: return "gate";
+        case SchedulerMode::account: return "account";
+    }
+    return "unknown";
+}
+
 Engine::Engine(EngineOptions options)
     : options_(std::move(options)), engine_id_(make_id("engine")),
       telemetry_(std::make_unique<TelemetryBus>(options_.telemetry)), devices_(enumerate_devices()) {
@@ -40,7 +49,8 @@ Engine::Engine(EngineOptions options)
     if (runtime_) {
         const auto& so = options_.scheduling;
         telemetry_->emit("scheduler.configured", ctx,
-                         json::Object{{"kv_block_size_tokens", so.kv_block_size_tokens},
+                         json::Object{{"mode", to_string(so.mode)},
+                                      {"kv_block_size_tokens", so.kv_block_size_tokens},
                                       {"kv_num_blocks", so.kv_num_blocks},
                                       {"prefix_caching", so.prefix_caching},
                                       {"max_running_sequences", so.max_running_sequences},

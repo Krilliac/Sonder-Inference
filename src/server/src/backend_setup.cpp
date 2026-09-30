@@ -118,7 +118,8 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
         static constexpr std::string_view known[] = {"mode", "base_url", "executable", "args", "allow_remote",
             "native_completion", "grammar", "connect_timeout_ms", "request_timeout_ms", "startup_timeout_ms",
             "poll_interval_ms", "shutdown_timeout_ms", "restart_backoff_ms", "max_restart_backoff_ms",
-            "max_restarts", "tls", "spill_guard", "log_file", "kv_pairing_check"};
+            "max_restarts", "tls", "spill_guard", "log_file", "kv_pairing_check", "context_length",
+            "slot_affinity"};
         for (auto k : known) if (k == key) return false;
         return true;
     };
@@ -198,6 +199,12 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
     if (setup.llamaserver_log_file.find('\0') != std::string::npos)
         return Status(ErrorCode::invalid_argument, "llamaserver config: log_file must not contain NUL");
     if (auto st = bool_field("kv_pairing_check", setup.llamaserver_kv_pairing_check); !st.ok()) return st;
+    if (auto st = bool_field("slot_affinity", setup.llamaserver_slot_affinity); !st.ok()) return st;
+    if (const auto* v = object.find("context_length")) {
+        if (!v->is_integer() || v->as_int(-1) < 0 || v->as_uint() > 4294967296ull)
+            return Status(ErrorCode::invalid_argument, "llamaserver config: 'context_length' must be an integer in [0, 4294967296]");
+        setup.llamaserver_context_length = v->as_uint();
+    }
     if (const auto* guard = object.find("spill_guard")) {
         if (!guard->is_object()) return Status(ErrorCode::invalid_argument, "llamaserver config: 'spill_guard' must be an object");
         static constexpr std::string_view guard_keys[] = {"enabled", "policy", "threshold_mib", "baseline_mib",
@@ -328,6 +335,8 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
         lo.spill_guard.fit_max_attempts = static_cast<std::size_t>(setup.llamaserver_fit_max_attempts);
         lo.diagnostics.log_file = setup.llamaserver_log_file;
         lo.diagnostics.kv_pairing_check = setup.llamaserver_kv_pairing_check;
+        lo.context_length = setup.llamaserver_context_length;
+        lo.slot_affinity = setup.llamaserver_slot_affinity;
         std::shared_ptr<Backend> backend = make_llamaserver_backend(std::move(lo));
         return backend;
 #else

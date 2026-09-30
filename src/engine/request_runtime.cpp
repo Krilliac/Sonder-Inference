@@ -82,6 +82,9 @@ struct Req {
     std::size_t cached_tokens = 0;
     std::uint64_t admission_reused = 0;
     bool admitted_once = false;
+    // false: one admission grant at the end of the logical prefill, then the
+    // session streams without grants (SchedulerMode::account).
+    bool gated = true;
     RuntimeRequestSummary summary;
 };
 
@@ -126,6 +129,25 @@ public:
         const std::uint64_t prompt = spec.prompt_tokens.size();
         const sch::RequestId id = next_id_++;
 
+        if (prompt + 1 > capacity && !spec.gated) {
+            // Ungated (remote-process) requests keep their KV upstream: a
+            // prompt beyond the logical pool runs unscheduled instead of
+            // being refused for a limit the upstream does not have.
+            bus_.emit("scheduler.bypassed", spec.context,
+                      json::Object{{"reason", "exceeds_kv_pool"},
+                                   {"prompt_tokens", prompt},
+                                   {"kv_capacity_tokens", capacity}},
+                      TelemetryLevel::metrics);
+            RuntimeSubmission bypass;
+            bypass.bypassed = true;
+            bypass.max_new_tokens = std::max<std::uint32_t>(1, spec.max_new_tokens);
+            if (spec.context_limit > 0) {
+                bypass.max_new_tokens = static_cast<std::uint32_t>(std::max<std::uint64_t>(
+                    1, std::min<std::uint64_t>(bypass.max_new_tokens,
+                                               spec.context_limit > prompt ? spec.context_limit - prompt : 1)));
+            }
+            return bypass;
+        }
         if (prompt + 1 > capacity) {
             bus_.emit("scheduler.rejected", spec.context,
                       json::Object{{"scheduler_request_id", id},
@@ -149,7 +171,11 @@ public:
         if (spec.context_limit > 0) {
             max_new = std::min<std::uint64_t>(max_new, spec.context_limit > prompt ? spec.context_limit - prompt : 1);
         }
-        max_new = std::max<std::uint64_t>(1, std::min<std::uint64_t>(max_new, capacity - prompt));
+        if (spec.gated) {
+            // Ungated output is not accounted in the pool (it leaves the
+            // scheduler after its prefill), so only gated requests are capped.
+            max_new = std::max<std::uint64_t>(1, std::min<std::uint64_t>(max_new, capacity - prompt));
+        }
 
         const int rank = static_cast<int>(spec.workload) - spec.priority;
         sch::RequestSpec rs;
@@ -160,7 +186,9 @@ public:
         }
         rs.task_id = spec.context.task_id.value_or("");
         rs.prompt_tokens = static_cast<sch::TokenCount>(prompt);
-        rs.max_new_tokens = static_cast<sch::TokenCount>(max_new);
+        // An ungated request completes in the scheduler with its first token,
+        // i.e. at the end of its logical prefill (admission + prompt KV).
+        rs.max_new_tokens = static_cast<sch::TokenCount>(spec.gated ? max_new : 1);
         rs.cancellable = true;
         const sch::SubmitResult submitted = scheduler_.submit(rs);
         if (!submitted.accepted) {
@@ -184,6 +212,7 @@ public:
         r.architecture = spec.architecture;
         r.cache_priority = static_cast<kvc::Priority>(std::clamp(6 - rank, 0, 255));
         r.submitted_at = clock_.now();
+        r.gated = spec.gated;
         bus_.emit("scheduler.enqueued", r.ctx,
                   json::Object{{"scheduler_request_id", id},
                                {"workload", str(sch::to_string(rs.workload))},
@@ -191,12 +220,16 @@ public:
                                {"prompt_tokens", prompt},
                                {"exact_prompt_tokens", spec.exact_tokens},
                                {"max_new_tokens", max_new},
-                               {"context_limit", spec.context_limit}},
+                               {"context_limit", spec.context_limit},
+                               {"gated", spec.gated}},
                   TelemetryLevel::metrics);
         reqs_.emplace(id, std::move(r));
         ++generation_;
         cv_.notify_all();
-        return RuntimeSubmission{static_cast<std::uint64_t>(id), static_cast<std::uint32_t>(max_new)};
+        RuntimeSubmission submission;
+        submission.id = static_cast<std::uint64_t>(id);
+        submission.max_new_tokens = static_cast<std::uint32_t>(max_new);
+        return submission;
     }
 
     Status acquire_token(std::uint64_t id, const CancellationToken& cancel) override {
@@ -505,7 +538,13 @@ private:
                                            {"reused_tokens", r->admission_reused},
                                            {"recompute", recompute}},
                               TelemetryLevel::metrics);
-                    grant(*r);
+                    if (r->gated) {
+                        grant(*r);
+                    } else {
+                        // Admission grant only: nothing is owed back, so the
+                        // step barrier never waits on an ungated request.
+                        ++r->credits;
+                    }
                 }
             } else {
                 if (!append(*r, w.context_offset, 1, ar)) {

@@ -75,6 +75,10 @@ struct RequestOptions {
     // completed, cancelled and failed. The envelope request_id stays the
     // engine-generated id.
     std::optional<std::string> parent_request_id;
+    // Chat on a native-chat backend only (ChatRequest::session_key and
+    // ChatRequest::thinking); ignored by generate() and the generic template.
+    std::string session_key;
+    ThinkingOptions thinking;
 };
 
 struct GenerationResult {

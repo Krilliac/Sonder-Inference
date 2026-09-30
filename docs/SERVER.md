@@ -60,6 +60,10 @@ itself.
 | `--ready-file PATH` | none | Written atomically once the socket **listens** (models may still be loading: poll health for 200): `{"url","pid","instance_id","api_version":1}`. Removed when `serve` returns, after a failed start as well as after a clean shutdown. A process killed outright (second signal, SIGKILL) leaves it behind: check that `pid` is alive. |
 | `--mock-delay-ms N` | `0` | Mock per-token delay. |
 | `--log-format text\|json` | `text` | Banner, access log and diagnostics on stderr. |
+| `--scheduler automatic\|gate\|account\|off` | `automatic` | Engine scheduling, see [Scheduling](#scheduling). `automatic` gates in-process backends per token and only admits and accounts remote-process backends (llamaserver, ollama); `off` disables the scheduler and the logical KV pool. |
+| `--kv-pool-tokens N` | `65536` | Logical KV pool size in tokens (16 to 16777216, rounded up to 16-token blocks). |
+| `--pin-enable-thinking on\|off` | none | Sent as `chat_template_kwargs.enable_thinking` (llama-server) / `think` (ollama) on every chat request. See [Thinking control](#thinking-control). |
+| `--pin-reasoning-effort E` | none | Same for `chat_template_kwargs.reasoning_effort` (1 to 64 of `[A-Za-z0-9._-]`). |
 
 `--key=value` is accepted as well as `--key value`. Exit status: 0 after a
 clean shutdown, 1 on a runtime error (for example the port is in use; the
@@ -291,7 +295,20 @@ from `user` or `tool`), `stream`, `stream_options.include_usage`,
 `SamplingConfig`'s (temperature 0.8, top_p 0.95, top_k 40, repeat_penalty
 1.1).
 
-Ignored: `user`, `chat_template_kwargs`, and any unknown top-level field.
+Request-path extensions (all optional; see the sections below):
+
+- `prompt_cache_key` (OpenAI; a 1-256 byte string): conversation key for
+  upstream prompt-cache affinity. Without it the key is derived from
+  `X-Sonder-Run-Id` and `X-Sonder-Agent-Id` (`run=<id>;agent=<id>`, either
+  part may be absent); with neither there is no affinity.
+- `chat_template_kwargs` (object): `enable_thinking` (boolean) and
+  `reasoning_effort` (string of 1-64 `[A-Za-z0-9._-]`) are forwarded to
+  native-chat backends; other keys are ignored. A non-object, or a key of the
+  wrong type, is 400 `invalid_json` naming it.
+- `think` (boolean, Ollama's name): same as
+  `chat_template_kwargs.enable_thinking`; both set and disagreeing is 400.
+
+Ignored: `user` and any unknown top-level field.
 Rejected with 400 `unsupported_parameter`: `tools`, `tool_choice`,
 `functions`, `function_call`, `response_format`, `logprobs: true`,
 `top_logprobs`, `n` other than 1, non-string message `content`, and
@@ -315,6 +332,16 @@ Non-streaming response:
   appears when a chunk was produced, and `prompt_ms`, `predicted_ms`,
   `prompt_per_second`, `predicted_per_second` only when the backend measured
   them.
+- Upstream cache observations are additive and appear only when the backend
+  reported them (llamaserver `cache_n` / `prompt_tokens_details`, Ollama
+  `prompt_eval_cached_count`); a reported 0 is a real miss, an absent field
+  means "not reported": `usage.prompt_tokens_details.cached_tokens` (part of
+  `prompt_tokens`), `timings.cache_n` (same count, llama-server's name),
+  `timings.draft_n` and `timings.draft_n_accepted` (speculative decoding).
+  `timings.queue_ms` is the scheduler's submit-to-admission time and appears
+  for scheduled requests only.
+- `sonder.warnings` (array of strings) appears only when the server changed
+  the request, today only a thinking pin overriding a request value.
 
 With `"stream": true` the response is `text/event-stream`: `data:` lines
 carrying `chat.completion.chunk` objects (the first with
@@ -328,6 +355,51 @@ arrives as one `data: {"error": …}` event and the stream ends without
 
 A client disconnect (detected while generating, streaming or not) cancels the
 session: the request ends with `request.cancelled`.
+
+#### Scheduling
+
+Every chat request goes through the engine scheduler unless `--scheduler off`.
+How it is paced depends on the backend (`SchedulerMode`,
+[engine wiring](integration/engine-wiring.md)):
+
+- `gate` (in-process backends under `automatic`: mock, llamacpp): each
+  generated chunk waits for a scheduler grant, and KV is accounted for the
+  prompt and the output. Unchanged from earlier releases.
+- `account` (remote-process backends under `automatic`: llamaserver,
+  ollama): the request is admitted in priority order and its prompt is
+  accounted (prefix reuse, `queue_ms`), then the backend streams with no
+  per-chunk grant. The upstream owns the real KV cache and batching, so a
+  prompt larger than the logical pool (`--kv-pool-tokens`, 65,536 tokens by
+  default) runs unscheduled (`scheduler.bypassed`) instead of being refused;
+  the upstream's own context limit still applies.
+
+`--scheduler gate` forces per-chunk gating everywhere (the old behaviour for
+remote backends, including the 400 for a prompt over the pool) and
+`--scheduler account` forces admission-only accounting everywhere.
+
+#### Prompt cache affinity
+
+llamaserver reuses a prompt prefix only inside the llama-server slot that
+last processed it. The conversation key above pins each conversation to one
+slot (`id_slot`), and every native llama-server request sends
+`"cache_prompt": true`. See [llama-server](integration/llama-server.md#prompt-cache-and-slot-affinity).
+
+#### Thinking control
+
+`chat_template_kwargs.enable_thinking` / `reasoning_effort` and `think` are
+forwarded only when the request (or a pin) sets them: llama-server gets
+`chat_template_kwargs`, Ollama gets `think` (it has no portable
+`reasoning_effort`, which is not sent). On hybrid reasoning models (Qwen3.x)
+these flags change the top of the rendered prompt, so a conversation that
+toggles them re-reads its whole prompt (about 2 minutes for 100k tokens).
+`--pin-enable-thinking` / `--pin-reasoning-effort` fix them server-wide: an
+unset request field takes the pinned value, and a request asking for a
+different value is **overridden** and the response carries a
+`sonder.warnings` entry. Overriding rather than rejecting is deliberate: the
+pin is an operator decision about the served prompt shape (like
+llama-server's `--ctx-size`), and a rejection would fail every turn of a
+client that sets thinking per turn, while the override keeps the turn, keeps
+the prefix cacheable, and says what it changed.
 
 Correlation request headers (all optional; values must match
 `[A-Za-z0-9._:-]{1,128}`, otherwise 400 `invalid_correlation_header`):

@@ -193,6 +193,60 @@ std::optional<ApiError> read_sampling(const json::Object& body, SamplingConfig& 
     return std::nullopt;
 }
 
+bool reasoning_effort_ok(std::string_view v) {
+    if (v.empty() || v.size() > 64) {
+        return false;
+    }
+    for (const char c : v) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' ||
+                        c == '_' || c == '-';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// prompt_cache_key, chat_template_kwargs and think (docs/SERVER.md).
+std::optional<ApiError> read_chat_extensions(const json::Object& body, ChatJob& job) {
+    if (const json::Value* key = body.find("prompt_cache_key"); present(key)) {
+        if (!key->is_string() || key->as_string().empty() || key->as_string().size() > 256) {
+            return bad("invalid_json", "prompt_cache_key must be a string of 1 to 256 bytes", "prompt_cache_key");
+        }
+        job.session_key = key->as_string();
+    }
+    if (const json::Value* kw = body.find("chat_template_kwargs"); present(kw)) {
+        if (!kw->is_object()) {
+            return bad("invalid_json", "chat_template_kwargs must be an object", "chat_template_kwargs");
+        }
+        if (const json::Value* v = kw->find("enable_thinking"); present(v)) {
+            if (!v->is_bool()) {
+                return bad("invalid_json", "chat_template_kwargs.enable_thinking must be a boolean",
+                           "chat_template_kwargs.enable_thinking");
+            }
+            job.thinking.enable_thinking = v->as_bool();
+        }
+        if (const json::Value* v = kw->find("reasoning_effort"); present(v)) {
+            if (!v->is_string() || !reasoning_effort_ok(v->as_string())) {
+                return bad("invalid_json",
+                           "chat_template_kwargs.reasoning_effort must be a string of 1 to 64 [A-Za-z0-9._-]",
+                           "chat_template_kwargs.reasoning_effort");
+            }
+            job.thinking.reasoning_effort = v->as_string();
+        }
+    }
+    if (const json::Value* think = body.find("think"); present(think)) {
+        if (!think->is_bool()) {
+            return bad("invalid_json", "think must be a boolean", "think");
+        }
+        if (job.thinking.enable_thinking && *job.thinking.enable_thinking != think->as_bool()) {
+            return bad("invalid_json", "think and chat_template_kwargs.enable_thinking disagree", "think");
+        }
+        job.thinking.enable_thinking = think->as_bool();
+    }
+    return std::nullopt;
+}
+
 }  // namespace
 
 std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body_text) {
@@ -273,6 +327,10 @@ std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body_text) {
     }
     if (Status st = validate_chat_messages(job.messages); !st.ok()) {
         return bad("invalid_messages", st.message(), "messages");
+    }
+
+    if (auto e = read_chat_extensions(body, job)) {
+        return *e;
     }
 
     job.sampling = SamplingConfig{};
@@ -360,9 +418,13 @@ const char* finish_reason(const GenerationResult& result) noexcept {
 }
 
 json::Object usage_json(const GenerationResult& result) {
-    return json::Object{{"prompt_tokens", result.stats.prompt_tokens},
-                        {"completion_tokens", result.stats.completion_tokens},
-                        {"total_tokens", result.stats.prompt_tokens + result.stats.completion_tokens}};
+    json::Object u{{"prompt_tokens", result.stats.prompt_tokens},
+                   {"completion_tokens", result.stats.completion_tokens},
+                   {"total_tokens", result.stats.prompt_tokens + result.stats.completion_tokens}};
+    if (result.stats.cached_tokens) {
+        u.set("prompt_tokens_details", json::Object{{"cached_tokens", *result.stats.cached_tokens}});
+    }
+    return u;
 }
 
 json::Object timings_json(const GenerationResult& result) {
@@ -385,6 +447,19 @@ json::Object timings_json(const GenerationResult& result) {
         if (result.stats.completion_tokens > 0) {
             t.set("predicted_per_second", static_cast<double>(result.stats.completion_tokens) * 1e3 / ms);
         }
+    }
+    // Backend observations: present only when reported (0 is a real value).
+    if (result.stats.cached_tokens) {
+        t.set("cache_n", *result.stats.cached_tokens);
+    }
+    if (result.stats.draft_tokens) {
+        t.set("draft_n", *result.stats.draft_tokens);
+    }
+    if (result.stats.draft_accepted_tokens) {
+        t.set("draft_n_accepted", *result.stats.draft_accepted_tokens);
+    }
+    if (result.scheduling.scheduled) {
+        t.set("queue_ms", result.scheduling.queue_ms);
     }
     return t;
 }

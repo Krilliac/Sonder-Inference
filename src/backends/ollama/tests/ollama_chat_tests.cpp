@@ -2,6 +2,7 @@
 // in-process fake Ollama server (recorded NDJSON fixture, no live Ollama).
 #include <doctest/doctest.h>
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -167,4 +168,39 @@ TEST_CASE("backend chat: logit_bias is rejected, not silently dropped") {
     CHECK(st.status().code() == ErrorCode::invalid_argument);
     CHECK(st.status().message().find("logit_bias") != std::string::npos);
     CHECK(srv.request_count() == before);  // nothing was sent
+}
+
+TEST_CASE("backend chat: thinking control becomes think and cached prompt tokens reach the stats") {
+    FakeOllamaServer srv;
+    StreamScript s;
+    s.body = R"({"model":"qwen3:8b","message":{"role":"assistant","content":"ok"},"done":false})" "\n"
+             R"({"model":"qwen3:8b","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop",)"
+             R"("prompt_eval_count":40,"prompt_eval_cached_count":32,"eval_count":1})" "\n";
+    srv.set_chat(s);
+    auto m = load(srv, config_for(srv));
+    ChatRequest req;
+    req.messages = {{"user", "hi"}};
+    auto st = m->chat(req, {}, {});
+    REQUIRE_MESSAGE(st.ok(), st.status().to_string());
+    CHECK(st->cached_tokens == std::optional<std::uint64_t>(32));
+    auto sent = json::parse(srv.last_chat_body());
+    REQUIRE(sent.ok());
+    CHECK(sent->find("think") == nullptr);  // unset: the model default applies
+
+    req.thinking.enable_thinking = false;
+    req.thinking.reasoning_effort = "high";  // no portable Ollama field: not sent
+    REQUIRE(m->chat(req, {}, {}).ok());
+    sent = json::parse(srv.last_chat_body());
+    REQUIRE(sent.ok());
+    REQUIRE(sent->find("think") != nullptr);
+    CHECK_FALSE(sent->find("think")->as_bool());
+    CHECK(sent->find("reasoning_effort") == nullptr);
+
+    // A server that omits the counter reports no cached count (not 0).
+    s.body = R"({"model":"qwen3:8b","message":{"role":"assistant","content":"ok"},"done":true,"done_reason":"stop",)"
+             R"("prompt_eval_count":40,"eval_count":1})" "\n";
+    srv.set_chat(s);
+    auto plain = m->chat(req, {}, {});
+    REQUIRE(plain.ok());
+    CHECK_FALSE(plain->cached_tokens.has_value());
 }

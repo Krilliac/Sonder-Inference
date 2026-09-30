@@ -84,6 +84,15 @@ struct LlamaServerBackendOptions {
     // providing /v1/completions. Chat always uses /v1/chat/completions.
     bool native_completion = true;
     std::string grammar; // optional upstream GBNF grammar; never synthesized
+    // Served per-slot context, used when the upstream has no GET /props (a
+    // generic OpenAI server). /props n_ctx wins when present. 0 = unknown.
+    // Requests may set num_ctx up to it (a no-op); larger values are refused.
+    std::uint64_t context_length = 0;
+    // Native mode (llama.cpp) always sends "cache_prompt": true, and with
+    // slot_affinity pins ChatRequest::session_key to one llama-server slot
+    // ("id_slot", slot count from /props total_slots). Generic OpenAI mode
+    // (native_completion = false) sends neither llama.cpp-only field.
+    bool slot_affinity = true;
     // Spawn mode only. Reported through Backend::runtime_status().
     LlamaServerSpillGuardOptions spill_guard;
     LlamaServerDiagnosticsOptions diagnostics;
