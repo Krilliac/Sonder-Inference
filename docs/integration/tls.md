@@ -36,8 +36,9 @@ node over TLS (for example Node1 at `https://10.77.0.2:8443`).
    next to the default TLS-OFF ones, which need no OpenSSL:
    - `tls-linux` (ubuntu-24.04, system libssl-dev, OpenSSL backend).
    - `tls-windows` (MSVC, Schannel backend), a required check.
-     It installs OpenSSL 4.0.2 only for the loopback test server and the
-     test-time certificate generation in `tests/tls`, and it checks with
+     It builds OpenSSL 4.0.3 from the SHA-256-pinned official release
+     tarball (cached under that hash) only for the loopback test server and
+     the test-time certificate generation in `tests/tls`, and it checks with
      `dumpbin /dependents` that `sonder-infer.exe` does not import OpenSSL.
 
    Both jobs fail if fewer than 14 `sonder.tls.*` tests are registered, so
