@@ -12,6 +12,8 @@
 
 #include <doctest/doctest.h>
 
+using sonder::inference::ModelArchitecture;
+
 using namespace sonder::inference::cache;
 using sonder::inference::ErrorCode;
 
@@ -187,6 +189,67 @@ TEST_CASE("prefix: reuse after the owner finished") {
     CHECK(s.avoided_prefill_tokens == 8);
     CHECK(s.prefix_miss_lookups == 1);  // seq 1's first block; seq 2's 3-token tail is not looked up
     CHECK(s.cached_blocks == 0);
+    CHECK(m.validate());
+}
+
+TEST_CASE("hybrid: prefix reuse stops at the nearest recurrent checkpoint") {
+    KvCacheManager m(cfg(8));
+    const SequenceOptions hybrid{kFp, 0, ModelArchitecture::hybrid};
+    REQUIRE(m.add_sequence(1, hybrid).ok());
+    REQUIRE(m.append_tokens(1, toks(0, 8)).ok());
+    REQUIRE(m.save_checkpoint(1, 4, 128).ok());
+    REQUIRE(m.free_sequence(1).ok());
+
+    CHECK(m.match_prefix(kFp, toks(0, 8), ModelArchitecture::hybrid) == 4);
+    REQUIRE(m.add_sequence(2, hybrid).ok());
+    AppendResult r;
+    REQUIRE(m.append_tokens(2, toks(0, 8), &r).ok());
+    CHECK(r.tokens_reused == 4);
+    CHECK(r.blocks_reused == 1);
+    CHECK(r.blocks_allocated == 1);
+    CHECK(m.stats().checkpoint_limited_tokens == 4);
+    CHECK(m.validate());
+}
+
+TEST_CASE("hybrid: later checkpoint authorizes the complete earlier prefix") {
+    KvCacheManager m(cfg(8));
+    const SequenceOptions hybrid{kFp, 0, ModelArchitecture::hybrid};
+    REQUIRE(m.add_sequence(1, hybrid).ok());
+    REQUIRE(m.append_tokens(1, toks(0, 8)).ok());
+    REQUIRE(m.save_checkpoint(1, 8, 128).ok());
+    REQUIRE(m.free_sequence(1).ok());
+    CHECK(m.match_prefix(kFp, toks(0, 8), ModelArchitecture::hybrid) == 8);
+    CHECK(m.match_prefix(kFp, toks(0, 12), ModelArchitecture::hybrid) == 8);
+    REQUIRE(m.add_sequence(2, hybrid).ok());
+    AppendResult r;
+    REQUIRE(m.append_tokens(2, toks(0, 8), &r).ok());
+    CHECK(r.tokens_reused == 8);
+    CHECK(r.checkpoint.has_value());
+}
+
+TEST_CASE("hybrid: unaligned checkpoint never authorizes an earlier position") {
+    KvCacheManager m(cfg(8));
+    const SequenceOptions hybrid{kFp, 0, ModelArchitecture::hybrid};
+    REQUIRE(m.add_sequence(1, hybrid).ok());
+    REQUIRE(m.append_tokens(1, toks(0, 8)).ok());
+    REQUIRE(m.save_checkpoint(1, 6, 128).ok());
+    CHECK(m.match_prefix(kFp, toks(0, 4), ModelArchitecture::hybrid) == 0);
+    CHECK(m.match_prefix(kFp, toks(0, 8), ModelArchitecture::hybrid) == 6);
+    CHECK(m.stats().checkpoints == 1);
+}
+
+TEST_CASE("hybrid: no checkpoint means no prefix reuse and checkpoints are bounded") {
+    auto c = cfg(8);
+    c.max_checkpoint_bytes = 10;
+    KvCacheManager m(c);
+    const SequenceOptions hybrid{kFp, 0, ModelArchitecture::recurrent};
+    REQUIRE(m.add_sequence(1, hybrid).ok());
+    REQUIRE(m.append_tokens(1, toks(0, 8)).ok());
+    CHECK(m.match_prefix(kFp, toks(0, 8), ModelArchitecture::recurrent) == 0);
+    REQUIRE(m.save_checkpoint(1, 4, 8).ok());
+    REQUIRE(m.save_checkpoint(1, 8, 8).ok());
+    CHECK(m.stats().checkpoint_bytes <= 10);
+    CHECK(m.stats().checkpoint_evictions == 1);
     CHECK(m.validate());
 }
 

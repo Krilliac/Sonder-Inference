@@ -251,6 +251,7 @@ public:
         d.backend = kLlamaCppBackendName;
         d.format = "gguf";
         d.family = info.description;  // e.g. "llama 7B Q4_0"
+        d.architecture = info.architecture;
         d.size_bytes = info.size_bytes;
         d.context_length = info.n_ctx;
         const std::size_t sp = info.description.find(' ');

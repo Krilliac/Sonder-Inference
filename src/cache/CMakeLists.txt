@@ -16,6 +16,7 @@ set(SONDER_CACHE_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/eviction_policy.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/kv_cache_manager.cpp)
 set(SONDER_CACHE_TEST_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_checkpoints.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_eviction_policy.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_kv_cache_manager.cpp)
 
