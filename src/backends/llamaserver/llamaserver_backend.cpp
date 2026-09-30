@@ -48,6 +48,7 @@ llamaserver::SpillGuardOptions spill_guard_options(const LlamaServerSpillGuardOp
     }
     g.threshold_bytes = o.threshold_bytes;
     g.baseline_bytes = o.baseline_bytes;
+    g.baseline_bytes_per_1k_ctx = o.baseline_bytes_per_1k_ctx;
     g.sample_interval = o.sample_interval;
     g.step_factor = o.fit_step_factor;
     g.step_align = o.fit_step_align;

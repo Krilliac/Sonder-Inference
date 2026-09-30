@@ -74,6 +74,7 @@ struct BackendSetup {
     std::string llamaserver_spill_policy = "warn";  // warn, refuse or auto_fit
     std::uint64_t llamaserver_spill_threshold_mib = 256;
     std::uint64_t llamaserver_spill_baseline_mib = 0;
+    std::uint64_t llamaserver_spill_baseline_per_1k_ctx_mib = 0;
     std::uint64_t llamaserver_spill_sample_interval_ms = 5000;
     double llamaserver_fit_step_factor = 0.85;
     std::uint64_t llamaserver_fit_step_align = 1024;

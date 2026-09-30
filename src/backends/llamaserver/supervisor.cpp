@@ -91,7 +91,7 @@ Supervisor::Supervisor(SupervisorOptions options, std::unique_ptr<ProcessLaunche
         gpu_.probe = "none";
         gpu_.status = "disabled";
     }
-    gpu_.shared_baseline_bytes = guard.baseline_bytes;
+    gpu_.shared_baseline_bytes = effective_baseline(guard, find_context_size(options_.arguments));
     gpu_.spill_threshold_bytes = guard.threshold_bytes;
     context_.policy = to_string(guard.policy);
     context_.configured_ctx = find_context_size(options_.arguments);
@@ -395,7 +395,9 @@ void Supervisor::observe(Process &child) {
     gpu_.dedicated_bytes = sample.dedicated_bytes;
     gpu_.shared_bytes = sample.shared_bytes;
     gpu_.peak_shared_bytes = std::max(gpu_.peak_shared_bytes, sample.shared_bytes);
-    gpu_.spilled = is_spilled(sample, options_.spill_guard);
+    const auto ctx = find_context_size(arguments_);
+    gpu_.shared_baseline_bytes = effective_baseline(options_.spill_guard, ctx);
+    gpu_.spilled = is_spilled(sample, options_.spill_guard, ctx);
     ++gpu_.samples;
 }
 
@@ -420,7 +422,7 @@ Supervisor::GuardVerdict Supervisor::guard_after_ready(Process &child) {
     const auto current = find_context_size(arguments_);
     const std::string numbers = "shared GPU memory " + mib_text(gpu_.shared_bytes) + " exceeds the " +
                                 mib_text(guard.threshold_bytes) + " spill threshold above a " +
-                                mib_text(guard.baseline_bytes) + " baseline (dedicated " +
+                                mib_text(effective_baseline(guard, current)) + " baseline (dedicated " +
                                 mib_text(gpu_.dedicated_bytes) +
                                 (current ? ", ctx " + std::to_string(*current) : std::string()) + ")";
     if (guard.policy == SpillPolicy::refuse) {
