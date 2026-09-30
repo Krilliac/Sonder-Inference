@@ -59,15 +59,64 @@ struct TensorOverride {
 // token.
 inline constexpr const char* kMoeExpertTensorPattern = R"(\.ffn_(up|down|gate)_(ch|)exps)";
 
+// Element type of the K or V cache (llama.cpp's --cache-type-k/-v). ToString
+// returns ggml's type names ("f16", "q8_0", "iq4_nl"), which llama.cpp's own
+// CLI also accepts. Storage per cached value (ggml block layouts): f32 4 B,
+// f16/bf16 2 B, q8_0 1.0625 B, q5_1 0.75 B, q5_0 0.6875 B, q4_1 0.625 B,
+// q4_0/iq4_nl 0.5625 B. See docs/PLACEMENT.md, "KV cache types".
+enum class KvCacheType { kF16, kF32, kBF16, kQ8_0, kQ5_1, kQ5_0, kQ4_1, kQ4_0, kIQ4_NL };
+
+// When llama.cpp uses Flash Attention (--flash-attn). kAuto lets llama.cpp
+// decide per model and device; it is llama.cpp's default.
+enum class FlashAttention { kAuto, kDisabled, kEnabled };
+
+[[nodiscard]] std::string_view ToString(KvCacheType type) noexcept;
+[[nodiscard]] std::string_view ToString(FlashAttention mode) noexcept;
+// Case-insensitive; returns false and leaves `out` untouched for an unknown name.
+[[nodiscard]] bool ParseKvCacheType(std::string_view name, KvCacheType& out) noexcept;
+// Accepts "auto", "on"/"enabled" and "off"/"disabled" (case-insensitive).
+[[nodiscard]] bool ParseFlashAttention(std::string_view name, FlashAttention& out) noexcept;
+// True for block-quantized types (everything except f32, f16 and bf16).
+[[nodiscard]] bool IsQuantized(KvCacheType type) noexcept;
+
 struct LoadOptions {
     std::string model_path;       // GGUF file
     std::uint32_t n_ctx = 2048;   // 0 = model training context
     std::uint32_t n_batch = 512;  // max tokens per llama_decode during prefill
+    // Physical micro-batch (llama.cpp n_ubatch): tokens per compute graph
+    // inside one llama_decode. 0 = llama.cpp's default (512) capped at
+    // n_batch; otherwise it must be <= n_batch.
+    std::uint32_t n_ubatch = 0;
     std::int32_t n_threads = 0;   // 0 = llama.cpp default
     std::int32_t n_gpu_layers = 0;  // CPU-only by default; -1 = offload all
     bool vocab_only = false;      // tokenizer metadata only, no weights
     bool use_mmap = true;
     std::vector<TensorOverride> tensor_overrides;  // applied in order
+    // KV cache element types and Flash Attention; the defaults are llama.cpp's
+    // defaults. A quantized V cache needs Flash Attention, so kDisabled with a
+    // quantized type_v is rejected (kAuto lets llama.cpp switch it on).
+    KvCacheType type_k = KvCacheType::kF16;
+    KvCacheType type_v = KvCacheType::kF16;
+    FlashAttention flash_attn = FlashAttention::kAuto;
+};
+
+// Checks the context options above (micro-batch vs batch, quantized V cache
+// vs Flash Attention). Pure: no file access and no llama.cpp calls. Load()
+// runs it before touching the model file. Always Ok for vocab_only loads,
+// which create no context.
+[[nodiscard]] Status ValidateContextOptions(const LoadOptions& options);
+
+// The llama_context_params values a Load() with given options passes to
+// llama.cpp, read back from the real parameter struct. Names come from
+// llama.cpp itself (ggml_type_name; llama_flash_attn_type_name gives "auto",
+// "enabled" or "disabled"). For tests and diagnostics.
+struct ContextParamsSummary {
+    std::uint32_t n_ctx = 0;
+    std::uint32_t n_batch = 0;
+    std::uint32_t n_ubatch = 0;
+    std::string type_k;
+    std::string type_v;
+    std::string flash_attn;
 };
 
 struct SamplingParams {
@@ -208,6 +257,10 @@ public:
     [[nodiscard]] static Status ResolveTensorOverrides(const std::vector<TensorOverride>& overrides,
                                                        std::vector<void*>* buffer_types = nullptr);
     [[nodiscard]] static std::string SystemInfo();
+    // Context parameters Load() would use for `options`, and llama.cpp's own
+    // llama_context_default_params(). Need no model file.
+    [[nodiscard]] static ContextParamsSummary ContextParamsFor(const LoadOptions& options);
+    [[nodiscard]] static ContextParamsSummary UpstreamContextDefaults();
 
     Status Load(const LoadOptions& options);
     void Unload() noexcept;

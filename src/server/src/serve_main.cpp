@@ -97,6 +97,14 @@ Backend:
                           placement to --gpu-layers
   --tensor-override P=D   llama.cpp: place tensors matching regex P on device D
                           (cpu, or a llama.cpp device such as Vulkan0); repeatable
+  --batch-size N          llama.cpp: max prompt tokens per decode call (default 512)
+  --ubatch-size N         llama.cpp: physical micro-batch, <= --batch-size
+                          (default: llama.cpp's 512, capped at --batch-size)
+  --cache-type-k T        llama.cpp: K cache type f16 (default), f32, bf16, q8_0,
+                          q5_1, q5_0, q4_1, q4_0, iq4_nl (q8_0 ~ half the bytes)
+  --cache-type-v T        llama.cpp: V cache type, same values; a quantized V
+                          cache needs flash attention (on or auto)
+  --flash-attn MODE       llama.cpp: auto (default), on or off
   --mock-delay-ms N       mock backend per-token delay
   --llamaserver-config PATH  JSON config (mode, URL/executable, args, TLS and timeouts)
   --llamaserver-url URL     attach upstream URL (default http://127.0.0.1:8080)
@@ -138,6 +146,9 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"lazy-models", Kind::flag},     {"model-idle-ttl", Kind::value},
         {"max-resident-models", Kind::value},
         {"moe-experts", Kind::value},    {"tensor-override", Kind::repeat},
+        {"batch-size", Kind::value},     {"ubatch-size", Kind::value},
+        {"cache-type-k", Kind::value},   {"cache-type-v", Kind::value},
+        {"flash-attn", Kind::value},
     };
     static const std::vector<std::pair<std::string, Kind>> kAll = [] {
         auto all = kSpec;
@@ -438,6 +449,18 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
     if (Status st = detail::parse_request_path_flags([&a](const std::string& k) { return a.get(k); }, o); !st.ok()) {
         return usage_error(st.message());
     }
+    if (auto v = a.get("batch-size")) {
+        if (!parse_uint(*v, 1u << 22, n) || n == 0) return usage_error("--batch-size must be from 1 to 4194304");
+        o.backend.llamacpp_batch_size = static_cast<std::uint32_t>(n);
+    }
+    if (auto v = a.get("ubatch-size")) {
+        if (!parse_uint(*v, 1u << 22, n) || n == 0) return usage_error("--ubatch-size must be from 1 to 4194304");
+        o.backend.llamacpp_ubatch_size = static_cast<std::uint32_t>(n);
+    }
+    // Values are checked by validate_options() (validate_llamacpp_options).
+    if (auto v = a.get("cache-type-k")) o.backend.llamacpp_kv_cache_type_k = *v;
+    if (auto v = a.get("cache-type-v")) o.backend.llamacpp_kv_cache_type_v = *v;
+    if (auto v = a.get("flash-attn")) o.backend.llamacpp_flash_attention = *v;
     if (auto v = a.get("mock-delay-ms")) {
         if (!parse_uint(*v, 60000, n)) return usage_error("--mock-delay-ms must be an integer from 0 to 60000");
         o.backend.mock_token_delay = std::chrono::milliseconds(n);
