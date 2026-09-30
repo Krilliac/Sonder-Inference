@@ -29,6 +29,19 @@ struct BackendWarning {
     std::uint64_t count = 1;           // occurrences folded into this warning
 };
 
+// Post-readiness GPU residency incidents. Absent when no residency event has
+// been observed, preserving the historical runtime JSON shape.
+// Flags are historical across child restarts; bytes describe the most recent
+// incident. Live usage remains in GpuMemoryStatus::dedicated_bytes.
+struct GpuResidencyStatus {
+    bool gpu_offload_missing = false;
+    bool vram_evicted = false;
+    std::uint64_t peak_dedicated_bytes = 0;
+    std::uint64_t observed_dedicated_bytes = 0;
+    std::uint64_t eviction_restarts = 0;
+    std::string action = "warn";
+};
+
 // Per-process GPU memory as measured by the backend's probe. Byte values are
 // meaningful only when `status` is "ok".
 struct GpuMemoryStatus {
@@ -42,6 +55,7 @@ struct GpuMemoryStatus {
     std::uint64_t spill_threshold_bytes = 0;
     bool spilled = false;
     std::uint64_t samples = 0;  // successful samples since the process started
+    std::optional<GpuResidencyStatus> residency;
 };
 
 // Context size the backend runs with, and whether it was reduced to fit.

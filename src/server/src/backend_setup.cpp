@@ -9,6 +9,7 @@
 #include "sonder/inference/backends.hpp"
 #include "sonder/inference/json.hpp"
 #include "warmup_config.hpp"
+#include "residency_config.hpp"
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
 #include "sonder/inference/backends/llamaserver.hpp"
 #endif
@@ -230,7 +231,7 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
     if (const auto* guard = object.find("spill_guard")) {
         if (!guard->is_object()) return Status(ErrorCode::invalid_argument, "llamaserver config: 'spill_guard' must be an object");
         static constexpr std::string_view guard_keys[] = {"enabled", "policy", "threshold_mib", "baseline_mib", "baseline_per_1k_ctx_mib",
-            "sample_interval_ms", "fit_step_factor", "fit_step_align", "fit_min_ctx", "fit_max_attempts"};
+            "sample_interval_ms", "fit_step_factor", "fit_step_align", "fit_min_ctx", "fit_max_attempts", "residency"};
         for (const auto& member : guard->as_object()) {
             if (std::find(std::begin(guard_keys), std::end(guard_keys), member.first) == std::end(guard_keys))
                 return Status(ErrorCode::invalid_argument, "llamaserver config: unknown spill_guard field '" + member.first + "'");
@@ -261,6 +262,9 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
         if (const auto* v = guard->find("fit_step_factor")) {
             if (!v->is_number() || !(v->as_double() > 0.0 && v->as_double() < 1.0)) return bad("fit_step_factor", "a number in (0, 1)");
             setup.llamaserver_fit_step_factor = v->as_double();
+        }
+        if (const auto *v = guard->find("residency")) {
+            if (auto st = detail::parse_residency_config(*v, setup); !st.ok()) return st;
         }
     }
     if (const auto* warmup = object.find("warmup")) {
@@ -355,6 +359,9 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
         lo.spill_guard.fit_step_align = setup.llamaserver_fit_step_align;
         lo.spill_guard.fit_min_ctx = setup.llamaserver_fit_min_ctx;
         lo.spill_guard.fit_max_attempts = static_cast<std::size_t>(setup.llamaserver_fit_max_attempts);
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+        if (auto st = detail::apply_residency_config(setup, lo.spill_guard.residency); !st.ok()) return st;
+#endif
         lo.diagnostics.log_file = setup.llamaserver_log_file;
         lo.diagnostics.kv_pairing_check = setup.llamaserver_kv_pairing_check;
         lo.context_length = setup.llamaserver_context_length;

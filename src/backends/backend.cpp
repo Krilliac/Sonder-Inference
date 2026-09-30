@@ -109,6 +109,15 @@ json::Object to_json(const GpuMemoryStatus& g) {
     out.set("spill_threshold_bytes", g.spill_threshold_bytes);
     out.set("spilled", g.spilled);
     out.set("samples", g.samples);
+    if (g.residency) {
+        const auto &r = *g.residency;
+        out.set("residency", json::Object{{"gpu_offload_missing", r.gpu_offload_missing},
+                                           {"vram_evicted", r.vram_evicted},
+                                           {"peak_dedicated_bytes", r.peak_dedicated_bytes},
+                                           {"observed_dedicated_bytes", r.observed_dedicated_bytes},
+                                           {"eviction_restarts", r.eviction_restarts},
+                                           {"action", r.action}});
+    }
     return out;
 }
 
