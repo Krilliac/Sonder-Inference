@@ -1,5 +1,6 @@
 #include "sonder/inference/engine.hpp"
 
+#include <algorithm>
 #include <chrono>
 
 #include "engine/request_runtime.hpp"
@@ -75,11 +76,53 @@ void Engine::sample_devices(const std::vector<DeviceInfo>& devices) {
     }
 }
 
+void Engine::sample_backend_runtime() {
+    std::vector<std::shared_ptr<Backend>> backends;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& kv : backends_) {
+            backends.push_back(kv.second);
+        }
+    }
+    for (const auto& backend : backends) {
+        const auto status = backend->runtime_status();  // cheap snapshot
+        if (!status) {
+            continue;
+        }
+        const std::string name = backend->name();
+        const auto& gpu = status->gpu_memory;
+        auto& seen = runtime_samples_seen_[name];
+        if (gpu.status == "ok" && gpu.samples != seen) {
+            seen = gpu.samples;
+            json::Object attrs = to_json(gpu);
+            attrs.set("backend", name);
+            attrs.set("fitted_ctx", json::Value(status->context.fitted_ctx));  // null when unknown
+            attrs.set("fit_outcome", status->context.outcome);
+            telemetry_->emit("backend.gpu_memory.sample", engine_context(), std::move(attrs), TelemetryLevel::metrics);
+        }
+        auto& emitted = runtime_warnings_seen_[name];
+        for (const auto& w : status->warnings) {
+            std::string key = w.code + '\n' + w.source + '\n' + w.message;
+            if (std::find(emitted.begin(), emitted.end(), key) != emitted.end()) {
+                continue;
+            }
+            if (emitted.size() >= 256) {
+                break;  // bounded: a backend cannot grow this without limit
+            }
+            emitted.push_back(std::move(key));
+            json::Object attrs = to_json(w);
+            attrs.set("backend", name);
+            telemetry_->emit("backend.warning", engine_context(), std::move(attrs), TelemetryLevel::metrics);
+        }
+    }
+}
+
 void Engine::device_sampler_loop() {
     std::unique_lock<std::mutex> lock(sampler_mutex_);
     while (!sampler_cv_.wait_for(lock, options_.device_sample_interval, [this] { return sampler_stop_; })) {
         lock.unlock();
         sample_devices(enumerate_devices());  // re-reads available memory
+        sample_backend_runtime();
         lock.lock();
     }
 }

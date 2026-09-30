@@ -1,4 +1,4 @@
-sonder_add_module_tests(llamaserver test_backend.cpp test_supervisor.cpp)
+sonder_add_module_tests(llamaserver test_backend.cpp test_runtime_guard.cpp test_supervisor.cpp)
 
 if(TARGET sonder_llamaserver_tests)
     # Reuse the already reviewed and pinned test-only cpp-httplib dependency

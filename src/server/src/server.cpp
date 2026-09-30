@@ -488,6 +488,11 @@ struct Server::Impl {
                 if (!version.empty()) {
                     entry.set("version", version);
                 }
+                // Additive: only backends that report runtime observations
+                // (e.g. a spawned llama-server) get this field.
+                if (const auto runtime = b->runtime_status()) {
+                    entry.set("runtime", to_json(*runtime));
+                }
                 backends.emplace_back(std::move(entry));
             }
         }
@@ -543,13 +548,22 @@ struct Server::Impl {
         if (!require_ready(ex)) {
             return;
         }
+        std::shared_ptr<Backend> b;
+        {
+            std::lock_guard<std::mutex> lock(engine_mu);
+            b = backend;
+        }
+        const std::optional<BackendRuntimeStatus> runtime = b ? b->runtime_status() : std::nullopt;
         json::Array data;
         for (const auto& m : served_snapshot()) {
+            json::Object ext{{"backend", m.backend}, {"default", m.is_default}, {"synthetic", synthetic}};
+            // Additive: context fit, GPU memory and warnings of the backend
+            // process serving this model, when the backend reports them.
+            if (runtime && b->name() == m.backend) {
+                ext.set("runtime", to_json(*runtime));
+            }
             data.emplace_back(json::Object{
-                {"id", m.id},
-                {"object", "model"},
-                {"owned_by", "sonder-inference"},
-                {"sonder", json::Object{{"backend", m.backend}, {"default", m.is_default}, {"synthetic", synthetic}}}});
+                {"id", m.id}, {"object", "model"}, {"owned_by", "sonder-inference"}, {"sonder", std::move(ext)}});
         }
         send_json(ex, 200, json::Object{{"object", "list"}, {"data", std::move(data)}, {"sonder", sonder_meta()}});
     }

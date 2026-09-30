@@ -42,6 +42,11 @@ expansion. Model placement, context, chat templates and speculative execution
 belong to the child. See the installed version's `llama-server --help` and
 the [upstream server reference](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md).
 
+Spawned children are also checked for VRAM spill (Windows PDH counters) and
+K/V cache types without a FlashAttention kernel, and their log can be scanned
+for performance warnings; see [VRAM spill and KV kernel pairing](vram-spill.md)
+for the `spill_guard`, `log_file` and `kv_pairing_check` keys.
+
 The first upstream operation starts the child on `127.0.0.1` at a free port
 and waits for `/health`. A background monitor restarts crashed children with
 capped exponential backoff and a finite restart budget. In-flight requests

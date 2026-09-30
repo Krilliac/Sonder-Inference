@@ -127,6 +127,9 @@ public:
 
 private:
     void sample_devices(const std::vector<DeviceInfo>& devices);
+    // backend.gpu_memory.sample / backend.warning for backends that report
+    // Backend::runtime_status() (sampler thread only).
+    void sample_backend_runtime();
     void device_sampler_loop();
 
     EngineOptions options_;
@@ -143,6 +146,10 @@ private:
     std::mutex sampler_mutex_;
     std::condition_variable sampler_cv_;
     bool sampler_stop_ = false;
+    // Sampler thread only: last reported GPU sample count and the warnings
+    // already emitted, per backend name.
+    std::map<std::string, std::uint64_t> runtime_samples_seen_;
+    std::map<std::string, std::vector<std::string>> runtime_warnings_seen_;
     std::thread sampler_;
 };
 
