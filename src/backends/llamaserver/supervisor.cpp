@@ -68,7 +68,9 @@ Result<std::uint16_t> ephemeral_port() {
 } // namespace
 
 Supervisor::Supervisor(SupervisorOptions options, std::unique_ptr<ProcessLauncher> launcher)
-    : options_(std::move(options)), launcher_(launcher ? std::move(launcher) : make_process_launcher()) {
+    : options_(std::move(options)), launcher_(launcher ? std::move(launcher) : make_process_launcher()),
+      residency_(options_.spill_guard.residency,
+                 expects_gpu_offload(options_.arguments, options_.spill_guard.residency.expect_gpu)) {
     arguments_ = options_.arguments;
     auto log_path = find_log_file(arguments_);
     if (!log_path && !options_.log_file.empty()) {
@@ -151,7 +153,7 @@ Result<std::uint16_t> Supervisor::start(const CancellationToken &cancel) {
             seen_epoch = epoch_;
             deadline = Clock::now() + options_.readiness_timeout + options_.restart_max_backoff;
         }
-        if (state_ == State::ready)
+        if (state_ == State::ready && !maintenance_pending_)
             return port_;
         if (state_ == State::failed)
             return failure_;
@@ -166,12 +168,13 @@ Result<std::uint16_t> Supervisor::settle_after_deadline(std::unique_lock<std::mu
                                                         Clock::time_point deadline) {
     // The monitor may still be inside a health probe (up to one 250 ms budget)
     // or stopping the child. Give it a bounded grace to publish its outcome so
-    // a timed-out start() never returns while the child is still running.
+    // startup normally reports the settled result. During maintenance an old
+    // request may still be draining; a new caller can time out independently.
     const auto grace_end = deadline + Milliseconds(250) + options_.shutdown_timeout;
-    while (state_ != State::ready && state_ != State::failed && !cancel.cancelled() &&
+    while ((state_ != State::ready || maintenance_pending_) && state_ != State::failed && !cancel.cancelled() &&
            !shutdown_.cancelled() && Clock::now() < grace_end)
         wake_.wait_until(lock, std::min(grace_end, Clock::now() + Milliseconds(10)));
-    if (state_ == State::ready)
+    if (state_ == State::ready && !maintenance_pending_)
         return port_;
     if (state_ == State::failed)
         return failure_;
@@ -283,18 +286,44 @@ void Supervisor::monitor() {
                             std::lock_guard lock(mutex_);
                             port_ = spec.port;
                             state_ = State::ready;
+                            maintenance_pending_ = false;
+                            if (gpu_.residency && gpu_.residency->action == "restarting")
+                                gpu_.residency->action = "restarted";
                             failure_ = Status::success();
                             wake_.notify_all();
                         }
                         if (options_.warmup && !shutdown_.cancelled())
                             options_.warmup->start("http://127.0.0.1:" + std::to_string(spec.port));
                         auto next_sample = Clock::now() + options_.spill_guard.sample_interval;
+                        auto maintenance = ResidencyAction::none;
                         while (!shutdown_.cancelled() && child->running()) {
                             pause(options_.health_poll_interval);
-                            if (Clock::now() >= next_sample && !shutdown_.cancelled()) {
+                            if (Clock::now() >= next_sample && !shutdown_.cancelled() && child->running()) {
                                 observe(*child);
                                 next_sample = Clock::now() + options_.spill_guard.sample_interval;
                             }
+                            if (!shutdown_.cancelled() && child->running()) {
+                                maintenance = residency_action();
+                                if (maintenance != ResidencyAction::none)
+                                    break;
+                            }
+                        }
+                        if (maintenance != ResidencyAction::none) {
+                            if (options_.warmup)
+                                options_.warmup->stop();
+                            child->stop(options_.shutdown_timeout);
+                            if (maintenance == ResidencyAction::refuse) {
+                                Status reason;
+                                {
+                                    std::lock_guard lock(mutex_);
+                                    reason = missing_offload_failure();
+                                }
+                                fail(std::move(reason));
+                                return;
+                            }
+                            // Dedicated-residency restarts have their own lifetime
+                            // budget and keep the configured/fitted context intact.
+                            continue;
                         }
                         result = Status(ErrorCode::unavailable, "llamaserver: child exited");
                     }
@@ -360,6 +389,10 @@ void Supervisor::begin_child() {
     if (log_tail_)
         log_tail_->rewind();
     std::lock_guard lock(mutex_);
+    residency_.reset();
+    reported_missing_ = false;
+    reported_eviction_ = false;
+    maintenance_pending_ = false;
     log_warnings_.clear();
     if (gpu_.status == "ok" || gpu_.status == "error") {
         gpu_.status = "not_sampled";
@@ -385,7 +418,12 @@ void Supervisor::observe(Process &child) {
     const auto pid = child.pid();
     auto read = gpu_source_->read(pid);
     std::lock_guard lock(mutex_);
+    if (!child.running()) {
+        residency_.unavailable();
+        return;
+    }
     if (!read.ok()) {
+        residency_.unavailable();
         gpu_.status = read.status().code() == ErrorCode::unsupported ? "unsupported" : "error";
         gpu_.error = read.status().message();
         return;
@@ -400,6 +438,11 @@ void Supervisor::observe(Process &child) {
     gpu_.shared_baseline_bytes = effective_baseline(options_.spill_guard, ctx);
     gpu_.spilled = is_spilled(sample, options_.spill_guard, ctx);
     ++gpu_.samples;
+    if (pid != 0)
+        residency_.observe(sample.dedicated_bytes);
+    else
+        residency_.unavailable();  // an unknown process id cannot prove missing offload
+    record_residency();
 }
 
 namespace {
@@ -411,6 +454,13 @@ Supervisor::GuardVerdict Supervisor::guard_after_ready(Process &child) {
     GuardVerdict verdict;
     std::lock_guard lock(mutex_);
     const auto &guard = options_.spill_guard;
+    if (guard.enabled && gpu_.status == "ok" && residency_.gpu_offload_missing() &&
+        guard.policy == SpillPolicy::refuse) {
+        gpu_.residency->action = "refused";
+        verdict.action = GuardAction::refuse;
+        verdict.status = missing_offload_failure();
+        return verdict;
+    }
     // A probe error or an unsupported platform cannot classify the child: it
     // is served (and the error is reported), never refused or refitted.
     if (!guard.enabled || gpu_.status != "ok" || !gpu_.spilled) {
@@ -466,6 +516,7 @@ BackendRuntimeStatus Supervisor::runtime_status() const {
     status.context = context_;
     status.warnings = config_warnings_;
     status.warnings.insert(status.warnings.end(), log_warnings_.begin(), log_warnings_.end());
+    append_residency_warnings(status);
     if (gpu_.status == "ok" && gpu_.spilled) {
         std::vector<std::pair<std::string, std::string>> details{
             {"dedicated_bytes", std::to_string(gpu_.dedicated_bytes)},

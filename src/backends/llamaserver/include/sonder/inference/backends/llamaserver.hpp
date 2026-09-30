@@ -1,6 +1,8 @@
 // External llama-server / OpenAI-compatible upstream, without llama.cpp linkage.
 #pragma once
 
+#include "sonder/inference/backends/llamaserver_residency.hpp"
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -55,6 +57,7 @@ struct LlamaServerSpillGuardOptions {
     std::uint64_t fit_step_align = 1024;
     std::uint64_t fit_min_ctx = 8192;
     std::size_t fit_max_attempts = 4;
+    LlamaServerResidencyGuardOptions residency;
 };
 
 struct LlamaServerDiagnosticsOptions {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -7,9 +8,11 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "gpu_memory.hpp"
+#include "gpu_residency.hpp"
 #include "log_diagnostics.hpp"
 #include "process.hpp"
 #include "sonder/inference/backend_runtime.hpp"
@@ -56,6 +59,26 @@ class Supervisor {
     Supervisor &operator=(const Supervisor &) = delete;
     // Lazy start or wait through a restart; never resets the retry budget.
     Result<std::uint16_t> start(const CancellationToken &cancel = {});
+    // A lease pins the ready child for the lifetime of an upstream request.
+    // Maintenance closes admission, drains these leases, then stops the child.
+    class RequestLease {
+      public:
+        RequestLease() = default;
+        ~RequestLease();
+        RequestLease(RequestLease &&other) noexcept;
+        RequestLease &operator=(RequestLease &&other) noexcept;
+        RequestLease(const RequestLease &) = delete;
+        RequestLease &operator=(const RequestLease &) = delete;
+        [[nodiscard]] std::uint16_t port() const { return port_; }
+
+      private:
+        friend class Supervisor;
+        RequestLease(std::shared_ptr<std::atomic<std::size_t>> activity, std::uint16_t port)
+            : activity_(std::move(activity)), port_(port) {}
+        std::shared_ptr<std::atomic<std::size_t>> activity_;
+        std::uint16_t port_ = 0;
+    };
+    Result<RequestLease> acquire_request(const CancellationToken &cancel = {});
     // Terminal/idempotent; interrupts probes and backoff, then joins the owner.
     void stop();
     [[nodiscard]] bool running() const;
@@ -86,6 +109,11 @@ class Supervisor {
     bool pause(std::chrono::milliseconds duration);
     void monitor();
     void fail(Status status);
+    enum class ResidencyAction { none, restart, refuse };
+    ResidencyAction residency_action();
+    void record_residency();  // mutex_ held
+    void append_residency_warnings(BackendRuntimeStatus &status) const;  // mutex_ held
+    Status missing_offload_failure() const;  // mutex_ held
 
     SupervisorOptions options_;
     std::unique_ptr<ProcessLauncher> launcher_;
@@ -97,6 +125,10 @@ class Supervisor {
     State state_ = State::idle;
     Status failure_;
     std::uint16_t port_ = 0;
+    // Shared with leases so destroying a stopped supervisor before its last
+    // caller unwinds cannot leave a dangling lease owner.
+    std::shared_ptr<std::atomic<std::size_t>> active_requests_ = std::make_shared<std::atomic<std::size_t>>(0);
+    bool maintenance_pending_ = false;
 
     // Diagnostics. Guarded by mutex_ unless noted.
     std::vector<std::string> arguments_;  // current launch argv
@@ -108,6 +140,10 @@ class Supervisor {
     std::shared_ptr<GpuCounterSource> gpu_source_;  // monitor thread only after construction
     std::unique_ptr<LogTail> log_tail_;             // monitor thread only
     LogDiagnostics log_diagnostics_;                // monitor thread only
+    GpuResidencyGuard residency_;  // guarded by mutex_, fed only after readiness
+    bool reported_missing_ = false;
+    bool reported_eviction_ = false;
+    std::size_t eviction_restarts_ = 0;  // lifetime budget; never reset per child
 };
 
 } // namespace sonder::inference::llamaserver

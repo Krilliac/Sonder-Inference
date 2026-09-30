@@ -1,4 +1,4 @@
-# VRAM spill and KV cache kernel pairing (llamaserver)
+# GPU residency, VRAM spill and KV cache kernel pairing (llamaserver)
 
 When `llamaserver` spawns llama-server, it checks two performance problems
 that the 2026-09-29 benchmarks on an RTX 5070 Ti (16 GB) found. Neither
@@ -13,8 +13,9 @@ problem shows up in normal tools:
    such as `q8_0`/`q5_1`, or for `q5_1`/`q5_1`. llama-server converts K and V
    to f16 at run time and prints one log line about it.
 
-Both checks only report by default. Nothing about how the child is started
-changes unless you choose the `refuse` or `auto_fit` policy. Attach mode has
+These checks and the dedicated-residency checks below only report by default.
+Child lifecycle changes require `refuse`, `auto_fit`, or the opt-in eviction
+restart policy. Attach mode has
 no child process to measure, so it reports nothing, and its responses are
 unchanged.
 
@@ -110,12 +111,108 @@ rejected before anything is launched. Relaunches do not use the crash-restart
 budget. A crash restart after a fit keeps the fitted context. Each relaunch
 gets a full `startup_timeout_ms` to load.
 
-The guard only acts on the sample taken at readiness. A spill that appears
+The shared-memory spill policy only acts on the sample taken at readiness. A spill that appears
 later, for example because another application takes VRAM, is reported but
 never kills a child that is already serving. A probe error does not refuse
 or refit the child either. Neither does a platform without the counters:
 non-Windows platforms report `status: "unsupported"`, and NVML is a possible
-later addition.
+later addition. The separate residency policies below can act on confirmed
+dedicated-memory loss after readiness.
+
+## Missing offload and VRAM eviction
+
+Two further incidents were reported by the owner on **2026-09-30**, on an
+RTX 5070 Ti (16 GB) under Windows WDDM with Qwen3.8-27B (16 attention and
+48 DeltaNet layers). These are owner measurements, not results from the
+GPU-free regression suite:
+
+- A PATH problem prevented the spawned server from loading its CUDA backend.
+  The 27B ran on the CPU at **2.2 tok/s decode**, **0.25 tok/s prefill**, with
+  about **9 GB working set**. `/health` was ready, dedicated and shared GPU
+  usage were both zero, and no warning appeared because no log file was set.
+- When Ollama loaded another **13.4 GB** model, the server's dedicated usage
+  fell from **14,736 MiB to 2,889 MiB**. Shared usage was zero at observation
+  (peak shared **424 MiB**), `spilled` was false, and performance stayed
+  degraded until the server was restarted. A shared-usage threshold alone
+  cannot detect this loss of residency.
+
+The residency guard uses the same post-readiness PDH samples and leaves the
+existing shared-memory spill calculation unchanged. It has two independent
+warnings:
+
+- `gpu_offload_missing`: dedicated usage stays **below 512 MiB for three
+  consecutive successful samples** while GPU offload is expected. The first
+  sample is taken after `/health` becomes ready; with the default five-second
+  interval, confirmation normally takes another ten seconds. A zero-instance
+  successful PDH read counts as zero usage. Failed/unsupported probes and an
+  unknown PID do not constitute evidence and interrupt unconfirmed streaks.
+- `vram_evicted`: dedicated usage stays below its post-readiness high-water
+  mark by **more than 25% OR more than 2 GiB** for three consecutive samples.
+  Equality is not a trigger. The peak must be at least the dedicated floor.
+  A normal sample interrupts an unconfirmed streak. Either threshold can be
+  disabled with zero; at least one must be enabled. This is evidence of a
+  residency loss, not proof that WDDM was its cause.
+
+GPU intent is conservative: explicit `--n-gpu-layers`, `--gpu-layers` or
+`-ngl` (separate or `=` values) with a positive count, `all`, or `-1` enables
+the missing-offload check. The last occurrence wins; explicit zero or an
+unrecognized value suppresses it. The supervisor cannot prove that an
+arbitrary external executable is CUDA-capable. With no GPU-layer flag, set
+`expect_gpu: true` only when that is known; the default is false. Eviction
+detection needs no flag because the measured high-water mark establishes
+prior dedicated residency. For intentionally tiny GPU allocations, lower the
+floor or disable this nested guard.
+
+Missing offload warns by default, including under `auto_fit` (reducing context
+does not repair a missing CUDA backend). Under `spill_guard.policy: "refuse"`,
+it closes request admission, drains tracked requests and warm-up, stops the
+child and enters a terminal failure with the measured numbers and a CUDA/PATH
+hint. For `consecutive_samples: 1`, it can refuse before exposing readiness.
+Otherwise readiness may already have been returned before confirmation.
+
+`on_eviction: "restart"` opts into reloading the child with the same arguments
+and fitted context. It closes admission atomically with the active-request
+check and waits for **all Sonder-tracked HTTP requests and prefix warm-up**
+to finish. New requests wait through recovery (subject to existing readiness
+timeouts and cancellation). A slow/hung request can delay recovery until its
+own request timeout; the guard does not kill it to force an idle period.
+Clients that bypass Sonder and call the private child port directly cannot
+be tracked; use this policy only when Sonder owns access to that child.
+
+There is at most **one eviction relaunch per supervisor lifetime** by default,
+independent of the existing crash and context-fit budgets. Repeated drops,
+including in a replacement child, cannot reset this budget. Exhaustion falls
+back to warnings and keeps serving. Release competing GPU allocations before
+reloading; a restart cannot guarantee that enough VRAM is available. Existing
+crash-restart rules still apply if a replacement crashes or fails to launch.
+
+Findings are latched per child to avoid flapping; a new child resets the
+detector's peak and streaks. The last incident remains visible across
+restarts. Only when an incident has occurred does `gpu_memory` gain the
+additive `residency` object:
+
+```json
+"residency": {
+  "gpu_offload_missing": false,
+  "vram_evicted": true,
+  "peak_dedicated_bytes": 15451815936,
+  "observed_dedicated_bytes": 3029336064,
+  "eviction_restarts": 1,
+  "action": "restarted"
+}
+```
+
+The booleans record incidents observed during this supervisor's lifetime;
+they do not claim that the replacement is still degraded. The peak and
+observed bytes describe the latest detected child incident; current usage
+remains in `gpu_memory.dedicated_bytes`. Actions are `warn`,
+`waiting_for_idle`, `refused`, `restarting`, `restarted` or
+`restart_exhausted`. Warnings include peak, observed and current dedicated
+bytes. Health (`backends[].runtime`), `/v1/models` (`sonder.runtime`) and
+`backend.gpu_memory.sample` telemetry use this same serialization;
+`backend.warning` carries the two new warning codes. No residency object
+or warning is added when no incident occurs. Existing GPU status strings,
+spill flags, and context-fit fields retain their meanings.
 
 ## KV cache pairing and log diagnostics
 
@@ -154,6 +251,18 @@ The first two appear exactly like this in the 2026-09-29 logs. The last four
 are taken from llama.cpp's source strings; the benchmark runs offloaded every
 layer, so those lines did not appear.
 
+Log diagnostics remain **opt-in through `log_file` or `--log-file`**. There
+is no separate enabled-without-a-file setting today. Default stderr capture
+would change both native launchers: inherited Windows handles/Job Object
+lifetime and POSIX spawn file actions/parent-liveness pipe ownership, plus
+a continuously drained, bounded pipe and shutdown/join handling to prevent
+the child from blocking on a full pipe. That wider process-lifecycle change
+is deferred. The dedicated-memory guard above detects the observed CPU
+fallback without requiring logs; it cannot identify the exact CUDA failure.
+Set a log file for `no_gpu_device`, `gpu_init_failed` and
+`cpu_buffer_fallback` classification. Existing log read/line/warning bounds
+are unchanged.
+
 ## Configuration
 
 These `llamaserver` JSON keys apply to spawn mode only. Each value shown is
@@ -177,7 +286,17 @@ the default.
     "fit_step_factor": 0.85,
     "fit_step_align": 1024,
     "fit_min_ctx": 8192,
-    "fit_max_attempts": 4
+    "fit_max_attempts": 4,
+    "residency": {
+      "enabled": true,
+      "expect_gpu": false,
+      "min_dedicated_mib": 512,
+      "consecutive_samples": 3,
+      "eviction_fraction": 0.25,
+      "eviction_mib": 2048,
+      "on_eviction": "warn",
+      "max_eviction_restarts": 1
+    }
   }
 }
 ```
@@ -187,6 +306,10 @@ In C++, set `LlamaServerBackendOptions::spill_guard`
 `LlamaServerBackendOptions::diagnostics` (`LlamaServerDiagnosticsOptions`).
 The status comes from `Backend::runtime_status()`. It is backend-neutral:
 other backends return `std::nullopt` by default.
+Residency options live in `LlamaServerSpillGuardOptions::residency`
+(`LlamaServerResidencyGuardOptions`); the C++ floor/amount are byte counts.
+`spill_guard.enabled: false` disables all counter checks;
+`spill_guard.residency.enabled: false` disables only the new detectors.
 
 ## Where it shows up
 

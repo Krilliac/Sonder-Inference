@@ -2,6 +2,7 @@
 # No llama.cpp sources, common library, executable or model downloads.
 sonder_module_sources(
     gpu_memory.cpp
+    gpu_residency.cpp
     llamaserver_backend.cpp
     llamaserver_protocol.cpp
     log_diagnostics.cpp
@@ -10,6 +11,7 @@ sonder_module_sources(
     prefix_warmup.cpp
     slot_affinity.cpp
     supervisor.cpp
+    supervisor_residency.cpp
     tune.cpp
     tune_main.cpp
     tune_model.cpp
