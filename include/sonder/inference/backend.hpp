@@ -142,10 +142,26 @@ struct ChatMessage {
     std::string content;
 };
 
+// Reasoning ("thinking") controls for native-chat backends. Unset fields are
+// not forwarded, so the model's chat template keeps its own default. On
+// hybrid reasoning models (Qwen3.x) these change the top of the rendered
+// prompt, so switching them between turns defeats upstream prefix reuse.
+struct ThinkingOptions {
+    // llama-server: chat_template_kwargs.enable_thinking; Ollama: think.
+    std::optional<bool> enable_thinking;
+    // llama-server: chat_template_kwargs.reasoning_effort (not sent to Ollama).
+    std::optional<std::string> reasoning_effort;
+    [[nodiscard]] bool empty() const noexcept { return !enable_thinking && !reasoning_effort; }
+};
+
 struct ChatRequest {
     std::string request_id;
     std::vector<ChatMessage> messages;
     SamplingConfig sampling;
+    // Conversation key for upstream cache affinity (llamaserver pins a key to
+    // one llama-server slot). Empty = no affinity.
+    std::string session_key;
+    ThinkingOptions thinking;
 };
 
 // True for "system", "user", "assistant" and "tool".

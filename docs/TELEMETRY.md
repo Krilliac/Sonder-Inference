@@ -68,7 +68,7 @@ Types used below: `int` (JSON integer), `num` (JSON number), `str`,
 | --- | --- | --- |
 | `engine.started` | metrics | `version` str, `commit` str, `platform` str, `device_count` int, `text_capture` str (`on` / `off`); optional `server` obj `{host` str, `port` int, `api_version` int`}` when the engine is hosted by `sonder-infer serve` (`EngineOptions::server`) |
 | `engine.stopped` | metrics | none |
-| `scheduler.configured` | metrics | emitted once at engine start when scheduling is active: `kv_block_size_tokens` int, `kv_num_blocks` int, `prefix_caching` bool, `max_running_sequences` int, `max_step_sequences` int, `max_step_tokens` int, `prefill_chunk_tokens` int, `admission_watermark_blocks` int, `max_requeue_count` int, `step_stall_timeout_ms` int |
+| `scheduler.configured` | metrics | emitted once at engine start when scheduling is active: `mode` str (`automatic`, `gate`, `account`), `kv_block_size_tokens` int, `kv_num_blocks` int, `prefix_caching` bool, `max_running_sequences` int, `max_step_sequences` int, `max_step_tokens` int, `prefill_chunk_tokens` int, `admission_watermark_blocks` int, `max_requeue_count` int, `step_stall_timeout_ms` int |
 | `device.memory.sample` | metrics | at start (`sample_devices_on_start`) and every `EngineOptions::device_sample_interval` (default 10 s, 0 disables): `kind` str, `name` str, `logical_cores` int, `total_bytes` int, `available_bytes` int; optional `used_bytes` int. Host memory only; per-process VRAM of a spawned llama-server is `backend.gpu_memory.sample` |
 | `backend.registered` | metrics | `backend` str, `description` str, `capabilities` arr of str |
 | `backend.gpu_memory.sample` | metrics | from the engine's periodic sampler, once per new sample of a backend that reports `Backend::runtime_status()` (a spawned `llamaserver` child): `backend`, `probe`, `status` str; `dedicated_bytes`, `shared_bytes`, `peak_shared_bytes`, `shared_baseline_bytes`, `spill_threshold_bytes`, `samples` int; `spilled` bool; `fitted_ctx` int or null; `fit_outcome` str ([vram-spill](integration/vram-spill.md)) |
@@ -86,7 +86,7 @@ Types used below: `int` (JSON integer), `num` (JSON number), `str`,
 | `session.created` | metrics | `model`, `backend` str; `priority` int; `workload` str (see below); `text_capture` str (`on` / `off`); `sampling` obj |
 | `session.closed` | metrics | `requests` int |
 | `request.queued` | metrics | `kind` str (`generate` from `Session::generate`, `chat` from `Session::chat`), `priority` int, `workload` str, `prompt_bytes` int (for chat: the generic formatted prompt); `chat` adds `messages` int |
-| `request.started` | metrics | `kind` str, `sampling` obj, `scheduled` bool, `sampler` str (`sonder` or `backend`); `chat` adds `chat_template` str (`native`: the backend's chat API or model template received the messages; `generic`: `format_chat_prompt()`) |
+| `request.started` | metrics | `kind` str, `sampling` obj, `scheduled` bool, `sampler` str (`sonder` or `backend`); when scheduled, `scheduler_mode` str (`gate`: per-chunk grants; `account`: admission and prompt accounting only); `chat` adds `chat_template` str (`native`: the backend's chat API or model template received the messages; `generic`: `format_chat_prompt()`) |
 | `request.completed` / `request.cancelled` / `request.failed` | metrics | `outcome`, `stop_reason` str; `prompt_tokens`, `completion_tokens`, `chunks` int; `token_counts_from_backend` bool; `ttft_ms`, `total_ms` num; `scheduled` bool; `sampler` str. When `scheduled`: `queue_ms` num, `preemptions` int, `accounted_prompt_tokens` int, `reused_prompt_tokens` int. `cancelled` optionally adds `cancel_latency_ms` num. `failed` adds `error_code`, `error` str, and `scheduler_rejected` bool (true) when the scheduler refused the request before any backend work |
 
 All five request lifecycle events carry the optional `parent_request_id` str
@@ -145,7 +145,8 @@ correlation id on every per-request event.
 
 | Event | Level | Attributes |
 | --- | --- | --- |
-| `scheduler.enqueued` | metrics | `scheduler_request_id` int, `workload` str, `priority_rank` int, `prompt_tokens` int, `exact_prompt_tokens` bool, `max_new_tokens` int, `context_limit` int |
+| `scheduler.enqueued` | metrics | `scheduler_request_id` int, `workload` str, `priority_rank` int, `prompt_tokens` int, `exact_prompt_tokens` bool, `max_new_tokens` int, `context_limit` int, `gated` bool |
+| `scheduler.bypassed` | metrics | an ungated (`account`) request whose prompt exceeds the logical KV pool runs unscheduled: `reason` str (`exceeds_kv_pool`), `prompt_tokens` int, `kv_capacity_tokens` int |
 | `scheduler.rejected` | metrics | `scheduler_request_id` int, `reason` str (`never_fits`, `invalid_request`, `duplicate_id`, `duplicate_sequence`), `prompt_tokens` int; optional `kv_capacity_tokens` int |
 | `scheduler.admitted` | metrics | `scheduler_request_id` int, `step` int, `queue_ms` num, `resumed` bool (true after a preemption), `reserved_blocks` int |
 | `scheduler.preempted` | metrics | `scheduler_request_id` int, `reason` str (`kv_pressure` / `priority_admission`), `mode` str (`recompute`), `kv_tokens` int, `beneficiary_scheduler_request_id` int, `preemptions` int, `queue_ms` num (first admission wait), `failed` bool (requeue limit exceeded) |
@@ -186,7 +187,9 @@ different threads are ordered by `sequence`, not by `mono_ns`.
 Additive within `/1`: `producer.role` and `producer.synthetic`;
 `request.queued.kind = "chat"` and `request.started.chat_template`;
 `parent_request_id` on the request lifecycle events;
-`request.failed.scheduler_rejected`; `engine.started.server`. Discovery
+`request.failed.scheduler_rejected`; `engine.started.server`;
+`scheduler.configured.mode`, `request.started.scheduler_mode`,
+`scheduler.enqueued.gated` and `scheduler.bypassed`. Discovery
 advertises this vocabulary as `vocabularies: {"sonder.inference.events": 1}`.
 
 ## Observatory change requests (Observatory `docs/telemetry-schema.md` @ f5e3ff5)

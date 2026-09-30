@@ -19,6 +19,7 @@
 #include "identity.hpp"
 #include "live_hub.hpp"
 #include "openai.hpp"
+#include "request_path.hpp"
 #include "socket.hpp"
 #include "test_hooks.hpp"
 #include "../../common/loopback.hpp"
@@ -780,6 +781,9 @@ struct Server::Impl {
         RequestOptions ro;
         ro.request_id = make_id("req");
         ro.parent_request_id = corr.parent_request_id;
+        ro.session_key = chat_session_key(job, corr);
+        ro.thinking = job.thinking;
+        const std::vector<std::string> warnings = apply_thinking_pins(opts, ro.thinking);
         const std::string completion_id = "chatcmpl-" + *ro.request_id;
         // X-Sonder-Request-Id and the access log carry the engine request id.
         ex.request_id = *ro.request_id;
@@ -925,6 +929,9 @@ struct Server::Impl {
                           {"backend", served_model->backend},
                           {"synthetic", synthetic},
                           {"token_counts_from_backend", r.stats.token_counts_from_backend}};
+        if (!warnings.empty()) {
+            meta.set("warnings", json::Array(warnings.begin(), warnings.end()));
+        }
         session->close();
         if (!job.stream) {
             json::Object doc{
@@ -1459,6 +1466,7 @@ struct Server::Impl {
             eo.telemetry_sinks.push_back(s);
         }
         eo.server = EngineServerInfo{opts.host, bound_port, kApiVersion};
+        apply_scheduling(opts, eo.scheduling);
         {
             std::lock_guard<std::mutex> lock(engine_mu);
             engine = std::make_unique<Engine>(std::move(eo));
@@ -1723,7 +1731,7 @@ Status validate_options(const ServerOptions& o) {
                               "path, trailing slash or wildcard (for example http://127.0.0.1:4173)");
         }
     }
-    return Status::success();
+    return validate_request_path_options(o);
 }
 
 Server::Server(ServerOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {}

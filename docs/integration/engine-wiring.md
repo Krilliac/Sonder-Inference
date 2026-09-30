@@ -52,6 +52,32 @@ hook frees a request's cache sequence *synchronously* when the scheduler drops
 its reservation. The scheduler re-reads free capacity after each victim, so
 without the hook one pressure event would preempt every running request.
 
+### Scheduler modes (gate and account)
+
+`SchedulingOptions::mode` decides how a scheduled request is paced
+(`sonder-infer serve --scheduler`):
+
+- `gate`: the path above. Every generated chunk waits for a grant, and KV is
+  accounted for prompt and output. Right for in-process backends, whose
+  decode the scheduler actually interleaves.
+- `account`: the request is submitted as usual, admitted in priority order,
+  and its prompt is prefilled into the logical cache (prefix reuse,
+  `queue_ms`), but it enters the scheduler with `max_new_tokens = 1`, so it
+  leaves the scheduler at the end of its logical prefill. The session takes
+  one admission grant before the backend call and then streams with no
+  `acquire_token()` / `token_produced()` per chunk, so a remote process is
+  never paced by the 2 ms grant polling or held in a 250 ms step barrier.
+  Output tokens are not accounted in the pool (the upstream owns the real
+  KV), and a prompt larger than the pool is bypassed (`scheduler.bypassed`,
+  `reason: exceeds_kv_pool`, `SchedulingInfo::scheduled == false`) rather
+  than rejected: the upstream's context decides.
+- `automatic` (default): `gate` for in-process backends, `account` for
+  backends declaring `Capability::remote_process` (llamaserver, ollama).
+  In-process behaviour is unchanged.
+
+`request.started` carries `scheduler_mode` (`gate` or `account`) for scheduled
+requests, and `scheduler.enqueued` carries `gated`.
+
 ### Sessions and blocks
 
 - A request's cache sequence lives from admission until it finishes. When a
@@ -64,8 +90,10 @@ without the hook one pressure event would preempt every running request.
 - A cancelled request frees its blocks immediately, whether it was running or
   still queued. A cancel while queued returns `outcome == cancelled` with no
   output.
-- A prompt that can never fit (`prompt + 1 > kv_num_blocks × block`) is
-  rejected with `invalid_argument` (`scheduler.rejected`, `never_fits`).
+- A gated prompt that can never fit (`prompt + 1 > kv_num_blocks × block`) is
+  rejected with `invalid_argument` (`scheduler.rejected`, `never_fits`); an
+  ungated one runs unscheduled (`scheduler.bypassed`). `serve
+  --kv-pool-tokens N` sizes the pool (default 4096 × 16 = 65,536 tokens).
 - A request preempted more than `max_requeue_count` times fails with
   `unavailable` (`scheduler.preempted` with `failed: true`).
 - `max_new_tokens` is clamped to the context limit and to the pool. The
@@ -153,8 +181,9 @@ forwarding headers. ADR-018.
   Ollama) prompt tokens come from an approximate accounting tokenizer (BOS +
   one token per whitespace word). Text chunks count as one token each. Block
   counts are then estimates.
-- The loop is lockstep: a slow chunk consumer delays the whole step for every
-  sequence in it.
+- The loop is lockstep for gated requests: a slow chunk consumer delays the
+  whole step for every sequence in it (bounded by `step_stall_timeout_ms`).
+  Ungated (`account`) requests are never part of a decode barrier.
 - The scheduler's per-request table (`seqs_`) is never pruned. Memory grows
   with the number of requests over the engine lifetime.
 - There is no session-level KV retention or fork across turns. Blocks outlive

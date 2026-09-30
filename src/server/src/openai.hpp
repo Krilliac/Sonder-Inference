@@ -45,10 +45,19 @@ struct ChatJob {
     SamplingConfig sampling;
     bool stream = false;
     bool include_usage = false;
+    // prompt_cache_key (OpenAI): conversation key for upstream cache affinity.
+    std::optional<std::string> session_key;
+    // chat_template_kwargs.enable_thinking / .reasoning_effort, and the
+    // top-level think (same meaning as enable_thinking).
+    ThinkingOptions thinking;
 };
 
 // Maps a request body to a ChatJob. Unknown top-level fields are ignored;
-// user and chat_template_kwargs are accepted and ignored. Rejected with
+// user is accepted and ignored. chat_template_kwargs must be an object:
+// enable_thinking (bool) and reasoning_effort (string, 1-64 of
+// [A-Za-z0-9._-]) are forwarded, other keys ignored; think (bool) must agree
+// with enable_thinking when both are set; prompt_cache_key is a 1-256 byte
+// string (invalid_json otherwise). Rejected with
 // unsupported_parameter: tools, tool_choice, functions, function_call,
 // response_format, logprobs (true), top_logprobs, n != 1, non-string message
 // content, tool_calls on a message. Sonder extensions: num_ctx, typical_p,
@@ -82,9 +91,14 @@ ApiError map_session_failure(const Status& status, bool scheduler_rejected);
 
 // "stop" | "length" | "cancelled".
 const char* finish_reason(const GenerationResult& result) noexcept;
+// prompt/completion/total_tokens, plus prompt_tokens_details.cached_tokens
+// when the backend reported a cached-prompt count.
 json::Object usage_json(const GenerationResult& result);
 // prompt_n, predicted_n, total_ms, plus only measured values: ttft_ms,
-// prompt_ms, predicted_ms, prompt_per_second, predicted_per_second.
+// prompt_ms, predicted_ms, prompt_per_second, predicted_per_second, and the
+// backend's cache_n, draft_n, draft_n_accepted and the scheduler's queue_ms
+// (scheduled requests only). A counter the backend did not report is
+// omitted, never emitted as 0.
 json::Object timings_json(const GenerationResult& result);
 
 }  // namespace sonder::inference::server::detail

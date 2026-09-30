@@ -60,17 +60,30 @@ void put_sampling(json::Object &o, const SamplingConfig &s, bool native) {
 }
 } // namespace
 
-Status validate_sampling(const SamplingConfig &sampling) {
+Status validate_sampling(const SamplingConfig &sampling, std::uint64_t served_ctx) {
     if (auto st = validate(sampling); !st.ok())
         return st;
-    if (supplied(sampling, SamplingConfig::kNumCtx, sampling.num_ctx != 0)) {
-        return Status(ErrorCode::unsupported, "llamaserver: num_ctx must be configured in server arguments");
+    if (sampling.num_ctx > 0 && served_ctx > 0 && static_cast<std::uint64_t>(sampling.num_ctx) > served_ctx) {
+        return Status(ErrorCode::invalid_argument,
+                      "llamaserver: num_ctx " + std::to_string(sampling.num_ctx) + " exceeds the served context " +
+                          std::to_string(served_ctx) +
+                          " (llama-server's per-slot n_ctx); restart llama-server with a larger --ctx-size");
     }
     return {};
 }
 
+namespace {
+void put_extras(json::Object &o, const RequestExtras &extras) {
+    if (extras.cache_prompt)
+        o.set("cache_prompt", true);
+    if (extras.id_slot)
+        o.set("id_slot", static_cast<std::int64_t>(*extras.id_slot));
+}
+} // namespace
+
 json::Value build_completion_body(const std::string &model, const GenerateRequest &request,
-                                  bool native_completion, std::string_view grammar) {
+                                  bool native_completion, std::string_view grammar,
+                                  const RequestExtras &extras) {
     json::Object o;
     o.set("model", model);
     o.set("prompt", request.prompt);
@@ -80,10 +93,12 @@ json::Value build_completion_body(const std::string &model, const GenerateReques
     put_sampling(o, request.sampling, native_completion);
     if (!grammar.empty())
         o.set("grammar", std::string(grammar));
+    put_extras(o, extras);
     return o;
 }
 
-json::Value build_chat_body(const std::string &model, const ChatRequest &request, std::string_view grammar) {
+json::Value build_chat_body(const std::string &model, const ChatRequest &request, std::string_view grammar,
+                            const RequestExtras &extras) {
     json::Object o;
     o.set("model", model);
     o.set("stream", true);
@@ -95,7 +110,43 @@ json::Value build_chat_body(const std::string &model, const ChatRequest &request
     put_sampling(o, request.sampling, false);
     if (!grammar.empty())
         o.set("grammar", std::string(grammar));
+    if (!request.thinking.empty()) {
+        json::Object kwargs;
+        if (request.thinking.enable_thinking)
+            kwargs.set("enable_thinking", *request.thinking.enable_thinking);
+        if (request.thinking.reasoning_effort)
+            kwargs.set("reasoning_effort", *request.thinking.reasoning_effort);
+        o.set("chat_template_kwargs", std::move(kwargs));
+    }
+    put_extras(o, extras);
     return o;
+}
+
+Status parse_props(const json::Value &value, ServerProps &out) {
+    out = {};
+    if (!value.is_object())
+        return Status(ErrorCode::protocol_error, "llamaserver: /props must be an object");
+    const auto count = [](const json::Value *v, std::uint64_t max, std::uint64_t &dest) {
+        if (!v || v->is_null())
+            return true;
+        if (!v->is_integer() || v->as_double() < 0 || v->as_uint() > max)
+            return false;
+        dest = v->as_uint();
+        return true;
+    };
+    const json::Value *n_ctx = nullptr;
+    if (const auto *settings = value.find("default_generation_settings"); settings && settings->is_object())
+        n_ctx = settings->find("n_ctx");
+    if (!n_ctx)
+        n_ctx = value.find("n_ctx");
+    std::uint64_t slots = 0;
+    if (!count(n_ctx, std::uint64_t{1} << 32, out.n_ctx) ||
+        !count(value.find("total_slots"), std::uint64_t{1} << 20, slots)) {
+        out = {};
+        return Status(ErrorCode::protocol_error, "llamaserver: invalid n_ctx or total_slots in /props");
+    }
+    out.total_slots = static_cast<std::uint32_t>(slots);
+    return Status::success();
 }
 
 Status parse_timings(const json::Value &value, Timings &out) {
