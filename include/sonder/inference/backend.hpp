@@ -14,6 +14,7 @@
 #include <string_view>
 #include <vector>
 
+#include "sonder/inference/backend_runtime.hpp"
 #include "sonder/inference/cancellation.hpp"
 #include "sonder/inference/error.hpp"
 #include "sonder/inference/model_architecture.hpp"
@@ -211,6 +212,11 @@ public:
     virtual Result<std::string> probe() = 0;
     virtual Result<std::vector<ModelDescriptor>> list_models() = 0;
     virtual Result<std::shared_ptr<BackendModel>> load_model(const ModelLoadOptions& options) = 0;
+    // Optional runtime observations (GPU memory, context fit, performance
+    // warnings). Must be a cheap snapshot: never blocks on backend I/O, and is
+    // safe to call from any thread. nullopt (the default) means the backend
+    // reports nothing, and hosts then add no runtime fields to their output.
+    [[nodiscard]] virtual std::optional<BackendRuntimeStatus> runtime_status() const { return std::nullopt; }
 };
 
 }  // namespace sonder::inference

@@ -27,6 +27,32 @@ Status status_for_http(int code) {
     return {ErrorCode::backend_error, message};
 }
 
+llamaserver::SpillGuardOptions spill_guard_options(const LlamaServerSpillGuardOptions &o) {
+    llamaserver::SpillGuardOptions g;
+    g.enabled = o.enabled;
+    // An out-of-range enum value stays invalid and is rejected by validate_spill_guard.
+    g.policy = static_cast<llamaserver::SpillPolicy>(-1);
+    switch (o.policy) {
+    case LlamaServerSpillPolicy::warn:
+        g.policy = llamaserver::SpillPolicy::warn;
+        break;
+    case LlamaServerSpillPolicy::refuse:
+        g.policy = llamaserver::SpillPolicy::refuse;
+        break;
+    case LlamaServerSpillPolicy::auto_fit:
+        g.policy = llamaserver::SpillPolicy::auto_fit;
+        break;
+    }
+    g.threshold_bytes = o.threshold_bytes;
+    g.baseline_bytes = o.baseline_bytes;
+    g.sample_interval = o.sample_interval;
+    g.step_factor = o.fit_step_factor;
+    g.step_align = o.fit_step_align;
+    g.min_ctx = o.fit_min_ctx;
+    g.max_attempts = o.fit_max_attempts;
+    return g;
+}
+
 Status validate_options(const LlamaServerBackendOptions &options) {
     const auto duration_ok = [](std::chrono::milliseconds ms) {
         return ms.count() > 0 && ms <= std::chrono::hours(24);
@@ -43,6 +69,16 @@ Status validate_options(const LlamaServerBackendOptions &options) {
     if (options.mode == LlamaServerMode::spawn) {
         if (options.executable.empty() || options.executable.find('\0') != std::string::npos) {
             return {ErrorCode::invalid_argument, "llamaserver: spawn needs an executable path"};
+        }
+        if (options.diagnostics.log_file.find('\0') != std::string::npos)
+            return {ErrorCode::invalid_argument, "llamaserver: log file path contains NUL"};
+        if (options.spill_guard.enabled) {
+            if (auto st = llamaserver::validate_spill_guard(spill_guard_options(options.spill_guard)); !st.ok())
+                return st;
+            if (options.spill_guard.policy == LlamaServerSpillPolicy::auto_fit &&
+                !llamaserver::find_context_size(options.args))
+                return {ErrorCode::invalid_argument,
+                        "llamaserver: spill_guard.policy=auto_fit needs an explicit --ctx-size/-c argument"};
         }
         return llamaserver::validate_process_arguments(options.args);
     }
@@ -152,6 +188,9 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             s.restart_max_backoff = options_.max_restart_backoff;
             s.shutdown_timeout = options_.shutdown_timeout;
             s.max_restarts = options_.max_restarts;
+            s.spill_guard = spill_guard_options(options_.spill_guard);
+            s.log_file = options_.diagnostics.log_file;
+            s.kv_pairing_check = options_.diagnostics.kv_pairing_check;
             supervisor_ = std::make_unique<llamaserver::Supervisor>(std::move(s));
         }
     }
@@ -207,6 +246,13 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         return slot_action(slot, filename, "restore");
     }
     const LlamaServerBackendOptions &options() const { return options_; }
+    // Spawn mode only: attach mode has no child to measure, so it reports
+    // nothing and its responses stay unchanged.
+    std::optional<BackendRuntimeStatus> runtime_status() const override {
+        if (!supervisor_)
+            return std::nullopt;
+        return supervisor_->runtime_status();
+    }
 
     Result<net::HttpRequest> prepare(std::string_view method, std::string_view path, std::string body,
                                      const CancellationToken &cancel) {

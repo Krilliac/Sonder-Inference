@@ -92,6 +92,7 @@ class WindowsProcess final : public Process {
             return false;
         return WaitForSingleObject(process_, 0) == WAIT_TIMEOUT;
     }
+    std::uint32_t pid() const override { return process_ ? static_cast<std::uint32_t>(GetProcessId(process_)) : 0; }
     void stop(std::chrono::milliseconds timeout) override {
         if (job_) {
             TerminateJobObject(job_, 0);
@@ -254,6 +255,7 @@ class PosixProcess final : public Process {
     }
     void adopt_server(pid_t pid) { pid_ = pid; }
     ~PosixProcess() override { stop(timeout_); }
+    std::uint32_t pid() const override { return pid_ > 0 ? static_cast<std::uint32_t>(pid_) : 0; }
     bool running() const override {
         if (pid_ <= 0)
             return false;

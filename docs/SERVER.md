@@ -229,6 +229,10 @@ reject with `never_fits` or `invalid_request`, both caller errors (400).
 once before `ready` and then every 2 s by a background refresher: health and
 identity only read that cache and never wait on the backend (a hung Ollama
 cannot stall them).
+A backend that reports runtime observations (a spawned `llamaserver` child)
+adds `backends[].runtime` with `gpu_memory`, `context` and `warnings`
+([vram-spill](integration/vram-spill.md)); other backends' entries are
+unchanged.
 `telemetry.emitted` and `telemetry.dropped` are the bus counters;
 `subscriber_dropped_events` counts events lost by slow live subscribers.
 
@@ -238,6 +242,9 @@ cannot stall them).
 {"object":"list","data":[{"id":"mock:tiny","object":"model","owned_by":"sonder-inference",
   "sonder":{"backend":"mock","default":true,"synthetic":true}}],"sonder":{"api_version":1}}
 ```
+
+`sonder.runtime` is added to a model only when its backend reports runtime
+status (same object as `backends[].runtime` in health).
 
 ### `GET /v1/sonder/identity[?model=ID]`
 

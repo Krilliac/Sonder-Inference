@@ -69,8 +69,10 @@ Types used below: `int` (JSON integer), `num` (JSON number), `str`,
 | `engine.started` | metrics | `version` str, `commit` str, `platform` str, `device_count` int, `text_capture` str (`on` / `off`); optional `server` obj `{host` str, `port` int, `api_version` int`}` when the engine is hosted by `sonder-infer serve` (`EngineOptions::server`) |
 | `engine.stopped` | metrics | none |
 | `scheduler.configured` | metrics | emitted once at engine start when scheduling is active: `kv_block_size_tokens` int, `kv_num_blocks` int, `prefix_caching` bool, `max_running_sequences` int, `max_step_sequences` int, `max_step_tokens` int, `prefill_chunk_tokens` int, `admission_watermark_blocks` int, `max_requeue_count` int, `step_stall_timeout_ms` int |
-| `device.memory.sample` | metrics | at start (`sample_devices_on_start`) and every `EngineOptions::device_sample_interval` (default 10 s, 0 disables): `kind` str, `name` str, `logical_cores` int, `total_bytes` int, `available_bytes` int; optional `used_bytes` int. Host memory only; no backend reports VRAM yet |
+| `device.memory.sample` | metrics | at start (`sample_devices_on_start`) and every `EngineOptions::device_sample_interval` (default 10 s, 0 disables): `kind` str, `name` str, `logical_cores` int, `total_bytes` int, `available_bytes` int; optional `used_bytes` int. Host memory only; per-process VRAM of a spawned llama-server is `backend.gpu_memory.sample` |
 | `backend.registered` | metrics | `backend` str, `description` str, `capabilities` arr of str |
+| `backend.gpu_memory.sample` | metrics | from the engine's periodic sampler, once per new sample of a backend that reports `Backend::runtime_status()` (a spawned `llamaserver` child): `backend`, `probe`, `status` str; `dedicated_bytes`, `shared_bytes`, `peak_shared_bytes`, `shared_baseline_bytes`, `spill_threshold_bytes`, `samples` int; `spilled` bool; `fitted_ctx` int or null; `fit_outcome` str ([vram-spill](integration/vram-spill.md)) |
+| `backend.warning` | metrics | once per distinct runtime warning: `backend`, `code`, `severity`, `source`, `message` str; `details` obj of str; `count` int |
 | `model.load.started` | metrics | `backend` str, `model` str |
 | `model.load.completed` | metrics | `backend`, `model`, `format`, `family`, `parameter_size`, `quantization` str; `size_bytes` int; `resident` bool (false when only metadata was fetched, e.g. Ollama `/api/show`; the weights load on first request); `duration_ms` num |
 | `model.load.failed` | metrics | `backend`, `model` str; `duration_ms` num; `error_code`, `error` str |
@@ -195,7 +197,7 @@ advertises this vocabulary as `vocabularies: {"sonder.inference.events": 1}`.
 | 2 | group a run | done: `run_id` defaults to the engine id |
 | 3 | capture policy | done: `text_capture` on `engine.started` and `session.created` |
 | 4 | live drop reports | done: `telemetry.dropped` while running, `final` flag |
-| 5 | periodic memory | done for host memory (`device_sample_interval`); VRAM waits for a backend that reports it |
+| 5 | periodic memory | done for host memory (`device_sample_interval`); per-process VRAM for spawned llama-server children (`backend.gpu_memory.sample`, Windows) |
 | 6 | tokens vs chunks | done: `unit` (`token` / `chunk`) and `count` on Sonder-sampled tokens; name unchanged |
 | 7 | Ollama helper duplicates | done: helper renamed to `backend.*`; session emits `inference.prefill.completed` |
 | 8 | metadata-only loads | done: `resident` on `model.load.completed` |

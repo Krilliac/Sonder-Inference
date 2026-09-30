@@ -97,4 +97,44 @@ Result<GenerateStats> BackendModel::chat(const ChatRequest& request, const Cance
     return generate(g, cancel, on_chunk);
 }
 
+json::Object to_json(const GpuMemoryStatus& g) {
+    json::Object out{{"probe", g.probe}, {"status", g.status}};
+    if (!g.error.empty()) {
+        out.set("error", g.error);
+    }
+    out.set("dedicated_bytes", g.dedicated_bytes);
+    out.set("shared_bytes", g.shared_bytes);
+    out.set("peak_shared_bytes", g.peak_shared_bytes);
+    out.set("shared_baseline_bytes", g.shared_baseline_bytes);
+    out.set("spill_threshold_bytes", g.spill_threshold_bytes);
+    out.set("spilled", g.spilled);
+    out.set("samples", g.samples);
+    return out;
+}
+
+json::Object to_json(const BackendWarning& w) {
+    json::Object details;
+    for (const auto& [key, value] : w.details) {
+        details.set(key, value);
+    }
+    return json::Object{{"code", w.code},     {"severity", w.severity},       {"source", w.source},
+                        {"message", w.message}, {"details", std::move(details)}, {"count", w.count}};
+}
+
+json::Object to_json(const BackendRuntimeStatus& status) {
+    const auto& c = status.context;
+    json::Object context{{"policy", c.policy},
+                         {"configured_ctx", c.configured_ctx ? json::Value(*c.configured_ctx) : json::Value()},
+                         {"fitted_ctx", c.fitted_ctx ? json::Value(*c.fitted_ctx) : json::Value()},
+                         {"fit_attempts", c.fit_attempts},
+                         {"outcome", c.outcome}};
+    json::Array warnings;
+    for (const auto& w : status.warnings) {
+        warnings.emplace_back(to_json(w));
+    }
+    return json::Object{{"gpu_memory", to_json(status.gpu_memory)},
+                        {"context", std::move(context)},
+                        {"warnings", std::move(warnings)}};
+}
+
 }  // namespace sonder::inference
