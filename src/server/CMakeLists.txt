@@ -10,6 +10,7 @@ sonder_module_sources(
     src/identity.cpp
     src/live_hub.cpp
     src/openai.cpp
+    src/priority_admission.cpp
     src/residency.cpp
     src/request_path.cpp
     src/residency_config.cpp
@@ -32,7 +33,10 @@ sonder_add_module_tests(server
     tests/test_server_residency.cpp
     tests/test_server_runtime.cpp
     tests/test_residency_config.cpp
-    tests/test_server_request_path.cpp)
+    tests/test_server_request_path.cpp
+    tests/test_priority_parsing.cpp
+    tests/test_priority_admission.cpp
+    tests/test_server_priority.cpp)
 if(TARGET sonder_server_tests)
     target_include_directories(sonder_server_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()

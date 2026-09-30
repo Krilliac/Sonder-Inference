@@ -37,6 +37,14 @@ struct BackendSetup {
     // llama.cpp: tensor placement overrides, "PATTERN=DEVICE" each
     // (see parse_tensor_override). Applied in order; first match wins.
     std::vector<std::string> llamacpp_tensor_overrides;
+    // llama.cpp context options; unset keeps the backend defaults (batch 512,
+    // micro-batch = llama.cpp default capped at batch, f16 K and V cache,
+    // flash attention auto). See LlamaCppBackendOptions.
+    std::optional<std::uint32_t> llamacpp_batch_size;
+    std::optional<std::uint32_t> llamacpp_ubatch_size;
+    std::optional<std::string> llamacpp_kv_cache_type_k;
+    std::optional<std::string> llamacpp_kv_cache_type_v;
+    std::optional<std::string> llamacpp_flash_attention;
     // MOCK backend: artificial per-token latency.
     std::chrono::microseconds mock_token_delay{0};
     // MOCK backend: >= 0 injects a backend error after that many tokens
@@ -148,8 +156,15 @@ std::vector<std::string> available_backend_names();
 // True for backends whose output is synthetic (the MOCK backend).
 bool is_synthetic_backend(std::string_view name) noexcept;
 
-// Builds the named backend. Errors: invalid_argument for an unknown name,
-// unsupported for a backend this build does not include.
+// Builds the named backend. Errors: invalid_argument for an unknown name or
+// invalid backend options, unsupported for a backend this build does not
+// include.
 Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup);
+
+// Checks backend-specific options without building anything: for "llamacpp"
+// in a build that has it, the tensor override syntax and the context options
+// (validate_llamacpp_options). Other backends, and llamacpp options in a
+// build without llama.cpp, are not checked here. Errors: invalid_argument.
+Status validate_backend_setup(const BackendSetup& setup);
 
 }  // namespace sonder::inference

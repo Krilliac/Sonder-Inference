@@ -142,3 +142,56 @@ TEST_CASE("llamacpp adapter: load_model error mapping") {
     o.device_id = "npu:0";
     CHECK(be->load_model(o).status().code() == ErrorCode::unsupported);
 }
+
+TEST_CASE("llamacpp adapter: context options default to today's behaviour and validate") {
+    const LlamaCppBackendOptions d;
+    CHECK(d.batch_size == 512u);
+    CHECK(d.ubatch_size == 0u);
+    CHECK(d.kv_cache_type_k == "f16");
+    CHECK(d.kv_cache_type_v == "f16");
+    CHECK(d.flash_attention == "auto");
+    CHECK(validate_llamacpp_options(d).ok());
+
+    LlamaCppBackendOptions o;
+    o.kv_cache_type_k = "q8_0";
+    o.kv_cache_type_v = "q8_0";
+    CHECK(validate_llamacpp_options(o).ok());  // flash attention auto
+    o.flash_attention = "on";
+    CHECK(validate_llamacpp_options(o).ok());
+    o.flash_attention = "off";
+    Status s = validate_llamacpp_options(o);
+    CHECK(s.code() == ErrorCode::invalid_argument);
+    CHECK(s.message().find("flash attention") != std::string::npos);
+    o.kv_cache_type_v = "f16";  // quantized K alone is fine without it
+    CHECK(validate_llamacpp_options(o).ok());
+
+    o = {};
+    o.kv_cache_type_k = "q4_k";
+    s = validate_llamacpp_options(o);
+    CHECK(s.code() == ErrorCode::invalid_argument);
+    CHECK(s.message().find("K cache type 'q4_k'") != std::string::npos);
+    o = {};
+    o.kv_cache_type_v = "";
+    CHECK(validate_llamacpp_options(o).message().find("V cache type") != std::string::npos);
+    o = {};
+    o.flash_attention = "maybe";
+    CHECK(validate_llamacpp_options(o).code() == ErrorCode::invalid_argument);
+    o = {};
+    o.batch_size = 256;
+    o.ubatch_size = 512;
+    CHECK(validate_llamacpp_options(o).code() == ErrorCode::invalid_argument);
+    o.ubatch_size = 128;
+    CHECK(validate_llamacpp_options(o).ok());
+}
+
+TEST_CASE("llamacpp adapter: load_model rejects invalid context options") {
+    LlamaCppBackendOptions opts;
+    opts.kv_cache_type_v = "q4_0";
+    opts.flash_attention = "off";
+    auto be = make_llamacpp_backend(opts);
+    ModelLoadOptions o;
+    o.model = std::string(SONDER_LLAMACPP_VOCAB_DIR) + "/ggml-vocab-llama-spm.gguf";
+    const auto r = be->load_model(o);
+    CHECK(r.status().code() == ErrorCode::invalid_argument);
+    CHECK(r.status().message().find("flash attention") != std::string::npos);
+}
