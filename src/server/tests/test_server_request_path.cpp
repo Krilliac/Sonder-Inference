@@ -133,7 +133,9 @@ TEST_CASE("thinking pin default mode preserves explicit request values without w
     srv::ServerOptions o;
     o.pin_mode = srv::PinMode::default_value;
     o.pin_enable_thinking = true;
-    o.pin_reasoning_effort = "medium";
+    // emplace: GCC 13 reports a false -Wmaybe-uninitialized (an error under -Werror)
+    // for an inlined optional<string> assignment from a literal in this test.
+    o.pin_reasoning_effort.emplace("medium");
 
     si::ThinkingOptions explicit_request;
     explicit_request.enable_thinking = false;
