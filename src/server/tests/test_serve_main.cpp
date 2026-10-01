@@ -248,7 +248,7 @@ TEST_CASE("serve_main: llama.cpp context flags are refused for every other backe
     // `--max-connections 0` is a later usage error: should the rule go
     // missing, serve still exits before it binds anything and the test fails
     // on the message instead of serving.
-    for (const char* backend : {"llamaserver", "mock", "ollama"}) {
+    for (const std::string backend : {"llamaserver", "mock", "ollama"}) {
         for (const auto& [flag, value] : flags) {
             CAPTURE(backend);
             CAPTURE(flag);

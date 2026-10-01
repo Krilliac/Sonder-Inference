@@ -1316,7 +1316,7 @@ TEST_CASE("serve_main: --profile refuses the llama.cpp context flags its typed f
         {"name":"direct","backend":"llamacpp","model":")" + m + R"(","ctx_size":512}]})");
     const std::string pf = profiles.string();
     std::string err;
-    for (const char* name : {"server", "direct"}) {
+    for (const std::string name : {"server", "direct"}) {
         for (const auto& [flag, value] : std::vector<std::pair<std::string, std::string>>{{"--batch-size", "1024"},
                                                                                           {"--ubatch-size", "256"},
                                                                                           {"--cache-type-k", "q8_0"},
