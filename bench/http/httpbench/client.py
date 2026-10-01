@@ -4,12 +4,43 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
+import threading
 import time
 import urllib.parse
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, Callable
 
 from .metrics import Chunk, StreamTrace
 from .sse import SSEParser
+
+
+_HEADER_NAME_CHARS = frozenset("!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def validate_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
+    """Validate and copy HTTP field names and values before handing them to ``http.client``."""
+    if headers is None:
+        return {}
+    if not isinstance(headers, Mapping):
+        raise TypeError("headers must be a mapping")
+    out: dict[str, str] = {}
+    for name, value in headers.items():
+        if not isinstance(name, str) or not name or any(c not in _HEADER_NAME_CHARS for c in name):
+            raise ValueError(f"invalid HTTP header name: {name!r}")
+        if not isinstance(value, str) or any(ord(c) < 32 or ord(c) > 255 for c in value):
+            raise ValueError(f"invalid HTTP header value for {name!r}")
+        out[name] = value
+    return out
+
+
+def parse_header(spec: str) -> tuple[str, str]:
+    """Parse one CLI-style ``K=V`` header specification."""
+    if not isinstance(spec, str) or "=" not in spec:
+        raise ValueError("header must use K=V")
+    name, value = spec.split("=", 1)
+    checked = validate_headers({name: value})
+    return next(iter(checked.items()))
 
 
 class Target:
@@ -22,7 +53,8 @@ class Target:
     ``/health``) hang off the root.
     """
 
-    def __init__(self, base_url: str, api_key: str | None = None, timeout: float = 900.0):
+    def __init__(self, base_url: str, api_key: str | None = None, timeout: float = 900.0,
+                 headers: Mapping[str, str] | None = None):
         u = urllib.parse.urlsplit(base_url.rstrip("/"))
         if u.scheme not in ("http", "https") or not u.hostname:
             raise ValueError(f"base URL must be http(s)://host[:port][/prefix], got {base_url!r}")
@@ -41,6 +73,7 @@ class Target:
             self.root_prefix = ""
         self.api_key = api_key
         self.timeout = timeout
+        self.headers = validate_headers(headers)
 
     @property
     def display(self) -> str:
@@ -54,22 +87,29 @@ class Target:
 
     def _conn(self, timeout: float | None = None) -> http.client.HTTPConnection:
         cls = http.client.HTTPSConnection if self.scheme == "https" else http.client.HTTPConnection
-        return cls(self.host, self.port, timeout=timeout or self.timeout)
+        return cls(self.host, self.port, timeout=self.timeout if timeout is None else timeout)
 
-    def _headers(self, body: bool) -> dict[str, str]:
+    def _headers(self, body: bool, overrides: Mapping[str, str] | None = None) -> dict[str, str]:
         h = {"Accept": "application/json, text/event-stream"}
         if body:
             h["Content-Type"] = "application/json"
         if self.api_key:
             h["Authorization"] = f"Bearer {self.api_key}"
+        for name, value in self.headers.items():
+            h = {key: old for key, old in h.items() if key.lower() != name.lower()}
+            h[name] = value
+        for name, value in validate_headers(overrides).items():
+            h = {key: old for key, old in h.items() if key.lower() != name.lower()}
+            h[name] = value
         return h
 
-    def request_json(self, method: str, path: str, body: Any = None, timeout: float = 10.0) -> tuple[int | None, Any]:
+    def request_json(self, method: str, path: str, body: Any = None, timeout: float = 10.0,
+                     headers: Mapping[str, str] | None = None) -> tuple[int | None, Any]:
         """Small JSON request. Returns (status, parsed body or text); (None, error) on transport failure."""
         conn = self._conn(timeout)
         try:
             data = json.dumps(body).encode() if body is not None else None
-            conn.request(method, path, body=data, headers=self._headers(data is not None))
+            conn.request(method, path, body=data, headers=self._headers(data is not None, headers))
             resp = conn.getresponse()
             raw = resp.read()
             try:
@@ -90,14 +130,48 @@ class Target:
 
     # ------------------------------------------------------------------ streaming
 
-    def stream(self, path: str, body: dict, api: str = "chat") -> StreamTrace:
+    def stream(self, path: str, body: dict, api: str = "chat", headers: Mapping[str, str] | None = None,
+               timeout: float | None = None, on_sent: Callable[[], None] | None = None,
+               wall_timeout: float | None = None) -> StreamTrace:
         """POST a streaming request and record chunk arrival times."""
         trace = StreamTrace()
         data = json.dumps(body).encode()
-        conn = self._conn()
+        conn = self._conn(timeout)
         t0 = time.perf_counter()
+        wall_timer: threading.Timer | None = None
+        response_socket: list[Any] = [None]
+        expired = threading.Event()
+        resp = None
+
+        def abort() -> None:
+            expired.set()
+            # Shutdown the socket before closing any buffered reader. Closing
+            # HTTPResponse from this thread can block on readline's lock while
+            # a peer trickles bytes without a newline, defeating the deadline.
+            sock = response_socket[0] or getattr(conn, "sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(2)
+                except OSError:
+                    pass
+
         try:
-            conn.request("POST", path, body=data, headers=self._headers(True))
+            if wall_timeout is not None:
+                if not math.isfinite(wall_timeout) or wall_timeout <= 0:
+                    raise ValueError("wall_timeout must be finite and positive")
+                conn.timeout = min(conn.timeout, wall_timeout) if conn.timeout is not None else wall_timeout
+                wall_timer = threading.Timer(wall_timeout, abort)
+                wall_timer.daemon = True
+                wall_timer.start()
+                conn.connect()
+                # Retain the socket before getresponse(): HTTP/1.0 may detach
+                # it from the connection while the response still owns it.
+                response_socket[0] = conn.sock
+                if expired.is_set():
+                    raise TimeoutError("request wall deadline exceeded")
+            conn.request("POST", path, body=data, headers=self._headers(True, headers))
+            if on_sent is not None:
+                on_sent()
             resp = conn.getresponse()
             trace.status = resp.status
             if resp.status != 200:
@@ -130,11 +204,19 @@ class Target:
             trace.end_t = time.perf_counter() - t0
             if not trace.done and trace.error is None:
                 trace.error = "stream ended without [DONE] / final event"
-        except (OSError, http.client.HTTPException) as e:
+        except (OSError, http.client.HTTPException, AttributeError) as e:
             trace.error = f"{type(e).__name__}: {e}"
             trace.end_t = time.perf_counter() - t0
         finally:
+            if wall_timer is not None:
+                wall_timer.cancel()
+                wall_timer.join()
+            if resp is not None:
+                resp.close()
             conn.close()
+            if expired.is_set():
+                trace.error = "request wall deadline exceeded"
+                trace.end_t = time.perf_counter() - t0
         return trace
 
     @staticmethod
@@ -151,8 +233,7 @@ class Target:
             return
         if isinstance(obj.get("usage"), dict):
             trace.usage = obj["usage"]
-        if isinstance(obj.get("timings"), dict):
-            trace.timings = obj["timings"]
+        Target._absorb_meta(trace, obj)
         if obj.get("model") and not trace.model:
             trace.model = obj["model"]
         if api == "completion":
@@ -190,19 +271,50 @@ class Target:
             trace.error = "error: " + json.dumps(obj["error"])[:500]
             return
         trace.usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else None
-        trace.timings = obj.get("timings") if isinstance(obj.get("timings"), dict) else None
+        Target._absorb_meta(trace, obj)
+        reasoning = ""
         if api == "completion":
             text = obj.get("content") or ""
         else:
             msg = ((obj.get("choices") or [{}])[0] or {}).get("message") or {}
             text = msg.get("content") or ""
+            reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
             trace.finish_reason = ((obj.get("choices") or [{}])[0] or {}).get("finish_reason")
-        if text:
-            trace.chunks.append(Chunk(t=now, text=text))
+        if text or reasoning:
+            trace.chunks.append(Chunk(t=now, text=text if isinstance(text, str) else "",
+                                      reasoning=reasoning if isinstance(reasoning, str) else ""))
         trace.done = True
         trace.error = None
         # A non-streamed answer has no token timing; mark it so the caller can tell.
         trace.extra_final["not_streamed"] = True
+
+    @staticmethod
+    def _absorb_meta(trace: StreamTrace, obj: dict[str, Any]) -> None:
+        """Collect additive Sonder metadata while retaining legacy top-level fields."""
+        usage = obj.get("usage")
+        nested = usage.get("sonder") if isinstance(usage, dict) else None
+        nested_timings = nested.get("timings") if isinstance(nested, dict) else None
+        top_timings = obj.get("timings")
+        if isinstance(top_timings, dict) or isinstance(nested_timings, dict):
+            merged = dict(trace.timings or {})
+            if isinstance(nested_timings, dict):
+                merged.update(nested_timings)
+            if isinstance(top_timings, dict):
+                merged.update(top_timings)
+            trace.timings = merged
+        sonder = obj.get("sonder")
+        warnings = None
+        if isinstance(sonder, dict):
+            warnings = sonder.get("warnings")
+        if warnings is None and isinstance(nested, dict):
+            warnings = nested.get("warnings")
+        if warnings:
+            previous = trace.extra_final.get("sonder_warnings")
+            if previous is None:
+                trace.extra_final["sonder_warnings"] = warnings
+            elif isinstance(previous, list):
+                additions = warnings if isinstance(warnings, list) else [warnings]
+                trace.extra_final["sonder_warnings"] = previous + [x for x in additions if x not in previous]
 
 
 def trace_text(trace: StreamTrace) -> tuple[str, str]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import platform
 import random
@@ -15,9 +16,11 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 from . import RESULTS_SCHEMA, SCENARIOS_SCHEMA, __version__
-from .client import Target, trace_text
+from .client import Target, trace_text, validate_headers
 from .gpumem import GpuSampler, spill_check
-from .metrics import derive, group_summary
+from .metrics import derive, group_summary, summarize
+from .observation import ChildLogProbe, MetricsProbe, metrics_delta
+from .scenarios import alternate_reuse, max_tokens_for, pinned_thinking, scenario_headers, stall_failures
 from .textgen import (Sizer, agent_system_prompt, plant, planted_facts, record_list,
                       tool_result_block, tool_schemas)
 
@@ -34,10 +37,16 @@ BUILTIN_SCENARIOS: dict[str, Any] = {
         {"name": "long-context", "kind": "long_context", "sizes": [32768, 65536, 100000, 130000],
          "depths": [0.1, 0.5, 0.9], "max_tokens": 64, "api": "chat"},
         {"name": "repeat-prompt", "kind": "repeat_prompt", "prompt_tokens": 8000, "repeats": 3, "max_tokens": 32},
+        {"name": "agent-alternate", "kind": "agent_alternate", "turns": 3,
+         "agent_tokens": {"A": 22000, "B": 5000, "C": 30000}, "max_tokens": 48},
+        {"name": "priority-contention", "kind": "priority_contention", "background_tokens": 20000,
+         "interactive_tokens": 500, "max_tokens": 48},
+        {"name": "concurrency-stall", "kind": "concurrency_stall", "clients": 3, "max_tokens": 48},
     ],
 }
 
-KINDS = ("agent_session", "concurrency_sweep", "long_context", "repeat_prompt")
+KINDS = ("agent_session", "concurrency_sweep", "long_context", "repeat_prompt", "agent_alternate",
+         "priority_contention", "concurrency_stall")
 
 
 def validate_config(cfg: dict) -> list[str]:
@@ -62,6 +71,32 @@ def validate_config(cfg: dict) -> list[str]:
                 errs.append(f"scenarios[{i}].sizes must be positive integers")
             if not all(isinstance(x, (int, float)) and 0 <= x <= 1 for x in s.get("depths", [0.5])):
                 errs.append(f"scenarios[{i}].depths must be in [0, 1]")
+        if s.get("headers") is not None and not isinstance(s.get("headers"), dict):
+            errs.append(f"scenarios[{i}].headers must be an object")
+        elif isinstance(s.get("headers"), dict):
+            try:
+                validate_headers(s["headers"])
+            except (TypeError, ValueError) as e:
+                errs.append(f"scenarios[{i}].headers invalid: {e}")
+        if s.get("priority") is not None and s.get("priority") not in ("interactive", "subagent", "background"):
+            errs.append(f"scenarios[{i}].priority must be interactive, subagent, or background")
+        if s.get("prompt_cache_key") is not None and not isinstance(s.get("prompt_cache_key"), str):
+            errs.append(f"scenarios[{i}].prompt_cache_key must be a string")
+        if s.get("kind") == "agent_alternate":
+            tokens = s.get("agent_tokens", {"A": 22000, "B": 5000, "C": 30000})
+            if (not isinstance(tokens, dict) or set(tokens) != {"A", "B", "C"}
+                    or not all(type(v) is int and v > 0 for v in tokens.values())):
+                errs.append(f"scenarios[{i}].agent_tokens must contain positive A, B, and C values")
+            if type(s.get("turns", 3)) is not int or s.get("turns", 3) <= 0:
+                errs.append(f"scenarios[{i}].turns must be a positive integer")
+        if s.get("kind") == "concurrency_stall" and s.get("clients", 3) != 3:
+            errs.append(f"scenarios[{i}].clients must be exactly 3")
+        for field in ("prefix_tokens", "background_tokens", "interactive_tokens"):
+            if field in s and (type(s[field]) is not int or s[field] <= 0):
+                errs.append(f"scenarios[{i}].{field} must be a positive integer")
+        for field in ("wall_limit_s", "interactive_start_timeout_s", "timeout", "wall_timeout"):
+            if field in s and (type(s[field]) not in (int, float) or not math.isfinite(s[field]) or s[field] <= 0):
+                errs.append(f"scenarios[{i}].{field} must be finite and positive")
     return errs
 
 
@@ -73,7 +108,8 @@ class Runner:
     def __init__(self, target: Target, *, model: str | None = None, defaults: dict | None = None,
                  extra_body: dict | None = None, sampler: GpuSampler | None = None,
                  ctx_size: int | None = None, shared_baseline_mib: float | None = None,
-                 log: Callable[[str], None] | None = None):
+                 log: Callable[[str], None] | None = None,
+                 metrics_url: str | None = None, child_log: str | None = None):
         self.t = target
         self.model = model
         self.defaults = dict(defaults or {})
@@ -86,6 +122,23 @@ class Runner:
         self.log = log or (lambda m: print(m, file=sys.stderr, flush=True))
         self.sizer: Sizer | None = None
         self._lock = threading.Lock()
+        self.server_warnings: Any = None
+        self.metrics_probe = MetricsProbe(metrics_url) if metrics_url else None
+        self.child_log_probe = ChildLogProbe(child_log) if child_log else None
+        self.run_id = uuid.uuid4().hex
+
+    def _observe_before(self) -> dict:
+        return {"metrics": self.metrics_probe.snapshot() if self.metrics_probe else None,
+                "child_log": self.child_log_probe.snapshot() if self.child_log_probe else None}
+
+    def _observe_after(self, before: dict, result: dict) -> None:
+        if self.metrics_probe:
+            after = self.metrics_probe.snapshot()
+            result["metrics"] = metrics_delta(before["metrics"], after)
+            result["metrics"].update({"before": before["metrics"], "after": after,
+                                      "scope": "server-wide interval"})
+        if self.child_log_probe:
+            result["child_log"] = self.child_log_probe.delta(before["child_log"])
 
     # ------------------------------------------------------------------ identity
 
@@ -108,6 +161,12 @@ class Runner:
         if not self.model and isinstance(models, list) and models and isinstance(models[0], dict):
             self.model = models[0].get("id")
         ident["model_ids"] = [m.get("id") for m in models] if isinstance(models, list) else []
+        for source in ("sonder_identity", "sonder_health"):
+            sid = ident[source].get("body")
+            if isinstance(sid, dict):
+                warnings = (sid.get("sonder") or {}).get("warnings") if isinstance(sid.get("sonder"), dict) else None
+                if warnings:
+                    self.server_warnings = warnings
         if not self.ctx_cli:
             self.ctx_size = _ctx_from_identity(ident)
             ident["ctx_source"] = "server" if self.ctx_size else None
@@ -125,6 +184,9 @@ class Runner:
         for k in ("max_tokens", "temperature", "seed", "top_p", "top_k"):
             if k in sc:
                 p[k] = sc[k]
+        warnings = self.server_warnings
+        if "max_tokens" in p or pinned_thinking(warnings):
+            p["max_tokens"] = max_tokens_for(sc, p, warnings)
         return p
 
     def body(self, api: str, sc: dict, messages: list[dict] | None = None, prompt: str | None = None,
@@ -132,6 +194,9 @@ class Runner:
         p = self._params(sc)
         extra = copy.deepcopy(self.extra_body)
         extra.update(copy.deepcopy(sc.get("extra_body") or {}))
+        for key in ("prompt_cache_key", "priority"):
+            if key in sc:
+                extra[key] = sc[key]
         if api == "completion":
             body = {"prompt": prompt if prompt is not None else _flatten(messages or []), "stream": True,
                     "cache_prompt": True, "n_predict": p.get("max_tokens", 64)}
@@ -153,10 +218,21 @@ class Runner:
         return self.t.oai("/chat/completions"), body
 
     def one(self, scenario: str, group: str, api: str, sc: dict, t_run0: float, **kw) -> dict[str, Any]:
+        on_sent = kw.pop("on_sent", None)
         path, body = self.body(api, sc, **kw)
+        before_metrics = self.metrics_probe.snapshot() if self.metrics_probe else None
         t_start = time.perf_counter() - t_run0
-        trace = self.t.stream(path, body, api=api)
+        headers = scenario_headers(sc)
+        trace = self.t.stream(path, body, api=api, headers=headers, timeout=sc.get("timeout"),
+                              wall_timeout=sc.get("wall_timeout"), on_sent=on_sent)
+        if trace.extra_final.get("sonder_warnings"):
+            self.server_warnings = trace.extra_final["sonder_warnings"]
         m = derive(trace)
+        if self.metrics_probe:
+            after_metrics = self.metrics_probe.snapshot()
+            m["metrics"] = metrics_delta(before_metrics, after_metrics)
+            m["metrics"].update({"before": before_metrics, "after": after_metrics,
+                                 "scope": "server-wide request window; concurrent windows overlap"})
         content, reasoning = trace_text(trace)
         m.update({"scenario": scenario, "group": group, "api": api, "t_start_s": t_start,
                   "content_tail": content[-240:], "content_chars": len(content),
@@ -164,6 +240,27 @@ class Runner:
                   "not_streamed": bool(trace.extra_final.get("not_streamed"))})
         m["_content"] = content
         m["_reasoning"] = reasoning
+        m["header_names"] = sorted(headers)
+        m["prompt_cache_key"] = body.get("prompt_cache_key")
+        m["priority"] = body.get("priority")
+        cap_name = "n_predict" if api == "completion" else "max_tokens"
+        cap = body.get(cap_name, 64)
+        m["max_tokens_sent"] = body.get(cap_name)
+        m["http_attempts"] = 1
+        explicit_body = {**self.extra_body, **(sc.get("extra_body") or {})}
+        larger = max_tokens_for(sc, {"max_tokens": cap}, trace.extra_final.get("sonder_warnings"))
+        if m["ok"] and not sc.get("_thinking_retry") and larger > cap and cap_name not in explicit_body:
+            prompt_n = m.get("prompt_tokens")
+            if self.ctx_size and (prompt_n is None or prompt_n + larger + 256 > self.ctx_size):
+                m["thinking_retry_skipped"] = "increased output budget cannot be proved to fit server n_ctx"
+            else:
+                retry_sc = {**sc, "max_tokens": larger, "_thinking_retry": True}
+                retried = self.one(scenario, group, api, retry_sc, t_run0, **kw)
+                initial = {k: v for k, v in m.items() if k not in ("_content", "_reasoning")}
+                retried["thinking_retry"] = {"reason": "server warning reports pinned thinking", "initial": initial}
+                retried["http_attempts"] = 2
+                retried["total_attempt_wall_s"] = (m.get("e2e_s") or 0) + (retried.get("e2e_s") or 0)
+                return retried
         return m
 
     # ------------------------------------------------------------------ scenarios
@@ -171,18 +268,25 @@ class Runner:
     def run_scenario(self, sc: dict, t_run0: float) -> dict[str, Any]:
         kind = sc["kind"]
         name = sc.get("name") or kind
-        res: dict[str, Any] = {"name": name, "kind": kind, "config": sc, "started_at": _now_iso()}
+        public = dict(sc)
+        if isinstance(public.get("headers"), dict):
+            public["headers"] = {str(k): "<redacted>" for k in public["headers"]}
+        res: dict[str, Any] = {"name": name, "kind": kind, "config": public, "started_at": _now_iso()}
         res["gpu_before"] = self.sampler.sample(f"{name}:before")
         self._maybe_set_baseline(res["gpu_before"])
+        observation_before = self._observe_before()
         t0 = time.perf_counter()
         fn = {"agent_session": self._agent, "concurrency_sweep": self._sweep,
-              "long_context": self._long, "repeat_prompt": self._repeat}[kind]
+              "long_context": self._long, "repeat_prompt": self._repeat,
+              "agent_alternate": self._alternate, "priority_contention": self._priority,
+              "concurrency_stall": self._stall}[kind]
         try:
             fn(sc, name, res, t_run0)
         except Exception as e:  # keep the partial scenario; the checks will fail it
             res["exception"] = f"{type(e).__name__}: {e}"
             self.log(f"[{name}] exception: {res['exception']}")
         res["wall_s"] = time.perf_counter() - t0
+        self._observe_after(observation_before, res)
         res["gpu_after"] = self.sampler.sample(f"{name}:after")
         res["spill"] = spill_check(res["gpu_after"], self.shared_baseline_mib)
         reqs = res.setdefault("requests", [])
@@ -194,6 +298,11 @@ class Runner:
         for r in reqs:
             groups.setdefault(r["group"], []).append(r)
         res["groups"] = {g: group_summary(rs) for g, rs in groups.items()}
+        for group, rows in groups.items():
+            res["groups"][group].update({key: summarize(r.get(key) for r in rows if r.get("ok"))
+                                         for key in ("cache_n", "prompt_n")})
+            if len(rows) == 1 and "metrics" in rows[0]:
+                res["groups"][group]["metrics"] = rows[0]["metrics"]
         for g, extra in (res.pop("_group_extra", {}) or {}).items():
             res["groups"].setdefault(g, {}).update(extra)
         return res
@@ -227,7 +336,7 @@ class Runner:
             res.setdefault("requests", []).append(r)
             self.log(f"[{name}] turn {turn}: ok={r['ok']} ttft={_fmt(r['ttft_s'])} hit={_fmt(r['prefix_hit'])} "
                      f"prompt={r['prompt_tokens']} gen={r['completion_tokens']}" + (f" err={r['error']}" if r["error"] else ""))
-            history.append({"role": "assistant", "content": (r.get("_content") or "(no answer)").strip() or "(no answer)"})
+            history.append(_assistant_history(r))
 
     def _sweep(self, sc: dict, name: str, res: dict, t_run0: float) -> None:
         levels = [int(x) for x in sc.get("levels", [1, 2, 4, 8])]
@@ -274,12 +383,13 @@ class Runner:
         sizes = [int(x) for x in sc.get("sizes", [32768])]
         depths = [float(x) for x in sc.get("depths", [0.1, 0.5, 0.9])]
         api = sc.get("api", "chat")
-        max_tokens = int(self._params(sc).get("max_tokens", 64))
         margin = int(sc.get("margin_tokens", 256))
         res["skipped"] = []
         expected = 0
         reqs = res.setdefault("requests", [])
         for size in sizes:
+            cap_field = "n_predict" if api == "completion" else "max_tokens"
+            max_tokens = int(self.body(api, sc, prompt="")[1].get(cap_field, 64))
             if self.ctx_size and size + max_tokens + margin > self.ctx_size:
                 res["skipped"].append({"size": size, "reason": f"size + max_tokens + {margin} > server n_ctx {self.ctx_size}"})
                 self.log(f"[{name}] skip {size}: exceeds server n_ctx {self.ctx_size}")
@@ -302,9 +412,10 @@ class Runner:
                 else:
                     r = self.one(name, group, api, sc, t_run0, messages=[{"role": "user", "content": body + q}])
                 content = r.get("_content") or ""
+                reasoning = r.get("_reasoning") or ""
                 r.update({"size": size, "depth": depths[k], "depth_actual": actual[k], "expected": f["phrase"],
-                          "recall_correct": f["phrase"].lower() in content.lower() if r["ok"] else None,
-                          "found_in_reasoning": f["phrase"].lower() in (r.get("_reasoning") or "").lower(),
+                          "recall_correct": f["phrase"].lower() in (content + "\n" + reasoning).lower() if r["ok"] else None,
+                          "found_in_reasoning": f["phrase"].lower() in reasoning.lower(),
                           "cold": k == 0})
                 reqs.append(r)
                 self.log(f"[{name}] size {size} depth {depths[k]}: ok={r['ok']} prompt={r['prompt_tokens']} "
@@ -330,10 +441,103 @@ class Runner:
             reqs.append(r)
             self.log(f"[{name}] repeat {i}: ok={r['ok']} ttft={_fmt(r['ttft_s'])} hit={_fmt(r['prefix_hit'])}")
 
+    def _alternate(self, sc: dict, name: str, res: dict, t_run0: float) -> None:
+        turns = int(sc.get("turns", 3))
+        sizes = {k: int(v) for k, v in (sc.get("agent_tokens") or {"A": 22000, "B": 5000, "C": 30000}).items()}
+        reqs = res.setdefault("requests", [])
+        res["expected_requests"] = turns * len(sizes)
+        prefixes = {}
+        histories = {agent: [] for agent in ("A", "B", "C")}
+        for agent in ("A", "B", "C"):
+            rnd = random.Random(int(sc.get("seed_text", 7000)) + ord(agent))
+            prefixes[agent] = "Agent " + agent + " stable context.\n" + "\n".join(
+                self.sizer.fit(record_list(rnd, sizes[agent], self.sizer.chars_per_token), sizes[agent]))
+        for turn in range(1, turns + 1):
+            for agent in ("A", "B", "C"):
+                histories[agent].append({"role": "user", "content": f"Agent {agent}, turn {turn}: continue."})
+                base_key = sc.get("prompt_cache_key", f"{self.run_id}:{name}")
+                sub = dict(sc, prompt_cache_key=f"{base_key}:agent-{agent}")
+                r = self.one(name, f"{agent}-turn{turn}", sc.get("api", "chat"), sub, t_run0,
+                             messages=[{"role": "system", "content": prefixes[agent]}] + histories[agent])
+                r.update({"agent": agent, "turn": turn, "key": f"agent-{agent}"})
+                reqs.append(r)
+                histories[agent].append(_assistant_history(r))
+        res["alternate_reuse"] = alternate_reuse(reqs)
+
+    def _priority(self, sc: dict, name: str, res: dict, t_run0: float) -> None:
+        target = int(sc.get("background_tokens", 20000))
+        rnd = random.Random(int(sc.get("seed_text", 8800)))
+        nonce = uuid.uuid4().hex
+        res["cold_nonce"] = nonce
+        bg_text = f"Cold background prefill {nonce}.\n" + "\n".join(
+            self.sizer.fit(record_list(rnd, target, self.sizer.chars_per_token), target))
+        base_key = str(sc.get("prompt_cache_key", "priority-contention"))
+        bg = dict(sc, prompt_cache_key=f"{base_key}:background:{nonce}", priority="background")
+        inter = dict(sc, prompt_cache_key=f"{base_key}:interactive:{nonce}", priority="interactive")
+        for request_sc in (bg, inter):
+            request_sc["headers"] = {k: v for k, v in (sc.get("headers") or {}).items()
+                                     if k.lower() != "x-sonder-priority"}
+            request_sc["headers"]["X-Sonder-Priority"] = request_sc["priority"]
+        interactive_text = "Interactive canary.\n" + "\n".join(
+            self.sizer.fit(record_list(random.Random(8811), int(sc.get("interactive_tokens", 500)),
+                                       self.sizer.chars_per_token), int(sc.get("interactive_tokens", 500))))
+        out: list[dict] = []
+        sent = threading.Event()
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            future = ex.submit(self.one, name, "background", sc.get("api", "chat"), bg, t_run0,
+                               messages=[{"role": "user", "content": bg_text}], on_sent=sent.set)
+            if not sent.wait(float(sc.get("interactive_start_timeout_s", 5.0))):
+                res["contention_failure"] = "background request was not sent before interactive request"
+            ir = self.one(name, "interactive", sc.get("api", "chat"), inter, t_run0,
+                          messages=[{"role": "user", "content": interactive_text}])
+            out.extend([future.result(), ir])
+        for r, group in zip(out, ("background", "interactive")):
+            r["priority"] = group
+        res["requests"] = out
+        res["expected_requests"] = 2
+        res["interactive_ttft_s"] = out[1].get("ttft_s")
+        bg_start = out[0].get("t_start_s")
+        bg_end = bg_start + (out[0].get("e2e_s") or 0) if bg_start is not None else None
+        res["overlapped"] = bool(sent.is_set() and bg_end is not None and
+                                  bg_start <= out[1].get("t_start_s", 0) < bg_end)
+
+    def _stall(self, sc: dict, name: str, res: dict, t_run0: float) -> None:
+        clients = int(sc.get("clients", 3))
+        if clients != 3:
+            raise ValueError("concurrency_stall requires exactly 3 clients")
+        barrier = threading.Barrier(clients)
+        base_key = sc.get("prompt_cache_key", f"{self.run_id}:{name}")
+        prefixes = []
+        for i in range(clients):
+            target = int(sc.get("prefix_tokens", 20000))
+            rnd = random.Random(int(sc.get("seed_text", 9100)) + i)
+            prefixes.append("Client prefix.\n" + "\n".join(
+                self.sizer.fit(record_list(rnd, target, self.sizer.chars_per_token), target)))
+        def run(i: int) -> dict:
+            key = f"{base_key}:client-{i}"
+            sub = dict(sc, prompt_cache_key=key, wall_timeout=min(float(sc.get("wall_limit_s", 250)), 250.0))
+            barrier.wait(timeout=10)
+            return self.one(name, f"client{i}", sc.get("api", "chat"), sub, t_run0,
+                            messages=[{"role": "system", "content": prefixes[i]},
+                                      {"role": "user", "content": f"marker=STALL_CANARY_{i}; return only your marker."}])
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=clients) as ex:
+            out = list(ex.map(run, range(clients)))
+        wall = time.perf_counter() - t0
+        for i, r in enumerate(out):
+            r.update({"key": f"stall-client-{i}", "marker": f"STALL_CANARY_{i}"})
+            r["marker_present"] = r["marker"] in ((r.get("_content") or "") + "\n" + (r.get("_reasoning") or ""))
+        # Keep content private until checks have inspected it.
+        res["requests"] = out
+        res["expected_requests"] = clients
+        res["stall_failures"] = stall_failures(out, wall, min(float(sc.get("wall_limit_s", 250)), 250.0))
+        res["stall_wall_s"] = wall
+
     # ------------------------------------------------------------------ run
 
     def run(self, cfg: dict, label: str = "", argv: list[str] | None = None) -> dict[str, Any]:
         started = _now_iso()
+        self.run_id = uuid.uuid4().hex
         ident = self.identify()
         self.log(f"target {self.t.display} model={self.model!r} n_ctx={self.ctx_size} build={ident.get('build_info')!r}")
         self.sizer = Sizer(self.t.tokenize)
@@ -342,6 +546,7 @@ class Runner:
         base = self.sampler.sample("baseline")
         self._maybe_set_baseline(base)
         t_run0 = time.perf_counter()
+        observation_before = self._observe_before()
         scenarios = []
         for sc in cfg["scenarios"]:
             self.log(f"== scenario {sc.get('name') or sc['kind']} ({sc['kind']})")
@@ -364,9 +569,19 @@ class Runner:
                     "samples": self.sampler.samples},
             "scenarios": scenarios,
         }
+        self._observe_after(observation_before, results)
         results["checks"] = run_checks(results)
         results["verdict"] = verdict(results["checks"])
         return results
+
+
+def _assistant_history(row: dict) -> dict:
+    content = row.get("_content") or ""
+    reasoning = row.get("_reasoning") or ""
+    history = {"role": "assistant", "content": content.strip() if reasoning else content.strip() or "(no answer)"}
+    if reasoning:
+        history["reasoning_content"] = reasoning
+    return history
 
 
 def _trim_props(p: dict) -> dict:
@@ -424,6 +639,30 @@ def run_checks(results: dict) -> list[dict]:
     """Non-vacuity assertions. A check that cannot observe its signal says so; it never passes silently."""
     checks: list[dict] = []
     scen = results.get("scenarios") or []
+    # No observation is mandatory unless the operator enabled it. Inspect
+    # every request too: a failed intermediate scrape must not disappear in
+    # an otherwise successful run-boundary delta.
+    sources = [results]
+    for scenario in scen:
+        sources.append(scenario)
+        for row in scenario.get("requests") or []:
+            sources.append(row)
+            initial = (row.get("thinking_retry") or {}).get("initial")
+            if initial:
+                sources.append(initial)
+    for key, check_name in (("metrics", "metrics_available"), ("child_log", "child_log_available")):
+        observations = [source[key] for source in sources if key in source]
+        if observations:
+            problems = []
+            for observation in observations:
+                problems.extend(str(e) for e in observation.get("errors") or [])
+                for flag in ("resets", "unknown", "reset", "partial"):
+                    if observation.get(flag):
+                        problems.append(f"{flag}: {observation[flag]}")
+            detail = "; ".join(dict.fromkeys(problems)) if problems else "all enabled observation windows were readable"
+            checks.append(_check(check_name, "warn" if problems else "pass", detail[:1000]))
+    if any(source.get("thinking_retry_skipped") for source in sources):
+        checks.append(_check("thinking_headroom", "warn", "pinned thinking needs 1500 output tokens but context fit is unproven"))
     if not scen:
         checks.append(_check("scenarios_ran", "fail", "no scenarios ran"))
     total_ok = 0
@@ -486,6 +725,24 @@ def run_checks(results: dict) -> list[dict]:
                 n_ok = sum(1 for x in rec if x)
                 checks.append(_check("recall", "pass" if n_ok == len(rec) else "warn",
                                      f"{n_ok}/{len(rec)} planted facts recalled exactly", name))
+        if s["kind"] == "agent_alternate":
+            reuse = s.get("alternate_reuse") or alternate_reuse(reqs)
+            checks.append(_check("alternate_prefix_reuse", "pass" if reuse.get("pass") else "fail",
+                                 f"A turn 2+ measured cache ratios {reuse.get('ratios') or 'unknown'}", name))
+        if s["kind"] == "concurrency_stall":
+            failures = s.get("stall_failures") or []
+            if s.get("stall_failures") is None or len(reqs) != 3:
+                failures = [*failures, "three-client stall observations missing"]
+            checks.append(_check("concurrency_stall", "fail" if failures else "pass",
+                                 "; ".join(failures) if failures else "three keyed clients completed without stalls, 503s, or marker leaks", name))
+            if any(r.get("ok") and not r.get("marker_present") for r in reqs):
+                checks.append(_check("concurrency_canary", "warn", "one or more clients did not echo their marker", name))
+        if s["kind"] == "priority_contention":
+            interactive = s.get("interactive_ttft_s")
+            okay = interactive is not None and s.get("overlapped") and not s.get("contention_failure")
+            detail = (f"interactive TTFT {interactive}s; overlapped={s.get('overlapped')}" if interactive is not None
+                      else "interactive request missing")
+            checks.append(_check("priority_contention", "pass" if okay else "fail", detail, name))
         sp = s.get("spill")
         if sp and sp.get("spill"):
             checks.append(_check("vram_spill", "warn",

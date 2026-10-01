@@ -167,3 +167,34 @@ are meaningless by design. Small reviewed snapshots go in
 [`bench/results/`](../bench/results/). The Ollama baseline is still pending
 (`bench/results/PENDING_ollama_baseline.md`): no live Ollama was reachable when
 the harness was built.
+
+## HTTP agent and contention harness
+
+[`bench/http/bench_http.py`](../bench/http/bench_http.py) is the Python stdlib
+HTTP harness; [its README](../bench/http/README.md) defines the scenarios and
+result fields. Its fake-server tests exercise transport, cache accounting and
+failure checks without model weights or a GPU. They establish harness
+behavior only, not inference quality or performance.
+
+The following measurements support the 2026-09-30 serving experiments:
+
+| Experiment | Scenario and evidence | Acceptance |
+| --- | --- | --- |
+| E02 busy-slot regression | `concurrency-stall`: three clients with different cache keys; per-request wall/status plus content and reasoning canaries; child `selected slot by id` and repeated `progress = 1.00` counters | No request over 250 s, no 503, no cross-client marker leak. A timeout or missing response fails; diagnostic-source failures are explicit. |
+| E07 proxy versus raw backend | `agent-stable`, `agent-volatile-top`, `fanout-sweep`, plus `agent-alternate`; per-turn `cache_n`, `prompt_n`, TTFT and cached-token provenance | Reuse through the proxy must agree with raw llama-server for the same model, pins, prompt and cache configuration. Missing cache data is not a zero-hit measurement. |
+| E08 prompt-cache RAM sizing | `agent-alternate`: A ~22k, B ~5k, C ~30k tokens, strict A/B/C order; separate histories and keys; count eviction/full-reprocessing log messages | A's turn-2+ `cache_n` (or reported cached-token equivalent) is at least 0.9 times measured prompt length. Record system commit and free RAM separately; this harness does not change cache RAM settings. |
+| E11 speculative draft length | `--metrics-url` samples accepted-token counters by position around each request and scenario | Compare the same sampling and prompt classes. Server-wide deltas from overlapping request windows must not be summed. Counter resets/missing positions remain explicit. |
+| Priority policy comparison | `priority-contention`: cold ~20k-token background prefill and ~500-token interactive request | Record interactive TTFT and actual overlap. Compare policy configurations with the same workload; this is not a claim that a running prefill is preemptible. |
+
+Repeatable `--header K=V` and per-scenario `headers`, `prompt_cache_key` and
+`priority` let each arm use the real session/priority paths. Preserve the
+existing baseline scenarios and their settings when comparing old results.
+Pinned-thinking warnings raise recall/agent default output headroom to at
+least 1,500 tokens, with explicit output overrides preserved; record any
+retry and whether the recalled fact was found only in `reasoning_content`.
+
+The GPU operator owns live runs and stores reviewed E02/E07/E08/E11 artifacts
+under `D:/sonder-eco/wf/bench/`. The lane author runs only fake-server tests;
+real GPU acceptance, deployment, commits and PR operations belong to the
+integrator. Each result should include exact server revision, model, launch
+configuration, pins, sampling, context size and the arm's scenario JSON.
