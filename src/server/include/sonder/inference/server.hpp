@@ -37,6 +37,9 @@ inline constexpr std::uint16_t kDefaultPort = 11437;
 
 enum class LogFormat { text, json };
 enum class SchedulerPolicy { automatic, gate, account, off };
+// Controls whether server-wide thinking pins override explicit request values
+// (the historical default) or only supply values that are absent.
+enum class PinMode { override_request, default_value };
 // Controls the server-side class/capacity admission layer. `automatic` only
 // enables it when an explicit class or queue cap is configured.
 enum class PriorityAdmissionPolicy { automatic, on, off };
@@ -116,9 +119,13 @@ struct ServerOptions {
     SchedulerPolicy scheduler = SchedulerPolicy::automatic;
     std::uint64_t kv_pool_tokens = 0;
     // --pin-enable-thinking / --pin-reasoning-effort: forwarded on every chat
-    // request; a conflicting request value is overridden with a warning.
+    // request; pin_mode controls whether conflicts are overridden or left
+    // intact. Budget pins are default-only and applied by request glue.
     std::optional<bool> pin_enable_thinking;
     std::optional<std::string> pin_reasoning_effort;
+    PinMode pin_mode = PinMode::override_request;
+    std::optional<std::int64_t> pin_reasoning_budget_tokens;
+    std::optional<std::string> pin_reasoning_budget_message;
 
     // Request-class admission limits, applied only when priority admission is
     // enabled. Zero means unlimited; engine scheduling is independent.

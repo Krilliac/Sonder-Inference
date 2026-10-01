@@ -621,6 +621,8 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                 chat_request.session_key = request_options.session_key;
                 chat_request.thinking = request_options.thinking;
                 chat_request.separate_reasoning = request_options.separate_reasoning;
+                chat_request.reasoning_budget_tokens = request_options.reasoning_budget_tokens;
+                chat_request.reasoning_budget_message = request_options.reasoning_budget_message;
                 generated = backend_model.chat(chat_request, token, on_backend_chunk);
             } else {
                 generated = backend_model.generate(request, token, on_backend_chunk);
@@ -683,6 +685,15 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                          {"scheduled", result.scheduling.scheduled},
                          {"sampler", result.scheduling.sonder_sampled ? "sonder" : "backend"}};
     backend_observations(summary, result.stats);
+    if (request_options.reasoning_budget_tokens) summary.set("reasoning_budget", *request_options.reasoning_budget_tokens);
+    if (result.stats.backend_timings) {
+        const auto& t = *result.stats.backend_timings;
+        if (t.cache_n) summary.set("backend_cache_n", *t.cache_n);
+        if (t.prompt_n) summary.set("backend_prompt_n", *t.prompt_n);
+        if (t.predicted_n) summary.set("backend_predicted_n", *t.predicted_n);
+        if (t.draft_n) summary.set("backend_draft_n", *t.draft_n);
+        if (t.draft_n_accepted) summary.set("backend_draft_accepted", *t.draft_n_accepted);
+    }
     if (result.scheduling.scheduled) {
         summary.set("queue_ms", result.scheduling.queue_ms);
         summary.set("preemptions", result.scheduling.preemptions);

@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "server_test_support.hpp"
+#include "src/openai.hpp"
+#include "src/request_path.hpp"
 
 using namespace server_test;
 namespace json = sonder::inference::json;
@@ -28,6 +30,103 @@ std::vector<std::string> sse_data(const std::string& body) {
 }
 
 }  // namespace
+
+// L1 pure request regressions (also runnable without a listening server).
+TEST_CASE("reasoning budget: invalid body values name the field") {
+    for (const auto* value : {"-2", "1.5", "true", "\"512\"", "null", "9223372036854775808"}) {
+        const auto parsed = det::parse_chat_request(chat_body(std::string(",\"reasoning_budget_tokens\":") + value));
+        REQUIRE(std::holds_alternative<det::ApiError>(parsed));
+        const auto& error = std::get<det::ApiError>(parsed);
+        CHECK(error.status == 400);
+        CHECK(error.param == std::optional<std::string>("reasoning_budget_tokens"));
+    }
+}
+
+TEST_CASE("reasoning budget: message byte limit and type are enforced") {
+    std::string oversized_utf8;
+    for (int i = 0; i < 257; ++i) oversized_utf8 += "\xC3\xA9";
+    for (const auto& value : {json::Value(std::string(513, 'x')), json::Value(3), json::Value(nullptr),
+                              json::Value(oversized_utf8)}) {
+        auto body = json::parse(chat_body());
+        REQUIRE(body.ok());
+        body->object().set("reasoning_budget_message", value);
+        const auto parsed = det::parse_chat_request(body->dump());
+        REQUIRE(std::holds_alternative<det::ApiError>(parsed));
+        const auto& error = std::get<det::ApiError>(parsed);
+        CHECK(error.status == 400);
+        CHECK(error.param == std::optional<std::string>("reasoning_budget_message"));
+    }
+}
+
+TEST_CASE("reasoning history: assistant reasoning content must be a string") {
+    const auto parsed = det::parse_chat_request(
+        R"({"messages":[{"role":"assistant","content":"answer","reasoning_content":42},{"role":"user","content":"next"}]})");
+    REQUIRE(std::holds_alternative<det::ApiError>(parsed));
+    CHECK(std::get<det::ApiError>(parsed).status == 400);
+    CHECK(std::get<det::ApiError>(parsed).param == std::optional<std::string>("messages[0].reasoning_content"));
+}
+
+TEST_CASE("pin mode: default flag preserves explicit false without warnings") {
+    srv::ServerOptions options;
+    options.pin_enable_thinking = true;
+    REQUIRE(det::parse_request_path_flags([](const std::string& name) -> std::optional<std::string> {
+        return name == "pin-mode" ? std::optional<std::string>("default") : std::nullopt;
+    }, options).ok());
+    si::ThinkingOptions thinking;
+    thinking.enable_thinking = false;
+    CHECK(det::apply_thinking_pins(options, thinking).empty());
+    CHECK(thinking.enable_thinking == std::optional<bool>(false));
+}
+// End L1 pure request regressions.
+
+TEST_CASE("chat: mock health and model features are explicitly empty") {
+    auto options = Fixture::defaults();
+    options.pin_mode = srv::PinMode::default_value;
+    options.pin_enable_thinking = true;
+    Fixture f(options);
+    for (const auto* path : {"/v1/sonder/health", "/v1/models"}) {
+        const auto reply = get(f.port, path);
+        REQUIRE(reply.status == 200);
+        const auto document = reply.json();
+        const auto* meta = document.find("sonder");
+        REQUIRE(meta != nullptr);
+        REQUIRE(meta->find("features") != nullptr);
+        CHECK(meta->find("features")->is_array());
+        CHECK(meta->find("features")->as_array().empty());
+        REQUIRE(meta->find("pins") != nullptr);
+        CHECK(meta->find("pins")->find("mode")->as_string() == "default");
+    }
+}
+
+TEST_CASE("chat: mock accepts budget controls with warnings and no timing fabrication") {
+    Fixture f;
+    const auto reply = post(f.port, "/v1/chat/completions",
+        chat_body(R"(,"max_tokens":1,"reasoning_budget_tokens":512,"reasoning_budget_message":"short")"));
+    REQUIRE(reply.status == 200);
+    const auto document = reply.json();
+    const auto* warnings = document.find("sonder")->find("warnings");
+    REQUIRE(warnings != nullptr);
+    REQUIRE(warnings->as_array().size() == 2);
+    CHECK(warnings->as_array()[0].as_string().find("reasoning_budget_tokens") != std::string::npos);
+    CHECK(warnings->as_array()[1].as_string().find("reasoning_budget_message") != std::string::npos);
+    CHECK(document.find("usage")->find("sonder") == nullptr);
+    CHECK(document.find("usage")->find("prompt_tokens_details") == nullptr);
+    const auto completed = f.of_type("request.completed");
+    REQUIRE(completed.size() == 1);
+    const auto* attributes = completed[0].find("attributes");
+    CHECK(attributes->find("reasoning_budget") == nullptr);
+    CHECK(attributes->find("backend_prompt_n") == nullptr);
+}
+
+TEST_CASE("chat: malformed reasoning budget headers fail before execution") {
+    Fixture f;
+    for (const auto* value : {"-2", "1.5", "none", "9223372036854775808"}) {
+        const auto reply = post(f.port, "/v1/chat/completions", chat_body(), {{"X-Sonder-Reasoning-Budget", value}});
+        REQUIRE(reply.status == 400);
+        CHECK(reply.json().find("error")->find("param")->as_string() == "X-Sonder-Reasoning-Budget");
+    }
+    CHECK(f.of_type("request.started").empty());
+}
 
 TEST_CASE("chat: non-streaming completion with usage, measured timings and Sonder metadata") {
     Fixture f;

@@ -7,6 +7,7 @@
 
 #include "sonder/inference/backend.hpp"
 #include "sonder/inference/json.hpp"
+#include "timings.hpp"
 
 namespace sonder::inference::llamaserver {
 
@@ -26,6 +27,9 @@ struct Timings {
     double predicted_tokens_per_second = 0.0;
     std::uint64_t prompt_ns = 0;
     std::uint64_t eval_ns = 0;
+    // Optional raw counters for the backend completion path. The legacy
+    // aggregate members above remain populated exactly as before.
+    std::optional<BackendTimings> backend_timings = std::nullopt;
 };
 
 // llama.cpp-only request fields (never sent to a generic OpenAI upstream).

@@ -9,12 +9,15 @@ sonder_module_sources(
     src/backend_setup.cpp
     src/chat_handler.cpp
     src/http.cpp
+    src/health_features.cpp
     src/identity.cpp
     src/live_hub.cpp
     src/openai.cpp
     src/priority_admission.cpp
     src/residency.cpp
     src/request_path.cpp
+    src/reasoning_budget.cpp
+    src/thinking_pins.cpp
     src/residency_config.cpp
     src/serve_main.cpp
     src/server.cpp

@@ -3,14 +3,20 @@
 // the cached-token usage and timings fields.
 #include <doctest/doctest.h>
 
+#include <cstdint>
 #include <map>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include "sonder/inference.hpp"
 #include "sonder/inference/server.hpp"
+#include "src/health_features.hpp"
+#include "src/http.hpp"
 #include "src/openai.hpp"
+#include "src/reasoning_budget.hpp"
 #include "src/request_path.hpp"
 
 namespace si = sonder::inference;
@@ -112,6 +118,36 @@ TEST_CASE("thinking pins fill unset fields and override conflicts with a warning
     CHECK(conflict.reasoning_effort == std::optional<std::string>("low"));
 }
 
+TEST_CASE("thinking pin override mode preserves the explicit false override warning") {
+    srv::ServerOptions o;
+    o.pin_enable_thinking = true;
+    si::ThinkingOptions explicit_off;
+    explicit_off.enable_thinking = false;
+    const auto off_warnings = det::apply_thinking_pins(o, explicit_off);
+    REQUIRE(off_warnings.size() == 1);
+    CHECK(off_warnings.front().find("enable_thinking=off") != std::string::npos);
+    CHECK(explicit_off.enable_thinking == std::optional<bool>(true));
+}
+
+TEST_CASE("thinking pin default mode preserves explicit request values without warnings") {
+    srv::ServerOptions o;
+    o.pin_mode = srv::PinMode::default_value;
+    o.pin_enable_thinking = true;
+    o.pin_reasoning_effort = "medium";
+
+    si::ThinkingOptions explicit_request;
+    explicit_request.enable_thinking = false;
+    explicit_request.reasoning_effort = "low";
+    CHECK(det::apply_thinking_pins(o, explicit_request).empty());
+    CHECK(explicit_request.enable_thinking == std::optional<bool>(false));
+    CHECK(explicit_request.reasoning_effort == std::optional<std::string>("low"));
+
+    si::ThinkingOptions absent_request;
+    CHECK(det::apply_thinking_pins(o, absent_request).empty());
+    CHECK(absent_request.enable_thinking == std::optional<bool>(true));
+    CHECK(absent_request.reasoning_effort == std::optional<std::string>("medium"));
+}
+
 TEST_CASE("--scheduler and --kv-pool-tokens map onto the engine scheduling options") {
     srv::ServerOptions o;
     REQUIRE(flags({}, o).ok());
@@ -150,6 +186,21 @@ TEST_CASE("--scheduler and --kv-pool-tokens map onto the engine scheduling optio
     CHECK(pins.pin_reasoning_effort == std::optional<std::string>("medium"));
 }
 
+TEST_CASE("thinking and budget pin flags validate their values") {
+    srv::ServerOptions mode;
+    REQUIRE(flags({{"pin-mode", "default"}, {"pin-reasoning-budget", "512"},
+                   {"pin-reasoning-budget-message", "short"}}, mode)
+                .ok());
+    CHECK(mode.pin_mode == srv::PinMode::default_value);
+    CHECK(mode.pin_reasoning_budget_tokens == std::optional<std::int64_t>(512));
+    CHECK(mode.pin_reasoning_budget_message == std::optional<std::string>("short"));
+    CHECK(flags({{"pin-mode", "bad"}}, mode).code() == si::ErrorCode::invalid_argument);
+    CHECK(flags({{"pin-reasoning-budget", "-2"}}, mode).code() == si::ErrorCode::invalid_argument);
+    CHECK(flags({{"pin-reasoning-budget", "nope"}}, mode).code() == si::ErrorCode::invalid_argument);
+    CHECK(flags({{"pin-reasoning-budget-message", std::string(513, 'x')}}, mode).code() ==
+          si::ErrorCode::invalid_argument);
+}
+
 TEST_CASE("usage and timings add cached, draft and queue fields only when measured") {
     si::GenerationResult r;
     r.stats.prompt_tokens = 12;
@@ -176,4 +227,169 @@ TEST_CASE("usage and timings add cached, draft and queue fields only when measur
     CHECK(timings.find("draft_n")->as_int() == 8);
     CHECK(timings.find("draft_n_accepted")->as_int() == 5);
     CHECK(timings.find("queue_ms")->as_double() == doctest::Approx(1.5));
+}
+
+TEST_CASE("upstream usage timings preserve fields and respect the existing cached token count") {
+    si::GenerationResult r;
+    r.stats.cached_tokens = 0;
+    si::BackendTimings backend;
+    backend.prompt_n = 20;
+    backend.cache_n = 19;
+    backend.prompt_ms = 2.5;
+    backend.predicted_n = 7;
+    backend.predicted_ms = 3.5;
+    backend.draft_n = 4;
+    backend.draft_n_accepted = 3;
+    r.stats.backend_timings = backend;
+    auto usage = si::json::Value(det::usage_json(r));
+    const auto* sonder = usage.find("sonder");
+    REQUIRE(sonder != nullptr);
+    const auto* upstream = sonder->find("timings");
+    REQUIRE(upstream != nullptr);
+    CHECK(upstream->find("prompt_n")->as_int() == 20);
+    CHECK(upstream->find("cache_n")->as_int() == 19);
+    CHECK(upstream->find("prompt_ms")->as_double() == doctest::Approx(2.5));
+    CHECK(upstream->find("predicted_n")->as_int() == 7);
+    CHECK(upstream->find("predicted_ms")->as_double() == doctest::Approx(3.5));
+    CHECK(upstream->find("draft_n")->as_int() == 4);
+    CHECK(upstream->find("draft_n_accepted")->as_int() == 3);
+    CHECK(usage.find("prompt_tokens_details")->find("cached_tokens")->as_int() == 0);
+
+    r.stats.cached_tokens.reset();
+    usage = si::json::Value(det::usage_json(r));
+    CHECK(usage.find("prompt_tokens_details")->find("cached_tokens")->as_int() == 19);
+    si::BackendTimings partial;
+    partial.prompt_n = 20;
+    r.stats.backend_timings = partial;
+    usage = si::json::Value(det::usage_json(r));
+    CHECK(usage.find("sonder")->find("timings")->find("cache_n") == nullptr);
+}
+
+TEST_CASE("reasoning budget parser accepts canonical, alias, zero and signed limits") {
+    CHECK(det::reasoning_budget::parse_integer("-1") == std::optional<std::int64_t>(-1));
+    CHECK(det::reasoning_budget::parse_integer("0") == std::optional<std::int64_t>(0));
+    CHECK(det::reasoning_budget::parse_integer("-0") == std::optional<std::int64_t>(0));
+    CHECK(det::reasoning_budget::parse_integer("-01") == std::optional<std::int64_t>(-1));
+    CHECK(det::reasoning_budget::parse_integer("9223372036854775807") ==
+          std::optional<std::int64_t>(INT64_MAX));
+    CHECK_FALSE(det::reasoning_budget::parse_integer("+1"));
+    CHECK_FALSE(det::reasoning_budget::parse_integer("9223372036854775808"));
+
+    auto parsed = si::json::parse(R"({"thinking_budget_tokens":0})");
+    REQUIRE(parsed.ok());
+    det::ChatJob alias_job;
+    CHECK_FALSE(det::reasoning_budget::parse_body(parsed->as_object(), alias_job));
+    CHECK(alias_job.reasoning_budget_tokens == std::optional<std::int64_t>(0));
+
+    parsed = si::json::parse(R"({"reasoning_budget_tokens":-1})");
+    REQUIRE(parsed.ok());
+    det::ChatJob canonical_job;
+    CHECK_FALSE(det::reasoning_budget::parse_body(parsed->as_object(), canonical_job));
+    CHECK(canonical_job.reasoning_budget_tokens == std::optional<std::int64_t>(-1));
+
+    det::RequestHead head;
+    head.headers = {{"x-sonder-reasoning-budget", "9223372036854775807"}};
+    det::Correlation correlation;
+    CHECK_FALSE(det::reasoning_budget::parse_header(head, correlation));
+    CHECK(correlation.reasoning_budget_tokens == std::optional<std::int64_t>(INT64_MAX));
+}
+
+TEST_CASE("reasoning budget header wins and pins fill only absent request values") {
+    det::ChatJob job;
+    job.reasoning_budget_tokens = 0;
+    job.reasoning_budget_message = "request";
+    det::Correlation header;
+    header.reasoning_budget_tokens = 1024;
+    srv::ServerOptions pins;
+    pins.pin_reasoning_budget_tokens = 512;
+    pins.pin_reasoning_budget_message = "pinned";
+    si::RequestOptions request;
+    std::vector<std::string> warnings;
+    det::reasoning_budget::apply(job, header, pins, "llamaserver", request, warnings);
+    CHECK(request.reasoning_budget_tokens == std::optional<std::int64_t>(1024));
+    CHECK(request.reasoning_budget_message == std::optional<std::string>("request"));
+    CHECK(warnings.empty());
+
+    det::ChatJob absent;
+    si::RequestOptions filled;
+    det::reasoning_budget::apply(absent, {}, pins, "llamaserver", filled, warnings);
+    CHECK(filled.reasoning_budget_tokens == std::optional<std::int64_t>(512));
+    CHECK(filled.reasoning_budget_message == std::optional<std::string>("pinned"));
+}
+
+TEST_CASE("reasoning budget request parser preserves byte boundaries and canonical precedence") {
+    std::string message;
+    for (int i = 0; i < 256; ++i) message += "\xC3\xA9";
+    si::json::Object body{{"messages", si::json::Array{si::json::Object{{"role", "user"}, {"content", "hi"}}}},
+                          {"reasoning_budget_tokens", 512}, {"thinking_budget_tokens", 99},
+                          {"reasoning_budget_message", message}};
+    const auto job = job_of(si::json::Value(body).dump());
+    CHECK(job.reasoning_budget_tokens == std::optional<std::int64_t>(512));
+    CHECK(job.reasoning_budget_message == std::optional<std::string>(message));
+    body.set("thinking_budget_tokens", -2);
+    CHECK(error_of(si::json::Value(body).dump()).param == std::optional<std::string>("thinking_budget_tokens"));
+
+    det::RequestHead duplicate;
+    duplicate.headers = {{"x-sonder-reasoning-budget", "512"}, {"x-sonder-reasoning-budget", "512"}};
+    const auto parsed = det::parse_correlation(duplicate);
+    REQUIRE(std::holds_alternative<det::ApiError>(parsed));
+    CHECK(std::get<det::ApiError>(parsed).status == 400);
+    CHECK(std::get<det::ApiError>(parsed).param == std::optional<std::string>("X-Sonder-Reasoning-Budget"));
+}
+
+TEST_CASE("reasoning budget rejects invalid body and header values and warns on unsupported backends") {
+    for (const auto* value : {"-2", "1.5", "true", "9223372036854775808"}) {
+        auto parsed = si::json::parse(std::string("{\"reasoning_budget_tokens\":") + value + "}");
+        REQUIRE(parsed.ok());
+        det::ChatJob job;
+        const auto error = det::reasoning_budget::parse_body(parsed->as_object(), job);
+        REQUIRE(error);
+        CHECK(error->status == 400);
+        CHECK(error->param == std::optional<std::string>("reasoning_budget_tokens"));
+    }
+    det::RequestHead head;
+    head.headers = {{"x-sonder-reasoning-budget", "-2"}};
+    det::Correlation correlation;
+    CHECK(det::reasoning_budget::parse_header(head, correlation)->status == 400);
+
+    det::ChatJob job;
+    job.reasoning_budget_tokens = 1;
+    job.reasoning_budget_message = "hint";
+    si::RequestOptions request;
+    std::vector<std::string> warnings;
+    det::reasoning_budget::apply(job, {}, {}, "mock", request, warnings);
+    CHECK_FALSE(request.reasoning_budget_tokens);
+    CHECK_FALSE(request.reasoning_budget_message);
+    REQUIRE(warnings.size() == 2);
+    CHECK(warnings[0].find("reasoning_budget_tokens") != std::string::npos);
+    CHECK(warnings[1].find("reasoning_budget_message") != std::string::npos);
+}
+
+TEST_CASE("health features are exact by backend and report pin mode") {
+    const auto mock = det::health_features("mock", {}, {});
+    REQUIRE(mock.find("features") != nullptr);
+    CHECK(mock.find("features")->as_array().empty());
+
+    srv::ServerOptions options;
+    options.pin_mode = srv::PinMode::default_value;
+    const auto llama = det::health_features("llamaserver", options, {});
+    const auto& features = llama.find("features")->as_array();
+    const std::vector<std::string> expected = {"thinking", "chat_template_kwargs", "enable_thinking",
+                                               "reasoning_effort", "reasoning_budget", "prompt_cache_key",
+                                               "priority_classes"};
+    REQUIRE(features.size() == expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) CHECK(features[i].as_string() == expected[i]);
+    CHECK(llama.find("pins")->find("mode")->as_string() == "default");
+    options.pin_mode = srv::PinMode::override_request;
+    CHECK(det::health_features("llamaserver", options, {}).find("pins")->find("mode")->as_string() ==
+          "override");
+}
+
+TEST_CASE("serve help advertises thinking pin and budget flags") {
+    std::ostringstream out;
+    std::ostringstream err;
+    CHECK(srv::serve_main({"--help"}, out, err) == 0);
+    CHECK(out.str().find("--pin-mode override|default") != std::string::npos);
+    CHECK(out.str().find("--pin-reasoning-budget N") != std::string::npos);
+    CHECK(out.str().find("--pin-reasoning-budget-message TEXT") != std::string::npos);
 }

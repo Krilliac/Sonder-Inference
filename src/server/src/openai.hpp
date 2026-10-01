@@ -55,6 +55,8 @@ struct ChatJob {
     // to interactive and applies header values before these body values.
     std::optional<RequestPriority> priority_class;
     std::optional<std::uint64_t> deadline_ms;
+    std::optional<std::int64_t> reasoning_budget_tokens = std::nullopt;
+    std::optional<std::string> reasoning_budget_message = std::nullopt;
 };
 
 // Maps a request body to a ChatJob. Unknown top-level fields are ignored;
@@ -90,6 +92,7 @@ struct Correlation {
     std::optional<std::uint64_t> deadline_ms;
     // Explicit numeric zero also keeps the workload's legacy scheduler rank.
     bool numeric_priority = false;
+    std::optional<std::int64_t> reasoning_budget_tokens = std::nullopt;
 };
 
 // X-Sonder-Run-Id, -Parent-Request-Id, -Agent-Id, -Task-Id, -Workload,
@@ -114,7 +117,8 @@ ApiError map_session_failure(const Status& status, bool scheduler_rejected);
 // "stop" | "length" | "cancelled".
 const char* finish_reason(const GenerationResult& result) noexcept;
 // prompt/completion/total_tokens, plus prompt_tokens_details.cached_tokens
-// when the backend reported a cached-prompt count.
+// when the backend reported a cached-prompt count, and usage.sonder.timings
+// when raw llama-server timing fields are present. Existing cached counts win.
 json::Object usage_json(const GenerationResult& result);
 // prompt_n, predicted_n, total_ms, plus only measured values: ttft_ms,
 // prompt_ms, predicted_ms, prompt_per_second, predicted_per_second, and the

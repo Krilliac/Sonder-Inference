@@ -12,6 +12,7 @@ sonder_module_sources(
     slot_affinity.cpp
     supervisor.cpp
     supervisor_residency.cpp
+    timings.cpp
     tune.cpp
     tune_main.cpp
     tune_model.cpp

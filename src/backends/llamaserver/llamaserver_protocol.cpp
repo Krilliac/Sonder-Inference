@@ -103,8 +103,12 @@ json::Value build_chat_body(const std::string &model, const ChatRequest &request
     o.set("model", model);
     o.set("stream", true);
     json::Array messages;
-    for (const auto &m : request.messages)
-        messages.emplace_back(json::Object{{"role", m.role}, {"content", m.content}});
+    for (const auto &m : request.messages) {
+        json::Object message{{"role", m.role}, {"content", m.content}};
+        if (m.role == "assistant" && m.reasoning_content)
+            message.set("reasoning_content", *m.reasoning_content);
+        messages.emplace_back(std::move(message));
+    }
     o.set("messages", std::move(messages));
     o.set("stream_options", json::Object{{"include_usage", true}});
     put_sampling(o, request.sampling, false);
@@ -118,6 +122,10 @@ json::Value build_chat_body(const std::string &model, const ChatRequest &request
             kwargs.set("reasoning_effort", *request.thinking.reasoning_effort);
         o.set("chat_template_kwargs", std::move(kwargs));
     }
+    if (request.reasoning_budget_tokens)
+        o.set("reasoning_budget_tokens", *request.reasoning_budget_tokens);
+    if (request.reasoning_budget_message)
+        o.set("reasoning_budget_message", *request.reasoning_budget_message);
     put_extras(o, extras);
     return o;
 }
@@ -202,6 +210,12 @@ Status parse_timings(const json::Value &value, Timings &out) {
     if (!duration("prompt_ms", out.prompt_ns) || !duration("predicted_ms", out.eval_ns)) {
         return Status(ErrorCode::protocol_error, "llamaserver: invalid timing duration");
     }
+    BackendTimings raw;
+    if (auto status = parse_timings(value, raw); !status.ok())
+        return status;
+    if (raw.prompt_n || raw.cache_n || raw.prompt_ms || raw.predicted_n || raw.predicted_ms || raw.draft_n ||
+        raw.draft_n_accepted)
+        out.backend_timings = std::move(raw);
     return Status::success();
 }
 

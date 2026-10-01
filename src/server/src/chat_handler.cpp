@@ -13,6 +13,7 @@
 
 #include "anthropic.hpp"
 #include "request_path.hpp"
+#include "reasoning_budget.hpp"
 #include "test_hooks.hpp"
 
 namespace sonder::inference::server::detail {
@@ -33,7 +34,8 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     ro.session_key = chat_session_key(job, corr);
     ro.thinking = job.thinking;
     ro.separate_reasoning = anthropic;
-    const std::vector<std::string> warnings = apply_thinking_pins(ex.options, ro.thinking);
+    std::vector<std::string> warnings = apply_thinking_pins(ex.options, ro.thinking);
+    reasoning_budget::apply(job, corr, ex.options, backend, ro, warnings);
     ro.priority_class = priority;
     ro.preserve_numeric_priority = corr.numeric_priority;
     if (deadline_ms) ro.deadline = deadline;
@@ -229,6 +231,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
         return;
     }
     const GenerationResult& r = result.value();
+    if (r.text.empty() && std::string_view(finish_reason(r)) == "length") warnings.emplace_back("empty_content_at_length");
     json::Object meta{
         {"api_version", kApiVersion},  {"request_id", r.request_id},
         {"session_id", session->id()}, {"backend", backend},
