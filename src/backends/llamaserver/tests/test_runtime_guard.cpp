@@ -18,6 +18,7 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -122,6 +123,31 @@ std::filesystem::path temp_log(const char *tag) {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     return std::filesystem::temp_directory_path() /
            ("sonder-llamaserver-" + std::string(tag) + "-" + std::to_string(stamp) + ".log");
+}
+
+std::string fixture_text(const char *name) {
+    const auto relative = std::filesystem::path("src/backends/llamaserver/tests/fixtures") / name;
+    std::vector<std::filesystem::path> candidates{
+        std::filesystem::path(__FILE__).parent_path() / "fixtures" / name,
+        relative,
+    };
+    auto root = std::filesystem::current_path();
+    for (int i = 0; i < 6; ++i) {
+        candidates.push_back(root / relative);
+        if (root == root.root_path())
+            break;
+        root = root.parent_path();
+    }
+    for (const auto &path : candidates) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            continue;
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    }
+    REQUIRE_MESSAGE(false, "missing fixture: ", relative.string());
+    return {};
 }
 
 } // namespace
@@ -390,6 +416,72 @@ TEST_CASE("log parser reports CPU fallback and offload messages") {
     CHECK(detail_of(d.warnings()[1], "buffer_type") == "CUDA_Host");
     CHECK(d.warnings()[2].code == "no_gpu_device");
     CHECK(d.warnings()[3].code == "gpu_init_failed");
+}
+
+TEST_CASE("log diagnostics readiness reports blind verbosity and final option precedence") {
+    LogDiagnostics d;
+    d.ready({"--log-verbosity", "4", "-lv", "3"});
+    CHECK(d.offload_status() == "blind");
+    REQUIRE(d.warnings().size() == 1);
+    CHECK(d.warnings()[0].code == "diagnostics_blind");
+
+    d.ready({"--log-verbosity=3", "--log-verbosity", "4"});
+    CHECK(d.offload_status() == "pending");
+    CHECK(d.warnings().empty());
+    d.ready({"-lv", "4", "--log-verbosity", "invalid"});
+    CHECK(d.offload_status() == "blind");
+    REQUIRE(d.warnings().size() == 1);
+    CHECK(d.warnings()[0].code == "diagnostics_blind");
+}
+
+TEST_CASE("log diagnostics tracks partial and complete offload") {
+    LogDiagnostics d;
+    d.ready({"--log-verbosity=4"});
+    CHECK(d.offload_status() == "pending");
+    d.feed("load_tensors: offloaded 63/66 layers to GPU\n");
+    CHECK(d.offload_status() == "partial");
+    REQUIRE(d.warnings().size() == 1);
+    CHECK(d.warnings()[0].code == "partial_gpu_offload");
+    d.feed("load_tensors: offloaded 66/66 layers to GPU\n");
+    CHECK(d.offload_status() == "ok");
+    CHECK(d.warnings().size() == 1);
+
+    d.reset();
+    CHECK(d.offload_status() == "pending");
+    CHECK(d.warnings().empty());
+}
+
+TEST_CASE("real diagnostics fixtures classify lv3 as blind and lv4 offload as observable") {
+    LogDiagnostics blind;
+    blind.ready({"--log-verbosity", "3"});
+    blind.feed(fixture_text("llama-server.log.snapshot-1144.txt"));
+    CHECK(blind.offload_status() == "blind");
+    REQUIRE(blind.warnings().size() >= 1);
+    CHECK(std::any_of(blind.warnings().begin(), blind.warnings().end(), [](const auto &warning) {
+        return warning.code == "diagnostics_blind";
+    }));
+
+    LogDiagnostics visible;
+    visible.ready({"--log-verbosity", "4"});
+    visible.feed(fixture_text("ollama-27b-load-excerpt.txt"));
+    CHECK(visible.offload_status() == "ok");
+    CHECK(std::none_of(visible.warnings().begin(), visible.warnings().end(), [](const auto &warning) {
+        return warning.code == "partial_gpu_offload" || warning.code == "diagnostics_blind";
+    }));
+    // Keep the captured fixture exact; vary only the offload count to replay
+    // the requested 63/66 partial-offload arm with its real log prefix.
+    auto partial = fixture_text("ollama-27b-load-excerpt.txt");
+    const auto at = partial.find("offloaded 66/66");
+    REQUIRE(at != std::string::npos);
+    partial.replace(at, std::string("offloaded 66/66").size(), "offloaded 63/66");
+    visible.reset();
+    visible.feed(partial);
+    CHECK(visible.offload_status() == "partial");
+    CHECK(std::any_of(visible.warnings().begin(), visible.warnings().end(), [](const auto &warning) {
+        return warning.code == "partial_gpu_offload";
+    }));
+    visible.feed("load_tensors: offloaded 63/66 layers to GPU\n");
+    CHECK(visible.offload_status() == "partial");
 }
 
 TEST_CASE("log parser frames lines across chunks and bounds line length and warning count") {
@@ -684,8 +776,9 @@ TEST_CASE("supervisor appends --log-file and surfaces log warnings after readine
 
 // ------------------------------------------------------------ backend level
 
-TEST_CASE("backend runtime status: spawn reports, attach stays silent") {
+TEST_CASE("backend runtime status: spawn reports and generic attach stays silent") {
     LlamaServerBackendOptions attach;
+    attach.native_completion = false;
     CHECK_FALSE(make_llamaserver_backend(attach)->runtime_status().has_value());
 
     LlamaServerBackendOptions spawn;

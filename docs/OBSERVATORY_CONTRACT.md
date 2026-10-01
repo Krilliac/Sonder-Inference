@@ -134,3 +134,42 @@ Not emitted yet: `inference.prefill.started`, speculation, `context.*`,
 backend events. For the Ollama adapter, streamed chunks approximate tokens;
 authoritative counts come from the backend's final `eval_count`
 (`token_counts_from_backend: true`).
+
+## Additive native child observability
+
+The following v1 additions are optional and consumers must ignore them when
+absent. A native `llamaserver` backend may expose the child port, bounded
+`/metrics` and `/slots` samples, slot state, KV usage, and cumulative
+speculation counters in `backends[].runtime.child`. The corresponding
+`backend.metrics.sample` event reports one completed poll with `status` of
+`ok`, `error`, or `unavailable`; `backend.metrics.dropped` reports bounded
+queue drops. Polling uses a minimum five-second cadence, a 250 ms request
+budget, and a 1 MiB response bound. A 404 disables the endpoints for that
+child after one warning. These are process observations, not per-request
+deltas or measured request speed.
+
+Speculation totals include draft tokens, accepted tokens, drafts, and
+cumulative accepted counts by position. `mean_accepted_len` is accepted
+tokens divided by drafts; `acceptance_by_position` divides each position's
+accepted count by drafts. Both are nullable when the denominator is missing
+or zero. Positional fields are arrays indexed by the upstream position.
+`speedup_est` is the documented heuristic
+`(1 + mean_accepted_len) / (1 + 0.6 * n_max)`; `n_max` is read from explicit
+`--spec-draft-n-max`, and the estimate is `null` when it is unknown.
+
+The optional `stall_guard` defaults to enabled, 90 seconds, and `warn`.
+`backend.warning` may add `backend_stalled`, `metrics_unavailable`, or
+`diagnostics_blind`. A stall requires active processing and no movement in
+either cumulative token counter; health remains `ready` and records monotonic
+`detected_at`/`since_ms`. The `restart` policy uses the existing restart
+budget; attach mode warns only. `backend.restart` records
+`reason: "backend_stalled"` and the attempt number.
+
+Runtime diagnostics expose additive `diagnostics.offload` states
+`blind`/`pending`/`ok`/`partial`. Offload and CPU-buffer diagnostics require
+child `-lv 4` or higher. Backend request events may add
+`backend_cached_tokens`, `backend_draft_tokens`,
+`backend_draft_accepted_tokens`, `backend_draft_acceptance_ratio`, and
+`backend_predicted_tokens_per_second`; configured prefix warm-up may add the
+`backend.warmup` fields. Affinity outcome is deferred until the affinity lane
+is integrated.

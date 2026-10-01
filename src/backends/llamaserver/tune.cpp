@@ -1,6 +1,7 @@
 #include "tune.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iomanip>
 #include <set>
@@ -10,13 +11,16 @@ namespace sonder::inference::llamaserver::tune {
 namespace {
 Status invalid(const char *message) { return {ErrorCode::invalid_argument, message}; }
 bool eligible(const Measurement &m) {
+    const auto weighted = weighted_decode_tps(m.workloads);
     return m.phase == Phase::benchmark && m.verdict == Verdict::clean && m.memory_released &&
            !m.slow_kernel && m.dedicated_bytes && m.shared_bytes && m.short_tps && m.prefill_tps &&
            std::isfinite(*m.short_tps) && *m.short_tps > 0 && std::isfinite(*m.prefill_tps) &&
-           *m.prefill_tps > 0 && m.safety_probe_ctx >= m.candidate.ctx + kMargin;
+           *m.prefill_tps > 0 && m.safety_probe_ctx >= m.candidate.ctx + kMargin && weighted.has_value();
 }
 bool faster(const Measurement &a, const Measurement &b) {
-    if (a.short_tps != b.short_tps) return a.short_tps > b.short_tps;
+    const auto aw = weighted_decode_tps(a.workloads);
+    const auto bw = weighted_decode_tps(b.workloads);
+    if (aw && bw && *aw != *bw) return *aw > *bw;
     if (a.prefill_tps != b.prefill_tps) return a.prefill_tps > b.prefill_tps;
     if (a.candidate.ctx != b.candidate.ctx) return a.candidate.ctx > b.candidate.ctx;
     return a.candidate.mtp < b.candidate.mtp;
@@ -40,11 +44,26 @@ json::Value measurement_json(const Measurement &m) {
     const auto mib = [](const std::optional<std::uint64_t> &n) -> json::Value {
         return n ? json::Value(static_cast<double>(*n) / static_cast<double>(kMiB)) : json::Value{};
     };
+    json::Array workloads;
+    for (const auto &w : m.workloads) {
+        std::optional<double> acceptance;
+        if (w.draft_n && *w.draft_n != 0 && w.draft_n_accepted)
+            acceptance = static_cast<double>(*w.draft_n_accepted) / static_cast<double>(*w.draft_n);
+        workloads.emplace_back(json::Object{{"name", w.name}, {"weight", w.weight}, {"tok_s", w.tok_s},
+            {"draft_n", w.draft_n ? json::Value(*w.draft_n) : json::Value{}},
+            {"draft_n_accepted", w.draft_n_accepted ? json::Value(*w.draft_n_accepted) : json::Value{}},
+            {"acceptance_ratio", acceptance ? json::Value(*acceptance) : json::Value{}}});
+    }
+    const auto weighted = weighted_decode_tps(m.workloads);
     return json::Object{{"ctx", m.candidate.ctx}, {"k", m.candidate.kv.k}, {"v", m.candidate.kv.v},
         {"ubatch", m.candidate.ubatch}, {"mtp_n", m.candidate.mtp},
+        {"spec_type", m.candidate.mtp == 0 ? "none" : m.candidate.spec_type},
+        {"p_min", m.candidate.mtp == 0 ? json::Value{} : json::Value(m.candidate.p_min)},
         {"phase", m.phase == Phase::probe ? "probe" : "benchmark"},
         {"shared_mib", mib(m.shared_bytes)}, {"dedicated_mib", mib(m.dedicated_bytes)},
         {"short_tok_s", m.short_tps}, {"prefill_tok_s", m.prefill_tps},
+        {"weighted_tok_s", weighted ? json::Value(*weighted) : json::Value{}},
+        {"workloads", std::move(workloads)},
         {"long_prefill_tok_s", m.long_prefill_tps}, {"verdict", to_string(m.verdict)},
         {"slow_kernel", m.slow_kernel}, {"served_ctx", m.served_ctx},
         {"safety_probe_ctx", m.safety_probe_ctx}, {"memory_released", m.memory_released}, {"detail", m.detail}};
@@ -56,6 +75,20 @@ Grid::Grid() {
     spill_mtp.baseline_bytes = 166 * kMiB;
     spill_mtp.baseline_bytes_per_1k_ctx = 2 * kMiB;
     spill_mtp.threshold_bytes = 32 * kMiB;
+}
+std::optional<double> weighted_decode_tps(const std::vector<WorkloadMeasurement> &workloads) {
+    static const std::array<const char *, 4> names{"prose", "code_edit", "tool_json", "reasoning"};
+    static const std::array<double, 4> weights{0.4, 0.3, 0.2, 0.1};
+    if (workloads.size() != names.size()) return {};
+    double total = 0.0;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        const auto it = std::find_if(workloads.begin(), workloads.end(), [&](const auto &w) {
+            return w.name == names[i];
+        });
+        if (it == workloads.end() || it->weight != weights[i] || !std::isfinite(it->tok_s) || it->tok_s <= 0) return {};
+        total += weights[i] * it->tok_s;
+    }
+    return std::isfinite(total) ? std::optional<double>(total) : std::nullopt;
 }
 const SpillGuardOptions &spill_guard_for(const Grid &grid, const Candidate &candidate) {
     return candidate.mtp > 0 ? grid.spill_mtp : grid.spill;
@@ -96,8 +129,13 @@ Status validate_grid(const Grid &g) {
     if (g.kv.empty() || g.kv.size() > 8 || g.ctx.empty() || g.ctx.size() > 128 ||
         g.ubatch.empty() || g.ubatch.size() > 8 || g.mtp.empty() || g.mtp.size() > 4)
         return invalid("grid arrays are empty or exceed their bounds");
-    if (g.kv.size() * g.ctx.size() * g.ubatch.size() * g.mtp.size() > 4096)
-        return invalid("grid exceeds 4096 candidate combinations");
+    const auto base_count = g.kv.size() * g.ctx.size() * g.ubatch.size() * g.mtp.size();
+    if (base_count > 4096) return invalid("grid exceeds 4096 base candidate combinations");
+    if (g.spec_type.empty() || g.spec_type.size() > 4 || g.p_min.empty() || g.p_min.size() > 4)
+        return invalid("spec_type and p_min arrays are empty or exceed their bounds");
+    const auto spec_variants = g.spec_type.size() * g.p_min.size();
+    if (g.kv.size() * g.ctx.size() * g.ubatch.size() * (1 + (g.mtp.size() - 1) * spec_variants) > 16384)
+        return invalid("grid exceeds 16384 candidate combinations");
     if (g.batch == 0 || g.batch > 8192) return invalid("batch must be in [1, 8192]");
     const std::set<std::string> types{"q4_0", "q8_0", "q5_1", "f16", "bf16"};
     std::set<std::pair<std::string, std::string>> pairs;
@@ -118,6 +156,20 @@ Status validate_grid(const Grid &g) {
     for (auto n : g.mtp)
         if (n > 3 || !drafts.insert(n).second) return invalid("mtp must contain unique integers in [0, 3]");
     if (!drafts.contains(0)) return invalid("mtp must include 0 for the non-speculative baseline");
+    std::set<std::string> spec_types;
+    for (const auto &type : g.spec_type)
+        if ((type != "draft-mtp" && type != "draft-mtp,ngram-mod") || !spec_types.insert(type).second)
+            return invalid("spec_type must contain unique supported values");
+    std::set<double> pmins;
+    for (const auto p : g.p_min)
+        if (!std::isfinite(p) || p < 0 || p > 1 || !pmins.insert(p).second)
+            return invalid("p_min must contain unique values in [0, 1]");
+    const auto &p = g.profile;
+    if (p.parallel != 1 || p.cache_ram > 1048576 || p.ctx_checkpoints == 0 ||
+        p.ctx_checkpoints > 128 || p.checkpoint_min_step == 0 || p.checkpoint_min_step > 1048576 ||
+        !std::isfinite(p.min_p) || p.min_p < 0 || p.min_p > 1 ||
+        (p.reasoning_format != "deepseek" && p.reasoning_format != "none"))
+        return invalid("profile values are outside their bounds");
     return validate_spill_guard(g.spill);
 }
 Result<Grid> parse_grid(const json::Value &value) {
@@ -145,6 +197,39 @@ Result<Grid> parse_grid(const json::Value &value) {
                 if (key == "ubatch") grid.ubatch.push_back(static_cast<std::uint32_t>(n.as_uint()));
                 if (key == "mtp") grid.mtp.push_back(static_cast<std::uint32_t>(n.as_uint()));
             }
+        } else if (key == "spec_type" || key == "p_min") {
+            if (!item.is_array()) return invalid("spec_type and p_min must be arrays");
+            if (key == "spec_type") {
+                grid.spec_type.clear();
+                for (const auto &v : item.as_array()) {
+                    if (!v.is_string()) return invalid("spec_type entries must be strings");
+                    grid.spec_type.push_back(v.as_string());
+                }
+            } else {
+                grid.p_min.clear();
+                for (const auto &v : item.as_array()) {
+                    if (!v.is_number()) return invalid("p_min entries must be numbers");
+                    grid.p_min.push_back(v.as_double());
+                }
+            }
+        } else if (key == "profile") {
+            if (!item.is_object()) return invalid("profile must be an object");
+            for (const auto &[profile_key, profile_value] : item.as_object()) {
+                if (profile_key == "parallel" && profile_value.is_integer() && profile_value.as_int(-1) >= 0 && profile_value.as_uint() <= 1)
+                    grid.profile.parallel = static_cast<std::uint32_t>(profile_value.as_uint());
+                else if (profile_key == "no_kv_unified" && profile_value.is_bool()) grid.profile.no_kv_unified = profile_value.as_bool();
+                else if (profile_key == "cache_ram" && profile_value.is_integer() && profile_value.as_int(-1) >= 0 && profile_value.as_uint() <= 1048576)
+                    grid.profile.cache_ram = static_cast<std::uint32_t>(profile_value.as_uint());
+                else if (profile_key == "ctx_checkpoints" && profile_value.is_integer() && profile_value.as_int(-1) > 0 && profile_value.as_uint() <= 128)
+                    grid.profile.ctx_checkpoints = static_cast<std::uint32_t>(profile_value.as_uint());
+                else if (profile_key == "checkpoint_min_step" && profile_value.is_integer() && profile_value.as_int(-1) > 0 && profile_value.as_uint() <= 1048576)
+                    grid.profile.checkpoint_min_step = profile_value.as_uint();
+                else if (profile_key == "jinja" && profile_value.is_bool()) grid.profile.jinja = profile_value.as_bool();
+                else if (profile_key == "reasoning_format" && profile_value.is_string()) grid.profile.reasoning_format = profile_value.as_string();
+                else if (profile_key == "min_p" && profile_value.is_number()) grid.profile.min_p = profile_value.as_double();
+                else if (profile_key == "metrics" && profile_value.is_bool()) grid.profile.metrics = profile_value.as_bool();
+                else return invalid("unknown or invalid profile key");
+            }
         } else if (key == "batch" || key == "spill_threshold_mib" || key == "shared_baseline_mib") {
             if (!item.is_integer() || item.as_int(-1) < 0 || item.as_uint() > 1048576)
                 return invalid("grid scalar is not a bounded nonnegative integer");
@@ -161,20 +246,32 @@ std::vector<Candidate> planned_candidates(const Grid &grid, bool mtp_available) 
     for (const auto &kv : grid.kv)
         for (auto ctx : grid.ctx)
             for (auto ubatch : grid.ubatch)
-                for (auto mtp : grid.mtp)
-                    if (mtp == 0 || mtp_available) candidates.push_back({kv, ctx, ubatch, mtp});
+                for (auto mtp : grid.mtp) {
+                    if (mtp != 0 && !mtp_available) continue;
+                    if (mtp == 0) candidates.push_back({kv, ctx, ubatch, mtp});
+                    else for (const auto &type : grid.spec_type)
+                        for (const auto p : grid.p_min) candidates.push_back({kv, ctx, ubatch, mtp, type, p});
+                }
     return candidates;
 }
 std::vector<std::string> arguments(const Options &o, const Candidate &c) {
     std::vector<std::string> args{"--model", o.model, "--ctx-size", std::to_string(c.ctx),
         "--cache-type-k", c.kv.k, "--cache-type-v", c.kv.v, "--ubatch-size", std::to_string(c.ubatch),
-        "--batch-size", std::to_string(o.grid.batch), "--flash-attn", "on", "--parallel", "1",
+        "--batch-size", std::to_string(o.grid.batch), "--flash-attn", "on", "--parallel", std::to_string(o.grid.profile.parallel),
         "--n-gpu-layers", "999", "--fit", "off"};
+    args.emplace_back(o.grid.profile.no_kv_unified ? "--no-kv-unified" : "--kv-unified");
+    args.insert(args.end(), {"--cache-ram", std::to_string(o.grid.profile.cache_ram), "--ctx-checkpoints",
+        std::to_string(o.grid.profile.ctx_checkpoints), "--checkpoint-min-step", std::to_string(o.grid.profile.checkpoint_min_step)});
+    args.emplace_back(o.grid.profile.jinja ? "--jinja" : "--no-jinja");
+    args.insert(args.end(), {"--reasoning-format", o.grid.profile.reasoning_format});
+    args.insert(args.end(), {"--min-p", std::to_string(o.grid.profile.min_p)});
+    if (o.grid.profile.metrics) args.emplace_back("--metrics");
     if (!o.mmproj.empty()) args.insert(args.end(), {"--mmproj", o.mmproj});
     // Explicit none avoids inheriting a speculative default from the environment.
     // Older executables without --spec-type support use the ordinary default.
     if (c.mtp != 0)
-        args.insert(args.end(), {"--spec-type", "draft-mtp", "--spec-draft-n-max", std::to_string(c.mtp)});
+        args.insert(args.end(), {"--spec-type", c.spec_type, "--spec-draft-n-max", std::to_string(c.mtp),
+            "--spec-draft-p-min", std::to_string(c.p_min)});
     else if (o.spec_type_supported) args.insert(args.end(), {"--spec-type", "none"});
     return args;
 }
@@ -259,7 +356,18 @@ Report search(const Options &o, bool mtp_available, Deadline deadline, const Tri
                 for (auto c : leaders) {
                     c.ubatch = ubatch;
                     c.mtp = mtp;
-                    measure(c);
+                    if (mtp == 0) {
+                        c.spec_type = "draft-mtp";
+                        c.p_min = 0.0;
+                        measure(c);
+                    } else {
+                        for (const auto &spec_type : o.grid.spec_type)
+                            for (const auto p_min : o.grid.p_min) {
+                                c.spec_type = spec_type;
+                                c.p_min = p_min;
+                                measure(c);
+                            }
+                    }
                 }
     report.budget_exhausted = now() >= deadline || std::any_of(report.results.begin(), report.results.end(),
         [](const Measurement &m) { return m.verdict == Verdict::timed_out; });
@@ -305,14 +413,17 @@ std::string markdown(const Report &report) {
         const auto &m = report.results[*index];
         out << m.candidate.kv.k << '/' << m.candidate.kv.v << ", ctx " << m.candidate.ctx
             << ", ubatch " << m.candidate.ubatch << ", MTP " << m.candidate.mtp
-            << ", " << std::fixed << std::setprecision(1) << *m.short_tps << " decode tok/s.\n";
+            << ", spec_type " << (m.candidate.mtp == 0 ? "none" : m.candidate.spec_type);
+        if (m.candidate.mtp != 0) out << ", p_min " << m.candidate.p_min;
+        out << ", " << std::fixed << std::setprecision(1) << *weighted_decode_tps(m.workloads)
+            << " weighted decode tok/s.\n";
     };
     recommendation("Fast default (>=64k)", report.fast_default);
     recommendation("Long context", report.long_context);
     out << "\nRecommendations reserve 4096 tokens below a clean probe of the same profile.\n"
            "Fastest means fastest measured within this budget; the search is not exhaustive.\n\n"
-           "| Phase | K/V | ctx | ubatch | MTP | shared MiB | dedicated MiB | decode tok/s | prefill tok/s | Verdict |\n"
-           "|---|---|---:|---:|---:|---:|---:|---:|---:|---|\n";
+           "| Phase | K/V | ctx | ubatch | MTP | spec_type | p_min | shared MiB | dedicated MiB | weighted decode tok/s | prefill tok/s | Verdict |\n"
+           "|---|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---|\n";
     const auto number = [&](const auto &n, double divisor) {
         if (n) out << std::fixed << std::setprecision(1) << static_cast<double>(*n) / divisor;
         else out << "-";
@@ -320,10 +431,13 @@ std::string markdown(const Report &report) {
     for (const auto &m : report.results) {
         out << "| " << (m.phase == Phase::probe ? "probe" : "bench") << " | " << m.candidate.kv.k << '/'
             << m.candidate.kv.v << " | " << m.candidate.ctx << " | " << m.candidate.ubatch << " | "
-            << m.candidate.mtp << " | ";
+            << m.candidate.mtp << " | " << (m.candidate.mtp == 0 ? "none" : m.candidate.spec_type) << " | ";
+        if (m.candidate.mtp != 0) out << m.candidate.p_min;
+        else out << "-";
+        out << " | ";
         number(m.shared_bytes, static_cast<double>(kMiB)); out << " | ";
         number(m.dedicated_bytes, static_cast<double>(kMiB)); out << " | ";
-        number(m.short_tps, 1); out << " | "; number(m.prefill_tps, 1);
+        number(weighted_decode_tps(m.workloads), 1); out << " | "; number(m.prefill_tps, 1);
         out << " | " << to_string(m.verdict);
         if (m.slow_kernel && m.verdict != Verdict::slow_kernel) out << "; slow kernel";
         out << " |\n";

@@ -162,6 +162,9 @@ json::Object to_json(const BackendRuntimeStatus& status) {
                      {"context", std::move(context)},
                      {"warnings", std::move(warnings)}};
     if (status.warmup) out.set("warmup", to_json(*status.warmup));
+    if (status.child) out.set("child", *status.child);
+    if (status.stall) out.set("stall", *status.stall);
+    if (status.diagnostics) out.set("diagnostics", *status.diagnostics);
     return out;
 }
 

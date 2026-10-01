@@ -6,6 +6,7 @@
 #include "net/http_client.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <filesystem>
 #include <fstream>
@@ -89,6 +90,189 @@ Status workload(const Exchange &exchange, std::uint16_t port, const json::Array 
         !timings.completion_present || timings.completion_tokens != decode_size ||
         timings.cached_tokens != 0 || timings.prompt_ns == 0 || timings.eval_ns == 0)
         return {ErrorCode::protocol_error, "workload was truncated/cached or did not return complete positive timings"};
+    return {};
+}
+struct DecodeWorkload {
+    const char *name;
+    double weight;
+    std::string prompt;
+    std::uint32_t max_tokens;
+};
+std::array<DecodeWorkload, 4> decode_workloads() {
+    // A complete, fixed 120-line file. Keep real edit traffic (including the
+    // unchanged surroundings) instead of a repeated token sequence.
+    const std::string code = R"(from dataclasses import dataclass
+from decimal import Decimal
+from typing import Iterable
+
+
+@dataclass(frozen=True)
+class Product:
+    sku: str
+    name: str
+    price: Decimal
+    category: str
+
+
+@dataclass(frozen=True)
+class LineItem:
+    product: Product
+    quantity: int
+
+
+CATALOG = (
+    Product("A01", "Notebook", Decimal("4.50"), "paper"),
+    Product("A02", "Sketchbook", Decimal("8.25"), "paper"),
+    Product("A03", "Envelope pack", Decimal("3.00"), "paper"),
+    Product("A04", "Index cards", Decimal("2.75"), "paper"),
+    Product("A05", "Graph paper", Decimal("5.00"), "paper"),
+    Product("A06", "Writing pad", Decimal("3.40"), "paper"),
+    Product("B01", "Blue pen", Decimal("1.20"), "writing"),
+    Product("B02", "Black pen", Decimal("1.20"), "writing"),
+    Product("B03", "Red pen", Decimal("1.20"), "writing"),
+    Product("B04", "Pencil", Decimal("0.80"), "writing"),
+    Product("B05", "Marker", Decimal("2.30"), "writing"),
+    Product("B06", "Highlighter", Decimal("1.90"), "writing"),
+    Product("C01", "Ruler", Decimal("2.00"), "tools"),
+    Product("C02", "Eraser", Decimal("0.90"), "tools"),
+    Product("C03", "Sharpener", Decimal("1.50"), "tools"),
+    Product("C04", "Scissors", Decimal("4.80"), "tools"),
+    Product("C05", "Glue stick", Decimal("1.70"), "tools"),
+    Product("C06", "Tape", Decimal("2.60"), "tools"),
+    Product("D01", "Folder", Decimal("1.10"), "storage"),
+    Product("D02", "Binder", Decimal("3.80"), "storage"),
+    Product("D03", "Paper clips", Decimal("1.40"), "storage"),
+    Product("D04", "Document tray", Decimal("6.50"), "storage"),
+    Product("D05", "Archive box", Decimal("7.20"), "storage"),
+    Product("D06", "Label pack", Decimal("2.40"), "storage"),
+)
+
+
+def lookup_product(sku: str) -> Product:
+    for product in CATALOG:
+        if product.sku == sku:
+            return product
+    raise KeyError(sku)
+
+
+def line_subtotal(item: LineItem) -> Decimal:
+    if item.quantity < 0:
+        raise ValueError("quantity must be nonnegative")
+    return item.product.price * item.quantity
+
+
+def calculate_total(items: Iterable[LineItem]) -> Decimal:
+    total = Decimal("0.00")
+    for item in items:
+        total += line_subtotal(item)
+    return total.quantize(Decimal("0.01"))
+
+
+def apply_discount(amount: Decimal, percent: int) -> Decimal:
+    if not 0 <= percent <= 100:
+        raise ValueError("discount must be between zero and one hundred")
+    multiplier = Decimal(100 - percent) / Decimal(100)
+    return (amount * multiplier).quantize(Decimal("0.01"))
+
+
+def category_names() -> list[str]:
+    return sorted({product.category for product in CATALOG})
+
+
+def products_in_category(category: str) -> list[Product]:
+    return [product for product in CATALOG if product.category == category]
+
+
+def format_money(amount: Decimal) -> str:
+    return f"${amount:.2f}"
+
+
+def receipt_lines(items: list[LineItem]) -> list[str]:
+    lines = ["Stationery order", "---------------"]
+    for item in items:
+        amount = format_money(line_subtotal(item))
+        lines.append(f"{item.quantity} x {item.product.name}: {amount}")
+    lines.append(f"Total: {format_money(calculate_total(items))}")
+    return lines
+
+
+def create_order(entries: list[tuple[str, int]]) -> list[LineItem]:
+    result = []
+    for sku, quantity in entries:
+        if quantity <= 0:
+            raise ValueError("order quantities must be positive")
+        result.append(LineItem(lookup_product(sku), quantity))
+    return result
+
+
+def order_summary(items: list[LineItem], discount: int = 0) -> dict:
+    subtotal = calculate_total(items)
+    due = apply_discount(subtotal, discount)
+    return {"lines": len(items), "subtotal": subtotal, "due": due}
+
+
+def main() -> None:
+    order = create_order([("A01", 3), ("B01", 2), ("C02", 1)])
+    for line in receipt_lines(order):
+        print(line)
+    summary = order_summary(order, discount=10)
+    print(f"Discounted total: {format_money(summary['due'])}")
+
+
+if __name__ == "__main__":
+    main()
+)";
+    return {{
+        {"prose", 0.4, "Write a 200-token essay explaining how a town can conserve water during a dry summer. "
+            "Discuss household use, farms, and a practical tradeoff. Use connected prose with a conclusion.", 256},
+        {"code_edit", 0.3, "In this 120-line Python file, rename calculate_total to order_total, including every call. "
+            "Return the complete edited file, keeping all other behaviour unchanged.\n```python\n" + code + "```", 2048},
+        {"tool_json", 0.2, "You are taking one step in a coding agent loop. Task: rename calculate_total to order_total "
+            "in invoice.py and update its callers. You have not read the file yet. Available tools: "
+            "file_read(path: string), text_patch(path: string, old: string, new: string), test_run(path: string). "
+            "Choose the next action. Return only a JSON object with keys tool and arguments. "
+            "Do not invent file contents or claim that tests ran.", 256},
+        {"reasoning", 0.1, "A cyclist rides 18 kilometres to a village at 12 kilometres per hour, rests for 15 minutes, "
+            "then returns along the same route at 18 kilometres per hour. What is the average speed over the entire "
+            "trip, including the rest? Give a short calculation and the answer in kilometres per hour.", 256}
+    }};
+}
+Status decode_workload(const Exchange &exchange, std::uint16_t port, const DecodeWorkload &work,
+                       bool mtp, Deadline deadline, const CancellationToken &cancel, WorkloadMeasurement &out) {
+    const json::Value body = json::Object{
+        {"messages", json::Array{
+            json::Object{{"role", "system"}, {"content", "Follow the user's instructions and answer directly."}},
+            json::Object{{"role", "user"}, {"content", work.prompt}}}},
+        {"chat_template_kwargs", json::Object{{"enable_thinking", false}}},
+        {"max_tokens", work.max_tokens}, {"temperature", 0}, {"seed", 42},
+        {"cache_prompt", false}, {"stream", false}};
+    auto response = exchange(port, "POST", "/v1/chat/completions", body, deadline, cancel);
+    if (!response.ok()) return response.status();
+    const auto *choices = response.value().find("choices");
+    if (!choices || !choices->is_array() || choices->as_array().size() != 1)
+        return {ErrorCode::protocol_error, "chat workload did not return one choice"};
+    const auto &choice = choices->as_array().front();
+    const auto *message = choice.find("message");
+    const auto *content = message ? message->find("content") : nullptr;
+    const auto *finish = choice.find("finish_reason");
+    if (!content || !content->is_string() || content->as_string().find_first_not_of(" \t\r\n") == std::string::npos ||
+        !finish || (finish->as_string() != "stop" && finish->as_string() != "length"))
+        return {ErrorCode::protocol_error, "chat workload returned no usable text or finish reason"};
+    Timings timings;
+    if (auto status = parse_timings(response.value(), timings); !status.ok()) return status;
+    if (!timings.prompt_present || timings.prompt_tokens == 0 || !timings.completion_present ||
+        timings.completion_tokens == 0 || timings.completion_tokens > work.max_tokens ||
+        timings.cached_tokens != 0 || timings.prompt_ns == 0 || timings.eval_ns == 0)
+        return {ErrorCode::protocol_error, "chat workload was cached or did not return positive bounded timings"};
+    if (mtp && (!timings.draft_present || timings.draft_tokens == 0 || !timings.draft_accepted_present))
+        return {ErrorCode::protocol_error, "MTP requested but draft activity and acceptance were not measured"};
+    if (!mtp && (timings.draft_tokens != 0 || timings.draft_accepted_tokens != 0))
+        return {ErrorCode::protocol_error, "baseline unexpectedly used speculative decoding"};
+    out.name = work.name;
+    out.weight = work.weight;
+    out.tok_s = static_cast<double>(timings.completion_tokens) * 1e9 / static_cast<double>(timings.eval_ns);
+    if (timings.draft_present) out.draft_n = timings.draft_tokens;
+    if (timings.draft_accepted_present) out.draft_n_accepted = timings.draft_accepted_tokens;
     return {};
 }
 } // namespace
@@ -208,12 +392,12 @@ Measurement run_candidate(const Options &o, const Candidate &candidate, Phase ph
             if (status.ok() && (parsed.n_ctx != candidate.ctx || parsed.total_slots != 1))
                 status = {ErrorCode::protocol_error, "/props did not confirm the requested context and single slot"};
             if (status.ok()) ready.store(true);
-            // Tokenize once, then repeat the valid token IDs to exact lengths.
-            // This avoids pretending that 8k characters are 8k tokens.
+            // Exact-token prefill probes qualify memory, independently of the
+            // natural chat decode suite. They never contribute to decode rank.
             json::Array pattern;
             if (status.ok()) {
                 auto tokens = exchange(port, "POST", "/tokenize", json::Object{
-                    {"content", "Explain how a careful engineer measures memory and checks results. The sun rises over a quiet river."},
+                    {"content", "Calibration prefill measures allocated context and memory usage."},
                     {"add_special", false}}, deadline, token);
                 if (!tokens.ok()) status = tokens.status();
                 else {
@@ -230,14 +414,20 @@ Measurement run_candidate(const Options &o, const Candidate &candidate, Phase ph
             }
             Timings timings;
             if (status.ok() && phase == Phase::benchmark) {
-                status = workload(exchange, port, pattern, 128, 256, deadline, token, timings);
-                if (status.ok()) {
-                    result.short_tps = static_cast<double>(timings.completion_tokens) * 1e9 / static_cast<double>(timings.eval_ns);
-                    if (candidate.mtp != 0 && (!timings.draft_present || timings.draft_tokens == 0))
-                        status = {ErrorCode::protocol_error, "MTP requested but no draft tokens were measured"};
-                    if (candidate.mtp == 0 && timings.draft_tokens != 0)
-                        status = {ErrorCode::protocol_error, "baseline unexpectedly used speculative decoding"};
+                for (const auto &work : decode_workloads()) {
+                    if (token.cancelled() || d.interrupted() || Clock::now() >= deadline) {
+                        status = {ErrorCode::cancelled, "decode suite cancelled before the next class"};
+                        break;
+                    }
+                    WorkloadMeasurement measured;
+                    status = decode_workload(exchange, port, work, candidate.mtp != 0, deadline, token, measured);
+                    if (!status.ok()) {
+                        status = {status.code(), std::string(work.name) + ": " + status.message()};
+                        break;
+                    }
+                    result.workloads.push_back(std::move(measured));
                 }
+                if (status.ok()) result.short_tps = weighted_decode_tps(result.workloads);
             }
             if (status.ok()) {
                 status = workload(exchange, port, pattern, 8192, 1, deadline, token, timings);

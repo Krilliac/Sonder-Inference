@@ -57,7 +57,7 @@ itself.
 | `--max-connections N` | `64` | A warning is printed when it plus 32 exceeds the open-file limit (`ulimit -n`). |
 | `--max-body-bytes N` | `4194304` | |
 | `--shutdown-grace-ms N` | `5000` | |
-| `--ready-file PATH` | none | Written atomically once the socket **listens** (models may still be loading: poll health for 200): `{"url","pid","instance_id","api_version":1}`. Removed when `serve` returns, after a failed start as well as after a clean shutdown. A process killed outright (second signal, SIGKILL) leaves it behind: check that `pid` is alive. |
+| `--ready-file PATH` | none | Written atomically once the socket **listens** (models may still be loading: poll health for 200): `{"url","pid","instance_id","api_version":1}`. Removed when `serve` returns, after a failed start as well as after a clean shutdown. A process killed outright (second signal, SIGKILL) leaves it behind: check that `pid` is alive. On Windows the rename can leave a handle with delete access on the file for a few milliseconds after it appears (longer under CPU load), so a reader that opens it without `FILE_SHARE_DELETE` (the C runtime and `std::ifstream` default) may get a sharing violation on its first attempt: retry the open. |
 | `--mock-delay-ms N` | `0` | Mock per-token delay. |
 | `--lazy-models` | off | Register the models at startup and load each on its first request (see [Model residency](#model-residency)). |
 | `--model-idle-ttl S` | `0` (never) | Unload a model no request has used for `S` seconds (0 to 2592000); the next request loads it again. |

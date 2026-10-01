@@ -73,6 +73,10 @@ Status validate_options(const LlamaServerBackendOptions &options) {
     }
     if (options.context_length > (std::uint64_t{1} << 32))
         return {ErrorCode::invalid_argument, "llamaserver: context_length must be at most 4294967296"};
+    if (options.stall_guard.stall_seconds < std::chrono::seconds(1) ||
+        options.stall_guard.stall_seconds > std::chrono::hours(24) ||
+        (options.stall_guard.policy != "warn" && options.stall_guard.policy != "restart"))
+        return {ErrorCode::invalid_argument, "llamaserver: invalid stall_guard options"};
     if (options.mode == LlamaServerMode::spawn) {
         if (options.executable.empty() || options.executable.find('\0') != std::string::npos) {
             return {ErrorCode::invalid_argument, "llamaserver: spawn needs an executable path"};
@@ -202,14 +206,38 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             s.log_file = options_.diagnostics.log_file;
             s.kv_pairing_check = options_.diagnostics.kv_pairing_check;
             s.warmup = warmup_;
+            s.native_completion = options_.native_completion;
+            s.stall_guard.enabled = options_.stall_guard.enabled;
+            s.stall_guard.stall_seconds = options_.stall_guard.stall_seconds;
+            s.stall_guard.policy = options_.stall_guard.policy;
             supervisor_ = std::make_unique<llamaserver::Supervisor>(std::move(s));
         }
         if (validation_.ok() && warmup_ && options_.mode == LlamaServerMode::attach)
             warmup_->start(options_.base_url, true);
+        if (validation_.ok() && options_.native_completion && options_.mode == LlamaServerMode::attach) {
+            // prepare preserves the validated URL and all existing TLS policy.
+            const auto request = prepare("GET", "", {}, {});
+            if (request.ok()) {
+                llamaserver::SupervisorOptions s;
+                s.attached_endpoint = request.value();
+                s.arguments = options_.args;
+                s.spill_guard.enabled = false;
+                s.spill_guard.sample_interval = options_.spill_guard.sample_interval;
+                s.kv_pairing_check = false;
+                s.stall_guard.enabled = options_.stall_guard.enabled;
+                s.stall_guard.stall_seconds = options_.stall_guard.stall_seconds;
+                s.stall_guard.policy = options_.stall_guard.policy;
+                attached_monitor_ = std::make_unique<llamaserver::Supervisor>(std::move(s));
+                // Observer startup failure remains diagnostic, never changes requests.
+                (void)attached_monitor_->start();
+            }
+        }
     }
     ~LlamaServerBackendImpl() override {
         if (supervisor_)
             supervisor_->stop();
+        if (attached_monitor_)
+            attached_monitor_->stop();
         if (warmup_)
             warmup_->stop();
     }
@@ -272,12 +300,13 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         return slot_action(slot, filename, "restore");
     }
     const LlamaServerBackendOptions &options() const { return options_; }
-    // Spawn mode contributes child diagnostics; attach mode contributes only
-    // configured warm-up status, preserving nullopt when warm-up is disabled.
+    // Native attach observes the upstream without owning its process. Generic
+    // OpenAI attach stays silent unless prefix warm-up was configured.
     std::optional<BackendRuntimeStatus> runtime_status() const override {
-        if (!supervisor_ && !warmup_)
+        if (!supervisor_ && !attached_monitor_ && !warmup_)
             return std::nullopt;
-        auto status = supervisor_ ? supervisor_->runtime_status() : BackendRuntimeStatus{};
+        auto status = supervisor_ ? supervisor_->runtime_status() :
+                      attached_monitor_ ? attached_monitor_->runtime_status() : BackendRuntimeStatus{};
         if (warmup_) {
             status.warmup = warmup_->status();
             const auto warnings = warmup_->warnings();
@@ -446,6 +475,7 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
     LlamaServerBackendOptions options_;
     Status validation_;
     std::unique_ptr<llamaserver::Supervisor> supervisor_;
+    std::unique_ptr<llamaserver::Supervisor> attached_monitor_;
     mutable std::mutex props_mutex_;
     bool props_fetched_ = false;
     std::string props_key_;

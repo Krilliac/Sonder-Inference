@@ -2,6 +2,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <iosfwd>
 #include <optional>
@@ -29,7 +30,24 @@ struct Grid {
     std::vector<std::uint64_t> ctx;
     std::vector<std::uint32_t> ubatch{512, 1024, 2048};
     std::vector<std::uint32_t> mtp{0, 1, 2, 3};
+    // Speculation variants are applied only to MTP rows.  The baseline (mtp=0)
+    // is emitted once and never multiplied by these axes.
+    std::vector<std::string> spec_type{"draft-mtp", "draft-mtp,ngram-mod"};
+    std::vector<double> p_min{0.0, 0.5};
     std::uint32_t batch = 2048;
+    struct Profile {
+        // Calibration requires one llama-server slot; generated profiles may
+        // be edited later, but any such change requires revalidation.
+        std::uint32_t parallel = 1;
+        bool no_kv_unified = true;
+        std::uint32_t cache_ram = 2048;
+        std::uint32_t ctx_checkpoints = 8;
+        std::uint64_t checkpoint_min_step = 8192;
+        bool jinja = true;
+        std::string reasoning_format = "deepseek";
+        double min_p = 0.0;
+        bool metrics = true;
+    } profile;
     // Spill rule for candidates without speculation.
     SpillGuardOptions spill;
     // Spill rule for MTP candidates (mtp > 0): MTP raises the clean shared
@@ -55,6 +73,8 @@ struct Candidate {
     std::uint64_t ctx = 0;
     std::uint32_t ubatch = 512;
     std::uint32_t mtp = 0;
+    std::string spec_type = "draft-mtp";
+    double p_min = 0.0;
     bool operator==(const Candidate &) const = default;
 };
 // The spill rule that applies to `candidate` (spill_mtp when it speculates).
@@ -62,6 +82,19 @@ const SpillGuardOptions &spill_guard_for(const Grid &grid, const Candidate &cand
 enum class Phase { probe, benchmark };
 enum class Verdict { clean, spill, slow_kernel, error, unsupported, timed_out, cancelled, release_failed };
 const char *to_string(Verdict verdict);
+
+struct WorkloadMeasurement {
+    std::string name;
+    double weight = 0.0;
+    double tok_s = 0.0;
+    std::optional<std::uint64_t> draft_n;
+    std::optional<std::uint64_t> draft_n_accepted;
+};
+
+// Returns the fixed .4/.3/.2/.1 weighted decode rate when exactly the four
+// natural workload classes are present and valid.  Missing or invalid classes
+// make the candidate ineligible for recommendation.
+std::optional<double> weighted_decode_tps(const std::vector<WorkloadMeasurement> &workloads);
 
 struct Measurement {
     Candidate candidate;
@@ -72,6 +105,7 @@ struct Measurement {
     std::optional<double> short_tps;
     std::optional<double> prefill_tps;
     std::optional<double> long_prefill_tps;
+    std::vector<WorkloadMeasurement> workloads;
     std::uint64_t served_ctx = 0;
     std::uint64_t safety_probe_ctx = 0;
     bool memory_released = false;
