@@ -103,6 +103,12 @@ constexpr std::string_view kDiskWriteFlags[] = {
     "--log-file", "--log-prompts-dir", "-lcd", "--lookup-cache-dynamic",
 };
 
+// llama-server flags that move model work to other machines: `--rpc
+// HOST:PORT,...` registers remote rpc-server devices, and layers placed on
+// them send their tensors and every request's activations over the network.
+// A shared profile must not route prompts off this host.
+constexpr std::string_view kRemoteOffloadFlags[] = {"--rpc"};
+
 // llama-server's built-in model presets (`--gpt-oss-20b-default`,
 // `--fim-qwen-7b-spec`, `--spec-default`, ...). Each one swaps in its own model
 // and settings, overriding the typed fields, and most "can download weights
@@ -138,6 +144,13 @@ Status check_extra_args(const LaunchProfile& p) {
                 return bad(where_of(p), "extra_args must not contain " + std::string(flag) +
                                             " (a launch profile cannot make llama-server write logs or prompts to "
                                             "disk)");
+            }
+        }
+        for (auto f : kRemoteOffloadFlags) {
+            if (flag == f) {
+                return bad(where_of(p), "extra_args must not contain " + std::string(flag) +
+                                            " (a launch profile cannot offload model work, and the activations "
+                                            "that carry each prompt, to remote RPC servers)");
             }
         }
         for (auto f : kUnsafeFeatureFlags) {
@@ -495,35 +508,6 @@ Result<std::vector<std::string>> llamaserver_arguments(const LaunchProfile& p) {
     return a;
 }
 
-namespace {
-
-template <class S>
-Status apply_context_fields(const LaunchProfile& p, S& setup) {
-    if constexpr (detail::has_llamacpp_context_fields<S>) {
-        if (p.batch_size) setup.llamacpp_batch_size = *p.batch_size;
-        if (p.ubatch_size) setup.llamacpp_ubatch_size = *p.ubatch_size;
-        if (p.cache_type_k) setup.llamacpp_kv_cache_type_k = *p.cache_type_k;
-        if (p.cache_type_v) setup.llamacpp_kv_cache_type_v = *p.cache_type_v;
-        if (p.flash_attn) setup.llamacpp_flash_attention = *p.flash_attn;
-        return {};
-    } else {
-        (void)setup;
-        for (const auto& [set, field] : {std::pair{p.batch_size.has_value(), "batch_size"},
-                                         std::pair{p.ubatch_size.has_value(), "ubatch_size"},
-                                         std::pair{p.cache_type_k.has_value(), "cache_type_k"},
-                                         std::pair{p.cache_type_v.has_value(), "cache_type_v"},
-                                         std::pair{p.flash_attn.has_value(), "flash_attn"}}) {
-            if (set) {
-                return bad(where_of(p), std::string("'") + field +
-                                            "' is not supported by the llamacpp backend; use llamaserver");
-            }
-        }
-        return {};
-    }
-}
-
-}  // namespace
-
 Status apply_llamacpp_profile(const LaunchProfile& p, BackendSetup& setup, std::string& device) {
     if (Status st = validate_launch_profile(p); !st.ok()) return st;
     if (p.backend != kLaunchProfileBackendLlamaCpp) return bad(where_of(p), "backend is not llamacpp");
@@ -550,7 +534,14 @@ Status apply_llamacpp_profile(const LaunchProfile& p, BackendSetup& setup, std::
         return bad(where_of(p), "'ctx_size' above 4194304 is not supported by the llamacpp backend; use llamaserver");
     }
     BackendSetup next = setup;
-    if (Status st = apply_context_fields(p, next); !st.ok()) return st;
+    // Same option names and values as serve's --batch-size, --ubatch-size,
+    // --cache-type-k/-v and --flash-attn; validate_options() checks them
+    // with validate_llamacpp_options() in builds that have the backend.
+    if (p.batch_size) next.llamacpp_batch_size = *p.batch_size;
+    if (p.ubatch_size) next.llamacpp_ubatch_size = *p.ubatch_size;
+    if (p.cache_type_k) next.llamacpp_kv_cache_type_k = *p.cache_type_k;
+    if (p.cache_type_v) next.llamacpp_kv_cache_type_v = *p.cache_type_v;
+    if (p.flash_attn) next.llamacpp_flash_attention = *p.flash_attn;
     if (p.ctx_size) next.llamacpp_context_length = *p.ctx_size;
     std::string next_device = device;
     if (p.n_gpu_layers) {

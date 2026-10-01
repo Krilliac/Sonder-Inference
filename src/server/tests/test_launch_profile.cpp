@@ -4,14 +4,18 @@
 // profile metadata in /v1/models (plus unchanged behaviour without profiles).
 #include <doctest/doctest.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "server_test_support.hpp"
@@ -219,6 +223,19 @@ TEST_CASE("launch profile: extra_args refuse model presets and prompt/log files"
     CHECK(ok.extra_args.size() == 4u);
 }
 
+TEST_CASE("launch profile: extra_args refuse remote RPC offload") {
+    const auto with = [](const std::string& arg) {
+        return R"({"name":"p","backend":"llamaserver","model":"m.gguf","extra_args":[)" + arg + "]}";
+    };
+    // --rpc registers rpc-server devices on other hosts; layers placed there
+    // send tensors and every prompt's activations over the network.
+    for (const char* remote : {R"("--rpc","10.0.0.5:50052")", R"("--rpc=192.168.1.2:50052,192.168.1.3:50052")"}) {
+        CAPTURE(remote);
+        CHECK(contains(parse_error(with(remote)), "extra_args must not contain --rpc"));
+        CHECK(contains(parse_error(with(remote)), "remote RPC servers"));
+    }
+}
+
 TEST_CASE("launch profile: file-level validation") {
     const auto error = [](const std::string& text) {
         auto doc = json::parse(text);
@@ -363,31 +380,38 @@ TEST_CASE("launch profile llamacpp: fields the direct backend cannot honour are 
 TEST_CASE("launch profile llamacpp: KV cache types and flash attention and batch use the backend's option names") {
     const LaunchProfile p = parse_single(
         R"({"name":"d","backend":"llamacpp","model":"m.gguf","batch_size":1024,"ubatch_size":256,
-            "cache_type_k":"q8_0","cache_type_v":"q8_0","flash_attn":"on"})");
+            "cache_type_k":"q8_0","cache_type_v":"q5_1","flash_attn":"enabled"})");
     si::BackendSetup setup;
     std::string device;
-    const si::Status st = si::apply_llamacpp_profile(p, setup, device);
-    if constexpr (si::kLlamaCppContextOptionsAvailable) {
-        // The llamacpp backend's own fields (kv_cache_type_k/_v,
-        // flash_attention, batch/ubatch) carry the values unchanged.
-        REQUIRE(st.ok());
-    } else {
-        REQUIRE_FALSE(st.ok());
-        CHECK(contains(st.message(), "'batch_size' is not supported by the llamacpp backend; use llamaserver"));
-        for (const char* field : {"ubatch_size", "cache_type_k", "cache_type_v", "flash_attn"}) {
-            CAPTURE(field);
-            const LaunchProfile one =
-                parse_single(std::string(R"({"name":"d","backend":"llamacpp","model":"m.gguf",")") + field +
-                             (std::string(field) == "ubatch_size" ? R"(":256})"
-                              : std::string(field) == "flash_attn" ? R"(":"on"})"
-                                                                    : R"(":"q8_0"})"));
-            si::BackendSetup s;
-            std::string d;
-            const si::Status one_st = si::apply_llamacpp_profile(one, s, d);
-            REQUIRE_FALSE(one_st.ok());
-            CHECK(contains(one_st.message(), std::string("'") + field + "' is not supported by the llamacpp backend"));
-        }
-    }
+    REQUIRE(si::apply_llamacpp_profile(p, setup, device).ok());
+    // The values land in the BackendSetup fields serve's --batch-size,
+    // --ubatch-size, --cache-type-k/-v and --flash-attn set (#45), unchanged
+    // except that flash_attn is canonical (enabled -> on).
+    CHECK(setup.llamacpp_batch_size == 1024u);
+    CHECK(setup.llamacpp_ubatch_size == 256u);
+    CHECK(setup.llamacpp_kv_cache_type_k == std::string("q8_0"));
+    CHECK(setup.llamacpp_kv_cache_type_v == std::string("q5_1"));
+    CHECK(setup.llamacpp_flash_attention == std::string("on"));
+    CHECK(device.empty());  // no n_gpu_layers: the device is left alone
+
+    // Fields the profile leaves unset keep the backend defaults (and any
+    // value already in the setup).
+    const LaunchProfile minimal = parse_single(R"({"name":"d","backend":"llamacpp","model":"m.gguf"})");
+    si::BackendSetup untouched;
+    untouched.llamacpp_batch_size = 2048u;
+    REQUIRE(si::apply_llamacpp_profile(minimal, untouched, device).ok());
+    CHECK(untouched.llamacpp_batch_size == 2048u);
+    CHECK_FALSE(untouched.llamacpp_ubatch_size.has_value());
+    CHECK_FALSE(untouched.llamacpp_kv_cache_type_k.has_value());
+    CHECK_FALSE(untouched.llamacpp_kv_cache_type_v.has_value());
+    CHECK_FALSE(untouched.llamacpp_flash_attention.has_value());
+
+    // A rejected profile applies nothing, these fields included.
+    const LaunchProfile rejected = parse_single(
+        R"({"name":"d","backend":"llamacpp","model":"m.gguf","cache_type_k":"q8_0","parallel":2})");
+    si::BackendSetup clean;
+    CHECK_FALSE(si::apply_llamacpp_profile(rejected, clean, device).ok());
+    CHECK_FALSE(clean.llamacpp_kv_cache_type_k.has_value());
 }
 
 // ------------------------------------------------------------- sampling defaults
@@ -716,6 +740,78 @@ TEST_CASE("VRAM estimate: parallel sequences and unified KV and MTP and partial 
     CHECK(si::estimate_vram(m, f16).kv_bytes_per_token == 16u * 4 * 256 * 4);
 }
 
+TEST_CASE("VRAM estimate: speculative rollback keeps one recurrent snapshot per draft position") {
+    const si::GgufModelInfo m = qwen38_q3();
+    LaunchProfile p = parse_single(kMeasuredProfile);
+    const si::VramEstimate plain = si::estimate_vram(m, p);
+    // One snapshot: 48 delta-net layers x 817,152 f32 values = 149.6 MiB.
+    CHECK(plain.recurrent_snapshots == 1u);
+    CHECK(plain.recurrent_bytes == 48ull * 817152 * 4);
+    for (const std::uint32_t n : {1u, 2u, 3u}) {
+        CAPTURE(n);
+        p.speculative = si::SpeculativeSettings{{"draft-mtp"}, n, ""};
+        const si::VramEstimate e = si::estimate_vram(m, p);
+        CHECK(e.recurrent_snapshots == 1u + n);
+        CHECK(e.recurrent_bytes == (1u + n) * plain.recurrent_bytes);
+        CHECK(e.total_bytes == e.weights_bytes + e.kv_bytes + e.recurrent_bytes + e.compute_bytes);
+    }
+    // Unset draft_n_max: llama.cpp's default of 3.
+    p.speculative = si::SpeculativeSettings{{"draft-mtp"}, std::nullopt, ""};
+    CHECK(si::estimate_vram(m, p).recurrent_snapshots == 4u);
+    // Per sequence: parallel 2 with n_max 2 keeps 2 x 3 states.
+    p.speculative = si::SpeculativeSettings{{"draft-mtp", "ngram-mod"}, 2, ""};
+    p.parallel = 2;
+    CHECK(si::estimate_vram(m, p).recurrent_bytes == 6 * plain.recurrent_bytes);
+    p.parallel = 1;
+    // N-gram drafts re-decode on a miss instead of rolling back: one state.
+    p.speculative = si::SpeculativeSettings{{"ngram-mod"}, 3, ""};
+    CHECK(si::estimate_vram(m, p).recurrent_snapshots == 1u);
+    CHECK(si::estimate_vram(m, p).recurrent_bytes == plain.recurrent_bytes);
+    // llama.cpp clamps the snapshots to none on architectures it cannot roll back.
+    si::GgufModelInfo other = m;
+    other.architecture = "qwen3next";
+    p.speculative = si::SpeculativeSettings{{"draft-mtp"}, 2, ""};
+    CHECK(si::estimate_vram(other, p).recurrent_snapshots == 1u);
+}
+
+TEST_CASE("VRAM estimate: the live MTP profile against the measured dedicated memory") {
+    // stack/llamaserver-switch/llamaserver.default.json as a profile: Q3_K_XL,
+    // q4_0/q4_0, draft-mtp n_max 2, parallel 1, ubatch 512, fit off.
+    const auto profile = [](std::uint32_t ctx, std::optional<std::uint32_t> n_max) {
+        LaunchProfile p = parse_single(R"({
+            "name": "qwen3.8-27b-q3-mtp", "backend": "llamaserver", "model": "q3.gguf",
+            "n_gpu_layers": 999, "ctx_size": 65536, "parallel": 1, "kv_unified": false,
+            "batch_size": 2048, "ubatch_size": 512, "flash_attn": "on",
+            "cache_type_k": "q4_0", "cache_type_v": "q4_0", "fit": false})");
+        p.ctx_size = ctx;
+        if (n_max) p.speculative = si::SpeculativeSettings{{"draft-mtp"}, *n_max, ""};
+        return p;
+    };
+    const si::VramEstimate live = si::estimate_vram(qwen38_q3(), profile(65536u, 2u));
+    CHECK(live.gpu_layers == 65u);        // the MTP block loads
+    CHECK(live.attention_layers == 17u);  // 16 + the MTP block's attention
+    CHECK(live.kv_bytes == 17ull * 1152 * 65536);
+    CHECK(live.recurrent_snapshots == 3u);
+    CHECK(live.recurrent_bytes == 3ull * 48 * 817152 * 4);
+    // Dedicated memory at load on the RTX 5070 Ti (bench-round3, llama-server
+    // 161755f29). Each +1 of n_max costs one 150 MiB recurrent snapshot;
+    // without that term the MTP rows were 2.2 to 4.2 % low.
+    struct Measured {
+        std::uint32_t ctx;
+        std::optional<std::uint32_t> n_max;
+        double mib;
+    };
+    for (const Measured& point : {Measured{65536u, std::nullopt, 13604.0}, Measured{65536u, 1u, 14478.0},
+                                  Measured{65536u, 2u, 14628.0}, Measured{65536u, 3u, 14778.0},
+                                  Measured{32768u, 2u, 13762.0}}) {
+        const si::VramEstimate e = si::estimate_vram(qwen38_q3(), profile(point.ctx, point.n_max));
+        const double error = (static_cast<double>(e.total_mib()) - point.mib) / point.mib;
+        MESSAGE("ctx " << point.ctx << ", n_max " << (point.n_max ? static_cast<int>(*point.n_max) : 0) << ": estimate "
+                       << e.total_mib() << " MiB vs " << point.mib << " MiB measured: " << error * 100.0 << " %");
+        CHECK(std::fabs(error) < 0.02);
+    }
+}
+
 TEST_CASE("VRAM estimate: attention-only models count every layer and ctx 0 uses the training context") {
     si::GgufModelInfo m;
     m.architecture = "llama";
@@ -897,7 +993,15 @@ TEST_CASE("models: launch profile metadata is additive and sampling defaults rea
     const auto& profiles = doc.find("sonder")->find("profiles")->as_array();
     REQUIRE(profiles.size() == 1);
     CHECK(profiles[0].find("served")->as_bool());
-    CHECK(doc.find("sonder")->find("api_version")->as_int() == 1);
+    // `profiles` is added next to the fields every /v1/models response has:
+    // api_version and the bound backend's features and pins.
+    const json::Value* meta = doc.find("sonder");
+    CHECK(meta->find("api_version")->as_int() == 1);
+    REQUIRE(meta->find("features") != nullptr);
+    CHECK(meta->find("features")->is_array());
+    REQUIRE(meta->find("pins") != nullptr);
+    CHECK(meta->find("pins")->find("mode")->as_string() == "override");
+    CHECK(meta->as_object().size() == 4u);  // api_version, features, pins, profiles
 
     // No sampling fields: the profile's defaults are sent as explicit values.
     REQUIRE(post(f.port, "/v1/chat/completions", model_chat("qwen-profile")).status == 200);
@@ -924,6 +1028,89 @@ TEST_CASE("models: launch profile metadata is additive and sampling defaults rea
     CHECK_FALSE(plain.is_explicit(si::SamplingConfig::kTemperature));
     CHECK_FALSE(plain.is_explicit(si::SamplingConfig::kTopK));
     CHECK(plain.top_k == si::SamplingConfig{}.top_k);
+}
+
+namespace {
+
+// Residency state of `id` in /v1/sonder/health ("missing" when absent).
+std::string served_model_state(std::uint16_t port, const std::string& id) {
+    const json::Value health = get(port, "/v1/sonder/health").json();
+    for (const auto& m : health.find("models")->as_array()) {
+        if (m.find("id")->as_string() == id) return m.find("state")->as_string();
+    }
+    return "missing";
+}
+
+// One launch-profile model ("qwen-profile", loaded as "mock:weights.gguf")
+// with the measured profile's sampling defaults.
+srv::ServerOptions profile_model_options(const std::shared_ptr<RecordingBackend>& backend) {
+    auto o = Fixture::defaults();
+    o.backend.backend.clear();
+    o.backend_instance = backend;
+    o.models = {"qwen-profile"};
+    srv::ModelProfileBinding binding;
+    binding.model = "qwen-profile";
+    binding.load_name = "mock:weights.gguf";
+    binding.sampling_defaults = parse_single(kMeasuredProfile).sampling;
+    o.profile_bindings.push_back(binding);
+    return o;
+}
+
+}  // namespace
+
+TEST_CASE("models: a lazy launch profile model loads under its load name, and reloads so after an idle eviction") {
+    auto backend = std::make_shared<RecordingBackend>();
+    auto o = profile_model_options(backend);
+    o.lazy_models = true;
+    o.model_idle_ttl = std::chrono::milliseconds(150);
+    Fixture f(o);
+    {
+        std::lock_guard<std::mutex> lock(backend->log->mu);
+        CHECK(backend->log->loads.empty());  // lazy: nothing loads at start
+    }
+    // "qwen-profile" is not a mock model name: a load under the served id
+    // fails (404), so a 200 proves the residency loader used the load name.
+    REQUIRE(post(f.port, "/v1/chat/completions", model_chat("qwen-profile")).status == 200);
+    REQUIRE(eventually([&] { return served_model_state(f.port, "qwen-profile") == "unloaded"; }));
+    REQUIRE(post(f.port, "/v1/chat/completions", model_chat("default")).status == 200);
+    {
+        std::lock_guard<std::mutex> lock(backend->log->mu);
+        CHECK(backend->log->loads == std::vector<std::string>{"mock:weights.gguf", "mock:weights.gguf"});
+        // The reloaded model still gets the profile's defaults ("default"
+        // resolves to the served id before the binding is looked up).
+        REQUIRE(backend->log->sampling.size() == 2);
+        CHECK(backend->log->sampling[1].top_k == 20);
+        CHECK(backend->log->sampling[1].is_explicit(si::SamplingConfig::kTopK));
+    }
+    const json::Value health = get(f.port, "/v1/sonder/health").json();
+    CHECK(health.find("residency")->find("loads")->as_int() == 2);
+    CHECK(health.find("residency")->find("load_failures")->as_int() == 0);
+}
+
+TEST_CASE("messages: launch profile sampling defaults reach the backend through /v1/messages too") {
+    auto backend = std::make_shared<RecordingBackend>();
+    Fixture f(profile_model_options(backend));
+    const std::string hello = R"("messages":[{"role":"user","content":"hello"}]})";
+    REQUIRE(post(f.port, "/v1/messages", R"({"model":"qwen-profile","max_tokens":8,)" + hello).status == 200);
+    // The caller's own value still wins.
+    REQUIRE(post(f.port, "/v1/messages", R"({"model":"qwen-profile","max_tokens":8,"temperature":0.3,)" + hello)
+                .status == 200);
+    std::lock_guard<std::mutex> lock(backend->log->mu);
+    REQUIRE(backend->log->sampling.size() == 2);
+    const si::SamplingConfig& d = backend->log->sampling[0];
+    CHECK(d.temperature == doctest::Approx(1.0));
+    CHECK(d.top_p == doctest::Approx(0.95));
+    CHECK(d.top_k == 20);
+    CHECK(d.min_p == doctest::Approx(0.0));
+    CHECK(d.is_explicit(si::SamplingConfig::kTemperature));
+    CHECK(d.is_explicit(si::SamplingConfig::kTopP));
+    CHECK(d.is_explicit(si::SamplingConfig::kTopK));
+    CHECK(d.is_explicit(si::SamplingConfig::kMinP));
+    CHECK_FALSE(d.is_explicit(si::SamplingConfig::kPresencePenalty));
+    CHECK(d.max_tokens == 8);
+    const si::SamplingConfig& c = backend->log->sampling[1];
+    CHECK(c.temperature == doctest::Approx(0.3));
+    CHECK(c.top_k == 20);
 }
 
 TEST_CASE("launch profile metadata: endpoint vs upstream capabilities") {
@@ -1119,4 +1306,30 @@ TEST_CASE("serve_main: launch profile usage errors exit 2 before starting anythi
     std::filesystem::remove(model);
     std::filesystem::remove(profiles);
     std::filesystem::remove(bad);
+}
+
+TEST_CASE("serve_main: --profile refuses the llama.cpp context flags its typed fields own") {
+    const auto model = write_temp("model.gguf", hybrid_fixture());
+    const std::string m = model.generic_string();
+    const auto profiles = write_temp("profiles.json", R"({"profiles":[
+        {"name":"server","backend":"llamaserver","model":")" + m + R"(","ctx_size":512},
+        {"name":"direct","backend":"llamacpp","model":")" + m + R"(","ctx_size":512}]})");
+    const std::string pf = profiles.string();
+    std::string err;
+    for (const char* name : {"server", "direct"}) {
+        for (const auto& [flag, value] : std::vector<std::pair<std::string, std::string>>{{"--batch-size", "1024"},
+                                                                                          {"--ubatch-size", "256"},
+                                                                                          {"--cache-type-k", "q8_0"},
+                                                                                          {"--cache-type-v", "q8_0"},
+                                                                                          {"--flash-attn", "on"}}) {
+            CAPTURE(name);
+            CAPTURE(flag);
+            // `--max-connections 0` is a later usage error, so a missing
+            // check exits with another message instead of serving.
+            CHECK(serve({"--profiles", pf, "--profile", name, flag, value, "--max-connections", "0"}, err) == 2);
+            CHECK(contains(err, flag + " conflicts with --profile (set the profile's typed fields)"));
+        }
+    }
+    std::filesystem::remove(model);
+    std::filesystem::remove(profiles);
 }

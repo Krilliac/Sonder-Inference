@@ -169,15 +169,13 @@ to about 1 tok/s at 72k. For long context, keep Q3_K_XL at 100k.
 | `extra_args` | appended verbatim | rejected | see below |
 | `vram_budget_mib` | | | fit-check budget, MiB |
 
-\* The llamacpp column uses the option names and values of the direct
-backend's KV cache lane (`feat/kv-cache-types-flash-attn-ubatch`:
-`LlamaCppBackendOptions::kv_cache_type_k/_v`, `flash_attention`,
-`ubatch_size`, and `BackendSetup::llamacpp_*`). Until that lane is merged,
-`BackendSetup` has no such fields, and a llamacpp profile that sets them is
-rejected with the "not supported by the llamacpp backend" error. The check
-is a compile-time test for the fields
-(`kLlamaCppContextOptionsAvailable`), so the mapping switches on by itself
-when they appear.
+\* The llamacpp column uses the direct backend's own option names and values
+(`LlamaCppBackendOptions::batch_size`, `ubatch_size`, `kv_cache_type_k/_v`,
+`flash_attention`). A profile sets the same `BackendSetup::llamacpp_*` fields
+as `serve`'s `--batch-size`, `--ubatch-size`, `--cache-type-k`,
+`--cache-type-v` and `--flash-attn` ([KV cache types](../PLACEMENT.md)), and
+`validate_llamacpp_options` checks them the same way in builds with the
+llama.cpp backend.
 
 Rules checked at load time (`invalid_argument`, before anything starts):
 
@@ -202,7 +200,8 @@ Rules checked at load time (`invalid_argument`, before anything starts):
   and settings and can download weights), `--log-file`,
   `--log-prompts-dir` and `-lcd`/`--lookup-cache-dynamic` (a shared profile
   must not record prompts to disk; `--slot-save-path` stays allowed, see
-  llama-server.md),
+  llama-server.md), `--rpc` (it offloads layers to rpc-server instances on
+  other hosts, which then receive every prompt's activations),
   or `--models-dir`/`--models-preset`. They may not
   turn on llama-server's agent tools, MCP or local file serving either:
   `--tools` (which includes `exec_shell_command` and `write_file`),
@@ -218,10 +217,16 @@ Rules checked at load time (`invalid_argument`, before anything starts):
 
 With `--profile`, `serve` also refuses `--backend` or `--model` values that
 differ from the profile, `--gpu-layers`, `--context-length`,
+`--batch-size`, `--ubatch-size`, `--cache-type-k`, `--cache-type-v`,
+`--flash-attn` (the profile's typed fields set them),
 `--llamaserver-arg`, `--llamaserver-url`, attach mode, and `args` in a
 `--llamaserver-config` file. Everything else, such as the executable,
 timeouts, restart policy, TLS, `--device`, `--moe-experts` and
-`--tensor-override`, is taken from the usual options.
+`--tensor-override`, is taken from the usual options. Without a profile,
+those five llama.cpp flags apply to `--backend llamacpp` only: any other
+backend exits with status 2 and
+`option --X applies only to --backend llamacpp; for llamaserver set it in the JSON args`
+instead of running without them.
 
 ## Default sampling
 
@@ -261,7 +266,14 @@ and compares it with a budget:
   `full_attention_interval`, using the architecture classification in `model_architecture.hpp`.
 - **recurrent state** = for each GPU block without attention in a hybrid or
   recurrent model: ((conv_kernel − 1) × (inner + 2 × groups × state) +
-  inner × state) × 4 bytes × `parallel`.
+  inner × state) × 4 bytes × `parallel` × snapshots. Snapshots is 1, or
+  1 + `speculative.draft_n_max` (llama.cpp's default 3 when unset) when
+  `speculative.types` has `draft-mtp`, `draft-eagle3`, `draft-dflash` or
+  `draft-dspark`: llama.cpp then keeps one recurrent state per draft position
+  so that it can roll a rejected draft back (`n_rs_seq`), on the
+  architectures it supports that for (qwen35, qwen35moe, qwen4exp,
+  deepseek4, nemotron_h, nemotron_h_moe, bailingmoe3, lfm2, lfm2moe,
+  kimi-k3; others clamp it to 1).
 - **compute** = n_vocab × ubatch × 4 (logits) + 4 × n_embd × ubatch × 4 +
   256 MiB runtime allowance.
 
@@ -310,14 +322,39 @@ treat the estimate as a lower bound near the limit. With
 `vram_budget_mib: 15600`, the check accepts IQ4_XS at 65,536 and refuses it
 at 73,728 and above.
 
+**MTP.** The live default (`stack/llamaserver-switch/llamaserver.default.json`
+as a profile: Q3_K_XL, q4_0/q4_0, `draft-mtp` with `draft_n_max` 2,
+`parallel` 1, ubatch 512, `fit` off) against dedicated memory at load from
+the round-3 benchmark (same card and llama-server build):
+
+| ctx | `draft_n_max` | estimate | measured | error |
+|---|---|---|---|---|
+| 65,536 | no MTP | 13,754 MiB | 13,604 MiB | +1.1 % |
+| 65,536 | 1 | 14,311 MiB | 14,478 MiB | −1.2 % |
+| 65,536 | 2 (the live profile) | 14,460 MiB | 14,628 MiB | −1.1 % |
+| 65,536 | 3 | 14,610 MiB | 14,778 MiB | −1.1 % |
+| 32,768 | 2 | 13,848 MiB | 13,762 MiB | +0.6 % |
+
+The live profile's 14,460 MiB is weights 12,006 (64 blocks, output, and the
+335 MiB MTP block), KV 1,224 (17 attention layers × 1,152 B/token × 65,536),
+recurrent 449 (3 snapshots of 149.6 MiB) and compute 781. Each +1 of
+`draft_n_max` measured +150 MiB, one recurrent snapshot. Before the estimate
+counted snapshots it was 2.2 to 4.2 % low on the MTP rows. The rest of the
+gap grows with the context: from 32,768 to 65,536 the measured footprint
+grew 866 MiB, the estimate 612 MiB. The likely cause (not yet confirmed
+from a load log) is the MTP draft context's compute buffer, which grows with
+the context and which the estimate does not include; its notes say so.
+Extrapolating that slope, the estimate is about 2 % low near the MTP clean
+edge (81,920), so the lower-bound advice above applies with MTP too.
+
 The known limits:
 
 - MLA (DeepSeek-style) and sliding-window attention are counted as full
   attention, which overestimates.
 - Placement flags in `extra_args` (`-ot`, `--cpu-moe`, `--tensor-split`,
   and so on) are not modelled. The estimate says so.
-- Vision encoder compute buffers and a draft model's KV cache are not
-  included.
+- Vision encoder compute buffers, a draft model's KV cache and the MTP draft
+  context's compute buffer are not included.
 - Windows does not fail an overcommitted allocation under `--fit off`. It
   spills into shared memory and runs 2 to 15 times slower. That is why the
   check refuses by default.
@@ -326,8 +363,10 @@ The known limits:
 
 The served model's entry gains `sonder.profile`, and the list gains
 `sonder.profiles` with every profile of the file (`served` marks the active
-one). All existing fields are unchanged, and without `--profile` neither
-field appears.
+one). All existing fields are unchanged (`api_version`, and the bound
+backend's `features` and `pins`), and without `--profile` neither field
+appears. Both are additive: Sonder Runtime's tier routing reads them, and
+clients that do not know them can ignore them.
 
 ```json
 {"object":"list","data":[{"id":"qwen3.8-27b-q3-100k","object":"model","owned_by":"sonder-inference",
@@ -336,8 +375,18 @@ field appears.
       "cache_type_k":"q8_0","cache_type_v":"q5_1","flash_attn":"on",
       "capabilities":[],"upstream_capabilities":["tools"],
       "estimated_vram_mib":15437,"vram_budget_mib":15600,"served":true}}}],
- "sonder":{"api_version":1,"profiles":[{"name":"qwen3.8-27b-q3-100k","...":"...","served":true}]}}
+ "sonder":{"api_version":1,"features":["thinking","..."],"pins":{"mode":"override"},
+   "profiles":[{"name":"qwen3.8-27b-q3-100k","...":"...","served":true}]}}
 ```
+
+The profile object's fields: `name`, `backend`, `context_length` (null for
+the model's training context), `parallel` (null when unset), `cache_type_k`,
+`cache_type_v`, `flash_attn`, `capabilities`, `upstream_capabilities`,
+`speculative_types` (only with speculative types other than `none`),
+`estimated_vram_mib` and `vram_budget_mib` (null when unknown),
+`estimate_error` (only when the estimate failed), `served`, and
+`configured_context_length` (only when the running context differs, see
+below).
 
 `capabilities` lists only what a request to this Sonder endpoint can use:
 `speculative` when speculative types other than `none` are set (it is
@@ -441,11 +490,17 @@ little conversion cost at 8k, and did not measure it at long prompts.
   prompt cache (`cache_ram_mib`, default 8,192 MiB). The measured profile
   keeps 4 checkpoints at least 8,192 tokens apart within a 4 GiB cache. That
   was enough to reuse 89,785 of about 90k prompt tokens in 1.0 s.
-- **MTP on 16 GB.** Qwen3.8's MTP block adds a 335 MiB block plus its KV
-  layer. On this card, MTP pushed 7 to 11 % of the layers out of VRAM. In
-  Ollama it was slower: 46 → 23 tok/s at n = 3. Keep `speculative` unset on
-  16 GB unless a smaller context frees the room. The fit check counts the
-  MTP block only when `draft-mtp` is set.
+- **MTP on 16 GB.** Through llama-server directly (`draft-mtp`), MTP is the
+  faster setup on this card: the round-3 benchmark measured 86.8 tok/s short
+  decode at `draft_n_max` 2 against 49.6 without it (Q3_K_XL, q4_0/q4_0,
+  65,536), and 61 tok/s at 68k depth. It costs VRAM: the 335 MiB MTP block,
+  its KV layer, one 149.6 MiB recurrent snapshot per draft position, and a
+  draft context that grows with the context (dedicated 13,604 MiB without
+  MTP, 14,628 MiB at `draft_n_max` 2). Its clean context edge on this card
+  was about 81,920 against 139,264 without MTP. (The earlier advice to leave
+  MTP off came from Ollama's runner, where it pushed layers out of VRAM and
+  halved the speed.) The fit check counts the MTP block, its KV and the
+  snapshots only when `draft-mtp` is set; see [VRAM fit check](#vram-fit-check).
 - **`fit: false`** makes the configuration exact and reproducible. It also
   lets Windows spill silently. Keep the budget honest, or leave `fit` on and
   `n_gpu_layers` unset to let llama-server shrink the offload itself.
@@ -476,18 +531,25 @@ next step (see the roadmap).
 `sonder.server.*` in CTest covers the following, with no model, GPU or
 llama-server needed:
 
-- schema parsing and every validation rule
+- schema parsing and every validation rule, including the `extra_args`
+  refusals (`--rpc` among them)
 - argv golden tests (the measured profile and one that sets every toggle)
-- direct-backend mapping and each rejection
+- direct-backend mapping (the values reaching `BackendSetup`) and each
+  rejection
 - the GGUF reader on synthetic headers (hybrid by tensors and by interval,
   per-layer head counts, truncation)
 - estimator arithmetic, including the hybrid rule, parallel and unified KV,
-  MTP and partial offload
-- sampling defaults reaching the backend
-- the additive `/v1/models` fields, and their absence without a profile
+  MTP, recurrent snapshots for speculative rollback, partial offload, and
+  the measured 100k and MTP profiles
+- sampling defaults reaching the backend through `/v1/chat/completions` and
+  `/v1/messages`, also for a lazily loaded model and after an idle eviction
+  reloads it (under the profile's load name)
+- the additive `/v1/models` fields next to `api_version`, `features` and
+  `pins`, and their absence without a profile
 - endpoint vs upstream capabilities, and a context reduced at run time
   (`auto_fit`) replacing `context_length` next to the backend's `runtime`
-- `serve` refusals
+- `serve` refusals, including the llama.cpp context flags next to
+  `--profile`
 
 Set `SONDER_TEST_GGUF` to a GGUF file, or to a copy of its header, to print
 the estimate for a real model.

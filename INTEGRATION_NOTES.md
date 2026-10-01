@@ -190,20 +190,34 @@ merging, because the dispatch now exists:
 Everything lives in the server module (`src/server`); see
 [docs/integration/launch-profiles.md](docs/integration/launch-profiles.md).
 
-- **KV-cache lane interplay** (`feat/kv-cache-types-flash-attn-ubatch`). A
-  llamacpp profile's `batch_size`, `ubatch_size`, `cache_type_k`,
-  `cache_type_v` and `flash_attn` map onto that lane's `BackendSetup` fields
-  (`llamacpp_batch_size`, `llamacpp_ubatch_size`, `llamacpp_kv_cache_type_k`,
-  `llamacpp_kv_cache_type_v`, `llamacpp_flash_attention`) with the same value
-  names. This branch does not add those fields; a C++20 `requires` check
-  (`kLlamaCppContextOptionsAvailable` in `launch_profile.hpp`) enables the
-  mapping when they exist and otherwise rejects the fields with "not
-  supported by the llamacpp backend; use llamaserver". Either merge order
-  compiles without conflict; the direct-backend test follows the flag.
+- **KV-cache options (#45).** A llamacpp profile's `batch_size`,
+  `ubatch_size`, `cache_type_k`, `cache_type_v` and `flash_attn` set #45's
+  `BackendSetup` fields (`llamacpp_batch_size`, `llamacpp_ubatch_size`,
+  `llamacpp_kv_cache_type_k`, `llamacpp_kv_cache_type_v`,
+  `llamacpp_flash_attention`) with the same value names; the compile-time
+  switch that waited for those fields is gone now that they exist. With
+  `--profile`, `serve` refuses #45's five flags (the profile's typed fields
+  own them). Without a profile, the five flags now apply to `--backend
+  llamacpp` only: any other backend exits 2 with "option --X applies only to
+  --backend llamacpp; for llamaserver set it in the JSON args" instead of
+  ignoring them (the GPU lane's finding; default llamacpp behaviour is
+  unchanged).
+- **Model residency (#43).** The per-model binding (load name, sampling
+  defaults, `/v1/models` metadata) is looked up from
+  `ServerOptions::profile_bindings` by served id. `load_served_model()` uses
+  the load name, so eager, lazy and post-eviction loads all load a llamacpp
+  profile's GGUF path; sampling defaults apply after the residency resolves
+  `default` to the served id, for `/v1/chat/completions` and `/v1/messages`.
 - `threads`/`threads_batch` are rejected for llamacpp profiles although
   `LlamaCppBackendOptions::threads` exists, because `BackendSetup` has no
-  field for it and adding one here would collide with the KV-cache lane's
-  rewrite of `make_backend`. A follow-up can plumb it.
+  field for it. A follow-up can plumb it.
+- **Overlap with `sonder-infer tune` (#44/#51).** tune writes a spawn config
+  (`tuned.json` with raw `args`) and has its own GGUF header reader
+  (`tune_model.cpp`); launch profiles are a typed schema with their own
+  reader and a fit check. Key names differ (tune's `no_kv_unified` vs
+  `kv_unified`, `cache_ram` vs `cache_ram_mib`), and a tuned config's `args`
+  cannot be combined with `--profile` (it refuses config `args`). Unifying
+  the two readers or schemas is an owner decision, not done here.
 - `ServerOptions` gains `profile_bindings` and `profile_catalog` (additive;
   empty keeps every code path unchanged). `/v1/models` gains
   `data[].sonder.profile` and `sonder.profiles` only when a profile is served.

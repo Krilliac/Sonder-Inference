@@ -71,8 +71,9 @@ Gate: measurable win on agent fan-out/long-context workloads without interactive
 - [x] typed per-model [launch profiles](integration/launch-profiles.md): one
   JSON schema drives llama-server argv and the direct llamacpp backend
   (unsupported fields rejected), default sampling per model, `/v1/models`
-  profile metadata, and a GGUF-header VRAM fit check (hybrid-aware KV; +1.1 %
-  vs the measured Qwen3.8-27B Q3_K_XL 100k profile) that refuses overcommit
+  profile metadata, and a GGUF-header VRAM fit check (hybrid-aware KV and
+  MTP recurrent snapshots; +1.1 % vs the measured Qwen3.8-27B Q3_K_XL 100k
+  profile, −1.1 % vs the live 65k MTP profile) that refuses overcommit
 - [ ] several launch profiles behind one `serve` (today one profile per
   instance) and Runtime tier routing across them
 - [ ] per-model placement planner from GGUF metadata (`docs/PLACEMENT.md` step 2;

@@ -93,6 +93,13 @@ Rules, checked at startup (`invalid_argument`, before any model file is read):
 - **`--ubatch-size` must not exceed `--batch-size`.**
 - Unknown type or mode names are rejected (case-insensitive; `on`/`enabled`
   and `off`/`disabled` are synonyms).
+- **These five flags apply to `--backend llamacpp` only.** Any other backend
+  would run without them, so `serve` exits with status 2 and
+  `option --X applies only to --backend llamacpp; for llamaserver set it in the JSON args`.
+  A spawned llama-server takes `--cache-type-k` and the rest in its
+  `--llamaserver-config` `args`, or from a
+  [launch profile](integration/launch-profiles.md)'s typed fields; with
+  `--profile` the five flags are refused because the profile sets them.
 
 Some limits depend on the model and are left to llama.cpp, which then fails
 the load: MLA models (DeepSeek-style) need identical K and V types, a

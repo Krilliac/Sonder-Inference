@@ -93,8 +93,9 @@ struct LaunchProfile {
     SamplingDefaults sampling;
 
     // Further llama-server arguments, passed verbatim after the typed ones.
-    // Host, port, API-key, download and argument-list-terminator flags are
-    // refused, as are flags that duplicate a typed field above.
+    // Host, port, API-key, download, model-preset, prompt/log-file, agent
+    // tool, remote RPC and argument-list-terminator flags are refused, as are
+    // flags that duplicate a typed field above (validate_launch_profile).
     std::vector<std::string> extra_args;
 
     // VRAM budget for the fit check; unset = --vram-budget-mib, else the
@@ -134,27 +135,14 @@ const LaunchProfile* find_launch_profile(const std::vector<LaunchProfile>& profi
 // Sampling defaults are not arguments: Sonder applies them per request.
 Result<std::vector<std::string>> llamaserver_arguments(const LaunchProfile& profile);
 
-// Maps a llamacpp profile onto `setup` (context length, GPU layers, and the
-// KV cache / flash attention / batch options when the build's BackendSetup
-// carries them). Returns invalid_argument for any field the direct backend
-// cannot honour. `device` is serve's --device: a profile that offloads layers
-// sets "gpu:0" when it is empty and refuses a cpu device.
+// Maps a llamacpp profile onto `setup`: context length, GPU layers, batch and
+// micro-batch sizes, K and V cache types and flash attention (the
+// BackendSetup::llamacpp_* fields `serve`'s --batch-size, --ubatch-size,
+// --cache-type-k/-v and --flash-attn set, with the same value names). Nothing
+// is applied on error. Returns invalid_argument for any field the direct
+// backend cannot honour. `device` is serve's --device: a profile that offloads
+// layers sets "gpu:0" when it is empty and refuses a cpu device.
 Status apply_llamacpp_profile(const LaunchProfile& profile, BackendSetup& setup, std::string& device);
-
-// True when BackendSetup has the llamacpp KV cache type, flash attention and
-// batch fields (branch feat/kv-cache-types-flash-attn-ubatch). Until then a
-// llamacpp profile that sets them is rejected.
-namespace detail {
-template <class S>
-constexpr bool has_llamacpp_context_fields = requires(S s) {
-    s.llamacpp_batch_size;
-    s.llamacpp_ubatch_size;
-    s.llamacpp_kv_cache_type_k;
-    s.llamacpp_kv_cache_type_v;
-    s.llamacpp_flash_attention;
-};
-}  // namespace detail
-inline constexpr bool kLlamaCppContextOptionsAvailable = detail::has_llamacpp_context_fields<BackendSetup>;
 
 // Sets every default the request did not set explicitly and marks it
 // explicit. Caller-set fields are never changed.
@@ -198,7 +186,7 @@ std::string redact_model_path(const Status& error, const std::string& path);
 struct VramEstimate {
     std::uint64_t weights_bytes = 0;    // offloaded blocks (+ output) + mmproj/draft when offloaded
     std::uint64_t kv_bytes = 0;         // attention layers on the GPU x context_per_sequence x sequences
-    std::uint64_t recurrent_bytes = 0;  // recurrent state of GPU blocks x sequences
+    std::uint64_t recurrent_bytes = 0;  // recurrent state of GPU blocks x parallel x recurrent_snapshots
     std::uint64_t compute_bytes = 0;    // compute buffers and runtime allowance
     std::uint64_t total_bytes = 0;
     std::uint32_t gpu_layers = 0;
@@ -207,6 +195,9 @@ struct VramEstimate {
     std::uint64_t context = 0;               // total context (--ctx-size, padded to 256)
     std::uint64_t context_per_sequence = 0;  // context when unified; else pad(context / sequences, 256)
     std::uint32_t sequences = 1;
+    // Recurrent states kept per sequence: 1, or 1 + --spec-draft-n-max
+    // (default 3) when draft-mtp/eagle3/dflash/dspark roll the state back.
+    std::uint32_t recurrent_snapshots = 1;
     std::vector<std::string> notes;  // what the estimate does not cover
 
     [[nodiscard]] std::uint64_t total_mib() const noexcept { return (total_bytes + (1u << 20) - 1) >> 20; }
@@ -227,6 +218,11 @@ struct VramEstimateInputs {
 //            kv_unified gives one pool of ctx (sequences 1); otherwise
 //            sequences = parallel and ctx_seq = pad(ctx / parallel, 256),
 //            as llama.cpp splits --ctx-size across the per-sequence streams
+//   recurrent  for each GPU block without attention in a hybrid or
+//            recurrent model: state values x 4 bytes x parallel x
+//            recurrent_snapshots (1 + --spec-draft-n-max when draft-mtp,
+//            draft-eagle3, draft-dflash or draft-dspark roll the state back
+//            on an architecture llama.cpp supports that for)
 //   compute  n_vocab x ubatch x 4 (logits) + 4 x n_embd x ubatch x 4
 //            + 256 MiB runtime allowance
 // ctx 0 or unset uses <arch>.context_length. Hybrid models count only their

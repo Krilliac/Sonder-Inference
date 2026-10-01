@@ -37,6 +37,33 @@ constexpr std::uint64_t kMiB = 1ull << 20;
 
 Status malformed(const std::string& what) { return Status(ErrorCode::invalid_argument, "GGUF header: " + what); }
 
+// Speculative decoding that rolls back recurrent state keeps one state
+// snapshot per draft position: llama.cpp allocates max(1, n_seq_max) x
+// (1 + n_rs_seq) recurrent rows per layer, with n_rs_seq = --spec-draft-n-max
+// for these types (common_params_speculative::need_n_rs_seq), clamped to 0 on
+// architectures without recurrent rollback (llm_arch_supports_rs_rollback;
+// llama-memory-recurrent.cpp; llama.cpp source at 7fe450e). On the bundled
+// llama-server (161755f29) each +1 of --spec-draft-n-max measured +150 MiB
+// with Qwen3.8-27B, whose snapshot is 149.6 MiB.
+constexpr std::string_view kRollbackSpeculativeTypes[] = {"draft-mtp", "draft-eagle3", "draft-dflash", "draft-dspark"};
+constexpr std::string_view kRecurrentRollbackArchitectures[] = {
+    "qwen35", "qwen35moe", "qwen4exp", "deepseek4", "nemotron_h", "nemotron_h_moe", "bailingmoe3", "lfm2", "lfm2moe",
+    "kimi-k3"};
+constexpr std::uint32_t kDefaultDraftNMax = 3;  // llama.cpp common_params_speculative_draft::n_max
+
+// n_rs_seq for `profile` on `model`: the extra recurrent snapshots per sequence.
+std::uint32_t recurrent_rollback_snapshots(const GgufModelInfo& model, const LaunchProfile& profile) {
+    if (!profile.speculative) return 0;
+    const auto& types = profile.speculative->types;
+    const bool rolls_back = std::any_of(types.begin(), types.end(), [](const std::string& t) {
+        return std::find(std::begin(kRollbackSpeculativeTypes), std::end(kRollbackSpeculativeTypes), t) !=
+               std::end(kRollbackSpeculativeTypes);
+    });
+    const bool supported = std::find(std::begin(kRecurrentRollbackArchitectures), std::end(kRecurrentRollbackArchitectures),
+                                     model.architecture) != std::end(kRecurrentRollbackArchitectures);
+    return rolls_back && supported ? profile.speculative->draft_n_max.value_or(kDefaultDraftNMax) : 0;
+}
+
 // ggml tensor types: (elements per block, bytes per block). ggml.h / ggml.c.
 bool ggml_type_size(std::uint32_t type, std::uint64_t& block_elems, std::uint64_t& block_bytes) {
     struct Entry {
@@ -393,6 +420,10 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
 
     const double bk = kv_cache_type_bytes(p.cache_type_k.value_or("f16"));
     const double bv = kv_cache_type_bytes(p.cache_type_v.value_or("f16"));
+    // Recurrent rows per layer: one state per sequence, times (1 + n_rs_seq)
+    // snapshots when the speculative types roll recurrent state back.
+    e.recurrent_snapshots = 1 + recurrent_rollback_snapshots(m, p);
+    const std::uint64_t recurrent_rows = static_cast<std::uint64_t>(slots) * e.recurrent_snapshots;
     double kv_per_token = 0.0;
     for (std::uint32_t i = first_gpu; i < n_layer; ++i) {
         if (i >= first_nextn && !mtp) continue;  // MTP blocks load only for draft-mtp
@@ -403,7 +434,7 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
             kv_per_token += static_cast<double>(m.kv_heads[i]) *
                             (static_cast<double>(m.key_length) * bk + static_cast<double>(m.value_length) * bv);
         } else if (m.kind != ModelArchitecture::attention_only) {
-            e.recurrent_bytes += m.recurrent_state_values * 4 * slots;
+            e.recurrent_bytes += m.recurrent_state_values * 4 * recurrent_rows;
         }
     }
     if (all) e.weights_bytes += m.output_bytes;
@@ -418,6 +449,9 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
     if (p.speculative && !p.speculative->draft_model.empty()) {
         e.weights_bytes += inputs.draft_model_bytes;
         e.notes.emplace_back("the draft model's KV cache is not included");
+    }
+    if (mtp && m.nextn_layers > 0) {
+        e.notes.emplace_back("the MTP draft context's compute buffer, which grows with the context, is not included");
     }
     if (offloaded > 0) {
         const std::uint64_t batch = p.batch_size.value_or(p.backend == kLaunchProfileBackendLlamaCpp ? 512u : 2048u);

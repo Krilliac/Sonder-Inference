@@ -107,6 +107,8 @@ Backend:
   --cache-type-v T        llama.cpp: V cache type, same values; a quantized V
                           cache needs flash attention (on or auto)
   --flash-attn MODE       llama.cpp: auto (default), on or off
+                          (--batch-size through --flash-attn: --backend llamacpp
+                          only; llama-server takes them in its spawn args)
   --mock-delay-ms N       mock backend per-token delay
   --llamaserver-config PATH  JSON config (mode, URL/executable, args, TLS and timeouts)
   --llamaserver-url URL     attach upstream URL (default http://127.0.0.1:8080)
@@ -136,8 +138,8 @@ at once), 1 on a runtime error (e.g. port in use), 2 on a usage error.
 enum class Kind { value, repeat, flag };
 
 // llama.cpp context options of the direct llamacpp backend (batch, micro-batch,
-// KV cache types, flash attention). serve refuses them next to --profile,
-// whose typed fields set them.
+// KV cache types, flash attention). serve refuses them for any other backend,
+// which would ignore them, and next to --profile, whose typed fields set them.
 constexpr const char* kLlamaCppContextFlags[] = {"batch-size", "ubatch-size", "cache-type-k", "cache-type-v",
                                                  "flash-attn"};
 
@@ -449,8 +451,11 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const La
                               " MiB (weights " + mib_text(e.weights_bytes) + ", KV " + mib_text(e.kv_bytes) + " = " +
                               std::to_string(e.attention_layers) + " attention layers x " +
                               std::to_string(e.context_per_sequence) + " tokens x " + std::to_string(e.sequences) +
-                              " sequence(s), recurrent " + mib_text(e.recurrent_bytes) + ", compute " +
-                              mib_text(e.compute_bytes) + ")";
+                              " sequence(s), recurrent " + mib_text(e.recurrent_bytes) +
+                              (e.recurrent_snapshots > 1 ? " = " + std::to_string(e.recurrent_snapshots) +
+                                                               " snapshots per sequence for speculative rollback"
+                                                         : std::string()) +
+                              ", compute " + mib_text(e.compute_bytes) + ")";
         if (budget) summary += " vs budget " + std::to_string(*budget) + " MiB";
         for (const auto& note : e.notes) summary += "; " + note;
         if (upstream_fits) {
@@ -630,6 +635,17 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
     }
     if (Status st = detail::parse_request_path_flags([&a](const std::string& k) { return a.get(k); }, o); !st.ok()) {
         return usage_error(st.message());
+    }
+    // Only the direct llamacpp backend reads these. Any other backend would
+    // run without them and say nothing; llama-server takes them in its spawn
+    // arguments (the --llamaserver-config "args", or a launch profile).
+    if (o.backend.backend != "llamacpp") {
+        for (const char* flag : kLlamaCppContextFlags) {
+            if (a.get(flag)) {
+                return usage_error(std::string("option --") + flag +
+                                   " applies only to --backend llamacpp; for llamaserver set it in the JSON args");
+            }
+        }
     }
     if (auto v = a.get("batch-size")) {
         if (!parse_uint(*v, 1u << 22, n) || n == 0) return usage_error("--batch-size must be from 1 to 4194304");
