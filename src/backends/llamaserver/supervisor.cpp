@@ -1,6 +1,7 @@
 #include "supervisor.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <exception>
 #include <utility>
 
@@ -22,6 +23,29 @@ namespace sonder::inference::llamaserver {
 namespace {
 using Clock = std::chrono::steady_clock;
 using Milliseconds = std::chrono::milliseconds;
+
+ChildMetricsOptions metrics_options(const SupervisorOptions &options) {
+    auto result = options.stall_guard;
+    for (std::size_t i = 0; i < options.arguments.size(); ++i) {
+        std::string_view arg = options.arguments[i];
+        std::string_view value;
+        if (arg == "--spec-draft-n-max") {
+            if (i + 1 < options.arguments.size()) value = options.arguments[++i];
+        } else if (arg.starts_with("--spec-draft-n-max=")) {
+            value = arg.substr(std::string_view("--spec-draft-n-max=").size());
+        } else {
+            continue;
+        }
+        result.n_max.reset();
+        if (value.empty())
+            continue;
+        std::uint64_t parsed = 0;
+        const auto number = std::from_chars(value.data(), value.data() + value.size(), parsed);
+        if (number.ec == std::errc{} && number.ptr == value.data() + value.size())
+            result.n_max = parsed;
+    }
+    return result;
+}
 
 Result<std::uint16_t> ephemeral_port() {
 #if defined(_WIN32)
@@ -70,7 +94,8 @@ Result<std::uint16_t> ephemeral_port() {
 Supervisor::Supervisor(SupervisorOptions options, std::unique_ptr<ProcessLauncher> launcher)
     : options_(std::move(options)), launcher_(launcher ? std::move(launcher) : make_process_launcher()),
       residency_(options_.spill_guard.residency,
-                 expects_gpu_offload(options_.arguments, options_.spill_guard.residency.expect_gpu)) {
+                 expects_gpu_offload(options_.arguments, options_.spill_guard.residency.expect_gpu)),
+      child_metrics_(metrics_options(options_), options_.metrics_poll, options_.metrics_clock) {
     arguments_ = options_.arguments;
     auto log_path = find_log_file(arguments_);
     if (!log_path && !options_.log_file.empty()) {
@@ -113,7 +138,7 @@ Result<std::uint16_t> Supervisor::start(const CancellationToken &cancel) {
             return value.count() > 0 && value <= std::chrono::hours(24);
         };
         Status valid = validate_process_arguments(options_.arguments);
-        if (options_.executable.empty() || options_.executable.find('\0') != std::string::npos ||
+        if ((!options_.attached_endpoint && options_.executable.empty()) || options_.executable.find('\0') != std::string::npos ||
             !valid_duration(options_.readiness_timeout) || !valid_duration(options_.health_poll_interval) ||
             !valid_duration(options_.restart_initial_backoff) ||
             !valid_duration(options_.restart_max_backoff) || !valid_duration(options_.shutdown_timeout) ||
@@ -122,6 +147,10 @@ Result<std::uint16_t> Supervisor::start(const CancellationToken &cancel) {
         }
         if (valid.ok() && options_.spill_guard.enabled)
             valid = validate_spill_guard(options_.spill_guard);
+        if (valid.ok() && (options_.stall_guard.stall_seconds < std::chrono::seconds(1) ||
+                           options_.stall_guard.stall_seconds > std::chrono::hours(24) ||
+                           (options_.stall_guard.policy != "warn" && options_.stall_guard.policy != "restart")))
+            valid = Status(ErrorCode::invalid_argument, "llamaserver: invalid stall_guard options");
         if (valid.ok() && options_.log_file.find('\0') != std::string::npos)
             valid = Status(ErrorCode::invalid_argument, "llamaserver: log file path contains NUL");
         if (valid.ok() && options_.spill_guard.enabled && options_.spill_guard.policy == SpillPolicy::auto_fit &&
@@ -233,7 +262,12 @@ void Supervisor::monitor() {
     std::size_t restarts = 0;
     auto backoff = options_.restart_initial_backoff;
     try {
+        if (options_.attached_endpoint) {
+            monitor_attached();
+            return;
+        }
         while (!shutdown_.cancelled()) {
+            bool stalled_restart = false;
             Status result;
             auto selected = ephemeral_port();
             if (!selected.ok()) {
@@ -255,6 +289,7 @@ void Supervisor::monitor() {
                     begin_child();
                     result = wait_ready(*child, spec.port);
                     if (result.ok() && !shutdown_.cancelled()) {
+                        log_diagnostics_.ready(arguments_);
                         const auto verdict = guard_after_ready(*child);
                         if (verdict.action == GuardAction::refuse) {
                             if (options_.warmup)
@@ -285,6 +320,13 @@ void Supervisor::monitor() {
                         {
                             std::lock_guard lock(mutex_);
                             port_ = spec.port;
+                            child_metrics_.reset(spec.port);
+                            if (options_.native_completion) {
+                                ChildSnapshot snapshot;
+                                snapshot.port = spec.port;
+                                child_status_ = snapshot.to_json();
+                                child_status_->set("sampled_at", nullptr);
+                            }
                             state_ = State::ready;
                             maintenance_pending_ = false;
                             if (gpu_.residency && gpu_.residency->action == "restarting")
@@ -295,12 +337,24 @@ void Supervisor::monitor() {
                         if (options_.warmup && !shutdown_.cancelled())
                             options_.warmup->start("http://127.0.0.1:" + std::to_string(spec.port));
                         auto next_sample = Clock::now() + options_.spill_guard.sample_interval;
+                        auto next_metrics = metrics_now();
                         auto maintenance = ResidencyAction::none;
                         while (!shutdown_.cancelled() && child->running()) {
                             pause(options_.health_poll_interval);
                             if (Clock::now() >= next_sample && !shutdown_.cancelled() && child->running()) {
                                 observe(*child);
                                 next_sample = Clock::now() + options_.spill_guard.sample_interval;
+                            }
+                            if (options_.native_completion && metrics_now() >= next_metrics &&
+                                !shutdown_.cancelled() && child->running()) {
+                                net::HttpRequest endpoint;
+                                endpoint.host = "127.0.0.1";
+                                endpoint.port = spec.port;
+                                const auto sample_time = metrics_now();
+                                stalled_restart = sample_child(std::move(endpoint));
+                                next_metrics = sample_time + std::max(options_.spill_guard.sample_interval, Milliseconds(5000));
+                                if (stalled_restart)
+                                    break;
                             }
                             if (!shutdown_.cancelled() && child->running()) {
                                 maintenance = residency_action();
@@ -325,7 +379,8 @@ void Supervisor::monitor() {
                             // budget and keep the configured/fitted context intact.
                             continue;
                         }
-                        result = Status(ErrorCode::unavailable, "llamaserver: child exited");
+                        result = Status(ErrorCode::unavailable, stalled_restart ? "llamaserver: backend_stalled" :
+                                                                                 "llamaserver: child exited");
                     }
                     if (options_.warmup)
                         options_.warmup->stop();
@@ -347,6 +402,9 @@ void Supervisor::monitor() {
                 return;
             }
             ++restarts;
+            if (stalled_restart)
+                runtime_events_->push("backend.restart", {{"reason", "backend_stalled"},
+                                                           {"attempt", static_cast<std::uint64_t>(restarts)}});
             {
                 std::lock_guard lock(mutex_);
                 state_ = State::backoff;
@@ -386,6 +444,7 @@ std::vector<std::string> Supervisor::launch_arguments() const {
 void Supervisor::begin_child() {
     // A new child truncates (or appends to) its log; parse it from the start.
     log_diagnostics_.reset();
+    diagnostics_warning_sent_ = false;
     if (log_tail_)
         log_tail_->rewind();
     std::lock_guard lock(mutex_);
@@ -394,6 +453,10 @@ void Supervisor::begin_child() {
     reported_eviction_ = false;
     maintenance_pending_ = false;
     log_warnings_.clear();
+    child_warnings_.clear();
+    child_status_.reset();
+    stall_status_.reset();
+    diagnostics_status_.reset();
     if (gpu_.status == "ok" || gpu_.status == "error") {
         gpu_.status = "not_sampled";
         gpu_.error.clear();
@@ -410,9 +473,8 @@ void Supervisor::observe(Process &child) {
         // Bounded read per tick. A missing file is not an error: the child may
         // not have created it yet.
         (void)log_tail_->poll(log_diagnostics_);
-        std::lock_guard lock(mutex_);
-        log_warnings_ = log_diagnostics_.warnings();
     }
+    publish_diagnostics();
     if (!gpu_source_ || !gpu_source_->supported())
         return;
     const auto pid = child.pid();
@@ -512,10 +574,16 @@ Supervisor::GuardVerdict Supervisor::guard_after_ready(Process &child) {
 BackendRuntimeStatus Supervisor::runtime_status() const {
     std::lock_guard lock(mutex_);
     BackendRuntimeStatus status;
+    status.child = child_status_;
+    if (status.child) status.child->set("port", port_);
+    status.stall = stall_status_;
+    status.diagnostics = diagnostics_status_;
+    status.take_events = [events = runtime_events_] { return events->drain(); };
     status.gpu_memory = gpu_;
     status.context = context_;
     status.warnings = config_warnings_;
     status.warnings.insert(status.warnings.end(), log_warnings_.begin(), log_warnings_.end());
+    status.warnings.insert(status.warnings.end(), child_warnings_.begin(), child_warnings_.end());
     append_residency_warnings(status);
     if (gpu_.status == "ok" && gpu_.spilled) {
         std::vector<std::pair<std::string, std::string>> details{
@@ -563,6 +631,133 @@ std::uint16_t Supervisor::port() const {
 Status Supervisor::failure() const {
     std::lock_guard lock(mutex_);
     return failure_;
+}
+
+void Supervisor::RuntimeEvents::push(std::string type, json::Object attrs) {
+    std::lock_guard lock(mutex);
+    if (pending.size() == 64) {
+        ++dropped;
+        return;
+    }
+    pending.emplace_back(std::move(type), std::move(attrs));
+}
+
+std::vector<Supervisor::RuntimeEvent> Supervisor::RuntimeEvents::drain() {
+    std::lock_guard lock(mutex);
+    std::vector<RuntimeEvent> result;
+    result.swap(pending);
+    if (dropped != 0) {
+        result.emplace_back("backend.metrics.dropped", json::Object{{"dropped_events", dropped}});
+        dropped = 0;
+    }
+    return result;
+}
+
+Clock::time_point Supervisor::metrics_now() const {
+    return options_.metrics_clock ? options_.metrics_clock() : Clock::now();
+}
+
+json::Object Supervisor::child_runtime_status() const {
+    std::lock_guard lock(mutex_);
+    json::Object result;
+    if (child_status_) {
+        auto child = *child_status_;
+        child.set("port", port_);
+        result.set("child", std::move(child));
+    }
+    if (stall_status_)
+        result.set("stall", *stall_status_);
+    if (diagnostics_status_)
+        result.set("diagnostics", *diagnostics_status_);
+    return result;
+}
+
+void Supervisor::publish_diagnostics() {
+    const auto &warnings = log_diagnostics_.warnings();
+    if (!diagnostics_warning_sent_) {
+        for (const auto &warning : warnings) {
+            if (warning.code != "diagnostics_blind")
+                continue;
+            auto attrs = to_json(warning);
+            attrs.set("kind", warning.code);
+            runtime_events_->push("backend.warning", std::move(attrs));
+            diagnostics_warning_sent_ = true;
+            break;
+        }
+    }
+    std::lock_guard lock(mutex_);
+    log_warnings_ = warnings;
+    diagnostics_status_ = json::Object{{"offload", log_diagnostics_.offload_status()}};
+}
+
+bool Supervisor::sample_child(net::HttpRequest endpoint) {
+    const auto sample = child_metrics_.sample_at(endpoint, metrics_now(), shutdown_.token());
+    if (shutdown_.cancelled() || !sample.polled)
+        return false;
+    if (sample.snapshot) {
+        auto attrs = sample.snapshot->to_json();
+        attrs.set("status", "ok");
+        runtime_events_->push("backend.metrics.sample", std::move(attrs));
+    } else {
+        runtime_events_->push("backend.metrics.sample", {{"port", endpoint.port},
+            {"status", sample.metrics_unavailable ? "unavailable" : "error"},
+            {"sampled_at", std::chrono::duration_cast<Milliseconds>(metrics_now().time_since_epoch()).count()}});
+    }
+    for (const auto &warning : sample.warnings) {
+        auto attrs = to_json(warning);
+        attrs.set("kind", warning.code);
+        if (warning.code == "backend_stalled" && sample.snapshot && sample.stall) {
+            attrs.set("processing", sample.snapshot->metrics.requests_processing);
+            attrs.set("deferred", sample.snapshot->metrics.requests_deferred);
+            attrs.set("since_ms", *sample.stall->find("since_ms"));
+        }
+        runtime_events_->push("backend.warning", std::move(attrs));
+    }
+    std::lock_guard lock(mutex_);
+    if (sample.snapshot)
+        child_status_ = sample.snapshot->to_json();
+    stall_status_ = sample.stall;
+    std::erase_if(child_warnings_, [&](const BackendWarning &warning) {
+        return (warning.code == "backend_stalled" && !sample.stall) ||
+               (warning.code == "metrics_scrape_failed" && sample.snapshot);
+    });
+    for (const auto &warning : sample.warnings) {
+        if (std::none_of(child_warnings_.begin(), child_warnings_.end(), [&](const BackendWarning &old) {
+                return old.code == warning.code;
+            }))
+            child_warnings_.push_back(warning);
+    }
+    return sample.restart_requested && !options_.attached_endpoint;
+}
+
+void Supervisor::monitor_attached() {
+    const auto endpoint = *options_.attached_endpoint;
+    child_metrics_.reset(endpoint.port);
+    log_diagnostics_.ready(options_.arguments);
+    publish_diagnostics();
+    {
+        std::lock_guard lock(mutex_);
+        port_ = endpoint.port;
+        ChildSnapshot snapshot;
+        snapshot.port = port_;
+        child_status_ = snapshot.to_json();
+        child_status_->set("sampled_at", nullptr);
+        state_ = State::ready;
+        wake_.notify_all();
+    }
+    auto next_sample = metrics_now();
+    while (!shutdown_.cancelled()) {
+        if (metrics_now() >= next_sample) {
+            const auto sample_time = metrics_now();
+            (void)sample_child(endpoint);
+            next_sample = sample_time + std::max(options_.spill_guard.sample_interval, Milliseconds(5000));
+        }
+        pause(options_.health_poll_interval);
+    }
+    std::lock_guard lock(mutex_);
+    state_ = State::stopped;
+    port_ = 0;
+    wake_.notify_all();
 }
 
 } // namespace sonder::inference::llamaserver

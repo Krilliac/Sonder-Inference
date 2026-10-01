@@ -88,6 +88,10 @@ struct BackendSetup {
     std::uint64_t llamaserver_fit_step_align = 1024;
     std::uint64_t llamaserver_fit_min_ctx = 8192;
     std::uint64_t llamaserver_fit_max_attempts = 4;
+    // Spawn/attach child stall watchdog (JSON "stall_guard").
+    bool llamaserver_stall_guard = true;
+    std::uint64_t llamaserver_stall_seconds = 90;
+    std::string llamaserver_stall_policy = "warn";  // warn or restart
     // Nested JSON "spill_guard.residency" mirror. Kept independent of the
     // optional llamaserver backend header so config loading remains available
     // in builds without that backend.

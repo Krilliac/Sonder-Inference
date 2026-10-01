@@ -143,7 +143,7 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
             "native_completion", "grammar", "connect_timeout_ms", "request_timeout_ms", "startup_timeout_ms",
             "poll_interval_ms", "shutdown_timeout_ms", "restart_backoff_ms", "max_restart_backoff_ms",
             "max_restarts", "tls", "spill_guard", "log_file", "kv_pairing_check", "context_length",
-            "slot_affinity", "env", "results", "warmup"};
+            "slot_affinity", "env", "results", "warmup", "stall_guard"};
         for (auto k : known) if (k == key) return false;
         return true;
     };
@@ -269,6 +269,35 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
             if (auto st = detail::parse_residency_config(*v, setup); !st.ok()) return st;
         }
     }
+    if (const auto* guard = object.find("stall_guard")) {
+        if (!guard->is_object())
+            return Status(ErrorCode::invalid_argument, "llamaserver config: 'stall_guard' must be an object");
+        static constexpr std::string_view guard_keys[] = {"enabled", "stall_seconds", "policy"};
+        for (const auto& member : guard->as_object()) {
+            if (std::find(std::begin(guard_keys), std::end(guard_keys), member.first) == std::end(guard_keys))
+                return Status(ErrorCode::invalid_argument,
+                              "llamaserver config: unknown stall_guard field '" + member.first + "'");
+        }
+        const auto bad = [](const char* key, const char* range) {
+            return Status(ErrorCode::invalid_argument,
+                          std::string("llamaserver config: stall_guard.") + key + " must be " + range);
+        };
+        if (const auto* v = guard->find("enabled")) {
+            if (!v->is_bool())
+                return bad("enabled", "boolean");
+            setup.llamaserver_stall_guard = v->as_bool();
+        }
+        if (const auto* v = guard->find("stall_seconds")) {
+            if (!v->is_integer() || v->as_int(-1) < 0 || v->as_uint() < 1 || v->as_uint() > 86400)
+                return bad("stall_seconds", "an integer in [1, 86400]");
+            setup.llamaserver_stall_seconds = v->as_uint();
+        }
+        if (const auto* v = guard->find("policy")) {
+            if (!v->is_string() || (v->as_string() != "warn" && v->as_string() != "restart"))
+                return bad("policy", "warn or restart");
+            setup.llamaserver_stall_policy = v->as_string();
+        }
+    }
     if (const auto* warmup = object.find("warmup")) {
         if (auto st = detail::parse_warmup_config(*warmup, setup); !st.ok()) return st;
     }
@@ -365,6 +394,9 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
         if (auto st = detail::apply_residency_config(setup, lo.spill_guard.residency); !st.ok()) return st;
 #endif
+        lo.stall_guard.enabled = setup.llamaserver_stall_guard;
+        lo.stall_guard.stall_seconds = std::chrono::seconds(setup.llamaserver_stall_seconds);
+        lo.stall_guard.policy = setup.llamaserver_stall_policy;
         lo.diagnostics.log_file = setup.llamaserver_log_file;
         lo.diagnostics.kv_pairing_check = setup.llamaserver_kv_pairing_check;
         lo.context_length = setup.llamaserver_context_length;

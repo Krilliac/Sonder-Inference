@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
@@ -88,6 +89,12 @@ struct BackendRuntimeStatus {
     ContextFitStatus context;
     std::vector<BackendWarning> warnings;
     std::optional<BackendWarmupStatus> warmup;  // absent when disabled
+    std::optional<json::Object> child;
+    std::optional<json::Object> stall;
+    std::optional<json::Object> diagnostics;
+    // Internal event source; only the engine sampler drains it. Health and
+    // model serialization must never consume it. Captures shared state only.
+    std::function<std::vector<std::pair<std::string, json::Object>>()> take_events;
 };
 
 // Stable JSON shape shared by /v1/sonder/health, /v1/models and telemetry:
