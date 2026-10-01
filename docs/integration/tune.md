@@ -50,7 +50,11 @@ GGUF files are rejected rather than guessing whether another shard has MTP.
 
 The defaults are K/V `q4_0/q4_0`, `q8_0/q8_0`, `q8_0/q4_0` (k8v4), and
 `q5_1/q5_1`; context 32768 through 139264 in 4096-token increments; ubatch
-512, 1024, 2048; batch 2048; and MTP draft limits 0, 1, 2, 3. FlashAttention is
+512, 1024, 2048; batch 2048; and MTP draft limits 0, 1, 2, 3. Each nonzero MTP
+limit is crossed with `spec_type` values `draft-mtp` and `draft-mtp,ngram-mod`,
+and draft `p_min` values 0 and 0.5. The no-MTP baseline appears once, without
+these extra axes. `p_min` sets **`--spec-draft-p-min`**, independently of the
+sampling flag `--min-p`. FlashAttention is
 on, GPU layers are requested in full, automatic upstream fitting is off, and
 there is one slot so `/props` describes the actual context being tested.
 
@@ -65,18 +69,24 @@ there is one slot so `/props` describes the actual context being tested.
    Only clean and spill outcomes move a bisection bound. Other failures abandon
    that lane; failed probes are retained in the report.
 3. Benchmark the clean-edge-minus-4096 and 65536-token profiles where feasible.
-   The short decode uses 128 prompt tokens and 256 generated tokens; the prefill
-   uses 8192 prompt tokens and one generated token. Then explore ubatch/MTP
+   Decode uses the four natural chat workloads below; the prefill uses 8192
+   prompt tokens and one generated token. Then explore ubatch/MTP/spec-type/p-min
    variants of at most two leaders: fastest decode at >=65536 context, and
    largest qualified context. Every variant must also pass a clean probe at
    **its own context plus 4096**, before its timed run. A variant that spills is
    rejected; the tuner does not infer a margin from a different variant.
-4. Tokenize fixed text once per child, repeating the resulting valid token IDs
-   to exact prompt lengths. Requests set greedy sampling, seed 42, `ignore_eos`,
-   and `cache_prompt: false`. Cached/truncated work or missing/zero timings is
-   not accepted as a throughput measurement. MTP benchmarks must report draft
-   activity; the baseline must not. Rates come from upstream measured token
-   counts and durations, not model-quality claims.
+4. Send decode requests through `/v1/chat/completions` so the model's chat
+   template is applied, with `chat_template_kwargs.enable_thinking: false`,
+   `stream: false`, and `cache_prompt: false`. Greedy sampling and seed 42 remain
+   unchanged. Decode no longer forces `ignore_eos` or repeats a token sequence.
+   Natural EOS before the output cap is valid; tok/s uses actual `predicted_n`
+   and `predicted_ms`. Empty text, invalid finish reasons, cached work,
+   missing/zero timings, or counts above the output cap fail that candidate.
+   Every MTP class must report positive `draft_n` and a `draft_n_accepted`
+   counter (zero accepted is valid); the baseline must not report draft activity.
+   Exact-token prefill probes still tokenize fixed text and repeat valid IDs
+   with `ignore_eos` for one output token. They qualify memory and measure
+   prefill, and never contribute to the decode score.
 5. Sample the existing PDH source during loading and workloads (200 ms), keeping
    peak dedicated/shared bytes. The threshold is the spill guard's independent
    clean line plus threshold: by default `0 + 256 MiB` for candidates without
@@ -99,16 +109,40 @@ there is one slot so `/props` describes the actual context being tested.
 
 A finite grid, binary search and a fixed two-leader refinement bound the work
 even with a very large time budget. The optimum is limited to profiles actually
-measured before the budget expires. Performance is a short synthetic workload
+measured before the budget expires. Performance is a fixed natural-workload
 estimate; use the HTTP benchmark harness for representative agent traffic,
 prefix reuse, concurrency and long-context quality checks.
+
+### Decode classes and ranking
+
+| Result name | Fixed prompt | Output cap | Weight |
+|---|---|---:|---:|
+| `prose` | A 200-token essay about conserving water in a town | 256 | 0.4 |
+| `code_edit` | Complete 120-line Python invoice file, rename one function and its callers | 2048 | 0.3 |
+| `tool_json` | One coding-agent step, choose a tool and emit its arguments as JSON | 256 | 0.2 |
+| `reasoning` | Short cycling average-speed word problem, including a rest | 256 | 0.1 |
+
+Each successful class contributes `weight * tok_s` to the weighted arithmetic
+mean. All four classes are required; an interrupted or failed suite retains
+partial evidence but has no weighted score and cannot be recommended.
+`fast_default` ranks qualified profiles at context >=65536 by this mean, then
+prefill rate, context and lower MTP limit. `long_context` prioritizes context,
+then uses the same throughput ranking. These are throughput measurements, not
+checks of essay quality, correct code edits, JSON validity or reasoning accuracy.
+
+The four classes all run with thinking off and temperature 0, preserving tune's
+sampling default. A production-sampling comparison (including E11's thinking-on
+reasoning arm) is a separate GPU acceptance check; agreement must be measured,
+not inferred from fake results or the similar class labels.
 
 ## Custom grid
 
 Arrays replace defaults. Unknown keys, duplicate entries, fractional integers,
 unsupported KV names and inconsistent batch sizes are rejected. `ctx` must be
-strictly increasing, 4096-aligned and in [16384, 1048576]. At most 4096 grid
-combinations are accepted. `mtp` must include 0 for the baseline. Recommendations
+strictly increasing, 4096-aligned and in [16384, 1048576]. At most 4096 base grid
+combinations and 16384 expanded combinations are accepted (the default expanded
+grid has 4212 rows). `mtp` must include 0 for the baseline. `spec_type` accepts
+the two names above; `p_min` accepts up to four unique finite numbers in [0, 1]. Recommendations
 and their safety probes can use derived contexts outside the explicit `ctx`
 array: the measured edge minus 4096 and the fixed >=64k comparison point.
 
@@ -119,6 +153,8 @@ array: the measured edge minus 4096 and the fixed >=64k comparison point.
   "ubatch": [512, 1024, 2048],
   "batch": 2048,
   "mtp": [0, 1, 2, 3],
+  "spec_type": ["draft-mtp", "draft-mtp,ngram-mod"],
+  "p_min": [0, 0.5],
   "spill_threshold_mib": 256,
   "shared_baseline_mib": 0
 }
@@ -128,6 +164,48 @@ The fixed 4096 margin still applies to sparse custom context arrays; an edge
 means the largest **observed clean** grid point, not a claim about untested gaps.
 Only change the independent shared-memory baseline with separate clean-line
 evidence. Enlarging it to match a spilling run defeats spill detection.
+
+### Drop-in profile defaults
+
+Every timed child and written profile includes these defaults, so calibration
+measures the configuration that will be served:
+
+```text
+--parallel 1 --no-kv-unified --cache-ram 2048
+--ctx-checkpoints 8 --checkpoint-min-step 8192
+--jinja --reasoning-format deepseek --min-p 0 --metrics
+```
+
+Override them with a typed `profile` object in `--grid`, for example:
+
+```json
+{
+  "profile": {
+    "parallel": 1,
+    "no_kv_unified": true,
+    "cache_ram": 1024,
+    "ctx_checkpoints": 4,
+    "checkpoint_min_step": 4096,
+    "jinja": true,
+    "reasoning_format": "deepseek",
+    "min_p": 0,
+    "metrics": true
+  }
+}
+```
+
+`cache_ram` is MiB in [0, 1048576]; checkpoints are integers in [1, 128],
+and the minimum step is in [1, 1048576]. `reasoning_format` is `deepseek` or
+`none`; sampling `min_p` is finite and in [0, 1]. The three switches are booleans:
+`no_kv_unified: false` emits `--kv-unified`, `jinja: false` emits `--no-jinja`,
+and `metrics: false` omits `--metrics`. Unknown keys, wrong types, negative
+integers and overflow are rejected before conversion.
+
+Calibration requires `parallel: 1`: `/props` must prove a single slot and the
+requested context. The written JSON `args` remain editable, including parallel
+slots, but changing flags after calibration invalidates its memory/performance
+qualification. Executables must support the selected flags and chat template;
+unsupported combinations remain error rows, never recommendations.
 
 ## Output and failures
 
@@ -140,7 +218,7 @@ spill guard carries the rule the winning candidate was judged by (including
 32768, so if the desktop later takes more VRAM the server shrinks the context
 instead of spilling silently or refusing to start.
 
-`results.candidates` records K/V, ctx, ubatch, MTP n, phase, peak shared/dedicated
+`results.candidates` records K/V, ctx, ubatch, MTP n, `spec_type`, `p_min`, phase, peak shared/dedicated
 MiB, decode and prefill tok/s, optional long-prefill tok/s, served context,
 safety-probe context, memory-release confirmation, verdict, and diagnostic
 detail. Unmeasured numbers are JSON `null`. `results.fast_default` and
@@ -148,6 +226,13 @@ detail. Unmeasured numbers are JSON `null`. `results.fast_default` and
 either may be null. The root config selects fast default when available,
 otherwise long context. To use the alternative, save its `config` object as
 another file. Configs still reject unknown top-level execution keys.
+
+Each candidate also has a `workloads` array with `name`, `weight`, `tok_s`,
+`draft_n`, `draft_n_accepted` and `acceptance_ratio` (accepted/drafted).
+Missing counters and ratios with a zero denominator are `null`.
+`weighted_tok_s` records the complete four-class score; the existing
+`short_tok_s` field is retained and now carries that same score. Existing
+response fields and the schema name remain; these new fields are additive.
 
 When no profile qualifies, an existing `tuned.json` is left intact and only
 `tuned.json.results.json` is written. That report is deliberately not loadable
@@ -167,3 +252,15 @@ spill guard's `FakeCounters`; fake HTTP responses provide counts/timings and
 faults. They do not spawn a real llama-server, read weights, or use a GPU.
 Full build/CTest and a separately authorized live calibration are still
 necessary before claiming real-machine performance or compatibility.
+
+For the old-workload diagnostic, inspect an MTP candidate from the pre-change
+runner: tokenize `Explain how a careful engineer measures memory and checks
+results. The sun rises over a quiet river.` with `add_special: false`, repeat
+its IDs to 128 tokens, and POST `/completion` with `n_predict: 256`,
+`temperature: 0`, `seed: 42`, `ignore_eos: true`, `cache_prompt: false`,
+`id_slot: 0`, `stream: false`. Record the returned text and
+`timings.draft_n_accepted / timings.draft_n`. Mock counters only validate this
+inspection path; they cannot establish that a real model loops or inflates
+acceptance. The GPU lane must record its text-inspection verdict either way,
+then run the 20-minute calibration once and compare `fast_default` and its
+MTP limit with the hand-tuned profile and E11.
