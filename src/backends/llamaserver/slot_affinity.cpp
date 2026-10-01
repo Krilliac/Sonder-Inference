@@ -10,7 +10,8 @@ SlotAffinity::Lease &SlotAffinity::Lease::operator=(Lease &&other) noexcept {
         reset();
         owner_ = std::exchange(other.owner_, nullptr);
         slot_ = std::exchange(other.slot_, std::nullopt);
-        generation_ = std::exchange(other.generation_, 0);
+        generation_ = std::exchange(other.generation_, std::uint64_t{0});
+        outcome_ = std::exchange(other.outcome_, std::string_view{"none"});
     }
     return *this;
 }
@@ -21,6 +22,7 @@ void SlotAffinity::Lease::reset() noexcept {
     owner_ = nullptr;
     slot_.reset();
     generation_ = 0;
+    outcome_ = "none";
 }
 
 void SlotAffinity::release(std::uint32_t slot, std::uint64_t generation) noexcept {
@@ -61,26 +63,32 @@ SlotAffinity::Lease SlotAffinity::acquire(std::string_view key_view, std::uint32
     std::lock_guard<std::mutex> lock(mutex_);
     if (slots_.size() != n_slots)
         reset_slots(n_slots);
+    if (n_slots == 1) {
+        lease.outcome_ = "single_slot";
+        return lease;
+    }
     std::optional<std::uint32_t> chosen;
     if (auto it = by_key_.find(key); it != by_key_.end()) {
         lru_.splice(lru_.begin(), lru_, it->second.lru);
+        if (slots_[it->second.slot].busy != 0) {
+            lease.outcome_ = "busy_unpinned";
+            return lease;
+        }
         chosen = it->second.slot;
-    } else if (n_slots == 1) {
-        assign(key, 0);
-        chosen = 0;
+        lease.outcome_ = "hit";
     } else {
         // Warmed slots are preferred for a new session, because using one
         // avoids immediately discarding the prefix populated by warm-up.
         // Keep this advisory: malformed/out-of-range entries and owned slots
         // are ignored, then the historical lowest-unowned policy applies.
         for (const auto slot : preferred_slots) {
-            if (slot < n_slots && !slots_[slot].owned) {
+            if (slot < n_slots && !slots_[slot].owned && slots_[slot].busy == 0) {
                 chosen = slot;
                 break;
             }
         }
         for (std::uint32_t i = 0; i < n_slots && !chosen; ++i) {
-            if (!slots_[i].owned)
+            if (!slots_[i].owned && slots_[i].busy == 0)
                 chosen = i;
         }
         // Least recently used owner whose slot is idle.
@@ -89,8 +97,11 @@ SlotAffinity::Lease SlotAffinity::acquire(std::string_view key_view, std::uint32
             if (slots_[slot].busy == 0)
                 chosen = slot;
         }
-        if (!chosen)
+        if (!chosen) {
+            lease.outcome_ = "busy_unpinned";
             return lease;  // every slot is owned and busy: let the upstream pick
+        }
+        lease.outcome_ = slots_[*chosen].owned ? "stolen" : "new";
         assign(key, *chosen);
     }
     ++slots_[*chosen].busy;
