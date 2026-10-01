@@ -17,7 +17,8 @@ namespace sonder::inference::server::detail {
 
 // Flags parsed by parse_request_path_flags() (all take a value).
 inline constexpr const char* kRequestPathFlags[] = {"scheduler", "kv-pool-tokens", "pin-enable-thinking",
-                                                    "pin-reasoning-effort", "max-concurrent-subagent",
+                                                    "pin-reasoning-effort", "pin-mode", "pin-reasoning-budget",
+                                                    "pin-reasoning-budget-message", "max-concurrent-subagent",
                                                     "max-concurrent-background", "max-queue-per-class",
                                                     "backend-capacity", "priority-admission"};
 
@@ -32,6 +33,10 @@ inline constexpr const char* kRequestPathUsage =
     "                          / think (ollama) on every chat request; a request that\n"
     "                          asks otherwise is overridden and warned (sonder.warnings)\n"
     "  --pin-reasoning-effort E  same for chat_template_kwargs.reasoning_effort\n"
+    "  --pin-mode override|default  override request thinking values (default), or\n"
+    "                          only fill values the request leaves unset\n"
+    "  --pin-reasoning-budget N  default-only llama-server reasoning budget (-1 allowed)\n"
+    "  --pin-reasoning-budget-message TEXT  default-only budget guidance (max 512 bytes)\n"
     "  --max-concurrent-subagent N  cap running subagent requests (0 = unlimited)\n"
     "  --max-concurrent-background N  cap running background requests (0 = unlimited)\n"
     "  --max-queue-per-class N  cap queued requests in each class (0 = unlimited)\n"
@@ -61,9 +66,7 @@ void apply_scheduling(const ServerOptions& o, SchedulingOptions& scheduling);
 // be absent), else empty (no affinity).
 std::string chat_session_key(const ChatJob& job, const Correlation& correlation);
 
-// Applies the server-wide pins to the request's thinking options: an unset
-// field takes the pinned value; a conflicting one is overridden. Returns one
-// warning per override (for the response's sonder.warnings).
+// Applies the server-wide thinking pins using ServerOptions::pin_mode.
 std::vector<std::string> apply_thinking_pins(const ServerOptions& o, ThinkingOptions& thinking);
 
 }  // namespace sonder::inference::server::detail

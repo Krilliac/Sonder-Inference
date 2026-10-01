@@ -104,6 +104,9 @@ struct RequestOptions {
     // with strict class admission. Used by legacy numeric HTTP priorities,
     // including explicit zero; the host ticket still enforces class/FIFO.
     bool preserve_numeric_priority = false;
+    // Native llama-server chat only. Unset leaves the upstream default intact.
+    std::optional<std::int64_t> reasoning_budget_tokens = std::nullopt;
+    std::optional<std::string> reasoning_budget_message = std::nullopt;
 };
 
 struct GenerationResult {

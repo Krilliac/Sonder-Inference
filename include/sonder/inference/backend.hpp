@@ -92,6 +92,19 @@ struct TokenChunk {
     std::string_view reasoning{};
 };
 
+// Per-request timing observations reported by llama-server. Each member is
+// optional because streaming and older server versions may omit individual
+// counters.
+struct BackendTimings {
+    std::optional<std::uint64_t> prompt_n = std::nullopt;
+    std::optional<std::uint64_t> cache_n = std::nullopt;
+    std::optional<double> prompt_ms = std::nullopt;
+    std::optional<std::uint64_t> predicted_n = std::nullopt;
+    std::optional<double> predicted_ms = std::nullopt;
+    std::optional<std::uint64_t> draft_n = std::nullopt;
+    std::optional<std::uint64_t> draft_n_accepted = std::nullopt;
+};
+
 enum class StopReason { none, max_tokens, stop_sequence, end_of_sequence, cancelled, callback, error };
 const char* to_string(StopReason reason) noexcept;
 
@@ -113,6 +126,9 @@ struct GenerateStats {
     // The exact configured stop sequence, when the backend/sampler identified
     // it. A finish reason alone is not sufficient to populate this field.
     std::optional<std::string> matched_stop = std::nullopt;
+    // Raw llama-server timing counters, when the upstream supplied them.
+    // This is additive to the legacy aggregate fields above.
+    std::optional<BackendTimings> backend_timings = std::nullopt;
 };
 
 // Return false to stop generation early (StopReason::callback).
@@ -147,6 +163,9 @@ public:
 struct ChatMessage {
     std::string role;
     std::string content;
+    // Native reasoning history is optional and is ignored by backends that do
+    // not have a separate reasoning channel.
+    std::optional<std::string> reasoning_content = std::nullopt;
 };
 
 // Reasoning ("thinking") controls for native-chat backends. Unset fields are
@@ -169,6 +188,8 @@ struct ChatRequest {
     // one llama-server slot). Empty = no affinity.
     std::string session_key;
     ThinkingOptions thinking;
+    std::optional<std::int64_t> reasoning_budget_tokens = std::nullopt;
+    std::optional<std::string> reasoning_budget_message = std::nullopt;
     // Request reasoning as a separate stream from visible assistant text.
     // False preserves the historical text-only callback contract.
     bool separate_reasoning = false;

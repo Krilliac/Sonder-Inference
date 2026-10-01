@@ -1,4 +1,5 @@
 #include "openai.hpp"
+#include "reasoning_budget.hpp"
 
 #include <cmath>
 #include <limits>
@@ -271,6 +272,7 @@ bool reasoning_effort_ok(std::string_view v) {
 
 // prompt_cache_key, chat_template_kwargs and think (docs/SERVER.md).
 std::optional<ApiError> read_chat_extensions(const json::Object& body, ChatJob& job) {
+    if (auto error = reasoning_budget::parse_body(body, job)) return error;
     if (const json::Value* key = body.find("prompt_cache_key"); present(key)) {
         if (!key->is_string() || key->as_string().empty() || key->as_string().size() > 256) {
             return bad("invalid_json", "prompt_cache_key must be a string of 1 to 256 bytes", "prompt_cache_key");
@@ -394,6 +396,14 @@ std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body_text) {
                        where + ".content");
         }
         job.messages.push_back(ChatMessage{role->as_string(), content->as_string()});
+        if (role->as_string() == "assistant") {
+            if (const auto* reasoning = m.find("reasoning_content")) {
+                if (!reasoning->is_string()) {
+                    return bad("invalid_messages", where + ".reasoning_content must be a string", where + ".reasoning_content");
+                }
+                job.messages.back().reasoning_content = reasoning->as_string();
+            }
+        }
     }
     if (Status st = validate_chat_messages(job.messages); !st.ok()) {
         return bad("invalid_messages", st.message(), "messages");
@@ -433,6 +443,7 @@ std::variant<Correlation, ApiError> parse_correlation(const RequestHead& head) {
         if (count > 1) return bad("invalid_correlation_header", std::string(name) + " must occur once", name);
     }
     Correlation c;
+    if (auto error = reasoning_budget::parse_header(head, c)) return *error;
     const auto id_header = [&head](const char* lower, const char* display,
                                    std::optional<std::string>& out) -> std::optional<ApiError> {
         const std::string* v = head.header(lower);
@@ -514,6 +525,21 @@ json::Object usage_json(const GenerationResult& result) {
                    {"total_tokens", result.stats.prompt_tokens + result.stats.completion_tokens}};
     if (result.stats.cached_tokens) {
         u.set("prompt_tokens_details", json::Object{{"cached_tokens", *result.stats.cached_tokens}});
+    }
+    if (result.stats.backend_timings) {
+        const auto& t = *result.stats.backend_timings;
+        json::Object upstream;
+        if (t.prompt_n) upstream.set("prompt_n", *t.prompt_n);
+        if (t.cache_n) upstream.set("cache_n", *t.cache_n);
+        if (t.prompt_ms) upstream.set("prompt_ms", *t.prompt_ms);
+        if (t.predicted_n) upstream.set("predicted_n", *t.predicted_n);
+        if (t.predicted_ms) upstream.set("predicted_ms", *t.predicted_ms);
+        if (t.draft_n) upstream.set("draft_n", *t.draft_n);
+        if (t.draft_n_accepted) upstream.set("draft_n_accepted", *t.draft_n_accepted);
+        u.set("sonder", json::Object{{"timings", std::move(upstream)}});
+        if (!result.stats.cached_tokens && t.cache_n) {
+            u.set("prompt_tokens_details", json::Object{{"cached_tokens", *t.cache_n}});
+        }
     }
     return u;
 }

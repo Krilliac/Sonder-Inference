@@ -1,5 +1,8 @@
 #include "request_path.hpp"
 
+#include "thinking_pins.hpp"
+#include "reasoning_budget.hpp"
+
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -40,8 +43,6 @@ std::optional<std::size_t> nonnegative_size(const std::string& text) {
     return value;
 }
 
-const char* on_off(bool v) { return v ? "on" : "off"; }
-
 }  // namespace
 
 Status parse_request_path_flags(const FlagLookup& get, ServerOptions& o) {
@@ -81,6 +82,23 @@ Status parse_request_path_flags(const FlagLookup& get, ServerOptions& o) {
     if (auto v = get("pin-reasoning-effort")) {
         o.pin_reasoning_effort = *v;
     }
+    if (auto v = get("pin-mode")) {
+        if (*v == "override") {
+            o.pin_mode = PinMode::override_request;
+        } else if (*v == "default") {
+            o.pin_mode = PinMode::default_value;
+        } else {
+            return invalid("--pin-mode must be override or default");
+        }
+    }
+    if (auto v = get("pin-reasoning-budget")) {
+        const auto value = reasoning_budget::parse_integer(*v);
+        if (!value) return invalid("--pin-reasoning-budget must be an integer >= -1 within INT64_MAX");
+        o.pin_reasoning_budget_tokens = value;
+    }
+    if (auto v = get("pin-reasoning-budget-message")) {
+        o.pin_reasoning_budget_message = *v;
+    }
     for (const auto& entry : {std::pair{"max-concurrent-subagent", &o.max_concurrent_subagent},
                               std::pair{"max-concurrent-background", &o.max_concurrent_background},
                               std::pair{"max-queue-per-class", &o.max_queue_per_class}}) {
@@ -115,6 +133,12 @@ Status validate_request_path_options(const ServerOptions& o) {
     }
     if (o.pin_reasoning_effort && !effort_ok(*o.pin_reasoning_effort)) {
         return invalid("--pin-reasoning-effort must be 1 to 64 characters of [A-Za-z0-9._-]");
+    }
+    if (o.pin_reasoning_budget_tokens && *o.pin_reasoning_budget_tokens < -1) {
+        return invalid("--pin-reasoning-budget must be an integer >= -1");
+    }
+    if (o.pin_reasoning_budget_message && o.pin_reasoning_budget_message->size() > 512) {
+        return invalid("--pin-reasoning-budget-message must be at most 512 bytes");
     }
     return Status::success();
 }
@@ -153,24 +177,10 @@ std::string chat_session_key(const ChatJob& job, const Correlation& correlation)
 }
 
 std::vector<std::string> apply_thinking_pins(const ServerOptions& o, ThinkingOptions& thinking) {
-    std::vector<std::string> warnings;
-    if (o.pin_enable_thinking) {
-        if (thinking.enable_thinking && *thinking.enable_thinking != *o.pin_enable_thinking) {
-            warnings.push_back(std::string("enable_thinking=") + on_off(*thinking.enable_thinking) +
-                               " was overridden by the server pin (" + on_off(*o.pin_enable_thinking) +
-                               ") that keeps the prompt prefix cacheable");
-        }
-        thinking.enable_thinking = o.pin_enable_thinking;
-    }
-    if (o.pin_reasoning_effort) {
-        if (thinking.reasoning_effort && *thinking.reasoning_effort != *o.pin_reasoning_effort) {
-            warnings.push_back("reasoning_effort=" + *thinking.reasoning_effort +
-                               " was overridden by the server pin (" + *o.pin_reasoning_effort +
-                               ") that keeps the prompt prefix cacheable");
-        }
-        thinking.reasoning_effort = o.pin_reasoning_effort;
-    }
-    return warnings;
+    ThinkingOptions pins;
+    pins.enable_thinking = o.pin_enable_thinking;
+    pins.reasoning_effort = o.pin_reasoning_effort;
+    return thinking_pins::apply(o.pin_mode, thinking, pins);
 }
 
 }  // namespace sonder::inference::server::detail

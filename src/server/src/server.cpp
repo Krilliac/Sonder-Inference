@@ -17,6 +17,7 @@
 #include "anthropic.hpp"
 #include "chat_handler.hpp"
 #include "http.hpp"
+#include "health_features.hpp"
 #include "identity.hpp"
 #include "live_hub.hpp"
 #include "openai.hpp"
@@ -49,7 +50,7 @@ const std::vector<std::string>& default_origins() {
 constexpr const char* kAllowHeaders =
     "Accept, Authorization, Cache-Control, Content-Type, Last-Event-ID, X-Sonder-Run-Id, "
     "X-Sonder-Parent-Request-Id, X-Sonder-Agent-Id, X-Sonder-Task-Id, X-Sonder-Workload, X-Sonder-Priority, "
-    "X-Sonder-Deadline-Ms";
+    "X-Sonder-Deadline-Ms, X-Sonder-Reasoning-Budget";
 constexpr const char* kExposeHeaders = "X-Sonder-Inference-Api, X-Sonder-Request-Id, Retry-After";
 
 enum class State { starting, ready, draining, stopped };
@@ -566,6 +567,7 @@ struct Server::Impl {
         std::string version;
         backend_status(available, version);
         json::Array backends;
+        std::string bound_backend;
         {
             std::shared_ptr<Backend> b;
             {
@@ -573,6 +575,7 @@ struct Server::Impl {
                 b = backend;
             }
             if (b) {
+                bound_backend = b->name();
                 json::Array caps;
                 for (const auto& c : b->capabilities().names()) {
                     caps.emplace_back(c);
@@ -624,7 +627,7 @@ struct Server::Impl {
                                                      {"emitted", emitted},
                                                      {"dropped", dropped},
                                                      {"subscriber_dropped_events", hs.subscriber_dropped_events}}},
-                          {"sonder", sonder_meta()}};
+                          {"sonder", health_features(bound_backend, opts, sonder_meta())}};
         send_json(ex, s == State::ready ? 200 : 503, body);
     }
 
@@ -663,7 +666,8 @@ struct Server::Impl {
             data.emplace_back(json::Object{
                 {"id", m.id}, {"object", "model"}, {"owned_by", "sonder-inference"}, {"sonder", std::move(ext)}});
         }
-        send_json(ex, 200, json::Object{{"object", "list"}, {"data", std::move(data)}, {"sonder", sonder_meta()}});
+        send_json(ex, 200, json::Object{{"object", "list"}, {"data", std::move(data)},
+                                      {"sonder", health_features(b ? b->name() : "", opts, sonder_meta())}});
     }
 
     void handle_identity(Exchange& ex, const RequestHead& head) {

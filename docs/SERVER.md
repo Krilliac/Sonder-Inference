@@ -67,6 +67,9 @@ itself.
 | `--kv-pool-tokens N` | `65536` | Logical KV pool size in tokens (16 to 16777216, rounded up to 16-token blocks). |
 | `--pin-enable-thinking on\|off` | none | Sent as `chat_template_kwargs.enable_thinking` (llama-server) / `think` (ollama) on every chat request. See [Thinking control](#thinking-control). |
 | `--pin-reasoning-effort E` | none | Same for `chat_template_kwargs.reasoning_effort` (1 to 64 of `[A-Za-z0-9._-]`). |
+| `--pin-mode override\|default` | `override` | `override` preserves today's behavior and replaces conflicting request thinking fields with a warning; `default` fills only unset `enable_thinking` and `reasoning_effort` fields, so explicit request values win. |
+| `--pin-reasoning-budget N` | none | Fills an unset `reasoning_budget_tokens` value. `N` is an integer greater than or equal to `-1`; it never overrides a request or header value. |
+| `--pin-reasoning-budget-message TEXT` | none | Fills an unset `reasoning_budget_message` value. The UTF-8 value is at most 512 bytes and never overrides a request value. |
 | `--max-concurrent-subagent N` | unlimited (`0`) | Maximum running `subagent` requests; `0` preserves today's unlimited behavior. |
 | `--max-concurrent-background N` | unlimited (`0`) | Maximum running `background` requests; `0` preserves today's unlimited behavior. |
 | `--max-queue-per-class N` | unlimited (`0`) | Maximum queued requests for each priority class; over-capacity requests receive 429 with `Retry-After: 1`. |
@@ -186,7 +189,7 @@ The preflight (`OPTIONS`) answers 204 with
 `Access-Control-Allow-Headers: Accept, Authorization, Cache-Control,
 Content-Type, Last-Event-ID, X-Sonder-Run-Id, X-Sonder-Parent-Request-Id,
 X-Sonder-Agent-Id, X-Sonder-Task-Id, X-Sonder-Workload, X-Sonder-Priority,
-X-Sonder-Deadline-Ms`
+X-Sonder-Deadline-Ms, X-Sonder-Reasoning-Budget`
 and `Access-Control-Max-Age: 600` (plus
 `Access-Control-Allow-Private-Network: true` when the browser asks for it).
 
@@ -230,6 +233,10 @@ there.
 
 Shape: `{"error": {"message", "type", "code", "param"}, "sonder": {"api_version": 1}}`.
 `param` names the offending field or header when there is one, else `null`.
+Invalid reasoning budget body values use 400 `invalid_json` and identify
+`reasoning_budget_tokens`, `thinking_budget_tokens`, or
+`reasoning_budget_message` in `param`. An invalid or duplicate budget header
+uses 400 `invalid_correlation_header`, with `X-Sonder-Reasoning-Budget` in `param`.
 
 How session failures map (`map_session_failure`): messages are validated
 before the session runs (400 `invalid_messages`, `param` `messages`); a prompt
@@ -272,7 +279,7 @@ reject with `never_fits` or `invalid_request`, both caller errors (400).
               "unloading":0,"loads":1,"load_failures":0,"evictions":0},
  "telemetry":{"level":"standard","subscribers":0,"retained":42,"capacity":8192,"emitted":42,"dropped":0,
               "subscriber_dropped_events":0},
- "sonder":{"api_version":1}}
+ "sonder":{"api_version":1,"features":[],"pins":{"mode":"override"}}}
 ```
 
 `backends[].available` and `version` come from the backend's `probe()`, run
@@ -285,6 +292,10 @@ adds `backends[].runtime` with `gpu_memory`, `context` and `warnings`
 unchanged.
 `telemetry.emitted` and `telemetry.dropped` are the bus counters;
 `subscriber_dropped_events` counts events lost by slow live subscribers.
+`sonder.features` is the backend capability list. For a llamaserver backend it
+is exactly `["thinking","chat_template_kwargs","enable_thinking",
+"reasoning_effort","reasoning_budget","prompt_cache_key","priority_classes"]`;
+for the mock backend it is `[]`. `sonder.pins.mode` is `override` or `default`.
 
 Model residency fields (additive; see [Model residency](#model-residency)):
 `models[].state` is `unloaded`, `loading`, `resident` or `unloading` (evicted,
@@ -302,13 +313,16 @@ are totals over all models.
 
 ```json
 {"object":"list","data":[{"id":"mock:tiny","object":"model","owned_by":"sonder-inference",
-  "sonder":{"backend":"mock","default":true,"synthetic":true}}],"sonder":{"api_version":1}}
+  "sonder":{"backend":"mock","default":true,"synthetic":true}}],
+ "sonder":{"api_version":1,"features":[],"pins":{"mode":"override"}}}
 ```
 
 `sonder.runtime` is added to a model only when its backend reports runtime
 status (same object as `backends[].runtime` in health). It describes the
 backend process, not the model handle, so it is reported whatever the
-model's residency state (lazy, loading or evicted).
+model's residency state (lazy, loading or evicted). Top-level `sonder.features` uses the
+same exact backend list as health: the seven llama-server features above, or
+`[]` for mock.
 
 ### `GET /v1/sonder/identity[?model=ID]`
 
@@ -351,7 +365,8 @@ from `user` or `tool`), `stream`, `stream_options.include_usage`,
 `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `stop` (a string or at most
 4 strings), `presence_penalty`, `frequency_penalty`, `repeat_penalty`,
 `logit_bias` (`{"<token id>": bias}`), `n` (1 only), and the Sonder extensions
-`num_ctx`, `typical_p`, `repeat_last_n`. Other sampling defaults are
+`num_ctx`, `typical_p`, `repeat_last_n`, `reasoning_budget_tokens`,
+`thinking_budget_tokens`, and `reasoning_budget_message`. Other sampling defaults are
 `SamplingConfig`'s (temperature 0.8, top_p 0.95, top_k 40, repeat_penalty
 1.1).
 
@@ -384,6 +399,23 @@ Request-path extensions (all optional; see the sections below):
   wrong type, is 400 `invalid_json` naming it.
 - `think` (boolean, Ollama's name): same as
   `chat_template_kwargs.enable_thinking`; both set and disagreeing is 400.
+- `reasoning_budget_tokens` (signed 64-bit integer >= -1) is the canonical per-request
+  reasoning budget. `thinking_budget_tokens` is an alias; when both are
+  present, both are validated and the canonical field wins. `reasoning_budget_message`
+  is a UTF-8 string of at most 512 bytes. `X-Sonder-Reasoning-Budget` accepts
+  the integer budget and wins over either body field. Invalid values return
+  400 with the offending field or header named in `param`.
+- `messages` assistant entries may include `reasoning_content` (string). The
+  field is forwarded to llamaserver history and dropped by other backends.
+
+Reasoning budget pins (`--pin-reasoning-budget` and
+`--pin-reasoning-budget-message`) fill only unset request values. For a backend
+that does not support the budget, the request still succeeds and
+`sonder.warnings` reports that the budget was ignored; this is not a 400.
+On this bundled llama.cpp build, budget `0` does not disable thinking (see PR
+#28356). To turn thinking off, send `chat_template_kwargs.enable_thinking:
+false` (and use `--pin-mode default` if an operator pin should remain a
+fallback).
 
 Ignored: `user` and any unknown top-level field.
 Rejected with 400 `unsupported_parameter`: `tools`, `tool_choice`,
@@ -417,8 +449,10 @@ Non-streaming response:
   `timings.draft_n` and `timings.draft_n_accepted` (speculative decoding).
   `timings.queue_ms` is the scheduler's submit-to-admission time and appears
   for scheduled requests only.
-- `sonder.warnings` (array of strings) appears only when the server changed
-  the request, today only a thinking pin overriding a request value.
+- `sonder.warnings` (array of strings) appears when the server changed or could
+  not apply a request option, including an `override`-mode thinking pin,
+  `empty_content_at_length`, or a reasoning budget ignored by a backend that
+  does not support it.
 
 With `"stream": true` the response is `text/event-stream`: `data:` lines
 carrying `chat.completion.chunk` objects (the first with
@@ -506,17 +540,45 @@ slot (`id_slot`), and every native llama-server request sends
 `chat_template_kwargs.enable_thinking` / `reasoning_effort` and `think` are
 forwarded only when the request (or a pin) sets them: llama-server gets
 `chat_template_kwargs`, Ollama gets `think` (it has no portable
-`reasoning_effort`, which is not sent). On hybrid reasoning models (Qwen3.x)
-these flags change the top of the rendered prompt, so a conversation that
-toggles them re-reads its whole prompt (about 2 minutes for 100k tokens).
-`--pin-enable-thinking` / `--pin-reasoning-effort` fix them server-wide: an
-unset request field takes the pinned value, and a request asking for a
-different value is **overridden** and the response carries a
-`sonder.warnings` entry. Overriding rather than rejecting is deliberate: the
-pin is an operator decision about the served prompt shape (like
-llama-server's `--ctx-size`), and a rejection would fail every turn of a
-client that sets thinking per turn, while the override keeps the turn, keeps
-the prefix cacheable, and says what it changed.
+`reasoning_effort`, which is not sent). Cache reuse depends on the model's
+chat template: an effort change can invalidate the prefix, while a thinking
+toggle can affect only the prompt tail. Measure reuse for the served template.
+`--pin-enable-thinking` / `--pin-reasoning-effort` supply server-wide defaults.
+Their behavior is controlled by `--pin-mode`:
+
+| Mode | Unset request field | Explicit request field | Warning |
+| --- | --- | --- | --- |
+| `override` (default) | pin is applied | pin replaces a conflicting request value | `sonder.warnings` records each conflict; agreeing values add no warning |
+| `default` | pin is applied | request value wins | no pin warning |
+
+The budget pins always fill only unset budget fields, in either mode. A pin is
+an operator decision about the served prompt shape (like llama-server's
+`--ctx-size`); `default` is the mode for callers such as JSON-only planner or
+reviewer steps that must explicitly disable thinking.
+
+The regular top-level `timings` object and existing statistics remain
+unchanged. When llama-server supplies its optional final `timings` object, the
+same upstream values are also exposed additively under
+`usage.sonder.timings`: `prompt_n`, `cache_n`, `prompt_ms`, `predicted_n`,
+`predicted_ms`, `draft_n`, and `draft_n_accepted`. The object is omitted when
+the upstream supplies no timings. If `cache_n` is present and
+`usage.prompt_tokens_details.cached_tokens` was not already set, the latter is
+filled from `cache_n` (including a reported zero).
+
+For example, a llama-server response may add this nested usage object while
+retaining the existing top-level `timings` object:
+
+```json
+{"usage":{"prompt_tokens":13,"completion_tokens":8,"total_tokens":21,
+ "prompt_tokens_details":{"cached_tokens":4},
+ "sonder":{"timings":{"prompt_n":9,"cache_n":4,"prompt_ms":2.1,
+                         "predicted_n":8,"predicted_ms":31.4,"draft_n":10,
+                         "draft_n_accepted":7}}}}
+```
+
+When `finish_reason` is `length` and the assistant `content` is empty, the
+response carries the additive warning `empty_content_at_length` in
+`sonder.warnings`.
 
 Correlation request headers (all optional; values must match
 `[A-Za-z0-9._:-]{1,128}`, otherwise 400 `invalid_correlation_header`):

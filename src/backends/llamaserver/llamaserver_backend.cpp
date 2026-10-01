@@ -609,6 +609,7 @@ Result<GenerateStats> LlamaServerBackendImpl::stream(std::string_view path, std:
         error = llamaserver::parse_timings(object, timing);
         if (!error.ok())
             return false;
+        llamaserver::merge_timings(stats.backend_timings, timing.backend_timings);
         if (timing.prompt_present && !usage_prompt) {
             stats.prompt_tokens = timing.prompt_tokens + timing.cached_tokens;
             stats.token_counts_from_backend = true;
