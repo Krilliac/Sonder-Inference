@@ -46,4 +46,11 @@ sonder_add_module_tests(server
     tests/test_server_priority.cpp)
 if(TARGET sonder_server_tests)
     target_include_directories(sonder_server_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    # GCC 13 raises a false -Wmaybe-uninitialized (fatal under -Werror) from <string> when a
+    # test sets a default-constructed std::optional<std::string> member of ServerOptions;
+    # a function-scope pragma does not reach the inlined library frame. GCC only, this file only.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        set_source_files_properties(tests/test_server_request_path.cpp
+            PROPERTIES COMPILE_OPTIONS "-Wno-maybe-uninitialized")
+    endif()
 endif()
