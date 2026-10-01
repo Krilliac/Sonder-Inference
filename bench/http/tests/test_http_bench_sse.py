@@ -249,7 +249,8 @@ def test_cli_usage_errors(tmp_path, capsys):
     assert bench_http.main(["scenarios"]) == 0
     printed = json.loads(capsys.readouterr().out)
     assert {s["kind"] for s in printed["scenarios"]} == {"agent_session", "concurrency_sweep", "long_context",
-                                                         "repeat_prompt"}
+                                                         "repeat_prompt", "agent_alternate",
+                                                         "priority_contention", "concurrency_stall"}
 
 
 def test_example_config_is_valid():

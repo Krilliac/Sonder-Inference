@@ -172,6 +172,8 @@ def derive(trace: StreamTrace) -> dict[str, Any]:
             prefill_client = processed / ttft
 
     t = trace.timings or {}
+    cache_n = _num(t.get("cache_n"))
+    prompt_n = _num(t.get("prompt_n"))
     draft_n = _num(t.get("draft_n"))
     draft_acc = _num(t.get("draft_n_accepted"))
     acceptance = draft_acc / draft_n if draft_n and draft_acc is not None else None
@@ -191,6 +193,10 @@ def derive(trace: StreamTrace) -> dict[str, Any]:
         "completion_tokens_source": ctok_src,
         "cached_tokens": cached,
         "cached_tokens_source": cached_src,
+        # Additive llama-server fields used by scenario reports.  Keep the
+        # source-labelled cached_tokens/prompt_tokens fields above intact.
+        "cache_n": int(cache_n) if cache_n is not None else None,
+        "prompt_n": int(prompt_n) if prompt_n is not None else None,
         "prefix_hit": hit,
         "prefill_tps_client": prefill_client,
         "prefill_tps_server": _num(t.get("prompt_per_second")),
@@ -201,6 +207,7 @@ def derive(trace: StreamTrace) -> dict[str, Any]:
         "draft_acceptance": acceptance,
         "timings": trace.timings,
         "usage": trace.usage,
+        "sonder_warnings": trace.extra_final.get("sonder_warnings"),
     }
 
 
