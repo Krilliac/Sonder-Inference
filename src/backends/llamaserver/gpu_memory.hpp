@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "sonder/inference/error.hpp"
+#include "sonder/inference/backends/llamaserver_residency.hpp"
 
 namespace sonder::inference::llamaserver {
 
@@ -88,6 +89,12 @@ struct SpillGuardOptions {
     // own baseline.
     std::uint64_t threshold_bytes = 256 * kMiB;
     std::uint64_t baseline_bytes = 0;
+    // Optional growth of the clean baseline with context size, added per
+    // 1,024 tokens of the child's --ctx-size (default 0 = fixed baseline).
+    // Clean shared usage rises with context: about 1 MiB per 1k ctx without
+    // speculation and about 2 MiB per 1k ctx (+~40 MiB after the first
+    // prompt) with MTP (--spec-type draft-mtp), measured 2026-09-30.
+    std::uint64_t baseline_bytes_per_1k_ctx = 0;
     // Periodic re-sampling while the child runs (monitor thread only).
     std::chrono::milliseconds sample_interval{5000};
     // auto_fit: next = align_down(ctx * step_factor, step_align), always at
@@ -96,11 +103,17 @@ struct SpillGuardOptions {
     std::uint64_t step_align = 1024;
     std::uint64_t min_ctx = 8192;
     std::size_t max_attempts = 4;
+    LlamaServerResidencyGuardOptions residency;
 };
 
 Status validate_spill_guard(const SpillGuardOptions &options);
 
-bool is_spilled(const GpuMemorySample &sample, const SpillGuardOptions &options);
+// baseline_bytes + baseline_bytes_per_1k_ctx * ctx / 1024 (saturating); the
+// fixed baseline when the context size is unknown.
+std::uint64_t effective_baseline(const SpillGuardOptions &options, std::optional<std::uint64_t> ctx);
+
+bool is_spilled(const GpuMemorySample &sample, const SpillGuardOptions &options,
+                std::optional<std::uint64_t> ctx = std::nullopt);
 
 // The next smaller context for auto_fit, or nullopt when `current` is already
 // at (or below) the floor. Strictly decreasing, so repeated application

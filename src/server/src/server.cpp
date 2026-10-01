@@ -5,7 +5,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
-#include <ctime>
 #include <mutex>
 #include <set>
 #include <system_error>
@@ -15,13 +14,17 @@
 #include <variant>
 #include <vector>
 
+#include "anthropic.hpp"
+#include "chat_handler.hpp"
 #include "http.hpp"
+#include "health_features.hpp"
 #include "identity.hpp"
 #include "live_hub.hpp"
 #include "openai.hpp"
+#include "priority_admission.hpp"
 #include "request_path.hpp"
+#include "residency.hpp"
 #include "socket.hpp"
-#include "test_hooks.hpp"
 #include "../../common/loopback.hpp"
 #include "sonder/inference/engine.hpp"
 #include "sonder/inference/json.hpp"
@@ -46,7 +49,8 @@ const std::vector<std::string>& default_origins() {
 
 constexpr const char* kAllowHeaders =
     "Accept, Authorization, Cache-Control, Content-Type, Last-Event-ID, X-Sonder-Run-Id, "
-    "X-Sonder-Parent-Request-Id, X-Sonder-Agent-Id, X-Sonder-Task-Id, X-Sonder-Workload, X-Sonder-Priority";
+    "X-Sonder-Parent-Request-Id, X-Sonder-Agent-Id, X-Sonder-Task-Id, X-Sonder-Workload, X-Sonder-Priority, "
+    "X-Sonder-Deadline-Ms, X-Sonder-Reasoning-Budget";
 constexpr const char* kExposeHeaders = "X-Sonder-Inference-Api, X-Sonder-Request-Id, Retry-After";
 
 enum class State { starting, ready, draining, stopped };
@@ -61,7 +65,7 @@ const char* state_name(State s) noexcept {
     return "draining";
 }
 
-enum class Route { none, health, models, identity, chat, embeddings, discovery, telemetry, telemetry_sse, telemetry_ndjson };
+enum class Route { none, health, models, identity, chat, messages, embeddings, discovery, telemetry, telemetry_sse, telemetry_ndjson };
 
 struct RouteInfo {
     Route route = Route::none;
@@ -73,6 +77,7 @@ RouteInfo lookup_route(std::string_view path) {
     if (path == "/v1/models") return {Route::models, "GET"};
     if (path == "/v1/sonder/identity") return {Route::identity, "GET"};
     if (path == "/v1/chat/completions") return {Route::chat, "POST"};
+    if (path == "/v1/messages") return {Route::messages, "POST"};
     if (path == "/v1/embeddings") return {Route::embeddings, "POST"};
     if (path == "/.well-known/sonder-telemetry") return {Route::discovery, "GET"};
     if (path == "/v1/telemetry") return {Route::telemetry, "GET"};
@@ -160,20 +165,6 @@ double seconds_since(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
 
-std::int64_t unix_seconds() {
-    return static_cast<std::int64_t>(std::time(nullptr));
-}
-
-struct ServedModel {
-    std::string id;
-    std::string backend;
-    bool is_default = false;
-    std::shared_ptr<Model> model;
-    // Launch profile binding (empty without one).
-    SamplingDefaults sampling_defaults;
-    std::optional<json::Object> profile;
-};
-
 // Per-connection bookkeeping shared between the accept loop and the
 // connection thread.
 struct ConnFlags {
@@ -258,7 +249,12 @@ json::Object profile_with_runtime_context(json::Object profile, const std::optio
 // ============================================================ Server::Impl
 
 struct Server::Impl {
-    explicit Impl(ServerOptions o) : opts(std::move(o)) {}
+    explicit Impl(ServerOptions o) : opts(std::move(o)) {
+        residency = std::make_shared<ModelResidency>(
+            ResidencyConfig{opts.model_idle_ttl, opts.max_resident_models},
+            [this](const std::string& id) { return load_served_model(id); },
+            [this](Eviction& ev) { on_model_evicted(ev); });
+    }
 
     ServerOptions opts;
     std::atomic<State> state{State::starting};
@@ -280,8 +276,10 @@ struct Server::Impl {
     mutable std::mutex engine_mu;
     std::unique_ptr<Engine> engine;
     std::shared_ptr<Backend> backend;
-    mutable std::mutex models_mu;
-    std::vector<ServedModel> served;
+    // Served models: registered during start(), loaded eagerly (default) or
+    // on first use, pinned by in-flight requests, optionally evicted when
+    // idle (docs/SERVER.md "Model residency").
+    std::shared_ptr<ModelResidency> residency;
 
     // Backend probe cache (health must stay cheap: it never does backend I/O).
     std::shared_ptr<ProbeCache> probe = std::make_shared<ProbeCache>();
@@ -309,6 +307,7 @@ struct Server::Impl {
     std::mutex inflight_mu;
     std::condition_variable inflight_cv;
     std::set<std::shared_ptr<Session>> inflight;
+    PriorityAdmission admission;
 
     std::once_flag stop_once;
     std::mutex stopped_mu;
@@ -395,26 +394,132 @@ struct Server::Impl {
         if (error.status == 401) {
             extra.emplace_back("WWW-Authenticate", "Bearer");
         }
-        send_json(ex, error.status, error_body(error), extra);
+        send_json(ex, error.status, ex.path == "/v1/messages" ? anthropic_error_body(error) : error_body(error), extra);
     }
 
     // ------------------------------------------------------------ helpers
 
     json::Object sonder_meta() const { return json::Object{{"api_version", kApiVersion}}; }
 
-    std::vector<ServedModel> served_snapshot() const {
-        std::lock_guard<std::mutex> lock(models_mu);
-        return served;
-    }
+    // ------------------------------------------------------ model residency
 
-    std::optional<ServedModel> resolve_model(const std::string& id) const {
-        std::lock_guard<std::mutex> lock(models_mu);
-        for (const auto& m : served) {
-            if (m.id == id || (id == "default" && m.is_default)) {
-                return m;
+    // Loads a served model on the engine (residency loader; no lock held).
+    Result<std::shared_ptr<Model>> load_served_model(const std::string& id) {
+        Engine* e = nullptr;
+        std::string backend_name;
+        {
+            std::lock_guard<std::mutex> lock(engine_mu);
+            e = engine.get();
+            if (backend) {
+                backend_name = backend->name();
             }
         }
-        return std::nullopt;
+        if (e == nullptr || backend_name.empty()) {
+            return Status(ErrorCode::unavailable, "the engine is not running");
+        }
+        // A lazy load that would start after stop() began only delays the
+        // shutdown: refuse it (503 not_ready, safe to retry elsewhere).
+        if (stopping.load()) {
+            return Status(ErrorCode::unavailable, "sonder-inference is draining");
+        }
+        ModelLoadOptions lo;
+        // A launch profile may load the model under another name (a llamacpp
+        // profile's GGUF path) while it is served under the profile's name.
+        // Every load goes through here: eager, lazy and after an eviction.
+        const ModelProfileBinding* binding = profile_binding(id);
+        lo.model = binding != nullptr && !binding->load_name.empty() ? binding->load_name : id;
+        // Keep ModelLoadOptions' default device unless --device was given.
+        if (!opts.device.empty()) lo.device_id = opts.device;
+        return e->load_model(backend_name, lo);
+    }
+
+    // The launch profile bound to served model `id`, if any (validate_options
+    // guarantees at most one per model).
+    const ModelProfileBinding* profile_binding(const std::string& id) const {
+        for (const auto& b : opts.profile_bindings) {
+            if (b.model == id) {
+                return &b;
+            }
+        }
+        return nullptr;
+    }
+
+    // Residency evictor: `model.evicted`, then the engine's `model.unload`.
+    // The residency's reference is dropped first, so `model.unload` reports
+    // the references still held elsewhere (none: evicted models are never
+    // pinned) and the backend model is freed inside unload_model() without
+    // any server lock held. Every eviction source (request threads and the
+    // sweeper) has finished before stop() destroys the engine.
+    void on_model_evicted(Eviction& ev) {
+        if (!ev.model) {
+            return;
+        }
+        const std::string model_instance = ev.model->instance_id();
+        const std::string device_id = ev.model->device_id();
+        ev.model.reset();
+        Engine* e = engine_ptr();
+        if (e == nullptr) {
+            return;
+        }
+        TelemetryContext ctx = e->engine_context();
+        ctx.model_instance_id = model_instance;
+        if (!device_id.empty()) {
+            ctx.device_id = device_id;
+        }
+        e->telemetry().emit("model.evicted", ctx,
+                            json::Object{{"backend", ev.backend},
+                                         {"model", ev.id},
+                                         {"reason", std::string(ev.reason)},
+                                         {"idle_ms", ev.idle_ms}},
+                            TelemetryLevel::metrics);
+        (void)e->unload_model(model_instance);
+        log_message("info", "unloaded model '" + ev.id + "' (" + ev.reason + ")");
+    }
+
+    // A lazy load that failed before anything executed.
+    static ApiError load_failure_error(const std::string& id, const Status& st) {
+        if (st.code() == ErrorCode::not_found) {
+            return make_error(404, "model_not_found", "cannot load model '" + id + "': " + st.message(), "model");
+        }
+        return make_error(503, "not_ready",
+                          "cannot load model '" + id + "': " + st.message() +
+                              "; nothing was executed, the request is safe to send elsewhere");
+    }
+
+    json::Array health_models() const {
+        json::Array models;
+        for (const auto& m : residency->snapshot()) {
+            json::Object entry{{"id", m.id}, {"backend", m.backend}, {"default", m.is_default}};
+            // Additive residency fields (docs/SERVER.md "Model residency").
+            entry.set("state", residency_state_name(m.state));
+            entry.set("resident", m.state == ResidencyState::resident);
+            entry.set("in_flight", m.pins);
+            entry.set("loads", m.loads);
+            entry.set("load_failures", m.load_failures);
+            entry.set("evictions", m.evictions);
+            entry.set("idle_s", m.idle_s ? json::Value(*m.idle_s) : json::Value(nullptr));
+            entry.set("model_instance_id",
+                      m.model_instance_id.empty() ? json::Value(nullptr) : json::Value(m.model_instance_id));
+            models.emplace_back(std::move(entry));
+        }
+        return models;
+    }
+
+    json::Object residency_summary() const {
+        const ResidencyTotals t = residency->totals();
+        const ResidencyConfig& c = residency->config();
+        return json::Object{
+            {"mode", opts.lazy_models ? "lazy" : "eager"},
+            {"idle_ttl_s", c.idle_ttl.count() > 0 ? json::Value(std::chrono::duration<double>(c.idle_ttl).count())
+                                                  : json::Value(nullptr)},
+            {"max_resident", c.max_resident > 0 ? json::Value(c.max_resident) : json::Value(nullptr)},
+            {"registered", t.registered},
+            {"resident", t.resident},
+            {"loading", t.loading},
+            {"unloading", t.unloading},
+            {"loads", t.loads},
+            {"load_failures", t.load_failures},
+            {"evictions", t.evictions}};
     }
 
     // Last probe result (refreshed every kProbeInterval by probe_thread).
@@ -499,6 +604,7 @@ struct Server::Impl {
         std::string version;
         backend_status(available, version);
         json::Array backends;
+        std::string bound_backend;
         {
             std::shared_ptr<Backend> b;
             {
@@ -506,6 +612,7 @@ struct Server::Impl {
                 b = backend;
             }
             if (b) {
+                bound_backend = b->name();
                 json::Array caps;
                 for (const auto& c : b->capabilities().names()) {
                     caps.emplace_back(c);
@@ -522,10 +629,7 @@ struct Server::Impl {
                 backends.emplace_back(std::move(entry));
             }
         }
-        json::Array models;
-        for (const auto& m : served_snapshot()) {
-            models.emplace_back(json::Object{{"id", m.id}, {"backend", m.backend}, {"default", m.is_default}});
-        }
+        json::Array models = health_models();
         const HubStats hs = hub->stats();
         std::uint64_t emitted = 0;
         std::uint64_t dropped = 0;
@@ -536,6 +640,7 @@ struct Server::Impl {
                 dropped = engine->telemetry().dropped_events();
             }
         }
+        const auto queued = admission.queued();
         json::Object body{{"status", state_name(s)},
                           {"api_version", kApiVersion},
                           {"version", version_string()},
@@ -548,6 +653,10 @@ struct Server::Impl {
                           {"auth_required", !opts.token.empty()},
                           {"backends", std::move(backends)},
                           {"models", std::move(models)},
+                          {"queued_by_class", json::Object{{"interactive", queued[0]},
+                                                           {"subagent", queued[1]},
+                                                           {"background", queued[2]}}},
+                          {"residency", residency_summary()},
                           {"telemetry", json::Object{{"level", to_string(opts.telemetry_level)},
                                                      {"subscribers", hs.subscribers},
                                                      {"retained", hs.retained},
@@ -555,7 +664,7 @@ struct Server::Impl {
                                                      {"emitted", emitted},
                                                      {"dropped", dropped},
                                                      {"subscriber_dropped_events", hs.subscriber_dropped_events}}},
-                          {"sonder", sonder_meta()}};
+                          {"sonder", health_features(bound_backend, opts, sonder_meta())}};
         send_json(ex, s == State::ready ? 200 : 503, body);
     }
 
@@ -581,22 +690,28 @@ struct Server::Impl {
         }
         const std::optional<BackendRuntimeStatus> runtime = b ? b->runtime_status() : std::nullopt;
         json::Array data;
-        for (const auto& m : served_snapshot()) {
+        for (const auto& m : residency->snapshot()) {
             json::Object ext{{"backend", m.backend}, {"default", m.is_default}, {"synthetic", synthetic}};
             // Additive: context fit, GPU memory and warnings of the backend
-            // process serving this model, when the backend reports them.
+            // process serving this model, when the backend reports them. This
+            // describes the backend process, not the model handle, so it is
+            // reported whatever the model's residency state (a lazy or
+            // evicted model is still served by that process).
             if (runtime && b->name() == m.backend) {
                 ext.set("runtime", to_json(*runtime));
             }
-            if (m.profile) {
+            // Additive: the launch profile behind this model (whatever its
+            // residency state, like `runtime` above).
+            if (const ModelProfileBinding* binding = profile_binding(m.id)) {
                 const bool own_runtime = b && b->name() == m.backend;
-                ext.set("profile", profile_with_runtime_context(
-                                       *m.profile, own_runtime ? runtime : std::optional<BackendRuntimeStatus>{}));
+                ext.set("profile",
+                        profile_with_runtime_context(binding->metadata, own_runtime ? runtime
+                                                                                     : std::optional<BackendRuntimeStatus>{}));
             }
             data.emplace_back(json::Object{
                 {"id", m.id}, {"object", "model"}, {"owned_by", "sonder-inference"}, {"sonder", std::move(ext)}});
         }
-        json::Object meta = sonder_meta();
+        json::Object meta = health_features(b ? b->name() : "", opts, sonder_meta());
         if (!opts.profile_catalog.empty()) {
             json::Array catalog;
             for (const auto& entry : opts.profile_catalog) {
@@ -622,19 +737,33 @@ struct Server::Impl {
                 wanted = *m;
             }
         }
-        const auto served_model = resolve_model(wanted);
-        if (!served_model) {
+        const auto served_id = residency->resolve(wanted);
+        if (!served_id) {
             send_error(ex, make_error(404, "model_not_found", "model '" + wanted + "' is not served", "model"));
             return;
         }
         bool available = false;
         std::string version;
         backend_status(available, version);
-        const IdentityResult id =
-            backend_identity(*served_model->model, available ? std::optional<std::string>(version) : std::nullopt);
+        const std::optional<std::string> probed = available ? std::optional<std::string>(version) : std::nullopt;
+        // Identity never loads a model (no backend I/O here): a model that is
+        // not resident reports the descriptor of its last load, if any.
+        IdentityResult id;
+        if (const std::shared_ptr<Model> model = residency->resident_model(*served_id)) {
+            id = backend_identity(*model, probed);
+        } else {
+            std::string backend_name;
+            for (const auto& m : residency->snapshot()) {
+                if (m.id == *served_id) {
+                    backend_name = m.backend;
+                }
+            }
+            const std::optional<ModelDescriptor> last = residency->last_descriptor(*served_id);
+            id = backend_identity(backend_name, *served_id, last ? &*last : nullptr, probed);
+        }
         send_json(ex, 200,
                   json::Object{{"schema", "sonder.inference.identity/1"},
-                               {"model", served_model->id},
+                               {"model", *served_id},
                                {"synthetic", synthetic},
                                {"backend_identity", id.backend_identity},
                                {"reason", id.reason},
@@ -766,14 +895,15 @@ struct Server::Impl {
         hub->unsubscribe(sub);
     }
 
-    void handle_chat(Exchange& ex, const RequestHead& head, const std::string& body) {
+    void handle_chat(Exchange& ex, const RequestHead& head, const std::string& body,
+                     ChatProtocol protocol = ChatProtocol::openai) {
         auto corr_v = parse_correlation(head);
         if (auto* e = std::get_if<ApiError>(&corr_v)) {
             send_error(ex, *e);
             return;
         }
         const Correlation corr = std::get<Correlation>(corr_v);
-        auto job_v = parse_chat_request(body);
+        auto job_v = protocol == ChatProtocol::anthropic ? parse_messages_request(body) : parse_chat_request(body);
         if (auto* e = std::get_if<ApiError>(&job_v)) {
             send_error(ex, *e);
             return;
@@ -782,13 +912,26 @@ struct Server::Impl {
         if (!require_ready(ex)) {
             return;
         }
-        const auto served_model = resolve_model(job.model);
-        if (!served_model) {
+        const auto served_id = residency->resolve(job.model);
+        if (!served_id) {
             send_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
             return;
         }
-        // Launch profile defaults fill only the fields the request left unset.
-        apply_sampling_defaults(served_model->sampling_defaults, job.sampling);
+        // Pins the model for the whole request (never evicted meanwhile);
+        // loads it first when it is not resident (lazy residency, or evicted
+        // after its idle TTL). Released after the response, when the session
+        // (declared later, destroyed earlier) is gone.
+        auto pinned = residency->acquire(*served_id);
+        if (!pinned.ok()) {
+            send_error(ex, load_failure_error(*served_id, pinned.status()));
+            return;
+        }
+        const ModelResidency::Pin pin = std::move(pinned).value();
+        // Launch profile defaults fill only the fields the request left unset
+        // (both chat protocols; "default" resolves to the served id first).
+        if (const ModelProfileBinding* binding = profile_binding(*served_id)) {
+            apply_sampling_defaults(binding->sampling_defaults, job.sampling);
+        }
 
         SessionOptions so;
         so.sampling = job.sampling;
@@ -804,7 +947,7 @@ struct Server::Impl {
                 send_error(ex, make_error(503, "not_ready", "sonder-inference is draining"));
                 return;
             }
-            auto created = engine->create_session(served_model->model, so);
+            auto created = engine->create_session(pin.model(), so);
             if (!created.ok()) {
                 send_error(ex, map_session_failure(created.status(), false));
                 return;
@@ -823,189 +966,27 @@ struct Server::Impl {
             inflight.insert(session);
         }
 
-        RequestOptions ro;
-        ro.request_id = make_id("req");
-        ro.parent_request_id = corr.parent_request_id;
-        ro.session_key = chat_session_key(job, corr);
-        ro.thinking = job.thinking;
-        const std::vector<std::string> warnings = apply_thinking_pins(opts, ro.thinking);
-        const std::string completion_id = "chatcmpl-" + *ro.request_id;
-        // X-Sonder-Request-Id and the access log carry the engine request id.
-        ex.request_id = *ro.request_id;
-        const std::int64_t created_at = unix_seconds();
-
-        // Client disconnect cancels the request (request.cancelled).
-        std::mutex watch_mu;
-        std::condition_variable watch_cv;
-        bool watch_done = false;
-        std::atomic<bool> disconnected{false};
-        std::thread watcher;
-        // Stops and joins the watcher and leaves `inflight` on every exit,
-        // including an exception out of the chat call: a joinable std::thread
-        // destroyed during unwinding would call std::terminate.
-        bool left_inflight = false;
-        const auto end_request = [&] {
-            {
-                std::lock_guard<std::mutex> lock(watch_mu);
-                watch_done = true;
-            }
-            watch_cv.notify_all();
-            if (watcher.joinable()) {
-                watcher.join();
-            }
-            if (!left_inflight) {
-                left_inflight = true;
+        ChatExchange exchange{
+            opts, ex.sock, ex.request_id, ex.status, synthetic,
+            ex.started, admission, hard_stop, engine_ptr()->telemetry(),
+            [&] {
                 {
                     std::lock_guard<std::mutex> lock(inflight_mu);
                     inflight.erase(session);
                 }
                 inflight_cv.notify_all();
-            }
-        };
-        struct EndRequestGuard {
-            const decltype(end_request)& end;
-            ~EndRequestGuard() { end(); }
-        } end_guard{end_request};
-        try {
-            if (detail::take_watcher_spawn_failure()) {
-                throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
-                                        "test hook: watcher thread creation refused");
-            }
-            watcher = std::thread([&] {
-                std::unique_lock<std::mutex> lock(watch_mu);
-                while (!watch_done) {
-                    lock.unlock();
-                    if (peer_gone(ex.sock)) {
-                        disconnected.store(true);
-                        session->cancel();
-                        return;
-                    }
-                    lock.lock();
-                    watch_cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return watch_done; });
-                }
-            });
-        } catch (const std::system_error&) {
-            // The OS refused a thread (thread or memory limits). Nothing ran:
-            // answer 503 for this request instead of taking the server down.
-            end_request();
-            session->close();
-            log_message("warning", "cannot start a request thread; chat request refused (503)");
-            ApiError e = make_error(503, "overloaded",
-                                    "sonder-inference cannot start a request thread right now; nothing was executed, "
-                                    "retry later");
-            e.retry_after = 1;
-            send_error(ex, e);
-            return;
-        }
-
-        bool headers_sent = false;
-        bool write_failed = false;
-        const auto chunk_object = [&](json::Object delta, json::Value finish) {
-            return json::Object{{"id", completion_id},
-                                {"object", "chat.completion.chunk"},
-                                {"created", created_at},
-                                {"model", served_model->id},
-                                {"choices", json::Array{json::Object{{"index", 0},
-                                                                     {"delta", std::move(delta)},
-                                                                     {"finish_reason", std::move(finish)}}}}};
-        };
-        const auto send_event = [&](const json::Object& obj) {
-            if (write_failed) {
-                return false;
-            }
-            std::string frame = "data: ";
-            frame += json::Value(obj).dump();
-            frame += "\n\n";
-            if (!send_raw(ex, frame)) {
-                write_failed = true;
-            }
-            return !write_failed;
-        };
-        const auto ensure_stream_head = [&]() {
-            if (headers_sent) {
-                return !write_failed;
-            }
-            headers_sent = true;
-            ex.status = 200;
-            Headers h = base_headers(ex, "text/event-stream; charset=utf-8");
-            h.emplace_back("X-Accel-Buffering", "no");
-            if (!send_raw(ex, format_head(200, h))) {
-                write_failed = true;
-                return false;
-            }
-            return send_event(chunk_object(json::Object{{"role", "assistant"}, {"content", ""}}, nullptr));
-        };
-
-        TokenCallback on_chunk;
-        if (job.stream) {
-            on_chunk = [&](const TokenChunk& chunk) {
-                if (!ensure_stream_head() ||
-                    !send_event(chunk_object(json::Object{{"content", std::string(chunk.text)}}, nullptr))) {
-                    session->cancel();
-                    return false;
-                }
-                return true;
-            };
-        }
-
-        auto result = session->chat(job.messages, on_chunk, job.sampling, ro);
-        end_request();
-        const bool rejected = session->last_scheduler_rejected();
-
-        if (disconnected.load() || write_failed) {
-            ex.status = 499;  // client closed the request (access log only)
-            session->close();
-            return;
-        }
-        if (!result.ok()) {
-            session->close();
-            const ApiError e = map_session_failure(result.status(), rejected);
-            if (headers_sent) {
-                (void)send_event(error_body(e));
-            } else {
-                send_error(ex, e);
-            }
-            return;
-        }
-        const GenerationResult& r = result.value();
-        json::Object meta{{"api_version", kApiVersion},
-                          {"request_id", r.request_id},
-                          {"session_id", session->id()},
-                          {"backend", served_model->backend},
-                          {"synthetic", synthetic},
-                          {"token_counts_from_backend", r.stats.token_counts_from_backend}};
-        if (!warnings.empty()) {
-            meta.set("warnings", json::Array(warnings.begin(), warnings.end()));
-        }
-        session->close();
-        if (!job.stream) {
-            json::Object doc{
-                {"id", completion_id},
-                {"object", "chat.completion"},
-                {"created", created_at},
-                {"model", served_model->id},
-                {"choices",
-                 json::Array{json::Object{{"index", 0},
-                                          {"message", json::Object{{"role", "assistant"}, {"content", r.text}}},
-                                          {"finish_reason", finish_reason(r)}}}},
-                {"usage", usage_json(r)},
-                {"timings", timings_json(r)},
-                {"sonder", std::move(meta)}};
-            send_json(ex, 200, doc);
-            return;
-        }
-        if (!ensure_stream_head()) {
-            return;
-        }
-        json::Object last = chunk_object(json::Object{}, finish_reason(r));
-        if (job.include_usage) {
-            last.set("usage", usage_json(r));
-        }
-        last.set("timings", timings_json(r));
-        last.set("sonder", std::move(meta));
-        if (send_event(last)) {
-            (void)send_raw(ex, "data: [DONE]\n\n");
-        }
+            },
+            [&](std::string_view data) { return send_raw(ex, data); },
+            [&] {
+                ex.status = 200;
+                Headers h = base_headers(ex, "text/event-stream; charset=utf-8");
+                h.emplace_back("X-Accel-Buffering", "no");
+                return send_raw(ex, format_head(200, h));
+            },
+            [&](int status, const json::Object& doc) { send_json(ex, status, doc); },
+            [&](const ApiError& error) { send_error(ex, error); },
+            [&] { log_message("warning", "cannot start a request thread; chat request refused (503)"); }};
+        execute_chat(exchange, job, corr, pin.id(), pin.backend(), session, protocol);
     }
 
     // --------------------------------------------------------- connection
@@ -1023,6 +1004,8 @@ struct Server::Impl {
                 return true;
             }
             if (pr.state == ParseState::error) {
+                // Header parsing may already have identified this endpoint.
+                if (head.path == "/v1/messages") ex.path = head.path;
                 const char* code = pr.status == 431   ? "request_header_fields_too_large"
                                    : pr.status == 505 ? "http_version_not_supported"
                                                       : "malformed_request";
@@ -1179,7 +1162,8 @@ struct Server::Impl {
         if (preflight) {
             Headers h = base_headers(ex, "");
             h.emplace_back("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            h.emplace_back("Access-Control-Allow-Headers", kAllowHeaders);
+            h.emplace_back("Access-Control-Allow-Headers", route.route == Route::messages
+                ? std::string(kAllowHeaders) + ", X-Api-Key, Anthropic-Version, Anthropic-Beta" : kAllowHeaders);
             h.emplace_back("Access-Control-Max-Age", "600");
             if (origin != nullptr && head.header("access-control-request-private-network") != nullptr) {
                 h.emplace_back("Access-Control-Allow-Private-Network", "true");
@@ -1198,8 +1182,13 @@ struct Server::Impl {
                                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
                 ok = scheme == "bearer " && constant_time_equals(std::string_view(*auth).substr(7), opts.token);
             }
+            if (!ok && route.route == Route::messages) {
+                const std::string* key = head.header("x-api-key");
+                ok = key != nullptr && constant_time_equals(*key, opts.token);
+            }
             if (!ok) {
-                send_error(ex, make_error(401, "unauthorized", "a valid bearer token is required"));
+                send_error(ex, make_error(401, "unauthorized", route.route == Route::messages
+                    ? "a valid bearer token or x-api-key is required" : "a valid bearer token is required"));
                 return;
             }
         }
@@ -1252,6 +1241,7 @@ struct Server::Impl {
             case Route::models: handle_models(ex); break;
             case Route::identity: handle_identity(ex, head); break;
             case Route::chat: handle_chat(ex, head, body); break;
+            case Route::messages: handle_chat(ex, head, body, ChatProtocol::anthropic); break;
             case Route::embeddings:
                 send_error(ex, make_error(501, "not_implemented", "embeddings are not implemented by sonder-inference"));
                 break;
@@ -1512,6 +1502,9 @@ struct Server::Impl {
         }
         eo.server = EngineServerInfo{opts.host, bound_port, kApiVersion};
         apply_scheduling(opts, eo.scheduling);
+        // Preserve the origin scheduler's default ordering unless the
+        // operator actually enabled the server-side priority policy.
+        eo.scheduling.strict_priority_admission = priority_admission_enabled(opts);
         {
             std::lock_guard<std::mutex> lock(engine_mu);
             engine = std::make_unique<Engine>(std::move(eo));
@@ -1592,28 +1585,22 @@ struct Server::Impl {
                 return cancelled_start();
             }
             StepGuard step{*this};
-            const ModelProfileBinding* binding = nullptr;
-            for (const auto& b : opts.profile_bindings) {
-                if (b.model == ids[i]) binding = &b;
+            // Registration is bookkeeping only (no backend I/O).
+            (void)residency->add(ids[i], backend_name, i == 0);
+            // Lazy residency loads on first use; eager (the default) loads
+            // every model now, or the first --max-resident-models of them.
+            if (opts.lazy_models || (opts.max_resident_models != 0 && i >= opts.max_resident_models)) {
+                continue;
             }
-            ModelLoadOptions lo;
-            lo.model = binding && !binding->load_name.empty() ? binding->load_name : ids[i];
-            // Keep ModelLoadOptions' default device unless --device was given.
-            if (!opts.device.empty()) lo.device_id = opts.device;
             // No lock held: the load may block on backend I/O while health
             // keeps answering 503 "starting". stop() waits for this step.
-            Result<std::shared_ptr<Model>> loaded = engine_ptr()->load_model(backend_name, lo);
+            // The pin is released at once: the model stays resident.
+            // load_served_model() applies a launch profile's load name.
+            auto loaded = residency->acquire(ids[i]);
             if (!loaded.ok()) {
                 return Status(loaded.status().code(), "cannot load model '" + ids[i] + "' on " + backend_name + ": " +
                                                           loaded.status().message());
             }
-            std::lock_guard<std::mutex> lock(models_mu);
-            ServedModel entry{ids[i], backend_name, i == 0, loaded.value(), {}, std::nullopt};
-            if (binding) {
-                entry.sampling_defaults = binding->sampling_defaults;
-                entry.profile = binding->metadata;
-            }
-            served.push_back(std::move(entry));
         }
         {
             if (!begin_step()) {
@@ -1624,6 +1611,17 @@ struct Server::Impl {
             // the refresher so health never waits on the backend.
             store_probe(*probe, made->probe());
             start_probe_refresher(made);
+            // Idle-TTL evictions (no thread unless --model-idle-ttl is set).
+            residency->start_sweeper();
+        }
+        // A backend that does not advertise slots is intentionally left
+        // ungated.  In particular, remote backends may already run multiple
+        // requests (for example Ollama NUM_PARALLEL or a worker pool).
+        if (priority_admission_enabled(opts)) {
+            const std::size_t capacity = opts.backend_capacity != 0 ? opts.backend_capacity
+                                                                   : made->max_concurrent_requests();
+            admission.configure(capacity, opts.max_concurrent_subagent, opts.max_concurrent_background,
+                                opts.max_queue_per_class);
         }
         State expected = State::starting;
         state.compare_exchange_strong(expected, State::ready);
@@ -1691,10 +1689,10 @@ struct Server::Impl {
         }
         // 4. engine.stopped (and a final telemetry.dropped) reach the hub.
         stop_probe_refresher(std::max(opts.shutdown_grace, std::chrono::milliseconds(100)));
-        {
-            std::lock_guard<std::mutex> models_lock(models_mu);
-            served.clear();
-        }
+        // No evictions after this point; the handles go with the engine
+        // (shutdown emits no model.unload, as before lazy residency).
+        residency->stop_sweeper();
+        residency->clear();
         std::unique_ptr<Engine> doomed;
         {
             std::lock_guard<std::mutex> lock(engine_mu);
@@ -1754,6 +1752,9 @@ Status validate_options(const ServerOptions& o) {
             return Status(ErrorCode::invalid_argument,
                           "unknown or unavailable backend '" + o.backend.backend + "' (this build has: " + list + ")");
         }
+        if (Status st = validate_backend_setup(o.backend); !st.ok()) {
+            return st;
+        }
     }
     if (o.models.empty() && !is_synthetic_backend(backend_name)) {
         return Status(ErrorCode::invalid_argument, "--model is required for backend " + backend_name +
@@ -1787,6 +1788,9 @@ Status validate_options(const ServerOptions& o) {
     if (o.max_connections == 0 || o.max_body_bytes == 0 || o.telemetry_buffer == 0 || o.max_subscribers == 0) {
         return Status(ErrorCode::invalid_argument,
                       "--max-connections, --max-body-bytes and --telemetry-buffer must be positive");
+    }
+    if (o.model_idle_ttl.count() < 0) {
+        return Status(ErrorCode::invalid_argument, "--model-idle-ttl must not be negative");
     }
     for (const auto& origin : o.cors_origins) {
         if (!is_serialized_origin(origin)) {

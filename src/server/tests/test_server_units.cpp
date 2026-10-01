@@ -233,6 +233,16 @@ TEST_CASE("openai: correlation headers") {
     CHECK(c.parent_request_id == std::optional<std::string>("turn:42"));
     CHECK(c.workload == WorkloadClass::maintenance);
     CHECK(c.priority == -16);
+    CHECK(c.priority_class == RequestPriority::interactive);
+
+    for (const auto* value : {"interactive", "subagent", "background"}) {
+        RequestHead class_head;
+        class_head.headers = {{"x-sonder-priority", value}};
+        const auto class_result = parse_correlation(class_head);
+        REQUIRE(std::holds_alternative<Correlation>(class_result));
+        CHECK(std::get<Correlation>(class_result).priority == 0);
+        CHECK(std::get<Correlation>(class_result).priority_class == parse_request_priority(value));
+    }
 
     RequestHead none;
     const auto defaults = parse_correlation(none);
@@ -244,6 +254,7 @@ TEST_CASE("openai: correlation headers") {
              {"x-sonder-agent-id", std::string(129, 'a')},
              {"x-sonder-workload", "urgent"},
              {"x-sonder-priority", "17"},
+             {"x-sonder-priority", "backgroundx"},
              {"x-sonder-priority", "1.5"},
              {"x-sonder-priority", ""}}) {
         RequestHead bad;
@@ -529,4 +540,52 @@ TEST_CASE("backend setup: tensor overrides parse as PATTERN=DEVICE") {
     CHECK_FALSE(parse_tensor_override("=cpu"));
     CHECK_FALSE(parse_tensor_override("pattern="));
     CHECK(parse_tensor_override("=cpu").status().code() == ErrorCode::invalid_argument);
+}
+
+TEST_CASE("backend setup: llama.cpp context options are validated up front") {
+    BackendSetup unset;
+    unset.backend = "llamacpp";
+    CHECK(validate_backend_setup(unset).ok());  // defaults are always valid
+    CHECK_FALSE(unset.llamacpp_batch_size.has_value());
+    CHECK_FALSE(unset.llamacpp_ubatch_size.has_value());
+    CHECK_FALSE(unset.llamacpp_kv_cache_type_k.has_value());
+    CHECK_FALSE(unset.llamacpp_kv_cache_type_v.has_value());
+    CHECK_FALSE(unset.llamacpp_flash_attention.has_value());
+
+    BackendSetup ok = unset;
+    ok.llamacpp_kv_cache_type_k = "q8_0";
+    ok.llamacpp_kv_cache_type_v = "q8_0";
+    ok.llamacpp_flash_attention = "on";
+    ok.llamacpp_batch_size = 1024;
+    ok.llamacpp_ubatch_size = 256;
+    CHECK(validate_backend_setup(ok).ok());
+
+    BackendSetup bad = unset;
+    bad.llamacpp_kv_cache_type_v = "q4_0";
+    bad.llamacpp_flash_attention = "off";
+    // Options for other backends are never checked.
+    BackendSetup mock = bad;
+    mock.backend = "mock";
+    CHECK(validate_backend_setup(mock).ok());
+#if defined(SONDER_HAS_LLAMACPP_BACKEND)
+    const Status st = validate_backend_setup(bad);
+    CHECK(st.code() == ErrorCode::invalid_argument);
+    CHECK(st.message().find("flash attention") != std::string::npos);
+    CHECK(make_backend(bad).status().code() == ErrorCode::invalid_argument);
+    BackendSetup name = unset;
+    name.llamacpp_kv_cache_type_k = "q9_9";
+    CHECK(validate_backend_setup(name).code() == ErrorCode::invalid_argument);
+    BackendSetup ub = unset;
+    ub.llamacpp_ubatch_size = 1024;  // > default batch 512
+    CHECK(validate_backend_setup(ub).code() == ErrorCode::invalid_argument);
+    BackendSetup tov = unset;
+    tov.llamacpp_tensor_overrides = {"no-device"};
+    CHECK(validate_backend_setup(tov).code() == ErrorCode::invalid_argument);
+    auto made = make_backend(ok);
+    REQUIRE(made.ok());
+    CHECK(made.value()->name() == "llamacpp");
+#else
+    // Without llama.cpp there is nothing to check against.
+    CHECK(validate_backend_setup(bad).ok());
+#endif
 }

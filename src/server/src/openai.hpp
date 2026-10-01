@@ -14,6 +14,7 @@
 #include "sonder/inference/json.hpp"
 #include "sonder/inference/sampling.hpp"
 #include "sonder/inference/session.hpp"
+#include "sonder/inference/request_priority.hpp"
 
 namespace sonder::inference::server::detail {
 
@@ -50,6 +51,12 @@ struct ChatJob {
     // chat_template_kwargs.enable_thinking / .reasoning_effort, and the
     // top-level think (same meaning as enable_thinking).
     ThinkingOptions thinking;
+    // Optional request scheduling hints. The server resolves an absent class
+    // to interactive and applies header values before these body values.
+    std::optional<RequestPriority> priority_class;
+    std::optional<std::uint64_t> deadline_ms;
+    std::optional<std::int64_t> reasoning_budget_tokens = std::nullopt;
+    std::optional<std::string> reasoning_budget_message = std::nullopt;
 };
 
 // Maps a request body to a ChatJob. Unknown top-level fields are ignored;
@@ -64,6 +71,16 @@ struct ChatJob {
 // repeat_last_n, repeat_penalty, top_k, min_p.
 std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body);
 
+// Parses the additive scheduling hint values used by both JSON bodies and
+// headers. Unknown values return nullopt; callers should map that to their
+// endpoint-specific 400 error.
+std::optional<RequestPriority> parse_request_priority(std::string_view value) noexcept;
+
+// Positive integer deadline in milliseconds. Zero and malformed values are
+// rejected. Values are bounded to INT32_MAX milliseconds so they can be
+// represented safely by the server's chrono deadline arithmetic.
+std::optional<std::uint64_t> parse_deadline_ms(const json::Value& value) noexcept;
+
 struct Correlation {
     std::optional<std::string> run_id;
     std::optional<std::string> parent_request_id;
@@ -71,10 +88,18 @@ struct Correlation {
     std::optional<std::string> task_id;
     WorkloadClass workload = WorkloadClass::interactive_user;
     int priority = 0;
+    std::optional<RequestPriority> priority_class;
+    std::optional<std::uint64_t> deadline_ms;
+    // Explicit numeric zero also keeps the workload's legacy scheduler rank.
+    bool numeric_priority = false;
+    std::optional<std::int64_t> reasoning_budget_tokens = std::nullopt;
 };
 
 // X-Sonder-Run-Id, -Parent-Request-Id, -Agent-Id, -Task-Id, -Workload,
-// -Priority. Invalid values: 400 invalid_correlation_header naming the header.
+// -Priority. X-Sonder-Priority accepts the legacy integer -16..16 (retained
+// in Correlation::priority and mapped to interactive admission) or the
+// additive class names interactive, subagent and background. Invalid values:
+// 400 invalid_correlation_header naming the header.
 std::variant<Correlation, ApiError> parse_correlation(const RequestHead& head);
 std::optional<WorkloadClass> parse_workload(std::string_view name) noexcept;
 
@@ -92,7 +117,8 @@ ApiError map_session_failure(const Status& status, bool scheduler_rejected);
 // "stop" | "length" | "cancelled".
 const char* finish_reason(const GenerationResult& result) noexcept;
 // prompt/completion/total_tokens, plus prompt_tokens_details.cached_tokens
-// when the backend reported a cached-prompt count.
+// when the backend reported a cached-prompt count, and usage.sonder.timings
+// when raw llama-server timing fields are present. Existing cached counts win.
 json::Object usage_json(const GenerationResult& result);
 // prompt_n, predicted_n, total_ms, plus only measured values: ttft_ms,
 // prompt_ms, predicted_ms, prompt_per_second, predicted_per_second, and the

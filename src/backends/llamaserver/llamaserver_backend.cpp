@@ -7,6 +7,7 @@
 
 #include "llamaserver_protocol.hpp"
 #include "net/http_client.hpp"
+#include "prefix_warmup.hpp"
 #include "slot_affinity.hpp"
 #include "supervisor.hpp"
 
@@ -47,11 +48,13 @@ llamaserver::SpillGuardOptions spill_guard_options(const LlamaServerSpillGuardOp
     }
     g.threshold_bytes = o.threshold_bytes;
     g.baseline_bytes = o.baseline_bytes;
+    g.baseline_bytes_per_1k_ctx = o.baseline_bytes_per_1k_ctx;
     g.sample_interval = o.sample_interval;
     g.step_factor = o.fit_step_factor;
     g.step_align = o.fit_step_align;
     g.min_ctx = o.fit_min_ctx;
     g.max_attempts = o.fit_max_attempts;
+    g.residency = o.residency;
     return g;
 }
 
@@ -70,6 +73,10 @@ Status validate_options(const LlamaServerBackendOptions &options) {
     }
     if (options.context_length > (std::uint64_t{1} << 32))
         return {ErrorCode::invalid_argument, "llamaserver: context_length must be at most 4294967296"};
+    if (options.stall_guard.stall_seconds < std::chrono::seconds(1) ||
+        options.stall_guard.stall_seconds > std::chrono::hours(24) ||
+        (options.stall_guard.policy != "warn" && options.stall_guard.policy != "restart"))
+        return {ErrorCode::invalid_argument, "llamaserver: invalid stall_guard options"};
     if (options.mode == LlamaServerMode::spawn) {
         if (options.executable.empty() || options.executable.find('\0') != std::string::npos) {
             return {ErrorCode::invalid_argument, "llamaserver: spawn needs an executable path"};
@@ -182,8 +189,11 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
   public:
     explicit LlamaServerBackendImpl(LlamaServerBackendOptions options)
         : options_(std::move(options)), validation_(validate_options(options_)) {
+        if (validation_.ok() && !options_.warmup.messages_file.empty())
+            warmup_ = std::make_shared<llamaserver::PrefixWarmup>(options_);
         if (validation_.ok() && options_.mode == LlamaServerMode::spawn) {
             llamaserver::SupervisorOptions s;
+            s.environment = options_.environment;
             s.executable = options_.executable;
             s.arguments = options_.args;
             s.readiness_timeout = options_.startup_timeout;
@@ -195,8 +205,41 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             s.spill_guard = spill_guard_options(options_.spill_guard);
             s.log_file = options_.diagnostics.log_file;
             s.kv_pairing_check = options_.diagnostics.kv_pairing_check;
+            s.warmup = warmup_;
+            s.native_completion = options_.native_completion;
+            s.stall_guard.enabled = options_.stall_guard.enabled;
+            s.stall_guard.stall_seconds = options_.stall_guard.stall_seconds;
+            s.stall_guard.policy = options_.stall_guard.policy;
             supervisor_ = std::make_unique<llamaserver::Supervisor>(std::move(s));
         }
+        if (validation_.ok() && warmup_ && options_.mode == LlamaServerMode::attach)
+            warmup_->start(options_.base_url, true);
+        if (validation_.ok() && options_.native_completion && options_.mode == LlamaServerMode::attach) {
+            // prepare preserves the validated URL and all existing TLS policy.
+            const auto request = prepare("GET", "", {}, {});
+            if (request.ok()) {
+                llamaserver::SupervisorOptions s;
+                s.attached_endpoint = request.value();
+                s.arguments = options_.args;
+                s.spill_guard.enabled = false;
+                s.spill_guard.sample_interval = options_.spill_guard.sample_interval;
+                s.kv_pairing_check = false;
+                s.stall_guard.enabled = options_.stall_guard.enabled;
+                s.stall_guard.stall_seconds = options_.stall_guard.stall_seconds;
+                s.stall_guard.policy = options_.stall_guard.policy;
+                attached_monitor_ = std::make_unique<llamaserver::Supervisor>(std::move(s));
+                // Observer startup failure remains diagnostic, never changes requests.
+                (void)attached_monitor_->start();
+            }
+        }
+    }
+    ~LlamaServerBackendImpl() override {
+        if (supervisor_)
+            supervisor_->stop();
+        if (attached_monitor_)
+            attached_monitor_->stop();
+        if (warmup_)
+            warmup_->stop();
     }
     std::string name() const override { return kLlamaServerBackendName; }
     std::string description() const override {
@@ -212,6 +255,13 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         if (options_.native_completion)
             c.add(Capability::speculative_decode).add(Capability::prefix_reuse);
         return c;
+    }
+    // /props is fetched during model discovery and cached per upstream
+    // instance.  Admission may use this snapshot without issuing network I/O
+    // from a const query; zero means that the upstream did not report slots.
+    std::size_t max_concurrent_requests() const override {
+        std::lock_guard<std::mutex> lock(props_mutex_);
+        return props_fetched_ ? static_cast<std::size_t>(props_.total_slots) : 0;
     }
     Result<std::string> probe() override {
         auto models = list_models();
@@ -250,12 +300,19 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         return slot_action(slot, filename, "restore");
     }
     const LlamaServerBackendOptions &options() const { return options_; }
-    // Spawn mode only: attach mode has no child to measure, so it reports
-    // nothing and its responses stay unchanged.
+    // Native attach observes the upstream without owning its process. Generic
+    // OpenAI attach stays silent unless prefix warm-up was configured.
     std::optional<BackendRuntimeStatus> runtime_status() const override {
-        if (!supervisor_)
+        if (!supervisor_ && !attached_monitor_ && !warmup_)
             return std::nullopt;
-        return supervisor_->runtime_status();
+        auto status = supervisor_ ? supervisor_->runtime_status() :
+                      attached_monitor_ ? attached_monitor_->runtime_status() : BackendRuntimeStatus{};
+        if (warmup_) {
+            status.warmup = warmup_->status();
+            const auto warnings = warmup_->warnings();
+            status.warnings.insert(status.warnings.end(), warnings.begin(), warnings.end());
+        }
+        return status;
     }
 
     Result<std::string> endpoint(const CancellationToken &cancel) {
@@ -271,8 +328,9 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         return "http://127.0.0.1:" + std::to_string(port.value());
     }
     Result<net::HttpRequest> prepare(std::string_view method, std::string_view path, std::string body,
-                                     const CancellationToken &cancel) {
-        auto base = endpoint(cancel);
+                                     const CancellationToken &cancel, std::uint16_t leased_port = 0) {
+        auto base = leased_port != 0 ? Result<std::string>("http://127.0.0.1:" + std::to_string(leased_port))
+                                     : endpoint(cancel);
         if (!base.ok())
             return base.status();
         auto url = net::parse_url(base.value());
@@ -296,7 +354,10 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         return request;
     }
     Result<std::string> request(std::string_view method, std::string_view path, std::string body) {
-        auto prepared = prepare(method, path, std::move(body), {});
+        auto activity = acquire_request({});
+        if (!activity.ok())
+            return activity.status();
+        auto prepared = prepare(method, path, std::move(body), {}, activity->port());
         if (!prepared.ok())
             return prepared.status();
         std::string response_body;
@@ -309,7 +370,7 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         return response_body;
     }
     Result<GenerateStats> stream(std::string_view path, std::string body, const CancellationToken &cancel,
-                                 const TokenCallback &callback, bool chat);
+                                 const TokenCallback &callback, bool chat, bool separate_reasoning = false);
 
     // Served context and slot count: GET /props once per upstream instance
     // (endpoint, plus the launch argv in spawn mode, so a restart or an
@@ -356,16 +417,25 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             return e;
         e.cache_prompt = true;
         if (options_.slot_affinity) {
-            lease = slots_.acquire(session_key, props.total_slots);
+            lease = slots_.acquire(session_key, props.total_slots,
+                                   warmup_ ? warmup_->warmed_slots() : std::vector<std::uint32_t>{});
             e.id_slot = lease.slot();
         }
         return e;
     }
 
   private:
+    Result<llamaserver::Supervisor::RequestLease> acquire_request(const CancellationToken &cancel) {
+        if (supervisor_)
+            return supervisor_->acquire_request(cancel);
+        return llamaserver::Supervisor::RequestLease{};
+    }
     llamaserver::ServerProps fetch_props(const CancellationToken &cancel) {
         llamaserver::ServerProps props;
-        auto prepared = prepare("GET", "/props", {}, cancel);
+        auto activity = acquire_request(cancel);
+        if (!activity.ok())
+            return props;
+        auto prepared = prepare("GET", "/props", {}, cancel, activity->port());
         if (!prepared.ok())
             return props;
         prepared->total_timeout = std::min(options_.request_timeout, std::chrono::milliseconds(30000));
@@ -405,11 +475,13 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
     LlamaServerBackendOptions options_;
     Status validation_;
     std::unique_ptr<llamaserver::Supervisor> supervisor_;
-    std::mutex props_mutex_;
+    std::unique_ptr<llamaserver::Supervisor> attached_monitor_;
+    mutable std::mutex props_mutex_;
     bool props_fetched_ = false;
     std::string props_key_;
     llamaserver::ServerProps props_;
     llamaserver::SlotAffinity slots_;
+    std::shared_ptr<llamaserver::PrefixWarmup> warmup_;
 };
 
 class LlamaServerModel final : public BackendModel {
@@ -446,7 +518,8 @@ class LlamaServerModel final : public BackendModel {
         llamaserver::SlotAffinity::Lease lease;
         auto body = llamaserver::build_chat_body(descriptor_.name, request, backend_->options().grammar,
                                                  backend_->extras(props, request.session_key, lease));
-        return backend_->stream("/v1/chat/completions", body.dump(), cancel, callback, true);
+        return backend_->stream("/v1/chat/completions", body.dump(), cancel, callback, true,
+                               request.separate_reasoning);
     }
 
   private:
@@ -479,8 +552,12 @@ Result<std::shared_ptr<BackendModel>> LlamaServerBackendImpl::load_model(const M
 
 Result<GenerateStats> LlamaServerBackendImpl::stream(std::string_view path, std::string body,
                                                      const CancellationToken &cancel,
-                                                     const TokenCallback &callback, bool chat) {
-    auto prepared = prepare("POST", path, std::move(body), cancel);
+                                                     const TokenCallback &callback, bool chat,
+                                                     bool separate_reasoning) {
+    auto activity = acquire_request(cancel);
+    if (!activity.ok())
+        return activity.status();
+    auto prepared = prepare("POST", path, std::move(body), cancel, activity->port());
     if (!prepared.ok())
         return prepared.status();
     auto request = std::move(prepared.value());
@@ -532,6 +609,7 @@ Result<GenerateStats> LlamaServerBackendImpl::stream(std::string_view path, std:
         error = llamaserver::parse_timings(object, timing);
         if (!error.ok())
             return false;
+        llamaserver::merge_timings(stats.backend_timings, timing.backend_timings);
         if (timing.prompt_present && !usage_prompt) {
             stats.prompt_tokens = timing.prompt_tokens + timing.cached_tokens;
             stats.token_counts_from_backend = true;
@@ -576,6 +654,7 @@ Result<GenerateStats> LlamaServerBackendImpl::stream(std::string_view path, std:
                 stats.token_counts_from_backend = true;
         }
         std::string piece;
+        std::string reasoning;
         std::string reason;
         if (native) {
             if (const auto *content = object.find("content")) {
@@ -616,15 +695,29 @@ Result<GenerateStats> LlamaServerBackendImpl::stream(std::string_view path, std:
             }
             if (!choices->as_array().empty()) {
                 const auto &choice = choices->as_array().front();
-                const auto *content =
-                    chat ? (choice.find("delta") ? choice.find("delta")->find("content") : nullptr)
-                         : choice.find("text");
+                const json::Value *delta = chat ? choice.find("delta") : nullptr;
+                const auto *content = chat ? (delta ? delta->find("content") : nullptr) : choice.find("text");
                 if (content && !content->is_null()) {
                     if (!content->is_string()) {
                         error = protocol_error("completion content must be text");
                         return false;
                     }
                     piece = content->as_string();
+                }
+                if (separate_reasoning && delta && delta->is_object()) {
+                    // llama-server's OpenAI-compatible reasoning extension is
+                    // emitted as reasoning_content. Accept reasoning as a
+                    // compatibility fallback used by some upstream builds.
+                    const auto *value = delta->find("reasoning_content");
+                    if (!value)
+                        value = delta->find("reasoning");
+                    if (value && !value->is_null()) {
+                        if (!value->is_string()) {
+                            error = protocol_error("reasoning content must be text");
+                            return false;
+                        }
+                        reasoning = value->as_string();
+                    }
                 }
                 if (const auto *finish = choice.find("finish_reason"); finish && !finish->is_null()) {
                     if (!finish->is_string()) {
@@ -651,10 +744,10 @@ Result<GenerateStats> LlamaServerBackendImpl::stream(std::string_view path, std:
             }
             stats.stop_reason = mapped;
         }
-        if (!piece.empty()) {
+        if (!piece.empty() || !reasoning.empty()) {
             ++observed_chunks;
             if (callback) {
-                const bool keep = callback(TokenChunk{piece, stats.chunks});
+                const bool keep = callback(TokenChunk{piece, stats.chunks, reasoning});
                 ++stats.chunks;
                 if (!keep) {
                     stopped = true;

@@ -70,9 +70,14 @@ class LogDiagnostics {
     void feed(std::string_view bytes);
     // Processes a trailing line without a newline.
     void finish();
+    // Records the child command line at readiness.  The final verbosity
+    // option wins; a level below four (or an invalid/missing value) makes
+    // offload diagnostics blind and adds one diagnostics_blind warning.
+    void ready(const std::vector<std::string> &args);
     void reset();
     [[nodiscard]] const std::vector<BackendWarning> &warnings() const noexcept { return warnings_; }
     [[nodiscard]] std::uint64_t lines() const noexcept { return lines_; }
+    [[nodiscard]] std::string offload_status() const;
 
   private:
     void line(std::string_view text);
@@ -85,6 +90,9 @@ class LogDiagnostics {
     std::vector<BackendWarning> warnings_;
     std::vector<std::string> keys_;  // parallel to warnings_: dedupe key
     std::uint64_t mtp_bytes_ = 0;
+    bool ready_ = false;
+    bool diagnostics_blind_ = false;
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> offload_;
 };
 
 // Incrementally reads a log file that a child appends to. Bounded per call;
@@ -92,7 +100,7 @@ class LogDiagnostics {
 // it). Never throws; I/O problems are reported through the Status.
 class LogTail {
   public:
-    explicit LogTail(std::string path) : path_(std::move(path)) {}
+    explicit LogTail(std::string path, bool utf8 = false) : path_(std::move(path)), utf8_(utf8) {}
     [[nodiscard]] const std::string &path() const noexcept { return path_; }
     void rewind() noexcept { offset_ = 0; }
     Status poll(LogDiagnostics &sink, std::size_t max_bytes = 256 * 1024);
@@ -100,6 +108,7 @@ class LogTail {
   private:
     std::string path_;
     std::uint64_t offset_ = 0;
+    bool utf8_ = false; // default preserves existing native path interpretation
 };
 
 } // namespace sonder::inference::llamaserver

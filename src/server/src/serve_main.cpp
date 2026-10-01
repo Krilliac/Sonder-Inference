@@ -85,6 +85,13 @@ Backend:
   --model-dir DIR         llama.cpp: directory with *.gguf files (repeatable)
   --device ID             device to load models on (llama.cpp: gpu:0 offloads to
                           the GPU; default cpu)
+  --lazy-models           register models at startup and load each on its first
+                          request (default: load every model before ready)
+  --model-idle-ttl S      unload a model no request has used for S seconds; the
+                          next request loads it again (default 0 = never)
+  --max-resident-models N keep at most N models loaded, evicting the least recently
+                          used idle one (default 0 = no cap; in-flight requests
+                          always keep their model)
   --gpu-layers N          llama.cpp: layers offloaded to the GPU (-1 = all, default)
   --context-length N      llama.cpp: context length (0 = model training context)
   --moe-experts WHERE     llama.cpp: cpu keeps MoE expert weights in system RAM
@@ -92,12 +99,21 @@ Backend:
                           placement to --gpu-layers
   --tensor-override P=D   llama.cpp: place tensors matching regex P on device D
                           (cpu, or a llama.cpp device such as Vulkan0); repeatable
+  --batch-size N          llama.cpp: max prompt tokens per decode call (default 512)
+  --ubatch-size N         llama.cpp: physical micro-batch, <= --batch-size
+                          (default: llama.cpp's 512, capped at --batch-size)
+  --cache-type-k T        llama.cpp: K cache type f16 (default), f32, bf16, q8_0,
+                          q5_1, q5_0, q4_1, q4_0, iq4_nl (q8_0 ~ half the bytes)
+  --cache-type-v T        llama.cpp: V cache type, same values; a quantized V
+                          cache needs flash attention (on or auto)
+  --flash-attn MODE       llama.cpp: auto (default), on or off
   --mock-delay-ms N       mock backend per-token delay
   --llamaserver-config PATH  JSON config (mode, URL/executable, args, TLS and timeouts)
   --llamaserver-url URL     attach upstream URL (default http://127.0.0.1:8080)
   --llamaserver-executable PATH  spawn executable
   --llamaserver-arg ARG     repeatable spawn argument (passed verbatim)
   --llamaserver-mode MODE   attach or spawn
+  --warmup-file PATH         llamaserver prefix messages JSON (requires --backend llamaserver)
 
 Launch profiles (docs/integration/launch-profiles.md):
   --profiles PATH         JSON file of typed per-model launch profiles
@@ -119,6 +135,12 @@ at once), 1 on a runtime error (e.g. port in use), 2 on a usage error.
 
 enum class Kind { value, repeat, flag };
 
+// llama.cpp context options of the direct llamacpp backend (batch, micro-batch,
+// KV cache types, flash attention). serve refuses them next to --profile,
+// whose typed fields set them.
+constexpr const char* kLlamaCppContextFlags[] = {"batch-size", "ubatch-size", "cache-type-k", "cache-type-v",
+                                                 "flash-attn"};
+
 const std::vector<std::pair<std::string, Kind>>& spec() {
     static const std::vector<std::pair<std::string, Kind>> kSpec = {
         {"host", Kind::value},           {"port", Kind::value},
@@ -134,9 +156,15 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"llamaserver-config", Kind::value}, {"llamaserver-url", Kind::value},
         {"llamaserver-executable", Kind::value}, {"llamaserver-arg", Kind::repeat},
         {"llamaserver-mode", Kind::value},
+        {"warmup-file", Kind::value},
         {"gpu-layers", Kind::value},     {"context-length", Kind::value},
         {"device", Kind::value},
+        {"lazy-models", Kind::flag},     {"model-idle-ttl", Kind::value},
+        {"max-resident-models", Kind::value},
         {"moe-experts", Kind::value},    {"tensor-override", Kind::repeat},
+        {"batch-size", Kind::value},     {"ubatch-size", Kind::value},
+        {"cache-type-k", Kind::value},   {"cache-type-v", Kind::value},
+        {"flash-attn", Kind::value},
         {"profiles", Kind::value},       {"profile", Kind::value},
         {"vram-budget-mib", Kind::value}, {"allow-overcommit", Kind::flag},
     };
@@ -510,6 +538,11 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
                 return usage_error(std::string("--") + flag + " conflicts with --profile (set the profile's typed fields)");
             }
         }
+        for (const char* flag : kLlamaCppContextFlags) {
+            if (a.get(flag)) {
+                return usage_error(std::string("--") + flag + " conflicts with --profile (set the profile's typed fields)");
+            }
+        }
     }
     o.backend.backend = profile ? profile->backend : a.get("backend").value_or(env.backend.value_or(""));
     if (o.backend.backend.empty()) {
@@ -542,6 +575,11 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
         auto argv = llamaserver_arguments(*profile);
         if (!argv.ok()) return usage_error(argv.status().message());
         o.backend.llamaserver_args = std::move(argv).value();
+    }
+    if (auto v = a.get("warmup-file")) {
+        if (o.backend.backend != "llamaserver")
+            return usage_error("--warmup-file requires --backend llamaserver");
+        o.backend.llamaserver_warmup_messages_file = *v;
     }
     if (o.backend.backend == "llamaserver") {
         if (o.backend.llamaserver_mode == "spawn") {
@@ -579,9 +617,32 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
         if (auto parsed = parse_tensor_override(spec); !parsed) return usage_error(parsed.status().message());
         o.backend.llamacpp_tensor_overrides.push_back(spec);
     }
+    o.lazy_models = a.flags.count("lazy-models") != 0;
+    if (auto v = a.get("model-idle-ttl")) {
+        if (!parse_uint(*v, 30u * 24u * 3600u, n)) {
+            return usage_error("--model-idle-ttl must be a number of seconds from 0 to 2592000");
+        }
+        o.model_idle_ttl = std::chrono::seconds(n);
+    }
+    if (auto v = a.get("max-resident-models")) {
+        if (!parse_uint(*v, 4096, n)) return usage_error("--max-resident-models must be an integer from 0 to 4096");
+        o.max_resident_models = static_cast<std::size_t>(n);
+    }
     if (Status st = detail::parse_request_path_flags([&a](const std::string& k) { return a.get(k); }, o); !st.ok()) {
         return usage_error(st.message());
     }
+    if (auto v = a.get("batch-size")) {
+        if (!parse_uint(*v, 1u << 22, n) || n == 0) return usage_error("--batch-size must be from 1 to 4194304");
+        o.backend.llamacpp_batch_size = static_cast<std::uint32_t>(n);
+    }
+    if (auto v = a.get("ubatch-size")) {
+        if (!parse_uint(*v, 1u << 22, n) || n == 0) return usage_error("--ubatch-size must be from 1 to 4194304");
+        o.backend.llamacpp_ubatch_size = static_cast<std::uint32_t>(n);
+    }
+    // Values are checked by validate_options() (validate_llamacpp_options).
+    if (auto v = a.get("cache-type-k")) o.backend.llamacpp_kv_cache_type_k = *v;
+    if (auto v = a.get("cache-type-v")) o.backend.llamacpp_kv_cache_type_v = *v;
+    if (auto v = a.get("flash-attn")) o.backend.llamacpp_flash_attention = *v;
     if (profile && profile->backend == kLaunchProfileBackendLlamaCpp) {
         if (Status st = apply_llamacpp_profile(*profile, o.backend, o.device); !st.ok()) return usage_error(st.message());
     }
@@ -694,6 +755,18 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
         models = "mock (default)";
     }
     const bool mock = is_synthetic_backend(o.backend.backend);
+    // Residency summary for the banner; empty with the defaults, which keep
+    // the banner exactly as it was before these options existed.
+    std::string residency;
+    if (o.lazy_models || o.model_idle_ttl.count() > 0 || o.max_resident_models > 0) {
+        residency = std::string(o.lazy_models ? "lazy" : "eager") + ", idle TTL " +
+                    (o.model_idle_ttl.count() > 0
+                         ? std::to_string(std::chrono::duration_cast<std::chrono::seconds>(o.model_idle_ttl).count()) +
+                               " s"
+                         : std::string("off")) +
+                    ", max resident " +
+                    (o.max_resident_models > 0 ? std::to_string(o.max_resident_models) : std::string("unlimited"));
+    }
     Server server(o);
     std::string ready_error;
     ReadyFileGuard ready_file{ready_path};
@@ -717,14 +790,19 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
                                                {"api_version", kApiVersion},
                                                {"backend", o.backend.backend},
                                                {"models", models},
-                                               {"status", "loading models"}})
+                                               {"status", o.lazy_models ? "registering models" : "loading models"}})
                           .dump());
         } else {
             log->line("sonder-infer serve: listening on " +
                       (wildcard ? bind_text() + " (all interfaces; local URL " + base + ")" : base) +
                       " (api_version " + std::to_string(kApiVersion) + ")");
-            log->line("sonder-infer serve: loading models on " + o.backend.backend + ": " + models +
-                      " (health reports 503 starting until they are loaded)");
+            if (o.lazy_models) {
+                log->line("sonder-infer serve: registering models on " + o.backend.backend + ": " + models +
+                          " (lazy residency: each model loads on its first request)");
+            } else {
+                log->line("sonder-infer serve: loading models on " + o.backend.backend + ": " + models +
+                          " (health reports 503 starting until they are loaded)");
+            }
         }
         if (ready_path.empty()) {
             return;
@@ -777,7 +855,7 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
     if (json_log) {
         json::Array origin_list;
         for (const auto& s : origins) origin_list.emplace_back(s);
-        log->line(json::Value(json::Object{
+        json::Object ready_doc{
                                   {"time", utc_timestamp_now()},
                                   {"level", "info"},
                                   {"message", "ready"},
@@ -793,8 +871,11 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
                                   {"discovery_url", base + "/.well-known/sonder-telemetry"},
                                   {"sse_url", base + "/v1/telemetry/sse"},
                                   {"ndjson_url", base + "/v1/telemetry/ndjson"},
-                                  {"synthetic", mock}})
-                      .dump());
+                                  {"synthetic", mock}};
+        if (!residency.empty()) {
+            ready_doc.set("residency", residency);
+        }
+        log->line(json::Value(std::move(ready_doc)).dump());
     } else {
         std::string cors;
         for (const auto& s : origins) cors += (cors.empty() ? "" : ", ") + s;
@@ -803,6 +884,9 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
         log->line("  cors:      " + (cors.empty() ? std::string("no explicit origins") : cors) +
                   (o.default_cors ? "; default Observatory origins for GET routes" : "; defaults disabled"));
         log->line("  backend:   " + o.backend.backend + "; models: " + models);
+        if (!residency.empty()) {
+            log->line("  residency: " + residency);
+        }
         log->line("  telemetry: level " + std::string(to_string(o.telemetry_level)) + ", discovery " + base +
                   "/.well-known/sonder-telemetry, sse " + base + "/v1/telemetry/sse, ndjson " + base +
                   "/v1/telemetry/ndjson");

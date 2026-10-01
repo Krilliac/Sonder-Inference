@@ -19,7 +19,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from httpbench import __version__  # noqa: E402
-from httpbench.client import Target  # noqa: E402
+from httpbench.client import Target, parse_header  # noqa: E402
 from httpbench.gpumem import GpuSampler, expected_clean_shared  # noqa: E402
 from httpbench.report import compare, render_markdown  # noqa: E402
 from httpbench.runner import BUILTIN_SCENARIOS, Runner, default_out_prefix, load_config  # noqa: E402
@@ -27,6 +27,30 @@ from httpbench.runner import BUILTIN_SCENARIOS, Runner, default_out_prefix, load
 
 def _csv_ints(s: str) -> list[int]:
     return [int(x) for x in s.split(",") if x.strip()]
+
+
+def _header(s: str) -> tuple[str, str]:
+    try:
+        return parse_header(s)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"invalid header: {e}") from e
+
+
+def _redact_argv(argv: list[str]) -> list[str]:
+    out = []
+    redact_next = False
+    for arg in argv:
+        option = arg.split("=", 1)[0]
+        sensitive = option.startswith("--") and any(flag.startswith(option) for flag in ("--header", "--api-key"))
+        if redact_next:
+            out.append("<redacted>")
+            redact_next = False
+        elif sensitive:
+            out.append(option + "=<redacted>" if "=" in arg else arg)
+            redact_next = "=" not in arg
+        else:
+            out.append(arg)
+    return out
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,6 +77,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--api-key", default=os.environ.get("BENCH_HTTP_API_KEY"),
                    help="bearer token (default: env BENCH_HTTP_API_KEY)")
     r.add_argument("--token-file", help="read the bearer token from this file (sonder-infer serve --token-file)")
+    r.add_argument("--header", type=_header, action="append", default=[], metavar="K=V",
+                   help="request header (repeatable; scenario headers override case-insensitively)")
+    r.add_argument("--metrics-url", help="full child /metrics URL, scraped around each request (no auth forwarded)")
+    r.add_argument("--child-log", metavar="PATH", help="count new child log events during the run")
     r.add_argument("--timeout", type=float, default=900.0, help="per-request socket timeout, seconds")
     g = r.add_argument_group("GPU memory (Windows PDH)")
     g.add_argument("--pid", type=int, help="server process id to sample")
@@ -94,6 +122,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             s["api"] = args.api
         if args.max_tokens:
             s["max_tokens"] = args.max_tokens
+            s["_max_tokens_explicit"] = True
         if args.long_sizes and s["kind"] == "long_context":
             s["sizes"] = args.long_sizes
     extra: dict = {}
@@ -111,14 +140,23 @@ def cmd_run(args: argparse.Namespace) -> int:
         with open(args.token_file, encoding="utf-8") as f:
             key = f.read().strip()
     try:
-        target = Target(args.base_url, api_key=key, timeout=args.timeout)
+        headers = {}
+        for name, value in args.header:
+            headers = {k: v for k, v in headers.items() if k.lower() != name.lower()}
+            headers[name] = value
+        target = Target(args.base_url, api_key=key, timeout=args.timeout, headers=headers)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
     sampler = GpuSampler(pid=args.pid, process_name=args.process_name)
     baseline = args.shared_baseline_mib
-    runner = Runner(target, model=args.model, extra_body=extra, sampler=sampler, ctx_size=args.ctx_size,
-                    shared_baseline_mib=baseline, log=(lambda m: None) if args.quiet else None)
+    try:
+        runner = Runner(target, model=args.model, extra_body=extra, sampler=sampler, ctx_size=args.ctx_size,
+                        shared_baseline_mib=baseline, log=(lambda m: None) if args.quiet else None,
+                        metrics_url=args.metrics_url, child_log=args.child_log)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     if args.clean_line:
         try:
             mib, ctx = args.clean_line.split("@")
@@ -129,7 +167,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         runner.identify()  # learn n_ctx before the run to place the line
         runner.shared_baseline_mib = expected_clean_shared(ref_mib, ref_ctx, runner.ctx_size)
         runner.baseline_source = f"clean line {args.clean_line} at n_ctx {runner.ctx_size}"
-    results = runner.run(cfg, label=args.label, argv=sys.argv[1:])
+    results = runner.run(cfg, label=args.label, argv=_redact_argv(sys.argv[1:]))
     prefix = args.out or default_out_prefix(args.label)
     os.makedirs(os.path.dirname(os.path.abspath(prefix)), exist_ok=True)
     with open(prefix + ".json", "w", encoding="utf-8") as f:

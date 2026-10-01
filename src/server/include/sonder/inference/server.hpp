@@ -39,6 +39,12 @@ inline constexpr std::uint16_t kDefaultPort = 11437;
 
 enum class LogFormat { text, json };
 enum class SchedulerPolicy { automatic, gate, account, off };
+// Controls whether server-wide thinking pins override explicit request values
+// (the historical default) or only supply values that are absent.
+enum class PinMode { override_request, default_value };
+// Controls the server-side class/capacity admission layer. `automatic` only
+// enables it when an explicit class or queue cap is configured.
+enum class PriorityAdmissionPolicy { automatic, on, off };
 
 // A served model backed by a launch profile (launch_profile.hpp).
 struct ModelProfileBinding {
@@ -107,6 +113,23 @@ struct ServerOptions {
     std::function<void(const std::string& line)> log;
     LogFormat log_format = LogFormat::text;
 
+    // Model residency (docs/SERVER.md "Model residency"). The defaults keep
+    // the behaviour from before these options existed: every model loads
+    // during start() and stays loaded until stop().
+    //
+    // Register the models during start() without loading them (no backend
+    // I/O) and load each on its first request. Concurrent first requests
+    // share one load. A model that cannot load then fails its requests (404
+    // model_not_found or 503 not_ready) instead of the start.
+    bool lazy_models = false;
+    // Unload a model once no request has used it for this long; the next
+    // request loads it again. A request in flight pins its model. 0 = never.
+    std::chrono::milliseconds model_idle_ttl{0};
+    // Keep at most this many models loaded, evicting the least recently used
+    // unpinned one first. Soft: pinned models are never evicted, so requests
+    // in flight can exceed it until they finish. With eager loading only the
+    // first N models load during start(). 0 = no cap.
+    std::size_t max_resident_models = 0;
     // Request path (docs/SERVER.md "Scheduling" and "Thinking control").
     // --scheduler: automatic gates in-process backends per token and only
     // admits/accounts remote-process ones (llamaserver, ollama); off disables
@@ -114,9 +137,23 @@ struct ServerOptions {
     SchedulerPolicy scheduler = SchedulerPolicy::automatic;
     std::uint64_t kv_pool_tokens = 0;
     // --pin-enable-thinking / --pin-reasoning-effort: forwarded on every chat
-    // request; a conflicting request value is overridden with a warning.
+    // request; pin_mode controls whether conflicts are overridden or left
+    // intact. Budget pins are default-only and applied by request glue.
     std::optional<bool> pin_enable_thinking;
     std::optional<std::string> pin_reasoning_effort;
+    PinMode pin_mode = PinMode::override_request;
+    std::optional<std::int64_t> pin_reasoning_budget_tokens;
+    std::optional<std::string> pin_reasoning_budget_message;
+
+    // Request-class admission limits, applied only when priority admission is
+    // enabled. Zero means unlimited; engine scheduling is independent.
+    std::size_t max_concurrent_subagent = 0;
+    std::size_t max_concurrent_background = 0;
+    std::size_t max_queue_per_class = 0;
+    // 0 uses the backend's advertised capacity; unknown stays ungated.
+    // A nonzero override applies only when priority admission is enabled.
+    std::size_t backend_capacity = 0;
+    PriorityAdmissionPolicy priority_admission = PriorityAdmissionPolicy::automatic;
 };
 
 // Checks option combinations that the server refuses to start with
@@ -135,7 +172,9 @@ public:
 
     // Binds the socket, builds the engine (engine.started carries the listen
     // address), starts accepting (health reports "starting"), registers the
-    // backend and loads the models, then reports "ready". `on_listening`
+    // backend and the models and loads them (all of them unless
+    // `lazy_models` or `max_resident_models` says otherwise), then reports
+    // "ready". `on_listening`
     // runs once the socket accepts connections, before models load. No lock
     // is held across backend I/O: health answers 503 "starting" while a
     // model loads. Errors: invalid_argument (options), unavailable (address

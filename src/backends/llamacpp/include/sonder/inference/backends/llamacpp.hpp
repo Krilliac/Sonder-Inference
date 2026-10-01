@@ -29,7 +29,24 @@ struct LlamaCppBackendOptions {
     // {"\.ffn_(up|down|gate)_(ch|)exps", "cpu"} keeps MoE experts in RAM.
     // Device is "cpu" or a llama.cpp device name ("Vulkan0", "CUDA0").
     std::vector<std::pair<std::string, std::string>> tensor_overrides;
+    // Physical micro-batch (llama.cpp n_ubatch). 0 = llama.cpp's default (512)
+    // capped at batch_size; otherwise must be <= batch_size.
+    std::uint32_t ubatch_size = 0;
+    // KV cache element types: f16 (default), f32, bf16, q8_0, q5_1, q5_0,
+    // q4_1, q4_0, iq4_nl. q8_0 roughly halves KV memory, q4_0 roughly quarters
+    // it (docs/PLACEMENT.md, "KV cache types").
+    std::string kv_cache_type_k = "f16";
+    std::string kv_cache_type_v = "f16";
+    // Flash Attention: auto (default, llama.cpp decides), on or off. A
+    // quantized V cache needs it: "off" with a quantized V type is rejected.
+    std::string flash_attention = "auto";
 };
+
+// Checks the llama.cpp context options (KV cache types, flash_attention,
+// ubatch_size vs batch_size) without loading anything. load_model() applies
+// the same checks; hosts call this to reject bad flags at startup.
+// Errors: invalid_argument.
+Status validate_llamacpp_options(const LlamaCppBackendOptions& options);
 
 std::shared_ptr<Backend> make_llamacpp_backend(LlamaCppBackendOptions options = {});
 

@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -36,27 +38,79 @@ class FakeLlamaServer {
             }
             r.set_content(props_, "application/json");
         });
-        svr_.Get("/v1/models", [](const httplib::Request &, httplib::Response &r) {
+        svr_.Get("/v1/models", [this](const httplib::Request &, httplib::Response &r) {
+            ++models_requests_;
             r.set_content(R"({"object":"list","data":[{"id":"fake-model","object":"model"}]})",
                           "application/json");
         });
-        auto stream = [this](const httplib::Request &req, httplib::Response &r) {
+        svr_.Get("/metrics", [this](const httplib::Request &, httplib::Response &r) {
             std::lock_guard<std::mutex> lock(mu_);
-            last_body_ = req.body;
-            bodies_.push_back(req.body);
+            ++metrics_requests_;
+            r.status = metrics_status_;
+            r.set_content(metrics_body_, "text/plain");
+        });
+        svr_.Get("/slots", [this](const httplib::Request &, httplib::Response &r) {
+            std::lock_guard<std::mutex> lock(mu_);
+            ++slots_requests_;
+            r.status = slots_status_;
+            r.set_content(slots_body_, "application/json");
+        });
+        auto stream = [this](const httplib::Request &req, httplib::Response &r) {
+            const bool nonstream = req.body.find(R"("stream":false)") != std::string::npos ||
+                                   req.body.find(R"("stream": false)") != std::string::npos;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                last_body_ = req.body;
+                bodies_.push_back(req.body);
+                if (nonstream)
+                    nonstream_bodies_.push_back(req.body);
+            }
+            changed_.notify_all();
+            if (nonstream) {
+                std::unique_lock lock(mu_);
+                changed_.wait(lock, [this] { return !hold_nonstream_; });
+            }
+            std::lock_guard<std::mutex> lock(mu_);
             r.status = status_;
             if (status_ != 200) {
-                r.set_content(body_, "text/event-stream");
+                r.set_content(body_, nonstream ? "application/json" : "text/event-stream");
                 return;
             }
             const auto payload = body_;
+            const auto initial_delay = initial_delay_;
+            if (nonstream) {
+                r.set_content(nonstream_body_.empty() ?
+                                  R"({"choices":[{"finish_reason":"stop"}],"timings":{"prompt_n":3,"cache_n":9}})" :
+                                  nonstream_body_,
+                              "application/json");
+                return;
+            }
             r.set_chunked_content_provider("text/event-stream",
-                                           [payload](std::size_t, httplib::DataSink &sink) {
+                                           [this, payload, initial_delay](std::size_t, httplib::DataSink &sink) {
+                                               if (initial_delay.count() > 0)
+                                                   std::this_thread::sleep_for(initial_delay);
                                                const std::size_t step = payload.size() > 4096 ? 4093 : 7;
                                                for (std::size_t i = 0; i < payload.size(); i += step) {
                                                    const auto n = std::min(step, payload.size() - i);
-                                                   if (!sink.write(payload.data() + i, n))
+                                                   if (!sink.write(payload.data() + i, n)) {
+                                                       disconnects_.fetch_add(1);
                                                        return false;
+                                                   }
+                                               }
+                                               if (initial_delay.count() > 0) {
+                                                   // Probe after the delayed
+                                                   // first write; a tiny fake
+                                                   // response can otherwise be
+                                                   // buffered after the peer
+                                                   // has already closed.
+                                                   for (int i = 0; i < 100; ++i) {
+                                                       std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                                                       if (!sink.write("\n", 1)) {
+                                                           disconnects_.fetch_add(1);
+                                                           return false;
+                                                       }
+                                                   }
+                                                   return false;
                                                }
                                                sink.done();
                                                return true;
@@ -79,6 +133,13 @@ class FakeLlamaServer {
         svr_.wait_until_ready();
     }
     ~FakeLlamaServer() {
+        stop();
+    }
+    void stop() {
+        // Release a held nonstream handler before asking httplib to stop and
+        // joining its listener thread; otherwise a cancellation test can
+        // leave the handler waiting forever while the destructor joins.
+        hold_nonstream(false);
         svr_.stop();
         if (thread_.joinable())
             thread_.join();
@@ -91,6 +152,14 @@ class FakeLlamaServer {
     void set_status(int status) {
         std::lock_guard<std::mutex> lock(mu_);
         status_ = status;
+    }
+    void set_initial_delay(std::chrono::milliseconds delay) {
+        std::lock_guard<std::mutex> lock(mu_);
+        initial_delay_ = delay;
+    }
+    void set_nonstream_body(std::string body) {
+        std::lock_guard<std::mutex> lock(mu_);
+        nonstream_body_ = std::move(body);
     }
     std::string last_body() const {
         std::lock_guard<std::mutex> lock(mu_);
@@ -117,6 +186,41 @@ class FakeLlamaServer {
         return last_slot_body_;
     }
     unsigned health_requests() const { return health_requests_.load(); }
+    unsigned models_requests() const { return models_requests_.load(); }
+    void set_metrics(std::string body, int status = 200) {
+        std::lock_guard<std::mutex> lock(mu_);
+        metrics_body_ = std::move(body);
+        metrics_status_ = status;
+    }
+    void set_slots(std::string body, int status = 200) {
+        std::lock_guard<std::mutex> lock(mu_);
+        slots_body_ = std::move(body);
+        slots_status_ = status;
+    }
+    unsigned metrics_requests() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return metrics_requests_;
+    }
+    unsigned slots_requests() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return slots_requests_;
+    }
+    unsigned disconnects() const { return disconnects_.load(); }
+    std::vector<std::string> nonstream_bodies() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return nonstream_bodies_;
+    }
+    void hold_nonstream(bool hold = true) {
+        std::lock_guard<std::mutex> lock(mu_);
+        hold_nonstream_ = hold;
+        if (!hold)
+            changed_.notify_all();
+    }
+    bool wait_for_nonstream(std::size_t count) const {
+        std::unique_lock lock(mu_);
+        return changed_.wait_for(lock, std::chrono::seconds(3),
+                                 [&] { return nonstream_bodies_.size() >= count; });
+    }
 
   private:
     httplib::Server svr_;
@@ -124,13 +228,26 @@ class FakeLlamaServer {
     int port_ = 0;
     mutable std::mutex mu_;
     std::string body_;
+    std::string nonstream_body_;
     std::string last_body_;
     std::vector<std::string> bodies_;
+    std::vector<std::string> nonstream_bodies_;
+    mutable std::condition_variable changed_;
+    bool hold_nonstream_ = false;
     std::string props_;
     unsigned props_requests_ = 0;
+    std::string metrics_body_;
+    std::string slots_body_;
+    int metrics_status_ = 404;
+    int slots_status_ = 404;
+    unsigned metrics_requests_ = 0;
+    unsigned slots_requests_ = 0;
     std::string last_slot_;
     std::string last_slot_body_;
     int status_ = 200;
+    std::chrono::milliseconds initial_delay_{0};
     std::atomic<unsigned> health_requests_{0};
+    std::atomic<unsigned> models_requests_{0};
+    std::atomic<unsigned> disconnects_{0};
 };
 } // namespace sonder_test

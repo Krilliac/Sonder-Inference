@@ -14,7 +14,9 @@
 #pragma once
 
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -31,6 +33,8 @@ struct RuntimeRequestSpec {
     TelemetryContext context;  // request-scoped (request_id set)
     WorkloadClass workload = WorkloadClass::implementation_worker;
     int priority = 0;
+    std::optional<RequestPriority> priority_class;
+    std::shared_ptr<RequestAdmission> admission;
     std::vector<TokenId> prompt_tokens;  // non-empty
     bool exact_tokens = false;
     std::uint32_t max_new_tokens = 1;
@@ -42,6 +46,7 @@ struct RuntimeRequestSpec {
     // the session acquires one admission grant and streams without per-chunk
     // grants. A prompt larger than the KV pool is bypassed, not rejected.
     bool gated = true;
+    bool preserve_numeric_priority = false;
 };
 
 struct RuntimeSubmission {
@@ -71,7 +76,12 @@ public:
     // Blocks until the scheduler grants the next token. Returns cancelled
     // when `cancel` trips while waiting, unavailable when the request was
     // failed by the scheduler (requeue limit, KV exhaustion) or on shutdown.
-    virtual Status acquire_token(std::uint64_t id, const CancellationToken& cancel) = 0;
+    virtual Status acquire_token(std::uint64_t id, const CancellationToken& cancel,
+                                 std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt) = 0;
+    // Waits for admission without consuming a token grant, leaving
+    // the first gate credit available for the backend's first token.
+    virtual Status admit_backend(std::uint64_t id, const CancellationToken& cancel,
+                                 std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt) = 0;
     // Records the token produced after a successful acquire_token().
     virtual void token_produced(std::uint64_t id, TokenId token) = 0;
     // Ends the request and frees its KV blocks. Safe to call once per id.

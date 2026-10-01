@@ -153,6 +153,57 @@ TEST_CASE("llamacpp integration: wrapper prefill, streaming decode, cancellation
     CHECK(!be.IsLoaded());
 }
 
+TEST_CASE("llamacpp integration: KV cache types and flash attention load and decode") {
+    struct Config {
+        KvCacheType k;
+        KvCacheType v;
+        FlashAttention fa;
+    };
+    const Config configs[] = {
+        {KvCacheType::kF16, KvCacheType::kF16, FlashAttention::kAuto},     // the default
+        {KvCacheType::kF16, KvCacheType::kF16, FlashAttention::kDisabled},
+        {KvCacheType::kQ8_0, KvCacheType::kQ8_0, FlashAttention::kAuto},   // llama.cpp enables FA
+        {KvCacheType::kQ8_0, KvCacheType::kF16, FlashAttention::kDisabled},  // quantized K alone
+        {KvCacheType::kQ4_0, KvCacheType::kQ4_0, FlashAttention::kEnabled},
+    };
+    for (const Config& c : configs) {
+        CAPTURE(ToString(c.k));
+        CAPTURE(ToString(c.v));
+        CAPTURE(ToString(c.fa));
+        LlamaCppBackend be;
+        LoadOptions opts;
+        opts.model_path = ModelPath();
+        opts.n_ctx = 512;
+        opts.n_batch = 64;
+        opts.n_ubatch = 32;  // explicit micro-batch below the batch size
+        opts.type_k = c.k;
+        opts.type_v = c.v;
+        opts.flash_attn = c.fa;
+        if (const char* t = std::getenv("SONDER_TEST_THREADS")) opts.n_threads = std::atoi(t);
+        const Status s = be.Load(opts);
+        if (!s.ok()) std::fprintf(stderr, "load failed: %s\n", s.message.c_str());
+        REQUIRE(s.ok());
+        std::vector<Token> prompt;
+        REQUIRE(be.Tokenize("Once upon a time, there was a little", true, prompt).ok());
+        RunOutput out = Run(be, prompt, 16);
+        CHECK(out.result.status.ok());
+        CHECK(out.result.generated_tokens > 0);
+        std::printf("[llamacpp_integration] kv k=%s v=%s fa=%s: %d tok, decode %.1f tok/s: %s\n",
+                    std::string(ToString(c.k)).c_str(), std::string(ToString(c.v)).c_str(),
+                    std::string(ToString(c.fa)).c_str(), out.result.generated_tokens,
+                    out.result.decode_tokens_per_second(), out.text.c_str());
+    }
+
+    // A quantized V cache with flash attention off is refused before loading.
+    LlamaCppBackend be;
+    LoadOptions bad;
+    bad.model_path = ModelPath();
+    bad.type_v = KvCacheType::kQ8_0;
+    bad.flash_attn = FlashAttention::kDisabled;
+    CHECK(be.Load(bad).code == ErrorCode::kInvalidArgument);
+    CHECK(!be.IsLoaded());
+}
+
 TEST_CASE("llamacpp integration: core Backend interface end to end") {
     si::LlamaCppBackendOptions opts;
     opts.context_length = 512;

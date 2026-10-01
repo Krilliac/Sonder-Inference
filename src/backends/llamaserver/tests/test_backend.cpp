@@ -1,7 +1,9 @@
 #include <doctest/doctest.h>
 
+#include <chrono>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../llamaserver_protocol.hpp"
@@ -38,6 +40,60 @@ TEST_SUITE("llamaserver_backend") {
         CHECK(z.prompt_present);
         CHECK_FALSE(z.cache_present);
         CHECK_FALSE(z.draft_present);
+    }
+
+    TEST_CASE("cached /props slot count supplies admission capacity without rereading") {
+        sonder_test::FakeLlamaServer server;
+        server.set_props(R"({"default_generation_settings":{"n_ctx":1024},"total_slots":2})");
+        LlamaServerBackendOptions options;
+        options.base_url = server.url();
+        auto backend = make_llamaserver_backend(options);
+        CHECK(backend->max_concurrent_requests() == 0);
+        auto model = backend->load_model({"fake-model", "cpu:0"});
+        REQUIRE(model.ok());
+        const auto props_reads = server.props_requests();
+        CHECK(backend->max_concurrent_requests() == 2);
+        CHECK(server.props_requests() == props_reads);
+    }
+
+    TEST_CASE("single-slot or disabled affinity omits id_slot during overlapping keyed chats") {
+        sonder_test::FakeLlamaServer server;
+        server.set_body("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"
+                        "data: [DONE]\n\n");
+        LlamaServerBackendOptions options;
+        options.base_url = server.url();
+        SUBCASE("one slot with default affinity") {
+            server.set_props(R"({"default_generation_settings":{"n_ctx":8192},"total_slots":1})");
+        }
+        SUBCASE("two slots with affinity disabled") {
+            server.set_props(R"({"default_generation_settings":{"n_ctx":8192},"total_slots":2})");
+            options.slot_affinity = false;
+        }
+        auto model = make_llamaserver_backend(options)->load_model({"fake-model", "cpu:0"});
+        REQUIRE(model.ok());
+        ChatRequest request;
+        request.messages = {{"user", "hi"}};
+        request.session_key = "a";
+        int callbacks = 0;
+        auto result = model.value()->chat(request, {}, [&](const TokenChunk &) {
+            ++callbacks;
+            CHECK(model.value()->chat(request, {}, {}).ok());
+            auto other = request;
+            other.session_key = "b";
+            CHECK(model.value()->chat(other, {}, {}).ok());
+            return true;
+        });
+        REQUIRE(result.ok());
+        CHECK(callbacks == 1);
+        const auto bodies = server.bodies();
+        REQUIRE(bodies.size() == 3);
+        for (const auto &body : bodies) {
+            const auto parsed = json::parse(body);
+            REQUIRE(parsed.ok());
+            CHECK(parsed->find("id_slot") == nullptr);
+            REQUIRE(parsed->find("cache_prompt"));
+            CHECK(parsed->find("cache_prompt")->as_bool());
+        }
     }
 
     TEST_CASE("sampling emits only explicitly selected values") {
@@ -310,6 +366,34 @@ TEST_SUITE("llamaserver_backend") {
         source.cancel();
         CHECK(m.value()->generate(GenerateRequest{"", "x", {}}, source.token(), {}).status().code() ==
               ErrorCode::cancelled);
+    }
+
+    TEST_CASE("cancellation during upstream prefill closes the response") {
+        sonder_test::FakeLlamaServer server;
+        server.set_body("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n");
+        server.set_initial_delay(std::chrono::milliseconds(300));
+        LlamaServerBackendOptions o;
+        o.base_url = server.url();
+        o.native_completion = false;
+        auto b = make_llamaserver_backend(o);
+        auto m = b->load_model({"fake-model", "cpu:0"});
+        REQUIRE(m.ok());
+        GenerateRequest q;
+        q.prompt = "x";
+        CancellationSource source;
+        std::thread canceller([&] {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (server.bodies().empty() && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            source.cancel();
+        });
+        auto result = m.value()->generate(q, source.token(), {});
+        canceller.join();
+        REQUIRE(!server.bodies().empty());
+        REQUIRE(result.status().code() == ErrorCode::cancelled);
+        for (int i = 0; i < 100 && server.disconnects() == 0; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        CHECK(server.disconnects() > 0);
     }
 
     TEST_CASE("malformed trailing and oversized SSE frames fail closed") {

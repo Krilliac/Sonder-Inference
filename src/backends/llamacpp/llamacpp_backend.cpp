@@ -117,6 +117,61 @@ DeviceKind MapDeviceKind(enum ggml_backend_dev_type type) {
     }
 }
 
+ggml_type ToGgmlType(KvCacheType type) {
+    switch (type) {
+        case KvCacheType::kF16: return GGML_TYPE_F16;
+        case KvCacheType::kF32: return GGML_TYPE_F32;
+        case KvCacheType::kBF16: return GGML_TYPE_BF16;
+        case KvCacheType::kQ8_0: return GGML_TYPE_Q8_0;
+        case KvCacheType::kQ5_1: return GGML_TYPE_Q5_1;
+        case KvCacheType::kQ5_0: return GGML_TYPE_Q5_0;
+        case KvCacheType::kQ4_1: return GGML_TYPE_Q4_1;
+        case KvCacheType::kQ4_0: return GGML_TYPE_Q4_0;
+        case KvCacheType::kIQ4_NL: return GGML_TYPE_IQ4_NL;
+    }
+    return GGML_TYPE_F16;  // unreachable after ValidateContextOptions
+}
+
+llama_flash_attn_type ToLlamaFlashAttn(FlashAttention mode) {
+    switch (mode) {
+        case FlashAttention::kAuto: return LLAMA_FLASH_ATTN_TYPE_AUTO;
+        case FlashAttention::kDisabled: return LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        case FlashAttention::kEnabled: return LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
+    return LLAMA_FLASH_ATTN_TYPE_AUTO;
+}
+
+// The single place that turns LoadOptions into llama_context_params; Load()
+// and ContextParamsFor() both use it. The abort callback is set by Load().
+llama_context_params MakeContextParams(const LoadOptions& options) {
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = options.n_ctx;
+    cp.n_batch = options.n_batch;
+    // 0 keeps llama.cpp's default micro-batch, capped at n_batch (the
+    // behaviour before n_ubatch was configurable).
+    cp.n_ubatch = options.n_ubatch == 0 ? std::min(cp.n_ubatch, options.n_batch) : options.n_ubatch;
+    cp.n_seq_max = 1;
+    if (options.n_threads > 0) {
+        cp.n_threads = options.n_threads;
+        cp.n_threads_batch = options.n_threads;
+    }
+    cp.type_k = ToGgmlType(options.type_k);
+    cp.type_v = ToGgmlType(options.type_v);
+    cp.flash_attn_type = ToLlamaFlashAttn(options.flash_attn);
+    return cp;
+}
+
+ContextParamsSummary Summarize(const llama_context_params& cp) {
+    ContextParamsSummary s;
+    s.n_ctx = cp.n_ctx;
+    s.n_batch = cp.n_batch;
+    s.n_ubatch = cp.n_ubatch;
+    s.type_k = ggml_type_name(cp.type_k);
+    s.type_v = ggml_type_name(cp.type_v);
+    s.flash_attn = llama_flash_attn_type_name(cp.flash_attn_type);
+    return s;
+}
+
 struct SamplerDeleter {
     void operator()(llama_sampler* s) const noexcept { llama_sampler_free(s); }
 };
@@ -223,6 +278,14 @@ std::string LlamaCppBackend::SystemInfo() {
     return s != nullptr ? std::string(s) : std::string();
 }
 
+ContextParamsSummary LlamaCppBackend::ContextParamsFor(const LoadOptions& options) {
+    return Summarize(MakeContextParams(options));
+}
+
+ContextParamsSummary LlamaCppBackend::UpstreamContextDefaults() {
+    return Summarize(llama_context_default_params());
+}
+
 LlamaCppBackend::LlamaCppBackend() : impl_(std::make_unique<Impl>()) {}
 LlamaCppBackend::~LlamaCppBackend() = default;
 LlamaCppBackend::LlamaCppBackend(LlamaCppBackend&&) noexcept = default;
@@ -273,6 +336,9 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
     if (Status s = ResolveTensorOverrides(options.tensor_overrides, &override_buffers); !s.ok()) {
         return s;
     }
+    if (Status s = ValidateContextOptions(options); !s.ok()) {
+        return s;
+    }
     std::error_code ec;
     const std::filesystem::path fs_path(std::u8string(options.model_path.begin(), options.model_path.end()));
     if (!std::filesystem::is_regular_file(fs_path, ec)) {
@@ -312,15 +378,7 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
     impl_->architecture = ReadModelArchitecture(model);
 
     if (!options.vocab_only) {
-        llama_context_params cp = llama_context_default_params();
-        cp.n_ctx = options.n_ctx;
-        cp.n_batch = options.n_batch;
-        cp.n_ubatch = std::min(cp.n_ubatch, options.n_batch);
-        cp.n_seq_max = 1;
-        if (options.n_threads > 0) {
-            cp.n_threads = options.n_threads;
-            cp.n_threads_batch = options.n_threads;
-        }
+        llama_context_params cp = MakeContextParams(options);
         cp.abort_callback = &Impl::AbortCallback;
         cp.abort_callback_data = impl_.get();
         impl_->ctx = llama_init_from_model(model, cp);

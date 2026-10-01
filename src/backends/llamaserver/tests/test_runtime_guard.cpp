@@ -5,6 +5,7 @@
 #include "../log_diagnostics.hpp"
 #include "../supervisor.hpp"
 #include "fake_process.hpp"
+#include "fake_gpu_memory.hpp"
 #include "sonder/inference/backends/llamaserver.hpp"
 
 #include <doctest/doctest.h>
@@ -17,6 +18,7 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -61,23 +63,6 @@ GpuProcessCounters counters(std::uint32_t pid, std::uint64_t dedicated, std::uin
     c.shared = {{instance(pid), shared}, {instance(pid, "0x000118C2"), 0}};
     return c;
 }
-
-class FakeCounters final : public GpuCounterSource {
-  public:
-    using Fn = std::function<Result<GpuProcessCounters>(std::uint32_t)>;
-    explicit FakeCounters(Fn fn, bool is_supported = true) : fn_(std::move(fn)), supported_(is_supported) {}
-    std::string name() const override { return "fake"; }
-    bool supported() const override { return supported_; }
-    Result<GpuProcessCounters> read(std::uint32_t pid) override {
-        reads.fetch_add(1);
-        return fn_(pid);
-    }
-    std::atomic<unsigned> reads{0};
-
-  private:
-    Fn fn_;
-    bool supported_;
-};
 
 // Shared usage as a function of the launched child's --ctx-size: children
 // above `limit` spill (388 MiB, measured), the others stay clean (182 MiB).
@@ -138,6 +123,31 @@ std::filesystem::path temp_log(const char *tag) {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     return std::filesystem::temp_directory_path() /
            ("sonder-llamaserver-" + std::string(tag) + "-" + std::to_string(stamp) + ".log");
+}
+
+std::string fixture_text(const char *name) {
+    const auto relative = std::filesystem::path("src/backends/llamaserver/tests/fixtures") / name;
+    std::vector<std::filesystem::path> candidates{
+        std::filesystem::path(__FILE__).parent_path() / "fixtures" / name,
+        relative,
+    };
+    auto root = std::filesystem::current_path();
+    for (int i = 0; i < 6; ++i) {
+        candidates.push_back(root / relative);
+        if (root == root.root_path())
+            break;
+        root = root.parent_path();
+    }
+    for (const auto &path : candidates) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            continue;
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
+    }
+    REQUIRE_MESSAGE(false, "missing fixture: ", relative.string());
+    return {};
 }
 
 } // namespace
@@ -216,6 +226,40 @@ TEST_CASE("spill classification uses the measured clean and spilled samples") {
     CHECK(spilled(457));
     o.baseline_bytes = std::numeric_limits<std::uint64_t>::max();
     CHECK_FALSE(spilled(1u << 20)); // saturating limit
+}
+
+TEST_CASE("spill baseline can grow with context for MTP profiles") {
+    // MTP (--spec-type draft-mtp) raises the clean line: measured 2026-09-30
+    // on the RTX 5070 Ti at about 126 MiB + 2 MiB per 1k ctx, +40 MiB after
+    // the first prompt (about 310 MiB at 73,728), and runs 33+ MiB above that
+    // line were already slower. A fixed 0 + 256 MiB limit calls that clean run
+    // spilled, which under auto_fit would shrink the context for nothing.
+    GpuMemorySample s;
+    s.shared_bytes = 310 * MiB;
+    SpillGuardOptions fixed; // defaults
+    CHECK(is_spilled(s, fixed, 73728u));
+    CHECK(effective_baseline(fixed, 73728u) == 0);
+
+    SpillGuardOptions o;
+    o.baseline_bytes = 166 * MiB;           // 126 + 40
+    o.baseline_bytes_per_1k_ctx = 2 * MiB;  // + 2 MiB per 1,024 tokens
+    o.threshold_bytes = 32 * MiB;
+    CHECK(effective_baseline(o, 73728u) == (166 + 144) * MiB);
+    CHECK_FALSE(is_spilled(s, o, 73728u));  // clean MTP line
+    s.shared_bytes = 342 * MiB;
+    CHECK_FALSE(is_spilled(s, o, 73728u));  // exactly baseline + threshold
+    s.shared_bytes = 343 * MiB;
+    CHECK(is_spilled(s, o, 73728u));        // mild spill
+    // Unknown context: the fixed baseline applies (no growth term).
+    CHECK(effective_baseline(o, std::nullopt) == 166 * MiB);
+    CHECK(is_spilled(s, o));
+    // The growth term saturates instead of wrapping.
+    o.baseline_bytes_per_1k_ctx = 1024 * MiB;
+    CHECK(effective_baseline(o, std::numeric_limits<std::uint64_t>::max()) ==
+          std::numeric_limits<std::uint64_t>::max());
+    CHECK(validate_spill_guard(o).ok());
+    o.baseline_bytes_per_1k_ctx = 1024 * MiB + 1;
+    CHECK_FALSE(validate_spill_guard(o).ok());
 }
 
 TEST_CASE("auto_fit context steps are aligned, strictly decreasing and floored") {
@@ -372,6 +416,72 @@ TEST_CASE("log parser reports CPU fallback and offload messages") {
     CHECK(detail_of(d.warnings()[1], "buffer_type") == "CUDA_Host");
     CHECK(d.warnings()[2].code == "no_gpu_device");
     CHECK(d.warnings()[3].code == "gpu_init_failed");
+}
+
+TEST_CASE("log diagnostics readiness reports blind verbosity and final option precedence") {
+    LogDiagnostics d;
+    d.ready({"--log-verbosity", "4", "-lv", "3"});
+    CHECK(d.offload_status() == "blind");
+    REQUIRE(d.warnings().size() == 1);
+    CHECK(d.warnings()[0].code == "diagnostics_blind");
+
+    d.ready({"--log-verbosity=3", "--log-verbosity", "4"});
+    CHECK(d.offload_status() == "pending");
+    CHECK(d.warnings().empty());
+    d.ready({"-lv", "4", "--log-verbosity", "invalid"});
+    CHECK(d.offload_status() == "blind");
+    REQUIRE(d.warnings().size() == 1);
+    CHECK(d.warnings()[0].code == "diagnostics_blind");
+}
+
+TEST_CASE("log diagnostics tracks partial and complete offload") {
+    LogDiagnostics d;
+    d.ready({"--log-verbosity=4"});
+    CHECK(d.offload_status() == "pending");
+    d.feed("load_tensors: offloaded 63/66 layers to GPU\n");
+    CHECK(d.offload_status() == "partial");
+    REQUIRE(d.warnings().size() == 1);
+    CHECK(d.warnings()[0].code == "partial_gpu_offload");
+    d.feed("load_tensors: offloaded 66/66 layers to GPU\n");
+    CHECK(d.offload_status() == "ok");
+    CHECK(d.warnings().size() == 1);
+
+    d.reset();
+    CHECK(d.offload_status() == "pending");
+    CHECK(d.warnings().empty());
+}
+
+TEST_CASE("real diagnostics fixtures classify lv3 as blind and lv4 offload as observable") {
+    LogDiagnostics blind;
+    blind.ready({"--log-verbosity", "3"});
+    blind.feed(fixture_text("llama-server.log.snapshot-1144.txt"));
+    CHECK(blind.offload_status() == "blind");
+    REQUIRE(blind.warnings().size() >= 1);
+    CHECK(std::any_of(blind.warnings().begin(), blind.warnings().end(), [](const auto &warning) {
+        return warning.code == "diagnostics_blind";
+    }));
+
+    LogDiagnostics visible;
+    visible.ready({"--log-verbosity", "4"});
+    visible.feed(fixture_text("ollama-27b-load-excerpt.txt"));
+    CHECK(visible.offload_status() == "ok");
+    CHECK(std::none_of(visible.warnings().begin(), visible.warnings().end(), [](const auto &warning) {
+        return warning.code == "partial_gpu_offload" || warning.code == "diagnostics_blind";
+    }));
+    // Keep the captured fixture exact; vary only the offload count to replay
+    // the requested 63/66 partial-offload arm with its real log prefix.
+    auto partial = fixture_text("ollama-27b-load-excerpt.txt");
+    const auto at = partial.find("offloaded 66/66");
+    REQUIRE(at != std::string::npos);
+    partial.replace(at, std::string("offloaded 66/66").size(), "offloaded 63/66");
+    visible.reset();
+    visible.feed(partial);
+    CHECK(visible.offload_status() == "partial");
+    CHECK(std::any_of(visible.warnings().begin(), visible.warnings().end(), [](const auto &warning) {
+        return warning.code == "partial_gpu_offload";
+    }));
+    visible.feed("load_tensors: offloaded 63/66 layers to GPU\n");
+    CHECK(visible.offload_status() == "partial");
 }
 
 TEST_CASE("log parser frames lines across chunks and bounds line length and warning count") {
@@ -666,8 +776,9 @@ TEST_CASE("supervisor appends --log-file and surfaces log warnings after readine
 
 // ------------------------------------------------------------ backend level
 
-TEST_CASE("backend runtime status: spawn reports, attach stays silent") {
+TEST_CASE("backend runtime status: spawn reports and generic attach stays silent") {
     LlamaServerBackendOptions attach;
+    attach.native_completion = false;
     CHECK_FALSE(make_llamaserver_backend(attach)->runtime_status().has_value());
 
     LlamaServerBackendOptions spawn;

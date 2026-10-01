@@ -34,6 +34,9 @@
 #include "../../src/cli/cli_spec.hpp"
 #include "../../src/cli/cli_values.hpp"
 #include "../../src/cli/sonder_infer_commands.hpp"
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+#include "../../src/backends/llamaserver/tune.hpp"
+#endif
 #if defined(SONDER_HAS_SERVER)
 #include "sonder/inference/backend_setup.hpp"
 #include "sonder/inference/server.hpp"
@@ -1058,6 +1061,14 @@ int main(int argc, char** argv) {
         return cli::kExitUsage;
     }
     if (cmd == "serve") return cmd_serve(rest);
+    if (cmd == "tune") {
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+        return si::llamaserver::tune::tune_main(rest, std::cout, std::cerr);
+#else
+        err() << "error: tune: this build does not include the llamaserver module\n";
+        return cli::kExitUsage;
+#endif
+    }
 
     std::string error;
     auto parsed = cli::parse_command_args(*spec, rest, error);

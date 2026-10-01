@@ -28,6 +28,50 @@ def _hit(g: dict) -> str:
     return f"{h['mean']:.2f}"
 
 
+def _observation_values(source: dict) -> dict[str, float]:
+    values = {}
+    for name in ("cache_n", "prompt_n"):
+        value = source.get(name)
+        if isinstance(value, dict):
+            value = value.get("mean")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            values[name] = value
+    metrics = source.get("metrics") or {}
+    accepted = source.get("accepted_per_position", metrics.get("accepted_per_position", {}))
+    for position, value in (accepted or {}).items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            values[f"accepted position {position}"] = value
+    child = source.get("child_log") or {}
+    for name, value in child.get("counters", {}).items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            values[f"child log {name}"] = value
+    return values
+
+
+def _observation_extra(source: dict) -> list[str]:
+    extra = []
+    values = _observation_values(source)
+    for name in ("cache_n", "prompt_n"):
+        if name in values:
+            extra.append(f"{name} {_f(values[name], digits=0)}")
+    accepted = [f"{k.removeprefix('accepted position ')}:{_f(v, digits=0)}"
+                for k, v in values.items() if k.startswith("accepted position ")]
+    if accepted:
+        extra.append("accepted/pos " + ",".join(accepted))
+    child = [f"{k.removeprefix('child log ')}={_f(v, digits=0)}"
+             for k, v in values.items() if k.startswith("child log ")]
+    if child:
+        extra.append("child log " + ",".join(child))
+    for name in ("metrics", "child_log"):
+        observation = source.get(name) or {}
+        for field in ("errors", "resets", "unknown"):
+            if observation.get(field):
+                extra.append(f"{name} {field}: {observation[field]}")
+        if observation.get("reset") or observation.get("partial"):
+            extra.append(f"{name}: reset or partial observation")
+    return extra
+
+
 def render_markdown(res: dict) -> str:
     L: list[str] = []
     srv = res.get("server") or {}
@@ -69,6 +113,7 @@ def render_markdown(res: dict) -> str:
             da = gs.get("draft_acceptance") or {}
             if da.get("n"):
                 extra.append(f"draft acc {da['mean']:.2f}")
+            extra.extend(_observation_extra(gs))
             rec = "–" if gs.get("recall") is None else f"{gs['recall'] * gs['recall_n']:.0f}/{gs['recall_n']}"
             L.append("| " + " | ".join([
                 s["name"], g, f"{gs.get('ok')}/{gs.get('requests')}",
@@ -81,6 +126,19 @@ def render_markdown(res: dict) -> str:
                 _hit(gs), rec, "; ".join(extra)]) + " |")
         for sk in s.get("skipped") or []:
             L.append(f"| {s['name']} | {sk['size']} | skipped | | | | | | | | | | | | | {sk['reason']} |")
+    observations = [("run", res)]
+    for scenario in res.get("scenarios") or []:
+        observations.append((scenario["name"], scenario))
+        observations.extend((f"{scenario['name']}/{request.get('group', i)}", request)
+                            for i, request in enumerate(scenario.get("requests") or []))
+    observed = [(scope, _observation_extra(source)) for scope, source in observations]
+    observed = [(scope, detail) for scope, detail in observed if detail]
+    if observed:
+        L.extend(["", "## Observations", "",
+                  "Metrics are server-wide interval deltas; concurrent request windows overlap. "
+                  "Child-log counters cover run/scenario intervals only.", ""])
+        for scope, detail in observed:
+            L.append(f"- `{scope}`: " + "; ".join(detail))
     samples = gpu.get("samples") or []
     if samples:
         L.append("")
@@ -116,6 +174,18 @@ COMPARE_METRICS = [
 ]
 
 
+def _compare_observations(a: dict, b: dict, scenario: str, group: str) -> list[dict]:
+    av, bv = _observation_values(a), _observation_values(b)
+    rows = []
+    for name in sorted(set(av) | set(bv)):
+        va, vb = av.get(name), bv.get(name)
+        rows.append({"scenario": scenario, "group": group, "metric": name, "a": va, "b": vb,
+                     "delta": vb - va if va is not None and vb is not None else None,
+                     "delta_pct": (vb - va) / va * 100 if va not in (None, 0) and vb is not None else None,
+                     "better": None})
+    return rows
+
+
 def _get(gs: dict, path: tuple) -> float | None:
     cur: Any = gs
     for k in path:
@@ -146,6 +216,13 @@ def compare(a: dict, b: dict) -> tuple[str, list[dict]]:
                 if vb != va:
                     row["better"] = (vb < va) if lower else (vb > va)
             rows.append(row)
+        rows.extend(_compare_observations(ga[key], gb[key], key[0], key[1]))
+    # Never sum overlapping request windows into scenario or run counters.
+    sa = {s["name"]: s for s in a.get("scenarios") or []}
+    sb = {s["name"]: s for s in b.get("scenarios") or []}
+    for name in sorted(set(sa) & set(sb)):
+        rows.extend(_compare_observations(sa[name], sb[name], name, "scenario"))
+    rows.extend(_compare_observations(a, b, "(run)", "observations"))
     L = [f"# A/B: `{a.get('label') or 'A'}` vs `{b.get('label') or 'B'}`", ""]
     L.append(f"- A: `{a['target']['base_url']}` model `{a['target'].get('model')}` build "
              f"`{(a.get('server') or {}).get('build_info')}` verdict {a.get('verdict')}")

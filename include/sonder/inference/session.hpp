@@ -2,7 +2,9 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -12,6 +14,7 @@
 #include "sonder/inference/backend.hpp"
 #include "sonder/inference/cancellation.hpp"
 #include "sonder/inference/model.hpp"
+#include "sonder/inference/request_priority.hpp"
 #include "sonder/inference/telemetry.hpp"
 
 // Session::chat() exists (runs chat through the request runtime and emits
@@ -79,6 +82,31 @@ struct RequestOptions {
     // ChatRequest::thinking); ignored by generate() and the generic template.
     std::string session_key;
     ThinkingOptions thinking;
+    // Backend-native chat may return reasoning separately for protocols that
+    // expose it (for example Anthropic-compatible responses).
+    bool separate_reasoning = false;
+    // Optional hosted-server admission class. The engine ignores this unless
+    // strict priority admission is enabled.
+    std::optional<RequestPriority> priority_class;
+    // Admission time spent in an outer server queue, supplied additively to
+    // the engine scheduler's own queue time for telemetry.
+    double admission_queue_ms = 0.0;
+    // Shared host ticket joins slot/class eligibility to logical KV admission.
+    // Its queue time supersedes admission_queue_ms + the runtime's queue time.
+    std::shared_ptr<RequestAdmission> admission;
+    // Optional absolute deadline. A request waiting for admission expires
+    // with timeout; a running request remains cooperatively cancellable.
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    // Called exactly once after scheduler admission and immediately before
+    // the backend invocation, after checking the deadline. Must not throw.
+    std::function<void()> on_backend_start;
+    // Keep SessionOptions::workload - priority as the scheduler rank even
+    // with strict class admission. Used by legacy numeric HTTP priorities,
+    // including explicit zero; the host ticket still enforces class/FIFO.
+    bool preserve_numeric_priority = false;
+    // Native llama-server chat only. Unset leaves the upstream default intact.
+    std::optional<std::int64_t> reasoning_budget_tokens = std::nullopt;
+    std::optional<std::string> reasoning_budget_message = std::nullopt;
 };
 
 struct GenerationResult {
@@ -89,6 +117,7 @@ struct GenerationResult {
     double ttft_ms = -1.0;   // -1 when no chunk was produced
     double total_ms = 0.0;
     SchedulingInfo scheduling;
+    std::string reasoning{};
 };
 
 class Engine;

@@ -73,6 +73,102 @@ Status Validate(const SamplingParams& params) {
     return Status::Ok();
 }
 
+namespace {
+
+constexpr KvCacheType kAllKvCacheTypes[] = {
+    KvCacheType::kF16,  KvCacheType::kF32,  KvCacheType::kBF16, KvCacheType::kQ8_0,   KvCacheType::kQ5_1,
+    KvCacheType::kQ5_0, KvCacheType::kQ4_1, KvCacheType::kQ4_0, KvCacheType::kIQ4_NL,
+};
+
+bool EqualsIgnoreCase(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const auto ca = static_cast<unsigned char>(a[i]);
+        const auto cb = static_cast<unsigned char>(b[i]);
+        const auto la = static_cast<unsigned char>(ca >= 'A' && ca <= 'Z' ? ca + ('a' - 'A') : ca);
+        const auto lb = static_cast<unsigned char>(cb >= 'A' && cb <= 'Z' ? cb + ('a' - 'A') : cb);
+        if (la != lb) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+std::string_view ToString(KvCacheType type) noexcept {
+    switch (type) {
+        case KvCacheType::kF16: return "f16";
+        case KvCacheType::kF32: return "f32";
+        case KvCacheType::kBF16: return "bf16";
+        case KvCacheType::kQ8_0: return "q8_0";
+        case KvCacheType::kQ5_1: return "q5_1";
+        case KvCacheType::kQ5_0: return "q5_0";
+        case KvCacheType::kQ4_1: return "q4_1";
+        case KvCacheType::kQ4_0: return "q4_0";
+        case KvCacheType::kIQ4_NL: return "iq4_nl";
+    }
+    return "unknown";
+}
+
+std::string_view ToString(FlashAttention mode) noexcept {
+    switch (mode) {
+        case FlashAttention::kAuto: return "auto";
+        case FlashAttention::kDisabled: return "off";
+        case FlashAttention::kEnabled: return "on";
+    }
+    return "unknown";
+}
+
+bool ParseKvCacheType(std::string_view name, KvCacheType& out) noexcept {
+    for (const KvCacheType t : kAllKvCacheTypes) {
+        if (EqualsIgnoreCase(name, ToString(t))) {
+            out = t;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ParseFlashAttention(std::string_view name, FlashAttention& out) noexcept {
+    if (EqualsIgnoreCase(name, "auto")) {
+        out = FlashAttention::kAuto;
+    } else if (EqualsIgnoreCase(name, "on") || EqualsIgnoreCase(name, "enabled")) {
+        out = FlashAttention::kEnabled;
+    } else if (EqualsIgnoreCase(name, "off") || EqualsIgnoreCase(name, "disabled")) {
+        out = FlashAttention::kDisabled;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+bool IsQuantized(KvCacheType type) noexcept {
+    return type != KvCacheType::kF16 && type != KvCacheType::kF32 && type != KvCacheType::kBF16;
+}
+
+Status ValidateContextOptions(const LoadOptions& options) {
+    if (options.vocab_only) return Status::Ok();
+    if (ToString(options.type_k) == "unknown" || ToString(options.type_v) == "unknown") {
+        return Status::Error(ErrorCode::kInvalidArgument, "unknown KV cache type");
+    }
+    if (ToString(options.flash_attn) == "unknown") {
+        return Status::Error(ErrorCode::kInvalidArgument, "unknown flash attention mode");
+    }
+    // n_batch == 0 keeps its own, older error in Load().
+    if (options.n_batch > 0 && options.n_ubatch > options.n_batch) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "n_ubatch (" + std::to_string(options.n_ubatch) + ") must be <= n_batch (" +
+                                 std::to_string(options.n_batch) + ")");
+    }
+    // llama.cpp refuses a quantized V cache without Flash Attention
+    // (llama_init_from_model: "quantized V cache requires flash_attn").
+    if (IsQuantized(options.type_v) && options.flash_attn == FlashAttention::kDisabled) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "V cache type " + std::string(ToString(options.type_v)) +
+                                 " is quantized and requires flash attention (use on or auto)");
+    }
+    return Status::Ok();
+}
+
 double GenerateResult::decode_tokens_per_second() const noexcept {
     return decode_ms > 0.0 ? generated_tokens * 1000.0 / decode_ms : 0.0;
 }

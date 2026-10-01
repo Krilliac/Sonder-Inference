@@ -109,6 +109,15 @@ json::Object to_json(const GpuMemoryStatus& g) {
     out.set("spill_threshold_bytes", g.spill_threshold_bytes);
     out.set("spilled", g.spilled);
     out.set("samples", g.samples);
+    if (g.residency) {
+        const auto &r = *g.residency;
+        out.set("residency", json::Object{{"gpu_offload_missing", r.gpu_offload_missing},
+                                           {"vram_evicted", r.vram_evicted},
+                                           {"peak_dedicated_bytes", r.peak_dedicated_bytes},
+                                           {"observed_dedicated_bytes", r.observed_dedicated_bytes},
+                                           {"eviction_restarts", r.eviction_restarts},
+                                           {"action", r.action}});
+    }
     return out;
 }
 
@@ -119,6 +128,20 @@ json::Object to_json(const BackendWarning& w) {
     }
     return json::Object{{"code", w.code},     {"severity", w.severity},       {"source", w.source},
                         {"message", w.message}, {"details", std::move(details)}, {"count", w.count}};
+}
+
+json::Object to_json(const BackendWarmupSlotStatus& slot) {
+    json::Object out{{"id_slot", slot.id_slot}, {"status", slot.status},
+                     {"prompt_tokens", json::Value(slot.prompt_tokens)},
+                     {"cache_n", json::Value(slot.cache_n)}, {"milliseconds", slot.milliseconds}};
+    if (!slot.error.empty()) out.set("error", slot.error);
+    return out;
+}
+
+json::Object to_json(const BackendWarmupStatus& status) {
+    json::Array slots;
+    for (const auto& slot : status.slots) slots.emplace_back(to_json(slot));
+    return json::Object{{"generation", status.generation}, {"status", status.status}, {"slots", std::move(slots)}};
 }
 
 json::Object to_json(const BackendRuntimeStatus& status) {
@@ -135,9 +158,14 @@ json::Object to_json(const BackendRuntimeStatus& status) {
     for (const auto& w : status.warnings) {
         warnings.emplace_back(to_json(w));
     }
-    return json::Object{{"gpu_memory", to_json(status.gpu_memory)},
-                        {"context", std::move(context)},
-                        {"warnings", std::move(warnings)}};
+    json::Object out{{"gpu_memory", to_json(status.gpu_memory)},
+                     {"context", std::move(context)},
+                     {"warnings", std::move(warnings)}};
+    if (status.warmup) out.set("warmup", to_json(*status.warmup));
+    if (status.child) out.set("child", *status.child);
+    if (status.stall) out.set("stall", *status.stall);
+    if (status.diagnostics) out.set("diagnostics", *status.diagnostics);
+    return out;
 }
 
 }  // namespace sonder::inference

@@ -23,7 +23,8 @@
 - [ ] model load/unload (engine registry + telemetry done; native residency pending)
 - [x] telemetry (Observatory envelope v1 JSONL; lifecycle, request, decode, token, device, scheduler, KV, sampling, drop accounting; see `docs/TELEMETRY.md`)
 - [x] side-by-side Ollama adapter (loopback HTTP, streaming, cancellation)
-- [x] local HTTP API for Sonder Runtime (module `src/server`: `serve_main()` and `Server`; OpenAI-compatible chat subset through `Session::chat`, health, models, backend identity; ADR-020 proposed, `docs/SERVER.md`)
+- [x] local HTTP API for Sonder Runtime (module `src/server`: `serve_main()` and `Server`; OpenAI-compatible chat subset plus Anthropic Messages `POST /v1/messages` through `Session::chat`, health, models, backend identity; ADR-020 proposed, `docs/SERVER.md`)
+- [x] request priority classes and bounded admission (interactive/subagent/background FIFO ordering, per-class concurrency and queue caps, deadlines, cancellation propagation, and additive telemetry; see `docs/SERVER.md` and `docs/TELEMETRY.md`)
 - [x] `sonder-infer serve` command-line dispatch (`src/cli/sonder_infer_commands.hpp`; exercised in CI by the Linux smoke step, which starts `serve --backend mock --port 0 --ready-file` and drains it on SIGINT)
 - [x] live telemetry transport: SSE and NDJSON with discovery, resume and per-subscriber backpressure (`docs/TELEMETRY.md`)
 - [ ] C ABI additions for chat, session metadata and a telemetry callback (follow-up to ADR-020)
@@ -57,10 +58,16 @@ Gate: measurable win on agent fan-out/long-context workloads without interactive
   Windows; warn / refuse / bounded `auto_fit` context step-down), KV cache
   pairing check and llama-server log diagnostics, surfaced additively on
   health, `/v1/models` and telemetry ([vram-spill](integration/vram-spill.md))
+- [x] llamaserver slot prefix warm-up after readiness and supervised restart
+  (bounded, per-slot, cancellable; `docs/integration/llama-server.md`)
 - [ ] adaptive speculation policy
+- [x] `sonder-infer tune`: bounded llama-server calibration, PDH spill qualification,
+  per-profile context margin, and spawn-config output with two recommendations
+  ([usage and qualification limits](integration/tune.md)); live performance validation pending
 - [ ] CPU KV spill
 - [ ] cache quantization where supported
 - [x] tensor placement overrides (MoE experts in RAM; `docs/PLACEMENT.md` step 1)
+- [x] llama.cpp KV cache types (K and V separately), flash attention mode and micro-batch size as backend/`serve` options; defaults unchanged, no automatic policy yet (`docs/PLACEMENT.md`, "KV cache types")
 - [x] typed per-model [launch profiles](integration/launch-profiles.md): one
   JSON schema drives llama-server argv and the direct llamacpp backend
   (unsupported fields rejected), default sampling per model, `/v1/models`

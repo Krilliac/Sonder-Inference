@@ -4,6 +4,7 @@
 // telemetry streams closed).
 #include <doctest/doctest.h>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include "server_test_support.hpp"
+#include "sonder/inference/backend_setup.hpp"
 
 using namespace server_test;
 namespace json = sonder::inference::json;
@@ -30,6 +32,43 @@ std::string read_file(const fs::path& p) {
     ss << in.rdbuf();
     return ss.str();
 }
+
+// Reads the ready file the server has just renamed into place. On Windows the
+// rename keeps a handle with DELETE access on the file for a moment after the
+// new name is visible (for milliseconds when the renaming thread is preempted
+// right there, as on a loaded CI machine), and std::ifstream shares only read
+// and write, so an open in that window fails with a sharing violation (errno
+// EACCES) although the file is complete. A failed open is retried for up to
+// `patience`; whatever is read once the file opens is returned unchanged, so a
+// truncated or malformed file still fails the caller's parse.
+std::string read_ready_file(const fs::path& p, std::chrono::milliseconds patience = std::chrono::milliseconds(5000)) {
+    const auto deadline = std::chrono::steady_clock::now() + patience;
+    for (;;) {
+        std::ifstream in(p, std::ios::binary);
+        if (in) {
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            return ss.str();
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return {};
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
+// Joins the serve_main thread if a failed REQUIRE unwinds the test first. A
+// joinable std::thread destroyed by unwinding calls std::terminate, which
+// turns one failed assertion into a crash of the whole test binary.
+struct JoinRunner {
+    std::thread& thread;
+    ~JoinRunner() {
+        if (thread.joinable()) {
+            srv::request_shutdown();
+            thread.join();
+        }
+    }
+};
 
 int run(const std::vector<std::string>& args, std::string& out_text, std::string& err_text) {
     std::ostringstream out;
@@ -53,6 +92,57 @@ TEST_CASE("serve_main: --help prints usage and exits 0") {
     CHECK(out.find("sonder-infer serve") != std::string::npos);
     CHECK(out.find("--ready-file") != std::string::npos);
     CHECK(out.find("--cors-origin") != std::string::npos);
+    CHECK(out.find("--backend-capacity") != std::string::npos);
+    CHECK(out.find("--priority-admission auto|on|off") != std::string::npos);
+    CHECK(out.find("--warmup-file") != std::string::npos);
+}
+
+TEST_CASE("llamaserver config: parses and validates warmup settings") {
+    const auto config = temp_path("warmup.json");
+    std::ofstream(config) << R"({
+      "warmup": {
+        "messages_file": "prefix.json",
+        "chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"},
+        "slots": [2, 7], "on_restart": false, "max_prefix_chars": 4096
+      }
+    })";
+    sonder::inference::BackendSetup setup;
+    REQUIRE(sonder::inference::load_llamaserver_config(config.string(), setup).ok());
+    CHECK(setup.llamaserver_warmup_messages_file == "prefix.json");
+    CHECK_FALSE(setup.llamaserver_warmup_all_slots);
+    REQUIRE(setup.llamaserver_warmup_slots.size() == 2);
+    CHECK(setup.llamaserver_warmup_slots[0] == 2);
+    CHECK(setup.llamaserver_warmup_slots[1] == 7);
+    CHECK_FALSE(setup.llamaserver_warmup_on_restart);
+    CHECK(setup.llamaserver_warmup_max_prefix_chars == 4096);
+    REQUIRE(setup.llamaserver_warmup_chat_template_kwargs.find("enable_thinking") != nullptr);
+    CHECK_FALSE(setup.llamaserver_warmup_chat_template_kwargs.find("enable_thinking")->as_bool(true));
+    std::error_code ec;
+    fs::remove(config, ec);
+}
+
+TEST_CASE("llamaserver config: rejects malformed warmup settings") {
+    const std::vector<std::string> documents = {
+        R"({"warmup": {"slots": [1, 1]}})",
+        R"({"warmup": {"slots": [1024]}})",
+        R"({"warmup": {"slots": "some"}})",
+        R"({"warmup": {"max_prefix_chars": 0}})",
+        R"({"warmup": {"unknown": true}})"};
+    for (std::size_t i = 0; i < documents.size(); ++i) {
+        const auto config = temp_path("bad-warmup-" + std::to_string(i) + ".json");
+        std::ofstream(config) << documents[i];
+        sonder::inference::BackendSetup setup;
+        CHECK_FALSE(sonder::inference::load_llamaserver_config(config.string(), setup).ok());
+        std::error_code ec;
+        fs::remove(config, ec);
+    }
+}
+
+TEST_CASE("serve_main: --warmup-file is llamaserver-only") {
+    std::string out;
+    std::string err;
+    CHECK(run({"--backend", "mock", "--warmup-file", "prefix.json"}, out, err) == 2);
+    CHECK(err.find("requires --backend llamaserver") != std::string::npos);
 }
 
 TEST_CASE("serve_main: usage errors exit 2") {
@@ -75,12 +165,18 @@ TEST_CASE("serve_main: usage errors exit 2") {
              {"--backend", "mock", "--log-format", "xml"},
              {"--backend", "mock", "--no-default-cors=1"},
              {"--backend", "mock", "--host", "a", "--host", "b"},
+             {"--backend", "mock", "--backend-capacity", "not-a-number"},
+             {"--backend", "mock", "--priority-admission", "sometimes"},
              {"--backend", "mock", "--token-file", (temp_path("missing")).string()},
              {"--backend", "ollama"},
              {"--backend", "mock", "--model", "default"},
              // Unknown backends are usage errors, caught before anything binds.
              {"--backend", "vllm", "--model", "x", "--port", "0"},
              {"--backend", "mock", "--cors-origin", "http://127.0.0.1:4173/", "--port", "0"},
+             {"--backend", "mock", "--model-idle-ttl", "-1"},
+             {"--backend", "mock", "--model-idle-ttl", "2592001"},
+             {"--backend", "mock", "--max-resident-models", "x"},
+             {"--backend", "mock", "--lazy-models=1"},
          }) {
         CAPTURE(args.back());
         CHECK(run(args, out, err) == 2);
@@ -95,6 +191,49 @@ TEST_CASE("serve_main: usage errors exit 2") {
     }
     std::error_code ec;
     fs::remove(token, ec);
+}
+
+TEST_CASE("serve_main: llama.cpp KV cache, flash attention and batch flags") {
+    std::string out;
+    std::string err;
+    CHECK(run({"--help"}, out, err) == 0);
+    for (const char* flag : {"--batch-size", "--ubatch-size", "--cache-type-k", "--cache-type-v", "--flash-attn"}) {
+        CAPTURE(flag);
+        CHECK(out.find(flag) != std::string::npos);
+    }
+    // Numeric flags are range-checked while parsing.
+    for (const auto& args : std::vector<std::vector<std::string>>{
+             {"--backend", "llamacpp", "--model", "x", "--batch-size", "0"},
+             {"--backend", "llamacpp", "--model", "x", "--batch-size", "12x"},
+             {"--backend", "llamacpp", "--model", "x", "--ubatch-size", "0"},
+             {"--backend", "llamacpp", "--model", "x", "--ubatch-size", "5000000"},
+         }) {
+        CAPTURE(args.back());
+        CHECK(run(args, out, err) == 2);
+        CHECK(err.find("error:") != std::string::npos);
+    }
+    // Bad values and combinations are usage errors before anything binds.
+    for (const auto& args : std::vector<std::vector<std::string>>{
+             {"--backend", "llamacpp", "--model", "x", "--port", "0", "--cache-type-v", "q4_0", "--flash-attn", "off"},
+             {"--backend", "llamacpp", "--model", "x", "--port", "0", "--cache-type-k", "q4_k"},
+             {"--backend", "llamacpp", "--model", "x", "--port", "0", "--flash-attn", "maybe"},
+             {"--backend", "llamacpp", "--model", "x", "--port", "0", "--batch-size", "256", "--ubatch-size", "512"},
+         }) {
+        CAPTURE(args.back());
+        CHECK(run(args, out, err) == 2);
+        CHECK(err.find("error:") != std::string::npos);
+    }
+#if defined(SONDER_HAS_LLAMACPP_BACKEND)
+    CHECK(run({"--backend", "llamacpp", "--model", "x", "--port", "0", "--cache-type-v", "q8_0", "--flash-attn",
+               "off"},
+              out, err) == 2);
+    CHECK(err.find("requires flash attention") != std::string::npos);
+    CHECK(run({"--backend", "llamacpp", "--model", "x", "--port", "0", "--cache-type-k", "q4_k"}, out, err) == 2);
+    CHECK(err.find("unknown K cache type 'q4_k'") != std::string::npos);
+    CHECK(run({"--backend", "llamacpp", "--model", "x", "--port", "0", "--batch-size", "256", "--ubatch-size", "512"},
+              out, err) == 2);
+    CHECK(err.find("n_ubatch (512) must be <= n_batch (256)") != std::string::npos);
+#endif
 }
 
 TEST_CASE("serve_main: ready file, banner, access log and graceful shutdown via the hook") {
@@ -112,8 +251,9 @@ TEST_CASE("serve_main: ready file, banner, access log and graceful shutdown via 
         err_text = local_err.str();
         done.set_value(rc);
     });
+    JoinRunner join_runner{runner};
     REQUIRE(eventually([&] { return fs::exists(ready); }, std::chrono::milliseconds(10000)));
-    auto doc = json::parse(read_file(ready));
+    auto doc = json::parse(read_ready_file(ready));
     REQUIRE(doc.ok());
     const std::string url = doc.value().find("url")->as_string();
     CHECK(url.rfind("http://127.0.0.1:", 0) == 0);
@@ -203,8 +343,9 @@ TEST_CASE("serve_main: a wildcard bind names the bind address and the local URL"
         err_text = local_err.str();
         done.set_value(rc);
     });
+    JoinRunner join_runner{runner};
     REQUIRE(eventually([&] { return fs::exists(ready); }, std::chrono::milliseconds(10000)));
-    auto doc = json::parse(read_file(ready));
+    auto doc = json::parse(read_ready_file(ready));
     REQUIRE(doc.ok());
     const std::string url = doc.value().find("url")->as_string();
     const std::string port = url.substr(url.rfind(':') + 1);
@@ -218,3 +359,31 @@ TEST_CASE("serve_main: a wildcard bind names the bind address and the local URL"
     std::error_code ec;
     fs::remove(token, ec);
 }
+
+#if defined(_WIN32)
+TEST_CASE("serve_main tests: a ready file held open for delete is read once it is released") {
+    const auto path = temp_path("held-for-delete.json");
+    {
+        std::ofstream(path, std::ios::binary) << "{\"ok\":true}\n";
+    }
+    // What a rename leaves on the file for a moment: a handle with DELETE
+    // access that shares everything.
+    HANDLE held = ::CreateFileW(path.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    REQUIRE(held != INVALID_HANDLE_VALUE);
+    {
+        // The hazard itself: a plain std::ifstream cannot open the file now.
+        std::ifstream in(path, std::ios::binary);
+        CHECK_FALSE(in.is_open());
+    }
+    std::thread release([held] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        ::CloseHandle(held);
+    });
+    const std::string text = read_ready_file(path);
+    release.join();
+    CHECK(text == "{\"ok\":true}\n");
+    std::error_code ec;
+    fs::remove(path, ec);
+}
+#endif

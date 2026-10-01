@@ -1,4 +1,5 @@
 #include "log_diagnostics.hpp"
+#include "utf8_path.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -61,6 +62,29 @@ std::optional<std::string> last_value(const std::vector<std::string> &args,
         return std::nullopt;
     const auto &v = values.back();
     return args[v.index].substr(v.offset);
+}
+
+std::optional<std::uint64_t> last_log_verbosity(const std::vector<std::string> &args) {
+    std::optional<std::uint64_t> result;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        std::string_view value;
+        const auto arg = std::string_view(args[i]);
+        if (arg == "-lv" || arg == "--log-verbosity") {
+            if (i + 1 >= args.size()) {
+                result.reset();
+                continue;
+            }
+            value = args[++i];
+        } else if (arg.rfind("--log-verbosity=", 0) == 0) {
+            value = arg.substr(std::string_view("--log-verbosity=").size());
+        } else if (arg.rfind("-lv=", 0) == 0) {
+            value = arg.substr(4);
+        } else {
+            continue;
+        }
+        result = parse_uint(value);
+    }
+    return result;
 }
 
 std::string lower(std::string text) {
@@ -203,6 +227,40 @@ void LogDiagnostics::reset() {
     warnings_.clear();
     keys_.clear();
     mtp_bytes_ = 0;
+    offload_.reset();
+    if (ready_ && diagnostics_blind_) {
+        add(BackendWarning{"diagnostics_blind", "warning", "config",
+                           "llama-server log verbosity is below 4; offload diagnostics cannot be observed", {}, 1},
+            "diagnostics_blind");
+    }
+}
+
+void LogDiagnostics::ready(const std::vector<std::string> &args) {
+    ready_ = true;
+    const auto verbosity = last_log_verbosity(args);
+    diagnostics_blind_ = !verbosity || *verbosity < 4;
+    offload_.reset();
+    // Readiness is a new child boundary. Keep the parser's existing warning
+    // accounting useful to callers while replacing only this readiness fact.
+    for (std::size_t i = warnings_.size(); i > 0; --i) {
+        if (warnings_[i - 1].code == "diagnostics_blind") {
+            warnings_.erase(warnings_.begin() + static_cast<std::ptrdiff_t>(i - 1));
+            keys_.erase(keys_.begin() + static_cast<std::ptrdiff_t>(i - 1));
+        }
+    }
+    if (diagnostics_blind_) {
+        add(BackendWarning{"diagnostics_blind", "warning", "config",
+                           "llama-server log verbosity is below 4; offload diagnostics cannot be observed", {}, 1},
+            "diagnostics_blind");
+    }
+}
+
+std::string LogDiagnostics::offload_status() const {
+    if (diagnostics_blind_)
+        return "blind";
+    if (!offload_)
+        return "pending";
+    return offload_->first < offload_->second ? "partial" : "ok";
 }
 
 void LogDiagnostics::feed(std::string_view bytes) {
@@ -329,7 +387,10 @@ void LogDiagnostics::line(std::string_view text) {
             return;
         const auto done = parse_uint(rest.substr(0, slash));
         const auto total = parse_uint(rest.substr(slash + 1, space - slash - 1));
-        if (!done || !total || *done >= *total)
+        if (!done || !total || *done > *total)
+            return;
+        offload_ = std::make_pair(*done, *total);
+        if (*done == *total)
             return;
         const auto d = std::to_string(*done);
         const auto t = std::to_string(*total);
@@ -374,7 +435,7 @@ void LogDiagnostics::line(std::string_view text) {
 Status LogTail::poll(LogDiagnostics &sink, std::size_t max_bytes) {
     if (path_.empty() || max_bytes == 0)
         return {};
-    std::ifstream in(path_, std::ios::binary);
+    std::ifstream in(utf8_ ? utf8_path(path_) : std::filesystem::path(path_), std::ios::binary);
     if (!in)
         return Status(ErrorCode::not_found, "llamaserver: cannot open log file");
     in.seekg(0, std::ios::end);

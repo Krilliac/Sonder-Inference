@@ -1,4 +1,5 @@
 #include "sonder/inference/backend_setup.hpp"
+#include "llamaserver_config_extensions.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -8,6 +9,8 @@
 
 #include "sonder/inference/backends.hpp"
 #include "sonder/inference/json.hpp"
+#include "warmup_config.hpp"
+#include "residency_config.hpp"
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
 #include "sonder/inference/backends/llamaserver.hpp"
 #endif
@@ -27,6 +30,27 @@ std::optional<std::string> non_empty(std::optional<std::string> v) {
     }
     return v;
 }
+
+#if defined(SONDER_HAS_LLAMACPP_BACKEND)
+Result<LlamaCppBackendOptions> llamacpp_options(const BackendSetup& setup) {
+    LlamaCppBackendOptions lo;
+    lo.model_dirs = setup.model_dirs;
+    if (setup.llamacpp_gpu_layers) lo.gpu_layers = *setup.llamacpp_gpu_layers;
+    if (setup.llamacpp_context_length) lo.context_length = *setup.llamacpp_context_length;
+    if (setup.llamacpp_batch_size) lo.batch_size = *setup.llamacpp_batch_size;
+    if (setup.llamacpp_ubatch_size) lo.ubatch_size = *setup.llamacpp_ubatch_size;
+    if (setup.llamacpp_kv_cache_type_k) lo.kv_cache_type_k = *setup.llamacpp_kv_cache_type_k;
+    if (setup.llamacpp_kv_cache_type_v) lo.kv_cache_type_v = *setup.llamacpp_kv_cache_type_v;
+    if (setup.llamacpp_flash_attention) lo.flash_attention = *setup.llamacpp_flash_attention;
+    for (const std::string& spec : setup.llamacpp_tensor_overrides) {
+        auto parsed = parse_tensor_override(spec);
+        if (!parsed) return parsed.status();
+        lo.tensor_overrides.push_back(std::move(parsed).value());
+    }
+    if (Status st = validate_llamacpp_options(lo); !st.ok()) return st;
+    return lo;
+}
+#endif
 }  // namespace
 
 BackendEnvDefaults backend_env_defaults(const EnvLookup& lookup) {
@@ -119,13 +143,14 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
             "native_completion", "grammar", "connect_timeout_ms", "request_timeout_ms", "startup_timeout_ms",
             "poll_interval_ms", "shutdown_timeout_ms", "restart_backoff_ms", "max_restart_backoff_ms",
             "max_restarts", "tls", "spill_guard", "log_file", "kv_pairing_check", "context_length",
-            "slot_affinity"};
+            "slot_affinity", "env", "results", "warmup", "stall_guard"};
         for (auto k : known) if (k == key) return false;
         return true;
     };
     for (const auto& member : object) {
         if (unknown(member.first)) return Status(ErrorCode::invalid_argument, "llamaserver config: unknown field '" + member.first + "'");
     }
+    if (auto st = load_llamaserver_extensions(object, setup.llamaserver_environment); !st.ok()) return st;
     const auto string_field = [&](const char* key, std::string& out) -> Status {
         if (const auto* v = object.find(key)) {
             if (!v->is_string()) return Status(ErrorCode::invalid_argument, std::string("llamaserver config: '") + key + "' must be a string");
@@ -207,8 +232,8 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
     }
     if (const auto* guard = object.find("spill_guard")) {
         if (!guard->is_object()) return Status(ErrorCode::invalid_argument, "llamaserver config: 'spill_guard' must be an object");
-        static constexpr std::string_view guard_keys[] = {"enabled", "policy", "threshold_mib", "baseline_mib",
-            "sample_interval_ms", "fit_step_factor", "fit_step_align", "fit_min_ctx", "fit_max_attempts"};
+        static constexpr std::string_view guard_keys[] = {"enabled", "policy", "threshold_mib", "baseline_mib", "baseline_per_1k_ctx_mib",
+            "sample_interval_ms", "fit_step_factor", "fit_step_align", "fit_min_ctx", "fit_max_attempts", "residency"};
         for (const auto& member : guard->as_object()) {
             if (std::find(std::begin(guard_keys), std::end(guard_keys), member.first) == std::end(guard_keys))
                 return Status(ErrorCode::invalid_argument, "llamaserver config: unknown spill_guard field '" + member.first + "'");
@@ -231,6 +256,7 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
         };
         if (auto st = uint_in("threshold_mib", 1, 1048576, setup.llamaserver_spill_threshold_mib, "an integer in [1, 1048576]"); !st.ok()) return st;
         if (auto st = uint_in("baseline_mib", 0, 1048576, setup.llamaserver_spill_baseline_mib, "an integer in [0, 1048576]"); !st.ok()) return st;
+        if (auto st = uint_in("baseline_per_1k_ctx_mib", 0, 1024, setup.llamaserver_spill_baseline_per_1k_ctx_mib, "an integer in [0, 1024]"); !st.ok()) return st;
         if (auto st = uint_in("sample_interval_ms", 100, 3600000, setup.llamaserver_spill_sample_interval_ms, "an integer in [100, 3600000]"); !st.ok()) return st;
         if (auto st = uint_in("fit_step_align", 1, 1048576, setup.llamaserver_fit_step_align, "an integer in [1, 1048576]"); !st.ok()) return st;
         if (auto st = uint_in("fit_min_ctx", 1, 4294967296ull, setup.llamaserver_fit_min_ctx, "an integer in [1, 4294967296]"); !st.ok()) return st;
@@ -239,6 +265,41 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
             if (!v->is_number() || !(v->as_double() > 0.0 && v->as_double() < 1.0)) return bad("fit_step_factor", "a number in (0, 1)");
             setup.llamaserver_fit_step_factor = v->as_double();
         }
+        if (const auto *v = guard->find("residency")) {
+            if (auto st = detail::parse_residency_config(*v, setup); !st.ok()) return st;
+        }
+    }
+    if (const auto* guard = object.find("stall_guard")) {
+        if (!guard->is_object())
+            return Status(ErrorCode::invalid_argument, "llamaserver config: 'stall_guard' must be an object");
+        static constexpr std::string_view guard_keys[] = {"enabled", "stall_seconds", "policy"};
+        for (const auto& member : guard->as_object()) {
+            if (std::find(std::begin(guard_keys), std::end(guard_keys), member.first) == std::end(guard_keys))
+                return Status(ErrorCode::invalid_argument,
+                              "llamaserver config: unknown stall_guard field '" + member.first + "'");
+        }
+        const auto bad = [](const char* key, const char* range) {
+            return Status(ErrorCode::invalid_argument,
+                          std::string("llamaserver config: stall_guard.") + key + " must be " + range);
+        };
+        if (const auto* v = guard->find("enabled")) {
+            if (!v->is_bool())
+                return bad("enabled", "boolean");
+            setup.llamaserver_stall_guard = v->as_bool();
+        }
+        if (const auto* v = guard->find("stall_seconds")) {
+            if (!v->is_integer() || v->as_int(-1) < 0 || v->as_uint() < 1 || v->as_uint() > 86400)
+                return bad("stall_seconds", "an integer in [1, 86400]");
+            setup.llamaserver_stall_seconds = v->as_uint();
+        }
+        if (const auto* v = guard->find("policy")) {
+            if (!v->is_string() || (v->as_string() != "warn" && v->as_string() != "restart"))
+                return bad("policy", "warn or restart");
+            setup.llamaserver_stall_policy = v->as_string();
+        }
+    }
+    if (const auto* warmup = object.find("warmup")) {
+        if (auto st = detail::parse_warmup_config(*warmup, setup); !st.ok()) return st;
     }
     setup.llamaserver_config = path;
     destination = std::move(setup);
@@ -282,16 +343,9 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
     }
     if (setup.backend == "llamacpp") {
 #if defined(SONDER_HAS_LLAMACPP_BACKEND)
-        LlamaCppBackendOptions lo;
-        lo.model_dirs = setup.model_dirs;
-        if (setup.llamacpp_gpu_layers) lo.gpu_layers = *setup.llamacpp_gpu_layers;
-        if (setup.llamacpp_context_length) lo.context_length = *setup.llamacpp_context_length;
-        for (const std::string& spec : setup.llamacpp_tensor_overrides) {
-            auto parsed = parse_tensor_override(spec);
-            if (!parsed) return parsed.status();
-            lo.tensor_overrides.push_back(std::move(parsed).value());
-        }
-        return make_llamacpp_backend(lo);
+        auto lo = llamacpp_options(setup);
+        if (!lo) return lo.status();
+        return make_llamacpp_backend(std::move(lo).value());
 #else
         return Status(ErrorCode::unsupported,
                       "this build does not include the llamacpp backend (configure with SONDER_WITH_LLAMA_CPP=ON)");
@@ -300,6 +354,7 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
     if (setup.backend == "llamaserver") {
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
         LlamaServerBackendOptions lo;
+        lo.environment = setup.llamaserver_environment;
         if (!setup.llamaserver_mode.empty()) {
             if (setup.llamaserver_mode == "attach") lo.mode = LlamaServerMode::attach;
             else if (setup.llamaserver_mode == "spawn") lo.mode = LlamaServerMode::spawn;
@@ -328,15 +383,30 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
             return Status(ErrorCode::invalid_argument, "llamaserver spill threshold/baseline must be at most 1048576 MiB");
         lo.spill_guard.threshold_bytes = setup.llamaserver_spill_threshold_mib * 1024ull * 1024ull;
         lo.spill_guard.baseline_bytes = setup.llamaserver_spill_baseline_mib * 1024ull * 1024ull;
+        if (setup.llamaserver_spill_baseline_per_1k_ctx_mib > 1024)
+            return Status(ErrorCode::invalid_argument, "llamaserver spill baseline growth must be at most 1024 MiB per 1k ctx");
+        lo.spill_guard.baseline_bytes_per_1k_ctx = setup.llamaserver_spill_baseline_per_1k_ctx_mib * 1024ull * 1024ull;
         lo.spill_guard.sample_interval = std::chrono::milliseconds(setup.llamaserver_spill_sample_interval_ms);
         lo.spill_guard.fit_step_factor = setup.llamaserver_fit_step_factor;
         lo.spill_guard.fit_step_align = setup.llamaserver_fit_step_align;
         lo.spill_guard.fit_min_ctx = setup.llamaserver_fit_min_ctx;
         lo.spill_guard.fit_max_attempts = static_cast<std::size_t>(setup.llamaserver_fit_max_attempts);
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+        if (auto st = detail::apply_residency_config(setup, lo.spill_guard.residency); !st.ok()) return st;
+#endif
+        lo.stall_guard.enabled = setup.llamaserver_stall_guard;
+        lo.stall_guard.stall_seconds = std::chrono::seconds(setup.llamaserver_stall_seconds);
+        lo.stall_guard.policy = setup.llamaserver_stall_policy;
         lo.diagnostics.log_file = setup.llamaserver_log_file;
         lo.diagnostics.kv_pairing_check = setup.llamaserver_kv_pairing_check;
         lo.context_length = setup.llamaserver_context_length;
         lo.slot_affinity = setup.llamaserver_slot_affinity;
+        lo.warmup.messages_file = setup.llamaserver_warmup_messages_file;
+        lo.warmup.chat_template_kwargs = setup.llamaserver_warmup_chat_template_kwargs;
+        lo.warmup.all_slots = setup.llamaserver_warmup_all_slots;
+        lo.warmup.slots = setup.llamaserver_warmup_slots;
+        lo.warmup.on_restart = setup.llamaserver_warmup_on_restart;
+        lo.warmup.max_prefix_chars = setup.llamaserver_warmup_max_prefix_chars;
         std::shared_ptr<Backend> backend = make_llamaserver_backend(std::move(lo));
         return backend;
 #else
@@ -345,6 +415,18 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
     }
     return Status(ErrorCode::invalid_argument,
                   "unknown backend '" + setup.backend + "' (expected mock, ollama, llamacpp or llamaserver)");
+}
+
+Status validate_backend_setup(const BackendSetup& setup) {
+#if defined(SONDER_HAS_LLAMACPP_BACKEND)
+    if (setup.backend == kLlamaCppBackendName) {
+        auto lo = llamacpp_options(setup);
+        return lo ? Status::success() : lo.status();
+    }
+#else
+    (void)setup;
+#endif
+    return Status::success();
 }
 
 }  // namespace sonder::inference

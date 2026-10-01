@@ -1040,7 +1040,10 @@ TEST_CASE("models: without launch profiles the response has no profile fields") 
     CHECK(ext.size() == 3u);  // backend, default, synthetic
     CHECK(ext.find("profile") == nullptr);
     const auto& meta = doc.find("sonder")->as_object();
-    CHECK(meta.size() == 1u);  // api_version
+    CHECK(meta.size() == 3u);  // api_version, and the backend's features and pins (health_features)
+    CHECK(meta.find("api_version") != nullptr);
+    CHECK(meta.find("features") != nullptr);
+    CHECK(meta.find("pins") != nullptr);
     CHECK(meta.find("profiles") == nullptr);
 }
 

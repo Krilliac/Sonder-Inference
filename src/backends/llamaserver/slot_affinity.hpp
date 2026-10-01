@@ -7,13 +7,13 @@
 // SlotAffinity pins each conversation key to one slot so its next turn lands
 // on the slot that holds its prefix.
 //
-// Policy: a known key keeps its slot (even while busy: turns of one
-// conversation are sequential, and waiting for its own slot beats a full
-// re-read elsewhere). A new key takes the lowest slot no key owns, otherwise
-// the slot of the least recently used key whose slot is idle; when every
-// slot is owned and busy the request is not pinned (the upstream picks).
-// With one slot every keyed request uses slot 0. The map holds at most one
-// key per slot, so it is bounded by the slot count (capped at kMaxSlots).
+// Policy: a known key pins its slot only while idle. While busy it keeps
+// ownership but the request is not pinned, so upstream can defer safely.
+// A new key takes an unowned idle slot, otherwise the slot of the least
+// recently used key whose slot is idle; when every slot is busy the request
+// is not pinned (the upstream picks). With one slot nothing is pinned.
+// The map holds at most one key per slot, so it is bounded by the slot count
+// (capped at kMaxSlots).
 #pragma once
 
 #include <cstddef>
@@ -43,6 +43,9 @@ class SlotAffinity {
         Lease &operator=(const Lease &) = delete;
         ~Lease() { reset(); }
         [[nodiscard]] std::optional<std::uint32_t> slot() const noexcept { return slot_; }
+        // Stable literal for telemetry: new, hit, stolen, single_slot,
+        // busy_unpinned, or none (empty key/unknown count/default/reset).
+        [[nodiscard]] std::string_view outcome() const noexcept { return outcome_; }
         void reset() noexcept;
 
       private:
@@ -50,11 +53,17 @@ class SlotAffinity {
         SlotAffinity *owner_ = nullptr;
         std::optional<std::uint32_t> slot_;
         std::uint64_t generation_ = 0;
+        std::string_view outcome_ = "none";
     };
 
     // Slot for `key` among `n_slots` upstream slots. No slot (and no busy
-    // mark) for an empty key or an unknown slot count (0).
-    [[nodiscard]] Lease acquire(std::string_view key, std::uint32_t n_slots);
+    // mark) for an empty key, a single/unknown slot count (1/0), or a busy
+    // owned slot. An unpinned busy request does not change ownership.
+    // New keys may prefer slots whose prefix was warmed by the backend. The
+    // preference is advisory: existing ownership and busy-slot rules still
+    // win, and an empty list preserves the historical selection policy.
+    [[nodiscard]] Lease acquire(std::string_view key, std::uint32_t n_slots,
+                                const std::vector<std::uint32_t> &preferred_slots = {});
 
     // Test observation: the slot a key currently owns.
     [[nodiscard]] std::optional<std::uint32_t> owned_slot(std::string_view key) const;

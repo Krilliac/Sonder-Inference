@@ -46,6 +46,64 @@ sonder-infer serve ... --tensor-override "blk\.(3[0-9]|4[0-7])\.ffn_.*_exps=cpu"
 See the "Measured" section at the end of this file. Numbers are recorded only
 from real runs.
 
+## KV cache types, flash attention and micro-batch (implemented)
+
+The KV cache competes with weights for VRAM, and its size grows linearly with
+context. The llama.cpp backend exposes llama.cpp's own context knobs so an
+operator can trade a little accuracy for a lot of KV memory. This is plumbing
+only: with no flags, `serve` passes exactly what it passed before (f16 K and V,
+flash attention `auto`, micro-batch = llama.cpp's 512 capped at the batch size).
+
+| `serve` flag | `LlamaCppBackendOptions` | Values | Default |
+|---|---|---|---|
+| `--cache-type-k T` | `kv_cache_type_k` | `f16`, `f32`, `bf16`, `q8_0`, `q5_1`, `q5_0`, `q4_1`, `q4_0`, `iq4_nl` | `f16` |
+| `--cache-type-v T` | `kv_cache_type_v` | same | `f16` |
+| `--flash-attn MODE` | `flash_attention` | `auto`, `on`, `off` | `auto` |
+| `--batch-size N` | `batch_size` | tokens per `llama_decode` during prefill | 512 |
+| `--ubatch-size N` | `ubatch_size` | physical micro-batch, `<= --batch-size` | llama.cpp's 512, capped at the batch size |
+
+Bytes per cached value, from ggml's block layouts (32 values per block), and
+the effect on the 384 MiB f16 KV cache measured below (4096 context):
+
+| Type | Bytes/value | vs f16 | 384 MiB f16 becomes |
+|---|---|---|---|
+| `f32` | 4 | 2× | 768 MiB |
+| `f16`, `bf16` | 2 | 1× | 384 MiB |
+| `q8_0` | 1.0625 | ≈ ½ | ≈ 204 MiB |
+| `q5_1` | 0.75 | ≈ 0.38 | ≈ 144 MiB |
+| `q5_0` | 0.6875 | ≈ 0.34 | ≈ 132 MiB |
+| `q4_1` | 0.625 | ≈ 0.31 | ≈ 120 MiB |
+| `q4_0`, `iq4_nl` | 0.5625 | ≈ ¼ | ≈ 108 MiB |
+
+K and V are sized independently, so `--cache-type-k q8_0` alone saves about a
+quarter of the total. The table is arithmetic from the formats, not a
+measurement; quality effects are model dependent and not yet measured here.
+One data point (Node1, CPU, a 491 MB GGUF, 512 context, greedy, 16 tokens,
+2026-09-30): `q8_0` K and V produced the same text as `f16`; `q4_0` K and V
+with flash attention on degenerated into a repeated token. Treat 4-bit V
+caches as something to evaluate per model, not a free default.
+
+Rules, checked at startup (`invalid_argument`, before any model file is read):
+
+- **A quantized V cache needs flash attention.** llama.cpp `b11195`
+  (`llama_init_from_model`) switches `auto` to enabled for a quantized V
+  cache and refuses one with flash attention disabled, so Sonder rejects
+  `--cache-type-v q8_0 --flash-attn off` up front. A quantized K cache alone
+  works without flash attention.
+- **`--ubatch-size` must not exceed `--batch-size`.**
+- Unknown type or mode names are rejected (case-insensitive; `on`/`enabled`
+  and `off`/`disabled` are synonyms).
+
+Some limits depend on the model and are left to llama.cpp, which then fails
+the load: MLA models (DeepSeek-style) need identical K and V types, a
+quantized type's block size must divide the head size, and Grok models force
+flash attention off (so a quantized V cache cannot load for them).
+
+```sh
+# Half the KV bytes, flash attention decided by llama.cpp (on for quantized V).
+sonder-infer serve --backend llamacpp ... --cache-type-k q8_0 --cache-type-v q8_0
+```
+
 ## Step 2 — per-model placement profiles (design)
 
 Today the operator picks overrides per `serve` invocation. [Launch profiles](integration/launch-profiles.md)

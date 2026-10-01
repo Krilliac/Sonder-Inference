@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -63,12 +64,18 @@ public:
         held_.append(text);
         if (stops_.empty()) return std::exchange(held_, {});
         std::size_t cut = std::string::npos;
+        const std::string* matched = nullptr;
         for (const auto& s : stops_) {
             const std::size_t at = held_.find(s);
-            if (at != std::string::npos) cut = std::min(cut, at);
+            if (at != std::string::npos &&
+                (at < cut || (at == cut && matched && s.size() > matched->size()))) {
+                cut = at;
+                matched = &s;
+            }
         }
         if (cut != std::string::npos) {
             matched_ = true;
+            matched_index_ = matched ? std::optional<std::string>(*matched) : std::nullopt;
             std::string out = held_.substr(0, cut);
             held_.clear();
             return out;
@@ -90,11 +97,13 @@ public:
     }
     std::string Flush() { return matched_ ? std::string() : std::exchange(held_, {}); }
     [[nodiscard]] bool matched() const noexcept { return matched_; }
+    [[nodiscard]] const std::optional<std::string>& matched_stop() const noexcept { return matched_index_; }
 
 private:
     std::vector<std::string> stops_;
     std::string held_;
     bool matched_ = false;
+    std::optional<std::string> matched_index_;
 };
 
 }  // namespace sonder::inference::llamacpp_detail

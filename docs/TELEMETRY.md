@@ -71,13 +71,104 @@ Types used below: `int` (JSON integer), `num` (JSON number), `str`,
 | `scheduler.configured` | metrics | emitted once at engine start when scheduling is active: `mode` str (`automatic`, `gate`, `account`), `kv_block_size_tokens` int, `kv_num_blocks` int, `prefix_caching` bool, `max_running_sequences` int, `max_step_sequences` int, `max_step_tokens` int, `prefill_chunk_tokens` int, `admission_watermark_blocks` int, `max_requeue_count` int, `step_stall_timeout_ms` int |
 | `device.memory.sample` | metrics | at start (`sample_devices_on_start`) and every `EngineOptions::device_sample_interval` (default 10 s, 0 disables): `kind` str, `name` str, `logical_cores` int, `total_bytes` int, `available_bytes` int; optional `used_bytes` int. Host memory only; per-process VRAM of a spawned llama-server is `backend.gpu_memory.sample` |
 | `backend.registered` | metrics | `backend` str, `description` str, `capabilities` arr of str |
-| `backend.gpu_memory.sample` | metrics | from the engine's periodic sampler, once per new sample of a backend that reports `Backend::runtime_status()` (a spawned `llamaserver` child): `backend`, `probe`, `status` str; `dedicated_bytes`, `shared_bytes`, `peak_shared_bytes`, `shared_baseline_bytes`, `spill_threshold_bytes`, `samples` int; `spilled` bool; `fitted_ctx` int or null; `fit_outcome` str ([vram-spill](integration/vram-spill.md)) |
+| `backend.gpu_memory.sample` | metrics | from the engine's periodic sampler, once per new sample of a backend that reports `Backend::runtime_status()` (a spawned `llamaserver` child): `backend`, `probe`, `status` str; `dedicated_bytes`, `shared_bytes`, `peak_shared_bytes`, `shared_baseline_bytes` (effective, including any per-1k-ctx growth), `spill_threshold_bytes`, `samples` int; `spilled` bool; `fitted_ctx` int or null; `fit_outcome` str ([vram-spill](integration/vram-spill.md)) |
+| `backend.metrics.sample` | metrics | each attempted native child poll: `backend`, `port` int, `status` str (`ok`, `error`, or `unavailable`), `sampled_at` monotonic milliseconds; on `ok`, `metrics`, `slots`, and `speculation` directly in attributes, matching the child health object below. Failure details are in the accompanying warning. A 404 is reported once per child |
 | `backend.warning` | metrics | once per distinct runtime warning: `backend`, `code`, `severity`, `source`, `message` str; `details` obj of str; `count` int |
+| `backend.metrics.dropped` | metrics | `backend` str, `dropped_events` int (observations dropped since the previous drain of the 64-event pending queue) |
+| `backend.restart` | metrics | child restart: `backend`, `reason` (`backend_stalled` for the stall policy), `attempt` int |
+| `backend.warmup` | metrics | once per terminal warm-up slot per generation: `backend` str, `generation` int, `id_slot` int, `status` str (`complete`, `error`, `cancelled`), `prompt_tokens` and `cache_n` int or null, `milliseconds` num; optional sanitized `error` str |
 | `model.load.started` | metrics | `backend` str, `model` str |
 | `model.load.completed` | metrics | `backend`, `model`, `format`, `family`, `parameter_size`, `quantization` str; `size_bytes` int; `resident` bool (false when only metadata was fetched, e.g. Ollama `/api/show`; the weights load on first request); `duration_ms` num |
 | `model.load.failed` | metrics | `backend`, `model` str; `duration_ms` num; `error_code`, `error` str |
 | `model.unload` | metrics | `backend`, `model` str; `outstanding_references` int |
+| `model.evicted` | metrics | `sonder-infer serve` model residency only (`--model-idle-ttl`, `--max-resident-models`; never with the defaults): `backend`, `model` str; `reason` str (`idle_ttl` or `max_resident`); `idle_ms` num (time since the model's last request finished). Always followed by `model.unload` for the same `model_instance_id` |
 | `telemetry.dropped` | metrics (bypasses the queue limit) | `dropped_events` int (cumulative), `emitted_events` int, `queue_capacity` int, `final` bool. Emitted as soon as the writer catches up after the first drop, then at most once per `TelemetryOptions::drop_report_interval` (default 1 s) while drops continue, and once at shutdown (`final: true`) if drops are still unreported |
+
+### Native child observation
+
+For a native `llamaserver` child, health may include the additive
+`backends[].runtime.child` object. The monitor polls `/metrics` and `/slots`
+at `max(5000, spill_guard.sample_interval_ms)` milliseconds, with a bounded
+250 ms HTTP budget and a 1 MiB response limit per endpoint. `sampled_at` is a
+monotonic millisecond timestamp; it is not wall time and is never a per-request
+delta. Token and draft totals below are cumulative process counters; rates,
+queue depth, busy slots and KV utilization are upstream gauges. These are
+upstream observations, not independently measured request speed:
+
+```json
+{
+  "port": 36515,
+  "metrics": {
+    "prompt_tokens_seconds": 1050.5,
+    "predicted_tokens_seconds": 86.8,
+    "prompt_tokens_total": 2500,
+    "tokens_predicted_total": 1500,
+    "requests_processing": 1,
+    "requests_deferred": 2,
+    "n_busy_slots_per_decode": 1.5,
+    "n_decode_total": 1000,
+    "spec_decode_num_draft_tokens_total": 2000,
+    "spec_decode_accepted_tokens_total": 1500,
+    "spec_decode_drafts_total": 1000,
+    "spec_decode_accepted_tokens_per_pos_total": [900, 600],
+    "kv_cache_usage_ratio": 0.25
+  },
+  "slots": [{"id": 0, "is_processing": true, "n_ctx": 77824}],
+  "speculation": {
+    "mean_accepted_len": 1.5,
+    "acceptance_by_position": [0.9, 0.6],
+    "speedup_est": 1.1363636363636362
+  },
+  "sampled_at": 1234567890
+}
+```
+
+This synthetic example uses `--spec-draft-n-max 2`. Missing counters are
+`null`; positional arrays use the upstream `position` label as their index,
+with `null` for missing positions and a maximum of 256 entries. Raw metric
+names use the `llamacpp:` prefix upstream; JSON omits that prefix.
+`mean_accepted_len` is accepted tokens divided by drafts, and each cumulative
+position acceptance is that position's accepted tokens divided by drafts.
+Both are `null` when the denominator is absent or zero.
+The speculation speedup heuristic is
+`(1 + mean_accepted_len) / (1 + 0.6 * n_max)`, where `0.6` is the documented
+default draft-cost coefficient and `n_max` comes from explicit
+`--spec-draft-n-max`; when that option is absent or not an integer,
+`speedup_est` is `null`. This coefficient is a heuristic, not a measured
+speedup or a calibrated hardware claim. A sample is emitted only after
+the poll completes; pending samples are bounded at 64 and are drained by the
+engine sampler. A drop emits additive `backend.metrics.dropped` telemetry.
+
+An endpoint 404 disables polling for that child and produces one
+`metrics_unavailable` warning. Other failures produce a warning and reset
+stall evidence; they are never fatal. A `backend.metrics.sample` event still
+records `status: "error"` or `status: "unavailable"` for each attempted poll.
+
+Runtime diagnostics are additive health state: `diagnostics.offload` is
+`blind`, `pending`, `ok`, or `partial`. Offload and CPU-buffer classification
+requires child verbosity `-lv 4` or higher; a lower or missing verbosity emits
+one `diagnostics_blind` warning and is not evidence that offload is healthy.
+`backend.warning` retains `code` and adds the matching `kind` for
+`diagnostics_blind`, `backend_stalled`, `metrics_unavailable`, and
+`metrics_scrape_failed`. `-lv 4` without observed offload evidence stays
+`pending`; `ok` requires an observed complete offload line, and `partial`
+requires N < M. A configured log file is still needed to read those lines.
+
+The optional `stall_guard` defaults to enabled with a 90-second threshold and
+`warn` policy. A stall requires `requests_processing > 0` and no movement in
+either token counter for the threshold. Both counters must be present; a
+counter reset, scrape failure, or idle sample breaks the evidence window.
+It adds `backend_stalled`, with numeric `processing`, nullable `deferred`,
+and duration `since_ms`; health adds `stall` with
+`detected_at` and `since_ms` while retaining `ready`. `restart` uses the
+existing crash-restart path and consumes `max_restarts`; attach mode warns
+only because the external process is not owned by the supervisor.
+`detected_at` is monotonic milliseconds at first detection; progress clears
+the active stall. Attach monitoring is passive and does not replace the
+existing backend health probe. Event delivery follows the engine sampler
+interval (default 10 s); health reads the latest sample immediately. Setting
+`device_sample_interval` to zero disables this delivery, as with existing
+GPU and warning events. The pending queue remains bounded and counts drops.
 
 ## Sessions and requests
 
@@ -85,9 +176,21 @@ Types used below: `int` (JSON integer), `num` (JSON number), `str`,
 | --- | --- | --- |
 | `session.created` | metrics | `model`, `backend` str; `priority` int; `workload` str (see below); `text_capture` str (`on` / `off`); `sampling` obj |
 | `session.closed` | metrics | `requests` int |
-| `request.queued` | metrics | `kind` str (`generate` from `Session::generate`, `chat` from `Session::chat`), `priority` int, `workload` str, `prompt_bytes` int (for chat: the generic formatted prompt); `chat` adds `messages` int |
+| `request.queued` | metrics | `kind` str (`generate` from `Session::generate`, `chat` from `Session::chat`), `priority` int (legacy scheduler rank, preserved), `priority_class` str (`interactive`, `subagent`, `background`), `workload` str, `prompt_bytes` int (for chat: the generic formatted prompt); `chat` adds `messages` int |
 | `request.started` | metrics | `kind` str, `sampling` obj, `scheduled` bool, `sampler` str (`sonder` or `backend`); when scheduled, `scheduler_mode` str (`gate`: per-chunk grants; `account`: admission and prompt accounting only); `chat` adds `chat_template` str (`native`: the backend's chat API or model template received the messages; `generic`: `format_chat_prompt()`) |
-| `request.completed` / `request.cancelled` / `request.failed` | metrics | `outcome`, `stop_reason` str; `prompt_tokens`, `completion_tokens`, `chunks` int; `token_counts_from_backend` bool; `ttft_ms`, `total_ms` num; `scheduled` bool; `sampler` str. When `scheduled`: `queue_ms` num, `preemptions` int, `accounted_prompt_tokens` int, `reused_prompt_tokens` int. `cancelled` optionally adds `cancel_latency_ms` num. `failed` adds `error_code`, `error` str, and `scheduler_rejected` bool (true) when the scheduler refused the request before any backend work |
+| `request.completed` / `request.cancelled` / `request.failed` | metrics | `outcome`, `stop_reason` str; `prompt_tokens`, `completion_tokens`, `chunks` int; `token_counts_from_backend` bool; `ttft_ms`, `total_ms` num; `scheduled` bool; `sampler` str. For hosted requests: additive `priority_class` str and `admission` obj with `priority` str and `queue_ms` num. When scheduled: the existing `queue_ms`, `preemptions`, `accounted_prompt_tokens`, and `reused_prompt_tokens` remain. Backend request attributes are optional and additive: `backend_cached_tokens`, `backend_draft_tokens`, `backend_draft_accepted_tokens`, `backend_draft_acceptance_ratio`, and `backend_predicted_tokens_per_second`. `cancelled` optionally adds `cancel_latency_ms` num. `failed` adds `error_code`, `error` str, and `scheduler_rejected` bool (true) when the scheduler refused the request before any backend work |
+
+Hosted request admission fields are additive: the historical numeric
+`request.queued.attributes.priority` remains unchanged. Class names live in
+`priority_class` and `admission.priority` (`interactive`, `subagent`,
+`background`). `admission.queue_ms` is the measured wait as of the event;
+terminal events include the full queue wait, including logical KV admission,
+without double-counting scheduler time. It remains available with scheduling
+off or an oversized account-mode prompt that bypasses the logical pool.
+A queue refusal before a session request begins emits `request.failed` with
+`backend_started: false`, `error_code`, class, queue time and correlation.
+Health exposes `queued_by_class` as instantaneous counts from these tickets.
+There is no separate Prometheus metrics endpoint.
 
 All five request lifecycle events carry the optional `parent_request_id` str
 when the caller set `RequestOptions::parent_request_id` (for `sonder-infer
@@ -189,7 +292,9 @@ Additive within `/1`: `producer.role` and `producer.synthetic`;
 `parent_request_id` on the request lifecycle events;
 `request.failed.scheduler_rejected`; `engine.started.server`;
 `scheduler.configured.mode`, `request.started.scheduler_mode`,
-`scheduler.enqueued.gated` and `scheduler.bypassed`. Discovery
+`scheduler.enqueued.gated`, `scheduler.bypassed`, request `priority_class`,
+request `admission.priority`, request `admission.queue_ms`, and the server
+health `queued_by_class` gauge. Discovery
 advertises this vocabulary as `vocabularies: {"sonder.inference.events": 1}`.
 
 ## Observatory change requests (Observatory `docs/telemetry-schema.md` @ f5e3ff5)

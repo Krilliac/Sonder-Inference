@@ -29,10 +29,20 @@ std::string cpu_hardware() {
 }  // namespace
 
 IdentityResult backend_identity(const Model& model, const std::optional<std::string>& backend_version) {
+    return backend_identity(model.backend_name(), model.descriptor().name, &model.descriptor(), backend_version);
+}
+
+IdentityResult backend_identity(const std::string& backend, const std::string& model_id,
+                                const ModelDescriptor* descriptor, const std::optional<std::string>& backend_version) {
     IdentityResult out;
-    const ModelDescriptor& d = model.descriptor();
-    const std::string& backend = model.backend_name();
     if (backend == kMockBackendName) {
+        if (descriptor == nullptr) {
+            out.reason = "model '" + model_id +
+                         "' is not loaded yet (lazy model residency): its identity is measured once a request "
+                         "loads it";
+            return out;
+        }
+        const ModelDescriptor& d = *descriptor;
         if (d.context_length == 0) {
             out.reason = "mock model reports no context length";
             return out;

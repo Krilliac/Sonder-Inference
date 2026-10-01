@@ -197,7 +197,8 @@ TEST_CASE("cors: preflight, allowed and blocked origins") {
     CHECK(pre.header("access-control-allow-methods") == "GET, POST, OPTIONS");
     CHECK(pre.header("access-control-allow-headers") ==
           "Accept, Authorization, Cache-Control, Content-Type, Last-Event-ID, X-Sonder-Run-Id, "
-          "X-Sonder-Parent-Request-Id, X-Sonder-Agent-Id, X-Sonder-Task-Id, X-Sonder-Workload, X-Sonder-Priority");
+          "X-Sonder-Parent-Request-Id, X-Sonder-Agent-Id, X-Sonder-Task-Id, X-Sonder-Workload, X-Sonder-Priority, "
+          "X-Sonder-Deadline-Ms, X-Sonder-Reasoning-Budget");
     CHECK(pre.header("access-control-max-age") == "600");
 
     // Every default origin works on read-only GET routes.

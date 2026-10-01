@@ -5,6 +5,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -16,6 +17,7 @@
 
 #include "sonder/inference/backend.hpp"
 #include "sonder/inference/error.hpp"
+#include "sonder/inference/json.hpp"
 
 namespace sonder::inference {
 
@@ -35,6 +37,14 @@ struct BackendSetup {
     // llama.cpp: tensor placement overrides, "PATTERN=DEVICE" each
     // (see parse_tensor_override). Applied in order; first match wins.
     std::vector<std::string> llamacpp_tensor_overrides;
+    // llama.cpp context options; unset keeps the backend defaults (batch 512,
+    // micro-batch = llama.cpp default capped at batch, f16 K and V cache,
+    // flash attention auto). See LlamaCppBackendOptions.
+    std::optional<std::uint32_t> llamacpp_batch_size;
+    std::optional<std::uint32_t> llamacpp_ubatch_size;
+    std::optional<std::string> llamacpp_kv_cache_type_k;
+    std::optional<std::string> llamacpp_kv_cache_type_v;
+    std::optional<std::string> llamacpp_flash_attention;
     // MOCK backend: artificial per-token latency.
     std::chrono::microseconds mock_token_delay{0};
     // MOCK backend: >= 0 injects a backend error after that many tokens
@@ -72,17 +82,45 @@ struct BackendSetup {
     std::string llamaserver_spill_policy = "warn";  // warn, refuse or auto_fit
     std::uint64_t llamaserver_spill_threshold_mib = 256;
     std::uint64_t llamaserver_spill_baseline_mib = 0;
+    std::uint64_t llamaserver_spill_baseline_per_1k_ctx_mib = 0;
     std::uint64_t llamaserver_spill_sample_interval_ms = 5000;
     double llamaserver_fit_step_factor = 0.85;
     std::uint64_t llamaserver_fit_step_align = 1024;
     std::uint64_t llamaserver_fit_min_ctx = 8192;
     std::uint64_t llamaserver_fit_max_attempts = 4;
+    // Spawn/attach child stall watchdog (JSON "stall_guard").
+    bool llamaserver_stall_guard = true;
+    std::uint64_t llamaserver_stall_seconds = 90;
+    std::string llamaserver_stall_policy = "warn";  // warn or restart
+    // Nested JSON "spill_guard.residency" mirror. Kept independent of the
+    // optional llamaserver backend header so config loading remains available
+    // in builds without that backend.
+    struct LlamaServerResidencyConfig {
+        bool enabled = true;
+        bool expect_gpu = false;
+        std::uint64_t min_dedicated_mib = 512;
+        std::uint64_t consecutive_samples = 3;
+        double eviction_fraction = 0.25;
+        std::uint64_t eviction_mib = 2048;
+        std::string on_eviction = "warn";
+        std::uint64_t max_eviction_restarts = 1;
+    } llamaserver_residency;
     std::string llamaserver_log_file;
     bool llamaserver_kv_pairing_check = true;
     // JSON "context_length" (served context when /props is unavailable) and
     // "slot_affinity" (id_slot pinning; docs/integration/llama-server.md).
     std::uint64_t llamaserver_context_length = 0;
     bool llamaserver_slot_affinity = true;
+    std::vector<std::pair<std::string, std::string>> llamaserver_environment;
+    // Optional llama-server prefix warm-up. Kept here as mirrors so the
+    // always-built server/CLI setup loader does not depend on the optional
+    // llamaserver backend header.
+    std::string llamaserver_warmup_messages_file;
+    json::Object llamaserver_warmup_chat_template_kwargs;
+    bool llamaserver_warmup_all_slots = true;
+    std::vector<std::uint32_t> llamaserver_warmup_slots;
+    bool llamaserver_warmup_on_restart = true;
+    std::size_t llamaserver_warmup_max_prefix_chars = 262144;
 };
 
 // Values taken from the environment when the matching option is absent:
@@ -123,8 +161,15 @@ std::vector<std::string> available_backend_names();
 // True for backends whose output is synthetic (the MOCK backend).
 bool is_synthetic_backend(std::string_view name) noexcept;
 
-// Builds the named backend. Errors: invalid_argument for an unknown name,
-// unsupported for a backend this build does not include.
+// Builds the named backend. Errors: invalid_argument for an unknown name or
+// invalid backend options, unsupported for a backend this build does not
+// include.
 Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup);
+
+// Checks backend-specific options without building anything: for "llamacpp"
+// in a build that has it, the tensor override syntax and the context options
+// (validate_llamacpp_options). Other backends, and llamacpp options in a
+// build without llama.cpp, are not checked here. Errors: invalid_argument.
+Status validate_backend_setup(const BackendSetup& setup);
 
 }  // namespace sonder::inference

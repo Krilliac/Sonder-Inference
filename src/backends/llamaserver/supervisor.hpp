@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -7,15 +8,20 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "gpu_memory.hpp"
+#include "child_metrics.hpp"
+#include "gpu_residency.hpp"
 #include "log_diagnostics.hpp"
 #include "process.hpp"
 #include "sonder/inference/backend_runtime.hpp"
 #include "sonder/inference/cancellation.hpp"
 
 namespace sonder::inference::llamaserver {
+
+class PrefixWarmup;
 
 struct SupervisorOptions {
     std::string executable;
@@ -40,6 +46,18 @@ struct SupervisorOptions {
     std::string log_file;
     // Warn up front about FlashAttention with mismatched K/V cache types.
     bool kv_pairing_check = true;
+    std::vector<std::pair<std::string, std::string>> environment;
+    std::string output_file;
+    // Optional best-effort prefix replay, started after each accepted child.
+    std::shared_ptr<PrefixWarmup> warmup;
+    bool native_completion = true;
+    ChildMetricsOptions stall_guard;
+    // Attach observes this already-validated upstream but never owns or stops it.
+    // target is its base path, not /metrics. TLS policy is copied unchanged.
+    std::optional<net::HttpRequest> attached_endpoint;
+    // Deterministic fake-only seams. Production uses HTTP and steady_clock.
+    ChildMetricsPoll metrics_poll;
+    ChildMetricsClock metrics_clock;
 };
 
 class Supervisor {
@@ -50,6 +68,26 @@ class Supervisor {
     Supervisor &operator=(const Supervisor &) = delete;
     // Lazy start or wait through a restart; never resets the retry budget.
     Result<std::uint16_t> start(const CancellationToken &cancel = {});
+    // A lease pins the ready child for the lifetime of an upstream request.
+    // Maintenance closes admission, drains these leases, then stops the child.
+    class RequestLease {
+      public:
+        RequestLease() = default;
+        ~RequestLease();
+        RequestLease(RequestLease &&other) noexcept;
+        RequestLease &operator=(RequestLease &&other) noexcept;
+        RequestLease(const RequestLease &) = delete;
+        RequestLease &operator=(const RequestLease &) = delete;
+        [[nodiscard]] std::uint16_t port() const { return port_; }
+
+      private:
+        friend class Supervisor;
+        RequestLease(std::shared_ptr<std::atomic<std::size_t>> activity, std::uint16_t port)
+            : activity_(std::move(activity)), port_(port) {}
+        std::shared_ptr<std::atomic<std::size_t>> activity_;
+        std::uint16_t port_ = 0;
+    };
+    Result<RequestLease> acquire_request(const CancellationToken &cancel = {});
     // Terminal/idempotent; interrupts probes and backoff, then joins the owner.
     void stop();
     [[nodiscard]] bool running() const;
@@ -58,6 +96,21 @@ class Supervisor {
     // Snapshot of GPU memory, context fit and warnings. Cheap; never blocks
     // on the child or on I/O.
     [[nodiscard]] BackendRuntimeStatus runtime_status() const;
+    // Additive child/diagnostics/stall fields for runtime JSON. Kept separate
+    // from the backend-neutral status until the integrator wires that type.
+    [[nodiscard]] json::Object child_runtime_status() const;
+    using RuntimeEvent = std::pair<std::string, json::Object>;
+    // A shared source lets the engine drain events without health consuming
+    // them or retaining a raw Supervisor pointer beyond its lifetime.
+    struct RuntimeEvents {
+        void push(std::string type, json::Object attrs);
+        std::vector<RuntimeEvent> drain();
+      private:
+        std::mutex mutex;
+        std::vector<RuntimeEvent> pending;
+        std::uint64_t dropped = 0;
+    };
+    [[nodiscard]] std::shared_ptr<RuntimeEvents> runtime_events() const { return runtime_events_; }
     // The argv the next (or current) child is launched with, including an
     // auto_fit context reduction and an appended --log-file.
     [[nodiscard]] std::vector<std::string> launch_arguments() const;
@@ -79,7 +132,16 @@ class Supervisor {
                                                 std::chrono::steady_clock::time_point deadline);
     bool pause(std::chrono::milliseconds duration);
     void monitor();
+    void monitor_attached();
+    bool sample_child(net::HttpRequest endpoint);
+    void publish_diagnostics();
+    [[nodiscard]] std::chrono::steady_clock::time_point metrics_now() const;
     void fail(Status status);
+    enum class ResidencyAction { none, restart, refuse };
+    ResidencyAction residency_action();
+    void record_residency();  // mutex_ held
+    void append_residency_warnings(BackendRuntimeStatus &status) const;  // mutex_ held
+    Status missing_offload_failure() const;  // mutex_ held
 
     SupervisorOptions options_;
     std::unique_ptr<ProcessLauncher> launcher_;
@@ -91,6 +153,10 @@ class Supervisor {
     State state_ = State::idle;
     Status failure_;
     std::uint16_t port_ = 0;
+    // Shared with leases so destroying a stopped supervisor before its last
+    // caller unwinds cannot leave a dangling lease owner.
+    std::shared_ptr<std::atomic<std::size_t>> active_requests_ = std::make_shared<std::atomic<std::size_t>>(0);
+    bool maintenance_pending_ = false;
 
     // Diagnostics. Guarded by mutex_ unless noted.
     std::vector<std::string> arguments_;  // current launch argv
@@ -102,6 +168,17 @@ class Supervisor {
     std::shared_ptr<GpuCounterSource> gpu_source_;  // monitor thread only after construction
     std::unique_ptr<LogTail> log_tail_;             // monitor thread only
     LogDiagnostics log_diagnostics_;                // monitor thread only
+    GpuResidencyGuard residency_;  // guarded by mutex_, fed only after readiness
+    bool reported_missing_ = false;
+    bool reported_eviction_ = false;
+    std::size_t eviction_restarts_ = 0;  // lifetime budget; never reset per child
+    ChildMetricsSampler child_metrics_;  // monitor thread only
+    std::optional<json::Object> child_status_;
+    std::optional<json::Object> stall_status_;
+    std::optional<json::Object> diagnostics_status_;
+    std::vector<BackendWarning> child_warnings_;
+    bool diagnostics_warning_sent_ = false;
+    const std::shared_ptr<RuntimeEvents> runtime_events_ = std::make_shared<RuntimeEvents>();
 };
 
 } // namespace sonder::inference::llamaserver
