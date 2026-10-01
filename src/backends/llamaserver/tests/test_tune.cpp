@@ -27,6 +27,8 @@ tune::Measurement clean(tune::Candidate c, tune::Phase phase = tune::Phase::benc
     m.shared_bytes = 182 * kMiB;
     m.short_tps = 60;
     m.prefill_tps = 1000;
+    m.workloads = {{"prose", 0.4, 60.0, 10, 5}, {"code_edit", 0.3, 60.0, 10, 5},
+        {"tool_json", 0.2, 60.0, 10, 5}, {"reasoning", 0.1, 60.0, 10, 5}};
     return m;
 }
 void integer(std::string &out, std::uint64_t n, unsigned bytes) {
@@ -67,7 +69,7 @@ TEST_CASE("tune default grid and capability gate are bounded") {
     REQUIRE(tune::validate_grid(grid).ok());
     CHECK(grid.ctx.front() == 32768);
     CHECK(grid.ctx.back() == 139264);
-    CHECK(tune::planned_candidates(grid, true).size() == 1296);
+    CHECK(tune::planned_candidates(grid, true).size() == 4212);
     const auto gated = tune::planned_candidates(grid, false);
     CHECK(gated.size() == 324);
     for (const auto &c : gated) { CHECK(c.mtp == 0); CHECK(c.ubatch <= grid.batch); }
@@ -110,6 +112,7 @@ TEST_CASE("tune search bisects then validates each recommendation and tunes only
         auto m = clean(c, phase);
         if (c.ctx > 77824 || (c.ubatch == 2048 && c.ctx > 69632)) m.verdict = tune::Verdict::spill;
         m.short_tps = 50.0 + (c.mtp == 2 ? 30.0 : 0.0) + (c.ubatch == 1024 ? 5.0 : 0.0);
+        for (auto &work : m.workloads) work.tok_s = *m.short_tps;
         return m;
     }, [&] { return now; });
     REQUIRE(report.fast_default);
@@ -173,8 +176,10 @@ TEST_CASE("tune ranking excludes unverified measurements and distinguishes fast 
     tune::Report report;
     auto fast = clean({{"q4_0", "q4_0"}, 65536, 1024, 2});
     fast.short_tps = 85;
+    for (auto &work : fast.workloads) work.tok_s = *fast.short_tps;
     auto longest = clean({{"q4_0", "q4_0"}, 126976, 512, 0});
     longest.short_tps = 29;
+    for (auto &work : longest.workloads) work.tok_s = *longest.short_tps;
     report.results = {fast, longest};
     for (int kind = 0; kind < 6; ++kind) {
         auto invalid = clean({{"q8_0", "q4_0"}, 139264, 512, 0});
@@ -237,6 +242,21 @@ TEST_CASE("tune output is a loadable spawn configuration with complete additive 
     CHECK(roundtrip.value().find("results")->find("candidates")->as_array().size() == 1);
     CHECK(roundtrip.value().find("results")->find("long_context")->find("config") != nullptr);
     const auto argv = tune::arguments(options, report.results.front().candidate);
+    std::vector<std::string> written_args;
+    for (const auto &arg : roundtrip.value().find("args")->as_array()) written_args.push_back(arg.as_string());
+    CHECK(written_args == argv);
+    const auto flag_value = [&](const std::string &flag) {
+        const auto it = std::find(written_args.begin(), written_args.end(), flag);
+        return it != written_args.end() && std::next(it) != written_args.end() ? *std::next(it) : std::string{};
+    };
+    CHECK(flag_value("--parallel") == "1");
+    CHECK(flag_value("--cache-ram") == "2048");
+    CHECK(flag_value("--ctx-checkpoints") == "8");
+    CHECK(flag_value("--checkpoint-min-step") == "8192");
+    CHECK(flag_value("--reasoning-format") == "deepseek");
+    CHECK(flag_value("--min-p") == "0.000000");
+    for (const auto *flag : {"--no-kv-unified", "--jinja", "--metrics"})
+        CHECK(std::find(written_args.begin(), written_args.end(), flag) != written_args.end());
     CHECK(find_context_size(argv) == 73728);
     CHECK(read_kv_cache_config(argv).flash_attn == "on");
     CHECK(std::find(argv.begin(), argv.end(), "--mmproj") != argv.end());
@@ -268,7 +288,7 @@ TEST_CASE("tune dry run never opens model or executable and respects CLI errors"
     std::ostringstream out, err;
     CHECK(tune::tune_main({"--executable", "does-not-exist.exe", "--model", "absent.gguf", "--dry-run",
         "--grid", R"({"kv":[["q4_0","q4_0"]],"ctx":[65536],"ubatch":[512],"mtp":[0]})"}, out, err) == 0);
-    CHECK(out.str().find("| q4_0/q4_0 | 65536 | 512 | 0 |") != std::string::npos);
+    CHECK(out.str().find("| q4_0/q4_0 | 65536 | 512 | 0 | none | 0 |") != std::string::npos);
     CHECK(err.str().empty());
     CHECK(tune::tune_main({"--nonsense", "--help"}, out, err) == 0);
     for (const auto &args : std::vector<std::vector<std::string>>{
@@ -303,4 +323,156 @@ TEST_CASE("tune MTP help gate requires the spec type section and draft limit fla
     CHECK_FALSE(tune::help_supports_mtp("--spec-type none\n  --other draft-mtp\n--spec-draft-n-max N\n"));
     CHECK_FALSE(tune::help_supports_mtp("--spec-type draft-mtp\n"));
     CHECK_FALSE(tune::help_supports_mtp("--spec-typex draft-mtp\n--spec-draft-n-max N\n"));
+}
+
+TEST_CASE("tune MTP grid enumerates spec type and p-min cross product while baseline stays singular") {
+    tune::Grid grid;
+    grid.kv = {{"q4_0", "q4_0"}};
+    grid.ctx = {65536};
+    grid.ubatch = {512};
+    grid.mtp = {0, 2};
+    grid.spec_type = {"draft-mtp", "draft-mtp,ngram-mod"};
+    grid.p_min = {0.0, 0.5};
+    const auto rows = tune::planned_candidates(grid, true);
+    REQUIRE(rows.size() == 5);
+    CHECK(std::count_if(rows.begin(), rows.end(), [](const auto &c) { return c.mtp == 0; }) == 1);
+    CHECK(std::count_if(rows.begin(), rows.end(), [](const auto &c) { return c.mtp != 0; }) == 4);
+    CHECK(std::count_if(rows.begin(), rows.end(), [](const auto &c) {
+        return c.spec_type == "draft-mtp,ngram-mod" && c.p_min == 0.5;
+    }) == 1);
+}
+
+TEST_CASE("tune search measures every MTP spec and p-min variant with safety probes") {
+    tune::Options options;
+    options.grid.kv = {{"q4_0", "q4_0"}};
+    options.grid.ctx = {65536, 69632};
+    options.grid.ubatch = {512};
+    options.grid.mtp = {0, 1};
+    options.grid.spec_type = {"draft-mtp", "draft-mtp,ngram-mod"};
+    options.grid.p_min = {0.0, 0.5};
+    auto now = tune::Clock::now();
+    const auto report = tune::search(options, true, now + std::chrono::minutes(2),
+        [&](const tune::Candidate &c, tune::Phase phase, tune::Deadline) {
+            auto m = clean(c, phase);
+            m.short_tps = 50.0 + c.mtp + c.p_min;
+            for (auto &work : m.workloads) work.tok_s = *m.short_tps;
+            return m;
+        }, [&] { return now; });
+    const auto variants = std::count_if(report.results.begin(), report.results.end(), [](const auto &m) {
+        return m.phase == tune::Phase::benchmark && m.candidate.mtp == 1;
+    });
+    CHECK(variants >= 4);
+    for (const auto &type : options.grid.spec_type)
+        for (const auto p_min : options.grid.p_min)
+            CHECK(std::any_of(report.results.begin(), report.results.end(), [&](const auto &m) {
+                return m.phase == tune::Phase::benchmark && m.candidate.mtp == 1 &&
+                    m.candidate.spec_type == type && m.candidate.p_min == p_min;
+            }));
+    for (const auto &m : report.results)
+        if (m.phase == tune::Phase::benchmark)
+            CHECK(std::any_of(report.results.begin(), report.results.end(), [&](const auto &probe) {
+                return probe.phase == tune::Phase::probe && probe.candidate ==
+                    tune::Candidate{m.candidate.kv, m.candidate.ctx + tune::kMargin, m.candidate.ubatch,
+                        m.candidate.mtp, m.candidate.spec_type, m.candidate.p_min};
+            }));
+}
+
+TEST_CASE("tune profile emits bounded drop-in flags and typed overrides") {
+    tune::Options options;
+    options.model = "model.gguf";
+    auto argv = tune::arguments(options, {{"q4_0", "q4_0"}, 65536, 512, 0});
+    const auto has = [&](const std::string &value) { return std::find(argv.begin(), argv.end(), value) != argv.end(); };
+    CHECK(has("--parallel")); CHECK(has("1")); CHECK(has("--no-kv-unified")); CHECK(has("--cache-ram"));
+    CHECK(has("--ctx-checkpoints")); CHECK(has("--checkpoint-min-step")); CHECK(has("--jinja"));
+    CHECK(has("--reasoning-format")); CHECK(has("deepseek")); CHECK(has("--min-p")); CHECK(has("--metrics"));
+
+    auto parsed = json::parse(R"({"profile":{"parallel":1,"no_kv_unified":false,"cache_ram":1024,"ctx_checkpoints":4,"checkpoint_min_step":4096,"jinja":false,"reasoning_format":"none","min_p":0.25,"metrics":false},"spec_type":["draft-mtp"],"p_min":[0,0.5]})");
+    REQUIRE(parsed.ok());
+    auto grid = tune::parse_grid(parsed.value());
+    REQUIRE(grid.ok());
+    options.grid = grid.value();
+    argv = tune::arguments(options, {{"q4_0", "q4_0"}, 65536, 512, 2, "draft-mtp", 0.5});
+    CHECK(std::find(argv.begin(), argv.end(), "--no-kv-unified") == argv.end());
+    CHECK(std::find(argv.begin(), argv.end(), "--kv-unified") != argv.end());
+    CHECK(std::find(argv.begin(), argv.end(), "--no-jinja") != argv.end());
+    CHECK(std::find(argv.begin(), argv.end(), "--parallel") != argv.end());
+    CHECK(std::find(argv.begin(), argv.end(), "--metrics") == argv.end());
+    CHECK(std::find(argv.begin(), argv.end(), "--reasoning-format") != argv.end());
+    CHECK(std::find(argv.begin(), argv.end(), "none") != argv.end());
+    CHECK(std::find(argv.begin(), argv.end(), "--spec-draft-p-min") != argv.end());
+    CHECK(std::find(argv.begin(), argv.end(), "0.500000") != argv.end());
+    CHECK(std::count(argv.begin(), argv.end(), "--min-p") == 1);
+
+    for (const auto *text : {R"({"profile":{"parallel":2}})", R"({"profile":{"cache_ram":-1}})",
+            R"({"profile":{"checkpoint_min_step":18446744073709551616}})"}) {
+        auto bad = json::parse(text);
+        REQUIRE(bad.ok());
+        CHECK_FALSE(tune::parse_grid(bad.value()).ok());
+    }
+}
+
+TEST_CASE("tune weighted workload ranking and serialization require all natural classes") {
+    const std::vector<tune::WorkloadMeasurement> workloads{
+        {"prose", 0.4, 100.0, 10, 5}, {"code_edit", 0.3, 80.0, 10, 4},
+        {"tool_json", 0.2, 60.0, 10, 3}, {"reasoning", 0.1, 40.0, 10, 2}};
+    const auto weighted = tune::weighted_decode_tps(workloads);
+    REQUIRE(weighted);
+    CHECK(*weighted == doctest::Approx(80.0));
+    auto missing = workloads;
+    missing.pop_back();
+    CHECK_FALSE(tune::weighted_decode_tps(missing));
+    tune::Measurement m = clean({{"q4_0", "q4_0"}, 65536, 512, 0});
+    m.workloads = workloads;
+    m.short_tps = 1.0;
+    auto slower_weighted = clean({{"q8_0", "q4_0"}, 65536, 512, 0});
+    slower_weighted.short_tps = 999.0;
+    slower_weighted.workloads = {{"prose", 0.4, 70.0, 10, 5}, {"code_edit", 0.3, 70.0, 10, 5},
+        {"tool_json", 0.2, 70.0, 10, 5}, {"reasoning", 0.1, 70.0, 10, 5}};
+    tune::Report report;
+    report.results = {m, slower_weighted};
+    tune::rank(report);
+    REQUIRE(report.fast_default);
+    CHECK(*report.fast_default == 0);
+    const auto doc = tune::report_json(tune::Options{}, report);
+    const auto *row = doc.find("results")->find("candidates")->as_array().front().find("workloads");
+    REQUIRE(row != nullptr);
+    CHECK(row->as_array().size() == 4);
+    CHECK(doc.find("results")->find("candidates")->as_array().front().find("weighted_tok_s")->as_double() == doctest::Approx(80.0));
+    CHECK(row->as_array().front().find("acceptance_ratio")->as_double() == doctest::Approx(0.5));
+}
+
+TEST_CASE("tune workload counters distinguish zero acceptance from unavailable ratios") {
+    auto measurement = clean({{"q4_0", "q4_0"}, 65536, 512, 2});
+    measurement.workloads[0].draft_n_accepted = 0;
+    measurement.workloads[1].draft_n = 0;
+    measurement.workloads[1].draft_n_accepted = 0;
+    measurement.workloads[2].draft_n_accepted.reset();
+    measurement.workloads[3].draft_n.reset();
+    tune::Report report;
+    report.results.push_back(measurement);
+    const auto document = tune::report_json({}, report);
+    const auto &rows = document.find("results")->find("candidates")->as_array()[0].find("workloads")->as_array();
+    CHECK(rows[0].find("acceptance_ratio")->as_double(-1) == 0);
+    for (std::size_t i = 1; i < rows.size(); ++i) CHECK(rows[i].find("acceptance_ratio")->is_null());
+    CHECK(rows[2].find("draft_n_accepted")->is_null());
+    CHECK(rows[3].find("draft_n")->is_null());
+}
+
+TEST_CASE("tune rejects missing duplicate nonfinite or incorrectly weighted classes") {
+    const auto valid = clean({{"q4_0", "q4_0"}, 65536, 512, 0});
+    for (int failure = 0; failure < 6; ++failure) {
+        auto measurement = valid;
+        if (failure == 0) measurement.workloads.clear();
+        if (failure == 1) measurement.workloads.pop_back();
+        if (failure == 2) measurement.workloads[1].name = "prose";
+        if (failure == 3) measurement.workloads[1].tok_s = std::numeric_limits<double>::infinity();
+        if (failure == 4) measurement.workloads[1].tok_s = 0;
+        if (failure == 5) measurement.workloads[1].weight = 0.9;
+        CHECK_FALSE(tune::weighted_decode_tps(measurement.workloads));
+        tune::Report report;
+        report.results.push_back(measurement);
+        tune::rank(report);
+        CHECK_FALSE(report.fast_default);
+        CHECK_FALSE(report.long_context);
+    }
 }
