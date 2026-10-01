@@ -94,18 +94,36 @@ struct LaunchProfile {
 
     // Further llama-server arguments, passed verbatim after the typed ones.
     // Host, port, API-key, download, model-preset, prompt/log-file, agent
-    // tool, remote RPC and argument-list-terminator flags are refused, as are
-    // flags that duplicate a typed field above (validate_launch_profile).
+    // tool, external-program, remote RPC and argument-list-terminator flags
+    // are refused, as are flags that duplicate a typed field above
+    // (validate_launch_profile). Every flag is checked under the name
+    // llama-server looks it up by (llamaserver_flag_name), so `--api_key` is
+    // refused exactly like `--api-key`.
     std::vector<std::string> extra_args;
 
-    // VRAM budget for the fit check; unset = --vram-budget-mib, else the
-    // detected device total minus kDefaultVramReserveMib.
+    // VRAM budget for the fit check. serve's --vram-budget-mib takes
+    // precedence; with neither, the detected device total minus
+    // kDefaultVramReserveMib.
     std::optional<std::uint64_t> vram_budget_mib;
 };
 
 inline constexpr const char* kLaunchProfileBackendLlamaServer = "llamaserver";
 inline constexpr const char* kLaunchProfileBackendLlamaCpp = "llamacpp";
 inline constexpr std::uint64_t kDefaultVramReserveMib = 1536;  // 1.5 GiB
+// llama-server's --parallel defaults to -1 (auto): 4 slots with a unified KV
+// cache, set unconditionally (tools/server/server.cpp, llama.cpp 7fe450e; the
+// bundled 161755f29 logs "n_parallel is set to auto, using n_parallel = 4 and
+// kv_unified = true"). A llamaserver profile without `parallel` runs that.
+inline constexpr std::uint32_t kLlamaServerAutoParallel = 4;
+
+// The name llama-server looks a command-line argument up by. llama.cpp's
+// parser (common_params_parse_ex, common/arg.cpp at 7fe450e; the bundled
+// 161755f29 behaves the same) rewrites every '_' to '-' in an argument that
+// starts with "--" before the lookup, so `--api_key` is `--api-key` to
+// llama-server. Single-dash flags are looked up as written. Anything from the
+// first '=' on is dropped: llama-server has no --flag=value form and refuses
+// such an argument, so the name before it is what a check has to judge.
+std::string llamaserver_flag_name(std::string_view arg);
 
 // KV cache element types accepted by llama-server --cache-type-k/-v and by
 // the llamacpp backend, and their storage in bytes per cached value
@@ -175,7 +193,10 @@ struct GgufModelInfo {
 };
 
 // Parses the GGUF header of `path` (versions 2 and 3). Errors: not_found,
-// io_error, invalid_argument for a malformed or truncated header.
+// io_error, invalid_argument for a malformed or truncated header, a
+// general.architecture longer than 256 bytes or not printable ASCII, or
+// implausible recurrent (ssm.*) sizes. Keys and tensor names quoted in an
+// error are cut to 64 printable characters (errors reach /v1/models).
 Result<GgufModelInfo> read_gguf_model_info(const std::string& path);
 Result<GgufModelInfo> parse_gguf_model_info(std::string_view header_bytes);
 // `error` (from read_gguf_model_info(path)) with every occurrence of `path`
@@ -186,7 +207,7 @@ std::string redact_model_path(const Status& error, const std::string& path);
 struct VramEstimate {
     std::uint64_t weights_bytes = 0;    // offloaded blocks (+ output) + mmproj/draft when offloaded
     std::uint64_t kv_bytes = 0;         // attention layers on the GPU x context_per_sequence x sequences
-    std::uint64_t recurrent_bytes = 0;  // recurrent state of GPU blocks x parallel x recurrent_snapshots
+    std::uint64_t recurrent_bytes = 0;  // recurrent state of GPU blocks x recurrent_sequences x recurrent_snapshots
     std::uint64_t compute_bytes = 0;    // compute buffers and runtime allowance
     std::uint64_t total_bytes = 0;
     std::uint32_t gpu_layers = 0;
@@ -194,13 +215,20 @@ struct VramEstimate {
     std::uint64_t kv_bytes_per_token = 0;
     std::uint64_t context = 0;               // total context (--ctx-size, padded to 256)
     std::uint64_t context_per_sequence = 0;  // context when unified; else pad(context / sequences, 256)
-    std::uint32_t sequences = 1;
+    std::uint32_t sequences = 1;             // KV streams: 1 when unified, else parallel
+    // Sequences that each keep a recurrent state (llama.cpp's n_seq_max):
+    // `parallel`, kLlamaServerAutoParallel for a llamaserver profile without
+    // it, 1 on the llamacpp backend.
+    std::uint32_t recurrent_sequences = 1;
     // Recurrent states kept per sequence: 1, or 1 + --spec-draft-n-max
     // (default 3) when draft-mtp/eagle3/dflash/dspark roll the state back.
     std::uint32_t recurrent_snapshots = 1;
     std::vector<std::string> notes;  // what the estimate does not cover
 
-    [[nodiscard]] std::uint64_t total_mib() const noexcept { return (total_bytes + (1u << 20) - 1) >> 20; }
+    // Rounded up; cannot wrap, even for a total near 2^64.
+    [[nodiscard]] std::uint64_t total_mib() const noexcept {
+        return (total_bytes >> 20) + ((total_bytes & ((1u << 20) - 1)) != 0 ? 1 : 0);
+    }
 };
 
 // Extra files the estimate needs sizes of (mmproj, draft model); 0 = absent.
@@ -217,12 +245,15 @@ struct VramEstimateInputs {
 //            bytes(k) + value_length x bytes(v)) x ctx_seq x sequences:
 //            kv_unified gives one pool of ctx (sequences 1); otherwise
 //            sequences = parallel and ctx_seq = pad(ctx / parallel, 256),
-//            as llama.cpp splits --ctx-size across the per-sequence streams
+//            as llama.cpp splits --ctx-size across the per-sequence streams.
+//            A llamaserver profile without `parallel` gets llama-server's
+//            auto default: kLlamaServerAutoParallel slots, unified
 //   recurrent  for each GPU block without attention in a hybrid or
-//            recurrent model: state values x 4 bytes x parallel x
-//            recurrent_snapshots (1 + --spec-draft-n-max when draft-mtp,
-//            draft-eagle3, draft-dflash or draft-dspark roll the state back
-//            on an architecture llama.cpp supports that for)
+//            recurrent model: state values x 4 bytes x recurrent_sequences
+//            (parallel; kLlamaServerAutoParallel when a llamaserver profile
+//            leaves it unset) x recurrent_snapshots (1 + --spec-draft-n-max
+//            when draft-mtp, draft-eagle3, draft-dflash or draft-dspark roll
+//            the state back on an architecture llama.cpp supports that for)
 //   compute  n_vocab x ubatch x 4 (logits) + 4 x n_embd x ubatch x 4
 //            + 256 MiB runtime allowance
 // ctx 0 or unset uses <arch>.context_length. Hybrid models count only their

@@ -121,8 +121,9 @@ Launch profiles (docs/integration/launch-profiles.md):
   --profiles PATH         JSON file of typed per-model launch profiles
   --profile NAME          serve that profile: it selects the backend and the model
                           (served under NAME) and sets every serving option
-  --vram-budget-mib N     VRAM budget for the fit check (default: the profile's
-                          vram_budget_mib, else device memory - 1536 MiB)
+  --vram-budget-mib N     VRAM budget for the fit check; overrides the profile's
+                          vram_budget_mib (default: the profile's value, else
+                          device memory - 1536 MiB)
   --allow-overcommit      start even when the estimate exceeds the budget
 
 Telemetry (Observatory envelope v1; live at /v1/telemetry/sse and /v1/telemetry/ndjson):
@@ -142,6 +143,12 @@ enum class Kind { value, repeat, flag };
 // which would ignore them, and next to --profile, whose typed fields set them.
 constexpr const char* kLlamaCppContextFlags[] = {"batch-size", "ubatch-size", "cache-type-k", "cache-type-v",
                                                  "flash-attn"};
+// Tensor placement options of the direct llamacpp backend
+// (BackendSetup::llamacpp_tensor_overrides). A llamaserver launch profile
+// refuses them, because the spawned llama-server never sees them; a llamacpp
+// profile takes them from the command line. (--device stays allowed: every
+// backend reports it as the model's device_id in telemetry and health.)
+constexpr const char* kLlamaCppPlacementFlags[] = {"moe-experts", "tensor-override"};
 
 const std::vector<std::pair<std::string, Kind>>& spec() {
     static const std::vector<std::pair<std::string, Kind>> kSpec = {
@@ -381,9 +388,11 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const La
                             std::vector<std::string>& notes, std::string& refusal) {
     std::optional<std::uint64_t> detected;
     bool detection_done = false;
+    // The operator's --vram-budget-mib wins over a (possibly shared) profile's
+    // vram_budget_mib: a budget tightened on the command line always applies.
     const auto budget_for = [&](const LaunchProfile& p) -> std::optional<std::uint64_t> {
-        if (p.vram_budget_mib) return p.vram_budget_mib;
         if (budget_flag) return budget_flag;
+        if (p.vram_budget_mib) return p.vram_budget_mib;
         if (!detection_done) {
             detected = detect_device_vram_mib();
             detection_done = true;
@@ -447,15 +456,17 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const La
             continue;
         }
         const VramEstimate& e = *estimate;
+        std::string recurrent = mib_text(e.recurrent_bytes);
+        if (e.recurrent_bytes > 0 && (e.recurrent_sequences > 1 || e.recurrent_snapshots > 1)) {
+            recurrent += " = " + std::to_string(e.recurrent_sequences) + " sequence(s) x " +
+                         std::to_string(e.recurrent_snapshots) + " snapshot(s)" +
+                         (e.recurrent_snapshots > 1 ? " for speculative rollback" : "");
+        }
         std::string summary = "launch profile '" + p.name + "': estimated VRAM " + std::to_string(e.total_mib()) +
                               " MiB (weights " + mib_text(e.weights_bytes) + ", KV " + mib_text(e.kv_bytes) + " = " +
                               std::to_string(e.attention_layers) + " attention layers x " +
                               std::to_string(e.context_per_sequence) + " tokens x " + std::to_string(e.sequences) +
-                              " sequence(s), recurrent " + mib_text(e.recurrent_bytes) +
-                              (e.recurrent_snapshots > 1 ? " = " + std::to_string(e.recurrent_snapshots) +
-                                                               " snapshots per sequence for speculative rollback"
-                                                         : std::string()) +
-                              ", compute " + mib_text(e.compute_bytes) + ")";
+                              " sequence(s), recurrent " + recurrent + ", compute " + mib_text(e.compute_bytes) + ")";
         if (budget) summary += " vs budget " + std::to_string(*budget) + " MiB";
         for (const auto& note : e.notes) summary += "; " + note;
         if (upstream_fits) {
@@ -546,6 +557,17 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
         for (const char* flag : kLlamaCppContextFlags) {
             if (a.get(flag)) {
                 return usage_error(std::string("--") + flag + " conflicts with --profile (set the profile's typed fields)");
+            }
+        }
+        // Only the direct llamacpp backend reads these; a llamaserver profile
+        // would start without them and say nothing.
+        if (profile->backend == kLaunchProfileBackendLlamaServer) {
+            for (const char* flag : kLlamaCppPlacementFlags) {
+                if (a.get(flag)) {
+                    return usage_error(std::string("option --") + flag + " applies only to --backend llamacpp; for "
+                                       "llamaserver launch profile '" + profile->name +
+                                       "' put llama-server's own flag (-ot, --cpu-moe) in extra_args");
+                }
             }
         }
     }

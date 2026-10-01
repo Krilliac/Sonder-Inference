@@ -41,6 +41,11 @@ std::string canonical_flash_attn(std::string_view v) {
     return {};
 }
 
+// The flag lists below hold the names llama-server looks flags up by
+// (llamaserver_flag_name): hyphens, never underscores. check_extra_args
+// compares each extra argument under that name, so `--ctx_size` and
+// `--mcp_servers_json` match `--ctx-size` and `--mcp-servers-json`.
+
 // Every spelling of the llama-server flags that the typed fields own, plus
 // flags Sonder owns (model, alias). Taken from `llama-server --help`.
 constexpr std::pair<std::string_view, std::string_view> kTypedFlags[] = {
@@ -109,6 +114,17 @@ constexpr std::string_view kDiskWriteFlags[] = {
 // A shared profile must not route prompts off this host.
 constexpr std::string_view kRemoteOffloadFlags[] = {"--rpc"};
 
+// llama-server flags that choose a program for the child to run:
+// `--video-ffmpeg-dir` is the directory it starts ffmpeg and ffprobe from for
+// video input (tools/mtmd/mtmd-helper.cpp). A shared profile must not pick
+// executables.
+constexpr std::string_view kExternalProgramFlags[] = {"--video-ffmpeg-dir"};
+
+template <std::size_t N>
+bool listed(const std::string_view (&list)[N], std::string_view flag) {
+    return std::find(std::begin(list), std::end(list), flag) != std::end(list);
+}
+
 // llama-server's built-in model presets (`--gpt-oss-20b-default`,
 // `--fim-qwen-7b-spec`, `--spec-default`, ...). Each one swaps in its own model
 // and settings, overriding the typed fields, and most "can download weights
@@ -126,45 +142,40 @@ Status check_extra_args(const LaunchProfile& p) {
     for (const auto& arg : p.extra_args) {
         if (has_nul(arg)) return bad(where_of(p), "extra_args must not contain NUL");
         if (arg.size() < 2 || arg[0] != '-') continue;  // a value, not a flag
-        const std::string_view flag = std::string_view(arg).substr(0, arg.find('='));
-        for (auto f : kForbiddenFlags) {
-            if (flag == f || (f.size() > 2 && (flag.rfind(std::string(f) + "_", 0) == 0))) {
-                return bad(where_of(p), "extra_args must not contain " + std::string(flag) +
-                                            " (the supervisor owns host and port; credentials and downloads are "
-                                            "not passed to llama-server)");
-            }
+        // Judge the flag llama-server will actually run: it reads
+        // `--mcp_servers_json` as `--mcp-servers-json`.
+        const std::string flag = llamaserver_flag_name(arg);
+        const std::string_view written = std::string_view(arg).substr(0, arg.find('='));
+        const std::string refused = "extra_args must not contain " + std::string(written) +
+                                    (written == flag ? std::string() : ", which llama-server reads as " + flag);
+        if (listed(kForbiddenFlags, flag)) {
+            return bad(where_of(p), refused +
+                                        " (the supervisor owns host and port; credentials and downloads are not "
+                                        "passed to llama-server)");
         }
         if (is_model_preset_flag(flag)) {
-            return bad(where_of(p), "extra_args must not contain " + std::string(flag) +
+            return bad(where_of(p), refused +
                                         " (llama-server's built-in model presets replace the profile's model and can "
                                         "download weights; set the typed fields instead)");
         }
-        for (auto f : kDiskWriteFlags) {
-            if (flag == f) {
-                return bad(where_of(p), "extra_args must not contain " + std::string(flag) +
-                                            " (a launch profile cannot make llama-server write logs or prompts to "
-                                            "disk)");
-            }
+        if (listed(kDiskWriteFlags, flag)) {
+            return bad(where_of(p), refused + " (a launch profile cannot make llama-server write logs or prompts to disk)");
         }
-        for (auto f : kRemoteOffloadFlags) {
-            if (flag == f) {
-                return bad(where_of(p), "extra_args must not contain " + std::string(flag) +
-                                            " (a launch profile cannot offload model work, and the activations "
-                                            "that carry each prompt, to remote RPC servers)");
-            }
+        if (listed(kRemoteOffloadFlags, flag)) {
+            return bad(where_of(p), refused +
+                                        " (a launch profile cannot offload model work, and the activations that "
+                                        "carry each prompt, to remote RPC servers)");
         }
-        for (auto f : kUnsafeFeatureFlags) {
-            if (flag == f) {
-                return bad(where_of(p), "extra_args must not contain " + std::string(flag) +
-                                            " (llama-server's agent tools, MCP and local file serving cannot be "
-                                            "enabled from a launch profile)");
-            }
+        if (listed(kUnsafeFeatureFlags, flag)) {
+            return bad(where_of(p), refused +
+                                        " (llama-server's agent tools, MCP and local file serving cannot be enabled "
+                                        "from a launch profile)");
+        }
+        if (listed(kExternalProgramFlags, flag)) {
+            return bad(where_of(p), refused + " (a launch profile cannot choose programs for llama-server to run)");
         }
         for (const auto& [f, field] : kTypedFlags) {
-            if (flag == f) {
-                return bad(where_of(p), "extra_args must not contain " + std::string(flag) + "; use the typed field '" +
-                                            std::string(field) + "'");
-            }
+            if (flag == f) return bad(where_of(p), refused + "; use the typed field '" + std::string(field) + "'");
         }
     }
     return {};
@@ -318,6 +329,14 @@ Result<LaunchProfile> parse_one(const json::Value& value, std::size_t index) {
 
 }  // namespace
 
+std::string llamaserver_flag_name(std::string_view arg) {
+    std::string flag(arg.substr(0, arg.find('=')));
+    // common_params_parse_ex: `if (arg.compare(0, 2, "--") == 0)
+    // std::replace(arg.begin(), arg.end(), '_', '-');` before the lookup.
+    if (flag.rfind("--", 0) == 0) std::replace(flag.begin(), flag.end(), '_', '-');
+    return flag;
+}
+
 double kv_cache_type_bytes(std::string_view type) noexcept {
     if (type == "f32") return 4.0;
     if (type == "f16" || type == "bf16") return 2.0;
@@ -373,6 +392,13 @@ Status validate_launch_profile(const LaunchProfile& p) {
     if (p.reasoning_format && *p.reasoning_format != "none" && *p.reasoning_format != "deepseek" &&
         *p.reasoning_format != "deepseek-legacy" && *p.reasoning_format != "auto") {
         return bad(where, "'reasoning_format' must be none, deepseek, deepseek-legacy or auto");
+    }
+    // Without --parallel, llama-server picks its slots automatically and then
+    // unifies the KV cache whatever --no-kv-unified said
+    // (kLlamaServerAutoParallel), so the field would silently not apply.
+    if (p.backend == kLaunchProfileBackendLlamaServer && p.kv_unified.has_value() && !*p.kv_unified && !p.parallel) {
+        return bad(where, "'kv_unified': false needs 'parallel' (with 'parallel' unset, llama-server runs 4 slots and "
+                          "always unifies the KV cache)");
     }
     if (p.speculative) {
         if (p.speculative->types.empty()) return bad(where, "'speculative.types' must not be empty");

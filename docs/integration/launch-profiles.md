@@ -150,8 +150,8 @@ to about 1 tok/s at 72k. For long context, keep Q3_K_XL at 100k.
 | `n_gpu_layers` | `--n-gpu-layers` (`-1` is `all`) | `gpu_layers`; sets `--device gpu:0` when none is given, refuses a cpu device | -1 to 100000 |
 | `batch_size` | `--batch-size` | `batch_size` * | 1 to 4194304 |
 | `ubatch_size` | `--ubatch-size` | `ubatch_size` * | at most `batch_size` (upstream default: 2048 for llama-server, 512 for llamacpp) |
-| `parallel` | `--parallel` | rejected | 1-256 |
-| `kv_unified` | `--kv-unified` / `--no-kv-unified` | rejected | bool |
+| `parallel` | `--parallel` | rejected | 1-256; unset = llama-server's automatic default (`-np -1`): 4 slots with a unified KV cache, which the fit check counts as 4 recurrent states |
+| `kv_unified` | `--kv-unified` / `--no-kv-unified` | rejected | bool; `false` needs `parallel` (the automatic slots always unify the cache) |
 | `flash_attn` | `--flash-attn` | `flash_attention` * | `on`, `off`, `auto` (also `enabled`, `disabled`) |
 | `cache_type_k`, `cache_type_v` | `--cache-type-k`, `--cache-type-v` | `kv_cache_type_k`, `kv_cache_type_v` * | `f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1` |
 | `ctx_checkpoints` | `--ctx-checkpoints` | rejected | 0-1024 |
@@ -187,10 +187,20 @@ Rules checked at load time (`invalid_argument`, before anything starts):
   attention on.
 - `ubatch_size` must not exceed `batch_size` (or the upstream default).
 - `mmproj_offload` and `image_max_tokens` need `mmproj`.
+- **`kv_unified: false` needs `parallel`** (llamaserver). Without
+  `--parallel`, llama-server picks 4 slots and unifies the KV cache whatever
+  `--no-kv-unified` says, so the field would silently not apply.
 - Speculative types must be known and unique. `none` cannot be combined
   with other types.
 - Sampling defaults must pass the same range checks as request values.
-- `extra_args` may not contain `--host`, `--port` (or `--host_*`/`--port_*`),
+- **`extra_args` are checked under the name llama-server reads.** llama.cpp's
+  parser turns every `_` into `-` in an argument that starts with `--` before
+  it looks the flag up (`common/arg.cpp`; the bundled build does the same),
+  so `--mcp_servers_json` is `--mcp-servers-json` and `--ctx_size` is
+  `--ctx-size`. Every rule below applies to that name, and a refusal names
+  both spellings. A `--flag=value` form is judged by the name before `=`
+  (llama-server itself refuses that form).
+- `extra_args` may not contain `--host`, `--port`,
   `--`, `--api-key`, `--api-key-file`, `--ssl-key-file`, `--ssl-cert-file`,
   download flags (`-hf`, `--hf-repo`, `--hf-file`, `--hf-token`,
   `--model-url`, `--docker-repo`, `--mmproj-url`, `--hf-repo-draft`,
@@ -207,22 +217,30 @@ Rules checked at load time (`invalid_argument`, before anything starts):
   `--tools` (which includes `exec_shell_command` and `write_file`),
   `--tools-runtime`, `--mcp-servers-config`, `--mcp-servers-json`,
   `-ag`/`--agent`, `--ui-mcp-proxy`/`--webui-mcp-proxy`, `--path` and
-  `--media-path`. Their `--no-*` forms are allowed. Profiles are meant to be
+  `--media-path`, and may not pick a program for the child to run:
+  `--video-ffmpeg-dir` (where it starts ffmpeg and ffprobe for video input).
+  Their `--no-*` forms are allowed. Profiles are meant to be
   copied from shared configurations, so a profile file must not be able to
   switch on shell execution in the child. (`--llamaserver-arg` without a
   profile is an operator flag and is not filtered this way.) The spawn-mode loopback
   rules still apply: the child only ever listens on 127.0.0.1. Any spelling
   of a flag that a typed field owns (for example `-c`, `--ctx-size=`,
-  `--temp`, `-ngl`) is refused with the field to use instead.
+  `--ctx_size`, `--temp`, `-ngl`) is refused with the field to use instead.
 
 With `--profile`, `serve` also refuses `--backend` or `--model` values that
 differ from the profile, `--gpu-layers`, `--context-length`,
 `--batch-size`, `--ubatch-size`, `--cache-type-k`, `--cache-type-v`,
 `--flash-attn` (the profile's typed fields set them),
 `--llamaserver-arg`, `--llamaserver-url`, attach mode, and `args` in a
-`--llamaserver-config` file. Everything else, such as the executable,
-timeouts, restart policy, TLS, `--device`, `--moe-experts` and
-`--tensor-override`, is taken from the usual options. Without a profile,
+`--llamaserver-config` file. A llamaserver profile also refuses
+`--moe-experts` and `--tensor-override`, which only the direct llamacpp
+backend reads: exit 2 with `option --X applies only to --backend llamacpp`,
+and put llama-server's own placement flags (`-ot`, `--cpu-moe`, `--device`)
+in `extra_args`. A llamacpp profile takes `--moe-experts`,
+`--tensor-override` and `--device` from the command line. Everything else,
+such as the executable, timeouts, restart policy and TLS, is taken from the
+usual options; `--device` with a llamaserver profile only labels the model's
+`device_id` in telemetry and health. Without a profile,
 those five llama.cpp flags apply to `--backend llamacpp` only: any other
 backend exits with status 2 and
 `option --X applies only to --backend llamacpp; for llamaserver set it in the JSON args`
@@ -243,9 +261,10 @@ profile get no defaults, and their requests are unchanged.
 about 11 MB for the Qwen files; no weights). It estimates the process's VRAM
 and compares it with a budget:
 
-- **budget** = the profile's `vram_budget_mib`, else `--vram-budget-mib`,
+- **budget** = `--vram-budget-mib`, else the profile's `vram_budget_mib`,
   else the largest adapter's dedicated memory (DXGI on Windows) minus 1,536
-  MiB. Other platforms need an explicit budget.
+  MiB. Other platforms need an explicit budget. The command line wins, so an
+  operator can tighten the budget of a shared profile without editing it.
 - **weights** = tensor bytes of the blocks on the GPU. llama.cpp offloads the
   last `n_gpu_layers` blocks, and adds the output tensors when every block
   is offloaded (`-1`/`all`, or more layers than blocks). `token_embd` stays
@@ -255,18 +274,25 @@ and compares it with a budget:
 - **KV** = sum over GPU attention layers of n_kv_heads × (key_length ×
   bytes(K) + value_length × bytes(V)) × ctx_seq × sequences. Bytes per value
   come from ggml's block layouts: f16 2, q8_0 1.0625, q5_1 0.75, q4_0 0.5625.
-  ctx is padded to 256. With `kv_unified` (the default when `parallel` is
-  unset) there is one pool: sequences = 1 and ctx_seq = ctx. Without it,
-  sequences = `parallel` and ctx_seq = ctx / `parallel` padded to 256,
-  because `--ctx-size` is the total and llama.cpp splits it into one stream
-  per sequence (`n_ctx_seq` in `llama_context`). Either way the KV holds
-  about ctx tokens in total; `parallel` does not multiply it.
+  ctx is padded to 256. With `kv_unified` there is one pool: sequences = 1
+  and ctx_seq = ctx. Without it, sequences = `parallel` and ctx_seq = ctx /
+  `parallel` padded to 256, because `--ctx-size` is the total and llama.cpp
+  splits it into one stream per sequence (`n_ctx_seq` in `llama_context`).
+  Either way the KV holds about ctx tokens in total; `parallel` does not
+  multiply it. A llamaserver profile without `parallel` runs llama-server's
+  automatic default, 4 slots with a unified cache (`n_parallel is set to
+  auto, using n_parallel = 4 and kv_unified = true`), and the estimate
+  counts exactly that.
   **Hybrid models count attention layers only.** They are found from
   per-block `head_count_kv` arrays, then `attn_k` tensors, then
   `full_attention_interval`, using the architecture classification in `model_architecture.hpp`.
 - **recurrent state** = for each GPU block without attention in a hybrid or
   recurrent model: ((conv_kernel − 1) × (inner + 2 × groups × state) +
-  inner × state) × 4 bytes × `parallel` × snapshots. Snapshots is 1, or
+  inner × state) × 4 bytes × sequences × snapshots. Sequences is
+  `parallel`: 4 when a llamaserver profile leaves it unset (each automatic
+  slot keeps its own state, unified KV or not), 1 on the llamacpp backend.
+  The live MTP profile without `parallel` estimates 15,807 MiB instead of
+  14,460 MiB, which is over the 16 GB card's default budget. Snapshots is 1, or
   1 + `speculative.draft_n_max` (llama.cpp's default 3 when unset) when
   `speculative.types` has `draft-mtp`, `draft-eagle3`, `draft-dflash` or
   `draft-dspark`: llama.cpp then keeps one recurrent state per draft position
@@ -532,15 +558,19 @@ next step (see the roadmap).
 llama-server needed:
 
 - schema parsing and every validation rule, including the `extra_args`
-  refusals (`--rpc` among them)
+  refusals (`--rpc` among them) in both the hyphen and the underscore
+  spelling llama-server accepts
 - argv golden tests (the measured profile and one that sets every toggle)
 - direct-backend mapping (the values reaching `BackendSetup`) and each
   rejection
 - the GGUF reader on synthetic headers (hybrid by tensors and by interval,
-  per-layer head counts, truncation)
+  per-layer head counts, truncation, implausible `ssm.*` sizes, oversized
+  names kept out of error messages); `fuzz/` adds `sonder_fuzz_gguf` over
+  the reader and the estimate
 - estimator arithmetic, including the hybrid rule, parallel and unified KV,
-  MTP, recurrent snapshots for speculative rollback, partial offload, and
-  the measured 100k and MTP profiles
+  llama-server's automatic 4 slots when `parallel` is unset, MTP, recurrent
+  snapshots for speculative rollback, partial offload, saturation instead of
+  overflow, and the measured 100k and MTP profiles
 - sampling defaults reaching the backend through `/v1/chat/completions` and
   `/v1/messages`, also for a lazily loaded model and after an idle eviction
   reloads it (under the profile's load name)
@@ -549,7 +579,10 @@ llama-server needed:
 - endpoint vs upstream capabilities, and a context reduced at run time
   (`auto_fit`) replacing `context_length` next to the backend's `runtime`
 - `serve` refusals, including the llama.cpp context flags next to
-  `--profile`
+  `--profile` and `--moe-experts`/`--tensor-override` next to a llamaserver
+  profile, and `--vram-budget-mib` taking precedence over the profile's
+  budget
 
 Set `SONDER_TEST_GGUF` to a GGUF file, or to a copy of its header, to print
-the estimate for a real model.
+the estimate for a real model. Without it doctest skips that diagnostic, so
+CTest neither registers nor counts it.

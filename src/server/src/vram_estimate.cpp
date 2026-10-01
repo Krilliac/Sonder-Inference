@@ -2,6 +2,7 @@
 // (launch_profile.hpp). Reads only the header: metadata and the tensor
 // table, never tensor data.
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <istream>
@@ -34,8 +35,42 @@ namespace {
 constexpr std::uint64_t kMaxCount = 1ull << 24;       // KV pairs, tensors, array items
 constexpr std::uint64_t kMaxStringBytes = 1ull << 24;  // one string (chat templates are ~20 KiB)
 constexpr std::uint64_t kMiB = 1ull << 20;
+// general.architecture is a short identifier ("qwen35", "llama"); it is kept
+// and quoted in messages, so a longer or non-printable one is refused.
+constexpr std::size_t kMaxArchitectureBytes = 256;
+// Recurrent (ssm.*) sizes from the file. Real models are far below these
+// (Qwen3.8-27B: conv 4, inner 6144, state 128, groups 16); within them the
+// state size cannot overflow, and a row stays under 2^28 f32 values (1 GiB).
+constexpr std::uint64_t kMaxSsmConvKernel = 1u << 10;
+constexpr std::uint64_t kMaxSsmSize = 1u << 20;  // inner, state, groups
+constexpr std::uint64_t kMaxRecurrentStateValues = 1ull << 28;
 
 Status malformed(const std::string& what) { return Status(ErrorCode::invalid_argument, "GGUF header: " + what); }
+
+bool printable(std::string_view text) {
+    return std::all_of(text.begin(), text.end(), [](char ch) { return ch >= 0x20 && ch < 0x7f; });
+}
+
+// File text (a key or tensor name, up to 16 MiB) as quoted in an error: at
+// most 64 bytes, non-printable bytes as '?'. Errors reach /v1/models
+// (`estimate_error`) and the operator's log.
+// (Not named `quoted`: ADL on a std::string argument would pick std::quoted.)
+std::string excerpt(std::string_view text) {
+    std::string out;
+    for (const char ch : text.substr(0, 64)) out += (ch >= 0x20 && ch < 0x7f) ? ch : '?';
+    if (text.size() > 64) out += "...";
+    return out;
+}
+
+// `v` rounded to the nearest integer and saturated to [0, 2^64 - 1]: casting
+// an out-of-range double is undefined behaviour, and crafted GGUF metadata
+// can push the KV arithmetic (done in double) past 2^64.
+std::uint64_t saturating_u64(double v) {
+    const double r = std::floor(v + 0.5);
+    if (!(r > 0.0)) return 0;  // also NaN
+    if (r >= 18446744073709551616.0) return std::numeric_limits<std::uint64_t>::max();  // 2^64
+    return static_cast<std::uint64_t>(r);
+}
 
 // Speculative decoding that rolls back recurrent state keeps one state
 // snapshot per draft position: llama.cpp allocates max(1, n_seq_max) x
@@ -196,7 +231,12 @@ Result<GgufModelInfo> parse(std::istream& in) {
         if (type == 8) {
             std::string value;
             if (!c.string(value)) return malformed("truncated string value");
-            if (key == "general.architecture") info.architecture = value;
+            if (key == "general.architecture") {
+                if (value.size() > kMaxArchitectureBytes || !printable(value)) {
+                    return malformed("general.architecture must be at most 256 printable ASCII characters");
+                }
+                info.architecture = value;
+            }
             if (value.size() <= 256) info.metadata.emplace_back(key, value);
             continue;
         }
@@ -212,7 +252,7 @@ Result<GgufModelInfo> parse(std::istream& in) {
                 continue;
             }
             const std::uint64_t size = scalar_size(item_type);
-            if (size == 0) return malformed("unsupported array item type in '" + key + "'");
+            if (size == 0) return malformed("unsupported array item type in '" + excerpt(key) + "'");
             if (item_type != 6 && item_type != 12 && item_type != 7 && n <= 4096) {
                 Numbers num;
                 std::int64_t max_value = 0;
@@ -234,7 +274,7 @@ Result<GgufModelInfo> parse(std::istream& in) {
         std::string text;
         std::int64_t v = 0;
         bool is_int = false;
-        if (!read_scalar(c, type, text, v, is_int)) return malformed("unsupported value type in '" + key + "'");
+        if (!read_scalar(c, type, text, v, is_int)) return malformed("unsupported value type in '" + excerpt(key) + "'");
         info.metadata.emplace_back(key, text);
         if (is_int) numbers.emplace_back(key, Numbers{v, {}});
     }
@@ -269,13 +309,20 @@ Result<GgufModelInfo> parse(std::istream& in) {
         std::fill(info.kv_heads.begin(), info.kv_heads.end(), static_cast<std::uint32_t>(std::max<std::int64_t>(0, kv_heads)));
     }
     // Recurrent state (Mamba 1/2, delta-net): conv (kernel - 1) x channels,
-    // channels = inner + 2 x groups x state, plus inner x state.
-    const std::int64_t conv = scalar(a + "ssm.conv_kernel", 0);
-    const std::int64_t inner = scalar(a + "ssm.inner_size", 0);
-    const std::int64_t state = scalar(a + "ssm.state_size", 0);
-    const std::int64_t groups = scalar(a + "ssm.group_count", 0);
+    // channels = inner + 2 x groups x state, plus inner x state. scalar()
+    // returns only non-negative values; the caps keep the unsigned products
+    // below 2^53, and a larger state than any real model's is refused.
+    const auto conv = static_cast<std::uint64_t>(scalar(a + "ssm.conv_kernel", 0));
+    const auto inner = static_cast<std::uint64_t>(scalar(a + "ssm.inner_size", 0));
+    const auto state = static_cast<std::uint64_t>(scalar(a + "ssm.state_size", 0));
+    const auto groups = static_cast<std::uint64_t>(scalar(a + "ssm.group_count", 0));
     if (conv > 0 && inner > 0 && state > 0) {
-        info.recurrent_state_values = static_cast<std::uint64_t>((conv - 1) * (inner + 2 * groups * state) + inner * state);
+        if (conv > kMaxSsmConvKernel || inner > kMaxSsmSize || state > kMaxSsmSize || groups > kMaxSsmSize) {
+            return malformed("implausible " + a + "ssm.* sizes");
+        }
+        const std::uint64_t values = (conv - 1) * (inner + 2 * groups * state) + inner * state;
+        if (values > kMaxRecurrentStateValues) return malformed("implausible " + a + "ssm.* sizes");
+        info.recurrent_state_values = values;
     }
 
     // Tensor table.
@@ -302,7 +349,7 @@ Result<GgufModelInfo> parse(std::istream& in) {
         std::uint64_t block_elems = 0;
         std::uint64_t block_bytes = 0;
         if (!ggml_type_size(type, block_elems, block_bytes)) {
-            return malformed("tensor " + name + " has an unknown ggml type " + std::to_string(type));
+            return malformed("tensor " + excerpt(name) + " has an unknown ggml type " + std::to_string(type));
         }
         const std::uint64_t bytes = (elements + block_elems - 1) / block_elems * block_bytes;
         if (name.rfind("blk.", 0) == 0) {
@@ -313,7 +360,7 @@ Result<GgufModelInfo> parse(std::istream& in) {
                 ok = name[k] >= '0' && name[k] <= '9' && layer < 1000000;
                 layer = layer * 10 + static_cast<std::uint64_t>(name[k] - '0');
             }
-            if (!ok || layer >= info.block_count) return malformed("tensor " + name + " names an unknown block");
+            if (!ok || layer >= info.block_count) return malformed("tensor " + excerpt(name) + " names an unknown block");
             info.block_bytes[layer] += bytes;
             const std::string suffix = name.substr(dot + 1);
             if (suffix == "attn_k.weight" || suffix == "attn_kv_a_mqa.weight") {
@@ -405,9 +452,15 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
     }
     ctx = (ctx + 255) / 256 * 256;  // llama.cpp pads the context to 256
     e.context = ctx;
-    const bool unified = p.kv_unified.value_or(!p.parallel.has_value());
-    const std::uint32_t slots = p.parallel.value_or(1);
+    // Without `parallel`, llama-server runs its automatic default: 4 slots
+    // (n_seq_max 4, so 4 recurrent states) with a unified KV cache
+    // (kLlamaServerAutoParallel). The direct llamacpp backend decodes one
+    // sequence and refuses `parallel`.
+    const bool auto_parallel = !p.parallel && p.backend == kLaunchProfileBackendLlamaServer;
+    const std::uint32_t slots = p.parallel ? *p.parallel : (auto_parallel ? kLlamaServerAutoParallel : 1u);
+    const bool unified = auto_parallel || p.kv_unified.value_or(!p.parallel.has_value());
     e.sequences = unified ? 1 : slots;
+    e.recurrent_sequences = slots;
     // --ctx-size is the total KV size. A non-unified cache splits it into one
     // stream per sequence of n_ctx_seq = pad(n_ctx / n_seq_max, 256) cells
     // (llama_context's constructor, llama.cpp b11195), so the pool is
@@ -438,9 +491,8 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
         }
     }
     if (all) e.weights_bytes += m.output_bytes;
-    e.kv_bytes_per_token = static_cast<std::uint64_t>(kv_per_token + 0.5);
-    e.kv_bytes =
-        static_cast<std::uint64_t>(kv_per_token * static_cast<double>(ctx_per_sequence) * e.sequences + 0.5);
+    e.kv_bytes_per_token = saturating_u64(kv_per_token);
+    e.kv_bytes = saturating_u64(kv_per_token * static_cast<double>(ctx_per_sequence) * e.sequences);
 
     if (!p.mmproj.empty() && p.mmproj_offload.value_or(true)) {
         e.weights_bytes += inputs.mmproj_bytes;
@@ -459,17 +511,21 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
         e.compute_bytes = m.vocab_size * ubatch * 4 + 4 * m.embedding_length * ubatch * 4 + 256 * kMiB;
     }
     for (const auto& arg : p.extra_args) {
-        const std::string_view flag = std::string_view(arg).substr(0, arg.find('='));
+        // The name llama-server reads (`--override_tensor` is `--override-tensor`).
+        const std::string flag = llamaserver_flag_name(arg);
         if (flag == "-ot" || flag == "--override-tensor" || flag == "-cmoe" || flag == "--cpu-moe" ||
             flag == "-ncmoe" || flag == "--n-cpu-moe" || flag == "-ts" || flag == "--tensor-split" ||
             flag == "-sm" || flag == "--split-mode" || flag == "-dev" || flag == "--device") {
-            e.notes.emplace_back("placement flags in extra_args (" + std::string(flag) +
+            e.notes.emplace_back("placement flags in extra_args (" + flag +
                                  ") are ignored: the estimate assumes every offloaded block is on one GPU");
             break;
         }
     }
     if (m.kind != ModelArchitecture::attention_only && m.recurrent_state_values == 0) {
         e.notes.emplace_back("recurrent state size unknown for this architecture");
+    }
+    if (auto_parallel && e.recurrent_bytes > 0) {
+        e.notes.emplace_back("parallel unset: llama-server's automatic 4 slots keep 4 recurrent states");
     }
     e.total_bytes = e.weights_bytes + e.kv_bytes + e.recurrent_bytes + e.compute_bytes;
     return e;

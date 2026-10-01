@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -128,6 +129,11 @@ TEST_CASE("launch profile: schema and range violations are rejected") {
     CHECK(contains(parse_error("{" + base + R"(,"sampling":{"top_p":0}})"), "sampling:"));
     CHECK(contains(parse_error("{" + base + R"(,"sampling":{"typical_p":0.9}})"), "unknown field 'typical_p'"));
     CHECK(contains(parse_error("{" + base + R"(,"vram_budget_mib":0})"), "'vram_budget_mib'"));
+    // Without `parallel`, llama-server's automatic slots unify the KV cache
+    // whatever --no-kv-unified says: the field would silently not apply.
+    CHECK(contains(parse_error("{" + base + R"(,"kv_unified":false})"), "'kv_unified': false needs 'parallel'"));
+    CHECK(parse_single("{" + base + R"(,"kv_unified":false,"parallel":2})").kv_unified == false);
+    CHECK(parse_single("{" + base + R"(,"kv_unified":true})").kv_unified == true);
 }
 
 TEST_CASE("launch profile: a quantized V cache requires flash attention") {
@@ -158,10 +164,16 @@ TEST_CASE("launch profile: extra_args refuse host and port and credentials and d
     };
     for (const char* forbidden : {R"("--host","0.0.0.0")", R"("--port=9000")", R"("--api-key","k")",
                                   R"("--api-key-file","f")", R"("-hf","org/model")", R"("--model-url","u")",
-                                  R"("--")", R"("--host_x")", R"("--models-dir","d")"}) {
+                                  R"("--")", R"("--models-dir","d")",
+                                  // llama-server reads every '_' of a "--" flag as '-' (common/arg.cpp).
+                                  R"("--api_key","k")", R"("--api_key_file","f")", R"("--hf_repo","org/model")",
+                                  R"("--hf_token","t")", R"("--model_url","u")", R"("--models_dir","d")",
+                                  R"("--models_preset","p.ini")", R"("--spec_draft_hf","org/draft")"}) {
         CAPTURE(forbidden);
         CHECK(contains(parse_error(with(forbidden)), "must not contain"));
     }
+    // The refusal names the flag llama-server would have read.
+    CHECK(contains(parse_error(with(R"("--api_key","k")")), "--api_key, which llama-server reads as --api-key"));
     for (const auto& [flag, field] : std::vector<std::pair<std::string, std::string>>{
              {R"("-c","4096")", "ctx_size"},
              {R"("--ctx-size=4096")", "ctx_size"},
@@ -171,13 +183,25 @@ TEST_CASE("launch profile: extra_args refuse host and port and credentials and d
              {R"("--temp","0.7")", "sampling.temperature"},
              {R"("-m","other.gguf")", "model"},
              {R"("--alias","x")", "name"},
-             {R"("--spec-type","draft-mtp")", "speculative.types"}}) {
+             {R"("--spec-type","draft-mtp")", "speculative.types"},
+             // Underscore spellings: llama-server would take the last of
+             // `--ctx-size 65536 --ctx_size 262144`, so the fit check and
+             // /v1/models would describe a launch that does not happen.
+             {R"("--ctx_size","262144")", "ctx_size"},
+             {R"("--ctx_size=262144")", "ctx_size"},
+             {R"("--n_gpu_layers","99")", "n_gpu_layers"},
+             {R"("--cache_type_k","q8_0")", "cache_type_k"},
+             {R"("--no_kv_unified")", "kv_unified"},
+             {R"("--spec_draft_model","d.gguf")", "speculative.draft_model"},
+             {R"("--top_p","0.5")", "sampling.top_p"}}) {
         CAPTURE(flag);
         const std::string message = parse_error(with(flag));
         CHECK(contains(message, "use the typed field '" + field + "'"));
     }
     const LaunchProfile ok = parse_single(with(R"("--no-warmup","--override-kv","a=int:1")"));
     CHECK(ok.extra_args == std::vector<std::string>{"--no-warmup", "--override-kv", "a=int:1"});
+    // Allowed flags stay allowed under any spelling, and pass through verbatim.
+    CHECK(parse_single(with(R"("--no_warmup")")).extra_args == std::vector<std::string>{"--no_warmup"});
 }
 
 TEST_CASE("launch profile: extra_args refuse llama-server agent tools, MCP and file serving") {
@@ -187,14 +211,25 @@ TEST_CASE("launch profile: extra_args refuse llama-server agent tools, MCP and f
     for (const char* unsafe :
          {R"("--tools","all")", R"("--tools=exec_shell_command")", R"("--tools-runtime","ssh:host")",
           R"("--mcp-servers-config","m.json")", R"("--mcp-servers-json","{}")", R"("-ag")", R"("--agent")",
-          R"("--ui-mcp-proxy")", R"("--webui-mcp-proxy")", R"("--path","C:/")", R"("--media-path","D:/")"}) {
+          R"("--ui-mcp-proxy")", R"("--webui-mcp-proxy")", R"("--path","C:/")", R"("--media-path","D:/")",
+          // llama-server reads these as the hyphen spellings above; MCP
+          // servers in the JSON are started with the child.
+          R"("--mcp_servers_json","{}")", R"("--mcp_servers_config","m.json")", R"("--tools_runtime","ssh:host")",
+          R"("--ui_mcp_proxy")", R"("--webui_mcp_proxy")", R"("--media_path","D:/")"}) {
         CAPTURE(unsafe);
         CHECK(contains(parse_error(with(unsafe)), "agent tools, MCP and local file serving"));
     }
+    CHECK(contains(parse_error(with(R"("--mcp_servers_json","{}")")),
+                   "--mcp_servers_json, which llama-server reads as --mcp-servers-json"));
+    // The directory llama-server starts ffmpeg/ffprobe from (video input).
+    for (const char* program : {R"("--video-ffmpeg-dir","C:/tools")", R"("--video_ffmpeg_dir","C:/tools")"}) {
+        CAPTURE(program);
+        CHECK(contains(parse_error(with(program)), "cannot choose programs for llama-server to run"));
+    }
     // The disabling spellings stay allowed.
     const LaunchProfile ok =
-        parse_single(with(R"("--no-agent","-no-ag","--no-ui-mcp-proxy","--no-webui-mcp-proxy")"));
-    CHECK(ok.extra_args.size() == 4u);
+        parse_single(with(R"("--no-agent","-no-ag","--no-ui-mcp-proxy","--no-webui-mcp-proxy","--no_agent")"));
+    CHECK(ok.extra_args.size() == 5u);
 }
 
 TEST_CASE("launch profile: extra_args refuse model presets and prompt/log files") {
@@ -207,14 +242,17 @@ TEST_CASE("launch profile: extra_args refuse model presets and prompt/log files"
           R"("--fim-qwen-7b-default")", R"("--fim-qwen-7b-spec")", R"("--fim-qwen-14b-spec")",
           R"("--fim-qwen-30b-default")", R"("--gpt-oss-20b-default")", R"("--gpt-oss-120b-default")",
           R"("--vision-gemma-4b-default")", R"("--vision-gemma-12b-default")", R"("--spec-default")",
-          R"("--some-future-model-default")"}) {
+          R"("--some-future-model-default")",
+          // Underscore spellings select the same presets in llama-server.
+          R"("--gpt_oss_20b_default")", R"("--fim_qwen_7b_spec")", R"("--spec_default")"}) {
         CAPTURE(preset);
         CHECK(contains(parse_error(with(preset)), "built-in model presets"));
     }
     for (const char* writer : {R"("--log-file","C:/x.log")", R"("--log-file=x.log")",
                                R"("--log-prompts-dir","D:/prompts")", R"("--log-prompts-dir=p")",
                                R"("-lcd","C:/ngram.bin")", R"("--lookup-cache-dynamic","ngram.bin")",
-                               R"("--lookup-cache-dynamic=ngram.bin")"}) {
+                               R"("--lookup-cache-dynamic=ngram.bin")", R"("--log_prompts_dir","D:/prompts")",
+                               R"("--log_file","x.log")", R"("--lookup_cache_dynamic","ngram.bin")"}) {
         CAPTURE(writer);
         CHECK(contains(parse_error(with(writer)), "write logs or prompts to disk"));
     }
@@ -607,6 +645,50 @@ TEST_CASE("GGUF reader: malformed and truncated headers are rejected") {
     CHECK(si::read_gguf_model_info("definitely-missing-model.gguf").status().code() == si::ErrorCode::not_found);
 }
 
+TEST_CASE("GGUF reader: implausible ssm sizes and oversized names are refused without overflow") {
+    // 2 x groups x state = 2^63 overflowed a signed 64-bit product before.
+    GgufWriter huge;
+    huge.kv_str("general.architecture", "mamba2");
+    huge.kv_u32("mamba2.block_count", 2);
+    huge.kv_u32("mamba2.ssm.conv_kernel", 4);
+    huge.kv_u32("mamba2.ssm.inner_size", 4096);
+    huge.kv_u32("mamba2.ssm.state_size", 0x80000000u);
+    huge.kv_u32("mamba2.ssm.group_count", 0x80000000u);
+    const auto h = si::parse_gguf_model_info(huge.finish(0, 6));
+    CHECK_FALSE(h.ok());
+    CHECK(h.status().code() == si::ErrorCode::invalid_argument);
+    CHECK(contains(h.status().message(), "implausible mamba2.ssm.* sizes"));
+
+    // general.architecture is kept and quoted in messages: a short printable name.
+    for (const std::string& arch : {std::string(300, 'a'), std::string("llama\x1b[2J")}) {
+        CAPTURE(arch.size());
+        GgufWriter w;
+        w.kv_str("general.architecture", arch);
+        w.kv_u32(arch + ".block_count", 1);
+        const auto parsed = si::parse_gguf_model_info(w.finish(0, 2));
+        CHECK_FALSE(parsed.ok());
+        CHECK(contains(parsed.status().message(), "general.architecture must be at most 256 printable"));
+    }
+
+    // A key or tensor name quoted in an error (which reaches /v1/models
+    // `estimate_error`) is cut to 64 printable characters.
+    GgufWriter long_tensor;
+    long_tensor.kv_str("general.architecture", "llama");
+    long_tensor.kv_u32("llama.block_count", 1);
+    long_tensor.tensor(std::string(100000, 'x') + "\n", {32}, 99);
+    const std::string tensor_message = si::parse_gguf_model_info(long_tensor.finish(1, 2)).status().message();
+    CHECK(contains(tensor_message, "unknown ggml type 99"));
+    CHECK(tensor_message.size() < 200);
+    CHECK(tensor_message.find('\n') == std::string::npos);
+    GgufWriter long_key;
+    long_key.kv_str("general.architecture", "llama");
+    long_key.str(std::string(100000, 'k'));
+    long_key.u32(99);  // no such value type
+    const std::string key_message = si::parse_gguf_model_info(long_key.finish(0, 2)).status().message();
+    CHECK(contains(key_message, "unsupported value type"));
+    CHECK(key_message.size() < 200);
+}
+
 TEST_CASE("gguf: client-visible read errors do not carry the model path") {
     const std::string missing = "C:/Users/someone/models/secret-dir/missing.gguf";
     const auto status = si::read_gguf_model_info(missing).status();
@@ -812,6 +894,76 @@ TEST_CASE("VRAM estimate: the live MTP profile against the measured dedicated me
     }
 }
 
+TEST_CASE("VRAM estimate: a llamaserver profile without parallel counts llama-server's 4 automatic slots") {
+    // llama-server's --parallel defaults to -1 (auto): 4 slots with a unified
+    // KV cache (server.cpp, llama.cpp 7fe450e; the bundled 161755f29 logs
+    // "using n_parallel = 4 and kv_unified = true"). Every slot keeps its own
+    // recurrent state (n_seq_max x (1 + n_rs_seq) rows).
+    const auto live = [](std::optional<std::uint32_t> parallel) {
+        LaunchProfile p = parse_single(R"({
+            "name": "qwen3.8-27b-q3-mtp", "backend": "llamaserver", "model": "q3.gguf",
+            "n_gpu_layers": 999, "ctx_size": 65536, "batch_size": 2048, "ubatch_size": 512,
+            "flash_attn": "on", "cache_type_k": "q4_0", "cache_type_v": "q4_0", "fit": false,
+            "speculative": {"types": ["draft-mtp"], "draft_n_max": 2}})");
+        p.parallel = parallel;
+        return p;
+    };
+    const si::GgufModelInfo m = qwen38_q3();
+    const std::uint64_t snapshot = 48ull * 817152 * 4;  // one recurrent state: 149.6 MiB
+    const si::VramEstimate one = si::estimate_vram(m, live(1u));
+    const si::VramEstimate unset = si::estimate_vram(m, live(std::nullopt));
+    CHECK(one.recurrent_bytes == 1 * 3 * snapshot);    // 1 sequence x (1 + draft_n_max 2)
+    CHECK(unset.recurrent_bytes == 4 * 3 * snapshot);  // 4 automatic slots x 3
+    // The automatic slots share one unified pool of ctx tokens: same KV.
+    CHECK(unset.sequences == 1u);
+    CHECK(unset.kv_bytes == one.kv_bytes);
+    // +1,347 MiB on the live profile: 15,807 instead of 14,460 MiB on the real
+    // header, above the 16 GB card's default budget of 14,767 MiB.
+    CHECK(unset.total_bytes - one.total_bytes == 3 * 3 * snapshot);
+    // An explicit `parallel` is what runs.
+    CHECK(si::estimate_vram(m, live(2u)).recurrent_bytes == 2 * 3 * snapshot);
+    // The direct llamacpp backend decodes one sequence.
+    const LaunchProfile direct = parse_single(R"({"name":"d","backend":"llamacpp","model":"q3.gguf","ctx_size":65536})");
+    CHECK(si::estimate_vram(m, direct).recurrent_bytes == snapshot);
+}
+
+TEST_CASE("VRAM estimate: placement flags in extra_args are noted under the name llama-server reads") {
+    for (const char* flag : {"--override-tensor", "--override_tensor", "--n_cpu_moe", "--tensor_split", "--split_mode"}) {
+        CAPTURE(flag);
+        const LaunchProfile p = parse_single(R"({"name":"p","backend":"llamaserver","model":"m.gguf","ctx_size":4096,)"
+                                             R"("parallel":1,"extra_args":[")" +
+                                             std::string(flag) + R"(","x"]})");
+        bool noted = false;
+        for (const auto& note : si::estimate_vram(qwen38_q3(), p).notes) {
+            noted = noted || contains(note, "placement flags in extra_args");
+        }
+        CHECK(noted);
+    }
+}
+
+TEST_CASE("VRAM estimate: crafted sizes saturate instead of overflowing") {
+    // KV arithmetic runs in double; a cast of a value past 2^64 back to an
+    // integer was undefined behaviour.
+    si::GgufModelInfo wide;
+    wide.architecture = "llama";
+    wide.block_count = 2;
+    wide.embedding_length = 64;
+    wide.key_length = std::uint64_t{1} << 62;
+    wide.value_length = std::uint64_t{1} << 62;
+    wide.kv_heads = {1u << 31, 1u << 31};
+    wide.block_bytes = {1, 1};
+    const LaunchProfile p = parse_single(R"({"name":"w","backend":"llamaserver","model":"m.gguf","ctx_size":1048576})");
+    const si::VramEstimate e = si::estimate_vram(wide, p);
+    CHECK(e.kv_bytes_per_token == std::numeric_limits<std::uint64_t>::max());
+    CHECK(e.kv_bytes == std::numeric_limits<std::uint64_t>::max());
+    // MiB round up without wrapping to 0 near 2^64.
+    si::VramEstimate near_max;
+    near_max.total_bytes = std::numeric_limits<std::uint64_t>::max();
+    CHECK(near_max.total_mib() == (std::uint64_t{1} << 44));
+    near_max.total_bytes = (std::uint64_t{1} << 20) + 1;
+    CHECK(near_max.total_mib() == 2u);
+}
+
 TEST_CASE("VRAM estimate: attention-only models count every layer and ctx 0 uses the training context") {
     si::GgufModelInfo m;
     m.architecture = "llama";
@@ -842,14 +994,18 @@ TEST_CASE("VRAM estimate: the GGUF fixture round-trips through the estimator") {
     CHECK(e.attention_layers == 2u);
     CHECK(e.kv_bytes_per_token == 2u * 2 * (16 * 2 + 32 * 2));
     CHECK(e.kv_bytes == e.kv_bytes_per_token * 512);
-    CHECK(e.recurrent_bytes == 2u * (3u * 64 + 256) * 4);
+    // Two delta-net blocks; `parallel` unset: llama-server's 4 automatic slots.
+    CHECK(e.recurrent_bytes == 4u * 2u * (3u * 64 + 256) * 4);
 }
 
-// Opt-in: SONDER_TEST_GGUF=<path to a GGUF (a header-only copy is enough)>.
-TEST_CASE("VRAM estimate: a real GGUF header (opt-in)") {
+// Opt-in diagnostic, not a check: SONDER_TEST_GGUF=<path to a GGUF (a
+// header-only copy is enough)> prints the estimate for a real model. Without
+// the variable doctest skips it, so it is neither listed (CTest does not
+// register it) nor counted as a pass.
+TEST_CASE("VRAM estimate: a real GGUF header (opt-in)" * doctest::skip(std::getenv("SONDER_TEST_GGUF") == nullptr)) {
     const char* path = std::getenv("SONDER_TEST_GGUF");
     if (path == nullptr || *path == '\0') {
-        MESSAGE("SONDER_TEST_GGUF not set; skipped");
+        MESSAGE("SONDER_TEST_GGUF is empty; nothing to print");
         return;
     }
     auto info = si::read_gguf_model_info(path);
@@ -1329,6 +1485,73 @@ TEST_CASE("serve_main: --profile refuses the llama.cpp context flags its typed f
             CHECK(serve({"--profiles", pf, "--profile", name, flag, value, "--max-connections", "0"}, err) == 2);
             CHECK(contains(err, flag + " conflicts with --profile (set the profile's typed fields)"));
         }
+    }
+    std::filesystem::remove(model);
+    std::filesystem::remove(profiles);
+}
+
+TEST_CASE("serve_main: --vram-budget-mib overrides the profile's vram_budget_mib") {
+    // The fixture needs the 256 MiB runtime allowance: 100 MiB never fits,
+    // 100000 MiB always does.
+    const auto model = write_temp("model.gguf", hybrid_fixture());
+    const std::string m = model.generic_string();
+    const std::string fixed = R"(","ctx_size":512,"n_gpu_layers":-1,"fit":false,"vram_budget_mib":)";
+    const auto profiles = write_temp("profiles.json", R"({"profiles":[
+        {"name":"loose","backend":"llamaserver","model":")" + m + fixed + R"(100000},
+        {"name":"tight","backend":"llamaserver","model":")" + m + fixed + R"(100}]})");
+    const std::string pf = profiles.string();
+    // `--max-connections 0` is a later usage error: a profile that passes the
+    // fit check exits there instead of starting llama-server.
+    const auto run = [&pf](const std::string& name, const std::optional<std::string>& budget, std::string& err) {
+        std::vector<std::string> args{"--profiles", pf, "--profile", name, "--llamaserver-executable",
+                                      "llama-server-not-started", "--max-connections", "0"};
+        if (budget) {
+            args.emplace_back("--vram-budget-mib");
+            args.push_back(*budget);
+        }
+        return serve(args, err);
+    };
+    std::string err;
+    // A budget tightened on the command line applies over the profile's.
+    CHECK(run("loose", std::string("100"), err) == 2);
+    CHECK(contains(err, "does not fit"));
+    CHECK(contains(err, "vs budget 100 MiB"));
+    // A looser one too: the profile gets past the fit check.
+    CHECK(run("tight", std::string("100000"), err) == 2);
+    CHECK_FALSE(contains(err, "does not fit"));
+    CHECK(contains(err, "--max-connections must be from 1 to 100000"));
+    // Without the flag, each profile's own budget applies.
+    CHECK(run("tight", std::nullopt, err) == 2);
+    CHECK(contains(err, "vs budget 100 MiB"));
+    CHECK(run("loose", std::nullopt, err) == 2);
+    CHECK_FALSE(contains(err, "does not fit"));
+    CHECK(contains(err, "--max-connections must be from 1 to 100000"));
+    std::filesystem::remove(model);
+    std::filesystem::remove(profiles);
+}
+
+TEST_CASE("serve_main: a llamaserver profile refuses the llamacpp-only tensor placement flags") {
+    const auto model = write_temp("model.gguf", hybrid_fixture());
+    const std::string m = model.generic_string();
+    const auto profiles = write_temp("profiles.json", R"({"profiles":[
+        {"name":"server","backend":"llamaserver","model":")" + m + R"(","ctx_size":512},
+        {"name":"direct","backend":"llamacpp","model":")" + m + R"(","ctx_size":512}]})");
+    const std::string pf = profiles.string();
+    std::string err;
+    for (const auto& [flag, value] : std::vector<std::pair<std::string, std::string>>{
+             {"--moe-experts", "cpu"}, {"--tensor-override", "ffn_.*_exps=cpu"}}) {
+        CAPTURE(flag);
+        // `--max-connections 0` is a later usage error, so a missing check
+        // exits with another message instead of serving.
+        CHECK(serve({"--profiles", pf, "--profile", "server", flag, value, "--llamaserver-executable",
+                     "llama-server-not-started", "--max-connections", "0"},
+                    err) == 2);
+        CHECK(contains(err, "option " + flag + " applies only to --backend llamacpp; for llamaserver launch profile "
+                                               "'server' put llama-server's own flag (-ot, --cpu-moe) in extra_args"));
+        // The direct backend reads them: a llamacpp profile still takes them.
+        CHECK(serve({"--profiles", pf, "--profile", "direct", flag, value, "--max-connections", "0"}, err) == 2);
+        CHECK_FALSE(contains(err, "applies only to --backend llamacpp"));
+        CHECK(contains(err, "--max-connections must be from 1 to 100000"));
     }
     std::filesystem::remove(model);
     std::filesystem::remove(profiles);

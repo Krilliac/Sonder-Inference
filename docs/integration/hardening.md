@@ -38,7 +38,7 @@ the sanitizer/libFuzzer runtimes). `vm.mmap_rnd_bits=28` is set because
 
 ### `fuzz/`
 
-Five libFuzzer targets (see `fuzz/README.md` for invariants and input
+Seven libFuzzer targets (see `fuzz/README.md` for invariants and input
 formats), seed corpora under `fuzz/corpus/<target>/`, and
 `fuzz/CMakeLists.txt`:
 
@@ -51,6 +51,11 @@ formats), seed corpora under `fuzz/corpus/<target>/`, and
   recording/replay format in the tree.
 * `sonder_fuzz_json`: the shared JSON parser/serializer under all of the above.
 * `sonder_fuzz_bench_report`: `render_markdown` / `default_result_stem`.
+* `sonder_fuzz_http_request`: the `sonder-infer serve` request front end
+  (request head, query, Host check, correlation headers, chat request).
+* `sonder_fuzz_gguf`: the launch-profile GGUF header reader
+  (`parse_gguf_model_info`) and `estimate_vram` on what it accepts. Model
+  files come from the internet, and the reader's errors reach `/v1/models`.
 
 `fuzz/CMakeLists.txt` works in two modes:
 

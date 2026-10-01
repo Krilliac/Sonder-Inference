@@ -11,6 +11,7 @@ libFuzzer targets for Sonder Inference's parsers and serializers. Owner:
 | `sonder_fuzz_bench_report` | `bench::render_markdown`, `bench::default_result_stem` | stem is filesystem-safe |
 | `sonder_fuzz_telemetry_envelope` | `TelemetryBus::make_envelope` + dump (the JSONL recording format) | one line per event; round-trips schema/event_type/session_id/attributes; UTF-8 preserved |
 | `sonder_fuzz_http_request` | `sonder-infer serve` front end: `parse_request_head`, query decoding, Host check, correlation headers, `parse_chat_request` (`src/server/src/http.cpp`, `openai.cpp`) | complete heads stay within 16 KiB / 64 headers with origin-form paths; errors are 400/431/505; accepted chat requests pass message and sampling validation; accepted correlation values match the pinned pattern |
+| `sonder_fuzz_gguf` | launch-profile GGUF header reader `parse_gguf_model_info` and `estimate_vram` on what it accepts (`src/server/src/vram_estimate.cpp`) | errors are `invalid_argument` "GGUF header: ..." under 1 KiB (file text cut short; they reach `/v1/models`); accepted headers have a printable architecture of at most 256 bytes, 1..100000 blocks and per-block vectors of that length; the estimate's total is the sum of its parts |
 
 There is no separate recording/replay serializer in the tree today; the
 telemetry JSONL envelope is the recording format, so that is what is fuzzed.
@@ -53,6 +54,10 @@ disables line-ending normalization so seeds stay byte-exact. Input formats:
 * `telemetry_envelope`: up to 7 newline-terminated fields (event_type,
   session_id, run_id, request_id, agent_id, task_id, model_instance_id), then
   a JSON document used as the event attributes.
+* `gguf`: the first bytes of a GGUF v3 file (magic, counts, metadata, tensor
+  table). Seeds are small synthetic headers: a qwen35 hybrid with ssm.* keys
+  and attention tensors, a llama header with per-layer KV head counts and an
+  MTP block, and a truncated copy.
 
 Add a minimized reproducer here (`-minimize_crash=1`) whenever a fuzz bug is
 fixed, so `fuzz-regress` keeps covering it.
