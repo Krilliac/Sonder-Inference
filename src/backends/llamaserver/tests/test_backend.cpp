@@ -56,6 +56,46 @@ TEST_SUITE("llamaserver_backend") {
         CHECK(server.props_requests() == props_reads);
     }
 
+    TEST_CASE("single-slot or disabled affinity omits id_slot during overlapping keyed chats") {
+        sonder_test::FakeLlamaServer server;
+        server.set_body("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"
+                        "data: [DONE]\n\n");
+        LlamaServerBackendOptions options;
+        options.base_url = server.url();
+        SUBCASE("one slot with default affinity") {
+            server.set_props(R"({"default_generation_settings":{"n_ctx":8192},"total_slots":1})");
+        }
+        SUBCASE("two slots with affinity disabled") {
+            server.set_props(R"({"default_generation_settings":{"n_ctx":8192},"total_slots":2})");
+            options.slot_affinity = false;
+        }
+        auto model = make_llamaserver_backend(options)->load_model({"fake-model", "cpu:0"});
+        REQUIRE(model.ok());
+        ChatRequest request;
+        request.messages = {{"user", "hi"}};
+        request.session_key = "a";
+        int callbacks = 0;
+        auto result = model.value()->chat(request, {}, [&](const TokenChunk &) {
+            ++callbacks;
+            CHECK(model.value()->chat(request, {}, {}).ok());
+            auto other = request;
+            other.session_key = "b";
+            CHECK(model.value()->chat(other, {}, {}).ok());
+            return true;
+        });
+        REQUIRE(result.ok());
+        CHECK(callbacks == 1);
+        const auto bodies = server.bodies();
+        REQUIRE(bodies.size() == 3);
+        for (const auto &body : bodies) {
+            const auto parsed = json::parse(body);
+            REQUIRE(parsed.ok());
+            CHECK(parsed->find("id_slot") == nullptr);
+            REQUIRE(parsed->find("cache_prompt"));
+            CHECK(parsed->find("cache_prompt")->as_bool());
+        }
+    }
+
     TEST_CASE("sampling emits only explicitly selected values") {
         GenerateRequest req;
         req.prompt = "hello";

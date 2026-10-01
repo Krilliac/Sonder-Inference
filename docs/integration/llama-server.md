@@ -132,20 +132,36 @@ back only to a checkpoint, so landing on the wrong slot means a full re-read
 (about 2 minutes for 100k tokens, against 0.13 s for a 121k-token reuse).
 In native mode (`native_completion`, the default) every request sends
 `"cache_prompt": true`, and with `slot_affinity` (default true; JSON
-`"slot_affinity"`) a chat's `ChatRequest::session_key` is pinned to one slot
-with `id_slot`:
+`"slot_affinity"`) a chat's `ChatRequest::session_key` can reuse an idle slot
+with `id_slot` when the upstream has more than one slot:
 
 - The server fills `session_key` from `prompt_cache_key`, else from
   `X-Sonder-Run-Id` / `X-Sonder-Agent-Id` (`run=<id>;agent=<id>`), so each
   agent of a run keeps its own slot. No key: no `id_slot` (llama-server picks
   an idle slot by prompt similarity, as before).
-- A known key keeps its slot, even while its previous turn still runs.
+- A known key pins its owned slot only while idle (`hit`). If its previous
+  turn still runs, the request omits `id_slot` (`busy_unpinned`), letting
+  llama-server select or defer safely. The key keeps ownership for its next
+  call; an unpinned request does not release the running request's busy mark.
 - A new key prefers a successfully warmed slot no key owns (when warm-up is
   enabled), then takes the lowest slot no key owns, else the slot of the least
-  recently used key whose slot is idle. When every slot is owned and busy the
-  request is not pinned. The map holds one key per slot (at most 1024).
-- With one slot (`total_slots` 1) every keyed chat uses slot 0; with an
-  unknown slot count nothing is pinned.
+  recently used key whose slot is idle. It never takes a busy slot: unowned
+  idle slots report `new`, and replacing an idle owner reports `stolen`.
+  When every slot is busy the request is not pinned (`busy_unpinned`). The
+  map holds one key per slot (at most 1024).
+- With one slot (`total_slots` 1), keyed chats omit `id_slot` (`single_slot`):
+  pinning buys no affinity and can trigger prompt save/load on a busy slot.
+  With an unknown slot count nothing is pinned.
+
+llama.cpp consolidated explicit-id selection and prompt-cache updates in
+`get_available_slot` ([PR #24755](https://github.com/ggml-org/llama.cpp/pull/24755)).
+Omitting a busy pin avoids forcing that slot through the prompt-cache path.
+Busy here means a request holding a lease in this backend; affinity does not
+observe other clients talking directly to the upstream. For proxy-side
+serialization, use `sonder-infer serve --priority-admission on --backend-capacity 1`
+alongside the usual backend options. Disabling affinity with JSON
+`"slot_affinity": false` also omits `id_slot`; its option name and default
+remain unchanged.
 
 Generic OpenAI mode (`native_completion: false`) sends neither field, since
 strict OpenAI-compatible servers reject unknown parameters. Raw completions

@@ -194,7 +194,7 @@ TEST_SUITE("llamaserver_request_path") {
         CHECK(body.find("id_slot") == nullptr);
     }
 
-    TEST_CASE("a single-slot server pins every keyed chat to slot 0") {
+    TEST_CASE("a single-slot server leaves every keyed chat unpinned") {
         sonder_test::FakeLlamaServer server;
         server.set_props(R"({"default_generation_settings":{"n_ctx":8192},"total_slots":1})");
         server.set_body(kPlainChatStream);
@@ -203,8 +203,48 @@ TEST_SUITE("llamaserver_request_path") {
         auto model = load(make_llamaserver_backend(o));
         for (const char *key : {"a", "b", "c", "a"}) {
             REQUIRE(model->chat(chat(key), {}, {}).ok());
-            CHECK(last_slot(server) == 0);
+            CHECK(last_slot(server) == -1);
+            const auto body = parse(server.last_body());
+            REQUIRE(body.find("cache_prompt"));
+            CHECK(body.find("cache_prompt")->as_bool());
         }
+    }
+
+    TEST_CASE("overlapping keyed chats never pin a busy slot and reuse ownership after release") {
+        sonder_test::FakeLlamaServer server;
+        server.set_props(R"({"default_generation_settings":{"n_ctx":8192},"total_slots":2})");
+        server.set_body(kPlainChatStream);
+        LlamaServerBackendOptions o;
+        o.base_url = server.url();
+        auto model = load(make_llamaserver_backend(o));
+        int a_callbacks = 0, b_callbacks = 0;
+        // Reentrant calls keep both outer request leases alive without sleeps
+        // or timing races. The fake handles HTTP only, never slot selection.
+        auto a = model->chat(chat("a"), {}, [&](const TokenChunk &) {
+            ++a_callbacks;
+            CHECK(last_slot(server) == 0);
+            auto b = model->chat(chat("b"), {}, [&](const TokenChunk &) {
+                ++b_callbacks;
+                CHECK(last_slot(server) == 1);
+                CHECK(model->chat(chat("a"), {}, {}).ok());
+                CHECK(last_slot(server) == -1); // known busy key
+                CHECK(model->chat(chat("c"), {}, {}).ok());
+                CHECK(last_slot(server) == -1); // no new key can take a busy slot
+                CHECK(model->chat(chat("a"), {}, {}).ok());
+                CHECK(last_slot(server) == -1); // unpinned completion did not release A
+                return true;
+            });
+            CHECK(b.ok());
+            CHECK(model->chat(chat("c"), {}, {}).ok());
+            CHECK(last_slot(server) == 1); // steal B's idle slot, never A's busy slot
+            return true;
+        });
+        REQUIRE(a.ok());
+        CHECK(a_callbacks == 1);
+        CHECK(b_callbacks == 1);
+        REQUIRE(model->chat(chat("a"), {}, {}).ok());
+        CHECK(last_slot(server) == 0);
+        CHECK(server.bodies().size() == 7);
     }
 
     TEST_CASE("generic OpenAI mode and disabled affinity send no llama.cpp-only fields") {
@@ -308,7 +348,7 @@ TEST_SUITE("llamaserver_request_path") {
         CHECK(merged->draft_n == std::optional<std::uint64_t>(4));
     }
 
-    TEST_CASE("slot affinity keeps busy slots, evicts the least recently used idle key and is bounded") {
+    TEST_CASE("slot affinity keeps ownership, evicts the least recently used idle key and is bounded") {
         llamaserver::SlotAffinity a;
         CHECK_FALSE(a.acquire("", 4).slot());
         CHECK_FALSE(a.acquire("k", 0).slot());
@@ -319,9 +359,10 @@ TEST_SUITE("llamaserver_request_path") {
             CHECK(y.slot() == std::optional<std::uint32_t>(1));
             // Both slots owned and busy: a new key is not pinned.
             CHECK_FALSE(a.acquire("z", 2).slot());
-            // A known key keeps its slot even while busy.
+            // A known busy key keeps ownership without pinning the request.
             auto x2 = a.acquire("x", 2);
-            CHECK(x2.slot() == std::optional<std::uint32_t>(0));
+            CHECK_FALSE(x2.slot());
+            CHECK(a.owned_slot("x") == std::optional<std::uint32_t>(0));
         }
         // All idle now; "y" is the least recently used, so "z" takes slot 1.
         CHECK(a.acquire("z", 2).slot() == std::optional<std::uint32_t>(1));
@@ -653,4 +694,179 @@ TEST_SUITE("llamaserver_request_path") {
         srv.stop();
     }
 #endif
+}
+
+TEST_SUITE("llamaserver_slot_affinity") {
+    TEST_CASE("empty keys and unknown counts do not consume or release existing slots") {
+        llamaserver::SlotAffinity affinity;
+        auto a = affinity.acquire("a", 2);
+        CHECK_FALSE(affinity.acquire("", 3).slot());
+        CHECK_FALSE(affinity.acquire("b", 0).slot());
+        CHECK(affinity.keys() == 1);
+        CHECK(affinity.owned_slot("a") == std::optional<std::uint32_t>(0));
+        CHECK_FALSE(affinity.acquire("a", 2).slot());
+        auto b = affinity.acquire("b", 2);
+        CHECK(b.slot() == std::optional<std::uint32_t>(1));
+    }
+
+    TEST_CASE("slot counts above the cap share a bounded layout without releasing busy slots") {
+        llamaserver::SlotAffinity affinity;
+        constexpr auto cap = llamaserver::SlotAffinity::kMaxSlots;
+        auto a = affinity.acquire("a", cap + 1u, {cap, cap - 1u});
+        CHECK(a.slot() == std::optional<std::uint32_t>(cap - 1u));
+        auto b = affinity.acquire("b", cap + 2u, {cap});
+        CHECK(b.slot() == std::optional<std::uint32_t>(0));
+        CHECK_FALSE(affinity.acquire("a", cap).slot());
+        CHECK(affinity.keys() == 2);
+        a.reset();
+        auto resumed = affinity.acquire("a", cap);
+        CHECK(resumed.slot() == std::optional<std::uint32_t>(cap - 1u));
+    }
+
+    TEST_CASE("lease outcomes distinguish skipped busy new hit and stolen requests") {
+        llamaserver::SlotAffinity affinity;
+        CHECK(affinity.acquire("", 2).outcome() == "none");
+        CHECK(affinity.acquire("a", 0).outcome() == "none");
+        auto single = affinity.acquire("a", 1);
+        CHECK(single.outcome() == "single_slot");
+        CHECK_FALSE(single.slot());
+        auto a = affinity.acquire("a", 2);
+        CHECK(a.outcome() == "new");
+        CHECK(a.slot() == std::optional<std::uint32_t>(0));
+        auto again = affinity.acquire("a", 2);
+        CHECK(again.outcome() == "busy_unpinned");
+        CHECK_FALSE(again.slot());
+        auto b = affinity.acquire("b", 2);
+        CHECK(b.outcome() == "new");
+        auto full = affinity.acquire("c", 2);
+        CHECK(full.outcome() == "busy_unpinned");
+        CHECK_FALSE(full.slot());
+        a.reset();
+        auto hit = affinity.acquire("a", 2);
+        CHECK(hit.outcome() == "hit");
+        CHECK(hit.slot() == std::optional<std::uint32_t>(0));
+        b.reset();
+        auto stolen = affinity.acquire("c", 2);
+        CHECK(stolen.outcome() == "stolen");
+        CHECK(stolen.slot() == std::optional<std::uint32_t>(1));
+        CHECK_FALSE(affinity.owned_slot("b"));
+    }
+
+    TEST_CASE("lease moves carry pinned and unpinned outcomes and reset clears them") {
+        llamaserver::SlotAffinity affinity;
+        llamaserver::SlotAffinity::Lease lease;
+        CHECK(lease.outcome() == "none");
+        auto a = affinity.acquire("a", 2);
+        lease = std::move(a);
+        CHECK(lease.outcome() == "new");
+        CHECK(a.outcome() == "none");
+        auto busy = affinity.acquire("a", 2);
+        auto moved_busy = std::move(busy);
+        CHECK(moved_busy.outcome() == "busy_unpinned");
+        CHECK_FALSE(moved_busy.slot());
+        CHECK(busy.outcome() == "none");
+        lease = std::move(moved_busy); // release the destination's pinned slot
+        CHECK(lease.outcome() == "busy_unpinned");
+        CHECK_FALSE(lease.slot());
+        CHECK(moved_busy.outcome() == "none");
+        CHECK(affinity.acquire("a", 2).outcome() == "hit");
+        lease.reset();
+        CHECK(lease.outcome() == "none");
+    }
+
+    TEST_CASE("one slot never pins or assigns ownership even with a warmed preference") {
+        llamaserver::SlotAffinity affinity;
+        auto a = affinity.acquire("a", 1);
+        auto b = affinity.acquire("b", 1, {0});
+        auto again = affinity.acquire("a", 1);
+        CHECK_FALSE(a.slot());
+        CHECK_FALSE(b.slot());
+        CHECK_FALSE(again.slot());
+        CHECK_FALSE(affinity.owned_slot("a"));
+        CHECK(affinity.keys() == 0);
+    }
+
+    TEST_CASE("a busy key stays unpinned even when another slot is idle") {
+        llamaserver::SlotAffinity affinity;
+        auto a = affinity.acquire("a", 2);
+        REQUIRE(a.slot() == std::optional<std::uint32_t>(0));
+        auto again = affinity.acquire("a", 2);
+        CHECK_FALSE(again.slot());
+        CHECK(affinity.owned_slot("a") == a.slot());
+        again.reset();
+        CHECK_FALSE(affinity.acquire("a", 2).slot());
+        auto b = affinity.acquire("b", 2);
+        REQUIRE(b.slot() == std::optional<std::uint32_t>(1));
+        CHECK_FALSE(affinity.acquire("c", 2).slot());
+        CHECK_FALSE(affinity.owned_slot("c"));
+        a.reset();
+        auto resumed = affinity.acquire("a", 2);
+        CHECK(resumed.slot() == std::optional<std::uint32_t>(0));
+        CHECK(affinity.keys() == 2);
+    }
+
+    TEST_CASE("stealing chooses the least recently used idle slot and skips busy owners") {
+        llamaserver::SlotAffinity affinity;
+        auto a = affinity.acquire("a", 3);
+        auto b = affinity.acquire("b", 3);
+        auto c = affinity.acquire("c", 3);
+        b.reset();
+        c.reset();
+        auto d = affinity.acquire("d", 3);
+        CHECK(d.slot() == std::optional<std::uint32_t>(1));
+        CHECK_FALSE(affinity.owned_slot("b"));
+        CHECK(affinity.owned_slot("a") == std::optional<std::uint32_t>(0));
+        auto e = affinity.acquire("e", 3);
+        CHECK(e.slot() == std::optional<std::uint32_t>(2));
+        CHECK_FALSE(affinity.owned_slot("c"));
+        CHECK_FALSE(affinity.acquire("f", 3).slot());
+        CHECK(affinity.keys() == 3);
+    }
+
+    TEST_CASE("warmed preferences never take owned busy slots or redirect known keys") {
+        llamaserver::SlotAffinity affinity;
+        auto a = affinity.acquire("a", 3, {99, 2});
+        CHECK(a.slot() == std::optional<std::uint32_t>(2));
+        auto b = affinity.acquire("b", 3, {2, 99, 1});
+        CHECK(b.slot() == std::optional<std::uint32_t>(1));
+        auto c = affinity.acquire("c", 3, {2, 1, 99});
+        CHECK(c.slot() == std::optional<std::uint32_t>(0));
+        CHECK_FALSE(affinity.acquire("a", 3, {0}).slot());
+        a.reset();
+        CHECK(affinity.acquire("a", 3, {0}).slot() == std::optional<std::uint32_t>(2));
+    }
+
+    TEST_CASE("moves transfer the busy mark and overwriting releases the previous lease") {
+        llamaserver::SlotAffinity affinity;
+        auto a = affinity.acquire("a", 2);
+        auto b = affinity.acquire("b", 2);
+        auto moved = std::move(a);
+        CHECK_FALSE(a.slot());
+        a.reset();
+        CHECK_FALSE(affinity.acquire("a", 2).slot());
+        moved = std::move(b);
+        CHECK_FALSE(b.slot());
+        CHECK(moved.slot() == std::optional<std::uint32_t>(1));
+        auto resumed = affinity.acquire("a", 2);
+        CHECK(resumed.slot() == std::optional<std::uint32_t>(0));
+        CHECK_FALSE(affinity.acquire("b", 2).slot());
+        moved.reset();
+        moved.reset();
+        CHECK(affinity.acquire("b", 2).slot() == std::optional<std::uint32_t>(1));
+    }
+
+    TEST_CASE("one-slot transitions invalidate old leases before returning to multiple slots") {
+        llamaserver::SlotAffinity affinity;
+        auto stale = affinity.acquire("old", 2);
+        auto single = affinity.acquire("single", 1);
+        CHECK_FALSE(single.slot());
+        CHECK(affinity.keys() == 0);
+        auto current = affinity.acquire("current", 2);
+        REQUIRE(current.slot() == std::optional<std::uint32_t>(0));
+        stale.reset();
+        CHECK_FALSE(affinity.acquire("current", 2).slot());
+        CHECK_FALSE(affinity.owned_slot("old"));
+        current.reset();
+        CHECK(affinity.acquire("current", 2).slot() == std::optional<std::uint32_t>(0));
+    }
 }
