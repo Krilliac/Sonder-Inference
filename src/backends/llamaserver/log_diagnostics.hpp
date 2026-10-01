@@ -92,7 +92,7 @@ class LogDiagnostics {
 // it). Never throws; I/O problems are reported through the Status.
 class LogTail {
   public:
-    explicit LogTail(std::string path) : path_(std::move(path)) {}
+    explicit LogTail(std::string path, bool utf8 = false) : path_(std::move(path)), utf8_(utf8) {}
     [[nodiscard]] const std::string &path() const noexcept { return path_; }
     void rewind() noexcept { offset_ = 0; }
     Status poll(LogDiagnostics &sink, std::size_t max_bytes = 256 * 1024);
@@ -100,6 +100,7 @@ class LogTail {
   private:
     std::string path_;
     std::uint64_t offset_ = 0;
+    bool utf8_ = false; // default preserves existing native path interpretation
 };
 
 } // namespace sonder::inference::llamaserver

@@ -2,13 +2,20 @@
 # No llama.cpp sources, common library, executable or model downloads.
 sonder_module_sources(
     gpu_memory.cpp
+    gpu_residency.cpp
     llamaserver_backend.cpp
     llamaserver_protocol.cpp
     log_diagnostics.cpp
     process.cpp
+    process_options.cpp
     prefix_warmup.cpp
     slot_affinity.cpp
-    supervisor.cpp)
+    supervisor.cpp
+    supervisor_residency.cpp
+    tune.cpp
+    tune_main.cpp
+    tune_model.cpp
+    tune_runner.cpp)
 sonder_module_include_directories(include)
 sonder_module_define(SONDER_HAS_LLAMASERVER_BACKEND)
 if(WIN32)

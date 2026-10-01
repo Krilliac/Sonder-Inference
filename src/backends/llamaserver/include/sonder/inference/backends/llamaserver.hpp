@@ -1,11 +1,14 @@
 // External llama-server / OpenAI-compatible upstream, without llama.cpp linkage.
 #pragma once
 
+#include "sonder/inference/backends/llamaserver_residency.hpp"
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "sonder/inference/backend.hpp"
@@ -54,6 +57,7 @@ struct LlamaServerSpillGuardOptions {
     std::uint64_t fit_step_align = 1024;
     std::uint64_t fit_min_ctx = 8192;
     std::size_t fit_max_attempts = 4;
+    LlamaServerResidencyGuardOptions residency;
 };
 
 struct LlamaServerDiagnosticsOptions {
@@ -111,6 +115,8 @@ struct LlamaServerBackendOptions {
     // Spawn mode only. Reported through Backend::runtime_status().
     LlamaServerSpillGuardOptions spill_guard;
     LlamaServerDiagnosticsOptions diagnostics;
+    // Additive child-only environment overrides; empty inherits unchanged.
+    std::vector<std::pair<std::string, std::string>> environment;
     LlamaServerWarmupOptions warmup;
 };
 

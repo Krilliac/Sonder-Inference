@@ -61,6 +61,9 @@ Gate: measurable win on agent fan-out/long-context workloads without interactive
 - [x] llamaserver slot prefix warm-up after readiness and supervised restart
   (bounded, per-slot, cancellable; `docs/integration/llama-server.md`)
 - [ ] adaptive speculation policy
+- [x] `sonder-infer tune`: bounded llama-server calibration, PDH spill qualification,
+  per-profile context margin, and spawn-config output with two recommendations
+  ([usage and qualification limits](integration/tune.md)); live performance validation pending
 - [ ] CPU KV spill
 - [ ] cache quantization where supported
 - [x] tensor placement overrides (MoE experts in RAM; `docs/PLACEMENT.md` step 1)

@@ -5,6 +5,7 @@
 #include "../log_diagnostics.hpp"
 #include "../supervisor.hpp"
 #include "fake_process.hpp"
+#include "fake_gpu_memory.hpp"
 #include "sonder/inference/backends/llamaserver.hpp"
 
 #include <doctest/doctest.h>
@@ -61,23 +62,6 @@ GpuProcessCounters counters(std::uint32_t pid, std::uint64_t dedicated, std::uin
     c.shared = {{instance(pid), shared}, {instance(pid, "0x000118C2"), 0}};
     return c;
 }
-
-class FakeCounters final : public GpuCounterSource {
-  public:
-    using Fn = std::function<Result<GpuProcessCounters>(std::uint32_t)>;
-    explicit FakeCounters(Fn fn, bool is_supported = true) : fn_(std::move(fn)), supported_(is_supported) {}
-    std::string name() const override { return "fake"; }
-    bool supported() const override { return supported_; }
-    Result<GpuProcessCounters> read(std::uint32_t pid) override {
-        reads.fetch_add(1);
-        return fn_(pid);
-    }
-    std::atomic<unsigned> reads{0};
-
-  private:
-    Fn fn_;
-    bool supported_;
-};
 
 // Shared usage as a function of the launched child's --ctx-size: children
 // above `limit` spill (388 MiB, measured), the others stay clean (182 MiB).

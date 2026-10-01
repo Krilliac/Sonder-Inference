@@ -15,6 +15,7 @@ sonder_module_sources(
     src/priority_admission.cpp
     src/residency.cpp
     src/request_path.cpp
+    src/residency_config.cpp
     src/serve_main.cpp
     src/server.cpp
     src/sha256.cpp
@@ -35,6 +36,7 @@ sonder_add_module_tests(server
     tests/test_server_faults.cpp
     tests/test_server_residency.cpp
     tests/test_server_runtime.cpp
+    tests/test_residency_config.cpp
     tests/test_server_request_path.cpp
     tests/test_priority_parsing.cpp
     tests/test_priority_admission.cpp

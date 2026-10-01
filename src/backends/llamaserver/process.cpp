@@ -1,4 +1,5 @@
 #include "process.hpp"
+#include "process_options.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -135,13 +136,15 @@ class WindowsLauncher final : public ProcessLauncher {
         }
         if (command.size() >= 32767)
             return Status(ErrorCode::invalid_argument, "command line is too long");
-        STARTUPINFOW si{};
-        si.cb = sizeof(si);
+        ProcessOptions extra;
+        if (auto st = extra.prepare(spec); !st.ok()) return st;
         PROCESS_INFORMATION pi{};
         auto mutable_command = command;
-        if (!CreateProcessW(executable.c_str(), mutable_command.data(), nullptr, nullptr, FALSE,
-                            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, nullptr,
-                            nullptr, &si, &pi)) {
+        if (!CreateProcessW(executable.c_str(), mutable_command.data(), nullptr, nullptr, extra.redirect ? TRUE : FALSE,
+                            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW |
+                                (extra.redirect ? EXTENDED_STARTUPINFO_PRESENT : 0),
+                            extra.environment.empty() ? nullptr : extra.environment.data(),
+                            nullptr, &extra.startup.StartupInfo, &pi)) {
             return Status(ErrorCode::unavailable, "CreateProcessW failed");
         }
         HANDLE job = CreateJobObjectW(nullptr, nullptr);
@@ -342,6 +345,8 @@ class PosixLauncher final : public ProcessLauncher {
         for (auto &arg : args)
             argv.push_back(arg.data());
         argv.push_back(nullptr);
+        ProcessOptions extra;
+        if (auto st = extra.prepare(spec); !st.ok()) return st;
 
         // Establish the watchdog BEFORE spawning the server, so there is no
         // parent-death window between launching the server and arming cleanup.
@@ -402,7 +407,8 @@ class PosixLauncher final : public ProcessLauncher {
             return Status(ErrorCode::io_error, "posix_spawn process group configuration failed");
         }
         pid_t pid = -1;
-        const int rc = posix_spawnp(&pid, spec.executable.c_str(), nullptr, &attr, argv.data(), environ);
+        const int rc = posix_spawnp(&pid, spec.executable.c_str(), extra.redirect ? &extra.actions : nullptr,
+                                    &attr, argv.data(), extra.envp.empty() ? environ : extra.envp.data());
         posix_spawnattr_destroy(&attr);
         if (rc != 0)
             return Status(ErrorCode::unavailable, "posix_spawnp failed");

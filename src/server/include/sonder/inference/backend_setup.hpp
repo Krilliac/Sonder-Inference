@@ -88,12 +88,26 @@ struct BackendSetup {
     std::uint64_t llamaserver_fit_step_align = 1024;
     std::uint64_t llamaserver_fit_min_ctx = 8192;
     std::uint64_t llamaserver_fit_max_attempts = 4;
+    // Nested JSON "spill_guard.residency" mirror. Kept independent of the
+    // optional llamaserver backend header so config loading remains available
+    // in builds without that backend.
+    struct LlamaServerResidencyConfig {
+        bool enabled = true;
+        bool expect_gpu = false;
+        std::uint64_t min_dedicated_mib = 512;
+        std::uint64_t consecutive_samples = 3;
+        double eviction_fraction = 0.25;
+        std::uint64_t eviction_mib = 2048;
+        std::string on_eviction = "warn";
+        std::uint64_t max_eviction_restarts = 1;
+    } llamaserver_residency;
     std::string llamaserver_log_file;
     bool llamaserver_kv_pairing_check = true;
     // JSON "context_length" (served context when /props is unavailable) and
     // "slot_affinity" (id_slot pinning; docs/integration/llama-server.md).
     std::uint64_t llamaserver_context_length = 0;
     bool llamaserver_slot_affinity = true;
+    std::vector<std::pair<std::string, std::string>> llamaserver_environment;
     // Optional llama-server prefix warm-up. Kept here as mirrors so the
     // always-built server/CLI setup loader does not depend on the optional
     // llamaserver backend header.
