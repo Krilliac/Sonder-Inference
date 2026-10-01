@@ -517,6 +517,15 @@ public:
         u64(values.size());
         for (const auto& v : values) str(v);
     }
+    // GGUF BOOL array (item type 7, one byte per item): how gguf-py writes a
+    // per-layer sliding_window_pattern.
+    void kv_bool_array(const std::string& key, const std::vector<bool>& values) {
+        str(key);
+        u32(9);
+        u32(7);
+        u64(values.size());
+        for (const bool v : values) bytes_.push_back(v ? '\x01' : '\x00');
+    }
     void tensor(const std::string& name, const std::vector<std::uint64_t>& dims, std::uint32_t type) {
         str(name);
         u32(static_cast<std::uint32_t>(dims.size()));
@@ -574,6 +583,42 @@ si::GgufModelInfo parse_fixture(const std::string& bytes) {
     return info.value();
 }
 
+// A Gemma-4-12B-shaped header (gemma4 architecture, no tensors): 48 blocks.
+// Every 6th block (5, 11, ..., 47) is full attention with 1 KV head of 512;
+// the other 40 use sliding-window attention (window 1024) with 8 KV heads
+// of 256. As convert_hf_to_gguf writes it: per-layer head_count_kv, the
+// _swa head sizes and a BOOL sliding_window_pattern (true = SWA).
+std::string gemma4_fixture() {
+    std::vector<std::int32_t> heads(48, 8);
+    std::vector<bool> pattern(48, true);
+    for (std::size_t i = 5; i < 48; i += 6) {
+        heads[i] = 1;
+        pattern[i] = false;
+    }
+    GgufWriter w;
+    w.kv_str("general.architecture", "gemma4");
+    w.kv_u32("gemma4.block_count", 48);
+    w.kv_u32("gemma4.embedding_length", 3840);
+    w.kv_u32("gemma4.context_length", 262144);
+    w.kv_u32("gemma4.attention.head_count", 16);
+    w.kv_i32_array("gemma4.attention.head_count_kv", heads);
+    w.kv_u32("gemma4.attention.key_length", 512);
+    w.kv_u32("gemma4.attention.value_length", 512);
+    w.kv_u32("gemma4.attention.key_length_swa", 256);
+    w.kv_u32("gemma4.attention.value_length_swa", 256);
+    w.kv_u32("gemma4.attention.sliding_window", 1024);
+    w.kv_bool_array("gemma4.attention.sliding_window_pattern", pattern);
+    w.kv_str_array("tokenizer.ggml.tokens", {"a", "b", "c", "d"});
+    return w.finish(0, 13);
+}
+
+// Blocks 0..n-1, true where block i % 6 != 5 (the Gemma 4 fixture's SWA blocks).
+std::vector<bool> every_sixth_full(std::size_t n) {
+    std::vector<bool> swa(n, true);
+    for (std::size_t i = 5; i < n; i += 6) swa[i] = false;
+    return swa;
+}
+
 }  // namespace
 
 TEST_CASE("GGUF reader: metadata and tensor sizes and hybrid attention layers") {
@@ -622,6 +667,123 @@ TEST_CASE("GGUF reader: full_attention_interval and per-layer head counts") {
     const si::GgufModelInfo d = parse_fixture(dense.finish(0, 5));
     CHECK(d.kind == si::ModelArchitecture::attention_only);
     CHECK(d.kv_heads == std::vector<std::uint32_t>{2, 2, 2});
+}
+
+namespace {
+
+// "1101" -> {true, true, false, true}
+std::vector<bool> bits(std::string_view text) {
+    std::vector<bool> out;
+    for (const char c : text) out.push_back(c == '1');
+    return out;
+}
+
+std::string repeat(std::string_view text, std::size_t times) {
+    std::string out;
+    for (std::size_t i = 0; i < times; ++i) out += text;
+    return out;
+}
+
+// A dense header for `arch`: `blocks` blocks of 8 KV heads of 128 (embedding
+// 1024 over 8 heads; f16 K and V: 4,096 bytes per token and layer), plus
+// integer keys under "<arch>.".
+si::GgufModelInfo swa_header(const std::string& arch, std::uint32_t blocks,
+                             const std::vector<std::pair<std::string, std::uint32_t>>& keys) {
+    GgufWriter w;
+    w.kv_str("general.architecture", arch);
+    w.kv_u32(arch + ".block_count", blocks);
+    w.kv_u32(arch + ".embedding_length", 1024);
+    w.kv_u32(arch + ".attention.head_count", 8);
+    w.kv_u32(arch + ".attention.head_count_kv", 8);
+    for (const auto& [key, value] : keys) w.kv_u32(arch + "." + key, value);
+    return parse_fixture(w.finish(0, 5 + keys.size()));
+}
+
+}  // namespace
+
+TEST_CASE("GGUF reader: a BOOL sliding_window_pattern array and the SWA head sizes") {
+    // gemma4's loader reads the per-layer pattern array (true = SWA), the
+    // window and key_length_swa/value_length_swa (src/models/gemma4.cpp).
+    const si::GgufModelInfo m = parse_fixture(gemma4_fixture());
+    CHECK(m.architecture == "gemma4");
+    CHECK(m.kind == si::ModelArchitecture::attention_only);
+    CHECK(m.swa_layers == every_sixth_full(48));
+    CHECK(m.sliding_window == 1024u);
+    CHECK(m.key_length == 512u);
+    CHECK(m.value_length == 512u);
+    CHECK(m.key_length_swa == 256u);
+    CHECK(m.value_length_swa == 256u);
+    CHECK(m.kv_heads[0] == 8u);
+    CHECK(m.kv_heads[5] == 1u);
+    CHECK(m.kv_heads[47] == 1u);
+    CHECK_FALSE(m.sliding_window_unmodelled);
+
+    // An INT32 pattern array works too (llama.cpp's get_arr takes BOOL, INT32
+    // and UINT32); blocks past the array's end stay full attention.
+    GgufWriter g;
+    g.kv_str("general.architecture", "granite_swa");
+    g.kv_u32("granite_swa.block_count", 6);
+    g.kv_u32("granite_swa.embedding_length", 512);
+    g.kv_u32("granite_swa.attention.head_count", 4);
+    g.kv_u32("granite_swa.attention.sliding_window", 512);
+    g.kv_i32_array("granite_swa.attention.sliding_window_pattern", {1, 1, 0, 1});
+    const si::GgufModelInfo granite = parse_fixture(g.finish(0, 6));
+    CHECK(granite.swa_layers == bits("110100"));
+    CHECK(granite.sliding_window == 512u);
+    // Without the _swa keys, SWA blocks use the full-attention head sizes.
+    CHECK(granite.key_length_swa == 128u);
+    CHECK(granite.value_length_swa == 128u);
+}
+
+TEST_CASE("GGUF reader: SWA layout per architecture and llama.cpp's built-in period when the file has none") {
+    // Each loader's load_arch_hparams in llama.cpp 7fe450e (src/models/). Without
+    // a per-layer array, load_swa_pattern(ml, period, dense_first) uses the
+    // file's scalar sliding_window_pattern, else the built-in period, and
+    // set_swa_pattern marks block i sliding-window when i % period < period - 1
+    // (the full block closes each period), or i % period != 0 when dense first.
+    struct Case {
+        std::string arch;
+        std::uint32_t blocks;
+        std::vector<std::pair<std::string, std::uint32_t>> keys;
+        std::string swa;  // expected per block; empty = no SWA blocks
+        std::uint64_t window;
+    };
+    for (const Case& c : std::vector<Case>{
+             // gemma3: SWA only with a positive window; period 6.
+             {"gemma3", 12, {{"attention.sliding_window", 1024}}, "111110111110", 1024},
+             {"gemma3", 12, {{"attention.sliding_window", 0}}, "", 0},
+             {"gemma3", 12, {}, "", 0},
+             // gpt-oss (openai-moe): period 2.
+             {"gpt-oss", 6, {{"attention.sliding_window", 128}}, "101010", 128},
+             // cohere2moe: period 4, dense first.
+             {"cohere2moe", 8, {{"attention.sliding_window", 4096}}, "01110111", 4096},
+             // gemma2: the window defaults to 4096 without the key.
+             {"gemma2", 4, {}, "1010", 4096},
+             // llama4: chunked attention (3 of 4 layers), window fixed at 8192,
+             // unless the file's window is 0.
+             {"llama4", 8, {}, "11101110", 8192},
+             {"llama4", 8, {{"attention.sliding_window", 0}}, "", 0},
+             // smallthinker: dense first, and the loader overwrites the window with 4096.
+             {"smallthinker", 8, {{"attention.sliding_window", 2048}}, "01110111", 4096},
+             // plamo3: period 8, or the file's scalar pattern.
+             {"plamo3", 8, {{"attention.sliding_window", 1024}}, "11111110", 1024},
+             {"plamo3", 8, {{"attention.sliding_window", 1024}, {"attention.sliding_window_pattern", 4}}, "11101110", 1024},
+             // exaone4: only the 64-layer model has SWA.
+             {"exaone4", 30, {{"attention.sliding_window", 4096}}, "", 0},
+             {"exaone4", 64, {{"attention.sliding_window", 2048}}, repeat("1110", 16), 2048},
+             // phi3: llama.cpp switches Phi SWA off whatever the file says.
+             {"phi3", 4, {{"attention.sliding_window", 2047}}, "", 0},
+             // gemma4 requires the per-layer array; without it the model does not load.
+             {"gemma4", 6, {{"attention.sliding_window", 1024}}, "", 0},
+         }) {
+        CAPTURE(c.arch);
+        CAPTURE(c.blocks);
+        CAPTURE(c.keys.size());
+        const si::GgufModelInfo m = swa_header(c.arch, c.blocks, c.keys);
+        CHECK(m.swa_layers == bits(c.swa));
+        CHECK(m.sliding_window == c.window);
+        CHECK_FALSE(m.sliding_window_unmodelled);
+    }
 }
 
 TEST_CASE("GGUF reader: malformed and truncated headers are rejected") {
@@ -996,6 +1158,218 @@ TEST_CASE("VRAM estimate: the GGUF fixture round-trips through the estimator") {
     CHECK(e.kv_bytes == e.kv_bytes_per_token * 512);
     // Two delta-net blocks; `parallel` unset: llama-server's 4 automatic slots.
     CHECK(e.recurrent_bytes == 4u * 2u * (3u * 64 + 256) * 4);
+}
+
+// ------------------------------------------------- sliding-window attention
+//
+// llama.cpp keeps sliding-window (SWA) layers in a second KV cache of
+//   size_swa = GGML_PAD(min(size_base, n_swa * (unified ? n_seq_max : 1) + n_ubatch), 256)
+// cells per stream, where size_base = n_ctx_seq is what full-attention layers
+// keep (llama_kv_cache_iswa, src/llama-kv-cache-iswa.cpp:73 in llama.cpp
+// 7fe450e; the same in b11195). --swa-full sets size_swa = size_base.
+
+namespace {
+
+LaunchProfile gemma4_profile(const std::string& extra = "") {
+    return parse_single(R"({"name":"gemma4-12b","backend":"llamaserver","model":"g4.gguf","ctx_size":262144,)"
+                        R"("parallel":1,"kv_unified":true,"n_gpu_layers":-1)" +
+                        extra + "}");
+}
+
+}  // namespace
+
+TEST_CASE("VRAM estimate: sliding-window layers keep llama.cpp's window-sized cache (Gemma 4 12B shape)") {
+    const si::GgufModelInfo m = parse_fixture(gemma4_fixture());
+    const si::VramEstimate e = si::estimate_vram(m, gemma4_profile());
+    // Full blocks: 8 x 1 head x (512 + 512) values x 2 bytes = 16,384 B/token,
+    // over all 262,144 cells: 4,294,967,296 bytes.
+    // SWA blocks: 40 x 8 heads x (256 + 256) x 2 = 327,680 B/token, over
+    // pad256(min(262144, 1024 x 1 + 512)) = 1,536 cells: 503,316,480 bytes.
+    // Every block at full context with the full blocks' head size was
+    // 176,093,659,136 bytes (164 GiB) for about 4.5 GiB of real KV.
+    CHECK(e.kv_bytes == 4798283776ull);
+    CHECK(e.attention_layers == 48u);
+    CHECK(e.swa_attention_layers == 40u);
+    CHECK(e.kv_bytes_per_token == 16384u);
+    CHECK(e.swa_kv_bytes_per_token == 327680u);
+    CHECK(e.context_per_sequence == 262144u);
+    CHECK(e.swa_context_per_sequence == 1536u);
+    CHECK(e.sequences == 1u);
+    CHECK(e.kv_bytes == 16384ull * 262144 + 327680ull * 1536);
+    CHECK((e.kv_bytes >> 20) == 4576u);  // 4,096 MiB + 480 MiB
+    CHECK(e.total_bytes == e.weights_bytes + e.kv_bytes + e.recurrent_bytes + e.compute_bytes);
+
+    // The micro-batch is part of the SWA cache: ubatch 1024 -> 1024 + 1024 =
+    // 2,048 cells; batch 256 caps the default ubatch at 256 -> pad256(1,280).
+    CHECK(si::estimate_vram(m, gemma4_profile(R"(,"ubatch_size":1024)")).swa_context_per_sequence == 2048u);
+    CHECK(si::estimate_vram(m, gemma4_profile(R"(,"batch_size":256)")).swa_context_per_sequence == 1280u);
+    CHECK(si::estimate_vram(m, gemma4_profile(R"(,"ubatch_size":300)")).swa_context_per_sequence == 1536u);
+    // A context below the window: the SWA cache is as large as the full one.
+    LaunchProfile small = gemma4_profile();
+    small.ctx_size = 1024;
+    const si::VramEstimate s = si::estimate_vram(m, small);
+    CHECK(s.swa_context_per_sequence == 1024u);
+    CHECK(s.kv_bytes == (16384ull + 327680ull) * 1024);
+}
+
+TEST_CASE("VRAM estimate: sliding-window cells per stream follow parallel and kv_unified") {
+    const si::GgufModelInfo m = parse_fixture(gemma4_fixture());
+    // Not unified, 4 slots: 4 streams of n_ctx_seq = pad(262144 / 4, 256) =
+    // 65,536 cells; each stream's SWA cache holds window + ubatch = 1,536.
+    LaunchProfile p = gemma4_profile();
+    p.parallel = 4;
+    p.kv_unified = false;
+    const si::VramEstimate split = si::estimate_vram(m, p);
+    CHECK(split.sequences == 4u);
+    CHECK(split.context_per_sequence == 65536u);
+    CHECK(split.swa_context_per_sequence == 1536u);
+    CHECK(split.kv_bytes == 16384ull * 65536 * 4 + 327680ull * 1536 * 4);  // 6,308,233,216
+    // Unified, 4 slots: one stream whose SWA cache holds window x 4 + ubatch.
+    p.kv_unified = true;
+    const si::VramEstimate unified = si::estimate_vram(m, p);
+    CHECK(unified.sequences == 1u);
+    CHECK(unified.swa_context_per_sequence == 4608u);
+    CHECK(unified.kv_bytes == 16384ull * 262144 + 327680ull * 4608);  // 5,804,916,736
+    // llama-server's automatic default (parallel unset) is 4 unified slots.
+    LaunchProfile automatic = gemma4_profile();
+    automatic.parallel.reset();
+    automatic.kv_unified.reset();
+    CHECK(si::estimate_vram(m, automatic).kv_bytes == unified.kv_bytes);
+    // Streams smaller than window + ubatch keep their full size.
+    p.kv_unified = false;
+    p.ctx_size = 4096;  // 4 streams of 1,024 cells
+    const si::VramEstimate tiny = si::estimate_vram(m, p);
+    CHECK(tiny.context_per_sequence == 1024u);
+    CHECK(tiny.swa_context_per_sequence == 1024u);
+    CHECK(tiny.kv_bytes == (16384ull + 327680ull) * 1024 * 4);
+}
+
+TEST_CASE("VRAM estimate: --swa-full and the llamacpp backend keep full-size sliding-window caches") {
+    const si::GgufModelInfo m = parse_fixture(gemma4_fixture());
+    // Every SWA block at full context, each with its own head size:
+    // (16,384 + 327,680) x 262,144 = 90,194,313,216 bytes (84 GiB).
+    const std::uint64_t full_size = (16384ull + 327680ull) * 262144;
+    // llama-server reads `--swa_full` as `--swa-full`.
+    for (const std::string flag : {"--swa-full", "--swa_full"}) {
+        CAPTURE(flag);
+        const si::VramEstimate e = si::estimate_vram(m, gemma4_profile(R"(,"extra_args":[")" + flag + R"("])"));
+        CHECK(e.kv_bytes == full_size);
+        CHECK(e.swa_context_per_sequence == e.context_per_sequence);
+        CHECK(e.kv_bytes == (e.kv_bytes_per_token + e.swa_kv_bytes_per_token) * e.context_per_sequence * e.sequences);
+        bool noted = false;
+        for (const auto& note : e.notes) noted = noted || contains(note, "--swa-full");
+        CHECK(noted);
+    }
+    // The direct backend keeps llama.cpp's library default swa_full = true
+    // (llama_context_default_params, b11195).
+    const LaunchProfile direct = parse_single(R"({"name":"d","backend":"llamacpp","model":"g4.gguf","ctx_size":262144})");
+    const si::VramEstimate d = si::estimate_vram(m, direct);
+    CHECK(d.kv_bytes == full_size);
+    bool noted = false;
+    for (const auto& note : d.notes) noted = noted || contains(note, "llamacpp backend");
+    CHECK(noted);
+}
+
+TEST_CASE("VRAM estimate: with flash attention off every layer's V row is the widest layer's") {
+    // A transposed V cache (flash attention off) has n_embd_v_gqa_max() values
+    // per row in every layer (llama_kv_cache, [TAG_V_CACHE_VARIABLE]). Gemma
+    // 4's widest V row is a SWA block's 8 x 256 = 2,048, so the full blocks'
+    // 1 x 512 rows are allocated at 2,048. `auto` and `on` allocate before
+    // flash attention is resolved, with each layer's own row.
+    const si::GgufModelInfo m = parse_fixture(gemma4_fixture());
+    LaunchProfile p = gemma4_profile();
+    p.flash_attn = "on";
+    const si::VramEstimate on = si::estimate_vram(m, p);
+    p.flash_attn = "auto";
+    CHECK(si::estimate_vram(m, p).kv_bytes == on.kv_bytes);
+    p.flash_attn = "off";
+    const si::VramEstimate off = si::estimate_vram(m, p);
+    CHECK(off.kv_bytes - on.kv_bytes == 8ull * (2048 - 512) * 2 * 262144);
+    CHECK(off.kv_bytes_per_token == 8u * (512 + 2048) * 2);
+    CHECK(off.swa_kv_bytes_per_token == on.swa_kv_bytes_per_token);
+}
+
+TEST_CASE("VRAM estimate: SWA layers from an architecture's built-in period") {
+    // gemma3 GGUFs carry no pattern: llama.cpp's period 6 makes blocks 5 and
+    // 11 full attention. 2 x 4,096 B/token x 32,768 + 10 x 4,096 x 1,536.
+    const si::GgufModelInfo m = swa_header("gemma3", 12, {{"attention.sliding_window", 1024}});
+    const LaunchProfile p =
+        parse_single(R"({"name":"g3","backend":"llamaserver","model":"g3.gguf","ctx_size":32768,"parallel":1})");
+    const si::VramEstimate e = si::estimate_vram(m, p);
+    CHECK(e.kv_bytes == 2ull * 4096 * 32768 + 10ull * 4096 * 1536);
+    CHECK(e.swa_attention_layers == 10u);
+    // Dense first (cohere2moe): blocks 0 and 4 full, window 4096.
+    const si::GgufModelInfo c = swa_header("cohere2moe", 8, {{"attention.sliding_window", 4096}});
+    CHECK(si::estimate_vram(c, p).kv_bytes == 2ull * 4096 * 32768 + 6ull * 4096 * 4608);
+}
+
+TEST_CASE("VRAM estimate: a window on an architecture whose SWA layout is not modelled counts at full context") {
+    // llama.cpp ignores sliding_window for llama; the estimate must not guess.
+    const si::GgufModelInfo m = swa_header("llama", 4, {{"attention.sliding_window", 4096}});
+    CHECK(m.swa_layers.empty());
+    CHECK(m.sliding_window_unmodelled);
+    const LaunchProfile p =
+        parse_single(R"({"name":"l","backend":"llamaserver","model":"l.gguf","ctx_size":32768,"parallel":1})");
+    const si::VramEstimate e = si::estimate_vram(m, p);
+    CHECK(e.kv_bytes == 4ull * 4096 * 32768);
+    bool noted = false;
+    for (const auto& note : e.notes) noted = noted || contains(note, "llama.attention.sliding_window is set");
+    CHECK(noted);
+}
+
+TEST_CASE("VRAM estimate: models without sliding-window layers are unchanged") {
+    // Guards the non-SWA path: these values are what the estimator produced
+    // before it knew about sliding windows.
+    const si::VramEstimate q = si::estimate_vram(qwen38_q3(), parse_single(kMeasuredProfile));
+    CHECK(q.kv_bytes == 29696ull * 100096);
+    CHECK(q.kv_bytes_per_token == 29696u);
+    CHECK(q.total_mib() == 15437u);
+    CHECK(q.swa_attention_layers == 0u);
+    CHECK(q.swa_kv_bytes_per_token == 0u);
+    CHECK(q.swa_context_per_sequence == 0u);
+
+    // A dense header carrying a BOOL array that the reader used to skip: the
+    // "recurrent" key name must not make it hybrid now that BOOL arrays are kept.
+    GgufWriter w;
+    w.kv_str("general.architecture", "llama");
+    w.kv_u32("llama.block_count", 4);
+    w.kv_u32("llama.embedding_length", 1024);
+    w.kv_u32("llama.attention.head_count", 8);
+    w.kv_u32("llama.attention.head_count_kv", 8);
+    w.kv_bool_array("llama.attention.recurrent_layers", {false, false, false, false});
+    const si::GgufModelInfo dense = parse_fixture(w.finish(0, 6));
+    CHECK(dense.kind == si::ModelArchitecture::attention_only);
+    CHECK(dense.kv_heads == std::vector<std::uint32_t>{8, 8, 8, 8});
+    CHECK(dense.swa_layers.empty());
+    CHECK_FALSE(dense.sliding_window_unmodelled);
+    // 4 blocks x 4,096 B/token, whatever the flash attention mode and --swa-full.
+    for (const std::string fa : {"on", "auto", "off"}) {
+        for (const std::string extra : {"", R"(,"extra_args":["--swa-full"])"}) {
+            CAPTURE(fa);
+            CAPTURE(extra);
+            LaunchProfile p = parse_single(R"({"name":"d","backend":"llamaserver","model":"d.gguf","ctx_size":8192,)"
+                                           R"("parallel":2,"kv_unified":false)" +
+                                           extra + "}");
+            p.flash_attn = fa;
+            const si::VramEstimate e = si::estimate_vram(dense, p);
+            CHECK(e.kv_bytes == 4ull * 4096 * 4096 * 2);  // 2 streams of 4,096 cells
+            CHECK(e.kv_bytes_per_token == 4u * 4096);
+            CHECK(e.swa_attention_layers == 0u);
+            CHECK(e.swa_context_per_sequence == 0u);
+            CHECK(e.notes.empty());
+        }
+    }
+    const LaunchProfile direct = parse_single(R"({"name":"d","backend":"llamacpp","model":"d.gguf","ctx_size":8192})");
+    CHECK(si::estimate_vram(dense, direct).kv_bytes == 4ull * 4096 * 8192);
+
+    // The hybrid fixture: flash attention off and --swa-full change nothing.
+    const si::GgufModelInfo hybrid = parse_fixture(hybrid_fixture());
+    LaunchProfile h = parse_single(R"({"name":"f","backend":"llamaserver","model":"m.gguf","ctx_size":512,"cache_type_k":"f16"})");
+    const std::uint64_t base = si::estimate_vram(hybrid, h).kv_bytes;
+    CHECK(base == 2u * 2 * (16 * 2 + 32 * 2) * 512);
+    h.flash_attn = "off";
+    h.extra_args = {"--swa-full"};
+    CHECK(si::estimate_vram(hybrid, h).kv_bytes == base);
 }
 
 // Opt-in diagnostic, not a check: SONDER_TEST_GGUF=<path to a GGUF (a
@@ -1526,6 +1900,36 @@ TEST_CASE("serve_main: --vram-budget-mib overrides the profile's vram_budget_mib
     CHECK(run("loose", std::nullopt, err) == 2);
     CHECK_FALSE(contains(err, "does not fit"));
     CHECK(contains(err, "--max-connections must be from 1 to 100000"));
+    std::filesystem::remove(model);
+    std::filesystem::remove(profiles);
+}
+
+TEST_CASE("serve_main: the fit check sizes sliding-window layers as llama.cpp does") {
+    // The Gemma 4 header at its full 262,144 context needs about 4.7 GiB
+    // (KV 4,576 MiB + compute); counting every SWA block at full context made
+    // it 164 GiB, and serve refused a model that fits with exit status 2.
+    const auto model = write_temp("gemma4.gguf", gemma4_fixture());
+    const std::string m = model.generic_string();
+    const std::string fixed = R"(","ctx_size":262144,"parallel":1,"kv_unified":true,"n_gpu_layers":-1,"fit":false})";
+    const auto profiles = write_temp("profiles.json", R"({"profiles":[{"name":"g4","backend":"llamaserver","model":")" +
+                                                          m + fixed + "]}");
+    const std::string pf = profiles.string();
+    const auto run = [&pf](const std::string& budget, std::string& err) {
+        // `--max-connections 0` is a later usage error: a profile that passes
+        // the fit check exits there instead of starting llama-server.
+        return serve({"--profiles", pf, "--profile", "g4", "--vram-budget-mib", budget, "--llamaserver-executable",
+                      "llama-server-not-started", "--max-connections", "0"},
+                     err);
+    };
+    std::string err;
+    CHECK(run("6000", err) == 2);
+    CHECK_FALSE(contains(err, "does not fit"));
+    CHECK(contains(err, "--max-connections must be from 1 to 100000"));
+    // Below the estimate it is refused, and the log names both caches.
+    CHECK(run("4000", err) == 2);
+    CHECK(contains(err, "does not fit"));
+    CHECK(contains(err, "KV 4576 = (8 full-attention layers x 262144 tokens + 40 sliding-window layers x 1536 "
+                        "tokens) x 1 sequence(s)"));
     std::filesystem::remove(model);
     std::filesystem::remove(profiles);
 }

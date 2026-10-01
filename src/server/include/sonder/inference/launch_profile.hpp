@@ -177,10 +177,25 @@ struct GgufModelInfo {
     std::uint32_t nextn_layers = 0;  // trailing MTP blocks (<arch>.nextn_predict_layers)
     std::uint64_t embedding_length = 0;
     std::uint64_t vocab_size = 0;
-    std::uint64_t key_length = 0;    // per-head K dimension
-    std::uint64_t value_length = 0;  // per-head V dimension
+    std::uint64_t key_length = 0;    // per-head K dimension (full-attention blocks)
+    std::uint64_t value_length = 0;  // per-head V dimension (full-attention blocks)
     // Per block: KV heads (0 = no attention KV in that block).
     std::vector<std::uint32_t> kv_heads;
+    // Sliding-window attention (SWA), resolved as llama.cpp's loader resolves
+    // it for the architectures vram_estimate.cpp lists (kSwaArchitectures).
+    // Per block: true = the block attends to the last `sliding_window` tokens
+    // only, and llama.cpp keeps its KV in a separate, smaller cache. Empty =
+    // no SWA blocks: the architecture has none, this file does not enable
+    // them, or the architecture is not one whose SWA layout is modelled.
+    std::vector<bool> swa_layers;
+    std::uint64_t sliding_window = 0;    // window in tokens (llama.cpp n_swa)
+    // Per-head K and V dimensions on SWA blocks: <arch>.attention.key_length_swa
+    // and value_length_swa; the parser sets key_length/value_length without them.
+    std::uint64_t key_length_swa = 0;
+    std::uint64_t value_length_swa = 0;
+    // <arch>.attention.sliding_window is set, but the architecture's SWA
+    // layout is not modelled: every block counts at full context.
+    bool sliding_window_unmodelled = false;
     // Per block: tensor bytes of blk.N.*.
     std::vector<std::uint64_t> block_bytes;
     std::uint64_t output_bytes = 0;      // output.weight and output_norm (GPU when all layers offload)
@@ -205,17 +220,29 @@ Result<GgufModelInfo> parse_gguf_model_info(std::string_view header_bytes);
 std::string redact_model_path(const Status& error, const std::string& path);
 
 struct VramEstimate {
-    std::uint64_t weights_bytes = 0;    // offloaded blocks (+ output) + mmproj/draft when offloaded
-    std::uint64_t kv_bytes = 0;         // attention layers on the GPU x context_per_sequence x sequences
+    std::uint64_t weights_bytes = 0;  // offloaded blocks (+ output) + mmproj/draft when offloaded
+    // (kv_bytes_per_token x context_per_sequence + swa_kv_bytes_per_token x
+    // swa_context_per_sequence) x sequences
+    std::uint64_t kv_bytes = 0;
     std::uint64_t recurrent_bytes = 0;  // recurrent state of GPU blocks x recurrent_sequences x recurrent_snapshots
     std::uint64_t compute_bytes = 0;    // compute buffers and runtime allowance
     std::uint64_t total_bytes = 0;
     std::uint32_t gpu_layers = 0;
-    std::uint32_t attention_layers = 0;  // attention layers whose KV is on the GPU
+    std::uint32_t attention_layers = 0;      // attention layers whose KV is on the GPU (full and sliding-window)
+    std::uint32_t swa_attention_layers = 0;  // of those, sliding-window layers
+    // KV bytes per cached token: over the full-attention layers on the GPU,
+    // and over the sliding-window ones.
     std::uint64_t kv_bytes_per_token = 0;
+    std::uint64_t swa_kv_bytes_per_token = 0;
     std::uint64_t context = 0;               // total context (--ctx-size, padded to 256)
     std::uint64_t context_per_sequence = 0;  // context when unified; else pad(context / sequences, 256)
-    std::uint32_t sequences = 1;             // KV streams: 1 when unified, else parallel
+    // Tokens per sequence stream in llama.cpp's sliding-window cache:
+    // pad(min(context_per_sequence, sliding_window x (unified ? parallel : 1)
+    // + ubatch), 256), or context_per_sequence when that cache is full size
+    // (--swa-full in extra_args; always on the llamacpp backend). 0 without
+    // sliding-window layers on the GPU.
+    std::uint64_t swa_context_per_sequence = 0;
+    std::uint32_t sequences = 1;  // KV streams: 1 when unified, else parallel
     // Sequences that each keep a recurrent state (llama.cpp's n_seq_max):
     // `parallel`, kLlamaServerAutoParallel for a llamaserver profile without
     // it, 1 on the llamacpp backend.
@@ -242,12 +269,20 @@ struct VramEstimateInputs {
 //            plus output tensors when every block is offloaded; MTP (nextn)
 //            blocks only when speculative types include draft-mtp
 //   KV       sum over GPU attention layers of n_kv_heads x (key_length x
-//            bytes(k) + value_length x bytes(v)) x ctx_seq x sequences:
+//            bytes(k) + value_length x bytes(v)) x cells x sequences:
 //            kv_unified gives one pool of ctx (sequences 1); otherwise
 //            sequences = parallel and ctx_seq = pad(ctx / parallel, 256),
 //            as llama.cpp splits --ctx-size across the per-sequence streams.
 //            A llamaserver profile without `parallel` gets llama-server's
-//            auto default: kLlamaServerAutoParallel slots, unified
+//            auto default: kLlamaServerAutoParallel slots, unified.
+//            Full-attention layers keep ctx_seq cells. Sliding-window layers
+//            use key_length_swa/value_length_swa and keep llama.cpp's
+//            size_swa = pad(min(ctx_seq, sliding_window x (unified ? slots :
+//            1) + ubatch), 256) cells, or ctx_seq with --swa-full in
+//            extra_args and on the llamacpp backend (llama.cpp's library
+//            default swa_full, which that backend keeps). With flash_attn
+//            off, every layer's V row is the widest layer's (llama.cpp pads
+//            the transposed V cache)
 //   recurrent  for each GPU block without attention in a hybrid or
 //            recurrent model: state values x 4 bytes x recurrent_sequences
 //            (parallel; kLlamaServerAutoParallel when a llamaserver profile
@@ -258,7 +293,8 @@ struct VramEstimateInputs {
 //            + 256 MiB runtime allowance
 // ctx 0 or unset uses <arch>.context_length. Hybrid models count only their
 // attention layers (per-block head_count_kv, attn_k tensors, or
-// full_attention_interval).
+// full_attention_interval). MLA (DeepSeek-style) layers are counted as
+// regular attention, which overestimates them.
 VramEstimate estimate_vram(const GgufModelInfo& model, const LaunchProfile& profile,
                            const VramEstimateInputs& inputs = {});
 

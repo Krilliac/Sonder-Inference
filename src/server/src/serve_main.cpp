@@ -462,11 +462,20 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const La
                          std::to_string(e.recurrent_snapshots) + " snapshot(s)" +
                          (e.recurrent_snapshots > 1 ? " for speculative rollback" : "");
         }
+        // Sliding-window layers keep their own, smaller cache: name both.
+        std::string kv = mib_text(e.kv_bytes) + " = ";
+        if (e.swa_attention_layers > 0) {
+            kv += "(" + std::to_string(e.attention_layers - e.swa_attention_layers) + " full-attention layers x " +
+                  std::to_string(e.context_per_sequence) + " tokens + " + std::to_string(e.swa_attention_layers) +
+                  " sliding-window layers x " + std::to_string(e.swa_context_per_sequence) + " tokens)";
+        } else {
+            kv += std::to_string(e.attention_layers) + " attention layers x " + std::to_string(e.context_per_sequence) +
+                  " tokens";
+        }
         std::string summary = "launch profile '" + p.name + "': estimated VRAM " + std::to_string(e.total_mib()) +
-                              " MiB (weights " + mib_text(e.weights_bytes) + ", KV " + mib_text(e.kv_bytes) + " = " +
-                              std::to_string(e.attention_layers) + " attention layers x " +
-                              std::to_string(e.context_per_sequence) + " tokens x " + std::to_string(e.sequences) +
-                              " sequence(s), recurrent " + recurrent + ", compute " + mib_text(e.compute_bytes) + ")";
+                              " MiB (weights " + mib_text(e.weights_bytes) + ", KV " + kv + " x " +
+                              std::to_string(e.sequences) + " sequence(s), recurrent " + recurrent + ", compute " +
+                              mib_text(e.compute_bytes) + ")";
         if (budget) summary += " vs budget " + std::to_string(*budget) + " MiB";
         for (const auto& note : e.notes) summary += "; " + note;
         if (upstream_fits) {
