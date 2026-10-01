@@ -55,6 +55,10 @@ the child's in-memory slots. Releasing the backend and its loaded model
 handles stops the child. Windows uses a kill-on-close Job Object; POSIX uses
 a process group, TERM and then KILL after the shutdown grace period.
 
+For typed, validated settings (context, KV cache types, offload,
+checkpoints, speculative decoding, default sampling) and a VRAM fit check,
+use a [launch profile](launch-profiles.md) instead of raw `args`.
+
 ## Attach to an existing server
 
 ```json

@@ -93,6 +93,13 @@ Rules, checked at startup (`invalid_argument`, before any model file is read):
 - **`--ubatch-size` must not exceed `--batch-size`.**
 - Unknown type or mode names are rejected (case-insensitive; `on`/`enabled`
   and `off`/`disabled` are synonyms).
+- **These five flags apply to `--backend llamacpp` only.** Any other backend
+  would run without them, so `serve` exits with status 2 and
+  `option --X applies only to --backend llamacpp; for llamaserver set it in the JSON args`.
+  A spawned llama-server takes `--cache-type-k` and the rest in its
+  `--llamaserver-config` `args`, or from a
+  [launch profile](integration/launch-profiles.md)'s typed fields; with
+  `--profile` the five flags are refused because the profile sets them.
 
 Some limits depend on the model and are left to llama.cpp, which then fails
 the load: MLA models (DeepSeek-style) need identical K and V types, a
@@ -106,7 +113,10 @@ sonder-infer serve --backend llamacpp ... --cache-type-k q8_0 --cache-type-v q8_
 
 ## Step 2 — per-model placement profiles (design)
 
-Today the operator picks overrides per `serve` invocation. The next step is a
+Today the operator picks overrides per `serve` invocation. [Launch profiles](integration/launch-profiles.md)
+now read the GGUF header for a VRAM fit estimate (weights of the offloaded
+blocks, hybrid-aware KV bytes per token, recurrent state, compute), but do not
+choose a placement. The next step is a
 placement profile per model, derived from the GGUF metadata:
 
 | Field | Source |
