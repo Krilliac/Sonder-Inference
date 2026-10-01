@@ -240,9 +240,9 @@ in `extra_args`. A llamacpp profile takes `--moe-experts`,
 `--tensor-override` and `--device` from the command line. Everything else,
 such as the executable, timeouts, restart policy and TLS, is taken from the
 usual options; `--device` with a llamaserver profile only labels the model's
-`device_id` in telemetry and health. Without a profile,
-those five llama.cpp flags apply to `--backend llamacpp` only: any other
-backend exits with status 2 and
+`device_id` in telemetry and health. Without a profile, the five llama.cpp
+context flags (`--batch-size` through `--flash-attn`) apply to
+`--backend llamacpp` only: any other backend exits with status 2 and
 `option --X applies only to --backend llamacpp; for llamaserver set it in the JSON args`
 instead of running without them.
 

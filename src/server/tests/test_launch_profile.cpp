@@ -162,7 +162,7 @@ TEST_CASE("launch profile: extra_args refuse host and port and credentials and d
     const auto with = [](const std::string& arg) {
         return R"({"name":"p","backend":"llamaserver","model":"m.gguf","extra_args":[)" + arg + "]}";
     };
-    for (const char* forbidden : {R"("--host","0.0.0.0")", R"("--port=9000")", R"("--api-key","k")",
+    for (const std::string forbidden : {R"("--host","0.0.0.0")", R"("--port=9000")", R"("--api-key","k")",
                                   R"("--api-key-file","f")", R"("-hf","org/model")", R"("--model-url","u")",
                                   R"("--")", R"("--models-dir","d")",
                                   // llama-server reads every '_' of a "--" flag as '-' (common/arg.cpp).
@@ -208,7 +208,7 @@ TEST_CASE("launch profile: extra_args refuse llama-server agent tools, MCP and f
     const auto with = [](const std::string& arg) {
         return R"({"name":"p","backend":"llamaserver","model":"m.gguf","extra_args":[)" + arg + "]}";
     };
-    for (const char* unsafe :
+    for (const std::string unsafe :
          {R"("--tools","all")", R"("--tools=exec_shell_command")", R"("--tools-runtime","ssh:host")",
           R"("--mcp-servers-config","m.json")", R"("--mcp-servers-json","{}")", R"("-ag")", R"("--agent")",
           R"("--ui-mcp-proxy")", R"("--webui-mcp-proxy")", R"("--path","C:/")", R"("--media-path","D:/")",
@@ -222,7 +222,7 @@ TEST_CASE("launch profile: extra_args refuse llama-server agent tools, MCP and f
     CHECK(contains(parse_error(with(R"("--mcp_servers_json","{}")")),
                    "--mcp_servers_json, which llama-server reads as --mcp-servers-json"));
     // The directory llama-server starts ffmpeg/ffprobe from (video input).
-    for (const char* program : {R"("--video-ffmpeg-dir","C:/tools")", R"("--video_ffmpeg_dir","C:/tools")"}) {
+    for (const std::string program : {R"("--video-ffmpeg-dir","C:/tools")", R"("--video_ffmpeg_dir","C:/tools")"}) {
         CAPTURE(program);
         CHECK(contains(parse_error(with(program)), "cannot choose programs for llama-server to run"));
     }
@@ -237,7 +237,7 @@ TEST_CASE("launch profile: extra_args refuse model presets and prompt/log files"
         return R"({"name":"p","backend":"llamaserver","model":"m.gguf","extra_args":[)" + arg + "]}";
     };
     // Every preset listed by `llama-server --help`; each can download weights.
-    for (const char* preset :
+    for (const std::string preset :
          {R"("--embd-gemma-default")", R"("--fim-qwen-1.5b-default")", R"("--fim-qwen-3b-default")",
           R"("--fim-qwen-7b-default")", R"("--fim-qwen-7b-spec")", R"("--fim-qwen-14b-spec")",
           R"("--fim-qwen-30b-default")", R"("--gpt-oss-20b-default")", R"("--gpt-oss-120b-default")",
@@ -248,7 +248,7 @@ TEST_CASE("launch profile: extra_args refuse model presets and prompt/log files"
         CAPTURE(preset);
         CHECK(contains(parse_error(with(preset)), "built-in model presets"));
     }
-    for (const char* writer : {R"("--log-file","C:/x.log")", R"("--log-file=x.log")",
+    for (const std::string writer : {R"("--log-file","C:/x.log")", R"("--log-file=x.log")",
                                R"("--log-prompts-dir","D:/prompts")", R"("--log-prompts-dir=p")",
                                R"("-lcd","C:/ngram.bin")", R"("--lookup-cache-dynamic","ngram.bin")",
                                R"("--lookup-cache-dynamic=ngram.bin")", R"("--log_prompts_dir","D:/prompts")",
@@ -267,7 +267,7 @@ TEST_CASE("launch profile: extra_args refuse remote RPC offload") {
     };
     // --rpc registers rpc-server devices on other hosts; layers placed there
     // send tensors and every prompt's activations over the network.
-    for (const char* remote : {R"("--rpc","10.0.0.5:50052")", R"("--rpc=192.168.1.2:50052,192.168.1.3:50052")"}) {
+    for (const std::string remote : {R"("--rpc","10.0.0.5:50052")", R"("--rpc=192.168.1.2:50052,192.168.1.3:50052")"}) {
         CAPTURE(remote);
         CHECK(contains(parse_error(with(remote)), "extra_args must not contain --rpc"));
         CHECK(contains(parse_error(with(remote)), "remote RPC servers"));
@@ -928,11 +928,11 @@ TEST_CASE("VRAM estimate: a llamaserver profile without parallel counts llama-se
 }
 
 TEST_CASE("VRAM estimate: placement flags in extra_args are noted under the name llama-server reads") {
-    for (const char* flag : {"--override-tensor", "--override_tensor", "--n_cpu_moe", "--tensor_split", "--split_mode"}) {
+    for (const std::string flag : {"--override-tensor", "--override_tensor", "--n_cpu_moe", "--tensor_split", "--split_mode"}) {
         CAPTURE(flag);
         const LaunchProfile p = parse_single(R"({"name":"p","backend":"llamaserver","model":"m.gguf","ctx_size":4096,)"
                                              R"("parallel":1,"extra_args":[")" +
-                                             std::string(flag) + R"(","x"]})");
+                                             flag + R"(","x"]})");
         bool noted = false;
         for (const auto& note : si::estimate_vram(qwen38_q3(), p).notes) {
             noted = noted || contains(note, "placement flags in extra_args");
