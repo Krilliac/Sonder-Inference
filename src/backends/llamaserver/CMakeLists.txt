@@ -1,6 +1,7 @@
 # External process backend: uses only Sonder's HTTP/TLS client at runtime.
 # No llama.cpp sources, common library, executable or model downloads.
 sonder_module_sources(
+    child_metrics.cpp
     gpu_memory.cpp
     gpu_residency.cpp
     llamaserver_backend.cpp

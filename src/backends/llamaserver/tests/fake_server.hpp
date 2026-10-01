@@ -38,9 +38,22 @@ class FakeLlamaServer {
             }
             r.set_content(props_, "application/json");
         });
-        svr_.Get("/v1/models", [](const httplib::Request &, httplib::Response &r) {
+        svr_.Get("/v1/models", [this](const httplib::Request &, httplib::Response &r) {
+            ++models_requests_;
             r.set_content(R"({"object":"list","data":[{"id":"fake-model","object":"model"}]})",
                           "application/json");
+        });
+        svr_.Get("/metrics", [this](const httplib::Request &, httplib::Response &r) {
+            std::lock_guard<std::mutex> lock(mu_);
+            ++metrics_requests_;
+            r.status = metrics_status_;
+            r.set_content(metrics_body_, "text/plain");
+        });
+        svr_.Get("/slots", [this](const httplib::Request &, httplib::Response &r) {
+            std::lock_guard<std::mutex> lock(mu_);
+            ++slots_requests_;
+            r.status = slots_status_;
+            r.set_content(slots_body_, "application/json");
         });
         auto stream = [this](const httplib::Request &req, httplib::Response &r) {
             const bool nonstream = req.body.find(R"("stream":false)") != std::string::npos ||
@@ -173,6 +186,25 @@ class FakeLlamaServer {
         return last_slot_body_;
     }
     unsigned health_requests() const { return health_requests_.load(); }
+    unsigned models_requests() const { return models_requests_.load(); }
+    void set_metrics(std::string body, int status = 200) {
+        std::lock_guard<std::mutex> lock(mu_);
+        metrics_body_ = std::move(body);
+        metrics_status_ = status;
+    }
+    void set_slots(std::string body, int status = 200) {
+        std::lock_guard<std::mutex> lock(mu_);
+        slots_body_ = std::move(body);
+        slots_status_ = status;
+    }
+    unsigned metrics_requests() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return metrics_requests_;
+    }
+    unsigned slots_requests() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return slots_requests_;
+    }
     unsigned disconnects() const { return disconnects_.load(); }
     std::vector<std::string> nonstream_bodies() const {
         std::lock_guard<std::mutex> lock(mu_);
@@ -204,11 +236,18 @@ class FakeLlamaServer {
     bool hold_nonstream_ = false;
     std::string props_;
     unsigned props_requests_ = 0;
+    std::string metrics_body_;
+    std::string slots_body_;
+    int metrics_status_ = 404;
+    int slots_status_ = 404;
+    unsigned metrics_requests_ = 0;
+    unsigned slots_requests_ = 0;
     std::string last_slot_;
     std::string last_slot_body_;
     int status_ = 200;
     std::chrono::milliseconds initial_delay_{0};
     std::atomic<unsigned> health_requests_{0};
+    std::atomic<unsigned> models_requests_{0};
     std::atomic<unsigned> disconnects_{0};
 };
 } // namespace sonder_test

@@ -40,6 +40,9 @@ use pytest.
     so prompt tokens = `prompt_n + cache_n`.
 - **Draft acceptance** is `draft_n_accepted / draft_n` when present
   (speculative decoding).
+- **Backend work**: additive `cache_n` and `prompt_n` fields retain the actual
+  cached/reprocessed counts. The proxy's `usage.sonder.timings` is supported
+  alongside raw llama-server `timings`.
 
 **Scenarios** (built-in set; print it with `bench_http.py scenarios`):
 
@@ -49,6 +52,9 @@ use pytest.
 | `concurrency_sweep` | Sub-agent fan-out. One warm-up request primes a shared prefix, then short requests run at each concurrency level (default 1/2/4/8, `waves` × level requests per level). Records makespan, aggregate tok/s and requests/s. |
 | `long_context` | One document per size (default 32k/64k/100k/130k) with planted facts at several depths (default 10/50/90 %), made of kvb.py-style `Record N: code …` filler. Each depth gets its own question, and the answer must contain the exact phrase. The first question per size is a cold prefill; the rest reuse the cached body. Sizes that do not fit the server's `n_ctx` (from `/props` or `--ctx-size`) are skipped and listed. |
 | `repeat_prompt` | The same prompt N times. Repeats 2+ should be almost entirely cached. |
+| `agent_alternate` (`agent-alternate`) | Three independent sessions, A ~22k / B ~5k / C ~30k tokens, in strict A/B/C order for three turns each. Each has a stable prefix, separate growing history and cache key. A's turn-2+ cached count must cover at least 90% of the measured prompt length. Missing reuse evidence fails this scenario. |
+| `priority_contention` (`priority-contention`) | A cold ~20k-token background request followed by a ~500-token interactive request while the background request is outstanding. Records the interactive TTFT and whether requests overlapped; it does not assert that priority preempts a running prefill. |
+| `concurrency_stall` (`concurrency-stall`) | Three simultaneous clients with distinct keys and unique marker canaries. Fails on any request over 250 seconds, HTTP 503, or another client's marker appearing in content or reasoning. Requests have an absolute wall deadline as well as the socket timeout. |
 
 Sizes are in tokens. When the server has llama-server's `/tokenize`, prompts
 are trimmed to size with it. Otherwise the harness estimates at 4 chars per
@@ -68,6 +74,12 @@ always recorded from the response.
 - `repeat_reuse` and `volatile_cache_loss`: the cache behaves as expected (a
   repeat hit of 0.9 or more, and stable greater than volatile).
 - `recall`: planted facts recalled exactly.
+- `alternate_prefix_reuse`, `priority_contention`, `concurrency_stall`: the
+  scenario-specific checks above. Timing or cache information that cannot be
+  observed is reported explicitly.
+- `metrics_available`, `child_log_available`: enabled observation sources
+  must be readable. Missing counters, resets, truncation or read failures warn,
+  rather than producing a zero count that looks like success.
 - `gpu_used`: with PDH sampling on, the server process holds dedicated GPU
   memory. A process holding 0 MiB **fails**.
 - `vram_spill`: shared GPU memory rose more than 256 MiB above the clean
@@ -118,7 +130,14 @@ python bench/http/bench_http.py run --base-url http://127.0.0.1:8080 --only long
 
 `--no-think` sends `chat_template_kwargs: {"enable_thinking": false}`. Without
 it, a Qwen3-style model may spend a small `max_tokens` budget inside a
-`<think>` block and then fail recall.
+`<think>` block. If `sonder.warnings` reports a thinking-on pin, recall and
+agent defaults reserve at least 1,500 output tokens. A warning first seen in
+a response can trigger one retry at the larger cap; the original attempt is
+retained in the result. An explicit `--max-tokens` or request-body cap wins.
+Recall searches both content and `reasoning_content`; `found_in_reasoning`
+distinguishes a fact recovered only in reasoning. Agent history preserves
+returned reasoning separately when present. This is a synthetic recall
+measurement, not proof that the final answer delivered the fact to a user.
 
 **`sonder-infer serve`** (default `--host 127.0.0.1 --port 11437`; see
 [docs/SERVER.md](../../docs/SERVER.md))
@@ -148,9 +167,55 @@ Per-scenario keys:
 
 - `max_tokens`, `temperature`, `seed`, `api` (`chat`/`completion`) and
   `extra_body`.
+- `headers` (an object of string header names and values), `prompt_cache_key`
+  (a string), and `priority` (`interactive`, `subagent`, `background`).
+  `--header K=V` is repeatable; scenario values override global values
+  case-insensitively. Header values are redacted in saved results, including
+  CLI arguments. `--api-key`, `--token-file`, and `BENCH_HTTP_API_KEY` retain
+  their existing bearer-token behavior.
 - Per kind: `turns`, `system_tokens`, `tools`, `turn_tokens`, `volatile_top`,
   `tools_mode`, `levels`, `waves`, `shared_prefix_tokens`, `sizes`, `depths`,
   `prompt_tokens`, `repeats`.
+
+## Agent and contention experiments
+
+Run these only against the serving stack assigned to the benchmark operator.
+These requests can fill the context window and occupy the backend for minutes.
+
+```bash
+python bench/http/bench_http.py run --base-url http://127.0.0.1:11437/v1 \
+    --only agent-alternate,priority-contention,concurrency-stall \
+    --header X-Sonder-Run-Id=experiment-a --label agent-a \
+    --metrics-url http://127.0.0.1:8080/metrics \
+    --child-log /path/to/llama-server.log --out /path/to/bench/agent-a
+```
+
+Use the actual child port for `--metrics-url`; 8080 above is an example. It
+accepts a full endpoint URL. Generation credentials and headers are **not**
+forwarded to that URL. Scrapes happen before and after each request and each
+scenario, outside client TTFT/ITL measurement. Accepted-token deltas are read
+from `llamacpp:spec_decode_accepted_tokens_per_pos_total{position="N"}`.
+These counters describe the entire server during the interval. Concurrent
+request windows overlap: do not sum their deltas or attribute them exclusively
+to one client. Run/scenario boundary deltas provide unduplicated totals.
+Scraping adds wall time and can affect the workload, so enable it consistently
+in both A/B arms.
+
+`--child-log` counts new log bytes during the run, excluding old startup and
+prior-run text: `making room`, `exceeds cache size limit`,
+`forcing full prompt re-processing`, `selected slot by id`, and repeated
+`progress = 1.00`. A single completed progress entry is normal; additional
+consecutive progress entries for the same slot/task are counted separately.
+The report includes read/reset errors, so a missing or rotated log cannot be
+mistaken for a clean zero. Counters alone do not establish a stall: use the
+request wall times and canary results with them.
+
+For short fake-server runs, scenario JSON can override `agent_tokens` with
+an A/B/C size map, `turns`, `background_tokens`, `interactive_tokens`, and the
+stall prompt size. Use identical scenario JSON for both measured arms. A new
+run gets a distinct cache-key namespace; within one run each agent keeps its
+key across turns. A per-scenario `prompt_cache_key` names that namespace for
+multi-client scenarios and is sent verbatim for single-session scenarios.
 
 **A/B compare**
 
@@ -163,7 +228,10 @@ python bench/http/bench_http.py compare /tmp/A.json /tmp/B.json --out /tmp/A-vs-
 `compare` matches scenario/group pairs and prints A, B, delta, delta % and
 better/worse for each metric: TTFT and ITL percentiles, e2e, prefill/decode
 tok/s, prefix hit, recall, and aggregate tok/s and makespan for concurrency
-levels. `--json` prints the rows instead.
+levels. It also prints cache/reprocessed tokens, accepted tokens by draft
+position, and child-log counters when present. Missing observations remain
+unknown when comparing with older result files. `--json` prints the rows
+instead.
 
 ## Tests
 

@@ -149,9 +149,10 @@ int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostr
                    "Adaptive bisection probes context first; only leaders receive throughput measurements.\n"
                    "MTP >0 rows are conditional on nextn tensors and executable --help; neither is probed here.\n"
                    "Benchmarks also include 65536 and clean-edge minus 4096; every recommendation gets a +4096 safety probe.\n\n"
-                   "| K/V | ctx | ubatch | MTP |\n|---|---:|---:|---:|\n";
+                   "| K/V | ctx | ubatch | MTP | spec_type | p_min |\n|---|---:|---:|---:|---|---:|\n";
             for (const auto &c : planned_candidates(options.grid, true))
-                out << "| " << c.kv.k << '/' << c.kv.v << " | " << c.ctx << " | " << c.ubatch << " | " << c.mtp << " |\n";
+                out << "| " << c.kv.k << '/' << c.kv.v << " | " << c.ctx << " | " << c.ubatch << " | " << c.mtp
+                    << " | " << (c.mtp == 0 ? "none" : c.spec_type) << " | " << c.p_min << " |\n";
             return cli::kExitOk;
         }
         // Platform eligibility precedes --help or any model/server process.
@@ -196,7 +197,8 @@ int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostr
             << "; MTP=" << (mtp ? "eligible" : "disabled (needs nextn tensors and --help support)") << '\n';
         auto report = search(options, mtp, deadline, [&](const Candidate &c, Phase phase, Deadline until) {
             err << "[tune] " << (phase == Phase::probe ? "probe " : "bench ") << c.kv.k << '/' << c.kv.v
-                << " ctx=" << c.ctx << " ubatch=" << c.ubatch << " mtp=" << c.mtp << '\n';
+                << " ctx=" << c.ctx << " ubatch=" << c.ubatch << " mtp=" << c.mtp
+                << " spec_type=" << (c.mtp == 0 ? "none" : c.spec_type) << " p_min=" << c.p_min << '\n';
             return run_candidate(options, c, phase, until, scratch.file("candidate.log"), dependencies);
         });
         out << markdown(report);
