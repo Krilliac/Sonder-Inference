@@ -1,0 +1,289 @@
+time=2026-09-30T08:50:27.411-05:00 level=INFO source=llama_server.go:436 msg="starting llama-server" cmd="C:\\Users\\Nathan\\AppData\\Local\\Programs\\Ollama\\lib\\ollama\\llama-server.exe --model C:\\Users\\Nathan\\.ollama\\models\\blobs\\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e --port 36515 --host 127.0.0.1 --no-webui --offline -c 16384 -np 1 --
+time=2026-09-30T08:50:27.420-05:00 level=INFO source=sched.go:618 msg="system memory" total="30.9 GiB" free="1.2 GiB" free_swap="9.9 GiB"
+time=2026-09-30T08:50:27.420-05:00 level=INFO source=sched.go:625 msg="gpu memory" id=0 library=CUDA available="13.6 GiB" free="14.1 GiB" minimum="457.0 MiB" overhead="0 B"
+time=2026-09-30T08:50:27.420-05:00 level=INFO source=llama_server.go:1054 msg="loading model via llama-server" model=C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e
+time=2026-09-30T08:50:27.420-05:00 level=INFO source=llama_server.go:1307 msg="waiting for llama-server to start responding"
+time=2026-09-30T08:50:27.434-05:00 level=INFO source=llama_server.go:1362 msg="waiting for llama-server to become available" status="llm server error"
+0.00.001.139 I srv  llama_server: initializing ...
+cmn  common_param: common_params_print_info: build 1 (161755f29) with Clang 18.1.8 for Windows AMD64
+cmn  common_param: common_params_print_info: verbosity = 4 (adjust with the `-lv N` CLI arg)
+cmn  common_param: device_info:
+cmn  common_param:   - CPU     : AMD Ryzen 9 9900X3D 12-Core Processor           (31652 MiB, 998 MiB free)
+cmn  common_param:   - CUDA0   : NVIDIA GeForce RTX 5070 Ti (16302 MiB, 14442 MiB free)
+cmn  common_param: system_info: n_threads = 24 (n_threads_batch = 24) / 24 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | CUDA : ARCHS = 750,800,860,890,1000,1200 | USE_GRAPHS = 1 | FA_QUANTS = q4_0-q4_0,q8_0-q8_0,f16-f16,bf16-bf16 | 
+srv          init: using 23 threads for HTTP server
+srv          init: The UI is disabled
+srv          init: Use --ui/--no-ui (or deprecated --webui/--no-webui) to enable/disable
+srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+srv         start: binding port with default address family
+srv    load_model: loading model 'C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e'
+srv    load_model: local path 'C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e'
+time=2026-09-30T08:50:27.942-05:00 level=INFO source=llama_server.go:1362 msg="waiting for llama-server to become available" status="llm server loading model"
+srv    load_model: [mtmd] estimated worst-case memory usage of mmproj is 1161.02 MiB (took 849.44 ms)
+cmn  common_init_: fitting params to device memory ...
+cmn  common_init_: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+common_params_fit_impl: getting device memory data for initial parameters:
+common_memory_breakdown_print: | memory breakdown [MiB]  | total    free     self   model   context   compute    unaccounted |
+common_memory_breakdown_print: |   - CUDA0 (RTX 5070 Ti) | 16302 = 14887 + (12525 = 11671 +     693 +     160) +      -11109 |
+common_memory_breakdown_print: |   - Host                |                    557 =   520 +       0 +      36                |
+common_params_fit_impl: projected to use 12525 MiB of device memory vs. 14887 MiB of free device memory
+common_params_fit_impl: will leave 2361 >= 1936 MiB of free device memory, no changes needed
+common_fit_params: successfully fit params to free device memory
+common_fit_params: fitting params to free memory took 0.76 seconds
+llama_model_loader: loaded meta data with 50 key-value pairs and 866 tensors from C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e (version GGUF V3 (latest))
+llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+llama_model_loader: - kv  17:                         qwen35.block_count u32              = 65
+llama_model_loader: - kv  18:                      qwen35.context_length u32              = 262144
+llama_model_loader: - kv  19:                    qwen35.embedding_length u32              = 5120
+llama_model_loader: - kv  20:                 qwen35.feed_forward_length u32              = 17408
+llama_model_loader: - kv  21:                qwen35.attention.head_count u32              = 24
+llama_model_loader: - kv  22:             qwen35.attention.head_count_kv u32              = 4
+llama_model_loader: - kv  23:             qwen35.rope.dimension_sections arr[i32,4]       = [11, 11, 10, 0]
+llama_model_loader: - kv  24:                      qwen35.rope.freq_base f32              = 10000000.000000
+llama_model_loader: - kv  25:    qwen35.attention.layer_norm_rms_epsilon f32              = 0.000001
+llama_model_loader: - kv  26:                qwen35.attention.key_length u32              = 256
+llama_model_loader: - kv  27:              qwen35.attention.value_length u32              = 256
+llama_model_loader: - kv  28:                qwen35.nextn_predict_layers u32              = 1
+llama_model_loader: - kv  29:                     qwen35.ssm.conv_kernel u32              = 4
+llama_model_loader: - kv  30:                      qwen35.ssm.state_size u32              = 128
+llama_model_loader: - kv  31:                     qwen35.ssm.group_count u32              = 16
+llama_model_loader: - kv  32:                  qwen35.ssm.time_step_rank u32              = 48
+llama_model_loader: - kv  33:                      qwen35.ssm.inner_size u32              = 6144
+llama_model_loader: - kv  34:             qwen35.full_attention_interval u32              = 4
+llama_model_loader: - kv  35:                qwen35.rope.dimension_count u32              = 64
+llama_model_loader: - kv  46:                      quantize.imatrix.file str              = Qwen3.8-27B-GGUF/imatrix_unsloth.gguf
+llama_model_loader: - kv  47:             quantize.imatrix.entries_count u32              = 496
+llama_model_loader: - kv  48:              quantize.imatrix.chunks_count u32              = 1251
+print_info: file format = GGUF V3 (latest)
+print_info: file type   = Q3_K - Large
+print_info: file size   = 12.23 GiB (3.85 BPW) 
+llama_prepare_model_devices: using device CUDA0 (NVIDIA GeForce RTX 5070 Ti) (0000:01:00.0) - 15037 MiB free
+load: 0 unused tokens
+load:   - 248044 ('<|endoftext|>')
+load:   - 248046 ('<|im_end|>')
+load:   - 248063 ('<|fim_pad|>')
+load:   - 248064 ('<|repo_name|>')
+load:   - 248065 ('<|file_sep|>')
+print_info: arch                  = qwen35
+print_info: vocab_only            = 0
+print_info: no_alloc              = 0
+print_info: n_ctx_train           = 262144
+print_info: n_embd_inp            = 5120
+print_info: n_embd                = 5120
+print_info: n_embd_out            = 5120
+print_info: n_layer               = 64
+print_info: n_layer_all           = 65
+print_info: n_head                = 24
+print_info: n_head_kv             = 4
+print_info: n_rot                 = 64
+print_info: n_swa                 = 0
+print_info: is_swa_any            = 0
+print_info: non_causal_type       = 0
+print_info: n_embd_head_k         = 256
+print_info: n_embd_head_v         = 256
+print_info: n_gqa                 = 6
+print_info: n_embd_k_gqa          = 1024
+print_info: n_embd_v_gqa          = 1024
+print_info: f_norm_eps            = 0.0e+00
+print_info: f_norm_rms_eps        = 1.0e-06
+print_info: f_clamp_kqv           = 0.0e+00
+print_info: f_max_alibi_bias      = 0.0e+00
+print_info: f_logit_scale         = 0.0e+00
+print_info: f_attn_scale          = 0.0e+00
+print_info: f_attn_value_scale    = 0.0000
+print_info: n_ff                  = 17408
+print_info: n_expert              = 0
+print_info: n_expert_used         = 0
+print_info: n_expert_groups       = 0
+print_info: n_group_used          = 0
+print_info: causal attn           = 1
+print_info: pooling type          = -1
+print_info: rope type             = 40
+print_info: rope scaling          = linear
+print_info: freq_base_train       = 10000000.0
+print_info: freq_scale_train      = 1
+print_info: n_ctx_orig_yarn       = 262144
+print_info: rope_yarn_log_mul     = 0.0000
+print_info: rope_finetuned        = unknown
+print_info: mrope sections        = [11, 11, 10, 0]
+print_info: ssm_d_conv            = 4
+print_info: ssm_d_inner           = 6144
+print_info: ssm_d_state           = 128
+print_info: ssm_dt_rank           = 48
+print_info: ssm_n_group           = 16
+print_info: ssm_dt_b_c_rms        = 0
+print_info: model type            = 27B
+print_info: model params          = 27.32 B
+print_info: general.name          = Qwen3.8-27B
+print_info: vocab type            = BPE
+print_info: n_vocab               = 248320
+print_info: n_merges              = 247587
+print_info: max token length      = 256
+load_tensors: loading model tensors, this can take a while... (load_mode = none)
+model has unused tensor blk.64.attn_norm.weight (size = 20480 bytes) -- ignoring
+model has unused tensor blk.64.post_attention_norm.weight (size = 20480 bytes) -- ignoring
+model has unused tensor blk.64.attn_q.weight (size = 51609600 bytes) -- ignoring
+model has unused tensor blk.64.attn_k.weight (size = 5570560 bytes) -- ignoring
+model has unused tensor blk.64.attn_v.weight (size = 5570560 bytes) -- ignoring
+model has unused tensor blk.64.attn_output.weight (size = 25804800 bytes) -- ignoring
+model has unused tensor blk.64.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+model has unused tensor blk.64.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+model has unused tensor blk.64.ffn_gate.weight (size = 73113600 bytes) -- ignoring
+model has unused tensor blk.64.ffn_down.weight (size = 73113600 bytes) -- ignoring
+model has unused tensor blk.64.ffn_up.weight (size = 73113600 bytes) -- ignoring
+model has unused tensor blk.64.nextn.eh_proj.weight (size = 43008000 bytes) -- ignoring
+model has unused tensor blk.64.nextn.enorm.weight (size = 20480 bytes) -- ignoring
+model has unused tensor blk.64.nextn.hnorm.weight (size = 20480 bytes) -- ignoring
+model has unused tensor blk.64.nextn.shared_head_norm.weight (size = 20480 bytes) -- ignoring
+load_tensors: offloading output layer to GPU
+load_tensors: offloading 64 repeating layers to GPU
+load_tensors: offloaded 66/66 layers to GPU
+load_tensors:        CUDA0 model buffer size = 11671.15 MiB
+load_tensors:    CUDA_Host model buffer size =   521.00 MiB
+time=2026-09-30T08:50:31.491-05:00 level=WARN source=llama_server.go:1313 msg="client connection closed before llama-server finished loading, aborting load"
+time=2026-09-30T08:50:31.493-05:00 level=INFO source=sched.go:646 msg="Load failed" model=C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e error="timed out waiting for llama-server to start: context canceled"
+time=2026-09-30T08:50:42.203-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T08:51:14.400-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T08:51:47.829-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T08:52:19.240-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T08:52:50.204-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T08:53:21.283-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T08:53:52.211-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T08:54:23.283-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T08:54:54.700-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T08:55:25.285-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T08:55:56.235-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T08:56:27.227-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T08:56:58.200-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T08:57:29.229-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T08:58:00.211-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T08:58:31.222-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T08:59:02.215-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T08:59:33.286-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T09:00:04.237-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T09:00:35.272-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T09:01:06.209-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T09:01:37.636-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T09:01:41.964-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
+time=2026-09-30T09:01:43.441-05:00 level=INFO source=sched.go:1152 msg="disabling mmap for llama-server load by default" model=C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e reason=windows_cuda
+time=2026-09-30T09:01:43.441-05:00 level=INFO source=server.go:100 msg="using llama-server for model" model=C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e
+time=2026-09-30T09:01:43.450-05:00 level=INFO source=llama_server.go:436 msg="starting llama-server" cmd="C:\\Users\\Nathan\\AppData\\Local\\Programs\\Ollama\\lib\\ollama\\llama-server.exe --model C:\\Users\\Nathan\\.ollama\\models\\blobs\\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e --port 64578 --host 127.0.0.1 --no-webui --offline -c 16384 -np 1 --
+time=2026-09-30T09:01:43.454-05:00 level=INFO source=sched.go:618 msg="system memory" total="30.9 GiB" free="2.2 GiB" free_swap="11.6 GiB"
+time=2026-09-30T09:01:43.454-05:00 level=INFO source=sched.go:625 msg="gpu memory" id=0 library=CUDA available="14.2 GiB" free="14.7 GiB" minimum="457.0 MiB" overhead="0 B"
+time=2026-09-30T09:01:43.454-05:00 level=INFO source=llama_server.go:1054 msg="loading model via llama-server" model=C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e
+time=2026-09-30T09:01:43.454-05:00 level=INFO source=llama_server.go:1307 msg="waiting for llama-server to start responding"
+time=2026-09-30T09:01:43.455-05:00 level=INFO source=llama_server.go:1362 msg="waiting for llama-server to become available" status="llm server error"
+0.00.000.737 I srv  llama_server: initializing ...
+cmn  common_param: common_params_print_info: build 1 (161755f29) with Clang 18.1.8 for Windows AMD64
+cmn  common_param: common_params_print_info: verbosity = 4 (adjust with the `-lv N` CLI arg)
+cmn  common_param: device_info:
+cmn  common_param:   - CPU     : AMD Ryzen 9 9900X3D 12-Core Processor           (31652 MiB, 2058 MiB free)
+cmn  common_param:   - CUDA0   : NVIDIA GeForce RTX 5070 Ti (16302 MiB, 15037 MiB free)
+cmn  common_param: system_info: n_threads = 24 (n_threads_batch = 24) / 24 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | CUDA : ARCHS = 750,800,860,890,1000,1200 | USE_GRAPHS = 1 | FA_QUANTS = q4_0-q4_0,q8_0-q8_0,f16-f16,bf16-bf16 | 
+srv          init: using 23 threads for HTTP server
+srv          init: The UI is disabled
+srv          init: Use --ui/--no-ui (or deprecated --webui/--no-webui) to enable/disable
+srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+srv         start: binding port with default address family
+srv    load_model: loading model 'C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e'
+srv    load_model: local path 'C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e'
+srv    load_model: [mtmd] estimated worst-case memory usage of mmproj is 1161.02 MiB (took 40.87 ms)
+cmn  common_init_: fitting params to device memory ...
+cmn  common_init_: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+common_params_fit_impl: getting device memory data for initial parameters:
+time=2026-09-30T09:01:43.707-05:00 level=INFO source=llama_server.go:1362 msg="waiting for llama-server to become available" status="llm server loading model"
+common_memory_breakdown_print: | memory breakdown [MiB]  | total    free     self   model   context   compute    unaccounted |
+common_memory_breakdown_print: |   - CUDA0 (RTX 5070 Ti) | 16302 = 14887 + (12525 = 11671 +     693 +     160) +      -11109 |
+common_memory_breakdown_print: |   - Host                |                    557 =   520 +       0 +      36                |
+common_params_fit_impl: projected to use 12525 MiB of device memory vs. 14887 MiB of free device memory
+common_params_fit_impl: will leave 2361 >= 1936 MiB of free device memory, no changes needed
+common_fit_params: successfully fit params to free device memory
+common_fit_params: fitting params to free memory took 0.40 seconds
+llama_model_loader: loaded meta data with 50 key-value pairs and 866 tensors from C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e (version GGUF V3 (latest))
+llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+llama_model_loader: - kv  17:                         qwen35.block_count u32              = 65
+llama_model_loader: - kv  18:                      qwen35.context_length u32              = 262144
+llama_model_loader: - kv  19:                    qwen35.embedding_length u32              = 5120
+llama_model_loader: - kv  20:                 qwen35.feed_forward_length u32              = 17408
+llama_model_loader: - kv  21:                qwen35.attention.head_count u32              = 24
+llama_model_loader: - kv  22:             qwen35.attention.head_count_kv u32              = 4
+llama_model_loader: - kv  23:             qwen35.rope.dimension_sections arr[i32,4]       = [11, 11, 10, 0]
+llama_model_loader: - kv  24:                      qwen35.rope.freq_base f32              = 10000000.000000
+llama_model_loader: - kv  25:    qwen35.attention.layer_norm_rms_epsilon f32              = 0.000001
+llama_model_loader: - kv  26:                qwen35.attention.key_length u32              = 256
+llama_model_loader: - kv  27:              qwen35.attention.value_length u32              = 256
+llama_model_loader: - kv  28:                qwen35.nextn_predict_layers u32              = 1
+llama_model_loader: - kv  29:                     qwen35.ssm.conv_kernel u32              = 4
+llama_model_loader: - kv  30:                      qwen35.ssm.state_size u32              = 128
+llama_model_loader: - kv  31:                     qwen35.ssm.group_count u32              = 16
+llama_model_loader: - kv  32:                  qwen35.ssm.time_step_rank u32              = 48
+llama_model_loader: - kv  33:                      qwen35.ssm.inner_size u32              = 6144
+llama_model_loader: - kv  34:             qwen35.full_attention_interval u32              = 4
+llama_model_loader: - kv  35:                qwen35.rope.dimension_count u32              = 64
+llama_model_loader: - kv  46:                      quantize.imatrix.file str              = Qwen3.8-27B-GGUF/imatrix_unsloth.gguf
+llama_model_loader: - kv  47:             quantize.imatrix.entries_count u32              = 496
+llama_model_loader: - kv  48:              quantize.imatrix.chunks_count u32              = 1251
+print_info: file format = GGUF V3 (latest)
+print_info: file type   = Q3_K - Large
+print_info: file size   = 12.23 GiB (3.85 BPW) 
+llama_prepare_model_devices: using device CUDA0 (NVIDIA GeForce RTX 5070 Ti) (0000:01:00.0) - 15037 MiB free
+load: 0 unused tokens
+load:   - 248044 ('<|endoftext|>')
+load:   - 248046 ('<|im_end|>')
+load:   - 248063 ('<|fim_pad|>')
+load:   - 248064 ('<|repo_name|>')
+load:   - 248065 ('<|file_sep|>')
+print_info: arch                  = qwen35
+print_info: vocab_only            = 0
+print_info: no_alloc              = 0
+print_info: n_ctx_train           = 262144
+print_info: n_embd_inp            = 5120
+print_info: n_embd                = 5120
+print_info: n_embd_out            = 5120
+print_info: n_layer               = 64
+print_info: n_layer_all           = 65
+print_info: n_head                = 24
+print_info: n_head_kv             = 4
+print_info: n_rot                 = 64
+print_info: n_swa                 = 0
+print_info: is_swa_any            = 0
+print_info: non_causal_type       = 0
+print_info: n_embd_head_k         = 256
+print_info: n_embd_head_v         = 256
+print_info: n_gqa                 = 6
+print_info: n_embd_k_gqa          = 1024
+print_info: n_embd_v_gqa          = 1024
+print_info: f_norm_eps            = 0.0e+00
+print_info: f_norm_rms_eps        = 1.0e-06
+print_info: f_clamp_kqv           = 0.0e+00
+print_info: f_max_alibi_bias      = 0.0e+00
+print_info: f_logit_scale         = 0.0e+00
+print_info: f_attn_scale          = 0.0e+00
+print_info: f_attn_value_scale    = 0.0000
+print_info: n_ff                  = 17408
+print_info: n_expert              = 0
+print_info: n_expert_used         = 0
+print_info: n_expert_groups       = 0
+print_info: n_group_used          = 0
+print_info: causal attn           = 1
+print_info: pooling type          = -1
+print_info: rope type             = 40
+print_info: rope scaling          = linear
+print_info: freq_base_train       = 10000000.0
+print_info: freq_scale_train      = 1
+print_info: n_ctx_orig_yarn       = 262144
+print_info: rope_yarn_log_mul     = 0.0000
+print_info: rope_finetuned        = unknown
+print_info: mrope sections        = [11, 11, 10, 0]
+print_info: ssm_d_conv            = 4
+print_info: ssm_d_inner           = 6144
+print_info: ssm_d_state           = 128
+print_info: ssm_dt_rank           = 48
+print_info: ssm_n_group           = 16
+print_info: ssm_dt_b_c_rms        = 0
+print_info: model type            = 27B
+print_info: model params          = 27.32 B
+print_info: general.name          = Qwen3.8-27B
+print_info: vocab type            = BPE
+print_info: n_vocab               = 248320
+print_info: n_merges              = 247587

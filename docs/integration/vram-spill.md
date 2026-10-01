@@ -238,14 +238,14 @@ If `args` already contains `--log-file`, that file is used instead. The
 supervisor reads the log in bounded chunks (at most 256 KiB per tick, lines
 capped at 4 KiB, at most 32 distinct warnings) and looks for these lines:
 
-| code | log line (substring) |
-|---|---|
-| `kv_kernel_f16_fallback` | `no FlashAttention vector kernel compiled for K/V types q8_0-q5_1, converting K and V to f16 instead (slow)`; `details.k_type`/`v_type` |
-| `mtp_tensors_ignored` | `model has unused tensor blk.64.nextn.… -- ignoring`; folded, with `details.layer`, `tensors`, `ignored_bytes` |
-| `partial_gpu_offload` | `offloaded N/M layers to GPU` with N < M |
-| `cpu_buffer_fallback` | `cannot be used with preferred buffer type …, using CPU instead` |
-| `no_gpu_device` | `no usable GPU found` |
-| `gpu_init_failed` | `failed to initialize CUDA` |
+| code | log line (substring) | requires `-lv 4` |
+|---|---|---|
+| `kv_kernel_f16_fallback` | `no FlashAttention vector kernel compiled for K/V types q8_0-q5_1, converting K and V to f16 instead (slow)`; `details.k_type`/`v_type` | no |
+| `mtp_tensors_ignored` | `model has unused tensor blk.64.nextn.… -- ignoring`; folded, with `details.layer`, `tensors`, `ignored_bytes` | no |
+| `partial_gpu_offload` | `offloaded N/M layers to GPU` with N < M | yes |
+| `cpu_buffer_fallback` | `cannot be used with preferred buffer type …, using CPU instead` | yes |
+| `no_gpu_device` | `no usable GPU found` | no |
+| `gpu_init_failed` | `failed to initialize CUDA` | no |
 
 The first two appear exactly like this in the 2026-09-29 logs. The last four
 are taken from llama.cpp's source strings; the benchmark runs offloaded every
@@ -263,10 +263,30 @@ Set a log file for `no_gpu_device`, `gpu_init_failed` and
 `cpu_buffer_fallback` classification. Existing log read/line/warning bounds
 are unchanged.
 
+## Stall guard
+
+The native child monitor also polls `/metrics` and `/slots` at the existing
+sample cadence, with a minimum interval of five seconds. A stall is present
+only when `requests_processing > 0` and neither cumulative token counter has
+moved for `stall_seconds`. The default is enabled, 90 seconds, and `warn`.
+Warnings include `processing`, `deferred`, and monotonic `since_ms`; health
+adds `runtime.stall.detected_at` and `since_ms` while retaining `ready`.
+Scrape failures are warnings and clear stall evidence. A 404 disables polling
+for that child after one `metrics_unavailable` warning. `restart` uses the
+existing crash-restart path and counts against `max_restarts`; attach mode
+warns only because the supervisor does not own the external process.
+
+The observed child metrics are cumulative process counters, not per-request
+deltas or measured speed. Speculation records cumulative accepted and draft
+totals and positional totals. `mean_accepted_len` is reported when available;
+`speedup_est` uses `(1 + mean_accepted_len) / (1 + 0.6 * n_max)`, with
+`n_max` taken from explicit `--spec-draft-n-max` and `null` when unknown.
+
 ## Configuration
 
-These `llamaserver` JSON keys apply to spawn mode only. Each value shown is
-the default.
+GPU and log-file diagnostics apply to spawn mode. `stall_guard` also applies
+to native attach, where it can only warn. Each value shown is the default;
+`stall_seconds` accepts integers in [1, 86400].
 
 ```json
 {
@@ -297,6 +317,11 @@ the default.
       "on_eviction": "warn",
       "max_eviction_restarts": 1
     }
+  },
+  "stall_guard": {
+    "enabled": true,
+    "stall_seconds": 90,
+    "policy": "warn"
   }
 }
 ```
