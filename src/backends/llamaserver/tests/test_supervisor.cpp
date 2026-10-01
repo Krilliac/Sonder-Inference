@@ -1,4 +1,5 @@
 #include "../process.hpp"
+#include "../child_metrics.hpp"
 #include "../supervisor.hpp"
 #include "fake_process.hpp"
 #include "fake_server.hpp"
@@ -7,6 +8,14 @@
 #include <doctest/doctest.h>
 #include <mutex>
 #include <thread>
+#include <limits>
+#include <filesystem>
+#include <fstream>
+#include "sonder/inference/engine.hpp"
+#include "sonder/inference/backends/llamaserver.hpp"
+#if defined(SONDER_HAS_SERVER)
+#include "sonder/inference/backend_setup.hpp"
+#endif
 
 #if !defined(_WIN32)
 #include <cerrno>
@@ -21,6 +30,612 @@
 using namespace sonder::inference;
 using namespace sonder::inference::llamaserver;
 using namespace sonder_test;
+
+namespace {
+constexpr const char *kChildMetrics =
+    "# HELP ignored exposition comments\n"
+    "llamacpp:prompt_tokens_seconds 1050.5\n"
+    "llamacpp:predicted_tokens_seconds 86.8\n"
+    "llamacpp:prompt_tokens_total 2500\n"
+    "llamacpp:tokens_predicted_total 1500\n"
+    "llamacpp:requests_processing 1\n"
+    "llamacpp:requests_deferred 2\n"
+    "llamacpp:n_busy_slots_per_decode 1.5\n"
+    "llamacpp:n_decode_total 1000\n"
+    "llamacpp:spec_decode_num_draft_tokens_total 2000\n"
+    "llamacpp:spec_decode_accepted_tokens_total 1500\n"
+    "llamacpp:spec_decode_drafts_total 1000\n"
+    "llamacpp:spec_decode_accepted_tokens_per_pos_total{position=\"0\"} 900\n"
+    "llamacpp:spec_decode_accepted_tokens_per_pos_total{position=\"1\"} 600\n"
+    "llamacpp:kv_cache_usage_ratio 0.25\n";
+constexpr const char *kChildSlots = R"([{"id":0,"is_processing":true,"n_ctx":77824}])";
+using MetricsClock = std::chrono::steady_clock;
+
+ChildMetricsPoll frozen_metrics() {
+    return [](const net::HttpRequest &request, const CancellationToken &) {
+        return ChildMetricsHttpResponse{200, request.target == "/metrics" ? kChildMetrics : kChildSlots};
+    };
+}
+} // namespace
+
+TEST_CASE("child metrics parse every documented counter and cumulative speculation") {
+    const auto metrics = parse_child_metrics(kChildMetrics);
+    CHECK(metrics.prompt_tokens_seconds == 1050.5);
+    CHECK(metrics.predicted_tokens_seconds == 86.8);
+    CHECK(metrics.prompt_tokens_total == 2500);
+    CHECK(metrics.tokens_predicted_total == 1500);
+    CHECK(metrics.requests_processing == 1);
+    CHECK(metrics.requests_deferred == 2);
+    CHECK(metrics.n_busy_slots_per_decode == 1.5);
+    CHECK(metrics.n_decode_total == 1000);
+    CHECK(metrics.spec_decode_num_draft_tokens_total == 2000);
+    CHECK(metrics.spec_decode_accepted_tokens_total == 1500);
+    CHECK(metrics.spec_decode_drafts_total == 1000);
+    CHECK(metrics.kv_cache_usage_ratio == 0.25);
+    ChildMetricsOptions options;
+    options.n_max = 2;
+    const auto derived = derive_child_speculation(metrics, options);
+    REQUIRE(derived.mean_accepted_len);
+    CHECK(*derived.mean_accepted_len == doctest::Approx(1.5));
+    REQUIRE(derived.acceptance_by_position.size() == 2);
+    CHECK(*derived.acceptance_by_position[0] == doctest::Approx(0.9));
+    CHECK(*derived.acceptance_by_position[1] == doctest::Approx(0.6));
+    CHECK(*derived.speedup_est == doctest::Approx(2.5 / 2.2));
+}
+
+TEST_CASE("child metrics reject invalid numbers and bound adversarial position labels") {
+    for (const auto *body : {"llamacpp:prompt_tokens_seconds NaN\n",
+        "llamacpp:predicted_tokens_seconds -5\n",
+        "llamacpp:prompt_tokens_total 18446744073709551616\n",
+        "llamacpp:tokens_predicted_total -1\n",
+        "llamacpp:requests_processing 0.5\n",
+        "llamacpp:requests_deferred +Inf\n",
+        "llamacpp:spec_decode_accepted_tokens_per_pos_total{position=\"18446744073709551615\"} 1\n",
+        "llamacpp:spec_decode_accepted_tokens_per_pos_total{position=\"1junk\"} 1\n",
+        "llamacpp:spec_decode_accepted_tokens_per_pos_total{notposition=\"0\"} 1\n"}) {
+        const auto metrics = parse_child_metrics(body);
+        CHECK_FALSE(metrics.valid);
+        CHECK_FALSE(metrics.prompt_tokens_seconds);
+        CHECK_FALSE(metrics.predicted_tokens_seconds);
+        CHECK_FALSE(metrics.prompt_tokens_total);
+        CHECK_FALSE(metrics.tokens_predicted_total);
+        CHECK_FALSE(metrics.requests_processing);
+        CHECK_FALSE(metrics.requests_deferred);
+        CHECK(metrics.spec_decode_accepted_tokens_per_position.empty());
+    }
+}
+
+TEST_CASE("child metrics accept exposition whitespace timestamps and exact integer counters") {
+    const auto metrics = parse_child_metrics(
+        " \t \r\n"
+        "  llamacpp:prompt_tokens_total 18446744073709551615 \r\n"
+        "llamacpp:tokens_predicted_total 2.5e3 123456\n"
+        "llamacpp:requests_processing 1\t\n"
+        "llamacpp:spec_decode_accepted_tokens_per_pos_total{position=\"0\"} 3 \n");
+    CHECK(metrics.valid);
+    CHECK(metrics.prompt_tokens_total == std::numeric_limits<std::uint64_t>::max());
+    CHECK(metrics.tokens_predicted_total == 2500);
+    CHECK(metrics.requests_processing == 1);
+    REQUIRE(metrics.spec_decode_accepted_tokens_per_position.size() == 1);
+    CHECK(metrics.spec_decode_accepted_tokens_per_position[0] == 3);
+}
+
+TEST_CASE("child speculation absent evidence remains null") {
+    ChildMetricsOptions options;
+    options.n_max = 2;
+    auto metrics = parse_child_metrics("llamacpp:spec_decode_drafts_total 0\n");
+    auto derived = derive_child_speculation(metrics, options);
+    CHECK_FALSE(derived.mean_accepted_len);
+    CHECK_FALSE(derived.speedup_est);
+    metrics = parse_child_metrics(kChildMetrics);
+    options.n_max.reset();
+    derived = derive_child_speculation(metrics, options);
+    CHECK(derived.mean_accepted_len);
+    CHECK_FALSE(derived.speedup_est);
+}
+
+TEST_CASE("child slots reject bogus unsigned and bool values without echoing prompts") {
+    const auto slots = parse_child_slots(
+        R"([{"id":0,"is_processing":true,"n_ctx":77824,"prompt":"private"},)"
+        R"({"id":-1,"is_processing":"yes","n_ctx":0.5}])");
+    REQUIRE(slots.size() == 2);
+    CHECK(slots[0].id == 0);
+    CHECK(slots[0].is_processing == true);
+    CHECK(slots[0].n_ctx == 77824);
+    CHECK_FALSE(slots[1].id);
+    CHECK_FALSE(slots[1].is_processing);
+    CHECK_FALSE(slots[1].n_ctx);
+    ChildSnapshot snapshot;
+    snapshot.slots = slots;
+    CHECK(json::Value(snapshot.to_json()).dump().find("private") == std::string::npos);
+}
+
+TEST_CASE("child metrics frozen processing warns once and retains live stall health") {
+    ChildMetricsOptions options;
+    options.n_max = 2;
+    ChildMetricsSampler sampler(options, frozen_metrics());
+    const auto now = MetricsClock::now();
+    CHECK(sampler.sample_at(1234, now).warnings.empty());
+    CHECK(sampler.sample_at(1234, now + std::chrono::seconds(89)).warnings.empty());
+    auto sample = sampler.sample_at(1234, now + std::chrono::seconds(90));
+    REQUIRE(sample.warnings.size() == 1);
+    CHECK(sample.warnings.front().code == "backend_stalled");
+    REQUIRE(sample.stall);
+    CHECK(sample.stall->find("since_ms")->as_int() == 90000);
+    CHECK_FALSE(sample.restart_requested);
+    const auto detected = sample.stall->find("detected_at")->as_int();
+    sample = sampler.sample_at(1234, now + std::chrono::seconds(95));
+    CHECK(sample.warnings.empty());
+    REQUIRE(sample.stall);
+    CHECK(sample.stall->find("detected_at")->as_int() == detected);
+    CHECK(sample.stall->find("since_ms")->as_int() == 95000);
+    REQUIRE(sample.snapshot);
+    const auto child = sample.snapshot->to_json();
+    CHECK(child.find("port")->as_uint() == 1234);
+    CHECK(child.find("metrics")->find("requests_processing")->as_uint() == 1);
+    CHECK(child.find("slots")->as_array().front().find("n_ctx")->as_uint() == 77824);
+    CHECK(child.find("speculation")->find("mean_accepted_len")->as_double() == doctest::Approx(1.5));
+    CHECK(child.find("sampled_at")->is_number());
+}
+
+TEST_CASE("child moving either counter and idle transitions clear stall evidence") {
+    std::string body = kChildMetrics;
+    ChildMetricsSampler sampler({}, [&](const net::HttpRequest &request, const CancellationToken &) {
+        return ChildMetricsHttpResponse{200, request.target == "/metrics" ? body : kChildSlots};
+    });
+    const auto now = MetricsClock::now();
+    (void)sampler.sample_at(1234, now);
+    for (unsigned i = 1; i <= 4; ++i) {
+        body = "llamacpp:requests_processing 1\nllamacpp:prompt_tokens_total " + std::to_string(2500 + i) +
+               "\nllamacpp:tokens_predicted_total 1500\n";
+        const auto sample = sampler.sample_at(1234, now + std::chrono::seconds(80 * i));
+        CHECK(sample.warnings.empty());
+        CHECK_FALSE(sample.stall);
+    }
+    body = "llamacpp:requests_processing 1\nllamacpp:prompt_tokens_total 2504\nllamacpp:tokens_predicted_total 1501\n";
+    CHECK(sampler.sample_at(1234, now + std::chrono::seconds(400)).warnings.empty());
+    REQUIRE(sampler.sample_at(1234, now + std::chrono::seconds(490)).stall);
+    body = "llamacpp:requests_processing 0\nllamacpp:prompt_tokens_total 2504\nllamacpp:tokens_predicted_total 1501\n";
+    CHECK_FALSE(sampler.sample_at(1234, now + std::chrono::seconds(500)).stall);
+}
+
+TEST_CASE("child scrape failures and counter reset break continuous stall evidence") {
+    int status = 200;
+    std::string body = kChildMetrics;
+    ChildMetricsSampler sampler({}, [&](const net::HttpRequest &request, const CancellationToken &) {
+        return ChildMetricsHttpResponse{status, request.target == "/metrics" ? body : kChildSlots};
+    });
+    const auto now = MetricsClock::now();
+    (void)sampler.sample_at(1234, now);
+    status = 503;
+    auto failed = sampler.sample_at(1234, now + std::chrono::seconds(80));
+    REQUIRE(failed.warnings.size() == 1);
+    CHECK(failed.warnings.front().code == "metrics_scrape_failed");
+    CHECK_FALSE(failed.stall);
+    status = 200;
+    CHECK_FALSE(sampler.sample_at(1234, now + std::chrono::seconds(100)).stall);
+    CHECK_FALSE(sampler.sample_at(1234, now + std::chrono::seconds(189)).stall);
+    body = "llamacpp:requests_processing 1\nllamacpp:prompt_tokens_total 1\nllamacpp:tokens_predicted_total 1\n";
+    CHECK_FALSE(sampler.sample_at(1234, now + std::chrono::seconds(190)).stall);
+    CHECK_FALSE(sampler.sample_at(1234, now + std::chrono::seconds(279)).stall);
+}
+
+TEST_CASE("child needs both counters for stall detection and disabled guard still scrapes") {
+    for (const auto *body : {"llamacpp:requests_processing 1\nllamacpp:prompt_tokens_total 1\n",
+                             "llamacpp:requests_processing 1\nllamacpp:tokens_predicted_total 1\n"}) {
+        ChildMetricsSampler sampler({}, [body](const net::HttpRequest &request, const CancellationToken &) {
+            return ChildMetricsHttpResponse{200, request.target == "/metrics" ? body : kChildSlots};
+        });
+        const auto now = MetricsClock::now();
+        (void)sampler.sample_at(1234, now);
+        const auto later = sampler.sample_at(1234, now + std::chrono::seconds(100));
+        CHECK_FALSE(later.stall);
+        CHECK_FALSE(later.restart_requested);
+    }
+    ChildMetricsOptions disabled;
+    disabled.enabled = false;
+    ChildMetricsSampler sampler(disabled, frozen_metrics());
+    const auto now = MetricsClock::now();
+    REQUIRE(sampler.sample_at(1234, now).snapshot);
+    const auto later = sampler.sample_at(1234, now + std::chrono::seconds(100));
+    CHECK(later.snapshot);
+    CHECK(later.warnings.empty());
+    CHECK_FALSE(later.stall);
+}
+
+TEST_CASE("child metrics 404 suppresses all later polling until a new child") {
+    for (const bool slots_missing : {false, true}) {
+        unsigned polls = 0;
+        ChildMetricsSampler sampler({}, [&](const net::HttpRequest &request, const CancellationToken &) {
+            ++polls;
+            return ChildMetricsHttpResponse{slots_missing && request.target == "/metrics" ? 200 : 404, kChildMetrics};
+        });
+        const auto first = sampler.sample(1234);
+        REQUIRE(first.warnings.size() == 1);
+        CHECK(first.warnings.front().code == "metrics_unavailable");
+        const auto count = polls;
+        CHECK(sampler.sample(1234).warnings.empty());
+        CHECK(sampler.sample(1234).warnings.empty());
+        CHECK(polls == count);
+        sampler.reset(1234);
+        CHECK(sampler.sample(1234).warnings.size() == 1);
+        CHECK(polls > count);
+    }
+}
+
+TEST_CASE("child restart policy requests one restart per continuous stall episode") {
+    ChildMetricsOptions options;
+    options.policy = "restart";
+    ChildMetricsSampler sampler(options, frozen_metrics());
+    const auto now = MetricsClock::now();
+    (void)sampler.sample_at(1234, now);
+    CHECK(sampler.sample_at(1234, now + std::chrono::seconds(90)).restart_requested);
+    CHECK_FALSE(sampler.sample_at(1234, now + std::chrono::seconds(180)).restart_requested);
+    sampler.reset(1234);
+    CHECK_FALSE(sampler.sample_at(1234, now + std::chrono::seconds(190)).restart_requested);
+}
+
+TEST_CASE("child metrics scrape real fake endpoints and preserve cached poll counts on 404") {
+    FakeLlamaServer server;
+    server.set_metrics(kChildMetrics);
+    server.set_slots(kChildSlots);
+    auto url = net::parse_url(server.url());
+    REQUIRE(url.ok());
+    ChildMetricsSampler sampler;
+    const auto sample = sampler.sample(url->port);
+    REQUIRE(sample.snapshot);
+    CHECK(sample.snapshot->metrics.prompt_tokens_total == 2500);
+    CHECK(server.metrics_requests() == 1);
+    CHECK(server.slots_requests() == 1);
+    server.set_metrics("", 404);
+    REQUIRE(sampler.sample(url->port).warnings.size() == 1);
+    (void)sampler.sample(url->port);
+    CHECK(server.metrics_requests() == 2);
+    CHECK(server.slots_requests() == 1);
+}
+
+TEST_CASE("child attach preserves base path TLS policy and bounded observation budgets") {
+    net::HttpRequest endpoint;
+    endpoint.host = "private.invalid";
+    endpoint.port = 8443;
+    endpoint.target = "/inference/";
+    endpoint.use_tls = true;
+    endpoint.tls.pinned_sha256 = "test-only-pin";
+    endpoint.tls.ca_bundle_path = "test-only-ca";
+    endpoint.tls.server_name = "private.invalid";
+    unsigned calls = 0;
+    ChildMetricsSampler sampler({}, [&](const net::HttpRequest &request, const CancellationToken &) {
+        ++calls;
+        CHECK(request.host == endpoint.host);
+        CHECK(request.port == 8443);
+        CHECK(request.use_tls);
+        CHECK(request.tls.pinned_sha256 == endpoint.tls.pinned_sha256);
+        CHECK(request.tls.ca_bundle_path == endpoint.tls.ca_bundle_path);
+        CHECK(request.tls.server_name == endpoint.tls.server_name);
+        CHECK_FALSE(request.tls.insecure_skip_verify);
+        CHECK(request.connect_timeout <= std::chrono::milliseconds(250));
+        CHECK(request.total_timeout <= std::chrono::milliseconds(250));
+        CHECK(request.tls.handshake_timeout <= std::chrono::milliseconds(250));
+        CHECK((request.target == "/inference/metrics" || request.target == "/inference/slots"));
+        return ChildMetricsHttpResponse{200, request.target.ends_with("/metrics") ? kChildMetrics : kChildSlots};
+    });
+    CHECK(sampler.sample_at(endpoint, MetricsClock::now()).snapshot);
+    CHECK(calls == 2);
+    CancellationSource cancelled;
+    cancelled.cancel();
+    CHECK_FALSE(sampler.sample_at(endpoint, MetricsClock::now(), cancelled.token()).polled);
+    CHECK(calls == 2);
+}
+
+TEST_CASE("child malformed payload and thrown transport produce warnings without stall evidence") {
+    bool throwing = true;
+    ChildMetricsSampler sampler({}, [&](const net::HttpRequest &request, const CancellationToken &) -> ChildMetricsHttpResponse {
+        if (throwing) throw std::runtime_error("private upstream body must never escape");
+        return {200, request.target == "/metrics" ? kChildMetrics : "not json"};
+    });
+    const auto first = sampler.sample(1234);
+    CHECK(first.polled);
+    REQUIRE(first.warnings.size() == 1);
+    CHECK(first.warnings.front().code == "metrics_scrape_failed");
+    CHECK(first.warnings.front().message.find("private") == std::string::npos);
+    throwing = false;
+    const auto second = sampler.sample(1234);
+    CHECK(second.polled);
+    CHECK_FALSE(second.snapshot);
+    CHECK_FALSE(second.stall);
+    CHECK(second.warnings.empty()); // one failure episode
+}
+
+TEST_CASE("supervisor health includes the ready child port before its first metrics poll") {
+    // Regression: health said ready throughout the measured five-minute hang
+    // but did not identify the upstream port or expose child observations.
+    auto state = std::make_shared<LaunchState>();
+    auto options = base_options();
+    options.health_check = [](std::uint16_t, std::chrono::milliseconds) { return true; };
+    options.spill_guard.enabled = false;
+    Supervisor supervisor(options, std::make_unique<FakeLauncher>(state));
+    const auto ready = supervisor.start();
+    REQUIRE(ready.ok());
+    const auto runtime = to_json(supervisor.runtime_status());
+    const auto *child = runtime.find("child");
+    REQUIRE(child != nullptr);
+    REQUIRE(child->find("port") != nullptr);
+    CHECK(child->find("port")->as_uint() == ready.value());
+    supervisor.stop();
+}
+
+TEST_CASE("supervisor stall restart uses crash budget and emits one restart with its reason") {
+    auto state = std::make_shared<LaunchState>();
+    auto options = base_options();
+    options.health_check = [](std::uint16_t, std::chrono::milliseconds) { return true; };
+    options.spill_guard.enabled = false;
+    options.stall_guard.policy = "restart";
+    options.max_restarts = 1;
+    std::atomic<std::int64_t> elapsed{0};
+    options.metrics_clock = [&] { return MetricsClock::time_point(std::chrono::milliseconds(elapsed.load())); };
+    std::atomic<unsigned> polls{0};
+    options.metrics_poll = [&](const net::HttpRequest &request, const CancellationToken &) {
+        if (request.target == "/metrics")
+            ++polls;
+        return ChildMetricsHttpResponse{200, request.target == "/metrics" ? kChildMetrics : kChildSlots};
+    };
+    Supervisor supervisor(options, std::make_unique<FakeLauncher>(state));
+    REQUIRE(supervisor.start().ok());
+    const auto wait_polls = [&](unsigned count) {
+        const auto end = MetricsClock::now() + std::chrono::seconds(2);
+        while (polls.load() < count && MetricsClock::now() < end)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        return polls.load() >= count;
+    };
+    REQUIRE(wait_polls(1));
+    // Wait for snapshot publication before advancing the injected clock.
+    const auto published = [&] {
+        const auto state_json = supervisor.child_runtime_status();
+        return state_json.find("child") && !state_json.find("child")->find("sampled_at")->is_null();
+    };
+    for (int i = 0; i < 1000 && !published(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    REQUIRE(published());
+    elapsed.store(95000);
+    REQUIRE(wait_for_starts(state, 2));
+    REQUIRE(supervisor.start().ok());
+    REQUIRE(wait_polls(3)); // the replacement gets its own baseline
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    elapsed.store(190000);
+    REQUIRE(wait_polls(4));
+    for (int i = 0; i < 1000 && child_at(state, 1)->stops.load() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CHECK_FALSE(supervisor.start().ok());
+    supervisor.stop();
+    CHECK(state->starts.size() == 2);
+    const auto events = supervisor.runtime_events()->drain();
+    unsigned restarts = 0;
+    unsigned stalls = 0;
+    for (const auto &[type, attrs] : events) {
+        if (type == "backend.restart") {
+            ++restarts;
+            CHECK(attrs.find("reason")->as_string() == "backend_stalled");
+            CHECK(attrs.find("attempt")->as_uint() == 1);
+        }
+        if (type == "backend.warning" && attrs.find("kind") &&
+            attrs.find("kind")->as_string() == "backend_stalled") {
+            ++stalls;
+            CHECK(attrs.find("processing")->as_uint() == 1);
+            CHECK(attrs.find("deferred")->as_uint() == 2);
+        }
+    }
+    CHECK(restarts == 1);
+    CHECK(stalls == 2);
+}
+
+TEST_CASE("supervisor generic mode never polls native endpoints") {
+    auto state = std::make_shared<LaunchState>();
+    auto options = base_options();
+    options.native_completion = false;
+    options.spill_guard.enabled = false;
+    options.health_check = [](std::uint16_t, std::chrono::milliseconds) { return true; };
+    std::atomic<unsigned> polls{0};
+    options.metrics_poll = [&](const net::HttpRequest &, const CancellationToken &) {
+        ++polls;
+        return ChildMetricsHttpResponse{404, {}};
+    };
+    Supervisor supervisor(options, std::make_unique<FakeLauncher>(state));
+    REQUIRE(supervisor.start().ok());
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    supervisor.stop();
+    CHECK(polls.load() == 0);
+    CHECK_FALSE(supervisor.child_runtime_status().contains("child"));
+}
+
+TEST_CASE("supervisor attach samples without a process and never restarts external ownership") {
+    FakeLlamaServer server;
+    server.set_metrics(kChildMetrics);
+    server.set_slots(kChildSlots);
+    const auto endpoint = net::parse_url(server.url());
+    REQUIRE(endpoint.ok());
+    SupervisorOptions options;
+    net::HttpRequest request;
+    request.host = endpoint->host;
+    request.port = endpoint->port;
+    options.attached_endpoint = request;
+    options.spill_guard.enabled = false;
+    options.stall_guard.policy = "restart";
+    std::atomic<std::int64_t> elapsed{0};
+    options.metrics_clock = [&] { return MetricsClock::time_point(std::chrono::milliseconds(elapsed.load())); };
+    Supervisor supervisor(options);
+    REQUIRE(supervisor.start().ok());
+    const auto sampled = [&] {
+        const auto state_json = supervisor.child_runtime_status();
+        return state_json.find("child") && !state_json.find("child")->find("sampled_at")->is_null();
+    };
+    for (int i = 0; i < 1000 && !sampled(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    REQUIRE(sampled());
+    elapsed.store(95000);
+    for (int i = 0; i < 1000 && !supervisor.child_runtime_status().contains("stall"); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CHECK(supervisor.child_runtime_status().contains("stall"));
+    CHECK(supervisor.running());
+    supervisor.stop();
+    for (const auto &[type, attrs] : supervisor.runtime_events()->drain()) {
+        (void)attrs;
+        CHECK(type != "backend.restart");
+    }
+    // Its listener still works after the observer stops.
+    ChildMetricsSampler sampler;
+    CHECK(sampler.sample(endpoint->port).snapshot);
+}
+
+TEST_CASE("native attach backend exposes child health while retaining its existing health probe") {
+    FakeLlamaServer server;
+    server.set_metrics(kChildMetrics);
+    server.set_slots(kChildSlots);
+    LlamaServerBackendOptions options;
+    options.base_url = server.url();
+    options.args = {"--spec-draft-n-max", "2"};
+    const auto backend = make_llamaserver_backend(options);
+    REQUIRE(backend->probe().ok());
+    json::Object runtime;
+    const auto end = MetricsClock::now() + std::chrono::seconds(2);
+    do {
+        const auto status = backend->runtime_status();
+        if (status) runtime = to_json(*status);
+        const auto *child = runtime.find("child");
+        if (child && !child->find("sampled_at")->is_null()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    } while (MetricsClock::now() < end);
+    const auto *child = runtime.find("child");
+    REQUIRE(child);
+    CHECK(child->find("port")->as_uint() == net::parse_url(server.url())->port);
+    CHECK(child->find("metrics")->find("prompt_tokens_total")->as_uint() == 2500);
+    CHECK(child->find("speculation")->find("speedup_est")->as_double() == doctest::Approx(2.5 / 2.2));
+    REQUIRE(runtime.find("diagnostics"));
+    CHECK(runtime.find("diagnostics")->find("offload")->as_string() == "blind");
+    CHECK(server.models_requests() == 1); // existing probe uses /v1/models
+    CHECK(server.health_requests() == 0);
+}
+
+TEST_CASE("supervisor observability queue is bounded and health does not drain events") {
+    Supervisor::RuntimeEvents events;
+    for (unsigned i = 0; i < 100; ++i)
+        events.push("backend.metrics.sample", {{"sample", i}});
+    const auto drained = events.drain();
+    REQUIRE(drained.size() == 65);
+    CHECK(drained.back().first == "backend.metrics.dropped");
+    CHECK(drained.back().second.find("dropped_events")->as_uint() == 36);
+    CHECK(events.drain().empty());
+}
+
+TEST_CASE("engine emits every child poll and health snapshots never consume queued observations") {
+    auto state = std::make_shared<LaunchState>();
+    auto options = base_options();
+    options.spill_guard.enabled = false;
+    options.spill_guard.sample_interval = std::chrono::milliseconds(100);
+    options.health_check = [](std::uint16_t, std::chrono::milliseconds) { return true; };
+    std::atomic<std::int64_t> elapsed{0};
+    options.metrics_clock = [&] { return MetricsClock::time_point(std::chrono::milliseconds(elapsed.load())); };
+    options.metrics_poll = frozen_metrics();
+    auto supervisor = std::make_shared<Supervisor>(options, std::make_unique<FakeLauncher>(state));
+    REQUIRE(supervisor->start().ok());
+    const auto wait_sample = [&](std::int64_t timestamp) {
+        const auto end = MetricsClock::now() + std::chrono::seconds(2);
+        while (MetricsClock::now() < end) {
+            const auto runtime = supervisor->child_runtime_status();
+            if (const auto *child = runtime.find("child")) {
+                const auto *sampled = child->find("sampled_at");
+                if (sampled && !sampled->is_null() && sampled->as_int() == timestamp) return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return false;
+    };
+    REQUIRE(wait_sample(0));
+    elapsed.store(4999);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK(wait_sample(0)); // the shorter GPU cadence must not increase HTTP polling
+    elapsed.store(5000);
+    REQUIRE(wait_sample(5000));
+    elapsed.store(10000);
+    REQUIRE(wait_sample(10000));
+    for (unsigned i = 0; i < 5; ++i) (void)to_json(supervisor->runtime_status());
+    class ObservedBackend final : public Backend {
+      public:
+        explicit ObservedBackend(std::shared_ptr<Supervisor> s) : supervisor_(std::move(s)) {}
+        std::string name() const override { return "fake-child-observer"; }
+        std::string description() const override { return "test-only child observations"; }
+        BackendCapabilities capabilities() const override { return {}; }
+        Result<std::string> probe() override { return std::string("fake"); }
+        Result<std::vector<ModelDescriptor>> list_models() override { return std::vector<ModelDescriptor>{}; }
+        Result<std::shared_ptr<BackendModel>> load_model(const ModelLoadOptions &) override {
+            return Status(ErrorCode::unsupported, "fake observations only");
+        }
+        std::optional<BackendRuntimeStatus> runtime_status() const override { return supervisor_->runtime_status(); }
+      private:
+        std::shared_ptr<Supervisor> supervisor_;
+    };
+    auto sink = std::make_shared<MemoryTelemetrySink>();
+    EngineOptions engine_options;
+    engine_options.telemetry_sinks.push_back(sink);
+    engine_options.device_sample_interval = std::chrono::milliseconds(10);
+    engine_options.sample_devices_on_start = false;
+    engine_options.scheduling.enabled = false;
+    Engine engine(engine_options);
+    REQUIRE(engine.register_backend(std::make_shared<ObservedBackend>(supervisor)).ok());
+    std::vector<json::Value> samples;
+    const auto end = MetricsClock::now() + std::chrono::seconds(2);
+    do {
+        samples.clear();
+        for (const auto &line : sink->lines()) {
+            const auto event = json::parse(line);
+            if (event.ok() && event->find("event_type")->as_string() == "backend.metrics.sample")
+                samples.push_back(event.value());
+        }
+        if (samples.size() >= 3) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    } while (MetricsClock::now() < end);
+    REQUIRE(samples.size() == 3);
+    for (std::size_t i = 0; i < samples.size(); ++i) {
+        CHECK(samples[i].find("schema")->as_string() == "sonder.observatory.event/1");
+        const auto *attrs = samples[i].find("attributes");
+        REQUIRE(attrs);
+        CHECK(attrs->find("backend")->as_string() == "fake-child-observer");
+        CHECK(attrs->find("sampled_at")->as_uint() == i * 5000);
+        CHECK(attrs->find("metrics")->find("requests_processing")->as_uint() == 1);
+    }
+    supervisor->stop();
+}
+
+#if defined(SONDER_HAS_SERVER)
+TEST_CASE("stall guard config is strict transactional and preserves defaults") {
+    BackendSetup setup;
+    CHECK(setup.llamaserver_stall_guard);
+    CHECK(setup.llamaserver_stall_seconds == 90);
+    CHECK(setup.llamaserver_stall_policy == "warn");
+    struct TempConfig {
+        std::filesystem::path path = std::filesystem::current_path() /
+            (".l3-stall-config-" + std::to_string(MetricsClock::now().time_since_epoch().count()) + ".json");
+        ~TempConfig() { std::error_code ec; std::filesystem::remove(path, ec); }
+        void write(const std::string &text) const { std::ofstream out(path, std::ios::binary); out << text; }
+    } config;
+    config.write(R"({"stall_guard":{"enabled":false,"stall_seconds":120,"policy":"restart"}})");
+    REQUIRE(load_llamaserver_config(config.path.string(), setup).ok());
+    CHECK_FALSE(setup.llamaserver_stall_guard);
+    CHECK(setup.llamaserver_stall_seconds == 120);
+    CHECK(setup.llamaserver_stall_policy == "restart");
+    for (const auto *bad : {"[]", "null", "true", R"({"enabled":1})", R"({"stall_seconds":0})",
+                            R"({"stall_seconds":86401})", R"({"stall_seconds":1.5})",
+                            R"({"stall_seconds":"90"})", R"({"policy":"refuse"})",
+                            R"({"policy":false})", R"({"unknown":1})"}) {
+        config.write(std::string(R"({"mode":"spawn","stall_guard":)") + bad + "}");
+        const auto old = setup;
+        CHECK_FALSE(load_llamaserver_config(config.path.string(), setup).ok());
+        CHECK(setup.llamaserver_mode == old.llamaserver_mode);
+        CHECK(setup.llamaserver_stall_seconds == old.llamaserver_stall_seconds);
+        CHECK(setup.llamaserver_stall_policy == old.llamaserver_stall_policy);
+        CHECK(setup.llamaserver_stall_guard == old.llamaserver_stall_guard);
+    }
+}
+#endif
 
 TEST_CASE("supervisor polls readiness false false true and appends loopback binding") {
     auto state = std::make_shared<LaunchState>();

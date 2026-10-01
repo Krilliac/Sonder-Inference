@@ -100,6 +100,12 @@ void Engine::sample_backend_runtime() {
             continue;
         }
         const std::string name = backend->name();
+        if (status->take_events) {
+            for (auto& [type, attrs] : status->take_events()) {
+                attrs.set("backend", name);
+                telemetry_->emit(std::move(type), engine_context(), std::move(attrs), TelemetryLevel::metrics);
+            }
+        }
         if (status->warmup) {
             const auto& warmup = *status->warmup;
             auto& [generation, slots] = runtime_warmups_seen_[name];
@@ -129,6 +135,11 @@ void Engine::sample_backend_runtime() {
         }
         auto& emitted = runtime_warnings_seen_[name];
         for (const auto& w : status->warnings) {
+            // These observations are queued per episode/poll, independently
+            // of the slower engine sampler and health snapshot frequency.
+            if (status->take_events && (w.code == "backend_stalled" || w.code == "diagnostics_blind" ||
+                                       w.code == "metrics_unavailable" || w.code == "metrics_scrape_failed"))
+                continue;
             std::string key = w.code + '\n' + w.source + '\n' + w.message;
             if (std::find(emitted.begin(), emitted.end(), key) != emitted.end()) {
                 continue;

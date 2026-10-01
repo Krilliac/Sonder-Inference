@@ -4,6 +4,7 @@
 // telemetry streams closed).
 #include <doctest/doctest.h>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -31,6 +32,43 @@ std::string read_file(const fs::path& p) {
     ss << in.rdbuf();
     return ss.str();
 }
+
+// Reads the ready file the server has just renamed into place. On Windows the
+// rename keeps a handle with DELETE access on the file for a moment after the
+// new name is visible (for milliseconds when the renaming thread is preempted
+// right there, as on a loaded CI machine), and std::ifstream shares only read
+// and write, so an open in that window fails with a sharing violation (errno
+// EACCES) although the file is complete. A failed open is retried for up to
+// `patience`; whatever is read once the file opens is returned unchanged, so a
+// truncated or malformed file still fails the caller's parse.
+std::string read_ready_file(const fs::path& p, std::chrono::milliseconds patience = std::chrono::milliseconds(5000)) {
+    const auto deadline = std::chrono::steady_clock::now() + patience;
+    for (;;) {
+        std::ifstream in(p, std::ios::binary);
+        if (in) {
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            return ss.str();
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return {};
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
+// Joins the serve_main thread if a failed REQUIRE unwinds the test first. A
+// joinable std::thread destroyed by unwinding calls std::terminate, which
+// turns one failed assertion into a crash of the whole test binary.
+struct JoinRunner {
+    std::thread& thread;
+    ~JoinRunner() {
+        if (thread.joinable()) {
+            srv::request_shutdown();
+            thread.join();
+        }
+    }
+};
 
 int run(const std::vector<std::string>& args, std::string& out_text, std::string& err_text) {
     std::ostringstream out;
@@ -213,8 +251,9 @@ TEST_CASE("serve_main: ready file, banner, access log and graceful shutdown via 
         err_text = local_err.str();
         done.set_value(rc);
     });
+    JoinRunner join_runner{runner};
     REQUIRE(eventually([&] { return fs::exists(ready); }, std::chrono::milliseconds(10000)));
-    auto doc = json::parse(read_file(ready));
+    auto doc = json::parse(read_ready_file(ready));
     REQUIRE(doc.ok());
     const std::string url = doc.value().find("url")->as_string();
     CHECK(url.rfind("http://127.0.0.1:", 0) == 0);
@@ -304,8 +343,9 @@ TEST_CASE("serve_main: a wildcard bind names the bind address and the local URL"
         err_text = local_err.str();
         done.set_value(rc);
     });
+    JoinRunner join_runner{runner};
     REQUIRE(eventually([&] { return fs::exists(ready); }, std::chrono::milliseconds(10000)));
-    auto doc = json::parse(read_file(ready));
+    auto doc = json::parse(read_ready_file(ready));
     REQUIRE(doc.ok());
     const std::string url = doc.value().find("url")->as_string();
     const std::string port = url.substr(url.rfind(':') + 1);
@@ -319,3 +359,31 @@ TEST_CASE("serve_main: a wildcard bind names the bind address and the local URL"
     std::error_code ec;
     fs::remove(token, ec);
 }
+
+#if defined(_WIN32)
+TEST_CASE("serve_main tests: a ready file held open for delete is read once it is released") {
+    const auto path = temp_path("held-for-delete.json");
+    {
+        std::ofstream(path, std::ios::binary) << "{\"ok\":true}\n";
+    }
+    // What a rename leaves on the file for a moment: a handle with DELETE
+    // access that shares everything.
+    HANDLE held = ::CreateFileW(path.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    REQUIRE(held != INVALID_HANDLE_VALUE);
+    {
+        // The hazard itself: a plain std::ifstream cannot open the file now.
+        std::ifstream in(path, std::ios::binary);
+        CHECK_FALSE(in.is_open());
+    }
+    std::thread release([held] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        ::CloseHandle(held);
+    });
+    const std::string text = read_ready_file(path);
+    release.join();
+    CHECK(text == "{\"ok\":true}\n");
+    std::error_code ec;
+    fs::remove(path, ec);
+}
+#endif

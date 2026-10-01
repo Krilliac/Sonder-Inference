@@ -82,6 +82,12 @@ struct LlamaServerWarmupOptions {
     std::size_t max_prefix_chars = 262144;
 };
 
+struct LlamaServerStallGuardOptions {
+    bool enabled = true;
+    std::chrono::seconds stall_seconds{90};
+    std::string policy = "warn";  // warn or restart (spawn only)
+};
+
 struct LlamaServerBackendOptions {
     LlamaServerMode mode = LlamaServerMode::attach;
     std::string base_url = "http://127.0.0.1:8080";
@@ -118,6 +124,7 @@ struct LlamaServerBackendOptions {
     // Additive child-only environment overrides; empty inherits unchanged.
     std::vector<std::pair<std::string, std::string>> environment;
     LlamaServerWarmupOptions warmup;
+    LlamaServerStallGuardOptions stall_guard;
 };
 
 // Slot snapshots are upstream-owned files, not portable Sonder KV blocks.
