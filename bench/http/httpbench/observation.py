@@ -22,7 +22,9 @@ _METRIC = re.compile(
     r"^\s*(?:llamacpp:)?spec_decode_accepted_tokens_per_pos_total\s*"
     r"\{(?P<labels>[^}]*)\}\s+(?P<value>[^\s#]+)(?:\s+[^\s]+)?\s*$"
 )
-_LABEL = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*\"(?P<value>(?:\\.|[^\"])*)\"")
+# The value class excludes the backslash so an escape can only match one way
+# (no catastrophic backtracking on backslash-heavy label values).
+_LABEL = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*\"(?P<value>(?:\\.|[^\"\\])*)\"")
 _POSITION = re.compile(r"^-?[0-9]+$")
 _LOG_PATTERNS = {
     "making_room": re.compile(r"making room", re.I),
