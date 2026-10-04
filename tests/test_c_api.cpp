@@ -271,4 +271,98 @@ TEST_CASE("null arguments are rejected") {
     sonder_session_destroy(nullptr);
     sonder_model_release(nullptr);
 }
+
+TEST_CASE("C ABI session metadata copies correlation ids and retains handles") {
+    const std::string path = "c_abi_session_metadata.jsonl";
+    std::remove(path.c_str());
+    sonder_engine_options eo;
+    sonder_engine_options_init(&eo);
+    eo.telemetry_level = SONDER_TELEMETRY_DEEP;
+    eo.capture_text = 0;
+    eo.telemetry_jsonl_path = path.c_str();
+    sonder_engine* engine = nullptr;
+    REQUIRE(sonder_engine_create(&eo, &engine) == SONDER_OK);
+    REQUIRE(sonder_engine_register_mock_backend(engine) == SONDER_OK);
+    sonder_model* model = nullptr;
+    REQUIRE(sonder_model_load(engine, "mock", "mock:tiny", &model) == SONDER_OK);
+    char sid[] = "sdk-session:copied";
+    char rid[] = "sdk-run:copied";
+    char aid[] = "sdk-agent:copied";
+    char tid[] = "sdk-task:copied";
+    struct Extended {
+        sonder_session_metadata metadata;
+        uint64_t future_field;
+    } options{{sizeof(Extended), sid, rid, aid, tid}, 42};
+    sonder_sampling_config sampling;
+    sonder_sampling_config_init(&sampling);
+    sampling.max_tokens = 4;
+    sonder_session* session = nullptr;
+    REQUIRE(sonder_session_create_with_metadata(engine, model, &sampling, &options.metadata, &session) == SONDER_OK);
+    sid[0] = rid[0] = aid[0] = tid[0] = 'X';  // copied, not borrowed
+    sonder_model_release(model);
+    sonder_engine_destroy(engine);  // metadata sessions preserve the old lifetime contract
+    sonder_generation_stats stats{};
+    stats.struct_size = sizeof(stats);
+    REQUIRE(sonder_session_generate(session, "private-metadata-canary", nullptr, nullptr, &stats) == SONDER_OK);
+    CHECK(stats.outcome == SONDER_OUTCOME_COMPLETED);
+    const sonder_chat_message message{sizeof(sonder_chat_message), "user", "private-metadata-canary"};
+    const sonder_chat_message* messages[] = {&message};
+    REQUIRE(sonder_session_chat(session, messages, 1, nullptr, nullptr, &stats) == SONDER_OK);
+    CHECK(stats.outcome == SONDER_OUTCOME_COMPLETED);
+    sonder_session_destroy(session);
+    std::ifstream input(path);
+    std::string line;
+    unsigned session_events = 0;
+    while (std::getline(input, line)) {
+        CHECK(line.find("private-metadata-canary") == std::string::npos);
+        if (line.find("\"session_id\":\"sdk-session:copied\"") != std::string::npos) {
+            ++session_events;
+            CHECK(line.find("\"run_id\":\"sdk-run:copied\"") != std::string::npos);
+            CHECK(line.find("\"agent_id\":\"sdk-agent:copied\"") != std::string::npos);
+            CHECK(line.find("\"task_id\":\"sdk-task:copied\"") != std::string::npos);
+        }
+    }
+    CHECK(session_events > 10);
+    input.close();
+    std::remove(path.c_str());
+}
+
+TEST_CASE("C ABI session metadata validates size and bounded identifiers without echo") {
+    sonder_engine_options eo;
+    sonder_engine_options_init(&eo);
+    eo.telemetry_level = SONDER_TELEMETRY_OFF;
+    sonder_engine* engine = nullptr;
+    REQUIRE(sonder_engine_create(&eo, &engine) == SONDER_OK);
+    REQUIRE(sonder_engine_register_mock_backend(engine) == SONDER_OK);
+    sonder_model* model = nullptr;
+    REQUIRE(sonder_model_load(engine, "mock", "mock:tiny", &model) == SONDER_OK);
+    sonder_session_metadata metadata{sizeof(sonder_session_metadata), nullptr, nullptr, nullptr, nullptr};
+    sonder_session* session = nullptr;
+    CHECK(sonder_session_create_with_metadata(nullptr, model, nullptr, &metadata, &session) == SONDER_ERROR_INVALID_ARGUMENT);
+    metadata.struct_size = offsetof(sonder_session_metadata, task_id);
+    CHECK(sonder_session_create_with_metadata(engine, model, nullptr, &metadata, &session) == SONDER_ERROR_INVALID_ARGUMENT);
+    CHECK(session == nullptr);
+    metadata.struct_size = sizeof(metadata);
+    const std::string invalid[] = {"", std::string(129, 'a'), "private/id", "line\nbreak", "h\xC3\xA9llo"};
+    for (const auto& value : invalid) {
+        metadata.run_id = value.c_str();
+        CHECK(sonder_session_create_with_metadata(engine, model, nullptr, &metadata, &session) == SONDER_ERROR_INVALID_ARGUMENT);
+        CHECK(session == nullptr);
+        if (!value.empty()) {
+            CHECK(std::string(sonder_last_error_message()).find(value) == std::string::npos);
+        }
+    }
+    const std::string longest(128, 'a');
+    metadata.run_id = longest.c_str();
+    REQUIRE(sonder_session_create_with_metadata(engine, model, nullptr, &metadata, &session) == SONDER_OK);
+    sonder_session_destroy(session);
+    metadata.run_id = nullptr;
+    REQUIRE(sonder_session_create_with_metadata(engine, model, nullptr, &metadata, &session) == SONDER_OK);
+    sonder_session_destroy(session);
+    REQUIRE(sonder_session_create_with_metadata(engine, model, nullptr, nullptr, &session) == SONDER_OK);
+    sonder_session_destroy(session);
+    sonder_model_release(model);
+    sonder_engine_destroy(engine);
+}
+
 }

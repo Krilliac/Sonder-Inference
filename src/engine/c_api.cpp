@@ -116,6 +116,25 @@ SamplingConfig from_c(const sonder_sampling_config& c) {
     return s;
 }
 
+// Mirror the existing HTTP correlation-header policy, without echoing input.
+// Read at most the 128-byte identifier plus its required terminator.
+bool valid_correlation_id(const char* value) {
+    if (!value) {
+        return true;
+    }
+    for (std::size_t i = 0; i <= SONDER_MAX_CORRELATION_ID_BYTES; ++i) {
+        const auto ch = static_cast<unsigned char>(value[i]);
+        if (ch == 0) {
+            return i > 0;
+        }
+        if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+              (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == ':' || ch == '-')) {
+            return false;
+        }
+    }
+    return false;
+}
+
 TokenCallback c_callback(sonder_token_callback callback, void* user_data) {
     if (!callback) {
         return {};
@@ -316,12 +335,42 @@ sonder_status sonder_sampling_config_validate(const sonder_sampling_config* conf
 
 sonder_status sonder_session_create(sonder_engine* engine, sonder_model* model, const sonder_sampling_config* sampling,
                                     sonder_session** out_session) {
+    return sonder_session_create_with_metadata(engine, model, sampling, nullptr, out_session);
+}
+
+sonder_status sonder_session_create_with_metadata(sonder_engine* engine, sonder_model* model,
+                                                   const sonder_sampling_config* sampling,
+                                                   const sonder_session_metadata* metadata,
+                                                   sonder_session** out_session) {
     return guarded([&] {
         if (!engine || !model || !out_session) {
             return fail(SONDER_ERROR_INVALID_ARGUMENT, "null argument");
         }
         *out_session = nullptr;
         SessionOptions so;
+        if (metadata) {
+            constexpr std::size_t min_size = offsetof(sonder_session_metadata, task_id) + sizeof(const char*);
+            if (metadata->struct_size < min_size) {
+                return fail(SONDER_ERROR_INVALID_ARGUMENT, "sonder_session_metadata.struct_size too small");
+            }
+            if (!valid_correlation_id(metadata->session_id) || !valid_correlation_id(metadata->run_id) ||
+                !valid_correlation_id(metadata->agent_id) || !valid_correlation_id(metadata->task_id)) {
+                return fail(SONDER_ERROR_INVALID_ARGUMENT,
+                            "session metadata identifiers must match [A-Za-z0-9._:-]{1,128}");
+            }
+            if (metadata->session_id) {
+                so.session_id = metadata->session_id;
+            }
+            if (metadata->run_id) {
+                so.run_id = metadata->run_id;
+            }
+            if (metadata->agent_id) {
+                so.agent_id = metadata->agent_id;
+            }
+            if (metadata->task_id) {
+                so.task_id = metadata->task_id;
+            }
+        }
         if (sampling) {
             if (const char* err = check_c_sampling(*sampling)) {
                 return fail(SONDER_ERROR_INVALID_ARGUMENT, err);

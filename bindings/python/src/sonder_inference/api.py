@@ -7,6 +7,7 @@ import contextlib
 import ctypes
 import enum
 import queue
+import re
 import threading
 import weakref
 from dataclasses import dataclass, fields, replace
@@ -345,6 +346,32 @@ class _Handle:
         return f"<{type(self).__name__} {state}>"
 
 
+@dataclass(frozen=True)
+class SessionMetadata:
+    """Caller correlation IDs. None keeps defaults; IDs follow the HTTP policy.
+
+    Identifiers appear in telemetry envelopes independently of text capture.
+    They must not contain prompts or secrets. Older ABI-v1 libraries can still
+    create default sessions; explicit metadata requires the additive export.
+    """
+
+    session_id: Optional[str] = None
+    run_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    task_id: Optional[str] = None
+
+    def _to_c(self) -> "S.CSessionMetadata":
+        record = S.CSessionMetadata()
+        record.struct_size = ctypes.sizeof(record)
+        for field in fields(self):
+            value = getattr(self, field.name)
+            if value is not None and (not isinstance(value, str) or
+                                      re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", value) is None):
+                raise InvalidArgumentError(f"{field.name} must match [A-Za-z0-9._:-]{{1,128}}")
+            setattr(record, field.name, value.encode("ascii") if value is not None else None)
+        return record
+
+
 class Engine(_Handle):
     """An inference engine. Closing it closes its models and sessions first."""
 
@@ -395,14 +422,26 @@ class Engine(_Handle):
             self._children.add(m)
         return m
 
-    def create_session(self, model: "Model", sampling: Optional[SamplingConfig] = None) -> "Session":
+    def create_session(self, model: "Model", sampling: Optional[SamplingConfig] = None,
+                       *, metadata: Optional[SessionMetadata] = None) -> "Session":
         if model.engine is not self:
             raise InvalidArgumentError("model belongs to a different engine")
+        if metadata is not None:
+            if not isinstance(metadata, SessionMetadata):
+                raise InvalidArgumentError("metadata must be SessionMetadata or None")
+            if not self._lib.has_symbol("sonder_session_create_with_metadata"):
+                raise UnsupportedError("this library does not export sonder_session_create_with_metadata")
+        c_metadata = metadata._to_c() if metadata is not None else None
         marshalled = sampling._to_c(self._lib) if sampling is not None else None
         out = ctypes.c_void_p()
         with self._use() as h, model._use() as mh:
-            _check(self._lib, self._lib.cdll.sonder_session_create(
-                h, mh, ctypes.byref(marshalled.struct) if marshalled else None, ctypes.byref(out)))
+            sampling_ptr = ctypes.byref(marshalled.struct) if marshalled else None
+            if c_metadata is None:
+                code = self._lib.cdll.sonder_session_create(h, mh, sampling_ptr, ctypes.byref(out))
+            else:
+                code = self._lib.cdll.sonder_session_create_with_metadata(
+                    h, mh, sampling_ptr, ctypes.byref(c_metadata), ctypes.byref(out))
+            _check(self._lib, code)
             s = Session(self, model, out.value, sampling)  # type: ignore[arg-type]
             self._children.add(s)
         return s
@@ -671,5 +710,5 @@ class TokenStream:
 
 __all__ = [
     "ChatMessage", "Engine", "GenerationResult", "Model", "Outcome", "SamplingConfig", "Session",
-    "TelemetryLevel", "TokenStream", "abi_version", "version",
+    "SessionMetadata", "TelemetryLevel", "TokenStream", "abi_version", "version",
 ]
