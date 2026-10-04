@@ -42,3 +42,41 @@ inference performance. Serial CTest execution isolates these controls from
 other tests in that invocation; it does not reserve the host or eliminate
 unrelated system load. No production API, privacy/consent, queue, producer
 cursor, effect recovery or rollback contract changes.
+
+## Qualification observations (2026-10-04)
+
+Implementation revision `fbf4f6310280b645821d9ba27013e9c04cdc521a` passed a
+strict Linux Debug build and all 919 CTest cases in 65.49 seconds. A Release
+shared-library build with tests disabled passed and omitted the stress target
+and registration. Repeating the registered controls with CTest `-j 8 -V` 24
+times passed all 72 tests: 1,728 lifecycles and 5,505,024 synthetic attempts in
+383.345 seconds, within a 720-second driver budget. Each invocation also had a
+205-second process-group budget around the three 60-second CTest limits. Peak
+observed child-tree RSS was 28,956 KiB, including CTest and its launched processes.
+
+| Local Debug control | Samples | Median seconds | Maximum seconds |
+| --- | --- | --- | --- |
+| Healthy stream | 24 | 5.425 | 5.523 |
+| Callback pressure | 24 | 5.082 | 6.284 |
+| Stream pressure | 24 | 5.310 | 6.003 |
+
+The three controls also passed individually in all seven hosted full-suite
+lanes: Linux, Windows, OpenSSL, Schannel, ASan+UBSan, TSan and optional native
+Windows. TSan passed all 919 cases in 24.15 seconds; its three stress controls
+took 1.98, 2.82 and 3.00 seconds. ASan+UBSan passed all 919 cases in 24.42
+seconds. Native Windows registered 946 cases: 945 passed and the existing
+model-dependent integration fixture skipped; none of these stress controls
+skipped. These are host/configuration-specific test costs, not a throughput
+comparison or an inference speed claim.
+
+Actual mock HTTP/SSE qualification passed 204 requests across three lifecycles
+and twelve active shutdown drains with zero errors. All 30 ecosystem gates
+passed in 70.8 seconds with Runtime `e42aefbd` and Observatory `9ea5f788`;
+all fourteen process groups stopped and Git/home guards stayed unchanged.
+
+The initial revision's three CodeQL analysis jobs and C++ SARIF upload passed,
+but GitHub's PR summary remained neutral because its C++ comparison
+configuration was unavailable. GitHub refused workflow and job reruns with
+HTTP 403. That result is preserved and is not a clean comparison receipt.
+These observations precede the documentation revision; fresh exact-revision
+checks remain necessary before merging.
