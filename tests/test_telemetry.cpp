@@ -1,10 +1,12 @@
 #include <doctest/doctest.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <fstream>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <thread>
 
 #include "test_helpers.hpp"
@@ -68,6 +70,8 @@ class GateSink final : public TelemetrySink {
 public:
     void write(std::string_view line) override {
         std::unique_lock<std::mutex> lock(mutex_);
+        entered_ = true;
+        cv_.notify_all();
         cv_.wait(lock, [this] { return open_; });
         lines_.emplace_back(line);
     }
@@ -82,11 +86,16 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         return lines_;
     }
+    bool wait_until_entered() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(5), [this] { return entered_; });
+    }
 
 private:
     std::mutex mutex_;
     std::condition_variable cv_;
     bool open_ = false;
+    bool entered_ = false;
     std::vector<std::string> lines_;
 };
 
@@ -428,4 +437,331 @@ TEST_CASE("engine.started carries the server listener when one is set") {
         CHECK(server->find("api_version")->as_int() == 1);
     }
     CHECK(found);
+}
+
+namespace {
+class ThrowingWriteSink final : public TelemetrySink {
+public:
+    void write(std::string_view) override {
+        ++calls;
+        throw std::ios_base::failure("synthetic telemetry write failure");
+    }
+    std::atomic<int> calls{0};
+};
+
+class DeferredFailureSink final : public TelemetrySink {
+public:
+    void write(std::string_view line) override {
+        ++calls;
+        gate.write(line);
+        throw std::ios_base::failure("synthetic delayed write failure");
+    }
+    GateSink gate;
+    std::atomic<int> calls{0};
+};
+
+enum class SinkFailure { event_override, flush, nonstandard };
+
+class FaultSink final : public TelemetrySink {
+public:
+    explicit FaultSink(SinkFailure failure) : failure_(failure) {}
+    void write(std::string_view) override { ++plain_calls; }
+    void write_event(std::uint64_t sequence, std::string_view line) override {
+        ++event_calls;
+        if (failure_ == SinkFailure::event_override) throw std::ios_base::failure("synthetic event failure");
+        if (failure_ == SinkFailure::nonstandard) throw 7;
+        TelemetrySink::write_event(sequence, line);
+    }
+    void flush() override {
+        ++flush_calls;
+        if (failure_ == SinkFailure::flush) throw std::ios_base::failure("synthetic flush failure");
+    }
+    std::atomic<int> event_calls{0};
+    std::atomic<int> plain_calls{0};
+    std::atomic<int> flush_calls{0};
+
+private:
+    SinkFailure failure_;
+};
+
+struct RetirementObservation {
+    std::atomic<bool> destroyed{false};
+    std::atomic<bool> healthy_bus_enabled{false};
+    std::atomic<bool> on_emitting_thread{true};
+};
+
+class DestructorQuerySink final : public TelemetrySink {
+public:
+    DestructorQuerySink(TelemetryBus& bus, RetirementObservation& observation)
+        : bus_(bus), observation_(observation), emitting_thread_(std::this_thread::get_id()) {}
+    ~DestructorQuerySink() override {
+        // Querying the bus would deadlock if retirement held its mutex.
+        observation_.healthy_bus_enabled = bus_.enabled(TelemetryLevel::metrics);
+        observation_.on_emitting_thread = std::this_thread::get_id() == emitting_thread_;
+        observation_.destroyed = true;
+    }
+    void write(std::string_view) override { throw std::ios_base::failure("synthetic destruction control"); }
+
+private:
+    TelemetryBus& bus_;
+    RetirementObservation& observation_;
+    std::thread::id emitting_thread_;
+};
+
+class FailingStreamBuffer final : public std::stringbuf {
+public:
+    explicit FailingStreamBuffer(bool fail_flush) : fail_flush_(fail_flush) {}
+    std::streamsize xsputn(const char* data, std::streamsize size) override {
+        ++write_calls;
+        return fail_flush_ ? std::stringbuf::xsputn(data, size) : 0;
+    }
+    int sync() override {
+        ++flush_calls;
+        return fail_flush_ ? -1 : std::stringbuf::sync();
+    }
+    int write_calls = 0;
+    int flush_calls = 0;
+
+private:
+    bool fail_flush_;
+};
+
+TelemetryOptions synthetic_sink_options() {
+    TelemetryOptions options;
+    options.synthetic = true;
+    return options;
+}
+
+void check_sink_sequences(const std::vector<std::string>& lines, const std::string& instance) {
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        auto value = json::parse(lines[i]);
+        REQUIRE(value.ok());
+        CHECK(value.value().find("sequence")->as_int() == static_cast<std::int64_t>(i));
+        CHECK(value.value().find("event_id")->as_string() == instance + "-" + std::to_string(i));
+        CHECK(value.value().find("producer")->find("instance_id")->as_string() == instance);
+        CHECK(value.value().find("producer")->find("synthetic")->as_bool());
+    }
+}
+}  // namespace
+
+TEST_CASE("telemetry write failure retires the sink and preserves healthy delivery") {
+    auto failed = std::make_shared<ThrowingWriteSink>();
+    auto healthy = std::make_shared<MemoryTelemetrySink>();
+    auto sibling = std::make_shared<MemoryTelemetrySink>();
+    TelemetryBus bus(synthetic_sink_options());
+    bus.add_sink(failed);
+    bus.add_sink(healthy);
+    bus.add_sink(sibling);
+    TelemetryContext ctx;
+    ctx.session_id = "synthetic-sink-failure";
+    for (int i = 0; i < 32; ++i) {
+        REQUIRE(bus.emit("test.event", ctx, json::Object{{"i", i}}));
+    }
+    bus.flush();
+    CHECK(failed->calls == 1);
+    CHECK(bus.failed_sinks() == 1);
+    CHECK(bus.dropped_events() == 0);
+    CHECK(bus.emitted_events() == 32);
+    CHECK(bus.enabled(TelemetryLevel::metrics));
+    REQUIRE(healthy->lines().size() == 32);
+    CHECK(healthy->lines() == sibling->lines());
+    check_sink_sequences(healthy->lines(), bus.instance_id());
+}
+
+TEST_CASE("telemetry override and flush exceptions stop retries while siblings continue") {
+    for (const auto failure : {SinkFailure::event_override, SinkFailure::flush, SinkFailure::nonstandard}) {
+        CAPTURE(static_cast<int>(failure));
+        auto failed = std::make_shared<FaultSink>(failure);
+        auto healthy = std::make_shared<MemoryTelemetrySink>();
+        TelemetryBus bus(synthetic_sink_options());
+        bus.add_sink(failed);
+        bus.add_sink(healthy);
+        TelemetryContext ctx;
+        ctx.session_id = "synthetic-sink-failure";
+        for (int i = 0; i < 8; ++i) CHECK(bus.emit("test.event", ctx, json::Object{{"i", i}}));
+        bus.flush();
+        const auto event_calls = failed->event_calls.load();
+        const auto flush_calls = failed->flush_calls.load();
+        CHECK(bus.failed_sinks() == 1);
+        if (failure == SinkFailure::flush) {
+            CHECK(flush_calls == 1);
+            CHECK(event_calls >= 1);
+        } else {
+            CHECK(event_calls == 1);
+            CHECK(flush_calls == 0);
+            CHECK(failed->plain_calls == 0);
+        }
+        for (int i = 8; i < 16; ++i) CHECK(bus.emit("test.event", ctx, json::Object{{"i", i}}));
+        bus.flush();
+        CHECK(failed->event_calls == event_calls);
+        CHECK(failed->flush_calls == flush_calls);
+        CHECK(bus.failed_sinks() == 1);
+        REQUIRE(healthy->lines().size() == 16);
+        check_sink_sequences(healthy->lines(), bus.instance_id());
+    }
+}
+
+TEST_CASE("telemetry retires duplicate failed aliases and drains with no surviving sink") {
+    auto failed = std::make_shared<ThrowingWriteSink>();
+    TelemetryBus bus(synthetic_sink_options());
+    bus.add_sink(failed);
+    bus.add_sink(failed);
+    TelemetryContext ctx;
+    ctx.session_id = "synthetic-all-sinks-failed";
+    CHECK(bus.emit("test.event", ctx, json::Object{}));
+    bus.flush();
+    bus.flush();
+    CHECK(failed->calls == 1);
+    CHECK(bus.failed_sinks() == 1);
+    CHECK_FALSE(bus.enabled(TelemetryLevel::metrics));
+    CHECK_FALSE(bus.emit("test.event", ctx, json::Object{}));
+    CHECK(bus.emitted_events() == 1);
+    CHECK(bus.dropped_events() == 0);
+    bus.shutdown();
+    bus.shutdown();
+    bus.flush();
+    CHECK(failed->calls == 1);
+}
+
+TEST_CASE("failed sink destruction runs outside the bus mutex and emitting thread") {
+    RetirementObservation observation;
+    TelemetryBus bus(synthetic_sink_options());
+    auto failed = std::make_shared<DestructorQuerySink>(bus, observation);
+    std::weak_ptr<TelemetrySink> weak = failed;
+    auto healthy = std::make_shared<MemoryTelemetrySink>();
+    bus.add_sink(failed);
+    bus.add_sink(healthy);
+    failed.reset();
+    TelemetryContext ctx;
+    ctx.session_id = "synthetic-destructor-control";
+    CHECK(bus.emit("test.event", ctx, json::Object{}));
+    bus.flush();
+    CHECK(weak.expired());
+    CHECK(observation.destroyed);
+    CHECK(observation.healthy_bus_enabled);
+    CHECK_FALSE(observation.on_emitting_thread);
+    CHECK(bus.failed_sinks() == 1);
+    CHECK(healthy->lines().size() == 1);
+}
+
+TEST_CASE("telemetry drains accepted backlog after its last sink fails") {
+    auto failed = std::make_shared<DeferredFailureSink>();
+    auto options = synthetic_sink_options();
+    options.queue_capacity = 4;
+    TelemetryBus bus(options);
+    bus.add_sink(failed);
+    TelemetryContext ctx;
+    ctx.session_id = "synthetic-all-failed-backlog";
+    CHECK(bus.emit("test.event", ctx, json::Object{}));
+    CHECK(failed->gate.wait_until_entered());
+    for (int i = 0; i < 4; ++i) CHECK(bus.emit("test.event", ctx, json::Object{}));
+    failed->gate.open();
+    bus.flush();
+    CHECK(bus.emitted_events() == 5);
+    CHECK(bus.failed_sinks() == 1);
+    CHECK(failed->calls == 1);
+    CHECK_FALSE(bus.enabled(TelemetryLevel::metrics));
+    CHECK_FALSE(bus.emit("test.event", ctx, json::Object{}));
+    bus.shutdown();
+    bus.flush();
+}
+
+TEST_CASE("ostream exception masks cannot terminate the telemetry writer") {
+    for (const bool fail_flush : {false, true}) {
+        CAPTURE(fail_flush);
+        FailingStreamBuffer buffer(fail_flush);
+        std::ostream stream(&buffer);
+        stream.exceptions(std::ios::badbit | std::ios::failbit);
+        auto healthy = std::make_shared<MemoryTelemetrySink>();
+        TelemetryBus bus(synthetic_sink_options());
+        bus.add_sink(std::shared_ptr<TelemetrySink>(make_ostream_sink(stream)));
+        bus.add_sink(healthy);
+        TelemetryContext ctx;
+        ctx.session_id = "synthetic-ostream-failure";
+        CHECK(bus.emit("test.event", ctx, json::Object{}));
+        bus.flush();
+        CHECK(bus.failed_sinks() == 1);
+        const int writes = buffer.write_calls;
+        const int flushes = buffer.flush_calls;
+        CHECK(bus.emit("test.event", ctx, json::Object{}));
+        bus.flush();
+        CHECK(buffer.write_calls == writes);
+        CHECK(buffer.flush_calls == flushes);
+        CHECK(healthy->lines().size() == 2);
+        check_sink_sequences(healthy->lines(), bus.instance_id());
+    }
+}
+
+TEST_CASE("sink failures remain separate from bounded queue drops") {
+    auto gate = std::make_shared<GateSink>();
+    auto failed = std::make_shared<ThrowingWriteSink>();
+    auto options = synthetic_sink_options();
+    options.queue_capacity = 4;
+    options.drop_report_interval = std::chrono::milliseconds(0);
+    TelemetryBus bus(options);
+    bus.add_sink(gate);
+    bus.add_sink(failed);
+    TelemetryContext ctx;
+    ctx.session_id = "synthetic-queue-pressure";
+    CHECK(bus.emit("test.event", ctx, json::Object{}));
+    CHECK(gate->wait_until_entered());
+    int accepted = 1;
+    for (int i = 0; i < 64; ++i) {
+        if (bus.emit("test.event", ctx, json::Object{{"i", i}})) ++accepted;
+    }
+    CHECK(accepted == 5);
+    CHECK(bus.dropped_events() == 60);
+    gate->open();
+    bus.shutdown();
+    CHECK(bus.failed_sinks() == 1);
+    CHECK(failed->calls == 1);
+    CHECK(bus.emitted_events() == static_cast<std::uint64_t>(accepted));
+    const auto lines = gate->lines();
+    REQUIRE(lines.size() == static_cast<std::size_t>(accepted + 1));
+    check_sink_sequences(lines, bus.instance_id());
+    const auto report = json::parse(lines.back());
+    REQUIRE(report.ok());
+    CHECK(report.value().find("event_type")->as_string() == "telemetry.dropped");
+    CHECK(report.value().find("attributes")->find("dropped_events")->as_int() == 60);
+}
+
+TEST_CASE("mock generation survives a failed telemetry sink without capturing text") {
+    auto failed = std::make_shared<ThrowingWriteSink>();
+    auto healthy = std::make_shared<MemoryTelemetrySink>();
+    EngineOptions options;
+    options.telemetry = synthetic_sink_options();
+    options.device_sample_interval = std::chrono::milliseconds(0);
+    options.telemetry_sinks = {failed, healthy};
+    Engine engine(options);
+    REQUIRE(engine.register_backend(make_mock_backend()).ok());
+    ModelLoadOptions load;
+    load.model = "mock:tiny";
+    auto model = engine.load_model(kMockBackendName, load);
+    REQUIRE(model.ok());
+    SessionOptions session_options;
+    session_options.sampling = SamplingConfig::greedy(8);
+    auto session = engine.create_session(model.value(), session_options);
+    REQUIRE(session.ok());
+    const std::string prompt = "synthetic private prompt canary";
+    const auto result = session.value()->generate(prompt);
+    REQUIRE(result.ok());
+    CHECK(result.value().stats.completion_tokens > 0);
+    session.value()->close();
+    engine.telemetry().flush();
+    CHECK(failed->calls == 1);
+    CHECK(engine.telemetry().failed_sinks() == 1);
+    const auto lines = healthy->lines();
+    REQUIRE_FALSE(lines.empty());
+    bool completed = false;
+    for (const auto& line : lines) {
+        CHECK(line.find(prompt) == std::string::npos);
+        CHECK(line.find("synthetic telemetry write failure") == std::string::npos);
+        auto value = json::parse(line);
+        REQUIRE(value.ok());
+        const auto type = value.value().find("event_type")->as_string();
+        if (type == "request.completed") completed = true;
+        if (type == "inference.token.generated") CHECK(value.value().find("attributes")->find("text") == nullptr);
+    }
+    CHECK(completed);
+    check_sink_sequences(lines, engine.telemetry().instance_id());
 }
