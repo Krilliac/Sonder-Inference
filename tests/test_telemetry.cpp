@@ -3,6 +3,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <set>
@@ -689,6 +690,184 @@ TEST_CASE("ostream exception masks cannot terminate the telemetry writer") {
         CHECK(buffer.flush_calls == flushes);
         CHECK(healthy->lines().size() == 2);
         check_sink_sequences(healthy->lines(), bus.instance_id());
+    }
+}
+
+TEST_CASE("builtin ostream fail bits retire the sink without changing its exception mask") {
+    for (const bool fail_flush : {false, true}) {
+        CAPTURE(fail_flush);
+        FailingStreamBuffer buffer(fail_flush);
+        std::ostream stream(&buffer);
+        REQUIRE(stream.exceptions() == std::ios::goodbit);
+        auto healthy = std::make_shared<MemoryTelemetrySink>();
+        auto sibling = std::make_shared<MemoryTelemetrySink>();
+        auto failed = std::shared_ptr<TelemetrySink>(make_ostream_sink(stream));
+        TelemetryBus bus(synthetic_sink_options());
+        bus.add_sink(failed);
+        bus.add_sink(failed);
+        bus.add_sink(healthy);
+        bus.add_sink(sibling);
+        TelemetryContext ctx;
+        ctx.session_id = "synthetic-default-mask-failure";
+        for (int i = 0; i < 8; ++i) CHECK(bus.emit("test.event", ctx, json::Object{{"i", i}}));
+        bus.flush();
+        CHECK(stream.bad());
+        CHECK(stream.exceptions() == std::ios::goodbit);
+        CHECK(bus.failed_sinks() == 1);
+        const int writes = buffer.write_calls;
+        const int flushes = buffer.flush_calls;
+        for (int i = 8; i < 16; ++i) CHECK(bus.emit("test.event", ctx, json::Object{{"i", i}}));
+        bus.flush();
+        CHECK(buffer.write_calls == writes);
+        CHECK(buffer.flush_calls == flushes);
+        CHECK(bus.failed_sinks() == 1);
+        CHECK(bus.dropped_events() == 0);
+        REQUIRE(healthy->lines().size() == 16);
+        CHECK(healthy->lines() == sibling->lines());
+        check_sink_sequences(healthy->lines(), bus.instance_id());
+    }
+}
+
+TEST_CASE("an already failed builtin stream drains without retry or mask mutation") {
+    for (const auto state : {std::ios::failbit, std::ios::badbit}) {
+        CAPTURE(static_cast<int>(state));
+        FailingStreamBuffer buffer(false);
+        std::ostream stream(&buffer);
+        stream.setstate(state);
+        TelemetryBus bus(synthetic_sink_options());
+        bus.add_sink(std::shared_ptr<TelemetrySink>(make_ostream_sink(stream)));
+        TelemetryContext ctx;
+        ctx.session_id = "synthetic-already-failed-stream";
+        CHECK(bus.emit("test.event", ctx, json::Object{}));
+        bus.flush();
+        CHECK(bus.failed_sinks() == 1);
+        CHECK(stream.exceptions() == std::ios::goodbit);
+        CHECK(buffer.write_calls == 0);
+        CHECK(buffer.flush_calls == 0);
+        CHECK_FALSE(bus.enabled(TelemetryLevel::metrics));
+        CHECK_FALSE(bus.emit("test.event", ctx, json::Object{}));
+        CHECK(bus.emitted_events() == 1);
+        CHECK(bus.dropped_events() == 0);
+        bus.shutdown();
+        bus.shutdown();
+        bus.flush();
+    }
+}
+
+TEST_CASE("healthy builtin sinks preserve JSONL bytes and file append and open errors") {
+    struct TemporaryDirectory {
+        std::filesystem::path path = std::filesystem::temp_directory_path() / make_id("sonder-telemetry");
+        TemporaryDirectory() { std::filesystem::create_directory(path); }
+        ~TemporaryDirectory() {
+            std::error_code ignored;
+            std::filesystem::remove_all(path, ignored);
+        }
+    } temporary;
+    const auto path = temporary.path / "events.jsonl";
+    Status status;
+    REQUIRE(make_jsonl_file_sink((temporary.path / "absent" / "events.jsonl").string(), false, &status) == nullptr);
+    CHECK(status.code() == ErrorCode::io_error);
+    auto read_file = [&] {
+        std::ifstream file(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    };
+    std::string expected;
+    for (const bool append : {false, true}) {
+        std::ostringstream stream;
+        auto file = make_jsonl_file_sink(path.string(), append, &status);
+        REQUIRE(file);
+        CHECK(status.ok());
+        auto healthy = std::make_shared<MemoryTelemetrySink>();
+        TelemetryBus bus(synthetic_sink_options());
+        bus.add_sink(std::shared_ptr<TelemetrySink>(std::move(file)));
+        bus.add_sink(std::shared_ptr<TelemetrySink>(make_ostream_sink(stream)));
+        bus.add_sink(healthy);
+        TelemetryContext ctx;
+        ctx.session_id = "synthetic-healthy-builtin-sinks";
+        for (int i = 0; i < 8; ++i) CHECK(bus.emit("test.event", ctx, json::Object{{"i", i}}));
+        bus.flush();
+        CHECK(bus.failed_sinks() == 0);
+        CHECK(bus.dropped_events() == 0);
+        CHECK(stream.good());
+        CHECK(stream.exceptions() == std::ios::goodbit);
+        std::string lines;
+        for (const auto& line : healthy->lines()) lines += line + '\n';
+        REQUIRE(healthy->lines().size() == 8);
+        CHECK(stream.str() == lines);
+        expected += lines;
+        CHECK(read_file() == expected);
+        check_sink_sequences(healthy->lines(), bus.instance_id());
+    }
+}
+
+#if defined(__linux__)
+TEST_CASE("builtin file sink retires on ordinary device I/O failure") {
+    // /dev/full is a standard Linux ENOSPC control; append avoids truncation.
+    Status status;
+    auto file = make_jsonl_file_sink("/dev/full", true, &status);
+    REQUIRE(file);
+    REQUIRE(status.ok());
+    auto healthy = std::make_shared<MemoryTelemetrySink>();
+    TelemetryBus bus(synthetic_sink_options());
+    bus.add_sink(std::shared_ptr<TelemetrySink>(std::move(file)));
+    bus.add_sink(healthy);
+    TelemetryContext ctx;
+    ctx.session_id = "synthetic-file-io-error";
+    CHECK(bus.emit("test.event", ctx, json::Object{}));
+    bus.flush();
+    CHECK(bus.failed_sinks() == 1);
+    CHECK(bus.emit("test.event", ctx, json::Object{}));
+    bus.flush();
+    CHECK(bus.failed_sinks() == 1);
+    CHECK(bus.dropped_events() == 0);
+    REQUIRE(healthy->lines().size() == 2);
+    check_sink_sequences(healthy->lines(), bus.instance_id());
+}
+#endif
+
+TEST_CASE("mock generation survives builtin default-mask failures with text capture off") {
+    for (const bool fail_flush : {false, true}) {
+        FailingStreamBuffer buffer(fail_flush);
+        std::ostream stream(&buffer);
+        auto healthy = std::make_shared<MemoryTelemetrySink>();
+        EngineOptions options;
+        options.telemetry = synthetic_sink_options();
+        options.device_sample_interval = std::chrono::milliseconds(0);
+        options.telemetry_sinks = {std::shared_ptr<TelemetrySink>(make_ostream_sink(stream)), healthy};
+        Engine engine(options);
+        REQUIRE(engine.register_backend(make_mock_backend()).ok());
+        ModelLoadOptions load;
+        load.model = "mock:tiny";
+        const auto model = engine.load_model(kMockBackendName, load);
+        REQUIRE(model.ok());
+        SessionOptions session_options;
+        session_options.sampling = SamplingConfig::greedy(8);
+        const auto session = engine.create_session(model.value(), session_options);
+        REQUIRE(session.ok());
+        const std::string prompt = "synthetic builtin failure private prompt canary";
+        const auto result = session.value()->generate(prompt);
+        REQUIRE(result.ok());
+        CHECK(result.value().stats.completion_tokens == 8);
+        session.value()->close();
+        engine.telemetry().flush();
+        CHECK(engine.telemetry().failed_sinks() == 1);
+        CHECK(stream.bad());
+        CHECK(stream.exceptions() == std::ios::goodbit);
+        const auto lines = healthy->lines();
+        REQUIRE_FALSE(lines.empty());
+        bool completed = false;
+        for (const auto& line : lines) {
+            CHECK(line.find(prompt) == std::string::npos);
+            CHECK(line.find("telemetry stream write failed") == std::string::npos);
+            CHECK(line.find("telemetry stream flush failed") == std::string::npos);
+            const auto parsed = json::parse(line);
+            REQUIRE(parsed.ok());
+            const auto type = parsed.value().find("event_type")->as_string();
+            if (type == "request.completed") completed = true;
+            if (type == "inference.token.generated") CHECK(parsed.value().find("attributes")->find("text") == nullptr);
+        }
+        CHECK(completed);
+        check_sink_sequences(lines, engine.telemetry().instance_id());
     }
 }
 

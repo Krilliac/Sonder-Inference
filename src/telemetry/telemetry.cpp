@@ -82,8 +82,12 @@ public:
     void write(std::string_view line) override {
         stream_.write(line.data(), static_cast<std::streamsize>(line.size()));
         stream_.put('\n');
+        if (!stream_) throw std::ios_base::failure("telemetry file write failed");
     }
-    void flush() override { stream_.flush(); }
+    void flush() override {
+        stream_.flush();
+        if (!stream_) throw std::ios_base::failure("telemetry file flush failed");
+    }
 
 private:
     std::ofstream stream_;
@@ -95,8 +99,12 @@ public:
     void write(std::string_view line) override {
         stream_.write(line.data(), static_cast<std::streamsize>(line.size()));
         stream_.put('\n');
+        if (!stream_) throw std::ios_base::failure("telemetry stream write failed");
     }
-    void flush() override { stream_.flush(); }
+    void flush() override {
+        stream_.flush();
+        if (!stream_) throw std::ios_base::failure("telemetry stream flush failed");
+    }
 
 private:
     std::ostream& stream_;

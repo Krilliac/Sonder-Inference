@@ -14,7 +14,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -32,6 +34,34 @@ inline std::string read_file(const std::string& path) {
   return ss.str();
 }
 
+// Test-only prefill barrier: headers have been sent, but no body is produced
+// until the client has returned from cancellation. Both waits are bounded.
+class PrefillGate {
+ public:
+  bool wait_until_entered(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [this] { return entered_; });
+  }
+  bool wait_for_release(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    entered_ = true;
+    cv_.notify_all();
+    return cv_.wait_for(lock, timeout, [this] { return released_; });
+  }
+  void release() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      released_ = true;
+    }
+    cv_.notify_all();
+  }
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool entered_ = false;
+  bool released_ = false;
+};
+
 struct StreamScript {
   std::string body;              // full NDJSON payload
   int status = 200;
@@ -40,6 +70,7 @@ struct StreamScript {
   // Delay the first response bytes. This models a slow prefill where the
   // upstream has accepted the request but has not produced a chunk yet.
   std::chrono::milliseconds initial_delay{0};
+  std::shared_ptr<PrefillGate> prefill_gate;
   // After writing `stall_after_bytes`, keep the connection open (sending blank
   // keepalive lines) until the client goes away or `stall_max` elapses.
   std::size_t stall_after_bytes = 0;
@@ -85,6 +116,9 @@ class FakeOllamaServer {
       }
       res.set_chunked_content_provider(
           s.content_type, [this, s](std::size_t, httplib::DataSink& sink) {
+            if (s.prefill_gate && !s.prefill_gate->wait_for_release(std::chrono::seconds(5))) {
+              return false;
+            }
             if (s.initial_delay.count() > 0) {
               std::this_thread::sleep_for(s.initial_delay);
             }
@@ -101,7 +135,7 @@ class FakeOllamaServer {
               off += n;
               if (s.delay_per_chunk.count() > 0) std::this_thread::sleep_for(s.delay_per_chunk);
             }
-            if (s.initial_delay.count() > 0 && !s.stall_after_bytes) {
+            if ((s.initial_delay.count() > 0 || s.prefill_gate) && !s.stall_after_bytes) {
               // Keep probing after the delayed first write so tests observe
               // the peer's close even when the payload fit the kernel buffer.
               for (int i = 0; i < 100; ++i) {
