@@ -128,12 +128,15 @@ def test_utf8_is_decoded(engine, model):
     assert r.completed and isinstance(r.text, str)
 
 
-def test_chat_is_a_stub(engine, model):
-    with engine.create_session(model) as s:
-        with pytest.raises(si.UnsupportedError, match="chat"):
-            s.chat([{"role": "user", "content": "hi"}])
-        with pytest.raises(NotImplementedError):
-            s.chat([si.ChatMessage("user", "hi")])
+def test_chat_collects_text_and_stats(engine, model):
+    messages = [si.ChatMessage("system", "Be concise"), {"role": "user", "content": "hi"}]
+    with engine.create_session(model, si.SamplingConfig.greedy(5)) as s:
+        chunks = []
+        r = s.chat(messages, on_token=chunks.append)
+    assert r.completed and not r.cancelled
+    assert r.completion_tokens == r.chunks == len(chunks) == 5
+    assert "".join(chunks) == r.text and r.text
+    assert r.prompt_tokens > 0 and r.ttft_ms is not None and r.total_ms >= r.ttft_ms
 
 
 def test_close_is_idempotent_and_closed_handles_raise(engine, model):

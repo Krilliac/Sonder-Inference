@@ -439,7 +439,7 @@ class Model(_Handle):
 
 
 class Session(_Handle):
-    """A generation session. One generate call at a time."""
+    """A generation session. One generate or chat call at a time."""
 
     _destroy_fn = "sonder_session_destroy"
 
@@ -456,8 +456,12 @@ class Session(_Handle):
         ``False`` from it to stop early; an exception raised in it stops the
         generation and is re-raised here.
         """
-        lib = self._lib
         prompt_b = _cstr("prompt", prompt)
+        return self._request(self._lib.cdll.sonder_session_generate, (prompt_b,), on_token)
+
+    def _request(self, function: Any, args: tuple[Any, ...],
+                 on_token: Optional[TokenCallback]) -> GenerationResult:
+        lib = self._lib
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         parts: list[str] = []
         error: list[BaseException] = []
@@ -484,8 +488,7 @@ class Session(_Handle):
         # close() on another thread cancels this call and destroys the C
         # session only after it returns (see _Handle).
         with self._use() as handle:
-            rc = lib.cdll.sonder_session_generate(handle, prompt_b, c_callback, None,
-                                                  ctypes.byref(stats))
+            rc = function(handle, *args, c_callback, None, ctypes.byref(stats))
         if error:
             raise error[0]
         _check(lib, rc)
@@ -517,23 +520,46 @@ class Session(_Handle):
         self._lib.cdll.sonder_session_cancel(handle)
 
     def close(self) -> None:
-        """Close the session. A generate()/stream() running on another thread
+        """Close the session. A generate()/chat()/stream() on another thread
         is cancelled, and the C session is destroyed only after it returns.
         Idempotent and thread-safe; later calls raise InvalidStateError."""
         super().close()
 
     def chat(self, messages: Iterable[Union[ChatMessage, Mapping[str, str]]],
              on_token: Optional[TokenCallback] = None) -> GenerationResult:
-        """Chat entry point: STUB until the C ABI exports one.
+        """Run text chat with 1 to 1024 messages, ending in user or tool.
 
-        The engine has Backend::chat, but include/sonder_inference.h has no chat
-        function yet, so this always raises :class:`UnsupportedError`. See
-        bindings/python/README.md for the proposed signature.
+        Accepts ChatMessage or mappings containing only role/content. Native
+        backend chat is used when available, otherwise the engine formats a
+        role-labelled prompt. Callback and cancellation match generate().
+        Older ABI v1 libraries without the chat export raise UnsupportedError.
         """
-        del messages, on_token
-        raise UnsupportedError(
-            "chat is not exported by the Sonder C ABI yet (no sonder_session_chat); "
-            "use generate() with a formatted prompt")
+        if not self._lib.has_symbol("sonder_session_chat"):
+            raise UnsupportedError("this library does not export sonder_session_chat")
+        records: list[S.CChatMessage] = []
+        for message in messages:
+            if len(records) == S.MAX_CHAT_MESSAGES:
+                raise InvalidArgumentError("chat accepts at most 1024 messages")
+            if isinstance(message, ChatMessage):
+                role, content = message.role, message.content
+            elif isinstance(message, Mapping):
+                if set(message) - {"role", "content"}:
+                    raise UnsupportedError("chat mappings support only role and content")
+                if "role" not in message or "content" not in message:
+                    raise InvalidArgumentError("chat messages require role and content")
+                role, content = message["role"], message["content"]
+            else:
+                raise TypeError("chat messages must be ChatMessage or role/content mappings")
+            # ctypes records retain the encoded bytes; the pointer array keeps
+            # the records alive until the synchronous native call returns.
+            records.append(S.CChatMessage(ctypes.sizeof(S.CChatMessage),
+                                          _cstr("role", role), _cstr("content", content)))
+        if not records:
+            raise InvalidArgumentError("chat requires at least one message")
+        pointers = (ctypes.POINTER(S.CChatMessage) * len(records))(
+            *(ctypes.pointer(record) for record in records))
+        return self._request(self._lib.cdll.sonder_session_chat, (pointers, len(records)), on_token)
+
 
 
 class TokenStream:

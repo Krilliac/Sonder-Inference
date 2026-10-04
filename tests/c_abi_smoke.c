@@ -37,6 +37,13 @@ int main(void) {
         return 6;
     }
     if (tokens != 4 || stats.completion_tokens != 4 || stats.outcome != SONDER_OUTCOME_COMPLETED) return 7;
+    {
+        const sonder_chat_message message = {sizeof(sonder_chat_message), "user", "c chat smoke"};
+        const sonder_chat_message* messages[] = {&message};
+        tokens = 0;
+        if (sonder_session_chat(session, messages, 1, count_tokens, &tokens, &stats) != SONDER_OK) return 8;
+        if (tokens != 4 || stats.chunks != 4 || stats.outcome != SONDER_OUTCOME_COMPLETED) return 9;
+    }
     sonder_session_destroy(session);
     sonder_model_release(model);
     sonder_engine_destroy(engine);

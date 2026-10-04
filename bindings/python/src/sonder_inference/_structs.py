@@ -70,3 +70,14 @@ class CGenerationStats(c.Structure):
 # int (*)(void* user_data, const char* text, size_t length). The text is not
 # NUL-terminated, so it is received as a raw pointer (c_void_p), not c_char_p.
 TOKEN_CALLBACK = c.CFUNCTYPE(c.c_int, c.c_void_p, c.c_void_p, c.c_size_t)
+
+
+MAX_CHAT_MESSAGES = 1024
+
+
+class CChatMessage(c.Structure):
+    _fields_ = [
+        ("struct_size", c.c_uint32),
+        ("role", c.c_char_p),
+        ("content", c.c_char_p),
+    ]

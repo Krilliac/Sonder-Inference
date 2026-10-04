@@ -92,6 +92,10 @@ def _declare(lib: ctypes.CDLL) -> None:
     fn("sonder_session_destroy", None, c.c_void_p)
     fn("sonder_session_generate", status, c.c_void_p, c.c_char_p, S.TOKEN_CALLBACK, c.c_void_p,
        c.POINTER(S.CGenerationStats))
+    # Older ABI v1 libraries remain loadable; chat alone is optional.
+    if hasattr(lib, "sonder_session_chat"):
+        fn("sonder_session_chat", status, c.c_void_p, c.POINTER(c.POINTER(S.CChatMessage)),
+           c.c_size_t, S.TOKEN_CALLBACK, c.c_void_p, c.POINTER(S.CGenerationStats))
     fn("sonder_session_cancel", status, c.c_void_p)
 
 

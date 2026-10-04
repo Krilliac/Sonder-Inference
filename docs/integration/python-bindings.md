@@ -28,27 +28,16 @@ Suggested root changes, for the lead to decide:
    it. The package already looks in its own directory and lists
    `*.so`/`*.dll`/`*.dylib` as package data.
 
-## Chat entry point (not in the C ABI yet)
+## Text chat entry point
 
-`Backend::chat` landed in #10, but `include/sonder_inference.h` has no chat
-function, so `Session.chat()` is a stub that raises `UnsupportedError`. A
-proposed append-only addition that the bindings can map directly:
-
-```c
-typedef struct sonder_chat_message {
-    const char* role;     /* "system" | "user" | "assistant" | "tool" */
-    const char* content;  /* UTF-8, NUL-terminated */
-} sonder_chat_message;
-
-/* Same streaming/stats contract as sonder_session_generate. */
-SONDER_API sonder_status sonder_session_chat(sonder_session* session,
-                                             const sonder_chat_message* messages, size_t message_count,
-                                             sonder_token_callback callback, void* user_data,
-                                             sonder_generation_stats* out_stats);
-```
-
-Once that exists, the binding is about 20 lines: marshal a
-`sonder_chat_message` array, then reuse the generate trampoline.
+The original proposal here was a two-pointer contiguous message array. The
+implemented additive ABI v1 entry uses independently versioned records and
+an array of pointers, so appending record fields cannot change array stride.
+`Session.chat()` now marshals those records and shares the generate trampoline.
+Libraries without the additive export still load and report Unsupported for
+chat alone. See [cabi-chat.md](cabi-chat.md) for the final signature, bounds,
+lifetime, consent and qualification contract. Session metadata and telemetry
+callbacks are separate pending ABI work.
 
 ## Other ABI gaps seen from the bindings (optional)
 
