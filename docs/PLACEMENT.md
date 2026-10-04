@@ -115,9 +115,10 @@ sonder-infer serve --backend llamacpp ... --cache-type-k q8_0 --cache-type-v q8_
 
 Today the operator picks overrides per `serve` invocation. [Launch profiles](integration/launch-profiles.md)
 now read the GGUF header for a VRAM fit estimate (weights of the offloaded
-blocks, hybrid-aware KV bytes per token, recurrent state, compute), but do not
-choose a placement. The next step is a
-placement profile per model, derived from the GGUF metadata:
+blocks, hybrid-aware KV bytes per token with sliding-window layers at their
+window-sized cache, recurrent state, compute), but do not choose a
+placement. The next step is a placement profile per model, derived from the
+GGUF metadata:
 
 | Field | Source |
 |---|---|

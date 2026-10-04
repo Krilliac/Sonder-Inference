@@ -274,8 +274,10 @@ and compares it with a budget:
   `speculative.types` has `draft-mtp`, because llama.cpp skips them
   otherwise. The mmproj and draft files count when offloaded.
 - **KV** = sum over GPU attention layers of n_kv_heads × (key_length ×
-  bytes(K) + value_length × bytes(V)) × ctx_seq × sequences. Bytes per value
+  bytes(K) + value_length × bytes(V)) × cells × sequences. Bytes per value
   come from ggml's block layouts: f16 2, q8_0 1.0625, q5_1 0.75, q4_0 0.5625.
+  A full-attention layer keeps cells = ctx_seq; sliding-window layers keep
+  fewer (see [Sliding-window attention](#sliding-window-attention)).
   ctx is padded to 256. With `kv_unified` there is one pool: sequences = 1
   and ctx_seq = ctx. Without it, sequences = `parallel` and ctx_seq = ctx /
   `parallel` padded to 256, because `--ctx-size` is the total and llama.cpp
@@ -288,6 +290,11 @@ and compares it with a budget:
   **Hybrid models count attention layers only.** They are found from
   per-block `head_count_kv` arrays, then `attn_k` tensors, then
   `full_attention_interval`, using the architecture classification in `model_architecture.hpp`.
+  **With `flash_attn: off`, every V row is the widest layer's.** llama.cpp
+  then stores V transposed and pads each layer's row to `n_embd_v_gqa_max`.
+  `on` and `auto` allocate the cache before flash attention is resolved,
+  with each layer's own row. This only matters for models whose layers
+  differ in KV heads or head size.
 - **recurrent state** = for each GPU block without attention in a hybrid or
   recurrent model: ((conv_kernel − 1) × (inner + 2 × groups × state) +
   inner × state) × 4 bytes × sequences × snapshots. Sequences is
@@ -346,7 +353,14 @@ The IQ4_XS runs had 0.67 to 1.2 GB of desktop VRAM in use, which leaves about
 larger size above it, the same line the measurements drew. The measured spill
 grew faster than the estimated overshoot. At 100,096 about 1.75 GB spilled
 beyond the baseline, against a 0.9 to 1.4 GiB overshoot. So on this card,
-treat the estimate as a lower bound near the limit. With
+near the limit, treat the estimate of a model like this one (attention and
+recurrent layers, no MLA) as a lower bound. Its errors there are
+under-counts. Windows spills more than the overshoot, and vision encoder
+buffers, a draft model's KV and the MTP draft context's compute buffer are
+not counted. The advice does not hold where the estimate over-counts. That
+covers MLA models, the sliding-window and shared-KV cases in the known
+limits below, and placement flags in `extra_args`. For those, the check can
+refuse a model that fits. With
 `vram_budget_mib: 15600`, the check accepts IQ4_XS at 65,536 and refuses it
 at 73,728 and above.
 
@@ -373,16 +387,88 @@ grew 866 MiB, the estimate 612 MiB. The likely cause (not yet confirmed
 from a load log) is the MTP draft context's compute buffer, which grows with
 the context and which the estimate does not include; its notes say so.
 Extrapolating that slope, the estimate is about 2 % low near the MTP clean
-edge (81,920), so the lower-bound advice above applies with MTP too.
+edge (81,920). The missing draft-context buffer is another under-count, so
+the lower-bound advice above applies with MTP too.
+
+### Sliding-window attention
+
+llama.cpp keeps the KV of sliding-window (SWA) layers in a second cache. It
+has `size_swa = pad(min(ctx_seq, sliding_window × (unified ? slots : 1) +
+ubatch), 256)` cells per stream, where full-attention layers keep ctx_seq
+(`llama_kv_cache_iswa`, `src/llama-kv-cache-iswa.cpp`). It is the same in
+llama.cpp 7fe450e, in b11195, and in 161755f29, the bundled llama-server's
+commit. The SWA layers use `key_length_swa` and
+`value_length_swa` as their head sizes. The estimate counts both caches like
+that. `serve` logs them separately, for example
+`KV 4576 = (8 full-attention layers x 262144 tokens + 40 sliding-window
+layers x 1536 tokens) x 1 sequence(s)`.
+
+Take a Gemma-4-12B-shaped model at its 262,144-token context, with f16 K and
+V and one sequence. It has 48 layers. Every 6th layer is full attention with
+1 KV head of 512, and the rest are SWA with 8 KV heads of 256 and a window of
+1,024 tokens.
+
+| Layers | Bytes per token | Cells | KV |
+|---|---|---|---|
+| 8 full-attention | 16,384 | 262,144 | 4,096 MiB |
+| 40 sliding-window | 327,680 | pad(1,024 + 512) = 1,536 | 480 MiB |
+| **total** | | | **4,576 MiB** |
+
+Before this, every layer was counted at the full context with the
+full-attention head size, which came to 164 GiB. `serve` refused the model
+with exit status 2 although it fits.
+
+- **Which layers slide.** The GGUF's per-layer `sliding_window_pattern`
+  array (BOOL, or INT32/UINT32) decides when it is present. Some
+  architectures store none, and llama.cpp's loader then builds in a
+  period: gemma2 2, gemma3 6, gemma3n 5, gpt-oss 2, plamo3 8, and 4 for
+  afmoe, cohere2, cohere2moe, exaone-moe, exaone4, laguna, llama4, mellum,
+  muse-glimmer, olmo2 and smallthinker. cohere2moe, laguna and
+  smallthinker put the full layer first in each period. A scalar
+  `sliding_window_pattern` replaces the built-in period.
+- **When.** Each architecture follows its own loader. gemma3, olmo2,
+  plamo3, afmoe, laguna, mellum, smallthinker and lfm2 use SWA only with a
+  positive `sliding_window`. llama4 uses it unless `sliding_window` is 0,
+  and always with a window of 8,192; smallthinker always uses 4,096. exaone4
+  uses it only in its 64-layer model, and gemma2 and exaone4 default to a
+  window of 4,096. lfm2 slides every attention layer.
+- **Which architectures.** SWA is modelled only for architectures whose
+  loaders were checked against llama.cpp: those above plus gemma4,
+  granite_swa, maple, mimo2, spark2_5 and step35, which store the
+  per-layer array. phi3's loader turns SWA off whatever the file says. Any
+  other architecture with `sliding_window` set counts every layer at full
+  context, and the estimate's notes say so.
+- **Full size.** `--swa-full` in `extra_args` makes the SWA cache as large
+  as the full one (cells = ctx_seq); the Gemma-4 shape above is then
+  84 GiB. So does the llamacpp backend. It keeps the llama.cpp library's
+  default, `swa_full = true` in `llama_context_default_params`, where
+  llama-server defaults to false. The notes say which applies.
 
 The known limits:
 
-- MLA (DeepSeek-style) and sliding-window attention are counted as full
-  attention, which overestimates.
+- MLA (DeepSeek-style) layers are counted as regular attention, with
+  n_kv_heads × (key_length + value_length) values per token. llama.cpp
+  stores only the compressed latent row (key_length wide) and no V for
+  them. That is an **over**-estimate. A current DeepSeek-V2/V3 GGUF has
+  1 KV head, key_length 576 and value_length 512, so its KV term is about
+  1.9 times the real one. The check can therefore refuse an MLA model that
+  fits. Check such a profile against measured usage, then set
+  `vram_budget_mib` or pass `--allow-overcommit`.
+- Sliding-window attention on an architecture outside the list above is
+  counted at full context, which overestimates where llama.cpp uses the
+  window. Layers that reuse another layer's KV (Gemma 3n, and Gemma 4 with
+  `shared_kv_layers`) are counted as if they kept their own, also an
+  overestimate. The CLI conservatively counts a full-size SWA cache whenever
+  inherited `LLAMA_ARG_SWA_FULL` is nonempty, including a false-looking value
+  such as `0`, and names that setting in the estimate notes. Unset it to use
+  window sizing. Embedding hosts pass their environment snapshot through
+  `VramEstimateInputs::inherited_swa_full`; the estimator itself reads no
+  environment.
 - Placement flags in `extra_args` (`-ot`, `--cpu-moe`, `--tensor-split`,
   and so on) are not modelled. The estimate says so.
 - Vision encoder compute buffers, a draft model's KV cache and the MTP draft
-  context's compute buffer are not included.
+  context's compute buffer are not included, so the estimate is low by
+  their size.
 - Windows does not fail an overcommitted allocation under `--fit off`. It
   spills into shared memory and runs 2 to 15 times slower. That is why the
   check refuses by default.
@@ -566,13 +652,19 @@ llama-server needed:
 - direct-backend mapping (the values reaching `BackendSetup`) and each
   rejection
 - the GGUF reader on synthetic headers (hybrid by tensors and by interval,
-  per-layer head counts, truncation, implausible `ssm.*` sizes, oversized
-  names kept out of error messages); `fuzz/` adds `sonder_fuzz_gguf` over
-  the reader and the estimate
+  per-layer head counts, BOOL and INT32 `sliding_window_pattern` arrays,
+  the SWA layout and built-in period per architecture, truncation,
+  implausible `ssm.*` sizes, oversized names kept out of error messages);
+  `fuzz/` adds `sonder_fuzz_gguf` over the reader and the estimate
 - estimator arithmetic, including the hybrid rule, parallel and unified KV,
   llama-server's automatic 4 slots when `parallel` is unset, MTP, recurrent
   snapshots for speculative rollback, partial offload, saturation instead of
   overflow, and the measured 100k and MTP profiles
+- sliding-window caches: the Gemma-4-12B shape at 262,144 tokens, window
+  plus micro-batch per stream with and without `kv_unified`, `--swa-full`
+  and the llamacpp backend's full-size default, padded V rows with flash
+  attention off, an architecture whose SWA layout is not modelled, and
+  models without SWA layers estimated exactly as before
 - sampling defaults reaching the backend through `/v1/chat/completions` and
   `/v1/messages`, also for a lazily loaded model and after an idle eviction
   reloads it (under the profile's load name)
@@ -582,8 +674,9 @@ llama-server needed:
   (`auto_fit`) replacing `context_length` next to the backend's `runtime`
 - `serve` refusals, including the llama.cpp context flags next to
   `--profile` and `--moe-experts`/`--tensor-override` next to a llamaserver
-  profile, and `--vram-budget-mib` taking precedence over the profile's
-  budget
+  profile, `--vram-budget-mib` taking precedence over the profile's
+  budget, and a sliding-window model that fits at its full context passing
+  the fit check
 
 Set `SONDER_TEST_GGUF` to a GGUF file, or to a copy of its header, to print
 the estimate for a real model. Without it doctest skips that diagnostic, so
