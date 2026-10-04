@@ -27,6 +27,16 @@ private prompt and token-text capture disabled. The Linux file-error control
 uses append mode and does not fill a disk. It is compiled only on Linux;
 portable stream and healthy-file controls also run on other platforms.
 
+The hosted TSan run on initial revision `adad5ee4` passed all five new controls
+but failed the existing upstream-prefill cancellation/disconnect case (915 of
+916 cases passed). Its fake server counted requests before entering the response
+provider, allowing cancellation before the callback that observes disconnects
+could run. The test now uses a bounded provider-entry/release gate: cancellation
+starts after provider entry, and prefill is released after the client returns.
+The existing disconnect probe and assertion remain, with additional checks for
+zero body chunks and cancellation within 2.5 seconds. Production HTTP is unchanged;
+fresh complete checks are required on the repaired revision.
+
 The local Linux Debug build with `SONDER_WARNINGS_AS_ERRORS=ON` passed all 916
 CTest cases in 53.58 seconds. These observations precede publication; hosted
 checks on the exact final revision are required before merging.

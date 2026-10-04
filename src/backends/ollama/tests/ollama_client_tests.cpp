@@ -164,24 +164,31 @@ TEST_CASE("client: cancellation during upstream prefill closes the response") {
     StreamScript s;
     s.body = fixture("generate_stream.ndjson");
     s.chunk_bytes = 1;
-    s.initial_delay = std::chrono::milliseconds(300);
+    auto prefill = std::make_shared<sonder_test::PrefillGate>();
+    s.prefill_gate = prefill;
     srv.set_generate(s);
     OllamaClient cli(config_for(srv));
     GenerateParams p;
     p.model = "m";
     CancellationSource source;
-    std::thread canceller([&] {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-        while (srv.request_count() == 0 && std::chrono::steady_clock::now() < deadline)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::atomic<bool> entered{false};
+    std::jthread canceller([&] {
+        entered = prefill->wait_until_entered(std::chrono::seconds(3));
         source.cancel();
     });
-    auto r = cli.generate(p, {}, source.token());
+    int chunks = 0;
+    const auto start = std::chrono::steady_clock::now();
+    auto r = cli.generate(p, [&](const StreamChunk&) { ++chunks; return true; }, source.token());
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    prefill->release();
     canceller.join();
+    REQUIRE(entered.load());
     REQUIRE(srv.request_count() > 0);
     REQUIRE(r.status().code() == ErrorCode::cancelled);
-    // The provider wakes after its simulated prefill and must observe that
-    // the client's socket was closed by the cancelled HTTP request.
+    CHECK(chunks == 0);
+    CHECK(elapsed < std::chrono::milliseconds(2500));
+    // Release prefill only after the cancelled client returned. The provider
+    // was already entered and must now observe the closed socket.
     for (int i = 0; i < 100 && srv.disconnects() == 0; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     CHECK(srv.disconnects() > 0);
