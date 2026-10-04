@@ -81,3 +81,13 @@ class CChatMessage(c.Structure):
         ("role", c.c_char_p),
         ("content", c.c_char_p),
     ]
+
+
+class CSessionMetadata(c.Structure):
+    _fields_ = [
+        ("struct_size", c.c_uint32),
+        ("session_id", c.c_char_p),
+        ("run_id", c.c_char_p),
+        ("agent_id", c.c_char_p),
+        ("task_id", c.c_char_p),
+    ]

@@ -143,3 +143,22 @@ close an abandoned stream (prefer its context manager). This is application
 output backpressure; the engine telemetry queue remains nonblocking.
 
 See [qualification and limits](../../docs/integration/python-stream-backpressure.md).
+
+### Session correlation metadata
+
+```python
+metadata = si.SessionMetadata(session_id="sdk-session:1", run_id="runtime-run:1",
+                              agent_id="worker:1", task_id="task:1")
+with engine.create_session(model, metadata=metadata) as session:
+    result = session.generate("hello")
+```
+
+IDs use the HTTP correlation policy `[A-Za-z0-9._:-]{1,128}`. `None` keeps the
+engine's defaults. The native session copies all IDs; metadata applies to
+`generate`, `chat` and `stream` telemetry and never enables text capture.
+IDs themselves are telemetry metadata independent of text consent: do not put
+prompts, secrets or personal data in them. Keep caller session IDs unique.
+Older ABI-v1 libraries still support default sessions; explicitly requested
+metadata raises `UnsupportedError` when the additive export is absent.
+Scheduling hints and a telemetry callback are separate follow-ups. See
+[contract and qualification](../../docs/integration/cabi-session-metadata.md).

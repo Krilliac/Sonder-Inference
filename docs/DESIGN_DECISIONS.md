@@ -262,3 +262,13 @@ callback delivery during cancel/close, including requests that have not entered
 the native call yet. This changes no public API or C ABI; response text remains
 retained and the bound does not imply a total byte-memory cap. See
 [integration/python-stream-backpressure.md](integration/python-stream-backpressure.md).
+
+
+## SDK session correlation prefix — 2026-10-04
+
+Add a separate ABI-v1 versioned metadata record and session-create export for
+caller session/run/agent/task IDs. Reuse the HTTP ASCII 1–128-byte correlation
+policy, copy ownership at creation, and preserve original-create defaults and
+older-library loading. IDs are telemetry metadata independent of text capture;
+no prompt-derived IDs, scheduling hints or telemetry callback are introduced.
+See [integration/cabi-session-metadata.md](integration/cabi-session-metadata.md).

@@ -172,6 +172,26 @@ SONDER_API sonder_status sonder_session_generate(sonder_session* session, const 
 SONDER_API sonder_status sonder_session_cancel(sonder_session* session);
 
 
+/* Additive ABI-v1 session correlation metadata. NULL fields retain defaults.
+ * Identifiers are caller-supplied metadata, not prompt text: each non-NULL
+ * value must match [A-Za-z0-9._:-]{1,128}. Values are copied before returning.
+ * Larger records are accepted; unknown tail fields are ignored. */
+#define SONDER_MAX_CORRELATION_ID_BYTES 128u
+typedef struct sonder_session_metadata {
+    uint32_t struct_size;  /* sizeof(sonder_session_metadata) */
+    const char* session_id; /* NULL: generated session id */
+    const char* run_id;     /* NULL: engine correlation default */
+    const char* agent_id;
+    const char* task_id;
+} sonder_session_metadata;
+
+/* metadata may be NULL for the existing defaults. Sampling and engine/model
+ * lifetime contracts are identical to sonder_session_create(). */
+SONDER_API sonder_status sonder_session_create_with_metadata(
+    sonder_engine* engine, sonder_model* model, const sonder_sampling_config* sampling,
+    const sonder_session_metadata* metadata, sonder_session** out_session);
+
+
 /* Text-only chat, additive in ABI version 1. Each record is independently
  * versioned; the pointer array allows future fields without changing its
  * stride. Larger records are accepted and unknown tail fields are ignored. */
