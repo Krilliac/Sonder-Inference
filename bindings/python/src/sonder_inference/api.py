@@ -580,6 +580,20 @@ class Session(_Handle):
         role-labelled prompt. Callback and cancellation match generate().
         Older ABI v1 libraries without the chat export raise UnsupportedError.
         """
+        args = self._chat_args(messages)
+        return self._request(self._lib.cdll.sonder_session_chat, args, on_token)
+
+    def chat_stream(self, messages: Iterable[Union[ChatMessage, Mapping[str, str]]]) -> "TokenStream":
+        """Iterate over structured chat chunks with the same 64-chunk bound
+        and cancellation/lifetime behavior as stream(). Native input buffers
+        are prepared before starting the worker. Close an abandoned iterator.
+        """
+        args = self._chat_args(messages)
+        if self.closed:
+            raise InvalidStateError("Session is closed")
+        return TokenStream._from_chat(self, args)
+
+    def _chat_args(self, messages: Iterable[Union[ChatMessage, Mapping[str, str]]]) -> tuple[Any, int]:
         if not self._lib.has_symbol("sonder_session_chat"):
             raise UnsupportedError("this library does not export sonder_session_chat")
         records: list[S.CChatMessage] = []
@@ -604,20 +618,30 @@ class Session(_Handle):
             raise InvalidArgumentError("chat requires at least one message")
         pointers = (ctypes.POINTER(S.CChatMessage) * len(records))(
             *(ctypes.pointer(record) for record in records))
-        return self._request(self._lib.cdll.sonder_session_chat, (pointers, len(records)), on_token)
+        return pointers, len(records)
 
 
 
 class TokenStream:
-    """Iterator over generated chunks; see :meth:`Session.stream`."""
+    """Iterator over generated chunks; see :meth:`Session.stream` and :meth:`Session.chat_stream`."""
 
     _DONE = object()
     _MAX_BUFFERED_CHUNKS = 64
     _POLL_INTERVAL_S = 0.025
 
     def __init__(self, session: Session, prompt: str) -> None:
-        self._session = session
         self._prompt = prompt
+        self._start(session, lambda: session.generate(self._prompt, on_token=self._push))
+
+    @classmethod
+    def _from_chat(cls, session: Session, args: tuple[Any, int]) -> "TokenStream":
+        stream = cls.__new__(cls)
+        stream._start(session, lambda: session._request(session._lib.cdll.sonder_session_chat, args, stream._push))
+        return stream
+
+    def _start(self, session: Session, call: Callable[[], GenerationResult]) -> None:
+        self._session = session
+        self._call = call
         self._queue: "queue.Queue[Any]" = queue.Queue(maxsize=self._MAX_BUFFERED_CHUNKS)
         self._closed = threading.Event()
         self._done = threading.Event()
@@ -631,10 +655,13 @@ class TokenStream:
 
     def _run(self) -> None:
         try:
-            self.result = self._session.generate(self._prompt, on_token=self._push)
+            self.result = self._call()
         except BaseException as e:  # noqa: BLE001 - surfaced to the consumer
             self._exc = e
         finally:
+            # The native call has ended; retain its result, not its prepared
+            # input buffers or the callable's reference back to this iterator.
+            del self._call
             # Completion must never wait for a consumer: close() joins this
             # worker even when the buffer is full. The event covers that case.
             try:

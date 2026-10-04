@@ -109,9 +109,21 @@ result = session.chat([
 Native backend chat receives structured messages. Other backends use the
 engine's existing role-labelled prompt fallback. Results, incremental UTF-8
 decoding, callback stop/exception propagation, cancellation and concurrent
-close behavior match `generate()`. There is no `chat_stream()` iterator in this
-slice. Iterables consume at most 1,025 records before rejecting an oversized
+close behavior match `generate()`. `Session.chat_stream(messages)` returns the
+same bounded `TokenStream` iterator as `stream(prompt)`, using structured chat
+through the existing C ABI. Message shapes, NULs and the count bound are checked
+and native input buffers are prepared on the calling thread before the worker
+starts. Later mutation of caller mappings cannot alter that request. Native
+validation/backend errors are raised during iteration after queued chunks drain.
+Iterables consume at most 1,025 records before rejecting an oversized
 conversation; message text length is not bounded by this count limit.
+
+```python
+with session.chat_stream([si.ChatMessage("user", "Hello")]) as stream:
+    for chunk in stream:
+        print(chunk, end="")
+    result = stream.result
+```
 
 The bindings still load older ABI v1 libraries; chat raises `UnsupportedError`
 when `sonder_session_chat` is absent. See [the C contract](../../docs/integration/cabi-chat.md).
@@ -128,7 +140,7 @@ weights are needed.
 
 ### Token iterator backpressure
 
-`Session.stream()` buffers at most 64 pending chunk objects. A paused consumer
+`Session.stream()` and `Session.chat_stream()` buffer at most 64 pending chunk objects. A paused consumer
 backpressures the worker callback; normal iteration resumes delivery in order
 without dropping text. `TokenStream.close()`, `Session.cancel()`, session close
 and engine close release a full-buffer wait. The completion/error signal never
@@ -155,7 +167,7 @@ with engine.create_session(model, metadata=metadata) as session:
 
 IDs use the HTTP correlation policy `[A-Za-z0-9._:-]{1,128}`. `None` keeps the
 engine's defaults. The native session copies all IDs; metadata applies to
-`generate`, `chat` and `stream` telemetry and never enables text capture.
+`generate`, `chat`, `stream` and `chat_stream` telemetry and never enables text capture.
 IDs themselves are telemetry metadata independent of text consent: do not put
 prompts, secrets or personal data in them. Keep caller session IDs unique.
 Older ABI-v1 libraries still support default sessions; explicitly requested
