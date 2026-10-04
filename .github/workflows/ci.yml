@@ -78,22 +78,36 @@ jobs:
           test "$rc" -eq 2
           rc=0; "$exe" || rc=$?
           test "$rc" -eq 2
-          # serve: listen on an ephemeral port, answer health, drain on SIGINT.
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            ready="$RUNNER_TEMP/infer.ready.json"
-            "$exe" serve --backend mock --port 0 --ready-file "$ready" 2> serve.log &
-            pid=$!
-            for _ in $(seq 100); do [ -s "$ready" ] && break; sleep 0.1; done
-            url=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["url"])' "$ready")
-            for _ in $(seq 100); do
-              if curl -fsS "$url/v1/sonder/health" > health.json 2>/dev/null; then break; fi
-              sleep 0.1
-            done
-            grep -q '"status":"ready"' health.json
-            kill -INT "$pid"
-            wait "$pid"
-            test ! -e "$ready"
-          fi
+
+      # Real synthetic HTTP/SSE clients, three fresh server lifecycles, and
+      # SIGINT while admitted streams are still active. This is a blocking
+      # step in the existing Linux context, not a model performance benchmark.
+      - name: Mock HTTP/SSE lifecycle stress (Linux)
+        id: mock-stress
+        if: runner.os == 'Linux'
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/qualification
+          python3 scripts/stress_mock.py \
+            --binary build/${{ matrix.preset }}/sonder-infer --cycles 3 --mock-delay-ms 40 \
+            --out build/qualification/mock-stress.json \
+            2>&1 | tee build/qualification/mock-stress.log
+          SONDER_STRESS_BINARY=build/${{ matrix.preset }}/sonder-infer SONDER_STRESS_DELAY_MS=40 \
+            python3 -m unittest scripts.test_stress_mock \
+            2>&1 | tee -a build/qualification/mock-stress.log
+
+      - name: Retain mock lifecycle qualification receipt
+        if: always() && runner.os == 'Linux' && steps.mock-stress.outcome != 'skipped'
+        uses: actions/upload-artifact@v7
+        with:
+          name: mock-lifecycle-stress-${{ matrix.preset }}
+          path: |
+            build/qualification/mock-stress.json
+            build/qualification/mock-stress.log
+          if-no-files-found: error
+          retention-days: 14
 
   # Optional MSVC build of the llama.cpp backend (SONDER_WITH_LLAMA_CPP=ON).
   # Non-blocking for now: failures are reported but do not fail the workflow.
