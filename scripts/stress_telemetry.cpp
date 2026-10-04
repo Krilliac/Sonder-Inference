@@ -209,7 +209,7 @@ int main(int argc, char** argv) {
 #endif
             }
         }
-        std::cout << json::Value(json::Object{{"synthetic", true}, {"scope", "Debug telemetry transport only; no provider/model calls"},
+        std::cout << json::Value(json::Object{{"synthetic", true}, {"scope", "Synthetic telemetry transport only; no provider/model calls"},
                                             {"cycles", std::move(receipts)}}).dump() << '\n';
         return 0;
     } catch (const std::exception& error) {
