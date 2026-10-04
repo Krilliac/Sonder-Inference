@@ -46,7 +46,9 @@ struct TelemetryContext {
 };
 
 // Receives fully serialized single-line JSON envelopes (no trailing newline).
-// Called only from the telemetry writer thread (or from flush()).
+// Called only from the telemetry writer thread. An exception from write_event()
+// or flush() retires this sink without retrying it or logging exception contents;
+// healthy sinks continue. Implementations must not block indefinitely.
 class TelemetrySink {
 public:
     virtual ~TelemetrySink() = default;
@@ -118,7 +120,8 @@ public:
     bool emit(std::string_view event_type, const TelemetryContext& context, json::Object attributes,
               TelemetryLevel level = TelemetryLevel::metrics);
 
-    // Blocks until everything queued so far has been written to sinks.
+    // Blocks until the writer has processed everything queued so far. Failed
+    // sinks are retired; draining completes even when no healthy sink remains.
     void flush();
     // Emits a final telemetry.dropped event if anything was dropped, drains, and
     // stops the writer. Idempotent; called by the destructor.
@@ -126,6 +129,9 @@ public:
 
     [[nodiscard]] std::uint64_t emitted_events() const noexcept { return emitted_.load(); }
     [[nodiscard]] std::uint64_t dropped_events() const noexcept { return dropped_.load(); }
+    // Distinct sink objects retired after a write/flush exception, counted once
+    // even if registered more than once. Separate from queue-pressure drops.
+    [[nodiscard]] std::uint64_t failed_sinks() const noexcept { return failed_sinks_.load(); }
 
     // Stream identity: event_id is "<instance_id>-<sequence>" and
     // producer.instance_id carries the same value (docs/TELEMETRY.md).
@@ -158,6 +164,7 @@ private:
     bool stopped_ = false;
     std::atomic<std::uint64_t> emitted_{0};
     std::atomic<std::uint64_t> dropped_{0};
+    std::atomic<std::uint64_t> failed_sinks_{0};
     std::uint64_t reported_dropped_ = 0;
     std::chrono::steady_clock::time_point last_drop_report_{};
     std::thread writer_;

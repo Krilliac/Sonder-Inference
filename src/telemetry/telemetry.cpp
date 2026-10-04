@@ -202,7 +202,7 @@ bool TelemetryBus::emit(std::string_view event_type, const TelemetryContext& con
         return false;
     }
     std::unique_lock<std::mutex> lock(mutex_);
-    if (stopping_) {
+    if (stopping_ || sinks_.empty()) {
         return false;
     }
     if (queue_.size() >= options_.queue_capacity) {
@@ -229,18 +229,40 @@ void TelemetryBus::writer_loop() {
         batch.swap(queue_);
         auto sinks = sinks_;
         lock.unlock();
+        auto retire_sink = [&](std::shared_ptr<TelemetrySink> failed) {
+            lock.lock();
+            std::erase(sinks_, failed);
+            failed_sinks_.fetch_add(1, std::memory_order_relaxed);
+            lock.unlock();
+            // Retain shared ownership through registry removal, then discard
+            // every snapshot alias outside the mutex. User destruction must
+            // never run while the bus mutex is held or on the emitting thread.
+            for (auto& alias : sinks) {
+                if (alias == failed) alias.reset();
+            }
+        };
         for (const auto& [sequence, line] : batch) {
             for (const auto& sink : sinks) {
-                sink->write_event(sequence, line);
+                if (!sink) continue;
+                try {
+                    sink->write_event(sequence, line);
+                } catch (...) {
+                    retire_sink(sink);
+                }
             }
         }
         for (const auto& sink : sinks) {
-            sink->flush();
+            if (!sink) continue;
+            try {
+                sink->flush();
+            } catch (...) {
+                retire_sink(sink);
+            }
         }
         lock.lock();
         written_sequence_ += batch.size();
         // Live drop reporting: first drop immediately, then rate limited.
-        if (!stopping_ && dropped_.load() > reported_dropped_ && options_.level != TelemetryLevel::off) {
+        if (!stopping_ && !sinks_.empty() && dropped_.load() > reported_dropped_ && options_.level != TelemetryLevel::off) {
             const auto now = std::chrono::steady_clock::now();
             if (reported_dropped_ == 0 || now - last_drop_report_ >= options_.drop_report_interval) {
                 enqueue_drop_report_locked(false);

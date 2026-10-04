@@ -1,0 +1,168 @@
+#include "sonder/inference/telemetry.hpp"
+
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <iostream>
+#include <set>
+#include <stdexcept>
+#include <thread>
+
+using namespace sonder::inference;
+using Clock = std::chrono::steady_clock;
+
+void require(bool value, const char* message) {
+    if (!value) throw std::runtime_error(message);
+}
+
+#ifndef SONDER_BASELINE_TELEMETRY
+class Fault final : public TelemetrySink {
+public:
+    explicit Fault(bool flush_failure) : flush_failure_(flush_failure) {}
+    void write(std::string_view) override {
+        ++writes;
+        if (!flush_failure_) throw std::ios_base::failure("synthetic I/O failure");
+    }
+    void flush() override {
+        ++flushes;
+        if (flush_failure_) throw std::ios_base::failure("synthetic I/O failure");
+    }
+    std::atomic<unsigned> writes{0}, flushes{0};
+private:
+    bool flush_failure_;
+};
+#endif
+
+json::Object cycle(std::string_view mode, unsigned workers, unsigned attempts,
+                   unsigned capacity, bool healthy_siblings = true) {
+    TelemetryOptions options;
+    options.synthetic = true;
+    options.queue_capacity = capacity;
+    options.drop_report_interval = std::chrono::hours(1);
+    TelemetryBus bus(options);
+#ifndef SONDER_BASELINE_TELEMETRY
+    std::shared_ptr<Fault> fault;
+    if (mode != "healthy") {
+        fault = std::make_shared<Fault>(mode == "flush");
+        bus.add_sink(fault);
+        bus.add_sink(fault);
+    }
+#else
+    require(mode == "healthy", "baseline supports healthy-only control");
+#endif
+    auto first = std::make_shared<MemoryTelemetrySink>();
+    auto second = std::make_shared<MemoryTelemetrySink>();
+    if (healthy_siblings) {
+        bus.add_sink(first);
+        bus.add_sink(second);
+    }
+    TelemetryContext context;
+    context.session_id = "synthetic-stability";
+    std::array<std::vector<unsigned>, 6> admitted;
+    std::vector<std::thread> threads;
+    const auto start = Clock::now();
+    for (unsigned worker = 0; worker < workers; ++worker) {
+        threads.emplace_back([&, worker] {
+            for (unsigned i = 0; i < attempts; ++i) {
+                unsigned id = worker * attempts + i;
+                if (bus.emit("stress.event", context, json::Object{{"id", id}})) {
+                    admitted[worker].push_back(id);
+                }
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    const auto drain_start = Clock::now();
+    bus.flush();
+    bus.shutdown();
+    bus.flush();
+    bus.shutdown();
+    const auto end = Clock::now();
+    std::set<unsigned> accepted;
+    for (unsigned worker = 0; worker < workers; ++worker) {
+        accepted.insert(admitted[worker].begin(), admitted[worker].end());
+    }
+    require(accepted.size() == bus.emitted_events(), "accepted counter mismatch");
+    if (healthy_siblings) {
+        require(accepted.size() + bus.dropped_events() == workers * attempts,
+                "pressure accounting mismatch");
+        auto lines = first->lines();
+        require(lines == second->lines(), "healthy sibling mismatch");
+        std::set<unsigned> delivered;
+        std::uint64_t seq = 0, last_drops = 0;
+        for (const auto& line : lines) {
+            auto parsed = json::parse(line);
+            require(parsed.ok(), "invalid envelope");
+            const auto& envelope = parsed.value();
+            require(envelope.find("sequence")->as_uint() == seq, "cursor gap");
+            require(envelope.find("event_id")->as_string() == bus.instance_id() + "-" + std::to_string(seq),
+                    "event id mismatch");
+            const auto* producer = envelope.find("producer");
+            require(producer->find("instance_id")->as_string() == bus.instance_id(), "producer mismatch");
+            require(producer->find("synthetic")->as_bool(), "missing synthetic label");
+            const auto* attributes = envelope.find("attributes");
+            if (envelope.find("event_type")->as_string() == "stress.event") {
+                auto id = static_cast<unsigned>(attributes->find("id")->as_uint());
+                require(delivered.insert(id).second, "duplicate accepted event");
+            } else {
+                require(envelope.find("event_type")->as_string() == "telemetry.dropped", "unexpected event");
+                auto count = attributes->find("dropped_events")->as_uint();
+                require(count >= last_drops && count <= bus.dropped_events(), "drop report mismatch");
+                last_drops = count;
+            }
+            ++seq;
+        }
+        require(delivered == accepted, "accepted delivery mismatch");
+        require(last_drops == bus.dropped_events(), "final drops not reported");
+        if (capacity >= workers * attempts) require(bus.dropped_events() == 0, "unpressured control dropped");
+    } else {
+        require(!bus.enabled(TelemetryLevel::metrics), "all failed sinks remain enabled");
+        require(!accepted.empty(), "all-failed cycle admitted no events");
+    }
+#ifndef SONDER_BASELINE_TELEMETRY
+    require(bus.failed_sinks() == (fault ? 1u : 0u), "distinct failure count mismatch");
+    if (fault) {
+        if (mode == "flush") {
+            require(fault->flushes == 1, "failed flush retried");
+            require(fault->writes > 0 && fault->writes <= capacity * 2, "flush fault write count mismatch");
+        } else {
+            require(fault->writes == 1 && fault->flushes == 0, "failed write retried");
+        }
+    }
+#endif
+    return json::Object{{"mode", std::string(mode)}, {"workers", workers}, {"attempts", workers * attempts},
+                        {"capacity", capacity}, {"healthy_siblings", healthy_siblings},
+                        {"accepted", bus.emitted_events()}, {"queue_drops", bus.dropped_events()},
+                        {"filtered", workers * attempts - bus.emitted_events() - bus.dropped_events()},
+                        {"elapsed_ms", std::chrono::duration<double, std::milli>(end - start).count()},
+                        {"drain_ms", std::chrono::duration<double, std::milli>(end - drain_start).count()}};
+}
+
+int main(int argc, char** argv) {
+    try {
+        require(argc == 1 || (argc == 2 && std::string_view(argv[1]) == "pressure"),
+                "usage: telemetry-stress [pressure]");
+        bool pressure = argc == 2 && std::string_view(argv[1]) == "pressure";
+        json::Array receipts;
+        for (unsigned i = 0; i < 8; ++i) {
+            if (!pressure) {
+                receipts.emplace_back(cycle("healthy", 1, 4096, 4096));
+            } else {
+#ifndef SONDER_BASELINE_TELEMETRY
+                receipts.emplace_back(cycle("healthy", 6, 512, 64));
+                receipts.emplace_back(cycle("write", 6, 512, 64));
+                receipts.emplace_back(cycle("flush", 6, 512, 64));
+                receipts.emplace_back(cycle("write", 6, 512, 64, false));
+#else
+                throw std::runtime_error("baseline pressure mode disabled");
+#endif
+            }
+        }
+        std::cout << json::Value(json::Object{{"synthetic", true}, {"scope", "Debug telemetry transport only; no provider/model calls"},
+                                            {"cycles", std::move(receipts)}}).dump() << '\n';
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}

@@ -62,6 +62,40 @@ Levels: `metrics` events are always recorded when telemetry is enabled.
 Types used below: `int` (JSON integer), `num` (JSON number), `str`,
 `bool`, `obj`, `arr`.
 
+## Sink failure isolation
+
+The writer catches exceptions from each sink's `write_event()` and `flush()`.
+It retires the failed sink and all duplicate registrations of that object,
+without retrying it or logging its exception message, event contents, or
+destination. Healthy siblings continue receiving the original envelopes in
+sequence order with the same producer instance and event IDs. No failure event
+is recursively queued, and the envelope schema and C ABI are unchanged.
+
+The C++ getter `TelemetryBus::failed_sinks()` counts distinct objects retired
+after an exception, once per object registered before emission. This counter is
+separate from `dropped_events()`, which retains its queue-pressure meaning.
+The existing queue capacity and drop-report rules remain in effect. Sink I/O
+and retirement stay on the writer; the final failed-sink reference is released
+outside the bus mutex so a destructor cannot hold up the emitting thread while
+holding that mutex.
+
+`flush()` waits for processing of already-admitted events, including a backlog
+left after the last sink fails. Further emission is disabled when no sink
+survives; `shutdown()` still drains and terminates the writer. Processing does
+not guarantee delivery to a sink that failed. Stream/file factories retain
+their existing open-error behavior.
+
+This contains thrown exceptions, including an ostream configured with an
+exception mask. A stream that only sets a fail bit without throwing is not
+detected by this boundary. Indefinitely blocking callbacks or destructors
+remain the sink implementation's responsibility; the bus cannot interrupt
+arbitrary user code. Tests exercise real writer-thread failures, healthy
+sibling cursor parity, alias retirement, queue pressure, backlog drain,
+destructor queries, and continued mock generation with raw-text capture off.
+Mock and synthetic I/O controls provide no provider/model quality measurement.
+The [qualification note](integration/telemetry-sink-isolation.md) records the
+regression, bounded concurrent harness, timing comparison and remaining limits.
+
 ## Engine and models
 
 | Event | Level | Attributes |
