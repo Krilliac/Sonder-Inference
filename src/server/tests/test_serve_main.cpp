@@ -240,7 +240,11 @@ TEST_CASE("serve_main: llama.cpp KV cache, flash attention and batch flags") {
 TEST_CASE("serve_main: llama.cpp context flags are refused for every other backend") {
     std::string out;
     std::string err;
-    const std::vector<std::pair<std::string, std::string>> flags{{"--batch-size", "1024"},
+    const std::vector<std::pair<std::string, std::string>> flags{{"--gpu-layers", "1"},
+                                                                 {"--context-length", "1024"},
+                                                                 {"--moe-experts", "cpu"},
+                                                                 {"--tensor-override", "weight=cpu"},
+                                                                 {"--batch-size", "1024"},
                                                                  {"--ubatch-size", "256"},
                                                                  {"--cache-type-k", "q8_0"},
                                                                  {"--cache-type-v", "q8_0"},

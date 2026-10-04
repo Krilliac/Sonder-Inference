@@ -662,7 +662,8 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
     // run without them and say nothing; llama-server takes them in its spawn
     // arguments (the --llamaserver-config "args", or a launch profile).
     if (o.backend.backend != "llamacpp") {
-        for (const char* flag : kLlamaCppContextFlags) {
+        for (const char* flag : {"gpu-layers", "context-length", "moe-experts", "tensor-override",
+                                 "batch-size", "ubatch-size", "cache-type-k", "cache-type-v", "flash-attn"}) {
             if (a.get(flag)) {
                 return usage_error(std::string("option --") + flag +
                                    " applies only to --backend llamacpp; for llamaserver set it in the JSON args");
