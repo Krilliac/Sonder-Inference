@@ -94,7 +94,8 @@ set(_sonder_fuzz_targets
     bench_corpus
     bench_report
     telemetry_envelope
-    http_request)
+    http_request
+    gguf)
 
 foreach(name IN LISTS _sonder_fuzz_targets)
     set(target sonder_fuzz_${name})

@@ -11,6 +11,7 @@ sonder_module_sources(
     src/http.cpp
     src/health_features.cpp
     src/identity.cpp
+    src/launch_profile.cpp
     src/live_hub.cpp
     src/openai.cpp
     src/priority_admission.cpp
@@ -23,6 +24,7 @@ sonder_module_sources(
     src/server.cpp
     src/sha256.cpp
     src/socket.cpp
+    src/vram_estimate.cpp
     src/warmup_config.cpp)
 sonder_module_include_directories(include)
 sonder_module_define(SONDER_HAS_SERVER)
@@ -43,7 +45,8 @@ sonder_add_module_tests(server
     tests/test_server_request_path.cpp
     tests/test_priority_parsing.cpp
     tests/test_priority_admission.cpp
-    tests/test_server_priority.cpp)
+    tests/test_server_priority.cpp
+    tests/test_launch_profile.cpp)
 if(TARGET sonder_server_tests)
     target_include_directories(sonder_server_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     # GCC 13 raises a false -Wmaybe-uninitialized (fatal under -Werror) from <string> when a

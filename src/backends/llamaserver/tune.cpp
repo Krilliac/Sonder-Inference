@@ -49,10 +49,12 @@ json::Value measurement_json(const Measurement &m) {
         std::optional<double> acceptance;
         if (w.draft_n && *w.draft_n != 0 && w.draft_n_accepted)
             acceptance = static_cast<double>(*w.draft_n_accepted) / static_cast<double>(*w.draft_n);
-        workloads.emplace_back(json::Object{{"name", w.name}, {"weight", w.weight}, {"tok_s", w.tok_s},
-            {"draft_n", w.draft_n ? json::Value(*w.draft_n) : json::Value{}},
-            {"draft_n_accepted", w.draft_n_accepted ? json::Value(*w.draft_n_accepted) : json::Value{}},
-            {"acceptance_ratio", acceptance ? json::Value(*acceptance) : json::Value{}}});
+        json::Object workload{{"name", w.name}, {"weight", w.weight}, {"tok_s", w.tok_s},
+                              {"draft_n", nullptr}, {"draft_n_accepted", nullptr}, {"acceptance_ratio", nullptr}};
+        if (w.draft_n) workload.set("draft_n", *w.draft_n);
+        if (w.draft_n_accepted) workload.set("draft_n_accepted", *w.draft_n_accepted);
+        if (acceptance) workload.set("acceptance_ratio", *acceptance);
+        workloads.emplace_back(std::move(workload));
     }
     const auto weighted = weighted_decode_tps(m.workloads);
     return json::Object{{"ctx", m.candidate.ctx}, {"k", m.candidate.kv.k}, {"v", m.candidate.kv.v},

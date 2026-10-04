@@ -184,3 +184,78 @@ merging, because the dispatch now exists:
   in the CTest driver) are written for MSVC but were not run in the Linux
   container; the `ci-windows` job must pass. The `serve` part of the CI smoke runs on Linux
   only (signal delivery from Git Bash to a native process is not reliable).
+
+# Integration notes: `feat/launch-profiles` (typed launch profiles)
+
+Everything lives in the server module (`src/server`); see
+[docs/integration/launch-profiles.md](docs/integration/launch-profiles.md).
+
+- **KV-cache options (#45).** A llamacpp profile's `batch_size`,
+  `ubatch_size`, `cache_type_k`, `cache_type_v` and `flash_attn` set #45's
+  `BackendSetup` fields (`llamacpp_batch_size`, `llamacpp_ubatch_size`,
+  `llamacpp_kv_cache_type_k`, `llamacpp_kv_cache_type_v`,
+  `llamacpp_flash_attention`) with the same value names; the compile-time
+  switch that waited for those fields is gone now that they exist. With
+  `--profile`, `serve` refuses #45's five flags (the profile's typed fields
+  own them). Without a profile, the five flags now apply to `--backend
+  llamacpp` only: any other backend exits 2 with "option --X applies only to
+  --backend llamacpp; for llamaserver set it in the JSON args" instead of
+  ignoring them (the GPU lane's finding; default llamacpp behaviour is
+  unchanged).
+- **Model residency (#43).** The per-model binding (load name, sampling
+  defaults, `/v1/models` metadata) is looked up from
+  `ServerOptions::profile_bindings` by served id. `load_served_model()` uses
+  the load name, so eager, lazy and post-eviction loads all load a llamacpp
+  profile's GGUF path; sampling defaults apply after the residency resolves
+  `default` to the served id, for `/v1/chat/completions` and `/v1/messages`.
+- `threads`/`threads_batch` are rejected for llamacpp profiles although
+  `LlamaCppBackendOptions::threads` exists, because `BackendSetup` has no
+  field for it. A follow-up can plumb it.
+- **Overlap with `sonder-infer tune` (#44/#51).** tune writes a spawn config
+  (`tuned.json` with raw `args`) and has its own GGUF header reader
+  (`tune_model.cpp`); launch profiles are a typed schema with their own
+  reader and a fit check. Key names differ (tune's `no_kv_unified` vs
+  `kv_unified`, `cache_ram` vs `cache_ram_mib`), and a tuned config's `args`
+  cannot be combined with `--profile` (it refuses config `args`). Unifying
+  the two readers or schemas is an owner decision, not done here.
+- `ServerOptions` gains `profile_bindings` and `profile_catalog` (additive;
+  empty keeps every code path unchanged). `/v1/models` gains
+  `data[].sonder.profile` and `sonder.profiles` only when a profile is served.
+- Windows VRAM detection uses DXGI (`dxgi.lib` via `#pragma comment`, MSVC
+  only); other platforms need `vram_budget_mib` or `--vram-budget-mib`.
+- **Runtime status interplay** (#35, VRAM-spill guard). Rebased onto it:
+  `data[].sonder` carries `runtime` (from #35, when the backend reports it)
+  and `profile` (from this branch) side by side. When the running context
+  differs from the profile's (spill guard `auto_fit`), the served profile's
+  `context_length` is the running value and `configured_context_length` the
+  profile's. `capabilities` lists only what Sonder's endpoint accepts;
+  `vision`/`tools` are in `upstream_capabilities` because
+  `/v1/chat/completions` rejects tool definitions and image content.
+
+## Closeout follow-up: ignored direct-backend flags
+
+The server module now refuses `--gpu-layers`, `--context-length`,
+`--moe-experts` and `--tensor-override` for every backend except `llamacpp`,
+alongside the existing batch/KV/flash-attention flag rule. Previously these
+four options populated only direct llama.cpp settings and were silently
+ignored by mock, Ollama and llamaserver. The refusal is a usage error (exit
+2) before model loading or server startup. `--device` remains a valid
+telemetry/health label for every backend, and llamacpp profiles retain their
+command-line placement options.
+
+Outside the module, `docs/integration/launch-profiles.md` now documents the
+complete backend-only flag list. The public `serve_main` regression checks
+all nine options against mock, Ollama and llamaserver and confirms the
+llamacpp path accepts them.
+
+The qualification pass also found a GCC 14.2 warnings-as-errors build failure
+in the existing llamaserver tune report's conditional JSON-value initializer.
+`src/backends/llamaserver/tune.cpp` now initializes the optional counters as
+null and sets available values explicitly. This preserves JSON field order,
+unsigned counts, zero acceptance and unavailable ratios; the existing tune
+serialization tests exercise those distinctions. No warning is disabled.
+
+The integrator also adds the stdlib-only POSIX runner `scripts/stress_mock.py`
+and its reproduction guide `docs/integration/stability-smoke.md`. It runs
+bounded mock-only streaming/nonstreaming fan-out and drains active streams
+on SIGINT, with generated receipts kept outside Git.

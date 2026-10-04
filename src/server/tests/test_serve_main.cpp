@@ -11,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "server_test_support.hpp"
@@ -234,6 +235,41 @@ TEST_CASE("serve_main: llama.cpp KV cache, flash attention and batch flags") {
               out, err) == 2);
     CHECK(err.find("n_ubatch (512) must be <= n_batch (256)") != std::string::npos);
 #endif
+}
+
+TEST_CASE("serve_main: llama.cpp context flags are refused for every other backend") {
+    std::string out;
+    std::string err;
+    const std::vector<std::pair<std::string, std::string>> flags{{"--gpu-layers", "1"},
+                                                                 {"--context-length", "1024"},
+                                                                 {"--moe-experts", "cpu"},
+                                                                 {"--tensor-override", "weight=cpu"},
+                                                                 {"--batch-size", "1024"},
+                                                                 {"--ubatch-size", "256"},
+                                                                 {"--cache-type-k", "q8_0"},
+                                                                 {"--cache-type-v", "q8_0"},
+                                                                 {"--flash-attn", "on"}};
+    // `--max-connections 0` is a later usage error: should the rule go
+    // missing, serve still exits before it binds anything and the test fails
+    // on the message instead of serving.
+    for (const std::string backend : {"llamaserver", "mock", "ollama"}) {
+        for (const auto& [flag, value] : flags) {
+            CAPTURE(backend);
+            CAPTURE(flag);
+            CHECK(run({"--backend", backend, "--model", "x", flag, value, "--max-connections", "0"}, out, err) == 2);
+            CHECK(err.find("error: option " + flag +
+                           " applies only to --backend llamacpp; for llamaserver set it in the JSON args") !=
+                  std::string::npos);
+        }
+    }
+    // The llamacpp backend still takes them: the run gets past the flag and
+    // stops at the later usage error.
+    for (const auto& [flag, value] : flags) {
+        CAPTURE(flag);
+        CHECK(run({"--backend", "llamacpp", "--model", "x", flag, value, "--max-connections", "0"}, out, err) == 2);
+        CHECK(err.find("applies only to --backend llamacpp") == std::string::npos);
+        CHECK(err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+    }
 }
 
 TEST_CASE("serve_main: ready file, banner, access log and graceful shutdown via the hook") {
