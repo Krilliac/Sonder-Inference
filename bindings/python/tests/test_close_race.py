@@ -28,7 +28,7 @@ _PRELUDE = textwrap.dedent("""
         m = e.load_model("mock", "mock:tiny")
         return e, m
 
-    def slow_first_chunk_worker(s, max_tokens_note=""):
+    def slow_first_chunk_worker(s, max_tokens_note="", chat=False):
         started, cb_exited = threading.Event(), threading.Event()
         box = {}
 
@@ -40,7 +40,8 @@ _PRELUDE = textwrap.dedent("""
 
         def run():
             try:
-                box["result"] = s.generate("race", on_token=on_token)
+                box["result"] = (s.chat([si.ChatMessage("user", "race")], on_token=on_token)
+                                 if chat else s.generate("race", on_token=on_token))
             except BaseException as e:
                 box["error"] = e
 
@@ -174,3 +175,33 @@ def test_close_from_own_callback_is_rejected_not_deadlocked(engine, model):
     assert len(seen) == 1 and not s.closed
     assert s.generate("still usable").completed
     s.close()
+
+
+@pytest.mark.parametrize("close_engine", [False, True])
+def test_close_waits_for_chat_on_other_thread(lib, close_engine):
+    closer = "e.close()" if close_engine else "s.close()"
+    _run(f"""
+        e, m = make()
+        s = e.create_session(m, si.SamplingConfig.greedy(2000))
+        t, cb_exited, box = slow_first_chunk_worker(s, chat=True)
+        {closer}
+        assert cb_exited.is_set(), "close returned before chat callback exited"
+        t.join(30)
+        assert not t.is_alive() and "error" not in box, box
+        assert box["result"].cancelled and box["result"].completion_tokens < 2000
+        assert s.closed
+        try:
+            s.chat([si.ChatMessage("user", "after")])
+        except si.InvalidStateError:
+            pass
+        else:
+            raise AssertionError("chat after close did not raise")
+        e.close()
+    """)
+
+
+def test_chat_close_from_callback_is_rejected(engine, model):
+    with engine.create_session(model, si.SamplingConfig.greedy(5)) as session:
+        with pytest.raises(si.InvalidStateError, match="callback"):
+            session.chat([si.ChatMessage("user", "hi")], on_token=lambda _text: session.close())
+        assert session.chat([si.ChatMessage("user", "again")]).completed

@@ -69,12 +69,12 @@ with si.Engine(telemetry_level=si.TelemetryLevel.OFF) as engine:
   closes its sessions and models first. A session keeps its model alive in C,
   so a model may be closed before the sessions created from it.
 - `close()` is thread-safe. Closing a session (or its engine) while
-  `generate()`/`stream()` runs on another thread cancels that request and
+  `generate()`/`chat()`/`stream()` runs on another thread cancels that request and
   destroys the C handle only after the call returns; any call on a closed
   handle raises `InvalidStateError`. Calling `close()` from inside the
   session's own token callback raises `InvalidStateError`; return `False` or
   call `cancel()` there instead.
-- Strings passed to the C ABI (prompt, backend, model, paths, URLs) must not
+- Strings passed to the C ABI (prompt, chat roles/content, backend, model, paths, URLs) must not
   contain NUL characters; they raise `ValueError` instead of being truncated.
 
 ## Struct versioning
@@ -92,9 +92,29 @@ letting the library silently ignore it.
 
 ## Chat
 
-`Session.chat()` is a stub that raises `UnsupportedError`: the C ABI does
-not export a chat entry point yet. The proposed signature is in
-`docs/integration/python-bindings.md`.
+`Session.chat()` accepts 1–1,024 `ChatMessage(role, content)` records or mappings
+containing only `role` and `content`. Roles are `system`, `user`, `assistant`
+and `tool`; the last message must be `user` or `tool`. Content is text only.
+Empty content is allowed; NUL characters, missing fields and unknown roles
+are rejected. Reasoning, tool-call objects, images and other mapping fields
+raise `UnsupportedError` rather than being silently discarded.
+
+```python
+result = session.chat([
+    si.ChatMessage("system", "Be concise"),
+    {"role": "user", "content": "Hello"},
+], on_token=lambda text: print(text, end=""))
+```
+
+Native backend chat receives structured messages. Other backends use the
+engine's existing role-labelled prompt fallback. Results, incremental UTF-8
+decoding, callback stop/exception propagation, cancellation and concurrent
+close behavior match `generate()`. There is no `chat_stream()` iterator in this
+slice. Iterables consume at most 1,025 records before rejecting an oversized
+conversation; message text length is not bounded by this count limit.
+
+The bindings still load older ABI v1 libraries; chat raises `UnsupportedError`
+when `sonder_session_chat` is absent. See [the C contract](../../docs/integration/cabi-chat.md).
 
 ## Tests
 

@@ -27,7 +27,8 @@
 - [x] request priority classes and bounded admission (interactive/subagent/background FIFO ordering, per-class concurrency and queue caps, deadlines, cancellation propagation, and additive telemetry; see `docs/SERVER.md` and `docs/TELEMETRY.md`)
 - [x] `sonder-infer serve` command-line dispatch (`src/cli/sonder_infer_commands.hpp`; exercised in CI by the Linux smoke step, which starts `serve --backend mock --port 0 --ready-file` and drains it on SIGINT)
 - [x] live telemetry transport: SSE and NDJSON with discovery, resume and per-subscriber backpressure (`docs/TELEMETRY.md`)
-- [ ] C ABI additions for chat, session metadata and a telemetry callback (follow-up to ADR-020)
+- [x] additive text chat C ABI and Python Session.chat (versioned messages, 1–1,024 count bound; `docs/integration/cabi-chat.md`)
+- [ ] C ABI additions for session metadata and a telemetry callback (follow-up to ADR-020)
 - [ ] backend identity for Ollama (tokenizer digest not measurable) and llama.cpp (GGUF hashing)
 
 Gate: correctness + reliability parity for selected models.

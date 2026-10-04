@@ -171,6 +171,29 @@ SONDER_API sonder_status sonder_session_generate(sonder_session* session, const 
 /* Thread-safe; cancels the in-flight request. */
 SONDER_API sonder_status sonder_session_cancel(sonder_session* session);
 
+
+/* Text-only chat, additive in ABI version 1. Each record is independently
+ * versioned; the pointer array allows future fields without changing its
+ * stride. Larger records are accepted and unknown tail fields are ignored. */
+#define SONDER_MAX_CHAT_MESSAGES 1024u
+typedef struct sonder_chat_message {
+    uint32_t struct_size;  /* sizeof(sonder_chat_message) */
+    const char* role;      /* system, user, assistant or tool */
+    const char* content;   /* UTF-8, NUL-terminated; may be empty */
+} sonder_chat_message;
+
+/* Blocks like generate, using native backend chat when available and the
+ * engine's existing role-labelled prompt fallback otherwise. Requires 1 to
+ * SONDER_MAX_CHAT_MESSAGES records, ending in user or tool. All record/string
+ * pointers must be valid and non-NULL, borrowed until this call returns, and
+ * must not be changed during the call. Inputs are copied before submission.
+ * Callback, stats, cancellation and handle lifetime rules match generate.
+ * No reasoning, tool-call objects or images are carried by this interface. */
+SONDER_API sonder_status sonder_session_chat(sonder_session* session,
+                                             const sonder_chat_message* const* messages, size_t message_count,
+                                             sonder_token_callback callback, void* user_data,
+                                             sonder_generation_stats* out_stats);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

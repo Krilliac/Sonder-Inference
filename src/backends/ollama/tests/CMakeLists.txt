@@ -6,6 +6,7 @@ sonder_add_module_tests(ollama
     ollama_client_tests.cpp
     ollama_backend_tests.cpp
     ollama_chat_tests.cpp
+    ollama_c_api_chat_tests.cpp
     ollama_reasoning_transport_tests.cpp)
 
 if(TARGET sonder_ollama_tests)

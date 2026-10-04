@@ -6,6 +6,7 @@
 #include <exception>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "sonder/inference/backends.hpp"
 #include "sonder/inference/engine.hpp"
@@ -113,6 +114,34 @@ SamplingConfig from_c(const sonder_sampling_config& c) {
         }
     }
     return s;
+}
+
+TokenCallback c_callback(sonder_token_callback callback, void* user_data) {
+    if (!callback) {
+        return {};
+    }
+    return [callback, user_data](const TokenChunk& chunk) {
+        return callback(user_data, chunk.text.data(), chunk.text.size()) == 0;
+    };
+}
+
+sonder_status finish_request(const Result<GenerationResult>& res, sonder_generation_stats* out_stats) {
+    if (!res.ok()) {
+        if (out_stats) {
+            out_stats->outcome = SONDER_OUTCOME_FAILED;
+        }
+        return fail(res.status());
+    }
+    if (out_stats) {
+        const auto& r = res.value();
+        out_stats->outcome = static_cast<sonder_outcome>(static_cast<int>(r.outcome));
+        out_stats->prompt_tokens = r.stats.prompt_tokens;
+        out_stats->completion_tokens = r.stats.completion_tokens;
+        out_stats->chunks = r.stats.chunks;
+        out_stats->ttft_ms = r.ttft_ms;
+        out_stats->total_ms = r.total_ms;
+    }
+    return ok();
 }
 
 template <class F>
@@ -319,27 +348,35 @@ sonder_status sonder_session_generate(sonder_session* session, const char* promp
         if (out_stats && out_stats->struct_size < sizeof(sonder_generation_stats)) {
             return fail(SONDER_ERROR_INVALID_ARGUMENT, "sonder_generation_stats.struct_size too small");
         }
-        TokenCallback cb;
-        if (callback) {
-            cb = [&](const TokenChunk& chunk) { return callback(user_data, chunk.text.data(), chunk.text.size()) == 0; };
+        return finish_request(session->session->generate(prompt, c_callback(callback, user_data)), out_stats);
+    });
+}
+
+sonder_status sonder_session_chat(sonder_session* session, const sonder_chat_message* const* messages,
+                                  size_t message_count, sonder_token_callback callback, void* user_data,
+                                  sonder_generation_stats* out_stats) {
+    return guarded([&] {
+        if (!session || !messages || message_count == 0 || message_count > SONDER_MAX_CHAT_MESSAGES) {
+            return fail(SONDER_ERROR_INVALID_ARGUMENT, "chat requires a session and 1 to 1024 messages");
         }
-        auto res = session->session->generate(prompt, cb);
-        if (!res.ok()) {
-            if (out_stats) {
-                out_stats->outcome = SONDER_OUTCOME_FAILED;
+        if (out_stats && out_stats->struct_size < sizeof(sonder_generation_stats)) {
+            return fail(SONDER_ERROR_INVALID_ARGUMENT, "sonder_generation_stats.struct_size too small");
+        }
+        // This prefix remains fixed even if future headers append fields.
+        constexpr std::size_t min_size = offsetof(sonder_chat_message, content) + sizeof(const char*);
+        std::vector<ChatMessage> copied;
+        copied.reserve(message_count);
+        for (std::size_t i = 0; i < message_count; ++i) {
+            const auto* message = messages[i];
+            if (!message || message->struct_size < min_size) {
+                return fail(SONDER_ERROR_INVALID_ARGUMENT, "null chat message or struct_size too small");
             }
-            return fail(res.status());
+            if (!message->role || !message->content) {
+                return fail(SONDER_ERROR_INVALID_ARGUMENT, "chat role and content must be non-null");
+            }
+            copied.push_back(ChatMessage{message->role, message->content});
         }
-        if (out_stats) {
-            const auto& r = res.value();
-            out_stats->outcome = static_cast<sonder_outcome>(static_cast<int>(r.outcome));
-            out_stats->prompt_tokens = r.stats.prompt_tokens;
-            out_stats->completion_tokens = r.stats.completion_tokens;
-            out_stats->chunks = r.stats.chunks;
-            out_stats->ttft_ms = r.ttft_ms;
-            out_stats->total_ms = r.total_ms;
-        }
-        return ok();
+        return finish_request(session->session->chat(copied, c_callback(callback, user_data)), out_stats);
     });
 }
 
