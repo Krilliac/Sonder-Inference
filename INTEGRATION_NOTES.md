@@ -254,3 +254,8 @@ in the existing llamaserver tune report's conditional JSON-value initializer.
 null and sets available values explicitly. This preserves JSON field order,
 unsigned counts, zero acceptance and unavailable ratios; the existing tune
 serialization tests exercise those distinctions. No warning is disabled.
+
+The integrator also adds the stdlib-only POSIX runner `scripts/stress_mock.py`
+and its reproduction guide `docs/integration/stability-smoke.md`. It runs
+bounded mock-only streaming/nonstreaming fan-out and drains active streams
+on SIGINT, with generated receipts kept outside Git.

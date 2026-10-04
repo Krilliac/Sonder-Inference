@@ -7,6 +7,7 @@
 - [KV / context cache](KV_CACHE.md)
 - [Backend strategy](BACKENDS.md)
 - [Benchmark and validation plan](BENCHMARK_PLAN.md)
+- [Bounded mock-server stability smoke](integration/stability-smoke.md)
 - [Observatory contract](OBSERVATORY_CONTRACT.md)
 - [Design decisions](DESIGN_DECISIONS.md)
 - [Roadmap](ROADMAP.md)
