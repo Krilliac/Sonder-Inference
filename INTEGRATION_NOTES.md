@@ -231,3 +231,26 @@ Everything lives in the server module (`src/server`); see
   profile's. `capabilities` lists only what Sonder's endpoint accepts;
   `vision`/`tools` are in `upstream_capabilities` because
   `/v1/chat/completions` rejects tool definitions and image content.
+
+## Closeout follow-up: ignored direct-backend flags
+
+The server module now refuses `--gpu-layers`, `--context-length`,
+`--moe-experts` and `--tensor-override` for every backend except `llamacpp`,
+alongside the existing batch/KV/flash-attention flag rule. Previously these
+four options populated only direct llama.cpp settings and were silently
+ignored by mock, Ollama and llamaserver. The refusal is a usage error (exit
+2) before model loading or server startup. `--device` remains a valid
+telemetry/health label for every backend, and llamacpp profiles retain their
+command-line placement options.
+
+Outside the module, `docs/integration/launch-profiles.md` now documents the
+complete backend-only flag list. The public `serve_main` regression checks
+all nine options against mock, Ollama and llamaserver and confirms the
+llamacpp path accepts them.
+
+The qualification pass also found a GCC 14.2 warnings-as-errors build failure
+in the existing llamaserver tune report's conditional JSON-value initializer.
+`src/backends/llamaserver/tune.cpp` now initializes the optional counters as
+null and sets available values explicitly. This preserves JSON field order,
+unsigned counts, zero acceptance and unavailable ratios; the existing tune
+serialization tests exercise those distinctions. No warning is disabled.
