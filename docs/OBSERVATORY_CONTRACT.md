@@ -106,10 +106,14 @@ Envelope additions (compatible with v1, `additionalProperties` allowed):
 `producer.instance_id`, `sampling.level` = the event's own level, and
 `run_id` defaulting to the engine id. Ecosystem contract v1 adds
 `producer.role` (`inference`) and an optional `producer.synthetic` (true
-with the MOCK backend under `serve`, false for a real backend there, absent
-when the host does not know), `request.queued.kind = "chat"`, and `parent_request_id` on the
+with known MOCK backend/model/session work through any API and for a mock
+`serve` host, false when explicitly classified by the host, absent when neither
+the context nor host knows), `request.queued.kind = "chat"`, and `parent_request_id` on the
 request lifecycle events. See TELEMETRY.md for the Observatory change-request
 status.
+
+Known mock context takes precedence over a host-wide false value; unrelated
+events retain that host's policy. See [SDK mock provenance](integration/sdk-mock-provenance.md).
 
 ## Live transport and cross-producer correlation (ecosystem contract v1)
 

@@ -38,7 +38,7 @@ def main() -> int:
         for workers in (1, 2, 4):
             latency = []
             creation = []
-            requests = events_total = 0
+            requests = events_total = synthetic_events = 0
             before = time.monotonic()
             for cycle in range(args.cycles):
                 path = Path(temporary) / f'{workers}-{cycle}.jsonl'
@@ -87,6 +87,7 @@ def main() -> int:
                 assert correlated
                 for event in correlated:
                     assert all(event.get(key) == value for key, value in expected[event['session_id']].items())
+                    assert event['producer'].get('synthetic') is True
                 assert all('text' not in event['attributes'] for event in events
                            if event['event_type'] == 'inference.token.generated')
                 sequences = [event['sequence'] for event in events]
@@ -94,9 +95,11 @@ def main() -> int:
                 assert len({event['event_id'] for event in events}) == len(events)
                 requests += len(queued)
                 events_total += len(events)
+                synthetic_events += len(correlated)
             ordered = sorted(latency)
             scenarios.append({'workers': workers, 'cycles': args.cycles, 'sessions': workers * args.cycles,
-                              'requests': requests, 'events': events_total, 'status': 'passed',
+                              'requests': requests, 'events': events_total,
+                              'synthetic_session_events': synthetic_events, 'status': 'passed',
                               'median_request_ms': statistics.median(latency),
                               'p95_request_ms': ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))],
                               'median_session_create_ms': statistics.median(creation),

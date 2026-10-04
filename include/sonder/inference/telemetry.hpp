@@ -43,6 +43,10 @@ struct TelemetryContext {
     std::optional<std::string> task_id;
     std::optional<std::string> model_instance_id;
     std::optional<std::string> device_id;
+    // Positive evidence that this event describes synthetic work. False
+    // means no event-specific classification, so the host setting applies.
+    // A known mock event cannot be labelled real by a host-wide false value.
+    bool synthetic_work = false;
 };
 
 // Receives fully serialized single-line JSON envelopes (no trailing newline).
@@ -93,8 +97,9 @@ struct TelemetryOptions {
     std::string role = "inference";
     // Envelope producer.synthetic: true when the events describe synthetic
     // work (the MOCK backend), false when the host knows they do not.
-    // Unset (the default) omits the field, meaning "unknown": hosts that do
-    // not decide it (the CLI, the C ABI, bench) never claim real output.
+    // Unset (the default) omits the field, meaning "unknown", except when
+    // the event context positively identifies mock work. Hosts that do not
+    // decide it (the CLI, the C ABI, bench) never claim real output.
     std::optional<bool> synthetic;
     // Minimum spacing between live telemetry.dropped reports while running.
     // The first drop is reported as soon as the writer catches up; a final

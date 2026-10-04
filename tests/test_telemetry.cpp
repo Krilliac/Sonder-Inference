@@ -413,6 +413,110 @@ TEST_CASE("an engine running the mock backend never labels its events synthetic:
     for (const auto& e : events) {
         const json::Value* synthetic = e.find("producer")->find("synthetic");
         CHECK_MESSAGE((synthetic == nullptr || synthetic->as_bool()), e.find("event_type")->as_string());
+        if (e.find("session_id")->as_string() == session->options().session_id ||
+            (e.find("attributes")->find("backend") &&
+             e.find("attributes")->find("backend")->as_string() == kMockBackendName)) {
+            REQUIRE(synthetic);
+            CHECK(synthetic->as_bool());
+        }
+    }
+}
+
+TEST_CASE("known synthetic work overrides a host false without classifying other events") {
+    for (const auto host : {std::optional<bool>{}, std::optional<bool>{false}, std::optional<bool>{true}}) {
+        TelemetryOptions options;
+        options.synthetic = host;
+        TelemetryBus bus(options);
+        auto context = ctx_s();
+        const auto unclassified = bus.make_envelope("x.y", context, json::Object{}, 0);
+        const auto* inherited = unclassified.find("producer")->find("synthetic");
+        if (host) {
+            REQUIRE(inherited);
+            CHECK(inherited->as_bool() == *host);
+        } else {
+            CHECK(inherited == nullptr);
+        }
+        context.synthetic_work = true;
+        const auto known = bus.make_envelope("x.y", context, json::Object{}, 1);
+        REQUIRE(known.find("producer")->find("synthetic"));
+        CHECK(known.find("producer")->find("synthetic")->as_bool());
+    }
+}
+
+namespace {
+// A deterministic test adapter with an unclassified backend identity. The
+// descriptor's mock model name must not decide envelope provenance.
+class UnclassifiedTestBackend final : public Backend {
+public:
+    std::string name() const override { return "unclassified-test"; }
+    std::string description() const override { return "synthetic test adapter with unknown identity"; }
+    BackendCapabilities capabilities() const override { return mock_->capabilities(); }
+    Result<std::string> probe() override { return mock_->probe(); }
+    Result<std::vector<ModelDescriptor>> list_models() override { return mock_->list_models(); }
+    Result<std::shared_ptr<BackendModel>> load_model(const ModelLoadOptions& options) override {
+        return mock_->load_model(options);
+    }
+private:
+    std::shared_ptr<Backend> mock_ = make_mock_backend();
+};
+}  // namespace
+
+TEST_CASE("a mixed engine labels only known mock backend model and session work") {
+    auto sink = std::make_shared<MemoryTelemetrySink>();
+    EngineOptions options;
+    options.telemetry.level = TelemetryLevel::deep;
+    options.telemetry_sinks.push_back(sink);
+    options.device_sample_interval = std::chrono::milliseconds(0);
+    Engine engine(std::move(options));
+    REQUIRE(engine.register_backend(make_mock_backend()).ok());
+    REQUIRE(engine.register_backend(std::make_shared<UnclassifiedTestBackend>()).ok());
+    std::set<std::string> mock_events;
+    std::set<std::string> unknown_events;
+    for (const char* backend : {kMockBackendName, "unclassified-test"}) {
+        ModelLoadOptions load;
+        load.model = "mock:tiny";
+        auto model = engine.load_model(backend, load);
+        REQUIRE(model.ok());
+        SessionOptions config;
+        config.session_id = backend;
+        config.sampling = SamplingConfig::greedy(4);
+        auto session = engine.create_session(model.value(), config);
+        REQUIRE(session.ok());
+        REQUIRE(session.value()->generate("private provenance canary").ok());
+        REQUIRE(session.value()->chat({{"user", "private provenance canary"}}).ok());
+        session.value()->close();
+        REQUIRE(engine.unload_model(model.value()->instance_id()).ok());
+    }
+    engine.telemetry().flush();
+    std::int64_t next = 0;
+    std::set<std::string> event_ids;
+    for (const auto& line : sink->lines()) {
+        CHECK(line.find("private provenance canary") == std::string::npos);
+        auto parsed = json::parse(line);
+        REQUIRE(parsed.ok());
+        const auto& event = parsed.value();
+        CHECK(event.find("sequence")->as_int() == next++);
+        CHECK(event_ids.insert(event.find("event_id")->as_string()).second);
+        const auto type = event.find("event_type")->as_string();
+        const auto sid = event.find("session_id")->as_string();
+        const auto* backend = event.find("attributes")->find("backend");
+        const bool known = sid == kMockBackendName || (backend && backend->as_string() == kMockBackendName);
+        const auto* synthetic = event.find("producer")->find("synthetic");
+        if (known) {
+            REQUIRE(synthetic);
+            CHECK(synthetic->as_bool());
+            mock_events.insert(type);
+        } else {
+            CHECK(synthetic == nullptr);
+            if (sid == "unclassified-test" || (backend && backend->as_string() == "unclassified-test"))
+                unknown_events.insert(type);
+        }
+    }
+    for (const char* type : {"backend.registered", "model.load.started", "model.load.completed", "model.unload",
+                             "session.created", "session.closed", "request.queued", "request.completed",
+                             "inference.token.generated"}) {
+        CHECK_MESSAGE(mock_events.count(type) == 1, type);
+        CHECK_MESSAGE(unknown_events.count(type) == 1, type);
     }
 }
 

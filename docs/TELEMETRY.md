@@ -62,6 +62,15 @@ Levels: `metrics` events are always recorded when telemetry is enabled.
 Types used below: `int` (JSON integer), `num` (JSON number), `str`,
 `bool`, `obj`, `arr`.
 
+## Synthetic provenance
+
+Known mock backend/model/session work carries `producer.synthetic = true`
+through the C++ engine, C ABI and Python SDK. Positive event context overrides
+a host-wide false value. Unclassified contexts inherit the optional host
+setting, keeping unknown absent; backend identity, rather than model names,
+decides known mock work. This preserves engine/device observations and mixed
+backend engines. See [SDK mock provenance](integration/sdk-mock-provenance.md).
+
 ## Sink failure isolation
 
 The [routine stress controls](integration/telemetry-stress-ci.md) exercise
