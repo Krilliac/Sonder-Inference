@@ -222,6 +222,28 @@ constexpr std::chrono::milliseconds kLingerIdle{500};
 // telemetry file, backend clients, stdio, ...), for the RLIMIT_NOFILE check.
 constexpr std::uint64_t kDescriptorHeadroom = 32;
 
+// A launch profile's `context_length` is the configured --ctx-size. When the
+// backend reports that the running process uses a different context (the
+// llamaserver spill guard's auto_fit relaunches with a smaller --ctx-size),
+// the served profile reports the running value as `context_length` and keeps
+// the configured one as `configured_context_length`. `estimated_vram_mib`
+// stays the estimate for the configured context. Unchanged otherwise.
+json::Object profile_with_runtime_context(json::Object profile, const std::optional<BackendRuntimeStatus>& runtime) {
+    if (!runtime || !runtime->context.fitted_ctx) {
+        return profile;
+    }
+    const json::Value* configured = profile.find("context_length");
+    const std::uint64_t fitted = *runtime->context.fitted_ctx;
+    if (configured != nullptr && configured->is_integer() &&
+        static_cast<std::uint64_t>(configured->as_int()) == fitted) {
+        return profile;
+    }
+    const json::Value configured_value = configured != nullptr ? *configured : json::Value();
+    profile.set("context_length", json::Value(fitted));
+    profile.set("configured_context_length", configured_value);
+    return profile;
+}
+
 }  // namespace
 
 // ============================================================ Server::Impl
@@ -401,10 +423,25 @@ struct Server::Impl {
             return Status(ErrorCode::unavailable, "sonder-inference is draining");
         }
         ModelLoadOptions lo;
-        lo.model = id;
+        // A launch profile may load the model under another name (a llamacpp
+        // profile's GGUF path) while it is served under the profile's name.
+        // Every load goes through here: eager, lazy and after an eviction.
+        const ModelProfileBinding* binding = profile_binding(id);
+        lo.model = binding != nullptr && !binding->load_name.empty() ? binding->load_name : id;
         // Keep ModelLoadOptions' default device unless --device was given.
         if (!opts.device.empty()) lo.device_id = opts.device;
         return e->load_model(backend_name, lo);
+    }
+
+    // The launch profile bound to served model `id`, if any (validate_options
+    // guarantees at most one per model).
+    const ModelProfileBinding* profile_binding(const std::string& id) const {
+        for (const auto& b : opts.profile_bindings) {
+            if (b.model == id) {
+                return &b;
+            }
+        }
+        return nullptr;
     }
 
     // Residency evictor: `model.evicted`, then the engine's `model.unload`.
@@ -663,11 +700,31 @@ struct Server::Impl {
             if (runtime && b->name() == m.backend) {
                 ext.set("runtime", to_json(*runtime));
             }
+            // Additive: the launch profile behind this model (whatever its
+            // residency state, like `runtime` above).
+            if (const ModelProfileBinding* binding = profile_binding(m.id)) {
+                const bool own_runtime = b && b->name() == m.backend;
+                ext.set("profile",
+                        profile_with_runtime_context(binding->metadata, own_runtime ? runtime
+                                                                                     : std::optional<BackendRuntimeStatus>{}));
+            }
             data.emplace_back(json::Object{
                 {"id", m.id}, {"object", "model"}, {"owned_by", "sonder-inference"}, {"sonder", std::move(ext)}});
         }
-        send_json(ex, 200, json::Object{{"object", "list"}, {"data", std::move(data)},
-                                      {"sonder", health_features(b ? b->name() : "", opts, sonder_meta())}});
+        json::Object meta = health_features(b ? b->name() : "", opts, sonder_meta());
+        if (!opts.profile_catalog.empty()) {
+            json::Array catalog;
+            for (const auto& entry : opts.profile_catalog) {
+                const json::Value* is_served = entry.find("served");
+                if (entry.is_object() && is_served != nullptr && is_served->is_bool() && is_served->as_bool()) {
+                    catalog.emplace_back(profile_with_runtime_context(entry.as_object(), runtime));
+                } else {
+                    catalog.push_back(entry);
+                }
+            }
+            meta.set("profiles", std::move(catalog));
+        }
+        send_json(ex, 200, json::Object{{"object", "list"}, {"data", std::move(data)}, {"sonder", std::move(meta)}});
     }
 
     void handle_identity(Exchange& ex, const RequestHead& head) {
@@ -851,7 +908,7 @@ struct Server::Impl {
             send_error(ex, *e);
             return;
         }
-        const ChatJob job = std::move(std::get<ChatJob>(job_v));
+        ChatJob job = std::move(std::get<ChatJob>(job_v));
         if (!require_ready(ex)) {
             return;
         }
@@ -870,6 +927,11 @@ struct Server::Impl {
             return;
         }
         const ModelResidency::Pin pin = std::move(pinned).value();
+        // Launch profile defaults fill only the fields the request left unset
+        // (both chat protocols; "default" resolves to the served id first).
+        if (const ModelProfileBinding* binding = profile_binding(*served_id)) {
+            apply_sampling_defaults(binding->sampling_defaults, job.sampling);
+        }
 
         SessionOptions so;
         so.sampling = job.sampling;
@@ -1533,6 +1595,7 @@ struct Server::Impl {
             // No lock held: the load may block on backend I/O while health
             // keeps answering 503 "starting". stop() waits for this step.
             // The pin is released at once: the model stays resident.
+            // load_served_model() applies a launch profile's load name.
             auto loaded = residency->acquire(ids[i]);
             if (!loaded.ok()) {
                 return Status(loaded.status().code(), "cannot load model '" + ids[i] + "' on " + backend_name + ": " +
@@ -1708,6 +1771,17 @@ Status validate_options(const ServerOptions& o) {
         for (std::size_t j = 0; j < i; ++j) {
             if (o.models[j] == o.models[i]) {
                 return Status(ErrorCode::invalid_argument, "--model " + o.models[i] + " is given twice");
+            }
+        }
+    }
+    for (std::size_t i = 0; i < o.profile_bindings.size(); ++i) {
+        const auto& b = o.profile_bindings[i];
+        if (std::find(o.models.begin(), o.models.end(), b.model) == o.models.end()) {
+            return Status(ErrorCode::invalid_argument, "launch profile '" + b.model + "' is not a served --model");
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            if (o.profile_bindings[j].model == b.model) {
+                return Status(ErrorCode::invalid_argument, "launch profile '" + b.model + "' is bound twice");
             }
         }
     }

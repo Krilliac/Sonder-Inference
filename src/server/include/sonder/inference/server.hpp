@@ -23,6 +23,8 @@
 
 #include "sonder/inference/backend_setup.hpp"
 #include "sonder/inference/error.hpp"
+#include "sonder/inference/json.hpp"
+#include "sonder/inference/launch_profile.hpp"
 #include "sonder/inference/telemetry.hpp"
 
 namespace sonder::inference {
@@ -44,6 +46,16 @@ enum class PinMode { override_request, default_value };
 // enables it when an explicit class or queue cap is configured.
 enum class PriorityAdmissionPolicy { automatic, on, off };
 
+// A served model backed by a launch profile (launch_profile.hpp).
+struct ModelProfileBinding {
+    std::string model;      // served id; must also be listed in ServerOptions::models
+    std::string load_name;  // passed to Backend::load_model (empty = `model`)
+    // Applied to requests that leave these fields unset (apply_sampling_defaults).
+    SamplingDefaults sampling_defaults;
+    // Added to the model's /v1/models entry as `sonder.profile`.
+    json::Object metadata;
+};
+
 struct ServerOptions {
     // Listen address. Non-loopback binds require `token`.
     std::string host = "127.0.0.1";
@@ -62,6 +74,12 @@ struct ServerOptions {
     // Embedding hosts and tests: a backend built by the caller, used instead
     // of make_backend(backend). Its name() decides the synthetic label.
     std::shared_ptr<Backend> backend_instance;
+    // Launch profiles (docs/integration/launch-profiles.md). Without bindings
+    // every model loads under its own id with no sampling defaults.
+    std::vector<ModelProfileBinding> profile_bindings;
+    // Every profile of the loaded file, listed additively as `sonder.profiles`
+    // in the /v1/models response; empty leaves that field out.
+    json::Array profile_catalog;
 
     // Bearer token required on every route except CORS preflight. Never
     // logged. Empty = no authentication (loopback binds only).
