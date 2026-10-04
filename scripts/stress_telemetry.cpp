@@ -5,6 +5,7 @@
 #include <chrono>
 #include <iostream>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 
@@ -16,6 +17,25 @@ void require(bool value, const char* message) {
 }
 
 #ifndef SONDER_BASELINE_TELEMETRY
+// Ordinary short writes and sync failures with the default exception mask.
+class StreamFault final : public std::streambuf {
+public:
+    explicit StreamFault(bool flush_failure) : flush_failure_(flush_failure) {}
+    unsigned writes = 0, flushes = 0;
+protected:
+    std::streamsize xsputn(const char*, std::streamsize size) override {
+        ++writes;
+        return flush_failure_ ? size : 0;
+    }
+    int_type overflow(int_type value) override { return traits_type::not_eof(value); }
+    int sync() override {
+        ++flushes;
+        return flush_failure_ ? -1 : 0;
+    }
+private:
+    bool flush_failure_;
+};
+
 class Fault final : public TelemetrySink {
 public:
     explicit Fault(bool flush_failure) : flush_failure_(flush_failure) {}
@@ -40,17 +60,28 @@ json::Object cycle(std::string_view mode, unsigned workers, unsigned attempts,
     options.synthetic = true;
     options.queue_capacity = capacity;
     options.drop_report_interval = std::chrono::hours(1);
+#ifndef SONDER_BASELINE_TELEMETRY
+    StreamFault stream_buffer(mode == "stream-flush");
+    std::ostream stream(&stream_buffer);
+#endif
+    std::ostringstream healthy_stream;
     TelemetryBus bus(options);
 #ifndef SONDER_BASELINE_TELEMETRY
     std::shared_ptr<Fault> fault;
-    if (mode != "healthy") {
+    const bool stream_failure = mode == "stream-write" || mode == "stream-flush";
+    if (stream_failure) {
+        auto sink = std::shared_ptr<TelemetrySink>(make_ostream_sink(stream));
+        bus.add_sink(sink);
+        bus.add_sink(sink);
+    } else if (mode != "healthy" && mode != "healthy-stream") {
         fault = std::make_shared<Fault>(mode == "flush");
         bus.add_sink(fault);
         bus.add_sink(fault);
     }
 #else
-    require(mode == "healthy", "baseline supports healthy-only control");
+    require(mode == "healthy" || mode == "healthy-stream", "baseline supports healthy-only control");
 #endif
+    if (mode == "healthy-stream") bus.add_sink(std::shared_ptr<TelemetrySink>(make_ostream_sink(healthy_stream)));
     auto first = std::make_shared<MemoryTelemetrySink>();
     auto second = std::make_shared<MemoryTelemetrySink>();
     if (healthy_siblings) {
@@ -89,6 +120,13 @@ json::Object cycle(std::string_view mode, unsigned workers, unsigned attempts,
                 "pressure accounting mismatch");
         auto lines = first->lines();
         require(lines == second->lines(), "healthy sibling mismatch");
+        if (mode == "healthy-stream") {
+            std::string expected;
+            for (const auto& line : lines) expected += line + '\n';
+            require(healthy_stream.str() == expected, "healthy stream byte mismatch");
+            require(healthy_stream.good() && healthy_stream.exceptions() == std::ios::goodbit,
+                    "healthy stream state/mask mismatch");
+        }
         std::set<unsigned> delivered;
         std::uint64_t seq = 0, last_drops = 0;
         for (const auto& line : lines) {
@@ -121,7 +159,17 @@ json::Object cycle(std::string_view mode, unsigned workers, unsigned attempts,
         require(!accepted.empty(), "all-failed cycle admitted no events");
     }
 #ifndef SONDER_BASELINE_TELEMETRY
-    require(bus.failed_sinks() == (fault ? 1u : 0u), "distinct failure count mismatch");
+    require(bus.failed_sinks() == ((fault || stream_failure) ? 1u : 0u), "distinct failure count mismatch");
+    if (stream_failure) {
+        require(stream.bad() && stream.exceptions() == std::ios::goodbit, "stream state/mask mismatch");
+        if (mode == "stream-flush") {
+            require(stream_buffer.flushes == 1, "failed stream flush retried");
+            require(stream_buffer.writes > 0 && stream_buffer.writes <= capacity * 2,
+                    "stream flush write count mismatch");
+        } else {
+            require(stream_buffer.writes == 1 && stream_buffer.flushes == 0, "failed stream write retried");
+        }
+    }
     if (fault) {
         if (mode == "flush") {
             require(fault->flushes == 1, "failed flush retried");
@@ -141,19 +189,21 @@ json::Object cycle(std::string_view mode, unsigned workers, unsigned attempts,
 
 int main(int argc, char** argv) {
     try {
-        require(argc == 1 || (argc == 2 && std::string_view(argv[1]) == "pressure"),
-                "usage: telemetry-stress [pressure]");
-        bool pressure = argc == 2 && std::string_view(argv[1]) == "pressure";
+        const std::string_view mode = argc == 2 ? argv[1] : "healthy";
+        require(argc == 1 || (argc == 2 && (mode == "pressure" || mode == "stream-pressure" || mode == "healthy-stream")),
+                "usage: telemetry-stress [pressure|stream-pressure|healthy-stream]");
+        bool pressure = mode == "pressure" || mode == "stream-pressure";
         json::Array receipts;
         for (unsigned i = 0; i < 8; ++i) {
             if (!pressure) {
-                receipts.emplace_back(cycle("healthy", 1, 4096, 4096));
+                receipts.emplace_back(cycle(mode, 1, 4096, 4096));
             } else {
 #ifndef SONDER_BASELINE_TELEMETRY
                 receipts.emplace_back(cycle("healthy", 6, 512, 64));
-                receipts.emplace_back(cycle("write", 6, 512, 64));
-                receipts.emplace_back(cycle("flush", 6, 512, 64));
-                receipts.emplace_back(cycle("write", 6, 512, 64, false));
+                const bool streams = mode == "stream-pressure";
+                receipts.emplace_back(cycle(streams ? "stream-write" : "write", 6, 512, 64));
+                receipts.emplace_back(cycle(streams ? "stream-flush" : "flush", 6, 512, 64));
+                receipts.emplace_back(cycle(streams ? "stream-write" : "write", 6, 512, 64, false));
 #else
                 throw std::runtime_error("baseline pressure mode disabled");
 #endif

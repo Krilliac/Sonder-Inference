@@ -85,16 +85,20 @@ survives; `shutdown()` still drains and terminates the writer. Processing does
 not guarantee delivery to a sink that failed. Stream/file factories retain
 their existing open-error behavior.
 
-This contains thrown exceptions, including an ostream configured with an
-exception mask. A stream that only sets a fail bit without throwing is not
-detected by this boundary. Indefinitely blocking callbacks or destructors
+Built-in file and ostream sinks check stream state after writing the line and
+newline, and after flushing. A failed operation retires the sink even with the
+default exception mask; caller-owned ostream masks are never changed. This
+also contains exceptions from streams with an explicit exception mask.
+Custom sinks must signal failure by throwing; the bus cannot detect a custom
+callback that silently discards output. Indefinitely blocking callbacks or destructors
 remain the sink implementation's responsibility; the bus cannot interrupt
 arbitrary user code. Tests exercise real writer-thread failures, healthy
 sibling cursor parity, alias retirement, queue pressure, backlog drain,
 destructor queries, and continued mock generation with raw-text capture off.
 Mock and synthetic I/O controls provide no provider/model quality measurement.
-The [qualification note](integration/telemetry-sink-isolation.md) records the
-regression, bounded concurrent harness, timing comparison and remaining limits.
+The [exception qualification note](integration/telemetry-sink-isolation.md) and
+[built-in stream follow-up](integration/telemetry-stream-failbits.md) record
+regressions, bounded concurrent controls, timing comparisons and remaining limits.
 
 ## Engine and models
 

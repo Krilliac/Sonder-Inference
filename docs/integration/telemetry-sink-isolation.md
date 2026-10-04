@@ -73,7 +73,9 @@ drained on SIGINT and all three ready files removed.
 
 ## Limits
 
-This isolates exceptions reported by sink callbacks. Silent ostream fail bits,
+This isolates exceptions reported by sink callbacks. Built-in file/ostream
+fail bits are now checked after writes and flushes, without changing the
+caller's exception mask. Silent failures in custom sinks,
 allocation failures outside callbacks, indefinitely blocking or reentrant sink
 callbacks/destructors and recovery/re-enabling of a retired sink remain outside
 this change. Raw text consent, bounded batching, producer cursors, effect
