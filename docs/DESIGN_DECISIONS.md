@@ -282,3 +282,12 @@ host policy. This gives SDK recordings the same existing envelope label used
 by the HTTP server, while supporting mixed engines and keeping C ABI layouts,
 capture and cursor contracts unchanged. See
 [integration/sdk-mock-provenance.md](integration/sdk-mock-provenance.md).
+
+## Structured Python chat iteration — 2026-10-04
+
+Use the existing C ABI chat callbacks and bounded token iterator for
+`Session.chat_stream`. Prepare and own conversation buffers before the worker
+starts, preserving synchronous chat's record limit and unsupported-field checks.
+Both iterator methods share cancellation epochs, the 64-chunk delivery bound,
+completion and close behavior. No ABI/native scheduler or capture contract
+changes. See [integration/python-chat-stream.md](integration/python-chat-stream.md).
