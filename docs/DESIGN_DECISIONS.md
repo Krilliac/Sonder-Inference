@@ -272,3 +272,13 @@ policy, copy ownership at creation, and preserve original-create defaults and
 older-library loading. IDs are telemetry metadata independent of text capture;
 no prompt-derived IDs, scheduling hints or telemetry callback are introduced.
 See [integration/cabi-session-metadata.md](integration/cabi-session-metadata.md).
+
+## Positive mock event provenance — 2026-10-04
+
+Carry known mock work on each telemetry context instead of changing the whole
+engine's classification when it registers a backend. Positive synthetic
+evidence overrides a host-wide false setting; unknown contexts preserve the
+host policy. This gives SDK recordings the same existing envelope label used
+by the HTTP server, while supporting mixed engines and keeping C ABI layouts,
+capture and cursor contracts unchanged. See
+[integration/sdk-mock-provenance.md](integration/sdk-mock-provenance.md).

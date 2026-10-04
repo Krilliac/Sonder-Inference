@@ -195,8 +195,9 @@ json::Object TelemetryBus::make_envelope(std::string_view event_type, const Tele
     if (!options_.role.empty()) {
         producer.set("role", options_.role);
     }
-    if (options_.synthetic) {
-        producer.set("synthetic", *options_.synthetic);
+    const auto synthetic = context.synthetic_work ? std::optional<bool>(true) : options_.synthetic;
+    if (synthetic) {
+        producer.set("synthetic", *synthetic);
     }
     env.set("producer", std::move(producer));
     env.set("sampling", json::Object{{"level", to_string(level)}, {"sampled", true}});

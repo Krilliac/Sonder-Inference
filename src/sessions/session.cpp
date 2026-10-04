@@ -6,6 +6,7 @@
 
 #include "engine/accounting_tokens.hpp"
 #include "engine/request_runtime.hpp"
+#include "sonder/inference/backends.hpp"
 #include "sonder/inference/engine.hpp"
 
 #if defined(SONDER_HAS_SAMPLER_CHAIN)
@@ -153,6 +154,7 @@ TelemetryContext Session::telemetry_context(const std::optional<std::string>& re
     ctx.task_id = options_.task_id;
     ctx.model_instance_id = model_->instance_id();
     ctx.device_id = model_->device_id();
+    ctx.synthetic_work = model_->backend_name() == kMockBackendName;
     return ctx;
 }
 
