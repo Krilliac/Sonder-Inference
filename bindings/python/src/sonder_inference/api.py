@@ -447,6 +447,7 @@ class Session(_Handle):
         super().__init__(engine._lib, ptr)
         self.engine = engine  # keeps the engine alive while the session is
         self.sampling = sampling
+        self._stream_cancel_epoch = 0
 
     def generate(self, prompt: str, on_token: Optional[TokenCallback] = None) -> GenerationResult:
         """Run a request to completion.
@@ -502,7 +503,9 @@ class Session(_Handle):
 
     def stream(self, prompt: str) -> "TokenStream":
         """Iterate over chunks as they are produced (generation runs on a
-        worker thread). Closing the stream early cancels the request."""
+        worker thread). At most 64 chunks wait for the consumer; a full
+        buffer pauses delivery without dropping text. Closing the stream
+        early cancels the request. The final result still retains its text."""
         _cstr("prompt", prompt)  # fail here, not later on the worker thread
         if self.closed:
             raise InvalidStateError("Session is closed")
@@ -511,6 +514,10 @@ class Session(_Handle):
     def cancel(self) -> None:
         """Cancel the in-flight request (thread-safe; no-op when idle)."""
         with self._use() as h:
+            # Wake a stream callback waiting for consumer capacity. Native
+            # cancellation alone cannot interrupt Python while inside it.
+            with self._cond:
+                self._stream_cancel_epoch += 1
             _check(self._lib, self._lib.cdll.sonder_session_cancel(h))
 
     def _interrupt(self, handle: ctypes.c_void_p) -> None:
@@ -566,12 +573,17 @@ class TokenStream:
     """Iterator over generated chunks; see :meth:`Session.stream`."""
 
     _DONE = object()
+    _MAX_BUFFERED_CHUNKS = 64
+    _POLL_INTERVAL_S = 0.025
 
     def __init__(self, session: Session, prompt: str) -> None:
         self._session = session
         self._prompt = prompt
-        self._queue: "queue.Queue[Any]" = queue.Queue()
+        self._queue: "queue.Queue[Any]" = queue.Queue(maxsize=self._MAX_BUFFERED_CHUNKS)
         self._closed = threading.Event()
+        self._done = threading.Event()
+        with session._cond:
+            self._cancel_epoch = session._stream_cancel_epoch
         self._exc: Optional[BaseException] = None
         self._finished = False
         self.result: Optional[GenerationResult] = None
@@ -584,13 +596,34 @@ class TokenStream:
         except BaseException as e:  # noqa: BLE001 - surfaced to the consumer
             self._exc = e
         finally:
-            self._queue.put(self._DONE)
+            # Completion must never wait for a consumer: close() joins this
+            # worker even when the buffer is full. The event covers that case.
+            try:
+                self._queue.put_nowait(self._DONE)
+            except queue.Full:
+                pass
+            self._done.set()
 
     def _push(self, text: str) -> Optional[bool]:
-        if self._closed.is_set():
-            return False
-        self._queue.put(text)
-        return None
+        while not self._closed.is_set():
+            with self._session._cond:
+                cancelled = (self._session._closing or
+                             self._session._stream_cancel_epoch != self._cancel_epoch)
+            if cancelled:
+                break
+            try:
+                self._queue.put(text, timeout=self._POLL_INTERVAL_S)
+                return None
+            except queue.Full:
+                continue
+        # Cancellation may have arrived before the native request started.
+        # Reassert it while this callback is inside that request so its
+        # terminal outcome is cancelled, rather than callback-stop completed.
+        try:
+            self._session.cancel()
+        except SonderError:
+            pass  # session close has already cancelled the native handle
+        return False
 
     def __iter__(self) -> Iterator[str]:
         return self
@@ -598,7 +631,17 @@ class TokenStream:
     def __next__(self) -> str:
         if self._finished:
             raise StopIteration
-        item = self._queue.get()
+        while True:
+            if self._closed.is_set():
+                raise StopIteration
+            if self._done.is_set() and self._queue.empty():
+                item = self._DONE
+                break
+            try:
+                item = self._queue.get(timeout=self._POLL_INTERVAL_S)
+                break
+            except queue.Empty:
+                continue
         if item is self._DONE:
             self._finished = True
             self._thread.join()

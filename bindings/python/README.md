@@ -125,3 +125,21 @@ cd bindings/python && SONDER_INFERENCE_LIB_DIR=../../build-shared python -m pyte
 
 The tests use the deterministic mock backend. No network access or model
 weights are needed.
+
+### Token iterator backpressure
+
+`Session.stream()` buffers at most 64 pending chunk objects. A paused consumer
+backpressures the worker callback; normal iteration resumes delivery in order
+without dropping text. `TokenStream.close()`, `Session.cancel()`, session close
+and engine close release a full-buffer wait. The completion/error signal never
+needs buffer capacity, so shutdown does not require draining the iterator.
+Cancellation before the worker enters the native request is observed by its
+first callback. Normal completion and worker errors drain queued chunks first.
+
+The bound counts chunks, not bytes: individual chunks may vary in size, and
+`TokenStream.result.text` still retains the completed response. A slow consumer
+can keep its session/admission resources occupied while delivery is paused;
+close an abandoned stream (prefer its context manager). This is application
+output backpressure; the engine telemetry queue remains nonblocking.
+
+See [qualification and limits](../../docs/integration/python-stream-backpressure.md).

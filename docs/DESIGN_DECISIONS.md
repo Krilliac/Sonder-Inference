@@ -252,3 +252,13 @@ approved (ADR-010, LICENSE_REVIEW.md; cpp-httplib stays test-only).
 
 This resolves the transport item that [SCAFFOLD.md](SCAFFOLD.md) listed as
 undecided.
+
+
+## Python token iterator delivery bound — 2026-10-04
+
+Bound pending iterator output to 64 chunks with lossless consumer backpressure.
+A private cancellation epoch and nonblocking completion signal release stalled
+callback delivery during cancel/close, including requests that have not entered
+the native call yet. This changes no public API or C ABI; response text remains
+retained and the bound does not imply a total byte-memory cap. See
+[integration/python-stream-backpressure.md](integration/python-stream-backpressure.md).
