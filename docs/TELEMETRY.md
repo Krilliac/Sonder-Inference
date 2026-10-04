@@ -64,6 +64,11 @@ Types used below: `int` (JSON integer), `num` (JSON number), `str`,
 
 ## Sink failure isolation
 
+The [routine stress controls](integration/telemetry-stress-ci.md) exercise
+healthy delivery, callback failures and default-mask stream failures in the
+normal platform and sanitizer CTest suites. They use synthetic transport data
+and make no provider or model calls.
+
 The writer catches exceptions from each sink's `write_event()` and `flush()`.
 It retires the failed sink and all duplicate registrations of that object,
 without retrying it or logging its exception message, event contents, or

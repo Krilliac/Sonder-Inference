@@ -28,6 +28,24 @@ set_target_properties(sonder_c_abi_smoke PROPERTIES LINKER_LANGUAGE CXX)
 add_test(NAME sonder.c_abi_smoke COMMAND sonder_c_abi_smoke)
 set_tests_properties(sonder.c_abi_smoke PROPERTIES TIMEOUT 60)
 
+# Exercise the actual library's bounded transport controls in every full suite,
+# including platform and sanitizer lanes. Keep pressure runs isolated from other
+# CTest work so parallel suite load does not dominate their shutdown budget.
+add_executable(sonder_telemetry_stress "${PROJECT_SOURCE_DIR}/scripts/stress_telemetry.cpp")
+target_link_libraries(sonder_telemetry_stress PRIVATE sonder::inference)
+sonder_set_warnings(sonder_telemetry_stress)
+add_test(NAME sonder.telemetry.stress.healthy_stream
+    COMMAND sonder_telemetry_stress healthy-stream)
+add_test(NAME sonder.telemetry.stress.callback_pressure
+    COMMAND sonder_telemetry_stress pressure)
+add_test(NAME sonder.telemetry.stress.stream_pressure
+    COMMAND sonder_telemetry_stress stream-pressure)
+set_tests_properties(
+    sonder.telemetry.stress.healthy_stream
+    sonder.telemetry.stress.callback_pressure
+    sonder.telemetry.stress.stream_pressure
+    PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE LABELS "stress;synthetic;telemetry")
+
 # A ';' in a doctest TEST_CASE name makes CTest split it into two entries that
 # match nothing, so the test silently never runs (see cmake/CheckTestNames.cmake).
 add_test(NAME sonder.meta.test_names_have_no_semicolons
