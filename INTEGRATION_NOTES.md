@@ -259,3 +259,24 @@ The integrator also adds the stdlib-only POSIX runner `scripts/stress_mock.py`
 and its reproduction guide `docs/integration/stability-smoke.md`. It runs
 bounded mock-only streaming/nonstreaming fan-out and drains active streams
 on SIGINT, with generated receipts kept outside Git.
+
+## CI follow-up: real mock lifecycle stress
+
+The existing Linux `build-test` context now runs `scripts/stress_mock.py`
+against its newly built CLI for three cycles, replacing the redundant idle
+health/SIGINT subsection of the CLI smoke. CTest and all CLI/telemetry
+assertions remain. The bounded step verifies 204 synthetic requests,
+stream usage/termination, twelve active-stream drains, process exit and
+ready-marker removal; it publishes JSON receipts and console logs without
+masking the harness exit status. No required context is added or renamed.
+The same step runs two stdlib CLI-boundary failure controls, including a
+real completed cycle followed by a failed restart.
+
+Outside CI, the existing script now preserves completed-cycle evidence in
+a failure receipt, requires ready health HTTP 200, and checks health reports
+four admitted model requests with all four futures active after first-token
+admission, sampled sequentially immediately before sending SIGINT. Those streams use
+16 tokens (the mock fixture's maximum); CI explicitly uses a 40 ms mock
+delay to give the signal a longer bounded tail inside the existing two-second
+grace. This remains mock transport/lifecycle qualification,
+not a native model quality or throughput measurement.
