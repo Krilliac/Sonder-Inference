@@ -35,6 +35,7 @@ private:
 
 json::Object cycle(std::string_view mode, unsigned workers, unsigned attempts,
                    unsigned capacity, bool healthy_siblings = true) {
+    const std::uint64_t total_attempts = std::uint64_t{workers} * attempts;
     TelemetryOptions options;
     options.synthetic = true;
     options.queue_capacity = capacity;
@@ -84,7 +85,7 @@ json::Object cycle(std::string_view mode, unsigned workers, unsigned attempts,
     }
     require(accepted.size() == bus.emitted_events(), "accepted counter mismatch");
     if (healthy_siblings) {
-        require(accepted.size() + bus.dropped_events() == workers * attempts,
+        require(accepted.size() + bus.dropped_events() == total_attempts,
                 "pressure accounting mismatch");
         auto lines = first->lines();
         require(lines == second->lines(), "healthy sibling mismatch");
@@ -114,7 +115,7 @@ json::Object cycle(std::string_view mode, unsigned workers, unsigned attempts,
         }
         require(delivered == accepted, "accepted delivery mismatch");
         require(last_drops == bus.dropped_events(), "final drops not reported");
-        if (capacity >= workers * attempts) require(bus.dropped_events() == 0, "unpressured control dropped");
+        if (capacity >= total_attempts) require(bus.dropped_events() == 0, "unpressured control dropped");
     } else {
         require(!bus.enabled(TelemetryLevel::metrics), "all failed sinks remain enabled");
         require(!accepted.empty(), "all-failed cycle admitted no events");
@@ -130,10 +131,10 @@ json::Object cycle(std::string_view mode, unsigned workers, unsigned attempts,
         }
     }
 #endif
-    return json::Object{{"mode", std::string(mode)}, {"workers", workers}, {"attempts", workers * attempts},
+    return json::Object{{"mode", std::string(mode)}, {"workers", workers}, {"attempts", total_attempts},
                         {"capacity", capacity}, {"healthy_siblings", healthy_siblings},
                         {"accepted", bus.emitted_events()}, {"queue_drops", bus.dropped_events()},
-                        {"filtered", workers * attempts - bus.emitted_events() - bus.dropped_events()},
+                        {"filtered", total_attempts - bus.emitted_events() - bus.dropped_events()},
                         {"elapsed_ms", std::chrono::duration<double, std::milli>(end - start).count()},
                         {"drain_ms", std::chrono::duration<double, std::milli>(end - drain_start).count()}};
 }
