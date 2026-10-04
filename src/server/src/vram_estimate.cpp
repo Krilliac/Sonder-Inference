@@ -72,6 +72,15 @@ std::uint64_t saturating_u64(double v) {
     return static_cast<std::uint64_t>(r);
 }
 
+// a x b and a + b, saturated at 2^64 - 1 (the window comes from the file).
+std::uint64_t saturating_mul(std::uint64_t a, std::uint64_t b) {
+    return b != 0 && a > std::numeric_limits<std::uint64_t>::max() / b ? std::numeric_limits<std::uint64_t>::max()
+                                                                         : a * b;
+}
+std::uint64_t saturating_add(std::uint64_t a, std::uint64_t b) {
+    return a > std::numeric_limits<std::uint64_t>::max() - b ? std::numeric_limits<std::uint64_t>::max() : a + b;
+}
+
 // Speculative decoding that rolls back recurrent state keeps one state
 // snapshot per draft position: llama.cpp allocates max(1, n_seq_max) x
 // (1 + n_rs_seq) recurrent rows per layer, with n_rs_seq = --spec-draft-n-max
@@ -206,6 +215,123 @@ bool read_scalar(Cursor& c, std::uint32_t type, std::string& text, std::int64_t&
     return true;
 }
 
+// An integer metadata value the estimate may need: a scalar (value >= 0), or
+// the items of an integer or BOOL array (per_layer; BOOL items are 0 or 1).
+struct Numbers {
+    std::int64_t value = -1;
+    std::vector<std::int64_t> per_layer;
+};
+
+// ------------------------------------------------- sliding-window attention
+//
+// llama.cpp keeps the KV of sliding-window (SWA) layers in a second cache of
+//   size_swa = GGML_PAD(min(n_ctx_seq, n_swa * (unified ? n_seq_max : 1) + n_ubatch), 256)
+// cells per stream, where full-attention layers keep n_ctx_seq
+// (llama_kv_cache_iswa, src/llama-kv-cache-iswa.cpp:73; llama.cpp 7fe450e,
+// b11195 and the bundled llama-server's 161755f29 agree). Which layers slide,
+// and the window, are set by each architecture's loader
+// (src/models/<arch>.cpp, load_arch_hparams), so the estimate models SWA only
+// for the architectures below. Each was checked in 7fe450e, and each gets
+// llama_kv_cache_iswa (lfm2: llama_memory_hybrid_iswa) from
+// llama_model::create_memory. Any other architecture counts every layer at
+// full context.
+enum class SwaWhen : std::uint8_t {
+    always,           // the loader sets an SWA type unconditionally
+    window_positive,  // only when <arch>.attention.sliding_window is present and > 0
+    window_not_zero,  // unless sliding_window is present and 0 (llama4)
+    blocks_64,        // only the 64-layer model (exaone4)
+    never,            // the loader turns SWA off whatever the file says (phi3)
+};
+
+struct SwaArchitecture {
+    std::string_view name;  // general.architecture
+    SwaWhen when;
+    // set_swa_pattern's period when the file has no per-layer
+    // sliding_window_pattern array (llama_model_base::load_swa_pattern; a
+    // scalar sliding_window_pattern in the file replaces it). 0 = the loader
+    // requires the array.
+    std::uint32_t period;
+    bool dense_first;          // the full layer opens each period instead of closing it
+    std::uint64_t window;      // the window without the key; 0 = the loader requires the key
+    bool window_fixed;         // the loader replaces the file's window with `window`
+    bool attention_layers;     // every layer with KV heads slides; no pattern (lfm2)
+};
+
+constexpr SwaArchitecture kSwaArchitectures[] = {
+    // name          when                      period dense_first window fixed attention_layers
+    {"afmoe",        SwaWhen::window_positive, 4, false, 0, false, false},
+    {"cohere2",      SwaWhen::always,          4, false, 0, false, false},
+    {"cohere2moe",   SwaWhen::always,          4, true, 0, false, false},
+    {"exaone-moe",   SwaWhen::always,          4, false, 0, false, false},
+    {"exaone4",      SwaWhen::blocks_64,       4, false, 4096, false, false},
+    {"gemma2",       SwaWhen::always,          2, false, 4096, false, false},
+    {"gemma3",       SwaWhen::window_positive, 6, false, 0, false, false},
+    {"gemma3n",      SwaWhen::always,          5, false, 0, false, false},
+    {"gemma4",       SwaWhen::always,          0, false, 0, false, false},
+    {"gpt-oss",      SwaWhen::always,          2, false, 0, false, false},
+    {"granite_swa",  SwaWhen::always,          0, false, 0, false, false},
+    {"laguna",       SwaWhen::window_positive, 4, true, 0, false, false},
+    {"lfm2",         SwaWhen::window_positive, 0, false, 0, false, true},
+    {"llama4",       SwaWhen::window_not_zero, 4, false, 8192, true, false},  // chunked attention
+    {"maple",        SwaWhen::always,          0, false, 0, false, false},
+    {"mellum",       SwaWhen::window_positive, 4, false, 0, false, false},
+    {"mimo2",        SwaWhen::always,          0, false, 0, false, false},
+    {"muse-glimmer", SwaWhen::always,          4, false, 0, false, false},
+    {"olmo2",        SwaWhen::window_positive, 4, false, 0, false, false},
+    {"phi3",         SwaWhen::never,           0, false, 0, false, false},
+    {"plamo3",       SwaWhen::window_positive, 8, false, 0, false, false},
+    {"smallthinker", SwaWhen::window_positive, 4, true, 4096, true, false},
+    {"spark2_5",     SwaWhen::always,          0, false, 0, false, false},
+    {"step35",       SwaWhen::always,          0, false, 0, false, false},
+};
+
+// Sets info.swa_layers and info.sliding_window as llama.cpp's loader does for
+// info.architecture. `window` and `pattern` are <arch>.attention.sliding_window
+// and sliding_window_pattern (null when absent). Needs the final kv_heads and
+// nextn_layers.
+void resolve_sliding_window(GgufModelInfo& info, const Numbers* window, const Numbers* pattern) {
+    const bool has_window = window && window->value >= 0;
+    const std::uint64_t file_window = has_window ? static_cast<std::uint64_t>(window->value) : 0;
+    const SwaArchitecture* arch = nullptr;
+    for (const auto& candidate : kSwaArchitectures) {
+        if (candidate.name == info.architecture) arch = &candidate;
+    }
+    if (!arch) {
+        info.sliding_window_unmodelled = file_window > 0;
+        return;
+    }
+    const std::uint32_t n_layer = info.block_count - info.nextn_layers;  // llama_hparams::n_layer()
+    bool enabled = false;
+    switch (arch->when) {
+        case SwaWhen::always: enabled = true; break;
+        case SwaWhen::window_positive: enabled = file_window > 0; break;
+        case SwaWhen::window_not_zero: enabled = !has_window || file_window > 0; break;
+        case SwaWhen::blocks_64: enabled = n_layer == 64; break;
+        case SwaWhen::never: break;
+    }
+    // A required key that is missing makes llama.cpp refuse the model, so
+    // nothing is capped then either.
+    if (!enabled || (!arch->window_fixed && !has_window && arch->window == 0)) return;
+    std::vector<bool> swa(info.block_count, false);
+    if (arch->attention_layers) {
+        for (std::uint32_t i = 0; i < n_layer; ++i) swa[i] = info.kv_heads[i] > 0;
+    } else if (pattern && !pattern->per_layer.empty()) {
+        // The per-layer array wins (get_arr); blocks past its end stay full.
+        for (std::size_t i = 0; i < swa.size() && i < pattern->per_layer.size(); ++i) swa[i] = pattern->per_layer[i] != 0;
+    } else if (arch->period > 0) {
+        // set_swa_pattern(n, dense_first); MTP blocks (past n_layer) stay full.
+        const std::int64_t n = pattern && pattern->value >= 0 ? pattern->value : arch->period;
+        for (std::uint32_t i = 0; i < n_layer; ++i) {
+            swa[i] = n == 0 || (arch->dense_first ? i % n != 0 : i % n < n - 1);
+        }
+    } else {
+        return;  // the loader requires the per-layer array
+    }
+    if (std::none_of(swa.begin(), swa.end(), [](bool b) { return b; })) return;
+    info.swa_layers = std::move(swa);
+    info.sliding_window = (arch->window_fixed || !has_window) ? arch->window : file_window;
+}
+
 Result<GgufModelInfo> parse(std::istream& in) {
     Cursor c(in);
     char magic[4];
@@ -218,10 +344,6 @@ Result<GgufModelInfo> parse(std::istream& in) {
         return malformed("implausible tensor or key count");
     }
     GgufModelInfo info;
-    struct Numbers {
-        std::int64_t value = -1;
-        std::vector<std::int64_t> per_layer;
-    };
     std::vector<std::pair<std::string, Numbers>> numbers;  // keys we may need
     std::uint64_t token_count = 0;
     for (std::uint64_t i = 0; i < n_kv; ++i) {
@@ -253,7 +375,11 @@ Result<GgufModelInfo> parse(std::istream& in) {
             }
             const std::uint64_t size = scalar_size(item_type);
             if (size == 0) return malformed("unsupported array item type in '" + excerpt(key) + "'");
-            if (item_type != 6 && item_type != 12 && item_type != 7 && n <= 4096) {
+            // Integer and BOOL arrays are kept per item: per-block head
+            // counts, a sliding_window_pattern (BOOL, or INT32/UINT32). A
+            // BOOL array stays out of `metadata`, which the classification
+            // reads and which never held one.
+            if (item_type != 6 && item_type != 12 && n <= 4096) {
                 Numbers num;
                 std::int64_t max_value = 0;
                 for (std::uint64_t k = 0; k < n; ++k) {
@@ -264,7 +390,7 @@ Result<GgufModelInfo> parse(std::istream& in) {
                     num.per_layer.push_back(v);
                     max_value = std::max(max_value, v);
                 }
-                info.metadata.emplace_back(key, std::to_string(max_value));
+                if (item_type != 7) info.metadata.emplace_back(key, std::to_string(max_value));
                 numbers.emplace_back(key, std::move(num));
                 continue;
             }
@@ -299,6 +425,11 @@ Result<GgufModelInfo> parse(std::istream& in) {
     const std::uint64_t head_dim = heads > 0 && info.embedding_length > 0 ? info.embedding_length / static_cast<std::uint64_t>(heads) : 0;
     info.key_length = static_cast<std::uint64_t>(scalar(a + "attention.key_length", static_cast<std::int64_t>(head_dim)));
     info.value_length = static_cast<std::uint64_t>(scalar(a + "attention.value_length", static_cast<std::int64_t>(head_dim)));
+    // SWA blocks' head sizes default to the full-attention ones (llama_model::load_hparams).
+    info.key_length_swa =
+        static_cast<std::uint64_t>(scalar(a + "attention.key_length_swa", static_cast<std::int64_t>(info.key_length)));
+    info.value_length_swa =
+        static_cast<std::uint64_t>(scalar(a + "attention.value_length_swa", static_cast<std::int64_t>(info.value_length)));
     info.kv_heads.assign(info.block_count, 0);
     if (const Numbers* kv = number(a + "attention.head_count_kv"); kv && !kv->per_layer.empty()) {
         for (std::size_t i = 0; i < info.kv_heads.size() && i < kv->per_layer.size(); ++i) {
@@ -396,6 +527,7 @@ Result<GgufModelInfo> parse(std::istream& in) {
             if (!attention) info.kv_heads[i] = 0;
         }
     }
+    resolve_sliding_window(info, number(a + "attention.sliding_window"), number(a + "attention.sliding_window_pattern"));
     return info;
 }
 
@@ -473,26 +605,84 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
 
     const double bk = kv_cache_type_bytes(p.cache_type_k.value_or("f16"));
     const double bv = kv_cache_type_bytes(p.cache_type_v.value_or("f16"));
+    // Micro-batch: --ubatch-size, at most --batch-size (llama_context). The
+    // defaults are llama-server's 2048/512 and the direct backend's 512/512.
+    const std::uint64_t batch = p.batch_size.value_or(p.backend == kLaunchProfileBackendLlamaCpp ? 512u : 2048u);
+    const std::uint64_t ubatch = std::min<std::uint64_t>(p.ubatch_size.value_or(512), batch);
     // Recurrent rows per layer: one state per sequence, times (1 + n_rs_seq)
     // snapshots when the speculative types roll recurrent state back.
     e.recurrent_snapshots = 1 + recurrent_rollback_snapshots(m, p);
     const std::uint64_t recurrent_rows = static_cast<std::uint64_t>(slots) * e.recurrent_snapshots;
-    double kv_per_token = 0.0;
+    const auto sliding = [&m](std::uint32_t i) { return i < m.swa_layers.size() && m.swa_layers[i]; };
+    // With flash attention off llama.cpp stores V transposed and gives every
+    // layer the widest layer's V row (n_embd_v_gqa_max over all blocks;
+    // llama_kv_cache, [TAG_V_CACHE_VARIABLE]). `auto` and `on` allocate the
+    // cache before flash attention is resolved, with each layer's own row.
+    const bool v_padded = p.flash_attn && (*p.flash_attn == "off" || *p.flash_attn == "disabled");
+    double v_row_max = 0.0;
+    if (v_padded) {
+        for (std::uint32_t i = 0; i < n_layer; ++i) {
+            const double v = static_cast<double>(sliding(i) ? m.value_length_swa : m.value_length);
+            v_row_max = std::max(v_row_max, static_cast<double>(m.kv_heads[i]) * v);
+        }
+    }
+    double kv_per_token = 0.0;      // full-attention layers on the GPU
+    double swa_kv_per_token = 0.0;  // sliding-window layers on the GPU
     for (std::uint32_t i = first_gpu; i < n_layer; ++i) {
         if (i >= first_nextn && !mtp) continue;  // MTP blocks load only for draft-mtp
         e.weights_bytes += m.block_bytes[i];
         ++e.gpu_layers;
         if (m.kv_heads[i] > 0) {
             ++e.attention_layers;
-            kv_per_token += static_cast<double>(m.kv_heads[i]) *
-                            (static_cast<double>(m.key_length) * bk + static_cast<double>(m.value_length) * bv);
+            const bool swa = sliding(i);
+            const double heads = static_cast<double>(m.kv_heads[i]);
+            const double k = static_cast<double>(swa ? m.key_length_swa : m.key_length);
+            const double v = static_cast<double>(swa ? m.value_length_swa : m.value_length);
+            const double bytes = v_padded ? heads * k * bk + v_row_max * bv : heads * (k * bk + v * bv);
+            if (swa) {
+                ++e.swa_attention_layers;
+                swa_kv_per_token += bytes;
+            } else {
+                kv_per_token += bytes;
+            }
         } else if (m.kind != ModelArchitecture::attention_only) {
             e.recurrent_bytes += m.recurrent_state_values * 4 * recurrent_rows;
         }
     }
     if (all) e.weights_bytes += m.output_bytes;
     e.kv_bytes_per_token = saturating_u64(kv_per_token);
-    e.kv_bytes = saturating_u64(kv_per_token * static_cast<double>(ctx_per_sequence) * e.sequences);
+    e.swa_kv_bytes_per_token = saturating_u64(swa_kv_per_token);
+    double kv = kv_per_token * static_cast<double>(ctx_per_sequence) * e.sequences;
+    if (e.swa_attention_layers > 0) {
+        // Full size with --swa-full (judged under the name llama-server
+        // reads), a caller-supplied inherited setting, and on the direct backend, which keeps the llama.cpp
+        // library's default swa_full = true (llama_context_default_params,
+        // b11195). llama-server's own default is false.
+        bool swa_full_flag = false;
+        for (const auto& arg : p.extra_args) swa_full_flag = swa_full_flag || llamaserver_flag_name(arg) == "--swa-full";
+        const bool direct = p.backend == kLaunchProfileBackendLlamaCpp;
+        if (direct || swa_full_flag || inputs.inherited_swa_full) {
+            e.swa_context_per_sequence = ctx_per_sequence;
+            e.notes.emplace_back(direct ? "the llamacpp backend allocates full-size sliding-window caches (llama.cpp's "
+                                          "default swa_full); sliding-window layers are counted at full context"
+                                        : swa_full_flag ? "--swa-full: sliding-window layers are counted at full context"
+                                                        : "LLAMA_ARG_SWA_FULL is set: sliding-window layers are counted at full context");
+        } else {
+            // size_swa: window x n_seq_max for one unified stream, the window
+            // for each stream of a split cache, plus the micro-batch. Below
+            // ctx_per_sequence, a multiple of 256, so the padding cannot wrap.
+            const std::uint64_t window = saturating_add(saturating_mul(m.sliding_window, unified ? slots : 1u), ubatch);
+            const std::uint64_t cells = std::min(ctx_per_sequence, window);
+            e.swa_context_per_sequence = (cells + 255) / 256 * 256;
+        }
+        kv += swa_kv_per_token * static_cast<double>(e.swa_context_per_sequence) * e.sequences;
+    }
+    e.kv_bytes = saturating_u64(kv);
+    if (m.sliding_window_unmodelled && e.attention_layers > 0) {
+        e.notes.emplace_back(m.architecture +
+                             ".attention.sliding_window is set, but sliding-window caches are modelled only for "
+                             "architectures checked against llama.cpp; every layer is counted at full context");
+    }
 
     if (!p.mmproj.empty() && p.mmproj_offload.value_or(true)) {
         e.weights_bytes += inputs.mmproj_bytes;
@@ -506,8 +696,6 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
         e.notes.emplace_back("the MTP draft context's compute buffer, which grows with the context, is not included");
     }
     if (offloaded > 0) {
-        const std::uint64_t batch = p.batch_size.value_or(p.backend == kLaunchProfileBackendLlamaCpp ? 512u : 2048u);
-        const std::uint64_t ubatch = std::min<std::uint64_t>(p.ubatch_size.value_or(512), batch);
         e.compute_bytes = m.vocab_size * ubatch * 4 + 4 * m.embedding_length * ubatch * 4 + 256 * kMiB;
     }
     for (const auto& arg : p.extra_args) {

@@ -11,9 +11,11 @@
 //     of bounded size: file text quoted in errors is cut short, because the
 //     message reaches /v1/models (`estimate_error`).
 //   * an accepted header has a printable architecture of at most 256 bytes,
-//     1..100000 blocks, per-block vectors of that length, and at most that
-//     many MTP blocks; the estimate's total is the sum of its parts and it
-//     never counts more GPU layers than blocks.
+//     1..100000 blocks, per-block vectors of that length (the sliding-window
+//     one may be empty), and at most that many MTP blocks; the estimate's
+//     total is the sum of its parts, it never counts more GPU layers than
+//     blocks or more sliding-window layers than attention layers, and the
+//     sliding-window cache never has more cells than the full one.
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -37,13 +39,14 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     SONDER_FUZZ_CHECK(m.block_count >= 1 && m.block_count <= 100000);
     SONDER_FUZZ_CHECK(m.kv_heads.size() == m.block_count);
     SONDER_FUZZ_CHECK(m.block_bytes.size() == m.block_count);
+    SONDER_FUZZ_CHECK(m.swa_layers.empty() || m.swa_layers.size() == m.block_count);
     SONDER_FUZZ_CHECK(m.nextn_layers <= m.block_count);
 
     si::LaunchProfile p;
     p.name = "fuzz";
     p.backend = si::kLaunchProfileBackendLlamaServer;
     p.model = "fuzz.gguf";
-    for (int variant = 0; variant < 4; ++variant) {
+    for (int variant = 0; variant < 5; ++variant) {
         if (variant == 1) {  // explicit slots, quantized KV, a fixed context
             p.parallel = 3;
             p.ctx_size = 4096;
@@ -57,12 +60,18 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
             p.name = "fuzz";
             p.backend = si::kLaunchProfileBackendLlamaCpp;
             p.model = "fuzz.gguf";
+        } else if (variant == 4) {  // padded V rows (flash attention off), full-size SWA cache
+            p.backend = si::kLaunchProfileBackendLlamaServer;
+            p.flash_attn = "off";
+            p.extra_args = {"--swa-full"};
         }
         const si::VramEstimate e = si::estimate_vram(m, p);
         // Unsigned sums wrap identically, so this holds for any input.
         SONDER_FUZZ_CHECK(e.total_bytes == e.weights_bytes + e.kv_bytes + e.recurrent_bytes + e.compute_bytes);
         SONDER_FUZZ_CHECK(e.gpu_layers <= m.block_count);
         SONDER_FUZZ_CHECK(e.attention_layers <= e.gpu_layers);
+        SONDER_FUZZ_CHECK(e.swa_attention_layers <= e.attention_layers);
+        SONDER_FUZZ_CHECK(e.swa_context_per_sequence <= e.context_per_sequence);
         SONDER_FUZZ_CHECK(e.total_mib() <= (e.total_bytes >> 20) + 1);
     }
     return 0;
