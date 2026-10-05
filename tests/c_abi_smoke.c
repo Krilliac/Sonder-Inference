@@ -44,6 +44,19 @@ int main(void) {
         if (sonder_session_chat(session, messages, 1, count_tokens, &tokens, &stats) != SONDER_OK) return 8;
         if (tokens != 4 || stats.chunks != 4 || stats.outcome != SONDER_OUTCOME_COMPLETED) return 9;
     }
+    {
+        const sonder_request_metadata metadata = {sizeof(sonder_request_metadata), "c-parent:1"};
+        const sonder_chat_message message = {sizeof(sonder_chat_message), "user", "c parent chat"};
+        const sonder_chat_message* messages[] = {&message};
+        tokens = 0;
+        if (sonder_session_generate_with_metadata(session, "c parent generate", &metadata,
+                                                 count_tokens, &tokens, &stats) != SONDER_OK) return 13;
+        if (tokens != 4 || stats.outcome != SONDER_OUTCOME_COMPLETED) return 14;
+        tokens = 0;
+        if (sonder_session_chat_with_metadata(session, messages, 1, &metadata,
+                                             count_tokens, &tokens, &stats) != SONDER_OK) return 15;
+        if (tokens != 4 || stats.outcome != SONDER_OUTCOME_COMPLETED) return 16;
+    }
     sonder_session_destroy(session);
     {
         const sonder_session_metadata metadata = {sizeof(sonder_session_metadata),

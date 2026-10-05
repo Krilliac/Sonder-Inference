@@ -10,6 +10,7 @@ sonder_add_module_tests(core
     test_telemetry.cpp
     test_c_api.cpp
     test_c_api_chat.cpp
+    test_c_api_request_metadata.cpp
     test_kv_capacity_adapter.cpp
     test_engine_runtime.cpp
     test_scheduler_modes.cpp

@@ -135,6 +135,23 @@ bool valid_correlation_id(const char* value) {
     return false;
 }
 
+const char* request_options_from_c(const sonder_request_metadata* metadata, RequestOptions& options) {
+    if (!metadata) {
+        return nullptr;
+    }
+    constexpr std::size_t min_size = offsetof(sonder_request_metadata, parent_request_id) + sizeof(const char*);
+    if (metadata->struct_size < min_size) {
+        return "sonder_request_metadata.struct_size too small";
+    }
+    if (!valid_correlation_id(metadata->parent_request_id)) {
+        return "parent_request_id must match [A-Za-z0-9._:-]{1,128}";
+    }
+    if (metadata->parent_request_id) {
+        options.parent_request_id = metadata->parent_request_id;
+    }
+    return nullptr;
+}
+
 TokenCallback c_callback(sonder_token_callback callback, void* user_data) {
     if (!callback) {
         return {};
@@ -390,6 +407,13 @@ void sonder_session_destroy(sonder_session* session) { delete session; }
 
 sonder_status sonder_session_generate(sonder_session* session, const char* prompt, sonder_token_callback callback,
                                       void* user_data, sonder_generation_stats* out_stats) {
+    return sonder_session_generate_with_metadata(session, prompt, nullptr, callback, user_data, out_stats);
+}
+
+sonder_status sonder_session_generate_with_metadata(sonder_session* session, const char* prompt,
+                                                    const sonder_request_metadata* metadata,
+                                                    sonder_token_callback callback, void* user_data,
+                                                    sonder_generation_stats* out_stats) {
     return guarded([&] {
         if (!session || !prompt) {
             return fail(SONDER_ERROR_INVALID_ARGUMENT, "null argument");
@@ -397,19 +421,35 @@ sonder_status sonder_session_generate(sonder_session* session, const char* promp
         if (out_stats && out_stats->struct_size < sizeof(sonder_generation_stats)) {
             return fail(SONDER_ERROR_INVALID_ARGUMENT, "sonder_generation_stats.struct_size too small");
         }
-        return finish_request(session->session->generate(prompt, c_callback(callback, user_data)), out_stats);
+        RequestOptions options;
+        if (const char* err = request_options_from_c(metadata, options)) {
+            return fail(SONDER_ERROR_INVALID_ARGUMENT, err);
+        }
+        return finish_request(session->session->generate(prompt, c_callback(callback, user_data), std::nullopt, options),
+                              out_stats);
     });
 }
 
 sonder_status sonder_session_chat(sonder_session* session, const sonder_chat_message* const* messages,
                                   size_t message_count, sonder_token_callback callback, void* user_data,
                                   sonder_generation_stats* out_stats) {
+    return sonder_session_chat_with_metadata(session, messages, message_count, nullptr, callback, user_data, out_stats);
+}
+
+sonder_status sonder_session_chat_with_metadata(sonder_session* session, const sonder_chat_message* const* messages,
+                                               size_t message_count, const sonder_request_metadata* metadata,
+                                               sonder_token_callback callback, void* user_data,
+                                               sonder_generation_stats* out_stats) {
     return guarded([&] {
         if (!session || !messages || message_count == 0 || message_count > SONDER_MAX_CHAT_MESSAGES) {
             return fail(SONDER_ERROR_INVALID_ARGUMENT, "chat requires a session and 1 to 1024 messages");
         }
         if (out_stats && out_stats->struct_size < sizeof(sonder_generation_stats)) {
             return fail(SONDER_ERROR_INVALID_ARGUMENT, "sonder_generation_stats.struct_size too small");
+        }
+        RequestOptions options;
+        if (const char* err = request_options_from_c(metadata, options)) {
+            return fail(SONDER_ERROR_INVALID_ARGUMENT, err);
         }
         // This prefix remains fixed even if future headers append fields.
         constexpr std::size_t min_size = offsetof(sonder_chat_message, content) + sizeof(const char*);
@@ -425,7 +465,8 @@ sonder_status sonder_session_chat(sonder_session* session, const sonder_chat_mes
             }
             copied.push_back(ChatMessage{message->role, message->content});
         }
-        return finish_request(session->session->chat(copied, c_callback(callback, user_data)), out_stats);
+        return finish_request(session->session->chat(copied, c_callback(callback, user_data), std::nullopt, options),
+                              out_stats);
     });
 }
 

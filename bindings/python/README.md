@@ -174,3 +174,22 @@ Older ABI-v1 libraries still support default sessions; explicitly requested
 metadata raises `UnsupportedError` when the additive export is absent.
 Scheduling hints and a telemetry callback are separate follow-ups. See
 [contract and qualification](../../docs/integration/cabi-session-metadata.md).
+
+### Per-request parent lineage
+
+```python
+parent = si.RequestMetadata(parent_request_id="runtime-turn:1")
+result = session.generate("hello", metadata=parent)
+with session.chat_stream([si.ChatMessage("user", "Hello")], metadata=parent) as stream:
+    chunks = list(stream)
+```
+
+`generate`, `chat`, `stream` and `chat_stream` all accept keyword-only
+`metadata`. The frozen record applies to that request alone; `None` leaves
+the parent absent. IDs follow the same 1–128-byte grammar and privacy rules
+as session metadata. Parent IDs appear on request lifecycle attributes;
+session run IDs and engine-generated request IDs remain unchanged. Explicit
+metadata, including an empty record, raises `UnsupportedError` when the
+matching additive export is absent; default methods still work with older
+ABI-v1 libraries. Iterators validate and own metadata before starting their
+worker. See [contract and qualification](../../docs/integration/cabi-request-parent.md).

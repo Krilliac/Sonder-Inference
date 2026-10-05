@@ -20,6 +20,7 @@ from .api import (
     GenerationResult,
     Model,
     Outcome,
+    RequestMetadata,
     SamplingConfig,
     Session,
     SessionMetadata,
@@ -50,7 +51,7 @@ __version__ = "0.1.0"
 __all__ = [
     "BackendError", "CancelledError", "ChatMessage", "ENV_LIBRARY", "ENV_LIB_DIR", "Engine",
     "GenerationResult", "InternalError", "InvalidArgumentError", "InvalidStateError", "Library",
-    "LibraryNotFoundError", "Model", "NotFoundError", "Outcome", "ProtocolError",
+    "LibraryNotFoundError", "Model", "NotFoundError", "Outcome", "ProtocolError", "RequestMetadata",
     "SUPPORTED_ABI_VERSION", "SamplingConfig", "Session", "SessionMetadata", "SonderError", "SonderIOError",
     "SonderTimeoutError", "Status", "TelemetryLevel", "TokenStream", "UnavailableError",
     "UnsupportedError", "abi_version", "error_for_status", "get_library", "load_library", "version",

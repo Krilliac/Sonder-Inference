@@ -260,6 +260,18 @@ and its reproduction guide `docs/integration/stability-smoke.md`. It runs
 bounded mock-only streaming/nonstreaming fan-out and drains active streams
 on SIGINT, with generated receipts kept outside Git.
 
+## SDK request parent integration — 2026-10-05
+
+The parent-only SDK slice crosses module boundaries explicitly: append-only
+C header and core ABI wrapper; Python mirrors/loader/API/exports; native C11,
+C++ and Python tests; three bounded qualification/fixture scripts; public
+documentation and the integration note at
+`docs/integration/cabi-request-parent.md`. Native RequestOptions, session/run
+ownership, HTTP server, scheduler/KV, telemetry schema and dependencies are
+unchanged. Default symbols remain usable, optional metadata symbols require
+explicit support, and the broader scheduling/request/callback item remains
+open. Root integration owns publication and exact-revision qualification.
+
 ## CI follow-up: real mock lifecycle stress
 
 The existing Linux `build-test` context now runs `scripts/stress_mock.py`

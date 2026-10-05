@@ -291,3 +291,15 @@ starts, preserving synchronous chat's record limit and unsupported-field checks.
 Both iterator methods share cancellation epochs, the 64-chunk delivery bound,
 completion and close behavior. No ABI/native scheduler or capture contract
 changes. See [integration/python-chat-stream.md](integration/python-chat-stream.md).
+
+## SDK per-request parent prefix — 2026-10-05
+
+Expose the existing native RequestOptions parent through independent ABI-v1
+request metadata and optional generate/chat exports. Frozen Python metadata
+is keyword-only on all four request methods, prepared before stream workers
+start; defaults retain older exports and explicit metadata is unsupported
+when the additive symbol is absent. Reuse bounded, sanitized correlation ID
+validation and copy ownership without changing native session/run ownership,
+request IDs, telemetry schema or scheduling. The scheduling/request metadata
+and telemetry callback roadmap umbrella remains incomplete. See
+[integration/cabi-request-parent.md](integration/cabi-request-parent.md).

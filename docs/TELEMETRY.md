@@ -247,7 +247,10 @@ There is no separate Prometheus metrics endpoint.
 All five request lifecycle events carry the optional `parent_request_id` str
 when the caller set `RequestOptions::parent_request_id` (for `sonder-infer
 serve`: the `X-Sonder-Parent-Request-Id` header, i.e. the Sonder Runtime turn
-id). The envelope `request_id` is always the engine's own id.
+id). The C ABI/Python SDK can also set this parent with the additive
+[request metadata record](integration/cabi-request-parent.md), without
+changing the session's run ID. The envelope `request_id` is always the
+engine's own id.
 
 `sampling` objects hold `temperature`, `top_k`, `top_p`, `min_p`,
 `repeat_penalty`, `typical_p`, `repeat_last_n`, `presence_penalty`,

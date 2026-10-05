@@ -100,6 +100,13 @@ def _declare(lib: ctypes.CDLL) -> None:
         fn("sonder_session_chat", status, c.c_void_p, c.POINTER(c.POINTER(S.CChatMessage)),
            c.c_size_t, S.TOKEN_CALLBACK, c.c_void_p, c.POINTER(S.CGenerationStats))
     fn("sonder_session_cancel", status, c.c_void_p)
+    if hasattr(lib, "sonder_session_generate_with_metadata"):
+        fn("sonder_session_generate_with_metadata", status, c.c_void_p, c.c_char_p,
+           c.POINTER(S.CRequestMetadata), S.TOKEN_CALLBACK, c.c_void_p, c.POINTER(S.CGenerationStats))
+    if hasattr(lib, "sonder_session_chat_with_metadata"):
+        fn("sonder_session_chat_with_metadata", status, c.c_void_p, c.POINTER(c.POINTER(S.CChatMessage)),
+           c.c_size_t, c.POINTER(S.CRequestMetadata), S.TOKEN_CALLBACK, c.c_void_p,
+           c.POINTER(S.CGenerationStats))
 
 
 class Library:
