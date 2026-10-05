@@ -312,12 +312,15 @@ class _Handle:
 
     def _drain(self) -> None:
         """Interrupt and wait until no call is in flight on this handle."""
-        handle = ctypes.c_void_p(self._ptr)
         while True:
-            with self._cond:
-                if not self._active:
-                    return
-            self._interrupt(handle)  # the handle is still valid: nothing is destroyed yet
+            # Concurrent closers share the destruction guard. Keep each
+            # interrupt inside it, but release it before waiting for calls.
+            with self._destroy_lock:
+                with self._cond:
+                    if not self._active:
+                        return
+                    handle = ctypes.c_void_p(self._ptr)
+                self._interrupt(handle)
             with self._cond:
                 if self._active:
                     self._cond.wait(self._INTERRUPT_INTERVAL_S)
@@ -326,7 +329,8 @@ class _Handle:
         # Concurrent closers all block here until the one destroy completes.
         with self._destroy_lock:
             self._finalizer()
-            self._ptr = None
+            with self._cond:
+                self._ptr = None
 
     def close(self) -> None:
         self._check_not_reentrant()

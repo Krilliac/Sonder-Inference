@@ -69,11 +69,15 @@ with si.Engine(telemetry_level=si.TelemetryLevel.OFF) as engine:
   closes its sessions and models first. A session keeps its model alive in C,
   so a model may be closed before the sessions created from it.
 - `close()` is thread-safe. Closing a session (or its engine) while
-  `generate()`/`chat()`/`stream()` runs on another thread cancels that request and
+  `generate()`/`chat()`/`stream()`/`chat_stream()` runs on another thread cancels that request and
   destroys the C handle only after the call returns; any call on a closed
   handle raises `InvalidStateError`. Calling `close()` from inside the
   session's own token callback raises `InvalidStateError`; return `False` or
   call `cancel()` there instead.
+  Concurrent closers synchronize each cancellation with handle destruction;
+  every closer waits for destruction to finish, which occurs once. Waiting
+  for active calls and closing child handles happen outside that destruction
+  guard. Stream capacity, polling and cancellation epochs are unchanged.
 - Strings passed to the C ABI (prompt, chat roles/content, backend, model, paths, URLs) must not
   contain NUL characters; they raise `ValueError` instead of being truncated.
 
