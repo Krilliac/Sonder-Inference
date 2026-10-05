@@ -90,16 +90,19 @@ _WAIT_FULL = """
 _WAIT_FULL = textwrap.indent(textwrap.dedent(_WAIT_FULL), "        ")
 
 
-def _iterator(mode, prompt):
-    return f"s.chat_stream([si.ChatMessage('user', {prompt!r})])" if mode == 'chat' else f"s.stream({prompt!r})"
+def _iterator(mode, prompt, metadata=False):
+    option = ", metadata=si.RequestMetadata('parent:bounded-stream')" if metadata else ""
+    return (f"s.chat_stream([si.ChatMessage('user', {prompt!r})]{option})" if mode == 'chat'
+            else f"s.stream({prompt!r}{option})")
 
 
+@pytest.mark.parametrize('metadata', [False, True])
 @pytest.mark.parametrize('mode', ['generate', 'chat'])
-def test_stalled_consumer_bounds_backlog_and_drains_without_loss(lib, long_backend_url, mode):
+def test_stalled_consumer_bounds_backlog_and_drains_without_loss(lib, long_backend_url, mode, metadata):
     _run(_native_make(long_backend_url) + f"""
         e, m = make()
         s = e.create_session(m, si.SamplingConfig.greedy(2048))
-        it = {_iterator(mode, 'synthetic bounded delivery')}
+        it = {_iterator(mode, 'synthetic bounded delivery', metadata)}
     """ + _WAIT_FULL + """
         chunks = list(it)
         assert len(chunks) == 2048
@@ -112,14 +115,15 @@ def test_stalled_consumer_bounds_backlog_and_drains_without_loss(lib, long_backe
 
 
 @pytest.mark.parametrize('action', ['stream.close', 'session.cancel', 'session.close', 'engine.close'])
+@pytest.mark.parametrize('metadata', [False, True])
 @pytest.mark.parametrize('mode', ['generate', 'chat'])
-def test_stalled_consumer_lifecycle_never_waits_for_drain(lib, action, long_backend_url, mode):
+def test_stalled_consumer_lifecycle_never_waits_for_drain(lib, action, long_backend_url, mode, metadata):
     calls = {'stream.close': 'it.close()', 'session.cancel': 's.cancel()',
              'session.close': 's.close()', 'engine.close': 'e.close()'}
     _run(_native_make(long_backend_url) + f"""
         e, m = make()
         s = e.create_session(m, si.SamplingConfig.greedy(2048))
-        it = {_iterator(mode, 'synthetic paused cancellation')}
+        it = {_iterator(mode, 'synthetic paused cancellation', metadata)}
     """ + _WAIT_FULL + f"""
         started = time.monotonic()
         {calls[action]}
@@ -139,8 +143,9 @@ def test_stalled_consumer_lifecycle_never_waits_for_drain(lib, action, long_back
     """)
 
 
+@pytest.mark.parametrize('metadata', [False, True])
 @pytest.mark.parametrize('mode', ['generate', 'chat'])
-def test_stream_error_after_queued_chunks_is_propagated(lib, mode):
+def test_stream_error_after_queued_chunks_is_propagated(lib, mode, metadata):
     _run(f"""
         e, m = make()
         s = e.create_session(m)
@@ -150,7 +155,7 @@ def test_stream_error_after_queued_chunks_is_propagated(lib, mode):
                     return
             raise ValueError('synthetic backend failure')
         s._request = failing_request
-        it = {_iterator(mode, 'synthetic worker failure')}
+        it = {_iterator(mode, 'synthetic worker failure', metadata)}
         chunks = []
         try:
             while True:
@@ -167,8 +172,9 @@ def test_stream_error_after_queued_chunks_is_propagated(lib, mode):
 
 
 @pytest.mark.parametrize('action', ['cancel', 'close'])
+@pytest.mark.parametrize('metadata', [False, True])
 @pytest.mark.parametrize('mode', ['generate', 'chat'])
-def test_stream_stop_before_native_request_enters(lib, action, mode):
+def test_stream_stop_before_native_request_enters(lib, action, mode, metadata):
     _run(f"""
         e, m = make()
         s = e.create_session(m, si.SamplingConfig.greedy(12))
@@ -179,7 +185,7 @@ def test_stream_stop_before_native_request_enters(lib, action, mode):
             assert release.wait(10)
             return original(*args, **kwargs)
         s._request = gated_request
-        it = {_iterator(mode, 'synthetic start race')}
+        it = {_iterator(mode, 'synthetic start race', metadata)}
         assert entered.wait(10)
         if '{action}' == 'cancel':
             s.cancel()

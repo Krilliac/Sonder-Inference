@@ -30,6 +30,7 @@
 - [x] additive text chat C ABI and Python Session.chat (versioned messages, 1–1,024 count bound; `docs/integration/cabi-chat.md`)
 - [x] bounded Python structured chat iterator (`Session.chat_stream`; shared 64-chunk delivery/cancellation path; `docs/integration/python-chat-stream.md`)
 - [x] additive C ABI/Python session correlation IDs (`docs/integration/cabi-session-metadata.md`)
+- [x] additive C ABI/Python per-request parent lineage (four methods, reused-session isolation; `docs/integration/cabi-request-parent.md`)
 - [ ] C ABI scheduling/request metadata and a telemetry callback (follow-up to ADR-020)
 - [ ] backend identity for Ollama (tokenizer digest not measurable) and llama.cpp (GGUF hashing)
 

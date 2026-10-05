@@ -207,6 +207,8 @@ with si.Engine() as engine:
 `Session.stream()` yields chunks from a worker thread. `Session.chat()` accepts
 text conversations and streams through `on_token`; see the [chat contract](docs/integration/cabi-chat.md).
 Older ABI v1 libraries without the additive chat export raise `UnsupportedError` for chat.
+All four request methods accept keyword-only `RequestMetadata` for caller
+parent lineage; see the [request parent contract](docs/integration/cabi-request-parent.md).
 
 ## Configuration
 

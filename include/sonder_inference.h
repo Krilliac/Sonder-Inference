@@ -214,6 +214,28 @@ SONDER_API sonder_status sonder_session_chat(sonder_session* session,
                                              sonder_token_callback callback, void* user_data,
                                              sonder_generation_stats* out_stats);
 
+/* Additive ABI-v1 per-request parent lineage. NULL retains no parent.
+ * Non-NULL IDs match [A-Za-z0-9._:-]{1,128} and are explicit telemetry
+ * metadata independent of text capture, not prompts or secrets. Records and
+ * strings must remain valid and unchanged until the call returns; the parent
+ * is copied before submission. Complete prefixes are required, larger records
+ * ignore unknown tails. Session/run IDs and engine request IDs are unchanged. */
+typedef struct sonder_request_metadata {
+    uint32_t struct_size;  /* sizeof(sonder_request_metadata) */
+    const char* parent_request_id;
+} sonder_request_metadata;
+
+/* metadata may be NULL. Request, callback, stats, cancellation and handle
+ * lifetime contracts match the original generate/chat exports. The parent is
+ * attributes.parent_request_id on the five request lifecycle events only. */
+SONDER_API sonder_status sonder_session_generate_with_metadata(
+    sonder_session* session, const char* prompt, const sonder_request_metadata* metadata,
+    sonder_token_callback callback, void* user_data, sonder_generation_stats* out_stats);
+SONDER_API sonder_status sonder_session_chat_with_metadata(
+    sonder_session* session, const sonder_chat_message* const* messages, size_t message_count,
+    const sonder_request_metadata* metadata, sonder_token_callback callback, void* user_data,
+    sonder_generation_stats* out_stats);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

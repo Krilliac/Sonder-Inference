@@ -372,6 +372,28 @@ class SessionMetadata:
         return record
 
 
+@dataclass(frozen=True)
+class RequestMetadata:
+    """Caller parent lineage for one request, independent of text capture.
+
+    None leaves the parent absent. Identifiers must not contain prompts,
+    secrets or personal data. Explicit metadata needs the additive export;
+    session run IDs and engine-generated request IDs remain unchanged.
+    """
+
+    parent_request_id: Optional[str] = None
+
+    def _to_c(self) -> "S.CRequestMetadata":
+        value = self.parent_request_id
+        if value is not None and (not isinstance(value, str) or
+                                  re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", value) is None):
+            raise InvalidArgumentError("parent_request_id must match [A-Za-z0-9._:-]{1,128}")
+        record = S.CRequestMetadata()
+        record.struct_size = ctypes.sizeof(record)
+        record.parent_request_id = value.encode("ascii") if value is not None else None
+        return record
+
+
 class Engine(_Handle):
     """An inference engine. Closing it closes its models and sessions first."""
 
@@ -488,7 +510,8 @@ class Session(_Handle):
         self.sampling = sampling
         self._stream_cancel_epoch = 0
 
-    def generate(self, prompt: str, on_token: Optional[TokenCallback] = None) -> GenerationResult:
+    def generate(self, prompt: str, on_token: Optional[TokenCallback] = None, *,
+                 metadata: Optional[RequestMetadata] = None) -> GenerationResult:
         """Run a request to completion.
 
         ``on_token(text)`` is called for each streamed chunk (UTF-8 decoded
@@ -497,7 +520,20 @@ class Session(_Handle):
         generation and is re-raised here.
         """
         prompt_b = _cstr("prompt", prompt)
-        return self._request(self._lib.cdll.sonder_session_generate, (prompt_b,), on_token)
+        function, args = self._request_args("sonder_session_generate", (prompt_b,), metadata)
+        return self._request(function, args, on_token)
+
+    def _request_args(self, name: str, args: tuple[Any, ...],
+                      metadata: Optional[RequestMetadata]) -> tuple[Any, tuple[Any, ...]]:
+        if metadata is None:
+            return getattr(self._lib.cdll, name), args
+        if not isinstance(metadata, RequestMetadata):
+            raise InvalidArgumentError("metadata must be RequestMetadata or None")
+        record = metadata._to_c()  # prepare owned bytes before any worker starts
+        export = name + "_with_metadata"
+        if not self._lib.has_symbol(export):
+            raise UnsupportedError(f"this library does not export {export}")
+        return getattr(self._lib.cdll, export), (*args, ctypes.pointer(record))
 
     def _request(self, function: Any, args: tuple[Any, ...],
                  on_token: Optional[TokenCallback]) -> GenerationResult:
@@ -540,15 +576,18 @@ class Session(_Handle):
             completion_tokens=stats.completion_tokens, chunks=stats.chunks,
             ttft_ms=None if stats.ttft_ms < 0 else stats.ttft_ms, total_ms=stats.total_ms)
 
-    def stream(self, prompt: str) -> "TokenStream":
+    def stream(self, prompt: str, *, metadata: Optional[RequestMetadata] = None) -> "TokenStream":
         """Iterate over chunks as they are produced (generation runs on a
         worker thread). At most 64 chunks wait for the consumer; a full
         buffer pauses delivery without dropping text. Closing the stream
         early cancels the request. The final result still retains its text."""
-        _cstr("prompt", prompt)  # fail here, not later on the worker thread
+        prompt_b = _cstr("prompt", prompt)  # fail here, not later on the worker thread
+        function, args = self._request_args("sonder_session_generate", (prompt_b,), metadata)
         if self.closed:
             raise InvalidStateError("Session is closed")
-        return TokenStream(self, prompt)
+        if metadata is None:
+            return TokenStream(self, prompt)
+        return TokenStream._from_request(self, function, args)
 
     def cancel(self) -> None:
         """Cancel the in-flight request (thread-safe; no-op when idle)."""
@@ -572,7 +611,8 @@ class Session(_Handle):
         super().close()
 
     def chat(self, messages: Iterable[Union[ChatMessage, Mapping[str, str]]],
-             on_token: Optional[TokenCallback] = None) -> GenerationResult:
+             on_token: Optional[TokenCallback] = None, *,
+             metadata: Optional[RequestMetadata] = None) -> GenerationResult:
         """Run text chat with 1 to 1024 messages, ending in user or tool.
 
         Accepts ChatMessage or mappings containing only role/content. Native
@@ -581,17 +621,20 @@ class Session(_Handle):
         Older ABI v1 libraries without the chat export raise UnsupportedError.
         """
         args = self._chat_args(messages)
-        return self._request(self._lib.cdll.sonder_session_chat, args, on_token)
+        function, args = self._request_args("sonder_session_chat", args, metadata)
+        return self._request(function, args, on_token)
 
-    def chat_stream(self, messages: Iterable[Union[ChatMessage, Mapping[str, str]]]) -> "TokenStream":
+    def chat_stream(self, messages: Iterable[Union[ChatMessage, Mapping[str, str]]], *,
+                    metadata: Optional[RequestMetadata] = None) -> "TokenStream":
         """Iterate over structured chat chunks with the same 64-chunk bound
         and cancellation/lifetime behavior as stream(). Native input buffers
         are prepared before starting the worker. Close an abandoned iterator.
         """
         args = self._chat_args(messages)
+        function, args = self._request_args("sonder_session_chat", args, metadata)
         if self.closed:
             raise InvalidStateError("Session is closed")
-        return TokenStream._from_chat(self, args)
+        return TokenStream._from_request(self, function, args)
 
     def _chat_args(self, messages: Iterable[Union[ChatMessage, Mapping[str, str]]]) -> tuple[Any, int]:
         if not self._lib.has_symbol("sonder_session_chat"):
@@ -635,8 +678,12 @@ class TokenStream:
 
     @classmethod
     def _from_chat(cls, session: Session, args: tuple[Any, int]) -> "TokenStream":
+        return cls._from_request(session, session._lib.cdll.sonder_session_chat, args)
+
+    @classmethod
+    def _from_request(cls, session: Session, function: Any, args: tuple[Any, ...]) -> "TokenStream":
         stream = cls.__new__(cls)
-        stream._start(session, lambda: session._request(session._lib.cdll.sonder_session_chat, args, stream._push))
+        stream._start(session, lambda: session._request(function, args, stream._push))
         return stream
 
     def _start(self, session: Session, call: Callable[[], GenerationResult]) -> None:
@@ -737,5 +784,5 @@ class TokenStream:
 
 __all__ = [
     "ChatMessage", "Engine", "GenerationResult", "Model", "Outcome", "SamplingConfig", "Session",
-    "SessionMetadata", "TelemetryLevel", "TokenStream", "abi_version", "version",
+    "RequestMetadata", "SessionMetadata", "TelemetryLevel", "TokenStream", "abi_version", "version",
 ]

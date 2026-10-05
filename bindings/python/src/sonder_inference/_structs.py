@@ -91,3 +91,7 @@ class CSessionMetadata(c.Structure):
         ("agent_id", c.c_char_p),
         ("task_id", c.c_char_p),
     ]
+
+
+class CRequestMetadata(c.Structure):
+    _fields_ = [("struct_size", c.c_uint32), ("parent_request_id", c.c_char_p)]
