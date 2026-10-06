@@ -127,6 +127,38 @@ GGUF metadata:
 | KV bytes per token at a given context | attention-layer count × KV head dims × dtype (exclude recurrent layers) |
 | recurrent-state checkpoint bytes | backend-reported state size per saved position, budgeted separately from token-indexed KV |
 
+### Routed-expert header observations
+
+`GgufModelInfo::routed_experts` is an optional typed pair of declared
+`total` (`expert_count`) and `active` (`expert_used_count`) counts. The parser
+requires exactly one string `general.architecture` with namespace syntax
+`[A-Za-z0-9_][A-Za-z0-9_.-]*` (at most 256 bytes), then exactly one scalar GGUF
+integer for each literal `<architecture>.expert_count` and
+`<architecture>.expert_used_count` key. It requires
+`0 < active <= total <= UINT32_MAX`. Missing, duplicate, wrongly typed or
+out-of-range fields leave the pair unset. Arrays and the string metadata
+view's array maxima are not scalar count evidence. Dots and case in the
+namespace are literal; `qwen3.8` is not an alias for `qwen3_8`.
+
+This observation is independent of `ModelArchitecture`, which describes the
+attention/hybrid/recurrent cache and state axis. A previously unknown family
+can supply valid count metadata without changing its existing cache
+classification. An unset pair means unknown, not dense; model and family
+names do not establish sparsity. Counts do not establish layer topology,
+active parameter totals or measured routing frequencies.
+
+The pair describes only the supplied GGUF header bytes. Neither
+`parse_gguf_model_info` nor `read_gguf_model_info` binds those bytes to an
+immutable full-model revision, and a header hash would not be a full-model
+hash. The observation is not propagated to `ModelDescriptor`, the C ABI,
+HTTP metadata or Runtime and is not consumed by placement, cache reuse or
+routing policy. Those follow-ups require an exact same-artifact revision
+binding and separate qualification. Backend execution capability bits and
+Runtime task-quality evidence remain separate from physical model traits.
+No model-quality, inference-speed or hardware recommendation follows from
+synthetic header tests. The current VRAM arithmetic and manual tensor
+placement rules remain unchanged.
+
 A planner then chooses the cheapest placement that fits. It fills VRAM in
 priority order: hot shared weights, then KV cache for the requested context,
 then as many expert blocks as fit (whole layers' experts at a time). The rest

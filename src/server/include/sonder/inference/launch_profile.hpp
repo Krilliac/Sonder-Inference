@@ -168,6 +168,14 @@ void apply_sampling_defaults(const SamplingDefaults& defaults, SamplingConfig& s
 
 // ------------------------------------------------------------------ VRAM fit
 
+// Optional physical metadata, independent of the cache/state architecture.
+// These counts describe the supplied GGUF header, not a measured model
+// revision, expert usage, placement, or task quality.
+struct RoutedExpertCounts {
+    std::uint32_t total = 0;   // declared expert_count
+    std::uint32_t active = 0;  // declared expert_used_count, not observed routing
+};
+
 // What the estimator needs from a GGUF header. Tensor sizes come from the
 // tensor table; no tensor data is read.
 struct GgufModelInfo {
@@ -205,6 +213,12 @@ struct GgufModelInfo {
     // f32 values: conv (kernel-1) x channels + state.
     std::uint64_t recurrent_state_values = 0;
     ModelMetadata metadata;  // scalar keys as strings (for classification)
+    // Present only for a unique, supported general.architecture namespace and
+    // one scalar integer of each <arch>.expert_count / expert_used_count key,
+    // with 0 < active <= total <= UINT32_MAX. Missing, duplicate, or invalid
+    // fields leave this unset; a model name is not evidence. Header-only
+    // observation: it does not authorize routing, placement, or cache reuse.
+    std::optional<RoutedExpertCounts> routed_experts;
 };
 
 // Parses the GGUF header of `path` (versions 2 and 3). Errors: not_found,

@@ -78,6 +78,10 @@ Gate: measurable win on agent fan-out/long-context workloads without interactive
   profile metadata, and a GGUF-header VRAM fit check (hybrid-aware KV and
   MTP recurrent snapshots; +1.1 % vs the measured Qwen3.8-27B Q3_K_XL 100k
   profile, −1.1 % vs the live 65k MTP profile) that refuses overcommit
+- [x] optional typed GGUF-header routed-expert counts, independent of cache
+  architecture (`GgufModelInfo::routed_experts`; literal scalar metadata only,
+  unknown stays unset; header-byte observation, no artifact revision binding
+  or policy consumption; see `docs/PLACEMENT.md`)
 - [ ] several launch profiles behind one `serve` (today one profile per
   instance) and Runtime tier routing across them
 - [ ] per-model placement planner from GGUF metadata (`docs/PLACEMENT.md` step 2;
@@ -118,3 +122,15 @@ For each candidate operator:
 - [ ] maintenance-cost review
 
 No "rewrite it ourselves" milestone exists without evidence.
+
+## Ordered architecture follow-ups
+
+After the bounded routed-expert header observation slice, the subsequent
+architecture work proceeds through MoE metadata plus placement, real backend
+recurrent checkpoints, embedding/reranking, architecture-aware routing,
+residency, then Runtime MoT orchestration. These are follow-ups, not additional
+capabilities inferred from the count pair. Placement and routing need an exact
+model/revision binding; Runtime task-quality evidence is separate from
+physical execution traits and backend capability advertisement. MoT across
+models is separate from internal MoE routing. Shared-chat hardware, model,
+license and provider-quality recommendations require independent evidence.

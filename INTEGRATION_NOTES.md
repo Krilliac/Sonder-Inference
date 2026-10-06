@@ -292,3 +292,31 @@ admission, sampled sequentially immediately before sending SIGINT. Those streams
 delay to give the signal a longer bounded tail inside the existing two-second
 grace. This remains mock transport/lifecycle qualification,
 not a native model quality or throughput measurement.
+
+## GGUF routed-expert header observations — bounded follow-up
+
+Provisional scope is the `src/server` module under root integration. The
+additive C++ header value, parser and synthetic tests stay in:
+
+- `src/server/include/sonder/inference/launch_profile.hpp`
+- `src/server/src/vram_estimate.cpp`
+- `src/server/tests/test_launch_profile.cpp`
+
+Cross-area documentation changes for the integrator are additive updates to
+`docs/PLACEMENT.md`, `docs/ROADMAP.md` and this integration note. No root
+CMake, common backend interface, `ModelDescriptor`, C ABI, Python, telemetry,
+CLI, dependencies or cache/scheduler/session code changes are needed.
+
+The optional count pair is a header-byte observation of original scalar
+integer metadata and exact unique namespace keys. Missing/invalid values
+stay unset; model names and array maxima supply no evidence. Existing cache
+architecture, cursor/cancellation/rollback behavior, VRAM estimates and
+manual expert placement remain unchanged. This does not implement a planner,
+backend artifact identity or Runtime task-quality classification. Exact
+same-artifact revision binding must precede any later policy consumption or
+backend descriptor propagation.
+
+This slice does not replace the separately retained callback-exception
+rollback candidate or merged Python close synchronization. Root integration
+owns application, exact-revision qualification and publication; no new lane
+ownership or live model qualification is claimed here.

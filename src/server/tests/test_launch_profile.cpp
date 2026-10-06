@@ -504,7 +504,7 @@ TEST_CASE("launch profile: sampling defaults fill only fields the request left u
 
 namespace {
 
-// Minimal GGUF v3 writer for header-only fixtures.
+// Minimal GGUF v2/v3 writer for header-only fixtures.
 class GgufWriter {
 public:
     void u32(std::uint32_t v) { raw(&v, 4); }
@@ -517,6 +517,12 @@ public:
         str(key);
         u32(4);
         u32(v);
+    }
+    template <class T>
+    void kv_scalar(const std::string& key, std::uint32_t type, T value) {
+        str(key);
+        u32(type);
+        raw(&value, sizeof(T));
     }
     void kv_str(const std::string& key, const std::string& v) {
         str(key);
@@ -553,10 +559,9 @@ public:
         u32(type);
         u64(0);
     }
-    std::string finish(std::uint64_t tensors, std::uint64_t kvs) const {
+    std::string finish(std::uint64_t tensors, std::uint64_t kvs, std::uint32_t version = 3) const {
         std::string head = "GGUF";
         const auto put = [&head](const void* p, std::size_t n) { head.append(static_cast<const char*>(p), n); };
-        const std::uint32_t version = 3;
         put(&version, 4);
         put(&tensors, 8);
         put(&kvs, 8);
@@ -570,7 +575,7 @@ private:
 
 // A four-block hybrid: blocks 1 and 3 carry attention (attn_k tensors),
 // blocks 0 and 2 are delta-net layers.
-std::string hybrid_fixture() {
+std::string hybrid_fixture(bool include_experts = false) {
     GgufWriter w;
     w.kv_str("general.architecture", "qwen35");
     w.kv_u32("qwen35.block_count", 4);
@@ -586,6 +591,10 @@ std::string hybrid_fixture() {
     w.kv_u32("qwen35.ssm.state_size", 8);
     w.kv_u32("qwen35.ssm.group_count", 2);
     w.kv_str_array("tokenizer.ggml.tokens", {"a", "b", "c", "d", "e"});
+    if (include_experts) {
+        w.kv_u32("qwen35.expert_count", 64);
+        w.kv_u32("qwen35.expert_used_count", 4);
+    }
     w.tensor("token_embd.weight", {64, 5}, 1);        // f16: 640 B
     w.tensor("blk.0.attn_qkv.weight", {64, 64}, 1);   // 8192 B (delta-net, not attention KV)
     w.tensor("blk.1.attn_k.weight", {64, 32}, 0);     // f32: 8192 B
@@ -594,13 +603,28 @@ std::string hybrid_fixture() {
     w.tensor("blk.3.attn_k.weight", {64, 32}, 1);     // 4096 B
     w.tensor("output_norm.weight", {64}, 0);          // 256 B
     w.tensor("output.weight", {64, 5}, 1);            // 640 B
-    return w.finish(8, 14);
+    return w.finish(8, include_experts ? 16 : 14);
 }
 
 si::GgufModelInfo parse_fixture(const std::string& bytes) {
     auto info = si::parse_gguf_model_info(bytes);
     REQUIRE_MESSAGE(info.ok(), info.status().message());
     return info.value();
+}
+
+// A small, otherwise identical header with optional extra metadata. The
+// tests supply the exact number of entries, including duplicate keys.
+template <class AddMetadata>
+std::string routed_expert_fixture(const std::string& architecture, std::uint64_t extra_entries,
+                                 AddMetadata add, std::uint32_t version = 3) {
+    GgufWriter w;
+    w.kv_str("general.architecture", architecture);
+    w.kv_u32(architecture + ".block_count", 2);
+    w.kv_u32(architecture + ".embedding_length", 32);
+    w.kv_u32(architecture + ".attention.head_count", 4);
+    w.kv_u32(architecture + ".attention.head_count_kv", 2);
+    add(w);
+    return w.finish(0, 5 + extra_entries, version);
 }
 
 // A Gemma-4-12B-shaped header (gemma4 architecture, no tensors): 48 blocks.
@@ -640,6 +664,278 @@ std::vector<bool> every_sixth_full(std::size_t n) {
 }
 
 }  // namespace
+
+TEST_CASE("GGUF reader: routed expert counts accept scalar integer types in v2 and v3") {
+    for (const std::uint32_t version : {2u, 3u}) {
+        CAPTURE(version);
+        const auto check_type = [&](std::uint32_t type, auto sample) {
+            CAPTURE(type);
+            using T = decltype(sample);
+            const auto m = parse_fixture(routed_expert_fixture("llama", 2, [&](GgufWriter& w) {
+                w.kv_scalar("llama.expert_count", type, static_cast<T>(64));
+                w.kv_scalar("llama.expert_used_count", type, static_cast<T>(4));
+            }, version));
+            REQUIRE(m.routed_experts.has_value());
+            CHECK(m.routed_experts->total == 64u);
+            CHECK(m.routed_experts->active == 4u);
+            CHECK(m.block_count == 2u);
+            CHECK(m.kind == si::ModelArchitecture::attention_only);
+        };
+        check_type(0, std::uint8_t{});
+        check_type(1, std::int8_t{});
+        check_type(2, std::uint16_t{});
+        check_type(3, std::int16_t{});
+        check_type(4, std::uint32_t{});
+        check_type(5, std::int32_t{});
+        check_type(10, std::uint64_t{});
+        check_type(11, std::int64_t{});
+    }
+}
+
+TEST_CASE("GGUF reader: routed expert observations are orthogonal to cache architecture") {
+    struct Case { std::string architecture; si::ModelArchitecture kind; };
+    for (const Case& c : std::vector<Case>{
+             {"llama", si::ModelArchitecture::attention_only},
+             {"qwen3.8", si::ModelArchitecture::hybrid},
+             {"mamba2", si::ModelArchitecture::recurrent},
+             {"future_family-42", si::ModelArchitecture::attention_only}}) {
+        CAPTURE(c.architecture);
+        const auto m = parse_fixture(routed_expert_fixture(c.architecture, 2, [&](GgufWriter& w) {
+            w.kv_u32(c.architecture + ".expert_count", 64);
+            w.kv_u32(c.architecture + ".expert_used_count", 4);
+        }));
+        REQUIRE(m.routed_experts.has_value());
+        CHECK(m.routed_experts->total == 64u);
+        CHECK(m.routed_experts->active == 4u);
+        CHECK(m.kind == c.kind);
+    }
+    // The namespace can appear after its qualified keys: order is not evidence.
+    GgufWriter late;
+    late.kv_u32("future_family.expert_count", 16);
+    late.kv_u32("future_family.expert_used_count", 2);
+    late.kv_u32("future_family.block_count", 1);
+    late.kv_str("general.architecture", "future_family");
+    const auto m = parse_fixture(late.finish(0, 4));
+    REQUIRE(m.routed_experts.has_value());
+    CHECK(m.routed_experts->total == 16u);
+    CHECK(m.routed_experts->active == 2u);
+    CHECK(m.kind == si::ModelArchitecture::attention_only);
+}
+
+TEST_CASE("GGUF reader: missing expert fields and model names do not establish counts") {
+    const auto named = parse_fixture(routed_expert_fixture("named_moe", 1, [](GgufWriter& w) {
+        w.kv_str("general.name", "huge-moe-a4b");
+    }));
+    CHECK_FALSE(named.routed_experts.has_value());
+    for (const std::string& key : {std::string("expert_count"), std::string("expert_used_count")}) {
+        CAPTURE(key);
+        const auto m = parse_fixture(routed_expert_fixture("llama", 1, [&](GgufWriter& w) {
+            w.kv_u32("llama." + key, 4);
+        }));
+        CHECK_FALSE(m.routed_experts.has_value());
+    }
+    for (const std::string& prefix : {std::string(""), std::string("other."), std::string("LLAMA."),
+                                      std::string("llama.extra.")}) {
+        CAPTURE(prefix);
+        const auto m = parse_fixture(routed_expert_fixture("llama", 2, [&](GgufWriter& w) {
+            w.kv_u32(prefix + "expert_count", 64);
+            w.kv_u32(prefix + "expert_used_count", 4);
+        }));
+        CHECK_FALSE(m.routed_experts.has_value());
+    }
+    const auto alias = parse_fixture(routed_expert_fixture("qwen3.8", 2, [](GgufWriter& w) {
+        w.kv_u32("qwen3_8.expert_count", 64);
+        w.kv_u32("qwen3_8.expert_used_count", 4);
+    }));
+    CHECK_FALSE(alias.routed_experts.has_value());
+}
+
+TEST_CASE("GGUF reader: routed expert counts require positive bounded active and total values") {
+    struct Case { std::uint64_t total; std::uint64_t active; bool valid; };
+    const auto max = static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max());
+    for (const Case& c : std::vector<Case>{{1, 1, true}, {max, 1, true}, {max, max, true},
+             {0, 0, false}, {0, 1, false}, {64, 0, false}, {4, 5, false},
+             {max + 1, 4, false}, {64, max + 1, false},
+             {std::numeric_limits<std::uint64_t>::max(), 4, false},
+             {64, std::numeric_limits<std::uint64_t>::max(), false}}) {
+        CAPTURE(c.total);
+        CAPTURE(c.active);
+        const auto m = parse_fixture(routed_expert_fixture("llama", 2, [&](GgufWriter& w) {
+            w.kv_scalar("llama.expert_count", 10, c.total);
+            w.kv_scalar("llama.expert_used_count", 10, c.active);
+        }));
+        REQUIRE(m.routed_experts.has_value() == c.valid);
+        if (c.valid) {
+            CHECK(m.routed_experts->total == c.total);
+            CHECK(m.routed_experts->active == c.active);
+        }
+        // No allocation or layer-count inference from even the largest valid counts.
+        CHECK(m.block_count == 2u);
+        CHECK(m.kv_heads == std::vector<std::uint32_t>{2, 2});
+    }
+    for (const bool negative_total : {false, true}) {
+        const auto m = parse_fixture(routed_expert_fixture("llama", 2, [&](GgufWriter& w) {
+            w.kv_scalar("llama.expert_count", 11, negative_total ? std::int64_t{-1} : std::int64_t{64});
+            w.kv_scalar("llama.expert_used_count", 5, negative_total ? std::int32_t{4} : std::int32_t{-1});
+        }));
+        CHECK_FALSE(m.routed_experts.has_value());
+    }
+}
+
+TEST_CASE("GGUF reader: strings floats bools and arrays are not scalar expert count evidence") {
+    const auto check_wrong_type = [&](auto write) {
+        for (const bool invalid_total : {false, true}) {
+            CAPTURE(invalid_total);
+            const std::string invalid_key = invalid_total ? "llama.expert_count" : "llama.expert_used_count";
+            const std::string valid_key = invalid_total ? "llama.expert_used_count" : "llama.expert_count";
+            const auto m = parse_fixture(routed_expert_fixture("llama", 2, [&](GgufWriter& w) {
+                write(w, invalid_key);
+                w.kv_u32(valid_key, invalid_total ? 4 : 64);
+            }));
+            CHECK_FALSE(m.routed_experts.has_value());
+        }
+    };
+    check_wrong_type([](GgufWriter& w, const std::string& key) { w.kv_str(key, "64"); });
+    check_wrong_type([](GgufWriter& w, const std::string& key) { w.kv_scalar(key, 6, 4.0f); });
+    check_wrong_type([](GgufWriter& w, const std::string& key) { w.kv_scalar(key, 12, 4.0); });
+    check_wrong_type([](GgufWriter& w, const std::string& key) { w.kv_scalar(key, 7, std::uint8_t{1}); });
+    check_wrong_type([](GgufWriter& w, const std::string& key) { w.kv_i32_array(key, {64, 4}); });
+    check_wrong_type([](GgufWriter& w, const std::string& key) { w.kv_i32_array(key, {}); });
+    // This array takes the parser's skip branch; it still counts as an invalid occurrence.
+    check_wrong_type([](GgufWriter& w, const std::string& key) {
+        w.kv_i32_array(key, std::vector<std::int32_t>(4097, 64));
+    });
+}
+
+TEST_CASE("GGUF reader: duplicate expert keys stay unknown regardless of order type or value") {
+    const auto check_duplicate = [&](auto write) {
+        for (const bool duplicate_total : {false, true}) {
+            for (const bool duplicate_first : {false, true}) {
+                CAPTURE(duplicate_total);
+                CAPTURE(duplicate_first);
+                const std::string key = duplicate_total ? "llama.expert_count" : "llama.expert_used_count";
+                const auto m = parse_fixture(routed_expert_fixture("llama", 3, [&](GgufWriter& w) {
+                    if (duplicate_first) write(w, key);
+                    w.kv_u32("llama.expert_count", 64);
+                    w.kv_u32("llama.expert_used_count", 4);
+                    if (!duplicate_first) write(w, key);
+                }));
+                CHECK_FALSE(m.routed_experts.has_value());
+            }
+        }
+    };
+    check_duplicate([](GgufWriter& w, const std::string& key) { w.kv_u32(key, 4); });
+    check_duplicate([](GgufWriter& w, const std::string& key) { w.kv_u32(key, 64); });
+    check_duplicate([](GgufWriter& w, const std::string& key) { w.kv_str(key, std::string(257, 'x')); });
+    check_duplicate([](GgufWriter& w, const std::string& key) { w.kv_i32_array(key, {}); });
+    check_duplicate([](GgufWriter& w, const std::string& key) {
+        w.kv_i32_array(key, std::vector<std::int32_t>(4097, 64));
+    });
+    // Invalid or duplicate observations in another namespace do not poison an exact pair.
+    const auto exact = parse_fixture(routed_expert_fixture("llama", 4, [](GgufWriter& w) {
+        w.kv_u32("llama.expert_count", 64);
+        w.kv_u32("llama.expert_used_count", 4);
+        w.kv_str("other.expert_count", "bad");
+        w.kv_u32("other.expert_count", 2);
+    }));
+    REQUIRE(exact.routed_experts.has_value());
+    CHECK(exact.routed_experts->total == 64u);
+    CHECK(exact.routed_experts->active == 4u);
+}
+
+TEST_CASE("GGUF reader: expert namespace requires unique string architecture metadata") {
+    for (const std::string& architecture : {std::string("bad family"), std::string("-bad"), std::string(".bad")}) {
+        CAPTURE(architecture);
+        const auto m = parse_fixture(routed_expert_fixture(architecture, 2, [&](GgufWriter& w) {
+            w.kv_u32(architecture + ".expert_count", 64);
+            w.kv_u32(architecture + ".expert_used_count", 4);
+        }));
+        CHECK_FALSE(m.routed_experts.has_value());  // existing parser still accepts the printable name
+        CHECK(m.kind == si::ModelArchitecture::attention_only);
+    }
+    for (const std::string& duplicate : {std::string("llama"), std::string("other")}) {
+        const auto m = parse_fixture(routed_expert_fixture("llama", 4, [&](GgufWriter& w) {
+            w.kv_str("general.architecture", duplicate);
+            w.kv_u32(duplicate + ".block_count", 2);
+            w.kv_u32(duplicate + ".expert_count", 64);
+            w.kv_u32(duplicate + ".expert_used_count", 4);
+        }));
+        CHECK_FALSE(m.routed_experts.has_value());
+    }
+    const auto duplicate_type = parse_fixture(routed_expert_fixture("llama", 3, [](GgufWriter& w) {
+        w.kv_u32("general.architecture", 1);
+        w.kv_u32("llama.expert_count", 64);
+        w.kv_u32("llama.expert_used_count", 4);
+    }));
+    CHECK_FALSE(duplicate_type.routed_experts.has_value());
+    for (const bool wrong_type : {false, true}) {
+        GgufWriter w;
+        if (wrong_type) w.kv_u32("general.architecture", 1);
+        w.kv_u32("llama.block_count", 1);
+        w.kv_u32("llama.expert_count", 64);
+        w.kv_u32("llama.expert_used_count", 4);
+        const auto parsed = si::parse_gguf_model_info(w.finish(0, wrong_type ? 4 : 3));
+        CHECK_FALSE(parsed.ok());  // preserve missing/wrong-type architecture error
+    }
+    GgufWriter empty;
+    empty.kv_str("general.architecture", "");
+    empty.kv_u32("llama.block_count", 1);
+    const auto parsed = si::parse_gguf_model_info(empty.finish(0, 2));
+    CHECK_FALSE(parsed.ok());
+}
+
+TEST_CASE("GGUF reader: expert observations reset across parses and do not change hybrid estimates") {
+    const std::string valid = routed_expert_fixture("llama", 2, [](GgufWriter& w) {
+        w.kv_u32("llama.expert_count", 8);
+        w.kv_u32("llama.expert_used_count", 2);
+    });
+    const std::string absent = routed_expert_fixture("future_family", 0, [](GgufWriter&) {});
+    for (std::size_t iteration = 0; iteration < 32; ++iteration) {
+        CAPTURE(iteration);
+        const auto m = parse_fixture(valid);
+        REQUIRE(m.routed_experts.has_value());
+        CHECK(m.routed_experts->total == 8u);
+        CHECK(m.routed_experts->active == 2u);
+        CHECK_FALSE(si::parse_gguf_model_info("GGUF").ok());
+        CHECK_FALSE(parse_fixture(absent).routed_experts.has_value());
+    }
+    const auto plain = parse_fixture(hybrid_fixture());
+    const auto experts = parse_fixture(hybrid_fixture(true));
+    REQUIRE(experts.routed_experts.has_value());
+    CHECK_FALSE(plain.routed_experts.has_value());
+    CHECK(experts.kind == plain.kind);
+    CHECK(experts.kv_heads == plain.kv_heads);
+    CHECK(experts.block_bytes == plain.block_bytes);
+    CHECK(experts.recurrent_state_values == plain.recurrent_state_values);
+    for (const std::string& backend : {std::string(si::kLaunchProfileBackendLlamaCpp),
+                                       std::string(si::kLaunchProfileBackendLlamaServer)}) {
+        LaunchProfile p;
+        p.backend = backend;
+        p.ctx_size = 1024;
+        p.parallel = 2;
+        p.n_gpu_layers = -1;
+        p.speculative = si::SpeculativeSettings{{"draft-mtp"}, 2, ""};
+        const auto before = si::estimate_vram(plain, p);
+        const auto after = si::estimate_vram(experts, p);
+        CHECK(after.weights_bytes == before.weights_bytes);
+        CHECK(after.kv_bytes == before.kv_bytes);
+        CHECK(after.recurrent_bytes == before.recurrent_bytes);
+        CHECK(after.compute_bytes == before.compute_bytes);
+        CHECK(after.total_bytes == before.total_bytes);
+        CHECK(after.gpu_layers == before.gpu_layers);
+        CHECK(after.attention_layers == before.attention_layers);
+        CHECK(after.swa_attention_layers == before.swa_attention_layers);
+        CHECK(after.kv_bytes_per_token == before.kv_bytes_per_token);
+        CHECK(after.swa_kv_bytes_per_token == before.swa_kv_bytes_per_token);
+        CHECK(after.context == before.context);
+        CHECK(after.context_per_sequence == before.context_per_sequence);
+        CHECK(after.swa_context_per_sequence == before.swa_context_per_sequence);
+        CHECK(after.sequences == before.sequences);
+        CHECK(after.recurrent_sequences == before.recurrent_sequences);
+        CHECK(after.recurrent_snapshots == before.recurrent_snapshots);
+        CHECK(after.notes == before.notes);
+    }
+}
 
 TEST_CASE("GGUF reader: metadata and tensor sizes and hybrid attention layers") {
     const si::GgufModelInfo m = parse_fixture(hybrid_fixture());
