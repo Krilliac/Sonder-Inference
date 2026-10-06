@@ -140,6 +140,9 @@ public:
     // A cancelled request returns a Result holding the partial output with
     // outcome == cancelled (not an error). Errors: invalid_argument (bad
     // sampling), invalid_state (closed or already running), backend errors.
+    // Exceptions from on_chunk propagate unchanged after session-state recovery
+    // and one runtime cleanup attempt (see docs/integration/request-callback-exceptions.md).
+    // Delivered chunks and callback side effects are never replayed or undone.
     Result<GenerationResult> generate(const std::string& prompt, const TokenCallback& on_chunk = {},
                                       const std::optional<SamplingConfig>& sampling_override = std::nullopt,
                                       const RequestOptions& request_options = {});

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <stdexcept>
 #include <set>
 #include <thread>
 
@@ -10,6 +11,18 @@
 
 using namespace sonder::inference;
 using namespace std::chrono_literals;
+
+namespace {
+template <class Marker>
+[[noreturn]] void throw_callback_marker(Marker marker, const void*& address) {
+    try {
+        throw marker;
+    } catch (const Marker& caught) {
+        address = &caught;
+        throw;  // Rethrow the actual live exception object, without capture/copy.
+    }
+}
+}  // namespace
 
 TEST_SUITE("session") {
 TEST_CASE("telemetry records a 64-bit seed above INT64_MAX exactly") {
@@ -183,4 +196,163 @@ TEST_CASE("engine rejects unknown backends and duplicate registration") {
     CHECK(h.engine->create_session(nullptr).status().code() == ErrorCode::invalid_argument);
     CHECK(h.events_of("model.load.completed").size() == 1);
 }
+TEST_CASE("throwing token callbacks preserve exceptions and allow immediate reuse") {
+    for (const bool chat : {false, true}) {
+        for (const int throw_at : {1, 3}) {
+            for (const bool nonstandard : {false, true}) {
+                CAPTURE(chat);
+                CAPTURE(throw_at);
+                CAPTURE(nonstandard);
+                sonder_test::Harness h({}, TelemetryLevel::standard, false);
+                auto session = h.session(SamplingConfig::greedy(5));
+                REQUIRE(session);
+                const std::string secret = "callback-exception-private-canary";
+                const void* thrown = nullptr;
+                RequestOptions options;
+                options.request_id = "callback-failed-request";
+                options.parent_request_id = "callback-parent";
+                int calls = 0;
+                bool overlap_rejected = false;
+                std::string delivered;
+                const TokenCallback callback = [&](const TokenChunk& chunk) {
+                    if (calls == 0) {
+                        overlap_rejected = session->generate("nested request").status().code() == ErrorCode::invalid_state
+                                           && session->requests_started() == 1;
+                    }
+                    delivered.append(chunk.text);
+                    if (++calls == throw_at) {
+                        if (nonstandard) throw_callback_marker(73, thrown);
+                        throw_callback_marker(std::runtime_error(secret), thrown);
+                    }
+                    return true;
+                };
+                bool caught = false;
+                try {
+                    if (chat) (void)session->chat({{"user", "first request"}}, callback, std::nullopt, options);
+                    else (void)session->generate("first request", callback, std::nullopt, options);
+                } catch (const std::runtime_error& error) {
+                    caught = true;
+                    CHECK_FALSE(nonstandard);
+                    CHECK(static_cast<const void*>(&error) == thrown);
+                    CHECK(std::string(error.what()) == secret);
+                } catch (const int& marker) {
+                    caught = true;
+                    CHECK(nonstandard);
+                    CHECK(static_cast<const void*>(&marker) == thrown);
+                    CHECK(marker == 73);
+                }
+                CHECK(caught);
+                CHECK(overlap_rejected);
+                CHECK(calls == throw_at);
+                CHECK_FALSE(delivered.empty());  // Already delivered effects survive.
+                CHECK(session->state() == SessionState::idle);
+                CHECK(session->last_outcome() == RequestOutcome::failed);
+                CHECK_FALSE(session->last_scheduler_rejected());
+                CHECK(session->requests_started() == 1);
+                const auto failed = h.events_of("request.failed");
+                REQUIRE(failed.size() == 1);
+                CHECK(failed[0].find("request_id")->as_string() == "callback-failed-request");
+                const auto* attrs = failed[0].find("attributes");
+                REQUIRE(attrs);
+                CHECK(attrs->find("parent_request_id")->as_string() == "callback-parent");
+                CHECK(attrs->find("error_code")->as_string() == "internal");
+                CHECK(attrs->find("chunks")->as_int() == throw_at);
+                CHECK(h.events_of("request.completed").empty());
+                CHECK(h.events_of("request.cancelled").empty());
+                for (const auto& line : h.sink->lines()) CHECK(line.find(secret) == std::string::npos);
+                const auto retained = delivered;
+                auto reused = session->generate("fresh request");
+                REQUIRE(reused.ok());
+                CHECK(reused->outcome == RequestOutcome::completed);
+                CHECK(session->requests_started() == 2);
+                CHECK(calls == throw_at);
+                CHECK(delivered == retained);
+            }
+        }
+    }
+}
+
+TEST_CASE("cancel or close before a callback exception preserves terminal state") {
+    for (const bool close : {false, true}) {
+        CAPTURE(close);
+        sonder_test::Harness h;
+        auto session = h.session(SamplingConfig::greedy(4));
+        REQUIRE(session);
+        const void* thrown = nullptr;
+        int calls = 0;
+        bool caught = false;
+        try {
+            (void)session->generate("close or cancel", [&](const TokenChunk&) -> bool {
+                ++calls;
+                if (close) session->close();
+                else session->cancel();
+                throw_callback_marker(std::runtime_error("private-close-canary"), thrown);
+            });
+        } catch (const std::runtime_error& error) {
+            caught = true;
+            CHECK(static_cast<const void*>(&error) == thrown);
+            CHECK(std::string(error.what()) == "private-close-canary");
+        }
+        CHECK(caught);
+        CHECK(calls == 1);
+        CHECK(session->last_outcome() == RequestOutcome::failed);
+        CHECK_FALSE(session->last_scheduler_rejected());
+        if (close) {
+            CHECK(session->state() == SessionState::closed);
+            CHECK(session->generate("must stay closed").status().code() == ErrorCode::invalid_state);
+            CHECK(session->requests_started() == 1);
+        } else {
+            CHECK(session->state() == SessionState::idle);
+            session->cancel();  // No stale cancellation source affects reuse.
+            const auto reused = session->generate("new cancellation epoch");
+            REQUIRE(reused.ok());
+            CHECK(reused->outcome == RequestOutcome::completed);
+            CHECK(session->requests_started() == 2);
+        }
+    }
+}
+
+TEST_CASE("callback exception cleanup also works without scheduling") {
+    EngineOptions options;
+    options.scheduling.enabled = false;
+    options.telemetry.level = TelemetryLevel::off;
+    Engine engine(options);
+    REQUIRE(engine.register_backend(make_mock_backend()).ok());
+    ModelLoadOptions load;
+    load.model = "mock:tiny";
+    auto model = engine.load_model(kMockBackendName, load);
+    REQUIRE(model.ok());
+    SessionOptions session_options;
+    session_options.sampling = SamplingConfig::greedy(5);
+    auto created = engine.create_session(model.value(), session_options);
+    REQUIRE(created.ok());
+    auto session = created.value();
+    REQUIRE_FALSE(engine.scheduling_active());
+    for (const int throw_at : {1, 3}) {
+        CAPTURE(throw_at);
+        const void* thrown = nullptr;
+        int calls = 0;
+        bool caught = false;
+        try {
+            (void)session->generate("unscheduled", [&](const TokenChunk&) {
+                if (++calls == throw_at) throw_callback_marker(91, thrown);
+                return true;
+            });
+        } catch (const int& marker) {
+            caught = true;
+            CHECK(static_cast<const void*>(&marker) == thrown);
+            CHECK(marker == 91);
+        }
+        CHECK(caught);
+        CHECK(calls == throw_at);
+        CHECK(session->state() == SessionState::idle);
+        CHECK(session->last_outcome() == RequestOutcome::failed);
+        auto reused = session->generate("new unscheduled request");
+        REQUIRE(reused.ok());
+        CHECK(reused->outcome == RequestOutcome::completed);
+        CHECK_FALSE(reused->scheduling.scheduled);
+        CHECK(calls == throw_at);
+    }
+}
+
 }

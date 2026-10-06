@@ -330,6 +330,83 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     request.prompt = prompt;
     request.sampling = sampling;
 
+    // Prepare failure recovery before publishing running. No cleanup action
+    // can replace an exception from a public C++ callback.
+    TelemetryBus& bus = engine_.telemetry();
+    const auto ctx = telemetry_context(request.request_id);
+    detail::RequestRuntime* runtime = engine_.request_runtime();
+    std::optional<std::uint64_t> sched_id;
+    bool finish_attempted = false;
+    bool terminal_attempted = false;
+    GenerationResult result;
+    std::uint64_t delivered = 0;
+    auto t_start = std::chrono::steady_clock::now();
+    const auto recover_request = [&]() noexcept {
+        if (sched_id && !finish_attempted) {
+            finish_attempted = true;  // finish can itself throw: never retry it.
+            try {
+                const detail::RuntimeRequestSummary sched = runtime->finish(*sched_id, RequestOutcome::failed);
+                result.scheduling.preemptions = sched.preemptions;
+                result.scheduling.queue_ms = request_options.admission_queue_ms + sched.queue_ms;
+                result.scheduling.reused_prompt_tokens = sched.reused_prompt_tokens;
+            } catch (...) {
+                // Preserve the original exception. Partial runtime cleanup is
+                // not an allocator/backend exception-safety guarantee.
+            }
+        }
+        try {
+            if (!terminal_attempted) {
+                terminal_attempted = true;
+                if (request_options.admission) result.scheduling.queue_ms = request_options.admission->queue_ms();
+                json::Object failed{{"outcome", "failed"},
+                                    {"stop_reason", to_string(result.stats.stop_reason)},
+                                    {"prompt_tokens", result.stats.prompt_tokens},
+                                    {"completion_tokens", result.stats.completion_tokens},
+                                    {"chunks", delivered},
+                                    {"token_counts_from_backend", result.stats.token_counts_from_backend},
+                                    {"ttft_ms", result.ttft_ms},
+                                    {"total_ms", ms_between(t_start, std::chrono::steady_clock::now())},
+                                    {"scheduled", result.scheduling.scheduled},
+                                    {"sampler", result.scheduling.sonder_sampled ? "sonder" : "backend"},
+                                    {"error_code", to_string(ErrorCode::internal)},
+                                    {"error", "request aborted by exception"}};
+                if (sched_id) {
+                    failed.set("queue_ms", result.scheduling.queue_ms);
+                    failed.set("preemptions", result.scheduling.preemptions);
+                    failed.set("accounted_prompt_tokens", result.scheduling.accounted_prompt_tokens);
+                    failed.set("reused_prompt_tokens", result.scheduling.reused_prompt_tokens);
+                }
+                if (request_options.parent_request_id) {
+                    failed.set("parent_request_id", *request_options.parent_request_id);
+                }
+                if (request_options.priority_class) {
+                    failed.set("priority_class", to_string(*request_options.priority_class));
+                    failed.set("admission", json::Object{{"priority", to_string(*request_options.priority_class)},
+                                                         {"queue_ms", result.scheduling.queue_ms}});
+                }
+                bus.emit("request.failed", ctx, std::move(failed), TelemetryLevel::metrics);
+            }
+        } catch (...) {
+            // Telemetry is best effort and never contains exception text.
+        }
+        try {
+            std::lock_guard<std::mutex> lock(mutex_);
+            active_cancel_.reset();
+            cancel_requested_ns_.store(0);
+            last_outcome_ = RequestOutcome::failed;
+            last_scheduler_rejected_ = false;
+            if (state_ == SessionState::running) state_ = SessionState::idle;
+        } catch (...) {
+            // A mutex failure must not mask the original exception either.
+            // Recovery from synchronization failure is outside this contract.
+        }
+    };
+    struct RequestFailureGuard {
+        const decltype(recover_request)& recover;
+        bool armed = false;
+        ~RequestFailureGuard() noexcept { if (armed) recover(); }
+    } failure_guard{recover_request};
+
     CancellationToken token;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -339,15 +416,14 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         if (state_ == SessionState::running) {
             return Status(ErrorCode::invalid_state, "session already has a request in flight");
         }
-        state_ = SessionState::running;
-        active_cancel_.emplace();
+        active_cancel_.emplace();  // Allocation may throw while still idle.
         token = active_cancel_->token();
+        state_ = SessionState::running;
         cancel_requested_ns_.store(0);
         ++requests_started_;
+        failure_guard.armed = true;
     }
 
-    TelemetryBus& bus = engine_.telemetry();
-    const auto ctx = telemetry_context(request.request_id);
     const bool emit_tokens = bus.enabled(TelemetryLevel::standard);
     const bool capture_text = bus.options().capture_text;
     BackendModel& backend_model = model_->backend_model();
@@ -382,9 +458,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                  with_parent(with_admission(std::move(queued), request_options.admission_queue_ms)),
                  TelemetryLevel::metrics);
     }
-    const auto t_start = std::chrono::steady_clock::now();
-
-    GenerationResult result;
+    t_start = std::chrono::steady_clock::now();
     result.request_id = request.request_id;
     result.scheduling.queue_ms = request_options.admission_queue_ms;
     Status failure;
@@ -411,8 +485,6 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     result.scheduling.sonder_sampled = stream != nullptr;
 
     // Scheduling: the request enters the scheduler queue and holds KV blocks.
-    detail::RequestRuntime* runtime = engine_.request_runtime();
-    std::optional<std::uint64_t> sched_id;
     // Per-chunk grants pace an in-process backend's decode; a remote process
     // batches on its own, so by default it is only admitted and accounted.
     const SchedulerMode mode = engine_.scheduling_options().mode;
@@ -500,7 +572,6 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
 
     std::chrono::steady_clock::time_point t_first{};
     bool have_first = false;
-    std::uint64_t delivered = 0;
 
     // Telemetry + user callback for one visible chunk (not gated).
     const auto deliver = [&](const TokenChunk& chunk, std::optional<TokenId> token_id, float probability) -> bool {
@@ -665,6 +736,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     result.outcome = outcome;
 
     if (sched_id) {
+        finish_attempted = true;
         const detail::RuntimeRequestSummary sched = runtime->finish(*sched_id, outcome);
         result.scheduling.preemptions = sched.preemptions;
         result.scheduling.queue_ms = request_options.admission_queue_ms + sched.queue_ms;
@@ -734,11 +806,13 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
             dec.set("backend_prompt_eval_ms", static_cast<double>(result.stats.prompt_eval_ns) / 1e6);
         }
         bus.emit("inference.decode.completed", ctx, std::move(dec), TelemetryLevel::metrics);
+        terminal_attempted = true;
         bus.emit("request.completed", ctx, with_parent(std::move(summary)), TelemetryLevel::metrics);
     } else if (outcome == RequestOutcome::cancelled) {
         if (cancel_ns != 0 && now_ns >= cancel_ns) {
             summary.set("cancel_latency_ms", static_cast<double>(now_ns - cancel_ns) / 1e6);
         }
+        terminal_attempted = true;
         bus.emit("request.cancelled", ctx, with_parent(std::move(summary)), TelemetryLevel::metrics);
     } else {
         summary.set("error_code", to_string(failure.code()));
@@ -746,12 +820,14 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         if (scheduler_rejected) {
             summary.set("scheduler_rejected", true);
         }
+        terminal_attempted = true;
         bus.emit("request.failed", ctx, with_parent(std::move(summary)), TelemetryLevel::metrics);
     }
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
         active_cancel_.reset();
+        cancel_requested_ns_.store(0);
         last_outcome_ = outcome;
         last_scheduler_rejected_ = outcome == RequestOutcome::failed && scheduler_rejected;
         if (state_ == SessionState::running) {
@@ -759,6 +835,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         }
     }
 
+    failure_guard.armed = false;
     if (outcome == RequestOutcome::failed) {
         return failure;
     }
