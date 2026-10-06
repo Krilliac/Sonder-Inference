@@ -78,6 +78,7 @@ class FakeLlamaServer {
             }
             const auto payload = body_;
             const auto initial_delay = initial_delay_;
+            const bool held_prefill = hold_prefill_;
             if (nonstream) {
                 r.set_content(nonstream_body_.empty() ?
                                   R"({"choices":[{"finish_reason":"stop"}],"timings":{"prompt_n":3,"cache_n":9}})" :
@@ -86,7 +87,30 @@ class FakeLlamaServer {
                 return;
             }
             r.set_chunked_content_provider("text/event-stream",
-                                           [this, payload, initial_delay](std::size_t, httplib::DataSink &sink) {
+                                           [this, payload, initial_delay, held_prefill](std::size_t, httplib::DataSink &sink) {
+                                               if (held_prefill) {
+                                                   // The provider runs only after headers and httplib's
+                                                   // peer check. Request-body publication is too early
+                                                   // to establish this cancellation observation point.
+                                                   std::unique_lock lock(mu_);
+                                                   ++prefill_entries_;
+                                                   changed_.notify_all();
+                                                   if (!changed_.wait_for(lock, std::chrono::seconds(3),
+                                                                         [this] { return !hold_prefill_; }))
+                                                       return false;
+                                                   lock.unlock();
+                                                   // Probe before the payload: a live control must stay
+                                                   // connected throughout this same bounded window.
+                                                   // Only a peer check/write failure counts as closure;
+                                                   // gate timeout and provider completion never do.
+                                                   for (int i = 0; i < 100; ++i) {
+                                                       if (!sink.is_writable() || !sink.write("\n", 1)) {
+                                                           disconnects_.fetch_add(1);
+                                                           return false;
+                                                       }
+                                                       std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                                                   }
+                                               }
                                                if (initial_delay.count() > 0)
                                                    std::this_thread::sleep_for(initial_delay);
                                                const std::size_t step = payload.size() > 4096 ? 4093 : 7;
@@ -140,6 +164,7 @@ class FakeLlamaServer {
         // joining its listener thread; otherwise a cancellation test can
         // leave the handler waiting forever while the destructor joins.
         hold_nonstream(false);
+        hold_prefill(false);
         svr_.stop();
         if (thread_.joinable())
             thread_.join();
@@ -221,6 +246,21 @@ class FakeLlamaServer {
         return changed_.wait_for(lock, std::chrono::seconds(3),
                                  [&] { return nonstream_bodies_.size() >= count; });
     }
+    void hold_prefill(bool hold = true) {
+        std::lock_guard<std::mutex> lock(mu_);
+        hold_prefill_ = hold;
+        if (!hold)
+            changed_.notify_all();
+    }
+    bool wait_for_prefill(std::size_t count) const {
+        std::unique_lock lock(mu_);
+        return changed_.wait_for(lock, std::chrono::seconds(3),
+                                 [&] { return prefill_entries_ >= count; });
+    }
+    unsigned prefill_entries() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return prefill_entries_;
+    }
 
   private:
     httplib::Server svr_;
@@ -234,6 +274,8 @@ class FakeLlamaServer {
     std::vector<std::string> nonstream_bodies_;
     mutable std::condition_variable changed_;
     bool hold_nonstream_ = false;
+    bool hold_prefill_ = false;
+    unsigned prefill_entries_ = 0;
     std::string props_;
     unsigned props_requests_ = 0;
     std::string metrics_body_;

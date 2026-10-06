@@ -343,3 +343,44 @@ cost retains 2,048 raw measurements across both binaries; observed candidate
 p95 times increased, so no speedup or production overhead bound is claimed.
 See the integration document for exact receipts, timings and supported limits.
 Publication still follows required checks on the exact public revision.
+
+## llama-server prefill cancellation observation
+
+Test-only scope: `src/backends/llamaserver/tests/fake_server.hpp` and
+`test_backend.cpp`; this integration note is the only cross-module change.
+The fake's request-body publication precedes response headers and httplib's
+provider admission. Cancelling at that point can bypass its write-based
+disconnect observer. A bounded provider-entry barrier now establishes that
+headers have been sent, holds token payload until cancelled generation has
+returned, and then observes peer closure through the actual sink peer/write
+checks. Gate timeout and normal provider completion never count as closure.
+
+Controls cover a live held peer and pre-cancelled generation, plus twenty
+serial and sixteen requests across two joined workers with alternating
+scheduling yields. Assertions run after joins and check cancelled status,
+zero token callbacks and exactly one observed closure per cancelled request.
+The existing three-second entry wait and one-second observation window remain
+bounded. Production transport/backend code, privacy, batching, cursor,
+recovery and rollback contracts are unchanged. This repairs an observer blind
+spot; the precise branch taken in the earlier main ASan failure is unknown.
+Native and hosted qualification are pending; loopback fake traffic provides
+no provider/model quality or throughput evidence.
+
+Subsequent local qualification on 2026-10-06 passed the offline GCC 14 Linux
+Debug configure, build, discovery, focused controls, full CTest and diff gates.
+All three new controls passed in 3.52 seconds; all 962 native tests passed with
+zero failures, errors or native CTest skips in 70.91 seconds. The repetition
+case passed 180 assertions in each focused/full invocation, and the retained
+case passed five: 73 synthetic cancellation observations total. Supervisor
+cleanup reached ECHILD without cleanup signals; deliberate fixture child
+statuses remain recorded. Old source/build/raw scopes and cached dependencies
+were preserved. Independent source and completed native data reviews passed.
+
+Native qualification SHA-256:
+`33c49b611e43e89c0d2316fd9e05faf624ecb0c2a0ec16ed952d6eb24c3c92fc`.
+Independent data review SHA-256:
+`d78df41e2ac86ed809b74563568a0f8a0d098bd2241dd2d1508bf53068490fcd`.
+The tested code is a frozen uncommitted overlay on `d8d02d3ae8d5`; its build
+stamp remains that base, with TLS and llama.cpp disabled. This later notes
+append does not restamp those executions as a published revision build.
+Hosted checks and merging still require the exact final public revision.

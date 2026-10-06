@@ -1,6 +1,8 @@
 #include <doctest/doctest.h>
 
+#include <array>
 #include <chrono>
+#include <exception>
 #include <limits>
 #include <string>
 #include <thread>
@@ -15,6 +17,67 @@
 #endif
 
 using namespace sonder::inference;
+
+namespace {
+struct PrefillCancellationObservation {
+    bool loaded = false;
+    bool entered = false;
+    ErrorCode status = ErrorCode::internal;
+    unsigned callbacks = 0;
+    unsigned disconnects = 0;
+};
+
+PrefillCancellationObservation observe_prefill_cancellation(bool yield_before_cancel) {
+    PrefillCancellationObservation observation;
+    sonder_test::FakeLlamaServer server;
+    server.set_body("data: {\"choices\":[{\"text\":\"x\",\"finish_reason\":\"stop\"}]}\n\n"
+                    "data: [DONE]\n\n");
+    server.hold_prefill();
+    LlamaServerBackendOptions options;
+    options.base_url = server.url();
+    options.native_completion = false;
+    auto model = make_llamaserver_backend(options)->load_model({"fake-model", "cpu:0"});
+    observation.loaded = model.ok();
+    if (!observation.loaded)
+        return observation;
+    CancellationSource source;
+    std::exception_ptr canceller_error;
+    std::jthread canceller([&] {
+        try {
+            observation.entered = server.wait_for_prefill(1);
+            if (yield_before_cancel)
+                std::this_thread::yield();
+        } catch (...) {
+            canceller_error = std::current_exception();
+        }
+        source.cancel();
+    });
+    auto result = model.value()->generate(GenerateRequest{"", "x", {}}, source.token(),
+                                         [&](const TokenChunk &) {
+                                             ++observation.callbacks;
+                                             return true;
+                                         });
+    canceller.join();
+    observation.status = result.status().code();
+    // generate() has returned and destroyed its transport socket before the
+    // fake provider resumes. No token payload was available before cancellation.
+    server.hold_prefill(false);
+    for (int i = 0; i < 100 && server.disconnects() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    observation.disconnects = server.disconnects();
+    if (canceller_error)
+        std::rethrow_exception(canceller_error);
+    return observation;
+}
+
+void check_prefill_cancellation(const PrefillCancellationObservation &observation) {
+    CHECK(observation.loaded);
+    CHECK(observation.entered);
+    CHECK(observation.status == ErrorCode::cancelled);
+    CHECK(observation.callbacks == 0);
+    CHECK(observation.disconnects == 1);
+}
+} // namespace
 
 TEST_SUITE("llamaserver_backend") {
 
@@ -369,9 +432,39 @@ TEST_SUITE("llamaserver_backend") {
     }
 
     TEST_CASE("cancellation during upstream prefill closes the response") {
+        check_prefill_cancellation(observe_prefill_cancellation(false));
+    }
+
+    TEST_CASE("prefill cancellation closes responses under serial and parallel repetition") {
+        for (int i = 0; i < 20; ++i)
+            check_prefill_cancellation(observe_prefill_cancellation(i % 2 != 0));
+        std::array<std::array<PrefillCancellationObservation, 8>, 2> observations{};
+        std::array<std::exception_ptr, 2> worker_errors{};
+        std::array<std::jthread, 2> workers;
+        for (std::size_t worker = 0; worker < workers.size(); ++worker)
+            workers[worker] = std::jthread([&, worker] {
+                try {
+                    for (std::size_t i = 0; i < observations[worker].size(); ++i)
+                        observations[worker][i] = observe_prefill_cancellation(i % 2 != 0);
+                } catch (...) {
+                    worker_errors[worker] = std::current_exception();
+                }
+            });
+        for (auto &worker : workers)
+            worker.join();
+        for (const auto &error : worker_errors)
+            if (error)
+                std::rethrow_exception(error);
+        for (const auto &worker : observations)
+            for (const auto &observation : worker)
+                check_prefill_cancellation(observation);
+    }
+
+    TEST_CASE("held prefill observes a live peer without reporting cancellation") {
         sonder_test::FakeLlamaServer server;
-        server.set_body("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n");
-        server.set_initial_delay(std::chrono::milliseconds(300));
+        server.set_body("data: {\"choices\":[{\"text\":\"x\",\"finish_reason\":\"stop\"}]}\n\n"
+                        "data: [DONE]\n\n");
+        server.hold_prefill();
         LlamaServerBackendOptions o;
         o.base_url = server.url();
         o.native_completion = false;
@@ -380,20 +473,53 @@ TEST_SUITE("llamaserver_backend") {
         REQUIRE(m.ok());
         GenerateRequest q;
         q.prompt = "x";
-        CancellationSource source;
-        std::thread canceller([&] {
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-            while (server.bodies().empty() && std::chrono::steady_clock::now() < deadline)
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            source.cancel();
+        bool succeeded = false;
+        std::string text;
+        std::exception_ptr client_error;
+        std::jthread client([&] {
+            try {
+                succeeded = m.value()->generate(q, {}, [&](const TokenChunk &chunk) {
+                    text += chunk.text;
+                    return true;
+                }).ok();
+            } catch (...) {
+                client_error = std::current_exception();
+            }
         });
-        auto result = m.value()->generate(q, source.token(), {});
-        canceller.join();
-        REQUIRE(!server.bodies().empty());
-        REQUIRE(result.status().code() == ErrorCode::cancelled);
-        for (int i = 0; i < 100 && server.disconnects() == 0; ++i)
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        CHECK(server.disconnects() > 0);
+        const bool entered = server.wait_for_prefill(1);
+        const auto disconnects_before_release = server.disconnects();
+        server.hold_prefill(false);
+        client.join();
+        if (client_error)
+            std::rethrow_exception(client_error);
+        CHECK(entered);
+        CHECK(disconnects_before_release == 0);
+        CHECK(server.disconnects() == 0);
+        CHECK(succeeded);
+        CHECK(text == "x");
+    }
+
+    TEST_CASE("pre-cancelled generation never enters held prefill") {
+        sonder_test::FakeLlamaServer server;
+        server.hold_prefill();
+        LlamaServerBackendOptions options;
+        options.base_url = server.url();
+        options.native_completion = false;
+        auto model = make_llamaserver_backend(options)->load_model({"fake-model", "cpu:0"});
+        REQUIRE(model.ok());
+        CancellationSource source;
+        source.cancel();
+        unsigned callbacks = 0;
+        auto result = model.value()->generate(GenerateRequest{"", "x", {}}, source.token(),
+                                             [&](const TokenChunk &) {
+                                                 ++callbacks;
+                                                 return true;
+                                             });
+        CHECK(result.status().code() == ErrorCode::cancelled);
+        CHECK(callbacks == 0);
+        CHECK(server.bodies().empty());
+        CHECK(server.prefill_entries() == 0);
+        CHECK(server.disconnects() == 0);
     }
 
     TEST_CASE("malformed trailing and oversized SSE frames fail closed") {
