@@ -5,6 +5,8 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <memory>
+#include <stdexcept>
 #include <sstream>
 #include <string>
 
@@ -363,6 +365,42 @@ TEST_CASE("C ABI session metadata validates size and bounded identifiers without
     sonder_session_destroy(session);
     sonder_model_release(model);
     sonder_engine_destroy(engine);
+}
+
+TEST_CASE("C ABI contains a C++ token callback exception and permits session reuse") {
+    sonder_engine_options eo;
+    sonder_engine_options_init(&eo);
+    eo.telemetry_level = SONDER_TELEMETRY_OFF;
+    sonder_engine* raw_engine = nullptr;
+    REQUIRE(sonder_engine_create(&eo, &raw_engine) == SONDER_OK);
+    const std::unique_ptr<sonder_engine, decltype(&sonder_engine_destroy)> engine(raw_engine, &sonder_engine_destroy);
+    REQUIRE(sonder_engine_register_mock_backend(engine.get()) == SONDER_OK);
+    sonder_model* raw_model = nullptr;
+    REQUIRE(sonder_model_load(engine.get(), "mock", "mock:tiny", &raw_model) == SONDER_OK);
+    const std::unique_ptr<sonder_model, decltype(&sonder_model_release)> model(raw_model, &sonder_model_release);
+    sonder_sampling_config cfg;
+    sonder_sampling_config_init(&cfg);
+    cfg.temperature = 0.0f;
+    cfg.max_tokens = 4;
+    sonder_session* raw_session = nullptr;
+    REQUIRE(sonder_session_create(engine.get(), model.get(), &cfg, &raw_session) == SONDER_OK);
+    const std::unique_ptr<sonder_session, decltype(&sonder_session_destroy)> session(raw_session, &sonder_session_destroy);
+    int calls = 0;
+    const auto throwing = [](void* user, const char*, size_t) -> int {
+        ++*static_cast<int*>(user);
+        throw std::runtime_error("C++ callback failure");
+    };
+    sonder_generation_stats stats{};
+    stats.struct_size = sizeof(stats);
+    sonder_status status = SONDER_OK;
+    CHECK_NOTHROW(status = sonder_session_generate(session.get(), "callback exception", throwing, &calls, &stats));
+    CHECK(status == SONDER_ERROR_INTERNAL);
+    CHECK(calls == 1);
+    Count count;
+    REQUIRE(sonder_session_generate(session.get(), "immediate reuse", on_token, &count, &stats) == SONDER_OK);
+    CHECK(stats.outcome == SONDER_OUTCOME_COMPLETED);
+    CHECK(count.chunks == 4);
+    CHECK(calls == 1);
 }
 
 }

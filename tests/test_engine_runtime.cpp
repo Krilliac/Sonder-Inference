@@ -6,6 +6,8 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <future>
+#include <stdexcept>
 #include <initializer_list>
 #include <limits>
 #include <memory>
@@ -15,11 +17,32 @@
 #include <vector>
 
 #include "sonder/inference.hpp"
+#include "engine/request_runtime.hpp"
 
 using namespace sonder::inference;
 using namespace std::chrono_literals;
 
 namespace {
+
+template <class Marker>
+[[noreturn]] void throw_callback_marker(Marker marker, const void*& address) {
+    try {
+        throw marker;
+    } catch (const Marker& caught) {
+        address = &caught;
+        throw;  // Rethrow the actual live exception object, without capture/copy.
+    }
+}
+
+// Synthetic host ticket: a known queue observation distinct from the outer hint.
+class FixedCallbackQueue final : public RequestAdmission {
+public:
+    bool ready() const override { return true; }
+    std::uint64_t order() const noexcept override { return 0; }
+    bool try_acquire() override { return true; }
+    Status wait(const CancellationToken&) override { return Status::success(); }
+    double queue_ms() const override { return 41.25; }
+};
 
 struct Rig {
     std::shared_ptr<MemoryTelemetrySink> sink = std::make_shared<MemoryTelemetrySink>();
@@ -141,6 +164,129 @@ template <typename Pred>
 
 TEST_SUITE("engine_runtime") {
 #if defined(SONDER_HAS_KV_CACHE) && defined(SONDER_HAS_SCHEDULER)
+
+
+TEST_CASE("callback exceptions release scheduled requests across modes and routes") {
+    for (const auto mode : {SchedulerMode::gate, SchedulerMode::account}) {
+        for (const bool token_logits : {false, true}) {
+            for (const int route : {0, 1, 2}) {
+                for (const int throw_at : {1, 3}) {
+                    CAPTURE(mode);
+                    CAPTURE(token_logits);
+                    CAPTURE(route);
+                    CAPTURE(throw_at);
+                    MockBackendOptions mock;
+                    mock.token_logits = token_logits;
+                    mock.default_completion_tokens = 8;
+                    SchedulingOptions sched;
+                    sched.mode = mode;
+                    sched.kv_block_size_tokens = 4;
+                    Rig rig(mock, sched);
+                    REQUIRE(rig.model);
+                    if (route == 2) {
+                        auto impl = std::make_shared<ArchitectureModel>(rig.model, ModelArchitecture::attention_only, true);
+                        rig.model = std::make_shared<Model>("callback-native-chat", kMockBackendName, "cpu:0", impl);
+                    }
+                    auto session = rig.session(SamplingConfig::greedy(5));
+                    REQUIRE(session);
+                    REQUIRE(rig.engine->request_runtime());
+                    const void* thrown = nullptr;
+                    RequestOptions options;
+                    options.request_id = "scheduled-callback-failure";
+                    options.admission_queue_ms = 3.75;
+                    options.priority_class = RequestPriority::subagent;
+                    options.admission = std::make_shared<FixedCallbackQueue>();
+                    int calls = 0;
+                    bool caught = false;
+                    const TokenCallback callback = [&](const TokenChunk&) {
+                        if (++calls == throw_at) throw_callback_marker(std::runtime_error("runtime-private-canary"), thrown);
+                        return true;
+                    };
+                    try {
+                        if (route == 0) (void)session->generate(words(7, "callback"), callback, std::nullopt, options);
+                        else (void)session->chat({{"user", words(7, "callback")}}, callback, std::nullopt, options);
+                    } catch (const std::runtime_error& error) {
+                        caught = true;
+                        CHECK(static_cast<const void*>(&error) == thrown);
+                        CHECK(std::string(error.what()) == "runtime-private-canary");
+                    }
+                    CHECK(caught);
+                    CHECK(calls == throw_at);
+                    CHECK(session->state() == SessionState::idle);
+                    CHECK(session->last_outcome() == RequestOutcome::failed);
+                    CHECK(rig.engine->kv_usage().sequences == 0);
+                    CHECK(rig.engine->kv_usage().pinned_blocks == 0);
+                    CHECK(rig.engine->request_runtime()->tracked_requests() == 0);
+                    const auto freed = rig.events_of("kv.freed");
+                    REQUIRE(freed.size() == 1);  // One reservation release, no finish replay.
+                    if (mode == SchedulerMode::gate) CHECK(attr_str(freed[0], "reason") == "failed");
+                    // Account mode may already have freed the logical prefill.
+                    const auto failed = rig.events_of("request.failed");
+                    REQUIRE(failed.size() == 1);
+                    const auto* attributes = failed[0].find("attributes");
+                    REQUIRE(attributes);
+                    CHECK(attributes->find("queue_ms")->as_double() == doctest::Approx(41.25));
+                    REQUIRE(attributes->find("admission"));
+                    CHECK(attributes->find("admission")->find("queue_ms")->as_double() == doctest::Approx(41.25));
+                    for (const auto& line : rig.sink->lines()) CHECK(line.find("runtime-private-canary") == std::string::npos);
+                    auto reused = session->generate("after exception");
+                    REQUIRE(reused.ok());
+                    CHECK(reused->outcome == RequestOutcome::completed);
+                    CHECK(calls == throw_at);
+                    CHECK(wait_for([&] { return rig.engine->request_runtime()->tracked_requests() == 0; }));
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("one callback exception does not cancel an independent session") {
+    Rig rig({}, {});
+    REQUIRE(rig.model);
+    auto failing = rig.session(SamplingConfig::greedy(4));
+    auto healthy = rig.session(SamplingConfig::greedy(4));
+    REQUIRE(failing);
+    REQUIRE(healthy);
+    std::promise<void> entered;
+    auto entered_future = entered.get_future();
+    std::promise<void> release;
+    const auto released = release.get_future().share();
+    const void* thrown = nullptr;
+    bool observed_same = false;
+    int failed_calls = 0;
+    std::jthread worker([&] {
+        try {
+            (void)failing->generate("held callback", [&](const TokenChunk&) -> bool {
+                ++failed_calls;
+                entered.set_value();
+                if (released.wait_for(5s) != std::future_status::ready) throw std::runtime_error("test release timeout");
+                throw_callback_marker(std::runtime_error("parallel-private-canary"), thrown);
+            });
+        } catch (const std::runtime_error& error) {
+            observed_same = static_cast<const void*>(&error) == thrown
+                            && std::string(error.what()) == "parallel-private-canary";
+        }
+    });
+    const bool started = entered_future.wait_for(5s) == std::future_status::ready;
+    std::optional<Result<GenerationResult>> good;
+    if (started) good.emplace(healthy->generate("independent request"));
+    release.set_value();
+    worker.join();
+    REQUIRE(started);
+    CHECK(observed_same);
+    CHECK(failed_calls == 1);
+    REQUIRE(good);
+    REQUIRE(good->ok());
+    CHECK(good->value().outcome == RequestOutcome::completed);
+    CHECK(failing->state() == SessionState::idle);
+    CHECK(failing->last_outcome() == RequestOutcome::failed);
+    CHECK(healthy->state() == SessionState::idle);
+    CHECK(healthy->last_outcome() == RequestOutcome::completed);
+    CHECK(wait_for([&] { return rig.engine->request_runtime()->tracked_requests() == 0; }));
+    CHECK(rig.engine->kv_usage().sequences == 0);
+    CHECK(rig.engine->kv_usage().pinned_blocks == 0);
+    REQUIRE(failing->generate("reused independent session").ok());
+}
 
 TEST_CASE("scheduling is active by default and can be disabled") {
     Rig on({}, {});

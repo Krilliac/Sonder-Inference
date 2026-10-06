@@ -320,3 +320,26 @@ This slice does not replace the separately retained callback-exception
 rollback candidate or merged Python close synchronization. Root integration
 owns application, exact-revision qualification and publication; no new lane
 ownership or live model qualification is claimed here.
+
+## C++ token callback exception lifecycle recovery
+
+Provisional sessions scope: `src/sessions/session.cpp`. Cross-area integrator
+changes are the public comment in `include/sonder/inference/session.hpp`,
+controls in existing `tests/test_session.cpp`, `tests/test_engine_runtime.cpp`
+and `tests/test_c_api.cpp`, and the additive
+`docs/integration/request-callback-exceptions.md`. No root CMake, C ABI layout,
+backend execution, scheduler/cache policy or Python changes are needed.
+
+This follows the separately retained callback recovery audit after the merged
+GGUF header observation slice. It clears internal request latches on ordinary
+callback exceptions and attempts acquired-id finalization once, preserving
+closed state and the original exception. It does not replay delivered effects,
+change Runtime journal/rollback ownership, or claim allocator/backend recovery.
+The isolated Linux Debug build and all 945 native tests passed, including the
+six new recovery cases. A separate mock driver reproduced two baseline defects
+and completed 512 concurrent failure/reuse pairs plus two closed controls, with
+once-only terminal/release evidence and zero final logical resources. Normal
+cost retains 2,048 raw measurements across both binaries; observed candidate
+p95 times increased, so no speedup or production overhead bound is claimed.
+See the integration document for exact receipts, timings and supported limits.
+Publication still follows required checks on the exact public revision.
