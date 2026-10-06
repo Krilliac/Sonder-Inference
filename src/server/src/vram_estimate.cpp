@@ -8,11 +8,14 @@
 #include <istream>
 #include <limits>
 #include <sstream>
+#include <streambuf>
 #include <string>
 #include <string_view>
 #include <type_traits>
 
 #include "sonder/inference/launch_profile.hpp"
+#include "gguf_artifact_observation.hpp"
+#include "sha256.hpp"
 
 #if defined(_WIN32)
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -133,15 +136,113 @@ bool ggml_type_size(std::uint32_t type, std::uint64_t& block_elems, std::uint64_
     return false;
 }
 
+// Optional observation state: ordinary header readers retain their original
+// istream behavior. Direct streambuf reads permit positive short transfers
+// without istream::read incorrectly treating every short transfer as EOF.
+class ObservationReader {
+public:
+    ObservationReader(std::istream& input, const server::detail::GgufObservationOptions& options,
+                      CancellationToken cancel)
+        : input_(input), buffer_(input.rdbuf()), options_(options), cancel_(std::move(cancel)) {}
+
+    bool poll() {
+        if (code_ != ErrorCode::ok) return false;
+        if (cancel_.cancelled()) return fail(ErrorCode::cancelled, "GGUF observation cancelled");
+        if (std::chrono::steady_clock::now() >= options_.deadline) {
+            return fail(ErrorCode::timeout, "GGUF observation deadline expired");
+        }
+        if (!input_.good() || !buffer_ || input_.rdbuf() != buffer_) {
+            return fail(ErrorCode::io_error, "GGUF observation input failure");
+        }
+        return true;
+    }
+    bool header_allow(std::uint64_t n) {
+        if (!poll()) return false;
+        if (n > options_.max_header_bytes - total_) {
+            return fail(ErrorCode::invalid_argument, "GGUF observation header budget exceeded");
+        }
+        if (n >= options_.max_read_bytes - total_) {
+            return fail(ErrorCode::invalid_argument, "GGUF observation read budget reached");
+        }
+        return true;
+    }
+    std::size_t read(char* out, std::size_t n) {
+        std::size_t done = 0;
+        while (done < n && !eof_ && poll()) {
+            const auto step = static_cast<std::streamsize>(std::min<std::uint64_t>(
+                std::min(n - done, options_.read_chunk_bytes), options_.max_read_bytes - total_));
+            try {
+                if (!input_.good() || !input_.rdbuf()) {
+                    fail(ErrorCode::io_error, "GGUF observation input failure");
+                    break;
+                }
+                const auto got = buffer_->sgetn(out + done, step);
+                if (got < 0 || got > step || !input_.good() || input_.rdbuf() != buffer_) {
+                    fail(ErrorCode::io_error, "GGUF observation input failure");
+                    break;
+                }
+                if (got == 0) {
+                    // A zero transfer with data still available is failure,
+                    // never an unbounded retry. This may cause source prefetch.
+                    const auto next = buffer_->sgetc();
+                    if (!input_.good() || input_.rdbuf() != buffer_ || next != std::char_traits<char>::eof()) {
+                        fail(ErrorCode::io_error, "GGUF observation input made no progress");
+                    } else {
+                        eof_ = true;
+                    }
+                    poll();
+                    break;
+                }
+                hash_.update(std::string_view(out + done, static_cast<std::size_t>(got)));
+                done += static_cast<std::size_t>(got);
+                total_ += static_cast<std::uint64_t>(got);
+                if (total_ == options_.max_read_bytes) {
+                    fail(ErrorCode::invalid_argument, "GGUF observation read budget reached");
+                }
+            } catch (const std::bad_alloc&) {
+                throw;
+            } catch (...) {
+                fail(ErrorCode::io_error, "GGUF observation input failure");
+            }
+            if (!poll()) break;
+        }
+        return done;
+    }
+    Status status() const { return {code_, message_}; }
+    std::uint64_t total() const { return total_; }
+    bool eof() const { return eof_; }
+    server::detail::Sha256& hash() { return hash_; }
+
+private:
+    bool fail(ErrorCode code, const char* message) {
+        if (code_ == ErrorCode::ok) { code_ = code; message_ = message; }
+        return false;
+    }
+    std::istream& input_;
+    std::streambuf* const buffer_;
+    const server::detail::GgufObservationOptions options_;
+    CancellationToken cancel_;
+    server::detail::Sha256 hash_;
+    std::uint64_t total_ = 0;
+    bool eof_ = false;
+    ErrorCode code_ = ErrorCode::ok;
+    const char* message_ = "";
+};
+
 class Cursor {
 public:
-    explicit Cursor(std::istream& in) : in_(in) {}
+    explicit Cursor(std::istream& in, ObservationReader* observer = nullptr) : in_(in), observer_(observer) {}
+
+    bool poll() { return !observer_ || observer_->poll(); }
+    bool allow(std::uint64_t n) { return !observer_ || observer_->header_allow(n); }
 
     bool bytes(void* out, std::size_t n) {
+        if (observer_) return allow(n) && observer_->read(static_cast<char*>(out), n) == n && poll();
         in_.read(static_cast<char*>(out), static_cast<std::streamsize>(n));
         return static_cast<std::size_t>(in_.gcount()) == n;
     }
     bool skip(std::uint64_t n) {
+        if (!allow(n)) return false;
         char buf[4096];
         while (n > 0) {
             const std::size_t step = static_cast<std::size_t>(std::min<std::uint64_t>(n, sizeof(buf)));
@@ -171,7 +272,7 @@ public:
     }
     bool string(std::string& out) {
         std::uint64_t n = 0;
-        if (!pod(n) || n > kMaxStringBytes) return false;
+        if (!pod(n) || n > kMaxStringBytes || !allow(n)) return false;
         out.resize(static_cast<std::size_t>(n));
         return n == 0 || bytes(out.data(), out.size());
     }
@@ -182,6 +283,7 @@ public:
 
 private:
     std::istream& in_;
+    ObservationReader* observer_;
 };
 
 std::uint64_t scalar_size(std::uint32_t type) {
@@ -248,7 +350,7 @@ bool expert_namespace(std::string_view architecture) {
 
 std::optional<RoutedExpertCounts> resolve_routed_experts(
     std::string_view architecture, std::size_t architecture_occurrences,
-    const std::vector<ExpertCountObservation>& observations) {
+    const std::vector<ExpertCountObservation>& observations, ObservationReader* observer = nullptr) {
     if (architecture_occurrences != 1 || !expert_namespace(architecture)) return std::nullopt;
     const std::string prefix = std::string(architecture) + ".";
     const std::string total_key = prefix + "expert_count";
@@ -258,6 +360,7 @@ std::optional<RoutedExpertCounts> resolve_routed_experts(
     std::optional<std::uint32_t> total;
     std::optional<std::uint32_t> active;
     for (const auto& observation : observations) {
+        if (observer && !observer->poll()) return std::nullopt;
         if (observation.key == total_key) {
             ++total_occurrences;
             total = observation.value;
@@ -339,7 +442,8 @@ constexpr SwaArchitecture kSwaArchitectures[] = {
 // info.architecture. `window` and `pattern` are <arch>.attention.sliding_window
 // and sliding_window_pattern (null when absent). Needs the final kv_heads and
 // nextn_layers.
-void resolve_sliding_window(GgufModelInfo& info, const Numbers* window, const Numbers* pattern) {
+void resolve_sliding_window(GgufModelInfo& info, const Numbers* window, const Numbers* pattern,
+                            ObservationReader* observer = nullptr) {
     const bool has_window = window && window->value >= 0;
     const std::uint64_t file_window = has_window ? static_cast<std::uint64_t>(window->value) : 0;
     const SwaArchitecture* arch = nullptr;
@@ -362,16 +466,24 @@ void resolve_sliding_window(GgufModelInfo& info, const Numbers* window, const Nu
     // A required key that is missing makes llama.cpp refuse the model, so
     // nothing is capped then either.
     if (!enabled || (!arch->window_fixed && !has_window && arch->window == 0)) return;
+    if (observer && !observer->poll()) return;
     std::vector<bool> swa(info.block_count, false);
     if (arch->attention_layers) {
-        for (std::uint32_t i = 0; i < n_layer; ++i) swa[i] = info.kv_heads[i] > 0;
+        for (std::uint32_t i = 0; i < n_layer; ++i) {
+            if (observer && !observer->poll()) return;
+            swa[i] = info.kv_heads[i] > 0;
+        }
     } else if (pattern && !pattern->per_layer.empty()) {
         // The per-layer array wins (get_arr); blocks past its end stay full.
-        for (std::size_t i = 0; i < swa.size() && i < pattern->per_layer.size(); ++i) swa[i] = pattern->per_layer[i] != 0;
+        for (std::size_t i = 0; i < swa.size() && i < pattern->per_layer.size(); ++i) {
+            if (observer && !observer->poll()) return;
+            swa[i] = pattern->per_layer[i] != 0;
+        }
     } else if (arch->period > 0) {
         // set_swa_pattern(n, dense_first); MTP blocks (past n_layer) stay full.
         const std::int64_t n = pattern && pattern->value >= 0 ? pattern->value : arch->period;
         for (std::uint32_t i = 0; i < n_layer; ++i) {
+            if (observer && !observer->poll()) return;
             swa[i] = n == 0 || (arch->dense_first ? i % n != 0 : i % n < n - 1);
         }
     } else {
@@ -382,8 +494,8 @@ void resolve_sliding_window(GgufModelInfo& info, const Numbers* window, const Nu
     info.sliding_window = (arch->window_fixed || !has_window) ? arch->window : file_window;
 }
 
-Result<GgufModelInfo> parse(std::istream& in) {
-    Cursor c(in);
+Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = nullptr) {
+    Cursor c(in, observer);
     char magic[4];
     if (!c.bytes(magic, 4) || std::memcmp(magic, "GGUF", 4) != 0) return malformed("not a GGUF file");
     std::uint32_t version = 0;
@@ -399,6 +511,7 @@ Result<GgufModelInfo> parse(std::istream& in) {
     std::size_t architecture_occurrences = 0;
     std::uint64_t token_count = 0;
     for (std::uint64_t i = 0; i < n_kv; ++i) {
+        if (!c.poll()) return malformed("observation interrupted");
         std::string key;
         std::uint32_t type = 0;
         if (!c.string(key) || !c.pod(type)) return malformed("truncated metadata");
@@ -466,10 +579,12 @@ Result<GgufModelInfo> parse(std::istream& in) {
         }
     }
     if (info.architecture.empty()) return malformed("general.architecture is missing");
-    info.routed_experts = resolve_routed_experts(info.architecture, architecture_occurrences, expert_observations);
+    if (!c.poll()) return malformed("observation interrupted");
+    info.routed_experts = resolve_routed_experts(info.architecture, architecture_occurrences, expert_observations, observer);
     const std::string a = info.architecture + ".";
     const auto number = [&](const std::string& key) -> const Numbers* {
         for (const auto& [k, n] : numbers) {
+            if (!c.poll()) return nullptr;
             if (k == key) return &n;
         }
         return nullptr;
@@ -492,9 +607,11 @@ Result<GgufModelInfo> parse(std::istream& in) {
         static_cast<std::uint64_t>(scalar(a + "attention.key_length_swa", static_cast<std::int64_t>(info.key_length)));
     info.value_length_swa =
         static_cast<std::uint64_t>(scalar(a + "attention.value_length_swa", static_cast<std::int64_t>(info.value_length)));
+    if (!c.poll()) return malformed("observation interrupted");
     info.kv_heads.assign(info.block_count, 0);
     if (const Numbers* kv = number(a + "attention.head_count_kv"); kv && !kv->per_layer.empty()) {
         for (std::size_t i = 0; i < info.kv_heads.size() && i < kv->per_layer.size(); ++i) {
+            if (!c.poll()) return malformed("observation interrupted");
             info.kv_heads[i] = static_cast<std::uint32_t>(std::max<std::int64_t>(0, kv->per_layer[i]));
         }
     } else {
@@ -519,11 +636,13 @@ Result<GgufModelInfo> parse(std::istream& in) {
     }
 
     // Tensor table.
+    if (!c.poll()) return malformed("observation interrupted");
     std::vector<bool> attention_tensor(info.block_count, false);
     bool any_attention_tensor = false;
     info.block_bytes.assign(info.block_count, 0);
     std::uint64_t output_vocab = 0;
     for (std::uint64_t t = 0; t < n_tensors; ++t) {
+        if (!c.poll()) return malformed("observation interrupted");
         std::string name;
         std::uint32_t dims = 0;
         if (!c.string(name) || !c.pod(dims) || dims == 0 || dims > 8) return malformed("truncated tensor table");
@@ -580,6 +699,7 @@ Result<GgufModelInfo> parse(std::istream& in) {
     if (!per_layer_heads && info.kind != ModelArchitecture::attention_only) {
         const std::int64_t interval = scalar(a + "full_attention_interval", 0);
         for (std::uint32_t i = 0; i < info.block_count; ++i) {
+            if (!c.poll()) return malformed("observation interrupted");
             bool attention = false;
             if (any_attention_tensor) {
                 attention = attention_tensor[i];
@@ -589,11 +709,63 @@ Result<GgufModelInfo> parse(std::istream& in) {
             if (!attention) info.kv_heads[i] = 0;
         }
     }
-    resolve_sliding_window(info, number(a + "attention.sliding_window"), number(a + "attention.sliding_window_pattern"));
+    resolve_sliding_window(info, number(a + "attention.sliding_window"), number(a + "attention.sliding_window_pattern"), observer);
+    if (!c.poll()) return malformed("observation interrupted");
     return info;
 }
 
 }  // namespace
+
+namespace server::detail {
+
+Result<GgufArtifactObservation> observe_gguf_artifact(
+    std::istream& input, std::string_view expected_sha256,
+    const GgufObservationOptions& options, CancellationToken cancel) {
+    if (expected_sha256.size() != 64 || !std::all_of(expected_sha256.begin(), expected_sha256.end(), [](char ch) {
+            return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+        }) || options.max_read_bytes < 2 || options.max_read_bytes > std::numeric_limits<std::uint64_t>::max() / 8 ||
+        options.max_header_bytes == 0 || options.max_header_bytes >= options.max_read_bytes ||
+        options.read_chunk_bytes == 0 || options.read_chunk_bytes > 65536 ||
+        options.deadline == std::chrono::steady_clock::time_point::max()) {
+        return Status(ErrorCode::invalid_argument, "invalid GGUF observation options");
+    }
+    try {
+        const std::string trusted_sha256(expected_sha256);
+        ObservationReader reader(input, options, std::move(cancel));
+        if (!reader.poll()) return reader.status();
+        if (!input.good() || !input.rdbuf()) return Status(ErrorCode::io_error, "GGUF observation input failure");
+        GgufArtifactObservation observation;
+        {
+            auto info = parse(input, &reader);
+            if (!reader.poll()) return reader.status();
+            if (!info.ok()) return Status(ErrorCode::invalid_argument, "invalid GGUF observation header");
+            observation.architecture = std::move(info->architecture);
+            observation.routed_experts = info->routed_experts;
+        }  // Discard estimate-only metadata/vectors before draining payload.
+        char buffer[65536];
+        while (!reader.eof() && reader.poll()) reader.read(buffer, sizeof(buffer));
+        if (!reader.poll()) return reader.status();
+        if (!reader.eof()) return Status(ErrorCode::io_error, "GGUF observation input failure");
+        const auto bytes = reader.hash().finish();
+        static constexpr char kHex[] = "0123456789abcdef";
+        observation.sha256.reserve(64);
+        for (const auto byte : bytes) {
+            observation.sha256.push_back(kHex[byte >> 4]);
+            observation.sha256.push_back(kHex[byte & 15]);
+        }
+        if (!reader.poll()) return reader.status();
+        if (observation.sha256 != trusted_sha256) {
+            return Status(ErrorCode::invalid_argument, "GGUF observation digest mismatch");
+        }
+        observation.byte_length = reader.total();
+        if (!reader.poll()) return reader.status();
+        return observation;
+    } catch (const std::bad_alloc&) {
+        return Status(ErrorCode::unavailable, "GGUF observation allocation failure");
+    }
+}
+
+}  // namespace server::detail
 
 Result<GgufModelInfo> parse_gguf_model_info(std::string_view header_bytes) {
     std::istringstream in{std::string(header_bytes)};

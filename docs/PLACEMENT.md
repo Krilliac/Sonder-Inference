@@ -223,3 +223,25 @@ layer offload (`--gpu-layers N` with no override) at equal VRAM.
 **This also found a gap.** `serve` never passed a device to model loads, so a
 llama.cpp model served by `sonder-infer serve` always ran CPU-only. `--device
 gpu:0` now fixes that.
+
+## Opt-in inspected-content foundation
+
+The private server-module `server::detail::observe_gguf_artifact` entrypoint
+binds the existing literal GGUF header interpretation and optional typed
+routed-expert counts to a caller-trusted full SHA256 of the same inspected
+stream. Success returns the matching digest and inspected byte length; missing
+or ambiguous counts remain unknown. The existing header-only APIs still make
+unbound header observations. See [the contract and local qualification](integration/gguf-artifact-observation.md).
+
+The observer is opt-in and has no default serving or placement call site. It
+does not populate model descriptors, backend identities, HTTP metadata,
+telemetry or cache/routing policy. Its strict logical read/header allowances
+and cooperative cancellation/deadline checks do not establish OS-prefetch,
+heap/RSS or hard-latency bounds. A matching digest does not validate tensor
+extents or model loadability, authenticate the expectation, or associate the
+inspected content with bytes actually loaded by a backend.
+
+Backend-loaded artifact association and separately qualified descriptor/HTTP
+projection are still prerequisites for consuming this evidence in placement
+or routing. Existing placement rules and residency controls remain unchanged;
+physical expert counts do not imply model/task quality or execution speed.

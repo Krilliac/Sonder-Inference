@@ -134,3 +134,19 @@ model/revision binding; Runtime task-quality evidence is separate from
 physical execution traits and backend capability advertisement. MoT across
 models is separate from internal MoE routing. Shared-chat hardware, model,
 license and provider-quality recommendations require independent evidence.
+
+## Inspected-content foundation and remaining boundaries
+
+- [x] Private opt-in full-artifact inspected-content observation: the same
+  caller-owned stream supplies native literal header facts and the matching
+  trusted full SHA256/byte length; optional routed-expert counts retain their
+  unknown semantics. [Contract and local qualification](integration/gguf-artifact-observation.md).
+- [ ] Associate inspected content with bytes actually loaded by each backend.
+- [ ] Qualify descriptor/HTTP projection and any placement, routing or cache
+  consumer separately; no default policy or public API is added by this slice.
+
+The existing header-only observation milestone remains distinct and unbound.
+This foundation does not establish tensor-extent validity, model loadability,
+filesystem immutability, digest provenance, backend identity completeness or
+model/task quality. The broader placement, recurrent-checkpoint,
+embedding/reranking, residency and Runtime orchestration work remains pending.
