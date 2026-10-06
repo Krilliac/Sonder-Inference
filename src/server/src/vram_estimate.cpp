@@ -222,6 +222,56 @@ struct Numbers {
     std::vector<std::int64_t> per_layer;
 };
 
+// Retain original scalar validity and every relevant key occurrence. The
+// string metadata view can contain array maxima and is not count evidence.
+// general.architecture may appear after its qualified keys in a GGUF header.
+struct ExpertCountObservation {
+    std::string key;
+    std::optional<std::uint32_t> value;
+};
+
+bool expert_count_key(std::string_view key) {
+    return key.size() <= kMaxArchitectureBytes + std::string_view(".expert_used_count").size() &&
+           (key.ends_with(".expert_count") || key.ends_with(".expert_used_count"));
+}
+
+bool expert_namespace(std::string_view architecture) {
+    const auto initial = [](char ch) {
+        return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+               (ch >= '0' && ch <= '9') || ch == '_';
+    };
+    return !architecture.empty() && initial(architecture.front()) &&
+           std::all_of(architecture.begin(), architecture.end(), [&](char ch) {
+               return initial(ch) || ch == '.' || ch == '-';
+           });
+}
+
+std::optional<RoutedExpertCounts> resolve_routed_experts(
+    std::string_view architecture, std::size_t architecture_occurrences,
+    const std::vector<ExpertCountObservation>& observations) {
+    if (architecture_occurrences != 1 || !expert_namespace(architecture)) return std::nullopt;
+    const std::string prefix = std::string(architecture) + ".";
+    const std::string total_key = prefix + "expert_count";
+    const std::string active_key = prefix + "expert_used_count";
+    std::size_t total_occurrences = 0;
+    std::size_t active_occurrences = 0;
+    std::optional<std::uint32_t> total;
+    std::optional<std::uint32_t> active;
+    for (const auto& observation : observations) {
+        if (observation.key == total_key) {
+            ++total_occurrences;
+            total = observation.value;
+        } else if (observation.key == active_key) {
+            ++active_occurrences;
+            active = observation.value;
+        }
+    }
+    if (total_occurrences != 1 || active_occurrences != 1 || !total || !active || *active > *total) {
+        return std::nullopt;
+    }
+    return RoutedExpertCounts{*total, *active};
+}
+
 // ------------------------------------------------- sliding-window attention
 //
 // llama.cpp keeps the KV of sliding-window (SWA) layers in a second cache of
@@ -345,11 +395,19 @@ Result<GgufModelInfo> parse(std::istream& in) {
     }
     GgufModelInfo info;
     std::vector<std::pair<std::string, Numbers>> numbers;  // keys we may need
+    std::vector<ExpertCountObservation> expert_observations;
+    std::size_t architecture_occurrences = 0;
     std::uint64_t token_count = 0;
     for (std::uint64_t i = 0; i < n_kv; ++i) {
         std::string key;
         std::uint32_t type = 0;
         if (!c.string(key) || !c.pod(type)) return malformed("truncated metadata");
+        if (key == "general.architecture") ++architecture_occurrences;
+        ExpertCountObservation* expert = nullptr;
+        if (expert_count_key(key)) {
+            expert_observations.push_back({key, std::nullopt});
+            expert = &expert_observations.back();
+        }
         if (type == 8) {
             std::string value;
             if (!c.string(value)) return malformed("truncated string value");
@@ -403,8 +461,12 @@ Result<GgufModelInfo> parse(std::istream& in) {
         if (!read_scalar(c, type, text, v, is_int)) return malformed("unsupported value type in '" + excerpt(key) + "'");
         info.metadata.emplace_back(key, text);
         if (is_int) numbers.emplace_back(key, Numbers{v, {}});
+        if (expert && is_int && v > 0 && v <= static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
+            expert->value = static_cast<std::uint32_t>(v);
+        }
     }
     if (info.architecture.empty()) return malformed("general.architecture is missing");
+    info.routed_experts = resolve_routed_experts(info.architecture, architecture_occurrences, expert_observations);
     const std::string a = info.architecture + ".";
     const auto number = [&](const std::string& key) -> const Numbers* {
         for (const auto& [k, n] : numbers) {
