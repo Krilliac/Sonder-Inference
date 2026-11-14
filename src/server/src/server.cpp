@@ -247,8 +247,9 @@ json::Object profile_with_runtime_context(json::Object profile, const std::optio
 
 // Text of the "lines dropped" report the log queue writes when it had to
 // drop access-log or diagnostic lines, in the configured log format. Captures
-// values only: the logger thread may call it after the Server is gone (see
-// LogQueue).
+// values only: the logger thread may call it after the Server is gone, and
+// the logger thread and stop() may call it at the same time (see LogQueue).
+// It keeps no state and utc_timestamp_now() is reentrant, so both are safe.
 LogQueue::DropLine log_drop_reporter(bool as_json) {
     return [as_json](std::uint64_t dropped, bool final_report) -> std::string {
         std::string message = "log queue full; " + std::to_string(dropped) + " lines dropped";
@@ -356,7 +357,9 @@ struct Server::Impl {
     }
 
     // Drains the log queue at shutdown, bounded: a sink still blocked after
-    // the patience is not waited for (see LogQueue::stop).
+    // the patience is not waited for (see LogQueue::stop). The result is not
+    // used: what was lost is in the queue's dropped count, and at this point
+    // there is no log left to report it to.
     void stop_log_queue() {
         (void)log_queue.stop(std::max(opts.shutdown_grace, std::chrono::milliseconds(100)));
     }

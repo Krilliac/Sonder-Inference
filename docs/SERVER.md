@@ -112,6 +112,15 @@ blocked sink before it gives up on it and counts the remaining lines as
 dropped. The lines `serve` writes directly are not queued: a stderr that is
 still blocked at that point holds `serve` at the line it is writing.
 
+Queued lines exist only in memory until the logger thread writes them, so
+they are lost when the process ends without a clean shutdown: a crash,
+`std::terminate`, `TerminateProcess` or SIGKILL, and the second SIGINT/SIGTERM
+that exits immediately (see below). Up to `log_queue_capacity` lines can be
+lost that way, and they are the newest ones: the access lines of the last
+requests before a crash are the ones most likely missing from the log. With a
+stderr that keeps up the queue is nearly always empty, so the loss is then at
+most the few lines in flight.
+
 ### Startup and shutdown
 
 `start()` binds the socket, builds the engine (so `engine.started` carries
@@ -167,7 +176,10 @@ On SIGINT or SIGTERM (or `request_shutdown()`):
    streaming client then sees `finish_reason: "cancelled"`).
 4. The engine stops: `engine.stopped`, plus a final `telemetry.dropped` if the
    bus dropped anything.
-5. Telemetry streams deliver what they hold and close. The process exits 0.
+5. Telemetry streams deliver what they hold and close.
+6. The access log drains: the queued log lines are written, waiting at most
+   `--shutdown-grace-ms` (at least 100 ms) for a blocked stderr; lines still
+   unwritten then are dropped. The process exits 0.
 
 ## Security
 

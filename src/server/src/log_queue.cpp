@@ -11,9 +11,6 @@ namespace sonder::inference::server::detail {
 
 namespace {
 
-// A "lines dropped" report is queued on the first drop, then at most this
-// often (measured on the steady clock).
-constexpr std::chrono::seconds kDropReportInterval{10};
 // Patience of a destructor that runs without a stop() before it.
 constexpr std::chrono::milliseconds kDestructorPatience{100};
 
@@ -30,13 +27,19 @@ struct LogQueue::State {
         bool report = false;
     };
 
-    State(Sink sink_fn, std::size_t max_lines, DropLine drop_line_fn)
-        : sink(std::move(sink_fn)), drop_line(std::move(drop_line_fn)), capacity(max_lines == 0 ? 1 : max_lines) {}
+    State(Sink sink_fn, std::size_t max_lines, DropLine drop_line_fn, std::chrono::milliseconds report_interval)
+        : sink(std::move(sink_fn)),
+          drop_line(std::move(drop_line_fn)),
+          capacity(max_lines == 0 ? 1 : max_lines),
+          drop_report_interval(report_interval) {}
 
     // Immutable after construction.
     const Sink sink;
     const DropLine drop_line;
     const std::size_t capacity;
+    // A live "lines dropped" report is queued on the first drop, then at
+    // most this often (measured on the steady clock).
+    const std::chrono::milliseconds drop_report_interval;
 
     std::mutex mu;
     std::condition_variable work_cv;  // logger thread: lines queued, or stop
@@ -59,8 +62,9 @@ struct LogQueue::State {
     std::atomic<std::size_t> queued{0};  // mirrors queued_lines
 };
 
-LogQueue::LogQueue(Sink sink, std::size_t capacity, DropLine drop_line)
-    : state_(std::make_shared<State>(std::move(sink), capacity, std::move(drop_line))) {
+LogQueue::LogQueue(Sink sink, std::size_t capacity, DropLine drop_line,
+                   std::chrono::milliseconds drop_report_interval)
+    : state_(std::make_shared<State>(std::move(sink), capacity, std::move(drop_line), drop_report_interval)) {
     if (!state_->sink) {
         state_->closed = true;  // nothing to write to
         return;
@@ -158,7 +162,8 @@ void LogQueue::writer_loop(const std::shared_ptr<State>& st) {
         if (!st->closed && st->drop_line) {
             dropped_now = st->dropped.load(std::memory_order_relaxed);
             report = dropped_now > st->reported &&
-                     (st->reported == 0 || std::chrono::steady_clock::now() - st->last_report >= kDropReportInterval);
+                     (st->reported == 0 ||
+                      std::chrono::steady_clock::now() - st->last_report >= st->drop_report_interval);
         }
         lock.unlock();
         batch.clear();  // frees the written lines with `mu` released

@@ -252,8 +252,11 @@ TEST_CASE("log sink: a blocked log sink never blocks health, the accept loop or 
     CHECK(eventually([&] { return gate.waiting.load() == 1; }, std::chrono::milliseconds(2000)));
 
     // Shutdown with the sink still blocked: run stop() on a helper so a hang is
-    // a failed bounded wait, not a stuck test.
-    const auto budget = o.shutdown_grace + std::chrono::seconds(2);
+    // a failed bounded wait, not a stuck test. The budget is the grace the
+    // queue gives its sink plus 5 s of slack for a slow runner (TSAN under
+    // ctest -j 4). It still separates fixed from broken: a stop() that waits
+    // for the sink is held until the gate's 60 s backstop.
+    const auto budget = o.shutdown_grace + std::chrono::seconds(5);
     std::promise<void> stopped;
     auto stopped_future = stopped.get_future();
     std::thread stopper([&] {

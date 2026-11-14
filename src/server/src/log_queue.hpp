@@ -47,12 +47,17 @@ public:
     // Starts the logger thread. `sink` and `drop_line` are copied into the
     // shared state. `sink` runs on the logger thread only, one call at a
     // time, in push order. `drop_line` runs on the logger thread and inside
-    // stop(); it must not block and must own everything it uses, because a
-    // detached logger thread may still call it after stop() returned false.
+    // stop(), so it can be called by two threads at the same time: it must
+    // be safe to call concurrently with itself. It must not block and must
+    // own everything it uses, because a detached logger thread may still
+    // call it after stop() returned false.
     // A null `sink` (or a logger thread the OS refuses to start) leaves the
     // queue without a writer: every push() is then counted as dropped.
-    // `capacity` 0 is treated as 1.
-    LogQueue(Sink sink, std::size_t capacity, DropLine drop_line);
+    // `capacity` 0 is treated as 1. `drop_report_interval` is the least time
+    // between two live "lines dropped" reports (the first drop is reported
+    // at once); it is a parameter for the tests, the server uses the default.
+    LogQueue(Sink sink, std::size_t capacity, DropLine drop_line,
+             std::chrono::milliseconds drop_report_interval = std::chrono::seconds(10));
     // stop() with a short patience when the owner has not called it.
     ~LogQueue();
     LogQueue(const LogQueue&) = delete;
@@ -65,13 +70,22 @@ public:
 
     // Refuses further lines, queues a final "lines dropped" report when drops
     // are still unreported (it bypasses `capacity`), and gives the logger
-    // thread `patience` to write what is queued. Returns true when everything
-    // was written and the thread was joined. Otherwise the sink is still
-    // blocked: the lines not yet handed to it are counted as dropped, the
-    // thread is detached and false is returned. After stop() returns, the
-    // sink is never entered again; only a call that was already in progress
-    // may still be running. Not safe against a concurrent stop() or the
-    // destructor; a repeated call returns the first result.
+    // thread `patience` to write what is queued.
+    //
+    // Returns true when no logger thread is left running and stop() itself
+    // discarded nothing: the thread handed every accepted line to the sink
+    // and was joined, or there never was a thread (null sink, or the OS
+    // refused to start one), in which case no line was ever accepted. True
+    // does not mean that no line was lost: lines refused by push() and lines
+    // the sink threw on are counted in stats().dropped either way.
+    //
+    // Returns false when the sink did not return within `patience`: the
+    // lines not yet handed to it are counted as dropped and the thread is
+    // detached. After stop() returns, the sink is never entered again; only
+    // a call that was already in progress may still be running.
+    //
+    // Not safe against a concurrent stop() or the destructor; a repeated
+    // call returns the first result.
     bool stop(std::chrono::milliseconds patience);
 
     // Counters, read from atomics: no lock is taken, so this never waits for

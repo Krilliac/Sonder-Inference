@@ -4,6 +4,7 @@
 // and the log queue (bounded, never waits for its sink).
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <future>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <variant>
@@ -871,4 +873,141 @@ TEST_CASE("log queue: stop() queues the final drop report even when the queue is
     CHECK(s.written == 5);
     CHECK(s.dropped == refused);
     CHECK(s.queued == 0);
+}
+
+TEST_CASE("log queue: a sink that throws loses only that line") {
+    std::mutex mu;
+    std::vector<std::string> got;  // guarded by mu
+    const auto snapshot = [&mu, &got] {
+        std::lock_guard<std::mutex> lock(mu);
+        return got;
+    };
+    LogQueue q(
+        [&mu, &got](const std::string& text) {
+            if (text == "bad") throw std::runtime_error("sink failed");
+            std::lock_guard<std::mutex> lock(mu);
+            got.push_back(text);
+        },
+        16, test_drop_line);
+    REQUIRE(q.push("one"));
+    REQUIRE(q.push("bad"));
+    REQUIRE(q.push("two"));
+    // The line the sink threw on is counted as dropped, and the line behind
+    // it still arrives.
+    REQUIRE(server_test::eventually([&] {
+        const LogQueueStats now_stats = q.stats();
+        return now_stats.written == 2 && now_stats.dropped == 1;
+    }));
+    // So does a later one, and the drop is reported like any other.
+    REQUIRE(q.push("three"));
+    CHECK(server_test::eventually([&] {
+        const std::vector<std::string> seen = snapshot();
+        return q.stats().written == 3 && std::count(seen.begin(), seen.end(), "dropped 1 live") == 1;
+    }));
+
+    // stop() is not held up by the failure.
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(q.stop(std::chrono::seconds(10)));
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0);
+    CHECK_MESSAGE(took < std::chrono::milliseconds(5000), "stop() took " << took.count() << " ms");
+    const LogQueueStats s = q.stats();
+    CHECK(s.written == 3);
+    CHECK(s.dropped == 1);
+    CHECK(s.queued == 0);
+    std::vector<std::string> delivered;
+    int reports = 0;
+    for (const auto& text : snapshot()) {
+        if (is_drop_line(text)) {
+            ++reports;
+        } else {
+            delivered.push_back(text);
+        }
+    }
+    CHECK(delivered == std::vector<std::string>{"one", "two", "three"});
+    CHECK(reports == 1);
+}
+
+TEST_CASE("log queue: without a sink every line is counted as dropped and stop() has nothing to wait for") {
+    LogQueue q(LogQueue::Sink{}, 8, test_drop_line);
+    CHECK_FALSE(q.push("lost"));
+    CHECK_FALSE(q.push("lost too"));
+    // True means that no logger thread is left and that stop() itself threw
+    // nothing away; the lines push() refused are in the count.
+    CHECK(q.stop(std::chrono::seconds(10)));
+    const LogQueueStats s = q.stats();
+    CHECK(s.written == 0);
+    CHECK(s.dropped == 2);
+    CHECK(s.queued == 0);
+    CHECK(s.capacity == 8);
+}
+
+namespace {
+
+// Puts one queue (capacity 2) through two rounds of drops with the sink
+// gated, so that the logger thread's batches are known, then stops it and
+// returns every line the sink received. Round 1 drops 2 lines, round 2 drops
+// 3 more.
+std::vector<std::string> two_rounds_of_drops(std::chrono::milliseconds report_interval) {
+    SinkGate gate;
+    gate.shut();
+    LogQueue q(gate.sink(), 2, test_drop_line, report_interval);
+
+    // Round 1: "a" is in the sink, "b" and "c" fill the queue, "d" and "e"
+    // are dropped.
+    REQUIRE(q.push("a"));
+    REQUIRE(server_test::eventually([&] { return gate.waiting.load() == 1; }));
+    REQUIRE(q.push("b"));
+    REQUIRE(q.push("c"));
+    CHECK_FALSE(q.push("d"));
+    CHECK_FALSE(q.push("e"));
+    gate.release();
+    // The first drop is reported at once: the report is queued when the
+    // batch in progress ("a") is done, behind "b" and "c". Wait until that
+    // fourth sink call has returned.
+    REQUIRE(server_test::eventually([&] { return gate.lines().size() == 4 && gate.inside.load() == 0; }));
+
+    // Round 2: "f" is in the sink, "g" and "h" fill the queue, "i", "j" and
+    // "k" are dropped.
+    gate.shut();
+    REQUIRE(q.push("f"));
+    REQUIRE(server_test::eventually([&] { return gate.waiting.load() == 1; }));
+    REQUIRE(q.push("g"));
+    REQUIRE(q.push("h"));
+    CHECK_FALSE(q.push("i"));
+    CHECK_FALSE(q.push("j"));
+    CHECK_FALSE(q.push("k"));
+    gate.release();
+    REQUIRE(server_test::eventually([&] { return q.stats().written == 6; }));
+    // One more line. The logger thread decides about a report after each
+    // batch and queues it before it takes the next one, so a report for
+    // round 2 is ahead of "z" in the queue: once "z" is written, a second
+    // live report is in the sink if there is ever going to be one.
+    REQUIRE(q.push("z"));
+    REQUIRE(server_test::eventually([&] { return q.stats().written == 7; }));
+
+    CHECK(q.stop(std::chrono::seconds(10)));
+    const LogQueueStats s = q.stats();
+    CHECK(s.written == 7);
+    CHECK(s.dropped == 5);
+    return gate.lines();
+}
+
+}  // namespace
+
+TEST_CASE("log queue: drop reports are rate limited and stop() reports what is left") {
+    // An interval the test never reaches: after the first report no second
+    // live one appears, however many more lines are dropped, and the final
+    // report at stop() carries the total (5), of which 3 were unreported.
+    const std::vector<std::string> got = two_rounds_of_drops(std::chrono::hours(1));
+    const std::vector<std::string> expected{"a", "b", "c", "dropped 2 live", "f", "g", "h", "z", "dropped 5 final"};
+    CHECK(got == expected);
+}
+
+TEST_CASE("log queue: with no report interval every round of drops is reported live") {
+    // The same rounds with the limit off: the second round is reported live
+    // (so the case above passes because of the interval, not by accident),
+    // and stop() has nothing left to report.
+    const std::vector<std::string> got = two_rounds_of_drops(std::chrono::milliseconds(0));
+    const std::vector<std::string> expected{"a", "b", "c", "dropped 2 live", "f", "g", "h", "dropped 5 live", "z"};
+    CHECK(got == expected);
 }
