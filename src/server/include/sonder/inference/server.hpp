@@ -110,8 +110,23 @@ struct ServerOptions {
 
     // Access log and diagnostics (one line per request; never bodies or
     // header values). Null discards them.
+    //
+    // Lines are queued and `log` is called on one logger thread, one call at
+    // a time, in the order the server produced them. It is never called on a
+    // request thread or the accept thread, so a slow or blocked sink costs
+    // log lines, never requests: at most `log_queue_capacity` lines wait, and
+    // while the queue is full new lines are dropped and counted (health
+    // `log.dropped`, plus a "lines dropped" line once the sink takes lines
+    // again). stop() gives the queue max(shutdown_grace, 100 ms) to drain. A
+    // call that has not returned by then is abandoned: the lines behind it
+    // are dropped, `log` is not entered again, but that one call may still be
+    // running after stop() returns and after the Server is destroyed.
+    // Whatever `log` uses must stay valid until the call returns (own it in
+    // the callable, for example through a shared_ptr).
     std::function<void(const std::string& line)> log;
     LogFormat log_format = LogFormat::text;
+    // Lines the log queue holds before it drops new ones; at least 1.
+    std::size_t log_queue_capacity = 4096;
 
     // Model residency (docs/SERVER.md "Model residency"). The defaults keep
     // the behaviour from before these options existed: every model loads

@@ -20,6 +20,7 @@
 #include "health_features.hpp"
 #include "identity.hpp"
 #include "live_hub.hpp"
+#include "log_queue.hpp"
 #include "openai.hpp"
 #include "priority_admission.hpp"
 #include "request_path.hpp"
@@ -244,12 +245,33 @@ json::Object profile_with_runtime_context(json::Object profile, const std::optio
     return profile;
 }
 
+// Text of the "lines dropped" report the log queue writes when it had to
+// drop access-log or diagnostic lines, in the configured log format. Captures
+// values only: the logger thread may call it after the Server is gone (see
+// LogQueue).
+LogQueue::DropLine log_drop_reporter(bool as_json) {
+    return [as_json](std::uint64_t dropped, bool final_report) -> std::string {
+        std::string message = "log queue full; " + std::to_string(dropped) + " lines dropped";
+        if (final_report) {
+            message += " (total at shutdown)";
+        }
+        if (as_json) {
+            return json::Value(
+                       json::Object{{"time", utc_timestamp_now()}, {"level", "warning"}, {"message", message}})
+                .dump();
+        }
+        return "sonder-infer serve: warning: " + message;
+    };
+}
+
 }  // namespace
 
 // ============================================================ Server::Impl
 
 struct Server::Impl {
-    explicit Impl(ServerOptions o) : opts(std::move(o)) {
+    explicit Impl(ServerOptions o)
+        : opts(std::move(o)),
+          log_queue(opts.log, opts.log_queue_capacity, log_drop_reporter(opts.log_format == LogFormat::json)) {
         residency = std::make_shared<ModelResidency>(
             ResidencyConfig{opts.model_idle_ttl, opts.max_resident_models},
             [this](const std::string& id) { return load_served_model(id); },
@@ -257,6 +279,13 @@ struct Server::Impl {
     }
 
     ServerOptions opts;
+    // Access-log and diagnostic lines on their way to `opts.log`, which is
+    // only ever called on the queue's logger thread (never on a request or
+    // accept thread). Declared right after `opts` (it is built from them) and
+    // before everything else, so it is destroyed last and anything that still
+    // logs while the other members go away finds it alive. Mutable: the
+    // logging helpers are const and the queue synchronizes itself.
+    mutable LogQueue log_queue;
     std::atomic<State> state{State::starting};
 
     Socket listener;
@@ -316,10 +345,20 @@ struct Server::Impl {
 
     // ------------------------------------------------------------- logging
 
-    void log_line(const std::string& line) const {
+    // Hands the line to the log queue and returns: the sink is never called
+    // here, so a slow or blocked sink cannot hold a request thread, the
+    // accept thread or shutdown. A line the queue has no room for is dropped
+    // and counted (health `log.dropped`).
+    void log_line(std::string line) const {
         if (opts.log) {
-            opts.log(line);
+            (void)log_queue.push(std::move(line));
         }
+    }
+
+    // Drains the log queue at shutdown, bounded: a sink still blocked after
+    // the patience is not waited for (see LogQueue::stop).
+    void stop_log_queue() {
+        (void)log_queue.stop(std::max(opts.shutdown_grace, std::chrono::milliseconds(100)));
     }
 
     void log_message(const char* level, const std::string& message) const {
@@ -641,6 +680,8 @@ struct Server::Impl {
             }
         }
         const auto queued = admission.queued();
+        // Atomics only: health never waits for the log queue or its sink.
+        const LogQueueStats log_stats = log_queue.stats();
         json::Object body{{"status", state_name(s)},
                           {"api_version", kApiVersion},
                           {"version", version_string()},
@@ -664,6 +705,10 @@ struct Server::Impl {
                                                      {"emitted", emitted},
                                                      {"dropped", dropped},
                                                      {"subscriber_dropped_events", hs.subscriber_dropped_events}}},
+                          {"log", json::Object{{"queued", log_stats.queued},
+                                               {"capacity", log_stats.capacity},
+                                               {"written", log_stats.written},
+                                               {"dropped", log_stats.dropped}}},
                           {"sonder", health_features(bound_backend, opts, sonder_meta())}};
         send_json(ex, s == State::ready ? 200 : 503, body);
     }
@@ -1661,6 +1706,7 @@ struct Server::Impl {
             was_started = started.load();
         }
         if (!was_started) {
+            stop_log_queue();
             state.store(State::stopped);
             std::lock_guard<std::mutex> lock(stopped_mu);
             stopped = true;
@@ -1717,6 +1763,9 @@ struct Server::Impl {
         for (auto& t : threads) {
             t.join();
         }
+        // 6. Nothing logs any more: the queued access-log lines are written,
+        // unless the sink is blocked, which shutdown does not wait out.
+        stop_log_queue();
         state.store(State::stopped);
         std::lock_guard<std::mutex> lock(stopped_mu);
         stopped = true;
@@ -1788,6 +1837,9 @@ Status validate_options(const ServerOptions& o) {
     if (o.max_connections == 0 || o.max_body_bytes == 0 || o.telemetry_buffer == 0 || o.max_subscribers == 0) {
         return Status(ErrorCode::invalid_argument,
                       "--max-connections, --max-body-bytes and --telemetry-buffer must be positive");
+    }
+    if (o.log_queue_capacity == 0) {
+        return Status(ErrorCode::invalid_argument, "log_queue_capacity must be at least 1");
     }
     if (o.model_idle_ttl.count() < 0) {
         return Status(ErrorCode::invalid_argument, "--model-idle-ttl must not be negative");

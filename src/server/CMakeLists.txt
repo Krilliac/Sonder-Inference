@@ -13,6 +13,7 @@ sonder_module_sources(
     src/identity.cpp
     src/launch_profile.cpp
     src/live_hub.cpp
+    src/log_queue.cpp
     src/openai.cpp
     src/priority_admission.cpp
     src/residency.cpp

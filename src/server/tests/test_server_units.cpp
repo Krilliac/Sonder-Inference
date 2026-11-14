@@ -1,15 +1,26 @@
 // Pure-function tests for the server module: SHA-256, the HTTP head parser,
 // query decoding, OpenAI request mapping, correlation headers, error mapping,
-// the live telemetry hub (ring, fan-out, resume), backend setup and identity.
+// the live telemetry hub (ring, fan-out, resume), backend setup and identity,
+// and the log queue (bounded, never waits for its sink).
 #include <doctest/doctest.h>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <future>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <variant>
+#include <vector>
 
 #include "server_test_support.hpp"
 #include "src/http.hpp"
 #include "src/identity.hpp"
 #include "src/live_hub.hpp"
+#include "src/log_queue.hpp"
 #include "src/openai.hpp"
 #include "src/sha256.hpp"
 #include "sonder/inference/backend_setup.hpp"
@@ -524,6 +535,13 @@ TEST_CASE("options: refused combinations") {
     o.backend_instance = sonder::inference::make_mock_backend();
     o.models.clear();
     CHECK(srv::validate_options(o).ok());
+    // The log queue needs room for at least one line.
+    o.log_queue_capacity = 0;
+    const Status no_queue = srv::validate_options(o);
+    CHECK(no_queue.code() == ErrorCode::invalid_argument);
+    CHECK(no_queue.message().find("log_queue_capacity") != std::string::npos);
+    o.log_queue_capacity = 1;
+    CHECK(srv::validate_options(o).ok());
 }
 
 TEST_CASE("backend setup: tensor overrides parse as PATTERN=DEVICE") {
@@ -588,4 +606,269 @@ TEST_CASE("backend setup: llama.cpp context options are validated up front") {
     // Without llama.cpp there is nothing to check against.
     CHECK(validate_backend_setup(bad).ok());
 #endif
+}
+
+namespace {
+
+// A LogQueue sink that records every line and, while closed, blocks each
+// call. A blocked call gives up after 10 s and leaves the gate open, so a
+// queue that waits for its sink fails the test instead of hanging the suite.
+// The destructor opens the gate and waits for the call in progress: a logger
+// thread that stop() gave up on may still be inside write().
+struct SinkGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool is_open = true;                // guarded by mu
+    std::vector<std::string> received;  // guarded by mu
+    std::atomic<int> waiting{0};        // calls blocked at the closed gate
+    std::atomic<int> inside{0};         // calls in progress
+
+    ~SinkGate() {
+        release();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (inside.load() != 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    void write(const std::string& text) {
+        ++inside;
+        {
+            std::unique_lock<std::mutex> lock(mu);
+            received.push_back(text);
+            if (!is_open) {
+                ++waiting;
+                if (!cv.wait_for(lock, std::chrono::seconds(10), [this] { return is_open; })) {
+                    is_open = true;
+                }
+                --waiting;
+            }
+        }
+        --inside;  // last access to the gate
+    }
+    void shut() {
+        std::lock_guard<std::mutex> lock(mu);
+        is_open = false;
+    }
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            is_open = true;
+        }
+        cv.notify_all();
+    }
+    std::vector<std::string> lines() {
+        std::lock_guard<std::mutex> lock(mu);
+        return received;
+    }
+    LogQueue::Sink sink() {
+        return [this](const std::string& text) { write(text); };
+    }
+};
+
+std::string test_drop_line(std::uint64_t dropped, bool final_report) {
+    return "dropped " + std::to_string(dropped) + (final_report ? " final" : " live");
+}
+
+bool is_drop_line(const std::string& text) { return text.rfind("dropped ", 0) == 0; }
+
+}  // namespace
+
+TEST_CASE("log queue: push never waits for a blocked sink, and every line is written or counted as dropped") {
+    constexpr std::size_t kCapacity = 16;
+    constexpr std::size_t kLines = 10 * kCapacity;
+    SinkGate gate;
+    gate.shut();
+    LogQueue q(gate.sink(), kCapacity, test_drop_line);
+
+    std::vector<std::string> expected;  // the lines the queue accepted, in order
+    const auto t0 = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < kLines; ++i) {
+        std::string text = "line " + std::to_string(i);
+        if (q.push(text)) expected.push_back(std::move(text));
+    }
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0);
+    // A push that called the sink, or waited for it, would sit at the gate
+    // for 10 s. The bound is generous so a loaded machine does not trip it.
+    CHECK_MESSAGE(took < std::chrono::milliseconds(1000), "the pushes took " << took.count() << " ms");
+
+    // The queue holds `capacity` lines; the logger thread may have taken one
+    // batch (at most `capacity` more) out before it blocked in the sink.
+    const std::size_t accepted = expected.size();
+    CHECK(accepted >= kCapacity);
+    CHECK(accepted <= 2 * kCapacity);
+    const std::uint64_t refused = static_cast<std::uint64_t>(kLines - accepted);
+    LogQueueStats s = q.stats();
+    CHECK(s.capacity == kCapacity);
+    CHECK(s.queued <= kCapacity);
+    CHECK(s.dropped == refused);
+    CHECK(s.written == 0);
+
+    gate.release();
+    CHECK(q.stop(std::chrono::seconds(10)));
+    s = q.stats();
+    CHECK(s.written == static_cast<std::uint64_t>(accepted));
+    CHECK(s.dropped == refused);
+    CHECK(s.queued == 0);
+
+    // The sink got the accepted lines in push order, and one report with the
+    // number of dropped lines (not counted as written).
+    std::vector<std::string> written_lines;
+    std::vector<std::string> reports;
+    for (const auto& text : gate.lines()) {
+        if (is_drop_line(text)) {
+            reports.push_back(text);
+        } else {
+            written_lines.push_back(text);
+        }
+    }
+    CHECK(written_lines == expected);
+    REQUIRE(reports.size() == 1);
+    CHECK(reports[0].rfind("dropped " + std::to_string(refused) + " ", 0) == 0);
+}
+
+TEST_CASE("log queue: the sink gets the lines in push order") {
+    SinkGate gate;
+    LogQueue q(gate.sink(), 256, test_drop_line);
+    std::vector<std::string> expected;
+    for (int i = 0; i < 200; ++i) {
+        expected.push_back("line " + std::to_string(i));
+        REQUIRE(q.push(expected.back()));
+    }
+    CHECK(q.stop(std::chrono::seconds(10)));
+    CHECK(gate.lines() == expected);
+    const LogQueueStats s = q.stats();
+    CHECK(s.written == 200);
+    CHECK(s.dropped == 0);
+    CHECK(s.queued == 0);
+    CHECK(s.capacity == 256);
+
+    // Stopped: a later line is refused and counted, and stop() keeps its answer.
+    CHECK_FALSE(q.push("late"));
+    CHECK(q.stats().dropped == 1);
+    CHECK(q.stop(std::chrono::milliseconds(0)));
+    CHECK(gate.lines() == expected);
+}
+
+TEST_CASE("log queue: concurrent producers keep their own order and every line is accounted for") {
+    constexpr int kThreads = 4;
+    constexpr int kPerThread = 500;
+    SinkGate gate;
+    LogQueue q(gate.sink(), 64, test_drop_line);
+    std::atomic<std::uint64_t> accepted{0};
+    std::vector<std::thread> producers;
+    for (int t = 0; t < kThreads; ++t) {
+        producers.emplace_back([&q, &accepted, t] {
+            for (int i = 0; i < kPerThread; ++i) {
+                if (q.push(std::to_string(t) + ":" + std::to_string(i))) ++accepted;
+            }
+        });
+    }
+    for (auto& p : producers) p.join();
+    CHECK(q.stop(std::chrono::seconds(10)));
+
+    // Drops are allowed here (the queue is small on purpose); losing a line
+    // without counting it is not.
+    const LogQueueStats s = q.stats();
+    CHECK(s.written == accepted.load());
+    CHECK(s.written + s.dropped == static_cast<std::uint64_t>(kThreads * kPerThread));
+    CHECK(s.queued == 0);
+
+    std::vector<int> last(static_cast<std::size_t>(kThreads), -1);
+    std::uint64_t seen = 0;
+    bool ordered = true;
+    for (const auto& text : gate.lines()) {
+        if (is_drop_line(text)) continue;
+        const std::size_t colon = text.find(':');
+        REQUIRE(colon != std::string::npos);
+        const std::size_t producer = static_cast<std::size_t>(std::stoi(text.substr(0, colon)));
+        const int index = std::stoi(text.substr(colon + 1));
+        REQUIRE(producer < last.size());
+        ordered = ordered && index > last[producer];
+        last[producer] = index;
+        ++seen;
+    }
+    CHECK(ordered);
+    CHECK(seen == s.written);
+}
+
+TEST_CASE("log queue: stop() gives up on a blocked sink after its patience") {
+    SinkGate gate;
+    gate.shut();
+    LogQueue q(gate.sink(), 8, test_drop_line);
+    REQUIRE(q.push("first"));
+    REQUIRE(server_test::eventually([&] { return gate.waiting.load() == 1; }));
+    // The logger thread is inside the sink with "first"; these wait behind it.
+    REQUIRE(q.push("second"));
+    REQUIRE(q.push("third"));
+    CHECK(q.stats().queued == 2);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool drained = q.stop(std::chrono::milliseconds(100));
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0);
+    CHECK_FALSE(drained);
+    // It waited for its patience, and not for the sink (the gate's own
+    // backstop is 10 s).
+    CHECK_MESSAGE(took >= std::chrono::milliseconds(90), "stop() took " << took.count() << " ms");
+    CHECK_MESSAGE(took < std::chrono::milliseconds(2000), "stop() took " << took.count() << " ms");
+
+    // What never reached the sink is counted as dropped; nothing is queued.
+    const LogQueueStats s = q.stats();
+    CHECK(s.written == 0);
+    CHECK(s.dropped == 2);
+    CHECK(s.queued == 0);
+    CHECK_FALSE(q.push("late"));
+    CHECK(q.stats().dropped == 3);
+    CHECK_FALSE(q.stop(std::chrono::milliseconds(0)));  // same answer, no second wait
+
+    // The call that was in progress finishes on its own, and the sink is not
+    // entered again.
+    gate.release();
+    CHECK(server_test::eventually([&] { return gate.inside.load() == 0 && q.stats().written == 1; }));
+    CHECK(gate.lines() == std::vector<std::string>{"first"});
+    CHECK(q.stats().dropped == 3);
+}
+
+TEST_CASE("log queue: stop() queues the final drop report even when the queue is full") {
+    constexpr std::size_t kCapacity = 4;
+    SinkGate gate;
+    gate.shut();
+    std::atomic<bool> final_built{false};
+    LogQueue q(gate.sink(), kCapacity, [&final_built](std::uint64_t dropped, bool final_report) {
+        if (final_report) final_built.store(true);
+        return test_drop_line(dropped, final_report);
+    });
+    std::vector<std::string> expected{"first"};
+    REQUIRE(q.push("first"));
+    REQUIRE(server_test::eventually([&] { return gate.waiting.load() == 1; }));
+    // The logger thread is blocked in the sink with "first": the next
+    // `capacity` lines fill the queue and the rest are dropped. No live
+    // report can be queued, because the logger thread is not coming back.
+    std::uint64_t refused = 0;
+    for (int i = 0; i < 20; ++i) {
+        std::string text = "line " + std::to_string(i);
+        if (q.push(text)) {
+            expected.push_back(std::move(text));
+        } else {
+            ++refused;
+        }
+    }
+    CHECK(refused == 16);
+    CHECK(q.stats().queued == kCapacity);
+    CHECK(q.stats().dropped == refused);
+
+    // stop() adds the report to the full queue, then waits for the drain.
+    std::future<bool> drained = std::async(std::launch::async, [&q] { return q.stop(std::chrono::seconds(10)); });
+    const bool built = server_test::eventually([&] { return final_built.load(); });
+    gate.release();  // before any assertion that can throw: stop() must be able to finish
+    CHECK(built);
+    REQUIRE(drained.wait_for(std::chrono::seconds(15)) == std::future_status::ready);
+    CHECK(drained.get());
+
+    // Everything accepted was written, in order, and the report came last.
+    expected.push_back(test_drop_line(refused, true));
+    CHECK(gate.lines() == expected);
+    const LogQueueStats s = q.stats();
+    CHECK(s.written == 5);
+    CHECK(s.dropped == refused);
+    CHECK(s.queued == 0);
 }
