@@ -92,6 +92,35 @@ method, path without the query, status, milliseconds and the request id
 logs bodies or header values. A request whose client disconnected is logged
 with status 499.
 
+Access-log and diagnostic lines never wait for stderr. The thread that
+produces a line (a request thread or the accept thread) puts it in a bounded
+queue and carries on; one logger thread writes the queue, in order. A stderr
+that stalls (a console that stopped scrolling, a pipe nobody reads, a
+saturated disk) therefore delays log lines, not requests or new
+connections. The queue holds 4096 lines (`ServerOptions::log_queue_capacity`;
+there is no command-line flag). While it is full, new lines are dropped and
+counted: health reports the count as `log.dropped`, and once the sink takes
+lines again the log shows `sonder-infer serve: warning: log queue full; N
+lines dropped` (with `--log-format json`, the same text as the `message` of a
+`warning` line), on the first drop and then at most every 10 s, with a last
+one at shutdown (ending in `(total at shutdown)`) for drops not reported
+yet. The lines are in order among
+themselves, but not relative to the lines `serve` writes directly (the
+`listening`, `ready` and shutdown lines). When the server stops it writes
+what is queued, waiting at most `--shutdown-grace-ms` (at least 100 ms) for a
+blocked sink before it gives up on it and counts the remaining lines as
+dropped. The lines `serve` writes directly are not queued: a stderr that is
+still blocked at that point holds `serve` at the line it is writing.
+
+Queued lines exist only in memory until the logger thread writes them, so
+they are lost when the process ends without a clean shutdown: a crash,
+`std::terminate`, `TerminateProcess` or SIGKILL, and the second SIGINT/SIGTERM
+that exits immediately (see below). Up to `log_queue_capacity` lines can be
+lost that way, and they are the newest ones: the access lines of the last
+requests before a crash are the ones most likely missing from the log. With a
+stderr that keeps up the queue is nearly always empty, so the loss is then at
+most the few lines in flight.
+
 ### Startup and shutdown
 
 `start()` binds the socket, builds the engine (so `engine.started` carries
@@ -147,7 +176,10 @@ On SIGINT or SIGTERM (or `request_shutdown()`):
    streaming client then sees `finish_reason: "cancelled"`).
 4. The engine stops: `engine.stopped`, plus a final `telemetry.dropped` if the
    bus dropped anything.
-5. Telemetry streams deliver what they hold and close. The process exits 0.
+5. Telemetry streams deliver what they hold and close.
+6. The access log drains: the queued log lines are written, waiting at most
+   `--shutdown-grace-ms` (at least 100 ms) for a blocked stderr; lines still
+   unwritten then are dropped. The process exits 0.
 
 ## Security
 
@@ -279,6 +311,7 @@ reject with `never_fits` or `invalid_request`, both caller errors (400).
               "unloading":0,"loads":1,"load_failures":0,"evictions":0},
  "telemetry":{"level":"standard","subscribers":0,"retained":42,"capacity":8192,"emitted":42,"dropped":0,
               "subscriber_dropped_events":0},
+ "log":{"queued":0,"capacity":4096,"written":57,"dropped":0},
  "sonder":{"api_version":1,"features":[],"pins":{"mode":"override"}}}
 ```
 
@@ -292,6 +325,14 @@ adds `backends[].runtime` with `gpu_memory`, `context` and `warnings`
 unchanged.
 `telemetry.emitted` and `telemetry.dropped` are the bus counters;
 `subscriber_dropped_events` counts events lost by slow live subscribers.
+`log` (additive) describes the access-log queue: `queued` lines are waiting
+for the logger thread (never more than `capacity`), `written` lines reached
+the log sink and `dropped` lines were lost because the queue was full, the
+sink failed, or shutdown gave up on a blocked sink. The "lines dropped"
+report lines are counted in neither. A `dropped` that grows, or a `queued`
+that stays at `capacity`, means stderr is not being read fast enough. Health
+reads these counters without taking a lock, so it answers even while the log
+sink is blocked. Without a log sink the three counters stay 0.
 `sonder.features` is the backend capability list. For a llamaserver backend it
 is exactly `["thinking","chat_template_kwargs","enable_thinking",
 "reasoning_effort","reasoning_budget","prompt_cache_key","priority_classes"]`;

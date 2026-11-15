@@ -304,14 +304,39 @@ public:
     explicit LockedLog(std::ostream& stream) : stream_(stream) {}
     void line(std::string_view text) {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (closed_) {
+            return;
+        }
         stream_.write(text.data(), static_cast<std::streamsize>(text.size()));
         stream_.put('\n');
         stream_.flush();
+    }
+    // Waits for a write in progress, then turns every later line() into a
+    // no-op: once this returns, nothing touches the stream again.
+    void close() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        closed_ = true;
     }
 
 private:
     std::mutex mutex_;
     std::ostream& stream_;
+    bool closed_ = false;  // guarded by mutex_
+};
+
+// Closes the log when serve_main() returns, on every path. The stream belongs
+// to the caller and may be gone right after the return, but a writer can
+// outlive the Server: when the log sink (ServerOptions::log, which calls
+// line()) has not returned by the end of the server's shutdown patience, the
+// server abandons its logger thread, and that thread keeps this LockedLog
+// alive through the sink's shared_ptr. Writing one more line after stop()
+// would wait for such a call too, but not on the paths that return without
+// one (a failed start, a ready-file error), and not for a logger thread
+// that was about to call line() rather than inside it.
+// Declared before the Server so that it runs after the Server is destroyed.
+struct LockedLogCloser {
+    std::shared_ptr<LockedLog> log;
+    ~LockedLogCloser() { log->close(); }
 };
 
 class LockedLogSink final : public TelemetrySink {
@@ -513,6 +538,9 @@ void request_shutdown() noexcept { g_shutdown.store(1); }
 int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
     g_shutdown.store(0);
     auto log = std::make_shared<LockedLog>(err);
+    // Last to run on every return path (see LockedLogCloser): after it, no
+    // thread writes to `err`, whichever way the server was stopped.
+    const LockedLogCloser close_log{log};
     const auto usage_error = [&](const std::string& message) {
         log->line("error: " + message + " (see `sonder-infer serve --help`)");
         return 2;
