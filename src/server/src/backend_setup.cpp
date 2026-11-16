@@ -1,5 +1,6 @@
 #include "sonder/inference/backend_setup.hpp"
 #include "llamaserver_config_extensions.hpp"
+#include "config_text.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -148,7 +149,7 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
         return true;
     };
     for (const auto& member : object) {
-        if (unknown(member.first)) return Status(ErrorCode::invalid_argument, "llamaserver config: unknown field '" + member.first + "'");
+        if (unknown(member.first)) return Status(ErrorCode::invalid_argument, "llamaserver config: unknown field '" + detail::bounded_for_message(member.first) + "'");
     }
     if (auto st = load_llamaserver_extensions(object, setup.llamaserver_environment); !st.ok()) return st;
     const auto string_field = [&](const char* key, std::string& out) -> Status {
@@ -211,7 +212,7 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
         if (!tls->is_object()) return Status(ErrorCode::invalid_argument, "llamaserver config: 'tls' must be an object");
         for (const auto& member : tls->as_object()) {
             if (member.first != "ca_bundle_path" && member.first != "pinned_sha256" && member.first != "pinned_cert_path" && member.first != "insecure_skip_verify" && member.first != "server_name" && member.first != "handshake_timeout_ms")
-                return Status(ErrorCode::invalid_argument, "llamaserver config: unknown tls field '" + member.first + "'");
+                return Status(ErrorCode::invalid_argument, "llamaserver config: unknown tls field '" + detail::bounded_for_message(member.first) + "'");
         }
         if (const auto* v = tls->find("ca_bundle_path")) { if (!v->is_string()) return Status(ErrorCode::invalid_argument, "tls.ca_bundle_path must be a string"); setup.llamaserver_ca_bundle_path = v->as_string(); }
         if (const auto* v = tls->find("pinned_sha256")) { if (!v->is_string()) return Status(ErrorCode::invalid_argument, "tls.pinned_sha256 must be a string"); setup.llamaserver_pinned_sha256 = v->as_string(); }
@@ -236,7 +237,7 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
             "sample_interval_ms", "fit_step_factor", "fit_step_align", "fit_min_ctx", "fit_max_attempts", "residency"};
         for (const auto& member : guard->as_object()) {
             if (std::find(std::begin(guard_keys), std::end(guard_keys), member.first) == std::end(guard_keys))
-                return Status(ErrorCode::invalid_argument, "llamaserver config: unknown spill_guard field '" + member.first + "'");
+                return Status(ErrorCode::invalid_argument, "llamaserver config: unknown spill_guard field '" + detail::bounded_for_message(member.first) + "'");
         }
         const auto bad = [](const char* key, const char* range) {
             return Status(ErrorCode::invalid_argument, std::string("llamaserver config: spill_guard.") + key + " must be " + range);
@@ -276,7 +277,7 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
         for (const auto& member : guard->as_object()) {
             if (std::find(std::begin(guard_keys), std::end(guard_keys), member.first) == std::end(guard_keys))
                 return Status(ErrorCode::invalid_argument,
-                              "llamaserver config: unknown stall_guard field '" + member.first + "'");
+                              "llamaserver config: unknown stall_guard field '" + detail::bounded_for_message(member.first) + "'");
         }
         const auto bad = [](const char* key, const char* range) {
             return Status(ErrorCode::invalid_argument,
@@ -414,7 +415,7 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
 #endif
     }
     return Status(ErrorCode::invalid_argument,
-                  "unknown backend '" + setup.backend + "' (expected mock, ollama, llamacpp or llamaserver)");
+                  "unknown backend '" + detail::bounded_for_message(setup.backend) + "' (expected mock, ollama, llamacpp or llamaserver)");
 }
 
 Status validate_backend_setup(const BackendSetup& setup) {

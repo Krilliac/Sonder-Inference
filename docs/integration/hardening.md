@@ -80,6 +80,9 @@ formats), seed corpora under `fuzz/corpus/<target>/`, and
    `sonder_inference` (PRIVATE compile, INTERFACE link) so normal builds are
    untouched. With MSVC/GCC it falls back to `SONDER_FUZZ_ENGINE=standalone`
    (replay-only driver, `standalone_main.cpp`).
+   On Windows, `fuzz/CMakeLists.txt` also defaults `CMAKE_MSVC_RUNTIME_LIBRARY` to
+   `MultiThreaded` for every standalone fuzz engine (not only libFuzzer) unless the
+   caller sets it.
 
 Verified locally: standalone clang build + regress + 60 s runs; in-tree build
 with the snippet below (`-Werror`, fuzz-regress, and the normal 251 tests
@@ -228,19 +231,17 @@ branch)**; the harnesses assert the strict invariants again.
 **Status: fixed (this branch).** `parse_child_metrics` resets the result to a default value on every invalid path.
 
 `valid == false` does not mean "empty": values parsed before the bad line stay
-in the result. Input `llamacpp:prompt_tokens_total 10
-llamacpp:requests_processing -1
-`
+in the result. Input `llamacpp:prompt_tokens_total 10\nllamacpp:requests_processing -1\n`
 yields `valid == false` with `prompt_tokens_total == 10`. `parse_child_slots`
 does clear its result on error. Consumers are safe today:
 `ChildMetricsSampler::sample_at` (same file, around the `metrics_valid`
 check) returns before publishing a snapshot when `valid` is false. A future
 caller that reads the counters without checking `valid` would see a half
-payload. **Fix:** `return ChildMetricCounters{.valid = false}` on the invalid
-paths (or reset `result` before returning), then the harness can assert
+payload. **Fix (done):** `parse_child_metrics` now resets the result to a
+default `ChildMetricCounters` on every invalid path, and the harness asserts
 "invalid implies default" again.
 
-### F2. "unknown field" config errors echo the whole key, `src/server/src/residency_config.cpp:29`, `src/server/src/warmup_config.cpp:15`
+### F2. "unknown field" config errors echo the whole key, `src/server/src/residency_config.cpp:31`, `src/server/src/warmup_config.cpp:18`, `src/server/src/backend_setup.cpp`, `src/server/src/launch_profile.cpp`
 
 **Status: fixed (this branch).** The echoed key is cut to 64 bytes on a UTF-8 boundary with `...` appended (`src/server/src/config_text.hpp`).
 
@@ -249,9 +250,15 @@ into the Status message unbounded, so a config with a 1 KiB+ key yields a
 message over 1 KiB (a 990-byte key is enough). The GGUF reader already cuts
 file-controlled text in its errors for the same reason. Reproducer: `{"` +
 990 x `k` + `":1}` as the document (also under `residency` or `warmup`).
-**Fix:** truncate the key to ~64 bytes in both messages. The harness allows the
-key-echo messages to exceed 1 KiB (up to 3x the input, since ill-formed bytes
-become U+FFFD) and nothing else.
+**Fix (done):** the echoed text is cut to 64 bytes in both messages, and in
+every other message that echoes a caller-supplied key or value:
+the top-level, `tls`, `spill_guard` and `stall_guard` unknown-field errors and
+the unknown backend name in `backend_setup.cpp`, and in `launch_profile.cpp`
+the unknown-field errors (profile and file level), the profile name used as
+the error location, the unknown speculative type, the duplicate profile name
+and the flag echoed by the `extra_args` refusals. The harness now requires
+every error message to be under 1 KiB with no exception
+(`fuzz/fuzz_backend_config.cpp`).
 
 ### Observations
 

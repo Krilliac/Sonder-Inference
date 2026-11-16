@@ -1,2 +1,0 @@
-Allamacpp:prompt_tokens_total 10
-llamacpp:requests_processing -1

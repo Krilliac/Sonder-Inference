@@ -57,7 +57,7 @@ struct Piece {
     std::string reasoning;
 };
 
-// Cuts `input` into 1..4 byte-length-varied pieces at UTF-8 boundaries so a
+// Cuts `input` into 1..29 byte-length-varied pieces at UTF-8 boundaries so a
 // valid input yields valid pieces. The low bits of each piece's first byte
 // choose whether it is text, reasoning, both, or empty.
 std::vector<Piece> make_pieces(std::string_view input) {
