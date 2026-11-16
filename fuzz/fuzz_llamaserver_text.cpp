@@ -11,8 +11,7 @@
 //   * metrics: gauges are finite and non-negative whether or not the payload
 //     was accepted; the *valid out-parameter agrees with
 //     ChildMetricCounters::valid; derived speculation values are finite and
-//     non-negative. (An invalid payload is NOT guaranteed to yield a default
-//     result; see finding F1 in docs/integration/hardening.md.)
+//     non-negative; an invalid payload yields an empty (default) result.
 //   * slots: a valid result has at most 1024 entries; an invalid one is empty.
 //   * LogDiagnostics: feeding the text in a fuzz-chosen split then finish()
 //     gives exactly the same warnings (code, severity, source, message,
@@ -54,11 +53,9 @@ void check_metrics(std::string_view text) {
     SONDER_FUZZ_CHECK(sane(m.prompt_tokens_seconds) && sane(m.predicted_tokens_seconds) &&
                       sane(m.n_busy_slots_per_decode) && sane(m.kv_cache_usage_ratio));
     SONDER_FUZZ_CHECK(m.spec_decode_accepted_tokens_per_position.size() <= 256);
-    // Known deviation (docs/integration/hardening.md, finding F1): a rejected
-    // payload keeps the values read before the bad line, so "invalid implies
-    // default" does not hold. ChildMetricsSampler::sample_at() drops the result
-    // when valid is false, so only validity and sanity are asserted for it.
-    if (m.valid) {
+    if (!m.valid) {
+        SONDER_FUZZ_CHECK(metrics_empty(m));
+    } else {
         SONDER_FUZZ_CHECK(!metrics_empty(m) || text.find("llamacpp:") != std::string_view::npos);
     }
     ls::ChildMetricsOptions options;

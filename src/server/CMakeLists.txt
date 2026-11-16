@@ -43,6 +43,7 @@ sonder_add_module_tests(server
     tests/test_server_residency.cpp
     tests/test_server_runtime.cpp
     tests/test_residency_config.cpp
+    tests/test_warmup_config.cpp
     tests/test_server_request_path.cpp
     tests/test_priority_parsing.cpp
     tests/test_priority_admission.cpp

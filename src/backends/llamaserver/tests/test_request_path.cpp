@@ -327,6 +327,29 @@ TEST_SUITE("llamaserver_request_path") {
         CHECK_FALSE(timings.prompt_n.has_value());
     }
 
+    TEST_CASE("Timings overload resets its output on every error path") {
+        const char *const invalid[] = {
+            R"({"timings":5})",
+            R"({"timings":{"prompt_n":3,"draft_n":2,"draft_n_accepted":3}})",
+            R"({"timings":{"prompt_n":3,"predicted_per_second":-1}})",
+            R"({"timings":{"prompt_n":3,"prompt_ms":-1}})",
+            R"({"timings":{"prompt_n":3,"predicted_ms":"x"}})",
+            R"({"timings":{"prompt_n":3,"predicted_n":-1}})"};
+        for (const char *text : invalid) {
+            CAPTURE(text);
+            llamaserver::Timings timings;
+            REQUIRE(llamaserver::parse_timings(parse(R"({"timings":{"prompt_n":9,"predicted_per_second":4}})"), timings)
+                        .ok());
+            REQUIRE(timings.present);
+            CHECK_FALSE(llamaserver::parse_timings(parse(text), timings).ok());
+            CHECK_FALSE(timings.present);
+            CHECK_FALSE(timings.prompt_present);
+            CHECK(timings.prompt_tokens == 0);
+            CHECK(timings.predicted_tokens_per_second == 0.0);
+            CHECK_FALSE(timings.backend_timings.has_value());
+        }
+    }
+
     TEST_CASE("partial timing frames merge without losing fields and preserve zero") {
         std::optional<BackendTimings> merged;
         BackendTimings first;

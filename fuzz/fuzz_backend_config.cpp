@@ -16,8 +16,7 @@
 //
 // Invariants:
 //   * nothing crashes, hangs, or trips ASan/UBSan on arbitrary documents.
-//   * an error Status has a non-empty message of at most 1 KiB (except the
-//     key-echoing "unknown ... field" messages, finding F2).
+//   * an error Status has a non-empty message under 1 KiB.
 //   * residency: a rejected document leaves the setup unchanged; an accepted
 //     one has min_dedicated_mib in [1, 1048576], consecutive_samples in
 //     [1, 1000], eviction_fraction finite in [0, 1], eviction_mib in
@@ -28,7 +27,7 @@
 //   * apply_residency_config() on arbitrary field values either rejects or
 //     yields a guard that passes validate_residency_guard() without
 //     overflowing the MiB conversion.
-//   * warmup: an accepted config has max_prefix_chars in [1, 16777216], unique
+//   * warmup: a rejected config leaves the setup unchanged; an accepted config has max_prefix_chars in [1, 16777216], unique
 //     slot ids <= 1023 (none when "all"), and no NUL in messages_file.
 //   * extensions: an accepted env has at most 128 entries, non-empty keys
 //     without '=' or NUL, values without NUL, within 32760 bytes in total.
@@ -59,21 +58,10 @@ namespace det = sonder::inference::detail;
 
 namespace {
 
-std::size_t g_input_size = 0;
-
-// Known deviation (docs/integration/hardening.md, finding F2): the "unknown
-// ... field '<key>'" messages of parse_residency_config / parse_warmup_config
-// echo the whole key, so they exceed 1 KiB for a long key. Those (and only
-// those) may exceed the bound, by at most 3x the input size (the JSON parser
-// turns each ill-formed input byte into a 3-byte U+FFFD in the key).
 void check_status(const si::Status& st) {
     if (!st.ok()) {
         SONDER_FUZZ_CHECK(!st.message().empty());
-        const std::string& m = st.message();
-        if (m.size() > 1024) {
-            SONDER_FUZZ_CHECK(m.find(" unknown ") != std::string::npos && m.find(" field '") != std::string::npos);
-            SONDER_FUZZ_CHECK(m.size() <= 1024 + 3 * g_input_size);
-        }
+        SONDER_FUZZ_CHECK(st.message().size() < 1024);
     }
 }
 
@@ -147,9 +135,24 @@ void check_apply_direct(std::string_view bytes) {
 
 void check_warmup(const si::json::Value& doc) {
     si::BackendSetup setup;
+    // Start from non-default values so any partial write is visible.
+    setup.llamaserver_warmup_messages_file = "keep";
+    setup.llamaserver_warmup_on_restart = !setup.llamaserver_warmup_on_restart;
+    setup.llamaserver_warmup_all_slots = false;
+    setup.llamaserver_warmup_slots = {7, 9};
+    const auto before_max = setup.llamaserver_warmup_max_prefix_chars;
+    const auto before_restart = setup.llamaserver_warmup_on_restart;
     const si::Status st = det::parse_warmup_config(doc, setup);
     check_status(st);
-    if (!st.ok()) return;
+    if (!st.ok()) {
+        SONDER_FUZZ_CHECK(setup.llamaserver_warmup_messages_file == "keep");
+        SONDER_FUZZ_CHECK(setup.llamaserver_warmup_chat_template_kwargs.empty());
+        SONDER_FUZZ_CHECK(setup.llamaserver_warmup_on_restart == before_restart);
+        SONDER_FUZZ_CHECK(setup.llamaserver_warmup_max_prefix_chars == before_max);
+        SONDER_FUZZ_CHECK(!setup.llamaserver_warmup_all_slots);
+        SONDER_FUZZ_CHECK(setup.llamaserver_warmup_slots == std::vector<std::uint32_t>({7, 9}));
+        return;
+    }
     SONDER_FUZZ_CHECK(setup.llamaserver_warmup_messages_file.find('\0') == std::string::npos);
     SONDER_FUZZ_CHECK(setup.llamaserver_warmup_max_prefix_chars >= 1 &&
                       setup.llamaserver_warmup_max_prefix_chars <= 16777216u);
@@ -203,6 +206,10 @@ void check_timings_and_props(const si::json::Value& doc) {
     ls::Timings t;
     const si::Status t_st = ls::parse_timings(doc, t);
     check_status(t_st);
+    if (!t_st.ok()) {
+        SONDER_FUZZ_CHECK(!t.present && !t.backend_timings && t.prompt_tokens == 0 && t.cached_tokens == 0 &&
+                          t.completion_tokens == 0 && t.draft_tokens == 0 && t.draft_accepted_tokens == 0);
+    }
     if (t_st.ok()) {
         SONDER_FUZZ_CHECK(!t.draft_present || !t.draft_accepted_present || t.draft_accepted_tokens <= t.draft_tokens);
         SONDER_FUZZ_CHECK(std::isfinite(t.predicted_tokens_per_second) && t.predicted_tokens_per_second >= 0.0);
@@ -229,7 +236,6 @@ void check_timings_and_props(const si::json::Value& doc) {
 
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
     const std::string_view input = sonder_fuzz::as_view(data, size);
-    g_input_size = size;
     check_apply_direct(input);
 
     const auto parsed = si::json::parse(input);

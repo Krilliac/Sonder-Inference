@@ -220,11 +220,12 @@ integration follow-up after #13.
 
 No crashes, hangs or sanitizer reports in any of the four targets (120 s
 each, see the run summary in the PR that added them). Two invariant
-deviations were found; both are benign today, the harnesses assert the
-weaker true property and mark the exception with a comment. Neither is fixed
-here (no `src/` changes in this change).
+deviations and two observations were found. **All four are fixed (this
+branch)**; the harnesses assert the strict invariants again.
 
 ### F1. `parse_child_metrics` returns partial counters for an invalid payload, `src/backends/llamaserver/child_metrics.cpp`
+
+**Status: fixed (this branch).** `parse_child_metrics` resets the result to a default value on every invalid path.
 
 `valid == false` does not mean "empty": values parsed before the bad line stay
 in the result. Input `llamacpp:prompt_tokens_total 10
@@ -241,6 +242,8 @@ paths (or reset `result` before returning), then the harness can assert
 
 ### F2. "unknown field" config errors echo the whole key, `src/server/src/residency_config.cpp:29`, `src/server/src/warmup_config.cpp:15`
 
+**Status: fixed (this branch).** The echoed key is cut to 64 bytes on a UTF-8 boundary with `...` appended (`src/server/src/config_text.hpp`).
+
 `parse_residency_config` and `parse_warmup_config` put the unknown member name
 into the Status message unbounded, so a config with a 1 KiB+ key yields a
 message over 1 KiB (a 990-byte key is enough). The GGUF reader already cuts
@@ -250,13 +253,13 @@ file-controlled text in its errors for the same reason. Reproducer: `{"` +
 key-echo messages to exceed 1 KiB (up to 3x the input, since ill-formed bytes
 become U+FFFD) and nothing else.
 
-### Observations (not asserted)
+### Observations
 
-* `parse_warmup_config` mutates `setup` before it finishes validating (e.g. a
+* **Fixed (this branch).** `parse_warmup_config` mutates `setup` before it finishes validating (e.g. a
   NUL-containing `messages_file` is stored, then rejected), so a rejected
   config leaves a partly applied setup. `parse_residency_config` is atomic.
   Callers appear to discard the setup on error.
-* `llamaserver::parse_timings(Value, Timings&)` does not reset `out` on
+* **Fixed (this branch).** `llamaserver::parse_timings(Value, Timings&)` does not reset `out` on
   error (the `BackendTimings` overload does).
 
 ### Not covered

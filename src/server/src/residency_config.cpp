@@ -1,5 +1,7 @@
 #include "residency_config.hpp"
 
+#include "config_text.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <string_view>
@@ -26,7 +28,7 @@ Status parse_residency_config(const json::Value &value, BackendSetup &setup) {
     for (const auto &member : value.as_object()) {
         if (std::find(std::begin(keys), std::end(keys), member.first) == std::end(keys))
             return Status(ErrorCode::invalid_argument,
-                          "llamaserver config: unknown spill_guard.residency field '" + member.first + "'");
+                          "llamaserver config: unknown spill_guard.residency field '" + bounded_for_message(member.first) + "'");
     }
 
     Config parsed = setup.llamaserver_residency;
