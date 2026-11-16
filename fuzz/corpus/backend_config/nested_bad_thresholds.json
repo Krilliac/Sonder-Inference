@@ -1,0 +1,1 @@
+{"spill_guard":{"residency":{"eviction_fraction":0,"eviction_mib":0}},"warmup":{"messages_file":"warm.json","slots":[0,1,2],"on_restart":false,"max_prefix_chars":4096,"chat_template_kwargs":{"enable_thinking":false}}}

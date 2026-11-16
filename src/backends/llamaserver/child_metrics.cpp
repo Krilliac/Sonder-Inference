@@ -203,6 +203,8 @@ ChildMetricCounters parse_child_metrics(std::string_view text, bool *valid_out) 
         }
         offset = end_line == std::string_view::npos ? text.size() : end_line + 1;
     }
+    if (!(valid && found))
+        result = ChildMetricCounters{};
     result.valid = valid && found;
     if (valid_out)
         *valid_out = result.valid;

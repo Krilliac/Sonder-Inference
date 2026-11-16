@@ -294,6 +294,24 @@ TEST_CASE("launch profile: extra_args refuse remote RPC offload") {
     }
 }
 
+TEST_CASE("launch profile: unknown-field errors bound the echoed key") {
+    const std::string longkey(990, 'k');
+    const std::string base = R"("name":"a","backend":"llamacpp","model":"m")";
+    const auto profile_error = parse_error("{" + base + ",\"" + longkey + "\":1}");
+    CHECK(profile_error.size() < 128);
+    CHECK(contains(profile_error, std::string(64, 'k') + "...'"));
+    CHECK_FALSE(contains(profile_error, std::string(65, 'k')));
+
+    auto doc = json::parse("{\"profiles\":[],\"" + longkey + "\":1}");
+    REQUIRE(doc.ok());
+    auto parsed = si::parse_launch_profiles(doc.value());
+    REQUIRE_FALSE(parsed.ok());
+    const std::string file_error = parsed.status().message();
+    CHECK(file_error.size() < 128);
+    CHECK(contains(file_error, std::string(64, 'k') + "...'"));
+    CHECK_FALSE(contains(file_error, std::string(65, 'k')));
+}
+
 TEST_CASE("launch profile: file-level validation") {
     const auto error = [](const std::string& text) {
         auto doc = json::parse(text);

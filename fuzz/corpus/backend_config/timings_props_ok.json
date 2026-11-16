@@ -1,0 +1,1 @@
+{"timings":{"prompt_n":12,"cache_n":4,"prompt_ms":10.5,"predicted_n":30,"predicted_ms":700.25,"predicted_per_second":42.8,"draft_n":10,"draft_n_accepted":7},"n_ctx":8192,"total_slots":4}

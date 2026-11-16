@@ -1,5 +1,7 @@
 #include <doctest/doctest.h>
 
+#include <string>
+
 #include "../src/residency_config.hpp"
 
 using namespace sonder::inference;
@@ -42,6 +44,23 @@ TEST_CASE("residency config parser rejects malformed and unsafe values") {
         BackendSetup setup;
         CHECK_MESSAGE(!detail::parse_residency_config(parse(text), setup).ok(), text);
     }
+}
+
+TEST_CASE("residency config unknown-field error bounds the echoed key") {
+    BackendSetup setup;
+    const auto value = parse((std::string("{\"") + std::string(990, 'k') + "\":1}").c_str());
+    const auto st = detail::parse_residency_config(value, setup);
+    REQUIRE_FALSE(st.ok());
+    CHECK(st.message().size() < 1024);
+    CHECK(st.message().find(std::string(64, 'k') + "...") != std::string::npos);
+    CHECK(st.message().find(std::string(65, 'k')) == std::string::npos);
+    const auto shortkey = detail::parse_residency_config(parse(R"({"zzz":1})"), setup);
+    CHECK(shortkey.message().find("'zzz'") != std::string::npos);
+    // A multi-byte character straddling the 64 byte limit is dropped whole.
+    const auto utf8 = parse((std::string("{\"") + std::string(63, 'k') + "\xC3\xA9" + std::string(10, 'k') + "\":1}").c_str());
+    const auto cut = detail::parse_residency_config(utf8, setup);
+    CHECK(cut.message().find(std::string(63, 'k') + "...") != std::string::npos);
+    CHECK(cut.message().find("\xC3") == std::string::npos);
 }
 
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)

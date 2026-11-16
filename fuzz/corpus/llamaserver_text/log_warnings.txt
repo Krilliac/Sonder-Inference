@@ -1,0 +1,9 @@
+7load_tensors: offloaded 20/41 layers to GPU
+llama_model_load: model has unused tensor blk.40.nextn.eh_proj (size = 1024 bytes) -- ignoring
+model has unused tensor blk.40.nextn.shared_head_norm (size = 4096 bytes) -- ignoring
+ggml: no FlashAttention vector kernel compiled for K/V types q8_0-q4_0, converting K and V to f16 instead (slow)
+tensor output.weight cannot be used with preferred buffer type CUDA_Host, using CPU instead
+no usable GPU found
+failed to initialize CUDA
+no usable GPU found
+partial line
