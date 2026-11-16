@@ -1,6 +1,7 @@
 // Launch profiles: schema, validation, llama-server argv, llamacpp mapping,
 // sampling defaults and /v1/models metadata. See launch_profile.hpp.
 #include "sonder/inference/launch_profile.hpp"
+#include "config_text.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -22,7 +23,7 @@ Status bad(const std::string& where, const std::string& message) {
     return Status(ErrorCode::invalid_argument, "launch profile " + where + ": " + message);
 }
 
-std::string where_of(const LaunchProfile& p) { return p.name.empty() ? std::string("(unnamed)") : "'" + p.name + "'"; }
+std::string where_of(const LaunchProfile& p) { return p.name.empty() ? std::string("(unnamed)") : "'" + detail::bounded_for_message(p.name) + "'"; }
 
 bool valid_name(std::string_view name) {
     if (name.empty() || name.size() > 128 || name == "default") return false;
@@ -146,8 +147,8 @@ Status check_extra_args(const LaunchProfile& p) {
         // `--mcp_servers_json` as `--mcp-servers-json`.
         const std::string flag = llamaserver_flag_name(arg);
         const std::string_view written = std::string_view(arg).substr(0, arg.find('='));
-        const std::string refused = "extra_args must not contain " + std::string(written) +
-                                    (written == flag ? std::string() : ", which llama-server reads as " + flag);
+        const std::string refused = "extra_args must not contain " + detail::bounded_for_message(written) +
+                                    (written == flag ? std::string() : ", which llama-server reads as " + detail::bounded_for_message(flag));
         if (listed(kForbiddenFlags, flag)) {
             return bad(where_of(p), refused +
                                         " (the supervisor owns host and port; credentials and downloads are not "
@@ -190,7 +191,7 @@ public:
     Status check_keys(std::initializer_list<std::string_view> known) const {
         for (const auto& member : object_) {
             if (std::find(known.begin(), known.end(), member.first) == known.end()) {
-                return bad(where_, "unknown field '" + member.first + "'");
+                return bad(where_, "unknown field '" + detail::bounded_for_message(member.first) + "'");
             }
         }
         return {};
@@ -405,7 +406,7 @@ Status validate_launch_profile(const LaunchProfile& p) {
         std::set<std::string> seen;
         for (const auto& t : p.speculative->types) {
             if (std::find(std::begin(kSpeculativeTypes), std::end(kSpeculativeTypes), t) == std::end(kSpeculativeTypes)) {
-                return bad(where, "unknown speculative type '" + t + "'");
+                return bad(where, "unknown speculative type '" + detail::bounded_for_message(t) + "'");
             }
             if (!seen.insert(t).second) return bad(where, "speculative type '" + t + "' is listed twice");
         }
@@ -422,7 +423,7 @@ Status validate_launch_profile(const LaunchProfile& p) {
 Result<std::vector<LaunchProfile>> parse_launch_profiles(const json::Value& document) {
     if (!document.is_object()) return bad("file", "must be a JSON object with a 'profiles' array");
     for (const auto& member : document.as_object()) {
-        if (member.first != "profiles") return bad("file", "unknown field '" + member.first + "'");
+        if (member.first != "profiles") return bad("file", "unknown field '" + detail::bounded_for_message(member.first) + "'");
     }
     const auto* list = document.find("profiles");
     if (!list || !list->is_array() || list->as_array().empty()) {
@@ -437,7 +438,7 @@ Result<std::vector<LaunchProfile>> parse_launch_profiles(const json::Value& docu
         if (!parsed.ok()) return parsed.status();
         if (Status st = validate_launch_profile(parsed.value()); !st.ok()) return st;
         if (!names.insert(parsed.value().name).second) {
-            return bad("'" + parsed.value().name + "'", "the name is used by more than one profile");
+            return bad("'" + detail::bounded_for_message(parsed.value().name) + "'", "the name is used by more than one profile");
         }
         out.push_back(std::move(parsed).value());
     }

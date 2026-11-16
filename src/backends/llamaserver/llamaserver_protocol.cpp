@@ -157,7 +157,8 @@ Status parse_props(const json::Value &value, ServerProps &out) {
     return Status::success();
 }
 
-Status parse_timings(const json::Value &value, Timings &out) {
+namespace {
+Status parse_timings_into(const json::Value &value, Timings &out) {
     out = {};
     const json::Value *t = value.find("timings");
     if (t && !t->is_object() && !t->is_null())
@@ -217,6 +218,14 @@ Status parse_timings(const json::Value &value, Timings &out) {
         raw.draft_n_accepted)
         out.backend_timings = std::move(raw);
     return Status::success();
+}
+} // namespace
+
+Status parse_timings(const json::Value &value, Timings &out) {
+    auto status = parse_timings_into(value, out);
+    if (!status.ok())
+        out = {};
+    return status;
 }
 
 StopReason map_finish_reason(std::string_view reason) {

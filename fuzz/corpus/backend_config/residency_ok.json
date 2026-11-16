@@ -1,0 +1,1 @@
+{"enabled":true,"expect_gpu":true,"min_dedicated_mib":512,"consecutive_samples":3,"eviction_fraction":0.25,"eviction_mib":2048,"on_eviction":"restart","max_eviction_restarts":2}

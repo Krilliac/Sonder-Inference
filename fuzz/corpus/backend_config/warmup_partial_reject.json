@@ -1,0 +1,1 @@
+{"warmup":{"messages_file":"new.json","chat_template_kwargs":{"a":1},"slots":[1,2],"on_restart":"bad"}}
