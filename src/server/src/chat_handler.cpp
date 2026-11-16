@@ -33,7 +33,10 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     ro.parent_request_id = corr.parent_request_id;
     ro.session_key = chat_session_key(job, corr);
     ro.thinking = job.thinking;
-    ro.separate_reasoning = anthropic;
+    // Both protocols ask the backend to split reasoning from visible text.
+    // Anthropic renders it as a thinking block, OpenAI as reasoning_content
+    // (llama-server's convention); neither adds a field when it is empty.
+    ro.separate_reasoning = true;
     std::vector<std::string> warnings = apply_thinking_pins(ex.options, ro.thinking);
     reasoning_budget::apply(job, corr, ex.options, backend, ro, warnings);
     ro.priority_class = priority;
@@ -190,10 +193,15 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     TokenCallback on_chunk;
     if (job.stream) {
         on_chunk = [&](const TokenChunk& chunk) {
+            const auto openai_delta = [&] {
+                json::Object delta;
+                if (!chunk.text.empty() || chunk.reasoning.empty()) delta.set("content", std::string(chunk.text));
+                if (!chunk.reasoning.empty()) delta.set("reasoning_content", std::string(chunk.reasoning));
+                return delta;
+            };
             if (!ensure_stream_head() ||
                 !(anthropic ? send_frame(messages_stream.chunk(chunk))
-                            : send_event(chunk_object(json::Object{{"content", std::string(chunk.text)}},
-                                                      nullptr)))) {
+                            : send_event(chunk_object(openai_delta(), nullptr)))) {
                 session->cancel();
                 return false;
             }
@@ -247,6 +255,8 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
             ex.send_json(200, doc);
             return;
         }
+        json::Object message{{"role", "assistant"}, {"content", r.text}};
+        if (!r.reasoning.empty()) message.set("reasoning_content", r.reasoning);
         json::Object doc{
             {"id", completion_id},
             {"object", "chat.completion"},
@@ -254,7 +264,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
             {"model", model},
             {"choices",
              json::Array{json::Object{{"index", 0},
-                                      {"message", json::Object{{"role", "assistant"}, {"content", r.text}}},
+                                      {"message", std::move(message)},
                                       {"finish_reason", finish_reason(r)}}}},
             {"usage", usage_json(r)},
             {"timings", timings_json(r)},

@@ -458,6 +458,19 @@ Request-path extensions (all optional; see the sections below):
 - `messages` assistant entries may include `reasoning_content` (string). The
   field is forwarded to llamaserver history and dropped by other backends.
 
+Reasoning in the response: when the backend separates the model's reasoning
+from its answer (llamaserver started with a reasoning format such as
+`--reasoning-format deepseek`, or Ollama with thinking on), the non-streaming
+`choices[0].message` carries `reasoning_content` (string) and each streaming
+chunk carries `delta.reasoning_content`, llama-server's convention. This is
+additive and always on, with no request switch. The field appears only when
+reasoning was produced: with thinking off, or a backend that produces none, the
+response is exactly as before. `content` never contains reasoning text, `usage`,
+`timings` and token counts are unchanged, and a streamed reasoning-only chunk
+has `reasoning_content` and no `content`. Reasoning tokens still count in
+`usage.completion_tokens`. The `/v1/messages` endpoint renders the same text
+as `thinking` blocks.
+
 Reasoning budget pins (`--pin-reasoning-budget` and
 `--pin-reasoning-budget-message`) fill only unset request values. For a backend
 that does not support the budget, the request still succeeds and
@@ -506,7 +519,8 @@ Non-streaming response:
 
 With `"stream": true` the response is `text/event-stream`: `data:` lines
 carrying `chat.completion.chunk` objects (the first with
-`delta.role = "assistant"`, then `delta.content` pieces), a final chunk with
+`delta.role = "assistant"`, then `delta.content` pieces, and
+`delta.reasoning_content` pieces when reasoning is produced), a final chunk with
 `finish_reason` plus `timings` and `sonder` (and `usage` when
 `stream_options.include_usage` is true), then `data: [DONE]`. Headers are sent
 with the first chunk, so a request rejected before generation still gets its
