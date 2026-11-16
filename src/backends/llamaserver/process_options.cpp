@@ -9,12 +9,35 @@ extern char **environ;
 #endif
 
 namespace sonder::inference::llamaserver {
+namespace {
+// llama-server's Vertex AI mode (AIP_MODE=PREDICTION) replaces --port with
+// AIP_HTTP_PORT, so the supervisor-owned port could be moved. Windows
+// environment names are case-insensitive, POSIX names are exact.
+template <class String> bool is_aip_name(const String &key) {
+    using Char = typename String::value_type;
+    constexpr std::string_view prefix = "AIP_";
+    if (key.size() < prefix.size()) return false;
+    for (std::size_t i = 0; i < prefix.size(); ++i) {
+        Char c = key[i];
+#if defined(_WIN32)
+        if (c >= Char('a') && c <= Char('z')) c = static_cast<Char>(c - Char('a') + Char('A'));
+#endif
+        if (c != static_cast<Char>(prefix[i])) return false;
+    }
+    return true;
+}
+} // namespace
 Status validate_process_environment(const std::vector<std::pair<std::string, std::string>> &env) {
     std::size_t bytes = 0;
     for (const auto &[key, value] : env) {
         if (key.empty() || key.find('=') != std::string::npos || key.find('\0') != std::string::npos ||
             value.find('\0') != std::string::npos)
             return {ErrorCode::invalid_argument, "invalid child environment entry"};
+        if (is_aip_name(key))
+            return {ErrorCode::invalid_argument,
+                    "child environment override '" + key +
+                        "' is refused: AIP_* variables enable llama-server's Vertex AI mode, which would replace the "
+                        "supervisor-owned port"};
         bytes += key.size() + value.size() + 2;
         if (bytes > 32760 || env.size() > 128)
             return {ErrorCode::invalid_argument, "child environment overrides exceed bounds"};
@@ -47,7 +70,7 @@ ProcessOptions::~ProcessOptions() {
 Status ProcessOptions::prepare(const ProcessSpec &spec) {
     if (auto st = validate_process_environment(spec.environment); !st.ok()) return st;
     startup.StartupInfo.cb = sizeof(STARTUPINFOW);
-    if (!spec.environment.empty()) {
+    {
         std::map<std::wstring, std::wstring, IgnoreCase> entries;
         auto *block = GetEnvironmentStringsW();
         if (!block) return {ErrorCode::io_error, "cannot read inherited environment"};
@@ -58,20 +81,33 @@ Status ProcessOptions::prepare(const ProcessSpec &spec) {
             p += entry.size() + 1;
         }
         FreeEnvironmentStringsW(block);
+        // Inherited AIP_* variables must never reach the child (see is_aip_name);
+        // when any is removed, an explicit block is built even with no overrides.
+        bool cleared = false;
+        for (auto it = entries.begin(); it != entries.end();) {
+            if (is_aip_name(it->first)) {
+                it = entries.erase(it);
+                cleared = true;
+            } else {
+                ++it;
+            }
+        }
         for (const auto &[key, value] : spec.environment) {
             auto k = utf16(key), v = utf16(value);
             if (!k.ok()) return k.status();
             if (!v.ok()) return v.status();
             entries[k.value()] = v.value();
         }
-        for (const auto &[key, value] : entries) {
-            environment.insert(environment.end(), key.begin(), key.end());
-            environment.push_back(L'=');
-            environment.insert(environment.end(), value.begin(), value.end());
+        if (cleared || !spec.environment.empty()) {
+            for (const auto &[key, value] : entries) {
+                environment.insert(environment.end(), key.begin(), key.end());
+                environment.push_back(L'=');
+                environment.insert(environment.end(), value.begin(), value.end());
+                environment.push_back(L'\0');
+            }
             environment.push_back(L'\0');
+            if (environment.size() > 32767) return {ErrorCode::invalid_argument, "merged child environment too large"};
         }
-        environment.push_back(L'\0');
-        if (environment.size() > 32767) return {ErrorCode::invalid_argument, "merged child environment too large"};
     }
     if (spec.output_file.empty()) return {};
     if (spec.output_file.find('\0') != std::string::npos) return {ErrorCode::invalid_argument, "capture path contains NUL"};
@@ -108,17 +144,30 @@ ProcessOptions::~ProcessOptions() {
 }
 Status ProcessOptions::prepare(const ProcessSpec &spec) {
     if (auto st = validate_process_environment(spec.environment); !st.ok()) return st;
-    if (!spec.environment.empty()) {
+    {
         std::map<std::string, std::string> entries;
         for (char **p = environ; p && *p; ++p) {
             const std::string entry(*p);
             const auto split = entry.find('=');
             if (split != std::string::npos) entries[entry.substr(0, split)] = entry.substr(split + 1);
         }
+        // Inherited AIP_* variables must never reach the child (see is_aip_name);
+        // when any is removed, an explicit block is built even with no overrides.
+        bool cleared = false;
+        for (auto it = entries.begin(); it != entries.end();) {
+            if (is_aip_name(it->first)) {
+                it = entries.erase(it);
+                cleared = true;
+            } else {
+                ++it;
+            }
+        }
         for (const auto &[key, value] : spec.environment) entries[key] = value;
-        for (const auto &[key, value] : entries) environment.push_back(key + '=' + value);
-        for (auto &entry : environment) envp.push_back(entry.data());
-        envp.push_back(nullptr);
+        if (cleared || !spec.environment.empty()) {
+            for (const auto &[key, value] : entries) environment.push_back(key + '=' + value);
+            for (auto &entry : environment) envp.push_back(entry.data());
+            envp.push_back(nullptr);
+        }
     }
     if (spec.output_file.empty()) return {};
     if (spec.output_file.find('\0') != std::string::npos) return {ErrorCode::invalid_argument, "capture path contains NUL"};

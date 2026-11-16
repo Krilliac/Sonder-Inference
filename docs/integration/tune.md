@@ -36,7 +36,7 @@ Options:
 | `--out PATH` | Output spawn config, default `tuned.json`. Parent directory must exist. |
 | `--budget-minutes N` | Work budget, default 20; accepts decimals from 0.1 to 1440. |
 | `--grid JSON` | Inline JSON, a JSON file path, or `@PATH`; at most 64 KiB. |
-| `--env KEY=VALUE` | Repeatable child-only overrides, inherited by help and candidate processes and recorded in the config's `env` object. Does not change the parent environment. Avoid secrets: the output stores these values. |
+| `--env KEY=VALUE` | Repeatable child-only overrides, inherited by help and candidate processes and recorded in the config's `env` object. Does not change the parent environment. `AIP_*` names are refused. Avoid secrets: the output stores these values. |
 | `--thorough` | Also measure a prefill of `ctx - 1024` tokens for timed candidates. |
 | `--dry-run` | Print the candidate grid and adaptive measurement rules, then exit. |
 
