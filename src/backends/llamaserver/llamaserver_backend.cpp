@@ -91,7 +91,11 @@ Status validate_options(const LlamaServerBackendOptions &options) {
                 return {ErrorCode::invalid_argument,
                         "llamaserver: spill_guard.policy=auto_fit needs an explicit --ctx-size/-c argument"};
         }
-        return llamaserver::validate_process_arguments(options.args);
+        if (auto st = llamaserver::validate_process_arguments(options.args); !st.ok())
+            return st;
+        // Checked here as well as at spawn, so an AIP_* or malformed override is
+        // refused when the backend is built rather than on the first restart.
+        return llamaserver::validate_process_environment(options.environment);
     }
     if (options.mode != LlamaServerMode::attach)
         return {ErrorCode::invalid_argument, "llamaserver: invalid mode"};
