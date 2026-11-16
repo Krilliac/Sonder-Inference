@@ -70,3 +70,35 @@ TEST_CASE("ollama legacy emit_thinking_chunks still flattens thinking into text"
     REQUIRE(result.ok());
     CHECK(text == "User wants a greeting.Hello, Nate!");
 }
+
+TEST_CASE("ollama separated reasoning adds nothing when the stream has no thinking") {
+    sonder_test::FakeOllamaServer server;
+    sonder_test::StreamScript script;
+    script.body =
+        "{\"model\":\"qwen3:8b\",\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"done\":false}\n"
+        "{\"model\":\"qwen3:8b\",\"message\":{\"role\":\"assistant\",\"content\":\", Nate!\"},"
+        "\"done_reason\":\"stop\",\"done\":true,\"prompt_eval_count\":12,\"eval_count\":8}\n";
+    server.set_chat(script);
+    auto model = load_reasoning_model(server, sonder_test::config_for(server));
+
+    ChatRequest request;
+    request.messages = {{"user", "hi"}};
+    std::string text_plain;
+    auto plain = model->chat(request, {}, [&](const TokenChunk &chunk) {
+        text_plain += chunk.text;
+        return true;
+    });
+    REQUIRE(plain.ok());
+
+    request.separate_reasoning = true;
+    std::string text;
+    auto result = model->chat(request, {}, [&](const TokenChunk &chunk) {
+        text += chunk.text;
+        CHECK(chunk.reasoning.empty());
+        return true;
+    });
+    REQUIRE(result.ok());
+    CHECK(text == "Hello, Nate!");
+    CHECK(text == text_plain);
+    CHECK(result.value().completion_tokens == plain.value().completion_tokens);
+}

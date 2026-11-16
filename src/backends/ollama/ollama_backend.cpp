@@ -139,8 +139,9 @@ private:
                 ++index;
             };
             if (separate_reasoning) {
-                // Anthropic-compatible callers need thinking kept out of the
-                // visible text stream. The old emit_thinking_chunks behavior
+                // Both server protocols (Anthropic thinking blocks, OpenAI
+                // reasoning_content) need thinking kept out of the visible
+                // text stream. The old emit_thinking_chunks behavior
                 // remains unchanged when this opt-in is false.
                 deliver(c.content, c.thinking);
             } else {

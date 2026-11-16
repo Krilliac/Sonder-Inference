@@ -3,6 +3,8 @@
 // in telemetry envelopes, and cancellation on client disconnect.
 #include <doctest/doctest.h>
 
+#include <atomic>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
@@ -27,6 +29,65 @@ std::vector<std::string> sse_data(const std::string& body) {
         pos = end == std::string::npos ? body.size() : end + 2;
     }
     return out;
+}
+
+namespace si = sonder::inference;
+
+// Native-chat backend that replays scripted chunks (text, reasoning) and records
+// whether the server asked for separated reasoning.
+struct ScriptedBackend final : si::Backend {
+    struct Model final : si::BackendModel {
+        si::ModelDescriptor description;
+        std::vector<std::pair<std::string, std::string>> chunks;
+        std::atomic<bool> separate_reasoning{false};
+        Model() {
+            description.name = "scripted:test";
+            description.backend = "scripted-test";
+            description.context_length = 2048;
+        }
+        const si::ModelDescriptor& descriptor() const override { return description; }
+        bool has_native_chat() const override { return true; }
+        si::Result<si::GenerateStats> generate(const si::GenerateRequest&, const si::CancellationToken&,
+                                              const si::TokenCallback&) override {
+            return si::Status(si::ErrorCode::internal, "this test requires native chat");
+        }
+        si::Result<si::GenerateStats> chat(const si::ChatRequest& request, const si::CancellationToken&,
+                                          const si::TokenCallback& callback) override {
+            separate_reasoning.store(request.separate_reasoning);
+            std::uint64_t index = 0;
+            for (const auto& [text, reasoning] : chunks) {
+                if (callback && !callback(si::TokenChunk{text, index++, reasoning})) break;
+            }
+            si::GenerateStats stats;
+            stats.chunks = index;
+            stats.prompt_tokens = 5;
+            stats.completion_tokens = 7;
+            stats.token_counts_from_backend = true;
+            stats.stop_reason = si::StopReason::end_of_sequence;
+            return stats;
+        }
+    };
+    std::shared_ptr<Model> model = std::make_shared<Model>();
+    std::string name() const override { return "scripted-test"; }
+    std::string description() const override { return "scripted reasoning test backend"; }
+    si::BackendCapabilities capabilities() const override {
+        return si::BackendCapabilities{}.add(si::Capability::streaming);
+    }
+    si::Result<std::string> probe() override { return std::string("test"); }
+    si::Result<std::vector<si::ModelDescriptor>> list_models() override {
+        return std::vector<si::ModelDescriptor>{model->descriptor()};
+    }
+    si::Result<std::shared_ptr<si::BackendModel>> load_model(const si::ModelLoadOptions&) override {
+        return std::static_pointer_cast<si::BackendModel>(model);
+    }
+};
+
+srv::ServerOptions scripted_options(const std::shared_ptr<ScriptedBackend>& backend) {
+    auto options = Fixture::defaults();
+    options.models = {"scripted:test"};
+    options.backend.backend.clear();
+    options.backend_instance = backend;
+    return options;
 }
 
 }  // namespace
@@ -433,4 +494,116 @@ TEST_CASE("chat: a client disconnect cancels the request (request.cancelled)") {
     }
     // The server keeps serving.
     CHECK(post(f.port, "/v1/chat/completions", chat_body(R"(,"max_tokens":2)")).status == 200);
+}
+
+TEST_CASE("chat: non-streaming message carries reasoning_content only when reasoning was produced") {
+    auto backend = std::make_shared<ScriptedBackend>();
+    backend->model->chunks = {{"", "step one, "}, {"", "step two"}, {"No, 91 ", ""}, {"is not prime.", ""}};
+    Fixture f(scripted_options(backend));
+    const Reply r = post(f.port, "/v1/chat/completions", chat_body());
+    REQUIRE_MESSAGE(r.status == 200, r.body);
+    CHECK(backend->model->separate_reasoning.load());
+    const json::Value doc = r.json();
+    const json::Value& message = *doc.find("choices")->as_array()[0].find("message");
+    CHECK(message.find("content")->as_string() == "No, 91 is not prime.");
+    REQUIRE(message.find("reasoning_content") != nullptr);
+    CHECK(message.find("reasoning_content")->as_string() == "step one, step two");
+    CHECK(doc.find("usage")->find("prompt_tokens")->as_int() == 5);
+    CHECK(doc.find("usage")->find("completion_tokens")->as_int() == 7);
+    CHECK(doc.find("timings")->find("predicted_n")->as_int() == 7);
+
+    backend->model->chunks = {{"plain ", ""}, {"answer", ""}};
+    const Reply none = post(f.port, "/v1/chat/completions", chat_body());
+    REQUIRE_MESSAGE(none.status == 200, none.body);
+    const json::Value none_doc = none.json();
+    const json::Value& none_message = *none_doc.find("choices")->as_array()[0].find("message");
+    CHECK(none_message.find("content")->as_string() == "plain answer");
+    CHECK(none_message.find("reasoning_content") == nullptr);
+}
+
+TEST_CASE("chat: streaming deltas carry reasoning_content next to content") {
+    auto backend = std::make_shared<ScriptedBackend>();
+    backend->model->chunks = {{"", "think "}, {"", "more"}, {"No, ", ""}, {"91 is not prime.", ""}};
+    Fixture f(scripted_options(backend));
+    const Reply r = post(f.port, "/v1/chat/completions",
+                         chat_body(R"(,"stream":true,"stream_options":{"include_usage":true})"));
+    REQUIRE_MESSAGE(r.status == 200, r.body);
+    const auto events = sse_data(r.body);
+    REQUIRE(events.size() >= 4);
+    CHECK(events.back() == "[DONE]");
+    std::string text;
+    std::string reasoning;
+    for (std::size_t i = 0; i + 1 < events.size(); ++i) {
+        auto chunk = json::parse(events[i]);
+        REQUIRE(chunk.ok());
+        const json::Value* delta = chunk.value().find("choices")->as_array()[0].find("delta");
+        if (const json::Value* c = delta->find("content")) text += c->as_string();
+        if (const json::Value* rc = delta->find("reasoning_content")) {
+            CHECK(delta->find("content") == nullptr);
+            reasoning += rc->as_string();
+        }
+        if (i + 2 == events.size()) {
+            CHECK(chunk.value().find("usage")->find("completion_tokens")->as_int() == 7);
+            CHECK(chunk.value().find("timings")->find("predicted_n")->as_int() == 7);
+        }
+    }
+    CHECK(text == "No, 91 is not prime.");
+    CHECK(reasoning == "think more");
+
+    backend->model->chunks = {{"plain ", ""}, {"answer", ""}};
+    const Reply none = post(f.port, "/v1/chat/completions", chat_body(R"(,"stream":true)"));
+    REQUIRE_MESSAGE(none.status == 200, none.body);
+    CHECK(none.body.find("reasoning_content") == std::string::npos);
+}
+
+TEST_CASE("chat: a chunk carrying both content and reasoning keeps both fields") {
+    auto backend = std::make_shared<ScriptedBackend>();
+    backend->model->chunks = {{"answer", "because"}};
+    Fixture f(scripted_options(backend));
+
+    const Reply plain = post(f.port, "/v1/chat/completions", chat_body());
+    REQUIRE_MESSAGE(plain.status == 200, plain.body);
+    const json::Value doc = plain.json();
+    const json::Value& message = *doc.find("choices")->as_array()[0].find("message");
+    REQUIRE(message.find("content") != nullptr);
+    REQUIRE(message.find("reasoning_content") != nullptr);
+    CHECK(message.find("content")->as_string() == "answer");
+    CHECK(message.find("reasoning_content")->as_string() == "because");
+
+    const Reply streamed = post(f.port, "/v1/chat/completions", chat_body(R"(,"stream":true)"));
+    REQUIRE_MESSAGE(streamed.status == 200, streamed.body);
+    const auto events = sse_data(streamed.body);
+    bool seen = false;
+    for (std::size_t i = 0; i + 1 < events.size(); ++i) {
+        auto chunk = json::parse(events[i]);
+        REQUIRE(chunk.ok());
+        const json::Value* delta = chunk.value().find("choices")->as_array()[0].find("delta");
+        if (delta->find("reasoning_content") == nullptr) continue;
+        seen = true;
+        REQUIRE(delta->find("content") != nullptr);
+        CHECK(delta->find("content")->as_string() == "answer");
+        CHECK(delta->find("reasoning_content")->as_string() == "because");
+    }
+    CHECK(seen);
+}
+
+TEST_CASE("chat: streaming deltas keep backend order, reasoning chunks before content chunks") {
+    auto backend = std::make_shared<ScriptedBackend>();
+    backend->model->chunks = {{"", "r1"}, {"", "r2"}, {"c1", ""}, {"c2", ""}};
+    Fixture f(scripted_options(backend));
+    const Reply r = post(f.port, "/v1/chat/completions", chat_body(R"(,"stream":true)"));
+    REQUIRE_MESSAGE(r.status == 200, r.body);
+    const auto events = sse_data(r.body);
+    std::vector<std::string> order;
+    for (std::size_t i = 0; i + 1 < events.size(); ++i) {
+        auto chunk = json::parse(events[i]);
+        REQUIRE(chunk.ok());
+        const json::Value* delta = chunk.value().find("choices")->as_array()[0].find("delta");
+        if (const json::Value* rc = delta->find("reasoning_content")) order.push_back("r:" + rc->as_string());
+        if (const json::Value* c = delta->find("content"); c && !c->as_string().empty()) {
+            order.push_back("c:" + c->as_string());
+        }
+    }
+    const std::vector<std::string> expected{"r:r1", "r:r2", "c:c1", "c:c2"};
+    CHECK(order == expected);
 }
