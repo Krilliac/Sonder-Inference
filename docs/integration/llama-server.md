@@ -257,6 +257,9 @@ nor a new route on Sonder's HTTP server or C ABI.
 
 - Spawn always appends its own `--host 127.0.0.1` and ephemeral `--port`.
   User host/port overrides and argument-list terminators are rejected.
+  `AIP_*` environment overrides are refused and an inherited `AIP_MODE` is
+  cleared from the child's environment, because llama-server's Vertex AI mode
+  would replace the supervisor-owned port.
   `--host 0.0.0.0` is never accepted. The executable is trusted native code,
   not a sandboxed program.
 - Attach accepts loopback by default. Remote hosts require

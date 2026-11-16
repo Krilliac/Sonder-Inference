@@ -30,7 +30,8 @@
 // %PROGRAMDATA%\llama.cpp\config.ini and %APPDATA%\llama.cpp\config.ini, or
 // /etc/llama.cpp and $XDG_CONFIG_HOME/~/.config on POSIX); and gcp_params in
 // tools/server/server-http.cpp:83-125 (AIP_MODE=PREDICTION makes
-// AIP_HTTP_PORT replace the --port value).
+// AIP_HTTP_PORT replace the --port value; Sonder refuses AIP_* overrides and
+// clears an inherited AIP_MODE, so that path is closed).
 #include <doctest/doctest.h>
 
 #include <algorithm>
@@ -427,8 +428,8 @@ std::vector<EnvRow> child_env_rows() {
         // name callers expect.
         {"LLAMA_ARG_API_KEY (name not read by 7fe450e)", "LLAMA_ARG_API_KEY", nullptr},
         // Non-LLAMA_ARG names that change what the child does
-        {"AIP_MODE enables the Vertex AI port override", "AIP_MODE", nullptr},
-        {"AIP_HTTP_PORT replaces --port when AIP_MODE=PREDICTION", "AIP_HTTP_PORT", nullptr},
+        // AIP_MODE / AIP_HTTP_PORT (Vertex AI port override) are refused: see
+        // "AIP_MODE never reaches the child" below.
         {"APPDATA chooses the user config.ini (Windows)", "APPDATA", nullptr},
         {"PROGRAMDATA chooses the system config.ini (Windows)", "PROGRAMDATA", nullptr},
         {"XDG_CONFIG_HOME chooses the user config.ini (POSIX)", "XDG_CONFIG_HOME", nullptr},
@@ -735,7 +736,7 @@ TEST_CASE("containment gap: child environment overrides equivalent to refused ll
     // "child-only string environment overrides". With --profile, serve refuses
     // the config's `args` but still applies its `env`.
     const auto rows = child_env_rows();
-    REQUIRE(rows.size() == 40u);
+    REQUIRE(rows.size() == 38u);
 #if defined(SONDER_HAS_SERVER)
     std::size_t profile_refused = 0;
 #endif
@@ -773,33 +774,48 @@ TEST_CASE("containment gap: child environment overrides equivalent to refused ll
 #endif
 }
 
-TEST_CASE("containment gap: AIP_MODE with AIP_HTTP_PORT moves the child off the supervisor-owned port") {
-    // GAP: llama-server.md says spawn appends its own --port and refuses user
-    // port overrides. That holds for argv, but llama-server 7fe450e replaces
-    // the --port value with AIP_HTTP_PORT when AIP_MODE=PREDICTION
-    // (server-http.cpp:117-125), after argv parsing, and the bind host stays
-    // the appended 127.0.0.1. The child then listens on a caller-chosen
-    // loopback port the supervisor never polls (startup fails, or another
-    // local listener on the supervisor's port answers its health checks).
+TEST_CASE("containment: AIP_MODE never reaches the child and AIP_* overrides are refused") {
+    // llama-server 7fe450e replaces the --port value with AIP_HTTP_PORT when
+    // AIP_MODE=PREDICTION (server-http.cpp:117-125; an empty or unset AIP_MODE
+    // leaves it disabled). The supervisor owns the child's port, so AIP_*
+    // overrides are refused and an inherited AIP_MODE is removed from the
+    // child's block.
     CHECK(decision_of(spawn_status({"-m", "m.gguf", "--port", "8080"})) == Decision::refused);
     const std::vector<std::pair<std::string, std::string>> env{{"AIP_MODE", "PREDICTION"}, {"AIP_HTTP_PORT", "8080"}};
-    CHECK(ls::validate_process_environment(env).ok());
-    CHECK(decision_of(spawn_status({"-m", "m.gguf"}, env)) == Decision::accepted);
+    CHECK(ls::validate_process_environment(env).code() == ErrorCode::invalid_argument);
+    CHECK(ls::validate_process_environment({{"AIP_HTTP_PORT", "8080"}}).code() == ErrorCode::invalid_argument);
+    CHECK(ls::validate_process_environment({{"AIP_HEALTH_ROUTE", "/x"}}).code() == ErrorCode::invalid_argument);
+#if defined(_WIN32)
+    CHECK(ls::validate_process_environment({{"aip_mode", "PREDICTION"}}).code() == ErrorCode::invalid_argument);
+#endif
+    CHECK(ls::validate_process_environment({{"AIP", "x"}, {"XAIP_MODE", "x"}}).ok());
+    CHECK(decision_of(spawn_status({"-m", "m.gguf"}, env)) == Decision::refused);
 #if defined(SONDER_HAS_SERVER)
     CHECK(decision_of(config_status(spawn_config(R"({"AIP_MODE":"PREDICTION","AIP_HTTP_PORT":"8080"})"))) ==
-          Decision::accepted);
+          Decision::refused);
 #endif
-    // Inherited too: a Sonder process running in a Vertex AI container has
-    // AIP_MODE=PREDICTION and AIP_HTTP_PORT set, and the child inherits both.
+    // Inherited: a Sonder process running in a Vertex AI container has
+    // AIP_MODE=PREDICTION and AIP_HTTP_PORT set.
     ScopedParentEnv mode("AIP_MODE", std::string("PREDICTION"));
     ScopedParentEnv port("AIP_HTTP_PORT", std::string("8080"));
-    ls::ProcessSpec spec;
-    spec.environment = {{"SONDER_CONTAINMENT_PROBE", "1"}};
-    ls::ProcessOptions options;
-    REQUIRE(options.prepare(spec).ok());
-    const auto entries = prepared_entries(options);
-    CHECK(values_named(entries, "AIP_MODE") == std::vector<std::string>{"PREDICTION"});
-    CHECK(values_named(entries, "AIP_HTTP_PORT") == std::vector<std::string>{"8080"});
+    {
+        ls::ProcessSpec spec;
+        spec.environment = {{"SONDER_CONTAINMENT_PROBE", "1"}};
+        ls::ProcessOptions options;
+        REQUIRE(options.prepare(spec).ok());
+        const auto entries = prepared_entries(options);
+        CHECK(values_named(entries, "SONDER_CONTAINMENT_PROBE") == std::vector<std::string>{"1"});
+        CHECK(values_named(entries, "AIP_MODE").empty());
+    }
+    {
+        // No overrides: the block must still be explicit so AIP_MODE is dropped.
+        ls::ProcessSpec spec;
+        ls::ProcessOptions options;
+        REQUIRE(options.prepare(spec).ok());
+        const auto entries = prepared_entries(options);
+        CHECK_FALSE(entries.empty());
+        CHECK(values_named(entries, "AIP_MODE").empty());
+    }
 }
 
 TEST_CASE("containment gap: inherited LLAMA_ARG and credential variables reach the spawned child") {
