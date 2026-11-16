@@ -626,7 +626,7 @@ TEST_CASE("containment: launch profiles refuse every llama-server spelling of th
     }
     CHECK(rows == 88u);
     // Smuggling through NUL is refused before any name check.
-    for (const std::string smuggled : {std::string("--no-warmup\0--api-key", 21), std::string("x\0-hf", 5),
+    for (const std::string &smuggled : {std::string("--no-warmup\0--api-key", 21), std::string("x\0-hf", 5),
                                        std::string("\0--ssl-key-file", 15)}) {
         CAPTURE(smuggled.size());
         CHECK(profile_struct_status({smuggled, "value"}).code() == ErrorCode::invalid_argument);
