@@ -1,0 +1,1 @@
+3llamacpp:spec_decode_accepted_tokens_per_pos_total{position="999"} 1

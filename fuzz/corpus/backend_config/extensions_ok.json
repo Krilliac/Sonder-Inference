@@ -1,0 +1,1 @@
+{"mode":"spawn","executable":"llama-server","args":["-m","m.gguf"],"env":{"CUDA_VISIBLE_DEVICES":"0","A":"b"},"results":{"schema":"sonder.inference.tune/1"}}

@@ -105,6 +105,18 @@ TEST_CASE("child metrics reject invalid numbers and bound adversarial position l
     }
 }
 
+TEST_CASE("child metrics invalid payload yields an empty result") {
+    bool valid = true;
+    const auto metrics =
+        parse_child_metrics("llamacpp:prompt_tokens_total 10\nllamacpp:requests_processing -1\n", &valid);
+    CHECK_FALSE(valid);
+    CHECK_FALSE(metrics.valid);
+    CHECK_FALSE(metrics.prompt_tokens_total);
+    CHECK_FALSE(metrics.requests_processing);
+    CHECK_FALSE(metrics.kv_cache_usage_ratio);
+    CHECK(metrics.spec_decode_accepted_tokens_per_position.empty());
+}
+
 TEST_CASE("child metrics accept exposition whitespace timestamps and exact integer counters") {
     const auto metrics = parse_child_metrics(
         " \t \r\n"

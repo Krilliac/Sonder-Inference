@@ -38,7 +38,7 @@ the sanitizer/libFuzzer runtimes). `vm.mmap_rnd_bits=28` is set because
 
 ### `fuzz/`
 
-Seven libFuzzer targets (see `fuzz/README.md` for invariants and input
+Eleven libFuzzer targets (see `fuzz/README.md` for invariants and input
 formats), seed corpora under `fuzz/corpus/<target>/`, and
 `fuzz/CMakeLists.txt`:
 
@@ -56,6 +56,18 @@ formats), seed corpora under `fuzz/corpus/<target>/`, and
 * `sonder_fuzz_gguf`: the launch-profile GGUF header reader
   (`parse_gguf_model_info`) and `estimate_vram` on what it accepts. Model
   files come from the internet, and the reader's errors reach `/v1/models`.
+* `sonder_fuzz_anthropic_request`: the `/v1/messages` front end
+  (`parse_messages_request`, `reasoning_budget::parse_body`) and the
+  `AnthropicStream` SSE encoder: frame grammar, UTF-8 and JSON re-parse of
+  every frame.
+* `sonder_fuzz_http_client`: the internal HTTP client's `parse_url`,
+  `is_loopback_host` (against a reference oracle), `ChunkedDecoder` and
+  `LineSplitter` (split invariance).
+* `sonder_fuzz_llamaserver_text`: the text read from a supervised
+  llama-server child: Prometheus metrics, `/slots`, the child log
+  (`LogDiagnostics`, split invariance), spill policy and finish reasons.
+* `sonder_fuzz_backend_config`: residency, warmup and tune-extension config
+  parsing plus the llama-server timings and `/props` readers.
 
 `fuzz/CMakeLists.txt` works in two modes:
 
@@ -68,6 +80,9 @@ formats), seed corpora under `fuzz/corpus/<target>/`, and
    `sonder_inference` (PRIVATE compile, INTERFACE link) so normal builds are
    untouched. With MSVC/GCC it falls back to `SONDER_FUZZ_ENGINE=standalone`
    (replay-only driver, `standalone_main.cpp`).
+   On Windows, `fuzz/CMakeLists.txt` also defaults `CMAKE_MSVC_RUNTIME_LIBRARY` to
+   `MultiThreaded` for every standalone fuzz engine (not only libFuzzer) unless the
+   caller sets it.
 
 Verified locally: standalone clang build + regress + 60 s runs; in-tree build
 with the snippet below (`-Werror`, fuzz-regress, and the normal 251 tests
@@ -203,6 +218,66 @@ integration follow-up after #13.
   `PASS_REGULAR_EXPRESSION "temperature must be"` over `WILL_FAIL`.
   **Done on main:** all CLI negative tests now use
   `PASS_REGULAR_EXPRESSION` on the error text instead of `WILL_FAIL`.
+
+## Findings from the second fuzz round (anthropic_request, http_client, llamaserver_text, backend_config)
+
+No crashes, hangs or sanitizer reports in any of the four targets (120 s
+each, see the run summary in the PR that added them). Two invariant
+deviations and two observations were found. **All four are fixed (this
+branch)**; the harnesses assert the strict invariants again.
+
+### F1. `parse_child_metrics` returns partial counters for an invalid payload, `src/backends/llamaserver/child_metrics.cpp`
+
+**Status: fixed (this branch).** `parse_child_metrics` resets the result to a default value on every invalid path.
+
+`valid == false` does not mean "empty": values parsed before the bad line stay
+in the result. Input `llamacpp:prompt_tokens_total 10\nllamacpp:requests_processing -1\n`
+yields `valid == false` with `prompt_tokens_total == 10`. `parse_child_slots`
+does clear its result on error. Consumers are safe today:
+`ChildMetricsSampler::sample_at` (same file, around the `metrics_valid`
+check) returns before publishing a snapshot when `valid` is false. A future
+caller that reads the counters without checking `valid` would see a half
+payload. **Fix (done):** `parse_child_metrics` now resets the result to a
+default `ChildMetricCounters` on every invalid path, and the harness asserts
+"invalid implies default" again.
+
+### F2. "unknown field" config errors echo the whole key, `src/server/src/residency_config.cpp:31`, `src/server/src/warmup_config.cpp:18`, `src/server/src/backend_setup.cpp`, `src/server/src/launch_profile.cpp`
+
+**Status: fixed (this branch).** The echoed key is cut to 64 bytes on a UTF-8 boundary with `...` appended (`src/server/src/config_text.hpp`).
+
+`parse_residency_config` and `parse_warmup_config` put the unknown member name
+into the Status message unbounded, so a config with a 1 KiB+ key yields a
+message over 1 KiB (a 990-byte key is enough). The GGUF reader already cuts
+file-controlled text in its errors for the same reason. Reproducer: `{"` +
+990 x `k` + `":1}` as the document (also under `residency` or `warmup`).
+**Fix (done):** the echoed text is cut to 64 bytes in both messages, and in
+every other message that echoes a caller-supplied key or value:
+the top-level, `tls`, `spill_guard` and `stall_guard` unknown-field errors and
+the unknown backend name in `backend_setup.cpp`, and in `launch_profile.cpp`
+the unknown-field errors (profile and file level), the profile name used as
+the error location, the unknown speculative type, the duplicate profile name
+and the flag echoed by the `extra_args` refusals. The harness now requires
+every error message to be under 1 KiB with no exception
+(`fuzz/fuzz_backend_config.cpp`).
+
+### Observations
+
+* **Fixed (this branch).** `parse_warmup_config` mutates `setup` before it finishes validating (e.g. a
+  NUL-containing `messages_file` is stored, then rejected), so a rejected
+  config leaves a partly applied setup. `parse_residency_config` is atomic.
+  Callers appear to discard the setup on error.
+* **Fixed (this branch).** `llamaserver::parse_timings(Value, Timings&)` does not reset `out` on
+  error (the `BackendTimings` overload does).
+
+### Not covered
+
+* The SSE `EventDecoder` in an unnamed namespace in
+  `src/backends/llamaserver/llamaserver_backend.cpp` (reaching it would need a
+  production code move).
+* Real sockets, TLS and the response head parser of `http_request()`.
+* `ChildMetricsSampler` state machine, `LogTail` file reads, `check_kv_cache_pairing`.
+* Anthropic request fields beyond what `parse_messages_request` reads (tool
+  use, images are rejected by design).
 
 ## Local run summary (box, clang 19.1.7, 4 build jobs)
 

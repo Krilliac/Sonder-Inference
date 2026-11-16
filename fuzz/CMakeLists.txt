@@ -23,6 +23,10 @@ cmake_minimum_required(VERSION 3.21)
 set(_sonder_fuzz_standalone OFF)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(_sonder_fuzz_standalone ON)
+    if(WIN32 AND NOT DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
+        # clang_rt.fuzzer is /MT; match it (see the annotation flags below).
+        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+    endif()
     project(SonderInferenceFuzz LANGUAGES C CXX)
     set(CMAKE_CXX_STANDARD 20)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -61,6 +65,13 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT MSVC)
         list(APPEND _sonder_fuzz_san_flags -fsanitize=${SONDER_FUZZ_SANITIZERS} -fno-sanitize-recover=all)
     endif()
     list(APPEND _sonder_fuzz_san_flags -fno-omit-frame-pointer -g)
+    if(WIN32 AND SONDER_FUZZ_ENGINE STREQUAL "libfuzzer")
+        # The prebuilt clang_rt.fuzzer lib is /MT and built without MSVC STL
+        # container annotations; without these flags lld-link fails with
+        # /failifmismatch (annotate_string, RuntimeLibrary). No effect on Linux.
+        list(APPEND _sonder_fuzz_san_flags -fms-runtime-lib=static
+             -D_DISABLE_STRING_ANNOTATION -D_DISABLE_VECTOR_ANNOTATION)
+    endif()
 endif()
 
 if(_sonder_fuzz_standalone)
@@ -95,7 +106,11 @@ set(_sonder_fuzz_targets
     bench_report
     telemetry_envelope
     http_request
-    gguf)
+    gguf
+    anthropic_request
+    http_client
+    llamaserver_text
+    backend_config)
 
 foreach(name IN LISTS _sonder_fuzz_targets)
     set(target sonder_fuzz_${name})

@@ -139,6 +139,28 @@ TEST_CASE("llamaserver config: rejects malformed warmup settings") {
     }
 }
 
+TEST_CASE("llamaserver config: unknown-key errors bound the echoed key") {
+    const std::string longkey(990, 'k');
+    const std::vector<std::pair<std::string, std::string>> documents = {
+        {"top-level", "{\"" + longkey + "\":1}"},
+        {"tls", "{\"tls\":{\"" + longkey + "\":1}}"},
+        {"spill_guard", "{\"spill_guard\":{\"" + longkey + "\":1}}"},
+        {"stall_guard", "{\"stall_guard\":{\"" + longkey + "\":1}}"}};
+    for (const auto& doc : documents) {
+        const auto config = temp_path("long-key-" + doc.first + ".json");
+        std::ofstream(config) << doc.second;
+        sonder::inference::BackendSetup setup;
+        const auto st = sonder::inference::load_llamaserver_config(config.string(), setup);
+        std::error_code ec;
+        fs::remove(config, ec);
+        INFO(doc.first);
+        REQUIRE_FALSE(st.ok());
+        CHECK(st.message().size() < 128);
+        CHECK(st.message().find(std::string(64, 'k') + "...'") != std::string::npos);
+        CHECK(st.message().find(std::string(65, 'k')) == std::string::npos);
+    }
+}
+
 TEST_CASE("serve_main: --warmup-file is llamaserver-only") {
     std::string out;
     std::string err;

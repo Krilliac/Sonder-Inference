@@ -1,0 +1,17 @@
+0# HELP llamacpp:prompt_tokens_total Number of prompt tokens processed.
+# TYPE llamacpp:prompt_tokens_total counter
+llamacpp:prompt_tokens_total 1024
+llamacpp:tokens_predicted_total 256
+llamacpp:prompt_tokens_seconds 812.5
+llamacpp:predicted_tokens_seconds 41.25
+llamacpp:requests_processing 1
+llamacpp:requests_deferred 0
+llamacpp:n_busy_slots_per_decode 1.5
+llamacpp:n_decode_total 300
+llamacpp:kv_cache_usage_ratio 0.25
+llamacpp:spec_decode_drafts_total 40
+llamacpp:spec_decode_num_draft_tokens_total 160
+llamacpp:spec_decode_accepted_tokens_total 90
+llamacpp:spec_decode_accepted_tokens_per_pos_total{position="0"} 35
+llamacpp:spec_decode_accepted_tokens_per_pos_total{position="1"} 20
+other_metric 7
