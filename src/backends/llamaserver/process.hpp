@@ -16,7 +16,8 @@ struct ProcessSpec {
     std::vector<std::string> arguments;
     std::uint16_t port = 0;
     std::chrono::milliseconds shutdown_timeout{2000};
-    // Child-only overrides; empty preserves the existing inherited environment.
+    // Child-only overrides; empty preserves the existing inherited environment
+    // except inherited AIP_* variables, which are removed; AIP_* overrides are refused.
     std::vector<std::pair<std::string, std::string>> environment;
     // Optional stdout+stderr capture, used by calibration/help probing. No shell.
     std::string output_file;

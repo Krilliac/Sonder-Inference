@@ -257,9 +257,10 @@ nor a new route on Sonder's HTTP server or C ABI.
 
 - Spawn always appends its own `--host 127.0.0.1` and ephemeral `--port`.
   User host/port overrides and argument-list terminators are rejected.
-  `AIP_*` environment overrides are refused and an inherited `AIP_MODE` is
-  cleared from the child's environment, because llama-server's Vertex AI mode
-  would replace the supervisor-owned port.
+  `AIP_*` environment overrides are refused and all inherited `AIP_*`
+  variables are cleared from the child's environment, because llama-server's
+  Vertex AI mode would replace the supervisor-owned port and it parses
+  `AIP_HTTP_PORT` unconditionally.
   `--host 0.0.0.0` is never accepted. The executable is trusted native code,
   not a sandboxed program.
 - Attach accepts loopback by default. Remote hosts require
@@ -288,7 +289,8 @@ types are rejected so misspelled settings do not silently select defaults.
 
 [`sonder-infer tune`](tune.md) writes a directly loadable spawn configuration.
 The additive `env` object supplies child-only string environment overrides;
-when absent, environment inheritance is unchanged. The optional `results`
+when absent, environment inheritance is unchanged, except that inherited
+`AIP_*` variables are always removed and `AIP_*` overrides are refused. The optional `results`
 object is inert calibration provenance with schema `sonder.inference.tune/1`;
 it is accepted only alongside an explicit spawn configuration. Other unknown
 top-level fields remain errors. No existing spawn/attach defaults change.

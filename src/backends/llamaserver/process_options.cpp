@@ -13,15 +13,16 @@ namespace {
 // llama-server's Vertex AI mode (AIP_MODE=PREDICTION) replaces --port with
 // AIP_HTTP_PORT, so the supervisor-owned port could be moved. Windows
 // environment names are case-insensitive, POSIX names are exact.
-bool is_aip_name(const std::string &key) {
+template <class String> bool is_aip_name(const String &key) {
+    using Char = typename String::value_type;
     constexpr std::string_view prefix = "AIP_";
     if (key.size() < prefix.size()) return false;
     for (std::size_t i = 0; i < prefix.size(); ++i) {
-        char c = key[i];
+        Char c = key[i];
 #if defined(_WIN32)
-        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+        if (c >= Char('a') && c <= Char('z')) c = static_cast<Char>(c - Char('a') + Char('A'));
 #endif
-        if (c != prefix[i]) return false;
+        if (c != static_cast<Char>(prefix[i])) return false;
     }
     return true;
 }
@@ -80,9 +81,17 @@ Status ProcessOptions::prepare(const ProcessSpec &spec) {
             p += entry.size() + 1;
         }
         FreeEnvironmentStringsW(block);
-        // An inherited AIP_MODE must never reach the child (see is_aip_name);
-        // when present, an explicit block is built even with no overrides.
-        const bool cleared = entries.erase(L"AIP_MODE") > 0;
+        // Inherited AIP_* variables must never reach the child (see is_aip_name);
+        // when any is removed, an explicit block is built even with no overrides.
+        bool cleared = false;
+        for (auto it = entries.begin(); it != entries.end();) {
+            if (is_aip_name(it->first)) {
+                it = entries.erase(it);
+                cleared = true;
+            } else {
+                ++it;
+            }
+        }
         for (const auto &[key, value] : spec.environment) {
             auto k = utf16(key), v = utf16(value);
             if (!k.ok()) return k.status();
@@ -142,9 +151,17 @@ Status ProcessOptions::prepare(const ProcessSpec &spec) {
             const auto split = entry.find('=');
             if (split != std::string::npos) entries[entry.substr(0, split)] = entry.substr(split + 1);
         }
-        // An inherited AIP_MODE must never reach the child (see is_aip_name);
-        // when present, an explicit block is built even with no overrides.
-        const bool cleared = entries.erase("AIP_MODE") > 0;
+        // Inherited AIP_* variables must never reach the child (see is_aip_name);
+        // when any is removed, an explicit block is built even with no overrides.
+        bool cleared = false;
+        for (auto it = entries.begin(); it != entries.end();) {
+            if (is_aip_name(it->first)) {
+                it = entries.erase(it);
+                cleared = true;
+            } else {
+                ++it;
+            }
+        }
         for (const auto &[key, value] : spec.environment) entries[key] = value;
         if (cleared || !spec.environment.empty()) {
             for (const auto &[key, value] : entries) environment.push_back(key + '=' + value);

@@ -94,7 +94,7 @@ Status validate_options(const LlamaServerBackendOptions &options) {
         if (auto st = llamaserver::validate_process_arguments(options.args); !st.ok())
             return st;
         // Checked here as well as at spawn, so an AIP_* or malformed override is
-        // refused when the backend is built rather than on the first restart.
+        // refused when the backend is built rather than when the child is first spawned.
         return llamaserver::validate_process_environment(options.environment);
     }
     if (options.mode != LlamaServerMode::attach)

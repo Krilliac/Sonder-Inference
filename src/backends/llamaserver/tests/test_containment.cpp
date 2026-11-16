@@ -727,9 +727,9 @@ TEST_CASE("containment: child environment validation keeps refusing malformed en
 }
 
 TEST_CASE("containment gap: child environment overrides equivalent to refused llama-server flags are accepted") {
-    // GAP: validate_process_environment (process_options.cpp:12) and the
+    // GAP: validate_process_environment (process_options.cpp) and the
     // config loader's "env" object (llamaserver_config_extensions.hpp) check
-    // only the shape of each entry, never the name. llama-server reads each
+    // the shape of each entry and refuse only AIP_* names. llama-server reads each
     // name below as the setting in the row name, so an "env" object in a
     // (model-written) llamaserver config can set what the argument checks
     // refuse. No document restricts env names; llama-server.md calls env
@@ -778,8 +778,8 @@ TEST_CASE("containment: AIP_MODE never reaches the child and AIP_* overrides are
     // llama-server 7fe450e replaces the --port value with AIP_HTTP_PORT when
     // AIP_MODE=PREDICTION (server-http.cpp:117-125; an empty or unset AIP_MODE
     // leaves it disabled). The supervisor owns the child's port, so AIP_*
-    // overrides are refused and an inherited AIP_MODE is removed from the
-    // child's block.
+    // overrides are refused and inherited AIP_* variables are removed from the
+    // child's block (AIP_HTTP_PORT is parsed with std::stoi unconditionally).
     CHECK(decision_of(spawn_status({"-m", "m.gguf", "--port", "8080"})) == Decision::refused);
     const std::vector<std::pair<std::string, std::string>> env{{"AIP_MODE", "PREDICTION"}, {"AIP_HTTP_PORT", "8080"}};
     CHECK(ls::validate_process_environment(env).code() == ErrorCode::invalid_argument);
@@ -806,24 +806,26 @@ TEST_CASE("containment: AIP_MODE never reaches the child and AIP_* overrides are
         const auto entries = prepared_entries(options);
         CHECK(values_named(entries, "SONDER_CONTAINMENT_PROBE") == std::vector<std::string>{"1"});
         CHECK(values_named(entries, "AIP_MODE").empty());
+        CHECK(values_named(entries, "AIP_HTTP_PORT").empty());
     }
     {
-        // No overrides: the block must still be explicit so AIP_MODE is dropped.
+        // No overrides: the block must still be explicit so AIP_* is dropped.
         ls::ProcessSpec spec;
         ls::ProcessOptions options;
         REQUIRE(options.prepare(spec).ok());
         const auto entries = prepared_entries(options);
         CHECK_FALSE(entries.empty());
         CHECK(values_named(entries, "AIP_MODE").empty());
+        CHECK(values_named(entries, "AIP_HTTP_PORT").empty());
     }
 }
 
 TEST_CASE("containment gap: inherited LLAMA_ARG and credential variables reach the spawned child") {
     // GAP: the parent's whole environment is the child's. With no overrides,
-    // prepare() leaves the block empty and the launcher passes nullptr /
-    // environ (process.cpp CreateProcessW / posix_spawnp), i.e. full
-    // inheritance; with overrides, prepare() merges them over a copy of the
-    // parent's block and removes nothing. Inheritance itself is documented
+    // prepare() leaves the block empty when nothing AIP_* is inherited and
+    // the launcher then passes nullptr / environ (process.cpp CreateProcessW /
+    // posix_spawnp), i.e. full inheritance; with overrides, prepare() merges
+    // them over a copy of the parent's block and removes only inherited AIP_*. Inheritance itself is documented
     // ("empty inherits unchanged", llamaserver.hpp; launch-profiles.md on
     // LLAMA_ARG_SWA_FULL), but no document considers inherited equivalents of
     // the refused flags: LLAMA_API_KEY makes the child demand a key Sonder
