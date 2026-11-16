@@ -38,7 +38,7 @@ the sanitizer/libFuzzer runtimes). `vm.mmap_rnd_bits=28` is set because
 
 ### `fuzz/`
 
-Seven libFuzzer targets (see `fuzz/README.md` for invariants and input
+Eleven libFuzzer targets (see `fuzz/README.md` for invariants and input
 formats), seed corpora under `fuzz/corpus/<target>/`, and
 `fuzz/CMakeLists.txt`:
 
@@ -56,6 +56,18 @@ formats), seed corpora under `fuzz/corpus/<target>/`, and
 * `sonder_fuzz_gguf`: the launch-profile GGUF header reader
   (`parse_gguf_model_info`) and `estimate_vram` on what it accepts. Model
   files come from the internet, and the reader's errors reach `/v1/models`.
+* `sonder_fuzz_anthropic_request`: the `/v1/messages` front end
+  (`parse_messages_request`, `reasoning_budget::parse_body`) and the
+  `AnthropicStream` SSE encoder: frame grammar, UTF-8 and JSON re-parse of
+  every frame.
+* `sonder_fuzz_http_client`: the internal HTTP client's `parse_url`,
+  `is_loopback_host` (against a reference oracle), `ChunkedDecoder` and
+  `LineSplitter` (split invariance).
+* `sonder_fuzz_llamaserver_text`: the text read from a supervised
+  llama-server child: Prometheus metrics, `/slots`, the child log
+  (`LogDiagnostics`, split invariance), spill policy and finish reasons.
+* `sonder_fuzz_backend_config`: residency, warmup and tune-extension config
+  parsing plus the llama-server timings and `/props` readers.
 
 `fuzz/CMakeLists.txt` works in two modes:
 
@@ -203,6 +215,59 @@ integration follow-up after #13.
   `PASS_REGULAR_EXPRESSION "temperature must be"` over `WILL_FAIL`.
   **Done on main:** all CLI negative tests now use
   `PASS_REGULAR_EXPRESSION` on the error text instead of `WILL_FAIL`.
+
+## Findings from the second fuzz round (anthropic_request, http_client, llamaserver_text, backend_config)
+
+No crashes, hangs or sanitizer reports in any of the four targets (120 s
+each, see the run summary in the PR that added them). Two invariant
+deviations were found; both are benign today, the harnesses assert the
+weaker true property and mark the exception with a comment. Neither is fixed
+here (no `src/` changes in this change).
+
+### F1. `parse_child_metrics` returns partial counters for an invalid payload, `src/backends/llamaserver/child_metrics.cpp`
+
+`valid == false` does not mean "empty": values parsed before the bad line stay
+in the result. Input `llamacpp:prompt_tokens_total 10
+llamacpp:requests_processing -1
+`
+yields `valid == false` with `prompt_tokens_total == 10`. `parse_child_slots`
+does clear its result on error. Consumers are safe today:
+`ChildMetricsSampler::sample_at` (same file, around the `metrics_valid`
+check) returns before publishing a snapshot when `valid` is false. A future
+caller that reads the counters without checking `valid` would see a half
+payload. **Fix:** `return ChildMetricCounters{.valid = false}` on the invalid
+paths (or reset `result` before returning), then the harness can assert
+"invalid implies default" again.
+
+### F2. "unknown field" config errors echo the whole key, `src/server/src/residency_config.cpp:29`, `src/server/src/warmup_config.cpp:15`
+
+`parse_residency_config` and `parse_warmup_config` put the unknown member name
+into the Status message unbounded, so a config with a 1 KiB+ key yields a
+message over 1 KiB (a 990-byte key is enough). The GGUF reader already cuts
+file-controlled text in its errors for the same reason. Reproducer: `{"` +
+990 x `k` + `":1}` as the document (also under `residency` or `warmup`).
+**Fix:** truncate the key to ~64 bytes in both messages. The harness allows the
+key-echo messages to exceed 1 KiB (up to 3x the input, since ill-formed bytes
+become U+FFFD) and nothing else.
+
+### Observations (not asserted)
+
+* `parse_warmup_config` mutates `setup` before it finishes validating (e.g. a
+  NUL-containing `messages_file` is stored, then rejected), so a rejected
+  config leaves a partly applied setup. `parse_residency_config` is atomic.
+  Callers appear to discard the setup on error.
+* `llamaserver::parse_timings(Value, Timings&)` does not reset `out` on
+  error (the `BackendTimings` overload does).
+
+### Not covered
+
+* The SSE `EventDecoder` in an unnamed namespace in
+  `src/backends/llamaserver/llamaserver_backend.cpp` (reaching it would need a
+  production code move).
+* Real sockets, TLS and the response head parser of `http_request()`.
+* `ChildMetricsSampler` state machine, `LogTail` file reads, `check_kv_cache_pairing`.
+* Anthropic request fields beyond what `parse_messages_request` reads (tool
+  use, images are rejected by design).
 
 ## Local run summary (box, clang 19.1.7, 4 build jobs)
 

@@ -12,6 +12,10 @@ libFuzzer targets for Sonder Inference's parsers and serializers. Owner:
 | `sonder_fuzz_telemetry_envelope` | `TelemetryBus::make_envelope` + dump (the JSONL recording format) | one line per event; round-trips schema/event_type/session_id/attributes; UTF-8 preserved |
 | `sonder_fuzz_http_request` | `sonder-infer serve` front end: `parse_request_head`, query decoding, Host check, correlation headers, `parse_chat_request` (`src/server/src/http.cpp`, `openai.cpp`) | complete heads stay within 16 KiB / 64 headers with origin-form paths; errors are 400/431/505; accepted chat requests pass message and sampling validation; accepted correlation values match the pinned pattern |
 | `sonder_fuzz_gguf` | launch-profile GGUF header reader `parse_gguf_model_info` and `estimate_vram` on what it accepts (`src/server/src/vram_estimate.cpp`) | errors are `invalid_argument` "GGUF header: ..." under 1 KiB (file text cut short; they reach `/v1/models`); accepted headers have a printable architecture of at most 256 bytes, 1..100000 blocks and per-block vectors of that length; the estimate's total is the sum of its parts |
+| `sonder_fuzz_anthropic_request` | `/v1/messages` front end: `parse_messages_request`, `reasoning_budget::parse_body`/`parse_integer`, `AnthropicStream` (`start`/`token`/`finish`), `anthropic_message_response` (`src/server/src/anthropic.cpp`, `reasoning_budget.cpp`) | errors are 4xx with a code and message and a re-parsing error body; accepted jobs pass `validate_chat_messages`/`validate`, have an explicit `max_tokens`, at most 16 stop sequences and a 1..256 byte session key; every SSE frame is valid UTF-8 `event:`/`data:` with a re-parsing payload whose `type` equals the event, follows the block grammar with consecutive indices, and (for valid UTF-8 input) the deltas add up to the input |
+| `sonder_fuzz_http_client` | `net::parse_url`, `is_loopback_host`, `ChunkedDecoder`, `LineSplitter` (`src/net/http_client.cpp`) | chunk-split invariance (output, error, `done()`, `stopped()`); decoded body never longer than the input; accepted URLs have scheme http/https, non-empty host, port 1..65535, normalised path; `is_loopback_host` equals a reference oracle (localhost, `::1`, `[::1]`, strict 127/8) |
+| `sonder_fuzz_llamaserver_text` | `parse_child_metrics`, `parse_child_slots`, `derive_child_speculation`, `LogDiagnostics`, `parse_spill_policy`, `map_finish_reason` (`src/backends/llamaserver`) | gauges finite and non-negative; `valid == false` leaves the result empty; log diagnostics are chunk-split invariant and bounded; policy and finish-reason tables match their documented values |
+| `sonder_fuzz_backend_config` | `parse_residency_config` + `apply_residency_config`, `parse_warmup_config`, `load_llamaserver_extensions`, `llamaserver::parse_timings` (both overloads), `parse_props` (`src/server/src`, `src/backends/llamaserver`) | error messages non-empty and under 1 KiB; rejected residency config leaves the setup unchanged; accepted configs satisfy their documented bounds and map exactly to the guard options; timings/props counts are consistent |
 
 There is no separate recording/replay serializer in the tree today; the
 telemetry JSONL envelope is the recording format, so that is what is fuzzed.
@@ -58,6 +62,20 @@ disables line-ending normalization so seeds stay byte-exact. Input formats:
   table). Seeds are small synthetic headers: a qwen35 hybrid with ssm.* keys
   and attention tensors, a llama header with per-layer KV head counts and an
   MTP block, and a truncated copy.
+* `anthropic_request`: the raw JSON body of `POST /v1/messages`; the same
+  bytes also drive the reasoning-budget parser and, cut at UTF-8 boundaries,
+  the streaming encoder's text and reasoning chunks.
+* `http_client`: byte 0 is a control byte (bits 0..1: stop the line splitter
+  at that line, 0 = never; bits 2..7 seed the chunk-split pattern), then one
+  URL line (up to the first `
+`), then a raw response body fed to the chunked
+  decoder and the line splitter.
+* `llamaserver_text`: byte 0 is a control byte (seed for the log chunk-split
+  pattern), the rest is given to every parser as Prometheus text, `/slots`
+  JSON, child log text, a spill policy name and a finish reason.
+* `backend_config`: raw JSON text, given to the residency, warmup, tune
+  extension, timings and `/props` readers; the same bytes also build a raw
+  residency setup for `apply_residency_config`.
 
 Add a minimized reproducer here (`-minimize_crash=1`) whenever a fuzz bug is
 fixed, so `fuzz-regress` keeps covering it.
