@@ -555,3 +555,55 @@ TEST_CASE("chat: streaming deltas carry reasoning_content next to content") {
     REQUIRE_MESSAGE(none.status == 200, none.body);
     CHECK(none.body.find("reasoning_content") == std::string::npos);
 }
+
+TEST_CASE("chat: a chunk carrying both content and reasoning keeps both fields") {
+    auto backend = std::make_shared<ScriptedBackend>();
+    backend->model->chunks = {{"answer", "because"}};
+    Fixture f(scripted_options(backend));
+
+    const Reply plain = post(f.port, "/v1/chat/completions", chat_body());
+    REQUIRE_MESSAGE(plain.status == 200, plain.body);
+    const json::Value doc = plain.json();
+    const json::Value& message = *doc.find("choices")->as_array()[0].find("message");
+    REQUIRE(message.find("content") != nullptr);
+    REQUIRE(message.find("reasoning_content") != nullptr);
+    CHECK(message.find("content")->as_string() == "answer");
+    CHECK(message.find("reasoning_content")->as_string() == "because");
+
+    const Reply streamed = post(f.port, "/v1/chat/completions", chat_body(R"(,"stream":true)"));
+    REQUIRE_MESSAGE(streamed.status == 200, streamed.body);
+    const auto events = sse_data(streamed.body);
+    bool seen = false;
+    for (std::size_t i = 0; i + 1 < events.size(); ++i) {
+        auto chunk = json::parse(events[i]);
+        REQUIRE(chunk.ok());
+        const json::Value* delta = chunk.value().find("choices")->as_array()[0].find("delta");
+        if (delta->find("reasoning_content") == nullptr) continue;
+        seen = true;
+        REQUIRE(delta->find("content") != nullptr);
+        CHECK(delta->find("content")->as_string() == "answer");
+        CHECK(delta->find("reasoning_content")->as_string() == "because");
+    }
+    CHECK(seen);
+}
+
+TEST_CASE("chat: streaming deltas keep backend order, reasoning chunks before content chunks") {
+    auto backend = std::make_shared<ScriptedBackend>();
+    backend->model->chunks = {{"", "r1"}, {"", "r2"}, {"c1", ""}, {"c2", ""}};
+    Fixture f(scripted_options(backend));
+    const Reply r = post(f.port, "/v1/chat/completions", chat_body(R"(,"stream":true)"));
+    REQUIRE_MESSAGE(r.status == 200, r.body);
+    const auto events = sse_data(r.body);
+    std::vector<std::string> order;
+    for (std::size_t i = 0; i + 1 < events.size(); ++i) {
+        auto chunk = json::parse(events[i]);
+        REQUIRE(chunk.ok());
+        const json::Value* delta = chunk.value().find("choices")->as_array()[0].find("delta");
+        if (const json::Value* rc = delta->find("reasoning_content")) order.push_back("r:" + rc->as_string());
+        if (const json::Value* c = delta->find("content"); c && !c->as_string().empty()) {
+            order.push_back("c:" + c->as_string());
+        }
+    }
+    const std::vector<std::string> expected{"r:r1", "r:r2", "c:c1", "c:c2"};
+    CHECK(order == expected);
+}

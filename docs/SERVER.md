@@ -459,17 +459,35 @@ Request-path extensions (all optional; see the sections below):
   field is forwarded to llamaserver history and dropped by other backends.
 
 Reasoning in the response: when the backend separates the model's reasoning
-from its answer (llamaserver started with a reasoning format such as
-`--reasoning-format deepseek`, or Ollama with thinking on), the non-streaming
+from its answer (llamaserver started with `--reasoning-format deepseek`, which
+the launch profiles use, or Ollama with thinking on), the non-streaming
 `choices[0].message` carries `reasoning_content` (string) and each streaming
 chunk carries `delta.reasoning_content`, llama-server's convention. This is
-additive and always on, with no request switch. The field appears only when
-reasoning was produced: with thinking off, or a backend that produces none, the
-response is exactly as before. `content` never contains reasoning text, `usage`,
-`timings` and token counts are unchanged, and a streamed reasoning-only chunk
-has `reasoning_content` and no `content`. Reasoning tokens still count in
-`usage.completion_tokens`. The `/v1/messages` endpoint renders the same text
-as `thinking` blocks.
+additive and always on, with no request switch, and it is not listed in
+`sonder.features`. The field appears only when reasoning was produced: with
+thinking off, or a backend that produces none, no field is added. A streamed
+chunk that carries both kinds of text (Ollama can) has both keys; a
+reasoning-only chunk has `reasoning_content` and no `content`, and deltas keep
+the order the backend produced them.
+
+`content` holds no reasoning only when the backend separates it. The in-process
+llamacpp backend leaves inline `<think>` text in `content`. llama-server with
+`--reasoning-format none` leaves the thoughts unparsed in `content`, and with
+`--reasoning-format deepseek-legacy` it keeps the `<think>` tags in `content`
+while also filling `reasoning_content`, so the client receives the reasoning
+twice. Use `deepseek` for clients that read `reasoning_content`.
+
+Behaviour changes for thinking models (no other response field changes):
+
+- `timings.ttft_ms` is set by the first chunk of any kind, including reasoning,
+  so on a thinking model it is the time to the first reasoning token and is
+  not comparable with earlier versions.
+- When the upstream sends no usage, `usage.completion_tokens` falls back to the
+  number of chunks observed. That count now includes reasoning frames, which
+  were previously dropped and uncounted, so the old fallback undercounted.
+  Upstream-reported usage is unchanged.
+
+The `/v1/messages` endpoint renders the same text as `thinking` blocks.
 
 Reasoning budget pins (`--pin-reasoning-budget` and
 `--pin-reasoning-budget-message`) fill only unset request values. For a backend
