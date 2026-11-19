@@ -456,8 +456,10 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const La
             if (offloads(p)) budget = budget_for(p);
             auto info = read_gguf_model_info(p.model);  // header only
             if (info.ok()) {
-                VramEstimateInputs in{file_bytes(p.mmproj),
-                                      p.speculative ? file_bytes(p.speculative->draft_model) : 0, swa_full};
+                VramEstimateInputs in{};
+                in.mmproj_bytes = file_bytes(p.mmproj);
+                in.draft_model_bytes = p.speculative ? file_bytes(p.speculative->draft_model) : 0;
+                in.inherited_swa_full = swa_full;
                 if (budget) {
                     in.fit_vram_budget_bytes =
                         *budget > (std::numeric_limits<std::uint64_t>::max() >> 20) ? std::numeric_limits<std::uint64_t>::max()
