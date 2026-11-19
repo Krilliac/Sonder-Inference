@@ -79,12 +79,6 @@ void flip_byte(const fs::path& p, std::size_t offset) {
     write_file(p, data);
 }
 
-w::WeightManifest build(const fs::path& dir, const w::BuildOptions& options = {}) {
-    auto built = w::build_manifest(dir, options);
-    REQUIRE_MESSAGE(built.ok(), built.status().message());
-    return built.value().manifest;
-}
-
 }  // namespace
 
 TEST_CASE("weights: SHA-256 streaming matches the known vector and is independent of buffer size") {
