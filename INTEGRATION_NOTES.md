@@ -455,7 +455,7 @@ Left for the integrator (outside the scoped files):
 - Linux/macOS: available commit is reported unknown; macOS available physical
   memory is unknown. cgroup v1 limits are not read (v2 only).
 - `--no-kv-offload` is not modelled in the host/VRAM split.
-- Build/test evidence is still outstanding: the msvc-debug build failed twice with C1041 (PDB contention on sonder_inference.pdb), which is environmental and left to the separate PDB lane (si-embedded-pdb) or the build step (/FS or /Z7). Nothing was compiled or run for the repack, serve-wiring and test changes in this lane.
+- Build/test evidence: the earlier C1041 (PDB contention on sonder_inference.pdb) failures were environmental. The lane has since been built with msvc-debug via build.ps1 and the llamaserver tests run (see the PR for the ctest results); the full suite was not run locally.
 
 ## `claude/si-weight-manifest` (module `src/artifacts`)
 

@@ -139,6 +139,19 @@ bool Supervisor::host_memory_tick() {
         return host_floor_.restart_pending() ? restart_if_idle() : false;
     }
     clear_host_warning("host_memory_unknown");
+    // Update the admission flag before publishing or clearing the warning, so
+    // host_memory_low is a true signal: once it is visible admission is already
+    // closed, and once it is gone admission is already reopened.
+    {
+        std::lock_guard lock(mutex_);
+        host_admission_closed_ = !host_floor_.admitting();
+        if (host_restart_maintenance_ && !host_floor_.restart_pending()) {
+            // The pressure that asked for a restart ended first: reopen.
+            host_restart_maintenance_ = false;
+            if (!residency_maintenance_) maintenance_pending_ = false;
+            wake_.notify_all();
+        }
+    }
     if (update.entered_pressure) {
         set_host_warning(BackendWarning{
             "host_memory_low", "warning", "host_probe",
@@ -152,16 +165,6 @@ bool Supervisor::host_memory_tick() {
             1});
     } else if (update.left_pressure) {
         clear_host_warning("host_memory_low");
-    }
-    {
-        std::lock_guard lock(mutex_);
-        host_admission_closed_ = !host_floor_.admitting();
-        if (host_restart_maintenance_ && !host_floor_.restart_pending()) {
-            // The pressure that asked for a restart ended first: reopen.
-            host_restart_maintenance_ = false;
-            if (!residency_maintenance_) maintenance_pending_ = false;
-            wake_.notify_all();
-        }
     }
     return host_floor_.restart_pending() ? restart_if_idle() : false;
 }

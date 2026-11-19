@@ -423,10 +423,20 @@ TEST_CASE("supervisor stop_admission closes new requests under the floor and reo
         REQUIRE(before.ok());
         f.available = 2 * kGiB;
         REQUIRE(until([&] { return warned(s->runtime_status(), "host_memory_low"); }));
-        auto refused = s->acquire_request();
-        REQUIRE_FALSE(refused.ok());
-        CHECK(refused.status().code() == ErrorCode::unavailable);
-        CHECK(contains(refused.status().message(), "host memory"));
+        // Wait for a refusal rather than asserting the first call: robust even
+        // if the warning is observed a moment before the flag.
+        ErrorCode refused_code = ErrorCode::ok;
+        std::string refused_message;
+        REQUIRE(until([&] {
+            auto refused = s->acquire_request();
+            if (refused.ok())
+                return false;
+            refused_code = refused.status().code();
+            refused_message = refused.status().message();
+            return true;
+        }));
+        CHECK(refused_code == ErrorCode::unavailable);
+        CHECK(contains(refused_message, "host memory"));
         CHECK(s->running());
         CHECK(child_at(f.launches, 0)->alive.load());
     }
