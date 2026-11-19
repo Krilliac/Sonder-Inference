@@ -51,6 +51,9 @@
 #if defined(SONDER_HAS_BENCH)
 #include "sonder/inference/benchmark.hpp"
 #endif
+#if defined(SONDER_HAS_WEIGHT_MANIFEST)
+#include "sonder/inference/weight_manifest.hpp"
+#endif
 // After the Sonder headers, so Windows macros cannot reach them.
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -1061,6 +1064,14 @@ int main(int argc, char** argv) {
         return cli::kExitUsage;
     }
     if (cmd == "serve") return cmd_serve(rest);
+    if (cmd == "weights") {
+#if defined(SONDER_HAS_WEIGHT_MANIFEST)
+        return si::weights::weights_main(rest, std::cout, std::cerr);
+#else
+        err() << "error: weights: this build does not include the artifacts module (src/artifacts)\n";
+        return 4;  // `weights` usage code (cli::kExitUsage is 2, which `weights` uses for "mismatch")
+#endif
+    }
     if (cmd == "tune") {
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
         return si::llamaserver::tune::tune_main(rest, std::cout, std::cerr);

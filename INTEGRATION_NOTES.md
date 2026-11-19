@@ -385,6 +385,40 @@ stamp remains that base, with TLS and llama.cpp disabled. This later notes
 append does not restamp those executions as a published revision build.
 Hosted checks and merging still require the exact final public revision.
 
+## `claude/si-weight-manifest` (module `src/artifacts`)
+
+Weight-content digest manifests (ROADMAP "associate inspected content with loaded
+bytes", first half). Reference: `docs/integration/weight-manifest.md`.
+
+Changes outside the module, for the integrator:
+
+1. Root `CMakeLists.txt`: `src/artifacts` added to `SONDER_MODULE_DIRS` (one line).
+   The module needs `src/server/src/sha256.cpp` and skips itself without it.
+2. `src/cli/sonder_infer_commands.hpp`: `weights_command()` spec, listed in
+   `all_commands()`. `tools/sonder-infer/main.cpp`: `weights` dispatch to
+   `weights::weights_main` behind `SONDER_HAS_WEIGHT_MANIFEST`.
+3. `docs/MODULES.md`, `docs/CLI.md`, `docs/integration/weight-manifest.md`.
+
+Supervisor integration point (not wired in this lane): before the llamaserver
+supervisor spawns, call `weights::parse_manifest` on the configured manifest, then
+`weights::verify_manifest(model_dir, manifest, options)` with `options.sample = N` and a
+recorded `options.seed` for a scheduled check, or `options.full = true` at install time,
+and refuse the spawn when `report.exit_code() != 0`, logging the `VerifyReport`. Run it
+off the request path: hashing 100 GB takes minutes, and it polls a `CancellationToken`
+once per buffer. The verified bytes are not bound to what llama-server maps (TOCTOU).
+
+Not done / open:
+
+- Build and test status: the msvc-debug ctest run from an empty build directory passed
+  1013/1013.
+- Symlink refusal tests skip with a message where the platform denies symlink creation
+  (unprivileged Windows); the directory-link case falls back to a junction (`mklink /J`)
+  and covers the reparse-point branch there (whether that branch executed, rather than
+  skipped, in the msvc-debug run is not confirmed here). The Windows unpaired-surrogate name path (caught in
+  `list_directory`) has no test; the POSIX non-UTF-8 name case does.
+- No `--json` output for the CLI, no resume or parallel hashing.
+- ROADMAP checkbox left unchecked: loaded-byte association is still open.
+
 ## `claude/si-colibri-attach`: slow OpenAI-compatible attach (colibri)
 
 Scope: `src/net/http_client.*`, `src/backends/llamaserver/` (header, backend,
