@@ -1,6 +1,8 @@
 #include "sonder/inference/backends/llamaserver.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <utility>
@@ -58,6 +60,39 @@ llamaserver::SpillGuardOptions spill_guard_options(const LlamaServerSpillGuardOp
     return g;
 }
 
+// Reads the bearer token from the environment variable `name`. Messages name
+// the variable, never the value. Refuses an unset/empty variable, a malformed
+// variable name, and a value that is not a single visible-ASCII token (no
+// spaces or control characters, so it cannot smuggle header syntax).
+Result<std::string> read_api_key(const std::string &name) {
+    const bool name_ok = !name.empty() && name.size() <= 128 &&
+                         !std::isdigit(static_cast<unsigned char>(name.front())) &&
+                         std::all_of(name.begin(), name.end(), [](unsigned char c) {
+                             return std::isalnum(c) != 0 || c == '_';
+                         });
+    if (!name_ok)
+        return Status(ErrorCode::invalid_argument, "llamaserver: api_key_env is not a valid variable name");
+    std::string value;
+#if defined(_WIN32)
+    char *buffer = nullptr;
+    std::size_t length = 0;
+    if (_dupenv_s(&buffer, &length, name.c_str()) == 0 && buffer != nullptr) {
+        value.assign(buffer);
+        std::free(buffer);
+    }
+#else
+    if (const char *raw = std::getenv(name.c_str()))
+        value.assign(raw);
+#endif
+    if (value.empty())
+        return Status(ErrorCode::invalid_argument, "llamaserver: environment variable " + name + " is not set");
+    if (value.size() > 4096 ||
+        std::any_of(value.begin(), value.end(), [](unsigned char c) { return c <= 0x20 || c >= 0x7f; }))
+        return Status(ErrorCode::invalid_argument,
+                      "llamaserver: environment variable " + name + " does not hold a valid bearer token");
+    return value;
+}
+
 Status validate_options(const LlamaServerBackendOptions &options) {
     const auto duration_ok = [](std::chrono::milliseconds ms) {
         return ms.count() > 0 && ms <= std::chrono::hours(24);
@@ -73,10 +108,56 @@ Status validate_options(const LlamaServerBackendOptions &options) {
     }
     if (options.context_length > (std::uint64_t{1} << 32))
         return {ErrorCode::invalid_argument, "llamaserver: context_length must be at most 4294967296"};
+    const bool generic_progress = options.stall_guard.generic_progress;
     if (options.stall_guard.stall_seconds < std::chrono::seconds(1) ||
         options.stall_guard.stall_seconds > std::chrono::hours(24) ||
-        (options.stall_guard.policy != "warn" && options.stall_guard.policy != "restart"))
+        (options.stall_guard.policy != "warn" && options.stall_guard.policy != "restart" &&
+         !(generic_progress && options.stall_guard.policy == "cancel")))
         return {ErrorCode::invalid_argument, "llamaserver: invalid stall_guard options"};
+    if (generic_progress && (options.mode != LlamaServerMode::attach || options.native_completion))
+        return {ErrorCode::invalid_argument,
+                "llamaserver: stall_guard.generic_progress needs attach mode with native_completion=false"};
+    if (generic_progress && !options.stall_guard.enabled)
+        return {ErrorCode::invalid_argument, "llamaserver: stall_guard.generic_progress needs stall_guard.enabled"};
+    if (generic_progress && options.stall_guard.policy == "restart")
+        return {ErrorCode::invalid_argument, "llamaserver: stall_guard.generic_progress policy is warn or cancel"};
+    if (!generic_progress && options.stall_guard.policy == "cancel")
+        return {ErrorCode::invalid_argument, "llamaserver: stall_guard policy cancel needs generic_progress"};
+    if (!options.upstream_grammar && !options.grammar.empty())
+        return {ErrorCode::invalid_argument,
+                "llamaserver: grammar is configured but the upstream declares no grammar support"};
+    const auto slow_enabled = options.idle_timeout.count() != 0 || options.first_content_timeout.count() != 0 ||
+                              options.unlimited_request_timeout || !options.api_key_env.empty();
+    if (slow_enabled && options.mode != LlamaServerMode::attach)
+        return {ErrorCode::invalid_argument,
+                "llamaserver: api_key_env, idle_timeout, first_content_timeout and unlimited_request_timeout "
+                "are attach-mode options"};
+    for (const auto value : {options.idle_timeout, options.first_content_timeout}) {
+        if (value.count() < 0 || value > std::chrono::hours(24))
+            return {ErrorCode::invalid_argument, "llamaserver: idle/first-content timeouts must be in [0, 24h]"};
+    }
+    if (options.keepalive_gap.count() <= 0 || options.keepalive_gap > std::chrono::hours(1))
+        return {ErrorCode::invalid_argument, "llamaserver: keepalive_gap must be in (0, 1h]"};
+    // The upstream sends an empty keepalive delta every keepalive_gap. An idle
+    // bound at or below that gap would cut off a healthy, merely slow stream.
+    if (options.idle_timeout.count() != 0 && options.idle_timeout <= options.keepalive_gap)
+        return {ErrorCode::invalid_argument,
+                "llamaserver: idle_timeout must exceed keepalive_gap (the upstream's keepalive interval, 10 s by "
+                "default), otherwise healthy keepalive-only periods would time out"};
+    if (options.unlimited_request_timeout && options.first_content_timeout.count() == 0)
+        return {ErrorCode::invalid_argument,
+                "llamaserver: unlimited_request_timeout needs first_content_timeout (a request that is never "
+                "accepted would otherwise wait forever)"};
+    if (options.unlimited_request_timeout && options.idle_timeout.count() == 0)
+        return {ErrorCode::invalid_argument,
+                "llamaserver: unlimited_request_timeout needs idle_timeout (a stream that goes silent after its "
+                "first content would otherwise never end)"};
+    if (!options.api_key_env.empty()) {
+        if (!options.warmup.messages_file.empty())
+            return {ErrorCode::invalid_argument, "llamaserver: api_key_env is not supported together with warmup"};
+        if (auto key = read_api_key(options.api_key_env); !key.ok())
+            return key.status();
+    }
     if (options.mode == LlamaServerMode::spawn) {
         if (options.executable.empty() || options.executable.find('\0') != std::string::npos) {
             return {ErrorCode::invalid_argument, "llamaserver: spawn needs an executable path"};
@@ -307,10 +388,29 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
     // Native attach observes the upstream without owning its process. Generic
     // OpenAI attach stays silent unless prefix warm-up was configured.
     std::optional<BackendRuntimeStatus> runtime_status() const override {
-        if (!supervisor_ && !attached_monitor_ && !warmup_)
+        const bool generic_report = options_.stall_guard.generic_progress || !options_.api_key_env.empty();
+        if (!supervisor_ && !attached_monitor_ && !warmup_ && !generic_report)
             return std::nullopt;
         auto status = supervisor_ ? supervisor_->runtime_status() :
                       attached_monitor_ ? attached_monitor_->runtime_status() : BackendRuntimeStatus{};
+        if (!options_.api_key_env.empty()) {
+            // Name of the variable only; the header value is always redacted.
+            auto diagnostics = status.diagnostics.value_or(json::Object{});
+            diagnostics.set("upstream_auth", json::Object{{"header", "Authorization"},
+                                                           {"api_key_env", options_.api_key_env},
+                                                           {"value", net::redacted_header_value("Authorization", "")}});
+            status.diagnostics = std::move(diagnostics);
+        }
+        if (options_.stall_guard.generic_progress) {
+            std::lock_guard<std::mutex> lock(stall_mutex_);
+            json::Object stall{{"generic_progress", true},
+                               {"policy", options_.stall_guard.policy},
+                               {"stall_seconds", static_cast<std::int64_t>(options_.stall_guard.stall_seconds.count())},
+                               {"events", static_cast<std::int64_t>(stall_events_)}};
+            status.stall = std::move(stall);
+            if (stall_events_ != 0)
+                status.warnings.push_back(stall_warning_);
+        }
         if (warmup_) {
             status.warmup = warmup_->status();
             const auto warnings = warmup_->warnings();
@@ -355,6 +455,14 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         request.tls.insecure_skip_verify = options_.tls.insecure_skip_verify;
         request.tls.server_name = options_.tls.server_name;
         request.tls.handshake_timeout = options_.tls.handshake_timeout;
+        if (!options_.api_key_env.empty() && !supervisor_) {
+            // Read per request so a rotated token is picked up; never cached
+            // in options_, never logged.
+            auto key = read_api_key(options_.api_key_env);
+            if (!key.ok())
+                return key.status();
+            request.headers.emplace_back("Authorization", "Bearer " + key.value());
+        }
         return request;
     }
     Result<std::string> request(std::string_view method, std::string_view path, std::string body) {
@@ -375,6 +483,35 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
     }
     Result<GenerateStats> stream(std::string_view path, std::string body, const CancellationToken &cancel,
                                  const TokenCallback &callback, bool chat, bool separate_reasoning = false);
+
+    // The idle, first-content and stall bounds raised by the HTTP client end
+    // the request with a protocol_error and get the backend prefix; every
+    // other client status (including the total timeout) passes through
+    // unchanged.
+    static Status upstream_status(const Status &status) {
+        if (status.code() == ErrorCode::protocol_error) {
+            const std::string &m = status.message();
+            for (const char *prefix : {"idle timeout", "first-content timeout", "stall timeout"})
+                if (m.rfind(prefix, 0) == 0)
+                    return {ErrorCode::protocol_error, "llamaserver: " + m};
+        }
+        return status;
+    }
+    // Generic-mode progress watchdog (warn policy), called from the request
+    // thread by the HTTP client. Folds repeats into one bounded warning.
+    void record_stall(std::chrono::milliseconds stalled) {
+        std::lock_guard<std::mutex> lock(stall_mutex_);
+        ++stall_events_;
+        if (stall_warning_.code.empty()) {
+            stall_warning_.code = "generic_stream_stalled";
+            stall_warning_.source = "config";
+            stall_warning_.message =
+                "an upstream stream produced no content or reasoning text for longer than stall_guard.stall_seconds "
+                "(keepalive-only periods do not count as progress)";
+        }
+        stall_warning_.count = stall_events_;
+        stall_warning_.details = {{"last_stalled_ms", std::to_string(stalled.count())}};
+    }
 
     // Served context and slot count: GET /props once per upstream instance
     // (endpoint, plus the launch argv in spawn mode, so a restart or an
@@ -417,8 +554,10 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
     llamaserver::RequestExtras extras(const llamaserver::ServerProps &props, std::string_view session_key,
                                       llamaserver::SlotAffinity::Lease &lease) {
         llamaserver::RequestExtras e;
-        if (!options_.native_completion)
+        if (!options_.native_completion) {
+            e.generic_thinking = true;
             return e;
+        }
         e.cache_prompt = true;
         if (options_.slot_affinity) {
             lease = slots_.acquire(session_key, props.total_slots,
@@ -486,6 +625,9 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
     llamaserver::ServerProps props_;
     llamaserver::SlotAffinity slots_;
     std::shared_ptr<llamaserver::PrefixWarmup> warmup_;
+    mutable std::mutex stall_mutex_;
+    std::uint64_t stall_events_ = 0;
+    BackendWarning stall_warning_;
 };
 
 class LlamaServerModel final : public BackendModel {
@@ -573,6 +715,22 @@ Result<GenerateStats> LlamaServerBackendImpl::stream(std::string_view path, std:
     bool stopped = false, terminal = false, done = false;
     bool usage_prompt = false, usage_completion = false, usage_cache = false;
     std::uint64_t observed_chunks = 0;
+    // Frames that carried content or reasoning text (visible to the caller or
+    // not). Empty keepalive deltas never count. Drives the first-content
+    // timeout and the generic stall watchdog.
+    std::uint64_t progress_events = 0;
+    if (options_.mode == LlamaServerMode::attach) {
+        request.unlimited_total = options_.unlimited_request_timeout;
+        request.idle_timeout = options_.idle_timeout;
+        request.first_progress_timeout = options_.first_content_timeout;
+        if (options_.stall_guard.generic_progress) {
+            request.progress_stall_timeout = options_.stall_guard.stall_seconds;
+            if (options_.stall_guard.policy == "warn")
+                request.on_progress_stall = [this](std::chrono::milliseconds stalled) { record_stall(stalled); };
+        }
+        if (request.first_progress_timeout.count() > 0 || request.progress_stall_timeout.count() > 0)
+            request.progress_counter = [&progress_events] { return progress_events; };
+    }
     const auto count = [&](const json::Value &object, const char *key, std::uint64_t &dest) {
         const auto *value = object.find(key);
         if (!value)
@@ -660,6 +818,7 @@ Result<GenerateStats> LlamaServerBackendImpl::stream(std::string_view path, std:
         std::string piece;
         std::string reasoning;
         std::string reason;
+        bool saw_reasoning_text = false;
         if (native) {
             if (const auto *content = object.find("content")) {
                 if (!content->is_string()) {
@@ -708,6 +867,16 @@ Result<GenerateStats> LlamaServerBackendImpl::stream(std::string_view path, std:
                     }
                     piece = content->as_string();
                 }
+                if (delta && delta->is_object()) {
+                    // Reasoning text is progress even when the caller did not
+                    // ask for it separately; a thinking model can stream only
+                    // reasoning for a long time.
+                    const auto *probe = delta->find("reasoning_content");
+                    if (!probe)
+                        probe = delta->find("reasoning");
+                    if (probe && probe->is_string() && !probe->as_string().empty())
+                        saw_reasoning_text = true;
+                }
                 if (separate_reasoning && delta && delta->is_object()) {
                     // llama-server's OpenAI-compatible reasoning extension is
                     // emitted as reasoning_content. Accept reasoning as a
@@ -748,6 +917,8 @@ Result<GenerateStats> LlamaServerBackendImpl::stream(std::string_view path, std:
             }
             stats.stop_reason = mapped;
         }
+        if (!piece.empty() || !reasoning.empty() || saw_reasoning_text)
+            ++progress_events;
         if (!piece.empty() || !reasoning.empty()) {
             ++observed_chunks;
             if (callback) {
@@ -783,7 +954,7 @@ Result<GenerateStats> LlamaServerBackendImpl::stream(std::string_view path, std:
         return stats;
     }
     if (!response.ok())
-        return response.status();
+        return upstream_status(response.status());
     const bool finished = decoder.finish();
     if (cancel.cancelled())
         return Status(ErrorCode::cancelled, "llamaserver: request cancelled");

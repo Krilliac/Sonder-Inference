@@ -36,6 +36,10 @@ struct Timings {
 struct RequestExtras {
     bool cache_prompt = false;             // "cache_prompt": true
     std::optional<std::uint32_t> id_slot;  // "id_slot": pinned slot
+    // Declared-generic upstream: thinking controls go out as top-level
+    // enable_thinking / reasoning_effort fields and chat_template_kwargs is
+    // never sent. False keeps the llama.cpp chat_template_kwargs form.
+    bool generic_thinking = false;
 };
 
 // GET /props: the per-slot context (default_generation_settings.n_ctx, or a
@@ -48,7 +52,8 @@ struct ServerProps {
 json::Value build_completion_body(const std::string &model, const GenerateRequest &request,
                                   bool native_completion, std::string_view grammar = {},
                                   const RequestExtras &extras = {});
-// Also forwards request.thinking as chat_template_kwargs when set.
+// Also forwards request.thinking as chat_template_kwargs when set (or as
+// top-level fields with extras.generic_thinking).
 json::Value build_chat_body(const std::string &model, const ChatRequest &request,
                             std::string_view grammar = {}, const RequestExtras &extras = {});
 Status parse_timings(const json::Value &value, Timings &out);
