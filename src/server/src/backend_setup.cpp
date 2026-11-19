@@ -204,7 +204,9 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
             "native_completion", "grammar", "connect_timeout_ms", "request_timeout_ms", "startup_timeout_ms",
             "poll_interval_ms", "shutdown_timeout_ms", "restart_backoff_ms", "max_restart_backoff_ms",
             "max_restarts", "tls", "spill_guard", "log_file", "kv_pairing_check", "context_length",
-            "slot_affinity", "env", "results", "warmup", "stall_guard", "host_memory"};
+            "slot_affinity", "env", "results", "warmup", "stall_guard", "host_memory",
+            "api_key_env", "idle_timeout_ms", "first_content_timeout_ms", "keepalive_gap_ms",
+            "unlimited_request_timeout", "upstream_grammar"};
         for (auto k : known) if (k == key) return false;
         return true;
     };
@@ -228,8 +230,12 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
     };
     const auto uint_field = [&](const char* key, std::uint64_t& out) -> Status {
         if (const auto* v = object.find(key)) {
-            const bool restarts = std::string_view(key) == "max_restarts";
-            if (!v->is_integer() || v->as_int(-1) < 0 || v->as_uint() > (restarts ? 1000 : 3600000) || (!restarts && v->as_uint() == 0))
+            const std::string_view k(key);
+            const bool restarts = k == "max_restarts";
+            const bool slow_bound = k == "idle_timeout_ms" || k == "first_content_timeout_ms";
+            const std::uint64_t max = restarts ? 1000 : slow_bound ? 86400000 : 3600000;
+            const bool zero_ok = restarts || slow_bound;
+            if (!v->is_integer() || v->as_int(-1) < 0 || v->as_uint() > max || (!zero_ok && v->as_uint() == 0))
                 return Status(ErrorCode::invalid_argument, std::string("llamaserver config: '") + key + "' is out of range");
             out = v->as_uint();
         }
@@ -244,15 +250,24 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
         return Status(ErrorCode::invalid_argument, "llamaserver config: mode must be attach or spawn");
     if (auto st = bool_field("allow_remote", setup.llamaserver_allow_remote); !st.ok()) return st;
     if (auto st = bool_field("native_completion", setup.llamaserver_native_completion); !st.ok()) return st;
+    if (auto st = string_field("api_key_env", setup.llamaserver_api_key_env); !st.ok()) return st;
+    if (setup.llamaserver_api_key_env.find('\0') != std::string::npos)
+        return Status(ErrorCode::invalid_argument, "llamaserver config: api_key_env must not contain NUL");
+    if (auto st = bool_field("unlimited_request_timeout", setup.llamaserver_unlimited_request_timeout); !st.ok()) return st;
+    if (auto st = bool_field("upstream_grammar", setup.llamaserver_upstream_grammar); !st.ok()) return st;
     for (const char* key : {"connect_timeout_ms", "request_timeout_ms", "startup_timeout_ms", "poll_interval_ms",
-                            "shutdown_timeout_ms", "restart_backoff_ms", "max_restart_backoff_ms", "max_restarts"}) {
+                            "shutdown_timeout_ms", "restart_backoff_ms", "max_restart_backoff_ms", "max_restarts",
+                            "idle_timeout_ms", "first_content_timeout_ms", "keepalive_gap_ms"}) {
         std::uint64_t* out = key == std::string_view("connect_timeout_ms") ? &setup.llamaserver_connect_timeout_ms :
             key == std::string_view("request_timeout_ms") ? &setup.llamaserver_request_timeout_ms :
             key == std::string_view("startup_timeout_ms") ? &setup.llamaserver_startup_timeout_ms :
             key == std::string_view("poll_interval_ms") ? &setup.llamaserver_poll_interval_ms :
             key == std::string_view("shutdown_timeout_ms") ? &setup.llamaserver_shutdown_timeout_ms :
             key == std::string_view("restart_backoff_ms") ? &setup.llamaserver_restart_backoff_ms :
-            key == std::string_view("max_restart_backoff_ms") ? &setup.llamaserver_max_restart_backoff_ms : &setup.llamaserver_max_restarts;
+            key == std::string_view("max_restart_backoff_ms") ? &setup.llamaserver_max_restart_backoff_ms :
+            key == std::string_view("idle_timeout_ms") ? &setup.llamaserver_idle_timeout_ms :
+            key == std::string_view("first_content_timeout_ms") ? &setup.llamaserver_first_content_timeout_ms :
+            key == std::string_view("keepalive_gap_ms") ? &setup.llamaserver_keepalive_gap_ms : &setup.llamaserver_max_restarts;
         if (auto st = uint_field(key, *out); !st.ok()) return st;
     }
     if (const auto* args = object.find("args")) {
@@ -333,7 +348,7 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
     if (const auto* guard = object.find("stall_guard")) {
         if (!guard->is_object())
             return Status(ErrorCode::invalid_argument, "llamaserver config: 'stall_guard' must be an object");
-        static constexpr std::string_view guard_keys[] = {"enabled", "stall_seconds", "policy"};
+        static constexpr std::string_view guard_keys[] = {"enabled", "stall_seconds", "policy", "generic_progress"};
         for (const auto& member : guard->as_object()) {
             if (std::find(std::begin(guard_keys), std::end(guard_keys), member.first) == std::end(guard_keys))
                 return Status(ErrorCode::invalid_argument,
@@ -354,9 +369,14 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
             setup.llamaserver_stall_seconds = v->as_uint();
         }
         if (const auto* v = guard->find("policy")) {
-            if (!v->is_string() || (v->as_string() != "warn" && v->as_string() != "restart"))
-                return bad("policy", "warn or restart");
+            if (!v->is_string() || (v->as_string() != "warn" && v->as_string() != "restart" && v->as_string() != "cancel"))
+                return bad("policy", "warn, restart or cancel");
             setup.llamaserver_stall_policy = v->as_string();
+        }
+        if (const auto* v = guard->find("generic_progress")) {
+            if (!v->is_bool())
+                return bad("generic_progress", "boolean");
+            setup.llamaserver_stall_generic_progress = v->as_bool();
         }
     }
     if (const auto* host = object.find("host_memory")) {
@@ -477,6 +497,13 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
             lo.host_memory.floor.restart_cooldown = std::chrono::milliseconds(h.restart_cooldown_ms);
             lo.host_memory.floor.max_restarts = static_cast<std::size_t>(h.max_restarts);
         }
+        lo.stall_guard.generic_progress = setup.llamaserver_stall_generic_progress;
+        lo.api_key_env = setup.llamaserver_api_key_env;
+        lo.idle_timeout = std::chrono::milliseconds(setup.llamaserver_idle_timeout_ms);
+        lo.first_content_timeout = std::chrono::milliseconds(setup.llamaserver_first_content_timeout_ms);
+        lo.keepalive_gap = std::chrono::milliseconds(setup.llamaserver_keepalive_gap_ms);
+        lo.unlimited_request_timeout = setup.llamaserver_unlimited_request_timeout;
+        lo.upstream_grammar = setup.llamaserver_upstream_grammar;
         lo.diagnostics.log_file = setup.llamaserver_log_file;
         lo.diagnostics.kv_pairing_check = setup.llamaserver_kv_pairing_check;
         lo.context_length = setup.llamaserver_context_length;

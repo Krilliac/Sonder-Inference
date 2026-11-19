@@ -85,7 +85,16 @@ struct LlamaServerWarmupOptions {
 struct LlamaServerStallGuardOptions {
     bool enabled = true;
     std::chrono::seconds stall_seconds{90};
-    std::string policy = "warn";  // warn or restart (spawn only)
+    std::string policy = "warn";  // warn or restart (spawn only); "cancel" with generic_progress
+    // Generic OpenAI attach (native_completion = false) only. Off by default so
+    // existing configs behave as before. When true, every active streaming
+    // request must make content-bearing progress (a delta with content or
+    // reasoning text; empty keepalive deltas and SSE comments do not count)
+    // at least every stall_seconds, measured from the last such delta or from
+    // the request being sent. policy "warn" records a runtime warning and
+    // keeps waiting; policy "cancel" ends the request with ErrorCode::protocol_error.
+    // Keep stall_seconds above the upstream's queue wait (colibri: 300 s).
+    bool generic_progress = false;
 };
 
 // Host RAM admission and floor guard for a spawned child (spawn mode only;
@@ -155,6 +164,36 @@ struct LlamaServerBackendOptions {
     LlamaServerStallGuardOptions stall_guard;
     // Spawn mode only.
     LlamaServerHostMemoryOptions host_memory;
+
+    // ---- Slow OpenAI-compatible upstreams (attach mode; docs/integration/colibri.md) ----
+    // Name of an environment variable holding a bearer token. The token is
+    // read from the process environment (never from config), sent as
+    // "Authorization: Bearer <token>" on every completion, discovery and /props request (the native-attach monitor keeps the value read at construction), and never
+    // logged or reported (runtime status shows only the variable name and
+    // "[redacted]"). Attach mode only; combine with HTTPS or loopback.
+    // Not supported together with warmup. Empty = no Authorization header.
+    std::string api_key_env;
+    // Stream idle timeout: maximum silence between received bytes once the
+    // response head has arrived. 0 = disabled (historical behaviour). Must
+    // exceed keepalive_gap, otherwise a healthy upstream that only sends its
+    // periodic empty keepalive delta would be cut off. Required when
+    // unlimited_request_timeout is set.
+    std::chrono::milliseconds idle_timeout{0};
+    // First-content timeout: from sending the request until the first delta
+    // carrying content or reasoning text. Empty keepalive deltas do not count.
+    // 0 = disabled. Required when unlimited_request_timeout is set.
+    std::chrono::milliseconds first_content_timeout{0};
+    // True removes request_timeout as a cap on streaming completions (attach
+    // only; discovery and /props requests keep request_timeout). The slow
+    // upstream may legitimately stream for hours at 0.2 tok/s. Needs
+    // first_content_timeout and idle_timeout.
+    bool unlimited_request_timeout = false;
+    // The upstream's longest gap between keepalive bytes (colibri: 10 s).
+    // idle_timeout is validated to be strictly larger.
+    std::chrono::milliseconds keepalive_gap{10000};
+    // False declares that the upstream cannot honour a grammar; a non-empty
+    // `grammar` is then refused when the backend is built.
+    bool upstream_grammar = true;
 };
 
 // Slot snapshots are upstream-owned files, not portable Sonder KV blocks.
