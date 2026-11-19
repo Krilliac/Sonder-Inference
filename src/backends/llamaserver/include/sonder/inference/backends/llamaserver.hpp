@@ -88,6 +88,33 @@ struct LlamaServerStallGuardOptions {
     std::string policy = "warn";  // warn or restart (spawn only)
 };
 
+// Host RAM admission and floor guard for a spawned child (spawn mode only;
+// src/backends/llamaserver/host_memory.hpp). Defaults are inert: with
+// estimated_resident_bytes == 0 no pre-spawn check runs, and the floor guard
+// is off. serve fills the estimates from the active launch profile.
+struct LlamaServerHostMemoryOptions {
+    // VramEstimate::host_resident_bytes / host_private_bytes (0 = no estimate).
+    std::uint64_t estimated_resident_bytes = 0;
+    std::uint64_t estimated_private_bytes = 0;
+    // The estimate assumes everything fits the GPU (llama-server --fit with no
+    // VRAM budget known): the supervisor raises a warning.
+    bool estimate_lower_bound = false;
+    // Kept free on top of the estimate for the OS and other processes.
+    std::uint64_t reserve_bytes = 2ull * 1024 * 1024 * 1024;
+    // Start anyway when the pre-spawn check would refuse (a warning is raised).
+    bool override_refusal = false;
+    struct Floor {
+        bool enabled = false;
+        std::string policy = "warn";  // warn, stop_admission or restart_smaller_ctx
+        std::uint64_t floor_bytes = 0;
+        std::uint64_t resume_bytes = 0;  // 0 = floor + floor / 4
+        std::size_t consecutive_samples = 2;
+        std::chrono::milliseconds sample_interval{5000};
+        std::chrono::milliseconds restart_cooldown{60000};
+        std::size_t max_restarts = 1;
+    } floor;
+};
+
 struct LlamaServerBackendOptions {
     LlamaServerMode mode = LlamaServerMode::attach;
     std::string base_url = "http://127.0.0.1:8080";
@@ -126,6 +153,8 @@ struct LlamaServerBackendOptions {
     std::vector<std::pair<std::string, std::string>> environment;
     LlamaServerWarmupOptions warmup;
     LlamaServerStallGuardOptions stall_guard;
+    // Spawn mode only.
+    LlamaServerHostMemoryOptions host_memory;
 };
 
 // Slot snapshots are upstream-owned files, not portable Sonder KV blocks.

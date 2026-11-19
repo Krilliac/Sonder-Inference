@@ -58,6 +58,31 @@ llamaserver::SpillGuardOptions spill_guard_options(const LlamaServerSpillGuardOp
     return g;
 }
 
+// False when the policy name is unknown; `out` is then left partly filled.
+bool host_memory_options(const LlamaServerHostMemoryOptions &o, llamaserver::HostMemoryOptions &out) {
+    out.admission.estimated_resident_bytes = o.estimated_resident_bytes;
+    out.admission.estimated_commit_bytes = o.estimated_private_bytes;
+    out.admission.estimate_lower_bound = o.estimate_lower_bound;
+    out.admission.reserve_bytes = o.reserve_bytes;
+    out.admission.override_refusal = o.override_refusal;
+    out.floor.enabled = o.floor.enabled;
+    out.floor.floor_bytes = o.floor.floor_bytes;
+    out.floor.resume_bytes = o.floor.resume_bytes;
+    out.floor.consecutive_samples = o.floor.consecutive_samples;
+    out.floor.sample_interval = o.floor.sample_interval;
+    out.floor.restart_cooldown = o.floor.restart_cooldown;
+    out.floor.max_restarts = o.floor.max_restarts;
+    if (o.floor.policy == "warn")
+        out.floor.policy = llamaserver::HostFloorPolicy::warn;
+    else if (o.floor.policy == "stop_admission")
+        out.floor.policy = llamaserver::HostFloorPolicy::stop_admission;
+    else if (o.floor.policy == "restart_smaller_ctx")
+        out.floor.policy = llamaserver::HostFloorPolicy::restart_smaller_ctx;
+    else
+        return false;
+    return true;
+}
+
 Status validate_options(const LlamaServerBackendOptions &options) {
     const auto duration_ok = [](std::chrono::milliseconds ms) {
         return ms.count() > 0 && ms <= std::chrono::hours(24);
@@ -90,6 +115,14 @@ Status validate_options(const LlamaServerBackendOptions &options) {
                 !llamaserver::find_context_size(options.args))
                 return {ErrorCode::invalid_argument,
                         "llamaserver: spill_guard.policy=auto_fit needs an explicit --ctx-size/-c argument"};
+        }
+        {
+            llamaserver::HostMemoryOptions host;
+            if (!host_memory_options(options.host_memory, host))
+                return {ErrorCode::invalid_argument,
+                        "llamaserver: host_memory.floor.policy must be warn, stop_admission or restart_smaller_ctx"};
+            if (auto st = llamaserver::validate_host_memory_options(host); !st.ok())
+                return st;
         }
         if (auto st = llamaserver::validate_process_arguments(options.args); !st.ok())
             return st;
@@ -207,6 +240,7 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             s.shutdown_timeout = options_.shutdown_timeout;
             s.max_restarts = options_.max_restarts;
             s.spill_guard = spill_guard_options(options_.spill_guard);
+            (void)host_memory_options(options_.host_memory, s.host_memory);  // policy validated above
             s.log_file = options_.diagnostics.log_file;
             s.kv_pairing_check = options_.diagnostics.kv_pairing_check;
             s.warmup = warmup_;

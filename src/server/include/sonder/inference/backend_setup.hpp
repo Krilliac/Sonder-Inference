@@ -105,6 +105,26 @@ struct BackendSetup {
         std::string on_eviction = "warn";
         std::uint64_t max_eviction_restarts = 1;
     } llamaserver_residency;
+    // Spawn-mode host RAM admission and floor guard (JSON "host_memory").
+    // The two estimate fields are not read from JSON: serve fills them from
+    // the active launch profile's VRAM estimate (VramEstimate::
+    // host_resident_bytes / host_private_bytes).
+    struct LlamaServerHostMemoryConfig {
+        std::uint64_t estimated_resident_bytes = 0;
+        std::uint64_t estimated_private_bytes = 0;
+        // VramEstimate::host_estimate_lower_bound; not read from JSON.
+        bool estimate_lower_bound = false;
+        std::uint64_t reserve_mib = 2048;
+        bool override_refusal = false;
+        bool floor_enabled = false;
+        std::string floor_policy = "warn";  // warn, stop_admission or restart_smaller_ctx
+        std::uint64_t floor_mib = 0;
+        std::uint64_t resume_mib = 0;
+        std::uint64_t consecutive_samples = 2;
+        std::uint64_t sample_interval_ms = 5000;
+        std::uint64_t restart_cooldown_ms = 60000;
+        std::uint64_t max_restarts = 1;
+    } llamaserver_host_memory;
     std::string llamaserver_log_file;
     bool llamaserver_kv_pairing_check = true;
     // JSON "context_length" (served context when /props is unavailable) and

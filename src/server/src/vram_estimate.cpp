@@ -6,12 +6,15 @@
 #include <cstring>
 #include <fstream>
 #include <istream>
+#include <cctype>
 #include <limits>
+#include <regex>
 #include <sstream>
 #include <streambuf>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
 #include "sonder/inference/launch_profile.hpp"
 #include "gguf_artifact_observation.hpp"
@@ -664,6 +667,7 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
             return malformed("tensor " + excerpt(name) + " has an unknown ggml type " + std::to_string(type));
         }
         const std::uint64_t bytes = (elements + block_elems - 1) / block_elems * block_bytes;
+        std::uint32_t tensor_block = kNoBlock;
         if (name.rfind("blk.", 0) == 0) {
             const auto dot = name.find('.', 4);
             std::uint64_t layer = 0;
@@ -674,6 +678,7 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
             }
             if (!ok || layer >= info.block_count) return malformed("tensor " + excerpt(name) + " names an unknown block");
             info.block_bytes[layer] += bytes;
+            tensor_block = static_cast<std::uint32_t>(layer);
             const std::string suffix = name.substr(dot + 1);
             if (suffix == "attn_k.weight" || suffix == "attn_kv_a_mqa.weight") {
                 attention_tensor[layer] = true;
@@ -686,6 +691,18 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
             if (name == "output.weight") output_vocab = second;
         } else {
             info.other_bytes += bytes;
+        }
+        if (info.tensors.size() < kMaxStoredTensors && name.size() <= kMaxStoredTensorName) {
+            GgufTensorInfo entry;
+            entry.expert = tensor_block != kNoBlock &&
+                           (name.find("_exps.") != std::string::npos || name.find("_chexps.") != std::string::npos);
+            entry.name = std::move(name);
+            entry.type = type;
+            entry.bytes = bytes;
+            entry.block = tensor_block;
+            info.tensors.push_back(std::move(entry));
+        } else {
+            info.tensors_truncated = true;
         }
     }
     info.vocab_size = token_count > 0 ? token_count : static_cast<std::uint64_t>(scalar(a + "vocab_size", static_cast<std::int64_t>(output_vocab)));
@@ -790,6 +807,158 @@ std::string redact_model_path(const Status& error, const std::string& path) {
     return text;
 }
 
+namespace {
+
+constexpr std::size_t kMaxPlacementRules = 256;
+constexpr std::size_t kMaxOverridePattern = 256;
+constexpr std::size_t kMaxOverrideValue = 4096;
+constexpr std::size_t kMaxBufferTypeName = 64;
+constexpr std::uint64_t kMaxCpuMoeLayers = 1u << 22;
+// Host workspace outside the weights/KV: output buffers, tokenizer, server.
+constexpr std::uint64_t kHostWorkspaceBytes = 256 * kMiB;
+
+// ggml types llama.cpp b11195 can repack for CPU matmul (arch/repack.cpp):
+// Q4_0 (2), Q8_0 (8), Q4_K (12), IQ4_NL (20).
+bool repackable_ggml_type(std::uint32_t type) { return type == 2 || type == 8 || type == 12 || type == 20; }
+
+bool host_buffer_type(std::string_view name) {
+    std::string up(name);
+    for (char& c : up) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return up == "CPU" || up.rfind("CPU_", 0) == 0 || (up.size() >= 5 && up.compare(up.size() - 5, 5, "_HOST") == 0);
+}
+
+Status placement_error(const std::string& flag, const std::string& what, std::string_view value = {}) {
+    std::string text = "extra_args " + excerpt(flag) + ": " + what;
+    if (!value.empty()) text += " (" + excerpt(value) + ")";
+    return Status(ErrorCode::invalid_argument, std::move(text));
+}
+
+}  // namespace
+
+Result<MoePlacement> parse_moe_placement(const std::vector<std::string>& extra_args) {
+    MoePlacement out;
+    for (std::size_t i = 0; i < extra_args.size(); ++i) {
+        const std::string& arg = extra_args[i];
+        if (arg.size() < 2 || arg[0] != '-') continue;
+        const std::string flag = llamaserver_flag_name(arg);
+        const bool has_equals = arg.find('=') != std::string::npos;
+        if (flag == "-lm" || flag == "--load-mode") {
+            // b11195 common/arg.cpp: -lm/--load-mode {auto,none,mmap,mlock,mmap+mlock,dio}.
+            // There is no --mmap/--no-mmap/--mlock in that build. The last one wins.
+            std::string value;
+            if (has_equals) {
+                value = arg.substr(arg.find('=') + 1);
+            } else if (i + 1 < extra_args.size()) {
+                value = extra_args[++i];
+            } else {
+                return placement_error(flag, "needs a value");
+            }
+            if (value == "auto" || value == "mmap") {
+                out.mmap = true;
+                out.mlock = false;
+            } else if (value == "none" || value == "dio") {
+                out.mmap = false;  // private memory (dio bypasses the page cache)
+                out.mlock = false;
+            } else if (value == "mlock") {
+                out.mmap = false;  // read into private memory and pinned
+                out.mlock = true;
+            } else if (value == "mmap+mlock") {
+                out.mmap = true;  // mapped but pinned: not droppable
+                out.mlock = true;
+            } else {
+                return placement_error(flag, "must be one of auto, none, mmap, mlock, mmap+mlock, dio", value);
+            }
+            continue;
+        }
+        if (flag == "-nr" || flag == "--no-repack") {
+            if (has_equals) return placement_error(flag, "takes no value");
+            out.repack = false;
+            continue;
+        }
+        if (flag == "--repack") {
+            if (has_equals) return placement_error(flag, "takes no value");
+            out.repack = true;
+            continue;
+        }
+        if (flag == "--cpu-moe" || flag == "-cmoe") {
+            if (has_equals) return placement_error(flag, "takes no value");
+            if (out.rules.size() >= kMaxPlacementRules) return placement_error(flag, "too many placement rules");
+            TensorPlacementRule rule;
+            rule.kind = TensorPlacementRule::Kind::all_experts;
+            rule.host = true;
+            out.rules.push_back(std::move(rule));
+            continue;
+        }
+        const bool is_override = flag == "-ot" || flag == "--override-tensor";
+        const bool is_ffn = flag == "--n-cpu-ffn" || flag == "-ncffn";
+        const bool is_count = flag == "--n-cpu-moe" || flag == "-ncmoe" || is_ffn;
+        if (!is_override && !is_count) continue;
+        std::string value;
+        if (has_equals) {
+            value = arg.substr(arg.find('=') + 1);
+        } else if (i + 1 < extra_args.size()) {
+            value = extra_args[++i];
+        } else {
+            return placement_error(flag, "needs a value");
+        }
+        if (value.empty()) return placement_error(flag, "needs a value");
+        if (is_count) {
+            if (value.size() > 7 || (value.size() > 1 && value[0] == '0')) {
+                return placement_error(flag, "must be a plain decimal layer count", value);
+            }
+            std::uint64_t n = 0;
+            for (const char c : value) {
+                if (c < '0' || c > '9') return placement_error(flag, "must be a plain decimal layer count", value);
+                n = n * 10 + static_cast<std::uint64_t>(c - '0');
+            }
+            if (n > kMaxCpuMoeLayers) return placement_error(flag, "layer count is implausibly large", value);
+            if (is_ffn) {
+                out.n_cpu_ffn = static_cast<std::uint32_t>(n);
+                continue;
+            }
+            if (out.rules.size() >= kMaxPlacementRules) return placement_error(flag, "too many placement rules");
+            TensorPlacementRule rule;
+            rule.kind = TensorPlacementRule::Kind::first_n_experts;
+            rule.count = static_cast<std::uint32_t>(n);
+            rule.host = true;
+            out.rules.push_back(std::move(rule));
+            continue;
+        }
+        if (value.size() > kMaxOverrideValue) return placement_error(flag, "value is too long");
+        std::size_t start = 0;
+        for (;;) {
+            const std::size_t comma = value.find(',', start);
+            const std::string item = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+            const std::size_t eq = item.find('=');
+            if (eq == std::string::npos || eq == 0) {
+                return placement_error(flag, "each override must be <pattern>=<buffer type>", item);
+            }
+            TensorPlacementRule rule;
+            rule.pattern = item.substr(0, eq);
+            rule.buffer_type = item.substr(eq + 1);
+            if (rule.pattern.size() > kMaxOverridePattern) return placement_error(flag, "pattern is too long");
+            if (rule.buffer_type.empty() || rule.buffer_type.size() > kMaxBufferTypeName ||
+                !std::all_of(rule.buffer_type.begin(), rule.buffer_type.end(), [](char c) {
+                    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+                })) {
+                return placement_error(flag, "buffer type must be 1-64 characters from [A-Za-z0-9_]", item);
+            }
+            try {
+                const std::regex check(rule.pattern, std::regex::ECMAScript | std::regex::nosubs);
+                (void)check;
+            } catch (...) {
+                return placement_error(flag, "pattern is not a valid regular expression", item);
+            }
+            rule.host = host_buffer_type(rule.buffer_type);
+            if (out.rules.size() >= kMaxPlacementRules) return placement_error(flag, "too many placement rules");
+            out.rules.push_back(std::move(rule));
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+    }
+    return out;
+}
+
 VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const VramEstimateInputs& inputs) {
     VramEstimate e;
     const std::uint32_t n_layer = m.block_count;
@@ -860,11 +1029,116 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
             v_row_max = std::max(v_row_max, static_cast<double>(m.kv_heads[i]) * v);
         }
     }
+    // Tensor placement (-ot, --n-cpu-moe, --cpu-moe). The first rule that
+    // matches a tensor decides; a tensor no rule matches follows its block
+    // (offloaded blocks on the GPU, the rest on the host).
+    MoePlacement placement;
+    {
+        auto parsed = parse_moe_placement(p.extra_args);
+        if (parsed.ok()) {
+            placement = std::move(parsed.value());
+        } else {
+            e.moe_placement_error = parsed.status().message();
+        }
+    }
+    // llama-server --fit sizes the offload when the profile leaves n_gpu_layers
+    // unset (b11195 common.h fit_params = true); any user tensor override makes
+    // upstream fit abort (fit.cpp), and `--n-cpu-moe 0` adds no override. A
+    // placement parse error leaves user_overrides false: the conservative side.
+    const bool user_overrides =
+        placement.n_cpu_ffn > 0 || std::any_of(placement.rules.begin(), placement.rules.end(), [](const TensorPlacementRule& r) {
+            return !(r.kind == TensorPlacementRule::Kind::first_n_experts && r.count == 0);
+        });
+    const bool fit_path = p.backend == kLaunchProfileBackendLlamaServer && p.fit.value_or(true) &&
+                          !p.n_gpu_layers && !user_overrides;
+    const bool tensor_table_usable = !m.tensors.empty() && !m.tensors_truncated;
+    std::uint64_t all_expert_total = 0;   // routed-expert bytes of every counted block tensor
+    std::uint64_t all_repack_expert = 0;  // of those, repackable types
+    std::uint64_t all_repack_dense = 0;   // repackable-type non-expert block bytes
+    bool regex_failed = false;
+    std::vector<std::uint64_t> moved_to_host(n_layer, 0);  // bytes of an offloaded block placed on the host
+    std::vector<std::uint64_t> moved_to_gpu(n_layer, 0);   // bytes of a host block placed on the GPU
+    std::uint64_t host_expert_total = 0;                   // routed-expert bytes that end up on the host
+    std::uint64_t host_repacked_expert = 0;                // repackable-type expert bytes on the host
+    std::uint64_t host_repacked_dense = 0;                 // repackable-type non-expert block bytes on the host
+    if (placement.has_tensor_rules() && !tensor_table_usable) {
+        e.notes.emplace_back(m.tensors_truncated
+                                 ? "the GGUF tensor table was too large to keep names for: -ot/--n-cpu-moe/--cpu-moe "
+                                   "are not applied"
+                                 : "no tensor names are available: -ot/--n-cpu-moe/--cpu-moe are not applied");
+        placement.rules.clear();
+    }
+    if (tensor_table_usable) {
+        std::vector<std::optional<std::regex>> compiled(placement.rules.size());
+        for (std::size_t r = 0; r < placement.rules.size(); ++r) {
+            if (placement.rules[r].kind != TensorPlacementRule::Kind::pattern) continue;
+            try {
+                compiled[r].emplace(placement.rules[r].pattern, std::regex::ECMAScript | std::regex::nosubs);
+            } catch (...) {
+                // parse_moe_placement already compiled it; stay conservative
+                // if the standard library disagrees: the rule never matches.
+            }
+        }
+        std::uint64_t matched_experts = 0;
+        for (const GgufTensorInfo& t : m.tensors) {
+            if (t.block == kNoBlock || t.block >= n_layer) continue;
+            if (t.block >= first_nextn && !mtp) continue;
+            const bool default_host = t.block < first_gpu;
+            bool host = default_host;
+            for (std::size_t r = 0; r < placement.rules.size(); ++r) {
+                const TensorPlacementRule& rule = placement.rules[r];
+                bool hit = false;
+                switch (rule.kind) {
+                    case TensorPlacementRule::Kind::all_experts: hit = t.expert; break;
+                    case TensorPlacementRule::Kind::first_n_experts: hit = t.expert && t.block < rule.count; break;
+                    case TensorPlacementRule::Kind::pattern:
+                        if (compiled[r].has_value()) {
+                            try {
+                                hit = std::regex_search(t.name, *compiled[r]);
+                            } catch (...) {
+                                // e.g. MSVC's regex_error(error_complexity); the rule does not match.
+                                hit = false;
+                                regex_failed = true;
+                            }
+                        }
+                        break;
+                }
+                if (!hit) continue;
+                host = rule.host;
+                break;
+            }
+            if (t.expert) all_expert_total = saturating_add(all_expert_total, t.bytes);
+            if (placement.repack && repackable_ggml_type(t.type)) {
+                (t.expert ? all_repack_expert : all_repack_dense) =
+                    saturating_add(t.expert ? all_repack_expert : all_repack_dense, t.bytes);
+            }
+            if (host != default_host) {
+                (host ? moved_to_host : moved_to_gpu)[t.block] = saturating_add((host ? moved_to_host : moved_to_gpu)[t.block], t.bytes);
+                if (t.expert && host) matched_experts = saturating_add(matched_experts, t.bytes);
+            }
+            if (host && t.expert) host_expert_total = saturating_add(host_expert_total, t.bytes);
+            if (host && placement.repack && repackable_ggml_type(t.type)) {
+                (t.expert ? host_repacked_expert : host_repacked_dense) =
+                    saturating_add(t.expert ? host_repacked_expert : host_repacked_dense, t.bytes);
+            }
+        }
+        if (regex_failed) {
+            e.notes.emplace_back("an -ot pattern could not be evaluated against a tensor name; that rule is treated as "
+                                 "not matching");
+        }
+        if (placement.has_tensor_rules()) {
+            if (matched_experts == 0 && std::none_of(moved_to_host.begin(), moved_to_host.end(),
+                                                      [](std::uint64_t v) { return v != 0; }) &&
+                std::none_of(moved_to_gpu.begin(), moved_to_gpu.end(), [](std::uint64_t v) { return v != 0; })) {
+                e.notes.emplace_back("-ot/--n-cpu-moe/--cpu-moe matched no tensor that changes placement");
+            }
+        }
+    }
     double kv_per_token = 0.0;      // full-attention layers on the GPU
     double swa_kv_per_token = 0.0;  // sliding-window layers on the GPU
     for (std::uint32_t i = first_gpu; i < n_layer; ++i) {
         if (i >= first_nextn && !mtp) continue;  // MTP blocks load only for draft-mtp
-        e.weights_bytes += m.block_bytes[i];
+        e.weights_bytes += m.block_bytes[i] - std::min(m.block_bytes[i], moved_to_host[i]);
         ++e.gpu_layers;
         if (m.kv_heads[i] > 0) {
             ++e.attention_layers;
@@ -882,6 +1156,10 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
         } else if (m.kind != ModelArchitecture::attention_only) {
             e.recurrent_bytes += m.recurrent_state_values * 4 * recurrent_rows;
         }
+    }
+    for (std::uint32_t i = 0; i < first_gpu; ++i) {
+        if (i >= first_nextn && !mtp) continue;
+        e.weights_bytes = saturating_add(e.weights_bytes, moved_to_gpu[i]);
     }
     if (all) e.weights_bytes += m.output_bytes;
     e.kv_bytes_per_token = saturating_u64(kv_per_token);
@@ -935,8 +1213,14 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
     for (const auto& arg : p.extra_args) {
         // The name llama-server reads (`--override_tensor` is `--override-tensor`).
         const std::string flag = llamaserver_flag_name(arg);
-        if (flag == "-ot" || flag == "--override-tensor" || flag == "-cmoe" || flag == "--cpu-moe" ||
-            flag == "-ncmoe" || flag == "--n-cpu-moe" || flag == "-ts" || flag == "--tensor-split" ||
+        // -ot/--cpu-moe/--n-cpu-moe are modelled when they parsed (see
+        // MoePlacement); a malformed one stays ignored and noted.
+        const bool moe_flag = flag == "-ot" || flag == "--override-tensor" || flag == "-cmoe" || flag == "--cpu-moe" ||
+                              flag == "-ncmoe" || flag == "--n-cpu-moe" ||
+                              flag == "-ncffn" || flag == "--n-cpu-ffn";
+        const bool ffn_flag = flag == "-ncffn" || flag == "--n-cpu-ffn";
+        if (moe_flag && !ffn_flag && e.moe_placement_error.empty()) continue;
+        if (moe_flag || flag == "-ts" || flag == "--tensor-split" ||
             flag == "-sm" || flag == "--split-mode" || flag == "-dev" || flag == "--device") {
             e.notes.emplace_back("placement flags in extra_args (" + flag +
                                  ") are ignored: the estimate assumes every offloaded block is on one GPU");
@@ -950,6 +1234,150 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
         e.notes.emplace_back("parallel unset: llama-server's automatic 4 slots keep 4 recurrent states");
     }
     e.total_bytes = e.weights_bytes + e.kv_bytes + e.recurrent_bytes + e.compute_bytes;
+
+    // ---- Host RAM resident estimate.
+    // Weights: token_embd and the other non-block tensors, the output tensors
+    // unless every block is offloaded, host blocks (minus what -ot sends to
+    // the GPU) and the tensors of offloaded blocks that -ot/--n-cpu-moe keep
+    // on the host. A vision encoder that is not offloaded also lives here.
+    std::uint64_t host_weights = saturating_add(m.embedding_bytes, m.other_bytes);
+    if (!all) host_weights = saturating_add(host_weights, m.output_bytes);
+    for (std::uint32_t i = 0; i < n_layer && i < m.block_bytes.size(); ++i) {
+        if (i >= first_nextn && !mtp) continue;
+        if (i < first_gpu) {
+            host_weights = saturating_add(host_weights, m.block_bytes[i] - std::min(m.block_bytes[i], moved_to_gpu[i]));
+        } else {
+            host_weights = saturating_add(host_weights, moved_to_host[i]);
+        }
+    }
+    if (!p.mmproj.empty() && !p.mmproj_offload.value_or(true)) {
+        host_weights = saturating_add(host_weights, inputs.mmproj_bytes);
+    }
+    if (fit_path) {
+        // llama-server's --fit picks the offload itself: whatever does not fit
+        // the VRAM budget (plus its margin) lands on the host, experts first.
+        e.host_fit_applies = true;
+        std::uint64_t overflow = 0;
+        if (inputs.fit_vram_budget_bytes) {
+            const std::uint64_t budget = *inputs.fit_vram_budget_bytes;
+            const std::uint64_t need = saturating_add(e.total_bytes, kLlamaServerFitTargetBytes);
+            if (need > budget) {
+                std::uint64_t granule = 0;
+                for (const std::uint64_t b : m.block_bytes) granule = std::max(granule, b);
+                const std::uint64_t movable = saturating_add(e.weights_bytes, saturating_add(e.kv_bytes, e.recurrent_bytes));
+                overflow = std::min(movable, saturating_add(need - budget, granule));
+            }
+            const std::uint64_t overflow_expert =
+                tensor_table_usable ? std::min(overflow, all_expert_total - std::min(all_expert_total, host_expert_total)) : 0;
+            const std::uint64_t overflow_dense = overflow - overflow_expert;
+            host_weights = saturating_add(host_weights, overflow);
+            host_expert_total = saturating_add(host_expert_total, overflow_expert);
+            if (placement.repack) {
+                host_repacked_expert = saturating_add(
+                    host_repacked_expert,
+                    std::min(overflow_expert, all_repack_expert - std::min(all_repack_expert, host_repacked_expert)));
+                host_repacked_dense = saturating_add(
+                    host_repacked_dense,
+                    tensor_table_usable
+                        ? std::min(overflow_dense, all_repack_dense - std::min(all_repack_dense, host_repacked_dense))
+                        : overflow_dense);
+            }
+            e.host_fit_overflow_bytes = overflow;
+            e.notes.emplace_back("host RAM: llama-server --fit sizes the offload; " + std::to_string(overflow / kMiB) +
+                                 " MiB that does not fit the " + std::to_string(budget / kMiB) +
+                                 " MiB VRAM budget (plus 1024 MiB fit margin) is counted on the host; the budget is "
+                                 "not free VRAM, so less may fit");
+        } else {
+            // No VRAM note: `notes` are VRAM caveats that callers fold into the
+            // VRAM fit summary. The flag carries this and the supervisor warns
+            // (host_memory_estimate_lower_bound).
+            e.host_estimate_lower_bound = true;
+        }
+    }
+    // Experts the table could not classify (no tensor names) are dense here:
+    // the whole host weight is then counted as needed.
+    e.host_expert_bytes = std::min(host_expert_total, host_weights);
+    e.host_dense_weight_bytes = host_weights - e.host_expert_bytes;
+    // Repacked tensors are copied into private memory whole (not mmapped).
+    host_repacked_expert = std::min(host_repacked_expert, e.host_expert_bytes);
+    host_repacked_dense = std::min(host_repacked_dense, e.host_dense_weight_bytes);
+    e.host_repacked_bytes = saturating_add(host_repacked_expert, host_repacked_dense);
+
+    // KV and recurrent state of non-offloaded blocks (the offloaded ones are
+    // in kv_bytes/recurrent_bytes above). --no-kv-offload is not modelled.
+    double host_kv_per_token = 0.0;
+    double host_swa_kv_per_token = 0.0;
+    std::uint64_t host_recurrent = 0;
+    for (std::uint32_t i = 0; i < first_gpu && i < m.kv_heads.size(); ++i) {
+        if (i >= first_nextn && !mtp) continue;
+        if (m.kv_heads[i] > 0) {
+            const bool swa = sliding(i);
+            const double heads = static_cast<double>(m.kv_heads[i]);
+            const double k = static_cast<double>(swa ? m.key_length_swa : m.key_length);
+            const double v = static_cast<double>(swa ? m.value_length_swa : m.value_length);
+            const double bytes = v_padded ? heads * k * bk + v_row_max * bv : heads * (k * bk + v * bv);
+            (swa ? host_swa_kv_per_token : host_kv_per_token) += bytes;
+        } else if (m.kind != ModelArchitecture::attention_only) {
+            host_recurrent = saturating_add(host_recurrent, saturating_mul(m.recurrent_state_values * 4, recurrent_rows));
+        }
+    }
+    double host_kv = host_kv_per_token * static_cast<double>(ctx_per_sequence) * e.sequences;
+    if (host_swa_kv_per_token > 0.0) {
+        std::uint64_t cells = e.swa_context_per_sequence;
+        if (e.swa_attention_layers == 0) {
+            bool swa_full_flag = false;
+            for (const auto& arg : p.extra_args) swa_full_flag = swa_full_flag || llamaserver_flag_name(arg) == "--swa-full";
+            if (p.backend == kLaunchProfileBackendLlamaCpp || swa_full_flag || inputs.inherited_swa_full) {
+                cells = ctx_per_sequence;
+            } else {
+                const std::uint64_t window = saturating_add(saturating_mul(m.sliding_window, unified ? slots : 1u), ubatch);
+                cells = (std::min(ctx_per_sequence, window) + 255) / 256 * 256;
+            }
+        }
+        host_kv += host_swa_kv_per_token * static_cast<double>(cells) * e.sequences;
+    }
+    e.host_kv_bytes = saturating_u64(host_kv);
+    e.host_recurrent_bytes = host_recurrent;
+    e.host_compute_bytes = saturating_add(kHostWorkspaceBytes, saturating_mul(m.vocab_size, saturating_mul(ubatch, 4)));
+    if (offloaded == 0) {
+        // Nothing is offloaded: the compute graph's activations are host buffers too.
+        e.host_compute_bytes =
+            saturating_add(e.host_compute_bytes, saturating_mul(saturating_mul(4 * m.embedding_length, ubatch), 4));
+    }
+
+    // Weights are page-cache-backed under mmap (clean file pages the kernel
+    // may drop), private memory under --load-mode none|mlock|dio, and pinned (not droppable) with mlock.
+    e.host_weights_mmapped = placement.mmap && !placement.mlock;
+    double fraction = 1.0;
+    if (e.host_weights_mmapped) {
+        if (inputs.expert_resident_fraction > 0.0) {  // false for NaN and negatives
+            fraction = std::min(1.0, inputs.expert_resident_fraction);
+        } else if (m.routed_experts && m.routed_experts->total > 0) {
+            fraction = static_cast<double>(m.routed_experts->active) / static_cast<double>(m.routed_experts->total);
+        }
+    }
+    e.host_expert_resident_fraction = fraction;
+    // Repacked tensors are private memory at 100%; only the rest is page cache.
+    const std::uint64_t expert_mapped = e.host_expert_bytes - host_repacked_expert;
+    const std::uint64_t dense_mapped = e.host_dense_weight_bytes - host_repacked_dense;
+    const std::uint64_t expert_resident =
+        fraction >= 1.0 ? expert_mapped : std::min(expert_mapped, saturating_u64(std::ceil(static_cast<double>(expert_mapped) * fraction)));
+    const std::uint64_t anonymous =
+        saturating_add(saturating_add(e.host_kv_bytes, e.host_recurrent_bytes), e.host_compute_bytes);
+    if (e.host_weights_mmapped) {
+        e.host_page_cache_bytes = saturating_add(dense_mapped, expert_resident);
+        e.host_private_bytes = saturating_add(anonymous, e.host_repacked_bytes);
+    } else {
+        e.host_page_cache_bytes = 0;
+        e.host_private_bytes = saturating_add(anonymous, saturating_add(e.host_dense_weight_bytes, e.host_expert_bytes));
+    }
+    e.host_resident_bytes = saturating_add(e.host_private_bytes, e.host_page_cache_bytes);
+    if (placement.has_tensor_rules() || e.host_expert_bytes > 0) {
+        e.notes.emplace_back("host RAM: mmapped weights are counted as page cache (experts at the stated resident "
+                             "fraction), not as private memory, except host Q4_0/Q4_K/Q8_0/IQ4_NL tensors, "
+                             "which llama.cpp repacks into private memory unless -nr/--no-repack; "
+                             "--no-kv-offload is not modelled");
+    }
     return e;
 }
 

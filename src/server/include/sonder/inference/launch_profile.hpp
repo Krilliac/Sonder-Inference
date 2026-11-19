@@ -176,6 +176,21 @@ struct RoutedExpertCounts {
     std::uint32_t active = 0;  // declared expert_used_count, not observed routing
 };
 
+inline constexpr std::size_t kMaxStoredTensors = 1u << 16;
+inline constexpr std::size_t kMaxStoredTensorName = 256;
+inline constexpr std::uint32_t kNoBlock = 0xFFFFFFFFu;
+
+// One tensor-table entry (no tensor data is read).
+struct GgufTensorInfo {
+    std::string name;            // e.g. "blk.3.ffn_up_exps.weight"
+    std::uint64_t bytes = 0;     // size from type and shape
+    std::uint32_t block = kNoBlock;  // N of "blk.N.", kNoBlock otherwise
+    // Routed-expert weights: a name with "_exps." or "_chexps." (llama.cpp's
+    // ffn_{up,gate,down,gate_up}_exps). Shared experts (_shexp) are dense.
+    bool expert = false;
+    std::uint32_t type = 0;      // ggml tensor type id (0 = F32)
+};
+
 // What the estimator needs from a GGUF header. Tensor sizes come from the
 // tensor table; no tensor data is read.
 struct GgufModelInfo {
@@ -219,6 +234,14 @@ struct GgufModelInfo {
     // fields leave this unset; a model name is not evidence. Header-only
     // observation: it does not authorize routing, placement, or cache reuse.
     std::optional<RoutedExpertCounts> routed_experts;
+    // Tensor table entries kept so --override-tensor patterns and
+    // --n-cpu-moe can be applied to real tensor names. Header-only
+    // observation. Not every tensor is kept: a table over
+    // kMaxStoredTensors entries, or a name over kMaxStoredTensorName bytes,
+    // sets tensors_truncated and the placement flags are then not modelled.
+    // block_bytes/embedding_bytes/... stay complete either way.
+    std::vector<GgufTensorInfo> tensors;
+    bool tensors_truncated = false;
 };
 
 // Parses the GGUF header of `path` (versions 2 and 3). Errors: not_found,
@@ -232,6 +255,58 @@ Result<GgufModelInfo> parse_gguf_model_info(std::string_view header_bytes);
 // replaced by "<model path>", for client-visible metadata such as
 // /v1/models `estimate_error`; local filesystem paths stay in operator logs.
 std::string redact_model_path(const Status& error, const std::string& path);
+
+// ------------------------------------------------- MoE tensor placement flags
+
+// One placement rule from llama-server's extra_args, in argv order. The first
+// rule that matches a tensor decides where it lives (llama.cpp's loader
+// walks its override list the same way).
+struct TensorPlacementRule {
+    enum class Kind {
+        pattern,         // -ot/--override-tensor <regex>=<buffer type>
+        all_experts,     // --cpu-moe / -cmoe
+        first_n_experts  // --n-cpu-moe N / -ncmoe N: experts of blocks 0..N-1
+    };
+    Kind kind = Kind::pattern;
+    std::string pattern;      // pattern rules: ECMAScript regex, searched in the tensor name
+    std::string buffer_type;  // pattern rules: as written, e.g. "CPU", "CUDA0", "CUDA_Host"
+    std::uint32_t count = 0;  // first_n_experts: N
+    // Lives in host RAM: buffer type CPU, CPU_*, or *_Host (pinned host
+    // memory). Always true for the two MoE kinds. Any other buffer type is
+    // treated as the GPU the estimate already assumes. b11195 accepts only
+    // the device buffer-type names its backends report, so llama-server may
+    // reject CPU_* and *_Host as an unknown buffer type; they are classified
+    // as host here if written.
+    bool host = false;
+};
+
+struct MoePlacement {
+    std::vector<TensorPlacementRule> rules;
+    bool mmap = true;   // -lm/--load-mode auto|mmap|mmap+mlock map the model; none|mlock|dio do not
+    bool mlock = false; // --load-mode mlock|mmap+mlock pins the pages
+    // llama.cpp repacks CPU-placed Q4_0/Q4_K/Q8_0/IQ4_NL weights into private
+    // memory unless -nr/--no-repack is given (b11195 common.h no_extra_bufts).
+    bool repack = true;
+    // --n-cpu-ffn/-ncffn N (recorded only; its placement is not modelled).
+    std::uint32_t n_cpu_ffn = 0;
+    [[nodiscard]] bool has_tensor_rules() const noexcept { return !rules.empty(); }
+};
+
+// Reads --cpu-moe/-cmoe, --n-cpu-moe/-ncmoe N, --n-cpu-ffn/-ncffn N (recorded
+// in n_cpu_ffn only), --repack/-nr/--no-repack (the last one wins), -ot/--override-tensor
+// "<regex>=<buffer>[,<regex>=<buffer>...]" (flag names as llama-server reads
+// them: llamaserver_flag_name; `--flag value` and `--flag=value`) and
+// -lm/--load-mode {auto,none,mmap,mlock,mmap+mlock,dio} (llama.cpp b11195;
+// any other value is invalid_argument; --mmap/--no-mmap/--mlock do not exist
+// there and are ignored) from extra_args. Everything else is ignored here.
+// invalid_argument for: a missing value; a non-decimal, zero-padded or
+// over-4,194,304 N; an override item without exactly one usable
+// "<pattern>=<buffer>" (the pattern is cut at the first '='), an empty
+// pattern, a buffer type that is not [A-Za-z0-9_]+ (at most 64 characters), a
+// pattern over 256 characters or one std::regex rejects; more than 256 rules.
+// The message names the flag and a bounded excerpt, never the whole value.
+// Never reads a file and never throws.
+Result<MoePlacement> parse_moe_placement(const std::vector<std::string>& extra_args);
 
 struct VramEstimate {
     std::uint64_t weights_bytes = 0;  // offloaded blocks (+ output) + mmproj/draft when offloaded
@@ -267,6 +342,53 @@ struct VramEstimate {
     std::uint32_t recurrent_snapshots = 1;
     std::vector<std::string> notes;  // what the estimate does not cover
 
+    // ---- Host RAM (additive). What llama-server keeps in system memory:
+    // blocks not offloaded, tensors placed on the CPU by -ot/--n-cpu-moe/
+    // --cpu-moe, token_embd, the output tensors when not every block is
+    // offloaded, and KV/recurrent state of non-offloaded blocks. Weights are
+    // page-cache-backed (mmap) unless --load-mode is none, mlock, mmap+mlock or dio: those pages are
+    // clean file cache the kernel can drop, not private memory.
+    std::uint64_t host_dense_weight_bytes = 0;   // host non-expert weights (token_embd, host blocks, ...)
+    std::uint64_t host_expert_bytes = 0;         // routed-expert weights kept on the host
+    // Host-placed weights of a repackable type (Q4_0, Q4_K, Q8_0, IQ4_NL) that
+    // llama.cpp copies into private memory at 100% (a subset of the dense and
+    // expert host bytes above); 0 with -nr/--no-repack.
+    std::uint64_t host_repacked_bytes = 0;
+    std::uint64_t host_kv_bytes = 0;             // KV of non-offloaded attention blocks
+    std::uint64_t host_recurrent_bytes = 0;      // recurrent state of non-offloaded blocks
+    std::uint64_t host_compute_bytes = 0;        // host workspace: logits buffer + fixed allowance
+    bool host_weights_mmapped = true;            // false with --load-mode none/mlock/mmap+mlock/dio
+    // Fraction of host expert bytes the estimate keeps resident when they are
+    // mmapped: the declared active/total expert ratio (one token's working
+    // set) or 1.0 when the header has no routed-expert counts, unless the
+    // caller sets VramEstimateInputs::expert_resident_fraction.
+    double host_expert_resident_fraction = 1.0;
+    // Mmapped weights counted as page cache that must stay resident: all
+    // dense host weights plus host_expert_bytes x host_expert_resident_fraction
+    // (rounded up). 0 when the weights are not mmapped.
+    std::uint64_t host_page_cache_bytes = 0;
+    // Anonymous memory: KV, recurrent, compute, and the host weights too when
+    // they are not mmapped.
+    std::uint64_t host_private_bytes = 0;
+    // host_private_bytes + host_page_cache_bytes: the host-RAM resident
+    // estimate the pre-spawn admission check compares with available memory.
+    std::uint64_t host_resident_bytes = 0;
+    // Why -ot/--n-cpu-moe/--cpu-moe were not applied ("" when applied or absent).
+    std::string moe_placement_error;
+    // llama-server's --fit sizes the offload (profile has no n_gpu_layers, fit
+    // is on, and no tensor override was given): host_fit_overflow_bytes of
+    // weights/KV/recurrent state that do not fit the VRAM budget plus
+    // kLlamaServerFitTargetBytes are counted on the host. VRAM-side fields
+    // are not changed by this.
+    bool host_fit_applies = false;
+    std::uint64_t host_fit_overflow_bytes = 0;
+    // The fit path applies but no VRAM budget was known: the host estimate
+    // assumes everything fits the GPU and is a lower bound.
+    bool host_estimate_lower_bound = false;
+    [[nodiscard]] std::uint64_t host_resident_mib() const noexcept {
+        return (host_resident_bytes >> 20) + ((host_resident_bytes & ((1u << 20) - 1)) != 0 ? 1 : 0);
+    }
+
     // Rounded up; cannot wrap, even for a total near 2^64.
     [[nodiscard]] std::uint64_t total_mib() const noexcept {
         return (total_bytes >> 20) + ((total_bytes & ((1u << 20) - 1)) != 0 ? 1 : 0);
@@ -280,7 +402,18 @@ struct VramEstimateInputs {
     // Caller snapshot of a nonempty inherited LLAMA_ARG_SWA_FULL setting.
     // Keep estimate_vram deterministic; the CLI supplies this before launch.
     bool inherited_swa_full = false;
+    // Share of mmapped host expert bytes to count as resident, in (0, 1].
+    // 0 (default), NaN or negative: derive it from the header's active/total
+    // expert counts (1.0 when absent). Above 1 is clamped to 1.
+    double expert_resident_fraction = 0.0;
+    // VRAM budget (bytes) llama-server's --fit sizes the offload against;
+    // nullopt = unknown. Keep this the last field: callers initialise the
+    // struct positionally.
+    std::optional<std::uint64_t> fit_vram_budget_bytes;
 };
+
+// llama-server's default --fit-target margin (b11195 fit_params_target, 1 GiB).
+inline constexpr std::uint64_t kLlamaServerFitTargetBytes = 1ull << 30;
 
 // Estimate for serving `profile` with `model`:
 //   weights  blocks on the GPU (the last n_gpu_layers, llama.cpp order),

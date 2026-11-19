@@ -178,6 +178,15 @@ struct ServerOptions {
 // naming the option.
 Status validate_options(const ServerOptions& options);
 
+// serve's launch-profile step (exposed so tests can drive the wiring): builds
+// the `sonder.profiles` catalog, binds `active` into `options`, runs the VRAM
+// fit check and, for an active llamaserver profile with or without GPU
+// offload, copies the GGUF host-RAM estimate into
+// options.backend.llamaserver_host_memory. On refusal `refusal` is non-empty.
+json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const LaunchProfile& active,
+                            ServerOptions& options, std::optional<std::uint64_t> budget_flag, bool allow_overcommit,
+                            std::vector<std::string>& notes, std::string& refusal);
+
 class Server {
 public:
     explicit Server(ServerOptions options);
