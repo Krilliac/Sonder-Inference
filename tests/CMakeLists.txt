@@ -48,6 +48,10 @@ set_tests_properties(
     sonder.telemetry.stress.stream_pressure
     PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE LABELS "stress;synthetic;telemetry")
 
+# Supervisor fault injection against a real child process and the reliability
+# driver self-test (tests/fault/).
+add_subdirectory(fault)
+
 # A ';' in a doctest TEST_CASE name makes CTest split it into two entries that
 # match nothing, so the test silently never runs (see cmake/CheckTestNames.cmake).
 add_test(NAME sonder.meta.test_names_have_no_semicolons

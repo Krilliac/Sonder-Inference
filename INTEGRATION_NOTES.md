@@ -384,3 +384,106 @@ The tested code is a frozen uncommitted overlay on `d8d02d3ae8d5`; its build
 stamp remains that base, with TLS and llama.cpp disabled. This later notes
 append does not restamp those executions as a published revision build.
 Hosted checks and merging still require the exact final public revision.
+
+# Integration notes: `claude/si-fault-harness` (reliability-run harness)
+
+Adds supervisor fault-injection tests, a reliability-run driver and evidence
+rules. Files: `tests/fault/*` (new), `scripts/reliability_run.py` (new),
+`docs/BENCHMARK_PLAN.md` and `bench/README.md` (appended sections). One edit
+outside "new files only": `tests/CMakeLists.txt` gains `add_subdirectory(fault)`
+(needed to register the tests).
+
+CTest names: `sonder.fault.*` (doctest cases in `sonder_fault_tests`, built only
+when the llamaserver module is present) and `sonder.reliability_run.self_test`
+(registered only when a Python 3 interpreter is found).
+
+Origin: colibri `PORT_PLAN.md` item 7. The ideas (fault injection against a
+real child, "a fault that never fired fails the run", host sampling) are
+reimplemented; no colibri code was copied.
+
+`sonder.fault.*` cases (8): kill child mid-stream; kill child during warm-up;
+cancel during a long prefill; a client that stops reading; child that exits at
+start; upstream that stops sending mid-stream (pins current behaviour: only the
+request total timeout ends it, no restart); fault gate RED proof (a scenario
+that injects nothing must fail `REQUIRE_FIRED`, expressed with
+`doctest::expected_failures(1)`); control run (every fault gate reads zero).
+They run `RUN_SERIAL` because they assert wall-clock bounds and port/pid state.
+
+Results (msvc-debug, Windows, review cycle 5 run; sccache `-Z7` build configuration, not part of this change):
+
+- History: the cycle-4 build was stale (76 of 151 objects had dependency
+  records from sibling checkouts) and was not trusted. The cycle-4 re-review
+  then showed the self-test failing 2 of 5 runs under a 24-process busy-loop
+  load: the fault-window controls shared one fake server whose failure period
+  was scheduled by wall clock, so a slow fault subprocess leaked failures into
+  the next control or started them after the run ended.
+- Fix: `_fault_window_controls` in `scripts/reliability_run.py`. Each control
+  has its own fake server. The failure state is switched by events
+  (`/__flaky/begin|wait|end|arm`; `wait` blocks until the server has failed a
+  request), and each run ends on an observed event (`run(args, stop_event)`;
+  `--duration` is only a ceiling) read from `events.jsonl` and
+  `requests.jsonl`. The controls run twice: once with prompt fault commands and
+  once with the fault subprocess sleeping 2 s before its first request and 2 s
+  before exiting, which is the load-independence proof. The negative control
+  is fail-closed: if no failure is seen after the window ended it reports
+  "control inconclusive". The ctest TIMEOUT is now 300 s.
+- RED proof: with `in_fault_window` forced to return False, the self-test
+  fails the positive and no-recovery controls in both the fast and lag passes
+  and the helper check.
+- Trusted build: `ninja-foreign-deps.py --delete` removed 76/76 stale objects,
+  rebuild with `SCCACHE_RECACHE=1` (exit 0, 0 errors, 0 warnings, 180 compiles),
+  and `ninja-foreign-deps.py build/msvc-debug` afterwards reports
+  "objects with dependency records: 151; foreign (sibling-checkout) deps: 0".
+- Round 5: sections 2 and 4c of the self-test now end on an observed event
+  (`_run_until`: an ok request after the fault finished), with `--duration`
+  only a ceiling, and a 2.5 s-slow fault command proves it for both shapes.
+  `expected_samples` is computed from the elapsed time of an early-stopped run.
+  Controls use `sample_interval == duration` and must pass every criterion
+  (the healthy run alone tolerates a starved sampler), and the `/__flaky/wait` give-up is 50 s. The earlier
+  "44.5-50.2 s under load" claim was wrong: that load was not effective (idle
+  is about 45-52 s). Effective load (24 CPU-bound busy loops; the self-test took
+  74, 104, 107 and 285 s, up to about 6x idle): final code 4/4 passed. Earlier
+  iterations under that load failed from starvation of the 60 s fault
+  subprocess limit, the 30 s wait give-up (since 50 s) and host_samples, which
+  is why those were changed. Under 40 busy loops (1000 s) nothing can pass; that is outside the design.
+  The ctest TIMEOUT is 900 s for this reason.
+- Round 6 (round-5 BLOCKING items): a 0.8 s stall between the fault row and the
+  recorded window end made failures precede the recorded end, so run() exempted
+  them. Now the window is recorded first and the `fault` event row carries
+  `start_rel`/`end_rel` (same values as `faults.windows_s`); the self-test
+  watcher acts only on rows in files (no sleeps/margins), every run ends on a
+  witness row (`duration` is a fail-closed ceiling), `host_samples` is computed
+  by `host_samples_ok` (tested on fixed tuples and with a starved sampler;
+  `summary.host.samples_expected_min` added), and a third control pass injects
+  0.8 s stalls at 5 points via `run(args, stop_event, seams)`. Idle self-test
+  about 57 s.
+- `sonder_fault_tests.exe -tc="fault gate*"` (checked in review 4) prints the
+  failing `REQUIRE 0 > 0` "fault 'die_midstream' never fired", then "Failed
+  exactly 1 times as expected", 1 passed, rc 0.
+- The full 1003-test ctest passed on the round-4 trusted build (1003/1003). Not yet run: the manual RED
+  proofs (die-after removed; `/v1/v1` stripping removed).
+
+Not done / not verified:
+
+- Linux branches of `fault_sock.hpp` and `process_gone` (`/proc`) are covered
+  only by CI. Strict-warning presets (`/WX`, `-Werror`) likewise.
+- Untested assumptions: after an abrupt child exit the HTTP client reports
+  `protocol_error` or `io_error` (the test accepts either); a non-reading
+  client with a 4 KiB receive buffer back-pressures a 4 KiB send buffer on
+  loopback on both Windows and Linux (if not, the stall test fails on its
+  `write_timeout` gate rather than passing vacuously).
+- Request-level cancellation and client-stall behaviour are asserted at the
+  child and client boundary; the supervisor does not expose its active-lease
+  count, so "lease released" is evidenced by the next acquire and a clean
+  `stop()` with every child gone and every port refusing connections.
+- The mid-stream stall test pins today's behaviour (no idle or inter-chunk
+  timeout). If one is added, its `elapsed >= 900 ms` bound must be revisited.
+- `reliability_run.py` has no real-server run recorded: no live endpoint or
+  weights were used. The process read rate is Windows all-I/O (sockets included) or Linux
+  storage reads, not a disk or paging counter; there is no host-wide disk counter. VRAM needs `nvidia-smi` on PATH, else it is `null`.
+- `faults_fired` proves only that a `--fault` command exited 0. Whether the
+  fault had an observable effect is checked only with `--pid-file` and
+  `--expected-restarts`; making every fault window require an effect is an open
+  design decision (some faults are legitimately invisible to the driver).
+- `--request-timeout` is exact over the body; a server trickling header bytes
+  can overrun it by up to one per-operation wait.
