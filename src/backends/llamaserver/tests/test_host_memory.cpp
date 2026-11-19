@@ -520,7 +520,8 @@ TEST_CASE("supervisor floor guard says admission stays closed while readings are
     REQUIRE(s->start().ok());
     f.available = 2 * kGiB;
     REQUIRE(until([&] { return warned(s->runtime_status(), "host_memory_low"); }));
-    REQUIRE_FALSE(s->acquire_request().ok());
+    // The warning is raised before the admission flag flips, so wait for the closed state.
+    REQUIRE(until([&] { return !s->acquire_request().ok(); }));
     f.unknown = true;
     const auto closed_warning = [&] {
         for (const auto &w : s->runtime_status().warnings)

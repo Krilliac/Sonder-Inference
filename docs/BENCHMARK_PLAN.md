@@ -198,3 +198,138 @@ under `D:/sonder-eco/wf/bench/`. The lane author runs only fake-server tests;
 real GPU acceptance, deployment, commits and PR operations belong to the
 integrator. Each result should include exact server revision, model, launch
 configuration, pins, sampling, context size and the arm's scenario JSON.
+
+## Evidence rules
+
+These rules apply to every number that goes into a report, a commit message or
+a decision. They are Sonder's own wording of practices used by other projects'
+benchmarking notes; no text or data was copied.
+
+1. **Same-session ABBA for A/B speed claims.** Compare two configurations by
+   running A, B, B, A (then repeat the block) in one session, same model load
+   state, same machine, no other GPU work. Report each arm's runs, not only the
+   mean, and the A-vs-A drift (first A against last A). If drift is as large as
+   the A/B difference the claim is not supported. Numbers from different
+   sessions, days or thermal states are never an A/B pair.
+2. **A correctness line beside every speed row.** Each speed row carries
+   either token-ID parity against the reference (only where the arithmetic is
+   the same: same weights, quantization, kernels and sampling at temperature 0)
+   or, where arithmetic differs, a score or perplexity on a named fixed set. A
+   speed row without a correctness line is marked `UNCHECKED` and cannot back a
+   promotion.
+3. **Cache state is a column.** Label every row `cold` (model not resident,
+   page cache dropped or first load), `warm` (resident, prompt cache empty) or
+   `warm-cache` (prompt/KV cache populated). State how cold was produced.
+4. **Exact token counts.** Record prompt and completion token counts as the
+   server or tokenizer reports them, plus their source (`usage`, tokenizer, or
+   streamed-chunk count as a fallback). Never derive tok/s from characters or
+   words, and never compare rows with different counts as if equal.
+5. **Retractions stay in place.** A wrong or superseded result is struck
+   through or marked `RETRACTED <date>: <reason>` where it stood, with a link
+   to the corrected row. Do not delete it and do not silently rewrite it.
+6. **Ledger of rejected ideas.** Every idea tried and dropped gets a row:
+
+   | Idea | Date | Evidence (run, commit, numbers) | Why rejected | Reopen when |
+   | --- | --- | --- | --- | --- |
+
+   `Reopen when` is a concrete, checkable condition (a driver version, a new
+   kernel, a hardware change, a different model family), not "later". An idea
+   whose condition is met is re-tested before it is built.
+7. **A check that stops checking is not a pass.** A run with zero completed
+   requests, zero host samples, or a fault schedule in which no fault fired
+   fails. Say what the number would look like if the harness were broken.
+
+## Reliability run recipe
+
+For hour-long (or longer) runs of slow models, where the question is whether
+the stack stays up, not how fast it is. The driver is
+[`scripts/reliability_run.py`](../scripts/reliability_run.py) (stdlib only;
+`--self-test` checks the driver against a built-in fake server and is part of
+CTest as `sonder.reliability_run.self_test`).
+
+**Setup.** One model, one launch configuration, fixed prompts, temperature 0,
+`max_tokens` fixed, one client unless concurrency is the thing under test.
+Record the exact server and model revision, launch flags, context size, host
+and driver versions, and whether the run starts cold or warm.
+
+**Sampling at 1 Hz** (`samples.jsonl`), for the server process and any child it
+supervises:
+
+| Signal | Windows | Linux |
+| --- | --- | --- |
+| Process private bytes (not comparable across OSes: Windows `PrivateUsage` is commit charge, Linux is resident private pages) | `GetProcessMemoryInfo` `PrivateUsage` | `smaps_rollup` Private_Clean+Private_Dirty (fallback `RssAnon`) |
+| Process working set | `WorkingSetSize` | `VmRSS` |
+| Host available memory | `GlobalMemoryStatusEx` `ullAvailPhys` | `MemAvailable` |
+| Host commit (used / limit) | `ullTotalPageFile` minus `ullAvailPageFile` / `ullTotalPageFile` | `Committed_AS` / `CommitLimit` |
+| Process read bytes/s | `GetProcessIoCounters` `ReadTransferCount` delta: all I/O reads of the process, sockets included | `/proc/<pid>/io` `read_bytes` delta: reads from the storage layer |
+| VRAM used | `nvidia-smi` | `nvidia-smi` |
+| Restarts | pid change in `--pid-file` (no supervisor counter is read) | same |
+
+A value that cannot be read is `null`, never `0`. On Windows the process read
+rate includes network and pipe reads, so it says nothing about paging by
+itself; a real disk or paging signal needs a host counter (for example the
+`\PhysicalDisk` or `\Memory\Pages Input/sec` performance counters), which the
+script does not sample. On Linux the rate is storage reads, so a sustained
+non-zero value on a model that should be resident suggests weights are being
+re-read.
+
+**Per request** (`requests.jsonl`): index, prompt id, TTFT, total time, decode
+tok/s, prompt and completion token counts with their source, finish reason,
+output SHA-256, HTTP status and error kind.
+
+**Fault schedule.** Decide the faults before the run and write them down with
+their offsets, for example a 60-minute run with: child kill mid-stream at 10
+and 40 minutes, cancel burst during a long prefill at 25 minutes, client stall
+at 50 minutes. Inject with `--fault SECONDS:COMMAND` (or the operator's own
+tooling) and log each injection time. Every injection must show evidence that
+it fired (a child-side log line, a pid change, a dropped connection).
+The fault unit tests under `tests/fault/` show the pattern: the supervisor's
+outcome is asserted together with proof of the injection.
+
+**Endpoint and headers.** `--base-url` may be the server root or end in `/v1`
+(a trailing `/v1` is stripped; the driver always posts to
+`<root>/v1/chat/completions`). `--header K=V` must contain `=`; to keep a
+token off the command line use `--header-env K=ENVVAR`, which reads the value
+from the environment. Error messages never include a header value.
+
+**Pass/fail criteria.** `scripts/reliability_run.py` enforces exactly these
+(fail on any). Each appears in `summary.json` `criteria` with its observed
+value; optional ones appear only when their flag is given.
+
+- `requests_completed`: at least one completed request;
+- `host_samples`: at least 80% of the expected 1 Hz samples;
+- `faults_fired`: every `--fault` command ran and exited 0. This proves only
+  the exit code: a fault that changed nothing still counts as fired unless
+  `--pid-file` with `--expected-restarts` (or a child-side event log) shows
+  an effect;
+- `fault_recovery`: after each fired fault, a request that starts after the
+  fault and finishes within `--recovery-budget-s` (default 120) succeeds;
+- `error_rate`: failed fraction of requests outside fault windows at most
+  `--max-error-rate` (default 0). A fault window runs from the fault command
+  start to its end plus `--fault-window` seconds (default 30); a request that
+  overlaps it is an expected error, listed under `requests.expected_fault_failures`
+  and not counted;
+- `restarts_explained` (with `--pid-file`): pid changes equal
+  `--expected-restarts` exactly (default 0, so declare the restarts your
+  schedule causes); a kill command that exits 0 but restarts nothing fails;
+- `deterministic_output`: the temperature-0 output hash for a prompt never
+  changes (unless `--allow-nondeterminism`);
+- `exact_token_counts` (with `--require-usage-tokens`): at least one request
+  completed and every completed request took its token counts from the
+  server's `usage` event, not the one-token-per-chunk fallback;
+- `ttft_p95` (with `--max-ttft-p95`), `restarts` (with `--max-restarts`);
+- `private_bytes_growth` (with `--max-private-growth-mib-per-hour`): slope per
+  sampled pid using only samples after `--warmup-s` (default 600);
+- `host_available_floor` (with `--min-available-mib`) and
+  `host_commit_headroom_floor` (with `--min-commit-headroom-mib`): the
+  minimum over the run must stay above the floor.
+
+`--request-timeout` is a total per-request deadline. It is exact over the
+response body: the socket timeout is shrunk to the time remaining before every
+body read, so a server that trickles body bytes still trips it. Before the
+body (sending the request and reading the status line and headers) each socket
+operation is bounded by the time remaining, so only a server that trickles
+header bytes can overrun it. A request that outlasts it is a failed request
+(`deadline_exceeded`) and so counts
+against `error_rate` like any other. Keep the raw JSONL with the result; small
+reviewed snapshots may go in `bench/results/`.

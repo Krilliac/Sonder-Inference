@@ -284,6 +284,20 @@ inline const CommandSpec& tune_command() {
     return spec;
 }
 
+inline const CommandSpec& weights_command() {
+    static const CommandSpec spec{"weights",
+        "weight-content digest manifests: 'weights manifest' and 'weights verify' (no network)",
+        {"weights manifest DIR -o FILE [--expected HF_TREE_JSON] [--quiet]",
+         "weights verify DIR MANIFEST [--sample N [--seed S]] [--full] [--quiet]"},
+        {},
+        {"Parsed by the weights module (src/artifacts); 'weights --help' prints its options. Exit status:\n"
+         "0 ok, 1 I/O failure, 2 hash or size mismatch, 3 missing or extra file, 4 usage error or\n"
+         "invalid manifest. See docs/integration/weight-manifest.md."},
+        {"weights manifest ./model -o model.manifest.json",
+         "weights verify ./model model.manifest.json --sample 3 --seed 7"}};
+    return spec;
+}
+
 inline const CommandSpec& help_command() {
     static const CommandSpec spec{"help",
                                   "show help for a command",
@@ -298,7 +312,7 @@ inline const CommandSpec& help_command() {
 inline const std::vector<const CommandSpec*>& all_commands() {
     static const std::vector<const CommandSpec*> list{&generate_command(), &chat_command(),     &serve_command(),
                                                       &bench_command(),    &models_command(),   &backends_command(),
-                                                      &devices_command(),  &version_command(),  &tune_command(), &help_command()};
+                                                      &devices_command(),  &version_command(),  &tune_command(), &weights_command(), &help_command()};
     return list;
 }
 

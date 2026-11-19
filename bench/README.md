@@ -66,3 +66,13 @@ and `children` (for agent fan-out). Bump `version` whenever prompts change.
 Caveat: `SamplingConfig` has no `num_ctx`, so Ollama runs use the server's
 default context window. The long-context prompt is sized to fit a 4096
 default.
+
+## Reliability runs
+
+Long, slow-model runs use [`scripts/reliability_run.py`](../scripts/reliability_run.py)
+and the evidence and reliability-run rules in
+[`docs/BENCHMARK_PLAN.md`](../docs/BENCHMARK_PLAN.md). It writes
+`requests.jsonl`, `samples.jsonl`, `events.jsonl` and `summary.json`, and exits
+non-zero when no request completed. `python scripts/reliability_run.py
+--self-test` needs no server or weights. Supervisor fault-injection tests live
+in `tests/fault/` and run under CTest as `sonder.fault.*`.

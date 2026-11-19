@@ -14,6 +14,7 @@ needs to edit root files.
 | `src/backends/llamacpp/` | `feat/llamacpp-backend` | merged (PR #5, 16 unit tests + opt-in GGUF integration); built only with `SONDER_WITH_LLAMA_CPP=ON`; license approved 2026-09-26 (MIT, compatible with the project's Apache-2.0) — notes: `docs/integration/llamacpp.md` |
 | `src/backends/ollama/` | `feat/ollama-bench` | extended (PR #6, 34 tests): `OllamaClient` generate/chat/tags/show/ps/version, NDJSON decoder, HTTP error mapping, timing telemetry — notes: `docs/integration/ollama-bench.md` |
 | `src/server/` | `eco/inf-serve` | new (ecosystem contract v1, ADR-020): `sonder-infer serve` HTTP/1.1 server (OpenAI-compatible chat through `Session::chat`, health, models, identity), live telemetry hub (SSE/NDJSON, discovery, resume), shared backend factory `sonder/inference/backend_setup.hpp`; `SONDER_HAS_SERVER`; tests `sonder.server.*` — reference: `docs/SERVER.md`; integrator changes: `INTEGRATION_NOTES.md` |
+| `src/artifacts/` | `claude/si-weight-manifest` | new: weight-content digest manifests and `sonder-infer weights manifest` / `weights verify`; `SONDER_HAS_WEIGHT_MANIFEST`; tests `sonder.artifacts.*` - reference: `docs/integration/weight-manifest.md` |
 | `bench/` | `feat/ollama-bench` | extended (PR #6, 12 tests): `sonder-bench` runner, baseline corpus with agent fan-out, markdown output; Ollama baseline still pending |
 
 ## Module contract
