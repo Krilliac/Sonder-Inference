@@ -1,9 +1,25 @@
 cmake_minimum_required(VERSION 3.21)
 
+# MSVC debug info: with a compiler launcher (sccache) the default /Zi funnels every
+# compile into one shared target PDB, so parallel compiles fail with C1041, and sccache
+# cannot package a separate PDB at all. /Z7 (Embedded) is what sccache can cache.
+# The policy must be set here: after cmake_minimum_required(), which resets policies
+# to 3.21 where CMP0141 is unset (OLD: /Zi baked into the default flags, variable
+# ignored), and before project(), because CMP0141 is read when project() first enables
+# the languages. CMake older than 3.25 has no CMP0141 and keeps /Zi. Non-MSVC
+# toolchains ignore the variable.
+if(POLICY CMP0141)
+    cmake_policy(SET CMP0141 NEW)
+endif()
+set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "Embedded")
+
 project(SonderInference
     VERSION 0.1.0
     DESCRIPTION "Sonder Inference runtime (policy layer over execution backends)"
     LANGUAGES C CXX)
+
+# Release carries no debug info; only Debug and RelWithDebInfo embed it.
+set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
