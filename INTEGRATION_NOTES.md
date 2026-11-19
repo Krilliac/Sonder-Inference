@@ -384,3 +384,42 @@ The tested code is a frozen uncommitted overlay on `d8d02d3ae8d5`; its build
 stamp remains that base, with TLS and llama.cpp disabled. This later notes
 append does not restamp those executions as a published revision build.
 Hosted checks and merging still require the exact final public revision.
+
+## `claude/si-colibri-attach`: slow OpenAI-compatible attach (colibri)
+
+Scope: `src/net/http_client.*`, `src/backends/llamaserver/` (header, backend,
+protocol, one new test file and its CMake line), `src/server` config loader
+(`backend_setup.*`, JSON keys `api_key_env`, `idle_timeout_ms`,
+`first_content_timeout_ms`, `keepalive_gap_ms`, `unlimited_request_timeout`,
+`upstream_grammar`, `stall_guard.generic_progress`, policy `cancel`),
+`docs/integration/`.
+
+Known gaps:
+
+- `prefix_warmup.cpp` does not send the Authorization header, so `api_key_env`
+  is refused together with `warmup`.
+- Native `attached_monitor_` requests do carry the header (built from
+  `prepare()`); its behaviour with a keyed native upstream is untested.
+- The api_key_env bearer token is copied into the native-attach monitor's
+  request at construction, so rotation is picked up by completion requests
+  but not by monitor polling.
+- With `unlimited_request_timeout`, a stream that sends only keepalives after
+  its first content is bounded only by `stall_guard.generic_progress` with
+  policy `cancel`; enable it for unattended use. Total silence is bounded by
+  the now-mandatory `idle_timeout` (`unlimited_request_timeout` requires both
+  `first_content_timeout` and `idle_timeout`).
+- `COLI_VISIBLE_KEEPALIVE=1` on the colibri side must not be set: its keepalive
+  (`reasoning_content: "."`) is non-empty reasoning text, so it counts as
+  progress and defeats `first_content_timeout` and the stall watchdog. The
+  default keepalive (`reasoning_content: ""`) is correctly not progress.
+- No live `coli serve` was available; wire behaviour is from the review notes.
+
+Behaviour change: with `native_completion=false`, thinking controls are now
+sent as top-level `enable_thinking` / `reasoning_effort` and
+`chat_template_kwargs` is no longer sent. A vLLM/TabbyAPI attach that relied on
+`chat_template_kwargs` is affected. Whether a compatibility switch is wanted is
+an open design decision.
+
+Config validation: `stall_guard.generic_progress` with `stall_guard.enabled:
+false` is refused; JSON `idle_timeout_ms` / `first_content_timeout_ms` accept
+0..86,400,000 ms to match the backend contract.
