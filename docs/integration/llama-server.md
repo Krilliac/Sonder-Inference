@@ -79,6 +79,10 @@ For a generic OpenAI-compatible server such as vLLM or TabbyAPI, set
 Only endpoints and parameters actually implemented by that upstream are
 available. Native grammar and slot operations require llama-server support.
 
+For a slow upstream that streams at a fraction of a token per second, with
+a bearer token, idle and first-content timeouts and a progress watchdog, see
+[colibri.md](colibri.md).
+
 ## Sampling and observations
 
 Only supplied sampling settings go onto the wire. CLI flags and incoming
@@ -174,6 +178,10 @@ strict OpenAI-compatible servers reject unknown parameters. Raw completions
 Thinking controls (`ChatRequest::thinking`) are sent as
 `chat_template_kwargs: {"enable_thinking", "reasoning_effort"}` only when set;
 see [SERVER.md](../SERVER.md#thinking-control) for pinning them server-wide.
+With `native_completion=false` (generic OpenAI mode) the controls are instead
+sent as top-level `enable_thinking` / `reasoning_effort` and
+`chat_template_kwargs` is no longer sent; a vLLM or TabbyAPI attach that relied
+on `chat_template_kwargs` is affected.
 
 ## Slot prefix warm-up
 

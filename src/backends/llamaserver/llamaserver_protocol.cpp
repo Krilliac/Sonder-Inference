@@ -114,7 +114,12 @@ json::Value build_chat_body(const std::string &model, const ChatRequest &request
     put_sampling(o, request.sampling, false);
     if (!grammar.empty())
         o.set("grammar", std::string(grammar));
-    if (!request.thinking.empty()) {
+    if (!request.thinking.empty() && extras.generic_thinking) {
+        if (request.thinking.enable_thinking)
+            o.set("enable_thinking", *request.thinking.enable_thinking);
+        if (request.thinking.reasoning_effort)
+            o.set("reasoning_effort", *request.thinking.reasoning_effort);
+    } else if (!request.thinking.empty()) {
         json::Object kwargs;
         if (request.thinking.enable_thinking)
             kwargs.set("enable_thinking", *request.thinking.enable_thinking);

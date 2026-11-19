@@ -91,7 +91,15 @@ struct BackendSetup {
     // Spawn/attach child stall watchdog (JSON "stall_guard").
     bool llamaserver_stall_guard = true;
     std::uint64_t llamaserver_stall_seconds = 90;
-    std::string llamaserver_stall_policy = "warn";  // warn or restart
+    std::string llamaserver_stall_policy = "warn";  // warn or restart; cancel with generic_progress
+    bool llamaserver_stall_generic_progress = false;
+    // Slow OpenAI-compatible upstreams (docs/integration/colibri.md).
+    std::string llamaserver_api_key_env;
+    std::uint64_t llamaserver_idle_timeout_ms = 0;           // 0 = off
+    std::uint64_t llamaserver_first_content_timeout_ms = 0;  // 0 = off
+    std::uint64_t llamaserver_keepalive_gap_ms = 10000;
+    bool llamaserver_unlimited_request_timeout = false;
+    bool llamaserver_upstream_grammar = true;
     // Nested JSON "spill_guard.residency" mirror. Kept independent of the
     // optional llamaserver backend header so config loading remains available
     // in builds without that backend.

@@ -404,9 +404,66 @@ std::string lower(std::string s) {
 
 }  // namespace
 
+Status validate_request_headers(const std::vector<std::pair<std::string, std::string>>& headers) {
+    static constexpr std::string_view reserved[] = {"host",       "content-length",    "content-type", "connection",
+                                                    "expect",     "transfer-encoding", "upgrade"};
+    for (const auto& header : headers) {
+        const std::string& name = header.first;
+        const std::string& value = header.second;
+        if (name.empty() || name.size() > 256) {
+            return Status(ErrorCode::invalid_argument, "http header name must be 1-256 bytes");
+        }
+        for (const char ch : name) {
+            const auto c = static_cast<unsigned char>(ch);
+            const bool token = c != 0 && c < 0x80 && (std::isalnum(c) != 0 || std::strchr("!#$%&'*+-.^_`|~", ch) != nullptr);
+            if (!token) {
+                return Status(ErrorCode::invalid_argument, "http header name has an invalid character");
+            }
+        }
+        const std::string key = lower(name);
+        for (const auto r : reserved) {
+            if (key == r) {
+                return Status(ErrorCode::invalid_argument, "http header '" + name + "' is managed by the client");
+            }
+        }
+        if (value.size() > 8192) {
+            return Status(ErrorCode::invalid_argument, "http header '" + name + "' value is too long");
+        }
+        for (const char ch : value) {
+            const auto c = static_cast<unsigned char>(ch);
+            if ((c < 0x20 && c != '\t') || c == 0x7f) {
+                return Status(ErrorCode::invalid_argument,
+                              "http header '" + name + "' value contains a control character (CR/LF/NUL refused)");
+            }
+        }
+    }
+    return Status::success();
+}
+
+std::string redacted_header_value(std::string_view name, std::string_view value) {
+    const std::string key = lower(std::string(name));
+    if (key == "authorization" || key == "proxy-authorization" || key == "cookie" || key == "set-cookie" ||
+        key.find("api-key") != std::string::npos || key.find("apikey") != std::string::npos ||
+        key.find("token") != std::string::npos || key.find("secret") != std::string::npos) {
+        return "[redacted]";
+    }
+    return std::string(value);
+}
+
 Result<HttpResponseInfo> http_request(const HttpRequest& request, const std::function<bool(std::string_view)>& on_body,
                                       const CancellationToken& cancel) {
-    const auto deadline = std::chrono::steady_clock::now() + request.total_timeout;
+    if (auto st = validate_request_headers(request.headers); !st.ok()) {
+        return st;
+    }
+    if ((request.first_progress_timeout.count() > 0 || request.progress_stall_timeout.count() > 0) &&
+        !request.progress_counter) {
+        return Status(ErrorCode::invalid_argument, "progress timeouts need progress_counter");
+    }
+    // "Unlimited" is a distant finite deadline so the deadline arithmetic in
+    // the socket and TLS helpers can never overflow.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          (request.unlimited_total ? std::chrono::milliseconds(std::chrono::hours(24 * 365))
+                                                   : request.total_timeout);
     auto connected = connect_to(request.host, request.port, request.connect_timeout, cancel);
     if (!connected.ok()) {
         return connected.status();
@@ -440,6 +497,9 @@ Result<HttpResponseInfo> http_request(const HttpRequest& request, const std::fun
         head += "Content-Type: " + request.content_type + "\r\n";
         head += "Content-Length: " + std::to_string(request.body.size()) + "\r\n";
     }
+    for (const auto& header : request.headers) {
+        head += header.first + ": " + header.second + "\r\n";
+    }
     head += "\r\n";
     if (auto st = send_bytes(head); !st.ok()) {
         return st;
@@ -459,6 +519,60 @@ Result<HttpResponseInfo> http_request(const HttpRequest& request, const std::fun
     std::uint64_t body_received = 0;
     ChunkedDecoder decoder;
     char buf[16384];
+
+    // Per-read deadline: the earliest of the total cap, the idle bound (after
+    // the head), the first-progress bound and the progress-stall bound.
+    enum class Bound { total, idle, first_progress, stall };
+    const auto sent_at = std::chrono::steady_clock::now();
+    auto last_activity = sent_at;
+    auto last_progress_at = sent_at;
+    std::uint64_t progress_seen = 0;
+    const auto read_deadline = [&](Bound& which) {
+        auto d = deadline;
+        which = Bound::total;
+        const auto consider = [&](std::chrono::steady_clock::time_point candidate, Bound kind) {
+            if (candidate < d) {
+                d = candidate;
+                which = kind;
+            }
+        };
+        if (headers_done && request.idle_timeout.count() > 0) {
+            consider(last_activity + request.idle_timeout, Bound::idle);
+        }
+        if (request.first_progress_timeout.count() > 0 && progress_seen == 0) {
+            consider(sent_at + request.first_progress_timeout, Bound::first_progress);
+        }
+        if (request.progress_stall_timeout.count() > 0) {
+            consider(last_progress_at + request.progress_stall_timeout, Bound::stall);
+        }
+        return d;
+    };
+    const auto timeout_status = [&](Bound which, Status original) {
+        switch (which) {
+        case Bound::idle:
+            return Status(ErrorCode::protocol_error,
+                          "idle timeout: no bytes received for " + std::to_string(request.idle_timeout.count()) + " ms");
+        case Bound::first_progress:
+            return Status(ErrorCode::protocol_error, "first-content timeout: no content within " +
+                                                  std::to_string(request.first_progress_timeout.count()) + " ms");
+        case Bound::stall:
+            return Status(ErrorCode::protocol_error, "stall timeout: no content progress for " +
+                                                  std::to_string(request.progress_stall_timeout.count()) + " ms");
+        case Bound::total:
+            break;
+        }
+        return original;
+    };
+    const auto note_progress = [&] {
+        if (!request.progress_counter) {
+            return;
+        }
+        const auto value = request.progress_counter();
+        if (value != progress_seen) {
+            progress_seen = value;
+            last_progress_at = std::chrono::steady_clock::now();
+        }
+    };
 
     auto deliver = [&](std::string_view data) -> Status {
         if (data.empty()) {
@@ -486,20 +600,45 @@ Result<HttpResponseInfo> http_request(const HttpRequest& request, const std::fun
         if (headers_done && ((chunked && decoder.done()) || (has_length && body_received >= content_length))) {
             return info;
         }
+        Bound bound = Bound::total;
+        const auto read_by = read_deadline(bound);
+        const bool stall_warns = bound == Bound::stall && static_cast<bool>(request.on_progress_stall);
+        if (stall_warns && std::chrono::steady_clock::now() >= read_by) {
+            // Warn-only stall policy: report, re-arm, keep reading.
+            const auto now = std::chrono::steady_clock::now();
+            request.on_progress_stall(std::chrono::duration_cast<std::chrono::milliseconds>(now - last_progress_at));
+            last_progress_at = now;
+            continue;
+        }
 #if defined(SONDER_HAS_TLS)
         if (tls) {
-            auto got = tls->read_some(buf, sizeof(buf), deadline, cancel);
+            auto got = tls->read_some(buf, sizeof(buf), read_by, cancel);
             if (!got.ok()) {
+                if (got.status().code() == ErrorCode::timeout) {
+                    if (stall_warns) {
+                        continue;
+                    }
+                    return timeout_status(bound, got.status());
+                }
                 return got.status();
             }
             n = static_cast<long long>(got.value());
         } else
 #endif
         {
-            if (auto st = wait_socket(sock.get(), false, deadline, cancel); !st.ok()) {
+            if (auto st = wait_socket(sock.get(), false, read_by, cancel); !st.ok()) {
+                if (st.code() == ErrorCode::timeout) {
+                    if (stall_warns) {
+                        continue;
+                    }
+                    return timeout_status(bound, st);
+                }
                 return st;
             }
             n = static_cast<long long>(::recv(sock.get(), buf, static_cast<int>(sizeof(buf)), 0));
+        }
+        if (n > 0) {
+            last_activity = std::chrono::steady_clock::now();
         }
         if (n < 0) {
             if (would_block(last_socket_error())) {
@@ -567,11 +706,13 @@ Result<HttpResponseInfo> http_request(const HttpRequest& request, const std::fun
             if (auto st = deliver(rest); !st.ok()) {
                 return st;
             }
+            note_progress();
             continue;
         }
         if (auto st = deliver(data); !st.ok()) {
             return st;
         }
+        note_progress();
     }
 }
 

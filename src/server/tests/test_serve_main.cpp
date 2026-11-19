@@ -139,6 +139,90 @@ TEST_CASE("llamaserver config: rejects malformed warmup settings") {
     }
 }
 
+TEST_CASE("llamaserver config: slow-upstream attach fields are loaded") {
+    const auto config = temp_path("slow-upstream.json");
+    std::ofstream(config) << R"({
+      "mode": "attach", "base_url": "http://127.0.0.1:8080", "native_completion": false,
+      "api_key_env": "COLI_API_KEY", "keepalive_gap_ms": 10000, "idle_timeout_ms": 45000,
+      "first_content_timeout_ms": 600000, "unlimited_request_timeout": true, "upstream_grammar": false,
+      "stall_guard": {"generic_progress": true, "stall_seconds": 900, "policy": "cancel"}
+    })";
+    sonder::inference::BackendSetup setup;
+    const auto st = sonder::inference::load_llamaserver_config(config.string(), setup);
+    std::error_code ec;
+    fs::remove(config, ec);
+    REQUIRE_MESSAGE(st.ok(), st.message());
+    CHECK(setup.llamaserver_api_key_env == "COLI_API_KEY");
+    CHECK(setup.llamaserver_keepalive_gap_ms == 10000);
+    CHECK(setup.llamaserver_idle_timeout_ms == 45000);
+    CHECK(setup.llamaserver_first_content_timeout_ms == 600000);
+    CHECK(setup.llamaserver_unlimited_request_timeout);
+    CHECK_FALSE(setup.llamaserver_upstream_grammar);
+    CHECK(setup.llamaserver_stall_generic_progress);
+    CHECK(setup.llamaserver_stall_seconds == 900);
+    CHECK(setup.llamaserver_stall_policy == "cancel");
+    // Defaults stay off for configs that do not mention the new keys.
+    sonder::inference::BackendSetup defaults;
+    CHECK(defaults.llamaserver_idle_timeout_ms == 0);
+    CHECK(defaults.llamaserver_first_content_timeout_ms == 0);
+    CHECK_FALSE(defaults.llamaserver_unlimited_request_timeout);
+    CHECK_FALSE(defaults.llamaserver_stall_generic_progress);
+    CHECK(defaults.llamaserver_api_key_env.empty());
+}
+
+TEST_CASE("llamaserver config: rejects malformed slow-upstream fields") {
+    const std::vector<std::string> documents = {
+        R"({"api_key_env": 5})", R"({"idle_timeout_ms": 86400001})", R"({"idle_timeout_ms": "x"})",
+        R"({"first_content_timeout_ms": -1})", R"({"first_content_timeout_ms": 86400001})",
+        R"({"keepalive_gap_ms": 0})", R"({"keepalive_gap_ms": 3600001})",
+        R"({"unlimited_request_timeout": 1})", R"({"upstream_grammar": "no"})",
+        R"({"stall_guard": {"generic_progress": "yes"}})", R"({"stall_guard": {"policy": "kill"}})"};
+    for (std::size_t i = 0; i < documents.size(); ++i) {
+        const auto config = temp_path("bad-slow-" + std::to_string(i) + ".json");
+        std::ofstream(config) << documents[i];
+        sonder::inference::BackendSetup setup;
+        INFO(documents[i]);
+        CHECK_FALSE(sonder::inference::load_llamaserver_config(config.string(), setup).ok());
+        std::error_code ec;
+        fs::remove(config, ec);
+    }
+    // Positive control: a valid document loads, so the rejections above are not
+    // caused by something unrelated in the harness.
+    const auto config = temp_path("good-slow.json");
+    std::ofstream(config) << R"({"idle_timeout_ms": 45000})";
+    sonder::inference::BackendSetup setup;
+    const auto st = sonder::inference::load_llamaserver_config(config.string(), setup);
+    std::error_code ec;
+    fs::remove(config, ec);
+    CHECK_MESSAGE(st.ok(), st.message());
+}
+
+TEST_CASE("llamaserver config: idle and first-content timeouts accept 0 and up to 24 h") {
+    const auto load = [](const std::string& document, sonder::inference::BackendSetup& setup) {
+        const auto config = temp_path("slow-range.json");
+        std::ofstream(config) << document;
+        const auto st = sonder::inference::load_llamaserver_config(config.string(), setup);
+        std::error_code ec;
+        fs::remove(config, ec);
+        return st;
+    };
+    {
+        sonder::inference::BackendSetup setup;
+        setup.llamaserver_idle_timeout_ms = 7;
+        setup.llamaserver_first_content_timeout_ms = 7;
+        const auto st = load(R"({"idle_timeout_ms": 0, "first_content_timeout_ms": 0})", setup);
+        REQUIRE_MESSAGE(st.ok(), st.message());
+        CHECK(setup.llamaserver_idle_timeout_ms == 0);
+        CHECK(setup.llamaserver_first_content_timeout_ms == 0);
+    }
+    for (const std::uint64_t value : {std::uint64_t{7200000}, std::uint64_t{86400000}}) {
+        sonder::inference::BackendSetup setup;
+        const auto st = load("{\"first_content_timeout_ms\": " + std::to_string(value) + "}", setup);
+        REQUIRE_MESSAGE(st.ok(), st.message());
+        CHECK(setup.llamaserver_first_content_timeout_ms == value);
+    }
+}
+
 TEST_CASE("llamaserver config: unknown-key errors bound the echoed key") {
     const std::string longkey(990, 'k');
     const std::vector<std::pair<std::string, std::string>> documents = {
