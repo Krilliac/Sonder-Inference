@@ -18,6 +18,7 @@ The HTTP server started by `sonder-infer serve` has its own reference:
 | `serve` | Local HTTP API (OpenAI-compatible subset) and live telemetry; see [SERVER.md](SERVER.md). |
 | `bench` | Run the benchmark harness over a corpus and write JSON results (plus markdown with `--markdown`). |
 | `tune` | Calibrate a llama-server spawn profile within a time budget; see [calibration](integration/tune.md). |
+| `weights` | Weight-content digest manifests: `weights manifest DIR -o FILE`, `weights verify DIR MANIFEST`; see [weight manifests](integration/weight-manifest.md). Exit status 0 ok, 1 I/O, 2 mismatch, 3 missing/extra, 4 usage. |
 | `models` | List the models a backend can serve. |
 | `backends` | Probe the backends compiled into this build. |
 | `devices` | List host devices (CPU and memory inventory). |
