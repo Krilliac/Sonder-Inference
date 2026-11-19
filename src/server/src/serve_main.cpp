@@ -407,8 +407,12 @@ std::uint64_t file_bytes(const std::string& path) {
 
 std::string mib_text(std::uint64_t bytes) { return std::to_string((bytes + (1u << 20) - 1) >> 20); }
 
+}  // namespace
+
 // Builds the `sonder.profiles` catalog, binds the active profile into `o`, and
 // runs the VRAM fit check for it. On refusal, `refusal` holds the message.
+// For an active llamaserver profile it also feeds the host-RAM estimate into
+// o.backend.llamaserver_host_memory, whether or not the profile offloads.
 json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const LaunchProfile& active,
                             ServerOptions& o, std::optional<std::uint64_t> budget_flag, bool allow_overcommit,
                             std::vector<std::string>& notes, std::string& refusal) {
@@ -445,20 +449,29 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const La
         std::string estimate_error;         // for the operator's log and refusal (includes the path)
         std::string public_estimate_error;  // for /v1/models (path redacted)
         std::optional<std::uint64_t> budget;
-        if (offloads(p)) {
-            budget = budget_for(p);
+        // The active llamaserver profile needs the estimate even with no GPU
+        // offload: its host-RAM footprint is the largest then.
+        const bool wants_host_estimate = is_active && p.backend == kLaunchProfileBackendLlamaServer;
+        if (offloads(p) || wants_host_estimate) {
+            if (offloads(p)) budget = budget_for(p);
             auto info = read_gguf_model_info(p.model);  // header only
             if (info.ok()) {
-                estimate = estimate_vram(info.value(), p,
-                                         VramEstimateInputs{file_bytes(p.mmproj),
-                                                            p.speculative ? file_bytes(p.speculative->draft_model) : 0,
-                                                            swa_full});
+                VramEstimateInputs in{};
+                in.mmproj_bytes = file_bytes(p.mmproj);
+                in.draft_model_bytes = p.speculative ? file_bytes(p.speculative->draft_model) : 0;
+                in.inherited_swa_full = swa_full;
+                if (budget) {
+                    in.fit_vram_budget_bytes =
+                        *budget > (std::numeric_limits<std::uint64_t>::max() >> 20) ? std::numeric_limits<std::uint64_t>::max()
+                                                                                    : *budget << 20;
+                }
+                estimate = estimate_vram(info.value(), p, in);
             } else {
                 estimate_error = info.status().message();
                 public_estimate_error = redact_model_path(info.status(), p.model);
             }
         }
-        json::Object meta = launch_profile_metadata(p, estimate, budget);
+        json::Object meta = launch_profile_metadata(p, offloads(p) ? estimate : std::nullopt, budget);
         if (!public_estimate_error.empty()) meta.set("estimate_error", public_estimate_error);
         meta.set("served", is_active);
         catalog.emplace_back(meta);
@@ -470,8 +483,32 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const La
         binding.sampling_defaults = p.sampling;
         binding.metadata = std::move(meta);
         o.profile_bindings.push_back(std::move(binding));
+        if (p.backend == kLaunchProfileBackendLlamaServer && estimate) {
+            // Feeds the supervisor's pre-spawn host RAM check and floor guard
+            // (BackendSetup::llamaserver_host_memory; reserve, override and
+            // floor come from the llamaserver config's "host_memory").
+            o.backend.llamaserver_host_memory.estimated_resident_bytes = estimate->host_resident_bytes;
+            o.backend.llamaserver_host_memory.estimated_private_bytes = estimate->host_private_bytes;
+            o.backend.llamaserver_host_memory.estimate_lower_bound = estimate->host_estimate_lower_bound;
+        }
+        if (p.backend == kLaunchProfileBackendLlamaServer) {
+            // The child inherits the environment (only AIP_* is removed), so
+            // llama-server reads these; the estimates do not model them.
+            for (const char* name : {"LLAMA_ARG_FIT", "LLAMA_ARG_N_GPU_LAYERS", "LLAMA_ARG_REPACK", "LLAMA_ARG_N_CPU_MOE",
+                                     "LLAMA_ARG_CPU_MOE", "LLAMA_ARG_N_CPU_FFN", "LLAMA_ARG_OVERRIDE_TENSOR",
+                                     "LLAMA_ARG_LOAD_MODE"}) {
+                const char* value = std::getenv(name);
+                if (value != nullptr && *value != '\0') {
+                    notes.push_back("launch profile '" + p.name + "': inherited " + name +
+                                    " is not modelled; the VRAM and host RAM estimates may be wrong");
+                }
+            }
+        }
         if (!offloads(p)) {
             notes.push_back("launch profile '" + p.name + "': no GPU offload; VRAM fit check skipped");
+            if (wants_host_estimate && !estimate) {
+                notes.push_back("launch profile '" + p.name + "': host RAM estimate unavailable (" + estimate_error + ")");
+            }
             continue;
         }
         // With --fit on (llama-server's default) and no fixed layer count,
@@ -484,7 +521,8 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const La
                           "); fix the model path or pass --allow-overcommit";
                 return catalog;
             }
-            notes.push_back("launch profile '" + p.name + "': VRAM estimate unavailable (" + estimate_error + ")");
+            notes.push_back("launch profile '" + p.name + "': VRAM estimate unavailable (" + estimate_error +
+                            "); the host RAM pre-spawn check is skipped");
             continue;
         }
         const VramEstimate& e = *estimate;
@@ -530,8 +568,6 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const La
     }
     return catalog;
 }
-
-}  // namespace
 
 void request_shutdown() noexcept { g_shutdown.store(1); }
 

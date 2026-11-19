@@ -14,6 +14,7 @@
 #include "gpu_memory.hpp"
 #include "child_metrics.hpp"
 #include "gpu_residency.hpp"
+#include "host_memory.hpp"
 #include "log_diagnostics.hpp"
 #include "process.hpp"
 #include "sonder/inference/backend_runtime.hpp"
@@ -38,6 +39,12 @@ struct SupervisorOptions {
     // Runtime diagnostics (docs/integration/vram-spill.md). They run on the
     // monitor thread only, never on the request path.
     SpillGuardOptions spill_guard;
+    // Host RAM admission before each spawn and a floor guard on available
+    // physical memory while the child runs (host_memory.hpp). Defaults are
+    // inert: no estimate means no pre-spawn check, floor.enabled is false.
+    // The floor guard samples on the monitor thread only and never blocks
+    // decode; restart_smaller_ctx reuses spill_guard's context step/min_ctx.
+    HostMemoryOptions host_memory;
     // Null uses make_gpu_counter_source() (PDH on Windows, unsupported elsewhere).
     std::shared_ptr<GpuCounterSource> gpu_counters;
     // Child log to scan for performance warnings. When set and `arguments`
@@ -139,6 +146,15 @@ class Supervisor {
     void fail(Status status);
     enum class ResidencyAction { none, restart, refuse };
     ResidencyAction residency_action();
+    // Pre-spawn check; monitor thread. Records override/unknown warnings.
+    Status admit_host_memory();
+    // Floor guard step; monitor thread. True when the child must be stopped
+    // and relaunched now (arguments_ already hold the smaller context).
+    bool host_memory_tick();
+    [[nodiscard]] std::chrono::steady_clock::time_point host_now() const;
+    [[nodiscard]] HostMemory host_memory_now() const;
+    void set_host_warning(BackendWarning warning);       // replaces one with the same code
+    void clear_host_warning(const std::string &code);
     void record_residency();  // mutex_ held
     void append_residency_warnings(BackendRuntimeStatus &status) const;  // mutex_ held
     Status missing_offload_failure() const;  // mutex_ held
@@ -157,6 +173,8 @@ class Supervisor {
     // caller unwinds cannot leave a dangling lease owner.
     std::shared_ptr<std::atomic<std::size_t>> active_requests_ = std::make_shared<std::atomic<std::size_t>>(0);
     bool maintenance_pending_ = false;
+    // A residency restart owns maintenance_pending_: the host floor guard must not clear it. Guarded by mutex_.
+    bool residency_maintenance_ = false;
 
     // Diagnostics. Guarded by mutex_ unless noted.
     std::vector<std::string> arguments_;  // current launch argv
@@ -169,6 +187,10 @@ class Supervisor {
     std::unique_ptr<LogTail> log_tail_;             // monitor thread only
     LogDiagnostics log_diagnostics_;                // monitor thread only
     GpuResidencyGuard residency_;  // guarded by mutex_, fed only after readiness
+    HostMemoryFloorGuard host_floor_;       // monitor thread only
+    bool host_admission_closed_ = false;    // guarded by mutex_; mirrors host_floor_.admitting()
+    bool host_restart_maintenance_ = false; // guarded by mutex_; host_memory_tick closed admission for a restart
+    std::vector<BackendWarning> host_warnings_;  // guarded by mutex_
     bool reported_missing_ = false;
     bool reported_eviction_ = false;
     std::size_t eviction_restarts_ = 0;  // lifetime budget; never reset per child

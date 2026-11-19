@@ -4,6 +4,7 @@ sonder_module_sources(
     child_metrics.cpp
     gpu_memory.cpp
     gpu_residency.cpp
+    host_memory.cpp
     llamaserver_backend.cpp
     llamaserver_protocol.cpp
     log_diagnostics.cpp
@@ -12,6 +13,7 @@ sonder_module_sources(
     prefix_warmup.cpp
     slot_affinity.cpp
     supervisor.cpp
+    supervisor_host_memory.cpp
     supervisor_residency.cpp
     timings.cpp
     tune.cpp

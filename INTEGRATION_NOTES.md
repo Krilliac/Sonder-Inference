@@ -385,6 +385,78 @@ stamp remains that base, with TLS and llama.cpp disabled. This later notes
 append does not restamp those executions as a published revision build.
 Hosted checks and merging still require the exact final public revision.
 
+# Host-memory admission for very large MoE models (branch `claude/si-mem-admission`)
+
+Not built or run when written (the build step is separate). Files:
+`include/sonder/inference/device.hpp`, `src/devices/device.cpp`,
+`src/server/src/vram_estimate.cpp` and `src/server/include/sonder/inference/launch_profile.hpp`
+(the estimator and its structs live in the server module, not under
+`src/backends/llamaserver/`), `src/backends/llamaserver/{host_memory,supervisor_host_memory}.*`,
+`supervisor.{hpp,cpp}`, `supervisor_residency.cpp`, and their tests
+(`tests/test_device_memory.cpp`, `src/server/tests/test_moe_placement.cpp`,
+`src/backends/llamaserver/tests/test_host_memory.cpp`).
+
+Left for the integrator (outside the scoped files):
+
+- Wired (review fix 6): the llamaserver JSON config has `host_memory`
+  (`reserve_mib` default 2048, `override_refusal`, and `floor` with `enabled`,
+  `policy` warn|stop_admission|restart_smaller_ctx, `floor_mib`, `resume_mib`,
+  `consecutive_samples`, `sample_interval_ms`, `restart_cooldown_ms`,
+  `max_restarts`) -> `BackendSetup::llamaserver_host_memory` ->
+  `LlamaServerBackendOptions::host_memory` (new public struct
+  `LlamaServerHostMemoryOptions`) -> `SupervisorOptions::host_memory`. `serve`
+  fills the two estimate fields from the active llamaserver profile's
+  `VramEstimate::host_resident_bytes` / `host_private_bytes` whenever its GGUF
+  header reads, including a CPU-only profile (`n_gpu_layers` 0; no VRAM fit
+  check then, and its catalog metadata carries no estimate). An unreadable
+  header gives no pre-spawn check and a log note. No CLI flag was added.
+  `profile_catalog` is declared in `server.hpp` so tests can drive this wiring.
+- A pre-spawn refusal is terminal on every iteration, including a crash
+  restart after the OOM killer took the child at a low-memory moment; the
+  supervisor then stays failed.
+- mmap/mlock: only `-lm/--load-mode {auto,none,mmap,mlock,mmap+mlock,dio}`
+  (llama.cpp b11195 arg.cpp) is modelled; `LLAMA_ARG_LOAD_MODE` and the other
+  `LLAMA_ARG_*` placement env forms the child inherits (`LLAMA_ARG_FIT`,
+  `LLAMA_ARG_N_GPU_LAYERS`, `LLAMA_ARG_REPACK`, `LLAMA_ARG_N_CPU_MOE`,
+  `LLAMA_ARG_CPU_MOE`, `LLAMA_ARG_N_CPU_FFN`, `LLAMA_ARG_OVERRIDE_TENSOR`) are
+  noted at startup ("inherited ... is not modelled"), not modelled.
+- Host-placed tensors of type Q4_0, Q8_0, Q4_K or IQ4_NL are counted as private
+  memory at 100% (llama.cpp b11195 repacks CPU weights, including MUL_MAT_ID
+  experts, into a private repack buffer) unless `-nr`/`--no-repack` is in
+  `extra_args`; `LLAMA_ARG_REPACK` (env form) is noted, not read; `--repack` re-enables it. `VramEstimate::host_repacked_bytes`
+  reports it. Whether a given CPU actually repacks a given type is UNVERIFIED
+  (check a `--cpu-moe` run for CPU_REPACK buffer lines); the estimate assumes it does.
+- `--fit` path: with a llamaserver profile that leaves `n_gpu_layers` unset,
+  `fit` on (the default) and no tensor override (`-ot`, `--cpu-moe`,
+  `--n-cpu-moe N>0`, `--n-cpu-ffn N>0` make upstream fit abort; `--n-cpu-moe 0`
+  does not), llama-server sizes the offload itself. The host estimate then also
+  counts what does not fit the VRAM budget (detected VRAM minus 1.5 GiB, or
+  `vram_budget_mib`) plus llama-server's 1 GiB fit margin, experts first
+  (`VramEstimate::host_fit_applies`, `host_fit_overflow_bytes`). The budget is
+  not free VRAM: if other processes hold VRAM, more overflows than estimated.
+  `--fit-target` is not parsed. With no budget known the estimate is a lower
+  bound (`host_estimate_lower_bound`) and the supervisor raises the
+  `host_memory_estimate_lower_bound` warning; set `vram_budget_mib` or
+  `n_gpu_layers`. VRAM-side numbers are unchanged. A llama-server build with no
+  GPU device puts everything on the host, which the estimator cannot see.
+- Remaining mmapped experts (types with no repack path) are counted resident at the declared active/total ratio (one
+  token's working set); steady decode touches more, so the pre-spawn estimate
+  is optimistic for those models. Set `VramEstimateInputs::expert_resident_fraction`
+  or a larger `reserve_mib` to cover it.
+- Linux: `memory.current` includes page cache charged to the cgroup, so inside
+  a tight container serving an mmapped GGUF the headroom can read near zero
+  while the memory is reclaimable (the floor guard may trip early). The
+  namespace-root cgroup (`0::/`) is now read.
+- Unverified: whether b11195 `-ot` accepts `CUDA_Host`/`*_Host` buffer-type
+  names (arg.cpp lists only `ggml_backend_dev_buffer_type` names).
+- `HostMemory` is not yet in the runtime JSON or health output; the guard
+  surfaces through `runtime_status().warnings` (`host_memory_low`,
+  `host_memory_unknown`, `host_memory_admission_override`) only.
+- Linux/macOS: available commit is reported unknown; macOS available physical
+  memory is unknown. cgroup v1 limits are not read (v2 only).
+- `--no-kv-offload` is not modelled in the host/VRAM split.
+- Build/test evidence: the earlier C1041 (PDB contention on sonder_inference.pdb) failures were environmental. The lane has since been built with msvc-debug via build.ps1 and the llamaserver tests run (see the PR for the ctest results); the full suite was not run locally.
+
 ## `claude/si-weight-manifest` (module `src/artifacts`)
 
 Weight-content digest manifests (ROADMAP "associate inspected content with loaded

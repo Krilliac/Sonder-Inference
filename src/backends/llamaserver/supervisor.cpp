@@ -97,6 +97,7 @@ Supervisor::Supervisor(SupervisorOptions options, std::unique_ptr<ProcessLaunche
                  expects_gpu_offload(options_.arguments, options_.spill_guard.residency.expect_gpu)),
       child_metrics_(metrics_options(options_), options_.metrics_poll, options_.metrics_clock) {
     arguments_ = options_.arguments;
+    host_floor_ = HostMemoryFloorGuard(options_.host_memory.floor);
     auto log_path = find_log_file(arguments_);
     if (!log_path && !options_.log_file.empty()) {
         arguments_.push_back("--log-file");
@@ -151,6 +152,8 @@ Result<std::uint16_t> Supervisor::start(const CancellationToken &cancel) {
                            options_.stall_guard.stall_seconds > std::chrono::hours(24) ||
                            (options_.stall_guard.policy != "warn" && options_.stall_guard.policy != "restart")))
             valid = Status(ErrorCode::invalid_argument, "llamaserver: invalid stall_guard options");
+        if (valid.ok())
+            valid = validate_host_memory_options(options_.host_memory);
         if (valid.ok() && options_.log_file.find('\0') != std::string::npos)
             valid = Status(ErrorCode::invalid_argument, "llamaserver: log file path contains NUL");
         if (valid.ok() && options_.spill_guard.enabled && options_.spill_guard.policy == SpillPolicy::auto_fit &&
@@ -266,9 +269,19 @@ void Supervisor::monitor() {
             monitor_attached();
             return;
         }
+        bool host_relaunch = false;
         while (!shutdown_.cancelled()) {
             bool stalled_restart = false;
             Status result;
+            // Refuse before spawning anything when the host cannot hold the
+            // model: a terminal failure, never retried by the crash budget.
+            // A relaunch the floor guard itself asked for (smaller context) is
+            // not re-judged against the unchanged whole-model estimate.
+            if (const Status admitted = std::exchange(host_relaunch, false) ? Status::success() : admit_host_memory();
+                !admitted.ok()) {
+                fail(admitted);
+                return;
+            }
             auto selected = ephemeral_port();
             if (!selected.ok()) {
                 result = selected.status();
@@ -329,6 +342,7 @@ void Supervisor::monitor() {
                             }
                             state_ = State::ready;
                             maintenance_pending_ = false;
+                            residency_maintenance_ = false;
                             if (gpu_.residency && gpu_.residency->action == "restarting")
                                 gpu_.residency->action = "restarted";
                             failure_ = Status::success();
@@ -339,6 +353,7 @@ void Supervisor::monitor() {
                         auto next_sample = Clock::now() + options_.spill_guard.sample_interval;
                         auto next_metrics = metrics_now();
                         auto maintenance = ResidencyAction::none;
+                        bool host_restart = false;
                         while (!shutdown_.cancelled() && child->running()) {
                             pause(options_.health_poll_interval);
                             if (Clock::now() >= next_sample && !shutdown_.cancelled() && child->running()) {
@@ -361,6 +376,22 @@ void Supervisor::monitor() {
                                 if (maintenance != ResidencyAction::none)
                                     break;
                             }
+                            // Host RAM floor guard: one cheap OS read per
+                            // sample_interval on this thread, never on the
+                            // request path.
+                            if (!shutdown_.cancelled() && child->running() && host_memory_tick()) {
+                                host_restart = true;
+                                break;
+                            }
+                        }
+                        if (host_restart) {
+                            if (options_.warmup)
+                                options_.warmup->stop();
+                            child->stop(options_.shutdown_timeout);
+                            // arguments_ already carry the smaller context; the
+                            // next iteration relaunches without a new admission check.
+                            host_relaunch = true;
+                            continue;
                         }
                         if (maintenance != ResidencyAction::none) {
                             if (options_.warmup)
@@ -442,6 +473,7 @@ std::vector<std::string> Supervisor::launch_arguments() const {
 }
 
 void Supervisor::begin_child() {
+    host_floor_.reset(host_now());
     // A new child truncates (or appends to) its log; parse it from the start.
     log_diagnostics_.reset();
     diagnostics_warning_sent_ = false;
@@ -452,6 +484,10 @@ void Supervisor::begin_child() {
     reported_missing_ = false;
     reported_eviction_ = false;
     maintenance_pending_ = false;
+    residency_maintenance_ = false;
+    host_admission_closed_ = false;
+    host_restart_maintenance_ = false;
+    std::erase_if(host_warnings_, [](const BackendWarning &warning) { return warning.code == "host_memory_low"; });
     log_warnings_.clear();
     child_warnings_.clear();
     child_status_.reset();
@@ -584,6 +620,7 @@ BackendRuntimeStatus Supervisor::runtime_status() const {
     status.warnings = config_warnings_;
     status.warnings.insert(status.warnings.end(), log_warnings_.begin(), log_warnings_.end());
     status.warnings.insert(status.warnings.end(), child_warnings_.begin(), child_warnings_.end());
+    status.warnings.insert(status.warnings.end(), host_warnings_.begin(), host_warnings_.end());
     append_residency_warnings(status);
     if (gpu_.status == "ok" && gpu_.spilled) {
         std::vector<std::pair<std::string, std::string>> details{

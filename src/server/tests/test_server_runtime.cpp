@@ -373,3 +373,91 @@ TEST_CASE("runtime: llamaserver config accepts spill_guard, log_file and kv_pair
     CHECK(runtime->context.configured_ctx == 8192u);
 #endif
 }
+
+TEST_CASE("runtime: llamaserver host_memory config is parsed strictly and reaches the supervisor") {
+    const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto path = std::filesystem::temp_directory_path() /
+                      ("sonder-llamaserver-hostmem-test-" + std::to_string(unique) + ".json");
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    } cleanup{path};
+    const auto write = [&](const std::string& body) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << body;
+    };
+    write(R"({"mode":"spawn","executable":"llama-server"})");
+    si::BackendSetup defaults;
+    REQUIRE(si::load_llamaserver_config(path.string(), defaults).ok());
+    CHECK(defaults.llamaserver_host_memory.reserve_mib == 2048);
+    CHECK_FALSE(defaults.llamaserver_host_memory.override_refusal);
+    CHECK_FALSE(defaults.llamaserver_host_memory.floor_enabled);
+
+    write(R"({"mode":"spawn","executable":"llama-server","host_memory":{"reserve_mib":4096,"override_refusal":true,)"
+          R"("floor":{"enabled":true,"policy":"restart_smaller_ctx","floor_mib":8192,"resume_mib":12288,)"
+          R"("consecutive_samples":3,"sample_interval_ms":2000,"restart_cooldown_ms":30000,"max_restarts":2}}})");
+    si::BackendSetup setup;
+    auto status = si::load_llamaserver_config(path.string(), setup);
+    REQUIRE_MESSAGE(status.ok(), status.to_string());
+    const auto& h = setup.llamaserver_host_memory;
+    CHECK(h.reserve_mib == 4096);
+    CHECK(h.override_refusal);
+    CHECK(h.floor_enabled);
+    CHECK(h.floor_policy == "restart_smaller_ctx");
+    CHECK(h.floor_mib == 8192);
+    CHECK(h.resume_mib == 12288);
+    CHECK(h.consecutive_samples == 3);
+    CHECK(h.sample_interval_ms == 2000);
+    CHECK(h.restart_cooldown_ms == 30000);
+    CHECK(h.max_restarts == 2);
+
+    for (const char* body : {R"({"host_memory":7})", R"({"host_memory":{"bogus":1}})",
+                             R"({"host_memory":{"reserve_mib":-1}})", R"({"host_memory":{"override_refusal":"yes"}})",
+                             R"({"host_memory":{"floor":{"enabled":true}}})",
+                             R"({"host_memory":{"floor":{"policy":"kill"}}})",
+                             R"({"host_memory":{"floor":{"floor_mib":10,"resume_mib":5}}})",
+                             R"({"host_memory":{"floor":{"consecutive_samples":0}}})",
+                             R"({"host_memory":{"floor":{"unknown":1}}})"}) {
+        write(body);
+        si::BackendSetup invalid;
+        CHECK_MESSAGE(!si::load_llamaserver_config(path.string(), invalid).ok(), body);
+    }
+
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+    // A configured profile reaches the supervisor: an estimate larger than any
+    // host's memory is refused before the (nonexistent) executable is spawned.
+    si::BackendSetup refused = setup;
+    refused.backend = "llamaserver";
+    refused.llamaserver_mode = "spawn";
+    refused.llamaserver_executable = "llama-server-that-does-not-exist";
+    refused.llamaserver_host_memory.override_refusal = false;
+    refused.llamaserver_host_memory.floor_enabled = false;
+    refused.llamaserver_host_memory.estimated_resident_bytes = 1ull << 60;
+    refused.llamaserver_host_memory.estimated_private_bytes = 1ull << 40;
+    auto made = si::make_backend(refused);
+    REQUIRE(made.ok());
+    const auto listed = made.value()->list_models();
+    REQUIRE_FALSE(listed.ok());
+    CHECK(listed.status().message().find("host memory admission refused") != std::string::npos);
+
+    // Without an estimate nothing is checked, so the failure is the missing executable instead.
+    si::BackendSetup none = refused;
+    none.llamaserver_host_memory.estimated_resident_bytes = 0;
+    none.llamaserver_host_memory.estimated_private_bytes = 0;
+    auto unchecked = si::make_backend(none);
+    REQUIRE(unchecked.ok());
+    const auto missing = unchecked.value()->list_models();
+    REQUIRE_FALSE(missing.ok());
+    CHECK(missing.status().message().find("host memory admission refused") == std::string::npos);
+
+    // An unknown policy cannot reach a running supervisor.
+    si::BackendSetup bad_policy = refused;
+    bad_policy.llamaserver_host_memory.floor_policy = "kill";
+    auto bad = si::make_backend(bad_policy);
+    REQUIRE(bad.ok());
+    CHECK(bad.value()->list_models().status().code() == si::ErrorCode::invalid_argument);
+#endif
+}

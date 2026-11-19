@@ -25,13 +25,25 @@ Supervisor::RequestLease &Supervisor::RequestLease::operator=(RequestLease &&oth
 }
 
 Result<Supervisor::RequestLease> Supervisor::acquire_request(const CancellationToken &cancel) {
+    const auto closed = [] {
+        return Status(ErrorCode::unavailable,
+                      "llamaserver: host memory is below the configured floor; not admitting new requests "
+                      "until it recovers");
+    };
     for (;;) {
+        {
+            std::lock_guard lock(mutex_);
+            if (host_admission_closed_)
+                return closed();
+        }
         auto ready = start(cancel);
         if (!ready.ok())
             return ready.status();
         std::lock_guard lock(mutex_);
         if (cancel.cancelled() || shutdown_.cancelled())
             return Status(ErrorCode::cancelled, "llamaserver: request cancelled");
+        if (host_admission_closed_)
+            return closed();
         // Atomic with maintenance admission closure. The caller uses this
         // lease's port, never a second start() that could wait behind itself.
         if (state_ == State::ready && !maintenance_pending_ && port_ == ready.value()) {
@@ -87,6 +99,7 @@ Supervisor::ResidencyAction Supervisor::residency_action() {
         return ResidencyAction::none;
     }
     maintenance_pending_ = true;
+    residency_maintenance_ = true;
     event.action = "waiting_for_idle";
     // Warm-up owns its own HTTP operations. Do not cancel one merely to
     // recover residency; it must finish before the child can be replaced.

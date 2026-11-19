@@ -125,6 +125,66 @@ Result<std::pair<std::string, std::string>> parse_tensor_override(std::string_vi
     return std::make_pair(std::string(spec.substr(0, eq)), std::string(spec.substr(eq + 1)));
 }
 
+namespace {
+
+Status parse_host_memory_config(const json::Value& value, BackendSetup::LlamaServerHostMemoryConfig& out) {
+    const auto bad = [](const std::string& key, const char* range) {
+        return Status(ErrorCode::invalid_argument, "llamaserver config: host_memory." + key + " must be " + range);
+    };
+    if (!value.is_object()) return Status(ErrorCode::invalid_argument, "llamaserver config: 'host_memory' must be an object");
+    static constexpr std::string_view keys[] = {"reserve_mib", "override_refusal", "floor"};
+    for (const auto& member : value.as_object()) {
+        if (std::find(std::begin(keys), std::end(keys), member.first) == std::end(keys))
+            return Status(ErrorCode::invalid_argument, "llamaserver config: unknown host_memory field '" +
+                                                           detail::bounded_for_message(member.first) + "'");
+    }
+    if (const auto* v = value.find("reserve_mib")) {
+        if (!v->is_integer() || v->as_int(-1) < 0 || v->as_uint() > 16777216) return bad("reserve_mib", "an integer in [0, 16777216]");
+        out.reserve_mib = v->as_uint();
+    }
+    if (const auto* v = value.find("override_refusal")) {
+        if (!v->is_bool()) return bad("override_refusal", "boolean");
+        out.override_refusal = v->as_bool();
+    }
+    const auto* floor = value.find("floor");
+    if (!floor) return {};
+    if (!floor->is_object()) return Status(ErrorCode::invalid_argument, "llamaserver config: 'host_memory.floor' must be an object");
+    static constexpr std::string_view floor_keys[] = {"enabled", "policy", "floor_mib", "resume_mib", "consecutive_samples",
+                                                      "sample_interval_ms", "restart_cooldown_ms", "max_restarts"};
+    for (const auto& member : floor->as_object()) {
+        if (std::find(std::begin(floor_keys), std::end(floor_keys), member.first) == std::end(floor_keys))
+            return Status(ErrorCode::invalid_argument, "llamaserver config: unknown host_memory.floor field '" +
+                                                           detail::bounded_for_message(member.first) + "'");
+    }
+    const auto uint_in = [&](const char* key, std::uint64_t lo, std::uint64_t hi, std::uint64_t& dest, const char* range) -> Status {
+        if (const auto* v = floor->find(key)) {
+            if (!v->is_integer() || v->as_int(-1) < 0 || v->as_uint() < lo || v->as_uint() > hi) return bad(std::string("floor.") + key, range);
+            dest = v->as_uint();
+        }
+        return {};
+    };
+    if (const auto* v = floor->find("enabled")) {
+        if (!v->is_bool()) return bad("floor.enabled", "boolean");
+        out.floor_enabled = v->as_bool();
+    }
+    if (const auto* v = floor->find("policy")) {
+        if (!v->is_string() || (v->as_string() != "warn" && v->as_string() != "stop_admission" && v->as_string() != "restart_smaller_ctx"))
+            return bad("floor.policy", "warn, stop_admission or restart_smaller_ctx");
+        out.floor_policy = v->as_string();
+    }
+    if (auto st = uint_in("floor_mib", 0, 16777216, out.floor_mib, "an integer in [0, 16777216]"); !st.ok()) return st;
+    if (auto st = uint_in("resume_mib", 0, 16777216, out.resume_mib, "an integer in [0, 16777216]"); !st.ok()) return st;
+    if (auto st = uint_in("consecutive_samples", 1, 100, out.consecutive_samples, "an integer in [1, 100]"); !st.ok()) return st;
+    if (auto st = uint_in("sample_interval_ms", 10, 3600000, out.sample_interval_ms, "an integer in [10, 3600000]"); !st.ok()) return st;
+    if (auto st = uint_in("restart_cooldown_ms", 0, 86400000, out.restart_cooldown_ms, "an integer in [0, 86400000]"); !st.ok()) return st;
+    if (auto st = uint_in("max_restarts", 0, 1000, out.max_restarts, "an integer in [0, 1000]"); !st.ok()) return st;
+    if (out.floor_enabled && out.floor_mib == 0) return bad("floor.floor_mib", "above 0 when the floor guard is enabled");
+    if (out.resume_mib != 0 && out.resume_mib < out.floor_mib) return bad("floor.resume_mib", "0 or at least floor_mib");
+    return {};
+}
+
+}  // namespace
+
 Status load_llamaserver_config(const std::string& path, BackendSetup& destination) {
     BackendSetup setup = destination;
     std::ifstream in(path, std::ios::binary);
@@ -144,8 +204,9 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
             "native_completion", "grammar", "connect_timeout_ms", "request_timeout_ms", "startup_timeout_ms",
             "poll_interval_ms", "shutdown_timeout_ms", "restart_backoff_ms", "max_restart_backoff_ms",
             "max_restarts", "tls", "spill_guard", "log_file", "kv_pairing_check", "context_length",
-            "slot_affinity", "env", "results", "warmup", "stall_guard", "api_key_env", "idle_timeout_ms",
-            "first_content_timeout_ms", "keepalive_gap_ms", "unlimited_request_timeout", "upstream_grammar"};
+            "slot_affinity", "env", "results", "warmup", "stall_guard", "host_memory",
+            "api_key_env", "idle_timeout_ms", "first_content_timeout_ms", "keepalive_gap_ms",
+            "unlimited_request_timeout", "upstream_grammar"};
         for (auto k : known) if (k == key) return false;
         return true;
     };
@@ -318,6 +379,9 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
             setup.llamaserver_stall_generic_progress = v->as_bool();
         }
     }
+    if (const auto* host = object.find("host_memory")) {
+        if (auto st = parse_host_memory_config(*host, setup.llamaserver_host_memory); !st.ok()) return st;
+    }
     if (const auto* warmup = object.find("warmup")) {
         if (auto st = detail::parse_warmup_config(*warmup, setup); !st.ok()) return st;
     }
@@ -417,6 +481,22 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
         lo.stall_guard.enabled = setup.llamaserver_stall_guard;
         lo.stall_guard.stall_seconds = std::chrono::seconds(setup.llamaserver_stall_seconds);
         lo.stall_guard.policy = setup.llamaserver_stall_policy;
+        {
+            const auto& h = setup.llamaserver_host_memory;
+            lo.host_memory.estimated_resident_bytes = h.estimated_resident_bytes;
+            lo.host_memory.estimated_private_bytes = h.estimated_private_bytes;
+            lo.host_memory.estimate_lower_bound = h.estimate_lower_bound;
+            lo.host_memory.reserve_bytes = h.reserve_mib * 1024ull * 1024ull;
+            lo.host_memory.override_refusal = h.override_refusal;
+            lo.host_memory.floor.enabled = h.floor_enabled;
+            lo.host_memory.floor.policy = h.floor_policy;
+            lo.host_memory.floor.floor_bytes = h.floor_mib * 1024ull * 1024ull;
+            lo.host_memory.floor.resume_bytes = h.resume_mib * 1024ull * 1024ull;
+            lo.host_memory.floor.consecutive_samples = static_cast<std::size_t>(h.consecutive_samples);
+            lo.host_memory.floor.sample_interval = std::chrono::milliseconds(h.sample_interval_ms);
+            lo.host_memory.floor.restart_cooldown = std::chrono::milliseconds(h.restart_cooldown_ms);
+            lo.host_memory.floor.max_restarts = static_cast<std::size_t>(h.max_restarts);
+        }
         lo.stall_guard.generic_progress = setup.llamaserver_stall_generic_progress;
         lo.api_key_env = setup.llamaserver_api_key_env;
         lo.idle_timeout = std::chrono::milliseconds(setup.llamaserver_idle_timeout_ms);

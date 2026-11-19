@@ -21,6 +21,7 @@ sonder_add_module_tests(core
     test_cli_spec.cpp
     test_cli_repl.cpp
     test_priority_runtime.cpp
+    test_device_memory.cpp
 )
 
 # Proves sonder_inference.h is valid C and the ABI is usable from C.

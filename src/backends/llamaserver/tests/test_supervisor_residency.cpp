@@ -1,4 +1,5 @@
 // GPU-free policy and concurrency regressions, using the existing fake launcher.
+#include "../host_memory.hpp"
 #include "../supervisor.hpp"
 #include "fake_process.hpp"
 
@@ -264,4 +265,55 @@ TEST_CASE("residency lease can safely unwind after supervisor shutdown and destr
     CHECK_FALSE(child_at(f.launches, 0)->alive);
     lease = {};  // ASan regression: no call through a freed Supervisor pointer
     CHECK(lease.port() == 0);
+}
+
+TEST_CASE("host floor recovery does not release a pending residency restart") {
+    Fixture f;
+    constexpr std::uint64_t kGiB = 1ull << 30;
+    std::atomic<std::uint64_t> available{64 * kGiB};
+    f.options.arguments = {"--model", "model.gguf", "--n-gpu-layers", "999", "--ctx-size", "65536"};
+    f.options.spill_guard.residency.on_eviction = LlamaServerEvictionPolicy::restart;
+    f.options.host_memory.provider = [&available] {
+        HostMemory m;
+        m.total_physical = MemoryReading::known(64 * kGiB);
+        m.available_physical = MemoryReading::known(available.load());
+        m.source = "fake";
+        return m;
+    };
+    auto &floor = f.options.host_memory.floor;
+    floor.enabled = true;
+    floor.policy = HostFloorPolicy::restart_smaller_ctx;
+    floor.floor_bytes = 8 * kGiB;
+    floor.resume_bytes = 12 * kGiB;
+    floor.consecutive_samples = 1;
+    floor.sample_interval = std::chrono::milliseconds(10);
+    floor.restart_cooldown = std::chrono::milliseconds(60000);
+    floor.max_restarts = 2;
+    auto s = f.supervisor();
+    auto acquired = s->acquire_request();
+    REQUIRE(acquired.ok());
+    Supervisor::RequestLease lease = std::move(acquired.value());
+    f.counters->dedicated = 2889 * kMiB;
+    REQUIRE(until([&] {
+        const auto r = s->runtime_status().gpu_memory.residency;
+        return r && r->action == "waiting_for_idle";
+    }));
+    // Host pressure comes and goes while the residency restart is waiting.
+    available = 2 * kGiB;
+    REQUIRE(until([&] { return warned(s->runtime_status(), "host_memory_low"); }));
+    available = 40 * kGiB;
+    REQUIRE(until([&] { return !warned(s->runtime_status(), "host_memory_low"); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(s->runtime_status().gpu_memory.residency->action == "waiting_for_idle");
+    CancellationSource cancel;
+    std::thread canceller([&cancel] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        cancel.cancel();
+    });
+    const auto second = s->acquire_request(cancel.token());
+    canceller.join();
+    CHECK_FALSE(second.ok());  // admission stays closed until the residency restart ran
+    CHECK(f.starts() == 1);
+    lease = {};
+    REQUIRE(wait_for_starts(f.launches, 2));
 }
