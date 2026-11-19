@@ -10,6 +10,8 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "sonder/inference/cancellation.hpp"
 #include "sonder/inference/error.hpp"
@@ -73,7 +75,45 @@ struct HttpRequest {
     TlsOptions tls;
     // Invoked once with the HTTP status code, before any body bytes.
     std::function<void(int)> on_status;
+
+    // Extra request headers, sent after the built-in ones. Names must be RFC
+    // 9110 tokens; values must not contain CR, LF, NUL or other control bytes
+    // (header injection). Host, Content-Length, Content-Type, Connection,
+    // Transfer-Encoding, Expect and Upgrade are owned by the client and are
+    // refused. A request with an invalid header fails with invalid_argument
+    // before any connection is made. Values can be credentials: the client
+    // never logs them and error messages name only the header, never its value.
+    std::vector<std::pair<std::string, std::string>> headers;
+
+    // False keeps the historical single wall-clock cap (total_timeout). True
+    // removes that outer cap; set idle/first-progress bounds when doing so.
+    bool unlimited_total = false;
+    // Maximum silence between received bytes once the response head has been
+    // read (any byte counts, including SSE keepalives). Zero disables it.
+    // Before the head arrives only total_timeout and first_progress_timeout
+    // apply, because a queueing upstream may send nothing at all until it
+    // accepts the request.
+    std::chrono::milliseconds idle_timeout{0};
+    // Progress is defined by the caller: progress_counter returns a value that
+    // only increases when content-bearing data arrived (polled on the calling
+    // thread after every read that delivered bytes). When first_progress_timeout
+    // is non-zero and the counter is still zero that long after the request was
+    // sent, the request fails with ErrorCode::protocol_error. Needs progress_counter.
+    std::chrono::milliseconds first_progress_timeout{0};
+    std::function<std::uint64_t()> progress_counter;
+    // When non-zero, the counter must change at least this often (measured
+    // from the last change, or from the request being sent). If on_progress_stall
+    // is set it is called (with the stalled duration) and the timer re-arms;
+    // otherwise the request fails with ErrorCode::protocol_error. Needs progress_counter.
+    std::chrono::milliseconds progress_stall_timeout{0};
+    std::function<void(std::chrono::milliseconds)> on_progress_stall;
 };
+
+// Checks HttpRequest::headers as described above. Never echoes a value.
+Status validate_request_headers(const std::vector<std::pair<std::string, std::string>>& headers);
+// "[redacted]" for credential-bearing headers (Authorization, Proxy-Authorization,
+// Cookie, X-Api-Key and similar), the value otherwise. For diagnostics only.
+std::string redacted_header_value(std::string_view name, std::string_view value);
 
 struct HttpResponseInfo {
     int status = 0;
