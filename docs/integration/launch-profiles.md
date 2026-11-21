@@ -12,9 +12,9 @@ The same profile works for both serving backends:
 
 - **`llamaserver`** (the [external llama-server backend](llama-server.md) in
   spawn mode). The fields become a llama-server argument vector. The flag
-  names were checked against the installed `llama-server --help` (Ollama's
-  bundled build, `version: 0.4.1-dev (commit 161755f29)`). The supervisor
-  still appends its own `--host 127.0.0.1 --port <free port>`.
+  names follow llama.cpp's `llama-server`; check them against
+  `llama-server --help` of the build you run, because flags change between
+  llama.cpp versions. The supervisor still appends its own `--host 127.0.0.1 --port <free port>`.
 - **`llamacpp`** (the direct, in-process [llama.cpp backend](llamacpp.md)).
   Fields map onto the backend's own options. A field the direct backend
   cannot honour is rejected with
@@ -25,7 +25,7 @@ Nothing changes for a `serve` without `--profile`.
 
 ## The measured 100k profile
 
-This profile is measured on the owner's RTX 5070 Ti 16 GB (Windows, 16,303
+This profile was measured on one test host with a 16 GB GPU (Windows, 16,303
 MiB usable). It runs Qwen3.8-27B UD-Q3_K_XL (12.24 GiB file):
 
 ```json
@@ -34,7 +34,7 @@ MiB usable). It runs Qwen3.8-27B UD-Q3_K_XL (12.24 GiB file):
     {
       "name": "qwen3.8-27b-q3-100k",
       "backend": "llamaserver",
-      "model": "D:/models/Qwen3.8-27B-UD-Q3_K_XL.gguf",
+      "model": "<model-dir>/Qwen3.8-27B-UD-Q3_K_XL.gguf",
       "n_gpu_layers": 999,
       "ctx_size": 100096,
       "parallel": 1,
@@ -66,7 +66,7 @@ sonder-infer serve --profiles profiles.json --profile qwen3.8-27b-q3-100k `
 It spawns llama-server with exactly the measured command line:
 
 ```text
---model D:/models/Qwen3.8-27B-UD-Q3_K_XL.gguf --alias qwen3.8-27b-q3-100k
+--model <model-dir>/Qwen3.8-27B-UD-Q3_K_XL.gguf --alias qwen3.8-27b-q3-100k
 --ctx-size 100096 --n-gpu-layers 999 --batch-size 2048 --ubatch-size 512 --parallel 1
 --no-kv-unified --flash-attn on --cache-type-k q8_0 --cache-type-v q5_1
 --ctx-checkpoints 4 --checkpoint-min-step 8192 --cache-ram 4096 --no-context-shift
@@ -110,8 +110,8 @@ projector kept in system RAM, plus Qwen's recommended sampling:
 {
   "name": "qwen3.8-27b-iq4xs-vision",
   "backend": "llamaserver",
-  "model": "D:/models/Qwen3.8-27B-UD-IQ4_XS.gguf",
-  "mmproj": "D:/models/mmproj-F16.gguf",
+  "model": "<model-dir>/Qwen3.8-27B-UD-IQ4_XS.gguf",
+  "mmproj": "<model-dir>/mmproj-F16.gguf",
   "mmproj_offload": false,
   "image_max_tokens": 2400,
   "n_gpu_layers": 999,
@@ -316,10 +316,12 @@ and compares it with a budget:
 the budget, unless `--allow-overcommit` is given. When llama-server sizes
 the offload itself (`fit` not false and `n_gpu_layers` unset), the estimate
 is only reported. A profile with `n_gpu_layers: 0`, or a llamacpp profile
-on a cpu device, skips the check.
+on a cpu device, skips the check. The separate host-RAM admission check for
+large MoE models, and its `host_memory` config keys, are described in
+[llama-server.md](llama-server.md#host-memory-admission-moe-offload).
 
 Validation against the measured 100k profile (estimator run on the real
-Q3_K_XL header on Node1):
+Q3_K_XL header on a second host):
 
 | Part | Estimate |
 |---|---|

@@ -3,13 +3,24 @@
 Status: **step 1 implemented** (tensor placement overrides in the llama.cpp
 backend). Steps 2–4 are design only.
 
+Scope note (2026-11-20): the placement and KV-cache flags on this page
+(`--gpu-layers`, `--context-length`, `--moe-experts`, `--tensor-override`,
+`--batch-size`, `--ubatch-size`, `--cache-type-k`, `--cache-type-v`,
+`--flash-attn`) apply to the `llamacpp` backend only; `serve` rejects them for
+any other backend with `option --<flag> applies only to --backend llamacpp`
+(`src/server/src/serve_main.cpp:744-752`). `--device` is not one of them: every
+backend accepts it and reports it as the model's device id in telemetry and
+health (`serve_main.cpp:150-151`). Build the `llamacpp` backend with
+`-DSONDER_WITH_LLAMA_CPP=ON` ([README](../README.md#build)); installation and
+run steps are in [SETUP.md](SETUP.md).
+
 ## Why
 
-VRAM is the scarcest resource on a Sonder host. The workstation has 16 GB on an
-RTX 5070 Ti, and Node1 has a Radeon 780M sharing 48 GB of system RAM. The
-common way to run a model larger than VRAM is to offload whole *layers* to the
-CPU. That is expensive for every token, because every token passes through
-every layer.
+VRAM is the scarcest resource on a Sonder host. The reference workstation has
+16 GB of discrete VRAM, and a second host has an integrated GPU sharing 48 GB of
+system RAM. The common way to run a model larger than VRAM is to offload whole
+*layers* to the CPU. That is expensive for every token, because every token
+passes through every layer.
 
 Mixture-of-Experts (MoE) models change the trade-off. Each token activates only
 a few experts per layer, and the experts hold most of the weights. The
@@ -30,7 +41,7 @@ follows `--gpu-layers`.
 
 ```sh
 # All layers on the GPU, MoE expert weights in system RAM.
-sonder-infer serve --backend llamacpp --model-dir D:/models --model qwen3-30b-a3b.gguf \
+sonder-infer serve --backend llamacpp --model-dir <models-dir> --model qwen3-30b-a3b.gguf \
     --gpu-layers -1 --moe-experts cpu
 
 # The general form: any regex, any llama.cpp device ("cpu", "Vulkan0", "CUDA0").
@@ -78,7 +89,7 @@ the effect on the 384 MiB f16 KV cache measured below (4096 context):
 K and V are sized independently, so `--cache-type-k q8_0` alone saves about a
 quarter of the total. The table is arithmetic from the formats, not a
 measurement; quality effects are model dependent and not yet measured here.
-One data point (Node1, CPU, a 491 MB GGUF, 512 context, greedy, 16 tokens,
+One data point (a second host, CPU, a 491 MB GGUF, 512 context, greedy, 16 tokens,
 2026-09-30): `q8_0` K and V produced the same text as `f16`; `q4_0` K and V
 with flash attention on degenerated into a repeated token. Treat 4-bit V
 caches as something to evaluate per model, not a free default.
@@ -178,7 +189,7 @@ Without data it is guesswork.
 ## Step 4 — Sonder-wide device scheduling (design)
 
 In the runtime, the Ollama pool already schedules whole requests across hosts
-(for example, the reasoning tier served by Node1's 780M while the workstation
+(for example, the reasoning tier served by a second host's integrated GPU while the workstation
 keeps its resident dense model). That pattern of distributed agents, rather
 than tensors split across the network, remains the right one over 2.5 GbE. The
 link is roughly 300 MB/s, against hundreds of GB/s for VRAM.
@@ -196,7 +207,7 @@ the main model.
 
 ## Measured
 
-**2026-09-27, workstation.** RTX 5070 Ti 16 GB, llama.cpp `b11195` with Vulkan,
+**2026-09-27, workstation.** A 16 GB discrete GPU, llama.cpp `b11195` with Vulkan,
 MSVC RelWithDebInfo. Model: `qwen3-coder:30b-a3b` Q4_K_M, a 17.3 GiB GGUF (larger
 than VRAM). Command:
 

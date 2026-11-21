@@ -1,5 +1,12 @@
 # Scaffold status
 
+> **Historical snapshot - superseded (2026-11-20).** This page records the
+> 2026-09-26 layout. llama.cpp is no longer a pending item: it is pinned at `b11195`
+> and implemented as the optional `llamacpp` backend. A Python binding
+> scaffold exists at `bindings/python/pyproject.toml`. For current build and run instructions see
+> [SETUP.md](SETUP.md) and the [README](../README.md#build). The body below is
+> unchanged.
+
 Created 2026-09-26 as documentation and structure only. **Superseded the same
 day by the first implementation slice** at the owner's request; this page now
 records the layout and what remains undecided.
