@@ -32,7 +32,7 @@ TEST_CASE("parses base URLs") {
     CHECK_FALSE(net::parse_url("http://host:99999").ok());
     CHECK(net::is_loopback_host("127.0.0.1"));
     CHECK(net::is_loopback_host("localhost"));
-    CHECK_FALSE(net::is_loopback_host("10.77.0.2"));
+    CHECK_FALSE(net::is_loopback_host("192.0.2.10"));
     // DNS names that merely start with "127." resolve wherever their owner says.
     CHECK_FALSE(net::is_loopback_host("127.0.0.1.attacker.example"));
     CHECK_FALSE(net::is_loopback_host("127.evil"));
@@ -51,7 +51,7 @@ TEST_CASE("a 127.-prefixed DNS name is remote: refused without allow_remote, bef
 
 TEST_CASE("refuses non-loopback hosts without touching the network") {
     OllamaBackendOptions o;
-    o.base_url = "http://10.77.0.2:11434";
+    o.base_url = "http://192.0.2.10:11434";
     auto b = make_ollama_backend(o);
     CHECK(b->probe().status().code() == ErrorCode::invalid_argument);
     CHECK(b->capabilities().has(Capability::remote_process));

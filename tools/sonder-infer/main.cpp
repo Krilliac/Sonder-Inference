@@ -317,7 +317,7 @@ bool resolve_backend(std::string_view command, const Args& a, const cli::EnvDefa
     }
     if (need_backend) {
         if (out.backend.empty()) {
-            rc = usage_error(command, "--backend is required (mock, ollama or llamacpp; or set SONDER_INFER_BACKEND)");
+            rc = usage_error(command, "--backend is required (mock, ollama, llamacpp or llamaserver; or set SONDER_INFER_BACKEND)");
             return false;
         }
         if (!check_backend_name(command, out.backend, rc)) return false;

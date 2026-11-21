@@ -755,6 +755,27 @@ TEST_CASE("supervisor crash retries twice, caps backoff, then exhausts") {
     CHECK(state->starts.size() == 3);
 }
 
+TEST_CASE("supervisor healthy run resets the crash-restart budget") {
+    auto state = std::make_shared<LaunchState>();
+    auto o = base_options();
+    o.max_restarts = 1;
+    o.healthy_reset_after = std::chrono::milliseconds(30);
+    o.health_check = [](std::uint16_t, std::chrono::milliseconds) { return true; };
+    Supervisor s(o, std::make_unique<FakeLauncher>(state));
+    REQUIRE(s.start().ok());
+    // Each child serves past healthy_reset_after before dying. Without the
+    // reset the second crash would exhaust max_restarts=1 and fail for good.
+    for (std::size_t i = 0; i < 3; ++i) {
+        REQUIRE(wait_for_starts(state, i + 1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        child_at(state, i)->alive.store(false);
+    }
+    REQUIRE(wait_for_starts(state, 4));
+    auto started = s.start();
+    CHECK(started.ok());
+    s.stop();
+}
+
 TEST_CASE("supervisor stop during readiness prevents later launches") {
     auto state = std::make_shared<LaunchState>();
     auto o = base_options();

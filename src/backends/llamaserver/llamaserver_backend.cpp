@@ -571,8 +571,11 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
                 }
             }
             if (!cached) {
-                props = fetch_props(cancel);
-                if (!cancel.cancelled()) {
+                bool definitive = false;
+                props = fetch_props(cancel, definitive);
+                // Transport failures, timeouts and transient statuses (e.g. 503
+                // while loading) are retried on the next request, never cached.
+                if (definitive && !cancel.cancelled()) {
                     std::lock_guard<std::mutex> lock(props_mutex_);
                     props_ = props;
                     props_key_ = std::move(key);
@@ -607,7 +610,10 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             return supervisor_->acquire_request(cancel);
         return llamaserver::Supervisor::RequestLease{};
     }
-    llamaserver::ServerProps fetch_props(const CancellationToken &cancel) {
+    // `definitive` is set only when the upstream gave a final answer (200 or
+    // 404); anything else leaves it false so the caller does not cache it.
+    llamaserver::ServerProps fetch_props(const CancellationToken &cancel, bool &definitive) {
+        definitive = false;
         llamaserver::ServerProps props;
         auto activity = acquire_request(cancel);
         if (!activity.ok())
@@ -618,8 +624,13 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         prepared->total_timeout = std::min(options_.request_timeout, std::chrono::milliseconds(30000));
         std::string body;
         const auto response = net::http_request_buffered(prepared.value(), body, cancel, 1024 * 1024);
-        if (!response.ok() || response->status != 200)
+        if (!response.ok())
             return props;
+        if (response->status == 404)
+            definitive = true;
+        if (response->status != 200)
+            return props;
+        definitive = true;
         auto parsed = json::parse(body);
         if (!parsed.ok() || !llamaserver::parse_props(parsed.value(), props).ok())
             return {};

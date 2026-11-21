@@ -158,7 +158,7 @@ std::vector<AttachRow> attach_rows() {
         {"octal 0177.0.0.1 (true loopback, refused)", "http://0177.0.0.1:8080", R},
         {"zero padded 127.000.000.001 (true loopback, refused)", "http://127.000.000.001:8080", R},
         {"wildcard 0.0.0.0", "http://0.0.0.0:8080", R},
-        {"private 10.77.0.2", "http://10.77.0.2:8080", R},
+        {"private 192.0.2.10", "http://192.0.2.10:8080", R},
         {"just outside 127/8: 128.0.0.1", "http://128.0.0.1:8080", R},
         {"octet overflow 127.0.0.256", "http://127.0.0.256:8080", R},
         {"five octets 127.0.0.1.2", "http://127.0.0.1.2:8080", R},
@@ -476,7 +476,7 @@ TEST_CASE("containment: attach accepts only loopback base URLs through the backe
 TEST_CASE("containment: attach refuses plain HTTP to a remote host even with allow_remote (by-design https only)") {
     // docs/integration/llama-server.md "Security and configuration limits":
     // remote hosts need allow_remote and HTTPS.
-    for (const std::string url : {"http://10.77.0.2:8080", "http://evil.example", "http://127.0.0.1.nip.io:8080",
+    for (const std::string url : {"http://192.0.2.10:8080", "http://evil.example", "http://127.0.0.1.nip.io:8080",
                                   "http://localhost.evil.com", "http://user@evil.com"}) {
         CAPTURE(url);
         CHECK(decision_of(attach_status(url, true)) == Decision::refused);
@@ -503,7 +503,7 @@ TEST_CASE("containment: attach accepts only loopback base URLs through the llama
     }
     // allow_remote in the file still needs HTTPS.
     CHECK(decision_of(config_status(R"({"mode":"attach","native_completion":false,"allow_remote":true,)"
-                                    R"("base_url":"http://10.77.0.2:8080"})")) == Decision::refused);
+                                    R"("base_url":"http://192.0.2.10:8080"})")) == Decision::refused);
 }
 #endif
 

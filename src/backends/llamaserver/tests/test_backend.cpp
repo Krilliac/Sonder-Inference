@@ -119,6 +119,21 @@ TEST_SUITE("llamaserver_backend") {
         CHECK(server.props_requests() == props_reads);
     }
 
+    TEST_CASE("transient /props failure is not cached and is refetched later") {
+        sonder_test::FakeLlamaServer server;
+        server.set_props(R"({"default_generation_settings":{"n_ctx":1024},"total_slots":2})");
+        server.set_props_status(503);
+        LlamaServerBackendOptions options;
+        options.base_url = server.url();
+        auto backend = make_llamaserver_backend(options);
+        REQUIRE(backend->load_model({"fake-model", "cpu:0"}).ok());
+        CHECK(server.props_requests() >= 1);
+        CHECK(backend->max_concurrent_requests() == 0);
+        server.set_props_status(0);
+        REQUIRE(backend->load_model({"fake-model", "cpu:0"}).ok());
+        CHECK(backend->max_concurrent_requests() == 2);
+    }
+
     TEST_CASE("single-slot or disabled affinity omits id_slot during overlapping keyed chats") {
         sonder_test::FakeLlamaServer server;
         server.set_body("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"
@@ -584,7 +599,7 @@ TEST_SUITE("llamaserver_backend") {
 
     TEST_CASE("remote plain HTTP and slot path traversal are rejected") {
         LlamaServerBackendOptions remote;
-        remote.base_url = "http://10.77.0.2:8080";
+        remote.base_url = "http://192.0.2.10:8080";
         remote.allow_remote = true;
         auto b = make_llamaserver_backend(remote);
         CHECK(b->probe().status().code() == ErrorCode::invalid_argument);

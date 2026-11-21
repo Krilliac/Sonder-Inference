@@ -32,6 +32,10 @@ class FakeLlamaServer {
         svr_.Get("/props", [this](const httplib::Request &, httplib::Response &r) {
             std::lock_guard<std::mutex> lock(mu_);
             ++props_requests_;
+            if (props_status_ != 0) {
+                r.status = props_status_;
+                return;
+            }
             if (props_.empty()) {
                 r.status = 404;
                 return;
@@ -198,6 +202,11 @@ class FakeLlamaServer {
         std::lock_guard<std::mutex> lock(mu_);
         props_ = std::move(props);
     }
+    // Nonzero forces /props to answer with this status (e.g. 503 while loading).
+    void set_props_status(int status) {
+        std::lock_guard<std::mutex> lock(mu_);
+        props_status_ = status;
+    }
     unsigned props_requests() const {
         std::lock_guard<std::mutex> lock(mu_);
         return props_requests_;
@@ -278,6 +287,7 @@ class FakeLlamaServer {
     unsigned prefill_entries_ = 0;
     std::string props_;
     unsigned props_requests_ = 0;
+    int props_status_ = 0;
     std::string metrics_body_;
     std::string slots_body_;
     int metrics_status_ = 404;
