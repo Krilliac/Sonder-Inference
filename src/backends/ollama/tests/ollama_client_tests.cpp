@@ -257,10 +257,10 @@ TEST_CASE("client: connection refused -> unavailable") {
 
 TEST_CASE("client: policy refuses plain HTTP to remote hosts and https") {
     OllamaConfig c;
-    c.base_url = "http://10.77.0.2:11434";
+    c.base_url = "http://192.0.2.10:11434";
     OllamaClient remote(c);
     CHECK(remote.version().status().code() == ErrorCode::invalid_argument);
-    c.base_url = "https://10.77.0.2:8443";
+    c.base_url = "https://192.0.2.10:8443";
     OllamaClient tls(c);
 #if defined(SONDER_HAS_TLS)
     // TLS builds accept https:// but still refuse non-loopback hosts without

@@ -3,7 +3,7 @@
 Status as of 2026-09-26: **not captured.**
 
 This branch was built in an isolated staging environment while the target
-workstation (DESKTOP-950K3EI, Ollama on `127.0.0.1:11434`) was offline. No live
+workstation (Ollama on `127.0.0.1:11434`) was offline. No live
 Ollama was reachable, so no numbers exist. No models were pulled and no
 placeholder numbers were invented.
 

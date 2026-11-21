@@ -2,7 +2,7 @@
 
 Optional TLS (`https://`) for the internal HTTP client in `src/net`, which is
 the transport the Ollama client uses, so the runtime can reach a remote Ollama
-node over TLS (for example Node1 at `https://10.77.0.2:8443`).
+node over TLS (for example Node1 at `https://192.0.2.10:8443`).
 
 - CMake option `SONDER_WITH_TLS`, **OFF by default**, defined in
   `cmake/SonderTls.cmake`. When OFF nothing changes: no extra sources, no
@@ -136,12 +136,12 @@ failures, untrusted chains, name mismatches and pin mismatches (the message
 says which), and `io_error` for failures after the handshake.
 
 Example for Node1 (the CA must have issued a certificate with
-`subjectAltName = IP:10.77.0.2`, or set `server_name` to the name in the
+`subjectAltName = IP:192.0.2.10`, or set `server_name` to the name in the
 certificate):
 
 ```cpp
 sonder::inference::OllamaBackendOptions o;
-o.base_url = "https://10.77.0.2:8443";
+o.base_url = "https://192.0.2.10:8443";
 o.allow_remote = true;                          // required for any non-loopback host
 o.tls.ca_bundle_path = "C:/sonder/node1-ca.pem"; // or:
 // o.tls.pinned_sha256 = "AB:CD:...";           // pin-only for a self-signed node cert
@@ -159,7 +159,7 @@ At test time the tests generate a throwaway PKI with OpenSSL in a temporary
 directory: a test CA, an unrelated CA, a leaf certificate for
 `IP:127.0.0.1, DNS:localhost`, and a leaf for `DNS:node1.invalid` only. No
 keys are checked in. A TLS server runs on `127.0.0.1:<ephemeral>` inside the
-test process. No external host is contacted. `10.77.0.2` appears only in
+test process. No external host is contacted. `192.0.2.10` appears only in
 parse-only and refused-before-connect checks.
 
 Covered:
