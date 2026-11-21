@@ -220,6 +220,68 @@ TEST_CASE("tune unsupported probes cannot produce a recommendation or start a ch
     empty.wrong_pid = true;
     CHECK(empty.run().verdict == tune::Verdict::unsupported);
 }
+TEST_CASE("tune child crash after readiness is a candidate error, not an unsupported probe") {
+    Fixture f;
+    f.dependencies.counters = std::make_shared<FakeCounters>([&f](std::uint32_t pid) -> Result<GpuProcessCounters> {
+        std::lock_guard lock(f.state->mutex);
+        if (f.state->children.empty() || !f.state->children.back()->alive.load()) return GpuProcessCounters{};
+        const auto instance = "pid_" + std::to_string(pid) + "_luid_test";
+        return GpuProcessCounters{{{instance, 14000 * kMiB}}, {{instance, 182 * kMiB}}};
+    });
+    const auto exchange = f.dependencies.exchange;
+    f.dependencies.exchange = [&f, exchange](std::uint16_t port, const std::string &method, const std::string &path,
+                                            const json::Value &body, tune::Deadline deadline,
+                                            const CancellationToken &cancel) -> Result<json::Value> {
+        if (path == "/completion") {
+            // Crash during the prefill workload: the process and its counter instances vanish.
+            std::lock_guard lock(f.state->mutex);
+            f.state->children.back()->alive.store(false);
+            return Status(ErrorCode::backend_error, "connection reset");
+        }
+        return exchange(port, method, path, body, deadline, cancel);
+    };
+    const auto result = f.run();
+    CHECK(result.verdict == tune::Verdict::error);
+    CHECK_FALSE(result.stop_search);
+    CHECK(result.detail == "child exited after readiness");
+}
+TEST_CASE("tune counters vanishing before the process is signalled still classify as a crash") {
+    Fixture f;
+    std::atomic<bool> crashing{false};
+    f.dependencies.counters = std::make_shared<FakeCounters>([&f, &crashing](std::uint32_t pid) -> Result<GpuProcessCounters> {
+        std::lock_guard lock(f.state->mutex);
+        if (f.state->children.empty()) return GpuProcessCounters{};
+        const auto &child = f.state->children.back();
+        // Counters vanish as soon as the crash starts, while the process still reports alive.
+        if (!child->alive.load() || crashing.load()) return GpuProcessCounters{};
+        const auto instance = "pid_" + std::to_string(pid) + "_luid_test";
+        return GpuProcessCounters{{{instance, 14000 * kMiB}}, {{instance, 182 * kMiB}}};
+    });
+    const auto exchange = f.dependencies.exchange;
+    std::jthread reaper;
+    f.dependencies.exchange = [&f, &crashing, &reaper, exchange](std::uint16_t port, const std::string &method, const std::string &path,
+                                                     const json::Value &body, tune::Deadline deadline,
+                                                     const CancellationToken &cancel) -> Result<json::Value> {
+        if (path == "/completion") {
+            std::shared_ptr<sonder_test::ChildState> child;
+            {
+                std::lock_guard lock(f.state->mutex);
+                crashing.store(true); // counters now empty, process still alive
+                child = f.state->children.back();
+            }
+            reaper = std::jthread([child] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                child->alive.store(false); // the process object is signalled late
+            });
+            return Status(ErrorCode::backend_error, "connection reset");
+        }
+        return exchange(port, method, path, body, deadline, cancel);
+    };
+    const auto result = f.run();
+    CHECK(result.verdict == tune::Verdict::error);
+    CHECK_FALSE(result.stop_search);
+    CHECK(result.detail == "child exited after readiness");
+}
 TEST_CASE("tune validates served context actual decode length timings and draft activity") {
     for (int failure = 0; failure != 4; ++failure) {
         Fixture f;
