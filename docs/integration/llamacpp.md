@@ -1,5 +1,9 @@
 # Integration notes: llama.cpp backend (`feat/llamacpp-backend`)
 
+> **Historical integration note (2026-11-20).** This describes the original
+> branch hand-off. For current setup see [SETUP.md](../SETUP.md) and the
+> [README build section](../../README.md#build).
+
 Owner paths in this branch: `src/backends/llamacpp/**` and this file. No root,
 core, docs, or other-module files are modified. Everything below that touches
 root/docs is for the lead to apply.
@@ -131,7 +135,7 @@ Offline builds: `-DFETCHCONTENT_SOURCE_DIR_LLAMACPP=/path/to/llama.cpp-b11195`.
   GGUF files are untrusted input parsed by llama.cpp; load only trusted model files.
   GitHub tag tarballs are pinned by hash; if GitHub regenerates an archive the hash check fails
   closed (update hash after verifying the tag commit)
-- approved: pending lead/Nate sign-off
+- approved: pending lead sign-off
 ```
 
 ## Status on main (applied by the integrator)
@@ -141,7 +145,7 @@ Offline builds: `-DFETCHCONTENT_SOURCE_DIR_LLAMACPP=/path/to/llama.cpp-b11195`.
 - §2 CLI hook applied: `tools/sonder-infer` registers `make_llamacpp_backend()`
   under `#if defined(SONDER_HAS_LLAMACPP_BACKEND)`.
 - §4 applied: the dependency record is in `docs/LICENSE_REVIEW.md`
-  (still `approved: pending lead/Nate sign-off`).
+  (approved 2026-09-26).
 - CI: optional job `llamacpp-windows` (windows-latest, MSVC,
   `SONDER_WITH_LLAMA_CPP=ON`, `GGML_NATIVE=OFF`, `continue-on-error`), with the
   pinned source tarball cached and passed via `FETCHCONTENT_SOURCE_DIR_LLAMACPP`.

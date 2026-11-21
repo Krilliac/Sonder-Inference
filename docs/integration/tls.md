@@ -2,7 +2,7 @@
 
 Optional TLS (`https://`) for the internal HTTP client in `src/net`, which is
 the transport the Ollama client uses, so the runtime can reach a remote Ollama
-node over TLS (for example Node1 at `https://192.0.2.10:8443`).
+node over TLS (for example a second host at `https://192.0.2.10:8443`).
 
 - CMake option `SONDER_WITH_TLS`, **OFF by default**, defined in
   `cmake/SonderTls.cmake`. When OFF nothing changes: no extra sources, no
@@ -52,14 +52,26 @@ node over TLS (for example Node1 at `https://192.0.2.10:8443`).
    Linux/macOS). Nothing is vendored or fetched. Schannel/crypt32/bcrypt are
    Windows OS components.*
 
-4. **Optional follow-ups, not done here**:
-   - CLI and bench flags that map to `OllamaBackendOptions::tls` in
-     `tools/sonder-infer/main.cpp` and `bench/tools/sonder_bench.cpp`, e.g.
-     `--tls-ca <pem>`, `--tls-pin-sha256 <hex>`, `--tls-pinned-cert <pem>`,
-     `--tls-server-name <name>`, `--tls-insecure`, plus `--allow-remote`.
-   - A `docs/MODULES.md` row, and README/ROADMAP mentions.
-   - Flip `src/backends/ollama/README.md`: its line "https:// is refused"
-     now holds only for non-TLS builds.
+4. **Follow-ups, state as of 2026-11-20** (checked against the code):
+   - `serve` declares and reads `--ollama-allow-remote`
+     (`src/server/src/serve_main.cpp:158` and `:664`), and the other CLI
+     commands resolve it in `resolve_backend` (`tools/sonder-infer/main.cpp`).
+     The ollama branch of the backend setup sets only `oo.base_url` and
+     `oo.allow_remote` before calling `make_ollama_backend`
+     (`src/server/src/backend_setup.cpp:420-423`). There are no `--tls-ca`,
+     `--tls-pin-sha256`, `--tls-pinned-cert`, `--tls-server-name` or
+     `--tls-insecure` flags for the `ollama` backend, so a remote `https://`
+     Ollama is verified against the system trust store only. The
+     `OllamaBackendOptions::tls` fields are reachable from the C++ API only.
+   - The `llamaserver` backend takes a `tls` object in its JSON config
+     (`src/server/src/backend_setup.cpp:286-297`); the fields are listed in
+     the [`tls` object table](llama-server.md#tls-object).
+   - `src/backends/ollama/README.md` already says `https://` works only in
+     `SONDER_WITH_TLS=ON` builds (lines 23-26); nothing remains to flip.
+   - Plain `http://` to a non-loopback host is refused even with
+     `--ollama-allow-remote` (`check_ollama_remote_url` in
+     `tools/sonder-infer/main.cpp:288-295`; for `serve` it runs first, from
+     `serve_ollama_remote_ok`, main.cpp:986-1006).
 
 ## Files
 
@@ -121,7 +133,8 @@ Small hooks in existing files (please review):
 | `server_name` | Overrides the name used for SNI and verification (default: the URL host). |
 | `handshake_timeout` | Bound on the handshake (default 10 s). The request's `connect_timeout` and total `request_timeout` still apply. |
 
-Verification modes:
+Verification modes (this section is the home for them; the README links
+here):
 
 1. `insecure_skip_verify`: no verification, loud warning.
 2. Pin set and no CA bundle ("pin-only", for self-signed nodes): the leaf
@@ -135,15 +148,16 @@ malformed fingerprint), `timeout`, `cancelled`, `protocol_error` for handshake
 failures, untrusted chains, name mismatches and pin mismatches (the message
 says which), and `io_error` for failures after the handshake.
 
-Example for Node1 (the CA must have issued a certificate with
+Example for a second host (the CA must have issued a certificate with
 `subjectAltName = IP:192.0.2.10`, or set `server_name` to the name in the
-certificate):
+certificate). This is the C++ API; the `serve` CLI exposes only
+`base_url` and `allow_remote` for the `ollama` backend:
 
 ```cpp
 sonder::inference::OllamaBackendOptions o;
 o.base_url = "https://192.0.2.10:8443";
 o.allow_remote = true;                          // required for any non-loopback host
-o.tls.ca_bundle_path = "C:/sonder/node1-ca.pem"; // or:
+o.tls.ca_bundle_path = "<config-dir>/worker1-ca.pem"; // or:
 // o.tls.pinned_sha256 = "AB:CD:...";           // pin-only for a self-signed node cert
 auto backend = sonder::inference::make_ollama_backend(o);
 ```
@@ -157,9 +171,9 @@ still uses one connection per request (`Connection: close`).
 
 At test time the tests generate a throwaway PKI with OpenSSL in a temporary
 directory: a test CA, an unrelated CA, a leaf certificate for
-`IP:127.0.0.1, DNS:localhost`, and a leaf for `DNS:node1.invalid` only. No
-keys are checked in. A TLS server runs on `127.0.0.1:<ephemeral>` inside the
-test process. No external host is contacted. `192.0.2.10` appears only in
+`IP:127.0.0.1, DNS:localhost`, and a leaf for a `.invalid` DNS name only. No keys are checked in. A TLS server runs on
+`127.0.0.1:<ephemeral>` inside the test process. No external host is
+contacted. `192.0.2.10` (a documentation address) appears only in
 parse-only and refused-before-connect checks.
 
 Covered:
@@ -179,7 +193,8 @@ Covered:
 - `OllamaClient::version()` over https (trusted / untrusted / wrong pin)
 - https to a non-loopback host still needs `allow_remote`
 
-Local results (Linux, GCC, Ninja, `-j4`, RelWithDebInfo, warnings as errors):
+Local results at the time of the original TLS change (historical, not
+re-run for this page; Linux, GCC, Ninja, `-j4`, RelWithDebInfo, warnings as errors):
 
 | Configuration | Result |
 | --- | --- |

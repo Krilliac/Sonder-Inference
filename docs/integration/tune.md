@@ -7,19 +7,22 @@ change the configuration or processes of an already running server.
 
 Live calibration **spawns the supplied executable and uses the GPU**. Use a
 trusted executable and close other GPU applications first. Desktop VRAM use
-varies (515–680 MiB in the owner's measurements); a result is a measurement
+varies (515–680 MiB when measured on one test host, 2026-09); a result is a measurement
 under current conditions, not a guarantee for every future workload. No model,
 executable, dependency, or package is downloaded. The subprocess supervisor
 keeps each server on loopback with a separately chosen ephemeral port.
 
 ```powershell
-sonder-infer tune --executable C:/llama/llama-server.exe `
-  --model D:/models/model.gguf --out tuned.json --budget-minutes 20
+# Set these first to your llama.cpp build directory and the GGUF directory.
+$env:LLAMA_DIR = "C:/path/to/llama.cpp"
+$env:MODEL_DIR = "C:/path/to/models"
+sonder-infer tune --executable "$env:LLAMA_DIR/llama-server.exe" `
+  --model "$env:MODEL_DIR/model.gguf" --out tuned.json --budget-minutes 20
 
 # Preview the search space without starting any process, reading the model,
 # probing the GPU, or writing an output file (MTP rows remain conditional).
-sonder-infer tune --executable C:/llama/llama-server.exe `
-  --model D:/models/model.gguf --dry-run
+sonder-infer tune --executable "$env:LLAMA_DIR/llama-server.exe" `
+  --model "$env:MODEL_DIR/model.gguf" --dry-run
 
 # Use the resulting best measured profile. Specify the backend's model ID as
 # usual; the spawn config's --model argument is the actual local GGUF path.
@@ -211,7 +214,7 @@ unsupported combinations remain error rows, never recommendations.
 
 Stdout is a Markdown summary with both recommendations and all candidate rows.
 Progress goes to stderr. `tuned.json` has ordinary `mode`, `executable`, `args`,
-`env`, `max_restarts: 3`, `startup_timeout_ms: 120000` and `spill_guard` keys, plus an inert `results` object
+`env`, `max_restarts: 3`, `startup_timeout_ms: 120000` and `spill_guard` keys (all keys and ranges: [llama-server.md](llama-server.md#configuration-reference)), plus an inert `results` object
 with schema `sonder.inference.tune/1`. The profile is meant for daily use: its
 spill guard carries the rule the winning candidate was judged by (including
 `baseline_per_1k_ctx_mib` for MTP) with policy `auto_fit` and `fit_min_ctx`

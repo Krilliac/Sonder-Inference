@@ -1,7 +1,7 @@
 # GPU residency, VRAM spill and KV cache kernel pairing (llamaserver)
 
 When `llamaserver` spawns llama-server, it checks two performance problems
-that the 2026-09-29 benchmarks on an RTX 5070 Ti (16 GB) found. Neither
+that benchmarks run on 2026-09-29 on a 16 GB GPU (one test host) found. Neither
 problem shows up in normal tools:
 
 1. **VRAM spill.** On Windows, a llama-server run with `--fit off` that does
@@ -23,8 +23,8 @@ unchanged.
 
 All runs used Ollama's bundled llama-server (0.4.1-dev) with Qwen3.8-27B,
 `--flash-attn on --fit off --n-gpu-layers 999`. Full reports:
-`bench-iq4xs.md` (IQ4_XS) and `bench-kv-fit` (Q3_K_XL probes), both in the
-sonder-eco workspace.
+`bench-iq4xs.md` (IQ4_XS) and `bench-kv-fit` (Q3_K_XL probes); these
+reports are kept outside this repository.
 
 Q3_K_XL, 8k-token prompt. "Shared" is the process's
 `GPU Process Memory\Shared Usage` after load.
@@ -121,9 +121,9 @@ dedicated-memory loss after readiness.
 
 ## Missing offload and VRAM eviction
 
-Two further incidents were reported by the owner on **2026-09-30**, on an
-RTX 5070 Ti (16 GB) under Windows WDDM with Qwen3.8-27B (16 attention and
-48 DeltaNet layers). These are owner measurements, not results from the
+Two further incidents were observed on **2026-09-30** on one test host with a
+16 GB GPU under Windows WDDM with Qwen3.8-27B (16 attention and
+48 DeltaNet layers). These are single-host measurements, not results from the
 GPU-free regression suite:
 
 - A PATH problem prevented the spawned server from loading its CUDA backend.
@@ -291,7 +291,7 @@ to native attach, where it can only warn. Each value shown is the default;
 ```json
 {
   "mode": "spawn",
-  "executable": "C:/llama/llama-server.exe",
+  "executable": "<llama.cpp-dir>/llama-server.exe",
   "args": ["--model", "m.gguf", "--ctx-size", "100096", "--flash-attn", "on",
            "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--fit", "off"],
   "log_file": "",
@@ -325,6 +325,11 @@ to native attach, where it can only warn. Each value shown is the default;
   }
 }
 ```
+
+Every key shown above, with its default and accepted range, is listed in the
+[configuration reference](llama-server.md#configuration-reference); that
+table is the home for key names and ranges, and this page explains what the
+spill, residency and stall settings do.
 
 In C++, set `LlamaServerBackendOptions::spill_guard`
 (`LlamaServerSpillGuardOptions`, with thresholds in bytes) and
