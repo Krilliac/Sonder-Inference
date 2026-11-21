@@ -363,6 +363,8 @@ bool Scheduler::try_priority_preemption(StepPlan& plan, Budget& budget, const Se
     const BlockCount target = need + config_.admission_watermark_blocks;
     for (auto it = order.rbegin(); it != order.rend() && freeable < target; ++it) {
         const Sequence& v = seqs_.at(*it);
+        // A request admitted earlier in this pass (including a starving one) must not be evicted again.
+        if (std::find(plan.admitted.begin(), plan.admitted.end(), *it) != plan.admitted.end()) continue;
         if (running_rank(v) - cand_rank < config_.priority_preemption_min_rank_gap) break;
         victims.push_back(*it);
         freeable += kv_.blocks_held(*it);
