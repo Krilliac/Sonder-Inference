@@ -115,6 +115,7 @@ Native code is justified when:
 | `mock` | implemented; **tests only**, performs no inference | tokenization, streaming, deterministic; token_logits when `MockBackendOptions::token_logits` |
 | `ollama` | implemented; loopback HTTP, streaming, cancellable | streaming, remote_process |
 | `llamacpp` | implemented, optional (`SONDER_WITH_LLAMA_CPP=ON`, pinned b11195); CPU by default, GPU via `GGML_*` | tokenization, streaming, batched_prefill, deterministic |
+| `llamaserver` | implemented, always built (`src/backends/llamaserver`); no llama.cpp linked. Attach to a running llama-server or any OpenAI-compatible upstream (default `http://127.0.0.1:8080`), or spawn and supervise a llama-server child. `"native_completion": false` selects generic OpenAI mode. Status 2026-11-20. See [integration/llama-server.md](integration/llama-server.md) | streaming, remote_process; plus speculative_decode and prefix_reuse in native mode (not generic OpenAI mode); structured_output when a grammar is configured |
 
 The interface lives in `include/sonder/inference/backend.hpp`. Capabilities
 are a bitset (`Capability`), matching the list above plus `deterministic`,

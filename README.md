@@ -57,8 +57,9 @@ Version 0.1.0 (`CMakeLists.txt`). Design notes and plans are in
 - A C++20 compiler. CI builds with MSVC on `windows-latest` and with the
   default compiler on `ubuntu-latest`; the hardening workflow uses Clang 18.
 - Network access on the first configure with tests enabled: doctest (and, for
-  the Ollama tests, cpp-httplib) are downloaded at pinned revisions with
-  SHA-256 checks.
+  the Ollama and llamaserver tests, cpp-httplib; the llamaserver tests reuse the
+  copy the Ollama tests fetch) are downloaded at pinned revisions with SHA-256
+  checks.
 - Optional: OpenSSL 1.1.1 or newer for TLS on non-Windows platforms.
 - Python bindings: Python 3.10 or newer.
 
@@ -131,6 +132,11 @@ Set `FETCHCONTENT_SOURCE_DIR_LLAMACPP` to a local llama.cpp checkout to build
 offline. The optional modules and how they are wired are described in
 [docs/MODULES.md](docs/MODULES.md).
 
+GPU builds: see
+[docs/SETUP.md](docs/SETUP.md#direct-llamacpp-backend-cpu-or-gpu).
+
+Next: [docs/SETUP.md](docs/SETUP.md) covers installing and running the result.
+
 ## Usage
 
 ### `sonder-infer`
@@ -172,6 +178,10 @@ session. Exit codes: 0 success, 1 runtime or backend failure, 2 usage error,
 $B/sonder-infer serve --backend mock --port 11437
 curl -fsS http://127.0.0.1:11437/v1/sonder/health
 ```
+
+To serve an existing llama-server upstream instead, use the `llamaserver`
+backend (`--llamaserver-url` or `--llamaserver-config`); setup steps are in
+[docs/SETUP.md](docs/SETUP.md).
 
 Routes, options, limits and the Observatory connection are documented in
 [docs/SERVER.md](docs/SERVER.md).
@@ -227,8 +237,9 @@ The following is enforced in code; details are in
 - `serve` listens on `127.0.0.1` by default. Binding a non-loopback address
   requires `--token-file`; requests must then carry
   `Authorization: Bearer <token>`, which is compared in constant time.
-- The server does not implement TLS. On a non-loopback bind it warns that the
-  token and traffic are sent in cleartext; use a TLS-terminating proxy.
+- The server does not implement TLS for its own listener. On a non-loopback
+  bind it warns that the token and traffic are sent in cleartext; use a
+  TLS-terminating proxy.
 - On a loopback bind, requests whose `Host` header is not `127.0.0.1`,
   `localhost` or `[::1]` are rejected (DNS-rebinding defence).
 - CORS uses an exact-match allowlist. The default origins reach only the
@@ -237,16 +248,16 @@ The following is enforced in code; details are in
   requires a token.
 - The Ollama client connects only to loopback hosts unless remote access is
   allowed (`--ollama-allow-remote`), and the CLI refuses plain `http://` to a
-  non-loopback host. `https://` requires a `SONDER_WITH_TLS=ON` build.
-- With TLS enabled, the client has three verification modes
-  (`src/net/tls.hpp`):
-  - default: the chain is verified against the system trust store, or only
-    against a configured CA bundle, and the certificate must match the host
-    name; a configured pin must also match;
-  - pin-only (a SHA-256 fingerprint or certificate pin and no CA bundle): the
-    leaf certificate must match the pin; chain and host name are not checked;
-  - insecure skip-verify: no chain or host-name checks and a warning on every
-    handshake; a configured pin is still enforced.
+  non-loopback host.
+- TLS is built in only with `-DSONDER_WITH_TLS=ON` (default OFF). With it,
+  `serve` can reach a remote `https://` Ollama with `--ollama-allow-remote`,
+  verified against the system trust store; `serve` has no CA or pin flags for
+  the `ollama` backend. The `llamaserver` backend accepts a `tls` object in its
+  JSON config (CA bundle, pins, server name, handshake timeout,
+  `insecure_skip_verify`). The three
+  verification modes (default, pin-only, insecure skip-verify) and the known
+  limitations are defined in
+  [docs/integration/tls.md](docs/integration/tls.md#behaviour).
 
 ## Project layout
 
@@ -297,6 +308,7 @@ CI workflows:
 ## Related projects
 
 - [Sonder Runtime](https://github.com/Krilliac/Sonder-runtime)
+- [Sonder Runtime: connect to Sonder Inference](https://github.com/Krilliac/Sonder-runtime/blob/main/docs/runbooks/sonder-inference.md)
 - [Sonder Observatory](https://github.com/Krilliac/Sonder-Observatory)
 - Website: [sondercore.si](https://sondercore.si)
 

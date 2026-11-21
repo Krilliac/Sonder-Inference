@@ -194,7 +194,7 @@ least 1,500 tokens, with explicit output overrides preserved; record any
 retry and whether the recalled fact was found only in `reasoning_content`.
 
 The GPU operator owns live runs and stores reviewed E02/E07/E08/E11 artifacts
-under `D:/sonder-eco/wf/bench/`. The lane author runs only fake-server tests;
+under `<bench-output-dir>`. The lane author runs only fake-server tests;
 real GPU acceptance, deployment, commits and PR operations belong to the
 integrator. Each result should include exact server revision, model, launch
 configuration, pins, sampling, context size and the arm's scenario JSON.

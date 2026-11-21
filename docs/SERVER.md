@@ -12,8 +12,13 @@ under [Deviations from the contract text](#deviations-from-the-contract-text)).
 
 The server is written in-house over POSIX sockets and Winsock, in the spirit
 of ADR-013: no third-party code, HTTP/1.1 only, `Connection: close` on every
-response, one thread per connection, and no TLS. It never emulates the Ollama
-API and never presents itself as Ollama.
+response, one thread per connection, and no TLS on the listening side (TLS to
+an upstream is an optional build feature, see [TLS to an upstream](#tls-to-an-upstream)).
+It never emulates the Ollama API and never presents itself as Ollama.
+
+Setup (installing, running as a service, putting a TLS-terminating reverse
+proxy such as Caddy in front): see [SETUP.md](SETUP.md). This page does not
+repeat it.
 
 ## Running it
 
@@ -26,7 +31,33 @@ sonder-infer serve --backend ollama --model llama3.2:3b --model qwen2.5:7b
 
 # llama.cpp (build with SONDER_WITH_LLAMA_CPP=ON)
 sonder-infer serve --backend llamacpp --model-dir ~/models --model tiny.gguf
+
+# Attach to an already running llama-server (or another OpenAI-compatible
+# upstream) at the default http://127.0.0.1:8080; --model is required and must
+# match an id in the upstream's /v1/models (llama-server --alias)
+sonder-infer serve --backend llamaserver --model local-model
+
+# Let serve start and supervise llama-server (spawn mode): the executable is
+# required, and every --llamaserver-arg is one argv entry passed verbatim
+sonder-infer serve --backend llamaserver --model local-model \
+  --llamaserver-mode spawn --llamaserver-executable /opt/llama.cpp/llama-server \
+  --llamaserver-arg --model --llamaserver-arg /models/model.gguf \
+  --llamaserver-arg --alias --llamaserver-arg local-model
+
+# Typed launch profile (llamaserver profile shown): the file names the backend,
+# the served model id and the model settings. It has no executable key, so the
+# llama-server path, timeouts, restart policy and TLS still come from the usual
+# options (see integration/launch-profiles.md)
+sonder-infer serve --profiles profiles.json --profile my-profile \
+  --llamaserver-executable /opt/llama.cpp/llama-server
 ```
+
+For `llamaserver`, `serve` checks the options before anything binds (see the
+Options table below for the spawn rules). An attach URL on a non-loopback host needs `"allow_remote":
+true` in the JSON config and an `https://` URL
+(`src/backends/llamaserver/llamaserver_backend.cpp:219`). Spawn, restart,
+generic OpenAI mode and the config keys are documented in
+[integration/llama-server.md](integration/llama-server.md).
 
 The CLI (`tools/sonder-infer`) dispatches the `serve` subcommand to
 `sonder::inference::server::serve_main(args, out, err)` from
@@ -42,11 +73,30 @@ itself.
 | --- | --- | --- |
 | `--host HOST` | `127.0.0.1` | A non-loopback host requires `--token-file` (exit 2 otherwise). Loopback means `localhost`, `::1` / `[::1]` or an IPv4 literal in 127.0.0.0/8; a DNS name that merely starts with `127.` is not loopback. |
 | `--port N` | `11437` | `0` picks an ephemeral port; the ready file and banner show it. |
-| `--backend mock\|ollama\|llamacpp` | env `SONDER_INFER_BACKEND` | Required. A backend this build does not include is a usage error (exit 2), checked before anything binds. |
-| `--model ID` (repeatable) | env `SONDER_INFER_MODEL` | The first model is the default and also answers to `default`. The mock backend serves `mock` when no model is given; other backends require a model (the error points to `sonder-infer models --backend X`). |
+| `--backend mock\|ollama\|llamacpp\|llamaserver` | env `SONDER_INFER_BACKEND` | Required, except with `--profile` (the profile names its backend). A backend this build does not include is a usage error (exit 2), checked before anything binds; `sonder-infer backends` lists what the build has. |
+| `--model ID` (repeatable) | env `SONDER_INFER_MODEL` | The first model is the default and also answers to `default`. The mock backend serves `mock` when no model is given; other backends require a model (the error points to `sonder-infer models --backend X`). With `--profile`, `--model` may only repeat the profile's name, which is the served model id. |
 | `--ollama-url URL` | env `SONDER_OLLAMA_URL`, then `OLLAMA_HOST` | `OLLAMA_HOST` values such as `0.0.0.0` or `host:port` are normalised (wildcards become `127.0.0.1`, the port defaults to 11434). |
-| `--ollama-allow-remote` | off | Allows a non-loopback Ollama host. Remote hosts also need `https://`, which needs a `SONDER_WITH_TLS=ON` build; the default build does not wire TLS, so remote Ollama is unusable in v1. |
+| `--ollama-allow-remote` | off | Allows a non-loopback Ollama host. `sonder-infer` refuses plain `http://` to a non-loopback host with this flag (exit 2), so a remote Ollama needs an `https://` URL; see [TLS to an upstream](#tls-to-an-upstream). |
 | `--model-dir DIR` (repeatable) | none | llama.cpp model directories. |
+| `--device ID` | `cpu` (empty) | Device the models load on. For `llamacpp`, `gpu:0` offloads to the GPU. Every backend reports it as the model's device id in telemetry and health, so it is accepted with any backend and with `--profile`. |
+| `--gpu-layers N` | `-1` (all) | `llamacpp` only: layers offloaded on a `gpu:*` device; `-1` or 0 to 100000. |
+| `--context-length N` | unset keeps the backend default of 4096; `0` is the model's training context | `llamacpp` only; 0 to 4194304. |
+| `--moe-experts cpu\|gpu` | `gpu` | `llamacpp` only. `cpu` keeps the mixture-of-experts expert tensors in system RAM while attention stays on the GPU; `gpu` leaves placement to `--gpu-layers`. |
+| `--tensor-override P=D` (repeatable) | none | `llamacpp` only. Places tensors whose name matches regex `P` on device `D` (`cpu`, or a llama.cpp device such as `Vulkan0`). The split is at the last `=`. |
+| `--batch-size N` | `512` | `llamacpp` only; 1 to 4194304. Maximum prompt tokens per decode call. |
+| `--ubatch-size N` | llama.cpp's 512, capped at `--batch-size` | `llamacpp` only; 1 to 4194304, and not above `--batch-size`. |
+| `--cache-type-k T`, `--cache-type-v T` | `f16` | `llamacpp` only. One of `f16`, `f32`, `bf16`, `q8_0`, `q5_1`, `q5_0`, `q4_1`, `q4_0`, `iq4_nl`. A quantized V cache needs flash attention `on` or `auto`. |
+| `--flash-attn auto\|on\|off` | `auto` | `llamacpp` only. |
+| `--llamaserver-config PATH` | none | `llamaserver`: JSON config (mode, URL or executable, `args`, timeouts, guards and a `tls` object); keys are in [integration/llama-server.md](integration/llama-server.md). An unreadable or invalid file is a usage error. |
+| `--llamaserver-mode attach\|spawn` | `attach` (`spawn` under a llamaserver profile) | Overrides the config's `mode`. |
+| `--llamaserver-url URL` | `http://127.0.0.1:8080` | Attach upstream URL. Refused with `--profile`. |
+| `--llamaserver-executable PATH` | none | `llama-server` binary; required in spawn mode. |
+| `--llamaserver-arg ARG` (repeatable) | none | One spawn argv entry per occurrence, passed verbatim; replaces the config's `args`. May not set `--host` or `--port`. Refused with `--profile`. |
+| `--warmup-file PATH` | none | `llamaserver` only (usage error otherwise): JSON of prefix messages replayed to warm the upstream's prompt cache. |
+| `--profiles PATH` | none | JSON file of typed launch profiles; needs `--profile`. See [launch profiles](integration/launch-profiles.md). |
+| `--profile NAME` | none | Serve that profile: its `backend` (`llamaserver` or `llamacpp`) is the backend and `NAME` is the served model id. Needs `--profiles`. `--backend`, if given, must equal the profile's backend. A llamaserver profile also refuses a llamaserver config file that sets `args` (move them into the profile's typed fields or `extra_args`). Under any profile `--gpu-layers`, `--context-length`, `--llamaserver-url`, `--llamaserver-arg` and the llama.cpp context flags (`--batch-size`, `--ubatch-size`, `--cache-type-k`, `--cache-type-v`, `--flash-attn`) are refused: set the profile's typed fields instead. A llamaserver profile forces spawn mode (attach is refused) and also refuses `--moe-experts` and `--tensor-override`; a llamacpp profile takes them from the command line. |
+| `--vram-budget-mib N` | the profile's `vram_budget_mib`, else detected device VRAM minus 1536 MiB | Budget for the profile's VRAM fit check; 1 to 16777216; wins over the profile's value. `--profile` only. |
+| `--allow-overcommit` | off | Start even when the estimate exceeds the budget or cannot be made. `--profile` only. |
 | `--token-file PATH` | none | Bearer token (one line). Read once, kept in memory, never logged. A warning is printed when the file is readable by group or others. |
 | `--cors-origin ORIGIN` (repeatable) | none | Exact-match browser origin, allowed on every route. Must be a serialized origin as browsers send it: lowercase `scheme://host[:port]`, no path, trailing slash, query or wildcard (exit 2 otherwise). |
 | `--no-default-cors` | off | Drops the default origin list. |
@@ -75,6 +125,12 @@ itself.
 | `--max-queue-per-class N` | unlimited (`0`) | Maximum queued requests for each priority class; over-capacity requests receive 429 with `Retry-After: 1`. |
 | `--priority-admission auto\|on\|off` | `auto` | Enable class-ordered admission. `auto` enables it only when a nonzero class concurrency or queue cap is configured; `on` always enables it; `off` bypasses it, including configured caps. |
 | `--backend-capacity N` | `0` | Explicit concurrent backend-request limit when priority admission is enabled. `0` uses the backend's advertised capacity; an unknown capacity stays ungated. This flag alone does not enable admission. |
+
+The `llamacpp`-only options (`--gpu-layers`, `--context-length`,
+`--moe-experts`, `--tensor-override`, `--batch-size`, `--ubatch-size`,
+`--cache-type-k`, `--cache-type-v`, `--flash-attn`) are a usage error with any
+other backend, so a setting is never silently ignored. For `llamaserver` put
+the equivalent llama-server flags in the config's `args`, or use a profile.
 
 `--key=value` is accepted as well as `--key value`. Exit status: 0 after a
 clean shutdown, 1 on a runtime error (for example the port is in use; the
@@ -180,6 +236,15 @@ On SIGINT or SIGTERM (or `request_shutdown()`):
 6. The access log drains: the queued log lines are written, waiting at most
    `--shutdown-grace-ms` (at least 100 ms) for a blocked stderr; lines still
    unwritten then are dropped. The process exits 0.
+
+### TLS to an upstream
+
+Status 2026-11-20. The listener is plain HTTP. `https://` upstreams need a
+build configured with `-DSONDER_WITH_TLS=ON`, which is OFF by default. The
+trust model, the build option and the `llamaserver` `tls` config keys are in
+[integration/tls.md](integration/tls.md); the build steps and a remote-Ollama
+setup are in [SETUP.md](SETUP.md). To put TLS in front of `serve` itself, use a
+reverse proxy (also [SETUP.md](SETUP.md)).
 
 ## Security
 

@@ -69,7 +69,9 @@ a stream that sends keepalives forever after its first content is unbounded.
 same-named `LlamaServerBackendOptions` fields (`api_key_env`, `idle_timeout`,
 `first_content_timeout`, `unlimited_request_timeout`, `keepalive_gap`,
 `upstream_grammar`, `stall_guard.generic_progress`); the `_ms` keys are
-milliseconds.
+milliseconds. Every key, default and range of the llamaserver config is in
+[llama-server.md](llama-server.md#configuration-reference); this page only
+explains how to choose the slow-upstream values.
 
 ### Authentication
 

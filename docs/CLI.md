@@ -79,6 +79,9 @@ Flags always win. Empty variables count as unset.
 | `OLLAMA_HOST` | `--ollama-url` when `SONDER_OLLAMA_URL` is unset. Accepts Ollama's forms: `host`, `host:port`, or a URL. The default scheme is `http`, the default port 11434 (443 for `https`), and `0.0.0.0`, `[::]` or an empty host map to `127.0.0.1`. |
 | `NO_COLOR` | Any non-empty value turns off colored REPL labels. |
 
+`sonder-infer` does not read `SONDER_INFERENCE_LIB_DIR` or `SONDER_INFERENCE_LIBRARY`; they belong to the Python bindings, see
+[bindings/python/README.md](../bindings/python/README.md).
+
 `sonder-infer serve` reads the same variables through the same code
 (`sonder/inference/backend_setup.hpp`). A build without the server module uses
 an equivalent copy in `src/cli/cli_env.hpp`, and the unit tests check that the
@@ -125,6 +128,33 @@ includes the mock backend, so that state cannot be produced.
   --ollama-url URL`.
 - `llamacpp`: the direct llama.cpp backend, only in builds configured with
   `SONDER_WITH_LLAMA_CPP=ON`; `--model` is a GGUF path.
+- `llamaserver`: an external llama-server, or another OpenAI-compatible
+  upstream, with no llama.cpp linked. It is part of the normal build
+  (`src/backends/llamaserver`, `SONDER_HAS_LLAMASERVER_BACKEND`). Attach to a
+  running upstream (default `http://127.0.0.1:8080`) or let the CLI spawn and
+  supervise one. Options (also on `serve`): `--llamaserver-config PATH` (JSON),
+  `--llamaserver-url URL`, `--llamaserver-mode attach|spawn`,
+  `--llamaserver-executable PATH` (required for spawn) and the repeatable
+  `--llamaserver-arg ARG`. Flags override the config file. Unset sampling
+  options use the upstream's defaults, not the defaults listed under
+  Sampling. Details: [integration/llama-server.md](integration/llama-server.md).
+
+```sh
+# --model must match an id in the upstream's /v1/models (llama-server --alias);
+# otherwise: "llamaserver: model is not advertised by upstream"
+sonder-infer generate --backend llamaserver --model local-model --prompt "hello"
+sonder-infer chat --backend llamaserver --model local-model \
+  --llamaserver-config llamaserver.json
+```
+
+`sonder-infer backends` shows which of the four names the build includes. Both
+failures are usage errors (exit 2). An unknown name gets `unknown backend
+'<name>'; this build has: <list>` (with a "did you mean" hint when close). A
+known name the build excludes gets `this build does not include the <name>
+backend` followed by `(configure with SONDER_WITH_LLAMA_CPP=ON)` for `llamacpp`
+or `(module src/backends/<name>)` for the others, and no list. The llama.cpp tuning options (`--gpu-layers`, `--context-length`,
+`--batch-size`, `--cache-type-k` and so on) and launch profiles exist on
+`serve` only; see [SERVER.md](SERVER.md).
 
 `--ollama-allow-remote` maps to `OllamaBackendOptions::allow_remote` and
 always prints a warning (also with `--quiet`). Prompts and replies never
@@ -136,9 +166,14 @@ including `serve`:
 `error: models: --ollama-allow-remote refuses plain http:// to a non-loopback host ('http://192.0.2.1:11434'); use https:// ...`.
 The Ollama client itself only checks the host once `allow_remote` is set, so
 this refusal lives in the CLI (`cli::is_plain_http_remote()`, tested against
-the client's own URL parser). `https://` needs a `SONDER_WITH_TLS=ON` build,
-which the default build does not wire in; in the default build the flag
-therefore cannot reach a remote host.
+the client's own URL parser).
+
+TLS status 2026-11-20: `https://` upstreams need a build configured with
+`-DSONDER_WITH_TLS=ON`, which is OFF by default, so in a default build
+`--ollama-allow-remote` cannot reach a remote host. See
+[integration/tls.md](integration/tls.md) for the trust model and the
+`llamaserver` `tls` keys, and [SETUP.md](SETUP.md) for the build and a
+remote-Ollama setup.
 
 ## generate
 

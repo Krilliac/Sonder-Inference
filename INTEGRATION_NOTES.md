@@ -166,8 +166,9 @@ merging, because the dispatch now exists:
   `make_request()` (or `make_backend()`) enforces "https:// only for remote
   hosts" itself; both are outside this lane. `https://` needs
   `SONDER_WITH_TLS=ON`, which root CMake does not include
-  (`cmake/SonderTls.cmake` is not wired), so the default build cannot reach a
-  remote host at all.
+  (correction 2026-11-20: root CMake does include `cmake/SonderTls.cmake`
+  via `include(SonderTls)`, but the option defaults to OFF, so a default build
+  still cannot reach a remote host).
 - `serve` keeps its own parser (`src/server/src/serve_main.cpp`; this lane
   used its one allowed edit for the shared unknown-option wording). Its other
   errors have no `serve:` prefix and its numeric errors do not echo the bad
@@ -456,6 +457,13 @@ Left for the integrator (outside the scoped files):
   memory is unknown. cgroup v1 limits are not read (v2 only).
 - `--no-kv-offload` is not modelled in the host/VRAM split.
 - Build/test evidence: the earlier C1041 (PDB contention on sonder_inference.pdb) failures were environmental. The lane has since been built with msvc-debug via build.ps1 and the llamaserver tests run (see the PR for the ctest results); the full suite was not run locally.
+- Correction 2026-11-20 (the two bullets above about the runtime JSON and unknown availability
+  describe the lane as written): `HostMemory` readings are still not exposed, but the warnings
+  are in `GET /v1/sonder/health` (`backends[].runtime.warnings`) and `/v1/models`
+  (`sonder.runtime.warnings`). On Linux available physical memory is known, so only macOS or an
+  unreadable cgroup v2 limit gives `host_memory_unknown`; unknown commit skips only the commit
+  comparison. Current operator-facing text:
+  [docs/integration/llama-server.md](docs/integration/llama-server.md#host-memory-admission-moe-offload).
 
 ## `claude/si-weight-manifest` (module `src/artifacts`)
 
