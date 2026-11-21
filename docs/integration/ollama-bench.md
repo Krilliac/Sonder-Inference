@@ -133,7 +133,7 @@ contracts that core and the CLI use are preserved:
   long-context case is sized for Ollama's default 4096 window.
 - **No TLS.** The core HTTP client is plain HTTP. `https://` returns
   `unsupported`, and a non-loopback host needs `allow_remote`. Reaching
-  Node1's TLS worker (`https://10.77.0.2:8443`) needs a TLS transport in core
+  Node1's TLS worker (`https://192.0.2.10:8443`) needs a TLS transport in core
   `net`, with verification on.
 - **Chat not wired into the Backend path.** `/api/chat` is in `OllamaClient`,
   but the Backend path uses `/api/generate` because `GenerateRequest` is

@@ -7,4 +7,4 @@ Results from the `mock` backend are harness checks, not performance data.
 
 | Baseline | Status |
 |---|---|
-| Ollama on Nate's workstation (DESKTOP-950K3EI) | **PENDING**. See [PENDING_ollama_baseline.md](PENDING_ollama_baseline.md) |
+| Ollama on the reference workstation | **PENDING**. See [PENDING_ollama_baseline.md](PENDING_ollama_baseline.md) |
