@@ -313,10 +313,10 @@ Result<std::string> hash_file(const fs::path& file, std::string_view display, co
 Result<DirListing> list_directory(const fs::path& dir, const std::vector<fs::path>& ignore) {
     std::error_code ec;
     if (!fs::is_directory(dir, ec)) {
-        return Status(ErrorCode::not_found, "not a directory: " + display_utf8(dir));
+        return Status(ErrorCode::not_found, "not a directory: " + printable_path(display_utf8(dir)));
     }
     fs::recursive_directory_iterator it(dir, fs::directory_options::none, ec);
-    if (ec) return Status(ErrorCode::io_error, "cannot list '" + display_utf8(dir) + "': " + ec.message());
+    if (ec) return Status(ErrorCode::io_error, "cannot list '" + printable_path(display_utf8(dir)) + "': " + ec.message());
     DirListing out;
     const fs::recursive_directory_iterator end;
     for (; it != end; it.increment(ec)) {
@@ -357,6 +357,8 @@ Result<DirListing> list_directory(const fs::path& dir, const std::vector<fs::pat
             out.unsafe.push_back(rel);
         }
     }
+    // increment(ec) turns the iterator into end() on failure, so the loop exits without seeing ec.
+    if (ec) return Status(ErrorCode::io_error, "directory walk failed: " + ec.message());
     std::sort(out.files.begin(), out.files.end());
     std::sort(out.unsafe.begin(), out.unsafe.end());
     return out;

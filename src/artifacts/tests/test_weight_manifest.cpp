@@ -363,6 +363,30 @@ TEST_CASE("weights: ill-formed UTF-8 names are refused, not written as U+FFFD") 
 #endif
 }
 
+TEST_CASE("weights: an unreadable subdirectory fails the listing instead of returning a truncated one") {
+#if defined(_WIN32)
+    MESSAGE("POSIX permission bits are needed to make a subdirectory unreadable; not exercised on Windows");
+#else
+    TempDir t;
+    const fs::path model = t.path / "model";
+    fs::create_directories(model / "locked");
+    { std::ofstream(model / "a.bin", std::ios::binary) << "x"; }
+    { std::ofstream(model / "locked" / "b.bin", std::ios::binary) << "y"; }
+    fs::permissions(model / "locked", fs::perms::none);
+    std::error_code probe;
+    const bool readable = fs::directory_iterator(model / "locked", probe) != fs::directory_iterator() || !probe;
+    if (!probe && readable) {
+        fs::permissions(model / "locked", fs::perms::owner_all);
+        MESSAGE("running with permission checks bypassed (root); not exercised");
+        return;
+    }
+    auto listing = w::list_directory(model, {});
+    fs::permissions(model / "locked", fs::perms::owner_all);
+    CHECK_FALSE(listing.ok());
+    if (!listing.ok()) CHECK(listing.status().code() == sonder::inference::ErrorCode::io_error);
+#endif
+}
+
 TEST_CASE("weights: printable_path escapes control, C1, bidi and ill-formed bytes and keeps ordinary names") {
     CHECK(w::printable_path("a\nverify: OK") == "a\\x0averify: OK");
     CHECK(w::printable_path("\x1b[2J") == "\\x1b[2J");
