@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <charconv>
 #include <exception>
+#include <optional>
 #include <utility>
 
 #include "net/http_client.hpp"
@@ -143,6 +144,7 @@ Result<std::uint16_t> Supervisor::start(const CancellationToken &cancel) {
             !valid_duration(options_.readiness_timeout) || !valid_duration(options_.health_poll_interval) ||
             !valid_duration(options_.restart_initial_backoff) ||
             !valid_duration(options_.restart_max_backoff) || !valid_duration(options_.shutdown_timeout) ||
+            !valid_duration(options_.healthy_reset_after) ||
             options_.restart_initial_backoff > options_.restart_max_backoff || options_.max_restarts > 1000) {
             valid = Status(ErrorCode::invalid_argument, "llamaserver: invalid process supervision options");
         }
@@ -264,6 +266,7 @@ void Supervisor::monitor() {
     // Only this thread accesses Process: native wait, reap and stop never race.
     std::size_t restarts = 0;
     auto backoff = options_.restart_initial_backoff;
+    std::optional<Clock::time_point> ready_since;
     try {
         if (options_.attached_endpoint) {
             monitor_attached();
@@ -300,6 +303,7 @@ void Supervisor::monitor() {
                 } else {
                     auto child = std::move(launched.value());
                     begin_child();
+                    ready_since.reset();
                     result = wait_ready(*child, spec.port);
                     if (result.ok() && !shutdown_.cancelled()) {
                         log_diagnostics_.ready(arguments_);
@@ -341,6 +345,7 @@ void Supervisor::monitor() {
                                 child_status_->set("sampled_at", nullptr);
                             }
                             state_ = State::ready;
+                            ready_since = Clock::now();
                             maintenance_pending_ = false;
                             residency_maintenance_ = false;
                             if (gpu_.residency && gpu_.residency->action == "restarting")
@@ -425,6 +430,13 @@ void Supervisor::monitor() {
             }
             if (shutdown_.cancelled())
                 break;
+            // A child that served for a healthy period before dying starts a fresh
+            // restart budget; only consecutive short-lived runs exhaust it.
+            if (ready_since && Clock::now() - *ready_since >= options_.healthy_reset_after) {
+                restarts = 0;
+                backoff = options_.restart_initial_backoff;
+            }
+            ready_since.reset();
             // A live child that never becomes ready has timed out; do not
             // repeatedly load a model behind the caller's back in that case.
             if (result.code() == ErrorCode::timeout || result.code() == ErrorCode::invalid_argument ||

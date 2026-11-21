@@ -1,7 +1,7 @@
-time=2026-09-30T08:50:27.411-05:00 level=INFO source=llama_server.go:436 msg="starting llama-server" cmd="C:\\Users\\Nathan\\AppData\\Local\\Programs\\Ollama\\lib\\ollama\\llama-server.exe --model C:\\Users\\Nathan\\.ollama\\models\\blobs\\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e --port 36515 --host 127.0.0.1 --no-webui --offline -c 16384 -np 1 --
+time=2026-09-30T08:50:27.411-05:00 level=INFO source=llama_server.go:436 msg="starting llama-server" cmd="C:\\Users\\example\\AppData\\Local\\Programs\\Ollama\\lib\\ollama\\llama-server.exe --model C:\\Users\\example\\.ollama\\models\\blobs\\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e --port 36515 --host 127.0.0.1 --no-webui --offline -c 16384 -np 1 --
 time=2026-09-30T08:50:27.420-05:00 level=INFO source=sched.go:618 msg="system memory" total="30.9 GiB" free="1.2 GiB" free_swap="9.9 GiB"
 time=2026-09-30T08:50:27.420-05:00 level=INFO source=sched.go:625 msg="gpu memory" id=0 library=CUDA available="13.6 GiB" free="14.1 GiB" minimum="457.0 MiB" overhead="0 B"
-time=2026-09-30T08:50:27.420-05:00 level=INFO source=llama_server.go:1054 msg="loading model via llama-server" model=C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e
+time=2026-09-30T08:50:27.420-05:00 level=INFO source=llama_server.go:1054 msg="loading model via llama-server" model=C:\Users\example\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e
 time=2026-09-30T08:50:27.420-05:00 level=INFO source=llama_server.go:1307 msg="waiting for llama-server to start responding"
 time=2026-09-30T08:50:27.434-05:00 level=INFO source=llama_server.go:1362 msg="waiting for llama-server to become available" status="llm server error"
 0.00.001.139 I srv  llama_server: initializing ...
@@ -16,8 +16,8 @@ srv          init: The UI is disabled
 srv          init: Use --ui/--no-ui (or deprecated --webui/--no-webui) to enable/disable
 srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
 srv         start: binding port with default address family
-srv    load_model: loading model 'C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e'
-srv    load_model: local path 'C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e'
+srv    load_model: loading model 'C:\Users\example\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e'
+srv    load_model: local path 'C:\Users\example\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e'
 time=2026-09-30T08:50:27.942-05:00 level=INFO source=llama_server.go:1362 msg="waiting for llama-server to become available" status="llm server loading model"
 srv    load_model: [mtmd] estimated worst-case memory usage of mmproj is 1161.02 MiB (took 849.44 ms)
 cmn  common_init_: fitting params to device memory ...
@@ -30,7 +30,7 @@ common_params_fit_impl: projected to use 12525 MiB of device memory vs. 14887 Mi
 common_params_fit_impl: will leave 2361 >= 1936 MiB of free device memory, no changes needed
 common_fit_params: successfully fit params to free device memory
 common_fit_params: fitting params to free memory took 0.76 seconds
-llama_model_loader: loaded meta data with 50 key-value pairs and 866 tensors from C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e (version GGUF V3 (latest))
+llama_model_loader: loaded meta data with 50 key-value pairs and 866 tensors from C:\Users\example\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e (version GGUF V3 (latest))
 llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
 llama_model_loader: - kv  17:                         qwen35.block_count u32              = 65
 llama_model_loader: - kv  18:                      qwen35.context_length u32              = 262144
@@ -141,7 +141,7 @@ load_tensors: offloaded 66/66 layers to GPU
 load_tensors:        CUDA0 model buffer size = 11671.15 MiB
 load_tensors:    CUDA_Host model buffer size =   521.00 MiB
 time=2026-09-30T08:50:31.491-05:00 level=WARN source=llama_server.go:1313 msg="client connection closed before llama-server finished loading, aborting load"
-time=2026-09-30T08:50:31.493-05:00 level=INFO source=sched.go:646 msg="Load failed" model=C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e error="timed out waiting for llama-server to start: context canceled"
+time=2026-09-30T08:50:31.493-05:00 level=INFO source=sched.go:646 msg="Load failed" model=C:\Users\example\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e error="timed out waiting for llama-server to start: context canceled"
 time=2026-09-30T08:50:42.203-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
 time=2026-09-30T08:51:14.400-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
 time=2026-09-30T08:51:47.829-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
@@ -165,12 +165,12 @@ time=2026-09-30T09:00:35.272-05:00 level=WARN source=images.go:800 msg="model is
 time=2026-09-30T09:01:06.209-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
 time=2026-09-30T09:01:37.636-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
 time=2026-09-30T09:01:41.964-05:00 level=WARN source=images.go:800 msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted" model=registry.ollama.ai/dimavz/whisper-tiny:latest env="OLLAMA_GO_TEMPLATE=1"
-time=2026-09-30T09:01:43.441-05:00 level=INFO source=sched.go:1152 msg="disabling mmap for llama-server load by default" model=C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e reason=windows_cuda
-time=2026-09-30T09:01:43.441-05:00 level=INFO source=server.go:100 msg="using llama-server for model" model=C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e
-time=2026-09-30T09:01:43.450-05:00 level=INFO source=llama_server.go:436 msg="starting llama-server" cmd="C:\\Users\\Nathan\\AppData\\Local\\Programs\\Ollama\\lib\\ollama\\llama-server.exe --model C:\\Users\\Nathan\\.ollama\\models\\blobs\\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e --port 64578 --host 127.0.0.1 --no-webui --offline -c 16384 -np 1 --
+time=2026-09-30T09:01:43.441-05:00 level=INFO source=sched.go:1152 msg="disabling mmap for llama-server load by default" model=C:\Users\example\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e reason=windows_cuda
+time=2026-09-30T09:01:43.441-05:00 level=INFO source=server.go:100 msg="using llama-server for model" model=C:\Users\example\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e
+time=2026-09-30T09:01:43.450-05:00 level=INFO source=llama_server.go:436 msg="starting llama-server" cmd="C:\\Users\\example\\AppData\\Local\\Programs\\Ollama\\lib\\ollama\\llama-server.exe --model C:\\Users\\example\\.ollama\\models\\blobs\\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e --port 64578 --host 127.0.0.1 --no-webui --offline -c 16384 -np 1 --
 time=2026-09-30T09:01:43.454-05:00 level=INFO source=sched.go:618 msg="system memory" total="30.9 GiB" free="2.2 GiB" free_swap="11.6 GiB"
 time=2026-09-30T09:01:43.454-05:00 level=INFO source=sched.go:625 msg="gpu memory" id=0 library=CUDA available="14.2 GiB" free="14.7 GiB" minimum="457.0 MiB" overhead="0 B"
-time=2026-09-30T09:01:43.454-05:00 level=INFO source=llama_server.go:1054 msg="loading model via llama-server" model=C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e
+time=2026-09-30T09:01:43.454-05:00 level=INFO source=llama_server.go:1054 msg="loading model via llama-server" model=C:\Users\example\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e
 time=2026-09-30T09:01:43.454-05:00 level=INFO source=llama_server.go:1307 msg="waiting for llama-server to start responding"
 time=2026-09-30T09:01:43.455-05:00 level=INFO source=llama_server.go:1362 msg="waiting for llama-server to become available" status="llm server error"
 0.00.000.737 I srv  llama_server: initializing ...
@@ -185,8 +185,8 @@ srv          init: The UI is disabled
 srv          init: Use --ui/--no-ui (or deprecated --webui/--no-webui) to enable/disable
 srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
 srv         start: binding port with default address family
-srv    load_model: loading model 'C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e'
-srv    load_model: local path 'C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e'
+srv    load_model: loading model 'C:\Users\example\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e'
+srv    load_model: local path 'C:\Users\example\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e'
 srv    load_model: [mtmd] estimated worst-case memory usage of mmproj is 1161.02 MiB (took 40.87 ms)
 cmn  common_init_: fitting params to device memory ...
 cmn  common_init_: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
@@ -199,7 +199,7 @@ common_params_fit_impl: projected to use 12525 MiB of device memory vs. 14887 Mi
 common_params_fit_impl: will leave 2361 >= 1936 MiB of free device memory, no changes needed
 common_fit_params: successfully fit params to free device memory
 common_fit_params: fitting params to free memory took 0.40 seconds
-llama_model_loader: loaded meta data with 50 key-value pairs and 866 tensors from C:\Users\Nathan\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e (version GGUF V3 (latest))
+llama_model_loader: loaded meta data with 50 key-value pairs and 866 tensors from C:\Users\example\.ollama\models\blobs\sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e (version GGUF V3 (latest))
 llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
 llama_model_loader: - kv  17:                         qwen35.block_count u32              = 65
 llama_model_loader: - kv  18:                      qwen35.context_length u32              = 262144

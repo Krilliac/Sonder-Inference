@@ -329,6 +329,24 @@ TEST_CASE("priority_preemption_admits_interactive") {
     CHECK_EQ(sched.stats().preemptions_priority, 1u);
 }
 
+TEST_CASE("priority_preemption_never_evicts_a_request_admitted_in_the_same_pass") {
+    SchedulerConfig cfg;
+    cfg.admission_watermark_blocks = 0;
+    cfg.aging_interval_us = 1'000'000'000;  // isolate the starvation guard
+    cfg.starvation_threshold_us = 5000;
+    SimClock clock;
+    FixedKvCapacity kv(8, 16);
+    Scheduler sched(cfg, clock, kv);
+    CHECK(sched.submit(spec(1, WorkloadClass::BackgroundIndexing, 60, 4)).accepted);  // 4 blocks, will starve
+    clock.advance(6000);
+    CHECK(sched.submit(spec(2, WorkloadClass::InteractiveUser, 80, 4)).accepted);  // 5 blocks, does not fit after 1
+    auto plan = step(sched, clock);
+    CHECK(std::find(plan.admitted.begin(), plan.admitted.end(), RequestId{1}) != plan.admitted.end());
+    CHECK(!was_preempted(plan, 1));
+    CHECK(plan.preempted.empty());
+    CHECK(sched.state(1) != RequestState::Preempted);
+}
+
 TEST_CASE("priority_preemption_respects_rank_gap") {
     SchedulerConfig cfg;
     cfg.admission_watermark_blocks = 0;

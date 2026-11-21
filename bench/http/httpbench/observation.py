@@ -8,6 +8,7 @@ unknown data and file truncation honestly.
 
 from __future__ import annotations
 
+import http.client
 import math
 import os
 import re
@@ -104,7 +105,7 @@ class MetricsProbe:
             return result
         except HTTPError as exc:
             return {"status": int(exc.code), "error": str(exc), "accepted_per_position": {}}
-        except (OSError, URLError, TimeoutError, ValueError) as exc:
+        except (OSError, URLError, TimeoutError, ValueError, http.client.HTTPException) as exc:
             return {"status": None, "error": str(exc), "accepted_per_position": {}}
 
 

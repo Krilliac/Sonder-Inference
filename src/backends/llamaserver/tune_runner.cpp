@@ -10,6 +10,7 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <thread>
 
 namespace sonder::inference::llamaserver::tune {
@@ -17,6 +18,46 @@ namespace {
 struct TrackedChild {
     std::atomic<std::uint32_t> pid{0};
     std::atomic<bool> launched{false};
+    // Serializes every call into the live Process (supervisor thread and the
+    // sampler) so liveness can be read without racing its stop().
+    std::mutex process_mutex;
+    Process *process = nullptr; // guarded by process_mutex; cleared before the Process dies
+    bool stopping = false;      // guarded by process_mutex
+    bool died = false;          // guarded by process_mutex; sticky
+    // True only when the child ended on its own, not through our stop().
+    [[nodiscard]] bool exited_unprompted() {
+        std::lock_guard lock(process_mutex);
+        if (!died && process && !stopping && !process->running()) died = true;
+        return died;
+    }
+};
+class TrackedProcess final : public Process {
+  public:
+    TrackedProcess(std::unique_ptr<Process> inner, std::shared_ptr<TrackedChild> child)
+        : inner_(std::move(inner)), child_(std::move(child)) {
+        std::lock_guard lock(child_->process_mutex);
+        child_->process = inner_.get();
+    }
+    ~TrackedProcess() override {
+        std::lock_guard lock(child_->process_mutex);
+        child_->process = nullptr;
+    }
+    bool running() const override {
+        std::lock_guard lock(child_->process_mutex);
+        const bool alive = inner_->running();
+        if (!alive && !child_->stopping) child_->died = true;
+        return alive;
+    }
+    void stop(std::chrono::milliseconds timeout) override {
+        std::lock_guard lock(child_->process_mutex);
+        if (!child_->stopping && !inner_->running()) child_->died = true;
+        child_->stopping = true;
+        inner_->stop(timeout);
+    }
+    std::uint32_t pid() const override { return inner_->pid(); }
+  private:
+    std::unique_ptr<Process> inner_;
+    std::shared_ptr<TrackedChild> child_;
 };
 class TrackingLauncher final : public ProcessLauncher {
   public:
@@ -27,6 +68,8 @@ class TrackingLauncher final : public ProcessLauncher {
         if (result.ok() && result.value()) {
             child_->pid.store(result.value()->pid());
             child_->launched.store(true);
+            return Result<std::unique_ptr<Process>>(
+                std::unique_ptr<Process>(new TrackedProcess(std::move(result.value()), child_)));
         }
         return result;
     }
@@ -318,7 +361,7 @@ Measurement run_candidate(const Options &o, const Candidate &candidate, Phase ph
     Supervisor supervisor(std::move(supervisor_options), std::make_unique<TrackingLauncher>(std::move(launcher), tracked));
     LogTail log(log_path, true);
     LogDiagnostics diagnostics;
-    bool sampled = false, spilled = false;
+    bool sampled = false, spilled = false, child_exited = false, vanished_after_ready = false;
     std::atomic<bool> ready{false};
     Status probe_status;
     std::string fatal_log;
@@ -332,7 +375,10 @@ Measurement run_candidate(const Options &o, const Candidate &candidate, Phase ph
         const bool complete = std::any_of(raw.value().dedicated.begin(), raw.value().dedicated.end(), matching) &&
                               std::any_of(raw.value().shared.begin(), raw.value().shared.end(), matching);
         if (!complete && ready.load()) {
-            probe_status = {ErrorCode::unavailable, "live GPU counter instances disappeared"};
+            // Crash vs probe failure is decided at verdict time: the OS frees GPU
+            // allocations before the process object is signalled, so liveness is
+            // not yet reliable here.
+            vanished_after_ready = true;
             cancellation.cancel();
         }
         if (complete) {
@@ -455,6 +501,15 @@ Measurement run_candidate(const Options &o, const Candidate &candidate, Phase ph
                 (candidate.mtp != 0 && warning.code == "mtp_tensors_ignored")) fatal_log = warning.code;
         }
     } catch (const std::exception &e) { probe_status = {ErrorCode::io_error, e.what()}; }
+    if (vanished_after_ready) {
+        // Give a crashing child a bounded window to finish teardown before
+        // calling the vanished counters a probe failure.
+        const auto settle_until = Clock::now() + std::chrono::milliseconds(2000);
+        while (!tracked->exited_unprompted() && Clock::now() < settle_until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (tracked->exited_unprompted()) child_exited = true;
+        else probe_status = {ErrorCode::unavailable, "live GPU counter instances disappeared"};
+    }
     supervisor.stop();
     const auto pid = tracked->pid.load();
     try {
@@ -473,6 +528,7 @@ Measurement run_candidate(const Options &o, const Candidate &candidate, Phase ph
     else if (result.slow_kernel) result.verdict = Verdict::slow_kernel;
     else if (!fatal_log.empty()) { result.verdict = Verdict::error; result.detail = fatal_log; }
     else if (Clock::now() >= deadline) result.verdict = Verdict::timed_out;
+    else if (child_exited) { result.verdict = Verdict::error; result.detail = "child exited after readiness"; }
     else if (!status.ok()) { result.verdict = Verdict::error; result.detail = status.message(); }
     else if (!sampled || !result.dedicated_bytes || *result.dedicated_bytes == 0) {
         result.verdict = Verdict::unsupported;

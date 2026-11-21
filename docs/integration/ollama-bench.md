@@ -136,7 +136,7 @@ The TLS item is updated to the 2026-11-20 state and says so.
   long-context case is sized for Ollama's default 4096 window.
 - **TLS only in opt-in builds.** In the default build the core HTTP client is
   plain HTTP, `https://` returns `unsupported`, and a non-loopback host needs
-  `allow_remote`. Reaching a second host's TLS worker (`https://10.0.0.2:8443`)
+  `allow_remote`. Reaching a second host's TLS worker (`https://192.0.2.10:8443`)
   needs a `-DSONDER_WITH_TLS=ON` build with verification on; see
   [tls.md](tls.md) (state as of 2026-11-20).
 - **Chat not wired into the Backend path.** `/api/chat` is in `OllamaClient`,

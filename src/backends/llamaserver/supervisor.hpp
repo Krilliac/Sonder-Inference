@@ -33,6 +33,10 @@ struct SupervisorOptions {
     std::chrono::milliseconds restart_max_backoff{2000};
     std::chrono::milliseconds shutdown_timeout{2000};
     std::size_t max_restarts = 3;
+    // A child that stayed ready at least this long before exiting clears the
+    // crash-restart count and backoff, so only consecutive short-lived runs
+    // exhaust max_restarts.
+    std::chrono::milliseconds healthy_reset_after{60000};
     // One bounded probe. The supervisor owns polling and liveness checks.
     std::function<bool(std::uint16_t, std::chrono::milliseconds)> health_check;
 

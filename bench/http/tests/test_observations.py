@@ -49,6 +49,31 @@ def test_metrics_probe_parses_labels_scientific_values_and_full_body():
         server.server_close()
 
 
+def test_metrics_probe_reports_http_protocol_errors_as_error_snapshot():
+    import socket
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+
+    def serve():
+        conn, _ = listener.accept()
+        conn.recv(4096)
+        conn.sendall(b"NOT-HTTP garbage\r\n\r\n")  # BadStatusLine (an HTTPException, not OSError)
+        conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        result = MetricsProbe(f"http://127.0.0.1:{listener.getsockname()[1]}/metrics").snapshot()
+    finally:
+        listener.close()
+        thread.join(timeout=5)
+    assert result["status"] is None
+    assert result["error"]
+    assert result["accepted_per_position"] == {}
+
+
 def test_metrics_delta_reports_new_positions_and_resets_without_negative_counts():
     assert metrics_delta(
         {"accepted_per_position": {"0": 9, "1": 3}},
