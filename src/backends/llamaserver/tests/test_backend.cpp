@@ -584,7 +584,7 @@ TEST_SUITE("llamaserver_backend") {
 
     TEST_CASE("remote plain HTTP and slot path traversal are rejected") {
         LlamaServerBackendOptions remote;
-        remote.base_url = "http://10.77.0.2:8080";
+        remote.base_url = "http://192.0.2.10:8080";
         remote.allow_remote = true;
         auto b = make_llamaserver_backend(remote);
         CHECK(b->probe().status().code() == ErrorCode::invalid_argument);

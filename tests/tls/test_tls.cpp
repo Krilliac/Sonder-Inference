@@ -45,10 +45,10 @@ TEST_CASE("backend and https URL parsing") {
     CHECK(net::kTlsCompiledIn);
     const std::string backend = net::tls_backend_name();
     CHECK((backend == "openssl" || backend == "schannel"));
-    auto u = net::parse_url("https://10.77.0.2:8443");  // parse only; never connected
+    auto u = net::parse_url("https://192.0.2.10:8443");  // parse only; never connected
     REQUIRE(u.ok());
     CHECK(u.value().scheme == "https");
-    CHECK(u.value().host == "10.77.0.2");
+    CHECK(u.value().host == "192.0.2.10");
     CHECK(u.value().port == 8443);
     auto d = net::parse_url("HTTPS://node1.invalid/base/");
     REQUIRE(d.ok());
@@ -271,7 +271,7 @@ TEST_CASE("ollama client speaks https to a loopback TLS server") {
 
 TEST_CASE("ollama https to a non-loopback host still needs allow_remote") {
     ollama::OllamaConfig cfg;
-    cfg.base_url = "https://10.77.0.2:8443";  // refused before any connection attempt
+    cfg.base_url = "https://192.0.2.10:8443";  // refused before any connection attempt
     cfg.tls.ca_bundle_path = "unused.pem";
     ollama::OllamaClient c(cfg);
     CHECK(c.version().status().code() == ErrorCode::invalid_argument);

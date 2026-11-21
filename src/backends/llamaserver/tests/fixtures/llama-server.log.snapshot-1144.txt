@@ -1,8 +1,8 @@
 [34m0.00.120.471[0m [32mI [0mcmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
 [34m0.00.124.529[0m [35mW srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
-[0m[34m0.00.134.645[0m [32mI [0msrv    load_model: loading model 'C:/Users/Nathan/.ollama/models/blobs/sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e'
+[0m[34m0.00.134.645[0m [32mI [0msrv    load_model: loading model 'C:/Users/example/.ollama/models/blobs/sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e'
 [34m0.23.532.160[0m [32mI [0mcmn          init: llama threadpool init, n_threads = 12
-[34m0.23.895.837[0m [32mI [0mcommon_speculative_init_result: creating MTP draft context against the target model 'C:/Users/Nathan/.ollama/models/blobs/sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e'
+[34m0.23.895.837[0m [32mI [0mcommon_speculative_init_result: creating MTP draft context against the target model 'C:/Users/example/.ollama/models/blobs/sha256-8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e'
 [34m0.23.946.441[0m [32mI [0msrv    load_model: initializing, n_slots = 1, n_ctx_slot = 65536, kv_unified = 'false'
 [34m0.24.190.205[0m [35mW srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
 [0m[34m0.24.191.259[0m [32mI [0msrv  llama_server: model loaded
