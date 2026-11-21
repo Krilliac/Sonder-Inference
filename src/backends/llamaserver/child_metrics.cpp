@@ -350,6 +350,7 @@ void ChildMetricsSampler::reset(std::uint16_t port) {
     scrape_failure_reported_ = false;
     previous_prompt_tokens_.reset();
     previous_predicted_tokens_.reset();
+    previous_decode_total_.reset();
 }
 
 ChildMetricsHttpResponse ChildMetricsSampler::get(const net::HttpRequest &request,
@@ -480,11 +481,15 @@ ChildMetricsSample ChildMetricsSampler::sample_at(const net::HttpRequest &metric
     const bool reset = (counters.prompt_tokens_total && previous_prompt_tokens_ &&
                         *counters.prompt_tokens_total < *previous_prompt_tokens_) ||
                        (counters.tokens_predicted_total && previous_predicted_tokens_ &&
-                        *counters.tokens_predicted_total < *previous_predicted_tokens_);
+                        *counters.tokens_predicted_total < *previous_predicted_tokens_) ||
+                       (counters.n_decode_total && previous_decode_total_ &&
+                        *counters.n_decode_total < *previous_decode_total_);
     const bool moved = (counters.prompt_tokens_total && previous_prompt_tokens_ &&
                         *counters.prompt_tokens_total > *previous_prompt_tokens_) ||
                        (counters.tokens_predicted_total && previous_predicted_tokens_ &&
-                        *counters.tokens_predicted_total > *previous_predicted_tokens_);
+                        *counters.tokens_predicted_total > *previous_predicted_tokens_) ||
+                       (counters.n_decode_total && previous_decode_total_ &&
+                        *counters.n_decode_total > *previous_decode_total_);
     if (!processing || !has_token_counter) {
         have_progress_ = false;
         stall_reported_ = false;
@@ -511,7 +516,7 @@ ChildMetricsSample ChildMetricsSampler::sample_at(const net::HttpRequest &metric
             BackendWarning warning{"backend_stalled",
                                    "warning",
                                    "child_metrics",
-                                   "child has processing requests but token counters are not moving",
+                                   "child has processing requests but token/decode counters are not moving",
                                    {},
                                    1};
             warning.details = {
@@ -527,6 +532,7 @@ ChildMetricsSample ChildMetricsSampler::sample_at(const net::HttpRequest &metric
     }
     previous_prompt_tokens_ = counters.prompt_tokens_total;
     previous_predicted_tokens_ = counters.tokens_predicted_total;
+    previous_decode_total_ = counters.n_decode_total;
     return result;
 }
 
