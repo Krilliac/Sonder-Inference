@@ -51,14 +51,14 @@ Prerequisites (2026-11-20):
 
 - CMake 3.21 or newer (`CMakePresets.json:2`) and Ninja
   (`CMakePresets.json:7`).
-- A C++20 compiler (`CMakeLists.txt:28-30`). On Windows the presets force
+- A C++20 compiler (`CMakeLists.txt:~23-25`). On Windows the presets force
   MSVC `cl` (`CMakePresets.json:18-22`), so build from an x64 Visual Studio
   developer environment, or let `scripts/build.ps1` set one up. On Linux,
   GCC or Clang.
 - Network access for the first configure: the test framework and, for
   `llamacpp`, llama.cpp are downloaded at pinned versions with SHA-256
   checks (`cmake/SonderDoctest.cmake:6-12`,
-  `src/backends/llamacpp/CMakeLists.txt:22-36`). With tests on (the
+  `src/backends/llamacpp/CMakeLists.txt:~26-31`). With tests on (the
   default), the Ollama and llamaserver tests also fetch cpp-httplib, a
   header used only to host their fake servers
   (`src/backends/ollama/tests/CMakeLists.txt:13-22`,
@@ -115,7 +115,7 @@ cmake --build --preset msvc-release
 
 `SONDER_WITH_LLAMA_CPP` is OFF by default (`CMakeLists.txt:36`). With it
 ON, llama.cpp is fetched at tag `b11195` and built as a library only
-(`src/backends/llamacpp/CMakeLists.txt:22-36`). The CPU backend is always
+(`src/backends/llamacpp/CMakeLists.txt:~26-31,62-67`). The CPU backend is always
 included. Accelerators are turned on with llama.cpp's own cache variables,
 passed on the same command line (`src/backends/llamacpp/CMakeLists.txt:~34-36`):
 
@@ -330,7 +330,7 @@ Create a token file with a random value. Pick one line:
 
 ```bash
 # Linux, macOS, Git Bash (needs openssl; output is 64 hex characters)
-umask 077 && openssl rand -hex 32 > sonder.token
+(umask 077 && openssl rand -hex 32 > sonder.token)
 ```
 
 ```powershell
@@ -377,7 +377,8 @@ curl.exe -H "Authorization: Bearer $t" http://127.0.0.1:11437/v1/sonder/health
 ```
 
 To rotate the token, write a new file and restart `serve`; the token is read
-once at startup.
+once at startup. On Windows the `icacls` step above leaves you read-only
+access, so delete the old file first (or grant yourself `(M)` instead of `(R)`).
 
 ## Run as a service
 
