@@ -211,6 +211,30 @@ TEST_CASE("child moving either counter and idle transitions clear stall evidence
     CHECK_FALSE(sampler.sample_at(1234, now + std::chrono::seconds(500)).stall);
 }
 
+TEST_CASE("child decode counter movement counts as progress for a long single generation") {
+    for (const bool decode_moves : {true, false}) {
+        std::string body;
+        ChildMetricsOptions options;
+        options.policy = "restart";
+        ChildMetricsSampler sampler(options, [&](const net::HttpRequest &request, const CancellationToken &) {
+            return ChildMetricsHttpResponse{200, request.target == "/metrics" ? body : kChildSlots};
+        });
+        const auto now = MetricsClock::now();
+        bool restarted = false;
+        bool stalled = false;
+        for (unsigned i = 0; i <= 4; ++i) {
+            body = "llamacpp:requests_processing 1\nllamacpp:prompt_tokens_total 2500\n"
+                   "llamacpp:tokens_predicted_total 1500\nllamacpp:n_decode_total " +
+                   std::to_string(decode_moves ? 1000 + 100 * i : 1000) + "\n";
+            const auto sample = sampler.sample_at(1234, now + std::chrono::seconds(80 * i));
+            restarted = restarted || sample.restart_requested;
+            stalled = stalled || sample.stall.has_value();
+        }
+        CHECK(stalled == !decode_moves);
+        CHECK(restarted == !decode_moves);
+    }
+}
+
 TEST_CASE("child scrape failures and counter reset break continuous stall evidence") {
     int status = 200;
     std::string body = kChildMetrics;

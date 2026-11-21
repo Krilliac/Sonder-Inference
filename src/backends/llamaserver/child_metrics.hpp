@@ -115,6 +115,7 @@ class ChildMetricsSampler {
     std::chrono::steady_clock::time_point detected_at_{};
     std::optional<std::uint64_t> previous_prompt_tokens_;
     std::optional<std::uint64_t> previous_predicted_tokens_;
+    std::optional<std::uint64_t> previous_decode_total_;
 };
 
 // Short integration name used by the supervisor monitor.
