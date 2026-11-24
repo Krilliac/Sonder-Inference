@@ -459,3 +459,43 @@ TEST_CASE("llamacpp wrapper: AdaptiveDraftController throttles on low acceptance
     for (int i = 0; i < 4; ++i) ctrl.Observe(ctrl.NextDraftLength(), ctrl.NextDraftLength());
     CHECK(ctrl.NextDraftLength() == 8);
 }
+
+TEST_CASE("llamacpp wrapper: NgramModTable chains across turns, enforces n_min, and resets on low streak") {
+    // Small table & match length for deterministic unit testing.
+    NgramModTable table(/*n_match=*/4, /*table_size=*/4096, /*n_min=*/6, /*n_max=*/12);
+    CHECK(table.n_match() == 4u);
+    CHECK(table.n_min() == 6u);
+    CHECK(table.n_max() == 12u);
+
+    // Turn 1 indexes a sequence of 20 tokens [100..119].
+    std::vector<Token> turn1;
+    for (Token t = 100; t < 120; ++t) turn1.push_back(t);
+    table.BeginRequest(turn1);
+    CHECK(table.used() == 16u);
+
+    // Turn 2 starts with the same 4-token seed [100, 101, 102] + id_last=103:
+    // persistent table chains 12 tokens [104..115] across requests.
+    const std::vector<Token> turn2_prompt{100, 101, 102};
+    table.BeginRequest(turn2_prompt);
+    std::vector<Token> draft;
+    table.Draft(turn2_prompt, /*id_last=*/103, /*max_draft=*/12, draft);
+    REQUIRE(draft.size() == 12u);
+    for (std::size_t i = 0; i < draft.size(); ++i) {
+        CHECK(draft[i] == static_cast<Token>(104 + i));
+    }
+
+    // Chain shorter than n_min (only 3 tokens available from seed [113,114,115]+116 -> 117,118,119) is rejected.
+    const std::vector<Token> tail_hist{113, 114, 115};
+    table.Draft(tail_hist, /*id_last=*/116, /*max_draft=*/12, draft);
+    CHECK(draft.empty());
+
+    // Five consecutive low-acceptance rounds (<25%) reset the table cleanly.
+    for (int i = 0; i < 4; ++i) {
+        table.Observe(12, 0);
+        CHECK(table.used() > 0u);
+    }
+    table.Observe(12, 0);
+    CHECK(table.used() == 0u);
+    table.Draft(turn2_prompt, /*id_last=*/103, /*max_draft=*/12, draft);
+    CHECK(draft.empty());
+}

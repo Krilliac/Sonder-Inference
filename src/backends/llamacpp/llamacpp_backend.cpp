@@ -295,44 +295,46 @@ llama_context_params MakeContextParams(const LoadOptions& options) {
 #if defined(SONDER_LLAMACPP_HAS_OP_OFFLOAD)
     cp.op_offload = true;
 #endif
-#if defined(SONDER_LLAMACPP_HAS_N_RS_SEQ)
+#if defined(SONDER_LLAMACPP_HAS_N_RS_SEQ) || defined(SONDER_LLAMACPP_HAS_N_OUTPUTS_MAX)
     uint32_t planned_draft_max = 0;
     {
         SpeculativeType spec = SpeculativeType::kNone;
         if (ParseSpeculativeType(options.spec_type, spec) && spec != SpeculativeType::kNone) {
-            uint32_t rs_need = 0;
             if (options.spec_draft_max > 0) {
-                rs_need = static_cast<uint32_t>(options.spec_draft_max);
+                planned_draft_max = static_cast<uint32_t>(options.spec_draft_max);
             } else if (spec == SpeculativeType::kDraftMtp) {
-                rs_need = static_cast<uint32_t>(kDefaultMtpDraftMax);
+                planned_draft_max = static_cast<uint32_t>(kDefaultMtpDraftMax);
+            } else if (spec == SpeculativeType::kNgramMod || spec == SpeculativeType::kAuto) {
+                planned_draft_max = static_cast<uint32_t>(kDefaultNgramModDraftMax);
             } else {
-                rs_need = static_cast<uint32_t>(kDefaultNgramDraftMax);
+                planned_draft_max = static_cast<uint32_t>(kDefaultNgramDraftMax);
             }
-            planned_draft_max = rs_need;
+#if defined(SONDER_LLAMACPP_HAS_N_RS_SEQ)
+            // Only allocate per-step GPU recurrent rollback slots (n_rs_seq) for
+            // short-horizon draft-model speculation (draft-mtp / auto). Long-horizon
+            // n-gram speculation uses zero GPU rollback slots (saving ~1.6 GiB VRAM
+            // on 27B hybrid models) and relies on on-demand PARTIAL_ONLY checkpoints.
+            uint32_t rs_need = 0;
+            if (spec == SpeculativeType::kDraftMtp) {
+                rs_need = planned_draft_max;
+            } else if (spec == SpeculativeType::kAuto) {
+                rs_need = options.spec_draft_max > 0
+                              ? std::min<uint32_t>(static_cast<uint32_t>(options.spec_draft_max), 8u)
+                              : static_cast<uint32_t>(kDefaultMtpDraftMax);
+            }
             const uint32_t n_batch_eff =
                 options.n_ctx > 0 ? std::min(options.n_batch, options.n_ctx) : options.n_batch;
             const uint32_t n_ubatch_eff = cp.n_ubatch == 0 ? n_batch_eff : std::min(n_batch_eff, cp.n_ubatch);
             if (rs_need > 0 && n_ubatch_eff > rs_need + 1u) {
                 cp.n_rs_seq = rs_need;
             }
+#endif
         }
     }
 #endif
 #if defined(SONDER_LLAMACPP_HAS_N_OUTPUTS_MAX)
     {
-        uint32_t per_seq = 1u;
-#if defined(SONDER_LLAMACPP_HAS_N_RS_SEQ)
-        per_seq = std::max<uint32_t>(1u, planned_draft_max + 1u);
-#else
-        SpeculativeType spec = SpeculativeType::kNone;
-        if (ParseSpeculativeType(options.spec_type, spec) && spec != SpeculativeType::kNone) {
-            const uint32_t dm = options.spec_draft_max > 0
-                                    ? static_cast<uint32_t>(options.spec_draft_max)
-                                    : (spec == SpeculativeType::kDraftMtp ? static_cast<uint32_t>(kDefaultMtpDraftMax)
-                                                                          : static_cast<uint32_t>(kDefaultNgramDraftMax));
-            per_seq = std::max<uint32_t>(1u, dm + 1u);
-        }
-#endif
+        const uint32_t per_seq = std::max<uint32_t>(1u, planned_draft_max + 1u);
         cp.n_outputs_max_per_seq = per_seq;
         cp.n_outputs_max = std::min<uint32_t>(cp.n_batch, cp.n_seq_max * per_seq);
     }
@@ -438,11 +440,13 @@ struct LlamaCppBackend::Impl {
         std::vector<std::uint8_t> tgt_state;
         std::vector<float> pending_h;
     };
-    static constexpr std::size_t kMaxCheckpointsPerSlot = 6;
-    static constexpr std::size_t kMaxPartialCheckpointBytes = std::size_t{64} << 20;
+    static constexpr std::size_t kMaxCheckpointsPerSlot = 3;
+    static constexpr std::size_t kMaxPartialCheckpointBytes = std::size_t{256} << 20;
 
     std::vector<PrefixSlotMeta> slots;
     std::vector<std::vector<PartialCheckpoint>> slot_checkpoints;
+    std::vector<std::uint8_t> spec_ckpt_buf;
+    std::size_t spec_ckpt_size = 0;
     std::uint64_t slot_clock = 0;
 
     // Isolated lazy embedding context so Embed() never disturbs live KV prefix
@@ -456,6 +460,7 @@ struct LlamaCppBackend::Impl {
     SpeculativeType active_spec = SpeculativeType::kNone;
     std::int32_t active_draft_max = 0;
     NgramMatcher ngram_matcher{false};
+    std::unique_ptr<NgramModTable> ngram_mod;
     std::vector<Token> draft_scratch;
     std::vector<Token> accepted_scratch;
     std::vector<Token> ngram_history;
@@ -579,9 +584,12 @@ struct LlamaCppBackend::Impl {
         vocab = nullptr;
         slots.clear();
         slot_checkpoints.clear();
+        spec_ckpt_buf.clear();
+        spec_ckpt_size = 0;
         slot_clock = 0;
         active_spec = SpeculativeType::kNone;
         active_draft_max = 0;
+        ngram_mod.reset();
     }
 
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
@@ -1281,9 +1289,19 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
                 impl_->active_draft_max = std::min(impl_->active_draft_max, impl_->mtp_n_layers);
             }
 #endif
-        } else if (impl_->active_spec == SpeculativeType::kNgram || impl_->active_spec == SpeculativeType::kNgramMod) {
+        } else if (impl_->active_spec == SpeculativeType::kNgramMod) {
+            impl_->active_draft_max = options.spec_draft_max > 0 ? options.spec_draft_max : kDefaultNgramModDraftMax;
+            const std::size_t min_draft =
+                options.spec_draft_max > 0
+                    ? std::min<std::size_t>(NgramModTable::kDefaultMinDraft,
+                                            static_cast<std::size_t>(impl_->active_draft_max))
+                    : NgramModTable::kDefaultMinDraft;
+            impl_->ngram_mod = std::make_unique<NgramModTable>(NgramModTable::kDefaultMatchLen,
+                                                               NgramModTable::kDefaultTableSize, min_draft,
+                                                               static_cast<std::size_t>(impl_->active_draft_max));
+        } else if (impl_->active_spec == SpeculativeType::kNgram) {
             impl_->active_draft_max = options.spec_draft_max > 0 ? options.spec_draft_max : kDefaultNgramDraftMax;
-            impl_->ngram_matcher = NgramMatcher(/*exact_scan_fallback=*/impl_->active_spec == SpeculativeType::kNgram);
+            impl_->ngram_matcher = NgramMatcher(/*exact_scan_fallback=*/true);
         } else {
             impl_->active_draft_max = 0;
         }
@@ -1887,36 +1905,48 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
 #else
     bool use_mtp = false;
 #endif
-    bool use_ngram = !use_mtp && (impl_->active_spec == SpeculativeType::kNgram ||
-                                  impl_->active_spec == SpeculativeType::kNgramMod) &&
-                     impl_->active_draft_max > 0;
+    bool use_ngram_mod =
+        !use_mtp && (impl_->active_spec == SpeculativeType::kNgramMod) && (impl_->ngram_mod != nullptr) &&
+        impl_->active_draft_max > 0;
+    bool use_ngram_short = !use_mtp && (impl_->active_spec == SpeculativeType::kNgram) && impl_->active_draft_max > 0;
+    bool use_ngram = use_ngram_mod || use_ngram_short;
     if (impl_->architecture == sonder::inference::ModelArchitecture::recurrent) {
         use_mtp = false;
+        use_ngram_mod = false;
+        use_ngram_short = false;
         use_ngram = false;
     }
+    uint32_t rs_cap = 0;
 #if defined(SONDER_LLAMACPP_HAS_N_RS_SEQ)
-    // On hybrid (attention + recurrent/SSM) models, speculative rollback requires
-    // recurrent-state rollback slots (n_rs_seq > 0). Clamp draft length to n_rs_seq
-    // or disable speculation cleanly if rollback slots were not allocated.
-    int32_t effective_draft_max = impl_->active_draft_max;
     if (impl_->architecture == sonder::inference::ModelArchitecture::hybrid) {
-        const uint32_t rs_cap = llama_n_rs_seq(ctx);
-        if (rs_cap == 0) {
-            use_mtp = false;
-            use_ngram = false;
-            effective_draft_max = 0;
-        } else {
-            effective_draft_max = std::min<int32_t>(effective_draft_max, static_cast<int32_t>(rs_cap));
-        }
-    }
-#else
-    int32_t effective_draft_max = impl_->active_draft_max;
-    if (impl_->architecture == sonder::inference::ModelArchitecture::hybrid) {
-        use_mtp = false;
-        use_ngram = false;
-        effective_draft_max = 0;
+        rs_cap = llama_n_rs_seq(ctx);
     }
 #endif
+#if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
+    const bool can_hybrid_spec_ckpt =
+        (impl_->architecture == sonder::inference::ModelArchitecture::hybrid) &&
+        (Impl::PartialCheckpointFlags() != 0);
+#else
+    const bool can_hybrid_spec_ckpt = false;
+#endif
+    int32_t effective_draft_max = impl_->active_draft_max;
+    if (impl_->architecture == sonder::inference::ModelArchitecture::hybrid) {
+        if (use_mtp) {
+            if (rs_cap == 0) {
+                use_mtp = false;
+                effective_draft_max = 0;
+            } else {
+                effective_draft_max = std::min<int32_t>(effective_draft_max, static_cast<int32_t>(rs_cap));
+            }
+        } else if (use_ngram) {
+            if (rs_cap == 0 && !can_hybrid_spec_ckpt) {
+                use_ngram = false;
+                use_ngram_mod = false;
+                use_ngram_short = false;
+                effective_draft_max = 0;
+            }
+        }
+    }
 
     // Bind GPU backend sampling when supported (avoids copying full vocab logits
     // across PCIe on every decode & verification step). Disabled when a grammar
@@ -2092,10 +2122,14 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
     // ---- Streaming decode (with optional in-process speculation) ----
     Utf8StreamBuffer utf8;
     int64_t pos = cur_pos;
+    std::size_t ngram_indexed = 0;
     const auto decode_start = Clock::now();
     auto finish = [&](StopReason reason) {
         result.stop_reason = reason;
         result.decode_ms = MsSince(decode_start);
+        if (use_ngram_mod && impl_->ngram_mod != nullptr && reason != StopReason::kError) {
+            ngram_indexed = impl_->ngram_mod->IndexRange(impl_->ngram_history, ngram_indexed, impl_->ngram_history.size());
+        }
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
         if (want_hybrid_prefix_ckpt && reason != StopReason::kError && reason != StopReason::kCancelled &&
             slot_idx < impl_->slots.size() && !impl_->slots[slot_idx].tokens.empty()) {
@@ -2147,8 +2181,13 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
 
     // Initialize n-gram index over prompt tokens when n-gram speculation is active.
     AdaptiveDraftController adaptive_ctrl(effective_draft_max);
-    std::size_t ngram_indexed = 0;
-    if (use_ngram) {
+    if (use_ngram_mod && impl_->ngram_mod != nullptr) {
+        impl_->ngram_history.assign(request.prompt.begin(), request.prompt.end());
+        impl_->ngram_mod->BeginRequest(impl_->ngram_history);
+        ngram_indexed = impl_->ngram_history.size() > impl_->ngram_mod->n_match()
+                            ? impl_->ngram_history.size() - impl_->ngram_mod->n_match()
+                            : 0;
+    } else if (use_ngram_short) {
         impl_->ngram_matcher.Reset();
         impl_->ngram_history.assign(request.prompt.begin(), request.prompt.end());
         impl_->ngram_matcher.IndexRange(impl_->ngram_history, 0, impl_->ngram_history.size());
@@ -2174,7 +2213,16 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
                 impl_->MtpDraft(slot_id, cur_tok, pos, k_lim, draft_tokens);
             } else
 #endif
-            if (use_ngram) {
+            if (use_ngram_mod && impl_->ngram_mod != nullptr) {
+                const auto k_lim = static_cast<std::size_t>(std::min<int64_t>(max_k, effective_draft_max));
+                impl_->ngram_mod->Draft(impl_->ngram_history, cur_tok, k_lim, draft_tokens);
+                for (std::size_t j = 0; j < draft_tokens.size(); ++j) {
+                    if (llama_vocab_is_eog(impl_->vocab, draft_tokens[j])) {
+                        draft_tokens.resize(j + 1);
+                        break;
+                    }
+                }
+            } else if (use_ngram_short) {
                 const int32_t ctrl_len = adaptive_ctrl.NextDraftLength();
                 if (ctrl_len > 0) {
                     // Append cur_tok to history for lookup, then index cur_tok after lookup.
@@ -2195,6 +2243,33 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
             }
         }
 
+        // On hybrid models whose recurrent rollback window `rs_cap` is smaller than
+        // the proposed draft (e.g. ngram-mod with n_rs_seq == 0), take a lightweight
+        // PARTIAL_ONLY checkpoint before verification so partial acceptance rolls
+        // back cleanly without reserving per-step GPU rollback slots.
+        bool have_spec_ckpt = false;
+#if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
+        if (!draft_tokens.empty() && impl_->architecture == sonder::inference::ModelArchitecture::hybrid &&
+            draft_tokens.size() > static_cast<std::size_t>(rs_cap)) {
+            const llama_state_seq_flags flags = Impl::PartialCheckpointFlags();
+            const std::size_t sz = flags != 0 ? llama_state_seq_get_size_ext(ctx, slot_id, flags) : 0;
+            if (sz > 0 && sz <= Impl::kMaxPartialCheckpointBytes) {
+                if (impl_->spec_ckpt_buf.size() < sz) {
+                    impl_->spec_ckpt_buf.resize(sz);
+                }
+                const std::size_t written =
+                    llama_state_seq_get_data_ext(ctx, impl_->spec_ckpt_buf.data(), sz, slot_id, flags);
+                if (written > 0) {
+                    impl_->spec_ckpt_size = written;
+                    have_spec_ckpt = true;
+                }
+            }
+            if (!have_spec_ckpt) {
+                draft_tokens.clear();
+            }
+        }
+#endif
+
         // Build ONE verification batch: [cur_tok, draft_0, ..., draft_{k-1}].
         BatchClear(impl_->batch);
         BatchAdd(impl_->batch, cur_tok, static_cast<llama_pos>(pos), slot_id, /*logits=*/true);
@@ -2204,16 +2279,19 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
         }
 
         const int32_t rc = llama_decode(ctx, impl_->batch);
-        if (rc == 2) {
-            llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
-            return finish(StopReason::kCancelled);
-        }
-        if (rc == 1) {
-            llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
-            return finish(StopReason::kContextFull);
-        }
         if (rc != 0) {
-            llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
+            if (!llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1)) {
+#if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
+                if (have_spec_ckpt) {
+                    const llama_state_seq_flags flags = Impl::PartialCheckpointFlags();
+                    (void)llama_state_seq_set_data_ext(ctx, impl_->spec_ckpt_buf.data(), impl_->spec_ckpt_size, slot_id,
+                                                       flags);
+                    (void)llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
+                }
+#endif
+            }
+            if (rc == 2) return finish(StopReason::kCancelled);
+            if (rc == 1) return finish(StopReason::kContextFull);
             result.status =
                 Status::Error(ErrorCode::kDecodeFailed, "llama_decode failed (rc=" + std::to_string(rc) + ")");
             return finish(StopReason::kError);
@@ -2231,7 +2309,11 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
             if (slot_idx < impl_->slots.size()) {
                 impl_->slots[slot_idx].tokens.push_back(cur_tok);
             }
-            if (use_ngram) {
+            if (use_ngram_mod && impl_->ngram_mod != nullptr) {
+                impl_->ngram_history.push_back(cur_tok);
+                ngram_indexed =
+                    impl_->ngram_mod->IndexRange(impl_->ngram_history, ngram_indexed, impl_->ngram_history.size());
+            } else if (use_ngram_short) {
                 impl_->ngram_history.push_back(cur_tok);
                 impl_->ngram_matcher.IndexRange(impl_->ngram_history, ngram_indexed, impl_->ngram_history.size());
                 ngram_indexed = impl_->ngram_history.size();
@@ -2248,7 +2330,10 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
             }
             if (!keep_going) return finish(StopReason::kCancelled);
             impl_->Emit(TelemetryKind::kTokenDecoded, 1, MsSince(step_start));
-            if (result.generated_tokens >= request.max_new_tokens) return finish(StopReason::kMaxTokens);
+            if (result.generated_tokens >= request.max_new_tokens) {
+                if (use_ngram_mod) impl_->ngram_history.push_back(next_tok);
+                return finish(StopReason::kMaxTokens);
+            }
             if (pos >= n_ctx) return finish(StopReason::kContextFull);
             cur_tok = next_tok;
             continue;
@@ -2256,6 +2341,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
 
         // Speculative verification: sample from indices 0..k and accept matched prefix + 1 bonus token.
         const std::size_t k = draft_tokens.size();
+        const Token step_base_tok = cur_tok;
         result.draft_tokens += static_cast<std::int32_t>(k);
         accepted_tokens.clear();
         std::size_t n_accepted = 0;
@@ -2273,16 +2359,18 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
             accepted_tokens.push_back(bonus);
         }
         result.draft_accepted_tokens += static_cast<std::int32_t>(n_accepted);
-        if (use_ngram) {
+        if (use_ngram_mod && impl_->ngram_mod != nullptr) {
+            impl_->ngram_mod->Observe(k, n_accepted);
+        } else if (use_ngram_short) {
             adaptive_ctrl.Observe(static_cast<std::int32_t>(k), static_cast<std::int32_t>(n_accepted));
         }
 
         // Commit `cur_tok` (at `pos`), then emit each verified token + bonus token.
         if (slot_idx < impl_->slots.size()) {
-            impl_->slots[slot_idx].tokens.push_back(cur_tok);
+            impl_->slots[slot_idx].tokens.push_back(step_base_tok);
         }
         if (use_ngram) {
-            impl_->ngram_history.push_back(cur_tok);
+            impl_->ngram_history.push_back(step_base_tok);
         }
         int64_t new_pos = pos + 1;
         std::size_t committed_drafts = 0;
@@ -2293,12 +2381,36 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
                 llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
                 return false;
             }
-#else
-            (void)keep_drafts;
 #endif
             const int64_t batch_end_pos = pos + 1 + static_cast<int64_t>(k);
             if (keep_pos < batch_end_pos) {
                 if (!llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(keep_pos), -1)) {
+#if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
+                    if (have_spec_ckpt) {
+                        const llama_state_seq_flags flags = Impl::PartialCheckpointFlags();
+                        const std::size_t read = llama_state_seq_set_data_ext(ctx, impl_->spec_ckpt_buf.data(),
+                                                                              impl_->spec_ckpt_size, slot_id, flags);
+                        if (read == 0 || !llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1)) {
+                            return false;
+                        }
+                        // Replay only the 1 + keep_drafts accepted tokens (logits=false since
+                        // all accepted + bonus tokens have already been sampled).
+                        BatchClear(impl_->batch);
+                        BatchAdd(impl_->batch, step_base_tok, static_cast<llama_pos>(pos), slot_id, /*logits=*/false);
+                        for (std::size_t j = 0; j < keep_drafts; ++j) {
+                            BatchAdd(impl_->batch, draft_tokens[j],
+                                     static_cast<llama_pos>(pos + 1 + static_cast<int64_t>(j)), slot_id,
+                                     /*logits=*/false);
+                        }
+                        if (llama_decode(ctx, impl_->batch) != 0) {
+                            return false;
+                        }
+                        return true;
+                    }
+#else
+                    (void)step_base_tok;
+                    (void)keep_drafts;
+#endif
                     return false;
                 }
             }
@@ -2336,6 +2448,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
                 return finish(StopReason::kCancelled);
             }
             if (result.generated_tokens >= request.max_new_tokens) {
+                if (is_bonus && use_ngram_mod) impl_->ngram_history.push_back(tok);
                 (void)rollback_rejected(new_pos, committed_drafts);
                 impl_->Emit(TelemetryKind::kTokenDecoded, static_cast<std::int32_t>(m + 1), MsSince(step_start));
                 return finish(StopReason::kMaxTokens);
@@ -2349,7 +2462,10 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
             result.status = Status::Error(ErrorCode::kDecodeFailed, "failed to trim rejected speculative KV tail");
             return finish(StopReason::kError);
         }
-        if (use_ngram) {
+        if (use_ngram_mod && impl_->ngram_mod != nullptr) {
+            ngram_indexed =
+                impl_->ngram_mod->IndexRange(impl_->ngram_history, ngram_indexed, impl_->ngram_history.size());
+        } else if (use_ngram_short) {
             impl_->ngram_matcher.IndexRange(impl_->ngram_history, ngram_indexed, impl_->ngram_history.size());
             ngram_indexed = impl_->ngram_history.size();
         }

@@ -546,6 +546,136 @@ void NgramMatcher::Draft(std::span<const Token> history, std::size_t max_draft, 
     }
 }
 
+namespace {
+
+std::size_t RoundUpPow2(std::size_t v) noexcept {
+    if (v <= 1024) return 1024;
+    std::size_t p = 1024;
+    while (p < v && p <= (std::size_t{1} << 26)) {
+        p <<= 1;
+    }
+    return p;
+}
+
+}  // namespace
+
+NgramModTable::NgramModTable(std::size_t n_match, std::size_t table_size, std::size_t n_min, std::size_t n_max)
+    : n_match_(std::max<std::size_t>(1, n_match)) {
+    const std::size_t cap = RoundUpPow2(table_size);
+    table_mask_ = cap - 1;
+    entries_.assign(cap, kEmpty);
+    Configure(n_min, n_max);
+}
+
+void NgramModTable::Configure(std::size_t n_min, std::size_t n_max) {
+    n_max_ = std::clamp<std::size_t>(n_max, 1, static_cast<std::size_t>(kMaxSpecDraftTokens));
+    n_min_ = std::min<std::size_t>(n_min, n_max_);
+    n_cur_ = n_max_;
+}
+
+void NgramModTable::Reset() {
+    std::fill(entries_.begin(), entries_.end(), kEmpty);
+    used_ = 0;
+    low_streak_ = 0;
+}
+
+std::size_t NgramModTable::IndexOf(const Token* tokens) const noexcept {
+    std::uint64_t h = 0;
+    for (std::size_t i = 0; i < n_match_; ++i) {
+        h = h * 6364136223846793005ULL + static_cast<std::uint64_t>(static_cast<std::uint32_t>(tokens[i]));
+    }
+    return static_cast<std::size_t>(h) & table_mask_;
+}
+
+void NgramModTable::Add(const Token* tokens) noexcept {
+    const std::size_t i = IndexOf(tokens);
+    if (entries_[i] == kEmpty) {
+        ++used_;
+    }
+    entries_[i] = tokens[n_match_];
+}
+
+Token NgramModTable::Get(const Token* tokens) const noexcept {
+    return entries_[IndexOf(tokens)];
+}
+
+std::size_t NgramModTable::IndexRange(std::span<const Token> history, std::size_t from_index, std::size_t to_index) {
+    if (entries_.empty() || history.size() <= n_match_) return from_index;
+    const std::size_t max_start = history.size() - n_match_;
+    const std::size_t end = std::min(to_index, max_start);
+    for (std::size_t i = from_index; i < end; ++i) {
+        Add(history.data() + i);
+    }
+    return std::max(from_index, end);
+}
+
+void NgramModTable::BeginRequest(std::span<const Token> prompt) {
+    n_cur_ = n_max_;
+    low_streak_ = 0;
+    if (entries_.empty()) return;
+    // Reset only if occupancy exceeds 25% (preserves cross-request n-grams across turns).
+    if (used_ * 4 > entries_.size()) {
+        Reset();
+    }
+    (void)IndexRange(prompt, 0, prompt.size());
+}
+
+void NgramModTable::Draft(std::span<const Token> history, Token id_last, std::size_t max_draft,
+                          std::vector<Token>& out) const {
+    out.clear();
+    if (entries_.empty() || max_draft == 0) return;
+    if (history.size() + 1 < n_match_) return;
+
+    const std::size_t limit = std::min(max_draft, n_max_);
+    const std::size_t min_req = std::min(n_min_, limit);
+    scratch_.resize(n_match_ + limit);
+    const std::size_t prefix_keep = n_match_ - 1;
+    const std::size_t base = history.size() - prefix_keep;
+    for (std::size_t i = 0; i < prefix_keep; ++i) {
+        scratch_[i] = history[base + i];
+    }
+    scratch_[prefix_keep] = id_last;
+
+    std::size_t chained = 0;
+    for (std::size_t i = 0; i < limit; ++i) {
+        const Token tok = Get(scratch_.data() + i);
+        if (tok == kEmpty) {
+            if (i < min_req) {
+                return;
+            }
+            break;
+        }
+        scratch_[n_match_ + i] = tok;
+        ++chained;
+    }
+    if (chained < min_req) {
+        return;
+    }
+
+    const std::size_t emit = (n_cur_ > 0 && chained > n_cur_) ? n_cur_ : chained;
+    out.assign(scratch_.begin() + static_cast<std::ptrdiff_t>(n_match_),
+               scratch_.begin() + static_cast<std::ptrdiff_t>(n_match_ + emit));
+}
+
+void NgramModTable::Observe(std::size_t drafted, std::size_t accepted) {
+    if (drafted == 0) return;
+    const std::size_t floor_len = std::min<std::size_t>(32, n_max_);
+    if (accepted >= drafted) {
+        n_cur_ = std::min<std::size_t>(n_cur_ * 2, n_max_);
+    } else {
+        n_cur_ = std::max<std::size_t>(floor_len, n_cur_ / 2);
+    }
+
+    if (accepted * 4 < drafted) {
+        ++low_streak_;
+        if (low_streak_ >= 5) {
+            Reset();
+        }
+    } else {
+        low_streak_ = 0;
+    }
+}
+
 AdaptiveDraftController::AdaptiveDraftController(std::int32_t max_draft) { Reset(max_draft); }
 
 void AdaptiveDraftController::Reset(std::int32_t max_draft) {

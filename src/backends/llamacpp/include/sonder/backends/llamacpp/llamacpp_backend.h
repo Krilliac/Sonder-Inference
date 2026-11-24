@@ -100,6 +100,7 @@ inline constexpr std::uint32_t kMaxSlots = 16;
 // Maximum draft tokens per speculative step and per-strategy defaults.
 inline constexpr std::int32_t kMaxSpecDraftTokens = 64;
 inline constexpr std::int32_t kDefaultNgramDraftMax = 8;
+inline constexpr std::int32_t kDefaultNgramModDraftMax = 64;
 inline constexpr std::int32_t kDefaultMtpDraftMax = 3;
 
 [[nodiscard]] std::string_view ToString(KvCacheType type) noexcept;
@@ -519,6 +520,60 @@ private:
     bool exact_scan_fallback_ = false;
     std::vector<std::int32_t> pos4_;
     std::vector<std::int32_t> pos3_;
+};
+
+// Persistent O(1) modular-hash n-gram table for `ngram-mod` self-speculation
+// (matches PrismML / llama.cpp common_ngram_mod: 4M flat entries = 16 MiB RAM,
+// n_match = 24, n_min = 48, n_max = 64, cross-request persistence with
+// occupancy and low-acceptance streak reset, plus adaptive draft length).
+class NgramModTable {
+public:
+    static constexpr Token kEmpty = -1;
+    static constexpr std::size_t kDefaultTableSize = std::size_t{4} << 20;  // 4M entries (16 MiB)
+    static constexpr std::size_t kDefaultMatchLen = 24;
+    static constexpr std::size_t kDefaultMinDraft = 48;
+    static constexpr std::size_t kDefaultMaxDraft = static_cast<std::size_t>(kDefaultNgramModDraftMax);
+
+    explicit NgramModTable(std::size_t n_match = kDefaultMatchLen, std::size_t table_size = kDefaultTableSize,
+                           std::size_t n_min = kDefaultMinDraft, std::size_t n_max = kDefaultMaxDraft);
+
+    void Configure(std::size_t n_min, std::size_t n_max);
+    void Reset();
+
+    // Indexes prompt tokens into the persistent table and resets per-request
+    // adaptive state. Resets the table only if occupancy exceeds 25%.
+    void BeginRequest(std::span<const Token> prompt);
+    // Indexes all n-gram windows whose start position lies in [from_index, to_index)
+    // and whose next-token target lies inside `history`. Returns the next start index.
+    std::size_t IndexRange(std::span<const Token> history, std::size_t from_index, std::size_t to_index);
+    // Chains up to `min(max_draft, n_max)` tokens starting from the trailing
+    // `n_match - 1` tokens of `history` plus `id_last`. Returns empty if fewer
+    // than `min(n_min, max_draft)` tokens chain from the table.
+    void Draft(std::span<const Token> history, Token id_last, std::size_t max_draft, std::vector<Token>& out) const;
+    // Updates adaptive draft length and low-acceptance streak guard.
+    void Observe(std::size_t drafted, std::size_t accepted);
+
+    [[nodiscard]] std::size_t n_match() const noexcept { return n_match_; }
+    [[nodiscard]] std::size_t n_min() const noexcept { return n_min_; }
+    [[nodiscard]] std::size_t n_max() const noexcept { return n_max_; }
+    [[nodiscard]] std::size_t current_draft_cap() const noexcept { return n_cur_; }
+    [[nodiscard]] std::size_t used() const noexcept { return used_; }
+    [[nodiscard]] std::size_t size() const noexcept { return entries_.size(); }
+
+private:
+    [[nodiscard]] std::size_t IndexOf(const Token* tokens) const noexcept;
+    void Add(const Token* tokens) noexcept;
+    [[nodiscard]] Token Get(const Token* tokens) const noexcept;
+
+    std::size_t n_match_ = kDefaultMatchLen;
+    std::size_t n_min_ = kDefaultMinDraft;
+    std::size_t n_max_ = kDefaultMaxDraft;
+    std::size_t n_cur_ = kDefaultMaxDraft;
+    std::size_t used_ = 0;
+    std::size_t table_mask_ = 0;
+    int low_streak_ = 0;
+    std::vector<Token> entries_;
+    mutable std::vector<Token> scratch_;
 };
 
 // Adaptive speculative draft-length controller for n-gram self-speculation.
