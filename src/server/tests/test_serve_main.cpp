@@ -453,6 +453,64 @@ TEST_CASE("serve_main: llama.cpp context flags are refused for every other backe
     }
 }
 
+TEST_CASE("serve_main: direct llamacpp performance CLI flags parse, validate and reject other backends") {
+    std::string out;
+    std::string err;
+    CHECK(run({"--help"}, out, err) == 0);
+    for (const char* flag : {"--threads", "--no-mmap", "--no-kv-unified", "--no-prefix-cache", "--slots",
+                             "--spec-type", "--spec-draft-max"}) {
+        CAPTURE(flag);
+        CHECK(out.find(flag) != std::string::npos);
+    }
+
+    // Valid flags populate BackendSetup for llamacpp.
+    det::ServeCliConfig cfg;
+    const int rc = build_cli({"--backend", "llamacpp", "--model", "x", "--threads", "12", "--no-mmap",
+                              "--no-kv-unified", "--no-prefix-cache", "--slots", "4", "--spec-type", "ngram-mod",
+                              "--spec-draft-max", "8", "--max-connections", "0"},
+                             cfg, err);
+    CHECK(rc == 2);
+    CHECK(err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+    CHECK(cfg.options.backend.llamacpp_threads == std::optional<std::int32_t>(12));
+    CHECK(cfg.options.backend.llamacpp_use_mmap == std::optional<bool>(false));
+    CHECK(cfg.options.backend.llamacpp_kv_unified == std::optional<bool>(false));
+    CHECK(cfg.options.backend.llamacpp_prefix_cache == std::optional<bool>(false));
+    CHECK(cfg.options.backend.llamacpp_slots == std::optional<std::uint32_t>(4u));
+    CHECK(cfg.options.backend.llamacpp_spec_type == std::optional<std::string>("ngram-mod"));
+    CHECK(cfg.options.backend.llamacpp_spec_draft_max == std::optional<std::int32_t>(8));
+
+    // Out-of-range / invalid values are usage errors.
+    for (const auto& args : std::vector<std::vector<std::string>>{
+             {"--backend", "llamacpp", "--model", "x", "--threads", "0"},
+             {"--backend", "llamacpp", "--model", "x", "--threads", "257"},
+             {"--backend", "llamacpp", "--model", "x", "--slots", "0"},
+             {"--backend", "llamacpp", "--model", "x", "--slots", "17"},
+             {"--backend", "llamacpp", "--model", "x", "--spec-type", "bogus"},
+             {"--backend", "llamacpp", "--model", "x", "--spec-draft-max", "65"},
+             {"--backend", "llamacpp", "--model", "x", "--no-mmap=1"},
+             {"--backend", "llamacpp", "--model", "x", "--no-kv-unified=1"},
+             {"--backend", "llamacpp", "--model", "x", "--no-prefix-cache=1"},
+         }) {
+        CAPTURE(args.back());
+        CHECK(run(args, out, err) == 2);
+        CHECK(err.find("error:") != std::string::npos);
+    }
+
+    // Refused on non-llamacpp backends.
+    for (const auto& args : std::vector<std::vector<std::string>>{
+             {"--backend", "mock", "--threads", "4", "--max-connections", "0"},
+             {"--backend", "mock", "--no-mmap", "--max-connections", "0"},
+             {"--backend", "mock", "--no-kv-unified", "--max-connections", "0"},
+             {"--backend", "mock", "--no-prefix-cache", "--max-connections", "0"},
+             {"--backend", "mock", "--slots", "2", "--max-connections", "0"},
+             {"--backend", "mock", "--spec-type", "auto", "--max-connections", "0"},
+             {"--backend", "mock", "--spec-draft-max", "4", "--max-connections", "0"},
+         }) {
+        CHECK(run(args, out, err) == 2);
+        CHECK(err.find("applies only to --backend llamacpp") != std::string::npos);
+    }
+}
+
 TEST_CASE("serve_main: ready file, banner, access log and graceful shutdown via the hook") {
     const auto ready = temp_path("ready.json");
     const auto events = temp_path("events.jsonl");

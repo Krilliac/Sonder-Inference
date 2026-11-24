@@ -44,6 +44,13 @@ Result<LlamaCppBackendOptions> llamacpp_options(const BackendSetup& setup) {
     if (setup.llamacpp_kv_cache_type_k) lo.kv_cache_type_k = *setup.llamacpp_kv_cache_type_k;
     if (setup.llamacpp_kv_cache_type_v) lo.kv_cache_type_v = *setup.llamacpp_kv_cache_type_v;
     if (setup.llamacpp_flash_attention) lo.flash_attention = *setup.llamacpp_flash_attention;
+    if (setup.llamacpp_threads) lo.threads = *setup.llamacpp_threads;
+    if (setup.llamacpp_use_mmap) lo.use_mmap = *setup.llamacpp_use_mmap;
+    if (setup.llamacpp_kv_unified) lo.kv_unified = *setup.llamacpp_kv_unified;
+    if (setup.llamacpp_prefix_cache) lo.prefix_cache = *setup.llamacpp_prefix_cache;
+    if (setup.llamacpp_slots) lo.slots = *setup.llamacpp_slots;
+    if (setup.llamacpp_spec_type) lo.spec_type = *setup.llamacpp_spec_type;
+    if (setup.llamacpp_spec_draft_max) lo.spec_draft_max = *setup.llamacpp_spec_draft_max;
     for (const std::string& spec : setup.llamacpp_tensor_overrides) {
         auto parsed = parse_tensor_override(spec);
         if (!parsed) return parsed.status();

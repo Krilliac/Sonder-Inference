@@ -8,7 +8,7 @@
 // Available when the build defines SONDER_HAS_SERVER (module src/server).
 // The server is written in-house over POSIX sockets / Winsock: no TLS (put a
 // TLS-terminating proxy in front for remote use), one thread per connection,
-// Connection: close on every response.
+// bounded HTTP/1.1 keep-alive (configurable via ServerOptions).
 #pragma once
 
 #include <chrono>
@@ -98,6 +98,10 @@ struct ServerOptions {
     std::chrono::milliseconds shutdown_grace{5000};         // in-flight requests on stop()
     std::chrono::milliseconds heartbeat_interval{15000};    // idle telemetry streams
     std::chrono::milliseconds write_stall_timeout{60000};   // peer not reading at all
+    // Bounded HTTP/1.1 persistent connections (keep-alive).
+    bool keep_alive = true;
+    std::chrono::milliseconds keep_alive_timeout{15000};
+    std::size_t max_keep_alive_requests = 256;
 
     // Telemetry. The live hub is always attached; `extra_sinks` (e.g. the
     // --telemetry JSONL file) receive the same events.

@@ -49,8 +49,11 @@ enum class Route {
     sonder_node,
     sonder_plan,
     chat,
+    completions,
     messages,
     embeddings,
+    tokenize,
+    detokenize,
     discovery,
     telemetry,
     telemetry_sse,
@@ -90,11 +93,15 @@ double seconds_since(std::chrono::steady_clock::time_point t);
 struct ConnFlags {
     std::atomic<bool> done{false};
     std::atomic<bool> streaming{false};  // telemetry stream: no engine access
-    // Still reading the request head: nothing authenticated has happened yet,
-    // so the connection may be evicted when the server is at its limit.
+    // Still reading the request head (or idle between keep-alive requests):
+    // nothing active is in flight, so the connection may be evicted when the
+    // server is at its limit.
     std::atomic<bool> in_head{true};
-    std::atomic<bool> evict{false};  // set by the accept thread; read_head gives up
-    std::chrono::steady_clock::time_point accepted_at = std::chrono::steady_clock::now();
+    std::atomic<bool> evict{false};  // set by the accept thread; read_head / idle wait gives up
+    std::atomic<std::int64_t> head_started_ns{
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count()};
 };
 
 // A connection still sending its request head after this long may be evicted
@@ -115,7 +122,15 @@ struct Exchange {
     // Request bytes the client may still be sending when the response goes
     // out (an unread body): the connection lingers to drain them.
     std::uint64_t unread_input = 0;
+    // Keep-alive state for this exchange (controls Connection / Keep-Alive headers).
+    bool keep_alive = false;
+    std::chrono::milliseconds keep_alive_timeout{0};
+    std::size_t keep_alive_remaining = 0;
+    bool write_failed = false;
 };
+
+// True when any Connection header token (case-insensitive, comma-separated) is "close".
+bool client_wants_close(const RequestHead& head);
 
 // Backend reachability, refreshed off the request path (health and identity
 // only read it). Shared with the refresher thread, which may outlive the
