@@ -8,6 +8,7 @@ namespace sonder::inference::llamaserver::tune {
 struct ModelInfo {
     ModelArchitecture architecture = ModelArchitecture::attention_only;
     bool has_nextn = false;
+    bool prism_hadamard = false;
 };
 // No weight loading. The optional embedded backend's reader takes a loaded
 // llama_model, so the external-server build needs this bounded GGUF directory

@@ -118,6 +118,15 @@ std::string_view ToString(FlashAttention mode) noexcept {
     return "unknown";
 }
 
+std::string_view ToString(SplitMode mode) noexcept {
+    switch (mode) {
+        case SplitMode::kNone: return "none";
+        case SplitMode::kLayer: return "layer";
+        case SplitMode::kRow: return "row";
+    }
+    return "unknown";
+}
+
 bool ParseKvCacheType(std::string_view name, KvCacheType& out) noexcept {
     for (const KvCacheType t : kAllKvCacheTypes) {
         if (EqualsIgnoreCase(name, ToString(t))) {
@@ -141,8 +150,64 @@ bool ParseFlashAttention(std::string_view name, FlashAttention& out) noexcept {
     return true;
 }
 
+bool ParseSplitMode(std::string_view name, SplitMode& out) noexcept {
+    if (EqualsIgnoreCase(name, "none")) {
+        out = SplitMode::kNone;
+    } else if (EqualsIgnoreCase(name, "layer")) {
+        out = SplitMode::kLayer;
+    } else if (EqualsIgnoreCase(name, "row")) {
+        out = SplitMode::kRow;
+    } else {
+        return false;
+    }
+    return true;
+}
+
 bool IsQuantized(KvCacheType type) noexcept {
     return type != KvCacheType::kF16 && type != KvCacheType::kF32 && type != KvCacheType::kBF16;
+}
+
+Status ValidatePlacementOptions(const LoadOptions& options) {
+    if (options.main_gpu < 0) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "main_gpu (" + std::to_string(options.main_gpu) + ") must be >= 0");
+    }
+    if (ToString(options.split_mode) == "unknown") {
+        return Status::Error(ErrorCode::kInvalidArgument, "unknown split mode");
+    }
+    if (options.devices.size() > kMaxTensorSplitDevices) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "too many devices (" + std::to_string(options.devices.size()) + ", maximum is " +
+                                 std::to_string(kMaxTensorSplitDevices) + ")");
+    }
+    for (const std::string& dev : options.devices) {
+        if (dev.empty()) {
+            return Status::Error(ErrorCode::kInvalidArgument, "device name in devices list is empty");
+        }
+        if (dev.find('\0') != std::string::npos) {
+            return Status::Error(ErrorCode::kInvalidArgument, "device name in devices list contains NUL");
+        }
+    }
+    if (!options.tensor_split.empty()) {
+        if (options.tensor_split.size() > kMaxTensorSplitDevices) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "tensor_split has " + std::to_string(options.tensor_split.size()) +
+                                     " entries (maximum is " + std::to_string(kMaxTensorSplitDevices) + ")");
+        }
+        bool any_positive = false;
+        for (const float weight : options.tensor_split) {
+            if (!std::isfinite(weight) || weight < 0.0F) {
+                return Status::Error(ErrorCode::kInvalidArgument,
+                                     "tensor_split values must be finite and >= 0");
+            }
+            if (weight > 0.0F) any_positive = true;
+        }
+        if (!any_positive) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "tensor_split must contain at least one positive value");
+        }
+    }
+    return Status::Ok();
 }
 
 Status ValidateContextOptions(const LoadOptions& options) {

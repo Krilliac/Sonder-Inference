@@ -120,6 +120,49 @@ struct DeviceInfo {
 // discovery is deferred to backend capability probing.
 std::vector<DeviceInfo> enumerate_devices();
 
+enum class GpuVendor { unknown, nvidia, amd, intel, apple };
+const char* to_string(GpuVendor vendor) noexcept;
+
+// Pure PCI vendor ID classification (0x10DE NVIDIA, 0x1002 AMD, 0x8086 Intel,
+// 0x106B Apple). Compiled on all platforms for cross-platform testing.
+GpuVendor gpu_vendor_from_pci_id(std::uint32_t vendor_id) noexcept;
+
+struct GpuDeviceInfo {
+    std::string id;                   // e.g. "gpu:0"
+    std::string name;                 // human-readable adapter name
+    GpuVendor vendor = GpuVendor::unknown;
+    std::uint32_t vendor_id = 0;      // PCI vendor id (0x10DE NVIDIA, 0x1002 AMD, 0x8086 Intel)
+    std::uint32_t device_id = 0;      // PCI device id
+    MemoryReading dedicated_total;    // total dedicated VRAM
+    MemoryReading dedicated_free;     // free/available budget VRAM when known
+    MemoryReading shared_total;       // shared/GTT system memory pool when known
+    bool is_integrated_uma = false;   // true on Ryzen APU/iGPU unified memory
+    std::string backend_hint;         // "cuda", "rocm", "vulkan", "metal", or ""
+    std::string source;               // "dxgi", "amdgpu-sysfs", "nvml", etc.
+};
+
+// Pure Linux amdgpu sysfs parser (/sys/class/drm/<card_id>/device/*).
+// Compiled on all platforms so it is testable everywhere via an injected FileReader.
+std::optional<GpuDeviceInfo> parse_amdgpu_sysfs_device(std::string_view card_id, const FileReader& read_file);
+
+// Live GPU inventory: DXGI on Windows (dedicated + free budget + shared/UMA),
+// amdgpu sysfs + optional dynamic libnvidia-ml.so.1 on Linux, empty elsewhere.
+std::vector<GpuDeviceInfo> enumerate_gpu_devices();
+
+// Effective usable VRAM pool in MiB. Discrete GPUs report dedicated_free when
+// prefer_free && dedicated_free.is_known(), else dedicated_total. Integrated
+// UMA GPUs (e.g. Ryzen APUs) include their shared/GTT pool rather than only
+// the small BIOS dedicated carveout.
+std::optional<std::uint64_t> gpu_effective_vram_mib(const GpuDeviceInfo& gpu, bool prefer_free = false) noexcept;
+
+// Selects the effective VRAM budget in MiB for `device_hint` ("CUDA0",
+// "ROCm0", "HIP0", "Vulkan0", "gpu:1", "nvidia", "amd", or comma-separated
+// combinations), or the largest discrete GPU (preferring discrete over
+// integrated UMA) when `device_hint` is empty.
+std::optional<std::uint64_t> select_gpu_vram_budget_mib(const std::vector<GpuDeviceInfo>& gpus,
+                                                        std::string_view device_hint = {},
+                                                        bool prefer_free = false) noexcept;
+
 // Current OS/arch label, e.g. "windows-x86_64".
 std::string host_platform();
 // Host name used as the telemetry producer node_id default.

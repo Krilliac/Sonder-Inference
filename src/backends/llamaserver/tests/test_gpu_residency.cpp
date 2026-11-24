@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include "../gpu_memory.hpp"
 #include "../gpu_residency.hpp"
 
 #include <limits>
@@ -170,4 +171,184 @@ TEST_CASE("explicit CPU intent overrides expect_gpu at detector construction") {
     g.observe(0);
     CHECK_FALSE(g.gpu_offload_missing());
     CHECK_FALSE(g.vram_evicted());
+}
+
+TEST_CASE("parse_linux_drm_fdinfo parses units, deduplicates client ids, and ignores malformed input") {
+    std::uint64_t vram = 123;
+    std::uint64_t gtt = 456;
+
+    // Single amdgpu fdinfo with tab-separated KiB values.
+    const std::string single =
+        "pos:\t0\n"
+        "flags:\t02100002\n"
+        "drm-driver:\tamdgpu\n"
+        "drm-client-id:\t42\n"
+        "drm-pdev:\t0000:03:00.0\n"
+        "drm-memory-vram:\t15421440 KiB\n"
+        "drm-memory-gtt:\t196608 KiB\n";
+    REQUIRE(parse_linux_drm_fdinfo(single, vram, gtt));
+    CHECK(vram == 15421440ull * 1024ull);
+    CHECK(gtt == 196608ull * 1024ull);
+
+    // MiB, GiB, and B units with CRLF line endings.
+    const std::string mixed_units =
+        "drm-driver: amdgpu\r\n"
+        "drm-client-id: 7\r\n"
+        "drm-memory-vram: 12 GiB\r\n"
+        "drm-memory-gtt: 256 MiB\r\n"
+        "\r\n"
+        "drm-driver: amdgpu\r\n"
+        "drm-client-id: 8\r\n"
+        "drm-memory-vram: 512 B\r\n"
+        "drm-memory-gtt: 0 B\r\n";
+    REQUIRE(parse_linux_drm_fdinfo(mixed_units, vram, gtt));
+    CHECK(vram == 12ull * GiB + 512ull);
+    CHECK(gtt == 256ull * MiB);
+
+    // Duplicate drm-client-id entries (both blank-line separated and adjacent) are deduplicated,
+    // while distinct client ids and distinct drivers are summed.
+    const std::string dedup =
+        "pos:\t0\n"
+        "drm-driver:\tamdgpu\n"
+        "drm-client-id:\t42\n"
+        "drm-memory-vram:\t2048 MiB\n"
+        "drm-memory-gtt:\t128 MiB\n"
+        "\n"
+        "pos:\t0\n"
+        "drm-driver:\tamdgpu\n"
+        "drm-client-id:\t42\n"
+        "drm-memory-vram:\t2048 MiB\n"
+        "drm-memory-gtt:\t128 MiB\n"
+        "drm-driver:\tamdgpu\n"
+        "drm-client-id:\t42\n"
+        "drm-memory-vram:\t2048 MiB\n"
+        "drm-memory-gtt:\t128 MiB\n"
+        "drm-driver:\tamdgpu\n"
+        "drm-client-id:\t43\n"
+        "drm-memory-vram:\t512 MiB\n"
+        "drm-memory-gtt:\t64 MiB\n"
+        "drm-driver:\ti915\n"
+        "drm-client-id:\t42\n"
+        "drm-memory-vram:\t100 MiB\n"
+        "drm-memory-gtt:\t32 MiB\n";
+    REQUIRE(parse_linux_drm_fdinfo(dedup, vram, gtt));
+    CHECK(vram == (2048ull + 512ull + 100ull) * MiB);
+    CHECK(gtt == (128ull + 64ull + 32ull) * MiB);
+
+    // Malformed / non-DRM inputs return false and reset outputs to 0.
+    vram = 99;
+    gtt = 99;
+    CHECK_FALSE(parse_linux_drm_fdinfo("", vram, gtt));
+    CHECK(vram == 0);
+    CHECK(gtt == 0);
+
+    // Hybrid AMD+NVIDIA Linux host: nvidia-drm/nvidia fdinfo entries are excluded
+    // so NVIDIA VRAM is never double-counted alongside NVML.
+    const std::string nvidia_only =
+        "drm-driver:\tnvidia-drm\n"
+        "drm-client-id:\t1\n"
+        "drm-memory-vram:\t14000 MiB\n"
+        "drm-memory-gtt:\t128 MiB\n";
+    vram = 55;
+    gtt = 66;
+    CHECK_FALSE(parse_linux_drm_fdinfo(nvidia_only, vram, gtt));
+    CHECK(vram == 0);
+    CHECK(gtt == 0);
+
+    const std::string hybrid =
+        "pos:\t0\n"
+        "drm-driver:\tnvidia-drm\n"
+        "drm-client-id:\t1\n"
+        "drm-memory-vram:\t14000 MiB\n"
+        "drm-memory-gtt:\t128 MiB\n"
+        "\n"
+        "pos:\t0\n"
+        "drm-driver:\tnvidia\n"
+        "drm-client-id:\t2\n"
+        "drm-memory-vram:\t2000 MiB\n"
+        "drm-memory-gtt:\t64 MiB\n"
+        "\n"
+        "pos:\t0\n"
+        "drm-driver:\tamdgpu\n"
+        "drm-client-id:\t3\n"
+        "drm-memory-vram:\t1024 MiB\n"
+        "drm-memory-gtt:\t96 MiB\n";
+    REQUIRE(parse_linux_drm_fdinfo(hybrid, vram, gtt));
+    CHECK(vram == 1024ull * MiB);
+    CHECK(gtt == 96ull * MiB);
+
+    const std::string malformed =
+        "pos:\t0\n"
+        "flags:\t0100000\n"
+        "drm-memory-vram:\t-10 MiB\n"
+        "drm-memory-gtt:\tabc KiB\n"
+        "drm-memory-vram:\t1024\n"
+        "drm-memory-gtt:\t50 XB\n"
+        "drm-memory-vram:\t99999999999999999999 GiB\n";
+    vram = 77;
+    gtt = 88;
+    CHECK_FALSE(parse_linux_drm_fdinfo(malformed, vram, gtt));
+    CHECK(vram == 0);
+    CHECK(gtt == 0);
+}
+
+TEST_CASE("is_spilled suppresses shared-memory spill false positives in uma_mode") {
+    GpuMemorySample sample;
+    sample.dedicated_bytes = 512 * MiB;
+    sample.shared_bytes = 12 * GiB;
+
+    SpillGuardOptions discrete;
+    CHECK_FALSE(discrete.uma_mode);
+    CHECK(is_spilled(sample, discrete));
+
+    SpillGuardOptions uma = discrete;
+    uma.uma_mode = true;
+    CHECK(validate_spill_guard(uma).ok());
+    CHECK_FALSE(is_spilled(sample, uma));
+    CHECK_FALSE(is_spilled(sample, uma, 65536u));
+}
+
+TEST_CASE("residency guard counts shared memory as active GPU memory only in uma_mode") {
+    LlamaServerResidencyGuardOptions uma;
+    uma.uma_mode = true;
+    uma.consecutive_samples = 2;
+    uma.min_dedicated_bytes = 512 * MiB;
+    GpuResidencyGuard apu(uma, true);
+
+    // Ryzen APU: small dedicated carveout (256 MiB) + 8 GiB in GTT/shared is healthy.
+    apu.observe(256 * MiB, 8 * GiB);
+    apu.observe(256 * MiB, 8 * GiB);
+    CHECK_FALSE(apu.gpu_offload_missing());
+    CHECK_FALSE(apu.vram_evicted());
+    CHECK(apu.peak_dedicated_bytes() == 256 * MiB + 8 * GiB);
+
+    // A steep drop in combined UMA usage still detects eviction.
+    apu.observe(128 * MiB, 100 * MiB);
+    CHECK_FALSE(apu.vram_evicted());
+    apu.observe(128 * MiB, 100 * MiB);
+    CHECK(apu.vram_evicted());
+    CHECK(apu.gpu_offload_missing());
+
+    // Pure CPU fallback on an APU (0 dedicated + 0 shared) triggers gpu_offload_missing.
+    GpuResidencyGuard cpu_fallback(uma, true);
+    cpu_fallback.observe(0, 0);
+    CHECK_FALSE(cpu_fallback.gpu_offload_missing());
+    cpu_fallback.observe(0, 0);
+    CHECK(cpu_fallback.gpu_offload_missing());
+
+    // Saturating addition guards against uint64_t overflow.
+    GpuResidencyGuard overflow_check(uma, true);
+    overflow_check.observe(std::numeric_limits<std::uint64_t>::max() - 10, 100);
+    CHECK_FALSE(overflow_check.gpu_offload_missing());
+    CHECK(overflow_check.peak_dedicated_bytes() == std::numeric_limits<std::uint64_t>::max());
+
+    // Discrete mode (uma_mode == false): shared memory must NOT hide missing dedicated offload.
+    LlamaServerResidencyGuardOptions discrete;
+    discrete.uma_mode = false;
+    discrete.consecutive_samples = 2;
+    GpuResidencyGuard dgpu(discrete, true);
+    dgpu.observe(100 * MiB, 8 * GiB);
+    dgpu.observe(100 * MiB, 8 * GiB);
+    CHECK(dgpu.gpu_offload_missing());
+    CHECK(dgpu.peak_dedicated_bytes() == 100 * MiB);
 }

@@ -6,8 +6,11 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <iomanip>
 #include <limits>
+#include <locale>
 #include <set>
+#include <sstream>
 #include <utility>
 
 namespace sonder::inference {
@@ -35,11 +38,55 @@ bool valid_name(std::string_view name) {
 
 bool has_nul(std::string_view s) { return s.find('\0') != std::string_view::npos; }
 
+bool has_nul_or_newline(std::string_view s) {
+    return has_nul(s) || s.find('\r') != std::string_view::npos || s.find('\n') != std::string_view::npos;
+}
+
 std::string canonical_flash_attn(std::string_view v) {
     if (v == "on" || v == "enabled") return "on";
     if (v == "off" || v == "disabled") return "off";
     if (v == "auto") return "auto";
     return {};
+}
+
+bool valid_device_spec(std::string_view spec) {
+    if (spec.empty() || spec.size() > 256 || has_nul(spec)) return false;
+    std::size_t start = 0;
+    for (;;) {
+        const std::size_t comma = spec.find(',', start);
+        const std::string_view item =
+            spec.substr(start, comma == std::string_view::npos ? std::string_view::npos : comma - start);
+        if (item.empty() || item.front() == '-') return false;
+        for (const char c : item) {
+            const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                            c == '_' || c == ':' || c == '.' || c == '-';
+            if (!ok) return false;
+        }
+        if (comma == std::string_view::npos) break;
+        start = comma + 1;
+    }
+    return true;
+}
+
+bool valid_load_mode(std::string_view mode) {
+    return mode == "auto" || mode == "mmap" || mode == "none" || mode == "mlock" || mode == "mmap+mlock" ||
+           mode == "dio";
+}
+
+bool is_llamacpp_kv_cache_type(std::string_view type) {
+    return type == "f32" || type == "f16" || type == "bf16" || type == "q8_0" || type == "q5_1" || type == "q5_0" ||
+           type == "q4_1" || type == "q4_0" || type == "iq4_nl";
+}
+
+std::string format_tensor_split(const std::vector<double>& weights) {
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << std::setprecision(6);
+    for (std::size_t i = 0; i < weights.size(); ++i) {
+        if (i > 0) out << ',';
+        out << weights[i];
+    }
+    return out.str();
 }
 
 // The flag lists below hold the names llama-server looks flags up by
@@ -57,6 +104,12 @@ constexpr std::pair<std::string_view, std::string_view> kTypedFlags[] = {
     {"--image-max-tokens", "image_max_tokens"},
     {"-c", "ctx_size"}, {"--ctx-size", "ctx_size"},
     {"-ngl", "n_gpu_layers"}, {"--gpu-layers", "n_gpu_layers"}, {"--n-gpu-layers", "n_gpu_layers"},
+    {"-dev", "device"}, {"--device", "device"},
+    {"-mg", "main_gpu"}, {"--main-gpu", "main_gpu"},
+    {"-sm", "split_mode"}, {"--split-mode", "split_mode"},
+    {"-ts", "tensor_split"}, {"--tensor-split", "tensor_split"},
+    {"-lm", "load_mode"}, {"--load-mode", "load_mode"},
+    {"-nr", "no_repack"}, {"--no-repack", "no_repack"}, {"--repack", "no_repack"},
     {"-b", "batch_size"}, {"--batch-size", "batch_size"},
     {"-ub", "ubatch_size"}, {"--ubatch-size", "ubatch_size"},
     {"-np", "parallel"}, {"--parallel", "parallel"},
@@ -77,6 +130,8 @@ constexpr std::pair<std::string_view, std::string_view> kTypedFlags[] = {
     {"-tb", "threads_batch"}, {"--threads-batch", "threads_batch"},
     {"--jinja", "jinja"}, {"--no-jinja", "jinja"},
     {"--reasoning-format", "reasoning_format"},
+    {"-rea", "reasoning"}, {"--reasoning", "reasoning"},
+    {"--reasoning-budget", "reasoning_budget"},
     {"--temp", "sampling.temperature"}, {"--temperature", "sampling.temperature"},
     {"--top-p", "sampling.top_p"}, {"--top-k", "sampling.top_k"}, {"--min-p", "sampling.min_p"},
     {"--presence-penalty", "sampling.presence_penalty"}, {"--repeat-penalty", "sampling.repeat_penalty"},
@@ -98,8 +153,11 @@ constexpr std::string_view kForbiddenFlags[] = {
 // or serves a directory). A profile is data that is meant to be shared, so it
 // may not switch them on; the `--no-*` spellings stay allowed.
 constexpr std::string_view kUnsafeFeatureFlags[] = {
-    "--tools", "--tools-runtime", "--mcp-servers-config", "--mcp-servers-json", "-ag", "--agent",
-    "--ui-mcp-proxy", "--webui-mcp-proxy", "--path", "--media-path",
+    "--tools", "--tools-runtime", "--allow-unauthenticated-tools",
+    "--mcp-servers-config", "--mcp-servers-json", "-ag", "--agent",
+    "--ui-mcp-proxy", "--webui-mcp-proxy", "--ui-mcp-proxy-allow-private-urls",
+    "--ui-config-file", "--webui-config-file",
+    "--path", "--media-path", "--media-allow-private-urls",
 };
 
 // llama-server flags that write prompts or logs to an arbitrary local path.
@@ -111,11 +169,11 @@ constexpr std::string_view kDiskWriteFlags[] = {
     "--log-file", "--log-prompts-dir", "-lcd", "--lookup-cache-dynamic",
 };
 
-// llama-server flags that move model work to other machines: `--rpc
-// HOST:PORT,...` registers remote rpc-server devices, and layers placed on
-// them send their tensors and every request's activations over the network.
-// A shared profile must not route prompts off this host.
-constexpr std::string_view kRemoteOffloadFlags[] = {"--rpc"};
+// llama-server flags that move model work to other machines or expose P2P
+// remote tunnels: `--rpc HOST:PORT,...` registers remote rpc-server devices,
+// and `--connect`/`--connect-code` tunnel requests off-host. A shared profile
+// must not route prompts off this host.
+constexpr std::string_view kRemoteOffloadFlags[] = {"--rpc", "--connect", "--connect-code"};
 
 // llama-server flags that choose a program for the child to run:
 // `--video-ffmpeg-dir` is the directory it starts ffmpeg and ffprobe from for
@@ -165,6 +223,7 @@ Status check_extra_args(const LaunchProfile& p) {
     for (const auto& arg : p.extra_args) {
         if (has_nul(arg)) return bad(where_of(p), "extra_args must not contain NUL");
         if (arg.size() < 2 || arg[0] != '-') continue;  // a value, not a flag
+        if (has_nul_or_newline(arg)) return bad(where_of(p), "extra_args flag must not contain newline characters");
         // Judge the flag llama-server will actually run: it reads
         // `--mcp_servers_json` as `--mcp-servers-json`.
         const std::string flag = llamaserver_flag_name(arg);
@@ -269,6 +328,19 @@ public:
         }
         return {};
     }
+    Status numbers(const char* key, std::vector<double>& out) const {
+        const auto* v = object_.find(key);
+        if (!v) return {};
+        if (!v->is_array()) return bad(where_, std::string("'") + key + "' must be an array of numbers");
+        out.clear();
+        for (const auto& item : v->as_array()) {
+            if (!item.is_number() || !std::isfinite(item.as_double())) {
+                return bad(where_, std::string("'") + key + "' entries must be positive finite numbers");
+            }
+            out.push_back(item.as_double());
+        }
+        return {};
+    }
     const json::Value* find(const char* key) const { return object_.find(key); }
     const std::string& where() const { return where_; }
 
@@ -290,10 +362,12 @@ Result<LaunchProfile> parse_one(const json::Value& value, std::size_t index) {
     const std::string where = name && name->is_string() ? "'" + name->as_string() + "'" : at;
     Reader r(value.as_object(), where);
     SONDER_TRY(r.check_keys({"name", "backend", "model", "mmproj", "mmproj_offload", "image_max_tokens", "ctx_size",
-                             "n_gpu_layers", "batch_size", "ubatch_size", "parallel", "kv_unified", "flash_attn",
+                             "n_gpu_layers", "device", "main_gpu", "split_mode", "tensor_split", "load_mode",
+                             "no_repack", "batch_size", "ubatch_size", "parallel", "kv_unified", "flash_attn",
                              "cache_type_k", "cache_type_v", "ctx_checkpoints", "checkpoint_min_step", "cache_ram_mib",
                              "context_shift", "fit", "speculative", "threads", "threads_batch", "jinja",
-                             "reasoning_format", "sampling", "extra_args", "vram_budget_mib"}));
+                             "reasoning_format", "reasoning", "reasoning_budget", "sampling", "extra_args",
+                             "vram_budget_mib"}));
     LaunchProfile p;
     SONDER_TRY(r.string("name", p.name, true));
     SONDER_TRY(r.string("backend", p.backend, true));
@@ -303,6 +377,12 @@ Result<LaunchProfile> parse_one(const json::Value& value, std::size_t index) {
     SONDER_TRY(r.integer("image_max_tokens", p.image_max_tokens, 1, 65536));
     SONDER_TRY(r.integer("ctx_size", p.ctx_size, 0, kMaxContext));
     SONDER_TRY(r.integer("n_gpu_layers", p.n_gpu_layers, -1, 100000));
+    SONDER_TRY(r.string("device", p.device));
+    SONDER_TRY(r.integer("main_gpu", p.main_gpu, 0, 1024));
+    SONDER_TRY(r.string("split_mode", p.split_mode));
+    SONDER_TRY(r.numbers("tensor_split", p.tensor_split));
+    SONDER_TRY(r.string("load_mode", p.load_mode));
+    SONDER_TRY(r.boolean("no_repack", p.no_repack));
     SONDER_TRY(r.integer("batch_size", p.batch_size, 1, kMaxBatch));
     SONDER_TRY(r.integer("ubatch_size", p.ubatch_size, 1, kMaxBatch));
     SONDER_TRY(r.integer("parallel", p.parallel, 1, 256));
@@ -319,6 +399,8 @@ Result<LaunchProfile> parse_one(const json::Value& value, std::size_t index) {
     SONDER_TRY(r.integer("threads_batch", p.threads_batch, -1, 1024));
     SONDER_TRY(r.boolean("jinja", p.jinja));
     SONDER_TRY(r.string("reasoning_format", p.reasoning_format));
+    SONDER_TRY(r.string("reasoning", p.reasoning));
+    SONDER_TRY(r.integer("reasoning_budget", p.reasoning_budget, -1, kMaxContext));
     SONDER_TRY(r.strings("extra_args", p.extra_args));
     SONDER_TRY(r.integer("vram_budget_mib", p.vram_budget_mib, 1, 1 << 24));
     if (const auto* spec = r.find("speculative")) {
@@ -363,11 +445,14 @@ std::string llamaserver_flag_name(std::string_view arg) {
 double kv_cache_type_bytes(std::string_view type) noexcept {
     if (type == "f32") return 4.0;
     if (type == "f16" || type == "bf16") return 2.0;
+    if (type == "f8_e4m3") return 1.0;
     if (type == "q8_0") return 34.0 / 32.0;
     if (type == "q5_1") return 24.0 / 32.0;
     if (type == "q5_0") return 22.0 / 32.0;
     if (type == "q4_1") return 20.0 / 32.0;
     if (type == "q4_0" || type == "iq4_nl") return 18.0 / 32.0;
+    if (type == "q2_0") return 18.0 / 64.0;
+    if (type == "pq2_0m") return 36.0 / 128.0;
     return 0.0;
 }
 
@@ -383,20 +468,39 @@ Status validate_launch_profile(const LaunchProfile& p) {
     if (p.backend != kLaunchProfileBackendLlamaServer && p.backend != kLaunchProfileBackendLlamaCpp) {
         return bad(where, "'backend' must be llamaserver or llamacpp");
     }
-    if (p.model.empty() || has_nul(p.model)) return bad(where, "'model' must be a GGUF path");
-    if (has_nul(p.mmproj)) return bad(where, "'mmproj' must not contain NUL");
+    if (p.model.empty() || has_nul_or_newline(p.model)) {
+        return bad(where, "'model' must be a GGUF path without NUL or newline characters");
+    }
+    if (has_nul_or_newline(p.mmproj)) return bad(where, "'mmproj' must not contain NUL or newline characters");
     if (p.mmproj.empty() && (p.mmproj_offload || p.image_max_tokens)) {
         return bad(where, "'mmproj_offload' and 'image_max_tokens' need 'mmproj'");
     }
     if (p.ctx_size && *p.ctx_size > kMaxContext) return bad(where, "'ctx_size' is out of range");
     if (p.n_gpu_layers && *p.n_gpu_layers < -1) return bad(where, "'n_gpu_layers' must be -1 or more");
+    if (p.device && !valid_device_spec(*p.device)) {
+        return bad(where, "'device' must be a comma-separated list of device names (e.g. CUDA0, ROCm0, Vulkan0)");
+    }
+    if (p.main_gpu && *p.main_gpu < 0) return bad(where, "'main_gpu' must be 0 or more");
+    if (p.split_mode && *p.split_mode != "none" && *p.split_mode != "layer" && *p.split_mode != "row") {
+        return bad(where, "'split_mode' must be none, layer or row");
+    }
+    if (p.tensor_split.size() > 16) return bad(where, "'tensor_split' must have at most 16 entries");
+    for (const double w : p.tensor_split) {
+        if (!std::isfinite(w) || !(w > 0.0)) {
+            return bad(where, "'tensor_split' entries must be positive finite numbers");
+        }
+    }
+    if (p.load_mode && !valid_load_mode(*p.load_mode)) {
+        return bad(where, "'load_mode' must be one of auto, mmap, none, mlock, mmap+mlock, dio");
+    }
     if (p.flash_attn && canonical_flash_attn(*p.flash_attn) != *p.flash_attn) {
         return bad(where, "'flash_attn' must be on, off or auto");
     }
     for (const auto* t : {&p.cache_type_k, &p.cache_type_v}) {
         if (*t && kv_cache_type_bytes(**t) == 0.0) {
             return bad(where, std::string(t == &p.cache_type_k ? "'cache_type_k'" : "'cache_type_v'") +
-                                  " must be one of f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1");
+                                  " must be one of f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, "
+                                  "q2_0, pq2_0m");
         }
     }
     // llama.cpp refuses a quantized V cache without flash attention
@@ -416,6 +520,12 @@ Status validate_launch_profile(const LaunchProfile& p) {
         *p.reasoning_format != "deepseek-legacy" && *p.reasoning_format != "auto") {
         return bad(where, "'reasoning_format' must be none, deepseek, deepseek-legacy or auto");
     }
+    if (p.reasoning && *p.reasoning != "on" && *p.reasoning != "off" && *p.reasoning != "auto") {
+        return bad(where, "'reasoning' must be on, off or auto");
+    }
+    if (p.reasoning_budget && *p.reasoning_budget < -1) {
+        return bad(where, "'reasoning_budget' must be -1 or more");
+    }
     // Without --parallel, llama-server picks its slots automatically and then
     // unifies the KV cache whatever --no-kv-unified said
     // (kLlamaServerAutoParallel), so the field would silently not apply.
@@ -433,7 +543,9 @@ Status validate_launch_profile(const LaunchProfile& p) {
             if (!seen.insert(t).second) return bad(where, "speculative type '" + t + "' is listed twice");
         }
         if (seen.count("none") && seen.size() > 1) return bad(where, "speculative type 'none' cannot be combined");
-        if (has_nul(p.speculative->draft_model)) return bad(where, "'speculative.draft_model' must not contain NUL");
+        if (has_nul_or_newline(p.speculative->draft_model)) {
+            return bad(where, "'speculative.draft_model' must not contain NUL or newline characters");
+        }
     }
     SamplingConfig check;
     apply_sampling_defaults(p.sampling, check);
@@ -511,6 +623,24 @@ Result<std::vector<std::string>> llamaserver_arguments(const LaunchProfile& p) {
         a.emplace_back("--n-gpu-layers");
         a.push_back(*p.n_gpu_layers < 0 ? std::string("all") : std::to_string(*p.n_gpu_layers));
     }
+    if (p.device) {
+        a.emplace_back("--device");
+        a.push_back(*p.device);
+    }
+    if (p.main_gpu) num("--main-gpu", *p.main_gpu);
+    if (p.split_mode) {
+        a.emplace_back("--split-mode");
+        a.push_back(*p.split_mode);
+    }
+    if (!p.tensor_split.empty()) {
+        a.emplace_back("--tensor-split");
+        a.push_back(format_tensor_split(p.tensor_split));
+    }
+    if (p.load_mode) {
+        a.emplace_back("--load-mode");
+        a.push_back(*p.load_mode);
+    }
+    toggle(p.no_repack, "--no-repack", "--repack");
     if (p.batch_size) num("--batch-size", *p.batch_size);
     if (p.ubatch_size) num("--ubatch-size", *p.ubatch_size);
     if (p.parallel) num("--parallel", *p.parallel);
@@ -553,6 +683,11 @@ Result<std::vector<std::string>> llamaserver_arguments(const LaunchProfile& p) {
         a.emplace_back("--reasoning-format");
         a.push_back(*p.reasoning_format);
     }
+    if (p.reasoning) {
+        a.emplace_back("--reasoning");
+        a.push_back(*p.reasoning);
+    }
+    if (p.reasoning_budget) num("--reasoning-budget", *p.reasoning_budget);
     a.insert(a.end(), p.extra_args.begin(), p.extra_args.end());
     return a;
 }
@@ -566,8 +701,22 @@ Status apply_llamacpp_profile(const LaunchProfile& p, BackendSetup& setup, std::
     if (!p.mmproj.empty()) return unsupported("mmproj");
     if (p.mmproj_offload) return unsupported("mmproj_offload");
     if (p.image_max_tokens) return unsupported("image_max_tokens");
+    if (p.device) return unsupported("device");
+    if (p.main_gpu) return unsupported("main_gpu");
+    if (p.split_mode) return unsupported("split_mode");
+    if (!p.tensor_split.empty()) return unsupported("tensor_split");
+    if (p.load_mode) return unsupported("load_mode");
+    if (p.no_repack) return unsupported("no_repack");
     if (p.parallel) return unsupported("parallel");
     if (p.kv_unified) return unsupported("kv_unified");
+    if (p.cache_type_k && !is_llamacpp_kv_cache_type(*p.cache_type_k)) {
+        return bad(where_of(p), "'cache_type_k' (" + *p.cache_type_k +
+                                    ") is not supported by the llamacpp backend; use llamaserver");
+    }
+    if (p.cache_type_v && !is_llamacpp_kv_cache_type(*p.cache_type_v)) {
+        return bad(where_of(p), "'cache_type_v' (" + *p.cache_type_v +
+                                    ") is not supported by the llamacpp backend; use llamaserver");
+    }
     if (p.ctx_checkpoints) return unsupported("ctx_checkpoints");
     if (p.checkpoint_min_step) return unsupported("checkpoint_min_step");
     if (p.cache_ram_mib) return unsupported("cache_ram_mib");
@@ -578,6 +727,8 @@ Status apply_llamacpp_profile(const LaunchProfile& p, BackendSetup& setup, std::
     if (p.threads_batch) return unsupported("threads_batch");
     if (p.jinja) return unsupported("jinja");
     if (p.reasoning_format) return unsupported("reasoning_format");
+    if (p.reasoning) return unsupported("reasoning");
+    if (p.reasoning_budget) return unsupported("reasoning_budget");
     if (!p.extra_args.empty()) return unsupported("extra_args");
     if (p.ctx_size && *p.ctx_size > (1u << 22)) {
         return bad(where_of(p), "'ctx_size' above 4194304 is not supported by the llamacpp backend; use llamaserver");
@@ -662,6 +813,13 @@ json::Object launch_profile_metadata(const LaunchProfile& p, const std::optional
     }
     o.set("estimated_vram_mib", estimate ? json::Value(estimate->total_mib()) : json::Value());
     o.set("vram_budget_mib", budget_mib ? json::Value(*budget_mib) : json::Value());
+    if (estimate && estimate->max_gpu_bytes > 0) {
+        o.set("per_gpu_max_mib", json::Value(estimate->max_gpu_mib()));
+    }
+    if (estimate && (estimate->prism_hadamard || estimate->requires_prism_runtime)) {
+        o.set("prism_hadamard", json::Value(estimate->prism_hadamard));
+        o.set("requires_prism_runtime", json::Value(estimate->requires_prism_runtime));
+    }
     return o;
 }
 

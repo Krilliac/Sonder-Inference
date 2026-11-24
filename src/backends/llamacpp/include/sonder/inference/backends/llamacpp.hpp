@@ -40,11 +40,26 @@ struct LlamaCppBackendOptions {
     // Flash Attention: auto (default, llama.cpp decides), on or off. A
     // quantized V cache needs it: "off" with a quantized V type is rejected.
     std::string flash_attention = "auto";
+    // Explicit ggml device names (e.g. "CUDA0", "ROCm0", "Vulkan0", "CUDA1")
+    // for vendor-targeted or multi-GPU offloading. Empty = llama.cpp default.
+    std::vector<std::string> devices;
+    // Primary GPU index for single-GPU mode (split_mode == "none") and
+    // non-split / scratch tensors. Must be >= 0.
+    std::int32_t main_gpu = 0;
+    // Multi-GPU split mode: "layer" (default), "none" (single GPU), or "row".
+    std::string split_mode = "layer";
+    // Relative split proportions across GPUs (empty = equal / llama.cpp
+    // default). When non-empty: at most 16 finite, non-negative entries with
+    // at least one strictly positive value.
+    std::vector<float> tensor_split;
+    // Lock model weights in RAM (llama.cpp load_mode mlock / mmap+mlock).
+    bool use_mlock = false;
 };
 
-// Checks the llama.cpp context options (KV cache types, flash_attention,
-// ubatch_size vs batch_size) without loading anything. load_model() applies
-// the same checks; hosts call this to reject bad flags at startup.
+// Checks the llama.cpp context and placement options (KV cache types,
+// flash_attention, ubatch_size vs batch_size, split_mode, main_gpu,
+// tensor_split, device name syntax) without loading anything. load_model()
+// applies the same checks; hosts call this to reject bad flags at startup.
 // Errors: invalid_argument.
 Status validate_llamacpp_options(const LlamaCppBackendOptions& options);
 

@@ -64,6 +64,61 @@
       "displayName": "CI: Linux Release, warnings as errors",
       "inherits": "linux-release",
       "cacheVariables": { "SONDER_WARNINGS_AS_ERRORS": "ON" }
+    },
+    {
+      "name": "windows-cuda-rtx",
+      "displayName": "Windows CUDA (NVIDIA RTX Ampere/Ada/Blackwell)",
+      "description": "Direct llama.cpp with CUDA for RTX 30/40/50-series (sm_86, sm_89, sm_120) and all quantized Flash Attention kernels.",
+      "inherits": "msvc-release",
+      "cacheVariables": {
+        "SONDER_WITH_LLAMA_CPP": "ON",
+        "GGML_CUDA": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "86;89;120",
+        "GGML_CUDA_FA_ALL_QUANTS": "ON"
+      }
+    },
+    {
+      "name": "windows-vulkan-xt",
+      "displayName": "Windows Vulkan (AMD RX XT / Radeon APU / Cross-Vendor GPU)",
+      "description": "Direct llama.cpp with Vulkan for AMD Radeon RX XT, Ryzen iGPU/APU, and other Vulkan-capable GPUs on Windows.",
+      "inherits": "msvc-release",
+      "cacheVariables": {
+        "SONDER_WITH_LLAMA_CPP": "ON",
+        "GGML_VULKAN": "ON"
+      }
+    },
+    {
+      "name": "linux-cuda-rtx",
+      "displayName": "Linux CUDA (NVIDIA RTX Ampere/Ada/Blackwell)",
+      "description": "Direct llama.cpp with CUDA for RTX 30/40/50-series (sm_86, sm_89, sm_120) and all quantized Flash Attention kernels.",
+      "inherits": "linux-release",
+      "cacheVariables": {
+        "SONDER_WITH_LLAMA_CPP": "ON",
+        "GGML_CUDA": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "86;89;120",
+        "GGML_CUDA_FA_ALL_QUANTS": "ON"
+      }
+    },
+    {
+      "name": "linux-rocm-xt",
+      "displayName": "Linux ROCm/HIP (AMD RX XT RDNA 2/3/4 & Ryzen APU)",
+      "description": "Direct llama.cpp with ROCm/HIP targeting AMD RDNA 2/3/4 discrete RX XT GPUs and RDNA 3 Ryzen APUs.",
+      "inherits": "linux-release",
+      "cacheVariables": {
+        "SONDER_WITH_LLAMA_CPP": "ON",
+        "GGML_HIP": "ON",
+        "AMDGPU_TARGETS": "gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1200;gfx1201"
+      }
+    },
+    {
+      "name": "linux-vulkan-xt",
+      "displayName": "Linux Vulkan (AMD RX XT / Radeon APU / Cross-Vendor GPU)",
+      "description": "Direct llama.cpp with Vulkan for AMD Radeon RX XT, Ryzen iGPU/APU, and other Vulkan-capable GPUs on Linux.",
+      "inherits": "linux-release",
+      "cacheVariables": {
+        "SONDER_WITH_LLAMA_CPP": "ON",
+        "GGML_VULKAN": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -72,7 +127,12 @@
     { "name": "linux-debug", "configurePreset": "linux-debug" },
     { "name": "linux-release", "configurePreset": "linux-release" },
     { "name": "ci-windows", "configurePreset": "ci-windows" },
-    { "name": "ci-linux", "configurePreset": "ci-linux" }
+    { "name": "ci-linux", "configurePreset": "ci-linux" },
+    { "name": "windows-cuda-rtx", "configurePreset": "windows-cuda-rtx" },
+    { "name": "windows-vulkan-xt", "configurePreset": "windows-vulkan-xt" },
+    { "name": "linux-cuda-rtx", "configurePreset": "linux-cuda-rtx" },
+    { "name": "linux-rocm-xt", "configurePreset": "linux-rocm-xt" },
+    { "name": "linux-vulkan-xt", "configurePreset": "linux-vulkan-xt" }
   ],
   "testPresets": [
     { "name": "msvc-debug", "configurePreset": "msvc-debug", "output": { "outputOnFailure": true } },
@@ -80,6 +140,11 @@
     { "name": "linux-debug", "configurePreset": "linux-debug", "output": { "outputOnFailure": true } },
     { "name": "linux-release", "configurePreset": "linux-release", "output": { "outputOnFailure": true } },
     { "name": "ci-windows", "configurePreset": "ci-windows", "output": { "outputOnFailure": true } },
-    { "name": "ci-linux", "configurePreset": "ci-linux", "output": { "outputOnFailure": true } }
+    { "name": "ci-linux", "configurePreset": "ci-linux", "output": { "outputOnFailure": true } },
+    { "name": "windows-cuda-rtx", "configurePreset": "windows-cuda-rtx", "output": { "outputOnFailure": true } },
+    { "name": "windows-vulkan-xt", "configurePreset": "windows-vulkan-xt", "output": { "outputOnFailure": true } },
+    { "name": "linux-cuda-rtx", "configurePreset": "linux-cuda-rtx", "output": { "outputOnFailure": true } },
+    { "name": "linux-rocm-xt", "configurePreset": "linux-rocm-xt", "output": { "outputOnFailure": true } },
+    { "name": "linux-vulkan-xt", "configurePreset": "linux-vulkan-xt", "output": { "outputOnFailure": true } }
   ]
 }

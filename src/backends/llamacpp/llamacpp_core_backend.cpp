@@ -1,6 +1,7 @@
 // Adapter: sonder::inference::Backend over the llama.cpp runtime wrapper.
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <filesystem>
 #include <mutex>
 #include <string>
@@ -14,6 +15,35 @@
 #include "llamacpp_internal.hpp"
 
 namespace sonder::inference {
+
+namespace llamacpp_detail {
+
+// Resolves LoadOptions::n_gpu_layers from backend options and a load request's
+// device_id. Explicit "cpu:*" always uses 0; "gpu:*" requires a GPU backend
+// and uses options.gpu_layers; empty device_id honors options.gpu_layers when
+// explicit ggml devices are configured, otherwise defaults to 0 (CPU).
+Result<std::int32_t> ResolveGpuLayers(const LlamaCppBackendOptions& options, std::string_view device_id,
+                                      bool has_gpu_backend);
+
+Result<std::int32_t> ResolveGpuLayers(const LlamaCppBackendOptions& options, std::string_view device_id,
+                                      bool has_gpu_backend) {
+    if (device_id.rfind("cpu", 0) == 0) {
+        return std::int32_t{0};
+    }
+    if (device_id.empty()) {
+        return options.devices.empty() ? std::int32_t{0} : options.gpu_layers;
+    }
+    if (device_id.rfind("gpu", 0) == 0) {
+        if (!has_gpu_backend) {
+            return Status(ErrorCode::unsupported, "this llama.cpp build has no GPU backend");
+        }
+        return options.gpu_layers;
+    }
+    return Status(ErrorCode::unsupported, "unsupported device id for llamacpp: " + std::string(device_id));
+}
+
+}  // namespace llamacpp_detail
+
 namespace {
 
 namespace lc = sonder::backends::llamacpp;
@@ -41,13 +71,21 @@ Status ToStatus(const lc::Status& s) { return s.ok() ? Status::success() : Statu
 
 std::uint64_t MsToNs(double ms) { return ms > 0.0 ? static_cast<std::uint64_t>(ms * 1e6) : 0; }
 
-// Copies the context options into `lo` and validates them with the wrapper's
-// ValidateContextOptions (the same check Load() runs).
-Status ApplyContextOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo) {
+// Copies the context and placement options into `lo` and validates them with
+// the wrapper's pure validators (the same checks Load() runs).
+Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo) {
     lo.n_ctx = o.context_length;
     lo.n_batch = o.batch_size;
     lo.n_ubatch = o.ubatch_size;
     lo.n_threads = o.threads;
+    lo.devices = o.devices;
+    lo.main_gpu = o.main_gpu;
+    lo.tensor_split = o.tensor_split;
+    lo.use_mlock = o.use_mlock;
+    if (!lc::ParseSplitMode(o.split_mode, lo.split_mode)) {
+        return Status(ErrorCode::invalid_argument,
+                      "unknown split mode '" + o.split_mode + "' (expected none, layer or row)");
+    }
     if (!lc::ParseKvCacheType(o.kv_cache_type_k, lo.type_k)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown K cache type '" + o.kv_cache_type_k +
@@ -61,6 +99,9 @@ Status ApplyContextOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     if (!lc::ParseFlashAttention(o.flash_attention, lo.flash_attn)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown flash attention mode '" + o.flash_attention + "' (expected auto, on or off)");
+    }
+    if (lc::Status s = lc::ValidatePlacementOptions(lo); !s.ok()) {
+        return ToStatus(s);
     }
     return ToStatus(lc::ValidateContextOptions(lo));
 }
@@ -279,23 +320,20 @@ public:
 
         lc::LoadOptions lo;
         lo.model_path = path;
-        if (Status s = ApplyContextOptions(options_, lo); !s.ok()) return s;
+        if (Status s = ApplyBackendOptions(options_, lo); !s.ok()) return s;
         for (const auto& [pattern, device] : options_.tensor_overrides) {
             lo.tensor_overrides.push_back({pattern, device});
         }
         const std::string_view dev = options.device_id;
-        if (dev.empty() || dev.rfind("cpu", 0) == 0) {
-            lo.n_gpu_layers = 0;
-        } else if (dev.rfind("gpu", 0) == 0) {
-            bool has_gpu = false;
+        bool has_gpu = false;
+        if (dev.rfind("gpu", 0) == 0) {
             for (const auto& d : lc::LlamaCppBackend::EnumerateDevices()) {
                 has_gpu = has_gpu || d.kind == lc::DeviceKind::kGpu || d.kind == lc::DeviceKind::kIntegratedGpu;
             }
-            if (!has_gpu) return Status(ErrorCode::unsupported, "this llama.cpp build has no GPU backend");
-            lo.n_gpu_layers = options_.gpu_layers;
-        } else {
-            return Status(ErrorCode::unsupported, "unsupported device id for llamacpp: " + options.device_id);
         }
+        const auto gpu_layers = llamacpp_detail::ResolveGpuLayers(options_, dev, has_gpu);
+        if (!gpu_layers.ok()) return gpu_layers.status();
+        lo.n_gpu_layers = gpu_layers.value();
 
         lc::LlamaCppBackend runtime;
         double load_ms = 0.0;
@@ -343,7 +381,7 @@ private:
 
 Status validate_llamacpp_options(const LlamaCppBackendOptions& options) {
     lc::LoadOptions lo;
-    return ApplyContextOptions(options, lo);
+    return ApplyBackendOptions(options, lo);
 }
 
 std::shared_ptr<Backend> make_llamacpp_backend(LlamaCppBackendOptions options) {

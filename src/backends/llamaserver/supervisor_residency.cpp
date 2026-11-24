@@ -80,7 +80,7 @@ Status Supervisor::missing_offload_failure() const {
                       std::to_string(options_.spill_guard.residency.min_dedicated_bytes) + " bytes for " +
                       std::to_string(options_.spill_guard.residency.consecutive_samples) +
                       " consecutive post-readiness samples despite requested GPU layers; refusing to serve "
-                      "(spill_guard.policy=refuse). Check CUDA backend availability and the child's PATH");
+                      "(spill_guard.policy=refuse). Check GPU backend availability (CUDA/ROCm/Vulkan) and the child's PATH");
 }
 
 Supervisor::ResidencyAction Supervisor::residency_action() {
@@ -134,7 +134,7 @@ void Supervisor::append_residency_warnings(BackendRuntimeStatus &status) const {
             "gpu_offload_missing", "warning", "gpu_probe",
             "GPU offload was requested but dedicated usage remained below " +
                 std::to_string(options_.spill_guard.residency.min_dedicated_bytes) +
-                " bytes after readiness. Check CUDA backend availability and the child's PATH", details, 1});
+                " bytes after readiness. Check GPU backend availability (CUDA/ROCm/Vulkan) and the child's PATH", details, 1});
     if (event.vram_evicted)
         status.warnings.push_back({
             "vram_evicted", "warning", "gpu_probe",

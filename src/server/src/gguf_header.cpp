@@ -39,11 +39,18 @@ constexpr std::uint64_t kMaxRecurrentStateValues = 1ull << 28;
 
 Status malformed(const std::string& what) { return Status(ErrorCode::invalid_argument, "GGUF header: " + what); }
 
+bool checked_add(std::uint64_t& dst, std::uint64_t add) noexcept {
+    if (add > std::numeric_limits<std::uint64_t>::max() - dst) return false;
+    dst += add;
+    return true;
+}
+
 bool printable(std::string_view text) {
     return std::all_of(text.begin(), text.end(), [](char ch) { return ch >= 0x20 && ch < 0x7f; });
 }
 
-// ggml tensor types: (elements per block, bytes per block). ggml.h / ggml.c.
+// ggml tensor types: (elements per block, bytes per block). ggml.h / ggml.c
+// (upstream ggml-org/llama.cpp + PrismML-Eng/llama.cpp `prism` branch).
 bool ggml_type_size(std::uint32_t type, std::uint64_t& block_elems, std::uint64_t& block_bytes) {
     struct Entry {
         std::uint32_t type;
@@ -57,6 +64,15 @@ bool ggml_type_size(std::uint32_t type, std::uint64_t& block_elems, std::uint64_
         {20, 32, 18},   {21, 256, 110}, {22, 256, 82},  {23, 256, 136}, {24, 1, 1},     {25, 1, 2},
         {26, 1, 4},     {27, 1, 8},     {28, 1, 8},     {29, 256, 56},  {30, 1, 2},     {34, 256, 54},
         {35, 256, 66},  {39, 32, 17},
+        // Mainline llama.cpp FP4/1-bit/2-bit-ternary/FP8 types:
+        {40, 64, 36},   // GGML_TYPE_NVFP4   (Blackwell FP4: 64 elems, 4x UE4M3 scales + 32 B data = 36 B)
+        {41, 128, 18},  // GGML_TYPE_Q1_0    (1-bit Bonsai-1: 128 elems, fp16 scale + 16 B data = 18 B)
+        {42, 64, 18},   // GGML_TYPE_Q2_0    (mainline 2-bit ternary: 64 elems, fp16 scale + 16 B data = 18 B)
+        {43, 1, 1},     // GGML_TYPE_F8_E4M3 (Ada/Blackwell/RDNA4 FP8: 1 elem, 1 B)
+        // PrismML-Eng/llama.cpp (`prism` branch) Bonsai-2 ternary & KV types:
+        {142, 128, 34}, // GGML_TYPE_PQ2_0   (PrismML Bonsai-2: 128 elems, fp16 scale + 32 B data = 34 B)
+        {143, 128, 28}, // GGML_TYPE_PTQ1_0  (PrismML Bonsai-2 dense ternary: 128 elems, fp16 scale + 26 B = 28 B)
+        {145, 128, 36}, // GGML_TYPE_PQ2_0M  (PrismML KV-only: 128 elems, fp16 scale + fp16 min + 32 B = 36 B)
     };
     for (const auto& e : kTypes) {
         if (e.type == type) {
@@ -487,6 +503,8 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
         std::uint32_t type = 0;
         if (!c.string(key) || !c.pod(type)) return malformed("truncated metadata");
         if (key == "general.architecture") ++architecture_occurrences;
+        const bool is_prism_hadamard = key.rfind("prism.hadamard.", 0) == 0;
+        if (is_prism_hadamard) info.prism_hadamard = true;
         ExpertCountObservation* expert = nullptr;
         if (expert_count_key(key)) {
             expert_observations.push_back({key, std::nullopt});
@@ -500,6 +518,8 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
                     return malformed("general.architecture must be at most 256 printable ASCII characters");
                 }
                 info.architecture = value;
+            } else if (key == "prism.hadamard.transform" && value.size() <= 256) {
+                info.prism_hadamard_transform = value;
             }
             if (value.size() <= 256) info.metadata.emplace_back(key, value);
             continue;
@@ -517,6 +537,12 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
             }
             const std::uint64_t size = scalar_size(item_type);
             if (size == 0) return malformed("unsupported array item type in '" + excerpt(key) + "'");
+            // PrismML Hadamard arrays (e.g. prism.hadamard.sign_values[28672])
+            // are skipped without allocating or bloating info.metadata.
+            if (is_prism_hadamard) {
+                if (!c.skip(size * n)) return malformed("truncated array");
+                continue;
+            }
             // Integer and BOOL arrays are kept per item: per-block head
             // counts, a sliding_window_pattern (BOOL, or INT32/UINT32). A
             // BOOL array stays out of `metadata`, which the classification
@@ -547,6 +573,10 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
         }
         info.metadata.emplace_back(key, text);
         if (is_int) numbers.emplace_back(key, Numbers{v, {}});
+        if (key == "prism.hadamard.block_size" && is_int && v > 0 &&
+            v <= static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
+            info.prism_hadamard_block_size = static_cast<std::uint32_t>(v);
+        }
         if (expert && is_int && v > 0 && v <= static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
             expert->value = static_cast<std::uint32_t>(v);
         }
@@ -641,7 +671,23 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
         if (!ggml_type_size(type, block_elems, block_bytes)) {
             return malformed("tensor " + excerpt(name) + " has an unknown ggml type " + std::to_string(type));
         }
-        const std::uint64_t bytes = (elements + block_elems - 1) / block_elems * block_bytes;
+        if (type == 34 || type == 35 || type == 42 || type == 142 || type == 143 || type == 145) {
+            info.has_ternary_tensors = true;
+        }
+        if (type == 41) {
+            info.has_one_bit_tensors = true;
+        }
+        if (type == 142 || type == 143 || type == 145) {
+            info.has_prism_private_tensors = true;
+        }
+        if (type == 39 || type == 40 || type == 43) {
+            info.has_fp4_or_fp8_tensors = true;
+        }
+        const std::uint64_t num_blocks = elements / block_elems + (elements % block_elems != 0 ? 1u : 0u);
+        if (num_blocks > std::numeric_limits<std::uint64_t>::max() / block_bytes) {
+            return malformed("tensor too large");
+        }
+        const std::uint64_t bytes = num_blocks * block_bytes;
         std::uint32_t tensor_block = kNoBlock;
         if (name.rfind("blk.", 0) == 0) {
             const auto dot = name.find('.', 4);
@@ -652,7 +698,7 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
                 layer = layer * 10 + static_cast<std::uint64_t>(name[k] - '0');
             }
             if (!ok || layer >= info.block_count) return malformed("tensor " + excerpt(name) + " names an unknown block");
-            info.block_bytes[layer] += bytes;
+            if (!checked_add(info.block_bytes[layer], bytes)) return malformed("tensor sizes overflow");
             tensor_block = static_cast<std::uint32_t>(layer);
             const std::string suffix = name.substr(dot + 1);
             if (suffix == "attn_k.weight" || suffix == "attn_kv_a_mqa.weight") {
@@ -660,12 +706,12 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
                 any_attention_tensor = true;
             }
         } else if (name == "token_embd.weight") {
-            info.embedding_bytes += bytes;
+            if (!checked_add(info.embedding_bytes, bytes)) return malformed("tensor sizes overflow");
         } else if (name.rfind("output", 0) == 0) {
-            info.output_bytes += bytes;
+            if (!checked_add(info.output_bytes, bytes)) return malformed("tensor sizes overflow");
             if (name == "output.weight") output_vocab = second;
         } else {
-            info.other_bytes += bytes;
+            if (!checked_add(info.other_bytes, bytes)) return malformed("tensor sizes overflow");
         }
         if (info.tensors.size() < kMaxStoredTensors && name.size() <= kMaxStoredTensorName) {
             GgufTensorInfo entry;

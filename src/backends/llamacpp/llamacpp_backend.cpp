@@ -141,6 +141,77 @@ llama_flash_attn_type ToLlamaFlashAttn(FlashAttention mode) {
     return LLAMA_FLASH_ATTN_TYPE_AUTO;
 }
 
+llama_split_mode ToLlamaSplitMode(SplitMode mode) {
+    switch (mode) {
+        case SplitMode::kNone: return LLAMA_SPLIT_MODE_NONE;
+        case SplitMode::kLayer: return LLAMA_SPLIT_MODE_LAYER;
+        case SplitMode::kRow: return LLAMA_SPLIT_MODE_ROW;
+    }
+    return LLAMA_SPLIT_MODE_LAYER;  // unreachable after ValidatePlacementOptions
+}
+
+std::string_view LlamaSplitModeName(llama_split_mode mode) noexcept {
+    switch (mode) {
+        case LLAMA_SPLIT_MODE_NONE: return "none";
+        case LLAMA_SPLIT_MODE_LAYER: return "layer";
+        case LLAMA_SPLIT_MODE_ROW: return "row";
+        case LLAMA_SPLIT_MODE_TENSOR: return "tensor";
+    }
+    return "unknown";
+}
+
+// The single place that turns LoadOptions into llama_model_params; Load() and
+// ModelParamsFor() both use it. Buffers owned by the caller must outlive the
+// llama_model_load_from_file() call (which copies devices and tensor_split).
+llama_model_params MakeModelParams(const LoadOptions& options,
+                                   const std::vector<void*>& resolved_devices,
+                                   std::vector<ggml_backend_dev_t>& device_buf,
+                                   std::vector<float>& tensor_split_buf) {
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = options.n_gpu_layers;
+    mp.vocab_only = options.vocab_only;
+    mp.main_gpu = options.main_gpu;
+    mp.split_mode = ToLlamaSplitMode(options.split_mode);
+    // llama.cpp b11195 merges mmap and mlock into llama_model_params::load_mode.
+    // Default (use_mmap=true, use_mlock=false) preserves LLAMA_LOAD_MODE_AUTO.
+    if (options.use_mlock) {
+        mp.load_mode = options.use_mmap ? LLAMA_LOAD_MODE_MMAP_MLOCK : LLAMA_LOAD_MODE_MLOCK;
+    } else if (!options.use_mmap) {
+        mp.load_mode = LLAMA_LOAD_MODE_NONE;
+    }
+    device_buf.clear();
+    if (!resolved_devices.empty()) {
+        device_buf.reserve(resolved_devices.size() + 1);
+        for (void* dev : resolved_devices) {
+            device_buf.push_back(static_cast<ggml_backend_dev_t>(dev));
+        }
+        device_buf.push_back(nullptr);
+        mp.devices = device_buf.data();
+    }
+    tensor_split_buf.clear();
+    if (!options.tensor_split.empty()) {
+        // llama_model copies exactly llama_max_devices() floats from tensor_split.
+        const std::size_t slot_count = std::max<std::size_t>(llama_max_devices(), options.tensor_split.size());
+        tensor_split_buf.assign(slot_count, 0.0F);
+        std::copy(options.tensor_split.begin(), options.tensor_split.end(), tensor_split_buf.begin());
+        mp.tensor_split = tensor_split_buf.data();
+    }
+    return mp;
+}
+
+ModelParamsSummary SummarizeModelParams(const llama_model_params& mp) {
+    ModelParamsSummary s;
+    s.n_gpu_layers = mp.n_gpu_layers;
+    s.main_gpu = mp.main_gpu;
+    s.split_mode = std::string(LlamaSplitModeName(mp.split_mode));
+    const char* lm = llama_load_mode_name(mp.load_mode);
+    s.load_mode = lm != nullptr ? std::string(lm) : std::string("unknown");
+    s.vocab_only = mp.vocab_only;
+    s.has_tensor_split = mp.tensor_split != nullptr;
+    s.has_devices = mp.devices != nullptr;
+    return s;
+}
+
 // The single place that turns LoadOptions into llama_context_params; Load()
 // and ContextParamsFor() both use it. The abort callback is set by Load().
 llama_context_params MakeContextParams(const LoadOptions& options) {
@@ -278,6 +349,18 @@ std::string LlamaCppBackend::SystemInfo() {
     return s != nullptr ? std::string(s) : std::string();
 }
 
+ModelParamsSummary LlamaCppBackend::ModelParamsFor(const LoadOptions& options) {
+    std::vector<void*> resolved_devices;
+    (void)ResolveDevices(options.devices, &resolved_devices);
+    std::vector<ggml_backend_dev_t> device_buf;
+    std::vector<float> tensor_split_buf;
+    return SummarizeModelParams(MakeModelParams(options, resolved_devices, device_buf, tensor_split_buf));
+}
+
+ModelParamsSummary LlamaCppBackend::UpstreamModelDefaults() {
+    return SummarizeModelParams(llama_model_default_params());
+}
+
 ContextParamsSummary LlamaCppBackend::ContextParamsFor(const LoadOptions& options) {
     return Summarize(MakeContextParams(options));
 }
@@ -290,6 +373,33 @@ LlamaCppBackend::LlamaCppBackend() : impl_(std::make_unique<Impl>()) {}
 LlamaCppBackend::~LlamaCppBackend() = default;
 LlamaCppBackend::LlamaCppBackend(LlamaCppBackend&&) noexcept = default;
 LlamaCppBackend& LlamaCppBackend::operator=(LlamaCppBackend&&) noexcept = default;
+
+Status LlamaCppBackend::ResolveDevices(const std::vector<std::string>& device_names, std::vector<void*>* resolved) {
+    EnsureBackendInitialized();
+    if (resolved != nullptr) resolved->clear();
+    if (device_names.size() > llama_max_devices()) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "too many devices (llama.cpp accepts " + std::to_string(llama_max_devices()) + ")");
+    }
+    std::vector<void*> out;
+    out.reserve(device_names.size());
+    for (const std::string& name : device_names) {
+        if (name.empty()) {
+            return Status::Error(ErrorCode::kInvalidArgument, "device name in devices list is empty");
+        }
+        if (name.find('\0') != std::string::npos) {
+            return Status::Error(ErrorCode::kInvalidArgument, "device name in devices list contains NUL");
+        }
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name(name.c_str());
+        if (dev == nullptr) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "device '" + name + "' is not available in this build");
+        }
+        out.push_back(dev);
+    }
+    if (resolved != nullptr) *resolved = std::move(out);
+    return Status::Ok();
+}
 
 Status LlamaCppBackend::ResolveTensorOverrides(const std::vector<TensorOverride>& overrides,
                                                std::vector<void*>* buffer_types) {
@@ -331,13 +441,25 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
     if (options.model_path.empty()) {
         return Status::Error(ErrorCode::kInvalidArgument, "model_path is empty");
     }
-    // Validate placement before touching the file so a bad flag fails fast.
+    // Validate placement and context options before touching the file so a bad
+    // flag fails fast.
+    if (Status s = ValidatePlacementOptions(options); !s.ok()) {
+        return s;
+    }
+    std::vector<void*> resolved_devices;
+    if (Status s = ResolveDevices(options.devices, &resolved_devices); !s.ok()) {
+        return s;
+    }
     std::vector<void*> override_buffers;
     if (Status s = ResolveTensorOverrides(options.tensor_overrides, &override_buffers); !s.ok()) {
         return s;
     }
     if (Status s = ValidateContextOptions(options); !s.ok()) {
         return s;
+    }
+    if (!options.tensor_split.empty() && options.tensor_split.size() > llama_max_devices()) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "tensor_split exceeds llama_max_devices (" + std::to_string(llama_max_devices()) + ")");
     }
     std::error_code ec;
     const std::filesystem::path fs_path(std::u8string(options.model_path.begin(), options.model_path.end()));
@@ -352,10 +474,9 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
     Unload();
 
     const auto start = Clock::now();
-    llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = options.n_gpu_layers;
-    mp.vocab_only = options.vocab_only;
-    if (!options.use_mmap) mp.load_mode = LLAMA_LOAD_MODE_NONE;
+    std::vector<ggml_backend_dev_t> device_buf;
+    std::vector<float> tensor_split_buf;
+    llama_model_params mp = MakeModelParams(options, resolved_devices, device_buf, tensor_split_buf);
     // Null-terminated list; patterns point into `options`, which outlives the load.
     std::vector<llama_model_tensor_buft_override> overrides;
     if (!options.tensor_overrides.empty()) {

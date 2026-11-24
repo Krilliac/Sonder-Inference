@@ -549,7 +549,7 @@ void Supervisor::observe(Process &child) {
     gpu_.spilled = is_spilled(sample, options_.spill_guard, ctx);
     ++gpu_.samples;
     if (pid != 0)
-        residency_.observe(sample.dedicated_bytes);
+        residency_.observe(sample.dedicated_bytes, sample.shared_bytes);
     else
         residency_.unavailable();  // an unknown process id cannot prove missing offload
     record_residency();

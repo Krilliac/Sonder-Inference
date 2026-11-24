@@ -4,12 +4,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "cli/cli_args.hpp"
 #include "cli/sonder_infer_commands.hpp"
+#include "sonder/inference/device.hpp"
+#include "sonder/inference/json.hpp"
 #include "test_helpers.hpp"
 
 using namespace sonder::inference;
@@ -218,4 +221,114 @@ TEST_CASE("cli: --logit-bias parsing") {
         CHECK_FALSE(cli::parse_logit_bias(bad, out, error));
         CHECK_FALSE(error.empty());
     }
+}
+
+TEST_CASE("cli: parse devices subcommand with optional --json flag") {
+    std::string error;
+    const auto plain = cli::parse_command_args(cli::devices_command(), {}, error);
+    REQUIRE_MESSAGE(plain.has_value(), error);
+    CHECK(plain->command == "devices");
+    CHECK_FALSE(plain->has("json"));
+    CHECK_FALSE(plain->help);
+
+    const auto as_json = cli::parse_command_args(cli::devices_command(), {"--json"}, error);
+    REQUIRE_MESSAGE(as_json.has_value(), error);
+    CHECK(as_json->command == "devices");
+    CHECK(as_json->has("json"));
+    CHECK(cli::is_boolean_flag("--json"));
+
+    const auto legacy = parse({"devices", "--json"}, error);
+    REQUIRE_MESSAGE(legacy.has_value(), error);
+    CHECK(legacy->command == "devices");
+    CHECK(legacy->has("json"));
+
+    const auto help = cli::parse_command_args(cli::devices_command(), {"--help"}, error);
+    REQUIRE_MESSAGE(help.has_value(), error);
+    CHECK(help->help);
+
+    CHECK_FALSE(cli::parse_command_args(cli::devices_command(), {"--unknown-flag"}, error).has_value());
+    CHECK_FALSE(error.empty());
+    error.clear();
+    CHECK_FALSE(cli::parse_command_args(cli::devices_command(), {"gpu:0"}, error).has_value());
+    CHECK_FALSE(error.empty());
+}
+
+TEST_CASE("cli: devices inventory helpers cover discrete, UMA and unknown memory readings") {
+    constexpr std::uint64_t kMiB = 1024ull * 1024ull;
+    constexpr std::uint64_t kGiB = 1024ull * kMiB;
+
+    // Backwards-compatible CPU device inventory always includes cpu:0.
+    const auto devices = enumerate_devices();
+    REQUIRE_FALSE(devices.empty());
+    CHECK(devices.front().id == "cpu:0");
+    CHECK(devices.front().kind == DeviceKind::cpu);
+
+    // Live GPU enumeration succeeds cleanly on both GPU hosts and headless 0-GPU CI.
+    const auto live_gpus = enumerate_gpu_devices();
+    for (const auto& g : live_gpus) {
+        CHECK_FALSE(g.id.empty());
+        CHECK(std::string(to_string(g.vendor)).size() > 0u);
+        CHECK_FALSE(g.source.empty());
+    }
+
+    // Verify MiB + effective VRAM contract across discrete NVIDIA/AMD, UMA APU, and unknown readings.
+    GpuDeviceInfo rtx;
+    rtx.id = "gpu:0";
+    rtx.name = "NVIDIA GeForce RTX 5070 Ti";
+    rtx.vendor = GpuVendor::nvidia;
+    rtx.vendor_id = 0x10DEu;
+    rtx.device_id = 0x2C05u;
+    rtx.dedicated_total = MemoryReading::known(16303ull * kMiB);
+    rtx.dedicated_free = MemoryReading::known(14800ull * kMiB);
+    rtx.shared_total = MemoryReading::known(16ull * kGiB);
+    rtx.is_integrated_uma = false;
+    rtx.backend_hint = "cuda";
+    rtx.source = "dxgi";
+    CHECK(std::string(to_string(rtx.vendor)) == "nvidia");
+    CHECK(gpu_effective_vram_mib(rtx, false) == std::optional<std::uint64_t>(16303ull));
+    CHECK(gpu_effective_vram_mib(rtx, true) == std::optional<std::uint64_t>(14800ull));
+
+    GpuDeviceInfo rx_xt;
+    rx_xt.id = "gpu:1";
+    rx_xt.name = "AMD Radeon RX 7900 XT";
+    rx_xt.vendor = GpuVendor::amd;
+    rx_xt.vendor_id = 0x1002u;
+    rx_xt.device_id = 0x744Cu;
+    rx_xt.dedicated_total = MemoryReading::known(20ull * kGiB);
+    rx_xt.dedicated_free = MemoryReading::known(18ull * kGiB);
+    rx_xt.shared_total = MemoryReading::known(16ull * kGiB);
+    rx_xt.is_integrated_uma = false;
+    rx_xt.backend_hint = "rocm";
+    rx_xt.source = "amdgpu-sysfs";
+    CHECK(std::string(to_string(rx_xt.vendor)) == "amd");
+    CHECK(gpu_effective_vram_mib(rx_xt, false) == std::optional<std::uint64_t>(20480ull));
+    CHECK(gpu_effective_vram_mib(rx_xt, true) == std::optional<std::uint64_t>(18432ull));
+
+    GpuDeviceInfo apu;
+    apu.id = "gpu:2";
+    apu.name = "AMD Radeon 780M Graphics";
+    apu.vendor = GpuVendor::amd;
+    apu.vendor_id = 0x1002u;
+    apu.device_id = 0x15BFu;
+    apu.dedicated_total = MemoryReading::known(512ull * kMiB);
+    apu.dedicated_free = MemoryReading::known(384ull * kMiB + 14ull * kGiB);
+    apu.shared_total = MemoryReading::known(16ull * kGiB);
+    apu.is_integrated_uma = true;
+    apu.backend_hint = "rocm";
+    apu.source = "amdgpu-sysfs";
+    CHECK(gpu_effective_vram_mib(apu, false) == std::optional<std::uint64_t>(16896ull));
+    CHECK(gpu_effective_vram_mib(apu, true) == std::optional<std::uint64_t>(14720ull));
+
+    GpuDeviceInfo unknown_gpu;
+    unknown_gpu.id = "gpu:3";
+    unknown_gpu.name = "Unknown GPU";
+    unknown_gpu.vendor = GpuVendor::unknown;
+    unknown_gpu.dedicated_total = MemoryReading::unknown();
+    unknown_gpu.dedicated_free = MemoryReading::unknown();
+    unknown_gpu.shared_total = MemoryReading::unknown();
+    CHECK(std::string(to_string(unknown_gpu.vendor)) == "unknown");
+    CHECK_FALSE(gpu_effective_vram_mib(unknown_gpu, false).has_value());
+    CHECK_FALSE(gpu_effective_vram_mib(unknown_gpu, true).has_value());
+    CHECK(json::Value(gpu_effective_vram_mib(unknown_gpu, false)).is_null());
+    CHECK(json::Value(gpu_effective_vram_mib(unknown_gpu, true)).is_null());
 }

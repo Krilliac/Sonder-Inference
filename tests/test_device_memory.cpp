@@ -2,6 +2,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "doctest/doctest.h"
 #include "sonder/inference/device.hpp"
@@ -223,4 +224,236 @@ TEST_CASE("linux composition caps MemAvailable by the cgroup and never guesses p
           MemoryReading::known(100 * 1024));
     // MemAvailable of exactly 0 is known zero, not unknown.
     CHECK(compose_linux_host_memory("MemAvailable: 0 kB\n", none).available_physical.is_known_zero());
+}
+
+TEST_CASE("GPU vendor PCI IDs map to canonical vendors and strings") {
+    CHECK(gpu_vendor_from_pci_id(0x10DEu) == GpuVendor::nvidia);
+    CHECK(gpu_vendor_from_pci_id(0x1002u) == GpuVendor::amd);
+    CHECK(gpu_vendor_from_pci_id(0x8086u) == GpuVendor::intel);
+    CHECK(gpu_vendor_from_pci_id(0x106Bu) == GpuVendor::apple);
+    CHECK(gpu_vendor_from_pci_id(0x0000u) == GpuVendor::unknown);
+    CHECK(gpu_vendor_from_pci_id(0x1AF4u) == GpuVendor::unknown);
+
+    CHECK(std::string(to_string(GpuVendor::nvidia)) == "nvidia");
+    CHECK(std::string(to_string(GpuVendor::amd)) == "amd");
+    CHECK(std::string(to_string(GpuVendor::intel)) == "intel");
+    CHECK(std::string(to_string(GpuVendor::apple)) == "apple");
+    CHECK(std::string(to_string(GpuVendor::unknown)) == "unknown");
+}
+
+TEST_CASE("parse_amdgpu_sysfs_device parses discrete RX XT and integrated Ryzen APU UMA devices") {
+    constexpr std::uint64_t kMiB = 1024ull * 1024ull;
+    constexpr std::uint64_t kGiB = 1024ull * kMiB;
+
+    // Discrete AMD Radeon RX 7900 XT (20 GiB VRAM, 16 GiB GTT).
+    const auto rx7900xt_files = fake_files({
+        {"/sys/class/drm/card0/device/vendor", "0x1002\n"},
+        {"/sys/class/drm/card0/device/device", "0x744c\n"},
+        {"/sys/class/drm/card0/device/product_name", "AMD Radeon RX 7900 XT\n"},
+        {"/sys/class/drm/card0/device/uevent", "DRIVER=amdgpu\nPCI_ID=1002:744C\n"},
+        {"/sys/class/drm/card0/device/mem_info_vram_total", std::to_string(20 * kGiB) + "\n"},
+        {"/sys/class/drm/card0/device/mem_info_vram_used", std::to_string(2 * kGiB) + "\n"},
+        {"/sys/class/drm/card0/device/mem_info_gtt_total", std::to_string(16 * kGiB) + "\n"},
+        {"/sys/class/drm/card0/device/mem_info_gtt_used", std::to_string(1 * kGiB) + "\n"},
+    });
+    const auto rx7900xt = parse_amdgpu_sysfs_device("card0", rx7900xt_files);
+    REQUIRE(rx7900xt.has_value());
+    CHECK(rx7900xt->id == "gpu:0");
+    CHECK(rx7900xt->name == "AMD Radeon RX 7900 XT");
+    CHECK(rx7900xt->vendor == GpuVendor::amd);
+    CHECK(rx7900xt->vendor_id == 0x1002u);
+    CHECK(rx7900xt->device_id == 0x744cu);
+    CHECK_FALSE(rx7900xt->is_integrated_uma);
+    CHECK(rx7900xt->dedicated_total == MemoryReading::known(20 * kGiB));
+    CHECK(rx7900xt->dedicated_free == MemoryReading::known(18 * kGiB));
+    CHECK(rx7900xt->shared_total == MemoryReading::known(16 * kGiB));
+    CHECK(rx7900xt->backend_hint == "rocm");
+    CHECK(rx7900xt->source == "amdgpu-sysfs");
+    CHECK(gpu_effective_vram_mib(*rx7900xt, false) == std::optional<std::uint64_t>(20480));
+    CHECK(gpu_effective_vram_mib(*rx7900xt, true) == std::optional<std::uint64_t>(18432));
+
+    // Discrete AMD Radeon RX 9070 XT (16 GiB VRAM, fallback name from PCI device id).
+    const auto rx9070xt_files = fake_files({
+        {"/sys/class/drm/card2/device/vendor", "0x1002\n"},
+        {"/sys/class/drm/card2/device/uevent", "DRIVER=amdgpu\nPCI_ID=1002:7550\n"},
+        {"/sys/class/drm/card2/device/mem_info_vram_total", std::to_string(16 * kGiB) + "\n"},
+        {"/sys/class/drm/card2/device/mem_info_vram_used", std::to_string(512 * kMiB) + "\n"},
+        {"/sys/class/drm/card2/device/mem_info_gtt_total", std::to_string(16 * kGiB) + "\n"},
+    });
+    const auto rx9070xt = parse_amdgpu_sysfs_device("/sys/class/drm/card2/device", rx9070xt_files);
+    REQUIRE(rx9070xt.has_value());
+    CHECK(rx9070xt->id == "gpu:2");
+    CHECK(rx9070xt->device_id == 0x7550u);
+    CHECK(rx9070xt->name == "AMD Radeon (0x7550)");
+    CHECK_FALSE(rx9070xt->is_integrated_uma);
+    CHECK(gpu_effective_vram_mib(*rx9070xt, false) == std::optional<std::uint64_t>(16384));
+    CHECK(gpu_effective_vram_mib(*rx9070xt, true) == std::optional<std::uint64_t>(15872));
+
+    // Integrated Ryzen 780M APU UMA (512 MiB BIOS carveout + 16 GiB GTT).
+    const auto apu_files = fake_files({
+        {"/sys/class/drm/card1/device/vendor", "0x1002\n"},
+        {"/sys/class/drm/card1/device/device", "0x15bf\n"},
+        {"/sys/class/drm/card1/device/product_name", "AMD Radeon 780M Graphics\n"},
+        {"/sys/class/drm/card1/device/mem_info_vram_total", std::to_string(512 * kMiB) + "\n"},
+        {"/sys/class/drm/card1/device/mem_info_vram_used", std::to_string(128 * kMiB) + "\n"},
+        {"/sys/class/drm/card1/device/mem_info_gtt_total", std::to_string(16 * kGiB) + "\n"},
+        {"/sys/class/drm/card1/device/mem_info_gtt_used", std::to_string(2 * kGiB) + "\n"},
+    });
+    const auto apu = parse_amdgpu_sysfs_device("card1", apu_files);
+    REQUIRE(apu.has_value());
+    CHECK(apu->id == "gpu:1");
+    CHECK(apu->name == "AMD Radeon 780M Graphics");
+    CHECK(apu->is_integrated_uma);
+    CHECK(apu->dedicated_total == MemoryReading::known(512 * kMiB));
+    CHECK(apu->shared_total == MemoryReading::known(16 * kGiB));
+    CHECK(apu->dedicated_free == MemoryReading::known(384 * kMiB + 14 * kGiB));
+    CHECK(gpu_effective_vram_mib(*apu, false) == std::optional<std::uint64_t>(512 + 16384));
+    CHECK(gpu_effective_vram_mib(*apu, true) == std::optional<std::uint64_t>(384 + 14336));
+
+    // Integrated APU without mem_info_gtt_used: prefer_free falls back to full UMA pool, not 384 MiB carveout.
+    const auto apu_no_gtt_used = fake_files({
+        {"/sys/class/drm/card1/device/vendor", "0x1002\n"},
+        {"/sys/class/drm/card1/device/mem_info_vram_total", std::to_string(512 * kMiB) + "\n"},
+        {"/sys/class/drm/card1/device/mem_info_vram_used", std::to_string(128 * kMiB) + "\n"},
+        {"/sys/class/drm/card1/device/mem_info_gtt_total", std::to_string(16 * kGiB) + "\n"},
+    });
+    const auto apu2 = parse_amdgpu_sysfs_device("card1", apu_no_gtt_used);
+    REQUIRE(apu2.has_value());
+    CHECK(apu2->is_integrated_uma);
+    CHECK_FALSE(apu2->dedicated_free.is_known());
+    CHECK(gpu_effective_vram_mib(*apu2, true) == std::optional<std::uint64_t>(512 + 16384));
+
+    // Integrated APU with 2 GiB BIOS carveout + 16 GiB GTT is still detected as UMA.
+    const auto apu_2g_files = fake_files({
+        {"/sys/class/drm/card1/device/vendor", "0x1002\n"},
+        {"/sys/class/drm/card1/device/device", "0x15bf\n"},
+        {"/sys/class/drm/card1/device/mem_info_vram_total", std::to_string(2 * kGiB) + "\n"},
+        {"/sys/class/drm/card1/device/mem_info_gtt_total", std::to_string(16 * kGiB) + "\n"},
+    });
+    const auto apu_2g = parse_amdgpu_sysfs_device("card1", apu_2g_files);
+    REQUIRE(apu_2g.has_value());
+    CHECK(apu_2g->is_integrated_uma);
+    CHECK(gpu_effective_vram_mib(*apu_2g, false) == std::optional<std::uint64_t>(2048 + 16384));
+
+    // 4 GiB discrete AMD Radeon RX 6500 XT on a 32 GB host (16 GiB GTT) must NOT be misclassified as UMA.
+    const auto rx6500xt_files = fake_files({
+        {"/sys/class/drm/card0/device/vendor", "0x1002\n"},
+        {"/sys/class/drm/card0/device/device", "0x743f\n"},
+        {"/sys/class/drm/card0/device/product_name", "AMD Radeon RX 6500 XT\n"},
+        {"/sys/class/drm/card0/device/mem_info_vram_total", std::to_string(4 * kGiB) + "\n"},
+        {"/sys/class/drm/card0/device/mem_info_vram_used", std::to_string(512 * kMiB) + "\n"},
+        {"/sys/class/drm/card0/device/mem_info_gtt_total", std::to_string(16 * kGiB) + "\n"},
+        {"/sys/class/drm/card0/device/mem_info_gtt_used", std::to_string(256 * kMiB) + "\n"},
+    });
+    const auto rx6500xt = parse_amdgpu_sysfs_device("card0", rx6500xt_files);
+    REQUIRE(rx6500xt.has_value());
+    CHECK_FALSE(rx6500xt->is_integrated_uma);
+    CHECK(rx6500xt->dedicated_total == MemoryReading::known(4 * kGiB));
+    CHECK(rx6500xt->dedicated_free == MemoryReading::known(4 * kGiB - 512 * kMiB));
+    CHECK(gpu_effective_vram_mib(*rx6500xt, false) == std::optional<std::uint64_t>(4096));
+    CHECK(gpu_effective_vram_mib(*rx6500xt, true) == std::optional<std::uint64_t>(3584));
+
+    // Reject non-AMD vendors, non-amdgpu drivers, path traversal, and missing memory info.
+    const auto nvidia_card = fake_files({
+        {"/sys/class/drm/card0/device/vendor", "0x10de\n"},
+        {"/sys/class/drm/card0/device/mem_info_vram_total", std::to_string(16 * kGiB) + "\n"},
+    });
+    CHECK_FALSE(parse_amdgpu_sysfs_device("card0", nvidia_card).has_value());
+
+    const auto legacy_radeon = fake_files({
+        {"/sys/class/drm/card0/device/vendor", "0x1002\n"},
+        {"/sys/class/drm/card0/device/uevent", "DRIVER=radeon\n"},
+        {"/sys/class/drm/card0/device/mem_info_vram_total", std::to_string(4 * kGiB) + "\n"},
+    });
+    CHECK_FALSE(parse_amdgpu_sysfs_device("card0", legacy_radeon).has_value());
+    CHECK_FALSE(parse_amdgpu_sysfs_device("../card0", rx7900xt_files).has_value());
+    CHECK_FALSE(parse_amdgpu_sysfs_device("card0", fake_files({{"/sys/class/drm/card0/device/vendor", "0x1002\n"}}))
+                    .has_value());
+}
+
+TEST_CASE("select_gpu_vram_budget_mib prefers discrete over iGPU and honors device hints") {
+    constexpr std::uint64_t kMiB = 1024ull * 1024ull;
+    constexpr std::uint64_t kGiB = 1024ull * kMiB;
+
+    GpuDeviceInfo rtx;
+    rtx.id = "gpu:0";
+    rtx.name = "NVIDIA GeForce RTX 5070 Ti";
+    rtx.vendor = GpuVendor::nvidia;
+    rtx.vendor_id = 0x10DEu;
+    rtx.dedicated_total = MemoryReading::known(16303 * kMiB);
+    rtx.dedicated_free = MemoryReading::known(14800 * kMiB);
+    rtx.shared_total = MemoryReading::known(16 * kGiB);
+    rtx.is_integrated_uma = false;
+    rtx.backend_hint = "cuda";
+    rtx.source = "dxgi";
+
+    GpuDeviceInfo ryzen_igpu;
+    ryzen_igpu.id = "gpu:1";
+    ryzen_igpu.name = "AMD Radeon(TM) Graphics";
+    ryzen_igpu.vendor = GpuVendor::amd;
+    ryzen_igpu.vendor_id = 0x1002u;
+    ryzen_igpu.dedicated_total = MemoryReading::known(512 * kMiB);
+    ryzen_igpu.dedicated_free = MemoryReading::known(15000 * kMiB);
+    ryzen_igpu.shared_total = MemoryReading::known(16 * kGiB);
+    ryzen_igpu.is_integrated_uma = true;
+    ryzen_igpu.backend_hint = "vulkan";
+    ryzen_igpu.source = "dxgi";
+
+    // Even when the iGPU's UMA pool (16896 MiB) exceeds the discrete GPU's dedicated
+    // VRAM (16303 MiB), default selection picks the discrete RTX regardless of order.
+    const std::vector<GpuDeviceInfo> rtx_first{rtx, ryzen_igpu};
+    CHECK(select_gpu_vram_budget_mib(rtx_first) == std::optional<std::uint64_t>(16303));
+    CHECK(select_gpu_vram_budget_mib(rtx_first, {}, true) == std::optional<std::uint64_t>(14800));
+
+    GpuDeviceInfo igpu_zero = ryzen_igpu;
+    igpu_zero.id = "gpu:0";
+    GpuDeviceInfo rtx_one = rtx;
+    rtx_one.id = "gpu:1";
+    const std::vector<GpuDeviceInfo> igpu_first{igpu_zero, rtx_one};
+    CHECK(select_gpu_vram_budget_mib(igpu_first) == std::optional<std::uint64_t>(16303));
+    CHECK(select_gpu_vram_budget_mib(igpu_first, "CUDA0") == std::optional<std::uint64_t>(16303));
+    CHECK(select_gpu_vram_budget_mib(igpu_first, "CUDA0", true) == std::optional<std::uint64_t>(14800));
+    CHECK(select_gpu_vram_budget_mib(igpu_first, "ROCm0") == std::optional<std::uint64_t>(16896));
+    CHECK(select_gpu_vram_budget_mib(igpu_first, "HIP0", true) == std::optional<std::uint64_t>(15000));
+    CHECK(select_gpu_vram_budget_mib(igpu_first, "amd") == std::optional<std::uint64_t>(16896));
+    CHECK(select_gpu_vram_budget_mib(igpu_first, "nvidia") == std::optional<std::uint64_t>(16303));
+    CHECK(select_gpu_vram_budget_mib(igpu_first, "Vulkan0") == std::optional<std::uint64_t>(16896));
+    CHECK(select_gpu_vram_budget_mib(igpu_first, "Vulkan1") == std::optional<std::uint64_t>(16303));
+    CHECK(select_gpu_vram_budget_mib(igpu_first, "gpu:1") == std::optional<std::uint64_t>(16303));
+    CHECK(select_gpu_vram_budget_mib(igpu_first, "gpu:0") == std::optional<std::uint64_t>(16896));
+
+    // Explicit hints fail closed when no matching device exists.
+    CHECK_FALSE(select_gpu_vram_budget_mib(rtx_first, "CUDA1").has_value());
+    CHECK_FALSE(select_gpu_vram_budget_mib(rtx_first, "gpu:5").has_value());
+    CHECK_FALSE(select_gpu_vram_budget_mib(rtx_first, "intel").has_value());
+    CHECK_FALSE(select_gpu_vram_budget_mib({}).has_value());
+
+    // Multi-device hints sum unique GPUs; UMA-only hosts report the full UMA pool.
+    CHECK(select_gpu_vram_budget_mib(rtx_first, "CUDA0,ROCm0") == std::optional<std::uint64_t>(16303 + 16896));
+    CHECK(select_gpu_vram_budget_mib(rtx_first, "CUDA0,CUDA0") == std::optional<std::uint64_t>(16303));
+    CHECK(select_gpu_vram_budget_mib({ryzen_igpu}) == std::optional<std::uint64_t>(16896));
+    CHECK(select_gpu_vram_budget_mib({ryzen_igpu}, {}, true) == std::optional<std::uint64_t>(15000));
+
+    // Dual discrete GPUs pick the largest discrete GPU by default.
+    GpuDeviceInfo rx7900xt;
+    rx7900xt.id = "gpu:1";
+    rx7900xt.name = "AMD Radeon RX 7900 XT";
+    rx7900xt.vendor = GpuVendor::amd;
+    rx7900xt.vendor_id = 0x1002u;
+    rx7900xt.dedicated_total = MemoryReading::known(20 * kGiB);
+    rx7900xt.dedicated_free = MemoryReading::known(19 * kGiB);
+    rx7900xt.is_integrated_uma = false;
+    rx7900xt.backend_hint = "rocm";
+    CHECK(select_gpu_vram_budget_mib({rtx, rx7900xt}) == std::optional<std::uint64_t>(20480));
+    CHECK(select_gpu_vram_budget_mib({rtx, rx7900xt}, "CUDA0") == std::optional<std::uint64_t>(16303));
+    CHECK(select_gpu_vram_budget_mib({rtx, rx7900xt}, "ROCm0") == std::optional<std::uint64_t>(20480));
+}
+
+TEST_CASE("enumerate_gpu_devices returns well-formed entries without crashing") {
+    const auto gpus = enumerate_gpu_devices();
+    for (const auto& gpu : gpus) {
+        CHECK_FALSE(gpu.id.empty());
+        CHECK_FALSE(gpu.source.empty());
+        CHECK(std::string(to_string(gpu.vendor)).size() > 0);
+    }
 }

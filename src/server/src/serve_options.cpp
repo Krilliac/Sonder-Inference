@@ -330,7 +330,8 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
                 return usage_error("launch profile '" + profile->name +
                                    "': llamaserver config env override '" + env_key +
                                    "' is not permitted with --profile (only GPU/runtime tuning overrides such as "
-                                   "CUDA_*, GGML_*, VK_*, ROCR_*, HSA_*, HIP_*, OMP_* are allowed)");
+                                   "CUDA_*, GGML_*, VK_*, ROCR_*, ROCM_*, HSA_*, HIP_*, AMD_*, ROCBLAS_*, HIPBLASLT_*, "
+                                   "RADV_*, MESA_*, GPU_MAX_ALLOC_PERCENT, DRI_PRIME, OMP_* are allowed)");
             }
         }
         auto argv = llamaserver_arguments(*profile);

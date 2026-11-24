@@ -1,6 +1,7 @@
 // sonder-infer: command-line interface over the Sonder Inference library.
 // Reference: docs/CLI.md (commands, environment, exit codes, JSON shapes).
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -24,6 +25,7 @@
 #include "../../src/backends/llamaserver/tune.hpp"
 #endif
 #if defined(SONDER_HAS_SERVER)
+#include "sonder/inference/placement_planner.hpp"
 #include "sonder/inference/server.hpp"
 #endif
 #if defined(SONDER_HAS_BENCH)
@@ -80,8 +82,42 @@ int cmd_version(const Args& a) {
     return cli::kExitOk;
 }
 
+constexpr std::uint64_t kBytesPerMiB = 1024ull * 1024ull;
+
+si::json::Value reading_mib_json(const si::MemoryReading& reading) {
+    if (!reading.is_known()) return si::json::Value(nullptr);
+    return si::json::Value(reading.bytes_or(0) / kBytesPerMiB);
+}
+
+si::json::Value optional_u64_json(std::optional<std::uint64_t> value) {
+    return value ? si::json::Value(*value) : si::json::Value(nullptr);
+}
+
+std::string format_reading_mib(const si::MemoryReading& reading) {
+    if (!reading.is_known()) return "unknown";
+    return std::to_string(reading.bytes_or(0) / kBytesPerMiB);
+}
+
+si::json::Object gpu_to_json(const si::GpuDeviceInfo& g) {
+    return si::json::Object{
+        {"id", g.id},
+        {"name", g.name},
+        {"vendor", si::to_string(g.vendor)},
+        {"vendor_id", g.vendor_id},
+        {"device_id", g.device_id},
+        {"dedicated_total_mib", reading_mib_json(g.dedicated_total)},
+        {"dedicated_free_mib", reading_mib_json(g.dedicated_free)},
+        {"shared_total_mib", reading_mib_json(g.shared_total)},
+        {"effective_vram_mib", optional_u64_json(si::gpu_effective_vram_mib(g, false))},
+        {"effective_free_vram_mib", optional_u64_json(si::gpu_effective_vram_mib(g, true))},
+        {"is_integrated_uma", g.is_integrated_uma},
+        {"backend_hint", g.backend_hint},
+        {"source", g.source}};
+}
+
 int cmd_devices(const Args& a) {
     const auto devices = si::enumerate_devices();
+    const auto gpus = si::enumerate_gpu_devices();
     if (a.has("json")) {
         si::json::Array list;
         for (const auto& d : devices) {
@@ -92,7 +128,14 @@ int cmd_devices(const Args& a) {
                                                {"total_memory_bytes", d.total_memory_bytes},
                                                {"available_memory_bytes", d.available_memory_bytes}});
         }
-        std::cout << si::json::Value(si::json::Object{{"platform", si::host_platform()}, {"devices", std::move(list)}})
+        si::json::Array gpu_list;
+        gpu_list.reserve(gpus.size());
+        for (const auto& g : gpus) {
+            gpu_list.emplace_back(gpu_to_json(g));
+        }
+        std::cout << si::json::Value(si::json::Object{{"platform", si::host_platform()},
+                                                      {"devices", std::move(list)},
+                                                      {"gpus", std::move(gpu_list)}})
                          .dump()
                   << "\n";
         return cli::kExitOk;
@@ -102,8 +145,128 @@ int cmd_devices(const Args& a) {
                   << "  logical_cores=" << d.logical_cores << "  total_memory_mib=" << (d.total_memory_bytes >> 20)
                   << "  available_memory_mib=" << (d.available_memory_bytes >> 20) << "\n";
     }
+    for (const auto& g : gpus) {
+        std::cout << g.id << "  kind=gpu  vendor=" << si::to_string(g.vendor) << "  name=\"" << g.name << "\""
+                  << "  dedicated_total_mib=" << format_reading_mib(g.dedicated_total)
+                  << "  dedicated_free_mib=" << format_reading_mib(g.dedicated_free)
+                  << "  shared_total_mib=" << format_reading_mib(g.shared_total)
+                  << "  uma=" << (g.is_integrated_uma ? "true" : "false")
+                  << "  backend_hint=" << (g.backend_hint.empty() ? "none" : g.backend_hint)
+                  << "  source=" << (g.source.empty() ? "unknown" : g.source) << "\n";
+    }
     std::cout << "platform=" << si::host_platform() << "\n";
     return cli::kExitOk;
+}
+
+int cmd_plan(const Args& a) {
+#if defined(SONDER_HAS_SERVER)
+    const auto model = a.get("model");
+    if (!model || model->empty()) return usage_error("plan", "--model is required");
+
+    si::PlacementPlanRequest req;
+    req.model_path = *model;
+    if (const auto name = a.get("name")) {
+        if (name->empty()) return usage_error("plan", "--name must not be empty");
+        req.profile_name = *name;
+    }
+    if (const auto mmproj = a.get("mmproj")) {
+        if (mmproj->empty()) return usage_error("plan", "--mmproj must not be empty");
+        std::error_code ec;
+        const auto sz = std::filesystem::file_size(*mmproj, ec);
+        if (ec) {
+            err() << "error: plan: cannot stat --mmproj '" << *mmproj << "': " << ec.message() << "\n";
+            return cli::kExitFailure;
+        }
+        req.mmproj_path = *mmproj;
+        req.mmproj_bytes = static_cast<std::uint64_t>(sz);
+    }
+    std::string parse_err;
+    if (const auto ctx = a.get("ctx")) {
+        if (!cli::parse_integer<std::uint32_t>("ctx", *ctx, 128u, 1048576u, req.target_ctx_size, parse_err)) {
+            return usage_error("plan", parse_err);
+        }
+    }
+    if (const auto min_ctx = a.get("min-ctx")) {
+        if (!cli::parse_integer<std::uint32_t>("min-ctx", *min_ctx, 128u, 1048576u, req.min_ctx_size, parse_err)) {
+            return usage_error("plan", parse_err);
+        }
+    }
+    if (req.min_ctx_size > req.target_ctx_size) {
+        req.min_ctx_size = req.target_ctx_size;
+    }
+    if (const auto parallel = a.get("parallel")) {
+        if (!cli::parse_integer<std::uint32_t>("parallel", *parallel, 1u, 256u, req.parallel, parse_err)) {
+            return usage_error("plan", parse_err);
+        }
+    }
+    if (const auto headroom = a.get("headroom-mib")) {
+        if (!cli::parse_integer<std::uint64_t>("headroom-mib", *headroom, 0ull, 65536ull, req.vram_headroom_mib,
+                                               parse_err)) {
+            return usage_error("plan", parse_err);
+        }
+    }
+    if (const auto device = a.get("device")) req.device_hint = *device;
+    if (a.has("total-vram")) req.prefer_free_vram = false;
+    if (a.has("no-quantized-kv")) req.allow_quantized_kv = false;
+    if (a.has("no-speculative")) req.allow_speculative = false;
+    if (a.has("no-moe-offload")) req.allow_moe_cpu_offload = false;
+
+    const auto info = si::read_gguf_model_info(req.model_path);
+    if (!info.ok()) {
+        report_error("plan", info.status(), "");
+        return cli::exit_code_for(info.status());
+    }
+    const auto gpus = si::enumerate_gpu_devices();
+    const auto host = si::read_host_memory();
+    const auto plan = si::plan_model_placement(info.value(), gpus, host, req);
+
+    if (a.has("json")) {
+        std::cout << si::json::Value(si::placement_plan_to_json(plan)).dump() << "\n";
+        return cli::kExitOk;
+    }
+
+    std::cout << "profile=" << plan.profile.name << "  vendor=" << si::to_string(plan.selected_vendor)
+              << "  backend_hint=" << plan.recommended_backend_hint
+              << "  uma=" << (plan.uma_mode ? "true" : "false")
+              << "  prism_runtime=" << (plan.requires_prism_runtime ? "true" : "false") << "\n";
+    std::cout << "fits_vram=" << (plan.fits_in_vram ? "true" : "false")
+              << "  fits_host_ram=" << (plan.fits_in_host_ram ? "true" : "false")
+              << "  budget_mib=" << plan.budget_mib
+              << "  est_vram_mib=" << plan.estimate.total_mib()
+              << "  est_host_ram_mib=" << plan.estimate.host_resident_mib() << "\n";
+    std::cout << "ctx=" << plan.profile.ctx_size.value_or(0)
+              << "  kv=" << plan.profile.cache_type_k.value_or("f16") << "/"
+              << plan.profile.cache_type_v.value_or("f16")
+              << "  flash_attn=" << plan.profile.flash_attn.value_or("auto")
+              << "  n_gpu_layers=" << (plan.profile.n_gpu_layers ? std::to_string(*plan.profile.n_gpu_layers) : "auto");
+    if (plan.profile.device) std::cout << "  device=" << *plan.profile.device;
+    if (plan.profile.split_mode) std::cout << "  split_mode=" << *plan.profile.split_mode;
+    if (plan.profile.speculative && !plan.profile.speculative->types.empty()) {
+        std::cout << "  spec=";
+        for (std::size_t i = 0; i < plan.profile.speculative->types.size(); ++i) {
+            if (i > 0) std::cout << ",";
+            std::cout << plan.profile.speculative->types[i];
+        }
+        if (plan.profile.speculative->draft_n_max) {
+            std::cout << "(n=" << *plan.profile.speculative->draft_n_max << ")";
+        }
+    }
+    std::cout << "\n";
+    for (const auto& kv : plan.recommended_env) {
+        std::cout << "env: " << kv.first << "=" << kv.second << "\n";
+    }
+    for (const auto& w : plan.warnings) {
+        std::cout << "warning: " << w << "\n";
+    }
+    for (const auto& r : plan.reasons) {
+        std::cout << "reason: " << r << "\n";
+    }
+    return cli::kExitOk;
+#else
+    (void)a;
+    err() << "error: plan: this build does not include the server module (src/server)\n";
+    return cli::kExitUsage;
+#endif
 }
 
 int cmd_backends(const Args& a, const cli::EnvDefaults& env) {
@@ -529,6 +692,7 @@ int main(int argc, char** argv) {
 
     if (cmd == "version") return cmd_version(a);
     if (cmd == "devices") return cmd_devices(a);
+    if (cmd == "plan") return cmd_plan(a);
     if (cmd == "backends") return cmd_backends(a, env);
     if (cmd == "models") return cmd_models(a, env);
     if (cmd == "generate") return cmd_generate(a, env);

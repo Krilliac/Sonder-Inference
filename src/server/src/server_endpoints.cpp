@@ -1,13 +1,44 @@
 #include "server_endpoints.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <mutex>
+#include <vector>
 
 #include "health_features.hpp"
 #include "identity.hpp"
+#include "sonder/inference/device.hpp"
 #include "sonder/inference/engine.hpp"
 #include "sonder_inference.h"
 
 namespace sonder::inference::server::detail {
+
+namespace {
+
+// Short-lived serialized cache so concurrent `/v1/sonder/health` bursts do not
+// race platform GPU loader calls (DXGI/NVML) or stall health polling while
+// still reflecting free-VRAM changes within a couple of seconds.
+constexpr auto kGpuInventoryCacheTtl = std::chrono::seconds(2);
+
+std::vector<GpuDeviceInfo> cached_gpu_inventory() {
+    struct Cache {
+        std::mutex mu;
+        bool populated = false;
+        std::chrono::steady_clock::time_point refreshed_at{};
+        std::vector<GpuDeviceInfo> gpus;
+    };
+    static Cache cache;
+    std::lock_guard<std::mutex> lock(cache.mu);
+    const auto now = std::chrono::steady_clock::now();
+    if (!cache.populated || (now - cache.refreshed_at) >= kGpuInventoryCacheTtl) {
+        cache.gpus = enumerate_gpu_devices();
+        cache.refreshed_at = std::chrono::steady_clock::now();
+        cache.populated = true;
+    }
+    return cache.gpus;
+}
+
+}  // namespace
 
 json::Object sonder_meta() { return json::Object{{"api_version", kApiVersion}}; }
 
@@ -130,6 +161,7 @@ json::Object build_health_body(const HealthSnapshot& s) {
                              {"capacity", s.log_stats.capacity},
                              {"written", s.log_stats.written},
                              {"dropped", s.log_stats.dropped}}},
+        {"gpus", gpu_inventory_json(cached_gpu_inventory())},
         {"sonder", health_features(bound_backend, s.opts, sonder_meta())}};
 }
 

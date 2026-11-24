@@ -7,6 +7,7 @@
 #include <iosfwd>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "gpu_memory.hpp"
@@ -30,10 +31,12 @@ struct Grid {
     std::vector<std::uint64_t> ctx;
     std::vector<std::uint32_t> ubatch{512, 1024, 2048};
     std::vector<std::uint32_t> mtp{0, 1, 2, 3};
-    // Speculation variants are applied only to MTP rows.  The baseline (mtp=0)
-    // is emitted once and never multiplied by these axes.
+    // Speculation variants are applied only to speculative rows (mtp > 0).
+    // The baseline (mtp=0) is emitted once and never multiplied by these axes.
+    // Standalone "ngram-mod" may also run when mtp_available is false.
     std::vector<std::string> spec_type{"draft-mtp", "draft-mtp,ngram-mod"};
     std::vector<double> p_min{0.0, 0.5};
+    std::vector<std::string> flash_attn{"on"};
     std::uint32_t batch = 2048;
     struct Profile {
         // Calibration requires one llama-server slot; generated profiles may
@@ -75,9 +78,23 @@ struct Candidate {
     std::uint32_t mtp = 0;
     std::string spec_type = "draft-mtp";
     double p_min = 0.0;
-    bool operator==(const Candidate &) const = default;
+    std::string flash_attn = "on";
+    bool operator==(const Candidate &other) const noexcept {
+        if (kv != other.kv || ctx != other.ctx || ubatch != other.ubatch || mtp != other.mtp ||
+            flash_attn != other.flash_attn)
+            return false;
+        if (mtp == 0) return true;
+        if (spec_type != other.spec_type) return false;
+        if (spec_type == "ngram-mod") return true;
+        return p_min == other.p_min;
+    }
 };
-// The spill rule that applies to `candidate` (spill_mtp when it speculates).
+// True when `candidate` uses multi-token prediction weights/buffers
+// (draft-mtp or draft-mtp,ngram-mod), as opposed to baseline or standalone ngram-mod.
+inline bool uses_mtp(const Candidate &candidate) noexcept {
+    return candidate.mtp != 0 && candidate.spec_type != "ngram-mod";
+}
+// The spill rule that applies to `candidate` (spill_mtp when it uses MTP).
 const SpillGuardOptions &spill_guard_for(const Grid &grid, const Candidate &candidate);
 enum class Phase { probe, benchmark };
 enum class Verdict { clean, spill, slow_kernel, error, unsupported, timed_out, cancelled, release_failed };
@@ -148,6 +165,7 @@ Report search(const Options &options, bool mtp_available, Deadline deadline, con
 void rank(Report &report);
 json::Value report_json(const Options &options, const Report &report);
 std::string markdown(const Report &report);
+bool help_supports_spec_type(std::string_view help);
 int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostream &err);
 
 } // namespace sonder::inference::llamaserver::tune

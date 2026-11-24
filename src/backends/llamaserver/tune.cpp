@@ -6,10 +6,23 @@
 #include <iomanip>
 #include <set>
 #include <sstream>
+#include <string_view>
 
 namespace sonder::inference::llamaserver::tune {
 namespace {
 Status invalid(const char *message) { return {ErrorCode::invalid_argument, message}; }
+bool is_quantized_kv_type(std::string_view type) {
+    return type != "f16" && type != "bf16" && type != "f32";
+}
+bool is_valid_kv_flash_attn(const KvPair &kv, std::string_view flash_attn) {
+    return !(flash_attn == "off" && is_quantized_kv_type(kv.v));
+}
+bool is_supported_spec_type(std::string_view type) {
+    return type == "draft-mtp" || type == "draft-mtp,ngram-mod" || type == "ngram-mod";
+}
+bool spec_type_requires_mtp(std::string_view type) {
+    return type != "ngram-mod";
+}
 bool eligible(const Measurement &m) {
     const auto weighted = weighted_decode_tps(m.workloads);
     return m.phase == Phase::benchmark && m.verdict == Verdict::clean && m.memory_released &&
@@ -23,7 +36,13 @@ bool faster(const Measurement &a, const Measurement &b) {
     if (aw && bw && *aw != *bw) return *aw > *bw;
     if (a.prefill_tps != b.prefill_tps) return a.prefill_tps > b.prefill_tps;
     if (a.candidate.ctx != b.candidate.ctx) return a.candidate.ctx > b.candidate.ctx;
-    return a.candidate.mtp < b.candidate.mtp;
+    if (a.candidate.mtp != b.candidate.mtp) return a.candidate.mtp < b.candidate.mtp;
+    const auto rank_fa = [](std::string_view fa) noexcept -> int {
+        if (fa == "on") return 0;
+        if (fa == "auto") return 1;
+        return 2;
+    };
+    return rank_fa(a.candidate.flash_attn) < rank_fa(b.candidate.flash_attn);
 }
 json::Object spawn_config(const Options &options, const Candidate &candidate) {
     json::Array args;
@@ -58,9 +77,9 @@ json::Value measurement_json(const Measurement &m) {
     }
     const auto weighted = weighted_decode_tps(m.workloads);
     return json::Object{{"ctx", m.candidate.ctx}, {"k", m.candidate.kv.k}, {"v", m.candidate.kv.v},
-        {"ubatch", m.candidate.ubatch}, {"mtp_n", m.candidate.mtp},
+        {"flash_attn", m.candidate.flash_attn}, {"ubatch", m.candidate.ubatch}, {"mtp_n", m.candidate.mtp},
         {"spec_type", m.candidate.mtp == 0 ? "none" : m.candidate.spec_type},
-        {"p_min", m.candidate.mtp == 0 ? json::Value{} : json::Value(m.candidate.p_min)},
+        {"p_min", uses_mtp(m.candidate) ? json::Value(m.candidate.p_min) : json::Value{}},
         {"phase", m.phase == Phase::probe ? "probe" : "benchmark"},
         {"shared_mib", mib(m.shared_bytes)}, {"dedicated_mib", mib(m.dedicated_bytes)},
         {"short_tok_s", m.short_tps}, {"prefill_tok_s", m.prefill_tps},
@@ -93,7 +112,7 @@ std::optional<double> weighted_decode_tps(const std::vector<WorkloadMeasurement>
     return std::isfinite(total) ? std::optional<double>(total) : std::nullopt;
 }
 const SpillGuardOptions &spill_guard_for(const Grid &grid, const Candidate &candidate) {
-    return candidate.mtp > 0 ? grid.spill_mtp : grid.spill;
+    return uses_mtp(candidate) ? grid.spill_mtp : grid.spill;
 }
 const char *to_string(Verdict verdict) {
     switch (verdict) {
@@ -129,14 +148,15 @@ std::optional<std::uint64_t> margin_context(std::uint64_t edge) {
 }
 Status validate_grid(const Grid &g) {
     if (g.kv.empty() || g.kv.size() > 8 || g.ctx.empty() || g.ctx.size() > 128 ||
-        g.ubatch.empty() || g.ubatch.size() > 8 || g.mtp.empty() || g.mtp.size() > 4)
+        g.ubatch.empty() || g.ubatch.size() > 8 || g.mtp.empty() || g.mtp.size() > 4 ||
+        g.flash_attn.empty() || g.flash_attn.size() > 3)
         return invalid("grid arrays are empty or exceed their bounds");
-    const auto base_count = g.kv.size() * g.ctx.size() * g.ubatch.size() * g.mtp.size();
+    const auto base_count = g.kv.size() * g.ctx.size() * g.ubatch.size() * g.mtp.size() * g.flash_attn.size();
     if (base_count > 4096) return invalid("grid exceeds 4096 base candidate combinations");
     if (g.spec_type.empty() || g.spec_type.size() > 4 || g.p_min.empty() || g.p_min.size() > 4)
         return invalid("spec_type and p_min arrays are empty or exceed their bounds");
     const auto spec_variants = g.spec_type.size() * g.p_min.size();
-    if (g.kv.size() * g.ctx.size() * g.ubatch.size() * (1 + (g.mtp.size() - 1) * spec_variants) > 16384)
+    if (g.kv.size() * g.ctx.size() * g.ubatch.size() * g.flash_attn.size() * (1 + (g.mtp.size() - 1) * spec_variants) > 16384)
         return invalid("grid exceeds 16384 candidate combinations");
     if (g.batch == 0 || g.batch > 8192) return invalid("batch must be in [1, 8192]");
     const std::set<std::string> types{"q4_0", "q8_0", "q5_1", "f16", "bf16"};
@@ -149,8 +169,8 @@ Status validate_grid(const Grid &g) {
         std::adjacent_find(g.ctx.begin(), g.ctx.end()) != g.ctx.end())
         return invalid("ctx must be strictly increasing");
     for (auto n : g.ctx)
-        if (n < 16384 || n > 1048576 || n % kMargin != 0)
-            return invalid("ctx must be 4096-aligned in [16384, 1048576]");
+        if (n < 8192 || n > 1048576 || n % kMargin != 0)
+            return invalid("ctx must be 4096-aligned in [8192, 1048576]");
     std::set<std::uint32_t> batches, drafts;
     for (auto n : g.ubatch)
         if (n < 32 || n > g.batch || !batches.insert(n).second)
@@ -160,12 +180,22 @@ Status validate_grid(const Grid &g) {
     if (!drafts.contains(0)) return invalid("mtp must include 0 for the non-speculative baseline");
     std::set<std::string> spec_types;
     for (const auto &type : g.spec_type)
-        if ((type != "draft-mtp" && type != "draft-mtp,ngram-mod") || !spec_types.insert(type).second)
+        if (!is_supported_spec_type(type) || !spec_types.insert(type).second)
             return invalid("spec_type must contain unique supported values");
     std::set<double> pmins;
     for (const auto p : g.p_min)
         if (!std::isfinite(p) || p < 0 || p > 1 || !pmins.insert(p).second)
             return invalid("p_min must contain unique values in [0, 1]");
+    std::set<std::string> flash_attns;
+    for (const auto &fa : g.flash_attn)
+        if ((fa != "on" && fa != "off" && fa != "auto") || !flash_attns.insert(fa).second)
+            return invalid("flash_attn must contain unique values in {on, off, auto}");
+    bool any_valid_kv_fa = false;
+    for (const auto &pair : g.kv)
+        for (const auto &fa : g.flash_attn)
+            if (is_valid_kv_flash_attn(pair, fa)) any_valid_kv_fa = true;
+    if (!any_valid_kv_fa)
+        return invalid("grid has no valid (kv, flash_attn) pair (quantized V cache requires flash_attn on or auto)");
     const auto &p = g.profile;
     if (p.parallel != 1 || p.cache_ram > 1048576 || p.ctx_checkpoints == 0 ||
         p.ctx_checkpoints > 128 || p.checkpoint_min_step == 0 || p.checkpoint_min_step > 1048576 ||
@@ -199,13 +229,19 @@ Result<Grid> parse_grid(const json::Value &value) {
                 if (key == "ubatch") grid.ubatch.push_back(static_cast<std::uint32_t>(n.as_uint()));
                 if (key == "mtp") grid.mtp.push_back(static_cast<std::uint32_t>(n.as_uint()));
             }
-        } else if (key == "spec_type" || key == "p_min") {
-            if (!item.is_array()) return invalid("spec_type and p_min must be arrays");
+        } else if (key == "spec_type" || key == "p_min" || key == "flash_attn") {
+            if (!item.is_array()) return invalid("spec_type, p_min and flash_attn must be arrays");
             if (key == "spec_type") {
                 grid.spec_type.clear();
                 for (const auto &v : item.as_array()) {
                     if (!v.is_string()) return invalid("spec_type entries must be strings");
                     grid.spec_type.push_back(v.as_string());
+                }
+            } else if (key == "flash_attn") {
+                grid.flash_attn.clear();
+                for (const auto &v : item.as_array()) {
+                    if (!v.is_string()) return invalid("flash_attn entries must be strings");
+                    grid.flash_attn.push_back(v.as_string());
                 }
             } else {
                 grid.p_min.clear();
@@ -246,20 +282,33 @@ Result<Grid> parse_grid(const json::Value &value) {
 std::vector<Candidate> planned_candidates(const Grid &grid, bool mtp_available) {
     std::vector<Candidate> candidates;
     for (const auto &kv : grid.kv)
-        for (auto ctx : grid.ctx)
-            for (auto ubatch : grid.ubatch)
-                for (auto mtp : grid.mtp) {
-                    if (mtp != 0 && !mtp_available) continue;
-                    if (mtp == 0) candidates.push_back({kv, ctx, ubatch, mtp});
-                    else for (const auto &type : grid.spec_type)
-                        for (const auto p : grid.p_min) candidates.push_back({kv, ctx, ubatch, mtp, type, p});
-                }
+        for (const auto &fa : grid.flash_attn) {
+            if (!is_valid_kv_flash_attn(kv, fa)) continue;
+            for (auto ctx : grid.ctx)
+                for (auto ubatch : grid.ubatch)
+                    for (auto mtp : grid.mtp) {
+                        if (mtp == 0) {
+                            candidates.push_back({kv, ctx, ubatch, mtp, "draft-mtp", 0.0, fa});
+                        } else {
+                            for (const auto &type : grid.spec_type) {
+                                if (!mtp_available && spec_type_requires_mtp(type)) continue;
+                                if (type == "ngram-mod") {
+                                    candidates.push_back({kv, ctx, ubatch, mtp, type, 0.0, fa});
+                                } else {
+                                    for (const auto p : grid.p_min)
+                                        candidates.push_back({kv, ctx, ubatch, mtp, type, p, fa});
+                                }
+                            }
+                        }
+                    }
+        }
     return candidates;
 }
 std::vector<std::string> arguments(const Options &o, const Candidate &c) {
+    const std::string fa = c.flash_attn.empty() ? std::string("on") : c.flash_attn;
     std::vector<std::string> args{"--model", o.model, "--ctx-size", std::to_string(c.ctx),
         "--cache-type-k", c.kv.k, "--cache-type-v", c.kv.v, "--ubatch-size", std::to_string(c.ubatch),
-        "--batch-size", std::to_string(o.grid.batch), "--flash-attn", "on", "--parallel", std::to_string(o.grid.profile.parallel),
+        "--batch-size", std::to_string(o.grid.batch), "--flash-attn", fa, "--parallel", std::to_string(o.grid.profile.parallel),
         "--n-gpu-layers", "999", "--fit", "off"};
     args.emplace_back(o.grid.profile.no_kv_unified ? "--no-kv-unified" : "--kv-unified");
     args.insert(args.end(), {"--cache-ram", std::to_string(o.grid.profile.cache_ram), "--ctx-checkpoints",
@@ -271,10 +320,14 @@ std::vector<std::string> arguments(const Options &o, const Candidate &c) {
     if (!o.mmproj.empty()) args.insert(args.end(), {"--mmproj", o.mmproj});
     // Explicit none avoids inheriting a speculative default from the environment.
     // Older executables without --spec-type support use the ordinary default.
-    if (c.mtp != 0)
-        args.insert(args.end(), {"--spec-type", c.spec_type, "--spec-draft-n-max", std::to_string(c.mtp),
-            "--spec-draft-p-min", std::to_string(c.p_min)});
-    else if (o.spec_type_supported) args.insert(args.end(), {"--spec-type", "none"});
+    if (c.mtp != 0) {
+        if (c.spec_type == "ngram-mod") {
+            args.insert(args.end(), {"--spec-type", c.spec_type, "--spec-ngram-mod-n-max", std::to_string(c.mtp)});
+        } else {
+            args.insert(args.end(), {"--spec-type", c.spec_type, "--spec-draft-n-max", std::to_string(c.mtp),
+                "--spec-draft-p-min", std::to_string(c.p_min)});
+        }
+    } else if (o.spec_type_supported) args.insert(args.end(), {"--spec-type", "none"});
     return args;
 }
 
@@ -301,9 +354,18 @@ Report search(const Options &o, bool mtp_available, Deadline deadline, const Tri
         report.results.push_back(std::move(m));
         return report.results.size() - 1;
     };
+    struct LaneSpec {
+        KvPair kv;
+        std::string flash_attn;
+    };
+    std::vector<LaneSpec> lane_specs;
+    for (const auto &kv : o.grid.kv)
+        for (const auto &fa : o.grid.flash_attn)
+            if (is_valid_kv_flash_attn(kv, fa))
+                lane_specs.push_back({kv, fa});
     std::vector<Bisection> lanes;
-    std::vector<bool> abandoned(o.grid.kv.size(), false);
-    for (std::size_t i = 0; i < o.grid.kv.size(); ++i) lanes.emplace_back(o.grid.ctx);
+    std::vector<bool> abandoned(lane_specs.size(), false);
+    for (std::size_t i = 0; i < lane_specs.size(); ++i) lanes.emplace_back(o.grid.ctx);
     // Round-robin so one pair cannot monopolize the cheap-probe budget.
     bool progress = true;
     while (progress && !stopped && now() < probe_deadline) {
@@ -311,7 +373,8 @@ Report search(const Options &o, bool mtp_available, Deadline deadline, const Tri
         for (std::size_t i = 0; i < lanes.size(); ++i) {
             const auto ctx = lanes[i].next();
             if (abandoned[i] || !ctx) continue;
-            const auto index = run({o.grid.kv[i], *ctx, base_ubatch, 0}, Phase::probe, probe_deadline);
+            const auto index = run({lane_specs[i].kv, *ctx, base_ubatch, 0, "draft-mtp", 0.0, lane_specs[i].flash_attn},
+                                   Phase::probe, probe_deadline);
             if (!index) break;
             progress = true;
             const auto verdict = report.results[*index].verdict;
@@ -340,8 +403,9 @@ Report search(const Options &o, bool mtp_available, Deadline deadline, const Tri
         if (abandoned[i] || !lanes[i].edge()) continue;
         const auto ctx = margin_context(*lanes[i].edge());
         if (!ctx) continue;
-        if (*ctx >= kFastContext) measure({o.grid.kv[i], kFastContext, base_ubatch, 0});
-        measure({o.grid.kv[i], *ctx, base_ubatch, 0});
+        if (*ctx >= kFastContext)
+            measure({lane_specs[i].kv, kFastContext, base_ubatch, 0, "draft-mtp", 0.0, lane_specs[i].flash_attn});
+        measure({lane_specs[i].kv, *ctx, base_ubatch, 0, "draft-mtp", 0.0, lane_specs[i].flash_attn});
     }
     rank(report);
     std::vector<Candidate> leaders;
@@ -350,27 +414,34 @@ Report search(const Options &o, bool mtp_available, Deadline deadline, const Tri
         const auto c = report.results[*report.long_context].candidate;
         if (leaders.empty() || !(leaders.front() == c)) leaders.push_back(c);
     }
-    // At most two leaders; interleave profiles to keep MTP and ubatch coverage
-    // useful under a short budget. Every variant gets its own safety probe.
+    // At most two leaders; interleave profiles to keep speculation and ubatch
+    // coverage useful under a short budget. Every variant gets its own safety probe.
     for (auto ubatch : o.grid.ubatch)
         for (auto mtp : o.grid.mtp)
-            if (mtp == 0 || mtp_available)
-                for (auto c : leaders) {
-                    c.ubatch = ubatch;
-                    c.mtp = mtp;
-                    if (mtp == 0) {
-                        c.spec_type = "draft-mtp";
-                        c.p_min = 0.0;
-                        measure(c);
-                    } else {
-                        for (const auto &spec_type : o.grid.spec_type)
+            for (auto c : leaders) {
+                c.ubatch = ubatch;
+                c.mtp = mtp;
+                if (mtp == 0) {
+                    c.spec_type = "draft-mtp";
+                    c.p_min = 0.0;
+                    measure(c);
+                } else {
+                    for (const auto &spec_type : o.grid.spec_type) {
+                        if (!mtp_available && spec_type_requires_mtp(spec_type)) continue;
+                        if (spec_type == "ngram-mod") {
+                            c.spec_type = spec_type;
+                            c.p_min = 0.0;
+                            measure(c);
+                        } else {
                             for (const auto p_min : o.grid.p_min) {
                                 c.spec_type = spec_type;
                                 c.p_min = p_min;
                                 measure(c);
                             }
+                        }
                     }
                 }
+            }
     report.budget_exhausted = now() >= deadline || std::any_of(report.results.begin(), report.results.end(),
         [](const Measurement &m) { return m.verdict == Verdict::timed_out; });
     rank(report);
@@ -413,10 +484,11 @@ std::string markdown(const Report &report) {
         out << "- **" << name << "**: ";
         if (!index) { out << "unavailable (no eligible measurement).\n"; return; }
         const auto &m = report.results[*index];
-        out << m.candidate.kv.k << '/' << m.candidate.kv.v << ", ctx " << m.candidate.ctx
+        out << m.candidate.kv.k << '/' << m.candidate.kv.v << ", fa " << m.candidate.flash_attn
+            << ", ctx " << m.candidate.ctx
             << ", ubatch " << m.candidate.ubatch << ", MTP " << m.candidate.mtp
             << ", spec_type " << (m.candidate.mtp == 0 ? "none" : m.candidate.spec_type);
-        if (m.candidate.mtp != 0) out << ", p_min " << m.candidate.p_min;
+        if (uses_mtp(m.candidate)) out << ", p_min " << m.candidate.p_min;
         out << ", " << std::fixed << std::setprecision(1) << *weighted_decode_tps(m.workloads)
             << " weighted decode tok/s.\n";
     };
@@ -424,17 +496,18 @@ std::string markdown(const Report &report) {
     recommendation("Long context", report.long_context);
     out << "\nRecommendations reserve 4096 tokens below a clean probe of the same profile.\n"
            "Fastest means fastest measured within this budget; the search is not exhaustive.\n\n"
-           "| Phase | K/V | ctx | ubatch | MTP | spec_type | p_min | shared MiB | dedicated MiB | weighted decode tok/s | prefill tok/s | Verdict |\n"
-           "|---|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---|\n";
+           "| Phase | K/V | FA | ctx | ubatch | MTP | spec_type | p_min | shared MiB | dedicated MiB | weighted decode tok/s | prefill tok/s | Verdict |\n"
+           "|---|---|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---|\n";
     const auto number = [&](const auto &n, double divisor) {
         if (n) out << std::fixed << std::setprecision(1) << static_cast<double>(*n) / divisor;
         else out << "-";
     };
     for (const auto &m : report.results) {
         out << "| " << (m.phase == Phase::probe ? "probe" : "bench") << " | " << m.candidate.kv.k << '/'
-            << m.candidate.kv.v << " | " << m.candidate.ctx << " | " << m.candidate.ubatch << " | "
+            << m.candidate.kv.v << " | " << m.candidate.flash_attn << " | " << m.candidate.ctx << " | "
+            << m.candidate.ubatch << " | "
             << m.candidate.mtp << " | " << (m.candidate.mtp == 0 ? "none" : m.candidate.spec_type) << " | ";
-        if (m.candidate.mtp != 0) out << m.candidate.p_min;
+        if (uses_mtp(m.candidate)) out << m.candidate.p_min;
         else out << "-";
         out << " | ";
         number(m.shared_bytes, static_cast<double>(kMiB)); out << " | ";

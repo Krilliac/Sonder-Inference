@@ -42,23 +42,31 @@ KvCacheConfig read_kv_cache_config(const std::vector<std::string> &args);
 
 // Up-front pairing check. With FlashAttention not explicitly off:
 //  - K and V types that differ yield "kv_type_mismatch" (warning): llama.cpp
-//    has no default CUDA FlashAttention vector kernel for mixed pairs and
-//    converts K and V to f16; measured with q8_0/q5_1.
+//    has no default FlashAttention vector kernel for mixed pairs and may
+//    convert K and V to f16; measured on CUDA with q8_0/q5_1.
 //  - q5_1/q5_1 yields "kv_type_no_vector_kernel" (warning); measured.
 //  - other matching types outside f16/bf16/q8_0/q4_0 yield
-//    "kv_type_kernel_unknown" (info): such pairs may need GGML_CUDA_FA_QUANTS.
-std::vector<BackendWarning> check_kv_cache_pairing(const std::vector<std::string> &args);
+//    "kv_type_kernel_unknown" (info): on CUDA such pairs may need
+//    GGML_CUDA_FA_ALL_QUANTS=ON.
+// When `backend_hint` is empty, the backend is inferred from `--device`/`-dev`
+// in `args` (Vulkan*/ROCm*/HIP*/CUDA*), defaulting to CUDA wording.
+std::vector<BackendWarning> check_kv_cache_pairing(const std::vector<std::string> &args,
+                                                   std::string_view backend_hint = {});
 
 // ---- log parser -----------------------------------------------------------
 
 // Recognised lines (matched as substrings, so log prefixes and timestamps
 // do not matter):
-//   kv_kernel_f16_fallback  "no FlashAttention vector kernel compiled for K/V types <k>-<v>, converting K and V to f16 instead (slow)"
-//   mtp_tensors_ignored     "model has unused tensor blk.<n>.nextn.<name> (size = <bytes> bytes) -- ignoring"
-//   partial_gpu_offload     "offloaded <n>/<total> layers to GPU" with n < total
-//   cpu_buffer_fallback     "... cannot be used with preferred buffer type <buft>, using CPU instead"
-//   no_gpu_device           "no usable GPU found"
-//   gpu_init_failed         "failed to initialize CUDA"
+//   kv_kernel_f16_fallback       "no FlashAttention vector kernel compiled for K/V types <k>-<v>, converting K and V to f16 instead (slow)"
+//   mtp_tensors_ignored          "model has unused tensor blk.<n>.nextn.<name> (size = <bytes> bytes) -- ignoring"
+//   partial_gpu_offload          "offloaded <n>/<total> layers to GPU" with n < total
+//   cpu_buffer_fallback          "... cannot be used with preferred buffer type <buft>, using CPU instead"
+//   no_gpu_device                "no usable GPU found"
+//   gpu_init_failed              "failed to initialize CUDA", "failed to initialize HIP", "failed to initialize ROCm"
+//   rocm_runtime_error           "HSA_STATUS_ERROR", "hipError"
+//   vulkan_runtime_error         "failed to initialize Vulkan", "VK_ERROR_DEVICE_LOST"
+//   gpu_oom                      CUDA/HIP/Vulkan out-of-memory / "OutOfDeviceMemoryError"
+//   ternary_runtime_incompatible "unknown tensor type", "unsupported ggml type", "prism.hadamard" errors
 // Repeated occurrences fold into one warning (count, and summed sizes for
 // mtp_tensors_ignored). Lines are capped at kMaxLineBytes and the number of
 // distinct warnings at kMaxWarnings.

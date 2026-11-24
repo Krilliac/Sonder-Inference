@@ -1,4 +1,4 @@
-// Pure policy for detecting missing CUDA offload and post-readiness VRAM
+// Pure policy for detecting missing GPU offload and post-readiness VRAM
 // eviction.  Counter collection and process supervision remain outside this
 // header so the policy can be tested without a GPU or a child process.
 #pragma once
@@ -23,6 +23,11 @@ struct LlamaServerResidencyGuardOptions {
     LlamaServerEvictionPolicy on_eviction = LlamaServerEvictionPolicy::warn;
     // Independent supervisor-lifetime budget, never reset by relaunches.
     std::size_t max_eviction_restarts = 1;
+    // Integrated UMA GPUs (e.g. Ryzen APUs) keep model weights/KV in shared/GTT
+    // memory rather than the small dedicated carveout; when true,
+    // observe(dedicated_bytes, shared_bytes) counts dedicated + shared as active
+    // GPU memory.
+    bool uma_mode = false;
 };
 
 }  // namespace sonder::inference

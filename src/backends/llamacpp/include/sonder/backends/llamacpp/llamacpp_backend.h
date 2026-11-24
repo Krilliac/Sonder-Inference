@@ -70,12 +70,23 @@ enum class KvCacheType { kF16, kF32, kBF16, kQ8_0, kQ5_1, kQ5_0, kQ4_1, kQ4_0, k
 // decide per model and device; it is llama.cpp's default.
 enum class FlashAttention { kAuto, kDisabled, kEnabled };
 
+// How llama.cpp distributes model weights and KV cache across GPUs
+// (--split-mode). kLayer matches llama.cpp's default.
+enum class SplitMode { kNone, kLayer, kRow };
+
+// Maximum number of GPU entries accepted in LoadOptions::tensor_split and
+// LoadOptions::devices (matches llama_max_devices() in pinned llama.cpp).
+inline constexpr std::size_t kMaxTensorSplitDevices = 16;
+
 [[nodiscard]] std::string_view ToString(KvCacheType type) noexcept;
 [[nodiscard]] std::string_view ToString(FlashAttention mode) noexcept;
+[[nodiscard]] std::string_view ToString(SplitMode mode) noexcept;
 // Case-insensitive; returns false and leaves `out` untouched for an unknown name.
 [[nodiscard]] bool ParseKvCacheType(std::string_view name, KvCacheType& out) noexcept;
 // Accepts "auto", "on"/"enabled" and "off"/"disabled" (case-insensitive).
 [[nodiscard]] bool ParseFlashAttention(std::string_view name, FlashAttention& out) noexcept;
+// Accepts "none", "layer", and "row" (case-insensitive); leaves `out` untouched on failure.
+[[nodiscard]] bool ParseSplitMode(std::string_view name, SplitMode& out) noexcept;
 // True for block-quantized types (everything except f32, f16 and bf16).
 [[nodiscard]] bool IsQuantized(KvCacheType type) noexcept;
 
@@ -98,13 +109,49 @@ struct LoadOptions {
     KvCacheType type_k = KvCacheType::kF16;
     KvCacheType type_v = KvCacheType::kF16;
     FlashAttention flash_attn = FlashAttention::kAuto;
+    // Explicit ggml device names (e.g. "CUDA0", "ROCm0", "Vulkan0", "CUDA1")
+    // passed as a null-terminated llama_model_params::devices list. Empty uses
+    // llama.cpp's default device selection. Validated upfront before loading.
+    std::vector<std::string> devices;
+    // Primary GPU index used for the full model when split_mode == kNone and
+    // for scratch / non-split tensors. Must be >= 0.
+    std::int32_t main_gpu = 0;
+    // Multi-GPU split strategy; kLayer matches llama.cpp's default.
+    SplitMode split_mode = SplitMode::kLayer;
+    // Relative proportions of layers/rows across GPUs (empty = llama.cpp
+    // default). When non-empty: at most kMaxTensorSplitDevices (16) finite,
+    // non-negative values with at least one strictly positive entry.
+    std::vector<float> tensor_split;
+    // Lock model weights in RAM. Mapped via llama.cpp b11195's load_mode:
+    // use_mmap + use_mlock -> LLAMA_LOAD_MODE_MMAP_MLOCK; !use_mmap +
+    // use_mlock -> LLAMA_LOAD_MODE_MLOCK.
+    bool use_mlock = false;
 };
+
+// Checks placement options (main_gpu >= 0, split_mode, tensor_split finite /
+// non-negative / at least one positive / max 16, non-empty device names).
+// Pure: no file access and no llama.cpp calls. Load() runs this before
+// touching the model file.
+[[nodiscard]] Status ValidatePlacementOptions(const LoadOptions& options);
 
 // Checks the context options above (micro-batch vs batch, quantized V cache
 // vs Flash Attention). Pure: no file access and no llama.cpp calls. Load()
 // runs it before touching the model file. Always Ok for vocab_only loads,
 // which create no context.
 [[nodiscard]] Status ValidateContextOptions(const LoadOptions& options);
+
+// The llama_model_params values a Load() with given options passes to
+// llama.cpp, read back from the real parameter struct. For tests and
+// diagnostics.
+struct ModelParamsSummary {
+    std::int32_t n_gpu_layers = 0;
+    std::int32_t main_gpu = 0;
+    std::string split_mode;
+    std::string load_mode;
+    bool vocab_only = false;
+    bool has_tensor_split = false;
+    bool has_devices = false;
+};
 
 // The llama_context_params values a Load() with given options passes to
 // llama.cpp, read back from the real parameter struct. Names come from
@@ -251,12 +298,22 @@ public:
     [[nodiscard]] static Capabilities GetCapabilities() noexcept { return {}; }
     // Devices ggml can see in this build (CPU always; CUDA/Vulkan/Metal when compiled in).
     [[nodiscard]] static std::vector<DeviceInfo> EnumerateDevices();
+    // Checks each ggml device name (non-empty, registered in this build via
+    // ggml_backend_dev_by_name, at most llama_max_devices()). On success,
+    // `resolved` (if non-null) receives one opaque ggml_backend_dev_t per
+    // device, in order (not null-terminated). Needs no model file.
+    [[nodiscard]] static Status ResolveDevices(const std::vector<std::string>& device_names,
+                                               std::vector<void*>* resolved = nullptr);
     // Checks each override (non-empty valid regex, device present in this
     // build). On success, `buffer_types` (if non-null) receives one opaque
     // ggml buffer type per override, in order. Needs no model file.
     [[nodiscard]] static Status ResolveTensorOverrides(const std::vector<TensorOverride>& overrides,
                                                        std::vector<void*>* buffer_types = nullptr);
     [[nodiscard]] static std::string SystemInfo();
+    // Model parameters Load() would use for `options`, and llama.cpp's own
+    // llama_model_default_params(). Need no model file.
+    [[nodiscard]] static ModelParamsSummary ModelParamsFor(const LoadOptions& options);
+    [[nodiscard]] static ModelParamsSummary UpstreamModelDefaults();
     // Context parameters Load() would use for `options`, and llama.cpp's own
     // llama_context_default_params(). Need no model file.
     [[nodiscard]] static ContextParamsSummary ContextParamsFor(const LoadOptions& options);

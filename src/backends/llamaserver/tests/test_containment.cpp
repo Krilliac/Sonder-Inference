@@ -47,6 +47,7 @@
 #include <utility>
 #include <vector>
 
+#include "../env_policy.hpp"
 #include "../process.hpp"
 #include "../process_options.hpp"
 #include "net/http_client.hpp"
@@ -888,4 +889,183 @@ TEST_CASE("containment: ProcessLauncher rejects relative executable paths") {
         CHECK_FALSE(res.ok());
         CHECK(res.status().code() == ErrorCode::invalid_argument);
     }
+}
+
+TEST_CASE("containment: AMD ROCm and Vulkan tuning env vars are allowed while forbidden vars remain refused") {
+    const std::vector<std::string> allowed_vars = {
+        "AMD_LOG_LEVEL",
+        "AMD_SERIALIZE_KERNEL",
+        "ROCBLAS_TENSILE_LIBPATH",
+        "HIPBLASLT_TUNING_OVERRIDE_FILE",
+        "RADV_PERFTEST",
+        "RADV_DEBUG",
+        "MESA_VK_DEVICE_SELECT",
+        "ROCM_PATH",
+        "ROCR_VISIBLE_DEVICES",
+        "HIP_VISIBLE_DEVICES",
+        "HSA_OVERRIDE_GFX_VERSION",
+        "VK_ICD_FILENAMES",
+        "CUDA_VISIBLE_DEVICES",
+        "GGML_VK_VISIBLE_DEVICES",
+        "OMP_NUM_THREADS",
+        "GPU_MAX_ALLOC_PERCENT",
+        "GPU_MAX_HEAP_SIZE",
+        "GPU_SINGLE_ALLOC_PERCENT",
+        "GPU_FORCE_64BIT_PTR",
+        "GPU_USE_SYNC_OBJECTS",
+        "DRI_PRIME",
+    };
+    for (const auto &key : allowed_vars) {
+        CAPTURE(key);
+        CHECK(ls::is_allowed_profile_env_override(key));
+        CHECK(ls::is_allowed_inherited_env_name(std::string_view(key)));
+        CHECK(ls::validate_process_environment({{key, "1"}}).ok());
+#if defined(SONDER_HAS_SERVER)
+        const std::string obj = "{" + json_string(key) + ":\"1\"}";
+        CHECK(decision_of(config_status(spawn_config(obj))) == Decision::accepted);
+#endif
+    }
+
+    const std::vector<std::string> forbidden_vars = {
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "LLAMA_ARG_HF_REPO",
+        "LLAMA_ARG_MODEL",
+        "LLAMA_API_KEY",
+        "HF_TOKEN",
+        "AIP_MODE",
+        "MCP_SERVERS",
+        "HTTP_PROXY",
+        "SSL_CERT_FILE",
+        "PATH",
+        "HOME",
+        "APPDATA",
+        "AMD_API_KEY",
+        "ROCM_TOKEN",
+        "HIP_SECRET",
+        "RADV_PASSWORD",
+        "MESA_API_KEY",
+        "ROCBLAS_TOKEN",
+        "HIPBLASLT_SECRET",
+        "amd_api_key",
+        "rocm_token",
+    };
+    for (const auto &key : forbidden_vars) {
+        CAPTURE(key);
+        CHECK_FALSE(ls::is_allowed_profile_env_override(key));
+        CHECK(ls::validate_process_environment({{key, "x"}}).code() == ErrorCode::invalid_argument);
+#if defined(SONDER_HAS_SERVER)
+        const std::string obj = "{" + json_string(key) + ":\"x\"}";
+        CHECK(decision_of(config_status(spawn_config(obj))) == Decision::refused);
+#endif
+    }
+
+    // Non-allowlisted GPU-looking names must not bypass the exact-key gate.
+    for (const std::string key : {"GPU_ARBITRARY", "DRI_PRIME_EXTRA", "ARBITRARY_VAR"}) {
+        CAPTURE(key);
+        CHECK_FALSE(ls::is_allowed_profile_env_override(key));
+        CHECK_FALSE(ls::is_allowed_inherited_env_name(std::string_view(key)));
+    }
+
+    // Inherited safe AMD/Vulkan vars pass through ProcessOptions::prepare(), while
+    // credential-suffixed AMD/ROCm/Vulkan names stay stripped.
+    ScopedParentEnv amd_log("AMD_LOG_LEVEL", std::string("2"));
+    ScopedParentEnv radv("RADV_PERFTEST", std::string("aco"));
+    ScopedParentEnv mesa("MESA_VK_DEVICE_SELECT", std::string("1002:744c"));
+    ScopedParentEnv gpu_alloc("GPU_MAX_ALLOC_PERCENT", std::string("100"));
+    ScopedParentEnv dri("DRI_PRIME", std::string("1"));
+    ScopedParentEnv amd_key("AMD_API_KEY", std::string("secret-key"));
+    ScopedParentEnv rocm_tok("ROCM_TOKEN", std::string("secret-tok"));
+
+    ls::ProcessSpec spec;
+    ls::ProcessOptions prepared;
+    REQUIRE(prepared.prepare(spec).ok());
+    const auto entries = prepared_entries(prepared);
+    CHECK(values_named(entries, "AMD_LOG_LEVEL") == std::vector<std::string>{"2"});
+    CHECK(values_named(entries, "RADV_PERFTEST") == std::vector<std::string>{"aco"});
+    CHECK(values_named(entries, "MESA_VK_DEVICE_SELECT") == std::vector<std::string>{"1002:744c"});
+    CHECK(values_named(entries, "GPU_MAX_ALLOC_PERCENT") == std::vector<std::string>{"100"});
+    CHECK(values_named(entries, "DRI_PRIME") == std::vector<std::string>{"1"});
+    CHECK(values_named(entries, "AMD_API_KEY").empty());
+    CHECK(values_named(entries, "ROCM_TOKEN").empty());
+}
+
+TEST_CASE("containment: GPU loader hooks, log-file hooks and expanded credential suffixes are refused and stripped") {
+    const std::vector<std::string> blocked_vars = {
+        // Arbitrary library / layer / driver loaders
+        "GGML_BACKEND_PATH",
+        "CUDA_INJECTION64_PATH",
+        "CUDA_INJECTION32_PATH",
+        "HSA_TOOLS_LIB",
+        "VK_LAYER_PATH",
+        "VK_ADD_LAYER_PATH",
+        "VK_INSTANCE_LAYERS",
+        "VK_LOADER_LAYERS_ENABLE",
+        "VK_DRIVER_FILES",
+        "VK_ADD_DRIVER_FILES",
+        "MESA_LOADER_DRIVER_OVERRIDE",
+        // Arbitrary file-write log hooks
+        "AMD_LOG_LEVEL_FILE",
+        "HIPBLASLT_LOG_FILE",
+        "ROCBLAS_LOG_TRACE_PATH",
+        "ROCBLAS_LOG_BENCH_PATH",
+        // Expanded credential / proxy / certificate suffixes under GPU prefixes
+        "AMD_SECRET_KEY",
+        "AMD_APIKEY",
+        "AMD_ACCESS_KEY",
+        "AMD_PRIVATE_KEY",
+        "AMD_AUTH",
+        "AMD_AUTH_KEY",
+        "AMD_PASSWD",
+        "AMD_PASS",
+        "AMD_CREDENTIAL",
+        "AMD_CREDENTIALS",
+        "AMD_BEARER",
+        "AMD_HTTP_PROXY",
+        "AMD_CERT_FILE",
+        "AMD_CA_BUNDLE",
+        // Lowercase variants
+        "ggml_backend_path",
+        "amd_log_level_file",
+        "rocblas_log_trace_path",
+    };
+    for (const auto &key : blocked_vars) {
+        CAPTURE(key);
+        CHECK_FALSE(ls::is_allowed_profile_env_override(key));
+        CHECK_FALSE(ls::is_allowed_inherited_env_name(std::string_view(key)));
+        CHECK(ls::validate_process_environment({{key, "/tmp/evil"}}).code() == ErrorCode::invalid_argument);
+#if defined(SONDER_HAS_SERVER)
+        const std::string obj = "{" + json_string(key) + ":\"/tmp/evil\"}";
+        CHECK(decision_of(config_status(spawn_config(obj))) == Decision::refused);
+#endif
+    }
+
+    // Inherited parent hooks and expanded credential/proxy vars must be stripped
+    // while VK_ICD_FILENAMES and AMD_LOG_LEVEL remain allowed.
+    ScopedParentEnv ggml_path("GGML_BACKEND_PATH", std::string("/tmp/evil"));
+    ScopedParentEnv cuda_inj("CUDA_INJECTION64_PATH", std::string("/tmp/evil.so"));
+    ScopedParentEnv hsa_tools("HSA_TOOLS_LIB", std::string("/tmp/evil.so"));
+    ScopedParentEnv vk_layer("VK_LAYER_PATH", std::string("/tmp/layers"));
+    ScopedParentEnv amd_log_file("AMD_LOG_LEVEL_FILE", std::string("/tmp/out.log"));
+    ScopedParentEnv rocblas_log("ROCBLAS_LOG_TRACE_PATH", std::string("/tmp/trace.log"));
+    ScopedParentEnv amd_secret_key("AMD_SECRET_KEY", std::string("s3cr3t"));
+    ScopedParentEnv amd_proxy("AMD_HTTP_PROXY", std::string("http://evil.invalid:3128"));
+    ScopedParentEnv vk_icd("VK_ICD_FILENAMES", std::string("/usr/share/vulkan/icd.d/radeon_icd.json"));
+    ScopedParentEnv amd_level("AMD_LOG_LEVEL", std::string("1"));
+
+    ls::ProcessSpec spec;
+    ls::ProcessOptions prepared;
+    REQUIRE(prepared.prepare(spec).ok());
+    const auto entries = prepared_entries(prepared);
+    CHECK(values_named(entries, "GGML_BACKEND_PATH").empty());
+    CHECK(values_named(entries, "CUDA_INJECTION64_PATH").empty());
+    CHECK(values_named(entries, "HSA_TOOLS_LIB").empty());
+    CHECK(values_named(entries, "VK_LAYER_PATH").empty());
+    CHECK(values_named(entries, "AMD_LOG_LEVEL_FILE").empty());
+    CHECK(values_named(entries, "ROCBLAS_LOG_TRACE_PATH").empty());
+    CHECK(values_named(entries, "AMD_SECRET_KEY").empty());
+    CHECK(values_named(entries, "AMD_HTTP_PROXY").empty());
+    CHECK(values_named(entries, "VK_ICD_FILENAMES") ==
+          std::vector<std::string>{"/usr/share/vulkan/icd.d/radeon_icd.json"});
+    CHECK(values_named(entries, "AMD_LOG_LEVEL") == std::vector<std::string>{"1"});
 }

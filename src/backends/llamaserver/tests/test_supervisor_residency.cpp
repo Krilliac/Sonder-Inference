@@ -88,6 +88,10 @@ TEST_CASE("residency supervisor warns on CPU fallback only after consecutive rea
     CHECK(status.gpu_memory.residency->gpu_offload_missing);
     CHECK(status.gpu_memory.residency->action == "warn");
     CHECK_FALSE(status.gpu_memory.spilled);
+    REQUIRE_FALSE(status.warnings.empty());
+    CHECK(status.warnings.back().message.find("Check GPU backend availability (CUDA/ROCm/Vulkan) and the child's PATH") !=
+          std::string::npos);
+    CHECK(status.warnings.back().message.find("Check CUDA backend availability") == std::string::npos);
     CHECK(s->running());
     CHECK(f.starts() == 1);
     CHECK(child_at(f.launches, 0)->stops == 0);
@@ -113,6 +117,9 @@ TEST_CASE("residency supervisor refuse stops a CPU child without crash restart")
     REQUIRE(until([&] { return !s->failure().ok(); }));
     CHECK(s->failure().message().find("gpu_offload_missing") != std::string::npos);
     CHECK(s->failure().message().find("refusing to serve") != std::string::npos);
+    CHECK(s->failure().message().find("Check GPU backend availability (CUDA/ROCm/Vulkan) and the child's PATH") !=
+          std::string::npos);
+    CHECK(s->failure().message().find("Check CUDA backend availability") == std::string::npos);
     CHECK_FALSE(s->running());
     CHECK_FALSE(child_at(f.launches, 0)->alive);
     CHECK(f.starts() == 1);

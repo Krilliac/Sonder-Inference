@@ -11,22 +11,9 @@
 #include <utility>
 #include <vector>
 
+#include "sonder/inference/device.hpp"
 #include "sonder/inference/launch_profile.hpp"
 #include "vram_internal.hpp"
-
-#if defined(_WIN32)
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  ifndef NOMINMAX
-#    define NOMINMAX
-#  endif
-#  include <windows.h>
-#  if defined(_MSC_VER)
-#    include <dxgi.h>
-#    pragma comment(lib, "dxgi.lib")
-#  endif
-#endif
 
 namespace sonder::inference {
 
@@ -67,6 +54,15 @@ std::uint32_t recurrent_rollback_snapshots(const GgufModelInfo& model, const Lau
     return rolls_back && supported ? profile.speculative->draft_n_max.value_or(kDefaultDraftNMax) : 0;
 }
 
+bool is_device_none(const std::optional<std::string>& device) noexcept {
+    if (!device || device->size() != 4) return false;
+    const auto lower = [](char c) noexcept {
+        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    };
+    return lower((*device)[0]) == 'n' && lower((*device)[1]) == 'o' && lower((*device)[2]) == 'n' &&
+           lower((*device)[3]) == 'e';
+}
+
 }  // namespace
 
 VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const VramEstimateInputs& inputs) {
@@ -75,9 +71,11 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
     const bool mtp =
         p.speculative &&
         std::find(p.speculative->types.begin(), p.speculative->types.end(), "draft-mtp") != p.speculative->types.end();
-    // llama.cpp: -1/all, or more layers than blocks, also offloads the output.
-    const std::int64_t requested = p.n_gpu_layers.value_or(-1);
-    const bool all = requested < 0 || requested > static_cast<std::int64_t>(n_layer);
+    // llama.cpp: `--device none` disables GPU offload regardless of n_gpu_layers;
+    // otherwise -1/all, or more layers than blocks, also offloads the output.
+    const bool device_none = is_device_none(p.device);
+    const std::int64_t requested = device_none ? 0 : p.n_gpu_layers.value_or(-1);
+    const bool all = !device_none && (requested < 0 || requested > static_cast<std::int64_t>(n_layer));
     const std::uint32_t offloaded = all ? n_layer : static_cast<std::uint32_t>(requested);
     const std::uint32_t first_gpu = n_layer - offloaded;
     const std::uint32_t first_nextn = n_layer - std::min(m.nextn_layers, n_layer);
@@ -152,10 +150,28 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
             e.moe_placement_error = parsed.status().message();
         }
     }
+    if (p.load_mode) {
+        if (*p.load_mode == "auto" || *p.load_mode == "mmap") {
+            placement.mmap = true;
+            placement.mlock = false;
+        } else if (*p.load_mode == "none" || *p.load_mode == "dio") {
+            placement.mmap = false;
+            placement.mlock = false;
+        } else if (*p.load_mode == "mlock") {
+            placement.mmap = false;
+            placement.mlock = true;
+        } else if (*p.load_mode == "mmap+mlock") {
+            placement.mmap = true;
+            placement.mlock = true;
+        }
+    }
+    if (p.no_repack) {
+        placement.repack = !*p.no_repack;
+    }
     detail::TensorPlacementBreakdown placed =
         detail::evaluate_tensor_placement(m, placement, n_layer, first_gpu, first_nextn, mtp, e.notes);
     const bool fit_path = p.backend == kLaunchProfileBackendLlamaServer && p.fit.value_or(true) && !p.n_gpu_layers &&
-                          !placed.user_overrides;
+                          !device_none && !placed.user_overrides;
 
     double kv_per_token = 0.0;      // full-attention layers on the GPU
     double swa_kv_per_token = 0.0;  // sliding-window layers on the GPU
@@ -223,11 +239,12 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
                              "architectures checked against llama.cpp; every layer is counted at full context");
     }
 
-    if (!p.mmproj.empty() && p.mmproj_offload.value_or(true)) {
+    const bool mmproj_on_gpu = !p.mmproj.empty() && !device_none && p.mmproj_offload.value_or(true);
+    if (mmproj_on_gpu) {
         e.weights_bytes += inputs.mmproj_bytes;
         e.notes.emplace_back("vision encoder compute buffers are not included");
     }
-    if (p.speculative && !p.speculative->draft_model.empty()) {
+    if (!device_none && p.speculative && !p.speculative->draft_model.empty()) {
         e.weights_bytes += inputs.draft_model_bytes;
         e.notes.emplace_back("the draft model's KV cache is not included");
     }
@@ -260,6 +277,61 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
         e.notes.emplace_back("parallel unset: llama-server's automatic 4 slots keep 4 recurrent states");
     }
     e.total_bytes = e.weights_bytes + e.kv_bytes + e.recurrent_bytes + e.compute_bytes;
+    e.prism_hadamard = m.prism_hadamard;
+    e.requires_prism_runtime = m.has_prism_private_tensors || m.prism_hadamard;
+    if (e.requires_prism_runtime) {
+        std::string note = "model requires a PrismML Hadamard-capable runtime (PQ2_0/PTQ1_0";
+        if (!m.prism_hadamard_transform.empty()) {
+            note += ", transform=" + m.prism_hadamard_transform;
+        }
+        if (m.prism_hadamard_block_size > 0) {
+            note += ", block_size=" + std::to_string(m.prism_hadamard_block_size);
+        }
+        note += ")";
+        e.notes.push_back(std::move(note));
+    }
+    if (!p.tensor_split.empty() && e.total_bytes > 0) {
+        std::size_t positive_gpus = 0;
+        double weight_sum = 0.0;
+        double weight_max = 0.0;
+        for (const double w : p.tensor_split) {
+            if (std::isfinite(w) && w > 0.0) {
+                ++positive_gpus;
+                weight_sum += w;
+                weight_max = std::max(weight_max, w);
+            }
+        }
+        const std::string mode = p.split_mode.value_or("layer");
+        if (positive_gpus >= 2 && weight_sum > 0.0) {
+            if (mode == "row") {
+                // llama.cpp --split-mode row splits weights/rows across GPUs
+                // but keeps the KV cache unsplit on main_gpu.
+                const double max_share = weight_max / weight_sum;
+                const std::uint64_t splittable = saturating_add(e.weights_bytes, e.recurrent_bytes);
+                const std::uint64_t shard = std::min(
+                    splittable, saturating_u64(std::ceil(static_cast<double>(splittable) * max_share)));
+                e.max_gpu_bytes = saturating_add(shard, saturating_add(e.kv_bytes, e.compute_bytes));
+                e.notes.emplace_back("multi-GPU tensor_split (" + std::to_string(positive_gpus) +
+                                     " GPUs, split_mode=row): heaviest GPU shard estimated at " +
+                                     std::to_string(e.max_gpu_mib()) +
+                                     " MiB (proportional weights/recurrent + unsplit KV + compute)");
+            } else if (mode != "none") {
+                const double max_share = weight_max / weight_sum;
+                const std::uint64_t splittable =
+                    saturating_add(e.weights_bytes, saturating_add(e.kv_bytes, e.recurrent_bytes));
+                const std::uint64_t shard = std::min(
+                    splittable, saturating_u64(std::ceil(static_cast<double>(splittable) * max_share)));
+                e.max_gpu_bytes = saturating_add(shard, e.compute_bytes);
+                e.notes.emplace_back("multi-GPU tensor_split (" + std::to_string(positive_gpus) +
+                                     " GPUs, split_mode=" + mode + "): heaviest GPU shard estimated at " +
+                                     std::to_string(e.max_gpu_mib()) +
+                                     " MiB (proportional weights/KV/recurrent + compute)");
+            } else {
+                e.notes.emplace_back(
+                    "split_mode=none: tensor_split is not applied; all offloaded layers stay on one GPU");
+            }
+        }
+    }
 
     // ---- Host RAM resident estimate.
     // Weights: token_embd and the other non-block tensors, the output tensors
@@ -276,8 +348,11 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
             host_weights = saturating_add(host_weights, placed.moved_to_host[i]);
         }
     }
-    if (!p.mmproj.empty() && !p.mmproj_offload.value_or(true)) {
+    if (!p.mmproj.empty() && !mmproj_on_gpu) {
         host_weights = saturating_add(host_weights, inputs.mmproj_bytes);
+    }
+    if (device_none && p.speculative && !p.speculative->draft_model.empty()) {
+        host_weights = saturating_add(host_weights, inputs.draft_model_bytes);
     }
     std::uint64_t host_expert_total = placed.host_expert_total;
     std::uint64_t host_repacked_expert = placed.host_repacked_expert;
@@ -420,28 +495,12 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
     return e;
 }
 
+std::optional<std::uint64_t> detect_device_vram_mib(std::string_view device_hint, bool prefer_free) {
+    return select_gpu_vram_budget_mib(enumerate_gpu_devices(), device_hint, prefer_free);
+}
+
 std::optional<std::uint64_t> detect_device_vram_mib() {
-#if defined(_WIN32) && defined(_MSC_VER)
-    IDXGIFactory1* factory = nullptr;
-    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) || !factory) {
-        return std::nullopt;
-    }
-    std::uint64_t best = 0;
-    IDXGIAdapter1* adapter = nullptr;
-    for (UINT i = 0; SUCCEEDED(factory->EnumAdapters1(i, &adapter)) && adapter != nullptr; ++i) {
-        DXGI_ADAPTER_DESC1 desc{};
-        if (SUCCEEDED(adapter->GetDesc1(&desc)) && (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
-            best = std::max<std::uint64_t>(best, static_cast<std::uint64_t>(desc.DedicatedVideoMemory));
-        }
-        adapter->Release();
-        adapter = nullptr;
-    }
-    factory->Release();
-    if (best == 0) return std::nullopt;
-    return best / kMiB;
-#else
-    return std::nullopt;
-#endif
+    return detect_device_vram_mib(std::string_view{}, false);
 }
 
 }  // namespace sonder::inference

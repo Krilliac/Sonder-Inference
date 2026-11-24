@@ -223,8 +223,8 @@ TEST_CASE("cli commands: table integrity and help content") {
         const std::string help = cli::render_help(cli::kProgram, *c);
         CHECK(help.find("Usage:") != std::string::npos);
     }
-    for (const char* expected : {"version", "devices", "backends", "models", "generate", "chat", "bench", "serve",
-                                 "help"}) {
+    for (const char* expected : {"version", "devices", "plan", "backends", "models", "generate", "chat", "bench",
+                                 "serve", "help"}) {
         CAPTURE(expected);
         CHECK(cli::find_command(expected) != nullptr);
     }
@@ -262,8 +262,8 @@ TEST_CASE("cli commands: table integrity and help content") {
         CHECK(c->find("stats")->kind == cli::OptionKind::value);
         CHECK(c->find("stop")->kind == cli::OptionKind::repeat);
     }
-    for (const auto* c : {&cli::version_command(), &cli::devices_command(), &cli::backends_command(),
-                          &cli::models_command()}) {
+    for (const auto* c : {&cli::version_command(), &cli::devices_command(), &cli::plan_command(),
+                          &cli::backends_command(), &cli::models_command()}) {
         CAPTURE(c->name);
         REQUIRE(c->find("json") != nullptr);
         CHECK(c->find("json")->kind == cli::OptionKind::flag);

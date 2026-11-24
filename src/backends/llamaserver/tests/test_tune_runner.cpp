@@ -493,3 +493,99 @@ TEST_CASE("process optional environment and capture preserve the no-option launc
     CHECK(overrides.envp.back() == nullptr);
 #endif
 }
+
+TEST_CASE("tune runner handles standalone ngram-mod drafts and ignores unused nextn logs") {
+    // 1. Standalone ngram-mod succeeds when only a subset of workloads produce draft
+    // tokens (e.g. code_edit hits n-grams while prose has 0) and ignores mtp_tensors_ignored.
+    {
+        Fixture f;
+        f.candidate = {{"q4_0", "q4_0"}, 73728, 1024, 2, "ngram-mod", 0.0, "on"};
+        const auto base_exchange = f.dependencies.exchange;
+        unsigned chat_idx = 0;
+        f.dependencies.exchange = [&](std::uint16_t port, const std::string &method, const std::string &path,
+                                      const json::Value &body, tune::Deadline deadline,
+                                      const CancellationToken &cancel) -> Result<json::Value> {
+            if (path == "/v1/chat/completions") {
+                const unsigned idx = chat_idx++;
+                if (idx == 0) {
+                    std::ofstream log(f.log_path, std::ios::binary | std::ios::app);
+                    log << "model has unused tensor blk.64.nextn.eh_proj.weight (size = 43008000 bytes) -- ignoring\n";
+                }
+                const std::uint64_t drafted = idx == 1 ? 64u : 0u;
+                const std::uint64_t accepted = idx == 1 ? 48u : 0u;
+                json::Object timing{{"prompt_n", 400}, {"cache_n", 0}, {"predicted_n", 100},
+                                    {"prompt_ms", 100}, {"predicted_ms", 1000},
+                                    {"draft_n", drafted}, {"draft_n_accepted", accepted}};
+                json::Object response{{"choices", json::Array{json::Object{
+                    {"message", json::Object{{"role", "assistant"}, {"content", "Mock natural answer."}}},
+                    {"finish_reason", "stop"}}}},
+                    {"timings", std::move(timing)}};
+                return json::Value(std::move(response));
+            }
+            return base_exchange(port, method, path, body, deadline, cancel);
+        };
+        const auto result = f.run();
+        REQUIRE_MESSAGE(result.verdict == tune::Verdict::clean, result.detail);
+        CHECK(result.short_tps.has_value());
+        REQUIRE(f.state->specs.size() == 1);
+        const auto &argv = f.state->specs[0].arguments;
+        CHECK(std::find(argv.begin(), argv.end(), "--spec-ngram-mod-n-max") != argv.end());
+        CHECK(std::find(argv.begin(), argv.end(), "--spec-draft-n-max") == argv.end());
+        CHECK(std::find(argv.begin(), argv.end(), "--spec-draft-p-min") == argv.end());
+    }
+
+    // 2. Standalone ngram-mod fails if NO workload produces any draft tokens.
+    {
+        Fixture f;
+        f.candidate = {{"q4_0", "q4_0"}, 73728, 1024, 2, "ngram-mod", 0.0, "on"};
+        f.ignored_mtp = true; // Fixture returns draft_n=0 for all 4 workloads
+        const auto result = f.run();
+        CHECK(result.verdict == tune::Verdict::error);
+        CHECK(result.detail.find("no workload produced draft tokens") != std::string::npos);
+        CHECK_FALSE(result.short_tps);
+    }
+
+    // 3. Standalone ngram-mod fails if drafts were produced without draft_n_accepted.
+    {
+        Fixture f;
+        f.candidate = {{"q4_0", "q4_0"}, 73728, 1024, 2, "ngram-mod", 0.0, "on"};
+        f.missing_acceptance = true;
+        const auto result = f.run();
+        CHECK(result.verdict == tune::Verdict::error);
+        CHECK_FALSE(result.short_tps);
+    }
+
+    // 4. Standalone ngram-mod uses the non-MTP spill rule (310 MiB shared is spilled,
+    // unlike draft-mtp where 310 MiB is clean at 73k ctx).
+    {
+        Fixture f;
+        f.candidate = {{"q4_0", "q4_0"}, 73728, 1024, 2, "ngram-mod", 0.0, "on"};
+        auto underlying = f.dependencies.counters;
+        f.dependencies.counters = std::make_shared<FakeCounters>([&](std::uint32_t pid) -> Result<GpuProcessCounters> {
+            auto raw = underlying->read(pid);
+            if (raw.ok() && !raw.value().shared.empty() && raw.value().shared.front().value != 0)
+                raw.value().shared.front().value = 310 * kMiB;
+            return raw;
+        });
+        CHECK(f.run().verdict == tune::Verdict::spill);
+    }
+
+    // 5. True draft-mtp still treats mtp_tensors_ignored as a fatal error.
+    {
+        Fixture f;
+        f.candidate = {{"q4_0", "q4_0"}, 73728, 1024, 2, "draft-mtp", 0.0, "on"};
+        const auto base_exchange = f.dependencies.exchange;
+        f.dependencies.exchange = [&](std::uint16_t port, const std::string &method, const std::string &path,
+                                      const json::Value &body, tune::Deadline deadline,
+                                      const CancellationToken &cancel) -> Result<json::Value> {
+            if (path == "/tokenize") {
+                std::ofstream log(f.log_path, std::ios::binary | std::ios::app);
+                log << "model has unused tensor blk.64.nextn.eh_proj.weight (size = 43008000 bytes) -- ignoring\n";
+            }
+            return base_exchange(port, method, path, body, deadline, cancel);
+        };
+        const auto result = f.run();
+        CHECK(result.verdict == tune::Verdict::error);
+        CHECK(result.detail == "mtp_tensors_ignored");
+    }
+}
