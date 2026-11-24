@@ -22,6 +22,7 @@ class GpuResidencyGuard {
     void reset();
     void unavailable();
     void observe(std::uint64_t dedicated_bytes);
+    void observe(std::uint64_t dedicated_bytes, std::uint64_t shared_bytes);
     [[nodiscard]] bool gpu_offload_missing() const noexcept { return gpu_offload_missing_; }
     [[nodiscard]] bool vram_evicted() const noexcept { return vram_evicted_; }
     [[nodiscard]] std::uint64_t peak_dedicated_bytes() const noexcept { return peak_dedicated_bytes_; }

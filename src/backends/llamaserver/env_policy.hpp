@@ -57,9 +57,27 @@ inline bool is_credential_suffix(std::string_view upper) noexcept {
 inline bool is_gpu_runtime_prefix(std::string_view upper) noexcept {
     return starts_with(upper, "CUDA_") || starts_with(upper, "CUDNN_") || starts_with(upper, "GGML_") ||
            starts_with(upper, "VK_") || starts_with(upper, "ROCR_") || starts_with(upper, "ROCM_") ||
-           starts_with(upper, "HSA_") || starts_with(upper, "HIP_") || starts_with(upper, "NVIDIA_") ||
-           starts_with(upper, "SYCL_") || starts_with(upper, "ZE_") || starts_with(upper, "METAL_") ||
-           starts_with(upper, "MTL_");
+           starts_with(upper, "HSA_") || starts_with(upper, "HIP_") || starts_with(upper, "AMD_") ||
+           starts_with(upper, "ROCBLAS_") || starts_with(upper, "HIPBLASLT_") || starts_with(upper, "RADV_") ||
+           starts_with(upper, "MESA_") || starts_with(upper, "NVIDIA_") || starts_with(upper, "SYCL_") ||
+           starts_with(upper, "ZE_") || starts_with(upper, "METAL_") || starts_with(upper, "MTL_");
+}
+
+inline bool is_gpu_runtime_exact(std::string_view upper) noexcept {
+    static constexpr std::string_view kGpuRuntimeExact[] = {
+        "GPU_MAX_ALLOC_PERCENT",
+        "GPU_MAX_HEAP_SIZE",
+        "GPU_SINGLE_ALLOC_PERCENT",
+        "GPU_FORCE_64BIT_PTR",
+        "GPU_USE_SYNC_OBJECTS",
+        "DRI_PRIME",
+    };
+    for (const std::string_view exact : kGpuRuntimeExact) {
+        if (upper == exact) {
+            return true;
+        }
+    }
+    return false;
 }
 
 inline bool is_forbidden_override_upper(std::string_view upper) noexcept {
@@ -89,7 +107,8 @@ inline bool is_allowed_inherited_upper(std::string_view upper) noexcept {
         starts_with(upper, "MCP_") || starts_with(upper, "SONDER_")) {
         return false;
     }
-    if (is_gpu_runtime_prefix(upper) || starts_with(upper, "LC_") || starts_with(upper, "OMP_")) {
+    if (is_gpu_runtime_prefix(upper) || is_gpu_runtime_exact(upper) || starts_with(upper, "LC_") ||
+        starts_with(upper, "OMP_")) {
         return true;
     }
     static constexpr std::string_view kAllowedExact[] = {
@@ -202,7 +221,8 @@ inline bool is_allowed_profile_env_override(std::string_view key) {
     if (detail::is_forbidden_override_upper(upper)) {
         return false;
     }
-    return detail::is_gpu_runtime_prefix(upper) || detail::starts_with(upper, "OMP_");
+    return detail::is_gpu_runtime_prefix(upper) || detail::is_gpu_runtime_exact(upper) ||
+           detail::starts_with(upper, "OMP_");
 }
 
 }  // namespace sonder::inference::llamaserver

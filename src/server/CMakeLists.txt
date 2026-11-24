@@ -56,7 +56,8 @@ sonder_add_module_tests(server
     tests/test_server_priority.cpp
     tests/test_launch_profile.cpp
     tests/test_moe_placement.cpp
-    tests/test_gguf_artifact_observation.cpp)
+    tests/test_gguf_artifact_observation.cpp
+    tests/test_ternary_gguf.cpp)
 if(TARGET sonder_server_tests)
     target_include_directories(sonder_server_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     # GCC 13 raises a false -Wmaybe-uninitialized (fatal under -Werror) from <string> when a

@@ -122,6 +122,30 @@ flash attention off (so a quantized V cache cannot load for them).
 sonder-infer serve --backend llamacpp ... --cache-type-k q8_0 --cache-type-v q8_0
 ```
 
+## Multi-GPU, vendor targeting, and memory locking (implemented)
+
+The direct `llamacpp` backend exposes multi-GPU and vendor device placement on `LlamaCppBackendOptions` (`sonder/inference/backends/llamacpp.hpp`) and `LoadOptions` (`sonder/backends/llamacpp/llamacpp_backend.h`). All fields are additive and default to `llama.cpp`'s existing behavior. (`llamaserver` launch profiles pass the corresponding `--device`, `--main-gpu`, `--split-mode`, `--tensor-split`, and `--load-mode` flags to `llama-server`.)
+
+| `LlamaCppBackendOptions` | `LoadOptions` | Values / constraints | Default | `llama_model_params` (`b11195`) |
+| --- | --- | --- | --- | --- |
+| `devices` | `devices` | ggml device names (`CUDA0`, `CUDA1`, `ROCm0`, `Vulkan0`), max 16; resolved via `ggml_backend_dev_by_name` | empty (llama.cpp default) | null-terminated `mp.devices` |
+| `main_gpu` | `main_gpu` | integer `>= 0`; primary GPU for `split_mode = none` and non-split/scratch tensors | `0` | `mp.main_gpu` |
+| `split_mode` | `split_mode` | `layer`, `none`, `row` (case-insensitive) | `layer` | `mp.split_mode` (`LLAMA_SPLIT_MODE_*`) |
+| `tensor_split` | `tensor_split` | up to 16 finite floats `>= 0`, at least one `> 0` when non-empty | empty (equal / default) | `mp.tensor_split` (zero-padded to `llama_max_devices()`) |
+| `use_mlock` | `use_mlock` | boolean; locks weights in RAM | `false` | `mp.load_mode` (`LLAMA_LOAD_MODE_MMAP_MLOCK` with `use_mmap`, `LLAMA_LOAD_MODE_MLOCK` without) |
+
+Rules, checked before any model file is read (`invalid_argument`):
+
+- **Pure validation (`validate_llamacpp_options` / `ValidatePlacementOptions`)** rejects `main_gpu < 0`, unknown `split_mode`, empty or NUL-containing device names, more than 16 devices or split entries, and `tensor_split` entries that are NaN, infinite, negative, or all zero.
+- **Runtime device validation (`LlamaCppBackend::ResolveDevices`)** resolves every name in `devices` against ggml's registered backend devices in `Load()` before touching the model file. Passing an unavailable device (for example `CUDA0` on a CPU-only or Vulkan-only build) fails fast with `invalid_argument`.
+- **Load mode mapping in `b11195`**: `llama.cpp` `b11195` folds mmap and mlock into `llama_model_params::load_mode`. Leaving `use_mmap = true` and `use_mlock = false` preserves `LLAMA_LOAD_MODE_AUTO` (so backends without `mmap_support` still fall back automatically); `use_mmap = false, use_mlock = false` sets `LLAMA_LOAD_MODE_NONE`; `use_mlock = true` selects `LLAMA_LOAD_MODE_MMAP_MLOCK` (with `use_mmap = true`) or `LLAMA_LOAD_MODE_MLOCK` (with `use_mmap = false`).
+
+## Vendor and low-bit placement notes
+
+- **NVIDIA RTX (Ampere `sm_86`, Ada `sm_89`, Blackwell `sm_120`)**: build with `windows-cuda-rtx` or `linux-cuda-rtx` (`GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=86;89;120`, `GGML_CUDA_FA_ALL_QUANTS=ON`). `GGML_CUDA_FA_ALL_QUANTS=ON` ensures quantized KV caches (`q8_0`, `q4_0`, etc.) execute with CUDA Flash Attention rather than failing or falling back. On mixed RTX + iGPU workstations, `llama.cpp`'s default selection skips integrated GPUs when a discrete GPU is present; set `devices = {"CUDA0"}` (or `{"CUDA0", "CUDA1"}` with `split_mode` and `tensor_split`) to pin placement explicitly.
+- **AMD Radeon RX XT (RDNA 2/3/4) and Ryzen APU UMA**: build with `linux-rocm-xt` (`GGML_HIP=ON`, targeting `gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1200;gfx1201`) for native ROCm (`ROCm0`), or `windows-vulkan-xt` / `linux-vulkan-xt` (`GGML_VULKAN=ON`, `Vulkan0`) on Windows and non-ROCm Linux hosts. Discrete RX XT cards budget against dedicated VRAM, whereas Ryzen APUs (`gfx1103`, e.g. Radeon 780M/890M) expose only a small BIOS carveout as dedicated VRAM and run primarily out of shared UMA/GTT memory; UMA hosts should not treat shared GPU allocations as PCIe spill, and `LLAMA_LOAD_MODE_AUTO` handles devices without `mmap_support` automatically.
+- **Ternary, 1-bit, and FP4/FP8 GGUFs**: compact block formats shrink weight footprints dramatically — `Q1_0` (18 B / 128 elems, ~1.125 bpw), `PTQ1_0` (28 B / 128 elems, ~1.75 bpw), `PQ2_0` (34 B / 128 elems, ~2.125 bpw), `PQ2_0M` (36 B / 128 elems, KV-only), `Q2_0` (18 B / 64 elems, ~2.25 bpw), `NVFP4` (36 B / 64 elems, ~4.5 bpw), and `F8_E4M3` (1 B / elem, 8 bpw). Because weights occupy much less VRAM per parameter, KV cache sizing (`--cache-type-k`/`--cache-type-v`, Flash Attention) and context budget become the dominant VRAM lever on 16 GB cards. Running these files requires a matching runtime build: mainline `llama.cpp >= b11556` for stock `Q2_0`/`Q1_0`/`NVFP4`/`F8_E4M3`, or `PrismML-Eng/llama.cpp` (`prism` branch) for Hadamard-transformed `PQ2_0`/`PTQ1_0`/`PQ2_0M` (`prism.hadamard.*`); see [BACKENDS.md](BACKENDS.md#upstream-llamacpp-pin-and-ternary--prismml-overrides).
+
 ## Step 2 — per-model placement profiles (design)
 
 Today the operator picks overrides per `serve` invocation. [Launch profiles](integration/launch-profiles.md)

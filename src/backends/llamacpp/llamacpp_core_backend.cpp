@@ -41,13 +41,21 @@ Status ToStatus(const lc::Status& s) { return s.ok() ? Status::success() : Statu
 
 std::uint64_t MsToNs(double ms) { return ms > 0.0 ? static_cast<std::uint64_t>(ms * 1e6) : 0; }
 
-// Copies the context options into `lo` and validates them with the wrapper's
-// ValidateContextOptions (the same check Load() runs).
-Status ApplyContextOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo) {
+// Copies the context and placement options into `lo` and validates them with
+// the wrapper's pure validators (the same checks Load() runs).
+Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo) {
     lo.n_ctx = o.context_length;
     lo.n_batch = o.batch_size;
     lo.n_ubatch = o.ubatch_size;
     lo.n_threads = o.threads;
+    lo.devices = o.devices;
+    lo.main_gpu = o.main_gpu;
+    lo.tensor_split = o.tensor_split;
+    lo.use_mlock = o.use_mlock;
+    if (!lc::ParseSplitMode(o.split_mode, lo.split_mode)) {
+        return Status(ErrorCode::invalid_argument,
+                      "unknown split mode '" + o.split_mode + "' (expected none, layer or row)");
+    }
     if (!lc::ParseKvCacheType(o.kv_cache_type_k, lo.type_k)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown K cache type '" + o.kv_cache_type_k +
@@ -61,6 +69,9 @@ Status ApplyContextOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     if (!lc::ParseFlashAttention(o.flash_attention, lo.flash_attn)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown flash attention mode '" + o.flash_attention + "' (expected auto, on or off)");
+    }
+    if (lc::Status s = lc::ValidatePlacementOptions(lo); !s.ok()) {
+        return ToStatus(s);
     }
     return ToStatus(lc::ValidateContextOptions(lo));
 }
@@ -279,7 +290,7 @@ public:
 
         lc::LoadOptions lo;
         lo.model_path = path;
-        if (Status s = ApplyContextOptions(options_, lo); !s.ok()) return s;
+        if (Status s = ApplyBackendOptions(options_, lo); !s.ok()) return s;
         for (const auto& [pattern, device] : options_.tensor_overrides) {
             lo.tensor_overrides.push_back({pattern, device});
         }
@@ -343,7 +354,7 @@ private:
 
 Status validate_llamacpp_options(const LlamaCppBackendOptions& options) {
     lc::LoadOptions lo;
-    return ApplyContextOptions(options, lo);
+    return ApplyBackendOptions(options, lo);
 }
 
 std::shared_ptr<Backend> make_llamacpp_backend(LlamaCppBackendOptions options) {

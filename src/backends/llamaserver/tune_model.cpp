@@ -4,9 +4,32 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 namespace sonder::inference::llamaserver::tune {
 namespace {
+bool is_positive_gguf_int(std::uint64_t type, std::uint64_t raw) noexcept {
+    switch (type) {
+    case 0:  // uint8
+    case 2:  // uint16
+    case 4:  // uint32
+    case 10: // uint64
+        return raw > 0;
+    case 1:  // int8
+        return static_cast<std::int8_t>(raw) > 0;
+    case 3:  // int16
+        return static_cast<std::int16_t>(raw) > 0;
+    case 5:  // int32
+        return static_cast<std::int32_t>(raw) > 0;
+    case 11: // int64
+        return static_cast<std::int64_t>(raw) > 0;
+    default:
+        return false;
+    }
+}
+
 // GGUF v2/v3 directory fields are little endian. All reads/seeks are checked
 // against the actual file length and a 256 MiB metadata work limit. Never
 // allocate tokenizer arrays or touch the tensor payload.
@@ -42,7 +65,7 @@ class DirectoryReader {
         in_.seekg(static_cast<std::streamoff>(n), std::ios::cur);
         if (!in_) throw std::runtime_error("truncated GGUF value");
     }
-    std::string value(std::uint64_t type, bool retain) {
+    std::string value(std::uint64_t type, bool retain, std::uint64_t *raw_scalar = nullptr) {
         if (type == 8) {
             if (retain) return string();
             const auto n = integer(8);
@@ -51,14 +74,24 @@ class DirectoryReader {
         }
         if (type == 9) {
             const auto element = integer(4), count = integer(8);
-            if (count > 2000000 || element == 9 || element > 12)
+            if (element == 9 || element > 12)
                 throw std::runtime_error("invalid or oversized GGUF array");
             if (element == 8) {
+                if (count > 2000000)
+                    throw std::runtime_error("invalid or oversized GGUF array");
                 for (std::uint64_t i = 0; i < count; ++i) value(8, false);
-            } else skip(count * width(element));
+            } else {
+                const auto w = width(element);
+                // Scalar arrays (such as prism.hadamard.sign_values) skip in O(1)
+                // without allocation; check bounds before multiplying.
+                if (count > (1ull << 24) || count > (256ull * 1024 * 1024) / w)
+                    throw std::runtime_error("invalid or oversized GGUF array");
+                skip(count * w);
+            }
             return {};
         }
         const auto n = integer(width(type));
+        if (raw_scalar) *raw_scalar = n;
         return retain ? std::to_string(n) : std::string{};
     }
   private:
@@ -91,21 +124,47 @@ Result<ModelInfo> read_model_info(std::istream &input, const std::function<bool(
         if (version != 2 && version != 3) return Status(ErrorCode::unsupported, "only GGUF v2/v3 are supported");
         const auto tensors = reader.integer(8), entries = reader.integer(8);
         if (tensors > 1000000 || entries > 100000) return Status(ErrorCode::invalid_argument, "GGUF directory exceeds bounds");
+        ModelInfo info;
         ModelMetadata metadata;
+        std::string arch;
+        std::vector<std::pair<std::string, bool>> nextn_predict_keys;
+        static constexpr std::string_view kNextnSuffix = ".nextn_predict_layers";
+        static constexpr std::string_view kPrismPrefix = "prism.hadamard.";
         for (std::uint64_t i = 0; i < entries; ++i) {
             auto key = reader.string();
             const auto type = reader.integer(4);
+            if (key.size() >= kPrismPrefix.size() && key.compare(0, kPrismPrefix.size(), kPrismPrefix) == 0) {
+                info.prism_hadamard = true;
+            }
+            const bool is_nextn_predict =
+                key.size() > kNextnSuffix.size() &&
+                key.compare(key.size() - kNextnSuffix.size(), kNextnSuffix.size(), kNextnSuffix) == 0;
             const bool relevant = key == "general.architecture" || key == "split.count" ||
                 key.find("ssm") != std::string::npos || key.find("attention") != std::string::npos ||
                 key.find("attn") != std::string::npos || key.find("deltanet") != std::string::npos ||
                 key.find("recurrent") != std::string::npos;
-            auto value = reader.value(type, relevant);
+            std::uint64_t raw_scalar = 0;
+            auto value = reader.value(type, relevant, is_nextn_predict ? &raw_scalar : nullptr);
+            if (key == "general.architecture" && type == 8) {
+                arch = value;
+            }
+            if (is_nextn_predict) {
+                nextn_predict_keys.emplace_back(key, is_positive_gguf_int(type, raw_scalar));
+            }
             if (key == "split.count" && value != "0" && value != "1")
                 return Status(ErrorCode::unsupported, "calibration requires a single-file GGUF (nextn may be in another shard)");
             if (relevant) metadata.emplace_back(std::move(key), std::move(value));
         }
-        ModelInfo info;
         info.architecture = classify_model_architecture(metadata);
+        if (!arch.empty()) {
+            const std::string expected_key = arch + std::string(kNextnSuffix);
+            for (const auto &[key, positive] : nextn_predict_keys) {
+                if (key == expected_key && positive) {
+                    info.has_nextn = true;
+                    break;
+                }
+            }
+        }
         for (std::uint64_t i = 0; i < tensors; ++i) {
             const auto name = reader.string();
             const auto dimensions = reader.integer(4);

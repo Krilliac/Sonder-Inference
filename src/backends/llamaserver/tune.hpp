@@ -30,10 +30,12 @@ struct Grid {
     std::vector<std::uint64_t> ctx;
     std::vector<std::uint32_t> ubatch{512, 1024, 2048};
     std::vector<std::uint32_t> mtp{0, 1, 2, 3};
-    // Speculation variants are applied only to MTP rows.  The baseline (mtp=0)
-    // is emitted once and never multiplied by these axes.
+    // Speculation variants are applied only to speculative rows (mtp > 0).
+    // The baseline (mtp=0) is emitted once and never multiplied by these axes.
+    // Standalone "ngram-mod" may also run when mtp_available is false.
     std::vector<std::string> spec_type{"draft-mtp", "draft-mtp,ngram-mod"};
     std::vector<double> p_min{0.0, 0.5};
+    std::vector<std::string> flash_attn{"on"};
     std::uint32_t batch = 2048;
     struct Profile {
         // Calibration requires one llama-server slot; generated profiles may
@@ -75,6 +77,7 @@ struct Candidate {
     std::uint32_t mtp = 0;
     std::string spec_type = "draft-mtp";
     double p_min = 0.0;
+    std::string flash_attn = "on";
     bool operator==(const Candidate &) const = default;
 };
 // The spill rule that applies to `candidate` (spill_mtp when it speculates).

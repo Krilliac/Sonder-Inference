@@ -38,11 +38,13 @@ struct GpuProcessCounters {
 };
 
 // Source of raw counter instances for a process. Injected in tests; the
-// production source reads PDH on Windows and is unsupported elsewhere.
+// production source reads PDH on Windows, DRM fdinfo / optional NVML on Linux,
+// and is unsupported elsewhere (or on Linux hosts without amdgpu/NVML).
 class GpuCounterSource {
   public:
     virtual ~GpuCounterSource() = default;
-    // Short identifier reported as GpuMemoryStatus::probe ("pdh", "none", ...).
+    // Short identifier reported as GpuMemoryStatus::probe ("pdh", "amdgpu-fdinfo",
+    // "nvml", "amdgpu-fdinfo+nvml", "none", ...).
     [[nodiscard]] virtual std::string name() const = 0;
     // False when the platform has no per-process GPU memory counters.
     [[nodiscard]] virtual bool supported() const = 0;
@@ -51,9 +53,17 @@ class GpuCounterSource {
     virtual Result<GpuProcessCounters> read(std::uint32_t pid) = 0;
 };
 
-// Windows: PDH `GPU Process Memory`. Elsewhere: an unsupported source whose
-// read() returns ErrorCode::unsupported (NVML is a possible later addition).
+// Windows: PDH `GPU Process Memory`. Linux: amdgpu `/proc/<pid>/fdinfo/*` and/or
+// dynamic `libnvidia-ml.so.1` when present, falling back cleanly to an
+// unsupported source (`"none"`) when neither is present. Elsewhere: unsupported.
 std::shared_ptr<GpuCounterSource> make_gpu_counter_source();
+
+// Parses Linux DRM `/proc/<pid>/fdinfo/*` text (single entry or concatenated
+// entries) for `drm-memory-vram:` and `drm-memory-gtt:` lines (`B`, `KiB`,
+// `MiB`, `GiB`). Deduplicates repeated descriptors sharing the same
+// `drm-client-id:` (scoped by `drm-driver:` when present). Compiled on all
+// platforms so it is testable everywhere.
+bool parse_linux_drm_fdinfo(std::string_view fdinfo_text, std::uint64_t &vram_bytes, std::uint64_t &gtt_bytes);
 
 struct GpuMemorySample {
     std::uint64_t dedicated_bytes = 0;
@@ -104,6 +114,10 @@ struct SpillGuardOptions {
     std::uint64_t min_ctx = 8192;
     std::size_t max_attempts = 4;
     LlamaServerResidencyGuardOptions residency;
+    // Integrated UMA GPUs (e.g. Ryzen APUs) legitimately allocate GPU buffers
+    // in shared/GTT system memory; when true, is_spilled() never flags shared
+    // usage as a PCIe VRAM spill.
+    bool uma_mode = false;
 };
 
 Status validate_spill_guard(const SpillGuardOptions &options);

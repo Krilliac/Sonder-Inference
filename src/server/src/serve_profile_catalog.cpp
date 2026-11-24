@@ -5,6 +5,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -41,11 +42,20 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const La
     const auto budget_for = [&](const LaunchProfile& p) -> std::optional<std::uint64_t> {
         if (budget_flag) return budget_flag;
         if (p.vram_budget_mib) return p.vram_budget_mib;
-        if (!detection_done) {
-            detected = detect_device_vram_mib();
-            detection_done = true;
+        std::optional<std::uint64_t> device_mib;
+        if (p.device && !p.device->empty()) {
+            const std::string_view full(*p.device);
+            const std::size_t comma = full.find(',');
+            const std::string_view hint = comma == std::string_view::npos ? full : full.substr(0, comma);
+            device_mib = detect_device_vram_mib(hint);
+        } else {
+            if (!detection_done) {
+                detected = detect_device_vram_mib();
+                detection_done = true;
+            }
+            device_mib = detected;
         }
-        if (detected && *detected > kDefaultVramReserveMib) return *detected - kDefaultVramReserveMib;
+        if (device_mib && *device_mib > kDefaultVramReserveMib) return *device_mib - kDefaultVramReserveMib;
         return std::nullopt;
     };
     // llamaserver offloads by default (--n-gpu-layers auto); the llamacpp
@@ -64,6 +74,8 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const La
     for (const auto& p : profiles) {
         const bool is_active = &p == &active;
         std::optional<VramEstimate> estimate;
+        bool info_prism_hadamard = false;
+        bool info_requires_prism_runtime = false;
         std::string estimate_error;         // for the operator's log and refusal (includes the path)
         std::string public_estimate_error;  // for /v1/models (path redacted)
         std::optional<std::uint64_t> budget;
@@ -74,6 +86,8 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const La
             if (offloads(p)) budget = budget_for(p);
             auto info = read_gguf_model_info(p.model);  // header only
             if (info.ok()) {
+                info_prism_hadamard = info->prism_hadamard;
+                info_requires_prism_runtime = info->has_prism_private_tensors || info->prism_hadamard;
                 VramEstimateInputs in{};
                 in.mmproj_bytes = file_bytes(p.mmproj);
                 in.draft_model_bytes = p.speculative ? file_bytes(p.speculative->draft_model) : 0;
@@ -91,6 +105,10 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const La
             }
         }
         json::Object meta = launch_profile_metadata(p, offloads(p) ? estimate : std::nullopt, budget);
+        if (info_prism_hadamard || info_requires_prism_runtime) {
+            meta.set("prism_hadamard", json::Value(info_prism_hadamard));
+            meta.set("requires_prism_runtime", json::Value(info_requires_prism_runtime));
+        }
         if (!public_estimate_error.empty()) meta.set("estimate_error", public_estimate_error);
         meta.set("served", is_active);
         catalog.emplace_back(meta);
@@ -161,10 +179,13 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const La
             kv += std::to_string(e.attention_layers) + " attention layers x " + std::to_string(e.context_per_sequence) +
                   " tokens";
         }
+        const bool multi_gpu_split = e.max_gpu_bytes > 0;
+        const std::uint64_t check_mib = multi_gpu_split ? e.max_gpu_mib() : e.total_mib();
         std::string summary = "launch profile '" + p.name + "': estimated VRAM " + std::to_string(e.total_mib()) +
                               " MiB (weights " + mib_text(e.weights_bytes) + ", KV " + kv + " x " +
                               std::to_string(e.sequences) + " sequence(s), recurrent " + recurrent + ", compute " +
                               mib_text(e.compute_bytes) + ")";
+        if (multi_gpu_split) summary += ", per-GPU max " + std::to_string(e.max_gpu_mib()) + " MiB";
         if (budget) summary += " vs budget " + std::to_string(*budget) + " MiB";
         for (const auto& note : e.notes) summary += "; " + note;
         if (upstream_fits) {
@@ -175,7 +196,7 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles, const La
                                     "--vram-budget-mib, or pass --allow-overcommit";
                 return catalog;
             }
-        } else if (e.total_mib() > *budget) {
+        } else if (check_mib > *budget) {
             if (!allow_overcommit) {
                 refusal = summary + ": does not fit; lower ctx_size or n_gpu_layers, use a smaller KV cache type, "
                                     "raise the budget, or pass --allow-overcommit";

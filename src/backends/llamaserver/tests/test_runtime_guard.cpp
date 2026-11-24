@@ -20,11 +20,14 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 #if defined(_WIN32)
 #include <process.h>
+#elif defined(__linux__)
+#include <unistd.h>
 #endif
 
 using namespace sonder::inference;
@@ -196,6 +199,21 @@ TEST_CASE("platform gpu counter source reports support honestly") {
     REQUIRE_MESSAGE(self.ok(), self.status().to_string());
     const auto sample = summarize_gpu_counters(pid, self.value());
     CHECK(sample.instances <= 64);
+#elif defined(__linux__)
+    if (source->supported()) {
+        const auto name = source->name();
+        CHECK((name == "amdgpu-fdinfo" || name == "nvml" || name == "amdgpu-fdinfo+nvml"));
+        CHECK(source->read(0).status().code() == ErrorCode::invalid_argument);
+        const auto pid = static_cast<std::uint32_t>(getpid());
+        auto self = source->read(pid);
+        if (self.ok()) {
+            const auto sample = summarize_gpu_counters(pid, self.value());
+            CHECK(sample.instances <= 64);
+        }
+    } else {
+        CHECK(source->name() == "none");
+        CHECK(source->read(1).status().code() == ErrorCode::unsupported);
+    }
 #else
     CHECK(source->name() == "none");
     CHECK_FALSE(source->supported());
@@ -355,10 +373,67 @@ TEST_CASE("kv pairing check: the benchmark baseline flags warn, matched pairs do
     auto q51 = check_kv_cache_pairing({"-fa", "on", "-ctk", "q5_1", "-ctv", "q5_1"});
     REQUIRE(q51.size() == 1);
     CHECK(q51[0].code == "kv_type_no_vector_kernel");
+    CHECK(q51[0].message.find("GGML_CUDA_FA_ALL_QUANTS") != std::string::npos);
+    CHECK(q51[0].message.find("GGML_CUDA_FA_QUANTS") == std::string::npos);
     auto other = check_kv_cache_pairing({"-fa", "on", "-ctk", "iq4_nl", "-ctv", "iq4_nl"});
     REQUIRE(other.size() == 1);
     CHECK(other[0].code == "kv_type_kernel_unknown");
     CHECK(other[0].severity == "info");
+}
+
+TEST_CASE("kv pairing check tailors wording by backend hint and --device argument") {
+    const std::vector<std::string> mixed{"--flash-attn", "on", "--cache-type-k", "q8_0", "--cache-type-v", "q5_1"};
+    const std::vector<std::string> q51{"--flash-attn", "on", "--cache-type-k", "q5_1", "--cache-type-v", "q5_1"};
+    const std::vector<std::string> unknown{"--flash-attn", "on", "--cache-type-k", "iq4_nl", "--cache-type-v", "iq4_nl"};
+
+    for (const auto &args : {mixed, q51, unknown}) {
+        const auto vk = check_kv_cache_pairing(args, "vulkan");
+        REQUIRE(vk.size() == 1);
+        CHECK(detail_of(vk[0], "backend") == "vulkan");
+        CHECK(vk[0].message.find("Vulkan") != std::string::npos);
+        CHECK(vk[0].message.find("CUDA") == std::string::npos);
+        CHECK(vk[0].message.find("GGML_CUDA_FA_ALL_QUANTS") == std::string::npos);
+
+        for (const std::string_view hint : {"rocm", "hip"}) {
+            const auto rocm = check_kv_cache_pairing(args, hint);
+            REQUIRE(rocm.size() == 1);
+            CHECK(detail_of(rocm[0], "backend") == "rocm");
+            CHECK(rocm[0].message.find("ROCm/HIP") != std::string::npos);
+            CHECK(rocm[0].message.find("CUDA") == std::string::npos);
+            CHECK(rocm[0].message.find("GGML_CUDA_FA_ALL_QUANTS") == std::string::npos);
+        }
+    }
+
+    const auto cuda_q51 = check_kv_cache_pairing(q51, "cuda");
+    REQUIRE(cuda_q51.size() == 1);
+    CHECK(detail_of(cuda_q51[0], "backend") == "cuda");
+    CHECK(cuda_q51[0].message.find("CUDA") != std::string::npos);
+    CHECK(cuda_q51[0].message.find("GGML_CUDA_FA_ALL_QUANTS") != std::string::npos);
+
+    // Infer backend from --device / -dev when no explicit hint is passed.
+    const auto vk_dev = check_kv_cache_pairing({"--device", "Vulkan0", "-fa", "on", "-ctk", "q8_0", "-ctv", "q4_0"});
+    REQUIRE(vk_dev.size() == 1);
+    CHECK(detail_of(vk_dev[0], "backend") == "vulkan");
+    CHECK(vk_dev[0].message.find("Vulkan") != std::string::npos);
+    CHECK(vk_dev[0].message.find("CUDA") == std::string::npos);
+
+    const auto rocm_dev = check_kv_cache_pairing({"--device=ROCm0", "-fa", "on", "-ctk", "q5_1", "-ctv", "q5_1"});
+    REQUIRE(rocm_dev.size() == 1);
+    CHECK(detail_of(rocm_dev[0], "backend") == "rocm");
+    CHECK(rocm_dev[0].message.find("ROCm/HIP") != std::string::npos);
+    CHECK(rocm_dev[0].message.find("GGML_CUDA_FA_ALL_QUANTS") == std::string::npos);
+
+    const auto hip_dev = check_kv_cache_pairing({"-dev", "HIP0", "-fa", "on", "-ctk", "q8_0", "-ctv", "q5_1"});
+    REQUIRE(hip_dev.size() == 1);
+    CHECK(detail_of(hip_dev[0], "backend") == "rocm");
+
+    const auto cuda_dev = check_kv_cache_pairing({"--device", "CUDA0", "-fa", "on", "-ctk", "q5_1", "-ctv", "q5_1"});
+    REQUIRE(cuda_dev.size() == 1);
+    CHECK(detail_of(cuda_dev[0], "backend") == "cuda");
+    CHECK(cuda_dev[0].message.find("GGML_CUDA_FA_ALL_QUANTS") != std::string::npos);
+
+    CHECK(check_kv_cache_pairing({"--device", "Vulkan0", "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0"}).empty());
+    CHECK(check_kv_cache_pairing({"--device", "ROCm0", "-fa", "off", "-ctk", "q8_0", "-ctv", "q5_1"}).empty());
 }
 
 // --------------------------------------------------------------- log parser
@@ -370,6 +445,8 @@ TEST_CASE("log parser extracts the FlashAttention f16 conversion from the real l
     const auto &w = d.warnings()[0];
     CHECK(w.code == "kv_kernel_f16_fallback");
     CHECK(w.source == "log");
+    CHECK(w.message.find("GGML_CUDA_FA_ALL_QUANTS") != std::string::npos);
+    CHECK(w.message.find("GGML_CUDA_FA_QUANTS") == std::string::npos);
     CHECK(detail_of(w, "k_type") == "q8_0");
     CHECK(detail_of(w, "v_type") == "q5_1");
     d.feed(std::string(kFaLine) + "\r\n"); // repeated per context: folded
@@ -416,6 +493,70 @@ TEST_CASE("log parser reports CPU fallback and offload messages") {
     CHECK(detail_of(d.warnings()[1], "buffer_type") == "CUDA_Host");
     CHECK(d.warnings()[2].code == "no_gpu_device");
     CHECK(d.warnings()[3].code == "gpu_init_failed");
+}
+
+TEST_CASE("log parser detects ROCm, Vulkan, multi-vendor OOM and ternary incompatibility") {
+    {
+        LogDiagnostics d;
+        d.feed("ggml_hip_init: failed to initialize HIP: no HIP-capable device detected\n");
+        d.feed("ggml_rocm_init: failed to initialize ROCm runtime\n");
+        d.feed("HSA_STATUS_ERROR_INVALID_ISA: unsupported gfx1100 target\n");
+        d.feed("HIP error: hipErrorNoBinaryForGpu\n");
+        REQUIRE(d.warnings().size() == 2);
+        CHECK(d.warnings()[0].code == "gpu_init_failed");
+        CHECK(d.warnings()[0].count == 2);
+        CHECK(detail_of(d.warnings()[0], "backend") == "rocm");
+        CHECK(d.warnings()[1].code == "rocm_runtime_error");
+        CHECK(d.warnings()[1].count == 2);
+        CHECK(detail_of(d.warnings()[1], "backend") == "rocm");
+    }
+    {
+        LogDiagnostics d;
+        d.feed("ggml_vulkan: failed to initialize Vulkan\n");
+        d.feed("ggml_vulkan: submit failed with VK_ERROR_DEVICE_LOST\n");
+        REQUIRE(d.warnings().size() == 2);
+        CHECK(d.warnings()[0].code == "vulkan_runtime_error");
+        CHECK(detail_of(d.warnings()[0], "backend") == "vulkan");
+        CHECK(detail_of(d.warnings()[0], "reason") == "init_failed");
+        CHECK(d.warnings()[1].code == "vulkan_runtime_error");
+        CHECK(detail_of(d.warnings()[1], "backend") == "vulkan");
+        CHECK(detail_of(d.warnings()[1], "reason") == "device_lost");
+    }
+    {
+        LogDiagnostics d;
+        d.feed("CUDA error: out of memory\n");
+        d.feed("ggml_vulkan: vk::OutOfDeviceMemoryError: Device::allocateMemory\n");
+        d.feed("ggml_hip: hipErrorOutOfMemory allocating KV cache\n");
+        d.feed("ggml_hip: allocation failed: out of memory\n");
+        d.feed("ggml_vulkan: buffer allocation out of memory\n");
+        // Non-GPU text mentioning "out of memory" or a word containing "hip" must not trigger.
+        d.feed("ordinary text about a relationship running out of memory\n");
+        REQUIRE(d.warnings().size() == 3);
+        CHECK(d.warnings()[0].code == "gpu_oom");
+        CHECK(detail_of(d.warnings()[0], "backend") == "cuda");
+        CHECK(d.warnings()[0].count == 1);
+        CHECK(d.warnings()[1].code == "gpu_oom");
+        CHECK(detail_of(d.warnings()[1], "backend") == "vulkan");
+        CHECK(d.warnings()[1].count == 2);
+        CHECK(d.warnings()[2].code == "gpu_oom");
+        CHECK(detail_of(d.warnings()[2], "backend") == "rocm");
+        CHECK(d.warnings()[2].count == 2);
+    }
+    {
+        LogDiagnostics d;
+        // Normal PrismML metadata info lines must not trigger a warning.
+        d.feed("llama_model_loader: - kv 24: prism.hadamard.block_size u32 = 128\n");
+        CHECK(d.warnings().empty());
+
+        d.feed("gguf_init_from_file_impl: unknown tensor type 142\n");
+        d.feed("llama_model_load: unsupported ggml type 41\n");
+        d.feed("llama_model_load: error: unsupported key prism.hadamard.sign_values\n");
+        REQUIRE(d.warnings().size() == 1);
+        CHECK(d.warnings()[0].code == "ternary_runtime_incompatible");
+        CHECK(d.warnings()[0].count == 3);
+        CHECK(d.warnings()[0].message.find("PrismML") != std::string::npos);
+        CHECK(d.warnings()[0].message.find("b11556") != std::string::npos);
+    }
 }
 
 TEST_CASE("log diagnostics readiness reports blind verbosity and final option precedence") {

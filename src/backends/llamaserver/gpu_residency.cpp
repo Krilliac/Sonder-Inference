@@ -8,6 +8,10 @@ namespace {
 
 constexpr std::uint64_t kGiB = 1024ull * 1024 * 1024;
 
+std::uint64_t saturating_add(std::uint64_t a, std::uint64_t b) noexcept {
+    return a > std::numeric_limits<std::uint64_t>::max() - b ? std::numeric_limits<std::uint64_t>::max() : a + b;
+}
+
 bool is_gpu_flag(std::string_view arg, std::string_view &inline_value, bool &has_inline_value) {
     constexpr std::string_view flags[] = {"--n-gpu-layers", "--gpu-layers", "-ngl"};
     for (const auto flag : flags) {
@@ -105,28 +109,35 @@ void GpuResidencyGuard::unavailable() {
 }
 
 void GpuResidencyGuard::observe(std::uint64_t dedicated_bytes) {
+    observe(dedicated_bytes, 0);
+}
+
+void GpuResidencyGuard::observe(std::uint64_t dedicated_bytes, std::uint64_t shared_bytes) {
     if (!options_.enabled)
         return;
 
-    if (dedicated_bytes > peak_dedicated_bytes_)
-        peak_dedicated_bytes_ = dedicated_bytes;
-    if (!event_observed_)
-        observed_dedicated_bytes_ = dedicated_bytes;
+    const std::uint64_t active_bytes =
+        options_.uma_mode ? saturating_add(dedicated_bytes, shared_bytes) : dedicated_bytes;
 
-    if (gpu_expected_ && options_.min_dedicated_bytes != 0 && dedicated_bytes < options_.min_dedicated_bytes) {
+    if (active_bytes > peak_dedicated_bytes_)
+        peak_dedicated_bytes_ = active_bytes;
+    if (!event_observed_)
+        observed_dedicated_bytes_ = active_bytes;
+
+    if (gpu_expected_ && options_.min_dedicated_bytes != 0 && active_bytes < options_.min_dedicated_bytes) {
         if (missing_streak_ < options_.consecutive_samples)
             ++missing_streak_;
         if (!gpu_offload_missing_ && missing_streak_ >= options_.consecutive_samples) {
             gpu_offload_missing_ = true;
             event_observed_ = true;
-            observed_dedicated_bytes_ = dedicated_bytes;
+            observed_dedicated_bytes_ = active_bytes;
         }
     } else {
         missing_streak_ = 0;
     }
 
     const bool sufficient_peak = peak_dedicated_bytes_ >= options_.min_dedicated_bytes;
-    const std::uint64_t drop = peak_dedicated_bytes_ > dedicated_bytes ? peak_dedicated_bytes_ - dedicated_bytes : 0;
+    const std::uint64_t drop = peak_dedicated_bytes_ > active_bytes ? peak_dedicated_bytes_ - active_bytes : 0;
     const bool fraction_triggered = options_.eviction_fraction != 0.0 &&
                                     static_cast<long double>(drop) >
                                         static_cast<long double>(peak_dedicated_bytes_) * options_.eviction_fraction;
@@ -137,7 +148,7 @@ void GpuResidencyGuard::observe(std::uint64_t dedicated_bytes) {
         if (!vram_evicted_ && eviction_streak_ >= options_.consecutive_samples) {
             vram_evicted_ = true;
             event_observed_ = true;
-            observed_dedicated_bytes_ = dedicated_bytes;
+            observed_dedicated_bytes_ = active_bytes;
         }
     } else {
         eviction_streak_ = 0;

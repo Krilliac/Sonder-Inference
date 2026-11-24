@@ -47,6 +47,7 @@
 #include <utility>
 #include <vector>
 
+#include "../env_policy.hpp"
 #include "../process.hpp"
 #include "../process_options.hpp"
 #include "net/http_client.hpp"
@@ -888,4 +889,103 @@ TEST_CASE("containment: ProcessLauncher rejects relative executable paths") {
         CHECK_FALSE(res.ok());
         CHECK(res.status().code() == ErrorCode::invalid_argument);
     }
+}
+
+TEST_CASE("containment: AMD ROCm and Vulkan tuning env vars are allowed while forbidden vars remain refused") {
+    const std::vector<std::string> allowed_vars = {
+        "AMD_LOG_LEVEL",
+        "AMD_SERIALIZE_KERNEL",
+        "ROCBLAS_TENSILE_LIBPATH",
+        "HIPBLASLT_TUNING_OVERRIDE_FILE",
+        "RADV_PERFTEST",
+        "RADV_DEBUG",
+        "MESA_VK_DEVICE_SELECT",
+        "ROCM_PATH",
+        "ROCR_VISIBLE_DEVICES",
+        "HIP_VISIBLE_DEVICES",
+        "HSA_OVERRIDE_GFX_VERSION",
+        "VK_ICD_FILENAMES",
+        "CUDA_VISIBLE_DEVICES",
+        "GGML_VK_VISIBLE_DEVICES",
+        "OMP_NUM_THREADS",
+        "GPU_MAX_ALLOC_PERCENT",
+        "GPU_MAX_HEAP_SIZE",
+        "GPU_SINGLE_ALLOC_PERCENT",
+        "GPU_FORCE_64BIT_PTR",
+        "GPU_USE_SYNC_OBJECTS",
+        "DRI_PRIME",
+    };
+    for (const auto &key : allowed_vars) {
+        CAPTURE(key);
+        CHECK(ls::is_allowed_profile_env_override(key));
+        CHECK(ls::is_allowed_inherited_env_name(std::string_view(key)));
+        CHECK(ls::validate_process_environment({{key, "1"}}).ok());
+#if defined(SONDER_HAS_SERVER)
+        const std::string obj = "{" + json_string(key) + ":\"1\"}";
+        CHECK(decision_of(config_status(spawn_config(obj))) == Decision::accepted);
+#endif
+    }
+
+    const std::vector<std::string> forbidden_vars = {
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "LLAMA_ARG_HF_REPO",
+        "LLAMA_ARG_MODEL",
+        "LLAMA_API_KEY",
+        "HF_TOKEN",
+        "AIP_MODE",
+        "MCP_SERVERS",
+        "HTTP_PROXY",
+        "SSL_CERT_FILE",
+        "PATH",
+        "HOME",
+        "APPDATA",
+        "AMD_API_KEY",
+        "ROCM_TOKEN",
+        "HIP_SECRET",
+        "RADV_PASSWORD",
+        "MESA_API_KEY",
+        "ROCBLAS_TOKEN",
+        "HIPBLASLT_SECRET",
+        "amd_api_key",
+        "rocm_token",
+    };
+    for (const auto &key : forbidden_vars) {
+        CAPTURE(key);
+        CHECK_FALSE(ls::is_allowed_profile_env_override(key));
+        CHECK(ls::validate_process_environment({{key, "x"}}).code() == ErrorCode::invalid_argument);
+#if defined(SONDER_HAS_SERVER)
+        const std::string obj = "{" + json_string(key) + ":\"x\"}";
+        CHECK(decision_of(config_status(spawn_config(obj))) == Decision::refused);
+#endif
+    }
+
+    // Non-allowlisted GPU-looking names must not bypass the exact-key gate.
+    for (const std::string key : {"GPU_ARBITRARY", "DRI_PRIME_EXTRA", "ARBITRARY_VAR"}) {
+        CAPTURE(key);
+        CHECK_FALSE(ls::is_allowed_profile_env_override(key));
+        CHECK_FALSE(ls::is_allowed_inherited_env_name(std::string_view(key)));
+    }
+
+    // Inherited safe AMD/Vulkan vars pass through ProcessOptions::prepare(), while
+    // credential-suffixed AMD/ROCm/Vulkan names stay stripped.
+    ScopedParentEnv amd_log("AMD_LOG_LEVEL", std::string("2"));
+    ScopedParentEnv radv("RADV_PERFTEST", std::string("aco"));
+    ScopedParentEnv mesa("MESA_VK_DEVICE_SELECT", std::string("1002:744c"));
+    ScopedParentEnv gpu_alloc("GPU_MAX_ALLOC_PERCENT", std::string("100"));
+    ScopedParentEnv dri("DRI_PRIME", std::string("1"));
+    ScopedParentEnv amd_key("AMD_API_KEY", std::string("secret-key"));
+    ScopedParentEnv rocm_tok("ROCM_TOKEN", std::string("secret-tok"));
+
+    ls::ProcessSpec spec;
+    ls::ProcessOptions prepared;
+    REQUIRE(prepared.prepare(spec).ok());
+    const auto entries = prepared_entries(prepared);
+    CHECK(values_named(entries, "AMD_LOG_LEVEL") == std::vector<std::string>{"2"});
+    CHECK(values_named(entries, "RADV_PERFTEST") == std::vector<std::string>{"aco"});
+    CHECK(values_named(entries, "MESA_VK_DEVICE_SELECT") == std::vector<std::string>{"1002:744c"});
+    CHECK(values_named(entries, "GPU_MAX_ALLOC_PERCENT") == std::vector<std::string>{"100"});
+    CHECK(values_named(entries, "DRI_PRIME") == std::vector<std::string>{"1"});
+    CHECK(values_named(entries, "AMD_API_KEY").empty());
+    CHECK(values_named(entries, "ROCM_TOKEN").empty());
 }

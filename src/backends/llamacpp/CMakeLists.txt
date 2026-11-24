@@ -11,10 +11,24 @@
 #                            sonder_inference (sonder/inference/backends/llamacpp.hpp)
 #   SONDER_HAS_LLAMACPP_BACKEND=1 on sonder_inference
 #
-# llama.cpp is pulled with FetchContent at a pinned release tag. To build from a
-# local checkout (offline builds, bisecting upstream), set
+# llama.cpp is pulled with FetchContent at a pinned release tag (b11195 by
+# default; recorded in docs/LICENSE_REVIEW.md — change both together on default
+# upgrades).
+#
+# Building against a local checkout (offline builds, newer mainline, or forks):
 #   -DFETCHCONTENT_SOURCE_DIR_LLAMACPP=/path/to/llama.cpp
-# The pin is recorded in docs/LICENSE_REVIEW.md; change both together.
+# Specifically:
+#   - Mainline ggml-org/llama.cpp >= b11556: adds stock Q2_0 (2-bit ternary),
+#     Q1_0 (1-bit Bonsai-1), NVFP4 (Blackwell FP4), and F8_E4M3 (FP8).
+#   - PrismML-Eng/llama.cpp (prism branch): adds Hadamard-transformed Bonsai-2
+#     ternary formats (PQ2_0, PTQ1_0, PQ2_0M) and prism.hadamard.* support.
+#
+# To override the fetched tarball tag instead of using a local checkout, pass
+# SONDER_LLAMACPP_TAG and the matching SONDER_LLAMACPP_SHA256 (and optionally
+# SONDER_LLAMACPP_URL) together; SHA-256 verification fails closed on mismatch.
+#
+# Opt-in GPU presets live in CMakePresets.json: windows-cuda-rtx,
+# windows-vulkan-xt, linux-cuda-rtx, linux-rocm-xt, and linux-vulkan-xt.
 
 if(NOT SONDER_WITH_LLAMA_CPP)
     return()
@@ -23,12 +37,15 @@ endif()
 include(FetchContent)
 
 # Tag and hash move together; bump both (and docs/LICENSE_REVIEW.md) on upgrade.
-set(SONDER_LLAMACPP_TAG "b11195")
+set(SONDER_LLAMACPP_TAG "b11195" CACHE STRING
+    "Upstream llama.cpp tag for FetchContent (default pinned b11195)")
 set(SONDER_LLAMACPP_URL
-    "https://github.com/ggml-org/llama.cpp/archive/refs/tags/${SONDER_LLAMACPP_TAG}.tar.gz")
+    "https://github.com/ggml-org/llama.cpp/archive/refs/tags/${SONDER_LLAMACPP_TAG}.tar.gz"
+    CACHE STRING "Source archive URL for llama.cpp FetchContent")
 # SHA-256 of the GitHub source tarball for tag b11195 (commit d834d44e6436).
 set(SONDER_LLAMACPP_SHA256
-    "d9818b7786c8a3b063bac7eb7dc8710e275638f1e288e206720c9e22e7ca216a")
+    "d9818b7786c8a3b063bac7eb7dc8710e275638f1e288e206720c9e22e7ca216a"
+    CACHE STRING "Expected SHA-256 of SONDER_LLAMACPP_URL")
 
 # Consume llama.cpp as a library only: no tools, server, examples, tests, or
 # networking. CPU backend is always available; accelerators are opt-in by the

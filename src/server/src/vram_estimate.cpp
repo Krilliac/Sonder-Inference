@@ -11,22 +11,9 @@
 #include <utility>
 #include <vector>
 
+#include "sonder/inference/device.hpp"
 #include "sonder/inference/launch_profile.hpp"
 #include "vram_internal.hpp"
-
-#if defined(_WIN32)
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  ifndef NOMINMAX
-#    define NOMINMAX
-#  endif
-#  include <windows.h>
-#  if defined(_MSC_VER)
-#    include <dxgi.h>
-#    pragma comment(lib, "dxgi.lib")
-#  endif
-#endif
 
 namespace sonder::inference {
 
@@ -152,6 +139,24 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
             e.moe_placement_error = parsed.status().message();
         }
     }
+    if (p.load_mode) {
+        if (*p.load_mode == "auto" || *p.load_mode == "mmap") {
+            placement.mmap = true;
+            placement.mlock = false;
+        } else if (*p.load_mode == "none" || *p.load_mode == "dio") {
+            placement.mmap = false;
+            placement.mlock = false;
+        } else if (*p.load_mode == "mlock") {
+            placement.mmap = false;
+            placement.mlock = true;
+        } else if (*p.load_mode == "mmap+mlock") {
+            placement.mmap = true;
+            placement.mlock = true;
+        }
+    }
+    if (p.no_repack) {
+        placement.repack = !*p.no_repack;
+    }
     detail::TensorPlacementBreakdown placed =
         detail::evaluate_tensor_placement(m, placement, n_layer, first_gpu, first_nextn, mtp, e.notes);
     const bool fit_path = p.backend == kLaunchProfileBackendLlamaServer && p.fit.value_or(true) && !p.n_gpu_layers &&
@@ -260,6 +265,49 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
         e.notes.emplace_back("parallel unset: llama-server's automatic 4 slots keep 4 recurrent states");
     }
     e.total_bytes = e.weights_bytes + e.kv_bytes + e.recurrent_bytes + e.compute_bytes;
+    e.prism_hadamard = m.prism_hadamard;
+    e.requires_prism_runtime = m.has_prism_private_tensors || m.prism_hadamard;
+    if (e.requires_prism_runtime) {
+        std::string note = "model requires a PrismML Hadamard-capable runtime (PQ2_0/PTQ1_0";
+        if (!m.prism_hadamard_transform.empty()) {
+            note += ", transform=" + m.prism_hadamard_transform;
+        }
+        if (m.prism_hadamard_block_size > 0) {
+            note += ", block_size=" + std::to_string(m.prism_hadamard_block_size);
+        }
+        note += ")";
+        e.notes.push_back(std::move(note));
+    }
+    if (!p.tensor_split.empty() && e.total_bytes > 0) {
+        std::size_t positive_gpus = 0;
+        double weight_sum = 0.0;
+        double weight_max = 0.0;
+        for (const double w : p.tensor_split) {
+            if (std::isfinite(w) && w > 0.0) {
+                ++positive_gpus;
+                weight_sum += w;
+                weight_max = std::max(weight_max, w);
+            }
+        }
+        const std::string mode = p.split_mode.value_or("layer");
+        if (positive_gpus >= 2 && weight_sum > 0.0) {
+            if (mode != "none") {
+                const double max_share = weight_max / weight_sum;
+                const std::uint64_t splittable =
+                    saturating_add(e.weights_bytes, saturating_add(e.kv_bytes, e.recurrent_bytes));
+                const std::uint64_t shard = std::min(
+                    splittable, saturating_u64(std::ceil(static_cast<double>(splittable) * max_share)));
+                e.max_gpu_bytes = saturating_add(shard, e.compute_bytes);
+                e.notes.emplace_back("multi-GPU tensor_split (" + std::to_string(positive_gpus) +
+                                     " GPUs, split_mode=" + mode + "): heaviest GPU shard estimated at " +
+                                     std::to_string(e.max_gpu_mib()) +
+                                     " MiB (proportional weights/KV/recurrent + compute)");
+            } else {
+                e.notes.emplace_back(
+                    "split_mode=none: tensor_split is not applied; all offloaded layers stay on one GPU");
+            }
+        }
+    }
 
     // ---- Host RAM resident estimate.
     // Weights: token_embd and the other non-block tensors, the output tensors
@@ -420,28 +468,12 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
     return e;
 }
 
+std::optional<std::uint64_t> detect_device_vram_mib(std::string_view device_hint, bool prefer_free) {
+    return select_gpu_vram_budget_mib(enumerate_gpu_devices(), device_hint, prefer_free);
+}
+
 std::optional<std::uint64_t> detect_device_vram_mib() {
-#if defined(_WIN32) && defined(_MSC_VER)
-    IDXGIFactory1* factory = nullptr;
-    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) || !factory) {
-        return std::nullopt;
-    }
-    std::uint64_t best = 0;
-    IDXGIAdapter1* adapter = nullptr;
-    for (UINT i = 0; SUCCEEDED(factory->EnumAdapters1(i, &adapter)) && adapter != nullptr; ++i) {
-        DXGI_ADAPTER_DESC1 desc{};
-        if (SUCCEEDED(adapter->GetDesc1(&desc)) && (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
-            best = std::max<std::uint64_t>(best, static_cast<std::uint64_t>(desc.DedicatedVideoMemory));
-        }
-        adapter->Release();
-        adapter = nullptr;
-    }
-    factory->Release();
-    if (best == 0) return std::nullopt;
-    return best / kMiB;
-#else
-    return std::nullopt;
-#endif
+    return detect_device_vram_mib(std::string_view{}, false);
 }
 
 }  // namespace sonder::inference

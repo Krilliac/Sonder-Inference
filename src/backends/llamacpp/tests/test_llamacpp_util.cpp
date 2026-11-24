@@ -1,6 +1,7 @@
 // Pure helper tests: no model, no llama.cpp calls.
 #include <limits>
 #include <string>
+#include <vector>
 
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include <doctest/doctest.h>
@@ -179,4 +180,104 @@ TEST_CASE("llamacpp wrapper: context option defaults match llama.cpp and validat
     o.flash_attn = FlashAttention::kDisabled;
     o.n_ubatch = 100000;
     CHECK(ValidateContextOptions(o).ok());
+}
+
+TEST_CASE("llamacpp wrapper: SplitMode names round-trip and reject invalid input") {
+    const SplitMode all[] = {SplitMode::kNone, SplitMode::kLayer, SplitMode::kRow};
+    for (const SplitMode m : all) {
+        SplitMode parsed = m == SplitMode::kLayer ? SplitMode::kNone : SplitMode::kLayer;
+        CHECK(ParseSplitMode(ToString(m), parsed));
+        CHECK(parsed == m);
+    }
+    CHECK(ToString(SplitMode::kNone) == "none");
+    CHECK(ToString(SplitMode::kLayer) == "layer");
+    CHECK(ToString(SplitMode::kRow) == "row");
+    CHECK(ToString(static_cast<SplitMode>(99)) == "unknown");
+
+    SplitMode parsed = SplitMode::kLayer;
+    CHECK(ParseSplitMode("NONE", parsed));
+    CHECK(parsed == SplitMode::kNone);
+    CHECK(ParseSplitMode("Layer", parsed));
+    CHECK(parsed == SplitMode::kLayer);
+    CHECK(ParseSplitMode("rOw", parsed));
+    CHECK(parsed == SplitMode::kRow);
+
+    for (const char* bad : {"", "tensor", "layers", "layer ", "gpu", "0"}) {
+        CAPTURE(bad);
+        SplitMode untouched = SplitMode::kRow;
+        CHECK_FALSE(ParseSplitMode(bad, untouched));
+        CHECK(untouched == SplitMode::kRow);
+    }
+}
+
+TEST_CASE("llamacpp wrapper: placement option defaults and pure validation") {
+    const LoadOptions d;
+    CHECK(d.devices.empty());
+    CHECK(d.main_gpu == 0);
+    CHECK(d.split_mode == SplitMode::kLayer);
+    CHECK(d.tensor_split.empty());
+    CHECK_FALSE(d.use_mlock);
+    CHECK(ValidatePlacementOptions(d).ok());
+
+    // main_gpu must be >= 0.
+    LoadOptions o;
+    o.main_gpu = 2;
+    CHECK(ValidatePlacementOptions(o).ok());
+    o.main_gpu = -1;
+    Status s = ValidatePlacementOptions(o);
+    CHECK(s.code == ErrorCode::kInvalidArgument);
+    CHECK(s.message.find("main_gpu") != std::string::npos);
+
+    // Out-of-range split_mode enum is rejected.
+    o = {};
+    o.split_mode = static_cast<SplitMode>(42);
+    CHECK(ValidatePlacementOptions(o).code == ErrorCode::kInvalidArgument);
+
+    // Valid tensor_split ratios (including zero on one GPU + positive on another, and up to 16).
+    o = {};
+    o.tensor_split = {1.0F};
+    CHECK(ValidatePlacementOptions(o).ok());
+    o.tensor_split = {0.0F, 1.0F};
+    CHECK(ValidatePlacementOptions(o).ok());
+    o.tensor_split = {0.65F, 0.35F};
+    CHECK(ValidatePlacementOptions(o).ok());
+    o.tensor_split.assign(kMaxTensorSplitDevices, 1.0F);
+    CHECK(ValidatePlacementOptions(o).ok());
+
+    // Invalid tensor_split: NaN, +Inf, -Inf, negative, all-zero, > 16.
+    o = {};
+    o.tensor_split = {std::numeric_limits<float>::quiet_NaN(), 1.0F};
+    CHECK(ValidatePlacementOptions(o).code == ErrorCode::kInvalidArgument);
+    o.tensor_split = {std::numeric_limits<float>::infinity(), 1.0F};
+    CHECK(ValidatePlacementOptions(o).code == ErrorCode::kInvalidArgument);
+    o.tensor_split = {-std::numeric_limits<float>::infinity(), 1.0F};
+    CHECK(ValidatePlacementOptions(o).code == ErrorCode::kInvalidArgument);
+    o.tensor_split = {-0.1F, 1.0F};
+    CHECK(ValidatePlacementOptions(o).code == ErrorCode::kInvalidArgument);
+    o.tensor_split = {0.0F};
+    CHECK(ValidatePlacementOptions(o).code == ErrorCode::kInvalidArgument);
+    o.tensor_split = {0.0F, 0.0F};
+    CHECK(ValidatePlacementOptions(o).code == ErrorCode::kInvalidArgument);
+    o.tensor_split.assign(kMaxTensorSplitDevices + 1, 1.0F);
+    CHECK(ValidatePlacementOptions(o).code == ErrorCode::kInvalidArgument);
+
+    // Device list pure checks: non-empty strings, no NUL, max 16.
+    o = {};
+    o.devices = {"CUDA0", "CUDA1"};
+    CHECK(ValidatePlacementOptions(o).ok());
+    o.devices = {""};
+    CHECK(ValidatePlacementOptions(o).code == ErrorCode::kInvalidArgument);
+    o.devices = {"CUDA0", ""};
+    CHECK(ValidatePlacementOptions(o).code == ErrorCode::kInvalidArgument);
+    std::string with_nul = "CUDA0";
+    with_nul[4] = '\0';
+    o.devices = {with_nul};
+    CHECK(ValidatePlacementOptions(o).code == ErrorCode::kInvalidArgument);
+    o.devices.assign(kMaxTensorSplitDevices + 1, "CUDA0");
+    CHECK(ValidatePlacementOptions(o).code == ErrorCode::kInvalidArgument);
+
+    // use_mlock is always accepted by pure validation.
+    o = {};
+    o.use_mlock = true;
+    CHECK(ValidatePlacementOptions(o).ok());
 }

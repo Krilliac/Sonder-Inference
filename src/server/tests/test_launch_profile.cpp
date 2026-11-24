@@ -1435,7 +1435,7 @@ TEST_CASE("VRAM estimate: a llamaserver profile without parallel counts llama-se
 }
 
 TEST_CASE("VRAM estimate: placement flags in extra_args are noted under the name llama-server reads") {
-    for (const std::string flag : {"--override-tensor", "--override_tensor", "--n_cpu_moe", "--tensor_split", "--split_mode"}) {
+    for (const std::string flag : {"--override-tensor", "--override_tensor", "--n_cpu_moe", "--n_cpu_ffn"}) {
         CAPTURE(flag);
         const LaunchProfile p = parse_single(R"({"name":"p","backend":"llamaserver","model":"m.gguf","ctx_size":4096,)"
                                              R"("parallel":1,"extra_args":[")" +

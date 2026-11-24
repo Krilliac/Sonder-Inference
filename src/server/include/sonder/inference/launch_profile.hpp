@@ -70,14 +70,22 @@ struct LaunchProfile {
 
     std::optional<std::uint32_t> ctx_size;       // 0 = model training context
     std::optional<std::int32_t> n_gpu_layers;    // -1 = all
+    // Multi-GPU and model loading controls (llama-server only).
+    std::optional<std::string> device;           // -dev/--device (e.g. CUDA0, ROCm0, Vulkan0, CUDA0,CUDA1)
+    std::optional<std::int32_t> main_gpu;        // -mg/--main-gpu (>= 0)
+    std::optional<std::string> split_mode;       // -sm/--split-mode: none, layer or row
+    std::vector<double> tensor_split;            // -ts/--tensor-split: positive finite weights (<= 16 GPUs)
+    std::optional<std::string> load_mode;        // -lm/--load-mode: auto, mmap, none, mlock, mmap+mlock or dio
+    std::optional<bool> no_repack;               // -nr/--no-repack
     std::optional<std::uint32_t> batch_size;
     std::optional<std::uint32_t> ubatch_size;
     std::optional<std::uint32_t> parallel;
     std::optional<bool> kv_unified;
     // KV cache and flash attention: the llamacpp backend's option names and
     // values (LlamaCppBackendOptions::kv_cache_type_k/_v, flash_attention).
+    // llamaserver profiles also accept f8_e4m3, q2_0 and pq2_0m.
     std::optional<std::string> flash_attn;    // on, off or auto
-    std::optional<std::string> cache_type_k;  // f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1
+    std::optional<std::string> cache_type_k;  // f32 f16 bf16 f8_e4m3 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1 q2_0 pq2_0m
     std::optional<std::string> cache_type_v;
     std::optional<std::uint32_t> ctx_checkpoints;
     std::optional<std::uint32_t> checkpoint_min_step;
@@ -88,7 +96,9 @@ struct LaunchProfile {
     std::optional<std::int32_t> threads;
     std::optional<std::int32_t> threads_batch;
     std::optional<bool> jinja;
-    std::optional<std::string> reasoning_format;  // none, deepseek, deepseek-legacy, auto
+    std::optional<std::string> reasoning_format;    // none, deepseek, deepseek-legacy, auto
+    std::optional<std::string> reasoning;           // --reasoning: on, off or auto
+    std::optional<std::int32_t> reasoning_budget;   // --reasoning-budget: >= -1 (-1 unlimited, 0 off)
 
     SamplingDefaults sampling;
 
@@ -242,6 +252,15 @@ struct GgufModelInfo {
     // block_bytes/embedding_bytes/... stay complete either way.
     std::vector<GgufTensorInfo> tensors;
     bool tensors_truncated = false;
+    // Ternary, 1-bit, FP4/FP8 and PrismML Hadamard header observations
+    // (header-only; metadata arrays under prism.hadamard.* are skipped safely).
+    bool prism_hadamard = false;
+    std::string prism_hadamard_transform;
+    std::uint32_t prism_hadamard_block_size = 0;
+    bool has_ternary_tensors = false;        // ggml types 34, 35, 42, 142, 143, 145
+    bool has_one_bit_tensors = false;        // ggml type 41 (Q1_0)
+    bool has_prism_private_tensors = false;  // ggml types 142 (PQ2_0), 143 (PTQ1_0), 145 (PQ2_0M)
+    bool has_fp4_or_fp8_tensors = false;     // ggml types 39 (MXFP4), 40 (NVFP4), 43 (F8_E4M3)
 };
 
 // Parses the GGUF header of `path` (versions 2 and 3). Errors: not_found,
@@ -393,6 +412,19 @@ struct VramEstimate {
     [[nodiscard]] std::uint64_t total_mib() const noexcept {
         return (total_bytes >> 20) + ((total_bytes & ((1u << 20) - 1)) != 0 ? 1 : 0);
     }
+
+    // Heaviest single-GPU shard when multi-GPU tensor_split (>= 2 positive
+    // weights) is active with split_mode != "none": proportionally splits
+    // weights + KV + recurrent across the weights and adds compute_bytes.
+    // 0 when single-GPU, split_mode == "none", or nothing is offloaded.
+    std::uint64_t max_gpu_bytes = 0;
+    [[nodiscard]] std::uint64_t max_gpu_mib() const noexcept {
+        return (max_gpu_bytes >> 20) + ((max_gpu_bytes & ((1u << 20) - 1)) != 0 ? 1 : 0);
+    }
+
+    // Propagated from GgufModelInfo for /v1/models metadata.
+    bool prism_hadamard = false;
+    bool requires_prism_runtime = false;
 };
 
 // Extra files the estimate needs sizes of (mmproj, draft model); 0 = absent.
@@ -450,9 +482,12 @@ inline constexpr std::uint64_t kLlamaServerFitTargetBytes = 1ull << 30;
 VramEstimate estimate_vram(const GgufModelInfo& model, const LaunchProfile& profile,
                            const VramEstimateInputs& inputs = {});
 
-// Largest dedicated video memory of any hardware adapter, in MiB (Windows
-// DXGI); nullopt where unknown (other platforms, no adapter).
+// Effective VRAM budget of the selected GPU adapter in MiB, delegating to
+// enumerate_gpu_devices() / select_gpu_vram_budget_mib() (Windows DXGI, Linux
+// amdgpu sysfs / NVML, AMD APU UMA sizing, and optional device hints such as
+// "CUDA0", "ROCm0", "Vulkan0", "gpu:1"); nullopt where unknown.
 std::optional<std::uint64_t> detect_device_vram_mib();
+std::optional<std::uint64_t> detect_device_vram_mib(std::string_view device_hint, bool prefer_free = false);
 
 // `sonder.profile` metadata for /v1/models (additive): backend, context
 // length, parallel, cache types, flash attention, capabilities (usable

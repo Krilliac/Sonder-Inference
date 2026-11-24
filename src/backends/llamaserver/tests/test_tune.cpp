@@ -476,3 +476,230 @@ TEST_CASE("tune rejects missing duplicate nonfinite or incorrectly weighted clas
         CHECK_FALSE(report.long_context);
     }
 }
+
+TEST_CASE("tune supports standalone ngram-mod speculation without MTP tensors") {
+    auto parsed = json::parse(
+        R"({"kv":[["q4_0","q4_0"]],"ctx":[65536,69632],"ubatch":[512],"mtp":[0,2],"spec_type":["ngram-mod"],"p_min":[0.0,0.5]})");
+    REQUIRE(parsed.ok());
+    auto grid_res = tune::parse_grid(parsed.value());
+    REQUIRE_MESSAGE(grid_res.ok(), grid_res.status().message());
+    const auto &grid = grid_res.value();
+
+    // Non-MTP models (mtp_available == false) still plan baseline + ngram-mod candidates.
+    const auto planned = tune::planned_candidates(grid, false);
+    REQUIRE(planned.size() == 6); // 2 ctx * (1 baseline + 2 ngram-mod p_min values)
+    CHECK(std::count_if(planned.begin(), planned.end(), [](const auto &c) { return c.mtp == 0; }) == 2);
+    CHECK(std::count_if(planned.begin(), planned.end(), [](const auto &c) {
+        return c.mtp == 2 && c.spec_type == "ngram-mod";
+    }) == 4);
+
+    // Mixed draft-mtp + ngram-mod skips draft-mtp when mtp_available is false.
+    tune::Grid mixed = grid;
+    mixed.ctx = {65536};
+    mixed.spec_type = {"draft-mtp", "draft-mtp,ngram-mod", "ngram-mod"};
+    REQUIRE(tune::validate_grid(mixed).ok());
+    const auto gated = tune::planned_candidates(mixed, false);
+    REQUIRE(gated.size() == 3); // 1 baseline + 2 ngram-mod
+    for (const auto &c : gated) {
+        if (c.mtp != 0) CHECK(c.spec_type == "ngram-mod");
+    }
+
+    tune::Options options;
+    options.model = "ternary-bonsai-2-27b.gguf";
+    options.grid = grid;
+    const tune::Candidate ngram{{"q4_0", "q4_0"}, 65536, 512, 2, "ngram-mod", 0.5};
+    const auto argv = tune::arguments(options, ngram);
+    const auto spec_it = std::find(argv.begin(), argv.end(), "--spec-type");
+    REQUIRE(spec_it != argv.end());
+    REQUIRE(std::next(spec_it) != argv.end());
+    CHECK(*std::next(spec_it) == "ngram-mod");
+
+    auto now = tune::Clock::now();
+    const auto report = tune::search(
+        options, false, now + std::chrono::minutes(2),
+        [&](const tune::Candidate &c, tune::Phase phase, tune::Deadline) {
+            auto m = clean(c, phase);
+            m.short_tps = 40.0 + (c.mtp == 2 && c.spec_type == "ngram-mod" ? 25.0 + c.p_min : 0.0);
+            for (auto &work : m.workloads) work.tok_s = *m.short_tps;
+            return m;
+        },
+        [&] { return now; });
+    REQUIRE(report.fast_default);
+    const auto &winner = report.results[*report.fast_default];
+    CHECK(winner.candidate.mtp == 2);
+    CHECK(winner.candidate.spec_type == "ngram-mod");
+    CHECK(winner.candidate.p_min == doctest::Approx(0.5));
+}
+
+TEST_CASE("tune sweeps flash_attn and skips quantized V cache when flash_attn is off") {
+    auto parsed = json::parse(
+        R"({"kv":[["f16","f16"],["q8_0","f16"],["q4_0","q4_0"]],"flash_attn":["on","off","auto"],"ctx":[65536,69632],"ubatch":[512],"mtp":[0]})");
+    REQUIRE(parsed.ok());
+    auto grid_res = tune::parse_grid(parsed.value());
+    REQUIRE_MESSAGE(grid_res.ok(), grid_res.status().message());
+    const auto &grid = grid_res.value();
+
+    // f16/f16 (3 FA modes) + q8_0/f16 (3 FA modes) + q4_0/q4_0 (2 FA modes: on, auto) = 8 valid lanes * 2 ctx = 16.
+    const auto planned = tune::planned_candidates(grid, false);
+    CHECK(planned.size() == 16);
+    CHECK(std::none_of(planned.begin(), planned.end(), [](const auto &c) {
+        return c.flash_attn == "off" && c.kv.v == "q4_0";
+    }));
+    CHECK(std::any_of(planned.begin(), planned.end(), [](const auto &c) {
+        return c.flash_attn == "off" && c.kv == tune::KvPair{"q8_0", "f16"};
+    }));
+
+    tune::Options options;
+    options.model = "model.gguf";
+    options.grid = grid;
+    for (const std::string fa : {"on", "off", "auto"}) {
+        const auto argv = tune::arguments(options, {{"f16", "f16"}, 65536, 512, 0, "draft-mtp", 0.0, fa});
+        CHECK(read_kv_cache_config(argv).flash_attn == fa);
+    }
+
+    auto now = tune::Clock::now();
+    bool saw_invalid = false;
+    bool saw_off = false;
+    bool saw_auto = false;
+    const auto report = tune::search(
+        options, false, now + std::chrono::minutes(2),
+        [&](const tune::Candidate &c, tune::Phase phase, tune::Deadline) {
+            if (c.flash_attn == "off" && c.kv.v == "q4_0") saw_invalid = true;
+            if (c.flash_attn == "off") saw_off = true;
+            if (c.flash_attn == "auto") saw_auto = true;
+            auto m = clean(c, phase);
+            m.short_tps = c.flash_attn == "auto" && c.kv == tune::KvPair{"q4_0", "q4_0"} ? 90.0 : 50.0;
+            for (auto &work : m.workloads) work.tok_s = *m.short_tps;
+            return m;
+        },
+        [&] { return now; });
+    CHECK_FALSE(saw_invalid);
+    CHECK(saw_off);
+    CHECK(saw_auto);
+    REQUIRE(report.fast_default);
+    CHECK(report.results[*report.fast_default].candidate.flash_attn == "auto");
+    const auto doc = tune::report_json(options, report);
+    const auto &rows = doc.find("results")->find("candidates")->as_array();
+    REQUIRE_FALSE(rows.empty());
+    CHECK(rows.front().find("flash_attn") != nullptr);
+
+    // Invalid flash_attn grids must be rejected.
+    for (const auto *bad_json : {R"({"flash_attn":[]})", R"({"flash_attn":["maybe"]})",
+                                  R"({"flash_attn":["on","on"]})",
+                                  R"({"kv":[["q4_0","q4_0"]],"flash_attn":["off"]})"}) {
+        CAPTURE(bad_json);
+        const auto bad = json::parse(bad_json);
+        REQUIRE(bad.ok());
+        CHECK_FALSE(tune::parse_grid(bad.value()).ok());
+    }
+}
+
+TEST_CASE("tune accepts 8192 context floor for multi-model presets while enforcing alignment") {
+    auto ok_json = json::parse(R"({"kv":[["q4_0","q4_0"]],"ctx":[8192,12288,16384,20480,24576],"ubatch":[512],"mtp":[0]})");
+    REQUIRE(ok_json.ok());
+    auto grid_res = tune::parse_grid(ok_json.value());
+    REQUIRE_MESSAGE(grid_res.ok(), grid_res.status().message());
+
+    tune::Options options;
+    options.grid = grid_res.value();
+    auto now = tune::Clock::now();
+    const auto report = tune::search(
+        options, false, now + std::chrono::minutes(1),
+        [&](const tune::Candidate &c, tune::Phase phase, tune::Deadline) { return clean(c, phase); },
+        [&] { return now; });
+    CHECK_FALSE(report.fast_default); // below 64k fast threshold
+    REQUIRE(report.long_context);
+    CHECK(report.results[*report.long_context].candidate.ctx == 20480);
+
+    for (const auto *bad_json : {R"({"ctx":[4096]})", R"({"ctx":[10000]})"}) {
+        CAPTURE(bad_json);
+        const auto bad = json::parse(bad_json);
+        REQUIRE(bad.ok());
+        CHECK_FALSE(tune::parse_grid(bad.value()).ok());
+    }
+}
+
+TEST_CASE("tune GGUF scanner detects nextn_predict_layers metadata and prism.hadamard arrays") {
+    const auto make_meta_gguf = [](bool nextn_before_arch, const std::string &nextn_key, std::uint32_t nextn_type,
+                                   std::uint64_t nextn_val, bool with_prism) {
+        std::string out = "GGUF";
+        const std::uint64_t kv_count = (nextn_key.empty() ? 1ull : 2ull) + (with_prism ? 2ull : 0ull);
+        integer(out, 3, 4);
+        integer(out, 1, 8);        // 1 tensor
+        integer(out, kv_count, 8); // kv count
+        const auto emit_arch = [&] {
+            string(out, "general.architecture");
+            integer(out, 8, 4);
+            string(out, "qwen35");
+        };
+        const auto emit_nextn = [&] {
+            if (nextn_key.empty()) return;
+            string(out, nextn_key);
+            integer(out, nextn_type, 4);
+            integer(out, nextn_val, nextn_type == 10 || nextn_type == 11 ? 8u : 4u);
+        };
+        if (nextn_before_arch) {
+            emit_nextn();
+            emit_arch();
+        } else {
+            emit_arch();
+            emit_nextn();
+        }
+        if (with_prism) {
+            string(out, "prism.hadamard.block_size");
+            integer(out, 4, 4); // uint32
+            integer(out, 128, 4);
+            // Large int8 sign_values array (28,672 bytes) must fast-skip safely.
+            string(out, "prism.hadamard.sign_values");
+            integer(out, 9, 4); // array
+            integer(out, 1, 4); // int8
+            integer(out, 28672, 8);
+            out.append(28672, '\x01');
+        }
+        string(out, "blk.0.attn_q.weight");
+        integer(out, 2, 4);
+        integer(out, 32, 8);
+        integer(out, 32, 8);
+        integer(out, 0, 4);
+        integer(out, 0, 8);
+        return out;
+    };
+
+    // Positive <arch>.nextn_predict_layers works both after and before general.architecture.
+    for (const bool before : {false, true}) {
+        std::istringstream in(make_meta_gguf(before, "qwen35.nextn_predict_layers", 4, 1, false));
+        const auto info = tune::read_model_info(in);
+        REQUIRE_MESSAGE(info.ok(), info.status().message());
+        CHECK(info.value().has_nextn);
+        CHECK_FALSE(info.value().prism_hadamard);
+    }
+
+    // Zero, negative signed int32, and wrong-architecture keys do not enable MTP.
+    {
+        std::istringstream in(make_meta_gguf(false, "qwen35.nextn_predict_layers", 4, 0, false));
+        const auto info = tune::read_model_info(in);
+        REQUIRE_MESSAGE(info.ok(), info.status().message());
+        CHECK_FALSE(info.value().has_nextn);
+    }
+    {
+        std::istringstream in(make_meta_gguf(false, "qwen35.nextn_predict_layers", 5, 0xffffffffu, false));
+        const auto info = tune::read_model_info(in);
+        REQUIRE_MESSAGE(info.ok(), info.status().message());
+        CHECK_FALSE(info.value().has_nextn);
+    }
+    {
+        std::istringstream in(make_meta_gguf(false, "other.nextn_predict_layers", 4, 2, false));
+        const auto info = tune::read_model_info(in);
+        REQUIRE_MESSAGE(info.ok(), info.status().message());
+        CHECK_FALSE(info.value().has_nextn);
+    }
+
+    // PrismML Hadamard metadata + large sign_values array sets prism_hadamard cleanly.
+    {
+        std::istringstream in(make_meta_gguf(false, "", 4, 0, true));
+        const auto info = tune::read_model_info(in);
+        REQUIRE_MESSAGE(info.ok(), info.status().message());
+        CHECK(info.value().prism_hadamard);
+        CHECK_FALSE(info.value().has_nextn);
+    }
+}
