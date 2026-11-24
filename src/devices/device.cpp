@@ -956,16 +956,27 @@ std::optional<GpuDeviceInfo> parse_amdgpu_sysfs_device(std::string_view card_id,
         }
     }
 
-    const auto vram_total_text = read_file(dev_dir + "/mem_info_vram_total");
-    const auto vram_used_text = read_file(dev_dir + "/mem_info_vram_used");
-    const auto gtt_total_text = read_file(dev_dir + "/mem_info_gtt_total");
-    const auto gtt_used_text = read_file(dev_dir + "/mem_info_gtt_used");
-
-    const auto vram_total = vram_total_text ? parse_sysfs_u64(*vram_total_text) : std::nullopt;
-    const auto vram_used = vram_used_text ? parse_sysfs_u64(*vram_used_text) : std::nullopt;
-    const auto gtt_total = gtt_total_text ? parse_sysfs_u64(*gtt_total_text) : std::nullopt;
-    const auto gtt_used = gtt_used_text ? parse_sysfs_u64(*gtt_used_text) : std::nullopt;
-    if (!vram_total && !gtt_total) {
+    std::uint64_t vram_total_bytes = 0;
+    std::uint64_t vram_used_bytes = 0;
+    std::uint64_t gtt_total_bytes = 0;
+    std::uint64_t gtt_used_bytes = 0;
+    bool has_vram_total = false;
+    bool has_vram_used = false;
+    bool has_gtt_total = false;
+    bool has_gtt_used = false;
+    const auto read_u64 = [&](const std::string& path, std::uint64_t& out, bool& present) {
+        if (const auto text = read_file(path)) {
+            if (const auto parsed = parse_sysfs_u64(*text)) {
+                out = *parsed;
+                present = true;
+            }
+        }
+    };
+    read_u64(dev_dir + "/mem_info_vram_total", vram_total_bytes, has_vram_total);
+    read_u64(dev_dir + "/mem_info_vram_used", vram_used_bytes, has_vram_used);
+    read_u64(dev_dir + "/mem_info_gtt_total", gtt_total_bytes, has_gtt_total);
+    read_u64(dev_dir + "/mem_info_gtt_used", gtt_used_bytes, has_gtt_used);
+    if (!has_vram_total && !has_gtt_total) {
         return std::nullopt;
     }
 
@@ -990,24 +1001,26 @@ std::optional<GpuDeviceInfo> parse_amdgpu_sysfs_device(std::string_view card_id,
         info.name = info.device_id != 0 ? "AMD Radeon (" + hex_u32_string(info.device_id) + ")" : "AMD GPU";
     }
 
-    if (vram_total) {
-        info.dedicated_total = MemoryReading::known(*vram_total);
+    if (has_vram_total) {
+        info.dedicated_total = MemoryReading::known(vram_total_bytes);
     }
-    if (gtt_total) {
-        info.shared_total = MemoryReading::known(*gtt_total);
+    if (has_gtt_total) {
+        info.shared_total = MemoryReading::known(gtt_total_bytes);
     }
     info.is_integrated_uma =
         is_integrated_uma_memory(GpuVendor::amd, info.dedicated_total.bytes_or(0), info.shared_total.bytes_or(0));
 
     if (!info.is_integrated_uma) {
-        if (vram_total && vram_used) {
-            info.dedicated_free = MemoryReading::known(*vram_total > *vram_used ? *vram_total - *vram_used : 0);
+        if (has_vram_total && has_vram_used) {
+            info.dedicated_free =
+                MemoryReading::known(vram_total_bytes > vram_used_bytes ? vram_total_bytes - vram_used_bytes : 0);
         }
-    } else if (gtt_total && gtt_used) {
-        const std::uint64_t gtt_free = *gtt_total > *gtt_used ? *gtt_total - *gtt_used : 0;
+    } else if (has_gtt_total && has_gtt_used) {
+        const std::uint64_t gtt_free = gtt_total_bytes > gtt_used_bytes ? gtt_total_bytes - gtt_used_bytes : 0;
         std::uint64_t vram_free = 0;
-        if (vram_total) {
-            vram_free = vram_used ? (*vram_total > *vram_used ? *vram_total - *vram_used : 0) : *vram_total;
+        if (has_vram_total) {
+            vram_free = has_vram_used ? (vram_total_bytes > vram_used_bytes ? vram_total_bytes - vram_used_bytes : 0)
+                                      : vram_total_bytes;
         }
         info.dedicated_free = MemoryReading::known(saturating_add(vram_free, gtt_free));
     }
