@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -193,11 +194,26 @@ enum class StopReason {
 
 [[nodiscard]] std::string_view ToString(StopReason reason) noexcept;
 
+// Maximum serialized byte size accepted by CaptureSequenceState / RestoreSequenceState.
+inline constexpr std::size_t kMaxSequenceStateBytes = std::size_t{512} << 20;
+
 struct GenerateRequest {
     std::vector<Token> prompt;     // already tokenized; must be non-empty
     std::int32_t max_new_tokens = 128;
     SamplingParams sampling{};
     bool reset_context = true;     // clear KV memory before prefill
+    // Optional atomic sequence-state restore before suffix prefill. When
+    // non-empty and 0 < restore_tokens < prompt.size(), Generate() clears
+    // memory, restores sequence 0 state, and prefills only prompt[restore_tokens..).
+    std::span<const std::uint8_t> restore_state{};
+    std::size_t restore_tokens = 0;
+    std::function<void()> on_state_restored;
+    // Optional atomic prefill-boundary capture: when > n_past and <= prompt.size(),
+    // Generate() splits prefill at `capture_at_tokens`, captures sequence 0 state
+    // before decoding tail prompt or completion tokens, and invokes `on_state_captured`.
+    std::size_t capture_at_tokens = 0;
+    std::size_t max_capture_bytes = kMaxSequenceStateBytes;
+    std::function<void(std::vector<std::uint8_t>)> on_state_captured;
 };
 
 // One event per generated token. After the last token a final event with
@@ -221,6 +237,10 @@ struct GenerateResult {
     std::int32_t generated_tokens = 0;
     double prefill_ms = 0.0;
     double decode_ms = 0.0;
+    bool state_restored = false;
+    Status restore_status{};
+    bool state_captured = false;
+    Status capture_status{};
 
     [[nodiscard]] double decode_tokens_per_second() const noexcept;
     [[nodiscard]] double prefill_tokens_per_second() const noexcept;
@@ -282,6 +302,7 @@ struct Capabilities {
     bool kv_import = false;
     bool prefix_reuse = false;
     bool speculative_decode = false;
+    bool recurrent_checkpoint = true;
 };
 
 class LlamaCppBackend {
@@ -346,6 +367,13 @@ public:
 
     GenerateResult Generate(const GenerateRequest& request, const TokenCallback& on_token,
                             const CancelPredicate& should_cancel = {});
+
+    // Captures sequence 0 state (KV + recurrent/SSM state) via llama_state_seq_get_*.
+    Status CaptureSequenceState(std::vector<std::uint8_t>& out_bytes,
+                                std::size_t max_bytes = kMaxSequenceStateBytes);
+    // Restores sequence 0 state via llama_state_seq_set_data.
+    Status RestoreSequenceState(std::span<const std::uint8_t> bytes,
+                                std::size_t max_bytes = kMaxSequenceStateBytes);
 
     void SetTelemetrySink(TelemetrySink sink);
 

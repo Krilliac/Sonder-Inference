@@ -87,16 +87,17 @@ itself.
 | `--ubatch-size N` | llama.cpp's 512, capped at `--batch-size` | `llamacpp` only; 1 to 4194304, and not above `--batch-size`. |
 | `--cache-type-k T`, `--cache-type-v T` | `f16` | `llamacpp` only. One of `f16`, `f32`, `bf16`, `q8_0`, `q5_1`, `q5_0`, `q4_1`, `q4_0`, `iq4_nl`. A quantized V cache needs flash attention `on` or `auto`. |
 | `--flash-attn auto\|on\|off` | `auto` | `llamacpp` only. |
-| `--llamaserver-config PATH` | none | `llamaserver`: JSON config (mode, URL or executable, `args`, timeouts, guards and a `tls` object); keys are in [integration/llama-server.md](integration/llama-server.md). An unreadable or invalid file is a usage error. |
+| `--llamaserver-config PATH` | none | `llamaserver`: JSON config (mode, URL or executable, `args`, timeouts, guards including `spill_guard.uma_mode` (`true`\|`false`\|`"auto"`), opt-in `adaptive_speculation`, and a `tls` object); keys are in [integration/llama-server.md](integration/llama-server.md) and [GPU_SUPPORT.md](GPU_SUPPORT.md). An unreadable or invalid file is a usage error. |
 | `--llamaserver-mode attach\|spawn` | `attach` (`spawn` under a llamaserver profile) | Overrides the config's `mode`. |
-| `--llamaserver-url URL` | `http://127.0.0.1:8080` | Attach upstream URL. Refused with `--profile`. |
+| `--llamaserver-url URL` | `http://127.0.0.1:8080` | Attach upstream URL. Refused with a single spawn `--profile`; permitted for multi-profile `llamaserver` attach mode. |
 | `--llamaserver-executable PATH` | none | `llama-server` binary; required in spawn mode. |
 | `--llamaserver-arg ARG` (repeatable) | none | One spawn argv entry per occurrence, passed verbatim; replaces the config's `args`. May not set `--host` or `--port`. Refused with `--profile`. |
 | `--warmup-file PATH` | none | `llamaserver` only (usage error otherwise): JSON of prefix messages replayed to warm the upstream's prompt cache. |
-| `--profiles PATH` | none | JSON file of typed launch profiles; needs `--profile`. See [launch profiles](integration/launch-profiles.md). |
-| `--profile NAME` | none | Serve that profile: its `backend` (`llamaserver` or `llamacpp`) is the backend and `NAME` is the served model id. Needs `--profiles`. `--backend`, if given, must equal the profile's backend. A llamaserver profile also refuses a llamaserver config file that sets `args` (move them into the profile's typed fields or `extra_args`). Under any profile `--gpu-layers`, `--context-length`, `--llamaserver-url`, `--llamaserver-arg` and the llama.cpp context flags (`--batch-size`, `--ubatch-size`, `--cache-type-k`, `--cache-type-v`, `--flash-attn`) are refused: set the profile's typed fields instead. A llamaserver profile forces spawn mode (attach is refused) and also refuses `--moe-experts` and `--tensor-override`; a llamacpp profile takes them from the command line. |
-| `--vram-budget-mib N` | the profile's `vram_budget_mib`, else detected device VRAM minus 1536 MiB | Budget for the profile's VRAM fit check; 1 to 16777216; wins over the profile's value. `--profile` only. |
-| `--allow-overcommit` | off | Start even when the estimate exceeds the budget or cannot be made. `--profile` only. |
+| `--profiles PATH` | none | JSON file of typed launch profiles; needs `--profile` or `--all-profiles`. See [launch profiles](integration/launch-profiles.md). |
+| `--profile NAME` (repeatable) | none | Serve one or more profiles from `--profiles`: the first is the default model id and sets the backend (`llamaserver` or `llamacpp`). Duplicate names and mixed incompatible backends are usage errors (exit 2). `--backend`, if given, must equal the profile backend. Multi-profile `llamacpp` shares backend context/KV/GPU-layer options (refusing conflicting values), binds each profile's GGUF path, and validates aggregate co-residency VRAM across active offloading profiles (respecting `--lazy-models` and `--max-resident-models`). Multi-profile `llamaserver` works in attach mode (or spawn mode only when profiles share the same GGUF and launch args, differing only in name/sampling); spawning multiple distinct GGUFs requires `--llamaserver-mode attach` or separate `serve` instances. Under any profile `--gpu-layers`, `--context-length`, `--llamaserver-arg`, and the llama.cpp context flags (`--batch-size`, `--ubatch-size`, `--cache-type-k`, `--cache-type-v`, `--flash-attn`) are refused: set the profile's typed fields instead. A llamaserver profile also refuses `--moe-experts`, `--tensor-override`, and a config file setting `args`. |
+| `--all-profiles` | off | Serve every profile in `--profiles` sharing the primary profile's backend (or explicit `--backend`). Mutually exclusive with `--profile`; requires `--profiles`. |
+| `--vram-budget-mib N` | the profile's `vram_budget_mib`, else detected device VRAM minus 1536 MiB | Budget for the profile's (or multi-profile aggregate) VRAM fit check; 1 to 16777216; wins over the profile's value. `--profile` / `--all-profiles` only. |
+| `--allow-overcommit` | off | Start even when the single-profile or aggregate co-residency VRAM estimate exceeds the budget or cannot be made. `--profile` / `--all-profiles` only. |
 | `--token-file PATH` | none | Bearer token (one line). Read once, kept in memory, never logged. A warning is printed when the file is readable by group or others. |
 | `--cors-origin ORIGIN` (repeatable) | none | Exact-match browser origin, allowed on every route. Must be a serialized origin as browsers send it: lowercase `scheme://host[:port]`, no path, trailing slash, query or wildcard (exit 2 otherwise). |
 | `--no-default-cors` | off | Drops the default origin list. |
@@ -298,7 +299,7 @@ and `Access-Control-Max-Age: 600` (plus
 | Malformed request line or header, obsolete line folding, conflicting `Content-Length`, `Content-Length` with `Transfer-Encoding`, more than one `Host` header (RFC 9112 section 3.2) | 400 `malformed_request` |
 | HTTP version other than 1.x | 505 |
 | `POST` without `Content-Length`, or with a chunked body | 411 `length_required` |
-| Body over `--max-body-bytes` (checked before reading it) | 413 `payload_too_large` |
+| Body over `--max-body-bytes` (or over `min(--max-body-bytes, 65536)` on `POST /v1/sonder/plan`; checked before reading it) | 413 `payload_too_large` |
 | Headers or body not received within 10 s | 408 `request_timeout` |
 | At `--max-connections`, a new connection arrives while another has spent 500 ms or more without completing its request head | The oldest such connection gets 408 `request_timeout` and the new one is served (slow clients cannot hold every slot). Connections past their head are never evicted. |
 | More than `--max-connections` open connections | 503 `overloaded`, `Retry-After: 1` |
@@ -377,6 +378,10 @@ reject with `never_fits` or `invalid_request`, both caller errors (400).
  "telemetry":{"level":"standard","subscribers":0,"retained":42,"capacity":8192,"emitted":42,"dropped":0,
               "subscriber_dropped_events":0},
  "log":{"queued":0,"capacity":4096,"written":57,"dropped":0},
+ "gpus":[{"id":"gpu:0","name":"NVIDIA GeForce RTX 5070 Ti","vendor":"nvidia","vendor_id":4318,
+          "device_id":11269,"dedicated_total_mib":15995,"dedicated_free_mib":14200,"shared_total_mib":15826,
+          "effective_vram_mib":15995,"effective_free_vram_mib":14200,"is_integrated_uma":false,
+          "backend_hint":"cuda","source":"dxgi"}],
  "sonder":{"api_version":1,"features":[],"pins":{"mode":"override"}}}
 ```
 
@@ -384,10 +389,16 @@ reject with `never_fits` or `invalid_request`, both caller errors (400).
 once before `ready` and then every 2 s by a background refresher: health and
 identity only read that cache and never wait on the backend (a hung Ollama
 cannot stall them).
-A backend that reports runtime observations (a spawned `llamaserver` child)
-adds `backends[].runtime` with `gpu_memory`, `context` and `warnings`
-([vram-spill](integration/vram-spill.md)); other backends' entries are
-unchanged.
+Top-level `gpus` (additive) reports the live host GPU inventory from
+`enumerate_gpu_devices()` (DXGI on Windows, `amdgpu` sysfs and/or dynamic NVML
+on Linux), cached under a 2 s TTL so health polls never contend on GPU drivers.
+A backend that reports runtime observations (a spawned `llamaserver` child, or
+a native `llamaserver` with `adaptive_speculation` enabled) adds
+`backends[].runtime` with `gpu_memory` (Windows PDH, Linux `amdgpu-fdinfo`, or
+NVML, honoring `uma_mode`), `context`, `warnings`, and (when live adaptive
+speculation is active) `diagnostics.adaptive_speculation`
+([vram-spill](integration/vram-spill.md), [GPU_SUPPORT.md](GPU_SUPPORT.md));
+other backends' entries are unchanged.
 `telemetry.emitted` and `telemetry.dropped` are the bus counters;
 `subscriber_dropped_events` counts events lost by slow live subscribers.
 `log` (additive) describes the access-log queue: `queued` lines are waiting
@@ -430,14 +441,16 @@ model's residency state (lazy, loading or evicted). Top-level `sonder.features` 
 same exact backend list as health: the seven llama-server features above, or
 `[]` for mock.
 
-With `--profile`, the served model's `sonder` object also carries `profile`
-(context length, cache types, backend, capabilities, estimated VRAM), and the
-top-level `sonder` object lists every profile of the file as `profiles`. Both
-are additive and absent without a profile. `context_length` follows a
-context the backend reduced at run time (`configured_context_length` then
-keeps the profile's), and `capabilities` lists only what this endpoint
-accepts (`upstream_capabilities` has the upstream's `vision`/`tools`); see
-[launch profiles](integration/launch-profiles.md).
+With `--profile` or `--all-profiles`, every served model's `sonder` object
+carries `profile` (context length, cache types, backend, capabilities,
+estimated VRAM, plus `per_gpu_max_mib`, `prism_hadamard`, and
+`requires_prism_runtime` when applicable), and the top-level `sonder` object
+lists every profile of the file as `profiles` (marking every active served
+profile `"served": true`). Both are additive and absent without a profile.
+`context_length` follows a context the backend reduced at run time
+(`configured_context_length` then keeps the profile's), and `capabilities`
+lists only what this endpoint accepts (`upstream_capabilities` has the
+upstream's `vision`/`tools`); see [launch profiles](integration/launch-profiles.md).
 
 ### `GET /v1/sonder/identity[?model=ID]`
 
@@ -460,9 +473,93 @@ is greater than 0. When any value cannot be measured, `backend_identity` is
 - `ollama`: always `null` in v1. The Ollama API does not expose a measurable
   tokenizer digest, and a partial identity would fail `BackendIdentity`
   validation.
-- `llamacpp`: `null`, because GGUF file hashing is not implemented.
+- `llamacpp`: returns a real, genuinely measured 9-key `backend_identity` once
+  the model has loaded (`descriptor != nullptr`) and its GGUF supplies all
+  required fields: streaming 64 KiB full-file SHA-256 (`model_digest`),
+  single-pass canonical 12-key `tokenizer.ggml.*` SHA-256 (`tokenizer_digest`),
+  raw `tokenizer.chat_template` SHA-256 (`template_digest`),
+  `general.file_type` or dominant-tensor `quantization`, GPU+CPU `hardware`,
+  and `context_tokens > 0`, cached in a bounded 16-entry `(path, file_size,
+  mtime)` LRU cache with post-hash verification. Returns `null` with a clear
+  `reason` (never fabricates a digest) when the model is unloaded/lazy, the
+  file cannot be read, or required metadata (`backend_version`, tokenizer
+  metadata, or `tokenizer.chat_template`) is missing.
 
 Unknown model: 404 `model_not_found`.
+
+### `GET /v1/sonder/node`
+
+Phase 4 local node capability inventory (schema `sonder.inference.node/1`).
+200 when ready, 503 while starting or draining; subject to the same loopback
+`Host`, read-only CORS, and `--token-file` bearer-auth rules as
+`/v1/sonder/health`.
+
+```json
+{"schema":"sonder.inference.node/1","node_id":"host","instance_id":"tel-…",
+ "platform":"windows-x86_64","version":"0.1.0","commit":"0915a2f3…","abi_version":1,
+ "api_version":1,"synthetic":false,
+ "host_memory":{"total_physical_bytes":33285996544,"available_physical_bytes":24159191040,
+                "available_commit_bytes":28454158336,"source":"GlobalMemoryStatusEx"},
+ "devices":[{"id":"cpu:0","kind":"cpu","name":"...","logical_cores":24,
+             "total_memory_bytes":33285996544,"available_memory_bytes":24159191040}],
+ "gpus":[...],
+ "backends":[{"name":"llamaserver","available":true,"capabilities":["streaming","remote_process"]}],
+ "models":[{"id":"my-model","backend":"llamaserver","state":"resident","resident":true,"default":true}],
+ "profiles":[],
+ "capabilities":{"ternary_gguf":true,"placement_planner":true,"coresidency_planner":true,
+                 "multi_gpu":true,"uma_telemetry":true,"adaptive_speculation":true},
+ "sonder":{"api_version":1}}
+```
+
+- `host_memory.*` fields are `null` when unknown on the host OS (e.g.
+  `available_commit_bytes` on Linux/macOS).
+- `gpus` reuses the 2 s TTL-cached `enumerate_gpu_devices()` snapshot.
+- `capabilities.adaptive_speculation` reflects whether the `llamaserver`
+  backend is compiled into the binary.
+- Never leaks internal host filesystem paths or secrets. Advertised in
+  `/.well-known/sonder-telemetry` under `links.node`.
+
+### `POST /v1/sonder/plan`
+
+Header-only hardware placement planning endpoint (schema
+`sonder.inference.plan/1`). Subject to the same `Host`, POST CORS, and
+`--token-file` auth rules as `/v1/chat/completions`, with request bodies
+capped to `min(--max-body-bytes, 65536)` bytes (413 `payload_too_large` above
+that).
+
+Strict containment: the endpoint never accepts arbitrary filesystem paths over
+HTTP. The request JSON object must specify **exactly one** of:
+
+- `"profile"` (string, `[A-Za-z0-9._:-]`, max 128 bytes, no `..`): resolved
+  only against profiles already bound on this server instance.
+- `"model"` (string, clean `.gguf` basename without `/`, `\`, `..`, `:`, NUL,
+  or control chars): resolved strictly inside configured `--model-dir`
+  directories after `std::filesystem::canonical()` verification so escaping
+  symlinks and non-GGUF files are refused with 404 `not_found`.
+
+Optional tuning overrides (strictly typed and range-checked; unknown keys or
+type/range violations return 400 `invalid_request`):
+
+| Field | Type / range | Effect |
+| --- | --- | --- |
+| `ctx_size` | integer `128..1048576` | Target context window (clamped to model training context). |
+| `min_ctx_size` | integer `128..1048576` | Floor for automatic context step-down. |
+| `parallel` | integer `1..256` | Parallel slot count. |
+| `vram_headroom_mib` | integer `0..65536` | Per-GPU OS/desktop VRAM reserve in MiB. |
+| `device_hint` | string, max 128 bytes | Device selector (`CUDA0`, `ROCm0`, `Vulkan0`, `gpu:0`, `uma`, `multi`, `cpu`, or comma-separated list). |
+| `prefer_free_vram` | boolean | Size against live free VRAM (`true`) vs total VRAM (`false`). |
+| `allow_quantized_kv` | boolean | Allow `q8_0`/`q4_0` KV quantization. |
+| `allow_speculative` | boolean | Allow automatic `draft-mtp` / `ngram-mod` selection. |
+| `allow_moe_cpu_offload` | boolean | Allow automatic `--n-cpu-moe` expert offload search. |
+
+Returns HTTP 200 with `"schema": "sonder.inference.plan/1"`, all fields from
+`placement_plan_to_json()` (`profile`, `estimate`, `budget_mib`,
+`fits_in_vram`, `fits_in_host_ram`, `uma_mode`, `requires_prism_runtime`,
+`selected_vendor`, `recommended_backend_hint`, `recommended_env`, `reasons`,
+`warnings`), and `"sonder": {"api_version": 1}`. `profile.model`,
+`profile.mmproj`, and `profile.speculative.draft_model` are redacted to
+basenames only so local host paths are never disclosed. Advertised in
+`/.well-known/sonder-telemetry` under `links.plan`.
 
 ### `POST /v1/chat/completions`
 
@@ -830,7 +927,8 @@ curl http://127.0.0.1:11437/v1/messages \
  "resume":{"header":"Last-Event-ID","query":"last_event_id","retained_events":42,"oldest_sequence":0,"next_sequence":42},
  "auth":{"required":false,"schemes":["bearer"]},"clock":{"mono_ns":"host-monotonic"},
  "sampling_level":"standard","text_capture":"off",
- "links":{"health":"/v1/sonder/health","identity":"/v1/sonder/identity","models":"/v1/models"},
+ "links":{"health":"/v1/sonder/health","identity":"/v1/sonder/identity","models":"/v1/models",
+          "node":"/v1/sonder/node","plan":"/v1/sonder/plan"},
  "vocabularies":{"sonder.inference.events":1},
  "stats":{"subscribers":0,"max_subscribers":8,"capacity":8192,"subscriber_dropped_events":0},
  "sonder":{"api_version":1}}
@@ -881,8 +979,11 @@ must send the token as a bearer header; it never goes in a URL.
 
 ```sh
 curl -s http://127.0.0.1:11437/v1/sonder/health
+curl -s http://127.0.0.1:11437/v1/sonder/node
 curl -s http://127.0.0.1:11437/v1/models
 curl -s 'http://127.0.0.1:11437/v1/sonder/identity?model=default'
+curl -s http://127.0.0.1:11437/v1/sonder/plan -H 'Content-Type: application/json' \
+  -d '{"model":"model.gguf","ctx_size":32768}'
 curl -s http://127.0.0.1:11437/v1/chat/completions -H 'Content-Type: application/json' \
   -H 'X-Sonder-Run-Id: turn-1' -H 'X-Sonder-Parent-Request-Id: turn-1' \
   -d '{"model":"default","messages":[{"role":"user","content":"hello"}],"max_tokens":16}'

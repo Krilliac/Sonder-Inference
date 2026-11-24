@@ -1,6 +1,7 @@
 // Core-interface adapter tests (no model weights needed).
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <limits>
 #include <memory>
 #include <string>
@@ -109,6 +110,9 @@ TEST_CASE("llamacpp adapter: backend identity, capabilities, probe") {
     CHECK(caps.has(Capability::streaming));
     CHECK(caps.has(Capability::batched_prefill));
     CHECK(caps.has(Capability::deterministic));
+    CHECK(caps.has(Capability::recurrent_checkpoint));
+    const auto cap_names = caps.names();
+    CHECK(std::find(cap_names.begin(), cap_names.end(), "recurrent_checkpoint") != cap_names.end());
     CHECK_FALSE(caps.has(Capability::remote_process));
     CHECK_FALSE(caps.has(Capability::kv_export));
     auto probe = be->probe();

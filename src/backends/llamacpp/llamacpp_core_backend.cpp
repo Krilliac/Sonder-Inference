@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -120,6 +121,15 @@ public:
 
     [[nodiscard]] const ModelDescriptor& descriptor() const override { return desc_; }
 
+    Result<std::vector<TokenId>> tokenize(std::string_view text) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<lc::Token> tokens;
+        if (lc::Status s = runtime_.Tokenize(text, /*add_special=*/true, tokens, /*parse_special=*/false); !s.ok()) {
+            return ToStatus(s);
+        }
+        return tokens;
+    }
+
     Result<GenerateStats> generate(const GenerateRequest& request, const CancellationToken& cancel,
                                    const TokenCallback& on_chunk) override {
         if (Status v = validate(request.sampling); !v.ok()) return v;
@@ -133,14 +143,15 @@ public:
                               " exceeds the loaded llama.cpp context (" + std::to_string(desc_.context_length) +
                               "); reload with a larger context_length");
         }
-        // One llama_context per model: serialize requests on it.
+        // One llama_context per model: serialize requests (including atomic
+        // checkpoint restore and prefill-boundary capture) under one lock.
         std::lock_guard<std::mutex> lock(mutex_);
         std::vector<lc::Token> prompt_tokens;
         if (lc::Status s = runtime_.Tokenize(request.prompt, /*add_special=*/true, prompt_tokens, /*parse_special=*/false);
             !s.ok()) {
             return ToStatus(s);
         }
-        return run_tokens(std::move(prompt_tokens), request.sampling, cancel, on_chunk);
+        return run_tokens(std::move(prompt_tokens), request.sampling, cancel, on_chunk, request.checkpoint);
     }
 
     // Chat through the GGUF chat template (llama_chat_apply_template). Models
@@ -199,11 +210,37 @@ public:
         return runtime_.ApplyChatTemplate({lc::ChatTurn{"user", "x"}}, true, ignored).ok();
     }
 
+    Result<RecurrentStateSnapshot> capture_recurrent_state(std::uint64_t token_position) override {
+        if (token_position == 0) {
+            return Status(ErrorCode::invalid_argument, "recurrent checkpoint token_position must be > 0");
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        RecurrentStateSnapshot snapshot;
+        snapshot.token_position = token_position;
+        if (lc::Status s = runtime_.CaptureSequenceState(snapshot.bytes, kMaxRecurrentCheckpointBytes); !s.ok()) {
+            return ToStatus(s);
+        }
+        return snapshot;
+    }
+
+    Status restore_recurrent_state(std::span<const std::uint8_t> bytes) override {
+        if (bytes.empty()) {
+            return Status(ErrorCode::invalid_argument, "recurrent checkpoint snapshot is empty");
+        }
+        if (bytes.size() > kMaxRecurrentCheckpointBytes) {
+            return Status(ErrorCode::invalid_argument,
+                          "recurrent checkpoint snapshot exceeds kMaxRecurrentCheckpointBytes");
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        return ToStatus(runtime_.RestoreSequenceState(bytes, kMaxRecurrentCheckpointBytes));
+    }
+
 private:
     // Caller holds mutex_. Prompt tokens are already produced across the
     // trusted/untrusted tokenization boundary.
     Result<GenerateStats> run_tokens(std::vector<lc::Token> prompt_tokens, const SamplingConfig& sampling,
-                                     const CancellationToken& cancel, const TokenCallback& on_chunk) {
+                                     const CancellationToken& cancel, const TokenCallback& on_chunk,
+                                     RecurrentCheckpointExchange* checkpoint = nullptr) {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
 
         lc::GenerateRequest req;
@@ -211,6 +248,32 @@ private:
         if (req.prompt.empty()) return Status(ErrorCode::invalid_argument, "prompt produced no tokens");
         req.max_new_tokens = sampling.max_tokens;
         req.sampling = ToLlamaSampling(sampling);
+        if (checkpoint != nullptr) {
+            if (!checkpoint->restore_bytes.empty() && checkpoint->restore_token_position > 0 &&
+                checkpoint->restore_token_position < req.prompt.size()) {
+                req.restore_state = checkpoint->restore_bytes;
+                req.restore_tokens = static_cast<std::size_t>(checkpoint->restore_token_position);
+                if (checkpoint->on_restored) {
+                    req.on_state_restored = [checkpoint] {
+                        checkpoint->restored = true;
+                        checkpoint->on_restored();
+                    };
+                }
+            }
+            if (checkpoint->capture_at_token_position > 0 &&
+                checkpoint->capture_at_token_position <= req.prompt.size()) {
+                req.capture_at_tokens = static_cast<std::size_t>(checkpoint->capture_at_token_position);
+                req.max_capture_bytes = kMaxRecurrentCheckpointBytes;
+                req.on_state_captured = [checkpoint](std::vector<std::uint8_t> bytes) {
+                    checkpoint->captured = true;
+                    if (checkpoint->on_captured) {
+                        checkpoint->on_captured(checkpoint->capture_at_token_position, std::move(bytes));
+                    } else {
+                        checkpoint->captured_bytes = std::move(bytes);
+                    }
+                };
+            }
+        }
 
         GenerateStats stats;
         stats.load_ns = load_ns_;
@@ -232,7 +295,23 @@ private:
             },
             [&] { return cancel.cancelled(); });
 
-        stats.prompt_tokens = static_cast<std::uint64_t>(r.prompt_tokens);
+        if (checkpoint != nullptr) {
+            checkpoint->restored = r.state_restored;
+            if (!r.restore_status.ok()) {
+                checkpoint->restore_error = ToStatus(r.restore_status);
+            }
+            checkpoint->captured = r.state_captured;
+            if (!r.capture_status.ok()) {
+                checkpoint->capture_error = ToStatus(r.capture_status);
+            }
+        }
+
+        const std::uint64_t restored_tokens =
+            r.state_restored ? static_cast<std::uint64_t>(req.restore_tokens) : 0;
+        stats.prompt_tokens = static_cast<std::uint64_t>(r.prompt_tokens) + restored_tokens;
+        if (r.state_restored) {
+            stats.cached_tokens = restored_tokens;
+        }
         stats.completion_tokens = static_cast<std::uint64_t>(r.generated_tokens);
         stats.prompt_eval_ns = MsToNs(r.prefill_ms);
         stats.eval_ns = MsToNs(r.decode_ms);
@@ -283,7 +362,8 @@ public:
         caps.add(Capability::tokenization)
             .add(Capability::streaming)
             .add(Capability::batched_prefill)
-            .add(Capability::deterministic);
+            .add(Capability::deterministic)
+            .add(Capability::recurrent_checkpoint);
         return caps;
     }
 

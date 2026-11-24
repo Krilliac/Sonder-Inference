@@ -1,9 +1,12 @@
 // MOCK BACKEND - deterministic output for tests and harness development only.
 // It performs no inference and must never be used for quality/perf claims.
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <span>
 #include <thread>
 
 #include "engine/accounting_tokens.hpp"
@@ -33,6 +36,44 @@ std::uint64_t splitmix64(std::uint64_t x) {
     x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
     x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
     return x ^ (x >> 31);
+}
+
+constexpr std::array<std::uint8_t, 8> kMockCheckpointMagic = {'S', 'N', 'D', 'R', 'C', 'K', 'P', '1'};
+constexpr std::size_t kMockCheckpointBytes = 64;
+
+void write_u64_le(std::uint8_t* dst, std::uint64_t v) noexcept {
+    for (int i = 0; i < 8; ++i) {
+        dst[i] = static_cast<std::uint8_t>((v >> (i * 8)) & 0xFFu);
+    }
+}
+
+std::uint64_t read_u64_le(const std::uint8_t* src) noexcept {
+    std::uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) {
+        v |= static_cast<std::uint64_t>(src[i]) << (i * 8);
+    }
+    return v;
+}
+
+std::uint64_t fnv1a_bytes(std::span<const std::uint8_t> data) noexcept {
+    std::uint64_t h = 1469598103934665603ull;
+    for (const std::uint8_t b : data) {
+        h ^= b;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+std::uint64_t hash_token_prefix(std::span<const TokenId> tokens) noexcept {
+    std::uint64_t h = 1469598103934665603ull;
+    for (const TokenId t : tokens) {
+        const auto u = static_cast<std::uint32_t>(t);
+        for (int b = 0; b < 4; ++b) {
+            h ^= static_cast<std::uint8_t>((u >> (b * 8)) & 0xFFu);
+            h *= 1099511628211ull;
+        }
+    }
+    return h;
 }
 
 std::uint64_t count_words(std::string_view s) {
@@ -140,7 +181,43 @@ public:
         if (!options_.token_logits) {
             return Status(ErrorCode::unsupported, "mock backend created without token_logits");
         }
+        apply_checkpoint_exchange(request);
         return std::unique_ptr<TokenStream>(std::make_unique<MockTokenStream>(request, descriptor_.name, options_));
+    }
+
+    Result<RecurrentStateSnapshot> capture_recurrent_state(std::uint64_t token_position) override {
+        if (!options_.enable_recurrent_checkpoints) {
+            return Status(ErrorCode::unsupported, "mock backend created without enable_recurrent_checkpoints");
+        }
+        std::uint64_t prefix_hash = 0;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            prefix_hash = last_prompt_hash_;
+        }
+        auto built = build_checkpoint_bytes(token_position, prefix_hash);
+        if (!built.ok()) {
+            return built.status();
+        }
+        RecurrentStateSnapshot snapshot;
+        snapshot.token_position = token_position;
+        snapshot.bytes = std::move(built).value();
+        return snapshot;
+    }
+
+    Status restore_recurrent_state(std::span<const std::uint8_t> bytes) override {
+        if (!options_.enable_recurrent_checkpoints) {
+            return Status(ErrorCode::unsupported, "mock backend created without enable_recurrent_checkpoints");
+        }
+        std::uint64_t restored_pos = 0;
+        std::uint64_t restored_prefix_hash = 0;
+        if (Status st = validate_checkpoint_bytes(bytes, restored_pos, restored_prefix_hash); !st.ok()) {
+            return st;
+        }
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            last_prompt_hash_ = restored_prefix_hash;
+        }
+        return Status::success();
     }
 
     Result<GenerateStats> generate(const GenerateRequest& request, const CancellationToken& cancel,
@@ -149,6 +226,16 @@ public:
         stats.prompt_tokens = count_words(request.prompt);
         stats.token_counts_from_backend = true;
         const auto t0 = std::chrono::steady_clock::now();
+
+        if (cancel.cancelled()) {
+            stats.stop_reason = StopReason::cancelled;
+            return Status(ErrorCode::cancelled, "cancelled by caller");
+        }
+
+        apply_checkpoint_exchange(request);
+        if (request.checkpoint != nullptr && request.checkpoint->restored) {
+            stats.cached_tokens = request.checkpoint->restore_token_position;
+        }
 
         // Greedy decoding ignores the seed, like a real sampler would.
         std::uint64_t state = fnv1a(request.prompt) ^ fnv1a(descriptor_.name);
@@ -225,8 +312,145 @@ public:
     }
 
 private:
+    [[nodiscard]] std::size_t effective_checkpoint_limit() const noexcept {
+        return std::min(options_.max_checkpoint_bytes, kMaxRecurrentCheckpointBytes);
+    }
+
+    [[nodiscard]] std::uint64_t checkpoint_model_hash() const noexcept {
+        return fnv1a(descriptor_.name) ^ splitmix64(static_cast<std::uint64_t>(descriptor_.architecture));
+    }
+
+    Result<std::vector<std::uint8_t>> build_checkpoint_bytes(std::uint64_t token_position,
+                                                             std::uint64_t prefix_hash) const {
+        if (token_position == 0) {
+            return Status(ErrorCode::invalid_argument, "recurrent checkpoint token_position must be > 0");
+        }
+        const std::size_t limit = effective_checkpoint_limit();
+        if (limit == 0 || kMockCheckpointBytes > limit) {
+            return Status(ErrorCode::invalid_argument,
+                          "recurrent checkpoint snapshot exceeds max_checkpoint_bytes (" + std::to_string(limit) +
+                              " bytes)");
+        }
+        const std::uint64_t model_hash = checkpoint_model_hash();
+        std::vector<std::uint8_t> bytes(kMockCheckpointBytes, 0);
+        std::memcpy(bytes.data(), kMockCheckpointMagic.data(), kMockCheckpointMagic.size());
+        write_u64_le(bytes.data() + 8, model_hash);
+        write_u64_le(bytes.data() + 16, token_position);
+        write_u64_le(bytes.data() + 24, prefix_hash);
+        std::uint64_t state = splitmix64(model_hash ^ token_position ^ prefix_hash);
+        for (std::size_t off = 32; off < 56; off += 8) {
+            state = splitmix64(state);
+            write_u64_le(bytes.data() + off, state);
+        }
+        const std::uint64_t checksum = fnv1a_bytes(std::span<const std::uint8_t>(bytes.data(), 56));
+        write_u64_le(bytes.data() + 56, checksum);
+        return bytes;
+    }
+
+    Status validate_checkpoint_bytes(std::span<const std::uint8_t> bytes, std::uint64_t& out_pos,
+                                     std::uint64_t& out_prefix_hash) const {
+        if (bytes.empty()) {
+            return Status(ErrorCode::invalid_argument, "recurrent checkpoint snapshot is empty");
+        }
+        const std::size_t limit = effective_checkpoint_limit();
+        if (limit == 0 || bytes.size() > limit) {
+            return Status(ErrorCode::invalid_argument,
+                          "recurrent checkpoint snapshot exceeds max_checkpoint_bytes (" + std::to_string(limit) +
+                              " bytes)");
+        }
+        if (bytes.size() != kMockCheckpointBytes ||
+            std::memcmp(bytes.data(), kMockCheckpointMagic.data(), kMockCheckpointMagic.size()) != 0) {
+            return Status(ErrorCode::invalid_argument, "invalid mock recurrent checkpoint snapshot");
+        }
+        const std::uint64_t expected_checksum = fnv1a_bytes(bytes.subspan(0, 56));
+        if (read_u64_le(bytes.data() + 56) != expected_checksum) {
+            return Status(ErrorCode::invalid_argument, "mock recurrent checkpoint checksum mismatch");
+        }
+        if (read_u64_le(bytes.data() + 8) != checkpoint_model_hash()) {
+            return Status(ErrorCode::invalid_argument, "mock recurrent checkpoint model mismatch");
+        }
+        const std::uint64_t pos = read_u64_le(bytes.data() + 16);
+        if (pos == 0) {
+            return Status(ErrorCode::invalid_argument, "mock recurrent checkpoint has zero token_position");
+        }
+        out_pos = pos;
+        out_prefix_hash = read_u64_le(bytes.data() + 24);
+        return Status::success();
+    }
+
+    // Performs atomic restore + prefill-boundary capture under state_mutex_
+    // before releasing the mutex to invoke caller callbacks.
+    void apply_checkpoint_exchange(const GenerateRequest& request) {
+        if (!options_.enable_recurrent_checkpoints) {
+            return;
+        }
+        const std::vector<TokenId> prompt_tokens = detail::accounting_tokenize(request.prompt);
+        if (request.checkpoint == nullptr) {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            last_prompt_hash_ = hash_token_prefix(prompt_tokens);
+            return;
+        }
+
+        RecurrentCheckpointExchange& cp = *request.checkpoint;
+        std::vector<std::uint8_t> captured_vec;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (!cp.restore_bytes.empty() && cp.restore_token_position > 0 &&
+                cp.restore_token_position <= prompt_tokens.size()) {
+                std::uint64_t restored_pos = 0;
+                std::uint64_t restored_hash = 0;
+                Status rst = validate_checkpoint_bytes(cp.restore_bytes, restored_pos, restored_hash);
+                if (rst.ok() && restored_pos != cp.restore_token_position) {
+                    rst = Status(ErrorCode::invalid_argument, "mock recurrent checkpoint token_position mismatch");
+                }
+                if (rst.ok()) {
+                    const std::uint64_t expected_prefix_hash = hash_token_prefix(
+                        std::span<const TokenId>(prompt_tokens.data(), static_cast<std::size_t>(restored_pos)));
+                    if (restored_hash != expected_prefix_hash) {
+                        rst = Status(ErrorCode::invalid_argument, "mock recurrent checkpoint prefix hash mismatch");
+                    }
+                }
+                if (rst.ok()) {
+                    last_prompt_hash_ = restored_hash;
+                    cp.restored = true;
+                } else {
+                    cp.restored = false;
+                    cp.restore_error = std::move(rst);
+                }
+            }
+
+            if (cp.capture_at_token_position > 0 && cp.capture_at_token_position <= prompt_tokens.size()) {
+                const std::uint64_t prefix_hash = hash_token_prefix(std::span<const TokenId>(
+                    prompt_tokens.data(), static_cast<std::size_t>(cp.capture_at_token_position)));
+                last_prompt_hash_ = prefix_hash;
+                auto built = build_checkpoint_bytes(cp.capture_at_token_position, prefix_hash);
+                if (built.ok()) {
+                    captured_vec = std::move(built).value();
+                    cp.captured = true;
+                } else {
+                    cp.capture_error = built.status();
+                }
+            } else {
+                last_prompt_hash_ = hash_token_prefix(prompt_tokens);
+            }
+        }
+
+        if (cp.restored && cp.on_restored) {
+            cp.on_restored();
+        }
+        if (cp.captured) {
+            if (cp.on_captured) {
+                cp.on_captured(cp.capture_at_token_position, std::move(captured_vec));
+            } else {
+                cp.captured_bytes = std::move(captured_vec);
+            }
+        }
+    }
+
     ModelDescriptor descriptor_;
     MockBackendOptions options_;
+    mutable std::mutex state_mutex_;
+    std::uint64_t last_prompt_hash_ = 0;
 };
 
 class MockBackend final : public Backend {
@@ -243,6 +467,9 @@ public:
         if (options_.token_logits) {
             c.add(Capability::token_logits);
         }
+        if (options_.enable_recurrent_checkpoints) {
+            c.add(Capability::recurrent_checkpoint);
+        }
         return c;
     }
     Result<std::string> probe() override { return std::string("mock-1"); }
@@ -255,7 +482,7 @@ public:
     }
 
 private:
-    static ModelDescriptor describe(const std::string& name) {
+    ModelDescriptor describe(const std::string& name) const {
         ModelDescriptor d;
         d.name = name;
         d.backend = kMockBackendName;
@@ -264,6 +491,7 @@ private:
         d.parameter_size = "0";
         d.quantization = "none";
         d.context_length = 4096;
+        d.architecture = options_.default_architecture;
         return d;
     }
     MockBackendOptions options_;
