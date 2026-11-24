@@ -457,3 +457,91 @@ TEST_CASE("enumerate_gpu_devices returns well-formed entries without crashing") 
         CHECK(std::string(to_string(gpu.vendor)).size() > 0);
     }
 }
+
+TEST_CASE("ROCm/KFD availability, visible-device filtering, and Windows AMD backend hints") {
+    constexpr std::uint64_t kMiB = 1024ull * 1024ull;
+    constexpr std::uint64_t kGiB = 1024ull * kMiB;
+
+    // 1. Linux amdgpu sysfs: without /dev/kfd (rocm_available=false), AMD APU and RX XT hint "vulkan".
+    const auto apu_files = fake_files({
+        {"/sys/class/drm/card0/device/vendor", "0x1002\n"},
+        {"/sys/class/drm/card0/device/device", "0x15bf\n"},
+        {"/sys/class/drm/card0/device/product_name", "AMD Radeon 780M Graphics\n"},
+        {"/sys/class/drm/card0/device/uevent", "DRIVER=amdgpu\nPCI_ID=1002:15BF\n"},
+        {"/sys/class/drm/card0/device/mem_info_vram_total", std::to_string(512 * kMiB) + "\n"},
+        {"/sys/class/drm/card0/device/mem_info_gtt_total", std::to_string(16 * kGiB) + "\n"},
+    });
+    const auto apu_with_kfd = parse_amdgpu_sysfs_device("card0", apu_files, true);
+    const auto apu_no_kfd = parse_amdgpu_sysfs_device("card0", apu_files, false);
+    REQUIRE(apu_with_kfd.has_value());
+    REQUIRE(apu_no_kfd.has_value());
+    CHECK(apu_with_kfd->backend_hint == "rocm");
+    CHECK(apu_no_kfd->backend_hint == "vulkan");
+    CHECK(apu_no_kfd->is_integrated_uma);
+
+    // 2. HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES ordinal filtering and composition.
+    CHECK(is_rocm_device_visible(0));
+    CHECK(is_rocm_device_visible(3));
+    CHECK_FALSE(is_rocm_device_visible(0, std::string_view("")));
+    CHECK_FALSE(is_rocm_device_visible(0, std::string_view("-1")));
+    CHECK_FALSE(is_rocm_device_visible(0, std::string_view("none")));
+    CHECK_FALSE(is_rocm_device_visible(0, std::nullopt, std::string_view("NoDevFiles")));
+    CHECK(is_rocm_device_visible(0, std::string_view("0")));
+    CHECK_FALSE(is_rocm_device_visible(1, std::string_view("0")));
+    CHECK_FALSE(is_rocm_device_visible(0, std::string_view("1")));
+    CHECK(is_rocm_device_visible(1, std::string_view("1")));
+    // Negative entry terminates HIP visible list ("0,-1,1" exposes only ordinal 0).
+    CHECK(is_rocm_device_visible(0, std::string_view("0,-1,1")));
+    CHECK_FALSE(is_rocm_device_visible(1, std::string_view("0,-1,1")));
+    // ROCR filters physical ordinals first; HIP indexes into ROCR's visible list.
+    CHECK_FALSE(is_rocm_device_visible(0, std::string_view("1"), std::string_view("1,2")));
+    CHECK_FALSE(is_rocm_device_visible(1, std::string_view("1"), std::string_view("1,2")));
+    CHECK(is_rocm_device_visible(2, std::string_view("1"), std::string_view("1,2")));
+    // ROCr UUID tokens stay permissive.
+    CHECK(is_rocm_device_visible(0, std::nullopt, std::string_view("GPU-0123456789abcdef")));
+
+    // 3. Windows GPU backend hint matrix (NVIDIA, AMD discrete w/ and w/o HIP SDK, AMD Ryzen iGPU UMA).
+    CHECK(resolve_windows_gpu_backend_hint(GpuVendor::nvidia, false, false) == "cuda");
+    CHECK(resolve_windows_gpu_backend_hint(GpuVendor::amd, false, false, 0) == "vulkan");
+    CHECK(resolve_windows_gpu_backend_hint(GpuVendor::amd, false, true, 0) == "rocm");
+    CHECK(resolve_windows_gpu_backend_hint(GpuVendor::amd, false, true, 0, std::string_view("1")) == "vulkan");
+    CHECK(resolve_windows_gpu_backend_hint(GpuVendor::amd, false, true, 1, std::string_view("1")) == "rocm");
+    // Integrated UMA Ryzen iGPU on Windows hints "vulkan" even when HIP SDK is installed.
+    CHECK(resolve_windows_gpu_backend_hint(GpuVendor::amd, true, true, 0) == "vulkan");
+    CHECK(resolve_windows_gpu_backend_hint(GpuVendor::intel, true, false) == "vulkan");
+    CHECK(resolve_windows_gpu_backend_hint(GpuVendor::apple, true, false) == "metal");
+    CHECK(resolve_windows_gpu_backend_hint(GpuVendor::unknown, false, false).empty());
+
+    // 4. Hybrid AMD host (gpu:0 = non-ROCm Ryzen iGPU "vulkan", gpu:1 = discrete RX 9070 XT "rocm"):
+    // "ROCm0" / "HIP0" budget selection targets the ROCm-capable discrete RX 9070 XT, not gpu:0!
+    GpuDeviceInfo ryzen_igpu;
+    ryzen_igpu.id = "gpu:0";
+    ryzen_igpu.name = "AMD Radeon(TM) Graphics";
+    ryzen_igpu.vendor = GpuVendor::amd;
+    ryzen_igpu.vendor_id = 0x1002u;
+    ryzen_igpu.dedicated_total = MemoryReading::known(512 * kMiB);
+    ryzen_igpu.shared_total = MemoryReading::known(16 * kGiB);
+    ryzen_igpu.is_integrated_uma = true;
+    ryzen_igpu.backend_hint = "vulkan";
+    ryzen_igpu.source = "dxgi";
+
+    GpuDeviceInfo rx9070xt;
+    rx9070xt.id = "gpu:1";
+    rx9070xt.name = "AMD Radeon RX 9070 XT";
+    rx9070xt.vendor = GpuVendor::amd;
+    rx9070xt.vendor_id = 0x1002u;
+    rx9070xt.dedicated_total = MemoryReading::known(16 * kGiB);
+    rx9070xt.dedicated_free = MemoryReading::known(15 * kGiB);
+    rx9070xt.shared_total = MemoryReading::known(16 * kGiB);
+    rx9070xt.is_integrated_uma = false;
+    rx9070xt.backend_hint = "rocm";
+    rx9070xt.source = "dxgi";
+
+    const std::vector<GpuDeviceInfo> hybrid_amd{ryzen_igpu, rx9070xt};
+    CHECK(select_gpu_vram_budget_mib(hybrid_amd) == std::optional<std::uint64_t>(16384));
+    CHECK(select_gpu_vram_budget_mib(hybrid_amd, "ROCm0") == std::optional<std::uint64_t>(16384));
+    CHECK(select_gpu_vram_budget_mib(hybrid_amd, "HIP0", true) == std::optional<std::uint64_t>(15360));
+    CHECK_FALSE(select_gpu_vram_budget_mib(hybrid_amd, "ROCm1").has_value());
+    CHECK(select_gpu_vram_budget_mib(hybrid_amd, "Vulkan0") == std::optional<std::uint64_t>(512 + 16384));
+    CHECK(select_gpu_vram_budget_mib(hybrid_amd, "Vulkan1") == std::optional<std::uint64_t>(16384));
+}

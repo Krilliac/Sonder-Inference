@@ -805,3 +805,86 @@ TEST_CASE("serve_profile_catalog: surfaces per_gpu_max_mib and PrismML flags and
     std::error_code ec;
     std::filesystem::remove(path, ec);
 }
+
+TEST_CASE("ternary GGUF: Bonsai-2 PQ2_0 file_type=141, tied LM head VRAM, and MTP attention interval") {
+    // 1. PrismML Bonsai-2-4B-PQ2_0-MTP-Q8_0 header layout:
+    //    - general.file_type = 141 (LLAMA_FTYPE_MOSTLY_PQ2_0)
+    //    - qwen35 hybrid (full_attention_interval = 4, block_count = 5, nextn_predict_layers = 1)
+    //    - prism.hadamard.tied_output = 1 (token_embd.weight + output_norm.weight, NO output.weight)
+    //    - trailing blk.4 MTP block in Q8_0 (type 8) with nextn.eh_proj.weight
+    TernaryGgufWriter w;
+    w.kv_str("general.architecture", "qwen35");
+    w.kv_u32("general.file_type", 141);
+    w.kv_u32("qwen35.block_count", 5);
+    w.kv_u32("qwen35.nextn_predict_layers", 1);
+    w.kv_u32("qwen35.context_length", 262144);
+    w.kv_u32("qwen35.embedding_length", 256);
+    w.kv_u32("qwen35.attention.head_count", 16);
+    w.kv_u32("qwen35.attention.head_count_kv", 4);
+    w.kv_u32("qwen35.attention.key_length", 64);
+    w.kv_u32("qwen35.attention.value_length", 64);
+    w.kv_u32("qwen35.full_attention_interval", 4);
+    w.kv_u32("qwen35.ssm.conv_kernel", 4);
+    w.kv_u32("qwen35.ssm.inner_size", 512);
+    w.kv_u32("qwen35.ssm.state_size", 64);
+    w.kv_u32("qwen35.ssm.group_count", 8);
+    w.kv_u32("prism.hadamard.tied_output", 1);
+    w.kv_u32("prism.hadamard.block_size", 512);
+    w.kv_str("prism.hadamard.transform", "normalized-sylvester-walsh-hadamard");
+
+    // Tied token_embd.weight: [256, 1024] in PQ2_0 (142) => 2048 blocks * 34 B = 69,632 B.
+    w.tensor("token_embd.weight", {256, 1024}, 142);
+    w.tensor("output_norm.weight", {256}, 0);  // 1,024 B
+    // Trunk blocks 0..2 (DeltaNet) + block 3 (full attention) in PQ2_0.
+    w.tensor("blk.0.attn_qkv.weight", {256, 256}, 142);
+    w.tensor("blk.1.attn_qkv.weight", {256, 256}, 142);
+    w.tensor("blk.2.attn_qkv.weight", {256, 256}, 142);
+    w.tensor("blk.3.attn_k.weight", {256, 256}, 142);
+    // MTP block 4 in Q8_0 (type 8) — deliberately larger byte total than trunk PQ2_0 tensors
+    // to prove general.file_type=141 resolves quantization="PQ2_0" directly!
+    w.tensor("blk.4.attn_k.weight", {256, 1024}, 8);
+    w.tensor("blk.4.nextn.eh_proj.weight", {512, 1024}, 8);
+
+    const auto parsed = si::parse_gguf_model_info(w.finish(8, 18));
+    REQUIRE_MESSAGE(parsed.ok(), parsed.status().message());
+    const si::GgufModelInfo& info = parsed.value();
+    CHECK(info.quantization == "PQ2_0");
+    CHECK(info.prism_hadamard);
+    CHECK(info.has_ternary_tensors);
+    CHECK(info.has_prism_private_tensors);
+    CHECK(info.nextn_layers == 1u);
+    CHECK(info.vocab_size == 1024u);  // inferred from tied token_embd.weight second dimension
+    CHECK(info.embedding_bytes == 69632u);
+    // Tied LM head duplicates token_embd.weight onto LAYER_OUTPUT alongside output_norm.weight.
+    CHECK(info.output_bytes == 1024u + 69632u);
+    CHECK(info.kv_heads == std::vector<std::uint32_t>{0, 0, 0, 4, 4});
+
+    const si::LaunchProfile p_mtp = parse_single(
+        R"({"name":"b4b","backend":"llamaserver","model":"b4b.gguf","ctx_size":8192,"parallel":1,"n_gpu_layers":-1,"speculative":{"types":["draft-mtp"],"draft_n_max":3}})");
+    const si::LaunchProfile p_plain = parse_single(
+        R"({"name":"b4b","backend":"llamaserver","model":"b4b.gguf","ctx_size":8192,"parallel":1,"n_gpu_layers":-1})");
+    const si::VramEstimate est_mtp = si::estimate_vram(info, p_mtp);
+    const si::VramEstimate est_plain = si::estimate_vram(info, p_plain);
+    CHECK(est_mtp.gpu_layers == 5u);
+    CHECK(est_plain.gpu_layers == 4u);
+    CHECK(est_mtp.attention_layers == 2u);
+    CHECK(est_plain.attention_layers == 1u);
+    CHECK(est_mtp.weights_bytes - est_plain.weights_bytes == info.block_bytes[4]);
+
+    // 2. Metadata-only hybrid header with nextn_predict_layers=1 and full_attention_interval=4
+    //    still keeps the trailing MTP block as dense attention (kv_heads[4] == 4).
+    TernaryGgufWriter meta_only;
+    meta_only.kv_str("general.architecture", "qwen35");
+    meta_only.kv_u32("general.file_type", 42);  // F8_E4M3
+    meta_only.kv_u32("qwen35.block_count", 5);
+    meta_only.kv_u32("qwen35.nextn_predict_layers", 1);
+    meta_only.kv_u32("qwen35.embedding_length", 256);
+    meta_only.kv_u32("qwen35.attention.head_count", 8);
+    meta_only.kv_u32("qwen35.attention.head_count_kv", 4);
+    meta_only.kv_u32("qwen35.full_attention_interval", 4);
+    meta_only.kv_u32("qwen35.ssm.conv_kernel", 4);
+    const auto parsed_meta = si::parse_gguf_model_info(meta_only.finish(0, 9));
+    REQUIRE_MESSAGE(parsed_meta.ok(), parsed_meta.status().message());
+    CHECK(parsed_meta->quantization == "F8_E4M3");
+    CHECK(parsed_meta->kv_heads == std::vector<std::uint32_t>{0, 0, 0, 4, 4});
+}

@@ -57,17 +57,43 @@ When a GGUF header contains any `prism.hadamard.*` metadata key (such as `prism.
 
 To build the direct `llamacpp` backend against a newer mainline or PrismML `llama.cpp` tree without editing the default `b11195` pin (see also [BACKENDS.md](BACKENDS.md#upstream-llamacpp-pin-and-ternary--prismml-overrides)):
 
-```sh
-# Local checkout (mainline >= b11556 or PrismML-Eng/llama.cpp `prism` branch):
-cmake --preset windows-cuda-rtx -DFETCHCONTENT_SOURCE_DIR_LLAMACPP=/path/to/llama.cpp
+```powershell
+# Windows one-liner (normalizes path, enters VS x64 DevShell, builds & tests):
+powershell -NoProfile -File scripts\build.ps1 `
+  -Preset windows-cuda-blackwell `
+  -LlamaCppSourceDir D:\ollama\runtimes\PrismML-Eng\llama.cpp `
+  -Jobs 8 -Test
+```
 
-# Or fetch an explicit tag with a matching SHA-256 (fails closed on mismatch):
+```sh
+# Linux / WSL2 one-liner (probes GPU toolchains, builds & tests):
+./scripts/build.sh \
+  --preset linux-cuda-blackwell \
+  --llamacpp-src /path/to/PrismML-Eng/llama.cpp \
+  --jobs 8 --test
+
+# Direct CMake invocation or explicit upstream tag + SHA-256 (fails closed on mismatch):
 cmake --preset linux-cuda-rtx \
   -DSONDER_LLAMACPP_TAG=b11556 \
   -DSONDER_LLAMACPP_SHA256=<sha256-of-tarball>
 ```
 
+Both wrapper scripts also forward arbitrary CMake cache flags (`-ExtraCMakeArgs @('-DSONDER_WARNINGS_AS_ERRORS=ON')` in `scripts/build.ps1`; `-- -DSONDER_WARNINGS_AS_ERRORS=ON` or `-D...` in `scripts/build.sh`). For WSL/Linux CI or CPU-only direct verification without GPU toolchains, use `--preset linux-llamacpp` (`SONDER_WITH_LLAMA_CPP=ON`, `RelWithDebInfo`).
+
 The `llamaserver` backend requires no `llama.cpp` compile-time linkage: point `--llamaserver-executable` (or `executable` in JSON config) at a mainline `>= b11556` or PrismML `llama-server` binary.
+
+### PrismML Bonsai GPU Acceleration Matrix
+
+| Host OS | Accelerator | Preset (`CMakePresets.json`) | Runtime / Toolchain | Supported Bonsai GGUF Families |
+| --- | --- | --- | --- | --- |
+| Windows 11 | NVIDIA Blackwell (`sm_120`, RTX 50-series) | `windows-cuda-blackwell` | CUDA 12.8+ / 13.x + MSVC (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp` via PrismML tree) |
+| Windows 11 | NVIDIA RTX (`sm_86;89;120`, RTX 30/40/50) | `windows-cuda-rtx` | CUDA 12.8+ / 13.x + MSVC (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp`) |
+| Linux / WSL2 | NVIDIA Blackwell (`sm_120`, RTX 50-series) | `linux-cuda-blackwell` | CUDA 12.8+ / 13.x + GCC/Clang (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp`) |
+| Linux / WSL2 | NVIDIA RTX (`sm_86;89;120`, RTX 30/40/50) | `linux-cuda-rtx` | CUDA 12.8+ / 13.x + GCC/Clang (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp`) |
+| Windows 11 | AMD Radeon RX XT (RDNA 2/3/4) & Ryzen APU | `windows-rocm-xt` | AMD HIP SDK (`HIP_PATH`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (with matching `llama.cpp` tree) |
+| Linux | AMD Radeon RX XT (RDNA 2/3/4) & Ryzen APU | `linux-rocm-xt` | ROCm 6.x+ (`/dev/kfd`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (with matching `llama.cpp` tree) |
+| Windows / Linux | AMD RX XT, Ryzen APU UMA, Intel, Cross-Vendor | `windows-vulkan-xt` / `linux-vulkan-xt` | Vulkan SDK (`GGML_VULKAN=ON`) | Cross-vendor Vulkan compute (including systems without `/dev/kfd` or HIP SDK) |
+| Linux / WSL2 | CPU (x86_64 / ARM64) | `linux-llamacpp` | GCC/Clang + Ninja (`SONDER_WITH_LLAMA_CPP=ON`) | Direct CPU execution and CI compile/test verification |
 
 ---
 
@@ -77,16 +103,19 @@ The `llamaserver` backend requires no `llama.cpp` compile-time linkage: point `-
 
 | Preset | Platform | Flags |
 | --- | --- | --- |
-| `windows-cuda-rtx` | Windows (MSVC + Ninja) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=86;89;120`, `GGML_CUDA_FA_ALL_QUANTS=ON` |
-| `linux-cuda-rtx` | Linux (GCC/Clang + Ninja) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=86;89;120`, `GGML_CUDA_FA_ALL_QUANTS=ON` |
+| `windows-cuda-blackwell` | Windows (MSVC + Ninja, `Release`) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=120`, `GGML_CUDA_FA_ALL_QUANTS=ON`, `GGML_CUDA_GRAPHS=ON` |
+| `linux-cuda-blackwell` | Linux / WSL2 (GCC/Clang + Ninja, `Release`) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=120`, `GGML_CUDA_FA_ALL_QUANTS=ON`, `GGML_CUDA_GRAPHS=ON` |
+| `windows-cuda-rtx` | Windows (MSVC + Ninja, `RelWithDebInfo`) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=86;89;120`, `GGML_CUDA_FA_ALL_QUANTS=ON`, `GGML_CUDA_GRAPHS=ON` |
+| `linux-cuda-rtx` | Linux / WSL2 (GCC/Clang + Ninja, `RelWithDebInfo`) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=86;89;120`, `GGML_CUDA_FA_ALL_QUANTS=ON`, `GGML_CUDA_GRAPHS=ON` |
 
-- `86;89;120` covers RTX 30-series (Ampere `sm_86`), RTX 40-series (Ada `sm_89`), and RTX 50-series (Blackwell `sm_120`).
+- `windows-cuda-blackwell` and `linux-cuda-blackwell` target RTX 50-series Blackwell (`sm_120`, such as RTX 5070 Ti, RTX 5080, RTX 5090) in pure `Release` mode (requiring CUDA Toolkit 12.8+ or 13.x), cutting multi-arch NVCC compile time while enabling `GGML_CUDA_GRAPHS=ON` for low-overhead single-token decode launches.
+- `86;89;120` in `*-cuda-rtx` covers RTX 30-series (Ampere `sm_86`), RTX 40-series (Ada `sm_89`), and RTX 50-series (Blackwell `sm_120`) in one portable binary.
 - `GGML_CUDA_FA_ALL_QUANTS=ON` compiles CUDA FlashAttention kernels for quantized KV pairs (`q8_0`, `q5_0`, `q5_1`, `q4_0`, `q4_1`, `iq4_nl`) so `llama.cpp` does not silently dequantize K/V back to `f16` at runtime.
 
 ### VRAM Discovery and Process Telemetry
 
-- **Windows**: `enumerate_gpu_devices()` loads `dxgi.dll` from System32 (`LOAD_LIBRARY_SEARCH_SYSTEM32`) and reads `DedicatedVideoMemory`, `SharedSystemMemory`, and live free budget via `IDXGIAdapter3::QueryVideoMemoryInfo` (`Budget - CurrentUsage` on `DXGI_MEMORY_SEGMENT_GROUP_LOCAL`), tagged `source: "dxgi"`, `backend_hint: "cuda"`. For spawned `llamaserver` children, the spill and residency guards poll Windows PDH `\GPU Process Memory(pid_<PID>_*)\Dedicated Usage` and `Shared Usage` (`probe: "pdh"`). See [integration/vram-spill.md](integration/vram-spill.md) for Windows WDDM shared-memory spill behavior and residency guard tuning.
-- **Linux**: `enumerate_gpu_devices()` dynamically loads `libnvidia-ml.so.1` via `dlopen` (`nvmlDeviceGetMemoryInfo`), reporting total and free VRAM (`source: "nvml"`, `backend_hint: "cuda"`). Spawned `llamaserver` monitoring and `sonder-infer tune` query per-PID NVML compute/graphics process memory (`probe: "nvml"`, or `"amdgpu-fdinfo+nvml"` on mixed AMD + NVIDIA hosts).
+- **Windows**: `enumerate_gpu_devices()` loads `dxgi.dll` from System32 (`LOAD_LIBRARY_SEARCH_SYSTEM32`), filters software and Microsoft virtual display adapters (`0x1414`), and reads `DedicatedVideoMemory`, `SharedSystemMemory`, and live free budget via `IDXGIAdapter3::QueryVideoMemoryInfo` (`Budget - CurrentUsage` on `DXGI_MEMORY_SEGMENT_GROUP_LOCAL`), tagged `source: "dxgi"`, `backend_hint: "cuda"`. On headless or TCC-mode NVIDIA hosts where DXGI reports no NVIDIA adapters, it falls back to System32 `nvml.dll`. For spawned `llamaserver` children, the spill and residency guards poll Windows PDH `\GPU Process Memory(pid_<PID>_*)\Dedicated Usage` and `Shared Usage` (`probe: "pdh"`). See [integration/vram-spill.md](integration/vram-spill.md) for Windows WDDM shared-memory spill behavior and residency guard tuning.
+- **Linux & WSL2**: `enumerate_gpu_devices()` dynamically loads `libnvidia-ml.so.1` via `dlopen` — falling back automatically to `/usr/lib/wsl/lib/libnvidia-ml.so.1` inside WSL2 (`/dev/dxg`) when the WSL driver directory is not in the default dynamic-linker cache — and queries `nvmlDeviceGetMemoryInfo` plus PCI device IDs (`source: "nvml"`, `backend_hint: "cuda"`). Spawned `llamaserver` monitoring and `sonder-infer tune` query per-PID NVML compute/graphics process memory (`probe: "nvml"`, or `"amdgpu-fdinfo+nvml"` on mixed AMD + NVIDIA hosts).
 
 ### Placement Defaults and Multi-GPU Splitting
 
@@ -94,7 +123,7 @@ For discrete NVIDIA RTX adapters, `plan_model_placement()` selects:
 
 - `flash_attn: "on"`, `kv_unified: true`, and `load_mode: "none"` for fully VRAM-resident models (automatically relaxed to `load_mode: "auto"` when `--n-cpu-moe`, `no_repack`, or partial `n_gpu_layers` is applied).
 - Initial KV cache `q8_0/q8_0` (stepping to `q4_0/q4_0` before context step-down if VRAM is tight, unless `--no-quantized-kv` is set).
-- Speculative decoding: `draft-mtp` (`draft_n_max: 3`) when GGUF `<arch>.nextn_predict_layers > 0`, or lightweight `ngram-mod` for ternary/1-bit models without MTP layers (unless `--no-speculative` is set).
+- Speculative decoding: `draft-mtp` (`draft_n_max: 3`) when GGUF `<arch>.nextn_predict_layers > 0` (such as `Ternary-Bonsai-2-4B-PQ2_0-MTP-Q8_0.gguf` and `Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf`), or lightweight `ngram-mod` for ternary/1-bit models without MTP layers (unless `--no-speculative` is set). Tied LM-head embeddings (`prism.hadamard.tied_output = 1` / `token_embd.weight` without `output.weight`) and trailing dense-attention MTP blocks are sized accurately in `estimate_vram()`.
 - **Multi-GPU (`split_mode: "layer"` + `tensor_split`)**: when two or more discrete NVIDIA GPUs are available and a single GPU cannot fit the model (or when `--device multi` / `--device CUDA0,CUDA1` is requested), the planner sets `device: "CUDA0,CUDA1"`, `split_mode: "layer"`, proportional `tensor_split` weights sized to each GPU's usable VRAM budget, and `main_gpu` to the largest shard when index > 0. `VramEstimate::max_gpu_mib()` validates the heaviest single-GPU shard plus compute buffers. Direct `llamacpp` users can configure the same `devices`, `main_gpu`, `split_mode`, `tensor_split`, and `use_mlock` fields on `LlamaCppBackendOptions` / `LoadOptions` (see [PLACEMENT.md](PLACEMENT.md#multi-gpu-vendor-targeting-and-memory-locking-implemented)).
 
 ---
@@ -105,17 +134,18 @@ For discrete NVIDIA RTX adapters, `plan_model_placement()` selects:
 
 | Preset | Platform | Accelerator | Flags |
 | --- | --- | --- | --- |
-| `linux-rocm-xt` | Linux (GCC/Clang + Ninja) | ROCm/HIP (`ROCm0`, ...) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_HIP=ON`, `AMDGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1200;gfx1201` |
+| `windows-rocm-xt` | Windows (MSVC + Ninja) | ROCm/HIP (`ROCm0`, ...) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `AMDGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1200;gfx1201` |
+| `linux-rocm-xt` | Linux (GCC/Clang + Ninja) | ROCm/HIP (`ROCm0`, ...) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `AMDGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1200;gfx1201` |
 | `windows-vulkan-xt` | Windows (MSVC + Ninja) | Vulkan (`Vulkan0`, ...) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_VULKAN=ON` |
 | `linux-vulkan-xt` | Linux (GCC/Clang + Ninja) | Vulkan (`Vulkan0`, ...) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_VULKAN=ON` |
 
-`AMDGPU_TARGETS` covers RDNA 2 (`gfx1030`, RX 6800/6900 XT), RDNA 3 discrete (`gfx1100`, `gfx1101`, `gfx1102`, RX 7900/7800/7700/7600 XT), RDNA 3 Ryzen APU (`gfx1103`, Radeon 780M/890M), and RDNA 4 (`gfx1200`, `gfx1201`, RX 9070 XT).
+`AMDGPU_TARGETS` covers RDNA 2 (`gfx1030`, RX 6800/6900 XT), RDNA 3 discrete (`gfx1100`, `gfx1101`, `gfx1102`, RX 7900/7800/7700/7600 XT), RDNA 3 Ryzen APU (`gfx1103`, Radeon 780M/890M), and RDNA 4 (`gfx1200`, `gfx1201`, RX 9070 XT). `GGML_HIP_GRAPHS=ON` enables HIP graph capture for lower kernel-launch overhead during decode.
 
 ### Discovery, Per-Process Counters, and Environment Policy
 
-- **Linux sysfs discovery (`/sys/class/drm`)**: `parse_amdgpu_sysfs_device()` scans `/sys/class/drm/cardN/device/` for PCI vendor `0x1002` with `DRIVER=amdgpu` in `uevent`, reading `mem_info_vram_total`, `mem_info_vram_used`, `mem_info_gtt_total`, `mem_info_gtt_used`, `product_name`, and `device` (`source: "amdgpu-sysfs"`, `backend_hint: "rocm"`).
+- **Linux sysfs discovery (`/sys/class/drm` + `/dev/kfd`)**: `parse_amdgpu_sysfs_device()` scans `/sys/class/drm/cardN/device/` for PCI vendor `0x1002` with `DRIVER=amdgpu` in `uevent`, reading `mem_info_vram_total`, `mem_info_vram_used`, `mem_info_gtt_total`, `mem_info_gtt_used`, `product_name`, and `device` (`source: "amdgpu-sysfs"`). Live enumeration checks `/dev/kfd` R/W accessibility and `HIP_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES` (`is_rocm_device_visible()`): cards with usable ROCm access report `backend_hint: "rocm"`, while systems/containers without `/dev/kfd` (such as Vulkan-only Linux Ryzen APUs or unprivileged containers) or cards masked by `HIP_VISIBLE_DEVICES` automatically fall back to `backend_hint: "vulkan"`.
 - **Linux per-process VRAM/GTT (`/proc/<pid>/fdinfo`)**: `LinuxGpuCounterSource` scans `/proc/<pid>/fdinfo/*` for `drm-memory-vram` and `drm-memory-gtt`, deduplicating shared DRM file descriptors by `drm-driver:drm-client-id` (`probe: "amdgpu-fdinfo"`). This feeds `llamaserver` spill/residency checks and `sonder-infer tune` on Linux AMD hosts.
-- **Windows discovery & counters**: DXGI reports dedicated and shared adapter memory (`backend_hint: "vulkan"`), and PDH reads per-process dedicated/shared usage.
+- **Windows discovery & counters**: DXGI reports dedicated and shared adapter memory, and PDH reads per-process dedicated/shared usage. When the AMD HIP SDK (`HIP_PATH` / `ROCM_PATH`) is installed and visible via `HIP_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES`, discrete Radeon RX XT cards report `backend_hint: "rocm"` (pairing cleanly with `windows-rocm-xt` and numbering `ROCm0` accurately even on Ryzen desktops whose integrated iGPU uses `"vulkan"`); without the HIP SDK (or on integrated Ryzen UMA iGPUs), Windows AMD adapters default to `backend_hint: "vulkan"`.
 - **`GPU_MAX_ALLOC_PERCENT=100`**: `plan_model_placement()` sets `flash_attn: "auto"`, `load_mode: "auto"`, `kv_unified: true`, and recommends `GPU_MAX_ALLOC_PERCENT=100` in `recommended_env` for discrete AMD ROCm/HIP cards (and AMD ROCm UMA) so the ROCm allocator permits single allocations up to full VRAM/GTT capacity.
 - **Child environment containment (`src/backends/llamaserver/env_policy.hpp`)**: `GPU_MAX_ALLOC_PERCENT`, `GPU_MAX_HEAP_SIZE`, `GPU_SINGLE_ALLOC_PERCENT`, `GPU_FORCE_64BIT_PTR`, `GPU_USE_SYNC_OBJECTS`, `DRI_PRIME`, `VK_ICD_FILENAMES`, `AMD_LOG_LEVEL`, and safe vendor tuning prefixes (`ROCR_*`, `ROCM_*`, `HSA_*`, `HIP_*`, `AMD_*`, `VK_*`, `RADV_*`, `MESA_*`, `CUDA_*`, `GGML_*`, `OMP_*`) are permitted. Loader/layer injection and file-write log hooks (`GGML_BACKEND_PATH`, `CUDA_INJECTION64_PATH`, `CUDA_INJECTION32_PATH`, `HSA_TOOLS_LIB`, `VK_LAYER_PATH`, `VK_ADD_LAYER_PATH`, `VK_INSTANCE_LAYERS`, `VK_LOADER_LAYERS_ENABLE`, `VK_DRIVER_FILES`, `VK_ADD_DRIVER_FILES`, `MESA_LOADER_DRIVER_OVERRIDE`, `AMD_LOG_LEVEL_FILE`, `HIPBLASLT_LOG_FILE`, `ROCBLAS_LOG_*`) and credential-suffixed variables are always refused as overrides and stripped from inherited child environments.
 

@@ -144,6 +144,26 @@ struct GpuDeviceInfo {
 // Pure Linux amdgpu sysfs parser (/sys/class/drm/<card_id>/device/*).
 // Compiled on all platforms so it is testable everywhere via an injected FileReader.
 std::optional<GpuDeviceInfo> parse_amdgpu_sysfs_device(std::string_view card_id, const FileReader& read_file);
+std::optional<GpuDeviceInfo> parse_amdgpu_sysfs_device(std::string_view card_id, const FileReader& read_file,
+                                                       bool rocm_available);
+
+// Pure ROCm/HIP device visibility check for AMD adapter ordinal `amd_ordinal`
+// given optional HIP_VISIBLE_DEVICES and ROCR_VISIBLE_DEVICES values
+// (std::nullopt when unset). Empty, "-1", "none", or "NoDevFiles" disables
+// ROCm; comma-separated integer lists filter by ordinal (ROCR applied before
+// HIP when both are set); UUID tokens ("GPU-...") are treated as visible.
+bool is_rocm_device_visible(std::size_t amd_ordinal,
+                            std::optional<std::string_view> hip_visible_devices = std::nullopt,
+                            std::optional<std::string_view> rocr_visible_devices = std::nullopt) noexcept;
+
+// Pure Windows GPU backend hint resolver: "cuda" for NVIDIA, "rocm" for
+// discrete AMD RX XT when AMD HIP SDK is installed and the device is visible
+// (else "vulkan"), "vulkan" for AMD Ryzen iGPU/APU UMA and Intel, "metal" for
+// Apple, "" for unknown.
+std::string resolve_windows_gpu_backend_hint(
+    GpuVendor vendor, bool is_integrated_uma, bool hip_sdk_available = false, std::size_t amd_ordinal = 0,
+    std::optional<std::string_view> hip_visible_devices = std::nullopt,
+    std::optional<std::string_view> rocr_visible_devices = std::nullopt);
 
 // Live GPU inventory: DXGI on Windows (dedicated + free budget + shared/UMA),
 // amdgpu sysfs + optional dynamic libnvidia-ml.so.1 on Linux, empty elsewhere.
