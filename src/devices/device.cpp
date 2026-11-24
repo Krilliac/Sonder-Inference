@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -1030,7 +1031,11 @@ std::optional<GpuDeviceInfo> parse_amdgpu_sysfs_device(std::string_view card_id,
     return info;
 }
 
-std::vector<GpuDeviceInfo> enumerate_gpu_devices() { return live_gpu_devices(); }
+std::vector<GpuDeviceInfo> enumerate_gpu_devices() {
+    static std::mutex probe_mutex;
+    std::lock_guard<std::mutex> lock(probe_mutex);
+    return live_gpu_devices();
+}
 
 std::optional<std::uint64_t> gpu_effective_vram_mib(const GpuDeviceInfo& gpu, bool prefer_free) noexcept {
     if (!gpu.is_integrated_uma) {

@@ -26,6 +26,14 @@ struct MockBackendOptions {
     // Test hook (token_logits only): every logit is -infinity, as if the
     // request's policy had banned the whole vocabulary.
     bool ban_all_tokens = false;
+    // Opt-in deterministic recurrent-state checkpoint support for hybrid and
+    // recurrent tests. Defaults preserve existing mock capabilities and models.
+    bool enable_recurrent_checkpoints = false;
+    ModelArchitecture default_architecture = ModelArchitecture::attention_only;
+    // Upper bound on checkpoint snapshot bytes accepted by mock capture/restore
+    // (defaults to kMaxRecurrentCheckpointBytes; tests may lower it to exercise
+    // oversized-snapshot rejection without large allocations).
+    std::size_t max_checkpoint_bytes = kMaxRecurrentCheckpointBytes;
 };
 inline constexpr const char* kMockBackendName = "mock";
 std::shared_ptr<Backend> make_mock_backend(MockBackendOptions options = {});

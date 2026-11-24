@@ -468,10 +468,15 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     // Sampling path: Sonder's sampler chain when the backend exposes logits.
     std::unique_ptr<TokenStream> stream;
     const auto backend = engine_.find_backend(model_->backend_name());
-    const bool defer_stream_open = engine_.scheduling_options().strict_priority_admission &&
-                                   !native_chat && backend &&
-                                   backend->capabilities().has(Capability::token_logits);
+    const ModelArchitecture arch = model_->descriptor().architecture;
+    const bool checkpoint_candidate =
+        runtime != nullptr && !native_chat &&
+        (arch == ModelArchitecture::hybrid || arch == ModelArchitecture::recurrent) &&
+        backend && backend->capabilities().has(Capability::recurrent_checkpoint);
 #if defined(SONDER_HAS_SAMPLER_CHAIN)
+    const bool defer_stream_open =
+        (engine_.scheduling_options().strict_priority_admission || checkpoint_candidate) &&
+        !native_chat && backend && backend->capabilities().has(Capability::token_logits);
     if (!defer_stream_open && !native_chat && backend && backend->capabilities().has(Capability::token_logits)) {
         auto opened = backend_model.open_token_stream(request);
         if (opened.ok()) {
@@ -481,6 +486,8 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
             pre_failed = true;
         }
     }
+#else
+    const bool defer_stream_open = false;
 #endif
     result.scheduling.sonder_sampled = stream != nullptr;
 
@@ -490,6 +497,8 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     const SchedulerMode mode = engine_.scheduling_options().mode;
     const bool remote = backend && backend->capabilities().has(Capability::remote_process);
     const bool gated = mode == SchedulerMode::gate || (mode == SchedulerMode::automatic && !remote);
+    bool use_checkpoints = false;
+    std::uint64_t aligned_capture_pos = 0;
     if (runtime != nullptr && !pre_failed) {
         detail::RuntimeRequestSpec spec;
         spec.context = ctx;
@@ -522,9 +531,15 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
             ctx_limit = ctx_limit == 0 ? requested : std::min(ctx_limit, requested);
         }
         spec.context_limit = static_cast<std::uint32_t>(std::min<std::uint64_t>(ctx_limit, 0xFFFFFFFFull));
+        const std::uint64_t block_size =
+            std::max<std::uint32_t>(1, engine_.scheduling_options().kv_block_size_tokens);
+        use_checkpoints = checkpoint_candidate && spec.exact_tokens;
+        aligned_capture_pos =
+            use_checkpoints ? (static_cast<std::uint64_t>(spec.prompt_tokens.size()) / block_size) * block_size : 0;
         spec.fingerprint = model_fingerprint(*model_);
-        spec.architecture = model_->descriptor().architecture;
+        spec.architecture = arch;
         spec.gated = gated;
+        spec.retain_for_checkpoint = use_checkpoints && aligned_capture_pos > 0;
         result.scheduling.accounted_prompt_tokens = spec.prompt_tokens.size();
         result.scheduling.exact_prompt_tokens = spec.exact_tokens;
         const bool exact = spec.exact_tokens;
@@ -632,8 +647,10 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     std::optional<Status> gate_failure;
     const auto prepare_backend = [&]() -> Status {
         // Library callers retain the old per-chunk gate unless they explicitly
-        // enable strict admission. Account mode always waits once up front.
-        if (sched_id && (!gated || engine_.scheduling_options().strict_priority_admission)) {
+        // enable strict admission. Account mode always waits once up front, and
+        // checkpoint-enabled hybrid/recurrent requests wait for logical prefill
+        // so any matched recurrent checkpoint can be restored before decode.
+        if (sched_id && (!gated || engine_.scheduling_options().strict_priority_admission || use_checkpoints)) {
             Status st = gated ? runtime->admit_backend(*sched_id, token, request_options.deadline)
                               : runtime->acquire_token(*sched_id, token, request_options.deadline);
             if (!st.ok()) return st;
@@ -674,9 +691,88 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     if (!prepared.ok()) {
         generated = prepared;
     } else {
+        std::optional<detail::RestoredCheckpoint> restored_checkpoint;
+        RecurrentCheckpointExchange checkpoint_io;
+        bool checkpoint_attached = false;
+        bool restored_event_emitted = false;
+        bool capture_registered_or_attempted = false;
+
+        if (use_checkpoints && sched_id) {
+            restored_checkpoint = runtime->lookup_restored_checkpoint(*sched_id);
+            std::uint64_t restored_pos = 0;
+            if (restored_checkpoint && restored_checkpoint->bytes && !restored_checkpoint->bytes->empty()) {
+                restored_pos = restored_checkpoint->handle.token_position;
+                checkpoint_io.restore_bytes = *restored_checkpoint->bytes;
+                checkpoint_io.restore_token_position = restored_pos;
+                checkpoint_io.on_restored = [&] {
+                    if (restored_event_emitted) return;
+                    restored_event_emitted = true;
+                    bus.emit("kv.checkpoint.restored", ctx,
+                             json::Object{{"scheduler_request_id", *sched_id},
+                                          {"owner_scheduler_request_id", restored_checkpoint->handle.owner_request_id},
+                                          {"token_position", restored_checkpoint->handle.token_position},
+                                          {"bytes", restored_checkpoint->bytes->size()},
+                                          {"architecture", std::string(to_string(arch))}},
+                             TelemetryLevel::metrics);
+                };
+                checkpoint_attached = true;
+            }
+
+            const bool want_capture = aligned_capture_pos > 0 && aligned_capture_pos > restored_pos;
+            if (want_capture) {
+                checkpoint_io.capture_at_token_position = aligned_capture_pos;
+                checkpoint_io.on_captured = [&](std::uint64_t pos, std::vector<std::uint8_t> bytes) {
+                    capture_registered_or_attempted = true;
+                    const std::size_t snapshot_bytes = bytes.size();
+                    if (snapshot_bytes == 0 || snapshot_bytes > kMaxRecurrentCheckpointBytes) {
+                        bus.emit("kv.checkpoint.save_failed", ctx,
+                                 json::Object{{"scheduler_request_id", *sched_id},
+                                              {"token_position", pos},
+                                              {"stage", "validate"},
+                                              {"architecture", std::string(to_string(arch))},
+                                              {"error_code", to_string(ErrorCode::invalid_argument)}},
+                                 TelemetryLevel::deep);
+                    } else {
+                        const Status reg = runtime->register_checkpoint(*sched_id, pos, std::move(bytes));
+                        if (reg.ok()) {
+                            bus.emit("kv.checkpoint.saved", ctx,
+                                     json::Object{{"scheduler_request_id", *sched_id},
+                                                  {"token_position", pos},
+                                                  {"bytes", snapshot_bytes},
+                                                  {"architecture", std::string(to_string(arch))}},
+                                     TelemetryLevel::metrics);
+                        } else {
+                            bus.emit("kv.checkpoint.save_failed", ctx,
+                                     json::Object{{"scheduler_request_id", *sched_id},
+                                                  {"token_position", pos},
+                                                  {"stage", "register"},
+                                                  {"architecture", std::string(to_string(arch))},
+                                                  {"error_code", to_string(reg.code())}},
+                                     TelemetryLevel::deep);
+                        }
+                    }
+                    if (!gated) {
+                        runtime->release_checkpoint_retention(*sched_id);
+                    }
+                };
+                checkpoint_attached = true;
+            } else if (!gated && aligned_capture_pos > 0) {
+                // No new capture needed (reused checkpoint already at aligned boundary):
+                // release retention immediately so blocks are not pinned during decode.
+                runtime->release_checkpoint_retention(*sched_id);
+            }
+
+            if (checkpoint_attached) {
+                request.checkpoint = &checkpoint_io;
+            }
+        }
 #if defined(SONDER_HAS_SAMPLER_CHAIN)
         if (defer_stream_open) {
             auto opened = backend_model.open_token_stream(request);
+            request.checkpoint = nullptr;
+            if (checkpoint_attached && sched_id && !gated && !capture_registered_or_attempted) {
+                runtime->release_checkpoint_retention(*sched_id);
+            }
             if (opened.ok()) {
                 stream = std::move(opened).value();
                 result.scheduling.sonder_sampled = true;
@@ -711,6 +807,40 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                 generated = backend_model.chat(chat_request, token, on_backend_chunk);
             } else {
                 generated = backend_model.generate(request, token, on_backend_chunk);
+            }
+        }
+        request.checkpoint = nullptr;
+        if (checkpoint_attached && sched_id) {
+            if (checkpoint_io.restored && !restored_event_emitted && restored_checkpoint &&
+                restored_checkpoint->bytes) {
+                restored_event_emitted = true;
+                bus.emit("kv.checkpoint.restored", ctx,
+                         json::Object{{"scheduler_request_id", *sched_id},
+                                      {"owner_scheduler_request_id", restored_checkpoint->handle.owner_request_id},
+                                      {"token_position", restored_checkpoint->handle.token_position},
+                                      {"bytes", restored_checkpoint->bytes->size()},
+                                      {"architecture", std::string(to_string(arch))}},
+                         TelemetryLevel::metrics);
+            } else if (checkpoint_io.restore_error && restored_checkpoint) {
+                bus.emit("kv.checkpoint.restore_failed", ctx,
+                         json::Object{{"scheduler_request_id", *sched_id},
+                                      {"owner_scheduler_request_id", restored_checkpoint->handle.owner_request_id},
+                                      {"token_position", restored_checkpoint->handle.token_position},
+                                      {"architecture", std::string(to_string(arch))},
+                                      {"error_code", to_string(checkpoint_io.restore_error->code())}},
+                         TelemetryLevel::deep);
+            }
+            if (checkpoint_io.capture_error) {
+                bus.emit("kv.checkpoint.save_failed", ctx,
+                         json::Object{{"scheduler_request_id", *sched_id},
+                                      {"token_position", checkpoint_io.capture_at_token_position},
+                                      {"stage", "capture"},
+                                      {"architecture", std::string(to_string(arch))},
+                                      {"error_code", to_string(checkpoint_io.capture_error->code())}},
+                         TelemetryLevel::deep);
+            }
+            if (!gated && !capture_registered_or_attempted) {
+                runtime->release_checkpoint_retention(*sched_id);
             }
         }
     }

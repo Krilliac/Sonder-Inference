@@ -108,7 +108,14 @@ struct EngineOptions {
     // Periodic device.memory.sample for every device (0 disables).
     std::chrono::milliseconds device_sample_interval{10000};
     SchedulingOptions scheduling;
+    // Enumerate live GPUs at startup and emit GPU device.memory.sample events.
+    bool sample_gpu_devices = true;
 };
+
+// Pure builder for GPU `device.memory.sample` event attributes
+// (`sonder.observatory.event/1`). Exposed for deterministic cross-platform
+// testing of discrete and integrated UMA GPU telemetry payloads.
+[[nodiscard]] json::Object gpu_memory_sample_attributes(const GpuDeviceInfo& gpu);
 
 class Engine {
 public:
@@ -122,6 +129,7 @@ public:
     [[nodiscard]] const std::string& engine_id() const noexcept { return engine_id_; }
     [[nodiscard]] TelemetryBus& telemetry() noexcept { return *telemetry_; }
     [[nodiscard]] const std::vector<DeviceInfo>& devices() const noexcept { return devices_; }
+    [[nodiscard]] std::vector<GpuDeviceInfo> gpu_devices() const;
 
     Status register_backend(std::shared_ptr<Backend> backend);
     [[nodiscard]] std::shared_ptr<Backend> find_backend(const std::string& name) const;
@@ -146,6 +154,7 @@ public:
 
 private:
     void sample_devices(const std::vector<DeviceInfo>& devices);
+    void sample_gpu_devices(const std::vector<GpuDeviceInfo>& gpus);
     // backend.gpu_memory.sample / backend.warning for backends that report
     // Backend::runtime_status() (sampler thread only).
     void sample_backend_runtime();
@@ -155,6 +164,9 @@ private:
     std::string engine_id_;
     std::unique_ptr<TelemetryBus> telemetry_;
     std::vector<DeviceInfo> devices_;
+
+    mutable std::mutex gpu_devices_mutex_;
+    std::vector<GpuDeviceInfo> gpu_devices_;
 
     mutable std::mutex mutex_;
     std::map<std::string, std::shared_ptr<Backend>> backends_;

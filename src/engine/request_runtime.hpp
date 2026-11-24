@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -47,6 +48,41 @@ struct RuntimeRequestSpec {
     // grants. A prompt larger than the KV pool is bypassed, not rejected.
     bool gated = true;
     bool preserve_numeric_priority = false;
+    // Keep the cache sequence live across scheduler completion until Session
+    // registers any captured recurrent-state checkpoint and calls finish().
+    // Preemption and cancellation still release blocks immediately.
+    bool retain_for_checkpoint = false;
+};
+
+// Opaque handle identifying a registered recurrent-state checkpoint blob in the
+// runtime store (maps 1:1 onto KvCacheManager's saved checkpoint).
+struct CheckpointHandle {
+    std::uint64_t owner_request_id = 0;
+    std::uint64_t token_position = 0;
+
+    friend bool operator==(const CheckpointHandle&, const CheckpointHandle&) = default;
+    friend bool operator<(const CheckpointHandle& a, const CheckpointHandle& b) noexcept {
+        return a.owner_request_id < b.owner_request_id ||
+               (a.owner_request_id == b.owner_request_id && a.token_position < b.token_position);
+    }
+};
+
+struct RestoredCheckpoint {
+    CheckpointHandle handle{};
+    std::shared_ptr<const std::vector<std::uint8_t>> bytes;
+};
+
+struct CheckpointStoreOptions {
+    // Bounded total serialized bytes retained across all saved checkpoints.
+    std::uint64_t max_bytes = 64ULL * 1024ULL * 1024ULL;  // 64 MiB
+    std::size_t max_checkpoints = 1024;
+};
+
+struct CheckpointStoreUsage {
+    std::size_t entries = 0;
+    std::uint64_t total_bytes = 0;
+    std::uint64_t max_bytes = 0;
+    std::uint64_t evictions = 0;
 };
 
 struct RuntimeSubmission {
@@ -87,6 +123,30 @@ public:
     // Ends the request and frees its KV blocks. Safe to call once per id.
     virtual RuntimeRequestSummary finish(std::uint64_t id, RequestOutcome outcome) = 0;
 
+    // Registers a backend-captured recurrent-state checkpoint for an active
+    // request and records it in KvCacheManager::save_checkpoint(). No-op when
+    // scheduling/cache is disabled.
+    virtual Status register_checkpoint(std::uint64_t id, std::uint64_t token_position,
+                                       std::vector<std::uint8_t> bytes) {
+        (void)id;
+        (void)token_position;
+        (void)bytes;
+        return Status::success();
+    }
+    // Returns the saved checkpoint matched during logical prefill for `id`, if
+    // any. Safe to call concurrently with evictions.
+    [[nodiscard]] virtual std::optional<RestoredCheckpoint> lookup_restored_checkpoint(std::uint64_t id) const {
+        (void)id;
+        return std::nullopt;
+    }
+    // Releases any checkpoint-induced cache sequence retention for `id` once
+    // prefill capture has registered (or been skipped/failed). For ungated
+    // (account-mode) or already-completed requests this frees the sequence
+    // immediately so KV blocks are not pinned during decode.
+    virtual void release_checkpoint_retention(std::uint64_t id) { (void)id; }
+    // Current occupancy of the bounded checkpoint blob store.
+    [[nodiscard]] virtual CheckpointStoreUsage checkpoint_store_usage() const { return {}; }
+
     [[nodiscard]] virtual KvUsage kv_usage() const = 0;
     // Requests the runtime and its scheduler still hold state for. Returns to
     // zero once every submitted request has finished (no per-request leak).
@@ -95,6 +155,7 @@ public:
 
 // Returns null when scheduling is disabled or the modules are not built.
 std::unique_ptr<RequestRuntime> make_request_runtime(const SchedulingOptions& options, TelemetryBus& bus,
-                                                     TelemetryContext engine_context);
+                                                     TelemetryContext engine_context,
+                                                     CheckpointStoreOptions checkpoint_options = {});
 
 }  // namespace sonder::inference::detail

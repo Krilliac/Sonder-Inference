@@ -27,6 +27,49 @@ const char* to_string(SchedulerMode mode) noexcept {
     return "unknown";
 }
 
+json::Object gpu_memory_sample_attributes(const GpuDeviceInfo& gpu) {
+    json::Object attrs{{"kind", "gpu"},
+                       {"name", gpu.name},
+                       {"vendor", to_string(gpu.vendor)},
+                       {"vendor_id", gpu.vendor_id},
+                       {"device_id", gpu.device_id},
+                       {"is_integrated_uma", gpu.is_integrated_uma},
+                       {"backend_hint", gpu.backend_hint},
+                       {"source", gpu.source}};
+    if (gpu.dedicated_total.is_known()) {
+        const std::uint64_t total_bytes = gpu.dedicated_total.bytes_or(0);
+        attrs.set("dedicated_total_bytes", total_bytes);
+        if (!gpu.is_integrated_uma) {
+            attrs.set("total_bytes", total_bytes);
+        }
+    }
+    if (gpu.dedicated_free.is_known()) {
+        const std::uint64_t free_bytes = gpu.dedicated_free.bytes_or(0);
+        attrs.set("dedicated_free_bytes", free_bytes);
+        if (!gpu.is_integrated_uma) {
+            attrs.set("available_bytes", free_bytes);
+            if (gpu.dedicated_total.is_known()) {
+                const std::uint64_t total_bytes = gpu.dedicated_total.bytes_or(0);
+                if (total_bytes >= free_bytes) {
+                    attrs.set("used_bytes", total_bytes - free_bytes);
+                }
+            }
+        }
+    }
+    if (gpu.shared_total.is_known()) {
+        attrs.set("shared_total_bytes", gpu.shared_total.bytes_or(0));
+    }
+    if (const auto effective_mib = gpu_effective_vram_mib(gpu, false)) {
+        attrs.set("effective_vram_mib", *effective_mib);
+    }
+    if (gpu.dedicated_free.is_known()) {
+        if (const auto effective_free_mib = gpu_effective_vram_mib(gpu, true)) {
+            attrs.set("effective_free_vram_mib", *effective_free_mib);
+        }
+    }
+    return attrs;
+}
+
 Engine::Engine(EngineOptions options)
     : options_(std::move(options)), engine_id_(make_id("engine")),
       telemetry_(std::make_unique<TelemetryBus>(options_.telemetry)), devices_(enumerate_devices()) {
@@ -34,11 +77,18 @@ Engine::Engine(EngineOptions options)
         telemetry_->add_sink(sink);
     }
     options_.telemetry_sinks.clear();
+    std::vector<GpuDeviceInfo> initial_gpus;
+    if (options_.sample_gpu_devices) {
+        initial_gpus = enumerate_gpu_devices();
+        std::lock_guard<std::mutex> lock(gpu_devices_mutex_);
+        gpu_devices_ = initial_gpus;
+    }
     auto ctx = engine_context();
     json::Object started{{"version", version_string()},
                          {"commit", build_commit()},
                          {"platform", host_platform()},
                          {"device_count", devices_.size()},
+                         {"gpu_device_count", initial_gpus.size()},
                          {"text_capture", options_.telemetry.capture_text ? "on" : "off"}};
     if (options_.server) {
         started.set("server", json::Object{{"host", options_.server->host},
@@ -65,10 +115,18 @@ Engine::Engine(EngineOptions options)
     }
     if (options_.sample_devices_on_start) {
         sample_devices(devices_);
+        if (options_.sample_gpu_devices) {
+            sample_gpu_devices(initial_gpus);
+        }
     }
     if (options_.device_sample_interval.count() > 0) {
         sampler_ = std::thread([this] { device_sampler_loop(); });
     }
+}
+
+std::vector<GpuDeviceInfo> Engine::gpu_devices() const {
+    std::lock_guard<std::mutex> lock(gpu_devices_mutex_);
+    return gpu_devices_;
 }
 
 void Engine::sample_devices(const std::vector<DeviceInfo>& devices) {
@@ -84,6 +142,16 @@ void Engine::sample_devices(const std::vector<DeviceInfo>& devices) {
             attrs.set("used_bytes", d.total_memory_bytes - d.available_memory_bytes);
         }
         telemetry_->emit("device.memory.sample", dctx, std::move(attrs), TelemetryLevel::metrics);
+    }
+}
+
+void Engine::sample_gpu_devices(const std::vector<GpuDeviceInfo>& gpus) {
+    for (const auto& gpu : gpus) {
+        auto dctx = engine_context();
+        if (!gpu.id.empty()) {
+            dctx.device_id = gpu.id;
+        }
+        telemetry_->emit("device.memory.sample", dctx, gpu_memory_sample_attributes(gpu), TelemetryLevel::metrics);
     }
 }
 
@@ -161,6 +229,14 @@ void Engine::device_sampler_loop() {
     while (!sampler_cv_.wait_for(lock, options_.device_sample_interval, [this] { return sampler_stop_; })) {
         lock.unlock();
         sample_devices(enumerate_devices());  // re-reads available memory
+        if (options_.sample_gpu_devices) {
+            auto gpus = enumerate_gpu_devices();
+            {
+                std::lock_guard<std::mutex> gpu_lock(gpu_devices_mutex_);
+                gpu_devices_ = gpus;
+            }
+            sample_gpu_devices(gpus);
+        }
         sample_backend_runtime();
         lock.lock();
     }

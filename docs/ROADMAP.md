@@ -8,22 +8,22 @@
 - [x] define Observatory contract
 - [x] define C/C++/Rust API boundary (C++20 API + stable C ABI `sonder_inference.h`; Rust binds the C ABI; ADR-011)
 - [x] choose implementation language for engine core (C++20 + CMake presets; ADR-011)
-- [x] establish benchmark harness (skeleton: `sonder-infer bench`, smoke corpus, results schema `sonder.inference.bench/1`, concurrency 1 only)
+- [x] establish benchmark harness (`sonder-infer bench` and `sonder-bench`, `smoke`/`baseline`/`ternary_agent` corpora, results schema `sonder.inference.bench/1`, `--concurrency 1..64` parallel worker runs, and before/after GPU VRAM snapshots)
 - [ ] snapshot Ollama baseline
-- [ ] define first supported model/quantization matrix
+- [ ] define first supported model/quantization matrix (supported GGUF layouts and hardware presets are documented in `docs/GPU_SUPPORT.md`; measured quality/performance matrix pending)
 
 ## Phase 1 — direct native inference path
 
-- [x] Engine / Device / Model / Session abstractions (CPU + cross-platform GPU discovery via DXGI/NVML/ROCm/DRM/sysfs with UMA detection, surfaced on `sonder-infer devices` and `/v1/sonder/health`)
-- [x] llama.cpp/GGML backend (optional build, `SONDER_WITH_LLAMA_CPP=ON`; license approved 2026-09-26)
+- [x] Engine / Device / Model / Session abstractions (CPU + cross-platform GPU discovery via DXGI/NVML/ROCm/DRM/sysfs with UMA detection, `Engine::gpu_devices()`, live GPU `device.memory.sample` telemetry, surfaced on `sonder-infer devices`, `sonder-infer node`, `/v1/sonder/health`, and `/v1/sonder/node`)
+- [x] llama.cpp/GGML backend (optional build, `SONDER_WITH_LLAMA_CPP=ON`, GPU presets `windows-cuda-rtx` / `linux-cuda-rtx` / `linux-rocm-xt` / `windows-vulkan-xt` / `linux-vulkan-xt`, multi-GPU placement and `FETCHCONTENT_SOURCE_DIR_LLAMACPP` override; license approved 2026-09-26; see `docs/GPU_SUPPORT.md`)
 - [ ] tokenizer + prompt processing
 - [x] streaming decode (session API; via mock and Ollama backends; native backend pending)
 - [ ] sampling parity (sampling config + validation done; Sonder sampler applied for `token_logits` backends; new fields in `feat/sampling-config`; parity checks need a native backend)
 - [x] cancellation (cooperative tokens; session cancel/close; Ctrl-C in CLI; cancel latency reported)
 - [ ] model load/unload (engine registry + telemetry done; native residency pending)
-- [x] telemetry (Observatory envelope v1 JSONL; lifecycle, request, decode, token, device, scheduler, KV, sampling, drop accounting; see `docs/TELEMETRY.md`)
+- [x] telemetry (Observatory envelope v1 JSONL; lifecycle, request, decode, token, CPU/GPU `device.memory.sample`, scheduler, KV + `kv.checkpoint.saved`/`restored`, sampling, drop accounting; see `docs/TELEMETRY.md`)
 - [x] side-by-side Ollama adapter (loopback HTTP, streaming, cancellation)
-- [x] local HTTP API for Sonder Runtime (module `src/server`: `serve_main()` and `Server`; OpenAI-compatible chat subset plus Anthropic Messages `POST /v1/messages` through `Session::chat`, health, models, backend identity; ADR-020 proposed, `docs/SERVER.md`)
+- [x] local HTTP API for Sonder Runtime (module `src/server`: `serve_main()` and `Server`; OpenAI-compatible chat subset plus Anthropic Messages `POST /v1/messages` through `Session::chat`, health with live GPU inventory, models, backend identity, `GET /v1/sonder/node`, `POST /v1/sonder/plan`, and multi-profile serving; ADR-020 proposed, `docs/SERVER.md`)
 - [x] request priority classes and bounded admission (interactive/subagent/background FIFO ordering, per-class concurrency and queue caps, deadlines, cancellation propagation, and additive telemetry; see `docs/SERVER.md` and `docs/TELEMETRY.md`)
 - [x] `sonder-infer serve` command-line dispatch (`src/cli/sonder_infer_commands.hpp`; exercised in CI by the Linux smoke step, which starts `serve --backend mock --port 0 --ready-file` and drains it on SIGINT)
 - [x] live telemetry transport: SSE and NDJSON with discovery, resume and per-subscriber backpressure (`docs/TELEMETRY.md`)
@@ -31,8 +31,9 @@
 - [x] bounded Python structured chat iterator (`Session.chat_stream`; shared 64-chunk delivery/cancellation path; `docs/integration/python-chat-stream.md`)
 - [x] additive C ABI/Python session correlation IDs (`docs/integration/cabi-session-metadata.md`)
 - [x] additive C ABI/Python per-request parent lineage (four methods, reused-session isolation; `docs/integration/cabi-request-parent.md`)
-- [ ] C ABI scheduling/request metadata and a telemetry callback (follow-up to ADR-020)
-- [ ] backend identity for Ollama (tokenizer digest not measurable) and llama.cpp (GGUF hashing)
+- [x] C ABI v1 GPU inventory (`sonder_gpu_info`, `sonder_gpu_device_count`, `sonder_gpu_device_info`), ADR-020 request scheduling metadata (`sonder_workload_class`, appended `workload_class`/`priority` on `sonder_request_metadata`), and live telemetry callback sink (`sonder_engine_set_telemetry_callback`), with full Python parity (`GpuInfo`, `list_gpu_devices`, `WorkloadClass`, `RequestMetadata`, `Engine.set_telemetry_callback`)
+- [x] backend identity for `llamacpp` via real GGUF hashing (streaming 64 KiB SHA-256 `model_digest`, single-pass canonical 12-key `tokenizer.ggml.*` `tokenizer_digest`, raw `tokenizer.chat_template` `template_digest`, quantization, GPU+CPU hardware, bounded 16-entry `(path, size, mtime)` LRU cache; honestly returns `null` with `reason` when required metadata is absent)
+- [ ] backend identity for Ollama (Ollama API does not expose a measurable tokenizer digest; stays `null` by honesty contract)
 
 Gate: correctness + reliability parity for selected models.
 
@@ -43,8 +44,8 @@ Gate: correctness + reliability parity for selected models.
 - [x] chunked prefill (policy: `src/scheduler`; wired, logical KV accounting)
 - [x] prefix reuse (logical, fingerprinted: `src/cache`; shared across concurrent requests by the engine; backend KV reuse pending)
 - [x] architecture-aware logical prefix policy: attention-only, hybrid, and recurrent descriptors; hybrid/recurrent reuse requires a saved state checkpoint (`docs/KV_CACHE.md`)
-- [ ] backend recurrent-state capture/restore and engine checkpoint registration (no physical reuse or model-quality/performance claim yet)
-- [ ] verify and upgrade the optional llama.cpp pin beyond b11195 (candidate b11232+ compile compatibility unverified; see `docs/KV_CACHE.md`)
+- [x] backend recurrent-state capture/restore and engine checkpoint registration (`Capability::recurrent_checkpoint`, `BackendModel::capture_recurrent_state`/`restore_recurrent_state`, `llama.cpp` `llama_state_seq_get_size`/`get_data`/`set_data` with 512 MiB cap, opt-in deterministic mock hybrid support, bounded `SchedulingRuntime` checkpoint blob store wired to `KvCacheManager::save_checkpoint()` and `Session` with `kv.checkpoint.saved`/`restored` telemetry; live real-model hybrid quality and speedup benchmarking pending)
+- [ ] verify and upgrade the optional llama.cpp pin beyond b11195 (configure-time overrides `FETCHCONTENT_SOURCE_DIR_LLAMACPP` and `SONDER_LLAMACPP_TAG`/`SHA256` are supported; default pin compile upgrade beyond b11195 unverified; see `docs/KV_CACHE.md` and `docs/GPU_SUPPORT.md`)
 - [x] session fork/share (logical fork + copy-on-write in `src/cache`; session API wiring pending)
 - [x] cache pressure/eviction (watermarks, priority-aware/LRU eviction in `src/cache`)
 - [x] workload priorities (7 classes, aging, starvation guard in `src/scheduler`)
@@ -58,18 +59,27 @@ Gate: measurable win on agent fan-out/long-context workloads without interactive
 - [x] external backend speculation via [`llamaserver`](integration/llama-server.md)
   (passes MTP/DFlash/n-gram configuration to llama-server; reports upstream
   draft acceptance and cache reuse; Sonder-owned adaptive policy remains below)
-- [x] llamaserver VRAM-spill guard (per-process PDH shared/dedicated usage on
-  Windows; warn / refuse / bounded `auto_fit` context step-down), KV cache
-  pairing check and llama-server log diagnostics, surfaced additively on
-  health, `/v1/models` and telemetry ([vram-spill](integration/vram-spill.md))
+- [x] llamaserver VRAM-spill guard (Windows PDH + Linux `amdgpu-fdinfo` and NVML
+  per-process counters; warn / refuse / bounded `auto_fit` context step-down;
+  Ryzen APU `"uma_mode": true|false|"auto"`), backend-aware KV cache pairing
+  check, and CUDA/ROCm/HIP/Vulkan/ternary log diagnostics, surfaced additively
+  on health, `/v1/models` and telemetry ([vram-spill](integration/vram-spill.md),
+  [GPU_SUPPORT.md](GPU_SUPPORT.md))
 - [x] llamaserver slot prefix warm-up after readiness and supervised restart
   (bounded, per-slot, cancellable; `docs/integration/llama-server.md`)
-- [x] adaptive speculation policy (`AdaptiveSpeculationPolicy`: per-workload rolling acceptance, hysteresis step-up/down, pause + cooldown re-probe in `src/backends/llamaserver/adaptive_speculation.{hpp,cpp}`)
-- [x] `sonder-infer tune`: bounded llama-server calibration, PDH spill qualification,
-  per-profile context margin, and spawn-config output with two recommendations
+- [x] adaptive speculation policy (`AdaptiveSpeculationPolicy` wired live into
+  `LlamaServerBackend`: per-workload rolling acceptance across `general`,
+  `code_edit`, `tool_json`, `prose`, and `reasoning`, native `"speculative.n_max"`
+  injection, hysteresis step-up/down, pause + monotonic `probe_id` cooldown
+  re-probe with RAII cancel guard, opt-in JSON `"adaptive_speculation"` config,
+  and `runtime_status()->diagnostics["adaptive_speculation"]`)
+- [x] `sonder-infer tune`: bounded llama-server calibration (Windows PDH, Linux
+  `amdgpu-fdinfo`, and Linux NVML counters), per-profile context margin,
+  `flash_attn` grid axis, `draft-mtp` and standalone `ngram-mod` calibration,
+  and spawn-config output with two recommendations
   ([usage and qualification limits](integration/tune.md)); live performance validation pending
 - [ ] CPU KV spill
-- [ ] cache quantization where supported
+- [ ] cache quantization where supported (manual `llamacpp` and `llamaserver` `f8_e4m3`/`q2_0`/`pq2_0m` options are supported; automatic quality-validated policy remains pending)
 - [x] tensor placement overrides (MoE experts in RAM; `docs/PLACEMENT.md` step 1)
 - [x] llama.cpp KV cache types (K and V separately), flash attention mode and micro-batch size as backend/`serve` options; defaults unchanged, no automatic policy yet (`docs/PLACEMENT.md`, "KV cache types")
 - [x] typed per-model [launch profiles](integration/launch-profiles.md): one
@@ -81,17 +91,25 @@ Gate: measurable win on agent fan-out/long-context workloads without interactive
 - [x] optional typed GGUF-header routed-expert counts, independent of cache
   architecture (`GgufModelInfo::routed_experts`; literal scalar metadata only,
   unknown stays unset; header-byte observation, no artifact revision binding
-  or policy consumption; see `docs/PLACEMENT.md`)
-- [ ] several launch profiles behind one `serve` (today one profile per
-  instance) and Runtime tier routing across them
-- [x] per-model placement planner from GGUF metadata (`docs/PLACEMENT.md` step 2; `plan_model_placement()` + `sonder-infer plan` covering RTX, AMD RX XT, Ryzen APU UMA, multi-GPU split, MoE `--n-cpu-moe`, ternary/PrismML Hadamard detection, and speculative decoding)
+  or Runtime routing consumption; see `docs/PLACEMENT.md`)
+- [x] several launch profiles behind one `serve` (repeatable `--profile` /
+  `--all-profiles` with aggregate co-residency VRAM validation, per-profile
+  sampling defaults, `llamacpp` multi-model residency, and `llamaserver` attach
+  / shared-GGUF spawn aliases)
+- [ ] Sonder Runtime tier routing across multiple served profiles
+- [x] per-model and multi-model co-residency placement planner from GGUF
+  metadata (`docs/PLACEMENT.md` step 2; `plan_model_placement()`,
+  `plan_coresident_models()`, repeatable `sonder-infer plan --model`, and
+  `POST /v1/sonder/plan` covering RTX, AMD RX XT, Ryzen APU UMA, multi-GPU
+  split, MoE `--n-cpu-moe`, ternary/PrismML Hadamard detection, and speculative
+  decoding; see `docs/GPU_SUPPORT.md`)
 - [ ] optional disk tier
 - [ ] model residency manager
 - [ ] warm/cold adapter/model policy
 
 ## Phase 4 — heterogeneous nodes
 
-- [ ] node capability inventory
+- [x] node capability inventory (`sonder-infer node [--json]` and `GET /v1/sonder/node`, schema `sonder.inference.node/1`, reporting host memory, CPU, GPUs, backends, residency, profiles, and feature capabilities; advertised in `/.well-known/sonder-telemetry`)
 - [ ] whole-request placement
 - [ ] remote workers
 - [ ] transfer-cost model
