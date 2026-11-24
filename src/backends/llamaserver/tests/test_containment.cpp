@@ -1069,3 +1069,23 @@ TEST_CASE("containment: GPU loader hooks, log-file hooks and expanded credential
           std::vector<std::string>{"/usr/share/vulkan/icd.d/radeon_icd.json"});
     CHECK(values_named(entries, "AMD_LOG_LEVEL") == std::vector<std::string>{"1"});
 }
+
+TEST_CASE("containment: oversized forbidden environment keys produce bounded status messages") {
+    const std::string long_aip = "AIP_" + std::string(2048, 'X');
+    const std::string long_llama = "LLAMA_" + std::string(2048, 'Y');
+    const std::string long_secret = std::string(2048, 'Z') + "_API_KEY";
+
+    for (const auto &key : {long_aip, long_llama, long_secret}) {
+        const Status st = ls::validate_process_environment({{key, "v"}});
+        CHECK(st.code() == ErrorCode::invalid_argument);
+        CHECK(!st.message().empty());
+        CHECK(st.message().size() < 1024);
+        CHECK(st.message().find("...") != std::string::npos);
+#if defined(SONDER_HAS_SERVER)
+        const std::string obj = "{" + json_string(key) + ":\"v\"}";
+        const Status cfg = config_status(spawn_config(obj));
+        CHECK(cfg.code() == ErrorCode::invalid_argument);
+        CHECK(cfg.message().size() < 1024);
+#endif
+    }
+}
