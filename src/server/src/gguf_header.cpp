@@ -148,6 +148,9 @@ std::string_view gguf_file_type_name(std::uint32_t ftype) noexcept {
         case 39: return "NVFP4";
         case 40: return "Q1_0";
         case 41: return "Q2_0";
+        case 42: return "F8_E4M3";
+        case 141: return "PQ2_0";
+        case 142: return "PTQ1_0";
         default: return {};
     }
 }
@@ -672,6 +675,7 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
     std::array<TokenizerKeyHash, kTokenizerKeys.size()> tokenizer_hashes{};
     std::size_t architecture_occurrences = 0;
     std::uint64_t token_count = 0;
+    bool prism_tied_output = false;
     for (std::uint64_t i = 0; i < n_kv; ++i) {
         if (!c.poll()) return malformed("observation interrupted");
         std::string key;
@@ -762,6 +766,9 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
             if (key == "prism.hadamard.block_size" && is_int && v > 0 &&
                 v <= static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
                 info.prism_hadamard_block_size = static_cast<std::uint32_t>(v);
+            }
+            if (key == "prism.hadamard.tied_output" && v != 0) {
+                prism_tied_output = true;
             }
             if (expert && is_int && v > 0 && v <= static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
                 expert->value = static_cast<std::uint32_t>(v);
@@ -870,6 +877,10 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
     info.block_bytes.assign(info.block_count, 0);
     std::map<std::uint32_t, std::uint64_t> tensor_bytes_by_type;
     std::uint64_t output_vocab = 0;
+    std::uint64_t embd_vocab = 0;
+    std::uint64_t token_embd_weight_bytes = 0;
+    bool has_output_weight = false;
+    bool has_output_norm = false;
     for (std::uint64_t t = 0; t < n_tensors; ++t) {
         if (!c.poll()) return malformed("observation interrupted");
         std::string name;
@@ -930,9 +941,16 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
             }
         } else if (name == "token_embd.weight") {
             if (!checked_add(info.embedding_bytes, bytes)) return malformed("tensor sizes overflow");
+            token_embd_weight_bytes = bytes;
+            embd_vocab = second;
         } else if (name.rfind("output", 0) == 0) {
             if (!checked_add(info.output_bytes, bytes)) return malformed("tensor sizes overflow");
-            if (name == "output.weight") output_vocab = second;
+            if (name == "output.weight") {
+                has_output_weight = true;
+                output_vocab = second;
+            } else if (name == "output_norm.weight") {
+                has_output_norm = true;
+            }
         } else {
             if (!checked_add(info.other_bytes, bytes)) return malformed("tensor sizes overflow");
         }
@@ -948,6 +966,12 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
         } else {
             info.tensors_truncated = true;
         }
+    }
+    // Tied LM head (e.g. Ternary-Bonsai-2-4B prism.hadamard.tied_output=1, Qwen3-4B,
+    // Llama-3.2, Gemma): llama.cpp duplicates token_embd.weight onto LAYER_OUTPUT
+    // (TENSOR_DUPLICATED), so full GPU offload allocates it in VRAM as well as host input.
+    if (!has_output_weight && token_embd_weight_bytes > 0 && (has_output_norm || prism_tied_output)) {
+        if (!checked_add(info.output_bytes, token_embd_weight_bytes)) return malformed("tensor sizes overflow");
     }
     const Numbers* file_type_num = number("general.file_type");
     if (file_type_num && file_type_num->value >= 0 &&
@@ -971,23 +995,28 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
             if (!dom_name.empty()) info.quantization = std::string(dom_name);
         }
     }
-    info.vocab_size = token_count > 0
-                          ? token_count
-                          : static_cast<std::uint64_t>(scalar(a + "vocab_size", static_cast<std::int64_t>(output_vocab)));
+    const std::uint64_t inferred_vocab = output_vocab > 0 ? output_vocab : embd_vocab;
+    info.vocab_size =
+        token_count > 0 ? token_count
+                        : static_cast<std::uint64_t>(scalar(a + "vocab_size", static_cast<std::int64_t>(inferred_vocab)));
     info.kind = classify_model_architecture(info.metadata);
 
     // Which blocks keep attention KV. Per-block head counts (already set)
     // are authoritative when the metadata had an array; otherwise hybrids
-    // use their attn_k tensors, then full_attention_interval.
+    // use their attn_k tensors, then full_attention_interval (trailing NextN/MTP
+    // blocks are always dense attention: qwen35.cpp load_arch_hparams).
     const Numbers* kv_array = number(a + "attention.head_count_kv");
     const bool per_layer_heads = kv_array && !kv_array->per_layer.empty();
     if (!per_layer_heads && info.kind != ModelArchitecture::attention_only) {
         const std::int64_t interval = scalar(a + "full_attention_interval", 0);
+        const std::uint32_t trunk_blocks = info.block_count - info.nextn_layers;
         for (std::uint32_t i = 0; i < info.block_count; ++i) {
             if (!c.poll()) return malformed("observation interrupted");
             bool attention = false;
             if (any_attention_tensor) {
                 attention = attention_tensor[i];
+            } else if (i >= trunk_blocks) {
+                attention = true;
             } else if (interval > 0) {
                 attention = (static_cast<std::int64_t>(i) + 1) % interval == 0;
             }

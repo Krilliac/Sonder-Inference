@@ -68,13 +68,40 @@
     {
       "name": "windows-cuda-rtx",
       "displayName": "Windows CUDA (NVIDIA RTX Ampere/Ada/Blackwell)",
-      "description": "Direct llama.cpp with CUDA for RTX 30/40/50-series (sm_86, sm_89, sm_120) and all quantized Flash Attention kernels.",
+      "description": "Direct llama.cpp with CUDA for RTX 30/40/50-series (sm_86, sm_89, sm_120), CUDA Graphs, and all quantized Flash Attention kernels.",
       "inherits": "msvc-release",
       "cacheVariables": {
         "SONDER_WITH_LLAMA_CPP": "ON",
         "GGML_CUDA": "ON",
         "CMAKE_CUDA_ARCHITECTURES": "86;89;120",
-        "GGML_CUDA_FA_ALL_QUANTS": "ON"
+        "GGML_CUDA_FA_ALL_QUANTS": "ON",
+        "GGML_CUDA_GRAPHS": "ON"
+      }
+    },
+    {
+      "name": "windows-cuda-blackwell",
+      "displayName": "Windows CUDA Blackwell (NVIDIA RTX 50-series sm_120, Release)",
+      "description": "Direct llama.cpp Release build tuned for NVIDIA Blackwell (sm_120, e.g. RTX 5070 Ti / 5080 / 5090) with CUDA Graphs and all quantized Flash Attention kernels.",
+      "inherits": "msvc-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SONDER_WITH_LLAMA_CPP": "ON",
+        "GGML_CUDA": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "120",
+        "GGML_CUDA_FA_ALL_QUANTS": "ON",
+        "GGML_CUDA_GRAPHS": "ON"
+      }
+    },
+    {
+      "name": "windows-rocm-xt",
+      "displayName": "Windows ROCm/HIP (AMD RX XT RDNA 2/3/4 & Ryzen APU)",
+      "description": "Direct llama.cpp with AMD HIP SDK on Windows targeting RDNA 2/3/4 discrete RX XT GPUs and RDNA 3 Ryzen APUs with HIP Graphs.",
+      "inherits": "msvc-release",
+      "cacheVariables": {
+        "SONDER_WITH_LLAMA_CPP": "ON",
+        "GGML_HIP": "ON",
+        "GGML_HIP_GRAPHS": "ON",
+        "AMDGPU_TARGETS": "gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1200;gfx1201"
       }
     },
     {
@@ -88,25 +115,50 @@
       }
     },
     {
+      "name": "linux-llamacpp",
+      "displayName": "Linux CPU Direct llama.cpp (Ninja)",
+      "description": "Direct llama.cpp CPU build on Linux/WSL for cross-platform compilation and verification without GPU toolchains.",
+      "inherits": "linux-release",
+      "cacheVariables": {
+        "SONDER_WITH_LLAMA_CPP": "ON"
+      }
+    },
+    {
       "name": "linux-cuda-rtx",
       "displayName": "Linux CUDA (NVIDIA RTX Ampere/Ada/Blackwell)",
-      "description": "Direct llama.cpp with CUDA for RTX 30/40/50-series (sm_86, sm_89, sm_120) and all quantized Flash Attention kernels.",
+      "description": "Direct llama.cpp with CUDA for RTX 30/40/50-series (sm_86, sm_89, sm_120), CUDA Graphs, and all quantized Flash Attention kernels.",
       "inherits": "linux-release",
       "cacheVariables": {
         "SONDER_WITH_LLAMA_CPP": "ON",
         "GGML_CUDA": "ON",
         "CMAKE_CUDA_ARCHITECTURES": "86;89;120",
-        "GGML_CUDA_FA_ALL_QUANTS": "ON"
+        "GGML_CUDA_FA_ALL_QUANTS": "ON",
+        "GGML_CUDA_GRAPHS": "ON"
+      }
+    },
+    {
+      "name": "linux-cuda-blackwell",
+      "displayName": "Linux CUDA Blackwell (NVIDIA RTX 50-series sm_120, Release)",
+      "description": "Direct llama.cpp Release build tuned for NVIDIA Blackwell (sm_120, e.g. RTX 5070 Ti / 5080 / 5090) with CUDA Graphs and all quantized Flash Attention kernels.",
+      "inherits": "linux-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SONDER_WITH_LLAMA_CPP": "ON",
+        "GGML_CUDA": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "120",
+        "GGML_CUDA_FA_ALL_QUANTS": "ON",
+        "GGML_CUDA_GRAPHS": "ON"
       }
     },
     {
       "name": "linux-rocm-xt",
       "displayName": "Linux ROCm/HIP (AMD RX XT RDNA 2/3/4 & Ryzen APU)",
-      "description": "Direct llama.cpp with ROCm/HIP targeting AMD RDNA 2/3/4 discrete RX XT GPUs and RDNA 3 Ryzen APUs.",
+      "description": "Direct llama.cpp with ROCm/HIP targeting AMD RDNA 2/3/4 discrete RX XT GPUs and RDNA 3 Ryzen APUs with HIP Graphs.",
       "inherits": "linux-release",
       "cacheVariables": {
         "SONDER_WITH_LLAMA_CPP": "ON",
         "GGML_HIP": "ON",
+        "GGML_HIP_GRAPHS": "ON",
         "AMDGPU_TARGETS": "gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1200;gfx1201"
       }
     },
@@ -129,8 +181,12 @@
     { "name": "ci-windows", "configurePreset": "ci-windows" },
     { "name": "ci-linux", "configurePreset": "ci-linux" },
     { "name": "windows-cuda-rtx", "configurePreset": "windows-cuda-rtx" },
+    { "name": "windows-cuda-blackwell", "configurePreset": "windows-cuda-blackwell" },
+    { "name": "windows-rocm-xt", "configurePreset": "windows-rocm-xt" },
     { "name": "windows-vulkan-xt", "configurePreset": "windows-vulkan-xt" },
+    { "name": "linux-llamacpp", "configurePreset": "linux-llamacpp" },
     { "name": "linux-cuda-rtx", "configurePreset": "linux-cuda-rtx" },
+    { "name": "linux-cuda-blackwell", "configurePreset": "linux-cuda-blackwell" },
     { "name": "linux-rocm-xt", "configurePreset": "linux-rocm-xt" },
     { "name": "linux-vulkan-xt", "configurePreset": "linux-vulkan-xt" }
   ],
@@ -142,8 +198,12 @@
     { "name": "ci-windows", "configurePreset": "ci-windows", "output": { "outputOnFailure": true } },
     { "name": "ci-linux", "configurePreset": "ci-linux", "output": { "outputOnFailure": true } },
     { "name": "windows-cuda-rtx", "configurePreset": "windows-cuda-rtx", "output": { "outputOnFailure": true } },
+    { "name": "windows-cuda-blackwell", "configurePreset": "windows-cuda-blackwell", "output": { "outputOnFailure": true } },
+    { "name": "windows-rocm-xt", "configurePreset": "windows-rocm-xt", "output": { "outputOnFailure": true } },
     { "name": "windows-vulkan-xt", "configurePreset": "windows-vulkan-xt", "output": { "outputOnFailure": true } },
+    { "name": "linux-llamacpp", "configurePreset": "linux-llamacpp", "output": { "outputOnFailure": true } },
     { "name": "linux-cuda-rtx", "configurePreset": "linux-cuda-rtx", "output": { "outputOnFailure": true } },
+    { "name": "linux-cuda-blackwell", "configurePreset": "linux-cuda-blackwell", "output": { "outputOnFailure": true } },
     { "name": "linux-rocm-xt", "configurePreset": "linux-rocm-xt", "output": { "outputOnFailure": true } },
     { "name": "linux-vulkan-xt", "configurePreset": "linux-vulkan-xt", "output": { "outputOnFailure": true } }
   ]

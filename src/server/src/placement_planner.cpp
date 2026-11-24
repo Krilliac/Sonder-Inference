@@ -152,7 +152,20 @@ bool is_nvidia_gpu(const GpuDeviceInfo& g) noexcept {
 }
 
 bool is_amd_gpu(const GpuDeviceInfo& g) noexcept {
-    return g.vendor == GpuVendor::amd || iequals(g.backend_hint, "rocm");
+    return g.vendor == GpuVendor::amd || iequals(g.backend_hint, "rocm") || iequals(g.backend_hint, "hip");
+}
+
+bool has_explicit_rocm_gpu(const std::vector<GpuDeviceInfo>& gpus) noexcept {
+    return std::any_of(gpus.begin(), gpus.end(), [](const GpuDeviceInfo& g) noexcept {
+        return iequals(g.backend_hint, "rocm") || iequals(g.backend_hint, "hip");
+    });
+}
+
+bool is_rocm_target_gpu(const GpuDeviceInfo& g, bool explicit_rocm_present) noexcept {
+    if (explicit_rocm_present) {
+        return iequals(g.backend_hint, "rocm") || iequals(g.backend_hint, "hip");
+    }
+    return is_amd_gpu(g);
 }
 
 bool is_intel_gpu(const GpuDeviceInfo& g) noexcept {
@@ -318,12 +331,20 @@ TokenMatch match_single_hint(const std::vector<GpuDeviceInfo>& gpus, const HostM
     }
     if (istarts_with(token, "rocm")) {
         out.backend_override = "rocm";
-        out.index = match_vendor_token(gpus, host, request, token.substr(4), is_amd_gpu, out.indexed);
+        const bool explicit_rocm = has_explicit_rocm_gpu(gpus);
+        out.index = match_vendor_token(
+            gpus, host, request, token.substr(4),
+            [explicit_rocm](const GpuDeviceInfo& g) noexcept { return is_rocm_target_gpu(g, explicit_rocm); },
+            out.indexed);
         return out;
     }
     if (istarts_with(token, "hip")) {
         out.backend_override = "rocm";
-        out.index = match_vendor_token(gpus, host, request, token.substr(3), is_amd_gpu, out.indexed);
+        const bool explicit_rocm = has_explicit_rocm_gpu(gpus);
+        out.index = match_vendor_token(
+            gpus, host, request, token.substr(3),
+            [explicit_rocm](const GpuDeviceInfo& g) noexcept { return is_rocm_target_gpu(g, explicit_rocm); },
+            out.indexed);
         return out;
     }
     if (istarts_with(token, "amd")) {
@@ -368,6 +389,7 @@ std::vector<std::size_t> collect_same_vendor_discrete_peers(const std::vector<Gp
     std::vector<std::size_t> peers;
     if (primary_idx >= gpus.size() || gpus[primary_idx].is_integrated_uma) return peers;
     const GpuDeviceInfo& primary = gpus[primary_idx];
+    const bool primary_is_rocm = iequals(primary.backend_hint, "rocm") || iequals(primary.backend_hint, "hip");
     for (std::size_t i = 0; i < gpus.size() && peers.size() < kMaxMultiGpu; ++i) {
         if (gpus[i].is_integrated_uma) continue;
         const bool same_vendor = primary.vendor != GpuVendor::unknown
@@ -375,6 +397,7 @@ std::vector<std::size_t> collect_same_vendor_discrete_peers(const std::vector<Gp
                                      : (gpus[i].vendor == GpuVendor::unknown &&
                                         iequals(gpus[i].backend_hint, primary.backend_hint));
         if (!same_vendor) continue;
+        if (primary_is_rocm && iequals(gpus[i].backend_hint, "vulkan")) continue;
         const auto budget = compute_gpu_budget(gpus[i], host, request);
         if (!budget || budget->usable_mib == 0) continue;
         peers.push_back(i);
@@ -523,9 +546,10 @@ std::string ggml_device_name_for(const std::vector<GpuDeviceInfo>& gpus, std::si
         return "CUDA" + std::to_string(local);
     }
     if (backend_hint == "rocm") {
+        const bool explicit_rocm = has_explicit_rocm_gpu(gpus);
         std::size_t local = 0;
         for (std::size_t i = 0; i < idx && i < gpus.size(); ++i) {
-            if (is_amd_gpu(gpus[i])) ++local;
+            if (is_rocm_target_gpu(gpus[i], explicit_rocm)) ++local;
         }
         return "ROCm" + std::to_string(local);
     }

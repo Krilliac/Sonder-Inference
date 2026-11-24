@@ -25,6 +25,7 @@
 #    include <dirent.h>
 #    include <dlfcn.h>
 #  endif
+#  include <cstdlib>
 #  include <fstream>
 #  include <iterator>
 #  include <sstream>
@@ -281,7 +282,16 @@ std::optional<std::size_t> match_single_gpu_hint(const std::vector<GpuDeviceInfo
         return g.vendor == GpuVendor::nvidia || iequals(g.backend_hint, "cuda");
     };
     const auto is_amd = [](const GpuDeviceInfo& g) noexcept {
-        return g.vendor == GpuVendor::amd || iequals(g.backend_hint, "rocm");
+        return g.vendor == GpuVendor::amd || iequals(g.backend_hint, "rocm") || iequals(g.backend_hint, "hip");
+    };
+    const bool any_explicit_rocm = std::any_of(gpus.begin(), gpus.end(), [](const GpuDeviceInfo& g) noexcept {
+        return iequals(g.backend_hint, "rocm") || iequals(g.backend_hint, "hip");
+    });
+    const auto is_rocm_target = [any_explicit_rocm, &is_amd](const GpuDeviceInfo& g) noexcept {
+        if (any_explicit_rocm) {
+            return iequals(g.backend_hint, "rocm") || iequals(g.backend_hint, "hip");
+        }
+        return is_amd(g);
     };
     const auto is_intel = [](const GpuDeviceInfo& g) noexcept { return g.vendor == GpuVendor::intel; };
     const auto is_apple = [](const GpuDeviceInfo& g) noexcept {
@@ -296,10 +306,10 @@ std::optional<std::size_t> match_single_gpu_hint(const std::vector<GpuDeviceInfo
         return match_vendor_hint(gpus, token.substr(6), is_nvidia, prefer_free);
     }
     if (istarts_with(token, "rocm")) {
-        return match_vendor_hint(gpus, token.substr(4), is_amd, prefer_free);
+        return match_vendor_hint(gpus, token.substr(4), is_rocm_target, prefer_free);
     }
     if (istarts_with(token, "hip")) {
-        return match_vendor_hint(gpus, token.substr(3), is_amd, prefer_free);
+        return match_vendor_hint(gpus, token.substr(3), is_rocm_target, prefer_free);
     }
     if (istarts_with(token, "amd")) {
         return match_vendor_hint(gpus, token.substr(3), is_amd, prefer_free);
@@ -323,6 +333,40 @@ std::optional<std::size_t> match_single_gpu_hint(const std::vector<GpuDeviceInfo
         return match_vendor_hint(gpus, token.substr(5), is_apple, prefer_free);
     }
     return std::nullopt;
+}
+
+std::optional<std::size_t> map_rocm_visible_ordinal(std::size_t ordinal, std::string_view raw) noexcept {
+    const std::string_view val = trim_view(raw);
+    if (val.empty() || iequals(val, "-1") || iequals(val, "none") || iequals(val, "nodevfiles")) {
+        return std::nullopt;
+    }
+    std::size_t mapped_pos = 0;
+    bool saw_uuid = false;
+    std::size_t pos = 0;
+    while (pos <= val.size()) {
+        const std::size_t comma = val.find(',', pos);
+        const std::string_view tok =
+            trim_view(val.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos));
+        pos = comma == std::string_view::npos ? val.size() + 1 : comma + 1;
+        if (tok.empty()) {
+            continue;
+        }
+        if (tok.front() == '-') {
+            break;  // HIP/ROCr terminates visible-device list parsing on negative entries
+        }
+        if (const auto idx = parse_index(tok)) {
+            if (*idx == ordinal) {
+                return mapped_pos;
+            }
+            ++mapped_pos;
+        } else if (istarts_with(tok, "gpu-")) {
+            saw_uuid = true;
+            ++mapped_pos;
+        } else {
+            break;
+        }
+    }
+    return saw_uuid ? std::optional<std::size_t>(ordinal) : std::nullopt;
 }
 
 #if defined(_WIN32)
@@ -379,6 +423,17 @@ struct ScopedComPtr {
     ScopedComPtr& operator=(const ScopedComPtr&) = delete;
 };
 
+template <typename Fn>
+bool load_win32_symbol(HMODULE handle, const char* symbol, Fn& out) noexcept {
+    static_assert(sizeof(Fn) == sizeof(FARPROC));
+    const FARPROC raw = GetProcAddress(handle, symbol);
+    if (!raw) {
+        return false;
+    }
+    std::memcpy(&out, &raw, sizeof(out));
+    return true;
+}
+
 std::string utf8_from_wide(const wchar_t* text, std::size_t max_chars) {
     if (!text) {
         return {};
@@ -404,91 +459,266 @@ std::string utf8_from_wide(const wchar_t* text, std::size_t max_chars) {
     return out;
 }
 
-std::string windows_backend_hint(GpuVendor vendor) {
-    switch (vendor) {
-        case GpuVendor::nvidia: return "cuda";
-        case GpuVendor::amd: return "vulkan";
-        case GpuVendor::intel: return "vulkan";
-        case GpuVendor::apple: return "metal";
-        case GpuVendor::unknown: return {};
+std::optional<std::string> read_win32_env_utf8(const char* name) {
+    SetLastError(ERROR_SUCCESS);
+    char stack_buf[512] = {};
+    const DWORD n = GetEnvironmentVariableA(name, stack_buf, static_cast<DWORD>(sizeof(stack_buf)));
+    if (n == 0) {
+        if (GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
+            return std::nullopt;
+        }
+        return std::string{};
     }
-    return {};
+    if (n < sizeof(stack_buf)) {
+        return std::string(stack_buf, static_cast<std::size_t>(n));
+    }
+    if (n > 32768u) {
+        return std::nullopt;
+    }
+    std::string dyn(static_cast<std::size_t>(n), '\0');
+    const DWORD n2 = GetEnvironmentVariableA(name, dyn.data(), n);
+    if (n2 == 0 || n2 >= n) {
+        return std::nullopt;
+    }
+    dyn.resize(static_cast<std::size_t>(n2));
+    return dyn;
 }
 
-std::vector<GpuDeviceInfo> live_gpu_devices() {
-    std::vector<GpuDeviceInfo> gpus;
-    ScopedLibrary dxgi(LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32));
-    if (!dxgi.handle) {
-        return gpus;
-    }
-    using CreateDXGIFactory1Fn = HRESULT(WINAPI*)(REFIID, void**);
-    const FARPROC raw_create = GetProcAddress(dxgi.handle, "CreateDXGIFactory1");
-    if (!raw_create) {
-        return gpus;
-    }
-    CreateDXGIFactory1Fn create_factory = nullptr;
-    static_assert(sizeof(create_factory) == sizeof(raw_create));
-    std::memcpy(&create_factory, &raw_create, sizeof(create_factory));
+bool win32_file_exists(const std::wstring& path) noexcept {
+    const DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
 
-    ScopedComPtr<IDXGIFactory1> factory;
-    if (FAILED(create_factory(kIidDxgiFactory1, reinterpret_cast<void**>(&factory.ptr))) || !factory.ptr) {
-        return gpus;
-    }
-
-    for (UINT i = 0;; ++i) {
-        ScopedComPtr<IDXGIAdapter1> adapter;
-        const HRESULT hr = factory.ptr->EnumAdapters1(i, &adapter.ptr);
-        if (FAILED(hr) || !adapter.ptr) {
-            break;
-        }
-        DXGI_ADAPTER_DESC1 desc{};
-        if (FAILED(adapter.ptr->GetDesc1(&desc))) {
+bool detect_windows_hip_sdk() {
+    for (const wchar_t* env_name : {L"HIP_PATH", L"ROCM_PATH"}) {
+        wchar_t root_buf[MAX_PATH * 2] = {};
+        const DWORD len = GetEnvironmentVariableW(env_name, root_buf, static_cast<DWORD>(sizeof(root_buf) / sizeof(wchar_t)));
+        if (len == 0 || len >= sizeof(root_buf) / sizeof(wchar_t)) {
             continue;
         }
-        if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
+        std::wstring base(root_buf, static_cast<std::size_t>(len));
+        while (!base.empty() && (base.back() == L'\\' || base.back() == L'/')) {
+            base.pop_back();
+        }
+        if (base.empty()) {
+            continue;
+        }
+        const std::wstring bin_dir = base + L"\\bin\\";
+        // Require the HIP SDK toolkit bin directory (hipblas.dll / hipcc) rather
+        // than bare System32 amdhip64_6.dll from consumer display drivers.
+        if ((win32_file_exists(bin_dir + L"hipblas.dll") || win32_file_exists(bin_dir + L"amdhip64_7.dll") ||
+             win32_file_exists(bin_dir + L"amdhip64_6.dll") || win32_file_exists(bin_dir + L"amdhip64.dll")) &&
+            (win32_file_exists(bin_dir + L"hipblas.dll") || win32_file_exists(bin_dir + L"hipcc.exe") ||
+             win32_file_exists(bin_dir + L"hipcc.bat") || win32_file_exists(bin_dir + L"hipcc.pl"))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void append_win32_nvml_fallback_devices(std::vector<GpuDeviceInfo>& gpus) {
+    ScopedLibrary nvml(LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32));
+    if (!nvml.handle) {
+        return;
+    }
+    using NvmlReturn = int;
+    struct NvmlDeviceOpaque;
+    using NvmlDevice = NvmlDeviceOpaque*;
+    struct NvmlMemory {
+        unsigned long long total;
+        unsigned long long free;
+        unsigned long long used;
+    };
+    struct NvmlPciInfo {
+        char bus_id_legacy[16];
+        unsigned int domain;
+        unsigned int bus;
+        unsigned int device;
+        unsigned int pci_device_id;
+        unsigned int pci_subsystem_id;
+        char bus_id[32];
+    };
+    constexpr NvmlReturn kNvmlSuccess = 0;
+
+    NvmlReturn (*nvml_init)() = nullptr;
+    NvmlReturn (*nvml_shutdown)() = nullptr;
+    NvmlReturn (*nvml_get_count)(unsigned int*) = nullptr;
+    NvmlReturn (*nvml_get_handle)(unsigned int, NvmlDevice*) = nullptr;
+    NvmlReturn (*nvml_get_name)(NvmlDevice, char*, unsigned int) = nullptr;
+    NvmlReturn (*nvml_get_memory)(NvmlDevice, NvmlMemory*) = nullptr;
+    NvmlReturn (*nvml_get_pci)(NvmlDevice, NvmlPciInfo*) = nullptr;
+
+    if (!load_win32_symbol(nvml.handle, "nvmlInit_v2", nvml_init) ||
+        !load_win32_symbol(nvml.handle, "nvmlShutdown", nvml_shutdown) ||
+        !load_win32_symbol(nvml.handle, "nvmlDeviceGetCount_v2", nvml_get_count) ||
+        !load_win32_symbol(nvml.handle, "nvmlDeviceGetHandleByIndex_v2", nvml_get_handle) ||
+        !load_win32_symbol(nvml.handle, "nvmlDeviceGetName", nvml_get_name) ||
+        !load_win32_symbol(nvml.handle, "nvmlDeviceGetMemoryInfo", nvml_get_memory)) {
+        return;
+    }
+    if (!load_win32_symbol(nvml.handle, "nvmlDeviceGetPciInfo_v3", nvml_get_pci)) {
+        (void)load_win32_symbol(nvml.handle, "nvmlDeviceGetPciInfo", nvml_get_pci);
+    }
+    if (nvml_init() != kNvmlSuccess) {
+        return;
+    }
+    struct ScopedNvml {
+        NvmlReturn (*shutdown)() = nullptr;
+        explicit ScopedNvml(NvmlReturn (*fn)()) noexcept : shutdown(fn) {}
+        ~ScopedNvml() {
+            if (shutdown) {
+                (void)shutdown();
+            }
+        }
+        ScopedNvml(const ScopedNvml&) = delete;
+        ScopedNvml& operator=(const ScopedNvml&) = delete;
+    } nvml_guard(nvml_shutdown);
+
+    unsigned int count = 0;
+    if (nvml_get_count(&count) != kNvmlSuccess || count == 0) {
+        return;
+    }
+    count = std::min<unsigned int>(count, 64u);
+    for (unsigned int i = 0; i < count; ++i) {
+        NvmlDevice dev = nullptr;
+        if (nvml_get_handle(i, &dev) != kNvmlSuccess || !dev) {
             continue;
         }
         GpuDeviceInfo info;
         info.id = "gpu:" + std::to_string(gpus.size());
-        info.name = trim(utf8_from_wide(desc.Description, sizeof(desc.Description) / sizeof(desc.Description[0])));
-        info.vendor_id = static_cast<std::uint32_t>(desc.VendorId);
-        info.device_id = static_cast<std::uint32_t>(desc.DeviceId);
-        info.vendor = gpu_vendor_from_pci_id(info.vendor_id);
-        const auto dedicated_total = static_cast<std::uint64_t>(desc.DedicatedVideoMemory);
-        const auto shared_total = static_cast<std::uint64_t>(desc.SharedSystemMemory);
-        info.dedicated_total = MemoryReading::known(dedicated_total);
-        info.shared_total = MemoryReading::known(shared_total);
-        info.is_integrated_uma = is_integrated_uma_memory(info.vendor, dedicated_total, shared_total);
-        info.backend_hint = windows_backend_hint(info.vendor);
-        info.source = "dxgi";
+        char name_buf[128] = {};
+        if (nvml_get_name(dev, name_buf, static_cast<unsigned int>(sizeof(name_buf))) == kNvmlSuccess) {
+            name_buf[sizeof(name_buf) - 1] = '\0';
+            info.name = trim(name_buf);
+        }
+        if (info.name.empty()) {
+            info.name = "NVIDIA GPU " + std::to_string(i);
+        }
+        info.vendor = GpuVendor::nvidia;
+        info.vendor_id = 0x10DEu;
+        if (nvml_get_pci) {
+            NvmlPciInfo pci{};
+            if (nvml_get_pci(dev, &pci) == kNvmlSuccess) {
+                info.device_id = static_cast<std::uint32_t>(pci.pci_device_id >> 16);
+            }
+        }
+        NvmlMemory mem{};
+        if (nvml_get_memory(dev, &mem) == kNvmlSuccess) {
+            info.dedicated_total = MemoryReading::known(static_cast<std::uint64_t>(mem.total));
+            if (mem.total == 0 || mem.free > 0 || mem.used > 0) {
+                info.dedicated_free = MemoryReading::known(static_cast<std::uint64_t>(mem.free));
+            }
+        }
+        info.is_integrated_uma = false;
+        info.backend_hint = "cuda";
+        info.source = "nvml";
+        gpus.push_back(std::move(info));
+    }
+}
 
-        ScopedComPtr<IDXGIAdapter3> adapter3;
-        if (SUCCEEDED(adapter.ptr->QueryInterface(kIidDxgiAdapter3, reinterpret_cast<void**>(&adapter3.ptr))) &&
-            adapter3.ptr) {
-            DXGI_QUERY_VIDEO_MEMORY_INFO local_info{};
-            if (SUCCEEDED(adapter3.ptr->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info))) {
-                std::uint64_t free_bytes =
-                    local_info.Budget > local_info.CurrentUsage ? local_info.Budget - local_info.CurrentUsage : 0;
-                bool free_complete = true;
-                if (info.is_integrated_uma) {
-                    DXGI_QUERY_VIDEO_MEMORY_INFO non_local_info{};
-                    if (SUCCEEDED(adapter3.ptr->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
-                                                                     &non_local_info))) {
-                        const std::uint64_t non_local_free =
-                            non_local_info.Budget > non_local_info.CurrentUsage
-                                ? non_local_info.Budget - non_local_info.CurrentUsage
-                                : 0;
-                        free_bytes = saturating_add(free_bytes, non_local_free);
-                    } else {
-                        free_complete = false;
+std::vector<GpuDeviceInfo> live_gpu_devices() {
+    std::vector<GpuDeviceInfo> gpus;
+    const bool hip_sdk_available = detect_windows_hip_sdk();
+    const auto hip_vis = read_win32_env_utf8("HIP_VISIBLE_DEVICES");
+    const auto rocr_vis = read_win32_env_utf8("ROCR_VISIBLE_DEVICES");
+    const std::optional<std::string_view> hip_vis_view =
+        hip_vis ? std::optional<std::string_view>(*hip_vis) : std::nullopt;
+    const std::optional<std::string_view> rocr_vis_view =
+        rocr_vis ? std::optional<std::string_view>(*rocr_vis) : std::nullopt;
+
+    bool saw_nvidia_dxgi = false;
+    ScopedLibrary dxgi(LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32));
+    if (dxgi.handle) {
+        using CreateDXGIFactory1Fn = HRESULT(WINAPI*)(REFIID, void**);
+        CreateDXGIFactory1Fn create_factory = nullptr;
+        if (load_win32_symbol(dxgi.handle, "CreateDXGIFactory1", create_factory)) {
+            ScopedComPtr<IDXGIFactory1> factory;
+            if (SUCCEEDED(create_factory(kIidDxgiFactory1, reinterpret_cast<void**>(&factory.ptr))) && factory.ptr) {
+                std::size_t amd_ordinal = 0;
+                for (UINT i = 0;; ++i) {
+                    ScopedComPtr<IDXGIAdapter1> adapter;
+                    const HRESULT hr = factory.ptr->EnumAdapters1(i, &adapter.ptr);
+                    if (FAILED(hr) || !adapter.ptr) {
+                        break;
                     }
-                }
-                if (free_complete) {
-                    info.dedicated_free = MemoryReading::known(free_bytes);
+                    DXGI_ADAPTER_DESC1 desc{};
+                    if (FAILED(adapter.ptr->GetDesc1(&desc))) {
+                        continue;
+                    }
+                    // Skip software/WARP adapters and Microsoft virtual/RDP display adapters (0x1414).
+                    if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 || desc.VendorId == 0x1414u) {
+                        continue;
+                    }
+                    GpuDeviceInfo info;
+                    info.id = "gpu:" + std::to_string(gpus.size());
+                    info.name =
+                        trim(utf8_from_wide(desc.Description, sizeof(desc.Description) / sizeof(desc.Description[0])));
+                    info.vendor_id = static_cast<std::uint32_t>(desc.VendorId);
+                    info.device_id = static_cast<std::uint32_t>(desc.DeviceId);
+                    info.vendor = gpu_vendor_from_pci_id(info.vendor_id);
+                    if (info.vendor == GpuVendor::nvidia) {
+                        saw_nvidia_dxgi = true;
+                    }
+                    const auto dedicated_total = static_cast<std::uint64_t>(desc.DedicatedVideoMemory);
+                    const auto shared_total = static_cast<std::uint64_t>(desc.SharedSystemMemory);
+                    info.dedicated_total = MemoryReading::known(dedicated_total);
+                    info.shared_total = MemoryReading::known(shared_total);
+                    info.is_integrated_uma = is_integrated_uma_memory(info.vendor, dedicated_total, shared_total);
+                    std::size_t cur_amd_ordinal = 0;
+                    if (info.vendor == GpuVendor::amd) {
+                        cur_amd_ordinal = amd_ordinal++;
+                    }
+                    info.backend_hint = resolve_windows_gpu_backend_hint(
+                        info.vendor, info.is_integrated_uma, hip_sdk_available, cur_amd_ordinal, hip_vis_view,
+                        rocr_vis_view);
+                    info.source = "dxgi";
+
+                    ScopedComPtr<IDXGIAdapter3> adapter3;
+                    if (SUCCEEDED(adapter.ptr->QueryInterface(kIidDxgiAdapter3, reinterpret_cast<void**>(&adapter3.ptr))) &&
+                        adapter3.ptr) {
+                        DXGI_QUERY_VIDEO_MEMORY_INFO local_info{};
+                        if (SUCCEEDED(adapter3.ptr->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
+                                                                         &local_info))) {
+                            std::uint64_t free_bytes = local_info.Budget > local_info.CurrentUsage
+                                                           ? local_info.Budget - local_info.CurrentUsage
+                                                           : 0;
+                            bool free_complete = true;
+                            bool has_wddm_budget = (local_info.Budget > 0 || local_info.CurrentUsage > 0 ||
+                                                    dedicated_total == 0);
+                            if (info.is_integrated_uma) {
+                                DXGI_QUERY_VIDEO_MEMORY_INFO non_local_info{};
+                                if (SUCCEEDED(adapter3.ptr->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
+                                                                                 &non_local_info))) {
+                                    const std::uint64_t non_local_free =
+                                        non_local_info.Budget > non_local_info.CurrentUsage
+                                            ? non_local_info.Budget - non_local_info.CurrentUsage
+                                            : 0;
+                                    free_bytes = saturating_add(free_bytes, non_local_free);
+                                    has_wddm_budget = (local_info.Budget > 0 || non_local_info.Budget > 0 ||
+                                                       local_info.CurrentUsage > 0 || non_local_info.CurrentUsage > 0 ||
+                                                       (dedicated_total == 0 && shared_total == 0));
+                                } else {
+                                    free_complete = false;
+                                }
+                            }
+                            if (free_complete && has_wddm_budget) {
+                                info.dedicated_free = MemoryReading::known(free_bytes);
+                            }
+                        }
+                    }
+                    gpus.push_back(std::move(info));
                 }
             }
         }
-        gpus.push_back(std::move(info));
+    }
+
+    // Headless / TCC-mode NVIDIA GPUs on Windows are not enumerated by DXGI;
+    // fall back to System32 nvml.dll when DXGI reported no NVIDIA adapters.
+    if (!saw_nvidia_dxgi) {
+        append_win32_nvml_fallback_devices(gpus);
+    }
+    for (std::size_t i = 0; i < gpus.size(); ++i) {
+        gpus[i].id = "gpu:" + std::to_string(i);
     }
     return gpus;
 }
@@ -589,9 +819,20 @@ void append_amdgpu_sysfs_devices(std::vector<GpuDeviceInfo>& gpus) {
 
     std::sort(cards.begin(), cards.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
+    const bool kfd_accessible = (::access("/dev/kfd", R_OK | W_OK) == 0);
+    const char* raw_hip_vis = std::getenv("HIP_VISIBLE_DEVICES");
+    const char* raw_rocr_vis = std::getenv("ROCR_VISIBLE_DEVICES");
+    const std::optional<std::string_view> hip_vis =
+        raw_hip_vis ? std::optional<std::string_view>(raw_hip_vis) : std::nullopt;
+    const std::optional<std::string_view> rocr_vis =
+        raw_rocr_vis ? std::optional<std::string_view>(raw_rocr_vis) : std::nullopt;
+
     const FileReader reader = [](const std::string& path) { return read_small_file(path, 4096); };
+    std::size_t amd_ordinal = 0;
     for (const auto& card : cards) {
-        if (auto gpu = parse_amdgpu_sysfs_device(card.second, reader)) {
+        const bool rocm_ok = kfd_accessible && is_rocm_device_visible(amd_ordinal, hip_vis, rocr_vis);
+        if (auto gpu = parse_amdgpu_sysfs_device(card.second, reader, rocm_ok)) {
+            ++amd_ordinal;
             gpus.push_back(std::move(*gpu));
         }
     }
@@ -604,6 +845,15 @@ struct NvmlMemory {
     unsigned long long total;
     unsigned long long free;
     unsigned long long used;
+};
+struct NvmlPciInfo {
+    char bus_id_legacy[16];
+    unsigned int domain;
+    unsigned int bus;
+    unsigned int device;
+    unsigned int pci_device_id;
+    unsigned int pci_subsystem_id;
+    char bus_id[32];
 };
 
 void append_nvml_gpu_devices(std::vector<GpuDeviceInfo>& gpus) {
@@ -619,7 +869,13 @@ void append_nvml_gpu_devices(std::vector<GpuDeviceInfo>& gpus) {
         ScopedDl& operator=(const ScopedDl&) = delete;
     };
 
-    ScopedDl lib(dlopen("libnvidia-ml.so.1", RTLD_LAZY));
+    void* dl_handle = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+    if (!dl_handle) {
+        // WSL2 mounts host NVIDIA driver libraries under /usr/lib/wsl/lib
+        // alongside /dev/dxg, which is not always in the default loader cache.
+        dl_handle = dlopen("/usr/lib/wsl/lib/libnvidia-ml.so.1", RTLD_LAZY);
+    }
+    ScopedDl lib(dl_handle);
     if (!lib.handle) {
         return;
     }
@@ -632,6 +888,7 @@ void append_nvml_gpu_devices(std::vector<GpuDeviceInfo>& gpus) {
     NvmlReturn (*nvml_get_handle)(unsigned int, NvmlDevice*) = nullptr;
     NvmlReturn (*nvml_get_name)(NvmlDevice, char*, unsigned int) = nullptr;
     NvmlReturn (*nvml_get_memory)(NvmlDevice, NvmlMemory*) = nullptr;
+    NvmlReturn (*nvml_get_pci)(NvmlDevice, NvmlPciInfo*) = nullptr;
 
     if (!load_dl_symbol(lib.handle, "nvmlInit_v2", nvml_init) ||
         !load_dl_symbol(lib.handle, "nvmlShutdown", nvml_shutdown) ||
@@ -640,6 +897,9 @@ void append_nvml_gpu_devices(std::vector<GpuDeviceInfo>& gpus) {
         !load_dl_symbol(lib.handle, "nvmlDeviceGetName", nvml_get_name) ||
         !load_dl_symbol(lib.handle, "nvmlDeviceGetMemoryInfo", nvml_get_memory)) {
         return;
+    }
+    if (!load_dl_symbol(lib.handle, "nvmlDeviceGetPciInfo_v3", nvml_get_pci)) {
+        (void)load_dl_symbol(lib.handle, "nvmlDeviceGetPciInfo", nvml_get_pci);
     }
 
     if (nvml_init() != kNvmlSuccess) {
@@ -679,10 +939,20 @@ void append_nvml_gpu_devices(std::vector<GpuDeviceInfo>& gpus) {
         }
         info.vendor = GpuVendor::nvidia;
         info.vendor_id = 0x10DEu;
+        if (nvml_get_pci) {
+            NvmlPciInfo pci{};
+            if (nvml_get_pci(device, &pci) == kNvmlSuccess) {
+                info.device_id = static_cast<std::uint32_t>(pci.pci_device_id >> 16);
+            }
+        }
         NvmlMemory mem{};
         if (nvml_get_memory(device, &mem) == kNvmlSuccess) {
             info.dedicated_total = MemoryReading::known(static_cast<std::uint64_t>(mem.total));
-            info.dedicated_free = MemoryReading::known(static_cast<std::uint64_t>(mem.free));
+            // Older WSL2 WDDM-paravirt drivers report total > 0 with free=0, used=0;
+            // keep dedicated_free unknown in that case so callers fall back to total.
+            if (mem.total == 0 || mem.free > 0 || mem.used > 0) {
+                info.dedicated_free = MemoryReading::known(static_cast<std::uint64_t>(mem.free));
+            }
         }
         info.is_integrated_uma = false;
         info.backend_hint = "cuda";
@@ -897,7 +1167,50 @@ std::vector<DeviceInfo> enumerate_devices() {
     return {cpu};
 }
 
+bool is_rocm_device_visible(std::size_t amd_ordinal,
+                            std::optional<std::string_view> hip_visible_devices,
+                            std::optional<std::string_view> rocr_visible_devices) noexcept {
+    std::size_t current = amd_ordinal;
+    if (rocr_visible_devices.has_value()) {
+        const auto mapped = map_rocm_visible_ordinal(current, *rocr_visible_devices);
+        if (!mapped) {
+            return false;
+        }
+        current = *mapped;
+    }
+    if (hip_visible_devices.has_value()) {
+        if (!map_rocm_visible_ordinal(current, *hip_visible_devices)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string resolve_windows_gpu_backend_hint(GpuVendor vendor, bool is_integrated_uma, bool hip_sdk_available,
+                                             std::size_t amd_ordinal,
+                                             std::optional<std::string_view> hip_visible_devices,
+                                             std::optional<std::string_view> rocr_visible_devices) {
+    switch (vendor) {
+        case GpuVendor::nvidia: return "cuda";
+        case GpuVendor::amd:
+            if (!is_integrated_uma && hip_sdk_available &&
+                is_rocm_device_visible(amd_ordinal, hip_visible_devices, rocr_visible_devices)) {
+                return "rocm";
+            }
+            return "vulkan";
+        case GpuVendor::intel: return "vulkan";
+        case GpuVendor::apple: return "metal";
+        case GpuVendor::unknown: return {};
+    }
+    return {};
+}
+
 std::optional<GpuDeviceInfo> parse_amdgpu_sysfs_device(std::string_view card_id, const FileReader& read_file) {
+    return parse_amdgpu_sysfs_device(card_id, read_file, true);
+}
+
+std::optional<GpuDeviceInfo> parse_amdgpu_sysfs_device(std::string_view card_id, const FileReader& read_file,
+                                                       bool rocm_available) {
     if (card_id.empty() || !read_file) {
         return std::nullopt;
     }
@@ -1026,7 +1339,7 @@ std::optional<GpuDeviceInfo> parse_amdgpu_sysfs_device(std::string_view card_id,
         info.dedicated_free = MemoryReading::known(saturating_add(vram_free, gtt_free));
     }
 
-    info.backend_hint = "rocm";
+    info.backend_hint = rocm_available ? "rocm" : "vulkan";
     info.source = "amdgpu-sysfs";
     return info;
 }
