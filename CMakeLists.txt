@@ -88,6 +88,8 @@ target_link_libraries(sonder_inference PUBLIC Threads::Threads)
 if(WIN32)
     target_link_libraries(sonder_inference PRIVATE ws2_32 advapi32)
     target_compile_definitions(sonder_inference PRIVATE _WIN32_WINNT=0x0A00)
+elseif(UNIX AND NOT APPLE)
+    target_link_libraries(sonder_inference PRIVATE ${CMAKE_DL_LIBS})
 endif()
 sonder_set_warnings(sonder_inference)
 

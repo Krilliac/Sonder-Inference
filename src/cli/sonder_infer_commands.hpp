@@ -135,11 +135,36 @@ inline const CommandSpec& version_command() {
 inline const CommandSpec& devices_command() {
     using namespace commands_detail;
     static const CommandSpec spec{"devices",
-                                  "list host devices (CPU and memory inventory)",
+                                  "list host devices (CPU, memory and GPU inventory)",
                                   {"devices [--json]"},
                                   {output_json()},
                                   {kExitNote},
                                   {"devices", "devices --json"}};
+    return spec;
+}
+
+inline const CommandSpec& plan_command() {
+    using namespace commands_detail;
+    static const CommandSpec spec{
+        "plan",
+        "plan hardware placement and a launch profile for a GGUF model (no model load)",
+        {"plan --model GGUF [options]"},
+        {{"Placement",
+          {{"model", OptionKind::value, "GGUF", "local GGUF model file (required)"},
+           {"mmproj", OptionKind::value, "PATH", "optional multimodal projector GGUF"},
+           {"name", OptionKind::value, "NAME", "profile name in the generated LaunchProfile (default planned)"},
+           {"ctx", OptionKind::value, "N", "target context size in tokens (default 32768; clamped to model max)"},
+           {"min-ctx", OptionKind::value, "N", "minimum context size before partial offload (default 8192)"},
+           {"parallel", OptionKind::value, "N", "parallel request slots (default 1)"},
+           {"headroom-mib", OptionKind::value, "N", "VRAM reserve in MiB per discrete GPU (default 1536)"},
+           {"device", OptionKind::value, "HINT", "device hint: CUDA0, ROCm0, Vulkan0, gpu:0, uma, multi, cpu"},
+           {"total-vram", OptionKind::flag, "", "size against total VRAM instead of live free VRAM"},
+           {"no-quantized-kv", OptionKind::flag, "", "keep f16 KV cache instead of q8_0/q4_0"},
+           {"no-speculative", OptionKind::flag, "", "disable automatic MTP / ngram-mod speculative decoding"},
+           {"no-moe-offload", OptionKind::flag, "", "disable automatic --n-cpu-moe selective expert offload"}}},
+         output_json()},
+        {"Reads only the GGUF header plus live GPU and host memory inventory; no weights are loaded.", kExitNote},
+        {"plan --model model.gguf --json", "plan --model model.gguf --ctx 32768 --device CUDA0"}};
     return spec;
 }
 
@@ -310,9 +335,10 @@ inline const CommandSpec& help_command() {
 
 // All commands, in display order.
 inline const std::vector<const CommandSpec*>& all_commands() {
-    static const std::vector<const CommandSpec*> list{&generate_command(), &chat_command(),     &serve_command(),
-                                                      &bench_command(),    &models_command(),   &backends_command(),
-                                                      &devices_command(),  &version_command(),  &tune_command(), &weights_command(), &help_command()};
+    static const std::vector<const CommandSpec*> list{
+        &generate_command(), &chat_command(),    &serve_command(),   &bench_command(),
+        &models_command(),   &backends_command(), &devices_command(), &plan_command(),
+        &version_command(),  &tune_command(),    &weights_command(), &help_command()};
     return list;
 }
 

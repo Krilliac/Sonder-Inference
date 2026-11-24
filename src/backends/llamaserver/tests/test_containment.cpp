@@ -989,3 +989,83 @@ TEST_CASE("containment: AMD ROCm and Vulkan tuning env vars are allowed while fo
     CHECK(values_named(entries, "AMD_API_KEY").empty());
     CHECK(values_named(entries, "ROCM_TOKEN").empty());
 }
+
+TEST_CASE("containment: GPU loader hooks, log-file hooks and expanded credential suffixes are refused and stripped") {
+    const std::vector<std::string> blocked_vars = {
+        // Arbitrary library / layer / driver loaders
+        "GGML_BACKEND_PATH",
+        "CUDA_INJECTION64_PATH",
+        "CUDA_INJECTION32_PATH",
+        "HSA_TOOLS_LIB",
+        "VK_LAYER_PATH",
+        "VK_ADD_LAYER_PATH",
+        "VK_INSTANCE_LAYERS",
+        "VK_LOADER_LAYERS_ENABLE",
+        "VK_DRIVER_FILES",
+        "VK_ADD_DRIVER_FILES",
+        "MESA_LOADER_DRIVER_OVERRIDE",
+        // Arbitrary file-write log hooks
+        "AMD_LOG_LEVEL_FILE",
+        "HIPBLASLT_LOG_FILE",
+        "ROCBLAS_LOG_TRACE_PATH",
+        "ROCBLAS_LOG_BENCH_PATH",
+        // Expanded credential / proxy / certificate suffixes under GPU prefixes
+        "AMD_SECRET_KEY",
+        "AMD_APIKEY",
+        "AMD_ACCESS_KEY",
+        "AMD_PRIVATE_KEY",
+        "AMD_AUTH",
+        "AMD_AUTH_KEY",
+        "AMD_PASSWD",
+        "AMD_PASS",
+        "AMD_CREDENTIAL",
+        "AMD_CREDENTIALS",
+        "AMD_BEARER",
+        "AMD_HTTP_PROXY",
+        "AMD_CERT_FILE",
+        "AMD_CA_BUNDLE",
+        // Lowercase variants
+        "ggml_backend_path",
+        "amd_log_level_file",
+        "rocblas_log_trace_path",
+    };
+    for (const auto &key : blocked_vars) {
+        CAPTURE(key);
+        CHECK_FALSE(ls::is_allowed_profile_env_override(key));
+        CHECK_FALSE(ls::is_allowed_inherited_env_name(std::string_view(key)));
+        CHECK(ls::validate_process_environment({{key, "/tmp/evil"}}).code() == ErrorCode::invalid_argument);
+#if defined(SONDER_HAS_SERVER)
+        const std::string obj = "{" + json_string(key) + ":\"/tmp/evil\"}";
+        CHECK(decision_of(config_status(spawn_config(obj))) == Decision::refused);
+#endif
+    }
+
+    // Inherited parent hooks and expanded credential/proxy vars must be stripped
+    // while VK_ICD_FILENAMES and AMD_LOG_LEVEL remain allowed.
+    ScopedParentEnv ggml_path("GGML_BACKEND_PATH", std::string("/tmp/evil"));
+    ScopedParentEnv cuda_inj("CUDA_INJECTION64_PATH", std::string("/tmp/evil.so"));
+    ScopedParentEnv hsa_tools("HSA_TOOLS_LIB", std::string("/tmp/evil.so"));
+    ScopedParentEnv vk_layer("VK_LAYER_PATH", std::string("/tmp/layers"));
+    ScopedParentEnv amd_log_file("AMD_LOG_LEVEL_FILE", std::string("/tmp/out.log"));
+    ScopedParentEnv rocblas_log("ROCBLAS_LOG_TRACE_PATH", std::string("/tmp/trace.log"));
+    ScopedParentEnv amd_secret_key("AMD_SECRET_KEY", std::string("s3cr3t"));
+    ScopedParentEnv amd_proxy("AMD_HTTP_PROXY", std::string("http://evil.invalid:3128"));
+    ScopedParentEnv vk_icd("VK_ICD_FILENAMES", std::string("/usr/share/vulkan/icd.d/radeon_icd.json"));
+    ScopedParentEnv amd_level("AMD_LOG_LEVEL", std::string("1"));
+
+    ls::ProcessSpec spec;
+    ls::ProcessOptions prepared;
+    REQUIRE(prepared.prepare(spec).ok());
+    const auto entries = prepared_entries(prepared);
+    CHECK(values_named(entries, "GGML_BACKEND_PATH").empty());
+    CHECK(values_named(entries, "CUDA_INJECTION64_PATH").empty());
+    CHECK(values_named(entries, "HSA_TOOLS_LIB").empty());
+    CHECK(values_named(entries, "VK_LAYER_PATH").empty());
+    CHECK(values_named(entries, "AMD_LOG_LEVEL_FILE").empty());
+    CHECK(values_named(entries, "ROCBLAS_LOG_TRACE_PATH").empty());
+    CHECK(values_named(entries, "AMD_SECRET_KEY").empty());
+    CHECK(values_named(entries, "AMD_HTTP_PROXY").empty());
+    CHECK(values_named(entries, "VK_ICD_FILENAMES") ==
+          std::vector<std::string>{"/usr/share/vulkan/icd.d/radeon_icd.json"});
+    CHECK(values_named(entries, "AMD_LOG_LEVEL") == std::vector<std::string>{"1"});
+}

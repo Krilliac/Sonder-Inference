@@ -3,13 +3,42 @@
 #pragma once
 
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "sonder/inference/backends/llamaserver.hpp"
+#include "sonder/inference/device.hpp"
+#include "sonder/inference/json.hpp"
 #include "supervisor.hpp"
 
 namespace sonder::inference::llamaserver {
 
+// True when `mode` is one of "on", "off", "auto", "true", "false".
+bool is_valid_uma_mode(std::string_view mode) noexcept;
+
+// Extracts the last --device / -dev argument value from `args`, or empty view.
+std::string_view extract_device_hint(const std::vector<std::string> &args) noexcept;
+
+// Pure UMA mode resolver:
+//  - "on" / "true"   -> true
+//  - "off" / "false" -> false
+//  - "auto"          -> true only when `gpus` is non-empty and the selected
+//                       GPU(s) (honoring `device_hint`, or preferring discrete
+//                       over integrated UMA when unset) are all integrated UMA.
+bool resolve_uma_mode(std::string_view mode_or_auto,
+                      const std::vector<GpuDeviceInfo> &gpus,
+                      std::string_view device_hint = {}) noexcept;
+
+// Parse a JSON boolean (true/false) or string ("auto", "on", "off", "true",
+// "false") into the canonical UMA mode setting ("on", "off", or "auto").
+Status parse_uma_mode_json(const json::Value &value, std::string &out);
+
 SpillGuardOptions to_spill_guard_options(const LlamaServerSpillGuardOptions &o);
+SpillGuardOptions to_spill_guard_options(const LlamaServerSpillGuardOptions &o,
+                                         const std::vector<std::string> &args);
+SpillGuardOptions to_spill_guard_options(const LlamaServerSpillGuardOptions &o,
+                                         const std::vector<std::string> &args,
+                                         const std::vector<GpuDeviceInfo> &gpus);
 
 // False when the policy name is unknown; `out` is then left partly filled.
 bool to_host_memory_options(const LlamaServerHostMemoryOptions &o, HostMemoryOptions &out);

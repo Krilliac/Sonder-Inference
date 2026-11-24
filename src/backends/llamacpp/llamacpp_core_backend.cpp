@@ -1,6 +1,7 @@
 // Adapter: sonder::inference::Backend over the llama.cpp runtime wrapper.
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <filesystem>
 #include <mutex>
 #include <string>
@@ -14,6 +15,35 @@
 #include "llamacpp_internal.hpp"
 
 namespace sonder::inference {
+
+namespace llamacpp_detail {
+
+// Resolves LoadOptions::n_gpu_layers from backend options and a load request's
+// device_id. Explicit "cpu:*" always uses 0; "gpu:*" requires a GPU backend
+// and uses options.gpu_layers; empty device_id honors options.gpu_layers when
+// explicit ggml devices are configured, otherwise defaults to 0 (CPU).
+Result<std::int32_t> ResolveGpuLayers(const LlamaCppBackendOptions& options, std::string_view device_id,
+                                      bool has_gpu_backend);
+
+Result<std::int32_t> ResolveGpuLayers(const LlamaCppBackendOptions& options, std::string_view device_id,
+                                      bool has_gpu_backend) {
+    if (device_id.rfind("cpu", 0) == 0) {
+        return std::int32_t{0};
+    }
+    if (device_id.empty()) {
+        return options.devices.empty() ? std::int32_t{0} : options.gpu_layers;
+    }
+    if (device_id.rfind("gpu", 0) == 0) {
+        if (!has_gpu_backend) {
+            return Status(ErrorCode::unsupported, "this llama.cpp build has no GPU backend");
+        }
+        return options.gpu_layers;
+    }
+    return Status(ErrorCode::unsupported, "unsupported device id for llamacpp: " + std::string(device_id));
+}
+
+}  // namespace llamacpp_detail
+
 namespace {
 
 namespace lc = sonder::backends::llamacpp;
@@ -295,18 +325,15 @@ public:
             lo.tensor_overrides.push_back({pattern, device});
         }
         const std::string_view dev = options.device_id;
-        if (dev.empty() || dev.rfind("cpu", 0) == 0) {
-            lo.n_gpu_layers = 0;
-        } else if (dev.rfind("gpu", 0) == 0) {
-            bool has_gpu = false;
+        bool has_gpu = false;
+        if (dev.rfind("gpu", 0) == 0) {
             for (const auto& d : lc::LlamaCppBackend::EnumerateDevices()) {
                 has_gpu = has_gpu || d.kind == lc::DeviceKind::kGpu || d.kind == lc::DeviceKind::kIntegratedGpu;
             }
-            if (!has_gpu) return Status(ErrorCode::unsupported, "this llama.cpp build has no GPU backend");
-            lo.n_gpu_layers = options_.gpu_layers;
-        } else {
-            return Status(ErrorCode::unsupported, "unsupported device id for llamacpp: " + options.device_id);
         }
+        const auto gpu_layers = llamacpp_detail::ResolveGpuLayers(options_, dev, has_gpu);
+        if (!gpu_layers.ok()) return gpu_layers.status();
+        lo.n_gpu_layers = gpu_layers.value();
 
         lc::LlamaCppBackend runtime;
         double load_ms = 0.0;

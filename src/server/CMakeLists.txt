@@ -17,6 +17,7 @@ sonder_module_sources(
     src/log_queue.cpp
     src/moe_placement.cpp
     src/openai.cpp
+    src/placement_planner.cpp
     src/priority_admission.cpp
     src/residency.cpp
     src/request_path.cpp
@@ -57,7 +58,8 @@ sonder_add_module_tests(server
     tests/test_launch_profile.cpp
     tests/test_moe_placement.cpp
     tests/test_gguf_artifact_observation.cpp
-    tests/test_ternary_gguf.cpp)
+    tests/test_ternary_gguf.cpp
+    tests/test_placement_planner.cpp)
 if(TARGET sonder_server_tests)
     target_include_directories(sonder_server_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     # GCC 13 raises a false -Wmaybe-uninitialized (fatal under -Werror) from <string> when a

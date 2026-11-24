@@ -4,6 +4,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -26,6 +27,7 @@
 #endif
 
 #include "server_test_support.hpp"
+#include "src/health_features.hpp"
 
 using namespace server_test;
 namespace json = sonder::inference::json;
@@ -621,4 +623,238 @@ TEST_CASE("serve: models keep the default device unless --device is given") {
         REQUIRE_FALSE(loaded.empty());
         CHECK(loaded.front().find("device_id")->as_string() == "cpu:0");
     }
+}
+
+TEST_CASE("health: gpu_inventory_json serializes discrete NVIDIA, AMD RX XT, Ryzen APU UMA and unknown readings") {
+    constexpr std::uint64_t kMiB = 1024ull * 1024ull;
+    constexpr std::uint64_t kGiB = 1024ull * kMiB;
+
+    // Headless / 0-GPU host serializes to an empty JSON array.
+    const json::Array empty = det::gpu_inventory_json({});
+    CHECK(empty.empty());
+
+    si::GpuDeviceInfo rtx;
+    rtx.id = "gpu:0";
+    rtx.name = "NVIDIA GeForce RTX 5070 Ti";
+    rtx.vendor = si::GpuVendor::nvidia;
+    rtx.vendor_id = 0x10DEu;
+    rtx.device_id = 0x2C05u;
+    rtx.dedicated_total = si::MemoryReading::known(16303ull * kMiB);
+    rtx.dedicated_free = si::MemoryReading::known(14800ull * kMiB);
+    rtx.shared_total = si::MemoryReading::known(16ull * kGiB);
+    rtx.is_integrated_uma = false;
+    rtx.backend_hint = "cuda";
+    rtx.source = "dxgi";
+
+    si::GpuDeviceInfo rx_xt;
+    rx_xt.id = "gpu:1";
+    rx_xt.name = "AMD Radeon RX 7900 XT";
+    rx_xt.vendor = si::GpuVendor::amd;
+    rx_xt.vendor_id = 0x1002u;
+    rx_xt.device_id = 0x744Cu;
+    rx_xt.dedicated_total = si::MemoryReading::known(20ull * kGiB);
+    rx_xt.dedicated_free = si::MemoryReading::known(18ull * kGiB);
+    rx_xt.shared_total = si::MemoryReading::known(16ull * kGiB);
+    rx_xt.is_integrated_uma = false;
+    rx_xt.backend_hint = "rocm";
+    rx_xt.source = "amdgpu-sysfs";
+
+    si::GpuDeviceInfo ryzen_apu;
+    ryzen_apu.id = "gpu:2";
+    ryzen_apu.name = "AMD Radeon 780M Graphics";
+    ryzen_apu.vendor = si::GpuVendor::amd;
+    ryzen_apu.vendor_id = 0x1002u;
+    ryzen_apu.device_id = 0x15BFu;
+    ryzen_apu.dedicated_total = si::MemoryReading::known(512ull * kMiB);
+    ryzen_apu.dedicated_free = si::MemoryReading::known(384ull * kMiB + 14ull * kGiB);
+    ryzen_apu.shared_total = si::MemoryReading::known(16ull * kGiB);
+    ryzen_apu.is_integrated_uma = true;
+    ryzen_apu.backend_hint = "rocm";
+    ryzen_apu.source = "amdgpu-sysfs";
+
+    si::GpuDeviceInfo ryzen_apu_no_free = ryzen_apu;
+    ryzen_apu_no_free.id = "gpu:3";
+    ryzen_apu_no_free.dedicated_free = si::MemoryReading::unknown();
+
+    si::GpuDeviceInfo unknown_mem;
+    unknown_mem.id = "gpu:4";
+    unknown_mem.name = "Unknown Adapter";
+    unknown_mem.vendor = si::GpuVendor::unknown;
+    unknown_mem.vendor_id = 0u;
+    unknown_mem.device_id = 0u;
+    unknown_mem.dedicated_total = si::MemoryReading::unknown();
+    unknown_mem.dedicated_free = si::MemoryReading::unknown();
+    unknown_mem.shared_total = si::MemoryReading::unknown();
+    unknown_mem.is_integrated_uma = false;
+    unknown_mem.backend_hint = "";
+    unknown_mem.source = "dxgi";
+
+    si::GpuDeviceInfo zero_free;
+    zero_free.id = "gpu:5";
+    zero_free.name = "NVIDIA GeForce RTX 4070";
+    zero_free.vendor = si::GpuVendor::nvidia;
+    zero_free.vendor_id = 0x10DEu;
+    zero_free.device_id = 0x2786u;
+    zero_free.dedicated_total = si::MemoryReading::known(12ull * kGiB);
+    zero_free.dedicated_free = si::MemoryReading::known(0u);
+    zero_free.shared_total = si::MemoryReading::unknown();
+    zero_free.is_integrated_uma = false;
+    zero_free.backend_hint = "cuda";
+    zero_free.source = "nvml";
+
+    const json::Array serialized =
+        det::gpu_inventory_json({rtx, rx_xt, ryzen_apu, ryzen_apu_no_free, unknown_mem, zero_free});
+    const auto parsed = json::parse(json::Value(serialized).dump());
+    REQUIRE_MESSAGE(parsed.ok(), parsed.status().to_string());
+    REQUIRE(parsed.value().is_array());
+    const auto& arr = parsed.value().as_array();
+    REQUIRE(arr.size() == 6u);
+
+    // 0: Discrete NVIDIA RTX
+    const auto& j_rtx = arr[0];
+    REQUIRE(j_rtx.is_object());
+    CHECK(j_rtx.as_object().size() == 13u);
+    CHECK(j_rtx.find("id")->as_string() == "gpu:0");
+    CHECK(j_rtx.find("name")->as_string() == "NVIDIA GeForce RTX 5070 Ti");
+    CHECK(j_rtx.find("vendor")->as_string() == "nvidia");
+    CHECK(j_rtx.find("vendor_id")->as_uint() == 0x10DEu);
+    CHECK(j_rtx.find("device_id")->as_uint() == 0x2C05u);
+    CHECK(j_rtx.find("dedicated_total_mib")->as_uint() == 16303ull);
+    CHECK(j_rtx.find("dedicated_free_mib")->as_uint() == 14800ull);
+    CHECK(j_rtx.find("shared_total_mib")->as_uint() == 16384ull);
+    CHECK(j_rtx.find("effective_vram_mib")->as_uint() == 16303ull);
+    CHECK(j_rtx.find("effective_free_vram_mib")->as_uint() == 14800ull);
+    CHECK_FALSE(j_rtx.find("is_integrated_uma")->as_bool());
+    CHECK(j_rtx.find("backend_hint")->as_string() == "cuda");
+    CHECK(j_rtx.find("source")->as_string() == "dxgi");
+
+    // 1: Discrete AMD RX XT
+    const auto& j_rx = arr[1];
+    CHECK(j_rx.find("id")->as_string() == "gpu:1");
+    CHECK(j_rx.find("name")->as_string() == "AMD Radeon RX 7900 XT");
+    CHECK(j_rx.find("vendor")->as_string() == "amd");
+    CHECK(j_rx.find("vendor_id")->as_uint() == 0x1002u);
+    CHECK(j_rx.find("device_id")->as_uint() == 0x744Cu);
+    CHECK(j_rx.find("dedicated_total_mib")->as_uint() == 20480ull);
+    CHECK(j_rx.find("dedicated_free_mib")->as_uint() == 18432ull);
+    CHECK(j_rx.find("shared_total_mib")->as_uint() == 16384ull);
+    CHECK(j_rx.find("effective_vram_mib")->as_uint() == 20480ull);
+    CHECK(j_rx.find("effective_free_vram_mib")->as_uint() == 18432ull);
+    CHECK_FALSE(j_rx.find("is_integrated_uma")->as_bool());
+    CHECK(j_rx.find("backend_hint")->as_string() == "rocm");
+    CHECK(j_rx.find("source")->as_string() == "amdgpu-sysfs");
+
+    // 2: Integrated AMD Ryzen 780M APU UMA (dedicated carveout + GTT pool)
+    const auto& j_apu = arr[2];
+    CHECK(j_apu.find("id")->as_string() == "gpu:2");
+    CHECK(j_apu.find("name")->as_string() == "AMD Radeon 780M Graphics");
+    CHECK(j_apu.find("vendor")->as_string() == "amd");
+    CHECK(j_apu.find("vendor_id")->as_uint() == 0x1002u);
+    CHECK(j_apu.find("device_id")->as_uint() == 0x15BFu);
+    CHECK(j_apu.find("dedicated_total_mib")->as_uint() == 512ull);
+    CHECK(j_apu.find("dedicated_free_mib")->as_uint() == 14720ull);
+    CHECK(j_apu.find("shared_total_mib")->as_uint() == 16384ull);
+    CHECK(j_apu.find("effective_vram_mib")->as_uint() == 16896ull);
+    CHECK(j_apu.find("effective_free_vram_mib")->as_uint() == 14720ull);
+    CHECK(j_apu.find("is_integrated_uma")->as_bool());
+    CHECK(j_apu.find("backend_hint")->as_string() == "rocm");
+    CHECK(j_apu.find("source")->as_string() == "amdgpu-sysfs");
+
+    // 3: Integrated UMA with unknown free reading falls back to full UMA pool for effective_free_vram_mib
+    const auto& j_apu_no_free = arr[3];
+    CHECK(j_apu_no_free.find("dedicated_free_mib")->is_null());
+    CHECK(j_apu_no_free.find("effective_vram_mib")->as_uint() == 16896ull);
+    CHECK(j_apu_no_free.find("effective_free_vram_mib")->as_uint() == 16896ull);
+
+    // 4: Unknown memory readings serialize strictly as JSON null
+    const auto& j_unknown = arr[4];
+    CHECK(j_unknown.find("vendor")->as_string() == "unknown");
+    CHECK(j_unknown.find("vendor_id")->as_uint() == 0u);
+    CHECK(j_unknown.find("device_id")->as_uint() == 0u);
+    CHECK(j_unknown.find("dedicated_total_mib")->is_null());
+    CHECK(j_unknown.find("dedicated_free_mib")->is_null());
+    CHECK(j_unknown.find("shared_total_mib")->is_null());
+    CHECK(j_unknown.find("effective_vram_mib")->is_null());
+    CHECK(j_unknown.find("effective_free_vram_mib")->is_null());
+    CHECK_FALSE(j_unknown.find("is_integrated_uma")->as_bool());
+    CHECK(j_unknown.find("backend_hint")->as_string().empty());
+    CHECK(j_unknown.find("source")->as_string() == "dxgi");
+
+    // 5: Known-zero free VRAM stays integer 0 (distinct from unknown null)
+    const auto& j_zero = arr[5];
+    CHECK(j_zero.find("dedicated_total_mib")->as_uint() == 12288ull);
+    REQUIRE(j_zero.find("dedicated_free_mib")->is_integer());
+    CHECK(j_zero.find("dedicated_free_mib")->as_uint() == 0ull);
+    CHECK(j_zero.find("shared_total_mib")->is_null());
+    CHECK(j_zero.find("effective_vram_mib")->as_uint() == 12288ull);
+    REQUIRE(j_zero.find("effective_free_vram_mib")->is_integer());
+    CHECK(j_zero.find("effective_free_vram_mib")->as_uint() == 0ull);
+}
+
+TEST_CASE("health: additive gpus inventory array is present and well-formed on any host") {
+    Fixture f;
+    const Reply r = get(f.port, "/v1/sonder/health");
+    REQUIRE(r.status == 200);
+    const json::Value h = r.json();
+
+    const json::Value* gpus = h.find("gpus");
+    REQUIRE(gpus != nullptr);
+    REQUIRE(gpus->is_array());
+    for (const auto& entry : gpus->as_array()) {
+        REQUIRE(entry.is_object());
+        const auto* id = entry.find("id");
+        const auto* name = entry.find("name");
+        const auto* vendor = entry.find("vendor");
+        const auto* vendor_id = entry.find("vendor_id");
+        const auto* device_id = entry.find("device_id");
+        const auto* ded_total = entry.find("dedicated_total_mib");
+        const auto* ded_free = entry.find("dedicated_free_mib");
+        const auto* shared_total = entry.find("shared_total_mib");
+        const auto* eff_total = entry.find("effective_vram_mib");
+        const auto* eff_free = entry.find("effective_free_vram_mib");
+        const auto* uma = entry.find("is_integrated_uma");
+        const auto* hint = entry.find("backend_hint");
+        const auto* source = entry.find("source");
+        REQUIRE(id != nullptr);
+        REQUIRE(name != nullptr);
+        REQUIRE(vendor != nullptr);
+        REQUIRE(vendor_id != nullptr);
+        REQUIRE(device_id != nullptr);
+        REQUIRE(ded_total != nullptr);
+        REQUIRE(ded_free != nullptr);
+        REQUIRE(shared_total != nullptr);
+        REQUIRE(eff_total != nullptr);
+        REQUIRE(eff_free != nullptr);
+        REQUIRE(uma != nullptr);
+        REQUIRE(hint != nullptr);
+        REQUIRE(source != nullptr);
+        CHECK(id->is_string());
+        CHECK_FALSE(id->as_string().empty());
+        CHECK(name->is_string());
+        CHECK(vendor->is_string());
+        CHECK_FALSE(vendor->as_string().empty());
+        CHECK(vendor_id->is_integer());
+        CHECK(device_id->is_integer());
+        CHECK((ded_total->is_null() || ded_total->is_integer()));
+        CHECK((ded_free->is_null() || ded_free->is_integer()));
+        CHECK((shared_total->is_null() || shared_total->is_integer()));
+        CHECK((eff_total->is_null() || eff_total->is_integer()));
+        CHECK((eff_free->is_null() || eff_free->is_integer()));
+        CHECK(uma->is_bool());
+        CHECK(hint->is_string());
+        CHECK(source->is_string());
+        CHECK_FALSE(source->as_string().empty());
+    }
+
+    // Adding `gpus` to /v1/sonder/health must not alter `sonder` metadata on /v1/health or /v1/models.
+    const json::Value* sonder_meta = h.find("sonder");
+    REQUIRE(sonder_meta != nullptr);
+    CHECK(sonder_meta->find("features")->is_array());
+    CHECK(sonder_meta->find("features")->as_array().empty());
+    CHECK(sonder_meta->find("pins") != nullptr);
+
+    const Reply models_reply = get(f.port, "/v1/models");
+    REQUIRE(models_reply.status == 200);
+    const auto models_doc = models_reply.json();
+    CHECK(models_doc.find("sonder")->as_object().size() == 3u);
 }

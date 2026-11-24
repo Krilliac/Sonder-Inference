@@ -88,6 +88,9 @@ struct BackendSetup {
     std::uint64_t llamaserver_fit_step_align = 1024;
     std::uint64_t llamaserver_fit_min_ctx = 8192;
     std::uint64_t llamaserver_fit_max_attempts = 4;
+    // Integrated UMA mode ("off", "on", or "auto"; default "off" preserves
+    // discrete-GPU behavior). Propagates to residency unless overridden there.
+    std::string llamaserver_spill_uma_mode = "off";
     // Spawn/attach child stall watchdog (JSON "stall_guard").
     bool llamaserver_stall_guard = true;
     std::uint64_t llamaserver_stall_seconds = 90;
@@ -112,6 +115,8 @@ struct BackendSetup {
         std::uint64_t eviction_mib = 2048;
         std::string on_eviction = "warn";
         std::uint64_t max_eviction_restarts = 1;
+        // Empty inherits llamaserver_spill_uma_mode; otherwise "off", "on", or "auto".
+        std::string uma_mode;
     } llamaserver_residency;
     // Spawn-mode host RAM admission and floor guard (JSON "host_memory").
     // The two estimate fields are not read from JSON: serve fills them from

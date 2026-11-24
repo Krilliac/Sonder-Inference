@@ -288,8 +288,12 @@ TEST_CASE("tune dry run never opens model or executable and respects CLI errors"
     std::ostringstream out, err;
     CHECK(tune::tune_main({"--executable", "does-not-exist.exe", "--model", "absent.gguf", "--dry-run",
         "--grid", R"({"kv":[["q4_0","q4_0"]],"ctx":[65536],"ubatch":[512],"mtp":[0]})"}, out, err) == 0);
-    CHECK(out.str().find("| q4_0/q4_0 | 65536 | 512 | 0 | none | 0 |") != std::string::npos);
+    CHECK(out.str().find("| q4_0/q4_0 | on | 65536 | 512 | 0 | none | - |") != std::string::npos);
     CHECK(err.str().empty());
+    out.str("");
+    CHECK(tune::tune_main({"--executable", "does-not-exist.exe", "--model", "absent.gguf", "--dry-run",
+        "--grid", R"({"kv":[["f16","f16"]],"flash_attn":["on","auto"],"ctx":[65536],"ubatch":[512],"mtp":[0,2],"spec_type":["ngram-mod"]})"}, out, err) == 0);
+    CHECK(out.str().find("| f16/f16 | auto | 65536 | 512 | 2 | ngram-mod | - |") != std::string::npos);
     CHECK(tune::tune_main({"--nonsense", "--help"}, out, err) == 0);
     for (const auto &args : std::vector<std::vector<std::string>>{
             {"--dry-run"}, {"--executable", "x", "--model", "m", "--budget-minutes", "nan", "--dry-run"},
@@ -323,6 +327,12 @@ TEST_CASE("tune MTP help gate requires the spec type section and draft limit fla
     CHECK_FALSE(tune::help_supports_mtp("--spec-type none\n  --other draft-mtp\n--spec-draft-n-max N\n"));
     CHECK_FALSE(tune::help_supports_mtp("--spec-type draft-mtp\n"));
     CHECK_FALSE(tune::help_supports_mtp("--spec-typex draft-mtp\n--spec-draft-n-max N\n"));
+
+    // --spec-type support is detected independently of draft-mtp support (e.g. ngram-mod-only builds).
+    CHECK(tune::help_supports_spec_type("--spec-type TYPE\n    possible: none, ngram-mod\n"));
+    CHECK(tune::help_supports_spec_type("  -s, --spec-type=TYPE\n"));
+    CHECK_FALSE(tune::help_supports_spec_type("--spec-typex TYPE\n"));
+    CHECK_FALSE(tune::help_supports_spec_type("--other-flag\n"));
 }
 
 TEST_CASE("tune MTP grid enumerates spec type and p-min cross product while baseline stays singular") {
@@ -485,50 +495,85 @@ TEST_CASE("tune supports standalone ngram-mod speculation without MTP tensors") 
     REQUIRE_MESSAGE(grid_res.ok(), grid_res.status().message());
     const auto &grid = grid_res.value();
 
-    // Non-MTP models (mtp_available == false) still plan baseline + ngram-mod candidates.
+    // Non-MTP models (mtp_available == false) plan baseline + standalone ngram-mod
+    // without multiplying ngram-mod by p_min.
     const auto planned = tune::planned_candidates(grid, false);
-    REQUIRE(planned.size() == 6); // 2 ctx * (1 baseline + 2 ngram-mod p_min values)
+    REQUIRE(planned.size() == 4); // 2 ctx * (1 baseline + 1 standalone ngram-mod)
     CHECK(std::count_if(planned.begin(), planned.end(), [](const auto &c) { return c.mtp == 0; }) == 2);
     CHECK(std::count_if(planned.begin(), planned.end(), [](const auto &c) {
         return c.mtp == 2 && c.spec_type == "ngram-mod";
-    }) == 4);
+    }) == 2);
 
-    // Mixed draft-mtp + ngram-mod skips draft-mtp when mtp_available is false.
+    // Mixed draft-mtp + ngram-mod skips draft-mtp when mtp_available is false,
+    // and only multiplies draft-mtp variants by p_min when mtp_available is true.
     tune::Grid mixed = grid;
     mixed.ctx = {65536};
     mixed.spec_type = {"draft-mtp", "draft-mtp,ngram-mod", "ngram-mod"};
     REQUIRE(tune::validate_grid(mixed).ok());
     const auto gated = tune::planned_candidates(mixed, false);
-    REQUIRE(gated.size() == 3); // 1 baseline + 2 ngram-mod
+    REQUIRE(gated.size() == 2); // 1 baseline + 1 standalone ngram-mod
     for (const auto &c : gated) {
         if (c.mtp != 0) CHECK(c.spec_type == "ngram-mod");
     }
+    const auto all_with_mtp = tune::planned_candidates(mixed, true);
+    CHECK(all_with_mtp.size() == 6); // 1 baseline + 2 draft-mtp + 2 hybrid + 1 standalone ngram-mod
 
+    // uses_mtp, spill_guard_for, and Candidate::operator== distinguish baseline,
+    // standalone ngram-mod, and MTP cleanly.
+    const tune::Candidate base_a{{"q4_0", "q4_0"}, 65536, 512, 0, "draft-mtp", 0.0};
+    const tune::Candidate base_b{{"q4_0", "q4_0"}, 65536, 512, 0, "ngram-mod", 0.5};
+    const tune::Candidate ngram_a{{"q4_0", "q4_0"}, 65536, 512, 2, "ngram-mod", 0.0};
+    const tune::Candidate ngram_b{{"q4_0", "q4_0"}, 65536, 512, 2, "ngram-mod", 0.5};
+    const tune::Candidate mtp_a{{"q4_0", "q4_0"}, 65536, 512, 2, "draft-mtp", 0.0};
+    const tune::Candidate mtp_b{{"q4_0", "q4_0"}, 65536, 512, 2, "draft-mtp", 0.5};
+    const tune::Candidate hybrid{{"q4_0", "q4_0"}, 65536, 512, 2, "draft-mtp,ngram-mod", 0.0};
+    CHECK_FALSE(tune::uses_mtp(base_a));
+    CHECK_FALSE(tune::uses_mtp(ngram_a));
+    CHECK(tune::uses_mtp(mtp_a));
+    CHECK(tune::uses_mtp(hybrid));
+    CHECK(&tune::spill_guard_for(grid, ngram_a) == &grid.spill);
+    CHECK(&tune::spill_guard_for(grid, mtp_a) == &grid.spill_mtp);
+    CHECK(base_a == base_b);
+    CHECK(ngram_a == ngram_b);
+    CHECK_FALSE(mtp_a == mtp_b);
+
+    // Standalone ngram-mod emits --spec-type ngram-mod --spec-ngram-mod-n-max N
+    // and never emits --spec-draft-n-max or --spec-draft-p-min.
     tune::Options options;
     options.model = "ternary-bonsai-2-27b.gguf";
     options.grid = grid;
-    const tune::Candidate ngram{{"q4_0", "q4_0"}, 65536, 512, 2, "ngram-mod", 0.5};
-    const auto argv = tune::arguments(options, ngram);
+    const auto argv = tune::arguments(options, ngram_b);
     const auto spec_it = std::find(argv.begin(), argv.end(), "--spec-type");
     REQUIRE(spec_it != argv.end());
     REQUIRE(std::next(spec_it) != argv.end());
     CHECK(*std::next(spec_it) == "ngram-mod");
+    const auto ngram_n_it = std::find(argv.begin(), argv.end(), "--spec-ngram-mod-n-max");
+    REQUIRE(ngram_n_it != argv.end());
+    REQUIRE(std::next(ngram_n_it) != argv.end());
+    CHECK(*std::next(ngram_n_it) == "2");
+    CHECK(std::find(argv.begin(), argv.end(), "--spec-draft-n-max") == argv.end());
+    CHECK(std::find(argv.begin(), argv.end(), "--spec-draft-p-min") == argv.end());
 
     auto now = tune::Clock::now();
+    unsigned ngram_benchmarks = 0;
     const auto report = tune::search(
         options, false, now + std::chrono::minutes(2),
         [&](const tune::Candidate &c, tune::Phase phase, tune::Deadline) {
+            if (phase == tune::Phase::benchmark && c.mtp == 2 && c.spec_type == "ngram-mod") ++ngram_benchmarks;
             auto m = clean(c, phase);
-            m.short_tps = 40.0 + (c.mtp == 2 && c.spec_type == "ngram-mod" ? 25.0 + c.p_min : 0.0);
+            m.short_tps = 40.0 + (c.mtp == 2 && c.spec_type == "ngram-mod" ? 25.0 : 0.0);
             for (auto &work : m.workloads) work.tok_s = *m.short_tps;
             return m;
         },
         [&] { return now; });
+    CHECK(ngram_benchmarks == 1);
     REQUIRE(report.fast_default);
     const auto &winner = report.results[*report.fast_default];
     CHECK(winner.candidate.mtp == 2);
     CHECK(winner.candidate.spec_type == "ngram-mod");
-    CHECK(winner.candidate.p_min == doctest::Approx(0.5));
+    const auto doc = tune::report_json(options, report);
+    const auto &rows = doc.find("results")->find("candidates")->as_array();
+    CHECK(rows[*report.fast_default].find("p_min")->is_null());
 }
 
 TEST_CASE("tune sweeps flash_attn and skips quantized V cache when flash_attn is off") {
@@ -582,6 +627,23 @@ TEST_CASE("tune sweeps flash_attn and skips quantized V cache when flash_attn is
     const auto &rows = doc.find("results")->find("candidates")->as_array();
     REQUIRE_FALSE(rows.empty());
     CHECK(rows.front().find("flash_attn") != nullptr);
+
+    // Tie-breaker in rank(): when decode/prefill/ctx/mtp tie, flash_attn prefers on > auto > off.
+    {
+        tune::Report tied;
+        tied.results = {
+            clean({{"f16", "f16"}, 65536, 512, 0, "draft-mtp", 0.0, "off"}),
+            clean({{"f16", "f16"}, 65536, 512, 0, "draft-mtp", 0.0, "auto"}),
+            clean({{"f16", "f16"}, 65536, 512, 0, "draft-mtp", 0.0, "on"}),
+        };
+        tune::rank(tied);
+        REQUIRE(tied.fast_default);
+        CHECK(*tied.fast_default == 2);
+        tied.results.pop_back(); // only off vs auto remain
+        tune::rank(tied);
+        REQUIRE(tied.fast_default);
+        CHECK(*tied.fast_default == 1);
+    }
 
     // Invalid flash_attn grids must be rejected.
     for (const auto *bad_json : {R"({"flash_attn":[]})", R"({"flash_attn":["maybe"]})",

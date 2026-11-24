@@ -9,6 +9,7 @@
 #include <sstream>
 
 #include "sonder/inference/backends.hpp"
+#include "sonder/inference/device.hpp"
 #include "sonder/inference/json.hpp"
 #include "warmup_config.hpp"
 #include "residency_config.hpp"
@@ -309,7 +310,7 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
     if (const auto* guard = object.find("spill_guard")) {
         if (!guard->is_object()) return Status(ErrorCode::invalid_argument, "llamaserver config: 'spill_guard' must be an object");
         static constexpr std::string_view guard_keys[] = {"enabled", "policy", "threshold_mib", "baseline_mib", "baseline_per_1k_ctx_mib",
-            "sample_interval_ms", "fit_step_factor", "fit_step_align", "fit_min_ctx", "fit_max_attempts", "residency"};
+            "sample_interval_ms", "fit_step_factor", "fit_step_align", "fit_min_ctx", "fit_max_attempts", "residency", "uma_mode"};
         for (const auto& member : guard->as_object()) {
             if (std::find(std::begin(guard_keys), std::end(guard_keys), member.first) == std::end(guard_keys))
                 return Status(ErrorCode::invalid_argument, "llamaserver config: unknown spill_guard field '" + detail::bounded_for_message(member.first) + "'");
@@ -340,6 +341,10 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
         if (const auto* v = guard->find("fit_step_factor")) {
             if (!v->is_number() || !(v->as_double() > 0.0 && v->as_double() < 1.0)) return bad("fit_step_factor", "a number in (0, 1)");
             setup.llamaserver_fit_step_factor = v->as_double();
+        }
+        if (const auto* v = guard->find("uma_mode")) {
+            if (auto st = detail::parse_uma_mode_value(*v, "spill_guard.uma_mode", setup.llamaserver_spill_uma_mode); !st.ok())
+                return st;
         }
         if (const auto *v = guard->find("residency")) {
             if (auto st = detail::parse_residency_config(*v, setup); !st.ok()) return st;
@@ -475,9 +480,25 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
         lo.spill_guard.fit_step_align = setup.llamaserver_fit_step_align;
         lo.spill_guard.fit_min_ctx = setup.llamaserver_fit_min_ctx;
         lo.spill_guard.fit_max_attempts = static_cast<std::size_t>(setup.llamaserver_fit_max_attempts);
-#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
-        if (auto st = detail::apply_residency_config(setup, lo.spill_guard.residency); !st.ok()) return st;
-#endif
+        if (!detail::is_valid_uma_mode(setup.llamaserver_spill_uma_mode))
+            return Status(ErrorCode::invalid_argument,
+                          "llamaserver spill_guard.uma_mode must be on, off, auto, true or false");
+        if (!setup.llamaserver_residency.uma_mode.empty() &&
+            !detail::is_valid_uma_mode(setup.llamaserver_residency.uma_mode))
+            return Status(ErrorCode::invalid_argument,
+                          "llamaserver residency uma_mode must be empty or on, off, auto, true or false");
+        const std::string_view device_hint = detail::extract_device_hint(setup.llamaserver_args);
+        const bool is_spawn = setup.llamaserver_mode == "spawn";
+        const bool guard_active = setup.llamaserver_spill_guard || setup.llamaserver_residency.enabled;
+        const bool needs_live_gpus =
+            is_spawn && guard_active &&
+            (setup.llamaserver_spill_uma_mode == "auto" || setup.llamaserver_residency.uma_mode == "auto");
+        const std::vector<GpuDeviceInfo> live_gpus =
+            needs_live_gpus ? enumerate_gpu_devices() : std::vector<GpuDeviceInfo>{};
+        lo.spill_guard.uma_mode =
+            detail::resolve_uma_mode(setup.llamaserver_spill_uma_mode, live_gpus, device_hint);
+        lo.spill_guard.residency_uma_mode_explicit = !setup.llamaserver_residency.uma_mode.empty();
+        if (auto st = detail::apply_residency_config(setup, lo.spill_guard.residency, live_gpus); !st.ok()) return st;
         lo.stall_guard.enabled = setup.llamaserver_stall_guard;
         lo.stall_guard.stall_seconds = std::chrono::seconds(setup.llamaserver_stall_seconds);
         lo.stall_guard.policy = setup.llamaserver_stall_policy;

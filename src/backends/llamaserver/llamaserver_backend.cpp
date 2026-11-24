@@ -41,7 +41,7 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             s.restart_max_backoff = options_.max_restart_backoff;
             s.shutdown_timeout = options_.shutdown_timeout;
             s.max_restarts = options_.max_restarts;
-            s.spill_guard = llamaserver::to_spill_guard_options(options_.spill_guard);
+            s.spill_guard = llamaserver::to_spill_guard_options(options_.spill_guard, options_.args);
             (void)llamaserver::to_host_memory_options(options_.host_memory, s.host_memory);  // policy validated above
             s.log_file = options_.diagnostics.log_file;
             s.kv_pairing_check = options_.diagnostics.kv_pairing_check;

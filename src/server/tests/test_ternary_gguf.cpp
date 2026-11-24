@@ -212,6 +212,72 @@ TEST_CASE("ternary GGUF: all 7 new ggml tensor types compute exact block sizes a
     }
 }
 
+TEST_CASE("ternary GGUF: uint64 tensor size and accumulation overflows are rejected without wraparound") {
+    constexpr std::uint64_t kMaxU64 = std::numeric_limits<std::uint64_t>::max();
+    // Quantized types with block_bytes < block_elems near UINT64_MAX elements:
+    // `(elements + block_elems - 1)` used to wrap around to ~0; exact block
+    // division computes the true byte count without wraparound.
+    {
+        TernaryGgufWriter w;
+        w.kv_str("general.architecture", "llama");
+        w.kv_u32("llama.block_count", 1);
+        w.tensor("blk.0.pq2.weight", {kMaxU64}, 142);  // PQ2_0 (128, 34)
+        const auto parsed = si::parse_gguf_model_info(w.finish(1, 2));
+        REQUIRE_MESSAGE(parsed.ok(), parsed.status().message());
+        const std::uint64_t expected_blocks = kMaxU64 / 128u + 1u;
+        CHECK(parsed->block_bytes[0] == expected_blocks * 34u);
+    }
+    {
+        TernaryGgufWriter w;
+        w.kv_str("general.architecture", "llama");
+        w.kv_u32("llama.block_count", 1);
+        w.tensor("blk.0.nvfp4.weight", {kMaxU64 - 10u}, 40);  // NVFP4 (64, 36)
+        const auto parsed = si::parse_gguf_model_info(w.finish(1, 2));
+        REQUIRE_MESSAGE(parsed.ok(), parsed.status().message());
+        const std::uint64_t expected_blocks = (kMaxU64 - 10u) / 64u + 1u;
+        CHECK(parsed->block_bytes[0] == expected_blocks * 36u);
+    }
+
+    // Single tensor where blocks * block_bytes overflows uint64_t is rejected.
+    for (const auto& [type, elems] : std::vector<std::pair<std::uint32_t, std::uint64_t>>{
+             {0u, (kMaxU64 / 4u) + 1u},   // F32 (1, 4): blocks * 4 overflows
+             {1u, (kMaxU64 / 2u) + 1u},   // F16 (1, 2): blocks * 2 overflows
+             {28u, (kMaxU64 / 8u) + 1u},  // F64 (1, 8): blocks * 8 overflows
+         }) {
+        CAPTURE(type);
+        TernaryGgufWriter w;
+        w.kv_str("general.architecture", "llama");
+        w.kv_u32("llama.block_count", 1);
+        w.tensor("blk.0.huge.weight", {elems}, type);
+        const auto parsed = si::parse_gguf_model_info(w.finish(1, 2));
+        REQUIRE_FALSE(parsed.ok());
+        CHECK(parsed.status().code() == si::ErrorCode::invalid_argument);
+        CHECK(contains(parsed.status().message(), "tensor too large"));
+    }
+
+    // Accumulation overflow across two valid F8_E4M3 (1 elem = 1 byte) tensors
+    // in every bucket: block_bytes, embedding_bytes, output_bytes, other_bytes.
+    const std::uint64_t over_half = (kMaxU64 / 2u) + 100u;
+    const std::vector<std::pair<std::string, std::string>> bucket_pairs{
+        {"blk.0.a.weight", "blk.0.b.weight"},
+        {"token_embd.weight", "token_embd.weight"},
+        {"output.weight", "output_norm.weight"},
+        {"misc.a", "misc.b"},
+    };
+    for (const auto& [t1, t2] : bucket_pairs) {
+        CAPTURE(t1);
+        TernaryGgufWriter w;
+        w.kv_str("general.architecture", "llama");
+        w.kv_u32("llama.block_count", 1);
+        w.tensor(t1, {over_half}, 43);  // F8_E4M3: 1 byte per element
+        w.tensor(t2, {over_half}, 43);
+        const auto parsed = si::parse_gguf_model_info(w.finish(2, 2));
+        REQUIRE_FALSE(parsed.ok());
+        CHECK(parsed.status().code() == si::ErrorCode::invalid_argument);
+        CHECK(contains(parsed.status().message(), "tensor sizes overflow"));
+    }
+}
+
 TEST_CASE("ternary GGUF: prism.hadamard metadata and large sign_values arrays parse without bloating metadata") {
     TernaryGgufWriter w;
     w.kv_str("general.architecture", "qwen35");
@@ -417,6 +483,7 @@ TEST_CASE("launch profile: new typed field validation, extra_args rejection, and
         {R"("--no-repack")", "no_repack"},
         {R"("--no_repack")", "no_repack"},
         {R"("--repack")", "no_repack"},
+        {R"("-rea","off")", "reasoning"},
         {R"("--reasoning","off")", "reasoning"},
         {R"("--reasoning-budget","0")", "reasoning_budget"},
         {R"("--reasoning_budget","-1")", "reasoning_budget"},
@@ -424,6 +491,44 @@ TEST_CASE("launch profile: new typed field validation, extra_args rejection, and
     for (const auto& [flag, field] : typed_flags) {
         CAPTURE(flag);
         CHECK(contains(parse_error(with(flag)), "use the typed field '" + field + "'"));
+    }
+
+    // Remote P2P tunnel flags and newly blocked unsafe UI/tool/media flags are refused.
+    for (const std::string remote : {R"("--connect")", R"("--connect-code","abc")", R"("--connect_code","abc")"}) {
+        CAPTURE(remote);
+        CHECK(contains(parse_error(with(remote)), "remote RPC servers"));
+    }
+    for (const std::string unsafe :
+         {R"("--ui-config-file","cfg.json")", R"("--ui_config_file","cfg.json")",
+          R"("--webui-config-file","cfg.json")", R"("--media-allow-private-urls")",
+          R"("--allow-unauthenticated-tools")", R"("--ui-mcp-proxy-allow-private-urls")"}) {
+        CAPTURE(unsafe);
+        CHECK(contains(parse_error(with(unsafe)), "agent tools, MCP and local file serving"));
+    }
+
+    // CR/LF control characters are rejected in model, mmproj, draft_model, and extra_args flags.
+    for (const char ctrl : {'\r', '\n'}) {
+        CAPTURE(static_cast<int>(ctrl));
+        {
+            si::LaunchProfile bad = parse_single("{" + base + "}");
+            bad.model = std::string("m") + ctrl + ".gguf";
+            CHECK(si::validate_launch_profile(bad).code() == si::ErrorCode::invalid_argument);
+        }
+        {
+            si::LaunchProfile bad = parse_single("{" + base + "}");
+            bad.mmproj = std::string("mm") + ctrl + ".gguf";
+            CHECK(si::validate_launch_profile(bad).code() == si::ErrorCode::invalid_argument);
+        }
+        {
+            si::LaunchProfile bad = parse_single("{" + base + "}");
+            bad.speculative = si::SpeculativeSettings{{"draft-simple"}, 2, std::string("d") + ctrl + ".gguf"};
+            CHECK(si::validate_launch_profile(bad).code() == si::ErrorCode::invalid_argument);
+        }
+        {
+            si::LaunchProfile bad = parse_single("{" + base + "}");
+            bad.extra_args = {std::string("--no-warmup") + ctrl};
+            CHECK(si::validate_launch_profile(bad).code() == si::ErrorCode::invalid_argument);
+        }
     }
 
     // Direct llamacpp backend rejects every new unsupported field without mutating setup/device.
@@ -510,14 +615,37 @@ TEST_CASE("VRAM estimate: multi-GPU tensor_split computes max_gpu_bytes and surf
     REQUIRE(meta_equal.find("per_gpu_max_mib") != nullptr);
     CHECK(static_cast<std::uint64_t>(meta_equal.find("per_gpu_max_mib")->as_int()) == e_equal.max_gpu_mib());
 
-    // Asymmetric split [3, 1] with split_mode=row: heaviest GPU gets 75% of splittable + compute.
-    const si::LaunchProfile asym = parse_single(
-        R"({"name":"asym","backend":"llamaserver","model":"m.gguf","ctx_size":4096,"parallel":1,"n_gpu_layers":-1,"fit":false,"split_mode":"row","tensor_split":[3,1]})");
-    const si::VramEstimate e_asym = si::estimate_vram(m, asym);
-    const std::uint64_t expected_3q =
-        static_cast<std::uint64_t>(std::ceil(static_cast<double>(splittable) * 0.75)) + e_asym.compute_bytes;
-    CHECK(e_asym.max_gpu_bytes == expected_3q);
-    CHECK(e_asym.max_gpu_bytes > e_equal.max_gpu_bytes);
+    // Asymmetric split [3, 1] with split_mode=layer: heaviest GPU gets 75% of (weights+KV+recurrent) + compute.
+    const si::LaunchProfile asym_layer = parse_single(
+        R"({"name":"asym-layer","backend":"llamaserver","model":"m.gguf","ctx_size":4096,"parallel":1,"n_gpu_layers":-1,"fit":false,"split_mode":"layer","tensor_split":[3,1]})");
+    const si::VramEstimate e_asym_layer = si::estimate_vram(m, asym_layer);
+    const std::uint64_t expected_layer_3q =
+        static_cast<std::uint64_t>(std::ceil(static_cast<double>(splittable) * 0.75)) + e_asym_layer.compute_bytes;
+    CHECK(e_asym_layer.max_gpu_bytes == expected_layer_3q);
+    CHECK(e_asym_layer.max_gpu_bytes > e_equal.max_gpu_bytes);
+
+    // split_mode=row keeps KV cache unsplit on main_gpu (heaviest shard):
+    // weights/recurrent split by 0.75, full kv_bytes + compute_bytes stay on main_gpu.
+    const si::LaunchProfile asym_row = parse_single(
+        R"({"name":"asym-row","backend":"llamaserver","model":"m.gguf","ctx_size":4096,"parallel":1,"n_gpu_layers":-1,"fit":false,"split_mode":"row","tensor_split":[3,1]})");
+    const si::VramEstimate e_asym_row = si::estimate_vram(m, asym_row);
+    const std::uint64_t row_splittable = e_asym_row.weights_bytes + e_asym_row.recurrent_bytes;
+    const std::uint64_t expected_row_3q =
+        static_cast<std::uint64_t>(std::ceil(static_cast<double>(row_splittable) * 0.75)) + e_asym_row.kv_bytes +
+        e_asym_row.compute_bytes;
+    CHECK(e_asym_row.max_gpu_bytes == expected_row_3q);
+    CHECK(e_asym_row.max_gpu_bytes - e_asym_layer.max_gpu_bytes == e_asym_row.kv_bytes / 4u);
+    bool row_unsplit_noted = false;
+    for (const auto& note : e_asym_row.notes) {
+        row_unsplit_noted = row_unsplit_noted || (contains(note, "split_mode=row") && contains(note, "unsplit KV"));
+    }
+    CHECK(row_unsplit_noted);
+
+    // Equal split [1, 1] with split_mode=row keeps full KV on main_gpu (+50% KV vs layer mode).
+    const si::LaunchProfile equal_row = parse_single(
+        R"({"name":"eq-row","backend":"llamaserver","model":"m.gguf","ctx_size":4096,"parallel":1,"n_gpu_layers":-1,"fit":false,"split_mode":"row","tensor_split":[1,1]})");
+    const si::VramEstimate e_equal_row = si::estimate_vram(m, equal_row);
+    CHECK(e_equal_row.max_gpu_bytes - e_equal.max_gpu_bytes == e_equal_row.kv_bytes / 2u);
 
     // split_mode=none disables multi-GPU splitting even if tensor_split has >= 2 weights.
     const si::LaunchProfile none = parse_single(
@@ -529,6 +657,32 @@ TEST_CASE("VRAM estimate: multi-GPU tensor_split computes max_gpu_bytes and surf
         none_noted = none_noted || contains(note, "split_mode=none");
     }
     CHECK(none_noted);
+}
+
+TEST_CASE("VRAM estimate & catalog: device=none disables GPU offload and accounts everything on host") {
+    const si::GgufModelInfo m = multi_gpu_model();
+    for (const std::string dev : {"none", "NONE"}) {
+        CAPTURE(dev);
+        si::LaunchProfile p = parse_single(
+            R"({"name":"cpu-dev","backend":"llamaserver","model":"m.gguf","ctx_size":4096,"parallel":1,)"
+            R"("mmproj":"mm.gguf","speculative":{"types":["draft-simple"],"draft_model":"d.gguf"},"device":")" +
+            dev + R"("})");
+        si::VramEstimateInputs in{};
+        in.mmproj_bytes = 64 * kMiB;
+        in.draft_model_bytes = 128 * kMiB;
+        const si::VramEstimate e = si::estimate_vram(m, p, in);
+        CHECK(e.gpu_layers == 0u);
+        CHECK(e.weights_bytes == 0u);
+        CHECK(e.kv_bytes == 0u);
+        CHECK(e.recurrent_bytes == 0u);
+        CHECK(e.compute_bytes == 0u);
+        CHECK(e.total_bytes == 0u);
+        CHECK(e.max_gpu_bytes == 0u);
+        CHECK_FALSE(e.host_fit_applies);
+        CHECK(e.host_kv_bytes > 0u);
+        // All blocks (4096 MiB) + output (512 MiB) + embedding (256 MiB) + mmproj (64 MiB) + draft (128 MiB).
+        CHECK(e.host_dense_weight_bytes == (4096u + 512u + 256u + 64u + 128u) * kMiB);
+    }
 }
 
 TEST_CASE("VRAM estimate: typed load_mode and no_repack control host RAM accounting") {
@@ -628,6 +782,25 @@ TEST_CASE("serve_profile_catalog: surfaces per_gpu_max_mib and PrismML flags and
                                tight_refusal);
     CHECK(contains(tight_refusal, "does not fit"));
     CHECK(contains(tight_refusal, "per-GPU max"));
+
+    // device="none" skips VRAM fit check (even with a 1 MiB budget) while still
+    // computing the active llamaserver host-RAM estimate.
+    si::LaunchProfile cpu_dev = p;
+    cpu_dev.device = std::string("none");
+    cpu_dev.tensor_split.clear();
+    const std::vector<si::LaunchProfile> cpu_profiles{cpu_dev};
+    srv::ServerOptions cpu_opts;
+    std::vector<std::string> cpu_notes;
+    std::string cpu_refusal;
+    (void)srv::profile_catalog(cpu_profiles, cpu_profiles[0], cpu_opts, std::optional<std::uint64_t>(1u), false,
+                               cpu_notes, cpu_refusal);
+    CHECK(cpu_refusal.empty());
+    CHECK(cpu_opts.backend.llamaserver_host_memory.estimated_resident_bytes > 0u);
+    bool skipped_noted = false;
+    for (const auto& note : cpu_notes) {
+        skipped_noted = skipped_noted || contains(note, "no GPU offload; VRAM fit check skipped");
+    }
+    CHECK(skipped_noted);
 
     std::error_code ec;
     std::filesystem::remove(path, ec);

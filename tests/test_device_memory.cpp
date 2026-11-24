@@ -323,6 +323,36 @@ TEST_CASE("parse_amdgpu_sysfs_device parses discrete RX XT and integrated Ryzen 
     CHECK_FALSE(apu2->dedicated_free.is_known());
     CHECK(gpu_effective_vram_mib(*apu2, true) == std::optional<std::uint64_t>(512 + 16384));
 
+    // Integrated APU with 2 GiB BIOS carveout + 16 GiB GTT is still detected as UMA.
+    const auto apu_2g_files = fake_files({
+        {"/sys/class/drm/card1/device/vendor", "0x1002\n"},
+        {"/sys/class/drm/card1/device/device", "0x15bf\n"},
+        {"/sys/class/drm/card1/device/mem_info_vram_total", std::to_string(2 * kGiB) + "\n"},
+        {"/sys/class/drm/card1/device/mem_info_gtt_total", std::to_string(16 * kGiB) + "\n"},
+    });
+    const auto apu_2g = parse_amdgpu_sysfs_device("card1", apu_2g_files);
+    REQUIRE(apu_2g.has_value());
+    CHECK(apu_2g->is_integrated_uma);
+    CHECK(gpu_effective_vram_mib(*apu_2g, false) == std::optional<std::uint64_t>(2048 + 16384));
+
+    // 4 GiB discrete AMD Radeon RX 6500 XT on a 32 GB host (16 GiB GTT) must NOT be misclassified as UMA.
+    const auto rx6500xt_files = fake_files({
+        {"/sys/class/drm/card0/device/vendor", "0x1002\n"},
+        {"/sys/class/drm/card0/device/device", "0x743f\n"},
+        {"/sys/class/drm/card0/device/product_name", "AMD Radeon RX 6500 XT\n"},
+        {"/sys/class/drm/card0/device/mem_info_vram_total", std::to_string(4 * kGiB) + "\n"},
+        {"/sys/class/drm/card0/device/mem_info_vram_used", std::to_string(512 * kMiB) + "\n"},
+        {"/sys/class/drm/card0/device/mem_info_gtt_total", std::to_string(16 * kGiB) + "\n"},
+        {"/sys/class/drm/card0/device/mem_info_gtt_used", std::to_string(256 * kMiB) + "\n"},
+    });
+    const auto rx6500xt = parse_amdgpu_sysfs_device("card0", rx6500xt_files);
+    REQUIRE(rx6500xt.has_value());
+    CHECK_FALSE(rx6500xt->is_integrated_uma);
+    CHECK(rx6500xt->dedicated_total == MemoryReading::known(4 * kGiB));
+    CHECK(rx6500xt->dedicated_free == MemoryReading::known(4 * kGiB - 512 * kMiB));
+    CHECK(gpu_effective_vram_mib(*rx6500xt, false) == std::optional<std::uint64_t>(4096));
+    CHECK(gpu_effective_vram_mib(*rx6500xt, true) == std::optional<std::uint64_t>(3584));
+
     // Reject non-AMD vendors, non-amdgpu drivers, path traversal, and missing memory info.
     const auto nvidia_card = fake_files({
         {"/sys/class/drm/card0/device/vendor", "0x10de\n"},

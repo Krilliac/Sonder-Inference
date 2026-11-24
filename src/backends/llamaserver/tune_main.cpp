@@ -13,6 +13,7 @@
 #include <fstream>
 #include <ostream>
 #include <stdexcept>
+#include <string_view>
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -92,6 +93,21 @@ void write_output(const std::string &destination, const std::string &text, const
 }
 } // namespace
 
+bool help_supports_spec_type(std::string_view help) {
+    static constexpr std::string_view kFlag = "--spec-type";
+    std::size_t pos = 0;
+    while ((pos = help.find(kFlag, pos)) != std::string_view::npos) {
+        const bool start_ok = pos == 0 || help[pos - 1] == ' ' || help[pos - 1] == '\t' ||
+                              help[pos - 1] == '\n' || help[pos - 1] == '\r' || help[pos - 1] == ',';
+        const std::size_t end = pos + kFlag.size();
+        const bool end_ok = end == help.size() || help[end] == ' ' || help[end] == '\t' ||
+                            help[end] == '=' || help[end] == '\n' || help[end] == '\r' || help[end] == ',';
+        if (start_ok && end_ok) return true;
+        pos = end;
+    }
+    return false;
+}
+
 int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostream &err) {
     namespace cli = sonder::cli;
     const auto usage_error = [&](const std::string &message) {
@@ -149,16 +165,20 @@ int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostr
                    "Adaptive bisection probes context first; only leaders receive throughput measurements.\n"
                    "MTP >0 rows are conditional on nextn tensors and executable --help; neither is probed here.\n"
                    "Benchmarks also include 65536 and clean-edge minus 4096; every recommendation gets a +4096 safety probe.\n\n"
-                   "| K/V | ctx | ubatch | MTP | spec_type | p_min |\n|---|---:|---:|---:|---|---:|\n";
-            for (const auto &c : planned_candidates(options.grid, true))
-                out << "| " << c.kv.k << '/' << c.kv.v << " | " << c.ctx << " | " << c.ubatch << " | " << c.mtp
-                    << " | " << (c.mtp == 0 ? "none" : c.spec_type) << " | " << c.p_min << " |\n";
+                   "| K/V | FA | ctx | ubatch | MTP | spec_type | p_min |\n|---|---|---:|---:|---:|---|---:|\n";
+            for (const auto &c : planned_candidates(options.grid, true)) {
+                out << "| " << c.kv.k << '/' << c.kv.v << " | " << c.flash_attn << " | " << c.ctx << " | "
+                    << c.ubatch << " | " << c.mtp << " | " << (c.mtp == 0 ? "none" : c.spec_type) << " | ";
+                if (uses_mtp(c)) out << c.p_min;
+                else out << "-";
+                out << " |\n";
+            }
             return cli::kExitOk;
         }
         // Platform eligibility precedes --help or any model/server process.
         Dependencies dependencies;
         if (!dependencies.counters->supported()) {
-            err << "error: tune: live calibration requires Windows GPU Process Memory counters; use --dry-run here\n";
+            err << "error: tune: live calibration requires per-process GPU memory counters (Windows PDH, Linux amdgpu fdinfo, or NVML); use --dry-run here\n";
             return cli::kExitFailure;
         }
         Signals signals;
@@ -192,13 +212,15 @@ int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostr
             return dependencies.interrupted() ? cli::kExitCancelled : cli::kExitFailure;
         }
         const bool mtp = info.value().has_nextn && help_supports_mtp(help.value());
-        options.spec_type_supported = help_supports_mtp(help.value());
+        options.spec_type_supported = help_supports_spec_type(help.value());
         err << "[tune] architecture=" << sonder::inference::to_string(info.value().architecture)
             << "; MTP=" << (mtp ? "eligible" : "disabled (needs nextn tensors and --help support)") << '\n';
         auto report = search(options, mtp, deadline, [&](const Candidate &c, Phase phase, Deadline until) {
             err << "[tune] " << (phase == Phase::probe ? "probe " : "bench ") << c.kv.k << '/' << c.kv.v
-                << " ctx=" << c.ctx << " ubatch=" << c.ubatch << " mtp=" << c.mtp
-                << " spec_type=" << (c.mtp == 0 ? "none" : c.spec_type) << " p_min=" << c.p_min << '\n';
+                << " fa=" << c.flash_attn << " ctx=" << c.ctx << " ubatch=" << c.ubatch << " mtp=" << c.mtp
+                << " spec_type=" << (c.mtp == 0 ? "none" : c.spec_type);
+            if (uses_mtp(c)) err << " p_min=" << c.p_min;
+            err << '\n';
             return run_candidate(options, c, phase, until, scratch.file("candidate.log"), dependencies);
         });
         out << markdown(report);

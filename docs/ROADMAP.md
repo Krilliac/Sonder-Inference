@@ -14,7 +14,7 @@
 
 ## Phase 1 — direct native inference path
 
-- [x] Engine / Device / Model / Session abstractions (CPU inventory only; GPU discovery pending)
+- [x] Engine / Device / Model / Session abstractions (CPU + cross-platform GPU discovery via DXGI/NVML/ROCm/DRM/sysfs with UMA detection, surfaced on `sonder-infer devices` and `/v1/sonder/health`)
 - [x] llama.cpp/GGML backend (optional build, `SONDER_WITH_LLAMA_CPP=ON`; license approved 2026-09-26)
 - [ ] tokenizer + prompt processing
 - [x] streaming decode (session API; via mock and Ollama backends; native backend pending)
@@ -64,7 +64,7 @@ Gate: measurable win on agent fan-out/long-context workloads without interactive
   health, `/v1/models` and telemetry ([vram-spill](integration/vram-spill.md))
 - [x] llamaserver slot prefix warm-up after readiness and supervised restart
   (bounded, per-slot, cancellable; `docs/integration/llama-server.md`)
-- [ ] adaptive speculation policy
+- [x] adaptive speculation policy (`AdaptiveSpeculationPolicy`: per-workload rolling acceptance, hysteresis step-up/down, pause + cooldown re-probe in `src/backends/llamaserver/adaptive_speculation.{hpp,cpp}`)
 - [x] `sonder-infer tune`: bounded llama-server calibration, PDH spill qualification,
   per-profile context margin, and spawn-config output with two recommendations
   ([usage and qualification limits](integration/tune.md)); live performance validation pending
@@ -84,8 +84,7 @@ Gate: measurable win on agent fan-out/long-context workloads without interactive
   or policy consumption; see `docs/PLACEMENT.md`)
 - [ ] several launch profiles behind one `serve` (today one profile per
   instance) and Runtime tier routing across them
-- [ ] per-model placement planner from GGUF metadata (`docs/PLACEMENT.md` step 2;
-  the launch-profile estimator covers the KV/weights arithmetic, not placement choice)
+- [x] per-model placement planner from GGUF metadata (`docs/PLACEMENT.md` step 2; `plan_model_placement()` + `sonder-infer plan` covering RTX, AMD RX XT, Ryzen APU UMA, multi-GPU split, MoE `--n-cpu-moe`, ternary/PrismML Hadamard detection, and speculative decoding)
 - [ ] optional disk tier
 - [ ] model residency manager
 - [ ] warm/cold adapter/model policy

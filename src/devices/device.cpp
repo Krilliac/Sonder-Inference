@@ -4,6 +4,7 @@
 #include <cstring>
 #include <limits>
 #include <thread>
+#include <utility>
 
 #if defined(_WIN32)
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -191,8 +192,8 @@ bool is_integrated_uma_memory(GpuVendor vendor, std::uint64_t dedicated_bytes, s
     if (vendor == GpuVendor::apple && shared_bytes > 0) {
         return true;
     }
-    if ((vendor == GpuVendor::amd || vendor == GpuVendor::intel) && dedicated_bytes <= 4 * kGiB &&
-        shared_bytes >= 2 * dedicated_bytes && shared_bytes > 0) {
+    if ((vendor == GpuVendor::amd || vendor == GpuVendor::intel) && dedicated_bytes <= 2 * kGiB &&
+        shared_bytes >= 4 * dedicated_bytes && shared_bytes > 0) {
         return true;
     }
     return false;
@@ -415,7 +416,7 @@ std::string windows_backend_hint(GpuVendor vendor) {
 
 std::vector<GpuDeviceInfo> live_gpu_devices() {
     std::vector<GpuDeviceInfo> gpus;
-    ScopedLibrary dxgi(LoadLibraryW(L"dxgi.dll"));
+    ScopedLibrary dxgi(LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32));
     if (!dxgi.handle) {
         return gpus;
     }
@@ -467,6 +468,7 @@ std::vector<GpuDeviceInfo> live_gpu_devices() {
             if (SUCCEEDED(adapter3.ptr->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info))) {
                 std::uint64_t free_bytes =
                     local_info.Budget > local_info.CurrentUsage ? local_info.Budget - local_info.CurrentUsage : 0;
+                bool free_complete = true;
                 if (info.is_integrated_uma) {
                     DXGI_QUERY_VIDEO_MEMORY_INFO non_local_info{};
                     if (SUCCEEDED(adapter3.ptr->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
@@ -476,9 +478,13 @@ std::vector<GpuDeviceInfo> live_gpu_devices() {
                                 ? non_local_info.Budget - non_local_info.CurrentUsage
                                 : 0;
                         free_bytes = saturating_add(free_bytes, non_local_free);
+                    } else {
+                        free_complete = false;
                     }
                 }
-                info.dedicated_free = MemoryReading::known(free_bytes);
+                if (free_complete) {
+                    info.dedicated_free = MemoryReading::known(free_bytes);
+                }
             }
         }
         gpus.push_back(std::move(info));

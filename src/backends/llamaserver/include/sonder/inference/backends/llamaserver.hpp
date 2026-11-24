@@ -58,6 +58,17 @@ struct LlamaServerSpillGuardOptions {
     std::uint64_t fit_min_ctx = 8192;
     std::size_t fit_max_attempts = 4;
     LlamaServerResidencyGuardOptions residency;
+    // Integrated UMA GPUs (e.g. Ryzen APUs) legitimately allocate GPU buffers
+    // in shared/GTT system memory. When true, the spill guard does not flag
+    // shared usage as a VRAM spill and propagates to residency unless
+    // `residency_uma_mode_explicit` is set.
+    bool uma_mode = false;
+    // Optional tri-state override ("off", "on", "auto", "true", "false").
+    // When non-empty, supersedes `uma_mode`, resolving "auto" via
+    // enumerate_gpu_devices() and any --device/-dev hint in args.
+    std::string uma_mode_policy;
+    // True when `residency.uma_mode` was set independently of `uma_mode`.
+    bool residency_uma_mode_explicit = false;
 };
 
 struct LlamaServerDiagnosticsOptions {

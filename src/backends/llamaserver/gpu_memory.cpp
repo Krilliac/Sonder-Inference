@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <unordered_set>
+#include <utility>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -249,7 +250,25 @@ std::optional<std::string> read_small_linux_file(const std::string &path, std::s
     return text;
 }
 
-bool read_proc_drm_fdinfo(std::uint32_t pid, std::string &out, bool &permission_denied) {
+bool fdinfo_has_driver(std::string_view text, std::string_view expected_driver) noexcept {
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        const auto end = text.find('\n', pos);
+        std::string_view line =
+            text.substr(pos, end == std::string_view::npos ? std::string_view::npos : end - pos);
+        pos = end == std::string_view::npos ? text.size() : end + 1;
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+        const auto colon = line.find(':');
+        if (colon == std::string_view::npos)
+            continue;
+        if (trim_view(line.substr(0, colon)) == "drm-driver")
+            return trim_view(line.substr(colon + 1)) == expected_driver;
+    }
+    return false;
+}
+
+bool read_proc_drm_fdinfo(std::uint32_t pid, std::string &out, bool &permission_denied, bool amdgpu_only) {
     permission_denied = false;
     out.clear();
     const std::string dir_path = "/proc/" + std::to_string(pid) + "/fdinfo";
@@ -269,6 +288,8 @@ bool read_proc_drm_fdinfo(std::uint32_t pid, std::string &out, bool &permission_
             break;
         const auto text = read_small_linux_file(dir_path + "/" + std::string(name), 4096);
         if (!text || text->find("drm-memory-") == std::string::npos)
+            continue;
+        if (amdgpu_only && !fdinfo_has_driver(*text, "amdgpu"))
             continue;
         if (!out.empty())
             out += "\n\n";
@@ -356,16 +377,16 @@ class NvmlProcessProbe {
             if (get_handle_(i, &dev) != kNvmlSuccess || !dev)
                 continue;
             std::uint64_t used_bytes = 0;
-            bool found = false;
+            bool has_valid_bytes = false;
             if (compute_v2_)
-                found |= query_list<NvmlProcessInfoV2>(compute_v2_, dev, pid, used_bytes);
+                has_valid_bytes |= query_list<NvmlProcessInfoV2>(compute_v2_, dev, pid, used_bytes);
             else if (compute_v1_)
-                found |= query_list<NvmlProcessInfoV1>(compute_v1_, dev, pid, used_bytes);
+                has_valid_bytes |= query_list<NvmlProcessInfoV1>(compute_v1_, dev, pid, used_bytes);
             if (graphics_v2_)
-                found |= query_list<NvmlProcessInfoV2>(graphics_v2_, dev, pid, used_bytes);
+                has_valid_bytes |= query_list<NvmlProcessInfoV2>(graphics_v2_, dev, pid, used_bytes);
             else if (graphics_v1_)
-                found |= query_list<NvmlProcessInfoV1>(graphics_v1_, dev, pid, used_bytes);
-            if (found) {
+                has_valid_bytes |= query_list<NvmlProcessInfoV1>(graphics_v1_, dev, pid, used_bytes);
+            if (has_valid_bytes) {
                 const std::string instance = "pid_" + std::to_string(pid) + "_nvml_" + std::to_string(i);
                 out.dedicated.push_back({instance, used_bytes});
                 out.shared.push_back({instance, 0});
@@ -383,7 +404,7 @@ class NvmlProcessProbe {
         if (rc == kNvmlSuccess || rc != kNvmlErrorInsufficientSize || count == 0)
             return false;
         for (int attempt = 0; attempt < 2; ++attempt) {
-            const unsigned int capacity = std::min<unsigned int>(count + 8u, 4096u);
+            const unsigned int capacity = std::min<unsigned int>(count, 4088u) + 8u;
             std::vector<Entry> entries(capacity);
             unsigned int actual = capacity;
             rc = fn(dev, &actual, entries.data());
@@ -393,19 +414,19 @@ class NvmlProcessProbe {
             }
             if (rc != kNvmlSuccess)
                 return false;
-            bool found = false;
+            bool has_valid_bytes = false;
             const unsigned int limit = std::min(actual, capacity);
             for (unsigned int i = 0; i < limit; ++i) {
                 if (entries[i].pid != pid)
                     continue;
-                found = true;
                 if (entries[i].usedGpuMemory != kNvmlValueNotAvailable) {
+                    has_valid_bytes = true;
                     const auto bytes = static_cast<std::uint64_t>(entries[i].usedGpuMemory);
                     if (bytes > max_bytes)
                         max_bytes = bytes;
                 }
             }
-            return found;
+            return has_valid_bytes;
         }
         return false;
     }
@@ -453,10 +474,10 @@ class LinuxGpuCounterSource final : public GpuCounterSource {
         if (pid == 0)
             return Status(ErrorCode::invalid_argument, "no process id to sample");
         GpuProcessCounters counters;
+        bool permission_denied = false;
         if (amdgpu_available_) {
             std::string fdinfo_text;
-            bool permission_denied = false;
-            const bool opened = read_proc_drm_fdinfo(pid, fdinfo_text, permission_denied);
+            const bool opened = read_proc_drm_fdinfo(pid, fdinfo_text, permission_denied, nvml_ != nullptr);
             if (!opened && permission_denied && !nvml_) {
                 return Status(ErrorCode::io_error,
                               "cannot read /proc/" + std::to_string(pid) + "/fdinfo (permission denied)");
@@ -471,8 +492,14 @@ class LinuxGpuCounterSource final : public GpuCounterSource {
                 }
             }
         }
-        if (nvml_)
+        if (nvml_) {
+            const std::size_t before = counters.dedicated.size();
             nvml_->read_pid(pid, counters);
+            if (permission_denied && counters.dedicated.size() == before) {
+                return Status(ErrorCode::io_error,
+                              "cannot read /proc/" + std::to_string(pid) + "/fdinfo (permission denied)");
+            }
+        }
         return counters;
     }
 
@@ -523,15 +550,18 @@ bool parse_linux_drm_fdinfo(std::string_view fdinfo_text, std::uint64_t &vram_by
 
     const auto flush = [&]() {
         if (rec.has_vram || rec.has_gtt) {
-            bool duplicate = false;
-            if (rec.has_client_id) {
-                std::string key = rec.driver + ":" + rec.client_id;
-                duplicate = !seen_clients.insert(std::move(key)).second;
-            }
-            if (!duplicate) {
-                vram_bytes = saturating_add(vram_bytes, rec.vram);
-                gtt_bytes = saturating_add(gtt_bytes, rec.gtt);
-                parsed_any = true;
+            const bool is_nvidia_drm = rec.driver == "nvidia-drm" || rec.driver == "nvidia";
+            if (!is_nvidia_drm) {
+                bool duplicate = false;
+                if (rec.has_client_id) {
+                    std::string key = rec.driver + ":" + rec.client_id;
+                    duplicate = !seen_clients.insert(std::move(key)).second;
+                }
+                if (!duplicate) {
+                    vram_bytes = saturating_add(vram_bytes, rec.vram);
+                    gtt_bytes = saturating_add(gtt_bytes, rec.gtt);
+                    parsed_any = true;
+                }
             }
         }
         rec = {};

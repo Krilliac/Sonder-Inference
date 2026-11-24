@@ -21,7 +21,8 @@ The HTTP server started by `sonder-infer serve` has its own reference:
 | `weights` | Weight-content digest manifests: `weights manifest DIR -o FILE`, `weights verify DIR MANIFEST`; see [weight manifests](integration/weight-manifest.md). Exit status 0 ok, 1 I/O, 2 mismatch, 3 missing/extra, 4 usage. |
 | `models` | List the models a backend can serve. |
 | `backends` | Probe the backends compiled into this build. |
-| `devices` | List host devices (CPU and memory inventory). |
+| `devices` | List host devices (CPU, memory and GPU inventory). |
+| `plan` | Plan hardware placement and a validated launch profile for a GGUF model (header-only; no weights loaded). |
 | `version` | Print version, commit, C ABI and HTTP API versions. |
 | `help` | `help` prints the overview; `help <command>` prints that command's options and examples. |
 
@@ -259,7 +260,7 @@ in its attributes.
   stats default `none`; an explicit `--stats` still applies. Errors and the
   `--ollama-allow-remote` warning are still printed. With `--quiet`,
   `--telemetry -` and optionally `--stats json`, stderr is pure JSON lines.
-- `--json` (`version`, `devices`, `backends`, `models`): one JSON document on
+- `--json` (`version`, `devices`, `plan`, `backends`, `models`): one JSON document on
   stdout instead of text.
 
 ## JSON shapes
@@ -281,8 +282,18 @@ without the server module.
 
 ```json
 {"platform":"linux-x86_64","devices":[{"id":"cpu:0","kind":"cpu","name":"...","logical_cores":4,
- "total_memory_bytes":16877547520,"available_memory_bytes":15598018560}]}
+ "total_memory_bytes":16877547520,"available_memory_bytes":15598018560}],
+ "gpus":[{"id":"gpu:0","name":"NVIDIA GeForce RTX 5070 Ti","vendor":"nvidia","vendor_id":4318,
+ "device_id":11269,"dedicated_total_mib":15995,"dedicated_free_mib":11985,"shared_total_mib":15826,
+ "effective_vram_mib":15995,"effective_free_vram_mib":11985,"is_integrated_uma":false,
+ "backend_hint":"cuda","source":"dxgi"}]}
 ```
+
+`plan --model model.gguf --json` prints a JSON object containing `profile` (in the
+same schema accepted by `parse_launch_profiles()`), `estimate`, `budget_mib`,
+`fits_in_vram`, `fits_in_host_ram`, `uma_mode`, `requires_prism_runtime`,
+`selected_vendor`, `recommended_backend_hint`, `recommended_env`, `reasons`, and
+`warnings`.
 
 `backends --json` (exit 1 when `available` is 0):
 

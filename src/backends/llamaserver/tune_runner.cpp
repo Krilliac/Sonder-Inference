@@ -280,8 +280,9 @@ if __name__ == "__main__":
             "trip, including the rest? Give a short calculation and the answer in kilometres per hour.", 256}
     }};
 }
+enum class SpecMode { none, mtp, ngram };
 Status decode_workload(const Exchange &exchange, std::uint16_t port, const DecodeWorkload &work,
-                       bool mtp, Deadline deadline, const CancellationToken &cancel, WorkloadMeasurement &out) {
+                       SpecMode spec_mode, Deadline deadline, const CancellationToken &cancel, WorkloadMeasurement &out) {
     const json::Value body = json::Object{
         {"messages", json::Array{
             json::Object{{"role", "system"}, {"content", "Follow the user's instructions and answer directly."}},
@@ -307,9 +308,11 @@ Status decode_workload(const Exchange &exchange, std::uint16_t port, const Decod
         timings.completion_tokens == 0 || timings.completion_tokens > work.max_tokens ||
         timings.cached_tokens != 0 || timings.prompt_ns == 0 || timings.eval_ns == 0)
         return {ErrorCode::protocol_error, "chat workload was cached or did not return positive bounded timings"};
-    if (mtp && (!timings.draft_present || timings.draft_tokens == 0 || !timings.draft_accepted_present))
+    if (spec_mode == SpecMode::mtp && (!timings.draft_present || timings.draft_tokens == 0 || !timings.draft_accepted_present))
         return {ErrorCode::protocol_error, "MTP requested but draft activity and acceptance were not measured"};
-    if (!mtp && (timings.draft_tokens != 0 || timings.draft_accepted_tokens != 0))
+    if (spec_mode == SpecMode::ngram && timings.draft_tokens > 0 && !timings.draft_accepted_present)
+        return {ErrorCode::protocol_error, "ngram-mod produced drafts without acceptance counts"};
+    if (spec_mode == SpecMode::none && (timings.draft_tokens != 0 || timings.draft_accepted_tokens != 0))
         return {ErrorCode::protocol_error, "baseline unexpectedly used speculative decoding"};
     out.name = work.name;
     out.weight = work.weight;
@@ -402,7 +405,7 @@ Measurement run_candidate(const Options &o, const Candidate &candidate, Phase ph
         for (const auto &warning : diagnostics.warnings()) {
             if (warning.code == "kv_kernel_f16_fallback") { result.slow_kernel = true; cancellation.cancel(); }
             if (warning.code == "no_gpu_device" || warning.code == "gpu_init_failed" ||
-                (candidate.mtp != 0 && warning.code == "mtp_tensors_ignored")) {
+                (uses_mtp(candidate) && warning.code == "mtp_tensors_ignored")) {
                 fatal_log = warning.code;
                 cancellation.cancel();
             }
@@ -460,18 +463,25 @@ Measurement run_candidate(const Options &o, const Candidate &candidate, Phase ph
             }
             Timings timings;
             if (status.ok() && phase == Phase::benchmark) {
+                const SpecMode spec_mode =
+                    candidate.mtp == 0 ? SpecMode::none : (uses_mtp(candidate) ? SpecMode::mtp : SpecMode::ngram);
+                bool any_ngram_drafts = false;
                 for (const auto &work : decode_workloads()) {
                     if (token.cancelled() || d.interrupted() || Clock::now() >= deadline) {
                         status = {ErrorCode::cancelled, "decode suite cancelled before the next class"};
                         break;
                     }
                     WorkloadMeasurement measured;
-                    status = decode_workload(exchange, port, work, candidate.mtp != 0, deadline, token, measured);
+                    status = decode_workload(exchange, port, work, spec_mode, deadline, token, measured);
                     if (!status.ok()) {
                         status = {status.code(), std::string(work.name) + ": " + status.message()};
                         break;
                     }
+                    if (measured.draft_n && *measured.draft_n > 0) any_ngram_drafts = true;
                     result.workloads.push_back(std::move(measured));
+                }
+                if (status.ok() && spec_mode == SpecMode::ngram && !any_ngram_drafts) {
+                    status = {ErrorCode::protocol_error, "ngram-mod requested but no workload produced draft tokens"};
                 }
                 if (status.ok()) result.short_tps = weighted_decode_tps(result.workloads);
             }
@@ -498,7 +508,7 @@ Measurement run_candidate(const Options &o, const Candidate &candidate, Phase ph
         for (const auto &warning : diagnostics.warnings()) {
             if (warning.code == "kv_kernel_f16_fallback") result.slow_kernel = true;
             if (warning.code == "no_gpu_device" || warning.code == "gpu_init_failed" ||
-                (candidate.mtp != 0 && warning.code == "mtp_tensors_ignored")) fatal_log = warning.code;
+                (uses_mtp(candidate) && warning.code == "mtp_tensors_ignored")) fatal_log = warning.code;
         }
     } catch (const std::exception &e) { probe_status = {ErrorCode::io_error, e.what()}; }
     if (vanished_after_ready) {

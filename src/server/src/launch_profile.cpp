@@ -38,6 +38,10 @@ bool valid_name(std::string_view name) {
 
 bool has_nul(std::string_view s) { return s.find('\0') != std::string_view::npos; }
 
+bool has_nul_or_newline(std::string_view s) {
+    return has_nul(s) || s.find('\r') != std::string_view::npos || s.find('\n') != std::string_view::npos;
+}
+
 std::string canonical_flash_attn(std::string_view v) {
     if (v == "on" || v == "enabled") return "on";
     if (v == "off" || v == "disabled") return "off";
@@ -126,7 +130,7 @@ constexpr std::pair<std::string_view, std::string_view> kTypedFlags[] = {
     {"-tb", "threads_batch"}, {"--threads-batch", "threads_batch"},
     {"--jinja", "jinja"}, {"--no-jinja", "jinja"},
     {"--reasoning-format", "reasoning_format"},
-    {"--reasoning", "reasoning"},
+    {"-rea", "reasoning"}, {"--reasoning", "reasoning"},
     {"--reasoning-budget", "reasoning_budget"},
     {"--temp", "sampling.temperature"}, {"--temperature", "sampling.temperature"},
     {"--top-p", "sampling.top_p"}, {"--top-k", "sampling.top_k"}, {"--min-p", "sampling.min_p"},
@@ -149,8 +153,11 @@ constexpr std::string_view kForbiddenFlags[] = {
 // or serves a directory). A profile is data that is meant to be shared, so it
 // may not switch them on; the `--no-*` spellings stay allowed.
 constexpr std::string_view kUnsafeFeatureFlags[] = {
-    "--tools", "--tools-runtime", "--mcp-servers-config", "--mcp-servers-json", "-ag", "--agent",
-    "--ui-mcp-proxy", "--webui-mcp-proxy", "--path", "--media-path",
+    "--tools", "--tools-runtime", "--allow-unauthenticated-tools",
+    "--mcp-servers-config", "--mcp-servers-json", "-ag", "--agent",
+    "--ui-mcp-proxy", "--webui-mcp-proxy", "--ui-mcp-proxy-allow-private-urls",
+    "--ui-config-file", "--webui-config-file",
+    "--path", "--media-path", "--media-allow-private-urls",
 };
 
 // llama-server flags that write prompts or logs to an arbitrary local path.
@@ -162,11 +169,11 @@ constexpr std::string_view kDiskWriteFlags[] = {
     "--log-file", "--log-prompts-dir", "-lcd", "--lookup-cache-dynamic",
 };
 
-// llama-server flags that move model work to other machines: `--rpc
-// HOST:PORT,...` registers remote rpc-server devices, and layers placed on
-// them send their tensors and every request's activations over the network.
-// A shared profile must not route prompts off this host.
-constexpr std::string_view kRemoteOffloadFlags[] = {"--rpc"};
+// llama-server flags that move model work to other machines or expose P2P
+// remote tunnels: `--rpc HOST:PORT,...` registers remote rpc-server devices,
+// and `--connect`/`--connect-code` tunnel requests off-host. A shared profile
+// must not route prompts off this host.
+constexpr std::string_view kRemoteOffloadFlags[] = {"--rpc", "--connect", "--connect-code"};
 
 // llama-server flags that choose a program for the child to run:
 // `--video-ffmpeg-dir` is the directory it starts ffmpeg and ffprobe from for
@@ -216,6 +223,7 @@ Status check_extra_args(const LaunchProfile& p) {
     for (const auto& arg : p.extra_args) {
         if (has_nul(arg)) return bad(where_of(p), "extra_args must not contain NUL");
         if (arg.size() < 2 || arg[0] != '-') continue;  // a value, not a flag
+        if (has_nul_or_newline(arg)) return bad(where_of(p), "extra_args flag must not contain newline characters");
         // Judge the flag llama-server will actually run: it reads
         // `--mcp_servers_json` as `--mcp-servers-json`.
         const std::string flag = llamaserver_flag_name(arg);
@@ -460,8 +468,10 @@ Status validate_launch_profile(const LaunchProfile& p) {
     if (p.backend != kLaunchProfileBackendLlamaServer && p.backend != kLaunchProfileBackendLlamaCpp) {
         return bad(where, "'backend' must be llamaserver or llamacpp");
     }
-    if (p.model.empty() || has_nul(p.model)) return bad(where, "'model' must be a GGUF path");
-    if (has_nul(p.mmproj)) return bad(where, "'mmproj' must not contain NUL");
+    if (p.model.empty() || has_nul_or_newline(p.model)) {
+        return bad(where, "'model' must be a GGUF path without NUL or newline characters");
+    }
+    if (has_nul_or_newline(p.mmproj)) return bad(where, "'mmproj' must not contain NUL or newline characters");
     if (p.mmproj.empty() && (p.mmproj_offload || p.image_max_tokens)) {
         return bad(where, "'mmproj_offload' and 'image_max_tokens' need 'mmproj'");
     }
@@ -533,7 +543,9 @@ Status validate_launch_profile(const LaunchProfile& p) {
             if (!seen.insert(t).second) return bad(where, "speculative type '" + t + "' is listed twice");
         }
         if (seen.count("none") && seen.size() > 1) return bad(where, "speculative type 'none' cannot be combined");
-        if (has_nul(p.speculative->draft_model)) return bad(where, "'speculative.draft_model' must not contain NUL");
+        if (has_nul_or_newline(p.speculative->draft_model)) {
+            return bad(where, "'speculative.draft_model' must not contain NUL or newline characters");
+        }
     }
     SamplingConfig check;
     apply_sampling_defaults(p.sampling, check);

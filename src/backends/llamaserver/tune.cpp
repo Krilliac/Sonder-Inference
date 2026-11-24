@@ -36,7 +36,13 @@ bool faster(const Measurement &a, const Measurement &b) {
     if (aw && bw && *aw != *bw) return *aw > *bw;
     if (a.prefill_tps != b.prefill_tps) return a.prefill_tps > b.prefill_tps;
     if (a.candidate.ctx != b.candidate.ctx) return a.candidate.ctx > b.candidate.ctx;
-    return a.candidate.mtp < b.candidate.mtp;
+    if (a.candidate.mtp != b.candidate.mtp) return a.candidate.mtp < b.candidate.mtp;
+    const auto rank_fa = [](std::string_view fa) noexcept -> int {
+        if (fa == "on") return 0;
+        if (fa == "auto") return 1;
+        return 2;
+    };
+    return rank_fa(a.candidate.flash_attn) < rank_fa(b.candidate.flash_attn);
 }
 json::Object spawn_config(const Options &options, const Candidate &candidate) {
     json::Array args;
@@ -73,7 +79,7 @@ json::Value measurement_json(const Measurement &m) {
     return json::Object{{"ctx", m.candidate.ctx}, {"k", m.candidate.kv.k}, {"v", m.candidate.kv.v},
         {"flash_attn", m.candidate.flash_attn}, {"ubatch", m.candidate.ubatch}, {"mtp_n", m.candidate.mtp},
         {"spec_type", m.candidate.mtp == 0 ? "none" : m.candidate.spec_type},
-        {"p_min", m.candidate.mtp == 0 ? json::Value{} : json::Value(m.candidate.p_min)},
+        {"p_min", uses_mtp(m.candidate) ? json::Value(m.candidate.p_min) : json::Value{}},
         {"phase", m.phase == Phase::probe ? "probe" : "benchmark"},
         {"shared_mib", mib(m.shared_bytes)}, {"dedicated_mib", mib(m.dedicated_bytes)},
         {"short_tok_s", m.short_tps}, {"prefill_tok_s", m.prefill_tps},
@@ -106,7 +112,7 @@ std::optional<double> weighted_decode_tps(const std::vector<WorkloadMeasurement>
     return std::isfinite(total) ? std::optional<double>(total) : std::nullopt;
 }
 const SpillGuardOptions &spill_guard_for(const Grid &grid, const Candidate &candidate) {
-    return candidate.mtp > 0 ? grid.spill_mtp : grid.spill;
+    return uses_mtp(candidate) ? grid.spill_mtp : grid.spill;
 }
 const char *to_string(Verdict verdict) {
     switch (verdict) {
@@ -286,8 +292,12 @@ std::vector<Candidate> planned_candidates(const Grid &grid, bool mtp_available) 
                         } else {
                             for (const auto &type : grid.spec_type) {
                                 if (!mtp_available && spec_type_requires_mtp(type)) continue;
-                                for (const auto p : grid.p_min)
-                                    candidates.push_back({kv, ctx, ubatch, mtp, type, p, fa});
+                                if (type == "ngram-mod") {
+                                    candidates.push_back({kv, ctx, ubatch, mtp, type, 0.0, fa});
+                                } else {
+                                    for (const auto p : grid.p_min)
+                                        candidates.push_back({kv, ctx, ubatch, mtp, type, p, fa});
+                                }
                             }
                         }
                     }
@@ -310,10 +320,14 @@ std::vector<std::string> arguments(const Options &o, const Candidate &c) {
     if (!o.mmproj.empty()) args.insert(args.end(), {"--mmproj", o.mmproj});
     // Explicit none avoids inheriting a speculative default from the environment.
     // Older executables without --spec-type support use the ordinary default.
-    if (c.mtp != 0)
-        args.insert(args.end(), {"--spec-type", c.spec_type, "--spec-draft-n-max", std::to_string(c.mtp),
-            "--spec-draft-p-min", std::to_string(c.p_min)});
-    else if (o.spec_type_supported) args.insert(args.end(), {"--spec-type", "none"});
+    if (c.mtp != 0) {
+        if (c.spec_type == "ngram-mod") {
+            args.insert(args.end(), {"--spec-type", c.spec_type, "--spec-ngram-mod-n-max", std::to_string(c.mtp)});
+        } else {
+            args.insert(args.end(), {"--spec-type", c.spec_type, "--spec-draft-n-max", std::to_string(c.mtp),
+                "--spec-draft-p-min", std::to_string(c.p_min)});
+        }
+    } else if (o.spec_type_supported) args.insert(args.end(), {"--spec-type", "none"});
     return args;
 }
 
@@ -414,10 +428,16 @@ Report search(const Options &o, bool mtp_available, Deadline deadline, const Tri
                 } else {
                     for (const auto &spec_type : o.grid.spec_type) {
                         if (!mtp_available && spec_type_requires_mtp(spec_type)) continue;
-                        for (const auto p_min : o.grid.p_min) {
+                        if (spec_type == "ngram-mod") {
                             c.spec_type = spec_type;
-                            c.p_min = p_min;
+                            c.p_min = 0.0;
                             measure(c);
+                        } else {
+                            for (const auto p_min : o.grid.p_min) {
+                                c.spec_type = spec_type;
+                                c.p_min = p_min;
+                                measure(c);
+                            }
                         }
                     }
                 }
@@ -468,7 +488,7 @@ std::string markdown(const Report &report) {
             << ", ctx " << m.candidate.ctx
             << ", ubatch " << m.candidate.ubatch << ", MTP " << m.candidate.mtp
             << ", spec_type " << (m.candidate.mtp == 0 ? "none" : m.candidate.spec_type);
-        if (m.candidate.mtp != 0) out << ", p_min " << m.candidate.p_min;
+        if (uses_mtp(m.candidate)) out << ", p_min " << m.candidate.p_min;
         out << ", " << std::fixed << std::setprecision(1) << *weighted_decode_tps(m.workloads)
             << " weighted decode tok/s.\n";
     };
@@ -487,7 +507,7 @@ std::string markdown(const Report &report) {
             << m.candidate.kv.v << " | " << m.candidate.flash_attn << " | " << m.candidate.ctx << " | "
             << m.candidate.ubatch << " | "
             << m.candidate.mtp << " | " << (m.candidate.mtp == 0 ? "none" : m.candidate.spec_type) << " | ";
-        if (m.candidate.mtp != 0) out << m.candidate.p_min;
+        if (uses_mtp(m.candidate)) out << m.candidate.p_min;
         else out << "-";
         out << " | ";
         number(m.shared_bytes, static_cast<double>(kMiB)); out << " | ";

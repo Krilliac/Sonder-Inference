@@ -7,6 +7,7 @@
 #include <iosfwd>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "gpu_memory.hpp"
@@ -78,9 +79,22 @@ struct Candidate {
     std::string spec_type = "draft-mtp";
     double p_min = 0.0;
     std::string flash_attn = "on";
-    bool operator==(const Candidate &) const = default;
+    bool operator==(const Candidate &other) const noexcept {
+        if (kv != other.kv || ctx != other.ctx || ubatch != other.ubatch || mtp != other.mtp ||
+            flash_attn != other.flash_attn)
+            return false;
+        if (mtp == 0) return true;
+        if (spec_type != other.spec_type) return false;
+        if (spec_type == "ngram-mod") return true;
+        return p_min == other.p_min;
+    }
 };
-// The spill rule that applies to `candidate` (spill_mtp when it speculates).
+// True when `candidate` uses multi-token prediction weights/buffers
+// (draft-mtp or draft-mtp,ngram-mod), as opposed to baseline or standalone ngram-mod.
+inline bool uses_mtp(const Candidate &candidate) noexcept {
+    return candidate.mtp != 0 && candidate.spec_type != "ngram-mod";
+}
+// The spill rule that applies to `candidate` (spill_mtp when it uses MTP).
 const SpillGuardOptions &spill_guard_for(const Grid &grid, const Candidate &candidate);
 enum class Phase { probe, benchmark };
 enum class Verdict { clean, spill, slow_kernel, error, unsupported, timed_out, cancelled, release_failed };
@@ -151,6 +165,7 @@ Report search(const Options &options, bool mtp_available, Deadline deadline, con
 void rank(Report &report);
 json::Value report_json(const Options &options, const Report &report);
 std::string markdown(const Report &report);
+bool help_supports_spec_type(std::string_view help);
 int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostream &err);
 
 } // namespace sonder::inference::llamaserver::tune

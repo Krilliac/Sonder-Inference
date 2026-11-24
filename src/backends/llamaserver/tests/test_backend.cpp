@@ -2,12 +2,15 @@
 
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <exception>
 #include <limits>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
+#include "../llamaserver_options.hpp"
 #include "../llamaserver_protocol.hpp"
 #include "fake_server.hpp"
 #include "sonder/inference/backends/llamaserver.hpp"
@@ -625,5 +628,185 @@ TEST_SUITE("llamaserver_backend") {
         GenerateRequest q;
         q.prompt = "x";
         CHECK(m.value()->generate(q, {}, {}).status().code() == ErrorCode::protocol_error);
+    }
+
+    TEST_CASE("llamaserver uma_mode JSON parser accepts booleans and strings and rejects invalid values") {
+        std::string mode;
+        auto parsed = json::parse("true");
+        REQUIRE(parsed.ok());
+        REQUIRE(llamaserver::parse_uma_mode_json(parsed.value(), mode).ok());
+        CHECK(mode == "on");
+
+        parsed = json::parse("false");
+        REQUIRE(parsed.ok());
+        REQUIRE(llamaserver::parse_uma_mode_json(parsed.value(), mode).ok());
+        CHECK(mode == "off");
+
+        const std::pair<const char *, const char *> valid_strings[] = {
+            {"\"auto\"", "auto"},
+            {"\"on\"", "on"},
+            {"\"off\"", "off"},
+            {"\"true\"", "on"},
+            {"\"false\"", "off"},
+        };
+        for (const auto &[raw, expected] : valid_strings) {
+            parsed = json::parse(raw);
+            REQUIRE(parsed.ok());
+            REQUIRE(llamaserver::parse_uma_mode_json(parsed.value(), mode).ok());
+            CHECK(mode == expected);
+        }
+
+        for (const auto *bad : {"\"\"", "\"yes\"", "\"no\"", "\"AUTO\"", "0", "1", "null", "[]", "{}"}) {
+            parsed = json::parse(bad);
+            REQUIRE(parsed.ok());
+            const auto st = llamaserver::parse_uma_mode_json(parsed.value(), mode);
+            CHECK_MESSAGE(st.code() == ErrorCode::invalid_argument, bad);
+        }
+    }
+
+    TEST_CASE("llamaserver resolve_uma_mode handles discrete, mixed, APU-only, and headless inventories") {
+        constexpr std::uint64_t kMiB = 1024ull * 1024ull;
+        constexpr std::uint64_t kGiB = 1024ull * kMiB;
+
+        GpuDeviceInfo rtx;
+        rtx.id = "gpu:0";
+        rtx.name = "NVIDIA GeForce RTX 5070 Ti";
+        rtx.vendor = GpuVendor::nvidia;
+        rtx.vendor_id = 0x10DEu;
+        rtx.dedicated_total = MemoryReading::known(16303 * kMiB);
+        rtx.shared_total = MemoryReading::known(16 * kGiB);
+        rtx.is_integrated_uma = false;
+        rtx.backend_hint = "cuda";
+
+        GpuDeviceInfo ryzen_780m;
+        ryzen_780m.id = "gpu:1";
+        ryzen_780m.name = "AMD Radeon 780M Graphics";
+        ryzen_780m.vendor = GpuVendor::amd;
+        ryzen_780m.vendor_id = 0x1002u;
+        ryzen_780m.dedicated_total = MemoryReading::known(512 * kMiB);
+        ryzen_780m.shared_total = MemoryReading::known(16 * kGiB);
+        ryzen_780m.is_integrated_uma = true;
+        ryzen_780m.backend_hint = "vulkan";
+
+        GpuDeviceInfo apu_zero = ryzen_780m;
+        apu_zero.id = "gpu:0";
+        GpuDeviceInfo rtx_one = rtx;
+        rtx_one.id = "gpu:1";
+
+        const std::vector<GpuDeviceInfo> rtx_only{rtx};
+        const std::vector<GpuDeviceInfo> mixed_rtx_first{rtx, ryzen_780m};
+        const std::vector<GpuDeviceInfo> mixed_igpu_first{apu_zero, rtx_one};
+        const std::vector<GpuDeviceInfo> apu_only{apu_zero};
+        const std::vector<GpuDeviceInfo> empty_gpus;
+
+        // Explicit modes
+        CHECK(llamaserver::resolve_uma_mode("on", rtx_only));
+        CHECK(llamaserver::resolve_uma_mode("true", empty_gpus));
+        CHECK_FALSE(llamaserver::resolve_uma_mode("off", apu_only));
+        CHECK_FALSE(llamaserver::resolve_uma_mode("false", apu_only));
+
+        // Discrete RTX only -> false
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", rtx_only));
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", rtx_only, "CUDA0"));
+
+        // Mixed RTX + Ryzen iGPU: default -> false, explicit Vulkan/AMD iGPU hint -> true
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", mixed_rtx_first));
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", mixed_igpu_first));
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", mixed_rtx_first, "Vulkan0"));
+        CHECK(llamaserver::resolve_uma_mode("auto", mixed_rtx_first, "Vulkan1"));
+        CHECK(llamaserver::resolve_uma_mode("auto", mixed_igpu_first, "Vulkan0"));
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", mixed_igpu_first, "Vulkan1"));
+        CHECK(llamaserver::resolve_uma_mode("auto", mixed_rtx_first, "ROCm0"));
+        CHECK(llamaserver::resolve_uma_mode("auto", mixed_rtx_first, "gpu:1"));
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", mixed_rtx_first, "CUDA0,Vulkan1"));
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", mixed_rtx_first, "none"));
+
+        // AMD Ryzen 780M APU-only -> true
+        CHECK(llamaserver::resolve_uma_mode("auto", apu_only));
+        CHECK(llamaserver::resolve_uma_mode("auto", apu_only, "Vulkan0"));
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", apu_only, "CUDA0"));
+
+        // Empty GPU list (headless CI) -> false
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", empty_gpus));
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", empty_gpus, "Vulkan0"));
+    }
+
+    TEST_CASE("llamaserver spill_guard mapping propagates uma_mode and validates uma_mode_policy") {
+        GpuDeviceInfo rtx;
+        rtx.id = "gpu:0";
+        rtx.vendor = GpuVendor::nvidia;
+        rtx.is_integrated_uma = false;
+        rtx.backend_hint = "cuda";
+
+        GpuDeviceInfo apu;
+        apu.id = "gpu:1";
+        apu.vendor = GpuVendor::amd;
+        apu.is_integrated_uma = true;
+        apu.backend_hint = "vulkan";
+
+        const std::vector<GpuDeviceInfo> mixed{rtx, apu};
+        const std::vector<GpuDeviceInfo> apu_only{apu};
+
+        // Omitted uma_mode keeps both flags false for backwards compatibility.
+        {
+            LlamaServerSpillGuardOptions o;
+            const auto mapped = llamaserver::to_spill_guard_options(o, {}, apu_only);
+            CHECK_FALSE(mapped.uma_mode);
+            CHECK_FALSE(mapped.residency.uma_mode);
+        }
+
+        // Boolean spill_guard.uma_mode = true propagates to residency unless explicitly overridden.
+        {
+            LlamaServerSpillGuardOptions o;
+            o.uma_mode = true;
+            const auto propagated = llamaserver::to_spill_guard_options(o, {}, mixed);
+            CHECK(propagated.uma_mode);
+            CHECK(propagated.residency.uma_mode);
+
+            o.residency.uma_mode = false;
+            o.residency_uma_mode_explicit = true;
+            const auto overridden = llamaserver::to_spill_guard_options(o, {}, mixed);
+            CHECK(overridden.uma_mode);
+            CHECK_FALSE(overridden.residency.uma_mode);
+        }
+
+        // Policy "auto" honors --device / -dev hint in args and propagates consistently.
+        {
+            LlamaServerSpillGuardOptions o;
+            o.uma_mode_policy = "auto";
+            const auto on_default = llamaserver::to_spill_guard_options(o, {}, mixed);
+            CHECK_FALSE(on_default.uma_mode);
+            CHECK_FALSE(on_default.residency.uma_mode);
+
+            const auto on_vk1 = llamaserver::to_spill_guard_options(o, {"--device", "Vulkan1"}, mixed);
+            CHECK(on_vk1.uma_mode);
+            CHECK(on_vk1.residency.uma_mode);
+
+            const auto on_dev_eq = llamaserver::to_spill_guard_options(o, {"-dev=Vulkan1"}, mixed);
+            CHECK(on_dev_eq.uma_mode);
+            CHECK(on_dev_eq.residency.uma_mode);
+
+            const auto on_apu = llamaserver::to_spill_guard_options(o, {}, apu_only);
+            CHECK(on_apu.uma_mode);
+            CHECK(on_apu.residency.uma_mode);
+
+            // Last --device wins, and a dangling --device clears the hint (discrete RTX wins).
+            const std::vector<std::string> multi_dev{"--device", "CUDA0", "--device", "Vulkan1"};
+            const std::vector<std::string> dangling_dev{"--device", "Vulkan1", "--device"};
+            CHECK(llamaserver::extract_device_hint(multi_dev) == "Vulkan1");
+            CHECK(llamaserver::extract_device_hint(dangling_dev).empty());
+        }
+
+        // validate_backend_options accepts valid uma_mode_policy and rejects invalid ones.
+        {
+            LlamaServerBackendOptions spawn;
+            spawn.mode = LlamaServerMode::spawn;
+            spawn.executable = "llama-server";
+            spawn.spill_guard.uma_mode_policy = "auto";
+            CHECK(llamaserver::validate_backend_options(spawn).ok());
+
+            spawn.spill_guard.uma_mode_policy = "invalid";
+            CHECK(llamaserver::validate_backend_options(spawn).code() == ErrorCode::invalid_argument);
+        }
     }
 }

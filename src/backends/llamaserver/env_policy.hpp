@@ -50,8 +50,48 @@ inline bool ends_with(std::string_view s, std::string_view suffix) noexcept {
 }
 
 inline bool is_credential_suffix(std::string_view upper) noexcept {
-    return ends_with(upper, "_TOKEN") || ends_with(upper, "_API_KEY") || ends_with(upper, "_SECRET") ||
-           ends_with(upper, "_PASSWORD");
+    static constexpr std::string_view kSensitiveSuffixes[] = {
+        "_TOKEN",      "_API_KEY",     "_SECRET",     "_PASSWORD", "_SECRET_KEY", "_APIKEY",
+        "_ACCESS_KEY", "_PRIVATE_KEY", "_AUTH",       "_AUTH_KEY", "_PASSWD",     "_PASS",
+        "_CREDENTIAL", "_CREDENTIALS", "_BEARER",     "_PROXY",    "_CERT_FILE",  "_CA_BUNDLE",
+    };
+    for (const std::string_view suffix : kSensitiveSuffixes) {
+        if (ends_with(upper, suffix)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Explicit denylist of GPU runtime DLL/.so loaders, layer/driver injection hooks,
+// and file-write log path variables. Checked before any prefix allowlist so
+// broad vendor prefixes (GGML_*, CUDA_*, HSA_*, VK_*, MESA_*, AMD_*, ROCBLAS_*,
+// HIPBLASLT_*) can never load arbitrary libraries or write arbitrary files.
+inline bool is_gpu_loader_or_log_hook_upper(std::string_view upper) noexcept {
+    if (starts_with(upper, "ROCBLAS_LOG_")) {
+        return true;
+    }
+    static constexpr std::string_view kBlockedHooks[] = {
+        "GGML_BACKEND_PATH",
+        "CUDA_INJECTION64_PATH",
+        "CUDA_INJECTION32_PATH",
+        "HSA_TOOLS_LIB",
+        "VK_LAYER_PATH",
+        "VK_ADD_LAYER_PATH",
+        "VK_INSTANCE_LAYERS",
+        "VK_LOADER_LAYERS_ENABLE",
+        "VK_DRIVER_FILES",
+        "VK_ADD_DRIVER_FILES",
+        "MESA_LOADER_DRIVER_OVERRIDE",
+        "AMD_LOG_LEVEL_FILE",
+        "HIPBLASLT_LOG_FILE",
+    };
+    for (const std::string_view hook : kBlockedHooks) {
+        if (upper == hook) {
+            return true;
+        }
+    }
+    return false;
 }
 
 inline bool is_gpu_runtime_prefix(std::string_view upper) noexcept {
@@ -83,7 +123,8 @@ inline bool is_gpu_runtime_exact(std::string_view upper) noexcept {
 inline bool is_forbidden_override_upper(std::string_view upper) noexcept {
     if (starts_with(upper, "AIP_") || starts_with(upper, "LLAMA_") || starts_with(upper, "HF_") ||
         starts_with(upper, "HUGGING_FACE_") || starts_with(upper, "HUGGINGFACE_") || starts_with(upper, "MCP_") ||
-        starts_with(upper, "LD_") || starts_with(upper, "DYLD_") || is_credential_suffix(upper)) {
+        starts_with(upper, "LD_") || starts_with(upper, "DYLD_") || is_credential_suffix(upper) ||
+        is_gpu_loader_or_log_hook_upper(upper)) {
         return true;
     }
     static constexpr std::string_view kForbiddenExact[] = {
@@ -102,9 +143,9 @@ inline bool is_forbidden_override_upper(std::string_view upper) noexcept {
 }
 
 inline bool is_allowed_inherited_upper(std::string_view upper) noexcept {
-    if (is_credential_suffix(upper) || starts_with(upper, "LLAMA_") || starts_with(upper, "HF_") ||
-        starts_with(upper, "HUGGING_FACE_") || starts_with(upper, "HUGGINGFACE_") || starts_with(upper, "AIP_") ||
-        starts_with(upper, "MCP_") || starts_with(upper, "SONDER_")) {
+    if (is_credential_suffix(upper) || is_gpu_loader_or_log_hook_upper(upper) || starts_with(upper, "LLAMA_") ||
+        starts_with(upper, "HF_") || starts_with(upper, "HUGGING_FACE_") || starts_with(upper, "HUGGINGFACE_") ||
+        starts_with(upper, "AIP_") || starts_with(upper, "MCP_") || starts_with(upper, "SONDER_")) {
         return false;
     }
     if (is_gpu_runtime_prefix(upper) || is_gpu_runtime_exact(upper) || starts_with(upper, "LC_") ||

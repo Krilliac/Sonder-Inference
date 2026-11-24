@@ -242,6 +242,41 @@ TEST_CASE("parse_linux_drm_fdinfo parses units, deduplicates client ids, and ign
     CHECK(vram == 0);
     CHECK(gtt == 0);
 
+    // Hybrid AMD+NVIDIA Linux host: nvidia-drm/nvidia fdinfo entries are excluded
+    // so NVIDIA VRAM is never double-counted alongside NVML.
+    const std::string nvidia_only =
+        "drm-driver:\tnvidia-drm\n"
+        "drm-client-id:\t1\n"
+        "drm-memory-vram:\t14000 MiB\n"
+        "drm-memory-gtt:\t128 MiB\n";
+    vram = 55;
+    gtt = 66;
+    CHECK_FALSE(parse_linux_drm_fdinfo(nvidia_only, vram, gtt));
+    CHECK(vram == 0);
+    CHECK(gtt == 0);
+
+    const std::string hybrid =
+        "pos:\t0\n"
+        "drm-driver:\tnvidia-drm\n"
+        "drm-client-id:\t1\n"
+        "drm-memory-vram:\t14000 MiB\n"
+        "drm-memory-gtt:\t128 MiB\n"
+        "\n"
+        "pos:\t0\n"
+        "drm-driver:\tnvidia\n"
+        "drm-client-id:\t2\n"
+        "drm-memory-vram:\t2000 MiB\n"
+        "drm-memory-gtt:\t64 MiB\n"
+        "\n"
+        "pos:\t0\n"
+        "drm-driver:\tamdgpu\n"
+        "drm-client-id:\t3\n"
+        "drm-memory-vram:\t1024 MiB\n"
+        "drm-memory-gtt:\t96 MiB\n";
+    REQUIRE(parse_linux_drm_fdinfo(hybrid, vram, gtt));
+    CHECK(vram == 1024ull * MiB);
+    CHECK(gtt == 96ull * MiB);
+
     const std::string malformed =
         "pos:\t0\n"
         "flags:\t0100000\n"

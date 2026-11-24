@@ -1,13 +1,20 @@
 // Backend tests that need llama.cpp linked but no model weights. Tokenization
 // uses llama.cpp's bundled vocab-only GGUF fixtures (tokenizer metadata only).
+#include <cstdint>
 #include <limits>
 #include <regex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include "sonder/inference/backends/llamacpp.hpp"
 #include <doctest/doctest.h>
+
+namespace sonder::inference::llamacpp_detail {
+Result<std::int32_t> ResolveGpuLayers(const LlamaCppBackendOptions& options, std::string_view device_id,
+                                      bool has_gpu_backend);
+}  // namespace sonder::inference::llamacpp_detail
 
 using namespace sonder::backends::llamacpp;
 
@@ -396,4 +403,58 @@ TEST_CASE("llamacpp adapter: multi-GPU placement options validate and forward") 
     si::ModelLoadOptions ml;
     ml.model = "this/file/does/not/exist.gguf";
     CHECK(be->load_model(ml).status().code() == si::ErrorCode::invalid_argument);
+}
+
+TEST_CASE("llamacpp adapter: explicit devices honor gpu_layers when device_id is empty") {
+    namespace si = sonder::inference;
+    using si::llamacpp_detail::ResolveGpuLayers;
+
+    // Default (no explicit devices) with empty device_id remains CPU-only (0 layers).
+    si::LlamaCppBackendOptions defaults;
+    defaults.gpu_layers = -1;
+    auto r = ResolveGpuLayers(defaults, "", /*has_gpu_backend=*/true);
+    REQUIRE(r.ok());
+    CHECK(r.value() == 0);
+
+    // Explicit ggml devices (e.g. CUDA0 or Vulkan0) with empty device_id honor gpu_layers.
+    si::LlamaCppBackendOptions explicit_cuda;
+    explicit_cuda.devices = {"CUDA0"};
+    explicit_cuda.gpu_layers = -1;
+    r = ResolveGpuLayers(explicit_cuda, "", /*has_gpu_backend=*/false);
+    REQUIRE(r.ok());
+    CHECK(r.value() == -1);
+
+    si::LlamaCppBackendOptions explicit_vulkan;
+    explicit_vulkan.devices = {"Vulkan0"};
+    explicit_vulkan.gpu_layers = 28;
+    r = ResolveGpuLayers(explicit_vulkan, "", /*has_gpu_backend=*/true);
+    REQUIRE(r.ok());
+    CHECK(r.value() == 28);
+
+    // Explicit "cpu:*" device_id still forces 0 layers even when options.devices is set.
+    r = ResolveGpuLayers(explicit_cuda, "cpu:0", /*has_gpu_backend=*/true);
+    REQUIRE(r.ok());
+    CHECK(r.value() == 0);
+
+    // Explicit "gpu:*" checks GPU backend availability and honors gpu_layers.
+    r = ResolveGpuLayers(defaults, "gpu:0", /*has_gpu_backend=*/true);
+    REQUIRE(r.ok());
+    CHECK(r.value() == -1);
+    CHECK(ResolveGpuLayers(defaults, "gpu:0", /*has_gpu_backend=*/false).status().code() ==
+          si::ErrorCode::unsupported);
+
+    // Unsupported device_id prefix still fails with unsupported.
+    CHECK(ResolveGpuLayers(explicit_cuda, "npu:0", /*has_gpu_backend=*/true).status().code() ==
+          si::ErrorCode::unsupported);
+
+    // End-to-end: empty device_id with a valid explicit ggml device ("CPU") passes
+    // device resolution cleanly and reaches the missing-file check.
+    si::LlamaCppBackendOptions explicit_cpu;
+    explicit_cpu.devices = {"CPU"};
+    explicit_cpu.gpu_layers = -1;
+    auto be = si::make_llamacpp_backend(explicit_cpu);
+    si::ModelLoadOptions ml;
+    ml.model = "this/file/does/not/exist.gguf";
+    ml.device_id = "";
+    CHECK(be->load_model(ml).status().code() == si::ErrorCode::not_found);
 }

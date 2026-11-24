@@ -39,6 +39,12 @@ constexpr std::uint64_t kMaxRecurrentStateValues = 1ull << 28;
 
 Status malformed(const std::string& what) { return Status(ErrorCode::invalid_argument, "GGUF header: " + what); }
 
+bool checked_add(std::uint64_t& dst, std::uint64_t add) noexcept {
+    if (add > std::numeric_limits<std::uint64_t>::max() - dst) return false;
+    dst += add;
+    return true;
+}
+
 bool printable(std::string_view text) {
     return std::all_of(text.begin(), text.end(), [](char ch) { return ch >= 0x20 && ch < 0x7f; });
 }
@@ -677,7 +683,11 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
         if (type == 39 || type == 40 || type == 43) {
             info.has_fp4_or_fp8_tensors = true;
         }
-        const std::uint64_t bytes = (elements + block_elems - 1) / block_elems * block_bytes;
+        const std::uint64_t num_blocks = elements / block_elems + (elements % block_elems != 0 ? 1u : 0u);
+        if (num_blocks > std::numeric_limits<std::uint64_t>::max() / block_bytes) {
+            return malformed("tensor too large");
+        }
+        const std::uint64_t bytes = num_blocks * block_bytes;
         std::uint32_t tensor_block = kNoBlock;
         if (name.rfind("blk.", 0) == 0) {
             const auto dot = name.find('.', 4);
@@ -688,7 +698,7 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
                 layer = layer * 10 + static_cast<std::uint64_t>(name[k] - '0');
             }
             if (!ok || layer >= info.block_count) return malformed("tensor " + excerpt(name) + " names an unknown block");
-            info.block_bytes[layer] += bytes;
+            if (!checked_add(info.block_bytes[layer], bytes)) return malformed("tensor sizes overflow");
             tensor_block = static_cast<std::uint32_t>(layer);
             const std::string suffix = name.substr(dot + 1);
             if (suffix == "attn_k.weight" || suffix == "attn_kv_a_mqa.weight") {
@@ -696,12 +706,12 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
                 any_attention_tensor = true;
             }
         } else if (name == "token_embd.weight") {
-            info.embedding_bytes += bytes;
+            if (!checked_add(info.embedding_bytes, bytes)) return malformed("tensor sizes overflow");
         } else if (name.rfind("output", 0) == 0) {
-            info.output_bytes += bytes;
+            if (!checked_add(info.output_bytes, bytes)) return malformed("tensor sizes overflow");
             if (name == "output.weight") output_vocab = second;
         } else {
-            info.other_bytes += bytes;
+            if (!checked_add(info.other_bytes, bytes)) return malformed("tensor sizes overflow");
         }
         if (info.tensors.size() < kMaxStoredTensors && name.size() <= kMaxStoredTensorName) {
             GgufTensorInfo entry;
