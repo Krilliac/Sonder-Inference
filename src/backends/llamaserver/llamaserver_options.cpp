@@ -324,6 +324,23 @@ bool to_host_memory_options(const LlamaServerHostMemoryOptions &o, HostMemoryOpt
     return true;
 }
 
+AdaptiveSpeculationConfig to_adaptive_speculation_config(const LlamaServerAdaptiveSpeculationOptions &o) noexcept {
+    AdaptiveSpeculationConfig cfg;
+    cfg.enabled = o.enabled;
+    cfg.min_draft_n = o.min_draft_n;
+    cfg.initial_draft_n = o.initial_draft_n;
+    cfg.max_draft_n = o.max_draft_n;
+    cfg.window_size = o.window_size;
+    cfg.min_samples = o.min_samples;
+    cfg.pause_acceptance_threshold = o.pause_acceptance_threshold;
+    cfg.step_down_acceptance_threshold = o.step_down_acceptance_threshold;
+    cfg.step_up_acceptance_threshold = o.step_up_acceptance_threshold;
+    cfg.cooldown_requests = o.cooldown_requests;
+    cfg.probe_draft_n = o.probe_draft_n;
+    cfg.min_draft_tokens_per_sample = o.min_draft_tokens_per_sample;
+    return cfg;
+}
+
 Result<std::string> read_api_key(const std::string &name) {
     const bool name_ok = !name.empty() && name.size() <= 128 &&
                          !std::isdigit(static_cast<unsigned char>(name.front())) &&
@@ -386,6 +403,17 @@ Status validate_backend_options(const LlamaServerBackendOptions &options) {
     if (!options.upstream_grammar && !options.grammar.empty())
         return {ErrorCode::invalid_argument,
                 "llamaserver: grammar is configured but the upstream declares no grammar support"};
+    if (options.adaptive_speculation.enabled) {
+        if (!options.native_completion) {
+            return {ErrorCode::invalid_argument,
+                    "llamaserver: adaptive_speculation requires native_completion=true"};
+        }
+        if (auto st = validate_adaptive_speculation_config(
+                to_adaptive_speculation_config(options.adaptive_speculation));
+            !st.ok()) {
+            return st;
+        }
+    }
     const auto slow_enabled = options.idle_timeout.count() != 0 || options.first_content_timeout.count() != 0 ||
                               options.unlimited_request_timeout || !options.api_key_env.empty();
     if (slow_enabled && options.mode != LlamaServerMode::attach)

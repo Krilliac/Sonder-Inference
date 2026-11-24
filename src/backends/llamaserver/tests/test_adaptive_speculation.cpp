@@ -332,6 +332,7 @@ TEST_CASE("cooldown reprobe recovers from paused state when acceptance improves"
     const auto probe1 = policy.recommend(SpeculationWorkload::prose);
     CHECK_FALSE(probe1.paused);
     CHECK(probe1.is_probe);
+    CHECK(probe1.probe_id > 0u);
     CHECK(probe1.draft_n_max == cfg.probe_draft_n);
     CHECK(probe1.reason == "cooldown_probe");
 
@@ -339,11 +340,15 @@ TEST_CASE("cooldown reprobe recovers from paused state when acceptance improves"
     const auto concurrent = policy.recommend(SpeculationWorkload::prose);
     CHECK(concurrent.paused);
     CHECK_FALSE(concurrent.is_probe);
+    CHECK(concurrent.probe_id == 0u);
     CHECK(concurrent.draft_n_max == 0);
     CHECK(concurrent.reason == "paused_probe_in_flight");
 
     // If the probe fails (10% < 25%), bucket stays paused and restarts cooldown.
-    const auto failed_probe = policy.observe(make_obs(SpeculationWorkload::prose, 20, 2));
+    auto fail_obs = make_obs(SpeculationWorkload::prose, 20, 2);
+    fail_obs.is_probe = true;
+    fail_obs.probe_id = probe1.probe_id;
+    const auto failed_probe = policy.observe(fail_obs);
     CHECK(failed_probe.paused);
     CHECK(failed_probe.draft_n_max == 0);
     CHECK(failed_probe.reason == "probe_failed_repaused");
@@ -358,11 +363,15 @@ TEST_CASE("cooldown reprobe recovers from paused state when acceptance improves"
     const auto probe2 = policy.recommend(SpeculationWorkload::prose);
     CHECK_FALSE(probe2.paused);
     CHECK(probe2.is_probe);
+    CHECK(probe2.probe_id > probe1.probe_id);
     CHECK(probe2.draft_n_max == cfg.probe_draft_n);
 
     // If the probe succeeds (85% >= 25%), stale bad history is cleared and
     // speculation unpauses immediately at probe_draft_n.
-    const auto recovered = policy.observe(make_obs(SpeculationWorkload::prose, 20, 17));
+    auto recov_obs = make_obs(SpeculationWorkload::prose, 20, 17);
+    recov_obs.is_probe = true;
+    recov_obs.probe_id = probe2.probe_id;
+    const auto recovered = policy.observe(recov_obs);
     CHECK_FALSE(recovered.paused);
     CHECK_FALSE(recovered.is_probe);
     CHECK(recovered.draft_n_max == cfg.probe_draft_n);
@@ -385,14 +394,18 @@ TEST_CASE("cooldown reprobe recovers from paused state when acceptance improves"
     for (std::uint32_t i = 0; i < cfg.cooldown_requests; ++i) {
         CHECK(policy.recommend(SpeculationWorkload::reasoning).paused);
     }
-    CHECK(policy.recommend(SpeculationWorkload::reasoning).is_probe);
-    policy.cancel_probe(SpeculationWorkload::reasoning);
+    const auto rp1 = policy.recommend(SpeculationWorkload::reasoning);
+    CHECK(rp1.is_probe);
+    CHECK(rp1.probe_id > probe2.probe_id);
+    policy.cancel_probe(SpeculationWorkload::reasoning, rp1.probe_id);
     for (std::uint32_t i = 0; i < cfg.cooldown_requests; ++i) {
         const auto d = policy.recommend(SpeculationWorkload::reasoning);
         CHECK(d.paused);
         CHECK_FALSE(d.is_probe);
     }
-    CHECK(policy.recommend(SpeculationWorkload::reasoning).is_probe);
+    const auto rp2 = policy.recommend(SpeculationWorkload::reasoning);
+    CHECK(rp2.is_probe);
+    CHECK(rp2.probe_id > rp1.probe_id);
 }
 
 TEST_CASE("ignores tiny noisy samples clamps malformed counts and converts timings") {
@@ -497,8 +510,13 @@ TEST_CASE("status_json exposes schema and reset restores initial state") {
     }
     CHECK(policy.recommend(SpeculationWorkload::prose).paused);
     CHECK(policy.recommend(SpeculationWorkload::prose).paused);
-    CHECK(policy.recommend(SpeculationWorkload::prose).is_probe);
-    policy.observe(make_obs(SpeculationWorkload::prose, 20, 16, 40, 75.0));
+    const auto prose_probe = policy.recommend(SpeculationWorkload::prose);
+    REQUIRE(prose_probe.is_probe);
+    CHECK(prose_probe.probe_id > 0u);
+    auto prose_probe_obs = make_obs(SpeculationWorkload::prose, 20, 16, 40, 75.0);
+    prose_probe_obs.is_probe = true;
+    prose_probe_obs.probe_id = prose_probe.probe_id;
+    policy.observe(prose_probe_obs);
 
     const json::Object status = policy.status_json();
     REQUIRE(status.find("enabled") != nullptr);
@@ -627,7 +645,10 @@ TEST_CASE("concurrent recommend observe and status_json stay thread safe and bou
                     violations.fetch_add(1);
                 }
                 const std::uint64_t accepted = (iter % 3 == 0) ? 18 : ((iter % 3 == 1) ? 3 : 12);
-                const auto upd = policy.observe(make_obs(workload, 20, accepted));
+                auto obs = make_obs(workload, 20, accepted);
+                obs.is_probe = rec.is_probe;
+                obs.probe_id = rec.probe_id;
+                const auto upd = policy.observe(obs);
                 if (upd.draft_n_max > cfg.max_draft_n || upd.sample_count > cfg.window_size ||
                     !std::isfinite(upd.rolling_acceptance) || upd.rolling_acceptance < 0.0 ||
                     upd.rolling_acceptance > 1.0 || (upd.draft_n_max == 0) != upd.paused) {
@@ -668,6 +689,7 @@ TEST_CASE("probe completing with zero draft tokens releases probe slot and resta
     }
     const auto probe = policy.recommend(SpeculationWorkload::prose);
     REQUIRE(probe.is_probe);
+    CHECK(probe.probe_id > 0u);
 
     // Concurrent non-probe request with 0 draft tokens must leave probe_in_flight intact.
     SpeculationObservation concurrent_non_probe = make_obs(SpeculationWorkload::prose, 0, 0);
@@ -679,6 +701,7 @@ TEST_CASE("probe completing with zero draft tokens releases probe slot and resta
     // the probe slot must release and restart cooldown rather than wedging permanently.
     SpeculationObservation empty_probe = make_obs(SpeculationWorkload::prose, 0, 0);
     empty_probe.is_probe = true;
+    empty_probe.probe_id = probe.probe_id;
     const auto after_empty = policy.observe(empty_probe);
     CHECK(after_empty.paused);
     CHECK(after_empty.reason == "ignored_no_draft");
@@ -691,7 +714,103 @@ TEST_CASE("probe completing with zero draft tokens releases probe slot and resta
     }
     const auto next_probe = policy.recommend(SpeculationWorkload::prose);
     CHECK(next_probe.is_probe);
+    CHECK(next_probe.probe_id > probe.probe_id);
     CHECK(next_probe.reason == "cooldown_probe");
+}
+
+TEST_CASE("concurrent non-probe and stale probe observations cannot hijack active probe") {
+    AdaptiveSpeculationConfig cfg;
+    cfg.window_size = 4;
+    cfg.min_samples = 4;
+    cfg.cooldown_requests = 2;
+    cfg.probe_draft_n = 1;
+    cfg.min_draft_tokens_per_sample = 4;
+    REQUIRE(validate_adaptive_speculation_config(cfg).ok());
+    AdaptiveSpeculationPolicy policy(cfg);
+
+    for (int i = 0; i < 4; ++i) {
+        policy.observe(make_obs(SpeculationWorkload::prose, 20, 2));
+    }
+    for (std::uint32_t i = 0; i < cfg.cooldown_requests; ++i) {
+        CHECK(policy.recommend(SpeculationWorkload::prose).paused);
+    }
+    const auto probe1 = policy.recommend(SpeculationWorkload::prose);
+    REQUIRE(probe1.is_probe);
+    REQUIRE(probe1.probe_id > 0u);
+
+    // Concurrent non-probe with below-floor positive draft_n must not clear probe_in_flight.
+    policy.observe(make_obs(SpeculationWorkload::prose, 2, 1));
+    CHECK(policy.recommend(SpeculationWorkload::prose).reason == "paused_probe_in_flight");
+
+    // Concurrent non-probe with above-floor high or low acceptance must not hijack probe1.
+    const auto non_probe_high = policy.observe(make_obs(SpeculationWorkload::prose, 20, 18));
+    CHECK(non_probe_high.paused);
+    CHECK(non_probe_high.reason == "paused_probe_in_flight");
+    CHECK(policy.recommend(SpeculationWorkload::prose).reason == "paused_probe_in_flight");
+
+    const auto non_probe_low = policy.observe(make_obs(SpeculationWorkload::prose, 20, 2));
+    CHECK(non_probe_low.paused);
+    CHECK(non_probe_low.reason == "paused_probe_in_flight");
+    CHECK(policy.recommend(SpeculationWorkload::prose).reason == "paused_probe_in_flight");
+
+    // Mismatched probe_id on cancel_probe and observe (below or above floor) must be ignored.
+    const std::uint64_t bogus_id = probe1.probe_id + 999u;
+    policy.cancel_probe(SpeculationWorkload::prose, bogus_id);
+    CHECK(policy.recommend(SpeculationWorkload::prose).reason == "paused_probe_in_flight");
+
+    auto bogus_empty = make_obs(SpeculationWorkload::prose, 0, 0);
+    bogus_empty.is_probe = true;
+    bogus_empty.probe_id = bogus_id;
+    policy.observe(bogus_empty);
+    CHECK(policy.recommend(SpeculationWorkload::prose).reason == "paused_probe_in_flight");
+
+    auto bogus_high = make_obs(SpeculationWorkload::prose, 20, 18);
+    bogus_high.is_probe = true;
+    bogus_high.probe_id = bogus_id;
+    const auto bogus_dec = policy.observe(bogus_high);
+    CHECK(bogus_dec.paused);
+    CHECK(bogus_dec.reason == "paused_probe_in_flight");
+    CHECK(policy.recommend(SpeculationWorkload::prose).reason == "paused_probe_in_flight");
+
+    // Matching cancel_probe releases probe1 and restarts cooldown.
+    policy.cancel_probe(SpeculationWorkload::prose, probe1.probe_id);
+    for (std::uint32_t i = 0; i < cfg.cooldown_requests; ++i) {
+        CHECK(policy.recommend(SpeculationWorkload::prose).reason == "paused_cooldown");
+    }
+    const auto probe2 = policy.recommend(SpeculationWorkload::prose);
+    REQUIRE(probe2.is_probe);
+    CHECK(probe2.probe_id > probe1.probe_id);
+
+    // A stale ProbeGuard or late observation from probe1 must not cancel or resolve probe2.
+    policy.cancel_probe(SpeculationWorkload::prose, probe1.probe_id);
+    CHECK(policy.recommend(SpeculationWorkload::prose).reason == "paused_probe_in_flight");
+
+    auto stale_obs = make_obs(SpeculationWorkload::prose, 20, 18);
+    stale_obs.is_probe = true;
+    stale_obs.probe_id = probe1.probe_id;
+    CHECK(policy.observe(stale_obs).reason == "paused_probe_in_flight");
+    CHECK(policy.recommend(SpeculationWorkload::prose).reason == "paused_probe_in_flight");
+
+    // Matching observation for probe2 resolves cleanly and recovers.
+    auto probe2_obs = make_obs(SpeculationWorkload::prose, 20, 17);
+    probe2_obs.is_probe = true;
+    probe2_obs.probe_id = probe2.probe_id;
+    const auto recovered = policy.observe(probe2_obs);
+    CHECK_FALSE(recovered.paused);
+    CHECK(recovered.draft_n_max == cfg.probe_draft_n);
+    CHECK(recovered.reason == "probe_recovered");
+
+    // probe_id remains strictly monotonic across reset().
+    policy.reset();
+    for (int i = 0; i < 4; ++i) {
+        policy.observe(make_obs(SpeculationWorkload::prose, 20, 2));
+    }
+    for (std::uint32_t i = 0; i < cfg.cooldown_requests; ++i) {
+        CHECK(policy.recommend(SpeculationWorkload::prose).paused);
+    }
+    const auto probe3 = policy.recommend(SpeculationWorkload::prose);
+    CHECK(probe3.is_probe);
+    CHECK(probe3.probe_id > probe2.probe_id);
 }
 
 }  // TEST_SUITE("llamaserver_adaptive_speculation")

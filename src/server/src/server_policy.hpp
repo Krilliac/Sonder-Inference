@@ -46,6 +46,8 @@ enum class Route {
     health,
     models,
     identity,
+    sonder_node,
+    sonder_plan,
     chat,
     messages,
     embeddings,
@@ -54,6 +56,9 @@ enum class Route {
     telemetry_sse,
     telemetry_ndjson
 };
+
+// Maximum JSON request body size accepted by POST /v1/sonder/plan.
+inline constexpr std::size_t kPlanMaxBodyBytes = 64u * 1024u;
 
 struct RouteInfo {
     Route route = Route::none;

@@ -214,15 +214,39 @@ SONDER_API sonder_status sonder_session_chat(sonder_session* session,
                                              sonder_token_callback callback, void* user_data,
                                              sonder_generation_stats* out_stats);
 
-/* Additive ABI-v1 per-request parent lineage. NULL retains no parent.
- * Non-NULL IDs match [A-Za-z0-9._:-]{1,128} and are explicit telemetry
- * metadata independent of text capture, not prompts or secrets. Records and
- * strings must remain valid and unchanged until the call returns; the parent
- * is copied before submission. Complete prefixes are required, larger records
- * ignore unknown tails. Session/run IDs and engine request IDs are unchanged. */
+/* Additive ABI-v1 per-request parent lineage and ADR-020 scheduling metadata.
+ * NULL parent_request_id retains no parent. Non-NULL IDs match
+ * [A-Za-z0-9._:-]{1,128} and are explicit telemetry metadata independent of
+ * text capture, not prompts or secrets. Records and strings must remain valid
+ * and unchanged until the call returns; the parent is copied before submission.
+ * Complete prefixes are required, larger records ignore unknown tails.
+ * Session/run IDs and engine request IDs are unchanged. */
+typedef enum sonder_workload_class {
+    SONDER_WORKLOAD_DEFAULT = 0,
+    SONDER_WORKLOAD_INTERACTIVE_USER = 1,
+    SONDER_WORKLOAD_OWNER_ORCHESTRATOR = 2,
+    SONDER_WORKLOAD_CRITIC_VERIFICATION = 3,
+    SONDER_WORKLOAD_IMPLEMENTATION_WORKER = 4,
+    SONDER_WORKLOAD_RESEARCH_WORKER = 5,
+    SONDER_WORKLOAD_BACKGROUND_INDEXING = 6,
+    SONDER_WORKLOAD_MAINTENANCE = 7
+} sonder_workload_class;
+
 typedef struct sonder_request_metadata {
     uint32_t struct_size;  /* sizeof(sonder_request_metadata) */
     const char* parent_request_id;
+    /* ---- Appended ADR-020 scheduling metadata (still ABI version 1).
+     * Read only when struct_size covers these fields; callers built against
+     * the original layout (struct_size ending after parent_request_id) keep
+     * working with session defaults. Zero-initialization selects
+     * SONDER_WORKLOAD_DEFAULT (0) and priority 0 (session default).
+     * workload_class: SONDER_WORKLOAD_DEFAULT (0) or 1..7.
+     * priority: [-16, 16]; 0 keeps the class default, positive = more urgent.
+     * When non-default, mapped onto native RequestOptions::priority_class
+     * (emitted in request telemetry and enforced when strict priority
+     * admission is enabled). ---- */
+    int32_t workload_class;
+    int32_t priority;
 } sonder_request_metadata;
 
 /* metadata may be NULL. Request, callback, stats, cancellation and handle
@@ -235,6 +259,49 @@ SONDER_API sonder_status sonder_session_chat_with_metadata(
     sonder_session* session, const sonder_chat_message* const* messages, size_t message_count,
     const sonder_request_metadata* metadata, sonder_token_callback callback, void* user_data,
     sonder_generation_stats* out_stats);
+
+/* Additive ABI-v1 GPU device inventory.
+ * Fixed UTF-8 NUL-terminated strings avoid caller-freed heap allocations.
+ * Set out_info->struct_size = sizeof(sonder_gpu_info) before calling
+ * sonder_gpu_device_info(). Memory counters are 0 when the matching has_*
+ * flag is 0 (unknown is distinct from a known zero reading). */
+typedef struct sonder_gpu_info {
+    uint32_t struct_size;             /* sizeof(sonder_gpu_info) */
+    char id[64];                      /* e.g. "gpu:0" */
+    char name[256];                   /* human-readable adapter name */
+    char vendor[32];                  /* "nvidia", "amd", "intel", "apple", "unknown" */
+    char backend_hint[32];            /* "cuda", "rocm", "vulkan", "metal", or "" */
+    char source[32];                  /* "dxgi", "amdgpu-sysfs", "nvml", etc. */
+    uint32_t vendor_id;               /* PCI vendor id (e.g. 0x10DE) */
+    uint32_t device_id;               /* PCI device id */
+    uint64_t dedicated_total_bytes;   /* 0 when has_dedicated_total == 0 */
+    uint64_t dedicated_free_bytes;    /* 0 when has_dedicated_free == 0 */
+    uint64_t shared_total_bytes;      /* 0 when has_shared_total == 0 */
+    uint64_t effective_vram_mib;      /* 0 when has_effective_vram == 0 */
+    uint64_t effective_free_vram_mib; /* 0 when has_effective_free_vram == 0 */
+    int32_t has_dedicated_total;
+    int32_t has_dedicated_free;
+    int32_t has_shared_total;
+    int32_t has_effective_vram;
+    int32_t has_effective_free_vram;
+    int32_t is_integrated_uma;
+} sonder_gpu_info;
+
+SONDER_API size_t sonder_gpu_device_count(void);
+SONDER_API sonder_status sonder_gpu_device_info(size_t index, sonder_gpu_info* out_info);
+
+/* Additive ABI-v1 live Observatory telemetry callback sink.
+ * Receives one serialized sonder.observatory.event/1 JSON line (no trailing
+ * newline) from the engine's telemetry writer thread; must not block
+ * indefinitely and must not call sonder_engine_destroy() from inside the
+ * callback. `json_line` is `length` bytes of UTF-8 and is not guaranteed
+ * NUL-terminated. Passing callback == NULL flushes queued events and clears
+ * the sink; replacing or destroying the engine waits for any in-flight
+ * callback invocation to finish so no dangling callback is ever invoked. */
+typedef void (*sonder_telemetry_callback)(void* user_data, const char* json_line, size_t length);
+SONDER_API sonder_status sonder_engine_set_telemetry_callback(sonder_engine* engine,
+                                                              sonder_telemetry_callback callback,
+                                                              void* user_data);
 
 #ifdef __cplusplus
 } /* extern "C" */

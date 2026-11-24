@@ -243,6 +243,7 @@ void AdaptiveSpeculationPolicy::reset_bucket_locked(BucketState &bucket) const {
     bucket.current_draft_n = config_.initial_draft_n;
     bucket.paused = (config_.initial_draft_n == 0);
     bucket.probe_in_flight = false;
+    bucket.active_probe_id = 0;
     bucket.cooldown_remaining = bucket.paused ? config_.cooldown_requests : 0;
     bucket.total_observations = 0;
     bucket.ignored_observations = 0;
@@ -312,7 +313,10 @@ SpeculationDecision AdaptiveSpeculationPolicy::recommend(SpeculationWorkload wor
         };
     }
 
+    if (++next_probe_id_ == 0)
+        ++next_probe_id_;
     bucket.probe_in_flight = true;
+    bucket.active_probe_id = next_probe_id_;
     bucket.probes_issued = saturating_add(bucket.probes_issued, 1);
     return SpeculationDecision{
         config_.probe_draft_n,
@@ -321,6 +325,7 @@ SpeculationDecision AdaptiveSpeculationPolicy::recommend(SpeculationWorkload wor
         stats.rolling_acceptance,
         bucket.count,
         "cooldown_probe",
+        bucket.active_probe_id,
     };
 }
 
@@ -338,17 +343,22 @@ SpeculationDecision AdaptiveSpeculationPolicy::observe(const SpeculationObservat
         };
     }
 
+    const bool matches_active_probe =
+        bucket.paused && bucket.probe_in_flight && (obs.is_probe || obs.probe_id != 0) &&
+        (obs.probe_id == 0 || obs.probe_id == bucket.active_probe_id);
+
     const std::uint64_t min_tokens = std::max<std::uint64_t>(1, config_.min_draft_tokens_per_sample);
     if (obs.draft_n < min_tokens) {
         bucket.ignored_observations = saturating_add(bucket.ignored_observations, 1);
-        // Release an in-flight probe when the probe itself completes below the
-        // evaluation floor (including draft_n == 0 on immediate-EOS replies) so
-        // the bucket cannot wedge permanently in paused_probe_in_flight, and
-        // restart cooldown so short responses do not spin-probe every request.
-        // Concurrent non-probe requests (is_probe == false && draft_n == 0)
-        // leave the in-flight probe untouched.
-        if (bucket.paused && bucket.probe_in_flight && (obs.is_probe || obs.draft_n > 0)) {
+        // Release an in-flight probe only when the matching probe itself
+        // completes below the evaluation floor (including draft_n == 0 on
+        // immediate-EOS replies) so the bucket cannot wedge permanently in
+        // paused_probe_in_flight, and restart cooldown so short responses do
+        // not spin-probe every request. Concurrent non-probe requests and stale
+        // probes leave the active probe untouched.
+        if (matches_active_probe) {
             bucket.probe_in_flight = false;
+            bucket.active_probe_id = 0;
             bucket.cooldown_remaining = config_.cooldown_requests;
         }
         const WindowStats stats = compute_window_stats(bucket);
@@ -373,10 +383,13 @@ SpeculationDecision AdaptiveSpeculationPolicy::observe(const SpeculationObservat
 
     const std::uint32_t active_floor = std::max<std::uint32_t>(1, config_.min_draft_n);
 
-    // Resolve an in-flight cooldown probe directly against its own acceptance
-    // ratio so stale pre-pause history does not block recovery.
-    if (bucket.paused && bucket.probe_in_flight) {
+    // Resolve an in-flight cooldown probe only from the matching probe
+    // observation (never from concurrent non-probe or stale-probe requests) so
+    // stale pre-pause history does not block recovery and concurrent slots
+    // cannot hijack probe ownership.
+    if (matches_active_probe) {
         bucket.probe_in_flight = false;
+        bucket.active_probe_id = 0;
         const double probe_acceptance = std::clamp(
             static_cast<double>(static_cast<long double>(accepted) / static_cast<long double>(obs.draft_n)), 0.0, 1.0);
         if (probe_acceptance >= config_.pause_acceptance_threshold) {
@@ -417,7 +430,7 @@ SpeculationDecision AdaptiveSpeculationPolicy::observe(const SpeculationObservat
     const WindowStats stats = compute_window_stats(bucket);
 
     if (bucket.paused) {
-        if (bucket.count >= config_.min_samples &&
+        if (!bucket.probe_in_flight && bucket.count >= config_.min_samples &&
             stats.rolling_acceptance >= config_.step_down_acceptance_threshold) {
             bucket.paused = false;
             bucket.cooldown_remaining = 0;
@@ -432,14 +445,15 @@ SpeculationDecision AdaptiveSpeculationPolicy::observe(const SpeculationObservat
                 bucket.last_reason,
             };
         }
-        bucket.last_reason = "paused_low_acceptance";
+        if (!bucket.probe_in_flight)
+            bucket.last_reason = "paused_low_acceptance";
         return SpeculationDecision{
             0,
             true,
             false,
             stats.rolling_acceptance,
             bucket.count,
-            bucket.last_reason,
+            bucket.probe_in_flight ? "paused_probe_in_flight" : bucket.last_reason,
         };
     }
 
@@ -458,6 +472,7 @@ SpeculationDecision AdaptiveSpeculationPolicy::observe(const SpeculationObservat
     if (config_.min_draft_n == 0 && stats.rolling_acceptance < config_.pause_acceptance_threshold) {
         bucket.paused = true;
         bucket.probe_in_flight = false;
+        bucket.active_probe_id = 0;
         bucket.current_draft_n = 0;
         bucket.cooldown_remaining = config_.cooldown_requests;
         bucket.last_reason = "paused_low_acceptance";
@@ -501,13 +516,16 @@ SpeculationDecision AdaptiveSpeculationPolicy::observe(const SpeculationObservat
     };
 }
 
-void AdaptiveSpeculationPolicy::cancel_probe(SpeculationWorkload workload) {
+void AdaptiveSpeculationPolicy::cancel_probe(SpeculationWorkload workload, std::uint64_t probe_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     BucketState &bucket = buckets_[workload_index(workload)];
-    if (bucket.paused && bucket.probe_in_flight) {
-        bucket.probe_in_flight = false;
-        bucket.cooldown_remaining = config_.cooldown_requests;
-    }
+    if (!bucket.paused || !bucket.probe_in_flight)
+        return;
+    if (probe_id != 0 && probe_id != bucket.active_probe_id)
+        return;
+    bucket.probe_in_flight = false;
+    bucket.active_probe_id = 0;
+    bucket.cooldown_remaining = config_.cooldown_requests;
 }
 
 json::Object AdaptiveSpeculationPolicy::status_json() const {

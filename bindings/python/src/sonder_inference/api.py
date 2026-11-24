@@ -15,9 +15,17 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequenc
 
 from . import _structs as S
 from ._lib import Library, get_library
-from .errors import InvalidArgumentError, InvalidStateError, SonderError, UnsupportedError, error_for_status
+from .errors import (
+    InvalidArgumentError,
+    InvalidStateError,
+    SonderError,
+    Status,
+    UnsupportedError,
+    error_for_status,
+)
 
 TokenCallback = Callable[[str], Optional[bool]]
+TelemetryCallback = Callable[[str], None]
 LogitBiasInput = Union[Mapping[int, float], Sequence[tuple[int, float]]]
 
 _INT32_MIN, _INT32_MAX = -(2**31), 2**31 - 1
@@ -38,6 +46,19 @@ class Outcome(enum.IntEnum):
     FAILED = 3
 
 
+class WorkloadClass(enum.IntEnum):
+    """Mirror of ``sonder_workload_class`` (ADR-020 scheduling classes)."""
+
+    DEFAULT = 0
+    INTERACTIVE_USER = 1
+    OWNER_ORCHESTRATOR = 2
+    CRITIC_VERIFICATION = 3
+    IMPLEMENTATION_WORKER = 4
+    RESEARCH_WORKER = 5
+    BACKGROUND_INDEXING = 6
+    MAINTENANCE = 7
+
+
 def _check(lib: Library, rc: int) -> None:
     if rc != 0:
         raise error_for_status(rc, lib.last_error() or f"sonder status {rc}")
@@ -51,6 +72,62 @@ def abi_version() -> int:
 def version() -> str:
     """Library version string."""
     return get_library().version
+
+
+@dataclass(frozen=True)
+class GpuInfo:
+    """One GPU adapter reported by the native inventory.
+
+    Memory fields are ``None`` when the platform could not determine them
+    (distinct from a known zero reading).
+    """
+
+    id: str
+    name: str
+    vendor: str
+    backend_hint: str
+    source: str
+    vendor_id: int
+    device_id: int
+    dedicated_total_bytes: Optional[int]
+    dedicated_free_bytes: Optional[int]
+    shared_total_bytes: Optional[int]
+    effective_vram_mib: Optional[int]
+    effective_free_vram_mib: Optional[int]
+    is_integrated_uma: bool
+
+
+def list_gpu_devices(library: Optional[Library] = None) -> list[GpuInfo]:
+    """Return the live host GPU inventory reported by the native library."""
+    lib = library or get_library()
+    if not (lib.has_symbol("sonder_gpu_device_count") and lib.has_symbol("sonder_gpu_device_info")):
+        raise UnsupportedError("this library does not export sonder_gpu_device_count/sonder_gpu_device_info")
+    count = int(lib.cdll.sonder_gpu_device_count())
+    devices: list[GpuInfo] = []
+    for index in range(count):
+        raw = S.CGpuInfo()
+        raw.struct_size = ctypes.sizeof(S.CGpuInfo)
+        rc = lib.cdll.sonder_gpu_device_info(index, ctypes.byref(raw))
+        if rc == int(Status.NOT_FOUND):
+            # Live inventory shrank between count and info calls; stop cleanly.
+            break
+        _check(lib, rc)
+        devices.append(GpuInfo(
+            id=raw.id.decode("utf-8", "replace"),
+            name=raw.name.decode("utf-8", "replace"),
+            vendor=raw.vendor.decode("utf-8", "replace"),
+            backend_hint=raw.backend_hint.decode("utf-8", "replace"),
+            source=raw.source.decode("utf-8", "replace"),
+            vendor_id=int(raw.vendor_id),
+            device_id=int(raw.device_id),
+            dedicated_total_bytes=int(raw.dedicated_total_bytes) if raw.has_dedicated_total else None,
+            dedicated_free_bytes=int(raw.dedicated_free_bytes) if raw.has_dedicated_free else None,
+            shared_total_bytes=int(raw.shared_total_bytes) if raw.has_shared_total else None,
+            effective_vram_mib=int(raw.effective_vram_mib) if raw.has_effective_vram else None,
+            effective_free_vram_mib=int(raw.effective_free_vram_mib) if raw.has_effective_free_vram else None,
+            is_integrated_uma=bool(raw.is_integrated_uma),
+        ))
+    return devices
 
 
 # ---------------------------------------------------------------------------
@@ -378,24 +455,75 @@ class SessionMetadata:
 
 @dataclass(frozen=True)
 class RequestMetadata:
-    """Caller parent lineage for one request, independent of text capture.
+    """Caller parent lineage and ADR-020 scheduling metadata for one request.
 
-    None leaves the parent absent. Identifiers must not contain prompts,
-    secrets or personal data. Explicit metadata needs the additive export;
-    session run IDs and engine-generated request IDs remain unchanged.
+    None leaves the parent absent and workload_class at the session default.
+    Identifiers must not contain prompts, secrets or personal data. Explicit
+    metadata needs the additive export; session run IDs and engine-generated
+    request IDs remain unchanged.
     """
 
     parent_request_id: Optional[str] = None
+    workload_class: Optional[Union[WorkloadClass, int]] = None
+    priority: int = 0
 
     def _to_c(self) -> "S.CRequestMetadata":
         value = self.parent_request_id
         if value is not None and (not isinstance(value, str) or
                                   re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", value) is None):
             raise InvalidArgumentError("parent_request_id must match [A-Za-z0-9._:-]{1,128}")
+        if self.workload_class is None:
+            workload = int(WorkloadClass.DEFAULT)
+        elif isinstance(self.workload_class, bool) or not isinstance(self.workload_class, int):
+            raise InvalidArgumentError("workload_class must be WorkloadClass, int, or None")
+        else:
+            workload = int(self.workload_class)
+            if workload < int(WorkloadClass.DEFAULT) or workload > int(WorkloadClass.MAINTENANCE):
+                raise InvalidArgumentError("workload_class must be WorkloadClass.DEFAULT (0) or in [1, 7]")
+        if isinstance(self.priority, bool) or not isinstance(self.priority, int):
+            raise InvalidArgumentError("priority must be an int in [-16, 16]")
+        if not -16 <= self.priority <= 16:
+            raise InvalidArgumentError("priority must be an int in [-16, 16]")
         record = S.CRequestMetadata()
         record.struct_size = ctypes.sizeof(record)
         record.parent_request_id = value.encode("ascii") if value is not None else None
+        record.workload_class = workload
+        record.priority = self.priority
         return record
+
+
+def _make_telemetry_trampoline(cb_lock: threading.RLock, state: dict[str, Any]) -> Any:
+    """Create the single permanent ctypes callback trampoline for an Engine.
+
+    Closes only over ``cb_lock`` and ``state`` (never ``Engine``) so the finalizer
+    never introduces a reference cycle preventing garbage collection.
+    """
+    def trampoline(_user: Any, ptr: Optional[int], length: int) -> None:
+        try:
+            with cb_lock:
+                cb = state["callback"]
+                if cb is None:
+                    return
+                prev_tid = state["active_tid"]
+                state["active_tid"] = threading.get_ident()
+            try:
+                line = ctypes.string_at(ptr, length).decode("utf-8", "replace") if length and ptr else ""
+                cb(line)
+            finally:
+                with cb_lock:
+                    state["active_tid"] = prev_tid
+        except BaseException:  # noqa: BLE001 - never escape across ctypes/C ABI
+            pass
+    return S.TELEMETRY_CALLBACK(trampoline)
+
+
+def _destroy_engine(destroy_fn: Any, ptr: ctypes.c_void_p,
+                    trampoline_box: list[Any], state: dict[str, Any]) -> None:
+    try:
+        destroy_fn(ptr)
+    finally:
+        state["callback"] = None
+        trampoline_box.clear()
 
 
 class Engine(_Handle):
@@ -405,8 +533,14 @@ class Engine(_Handle):
 
     def __init__(self, telemetry_level: Optional[TelemetryLevel] = None,
                  telemetry_jsonl_path: Optional[str] = None, capture_text: bool = False,
-                 library: Optional[Library] = None) -> None:
+                 library: Optional[Library] = None,
+                 telemetry_callback: Optional[TelemetryCallback] = None) -> None:
         lib = library or get_library()
+        if telemetry_callback is not None:
+            if not callable(telemetry_callback):
+                raise TypeError("telemetry_callback must be callable or None")
+            if not lib.has_symbol("sonder_engine_set_telemetry_callback"):
+                raise UnsupportedError("this library does not export sonder_engine_set_telemetry_callback")
         opts = S.EngineOptions()
         lib.cdll.sonder_engine_options_init(ctypes.byref(opts))
         if telemetry_level is not None:
@@ -417,7 +551,38 @@ class Engine(_Handle):
         out = ctypes.c_void_p()
         _check(lib, lib.cdll.sonder_engine_create(ctypes.byref(opts), ctypes.byref(out)))
         super().__init__(lib, out.value)  # type: ignore[arg-type]
+        self._telemetry_cb_lock = threading.RLock()
+        self._telemetry_set_lock = threading.RLock()
+        self._telemetry_state: dict[str, Any] = {"callback": None, "active_tid": None}
+        self._telemetry_registered = False
+        self._telemetry_trampoline_box: list[Any] = []
+        # Keep the permanent ctypes trampoline pinned until sonder_engine_destroy()
+        # has flushed and cleared the native sink.
+        self._finalizer.detach()
+        self._finalizer = weakref.finalize(
+            self, _destroy_engine, lib.cdll.sonder_engine_destroy,
+            ctypes.c_void_p(out.value), self._telemetry_trampoline_box, self._telemetry_state)
         self._children: "weakref.WeakSet[_Handle]" = weakref.WeakSet()
+        if telemetry_callback is not None:
+            try:
+                self.set_telemetry_callback(telemetry_callback)
+            except BaseException:
+                self.close()
+                raise
+
+    def _in_telemetry_callback(self) -> bool:
+        cb_lock = getattr(self, "_telemetry_cb_lock", None)
+        if cb_lock is None:
+            return False
+        with cb_lock:
+            return self._telemetry_state["active_tid"] == threading.get_ident()
+
+    def _check_not_reentrant(self) -> None:
+        super()._check_not_reentrant()
+        if self._in_telemetry_callback():
+            raise InvalidStateError(
+                "Engine.close() called from inside its own telemetry callback; "
+                "call set_telemetry_callback(None) or close the engine from another thread instead")
 
     @property
     def library(self) -> Library:
@@ -427,6 +592,55 @@ class Engine(_Handle):
     def device_count(self) -> int:
         with self._use() as h:
             return int(self._lib.cdll.sonder_engine_device_count(h))
+
+    def set_telemetry_callback(self, callback: Optional[TelemetryCallback]) -> None:
+        """Register, replace, or clear (``None``) a live Observatory JSONL sink.
+
+        ``callback(json_line)`` receives one serialized
+        ``sonder.observatory.event/1`` line (no trailing newline) on the
+        engine's telemetry writer thread and must not block indefinitely.
+        Calling :meth:`close` from inside the callback raises
+        :class:`InvalidStateError`.
+        """
+        if callback is not None and not callable(callback):
+            raise TypeError("telemetry_callback must be callable or None")
+        if not self._lib.has_symbol("sonder_engine_set_telemetry_callback"):
+            raise UnsupportedError("this library does not export sonder_engine_set_telemetry_callback")
+        with self._use() as h:
+            if self._in_telemetry_callback():
+                with self._telemetry_cb_lock:
+                    self._telemetry_state["callback"] = callback
+                if callback is None:
+                    _check(self._lib, self._lib.cdll.sonder_engine_set_telemetry_callback(
+                        h, S.TELEMETRY_CALLBACK(), None))
+                return
+            with self._telemetry_set_lock:
+                if callback is None:
+                    _check(self._lib, self._lib.cdll.sonder_engine_set_telemetry_callback(
+                        h, S.TELEMETRY_CALLBACK(), None))
+                    with self._telemetry_cb_lock:
+                        self._telemetry_state["callback"] = None
+                    self._telemetry_registered = False
+                    return
+                if not self._telemetry_trampoline_box:
+                    self._telemetry_trampoline_box.append(
+                        _make_telemetry_trampoline(self._telemetry_cb_lock, self._telemetry_state))
+                trampoline = self._telemetry_trampoline_box[0]
+                if self._telemetry_registered:
+                    # Detach first so queued events flush to the previous Python
+                    # callback and any in-flight trampoline call finishes before swap.
+                    _check(self._lib, self._lib.cdll.sonder_engine_set_telemetry_callback(
+                        h, S.TELEMETRY_CALLBACK(), None))
+                    self._telemetry_registered = False
+                with self._telemetry_cb_lock:
+                    self._telemetry_state["callback"] = callback
+                try:
+                    _check(self._lib, self._lib.cdll.sonder_engine_set_telemetry_callback(h, trampoline, None))
+                except BaseException:
+                    with self._telemetry_cb_lock:
+                        self._telemetry_state["callback"] = None
+                    raise
+                self._telemetry_registered = True
 
     def register_mock_backend(self) -> None:
         """Register the deterministic MOCK backend ("mock"). Tests only."""
@@ -787,6 +1001,7 @@ class TokenStream:
 
 
 __all__ = [
-    "ChatMessage", "Engine", "GenerationResult", "Model", "Outcome", "SamplingConfig", "Session",
-    "RequestMetadata", "SessionMetadata", "TelemetryLevel", "TokenStream", "abi_version", "version",
+    "ChatMessage", "Engine", "GenerationResult", "GpuInfo", "Model", "Outcome", "SamplingConfig", "Session",
+    "RequestMetadata", "SessionMetadata", "TelemetryLevel", "TokenStream", "WorkloadClass",
+    "abi_version", "list_gpu_devices", "version",
 ]

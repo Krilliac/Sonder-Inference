@@ -5,24 +5,107 @@
 #include <cstring>
 #include <exception>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "sonder/inference/backends.hpp"
+#include "sonder/inference/device.hpp"
 #include "sonder/inference/engine.hpp"
+#include "sonder/inference/telemetry.hpp"
 #if defined(SONDER_HAS_OLLAMA_BACKEND)
 #include "sonder/inference/backends/ollama.hpp"
 #endif
 
 using namespace sonder::inference;
 
+namespace sonder::inference::detail {
+
+// Thread-safe C ABI telemetry callback sink. Keeps a recursive mutex around
+// callback invocation and updates so replacing/clearing or destroying the
+// engine blocks until any in-flight callback finishes (preventing dangling
+// callback invocations) without deadlocking on self-clearing from the writer
+// thread. Exceptions from callbacks are contained so the sink is never retired
+// and exceptions never cross the C ABI.
+class CabiTelemetryCallbackSink final : public TelemetrySink {
+public:
+    CabiTelemetryCallbackSink(sonder_telemetry_callback callback, void* user_data) noexcept
+        : callback_(callback), user_data_(user_data) {}
+
+    void write(std::string_view json_line) override {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        if (!callback_) {
+            return;
+        }
+        std::thread::id prev{};
+        const std::thread::id self = std::this_thread::get_id();
+        {
+            std::lock_guard<std::mutex> tid_lock(thread_id_mutex_);
+            prev = active_thread_;
+            active_thread_ = self;
+        }
+        struct ThreadReset {
+            std::mutex& mu;
+            std::thread::id& slot;
+            std::thread::id previous;
+            ~ThreadReset() noexcept {
+                try {
+                    std::lock_guard<std::mutex> tid_lock(mu);
+                    slot = previous;
+                } catch (...) {
+                }
+            }
+        } reset{thread_id_mutex_, active_thread_, prev};
+        try {
+            const char* data = json_line.empty() ? "" : json_line.data();
+            callback_(user_data_, data, json_line.size());
+        } catch (...) {
+            // Contain exceptions from C/C++ callbacks; never escape into TelemetryBus.
+        }
+    }
+
+    void set(sonder_telemetry_callback callback, void* user_data) {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        callback_ = callback;
+        user_data_ = callback ? user_data : nullptr;
+    }
+
+    void clear() { set(nullptr, nullptr); }
+
+    [[nodiscard]] bool has_callback() const {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        return callback_ != nullptr;
+    }
+
+    [[nodiscard]] bool is_in_callback_on_this_thread() const {
+        std::lock_guard<std::mutex> tid_lock(thread_id_mutex_);
+        return active_thread_ == std::this_thread::get_id();
+    }
+
+private:
+    mutable std::recursive_mutex mutex_;
+    sonder_telemetry_callback callback_ = nullptr;
+    void* user_data_ = nullptr;
+    mutable std::mutex thread_id_mutex_;
+    std::thread::id active_thread_{};
+};
+
+}  // namespace sonder::inference::detail
+
 // The engine is shared: every session handle holds a reference, because a
 // Session keeps a plain Engine& and uses the engine's telemetry bus and
 // request runtime until it is destroyed. sonder_engine_destroy() therefore
-// only drops the caller's reference; the engine stops when the last session
-// handle is destroyed (or at once when there are none).
+// flushes and clears any C telemetry callback attached to this handle, then
+// drops the caller's reference; the engine stops when the last session handle
+// is destroyed (or at once when there are none).
 struct sonder_engine {
     std::shared_ptr<Engine> engine;
+    std::mutex telemetry_sink_mutex;
+    std::shared_ptr<detail::CabiTelemetryCallbackSink> telemetry_sink;
 };
 struct sonder_model {
     std::shared_ptr<Model> model;
@@ -135,16 +218,94 @@ bool valid_correlation_id(const char* value) {
     return false;
 }
 
+// Original (v1) layout of sonder_request_metadata: struct_size + parent_request_id.
+// Appended scheduling fields (workload_class, priority) are only read when
+// struct_size >= sizeof(sonder_request_metadata).
+struct sonder_request_metadata_v1 {
+    uint32_t struct_size;
+    const char* parent_request_id;
+};
+static_assert(std::is_standard_layout_v<sonder_request_metadata>);
+static_assert(std::is_trivial_v<sonder_request_metadata>);
+static_assert(std::is_trivially_copyable_v<sonder_request_metadata>);
+static_assert(offsetof(sonder_request_metadata, struct_size) ==
+              offsetof(sonder_request_metadata_v1, struct_size));
+static_assert(offsetof(sonder_request_metadata, parent_request_id) ==
+              offsetof(sonder_request_metadata_v1, parent_request_id));
+static_assert(sizeof(sonder_request_metadata) > sizeof(sonder_request_metadata_v1));
+static_assert(offsetof(sonder_request_metadata, workload_class) >= sizeof(sonder_request_metadata_v1));
+
+static_assert(std::is_standard_layout_v<sonder_gpu_info>);
+static_assert(std::is_trivial_v<sonder_gpu_info>);
+static_assert(std::is_trivially_copyable_v<sonder_gpu_info>);
+
+constexpr std::size_t kRequestMetadataMinSize = sizeof(sonder_request_metadata_v1);
+constexpr std::size_t kRequestMetadataExtendedMinSize =
+    offsetof(sonder_request_metadata, priority) + sizeof(int32_t);
+static_assert(kRequestMetadataExtendedMinSize > kRequestMetadataMinSize);
+static_assert(kRequestMetadataExtendedMinSize <= sizeof(sonder_request_metadata));
+
+constexpr int32_t kMinRequestPriority = -16;
+constexpr int32_t kMaxRequestPriority = 16;
+
+bool has_extended_request_metadata(const sonder_request_metadata& m) noexcept {
+    return m.struct_size >= kRequestMetadataExtendedMinSize;
+}
+
+RequestPriority map_scheduling_to_priority_class(int32_t workload_class, int32_t priority) noexcept {
+    const int base_rank = (workload_class == static_cast<int32_t>(SONDER_WORKLOAD_DEFAULT))
+                              ? static_cast<int>(WorkloadClass::implementation_worker)
+                              : static_cast<int>(workload_class - 1);
+    const int effective_rank = base_rank - static_cast<int>(priority);
+    if (effective_rank <= static_cast<int>(WorkloadClass::owner_orchestrator)) {
+        return RequestPriority::interactive;
+    }
+    if (effective_rank <= static_cast<int>(WorkloadClass::research_worker)) {
+        return RequestPriority::subagent;
+    }
+    return RequestPriority::background;
+}
+
+template <std::size_t N>
+void copy_utf8_c_string(char (&dst)[N], std::string_view src) noexcept {
+    static_assert(N > 0);
+    std::size_t n = src.size() < (N - 1) ? src.size() : (N - 1);
+    if (src.size() > n && n > 0 && (static_cast<unsigned char>(src[n]) & 0xC0u) == 0x80u) {
+        while (n > 0 && (static_cast<unsigned char>(src[n - 1]) & 0xC0u) == 0x80u) {
+            --n;
+        }
+        if (n > 0 && (static_cast<unsigned char>(src[n - 1]) & 0x80u) != 0u) {
+            --n;
+        }
+    }
+    if (n > 0) {
+        std::memcpy(dst, src.data(), n);
+    }
+    dst[n] = '\0';
+}
+
 const char* request_options_from_c(const sonder_request_metadata* metadata, RequestOptions& options) {
     if (!metadata) {
         return nullptr;
     }
-    constexpr std::size_t min_size = offsetof(sonder_request_metadata, parent_request_id) + sizeof(const char*);
-    if (metadata->struct_size < min_size) {
+    if (metadata->struct_size < kRequestMetadataMinSize) {
         return "sonder_request_metadata.struct_size too small";
     }
     if (!valid_correlation_id(metadata->parent_request_id)) {
         return "parent_request_id must match [A-Za-z0-9._:-]{1,128}";
+    }
+    if (has_extended_request_metadata(*metadata)) {
+        if (metadata->workload_class < static_cast<int32_t>(SONDER_WORKLOAD_DEFAULT) ||
+            metadata->workload_class > static_cast<int32_t>(SONDER_WORKLOAD_MAINTENANCE)) {
+            return "workload_class must be SONDER_WORKLOAD_DEFAULT (0) or in [1, 7]";
+        }
+        if (metadata->priority < kMinRequestPriority || metadata->priority > kMaxRequestPriority) {
+            return "priority must be in [-16, 16]";
+        }
+        if (metadata->workload_class != static_cast<int32_t>(SONDER_WORKLOAD_DEFAULT) ||
+            metadata->priority != 0) {
+            options.priority_class = map_scheduling_to_priority_class(metadata->workload_class, metadata->priority);
+        }
     }
     if (metadata->parent_request_id) {
         options.parent_request_id = metadata->parent_request_id;
@@ -240,10 +401,118 @@ sonder_status sonder_engine_create(const sonder_engine_options* options, sonder_
     });
 }
 
-void sonder_engine_destroy(sonder_engine* engine) { delete engine; }
+void sonder_engine_destroy(sonder_engine* engine) {
+    if (!engine) {
+        return;
+    }
+    std::shared_ptr<detail::CabiTelemetryCallbackSink> sink;
+    try {
+        std::lock_guard<std::mutex> lock(engine->telemetry_sink_mutex);
+        sink = engine->telemetry_sink;
+    } catch (...) {
+        // Best-effort lock acquisition; never let exceptions escape destroy.
+    }
+    if (sink) {
+        try {
+            if (!sink->is_in_callback_on_this_thread() && sink->has_callback()) {
+                engine->engine->telemetry().flush();
+            }
+        } catch (...) {
+            // Best-effort flush; always proceed to clear the callback sink below.
+        }
+        try {
+            sink->clear();
+        } catch (...) {
+            // Best-effort clear; never let exceptions escape destroy.
+        }
+    }
+    delete engine;
+}
 
 size_t sonder_engine_device_count(const sonder_engine* engine) {
     return engine ? engine->engine->devices().size() : 0;
+}
+
+size_t sonder_gpu_device_count(void) {
+    try {
+        return enumerate_gpu_devices().size();
+    } catch (...) {
+        return 0;
+    }
+}
+
+sonder_status sonder_gpu_device_info(size_t index, sonder_gpu_info* out_info) {
+    return guarded([&] {
+        if (!out_info) {
+            return fail(SONDER_ERROR_INVALID_ARGUMENT, "out_info is null");
+        }
+        if (out_info->struct_size < sizeof(sonder_gpu_info)) {
+            return fail(SONDER_ERROR_INVALID_ARGUMENT, "sonder_gpu_info.struct_size too small");
+        }
+        const std::vector<GpuDeviceInfo> gpus = enumerate_gpu_devices();
+        if (index >= gpus.size()) {
+            return fail(SONDER_ERROR_NOT_FOUND, "gpu device index out of range");
+        }
+        const GpuDeviceInfo& gpu = gpus[index];
+        // Zero all bytes including implicit padding (offsets 428..431) and copy
+        // via memcpy so uninitialized stack or stale caller bytes never leak.
+        sonder_gpu_info info;
+        std::memset(&info, 0, sizeof(info));
+        info.struct_size = sizeof(sonder_gpu_info);
+        copy_utf8_c_string(info.id, gpu.id);
+        copy_utf8_c_string(info.name, gpu.name);
+        copy_utf8_c_string(info.vendor, to_string(gpu.vendor));
+        copy_utf8_c_string(info.backend_hint, gpu.backend_hint);
+        copy_utf8_c_string(info.source, gpu.source);
+        info.vendor_id = gpu.vendor_id;
+        info.device_id = gpu.device_id;
+        info.has_dedicated_total = gpu.dedicated_total.is_known() ? 1 : 0;
+        info.dedicated_total_bytes = gpu.dedicated_total.bytes_or(0);
+        info.has_dedicated_free = gpu.dedicated_free.is_known() ? 1 : 0;
+        info.dedicated_free_bytes = gpu.dedicated_free.bytes_or(0);
+        info.has_shared_total = gpu.shared_total.is_known() ? 1 : 0;
+        info.shared_total_bytes = gpu.shared_total.bytes_or(0);
+        const auto effective_total = gpu_effective_vram_mib(gpu, false);
+        info.has_effective_vram = effective_total.has_value() ? 1 : 0;
+        info.effective_vram_mib = effective_total.value_or(0);
+        std::optional<std::uint64_t> effective_free;
+        if (gpu.dedicated_free.is_known()) {
+            effective_free = gpu_effective_vram_mib(gpu, true);
+        }
+        info.has_effective_free_vram = effective_free.has_value() ? 1 : 0;
+        info.effective_free_vram_mib = effective_free.value_or(0);
+        info.is_integrated_uma = gpu.is_integrated_uma ? 1 : 0;
+        std::memcpy(out_info, &info, sizeof(info));
+        return ok();
+    });
+}
+
+sonder_status sonder_engine_set_telemetry_callback(sonder_engine* engine, sonder_telemetry_callback callback,
+                                                   void* user_data) {
+    return guarded([&] {
+        if (!engine) {
+            return fail(SONDER_ERROR_INVALID_ARGUMENT, "engine is null");
+        }
+        std::shared_ptr<detail::CabiTelemetryCallbackSink> sink;
+        {
+            std::lock_guard<std::mutex> lock(engine->telemetry_sink_mutex);
+            sink = engine->telemetry_sink;
+            if (!sink) {
+                if (!callback) {
+                    return ok();
+                }
+                sink = std::make_shared<detail::CabiTelemetryCallbackSink>(callback, user_data);
+                engine->engine->telemetry().add_sink(sink);
+                engine->telemetry_sink = sink;
+                return ok();
+            }
+        }
+        if (!sink->is_in_callback_on_this_thread() && sink->has_callback()) {
+            engine->engine->telemetry().flush();
+        }
+        sink->set(callback, user_data);
+        return ok();
+    });
 }
 
 sonder_status sonder_engine_register_mock_backend(sonder_engine* engine) {

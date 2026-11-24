@@ -154,6 +154,23 @@ struct BackendSetup {
     std::vector<std::uint32_t> llamaserver_warmup_slots;
     bool llamaserver_warmup_on_restart = true;
     std::size_t llamaserver_warmup_max_prefix_chars = 262144;
+    // Opt-in workload-aware adaptive speculation controller (JSON
+    // "adaptive_speculation"). Kept independent of the optional llamaserver
+    // backend header so config loading stays available in all builds.
+    struct LlamaServerAdaptiveSpeculationConfig {
+        bool enabled = false;
+        std::uint32_t min_draft_n = 0;
+        std::uint32_t initial_draft_n = 3;
+        std::uint32_t max_draft_n = 6;
+        std::size_t window_size = 16;
+        std::size_t min_samples = 4;
+        double pause_acceptance_threshold = 0.25;
+        double step_down_acceptance_threshold = 0.45;
+        double step_up_acceptance_threshold = 0.72;
+        std::uint32_t cooldown_requests = 8;
+        std::uint32_t probe_draft_n = 1;
+        std::uint64_t min_draft_tokens_per_sample = 4;
+    } llamaserver_adaptive_speculation;
 };
 
 // Values taken from the environment when the matching option is absent:

@@ -107,6 +107,12 @@ def _declare(lib: ctypes.CDLL) -> None:
         fn("sonder_session_chat_with_metadata", status, c.c_void_p, c.POINTER(c.POINTER(S.CChatMessage)),
            c.c_size_t, c.POINTER(S.CRequestMetadata), S.TOKEN_CALLBACK, c.c_void_p,
            c.POINTER(S.CGenerationStats))
+    if hasattr(lib, "sonder_gpu_device_count"):
+        fn("sonder_gpu_device_count", c.c_size_t)
+    if hasattr(lib, "sonder_gpu_device_info"):
+        fn("sonder_gpu_device_info", status, c.c_size_t, c.POINTER(S.CGpuInfo))
+    if hasattr(lib, "sonder_engine_set_telemetry_callback"):
+        fn("sonder_engine_set_telemetry_callback", status, c.c_void_p, S.TELEMETRY_CALLBACK, c.c_void_p)
 
 
 class Library:

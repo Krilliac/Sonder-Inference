@@ -1,11 +1,14 @@
 // sonder-infer: command-line interface over the Sonder Inference library.
 // Reference: docs/CLI.md (commands, environment, exit codes, JSON shapes).
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -25,6 +28,7 @@
 #include "../../src/backends/llamaserver/tune.hpp"
 #endif
 #if defined(SONDER_HAS_SERVER)
+#include "sonder/inference/coresidency_planner.hpp"
 #include "sonder/inference/placement_planner.hpp"
 #include "sonder/inference/server.hpp"
 #endif
@@ -87,6 +91,11 @@ constexpr std::uint64_t kBytesPerMiB = 1024ull * 1024ull;
 si::json::Value reading_mib_json(const si::MemoryReading& reading) {
     if (!reading.is_known()) return si::json::Value(nullptr);
     return si::json::Value(reading.bytes_or(0) / kBytesPerMiB);
+}
+
+si::json::Value reading_bytes_json(const si::MemoryReading& reading) {
+    if (!reading.is_known()) return si::json::Value(nullptr);
+    return si::json::Value(reading.bytes_or(0));
 }
 
 si::json::Value optional_u64_json(std::optional<std::uint64_t> value) {
@@ -158,89 +167,136 @@ int cmd_devices(const Args& a) {
     return cli::kExitOk;
 }
 
-int cmd_plan(const Args& a) {
-#if defined(SONDER_HAS_SERVER)
-    const auto model = a.get("model");
-    if (!model || model->empty()) return usage_error("plan", "--model is required");
-
-    si::PlacementPlanRequest req;
-    req.model_path = *model;
-    if (const auto name = a.get("name")) {
-        if (name->empty()) return usage_error("plan", "--name must not be empty");
-        req.profile_name = *name;
-    }
-    if (const auto mmproj = a.get("mmproj")) {
-        if (mmproj->empty()) return usage_error("plan", "--mmproj must not be empty");
-        std::error_code ec;
-        const auto sz = std::filesystem::file_size(*mmproj, ec);
-        if (ec) {
-            err() << "error: plan: cannot stat --mmproj '" << *mmproj << "': " << ec.message() << "\n";
-            return cli::kExitFailure;
-        }
-        req.mmproj_path = *mmproj;
-        req.mmproj_bytes = static_cast<std::uint64_t>(sz);
-    }
-    std::string parse_err;
-    if (const auto ctx = a.get("ctx")) {
-        if (!cli::parse_integer<std::uint32_t>("ctx", *ctx, 128u, 1048576u, req.target_ctx_size, parse_err)) {
-            return usage_error("plan", parse_err);
-        }
-    }
-    if (const auto min_ctx = a.get("min-ctx")) {
-        if (!cli::parse_integer<std::uint32_t>("min-ctx", *min_ctx, 128u, 1048576u, req.min_ctx_size, parse_err)) {
-            return usage_error("plan", parse_err);
-        }
-    }
-    if (req.min_ctx_size > req.target_ctx_size) {
-        req.min_ctx_size = req.target_ctx_size;
-    }
-    if (const auto parallel = a.get("parallel")) {
-        if (!cli::parse_integer<std::uint32_t>("parallel", *parallel, 1u, 256u, req.parallel, parse_err)) {
-            return usage_error("plan", parse_err);
-        }
-    }
-    if (const auto headroom = a.get("headroom-mib")) {
-        if (!cli::parse_integer<std::uint64_t>("headroom-mib", *headroom, 0ull, 65536ull, req.vram_headroom_mib,
-                                               parse_err)) {
-            return usage_error("plan", parse_err);
-        }
-    }
-    if (const auto device = a.get("device")) req.device_hint = *device;
-    if (a.has("total-vram")) req.prefer_free_vram = false;
-    if (a.has("no-quantized-kv")) req.allow_quantized_kv = false;
-    if (a.has("no-speculative")) req.allow_speculative = false;
-    if (a.has("no-moe-offload")) req.allow_moe_cpu_offload = false;
-
-    const auto info = si::read_gguf_model_info(req.model_path);
-    if (!info.ok()) {
-        report_error("plan", info.status(), "");
-        return cli::exit_code_for(info.status());
-    }
-    const auto gpus = si::enumerate_gpu_devices();
+int cmd_node(const Args& a) {
+    const auto devices = si::enumerate_devices();
     const auto host = si::read_host_memory();
-    const auto plan = si::plan_model_placement(info.value(), gpus, host, req);
+    const auto gpus = si::enumerate_gpu_devices();
+    const auto backend_names = compiled_backends();
+#if defined(SONDER_HAS_SERVER)
+    const bool has_server = true;
+#else
+    const bool has_server = false;
+#endif
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+    const bool has_adaptive_spec = true;
+#else
+    const bool has_adaptive_spec = false;
+#endif
 
     if (a.has("json")) {
-        std::cout << si::json::Value(si::placement_plan_to_json(plan)).dump() << "\n";
+#if defined(SONDER_HAS_SERVER)
+        const si::json::Value api_version(si::server::kApiVersion);
+#else
+        const si::json::Value api_version(nullptr);
+#endif
+        si::json::Array dev_list;
+        dev_list.reserve(devices.size());
+        for (const auto& d : devices) {
+            dev_list.emplace_back(si::json::Object{{"id", d.id},
+                                                   {"kind", si::to_string(d.kind)},
+                                                   {"name", d.name},
+                                                   {"logical_cores", d.logical_cores},
+                                                   {"total_memory_bytes", d.total_memory_bytes},
+                                                   {"available_memory_bytes", d.available_memory_bytes}});
+        }
+        si::json::Array gpu_list;
+        gpu_list.reserve(gpus.size());
+        for (const auto& g : gpus) {
+            gpu_list.emplace_back(gpu_to_json(g));
+        }
+        si::json::Array backends;
+        backends.reserve(backend_names.size());
+        for (const auto& n : backend_names) backends.emplace_back(n);
+
+        si::json::Object host_mem{{"total_physical_bytes", reading_bytes_json(host.total_physical)},
+                                  {"available_physical_bytes", reading_bytes_json(host.available_physical)},
+                                  {"available_commit_bytes", reading_bytes_json(host.available_commit)},
+                                  {"source", host.source}};
+        si::json::Object caps{{"ternary_gguf", has_server},
+                              {"placement_planner", has_server},
+                              {"coresidency_planner", has_server},
+                              {"multi_gpu", true},
+                              {"uma_telemetry", true},
+                              {"adaptive_speculation", has_adaptive_spec}};
+        const si::json::Object doc{{"schema", "sonder.inference.node/1"},
+                                   {"node_id", si::host_name()},
+                                   {"platform", si::host_platform()},
+                                   {"version", si::version_string()},
+                                   {"commit", si::build_commit()},
+                                   {"abi_version", SONDER_ABI_VERSION},
+                                   {"api_version", api_version},
+                                   {"host_memory", std::move(host_mem)},
+                                   {"devices", std::move(dev_list)},
+                                   {"gpus", std::move(gpu_list)},
+                                   {"backends", std::move(backends)},
+                                   {"capabilities", std::move(caps)}};
+        std::cout << si::json::Value(doc).dump() << "\n";
         return cli::kExitOk;
     }
 
-    std::cout << "profile=" << plan.profile.name << "  vendor=" << si::to_string(plan.selected_vendor)
-              << "  backend_hint=" << plan.recommended_backend_hint
-              << "  uma=" << (plan.uma_mode ? "true" : "false")
-              << "  prism_runtime=" << (plan.requires_prism_runtime ? "true" : "false") << "\n";
-    std::cout << "fits_vram=" << (plan.fits_in_vram ? "true" : "false")
-              << "  fits_host_ram=" << (plan.fits_in_host_ram ? "true" : "false")
-              << "  budget_mib=" << plan.budget_mib
-              << "  est_vram_mib=" << plan.estimate.total_mib()
-              << "  est_host_ram_mib=" << plan.estimate.host_resident_mib() << "\n";
-    std::cout << "ctx=" << plan.profile.ctx_size.value_or(0)
-              << "  kv=" << plan.profile.cache_type_k.value_or("f16") << "/"
-              << plan.profile.cache_type_v.value_or("f16")
-              << "  flash_attn=" << plan.profile.flash_attn.value_or("auto")
-              << "  n_gpu_layers=" << (plan.profile.n_gpu_layers ? std::to_string(*plan.profile.n_gpu_layers) : "auto");
-    if (plan.profile.device) std::cout << "  device=" << *plan.profile.device;
-    if (plan.profile.split_mode) std::cout << "  split_mode=" << *plan.profile.split_mode;
+    std::cout << "node=" << si::host_name() << "  platform=" << si::host_platform()
+              << "  version=" << si::version_string() << " (" << si::build_commit() << ")\n";
+    std::cout << "host_memory: total_mib=" << format_reading_mib(host.total_physical)
+              << "  available_mib=" << format_reading_mib(host.available_physical)
+              << "  available_commit_mib=" << format_reading_mib(host.available_commit)
+              << "  source=" << (host.source.empty() ? "unknown" : host.source) << "\n";
+    for (const auto& d : devices) {
+        std::cout << d.id << "  kind=" << si::to_string(d.kind) << "  name=\"" << d.name << "\""
+                  << "  logical_cores=" << d.logical_cores << "  total_memory_mib=" << (d.total_memory_bytes >> 20)
+                  << "  available_memory_mib=" << (d.available_memory_bytes >> 20) << "\n";
+    }
+    for (const auto& g : gpus) {
+        std::cout << g.id << "  kind=gpu  vendor=" << si::to_string(g.vendor) << "  name=\"" << g.name << "\""
+                  << "  dedicated_total_mib=" << format_reading_mib(g.dedicated_total)
+                  << "  dedicated_free_mib=" << format_reading_mib(g.dedicated_free)
+                  << "  shared_total_mib=" << format_reading_mib(g.shared_total)
+                  << "  uma=" << (g.is_integrated_uma ? "true" : "false")
+                  << "  backend_hint=" << (g.backend_hint.empty() ? "none" : g.backend_hint)
+                  << "  source=" << (g.source.empty() ? "unknown" : g.source) << "\n";
+    }
+    std::cout << "backends:";
+    for (const auto& n : backend_names) std::cout << " " << n;
+    std::cout << "\n";
+    std::cout << "capabilities:"
+              << " ternary_gguf=" << (has_server ? "true" : "false")
+              << " placement_planner=" << (has_server ? "true" : "false")
+              << " coresidency_planner=" << (has_server ? "true" : "false") << " multi_gpu=true uma_telemetry=true"
+              << " adaptive_speculation=" << (has_adaptive_spec ? "true" : "false") << "\n";
+    return cli::kExitOk;
+}
+
+#if defined(SONDER_HAS_SERVER)
+std::string make_coresidency_profile_name(const std::optional<std::string>& name_prefix, const std::string& model_path,
+                                          std::size_t index, std::set<std::string>& used_names) {
+    constexpr std::size_t kMaxNameLen = 128;
+    std::string raw;
+    if (name_prefix) {
+        raw = *name_prefix + "-" + std::to_string(index + 1);
+    } else {
+        raw = std::filesystem::path(model_path).stem().string();
+    }
+    std::string base;
+    base.reserve(std::min(raw.size(), kMaxNameLen));
+    for (const char c : raw) {
+        if (base.size() >= kMaxNameLen) break;
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' ||
+                        c == '_' || c == '-' || c == ':';
+        base.push_back(ok ? c : '-');
+    }
+    if (base.empty() || base == "default") {
+        base = "model-" + std::to_string(index + 1);
+    }
+    std::string candidate = base;
+    for (std::size_t suffix = 2; used_names.count(candidate) != 0; ++suffix) {
+        const std::string tag = "-" + std::to_string(suffix);
+        const std::size_t keep = base.size() + tag.size() > kMaxNameLen ? (kMaxNameLen - tag.size()) : base.size();
+        candidate = base.substr(0, keep) + tag;
+    }
+    used_names.insert(candidate);
+    return candidate;
+}
+
+void print_plan_speculative(const si::PlacementPlan& plan) {
     if (plan.profile.speculative && !plan.profile.speculative->types.empty()) {
         std::cout << "  spec=";
         for (std::size_t i = 0; i < plan.profile.speculative->types.size(); ++i) {
@@ -251,15 +307,192 @@ int cmd_plan(const Args& a) {
             std::cout << "(n=" << *plan.profile.speculative->draft_n_max << ")";
         }
     }
-    std::cout << "\n";
-    for (const auto& kv : plan.recommended_env) {
-        std::cout << "env: " << kv.first << "=" << kv.second << "\n";
+}
+#endif
+
+int cmd_plan(const Args& a) {
+#if defined(SONDER_HAS_SERVER)
+    const auto models = a.all("model");
+    if (models.empty()) return usage_error("plan", "--model is required");
+    for (const auto& m : models) {
+        if (m.empty()) return usage_error("plan", "--model must not be empty");
     }
-    for (const auto& w : plan.warnings) {
+
+    const auto name = a.get("name");
+    if (name && name->empty()) return usage_error("plan", "--name must not be empty");
+
+    const auto mmproj = a.get("mmproj");
+    if (models.size() > 1 && mmproj.has_value()) {
+        return usage_error("plan",
+                           "--mmproj applies only to single-model 'plan' (cannot be used with multiple --model flags)");
+    }
+
+    si::PlacementPlanRequest base_req;
+    if (name) {
+        base_req.profile_name = *name;
+    }
+    std::string parse_err;
+    if (const auto ctx = a.get("ctx")) {
+        if (!cli::parse_integer<std::uint32_t>("ctx", *ctx, 128u, 1048576u, base_req.target_ctx_size, parse_err)) {
+            return usage_error("plan", parse_err);
+        }
+    }
+    if (const auto min_ctx = a.get("min-ctx")) {
+        if (!cli::parse_integer<std::uint32_t>("min-ctx", *min_ctx, 128u, 1048576u, base_req.min_ctx_size, parse_err)) {
+            return usage_error("plan", parse_err);
+        }
+    }
+    if (base_req.min_ctx_size > base_req.target_ctx_size) {
+        base_req.min_ctx_size = base_req.target_ctx_size;
+    }
+    if (const auto parallel = a.get("parallel")) {
+        if (!cli::parse_integer<std::uint32_t>("parallel", *parallel, 1u, 256u, base_req.parallel, parse_err)) {
+            return usage_error("plan", parse_err);
+        }
+    }
+    if (const auto headroom = a.get("headroom-mib")) {
+        if (!cli::parse_integer<std::uint64_t>("headroom-mib", *headroom, 0ull, 65536ull, base_req.vram_headroom_mib,
+                                               parse_err)) {
+            return usage_error("plan", parse_err);
+        }
+    }
+    if (const auto device = a.get("device")) base_req.device_hint = *device;
+    if (a.has("total-vram")) base_req.prefer_free_vram = false;
+    if (a.has("no-quantized-kv")) base_req.allow_quantized_kv = false;
+    if (a.has("no-speculative")) base_req.allow_speculative = false;
+    if (a.has("no-moe-offload")) base_req.allow_moe_cpu_offload = false;
+
+    if (models.size() == 1) {
+        si::PlacementPlanRequest req = base_req;
+        req.model_path = models.front();
+        if (mmproj) {
+            if (mmproj->empty()) return usage_error("plan", "--mmproj must not be empty");
+            std::error_code ec;
+            const auto sz = std::filesystem::file_size(*mmproj, ec);
+            if (ec) {
+                err() << "error: plan: cannot stat --mmproj '" << *mmproj << "': " << ec.message() << "\n";
+                return cli::kExitFailure;
+            }
+            req.mmproj_path = *mmproj;
+            req.mmproj_bytes = static_cast<std::uint64_t>(sz);
+        }
+
+        const auto info = si::read_gguf_model_info(req.model_path);
+        if (!info.ok()) {
+            report_error("plan", info.status(), "");
+            return cli::exit_code_for(info.status());
+        }
+        const auto gpus = si::enumerate_gpu_devices();
+        const auto host = si::read_host_memory();
+        const auto plan = si::plan_model_placement(info.value(), gpus, host, req);
+
+        if (a.has("json")) {
+            std::cout << si::json::Value(si::placement_plan_to_json(plan)).dump() << "\n";
+            return cli::kExitOk;
+        }
+
+        std::cout << "profile=" << plan.profile.name << "  vendor=" << si::to_string(plan.selected_vendor)
+                  << "  backend_hint=" << plan.recommended_backend_hint
+                  << "  uma=" << (plan.uma_mode ? "true" : "false")
+                  << "  prism_runtime=" << (plan.requires_prism_runtime ? "true" : "false") << "\n";
+        std::cout << "fits_vram=" << (plan.fits_in_vram ? "true" : "false")
+                  << "  fits_host_ram=" << (plan.fits_in_host_ram ? "true" : "false")
+                  << "  budget_mib=" << plan.budget_mib
+                  << "  est_vram_mib=" << plan.estimate.total_mib()
+                  << "  est_host_ram_mib=" << plan.estimate.host_resident_mib() << "\n";
+        std::cout << "ctx=" << plan.profile.ctx_size.value_or(0)
+                  << "  kv=" << plan.profile.cache_type_k.value_or("f16") << "/"
+                  << plan.profile.cache_type_v.value_or("f16")
+                  << "  flash_attn=" << plan.profile.flash_attn.value_or("auto")
+                  << "  n_gpu_layers="
+                  << (plan.profile.n_gpu_layers ? std::to_string(*plan.profile.n_gpu_layers) : "auto");
+        if (plan.profile.device) std::cout << "  device=" << *plan.profile.device;
+        if (plan.profile.split_mode) std::cout << "  split_mode=" << *plan.profile.split_mode;
+        print_plan_speculative(plan);
+        std::cout << "\n";
+        for (const auto& kv : plan.recommended_env) {
+            std::cout << "env: " << kv.first << "=" << kv.second << "\n";
+        }
+        for (const auto& w : plan.warnings) {
+            std::cout << "warning: " << w << "\n";
+        }
+        for (const auto& r : plan.reasons) {
+            std::cout << "reason: " << r << "\n";
+        }
+        return cli::kExitOk;
+    }
+
+    // Multi-model co-residency planning (2+ --model flags).
+    std::vector<si::CoResidencyEntry> entries;
+    entries.reserve(models.size());
+    std::set<std::string> used_names;
+    for (std::size_t i = 0; i < models.size(); ++i) {
+        const auto info = si::read_gguf_model_info(models[i]);
+        if (!info.ok()) {
+            report_error("plan", info.status(), "");
+            return cli::exit_code_for(info.status());
+        }
+        si::CoResidencyEntry entry;
+        entry.model = info.value();
+        entry.request = base_req;
+        entry.request.model_path = models[i];
+        entry.request.profile_name = make_coresidency_profile_name(name, models[i], i, used_names);
+        entries.push_back(std::move(entry));
+    }
+
+    const auto gpus = si::enumerate_gpu_devices();
+    const auto host = si::read_host_memory();
+    const auto co_plan = si::plan_coresident_models(entries, gpus, host);
+
+    if (a.has("json")) {
+        std::cout << si::json::Value(si::coresidency_plan_to_json(co_plan)).dump() << "\n";
+        return cli::kExitOk;
+    }
+
+    std::cout << "models=" << co_plan.models.size()
+              << "  all_fit_coresident=" << (co_plan.all_fit_coresident ? "true" : "false")
+              << "  aggregate_vram_mib=" << co_plan.aggregate_vram_mib
+              << "  aggregate_host_ram_mib=" << co_plan.aggregate_host_ram_mib
+              << "  remaining_host_ram_mib=" << co_plan.remaining_host_ram_mib << "\n";
+    if (!co_plan.remaining_gpu_vram_mib.empty()) {
+        std::cout << "remaining_gpu_vram_mib:";
+        for (const auto& [gpu_id, mib] : co_plan.remaining_gpu_vram_mib) {
+            std::cout << " " << gpu_id << "=" << mib;
+        }
+        std::cout << "\n";
+    }
+    for (std::size_t i = 0; i < co_plan.models.size(); ++i) {
+        const auto& plan = co_plan.models[i];
+        std::cout << "[" << i << "] profile=" << plan.profile.name
+                  << "  vendor=" << si::to_string(plan.selected_vendor)
+                  << "  backend_hint=" << plan.recommended_backend_hint
+                  << "  uma=" << (plan.uma_mode ? "true" : "false")
+                  << "  fits_vram=" << (plan.fits_in_vram ? "true" : "false")
+                  << "  fits_host_ram=" << (plan.fits_in_host_ram ? "true" : "false")
+                  << "  budget_mib=" << plan.budget_mib
+                  << "  est_vram_mib=" << plan.estimate.total_mib()
+                  << "  est_host_ram_mib=" << plan.estimate.host_resident_mib()
+                  << "  ctx=" << plan.profile.ctx_size.value_or(0)
+                  << "  kv=" << plan.profile.cache_type_k.value_or("f16") << "/"
+                  << plan.profile.cache_type_v.value_or("f16")
+                  << "  n_gpu_layers="
+                  << (plan.profile.n_gpu_layers ? std::to_string(*plan.profile.n_gpu_layers) : "auto");
+        if (plan.profile.device) std::cout << "  device=" << *plan.profile.device;
+        if (plan.profile.split_mode) std::cout << "  split_mode=" << *plan.profile.split_mode;
+        print_plan_speculative(plan);
+        std::cout << "\n";
+        for (const auto& kv : plan.recommended_env) {
+            std::cout << "  env[" << i << "]: " << kv.first << "=" << kv.second << "\n";
+        }
+        for (const auto& w : plan.warnings) {
+            std::cout << "  warning[" << i << "]: " << w << "\n";
+        }
+    }
+    for (const auto& n : co_plan.notes) {
+        std::cout << "note: " << n << "\n";
+    }
+    for (const auto& w : co_plan.warnings) {
         std::cout << "warning: " << w << "\n";
-    }
-    for (const auto& r : plan.reasons) {
-        std::cout << "reason: " << r << "\n";
     }
     return cli::kExitOk;
 #else
@@ -692,6 +925,7 @@ int main(int argc, char** argv) {
 
     if (cmd == "version") return cmd_version(a);
     if (cmd == "devices") return cmd_devices(a);
+    if (cmd == "node") return cmd_node(a);
     if (cmd == "plan") return cmd_plan(a);
     if (cmd == "backends") return cmd_backends(a, env);
     if (cmd == "models") return cmd_models(a, env);

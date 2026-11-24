@@ -2,13 +2,23 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <limits>
 #include <mutex>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include "health_features.hpp"
 #include "identity.hpp"
 #include "sonder/inference/device.hpp"
 #include "sonder/inference/engine.hpp"
+#include "sonder/inference/launch_profile.hpp"
+#include "sonder/inference/placement_planner.hpp"
 #include "sonder_inference.h"
 
 namespace sonder::inference::server::detail {
@@ -36,6 +46,246 @@ std::vector<GpuDeviceInfo> cached_gpu_inventory() {
         cache.populated = true;
     }
     return cache.gpus;
+}
+
+json::Value memory_reading_bytes_json(const MemoryReading& reading) {
+    if (!reading.is_known()) {
+        return json::Value(nullptr);
+    }
+    return json::Value(reading.bytes_or(0));
+}
+
+bool has_control_or_nul(std::string_view sv) noexcept {
+    for (const char c : sv) {
+        const auto u = static_cast<unsigned char>(c);
+        if (u < 0x20u || u == 0x7Fu) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string sanitize_key_for_error(std::string_view key) {
+    constexpr std::size_t kMaxLen = 64;
+    std::string out;
+    out.reserve(std::min(key.size(), kMaxLen) + 3);
+    for (std::size_t i = 0; i < key.size(); ++i) {
+        if (out.size() >= kMaxLen) {
+            out += "...";
+            break;
+        }
+        const auto u = static_cast<unsigned char>(key[i]);
+        out.push_back((u < 0x20u || u >= 0x7Fu) ? '?' : static_cast<char>(u));
+    }
+    return out;
+}
+
+bool is_safe_profile_name(std::string_view name) noexcept {
+    if (name.empty() || name.size() > 128) {
+        return false;
+    }
+    if (name.find("..") != std::string_view::npos) {
+        return false;
+    }
+    for (const char c : name) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' ||
+                        c == '_' || c == '-' || c == ':';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool is_safe_model_basename(std::string_view name) noexcept {
+    if (name.empty() || name.size() > 255) {
+        return false;
+    }
+    if (name == "." || name == "..") {
+        return false;
+    }
+    if (name.find("..") != std::string_view::npos) {
+        return false;
+    }
+    for (const char c : name) {
+        const auto u = static_cast<unsigned char>(c);
+        if (u < 0x20u || u == 0x7Fu) {
+            return false;
+        }
+        if (c == '/' || c == '\\' || c == ':') {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ends_with_gguf_ci(std::string_view name) noexcept {
+    if (name.size() <= 5) {
+        return false;
+    }
+    const std::string_view tail = name.substr(name.size() - 5);
+    const auto lower = [](char c) noexcept {
+        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
+    };
+    return tail[0] == '.' && lower(tail[1]) == 'g' && lower(tail[2]) == 'g' && lower(tail[3]) == 'u' &&
+           lower(tail[4]) == 'f';
+}
+
+std::string path_basename(std::string_view path) {
+    const std::size_t slash = path.find_last_of("/\\");
+    std::string_view name = slash == std::string_view::npos ? path : path.substr(slash + 1);
+    const std::size_t colon = name.rfind(':');
+    if (colon != std::string_view::npos) {
+        name = name.substr(colon + 1);
+    }
+    return std::string(name);
+}
+
+bool parse_strict_u64_range(const json::Value& value, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) noexcept {
+    if (!value.is_integer()) {
+        return false;
+    }
+    constexpr std::uint64_t kSentinel = std::numeric_limits<std::uint64_t>::max();
+    const std::uint64_t n = value.as_uint(kSentinel);
+    if (n == kSentinel || n < lo || n > hi) {
+        return false;
+    }
+    out = n;
+    return true;
+}
+
+bool is_canonical_child_of(const std::filesystem::path& file, const std::filesystem::path& dir) {
+    auto dir_it = dir.begin();
+    auto file_it = file.begin();
+    for (; dir_it != dir.end(); ++dir_it) {
+        if (dir_it->empty()) {
+            continue;
+        }
+        while (file_it != file.end() && file_it->empty()) {
+            ++file_it;
+        }
+        if (file_it == file.end() || *file_it != *dir_it) {
+            return false;
+        }
+        ++file_it;
+    }
+    while (file_it != file.end() && file_it->empty()) {
+        ++file_it;
+    }
+    return file_it != file.end();
+}
+
+bool resolve_model_in_dirs(const std::vector<std::string>& model_dirs, const std::string& basename,
+                           std::string& resolved_out) {
+    if (!is_safe_model_basename(basename) || !ends_with_gguf_ci(basename)) {
+        return false;
+    }
+    for (const auto& dir_str : model_dirs) {
+        if (dir_str.empty()) {
+            continue;
+        }
+        std::error_code ec;
+        const std::filesystem::path canonical_dir = std::filesystem::canonical(std::filesystem::path(dir_str), ec);
+        if (ec || !std::filesystem::is_directory(canonical_dir, ec) || ec) {
+            continue;
+        }
+        const std::filesystem::path candidate = canonical_dir / std::filesystem::path(basename);
+        const std::filesystem::file_status sym_status = std::filesystem::symlink_status(candidate, ec);
+        if (ec || !std::filesystem::exists(sym_status)) {
+            continue;
+        }
+        const std::filesystem::path canonical_file = std::filesystem::canonical(candidate, ec);
+        if (ec) {
+            continue;
+        }
+        if (!is_canonical_child_of(canonical_file, canonical_dir)) {
+            // Symlink escapes its configured model_dir: refuse immediately.
+            return false;
+        }
+        if (!std::filesystem::is_regular_file(canonical_file, ec) || ec) {
+            continue;
+        }
+        if (!ends_with_gguf_ci(canonical_file.filename().string())) {
+            return false;
+        }
+        resolved_out = canonical_file.string();
+        return true;
+    }
+    return false;
+}
+
+void extract_llamaserver_profile_paths(const std::vector<std::string>& args, std::string_view profile_name,
+                                       bool single_binding, std::string& model_out, std::string& mmproj_out) {
+    std::string arg_model;
+    std::string arg_alias;
+    std::string arg_mmproj;
+    const auto take_value = [&args](std::size_t& idx, std::string& dst) {
+        const std::string& raw = args[idx];
+        const std::size_t eq = raw.find('=');
+        if (eq != std::string::npos) {
+            dst = raw.substr(eq + 1);
+            return;
+        }
+        if (idx + 1 < args.size()) {
+            dst = args[++idx];
+        }
+    };
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string flag = llamaserver_flag_name(args[i]);
+        if (flag == "--model" || flag == "-m") {
+            take_value(i, arg_model);
+        } else if (flag == "--alias" || flag == "-a") {
+            take_value(i, arg_alias);
+        } else if (flag == "--mmproj" || flag == "-mm") {
+            take_value(i, arg_mmproj);
+        }
+    }
+    if (!arg_model.empty() && (arg_alias == profile_name || (arg_alias.empty() && single_binding))) {
+        model_out = std::move(arg_model);
+        mmproj_out = std::move(arg_mmproj);
+    }
+}
+
+bool resolve_profile_paths(const ServerOptions& opts, const std::string& profile_name, std::string& model_out,
+                           std::string& mmproj_out) {
+    const ModelProfileBinding* binding = find_profile_binding(opts, profile_name);
+    if (binding == nullptr) {
+        return false;
+    }
+    // 1. Active llamaserver profiles carry their operator-configured --model / --mmproj in llamaserver_args.
+    extract_llamaserver_profile_paths(opts.backend.llamaserver_args, profile_name, opts.profile_bindings.size() == 1,
+                                      model_out, mmproj_out);
+    if (!model_out.empty()) {
+        std::error_code ec;
+        if (ends_with_gguf_ci(model_out) && std::filesystem::is_regular_file(std::filesystem::path(model_out), ec) &&
+            !ec) {
+            if (!mmproj_out.empty()) {
+                std::error_code mmproj_ec;
+                if (!std::filesystem::is_regular_file(std::filesystem::path(mmproj_out), mmproj_ec) || mmproj_ec) {
+                    mmproj_out.clear();
+                }
+            }
+            return true;
+        }
+        model_out.clear();
+        mmproj_out.clear();
+    }
+    // 2. llamacpp / direct bindings store the GGUF path (or a model_dir basename) in load_name.
+    const std::string& target = binding->load_name.empty() ? binding->model : binding->load_name;
+    if (is_safe_model_basename(target)) {
+        if (resolve_model_in_dirs(opts.backend.model_dirs, target, model_out)) {
+            return true;
+        }
+    }
+    if (!binding->load_name.empty() && binding->load_name != binding->model) {
+        std::error_code ec;
+        if (ends_with_gguf_ci(binding->load_name) &&
+            std::filesystem::is_regular_file(std::filesystem::path(binding->load_name), ec) && !ec) {
+            model_out = binding->load_name;
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace
@@ -231,6 +481,274 @@ json::Object build_identity_body(const ModelResidency& residency, const std::str
                         {"sonder", sonder_meta()}};
 }
 
+json::Object build_node_body(const NodeSnapshot& s) {
+    const HostMemory host = read_host_memory();
+    json::Object host_memory{
+        {"total_physical_bytes", memory_reading_bytes_json(host.total_physical)},
+        {"available_physical_bytes", memory_reading_bytes_json(host.available_physical)},
+        {"available_commit_bytes", memory_reading_bytes_json(host.available_commit)},
+        {"source", host.source.empty() ? json::Value(nullptr) : json::Value(host.source)}};
+
+    json::Array devices;
+    for (const auto& d : enumerate_devices()) {
+        devices.emplace_back(json::Object{{"id", d.id},
+                                          {"kind", to_string(d.kind)},
+                                          {"name", d.name},
+                                          {"logical_cores", d.logical_cores},
+                                          {"total_memory_bytes", d.total_memory_bytes},
+                                          {"available_memory_bytes", d.available_memory_bytes}});
+    }
+
+    json::Array backends;
+    if (s.backend) {
+        json::Array caps;
+        for (const auto& c : s.backend->capabilities().names()) {
+            caps.emplace_back(c);
+        }
+        json::Object entry{
+            {"name", s.backend->name()}, {"available", s.backend_available}, {"capabilities", std::move(caps)}};
+        if (!s.backend_version.empty()) {
+            entry.set("version", s.backend_version);
+        }
+        backends.emplace_back(std::move(entry));
+    }
+
+    json::Array models;
+    for (const auto& m : s.residency.snapshot()) {
+        models.emplace_back(json::Object{{"id", m.id},
+                                         {"backend", m.backend},
+                                         {"state", residency_state_name(m.state)},
+                                         {"resident", m.state == ResidencyState::resident},
+                                         {"default", m.is_default}});
+    }
+
+    json::Array profiles;
+    if (!s.opts.profile_catalog.empty()) {
+        const std::optional<BackendRuntimeStatus> runtime = s.backend ? s.backend->runtime_status() : std::nullopt;
+        for (const auto& entry : s.opts.profile_catalog) {
+            const json::Value* is_served = entry.find("served");
+            if (entry.is_object() && is_served != nullptr && is_served->is_bool() && is_served->as_bool()) {
+                profiles.emplace_back(profile_with_runtime_context(entry.as_object(), runtime));
+            } else {
+                profiles.push_back(entry);
+            }
+        }
+    }
+
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+    constexpr bool kHasAdaptiveSpeculation = true;
+#else
+    constexpr bool kHasAdaptiveSpeculation = false;
+#endif
+    json::Object capabilities{{"ternary_gguf", true},
+                              {"placement_planner", true},
+                              {"coresidency_planner", true},
+                              {"multi_gpu", true},
+                              {"uma_telemetry", true},
+                              {"adaptive_speculation", kHasAdaptiveSpeculation}};
+
+    return json::Object{{"schema", "sonder.inference.node/1"},
+                        {"node_id", s.node_id},
+                        {"instance_id", s.instance_id},
+                        {"platform", host_platform()},
+                        {"version", version_string()},
+                        {"commit", build_commit()},
+                        {"abi_version", SONDER_ABI_VERSION},
+                        {"api_version", kApiVersion},
+                        {"synthetic", s.synthetic},
+                        {"host_memory", std::move(host_memory)},
+                        {"devices", std::move(devices)},
+                        {"gpus", gpu_inventory_json(cached_gpu_inventory())},
+                        {"backends", std::move(backends)},
+                        {"models", std::move(models)},
+                        {"profiles", std::move(profiles)},
+                        {"capabilities", std::move(capabilities)},
+                        {"sonder", sonder_meta()}};
+}
+
+std::variant<PlanHttpRequest, ApiError> parse_plan_request(std::string_view body) {
+    const Result<json::Value> parsed = json::parse(body, json::ParseLimits{32, 4096});
+    if (!parsed.ok()) {
+        return make_error(400, "invalid_request", "request body is not valid JSON: " + parsed.status().message());
+    }
+    if (!parsed.value().is_object()) {
+        return make_error(400, "invalid_request", "request body must be a JSON object");
+    }
+
+    PlanHttpRequest out;
+    const json::Object& obj = parsed.value().as_object();
+    for (const auto& [key, val] : obj) {
+        if (key == "profile") {
+            if (!val.is_string()) {
+                return make_error(400, "invalid_request", "profile must be a string", "profile");
+            }
+            if (!is_safe_profile_name(val.as_string())) {
+                return make_error(400, "invalid_request",
+                                  "profile must be a non-empty identifier using [A-Za-z0-9._:-] (max 128 bytes, no '..')",
+                                  "profile");
+            }
+            out.has_profile = true;
+            out.profile = val.as_string();
+        } else if (key == "model") {
+            if (!val.is_string()) {
+                return make_error(400, "invalid_request", "model must be a string", "model");
+            }
+            if (!is_safe_model_basename(val.as_string())) {
+                return make_error(
+                    400, "invalid_request",
+                    "model must be a single clean basename without path separators, '..', ':', or control characters",
+                    "model");
+            }
+            out.has_model = true;
+            out.model = val.as_string();
+        } else if (key == "ctx_size") {
+            std::uint64_t n = 0;
+            if (!parse_strict_u64_range(val, 128ull, 1048576ull, n)) {
+                return make_error(400, "invalid_request", "ctx_size must be an integer between 128 and 1048576",
+                                  "ctx_size");
+            }
+            out.plan_request.target_ctx_size = static_cast<std::uint32_t>(n);
+        } else if (key == "min_ctx_size") {
+            std::uint64_t n = 0;
+            if (!parse_strict_u64_range(val, 128ull, 1048576ull, n)) {
+                return make_error(400, "invalid_request", "min_ctx_size must be an integer between 128 and 1048576",
+                                  "min_ctx_size");
+            }
+            out.plan_request.min_ctx_size = static_cast<std::uint32_t>(n);
+        } else if (key == "parallel") {
+            std::uint64_t n = 0;
+            if (!parse_strict_u64_range(val, 1ull, 256ull, n)) {
+                return make_error(400, "invalid_request", "parallel must be an integer between 1 and 256", "parallel");
+            }
+            out.plan_request.parallel = static_cast<std::uint32_t>(n);
+        } else if (key == "vram_headroom_mib") {
+            std::uint64_t n = 0;
+            if (!parse_strict_u64_range(val, 0ull, 65536ull, n)) {
+                return make_error(400, "invalid_request", "vram_headroom_mib must be an integer between 0 and 65536",
+                                  "vram_headroom_mib");
+            }
+            out.plan_request.vram_headroom_mib = n;
+        } else if (key == "device_hint") {
+            if (!val.is_string()) {
+                return make_error(400, "invalid_request", "device_hint must be a string", "device_hint");
+            }
+            const std::string& hint = val.as_string();
+            if (hint.size() > 128 || has_control_or_nul(hint)) {
+                return make_error(400, "invalid_request",
+                                  "device_hint must be at most 128 bytes with no control characters", "device_hint");
+            }
+            out.plan_request.device_hint = hint;
+        } else if (key == "prefer_free_vram") {
+            if (!val.is_bool()) {
+                return make_error(400, "invalid_request", "prefer_free_vram must be a boolean", "prefer_free_vram");
+            }
+            out.plan_request.prefer_free_vram = val.as_bool();
+        } else if (key == "allow_quantized_kv") {
+            if (!val.is_bool()) {
+                return make_error(400, "invalid_request", "allow_quantized_kv must be a boolean", "allow_quantized_kv");
+            }
+            out.plan_request.allow_quantized_kv = val.as_bool();
+        } else if (key == "allow_speculative") {
+            if (!val.is_bool()) {
+                return make_error(400, "invalid_request", "allow_speculative must be a boolean", "allow_speculative");
+            }
+            out.plan_request.allow_speculative = val.as_bool();
+        } else if (key == "allow_moe_cpu_offload") {
+            if (!val.is_bool()) {
+                return make_error(400, "invalid_request", "allow_moe_cpu_offload must be a boolean",
+                                  "allow_moe_cpu_offload");
+            }
+            out.plan_request.allow_moe_cpu_offload = val.as_bool();
+        } else {
+            const std::string safe_key = sanitize_key_for_error(key);
+            return make_error(400, "invalid_request", "unknown field '" + safe_key + "'", safe_key);
+        }
+    }
+
+    if (!out.has_profile && !out.has_model) {
+        return make_error(400, "invalid_request", "either 'profile' or 'model' is required");
+    }
+    if (out.has_profile && out.has_model) {
+        return make_error(400, "invalid_request", "specify either 'profile' or 'model', not both");
+    }
+    if (out.plan_request.min_ctx_size > out.plan_request.target_ctx_size) {
+        out.plan_request.min_ctx_size = out.plan_request.target_ctx_size;
+    }
+    return out;
+}
+
+std::variant<json::Object, ApiError> execute_plan_request(const ServerOptions& opts, const PlanHttpRequest& request) {
+    std::string resolved_model_path;
+    std::string resolved_mmproj_path;
+    std::string profile_name = "planned";
+
+    if (request.has_model) {
+        if (!resolve_model_in_dirs(opts.backend.model_dirs, request.model, resolved_model_path)) {
+            return make_error(404, "not_found", "model '" + request.model + "' was not found in configured model_dirs",
+                              "model");
+        }
+        if (request.model.size() > 5) {
+            profile_name = request.model.substr(0, request.model.size() - 5);
+        }
+    } else if (request.has_profile) {
+        if (!resolve_profile_paths(opts, request.profile, resolved_model_path, resolved_mmproj_path)) {
+            return make_error(404, "not_found", "profile '" + request.profile + "' was not found", "profile");
+        }
+        profile_name = request.profile;
+    } else {
+        return make_error(400, "invalid_request", "either 'profile' or 'model' is required");
+    }
+
+    const Result<GgufModelInfo> info = read_gguf_model_info(resolved_model_path);
+    if (!info.ok()) {
+        if (info.status().code() == ErrorCode::not_found) {
+            return make_error(404, "not_found", "model file is not available");
+        }
+        const std::string redacted = redact_model_path(info.status(), resolved_model_path);
+        if (info.status().code() == ErrorCode::invalid_argument) {
+            return make_error(400, "invalid_request", "cannot parse GGUF header: " + redacted);
+        }
+        return make_error(500, "internal_error", "cannot read GGUF header: " + redacted);
+    }
+
+    PlacementPlanRequest plan_req = request.plan_request;
+    plan_req.profile_name = profile_name;
+    const std::string safe_model_basename = path_basename(resolved_model_path);
+    plan_req.model_path = safe_model_basename.empty() ? std::string("model.gguf") : safe_model_basename;
+    if (!resolved_mmproj_path.empty()) {
+        std::error_code ec;
+        const auto sz = std::filesystem::file_size(std::filesystem::path(resolved_mmproj_path), ec);
+        const std::string safe_mmproj_basename = path_basename(resolved_mmproj_path);
+        if (!ec && !safe_mmproj_basename.empty()) {
+            plan_req.mmproj_path = safe_mmproj_basename;
+            plan_req.mmproj_bytes = static_cast<std::uint64_t>(sz);
+        }
+    }
+
+    PlacementPlan plan = plan_model_placement(info.value(), cached_gpu_inventory(), read_host_memory(), plan_req);
+
+    // Strictly redact any filesystem paths in the HTTP response to basename only.
+    plan.profile.model = path_basename(plan.profile.model);
+    if (plan.profile.model.empty()) {
+        plan.profile.model = "model.gguf";
+    }
+    if (!plan.profile.mmproj.empty()) {
+        plan.profile.mmproj = path_basename(plan.profile.mmproj);
+    }
+    if (plan.profile.speculative && !plan.profile.speculative->draft_model.empty()) {
+        plan.profile.speculative->draft_model = path_basename(plan.profile.speculative->draft_model);
+    }
+
+    json::Object out;
+    out.set("schema", "sonder.inference.plan/1");
+    const json::Object planned = placement_plan_to_json(plan);
+    for (const auto& [k, v] : planned) {
+        out.set(k, v);
+    }
+    out.set("sonder", sonder_meta());
+    return out;
+}
+
 json::Object build_discovery_document(const ServerOptions& opts, const LiveTelemetryHub& hub,
                                       const std::string& instance_id, const std::string& node_id, bool synthetic) {
     const HubStats hs = hub.stats();
@@ -256,7 +774,9 @@ json::Object build_discovery_document(const ServerOptions& opts, const LiveTelem
         {"text_capture", opts.capture_text ? "on" : "off"},
         {"links", json::Object{{"health", "/v1/sonder/health"},
                                {"identity", "/v1/sonder/identity"},
-                               {"models", "/v1/models"}}},
+                               {"models", "/v1/models"},
+                               {"node", "/v1/sonder/node"},
+                               {"plan", "/v1/sonder/plan"}}},
         {"vocabularies", json::Object{{"sonder.inference.events", 1}}},
         {"stats", json::Object{{"subscribers", hs.subscribers},
                                {"max_subscribers", opts.max_subscribers},

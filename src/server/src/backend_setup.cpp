@@ -207,7 +207,7 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
             "max_restarts", "tls", "spill_guard", "log_file", "kv_pairing_check", "context_length",
             "slot_affinity", "env", "results", "warmup", "stall_guard", "host_memory",
             "api_key_env", "idle_timeout_ms", "first_content_timeout_ms", "keepalive_gap_ms",
-            "unlimited_request_timeout", "upstream_grammar"};
+            "unlimited_request_timeout", "upstream_grammar", "adaptive_speculation"};
         for (auto k : known) if (k == key) return false;
         return true;
     };
@@ -390,6 +390,10 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
     if (const auto* warmup = object.find("warmup")) {
         if (auto st = detail::parse_warmup_config(*warmup, setup); !st.ok()) return st;
     }
+    if (const auto* spec = object.find("adaptive_speculation")) {
+        if (auto st = detail::parse_adaptive_speculation_config(*spec, setup.llamaserver_adaptive_speculation); !st.ok())
+            return st;
+    }
     setup.llamaserver_config = path;
     destination = std::move(setup);
     return {};
@@ -535,6 +539,21 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
         lo.warmup.slots = setup.llamaserver_warmup_slots;
         lo.warmup.on_restart = setup.llamaserver_warmup_on_restart;
         lo.warmup.max_prefix_chars = setup.llamaserver_warmup_max_prefix_chars;
+        {
+            const auto& s = setup.llamaserver_adaptive_speculation;
+            lo.adaptive_speculation.enabled = s.enabled;
+            lo.adaptive_speculation.min_draft_n = s.min_draft_n;
+            lo.adaptive_speculation.initial_draft_n = s.initial_draft_n;
+            lo.adaptive_speculation.max_draft_n = s.max_draft_n;
+            lo.adaptive_speculation.window_size = s.window_size;
+            lo.adaptive_speculation.min_samples = s.min_samples;
+            lo.adaptive_speculation.pause_acceptance_threshold = s.pause_acceptance_threshold;
+            lo.adaptive_speculation.step_down_acceptance_threshold = s.step_down_acceptance_threshold;
+            lo.adaptive_speculation.step_up_acceptance_threshold = s.step_up_acceptance_threshold;
+            lo.adaptive_speculation.cooldown_requests = s.cooldown_requests;
+            lo.adaptive_speculation.probe_draft_n = s.probe_draft_n;
+            lo.adaptive_speculation.min_draft_tokens_per_sample = s.min_draft_tokens_per_sample;
+        }
         std::shared_ptr<Backend> backend = make_llamaserver_backend(std::move(lo));
         return backend;
 #else

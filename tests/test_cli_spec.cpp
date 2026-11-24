@@ -223,8 +223,8 @@ TEST_CASE("cli commands: table integrity and help content") {
         const std::string help = cli::render_help(cli::kProgram, *c);
         CHECK(help.find("Usage:") != std::string::npos);
     }
-    for (const char* expected : {"version", "devices", "plan", "backends", "models", "generate", "chat", "bench",
-                                 "serve", "help"}) {
+    for (const char* expected : {"version", "devices", "node", "plan", "backends", "models", "generate", "chat",
+                                 "bench", "serve", "help"}) {
         CAPTURE(expected);
         CHECK(cli::find_command(expected) != nullptr);
     }
@@ -262,13 +262,54 @@ TEST_CASE("cli commands: table integrity and help content") {
         CHECK(c->find("stats")->kind == cli::OptionKind::value);
         CHECK(c->find("stop")->kind == cli::OptionKind::repeat);
     }
-    for (const auto* c : {&cli::version_command(), &cli::devices_command(), &cli::plan_command(),
-                          &cli::backends_command(), &cli::models_command()}) {
+    for (const auto* c : {&cli::version_command(), &cli::devices_command(), &cli::node_command(),
+                          &cli::plan_command(), &cli::backends_command(), &cli::models_command()}) {
         CAPTURE(c->name);
         REQUIRE(c->find("json") != nullptr);
         CHECK(c->find("json")->kind == cli::OptionKind::flag);
     }
     CHECK(cli::generate_command().find("ollama-allow-remote")->kind == cli::OptionKind::flag);
+
+    // `plan --model` is repeatable for multi-model co-residency planning.
+    REQUIRE(cli::plan_command().find("model") != nullptr);
+    CHECK(cli::plan_command().find("model")->kind == cli::OptionKind::repeat);
+    {
+        std::string plan_err;
+        auto single = cli::parse_command_args(cli::plan_command(), {"--model", "a.gguf", "--json"}, plan_err);
+        REQUIRE_MESSAGE(single.has_value(), plan_err);
+        CHECK(single->all("model") == std::vector<std::string>{"a.gguf"});
+        CHECK(single->has("json"));
+
+        auto multi = cli::parse_command_args(
+            cli::plan_command(),
+            {"--model", "bonsai-27b.gguf", "--model=bonsai-9b-mtp.gguf", "--ctx", "32768", "--headroom-mib", "1536",
+             "--total-vram", "--json"},
+            plan_err);
+        REQUIRE_MESSAGE(multi.has_value(), plan_err);
+        CHECK(multi->all("model") == std::vector<std::string>{"bonsai-27b.gguf", "bonsai-9b-mtp.gguf"});
+        CHECK(multi->get("ctx") == std::optional<std::string>("32768"));
+        CHECK(multi->get("headroom-mib") == std::optional<std::string>("1536"));
+        CHECK(multi->has("total-vram"));
+        CHECK(multi->has("json"));
+    }
+
+    // `node [--json]` command spec and argument parsing.
+    {
+        std::string node_err;
+        auto plain = cli::parse_command_args(cli::node_command(), {}, node_err);
+        REQUIRE_MESSAGE(plain.has_value(), node_err);
+        CHECK(plain->command == "node");
+        CHECK_FALSE(plain->has("json"));
+
+        auto as_json = cli::parse_command_args(cli::node_command(), {"--json"}, node_err);
+        REQUIRE_MESSAGE(as_json.has_value(), node_err);
+        CHECK(as_json->has("json"));
+
+        CHECK_FALSE(cli::parse_command_args(cli::node_command(), {"--unknown"}, node_err).has_value());
+        CHECK_FALSE(node_err.empty());
+        CHECK(cli::render_help(cli::kProgram, cli::node_command()).find("sonder.inference.node/1") !=
+              std::string::npos);
+    }
 
     std::string error;
     CHECK_FALSE(cli::parse_command_args(cli::generate_command(), {"--max-token", "5"}, error).has_value());

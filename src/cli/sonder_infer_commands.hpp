@@ -143,16 +143,29 @@ inline const CommandSpec& devices_command() {
     return spec;
 }
 
+inline const CommandSpec& node_command() {
+    using namespace commands_detail;
+    static const CommandSpec spec{"node",
+                                  "print unified local hardware, GPU, backend and capability snapshot",
+                                  {"node [--json]"},
+                                  {output_json()},
+                                  {"JSON output follows schema sonder.inference.node/1.", kExitNote},
+                                  {"node", "node --json"}};
+    return spec;
+}
+
 inline const CommandSpec& plan_command() {
     using namespace commands_detail;
     static const CommandSpec spec{
         "plan",
-        "plan hardware placement and a launch profile for a GGUF model (no model load)",
-        {"plan --model GGUF [options]"},
+        "plan hardware placement and launch profile(s) for one or more GGUF models (no model load)",
+        {"plan --model GGUF [--model GGUF ...] [options]"},
         {{"Placement",
-          {{"model", OptionKind::value, "GGUF", "local GGUF model file (required)"},
-           {"mmproj", OptionKind::value, "PATH", "optional multimodal projector GGUF"},
-           {"name", OptionKind::value, "NAME", "profile name in the generated LaunchProfile (default planned)"},
+          {{"model", OptionKind::repeat, "GGUF",
+            "local GGUF model file (required; repeatable for co-residency planning)"},
+           {"mmproj", OptionKind::value, "PATH", "optional multimodal projector GGUF (single-model plan only)"},
+           {"name", OptionKind::value, "NAME",
+            "profile name in the generated LaunchProfile (default planned; prefix for multi-model plan)"},
            {"ctx", OptionKind::value, "N", "target context size in tokens (default 32768; clamped to model max)"},
            {"min-ctx", OptionKind::value, "N", "minimum context size before partial offload (default 8192)"},
            {"parallel", OptionKind::value, "N", "parallel request slots (default 1)"},
@@ -163,8 +176,11 @@ inline const CommandSpec& plan_command() {
            {"no-speculative", OptionKind::flag, "", "disable automatic MTP / ngram-mod speculative decoding"},
            {"no-moe-offload", OptionKind::flag, "", "disable automatic --n-cpu-moe selective expert offload"}}},
          output_json()},
-        {"Reads only the GGUF header plus live GPU and host memory inventory; no weights are loaded.", kExitNote},
-        {"plan --model model.gguf --json", "plan --model model.gguf --ctx 32768 --device CUDA0"}};
+        {"Reads only GGUF header(s) plus live GPU and host memory inventory; no weights are loaded.\n"
+         "Pass --model once for a single-model LaunchProfile, or multiple times for a co-residency plan.",
+         kExitNote},
+        {"plan --model model.gguf --json", "plan --model model.gguf --ctx 32768 --device CUDA0",
+         "plan --model model-a.gguf --model model-b.gguf --json"}};
     return spec;
 }
 
@@ -336,9 +352,10 @@ inline const CommandSpec& help_command() {
 // All commands, in display order.
 inline const std::vector<const CommandSpec*>& all_commands() {
     static const std::vector<const CommandSpec*> list{
-        &generate_command(), &chat_command(),    &serve_command(),   &bench_command(),
-        &models_command(),   &backends_command(), &devices_command(), &plan_command(),
-        &version_command(),  &tune_command(),    &weights_command(), &help_command()};
+        &generate_command(), &chat_command(),     &serve_command(),   &bench_command(),
+        &models_command(),   &backends_command(), &devices_command(), &node_command(),
+        &plan_command(),     &version_command(),  &tune_command(),    &weights_command(),
+        &help_command()};
     return list;
 }
 

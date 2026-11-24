@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <exception>
 #include <limits>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -16,7 +17,12 @@
 #include "sonder/inference/backends/llamaserver.hpp"
 #include "sonder/inference/engine.hpp"
 #if defined(SONDER_HAS_SERVER)
+#include <filesystem>
+#include <fstream>
+#include <system_error>
+
 #include "server/src/openai.hpp"
+#include "sonder/inference/backend_setup.hpp"
 #endif
 
 using namespace sonder::inference;
@@ -809,4 +815,492 @@ TEST_SUITE("llamaserver_backend") {
             CHECK(llamaserver::validate_backend_options(spawn).code() == ErrorCode::invalid_argument);
         }
     }
+
+    TEST_CASE("protocol spec_draft_n_max is omitted by default and serialized only in native mode") {
+        GenerateRequest gen_req;
+        gen_req.prompt = "hello";
+        ChatRequest chat_req;
+        chat_req.messages = {{"user", "hello"}};
+
+        // Omitted by default in every mode.
+        CHECK(llamaserver::build_completion_body("m", gen_req, true).find("speculative.n_max") == nullptr);
+        CHECK(llamaserver::build_completion_body("m", gen_req, false).find("speculative.n_max") == nullptr);
+        CHECK(llamaserver::build_chat_body("m", chat_req).find("speculative.n_max") == nullptr);
+
+        // Native completion emits speculative.n_max (including 0 when paused).
+        llamaserver::RequestExtras native_extras;
+        native_extras.cache_prompt = true;
+        native_extras.spec_draft_n_max = 4u;
+        const auto native_comp = llamaserver::build_completion_body("m", gen_req, true, {}, native_extras);
+        REQUIRE(native_comp.find("speculative.n_max") != nullptr);
+        CHECK(native_comp.find("speculative.n_max")->as_int() == 4);
+
+        native_extras.spec_draft_n_max = 0u;
+        const auto paused_comp = llamaserver::build_completion_body("m", gen_req, true, {}, native_extras);
+        REQUIRE(paused_comp.find("speculative.n_max") != nullptr);
+        CHECK(paused_comp.find("speculative.n_max")->as_int() == 0);
+
+        // Non-native completion omits speculative.n_max even when populated on RequestExtras.
+        native_extras.spec_draft_n_max = 4u;
+        CHECK(llamaserver::build_completion_body("m", gen_req, false, {}, native_extras).find("speculative.n_max") ==
+              nullptr);
+
+        // Native chat emits speculative.n_max; generic chat omits it.
+        native_extras.spec_draft_n_max = 5u;
+        const auto native_chat = llamaserver::build_chat_body("m", chat_req, {}, native_extras);
+        REQUIRE(native_chat.find("speculative.n_max") != nullptr);
+        CHECK(native_chat.find("speculative.n_max")->as_int() == 5);
+
+        native_extras.spec_draft_n_max = 0u;
+        const auto paused_chat = llamaserver::build_chat_body("m", chat_req, {}, native_extras);
+        REQUIRE(paused_chat.find("speculative.n_max") != nullptr);
+        CHECK(paused_chat.find("speculative.n_max")->as_int() == 0);
+
+        llamaserver::RequestExtras generic_extras;
+        generic_extras.generic_thinking = true;
+        generic_extras.spec_draft_n_max = 5u;
+        CHECK(llamaserver::build_chat_body("m", chat_req, {}, generic_extras).find("speculative.n_max") == nullptr);
+        CHECK(llamaserver::build_completion_body("m", gen_req, true, {}, generic_extras).find("speculative.n_max") ==
+              nullptr);
+    }
+
+    TEST_CASE("adaptive speculation options map faithfully and validate only when enabled") {
+        LlamaServerAdaptiveSpeculationOptions defaults;
+        CHECK_FALSE(defaults.enabled);
+        CHECK(defaults.min_draft_n == 0u);
+        CHECK(defaults.initial_draft_n == 3u);
+        CHECK(defaults.max_draft_n == 6u);
+        CHECK(defaults.window_size == 16u);
+        CHECK(defaults.min_samples == 4u);
+        CHECK(defaults.pause_acceptance_threshold == doctest::Approx(0.25));
+        CHECK(defaults.step_down_acceptance_threshold == doctest::Approx(0.45));
+        CHECK(defaults.step_up_acceptance_threshold == doctest::Approx(0.72));
+        CHECK(defaults.cooldown_requests == 8u);
+        CHECK(defaults.probe_draft_n == 1u);
+        CHECK(defaults.min_draft_tokens_per_sample == 4u);
+
+        LlamaServerAdaptiveSpeculationOptions custom;
+        custom.enabled = true;
+        custom.min_draft_n = 1;
+        custom.initial_draft_n = 2;
+        custom.max_draft_n = 8;
+        custom.window_size = 32;
+        custom.min_samples = 6;
+        custom.pause_acceptance_threshold = 0.20;
+        custom.step_down_acceptance_threshold = 0.40;
+        custom.step_up_acceptance_threshold = 0.80;
+        custom.cooldown_requests = 12;
+        custom.probe_draft_n = 2;
+        custom.min_draft_tokens_per_sample = 8;
+        const auto mapped = llamaserver::to_adaptive_speculation_config(custom);
+        CHECK(mapped.enabled == custom.enabled);
+        CHECK(mapped.min_draft_n == custom.min_draft_n);
+        CHECK(mapped.initial_draft_n == custom.initial_draft_n);
+        CHECK(mapped.max_draft_n == custom.max_draft_n);
+        CHECK(mapped.window_size == custom.window_size);
+        CHECK(mapped.min_samples == custom.min_samples);
+        CHECK(mapped.pause_acceptance_threshold == doctest::Approx(custom.pause_acceptance_threshold));
+        CHECK(mapped.step_down_acceptance_threshold == doctest::Approx(custom.step_down_acceptance_threshold));
+        CHECK(mapped.step_up_acceptance_threshold == doctest::Approx(custom.step_up_acceptance_threshold));
+        CHECK(mapped.cooldown_requests == custom.cooldown_requests);
+        CHECK(mapped.probe_draft_n == custom.probe_draft_n);
+        CHECK(mapped.min_draft_tokens_per_sample == custom.min_draft_tokens_per_sample);
+
+        // Disabled adaptive speculation stays inert even if bounds are invalid or in generic mode.
+        LlamaServerBackendOptions inert;
+        inert.adaptive_speculation.enabled = false;
+        inert.adaptive_speculation.max_draft_n = 0;
+        CHECK(llamaserver::validate_backend_options(inert).ok());
+        inert.native_completion = false;
+        CHECK(llamaserver::validate_backend_options(inert).ok());
+
+        // Enabled adaptive speculation validates ranges, thresholds, and native mode strictly.
+        LlamaServerBackendOptions valid;
+        valid.adaptive_speculation = custom;
+        CHECK(llamaserver::validate_backend_options(valid).ok());
+
+        {
+            LlamaServerBackendOptions generic_enabled;
+            generic_enabled.native_completion = false;
+            generic_enabled.adaptive_speculation.enabled = true;
+            CHECK(llamaserver::validate_backend_options(generic_enabled).code() == ErrorCode::invalid_argument);
+        }
+
+        const auto expect_invalid = [](LlamaServerBackendOptions bad) {
+            bad.adaptive_speculation.enabled = true;
+            CHECK(llamaserver::validate_backend_options(bad).code() == ErrorCode::invalid_argument);
+        };
+        {
+            LlamaServerBackendOptions b;
+            b.adaptive_speculation.max_draft_n = 0;
+            expect_invalid(b);
+        }
+        {
+            LlamaServerBackendOptions b;
+            b.adaptive_speculation.min_draft_n = 7;
+            b.adaptive_speculation.max_draft_n = 6;
+            expect_invalid(b);
+        }
+        {
+            LlamaServerBackendOptions b;
+            b.adaptive_speculation.initial_draft_n = 7;
+            expect_invalid(b);
+        }
+        {
+            LlamaServerBackendOptions b;
+            b.adaptive_speculation.probe_draft_n = 0;
+            expect_invalid(b);
+        }
+        {
+            LlamaServerBackendOptions b;
+            b.adaptive_speculation.window_size = 0;
+            expect_invalid(b);
+        }
+        {
+            LlamaServerBackendOptions b;
+            b.adaptive_speculation.min_samples = b.adaptive_speculation.window_size + 1;
+            expect_invalid(b);
+        }
+        {
+            LlamaServerBackendOptions b;
+            b.adaptive_speculation.pause_acceptance_threshold = 0.60;
+            b.adaptive_speculation.step_down_acceptance_threshold = 0.40;
+            expect_invalid(b);
+        }
+        {
+            LlamaServerBackendOptions b;
+            b.adaptive_speculation.step_down_acceptance_threshold = 0.85;
+            b.adaptive_speculation.step_up_acceptance_threshold = 0.70;
+            expect_invalid(b);
+        }
+        {
+            LlamaServerBackendOptions b;
+            b.adaptive_speculation.pause_acceptance_threshold = std::numeric_limits<double>::quiet_NaN();
+            expect_invalid(b);
+        }
+    }
+
+    TEST_CASE("adaptive speculation live loopback adjusts draft_n_max cancels failed probes and reports runtime diagnostics") {
+        sonder_test::FakeLlamaServer server;
+        const auto last_spec_n_max = [&server]() -> std::optional<std::int64_t> {
+            const auto parsed = json::parse(server.last_body());
+            REQUIRE(parsed.ok());
+            const auto *v = parsed->find("speculative.n_max");
+            if (!v)
+                return std::nullopt;
+            return v->as_int(-1);
+        };
+
+        const std::string high_chat =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],"
+            "\"timings\":{\"prompt_n\":4,\"predicted_n\":20,\"predicted_ms\":200.0,"
+            "\"draft_n\":20,\"draft_n_accepted\":18}}\n\n"
+            "data: [DONE]\n\n";
+        const std::string low_gen =
+            "data: {\"content\":\"ok\",\"stop\":true,"
+            "\"timings\":{\"prompt_n\":4,\"predicted_n\":10,\"predicted_ms\":200.0,"
+            "\"draft_n\":20,\"draft_n_accepted\":2}}\n\n";
+        const std::string paused_gen =
+            "data: {\"content\":\"ok\",\"stop\":true,"
+            "\"timings\":{\"prompt_n\":4,\"predicted_n\":10,\"predicted_ms\":200.0,"
+            "\"draft_n\":0,\"draft_n_accepted\":0}}\n\n";
+        const std::string high_gen =
+            "data: {\"content\":\"ok\",\"stop\":true,"
+            "\"timings\":{\"prompt_n\":4,\"predicted_n\":20,\"predicted_ms\":250.0,"
+            "\"draft_n\":20,\"draft_n_accepted\":16}}\n\n";
+
+        // Default (disabled): omits speculative.n_max and runtime_status diagnostics entry.
+        {
+            server.set_body(high_gen);
+            LlamaServerBackendOptions disabled_opts;
+            disabled_opts.base_url = server.url();
+            auto backend = make_llamaserver_backend(disabled_opts);
+            auto model = backend->load_model({"fake-model", "cpu:0"});
+            REQUIRE(model.ok());
+            REQUIRE(model.value()->generate(GenerateRequest{"", "hello", {}}, {}, {}).ok());
+            CHECK_FALSE(last_spec_n_max().has_value());
+            if (const auto rt = backend->runtime_status(); rt && rt->diagnostics)
+                CHECK(rt->diagnostics->find("adaptive_speculation") == nullptr);
+        }
+
+        // Generic mode (native_completion = false) with adaptive_speculation.enabled = true is rejected.
+        {
+            LlamaServerBackendOptions generic_opts;
+            generic_opts.base_url = server.url();
+            generic_opts.native_completion = false;
+            generic_opts.adaptive_speculation.enabled = true;
+            CHECK(llamaserver::validate_backend_options(generic_opts).code() == ErrorCode::invalid_argument);
+            auto backend = make_llamaserver_backend(generic_opts);
+            CHECK(backend->load_model({"fake-model", "cpu:0"}).status().code() == ErrorCode::invalid_argument);
+            CHECK_FALSE(backend->runtime_status().has_value());
+        }
+
+        // Native mode with adaptive speculation enabled: live feedback loop.
+        LlamaServerBackendOptions opts;
+        opts.base_url = server.url();
+        opts.adaptive_speculation.enabled = true;
+        opts.adaptive_speculation.min_draft_n = 0;
+        opts.adaptive_speculation.initial_draft_n = 3;
+        opts.adaptive_speculation.max_draft_n = 5;
+        opts.adaptive_speculation.window_size = 4;
+        opts.adaptive_speculation.min_samples = 2;
+        opts.adaptive_speculation.pause_acceptance_threshold = 0.25;
+        opts.adaptive_speculation.step_down_acceptance_threshold = 0.45;
+        opts.adaptive_speculation.step_up_acceptance_threshold = 0.72;
+        opts.adaptive_speculation.cooldown_requests = 2;
+        opts.adaptive_speculation.probe_draft_n = 1;
+        opts.adaptive_speculation.min_draft_tokens_per_sample = 4;
+
+        auto backend = make_llamaserver_backend(opts);
+        auto model = backend->load_model({"fake-model", "cpu:0"});
+        REQUIRE(model.ok());
+
+        // 1. High-acceptance code_edit chat requests step up draft_n_max: 3 -> 4 -> 5.
+        server.set_body(high_chat);
+        ChatRequest code_req;
+        code_req.messages = {{"user", "Update this block:\n```cpp\nint x = 1;\n```"}};
+        REQUIRE(model.value()->chat(code_req, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(3));
+        REQUIRE(model.value()->chat(code_req, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(3));
+        REQUIRE(model.value()->chat(code_req, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(4));
+        REQUIRE(model.value()->chat(code_req, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(5));
+
+        // 2. Low-acceptance general completions pause general without disturbing code_edit.
+        server.set_body(low_gen);
+        GenerateRequest gen_req{"", "Write a brief summary of cloud formations.", {}};
+        REQUIRE(model.value()->generate(gen_req, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(3));
+        REQUIRE(model.value()->generate(gen_req, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(3));
+
+        // Workload isolation: code_edit remains at 5 while general is paused.
+        server.set_body(high_chat);
+        REQUIRE(model.value()->chat(code_req, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(5));
+
+        // 3. Cooldown skips 2 paused requests (emitting speculative.n_max = 0).
+        server.set_body(paused_gen);
+        REQUIRE(model.value()->generate(gen_req, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(0));
+        REQUIRE(model.value()->generate(gen_req, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(0));
+
+        // 4. First cooldown probe fails upstream with HTTP 500: RAII guard cancels probe
+        // and restarts cooldown so the workload cannot wedge in probe_in_flight.
+        server.set_status(500);
+        const auto failed_probe = model.value()->generate(gen_req, {}, {});
+        CHECK_FALSE(failed_probe.ok());
+        CHECK(failed_probe.status().code() == ErrorCode::backend_error);
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(1));
+
+        {
+            const auto rt = backend->runtime_status();
+            REQUIRE(rt.has_value());
+            REQUIRE(rt->diagnostics.has_value());
+            const auto *spec = rt->diagnostics->find("adaptive_speculation");
+            REQUIRE(spec != nullptr);
+            const auto *spec_workloads = spec->find("workloads");
+            REQUIRE(spec_workloads != nullptr);
+            const auto *general_bucket = spec_workloads->find("general");
+            REQUIRE(general_bucket != nullptr);
+            CHECK(general_bucket->find("paused")->as_bool());
+            CHECK_FALSE(general_bucket->find("probe_in_flight")->as_bool());
+            CHECK(general_bucket->find("cooldown_remaining")->as_uint() == 2u);
+            CHECK(general_bucket->find("probes_issued")->as_uint() == 1u);
+            CHECK(general_bucket->find("probe_recoveries")->as_uint() == 0u);
+        }
+
+        // 5. Restarted cooldown runs 2 paused requests, then probe #2 succeeds and recovers.
+        server.set_status(200);
+        server.set_body(paused_gen);
+        REQUIRE(model.value()->generate(gen_req, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(0));
+        REQUIRE(model.value()->generate(gen_req, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(0));
+
+        server.set_body(high_gen);
+        REQUIRE(model.value()->generate(gen_req, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(1));
+
+        // 6. Reasoning chat classifies into the reasoning bucket.
+        server.set_body(high_chat);
+        ChatRequest reason_req;
+        reason_req.messages = {{"user", "Derive the recurrence"}};
+        reason_req.separate_reasoning = true;
+        REQUIRE(model.value()->chat(reason_req, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(3));
+
+        // 7. Inspect full runtime_status()->diagnostics["adaptive_speculation"] snapshot.
+        const auto rt = backend->runtime_status();
+        REQUIRE(rt.has_value());
+        REQUIRE(rt->diagnostics.has_value());
+        const auto *spec = rt->diagnostics->find("adaptive_speculation");
+        REQUIRE(spec != nullptr);
+        CHECK(spec->find("enabled")->as_bool());
+        const auto *workloads = spec->find("workloads");
+        REQUIRE(workloads != nullptr);
+        const auto *code_bucket = workloads->find("code_edit");
+        const auto *general_bucket = workloads->find("general");
+        const auto *reasoning_bucket = workloads->find("reasoning");
+        REQUIRE(code_bucket != nullptr);
+        REQUIRE(general_bucket != nullptr);
+        REQUIRE(reasoning_bucket != nullptr);
+        CHECK(code_bucket->find("draft_n_max")->as_uint() == 5u);
+        CHECK_FALSE(code_bucket->find("paused")->as_bool());
+        CHECK_FALSE(general_bucket->find("paused")->as_bool());
+        CHECK(general_bucket->find("draft_n_max")->as_uint() == 1u);
+        CHECK(general_bucket->find("probes_issued")->as_uint() == 2u);
+        CHECK(general_bucket->find("probe_recoveries")->as_uint() == 1u);
+        CHECK(general_bucket->find("reason")->as_string() == "probe_recovered");
+        CHECK(general_bucket->find("rolling_decode_tps")->as_double() == doctest::Approx(80.0));
+        CHECK(reasoning_bucket->find("total_observations")->as_uint() == 1u);
+
+        // 8. Non-empty grammar classifies requests into tool_json.
+        LlamaServerBackendOptions grammar_opts = opts;
+        grammar_opts.grammar = "root ::= \"ok\"";
+        auto grammar_backend = make_llamaserver_backend(grammar_opts);
+        auto grammar_model = grammar_backend->load_model({"fake-model", "cpu:0"});
+        REQUIRE(grammar_model.ok());
+        server.set_body(high_gen);
+        REQUIRE(grammar_model.value()->generate(gen_req, {}, {}).ok());
+        const auto grt = grammar_backend->runtime_status();
+        REQUIRE(grt.has_value());
+        REQUIRE(grt->diagnostics.has_value());
+        const auto *gspec = grt->diagnostics->find("adaptive_speculation");
+        REQUIRE(gspec != nullptr);
+        const auto *gworkloads = gspec->find("workloads");
+        REQUIRE(gworkloads != nullptr);
+        REQUIRE(gworkloads->find("tool_json") != nullptr);
+        REQUIRE(gworkloads->find("general") != nullptr);
+        CHECK(gworkloads->find("tool_json")->find("total_observations")->as_uint() == 1u);
+        CHECK(gworkloads->find("general")->find("total_observations")->as_uint() == 0u);
+    }
+
+#if defined(SONDER_HAS_SERVER)
+    TEST_CASE("llamaserver JSON config parses adaptive_speculation strictly and wires into backend") {
+        const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+        const auto path = std::filesystem::temp_directory_path() /
+                          ("sonder-adaptive-spec-cfg-test-" + std::to_string(unique) + ".json");
+        struct Cleanup {
+            std::filesystem::path file;
+            ~Cleanup() {
+                std::error_code ec;
+                std::filesystem::remove(file, ec);
+            }
+        } cleanup{path};
+        const auto write = [&](const std::string &body) {
+            std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            out << body;
+        };
+
+        // Omitted adaptive_speculation keeps enabled = false.
+        write(R"({"mode":"attach","base_url":"http://127.0.0.1:8080"})");
+        {
+            BackendSetup setup;
+            REQUIRE(load_llamaserver_config(path.string(), setup).ok());
+            CHECK_FALSE(setup.llamaserver_adaptive_speculation.enabled);
+        }
+
+        // Valid full adaptive_speculation object parses and wires into make_backend().
+        sonder_test::FakeLlamaServer server;
+        write(std::string(R"({"mode":"attach","base_url":")") + server.url() +
+              R"(","adaptive_speculation":{"enabled":true,"min_draft_n":1,"initial_draft_n":2,)"
+              R"("max_draft_n":8,"window_size":24,"min_samples":5,)"
+              R"("pause_acceptance_threshold":0.2,"step_down_acceptance_threshold":0.4,)"
+              R"("step_up_acceptance_threshold":0.75,"cooldown_requests":10,)"
+              R"("probe_draft_n":2,"min_draft_tokens_per_sample":6}})");
+        {
+            BackendSetup setup;
+            setup.backend = "llamaserver";
+            const auto loaded = load_llamaserver_config(path.string(), setup);
+            REQUIRE_MESSAGE(loaded.ok(), loaded.to_string());
+            const auto &cfg = setup.llamaserver_adaptive_speculation;
+            CHECK(cfg.enabled);
+            CHECK(cfg.min_draft_n == 1u);
+            CHECK(cfg.initial_draft_n == 2u);
+            CHECK(cfg.max_draft_n == 8u);
+            CHECK(cfg.window_size == 24u);
+            CHECK(cfg.min_samples == 5u);
+            CHECK(cfg.pause_acceptance_threshold == doctest::Approx(0.2));
+            CHECK(cfg.step_down_acceptance_threshold == doctest::Approx(0.4));
+            CHECK(cfg.step_up_acceptance_threshold == doctest::Approx(0.75));
+            CHECK(cfg.cooldown_requests == 10u);
+            CHECK(cfg.probe_draft_n == 2u);
+            CHECK(cfg.min_draft_tokens_per_sample == 6u);
+
+            auto built = make_backend(setup);
+            REQUIRE_MESSAGE(built.ok(), built.status().to_string());
+            const auto rt = built.value()->runtime_status();
+            REQUIRE(rt.has_value());
+            REQUIRE(rt->diagnostics.has_value());
+            const auto *spec = rt->diagnostics->find("adaptive_speculation");
+            REQUIRE(spec != nullptr);
+            CHECK(spec->find("enabled")->as_bool());
+            const auto *rcfg = spec->find("config");
+            REQUIRE(rcfg != nullptr);
+            CHECK(rcfg->find("min_draft_n")->as_uint() == 1u);
+            CHECK(rcfg->find("initial_draft_n")->as_uint() == 2u);
+            CHECK(rcfg->find("max_draft_n")->as_uint() == 8u);
+            CHECK(rcfg->find("window_size")->as_uint() == 24u);
+            CHECK(rcfg->find("min_samples")->as_uint() == 5u);
+            CHECK(rcfg->find("pause_acceptance_threshold")->as_double() == doctest::Approx(0.2));
+            CHECK(rcfg->find("step_down_acceptance_threshold")->as_double() == doctest::Approx(0.4));
+            CHECK(rcfg->find("step_up_acceptance_threshold")->as_double() == doctest::Approx(0.75));
+            CHECK(rcfg->find("cooldown_requests")->as_uint() == 10u);
+            CHECK(rcfg->find("probe_draft_n")->as_uint() == 2u);
+            CHECK(rcfg->find("min_draft_tokens_per_sample")->as_uint() == 6u);
+        }
+
+        // Strict rejection of unknown keys, wrong types, out-of-range values, and reversed thresholds.
+        const char *const invalid_docs[] = {
+            R"({"adaptive_speculation":true})",
+            R"({"adaptive_speculation":{"unknown_key":1}})",
+            R"({"adaptive_speculation":{"enabled":1}})",
+            R"({"adaptive_speculation":{"max_draft_n":true}})",
+            R"({"adaptive_speculation":{"max_draft_n":3.5}})",
+            R"({"adaptive_speculation":{"max_draft_n":0}})",
+            R"({"adaptive_speculation":{"max_draft_n":129}})",
+            R"({"adaptive_speculation":{"min_draft_n":-1}})",
+            R"({"adaptive_speculation":{"min_draft_n":5,"max_draft_n":4}})",
+            R"({"adaptive_speculation":{"initial_draft_n":7,"max_draft_n":6}})",
+            R"({"adaptive_speculation":{"min_draft_n":3,"initial_draft_n":2,"max_draft_n":6}})",
+            R"({"adaptive_speculation":{"probe_draft_n":0}})",
+            R"({"adaptive_speculation":{"probe_draft_n":7,"max_draft_n":6}})",
+            R"({"adaptive_speculation":{"window_size":0}})",
+            R"({"adaptive_speculation":{"window_size":257}})",
+            R"({"adaptive_speculation":{"window_size":4,"min_samples":5}})",
+            R"({"adaptive_speculation":{"pause_acceptance_threshold":"0.25"}})",
+            R"({"adaptive_speculation":{"pause_acceptance_threshold":-0.1}})",
+            R"({"adaptive_speculation":{"step_up_acceptance_threshold":1.1}})",
+            R"({"adaptive_speculation":{"pause_acceptance_threshold":0.5,"step_down_acceptance_threshold":0.4}})",
+            R"({"adaptive_speculation":{"step_down_acceptance_threshold":0.8,"step_up_acceptance_threshold":0.7}})",
+            R"({"adaptive_speculation":{"cooldown_requests":-1}})",
+            R"({"adaptive_speculation":{"min_draft_tokens_per_sample":-1}})",
+            R"({"adaptive_speculation":{"min_draft_tokens_per_sample":1.5}})",
+        };
+        for (const char *body : invalid_docs) {
+            write(body);
+            BackendSetup untouched;
+            untouched.llamaserver_adaptive_speculation.enabled = true;
+            untouched.llamaserver_adaptive_speculation.max_draft_n = 10;
+            const auto st = load_llamaserver_config(path.string(), untouched);
+            CHECK_MESSAGE(st.code() == ErrorCode::invalid_argument, body);
+            CHECK(untouched.llamaserver_adaptive_speculation.enabled);
+            CHECK(untouched.llamaserver_adaptive_speculation.max_draft_n == 10u);
+        }
+
+        // Oversized unknown key is bounded in the error message.
+        write(std::string(R"({"adaptive_speculation":{")") + std::string(900, 'z') + R"(":1}})");
+        {
+            BackendSetup setup;
+            const auto st = load_llamaserver_config(path.string(), setup);
+            REQUIRE(st.code() == ErrorCode::invalid_argument);
+            CHECK(st.message().size() < 1024u);
+            CHECK(st.message().find(std::string(64, 'z') + "...") != std::string::npos);
+        }
+    }
+#endif
 }

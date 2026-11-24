@@ -195,6 +195,16 @@ inline bool is_allowed_inherited_upper(std::string_view upper) noexcept {
     return false;
 }
 
+inline std::string bounded_key_for_message(std::string_view key) {
+    constexpr std::size_t kMaxKeyChars = 64;
+    if (key.size() <= kMaxKeyChars) {
+        return std::string(key);
+    }
+    std::string out(key.substr(0, kMaxKeyChars));
+    out += "...";
+    return out;
+}
+
 }  // namespace detail
 
 // True if an inherited parent environment variable is on the minimal explicit
@@ -234,13 +244,13 @@ inline Status check_child_environment_overrides(const std::vector<std::pair<std:
         }
         if (detail::starts_with(upper, "AIP_")) {
             return {ErrorCode::invalid_argument,
-                    "child environment override '" + key +
+                    "child environment override '" + detail::bounded_key_for_message(key) +
                         "' is refused: AIP_* variables enable llama-server's Vertex AI mode, which would replace the "
                         "supervisor-owned port"};
         }
         if (detail::is_forbidden_override_upper(upper)) {
             return {ErrorCode::invalid_argument,
-                    "child environment override '" + key +
+                    "child environment override '" + detail::bounded_key_for_message(key) +
                         "' is refused: llama-server arguments, credentials, downloads, proxy, loader and config-home "
                         "variables cannot be set via environment overrides"};
         }

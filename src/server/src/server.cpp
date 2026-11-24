@@ -277,6 +277,54 @@ struct Server::Impl {
         write_json(ex, 200, build_identity_body(*residency, *served_id, synthetic, probed));
     }
 
+    void handle_node(Exchange& ex) {
+        if (!require_ready(ex)) {
+            return;
+        }
+        bool available = false;
+        std::string version;
+        probe.status(available, version);
+        std::shared_ptr<Backend> b;
+        {
+            std::lock_guard<std::mutex> lock(engine_mu);
+            b = backend;
+        }
+        const NodeSnapshot snapshot{opts,       available,   std::move(version), std::move(b),
+                                    *residency, instance_id, node_id,            synthetic};
+        write_json(ex, 200, build_node_body(snapshot));
+    }
+
+    void handle_plan(Exchange& ex, const std::string& body) {
+        std::variant<PlanHttpRequest, ApiError> parsed = make_error(500, "internal_error", "uninitialized");
+        {
+            const auto parse_timeout = std::min(opts.read_timeout, std::chrono::milliseconds(2000));
+            auto parse_guard = parse_gate.acquire(body.size(), parse_timeout);
+            if (!parse_guard) {
+                if (!require_ready(ex)) {
+                    return;
+                }
+                ApiError e = make_error(503, "overloaded", "request parser concurrency limit reached; retry later");
+                e.retry_after = 1;
+                write_error(ex, e);
+                return;
+            }
+            parsed = parse_plan_request(body);
+        }
+        if (auto* e = std::get_if<ApiError>(&parsed)) {
+            write_error(ex, *e);
+            return;
+        }
+        if (!require_ready(ex)) {
+            return;
+        }
+        auto planned = execute_plan_request(opts, std::get<PlanHttpRequest>(parsed));
+        if (auto* e = std::get_if<ApiError>(&planned)) {
+            write_error(ex, *e);
+            return;
+        }
+        write_json(ex, 200, std::get<json::Object>(planned));
+    }
+
     void handle_chat(Exchange& ex, const RequestHead& head, const std::string& body,
                      ChatProtocol protocol = ChatProtocol::openai) {
         auto corr_v = parse_correlation(head);
@@ -432,6 +480,8 @@ struct Server::Impl {
             case Route::health: handle_health(ex); break;
             case Route::models: handle_models(ex); break;
             case Route::identity: handle_identity(ex, head); break;
+            case Route::sonder_node: handle_node(ex); break;
+            case Route::sonder_plan: handle_plan(ex, checked.body); break;
             case Route::chat: handle_chat(ex, head, checked.body); break;
             case Route::messages: handle_chat(ex, head, checked.body, ChatProtocol::anthropic); break;
             case Route::embeddings:
