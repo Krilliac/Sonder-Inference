@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <memory>
@@ -159,6 +160,9 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
     if (models.empty()) {
         models = "mock (default)";
     }
+    if (o.profile_bindings.size() > 1) {
+        diag("info", "serving " + std::to_string(o.profile_bindings.size()) + " launch profiles: " + models);
+    }
     const bool mock = is_synthetic_backend(o.backend.backend);
     // Residency summary for the banner; empty with the defaults, which keep
     // the banner exactly as it was before these options existed.
@@ -187,16 +191,19 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
     const auto on_listening = [&] {
         const std::string base = server.url();
         if (json_log) {
-            log->line(json::Value(json::Object{{"time", utc_timestamp_now()},
-                                               {"level", "info"},
-                                               {"message", "listening"},
-                                               {"url", base},
-                                               {"bind", bind_text()},
-                                               {"api_version", kApiVersion},
-                                               {"backend", o.backend.backend},
-                                               {"models", models},
-                                               {"status", o.lazy_models ? "registering models" : "loading models"}})
-                          .dump());
+            json::Object listening_doc{{"time", utc_timestamp_now()},
+                                       {"level", "info"},
+                                       {"message", "listening"},
+                                       {"url", base},
+                                       {"bind", bind_text()},
+                                       {"api_version", kApiVersion},
+                                       {"backend", o.backend.backend},
+                                       {"models", models},
+                                       {"status", o.lazy_models ? "registering models" : "loading models"}};
+            if (o.profile_bindings.size() > 1) {
+                listening_doc.set("served_profiles", static_cast<std::uint64_t>(o.profile_bindings.size()));
+            }
+            log->line(json::Value(std::move(listening_doc)).dump());
         } else {
             log->line("sonder-infer serve: listening on " +
                       (wildcard ? bind_text() + " (all interfaces; local URL " + base + ")" : base) +
@@ -276,6 +283,9 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
                                {"sse_url", base + "/v1/telemetry/sse"},
                                {"ndjson_url", base + "/v1/telemetry/ndjson"},
                                {"synthetic", mock}};
+        if (o.profile_bindings.size() > 1) {
+            ready_doc.set("served_profiles", static_cast<std::uint64_t>(o.profile_bindings.size()));
+        }
         if (!residency.empty()) {
             ready_doc.set("residency", residency);
         }
@@ -288,6 +298,9 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
         log->line("  cors:      " + (cors.empty() ? std::string("no explicit origins") : cors) +
                   (o.default_cors ? "; default Observatory origins for GET routes" : "; defaults disabled"));
         log->line("  backend:   " + o.backend.backend + "; models: " + models);
+        if (o.profile_bindings.size() > 1) {
+            log->line("  profiles:  " + std::to_string(o.profile_bindings.size()) + " active");
+        }
         if (!residency.empty()) {
             log->line("  residency: " + residency);
         }

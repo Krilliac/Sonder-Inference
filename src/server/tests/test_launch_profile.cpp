@@ -21,6 +21,7 @@
 
 #include "server_test_support.hpp"
 #include "sonder/inference/launch_profile.hpp"
+#include "src/serve_options.hpp"
 
 using namespace server_test;
 namespace json = sonder::inference::json;
@@ -2340,4 +2341,219 @@ TEST_CASE("serve_main: a llamaserver profile refuses the llamacpp-only tensor pl
     }
     std::filesystem::remove(model);
     std::filesystem::remove(profiles);
+}
+
+TEST_CASE("profile_catalog: multi-profile llamacpp binds models and enforces aggregate co-residency VRAM") {
+    const auto a_file = write_temp("multi-a.gguf", hybrid_fixture());
+    const auto b_file = write_temp("multi-b.gguf", hybrid_fixture());
+    const std::string a_path = a_file.generic_string();
+    const std::string b_path = b_file.generic_string();
+
+    LaunchProfile alpha = parse_single(
+        R"({"name":"alpha","backend":"llamacpp","model":")" + a_path +
+        R"(","ctx_size":512,"n_gpu_layers":-1,"sampling":{"temperature":0.25}})");
+    LaunchProfile beta = parse_single(
+        R"({"name":"beta","backend":"llamacpp","model":")" + b_path +
+        R"(","ctx_size":512,"n_gpu_layers":-1,"sampling":{"temperature":0.85}})");
+    LaunchProfile idle = parse_single(
+        R"({"name":"idle","backend":"llamacpp","model":")" + a_path +
+        R"(","ctx_size":512,"n_gpu_layers":-1,"sampling":{"temperature":0.5}})");
+    const std::vector<LaunchProfile> all{alpha, beta, idle};
+
+    const auto parsed_info = si::read_gguf_model_info(a_path);
+    REQUIRE_MESSAGE(parsed_info.ok(), parsed_info.status().message());
+    const std::uint64_t single_mib = si::estimate_vram(parsed_info.value(), alpha).total_mib();
+    const std::uint64_t tight_budget = single_mib + 40u;
+    const std::uint64_t pair_budget = 2u * single_mib + 40u;
+    REQUIRE(tight_budget < 2u * single_mib);
+    REQUIRE(pair_budget < 3u * single_mib);
+
+    // Reverse file order: beta is primary (default), alpha is second, idle is unserved.
+    const std::vector<const LaunchProfile*> two_active{&all[1], &all[0]};
+
+    // Eager fit when budget >= sum: verifies o.models order, GGUF load_names, sampling, and catalog served flags.
+    {
+        srv::ServerOptions opts;
+        opts.device = "gpu:0";
+        std::vector<std::string> notes;
+        std::string refusal;
+        const json::Array catalog = srv::profile_catalog(
+            all, two_active, opts, std::optional<std::uint64_t>(pair_budget), false, notes, refusal);
+        CHECK(refusal.empty());
+        CHECK(opts.models == std::vector<std::string>{"beta", "alpha"});
+        REQUIRE(opts.profile_bindings.size() == 2u);
+        CHECK(opts.profile_bindings[0].model == "beta");
+        CHECK(opts.profile_bindings[0].load_name == b_path);
+        CHECK(*opts.profile_bindings[0].sampling_defaults.temperature == doctest::Approx(0.85));
+        CHECK(opts.profile_bindings[1].model == "alpha");
+        CHECK(opts.profile_bindings[1].load_name == a_path);
+        CHECK(*opts.profile_bindings[1].sampling_defaults.temperature == doctest::Approx(0.25));
+        REQUIRE(catalog.size() == 3u);
+        CHECK(catalog[0].find("served")->as_bool());
+        CHECK(catalog[1].find("served")->as_bool());
+        CHECK_FALSE(catalog[2].find("served")->as_bool());
+    }
+
+    // Eager overcommit when sum > budget refuses with both profile names, sum vs budget, and suggestions.
+    {
+        srv::ServerOptions opts;
+        opts.device = "gpu:0";
+        std::vector<std::string> notes;
+        std::string refusal;
+        (void)srv::profile_catalog(all, two_active, opts, std::optional<std::uint64_t>(tight_budget), false, notes,
+                                   refusal);
+        CHECK(contains(refusal, "aggregate VRAM"));
+        CHECK(contains(refusal, "beta"));
+        CHECK(contains(refusal, "alpha"));
+        CHECK(contains(refusal, std::to_string(2u * single_mib) + " MiB vs budget " + std::to_string(tight_budget) +
+                                    " MiB"));
+        CHECK(contains(refusal, "--lazy-models --max-resident-models 1"));
+        CHECK(contains(refusal, "--allow-overcommit"));
+    }
+
+    // Lazy residency WITHOUT max_resident_models cap still allows both models co-resident -> refuses.
+    {
+        srv::ServerOptions opts;
+        opts.device = "gpu:0";
+        opts.lazy_models = true;
+        opts.max_resident_models = 0;
+        std::vector<std::string> notes;
+        std::string refusal;
+        (void)srv::profile_catalog(all, two_active, opts, std::optional<std::uint64_t>(tight_budget), false, notes,
+                                   refusal);
+        CHECK(contains(refusal, "aggregate VRAM does not fit"));
+    }
+
+    // Lazy residency WITH max_resident_models == 1 keeps peak resident to 1 model -> passes at tight_budget.
+    {
+        srv::ServerOptions opts;
+        opts.device = "gpu:0";
+        opts.lazy_models = true;
+        opts.max_resident_models = 1;
+        std::vector<std::string> notes;
+        std::string refusal;
+        (void)srv::profile_catalog(all, two_active, opts, std::optional<std::uint64_t>(tight_budget), false, notes,
+                                   refusal);
+        CHECK(refusal.empty());
+        bool noted_cap = false;
+        for (const auto& note : notes) {
+            if (contains(note, "max resident is 1")) noted_cap = true;
+        }
+        CHECK(noted_cap);
+    }
+
+    // allow_overcommit permits eager multi-profile start past budget and logs the override.
+    {
+        srv::ServerOptions opts;
+        opts.device = "gpu:0";
+        std::vector<std::string> notes;
+        std::string refusal;
+        (void)srv::profile_catalog(all, two_active, opts, std::optional<std::uint64_t>(tight_budget), true, notes,
+                                   refusal);
+        CHECK(refusal.empty());
+        bool noted_over = false;
+        for (const auto& note : notes) {
+            if (contains(note, "aggregate VRAM") && contains(note, "(over budget; --allow-overcommit)")) {
+                noted_over = true;
+            }
+        }
+        CHECK(noted_over);
+    }
+
+    // 3 active profiles with max_resident_models == 2 checks worst-case 2 resident (<= pair_budget < 3 * single_mib).
+    {
+        const std::vector<const LaunchProfile*> three_active{&all[0], &all[1], &all[2]};
+        srv::ServerOptions opts;
+        opts.device = "gpu:0";
+        opts.lazy_models = true;
+        opts.max_resident_models = 2;
+        std::vector<std::string> notes;
+        std::string refusal;
+        (void)srv::profile_catalog(all, three_active, opts, std::optional<std::uint64_t>(pair_budget), false, notes,
+                                   refusal);
+        CHECK(refusal.empty());
+        CHECK(opts.models == std::vector<std::string>{"alpha", "beta", "idle"});
+        CHECK(opts.profile_bindings.size() == 3u);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(a_file, ec);
+    std::filesystem::remove(b_file, ec);
+}
+
+TEST_CASE("profile_catalog: multi-profile llamaserver attach and shared-model spawn bindings") {
+    const auto m1_file = write_temp("ls-a.gguf", hybrid_fixture());
+    const auto m2_file = write_temp("ls-b.gguf", hybrid_fixture());
+    const std::string m1 = m1_file.generic_string();
+    const std::string m2 = m2_file.generic_string();
+
+    LaunchProfile p1 = parse_single(
+        R"({"name":"bonsai-27b","backend":"llamaserver","model":")" + m1 +
+        R"(","ctx_size":512,"parallel":1,"n_gpu_layers":-1,"fit":false,"sampling":{"temperature":0.2}})");
+    LaunchProfile p2 = parse_single(
+        R"({"name":"bonsai-9b","backend":"llamaserver","model":")" + m2 +
+        R"(","ctx_size":512,"parallel":1,"n_gpu_layers":-1,"fit":false,"sampling":{"temperature":0.7}})");
+    LaunchProfile p1_alias = parse_single(
+        R"({"name":"bonsai-27b-alt","backend":"llamaserver","model":")" + m1 +
+        R"(","ctx_size":512,"parallel":1,"n_gpu_layers":-1,"fit":false,"sampling":{"temperature":1.0}})");
+
+    const auto parsed_info = si::read_gguf_model_info(m1);
+    REQUIRE_MESSAGE(parsed_info.ok(), parsed_info.status().message());
+    const std::uint64_t single_mib = si::estimate_vram(parsed_info.value(), p1).total_mib();
+    const std::uint64_t tight_budget = single_mib + 40u;
+    const std::uint64_t fit_budget = 2u * single_mib + 40u;
+    REQUIRE(tight_budget < 2u * single_mib);
+
+    // Attach mode: distinct upstream router models bind under their own profile names and check aggregate VRAM.
+    {
+        const std::vector<LaunchProfile> all{p1, p2, p1_alias};
+        const std::vector<const LaunchProfile*> active{&all[0], &all[1]};
+        srv::ServerOptions opts;
+        opts.backend.llamaserver_mode = "attach";
+        std::vector<std::string> notes;
+        std::string refusal;
+        const json::Array catalog = srv::profile_catalog(
+            all, active, opts, std::optional<std::uint64_t>(fit_budget), false, notes, refusal);
+        CHECK(refusal.empty());
+        CHECK(opts.models == std::vector<std::string>{"bonsai-27b", "bonsai-9b"});
+        REQUIRE(opts.profile_bindings.size() == 2u);
+        CHECK(opts.profile_bindings[0].load_name == "bonsai-27b");
+        CHECK(opts.profile_bindings[1].load_name == "bonsai-9b");
+        CHECK(*opts.profile_bindings[0].sampling_defaults.temperature == doctest::Approx(0.2));
+        CHECK(*opts.profile_bindings[1].sampling_defaults.temperature == doctest::Approx(0.7));
+        REQUIRE(catalog.size() == 3u);
+        CHECK(catalog[0].find("served")->as_bool());
+        CHECK(catalog[1].find("served")->as_bool());
+        CHECK_FALSE(catalog[2].find("served")->as_bool());
+
+        // Over budget in attach mode refuses unless capped or overcommit allowed.
+        srv::ServerOptions tight_opts;
+        tight_opts.backend.llamaserver_mode = "attach";
+        std::vector<std::string> tight_notes;
+        std::string tight_refusal;
+        (void)srv::profile_catalog(all, active, tight_opts, std::optional<std::uint64_t>(tight_budget), false,
+                                   tight_notes, tight_refusal);
+        CHECK(contains(tight_refusal, "aggregate VRAM does not fit"));
+    }
+
+    // Shared-model spawn mode: both profiles target the single spawned child's alias and do not double-count VRAM.
+    {
+        const std::vector<LaunchProfile> all{p1, p1_alias};
+        const std::vector<const LaunchProfile*> active{&all[0], &all[1]};
+        srv::ServerOptions opts;
+        opts.backend.llamaserver_mode = "spawn";
+        std::vector<std::string> notes;
+        std::string refusal;
+        (void)srv::profile_catalog(all, active, opts, std::optional<std::uint64_t>(tight_budget), false, notes,
+                                   refusal);
+        CHECK(refusal.empty());
+        CHECK(opts.models == std::vector<std::string>{"bonsai-27b", "bonsai-27b-alt"});
+        REQUIRE(opts.profile_bindings.size() == 2u);
+        CHECK(opts.profile_bindings[0].load_name == "bonsai-27b");
+        CHECK(opts.profile_bindings[1].load_name == "bonsai-27b");
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(m1_file, ec);
+    std::filesystem::remove(m2_file, ec);
 }

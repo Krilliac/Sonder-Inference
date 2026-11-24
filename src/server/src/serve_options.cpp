@@ -85,8 +85,10 @@ Backend:
 
 Launch profiles (docs/integration/launch-profiles.md):
   --profiles PATH         JSON file of typed per-model launch profiles
-  --profile NAME          serve that profile: it selects the backend and the model
-                          (served under NAME) and sets every serving option
+  --profile NAME          serve that profile (repeatable; the first is the default);
+                          selects the backend and models and sets serving options
+  --all-profiles          serve every profile in --profiles sharing the primary
+                          profile's backend (or --backend if specified)
   --vram-budget-mib N     VRAM budget for the fit check; overrides the profile's
                           vram_budget_mib (default: the profile's value, else
                           device memory - 1536 MiB)
@@ -140,8 +142,8 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"batch-size", Kind::value},             {"ubatch-size", Kind::value},
         {"cache-type-k", Kind::value},           {"cache-type-v", Kind::value},
         {"flash-attn", Kind::value},             {"profiles", Kind::value},
-        {"profile", Kind::value},                {"vram-budget-mib", Kind::value},
-        {"allow-overcommit", Kind::flag},
+        {"profile", Kind::repeat},               {"all-profiles", Kind::flag},
+        {"vram-budget-mib", Kind::value},        {"allow-overcommit", Kind::flag},
     };
     static const std::vector<std::pair<std::string, Kind>> kAll = [] {
         auto all = kSpec;
@@ -246,38 +248,86 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
         if (!parse_uint(*v, 65535, n)) return usage_error("--port must be an integer from 0 to 65535");
         o.port = static_cast<std::uint16_t>(n);
     }
-    // Launch profile: it names the backend and the one model it serves.
+    // Launch profiles: one or more typed profiles naming the backend and served models.
     std::vector<LaunchProfile> profiles;
-    const LaunchProfile* profile = nullptr;
+    std::vector<const LaunchProfile*> active_profiles;
+    const std::vector<std::string> requested_profiles = a.all("profile");
+    const bool all_profiles = a.flags.count("all-profiles") != 0;
     if (auto path = a.get("profiles")) {
         auto loaded = load_launch_profiles(*path);
         if (!loaded.ok()) return usage_error(loaded.status().message());
         profiles = std::move(loaded).value();
     }
-    if (auto name = a.get("profile")) {
-        if (profiles.empty()) return usage_error("--profile needs --profiles FILE");
-        profile = find_launch_profile(profiles, *name);
-        if (!profile) return usage_error("no launch profile named '" + *name + "' in --profiles");
-    } else if (!profiles.empty()) {
-        return usage_error("--profiles needs --profile NAME (the profile to serve)");
-    } else if (a.get("vram-budget-mib") || a.flags.count("allow-overcommit") != 0) {
-        return usage_error("--vram-budget-mib and --allow-overcommit apply to --profile only");
+    if (all_profiles && !requested_profiles.empty()) {
+        return usage_error("--all-profiles cannot be combined with --profile");
     }
-    if (profile) {
-        if (auto b = a.get("backend"); b && *b != profile->backend) {
-            return usage_error("--backend " + *b + " conflicts with launch profile '" + profile->name + "' (backend " +
-                               profile->backend + ")");
+    if (!requested_profiles.empty()) {
+        if (profiles.empty()) return usage_error("--profile needs --profiles FILE");
+        std::set<std::string> seen;
+        for (const std::string& name : requested_profiles) {
+            if (!seen.insert(name).second) {
+                return usage_error("duplicate --profile '" + name + "'");
+            }
+            const LaunchProfile* found = find_launch_profile(profiles, name);
+            if (!found) return usage_error("no launch profile named '" + name + "' in --profiles");
+            active_profiles.push_back(found);
         }
-        for (const auto& m : a.all("model")) {
-            if (m != profile->name) {
-                return usage_error("--model " + m + " conflicts with launch profile '" + profile->name +
-                                   "' (it serves the model as " + profile->name + ")");
+    } else if (all_profiles) {
+        if (profiles.empty()) return usage_error("--all-profiles needs --profiles FILE");
+        const std::string target_backend = a.get("backend").value_or(profiles.front().backend);
+        for (const auto& candidate : profiles) {
+            if (candidate.backend == target_backend) {
+                active_profiles.push_back(&candidate);
+            } else {
+                out.profile_notes.push_back("--all-profiles: skipping launch profile '" + candidate.name +
+                                            "' (backend " + candidate.backend + "; serving backend " + target_backend +
+                                            ")");
             }
         }
-        for (const char* flag : {"gpu-layers", "context-length", "llamaserver-arg", "llamaserver-url"}) {
+        if (active_profiles.empty()) {
+            return usage_error("--backend " + target_backend +
+                               " conflicts with --all-profiles (no profile in --profiles uses backend " +
+                               target_backend + ")");
+        }
+    } else if (!profiles.empty()) {
+        return usage_error("--profiles needs --profile NAME or --all-profiles (the profile to serve)");
+    } else if (a.get("vram-budget-mib") || a.flags.count("allow-overcommit") != 0) {
+        return usage_error("--vram-budget-mib and --allow-overcommit apply to --profile / --all-profiles only");
+    }
+    const LaunchProfile* primary = active_profiles.empty() ? nullptr : active_profiles.front();
+    const bool multi_profile = active_profiles.size() > 1;
+    if (primary) {
+        for (std::size_t i = 1; i < active_profiles.size(); ++i) {
+            const LaunchProfile* secondary = active_profiles[i];
+            if (secondary->backend != primary->backend) {
+                return usage_error("cannot mix incompatible backends across --profile: '" + secondary->name +
+                                   "' uses " + secondary->backend + " while '" + primary->name + "' uses " +
+                                   primary->backend + " (serve each backend in a separate instance)");
+            }
+        }
+        if (auto b = a.get("backend"); b && *b != primary->backend) {
+            return usage_error("--backend " + *b + " conflicts with launch profile '" + primary->name + "' (backend " +
+                               primary->backend + ")");
+        }
+        for (const auto& m : a.all("model")) {
+            const bool is_active_name = std::any_of(active_profiles.begin(), active_profiles.end(),
+                                                    [&](const LaunchProfile* p) { return p->name == m; });
+            if (!is_active_name) {
+                if (!multi_profile) {
+                    return usage_error("--model " + m + " conflicts with launch profile '" + primary->name +
+                                       "' (it serves the model as " + primary->name + ")");
+                }
+                return usage_error("--model " + m +
+                                   " conflicts with active launch profiles (models are selected by --profile)");
+            }
+        }
+        for (const char* flag : {"gpu-layers", "context-length", "llamaserver-arg"}) {
             if (a.get(flag)) {
                 return usage_error(std::string("--") + flag + " conflicts with --profile (set the profile's typed fields)");
             }
+        }
+        if (a.get("llamaserver-url") && (!multi_profile || primary->backend != kLaunchProfileBackendLlamaServer)) {
+            return usage_error("--llamaserver-url conflicts with --profile (set the profile's typed fields)");
         }
         for (const char* flag : kLlamaCppContextFlags) {
             if (a.get(flag)) {
@@ -286,21 +336,29 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
         }
         // Only the direct llamacpp backend reads these; a llamaserver profile
         // would start without them and say nothing.
-        if (profile->backend == kLaunchProfileBackendLlamaServer) {
+        if (primary->backend == kLaunchProfileBackendLlamaServer) {
             for (const char* flag : kLlamaCppPlacementFlags) {
                 if (a.get(flag)) {
                     return usage_error(std::string("option --") + flag + " applies only to --backend llamacpp; for "
-                                       "llamaserver launch profile '" + profile->name +
+                                       "llamaserver launch profile '" + primary->name +
                                        "' put llama-server's own flag (-ot, --cpu-moe) in extra_args");
                 }
             }
         }
     }
-    o.backend.backend = profile ? profile->backend : a.get("backend").value_or(env.backend.value_or(""));
+    o.backend.backend = primary ? primary->backend : a.get("backend").value_or(env.backend.value_or(""));
     if (o.backend.backend.empty()) {
         return usage_error("--backend is required (mock, ollama, llamacpp or llamaserver; or set SONDER_INFER_BACKEND)");
     }
-    o.models = profile ? std::vector<std::string>{profile->name} : a.all("model");
+    if (!active_profiles.empty()) {
+        o.models.clear();
+        o.models.reserve(active_profiles.size());
+        for (const LaunchProfile* p : active_profiles) {
+            o.models.push_back(p->name);
+        }
+    } else {
+        o.models = a.all("model");
+    }
     o.device = a.get("device").value_or("");
     if (o.models.empty() && env.model) {
         o.models.push_back(*env.model);
@@ -314,29 +372,83 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     if (auto v = a.get("llamaserver-url")) o.backend.llamaserver_url = *v;
     if (auto v = a.get("llamaserver-executable")) o.backend.llamaserver_executable = *v;
     if (!a.all("llamaserver-arg").empty()) o.backend.llamaserver_args = a.all("llamaserver-arg");
-    if (profile && profile->backend == kLaunchProfileBackendLlamaServer) {
-        if (o.backend.llamaserver_mode.empty()) o.backend.llamaserver_mode = "spawn";
-        if (o.backend.llamaserver_mode != "spawn") {
-            return usage_error("launch profile '" + profile->name + "' needs llamaserver spawn mode (attach cannot "
-                               "apply its settings)");
-        }
-        if (!o.backend.llamaserver_args.empty()) {
-            return usage_error("launch profile '" + profile->name + "': move the llamaserver config 'args' into the "
-                               "profile's typed fields or extra_args");
-        }
-        for (const auto& [env_key, env_val] : o.backend.llamaserver_environment) {
-            (void)env_val;
-            if (!llamaserver::is_allowed_profile_env_override(env_key)) {
-                return usage_error("launch profile '" + profile->name +
-                                   "': llamaserver config env override '" + env_key +
-                                   "' is not permitted with --profile (only GPU/runtime tuning overrides such as "
-                                   "CUDA_*, GGML_*, VK_*, ROCR_*, ROCM_*, HSA_*, HIP_*, AMD_*, ROCBLAS_*, HIPBLASLT_*, "
-                                   "RADV_*, MESA_*, GPU_MAX_ALLOC_PERCENT, DRI_PRIME, OMP_* are allowed)");
+    if (primary && primary->backend == kLaunchProfileBackendLlamaServer) {
+        const auto check_profile_env = [&]() -> std::string {
+            for (const auto& [env_key, env_val] : o.backend.llamaserver_environment) {
+                (void)env_val;
+                if (!llamaserver::is_allowed_profile_env_override(env_key)) {
+                    return "launch profile '" + primary->name + "': llamaserver config env override '" + env_key +
+                           "' is not permitted with --profile (only GPU/runtime tuning overrides such as "
+                           "CUDA_*, GGML_*, VK_*, ROCR_*, ROCM_*, HSA_*, HIP_*, AMD_*, ROCBLAS_*, HIPBLASLT_*, "
+                           "RADV_*, MESA_*, GPU_MAX_ALLOC_PERCENT, DRI_PRIME, OMP_* are allowed)";
+                }
+            }
+            return {};
+        };
+        if (!multi_profile) {
+            if (o.backend.llamaserver_mode.empty()) o.backend.llamaserver_mode = "spawn";
+            if (o.backend.llamaserver_mode != "spawn") {
+                return usage_error("launch profile '" + primary->name + "' needs llamaserver spawn mode (attach cannot "
+                                   "apply its settings)");
+            }
+            if (!o.backend.llamaserver_args.empty()) {
+                return usage_error("launch profile '" + primary->name + "': move the llamaserver config 'args' into the "
+                                   "profile's typed fields or extra_args");
+            }
+            if (const std::string env_err = check_profile_env(); !env_err.empty()) return usage_error(env_err);
+            auto argv = llamaserver_arguments(*primary);
+            if (!argv.ok()) return usage_error(argv.status().message());
+            o.backend.llamaserver_args = std::move(argv).value();
+        } else {
+            if (o.backend.llamaserver_mode.empty()) {
+                o.backend.llamaserver_mode = !o.backend.llamaserver_url.empty() ? "attach" : "spawn";
+            }
+            if (o.backend.llamaserver_mode == "attach") {
+                if (!o.backend.llamaserver_args.empty()) {
+                    return usage_error("launch profiles in llamaserver attach mode cannot use llamaserver config 'args'");
+                }
+                if (const std::string env_err = check_profile_env(); !env_err.empty()) return usage_error(env_err);
+            } else if (o.backend.llamaserver_mode == "spawn") {
+                if (!o.backend.llamaserver_url.empty()) {
+                    return usage_error(
+                        std::string(a.get("llamaserver-url") ? "--llamaserver-url" : "llamaserver config 'base_url'") +
+                        " conflicts with --profile in llamaserver spawn mode (use --llamaserver-mode attach to target "
+                        "an upstream router)");
+                }
+                for (std::size_t i = 1; i < active_profiles.size(); ++i) {
+                    const LaunchProfile* secondary = active_profiles[i];
+                    if (secondary->model != primary->model) {
+                        return usage_error(
+                            "llamaserver spawn mode launches a single child process for one model and cannot spawn "
+                            "multiple distinct GGUF models ('" + primary->name + "' uses '" + primary->model + "', '" +
+                            secondary->name + "' uses '" + secondary->model +
+                            "'); use --llamaserver-mode attach against an upstream router (with --llamaserver-url) "
+                            "or run separate `sonder-infer serve` instances");
+                    }
+                }
+                if (!o.backend.llamaserver_args.empty()) {
+                    return usage_error("launch profile '" + primary->name + "': move the llamaserver config 'args' into "
+                                       "the profile's typed fields or extra_args");
+                }
+                if (const std::string env_err = check_profile_env(); !env_err.empty()) return usage_error(env_err);
+                auto argv = llamaserver_arguments(*primary);
+                if (!argv.ok()) return usage_error(argv.status().message());
+                for (std::size_t i = 1; i < active_profiles.size(); ++i) {
+                    LaunchProfile normalized = *active_profiles[i];
+                    normalized.name = primary->name;
+                    auto secondary_argv = llamaserver_arguments(normalized);
+                    if (!secondary_argv.ok()) return usage_error(secondary_argv.status().message());
+                    if (secondary_argv.value() != argv.value()) {
+                        return usage_error(
+                            "llamaserver spawn mode launches one child process and cannot apply conflicting launch "
+                            "settings for '" + active_profiles[i]->name + "' vs '" + primary->name +
+                            "'; align launch fields (only name and sampling may differ in shared-model spawn mode), "
+                            "use --llamaserver-mode attach, or run separate `sonder-infer serve` instances");
+                    }
+                }
+                o.backend.llamaserver_args = std::move(argv).value();
             }
         }
-        auto argv = llamaserver_arguments(*profile);
-        if (!argv.ok()) return usage_error(argv.status().message());
-        o.backend.llamaserver_args = std::move(argv).value();
     }
     if (auto v = a.get("warmup-file")) {
         if (o.backend.backend != "llamaserver")
@@ -420,17 +532,119 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     if (auto v = a.get("cache-type-k")) o.backend.llamacpp_kv_cache_type_k = *v;
     if (auto v = a.get("cache-type-v")) o.backend.llamacpp_kv_cache_type_v = *v;
     if (auto v = a.get("flash-attn")) o.backend.llamacpp_flash_attention = *v;
-    if (profile && profile->backend == kLaunchProfileBackendLlamaCpp) {
-        if (Status st = apply_llamacpp_profile(*profile, o.backend, o.device); !st.ok()) return usage_error(st.message());
+    if (primary && primary->backend == kLaunchProfileBackendLlamaCpp) {
+        const BackendSetup base_backend = o.backend;
+        const std::string base_device = o.device;
+        if (Status st = apply_llamacpp_profile(*primary, o.backend, o.device); !st.ok()) {
+            return usage_error(st.message());
+        }
+        std::string owner_ctx = o.backend.llamacpp_context_length ? primary->name : std::string{};
+        std::string owner_ngl = o.backend.llamacpp_gpu_layers ? primary->name : std::string{};
+        std::string owner_batch = o.backend.llamacpp_batch_size ? primary->name : std::string{};
+        std::string owner_ubatch = o.backend.llamacpp_ubatch_size ? primary->name : std::string{};
+        std::string owner_k = o.backend.llamacpp_kv_cache_type_k ? primary->name : std::string{};
+        std::string owner_v = o.backend.llamacpp_kv_cache_type_v ? primary->name : std::string{};
+        std::string owner_fa = o.backend.llamacpp_flash_attention ? primary->name : std::string{};
+        const auto int_text = [](auto v) { return std::to_string(v); };
+        const auto str_text = [](const std::string& s) { return s; };
+        for (std::size_t i = 1; i < active_profiles.size(); ++i) {
+            const LaunchProfile& secondary = *active_profiles[i];
+            BackendSetup candidate_backend = base_backend;
+            std::string candidate_device = base_device;
+            if (Status st = apply_llamacpp_profile(secondary, candidate_backend, candidate_device); !st.ok()) {
+                return usage_error(st.message());
+            }
+            const auto merge_opt = [&](const char* field_name, auto& shared_opt, const auto& next_opt,
+                                       std::string& owner, auto to_text) -> std::string {
+                if (!next_opt) {
+                    if (shared_opt) {
+                        out.profile_notes.push_back("launch profile '" + secondary.name +
+                                                    "' inherits shared llamacpp option '" + field_name + "' = " +
+                                                    to_text(*shared_opt) + " from '" + owner + "'");
+                    }
+                    return {};
+                }
+                if (shared_opt) {
+                    if (*shared_opt != *next_opt) {
+                        return "launch profile '" + secondary.name + "' conflicts with '" + owner +
+                               "' on shared llamacpp option '" + field_name + "' (" + to_text(*next_opt) + " vs " +
+                               to_text(*shared_opt) + "); align the profiles or run separate serve instances";
+                    }
+                    return {};
+                }
+                shared_opt = *next_opt;
+                owner = secondary.name;
+                std::string earlier;
+                for (std::size_t k = 0; k < i; ++k) {
+                    if (k > 0) earlier += ", ";
+                    earlier += "'" + active_profiles[k]->name + "'";
+                }
+                out.profile_notes.push_back("launch profile '" + secondary.name + "' sets shared llamacpp option '" +
+                                            field_name + "' = " + to_text(*next_opt) + " (unset on " + earlier + ")");
+                return {};
+            };
+            if (const std::string err = merge_opt("ctx_size", o.backend.llamacpp_context_length,
+                                                  candidate_backend.llamacpp_context_length, owner_ctx, int_text);
+                !err.empty()) {
+                return usage_error(err);
+            }
+            if (const std::string err = merge_opt("n_gpu_layers", o.backend.llamacpp_gpu_layers,
+                                                  candidate_backend.llamacpp_gpu_layers, owner_ngl, int_text);
+                !err.empty()) {
+                return usage_error(err);
+            }
+            if (const std::string err = merge_opt("batch_size", o.backend.llamacpp_batch_size,
+                                                  candidate_backend.llamacpp_batch_size, owner_batch, int_text);
+                !err.empty()) {
+                return usage_error(err);
+            }
+            if (const std::string err = merge_opt("ubatch_size", o.backend.llamacpp_ubatch_size,
+                                                  candidate_backend.llamacpp_ubatch_size, owner_ubatch, int_text);
+                !err.empty()) {
+                return usage_error(err);
+            }
+            if (const std::string err = merge_opt("cache_type_k", o.backend.llamacpp_kv_cache_type_k,
+                                                  candidate_backend.llamacpp_kv_cache_type_k, owner_k, str_text);
+                !err.empty()) {
+                return usage_error(err);
+            }
+            if (const std::string err = merge_opt("cache_type_v", o.backend.llamacpp_kv_cache_type_v,
+                                                  candidate_backend.llamacpp_kv_cache_type_v, owner_v, str_text);
+                !err.empty()) {
+                return usage_error(err);
+            }
+            if (const std::string err = merge_opt("flash_attn", o.backend.llamacpp_flash_attention,
+                                                  candidate_backend.llamacpp_flash_attention, owner_fa, str_text);
+                !err.empty()) {
+                return usage_error(err);
+            }
+            if (o.device.empty() && !candidate_device.empty()) {
+                o.device = candidate_device;
+            }
+        }
+        if (multi_profile) {
+            const std::uint32_t effective_batch = o.backend.llamacpp_batch_size.value_or(512u);
+            if (o.backend.llamacpp_ubatch_size && *o.backend.llamacpp_ubatch_size > effective_batch) {
+                return usage_error("combined llamacpp launch profiles have ubatch_size (" +
+                                   std::to_string(*o.backend.llamacpp_ubatch_size) + ") > batch_size (" +
+                                   std::to_string(effective_batch) + ")");
+            }
+            if (o.backend.llamacpp_kv_cache_type_v &&
+                is_quantized_kv_cache_type(*o.backend.llamacpp_kv_cache_type_v) &&
+                o.backend.llamacpp_flash_attention && *o.backend.llamacpp_flash_attention == "off") {
+                return usage_error("combined llamacpp launch profiles set quantized cache_type_v ('" +
+                                   *o.backend.llamacpp_kv_cache_type_v + "') with flash_attn 'off'");
+            }
+        }
     }
     std::optional<std::uint64_t> budget_flag;
     if (auto v = a.get("vram-budget-mib")) {
         if (!parse_uint(*v, 1u << 24, n) || n == 0) return usage_error("--vram-budget-mib must be from 1 to 16777216");
         budget_flag = n;
     }
-    if (profile) {
+    if (!active_profiles.empty()) {
         std::string refusal;
-        o.profile_catalog = profile_catalog(profiles, *profile, o, budget_flag,
+        o.profile_catalog = profile_catalog(profiles, active_profiles, o, budget_flag,
                                             a.flags.count("allow-overcommit") != 0, out.profile_notes, refusal);
         if (!refusal.empty()) return usage_error(refusal);
     }

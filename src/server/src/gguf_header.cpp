@@ -2,10 +2,15 @@
 // resolution, and bounded artifact observation. Reads only the header:
 // metadata and the tensor table, never tensor data.
 #include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <istream>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <streambuf>
 #include <string>
@@ -83,6 +88,152 @@ bool ggml_type_size(std::uint32_t type, std::uint64_t& block_elems, std::uint64_
     }
     return false;
 }
+
+std::string digest_to_hex(const std::array<std::uint8_t, 32>& bytes) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(64);
+    for (const std::uint8_t byte : bytes) {
+        out.push_back(kHex[byte >> 4]);
+        out.push_back(kHex[byte & 0x0Fu]);
+    }
+    return out;
+}
+
+std::filesystem::path path_from_utf8(std::string_view s) {
+    std::u8string u;
+    u.reserve(s.size());
+    for (const char ch : s) {
+        u.push_back(static_cast<char8_t>(static_cast<unsigned char>(ch)));
+    }
+    return std::filesystem::path(std::move(u));
+}
+
+// general.file_type (llama_ftype from llama.h) to canonical quantization label.
+std::string_view gguf_file_type_name(std::uint32_t ftype) noexcept {
+    switch (ftype) {
+        case 0: return "F32";
+        case 1: return "F16";
+        case 2: return "Q4_0";
+        case 3: return "Q4_1";
+        case 7: return "Q8_0";
+        case 8: return "Q5_0";
+        case 9: return "Q5_1";
+        case 10: return "Q2_K";
+        case 11: return "Q3_K_S";
+        case 12: return "Q3_K_M";
+        case 13: return "Q3_K_L";
+        case 14: return "Q4_K_S";
+        case 15: return "Q4_K_M";
+        case 16: return "Q5_K_S";
+        case 17: return "Q5_K_M";
+        case 18: return "Q6_K";
+        case 19: return "IQ2_XXS";
+        case 20: return "IQ2_XS";
+        case 21: return "Q2_K_S";
+        case 22: return "IQ3_XS";
+        case 23: return "IQ3_XXS";
+        case 24: return "IQ1_S";
+        case 25: return "IQ4_NL";
+        case 26: return "IQ3_S";
+        case 27: return "IQ3_M";
+        case 28: return "IQ2_S";
+        case 29: return "IQ2_M";
+        case 30: return "IQ4_XS";
+        case 31: return "IQ1_M";
+        case 32: return "BF16";
+        case 36: return "TQ1_0";
+        case 37: return "TQ2_0";
+        case 38: return "MXFP4_MOE";
+        case 39: return "NVFP4";
+        case 40: return "Q1_0";
+        case 41: return "Q2_0";
+        default: return {};
+    }
+}
+
+// ggml tensor type id to canonical quantization label (fallback when
+// general.file_type is absent or unrecognized).
+std::string_view ggml_type_name(std::uint32_t type) noexcept {
+    switch (type) {
+        case 0: return "F32";
+        case 1: return "F16";
+        case 2: return "Q4_0";
+        case 3: return "Q4_1";
+        case 6: return "Q5_0";
+        case 7: return "Q5_1";
+        case 8: return "Q8_0";
+        case 9: return "Q8_1";
+        case 10: return "Q2_K";
+        case 11: return "Q3_K";
+        case 12: return "Q4_K";
+        case 13: return "Q5_K";
+        case 14: return "Q6_K";
+        case 15: return "Q8_K";
+        case 16: return "IQ2_XXS";
+        case 17: return "IQ2_XS";
+        case 18: return "IQ3_XXS";
+        case 19: return "IQ1_S";
+        case 20: return "IQ4_NL";
+        case 21: return "IQ3_S";
+        case 22: return "IQ2_S";
+        case 23: return "IQ4_XS";
+        case 24: return "I8";
+        case 25: return "I16";
+        case 26: return "I32";
+        case 27: return "I64";
+        case 28: return "F64";
+        case 29: return "IQ1_M";
+        case 30: return "BF16";
+        case 34: return "TQ1_0";
+        case 35: return "TQ2_0";
+        case 39: return "MXFP4";
+        case 40: return "NVFP4";
+        case 41: return "Q1_0";
+        case 42: return "Q2_0";
+        case 43: return "F8_E4M3";
+        case 142: return "PQ2_0";
+        case 143: return "PTQ1_0";
+        case 145: return "PQ2_0M";
+        default: return {};
+    }
+}
+
+// Canonical sorted GGUF tokenizer metadata keys hashed into tokenizer_digest.
+constexpr std::array<std::string_view, 12> kTokenizerKeys = {
+    "tokenizer.ggml.add_bos_token",
+    "tokenizer.ggml.add_eos_token",
+    "tokenizer.ggml.bos_token_id",
+    "tokenizer.ggml.eos_token_id",
+    "tokenizer.ggml.merges",
+    "tokenizer.ggml.model",
+    "tokenizer.ggml.pad_token_id",
+    "tokenizer.ggml.pre",
+    "tokenizer.ggml.scores",
+    "tokenizer.ggml.token_type",
+    "tokenizer.ggml.tokens",
+    "tokenizer.ggml.unk_token_id",
+};
+
+constexpr bool tokenizer_keys_sorted() noexcept {
+    for (std::size_t idx = 1; idx < kTokenizerKeys.size(); ++idx) {
+        if (!(kTokenizerKeys[idx - 1] < kTokenizerKeys[idx])) return false;
+    }
+    return true;
+}
+static_assert(tokenizer_keys_sorted(), "kTokenizerKeys must be strictly sorted");
+
+int tokenizer_key_index(std::string_view key) noexcept {
+    for (std::size_t idx = 0; idx < kTokenizerKeys.size(); ++idx) {
+        if (kTokenizerKeys[idx] == key) return static_cast<int>(idx);
+    }
+    return -1;
+}
+
+struct TokenizerKeyHash {
+    bool present = false;
+    std::array<std::uint8_t, 32> digest{};
+};
 
 // Optional observation state: ordinary header readers retain their original
 // istream behavior. Direct streambuf reads permit positive short transfers
@@ -182,15 +333,37 @@ private:
 
 class Cursor {
 public:
+    class TapGuard {
+    public:
+        TapGuard(Cursor& cursor, server::detail::Sha256* hasher) noexcept : cursor_(cursor) {
+            cursor_.set_tap(hasher);
+        }
+        ~TapGuard() { cursor_.set_tap(nullptr); }
+        TapGuard(const TapGuard&) = delete;
+        TapGuard& operator=(const TapGuard&) = delete;
+
+    private:
+        Cursor& cursor_;
+    };
+
     explicit Cursor(std::istream& in, ObservationReader* observer = nullptr) : in_(in), observer_(observer) {}
 
+    void set_tap(server::detail::Sha256* tap) noexcept { tap_ = tap; }
     bool poll() { return !observer_ || observer_->poll(); }
     bool allow(std::uint64_t n) { return !observer_ || observer_->header_allow(n); }
 
     bool bytes(void* out, std::size_t n) {
-        if (observer_) return allow(n) && observer_->read(static_cast<char*>(out), n) == n && poll();
-        in_.read(static_cast<char*>(out), static_cast<std::streamsize>(n));
-        return static_cast<std::size_t>(in_.gcount()) == n;
+        bool ok = false;
+        if (observer_) {
+            ok = allow(n) && observer_->read(static_cast<char*>(out), n) == n && poll();
+        } else {
+            in_.read(static_cast<char*>(out), static_cast<std::streamsize>(n));
+            ok = static_cast<std::size_t>(in_.gcount()) == n;
+        }
+        if (ok && tap_ && n > 0) {
+            tap_->update(std::string_view(static_cast<const char*>(out), n));
+        }
+        return ok;
     }
     bool skip(std::uint64_t n) {
         if (!allow(n)) return false;
@@ -235,6 +408,7 @@ public:
 private:
     std::istream& in_;
     ObservationReader* observer_;
+    server::detail::Sha256* tap_ = nullptr;
 };
 
 std::uint64_t scalar_size(std::uint32_t type) {
@@ -495,6 +669,7 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
     GgufModelInfo info;
     std::vector<std::pair<std::string, Numbers>> numbers;  // keys we may need
     std::vector<ExpertCountObservation> expert_observations;
+    std::array<TokenizerKeyHash, kTokenizerKeys.size()> tokenizer_hashes{};
     std::size_t architecture_occurrences = 0;
     std::uint64_t token_count = 0;
     for (std::uint64_t i = 0; i < n_kv; ++i) {
@@ -510,6 +685,18 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
             expert_observations.push_back({key, std::nullopt});
             expert = &expert_observations.back();
         }
+        const int tok_idx = tokenizer_key_index(key);
+        server::detail::Sha256 tok_hash;
+        if (tok_idx >= 0) {
+            const unsigned char tok_type_le[4] = {
+                static_cast<unsigned char>(type & 0xFFu),
+                static_cast<unsigned char>((type >> 8) & 0xFFu),
+                static_cast<unsigned char>((type >> 16) & 0xFFu),
+                static_cast<unsigned char>((type >> 24) & 0xFFu),
+            };
+            tok_hash.update(std::string_view(reinterpret_cast<const char*>(tok_type_le), 4));
+        }
+        Cursor::TapGuard tap_guard(c, tok_idx >= 0 ? &tok_hash : nullptr);
         if (type == 8) {
             std::string value;
             if (!c.string(value)) return malformed("truncated string value");
@@ -520,11 +707,11 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
                 info.architecture = value;
             } else if (key == "prism.hadamard.transform" && value.size() <= 256) {
                 info.prism_hadamard_transform = value;
+            } else if (key == "tokenizer.chat_template") {
+                info.template_digest = value.empty() ? std::string() : server::detail::sha256_hex(value);
             }
             if (value.size() <= 256) info.metadata.emplace_back(key, value);
-            continue;
-        }
-        if (type == 9) {
+        } else if (type == 9) {
             std::uint32_t item_type = 0;
             std::uint64_t n = 0;
             if (!c.pod(item_type) || !c.pod(n) || n > kMaxCount) return malformed("truncated array");
@@ -533,56 +720,87 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
                 for (std::uint64_t k = 0; k < n; ++k) {
                     if (!c.skip_string()) return malformed("truncated string array");
                 }
-                continue;
-            }
-            const std::uint64_t size = scalar_size(item_type);
-            if (size == 0) return malformed("unsupported array item type in '" + excerpt(key) + "'");
-            // PrismML Hadamard arrays (e.g. prism.hadamard.sign_values[28672])
-            // are skipped without allocating or bloating info.metadata.
-            if (is_prism_hadamard) {
-                if (!c.skip(size * n)) return malformed("truncated array");
-                continue;
-            }
-            // Integer and BOOL arrays are kept per item: per-block head
-            // counts, a sliding_window_pattern (BOOL, or INT32/UINT32). A
-            // BOOL array stays out of `metadata`, which the classification
-            // reads and which never held one.
-            if (item_type != 6 && item_type != 12 && n <= 4096) {
-                Numbers num;
-                std::int64_t max_value = 0;
-                for (std::uint64_t k = 0; k < n; ++k) {
-                    std::string text;
-                    std::int64_t v = 0;
-                    bool is_int = false;
-                    if (!read_scalar(c, item_type, text, v, is_int)) return malformed("truncated array");
-                    num.per_layer.push_back(v);
-                    max_value = std::max(max_value, v);
+            } else {
+                const std::uint64_t size = scalar_size(item_type);
+                if (size == 0) return malformed("unsupported array item type in '" + excerpt(key) + "'");
+                // PrismML Hadamard arrays (e.g. prism.hadamard.sign_values[28672])
+                // and tokenizer arrays (scores/token_type) are skipped without
+                // allocating or bloating info.metadata (tokenizer arrays are
+                // hashed incrementally through Cursor's tap).
+                if (is_prism_hadamard || tok_idx >= 0) {
+                    if (!c.skip(size * n)) return malformed("truncated array");
+                } else if (item_type != 6 && item_type != 12 && n <= 4096) {
+                    // Integer and BOOL arrays are kept per item: per-block head
+                    // counts, a sliding_window_pattern (BOOL, or INT32/UINT32). A
+                    // BOOL array stays out of `metadata`, which the classification
+                    // reads and which never held one.
+                    Numbers num;
+                    std::int64_t max_value = 0;
+                    for (std::uint64_t k = 0; k < n; ++k) {
+                        std::string text;
+                        std::int64_t v = 0;
+                        bool is_int = false;
+                        if (!read_scalar(c, item_type, text, v, is_int)) return malformed("truncated array");
+                        num.per_layer.push_back(v);
+                        max_value = std::max(max_value, v);
+                    }
+                    if (item_type != 7) info.metadata.emplace_back(key, std::to_string(max_value));
+                    numbers.emplace_back(key, std::move(num));
+                } else {
+                    if (!c.skip(size * n)) return malformed("truncated array");
                 }
-                if (item_type != 7) info.metadata.emplace_back(key, std::to_string(max_value));
-                numbers.emplace_back(key, std::move(num));
-                continue;
             }
-            if (!c.skip(size * n)) return malformed("truncated array");
-            continue;
+        } else {
+            std::string text;
+            std::int64_t v = 0;
+            bool is_int = false;
+            if (!read_scalar(c, type, text, v, is_int)) {
+                return malformed("unsupported value type in '" + excerpt(key) + "'");
+            }
+            info.metadata.emplace_back(key, text);
+            if (is_int) numbers.emplace_back(key, Numbers{v, {}});
+            if (key == "prism.hadamard.block_size" && is_int && v > 0 &&
+                v <= static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
+                info.prism_hadamard_block_size = static_cast<std::uint32_t>(v);
+            }
+            if (expert && is_int && v > 0 && v <= static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
+                expert->value = static_cast<std::uint32_t>(v);
+            }
         }
-        std::string text;
-        std::int64_t v = 0;
-        bool is_int = false;
-        if (!read_scalar(c, type, text, v, is_int)) {
-            return malformed("unsupported value type in '" + excerpt(key) + "'");
-        }
-        info.metadata.emplace_back(key, text);
-        if (is_int) numbers.emplace_back(key, Numbers{v, {}});
-        if (key == "prism.hadamard.block_size" && is_int && v > 0 &&
-            v <= static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
-            info.prism_hadamard_block_size = static_cast<std::uint32_t>(v);
-        }
-        if (expert && is_int && v > 0 && v <= static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
-            expert->value = static_cast<std::uint32_t>(v);
+        if (tok_idx >= 0) {
+            c.set_tap(nullptr);
+            tokenizer_hashes[static_cast<std::size_t>(tok_idx)].present = true;
+            tokenizer_hashes[static_cast<std::size_t>(tok_idx)].digest = tok_hash.finish();
         }
     }
     if (info.architecture.empty()) return malformed("general.architecture is missing");
     if (!c.poll()) return malformed("observation interrupted");
+    bool any_tokenizer_key = false;
+    for (const auto& entry : tokenizer_hashes) {
+        if (entry.present) {
+            any_tokenizer_key = true;
+            break;
+        }
+    }
+    if (any_tokenizer_key) {
+        server::detail::Sha256 tok_combined;
+        tok_combined.update("sonder-gguf-tokenizer-v1\n");
+        for (std::size_t idx = 0; idx < kTokenizerKeys.size(); ++idx) {
+            if (!tokenizer_hashes[idx].present) continue;
+            const std::string_view tok_k = kTokenizerKeys[idx];
+            const std::uint64_t tok_klen = static_cast<std::uint64_t>(tok_k.size());
+            unsigned char tok_len_le[8];
+            for (std::size_t tok_b = 0; tok_b < 8; ++tok_b) {
+                tok_len_le[tok_b] = static_cast<unsigned char>((tok_klen >> (8 * tok_b)) & 0xFFu);
+            }
+            tok_combined.update(std::string_view(reinterpret_cast<const char*>(tok_len_le), 8));
+            tok_combined.update(tok_k);
+            tok_combined.update(std::string_view(
+                reinterpret_cast<const char*>(tokenizer_hashes[idx].digest.data()),
+                tokenizer_hashes[idx].digest.size()));
+        }
+        info.tokenizer_digest = digest_to_hex(tok_combined.finish());
+    }
     info.routed_experts =
         resolve_routed_experts(info.architecture, architecture_occurrences, expert_observations, observer);
     const std::string a = info.architecture + ".";
@@ -600,6 +818,8 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
     const std::int64_t blocks = scalar(a + "block_count", -1);
     if (blocks <= 0 || blocks > 100000) return malformed(a + "block_count is missing");
     info.block_count = static_cast<std::uint32_t>(blocks);
+    const std::int64_t ctx_len = scalar(a + "context_length", 0);
+    info.training_context_length = ctx_len > 0 ? static_cast<std::uint64_t>(ctx_len) : 0;
     info.embedding_length = static_cast<std::uint64_t>(scalar(a + "embedding_length", 0));
     info.nextn_layers =
         static_cast<std::uint32_t>(std::clamp<std::int64_t>(scalar(a + "nextn_predict_layers", 0), 0, blocks));
@@ -648,6 +868,7 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
     std::vector<bool> attention_tensor(info.block_count, false);
     bool any_attention_tensor = false;
     info.block_bytes.assign(info.block_count, 0);
+    std::map<std::uint32_t, std::uint64_t> tensor_bytes_by_type;
     std::uint64_t output_vocab = 0;
     for (std::uint64_t t = 0; t < n_tensors; ++t) {
         if (!c.poll()) return malformed("observation interrupted");
@@ -688,6 +909,8 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
             return malformed("tensor too large");
         }
         const std::uint64_t bytes = num_blocks * block_bytes;
+        std::uint64_t& type_bytes_acc = tensor_bytes_by_type[type];
+        type_bytes_acc = detail::saturating_add(type_bytes_acc, bytes);
         std::uint32_t tensor_block = kNoBlock;
         if (name.rfind("blk.", 0) == 0) {
             const auto dot = name.find('.', 4);
@@ -724,6 +947,28 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
             info.tensors.push_back(std::move(entry));
         } else {
             info.tensors_truncated = true;
+        }
+    }
+    const Numbers* file_type_num = number("general.file_type");
+    if (file_type_num && file_type_num->value >= 0 &&
+        file_type_num->value <= static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
+        const std::string_view ftype_name = gguf_file_type_name(static_cast<std::uint32_t>(file_type_num->value));
+        if (!ftype_name.empty()) info.quantization = std::string(ftype_name);
+    }
+    if (info.quantization.empty() && !tensor_bytes_by_type.empty()) {
+        std::uint32_t dominant_type = 0;
+        std::uint64_t dominant_bytes = 0;
+        bool has_dominant = false;
+        for (const auto& [tb_type, tb_bytes] : tensor_bytes_by_type) {
+            if (!has_dominant || tb_bytes > dominant_bytes) {
+                dominant_type = tb_type;
+                dominant_bytes = tb_bytes;
+                has_dominant = true;
+            }
+        }
+        if (has_dominant) {
+            const std::string_view dom_name = ggml_type_name(dominant_type);
+            if (!dom_name.empty()) info.quantization = std::string(dom_name);
         }
     }
     info.vocab_size = token_count > 0
@@ -814,7 +1059,7 @@ Result<GgufModelInfo> parse_gguf_model_info(std::string_view header_bytes) {
 }
 
 Result<GgufModelInfo> read_gguf_model_info(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
+    std::ifstream in(path_from_utf8(path), std::ios::binary);
     if (!in) return Status(ErrorCode::not_found, "cannot read GGUF " + path);
     auto info = parse(in);
     if (!info.ok()) return Status(info.status().code(), info.status().message() + " (" + path + ")");

@@ -4,16 +4,12 @@
 // Options, checked values and exit codes: docs/CLI.md "sonder-bench".
 #include <algorithm>
 #include <chrono>
-#include <cstdint>
+#include <cstddef>
 #include <iostream>
 #include <memory>
 #include <ostream>
 #include <string>
 #include <vector>
-
-// Header-only CLI helpers shared with sonder-infer (src/cli).
-#include "../../src/cli/cli_spec.hpp"
-#include "../../src/cli/cli_values.hpp"
 
 #include "sonder/inference.hpp"
 #include "sonder/inference/benchmark.hpp"
@@ -22,7 +18,6 @@
 #endif
 
 namespace si = sonder::inference;
-namespace cli = sonder::cli;
 
 namespace {
 
@@ -30,63 +25,11 @@ namespace {
 // output file could not be written, 2 usage error, 3 backend unreachable or
 // model load failed, 4 --require-idle refused to run.
 constexpr int kExitBackend = 3;
+#if defined(SONDER_HAS_OLLAMA_BACKEND)
 constexpr int kExitNotIdle = 4;
+#endif
 
-const cli::CommandSpec& bench_spec() {
-    static const cli::CommandSpec spec{
-        "",
-        "standalone benchmark runner (docs/BENCHMARK_PLAN.md)",
-        {"--model NAME [options]", "--backend ollama --list-models"},
-        {{"Backend",
-          {{"backend", cli::OptionKind::value, "NAME", "ollama | mock (default: ollama)"},
-           {"ollama-url", cli::OptionKind::value, "URL",
-            "Ollama base URL (default: http://127.0.0.1:11434, loopback only)"},
-           {"model", cli::OptionKind::value, "NAME", "model to benchmark (required unless --list-models)"},
-           {"require-idle", cli::OptionKind::flag, "",
-            "ollama: refuse to run if a different model is resident\n(avoids competing with live traffic for the GPU)"},
-           {"list-models", cli::OptionKind::flag, "", "list models on the backend and exit"}}},
-         {"Run",
-          {{"corpus", cli::OptionKind::value, "PATH", "corpus JSON (default: bench/corpus/baseline.json)"},
-           {"prompts", cli::OptionKind::value, "a,b,c", "run only these prompt ids"},
-           {"warmup", cli::OptionKind::value, "N", "discarded warmup runs per prompt, 0 to 100 (default: 1)"},
-           {"runs", cli::OptionKind::value, "N", "measured runs per prompt, 1 to 1000 (default: 3)"},
-           {"seed", cli::OptionKind::value, "N", "sampling seed (greedy decoding; default: 42)"},
-           {"budget-seconds", cli::OptionKind::value, "S",
-            "stop issuing requests after S seconds, 0 = unlimited (default: 540)"},
-           {"dry-run", cli::OptionKind::flag, "", "print the plan and exit without sending requests"}}},
-         {"Results",
-          {{"hardware", cli::OptionKind::value, "TEXT",
-            "hardware description recorded in results (GPU/VRAM/CPU/RAM/driver)"},
-           {"label", cli::OptionKind::value, "TEXT", "free-form run label"},
-           {"out-dir", cli::OptionKind::value, "DIR", "results directory (default: bench/results)"},
-           {"stem", cli::OptionKind::value, "NAME", "output file stem (default: <date>-<backend>-<model>-<corpus>)"},
-           {"telemetry", cli::OptionKind::value, "FILE", "also write Observatory telemetry JSONL"}}}},
-        {"MOCK backend runs are harness checks only: stderr shows a MOCK BACKEND banner and the\n"
-         "markdown summary is headed 'MOCK BACKEND: not a performance claim'.",
-         "Exit status: 0 ok, 1 a request failed or an output file could not be written, 2 usage error,\n"
-         "3 backend unreachable or model load failed, 4 --require-idle refused to run."},
-        {"--backend ollama --list-models",
-         "--backend ollama --model qwen3:0.6b --warmup 1 --runs 3 --require-idle --hardware \"RTX 4090\"",
-         "--backend mock --model mock:tiny --warmup 0 --runs 1"}};
-    return spec;
-}
-
-void usage(std::ostream& out) { out << cli::render_help("sonder-bench", bench_spec()); }
-
-std::vector<std::string> split_csv(const std::string& s) {
-    std::vector<std::string> out;
-    std::string cur;
-    for (char c : s) {
-        if (c == ',') {
-            if (!cur.empty()) out.push_back(cur);
-            cur.clear();
-        } else {
-            cur += c;
-        }
-    }
-    if (!cur.empty()) out.push_back(cur);
-    return out;
-}
+void usage(std::ostream& out) { out << si::bench::render_bench_cli_help(); }
 
 int usage_error(const std::string& message) {
     std::cerr << "error: " << message << "\n(see 'sonder-bench --help')\n";
@@ -102,44 +45,25 @@ int main(int argc, char** argv) {
         usage(std::cerr);
         return 2;
     }
-    cli::ParsedCommand a;
+    si::bench::BenchCliArgs parsed;
     std::string error;
-    const bool parsed = cli::parse_command(bench_spec(), args, a, error);
-    if (parsed ? a.help : std::find(args.begin(), args.end(), "--help") != args.end() ||
-                              std::find(args.begin(), args.end(), "-h") != args.end()) {
+    if (!si::bench::parse_bench_cli_args(args, parsed, error)) {
+        return usage_error(error);
+    }
+    if (parsed.help) {
         usage(std::cout);
         return 0;
     }
-    if (!parsed) return usage_error(error);
 
-    const std::string backend_name = a.get("backend").value_or("ollama");
-    const std::string ollama_url = a.get("ollama-url").value_or("");
-    const std::string model_name = a.get("model").value_or("");
-    const std::string corpus_path = a.get("corpus").value_or("bench/corpus/baseline.json");
-    const std::string out_dir = a.get("out-dir").value_or("bench/results");
-    std::string stem = a.get("stem").value_or("");
-    const std::string telemetry_path = a.get("telemetry").value_or("");
-    const bool list_models = a.has("list-models");
-    const bool dry_run = a.has("dry-run");
-    const bool require_idle = a.has("require-idle");
-    si::bench::Options opts;
-    opts.budget_seconds = 540.0;
-    std::uint64_t seed = 42;
-    if (auto v = a.get("prompts")) opts.prompt_ids = split_csv(*v);
-    if (auto v = a.get("warmup"); v && !cli::parse_integer<int>("warmup", *v, 0, 100, opts.warmup_runs, error)) {
-        return usage_error(error);
-    }
-    if (auto v = a.get("runs"); v && !cli::parse_integer<int>("runs", *v, 1, 1000, opts.measured_runs, error)) {
-        return usage_error(error);
-    }
-    if (auto v = a.get("seed"); v && !cli::parse_u64("seed", *v, seed, error)) return usage_error(error);
-    if (auto v = a.get("budget-seconds");
-        v && !cli::parse_number("budget-seconds", *v, 0.0, 31536000.0, opts.budget_seconds, error)) {
-        return usage_error(error);
-    }
-    opts.hardware = a.get("hardware").value_or("");
-    opts.label = a.get("label").value_or("");
-    opts.sampling = si::SamplingConfig::greedy(128, seed);
+    const std::string& backend_name = parsed.backend;
+    const std::string& model_name = parsed.model;
+    const std::string& corpus_path = parsed.corpus_path;
+    const std::string& out_dir = parsed.out_dir;
+    std::string stem = parsed.stem;
+    const std::string& telemetry_path = parsed.telemetry_path;
+    const bool list_models = parsed.list_models;
+    const bool dry_run = parsed.dry_run;
+    const si::bench::Options& opts = parsed.options;
     if (backend_name == "mock") {
         std::cerr << "[sonder-bench] MOCK BACKEND - synthetic output, not a quality or performance signal\n";
     }
@@ -166,8 +90,8 @@ int main(int argc, char** argv) {
 #if defined(SONDER_HAS_OLLAMA_BACKEND)
     else if (backend_name == "ollama") {
         si::OllamaBackendOptions oo;
-        if (!ollama_url.empty()) oo.base_url = ollama_url;
-        if (require_idle && !model_name.empty()) {
+        if (!parsed.ollama_url.empty()) oo.base_url = parsed.ollama_url;
+        if (parsed.require_idle && !model_name.empty()) {
             si::ollama::OllamaClient client(oo);
             auto running = client.running_models();
             if (!running.ok()) {
@@ -227,12 +151,13 @@ int main(int argc, char** argv) {
                 continue;
             }
             std::cout << "  " << p.id << " [" << p.workload << "] requests/iteration="
-                      << (p.is_fanout() ? p.children.size() : 1u)
+                      << (p.is_fanout() ? p.children.size() : static_cast<std::size_t>(opts.concurrency))
                       << " prompt_bytes=" << (p.is_fanout() ? p.children.front().size() : p.prompt.size())
                       << " max_tokens=" << p.max_tokens << "\n";
         }
-        std::cout << "warmup " << opts.warmup_runs << ", runs " << opts.measured_runs << ", budget "
-                  << opts.budget_seconds << " s\n";
+        std::cout << "warmup " << opts.warmup_runs << ", runs " << opts.measured_runs << ", concurrency "
+                  << opts.concurrency << ", gpu_snapshot " << (opts.capture_gpu_snapshot ? "on" : "off")
+                  << ", budget " << opts.budget_seconds << " s\n";
         return 0;
     }
 

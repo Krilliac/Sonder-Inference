@@ -2,12 +2,18 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <exception>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <thread>
+
+#include "cli/cli_spec.hpp"
+#include "cli/cli_values.hpp"
 
 namespace sonder::inference::bench {
 
@@ -228,6 +234,8 @@ struct Metrics {
     std::uint64_t requests = 0;
     std::uint64_t failures = 0;
     std::uint64_t cancelled = 0;
+    std::uint64_t total_completion_tokens = 0;
+    double measured_wall_ms = 0.0;
 };
 
 struct Outcome {
@@ -239,15 +247,127 @@ struct Outcome {
     double load_ms = 0;
 };
 
+constexpr std::uint64_t kBytesPerMiB = 1024ull * 1024ull;
+
+json::Value reading_mib_json(const MemoryReading& reading) {
+    if (!reading.is_known()) {
+        return json::Value(nullptr);
+    }
+    return json::Value(reading.bytes_or(0) / kBytesPerMiB);
+}
+
+json::Value optional_u64_json(std::optional<std::uint64_t> value) {
+    if (!value) {
+        return json::Value(nullptr);
+    }
+    return json::Value(*value);
+}
+
+const GpuDeviceInfo* find_matching_gpu(const std::vector<GpuDeviceInfo>& baseline, const GpuDeviceInfo& gpu,
+                                       std::size_t index) {
+    if (!gpu.id.empty()) {
+        for (const auto& candidate : baseline) {
+            if (candidate.id == gpu.id) {
+                return &candidate;
+            }
+        }
+    }
+    if (index < baseline.size() && baseline[index].id == gpu.id && baseline[index].name == gpu.name) {
+        return &baseline[index];
+    }
+    return nullptr;
+}
+
+// Coordinates simultaneous release of all worker threads in a concurrent batch.
+// Uses mutex + condition_variable for portability across toolchains and TSan,
+// and supports abort() so a partial thread-spawn failure can never deadlock.
+struct StartLatch {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::size_t ready = 0;
+    bool go = false;
+    bool aborted = false;
+
+    bool arrive_and_wait() {
+        std::unique_lock<std::mutex> lock(mu);
+        ++ready;
+        cv.notify_all();
+        cv.wait(lock, [&] { return go || aborted; });
+        return go && !aborted;
+    }
+
+    Clock::time_point wait_for_ready_and_release(std::size_t expected) {
+        std::unique_lock<std::mutex> lock(mu);
+        cv.wait(lock, [&] { return ready >= expected || aborted; });
+        const auto start_time = Clock::now();
+        if (!aborted) {
+            go = true;
+        }
+        cv.notify_all();
+        return start_time;
+    }
+
+    void abort() {
+        std::lock_guard<std::mutex> lock(mu);
+        aborted = true;
+        cv.notify_all();
+    }
+};
+
+struct BatchThreadGuard {
+    StartLatch& latch;
+    std::vector<std::thread>& threads;
+    bool released = false;
+
+    BatchThreadGuard(StartLatch& l, std::vector<std::thread>& t) noexcept : latch(l), threads(t) {}
+    BatchThreadGuard(const BatchThreadGuard&) = delete;
+    BatchThreadGuard& operator=(const BatchThreadGuard&) = delete;
+
+    ~BatchThreadGuard() noexcept {
+        if (!released) {
+            try {
+                latch.abort();
+            } catch (...) {
+            }
+        }
+        for (auto& thr : threads) {
+            if (thr.joinable()) {
+                try {
+                    thr.join();
+                } catch (...) {
+                }
+            }
+        }
+    }
+};
+
+json::Object make_failed_row(const Prompt& prompt, std::int64_t iteration, int child, int worker_index, bool warmup,
+                             const std::string& error_message) {
+    json::Object row{{"prompt_id", prompt.id}, {"workload", prompt.workload}, {"iteration", iteration},
+                     {"warmup", warmup}};
+    if (child >= 0) {
+        row.set("child", child);
+    }
+    if (worker_index >= 0) {
+        row.set("worker_index", worker_index);
+    }
+    row.set("outcome", "failed");
+    row.set("error", error_message);
+    return row;
+}
+
 json::Object execute(Engine& engine, const std::shared_ptr<Model>& model, const Prompt& prompt,
-                     const std::string& text, int iteration, int child, bool warmup, const Options& options,
-                     Outcome& o) {
+                     const std::string& text, std::int64_t iteration, int child, int worker_index, bool warmup,
+                     const Options& options, Outcome& o) {
     SamplingConfig sampling = options.sampling;
     sampling.max_tokens = prompt.max_tokens;
     SessionOptions so;
     so.sampling = sampling;
-    so.run_id = options.run_id ? options.run_id
-                               : (options.label.empty() ? std::optional<std::string>() : options.label);
+    if (options.run_id) {
+        so.run_id = options.run_id;
+    } else if (!options.label.empty()) {
+        so.run_id = options.label;
+    }
     so.agent_id = options.agent_id;
     so.task_id = options.task_id;
     so.workload = options.workload;
@@ -256,6 +376,9 @@ json::Object execute(Engine& engine, const std::shared_ptr<Model>& model, const 
                      {"warmup", warmup}};
     if (child >= 0) {
         row.set("child", child);
+    }
+    if (worker_index >= 0) {
+        row.set("worker_index", worker_index);
     }
     auto session = engine.create_session(model, so);
     if (!session.ok()) {
@@ -336,11 +459,165 @@ void record(Metrics& m, const Outcome& o) {
     m.completion_tokens.push_back(static_cast<double>(o.completion_tokens));
 }
 
+const sonder::cli::CommandSpec& bench_cli_spec() {
+    namespace cli = sonder::cli;
+    static const cli::CommandSpec spec{
+        "",
+        "standalone benchmark runner (docs/BENCHMARK_PLAN.md)",
+        {"--model NAME [options]", "--backend ollama --list-models"},
+        {{"Backend",
+          {{"backend", cli::OptionKind::value, "NAME", "ollama | mock (default: ollama)"},
+           {"ollama-url", cli::OptionKind::value, "URL",
+            "Ollama base URL (default: http://127.0.0.1:11434, loopback only)"},
+           {"model", cli::OptionKind::value, "NAME", "model to benchmark (required unless --list-models)"},
+           {"require-idle", cli::OptionKind::flag, "",
+            "ollama: refuse to run if a different model is resident\n(avoids competing with live traffic for the GPU)"},
+           {"list-models", cli::OptionKind::flag, "", "list models on the backend and exit"}}},
+         {"Run",
+          {{"corpus", cli::OptionKind::value, "PATH", "corpus JSON (default: bench/corpus/baseline.json)"},
+           {"prompts", cli::OptionKind::value, "a,b,c", "run only these prompt ids"},
+           {"warmup", cli::OptionKind::value, "N", "discarded warmup runs per prompt, 0 to 100 (default: 1)"},
+           {"runs", cli::OptionKind::value, "N", "measured runs per prompt, 1 to 1000 (default: 3)"},
+           {"concurrency", cli::OptionKind::value, "N",
+            "parallel worker sessions per measured run, 1 to 64 (default: 1)"},
+           {"seed", cli::OptionKind::value, "N", "sampling seed (greedy decoding; default: 42)"},
+           {"budget-seconds", cli::OptionKind::value, "S",
+            "stop issuing requests after S seconds, 0 = unlimited (default: 540)"},
+           {"no-gpu-snapshot", cli::OptionKind::flag, "",
+            "skip before/after GPU VRAM snapshot enumeration"},
+           {"dry-run", cli::OptionKind::flag, "", "print the plan and exit without sending requests"}}},
+         {"Results",
+          {{"hardware", cli::OptionKind::value, "TEXT",
+            "hardware description recorded in results (GPU/VRAM/CPU/RAM/driver)"},
+           {"label", cli::OptionKind::value, "TEXT", "free-form run label"},
+           {"out-dir", cli::OptionKind::value, "DIR", "results directory (default: bench/results)"},
+           {"stem", cli::OptionKind::value, "NAME", "output file stem (default: <date>-<backend>-<model>-<corpus>)"},
+           {"telemetry", cli::OptionKind::value, "FILE", "also write Observatory telemetry JSONL"}}}},
+        {"MOCK backend runs are harness checks only: stderr shows a MOCK BACKEND banner and the\n"
+         "markdown summary is headed 'MOCK BACKEND: not a performance claim'.",
+         "Exit status: 0 ok, 1 a request failed or an output file could not be written, 2 usage error,\n"
+         "3 backend unreachable or model load failed, 4 --require-idle refused to run."},
+        {"--backend ollama --list-models",
+         "--backend ollama --model qwen3:0.6b --warmup 1 --runs 3 --require-idle --hardware \"RTX 4090\"",
+         "--backend mock --model mock:tiny --warmup 0 --runs 1 --concurrency 4"}};
+    return spec;
+}
+
+std::vector<std::string> split_csv(const std::string& s) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char ch : s) {
+        if (ch == ',') {
+            if (!cur.empty()) out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += ch;
+        }
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
 }  // namespace
+
+json::Array gpu_snapshot_to_json(const std::vector<GpuDeviceInfo>& gpus, const std::vector<GpuDeviceInfo>* before) {
+    json::Array out;
+    out.reserve(gpus.size());
+    for (std::size_t idx = 0; idx < gpus.size(); ++idx) {
+        const auto& g = gpus[idx];
+        const auto eff_total = gpu_effective_vram_mib(g, false);
+        std::optional<std::uint64_t> eff_free;
+        if (g.dedicated_free.is_known()) {
+            eff_free = gpu_effective_vram_mib(g, true);
+        }
+        json::Object entry{{"id", g.id},
+                           {"name", g.name},
+                           {"vendor", to_string(g.vendor)},
+                           {"dedicated_total_mib", reading_mib_json(g.dedicated_total)},
+                           {"dedicated_free_mib", reading_mib_json(g.dedicated_free)},
+                           {"effective_vram_mib", optional_u64_json(eff_total)},
+                           {"effective_free_vram_mib", optional_u64_json(eff_free)},
+                           {"is_integrated_uma", g.is_integrated_uma},
+                           {"backend_hint", g.backend_hint},
+                           {"source", g.source}};
+        if (before != nullptr && eff_free) {
+            if (const GpuDeviceInfo* prev = find_matching_gpu(*before, g, idx);
+                prev != nullptr && prev->dedicated_free.is_known()) {
+                const auto prev_free = gpu_effective_vram_mib(*prev, true);
+                if (prev_free && *prev_free > *eff_free) {
+                    entry.set("peak_vram_delta_mib", *prev_free - *eff_free);
+                }
+            }
+        }
+        out.emplace_back(std::move(entry));
+    }
+    return out;
+}
+
+std::string render_bench_cli_help() { return sonder::cli::render_help("sonder-bench", bench_cli_spec()); }
+
+bool parse_bench_cli_args(const std::vector<std::string>& args, BenchCliArgs& out, std::string& error) {
+    namespace cli = sonder::cli;
+    out = BenchCliArgs{};
+    out.options.budget_seconds = 540.0;
+    error.clear();
+
+    cli::ParsedCommand a;
+    const bool parsed = cli::parse_command(bench_cli_spec(), args, a, error);
+    if (parsed ? a.help
+               : std::find(args.begin(), args.end(), "--help") != args.end() ||
+                     std::find(args.begin(), args.end(), "-h") != args.end()) {
+        out.help = true;
+        error.clear();
+        return true;
+    }
+    if (!parsed) {
+        return false;
+    }
+
+    out.backend = a.get("backend").value_or("ollama");
+    out.ollama_url = a.get("ollama-url").value_or("");
+    out.model = a.get("model").value_or("");
+    out.corpus_path = a.get("corpus").value_or("bench/corpus/baseline.json");
+    out.out_dir = a.get("out-dir").value_or("bench/results");
+    out.stem = a.get("stem").value_or("");
+    out.telemetry_path = a.get("telemetry").value_or("");
+    out.list_models = a.has("list-models");
+    out.dry_run = a.has("dry-run");
+    out.require_idle = a.has("require-idle");
+    out.options.capture_gpu_snapshot = !a.has("no-gpu-snapshot");
+
+    if (auto v = a.get("prompts")) {
+        out.options.prompt_ids = split_csv(*v);
+    }
+    if (auto v = a.get("warmup"); v && !cli::parse_integer<int>("warmup", *v, 0, 100, out.options.warmup_runs, error)) {
+        return false;
+    }
+    if (auto v = a.get("runs"); v && !cli::parse_integer<int>("runs", *v, 1, 1000, out.options.measured_runs, error)) {
+        return false;
+    }
+    if (auto v = a.get("concurrency");
+        v && !cli::parse_integer<int>("concurrency", *v, kMinConcurrency, kMaxConcurrency, out.options.concurrency,
+                                      error)) {
+        return false;
+    }
+    if (auto v = a.get("seed"); v && !cli::parse_u64("seed", *v, out.seed, error)) {
+        return false;
+    }
+    if (auto v = a.get("budget-seconds");
+        v && !cli::parse_number("budget-seconds", *v, 0.0, 31536000.0, out.options.budget_seconds, error)) {
+        return false;
+    }
+    out.options.hardware = a.get("hardware").value_or("");
+    out.options.label = a.get("label").value_or("");
+    out.options.sampling = SamplingConfig::greedy(128, out.seed);
+    return true;
+}
 
 json::Object run(Engine& engine, const std::shared_ptr<Model>& model, const Corpus& corpus, const Options& options,
                  std::ostream* progress) {
     const auto t0 = Clock::now();
+    const int concurrency = std::clamp(options.concurrency, kMinConcurrency, kMaxConcurrency);
     const auto& d = model->descriptor();
     auto backend = engine.find_backend(model->backend_name());
     std::string backend_version = "unknown";
@@ -361,6 +638,11 @@ json::Object run(Engine& engine, const std::shared_ptr<Model>& model, const Corp
                                                {"total_memory_bytes", dev.total_memory_bytes}});
     }
 
+    std::vector<GpuDeviceInfo> gpus_before;
+    if (options.capture_gpu_snapshot) {
+        gpus_before = enumerate_gpu_devices();
+    }
+
     json::Array runs;
     json::Array batches;
     json::Array per_prompt;
@@ -376,65 +658,151 @@ json::Object run(Engine& engine, const std::shared_ptr<Model>& model, const Corp
             continue;
         }
         Metrics pm;
-        const int warmups = std::max(0, options.warmup_runs);
-        const int total_runs = warmups + std::max(1, options.measured_runs);
-        for (int i = 0; i < total_runs; ++i) {
+        const std::int64_t warmups = std::max<std::int64_t>(0, options.warmup_runs);
+        const std::int64_t measured = std::max<std::int64_t>(1, options.measured_runs);
+        const std::int64_t total_runs = warmups + measured;
+        for (std::int64_t i = 0; i < total_runs; ++i) {
             if (over_budget()) {
                 truncated = true;
                 break;
             }
             const bool warmup = i < warmups;
-            std::vector<std::string> texts = prompt.is_fanout() ? prompt.children : std::vector<std::string>{prompt.prompt};
-            std::vector<json::Object> rows(texts.size());
-            std::vector<Outcome> outcomes(texts.size());
-            const auto b0 = Clock::now();
-            if (texts.size() == 1) {
-                rows[0] = execute(engine, model, prompt, texts[0], i, -1, warmup, options, outcomes[0]);
-            } else {
-                std::vector<std::thread> threads;
-                threads.reserve(texts.size());
-                for (std::size_t c = 0; c < texts.size(); ++c) {
-                    threads.emplace_back([&, c] {
-                        rows[c] = execute(engine, model, prompt, texts[c], i, static_cast<int>(c), warmup, options,
-                                          outcomes[c]);
-                    });
+            const bool concurrent_non_fanout = !prompt.is_fanout() && !warmup && concurrency > 1;
+            const std::size_t batch_size =
+                prompt.is_fanout() ? prompt.children.size()
+                                   : (concurrent_non_fanout ? static_cast<std::size_t>(concurrency) : std::size_t{1});
+            const auto text_for = [&](std::size_t slot) -> const std::string& {
+                return prompt.is_fanout() ? prompt.children[slot] : prompt.prompt;
+            };
+            std::vector<json::Object> rows(batch_size);
+            std::vector<Outcome> outcomes(batch_size);
+            Clock::time_point b0 = Clock::now();
+            if (batch_size == 1) {
+                const int child_idx = prompt.is_fanout() ? 0 : -1;
+                try {
+                    rows[0] = execute(engine, model, prompt, text_for(0), i, child_idx, -1, warmup, options, outcomes[0]);
+                } catch (const std::exception& ex) {
+                    outcomes[0] = Outcome{};
+                    outcomes[0].failed = true;
+                    rows[0] = make_failed_row(prompt, i, child_idx, -1, warmup, ex.what());
+                } catch (...) {
+                    outcomes[0] = Outcome{};
+                    outcomes[0].failed = true;
+                    rows[0] = make_failed_row(prompt, i, child_idx, -1, warmup, "unknown exception");
                 }
-                for (auto& t : threads) t.join();
+            } else {
+                StartLatch latch;
+                std::vector<std::thread> threads;
+                threads.reserve(batch_size);
+                BatchThreadGuard guard{latch, threads};
+                std::string spawn_error;
+                try {
+                    for (std::size_t c = 0; c < batch_size; ++c) {
+                        const int child_idx = prompt.is_fanout() ? static_cast<int>(c) : -1;
+                        const int worker_idx = concurrent_non_fanout ? static_cast<int>(c) : -1;
+                        threads.emplace_back([&, c, child_idx, worker_idx] {
+                            try {
+                                if (!latch.arrive_and_wait()) {
+                                    outcomes[c] = Outcome{};
+                                    outcomes[c].failed = true;
+                                    rows[c] = make_failed_row(prompt, i, child_idx, worker_idx, warmup,
+                                                              "concurrent batch aborted before start");
+                                    return;
+                                }
+                                rows[c] = execute(engine, model, prompt, text_for(c), i, child_idx, worker_idx, warmup,
+                                                  options, outcomes[c]);
+                            } catch (const std::exception& ex) {
+                                outcomes[c] = Outcome{};
+                                outcomes[c].failed = true;
+                                try {
+                                    rows[c] = make_failed_row(prompt, i, child_idx, worker_idx, warmup, ex.what());
+                                } catch (...) {
+                                }
+                            } catch (...) {
+                                outcomes[c] = Outcome{};
+                                outcomes[c].failed = true;
+                                try {
+                                    rows[c] = make_failed_row(prompt, i, child_idx, worker_idx, warmup,
+                                                              "unknown exception");
+                                } catch (...) {
+                                }
+                            }
+                        });
+                    }
+                    b0 = latch.wait_for_ready_and_release(threads.size());
+                    guard.released = true;
+                } catch (const std::exception& ex) {
+                    latch.abort();
+                    spawn_error = std::string("failed to spawn worker thread: ") + ex.what();
+                } catch (...) {
+                    latch.abort();
+                    spawn_error = "failed to spawn worker thread: unknown exception";
+                }
+                for (auto& thr : threads) {
+                    if (thr.joinable()) {
+                        thr.join();
+                    }
+                }
+                if (!spawn_error.empty()) {
+                    for (std::size_t c = threads.size(); c < batch_size; ++c) {
+                        const int child_idx = prompt.is_fanout() ? static_cast<int>(c) : -1;
+                        const int worker_idx = concurrent_non_fanout ? static_cast<int>(c) : -1;
+                        outcomes[c] = Outcome{};
+                        outcomes[c].failed = true;
+                        rows[c] = make_failed_row(prompt, i, child_idx, worker_idx, warmup, spawn_error);
+                    }
+                }
             }
             const double makespan = ms_since(b0);
-            if (cold_first_ms < 0) {
+            if (cold_first_ms < 0 && !outcomes.empty()) {
                 cold_first_ms = outcomes[0].total;
                 cold_load_ms = outcomes[0].load_ms;
             }
             std::uint64_t batch_tokens = 0;
+            std::uint64_t batch_completed_tokens = 0;
             std::uint64_t batch_failures = 0;
-            for (std::size_t c = 0; c < texts.size(); ++c) {
+            for (std::size_t c = 0; c < batch_size; ++c) {
                 if (!warmup) {
                     record(pm, outcomes[c]);
                     record(global, outcomes[c]);
                 }
                 batch_tokens += outcomes[c].completion_tokens;
+                if (outcomes[c].completed) {
+                    batch_completed_tokens += outcomes[c].completion_tokens;
+                }
                 batch_failures += outcomes[c].failed ? 1u : 0u;
                 if (progress) {
                     *progress << "[bench] " << prompt.id << " #" << i;
-                    if (prompt.is_fanout()) *progress << "." << c;
-                    *progress << (warmup ? " (warmup)" : "") << ": " << rows[c].find("outcome")->as_string();
-                    if (const json::Value* t = rows[c].find("ttft_ms")) *progress << " ttft_ms=" << t->as_double();
-                    if (const json::Value* t = rows[c].find("total_ms")) *progress << " total_ms=" << t->as_double();
-                    if (const json::Value* t = rows[c].find("decode_tokens_per_sec")) {
-                        *progress << " decode_tps=" << t->as_double();
+                    if (prompt.is_fanout()) {
+                        *progress << "." << c;
+                    } else if (concurrent_non_fanout) {
+                        *progress << " [w" << c << "]";
                     }
-                    if (const json::Value* e = rows[c].find("error")) *progress << " error=" << e->as_string();
+                    const json::Value* out_v = rows[c].find("outcome");
+                    *progress << (warmup ? " (warmup)" : "") << ": "
+                              << (out_v != nullptr ? out_v->as_string() : std::string("failed"));
+                    if (const json::Value* tv = rows[c].find("ttft_ms")) *progress << " ttft_ms=" << tv->as_double();
+                    if (const json::Value* tv = rows[c].find("total_ms")) *progress << " total_ms=" << tv->as_double();
+                    if (const json::Value* tv = rows[c].find("decode_tokens_per_sec")) {
+                        *progress << " decode_tps=" << tv->as_double();
+                    }
+                    if (const json::Value* ev = rows[c].find("error")) *progress << " error=" << ev->as_string();
                     *progress << "\n";
                 }
                 runs.emplace_back(std::move(rows[c]));
+            }
+            if (!warmup) {
+                pm.measured_wall_ms += makespan;
+                pm.total_completion_tokens += batch_completed_tokens;
+                global.measured_wall_ms += makespan;
+                global.total_completion_tokens += batch_completed_tokens;
             }
             if (prompt.is_fanout()) {
                 const double agg = makespan > 0 ? static_cast<double>(batch_tokens) * 1000.0 / makespan : 0.0;
                 batches.emplace_back(json::Object{{"prompt_id", prompt.id},
                                                   {"iteration", i},
                                                   {"warmup", warmup},
-                                                  {"children", texts.size()},
+                                                  {"children", batch_size},
                                                   {"failures", batch_failures},
                                                   {"makespan_ms", makespan},
                                                   {"completion_tokens", batch_tokens},
@@ -444,19 +812,29 @@ json::Object run(Engine& engine, const std::shared_ptr<Model>& model, const Corp
                     if (agg > 0) pm.aggregate_tps.push_back(agg);
                 }
                 if (progress) {
-                    *progress << "[bench] " << prompt.id << " #" << i << " fan-out x" << texts.size()
+                    *progress << "[bench] " << prompt.id << " #" << i << " fan-out x" << batch_size
                               << " makespan_ms=" << makespan << " aggregate_tps=" << agg << "\n";
                 }
+            } else if (concurrent_non_fanout && progress) {
+                const double agg = makespan > 0 ? static_cast<double>(batch_completed_tokens) * 1000.0 / makespan : 0.0;
+                *progress << "[bench] " << prompt.id << " #" << i << " concurrency x" << batch_size
+                          << " makespan_ms=" << makespan << " aggregate_tps=" << agg << "\n";
             }
         }
+        const double pm_wall_seconds = pm.measured_wall_ms / 1000.0;
+        const double pm_aggregate_tps =
+            pm_wall_seconds > 0.0 ? static_cast<double>(pm.total_completion_tokens) / pm_wall_seconds : 0.0;
         json::Object ps{{"prompt_id", prompt.id},
                         {"workload", prompt.workload},
-                        {"requests_per_iteration", prompt.is_fanout() ? prompt.children.size() : std::size_t{1}},
+                        {"requests_per_iteration",
+                         prompt.is_fanout() ? prompt.children.size() : static_cast<std::size_t>(concurrency)},
                         {"prompt_bytes", prompt.is_fanout() ? prompt.children.front().size() : prompt.prompt.size()},
                         {"max_tokens", prompt.max_tokens},
                         {"measured_requests", pm.requests},
                         {"failures", pm.failures},
                         {"cancelled", pm.cancelled},
+                        {"wall_seconds", pm_wall_seconds},
+                        {"aggregate_decode_tokens_per_sec", pm_aggregate_tps},
                         {"ttft_ms", distribution(pm.ttft)},
                         {"total_ms", distribution(pm.total)},
                         {"decode_tokens_per_sec", distribution(pm.decode_tps)},
@@ -473,6 +851,15 @@ json::Object run(Engine& engine, const std::shared_ptr<Model>& model, const Corp
             break;
         }
     }
+
+    std::vector<GpuDeviceInfo> gpus_after;
+    if (options.capture_gpu_snapshot) {
+        gpus_after = enumerate_gpu_devices();
+    }
+
+    const double measured_wall_seconds = global.measured_wall_ms / 1000.0;
+    const double aggregate_decode_tps =
+        measured_wall_seconds > 0.0 ? static_cast<double>(global.total_completion_tokens) / measured_wall_seconds : 0.0;
 
     const auto& s = options.sampling;
     json::Object doc;
@@ -509,7 +896,9 @@ json::Object run(Engine& engine, const std::shared_ptr<Model>& model, const Corp
                                      {"max_tokens", "per-prompt"}});
     doc.set("config", json::Object{{"warmup_runs", options.warmup_runs},
                                    {"measured_runs", options.measured_runs},
-                                   {"concurrency", "1 (agent_fanout prompts: one session per child, concurrent)"},
+                                   {"concurrency", concurrency},
+                                   {"concurrency_note", "agent_fanout prompts run one session per child concurrently"},
+                                   {"capture_gpu_snapshot", options.capture_gpu_snapshot},
                                    {"cache_state", options.warmup_runs > 0 ? "warm after per-prompt warmup (backend-managed)"
                                                                            : "backend-default (not controlled)"},
                                    {"budget_seconds", options.budget_seconds}});
@@ -517,13 +906,21 @@ json::Object run(Engine& engine, const std::shared_ptr<Model>& model, const Corp
                                    {"version", corpus.version},
                                    {"fnv1a", corpus.fnv1a},
                                    {"prompts", corpus.prompts.size()}});
+    if (options.capture_gpu_snapshot) {
+        doc.set("gpus_before", gpu_snapshot_to_json(gpus_before, nullptr));
+        doc.set("gpus_after", gpu_snapshot_to_json(gpus_after, &gpus_before));
+    }
     doc.set("truncated_by_budget", truncated);
     doc.set("cold_first_request_ms", cold_first_ms);
     doc.set("cold_first_request_backend_load_ms", cold_load_ms);
     doc.set("wall_seconds", ms_since(t0) / 1000.0);
-    doc.set("summary", json::Object{{"measured_requests", global.requests},
+    doc.set("summary", json::Object{{"concurrency", concurrency},
+                                    {"measured_requests", global.requests},
                                     {"failures", global.failures},
                                     {"cancelled", global.cancelled},
+                                    {"wall_seconds", measured_wall_seconds},
+                                    {"total_completion_tokens", global.total_completion_tokens},
+                                    {"aggregate_decode_tokens_per_sec", aggregate_decode_tps},
                                     {"ttft_ms", distribution(global.ttft)},
                                     {"total_ms", distribution(global.total)},
                                     {"decode_tokens_per_sec", distribution(global.decode_tps)},

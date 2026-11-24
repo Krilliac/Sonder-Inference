@@ -5,9 +5,11 @@
 #include <doctest/doctest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -16,6 +18,8 @@
 
 #include "server_test_support.hpp"
 #include "sonder/inference/backend_setup.hpp"
+#include "sonder/inference/launch_profile.hpp"
+#include "src/serve_options.hpp"
 
 using namespace server_test;
 namespace json = sonder::inference::json;
@@ -82,6 +86,53 @@ int run(const std::vector<std::string>& args, std::string& out_text, std::string
 
 bool connection_refused(std::uint16_t port) {
     return !det::connect_tcp("127.0.0.1", port, std::chrono::milliseconds(500)).ok();
+}
+
+std::string minimal_gguf_header() {
+    std::string body;
+    const auto raw = [&body](const void* ptr, std::size_t n) { body.append(static_cast<const char*>(ptr), n); };
+    const auto u32 = [&](std::uint32_t v) { raw(&v, 4); };
+    const auto u64 = [&](std::uint64_t v) { raw(&v, 8); };
+    const auto str = [&](const std::string& s) {
+        u64(s.size());
+        body.append(s);
+    };
+    const auto kv_u32 = [&](const std::string& key, std::uint32_t v) {
+        str(key);
+        u32(4u);
+        u32(v);
+    };
+    const auto kv_str = [&](const std::string& key, const std::string& v) {
+        str(key);
+        u32(8u);
+        str(v);
+    };
+    kv_str("general.architecture", "llama");
+    kv_u32("llama.block_count", 4u);
+    kv_u32("llama.embedding_length", 128u);
+    kv_u32("llama.attention.head_count", 8u);
+    kv_u32("llama.attention.head_count_kv", 2u);
+    std::string head = "GGUF";
+    const auto put = [&head](const void* ptr, std::size_t n) { head.append(static_cast<const char*>(ptr), n); };
+    const std::uint32_t version = 3u;
+    const std::uint64_t tensors = 0u;
+    const std::uint64_t kvs = 5u;
+    put(&version, 4);
+    put(&tensors, 8);
+    put(&kvs, 8);
+    return head + body;
+}
+
+int build_cli(const std::vector<std::string>& args, det::ServeCliConfig& cfg, std::string& err_text) {
+    det::ParsedServeArgs parsed;
+    std::string parse_err;
+    REQUIRE_MESSAGE(det::parse_serve_args(args, parsed, parse_err), parse_err);
+    std::ostringstream err;
+    auto log = std::make_shared<det::LockedLog>(err);
+    const int rc = det::build_serve_options(parsed, log, cfg);
+    log->close();
+    err_text = err.str();
+    return rc;
 }
 
 }  // namespace
@@ -553,3 +604,511 @@ TEST_CASE("serve_main tests: a ready file held open for delete is read once it i
     fs::remove(path, ec);
 }
 #endif
+
+TEST_CASE("serve_main: repeatable --profile and --all-profiles parsing and validation") {
+    std::string out;
+    std::string err;
+    CHECK(run({"--help"}, out, err) == 0);
+    CHECK(out.find("--all-profiles") != std::string::npos);
+    CHECK(out.find("repeatable") != std::string::npos);
+
+    {
+        det::ParsedServeArgs parsed;
+        std::string parse_err;
+        REQUIRE(det::parse_serve_args({"--profiles", "p.json", "--profile", "alpha", "--profile", "beta"}, parsed,
+                                      parse_err));
+        CHECK(parsed.all("profile") == std::vector<std::string>{"alpha", "beta"});
+    }
+    {
+        det::ParsedServeArgs parsed;
+        std::string parse_err;
+        REQUIRE(det::parse_serve_args({"--profiles", "p.json", "--all-profiles"}, parsed, parse_err));
+        CHECK(parsed.flags.count("all-profiles") == 1u);
+    }
+
+    const auto model = temp_path("multi-parse.gguf");
+    {
+        std::ofstream(model, std::ios::binary) << minimal_gguf_header();
+    }
+    const std::string m = model.generic_string();
+    const auto profiles = temp_path("multi-parse-profiles.json");
+    {
+        std::ofstream(profiles) << R"({"profiles":[
+            {"name":"direct-a","backend":"llamacpp","model":")" << m << R"(","ctx_size":512,"n_gpu_layers":-1},
+            {"name":"srv-b","backend":"llamaserver","model":")" << m << R"(","ctx_size":512,"n_gpu_layers":-1,"fit":false},
+            {"name":"direct-c","backend":"llamacpp","model":")" << m << R"(","ctx_size":512,"n_gpu_layers":-1}
+        ]})";
+    }
+    const std::string pf = profiles.string();
+
+    CHECK(run({"--profiles", pf, "--profile", "direct-a", "--profile", "direct-a"}, out, err) == 2);
+    CHECK(err.find("duplicate --profile 'direct-a'") != std::string::npos);
+
+    CHECK(run({"--profiles", pf, "--all-profiles", "--profile", "direct-a"}, out, err) == 2);
+    CHECK(err.find("--all-profiles cannot be combined with --profile") != std::string::npos);
+
+    CHECK(run({"--all-profiles"}, out, err) == 2);
+    CHECK(err.find("--all-profiles needs --profiles") != std::string::npos);
+
+    CHECK(run({"--profiles", pf, "--profile", "direct-a", "--profile", "srv-b"}, out, err) == 2);
+    CHECK(err.find("cannot mix incompatible backends") != std::string::npos);
+
+    CHECK(run({"--profiles", pf, "--all-profiles", "--backend", "mock"}, out, err) == 2);
+    CHECK(err.find("conflicts with --all-profiles") != std::string::npos);
+
+    // --all-profiles selects all profiles sharing the primary profile's backend
+    // (llamacpp: direct-a and direct-c) and skips incompatible backends cleanly.
+    det::ServeCliConfig cfg;
+    const int rc =
+        build_cli({"--profiles", pf, "--all-profiles", "--vram-budget-mib", "10000", "--max-connections", "0"}, cfg,
+                  err);
+    CHECK(rc == 2);
+    CHECK(err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+    CHECK(cfg.options.backend.backend == "llamacpp");
+    CHECK(cfg.options.models == std::vector<std::string>{"direct-a", "direct-c"});
+    REQUIRE(cfg.options.profile_bindings.size() == 2u);
+    CHECK(cfg.options.profile_bindings[0].model == "direct-a");
+    CHECK(cfg.options.profile_bindings[1].model == "direct-c");
+    REQUIRE(cfg.options.profile_catalog.size() == 3u);
+    CHECK(cfg.options.profile_catalog[0].find("served")->as_bool());
+    CHECK_FALSE(cfg.options.profile_catalog[1].find("served")->as_bool());
+    CHECK(cfg.options.profile_catalog[2].find("served")->as_bool());
+    bool skipped_noted = false;
+    for (const auto& note : cfg.profile_notes) {
+        if (note.find("skipping launch profile 'srv-b'") != std::string::npos) skipped_noted = true;
+    }
+    CHECK(skipped_noted);
+
+    std::error_code ec;
+    fs::remove(model, ec);
+    fs::remove(profiles, ec);
+}
+
+TEST_CASE("serve_main: multi-profile llamaserver attach mode binds profiles while spawn rejects distinct models") {
+    const auto m1_path = temp_path("bonsai-27b.gguf");
+    const auto m2_path = temp_path("bonsai-9b.gguf");
+    {
+        const std::string gguf = minimal_gguf_header();
+        std::ofstream(m1_path, std::ios::binary) << gguf;
+        std::ofstream(m2_path, std::ios::binary) << gguf;
+    }
+    const std::string m1 = m1_path.generic_string();
+    const std::string m2 = m2_path.generic_string();
+    const auto profiles = temp_path("bonsai-profiles.json");
+    {
+        std::ofstream(profiles) << R"({"profiles":[
+            {"name":"bonsai-27b","backend":"llamaserver","model":")" << m1
+                                << R"(","ctx_size":512,"n_gpu_layers":-1,"fit":false,"sampling":{"temperature":0.3}},
+            {"name":"bonsai-9b","backend":"llamaserver","model":")" << m2
+                                << R"(","ctx_size":512,"n_gpu_layers":-1,"fit":false,"sampling":{"temperature":0.8}},
+            {"name":"bonsai-27b-creative","backend":"llamaserver","model":")" << m1
+                                << R"(","ctx_size":512,"n_gpu_layers":-1,"fit":false,"sampling":{"temperature":1.1}},
+            {"name":"bonsai-27b-wide","backend":"llamaserver","model":")" << m1
+                                << R"(","ctx_size":1024,"n_gpu_layers":-1,"fit":false}
+        ]})";
+    }
+    const std::string pf = profiles.string();
+
+    const auto loaded_profiles = si::load_launch_profiles(pf);
+    REQUIRE_MESSAGE(loaded_profiles.ok(), loaded_profiles.status().message());
+    const auto parsed_gguf = si::read_gguf_model_info(m1);
+    REQUIRE_MESSAGE(parsed_gguf.ok(), parsed_gguf.status().message());
+    const std::uint64_t single_mib = si::estimate_vram(parsed_gguf.value(), loaded_profiles.value()[0]).total_mib();
+    const std::uint64_t tight_budget = single_mib + 50u;
+    const std::uint64_t fit_budget = 2u * single_mib + 50u;
+    REQUIRE(tight_budget < 2u * single_mib);
+
+    std::string out;
+    std::string err;
+
+    // Spawn mode with two distinct GGUFs refuses with actionable guidance.
+    CHECK(run({"--profiles", pf, "--profile", "bonsai-27b", "--profile", "bonsai-9b", "--llamaserver-executable",
+               "llama-server-not-started"},
+              out, err) == 2);
+    CHECK(err.find("cannot spawn multiple distinct GGUF models") != std::string::npos);
+    CHECK(err.find("--llamaserver-mode attach") != std::string::npos);
+    CHECK(err.find("separate") != std::string::npos);
+
+    // Explicit spawn mode also refuses --llamaserver-url.
+    CHECK(run({"--profiles", pf, "--profile", "bonsai-27b", "--profile", "bonsai-9b", "--llamaserver-mode", "spawn",
+               "--llamaserver-url", "http://127.0.0.1:8080"},
+              out, err) == 2);
+    CHECK(err.find("--llamaserver-url conflicts with --profile in llamaserver spawn mode") != std::string::npos);
+
+    // Shared-model spawn mode with conflicting launch settings refuses cleanly.
+    CHECK(run({"--profiles", pf, "--profile", "bonsai-27b", "--profile", "bonsai-27b-wide", "--llamaserver-executable",
+               "llama-server-not-started"},
+              out, err) == 2);
+    CHECK(err.find("conflicting launch settings") != std::string::npos);
+
+    // Shared-model spawn mode with matching launch settings (only sampling differs)
+    // binds both aliases to the single spawned child without double-counting VRAM.
+    {
+        det::ServeCliConfig cfg_spawn;
+        const int rc = build_cli({"--profiles", pf, "--profile", "bonsai-27b", "--profile", "bonsai-27b-creative",
+                                  "--llamaserver-executable", "llama-server-not-started", "--vram-budget-mib",
+                                  std::to_string(tight_budget), "--max-connections", "0"},
+                                 cfg_spawn, err);
+        CHECK(rc == 2);
+        CHECK(err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+        CHECK(cfg_spawn.options.backend.llamaserver_mode == "spawn");
+        CHECK(cfg_spawn.options.models == std::vector<std::string>{"bonsai-27b", "bonsai-27b-creative"});
+        REQUIRE(cfg_spawn.options.profile_bindings.size() == 2u);
+        CHECK(cfg_spawn.options.profile_bindings[0].load_name == "bonsai-27b");
+        CHECK(cfg_spawn.options.profile_bindings[1].load_name == "bonsai-27b");
+        CHECK(*cfg_spawn.options.profile_bindings[0].sampling_defaults.temperature == doctest::Approx(0.3));
+        CHECK(*cfg_spawn.options.profile_bindings[1].sampling_defaults.temperature == doctest::Approx(1.1));
+    }
+
+    // Attach mode against an upstream router binds multiple distinct profiles cleanly.
+    {
+        det::ServeCliConfig cfg_attach;
+        const int rc = build_cli({"--profiles", pf, "--profile", "bonsai-27b", "--profile", "bonsai-9b",
+                                  "--llamaserver-mode", "attach", "--llamaserver-url", "http://127.0.0.1:8080",
+                                  "--vram-budget-mib", std::to_string(fit_budget), "--max-connections", "0"},
+                                 cfg_attach, err);
+        CHECK(rc == 2);
+        CHECK(err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+        CHECK(cfg_attach.options.backend.llamaserver_mode == "attach");
+        CHECK(cfg_attach.options.backend.llamaserver_url == "http://127.0.0.1:8080");
+        CHECK(cfg_attach.options.models == std::vector<std::string>{"bonsai-27b", "bonsai-9b"});
+        REQUIRE(cfg_attach.options.profile_bindings.size() == 2u);
+        CHECK(cfg_attach.options.profile_bindings[0].load_name == "bonsai-27b");
+        CHECK(cfg_attach.options.profile_bindings[1].load_name == "bonsai-9b");
+        CHECK(*cfg_attach.options.profile_bindings[0].sampling_defaults.temperature == doctest::Approx(0.3));
+        CHECK(*cfg_attach.options.profile_bindings[1].sampling_defaults.temperature == doctest::Approx(0.8));
+        REQUIRE(cfg_attach.options.profile_catalog.size() == 4u);
+        CHECK(cfg_attach.options.profile_catalog[0].find("served")->as_bool());
+        CHECK(cfg_attach.options.profile_catalog[1].find("served")->as_bool());
+        CHECK_FALSE(cfg_attach.options.profile_catalog[2].find("served")->as_bool());
+        CHECK_FALSE(cfg_attach.options.profile_catalog[3].find("served")->as_bool());
+    }
+
+    // Passing --llamaserver-url with multiple profiles infers attach mode.
+    {
+        det::ServeCliConfig cfg_inferred;
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+        const int rc = build_cli({"--profiles", pf, "--profile", "bonsai-27b", "--profile", "bonsai-9b",
+                                  "--llamaserver-url", "http://127.0.0.1:8080", "--vram-budget-mib",
+                                  std::to_string(fit_budget)},
+                                 cfg_inferred, err);
+        CHECK_MESSAGE(rc == 0, err);
+#else
+        const int rc = build_cli({"--profiles", pf, "--profile", "bonsai-27b", "--profile", "bonsai-9b",
+                                  "--llamaserver-url", "http://127.0.0.1:8080", "--vram-budget-mib",
+                                  std::to_string(fit_budget), "--max-connections", "0"},
+                                 cfg_inferred, err);
+        CHECK(rc == 2);
+        CHECK(err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+#endif
+        CHECK(cfg_inferred.options.backend.llamaserver_mode == "attach");
+        CHECK(cfg_inferred.options.models == std::vector<std::string>{"bonsai-27b", "bonsai-9b"});
+    }
+
+    std::error_code ec;
+    fs::remove(m1_path, ec);
+    fs::remove(m2_path, ec);
+    fs::remove(profiles, ec);
+}
+
+TEST_CASE("serve_main: multi-profile llamacpp validates shared options and checks aggregate VRAM") {
+    const auto a_path = temp_path("direct-a.gguf");
+    const auto b_path = temp_path("direct-b.gguf");
+    {
+        const std::string gguf = minimal_gguf_header();
+        std::ofstream(a_path, std::ios::binary) << gguf;
+        std::ofstream(b_path, std::ios::binary) << gguf;
+    }
+    const std::string a_str = a_path.generic_string();
+    const std::string b_str = b_path.generic_string();
+    const auto profiles = temp_path("direct-multi-profiles.json");
+    {
+        std::ofstream(profiles) << R"({"profiles":[
+            {"name":"alpha","backend":"llamacpp","model":")" << a_str
+                                << R"(","ctx_size":512,"n_gpu_layers":-1,"cache_type_k":"q8_0","sampling":{"temperature":0.2}},
+            {"name":"beta","backend":"llamacpp","model":")" << b_str
+                                << R"(","ctx_size":512,"n_gpu_layers":-1,"cache_type_k":"q8_0","sampling":{"temperature":0.9}},
+            {"name":"conflict","backend":"llamacpp","model":")" << b_str
+                                << R"(","ctx_size":1024,"n_gpu_layers":-1},
+            {"name":"unsupported","backend":"llamacpp","model":")" << b_str
+                                << R"(","parallel":2}
+        ]})";
+    }
+    const std::string pf = profiles.string();
+
+    const auto loaded_profiles = si::load_launch_profiles(pf);
+    REQUIRE_MESSAGE(loaded_profiles.ok(), loaded_profiles.status().message());
+    const auto parsed_gguf = si::read_gguf_model_info(a_str);
+    REQUIRE_MESSAGE(parsed_gguf.ok(), parsed_gguf.status().message());
+    const std::uint64_t single_mib = si::estimate_vram(parsed_gguf.value(), loaded_profiles.value()[0]).total_mib();
+    const std::uint64_t tight_budget = single_mib + 50u;
+    const std::uint64_t fit_budget = 2u * single_mib + 50u;
+    REQUIRE(tight_budget < 2u * single_mib);
+
+    std::string out;
+    std::string err;
+
+    // Conflicting shared llamacpp option is refused clearly.
+    CHECK(run({"--profiles", pf, "--profile", "alpha", "--profile", "conflict", "--vram-budget-mib",
+               std::to_string(fit_budget)},
+              out, err) == 2);
+    CHECK(err.find("conflicts with 'alpha' on shared llamacpp option 'ctx_size'") != std::string::npos);
+
+    // Unsupported llamacpp field on secondary profile is refused cleanly.
+    CHECK(run({"--profiles", pf, "--profile", "alpha", "--profile", "unsupported", "--vram-budget-mib",
+               std::to_string(fit_budget)},
+              out, err) == 2);
+    CHECK(err.find("'parallel' is not supported by the llamacpp backend") != std::string::npos);
+
+    // Eager multi-profile overcommit refuses with both profile names, sum vs budget, and suggestions.
+    CHECK(run({"--profiles", pf, "--profile", "alpha", "--profile", "beta", "--vram-budget-mib",
+               std::to_string(tight_budget)},
+              out, err) == 2);
+    CHECK(err.find("aggregate VRAM") != std::string::npos);
+    CHECK(err.find("alpha") != std::string::npos);
+    CHECK(err.find("beta") != std::string::npos);
+    CHECK(err.find(std::to_string(2u * single_mib) + " MiB vs budget " + std::to_string(tight_budget) + " MiB") !=
+          std::string::npos);
+    CHECK(err.find("--lazy-models --max-resident-models 1") != std::string::npos);
+    CHECK(err.find("--allow-overcommit") != std::string::npos);
+
+    // --lazy-models --max-resident-models 1 keeps peak resident to 1 model and passes at tight_budget.
+    {
+        det::ServeCliConfig cfg_lazy;
+        const int rc = build_cli({"--profiles", pf, "--profile", "alpha", "--profile", "beta", "--vram-budget-mib",
+                                  std::to_string(tight_budget), "--lazy-models", "--max-resident-models", "1",
+                                  "--max-connections", "0"},
+                                 cfg_lazy, err);
+        CHECK(rc == 2);
+        CHECK(err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+        CHECK(cfg_lazy.options.models == std::vector<std::string>{"alpha", "beta"});
+        REQUIRE(cfg_lazy.options.profile_bindings.size() == 2u);
+        CHECK(cfg_lazy.options.profile_bindings[0].load_name == a_str);
+        CHECK(cfg_lazy.options.profile_bindings[1].load_name == b_str);
+    }
+
+    // --allow-overcommit allows eager start even when aggregate sum exceeds budget.
+    {
+        det::ServeCliConfig cfg_over;
+        const int rc = build_cli({"--profiles", pf, "--profile", "alpha", "--profile", "beta", "--vram-budget-mib",
+                                  std::to_string(tight_budget), "--allow-overcommit", "--max-connections", "0"},
+                                 cfg_over, err);
+        CHECK(rc == 2);
+        CHECK(err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+    }
+
+    // Budget >= sum passes eagerly and marks both active profiles served in the catalog.
+    {
+        det::ServeCliConfig cfg_fit;
+        const int rc = build_cli({"--profiles", pf, "--profile", "alpha", "--profile", "beta", "--vram-budget-mib",
+                                  std::to_string(fit_budget), "--max-connections", "0"},
+                                 cfg_fit, err);
+        CHECK(rc == 2);
+        CHECK(err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+        CHECK(cfg_fit.options.models == std::vector<std::string>{"alpha", "beta"});
+        REQUIRE(cfg_fit.options.profile_catalog.size() == 4u);
+        CHECK(cfg_fit.options.profile_catalog[0].find("served")->as_bool());
+        CHECK(cfg_fit.options.profile_catalog[1].find("served")->as_bool());
+        CHECK_FALSE(cfg_fit.options.profile_catalog[2].find("served")->as_bool());
+        CHECK_FALSE(cfg_fit.options.profile_catalog[3].find("served")->as_bool());
+    }
+
+    std::error_code ec;
+    fs::remove(a_path, ec);
+    fs::remove(b_path, ec);
+    fs::remove(profiles, ec);
+}
+
+TEST_CASE("serve_main: multi-profile llamacpp applies merged shared options to VRAM estimate and metadata") {
+    // 32 layers, 16 KV heads, head_dim 128, training ctx 4096:
+    //   unmerged (ctx 4096, f16 K/V) ~ 1.3 GiB vs merged (ctx 32768, q8_0 K) ~ 6.5 GiB.
+    const auto make_large_kv_gguf = []() {
+        std::string body;
+        const auto raw = [&body](const void* ptr, std::size_t n) { body.append(static_cast<const char*>(ptr), n); };
+        const auto u32 = [&](std::uint32_t v) { raw(&v, 4); };
+        const auto u64 = [&](std::uint64_t v) { raw(&v, 8); };
+        const auto str = [&](const std::string& s) {
+            u64(s.size());
+            body.append(s);
+        };
+        const auto kv_u32 = [&](const std::string& key, std::uint32_t v) {
+            str(key);
+            u32(4u);
+            u32(v);
+        };
+        const auto kv_str = [&](const std::string& key, const std::string& v) {
+            str(key);
+            u32(8u);
+            str(v);
+        };
+        kv_str("general.architecture", "llama");
+        kv_u32("llama.block_count", 32u);
+        kv_u32("llama.embedding_length", 2048u);
+        kv_u32("llama.context_length", 4096u);
+        kv_u32("llama.attention.head_count", 16u);
+        kv_u32("llama.attention.head_count_kv", 16u);
+        std::string head = "GGUF";
+        const auto put = [&head](const void* ptr, std::size_t n) { head.append(static_cast<const char*>(ptr), n); };
+        const std::uint32_t version = 3u;
+        const std::uint64_t tensors = 0u;
+        const std::uint64_t kvs = 6u;
+        put(&version, 4);
+        put(&tensors, 8);
+        put(&kvs, 8);
+        return head + body;
+    };
+
+    const auto a_path = temp_path("merged-a.gguf");
+    const auto b_path = temp_path("merged-b.gguf");
+    {
+        const std::string gguf = make_large_kv_gguf();
+        std::ofstream(a_path, std::ios::binary) << gguf;
+        std::ofstream(b_path, std::ios::binary) << gguf;
+    }
+    const std::string a_str = a_path.generic_string();
+    const std::string b_str = b_path.generic_string();
+    const auto profiles = temp_path("merged-llamacpp-profiles.json");
+    {
+        std::ofstream(profiles) << R"({"profiles":[
+            {"name":"tuned","backend":"llamacpp","model":")" << a_str
+                                << R"(","ctx_size":32768,"n_gpu_layers":-1,"cache_type_k":"q8_0"},
+            {"name":"minimal","backend":"llamacpp","model":")" << b_str << R"("},
+            {"name":"minimal2","backend":"llamacpp","model":")" << b_str << R"("},
+            {"name":"cpu-only","backend":"llamacpp","model":")" << a_str << R"(","n_gpu_layers":0}
+        ]})";
+    }
+    const std::string pf = profiles.string();
+
+    const auto loaded_profiles = si::load_launch_profiles(pf);
+    REQUIRE_MESSAGE(loaded_profiles.ok(), loaded_profiles.status().message());
+    const auto parsed_gguf = si::read_gguf_model_info(a_str);
+    REQUIRE_MESSAGE(parsed_gguf.ok(), parsed_gguf.status().message());
+    const std::uint64_t merged_mib = si::estimate_vram(parsed_gguf.value(), loaded_profiles.value()[0]).total_mib();
+    const std::uint64_t unmerged_mib = si::estimate_vram(parsed_gguf.value(), loaded_profiles.value()[1]).total_mib();
+    REQUIRE(merged_mib > unmerged_mib + 2000u);
+    // Midpoint budget: comfortably above (tuned + unmerged minimal), strictly below (tuned + merged minimal).
+    const std::uint64_t mid_budget = merged_mib + unmerged_mib + 500u;
+    const std::uint64_t fit_budget = 2u * merged_mib + 500u;
+    REQUIRE(mid_budget < 2u * merged_mib);
+
+    std::string out;
+    std::string err;
+
+    // Primary 'tuned' sets ctx_size/cache_type_k/n_gpu_layers; secondary 'minimal' leaves them unset.
+    // Aggregate VRAM MUST count 'minimal' at merged_mib and refuse mid_budget.
+    CHECK(run({"--profiles", pf, "--profile", "tuned", "--profile", "minimal", "--vram-budget-mib",
+               std::to_string(mid_budget)},
+              out, err) == 2);
+    CHECK(err.find("aggregate VRAM") != std::string::npos);
+    CHECK(err.find(std::to_string(2u * merged_mib) + " MiB vs budget " + std::to_string(mid_budget) + " MiB") !=
+          std::string::npos);
+
+    // At fit_budget, both binding metadata (/v1/models sonder.profile) and catalog metadata
+    // (sonder.profiles) for 'minimal' reflect the merged effective options and VRAM estimate.
+    {
+        det::ServeCliConfig cfg;
+        const int rc = build_cli({"--profiles", pf, "--profile", "tuned", "--profile", "minimal", "--vram-budget-mib",
+                                  std::to_string(fit_budget), "--max-connections", "0"},
+                                 cfg, err);
+        CHECK(rc == 2);
+        CHECK(err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+        REQUIRE(cfg.options.profile_bindings.size() == 2u);
+        const auto& b_meta = cfg.options.profile_bindings[1].metadata;
+        REQUIRE(b_meta.find("context_length") != nullptr);
+        CHECK(b_meta.find("context_length")->as_int() == 32768);
+        REQUIRE(b_meta.find("cache_type_k") != nullptr);
+        CHECK(b_meta.find("cache_type_k")->as_string() == "q8_0");
+        REQUIRE(b_meta.find("estimated_vram_mib") != nullptr);
+        CHECK(b_meta.find("estimated_vram_mib")->as_uint() == merged_mib);
+
+        REQUIRE(cfg.options.profile_catalog.size() == 4u);
+        const auto& cat_b = cfg.options.profile_catalog[1];
+        CHECK(cat_b.find("served")->as_bool());
+        CHECK(cat_b.find("context_length")->as_int() == 32768);
+        CHECK(cat_b.find("cache_type_k")->as_string() == "q8_0");
+        CHECK(cat_b.find("estimated_vram_mib")->as_uint() == merged_mib);
+
+        bool noted_inherit_ctx = false;
+        bool noted_inherit_k = false;
+        for (const auto& note : cfg.profile_notes) {
+            if (note.find("'minimal' inherits shared llamacpp option 'ctx_size' = 32768 from 'tuned'") !=
+                std::string::npos) {
+                noted_inherit_ctx = true;
+            }
+            if (note.find("'minimal' inherits shared llamacpp option 'cache_type_k' = q8_0 from 'tuned'") !=
+                std::string::npos) {
+                noted_inherit_k = true;
+            }
+        }
+        CHECK(noted_inherit_ctx);
+        CHECK(noted_inherit_k);
+    }
+
+    // Reverse order with 3 profiles: 'minimal' and 'minimal2' omit options, third profile 'tuned' sets them.
+    // All three reflect merged effective options, and diagnostics accurately name both earlier profiles.
+    {
+        det::ServeCliConfig cfg;
+        const std::uint64_t triple_budget = 3u * merged_mib + 500u;
+        const int rc = build_cli({"--profiles", pf, "--profile", "minimal", "--profile", "minimal2", "--profile",
+                                  "tuned", "--vram-budget-mib", std::to_string(triple_budget), "--max-connections",
+                                  "0"},
+                                 cfg, err);
+        CHECK(rc == 2);
+        CHECK(err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+        REQUIRE(cfg.options.profile_bindings.size() == 3u);
+        for (std::size_t i = 0; i < 3u; ++i) {
+            CHECK(cfg.options.profile_bindings[i].metadata.find("context_length")->as_int() == 32768);
+            CHECK(cfg.options.profile_bindings[i].metadata.find("cache_type_k")->as_string() == "q8_0");
+            CHECK(cfg.options.profile_bindings[i].metadata.find("estimated_vram_mib")->as_uint() == merged_mib);
+        }
+        bool noted_both_earlier = false;
+        for (const auto& note : cfg.profile_notes) {
+            if (note.find("'tuned' sets shared llamacpp option 'ctx_size' = 32768 (unset on 'minimal', 'minimal2')") !=
+                std::string::npos) {
+                noted_both_earlier = true;
+            }
+        }
+        CHECK(noted_both_earlier);
+    }
+
+    // CPU-only propagation: primary sets n_gpu_layers=0, secondary omits it; even on --device gpu:0
+    // with a 1 MiB budget, effective n_gpu_layers=0 skips GPU offload for both profiles.
+    {
+        det::ServeCliConfig cfg_cpu;
+        const int rc = build_cli({"--profiles", pf, "--profile", "cpu-only", "--profile", "minimal", "--device",
+                                  "gpu:0", "--vram-budget-mib", "1", "--max-connections", "0"},
+                                 cfg_cpu, err);
+        CHECK(rc == 2);
+        CHECK(err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+        REQUIRE(cfg_cpu.options.profile_bindings.size() == 2u);
+        CHECK(cfg_cpu.options.profile_bindings[0].metadata.find("estimated_vram_mib")->is_null());
+        CHECK(cfg_cpu.options.profile_bindings[1].metadata.find("estimated_vram_mib")->is_null());
+    }
+
+    // Consistency checks: --vram-budget-mib without profiles mentions --all-profiles, and
+    // llamaserver config base_url conflicts with multi-profile spawn mode.
+    CHECK(run({"--backend", "mock", "--vram-budget-mib", "100"}, out, err) == 2);
+    CHECK(err.find("--all-profiles") != std::string::npos);
+
+    const auto ls_profiles = temp_path("ls-spawn-url-profiles.json");
+    const auto ls_cfg = temp_path("ls-spawn-url-cfg.json");
+    {
+        std::ofstream(ls_profiles) << R"({"profiles":[
+            {"name":"s1","backend":"llamaserver","model":")" << a_str << R"("},
+            {"name":"s2","backend":"llamaserver","model":")" << a_str << R"("}
+        ]})";
+        std::ofstream(ls_cfg) << R"({"mode":"spawn","base_url":"http://127.0.0.1:8080","executable":"llama-server"})";
+    }
+    CHECK(run({"--profiles", ls_profiles.string(), "--profile", "s1", "--profile", "s2", "--llamaserver-config",
+               ls_cfg.string()},
+              out, err) == 2);
+    CHECK(err.find("base_url") != std::string::npos);
+    CHECK(err.find("conflicts with --profile in llamaserver spawn mode") != std::string::npos);
+
+    std::error_code ec;
+    fs::remove(a_path, ec);
+    fs::remove(b_path, ec);
+    fs::remove(profiles, ec);
+    fs::remove(ls_profiles, ec);
+    fs::remove(ls_cfg, ec);
+}
