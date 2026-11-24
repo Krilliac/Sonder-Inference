@@ -71,6 +71,10 @@ class CGenerationStats(c.Structure):
 # NUL-terminated, so it is received as a raw pointer (c_void_p), not c_char_p.
 TOKEN_CALLBACK = c.CFUNCTYPE(c.c_int, c.c_void_p, c.c_void_p, c.c_size_t)
 
+# void (*)(void* user_data, const char* json_line, size_t length).
+# The JSON line is not guaranteed NUL-terminated, so receive as c_void_p.
+TELEMETRY_CALLBACK = c.CFUNCTYPE(None, c.c_void_p, c.c_void_p, c.c_size_t)
+
 
 MAX_CHAT_MESSAGES = 1024
 
@@ -93,5 +97,49 @@ class CSessionMetadata(c.Structure):
     ]
 
 
+_REQUEST_METADATA_V1_FIELDS = [
+    ("struct_size", c.c_uint32),
+    ("parent_request_id", c.c_char_p),
+]
+
+
+class CRequestMetadataV1(c.Structure):
+    _fields_ = _REQUEST_METADATA_V1_FIELDS
+
+
 class CRequestMetadata(c.Structure):
-    _fields_ = [("struct_size", c.c_uint32), ("parent_request_id", c.c_char_p)]
+    _fields_ = _REQUEST_METADATA_V1_FIELDS + [
+        ("workload_class", c.c_int32),
+        ("priority", c.c_int32),
+    ]
+
+
+REQUEST_METADATA_V1_SIZE = c.sizeof(CRequestMetadataV1)
+REQUEST_METADATA_SIZE = c.sizeof(CRequestMetadata)
+
+
+class CGpuInfo(c.Structure):
+    _fields_ = [
+        ("struct_size", c.c_uint32),
+        ("id", c.c_char * 64),
+        ("name", c.c_char * 256),
+        ("vendor", c.c_char * 32),
+        ("backend_hint", c.c_char * 32),
+        ("source", c.c_char * 32),
+        ("vendor_id", c.c_uint32),
+        ("device_id", c.c_uint32),
+        ("dedicated_total_bytes", c.c_uint64),
+        ("dedicated_free_bytes", c.c_uint64),
+        ("shared_total_bytes", c.c_uint64),
+        ("effective_vram_mib", c.c_uint64),
+        ("effective_free_vram_mib", c.c_uint64),
+        ("has_dedicated_total", c.c_int32),
+        ("has_dedicated_free", c.c_int32),
+        ("has_shared_total", c.c_int32),
+        ("has_effective_vram", c.c_int32),
+        ("has_effective_free_vram", c.c_int32),
+        ("is_integrated_uma", c.c_int32),
+    ]
+
+
+GPU_INFO_SIZE = c.sizeof(CGpuInfo)

@@ -31,6 +31,8 @@ RouteInfo lookup_route(std::string_view path) {
     if (path == "/v1/sonder/health") return {Route::health, "GET"};
     if (path == "/v1/models") return {Route::models, "GET"};
     if (path == "/v1/sonder/identity") return {Route::identity, "GET"};
+    if (path == "/v1/sonder/node") return {Route::sonder_node, "GET"};
+    if (path == "/v1/sonder/plan") return {Route::sonder_plan, "POST"};
     if (path == "/v1/chat/completions") return {Route::chat, "POST"};
     if (path == "/v1/messages") return {Route::messages, "POST"};
     if (path == "/v1/embeddings") return {Route::embeddings, "POST"};
@@ -419,9 +421,11 @@ PreDispatchResult run_request_guards(Exchange& ex, const RequestHead& head, std:
             return fail(make_error(411, "length_required",
                                    "POST requires Content-Length (chunked bodies are not accepted)"));
         }
-        if (*head.content_length > opts.max_body_bytes) {
+        const std::size_t max_body =
+            route.route == Route::sonder_plan ? std::min(opts.max_body_bytes, kPlanMaxBodyBytes) : opts.max_body_bytes;
+        if (*head.content_length > max_body) {
             return fail(make_error(413, "payload_too_large",
-                                   "request body exceeds " + std::to_string(opts.max_body_bytes) + " bytes"));
+                                   "request body exceeds " + std::to_string(max_body) + " bytes"));
         }
         // The request passed every check that does not need the body:
         // tell a waiting client (curl waits 1 s otherwise) to send it.

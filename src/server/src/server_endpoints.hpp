@@ -1,5 +1,6 @@
-// Internal: read-only status, model listing, backend identity, discovery, and
-// SSE/NDJSON live telemetry streaming endpoints for the server module.
+// Internal: read-only status, model listing, backend identity, node capability
+// inventory, safe placement planning, discovery, and SSE/NDJSON live telemetry
+// streaming endpoints for the server module.
 #pragma once
 
 #include <array>
@@ -10,7 +11,9 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <variant>
 
 #include "live_hub.hpp"
 #include "log_queue.hpp"
@@ -18,6 +21,7 @@
 #include "server_policy.hpp"
 #include "sonder/inference/backend.hpp"
 #include "sonder/inference/json.hpp"
+#include "sonder/inference/placement_planner.hpp"
 #include "sonder/inference/server.hpp"
 
 namespace sonder::inference::server::detail {
@@ -64,6 +68,35 @@ json::Object build_models_body(const ServerOptions& opts, const ModelResidency& 
 
 json::Object build_identity_body(const ModelResidency& residency, const std::string& served_id, bool synthetic,
                                  const std::optional<std::string>& probed);
+
+struct NodeSnapshot {
+    const ServerOptions& opts;
+    bool backend_available = false;
+    std::string backend_version;
+    std::shared_ptr<Backend> backend;
+    const ModelResidency& residency;
+    const std::string& instance_id;
+    const std::string& node_id;
+    bool synthetic = false;
+};
+
+json::Object build_node_body(const NodeSnapshot& snapshot);
+
+struct PlanHttpRequest {
+    bool has_profile = false;
+    std::string profile;
+    bool has_model = false;
+    std::string model;
+    PlacementPlanRequest plan_request;
+};
+
+// Strictly parses and validates a POST /v1/sonder/plan JSON request body.
+std::variant<PlanHttpRequest, ApiError> parse_plan_request(std::string_view body);
+
+// Resolves the requested profile or model strictly inside configured server
+// bindings or model_dirs, reads only the GGUF header, runs the placement
+// planner, and redacts any host paths to basenames before returning JSON.
+std::variant<json::Object, ApiError> execute_plan_request(const ServerOptions& opts, const PlanHttpRequest& request);
 
 json::Object build_discovery_document(const ServerOptions& opts, const LiveTelemetryHub& hub,
                                       const std::string& instance_id, const std::string& node_id, bool synthetic);

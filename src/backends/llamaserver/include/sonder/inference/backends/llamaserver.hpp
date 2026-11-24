@@ -135,6 +135,24 @@ struct LlamaServerHostMemoryOptions {
     } floor;
 };
 
+// Workload-aware adaptive speculation controller (opt-in; native llama-server
+// mode only). Mirrors AdaptiveSpeculationConfig with `enabled = false` by
+// default so existing behavior stays unchanged unless explicitly opted in.
+struct LlamaServerAdaptiveSpeculationOptions {
+    bool enabled = false;
+    std::uint32_t min_draft_n = 0;
+    std::uint32_t initial_draft_n = 3;
+    std::uint32_t max_draft_n = 6;
+    std::size_t window_size = 16;
+    std::size_t min_samples = 4;
+    double pause_acceptance_threshold = 0.25;
+    double step_down_acceptance_threshold = 0.45;
+    double step_up_acceptance_threshold = 0.72;
+    std::uint32_t cooldown_requests = 8;
+    std::uint32_t probe_draft_n = 1;
+    std::uint64_t min_draft_tokens_per_sample = 4;
+};
+
 struct LlamaServerBackendOptions {
     LlamaServerMode mode = LlamaServerMode::attach;
     std::string base_url = "http://127.0.0.1:8080";
@@ -205,6 +223,8 @@ struct LlamaServerBackendOptions {
     // False declares that the upstream cannot honour a grammar; a non-empty
     // `grammar` is then refused when the backend is built.
     bool upstream_grammar = true;
+    // Opt-in workload-aware adaptive speculation policy (native mode only).
+    LlamaServerAdaptiveSpeculationOptions adaptive_speculation;
 };
 
 // Slot snapshots are upstream-owned files, not portable Sonder KV blocks.

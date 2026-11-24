@@ -6,6 +6,7 @@
 #include <string_view>
 #include <vector>
 
+#include "adaptive_speculation.hpp"
 #include "sonder/inference/backends/llamaserver.hpp"
 #include "sonder/inference/device.hpp"
 #include "sonder/inference/json.hpp"
@@ -42,6 +43,8 @@ SpillGuardOptions to_spill_guard_options(const LlamaServerSpillGuardOptions &o,
 
 // False when the policy name is unknown; `out` is then left partly filled.
 bool to_host_memory_options(const LlamaServerHostMemoryOptions &o, HostMemoryOptions &out);
+
+AdaptiveSpeculationConfig to_adaptive_speculation_config(const LlamaServerAdaptiveSpeculationOptions &o) noexcept;
 
 // Reads the bearer token from the environment variable `name`. Messages name
 // the variable, never the value. Refuses an unset/empty variable, a malformed

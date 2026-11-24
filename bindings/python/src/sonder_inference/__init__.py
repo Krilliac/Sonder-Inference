@@ -18,6 +18,7 @@ from .api import (
     ChatMessage,
     Engine,
     GenerationResult,
+    GpuInfo,
     Model,
     Outcome,
     RequestMetadata,
@@ -26,7 +27,9 @@ from .api import (
     SessionMetadata,
     TelemetryLevel,
     TokenStream,
+    WorkloadClass,
     abi_version,
+    list_gpu_devices,
     version,
 )
 from .errors import (
@@ -50,9 +53,10 @@ __version__ = "0.1.0"
 
 __all__ = [
     "BackendError", "CancelledError", "ChatMessage", "ENV_LIBRARY", "ENV_LIB_DIR", "Engine",
-    "GenerationResult", "InternalError", "InvalidArgumentError", "InvalidStateError", "Library",
+    "GenerationResult", "GpuInfo", "InternalError", "InvalidArgumentError", "InvalidStateError", "Library",
     "LibraryNotFoundError", "Model", "NotFoundError", "Outcome", "ProtocolError", "RequestMetadata",
     "SUPPORTED_ABI_VERSION", "SamplingConfig", "Session", "SessionMetadata", "SonderError", "SonderIOError",
     "SonderTimeoutError", "Status", "TelemetryLevel", "TokenStream", "UnavailableError",
-    "UnsupportedError", "abi_version", "error_for_status", "get_library", "load_library", "version",
+    "UnsupportedError", "WorkloadClass", "abi_version", "error_for_status", "get_library",
+    "list_gpu_devices", "load_library", "version",
 ]

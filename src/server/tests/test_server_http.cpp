@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -21,7 +23,6 @@
 #  include <sys/time.h>
 
 #  include <cstdlib>
-#  include <fstream>
 #  include <map>
 #  include <optional>
 #endif
@@ -857,4 +858,452 @@ TEST_CASE("health: additive gpus inventory array is present and well-formed on a
     REQUIRE(models_reply.status == 200);
     const auto models_doc = models_reply.json();
     CHECK(models_doc.find("sonder")->as_object().size() == 3u);
+}
+
+namespace {
+
+struct TempModelDir {
+    std::filesystem::path path;
+    explicit TempModelDir(const char* prefix) : path(std::filesystem::temp_directory_path() / si::make_id(prefix)) {
+        std::filesystem::create_directories(path);
+    }
+    ~TempModelDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(path, ec);
+    }
+    TempModelDir(const TempModelDir&) = delete;
+    TempModelDir& operator=(const TempModelDir&) = delete;
+};
+
+class SyntheticGgufWriter {
+public:
+    void kv_str(const std::string& key, const std::string& value) {
+        str(key);
+        u32(8u);  // GGUF_TYPE_STRING
+        str(value);
+        ++kv_count_;
+    }
+    void kv_u32(const std::string& key, std::uint32_t value) {
+        str(key);
+        u32(4u);  // GGUF_TYPE_UINT32
+        u32(value);
+        ++kv_count_;
+    }
+    void tensor(const std::string& name, const std::vector<std::uint64_t>& dims, std::uint32_t type) {
+        str(name);
+        u32(static_cast<std::uint32_t>(dims.size()));
+        for (const std::uint64_t d : dims) u64(d);
+        u32(type);
+        u64(0u);
+        ++tensor_count_;
+    }
+    [[nodiscard]] std::string finish() const {
+        std::string out = "GGUF";
+        append_u32(out, 3u);
+        append_u64(out, tensor_count_);
+        append_u64(out, kv_count_);
+        out += bytes_;
+        return out;
+    }
+
+private:
+    static void append_u32(std::string& dst, std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) dst.push_back(static_cast<char>((v >> (i * 8)) & 0xFFu));
+    }
+    static void append_u64(std::string& dst, std::uint64_t v) {
+        for (int i = 0; i < 8; ++i) dst.push_back(static_cast<char>((v >> (i * 8)) & 0xFFu));
+    }
+    void u32(std::uint32_t v) { append_u32(bytes_, v); }
+    void u64(std::uint64_t v) { append_u64(bytes_, v); }
+    void str(const std::string& s) {
+        u64(static_cast<std::uint64_t>(s.size()));
+        bytes_.append(s);
+    }
+
+    std::string bytes_;
+    std::uint64_t kv_count_ = 0;
+    std::uint64_t tensor_count_ = 0;
+};
+
+std::string make_synthetic_gguf_bytes() {
+    SyntheticGgufWriter w;
+    w.kv_str("general.architecture", "llama");
+    w.kv_u32("llama.block_count", 4u);
+    w.kv_u32("llama.context_length", 8192u);
+    w.kv_u32("llama.embedding_length", 512u);
+    w.kv_u32("llama.vocab_size", 32000u);
+    w.kv_u32("llama.attention.head_count", 8u);
+    w.kv_u32("llama.attention.head_count_kv", 4u);
+    w.tensor("token_embd.weight", {512u, 32000u}, 2u);
+    for (std::uint32_t b = 0; b < 4u; ++b) {
+        w.tensor("blk." + std::to_string(b) + ".attn_q.weight", {512u, 512u}, 2u);
+        w.tensor("blk." + std::to_string(b) + ".ffn_up.weight", {512u, 1024u}, 2u);
+    }
+    w.tensor("output.weight", {512u, 32000u}, 2u);
+    return w.finish();
+}
+
+void write_binary_file(const std::filesystem::path& path, const std::string& content) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    REQUIRE_MESSAGE(out.good(), "failed to create test fixture file");
+    out.write(content.data(), static_cast<std::streamsize>(content.size()));
+    REQUIRE(out.good());
+}
+
+}  // namespace
+
+TEST_CASE("node: capability inventory returns schema, hardware, backends, models and honors auth") {
+    {
+        auto o = Fixture::defaults();
+        o.profile_catalog.emplace_back(json::Object{{"name", "mock:tiny"}, {"backend", "mock"}, {"served", true}});
+        Fixture f(o);
+
+        const Reply r = get(f.port, "/v1/sonder/node");
+        REQUIRE(r.status == 200);
+        CHECK(r.complete);
+        check_common_headers(r);
+        CHECK(r.header("content-type") == "application/json");
+        const json::Value doc = r.json();
+
+        CHECK(doc.find("schema")->as_string() == "sonder.inference.node/1");
+        CHECK_FALSE(doc.find("node_id")->as_string().empty());
+        CHECK(doc.find("instance_id")->as_string() == f.server->instance_id());
+        CHECK_FALSE(doc.find("platform")->as_string().empty());
+        CHECK_FALSE(doc.find("version")->as_string().empty());
+        CHECK_FALSE(doc.find("commit")->as_string().empty());
+        CHECK(doc.find("abi_version")->as_int() == 1);
+        CHECK(doc.find("api_version")->as_int() == 1);
+        CHECK(doc.find("synthetic")->as_bool());
+
+        const json::Value* host_mem = doc.find("host_memory");
+        REQUIRE(host_mem != nullptr);
+        REQUIRE(host_mem->is_object());
+        REQUIRE(host_mem->find("total_physical_bytes") != nullptr);
+        REQUIRE(host_mem->find("available_physical_bytes") != nullptr);
+        REQUIRE(host_mem->find("available_commit_bytes") != nullptr);
+        REQUIRE(host_mem->find("source") != nullptr);
+        CHECK((host_mem->find("total_physical_bytes")->is_null() ||
+               host_mem->find("total_physical_bytes")->is_integer()));
+        CHECK((host_mem->find("available_physical_bytes")->is_null() ||
+               host_mem->find("available_physical_bytes")->is_integer()));
+        CHECK((host_mem->find("available_commit_bytes")->is_null() ||
+               host_mem->find("available_commit_bytes")->is_integer()));
+        CHECK((host_mem->find("source")->is_null() || host_mem->find("source")->is_string()));
+
+        const json::Value* devices = doc.find("devices");
+        REQUIRE(devices != nullptr);
+        REQUIRE(devices->is_array());
+        REQUIRE_FALSE(devices->as_array().empty());
+        const auto& cpu = devices->as_array().front();
+        CHECK(cpu.find("id")->is_string());
+        CHECK(cpu.find("kind")->as_string() == "cpu");
+        CHECK(cpu.find("name")->is_string());
+        CHECK(cpu.find("logical_cores")->is_integer());
+        CHECK(cpu.find("total_memory_bytes")->is_integer());
+        CHECK(cpu.find("available_memory_bytes")->is_integer());
+
+        const json::Value* gpus = doc.find("gpus");
+        REQUIRE(gpus != nullptr);
+        CHECK(gpus->is_array());
+
+        const json::Value* backends = doc.find("backends");
+        REQUIRE(backends != nullptr);
+        REQUIRE(backends->is_array());
+        REQUIRE(backends->as_array().size() == 1u);
+        CHECK(backends->as_array()[0].find("name")->as_string() == "mock");
+        CHECK(backends->as_array()[0].find("available")->as_bool());
+        CHECK(backends->as_array()[0].find("capabilities")->is_array());
+
+        const json::Value* models = doc.find("models");
+        REQUIRE(models != nullptr);
+        REQUIRE(models->is_array());
+        REQUIRE(models->as_array().size() == 1u);
+        CHECK(models->as_array()[0].find("id")->as_string() == "mock:tiny");
+        CHECK(models->as_array()[0].find("backend")->as_string() == "mock");
+        CHECK(models->as_array()[0].find("state")->as_string() == "resident");
+        CHECK(models->as_array()[0].find("resident")->as_bool());
+        CHECK(models->as_array()[0].find("default")->as_bool());
+
+        const json::Value* profiles = doc.find("profiles");
+        REQUIRE(profiles != nullptr);
+        REQUIRE(profiles->is_array());
+        REQUIRE(profiles->as_array().size() == 1u);
+        CHECK(profiles->as_array()[0].find("name")->as_string() == "mock:tiny");
+
+        const json::Value* caps = doc.find("capabilities");
+        REQUIRE(caps != nullptr);
+        REQUIRE(caps->is_object());
+        CHECK(caps->find("ternary_gguf")->as_bool());
+        CHECK(caps->find("placement_planner")->as_bool());
+        CHECK(caps->find("coresidency_planner")->as_bool());
+        CHECK(caps->find("multi_gpu")->as_bool());
+        CHECK(caps->find("uma_telemetry")->as_bool());
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+        CHECK(caps->find("adaptive_speculation")->as_bool());
+#else
+        CHECK_FALSE(caps->find("adaptive_speculation")->as_bool());
+#endif
+
+        CHECK(doc.find("sonder")->find("api_version")->as_int() == 1);
+
+        // Wrong HTTP method returns 405 with accurate Allow header.
+        const Reply wrong = post(f.port, "/v1/sonder/node", "{}");
+        check_error(wrong, 405, "invalid_request_error", "method_not_allowed");
+        CHECK(wrong.header("allow") == "GET, OPTIONS");
+    }
+    {
+        // Bearer auth enforcement and no token/path leakage.
+        TempModelDir dir("sonder-node-dir");
+        auto o = Fixture::defaults();
+        o.token = "node-secret-token";
+        o.backend.model_dirs = {dir.path.string()};
+        Fixture f(o);
+
+        const Reply missing = get(f.port, "/v1/sonder/node");
+        check_error(missing, 401, "authentication_error", "unauthorized");
+        CHECK(missing.header("www-authenticate") == "Bearer");
+
+        check_error(get(f.port, "/v1/sonder/node", {{"Authorization", "Bearer wrong-token"}}), 401,
+                    "authentication_error", "unauthorized");
+
+        const Reply ok = get(f.port, "/v1/sonder/node", {{"Authorization", "Bearer node-secret-token"}});
+        REQUIRE(ok.status == 200);
+        CHECK(ok.json().find("schema")->as_string() == "sonder.inference.node/1");
+        CHECK(ok.json().find("profiles")->as_array().empty());
+        CHECK(ok.body.find("node-secret-token") == std::string::npos);
+        CHECK(ok.body.find(dir.path.string()) == std::string::npos);
+        CHECK(ok.body.find(dir.path.filename().string()) == std::string::npos);
+    }
+}
+
+TEST_CASE("discovery: links advertise node and plan endpoints") {
+    Fixture f;
+    const Reply r = get(f.port, "/.well-known/sonder-telemetry");
+    REQUIRE(r.status == 200);
+    const json::Value doc = r.json();
+    const json::Value* links = doc.find("links");
+    REQUIRE(links != nullptr);
+    REQUIRE(links->is_object());
+    CHECK(links->find("health")->as_string() == "/v1/sonder/health");
+    CHECK(links->find("identity")->as_string() == "/v1/sonder/identity");
+    CHECK(links->find("models")->as_string() == "/v1/models");
+    CHECK(links->find("node")->as_string() == "/v1/sonder/node");
+    CHECK(links->find("plan")->as_string() == "/v1/sonder/plan");
+}
+
+TEST_CASE("plan: rejects bad methods, oversized bodies, malformed JSON, unknown keys, path traversal and missing targets") {
+    TempModelDir model_dir("sonder-plan-reject");
+    TempModelDir outside_dir("sonder-plan-outside");
+    write_binary_file(model_dir.path / "notes.txt", "not a model");
+    write_binary_file(outside_dir.path / "outside.gguf", make_synthetic_gguf_bytes());
+    write_binary_file(model_dir.path / "corrupt.gguf", "not-a-valid-gguf-header");
+
+    std::error_code sym_ec;
+    std::filesystem::create_symlink(outside_dir.path / "outside.gguf", model_dir.path / "escape.gguf", sym_ec);
+    const bool symlink_created = !sym_ec;
+
+    auto o = Fixture::defaults();
+    o.backend.model_dirs = {model_dir.path.string()};
+    Fixture f(o);
+
+    // Wrong method returns 405 with accurate Allow header.
+    const Reply wrong_method = get(f.port, "/v1/sonder/plan");
+    check_error(wrong_method, 405, "invalid_request_error", "method_not_allowed");
+    CHECK(wrong_method.header("allow") == "POST, OPTIONS");
+
+    // Body limit for /v1/sonder/plan is capped at 64 KiB even when max_body_bytes is 4 MiB.
+    const std::string oversized(65u * 1024u, ' ');
+    check_error(post(f.port, "/v1/sonder/plan", oversized), 413, "invalid_request_error", "payload_too_large");
+
+    // Malformed JSON and non-object payloads.
+    check_error(post(f.port, "/v1/sonder/plan", "{"), 400, "invalid_request_error", "invalid_request");
+    check_error(post(f.port, "/v1/sonder/plan", "[]"), 400, "invalid_request_error", "invalid_request");
+    check_error(post(f.port, "/v1/sonder/plan", "42"), 400, "invalid_request_error", "invalid_request");
+    check_error(post(f.port, "/v1/sonder/plan", "{}"), 400, "invalid_request_error", "invalid_request");
+    check_error(post(f.port, "/v1/sonder/plan", R"({"profile":"a","model":"b.gguf"})"), 400, "invalid_request_error",
+                "invalid_request");
+
+    // Unknown keys rejected strictly.
+    check_error(post(f.port, "/v1/sonder/plan", R"({"model":"x.gguf","model_path":"/etc/passwd"})"), 400,
+                "invalid_request_error", "invalid_request");
+    check_error(post(f.port, "/v1/sonder/plan", R"({"model":"x.gguf","bogus":1})"), 400, "invalid_request_error",
+                "invalid_request");
+
+    // Path traversal and invalid target names rejected with 400.
+    for (const char* bad_body : {
+             R"({"model":"../secret.gguf"})",
+             R"({"model":"..\\secret.gguf"})",
+             R"({"model":"C:\\foo.gguf"})",
+             R"({"model":"/etc/passwd"})",
+             R"({"model":"sub/model.gguf"})",
+             R"({"model":"model.gguf:stream"})",
+             R"({"model":"bad\u0000name.gguf"})",
+             R"({"model":""})",
+             R"({"profile":"../secret"})",
+             R"({"profile":"/etc/passwd"})",
+             R"({"model":123})",
+             R"({"profile":true})",
+         }) {
+        CAPTURE(bad_body);
+        check_error(post(f.port, "/v1/sonder/plan", bad_body), 400, "invalid_request_error", "invalid_request");
+    }
+
+    // Strict type and range checks on optional tuning overrides.
+    for (const char* bad_override : {
+             R"({"model":"missing.gguf","ctx_size":64})",
+             R"({"model":"missing.gguf","ctx_size":2000000})",
+             R"({"model":"missing.gguf","ctx_size":"4096"})",
+             R"({"model":"missing.gguf","ctx_size":4096.5})",
+             R"({"model":"missing.gguf","min_ctx_size":100})",
+             R"({"model":"missing.gguf","parallel":0})",
+             R"({"model":"missing.gguf","parallel":257})",
+             R"({"model":"missing.gguf","vram_headroom_mib":-1})",
+             R"({"model":"missing.gguf","vram_headroom_mib":70000})",
+             R"({"model":"missing.gguf","prefer_free_vram":"true"})",
+             R"({"model":"missing.gguf","allow_quantized_kv":1})",
+             R"({"model":"missing.gguf","allow_speculative":null})",
+             R"({"model":"missing.gguf","allow_moe_cpu_offload":"no"})",
+             R"({"model":"missing.gguf","device_hint":7})",
+         }) {
+        CAPTURE(bad_override);
+        check_error(post(f.port, "/v1/sonder/plan", bad_override), 400, "invalid_request_error", "invalid_request");
+    }
+    const std::string long_hint = R"({"model":"missing.gguf","device_hint":")" + std::string(129, 'a') + R"("})";
+    check_error(post(f.port, "/v1/sonder/plan", long_hint), 400, "invalid_request_error", "invalid_request");
+
+    // Missing model, missing profile, and non-GGUF file return 404 without leaking host paths.
+    const Reply missing_model = post(f.port, "/v1/sonder/plan", R"({"model":"missing.gguf"})");
+    check_error(missing_model, 404, "not_found_error", "not_found");
+    CHECK(missing_model.body.find(model_dir.path.filename().string()) == std::string::npos);
+
+    const Reply missing_profile = post(f.port, "/v1/sonder/plan", R"({"profile":"missing-profile"})");
+    check_error(missing_profile, 404, "not_found_error", "not_found");
+    CHECK(missing_profile.body.find(model_dir.path.filename().string()) == std::string::npos);
+
+    const Reply non_gguf = post(f.port, "/v1/sonder/plan", R"({"model":"notes.txt"})");
+    check_error(non_gguf, 404, "not_found_error", "not_found");
+
+    // Malformed GGUF inside model_dir returns 400 with host path redacted.
+    const Reply corrupt = post(f.port, "/v1/sonder/plan", R"({"model":"corrupt.gguf"})");
+    check_error(corrupt, 400, "invalid_request_error", "invalid_request");
+    CHECK(corrupt.body.find(model_dir.path.filename().string()) == std::string::npos);
+
+    // Symlink escaping model_dir must be refused.
+    if (symlink_created) {
+        const Reply escaped = post(f.port, "/v1/sonder/plan", R"({"model":"escape.gguf"})");
+        check_error(escaped, 404, "not_found_error", "not_found");
+        CHECK(escaped.body.find(outside_dir.path.filename().string()) == std::string::npos);
+        CHECK(escaped.body.find(model_dir.path.filename().string()) == std::string::npos);
+    }
+
+    // Auth gating on POST /v1/sonder/plan when a bearer token is configured.
+    auto auth_opts = Fixture::defaults();
+    auth_opts.token = "plan-secret-token";
+    Fixture auth_f(auth_opts);
+    const Reply unauth = post(auth_f.port, "/v1/sonder/plan", R"({"model":"missing.gguf"})");
+    check_error(unauth, 401, "authentication_error", "unauthorized");
+    CHECK(unauth.header("www-authenticate") == "Bearer");
+}
+
+TEST_CASE("plan: plans a synthetic GGUF in model_dirs and via bound profile with redacted basename-only paths") {
+    TempModelDir model_dir("sonder-plan-models");
+    TempModelDir bound_dir("sonder-plan-bound");
+    const auto gguf_path = model_dir.path / "synthetic-bonsai.gguf";
+    const auto bound_gguf_path = bound_dir.path / "bound-model.gguf";
+    const auto bound_mmproj_path = bound_dir.path / "bound-mmproj.gguf";
+    const std::string gguf_bytes = make_synthetic_gguf_bytes();
+    write_binary_file(gguf_path, gguf_bytes);
+    write_binary_file(bound_gguf_path, gguf_bytes);
+    write_binary_file(bound_mmproj_path, std::string(4096, '\0'));
+
+    auto o = Fixture::defaults();
+    o.models = {"mock:tiny", "bound-prof"};
+    o.backend.model_dirs = {model_dir.path.string()};
+    srv::ModelProfileBinding binding;
+    binding.model = "bound-prof";
+    binding.load_name = "mock:bound";
+    o.profile_bindings.push_back(std::move(binding));
+    o.backend.llamaserver_args = {
+        "--model", bound_gguf_path.string(), "--alias", "bound-prof", "--mmproj", bound_mmproj_path.string()};
+    Fixture f(o);
+
+    // 1. Plan by clean basename inside model_dirs with explicit tuning overrides.
+    const Reply r = post(
+        f.port, "/v1/sonder/plan",
+        R"({"model":"synthetic-bonsai.gguf","ctx_size":2048,"min_ctx_size":1024,"parallel":2,"vram_headroom_mib":512,"prefer_free_vram":true,"allow_quantized_kv":false,"allow_speculative":false,"allow_moe_cpu_offload":true})");
+    REQUIRE(r.status == 200);
+    check_common_headers(r);
+    CHECK(r.header("content-type") == "application/json");
+    const json::Value doc = r.json();
+
+    CHECK(doc.find("schema")->as_string() == "sonder.inference.plan/1");
+    CHECK(doc.find("sonder")->find("api_version")->as_int() == 1);
+    REQUIRE(doc.find("fits_in_vram") != nullptr);
+    CHECK(doc.find("fits_in_vram")->is_bool());
+    REQUIRE(doc.find("fits_in_host_ram") != nullptr);
+    CHECK(doc.find("fits_in_host_ram")->is_bool());
+
+    const json::Value* prof = doc.find("profile");
+    REQUIRE(prof != nullptr);
+    REQUIRE(prof->is_object());
+    CHECK(prof->find("name")->as_string() == "synthetic-bonsai");
+    CHECK(prof->find("model")->as_string() == "synthetic-bonsai.gguf");
+    CHECK(prof->find("ctx_size")->as_uint() == 2048u);
+    CHECK(prof->find("parallel")->as_uint() == 2u);
+    CHECK(prof->find("cache_type_k")->as_string() == "f16");
+    CHECK(prof->find("cache_type_v")->as_string() == "f16");
+    CHECK(prof->find("speculative") == nullptr);
+
+    const json::Value* est = doc.find("estimate");
+    REQUIRE(est != nullptr);
+    REQUIRE(est->is_object());
+    CHECK(est->find("total_bytes")->is_integer());
+    CHECK(est->find("host_resident_bytes")->is_integer());
+    CHECK((doc.find("fits_in_vram")->as_bool() ? est->find("total_bytes")->as_uint() > 0u
+                                               : est->find("host_resident_bytes")->as_uint() > 0u));
+
+    // Full host filesystem directory path must never appear anywhere in the HTTP body.
+    CHECK(r.body.find(model_dir.path.string()) == std::string::npos);
+    CHECK(r.body.find(model_dir.path.filename().string()) == std::string::npos);
+
+    // 2. Deterministic CPU-only planning via device_hint="cpu" works identically on GPU and headless hosts.
+    const Reply cpu_r =
+        post(f.port, "/v1/sonder/plan", R"({"model":"synthetic-bonsai.gguf","device_hint":"cpu","ctx_size":1024})");
+    REQUIRE(cpu_r.status == 200);
+    const json::Value cpu_doc = cpu_r.json();
+    CHECK(cpu_doc.find("recommended_backend_hint")->as_string() == "cpu");
+    CHECK_FALSE(cpu_doc.find("fits_in_vram")->as_bool());
+    CHECK(cpu_doc.find("profile")->find("model")->as_string() == "synthetic-bonsai.gguf");
+    CHECK(cpu_doc.find("profile")->find("n_gpu_layers")->as_int() == 0);
+    CHECK(cpu_doc.find("estimate")->find("host_resident_bytes")->as_uint() > 0u);
+
+    // 3. Plan by bound profile resolves operator-configured model + mmproj and redacts both to basenames.
+    const Reply prof_r = post(f.port, "/v1/sonder/plan", R"({"profile":"bound-prof","device_hint":"cpu"})");
+    REQUIRE(prof_r.status == 200);
+    const json::Value prof_doc = prof_r.json();
+    CHECK(prof_doc.find("schema")->as_string() == "sonder.inference.plan/1");
+    CHECK(prof_doc.find("profile")->find("name")->as_string() == "bound-prof");
+    CHECK(prof_doc.find("profile")->find("model")->as_string() == "bound-model.gguf");
+    REQUIRE(prof_doc.find("profile")->find("mmproj") != nullptr);
+    CHECK(prof_doc.find("profile")->find("mmproj")->as_string() == "bound-mmproj.gguf");
+    CHECK(prof_r.body.find(bound_dir.path.string()) == std::string::npos);
+    CHECK(prof_r.body.find(bound_dir.path.filename().string()) == std::string::npos);
+
+    // 4. Bound profile whose --mmproj is missing or non-regular omits mmproj rather than emitting a 0-byte phantom.
+    auto o_missing_mm = Fixture::defaults();
+    o_missing_mm.models = {"mock:tiny", "bound-nomm"};
+    srv::ModelProfileBinding binding_nomm;
+    binding_nomm.model = "bound-nomm";
+    binding_nomm.load_name = "mock:bound-nomm";
+    o_missing_mm.profile_bindings.push_back(std::move(binding_nomm));
+    o_missing_mm.backend.llamaserver_args = {
+        "--model", bound_gguf_path.string(), "--alias", "bound-nomm", "--mmproj",
+        (bound_dir.path / "does-not-exist-mmproj.gguf").string()};
+    Fixture f_nomm(o_missing_mm);
+    const Reply nomm_r = post(f_nomm.port, "/v1/sonder/plan", R"({"profile":"bound-nomm","device_hint":"cpu"})");
+    REQUIRE(nomm_r.status == 200);
+    const json::Value nomm_doc = nomm_r.json();
+    CHECK(nomm_doc.find("profile")->find("model")->as_string() == "bound-model.gguf");
+    CHECK(nomm_doc.find("profile")->find("mmproj") == nullptr);
+    CHECK(nomm_r.body.find(bound_dir.path.filename().string()) == std::string::npos);
 }

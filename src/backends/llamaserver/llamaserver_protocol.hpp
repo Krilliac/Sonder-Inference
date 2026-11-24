@@ -40,6 +40,9 @@ struct RequestExtras {
     // enable_thinking / reasoning_effort fields and chat_template_kwargs is
     // never sent. False keeps the llama.cpp chat_template_kwargs form.
     bool generic_thinking = false;
+    // Per-request speculative draft length ("speculative.n_max" in llama-server
+    // tools/server/server-task.cpp). Omitted when unset or in generic mode.
+    std::optional<std::uint32_t> spec_draft_n_max;
 };
 
 // GET /props: the per-slot context (default_generation_settings.n_ctx, or a

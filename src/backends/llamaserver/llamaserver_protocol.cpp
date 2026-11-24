@@ -73,11 +73,13 @@ Status validate_sampling(const SamplingConfig &sampling, std::uint64_t served_ct
 }
 
 namespace {
-void put_extras(json::Object &o, const RequestExtras &extras) {
+void put_extras(json::Object &o, const RequestExtras &extras, bool emit_speculative) {
     if (extras.cache_prompt)
         o.set("cache_prompt", true);
     if (extras.id_slot)
         o.set("id_slot", static_cast<std::int64_t>(*extras.id_slot));
+    if (emit_speculative && extras.spec_draft_n_max)
+        o.set("speculative.n_max", static_cast<std::int64_t>(*extras.spec_draft_n_max));
 }
 } // namespace
 
@@ -93,7 +95,7 @@ json::Value build_completion_body(const std::string &model, const GenerateReques
     put_sampling(o, request.sampling, native_completion);
     if (!grammar.empty())
         o.set("grammar", std::string(grammar));
-    put_extras(o, extras);
+    put_extras(o, extras, native_completion && !extras.generic_thinking);
     return o;
 }
 
@@ -131,7 +133,7 @@ json::Value build_chat_body(const std::string &model, const ChatRequest &request
         o.set("reasoning_budget_tokens", *request.reasoning_budget_tokens);
     if (request.reasoning_budget_message)
         o.set("reasoning_budget_message", *request.reasoning_budget_message);
-    put_extras(o, extras);
+    put_extras(o, extras, !extras.generic_thinking);
     return o;
 }
 

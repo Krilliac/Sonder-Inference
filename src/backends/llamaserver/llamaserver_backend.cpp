@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -11,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "adaptive_speculation.hpp"
 #include "llamaserver_options.hpp"
 #include "llamaserver_protocol.hpp"
 #include "llamaserver_stream.hpp"
@@ -22,12 +24,103 @@
 namespace sonder::inference {
 namespace {
 
+bool contains_code_or_diff_markers(std::string_view text) noexcept {
+    return text.find("```") != std::string_view::npos ||
+           text.find("diff --git") != std::string_view::npos ||
+           text.find("@@ ") != std::string_view::npos;
+}
+
+bool chat_thinking_enabled(const ChatRequest &request) noexcept {
+    if (request.separate_reasoning)
+        return true;
+    if (request.thinking.enable_thinking.has_value())
+        return *request.thinking.enable_thinking;
+    if (request.thinking.reasoning_effort.has_value() && !request.thinking.reasoning_effort->empty() &&
+        *request.thinking.reasoning_effort != "none")
+        return true;
+    return false;
+}
+
+llamaserver::SpeculationWorkload classify_generate_workload(const GenerateRequest &request,
+                                                            std::string_view grammar) noexcept {
+    if (!grammar.empty())
+        return llamaserver::SpeculationWorkload::tool_json;
+    if (contains_code_or_diff_markers(request.prompt))
+        return llamaserver::SpeculationWorkload::code_edit;
+    return llamaserver::SpeculationWorkload::general;
+}
+
+llamaserver::SpeculationWorkload classify_chat_workload(const ChatRequest &request,
+                                                        std::string_view grammar) noexcept {
+    if (!grammar.empty())
+        return llamaserver::SpeculationWorkload::tool_json;
+    if (chat_thinking_enabled(request))
+        return llamaserver::SpeculationWorkload::reasoning;
+    for (auto it = request.messages.rbegin(); it != request.messages.rend(); ++it) {
+        if (it->role == "user") {
+            if (contains_code_or_diff_markers(it->content))
+                return llamaserver::SpeculationWorkload::code_edit;
+            break;
+        }
+    }
+    return llamaserver::SpeculationWorkload::general;
+}
+
+class ProbeGuard {
+  public:
+    ProbeGuard(llamaserver::AdaptiveSpeculationPolicy *policy,
+               llamaserver::SpeculationWorkload workload,
+               bool active,
+               std::uint64_t probe_id) noexcept
+        : policy_(policy), workload_(workload), active_(active), probe_id_(probe_id) {}
+    ~ProbeGuard() noexcept {
+        if (active_ && policy_ != nullptr) {
+            try {
+                policy_->cancel_probe(workload_, probe_id_);
+            } catch (...) {
+            }
+        }
+    }
+    ProbeGuard(const ProbeGuard &) = delete;
+    ProbeGuard &operator=(const ProbeGuard &) = delete;
+    void disarm() noexcept { active_ = false; }
+
+  private:
+    llamaserver::AdaptiveSpeculationPolicy *policy_ = nullptr;
+    llamaserver::SpeculationWorkload workload_ = llamaserver::SpeculationWorkload::general;
+    bool active_ = false;
+    std::uint64_t probe_id_ = 0;
+};
+
+void record_speculation_observation(llamaserver::AdaptiveSpeculationPolicy *policy,
+                                    const GenerateStats &stats,
+                                    llamaserver::SpeculationWorkload workload,
+                                    bool is_probe,
+                                    std::uint64_t probe_id,
+                                    ProbeGuard &probe_guard) {
+    if (policy == nullptr || !stats.backend_timings.has_value())
+        return;
+    auto obs = llamaserver::observation_from_timings(*stats.backend_timings, workload);
+    if (obs.decode_tps <= 0.0 && stats.predicted_tokens_per_second.has_value() &&
+        std::isfinite(*stats.predicted_tokens_per_second) && *stats.predicted_tokens_per_second > 0.0) {
+        obs.decode_tps = *stats.predicted_tokens_per_second;
+    }
+    obs.is_probe = is_probe;
+    obs.probe_id = probe_id;
+    probe_guard.disarm();
+    policy->observe(obs);
+}
+
 class LlamaServerModel;
 class LlamaServerBackendImpl final : public LlamaServerBackend,
                                      public std::enable_shared_from_this<LlamaServerBackendImpl> {
   public:
     explicit LlamaServerBackendImpl(LlamaServerBackendOptions options)
         : options_(std::move(options)), validation_(llamaserver::validate_backend_options(options_)) {
+        if (validation_.ok() && options_.adaptive_speculation.enabled && options_.native_completion) {
+            adaptive_spec_ = std::make_unique<llamaserver::AdaptiveSpeculationPolicy>(
+                llamaserver::to_adaptive_speculation_config(options_.adaptive_speculation));
+        }
         if (validation_.ok() && !options_.warmup.messages_file.empty())
             warmup_ = std::make_shared<llamaserver::PrefixWarmup>(options_);
         if (validation_.ok() && options_.mode == LlamaServerMode::spawn) {
@@ -140,22 +233,29 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         return slot_action(slot, filename, "restore");
     }
     const LlamaServerBackendOptions &options() const { return options_; }
+    llamaserver::AdaptiveSpeculationPolicy *adaptive_speculation() const noexcept { return adaptive_spec_.get(); }
     // Native attach observes the upstream without owning its process. Generic
     // OpenAI attach stays silent unless prefix warm-up was configured.
     std::optional<BackendRuntimeStatus> runtime_status() const override {
         const bool generic_report = options_.stall_guard.generic_progress || !options_.api_key_env.empty();
-        if (!supervisor_ && !attached_monitor_ && !warmup_ && !generic_report)
+        if (!supervisor_ && !attached_monitor_ && !warmup_ && !adaptive_spec_ && !generic_report)
             return std::nullopt;
         auto status = supervisor_       ? supervisor_->runtime_status()
                       : attached_monitor_ ? attached_monitor_->runtime_status()
                                           : BackendRuntimeStatus{};
         if (!options_.api_key_env.empty()) {
             // Name of the variable only; the header value is always redacted.
-            auto diagnostics = status.diagnostics.value_or(json::Object{});
-            diagnostics.set("upstream_auth", json::Object{{"header", "Authorization"},
-                                                          {"api_key_env", options_.api_key_env},
-                                                          {"value", net::redacted_header_value("Authorization", "")}});
-            status.diagnostics = std::move(diagnostics);
+            if (!status.diagnostics)
+                status.diagnostics.emplace();
+            status.diagnostics->set("upstream_auth",
+                                    json::Object{{"header", "Authorization"},
+                                                 {"api_key_env", options_.api_key_env},
+                                                 {"value", net::redacted_header_value("Authorization", "")}});
+        }
+        if (adaptive_spec_) {
+            if (!status.diagnostics)
+                status.diagnostics.emplace();
+            status.diagnostics->set("adaptive_speculation", adaptive_spec_->status_json());
         }
         if (options_.stall_guard.generic_progress) {
             std::lock_guard<std::mutex> lock(stall_mutex_);
@@ -405,6 +505,7 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
     llamaserver::ServerProps props_;
     llamaserver::SlotAffinity slots_;
     std::shared_ptr<llamaserver::PrefixWarmup> warmup_;
+    std::unique_ptr<llamaserver::AdaptiveSpeculationPolicy> adaptive_spec_;
     mutable std::mutex stall_mutex_;
     std::uint64_t stall_events_ = 0;
     BackendWarning stall_warning_;
@@ -424,10 +525,29 @@ class LlamaServerModel final : public BackendModel {
         if (auto status = llamaserver::validate_sampling(request.sampling, props.n_ctx); !status.ok())
             return status;
         const bool native = backend_->options().native_completion;
+        const auto workload = classify_generate_workload(request, backend_->options().grammar);
+        auto *policy = backend_->adaptive_speculation();
+        bool has_spec_decision = false;
+        llamaserver::SpeculationDecision spec_decision;
+        if (policy != nullptr && !cancel.cancelled()) {
+            spec_decision = policy->recommend(workload);
+            has_spec_decision = true;
+        }
+        ProbeGuard probe_guard(policy, workload, has_spec_decision && spec_decision.is_probe,
+                               has_spec_decision ? spec_decision.probe_id : 0u);
         llamaserver::SlotAffinity::Lease lease;
+        auto req_extras = backend_->extras(props, {}, lease);
+        if (has_spec_decision)
+            req_extras.spec_draft_n_max = spec_decision.draft_n_max;
         auto body = llamaserver::build_completion_body(descriptor_.name, request, native, backend_->options().grammar,
-                                                       backend_->extras(props, {}, lease));
-        return backend_->stream(native ? "/completion" : "/v1/completions", body.dump(), cancel, callback, false);
+                                                       req_extras);
+        auto result =
+            backend_->stream(native ? "/completion" : "/v1/completions", body.dump(), cancel, callback, false);
+        if (result.ok() && has_spec_decision) {
+            record_speculation_observation(policy, result.value(), workload, spec_decision.is_probe,
+                                           spec_decision.probe_id, probe_guard);
+        }
+        return result;
     }
     Result<GenerateStats> chat(const ChatRequest &request, const CancellationToken &cancel,
                                const TokenCallback &callback) override {
@@ -438,12 +558,29 @@ class LlamaServerModel final : public BackendModel {
         const auto props = backend_->served_props(cancel);
         if (auto status = llamaserver::validate_sampling(request.sampling, props.n_ctx); !status.ok())
             return status;
+        const auto workload = classify_chat_workload(request, backend_->options().grammar);
+        auto *policy = backend_->adaptive_speculation();
+        bool has_spec_decision = false;
+        llamaserver::SpeculationDecision spec_decision;
+        if (policy != nullptr && !cancel.cancelled()) {
+            spec_decision = policy->recommend(workload);
+            has_spec_decision = true;
+        }
+        ProbeGuard probe_guard(policy, workload, has_spec_decision && spec_decision.is_probe,
+                               has_spec_decision ? spec_decision.probe_id : 0u);
         // The lease keeps the slot marked busy until the stream ends.
         llamaserver::SlotAffinity::Lease lease;
-        auto body = llamaserver::build_chat_body(descriptor_.name, request, backend_->options().grammar,
-                                                 backend_->extras(props, request.session_key, lease));
-        return backend_->stream("/v1/chat/completions", body.dump(), cancel, callback, true,
-                                request.separate_reasoning);
+        auto req_extras = backend_->extras(props, request.session_key, lease);
+        if (has_spec_decision)
+            req_extras.spec_draft_n_max = spec_decision.draft_n_max;
+        auto body = llamaserver::build_chat_body(descriptor_.name, request, backend_->options().grammar, req_extras);
+        auto result = backend_->stream("/v1/chat/completions", body.dump(), cancel, callback, true,
+                                       request.separate_reasoning);
+        if (result.ok() && has_spec_decision) {
+            record_speculation_observation(policy, result.value(), workload, spec_decision.is_probe,
+                                           spec_decision.probe_id, probe_guard);
+        }
+        return result;
     }
 
   private:

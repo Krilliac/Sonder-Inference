@@ -80,6 +80,8 @@ struct SpeculationObservation {
     double decode_tps = 0.0;
     // True when this observation belongs to a cooldown re-probe issued by recommend().
     bool is_probe = false;
+    // Monotonic probe identifier returned by recommend() when is_probe == true (0 = unspecified).
+    std::uint64_t probe_id = 0;
 };
 
 [[nodiscard]] SpeculationObservation observation_from_timings(
@@ -94,6 +96,8 @@ struct SpeculationDecision {
     double rolling_acceptance = 0.0;
     std::size_t sample_count = 0;
     std::string reason;
+    // Monotonic non-zero probe identifier when is_probe == true; 0 otherwise.
+    std::uint64_t probe_id = 0;
 };
 
 class AdaptiveSpeculationPolicy {
@@ -120,8 +124,9 @@ class AdaptiveSpeculationPolicy {
     SpeculationDecision observe(const SpeculationObservation &obs);
 
     // Releases an in-flight probe (e.g. if the probe request was cancelled or
-    // failed before producing timings) and restarts cooldown.
-    void cancel_probe(SpeculationWorkload workload);
+    // failed before producing timings) and restarts cooldown. When `probe_id`
+    // is non-zero, only cancels if it matches the currently active probe.
+    void cancel_probe(SpeculationWorkload workload, std::uint64_t probe_id = 0);
 
     // Observatory telemetry and /health inspection snapshot.
     [[nodiscard]] json::Object status_json() const;
@@ -150,6 +155,7 @@ class AdaptiveSpeculationPolicy {
         std::uint32_t current_draft_n = 0;
         bool paused = false;
         bool probe_in_flight = false;
+        std::uint64_t active_probe_id = 0;
         std::uint32_t cooldown_remaining = 0;
         std::uint64_t total_observations = 0;
         std::uint64_t ignored_observations = 0;
@@ -166,6 +172,7 @@ class AdaptiveSpeculationPolicy {
 
     AdaptiveSpeculationConfig config_;
     mutable std::mutex mutex_;
+    std::uint64_t next_probe_id_ = 0;
     std::array<BucketState, kSpeculationWorkloadCount> buckets_{};
 };
 
