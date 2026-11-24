@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -46,13 +47,86 @@ namespace sonder::inference::net {
 
 // -------------------------------------------------------------- URL utils
 
+namespace {
+
+bool is_http_tchar(char ch) noexcept {
+    const auto c = static_cast<unsigned char>(ch);
+    return c != 0 && c < 0x80 && (std::isalnum(c) != 0 || std::strchr("!#$%&'*+-.^_`|~", ch) != nullptr);
+}
+
+bool is_valid_hostname_char(char ch) noexcept {
+    const auto c = static_cast<unsigned char>(ch);
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-' ||
+           c == '_';
+}
+
+bool is_valid_ipv6_literal(std::string_view host) noexcept {
+    if (host.empty() || host.size() > 64) {
+        return false;
+    }
+    bool saw_colon = false;
+    for (const char ch : host) {
+        const auto c = static_cast<unsigned char>(ch);
+        if (c == ':') {
+            saw_colon = true;
+            continue;
+        }
+        const bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == '.';
+        if (!ok) {
+            return false;
+        }
+    }
+    return saw_colon;
+}
+
+bool is_valid_url_path_or_target(std::string_view s) noexcept {
+    if (s.empty() || s.size() > 8192 || s.front() != '/') {
+        return false;
+    }
+    for (const char ch : s) {
+        const auto c = static_cast<unsigned char>(ch);
+        // Reject C0 controls (CR/LF/NUL/TAB), space, DEL, non-ASCII (incl. C1),
+        // backslashes and fragments.
+        if (c < 0x21 || c >= 0x7f || ch == '\\' || ch == '#') {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
 Result<Url> parse_url(std::string_view text) {
+    if (text.empty() || text.size() > 8192) {
+        return Status(ErrorCode::invalid_argument, "URL must be 1-8192 bytes");
+    }
+    for (const char ch : text) {
+        const auto c = static_cast<unsigned char>(ch);
+        // Reject all C0 controls (CR/LF/NUL/TAB), whitespace, DEL, non-ASCII
+        // (including UTF-8 C1 controls and confusables), backslashes and fragments.
+        if (c < 0x21 || c >= 0x7f) {
+            return Status(ErrorCode::invalid_argument, "URL contains control, whitespace, or non-ASCII characters");
+        }
+        if (ch == '\\' || ch == '#') {
+            return Status(ErrorCode::invalid_argument, "URL contains forbidden backslash or fragment");
+        }
+    }
     Url url;
     const auto scheme_end = text.find("://");
-    if (scheme_end == std::string_view::npos) {
-        return Status(ErrorCode::invalid_argument, "URL must include a scheme: " + std::string(text));
+    if (scheme_end == std::string_view::npos || scheme_end == 0) {
+        return Status(ErrorCode::invalid_argument, "URL must include a scheme");
     }
-    url.scheme = std::string(text.substr(0, scheme_end));
+    const std::string_view raw_scheme = text.substr(0, scheme_end);
+    for (std::size_t i = 0; i < raw_scheme.size(); ++i) {
+        const auto c = static_cast<unsigned char>(raw_scheme[i]);
+        const bool alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        const bool digit = c >= '0' && c <= '9';
+        const bool extra = c == '+' || c == '-' || c == '.';
+        if (i == 0 ? !alpha : !(alpha || digit || extra)) {
+            return Status(ErrorCode::invalid_argument, "URL has invalid scheme");
+        }
+    }
+    url.scheme = std::string(raw_scheme);
     std::transform(url.scheme.begin(), url.scheme.end(), url.scheme.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 #if defined(SONDER_HAS_TLS)
@@ -65,17 +139,27 @@ Result<Url> parse_url(std::string_view text) {
                       "only http:// URLs are supported (got " + url.scheme + "://)" +
                           (url.scheme == "https" ? "; https:// needs a build with SONDER_WITH_TLS=ON" : ""));
     }
-    std::string_view rest = text.substr(scheme_end + 3);
+    const std::string_view rest = text.substr(scheme_end + 3);
     const auto path_start = rest.find('/');
-    std::string_view authority = rest.substr(0, path_start);
+    const std::string_view authority = rest.substr(0, path_start);
     if (path_start != std::string_view::npos) {
-        url.path = std::string(rest.substr(path_start));
+        const std::string_view raw_path = rest.substr(path_start);
+        if (!is_valid_url_path_or_target(raw_path)) {
+            return Status(ErrorCode::invalid_argument, "URL path is invalid");
+        }
+        url.path = std::string(raw_path);
         while (url.path.size() > 1 && url.path.back() == '/') {
             url.path.pop_back();
         }
     }
     if (authority.empty()) {
         return Status(ErrorCode::invalid_argument, "URL has no host");
+    }
+    if (authority.find('@') != std::string_view::npos) {
+        return Status(ErrorCode::invalid_argument, "URL userinfo is not allowed");
+    }
+    if (authority.find('?') != std::string_view::npos) {
+        return Status(ErrorCode::invalid_argument, "URL query before path is invalid");
     }
     std::string_view port_text;
     if (authority.front() == '[') {
@@ -84,6 +168,9 @@ Result<Url> parse_url(std::string_view text) {
             return Status(ErrorCode::invalid_argument, "unterminated IPv6 literal");
         }
         url.host = std::string(authority.substr(1, close - 1));
+        if (!is_valid_ipv6_literal(url.host)) {
+            return Status(ErrorCode::invalid_argument, "invalid IPv6 literal");
+        }
         if (close + 1 < authority.size()) {
             if (authority[close + 1] != ':') {
                 return Status(ErrorCode::invalid_argument, "invalid authority");
@@ -95,6 +182,18 @@ Result<Url> parse_url(std::string_view text) {
         url.host = std::string(authority.substr(0, colon));
         if (colon != std::string_view::npos) {
             port_text = authority.substr(colon + 1);
+        }
+        if (url.host.empty() || url.host.size() > 253) {
+            return Status(ErrorCode::invalid_argument, "URL has invalid host");
+        }
+        // Preserve compatibility for unbracketed loopback "::1:<port>" while
+        // rejecting arbitrary colons or characters in unbracketed hosts.
+        if (url.host != "::1") {
+            for (const char ch : url.host) {
+                if (!is_valid_hostname_char(ch)) {
+                    return Status(ErrorCode::invalid_argument, "URL host contains an invalid character");
+                }
+            }
         }
     }
     if (url.host.empty()) {
@@ -155,8 +254,15 @@ Status ChunkedDecoder::feed(std::string_view data, const std::function<bool(std:
                         state_ = State::done;
                     }
                 } else {
-                    // Chunk size, optionally followed by ";extensions".
-                    const std::string size_text = line_.substr(0, line_.find(';'));
+                    // Chunk size, optionally followed by ";extensions" (with optional
+                    // trailing BWS before ';').
+                    std::string_view size_text(line_);
+                    if (const auto semi = size_text.find(';'); semi != std::string_view::npos) {
+                        size_text = size_text.substr(0, semi);
+                    }
+                    while (!size_text.empty() && (size_text.back() == ' ' || size_text.back() == '\t')) {
+                        size_text.remove_suffix(1);
+                    }
                     if (size_text.empty()) {
                         return Status(ErrorCode::protocol_error, "empty chunk size");
                     }
@@ -166,7 +272,6 @@ Status ChunkedDecoder::feed(std::string_view data, const std::function<bool(std:
                         if (h >= '0' && h <= '9') v = h - '0';
                         else if (h >= 'a' && h <= 'f') v = h - 'a' + 10;
                         else if (h >= 'A' && h <= 'F') v = h - 'A' + 10;
-                        else if (h == ' ' || h == '\t') continue;
                         if (v < 0 || size > (1ull << 40)) {
                             return Status(ErrorCode::protocol_error, "invalid chunk size");
                         }
@@ -334,10 +439,22 @@ Result<Socket> connect_to(const std::string& host, std::uint16_t port, std::chro
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     Status last(ErrorCode::unavailable, "no address for " + host);
     for (addrinfo* ai = list; ai != nullptr; ai = ai->ai_next) {
-        Socket sock(::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol));
+        int sock_type = ai->ai_socktype;
+#if !defined(_WIN32) && defined(SOCK_CLOEXEC)
+        sock_type |= SOCK_CLOEXEC;
+#endif
+        Socket sock(::socket(ai->ai_family, sock_type, ai->ai_protocol));
         if (!sock.valid()) {
             continue;
         }
+#if !defined(_WIN32)
+        {
+            const int fd_flags = ::fcntl(sock.get(), F_GETFD, 0);
+            if (fd_flags >= 0) {
+                ::fcntl(sock.get(), F_SETFD, fd_flags | FD_CLOEXEC);
+            }
+        }
+#endif
         set_nonblocking(sock.get(), true);
         const int rc = ::connect(sock.get(), ai->ai_addr, static_cast<int>(ai->ai_addrlen));
         if (rc != 0 && !would_block(last_socket_error())) {
@@ -450,9 +567,185 @@ std::string redacted_header_value(std::string_view name, std::string_view value)
     return std::string(value);
 }
 
+Status validate_http_request(const HttpRequest& request) {
+    if (request.method.empty() || request.method.size() > 64) {
+        return Status(ErrorCode::invalid_argument, "http method must be 1-64 bytes");
+    }
+    for (const char ch : request.method) {
+        if (!is_http_tchar(ch)) {
+            return Status(ErrorCode::invalid_argument, "http method contains an invalid character");
+        }
+    }
+    if (!is_valid_url_path_or_target(request.target)) {
+        return Status(ErrorCode::invalid_argument, "http request target must be a valid origin-form path starting with '/'");
+    }
+    if (request.host.empty() || request.host.size() > 255) {
+        return Status(ErrorCode::invalid_argument, "http host must be 1-255 bytes");
+    }
+    if (request.host.find(':') != std::string::npos) {
+        if (!is_valid_ipv6_literal(request.host)) {
+            return Status(ErrorCode::invalid_argument, "http IPv6 host literal is invalid");
+        }
+    } else {
+        for (const char ch : request.host) {
+            if (!is_valid_hostname_char(ch)) {
+                return Status(ErrorCode::invalid_argument, "http host contains an invalid character");
+            }
+        }
+    }
+    if (request.port == 0) {
+        return Status(ErrorCode::invalid_argument, "http port must be 1-65535");
+    }
+    if (request.content_type.size() > 1024) {
+        return Status(ErrorCode::invalid_argument, "http Content-Type is too long");
+    }
+    for (const char ch : request.content_type) {
+        const auto c = static_cast<unsigned char>(ch);
+        if ((c < 0x20 && c != '\t') || c >= 0x7f) {
+            return Status(ErrorCode::invalid_argument, "http Content-Type contains a control or non-ASCII character");
+        }
+    }
+    return validate_request_headers(request.headers);
+}
+
+Result<ParsedResponseHead> parse_response_head(std::string_view head_text) {
+    if (head_text.empty()) {
+        return Status(ErrorCode::protocol_error, "empty response head");
+    }
+    const auto reject_bare_ctl = [](std::string_view line) -> bool {
+        for (const char ch : line) {
+            if (ch == '\r' || ch == '\n' || ch == '\0') {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    const auto first_crlf = head_text.find("\r\n");
+    const std::string_view status_line =
+        first_crlf == std::string_view::npos ? head_text : head_text.substr(0, first_crlf);
+    if (reject_bare_ctl(status_line)) {
+        return Status(ErrorCode::protocol_error, "malformed status line: bare CR/LF/NUL");
+    }
+    // RFC 9112 status-line: "HTTP/1." ("0" / "1") SP 3DIGIT [ SP reason-phrase ]
+    if (status_line.size() < 12 ||
+        (status_line.compare(0, 9, "HTTP/1.1 ") != 0 && status_line.compare(0, 9, "HTTP/1.0 ") != 0)) {
+        return Status(ErrorCode::protocol_error, "malformed status line");
+    }
+    int status = 0;
+    for (std::size_t i = 9; i < 12; ++i) {
+        const char ch = status_line[i];
+        if (ch < '0' || ch > '9') {
+            return Status(ErrorCode::protocol_error, "malformed status code");
+        }
+        status = status * 10 + (ch - '0');
+    }
+    if (status < 100 || status > 599) {
+        return Status(ErrorCode::protocol_error, "status code out of range");
+    }
+    if (status_line.size() > 12) {
+        if (status_line[12] != ' ') {
+            return Status(ErrorCode::protocol_error, "malformed status line delimiter");
+        }
+        for (std::size_t i = 13; i < status_line.size(); ++i) {
+            const auto c = static_cast<unsigned char>(status_line[i]);
+            if ((c < 0x20 && c != '\t') || c == 0x7f) {
+                return Status(ErrorCode::protocol_error, "malformed status reason phrase");
+            }
+        }
+    }
+
+    ParsedResponseHead out;
+    out.status = status;
+    bool has_transfer_encoding = false;
+    std::size_t header_count = 0;
+    constexpr std::size_t kMaxResponseHeaders = 256;
+
+    std::size_t pos = first_crlf;
+    while (pos != std::string_view::npos) {
+        pos += 2;
+        const auto next_crlf = head_text.find("\r\n", pos);
+        const std::string_view line =
+            next_crlf == std::string_view::npos ? head_text.substr(pos) : head_text.substr(pos, next_crlf - pos);
+        pos = next_crlf;
+
+        if (++header_count > kMaxResponseHeaders) {
+            return Status(ErrorCode::protocol_error, "too many response headers");
+        }
+        if (line.empty()) {
+            return Status(ErrorCode::protocol_error, "unexpected empty response header line");
+        }
+        if (reject_bare_ctl(line)) {
+            return Status(ErrorCode::protocol_error, "response header contains bare CR/LF/NUL");
+        }
+        if (line.front() == ' ' || line.front() == '\t') {
+            return Status(ErrorCode::protocol_error, "obsolete response header line folding refused");
+        }
+        const auto colon = line.find(':');
+        if (colon == std::string_view::npos || colon == 0) {
+            return Status(ErrorCode::protocol_error, "malformed response header: missing colon or empty name");
+        }
+        const std::string_view raw_name = line.substr(0, colon);
+        for (const char ch : raw_name) {
+            if (!is_http_tchar(ch)) {
+                return Status(ErrorCode::protocol_error, "response header name contains invalid character");
+            }
+        }
+        std::string_view value = line.substr(colon + 1);
+        for (const char ch : value) {
+            const auto c = static_cast<unsigned char>(ch);
+            if ((c < 0x20 && c != '\t') || c == 0x7f) {
+                return Status(ErrorCode::protocol_error, "response header value contains control character");
+            }
+        }
+        while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+            value.remove_prefix(1);
+        }
+        while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+            value.remove_suffix(1);
+        }
+
+        const std::string key = lower(std::string(raw_name));
+        if (key == "transfer-encoding") {
+            if (has_transfer_encoding) {
+                return Status(ErrorCode::protocol_error, "duplicate Transfer-Encoding response header");
+            }
+            has_transfer_encoding = true;
+            if (lower(std::string(value)) != "chunked") {
+                return Status(ErrorCode::protocol_error, "unsupported Transfer-Encoding response header");
+            }
+            out.chunked = true;
+        } else if (key == "content-length") {
+            if (out.has_length) {
+                return Status(ErrorCode::protocol_error, "duplicate Content-Length response header");
+            }
+            if (value.empty()) {
+                return Status(ErrorCode::protocol_error, "empty Content-Length response header");
+            }
+            for (const char ch : value) {
+                if (ch < '0' || ch > '9') {
+                    return Status(ErrorCode::protocol_error, "non-decimal Content-Length response header");
+                }
+            }
+            std::uint64_t parsed_len = 0;
+            const auto fc = std::from_chars(value.data(), value.data() + value.size(), parsed_len, 10);
+            if (fc.ec != std::errc{} || fc.ptr != value.data() + value.size()) {
+                return Status(ErrorCode::protocol_error, "Content-Length overflow or invalid format");
+            }
+            out.has_length = true;
+            out.content_length = parsed_len;
+        }
+    }
+
+    if (has_transfer_encoding && out.has_length) {
+        return Status(ErrorCode::protocol_error, "conflicting Transfer-Encoding and Content-Length response headers");
+    }
+    return out;
+}
+
 Result<HttpResponseInfo> http_request(const HttpRequest& request, const std::function<bool(std::string_view)>& on_body,
                                       const CancellationToken& cancel) {
-    if (auto st = validate_request_headers(request.headers); !st.ok()) {
+    if (auto st = validate_http_request(request); !st.ok()) {
         return st;
     }
     if ((request.first_progress_timeout.count() > 0 || request.progress_stall_timeout.count() > 0) &&
@@ -585,6 +878,15 @@ Result<HttpResponseInfo> http_request(const HttpRequest& request, const std::fun
             }
             return st;
         }
+        if (has_length) {
+            if (body_received >= content_length) {
+                return Status::success();
+            }
+            const std::uint64_t remaining = content_length - body_received;
+            if (static_cast<std::uint64_t>(data.size()) > remaining) {
+                data = data.substr(0, static_cast<std::size_t>(remaining));
+            }
+        }
         body_received += data.size();
         if (on_body && !on_body(data)) {
             info.stopped_by_callback = true;
@@ -671,35 +973,14 @@ Result<HttpResponseInfo> http_request(const HttpRequest& request, const std::fun
             headers_done = true;
             const std::string head_text = header_buf.substr(0, end);
             const std::string rest = header_buf.substr(end + 4);
-            // Status line: HTTP/1.1 200 OK
-            const auto sp = head_text.find(' ');
-            if (head_text.rfind("HTTP/", 0) != 0 || sp == std::string::npos) {
-                return Status(ErrorCode::protocol_error, "malformed status line");
+            auto parsed_head = parse_response_head(head_text);
+            if (!parsed_head.ok()) {
+                return parsed_head.status();
             }
-            info.status = std::atoi(head_text.c_str() + sp + 1);
-            std::size_t line_start = head_text.find("\r\n");
-            while (line_start != std::string::npos) {
-                line_start += 2;
-                const auto line_end = head_text.find("\r\n", line_start);
-                const std::string line = head_text.substr(line_start, line_end == std::string::npos ? std::string::npos
-                                                                                                     : line_end - line_start);
-                const auto colon = line.find(':');
-                if (colon != std::string::npos) {
-                    const std::string key = lower(line.substr(0, colon));
-                    std::string value = line.substr(colon + 1);
-                    value.erase(0, value.find_first_not_of(" \t"));
-                    if (key == "transfer-encoding" && lower(value).find("chunked") != std::string::npos) {
-                        chunked = true;
-                    } else if (key == "content-length") {
-                        has_length = true;
-                        content_length = std::strtoull(value.c_str(), nullptr, 10);
-                    }
-                }
-                line_start = line_end;
-            }
-            if (chunked) {
-                has_length = false;
-            }
+            info.status = parsed_head->status;
+            chunked = parsed_head->chunked;
+            has_length = parsed_head->has_length;
+            content_length = parsed_head->content_length;
             if (request.on_status) {
                 request.on_status(info.status);
             }

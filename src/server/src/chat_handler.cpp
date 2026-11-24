@@ -37,6 +37,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     // Anthropic renders it as a thinking block, OpenAI as reasoning_content
     // (llama-server's convention); neither adds a field when it is empty.
     ro.separate_reasoning = true;
+    ro.retain_text = !job.stream;
     std::vector<std::string> warnings = apply_thinking_pins(ex.options, ro.thinking);
     reasoning_budget::apply(job, corr, ex.options, backend, ro, warnings);
     ro.priority_class = priority;
@@ -190,9 +191,13 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
         return send_event(chunk_object(json::Object{{"role", "assistant"}, {"content", ""}}, nullptr));
     };
 
+    bool saw_text = false;
     TokenCallback on_chunk;
     if (job.stream) {
         on_chunk = [&](const TokenChunk& chunk) {
+            if (!chunk.text.empty()) {
+                saw_text = true;
+            }
             const auto openai_delta = [&] {
                 json::Object delta;
                 if (!chunk.text.empty() || chunk.reasoning.empty()) delta.set("content", std::string(chunk.text));
@@ -239,7 +244,8 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
         return;
     }
     const GenerationResult& r = result.value();
-    if (r.text.empty() && std::string_view(finish_reason(r)) == "length") warnings.emplace_back("empty_content_at_length");
+    const bool empty_text = job.stream ? !saw_text : r.text.empty();
+    if (empty_text && std::string_view(finish_reason(r)) == "length") warnings.emplace_back("empty_content_at_length");
     json::Object meta{
         {"api_version", kApiVersion},  {"request_id", r.request_id},
         {"session_id", session->id()}, {"backend", backend},

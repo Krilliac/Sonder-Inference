@@ -322,7 +322,8 @@ std::optional<std::uint64_t> parse_deadline_ms(const json::Value& value) noexcep
 }
 
 std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body_text) {
-    auto parsed = json::parse(body_text);
+    // Cap parsed value nodes on ingress requests to limit allocation/CPU amplification (M-17).
+    auto parsed = json::parse(body_text, json::ParseLimits{128, 65536});
     if (!parsed.ok()) {
         return bad("invalid_json", "request body is not valid JSON: " + parsed.status().message());
     }

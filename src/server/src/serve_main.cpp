@@ -26,6 +26,7 @@
 #  include <unistd.h>
 #endif
 
+#include "backends/llamaserver/env_policy.hpp"
 #include "cli/cli_spec.hpp"
 #include "sonder/inference/backend_setup.hpp"
 #include "sonder/inference/json.hpp"
@@ -678,6 +679,15 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
         if (!o.backend.llamaserver_args.empty()) {
             return usage_error("launch profile '" + profile->name + "': move the llamaserver config 'args' into the "
                                "profile's typed fields or extra_args");
+        }
+        for (const auto& [env_key, env_val] : o.backend.llamaserver_environment) {
+            (void)env_val;
+            if (!llamaserver::is_allowed_profile_env_override(env_key)) {
+                return usage_error("launch profile '" + profile->name +
+                                   "': llamaserver config env override '" + env_key +
+                                   "' is not permitted with --profile (only GPU/runtime tuning overrides such as "
+                                   "CUDA_*, GGML_*, VK_*, ROCR_*, HSA_*, HIP_*, OMP_* are allowed)");
+            }
         }
         auto argv = llamaserver_arguments(*profile);
         if (!argv.ok()) return usage_error(argv.status().message());

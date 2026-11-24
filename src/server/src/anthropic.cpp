@@ -120,7 +120,8 @@ std::string frame(std::string_view event, const json::Object& value) {
 } // namespace
 
 std::variant<ChatJob, ApiError> parse_messages_request(std::string_view body_text) {
-    auto parsed = json::parse(body_text);
+    // Cap parsed value nodes on ingress requests to limit allocation/CPU amplification (M-17).
+    auto parsed = json::parse(body_text, json::ParseLimits{128, 65536});
     if (!parsed.ok())
         return bad("invalid_json", "request body is not valid JSON: " + parsed.status().message());
     if (!parsed.value().is_object())

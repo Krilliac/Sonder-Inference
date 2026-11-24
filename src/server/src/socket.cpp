@@ -50,6 +50,12 @@ void set_nonblocking(native_socket s) {
     const int flags = fcntl(s, F_GETFL, 0);
     fcntl(s, F_SETFL, flags | O_NONBLOCK);
 }
+void set_cloexec(native_socket s) {
+    const int flags = fcntl(s, F_GETFD, 0);
+    if (flags >= 0) {
+        fcntl(s, F_SETFD, flags | FD_CLOEXEC);
+    }
+}
 #endif
 
 void no_sigpipe(native_socket s) {
@@ -166,10 +172,17 @@ Result<Listener> listen_tcp(const std::string& host, std::uint16_t port, bool& i
     }
     Status last(ErrorCode::unavailable, "no usable address for " + host);
     for (addrinfo* ai = list; ai != nullptr; ai = ai->ai_next) {
-        Socket sock(static_cast<native_socket>(::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol)));
+        int sock_type = ai->ai_socktype;
+#if !defined(_WIN32) && defined(SOCK_CLOEXEC)
+        sock_type |= SOCK_CLOEXEC;
+#endif
+        Socket sock(static_cast<native_socket>(::socket(ai->ai_family, sock_type, ai->ai_protocol)));
         if (!sock.valid()) {
             continue;
         }
+#if !defined(_WIN32)
+        set_cloexec(sock.get());
+#endif
         int one = 1;
 #if defined(_WIN32)
         setsockopt(raw(sock.get()), SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&one),
@@ -240,7 +253,11 @@ WaitResult wait_socket(native_socket s, bool for_write, std::chrono::millisecond
 Accepted accept_client(const Socket& listener) {
     sockaddr_storage addr{};
     socklen_t len = sizeof(addr);
+#if !defined(_WIN32) && (defined(__linux__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)) && defined(SOCK_CLOEXEC) && defined(SOCK_NONBLOCK)
+    const auto s = ::accept4(raw(listener.get()), reinterpret_cast<sockaddr*>(&addr), &len, SOCK_CLOEXEC | SOCK_NONBLOCK);
+#else
     const auto s = ::accept(raw(listener.get()), reinterpret_cast<sockaddr*>(&addr), &len);
+#endif
     Accepted out;
     Socket client(static_cast<native_socket>(s));
     if (!client.valid()) {
@@ -267,6 +284,9 @@ Accepted accept_client(const Socket& listener) {
 #endif
         return out;
     }
+#if !defined(_WIN32)
+    set_cloexec(client.get());
+#endif
     set_nonblocking(client.get());
     no_sigpipe(client.get());
     int one = 1;
@@ -410,10 +430,17 @@ Result<Socket> connect_tcp(const std::string& host, std::uint16_t port, std::chr
     }
     Status last(ErrorCode::unavailable, "cannot connect to " + host + ":" + port_text);
     for (addrinfo* ai = list; ai != nullptr; ai = ai->ai_next) {
-        Socket sock(static_cast<native_socket>(::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol)));
+        int sock_type = ai->ai_socktype;
+#if !defined(_WIN32) && defined(SOCK_CLOEXEC)
+        sock_type |= SOCK_CLOEXEC;
+#endif
+        Socket sock(static_cast<native_socket>(::socket(ai->ai_family, sock_type, ai->ai_protocol)));
         if (!sock.valid()) {
             continue;
         }
+#if !defined(_WIN32)
+        set_cloexec(sock.get());
+#endif
         set_nonblocking(sock.get());
         no_sigpipe(sock.get());
         const int rc = ::connect(raw(sock.get()), ai->ai_addr, static_cast<int>(ai->ai_addrlen));

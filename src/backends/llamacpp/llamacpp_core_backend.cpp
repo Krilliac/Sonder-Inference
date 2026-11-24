@@ -94,26 +94,62 @@ public:
         }
         // One llama_context per model: serialize requests on it.
         std::lock_guard<std::mutex> lock(mutex_);
-        return run(request.prompt, /*templated=*/false, request.sampling, cancel, on_chunk);
+        std::vector<lc::Token> prompt_tokens;
+        if (lc::Status s = runtime_.Tokenize(request.prompt, /*add_special=*/true, prompt_tokens, /*parse_special=*/false);
+            !s.ok()) {
+            return ToStatus(s);
+        }
+        return run_tokens(std::move(prompt_tokens), request.sampling, cancel, on_chunk);
     }
 
     // Chat through the GGUF chat template (llama_chat_apply_template). Models
     // without a template, or with one llama.cpp does not recognise, use the
-    // generic BackendModel::chat() prompt format instead.
+    // generic BackendModel::chat() prompt format instead. Template scaffolding
+    // is tokenized with parse_special=true while untrusted message content is
+    // strictly tokenized with parse_special=false (G0028).
     Result<GenerateStats> chat(const ChatRequest& request, const CancellationToken& cancel,
                                const TokenCallback& on_chunk) override {
         if (Status v = validate_chat_messages(request.messages); !v.ok()) return v;
         if (Status v = validate(request.sampling); !v.ok()) return v;
-        std::vector<lc::ChatTurn> turns;
-        turns.reserve(request.messages.size());
-        for (const auto& m : request.messages) turns.push_back(lc::ChatTurn{m.role, m.content});
-        std::unique_lock<std::mutex> lock(mutex_);
-        std::string prompt;
-        if (!runtime_.ApplyChatTemplate(turns, /*add_assistant=*/true, prompt).ok()) {
-            lock.unlock();
-            return BackendModel::chat(request, cancel, on_chunk);
+        if (request.sampling.num_ctx > 0 && desc_.context_length > 0 &&
+            static_cast<std::uint64_t>(request.sampling.num_ctx) > desc_.context_length) {
+            return Status(ErrorCode::invalid_argument,
+                          "num_ctx " + std::to_string(request.sampling.num_ctx) +
+                              " exceeds the loaded llama.cpp context (" + std::to_string(desc_.context_length) +
+                              "); reload with a larger context_length");
         }
-        return run(prompt, /*templated=*/true, request.sampling, cancel, on_chunk);
+        std::unique_lock<std::mutex> lock(mutex_);
+        bool template_unsupported = false;
+        auto segments = build_chat_template_segments(
+            request.messages,
+            [&](const std::vector<ChatMessage>& placeholder_msgs) -> Result<std::string> {
+                std::vector<lc::ChatTurn> turns;
+                turns.reserve(placeholder_msgs.size());
+                for (const auto& m : placeholder_msgs) turns.push_back(lc::ChatTurn{m.role, m.content});
+                std::string rendered;
+                const lc::Status s = runtime_.ApplyChatTemplate(turns, /*add_assistant=*/true, rendered);
+                if (!s.ok()) {
+                    template_unsupported = true;
+                    return ToStatus(s);
+                }
+                return rendered;
+            });
+        if (!segments.ok()) {
+            if (template_unsupported) {
+                lock.unlock();
+                return BackendModel::chat(request, cancel, on_chunk);
+            }
+            return segments.status();
+        }
+        std::vector<lc::Token> prompt_tokens;
+        const Status tok_status = tokenize_chat_segments(
+            segments.value(),
+            [&](std::string_view piece, bool add_special, bool parse_special, std::vector<TokenId>& out) -> Status {
+                return ToStatus(runtime_.Tokenize(piece, add_special, out, parse_special));
+            },
+            prompt_tokens);
+        if (!tok_status.ok()) return tok_status;
+        return run_tokens(std::move(prompt_tokens), request.sampling, cancel, on_chunk);
     }
 
     [[nodiscard]] bool has_native_chat() const override {
@@ -123,17 +159,14 @@ public:
     }
 
 private:
-    // Caller holds mutex_. `templated` prompts come from the model's chat
-    // template and contain control-token text that must parse as specials.
-    Result<GenerateStats> run(const std::string& prompt, bool templated, const SamplingConfig& sampling,
-                              const CancellationToken& cancel, const TokenCallback& on_chunk) {
+    // Caller holds mutex_. Prompt tokens are already produced across the
+    // trusted/untrusted tokenization boundary.
+    Result<GenerateStats> run_tokens(std::vector<lc::Token> prompt_tokens, const SamplingConfig& sampling,
+                                     const CancellationToken& cancel, const TokenCallback& on_chunk) {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
 
         lc::GenerateRequest req;
-        if (lc::Status s = runtime_.Tokenize(prompt, /*add_special=*/true, req.prompt, /*parse_special=*/templated);
-            !s.ok()) {
-            return ToStatus(s);
-        }
+        req.prompt = std::move(prompt_tokens);
         if (req.prompt.empty()) return Status(ErrorCode::invalid_argument, "prompt produced no tokens");
         req.max_new_tokens = sampling.max_tokens;
         req.sampling = ToLlamaSampling(sampling);

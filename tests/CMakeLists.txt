@@ -22,7 +22,12 @@ sonder_add_module_tests(core
     test_cli_repl.cpp
     test_priority_runtime.cpp
     test_device_memory.cpp
+    test_http_client.cpp
 )
+
+if(WIN32 AND TARGET sonder_core_tests)
+    target_link_libraries(sonder_core_tests PRIVATE ws2_32)
+endif()
 
 # Proves sonder_inference.h is valid C and the ABI is usable from C.
 add_executable(sonder_c_abi_smoke c_abi_smoke.c)

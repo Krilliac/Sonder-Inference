@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <limits>
 #include <string_view>
 #include <thread>
@@ -122,6 +123,10 @@ class WindowsLauncher final : public ProcessLauncher {
         const auto executable = widen(spec.executable);
         if (executable.empty())
             return Status(ErrorCode::invalid_argument, "executable is not valid UTF-8 or is too long");
+        const std::filesystem::path exe_path(executable);
+        if (!exe_path.is_absolute())
+            return Status(ErrorCode::invalid_argument, "executable path must be absolute");
+        const std::wstring workdir = exe_path.parent_path().wstring();
         std::wstring command = quote_windows(spec.executable);
         for (const auto &arg : spec.arguments) {
             if (contains_nul(arg))
@@ -143,8 +148,8 @@ class WindowsLauncher final : public ProcessLauncher {
         if (!CreateProcessW(executable.c_str(), mutable_command.data(), nullptr, nullptr, extra.redirect ? TRUE : FALSE,
                             CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW |
                                 (extra.redirect ? EXTENDED_STARTUPINFO_PRESENT : 0),
-                            extra.environment.empty() ? nullptr : extra.environment.data(),
-                            nullptr, &extra.startup.StartupInfo, &pi)) {
+                            extra.has_environment ? extra.environment.data() : nullptr,
+                            workdir.empty() ? nullptr : workdir.c_str(), &extra.startup.StartupInfo, &pi)) {
             return Status(ErrorCode::unavailable, "CreateProcessW failed");
         }
         HANDLE job = CreateJobObjectW(nullptr, nullptr);
@@ -332,6 +337,8 @@ class PosixLauncher final : public ProcessLauncher {
     Result<std::unique_ptr<Process>> start(const ProcessSpec &spec) override {
         if (spec.executable.empty() || spec.port == 0 || contains_nul(spec.executable))
             return Status(ErrorCode::invalid_argument, "invalid process spec");
+        if (spec.executable.front() != '/')
+            return Status(ErrorCode::invalid_argument, "executable path must be absolute");
         std::vector<std::string> args;
         args.reserve(spec.arguments.size() + 1);
         args.push_back(spec.executable);
@@ -401,17 +408,23 @@ class PosixLauncher final : public ProcessLauncher {
         posix_spawnattr_t attr{};
         if (posix_spawnattr_init(&attr) != 0)
             return Status(ErrorCode::io_error, "posix_spawnattr_init failed");
-        if (posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP) != 0 ||
+        short spawn_flags = POSIX_SPAWN_SETPGROUP;
+#if defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
+        spawn_flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
+#endif
+        if (posix_spawnattr_setflags(&attr, spawn_flags) != 0 ||
             posix_spawnattr_setpgroup(&attr, watcher) != 0) {
             posix_spawnattr_destroy(&attr);
             return Status(ErrorCode::io_error, "posix_spawn process group configuration failed");
         }
         pid_t pid = -1;
-        const int rc = posix_spawnp(&pid, spec.executable.c_str(), extra.redirect ? &extra.actions : nullptr,
-                                    &attr, argv.data(), extra.envp.empty() ? environ : extra.envp.data());
+        // Always spawn by explicit absolute path (never PATH-searching posix_spawnp)
+        // with the explicitly allowlisted environment block (H-12 / L-07).
+        const int rc = posix_spawn(&pid, spec.executable.c_str(), extra.has_actions ? &extra.actions : nullptr,
+                                   &attr, argv.data(), extra.has_environment ? extra.envp.data() : environ);
         posix_spawnattr_destroy(&attr);
         if (rc != 0)
-            return Status(ErrorCode::unavailable, "posix_spawnp failed");
+            return Status(ErrorCode::unavailable, "posix_spawn failed");
         process->adopt_server(pid);
         // The server now holds the group open. Move the watcher out so it
         // survives SIGTERM during normal shutdown and does not keep an empty

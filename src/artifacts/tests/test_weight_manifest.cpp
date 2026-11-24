@@ -712,3 +712,49 @@ TEST_CASE("weights: cancellation stops hashing") {
     CHECK_FALSE(r.ok());
     CHECK(r.status().code() == sonder::inference::ErrorCode::cancelled);
 }
+
+TEST_CASE("weights: hash_file refuses directories and links directly") {
+    TempDir t;
+    const fs::path sub = t.path / "sub";
+    fs::create_directories(sub);
+    auto dir_res = w::hash_file(sub, "sub", {});
+    CHECK_FALSE(dir_res.ok());
+    CHECK(dir_res.status().code() == sonder::inference::ErrorCode::invalid_argument);
+
+    write_file(t.path / "target.bin", "secret");
+    std::error_code ec;
+    fs::create_symlink(t.path / "target.bin", t.path / "link.bin", ec);
+    if (!ec) {
+        auto link_res = w::hash_file(t.path / "link.bin", "link.bin", {});
+        CHECK_FALSE(link_res.ok());
+        CHECK(link_res.status().code() == sonder::inference::ErrorCode::invalid_argument);
+    }
+}
+
+TEST_CASE("weights: atomic manifest publish preserves hard-linked previous manifest and leaves no temp files") {
+    TempDir t;
+    const fs::path model = t.path / "model";
+    make_model(model);
+    const fs::path manifest = t.path / "weights.manifest.json";
+    REQUIRE(run_cli({"manifest", model.string(), "-o", manifest.string(), "--quiet"}).rc == 0);
+    const std::string original = slurp(manifest);
+
+    const fs::path pinned = t.path / "pinned-old.json";
+    std::error_code ec;
+    fs::create_hard_link(manifest, pinned, ec);
+    REQUIRE_MESSAGE(!ec, ec.message());
+
+    // Mutate a shard and regenerate the manifest; atomic publish replaces the
+    // manifest directory entry without overwriting the hard-linked old inode.
+    write_file(model / "empty.bin", "changed");
+    REQUIRE(run_cli({"manifest", model.string(), "-o", manifest.string(), "--quiet"}).rc == 0);
+    const std::string updated = slurp(manifest);
+    CHECK(updated != original);
+    CHECK(slurp(pinned) == original);
+
+    // No leftover .sonder-manifest-*.tmp sibling files.
+    for (const auto& entry : fs::directory_iterator(t.path)) {
+        const std::string name = entry.path().filename().string();
+        CHECK(name.rfind(".sonder-manifest-", 0) != 0);
+    }
+}

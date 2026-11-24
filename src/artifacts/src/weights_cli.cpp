@@ -1,7 +1,10 @@
 // `sonder-infer weights manifest|verify` (docs/integration/weight-manifest.md).
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <iterator>
@@ -9,6 +12,20 @@
 #include <random>
 
 #include "sonder/inference/weight_manifest.hpp"
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace sonder::inference::weights {
 
@@ -167,22 +184,244 @@ std::string parse_flags(const std::vector<std::string>& args, bool is_manifest, 
 }
 
 // Refuses to write over anything that is not a regular file holding a weight manifest, so a typo or a
-// link cannot destroy a weight shard. Not atomic: a writer racing the tool can still swap the target
-// between this check and the open (TOCTOU).
-Status check_output_target(const fs::path& out, const std::string& shown) {
-    std::error_code ec;
-    const fs::file_status st = fs::symlink_status(out, ec);
-    if (st.type() == fs::file_type::not_found) return Status::success();
-    if (ec) return Status(ErrorCode::io_error, "cannot stat '" + printable_path(shown) + "': " + ec.message());
-    if (st.type() != fs::file_type::regular) {
+// link cannot destroy a weight shard. Opens the existing file handle without following symlinks or
+// reparse points and inspects + reads from that same handle.
+Status check_output_target(const fs::path& out, const std::string& shown, bool& existed_as_manifest) {
+    existed_as_manifest = false;
+    std::string content;
+#if defined(_WIN32)
+    HANDLE h = ::CreateFileW(out.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                             OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD err = ::GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) return Status::success();
+        if (err == ERROR_ACCESS_DENIED) {
+            const DWORD attrs = ::GetFileAttributesW(out.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES &&
+                ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 || (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)) {
+                return Status(ErrorCode::invalid_argument,
+                              "refusing to overwrite '" + printable_path(shown) + "': not a regular file");
+            }
+        }
+        return Status(ErrorCode::io_error,
+                      "cannot stat '" + printable_path(shown) + "': win32 error " + std::to_string(err));
+    }
+    struct Guard {
+        HANDLE h;
+        ~Guard() { ::CloseHandle(h); }
+    } guard{h};
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (::GetFileType(h) != FILE_TYPE_DISK || !::GetFileInformationByHandle(h, &info) ||
+        (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+        (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
         return Status(ErrorCode::invalid_argument,
                       "refusing to overwrite '" + printable_path(shown) + "': not a regular file");
     }
-    auto text = read_text(out, shown);
-    if (!text.ok() || !parse_manifest(text.value()).ok()) {
+    const std::uint64_t size =
+        (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | static_cast<std::uint64_t>(info.nFileSizeLow);
+    if (size > kMaxJsonBytes) {
         return Status(ErrorCode::invalid_argument, "refusing to overwrite '" + printable_path(shown) +
                                                        "': it exists and is not a weight manifest (remove it first)");
     }
+    content.reserve(static_cast<std::size_t>(size));
+    char buf[16384];
+    while (true) {
+        DWORD got = 0;
+        if (!::ReadFile(h, buf, sizeof(buf), &got, nullptr)) {
+            return Status(ErrorCode::invalid_argument, "refusing to overwrite '" + printable_path(shown) +
+                                                           "': it exists and is not a weight manifest (remove it first)");
+        }
+        if (got == 0) break;
+        if (content.size() + got > kMaxJsonBytes) {
+            return Status(ErrorCode::invalid_argument, "refusing to overwrite '" + printable_path(shown) +
+                                                           "': it exists and is not a weight manifest (remove it first)");
+        }
+        content.append(buf, got);
+    }
+#else
+    const int fd = ::open(out.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) {
+        const int err = errno;
+        if (err == ENOENT) return Status::success();
+        if (err == ELOOP || err == EISDIR || err == ENXIO) {
+            return Status(ErrorCode::invalid_argument,
+                          "refusing to overwrite '" + printable_path(shown) + "': not a regular file");
+        }
+        return Status(ErrorCode::io_error,
+                      "cannot stat '" + printable_path(shown) + "': " + std::strerror(err));
+    }
+    struct Guard {
+        int fd;
+        ~Guard() { ::close(fd); }
+    } guard{fd};
+    struct stat st {};
+    if (::fstat(fd, &st) != 0) {
+        return Status(ErrorCode::io_error, "cannot stat '" + printable_path(shown) + "': " + std::strerror(errno));
+    }
+    if (!S_ISREG(st.st_mode)) {
+        return Status(ErrorCode::invalid_argument,
+                      "refusing to overwrite '" + printable_path(shown) + "': not a regular file");
+    }
+    if (st.st_size < 0 || static_cast<std::uint64_t>(st.st_size) > kMaxJsonBytes) {
+        return Status(ErrorCode::invalid_argument, "refusing to overwrite '" + printable_path(shown) +
+                                                       "': it exists and is not a weight manifest (remove it first)");
+    }
+    content.reserve(static_cast<std::size_t>(st.st_size));
+    char buf[16384];
+    while (true) {
+        const ssize_t got = ::read(fd, buf, sizeof(buf));
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            return Status(ErrorCode::invalid_argument, "refusing to overwrite '" + printable_path(shown) +
+                                                           "': it exists and is not a weight manifest (remove it first)");
+        }
+        if (got == 0) break;
+        if (content.size() + static_cast<std::size_t>(got) > kMaxJsonBytes) {
+            return Status(ErrorCode::invalid_argument, "refusing to overwrite '" + printable_path(shown) +
+                                                           "': it exists and is not a weight manifest (remove it first)");
+        }
+        content.append(buf, static_cast<std::size_t>(got));
+    }
+#endif
+    if (!parse_manifest(content).ok()) {
+        return Status(ErrorCode::invalid_argument, "refusing to overwrite '" + printable_path(shown) +
+                                                       "': it exists and is not a weight manifest (remove it first)");
+    }
+    existed_as_manifest = true;
+    return Status::success();
+}
+
+// Writes `payload` to an exclusively created sibling temporary file and publishes it to `out_path`
+// atomically, never following a symlink and never truncating an existing hard-linked target inode.
+Status write_manifest_atomically(const fs::path& out_path, const std::string& shown, const std::string& payload) {
+    bool existed_as_manifest = false;
+    if (Status s = check_output_target(out_path, shown, existed_as_manifest); !s.ok()) return s;
+
+    fs::path parent = out_path.parent_path();
+    if (parent.empty()) parent = fs::path(".");
+    std::random_device rd;
+    fs::path tmp_path;
+
+#if defined(_WIN32)
+    HANDLE h = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        const std::uint64_t r = (static_cast<std::uint64_t>(rd()) << 32) ^ static_cast<std::uint64_t>(rd());
+        char suffix[48];
+        std::snprintf(suffix, sizeof(suffix), ".sonder-manifest-%016llx.tmp", static_cast<unsigned long long>(r));
+        tmp_path = parent / suffix;
+        h = ::CreateFileW(tmp_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        if (h != INVALID_HANDLE_VALUE) break;
+        if (::GetLastError() != ERROR_FILE_EXISTS) {
+            return Status(ErrorCode::io_error, "cannot write '" + printable_path(shown) + "'");
+        }
+    }
+    if (h == INVALID_HANDLE_VALUE) {
+        return Status(ErrorCode::io_error, "cannot create temporary file for '" + printable_path(shown) + "'");
+    }
+    auto cleanup_tmp = [&] {
+        std::error_code ec;
+        fs::remove(tmp_path, ec);
+    };
+    std::size_t off = 0;
+    bool write_ok = true;
+    while (off < payload.size()) {
+        DWORD wrote = 0;
+        const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(payload.size() - off, 0x40000000u));
+        if (!::WriteFile(h, payload.data() + off, chunk, &wrote, nullptr) || wrote == 0) {
+            write_ok = false;
+            break;
+        }
+        off += wrote;
+    }
+    if (write_ok) {
+        write_ok = ::FlushFileBuffers(h) != 0;
+    }
+    ::CloseHandle(h);
+    if (!write_ok) {
+        cleanup_tmp();
+        return Status(ErrorCode::io_error, "write failed for '" + printable_path(shown) + "'");
+    }
+
+    if (Status s = check_output_target(out_path, shown, existed_as_manifest); !s.ok()) {
+        cleanup_tmp();
+        return s;
+    }
+    const DWORD flags = MOVEFILE_WRITE_THROUGH | (existed_as_manifest ? MOVEFILE_REPLACE_EXISTING : 0u);
+    if (!::MoveFileExW(tmp_path.c_str(), out_path.c_str(), flags)) {
+        cleanup_tmp();
+        return Status(ErrorCode::io_error, "cannot publish '" + printable_path(shown) + "'");
+    }
+#else
+    int fd = -1;
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        const std::uint64_t r = (static_cast<std::uint64_t>(rd()) << 32) ^ static_cast<std::uint64_t>(rd());
+        char suffix[48];
+        std::snprintf(suffix, sizeof(suffix), ".sonder-manifest-%016llx.tmp", static_cast<unsigned long long>(r));
+        tmp_path = parent / suffix;
+        fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+        if (fd >= 0) break;
+        if (errno != EEXIST) {
+            return Status(ErrorCode::io_error, "cannot write '" + printable_path(shown) + "'");
+        }
+    }
+    if (fd < 0) {
+        return Status(ErrorCode::io_error, "cannot create temporary file for '" + printable_path(shown) + "'");
+    }
+    auto cleanup_tmp = [&] {
+        std::error_code ec;
+        fs::remove(tmp_path, ec);
+    };
+    std::size_t off = 0;
+    bool write_ok = true;
+    while (off < payload.size()) {
+        const ssize_t wrote = ::write(fd, payload.data() + off, payload.size() - off);
+        if (wrote < 0) {
+            if (errno == EINTR) continue;
+            write_ok = false;
+            break;
+        }
+        if (wrote == 0) {
+            write_ok = false;
+            break;
+        }
+        off += static_cast<std::size_t>(wrote);
+    }
+    if (write_ok && ::fsync(fd) != 0 && errno != EINVAL && errno != ENOTSUP) {
+        write_ok = false;
+    }
+    if (::close(fd) != 0) write_ok = false;
+    if (!write_ok) {
+        cleanup_tmp();
+        return Status(ErrorCode::io_error, "write failed for '" + printable_path(shown) + "'");
+    }
+
+    if (Status s = check_output_target(out_path, shown, existed_as_manifest); !s.ok()) {
+        cleanup_tmp();
+        return s;
+    }
+    if (!existed_as_manifest) {
+        if (::link(tmp_path.c_str(), out_path.c_str()) == 0) {
+            cleanup_tmp();
+        } else if (errno == EEXIST) {
+            cleanup_tmp();
+            return Status(ErrorCode::invalid_argument,
+                          "refusing to overwrite '" + printable_path(shown) + "': file appeared concurrently");
+        } else if (errno == EPERM || errno == ENOTSUP || errno == EXDEV) {
+            if (::rename(tmp_path.c_str(), out_path.c_str()) != 0) {
+                cleanup_tmp();
+                return Status(ErrorCode::io_error, "cannot publish '" + printable_path(shown) + "'");
+            }
+        } else {
+            cleanup_tmp();
+            return Status(ErrorCode::io_error, "cannot publish '" + printable_path(shown) + "'");
+        }
+    } else {
+        if (::rename(tmp_path.c_str(), out_path.c_str()) != 0) {
+            cleanup_tmp();
+            return Status(ErrorCode::io_error, "cannot publish '" + printable_path(shown) + "'");
+        }
+    }
+#endif
     return Status::success();
 }
 
@@ -194,7 +433,8 @@ int run_manifest(const std::vector<std::string>& args, std::ostream& out, std::o
     const fs::path dir = fs::path(p.positional[0]);
     const fs::path out_path = fs::path(*p.out);
 
-    if (Status s = check_output_target(out_path, *p.out); !s.ok()) return status_exit(err, s);
+    bool existed_as_manifest = false;
+    if (Status s = check_output_target(out_path, *p.out, existed_as_manifest); !s.ok()) return status_exit(err, s);
 
     BuildOptions options;
     options.ignore.push_back(out_path);
@@ -210,19 +450,8 @@ int run_manifest(const std::vector<std::string>& args, std::ostream& out, std::o
     auto built = build_manifest(dir, options);
     if (!built.ok()) return status_exit(err, built.status());
 
-    if (Status s = check_output_target(out_path, *p.out); !s.ok()) return status_exit(err, s);
-    {
-        std::ofstream file(out_path, std::ios::binary | std::ios::trunc);
-        if (!file) {
-            err << "error: weights: cannot write '" << printable_path(*p.out) << "'\n";
-            return kExitIo;
-        }
-        file << manifest_to_json(built->manifest);
-        file.flush();
-        if (!file) {
-            err << "error: weights: write failed for '" << printable_path(*p.out) << "'\n";
-            return kExitIo;
-        }
+    if (Status s = write_manifest_atomically(out_path, *p.out, manifest_to_json(built->manifest)); !s.ok()) {
+        return status_exit(err, s);
     }
     std::uint64_t bytes = 0;
     for (const auto& f : built->manifest.files) bytes += f.size;

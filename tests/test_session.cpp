@@ -355,4 +355,101 @@ TEST_CASE("callback exception cleanup also works without scheduling") {
     }
 }
 
+TEST_CASE("telemetry redacts raw backend failure messages from request.failed and model.load.failed (M-15)") {
+    const std::string load_secret = "CANARY_LOAD_SECRET_481516";
+    const std::string gen_secret = "CANARY_GEN_SECRET_234200";
+
+    class SecretErrorModel final : public BackendModel {
+    public:
+        explicit SecretErrorModel(std::string secret) : secret_(std::move(secret)) {
+            desc_.name = "secret-model";
+            desc_.backend = "secret-backend";
+        }
+        const ModelDescriptor& descriptor() const override { return desc_; }
+        Result<GenerateStats> generate(const GenerateRequest&, const CancellationToken&,
+                                       const TokenCallback&) override {
+            return Status(ErrorCode::backend_error, "upstream failed: " + secret_);
+        }
+    private:
+        ModelDescriptor desc_;
+        std::string secret_;
+    };
+
+    class SecretErrorBackend final : public Backend {
+    public:
+        SecretErrorBackend(std::string load_err, std::string gen_err)
+            : load_err_(std::move(load_err)), gen_err_(std::move(gen_err)) {}
+        std::string name() const override { return "secret-backend"; }
+        std::string description() const override { return "test backend"; }
+        BackendCapabilities capabilities() const override { return {}; }
+        Result<std::string> probe() override { return std::string("1"); }
+        Result<std::vector<ModelDescriptor>> list_models() override { return std::vector<ModelDescriptor>{}; }
+        Result<std::shared_ptr<BackendModel>> load_model(const ModelLoadOptions& opts) override {
+            if (opts.model == "fail-load") {
+                return Status(ErrorCode::backend_error, "loader saw " + load_err_);
+            }
+            return std::shared_ptr<BackendModel>(std::make_shared<SecretErrorModel>(gen_err_));
+        }
+    private:
+        std::string load_err_;
+        std::string gen_err_;
+    };
+
+    EngineOptions options;
+    options.telemetry.level = TelemetryLevel::metrics;
+    auto sink = std::make_shared<MemoryTelemetrySink>();
+    Engine engine(options);
+    engine.telemetry().add_sink(sink);
+    REQUIRE(engine.register_backend(std::make_shared<SecretErrorBackend>(load_secret, gen_secret)).ok());
+
+    ModelLoadOptions bad_load;
+    bad_load.model = "fail-load";
+    auto failed_load = engine.load_model("secret-backend", bad_load);
+    REQUIRE_FALSE(failed_load.ok());
+    CHECK(failed_load.status().message().find(load_secret) != std::string::npos);
+
+    ModelLoadOptions ok_load;
+    ok_load.model = "secret-model";
+    auto model = engine.load_model("secret-backend", ok_load);
+    REQUIRE(model.ok());
+    auto session = engine.create_session(model.value());
+    REQUIRE(session.ok());
+    auto gen = session.value()->generate("hi");
+    REQUIRE_FALSE(gen.ok());
+    CHECK(gen.status().message().find(gen_secret) != std::string::npos);
+
+    engine.telemetry().flush();
+    bool saw_load_failed = false;
+    bool saw_req_failed = false;
+    for (const auto& line : sink->lines()) {
+        CHECK(line.find(load_secret) == std::string::npos);
+        CHECK(line.find(gen_secret) == std::string::npos);
+        if (line.find("\"model.load.failed\"") != std::string::npos) saw_load_failed = true;
+        if (line.find("\"request.failed\"") != std::string::npos) saw_req_failed = true;
+    }
+    CHECK(saw_load_failed);
+    CHECK(saw_req_failed);
+}
+
+TEST_CASE("session enforces cumulative response byte cap (M-16)") {
+    sonder_test::Harness h;
+    auto session = h.session(SamplingConfig::greedy(16));
+    REQUIRE(session);
+    RequestOptions ro;
+    ro.max_response_bytes = 8;
+    std::size_t received = 0;
+    auto r = session->generate(
+        "long response",
+        [&](const TokenChunk& c) {
+            received += c.text.size() + c.reasoning.size();
+            return true;
+        },
+        std::nullopt, ro);
+    REQUIRE_FALSE(r.ok());
+    CHECK(r.status().code() == ErrorCode::protocol_error);
+    CHECK(received <= ro.max_response_bytes);
+    CHECK(session->last_outcome() == RequestOutcome::failed);
+    CHECK(session->state() == SessionState::idle);
+}
+
 }

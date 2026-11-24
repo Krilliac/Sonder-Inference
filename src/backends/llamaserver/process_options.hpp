@@ -27,6 +27,7 @@ class ProcessOptions {
 #if defined(_WIN32)
     STARTUPINFOEXW startup{};
     std::vector<wchar_t> environment;
+    bool has_environment = false;
     bool redirect = false;
   private:
     HANDLE output_ = INVALID_HANDLE_VALUE;
@@ -35,9 +36,11 @@ class ProcessOptions {
     std::array<HANDLE, 2> inherited_{}; // attribute values must outlive CreateProcessW
 #else
     posix_spawn_file_actions_t actions{};
+    bool has_actions = false;
     bool redirect = false;
     std::vector<std::string> environment;
     std::vector<char *> envp;
+    bool has_environment = false;
 #endif
 };
 } // namespace sonder::inference::llamaserver

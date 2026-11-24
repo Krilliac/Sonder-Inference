@@ -87,7 +87,9 @@ constexpr std::pair<std::string_view, std::string_view> kTypedFlags[] = {
 constexpr std::string_view kForbiddenFlags[] = {
     "--", "--host", "--port", "--api-key", "--api-key-file", "--ssl-key-file", "--ssl-cert-file",
     "-mu", "--model-url", "-hf", "-hfr", "--hf-repo", "-hff", "--hf-file", "-hft", "--hf-token",
-    "-dr", "--docker-repo", "-mmu", "--mmproj-url", "-hfd", "-hfrd", "--hf-repo-draft", "--spec-draft-hf",
+    "-hfv", "-hfrv", "--hf-repo-v", "-hffv", "--hf-file-v",
+    "-dr", "--docker-repo", "-mmu", "--mmproj-url", "-hfd", "-hfrd", "--hf-repo-draft", "-hffd",
+    "--hf-file-draft", "--spec-draft-hf", "--vocoder-url",
     "--models-dir", "--models-preset",
 };
 
@@ -138,6 +140,26 @@ bool is_model_preset_flag(std::string_view flag) {
     return flag.rfind("--", 0) == 0 && (ends_with("-default") || ends_with("-spec"));
 }
 
+// Future-proof download-family classifier (G0094): refuses any Hugging Face
+// download flag (-hf*, --hf-*, --*-hf, --*-hf-*) or URL download flag
+// (--*-url) so newly added upstream download aliases cannot bypass offline
+// launch profiles.
+bool is_download_flag(std::string_view flag) {
+    const auto ends_with = [&](std::string_view suffix) {
+        return flag.size() > suffix.size() && flag.substr(flag.size() - suffix.size()) == suffix;
+    };
+    if (flag.rfind("-hf", 0) == 0) {
+        return true;
+    }
+    if (flag.rfind("--", 0) == 0) {
+        if (flag.rfind("--hf-", 0) == 0 || ends_with("-url") || ends_with("-hf") ||
+            flag.find("-hf-") != std::string_view::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
 Status check_extra_args(const LaunchProfile& p) {
     if (p.extra_args.size() > kMaxExtraArgs) return bad(where_of(p), "extra_args has more than 256 entries");
     for (const auto& arg : p.extra_args) {
@@ -149,7 +171,7 @@ Status check_extra_args(const LaunchProfile& p) {
         const std::string_view written = std::string_view(arg).substr(0, arg.find('='));
         const std::string refused = "extra_args must not contain " + detail::bounded_for_message(written) +
                                     (written == flag ? std::string() : ", which llama-server reads as " + detail::bounded_for_message(flag));
-        if (listed(kForbiddenFlags, flag)) {
+        if (listed(kForbiddenFlags, flag) || is_download_flag(flag)) {
             return bad(where_of(p), refused +
                                         " (the supervisor owns host and port; credentials and downloads are not "
                                         "passed to llama-server)");

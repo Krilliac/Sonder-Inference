@@ -577,9 +577,11 @@ const std::vector<FlagGroup> &forbidden_groups() {
         {"Hugging Face repo download", {"-hf", "-hfr", "--hf-repo"}},
         {"Hugging Face file download", {"-hff", "--hf-file"}},
         {"Hugging Face token", {"-hft", "--hf-token"}},
+        {"vocoder Hugging Face download", {"-hfv", "-hfrv", "--hf-repo-v", "-hffv", "--hf-file-v"}},
         {"Docker repo download", {"-dr", "--docker-repo"}},
         {"mmproj URL download", {"-mmu", "--mmproj-url"}},
-        {"draft model Hugging Face download", {"--spec-draft-hf", "-hfd", "-hfrd", "--hf-repo-draft"}},
+        {"vocoder URL download", {"--vocoder-url"}},
+        {"draft model Hugging Face download", {"--spec-draft-hf", "-hfd", "-hfrd", "--hf-repo-draft", "-hffd", "--hf-file-draft"}},
         {"router models directory", {"--models-dir"}},
         {"router model presets", {"--models-preset"}},
     };
@@ -625,7 +627,7 @@ TEST_CASE("containment: launch profiles refuse every llama-server spelling of th
             }
         }
     }
-    CHECK(rows == 88u);
+    CHECK(rows == 118u);
     // Smuggling through NUL is refused before any name check.
     for (const std::string &smuggled : {std::string("--no-warmup\0--api-key", 21), std::string("x\0-hf", 5),
                                        std::string("\0--ssl-key-file", 15)}) {
@@ -690,7 +692,7 @@ TEST_CASE("containment: by-design operator spawn args are filtered only for host
         }
     }
     CHECK(both == 2u);
-    CHECK(profile_only == 23u);
+    CHECK(profile_only == 31u);
     // "--" is refused by lists 1 and 3.
     CHECK(profile_status({"--"}).code() == ErrorCode::invalid_argument);
     CHECK_FALSE(ls::validate_process_arguments({"--"}).ok());
@@ -726,15 +728,11 @@ TEST_CASE("containment: child environment validation keeps refusing malformed en
 #endif
 }
 
-TEST_CASE("containment gap: child environment overrides equivalent to refused llama-server flags are accepted") {
-    // GAP: validate_process_environment (process_options.cpp) and the
-    // config loader's "env" object (llamaserver_config_extensions.hpp) check
-    // the shape of each entry and refuse only AIP_* names. llama-server reads each
-    // name below as the setting in the row name, so an "env" object in a
-    // (model-written) llamaserver config can set what the argument checks
-    // refuse. No document restricts env names; llama-server.md calls env
-    // "child-only string environment overrides". With --profile, serve refuses
-    // the config's `args` but still applies its `env`.
+TEST_CASE("containment: child environment overrides equivalent to refused llama-server flags are refused") {
+    // G0050: validate_process_environment (process_options.cpp) and the config
+    // loader's "env" object (llamaserver_config_extensions.hpp) refuse every
+    // case-normalized llama-server argument, credential, download, tool, proxy,
+    // loader, and config-home override, plus malformed env names.
     const auto rows = child_env_rows();
     REQUIRE(rows.size() == 38u);
 #if defined(SONDER_HAS_SERVER)
@@ -744,26 +742,20 @@ TEST_CASE("containment gap: child environment overrides equivalent to refused ll
         CAPTURE(row.name);
         const std::string value = "containment-value";
         const std::vector<std::pair<std::string, std::string>> env{{row.key, value}};
-        CHECK(ls::validate_process_environment(env).ok());
-        CHECK(decision_of(spawn_status({"-m", "m.gguf"}, env)) == Decision::accepted);
+        CHECK(ls::validate_process_environment(env).code() == ErrorCode::invalid_argument);
+        CHECK(decision_of(spawn_status({"-m", "m.gguf"}, env)) == Decision::refused);
 
-        // The entry reaches the block prepare() builds for the child.
         ls::ProcessSpec spec;
         spec.environment = env;
         ls::ProcessOptions options;
-        REQUIRE(options.prepare(spec).ok());
-        const auto values = values_named(prepared_entries(options), row.key);
-        CHECK(values == std::vector<std::string>{value});
+        CHECK(options.prepare(spec).code() == ErrorCode::invalid_argument);
 
 #if defined(SONDER_HAS_SERVER)
         if (row.key.find('\x01') == std::string::npos) {
-            BackendSetup loaded;
             const std::string object = "{" + json_string(row.key) + ":" + json_string(value) + "}";
-            CHECK(decision_of(config_status(spawn_config(object), &loaded)) == Decision::accepted);
-            CHECK(loaded.llamaserver_environment == env);
+            CHECK(decision_of(config_status(spawn_config(object))) == Decision::refused);
         }
         if (row.profile_refused_flag) {
-            // The same setting as an argument is refused in a launch profile.
             CHECK(profile_status({row.profile_refused_flag, "value"}).code() == ErrorCode::invalid_argument);
             ++profile_refused;
         }
@@ -772,6 +764,13 @@ TEST_CASE("containment gap: child environment overrides equivalent to refused ll
 #if defined(SONDER_HAS_SERVER)
     CHECK(profile_refused == 23u);
 #endif
+    // Additional credential/tool/proxy overrides are also rejected case-insensitively.
+    for (const std::string key : {"HUGGING_FACE_HUB_TOKEN", "hugging_face_hub_token", "MCP_SERVERS", "mcp_token",
+                                  "HTTP_PROXY", "https_proxy", "ALL_PROXY", "NO_PROXY", "SONDER_AUTH_TOKEN",
+                                  "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"}) {
+        CAPTURE(key);
+        CHECK(ls::validate_process_environment({{key, "x"}}).code() == ErrorCode::invalid_argument);
+    }
 }
 
 TEST_CASE("containment: AIP_MODE never reaches the child and AIP_* overrides are refused") {
@@ -785,9 +784,7 @@ TEST_CASE("containment: AIP_MODE never reaches the child and AIP_* overrides are
     CHECK(ls::validate_process_environment(env).code() == ErrorCode::invalid_argument);
     CHECK(ls::validate_process_environment({{"AIP_HTTP_PORT", "8080"}}).code() == ErrorCode::invalid_argument);
     CHECK(ls::validate_process_environment({{"AIP_HEALTH_ROUTE", "/x"}}).code() == ErrorCode::invalid_argument);
-#if defined(_WIN32)
     CHECK(ls::validate_process_environment({{"aip_mode", "PREDICTION"}}).code() == ErrorCode::invalid_argument);
-#endif
     CHECK(ls::validate_process_environment({{"AIP", "x"}, {"XAIP_MODE", "x"}}).ok());
     CHECK(decision_of(spawn_status({"-m", "m.gguf"}, env)) == Decision::refused);
 #if defined(SONDER_HAS_SERVER)
@@ -809,45 +806,50 @@ TEST_CASE("containment: AIP_MODE never reaches the child and AIP_* overrides are
         CHECK(values_named(entries, "AIP_HTTP_PORT").empty());
     }
     {
-        // No overrides: the block must still be explicit so AIP_* is dropped.
+        // No overrides: an explicit allowlisted block is still built so AIP_* is dropped.
         ls::ProcessSpec spec;
         ls::ProcessOptions options;
         REQUIRE(options.prepare(spec).ok());
+        CHECK(options.has_environment);
         const auto entries = prepared_entries(options);
-        CHECK_FALSE(entries.empty());
         CHECK(values_named(entries, "AIP_MODE").empty());
         CHECK(values_named(entries, "AIP_HTTP_PORT").empty());
     }
 }
 
-TEST_CASE("containment gap: inherited LLAMA_ARG and credential variables reach the spawned child") {
-    // GAP: the parent's whole environment is the child's. With no overrides,
-    // prepare() leaves the block empty when nothing AIP_* is inherited and
-    // the launcher then passes nullptr / environ (process.cpp CreateProcessW /
-    // posix_spawnp), i.e. full inheritance; with overrides, prepare() merges
-    // them over a copy of the parent's block and removes only inherited AIP_*. Inheritance itself is documented
-    // ("empty inherits unchanged", llamaserver.hpp; launch-profiles.md on
-    // LLAMA_ARG_SWA_FULL), but no document considers inherited equivalents of
-    // the refused flags: LLAMA_API_KEY makes the child demand a key Sonder
-    // never sends, and LLAMA_ARG_HF_REPO makes it download a model although
-    // "profiles never download".
+TEST_CASE("containment: inherited LLAMA_ARG, credential and proxy variables are blocked from reaching the child") {
+    // B1 / G0050: ProcessOptions::prepare() always constructs an explicit
+    // minimal child environment from an allowlist of OS/GPU/runtime variables.
+    // Sensitive parent variables (LLAMA_*, HF_*, HUGGING_FACE_*, AIP_*,
+    // proxies, MCP_*, SONDER_*, XDG_CONFIG_HOME, PROGRAMDATA, arbitrary secrets)
+    // never reach the spawned child, with or without explicit overrides.
     ScopedParentEnv key("LLAMA_API_KEY", std::string("containment-parent-secret"));
     ScopedParentEnv repo("LLAMA_ARG_HF_REPO", std::string("containment/parent-repo"));
     ScopedParentEnv tools("LLAMA_ARG_TOOLS", std::string("all"));
-    ScopedParentEnv config_home(
-#if defined(_WIN32)
-        "APPDATA",
-#else
-        "XDG_CONFIG_HOME",
-#endif
-        std::string("containment-config-home"));
+    ScopedParentEnv hf("HF_TOKEN", std::string("hf_secret_parent"));
+    ScopedParentEnv proxy("HTTP_PROXY", std::string("http://proxy.invalid:3128"));
+    ScopedParentEnv mcp("MCP_SERVERS", std::string("{}"));
+    ScopedParentEnv sonder_tok("SONDER_API_TOKEN", std::string("sonder-secret"));
+    ScopedParentEnv xdg_cfg("XDG_CONFIG_HOME", std::string("containment-xdg-config"));
+    ScopedParentEnv gpu("CUDA_VISIBLE_DEVICES", std::string("0"));
 
     {
+        // No overrides: still builds an explicit allowlisted environment block.
         ls::ProcessSpec spec;
-        ls::ProcessOptions inherit_all;
-        REQUIRE(inherit_all.prepare(spec).ok());
-        // Empty block -> the launcher hands the child the parent's own block.
-        CHECK(inherit_all.environment.empty());
+        ls::ProcessOptions contained;
+        REQUIRE(contained.prepare(spec).ok());
+        CHECK(contained.has_environment);
+        const auto entries = prepared_entries(contained);
+        CHECK(values_named(entries, "LLAMA_API_KEY").empty());
+        CHECK(values_named(entries, "LLAMA_ARG_HF_REPO").empty());
+        CHECK(values_named(entries, "LLAMA_ARG_TOOLS").empty());
+        CHECK(values_named(entries, "HF_TOKEN").empty());
+        CHECK(values_named(entries, "HTTP_PROXY").empty());
+        CHECK(values_named(entries, "MCP_SERVERS").empty());
+        CHECK(values_named(entries, "SONDER_API_TOKEN").empty());
+        CHECK(values_named(entries, "XDG_CONFIG_HOME").empty());
+        // Allowlisted GPU/runtime variables still pass through.
+        CHECK(values_named(entries, "CUDA_VISIBLE_DEVICES") == std::vector<std::string>{"0"});
     }
     {
         ls::ProcessSpec spec;
@@ -856,38 +858,34 @@ TEST_CASE("containment gap: inherited LLAMA_ARG and credential variables reach t
         REQUIRE(merged.prepare(spec).ok());
         const auto entries = prepared_entries(merged);
         CHECK(values_named(entries, "SONDER_CONTAINMENT_PROBE") == std::vector<std::string>{"1"});
-        CHECK(values_named(entries, "LLAMA_API_KEY") == std::vector<std::string>{"containment-parent-secret"});
-        CHECK(values_named(entries, "LLAMA_ARG_HF_REPO") == std::vector<std::string>{"containment/parent-repo"});
-        CHECK(values_named(entries, "LLAMA_ARG_TOOLS") == std::vector<std::string>{"all"});
-#if defined(_WIN32)
-        CHECK(values_named(entries, "APPDATA") == std::vector<std::string>{"containment-config-home"});
-#else
-        CHECK(values_named(entries, "XDG_CONFIG_HOME") == std::vector<std::string>{"containment-config-home"});
-#endif
+        CHECK(values_named(entries, "LLAMA_API_KEY").empty());
+        CHECK(values_named(entries, "LLAMA_ARG_HF_REPO").empty());
+        CHECK(values_named(entries, "LLAMA_ARG_TOOLS").empty());
+        CHECK(values_named(entries, "HF_TOKEN").empty());
+        CHECK(values_named(entries, "HTTP_PROXY").empty());
+        CHECK(values_named(entries, "CUDA_VISIBLE_DEVICES") == std::vector<std::string>{"0"});
     }
     {
-        // An override can blank an inherited variable but cannot remove it:
-        // the child still sees LLAMA_API_KEY set (to "").
-        ls::ProcessSpec spec;
-        spec.environment = {{"LLAMA_API_KEY", ""}};
-        ls::ProcessOptions blanked;
-        REQUIRE(blanked.prepare(spec).ok());
-        CHECK(values_named(prepared_entries(blanked), "LLAMA_API_KEY") == std::vector<std::string>{""});
+        // Attempting to override or blank LLAMA_API_KEY (any case) is refused.
+        for (const std::string name : {"LLAMA_API_KEY", "llama_api_key", "Llama_Arg_Hf_Repo"}) {
+            CAPTURE(name);
+            ls::ProcessSpec spec;
+            spec.environment = {{name, ""}};
+            ls::ProcessOptions refused;
+            CHECK(refused.prepare(spec).code() == ErrorCode::invalid_argument);
+        }
     }
-    {
-        // Windows names are case-insensitive: prepare() merges an override
-        // spelled llama_api_key into the inherited LLAMA_API_KEY (one entry).
-        // POSIX names are case-sensitive, so the child sees both.
+}
+
+TEST_CASE("containment: ProcessLauncher rejects relative executable paths") {
+    auto launcher = ls::make_process_launcher();
+    for (const std::string rel : {"llama-server", "llama-server.exe", "./llama-server", "bin/llama-server"}) {
+        CAPTURE(rel);
         ls::ProcessSpec spec;
-        spec.environment = {{"llama_api_key", "override"}};
-        ls::ProcessOptions cased;
-        REQUIRE(cased.prepare(spec).ok());
-        const auto values = values_named(prepared_entries(cased), "LLAMA_API_KEY");
-#if defined(_WIN32)
-        CHECK(values == std::vector<std::string>{"override"});
-#else
-        CHECK(values == std::vector<std::string>{"containment-parent-secret"});
-        CHECK(values_named(prepared_entries(cased), "llama_api_key") == std::vector<std::string>{"override"});
-#endif
+        spec.executable = rel;
+        spec.port = 18080;
+        auto res = launcher->start(spec);
+        CHECK_FALSE(res.ok());
+        CHECK(res.status().code() == ErrorCode::invalid_argument);
     }
 }

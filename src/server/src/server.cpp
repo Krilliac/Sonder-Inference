@@ -1,6 +1,7 @@
 #include "sonder/inference/server.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
@@ -265,6 +266,80 @@ LogQueue::DropLine log_drop_reporter(bool as_json) {
     };
 }
 
+// Bounded concurrent JSON parse admission gate (M-17): caps both concurrent
+// parsers and aggregate in-flight raw body bytes before allocating DOM nodes.
+struct ParseGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::size_t active = 0;
+    std::size_t active_bytes = 0;
+    std::size_t max_active = 4;
+    std::size_t max_bytes = 16u << 20;
+    bool closed = false;
+
+    struct Guard {
+        ParseGate* gate = nullptr;
+        std::size_t bytes = 0;
+        Guard() = default;
+        Guard(ParseGate* g, std::size_t b) noexcept : gate(g), bytes(b) {}
+        ~Guard() {
+            if (gate != nullptr) {
+                gate->release(bytes);
+            }
+        }
+        Guard(const Guard&) = delete;
+        Guard& operator=(const Guard&) = delete;
+        Guard(Guard&& o) noexcept : gate(o.gate), bytes(o.bytes) {
+            o.gate = nullptr;
+            o.bytes = 0;
+        }
+        Guard& operator=(Guard&& o) noexcept {
+            if (this != &o) {
+                if (gate != nullptr) {
+                    gate->release(bytes);
+                }
+                gate = o.gate;
+                bytes = o.bytes;
+                o.gate = nullptr;
+                o.bytes = 0;
+            }
+            return *this;
+        }
+        explicit operator bool() const noexcept { return gate != nullptr; }
+    };
+
+    Guard acquire(std::size_t bytes, std::chrono::milliseconds timeout) {
+        const std::size_t charge = std::min(bytes, max_bytes);
+        std::unique_lock<std::mutex> lock(mu);
+        const bool ok = cv.wait_for(lock, timeout, [&] {
+            return closed || (active < max_active && active_bytes + charge <= max_bytes);
+        });
+        if (!ok || closed) {
+            return {};
+        }
+        ++active;
+        active_bytes += charge;
+        return Guard{this, charge};
+    }
+
+    void release(std::size_t bytes) {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (active > 0) --active;
+            active_bytes = active_bytes >= bytes ? active_bytes - bytes : 0;
+        }
+        cv.notify_all();
+    }
+
+    void close() {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            closed = true;
+        }
+        cv.notify_all();
+    }
+};
+
 }  // namespace
 
 // ============================================================ Server::Impl
@@ -273,6 +348,12 @@ struct Server::Impl {
     explicit Impl(ServerOptions o)
         : opts(std::move(o)),
           log_queue(opts.log, opts.log_queue_capacity, log_drop_reporter(opts.log_format == LogFormat::json)) {
+        if (!opts.token.empty()) {
+            token_digest = sha256_digest(opts.token);
+            has_token_digest = true;
+        }
+        parse_gate.max_active = std::clamp<std::size_t>(opts.max_connections / 4, 4, 16);
+        parse_gate.max_bytes = std::max<std::size_t>(opts.max_body_bytes * 4, 16u << 20);
         residency = std::make_shared<ModelResidency>(
             ResidencyConfig{opts.model_idle_ttl, opts.max_resident_models},
             [this](const std::string& id) { return load_served_model(id); },
@@ -280,6 +361,9 @@ struct Server::Impl {
     }
 
     ServerOptions opts;
+    std::array<std::uint8_t, 32> token_digest{};
+    bool has_token_digest = false;
+    ParseGate parse_gate;
     // Access-log and diagnostic lines on their way to `opts.log`, which is
     // only ever called on the queue's logger thread (never on a request or
     // accept thread). Declared right after `opts` (it is built from them) and
@@ -951,7 +1035,21 @@ struct Server::Impl {
             return;
         }
         const Correlation corr = std::get<Correlation>(corr_v);
-        auto job_v = protocol == ChatProtocol::anthropic ? parse_messages_request(body) : parse_chat_request(body);
+        std::variant<ChatJob, ApiError> job_v = make_error(500, "internal_error", "uninitialized");
+        {
+            const auto parse_timeout = std::min(opts.read_timeout, std::chrono::milliseconds(2000));
+            auto parse_guard = parse_gate.acquire(body.size(), parse_timeout);
+            if (!parse_guard) {
+                if (!require_ready(ex)) {
+                    return;
+                }
+                ApiError e = make_error(503, "overloaded", "request parser concurrency limit reached; retry later");
+                e.retry_after = 1;
+                send_error(ex, e);
+                return;
+            }
+            job_v = protocol == ChatProtocol::anthropic ? parse_messages_request(body) : parse_chat_request(body);
+        }
         if (auto* e = std::get_if<ApiError>(&job_v)) {
             send_error(ex, *e);
             return;
@@ -1221,18 +1319,18 @@ struct Server::Impl {
             (void)send_raw(ex, format_head(204, h));
             return;
         }
-        if (!opts.token.empty()) {
+        if (has_token_digest) {
             const std::string* auth = head.header("authorization");
             bool ok = false;
             if (auth != nullptr && auth->size() > 7) {
                 std::string scheme = auth->substr(0, 7);
                 std::transform(scheme.begin(), scheme.end(), scheme.begin(),
                                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                ok = scheme == "bearer " && constant_time_equals(std::string_view(*auth).substr(7), opts.token);
+                ok = scheme == "bearer " && constant_time_equals_digest(std::string_view(*auth).substr(7), token_digest);
             }
             if (!ok && route.route == Route::messages) {
                 const std::string* key = head.header("x-api-key");
-                ok = key != nullptr && constant_time_equals(*key, opts.token);
+                ok = key != nullptr && constant_time_equals_digest(*key, token_digest);
             }
             if (!ok) {
                 send_error(ex, make_error(401, "unauthorized", route.route == Route::messages
@@ -1402,7 +1500,8 @@ struct Server::Impl {
             if (w != WaitResult::ready) {
                 continue;
             }
-            for (;;) {
+            constexpr std::size_t kMaxAcceptBatch = 32;
+            for (std::size_t batch = 0; batch < kMaxAcceptBatch && !stopping.load(); ++batch) {
                 Accepted a = accept_client(listener);
                 if (a.status == AcceptStatus::none_pending) {
                     break;
@@ -1453,7 +1552,13 @@ struct Server::Impl {
                 }
                 auto flags = std::make_shared<ConnFlags>();
                 active.fetch_add(1);
+                bool slot_reserved = false;
                 try {
+                    {
+                        std::lock_guard<std::mutex> lock(conns_mu);
+                        conns.emplace_back(std::thread{}, flags);
+                        slot_reserved = true;
+                    }
                     std::thread t([this, flags, s = std::move(client)]() mutable {
                         // Nothing may escape a thread entry point (std::terminate
                         // would take every in-flight request down): one failed
@@ -1469,12 +1574,22 @@ struct Server::Impl {
                         flags->done.store(true);
                     });
                     std::lock_guard<std::mutex> lock(conns_mu);
-                    conns.emplace_back(std::move(t), flags);
+                    conns.back().first = std::move(t);  // noexcept; slot already allocated
                 } catch (const std::system_error&) {
+                    if (slot_reserved) {
+                        std::lock_guard<std::mutex> lock(conns_mu);
+                        if (!conns.empty() && conns.back().second == flags && !conns.back().first.joinable()) {
+                            conns.pop_back();
+                        }
+                    }
                     active.fetch_sub(1);
                     log_message("warning", "cannot start a connection thread; connection dropped");
+                } catch (const std::bad_alloc&) {
+                    active.fetch_sub(1);
+                    log_message("warning", "cannot allocate connection slot; connection dropped");
                 }
             }
+            reap_finished();
         }
         listener.close();
     }
@@ -1719,6 +1834,7 @@ struct Server::Impl {
         // 1. New chats get 503 not_ready.
         // 2. Stop accepting.
         stopping.store(true);
+        parse_gate.close();
         if (accept_thread.joinable()) {
             accept_thread.join();
         }

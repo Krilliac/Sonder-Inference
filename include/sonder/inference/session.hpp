@@ -107,6 +107,13 @@ struct RequestOptions {
     // Native llama-server chat only. Unset leaves the upstream default intact.
     std::optional<std::int64_t> reasoning_budget_tokens = std::nullopt;
     std::optional<std::string> reasoning_budget_message = std::nullopt;
+    // Cumulative byte cap on generated text + reasoning delivered in one
+    // request (0 disables). Exceeding it stops streaming and fails the request
+    // with ErrorCode::protocol_error.
+    std::size_t max_response_bytes = 32u << 20;
+    // When false (e.g. SSE streaming where chunks are flushed immediately),
+    // Session skips retaining the full text/reasoning in GenerationResult.
+    bool retain_text = true;
 };
 
 struct GenerationResult {

@@ -115,12 +115,20 @@ private:
     std::variant<std::nullptr_t, bool, std::int64_t, double, std::string, Array, Object, std::uint64_t> data_{nullptr};
 };
 
+// Bounds applied by json::parse(text, limits). max_values == 0 disables the
+// value-node cap (used by unbounded internal/trusted callers).
+struct ParseLimits {
+    int max_depth = 128;
+    std::size_t max_values = 0;
+};
+
 // Parses exactly one JSON document (surrounding whitespace allowed).
 // Objects parse in linear time. Numbers that overflow a double (e.g. 1e999)
 // are rejected. An unpaired UTF-16 surrogate escape and each byte of an
 // ill-formed raw UTF-8 sequence decode to U+FFFD, so parsed strings are always
 // valid UTF-8.
 Result<Value> parse(std::string_view text);
+Result<Value> parse(std::string_view text, ParseLimits limits);
 
 // Appends a JSON string literal (with quotes) for `s` to `out`. Output is
 // always valid UTF-8: each byte of an ill-formed UTF-8 sequence in `s` is
