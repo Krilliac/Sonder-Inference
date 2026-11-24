@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <mutex>
 #include <regex>
+#include <span>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -635,6 +636,53 @@ Status LlamaCppBackend::FormatChat(std::string_view chat_template, const std::ve
 
 void LlamaCppBackend::SetTelemetrySink(TelemetrySink sink) { impl_->telemetry = std::move(sink); }
 
+Status LlamaCppBackend::CaptureSequenceState(std::vector<std::uint8_t>& out_bytes, std::size_t max_bytes) {
+    out_bytes.clear();
+    if (max_bytes == 0) return Status::Error(ErrorCode::kInvalidArgument, "max_bytes must be > 0");
+    if (!IsLoaded()) return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
+    if (impl_->ctx == nullptr) return Status::Error(ErrorCode::kNotLoaded, "model loaded vocab-only; no context");
+
+    const std::size_t state_size = llama_state_seq_get_size(impl_->ctx, 0);
+    if (state_size == 0) {
+        return Status::Error(ErrorCode::kDecodeFailed, "llama_state_seq_get_size returned 0");
+    }
+    if (state_size > max_bytes) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "sequence state size (" + std::to_string(state_size) + " bytes) exceeds max_bytes (" +
+                                 std::to_string(max_bytes) + ")");
+    }
+    out_bytes.resize(state_size);
+    const std::size_t written = llama_state_seq_get_data(impl_->ctx, out_bytes.data(), out_bytes.size(), 0);
+    if (written == 0 || written > state_size) {
+        out_bytes.clear();
+        return Status::Error(ErrorCode::kDecodeFailed,
+                             "llama_state_seq_get_data failed (wrote " + std::to_string(written) + " of " +
+                                 std::to_string(state_size) + " bytes)");
+    }
+    out_bytes.resize(written);
+    return Status::Ok();
+}
+
+Status LlamaCppBackend::RestoreSequenceState(std::span<const std::uint8_t> bytes, std::size_t max_bytes) {
+    if (bytes.empty()) {
+        return Status::Error(ErrorCode::kInvalidArgument, "sequence state buffer is empty");
+    }
+    if (max_bytes == 0 || bytes.size() > max_bytes) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "sequence state size (" + std::to_string(bytes.size()) + " bytes) exceeds max_bytes (" +
+                                 std::to_string(max_bytes) + ")");
+    }
+    if (!IsLoaded()) return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
+    if (impl_->ctx == nullptr) return Status::Error(ErrorCode::kNotLoaded, "model loaded vocab-only; no context");
+    const std::size_t read = llama_state_seq_set_data(impl_->ctx, bytes.data(), bytes.size(), 0);
+    if (read == 0 || read != bytes.size()) {
+        return Status::Error(ErrorCode::kDecodeFailed,
+                             "llama_state_seq_set_data failed (read " + std::to_string(read) + " of " +
+                                 std::to_string(bytes.size()) + " bytes)");
+    }
+    return Status::Ok();
+}
+
 GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const TokenCallback& on_token,
                                          const CancelPredicate& should_cancel) {
     GenerateResult result;
@@ -662,12 +710,43 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
 
     llama_context* ctx = impl_->ctx;
     llama_memory_t mem = llama_get_memory(ctx);
-    if (request.reset_context) llama_memory_clear(mem, true);
-
     const auto n_ctx = static_cast<int64_t>(llama_n_ctx(ctx));
-    const int64_t n_past = llama_memory_seq_pos_max(mem, 0) + 1;  // 0 when empty
     const auto n_prompt = static_cast<int64_t>(request.prompt.size());
-    if (n_past + n_prompt > n_ctx) {
+
+    int64_t prefill_start_offset = 0;
+    if (!request.restore_state.empty() && request.restore_tokens > 0 &&
+        request.restore_tokens < request.prompt.size()) {
+        // Restore atomically into a freshly cleared sequence 0, then prefill
+        // only the suffix [restore_tokens .. prompt.size()) so logits are fresh
+        // before sampling begins.
+        llama_memory_clear(mem, true);
+        Status rst = RestoreSequenceState(request.restore_state, request.max_capture_bytes);
+        if (rst.ok()) {
+            const int64_t restored_pos = llama_memory_seq_pos_max(mem, 0) + 1;
+            if (restored_pos == static_cast<int64_t>(request.restore_tokens)) {
+                result.state_restored = true;
+                prefill_start_offset = static_cast<int64_t>(request.restore_tokens);
+                if (request.on_state_restored) {
+                    request.on_state_restored();
+                }
+            } else {
+                llama_memory_clear(mem, true);
+                result.restore_status = Status::Error(
+                    ErrorCode::kDecodeFailed, "restored sequence position (" + std::to_string(restored_pos) +
+                                                  ") does not match expected token_position (" +
+                                                  std::to_string(request.restore_tokens) + ")");
+            }
+        } else {
+            llama_memory_clear(mem, true);
+            result.restore_status = std::move(rst);
+        }
+    } else if (request.reset_context) {
+        llama_memory_clear(mem, true);
+    }
+
+    const int64_t n_past = llama_memory_seq_pos_max(mem, 0) + 1;  // 0 when empty
+    const int64_t remaining_prompt = n_prompt - prefill_start_offset;
+    if (n_past + remaining_prompt > n_ctx) {
         return fail(ErrorCode::kContextOverflow, "prompt does not fit in the context window");
     }
 
@@ -684,17 +763,24 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
         return impl_->abort_requested.load(std::memory_order_relaxed) || (should_cancel && should_cancel());
     };
 
-    // ---- Prefill in n_batch chunks ----
+    // ---- Prefill in n_batch chunks (split at capture_at_tokens when requested) ----
     std::vector<Token> prompt = request.prompt;  // llama_batch_get_one takes a mutable pointer
     const auto n_batch = static_cast<int64_t>(std::max<uint32_t>(1, impl_->options.n_batch));
+    const bool want_capture = request.capture_at_tokens > static_cast<std::size_t>(prefill_start_offset) &&
+                              request.capture_at_tokens <= request.prompt.size();
+    const int64_t capture_offset = want_capture ? static_cast<int64_t>(request.capture_at_tokens) : -1;
     const auto prefill_start = Clock::now();
-    for (int64_t off = 0; off < n_prompt; off += n_batch) {
+    for (int64_t off = prefill_start_offset; off < n_prompt;) {
         if (cancelled()) {
             result.stop_reason = StopReason::kCancelled;
             result.prefill_ms = MsSince(prefill_start);
             return result;
         }
-        const auto n = static_cast<int32_t>(std::min(n_batch, n_prompt - off));
+        int64_t step_end = std::min(n_prompt, off + n_batch);
+        if (capture_offset > off && step_end > capture_offset) {
+            step_end = capture_offset;
+        }
+        const auto n = static_cast<int32_t>(step_end - off);
         const int32_t rc = llama_decode(ctx, llama_batch_get_one(prompt.data() + off, n));
         if (rc == 2) {
             result.stop_reason = StopReason::kCancelled;
@@ -705,6 +791,17 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
             return fail(ErrorCode::kDecodeFailed, "llama_decode failed during prefill (rc=" + std::to_string(rc) + ")");
         }
         result.prompt_tokens += n;
+        off = step_end;
+        if (capture_offset == off) {
+            std::vector<std::uint8_t> captured;
+            result.capture_status = CaptureSequenceState(captured, request.max_capture_bytes);
+            if (result.capture_status.ok()) {
+                result.state_captured = true;
+                if (request.on_state_captured) {
+                    request.on_state_captured(std::move(captured));
+                }
+            }
+        }
     }
     result.prefill_ms = MsSince(prefill_start);
     impl_->Emit(TelemetryKind::kPrefillDone, result.prompt_tokens, result.prefill_ms);
@@ -712,7 +809,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
     // ---- Streaming decode ----
     SamplerPtr sampler = MakeSampler(request.sampling, n_vocab, static_cast<int32_t>(n_ctx));
     Utf8StreamBuffer utf8;
-    int64_t pos = n_past + n_prompt;
+    int64_t pos = n_past + remaining_prompt;
     const auto decode_start = Clock::now();
     auto finish = [&](StopReason reason) {
         result.stop_reason = reason;

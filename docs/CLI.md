@@ -22,7 +22,8 @@ The HTTP server started by `sonder-infer serve` has its own reference:
 | `models` | List the models a backend can serve. |
 | `backends` | Probe the backends compiled into this build. |
 | `devices` | List host devices (CPU, memory and GPU inventory). |
-| `plan` | Plan hardware placement and a validated launch profile for a GGUF model (header-only; no weights loaded). |
+| `node` | Print unified local hardware, GPU, backend and capability snapshot (`sonder.inference.node/1`). |
+| `plan` | Plan hardware placement and validated launch profile(s) for one or more GGUF models (repeatable `--model` for co-residency planning; header-only, no weights loaded). |
 | `version` | Print version, commit, C ABI and HTTP API versions. |
 | `help` | `help` prints the overview; `help <command>` prints that command's options and examples. |
 
@@ -37,9 +38,10 @@ did-you-mean suggestion (`genrate` → `generate`).
 - Options are declared per command. Boolean flags take no value; every other
   option takes exactly one: `--max-tokens 8` or `--max-tokens=8`. A value may
   start with dashes when it is the separate next argument (`--prompt --x`).
-- Repeatable options (`--stop`, and for `serve` `--model`, `--model-dir`,
-  `--cors-origin`, `--tensor-override`) may be given several times. Any other option given twice is
-  a usage error.
+- Repeatable options (`--stop`, `--model` on `plan`, `--env` on `tune`,
+  `--llamaserver-arg`, and for `serve` `--model`, `--model-dir`, `--profile`,
+  `--cors-origin`, `--tensor-override`) may be given several times. Any other
+  option given twice is a usage error.
 - An unknown option is a usage error naming the command, with a suggestion
   when a declared option is at most two edits away (insertions, deletions,
   substitutions or adjacent transpositions):
@@ -66,7 +68,10 @@ did-you-mean suggestion (`genrate` → `generate`).
   | `--priority` | -16 to 16 |
   | `--max-tokens` | 1 and up (then `validate()`) |
   | `--seed` | 0 to 18446744073709551615 |
-  | `--budget-seconds` (sonder-bench) | 0 to 31536000 |
+  | `--ctx`, `--min-ctx` (`plan`) | 128 to 1048576 |
+  | `--parallel` (`plan`) | 1 to 256 |
+  | `--concurrency` (`sonder-bench`) | 1 to 64 (default 1) |
+  | `--budget-seconds` (`sonder-bench`) | 0 to 31536000 |
 
 ## Environment
 
@@ -260,8 +265,8 @@ in its attributes.
   stats default `none`; an explicit `--stats` still applies. Errors and the
   `--ollama-allow-remote` warning are still printed. With `--quiet`,
   `--telemetry -` and optionally `--stats json`, stderr is pure JSON lines.
-- `--json` (`version`, `devices`, `plan`, `backends`, `models`): one JSON document on
-  stdout instead of text.
+- `--json` (`version`, `devices`, `node`, `plan`, `backends`, `models`): one
+  JSON document on stdout instead of text.
 
 ## JSON shapes
 
@@ -289,11 +294,31 @@ without the server module.
  "backend_hint":"cuda","source":"dxgi"}]}
 ```
 
-`plan --model model.gguf --json` prints a JSON object containing `profile` (in the
-same schema accepted by `parse_launch_profiles()`), `estimate`, `budget_mib`,
-`fits_in_vram`, `fits_in_host_ram`, `uma_mode`, `requires_prism_runtime`,
-`selected_vendor`, `recommended_backend_hint`, `recommended_env`, `reasons`, and
-`warnings`.
+`node --json`:
+
+```json
+{"schema":"sonder.inference.node/1","node_id":"host","platform":"windows-x86_64","version":"0.1.0",
+ "commit":"0915a2f3…","abi_version":1,"api_version":1,
+ "host_memory":{"total_physical_bytes":33285996544,"available_physical_bytes":24159191040,
+                "available_commit_bytes":28454158336,"source":"GlobalMemoryStatusEx"},
+ "devices":[{"id":"cpu:0","kind":"cpu","name":"...","logical_cores":24,
+             "total_memory_bytes":33285996544,"available_memory_bytes":24159191040}],
+ "gpus":[...],"backends":["mock","ollama","llamaserver"],
+ "capabilities":{"ternary_gguf":true,"placement_planner":true,"coresidency_planner":true,
+                 "multi_gpu":true,"uma_telemetry":true,"adaptive_speculation":true}}
+```
+
+`plan --model model.gguf --json` (single `--model`) prints a JSON object
+containing `profile` (in the same schema accepted by `parse_launch_profiles()`),
+`estimate`, `budget_mib`, `fits_in_vram`, `fits_in_host_ram`, `uma_mode`,
+`requires_prism_runtime`, `selected_vendor`, `recommended_backend_hint`,
+`recommended_env`, `reasons`, and `warnings`. Repeating `--model`
+(`plan --model a.gguf --model b.gguf --json`) runs the multi-model co-residency
+planner and outputs schema `sonder.inference.coresidency_plan/1` (`models`,
+`all_fit_coresident`, `aggregate_vram_mib`, `aggregate_host_ram_mib`,
+`remaining_gpu_vram_mib`, `remaining_host_ram_mib`, `notes`, `warnings`);
+`--mmproj` applies only to single-model `plan`. See [GPU_SUPPORT.md](GPU_SUPPORT.md)
+and [PLACEMENT.md](PLACEMENT.md).
 
 `backends --json` (exit 1 when `available` is 0):
 
@@ -353,6 +378,19 @@ summary and writes it next to `--out`. `--quiet` suppresses progress lines.
 - With no arguments it prints its usage on stderr and exits 2; `--help`
   prints it on stdout and exits 0.
 - Options use the same spec parser (did-you-mean, checked numbers).
+- `--concurrency N` (1 to 64, default 1) runs `N` parallel barrier-synchronized
+  worker sessions per measured iteration on non-fanout prompts, recording
+  per-row `worker_index`, `summary.wall_seconds`, and
+  `summary.aggregate_decode_tokens_per_sec` alongside per-request p50/p95/p99
+  distributions.
+- Live before/after GPU VRAM snapshots (`gpus_before`, `gpus_after`, per-GPU
+  `peak_vram_delta_mib`, and a `## GPUs` Markdown table) are captured by
+  default; pass `--no-gpu-snapshot` to omit them.
+- Available corpora under `bench/corpus/`: `smoke.json` (bring-up),
+  `baseline.json` (chat, coding, long-context, fan-out), and
+  `ternary_agent.json` (ternary/1-bit code-edit, JSON tool-call, short
+  reasoning, ~4k hybrid long-context, 4-way agent fan-out, and low-speculation
+  prose).
 - The mock backend prints a `MOCK BACKEND` banner on stderr, and the markdown
   summary is headed `MOCK BACKEND: not a performance claim`.
 - Exit codes: 0 ok; 1 a request failed or an output file could not be

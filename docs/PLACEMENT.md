@@ -1,18 +1,22 @@
 # Model placement across memory tiers
 
-Status: **step 1 implemented** (tensor placement overrides in the llama.cpp
-backend). Steps 2–4 are design only.
+Status: **steps 1 and 2 implemented** (tensor placement overrides, multi-GPU
+placement, and the header-only per-model and multi-model co-residency placement
+planner). Steps 3–4 remain design only (local node capability inventory is
+implemented in `sonder-infer node` / `GET /v1/sonder/node`). See
+[GPU_SUPPORT.md](GPU_SUPPORT.md) for the complete hardware, ternary/1-bit, RTX,
+AMD RX XT, and Ryzen APU UMA operator guide.
 
-Scope note (2026-11-20): the placement and KV-cache flags on this page
+Scope note: the direct placement and KV-cache flags on this page
 (`--gpu-layers`, `--context-length`, `--moe-experts`, `--tensor-override`,
 `--batch-size`, `--ubatch-size`, `--cache-type-k`, `--cache-type-v`,
 `--flash-attn`) apply to the `llamacpp` backend only; `serve` rejects them for
 any other backend with `option --<flag> applies only to --backend llamacpp`
-(`src/server/src/serve_main.cpp:744-752`). `--device` is not one of them: every
+(`src/server/src/serve_options.cpp`). `--device` is not one of them: every
 backend accepts it and reports it as the model's device id in telemetry and
-health (`serve_main.cpp:150-151`). Build the `llamacpp` backend with
-`-DSONDER_WITH_LLAMA_CPP=ON` ([README](../README.md#build)); installation and
-run steps are in [SETUP.md](SETUP.md).
+health. Build the `llamacpp` backend with `-DSONDER_WITH_LLAMA_CPP=ON`
+([README](../README.md#build)); installation and run steps are in
+[SETUP.md](SETUP.md).
 
 ## Why
 
@@ -86,6 +90,12 @@ the effect on the 384 MiB f16 KV cache measured below (4096 context):
 | `q4_1` | 0.625 | ≈ 0.31 | ≈ 120 MiB |
 | `q4_0`, `iq4_nl` | 0.5625 | ≈ ¼ | ≈ 108 MiB |
 
+`llamaserver` launch profiles additionally support `f8_e4m3` (1.0 B/value, ½ of
+`f16`), `q2_0` (0.28125 B/value, 18/64), and `pq2_0m` (0.28125 B/value, 36/128,
+PrismML KV-only) when backed by a matching `llama-server` build; direct
+`llamacpp` (`b11195`) keeps the nine types in the table above. See
+[GPU_SUPPORT.md](GPU_SUPPORT.md#quantized-kv-cache-types).
+
 K and V are sized independently, so `--cache-type-k q8_0` alone saves about a
 quarter of the total. The table is arithmetic from the formats, not a
 measurement; quality effects are model dependent and not yet measured here.
@@ -144,23 +154,60 @@ Rules, checked before any model file is read (`invalid_argument`):
 
 - **NVIDIA RTX (Ampere `sm_86`, Ada `sm_89`, Blackwell `sm_120`)**: build with `windows-cuda-rtx` or `linux-cuda-rtx` (`GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=86;89;120`, `GGML_CUDA_FA_ALL_QUANTS=ON`). `GGML_CUDA_FA_ALL_QUANTS=ON` ensures quantized KV caches (`q8_0`, `q4_0`, etc.) execute with CUDA Flash Attention rather than failing or falling back. On mixed RTX + iGPU workstations, `llama.cpp`'s default selection skips integrated GPUs when a discrete GPU is present; set `devices = {"CUDA0"}` (or `{"CUDA0", "CUDA1"}` with `split_mode` and `tensor_split`) to pin placement explicitly.
 - **AMD Radeon RX XT (RDNA 2/3/4) and Ryzen APU UMA**: build with `linux-rocm-xt` (`GGML_HIP=ON`, targeting `gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1200;gfx1201`) for native ROCm (`ROCm0`), or `windows-vulkan-xt` / `linux-vulkan-xt` (`GGML_VULKAN=ON`, `Vulkan0`) on Windows and non-ROCm Linux hosts. Discrete RX XT cards budget against dedicated VRAM, whereas Ryzen APUs (`gfx1103`, e.g. Radeon 780M/890M) expose only a small BIOS carveout as dedicated VRAM and run primarily out of shared UMA/GTT memory; UMA hosts should not treat shared GPU allocations as PCIe spill, and `LLAMA_LOAD_MODE_AUTO` handles devices without `mmap_support` automatically.
-- **Ternary, 1-bit, and FP4/FP8 GGUFs**: compact block formats shrink weight footprints dramatically — `Q1_0` (18 B / 128 elems, ~1.125 bpw), `PTQ1_0` (28 B / 128 elems, ~1.75 bpw), `PQ2_0` (34 B / 128 elems, ~2.125 bpw), `PQ2_0M` (36 B / 128 elems, KV-only), `Q2_0` (18 B / 64 elems, ~2.25 bpw), `NVFP4` (36 B / 64 elems, ~4.5 bpw), and `F8_E4M3` (1 B / elem, 8 bpw). Because weights occupy much less VRAM per parameter, KV cache sizing (`--cache-type-k`/`--cache-type-v`, Flash Attention) and context budget become the dominant VRAM lever on 16 GB cards. Running these files requires a matching runtime build: mainline `llama.cpp >= b11556` for stock `Q2_0`/`Q1_0`/`NVFP4`/`F8_E4M3`, or `PrismML-Eng/llama.cpp` (`prism` branch) for Hadamard-transformed `PQ2_0`/`PTQ1_0`/`PQ2_0M` (`prism.hadamard.*`); see [BACKENDS.md](BACKENDS.md#upstream-llamacpp-pin-and-ternary--prismml-overrides).
+- **Ternary, 1-bit, and FP4/FP8 GGUFs**: compact block formats shrink weight footprints dramatically — `Q1_0` (18 B / 128 elems, ~1.125 bpw), `PTQ1_0` (28 B / 128 elems, ~1.75 bpw), `PQ2_0` (34 B / 128 elems, ~2.125 bpw), `PQ2_0M` (36 B / 128 elems, KV-only), `Q2_0` (18 B / 64 elems, ~2.25 bpw), `NVFP4` (36 B / 64 elems, ~4.5 bpw), and `F8_E4M3` (1 B / elem, 8 bpw). Because weights occupy much less VRAM per parameter, KV cache sizing (`--cache-type-k`/`--cache-type-v`, Flash Attention) and context budget become the dominant VRAM lever on 16 GB cards. Running these files requires a matching runtime build: mainline `llama.cpp >= b11556` for stock `Q2_0`/`Q1_0`/`NVFP4`/`F8_E4M3`, or `PrismML-Eng/llama.cpp` (`prism` branch) for Hadamard-transformed `PQ2_0`/`PTQ1_0`/`PQ2_0M` (`prism.hadamard.*`); see [GPU_SUPPORT.md](GPU_SUPPORT.md) and [BACKENDS.md](BACKENDS.md#upstream-llamacpp-pin-and-ternary--prismml-overrides).
 
-## Step 2 — per-model placement profiles (design)
+## Step 2 — per-model and co-residency placement planner (implemented)
 
-Today the operator picks overrides per `serve` invocation. [Launch profiles](integration/launch-profiles.md)
-now read the GGUF header for a VRAM fit estimate (weights of the offloaded
-blocks, hybrid-aware KV bytes per token with sliding-window layers at their
-window-sized cache, recurrent state, compute), but do not choose a
-placement. The next step is a placement profile per model, derived from the
-GGUF metadata:
+Header-only placement planning is implemented in
+`src/server/include/sonder/inference/placement_planner.hpp`
+(`plan_model_placement()`, `placement_plan_to_json()`) and
+`src/server/include/sonder/inference/coresidency_planner.hpp`
+(`plan_coresident_models()`, `coresidency_plan_to_json()`), exposed through
+`sonder-infer plan` ([CLI.md](CLI.md)) and `POST /v1/sonder/plan`
+([SERVER.md](SERVER.md#post-v1sonderplan)). It reads only GGUF headers plus
+live GPU inventory (DXGI, NVML, or `amdgpu` sysfs) and host memory without
+loading model weights:
 
 | Field | Source |
 |---|---|
-| total weight bytes, per tensor class (attention, dense FFN, experts, shared, embeddings) | GGUF tensor table |
-| experts per layer / experts used per token | `*.expert_count`, `*.expert_used_count` |
-| KV bytes per token at a given context | attention-layer count × KV head dims × dtype (exclude recurrent layers) |
-| recurrent-state checkpoint bytes | backend-reported state size per saved position, budgeted separately from token-indexed KV |
+| total weight bytes, per tensor class (attention, dense FFN, experts, shared, embeddings) | GGUF tensor table (`gguf_header.cpp`) |
+| experts per layer / experts used per token | `<arch>.expert_count`, `<arch>.expert_used_count` (`routed_experts`) |
+| KV bytes per token at a given context | attention-layer count × KV head dims × dtype, with sliding-window layers sized to their window and recurrent layers excluded |
+| recurrent-state & rollback snapshot bytes | `<arch>.ssm.*` state per sequence × `(1 + draft_n_max)` when rollback speculation (`draft-mtp`, `draft-eagle3`, `draft-dflash`, `draft-dspark`) is enabled |
+| PrismML Hadamard & low-bit tensor traits | `prism.hadamard.*` keys and `ggml_type` IDs (`40`–`43`, `142`, `143`, `145`) |
+
+- **Single-model planner (`plan_model_placement`)**: selects the target GPU
+  (preferring discrete GPUs over integrated UMA unless pinned by `device_hint`),
+  applies vendor defaults (NVIDIA RTX `flash_attn=on`, `load_mode=none`; AMD RX
+  XT `flash_attn=auto`, `GPU_MAX_ALLOC_PERCENT=100`; Ryzen APU `uma_mode=true`
+  with host-RAM pool cap and bandwidth warning), auto-expands to same-vendor
+  multi-GPU `split_mode=layer` + proportional `tensor_split` when a single GPU
+  cannot fit, flags `requires_prism_runtime` on Hadamard/PrismML GGUFs, enables
+  `draft-mtp` (when `nextn_layers > 0`) or `ngram-mod` (on ternary/1-bit
+  models), and runs a deterministic iterative fit solver via `estimate_vram()`:
+  `q4_0/q4_0` KV -> binary-searched `--n-cpu-moe N` (restoring `q8_0/q8_0` if
+  it fits at the same `N`) -> MTP rollback trim -> 4096-aligned `ctx_size`
+  step-down -> MTP drop / CPU `mmproj` -> binary-searched `n_gpu_layers` ->
+  `no_repack` / CPU-only fallback.
+- **Multi-model co-residency planner (`plan_coresident_models`)**: invoked via
+  repeatable `sonder-infer plan --model A.gguf --model B.gguf`
+  (`sonder.inference.coresidency_plan/1`) and mirrored by multi-profile
+  aggregate VRAM gating in `sonder-infer serve --profile A --profile B` /
+  `--all-profiles`. Schedules models sequentially in input order, reserves
+  OS/desktop `vram_headroom_mib` once per occupied GPU (not double-counted per
+  co-resident model), deducts discrete VRAM, multi-GPU split shards, and UMA
+  shared host RAM without double-counting, and overflows unpinned models to a
+  second GPU, iGPU, or CPU when GPU 0 fills.
+- **Telemetry follow-up**: publishing the chosen per-tensor-class placement in
+  `model.loaded` telemetry for Observatory remains a follow-up.
+
+```sh
+# Single-model LaunchProfile + VRAM fit plan (header-only)
+sonder-infer plan --model model.gguf --ctx 32768 --json
+
+# Multi-model co-residency plan across host GPUs and RAM
+sonder-infer plan --model bonsai-27b.gguf --model bonsai-9b-mtp.gguf --json
+```
 
 ### Routed-expert header observations
 
@@ -185,21 +232,15 @@ active parameter totals or measured routing frequencies.
 The pair describes only the supplied GGUF header bytes. Neither
 `parse_gguf_model_info` nor `read_gguf_model_info` binds those bytes to an
 immutable full-model revision, and a header hash would not be a full-model
-hash. The observation is not propagated to `ModelDescriptor`, the C ABI,
-HTTP metadata or Runtime and is not consumed by placement, cache reuse or
-routing policy. Those follow-ups require an exact same-artifact revision
-binding and separate qualification. Backend execution capability bits and
-Runtime task-quality evidence remain separate from physical model traits.
-No model-quality, inference-speed or hardware recommendation follows from
-synthetic header tests. The current VRAM arithmetic and manual tensor
-placement rules remain unchanged.
-
-A planner then chooses the cheapest placement that fits. It fills VRAM in
-priority order: hot shared weights, then KV cache for the requested context,
-then as many expert blocks as fit (whole layers' experts at a time). The rest
-goes to RAM. The chosen placement should be published in the `model.loaded`
-telemetry event, so the Observatory can show where each tensor class lives
-rather than guessing.
+hash. `plan_model_placement()` uses `routed_experts` together with the GGUF
+tensor table solely to decide whether to search `--n-cpu-moe` expert-offload
+candidates (and `estimate_vram()` uses the declared active/total ratio for
+mmapped host-expert residency estimates); the pair is not propagated to
+`ModelDescriptor`, the C ABI, or Runtime routing policy, and does not establish
+measured routing frequencies or model/task quality. Backend execution
+capability bits and Runtime task-quality evidence remain separate from physical
+model traits. No model-quality, inference-speed or hardware recommendation
+follows from synthetic header tests.
 
 ## Step 3 — NVMe as a cold tier (design)
 
@@ -211,6 +252,11 @@ selects, so this step needs expert-usage telemetry (routing histograms) first.
 Without data it is guesswork.
 
 ## Step 4 — Sonder-wide device scheduling (design)
+
+Local node capability inventory is now implemented (`sonder-infer node` and
+`GET /v1/sonder/node`, schema `sonder.inference.node/1`) so each host reports
+its CPU, host memory, GPUs, backends, models, profiles, and feature flags.
+Multi-host scheduling remains design work:
 
 In the runtime, the Ollama pool already schedules whole requests across hosts
 (for example, the reasoning tier served by a second host's integrated GPU while the workstation

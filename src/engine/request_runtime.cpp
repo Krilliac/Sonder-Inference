@@ -10,6 +10,7 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -37,13 +38,94 @@ private:
 
 std::uint32_t at_least_one(std::uint32_t v) { return v == 0 ? 1u : v; }
 
-kvc::KvCacheConfig make_cache_config(const SchedulingOptions& o) {
+kvc::KvCacheConfig make_cache_config(const SchedulingOptions& o, const CheckpointStoreOptions& cp) {
     kvc::KvCacheConfig c;
     c.block_size_tokens = at_least_one(o.kv_block_size_tokens);
     c.num_blocks = at_least_one(o.kv_num_blocks);
     c.enable_prefix_caching = o.prefix_caching;
+    c.max_checkpoint_bytes = cp.max_bytes;
+    c.max_checkpoints = cp.max_checkpoints;
     return c;
 }
+
+// Bounded, leaf-mutex-protected store for serialized recurrent-state blobs.
+// Entries are keyed 1:1 with KvCacheManager checkpoints via CheckpointHandle
+// and evicted synchronously whenever KvCacheManager emits checkpoint_evicted.
+class CheckpointBlobStore {
+public:
+    explicit CheckpointBlobStore(std::uint64_t max_bytes) noexcept : max_bytes_(max_bytes) {}
+
+    [[nodiscard]] std::uint64_t max_bytes() const noexcept { return max_bytes_; }
+
+    bool put(const CheckpointHandle& handle, std::shared_ptr<const std::vector<std::uint8_t>> blob) {
+        if (!blob || blob->empty()) {
+            return false;
+        }
+        const auto size = static_cast<std::uint64_t>(blob->size());
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (size > max_bytes_) {
+            return false;
+        }
+        auto existing = blobs_.find(handle);
+        std::uint64_t existing_bytes = 0;
+        if (existing != blobs_.end() && existing->second) {
+            existing_bytes = static_cast<std::uint64_t>(existing->second->size());
+        }
+        const std::uint64_t base_bytes = total_bytes_ >= existing_bytes ? (total_bytes_ - existing_bytes) : 0;
+        if (size > max_bytes_ - base_bytes) {
+            return false;
+        }
+        if (existing != blobs_.end()) {
+            existing->second = std::move(blob);
+        } else {
+            blobs_.emplace(handle, std::move(blob));
+        }
+        total_bytes_ = base_bytes + size;
+        return true;
+    }
+
+    [[nodiscard]] std::shared_ptr<const std::vector<std::uint8_t>> get(const CheckpointHandle& handle) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = blobs_.find(handle);
+        return it == blobs_.end() ? nullptr : it->second;
+    }
+
+    bool erase(const CheckpointHandle& handle) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = blobs_.find(handle);
+        if (it == blobs_.end()) {
+            return false;
+        }
+        const std::uint64_t sz = it->second ? static_cast<std::uint64_t>(it->second->size()) : 0;
+        total_bytes_ = total_bytes_ >= sz ? (total_bytes_ - sz) : 0;
+        blobs_.erase(it);
+        ++evictions_;
+        return true;
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        blobs_.clear();
+        total_bytes_ = 0;
+    }
+
+    [[nodiscard]] CheckpointStoreUsage usage() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        CheckpointStoreUsage u;
+        u.entries = blobs_.size();
+        u.total_bytes = total_bytes_;
+        u.max_bytes = max_bytes_;
+        u.evictions = evictions_;
+        return u;
+    }
+
+private:
+    std::uint64_t max_bytes_ = 0;
+    mutable std::mutex mutex_;
+    std::map<CheckpointHandle, std::shared_ptr<const std::vector<std::uint8_t>>> blobs_;
+    std::uint64_t total_bytes_ = 0;
+    std::uint64_t evictions_ = 0;
+};
 
 sch::SchedulerConfig make_scheduler_config(const SchedulingOptions& o) {
     sch::SchedulerConfig c;
@@ -94,15 +176,19 @@ struct Req {
     // false: one admission grant at the end of the logical prefill, then the
     // session streams without grants (SchedulerMode::account).
     bool gated = true;
+    bool retain_for_checkpoint = false;
+    std::optional<RestoredCheckpoint> restored_checkpoint;
     RuntimeRequestSummary summary;
 };
 
 class SchedulingRuntime final : public RequestRuntime {
 public:
-    SchedulingRuntime(const SchedulingOptions& options, TelemetryBus& bus, TelemetryContext engine_context)
+    SchedulingRuntime(const SchedulingOptions& options, TelemetryBus& bus, TelemetryContext engine_context,
+                      CheckpointStoreOptions checkpoint_options)
         : bus_(bus),
           engine_ctx_(std::move(engine_context)),
-          cache_(make_cache_config(options)),
+          blob_store_(checkpoint_options.max_bytes),
+          cache_(make_cache_config(options, checkpoint_options)),
           adapter_(cache_),
           scheduler_(make_scheduler_config(options), clock_, adapter_),
           stall_timeout_(std::max<std::uint32_t>(1, options.step_stall_timeout_ms)),
@@ -110,8 +196,15 @@ public:
         cache_.set_event_listener([this](const kvc::CacheEvent& e) { on_cache_event(e); });
         // Free a request's sequence the moment the scheduler drops its
         // reservation so preemption sees the blocks come back (recompute).
+        // Checkpoint-enabled requests keep their sequence attached on normal
+        // scheduler completion until Session registers any captured checkpoint
+        // and calls finish().
         adapter_.set_release_hook([this](sch::RequestId id) {
             if (Req* r = find(id)) {
+                if (r->retain_for_checkpoint && !r->done && release_reason_ != nullptr &&
+                    std::string_view(release_reason_) == "completed") {
+                    return;
+                }
                 free_cache(*r, release_reason_);
             }
         });
@@ -127,6 +220,8 @@ public:
         if (thread_.joinable()) {
             thread_.join();
         }
+        cache_.set_event_listener({});
+        blob_store_.clear();
     }
 
     Result<RuntimeSubmission> submit(RuntimeRequestSpec spec) override {
@@ -236,6 +331,7 @@ public:
         r.cache_priority = static_cast<kvc::Priority>(std::clamp(6 - rank, 0, 255));
         r.submitted_at = clock_.now();
         r.gated = spec.gated;
+        r.retain_for_checkpoint = spec.retain_for_checkpoint;
         r.admission = std::move(spec.admission);
         bus_.emit("scheduler.enqueued", r.ctx,
                   json::Object{{"scheduler_request_id", id},
@@ -321,13 +417,14 @@ public:
             }
             Req& r = it->second;
             r.done = true;
+            r.restored_checkpoint.reset();
             const auto state = scheduler_.state(id);
             bool terminal = !state || sch::is_terminal(*state);
             if (!terminal) {
                 const bool running = *state == sch::RequestState::Prefill || *state == sch::RequestState::Decode;
                 if (outcome != RequestOutcome::completed || !running) {
                     // Releases the KV reservation (and the sequence) immediately.
-                    release_reason_ = to_string(outcome);
+                    ScopedReleaseReason guard(release_reason_, to_string(outcome));
                     (void)scheduler_.cancel(id);
                     terminal = true;
                 }
@@ -345,6 +442,83 @@ public:
         cv_.notify_all();
         return summary;
     }
+
+    Status register_checkpoint(std::uint64_t id, std::uint64_t token_position,
+                               std::vector<std::uint8_t> bytes) override {
+        if (token_position == 0) {
+            return Status(ErrorCode::invalid_argument, "checkpoint token_position must be > 0");
+        }
+        if constexpr (sizeof(std::size_t) < sizeof(std::uint64_t)) {
+            if (token_position > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+                return Status(ErrorCode::invalid_argument, "checkpoint token_position exceeds addressable range");
+            }
+        }
+        if (bytes.empty()) {
+            return Status(ErrorCode::invalid_argument, "checkpoint state is empty");
+        }
+        if (bytes.size() > kMaxRecurrentCheckpointBytes) {
+            return Status(ErrorCode::invalid_argument, "checkpoint state exceeds kMaxRecurrentCheckpointBytes");
+        }
+        std::lock_guard<std::mutex> lock(mu_);
+        if (static_cast<std::uint64_t>(bytes.size()) > blob_store_.max_bytes()) {
+            return Status(ErrorCode::invalid_argument, "checkpoint state exceeds checkpoint store budget");
+        }
+        Req* r = find(id);
+        if (r == nullptr || !r->in_cache) {
+            return Status(ErrorCode::not_found, "active cache sequence not found for checkpoint registration");
+        }
+        if (r->architecture == ModelArchitecture::attention_only) {
+            return Status(ErrorCode::invalid_argument,
+                          "recurrent checkpoints require hybrid or recurrent architecture");
+        }
+        const auto pos = static_cast<std::size_t>(token_position);
+        const auto byte_size = static_cast<std::uint64_t>(bytes.size());
+        Status st = cache_.save_checkpoint(id, pos, byte_size);
+        if (!st.ok()) {
+            flush_cache_events(r->ctx, id);
+            return st;
+        }
+        const CheckpointHandle handle{id, token_position};
+        auto blob = std::make_shared<const std::vector<std::uint8_t>>(std::move(bytes));
+        if (!blob_store_.put(handle, std::move(blob))) {
+            // Roll back cache bookkeeping without emitting a spurious
+            // kv.checkpoint.evicted event for a blob that was never stored.
+            const std::size_t prev_evicted = checkpoint_evicted_pending_;
+            const std::uint64_t prev_bytes = checkpoint_evicted_bytes_pending_;
+            (void)cache_.remove_checkpoint(id, pos);
+            checkpoint_evicted_pending_ = prev_evicted;
+            checkpoint_evicted_bytes_pending_ = prev_bytes;
+            flush_cache_events(r->ctx, id);
+            return Status(ErrorCode::unavailable, "checkpoint blob store budget exceeded");
+        }
+        flush_cache_events(r->ctx, id);
+        return Status::success();
+    }
+
+    std::optional<RestoredCheckpoint> lookup_restored_checkpoint(std::uint64_t id) const override {
+        std::lock_guard<std::mutex> lock(mu_);
+        const auto it = reqs_.find(id);
+        if (it == reqs_.end()) {
+            return std::nullopt;
+        }
+        return it->second.restored_checkpoint;
+    }
+
+    void release_checkpoint_retention(std::uint64_t id) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        Req* r = find(id);
+        if (r == nullptr || !r->retain_for_checkpoint) {
+            return;
+        }
+        r->retain_for_checkpoint = false;
+        const auto state = scheduler_.state(id);
+        const bool terminal = !state || sch::is_terminal(*state);
+        if (terminal || !r->gated) {
+            free_cache(*r, "completed");
+        }
+    }
+
+    CheckpointStoreUsage checkpoint_store_usage() const override { return blob_store_.usage(); }
 
     std::size_t tracked_requests() const override {
         std::lock_guard<std::mutex> lock(mu_);
@@ -370,6 +544,18 @@ public:
     }
 
 private:
+    class ScopedReleaseReason {
+    public:
+        ScopedReleaseReason(const char*& slot, const char* next) noexcept : slot_(slot), prev_(slot) { slot_ = next; }
+        ~ScopedReleaseReason() noexcept { slot_ = prev_; }
+        ScopedReleaseReason(const ScopedReleaseReason&) = delete;
+        ScopedReleaseReason& operator=(const ScopedReleaseReason&) = delete;
+
+    private:
+        const char*& slot_;
+        const char* prev_;
+    };
+
     Req* find(sch::RequestId id) {
         auto it = reqs_.find(id);
         return it == reqs_.end() ? nullptr : &it->second;
@@ -380,6 +566,12 @@ private:
             ++evicted_pending_;
         } else if (e.kind == kvc::CacheEvent::Kind::pressure_changed) {
             pressure_pending_ = e.pressure;
+        } else if (e.kind == kvc::CacheEvent::Kind::checkpoint_evicted && e.checkpoint) {
+            const CheckpointHandle handle{static_cast<std::uint64_t>(e.checkpoint->owner),
+                                          static_cast<std::uint64_t>(e.checkpoint->position)};
+            blob_store_.erase(handle);
+            ++checkpoint_evicted_pending_;
+            checkpoint_evicted_bytes_pending_ += e.checkpoint->state_size;
         }
     }
 
@@ -392,6 +584,16 @@ private:
                                    {"total_evictions", cache_.stats().evictions}},
                       TelemetryLevel::metrics);
             evicted_pending_ = 0;
+        }
+        if (checkpoint_evicted_pending_ > 0) {
+            bus_.emit("kv.checkpoint.evicted", ctx,
+                      json::Object{{"checkpoints", checkpoint_evicted_pending_},
+                                   {"bytes", checkpoint_evicted_bytes_pending_},
+                                   {"trigger_scheduler_request_id", trigger},
+                                   {"total_checkpoint_evictions", cache_.stats().checkpoint_evictions}},
+                      TelemetryLevel::metrics);
+            checkpoint_evicted_pending_ = 0;
+            checkpoint_evicted_bytes_pending_ = 0;
         }
         if (pressure_pending_) {
             const auto s = cache_.stats();
@@ -449,8 +651,10 @@ private:
         Status st = cache_.append_tokens(r.id, span, &result);
         flush_cache_events(r.ctx, r.id);
         if (!st.ok()) {
-            release_reason_ = "failed";
-            (void)scheduler_.cancel(r.id);
+            {
+                ScopedReleaseReason guard(release_reason_, "failed");
+                (void)scheduler_.cancel(r.id);
+            }
             fail(r, Status(ErrorCode::unavailable, "KV cache exhausted: " + st.message()));
             return false;
         }
@@ -488,6 +692,7 @@ private:
                 continue;
             }
             ++r->summary.preemptions;
+            r->restored_checkpoint.reset();
             free_cache(*r, "preempted");
             bus_.emit("scheduler.preempted", r->ctx,
                       json::Object{{"scheduler_request_id", ev.id},
@@ -515,6 +720,7 @@ private:
                 r->summary.queue_ms = r->admission ? r->admission->queue_ms() : queue_ms;
             }
             r->admission_reused = 0;
+            r->restored_checkpoint.reset();
             bus_.emit("scheduler.admitted", r->ctx,
                       json::Object{{"scheduler_request_id", id},
                                    {"step", plan.step_index},
@@ -536,6 +742,13 @@ private:
             if (w.phase == sch::Phase::Prefill) {
                 if (!append(*r, w.context_offset, w.num_tokens, ar)) {
                     continue;
+                }
+                if (ar.checkpoint) {
+                    const CheckpointHandle handle{static_cast<std::uint64_t>(ar.checkpoint->owner),
+                                                  static_cast<std::uint64_t>(ar.checkpoint->position)};
+                    if (auto blob = blob_store_.get(handle)) {
+                        r->restored_checkpoint = RestoredCheckpoint{handle, std::move(blob)};
+                    }
                 }
                 r->admission_reused += ar.tokens_reused;
                 const bool recompute = r->summary.preemptions > 0;
@@ -672,12 +885,16 @@ private:
                 continue;
             }
             const sch::TimeUs started = clock_.now();
-            release_reason_ = "preempted";
-            const sch::StepPlan plan = scheduler_.plan_step();
-            release_reason_ = "completed";
+            const sch::StepPlan plan = [&] {
+                ScopedReleaseReason guard(release_reason_, "preempted");
+                return scheduler_.plan_step();
+            }();
             const std::vector<sch::RequestId> lagging = apply_plan(plan);
             if (plan.empty()) {
-                scheduler_.complete_step(plan);
+                {
+                    ScopedReleaseReason guard(release_reason_, "completed");
+                    scheduler_.complete_step(plan);
+                }
                 post_step(plan, started);
                 cv_.notify_all();
                 if (!plan.preempted.empty() || !plan.admitted.empty() || !plan.failed.empty()) {
@@ -739,7 +956,10 @@ private:
                     (void)append(*r, w.context_offset, w.phase == sch::Phase::Prefill ? w.num_tokens : 1, ar);
                 }
             }
-            scheduler_.complete_step(plan, outcome);
+            {
+                ScopedReleaseReason guard(release_reason_, "completed");
+                scheduler_.complete_step(plan, outcome);
+            }
             post_step(plan, started);
             cv_.notify_all();
         }
@@ -750,6 +970,7 @@ private:
     TelemetryBus& bus_;
     TelemetryContext engine_ctx_;
     SteadyClock clock_;
+    CheckpointBlobStore blob_store_;
     kvc::KvCacheManager cache_;
     KvCacheCapacityAdapter adapter_;
     sch::Scheduler scheduler_;
@@ -760,6 +981,8 @@ private:
     sch::RequestId next_id_ = 1;
     std::uint64_t generation_ = 0;
     std::size_t evicted_pending_ = 0;
+    std::size_t checkpoint_evicted_pending_ = 0;
+    std::uint64_t checkpoint_evicted_bytes_pending_ = 0;
     std::optional<kvc::PressureLevel> pressure_pending_;
     const char* release_reason_ = "completed";  // kv.freed reason for the release hook
     std::chrono::milliseconds stall_timeout_;
@@ -771,11 +994,12 @@ private:
 }  // namespace
 
 std::unique_ptr<RequestRuntime> make_request_runtime(const SchedulingOptions& options, TelemetryBus& bus,
-                                                     TelemetryContext engine_context) {
+                                                     TelemetryContext engine_context,
+                                                     CheckpointStoreOptions checkpoint_options) {
     if (!options.enabled) {
         return nullptr;
     }
-    return std::make_unique<SchedulingRuntime>(options, bus, std::move(engine_context));
+    return std::make_unique<SchedulingRuntime>(options, bus, std::move(engine_context), checkpoint_options);
 }
 
 }  // namespace sonder::inference::detail
@@ -784,7 +1008,8 @@ std::unique_ptr<RequestRuntime> make_request_runtime(const SchedulingOptions& op
 
 namespace sonder::inference::detail {
 
-std::unique_ptr<RequestRuntime> make_request_runtime(const SchedulingOptions&, TelemetryBus&, TelemetryContext) {
+std::unique_ptr<RequestRuntime> make_request_runtime(const SchedulingOptions&, TelemetryBus&, TelemetryContext,
+                                                     CheckpointStoreOptions) {
     return nullptr;
 }
 

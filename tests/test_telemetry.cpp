@@ -284,6 +284,7 @@ TEST_CASE("devices are sampled periodically") {
     EngineOptions eo;
     eo.telemetry_sinks.push_back(sink);
     eo.sample_devices_on_start = false;
+    eo.sample_gpu_devices = false;
     eo.device_sample_interval = std::chrono::milliseconds(10);
     std::size_t samples = 0;
     {
@@ -1047,4 +1048,440 @@ TEST_CASE("mock generation survives a failed telemetry sink without capturing te
     }
     CHECK(completed);
     check_sink_sequences(lines, engine.telemetry().instance_id());
+}
+
+TEST_CASE("gpu_memory_sample_attributes covers discrete RTX, AMD RX XT, Ryzen APU UMA, and unknown readings") {
+    constexpr std::uint64_t kMiB = 1024ull * 1024ull;
+    constexpr std::uint64_t kGiB = 1024ull * kMiB;
+
+    // 1. NVIDIA RTX discrete GPU.
+    GpuDeviceInfo rtx;
+    rtx.id = "gpu:0";
+    rtx.name = "NVIDIA GeForce RTX 5070 Ti";
+    rtx.vendor = GpuVendor::nvidia;
+    rtx.vendor_id = 0x10DEu;
+    rtx.device_id = 0x2C05u;
+    rtx.dedicated_total = MemoryReading::known(16303 * kMiB);
+    rtx.dedicated_free = MemoryReading::known(14800 * kMiB);
+    rtx.shared_total = MemoryReading::known(16 * kGiB);
+    rtx.is_integrated_uma = false;
+    rtx.backend_hint = "cuda";
+    rtx.source = "dxgi";
+
+    const json::Object rtx_attrs = gpu_memory_sample_attributes(rtx);
+    REQUIRE(rtx_attrs.find("kind") != nullptr);
+    CHECK(rtx_attrs.find("kind")->as_string() == "gpu");
+    REQUIRE(rtx_attrs.find("name") != nullptr);
+    CHECK(rtx_attrs.find("name")->as_string() == "NVIDIA GeForce RTX 5070 Ti");
+    REQUIRE(rtx_attrs.find("vendor") != nullptr);
+    CHECK(rtx_attrs.find("vendor")->as_string() == "nvidia");
+    REQUIRE(rtx_attrs.find("vendor_id") != nullptr);
+    CHECK(rtx_attrs.find("vendor_id")->as_uint() == std::uint64_t{0x10DEu});
+    REQUIRE(rtx_attrs.find("device_id") != nullptr);
+    CHECK(rtx_attrs.find("device_id")->as_uint() == std::uint64_t{0x2C05u});
+    REQUIRE(rtx_attrs.find("is_integrated_uma") != nullptr);
+    CHECK_FALSE(rtx_attrs.find("is_integrated_uma")->as_bool());
+    REQUIRE(rtx_attrs.find("backend_hint") != nullptr);
+    CHECK(rtx_attrs.find("backend_hint")->as_string() == "cuda");
+    REQUIRE(rtx_attrs.find("source") != nullptr);
+    CHECK(rtx_attrs.find("source")->as_string() == "dxgi");
+    REQUIRE(rtx_attrs.find("dedicated_total_bytes") != nullptr);
+    CHECK(rtx_attrs.find("dedicated_total_bytes")->as_uint() == 16303 * kMiB);
+    REQUIRE(rtx_attrs.find("total_bytes") != nullptr);
+    CHECK(rtx_attrs.find("total_bytes")->as_uint() == 16303 * kMiB);
+    REQUIRE(rtx_attrs.find("dedicated_free_bytes") != nullptr);
+    CHECK(rtx_attrs.find("dedicated_free_bytes")->as_uint() == 14800 * kMiB);
+    REQUIRE(rtx_attrs.find("available_bytes") != nullptr);
+    CHECK(rtx_attrs.find("available_bytes")->as_uint() == 14800 * kMiB);
+    REQUIRE(rtx_attrs.find("used_bytes") != nullptr);
+    CHECK(rtx_attrs.find("used_bytes")->as_uint() == 1503 * kMiB);
+    REQUIRE(rtx_attrs.find("shared_total_bytes") != nullptr);
+    CHECK(rtx_attrs.find("shared_total_bytes")->as_uint() == 16 * kGiB);
+    REQUIRE(rtx_attrs.find("effective_vram_mib") != nullptr);
+    CHECK(rtx_attrs.find("effective_vram_mib")->as_uint() == std::uint64_t{16303});
+    REQUIRE(rtx_attrs.find("effective_free_vram_mib") != nullptr);
+    CHECK(rtx_attrs.find("effective_free_vram_mib")->as_uint() == std::uint64_t{14800});
+
+    // Known-zero free VRAM on a discrete GPU reports 0 free and full used_bytes.
+    GpuDeviceInfo rtx_full = rtx;
+    rtx_full.dedicated_free = MemoryReading::known(0);
+    const json::Object rtx_full_attrs = gpu_memory_sample_attributes(rtx_full);
+    REQUIRE(rtx_full_attrs.find("dedicated_free_bytes") != nullptr);
+    CHECK(rtx_full_attrs.find("dedicated_free_bytes")->as_uint() == std::uint64_t{0});
+    REQUIRE(rtx_full_attrs.find("available_bytes") != nullptr);
+    CHECK(rtx_full_attrs.find("available_bytes")->as_uint() == std::uint64_t{0});
+    REQUIRE(rtx_full_attrs.find("used_bytes") != nullptr);
+    CHECK(rtx_full_attrs.find("used_bytes")->as_uint() == 16303 * kMiB);
+    REQUIRE(rtx_full_attrs.find("effective_free_vram_mib") != nullptr);
+    CHECK(rtx_full_attrs.find("effective_free_vram_mib")->as_uint() == std::uint64_t{0});
+
+    // Anomalous free > total omits used_bytes rather than underflowing.
+    GpuDeviceInfo rtx_anomalous = rtx;
+    rtx_anomalous.dedicated_free = MemoryReading::known(17000 * kMiB);
+    const json::Object rtx_anomalous_attrs = gpu_memory_sample_attributes(rtx_anomalous);
+    CHECK(rtx_anomalous_attrs.find("used_bytes") == nullptr);
+
+    // Envelope round-trip obeys sonder.observatory.event/1.
+    TelemetryBus bus;
+    auto gpu_ctx = ctx_s();
+    gpu_ctx.device_id = rtx.id;
+    const auto parsed_env = json::parse(json::Value(bus.make_envelope("device.memory.sample", gpu_ctx, rtx_attrs, 0)).dump());
+    REQUIRE(parsed_env.ok());
+    check_envelope(parsed_env.value());
+    CHECK(parsed_env.value().find("device_id")->as_string() == "gpu:0");
+
+    // 2. AMD Radeon RX XT discrete GPU.
+    GpuDeviceInfo rx7900xt;
+    rx7900xt.id = "gpu:0";
+    rx7900xt.name = "AMD Radeon RX 7900 XT";
+    rx7900xt.vendor = GpuVendor::amd;
+    rx7900xt.vendor_id = 0x1002u;
+    rx7900xt.device_id = 0x744Cu;
+    rx7900xt.dedicated_total = MemoryReading::known(20 * kGiB);
+    rx7900xt.dedicated_free = MemoryReading::known(18 * kGiB);
+    rx7900xt.shared_total = MemoryReading::known(16 * kGiB);
+    rx7900xt.is_integrated_uma = false;
+    rx7900xt.backend_hint = "rocm";
+    rx7900xt.source = "amdgpu-sysfs";
+
+    const json::Object amd_attrs = gpu_memory_sample_attributes(rx7900xt);
+    CHECK(amd_attrs.find("kind")->as_string() == "gpu");
+    CHECK(amd_attrs.find("name")->as_string() == "AMD Radeon RX 7900 XT");
+    CHECK(amd_attrs.find("vendor")->as_string() == "amd");
+    CHECK(amd_attrs.find("vendor_id")->as_uint() == std::uint64_t{0x1002u});
+    CHECK(amd_attrs.find("device_id")->as_uint() == std::uint64_t{0x744Cu});
+    CHECK_FALSE(amd_attrs.find("is_integrated_uma")->as_bool());
+    CHECK(amd_attrs.find("backend_hint")->as_string() == "rocm");
+    CHECK(amd_attrs.find("source")->as_string() == "amdgpu-sysfs");
+    REQUIRE(amd_attrs.find("dedicated_total_bytes") != nullptr);
+    CHECK(amd_attrs.find("dedicated_total_bytes")->as_uint() == 20 * kGiB);
+    REQUIRE(amd_attrs.find("total_bytes") != nullptr);
+    CHECK(amd_attrs.find("total_bytes")->as_uint() == 20 * kGiB);
+    REQUIRE(amd_attrs.find("dedicated_free_bytes") != nullptr);
+    CHECK(amd_attrs.find("dedicated_free_bytes")->as_uint() == 18 * kGiB);
+    REQUIRE(amd_attrs.find("available_bytes") != nullptr);
+    CHECK(amd_attrs.find("available_bytes")->as_uint() == 18 * kGiB);
+    REQUIRE(amd_attrs.find("used_bytes") != nullptr);
+    CHECK(amd_attrs.find("used_bytes")->as_uint() == 2 * kGiB);
+    REQUIRE(amd_attrs.find("shared_total_bytes") != nullptr);
+    CHECK(amd_attrs.find("shared_total_bytes")->as_uint() == 16 * kGiB);
+    REQUIRE(amd_attrs.find("effective_vram_mib") != nullptr);
+    CHECK(amd_attrs.find("effective_vram_mib")->as_uint() == std::uint64_t{20480});
+    REQUIRE(amd_attrs.find("effective_free_vram_mib") != nullptr);
+    CHECK(amd_attrs.find("effective_free_vram_mib")->as_uint() == std::uint64_t{18432});
+
+    // 3. AMD Ryzen APU integrated UMA GPU.
+    GpuDeviceInfo apu;
+    apu.id = "gpu:1";
+    apu.name = "AMD Radeon 780M Graphics";
+    apu.vendor = GpuVendor::amd;
+    apu.vendor_id = 0x1002u;
+    apu.device_id = 0x15BFu;
+    apu.dedicated_total = MemoryReading::known(512 * kMiB);
+    apu.dedicated_free = MemoryReading::known(384 * kMiB + 14 * kGiB);
+    apu.shared_total = MemoryReading::known(16 * kGiB);
+    apu.is_integrated_uma = true;
+    apu.backend_hint = "rocm";
+    apu.source = "amdgpu-sysfs";
+
+    const json::Object apu_attrs = gpu_memory_sample_attributes(apu);
+    CHECK(apu_attrs.find("kind")->as_string() == "gpu");
+    CHECK(apu_attrs.find("name")->as_string() == "AMD Radeon 780M Graphics");
+    CHECK(apu_attrs.find("vendor")->as_string() == "amd");
+    CHECK(apu_attrs.find("is_integrated_uma")->as_bool());
+    REQUIRE(apu_attrs.find("dedicated_total_bytes") != nullptr);
+    CHECK(apu_attrs.find("dedicated_total_bytes")->as_uint() == 512 * kMiB);
+    REQUIRE(apu_attrs.find("dedicated_free_bytes") != nullptr);
+    CHECK(apu_attrs.find("dedicated_free_bytes")->as_uint() == 384 * kMiB + 14 * kGiB);
+    // UMA free spans dedicated + shared GTT, so generic total/available/used
+    // bytes are omitted rather than pairing unified free against a BIOS carveout.
+    CHECK(apu_attrs.find("total_bytes") == nullptr);
+    CHECK(apu_attrs.find("available_bytes") == nullptr);
+    CHECK(apu_attrs.find("used_bytes") == nullptr);
+    REQUIRE(apu_attrs.find("shared_total_bytes") != nullptr);
+    CHECK(apu_attrs.find("shared_total_bytes")->as_uint() == 16 * kGiB);
+    REQUIRE(apu_attrs.find("effective_vram_mib") != nullptr);
+    CHECK(apu_attrs.find("effective_vram_mib")->as_uint() == std::uint64_t{512 + 16384});
+    REQUIRE(apu_attrs.find("effective_free_vram_mib") != nullptr);
+    CHECK(apu_attrs.find("effective_free_vram_mib")->as_uint() == std::uint64_t{384 + 14336});
+
+    // UMA with unknown free reading keeps effective_vram_mib but omits effective_free_vram_mib.
+    GpuDeviceInfo apu_no_free = apu;
+    apu_no_free.dedicated_free = MemoryReading::unknown();
+    const json::Object apu_no_free_attrs = gpu_memory_sample_attributes(apu_no_free);
+    CHECK(apu_no_free_attrs.find("total_bytes") == nullptr);
+    CHECK(apu_no_free_attrs.find("dedicated_free_bytes") == nullptr);
+    CHECK(apu_no_free_attrs.find("available_bytes") == nullptr);
+    CHECK(apu_no_free_attrs.find("used_bytes") == nullptr);
+    REQUIRE(apu_no_free_attrs.find("effective_vram_mib") != nullptr);
+    CHECK(apu_no_free_attrs.find("effective_vram_mib")->as_uint() == std::uint64_t{512 + 16384});
+    CHECK(apu_no_free_attrs.find("effective_free_vram_mib") == nullptr);
+
+    // 4. Unknown memory readings omit all optional byte and MiB metrics.
+    GpuDeviceInfo unknown_gpu;
+    unknown_gpu.id = "gpu:2";
+    unknown_gpu.name = "Unknown GPU";
+    unknown_gpu.vendor = GpuVendor::unknown;
+    unknown_gpu.vendor_id = 0;
+    unknown_gpu.device_id = 0;
+    unknown_gpu.is_integrated_uma = false;
+    unknown_gpu.backend_hint = "";
+    unknown_gpu.source = "probe";
+
+    const json::Object unknown_attrs = gpu_memory_sample_attributes(unknown_gpu);
+    CHECK(unknown_attrs.find("kind")->as_string() == "gpu");
+    CHECK(unknown_attrs.find("name")->as_string() == "Unknown GPU");
+    CHECK(unknown_attrs.find("vendor")->as_string() == "unknown");
+    CHECK(unknown_attrs.find("vendor_id")->as_uint() == std::uint64_t{0});
+    CHECK(unknown_attrs.find("device_id")->as_uint() == std::uint64_t{0});
+    CHECK_FALSE(unknown_attrs.find("is_integrated_uma")->as_bool());
+    CHECK(unknown_attrs.find("backend_hint")->as_string().empty());
+    CHECK(unknown_attrs.find("source")->as_string() == "probe");
+    CHECK(unknown_attrs.find("dedicated_total_bytes") == nullptr);
+    CHECK(unknown_attrs.find("total_bytes") == nullptr);
+    CHECK(unknown_attrs.find("dedicated_free_bytes") == nullptr);
+    CHECK(unknown_attrs.find("available_bytes") == nullptr);
+    CHECK(unknown_attrs.find("used_bytes") == nullptr);
+    CHECK(unknown_attrs.find("shared_total_bytes") == nullptr);
+    CHECK(unknown_attrs.find("effective_vram_mib") == nullptr);
+    CHECK(unknown_attrs.find("effective_free_vram_mib") == nullptr);
+}
+
+TEST_CASE("engine startup honors sample_gpu_devices false vs true") {
+    // Disabled: no GPU enumeration, gpu_device_count == 0, zero GPU memory samples.
+    {
+        auto sink = std::make_shared<MemoryTelemetrySink>();
+        EngineOptions eo;
+        eo.telemetry_sinks.push_back(sink);
+        eo.sample_devices_on_start = true;
+        eo.sample_gpu_devices = false;
+        eo.device_sample_interval = std::chrono::milliseconds(0);
+        std::size_t cpu_count = 0;
+        {
+            Engine engine(std::move(eo));
+            CHECK(engine.gpu_devices().empty());
+            cpu_count = engine.devices().size();
+            engine.telemetry().flush();
+        }
+        std::size_t started_events = 0;
+        std::size_t cpu_samples = 0;
+        std::size_t gpu_samples = 0;
+        for (const auto& line : sink->lines()) {
+            const auto parsed = json::parse(line);
+            REQUIRE(parsed.ok());
+            check_envelope(parsed.value());
+            const std::string type = parsed.value().find("event_type")->as_string();
+            const json::Value* attrs = parsed.value().find("attributes");
+            REQUIRE(attrs != nullptr);
+            if (type == "engine.started") {
+                ++started_events;
+                REQUIRE(attrs->find("gpu_device_count") != nullptr);
+                CHECK(attrs->find("gpu_device_count")->as_uint() == std::uint64_t{0});
+                REQUIRE(attrs->find("device_count") != nullptr);
+                CHECK(attrs->find("device_count")->as_uint() == static_cast<std::uint64_t>(cpu_count));
+            } else if (type == "device.memory.sample") {
+                REQUIRE(attrs->find("kind") != nullptr);
+                const std::string kind = attrs->find("kind")->as_string();
+                if (kind == "cpu") {
+                    ++cpu_samples;
+                } else if (kind == "gpu") {
+                    ++gpu_samples;
+                }
+            }
+        }
+        CHECK(started_events == 1);
+        CHECK(cpu_samples == cpu_count);
+        CHECK(gpu_samples == 0);
+    }
+
+    // Enabled (default): gpu_device_count and startup GPU samples match engine.gpu_devices().
+    {
+        auto sink = std::make_shared<MemoryTelemetrySink>();
+        EngineOptions eo;
+        CHECK(eo.sample_gpu_devices);
+        eo.telemetry_sinks.push_back(sink);
+        eo.sample_devices_on_start = true;
+        eo.device_sample_interval = std::chrono::milliseconds(0);
+        std::vector<GpuDeviceInfo> gpus;
+        std::size_t cpu_count = 0;
+        {
+            Engine engine(std::move(eo));
+            gpus = engine.gpu_devices();
+            cpu_count = engine.devices().size();
+            engine.telemetry().flush();
+        }
+        std::size_t started_events = 0;
+        std::size_t cpu_samples = 0;
+        std::vector<json::Value> gpu_sample_events;
+        for (const auto& line : sink->lines()) {
+            const auto parsed = json::parse(line);
+            REQUIRE(parsed.ok());
+            check_envelope(parsed.value());
+            const std::string type = parsed.value().find("event_type")->as_string();
+            const json::Value* attrs = parsed.value().find("attributes");
+            REQUIRE(attrs != nullptr);
+            if (type == "engine.started") {
+                ++started_events;
+                REQUIRE(attrs->find("gpu_device_count") != nullptr);
+                CHECK(attrs->find("gpu_device_count")->as_uint() == static_cast<std::uint64_t>(gpus.size()));
+                REQUIRE(attrs->find("device_count") != nullptr);
+                CHECK(attrs->find("device_count")->as_uint() == static_cast<std::uint64_t>(cpu_count));
+            } else if (type == "device.memory.sample") {
+                REQUIRE(attrs->find("kind") != nullptr);
+                const std::string kind = attrs->find("kind")->as_string();
+                if (kind == "cpu") {
+                    ++cpu_samples;
+                } else if (kind == "gpu") {
+                    gpu_sample_events.push_back(parsed.value());
+                }
+            }
+        }
+        CHECK(started_events == 1);
+        CHECK(cpu_samples == cpu_count);
+        REQUIRE(gpu_sample_events.size() == gpus.size());
+        for (std::size_t i = 0; i < gpus.size(); ++i) {
+            const auto& event = gpu_sample_events[i];
+            const auto& gpu = gpus[i];
+            CHECK(event.find("producer")->find("synthetic") == nullptr);
+            if (!gpu.id.empty()) {
+                REQUIRE(event.find("device_id")->is_string());
+                CHECK(event.find("device_id")->as_string() == gpu.id);
+            }
+            const json::Value* attrs = event.find("attributes");
+            REQUIRE(attrs != nullptr);
+            CHECK(attrs->find("kind")->as_string() == "gpu");
+            CHECK(attrs->find("name")->as_string() == gpu.name);
+            CHECK(attrs->find("vendor")->as_string() == std::string(to_string(gpu.vendor)));
+            CHECK(attrs->find("is_integrated_uma")->as_bool() == gpu.is_integrated_uma);
+            CHECK(attrs->find("source")->as_string() == gpu.source);
+        }
+    }
+
+    // sample_devices_on_start = false suppresses startup GPU samples while keeping startup GPU inventory.
+    {
+        auto sink = std::make_shared<MemoryTelemetrySink>();
+        EngineOptions eo;
+        eo.telemetry_sinks.push_back(sink);
+        eo.sample_devices_on_start = false;
+        eo.sample_gpu_devices = true;
+        eo.device_sample_interval = std::chrono::milliseconds(0);
+        std::size_t gpu_count = 0;
+        {
+            Engine engine(std::move(eo));
+            gpu_count = engine.gpu_devices().size();
+            engine.telemetry().flush();
+        }
+        std::size_t sample_events = 0;
+        std::size_t started_events = 0;
+        for (const auto& line : sink->lines()) {
+            const auto parsed = json::parse(line);
+            REQUIRE(parsed.ok());
+            check_envelope(parsed.value());
+            const std::string type = parsed.value().find("event_type")->as_string();
+            if (type == "engine.started") {
+                ++started_events;
+                REQUIRE(parsed.value().find("attributes")->find("gpu_device_count") != nullptr);
+                CHECK(parsed.value().find("attributes")->find("gpu_device_count")->as_uint() ==
+                      static_cast<std::uint64_t>(gpu_count));
+            } else if (type == "device.memory.sample") {
+                ++sample_events;
+            }
+        }
+        CHECK(started_events == 1);
+        CHECK(sample_events == 0);
+    }
+}
+
+TEST_CASE("periodic device sampler updates gpu_devices snapshot and respects sample_gpu_devices") {
+    // With sample_gpu_devices = false, periodic ticks emit only CPU samples.
+    {
+        auto sink = std::make_shared<MemoryTelemetrySink>();
+        EngineOptions eo;
+        eo.telemetry_sinks.push_back(sink);
+        eo.sample_devices_on_start = false;
+        eo.sample_gpu_devices = false;
+        eo.device_sample_interval = std::chrono::milliseconds(10);
+        {
+            Engine engine(std::move(eo));
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (std::chrono::steady_clock::now() < deadline) {
+                engine.telemetry().flush();
+                CHECK(engine.gpu_devices().empty());
+                bool saw_cpu = false;
+                for (const auto& line : sink->lines()) {
+                    const auto parsed = json::parse(line);
+                    REQUIRE(parsed.ok());
+                    if (parsed.value().find("event_type")->as_string() != "device.memory.sample") continue;
+                    if (parsed.value().find("attributes")->find("kind")->as_string() == "cpu") {
+                        saw_cpu = true;
+                        break;
+                    }
+                }
+                if (saw_cpu) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+        std::size_t cpu_samples = 0;
+        std::size_t gpu_samples = 0;
+        for (const auto& line : sink->lines()) {
+            const auto parsed = json::parse(line);
+            REQUIRE(parsed.ok());
+            check_envelope(parsed.value());
+            if (parsed.value().find("event_type")->as_string() != "device.memory.sample") continue;
+            const std::string kind = parsed.value().find("attributes")->find("kind")->as_string();
+            if (kind == "cpu") ++cpu_samples;
+            if (kind == "gpu") ++gpu_samples;
+        }
+        CHECK(cpu_samples >= 1);
+        CHECK(gpu_samples == 0);
+    }
+
+    // With sample_gpu_devices = true, concurrent gpu_devices() snapshots stay synchronized with periodic ticks.
+    {
+        auto sink = std::make_shared<MemoryTelemetrySink>();
+        EngineOptions eo;
+        eo.telemetry_sinks.push_back(sink);
+        eo.sample_devices_on_start = false;
+        eo.sample_gpu_devices = true;
+        eo.device_sample_interval = std::chrono::milliseconds(10);
+        std::size_t expected_gpus = 0;
+        {
+            Engine engine(std::move(eo));
+            expected_gpus = engine.gpu_devices().size();
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (std::chrono::steady_clock::now() < deadline) {
+                for (const auto& gpu : engine.gpu_devices()) {
+                    CHECK_FALSE(gpu.id.empty());
+                }
+                engine.telemetry().flush();
+                std::size_t saw_cpu = 0;
+                std::size_t saw_gpu = 0;
+                for (const auto& line : sink->lines()) {
+                    const auto parsed = json::parse(line);
+                    REQUIRE(parsed.ok());
+                    if (parsed.value().find("event_type")->as_string() != "device.memory.sample") continue;
+                    const std::string kind = parsed.value().find("attributes")->find("kind")->as_string();
+                    if (kind == "cpu") ++saw_cpu;
+                    if (kind == "gpu") ++saw_gpu;
+                }
+                if (saw_cpu >= 1 && (expected_gpus == 0 || saw_gpu >= expected_gpus)) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+        std::size_t cpu_samples = 0;
+        std::size_t gpu_samples = 0;
+        for (const auto& line : sink->lines()) {
+            const auto parsed = json::parse(line);
+            REQUIRE(parsed.ok());
+            check_envelope(parsed.value());
+            if (parsed.value().find("event_type")->as_string() != "device.memory.sample") continue;
+            const std::string kind = parsed.value().find("attributes")->find("kind")->as_string();
+            if (kind == "cpu") ++cpu_samples;
+            if (kind == "gpu") ++gpu_samples;
+        }
+        CHECK(cpu_samples >= 1);
+        if (expected_gpus > 0) {
+            CHECK(gpu_samples >= expected_gpus);
+        }
+    }
 }

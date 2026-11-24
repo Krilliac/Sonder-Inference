@@ -458,3 +458,35 @@ TEST_CASE("llamacpp adapter: explicit devices honor gpu_layers when device_id is
     ml.device_id = "";
     CHECK(be->load_model(ml).status().code() == si::ErrorCode::not_found);
 }
+
+TEST_CASE("llamacpp wrapper: sequence state capture and restore validate preconditions") {
+    static_assert(kMaxSequenceStateBytes == 512ULL * 1024ULL * 1024ULL);
+    CHECK(LlamaCppBackend::GetCapabilities().recurrent_checkpoint);
+
+    LlamaCppBackend be;
+    std::vector<std::uint8_t> out{1, 2, 3};
+    CHECK(be.CaptureSequenceState(out, 0).code == ErrorCode::kInvalidArgument);
+    CHECK(out.empty());
+
+    out = {4, 5};
+    CHECK(be.CaptureSequenceState(out, 64).code == ErrorCode::kNotLoaded);
+    CHECK(out.empty());
+
+    // Empty, zero-cap, and oversized buffers fail argument validation before load state.
+    CHECK(be.RestoreSequenceState({}).code == ErrorCode::kInvalidArgument);
+    const std::vector<std::uint8_t> small_buf(16, 0xAA);
+    CHECK(be.RestoreSequenceState(small_buf, 0).code == ErrorCode::kInvalidArgument);
+    const std::vector<std::uint8_t> oversized_buf(128, 0x55);
+    CHECK(be.RestoreSequenceState(oversized_buf, 64).code == ErrorCode::kInvalidArgument);
+    CHECK(be.RestoreSequenceState(small_buf, 64).code == ErrorCode::kNotLoaded);
+
+    // Vocab-only load has no llama_context, so valid arguments report kNotLoaded.
+    LoadOptions opts;
+    opts.model_path = std::string(SONDER_LLAMACPP_VOCAB_DIR) + "/ggml-vocab-llama-spm.gguf";
+    opts.vocab_only = true;
+    REQUIRE(be.Load(opts).ok());
+    CHECK(be.CaptureSequenceState(out, 64).code == ErrorCode::kNotLoaded);
+    CHECK(be.RestoreSequenceState(small_buf, 64).code == ErrorCode::kNotLoaded);
+    CHECK(be.RestoreSequenceState(oversized_buf, 64).code == ErrorCode::kInvalidArgument);
+    be.Unload();
+}

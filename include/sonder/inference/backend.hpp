@@ -5,6 +5,7 @@
 // around a single backend (see docs/BACKENDS.md).
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -42,6 +43,48 @@ enum class Capability : std::uint32_t {
     deterministic = 1u << 14,  // identical inputs + seed => identical output
     remote_process = 1u << 15, // execution happens in another process/server
     token_logits = 1u << 16,   // exposes per-step logits (open_token_stream); Sonder samples
+    recurrent_checkpoint = 1u << 17,  // supports recurrent/hybrid sequence state capture & restore
+};
+
+// Maximum serialized byte size permitted for a single recurrent-state snapshot.
+inline constexpr std::size_t kMaxRecurrentCheckpointBytes = std::size_t{512} << 20;
+
+// Opaque serialized recurrent/SSM sequence state captured at an exact token position.
+struct RecurrentStateSnapshot {
+    std::uint64_t token_position = 0;
+    std::vector<std::uint8_t> bytes;
+};
+
+// Optional atomic checkpoint exchange attached to GenerateRequest for
+// hybrid/recurrent models. When provided, a capable backend executes restore
+// and prefill-boundary capture under the same execution lock as prefill/decode
+// so concurrent requests cannot clobber sequence state and captured bytes match
+// the exact prefill boundary (never post-decode state).
+struct RecurrentCheckpointExchange {
+    // Input: checkpoint bytes to restore before prefilling the suffix.
+    std::span<const std::uint8_t> restore_bytes{};
+    // Input: exact token position represented by `restore_bytes` (0 = none).
+    std::uint64_t restore_token_position = 0;
+    // Input: optional callback invoked synchronously when restore succeeds
+    // (before decode begins).
+    std::function<void()> on_restored;
+    // Output: true iff `restore_bytes` was applied before suffix prefill.
+    bool restored = false;
+    // Output: populated if restore was attempted and failed.
+    std::optional<Status> restore_error = std::nullopt;
+
+    // Input: exact prefill token position at which to capture a checkpoint
+    // before decoding any tail prompt or completion tokens (0 = skip capture).
+    std::uint64_t capture_at_token_position = 0;
+    // Input: optional callback invoked synchronously at `capture_at_token_position`
+    // with the captured snapshot bytes.
+    std::function<void(std::uint64_t token_position, std::vector<std::uint8_t> bytes)> on_captured;
+    // Output: true iff capture succeeded.
+    bool captured = false;
+    // Output: populated if capture was requested and failed.
+    std::optional<Status> capture_error = std::nullopt;
+    // Output: captured snapshot bytes when `on_captured` is empty.
+    std::vector<std::uint8_t> captured_bytes;
 };
 
 // Vocabulary index as produced by a backend tokenizer.
@@ -81,6 +124,9 @@ struct GenerateRequest {
     std::string request_id;
     std::string prompt;
     SamplingConfig sampling;
+    // Optional non-owning atomic checkpoint exchange for hybrid/recurrent models.
+    // Must outlive the generate() / open_token_stream() call when non-null.
+    RecurrentCheckpointExchange* checkpoint = nullptr;
 };
 
 struct TokenChunk {
@@ -276,6 +322,20 @@ public:
     // True when chat() uses a backend-native chat API or model chat template
     // instead of the generic format_chat_prompt() fallback.
     [[nodiscard]] virtual bool has_native_chat() const { return false; }
+
+    // Optional (Capability::recurrent_checkpoint): capture serialized recurrent
+    // state corresponding to `token_position`.
+    virtual Result<RecurrentStateSnapshot> capture_recurrent_state(std::uint64_t token_position) {
+        (void)token_position;
+        return Status(ErrorCode::unsupported, "backend does not expose recurrent-state checkpoints");
+    }
+
+    // Optional (Capability::recurrent_checkpoint): restore a previously captured
+    // recurrent-state snapshot prior to backend decode.
+    virtual Status restore_recurrent_state(std::span<const std::uint8_t> bytes) {
+        (void)bytes;
+        return Status(ErrorCode::unsupported, "backend does not expose recurrent-state checkpoints");
+    }
 };
 
 class Backend {
