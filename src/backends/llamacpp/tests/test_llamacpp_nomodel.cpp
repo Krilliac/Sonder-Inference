@@ -489,4 +489,71 @@ TEST_CASE("llamacpp wrapper: sequence state capture and restore validate precond
     CHECK(be.RestoreSequenceState(small_buf, 64).code == ErrorCode::kNotLoaded);
     CHECK(be.RestoreSequenceState(oversized_buf, 64).code == ErrorCode::kInvalidArgument);
     be.Unload();
+    CHECK(!be.IsLoaded());
+}
+
+TEST_CASE("llamacpp wrapper: Detokenize, Embed preconditions, and tuning params") {
+    // Unloaded backend rejects Detokenize and Embed cleanly.
+    LlamaCppBackend unloaded;
+    std::string detok;
+    const std::vector<Token> one_tok{1};
+    CHECK(unloaded.Detokenize(one_tok, detok).code == ErrorCode::kNotLoaded);
+    EmbedOutput emb;
+    const std::vector<std::vector<Token>> sample_embed{{1, 2}};
+    CHECK(unloaded.Embed(sample_embed, true, emb).code == ErrorCode::kNotLoaded);
+
+    // Vocab-only GGUF exercises Detokenize round-trip and Embed no-context guard.
+    LlamaCppBackend be;
+    LoadOptions opts;
+    opts.model_path = std::string(SONDER_LLAMACPP_VOCAB_DIR) + "/ggml-vocab-llama-spm.gguf";
+    opts.vocab_only = true;
+    REQUIRE(be.Load(opts).ok());
+
+    std::vector<Token> toks;
+    REQUIRE(be.Tokenize("Hello world", false, toks).ok());
+    REQUIRE(!toks.empty());
+    REQUIRE(be.Detokenize(toks, detok).ok());
+    CHECK((detok == "Hello world" || detok == " Hello world"));
+    REQUIRE(be.Detokenize({}, detok).ok());
+    CHECK(detok.empty());
+    CHECK(be.Detokenize(std::vector<Token>{-1}, detok).code == ErrorCode::kInvalidArgument);
+    CHECK(be.Embed({toks}, true, emb).code == ErrorCode::kNotLoaded);
+    be.Unload();
+
+    // ContextParamsFor reflects multi-slot, offload_kqv, no_perf, and optional kv_unified/op_offload.
+    LoadOptions ctx_opts;
+    ctx_opts.n_slots = 4;
+    ctx_opts.kv_unified = true;
+    const ContextParamsSummary cs = LlamaCppBackend::ContextParamsFor(ctx_opts);
+    CHECK(cs.n_seq_max == 4u);
+    CHECK(cs.offload_kqv);
+    CHECK(cs.no_perf);
+#if defined(SONDER_LLAMACPP_HAS_KV_UNIFIED)
+    CHECK(cs.kv_unified);
+    ctx_opts.kv_unified = false;
+    CHECK_FALSE(LlamaCppBackend::ContextParamsFor(ctx_opts).kv_unified);
+#endif
+#if defined(SONDER_LLAMACPP_HAS_OP_OFFLOAD)
+    CHECK(cs.op_offload);
+#endif
+
+    // ModelParamsFor sets load_mtp when built against MTP-capable llama.cpp.
+    LoadOptions mtp_opts;
+    mtp_opts.spec_type = "draft-mtp";
+    const ModelParamsSummary ms = LlamaCppBackend::ModelParamsFor(mtp_opts);
+#if defined(SONDER_LLAMACPP_HAS_MTP)
+    CHECK(ms.load_mtp);
+#else
+    CHECK_FALSE(ms.load_mtp);
+#endif
+
+    // Bad slots / spec options fail before touching the model file.
+    LoadOptions bad;
+    bad.model_path = "this/file/does/not/exist.gguf";
+    bad.n_slots = 0;
+    CHECK(be.Load(bad).code == ErrorCode::kInvalidArgument);
+    bad = {};
+    bad.model_path = "this/file/does/not/exist.gguf";
+    bad.spec_type = "unknown";
+    CHECK(be.Load(bad).code == ErrorCode::kInvalidArgument);
 }

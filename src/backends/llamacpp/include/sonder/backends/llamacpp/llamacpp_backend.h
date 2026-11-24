@@ -61,11 +61,23 @@ struct TensorOverride {
 inline constexpr const char* kMoeExpertTensorPattern = R"(\.ffn_(up|down|gate)_(ch|)exps)";
 
 // Element type of the K or V cache (llama.cpp's --cache-type-k/-v). ToString
-// returns ggml's type names ("f16", "q8_0", "iq4_nl"), which llama.cpp's own
-// CLI also accepts. Storage per cached value (ggml block layouts): f32 4 B,
-// f16/bf16 2 B, q8_0 1.0625 B, q5_1 0.75 B, q5_0 0.6875 B, q4_1 0.625 B,
-// q4_0/iq4_nl 0.5625 B. See docs/PLACEMENT.md, "KV cache types".
-enum class KvCacheType { kF16, kF32, kBF16, kQ8_0, kQ5_1, kQ5_0, kQ4_1, kQ4_0, kIQ4_NL };
+// returns ggml's type names ("f16", "q8_0", "iq4_nl", ...), which llama.cpp's
+// own CLI also accepts. Extended types (f8_e4m3, q2_0, pq2_0) require a
+// llama.cpp/ggml build that defines the corresponding GGML_TYPE_* enum value.
+enum class KvCacheType {
+    kF16,
+    kF32,
+    kBF16,
+    kQ8_0,
+    kQ5_1,
+    kQ5_0,
+    kQ4_1,
+    kQ4_0,
+    kIQ4_NL,
+    kF8_E4M3,
+    kQ2_0,
+    kPQ2_0,
+};
 
 // When llama.cpp uses Flash Attention (--flash-attn). kAuto lets llama.cpp
 // decide per model and device; it is llama.cpp's default.
@@ -75,21 +87,37 @@ enum class FlashAttention { kAuto, kDisabled, kEnabled };
 // (--split-mode). kLayer matches llama.cpp's default.
 enum class SplitMode { kNone, kLayer, kRow };
 
+// In-process speculative decoding strategy.
+enum class SpeculativeType { kNone, kAuto, kNgram, kNgramMod, kDraftMtp };
+
 // Maximum number of GPU entries accepted in LoadOptions::tensor_split and
 // LoadOptions::devices (matches llama_max_devices() in pinned llama.cpp).
 inline constexpr std::size_t kMaxTensorSplitDevices = 16;
 
+// Maximum number of cached KV sequence slots (1..kMaxSlots).
+inline constexpr std::uint32_t kMaxSlots = 16;
+
+// Maximum draft tokens per speculative step and per-strategy defaults.
+inline constexpr std::int32_t kMaxSpecDraftTokens = 64;
+inline constexpr std::int32_t kDefaultNgramDraftMax = 8;
+inline constexpr std::int32_t kDefaultMtpDraftMax = 3;
+
 [[nodiscard]] std::string_view ToString(KvCacheType type) noexcept;
 [[nodiscard]] std::string_view ToString(FlashAttention mode) noexcept;
 [[nodiscard]] std::string_view ToString(SplitMode mode) noexcept;
+[[nodiscard]] std::string_view ToString(SpeculativeType type) noexcept;
 // Case-insensitive; returns false and leaves `out` untouched for an unknown name.
 [[nodiscard]] bool ParseKvCacheType(std::string_view name, KvCacheType& out) noexcept;
 // Accepts "auto", "on"/"enabled" and "off"/"disabled" (case-insensitive).
 [[nodiscard]] bool ParseFlashAttention(std::string_view name, FlashAttention& out) noexcept;
 // Accepts "none", "layer", and "row" (case-insensitive); leaves `out` untouched on failure.
 [[nodiscard]] bool ParseSplitMode(std::string_view name, SplitMode& out) noexcept;
+// Accepts "none", "auto", "ngram", "ngram-mod", and "draft-mtp" (case-insensitive).
+[[nodiscard]] bool ParseSpeculativeType(std::string_view name, SpeculativeType& out) noexcept;
 // True for block-quantized types (everything except f32, f16 and bf16).
 [[nodiscard]] bool IsQuantized(KvCacheType type) noexcept;
+// True if this llama.cpp/ggml build defines the corresponding GGML_TYPE_*.
+[[nodiscard]] bool IsKvCacheTypeSupported(KvCacheType type) noexcept;
 
 struct LoadOptions {
     std::string model_path;       // GGUF file
@@ -125,8 +153,20 @@ struct LoadOptions {
     std::vector<float> tensor_split;
     // Lock model weights in RAM. Mapped via llama.cpp b11195's load_mode:
     // use_mmap + use_mlock -> LLAMA_LOAD_MODE_MMAP_MLOCK; !use_mmap +
-    // use_mlock -> LLAMA_LOAD_MODE_MLOCK.
+    // use_mlock -> LLAMA_LOAD_MODE_MLOCK; !use_mmap && !use_mlock ->
+    // LLAMA_LOAD_MODE_NONE.
     bool use_mlock = false;
+    // Use a unified KV buffer across slots/sequences when supported by llama.cpp.
+    bool kv_unified = true;
+    // Reuse longest matching prompt KV prefix across consecutive turns.
+    bool prefix_cache = true;
+    // Number of cached KV sequence slots (1..kMaxSlots).
+    std::uint32_t n_slots = 1;
+    // In-process speculative decoding strategy: "none", "auto", "ngram",
+    // "ngram-mod", or "draft-mtp".
+    std::string spec_type = "none";
+    // Max draft tokens per speculative step (0 = automatic default for spec_type).
+    std::int32_t spec_draft_max = 0;
 };
 
 // Checks placement options (main_gpu >= 0, split_mode, tensor_split finite /
@@ -152,6 +192,7 @@ struct ModelParamsSummary {
     bool vocab_only = false;
     bool has_tensor_split = false;
     bool has_devices = false;
+    bool load_mtp = false;
 };
 
 // The llama_context_params values a Load() with given options passes to
@@ -162,9 +203,14 @@ struct ContextParamsSummary {
     std::uint32_t n_ctx = 0;
     std::uint32_t n_batch = 0;
     std::uint32_t n_ubatch = 0;
+    std::uint32_t n_seq_max = 1;
     std::string type_k;
     std::string type_v;
     std::string flash_attn;
+    bool offload_kqv = true;
+    bool no_perf = true;
+    bool kv_unified = false;
+    bool op_offload = false;
 };
 
 struct SamplingParams {
@@ -179,6 +225,7 @@ struct SamplingParams {
     float typical_p = 1.0F;            // >= 1 disables
     std::vector<std::pair<Token, float>> logit_bias;  // token -> additive bias (-inf bans)
     std::uint32_t seed = 0xC0FFEEU;    // 0xFFFFFFFF = random
+    std::string grammar;               // optional GBNF grammar constraining output (root rule)
 };
 
 [[nodiscard]] Status Validate(const SamplingParams& params);
@@ -201,7 +248,9 @@ struct GenerateRequest {
     std::vector<Token> prompt;     // already tokenized; must be non-empty
     std::int32_t max_new_tokens = 128;
     SamplingParams sampling{};
-    bool reset_context = true;     // clear KV memory before prefill
+    bool reset_context = true;     // clear KV memory before prefill (ignored when prefix_cache reuses a slot)
+    // Optional conversation/slot affinity key for multi-slot KV prefix caching.
+    std::string session_key;
     // Optional atomic sequence-state restore before suffix prefill. When
     // non-empty and 0 < restore_tokens < prompt.size(), Generate() clears
     // memory, restores sequence 0 state, and prefills only prompt[restore_tokens..).
@@ -233,8 +282,11 @@ using CancelPredicate = std::function<bool()>;
 struct GenerateResult {
     Status status{};
     StopReason stop_reason = StopReason::kNone;
-    std::int32_t prompt_tokens = 0;
+    std::int32_t prompt_tokens = 0;          // newly evaluated prompt tokens
+    std::int32_t cached_tokens = 0;          // prompt tokens reused from KV prefix cache
     std::int32_t generated_tokens = 0;
+    std::int32_t draft_tokens = 0;           // speculative draft tokens proposed
+    std::int32_t draft_accepted_tokens = 0;  // speculative draft tokens accepted
     double prefill_ms = 0.0;
     double decode_ms = 0.0;
     bool state_restored = false;
@@ -244,6 +296,12 @@ struct GenerateResult {
 
     [[nodiscard]] double decode_tokens_per_second() const noexcept;
     [[nodiscard]] double prefill_tokens_per_second() const noexcept;
+};
+
+struct EmbedOutput {
+    std::vector<std::vector<float>> embeddings;
+    std::int32_t prompt_tokens = 0;
+    double eval_ms = 0.0;
 };
 
 enum class DeviceKind { kCpu, kGpu, kIntegratedGpu, kAccelerator, kOther };
@@ -300,8 +358,10 @@ struct Capabilities {
     bool cancellation = true;
     bool kv_export = false;
     bool kv_import = false;
-    bool prefix_reuse = false;
-    bool speculative_decode = false;
+    bool prefix_reuse = true;
+    bool speculative_decode = true;
+    bool structured_output = true;
+    bool embeddings = true;
     bool recurrent_checkpoint = true;
 };
 
@@ -350,6 +410,8 @@ public:
     Status Tokenize(std::string_view text, bool add_special, std::vector<Token>& out,
                     bool parse_special = false) const;
     Status TokenToPiece(Token token, std::string& out) const;
+    Status Detokenize(std::span<const Token> tokens, std::string& out, bool remove_special = false,
+                      bool unparse_special = false) const;
     [[nodiscard]] bool IsEndOfGeneration(Token token) const;
 
     // Chat template stored in the GGUF metadata (tokenizer.chat_template), or
@@ -367,6 +429,11 @@ public:
 
     GenerateResult Generate(const GenerateRequest& request, const TokenCallback& on_token,
                             const CancelPredicate& should_cancel = {});
+
+    // Computes dense embeddings for one or more tokenized inputs.
+    // Clears active KV prefix cache entries while running.
+    Status Embed(const std::vector<std::vector<Token>>& inputs, bool normalize, EmbedOutput& out,
+                 const CancelPredicate& should_cancel = {});
 
     // Captures sequence 0 state (KV + recurrent/SSM state) via llama_state_seq_get_*.
     Status CaptureSequenceState(std::vector<std::uint8_t>& out_bytes,
@@ -402,5 +469,86 @@ private:
 // Length of the longest prefix of `s` that does not end in an incomplete
 // UTF-8 sequence. Invalid bytes are treated as complete single bytes.
 [[nodiscard]] std::size_t CompleteUtf8Prefix(std::string_view s) noexcept;
+
+// Length of the longest common prefix between two token spans.
+[[nodiscard]] std::size_t LongestCommonPrefix(std::span<const Token> a, std::span<const Token> b) noexcept;
+
+// Per-slot prefix cache metadata used for slot selection.
+struct PrefixSlotMeta {
+    std::int32_t id = 0;
+    std::vector<Token> tokens;
+    std::string session_key;
+    std::uint64_t last_used = 0;
+};
+
+struct SlotSelection {
+    std::size_t slot_index = 0;
+    std::size_t matched_prefix = 0;  // clamped to min(lcp, prompt.size() - 1)
+};
+
+// Selects a KV slot for `prompt` and optional `session_key`:
+//   1. Exact non-empty `session_key` match
+//   2. Longest common token prefix (> 0), tie-broken by most recently used
+//   3. Least recently used slot (lowest `last_used`)
+// `matched_prefix` is clamped to `prompt.size() - 1` (0 when prompt has <= 1
+// token) so at least one prompt token is always decoded for fresh logits.
+[[nodiscard]] SlotSelection SelectPrefixSlot(std::span<const PrefixSlotMeta> slots, std::span<const Token> prompt,
+                                             std::string_view session_key) noexcept;
+
+// Fast, allocation-light rolling 4-gram / 3-gram self-speculation matcher.
+// Stores indices into the caller's token history in flat fixed-size hash tables
+// (no per-token heap allocations).
+class NgramMatcher {
+public:
+    explicit NgramMatcher(bool exact_scan_fallback = false);
+
+    void Reset();
+    // Indexes history positions [from_index, to_index). Callers must index only
+    // positions strictly before the current tail position used for Draft().
+    void IndexRange(std::span<const Token> history, std::size_t from_index, std::size_t to_index);
+    // Appends up to `max_draft` candidate tokens into `out` (cleared first)
+    // matching the 4-gram (or 3-gram fallback) ending at `history.back()`.
+    void Draft(std::span<const Token> history, std::size_t max_draft, std::vector<Token>& out) const;
+
+private:
+    static constexpr std::size_t kTableBits = 14;
+    static constexpr std::size_t kTableSize = std::size_t{1} << kTableBits;
+    static constexpr std::size_t kTableMask = kTableSize - 1;
+    static constexpr std::size_t kFallbackScanLimit = 2048;
+
+    bool exact_scan_fallback_ = false;
+    std::vector<std::int32_t> pos4_;
+    std::vector<std::int32_t> pos3_;
+};
+
+// Adaptive speculative draft-length controller for n-gram self-speculation.
+// Ramps up toward `max_draft` on high acceptance (>= 50%), shrinks on moderate
+// acceptance, and pauses briefly (with periodic small probes) when rolling
+// acceptance falls below 20% so unpredictable prose incurs near-zero overhead.
+class AdaptiveDraftController {
+public:
+    explicit AdaptiveDraftController(std::int32_t max_draft = kDefaultNgramDraftMax);
+
+    void Reset(std::int32_t max_draft);
+    // Number of draft tokens to propose on the next step (0 while paused).
+    [[nodiscard]] std::int32_t NextDraftLength() const noexcept;
+    // Advances one non-speculative step while paused (counts down cooldown).
+    void NoteSkippedStep() noexcept;
+    // Records outcome of a speculative verification step (drafted > 0).
+    void Observe(std::int32_t drafted, std::int32_t accepted) noexcept;
+
+    [[nodiscard]] double acceptance_ema() const noexcept { return acceptance_ema_; }
+    [[nodiscard]] std::int32_t max_draft() const noexcept { return max_draft_; }
+    [[nodiscard]] bool paused() const noexcept { return cooldown_remaining_ > 0; }
+
+private:
+    std::int32_t max_draft_ = kDefaultNgramDraftMax;
+    std::int32_t current_draft_ = kDefaultNgramDraftMax;
+    std::int32_t cooldown_remaining_ = 0;
+    std::int32_t cooldown_period_ = 8;
+    std::int32_t steps_observed_ = 0;
+    std::int32_t total_drafted_ = 0;
+    double acceptance_ema_ = 0.5;
+};
 
 }  // namespace sonder::backends::llamacpp
