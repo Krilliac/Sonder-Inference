@@ -93,9 +93,11 @@ bool is_valid_utf8(std::string_view s) {
     return true;
 }
 
+#if defined(_WIN32)
 fs::path from_utf8(std::string_view s) {
     return fs::path(std::u8string(s.begin(), s.end()));
 }
+#endif
 
 std::string to_hex(const std::array<std::uint8_t, 32>& d) {
     static constexpr char kDigits[] = "0123456789abcdef";
