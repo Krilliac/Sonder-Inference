@@ -11,7 +11,10 @@
 #include "sonder/inference/backends/llamacpp.hpp"
 
 using namespace sonder::inference;
+using llamacpp_detail::ApplyNoThinkScaffolding;
 using llamacpp_detail::StopSequenceFilter;
+using llamacpp_detail::ThinkingSplitResult;
+using llamacpp_detail::ThinkingStreamSplitter;
 using llamacpp_detail::ToLlamaSampling;
 
 TEST_CASE("llamacpp adapter: stop filter passes text through without stops") {
@@ -109,6 +112,10 @@ TEST_CASE("llamacpp adapter: backend identity, capabilities, probe") {
     CHECK(caps.has(Capability::tokenization));
     CHECK(caps.has(Capability::streaming));
     CHECK(caps.has(Capability::batched_prefill));
+    CHECK(caps.has(Capability::prefix_reuse));
+    CHECK(caps.has(Capability::speculative_decode));
+    CHECK(caps.has(Capability::structured_output));
+    CHECK(caps.has(Capability::embeddings));
     CHECK(caps.has(Capability::deterministic));
     CHECK(caps.has(Capability::recurrent_checkpoint));
     const auto cap_names = caps.names();
@@ -198,4 +205,126 @@ TEST_CASE("llamacpp adapter: load_model rejects invalid context options") {
     const auto r = be->load_model(o);
     CHECK(r.status().code() == ErrorCode::invalid_argument);
     CHECK(r.status().message().find("flash attention") != std::string::npos);
+}
+
+TEST_CASE("llamacpp adapter: ThinkingStreamSplitter splits <think> blocks across arbitrary chunk boundaries") {
+    // Plain text passes through without buffering artifacts.
+    {
+        ThinkingStreamSplitter s;
+        const ThinkingSplitResult r1 = s.Push("Hello world");
+        const ThinkingSplitResult r2 = s.Flush();
+        CHECK(r1.text + r2.text == "Hello world");
+        CHECK((r1.reasoning + r2.reasoning).empty());
+        CHECK_FALSE(s.in_thinking());
+    }
+
+    // Tag boundaries split across tiny chunks.
+    {
+        ThinkingStreamSplitter s;
+        std::string text;
+        std::string reasoning;
+        for (const std::string_view piece : {"<thi", "nk>step 1 ", "and 2</th", "ink>Final ", "answer."}) {
+            const ThinkingSplitResult r = s.Push(piece);
+            text += r.text;
+            reasoning += r.reasoning;
+        }
+        const ThinkingSplitResult tail = s.Flush();
+        text += tail.text;
+        reasoning += tail.reasoning;
+        CHECK(reasoning == "step 1 and 2");
+        CHECK(text == "Final answer.");
+        CHECK_FALSE(s.in_thinking());
+    }
+
+    // False partial tag prefixes release cleanly without dropping characters.
+    {
+        ThinkingStreamSplitter s;
+        std::string text;
+        std::string reasoning;
+        for (const std::string_view piece : {"1 < 2 <th", "at <think>a </thi", "x b</think> done"}) {
+            const ThinkingSplitResult r = s.Push(piece);
+            text += r.text;
+            reasoning += r.reasoning;
+        }
+        const ThinkingSplitResult tail = s.Flush();
+        text += tail.text;
+        reasoning += tail.reasoning;
+        CHECK(text == "1 < 2 <that  done");
+        CHECK(reasoning == "a </thix b");
+    }
+
+    // Unclosed <think> flushes remaining text to reasoning.
+    {
+        ThinkingStreamSplitter s;
+        const ThinkingSplitResult r1 = s.Push("<think>still thinking</thi");
+        CHECK(s.in_thinking());
+        const ThinkingSplitResult r2 = s.Flush();
+        CHECK(r1.reasoning + r2.reasoning == "still thinking</thi");
+        CHECK((r1.text + r2.text).empty());
+    }
+}
+
+TEST_CASE("llamacpp adapter: ApplyNoThinkScaffolding injects empty think block only on ChatML assistant cue") {
+    // Appends when thinking is disabled on ChatML/Qwen3 assistant cue.
+    std::vector<ChatPromptSegment> segs{
+        {"<|im_start|>user\n", true},
+        {"Hi", false},
+        {"<|im_end|>\n<|im_start|>assistant\n", true},
+    };
+    CHECK(ApplyNoThinkScaffolding(segs, /*enable_thinking=*/false));
+    REQUIRE(segs.size() == 4u);
+    CHECK(segs.back().parse_special);
+    CHECK(segs.back().text == "<think>\n\n</think>\n\n");
+
+    // Idempotent: does not append again once <think> is already present.
+    CHECK_FALSE(ApplyNoThinkScaffolding(segs, /*enable_thinking=*/false));
+
+    // Does not append when thinking is enabled.
+    std::vector<ChatPromptSegment> segs_on{
+        {"<|im_start|>assistant\n", true},
+    };
+    CHECK_FALSE(ApplyNoThinkScaffolding(segs_on, /*enable_thinking=*/true));
+
+    // Does not append on non-ChatML templates or untrusted content segments.
+    std::vector<ChatPromptSegment> llama3{
+        {"<|start_header_id|>assistant<|end_header_id|>\n\n", true},
+    };
+    CHECK_FALSE(ApplyNoThinkScaffolding(llama3, /*enable_thinking=*/false));
+
+    std::vector<ChatPromptSegment> untrusted{
+        {"<|im_start|>assistant\n", false},
+    };
+    CHECK_FALSE(ApplyNoThinkScaffolding(untrusted, /*enable_thinking=*/false));
+}
+
+TEST_CASE("llamacpp adapter: new tuning, slot, and speculation options validate") {
+    LlamaCppBackendOptions o;
+    CHECK(o.use_mmap);
+    CHECK(o.kv_unified);
+    CHECK(o.prefix_cache);
+    CHECK(o.slots == 1u);
+    CHECK(o.spec_type == "none");
+    CHECK(o.spec_draft_max == 0);
+    CHECK(validate_llamacpp_options(o).ok());
+
+    o.use_mmap = false;
+    o.kv_unified = false;
+    o.prefix_cache = true;
+    o.slots = 4;
+    o.spec_type = "auto";
+    o.spec_draft_max = 8;
+    CHECK(validate_llamacpp_options(o).ok());
+
+    o.slots = 0;
+    CHECK(validate_llamacpp_options(o).code() == ErrorCode::invalid_argument);
+    o.slots = 17;
+    CHECK(validate_llamacpp_options(o).code() == ErrorCode::invalid_argument);
+    o.slots = 2;
+    o.spec_type = "invalid-spec";
+    CHECK(validate_llamacpp_options(o).code() == ErrorCode::invalid_argument);
+    o.spec_type = "draft-mtp";
+    o.spec_draft_max = -1;
+    CHECK(validate_llamacpp_options(o).code() == ErrorCode::invalid_argument);
+    o.spec_draft_max = 3;
+    CHECK(validate_llamacpp_options(o).ok());
 }

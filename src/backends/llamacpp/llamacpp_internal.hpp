@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
+#include "sonder/inference/backend.hpp"
 #include "sonder/inference/sampling.hpp"
 
 namespace sonder::inference::llamacpp_detail {
@@ -105,5 +106,109 @@ private:
     bool matched_ = false;
     std::optional<std::string> matched_index_;
 };
+
+// Result of one incremental step of ThinkingStreamSplitter.
+struct ThinkingSplitResult {
+    std::string text;
+    std::string reasoning;
+};
+
+// Streaming splitter that routes text inside <think>...</think> tags to
+// `reasoning` and visible output outside tags to `text`. Safely buffers
+// partial tag prefixes across arbitrary token chunk boundaries.
+class ThinkingStreamSplitter {
+public:
+    ThinkingSplitResult Push(std::string_view chunk) {
+        ThinkingSplitResult out;
+        pending_.append(chunk);
+        while (!pending_.empty()) {
+            if (!in_thinking_) {
+                const std::size_t pos = pending_.find(kOpenTag);
+                if (pos != std::string::npos) {
+                    out.text.append(pending_, 0, pos);
+                    pending_.erase(0, pos + kOpenTag.size());
+                    in_thinking_ = true;
+                    continue;
+                }
+                const std::size_t keep = TrailingPrefixLength(pending_, kOpenTag);
+                const std::size_t emit = pending_.size() - keep;
+                if (emit > 0) {
+                    out.text.append(pending_, 0, emit);
+                    pending_.erase(0, emit);
+                }
+                break;
+            }
+            const std::size_t pos = pending_.find(kCloseTag);
+            if (pos != std::string::npos) {
+                out.reasoning.append(pending_, 0, pos);
+                pending_.erase(0, pos + kCloseTag.size());
+                in_thinking_ = false;
+                continue;
+            }
+            const std::size_t keep = TrailingPrefixLength(pending_, kCloseTag);
+            const std::size_t emit = pending_.size() - keep;
+            if (emit > 0) {
+                out.reasoning.append(pending_, 0, emit);
+                pending_.erase(0, emit);
+            }
+            break;
+        }
+        return out;
+    }
+
+    ThinkingSplitResult Flush() {
+        ThinkingSplitResult out;
+        if (!pending_.empty()) {
+            if (in_thinking_) {
+                out.reasoning = std::exchange(pending_, {});
+            } else {
+                out.text = std::exchange(pending_, {});
+            }
+        }
+        return out;
+    }
+
+    [[nodiscard]] bool in_thinking() const noexcept { return in_thinking_; }
+    [[nodiscard]] std::size_t pending() const noexcept { return pending_.size(); }
+
+private:
+    static constexpr std::string_view kOpenTag = "<think>";
+    static constexpr std::string_view kCloseTag = "</think>";
+
+    static std::size_t TrailingPrefixLength(std::string_view s, std::string_view tag) noexcept {
+        const std::size_t limit = std::min(s.size(), tag.size() - 1);
+        for (std::size_t k = limit; k > 0; --k) {
+            if (s.substr(s.size() - k) == tag.substr(0, k)) return k;
+        }
+        return 0;
+    }
+
+    std::string pending_;
+    bool in_thinking_ = false;
+};
+
+// When thinking is explicitly disabled on Qwen3/ChatML-style templates ending
+// in `<|im_start|>assistant\n` (and not already containing `<think>`), appends
+// `<think>\n\n</think>\n\n` as a parse_special=true scaffolding segment so the
+// model skips its reasoning block cleanly (matching Prism's reasoning = off).
+inline bool ApplyNoThinkScaffolding(std::vector<ChatPromptSegment>& segments, bool enable_thinking) {
+    if (enable_thinking || segments.empty()) return false;
+    static constexpr std::string_view kAssistantCue = "<|im_start|>assistant\n";
+    std::string trailing;
+    std::size_t idx = segments.size();
+    while (idx > 0 && segments[idx - 1].parse_special) {
+        --idx;
+    }
+    for (std::size_t i = idx; i < segments.size(); ++i) {
+        trailing.append(segments[i].text);
+    }
+    if (trailing.size() < kAssistantCue.size()) return false;
+    if (std::string_view(trailing).substr(trailing.size() - kAssistantCue.size()) != kAssistantCue) {
+        return false;
+    }
+    if (trailing.find("<think>") != std::string::npos) return false;
+    segments.push_back(ChatPromptSegment{"<think>\n\n</think>\n\n", /*parse_special=*/true});
+    return true;
+}
 
 }  // namespace sonder::inference::llamacpp_detail
