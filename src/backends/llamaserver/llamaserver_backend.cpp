@@ -43,7 +43,7 @@ bool chat_thinking_enabled(const ChatRequest &request) noexcept {
 
 llamaserver::SpeculationWorkload classify_generate_workload(const GenerateRequest &request,
                                                             std::string_view grammar) noexcept {
-    if (!grammar.empty())
+    if (!grammar.empty() || !request.grammar.empty())
         return llamaserver::SpeculationWorkload::tool_json;
     if (contains_code_or_diff_markers(request.prompt))
         return llamaserver::SpeculationWorkload::code_edit;
@@ -52,7 +52,8 @@ llamaserver::SpeculationWorkload classify_generate_workload(const GenerateReques
 
 llamaserver::SpeculationWorkload classify_chat_workload(const ChatRequest &request,
                                                         std::string_view grammar) noexcept {
-    if (!grammar.empty())
+    if (!grammar.empty() || !request.grammar.empty() ||
+        (request.response_format_type && *request.response_format_type != "text"))
         return llamaserver::SpeculationWorkload::tool_json;
     if (chat_thinking_enabled(request))
         return llamaserver::SpeculationWorkload::reasoning;
@@ -181,7 +182,7 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
     }
     BackendCapabilities capabilities() const override {
         BackendCapabilities c;
-        c.add(Capability::streaming).add(Capability::remote_process);
+        c.add(Capability::streaming).add(Capability::remote_process).add(Capability::embeddings);
         if (!options_.grammar.empty())
             c.add(Capability::structured_output);
         // These indicate delegation support, not measured acceleration or KV ownership.
@@ -332,6 +333,25 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         const auto response = net::http_request_buffered(prepared.value(), response_body, {}, 4 * 1024 * 1024);
         if (!response.ok())
             return response.status();
+        if (response->status != 200)
+            return llamaserver::status_for_http(response->status);
+        return response_body;
+    }
+    Result<std::string> request_embeddings(std::string body, const CancellationToken &cancel) {
+        auto activity = acquire_request(cancel);
+        if (!activity.ok())
+            return activity.status();
+        auto prepared = prepare("POST", "/v1/embeddings", std::move(body), cancel, activity->port());
+        if (!prepared.ok())
+            return prepared.status();
+        std::string response_body;
+        const auto response = net::http_request_buffered(prepared.value(), response_body, cancel, 64u * 1024u * 1024u);
+        if (cancel.cancelled())
+            return Status(ErrorCode::cancelled, "llamaserver: request cancelled");
+        if (!response.ok())
+            return response.status();
+        if (response->status == 501)
+            return Status(ErrorCode::unsupported, "llamaserver: upstream does not support embeddings");
         if (response->status != 200)
             return llamaserver::status_for_http(response->status);
         return response_body;
@@ -580,6 +600,67 @@ class LlamaServerModel final : public BackendModel {
             record_speculation_observation(policy, result.value(), workload, spec_decision.is_probe,
                                            spec_decision.probe_id, probe_guard);
         }
+        return result;
+    }
+    Result<EmbedResult> embed(const EmbedRequest &request, const CancellationToken &cancel) override {
+        if (cancel.cancelled())
+            return Status(ErrorCode::cancelled, "llamaserver: request cancelled");
+        if (request.inputs.empty())
+            return Status(ErrorCode::invalid_argument, "llamaserver: embed inputs must be non-empty");
+        json::Array input_arr;
+        input_arr.reserve(request.inputs.size());
+        for (const auto &text : request.inputs)
+            input_arr.emplace_back(text);
+        json::Object req_body{{"model", descriptor_.name}, {"input", std::move(input_arr)}};
+        const auto t0 = std::chrono::steady_clock::now();
+        auto response = backend_->request_embeddings(json::Value(std::move(req_body)).dump(), cancel);
+        if (!response.ok())
+            return response.status();
+        auto parsed = json::parse(response.value());
+        if (!parsed.ok() || !parsed->is_object())
+            return llamaserver::protocol_error("malformed /v1/embeddings response");
+        const auto *data = parsed->find("data");
+        if (!data || !data->is_array())
+            return llamaserver::protocol_error("missing data array in /v1/embeddings response");
+        const auto &items = data->as_array();
+        if (items.size() != request.inputs.size())
+            return llamaserver::protocol_error("embedding count mismatch in /v1/embeddings response");
+        EmbedResult result;
+        result.embeddings.resize(items.size());
+        std::vector<bool> populated(items.size(), false);
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            const auto &item = items[i];
+            if (!item.is_object())
+                return llamaserver::protocol_error("malformed embedding entry");
+            std::size_t slot = i;
+            if (const auto *idx = item.find("index"); idx && idx->is_integer()) {
+                const std::int64_t v = idx->as_int(-1);
+                if (v < 0 || static_cast<std::size_t>(v) >= items.size())
+                    return llamaserver::protocol_error("out-of-range embedding index");
+                slot = static_cast<std::size_t>(v);
+            }
+            if (populated[slot])
+                return llamaserver::protocol_error("duplicate embedding index");
+            const auto *emb = item.find("embedding");
+            if (!emb || !emb->is_array())
+                return llamaserver::protocol_error("missing embedding vector");
+            std::vector<float> vec;
+            vec.reserve(emb->as_array().size());
+            for (const auto &num : emb->as_array()) {
+                if (!num.is_number() || !std::isfinite(num.as_double()))
+                    return llamaserver::protocol_error("non-finite value in embedding vector");
+                vec.push_back(static_cast<float>(num.as_double()));
+            }
+            result.embeddings[slot] = std::move(vec);
+            populated[slot] = true;
+        }
+        if (const auto *usage = parsed->find("usage"); usage && usage->is_object()) {
+            if (const auto *pt = usage->find("prompt_tokens"); pt && pt->is_integer() && pt->as_int(-1) >= 0) {
+                result.prompt_tokens = pt->as_uint();
+            }
+        }
+        result.eval_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
         return result;
     }
 

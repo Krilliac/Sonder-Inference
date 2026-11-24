@@ -73,8 +73,16 @@ Backend:
   --cache-type-v T        llama.cpp: V cache type, same values; a quantized V
                           cache needs flash attention (on or auto)
   --flash-attn MODE       llama.cpp: auto (default), on or off
-                          (--batch-size through --flash-attn: --backend llamacpp
-                          only; llama-server takes them in its spawn args)
+  --threads N             llama.cpp: CPU thread count (1..256)
+  --no-mmap               llama.cpp: disable GGUF memory-mapping (direct read)
+  --no-kv-unified         llama.cpp: disable unified KV buffer across slots
+  --no-prefix-cache       llama.cpp: disable prompt KV prefix reuse across turns
+  --slots N               llama.cpp: cached KV sequence slots (1..16, default 1)
+  --spec-type TYPE        llama.cpp: in-process speculative decoding
+                          (none|auto|ngram|ngram-mod|draft-mtp, default none)
+  --spec-draft-max N      llama.cpp: max draft tokens per speculative step (0..64)
+                          (--batch-size through --spec-draft-max: --backend
+                          llamacpp only; llama-server takes them in its spawn args)
   --mock-delay-ms N       mock backend per-token delay
   --llamaserver-config PATH  JSON config (mode, URL/executable, args, TLS and timeouts)
   --llamaserver-url URL     attach upstream URL (default http://127.0.0.1:8080)
@@ -141,7 +149,11 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"moe-experts", Kind::value},            {"tensor-override", Kind::repeat},
         {"batch-size", Kind::value},             {"ubatch-size", Kind::value},
         {"cache-type-k", Kind::value},           {"cache-type-v", Kind::value},
-        {"flash-attn", Kind::value},             {"profiles", Kind::value},
+        {"flash-attn", Kind::value},             {"threads", Kind::value},
+        {"no-mmap", Kind::flag},                 {"no-kv-unified", Kind::flag},
+        {"no-prefix-cache", Kind::flag},         {"slots", Kind::value},
+        {"spec-type", Kind::value},              {"spec-draft-max", Kind::value},
+        {"profiles", Kind::value},
         {"profile", Kind::repeat},               {"all-profiles", Kind::flag},
         {"vram-budget-mib", Kind::value},        {"allow-overcommit", Kind::flag},
     };
@@ -513,8 +525,15 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     // arguments (the --llamaserver-config "args", or a launch profile).
     if (o.backend.backend != "llamacpp") {
         for (const char* flag : {"gpu-layers", "context-length", "moe-experts", "tensor-override",
-                                 "batch-size", "ubatch-size", "cache-type-k", "cache-type-v", "flash-attn"}) {
+                                 "batch-size", "ubatch-size", "cache-type-k", "cache-type-v", "flash-attn",
+                                 "threads", "slots", "spec-type", "spec-draft-max"}) {
             if (a.get(flag)) {
+                return usage_error(std::string("option --") + flag +
+                                   " applies only to --backend llamacpp; for llamaserver set it in the JSON args");
+            }
+        }
+        for (const char* flag : {"no-mmap", "no-kv-unified", "no-prefix-cache"}) {
+            if (a.flags.count(flag) != 0) {
                 return usage_error(std::string("option --") + flag +
                                    " applies only to --backend llamacpp; for llamaserver set it in the JSON args");
             }
@@ -532,6 +551,33 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     if (auto v = a.get("cache-type-k")) o.backend.llamacpp_kv_cache_type_k = *v;
     if (auto v = a.get("cache-type-v")) o.backend.llamacpp_kv_cache_type_v = *v;
     if (auto v = a.get("flash-attn")) o.backend.llamacpp_flash_attention = *v;
+    if (auto v = a.get("threads")) {
+        if (!parse_uint(*v, 256, n) || n == 0) return usage_error("--threads must be an integer from 1 to 256");
+        o.backend.llamacpp_threads = static_cast<std::int32_t>(n);
+    }
+    if (a.flags.count("no-mmap") != 0) {
+        o.backend.llamacpp_use_mmap = false;
+    }
+    if (a.flags.count("no-kv-unified") != 0) {
+        o.backend.llamacpp_kv_unified = false;
+    }
+    if (a.flags.count("no-prefix-cache") != 0) {
+        o.backend.llamacpp_prefix_cache = false;
+    }
+    if (auto v = a.get("slots")) {
+        if (!parse_uint(*v, 16, n) || n == 0) return usage_error("--slots must be an integer from 1 to 16");
+        o.backend.llamacpp_slots = static_cast<std::uint32_t>(n);
+    }
+    if (auto v = a.get("spec-type")) {
+        if (*v != "none" && *v != "auto" && *v != "ngram" && *v != "ngram-mod" && *v != "draft-mtp") {
+            return usage_error("--spec-type must be none, auto, ngram, ngram-mod or draft-mtp");
+        }
+        o.backend.llamacpp_spec_type = *v;
+    }
+    if (auto v = a.get("spec-draft-max")) {
+        if (!parse_uint(*v, 64, n)) return usage_error("--spec-draft-max must be an integer from 0 to 64");
+        o.backend.llamacpp_spec_draft_max = static_cast<std::int32_t>(n);
+    }
     if (primary && primary->backend == kLaunchProfileBackendLlamaCpp) {
         const BackendSetup base_backend = o.backend;
         const std::string base_device = o.device;

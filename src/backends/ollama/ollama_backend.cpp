@@ -1,8 +1,12 @@
 // Backend adapter: exposes OllamaClient through the core Backend interface.
+#include <chrono>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
+#include "net/http_client.hpp"
 #include "sonder/inference/backends/ollama.hpp"
 
 namespace sonder::inference {
@@ -115,6 +119,130 @@ public:
 
     bool has_native_chat() const override { return true; }
 
+    Result<EmbedResult> embed(const EmbedRequest& request, const CancellationToken& cancel) override {
+        if (cancel.cancelled()) {
+            return Status(ErrorCode::cancelled, "ollama: request cancelled");
+        }
+        if (request.inputs.empty()) {
+            return Status(ErrorCode::invalid_argument, "ollama: embed inputs must be non-empty");
+        }
+        const auto& cfg = client_->config();
+        auto url = net::parse_url(cfg.base_url);
+        if (!url.ok()) {
+            return url.status();
+        }
+        const net::Url& u = url.value();
+        const bool https = u.scheme == "https";
+        if (u.scheme != "http" && !https) {
+            return Status(ErrorCode::unsupported,
+                          "ollama: only http:// endpoints are supported by the internal client (got '" + u.scheme +
+                              "'); front TLS workers with a local proxy");
+        }
+        if (!cfg.allow_remote && !net::is_loopback_host(u.host)) {
+            return Status(ErrorCode::invalid_argument,
+                          std::string(https ? "ollama: refusing non-loopback host '"
+                                            : "ollama: refusing plain HTTP to non-loopback host '") +
+                              u.host + "' (set allow_remote to override)");
+        }
+        std::string target = "/api/embed";
+        if (!u.path.empty() && u.path != "/") {
+            std::string base = u.path;
+            if (base.back() == '/') base.pop_back();
+            target = base + target;
+        }
+        json::Array input_arr;
+        input_arr.reserve(request.inputs.size());
+        for (const auto& text : request.inputs) {
+            input_arr.emplace_back(text);
+        }
+        json::Object body_obj{{"model", descriptor_.name}, {"input", std::move(input_arr)}};
+        if (!cfg.keep_alive.empty()) {
+            body_obj.set("keep_alive", cfg.keep_alive);
+        }
+        net::HttpRequest http_req;
+        http_req.method = "POST";
+        http_req.host = u.host;
+        http_req.port = u.port;
+        http_req.target = std::move(target);
+        http_req.body = json::Value(std::move(body_obj)).dump();
+        http_req.content_type = "application/json";
+        http_req.connect_timeout = cfg.connect_timeout;
+        http_req.total_timeout = cfg.request_timeout;
+        if (https) {
+            http_req.use_tls = true;
+            http_req.tls.ca_bundle_path = cfg.tls.ca_bundle_path;
+            http_req.tls.pinned_sha256 = cfg.tls.pinned_sha256;
+            http_req.tls.pinned_cert_path = cfg.tls.pinned_cert_path;
+            http_req.tls.insecure_skip_verify = cfg.tls.insecure_skip_verify;
+            http_req.tls.server_name = cfg.tls.server_name;
+            http_req.tls.handshake_timeout = cfg.tls.handshake_timeout;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string out;
+        auto res = net::http_request_buffered(http_req, out, cancel, 64u * 1024u * 1024u);
+        if (cancel.cancelled()) {
+            return Status(ErrorCode::cancelled, "ollama: request cancelled");
+        }
+        if (!res.ok()) {
+            return res.status();
+        }
+        const int status = res.value().status;
+        if (status < 200 || status >= 300) {
+            std::string detail;
+            if (auto err_parsed = json::parse(out); err_parsed.ok()) {
+                if (const json::Value* e = err_parsed.value().find("error"); e != nullptr) {
+                    detail = e->is_string() ? e->as_string() : e->dump();
+                }
+            }
+            const std::string text = "ollama HTTP " + std::to_string(status) + (detail.empty() ? "" : ": " + detail);
+            if (status == 501 || (status == 400 && detail.find("does not support") != std::string::npos)) {
+                return Status(ErrorCode::unsupported, text);
+            }
+            if (status == 404) return Status(ErrorCode::not_found, text);
+            if (status == 400) return Status(ErrorCode::invalid_argument, text);
+            if (status == 503) return Status(ErrorCode::unavailable, text);
+            return Status(ErrorCode::backend_error, text);
+        }
+        auto parsed = json::parse(out);
+        if (!parsed.ok() || !parsed.value().is_object()) {
+            return Status(ErrorCode::protocol_error, "ollama: /api/embed did not return a JSON object");
+        }
+        const json::Value* embs = parsed.value().find("embeddings");
+        if (embs == nullptr || !embs->is_array()) {
+            return Status(ErrorCode::protocol_error, "ollama: /api/embed response missing embeddings array");
+        }
+        const auto& rows = embs->as_array();
+        if (rows.size() != request.inputs.size()) {
+            return Status(ErrorCode::protocol_error, "ollama: /api/embed returned unexpected embedding count");
+        }
+        EmbedResult result;
+        result.embeddings.reserve(rows.size());
+        for (const auto& row : rows) {
+            if (!row.is_array()) {
+                return Status(ErrorCode::protocol_error, "ollama: /api/embed embedding entry must be an array");
+            }
+            std::vector<float> vec;
+            vec.reserve(row.as_array().size());
+            for (const auto& val : row.as_array()) {
+                if (!val.is_number() || !std::isfinite(val.as_double())) {
+                    return Status(ErrorCode::protocol_error, "ollama: /api/embed returned non-finite value");
+                }
+                vec.push_back(static_cast<float>(val.as_double()));
+            }
+            result.embeddings.push_back(std::move(vec));
+        }
+        if (const json::Value* pe = parsed.value().find("prompt_eval_count"); pe != nullptr && pe->is_number()) {
+            result.prompt_tokens = to_u64(pe->as_int());
+        }
+        if (const json::Value* td = parsed.value().find("total_duration"); td != nullptr && td->is_number()) {
+            result.eval_ns = to_u64(td->as_int());
+        } else {
+            result.eval_ns = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        }
+        return result;
+    }
+
 private:
     // Shared streaming path for /api/generate and /api/chat: maps Ollama
     // stream chunks onto TokenCallback and the final chunk onto GenerateStats.
@@ -196,7 +324,7 @@ public:
     }
     BackendCapabilities capabilities() const override {
         BackendCapabilities caps;
-        caps.add(Capability::streaming).add(Capability::remote_process);
+        caps.add(Capability::streaming).add(Capability::remote_process).add(Capability::embeddings);
         return caps;
     }
 

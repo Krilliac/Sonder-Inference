@@ -203,12 +203,21 @@ TEST_CASE("openai: rejected and invalid requests name the field") {
     const std::string msgs = R"("messages":[{"role":"user","content":"hi"}])";
     CHECK(error_of("{").code == "invalid_json");
     CHECK(error_of("[]").code == "invalid_json");
-    for (const char* key : {"tools", "tool_choice", "functions", "function_call", "response_format", "top_logprobs"}) {
+    for (const char* key : {"tools", "tool_choice", "functions", "function_call", "top_logprobs"}) {
         const ApiError e = error_of("{" + msgs + R"(,")" + key + R"(":[1]})");
         CHECK(e.status == 400);
         CHECK(e.code == "unsupported_parameter");
         CHECK(e.param == std::optional<std::string>(key));
     }
+    // Valid response_format is accepted; malformed/unknown types are rejected.
+    {
+        const auto rf_ok = parse_chat_request("{" + msgs + R"(,"response_format":{"type":"json_object"}})");
+        REQUIRE(std::holds_alternative<ChatJob>(rf_ok));
+        CHECK(std::get<ChatJob>(rf_ok).response_format_type == std::optional<std::string>("json_object"));
+        CHECK_FALSE(std::get<ChatJob>(rf_ok).grammar.empty());
+    }
+    CHECK(error_of("{" + msgs + R"(,"response_format":{"type":"xml"}})").code == "unsupported_parameter");
+    CHECK(error_of("{" + msgs + R"(,"response_format":[1]})").code == "invalid_request");
     CHECK(error_of("{" + msgs + R"(,"logprobs":true})").code == "unsupported_parameter");
     CHECK(error_of("{" + msgs + R"(,"n":2})").code == "unsupported_parameter");
     CHECK(error_of(R"({"messages":[{"role":"user","content":[{"type":"text","text":"x"}]}]})").code ==

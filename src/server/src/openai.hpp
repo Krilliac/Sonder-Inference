@@ -39,6 +39,8 @@ json::Object error_body(const ApiError& error);
 // Default completion budget when the request sets neither max_tokens nor
 // max_completion_tokens.
 inline constexpr std::int32_t kDefaultMaxTokens = 1024;
+inline constexpr std::size_t kMaxRequestGrammarBytes = 64u * 1024u;
+inline constexpr std::size_t kMaxEmbedInputs = 256u;
 
 struct ChatJob {
     std::string model = "default";
@@ -57,6 +59,42 @@ struct ChatJob {
     std::optional<std::uint64_t> deadline_ms;
     std::optional<std::int64_t> reasoning_budget_tokens = std::nullopt;
     std::optional<std::string> reasoning_budget_message = std::nullopt;
+    // Optional GBNF grammar (from explicit `grammar` or converted from `response_format`).
+    std::string grammar;
+    // Optional native OpenAI response_format hint ("json_object" or "json_schema")
+    // and serialized JSON schema when type == "json_schema".
+    std::optional<std::string> response_format_type;
+    std::optional<std::string> response_format_schema;
+};
+
+struct EmbedJob {
+    std::string model = "default";
+    std::vector<std::string> inputs;
+    std::optional<RequestPriority> priority_class;
+    std::optional<std::uint64_t> deadline_ms;
+};
+
+struct CompletionJob {
+    std::string model = "default";
+    std::string prompt;
+    SamplingConfig sampling;
+    bool stream = false;
+    bool include_usage = false;
+    bool echo = false;
+    std::optional<std::string> session_key;
+    std::string grammar;
+    std::optional<RequestPriority> priority_class;
+    std::optional<std::uint64_t> deadline_ms;
+};
+
+struct TokenizeJob {
+    std::string model = "default";
+    std::string content;
+};
+
+struct DetokenizeJob {
+    std::string model = "default";
+    std::vector<TokenId> tokens;
 };
 
 // Maps a request body to a ChatJob. Unknown top-level fields are ignored;
@@ -64,12 +102,17 @@ struct ChatJob {
 // enable_thinking (bool) and reasoning_effort (string, 1-64 of
 // [A-Za-z0-9._-]) are forwarded, other keys ignored; think (bool) must agree
 // with enable_thinking when both are set; prompt_cache_key is a 1-256 byte
-// string (invalid_json otherwise). Rejected with
-// unsupported_parameter: tools, tool_choice, functions, function_call,
-// response_format, logprobs (true), top_logprobs, n != 1, non-string message
+// string (invalid_json otherwise). Supports response_format ("text",
+// "json_object", "json_schema") and optional grammar (up to 64 KiB).
+// Rejected with unsupported_parameter: tools, tool_choice, functions,
+// function_call, logprobs (true), top_logprobs, n != 1, non-string message
 // content, tool_calls on a message. Sonder extensions: num_ctx, typical_p,
 // repeat_last_n, repeat_penalty, top_k, min_p.
 std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body);
+std::variant<EmbedJob, ApiError> parse_embed_request(std::string_view body);
+std::variant<CompletionJob, ApiError> parse_completion_request(std::string_view body);
+std::variant<TokenizeJob, ApiError> parse_tokenize_request(std::string_view body);
+std::variant<DetokenizeJob, ApiError> parse_detokenize_request(std::string_view body);
 
 // Parses the additive scheduling hint values used by both JSON bodies and
 // headers. Unknown values return nullopt; callers should map that to their

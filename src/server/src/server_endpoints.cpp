@@ -913,6 +913,7 @@ void handle_telemetry_stream(Exchange& ex, const RequestHead& head, Route route,
     const auto sub = subscribed.subscription;
     // From here on the stream never touches the engine.
     flags.streaming.store(true);
+    ex.keep_alive = false;
     Headers h = base_headers(ex, sse ? "text/event-stream; charset=utf-8" : "application/x-ndjson");
     h.emplace_back("X-Accel-Buffering", "no");
     ex.status = 200;

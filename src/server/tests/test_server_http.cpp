@@ -143,7 +143,9 @@ TEST_CASE("routing: unknown path, wrong method and embeddings") {
     const Reply wrong = post(f.port, "/v1/models", "{}");
     check_error(wrong, 405, "invalid_request_error", "method_not_allowed");
     CHECK(wrong.header("allow") == "GET, OPTIONS");
-    check_error(post(f.port, "/v1/embeddings", R"({"input":"x"})"), 501, "not_implemented_error", "not_implemented");
+    const Reply emb = post(f.port, "/v1/embeddings", R"({"input":"x"})");
+    REQUIRE(emb.status == 200);
+    CHECK(emb.json().find("object")->as_string() == "list");
 }
 
 TEST_CASE("auth: a configured token is required on every route except preflight") {
@@ -390,7 +392,7 @@ TEST_CASE("expect: 100-continue is answered before the body is read, other expec
     {
         Conn c(f.port);
         c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
-               "Expect: 100-continue\r\nContent-Length: " +
+               "Connection: close\r\nExpect: 100-continue\r\nContent-Length: " +
                std::to_string(body.size()) + "\r\n\r\n");
         std::string acc;
         // curl waits 1 s for this before sending the body anyway.

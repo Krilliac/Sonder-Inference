@@ -93,8 +93,10 @@ json::Value build_completion_body(const std::string &model, const GenerateReques
     if (!native_completion)
         o.set("stream_options", json::Object{{"include_usage", true}});
     put_sampling(o, request.sampling, native_completion);
-    if (!grammar.empty())
-        o.set("grammar", std::string(grammar));
+    const std::string_view effective_grammar =
+        !request.grammar.empty() ? std::string_view(request.grammar) : grammar;
+    if (!effective_grammar.empty())
+        o.set("grammar", std::string(effective_grammar));
     put_extras(o, extras, native_completion && !extras.generic_thinking);
     return o;
 }
@@ -114,8 +116,30 @@ json::Value build_chat_body(const std::string &model, const ChatRequest &request
     o.set("messages", std::move(messages));
     o.set("stream_options", json::Object{{"include_usage", true}});
     put_sampling(o, request.sampling, false);
-    if (!grammar.empty())
-        o.set("grammar", std::string(grammar));
+    bool emitted_response_format = false;
+    if (request.response_format_type && !request.response_format_type->empty()) {
+        const std::string &rf_type = *request.response_format_type;
+        if (rf_type == "json_object" || rf_type == "text") {
+            o.set("response_format", json::Object{{"type", rf_type}});
+            emitted_response_format = true;
+        } else if (rf_type == "json_schema" && request.response_format_schema) {
+            auto parsed_schema = json::parse(*request.response_format_schema);
+            if (parsed_schema.ok() && parsed_schema.value().is_object()) {
+                o.set("response_format",
+                      json::Object{{"type", "json_schema"},
+                                   {"json_schema", json::Object{{"name", "response"},
+                                                                {"schema", std::move(parsed_schema).value()},
+                                                                {"strict", true}}}});
+                emitted_response_format = true;
+            }
+        }
+    }
+    if (!emitted_response_format) {
+        const std::string_view effective_grammar =
+            !request.grammar.empty() ? std::string_view(request.grammar) : grammar;
+        if (!effective_grammar.empty())
+            o.set("grammar", std::string(effective_grammar));
+    }
     if (!request.thinking.empty() && extras.generic_thinking) {
         if (request.thinking.enable_thinking)
             o.set("enable_thinking", *request.thinking.enable_thinking);
