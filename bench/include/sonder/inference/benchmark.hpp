@@ -1,7 +1,7 @@
 // Sonder Inference: benchmark harness (docs/BENCHMARK_PLAN.md).
 //
-// Runs a prompt corpus through Engine sessions on any backend (ollama, mock,
-// future native backends) and produces a results document
+// Runs a prompt corpus through Engine sessions on any backend (ollama,
+// llamaserver, mock, future native backends) and produces a results document
 // (schema sonder.inference.bench/1): per-request rows, per-prompt and global
 // distributions (TTFT, total latency, decode/prompt tokens/sec, errors),
 // agent fan-out batches, and full provenance. render_markdown() turns a
@@ -106,6 +106,8 @@ struct BenchCliArgs {
     bool help = false;
     std::string backend = "ollama";
     std::string ollama_url;
+    std::string llamaserver_url;
+    std::string llamaserver_config;
     std::string model;
     std::string corpus_path = "bench/corpus/baseline.json";
     std::string out_dir = "bench/results";
@@ -118,11 +120,30 @@ struct BenchCliArgs {
     Options options;
 };
 
+// Options for building a loopback-contained llamaserver benchmark backend.
+// Non-loopback URLs and allow_remote=true are always rejected.
+struct LlamaServerBenchOptions {
+    std::string url;
+    std::string config_path;
+    std::string mode;
+    std::string executable;
+    std::vector<std::string> args;
+};
+
+// Builds a loopback-contained llamaserver backend for benchmarking. Loads
+// `config_path` via load_llamaserver_config() when SONDER_HAS_SERVER is
+// defined, or attaches via LlamaServerBackendOptions directly when built
+// without SONDER_HAS_SERVER. `url` and `config_path` are mutually exclusive.
+// Always enforces loopback containment (allow_remote stays false) and eagerly
+// validates attach/spawn options.
+Result<std::shared_ptr<Backend>> make_llamaserver_bench_backend(const LlamaServerBenchOptions& opts);
+
 // Generated help text for `sonder-bench`.
 std::string render_bench_cli_help();
 
 // Parses `sonder-bench` argv (excluding argv[0]) against its option spec and
-// validates numeric ranges (including --concurrency 1..64 and --no-gpu-snapshot).
+// validates backend combinations and numeric ranges (including --concurrency
+// 1..64, --no-gpu-snapshot, and --llamaserver-url / --llamaserver-config).
 // Returns true on success (or when -h/--help is present, setting out.help = true);
 // returns false and writes a diagnostic into `error` on usage errors.
 bool parse_bench_cli_args(const std::vector<std::string>& args, BenchCliArgs& out, std::string& error);

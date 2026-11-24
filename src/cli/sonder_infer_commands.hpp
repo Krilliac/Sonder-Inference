@@ -271,25 +271,39 @@ inline const CommandSpec& bench_command() {
     static const CommandSpec spec{
         "bench",
         "run the benchmark harness over a corpus (JSON results)",
-        {"bench --backend NAME --model MODEL --corpus FILE --out FILE [--markdown] [options]"},
+        {"bench --backend NAME --model MODEL --corpus FILE --out FILE [--markdown] [options]",
+         "bench --backend NAME --list-models [options]"},
         {backend_options(),
          {"Bench",
-          {{"corpus", OptionKind::value, "FILE", "corpus JSON (e.g. bench/corpus/smoke.json; required)"},
-           {"out", OptionKind::value, "FILE", "results JSON, schema sonder.inference.bench/1 (required)"},
+          {{"corpus", OptionKind::value, "FILE",
+            "corpus JSON (e.g. bench/corpus/smoke.json; required unless --list-models)"},
+           {"out", OptionKind::value, "FILE",
+            "results JSON, schema sonder.inference.bench/1 (required unless --list-models)"},
+           {"list-models", OptionKind::flag, "", "list models on the backend and exit"},
            {"markdown", OptionKind::flag, "",
             "also print the markdown summary and write it next to --out\n"
             "(same name, .md extension)"},
            {"warmup", OptionKind::value, "N", "warmup runs per prompt, 0 to 100 (default 1)"},
            {"runs", OptionKind::value, "N", "measured runs per prompt, 1 to 1000 (default 3)"},
+           {"concurrency", OptionKind::value, "N",
+            "parallel worker sessions per measured run, 1 to 64 (default 1)"},
+           {"no-gpu-snapshot", OptionKind::flag, "",
+            "skip before/after GPU VRAM snapshot enumeration"},
+           {"hardware", OptionKind::value, "TEXT",
+            "hardware description recorded in results (GPU/VRAM/CPU/RAM/driver)"},
            {"label", OptionKind::value, "TEXT", "free-form label stored in results (default run_id)"}}},
          sampling_options(),
          telemetry_options(),
          correlation_options(),
          {"Output", {{"quiet", OptionKind::flag, "", "suppress progress lines on stderr"}}}},
         {kBackendNote, kEnvNote,
+         "The llamaserver backend in bench is loopback-only (allow_remote is refused;\n"
+         "--llamaserver-url and --llamaserver-config are mutually exclusive).",
          "MOCK results are labelled in the markdown summary and are never a performance claim.",
          "Exits 1 when any request failed.", kExitNote},
-        {"bench --backend mock --model mock:tiny --corpus bench/corpus/smoke.json --out r.json --warmup 0 --runs 1"}};
+        {"bench --backend mock --model mock:tiny --corpus bench/corpus/smoke.json --out r.json --warmup 0 --runs 1",
+         "bench --backend llamaserver --llamaserver-url http://127.0.0.1:8080 --list-models",
+         "bench --backend llamaserver --llamaserver-url http://127.0.0.1:8080 --model bonsai-2 --corpus bench/corpus/smoke.json --out r.json --markdown"}};
     return spec;
 }
 

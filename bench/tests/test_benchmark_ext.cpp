@@ -8,13 +8,19 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "cli/cli_args.hpp"
+#include "cli/sonder_infer_commands.hpp"
 #include "sonder/inference/benchmark.hpp"
 #include "test_helpers.hpp"
 
@@ -27,6 +33,128 @@ std::string slurp(const std::string& p) {
     ss << in.rdbuf();
     return ss.str();
 }
+
+struct SpecScriptedReply {
+    std::string text = "ok";
+    std::uint64_t prompt_tokens = 32;
+    std::uint64_t completion_tokens = 8;
+    std::uint64_t prompt_eval_ns = 10'000'000;
+    std::uint64_t eval_ns = 20'000'000;
+    // When true, populate only GenerateStats::backend_timings so tests verify
+    // raw BackendTimings extraction even when top-level optional fields are unset.
+    bool timings_only = false;
+    bool fail_request = false;
+    bool cancel_request = false;
+    std::optional<std::uint64_t> draft_n;
+    std::optional<std::uint64_t> draft_n_accepted;
+    std::optional<std::uint64_t> cache_n;
+};
+
+class SpecStubModel final : public BackendModel {
+public:
+    SpecStubModel(ModelDescriptor desc, std::vector<SpecScriptedReply> replies,
+                  std::shared_ptr<std::vector<SamplingConfig>> seen_sampling)
+        : descriptor_(std::move(desc)), replies_(std::move(replies)), seen_sampling_(std::move(seen_sampling)) {}
+
+    const ModelDescriptor& descriptor() const override { return descriptor_; }
+
+    Result<GenerateStats> generate(const GenerateRequest& request, const CancellationToken& cancel,
+                                   const TokenCallback& on_chunk) override {
+        if (cancel.cancelled()) {
+            return Status(ErrorCode::cancelled, "cancelled");
+        }
+        SpecScriptedReply reply;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (seen_sampling_) {
+                seen_sampling_->push_back(request.sampling);
+            }
+            if (index_ < replies_.size()) {
+                reply = replies_[index_++];
+            } else if (!replies_.empty()) {
+                reply = replies_.back();
+            }
+        }
+        if (reply.fail_request) {
+            return Status(ErrorCode::backend_error, "injected backend failure");
+        }
+        if (reply.cancel_request) {
+            return Status(ErrorCode::cancelled, "injected cancellation");
+        }
+        GenerateStats stats;
+        stats.prompt_tokens = reply.prompt_tokens;
+        stats.completion_tokens = reply.completion_tokens;
+        stats.prompt_eval_ns = reply.prompt_eval_ns;
+        stats.eval_ns = reply.eval_ns;
+        stats.token_counts_from_backend = true;
+        stats.stop_reason = StopReason::max_tokens;
+        if (reply.draft_n.has_value() || reply.draft_n_accepted.has_value() || reply.cache_n.has_value()) {
+            BackendTimings bt;
+            bt.prompt_n = reply.prompt_tokens;
+            bt.predicted_n = reply.completion_tokens;
+            bt.draft_n = reply.draft_n;
+            bt.draft_n_accepted = reply.draft_n_accepted;
+            bt.cache_n = reply.cache_n;
+            stats.backend_timings = bt;
+            if (!reply.timings_only) {
+                stats.draft_tokens = reply.draft_n;
+                stats.draft_accepted_tokens = reply.draft_n_accepted;
+                stats.cached_tokens = reply.cache_n;
+            }
+        }
+        if (on_chunk) {
+            (void)on_chunk(TokenChunk{reply.text, 0});
+        }
+        stats.chunks = 1;
+        return stats;
+    }
+
+private:
+    ModelDescriptor descriptor_;
+    std::vector<SpecScriptedReply> replies_;
+    std::shared_ptr<std::vector<SamplingConfig>> seen_sampling_;
+    std::mutex mu_;
+    std::size_t index_ = 0;
+};
+
+class SpecStubBackend final : public Backend {
+public:
+    explicit SpecStubBackend(std::vector<SpecScriptedReply> replies,
+                             std::shared_ptr<std::vector<SamplingConfig>> seen_sampling = nullptr)
+        : replies_(std::move(replies)), seen_sampling_(std::move(seen_sampling)) {}
+
+    std::string name() const override { return "llamaserver"; }
+    std::string description() const override { return "Stub llamaserver with speculative timings"; }
+    BackendCapabilities capabilities() const override {
+        BackendCapabilities c;
+        c.add(Capability::streaming)
+            .add(Capability::remote_process)
+            .add(Capability::speculative_decode)
+            .add(Capability::prefix_reuse);
+        return c;
+    }
+    Result<std::string> probe() override { return std::string("stub-llamaserver/1"); }
+    Result<std::vector<ModelDescriptor>> list_models() override {
+        ModelDescriptor m;
+        m.name = "bonsai-2-q1";
+        m.backend = "llamaserver";
+        m.format = "gguf";
+        m.quantization = "Q1_0_G128";
+        return std::vector<ModelDescriptor>{m};
+    }
+    Result<std::shared_ptr<BackendModel>> load_model(const ModelLoadOptions& options) override {
+        ModelDescriptor m;
+        m.name = options.model;
+        m.backend = "llamaserver";
+        m.format = "gguf";
+        m.quantization = "Q1_0_G128";
+        return std::shared_ptr<BackendModel>(std::make_shared<SpecStubModel>(std::move(m), replies_, seen_sampling_));
+    }
+
+private:
+    std::vector<SpecScriptedReply> replies_;
+    std::shared_ptr<std::vector<SamplingConfig>> seen_sampling_;
+};
 }  // namespace
 
 TEST_SUITE("benchmark_ext") {
@@ -535,5 +663,867 @@ TEST_CASE("single-child fan-out records child index 0") {
     const auto& batches = doc.find("fanout_batches")->as_array();
     REQUIRE(batches.size() == 1u);
     CHECK(batches[0].find("children")->as_int() == 1);
+}
+
+TEST_CASE("sonder-bench CLI options for llamaserver backend") {
+    bench::BenchCliArgs parsed;
+    std::string error;
+
+    REQUIRE_MESSAGE(
+        bench::parse_bench_cli_args(
+            {"--backend", "llamaserver", "--llamaserver-url", "http://127.0.0.1:18080", "--model", "bonsai-2"}, parsed,
+            error),
+        error);
+    CHECK(parsed.backend == "llamaserver");
+    CHECK(parsed.llamaserver_url == "http://127.0.0.1:18080");
+    CHECK(parsed.llamaserver_config.empty());
+    CHECK(parsed.model == "bonsai-2");
+    CHECK_FALSE(parsed.list_models);
+
+    REQUIRE_MESSAGE(
+        bench::parse_bench_cli_args(
+            {"--backend", "llamaserver", "--llamaserver-config", "server.json", "--model", "bonsai-2"}, parsed, error),
+        error);
+    CHECK(parsed.backend == "llamaserver");
+    CHECK(parsed.llamaserver_config == "server.json");
+    CHECK(parsed.llamaserver_url.empty());
+
+    // --llamaserver-url and --llamaserver-config are strictly mutually exclusive.
+    CHECK_FALSE(bench::parse_bench_cli_args({"--backend", "llamaserver", "--llamaserver-config", "server.json",
+                                             "--llamaserver-url", "http://127.0.0.1:18080", "--model", "bonsai-2"},
+                                            parsed, error));
+    CHECK(error.find("cannot be used together") != std::string::npos);
+
+    REQUIRE_MESSAGE(
+        bench::parse_bench_cli_args(
+            {"--backend", "llamaserver", "--llamaserver-url", "http://127.0.0.1:18080", "--list-models"}, parsed,
+            error),
+        error);
+    CHECK(parsed.backend == "llamaserver");
+    CHECK(parsed.list_models);
+    CHECK(parsed.model.empty());
+
+    REQUIRE_MESSAGE(bench::parse_bench_cli_args({"--backend", "llamaserver", "--list-models"}, parsed, error), error);
+    CHECK(parsed.backend == "llamaserver");
+    CHECK(parsed.list_models);
+
+    // Ollama defaults and --require-idle stay intact.
+    REQUIRE_MESSAGE(
+        bench::parse_bench_cli_args(
+            {"--backend", "ollama", "--ollama-url", "http://127.0.0.1:11434", "--require-idle", "--model", "qwen3:0.6b"},
+            parsed, error),
+        error);
+    CHECK(parsed.backend == "ollama");
+    CHECK(parsed.require_idle);
+    CHECK(parsed.ollama_url == "http://127.0.0.1:11434");
+
+    // Conflicting and invalid backend/option combinations are rejected.
+    CHECK_FALSE(bench::parse_bench_cli_args({"--llamaserver-url", "http://127.0.0.1:18080", "--model", "m"}, parsed,
+                                            error));
+    CHECK(error.find("--llamaserver-url") != std::string::npos);
+
+    CHECK_FALSE(bench::parse_bench_cli_args(
+        {"--backend", "ollama", "--llamaserver-url", "http://127.0.0.1:18080", "--model", "m"}, parsed, error));
+    CHECK(error.find("--llamaserver-url") != std::string::npos);
+
+    CHECK_FALSE(bench::parse_bench_cli_args(
+        {"--backend", "mock", "--llamaserver-url", "http://127.0.0.1:18080", "--model", "mock:tiny"}, parsed, error));
+    CHECK(error.find("--llamaserver-url") != std::string::npos);
+
+    CHECK_FALSE(bench::parse_bench_cli_args(
+        {"--backend", "ollama", "--llamaserver-config", "server.json", "--model", "m"}, parsed, error));
+    CHECK(error.find("--llamaserver-config") != std::string::npos);
+
+    CHECK_FALSE(bench::parse_bench_cli_args(
+        {"--backend", "mock", "--llamaserver-config", "server.json", "--model", "mock:tiny"}, parsed, error));
+    CHECK(error.find("--llamaserver-config") != std::string::npos);
+
+    CHECK_FALSE(bench::parse_bench_cli_args(
+        {"--backend", "llamaserver", "--ollama-url", "http://127.0.0.1:11434", "--model", "m"}, parsed, error));
+    CHECK(error.find("--ollama-url") != std::string::npos);
+
+    CHECK_FALSE(bench::parse_bench_cli_args({"--backend", "llamaserver", "--require-idle", "--model", "m"}, parsed,
+                                            error));
+    CHECK(error.find("--require-idle") != std::string::npos);
+
+    CHECK_FALSE(bench::parse_bench_cli_args({"--backend", "mock", "--require-idle", "--model", "mock:tiny"}, parsed,
+                                            error));
+    CHECK(error.find("--require-idle") != std::string::npos);
+
+    CHECK_FALSE(bench::parse_bench_cli_args({"--backend", "llamaserver", "--llamaserver-url", "", "--model", "m"},
+                                            parsed, error));
+    CHECK(error.find("--llamaserver-url") != std::string::npos);
+
+    CHECK_FALSE(bench::parse_bench_cli_args({"--backend", "llamaserver", "--llamaserver-config", "", "--model", "m"},
+                                            parsed, error));
+    CHECK(error.find("--llamaserver-config") != std::string::npos);
+
+    CHECK_FALSE(bench::parse_bench_cli_args({"--backend", "bogus", "--model", "m"}, parsed, error));
+    CHECK(error.find("unsupported backend") != std::string::npos);
+
+    const std::string help = bench::render_bench_cli_help();
+    CHECK(help.find("llamaserver") != std::string::npos);
+    CHECK(help.find("--llamaserver-url") != std::string::npos);
+    CHECK(help.find("--llamaserver-config") != std::string::npos);
+}
+
+TEST_CASE("llamaserver bench backend enforces loopback containment and config validation") {
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+    // Non-loopback URLs are always rejected before creating a backend.
+    for (const char* remote_url :
+         {"http://192.0.2.1:18080", "http://127.0.0.1.attacker.example:18080", "http://0.0.0.0:18080"}) {
+        CAPTURE(remote_url);
+        bench::LlamaServerBenchOptions opts;
+        opts.url = remote_url;
+        auto res = bench::make_llamaserver_bench_backend(opts);
+        REQUIRE_FALSE(res.ok());
+        CHECK(res.status().code() == ErrorCode::invalid_argument);
+    }
+    {
+        bench::LlamaServerBenchOptions opts;
+        opts.url = "https://example.com:18080";
+        auto res = bench::make_llamaserver_bench_backend(opts);
+        REQUIRE_FALSE(res.ok());
+        CHECK((res.status().code() == ErrorCode::invalid_argument || res.status().code() == ErrorCode::unsupported));
+    }
+    {
+        bench::LlamaServerBenchOptions opts;
+        opts.url = "not-a-valid-url";
+        auto res = bench::make_llamaserver_bench_backend(opts);
+        CHECK_FALSE(res.ok());
+    }
+
+    // Valid loopback URLs construct the llamaserver backend cleanly.
+    {
+        bench::LlamaServerBenchOptions opts;
+        opts.url = "http://127.0.0.1:18080";
+        auto res = bench::make_llamaserver_bench_backend(opts);
+        REQUIRE_MESSAGE(res.ok(), res.status().to_string());
+        REQUIRE(res.value() != nullptr);
+        CHECK(res.value()->name() == "llamaserver");
+    }
+
+    // Invalid spawn options fail fast with invalid_argument (not deferred to probe()).
+    {
+        bench::LlamaServerBenchOptions opts;
+        opts.mode = "spawn";
+        auto res = bench::make_llamaserver_bench_backend(opts);
+        REQUIRE_FALSE(res.ok());
+        CHECK(res.status().code() == ErrorCode::invalid_argument);
+    }
+    {
+        bench::LlamaServerBenchOptions opts;
+        opts.mode = "spawn";
+        opts.executable = "llama-server.exe";
+        opts.args = {"--host", "0.0.0.0"};
+        auto res = bench::make_llamaserver_bench_backend(opts);
+        REQUIRE_FALSE(res.ok());
+        CHECK(res.status().code() == ErrorCode::invalid_argument);
+    }
+    {
+        bench::LlamaServerBenchOptions opts;
+        opts.mode = "bogus";
+        auto res = bench::make_llamaserver_bench_backend(opts);
+        REQUIRE_FALSE(res.ok());
+        CHECK(res.status().code() == ErrorCode::invalid_argument);
+    }
+
+#if defined(SONDER_HAS_SERVER)
+    const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto cfg_path = std::filesystem::temp_directory_path() /
+                          ("sonder-bench-llamaserver-cfg-" + std::to_string(unique) + ".json");
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    } cleanup{cfg_path};
+    const auto write_cfg = [&](const std::string& body) {
+        std::ofstream out(cfg_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(out);
+        out << body;
+    };
+
+    // Valid loopback attach config loads cleanly.
+    write_cfg(R"({"mode":"attach","base_url":"http://127.0.0.1:18080","native_completion":false,"connect_timeout_ms":100})");
+    {
+        bench::LlamaServerBenchOptions opts;
+        opts.config_path = cfg_path.string();
+        auto res = bench::make_llamaserver_bench_backend(opts);
+        REQUIRE_MESSAGE(res.ok(), res.status().to_string());
+        CHECK(res.value()->name() == "llamaserver");
+    }
+
+    // Passing both config_path and url is strictly refused (mutually exclusive).
+    {
+        bench::LlamaServerBenchOptions opts;
+        opts.config_path = cfg_path.string();
+        opts.url = "http://[::1]:18080";
+        auto res = bench::make_llamaserver_bench_backend(opts);
+        REQUIRE_FALSE(res.ok());
+        CHECK(res.status().code() == ErrorCode::invalid_argument);
+    }
+    {
+        bench::LlamaServerBenchOptions opts;
+        opts.config_path = cfg_path.string();
+        opts.url = "http://192.0.2.1:18080";
+        auto res = bench::make_llamaserver_bench_backend(opts);
+        REQUIRE_FALSE(res.ok());
+        CHECK(res.status().code() == ErrorCode::invalid_argument);
+    }
+
+    // Spawn config with empty executable or forbidden --port arg fails eagerly.
+    write_cfg(R"({"mode":"spawn","executable":""})");
+    {
+        bench::LlamaServerBenchOptions opts;
+        opts.config_path = cfg_path.string();
+        auto res = bench::make_llamaserver_bench_backend(opts);
+        REQUIRE_FALSE(res.ok());
+        CHECK(res.status().code() == ErrorCode::invalid_argument);
+    }
+    write_cfg(R"({"mode":"spawn","executable":"llama-server.exe","args":["--port","8080"]})");
+    {
+        bench::LlamaServerBenchOptions opts;
+        opts.config_path = cfg_path.string();
+        auto res = bench::make_llamaserver_bench_backend(opts);
+        REQUIRE_FALSE(res.ok());
+        CHECK(res.status().code() == ErrorCode::invalid_argument);
+    }
+
+    // Config enabling allow_remote is strictly refused in benchmark mode.
+    write_cfg(R"({"mode":"attach","base_url":"http://127.0.0.1:18080","allow_remote":true})");
+    {
+        bench::LlamaServerBenchOptions opts;
+        opts.config_path = cfg_path.string();
+        auto res = bench::make_llamaserver_bench_backend(opts);
+        REQUIRE_FALSE(res.ok());
+        CHECK(res.status().code() == ErrorCode::invalid_argument);
+    }
+
+    // Config pointing to a non-loopback URL is refused.
+    write_cfg(R"({"mode":"attach","base_url":"http://192.0.2.1:18080","allow_remote":false})");
+    {
+        bench::LlamaServerBenchOptions opts;
+        opts.config_path = cfg_path.string();
+        auto res = bench::make_llamaserver_bench_backend(opts);
+        REQUIRE_FALSE(res.ok());
+        CHECK(res.status().code() == ErrorCode::invalid_argument);
+    }
+#endif
+#else
+    bench::LlamaServerBenchOptions opts;
+    opts.url = "http://127.0.0.1:18080";
+    auto res = bench::make_llamaserver_bench_backend(opts);
+    REQUIRE_FALSE(res.ok());
+    CHECK(res.status().code() == ErrorCode::unsupported);
+#endif
+}
+
+TEST_CASE("sonder-infer bench command spec exposes list-models and llamaserver options") {
+    const auto& spec = sonder::cli::bench_command();
+    REQUIRE(spec.find("list-models") != nullptr);
+    CHECK(spec.find("list-models")->kind == sonder::cli::OptionKind::flag);
+    REQUIRE(spec.find("llamaserver-url") != nullptr);
+    REQUIRE(spec.find("llamaserver-config") != nullptr);
+    REQUIRE(spec.find("concurrency") != nullptr);
+    REQUIRE(spec.find("no-gpu-snapshot") != nullptr);
+    REQUIRE(spec.find("hardware") != nullptr);
+
+    std::string error;
+    auto parsed = sonder::cli::parse_command_args(
+        spec, {"--backend", "llamaserver", "--llamaserver-url", "http://127.0.0.1:18080", "--list-models"}, error);
+    REQUIRE_MESSAGE(parsed.has_value(), error);
+    CHECK(parsed->get("backend") == std::optional<std::string>("llamaserver"));
+    CHECK(parsed->get("llamaserver-url") == std::optional<std::string>("http://127.0.0.1:18080"));
+    CHECK(parsed->has("list-models"));
+}
+
+TEST_CASE("speculative decoding and cached prompt metrics aggregate weighted rate and render markdown") {
+    // Prompt p1: 1 warmup + 2 measured; Prompt p2: 1 warmup + 2 measured.
+    // Warmup values are intentionally skewed to verify they stay on runs[] and never pollute summaries.
+    std::vector<SpecScriptedReply> replies;
+    {
+        SpecScriptedReply r;
+        r.timings_only = true;
+        r.draft_n = 100;
+        r.draft_n_accepted = 10;
+        r.cache_n = 999;
+        replies.push_back(r);  // p1 warmup
+    }
+    {
+        SpecScriptedReply r;
+        r.timings_only = true;  // raw BackendTimings only (draft_n / draft_n_accepted / cache_n)
+        r.draft_n = 10;
+        r.draft_n_accepted = 7;
+        r.cache_n = 0;  // explicit zero is a real measurement, not absence
+        replies.push_back(r);  // p1 measured #1 (rate 0.7)
+    }
+    {
+        SpecScriptedReply r;
+        r.timings_only = false;
+        r.draft_n = 20;
+        r.draft_n_accepted = 17;
+        r.cache_n = 64;
+        replies.push_back(r);  // p1 measured #2 (rate 0.85; p1 weighted = 24/30 = 0.80)
+    }
+    {
+        SpecScriptedReply r;
+        replies.push_back(r);  // p2 warmup (no draft or cache counters reported)
+    }
+    {
+        SpecScriptedReply r;
+        r.timings_only = false;
+        r.draft_n = 10;
+        r.draft_n_accepted = 6;
+        r.cache_n = 128;
+        replies.push_back(r);  // p2 measured #1 (rate 0.60)
+    }
+    {
+        SpecScriptedReply r;
+        r.timings_only = true;
+        r.draft_n = 30;
+        r.draft_n_accepted = 24;
+        r.cache_n = 192;
+        replies.push_back(r);  // p2 measured #2 (rate 0.80; p2 weighted = 30/40 = 0.75)
+    }
+
+    auto seen_sampling = std::make_shared<std::vector<SamplingConfig>>();
+    EngineOptions eo;
+    eo.sample_devices_on_start = false;
+    eo.telemetry.level = TelemetryLevel::metrics;
+    Engine engine(std::move(eo));
+    REQUIRE(engine.register_backend(std::make_shared<SpecStubBackend>(replies, seen_sampling)).ok());
+
+    ModelLoadOptions lo;
+    lo.model = "bonsai-2-q1";
+    auto model = engine.load_model("llamaserver", lo);
+    REQUIRE_MESSAGE(model.ok(), model.status().to_string());
+
+    auto corpus = bench::parse_corpus(R"({"schema":"sonder.inference.corpus/1","name":"spec","version":"1","prompts":[
+        {"id":"p1","workload":"coding","prompt":"implement add","max_tokens":12},
+        {"id":"p2","workload":"interactive_chat","prompt":"hello","max_tokens":16}]})");
+    REQUIRE_MESSAGE(corpus.ok(), corpus.status().to_string());
+
+    bench::Options opts;
+    opts.warmup_runs = 1;
+    opts.measured_runs = 2;
+    opts.capture_gpu_snapshot = false;
+    opts.sampling = SamplingConfig{};
+    opts.sampling.explicit_only = true;  // mirror `sonder-infer bench --backend llamaserver`
+
+    std::ostringstream progress;
+    const json::Value doc = bench::run(engine, model.value(), corpus.value(), opts, &progress);
+
+    // Per-prompt max_tokens is flagged explicit even when caller sampling uses explicit_only,
+    // and sampling provenance honestly reports explicit_only=true with null unset fields.
+    REQUIRE(seen_sampling->size() == 6u);
+    CHECK((*seen_sampling)[0].max_tokens == 12);
+    CHECK((*seen_sampling)[0].is_explicit(SamplingConfig::kMaxTokens));
+    CHECK((*seen_sampling)[3].max_tokens == 16);
+    CHECK((*seen_sampling)[3].is_explicit(SamplingConfig::kMaxTokens));
+    const auto* sampling_doc = doc.find("sampling");
+    REQUIRE(sampling_doc != nullptr);
+    REQUIRE(sampling_doc->find("explicit_only") != nullptr);
+    CHECK(sampling_doc->find("explicit_only")->as_bool());
+    REQUIRE(sampling_doc->find("temperature") != nullptr);
+    CHECK(sampling_doc->find("temperature")->is_null());
+    REQUIRE(sampling_doc->find("seed") != nullptr);
+    CHECK(sampling_doc->find("seed")->is_null());
+
+    const auto& rows = doc.find("runs")->as_array();
+    REQUIRE(rows.size() == 6u);
+
+    // p1 warmup row preserves its own per-request measurements.
+    CHECK(rows[0].find("warmup")->as_bool());
+    REQUIRE(rows[0].find("draft_tokens") != nullptr);
+    REQUIRE(rows[0].find("draft_accepted_tokens") != nullptr);
+    REQUIRE(rows[0].find("draft_acceptance_rate") != nullptr);
+    REQUIRE(rows[0].find("cached_prompt_tokens") != nullptr);
+    CHECK(rows[0].find("draft_tokens")->as_uint() == 100u);
+    CHECK(rows[0].find("draft_accepted_tokens")->as_uint() == 10u);
+    CHECK(rows[0].find("draft_acceptance_rate")->as_double() == doctest::Approx(0.1));
+    CHECK(rows[0].find("cached_prompt_tokens")->as_uint() == 999u);
+
+    // p1 measured #1 (BackendTimings only, explicit cache_n=0).
+    CHECK_FALSE(rows[1].find("warmup")->as_bool(true));
+    REQUIRE(rows[1].find("draft_tokens") != nullptr);
+    REQUIRE(rows[1].find("draft_accepted_tokens") != nullptr);
+    REQUIRE(rows[1].find("draft_acceptance_rate") != nullptr);
+    REQUIRE(rows[1].find("cached_prompt_tokens") != nullptr);
+    CHECK(rows[1].find("draft_tokens")->as_uint() == 10u);
+    CHECK(rows[1].find("draft_accepted_tokens")->as_uint() == 7u);
+    CHECK(rows[1].find("draft_acceptance_rate")->as_double() == doctest::Approx(0.7));
+    CHECK(rows[1].find("cached_prompt_tokens")->as_uint() == 0u);
+
+    // p1 measured #2.
+    REQUIRE(rows[2].find("draft_tokens") != nullptr);
+    REQUIRE(rows[2].find("draft_accepted_tokens") != nullptr);
+    REQUIRE(rows[2].find("draft_acceptance_rate") != nullptr);
+    REQUIRE(rows[2].find("cached_prompt_tokens") != nullptr);
+    CHECK(rows[2].find("draft_tokens")->as_uint() == 20u);
+    CHECK(rows[2].find("draft_accepted_tokens")->as_uint() == 17u);
+    CHECK(rows[2].find("draft_acceptance_rate")->as_double() == doctest::Approx(0.85));
+    CHECK(rows[2].find("cached_prompt_tokens")->as_uint() == 64u);
+
+    // p2 warmup had no draft or cache counters reported: all four optional fields omitted.
+    CHECK(rows[3].find("draft_tokens") == nullptr);
+    CHECK(rows[3].find("draft_accepted_tokens") == nullptr);
+    CHECK(rows[3].find("draft_acceptance_rate") == nullptr);
+    CHECK(rows[3].find("cached_prompt_tokens") == nullptr);
+
+    // p2 measured #1 and #2.
+    REQUIRE(rows[4].find("draft_tokens") != nullptr);
+    REQUIRE(rows[4].find("draft_accepted_tokens") != nullptr);
+    REQUIRE(rows[4].find("draft_acceptance_rate") != nullptr);
+    REQUIRE(rows[4].find("cached_prompt_tokens") != nullptr);
+    CHECK(rows[4].find("draft_tokens")->as_uint() == 10u);
+    CHECK(rows[4].find("draft_accepted_tokens")->as_uint() == 6u);
+    CHECK(rows[4].find("draft_acceptance_rate")->as_double() == doctest::Approx(0.6));
+    CHECK(rows[4].find("cached_prompt_tokens")->as_uint() == 128u);
+
+    REQUIRE(rows[5].find("draft_tokens") != nullptr);
+    REQUIRE(rows[5].find("draft_accepted_tokens") != nullptr);
+    REQUIRE(rows[5].find("draft_acceptance_rate") != nullptr);
+    REQUIRE(rows[5].find("cached_prompt_tokens") != nullptr);
+    CHECK(rows[5].find("draft_tokens")->as_uint() == 30u);
+    CHECK(rows[5].find("draft_accepted_tokens")->as_uint() == 24u);
+    CHECK(rows[5].find("draft_acceptance_rate")->as_double() == doctest::Approx(0.8));
+    CHECK(rows[5].find("cached_prompt_tokens")->as_uint() == 192u);
+
+    // Per-prompt weighted aggregates (warmups excluded).
+    const auto& pp = doc.find("per_prompt")->as_array();
+    REQUIRE(pp.size() == 2u);
+    REQUIRE(pp[0].find("draft_tokens_total") != nullptr);
+    REQUIRE(pp[0].find("draft_accepted_total") != nullptr);
+    REQUIRE(pp[0].find("draft_acceptance_rate") != nullptr);
+    REQUIRE(pp[0].find("cached_prompt_tokens_total") != nullptr);
+    CHECK(pp[0].find("draft_tokens_total")->as_uint() == 30u);
+    CHECK(pp[0].find("draft_accepted_total")->as_uint() == 24u);
+    CHECK(pp[0].find("draft_acceptance_rate")->as_double() == doctest::Approx(24.0 / 30.0));
+    CHECK(pp[0].find("cached_prompt_tokens_total")->as_uint() == 64u);
+
+    REQUIRE(pp[1].find("draft_tokens_total") != nullptr);
+    REQUIRE(pp[1].find("draft_accepted_total") != nullptr);
+    REQUIRE(pp[1].find("draft_acceptance_rate") != nullptr);
+    REQUIRE(pp[1].find("cached_prompt_tokens_total") != nullptr);
+    CHECK(pp[1].find("draft_tokens_total")->as_uint() == 40u);
+    CHECK(pp[1].find("draft_accepted_total")->as_uint() == 30u);
+    CHECK(pp[1].find("draft_acceptance_rate")->as_double() == doctest::Approx(30.0 / 40.0));
+    CHECK(pp[1].find("cached_prompt_tokens_total")->as_uint() == 320u);
+
+    // Overall summary weighted aggregate: (24 + 30) / (30 + 40) = 54 / 70.
+    const auto* summary = doc.find("summary");
+    REQUIRE(summary != nullptr);
+    REQUIRE(summary->find("draft_tokens_total") != nullptr);
+    REQUIRE(summary->find("draft_accepted_total") != nullptr);
+    REQUIRE(summary->find("draft_acceptance_rate") != nullptr);
+    REQUIRE(summary->find("cached_prompt_tokens_total") != nullptr);
+    CHECK(summary->find("draft_tokens_total")->as_uint() == 70u);
+    CHECK(summary->find("draft_accepted_total")->as_uint() == 54u);
+    CHECK(summary->find("draft_acceptance_rate")->as_double() == doctest::Approx(54.0 / 70.0));
+    CHECK(summary->find("cached_prompt_tokens_total")->as_uint() == 384u);
+
+    // Markdown renders the Speculation acceptance row with accepted / total (XX.X%).
+    const std::string md = bench::render_markdown(doc);
+    CHECK(md.find("| Speculation | 54 / 70 (77.1%) |") != std::string::npos);
+    CHECK(md.find("MOCK BACKEND") == std::string::npos);
+    CHECK(progress.str().find("draft_acc=") != std::string::npos);
+}
+
+TEST_CASE("speculation metrics omitted cleanly when draft tokens are absent or zero") {
+    // Case 1: mock backend reports neither draft nor cached prompt tokens.
+    {
+        sonder_test::Harness h({}, TelemetryLevel::metrics);
+        bench::Corpus corpus;
+        corpus.name = "no-spec";
+        corpus.prompts = {{"p1", "interactive_chat", "hello", 4}};
+        bench::Options opts;
+        opts.warmup_runs = 0;
+        opts.measured_runs = 1;
+        opts.capture_gpu_snapshot = false;
+
+        const json::Value doc = bench::run(*h.engine, h.model, corpus, opts);
+        const auto& row = doc.find("runs")->as_array().front();
+        CHECK(row.find("draft_tokens") == nullptr);
+        CHECK(row.find("draft_accepted_tokens") == nullptr);
+        CHECK(row.find("draft_acceptance_rate") == nullptr);
+        CHECK(row.find("cached_prompt_tokens") == nullptr);
+
+        const auto* summary = doc.find("summary");
+        CHECK(summary->find("draft_tokens_total") == nullptr);
+        CHECK(summary->find("draft_accepted_total") == nullptr);
+        CHECK(summary->find("draft_acceptance_rate") == nullptr);
+        CHECK(summary->find("cached_prompt_tokens_total") == nullptr);
+
+        const auto& pp0 = doc.find("per_prompt")->as_array().front();
+        CHECK(pp0.find("draft_tokens_total") == nullptr);
+        CHECK(pp0.find("draft_accepted_total") == nullptr);
+        CHECK(pp0.find("draft_acceptance_rate") == nullptr);
+        CHECK(pp0.find("cached_prompt_tokens_total") == nullptr);
+
+        CHECK(bench::render_markdown(doc).find("Speculation") == std::string::npos);
+    }
+
+    // Case 2: backend reports draft_n=0, draft_n_accepted=0, cache_n=32.
+    {
+        SpecScriptedReply r;
+        r.timings_only = true;
+        r.draft_n = 0;
+        r.draft_n_accepted = 0;
+        r.cache_n = 32;
+
+        EngineOptions eo;
+        eo.sample_devices_on_start = false;
+        eo.telemetry.level = TelemetryLevel::metrics;
+        Engine engine(std::move(eo));
+        REQUIRE(engine.register_backend(std::make_shared<SpecStubBackend>(std::vector<SpecScriptedReply>{r})).ok());
+
+        ModelLoadOptions lo;
+        lo.model = "bonsai-2-q1";
+        auto model = engine.load_model("llamaserver", lo);
+        REQUIRE(model.ok());
+
+        bench::Corpus corpus;
+        corpus.name = "zero-draft";
+        corpus.prompts = {{"p1", "coding", "hi", 8}};
+        bench::Options opts;
+        opts.warmup_runs = 0;
+        opts.measured_runs = 1;
+        opts.capture_gpu_snapshot = false;
+
+        const json::Value doc = bench::run(engine, model.value(), corpus, opts);
+        const auto& row = doc.find("runs")->as_array().front();
+        REQUIRE(row.find("draft_tokens") != nullptr);
+        CHECK(row.find("draft_tokens")->as_uint() == 0u);
+        REQUIRE(row.find("draft_accepted_tokens") != nullptr);
+        CHECK(row.find("draft_accepted_tokens")->as_uint() == 0u);
+        CHECK(row.find("draft_acceptance_rate") == nullptr);
+        REQUIRE(row.find("cached_prompt_tokens") != nullptr);
+        CHECK(row.find("cached_prompt_tokens")->as_uint() == 32u);
+
+        const auto* summary = doc.find("summary");
+        CHECK(summary->find("draft_tokens_total") == nullptr);
+        CHECK(summary->find("draft_accepted_total") == nullptr);
+        CHECK(summary->find("draft_acceptance_rate") == nullptr);
+        REQUIRE(summary->find("cached_prompt_tokens_total") != nullptr);
+        CHECK(summary->find("cached_prompt_tokens_total")->as_uint() == 32u);
+
+        const auto& pp0 = doc.find("per_prompt")->as_array().front();
+        CHECK(pp0.find("draft_tokens_total") == nullptr);
+        CHECK(pp0.find("draft_accepted_total") == nullptr);
+        CHECK(pp0.find("draft_acceptance_rate") == nullptr);
+        REQUIRE(pp0.find("cached_prompt_tokens_total") != nullptr);
+        CHECK(pp0.find("cached_prompt_tokens_total")->as_uint() == 32u);
+
+        CHECK(bench::render_markdown(doc).find("Speculation") == std::string::npos);
+    }
+}
+
+TEST_CASE("speculative decoding and cached prompt metrics under concurrency 4") {
+    std::vector<SpecScriptedReply> replies;
+    // Sequential warmup runs first before concurrent measured waves.
+    {
+        SpecScriptedReply warmup;
+        warmup.timings_only = true;
+        warmup.draft_n = 100;
+        warmup.draft_n_accepted = 10;
+        warmup.cache_n = 999;
+        replies.push_back(warmup);
+    }
+    // 2 measured runs x 4 concurrent workers = 8 measured requests.
+    for (int i = 0; i < 8; ++i) {
+        SpecScriptedReply r;
+        r.timings_only = (i % 2 == 0);
+        r.draft_n = 12;
+        r.draft_n_accepted = 9;
+        r.cache_n = 40;
+        replies.push_back(r);
+    }
+
+    EngineOptions eo;
+    eo.sample_devices_on_start = false;
+    eo.telemetry.level = TelemetryLevel::metrics;
+    Engine engine(std::move(eo));
+    REQUIRE(engine.register_backend(std::make_shared<SpecStubBackend>(replies)).ok());
+
+    ModelLoadOptions lo;
+    lo.model = "bonsai-2-q1";
+    auto model = engine.load_model("llamaserver", lo);
+    REQUIRE_MESSAGE(model.ok(), model.status().to_string());
+
+    bench::Corpus corpus;
+    corpus.name = "spec-conc4";
+    corpus.prompts = {{"p1", "coding", "write parser", 12}};
+
+    bench::Options opts;
+    opts.warmup_runs = 1;
+    opts.measured_runs = 2;
+    opts.concurrency = 4;
+    opts.capture_gpu_snapshot = false;
+
+    const json::Value doc = bench::run(engine, model.value(), corpus, opts);
+    REQUIRE(doc.find("runs")->as_array().size() == 9u);
+
+    const auto* sampling_doc = doc.find("sampling");
+    REQUIRE(sampling_doc != nullptr);
+    REQUIRE(sampling_doc->find("explicit_only") != nullptr);
+    CHECK_FALSE(sampling_doc->find("explicit_only")->as_bool(true));
+    CHECK(sampling_doc->find("temperature")->is_number());
+    CHECK(sampling_doc->find("seed")->is_integer());
+
+    const auto* summary = doc.find("summary");
+    REQUIRE(summary != nullptr);
+    CHECK(summary->find("measured_requests")->as_int() == 8);
+    REQUIRE(summary->find("draft_tokens_total") != nullptr);
+    REQUIRE(summary->find("draft_accepted_total") != nullptr);
+    REQUIRE(summary->find("draft_acceptance_rate") != nullptr);
+    REQUIRE(summary->find("cached_prompt_tokens_total") != nullptr);
+    CHECK(summary->find("draft_tokens_total")->as_uint() == 96u);
+    CHECK(summary->find("draft_accepted_total")->as_uint() == 72u);
+    CHECK(summary->find("draft_acceptance_rate")->as_double() == doctest::Approx(0.75));
+    CHECK(summary->find("cached_prompt_tokens_total")->as_uint() == 320u);
+
+    const auto& pp0 = doc.find("per_prompt")->as_array().front();
+    CHECK(pp0.find("draft_tokens_total")->as_uint() == 96u);
+    CHECK(pp0.find("draft_accepted_total")->as_uint() == 72u);
+    CHECK(pp0.find("draft_acceptance_rate")->as_double() == doctest::Approx(0.75));
+    CHECK(pp0.find("cached_prompt_tokens_total")->as_uint() == 320u);
+
+    const std::string md = bench::render_markdown(doc);
+    CHECK(md.find("| Speculation | 72 / 96 (75.0%) |") != std::string::npos);
+}
+
+TEST_CASE("speculation clamping denominator parity saturation and failed or cancelled exclusion") {
+    // 1. Clamp draft_accepted_tokens <= draft_tokens (including draft_tokens == 0).
+    {
+        std::vector<SpecScriptedReply> replies;
+        {
+            SpecScriptedReply r;
+            r.timings_only = true;
+            r.draft_n = 10;
+            r.draft_n_accepted = 25;  // exceeds draft_n; must clamp to 10
+            replies.push_back(r);
+        }
+        {
+            SpecScriptedReply r;
+            r.timings_only = true;
+            r.draft_n = 0;
+            r.draft_n_accepted = 5;  // draft_n == 0; must clamp accepted to 0 and omit rate
+            replies.push_back(r);
+        }
+
+        EngineOptions eo;
+        eo.sample_devices_on_start = false;
+        eo.telemetry.level = TelemetryLevel::metrics;
+        Engine engine(std::move(eo));
+        REQUIRE(engine.register_backend(std::make_shared<SpecStubBackend>(replies)).ok());
+
+        ModelLoadOptions lo;
+        lo.model = "bonsai-2-q1";
+        auto model = engine.load_model("llamaserver", lo);
+        REQUIRE(model.ok());
+
+        bench::Corpus corpus;
+        corpus.name = "clamp";
+        corpus.prompts = {{"p1", "coding", "hi", 8}};
+        bench::Options opts;
+        opts.warmup_runs = 0;
+        opts.measured_runs = 2;
+        opts.capture_gpu_snapshot = false;
+
+        const json::Value doc = bench::run(engine, model.value(), corpus, opts);
+        const auto& rows = doc.find("runs")->as_array();
+        REQUIRE(rows.size() == 2u);
+        REQUIRE(rows[0].find("draft_tokens") != nullptr);
+        REQUIRE(rows[0].find("draft_accepted_tokens") != nullptr);
+        REQUIRE(rows[0].find("draft_acceptance_rate") != nullptr);
+        CHECK(rows[0].find("draft_tokens")->as_uint() == 10u);
+        CHECK(rows[0].find("draft_accepted_tokens")->as_uint() == 10u);
+        CHECK(rows[0].find("draft_acceptance_rate")->as_double() == doctest::Approx(1.0));
+
+        REQUIRE(rows[1].find("draft_tokens") != nullptr);
+        REQUIRE(rows[1].find("draft_accepted_tokens") != nullptr);
+        CHECK(rows[1].find("draft_tokens")->as_uint() == 0u);
+        CHECK(rows[1].find("draft_accepted_tokens")->as_uint() == 0u);
+        CHECK(rows[1].find("draft_acceptance_rate") == nullptr);
+
+        const auto* summary = doc.find("summary");
+        REQUIRE(summary != nullptr);
+        CHECK(summary->find("draft_tokens_total")->as_uint() == 10u);
+        CHECK(summary->find("draft_accepted_total")->as_uint() == 10u);
+        CHECK(summary->find("draft_acceptance_rate")->as_double() == doctest::Approx(1.0));
+
+        // render_markdown clamps out-of-range summary rate and accepted > total too.
+        auto malformed = json::parse(
+            R"({"backend":{"name":"llamaserver"},"model":{"name":"m"},)"
+            R"("summary":{"measured_requests":1,"draft_tokens_total":40,"draft_accepted_total":99,"draft_acceptance_rate":1.5}})");
+        REQUIRE(malformed.ok());
+        CHECK(bench::render_markdown(malformed.value()).find("| Speculation | 40 / 40 (100.0%) |") !=
+              std::string::npos);
+    }
+
+    // 2. Partial acceptance reporting emits draft_tokens_evaluated_total so Markdown fraction matches rate.
+    {
+        std::vector<SpecScriptedReply> replies;
+        {
+            SpecScriptedReply r;
+            r.timings_only = true;
+            r.draft_n = 20;
+            r.draft_n_accepted = 10;
+            replies.push_back(r);
+        }
+        {
+            SpecScriptedReply r;
+            r.timings_only = true;
+            r.draft_n = 100;  // accepted absent on this request
+            replies.push_back(r);
+        }
+
+        EngineOptions eo;
+        eo.sample_devices_on_start = false;
+        eo.telemetry.level = TelemetryLevel::metrics;
+        Engine engine(std::move(eo));
+        REQUIRE(engine.register_backend(std::make_shared<SpecStubBackend>(replies)).ok());
+
+        ModelLoadOptions lo;
+        lo.model = "bonsai-2-q1";
+        auto model = engine.load_model("llamaserver", lo);
+        REQUIRE(model.ok());
+
+        bench::Corpus corpus;
+        corpus.name = "partial-eval";
+        corpus.prompts = {{"p1", "coding", "hi", 8}};
+        bench::Options opts;
+        opts.warmup_runs = 0;
+        opts.measured_runs = 2;
+        opts.capture_gpu_snapshot = false;
+
+        const json::Value doc = bench::run(engine, model.value(), corpus, opts);
+        const auto* summary = doc.find("summary");
+        REQUIRE(summary != nullptr);
+        REQUIRE(summary->find("draft_tokens_total") != nullptr);
+        REQUIRE(summary->find("draft_tokens_evaluated_total") != nullptr);
+        REQUIRE(summary->find("draft_accepted_total") != nullptr);
+        REQUIRE(summary->find("draft_acceptance_rate") != nullptr);
+        CHECK(summary->find("draft_tokens_total")->as_uint() == 120u);
+        CHECK(summary->find("draft_tokens_evaluated_total")->as_uint() == 20u);
+        CHECK(summary->find("draft_accepted_total")->as_uint() == 10u);
+        CHECK(summary->find("draft_acceptance_rate")->as_double() == doctest::Approx(0.5));
+        CHECK(bench::render_markdown(doc).find("| Speculation | 10 / 20 (50.0%) |") != std::string::npos);
+    }
+
+    // 3. Saturating uint64_t totals near UINT64_MAX preserve accurate long-double acceptance rate
+    //    even when both draft_tokens_total and draft_accepted_total saturate at UINT64_MAX.
+    {
+        constexpr std::uint64_t kMaxU64 = std::numeric_limits<std::uint64_t>::max();
+        const std::uint64_t big_draft = kMaxU64 - 10u;
+        const std::uint64_t big_acc = (kMaxU64 / 2u) + 1000u;
+        SpecScriptedReply r;
+        r.timings_only = true;
+        r.draft_n = big_draft;
+        r.draft_n_accepted = big_acc;
+        r.cache_n = big_draft;
+
+        EngineOptions eo;
+        eo.sample_devices_on_start = false;
+        eo.telemetry.level = TelemetryLevel::metrics;
+        Engine engine(std::move(eo));
+        REQUIRE(engine.register_backend(std::make_shared<SpecStubBackend>(std::vector<SpecScriptedReply>{r, r})).ok());
+
+        ModelLoadOptions lo;
+        lo.model = "bonsai-2-q1";
+        auto model = engine.load_model("llamaserver", lo);
+        REQUIRE(model.ok());
+
+        bench::Corpus corpus;
+        corpus.name = "saturate";
+        corpus.prompts = {{"p1", "coding", "hi", 8}};
+        bench::Options opts;
+        opts.warmup_runs = 0;
+        opts.measured_runs = 2;
+        opts.capture_gpu_snapshot = false;
+
+        const json::Value doc = bench::run(engine, model.value(), corpus, opts);
+        const auto* summary = doc.find("summary");
+        REQUIRE(summary != nullptr);
+        REQUIRE(summary->find("draft_tokens_total") != nullptr);
+        REQUIRE(summary->find("draft_accepted_total") != nullptr);
+        REQUIRE(summary->find("draft_acceptance_rate") != nullptr);
+        REQUIRE(summary->find("cached_prompt_tokens_total") != nullptr);
+        CHECK(summary->find("draft_tokens_total")->as_uint() == kMaxU64);
+        CHECK(summary->find("draft_accepted_total")->as_uint() == kMaxU64);
+        CHECK(summary->find("cached_prompt_tokens_total")->as_uint() == kMaxU64);
+        CHECK(summary->find("draft_acceptance_rate")->as_double() == doctest::Approx(0.5));
+    }
+
+    // 4. Failed and cancelled measured requests are excluded from summary and per_prompt aggregates.
+    {
+        std::vector<SpecScriptedReply> replies;
+        {
+            SpecScriptedReply ok;
+            ok.timings_only = true;
+            ok.draft_n = 10;
+            ok.draft_n_accepted = 8;
+            ok.cache_n = 20;
+            replies.push_back(ok);
+        }
+        {
+            SpecScriptedReply failed;
+            failed.fail_request = true;
+            failed.draft_n = 500;
+            failed.draft_n_accepted = 500;
+            failed.cache_n = 5000;
+            replies.push_back(failed);
+        }
+        {
+            SpecScriptedReply cancelled;
+            cancelled.cancel_request = true;
+            cancelled.draft_n = 600;
+            cancelled.draft_n_accepted = 600;
+            cancelled.cache_n = 6000;
+            replies.push_back(cancelled);
+        }
+
+        EngineOptions eo;
+        eo.sample_devices_on_start = false;
+        eo.telemetry.level = TelemetryLevel::metrics;
+        Engine engine(std::move(eo));
+        REQUIRE(engine.register_backend(std::make_shared<SpecStubBackend>(replies)).ok());
+
+        ModelLoadOptions lo;
+        lo.model = "bonsai-2-q1";
+        auto model = engine.load_model("llamaserver", lo);
+        REQUIRE(model.ok());
+
+        bench::Corpus corpus;
+        corpus.name = "fail-cancel";
+        corpus.prompts = {{"p1", "coding", "hi", 8}};
+        bench::Options opts;
+        opts.warmup_runs = 0;
+        opts.measured_runs = 3;
+        opts.capture_gpu_snapshot = false;
+
+        const json::Value doc = bench::run(engine, model.value(), corpus, opts);
+        const auto* summary = doc.find("summary");
+        REQUIRE(summary != nullptr);
+        CHECK(summary->find("measured_requests")->as_int() == 3);
+        CHECK(summary->find("failures")->as_int() == 1);
+        CHECK(summary->find("cancelled")->as_int() == 1);
+        REQUIRE(summary->find("draft_tokens_total") != nullptr);
+        REQUIRE(summary->find("draft_accepted_total") != nullptr);
+        REQUIRE(summary->find("draft_acceptance_rate") != nullptr);
+        REQUIRE(summary->find("cached_prompt_tokens_total") != nullptr);
+        CHECK(summary->find("draft_tokens_total")->as_uint() == 10u);
+        CHECK(summary->find("draft_accepted_total")->as_uint() == 8u);
+        CHECK(summary->find("draft_acceptance_rate")->as_double() == doctest::Approx(0.8));
+        CHECK(summary->find("cached_prompt_tokens_total")->as_uint() == 20u);
+
+        const auto& pp0 = doc.find("per_prompt")->as_array().front();
+        CHECK(pp0.find("draft_tokens_total")->as_uint() == 10u);
+        CHECK(pp0.find("draft_accepted_total")->as_uint() == 8u);
+        CHECK(pp0.find("draft_acceptance_rate")->as_double() == doctest::Approx(0.8));
+        CHECK(pp0.find("cached_prompt_tokens_total")->as_uint() == 20u);
+    }
 }
 }

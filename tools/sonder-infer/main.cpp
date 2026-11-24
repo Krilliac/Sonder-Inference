@@ -743,7 +743,103 @@ int cmd_chat(const Args& a, const cli::EnvDefaults& env) {
 #if defined(SONDER_HAS_BENCH)
 int cmd_bench(const Args& a, const cli::EnvDefaults& env) {
     const bool quiet = a.has("quiet");
+    const bool list_models = a.has("list-models");
     int rc = cli::kExitOk;
+
+    const auto check_backend_option_conflicts = [&](const std::string& backend_name) -> bool {
+        const auto ls_url = a.get("llamaserver-url");
+        const auto ls_cfg = a.get("llamaserver-config");
+        const auto ls_mode = a.get("llamaserver-mode");
+        const auto ls_exe = a.get("llamaserver-executable");
+        const bool has_ls_args = !a.all("llamaserver-arg").empty();
+        if (backend_name != "llamaserver") {
+            if (ls_url.has_value()) {
+                rc = usage_error("bench", "--llamaserver-url requires --backend llamaserver");
+                return false;
+            }
+            if (ls_cfg.has_value()) {
+                rc = usage_error("bench", "--llamaserver-config requires --backend llamaserver");
+                return false;
+            }
+            if (ls_mode.has_value() || ls_exe.has_value() || has_ls_args) {
+                rc = usage_error("bench", "--llamaserver-* options require --backend llamaserver");
+                return false;
+            }
+        } else {
+            if (ls_url.has_value() && ls_cfg.has_value()) {
+                rc = usage_error("bench", "--llamaserver-url and --llamaserver-config cannot be used together");
+                return false;
+            }
+            if (ls_url.has_value() && ls_url->empty()) {
+                rc = usage_error("bench", "--llamaserver-url must not be empty");
+                return false;
+            }
+            if (ls_cfg.has_value() && ls_cfg->empty()) {
+                rc = usage_error("bench", "--llamaserver-config must not be empty");
+                return false;
+            }
+        }
+        if (backend_name != "ollama") {
+            if (a.get("ollama-url").has_value()) {
+                rc = usage_error("bench", "--ollama-url requires --backend ollama");
+                return false;
+            }
+            if (a.has("ollama-allow-remote")) {
+                rc = usage_error("bench", "--ollama-allow-remote requires --backend ollama");
+                return false;
+            }
+        }
+        return true;
+    };
+
+    const auto make_llamaserver = [&](const BackendChoice& choice) -> std::shared_ptr<si::Backend> {
+        si::bench::LlamaServerBenchOptions lso;
+        lso.url = choice.llamaserver_url;
+        lso.config_path = choice.llamaserver_config;
+        lso.mode = choice.llamaserver_mode;
+        lso.executable = choice.llamaserver_executable;
+        lso.args = choice.llamaserver_args;
+        auto made = si::bench::make_llamaserver_bench_backend(lso);
+        if (!made.ok()) {
+            rc = usage_error("bench", made.status().to_string());
+            return nullptr;
+        }
+        return std::move(made.value());
+    };
+
+    const std::string effective_backend = a.get("backend").value_or(env.backend.value_or(""));
+
+    if (list_models) {
+        if (!effective_backend.empty()) {
+            if (!check_backend_name("bench", effective_backend, rc)) return rc;
+            if (!check_backend_option_conflicts(effective_backend)) return rc;
+        }
+        BackendChoice choice;
+        if (!resolve_backend("bench", a, env, true, false, choice, rc)) return rc;
+        std::shared_ptr<si::Backend> backend;
+        std::unique_ptr<si::Engine> engine;
+        if (choice.backend == "llamaserver") {
+            backend = make_llamaserver(choice);
+            if (!backend) return rc;
+        } else {
+            if (!build_engine("bench", a, false, choice, engine, rc)) return rc;
+            backend = engine->find_backend(choice.backend);
+            if (!backend) {
+                err() << "error: bench: backend '" << choice.backend << "' is unavailable\n";
+                return cli::kExitFailure;
+            }
+        }
+        auto models = backend->list_models();
+        if (!models.ok()) {
+            report_error("bench", models.status(), choice.backend);
+            return cli::exit_code_for(models.status());
+        }
+        for (const auto& m : models.value()) {
+            std::cout << m.name << "\t" << m.parameter_size << "\t" << m.quantization << "\t" << m.size_bytes << "\n";
+        }
+        return cli::kExitOk;
+    }
+
     const auto corpus_path = a.get("corpus");
     const auto out_path = a.get("out");
     if (!corpus_path || !out_path) return usage_error("bench", "--corpus and --out are required");
@@ -755,26 +851,67 @@ int cmd_bench(const Args& a, const cli::EnvDefaults& env) {
     if (auto v = a.get("runs"); v && !cli::parse_integer<int>("runs", *v, 1, 1000, opts.measured_runs, error)) {
         return usage_error("bench", error);
     }
+    if (auto v = a.get("concurrency");
+        v && !cli::parse_integer<int>("concurrency", *v, si::bench::kMinConcurrency, si::bench::kMaxConcurrency,
+                                      opts.concurrency, error)) {
+        return usage_error("bench", error);
+    }
+    opts.capture_gpu_snapshot = !a.has("no-gpu-snapshot");
+    opts.hardware = a.get("hardware").value_or("");
     opts.label = a.get("label").value_or("");
-    std::optional<si::bench::Corpus> corpus;
-    const auto read_corpus = [&](int& code) {
-        auto loaded = si::bench::load_corpus(*corpus_path);
-        if (!loaded.ok()) {
-            code = usage_error("bench", loaded.status().to_string());
-            return false;
-        }
-        corpus = std::move(loaded.value());
-        return true;
-    };
+    if (!effective_backend.empty()) {
+        if (!check_backend_name("bench", effective_backend, rc)) return rc;
+        if (!check_backend_option_conflicts(effective_backend)) return rc;
+    }
     RequestSetup setup;
-    if (!prepare_request("bench", a, env, quiet, setup, read_corpus, rc)) return rc;
+    if (!resolve_backend("bench", a, env, true, true, setup.choice, rc)) return rc;
+    if (!sampling_from_args(a, setup.sampling, error, false) || !session_meta_from_args(a, setup.meta, error)) {
+        return usage_error("bench", error);
+    }
+    auto corpus = si::bench::load_corpus(*corpus_path);
+    if (!corpus.ok()) return usage_error("bench", corpus.status().to_string());
+    if (setup.choice.backend == "llamaserver") {
+        si::EngineOptions eo;
+        eo.telemetry.capture_text = a.has("capture-text");
+        const std::string level_text = a.get("telemetry-level").value_or("standard");
+        auto level = si::parse_telemetry_level(level_text);
+        if (!level) {
+            return usage_error("bench", "invalid value '" + level_text +
+                                            "' for --telemetry-level (expected off, metrics, standard or deep)");
+        }
+        eo.telemetry.level = *level;
+        if (auto path = a.get("telemetry")) {
+            if (*path == "-") {
+                eo.telemetry_sinks.push_back(std::make_shared<StderrTelemetrySink>());
+            } else {
+                si::Status st;
+                auto sink = si::make_jsonl_file_sink(*path, false, &st);
+                if (!sink) {
+                    err() << "error: bench: cannot open --telemetry " << *path << ": " << st.to_string() << "\n";
+                    return cli::kExitFailure;
+                }
+                eo.telemetry_sinks.push_back(std::shared_ptr<si::TelemetrySink>(std::move(sink)));
+            }
+        }
+        auto backend = make_llamaserver(setup.choice);
+        if (!backend) return rc;
+        setup.engine = std::make_unique<si::Engine>(std::move(eo));
+        (void)setup.engine->register_backend(std::move(backend));
+    } else {
+        if (!build_engine("bench", a, true, setup.choice, setup.engine, rc)) return rc;
+        if (!quiet && is_mock_backend(setup.choice.backend)) {
+            err() << "[sonder-infer] MOCK BACKEND - synthetic output, not a quality or performance signal\n";
+        }
+    }
+    setup.model = load_model("bench", *setup.engine, setup.choice, rc);
+    if (!setup.model) return rc;
     opts.sampling = setup.sampling;
     opts.run_id = setup.meta.run_id;
     opts.agent_id = setup.meta.agent_id;
     opts.task_id = setup.meta.task_id;
     opts.workload = setup.meta.workload;
     opts.priority = setup.meta.priority;
-    auto doc = si::bench::run(*setup.engine, setup.model, *corpus, opts, quiet ? nullptr : &err());
+    auto doc = si::bench::run(*setup.engine, setup.model, corpus.value(), opts, quiet ? nullptr : &err());
     std::ofstream out(*out_path, std::ios::binary | std::ios::trunc);
     if (!out) {
         err() << "error: bench: cannot write " << *out_path << "\n";

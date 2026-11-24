@@ -2,18 +2,29 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <exception>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <thread>
+#include <utility>
 
 #include "cli/cli_spec.hpp"
 #include "cli/cli_values.hpp"
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+#include "backends/llamaserver/llamaserver_options.hpp"
+#include "net/http_client.hpp"
+#include "sonder/inference/backends/llamaserver.hpp"
+#if defined(SONDER_HAS_SERVER)
+#include "sonder/inference/backend_setup.hpp"
+#endif
+#endif
 
 namespace sonder::inference::bench {
 
@@ -228,6 +239,11 @@ json::Object distribution(const std::vector<double>& v) {
                         {"max", v.empty() ? 0.0 : *std::max_element(v.begin(), v.end())}};
 }
 
+std::uint64_t saturating_add(std::uint64_t a, std::uint64_t b) noexcept {
+    constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
+    return b > kMax - a ? kMax : a + b;
+}
+
 struct Metrics {
     std::vector<double> ttft, total, decode_tps, client_decode_tps, prompt_tps, completion_tokens;
     std::vector<double> makespan, aggregate_tps;  // fan-out batches
@@ -236,6 +252,14 @@ struct Metrics {
     std::uint64_t cancelled = 0;
     std::uint64_t total_completion_tokens = 0;
     double measured_wall_ms = 0.0;
+    std::uint64_t draft_tokens_total = 0;
+    std::uint64_t draft_tokens_with_accepted = 0;
+    std::uint64_t draft_accepted_total = 0;
+    long double draft_tokens_with_accepted_ld = 0.0L;
+    long double draft_accepted_ld = 0.0L;
+    bool has_draft_accepted = false;
+    bool has_cached_prompt_tokens = false;
+    std::uint64_t cached_prompt_tokens_total = 0;
 };
 
 struct Outcome {
@@ -245,7 +269,63 @@ struct Outcome {
     double ttft = -1, total = 0, dtps = 0, client_dtps = 0, ptps = 0;
     std::uint64_t completion_tokens = 0;
     double load_ms = 0;
+    bool has_draft_tokens = false;
+    std::uint64_t draft_tokens = 0;
+    bool has_draft_accepted_tokens = false;
+    std::uint64_t draft_accepted_tokens = 0;
+    bool has_cached_prompt_tokens = false;
+    std::uint64_t cached_prompt_tokens = 0;
 };
+
+std::optional<std::uint64_t> extract_draft_tokens(const GenerateStats& s) noexcept {
+    if (s.draft_tokens.has_value()) {
+        return *s.draft_tokens;
+    }
+    if (s.backend_timings.has_value() && s.backend_timings->draft_n.has_value()) {
+        return *s.backend_timings->draft_n;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::uint64_t> extract_draft_accepted_tokens(const GenerateStats& s) noexcept {
+    if (s.draft_accepted_tokens.has_value()) {
+        return *s.draft_accepted_tokens;
+    }
+    if (s.backend_timings.has_value() && s.backend_timings->draft_n_accepted.has_value()) {
+        return *s.backend_timings->draft_n_accepted;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::uint64_t> extract_cached_prompt_tokens(const GenerateStats& s) noexcept {
+    if (s.cached_tokens.has_value()) {
+        return *s.cached_tokens;
+    }
+    if (s.backend_timings.has_value() && s.backend_timings->cache_n.has_value()) {
+        return *s.backend_timings->cache_n;
+    }
+    return std::nullopt;
+}
+
+void append_speculation_and_cache_metrics(json::Object& target, const Metrics& m) {
+    if (m.draft_tokens_total > 0) {
+        target.set("draft_tokens_total", m.draft_tokens_total);
+        if (m.has_draft_accepted && m.draft_tokens_with_accepted > 0 && m.draft_tokens_with_accepted_ld > 0.0L) {
+            if (m.draft_tokens_with_accepted != m.draft_tokens_total) {
+                target.set("draft_tokens_evaluated_total", m.draft_tokens_with_accepted);
+            }
+            target.set("draft_accepted_total", m.draft_accepted_total);
+            const double rate =
+                std::clamp(static_cast<double>(m.draft_accepted_ld / m.draft_tokens_with_accepted_ld), 0.0, 1.0);
+            if (std::isfinite(rate)) {
+                target.set("draft_acceptance_rate", rate);
+            }
+        }
+    }
+    if (m.has_cached_prompt_tokens) {
+        target.set("cached_prompt_tokens_total", m.cached_prompt_tokens_total);
+    }
+}
 
 constexpr std::uint64_t kBytesPerMiB = 1024ull * 1024ull;
 
@@ -361,6 +441,7 @@ json::Object execute(Engine& engine, const std::shared_ptr<Model>& model, const 
                      const Options& options, Outcome& o) {
     SamplingConfig sampling = options.sampling;
     sampling.max_tokens = prompt.max_tokens;
+    sampling.explicit_fields |= SamplingConfig::kMaxTokens;
     SessionOptions so;
     so.sampling = sampling;
     if (options.run_id) {
@@ -426,6 +507,36 @@ json::Object execute(Engine& engine, const std::shared_ptr<Model>& model, const 
     row.set("prompt_tokens_per_sec", ptps);
     row.set("backend_load_ms", static_cast<double>(s.load_ns) / 1e6);
 
+    const std::optional<std::uint64_t> draft_tokens = extract_draft_tokens(s);
+    const std::optional<std::uint64_t> draft_accepted_raw = extract_draft_accepted_tokens(s);
+    const std::optional<std::uint64_t> cached_prompt_tokens = extract_cached_prompt_tokens(s);
+    if (draft_tokens.has_value()) {
+        row.set("draft_tokens", *draft_tokens);
+        o.has_draft_tokens = true;
+        o.draft_tokens = *draft_tokens;
+    }
+    if (draft_accepted_raw.has_value()) {
+        std::uint64_t accepted = *draft_accepted_raw;
+        if (draft_tokens.has_value()) {
+            accepted = std::min(accepted, *draft_tokens);
+        }
+        row.set("draft_accepted_tokens", accepted);
+        o.has_draft_accepted_tokens = true;
+        o.draft_accepted_tokens = accepted;
+        if (draft_tokens.has_value() && *draft_tokens > 0) {
+            const double rate =
+                std::clamp(static_cast<double>(accepted) / static_cast<double>(*draft_tokens), 0.0, 1.0);
+            if (std::isfinite(rate)) {
+                row.set("draft_acceptance_rate", rate);
+            }
+        }
+    }
+    if (cached_prompt_tokens.has_value()) {
+        row.set("cached_prompt_tokens", *cached_prompt_tokens);
+        o.has_cached_prompt_tokens = true;
+        o.cached_prompt_tokens = *cached_prompt_tokens;
+    }
+
     o.completed = r.outcome == RequestOutcome::completed;
     o.cancelled = r.outcome == RequestOutcome::cancelled;
     o.ttft = r.ttft_ms;
@@ -457,6 +568,21 @@ void record(Metrics& m, const Outcome& o) {
     if (o.client_dtps > 0) m.client_decode_tps.push_back(o.client_dtps);
     if (o.ptps > 0) m.prompt_tps.push_back(o.ptps);
     m.completion_tokens.push_back(static_cast<double>(o.completion_tokens));
+    if (o.has_draft_tokens && o.draft_tokens > 0) {
+        m.draft_tokens_total = saturating_add(m.draft_tokens_total, o.draft_tokens);
+        if (o.has_draft_accepted_tokens) {
+            const std::uint64_t accepted = std::min(o.draft_accepted_tokens, o.draft_tokens);
+            m.draft_tokens_with_accepted = saturating_add(m.draft_tokens_with_accepted, o.draft_tokens);
+            m.draft_accepted_total = saturating_add(m.draft_accepted_total, accepted);
+            m.draft_tokens_with_accepted_ld += static_cast<long double>(o.draft_tokens);
+            m.draft_accepted_ld += static_cast<long double>(accepted);
+            m.has_draft_accepted = true;
+        }
+    }
+    if (o.has_cached_prompt_tokens) {
+        m.has_cached_prompt_tokens = true;
+        m.cached_prompt_tokens_total = saturating_add(m.cached_prompt_tokens_total, o.cached_prompt_tokens);
+    }
 }
 
 const sonder::cli::CommandSpec& bench_cli_spec() {
@@ -464,11 +590,16 @@ const sonder::cli::CommandSpec& bench_cli_spec() {
     static const cli::CommandSpec spec{
         "",
         "standalone benchmark runner (docs/BENCHMARK_PLAN.md)",
-        {"--model NAME [options]", "--backend ollama --list-models"},
+        {"--model NAME [options]", "--backend ollama --list-models",
+         "--backend llamaserver --llamaserver-url URL --list-models"},
         {{"Backend",
-          {{"backend", cli::OptionKind::value, "NAME", "ollama | mock (default: ollama)"},
+          {{"backend", cli::OptionKind::value, "NAME", "ollama | llamaserver | mock (default: ollama)"},
            {"ollama-url", cli::OptionKind::value, "URL",
             "Ollama base URL (default: http://127.0.0.1:11434, loopback only)"},
+           {"llamaserver-url", cli::OptionKind::value, "URL",
+            "llama-server base URL (default: http://127.0.0.1:8080, loopback only)"},
+           {"llamaserver-config", cli::OptionKind::value, "PATH",
+            "llama-server JSON config (attach or spawn, loopback only)"},
            {"model", cli::OptionKind::value, "NAME", "model to benchmark (required unless --list-models)"},
            {"require-idle", cli::OptionKind::flag, "",
             "ollama: refuse to run if a different model is resident\n(avoids competing with live traffic for the GPU)"},
@@ -499,6 +630,8 @@ const sonder::cli::CommandSpec& bench_cli_spec() {
          "3 backend unreachable or model load failed, 4 --require-idle refused to run."},
         {"--backend ollama --list-models",
          "--backend ollama --model qwen3:0.6b --warmup 1 --runs 3 --require-idle --hardware \"RTX 4090\"",
+         "--backend llamaserver --llamaserver-url http://127.0.0.1:8080 --list-models",
+         "--backend llamaserver --llamaserver-url http://127.0.0.1:8080 --model bonsai-2 --warmup 1 --runs 3",
          "--backend mock --model mock:tiny --warmup 0 --runs 1 --concurrency 4"}};
     return spec;
 }
@@ -554,6 +687,217 @@ json::Array gpu_snapshot_to_json(const std::vector<GpuDeviceInfo>& gpus, const s
     return out;
 }
 
+Result<std::shared_ptr<Backend>> make_llamaserver_bench_backend(const LlamaServerBenchOptions& opts) {
+#if !defined(SONDER_HAS_LLAMASERVER_BACKEND)
+    (void)opts;
+    return Status(ErrorCode::unsupported,
+                  "this build does not include the llamaserver backend (src/backends/llamaserver)");
+#else
+    if (!opts.url.empty() && !opts.config_path.empty()) {
+        return Status(ErrorCode::invalid_argument,
+                      "llamaserver: --llamaserver-url and --llamaserver-config cannot be used together");
+    }
+
+    const auto validate_loopback_url = [](const std::string& url) -> Status {
+        auto parsed = net::parse_url(url);
+        if (!parsed.ok()) {
+            return parsed.status();
+        }
+        if (!net::is_loopback_host(parsed->host)) {
+            return Status(ErrorCode::invalid_argument,
+                          "llamaserver: non-loopback upstream is not allowed in benchmark mode (loopback only)");
+        }
+        return Status::success();
+    };
+
+    if (!opts.url.empty()) {
+        if (auto st = validate_loopback_url(opts.url); !st.ok()) {
+            return st;
+        }
+    }
+
+#if defined(SONDER_HAS_SERVER)
+    BackendSetup setup;
+    setup.backend = kLlamaServerBackendName;
+    if (!opts.config_path.empty()) {
+        if (auto st = load_llamaserver_config(opts.config_path, setup); !st.ok()) {
+            return st;
+        }
+    }
+    if (!opts.url.empty()) {
+        setup.llamaserver_url = opts.url;
+    }
+    if (!opts.mode.empty()) {
+        setup.llamaserver_mode = opts.mode;
+    }
+    if (!opts.executable.empty()) {
+        setup.llamaserver_executable = opts.executable;
+    }
+    if (!opts.args.empty()) {
+        setup.llamaserver_args = opts.args;
+    }
+    if (setup.llamaserver_allow_remote) {
+        return Status(ErrorCode::invalid_argument,
+                      "llamaserver: allow_remote=true is not allowed in benchmark mode (loopback only)");
+    }
+    setup.llamaserver_allow_remote = false;
+    if (!setup.llamaserver_url.empty()) {
+        if (auto st = validate_loopback_url(setup.llamaserver_url); !st.ok()) {
+            return st;
+        }
+    }
+
+    // Eagerly mirror BackendSetup into LlamaServerBackendOptions and run
+    // validate_backend_options() so invalid attach/spawn configs fail fast
+    // with invalid_argument (exit 2) instead of deferring to probe() (exit 3).
+    LlamaServerBackendOptions check_lo;
+    check_lo.allow_remote = false;
+    if (!setup.llamaserver_mode.empty()) {
+        if (setup.llamaserver_mode == "attach") {
+            check_lo.mode = LlamaServerMode::attach;
+        } else if (setup.llamaserver_mode == "spawn") {
+            check_lo.mode = LlamaServerMode::spawn;
+        } else {
+            return Status(ErrorCode::invalid_argument, "llamaserver: mode must be attach or spawn");
+        }
+    }
+    if (!setup.llamaserver_url.empty()) {
+        check_lo.base_url = setup.llamaserver_url;
+    }
+    check_lo.executable = setup.llamaserver_executable;
+    check_lo.args = setup.llamaserver_args;
+    check_lo.environment = setup.llamaserver_environment;
+    check_lo.native_completion = setup.llamaserver_native_completion;
+    check_lo.grammar = setup.llamaserver_grammar;
+    check_lo.upstream_grammar = setup.llamaserver_upstream_grammar;
+    check_lo.context_length = setup.llamaserver_context_length;
+    check_lo.connect_timeout = std::chrono::milliseconds(setup.llamaserver_connect_timeout_ms);
+    check_lo.request_timeout = std::chrono::milliseconds(setup.llamaserver_request_timeout_ms);
+    check_lo.startup_timeout = std::chrono::milliseconds(setup.llamaserver_startup_timeout_ms);
+    check_lo.poll_interval = std::chrono::milliseconds(setup.llamaserver_poll_interval_ms);
+    check_lo.shutdown_timeout = std::chrono::milliseconds(setup.llamaserver_shutdown_timeout_ms);
+    check_lo.restart_backoff = std::chrono::milliseconds(setup.llamaserver_restart_backoff_ms);
+    check_lo.max_restart_backoff = std::chrono::milliseconds(setup.llamaserver_max_restart_backoff_ms);
+    check_lo.max_restarts = static_cast<std::size_t>(setup.llamaserver_max_restarts);
+    check_lo.tls.handshake_timeout = std::chrono::milliseconds(setup.llamaserver_handshake_timeout_ms);
+    check_lo.diagnostics.log_file = setup.llamaserver_log_file;
+    check_lo.stall_guard.enabled = setup.llamaserver_stall_guard;
+    check_lo.stall_guard.stall_seconds = std::chrono::seconds(setup.llamaserver_stall_seconds);
+    check_lo.stall_guard.policy = setup.llamaserver_stall_policy;
+    check_lo.stall_guard.generic_progress = setup.llamaserver_stall_generic_progress;
+    check_lo.api_key_env = setup.llamaserver_api_key_env;
+    check_lo.idle_timeout = std::chrono::milliseconds(setup.llamaserver_idle_timeout_ms);
+    check_lo.first_content_timeout = std::chrono::milliseconds(setup.llamaserver_first_content_timeout_ms);
+    check_lo.keepalive_gap = std::chrono::milliseconds(setup.llamaserver_keepalive_gap_ms);
+    check_lo.unlimited_request_timeout = setup.llamaserver_unlimited_request_timeout;
+    check_lo.warmup.messages_file = setup.llamaserver_warmup_messages_file;
+    check_lo.spill_guard.enabled = setup.llamaserver_spill_guard;
+    if (setup.llamaserver_spill_policy == "warn") {
+        check_lo.spill_guard.policy = LlamaServerSpillPolicy::warn;
+    } else if (setup.llamaserver_spill_policy == "refuse") {
+        check_lo.spill_guard.policy = LlamaServerSpillPolicy::refuse;
+    } else if (setup.llamaserver_spill_policy == "auto_fit") {
+        check_lo.spill_guard.policy = LlamaServerSpillPolicy::auto_fit;
+    } else {
+        return Status(ErrorCode::invalid_argument, "llamaserver: spill policy must be warn, refuse or auto_fit");
+    }
+    if (setup.llamaserver_spill_threshold_mib > 1048576 || setup.llamaserver_spill_baseline_mib > 1048576) {
+        return Status(ErrorCode::invalid_argument, "llamaserver: spill threshold/baseline must be at most 1048576 MiB");
+    }
+    check_lo.spill_guard.threshold_bytes = setup.llamaserver_spill_threshold_mib * kBytesPerMiB;
+    check_lo.spill_guard.baseline_bytes = setup.llamaserver_spill_baseline_mib * kBytesPerMiB;
+    if (setup.llamaserver_spill_baseline_per_1k_ctx_mib > 1024) {
+        return Status(ErrorCode::invalid_argument,
+                      "llamaserver: spill baseline growth must be at most 1024 MiB per 1k ctx");
+    }
+    check_lo.spill_guard.baseline_bytes_per_1k_ctx = setup.llamaserver_spill_baseline_per_1k_ctx_mib * kBytesPerMiB;
+    check_lo.spill_guard.sample_interval = std::chrono::milliseconds(setup.llamaserver_spill_sample_interval_ms);
+    check_lo.spill_guard.fit_step_factor = setup.llamaserver_fit_step_factor;
+    check_lo.spill_guard.fit_step_align = setup.llamaserver_fit_step_align;
+    check_lo.spill_guard.fit_min_ctx = setup.llamaserver_fit_min_ctx;
+    check_lo.spill_guard.fit_max_attempts = static_cast<std::size_t>(setup.llamaserver_fit_max_attempts);
+    check_lo.spill_guard.uma_mode_policy = setup.llamaserver_spill_uma_mode;
+    {
+        const auto& rc_cfg = setup.llamaserver_residency;
+        check_lo.spill_guard.residency.enabled = rc_cfg.enabled;
+        check_lo.spill_guard.residency.expect_gpu = rc_cfg.expect_gpu;
+        check_lo.spill_guard.residency.min_dedicated_bytes = rc_cfg.min_dedicated_mib * kBytesPerMiB;
+        check_lo.spill_guard.residency.consecutive_samples = static_cast<std::size_t>(rc_cfg.consecutive_samples);
+        check_lo.spill_guard.residency.eviction_fraction = rc_cfg.eviction_fraction;
+        check_lo.spill_guard.residency.eviction_bytes = rc_cfg.eviction_mib * kBytesPerMiB;
+        if (rc_cfg.on_eviction == "warn") {
+            check_lo.spill_guard.residency.on_eviction = LlamaServerEvictionPolicy::warn;
+        } else if (rc_cfg.on_eviction == "restart") {
+            check_lo.spill_guard.residency.on_eviction = LlamaServerEvictionPolicy::restart;
+        } else {
+            return Status(ErrorCode::invalid_argument, "llamaserver: residency.on_eviction must be warn or restart");
+        }
+        check_lo.spill_guard.residency.max_eviction_restarts = static_cast<std::size_t>(rc_cfg.max_eviction_restarts);
+    }
+    {
+        const auto& hm = setup.llamaserver_host_memory;
+        check_lo.host_memory.estimated_resident_bytes = hm.estimated_resident_bytes;
+        check_lo.host_memory.estimated_private_bytes = hm.estimated_private_bytes;
+        check_lo.host_memory.estimate_lower_bound = hm.estimate_lower_bound;
+        check_lo.host_memory.reserve_bytes = hm.reserve_mib * kBytesPerMiB;
+        check_lo.host_memory.override_refusal = hm.override_refusal;
+        check_lo.host_memory.floor.enabled = hm.floor_enabled;
+        check_lo.host_memory.floor.policy = hm.floor_policy;
+        check_lo.host_memory.floor.floor_bytes = hm.floor_mib * kBytesPerMiB;
+        check_lo.host_memory.floor.resume_bytes = hm.resume_mib * kBytesPerMiB;
+        check_lo.host_memory.floor.consecutive_samples = static_cast<std::size_t>(hm.consecutive_samples);
+        check_lo.host_memory.floor.sample_interval = std::chrono::milliseconds(hm.sample_interval_ms);
+        check_lo.host_memory.floor.restart_cooldown = std::chrono::milliseconds(hm.restart_cooldown_ms);
+        check_lo.host_memory.floor.max_restarts = static_cast<std::size_t>(hm.max_restarts);
+    }
+    {
+        const auto& sp = setup.llamaserver_adaptive_speculation;
+        check_lo.adaptive_speculation.enabled = sp.enabled;
+        check_lo.adaptive_speculation.min_draft_n = sp.min_draft_n;
+        check_lo.adaptive_speculation.initial_draft_n = sp.initial_draft_n;
+        check_lo.adaptive_speculation.max_draft_n = sp.max_draft_n;
+        check_lo.adaptive_speculation.window_size = sp.window_size;
+        check_lo.adaptive_speculation.min_samples = sp.min_samples;
+        check_lo.adaptive_speculation.pause_acceptance_threshold = sp.pause_acceptance_threshold;
+        check_lo.adaptive_speculation.step_down_acceptance_threshold = sp.step_down_acceptance_threshold;
+        check_lo.adaptive_speculation.step_up_acceptance_threshold = sp.step_up_acceptance_threshold;
+        check_lo.adaptive_speculation.cooldown_requests = sp.cooldown_requests;
+        check_lo.adaptive_speculation.probe_draft_n = sp.probe_draft_n;
+        check_lo.adaptive_speculation.min_draft_tokens_per_sample = sp.min_draft_tokens_per_sample;
+    }
+    if (auto st = llamaserver::validate_backend_options(check_lo); !st.ok()) {
+        return st;
+    }
+    return make_backend(setup);
+#else
+    if (!opts.config_path.empty()) {
+        return Status(ErrorCode::unsupported,
+                      "llamaserver: --llamaserver-config requires a build with the server module (SONDER_HAS_SERVER)");
+    }
+    LlamaServerBackendOptions lo;
+    lo.allow_remote = false;
+    if (!opts.mode.empty()) {
+        if (opts.mode == "attach") {
+            lo.mode = LlamaServerMode::attach;
+        } else if (opts.mode == "spawn") {
+            lo.mode = LlamaServerMode::spawn;
+        } else {
+            return Status(ErrorCode::invalid_argument, "llamaserver: mode must be attach or spawn");
+        }
+    }
+    if (!opts.url.empty()) {
+        lo.base_url = opts.url;
+    }
+    lo.executable = opts.executable;
+    lo.args = opts.args;
+    if (auto st = llamaserver::validate_backend_options(lo); !st.ok()) {
+        return st;
+    }
+    return std::shared_ptr<Backend>(make_llamaserver_backend(std::move(lo)));
+#endif
+#endif
+}
+
 std::string render_bench_cli_help() { return sonder::cli::render_help("sonder-bench", bench_cli_spec()); }
 
 bool parse_bench_cli_args(const std::vector<std::string>& args, BenchCliArgs& out, std::string& error) {
@@ -576,7 +920,52 @@ bool parse_bench_cli_args(const std::vector<std::string>& args, BenchCliArgs& ou
     }
 
     out.backend = a.get("backend").value_or("ollama");
-    out.ollama_url = a.get("ollama-url").value_or("");
+    if (out.backend != "ollama" && out.backend != "llamaserver" && out.backend != "mock") {
+        error = "unsupported backend '" + out.backend + "' (expected ollama, llamaserver or mock)";
+        return false;
+    }
+
+    const auto ollama_url = a.get("ollama-url");
+    const auto llamaserver_url = a.get("llamaserver-url");
+    const auto llamaserver_config = a.get("llamaserver-config");
+    if (llamaserver_url.has_value() && llamaserver_config.has_value()) {
+        error = "--llamaserver-url and --llamaserver-config cannot be used together";
+        return false;
+    }
+    if (llamaserver_url.has_value()) {
+        if (out.backend != "llamaserver") {
+            error = "--llamaserver-url requires --backend llamaserver";
+            return false;
+        }
+        if (llamaserver_url->empty()) {
+            error = "--llamaserver-url must not be empty";
+            return false;
+        }
+        out.llamaserver_url = *llamaserver_url;
+    }
+    if (llamaserver_config.has_value()) {
+        if (out.backend != "llamaserver") {
+            error = "--llamaserver-config requires --backend llamaserver";
+            return false;
+        }
+        if (llamaserver_config->empty()) {
+            error = "--llamaserver-config must not be empty";
+            return false;
+        }
+        out.llamaserver_config = *llamaserver_config;
+    }
+    if (ollama_url.has_value()) {
+        if (out.backend != "ollama") {
+            error = "--ollama-url requires --backend ollama";
+            return false;
+        }
+        if (ollama_url->empty()) {
+            error = "--ollama-url must not be empty";
+            return false;
+        }
+        out.ollama_url = *ollama_url;
+    }
+
     out.model = a.get("model").value_or("");
     out.corpus_path = a.get("corpus").value_or("bench/corpus/baseline.json");
     out.out_dir = a.get("out-dir").value_or("bench/results");
@@ -585,6 +974,10 @@ bool parse_bench_cli_args(const std::vector<std::string>& args, BenchCliArgs& ou
     out.list_models = a.has("list-models");
     out.dry_run = a.has("dry-run");
     out.require_idle = a.has("require-idle");
+    if (out.require_idle && out.backend != "ollama") {
+        error = "--require-idle is only supported with --backend ollama";
+        return false;
+    }
     out.options.capture_gpu_snapshot = !a.has("no-gpu-snapshot");
 
     if (auto v = a.get("prompts")) {
@@ -786,6 +1179,9 @@ json::Object run(Engine& engine, const std::shared_ptr<Model>& model, const Corp
                     if (const json::Value* tv = rows[c].find("decode_tokens_per_sec")) {
                         *progress << " decode_tps=" << tv->as_double();
                     }
+                    if (const json::Value* dv = rows[c].find("draft_acceptance_rate")) {
+                        *progress << " draft_acc=" << dv->as_double();
+                    }
                     if (const json::Value* ev = rows[c].find("error")) *progress << " error=" << ev->as_string();
                     *progress << "\n";
                 }
@@ -846,6 +1242,7 @@ json::Object run(Engine& engine, const std::shared_ptr<Model>& model, const Corp
             ps.set("fanout_makespan_ms", distribution(pm.makespan));
             ps.set("fanout_aggregate_tokens_per_sec", distribution(pm.aggregate_tps));
         }
+        append_speculation_and_cache_metrics(ps, pm);
         per_prompt.emplace_back(std::move(ps));
         if (truncated) {
             break;
@@ -881,19 +1278,28 @@ json::Object run(Engine& engine, const std::shared_ptr<Model>& model, const Corp
                                   {"quantization", d.quantization},
                                   {"size_bytes", d.size_bytes},
                                   {"context_length", d.context_length}});
-    doc.set("sampling", json::Object{{"temperature", s.temperature},
-                                     {"top_p", s.top_p},
-                                     {"top_k", s.top_k},
-                                     {"min_p", s.min_p},
-                                     {"repeat_penalty", s.repeat_penalty},
-                                     {"typical_p", s.typical_p},
-                                     {"repeat_last_n", s.repeat_last_n},
-                                     {"presence_penalty", s.presence_penalty},
-                                     {"frequency_penalty", s.frequency_penalty},
-                                     {"logit_bias_count", static_cast<std::int64_t>(s.logit_bias.size())},
-                                     {"num_ctx", s.num_ctx},
-                                     {"seed", s.seed},
-                                     {"max_tokens", "per-prompt"}});
+    const auto sampling_field = [&](SamplingConfig::Field f, json::Value v) -> json::Value {
+        if (!s.explicit_only || s.is_explicit(f)) {
+            return v;
+        }
+        return json::Value(nullptr);
+    };
+    doc.set("sampling", json::Object{
+                            {"temperature", sampling_field(SamplingConfig::kTemperature, s.temperature)},
+                            {"top_p", sampling_field(SamplingConfig::kTopP, s.top_p)},
+                            {"top_k", sampling_field(SamplingConfig::kTopK, s.top_k)},
+                            {"min_p", sampling_field(SamplingConfig::kMinP, s.min_p)},
+                            {"repeat_penalty", sampling_field(SamplingConfig::kRepeatPenalty, s.repeat_penalty)},
+                            {"typical_p", sampling_field(SamplingConfig::kTypicalP, s.typical_p)},
+                            {"repeat_last_n", sampling_field(SamplingConfig::kRepeatLastN, s.repeat_last_n)},
+                            {"presence_penalty", sampling_field(SamplingConfig::kPresencePenalty, s.presence_penalty)},
+                            {"frequency_penalty",
+                             sampling_field(SamplingConfig::kFrequencyPenalty, s.frequency_penalty)},
+                            {"explicit_only", s.explicit_only},
+                            {"logit_bias_count", static_cast<std::int64_t>(s.logit_bias.size())},
+                            {"num_ctx", sampling_field(SamplingConfig::kNumCtx, s.num_ctx)},
+                            {"seed", sampling_field(SamplingConfig::kSeed, json::Value(s.seed))},
+                            {"max_tokens", "per-prompt"}});
     doc.set("config", json::Object{{"warmup_runs", options.warmup_runs},
                                    {"measured_runs", options.measured_runs},
                                    {"concurrency", concurrency},
@@ -914,18 +1320,20 @@ json::Object run(Engine& engine, const std::shared_ptr<Model>& model, const Corp
     doc.set("cold_first_request_ms", cold_first_ms);
     doc.set("cold_first_request_backend_load_ms", cold_load_ms);
     doc.set("wall_seconds", ms_since(t0) / 1000.0);
-    doc.set("summary", json::Object{{"concurrency", concurrency},
-                                    {"measured_requests", global.requests},
-                                    {"failures", global.failures},
-                                    {"cancelled", global.cancelled},
-                                    {"wall_seconds", measured_wall_seconds},
-                                    {"total_completion_tokens", global.total_completion_tokens},
-                                    {"aggregate_decode_tokens_per_sec", aggregate_decode_tps},
-                                    {"ttft_ms", distribution(global.ttft)},
-                                    {"total_ms", distribution(global.total)},
-                                    {"decode_tokens_per_sec", distribution(global.decode_tps)},
-                                    {"client_decode_tokens_per_sec", distribution(global.client_decode_tps)},
-                                    {"prompt_tokens_per_sec", distribution(global.prompt_tps)}});
+    json::Object summary{{"concurrency", concurrency},
+                         {"measured_requests", global.requests},
+                         {"failures", global.failures},
+                         {"cancelled", global.cancelled},
+                         {"wall_seconds", measured_wall_seconds},
+                         {"total_completion_tokens", global.total_completion_tokens},
+                         {"aggregate_decode_tokens_per_sec", aggregate_decode_tps},
+                         {"ttft_ms", distribution(global.ttft)},
+                         {"total_ms", distribution(global.total)},
+                         {"decode_tokens_per_sec", distribution(global.decode_tps)},
+                         {"client_decode_tokens_per_sec", distribution(global.client_decode_tps)},
+                         {"prompt_tokens_per_sec", distribution(global.prompt_tps)}};
+    append_speculation_and_cache_metrics(summary, global);
+    doc.set("summary", std::move(summary));
     doc.set("per_prompt", std::move(per_prompt));
     doc.set("fanout_batches", std::move(batches));
     doc.set("runs", std::move(runs));

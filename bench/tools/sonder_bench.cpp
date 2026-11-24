@@ -109,16 +109,32 @@ int main(int argc, char** argv) {
         (void)engine.register_backend(si::make_ollama_backend(oo));
     }
 #endif
-    else {
-        return usage_error("unsupported backend '" + backend_name + "' (expected ollama or mock)");
+    else if (backend_name == "llamaserver") {
+        si::bench::LlamaServerBenchOptions lso;
+        lso.url = parsed.llamaserver_url;
+        lso.config_path = parsed.llamaserver_config;
+        auto made = si::bench::make_llamaserver_bench_backend(lso);
+        if (!made.ok()) {
+            return usage_error(made.status().to_string());
+        }
+        (void)engine.register_backend(std::move(made.value()));
+    } else {
+        return usage_error("unsupported backend '" + backend_name + "' (expected ollama, llamaserver or mock)");
     }
 
     auto backend = engine.find_backend(backend_name);
+    if (!backend) {
+        std::cerr << "error: backend '" << backend_name << "' was not registered\n";
+        return kExitBackend;
+    }
     auto version = backend->probe();
     if (!version.ok()) {
         std::cerr << "error: " << backend_name << " probe failed: " << version.status().to_string() << "\n";
         if (backend_name == "ollama") {
             std::cerr << "hint: start Ollama with 'ollama serve', or pass --ollama-url URL\n";
+        } else if (backend_name == "llamaserver") {
+            std::cerr << "hint: start llama-server on loopback, or pass --llamaserver-url URL / --llamaserver-config "
+                         "PATH\n";
         }
         return kExitBackend;
     }
