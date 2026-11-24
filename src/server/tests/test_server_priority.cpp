@@ -584,8 +584,8 @@ TEST_CASE("omitted priority matches explicit interactive and preserves chat resp
     CHECK(omitted_json.find("usage")->find("total_tokens")->as_int() == 2);
     CHECK(omitted_json.find("sonder")->find("api_version")->as_int() ==
           explicit_json.find("sonder")->find("api_version")->as_int());
-    // The unrequested text endpoint is not exposed by this priority slice.
-    CHECK(post(fixture.port, "/v1/completions", R"({"prompt":"completion"})").status == 404);
+    // An unrouted endpoint still returns 404 without touching the backend.
+    CHECK(post(fixture.port, "/v1/audio/speech", R"({"input":"hello"})").status == 404);
 }
 
 }  // namespace
