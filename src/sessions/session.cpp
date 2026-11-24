@@ -572,9 +572,19 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
 
     std::chrono::steady_clock::time_point t_first{};
     bool have_first = false;
+    std::size_t delivered_bytes = 0;
+    std::optional<Status> output_limit_failure;
 
     // Telemetry + user callback for one visible chunk (not gated).
     const auto deliver = [&](const TokenChunk& chunk, std::optional<TokenId> token_id, float probability) -> bool {
+        const std::size_t chunk_bytes = chunk.text.size() + chunk.reasoning.size();
+        if (request_options.max_response_bytes > 0 &&
+            (chunk_bytes > request_options.max_response_bytes ||
+             delivered_bytes > request_options.max_response_bytes - chunk_bytes)) {
+            output_limit_failure = Status(ErrorCode::protocol_error, "response output exceeds cumulative byte limit");
+            return false;
+        }
+        delivered_bytes += chunk_bytes;
         const auto now = std::chrono::steady_clock::now();
         if (!have_first) {
             have_first = true;
@@ -583,11 +593,13 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
             bus.emit("inference.decode.started", ctx, json::Object{{"ttft_ms", result.ttft_ms}},
                      TelemetryLevel::metrics);
         }
-        if (!chunk.text.empty()) {
-            result.text.append(chunk.text.data(), chunk.text.size());
-        }
-        if (!chunk.reasoning.empty()) {
-            result.reasoning.append(chunk.reasoning.data(), chunk.reasoning.size());
+        if (request_options.retain_text) {
+            if (!chunk.text.empty()) {
+                result.text.append(chunk.text.data(), chunk.text.size());
+            }
+            if (!chunk.reasoning.empty()) {
+                result.reasoning.append(chunk.reasoning.data(), chunk.reasoning.size());
+            }
         }
         ++delivered;
         if (emit_tokens) {
@@ -709,7 +721,13 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         token.cancelled() || (!generated.ok() && generated.status().code() == ErrorCode::cancelled);
 
     RequestOutcome outcome = RequestOutcome::completed;
-    if (gate_failure && !token.cancelled()) {
+    if (output_limit_failure && !token.cancelled()) {
+        outcome = RequestOutcome::failed;
+        failure = *output_limit_failure;
+        if (generated.ok()) {
+            result.stats = generated.value();
+        }
+    } else if (gate_failure && !token.cancelled()) {
         outcome = RequestOutcome::failed;
         failure = *gate_failure;
         if (generated.ok()) {
@@ -815,8 +833,10 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         terminal_attempted = true;
         bus.emit("request.cancelled", ctx, with_parent(std::move(summary)), TelemetryLevel::metrics);
     } else {
+        // Never emit raw upstream error text into shared Observatory telemetry
+        // (M-15): only record the safe structured error_code.
         summary.set("error_code", to_string(failure.code()));
-        summary.set("error", failure.message());
+        summary.set("error", to_string(failure.code()));
         if (scheduler_rejected) {
             summary.set("scheduler_rejected", true);
         }

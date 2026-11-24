@@ -198,9 +198,38 @@ struct ChatRequest {
 // True for "system", "user", "assistant" and "tool".
 [[nodiscard]] bool is_known_chat_role(std::string_view role) noexcept;
 
-// invalid_argument when the list is empty, a role is unknown, or the final
-// message is not from "user" or "tool" (there would be nothing to answer).
+// invalid_argument when the list is empty, a role is unknown, a message
+// contains an embedded NUL byte, or the final message is not from "user" or
+// "tool" (there would be nothing to answer).
 Status validate_chat_messages(const std::vector<ChatMessage>& messages);
+
+// One segment of a chat-templated prompt, preserving the boundary between
+// template-owned scaffolding (parse_special == true) and untrusted message
+// content (parse_special == false).
+struct ChatPromptSegment {
+    std::string text;
+    bool parse_special = false;
+};
+
+// Renders `messages` through `render_template` using unique per-message
+// placeholders so template-owned control-token scaffolding is strictly
+// separated from untrusted message content. Every scaffolding segment has
+// parse_special == true; every message-content segment has parse_special ==
+// false. Fails closed if any non-empty message placeholder does not round-trip
+// through the template.
+Result<std::vector<ChatPromptSegment>> build_chat_template_segments(
+    const std::vector<ChatMessage>& messages,
+    const std::function<Result<std::string>(const std::vector<ChatMessage>&)>& render_template);
+
+// Tokenizes segmented chat output across the hard special-token boundary:
+// scaffolding segments run with parse_special == true and untrusted content
+// segments run with parse_special == false. `add_special` is enabled only on
+// the first non-empty segment.
+Status tokenize_chat_segments(
+    const std::vector<ChatPromptSegment>& segments,
+    const std::function<Status(std::string_view text, bool add_special, bool parse_special,
+                               std::vector<TokenId>& out)>& tokenize_piece,
+    std::vector<TokenId>& out);
 
 // Backend-neutral prompt used by the default BackendModel::chat():
 //

@@ -300,6 +300,30 @@ TEST_CASE("serve_main: usage errors exit 2") {
     fs::remove(token, ec);
 }
 
+TEST_CASE("serve_main: --profile enforces GPU/runtime env allowlist on --llamaserver-config") {
+    const auto profiles = temp_path("profiles-env.json");
+    const auto bad_cfg = temp_path("cfg-bad-env.json");
+    const auto arbitrary_cfg = temp_path("cfg-arbitrary-env.json");
+    {
+        std::ofstream(profiles) << R"({"profiles":[{"name":"p1","backend":"llamaserver","model":"m.gguf"}]})";
+        std::ofstream(bad_cfg) << R"({"mode":"spawn","executable":"C:/llama-server.exe","env":{"LLAMA_ARG_HF_REPO":"evil/repo"}})";
+        std::ofstream(arbitrary_cfg) << R"({"mode":"spawn","executable":"C:/llama-server.exe","env":{"ARBITRARY_VAR":"1"}})";
+    }
+    std::string out, err;
+    CHECK(run({"--profiles", profiles.string(), "--profile", "p1", "--llamaserver-config", bad_cfg.string()}, out, err) == 2);
+    CHECK(err.find("refused") != std::string::npos);
+
+    out.clear();
+    err.clear();
+    CHECK(run({"--profiles", profiles.string(), "--profile", "p1", "--llamaserver-config", arbitrary_cfg.string()}, out, err) == 2);
+    CHECK(err.find("not permitted with --profile") != std::string::npos);
+
+    std::error_code ec;
+    fs::remove(profiles, ec);
+    fs::remove(bad_cfg, ec);
+    fs::remove(arbitrary_cfg, ec);
+}
+
 TEST_CASE("serve_main: llama.cpp KV cache, flash attention and batch flags") {
     std::string out;
     std::string err;

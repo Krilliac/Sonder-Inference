@@ -3,6 +3,7 @@
 // (fuzz/fuzz_http_request.cpp).
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -67,8 +68,11 @@ const char* reason_phrase(int status) noexcept;
 // must not contain CR or LF; offending characters are dropped.
 std::string format_head(int status, const std::vector<std::pair<std::string, std::string>>& headers);
 
-// Constant-time comparison of equal-length prefixes; false when the lengths
-// differ (the length itself is not secret for bearer tokens).
+// Fixed-size SHA-256 digest and constant-time comparisons that avoid an
+// early-return length leak on authentication tokens (L-05 / B4).
+std::array<std::uint8_t, 32> sha256_digest(std::string_view data) noexcept;
+bool constant_time_equals_digest(std::string_view candidate,
+                                 const std::array<std::uint8_t, 32>& expected_digest) noexcept;
 bool constant_time_equals(std::string_view a, std::string_view b) noexcept;
 
 // [A-Za-z0-9._:-]{1,128} (correlation header values).

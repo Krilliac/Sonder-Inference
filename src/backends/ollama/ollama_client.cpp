@@ -266,8 +266,13 @@ json::Value build_chat_body(const ChatParams& p, const OllamaConfig& config) {
 // ---------------------------------------------------------------------------
 // StreamDecoder
 
-StreamDecoder::StreamDecoder(StreamKind kind, ChunkCallback on_chunk, Clock::time_point start)
-    : kind_(kind), on_chunk_(std::move(on_chunk)), start_(start) {}
+StreamDecoder::StreamDecoder(StreamKind kind, ChunkCallback on_chunk, Clock::time_point start,
+                             std::size_t max_output_bytes, bool retain_text)
+    : kind_(kind),
+      on_chunk_(std::move(on_chunk)),
+      start_(start),
+      max_output_bytes_(max_output_bytes),
+      retain_text_(retain_text) {}
 
 bool StreamDecoder::feed(std::string_view bytes) {
     if (!error_.ok()) {
@@ -317,8 +322,7 @@ bool StreamDecoder::on_line(std::string_view line) {
     }
     auto parsed = json::parse(line);
     if (!parsed.ok() || !parsed.value().is_object()) {
-        std::string snippet(line.substr(0, 200));
-        error_ = Status(ErrorCode::protocol_error, "ollama: malformed NDJSON line: " + snippet);
+        error_ = Status(ErrorCode::protocol_error, "ollama: malformed NDJSON line");
         return false;
     }
     const json::Value& j = parsed.value();
@@ -339,14 +343,23 @@ bool StreamDecoder::on_line(std::string_view line) {
         c.done = d->as_bool();
     }
     c.done_reason = str_view(j, "done_reason");
+    const std::size_t chunk_bytes = c.content.size() + c.thinking.size();
+    if (max_output_bytes_ > 0 &&
+        (chunk_bytes > max_output_bytes_ || output_bytes_ > max_output_bytes_ - chunk_bytes)) {
+        error_ = Status(ErrorCode::protocol_error, "ollama: stream output exceeds cumulative byte limit");
+        return false;
+    }
+    output_bytes_ += chunk_bytes;
     if (!c.content.empty() || !c.thinking.empty()) {
         if (result_.timings.ttft_ms < 0) {
             result_.timings.ttft_ms = ms_between(start_, Clock::now());
         }
         ++result_.timings.content_chunks;
     }
-    result_.text.append(c.content);
-    result_.thinking.append(c.thinking);
+    if (retain_text_) {
+        result_.text.append(c.content);
+        result_.thinking.append(c.thinking);
+    }
     if (result_.model.empty()) {
         result_.model = str_field(j, "model");
     }
@@ -472,16 +485,19 @@ Result<json::Value> OllamaClient::show_model(const std::string& name) const {
 
 Result<StreamResult> OllamaClient::generate(const GenerateParams& params, const ChunkCallback& on_chunk,
                                             const CancellationToken& cancel) const {
-    return stream(StreamKind::generate, "/api/generate", build_generate_body(params, config_).dump(), on_chunk, cancel);
+    return stream(StreamKind::generate, "/api/generate", build_generate_body(params, config_).dump(), on_chunk, cancel,
+                  params.retain_text);
 }
 
 Result<StreamResult> OllamaClient::chat(const ChatParams& params, const ChunkCallback& on_chunk,
                                         const CancellationToken& cancel) const {
-    return stream(StreamKind::chat, "/api/chat", build_chat_body(params, config_).dump(), on_chunk, cancel);
+    return stream(StreamKind::chat, "/api/chat", build_chat_body(params, config_).dump(), on_chunk, cancel,
+                  params.retain_text);
 }
 
 Result<StreamResult> OllamaClient::stream(StreamKind kind, const std::string& path, const std::string& body,
-                                          const ChunkCallback& on_chunk, const CancellationToken& cancel) const {
+                                          const ChunkCallback& on_chunk, const CancellationToken& cancel,
+                                          bool retain_text) const {
     if (cancel.cancelled()) {
         return Status(ErrorCode::cancelled, "ollama: cancelled before start");
     }
@@ -493,7 +509,7 @@ Result<StreamResult> OllamaClient::stream(StreamKind kind, const std::string& pa
     req.value().on_status = [&http_status](int s) { http_status = s; };
 
     const auto start = Clock::now();
-    StreamDecoder decoder(kind, on_chunk, start);
+    StreamDecoder decoder(kind, on_chunk, start, config_.max_stream_output_bytes, retain_text);
     std::string error_body;
     auto res = net::http_request(
         req.value(),

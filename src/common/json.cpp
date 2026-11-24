@@ -323,7 +323,7 @@ namespace {
 
 class Parser {
 public:
-    explicit Parser(std::string_view text) : text_(text) {}
+    explicit Parser(std::string_view text, ParseLimits limits = {}) : text_(text), limits_(limits) {}
 
     Result<Value> parse_document() {
         skip_ws();
@@ -340,8 +340,6 @@ public:
     }
 
 private:
-    static constexpr int kMaxDepth = 128;
-
     Status fail() const {
         return Status(ErrorCode::protocol_error,
                       "json parse error at offset " + std::to_string(pos_) + ": " + error_);
@@ -368,8 +366,12 @@ private:
     }
 
     bool parse_value(Value& out, int depth) {
-        if (depth > kMaxDepth) {
+        if (depth > limits_.max_depth) {
             error_ = "nesting too deep";
+            return false;
+        }
+        if (limits_.max_values > 0 && ++value_count_ > limits_.max_values) {
+            error_ = "too many JSON values";
             return false;
         }
         if (pos_ >= text_.size()) {
@@ -604,12 +606,15 @@ private:
     }
 
     std::string_view text_;
+    ParseLimits limits_{};
     std::size_t pos_ = 0;
+    std::size_t value_count_ = 0;
     std::string error_;
 };
 
 }  // namespace
 
 Result<Value> parse(std::string_view text) { return Parser(text).parse_document(); }
+Result<Value> parse(std::string_view text, ParseLimits limits) { return Parser(text, limits).parse_document(); }
 
 }  // namespace sonder::inference::json

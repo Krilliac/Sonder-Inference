@@ -13,6 +13,9 @@ namespace sonder::inference::ollama {
 // Longest NDJSON line StreamDecoder accepts before failing with
 // protocol_error (see StreamDecoder::feed).
 inline constexpr std::size_t kMaxNdjsonLineBytes = 4u << 20;
+// Default cumulative cap on streamed content + thinking bytes across one
+// Ollama generation/chat response.
+inline constexpr std::size_t kMaxStreamOutputBytes = 32u << 20;
 
 // Body for POST /api/generate with stream=true and sampling mapped to options.
 json::Object build_generate_body(const std::string& model, const GenerateRequest& request,

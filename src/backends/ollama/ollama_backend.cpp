@@ -83,6 +83,7 @@ public:
         ollama::GenerateParams params;
         params.model = descriptor_.name;
         params.prompt = request.prompt;
+        params.retain_text = false;
         params.options = ollama::sampling_to_options(request.sampling);
         return run(cancel, on_chunk, [&](const ollama::ChunkCallback& cb) { return client_->generate(params, cb, cancel); });
     }
@@ -104,6 +105,7 @@ public:
         ollama::ChatParams params;
         params.model = descriptor_.name;
         params.messages = request.messages;
+        params.retain_text = false;
         params.options = ollama::sampling_to_options(request.sampling);
         // Ollama's own switch; reasoning_effort has no portable Ollama field.
         params.think = request.thinking.enable_thinking;

@@ -111,9 +111,21 @@ struct HttpRequest {
 
 // Checks HttpRequest::headers as described above. Never echoes a value.
 Status validate_request_headers(const std::vector<std::pair<std::string, std::string>>& headers);
+// Validates the whole HttpRequest (method, host, port, target, content_type,
+// and headers) before any connection or wire serialization.
+Status validate_http_request(const HttpRequest& request);
 // "[redacted]" for credential-bearing headers (Authorization, Proxy-Authorization,
 // Cookie, X-Api-Key and similar), the value otherwise. For diagnostics only.
 std::string redacted_header_value(std::string_view name, std::string_view value);
+
+// Strictly parsed HTTP/1.x response status line and framing headers.
+struct ParsedResponseHead {
+    int status = 0;
+    bool chunked = false;
+    bool has_length = false;
+    std::uint64_t content_length = 0;
+};
+Result<ParsedResponseHead> parse_response_head(std::string_view head_text);
 
 struct HttpResponseInfo {
     int status = 0;

@@ -322,3 +322,20 @@ TEST_CASE("decoder: lines longer than the cap are rejected") {
     CHECK(big.feed(line));
     CHECK(big.finish().ok());
 }
+
+TEST_CASE("decoder: cumulative output cap stops unbounded streaming responses (M-16)") {
+    StreamDecoder d(StreamKind::generate, {}, std::chrono::steady_clock::now(), 16u);
+    CHECK(d.feed("{\"response\":\"12345678\",\"done\":false}\n"));
+    CHECK(d.feed("{\"response\":\"abcdefgh\",\"done\":false}\n"));
+    CHECK_FALSE(d.feed("{\"response\":\"!\",\"done\":true}\n"));
+    CHECK(d.error().code() == ErrorCode::protocol_error);
+    CHECK(d.finish().code() == ErrorCode::protocol_error);
+}
+
+TEST_CASE("decoder: malformed NDJSON error does not echo raw payload (M-15)") {
+    StreamDecoder d(StreamKind::generate, {});
+    const std::string canary = "SECRET_PROMPT_LEAK_CANARY_999";
+    CHECK_FALSE(d.feed("not-json-" + canary + "\n"));
+    CHECK(d.error().code() == ErrorCode::protocol_error);
+    CHECK(d.error().message().find(canary) == std::string::npos);
+}

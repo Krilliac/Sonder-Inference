@@ -196,3 +196,26 @@ TEST_CASE("lifecycle: stop() while a model load blocks reports draining and canc
     REQUIRE(stopped.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
     CHECK(server.engine() == nullptr);
 }
+
+TEST_CASE("lifecycle: continuous burst backlog reaps finished worker threads cleanly (M-18)") {
+    Fixture f;
+    constexpr int kBursts = 80;
+    std::atomic<int> ok_count{0};
+    std::vector<std::thread> clients;
+    clients.reserve(4);
+    for (int w = 0; w < 4; ++w) {
+        clients.emplace_back([&, port = f.port] {
+            for (int i = 0; i < kBursts / 4; ++i) {
+                const Reply r = get(port, "/v1/sonder/health");
+                if (r.status == 200) {
+                    ok_count.fetch_add(1);
+                }
+            }
+        });
+    }
+    for (auto& t : clients) t.join();
+    CHECK(ok_count.load() == kBursts);
+    const auto t0 = std::chrono::steady_clock::now();
+    f.server->stop();
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
+}

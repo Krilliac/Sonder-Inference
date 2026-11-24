@@ -27,7 +27,7 @@ jobs:
           - os: windows-latest
             preset: ci-windows
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
@@ -35,7 +35,7 @@ jobs:
 
       - name: MSVC developer environment (Windows)
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
 
@@ -100,7 +100,7 @@ jobs:
 
       - name: Retain mock lifecycle qualification receipt
         if: always() && runner.os == 'Linux' && steps.mock-stress.outcome != 'skipped'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: mock-lifecycle-stress-${{ matrix.preset }}
           path: |
@@ -120,10 +120,10 @@ jobs:
       LLAMACPP_TAG: b11195
       LLAMACPP_SHA256: d9818b7786c8a3b063bac7eb7dc8710e275638f1e288e206720c9e22e7ca216a
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: MSVC developer environment
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
 
@@ -133,7 +133,7 @@ jobs:
 
       - name: Cache llama.cpp source
         id: llamacpp-cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ runner.temp }}/llamacpp-src
           key: llamacpp-src-${{ env.LLAMACPP_TAG }}-${{ env.LLAMACPP_SHA256 }}
@@ -171,7 +171,7 @@ jobs:
     # recorded in docs/LICENSE_REVIEW.md.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Ninja + OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev
@@ -209,10 +209,10 @@ jobs:
       OPENSSL_CONFIG: VC-WIN64A no-asm no-apps no-tests no-docs no-makedepend
       OPENSSL_PREFIX: C:\sonder-openssl
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: MSVC developer environment
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
 
@@ -222,7 +222,7 @@ jobs:
 
       - name: Cache OpenSSL (in-test TLS server only)
         id: openssl-cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: C:\sonder-openssl
           # Bump the trailing revision when OPENSSL_CONFIG or the prefix changes.

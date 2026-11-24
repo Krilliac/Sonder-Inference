@@ -188,12 +188,23 @@ TEST_CASE("launch profile: extra_args refuse host and port and credentials and d
                                   // llama-server reads every '_' of a "--" flag as '-' (common/arg.cpp).
                                   R"("--api_key","k")", R"("--api_key_file","f")", R"("--hf_repo","org/model")",
                                   R"("--hf_token","t")", R"("--model_url","u")", R"("--models_dir","d")",
-                                  R"("--models_preset","p.ini")", R"("--spec_draft_hf","org/draft")"}) {
+                                  R"("--models_preset","p.ini")", R"("--spec_draft_hf","org/draft")",
+                                  // Vocoder HF and future download-family aliases (G0094).
+                                  R"("-hfv","org/vocoder")", R"("-hfv=org/vocoder")",
+                                  R"("-hfrv","org/vocoder")", R"("-hfrv=org/vocoder")",
+                                  R"("--hf-repo-v","org/vocoder")", R"("--hf-repo-v=org/vocoder")",
+                                  R"("--hf_repo_v","org/vocoder")", R"("--hf_repo_v=org/vocoder")",
+                                  R"("-hffv","v.gguf")", R"("--hf-file-v","v.gguf")",
+                                  R"("--hf_file_v=v.gguf")", R"("--vocoder-url","https://x")",
+                                  R"("--vocoder_url=https://x")", R"("--future-model-url","https://x")",
+                                  R"("--hf-future-option","x")"}) {
         CAPTURE(forbidden);
         CHECK(contains(parse_error(with(forbidden)), "must not contain"));
     }
     // The refusal names the flag llama-server would have read.
     CHECK(contains(parse_error(with(R"("--api_key","k")")), "--api_key, which llama-server reads as --api-key"));
+    CHECK(contains(parse_error(with(R"("--hf_repo_v","org/vocoder")")),
+                   "--hf_repo_v, which llama-server reads as --hf-repo-v"));
     for (const auto& [flag, field] : std::vector<std::pair<std::string, std::string>>{
              {R"("-c","4096")", "ctx_size"},
              {R"("--ctx-size=4096")", "ctx_size"},

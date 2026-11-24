@@ -60,6 +60,8 @@ struct OllamaBackendOptions {
     // Also deliver reasoning ("thinking") text to Backend token callbacks.
     // Off by default, so TTFT measures the first *content* token.
     bool emit_thinking_chunks = false;
+    // Cumulative byte cap on streamed response content + thinking (0 disables).
+    std::size_t max_stream_output_bytes = 32u << 20;
     // Used when base_url is https:// (non-loopback hosts still need allow_remote).
     OllamaTlsOptions tls;
 };
@@ -125,7 +127,8 @@ struct StreamResult {
 class StreamDecoder {
 public:
     StreamDecoder(StreamKind kind, ChunkCallback on_chunk,
-                  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now());
+                  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now(),
+                  std::size_t max_output_bytes = 32u << 20, bool retain_text = true);
 
     // Returns false when the callback asked to stop or a hard error occurred.
     bool feed(std::string_view bytes);
@@ -144,6 +147,9 @@ private:
     StreamKind kind_;
     ChunkCallback on_chunk_;
     std::chrono::steady_clock::time_point start_;
+    std::size_t max_output_bytes_ = 32u << 20;
+    std::size_t output_bytes_ = 0;
+    bool retain_text_ = true;
     std::string buffer_;
     StreamResult result_;
     Status error_;
@@ -158,6 +164,7 @@ struct GenerateParams {
     std::string system;
     bool raw = false;
     bool stream = true;
+    bool retain_text = true;        // false avoids buffering when caller only streams via callback
     std::optional<bool> think;
     std::string keep_alive;         // overrides OllamaConfig::keep_alive
     json::Object options;           // Ollama "options" (num_predict, seed, ...)
@@ -167,6 +174,7 @@ struct ChatParams {
     std::string model;
     std::vector<ChatMessage> messages;
     bool stream = true;
+    bool retain_text = true;        // false avoids buffering when caller only streams via callback
     std::optional<bool> think;
     std::string keep_alive;
     json::Object options;
@@ -220,7 +228,8 @@ public:
 private:
     Result<json::Value> get_json(const std::string& method, const std::string& path, const std::string& body) const;
     Result<StreamResult> stream(StreamKind kind, const std::string& path, const std::string& body,
-                                const ChunkCallback& on_chunk, const CancellationToken& cancel) const;
+                                const ChunkCallback& on_chunk, const CancellationToken& cancel,
+                                bool retain_text) const;
 
     OllamaConfig config_;
 };

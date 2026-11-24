@@ -207,4 +207,20 @@ TEST_CASE("numbers outside double range are rejected") {
     CHECK(tiny.value().as_double() == 0.0);
     CHECK(json::parse("18446744073709551616").ok());  // > int64 falls back to double
 }
+
+TEST_CASE("ParseLimits caps total JSON value count (M-17)") {
+    std::string arr = "[";
+    for (int i = 0; i < 100; ++i) {
+        if (i > 0) arr.push_back(',');
+        arr.push_back('0');
+    }
+    arr.push_back(']');
+
+    CHECK(json::parse(arr).ok());  // default unlimited
+    CHECK(json::parse(arr, json::ParseLimits{128, 101}).ok());  // 1 array + 100 elements
+    auto capped = json::parse(arr, json::ParseLimits{128, 50});
+    CHECK_FALSE(capped.ok());
+    CHECK(capped.status().code() == sonder::inference::ErrorCode::protocol_error);
+    CHECK(capped.status().message().find("too many JSON values") != std::string::npos);
+}
 }

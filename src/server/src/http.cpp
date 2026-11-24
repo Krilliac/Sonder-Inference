@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cctype>
 
+#include "sha256.hpp"
+
 namespace sonder::inference::server::detail {
 
 namespace {
@@ -272,15 +274,33 @@ std::string format_head(int status, const std::vector<std::pair<std::string, std
     return out;
 }
 
-bool constant_time_equals(std::string_view a, std::string_view b) noexcept {
-    if (a.size() != b.size()) {
-        return false;
-    }
-    unsigned char diff = 0;
-    for (std::size_t i = 0; i < a.size(); ++i) {
-        diff = static_cast<unsigned char>(diff | (static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i])));
+std::array<std::uint8_t, 32> sha256_digest(std::string_view data) noexcept {
+    Sha256 hasher;
+    hasher.update(data);
+    return hasher.finish();
+}
+
+bool constant_time_equals_digest(std::string_view candidate,
+                                 const std::array<std::uint8_t, 32>& expected_digest) noexcept {
+    const auto actual = sha256_digest(candidate);
+    volatile unsigned char diff = 0;
+    for (std::size_t i = 0; i < actual.size(); ++i) {
+        diff = static_cast<unsigned char>(diff | (actual[i] ^ expected_digest[i]));
     }
     return diff == 0;
+}
+
+bool constant_time_equals(std::string_view a, std::string_view b) noexcept {
+    // Compare fixed-size SHA-256 digests without an early return on length
+    // mismatch, then fold the length equality into the final result.
+    const auto da = sha256_digest(a);
+    const auto db = sha256_digest(b);
+    volatile unsigned char diff = 0;
+    for (std::size_t i = 0; i < da.size(); ++i) {
+        diff = static_cast<unsigned char>(diff | (da[i] ^ db[i]));
+    }
+    const std::size_t len_diff = a.size() ^ b.size();
+    return diff == 0 && len_diff == 0;
 }
 
 bool is_correlation_value(std::string_view value) noexcept {

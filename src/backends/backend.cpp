@@ -1,6 +1,7 @@
 #include "sonder/inference/backend.hpp"
 
 #include <cctype>
+#include <cstdio>
 #include <utility>
 
 namespace sonder::inference {
@@ -61,10 +62,152 @@ Status validate_chat_messages(const std::vector<ChatMessage>& messages) {
                                                            messages[i].role +
                                                            "\" (expected system, user, assistant or tool)");
         }
+        if (messages[i].content.find('\0') != std::string::npos) {
+            return Status(ErrorCode::invalid_argument,
+                          "chat: message " + std::to_string(i) + " content must not contain NUL");
+        }
     }
     const std::string& last = messages.back().role;
     if (last != "user" && last != "tool") {
         return Status(ErrorCode::invalid_argument, "chat: the last message must be from user or tool, got " + last);
+    }
+    return Status::success();
+}
+
+Result<std::vector<ChatPromptSegment>> build_chat_template_segments(
+    const std::vector<ChatMessage>& messages,
+    const std::function<Result<std::string>(const std::vector<ChatMessage>&)>& render_template) {
+    if (Status st = validate_chat_messages(messages); !st.ok()) {
+        return st;
+    }
+    if (!render_template) {
+        return Status(ErrorCode::invalid_argument, "chat: render_template callback is empty");
+    }
+
+    std::uint64_t nonce = 0x7f3a9c1e5b2d4a09ULL;
+    auto next_prefix = [&]() {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "SNDRMSGSLOT%016llxX", static_cast<unsigned long long>(nonce));
+        nonce = nonce * 6364136223846793005ULL + 1442695040888963407ULL;
+        return std::string(buf);
+    };
+
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        std::string prefix = next_prefix();
+        auto prefix_in_messages = [&](std::string_view candidate) {
+            for (const auto& m : messages) {
+                if (m.role.find(candidate) != std::string::npos || m.content.find(candidate) != std::string::npos) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        while (prefix_in_messages(prefix)) {
+            prefix = next_prefix();
+        }
+
+        std::vector<ChatMessage> placeholder_messages;
+        placeholder_messages.reserve(messages.size());
+        std::vector<std::string> placeholders(messages.size());
+        for (std::size_t i = 0; i < messages.size(); ++i) {
+            ChatMessage m;
+            m.role = messages[i].role;
+            if (!messages[i].content.empty()) {
+                placeholders[i] = prefix + "_" + std::to_string(i) + "_Z";
+                m.content = placeholders[i];
+            }
+            placeholder_messages.push_back(std::move(m));
+        }
+
+        auto rendered = render_template(placeholder_messages);
+        if (!rendered.ok()) {
+            return rendered.status();
+        }
+        const std::string& text = rendered.value();
+        std::vector<ChatPromptSegment> segments;
+        std::vector<std::size_t> seen(messages.size(), 0);
+        bool collided = false;
+        std::size_t cursor = 0;
+        while (cursor < text.size()) {
+            const std::size_t pos = text.find(prefix, cursor);
+            if (pos == std::string::npos) {
+                segments.push_back(ChatPromptSegment{text.substr(cursor), true});
+                break;
+            }
+            const std::size_t after_prefix = pos + prefix.size();
+            if (after_prefix >= text.size() || text[after_prefix] != '_') {
+                collided = true;
+                break;
+            }
+            const std::size_t digits_start = after_prefix + 1;
+            std::size_t digits_end = digits_start;
+            while (digits_end < text.size() && text[digits_end] >= '0' && text[digits_end] <= '9') {
+                ++digits_end;
+            }
+            if (digits_end == digits_start || digits_end + 2 > text.size() || text[digits_end] != '_' ||
+                text[digits_end + 1] != 'Z') {
+                collided = true;
+                break;
+            }
+            std::size_t idx = 0;
+            bool overflow = false;
+            for (std::size_t k = digits_start; k < digits_end; ++k) {
+                const std::size_t digit = static_cast<std::size_t>(text[k] - '0');
+                if (idx > (messages.size() - 1) / 10 + 1) {
+                    overflow = true;
+                    break;
+                }
+                idx = idx * 10 + digit;
+            }
+            if (overflow || idx >= messages.size() || placeholders[idx].empty() ||
+                text.compare(pos, placeholders[idx].size(), placeholders[idx]) != 0) {
+                collided = true;
+                break;
+            }
+            if (pos > cursor) {
+                segments.push_back(ChatPromptSegment{text.substr(cursor, pos - cursor), true});
+            }
+            segments.push_back(ChatPromptSegment{messages[idx].content, false});
+            ++seen[idx];
+            cursor = pos + placeholders[idx].size();
+        }
+        if (collided) {
+            continue;
+        }
+        for (std::size_t i = 0; i < messages.size(); ++i) {
+            if (!messages[i].content.empty() && seen[i] == 0) {
+                return Status(ErrorCode::invalid_argument,
+                              "chat: template did not preserve message boundary for message " + std::to_string(i));
+            }
+        }
+        return segments;
+    }
+    return Status(ErrorCode::internal, "chat: failed to establish collision-free template boundary");
+}
+
+Status tokenize_chat_segments(
+    const std::vector<ChatPromptSegment>& segments,
+    const std::function<Status(std::string_view text, bool add_special, bool parse_special,
+                               std::vector<TokenId>& out)>& tokenize_piece,
+    std::vector<TokenId>& out) {
+    out.clear();
+    if (!tokenize_piece) {
+        return Status(ErrorCode::invalid_argument, "chat: tokenize callback is empty");
+    }
+    bool first_non_empty = true;
+    std::vector<TokenId> piece_tokens;
+    for (const auto& seg : segments) {
+        if (seg.text.empty()) {
+            continue;
+        }
+        piece_tokens.clear();
+        const bool add_special = first_non_empty;
+        first_non_empty = false;
+        if (Status st = tokenize_piece(seg.text, add_special, seg.parse_special, piece_tokens); !st.ok()) {
+            out.clear();
+            return st;
+        }
+        out.insert(out.end(), piece_tokens.begin(), piece_tokens.end());
     }
     return Status::success();
 }

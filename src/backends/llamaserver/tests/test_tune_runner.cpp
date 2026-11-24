@@ -470,7 +470,8 @@ TEST_CASE("process optional environment and capture preserve the no-option launc
     ProcessSpec spec;
     ProcessOptions unchanged;
     REQUIRE(unchanged.prepare(spec).ok());
-    CHECK(unchanged.environment.empty());
+    CHECK(unchanged.has_environment);
+    CHECK_FALSE(unchanged.environment.empty());
     CHECK_FALSE(unchanged.redirect);
     CHECK(validate_process_environment({{"TUNE_TEST", "has spaces=and equals"}}).ok());
     CHECK_FALSE(validate_process_environment({{"", "x"}}).ok());

@@ -1011,3 +1011,31 @@ TEST_CASE("log queue: with no report interval every round of drops is reported l
     const std::vector<std::string> expected{"a", "b", "c", "dropped 2 live", "f", "g", "h", "dropped 5 live", "z"};
     CHECK(got == expected);
 }
+
+TEST_CASE("auth: fixed-size SHA-256 constant-time token comparison (L-05)") {
+    CHECK(constant_time_equals("", ""));
+    CHECK(constant_time_equals("sonder-secret-token", "sonder-secret-token"));
+    CHECK_FALSE(constant_time_equals("sonder-secret-token", "sonder-secret-tokeN"));
+    CHECK_FALSE(constant_time_equals("short", "much-longer-secret-token"));
+    CHECK_FALSE(constant_time_equals("prefix", "prefix-extended"));
+
+    const auto digest = sha256_digest("bearer-token-value-123");
+    CHECK(constant_time_equals_digest("bearer-token-value-123", digest));
+    CHECK_FALSE(constant_time_equals_digest("bearer-token-value-124", digest));
+    CHECK_FALSE(constant_time_equals_digest("", digest));
+    CHECK_FALSE(constant_time_equals_digest("bearer-token-value-123-extra", digest));
+}
+
+TEST_CASE("openai: ingress JSON parser rejects high-node-count array bombs (M-17)") {
+    std::string bomb = "{\"model\":\"m\",\"messages\":[";
+    for (int i = 0; i < 70000; ++i) {
+        if (i > 0) bomb.push_back(',');
+        bomb.push_back('0');
+    }
+    bomb += "]}";
+    const auto parsed = parse_chat_request(bomb);
+    const auto* err = std::get_if<ApiError>(&parsed);
+    REQUIRE(err != nullptr);
+    CHECK(err->status == 400);
+    CHECK(err->code == "invalid_json");
+}

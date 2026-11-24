@@ -255,9 +255,10 @@ Result<std::shared_ptr<Model>> Engine::load_model(const std::string& backend_nam
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (!loaded.ok()) {
         const auto st = loaded.status();
+        // Never emit raw upstream error text into shared Observatory telemetry (M-15).
         telemetry_->emit("model.load.failed", ctx,
                          json::Object{{"backend", backend_name}, {"model", options.model}, {"duration_ms", ms},
-                                      {"error_code", to_string(st.code())}, {"error", st.message()}},
+                                      {"error_code", to_string(st.code())}, {"error", to_string(st.code())}},
                          TelemetryLevel::metrics);
         return st;
     }
