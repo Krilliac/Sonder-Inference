@@ -1,16 +1,54 @@
 #include "tune.hpp"
+#include "llamaserver_options.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <iomanip>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <string_view>
 
 namespace sonder::inference::llamaserver::tune {
 namespace {
+constexpr std::uint64_t kGiB = 1024ull * kMiB;
+
 Status invalid(const char *message) { return {ErrorCode::invalid_argument, message}; }
+char ascii_lower(char c) noexcept {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+bool icontains_ascii(std::string_view haystack, std::string_view needle) noexcept {
+    if (needle.empty()) return true;
+    if (needle.size() > haystack.size()) return false;
+    for (std::size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
+        bool match = true;
+        for (std::size_t j = 0; j < needle.size(); ++j) {
+            if (ascii_lower(haystack[i + j]) != ascii_lower(needle[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+std::uint64_t saturating_add_u64(std::uint64_t a, std::uint64_t b) noexcept {
+    return a > std::numeric_limits<std::uint64_t>::max() - b ? std::numeric_limits<std::uint64_t>::max() : a + b;
+}
+std::vector<std::uint64_t> context_ladder(std::uint64_t lo, std::uint64_t hi) {
+    std::vector<std::uint64_t> out;
+    for (std::uint64_t ctx_size = lo; ctx_size <= hi; ctx_size += kMargin) out.push_back(ctx_size);
+    return out;
+}
+void append_unique_kv(std::vector<KvPair> &kv, KvPair pair) {
+    if (kv.size() >= 8) return;
+    if (std::find(kv.begin(), kv.end(), pair) == kv.end()) kv.push_back(std::move(pair));
+}
+void append_unique_spec(std::vector<std::string> &specs, std::string spec) {
+    if (specs.size() >= 7) return;
+    if (std::find(specs.begin(), specs.end(), spec) == specs.end()) specs.push_back(std::move(spec));
+}
 bool is_quantized_kv_type(std::string_view type) {
     return type != "f16" && type != "bf16" && type != "f32";
 }
@@ -18,10 +56,11 @@ bool is_valid_kv_flash_attn(const KvPair &kv, std::string_view flash_attn) {
     return !(flash_attn == "off" && is_quantized_kv_type(kv.v));
 }
 bool is_supported_spec_type(std::string_view type) {
-    return type == "draft-mtp" || type == "draft-mtp,ngram-mod" || type == "ngram-mod";
+    return type == "draft-mtp" || type == "draft-mtp,ngram-mod" || type == "ngram-mod" ||
+           type == "dflash" || type == "draft-dflash" || type == "draft" || type == "draft-simple";
 }
 bool spec_type_requires_mtp(std::string_view type) {
-    return type != "ngram-mod";
+    return type == "draft-mtp" || type == "draft-mtp,ngram-mod";
 }
 bool eligible(const Measurement &m) {
     const auto weighted = weighted_decode_tps(m.workloads);
@@ -49,15 +88,44 @@ json::Object spawn_config(const Options &options, const Candidate &candidate) {
     for (const auto &arg : arguments(options, candidate)) args.emplace_back(arg);
     json::Object env;
     for (const auto &[key, value] : options.environment) env.set(key, value);
-    return {{"mode", "spawn"}, {"executable", options.executable}, {"args", std::move(args)},
-            // A profile for daily use: restart after a crash, and shrink the
-            // context (not refuse) if the desktop takes more VRAM later.
-            {"env", std::move(env)}, {"max_restarts", 3}, {"startup_timeout_ms", 120000},
-            {"spill_guard", json::Object{{"enabled", true}, {"policy", "auto_fit"},
-                {"threshold_mib", spill_guard_for(options.grid, candidate).threshold_bytes / kMiB},
-                {"baseline_mib", spill_guard_for(options.grid, candidate).baseline_bytes / kMiB},
-                {"baseline_per_1k_ctx_mib", spill_guard_for(options.grid, candidate).baseline_bytes_per_1k_ctx / kMiB},
-                {"fit_min_ctx", std::min<std::uint64_t>(candidate.ctx, 32768)}}}};
+    const auto &guard = spill_guard_for(options.grid, candidate);
+    json::Object spill_guard{
+        {"enabled", true},
+        {"policy", "auto_fit"},
+        {"threshold_mib", guard.threshold_bytes / kMiB},
+        {"baseline_mib", guard.baseline_bytes / kMiB},
+        {"baseline_per_1k_ctx_mib", guard.baseline_bytes_per_1k_ctx / kMiB},
+        {"fit_min_ctx", std::min<std::uint64_t>(candidate.ctx, 32768)},
+    };
+    if (options.uma_mode == UmaMode::on || (options.uma_mode == UmaMode::off && guard.uma_mode)) {
+        spill_guard.set("uma_mode", true);
+    } else if (options.uma_mode == UmaMode::auto_detect) {
+        spill_guard.set("uma_mode", "auto");
+    }
+    json::Object config{
+        {"mode", "spawn"},
+        {"executable", options.executable},
+        {"args", std::move(args)},
+        // A profile for daily use: restart after a crash, and shrink the
+        // context (not refuse) if the desktop takes more VRAM later.
+        {"env", std::move(env)},
+        {"max_restarts", 3},
+        {"startup_timeout_ms", 120000},
+        {"spill_guard", std::move(spill_guard)},
+    };
+    if (options.emit_adaptive_speculation && candidate.mtp > 0) {
+        const std::uint32_t initial_n = std::min<std::uint32_t>(candidate.mtp, 128u);
+        const std::uint32_t max_n = std::max<std::uint32_t>(initial_n, 4u);
+        const std::uint32_t probe_n = std::max<std::uint32_t>(1u, std::min<std::uint32_t>(initial_n, 2u));
+        config.set("adaptive_speculation", json::Object{
+            {"enabled", true},
+            {"min_draft_n", static_cast<std::uint64_t>(0u)},
+            {"initial_draft_n", static_cast<std::uint64_t>(initial_n)},
+            {"max_draft_n", static_cast<std::uint64_t>(max_n)},
+            {"probe_draft_n", static_cast<std::uint64_t>(probe_n)},
+        });
+    }
+    return config;
 }
 json::Value measurement_json(const Measurement &m) {
     const auto mib = [](const std::optional<std::uint64_t> &n) -> json::Value {
@@ -79,7 +147,7 @@ json::Value measurement_json(const Measurement &m) {
     return json::Object{{"ctx", m.candidate.ctx}, {"k", m.candidate.kv.k}, {"v", m.candidate.kv.v},
         {"flash_attn", m.candidate.flash_attn}, {"ubatch", m.candidate.ubatch}, {"mtp_n", m.candidate.mtp},
         {"spec_type", m.candidate.mtp == 0 ? "none" : m.candidate.spec_type},
-        {"p_min", uses_mtp(m.candidate) ? json::Value(m.candidate.p_min) : json::Value{}},
+        {"p_min", uses_draft_p_min(m.candidate) ? json::Value(m.candidate.p_min) : json::Value{}},
         {"phase", m.phase == Phase::probe ? "probe" : "benchmark"},
         {"shared_mib", mib(m.shared_bytes)}, {"dedicated_mib", mib(m.dedicated_bytes)},
         {"short_tok_s", m.short_tps}, {"prefill_tok_s", m.prefill_tps},
@@ -92,10 +160,94 @@ json::Value measurement_json(const Measurement &m) {
 } // namespace
 
 Grid::Grid() {
-    for (std::uint64_t ctx_size = 32768; ctx_size <= 139264; ctx_size += kMargin) ctx.push_back(ctx_size);
+    ctx = context_ladder(32768, 139264);
     spill_mtp.baseline_bytes = 166 * kMiB;
     spill_mtp.baseline_bytes_per_1k_ctx = 2 * kMiB;
     spill_mtp.threshold_bytes = 32 * kMiB;
+}
+const char *to_string(UmaMode mode) noexcept {
+    switch (mode) {
+    case UmaMode::off: return "off";
+    case UmaMode::on: return "on";
+    case UmaMode::auto_detect: return "auto";
+    }
+    return "off";
+}
+std::optional<UmaMode> parse_uma_mode(std::string_view text) noexcept {
+    if (text == "off") return UmaMode::off;
+    if (text == "on") return UmaMode::on;
+    if (text == "auto") return UmaMode::auto_detect;
+    return std::nullopt;
+}
+Grid grid_for_gpu(const GpuDeviceInfo &gpu, bool is_ternary) {
+    Grid grid;
+    if (gpu.is_integrated_uma) {
+        grid.ctx = context_ladder(8192, 65536);
+        grid.ubatch = {256, 512, 1024};
+        grid.kv = {{"q8_0", "q8_0"}, {"q4_0", "q4_0"}};
+        grid.spill.uma_mode = true;
+        grid.spill_mtp.uma_mode = true;
+    } else {
+        const bool dedicated_known = gpu.dedicated_total.is_known();
+        const std::uint64_t dedicated_bytes = gpu.dedicated_total.bytes_or(0);
+        if (gpu.vendor == GpuVendor::nvidia) {
+            const bool rtx_or_12g =
+                (dedicated_known && dedicated_bytes >= 12ull * kGiB) || icontains_ascii(gpu.name, "rtx");
+            if (rtx_or_12g) {
+                grid.kv = {{"f8_e4m3", "f8_e4m3"}, {"q8_0", "q8_0"}, {"q8_0", "q4_0"}, {"q4_0", "q4_0"}};
+            }
+        } else if (gpu.vendor == GpuVendor::amd) {
+            // Avoid unsupported FP8 KV kernels on RDNA3/4 discrete cards.
+            grid.kv = {{"q8_0", "q8_0"}, {"q8_0", "q4_0"}, {"q4_0", "q4_0"}, {"f16", "f16"}};
+        }
+        if (dedicated_known && dedicated_bytes < 10ull * kGiB) {
+            grid.ctx = context_ladder(8192, 65536);
+        }
+    }
+    if (is_ternary) {
+        append_unique_kv(grid.kv, {"q2_0", "q2_0"});
+        append_unique_spec(grid.spec_type, "ngram-mod");
+    }
+    return grid;
+}
+bool resolve_tune_uma_mode(UmaMode mode, const std::vector<GpuDeviceInfo> &gpus,
+                           const std::vector<std::string> &args) noexcept {
+    if (mode == UmaMode::on) return true;
+    if (mode == UmaMode::off) return false;
+    return resolve_uma_mode("auto", gpus, extract_device_hint(args));
+}
+std::optional<std::uint64_t> uma_pool_ceiling_bytes(const HostMemory &host,
+                                                    const std::vector<GpuDeviceInfo> &gpus) noexcept {
+    bool has_gpu_pool = false;
+    std::uint64_t gpu_pool = 0;
+    for (const auto &gpu : gpus) {
+        if (!gpu.is_integrated_uma) continue;
+        if (!gpu.dedicated_total.is_known() && !gpu.shared_total.is_known()) continue;
+        const std::uint64_t sum = saturating_add_u64(gpu.dedicated_total.bytes_or(0), gpu.shared_total.bytes_or(0));
+        if (sum == 0) continue;
+        if (!has_gpu_pool || sum > gpu_pool) {
+            gpu_pool = sum;
+            has_gpu_pool = true;
+        }
+    }
+
+    bool has_host_ceiling = false;
+    std::uint64_t host_ceiling = 0;
+    if (host.available_physical.is_known()) {
+        const std::uint64_t avail = host.available_physical.bytes_or(0);
+        const std::uint64_t reserve = std::min<std::uint64_t>(2048ull * kMiB, avail / 4);
+        host_ceiling = avail > reserve ? avail - reserve : 0;
+        has_host_ceiling = true;
+    } else if (host.total_physical.is_known()) {
+        const std::uint64_t total = host.total_physical.bytes_or(0);
+        host_ceiling = (total / 4) * 3;
+        has_host_ceiling = true;
+    }
+
+    if (has_gpu_pool && has_host_ceiling) return std::min(gpu_pool, host_ceiling);
+    if (has_host_ceiling) return host_ceiling;
+    if (has_gpu_pool) return gpu_pool;
+    return std::nullopt;
 }
 std::optional<double> weighted_decode_tps(const std::vector<WorkloadMeasurement> &workloads) {
     static const std::array<const char *, 4> names{"prose", "code_edit", "tool_json", "reasoning"};
@@ -148,18 +300,18 @@ std::optional<std::uint64_t> margin_context(std::uint64_t edge) {
 }
 Status validate_grid(const Grid &g) {
     if (g.kv.empty() || g.kv.size() > 8 || g.ctx.empty() || g.ctx.size() > 128 ||
-        g.ubatch.empty() || g.ubatch.size() > 8 || g.mtp.empty() || g.mtp.size() > 4 ||
+        g.ubatch.empty() || g.ubatch.size() > 8 || g.mtp.empty() || g.mtp.size() > 8 ||
         g.flash_attn.empty() || g.flash_attn.size() > 3)
         return invalid("grid arrays are empty or exceed their bounds");
     const auto base_count = g.kv.size() * g.ctx.size() * g.ubatch.size() * g.mtp.size() * g.flash_attn.size();
     if (base_count > 4096) return invalid("grid exceeds 4096 base candidate combinations");
-    if (g.spec_type.empty() || g.spec_type.size() > 4 || g.p_min.empty() || g.p_min.size() > 4)
+    if (g.spec_type.empty() || g.spec_type.size() > 7 || g.p_min.empty() || g.p_min.size() > 4)
         return invalid("spec_type and p_min arrays are empty or exceed their bounds");
     const auto spec_variants = g.spec_type.size() * g.p_min.size();
     if (g.kv.size() * g.ctx.size() * g.ubatch.size() * g.flash_attn.size() * (1 + (g.mtp.size() - 1) * spec_variants) > 16384)
         return invalid("grid exceeds 16384 candidate combinations");
     if (g.batch == 0 || g.batch > 8192) return invalid("batch must be in [1, 8192]");
-    const std::set<std::string> types{"q4_0", "q8_0", "q5_1", "f16", "bf16"};
+    const std::set<std::string> types{"q4_0", "q8_0", "q5_1", "q5_0", "q2_0", "pq2_0m", "f8_e4m3", "f16", "bf16"};
     std::set<std::pair<std::string, std::string>> pairs;
     for (const auto &pair : g.kv) {
         if (!types.contains(pair.k) || !types.contains(pair.v) || !pairs.emplace(pair.k, pair.v).second)
@@ -176,7 +328,7 @@ Status validate_grid(const Grid &g) {
         if (n < 32 || n > g.batch || !batches.insert(n).second)
             return invalid("ubatch must be unique, at least 32 and at most batch");
     for (auto n : g.mtp)
-        if (n > 3 || !drafts.insert(n).second) return invalid("mtp must contain unique integers in [0, 3]");
+        if (n > 16 || !drafts.insert(n).second) return invalid("mtp must contain unique integers in [0, 16]");
     if (!drafts.contains(0)) return invalid("mtp must include 0 for the non-speculative baseline");
     std::set<std::string> spec_types;
     for (const auto &type : g.spec_type)
@@ -202,7 +354,8 @@ Status validate_grid(const Grid &g) {
         !std::isfinite(p.min_p) || p.min_p < 0 || p.min_p > 1 ||
         (p.reasoning_format != "deepseek" && p.reasoning_format != "none"))
         return invalid("profile values are outside their bounds");
-    return validate_spill_guard(g.spill);
+    if (auto st = validate_spill_guard(g.spill); !st.ok()) return st;
+    return validate_spill_guard(g.spill_mtp);
 }
 Result<Grid> parse_grid(const json::Value &value) {
     if (!value.is_object()) return invalid("grid must be a JSON object");
@@ -488,7 +641,7 @@ std::string markdown(const Report &report) {
             << ", ctx " << m.candidate.ctx
             << ", ubatch " << m.candidate.ubatch << ", MTP " << m.candidate.mtp
             << ", spec_type " << (m.candidate.mtp == 0 ? "none" : m.candidate.spec_type);
-        if (uses_mtp(m.candidate)) out << ", p_min " << m.candidate.p_min;
+        if (uses_draft_p_min(m.candidate)) out << ", p_min " << m.candidate.p_min;
         out << ", " << std::fixed << std::setprecision(1) << *weighted_decode_tps(m.workloads)
             << " weighted decode tok/s.\n";
     };
@@ -507,7 +660,7 @@ std::string markdown(const Report &report) {
             << m.candidate.kv.v << " | " << m.candidate.flash_attn << " | " << m.candidate.ctx << " | "
             << m.candidate.ubatch << " | "
             << m.candidate.mtp << " | " << (m.candidate.mtp == 0 ? "none" : m.candidate.spec_type) << " | ";
-        if (uses_mtp(m.candidate)) out << m.candidate.p_min;
+        if (uses_draft_p_min(m.candidate)) out << m.candidate.p_min;
         else out << "-";
         out << " | ";
         number(m.shared_bytes, static_cast<double>(kMiB)); out << " | ";

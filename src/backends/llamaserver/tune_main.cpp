@@ -91,6 +91,29 @@ void write_output(const std::string &destination, const std::string &text, const
     std::filesystem::rename(temporary, target);
 #endif
 }
+std::optional<GpuDeviceInfo> select_primary_gpu(const std::vector<GpuDeviceInfo> &gpus) {
+    std::optional<std::size_t> best_discrete;
+    std::uint64_t best_discrete_mib = 0;
+    std::optional<std::size_t> best_uma;
+    std::uint64_t best_uma_mib = 0;
+    for (std::size_t i = 0; i < gpus.size(); ++i) {
+        const std::uint64_t mib = gpu_effective_vram_mib(gpus[i], false).value_or(0);
+        if (!gpus[i].is_integrated_uma) {
+            if (!best_discrete || mib > best_discrete_mib) {
+                best_discrete = i;
+                best_discrete_mib = mib;
+            }
+        } else {
+            if (!best_uma || mib > best_uma_mib) {
+                best_uma = i;
+                best_uma_mib = mib;
+            }
+        }
+    }
+    if (best_discrete) return gpus[*best_discrete];
+    if (best_uma) return gpus[*best_uma];
+    return std::nullopt;
+}
 } // namespace
 
 bool help_supports_spec_type(std::string_view help) {
@@ -116,11 +139,12 @@ int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostr
     };
     try {
         std::string error;
-        const auto parsed = cli::parse_command_args(cli::tune_command(), args, error);
+        const auto &spec = cli::tune_command();
+        const auto parsed = cli::parse_command_args(spec, args, error);
         // Match the CLI's help-wins convention even alongside malformed options.
         if ((parsed && parsed->help) || std::find(args.begin(), args.end(), "--help") != args.end() ||
             std::find(args.begin(), args.end(), "-h") != args.end()) {
-            out << cli::render_help(cli::kProgram, cli::tune_command());
+            out << cli::render_help(cli::kProgram, spec);
             return cli::kExitOk;
         }
         if (!parsed) return usage_error(error);
@@ -130,6 +154,16 @@ int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostr
         options.mmproj = parsed->get("mmproj").value_or("");
         options.out = parsed->get("out").value_or("tuned.json");
         options.thorough = parsed->has("thorough");
+        options.emit_adaptive_speculation = parsed->has("adaptive-speculation");
+        const bool auto_gpu = parsed->has("auto-gpu");
+        const bool is_ternary = parsed->has("ternary");
+        bool explicit_uma_mode = false;
+        if (auto uma_arg = parsed->get("uma-mode")) {
+            const auto parsed_uma = parse_uma_mode(*uma_arg);
+            if (!parsed_uma) return usage_error("--uma-mode must be auto, on, or off");
+            options.uma_mode = *parsed_uma;
+            explicit_uma_mode = true;
+        }
         if (options.executable.empty() || options.model.empty() || options.out.empty())
             return usage_error("--executable and --model are required; paths must not be empty");
         for (const auto *path : {&options.executable, &options.model, &options.mmproj, &options.out})
@@ -146,6 +180,8 @@ int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostr
         }
         if (auto status = validate_process_environment(options.environment); !status.ok()) return usage_error(status.message());
         if (auto grid_arg = parsed->get("grid")) {
+            if (auto_gpu || is_ternary)
+                return usage_error("--grid cannot be combined with --auto-gpu or --ternary");
             auto text = *grid_arg;
             const auto first = text.find_first_not_of(" \t\r\n");
             if (first == std::string::npos || text[first] != '{') {
@@ -159,6 +195,27 @@ int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostr
             auto grid = parse_grid(json.value());
             if (!grid.ok()) return usage_error(grid.status().message());
             options.grid = std::move(grid.value());
+        } else if (auto_gpu) {
+            const auto gpus = enumerate_gpu_devices();
+            if (const auto primary = select_primary_gpu(gpus)) {
+                options.grid = grid_for_gpu(*primary, is_ternary);
+                if (!explicit_uma_mode && primary->is_integrated_uma) {
+                    options.uma_mode = UmaMode::auto_detect;
+                }
+            } else {
+                options.grid = grid_for_gpu(GpuDeviceInfo{}, is_ternary);
+            }
+        } else if (is_ternary) {
+            options.grid = grid_for_gpu(GpuDeviceInfo{}, true);
+        }
+        if (explicit_uma_mode) {
+            if (options.uma_mode == UmaMode::on) {
+                options.grid.spill.uma_mode = true;
+                options.grid.spill_mtp.uma_mode = true;
+            } else if (options.uma_mode == UmaMode::off) {
+                options.grid.spill.uma_mode = false;
+                options.grid.spill_mtp.uma_mode = false;
+            }
         }
         if (parsed->has("dry-run")) {
             out << "# Planned calibration search space\n\n"
@@ -169,7 +226,7 @@ int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostr
             for (const auto &c : planned_candidates(options.grid, true)) {
                 out << "| " << c.kv.k << '/' << c.kv.v << " | " << c.flash_attn << " | " << c.ctx << " | "
                     << c.ubatch << " | " << c.mtp << " | " << (c.mtp == 0 ? "none" : c.spec_type) << " | ";
-                if (uses_mtp(c)) out << c.p_min;
+                if (uses_draft_p_min(c)) out << c.p_min;
                 else out << "-";
                 out << " |\n";
             }
@@ -219,7 +276,7 @@ int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostr
             err << "[tune] " << (phase == Phase::probe ? "probe " : "bench ") << c.kv.k << '/' << c.kv.v
                 << " fa=" << c.flash_attn << " ctx=" << c.ctx << " ubatch=" << c.ubatch << " mtp=" << c.mtp
                 << " spec_type=" << (c.mtp == 0 ? "none" : c.spec_type);
-            if (uses_mtp(c)) err << " p_min=" << c.p_min;
+            if (uses_draft_p_min(c)) err << " p_min=" << c.p_min;
             err << '\n';
             return run_candidate(options, c, phase, until, scratch.file("candidate.log"), dependencies);
         });

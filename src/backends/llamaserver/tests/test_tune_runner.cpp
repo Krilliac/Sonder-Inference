@@ -589,3 +589,130 @@ TEST_CASE("tune runner handles standalone ngram-mod drafts and ignores unused ne
         CHECK(result.detail == "mtp_tensors_ignored");
     }
 }
+
+TEST_CASE("tune runner UMA qualification checks host pool ceiling instead of discrete spill") {
+    const auto make_uma_counters = [](Fixture &f, std::uint64_t dedicated_mib, std::uint64_t shared_mib) {
+        return std::make_shared<FakeCounters>([&f, dedicated_mib, shared_mib](std::uint32_t pid) -> Result<GpuProcessCounters> {
+            std::lock_guard lock(f.state->mutex);
+            if (f.state->children.empty()) return GpuProcessCounters{};
+            const bool alive = f.state->children.back()->alive.load();
+            const auto instance = "pid_" + std::to_string(pid) + "_luid_uma";
+            return GpuProcessCounters{{{instance, alive ? dedicated_mib * kMiB : 0}},
+                                      {{instance, alive ? shared_mib * kMiB : 0}}};
+        });
+    };
+
+    // 1. 6 GiB shared on discrete mode is a spill, while UMA mode within 12 GiB pool is clean.
+    {
+        Fixture discrete;
+        discrete.dependencies.counters = make_uma_counters(discrete, 512, 6000);
+        CHECK(discrete.run().verdict == tune::Verdict::spill);
+
+        Fixture uma;
+        uma.options.uma_mode = tune::UmaMode::on;
+        uma.options.uma_pool_ceiling_bytes = 12288 * kMiB;
+        uma.dependencies.counters = make_uma_counters(uma, 512, 6000);
+        const auto res = uma.run();
+        REQUIRE_MESSAGE(res.verdict == tune::Verdict::clean, res.detail);
+        CHECK(res.dedicated_bytes == 512 * kMiB);
+        CHECK(res.shared_bytes == 6000 * kMiB);
+    }
+
+    // 2. UMA allocation exceeding the host-RAM pool ceiling (512 + 12000 > 12288 MiB) spills.
+    {
+        Fixture uma_over;
+        uma_over.options.uma_mode = tune::UmaMode::on;
+        uma_over.options.uma_pool_ceiling_bytes = 12288 * kMiB;
+        uma_over.dependencies.counters = make_uma_counters(uma_over, 512, 12000);
+        const auto res = uma_over.run();
+        CHECK(res.verdict == tune::Verdict::spill);
+        CHECK(res.memory_released);
+    }
+
+    // 3. UMA with 0 dedicated carveout and active shared allocation qualifies cleanly;
+    //    0 dedicated + 0 shared still stops as unsupported.
+    {
+        Fixture shared_only;
+        shared_only.options.uma_mode = tune::UmaMode::on;
+        shared_only.options.uma_pool_ceiling_bytes = 12288 * kMiB;
+        shared_only.dependencies.counters = make_uma_counters(shared_only, 0, 4096);
+        const auto res = shared_only.run();
+        REQUIRE_MESSAGE(res.verdict == tune::Verdict::clean, res.detail);
+        CHECK(res.shared_bytes == 4096 * kMiB);
+
+        Fixture zero_alloc;
+        zero_alloc.options.uma_mode = tune::UmaMode::on;
+        zero_alloc.options.uma_pool_ceiling_bytes = 12288 * kMiB;
+        zero_alloc.dependencies.counters = make_uma_counters(zero_alloc, 0, 0);
+        const auto zero_res = zero_alloc.run();
+        CHECK(zero_res.verdict == tune::Verdict::unsupported);
+        CHECK(zero_res.stop_search);
+    }
+
+    // 4. grid_for_gpu(APU) propagates spill.uma_mode and probes ctx=8192 safely within window.
+    {
+        GpuDeviceInfo apu;
+        apu.id = "gpu:0";
+        apu.name = "AMD Radeon 890M Graphics";
+        apu.vendor = GpuVendor::amd;
+        apu.dedicated_total = MemoryReading::known(512 * kMiB);
+        apu.shared_total = MemoryReading::known(16384 * kMiB);
+        apu.is_integrated_uma = true;
+
+        Fixture f;
+        f.options.grid = tune::grid_for_gpu(apu, true);
+        f.options.uma_pool_ceiling_bytes = 12288 * kMiB;
+        f.candidate = {{"q2_0", "q2_0"}, 8192, 512, 0, "draft-mtp", 0.0, "on"};
+        f.dependencies.counters = make_uma_counters(f, 512, 4096);
+        const auto res = f.run(tune::Phase::probe);
+        REQUIRE_MESSAGE(res.verdict == tune::Verdict::clean, res.detail);
+        CHECK(f.prompt_sizes == std::vector<std::size_t>{7168});
+    }
+
+    // 5. UmaMode::on with auto-detected live host ceiling allows 388 MiB shared (above discrete 256 MiB).
+    {
+        Fixture live_uma;
+        live_uma.options.uma_mode = tune::UmaMode::on;
+        live_uma.dependencies.counters = make_uma_counters(live_uma, 64, 388);
+        const auto res = live_uma.run(tune::Phase::probe);
+        REQUIRE_MESSAGE(res.verdict == tune::Verdict::clean, res.detail);
+    }
+
+    // 6. dflash / draft-dflash speculation with mtp=8 emits draft flags and ignores unused nextn log warnings.
+    for (const auto *spec_name : {"dflash", "draft-dflash"}) {
+        Fixture f;
+        f.candidate = {{"f8_e4m3", "f8_e4m3"}, 65536, 1024, 8, spec_name, 0.5, "on"};
+        const auto base_exchange = f.dependencies.exchange;
+        f.dependencies.exchange = [&](std::uint16_t port, const std::string &method, const std::string &path,
+                                      const json::Value &body, tune::Deadline deadline,
+                                      const CancellationToken &cancel) -> Result<json::Value> {
+            if (path == "/tokenize") {
+                std::ofstream log(f.log_path, std::ios::binary | std::ios::app);
+                log << "model has unused tensor blk.64.nextn.eh_proj.weight (size = 43008000 bytes) -- ignoring\n";
+            }
+            return base_exchange(port, method, path, body, deadline, cancel);
+        };
+        const auto res = f.run();
+        REQUIRE_MESSAGE(res.verdict == tune::Verdict::clean, res.detail);
+        REQUIRE(f.state->specs.size() == 1);
+        const auto &argv = f.state->specs[0].arguments;
+        const auto spec_it = std::find(argv.begin(), argv.end(), "--spec-type");
+        REQUIRE(spec_it != argv.end());
+        REQUIRE(std::next(spec_it) != argv.end());
+        CHECK(*std::next(spec_it) == spec_name);
+        const auto n_it = std::find(argv.begin(), argv.end(), "--spec-draft-n-max");
+        REQUIRE(n_it != argv.end());
+        REQUIRE(std::next(n_it) != argv.end());
+        CHECK(*std::next(n_it) == "8");
+    }
+
+    // 7. Missing draft activity for draft-dflash reports generalized speculative decoding error.
+    {
+        Fixture f;
+        f.candidate = {{"f8_e4m3", "f8_e4m3"}, 65536, 1024, 8, "draft-dflash", 0.5, "on"};
+        f.ignored_mtp = true;
+        const auto res = f.run();
+        CHECK(res.verdict == tune::Verdict::error);
+        CHECK(res.detail.find("speculative decoding requested") != std::string::npos);
+    }
+}

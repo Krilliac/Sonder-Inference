@@ -359,15 +359,26 @@ bool Scheduler::try_priority_preemption(StepPlan& plan, Budget& budget, const Se
     const int cand_rank = cand.base_rank;
     auto order = sorted_running_best_first();
     std::vector<RequestId> victims;
+    constexpr BlockCount kMaxBlocks = std::numeric_limits<BlockCount>::max();
+    const auto saturating_add = [](BlockCount a, BlockCount b) noexcept -> BlockCount {
+        constexpr BlockCount kMax = std::numeric_limits<BlockCount>::max();
+        return a > kMax - b ? kMax : a + b;
+    };
+    const BlockCount deficit = kv_.over_budget_blocks();
+    // If need + watermark + over-budget deficit exceeds BlockCount::max(), no
+    // valid set of releases can make the candidate fit; preempt nothing.
+    if (need > kMaxBlocks - config_.admission_watermark_blocks) return false;
+    const BlockCount required_free = need + config_.admission_watermark_blocks;
+    if (required_free > kMaxBlocks - deficit) return false;
+    const BlockCount target = required_free + deficit;
     BlockCount freeable = kv_.free_blocks();
-    const BlockCount target = need + config_.admission_watermark_blocks;
     for (auto it = order.rbegin(); it != order.rend() && freeable < target; ++it) {
         const Sequence& v = seqs_.at(*it);
         // A request admitted earlier in this pass (including a starving one) must not be evicted again.
         if (std::find(plan.admitted.begin(), plan.admitted.end(), *it) != plan.admitted.end()) continue;
         if (running_rank(v) - cand_rank < config_.priority_preemption_min_rank_gap) break;
         victims.push_back(*it);
-        freeable += kv_.blocks_held(*it);
+        freeable = saturating_add(freeable, kv_.blocks_held(*it));
     }
     if (freeable < target) return false;  // would not help; preempt nothing
     for (RequestId v : victims) {
