@@ -12,6 +12,7 @@
 
 #include "gpu_memory.hpp"
 #include "process.hpp"
+#include "sonder/inference/device.hpp"
 #include "sonder/inference/json.hpp"
 
 namespace sonder::inference::llamaserver::tune {
@@ -60,6 +61,10 @@ struct Grid {
     SpillGuardOptions spill_mtp;
     Grid();
 };
+enum class UmaMode { off, on, auto_detect };
+const char *to_string(UmaMode mode) noexcept;
+std::optional<UmaMode> parse_uma_mode(std::string_view text) noexcept;
+
 struct Options {
     std::string executable;
     std::string model;
@@ -70,6 +75,10 @@ struct Options {
     std::chrono::milliseconds budget{std::chrono::minutes(20)};
     bool thorough = false;
     bool spec_type_supported = false; // set only after the executable's --help
+    UmaMode uma_mode = UmaMode::off;
+    bool emit_adaptive_speculation = false;
+    // Optional UMA host-RAM pool ceiling override in bytes (0 = auto-detect from host RAM and UMA GPU pool).
+    std::uint64_t uma_pool_ceiling_bytes = 0;
 };
 struct Candidate {
     KvPair kv;
@@ -90,8 +99,16 @@ struct Candidate {
     }
 };
 // True when `candidate` uses multi-token prediction weights/buffers
-// (draft-mtp or draft-mtp,ngram-mod), as opposed to baseline or standalone ngram-mod.
+// (draft-mtp or draft-mtp,ngram-mod), as opposed to baseline, standalone
+// ngram-mod, or external/diffusion draft speculation.
 inline bool uses_mtp(const Candidate &candidate) noexcept {
+    return candidate.mtp != 0 &&
+           (candidate.spec_type == "draft-mtp" || candidate.spec_type == "draft-mtp,ngram-mod");
+}
+// True when `candidate` uses draft-probability speculation flags
+// (`--spec-draft-n-max` / `--spec-draft-p-min`), i.e. any non-zero draft
+// length except standalone `ngram-mod`.
+inline bool uses_draft_p_min(const Candidate &candidate) noexcept {
     return candidate.mtp != 0 && candidate.spec_type != "ngram-mod";
 }
 // The spill rule that applies to `candidate` (spill_mtp when it uses MTP).
@@ -155,6 +172,11 @@ class Bisection {
 
 Status validate_grid(const Grid &grid);
 Result<Grid> parse_grid(const json::Value &value);
+Grid grid_for_gpu(const GpuDeviceInfo &gpu, bool is_ternary = false);
+bool resolve_tune_uma_mode(UmaMode mode, const std::vector<GpuDeviceInfo> &gpus,
+                           const std::vector<std::string> &args = {}) noexcept;
+std::optional<std::uint64_t> uma_pool_ceiling_bytes(const HostMemory &host,
+                                                    const std::vector<GpuDeviceInfo> &gpus = {}) noexcept;
 std::vector<Candidate> planned_candidates(const Grid &grid, bool mtp_available);
 std::optional<std::uint64_t> margin_context(std::uint64_t measured_edge);
 std::vector<std::string> arguments(const Options &options, const Candidate &candidate);

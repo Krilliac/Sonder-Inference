@@ -1,5 +1,6 @@
 #include "../tune.hpp"
 #include "../tune_model.hpp"
+#include "../adaptive_speculation.hpp"
 #include "../log_diagnostics.hpp"
 #include <doctest/doctest.h>
 #include <algorithm>
@@ -78,7 +79,7 @@ TEST_CASE("tune default grid and capability gate are bounded") {
 TEST_CASE("tune grid rejects typos fractions duplicate contexts and unbounded work") {
     for (const auto *text : {R"({"unknown":1})", R"({"ctx":[]})", R"({"ctx":[32768,32768]})",
             R"({"ctx":[65536,32768]})", R"({"ctx":[32769]})", R"({"ctx":[32768.5]})",
-            R"({"ctx":[9223372036854775808]})", R"({"mtp":[1,2]})", R"({"mtp":[0,4]})",
+            R"({"ctx":[9223372036854775808]})", R"({"mtp":[1,2]})", R"({"mtp":[0,17]})",
             R"({"ubatch":[4096],"batch":2048})", R"({"kv":[["made_up","q4_0"]]})",
             R"({"spill_threshold_mib":0})", R"({"batch":-1})", R"({"ubatch":[512,512]})"}) {
         CAPTURE(text);
@@ -763,5 +764,414 @@ TEST_CASE("tune GGUF scanner detects nextn_predict_layers metadata and prism.had
         REQUIRE_MESSAGE(info.ok(), info.status().message());
         CHECK(info.value().prism_hadamard);
         CHECK_FALSE(info.value().has_nextn);
+    }
+}
+
+TEST_CASE("tune accepts expanded KV types extended mtp range and dflash or draft spec types") {
+    auto parsed = json::parse(
+        R"({"kv":[["f8_e4m3","f8_e4m3"],["q5_0","q5_0"],["q2_0","q2_0"],["pq2_0m","pq2_0m"]],)"
+        R"("ctx":[8192,16384],"ubatch":[512],"mtp":[0,4,8,16],)"
+        R"("spec_type":["draft-mtp","draft-mtp,ngram-mod","ngram-mod","dflash","draft-dflash","draft","draft-simple"],"p_min":[0.0,0.5]})");
+    REQUIRE(parsed.ok());
+    auto grid_res = tune::parse_grid(parsed.value());
+    REQUIRE_MESSAGE(grid_res.ok(), grid_res.status().message());
+    const auto &grid = grid_res.value();
+    CHECK(grid.kv.size() == 4);
+    CHECK(grid.ctx == std::vector<std::uint64_t>{8192, 16384});
+    CHECK(grid.mtp == std::vector<std::uint32_t>{0, 4, 8, 16});
+    CHECK(grid.spec_type.size() == 7);
+
+    // Non-MTP models still plan standalone ngram-mod, dflash/draft-dflash, and draft/draft-simple without requiring nextn tensors.
+    const auto planned_no_mtp = tune::planned_candidates(grid, false);
+    CHECK(std::any_of(planned_no_mtp.begin(), planned_no_mtp.end(), [](const auto &c) {
+        return c.mtp == 8 && c.spec_type == "dflash" && c.p_min == 0.5;
+    }));
+    CHECK(std::any_of(planned_no_mtp.begin(), planned_no_mtp.end(), [](const auto &c) {
+        return c.mtp == 8 && c.spec_type == "draft-dflash" && c.p_min == 0.5;
+    }));
+    CHECK(std::any_of(planned_no_mtp.begin(), planned_no_mtp.end(), [](const auto &c) {
+        return c.mtp == 16 && c.spec_type == "draft" && c.p_min == 0.0;
+    }));
+    CHECK(std::any_of(planned_no_mtp.begin(), planned_no_mtp.end(), [](const auto &c) {
+        return c.mtp == 16 && c.spec_type == "draft-simple" && c.p_min == 0.0;
+    }));
+    CHECK(std::any_of(planned_no_mtp.begin(), planned_no_mtp.end(), [](const auto &c) {
+        return c.mtp == 8 && c.spec_type == "ngram-mod";
+    }));
+    CHECK(std::none_of(planned_no_mtp.begin(), planned_no_mtp.end(), [](const auto &c) {
+        return c.mtp != 0 && (c.spec_type == "draft-mtp" || c.spec_type == "draft-mtp,ngram-mod");
+    }));
+
+    // Quantized / FP8 V caches still reject flash_attn=off alone; out-of-range mtp/spec_type rejected.
+    for (const auto *bad_json : {
+             R"({"kv":[["f8_e4m3","f8_e4m3"]],"flash_attn":["off"]})",
+             R"({"kv":[["q2_0","q2_0"]],"flash_attn":["off"]})",
+             R"({"kv":[["pq2_0m","pq2_0m"]],"flash_attn":["off"]})",
+             R"({"kv":[["q5_0","q5_0"]],"flash_attn":["off"]})",
+             R"({"mtp":[0,17]})",
+             R"({"spec_type":["unknown-spec"]})",
+         }) {
+        CAPTURE(bad_json);
+        const auto bad = json::parse(bad_json);
+        REQUIRE(bad.ok());
+        CHECK_FALSE(tune::parse_grid(bad.value()).ok());
+    }
+
+    const tune::Candidate dflash_cand{{"q2_0", "q2_0"}, 8192, 512, 8, "dflash", 0.5, "on"};
+    const tune::Candidate draft_dflash_cand{{"q2_0", "q2_0"}, 8192, 512, 8, "draft-dflash", 0.5, "on"};
+    const tune::Candidate draft_cand{{"f8_e4m3", "f8_e4m3"}, 16384, 512, 8, "draft", 0.25, "on"};
+    const tune::Candidate draft_simple_cand{{"f8_e4m3", "f8_e4m3"}, 16384, 512, 8, "draft-simple", 0.25, "on"};
+    const tune::Candidate ngram_cand{{"pq2_0m", "pq2_0m"}, 8192, 512, 8, "ngram-mod", 0.0, "on"};
+    CHECK_FALSE(tune::uses_mtp(dflash_cand));
+    CHECK_FALSE(tune::uses_mtp(draft_dflash_cand));
+    CHECK_FALSE(tune::uses_mtp(draft_cand));
+    CHECK_FALSE(tune::uses_mtp(draft_simple_cand));
+    CHECK(tune::uses_draft_p_min(dflash_cand));
+    CHECK(tune::uses_draft_p_min(draft_dflash_cand));
+    CHECK(tune::uses_draft_p_min(draft_cand));
+    CHECK(tune::uses_draft_p_min(draft_simple_cand));
+    CHECK_FALSE(tune::uses_draft_p_min(ngram_cand));
+    CHECK(&tune::spill_guard_for(grid, dflash_cand) == &grid.spill);
+    CHECK(&tune::spill_guard_for(grid, draft_dflash_cand) == &grid.spill);
+    CHECK(&tune::spill_guard_for(grid, draft_cand) == &grid.spill);
+    CHECK(&tune::spill_guard_for(grid, draft_simple_cand) == &grid.spill);
+
+    tune::Options options;
+    options.model = "bonsai.gguf";
+    options.grid = grid;
+    const auto flag_val = [](const std::vector<std::string> &argv, const std::string &flag) -> std::string {
+        const auto it = std::find(argv.begin(), argv.end(), flag);
+        if (it != argv.end() && std::next(it) != argv.end()) return *std::next(it);
+        return {};
+    };
+    const auto dflash_argv = tune::arguments(options, dflash_cand);
+    CHECK(flag_val(dflash_argv, "--spec-type") == "dflash");
+    CHECK(flag_val(dflash_argv, "--spec-draft-n-max") == "8");
+    CHECK(flag_val(dflash_argv, "--spec-draft-p-min") == "0.500000");
+    const auto draft_dflash_argv = tune::arguments(options, draft_dflash_cand);
+    CHECK(flag_val(draft_dflash_argv, "--spec-type") == "draft-dflash");
+    CHECK(flag_val(draft_dflash_argv, "--spec-draft-n-max") == "8");
+    CHECK(flag_val(draft_dflash_argv, "--spec-draft-p-min") == "0.500000");
+    const auto draft_simple_argv = tune::arguments(options, draft_simple_cand);
+    CHECK(flag_val(draft_simple_argv, "--spec-type") == "draft-simple");
+    CHECK(flag_val(draft_simple_argv, "--spec-draft-n-max") == "8");
+    CHECK(flag_val(draft_simple_argv, "--spec-draft-p-min") == "0.250000");
+    const auto ngram_argv = tune::arguments(options, ngram_cand);
+    CHECK(flag_val(ngram_argv, "--spec-type") == "ngram-mod");
+    CHECK(flag_val(ngram_argv, "--spec-ngram-mod-n-max") == "8");
+}
+
+TEST_CASE("tune grid_for_gpu selects vendor VRAM UMA and ternary presets") {
+    constexpr std::uint64_t kGiB = 1024ull * kMiB;
+    const auto has_kv = [](const tune::Grid &g, const std::string &k, const std::string &v) {
+        return std::find(g.kv.begin(), g.kv.end(), tune::KvPair{k, v}) != g.kv.end();
+    };
+    const auto has_spec = [](const tune::Grid &g, const std::string &spec) {
+        return std::find(g.spec_type.begin(), g.spec_type.end(), spec) != g.spec_type.end();
+    };
+
+    // 1. NVIDIA RTX 5070 Ti 16 GiB (Blackwell/Ada discrete)
+    GpuDeviceInfo rtx;
+    rtx.id = "gpu:0";
+    rtx.name = "NVIDIA GeForce RTX 5070 Ti";
+    rtx.vendor = GpuVendor::nvidia;
+    rtx.dedicated_total = MemoryReading::known(16ull * kGiB);
+    rtx.is_integrated_uma = false;
+    const auto rtx_grid = tune::grid_for_gpu(rtx, false);
+    REQUIRE_MESSAGE(tune::validate_grid(rtx_grid).ok(), tune::validate_grid(rtx_grid).message());
+    CHECK(has_kv(rtx_grid, "f8_e4m3", "f8_e4m3"));
+    CHECK(has_kv(rtx_grid, "q8_0", "q8_0"));
+    CHECK(has_kv(rtx_grid, "q8_0", "q4_0"));
+    CHECK(has_kv(rtx_grid, "q4_0", "q4_0"));
+    CHECK_FALSE(has_kv(rtx_grid, "q2_0", "q2_0"));
+    CHECK(rtx_grid.ctx.front() == 32768);
+    CHECK(rtx_grid.ctx.back() == 139264);
+    CHECK_FALSE(rtx_grid.spill.uma_mode);
+
+    const auto rtx_ternary = tune::grid_for_gpu(rtx, true);
+    REQUIRE_MESSAGE(tune::validate_grid(rtx_ternary).ok(), tune::validate_grid(rtx_ternary).message());
+    CHECK(has_kv(rtx_ternary, "f8_e4m3", "f8_e4m3"));
+    CHECK(has_kv(rtx_ternary, "q2_0", "q2_0"));
+    CHECK(rtx_ternary.kv.size() <= 8);
+    CHECK(has_spec(rtx_ternary, "ngram-mod"));
+
+    // 2. AMD RX 9070 XT 16 GiB discrete (no unsupported FP8 KV)
+    GpuDeviceInfo rx_xt;
+    rx_xt.id = "gpu:0";
+    rx_xt.name = "AMD Radeon RX 9070 XT";
+    rx_xt.vendor = GpuVendor::amd;
+    rx_xt.dedicated_total = MemoryReading::known(16ull * kGiB);
+    rx_xt.is_integrated_uma = false;
+    const auto xt_grid = tune::grid_for_gpu(rx_xt, false);
+    REQUIRE_MESSAGE(tune::validate_grid(xt_grid).ok(), tune::validate_grid(xt_grid).message());
+    CHECK_FALSE(has_kv(xt_grid, "f8_e4m3", "f8_e4m3"));
+    CHECK(has_kv(xt_grid, "q8_0", "q8_0"));
+    CHECK(has_kv(xt_grid, "q8_0", "q4_0"));
+    CHECK(has_kv(xt_grid, "q4_0", "q4_0"));
+    CHECK(has_kv(xt_grid, "f16", "f16"));
+    CHECK(xt_grid.ctx.front() == 32768);
+    CHECK_FALSE(xt_grid.spill.uma_mode);
+
+    const auto xt_ternary = tune::grid_for_gpu(rx_xt, true);
+    REQUIRE_MESSAGE(tune::validate_grid(xt_ternary).ok(), tune::validate_grid(xt_ternary).message());
+    CHECK_FALSE(has_kv(xt_ternary, "f8_e4m3", "f8_e4m3"));
+    CHECK(has_kv(xt_ternary, "q2_0", "q2_0"));
+    CHECK(has_spec(xt_ternary, "ngram-mod"));
+
+    // 3. AMD Ryzen APU (Unified Memory / UMA)
+    GpuDeviceInfo apu;
+    apu.id = "gpu:0";
+    apu.name = "AMD Radeon 780M Graphics";
+    apu.vendor = GpuVendor::amd;
+    apu.dedicated_total = MemoryReading::known(512ull * kMiB);
+    apu.shared_total = MemoryReading::known(16ull * kGiB);
+    apu.is_integrated_uma = true;
+    const auto apu_grid = tune::grid_for_gpu(apu, false);
+    REQUIRE_MESSAGE(tune::validate_grid(apu_grid).ok(), tune::validate_grid(apu_grid).message());
+    CHECK(apu_grid.ctx.front() == 8192);
+    CHECK(apu_grid.ctx.back() == 65536);
+    CHECK(apu_grid.ctx.size() == 15);
+    CHECK(apu_grid.ubatch == std::vector<std::uint32_t>{256, 512, 1024});
+    CHECK(apu_grid.kv == std::vector<tune::KvPair>{{"q8_0", "q8_0"}, {"q4_0", "q4_0"}});
+    CHECK(apu_grid.spill.uma_mode);
+    CHECK(apu_grid.spill_mtp.uma_mode);
+
+    const auto apu_ternary = tune::grid_for_gpu(apu, true);
+    REQUIRE_MESSAGE(tune::validate_grid(apu_ternary).ok(), tune::validate_grid(apu_ternary).message());
+    CHECK(has_kv(apu_ternary, "q2_0", "q2_0"));
+    CHECK(has_spec(apu_ternary, "ngram-mod"));
+    CHECK(apu_ternary.spill.uma_mode);
+
+    // 4. Low-VRAM 8 GiB discrete GPUs (RTX 4060 & RX 7600)
+    GpuDeviceInfo rtx_8g;
+    rtx_8g.id = "gpu:0";
+    rtx_8g.name = "NVIDIA GeForce RTX 4060";
+    rtx_8g.vendor = GpuVendor::nvidia;
+    rtx_8g.dedicated_total = MemoryReading::known(8ull * kGiB);
+    rtx_8g.is_integrated_uma = false;
+    const auto rtx_8g_grid = tune::grid_for_gpu(rtx_8g, false);
+    REQUIRE_MESSAGE(tune::validate_grid(rtx_8g_grid).ok(), tune::validate_grid(rtx_8g_grid).message());
+    CHECK(rtx_8g_grid.ctx.front() == 8192);
+    CHECK(rtx_8g_grid.ctx.back() == 65536);
+    CHECK(has_kv(rtx_8g_grid, "f8_e4m3", "f8_e4m3"));
+    CHECK_FALSE(rtx_8g_grid.spill.uma_mode);
+
+    GpuDeviceInfo rx_8g;
+    rx_8g.id = "gpu:0";
+    rx_8g.name = "AMD Radeon RX 7600";
+    rx_8g.vendor = GpuVendor::amd;
+    rx_8g.dedicated_total = MemoryReading::known(8ull * kGiB);
+    rx_8g.is_integrated_uma = false;
+    const auto rx_8g_grid = tune::grid_for_gpu(rx_8g, false);
+    REQUIRE_MESSAGE(tune::validate_grid(rx_8g_grid).ok(), tune::validate_grid(rx_8g_grid).message());
+    CHECK(rx_8g_grid.ctx.front() == 8192);
+    CHECK(rx_8g_grid.ctx.back() == 65536);
+    CHECK_FALSE(has_kv(rx_8g_grid, "f8_e4m3", "f8_e4m3"));
+
+    // 5. UMA mode parsing, resolution, and host-RAM pool ceiling helpers
+    CHECK(tune::parse_uma_mode("off") == tune::UmaMode::off);
+    CHECK(tune::parse_uma_mode("on") == tune::UmaMode::on);
+    CHECK(tune::parse_uma_mode("auto") == tune::UmaMode::auto_detect);
+    CHECK_FALSE(tune::parse_uma_mode("bogus").has_value());
+    CHECK(std::string(tune::to_string(tune::UmaMode::off)) == "off");
+    CHECK(std::string(tune::to_string(tune::UmaMode::on)) == "on");
+    CHECK(std::string(tune::to_string(tune::UmaMode::auto_detect)) == "auto");
+
+    CHECK(tune::resolve_tune_uma_mode(tune::UmaMode::on, {rtx}));
+    CHECK_FALSE(tune::resolve_tune_uma_mode(tune::UmaMode::off, {apu}));
+    CHECK(tune::resolve_tune_uma_mode(tune::UmaMode::auto_detect, {apu}));
+    CHECK_FALSE(tune::resolve_tune_uma_mode(tune::UmaMode::auto_detect, {rtx, apu}));
+    CHECK_FALSE(tune::resolve_tune_uma_mode(tune::UmaMode::auto_detect, {}));
+    GpuDeviceInfo apu_second = apu;
+    apu_second.id = "gpu:1";
+    CHECK(tune::resolve_tune_uma_mode(tune::UmaMode::auto_detect, {rtx, apu_second}, {"--device", "gpu:1"}));
+
+    HostMemory host;
+    host.total_physical = MemoryReading::known(32ull * kGiB);
+    host.available_physical = MemoryReading::known(24ull * kGiB);
+    const auto apu_cap = tune::uma_pool_ceiling_bytes(host, {apu});
+    REQUIRE(apu_cap.has_value());
+    // GPU pool (512 MiB + 16 GiB = 16.5 GiB) is tighter than host ceiling (24 GiB - 2 GiB = 22 GiB).
+    CHECK(*apu_cap == 512ull * kMiB + 16ull * kGiB);
+
+    HostMemory tight_host;
+    tight_host.total_physical = MemoryReading::known(16ull * kGiB);
+    tight_host.available_physical = MemoryReading::known(10ull * kGiB);
+    const auto tight_cap = tune::uma_pool_ceiling_bytes(tight_host, {apu});
+    REQUIRE(tight_cap.has_value());
+    // Host ceiling (10 GiB - 2 GiB = 8 GiB) caps the 16.5 GiB GPU pool.
+    CHECK(*tight_cap == 8ull * kGiB);
+
+    HostMemory zero_host;
+    zero_host.available_physical = MemoryReading::known(0);
+    const auto zero_cap = tune::uma_pool_ceiling_bytes(zero_host, {apu});
+    REQUIRE(zero_cap.has_value());
+    CHECK(*zero_cap == 0);
+
+    // Zero-sized UMA GPU pools (0 dedicated + 0 shared) are skipped rather than clamping host ceiling to 0.
+    GpuDeviceInfo empty_uma = apu;
+    empty_uma.dedicated_total = MemoryReading::known(0);
+    empty_uma.shared_total = MemoryReading::known(0);
+    const auto skipped_zero_gpu = tune::uma_pool_ceiling_bytes(host, {empty_uma});
+    REQUIRE(skipped_zero_gpu.has_value());
+    CHECK(*skipped_zero_gpu == 22ull * kGiB);
+    CHECK_FALSE(tune::uma_pool_ceiling_bytes(HostMemory{}, {empty_uma}).has_value());
+
+    CHECK_FALSE(tune::uma_pool_ceiling_bytes(HostMemory{}, {}).has_value());
+}
+
+TEST_CASE("tune spawn_config emits uma_mode and adaptive_speculation only when configured") {
+    tune::Options options;
+    options.executable = "C:/bin/llama-server.exe";
+    options.model = "C:/models/bonsai.gguf";
+
+    // Default options omit both spill_guard.uma_mode and adaptive_speculation.
+    {
+        tune::Report report;
+        report.results = {clean({{"q4_0", "q4_0"}, 73728, 1024, 2})};
+        tune::rank(report);
+        const auto doc = tune::report_json(options, report);
+        const auto *guard = doc.find("spill_guard");
+        REQUIRE(guard != nullptr);
+        CHECK(guard->find("uma_mode") == nullptr);
+        CHECK(doc.find("adaptive_speculation") == nullptr);
+    }
+
+    // UmaMode::on emits boolean true; UmaMode::auto_detect emits string "auto".
+    for (const auto mode : {tune::UmaMode::on, tune::UmaMode::auto_detect}) {
+        tune::Options uma_opts = options;
+        uma_opts.uma_mode = mode;
+        tune::Report report;
+        report.results = {clean({{"q4_0", "q4_0"}, 65536, 512, 0})};
+        tune::rank(report);
+        const auto doc = tune::report_json(uma_opts, report);
+        const auto *guard = doc.find("spill_guard");
+        REQUIRE(guard != nullptr);
+        const auto *uma_val = guard->find("uma_mode");
+        REQUIRE(uma_val != nullptr);
+        if (mode == tune::UmaMode::on) {
+            CHECK(uma_val->is_bool());
+            CHECK(uma_val->as_bool());
+        } else {
+            CHECK(uma_val->is_string());
+            CHECK(uma_val->as_string() == "auto");
+        }
+#if defined(SONDER_HAS_SERVER)
+        const std::string tag = mode == tune::UmaMode::on ? "-on" : "-auto";
+        const auto path = std::filesystem::temp_directory_path() /
+            ("sonder-tune-uma-" + std::to_string(tune::Clock::now().time_since_epoch().count()) + tag + ".json");
+        struct Cleanup { std::filesystem::path p; ~Cleanup() { std::error_code ec; std::filesystem::remove(p, ec); } } cleanup{path};
+        { std::ofstream file(path, std::ios::binary); file << doc.dump(); }
+        BackendSetup setup;
+        auto loaded = load_llamaserver_config(path.string(), setup);
+        REQUIRE_MESSAGE(loaded.ok(), loaded.message());
+        CHECK(setup.llamaserver_spill_uma_mode == (mode == tune::UmaMode::on ? "on" : "auto"));
+#endif
+    }
+
+    // C++ callers setting options.grid = grid_for_gpu(apu) emit spill_guard.uma_mode = true
+    // even when options.uma_mode remains at its default UmaMode::off.
+    {
+        GpuDeviceInfo apu;
+        apu.id = "gpu:0";
+        apu.name = "AMD Radeon 890M Graphics";
+        apu.vendor = GpuVendor::amd;
+        apu.dedicated_total = MemoryReading::known(512ull * kMiB);
+        apu.shared_total = MemoryReading::known(16384ull * kMiB);
+        apu.is_integrated_uma = true;
+
+        tune::Options apu_opts = options;
+        apu_opts.grid = tune::grid_for_gpu(apu, false);
+        tune::Report report;
+        report.results = {clean({{"q4_0", "q4_0"}, 65536, 512, 0})};
+        tune::rank(report);
+        const auto doc = tune::report_json(apu_opts, report);
+        const auto *guard = doc.find("spill_guard");
+        REQUIRE(guard != nullptr);
+        const auto *uma_val = guard->find("uma_mode");
+        REQUIRE(uma_val != nullptr);
+        CHECK(uma_val->is_bool());
+        CHECK(uma_val->as_bool());
+    }
+
+    // emit_adaptive_speculation emits valid schema only when candidate.mtp > 0.
+    tune::Options spec_opts = options;
+    spec_opts.emit_adaptive_speculation = true;
+    {
+        tune::Report report;
+        report.results = {clean({{"q4_0", "q4_0"}, 65536, 512, 0})};
+        tune::rank(report);
+        const auto doc = tune::report_json(spec_opts, report);
+        CHECK(doc.find("adaptive_speculation") == nullptr);
+    }
+    for (const std::uint32_t mtp : {1u, 2u, 8u}) {
+        CAPTURE(mtp);
+        tune::Report report;
+        report.results = {clean({{"q4_0", "q4_0"}, 65536, 512, mtp, mtp == 8u ? "dflash" : "draft-mtp", 0.5})};
+        tune::rank(report);
+        const auto doc = tune::report_json(spec_opts, report);
+        const auto *spec = doc.find("adaptive_speculation");
+        REQUIRE(spec != nullptr);
+        REQUIRE(spec->is_object());
+        CHECK(spec->as_object().size() == 5);
+        CHECK(spec->find("enabled")->as_bool());
+        CHECK(spec->find("min_draft_n")->as_uint() == 0);
+        CHECK(spec->find("initial_draft_n")->as_uint() == mtp);
+        CHECK(spec->find("max_draft_n")->as_uint() == std::max<std::uint32_t>(mtp, 4u));
+        CHECK(spec->find("probe_draft_n")->as_uint() == std::min<std::uint32_t>(mtp, 2u));
+
+        AdaptiveSpeculationConfig cfg;
+        cfg.enabled = spec->find("enabled")->as_bool();
+        cfg.min_draft_n = static_cast<std::uint32_t>(spec->find("min_draft_n")->as_uint());
+        cfg.initial_draft_n = static_cast<std::uint32_t>(spec->find("initial_draft_n")->as_uint());
+        cfg.max_draft_n = static_cast<std::uint32_t>(spec->find("max_draft_n")->as_uint());
+        cfg.probe_draft_n = static_cast<std::uint32_t>(spec->find("probe_draft_n")->as_uint());
+        CHECK(validate_adaptive_speculation_config(cfg).ok());
+    }
+}
+
+TEST_CASE("tune CLI accepts auto-gpu ternary uma-mode and adaptive-speculation flags") {
+    std::ostringstream out, err;
+    CHECK(tune::tune_main({"--help"}, out, err) == 0);
+    CHECK(out.str().find("--auto-gpu") != std::string::npos);
+    CHECK(out.str().find("--ternary") != std::string::npos);
+    CHECK(out.str().find("--uma-mode") != std::string::npos);
+    CHECK(out.str().find("--adaptive-speculation") != std::string::npos);
+
+    out.str("");
+    err.str("");
+    CHECK(tune::tune_main({"--executable", "does-not-exist.exe", "--model", "absent.gguf",
+                           "--ternary", "--dry-run"}, out, err) == 0);
+    CHECK(out.str().find("q2_0/q2_0") != std::string::npos);
+    CHECK(out.str().find("ngram-mod") != std::string::npos);
+    CHECK(err.str().empty());
+
+    out.str("");
+    err.str("");
+    CHECK(tune::tune_main({"--executable", "does-not-exist.exe", "--model", "absent.gguf",
+                           "--auto-gpu", "--uma-mode", "auto", "--adaptive-speculation", "--dry-run"}, out, err) == 0);
+    CHECK(err.str().empty());
+
+    for (const auto *mode : {"on", "off"}) {
+        out.str("");
+        err.str("");
+        CHECK(tune::tune_main({"--executable", "does-not-exist.exe", "--model", "absent.gguf",
+                               "--uma-mode", mode, "--dry-run"}, out, err) == 0);
+        CHECK(err.str().empty());
+    }
+
+    out.str("");
+    err.str("");
+    CHECK(tune::tune_main({"--executable", "does-not-exist.exe", "--model", "absent.gguf",
+                           "--uma-mode", "invalid", "--dry-run"}, out, err) == 2);
+
+    // Combining --grid with --auto-gpu or --ternary is rejected with a usage error.
+    for (const auto *conflict_flag : {"--auto-gpu", "--ternary"}) {
+        out.str("");
+        err.str("");
+        CHECK(tune::tune_main({"--executable", "does-not-exist.exe", "--model", "absent.gguf",
+                               "--grid", R"({"kv":[["q4_0","q4_0"]],"ctx":[65536],"ubatch":[512],"mtp":[0]})",
+                               conflict_flag, "--dry-run"}, out, err) == 2);
+        CHECK(err.str().find("--grid cannot be combined") != std::string::npos);
     }
 }

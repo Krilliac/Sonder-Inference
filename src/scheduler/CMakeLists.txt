@@ -22,7 +22,8 @@ set(SONDER_SCHEDULER_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/simulator.cpp)
 set(SONDER_SCHEDULER_TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/scheduler_unit_tests.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests/scheduler_sim_tests.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/scheduler_sim_tests.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/kv_capacity_tests.cpp)
 
 if(TARGET sonder_inference AND COMMAND sonder_module_sources)
     # ---- Integrated into the Sonder Inference root project ----

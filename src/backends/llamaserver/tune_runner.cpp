@@ -10,6 +10,7 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <thread>
 
@@ -309,7 +310,7 @@ Status decode_workload(const Exchange &exchange, std::uint16_t port, const Decod
         timings.cached_tokens != 0 || timings.prompt_ns == 0 || timings.eval_ns == 0)
         return {ErrorCode::protocol_error, "chat workload was cached or did not return positive bounded timings"};
     if (spec_mode == SpecMode::mtp && (!timings.draft_present || timings.draft_tokens == 0 || !timings.draft_accepted_present))
-        return {ErrorCode::protocol_error, "MTP requested but draft activity and acceptance were not measured"};
+        return {ErrorCode::protocol_error, "speculative decoding requested but draft activity and acceptance were not measured"};
     if (spec_mode == SpecMode::ngram && timings.draft_tokens > 0 && !timings.draft_accepted_present)
         return {ErrorCode::protocol_error, "ngram-mod produced drafts without acceptance counts"};
     if (spec_mode == SpecMode::none && (timings.draft_tokens != 0 || timings.draft_accepted_tokens != 0))
@@ -359,6 +360,29 @@ Measurement run_candidate(const Options &o, const Candidate &candidate, Phase ph
     supervisor_options.health_check = [&](std::uint16_t port, std::chrono::milliseconds timeout) {
         return exchange(port, "GET", "/health", {}, std::min(deadline, Clock::now() + timeout), token).ok();
     };
+    SpillGuardOptions effective_spill = spill_guard_for(o.grid, candidate);
+    std::vector<GpuDeviceInfo> detected_gpus;
+    bool gpus_queried = false;
+    const auto ensure_gpus = [&]() -> const std::vector<GpuDeviceInfo> & {
+        if (!gpus_queried) {
+            detected_gpus = enumerate_gpu_devices();
+            gpus_queried = true;
+        }
+        return detected_gpus;
+    };
+    if (o.uma_mode == UmaMode::on) {
+        effective_spill.uma_mode = true;
+    } else if (o.uma_mode == UmaMode::auto_detect) {
+        effective_spill.uma_mode = resolve_tune_uma_mode(o.uma_mode, ensure_gpus(), supervisor_options.arguments);
+    }
+    std::optional<std::uint64_t> uma_ceiling;
+    if (effective_spill.uma_mode) {
+        if (o.uma_pool_ceiling_bytes > 0) {
+            uma_ceiling = o.uma_pool_ceiling_bytes;
+        } else {
+            uma_ceiling = uma_pool_ceiling_bytes(read_host_memory(), ensure_gpus());
+        }
+    }
     auto launcher = d.launcher();
     if (!launcher) { result.detail = "no process launcher"; result.stop_search = true; return result; }
     Supervisor supervisor(std::move(supervisor_options), std::make_unique<TrackingLauncher>(std::move(launcher), tracked));
@@ -388,7 +412,15 @@ Measurement run_candidate(const Options &o, const Candidate &candidate, Phase ph
             sampled = true;
             result.dedicated_bytes = std::max(result.dedicated_bytes.value_or(0), memory.dedicated_bytes);
             result.shared_bytes = std::max(result.shared_bytes.value_or(0), memory.shared_bytes);
-            spilled = spilled || is_spilled(memory, spill_guard_for(o.grid, candidate), candidate.ctx);
+            bool sample_spilled = is_spilled(memory, effective_spill, candidate.ctx);
+            if (!sample_spilled && effective_spill.uma_mode && uma_ceiling) {
+                const std::uint64_t total_uma_bytes =
+                    memory.dedicated_bytes > std::numeric_limits<std::uint64_t>::max() - memory.shared_bytes
+                        ? std::numeric_limits<std::uint64_t>::max()
+                        : memory.dedicated_bytes + memory.shared_bytes;
+                if (total_uma_bytes > *uma_ceiling) sample_spilled = true;
+            }
+            spilled = spilled || sample_spilled;
             if (spilled) cancellation.cancel();
         }
         std::error_code ec;
@@ -464,7 +496,7 @@ Measurement run_candidate(const Options &o, const Candidate &candidate, Phase ph
             Timings timings;
             if (status.ok() && phase == Phase::benchmark) {
                 const SpecMode spec_mode =
-                    candidate.mtp == 0 ? SpecMode::none : (uses_mtp(candidate) ? SpecMode::mtp : SpecMode::ngram);
+                    candidate.mtp == 0 ? SpecMode::none : (candidate.spec_type == "ngram-mod" ? SpecMode::ngram : SpecMode::mtp);
                 bool any_ngram_drafts = false;
                 for (const auto &work : decode_workloads()) {
                     if (token.cancelled() || d.interrupted() || Clock::now() >= deadline) {
@@ -486,11 +518,17 @@ Measurement run_candidate(const Options &o, const Candidate &candidate, Phase ph
                 if (status.ok()) result.short_tps = weighted_decode_tps(result.workloads);
             }
             if (status.ok()) {
-                status = workload(exchange, port, pattern, 8192, 1, deadline, token, timings);
+                const std::size_t prefill_tokens =
+                    candidate.ctx > 8192
+                        ? std::size_t{8192}
+                        : (candidate.ctx > 1024 ? static_cast<std::size_t>(candidate.ctx - 1024) : std::size_t{1024});
+                status = workload(exchange, port, pattern, prefill_tokens, 1, deadline, token, timings);
                 if (status.ok()) result.prefill_tps = static_cast<double>(timings.prompt_tokens) * 1e9 / static_cast<double>(timings.prompt_ns);
             }
             if (status.ok() && phase == Phase::benchmark && o.thorough) {
-                status = workload(exchange, port, pattern, static_cast<std::size_t>(candidate.ctx - 1024), 1, deadline, token, timings);
+                const std::size_t thorough_tokens =
+                    candidate.ctx > 1024 ? static_cast<std::size_t>(candidate.ctx - 1024) : std::size_t{1024};
+                status = workload(exchange, port, pattern, thorough_tokens, 1, deadline, token, timings);
                 if (status.ok()) result.long_prefill_tps = static_cast<double>(timings.prompt_tokens) * 1e9 / static_cast<double>(timings.prompt_ns);
             }
             if (status.ok() && !supervisor.running()) status = {ErrorCode::backend_error, "child exited during calibration"};
@@ -540,11 +578,20 @@ Measurement run_candidate(const Options &o, const Candidate &candidate, Phase ph
     else if (Clock::now() >= deadline) result.verdict = Verdict::timed_out;
     else if (child_exited) { result.verdict = Verdict::error; result.detail = "child exited after readiness"; }
     else if (!status.ok()) { result.verdict = Verdict::error; result.detail = status.message(); }
-    else if (!sampled || !result.dedicated_bytes || *result.dedicated_bytes == 0) {
-        result.verdict = Verdict::unsupported;
-        result.detail = "no live dedicated GPU allocation observed; cannot establish non-spilling operation";
-        result.stop_search = true;
-    } else result.verdict = Verdict::clean;
+    else {
+        const bool observed_gpu_allocation =
+            sampled && (result.dedicated_bytes.value_or(0) > 0 ||
+                        (effective_spill.uma_mode && result.shared_bytes.value_or(0) > 0));
+        if (!observed_gpu_allocation) {
+            result.verdict = Verdict::unsupported;
+            result.detail = effective_spill.uma_mode
+                                ? "no live UMA GPU allocation observed; cannot establish non-spilling operation"
+                                : "no live dedicated GPU allocation observed; cannot establish non-spilling operation";
+            result.stop_search = true;
+        } else {
+            result.verdict = Verdict::clean;
+        }
+    }
     return result;
 }
 

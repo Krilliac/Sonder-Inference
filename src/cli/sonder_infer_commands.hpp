@@ -317,7 +317,12 @@ inline const CommandSpec& tune_command() {
             {"grid", OptionKind::value, "JSON", "inline grid JSON or a JSON file path (also @PATH)"},
             {"env", OptionKind::repeat, "KEY=VALUE", "child-only environment override"},
             {"thorough", OptionKind::flag, "", "also prefill near the candidate context"},
-            {"dry-run", OptionKind::flag, "", "print search space; no child, GPU probe or output file"}}}},
+            {"dry-run", OptionKind::flag, "", "print search space; no child, GPU probe or output file"},
+            {"auto-gpu", OptionKind::flag, "", "select GPU-aware grid defaults from detected hardware"},
+            {"ternary", OptionKind::flag, "", "include ternary/1-bit KV (q2_0) and ngram-mod speculation presets"},
+            {"uma-mode", OptionKind::value, "MODE", "UMA shared-memory qualification: auto | on | off (default off)"},
+            {"adaptive-speculation", OptionKind::flag, "",
+             "emit adaptive_speculation config block when speculative decoding wins"}}}},
         {"Close other GPU applications before calibrating. Windows PDH counters are required for a live run.\n"
          "MTP requires both GGUF nextn tensors and executable --help support. See docs/integration/tune.md.",
          commands_detail::kExitNote},
