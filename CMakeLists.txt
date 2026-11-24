@@ -92,7 +92,9 @@ endif()
 sonder_set_warnings(sonder_inference)
 
 if(SONDER_BUILD_CLI)
-    add_executable(sonder-infer tools/sonder-infer/main.cpp)
+    add_executable(sonder-infer
+        tools/sonder-infer/cli_runtime.cpp
+        tools/sonder-infer/main.cpp)
     target_link_libraries(sonder-infer PRIVATE sonder::inference)
     sonder_set_warnings(sonder-infer)
 endif()

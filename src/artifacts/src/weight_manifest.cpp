@@ -1,31 +1,13 @@
 #include "sonder/inference/weight_manifest.hpp"
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cstdio>
-#include <fstream>
 #include <set>
 
 #include "sonder/inference/engine.hpp"
 #include "sonder/inference/json.hpp"
-#include "server/src/sha256.hpp"
-
-#if defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#else
-#include <cerrno>
-#include <cstring>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
+#include "weight_manifest_io.hpp"
 
 namespace sonder::inference::weights {
 
@@ -33,9 +15,6 @@ namespace fs = std::filesystem;
 namespace json = sonder::inference::json;
 
 namespace {
-
-constexpr std::size_t kMinBuffer = 4096;
-constexpr std::size_t kMaxBuffer = 64u << 20;
 
 std::string to_utf8(const fs::path& p) {
     const auto u = p.generic_u8string();
@@ -93,35 +72,6 @@ bool is_valid_utf8(std::string_view s) {
     return true;
 }
 
-#if defined(_WIN32)
-fs::path from_utf8(std::string_view s) {
-    return fs::path(std::u8string(s.begin(), s.end()));
-}
-#endif
-
-std::string to_hex(const std::array<std::uint8_t, 32>& d) {
-    static constexpr char kDigits[] = "0123456789abcdef";
-    std::string out;
-    out.reserve(64);
-    for (std::uint8_t b : d) {
-        out.push_back(kDigits[b >> 4]);
-        out.push_back(kDigits[b & 15]);
-    }
-    return out;
-}
-
-bool is_link_like(const fs::path& p, const fs::file_status& st) {
-    if (st.type() == fs::file_type::symlink) return true;
-#if defined(_WIN32)
-    // Junctions, OneDrive placeholders and other reparse points can redirect reads.
-    const DWORD attrs = GetFileAttributesW(p.c_str());
-    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return true;
-#else
-    (void)p;
-#endif
-    return false;
-}
-
 std::string utc_now() {
     using namespace std::chrono;
     const std::int64_t secs =
@@ -157,392 +107,6 @@ std::uint64_t splitmix64(std::uint64_t& state) {
     return z ^ (z >> 31);
 }
 
-enum class OpenOutcome { ok, missing, unsafe, io_error };
-
-#if defined(_WIN32)
-struct OwnedFileHandle {
-    HANDLE h = INVALID_HANDLE_VALUE;
-    OwnedFileHandle() = default;
-    explicit OwnedFileHandle(HANDLE handle) noexcept : h(handle) {}
-    ~OwnedFileHandle() { reset(); }
-    OwnedFileHandle(const OwnedFileHandle&) = delete;
-    OwnedFileHandle& operator=(const OwnedFileHandle&) = delete;
-    OwnedFileHandle(OwnedFileHandle&& o) noexcept : h(o.h) { o.h = INVALID_HANDLE_VALUE; }
-    OwnedFileHandle& operator=(OwnedFileHandle&& o) noexcept {
-        if (this != &o) {
-            reset();
-            h = o.h;
-            o.h = INVALID_HANDLE_VALUE;
-        }
-        return *this;
-    }
-    void reset() noexcept {
-        if (h != INVALID_HANDLE_VALUE) {
-            ::CloseHandle(h);
-            h = INVALID_HANDLE_VALUE;
-        }
-    }
-    bool valid() const noexcept { return h != INVALID_HANDLE_VALUE; }
-};
-
-std::string win32_err_string(DWORD err) {
-    return "win32 error " + std::to_string(err);
-}
-
-bool get_final_nt_path(HANDLE h, std::wstring& out) {
-    DWORD needed = ::GetFinalPathNameByHandleW(h, nullptr, 0, VOLUME_NAME_NT | FILE_NAME_NORMALIZED);
-    if (needed == 0) return false;
-    std::wstring buf(static_cast<std::size_t>(needed), L'\0');
-    DWORD got = ::GetFinalPathNameByHandleW(h, buf.data(), needed, VOLUME_NAME_NT | FILE_NAME_NORMALIZED);
-    if (got == 0 || got >= needed) return false;
-    buf.resize(static_cast<std::size_t>(got));
-    while (buf.size() > 1 && buf.back() == L'\\') {
-        buf.pop_back();
-    }
-    out = std::move(buf);
-    return true;
-}
-
-bool paths_equal_ordinal_ci(const std::wstring& a, const std::wstring& b) {
-    if (a.size() != b.size()) return false;
-    return ::CompareStringOrdinal(a.c_str(), static_cast<int>(a.size()), b.c_str(), static_cast<int>(b.size()), TRUE) ==
-           CSTR_EQUAL;
-}
-
-OpenOutcome open_anchored_regular(const fs::path& root, std::string_view rel, OwnedFileHandle& out_handle,
-                                  std::uint64_t& out_size, std::string& err_msg) {
-    OwnedFileHandle root_h(::CreateFileW(root.c_str(), FILE_READ_ATTRIBUTES,
-                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                                         FILE_FLAG_BACKUP_SEMANTICS, nullptr));
-    if (!root_h.valid()) {
-        err_msg = win32_err_string(::GetLastError());
-        return OpenOutcome::io_error;
-    }
-    std::wstring root_nt;
-    if (!get_final_nt_path(root_h.h, root_nt)) {
-        err_msg = win32_err_string(::GetLastError());
-        return OpenOutcome::io_error;
-    }
-
-    fs::path cur = root;
-    std::wstring expected_nt = root_nt;
-    std::size_t pos = 0;
-    while (pos <= rel.size()) {
-        std::size_t next = rel.find('/', pos);
-        if (next == std::string_view::npos) next = rel.size();
-        const fs::path seg = from_utf8(rel.substr(pos, next - pos));
-        cur /= seg;
-        expected_nt.push_back(L'\\');
-        expected_nt.append(seg.native());
-        const bool last = next >= rel.size();
-
-        if (!last) {
-            OwnedFileHandle dir_h(::CreateFileW(cur.c_str(), FILE_READ_ATTRIBUTES,
-                                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                                                OPEN_EXISTING,
-                                                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-            if (!dir_h.valid()) {
-                const DWORD err = ::GetLastError();
-                if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) return OpenOutcome::missing;
-                err_msg = win32_err_string(err);
-                return OpenOutcome::io_error;
-            }
-            BY_HANDLE_FILE_INFORMATION info{};
-            if (!::GetFileInformationByHandle(dir_h.h, &info)) {
-                err_msg = win32_err_string(::GetLastError());
-                return OpenOutcome::io_error;
-            }
-            if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
-                (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
-                return OpenOutcome::unsafe;
-            }
-            std::wstring dir_nt;
-            if (!get_final_nt_path(dir_h.h, dir_nt) || !paths_equal_ordinal_ci(dir_nt, expected_nt)) {
-                return OpenOutcome::unsafe;
-            }
-            pos = next + 1;
-            continue;
-        }
-
-        // Open the leaf without following reparse points; backup semantics lets
-        // us inspect directory/junction handles directly as unsafe instead of
-        // misclassifying them as access errors.
-        OwnedFileHandle leaf_h(::CreateFileW(cur.c_str(), GENERIC_READ,
-                                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                                             OPEN_EXISTING,
-                                             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT |
-                                                 FILE_FLAG_SEQUENTIAL_SCAN,
-                                             nullptr));
-        if (!leaf_h.valid()) {
-            const DWORD err = ::GetLastError();
-            if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) return OpenOutcome::missing;
-            if (err == ERROR_ACCESS_DENIED) {
-                const DWORD attrs = ::GetFileAttributesW(cur.c_str());
-                if (attrs != INVALID_FILE_ATTRIBUTES &&
-                    ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 || (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)) {
-                    return OpenOutcome::unsafe;
-                }
-            }
-            err_msg = win32_err_string(err);
-            return OpenOutcome::io_error;
-        }
-        if (::GetFileType(leaf_h.h) != FILE_TYPE_DISK) {
-            return OpenOutcome::unsafe;
-        }
-        BY_HANDLE_FILE_INFORMATION info{};
-        if (!::GetFileInformationByHandle(leaf_h.h, &info)) {
-            err_msg = win32_err_string(::GetLastError());
-            return OpenOutcome::io_error;
-        }
-        if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
-            (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-            return OpenOutcome::unsafe;
-        }
-        std::wstring leaf_nt;
-        if (!get_final_nt_path(leaf_h.h, leaf_nt) || !paths_equal_ordinal_ci(leaf_nt, expected_nt)) {
-            return OpenOutcome::unsafe;
-        }
-        out_size = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | static_cast<std::uint64_t>(info.nFileSizeLow);
-        out_handle = std::move(leaf_h);
-        return OpenOutcome::ok;
-    }
-    return OpenOutcome::missing;
-}
-
-OpenOutcome open_single_regular(const fs::path& file, OwnedFileHandle& out_handle, std::uint64_t& out_size,
-                                std::string& err_msg) {
-    OwnedFileHandle h(::CreateFileW(file.c_str(), GENERIC_READ,
-                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT |
-                                        FILE_FLAG_SEQUENTIAL_SCAN,
-                                    nullptr));
-    if (!h.valid()) {
-        const DWORD err = ::GetLastError();
-        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
-            err_msg = win32_err_string(err);
-            return OpenOutcome::missing;
-        }
-        if (err == ERROR_ACCESS_DENIED) {
-            const DWORD attrs = ::GetFileAttributesW(file.c_str());
-            if (attrs != INVALID_FILE_ATTRIBUTES &&
-                ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 || (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)) {
-                return OpenOutcome::unsafe;
-            }
-        }
-        err_msg = win32_err_string(err);
-        return OpenOutcome::io_error;
-    }
-    if (::GetFileType(h.h) != FILE_TYPE_DISK) {
-        return OpenOutcome::unsafe;
-    }
-    BY_HANDLE_FILE_INFORMATION info{};
-    if (!::GetFileInformationByHandle(h.h, &info)) {
-        err_msg = win32_err_string(::GetLastError());
-        return OpenOutcome::io_error;
-    }
-    if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
-        (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-        return OpenOutcome::unsafe;
-    }
-    out_size = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | static_cast<std::uint64_t>(info.nFileSizeLow);
-    out_handle = std::move(h);
-    return OpenOutcome::ok;
-}
-
-Result<std::string> hash_open_handle(const OwnedFileHandle& handle, std::uint64_t initial_size,
-                                     std::string_view display, const HashOptions& options, std::uint64_t* bytes_read) {
-    const std::size_t cap = std::clamp(options.buffer_bytes, kMinBuffer, kMaxBuffer);
-    std::string buffer(cap, '\0');
-    server::detail::Sha256 sha;
-    std::uint64_t done = 0;
-    while (true) {
-        if (options.cancel.cancelled()) {
-            return Status(ErrorCode::cancelled, "cancelled while hashing '" + printable_path(display) + "'");
-        }
-        std::size_t filled = 0;
-        bool eof = false;
-        while (filled < cap) {
-            DWORD got = 0;
-            const DWORD want = static_cast<DWORD>(std::min<std::size_t>(cap - filled, 0x40000000u));
-            if (!::ReadFile(handle.h, buffer.data() + filled, want, &got, nullptr)) {
-                return Status(ErrorCode::io_error,
-                              "read error on '" + printable_path(display) + "': " + win32_err_string(::GetLastError()));
-            }
-            if (got == 0) {
-                eof = true;
-                break;
-            }
-            filled += static_cast<std::size_t>(got);
-        }
-        if (filled > 0) {
-            sha.update(std::string_view(buffer.data(), filled));
-            done += filled;
-            if (options.progress) options.progress(display, done, initial_size);
-        }
-        if (eof) break;
-    }
-    BY_HANDLE_FILE_INFORMATION after{};
-    if (!::GetFileInformationByHandle(handle.h, &after)) {
-        return Status(ErrorCode::io_error,
-                      "cannot verify size after hashing '" + printable_path(display) + "'");
-    }
-    const std::uint64_t after_size =
-        (static_cast<std::uint64_t>(after.nFileSizeHigh) << 32) | static_cast<std::uint64_t>(after.nFileSizeLow);
-    if ((after.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 || after_size != done) {
-        return Status(ErrorCode::io_error, "'" + printable_path(display) + "' changed while it was being hashed");
-    }
-    if (bytes_read) *bytes_read = done;
-    return to_hex(sha.finish());
-}
-
-#else
-
-struct OwnedFileHandle {
-    int fd = -1;
-    OwnedFileHandle() = default;
-    explicit OwnedFileHandle(int d) noexcept : fd(d) {}
-    ~OwnedFileHandle() { reset(); }
-    OwnedFileHandle(const OwnedFileHandle&) = delete;
-    OwnedFileHandle& operator=(const OwnedFileHandle&) = delete;
-    OwnedFileHandle(OwnedFileHandle&& o) noexcept : fd(o.fd) { o.fd = -1; }
-    OwnedFileHandle& operator=(OwnedFileHandle&& o) noexcept {
-        if (this != &o) {
-            reset();
-            fd = o.fd;
-            o.fd = -1;
-        }
-        return *this;
-    }
-    void reset() noexcept {
-        if (fd >= 0) {
-            ::close(fd);
-            fd = -1;
-        }
-    }
-    bool valid() const noexcept { return fd >= 0; }
-};
-
-OpenOutcome open_anchored_regular(const fs::path& root, std::string_view rel, OwnedFileHandle& out_handle,
-                                  std::uint64_t& out_size, std::string& err_msg) {
-    OwnedFileHandle cur(::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-    if (!cur.valid()) {
-        err_msg = std::strerror(errno);
-        return OpenOutcome::io_error;
-    }
-    std::size_t pos = 0;
-    while (pos <= rel.size()) {
-        std::size_t next = rel.find('/', pos);
-        if (next == std::string_view::npos) next = rel.size();
-        const std::string seg(rel.substr(pos, next - pos));
-        const bool last = next >= rel.size();
-
-        if (!last) {
-            OwnedFileHandle child(::openat(cur.fd, seg.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
-            if (!child.valid()) {
-                const int err = errno;
-                if (err == ENOENT) return OpenOutcome::missing;
-                if (err == ELOOP || err == ENOTDIR) return OpenOutcome::unsafe;
-                err_msg = std::strerror(err);
-                return OpenOutcome::io_error;
-            }
-            cur = std::move(child);
-            pos = next + 1;
-            continue;
-        }
-
-        OwnedFileHandle leaf(::openat(cur.fd, seg.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK));
-        if (!leaf.valid()) {
-            const int err = errno;
-            if (err == ENOENT) return OpenOutcome::missing;
-            if (err == ELOOP || err == EISDIR || err == ENXIO) return OpenOutcome::unsafe;
-            err_msg = std::strerror(err);
-            return OpenOutcome::io_error;
-        }
-        struct stat st {};
-        if (::fstat(leaf.fd, &st) != 0) {
-            err_msg = std::strerror(errno);
-            return OpenOutcome::io_error;
-        }
-        if (!S_ISREG(st.st_mode)) {
-            return OpenOutcome::unsafe;
-        }
-        out_size = st.st_size < 0 ? 0u : static_cast<std::uint64_t>(st.st_size);
-        out_handle = std::move(leaf);
-        return OpenOutcome::ok;
-    }
-    return OpenOutcome::missing;
-}
-
-OpenOutcome open_single_regular(const fs::path& file, OwnedFileHandle& out_handle, std::uint64_t& out_size,
-                                std::string& err_msg) {
-    OwnedFileHandle h(::open(file.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK));
-    if (!h.valid()) {
-        const int err = errno;
-        if (err == ENOENT) {
-            err_msg = std::strerror(err);
-            return OpenOutcome::missing;
-        }
-        if (err == ELOOP || err == EISDIR || err == ENXIO) {
-            return OpenOutcome::unsafe;
-        }
-        err_msg = std::strerror(err);
-        return OpenOutcome::io_error;
-    }
-    struct stat st {};
-    if (::fstat(h.fd, &st) != 0) {
-        err_msg = std::strerror(errno);
-        return OpenOutcome::io_error;
-    }
-    if (!S_ISREG(st.st_mode)) {
-        return OpenOutcome::unsafe;
-    }
-    out_size = st.st_size < 0 ? 0u : static_cast<std::uint64_t>(st.st_size);
-    out_handle = std::move(h);
-    return OpenOutcome::ok;
-}
-
-Result<std::string> hash_open_handle(const OwnedFileHandle& handle, std::uint64_t initial_size,
-                                     std::string_view display, const HashOptions& options, std::uint64_t* bytes_read) {
-    const std::size_t cap = std::clamp(options.buffer_bytes, kMinBuffer, kMaxBuffer);
-    std::string buffer(cap, '\0');
-    server::detail::Sha256 sha;
-    std::uint64_t done = 0;
-    while (true) {
-        if (options.cancel.cancelled()) {
-            return Status(ErrorCode::cancelled, "cancelled while hashing '" + printable_path(display) + "'");
-        }
-        std::size_t filled = 0;
-        bool eof = false;
-        while (filled < cap) {
-            const ssize_t got = ::read(handle.fd, buffer.data() + filled, cap - filled);
-            if (got < 0) {
-                if (errno == EINTR) continue;
-                return Status(ErrorCode::io_error,
-                              "read error on '" + printable_path(display) + "': " + std::strerror(errno));
-            }
-            if (got == 0) {
-                eof = true;
-                break;
-            }
-            filled += static_cast<std::size_t>(got);
-        }
-        if (filled > 0) {
-            sha.update(std::string_view(buffer.data(), filled));
-            done += filled;
-            if (options.progress) options.progress(display, done, initial_size);
-        }
-        if (eof) break;
-    }
-    struct stat after {};
-    if (::fstat(handle.fd, &after) != 0 || !S_ISREG(after.st_mode) || after.st_size < 0 ||
-        static_cast<std::uint64_t>(after.st_size) != done) {
-        return Status(ErrorCode::io_error, "'" + printable_path(display) + "' changed while it was being hashed");
-    }
-    if (bytes_read) *bytes_read = done;
-    return to_hex(sha.finish());
-}
-#endif
-
 Status check_manifest_entries(const WeightManifest& m) {
     std::set<std::string> seen;
     for (const auto& f : m.files) {
@@ -554,7 +118,8 @@ Status check_manifest_entries(const WeightManifest& m) {
         }
         if (f.expected_sha256 && !is_sha256_hex(*f.expected_sha256)) {
             return Status(ErrorCode::invalid_argument,
-                          "manifest entry '" + printable_path(f.path) + "': expected_sha256 must be 64 lowercase hex digits");
+                          "manifest entry '" + printable_path(f.path) +
+                              "': expected_sha256 must be 64 lowercase hex digits");
         }
         if (!seen.insert(f.path).second) {
             return Status(ErrorCode::invalid_argument, "manifest lists '" + printable_path(f.path) + "' twice");
@@ -655,20 +220,20 @@ bool is_sha256_hex(std::string_view text) {
 
 Result<std::string> hash_file(const fs::path& file, std::string_view display, const HashOptions& options,
                               std::uint64_t* bytes_read) {
-    OwnedFileHandle handle;
+    detail::OwnedFileHandle handle;
     std::uint64_t total = 0;
     std::string err_msg;
-    switch (open_single_regular(file, handle, total, err_msg)) {
-        case OpenOutcome::ok:
+    switch (detail::open_single_regular(file, handle, total, err_msg)) {
+        case detail::OpenOutcome::ok:
             break;
-        case OpenOutcome::unsafe:
+        case detail::OpenOutcome::unsafe:
             return Status(ErrorCode::invalid_argument,
                           "refusing to hash non-regular file, symlink or reparse point '" + printable_path(display) + "'");
-        case OpenOutcome::missing:
-        case OpenOutcome::io_error:
+        case detail::OpenOutcome::missing:
+        case detail::OpenOutcome::io_error:
             return Status(ErrorCode::io_error, "cannot open '" + printable_path(display) + "': " + err_msg);
     }
-    return hash_open_handle(handle, total, display, options, bytes_read);
+    return detail::hash_open_handle(handle, total, display, options, bytes_read);
 }
 
 Result<DirListing> list_directory(const fs::path& dir, const std::vector<fs::path>& ignore) {
@@ -689,11 +254,11 @@ Result<DirListing> list_directory(const fs::path& dir, const std::vector<fs::pat
         if (!try_to_utf8(entry.lexically_relative(dir), rel)) {
             // Name has no UTF-8 form (e.g. unpaired surrogate); it can never be written to a manifest.
             out.unsafe.push_back("<name not representable as UTF-8>");
-            if (e2 || is_link_like(entry, st)) it.disable_recursion_pending();
+            if (e2 || detail::is_link_like(entry, st)) it.disable_recursion_pending();
             continue;
         }
         if (e2) return Status(ErrorCode::io_error, "cannot stat '" + printable_path(rel) + "': " + e2.message());
-        if (is_link_like(entry, st)) {
+        if (detail::is_link_like(entry, st)) {
             it.disable_recursion_pending();
             out.unsafe.push_back(rel);
             continue;
@@ -742,23 +307,23 @@ Result<BuildResult> build_manifest(const fs::path& dir, const BuildOptions& opti
     result.manifest.created_at = utc_now();
     result.manifest.tool_version = version_string();
     for (const std::string& rel : listing->files) {
-        OwnedFileHandle handle;
+        detail::OwnedFileHandle handle;
         std::uint64_t initial_size = 0;
         std::string err_msg;
-        switch (open_anchored_regular(dir, rel, handle, initial_size, err_msg)) {
-            case OpenOutcome::ok:
+        switch (detail::open_anchored_regular(dir, rel, handle, initial_size, err_msg)) {
+            case detail::OpenOutcome::ok:
                 break;
-            case OpenOutcome::unsafe:
+            case detail::OpenOutcome::unsafe:
                 return Status(ErrorCode::invalid_argument,
                               "refusing directory: unsafe entry (symlink, reparse point, special file or bad name): " +
                                   printable_path(rel));
-            case OpenOutcome::missing:
+            case detail::OpenOutcome::missing:
                 return Status(ErrorCode::io_error, "'" + printable_path(rel) + "' disappeared while building manifest");
-            case OpenOutcome::io_error:
+            case detail::OpenOutcome::io_error:
                 return Status(ErrorCode::io_error, "cannot open '" + printable_path(rel) + "': " + err_msg);
         }
         std::uint64_t n = 0;
-        auto digest = hash_open_handle(handle, initial_size, rel, options.hash, &n);
+        auto digest = detail::hash_open_handle(handle, initial_size, rel, options.hash, &n);
         if (!digest.ok()) return digest.status();
         if (n != initial_size) {
             return Status(ErrorCode::io_error, "'" + printable_path(rel) + "' changed while it was being hashed");
@@ -953,21 +518,21 @@ Result<VerifyReport> verify_manifest(const fs::path& dir, const WeightManifest& 
         if (f.expected_sha256 && *f.expected_sha256 != f.sha256) {
             report.mismatches.push_back({f.path, "expected_sha256", *f.expected_sha256, f.sha256});
         }
-        OwnedFileHandle handle;
+        detail::OwnedFileHandle handle;
         std::uint64_t size = 0;
         std::string err_msg;
-        switch (open_anchored_regular(dir, f.path, handle, size, err_msg)) {
-            case OpenOutcome::missing:
+        switch (detail::open_anchored_regular(dir, f.path, handle, size, err_msg)) {
+            case detail::OpenOutcome::missing:
                 report.missing.push_back(f.path);
                 continue;
-            case OpenOutcome::unsafe:
+            case detail::OpenOutcome::unsafe:
                 if (std::find(report.unsafe.begin(), report.unsafe.end(), f.path) == report.unsafe.end()) {
                     report.unsafe.push_back(f.path);
                 }
                 continue;
-            case OpenOutcome::io_error:
+            case detail::OpenOutcome::io_error:
                 return Status(ErrorCode::io_error, "cannot open '" + printable_path(f.path) + "': " + err_msg);
-            case OpenOutcome::ok:
+            case detail::OpenOutcome::ok:
                 break;
         }
         if (size != f.size) {
@@ -978,7 +543,7 @@ Result<VerifyReport> verify_manifest(const fs::path& dir, const WeightManifest& 
             continue;
         }
         std::uint64_t hashed_bytes = 0;
-        auto digest = hash_open_handle(handle, size, f.path, options.hash, &hashed_bytes);
+        auto digest = detail::hash_open_handle(handle, size, f.path, options.hash, &hashed_bytes);
         if (!digest.ok()) return digest.status();
         report.hashed.push_back(f.path);
         if (hashed_bytes != f.size) {

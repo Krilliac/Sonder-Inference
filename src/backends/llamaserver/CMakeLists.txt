@@ -6,7 +6,9 @@ sonder_module_sources(
     gpu_residency.cpp
     host_memory.cpp
     llamaserver_backend.cpp
+    llamaserver_options.cpp
     llamaserver_protocol.cpp
+    llamaserver_stream.cpp
     log_diagnostics.cpp
     process.cpp
     process_options.cpp

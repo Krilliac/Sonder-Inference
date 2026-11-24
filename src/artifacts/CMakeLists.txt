@@ -8,8 +8,14 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../server/src/sha256.cpp")
     message(STATUS "Sonder module src/artifacts skipped: needs src/server (sha256)")
     return()
 endif()
+if(WIN32)
+    set(_sonder_weight_manifest_io src/weight_manifest_io_win32.cpp)
+else()
+    set(_sonder_weight_manifest_io src/weight_manifest_io_posix.cpp)
+endif()
 sonder_module_sources(
     src/weight_manifest.cpp
+    ${_sonder_weight_manifest_io}
     src/weights_cli.cpp)
 sonder_module_include_directories(include)
 sonder_module_define(SONDER_HAS_WEIGHT_MANIFEST)

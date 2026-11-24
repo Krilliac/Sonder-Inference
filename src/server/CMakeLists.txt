@@ -8,12 +8,14 @@ sonder_module_sources(
     src/anthropic.cpp
     src/backend_setup.cpp
     src/chat_handler.cpp
+    src/gguf_header.cpp
     src/http.cpp
     src/health_features.cpp
     src/identity.cpp
     src/launch_profile.cpp
     src/live_hub.cpp
     src/log_queue.cpp
+    src/moe_placement.cpp
     src/openai.cpp
     src/priority_admission.cpp
     src/residency.cpp
@@ -22,7 +24,11 @@ sonder_module_sources(
     src/thinking_pins.cpp
     src/residency_config.cpp
     src/serve_main.cpp
+    src/serve_options.cpp
+    src/serve_profile_catalog.cpp
     src/server.cpp
+    src/server_endpoints.cpp
+    src/server_policy.cpp
     src/sha256.cpp
     src/socket.cpp
     src/vram_estimate.cpp
