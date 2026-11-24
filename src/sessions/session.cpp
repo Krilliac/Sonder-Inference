@@ -315,6 +315,90 @@ Result<GenerationResult> Session::chat(const std::vector<ChatMessage>& messages,
                        request_options);
 }
 
+Result<EmbedResult> Session::embed(const std::vector<std::string>& inputs, const RequestOptions& request_options) {
+    if (inputs.empty()) {
+        return Status(ErrorCode::invalid_argument, "embed inputs must be non-empty");
+    }
+    const std::string req_id = request_options.request_id && !request_options.request_id->empty()
+                                   ? *request_options.request_id
+                                   : make_id("req");
+    TelemetryBus& bus = engine_.telemetry();
+    const auto ctx = telemetry_context(req_id);
+    CancellationToken token;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == SessionState::closed) {
+            return Status(ErrorCode::invalid_state, "session is closed");
+        }
+        if (state_ == SessionState::running) {
+            return Status(ErrorCode::invalid_state, "session already has a request in flight");
+        }
+        active_cancel_.emplace();
+        token = active_cancel_->token();
+        state_ = SessionState::running;
+        cancel_requested_ns_.store(0);
+        ++requests_started_;
+    }
+
+    auto finish_state = [&](RequestOutcome outcome) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        active_cancel_.reset();
+        cancel_requested_ns_.store(0);
+        last_outcome_ = outcome;
+        last_scheduler_rejected_ = false;
+        if (state_ == SessionState::running) {
+            state_ = SessionState::idle;
+        }
+    };
+
+    const auto t_start = std::chrono::steady_clock::now();
+    bus.emit("request.queued", ctx,
+             json::Object{{"kind", "embed"}, {"inputs", static_cast<std::uint64_t>(inputs.size())}},
+             TelemetryLevel::metrics);
+
+    if (request_options.deadline && std::chrono::steady_clock::now() >= *request_options.deadline) {
+        finish_state(RequestOutcome::failed);
+        bus.emit("request.failed", ctx, json::Object{{"kind", "embed"}, {"error_code", to_string(ErrorCode::timeout)}},
+                 TelemetryLevel::metrics);
+        return Status(ErrorCode::timeout, "request deadline exceeded before backend start");
+    }
+    if (request_options.on_backend_start) {
+        request_options.on_backend_start();
+    }
+    if (token.cancelled()) {
+        finish_state(RequestOutcome::cancelled);
+        bus.emit("request.cancelled", ctx, json::Object{{"kind", "embed"}}, TelemetryLevel::metrics);
+        return Status(ErrorCode::cancelled, "cancelled before backend start");
+    }
+
+    EmbedRequest req;
+    req.request_id = req_id;
+    req.inputs = inputs;
+    auto embedded = model_->backend_model().embed(req, token);
+    const double total_ms = ms_between(t_start, std::chrono::steady_clock::now());
+
+    if (!embedded.ok()) {
+        const bool cancelled = token.cancelled() || embedded.status().code() == ErrorCode::cancelled;
+        finish_state(cancelled ? RequestOutcome::cancelled : RequestOutcome::failed);
+        bus.emit(cancelled ? "request.cancelled" : "request.failed", ctx,
+                 json::Object{{"kind", "embed"},
+                              {"total_ms", total_ms},
+                              {"error_code", to_string(embedded.status().code())}},
+                 TelemetryLevel::metrics);
+        return embedded.status();
+    }
+
+    finish_state(RequestOutcome::completed);
+    bus.emit("request.completed", ctx,
+             json::Object{{"kind", "embed"},
+                          {"outcome", "completed"},
+                          {"prompt_tokens", embedded.value().prompt_tokens},
+                          {"inputs", static_cast<std::uint64_t>(embedded.value().embeddings.size())},
+                          {"total_ms", total_ms}},
+             TelemetryLevel::metrics);
+    return embedded;
+}
+
 Result<GenerationResult> Session::run_request(const char* kind, const std::string& prompt,
                                               const std::vector<ChatMessage>* messages, const TokenCallback& on_chunk,
                                               const std::optional<SamplingConfig>& sampling_override,
@@ -329,6 +413,8 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                              : make_id("req");
     request.prompt = prompt;
     request.sampling = sampling;
+    request.session_key = request_options.session_key;
+    request.grammar = request_options.grammar;
 
     // Prepare failure recovery before publishing running. No cleanup action
     // can replace an exception from a public C++ callback.
@@ -474,10 +560,11 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         (arch == ModelArchitecture::hybrid || arch == ModelArchitecture::recurrent) &&
         backend && backend->capabilities().has(Capability::recurrent_checkpoint);
 #if defined(SONDER_HAS_SAMPLER_CHAIN)
+    const bool use_token_logits =
+        !native_chat && request.grammar.empty() && backend && backend->capabilities().has(Capability::token_logits);
     const bool defer_stream_open =
-        (engine_.scheduling_options().strict_priority_admission || checkpoint_candidate) &&
-        !native_chat && backend && backend->capabilities().has(Capability::token_logits);
-    if (!defer_stream_open && !native_chat && backend && backend->capabilities().has(Capability::token_logits)) {
+        (engine_.scheduling_options().strict_priority_admission || checkpoint_candidate) && use_token_logits;
+    if (!defer_stream_open && use_token_logits) {
         auto opened = backend_model.open_token_stream(request);
         if (opened.ok()) {
             stream = std::move(opened).value();
@@ -804,6 +891,9 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                 chat_request.separate_reasoning = request_options.separate_reasoning;
                 chat_request.reasoning_budget_tokens = request_options.reasoning_budget_tokens;
                 chat_request.reasoning_budget_message = request_options.reasoning_budget_message;
+                chat_request.grammar = request_options.grammar;
+                chat_request.response_format_type = request_options.response_format_type;
+                chat_request.response_format_schema = request_options.response_format_schema;
                 generated = backend_model.chat(chat_request, token, on_backend_chunk);
             } else {
                 generated = backend_model.generate(request, token, on_backend_chunk);

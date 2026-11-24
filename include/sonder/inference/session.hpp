@@ -114,6 +114,12 @@ struct RequestOptions {
     // When false (e.g. SSE streaming where chunks are flushed immediately),
     // Session skips retaining the full text/reasoning in GenerationResult.
     bool retain_text = true;
+    // Optional GBNF grammar constraining output (empty = unconstrained).
+    std::string grammar;
+    // Optional OpenAI response_format hint ("text", "json_object", "json_schema")
+    // and serialized JSON schema for native-format upstreams.
+    std::optional<std::string> response_format_type = std::nullopt;
+    std::optional<std::string> response_format_schema = std::nullopt;
 };
 
 struct GenerationResult {
@@ -165,6 +171,10 @@ public:
     Result<GenerationResult> chat(const std::vector<ChatMessage>& messages, const TokenCallback& on_chunk = {},
                                   const std::optional<SamplingConfig>& sampling_override = std::nullopt,
                                   const RequestOptions& request_options = {});
+
+    // Embedding generation for one or more text inputs on backends that support
+    // Capability::embeddings.
+    Result<EmbedResult> embed(const std::vector<std::string>& inputs, const RequestOptions& request_options = {});
 
     // True when the last request failed because the engine scheduler rejected
     // it before any backend work started (nothing executed).

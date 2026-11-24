@@ -54,6 +54,22 @@ struct LlamaCppBackendOptions {
     std::vector<float> tensor_split;
     // Lock model weights in RAM (llama.cpp load_mode mlock / mmap+mlock).
     bool use_mlock = false;
+    // Memory-map GGUF weights (true = mmap default; false = direct read, e.g. load-mode=none).
+    bool use_mmap = true;
+    // Use a unified KV buffer across slots/sequences when supported by llama.cpp.
+    bool kv_unified = true;
+    // Reuse longest matching prompt KV prefix across consecutive turns.
+    bool prefix_cache = true;
+    // Number of cached KV sequence slots (1..16). Values > 1 allow interleaved
+    // conversations (matched by session_key or longest common prefix) without
+    // evicting each other's prefix cache.
+    std::uint32_t slots = 1;
+    // In-process speculative decoding strategy: "none" (default), "auto"
+    // (draft-mtp if model has MTP layers, else ngram-mod), "ngram",
+    // "ngram-mod", or "draft-mtp".
+    std::string spec_type = "none";
+    // Max draft tokens per speculative step (0 = automatic default for spec_type).
+    std::int32_t spec_draft_max = 0;
 };
 
 // Checks the llama.cpp context and placement options (KV cache types,
