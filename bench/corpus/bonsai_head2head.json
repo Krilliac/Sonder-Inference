@@ -1,0 +1,404 @@
+{
+  "schema": "sonder.inference.corpus/1",
+  "name": "bonsai_head2head",
+  "version": "2026-11-24.1",
+  "description": "Deterministic PrismML llama-server vs Sonder-Inference head-to-head speed & quality corpus targeting Bonsai models (4B-MTP, 9B-MTP, 27B-PQ2, 27B-Q1): cold prefill (128/1024/3072 tok), 3-turn warm KV prefix reuse (~1500-tok shared prefix), 4 decode speed regimes (code_edit, structured_json, reasoning_math, open_prose), concurrency fan-out, HTTP keep-alive, endpoint parity, and 12 deterministic quality & output-parity probes.",
+  "target_models": [
+    "Bonsai-2-4B-MTP",
+    "Bonsai-2-9B-MTP",
+    "Bonsai-2-27B-PQ2",
+    "Bonsai-2-27B-Q1"
+  ],
+  "defaults": {
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 256
+  },
+  "prefill": [
+    {
+      "id": "short",
+      "label": "short (~128 tok)",
+      "target_tokens": 128,
+      "approx_tokens": 134,
+      "prompt": "Inspect this C++20 streaming benchmark helper and state in two concise sentences what edge case occurs when `total_tokens <= 1` or `total_s <= ttft_s` (for example on a single-token reply), and why `total_tokens - 1` is used in the numerator:\n\n```cpp\n#include <cstdint>\n#include <optional>\n\nstd::optional<double> wall_decode_tps(std::uint64_t total_tokens, double ttft_s, double total_s) {\n    if (total_tokens <= 1 || total_s <= ttft_s) return std::nullopt;\n    return static_cast<double>(total_tokens - 1) / (total_s - ttft_s);\n}\n```",
+      "max_tokens": 32
+    },
+    {
+      "id": "medium",
+      "label": "medium (~1024 tok)",
+      "target_tokens": 1024,
+      "approx_tokens": 1074,
+      "prompt": "Review the `SlotRouter` C++20 header below and answer in three concise bullet points:\n(1) Why `max_reusable` clamps `matched_prefix` to `prompt.size() - 1`.\n(2) In what priority order `acquire()` selects an idle slot.\n(3) What happens when `session_key` matches no idle slot and all idle slots have `lcp < 32`.\n\n```cpp\n#pragma once\n#include <algorithm>\n#include <cstdint>\n#include <limits>\n#include <span>\n#include <string>\n#include <string_view>\n#include <vector>\n\nnamespace sonder::inference::kv {\n\nstruct SlotEntry {\n    std::int32_t slot_id = 0;\n    std::vector<std::int32_t> cached_tokens;\n    std::string session_key;\n    std::uint64_t last_used_tick = 0;\n    bool busy = false;\n};\n\nstruct RouteDecision {\n    std::int32_t slot_id = -1;\n    std::size_t matched_prefix = 0;\n    std::size_t tokens_to_prefill = 0;\n    bool exact_key_hit = false;\n};\n\ninline std::size_t longest_common_prefix(\n    std::span<const std::int32_t> a,\n    std::span<const std::int32_t> b) noexcept {\n    const std::size_t limit = std::min(a.size(), b.size());\n    std::size_t idx = 0;\n    while (idx < limit && a[idx] == b[idx]) {\n        ++idx;\n    }\n    return idx;\n}\n\nclass SlotRouter {\npublic:\n    explicit SlotRouter(std::int32_t num_slots) {\n        slots_.reserve(static_cast<std::size_t>(std::max(1, num_slots)));\n        for (std::int32_t i = 0; i < std::max(1, num_slots); ++i) {\n            slots_.push_back(SlotEntry{.slot_id = i});\n        }\n    }\n\n    RouteDecision acquire(std::span<const std::int32_t> prompt,\n                          std::string_view session_key) noexcept {\n        ++clock_;\n        if (prompt.empty()) {\n            return RouteDecision{};\n        }\n        const std::size_t max_reusable = prompt.size() - 1;\n\n        if (!session_key.empty()) {\n            for (auto& slot : slots_) {\n                if (!slot.busy && slot.session_key == session_key) {\n                    const std::size_t lcp = std::min(\n                        longest_common_prefix(slot.cached_tokens, prompt),\n                        max_reusable);\n                    slot.busy = true;\n                    slot.last_used_tick = clock_;\n                    return RouteDecision{\n                        .slot_id = slot.slot_id,\n                        .matched_prefix = lcp,\n                        .tokens_to_prefill = prompt.size() - lcp,\n                        .exact_key_hit = true,\n                    };\n                }\n            }\n        }\n\n        SlotEntry* best_lcp_slot = nullptr;\n        std::size_t best_lcp = 0;\n        SlotEntry* lru_slot = nullptr;\n        std::uint64_t oldest_tick = std::numeric_limits<std::uint64_t>::max();\n\n        for (auto& slot : slots_) {\n            if (slot.busy) {\n                continue;\n            }\n            if (slot.last_used_tick < oldest_tick) {\n                oldest_tick = slot.last_used_tick;\n                lru_slot = &slot;\n            }\n            const std::size_t lcp = std::min(\n                longest_common_prefix(slot.cached_tokens, prompt),\n                max_reusable);\n            if (lcp >= 32 && lcp > best_lcp) {\n                best_lcp = lcp;\n                best_lcp_slot = &slot;\n            }\n        }\n\n        SlotEntry* chosen = best_lcp_slot ? best_lcp_slot : lru_slot;\n        if (!chosen) {\n            return RouteDecision{};\n        }\n        const std::size_t lcp = best_lcp_slot ? best_lcp : std::min(\n            longest_common_prefix(chosen->cached_tokens, prompt), max_reusable);\n        chosen->busy = true;\n        chosen->session_key = std::string(session_key);\n        chosen->last_used_tick = clock_;\n        return RouteDecision{\n            .slot_id = chosen->slot_id,\n            .matched_prefix = lcp,\n            .tokens_to_prefill = prompt.size() - lcp,\n            .exact_key_hit = false,\n        };\n    }\n\n    void release(std::int32_t slot_id, std::vector<std::int32_t> full_sequence) {\n        for (auto& slot : slots_) {\n            if (slot.slot_id == slot_id) {\n                slot.cached_tokens = std::move(full_sequence);\n                slot.busy = false;\n                slot.last_used_tick = ++clock_;\n                return;\n            }\n        }\n    }\n\nprivate:\n    std::vector<SlotEntry> slots_;\n    std::uint64_t clock_ = 0;\n};\n\n} // namespace sonder::inference::kv\n```",
+      "max_tokens": 32
+    },
+    {
+      "id": "long",
+      "label": "long (~3072 tok)",
+      "target_tokens": 3072,
+      "approx_tokens": 3112,
+      "prompt": "You are auditing the two inference runtime modules and placement ledger below. Answer in four numbered points (at most two sentences each):\n1. How `SlotRouter::acquire` prevents returning stale logits on an exact full-prompt cache hit.\n2. How `AdaptiveDraftController::record_step` protects open-ended prose from speculative verification regressions.\n3. How `NgramLookupTable::draft` resolves hash collisions before proposing tokens and what fallback it tries.\n4. Why `Bonsai-2 27B-PQ2` and `27B-Q1` benchmarks must run sequentially rather than concurrently on a 16 GiB GPU.\n\n```cpp\n// Module: kv_slot_table.hpp — Multi-slot Longest-Common-Prefix KV Router\n#pragma once\n#include <algorithm>\n#include <cstdint>\n#include <limits>\n#include <span>\n#include <string>\n#include <string_view>\n#include <vector>\n\nnamespace sonder::inference::kv {\n\nstruct SlotEntry {\n    std::int32_t slot_id = 0;\n    std::vector<std::int32_t> cached_tokens;\n    std::string session_key;\n    std::uint64_t last_used_tick = 0;\n    bool busy = false;\n};\n\nstruct RouteDecision {\n    std::int32_t slot_id = -1;\n    std::size_t matched_prefix = 0;\n    std::size_t tokens_to_prefill = 0;\n    bool exact_key_hit = false;\n};\n\ninline std::size_t longest_common_prefix(\n    std::span<const std::int32_t> a,\n    std::span<const std::int32_t> b) noexcept {\n    const std::size_t limit = std::min(a.size(), b.size());\n    std::size_t idx = 0;\n    while (idx < limit && a[idx] == b[idx]) {\n        ++idx;\n    }\n    return idx;\n}\n\nclass SlotRouter {\npublic:\n    explicit SlotRouter(std::int32_t num_slots) {\n        slots_.reserve(static_cast<std::size_t>(std::max(1, num_slots)));\n        for (std::int32_t i = 0; i < std::max(1, num_slots); ++i) {\n            slots_.push_back(SlotEntry{.slot_id = i});\n        }\n    }\n\n    RouteDecision acquire(std::span<const std::int32_t> prompt,\n                          std::string_view session_key) noexcept {\n        ++clock_;\n        if (prompt.empty()) {\n            return RouteDecision{};\n        }\n        // Always re-evaluate at least the final token so logits are fresh.\n        const std::size_t max_reusable = prompt.size() - 1;\n\n        // 1. Exact session_key match among idle slots.\n        if (!session_key.empty()) {\n            for (auto& slot : slots_) {\n                if (!slot.busy && slot.session_key == session_key) {\n                    const std::size_t lcp = std::min(\n                        longest_common_prefix(slot.cached_tokens, prompt),\n                        max_reusable);\n                    slot.busy = true;\n                    slot.last_used_tick = clock_;\n                    return RouteDecision{\n                        .slot_id = slot.slot_id,\n                        .matched_prefix = lcp,\n                        .tokens_to_prefill = prompt.size() - lcp,\n                        .exact_key_hit = true,\n                    };\n                }\n            }\n        }\n\n        // 2. Best LCP match (>= 32 tokens) among idle slots.\n        SlotEntry* best_lcp_slot = nullptr;\n        std::size_t best_lcp = 0;\n        SlotEntry* lru_slot = nullptr;\n        std::uint64_t oldest_tick = std::numeric_limits<std::uint64_t>::max();\n\n        for (auto& slot : slots_) {\n            if (slot.busy) {\n                continue;\n            }\n            if (slot.last_used_tick < oldest_tick) {\n                oldest_tick = slot.last_used_tick;\n                lru_slot = &slot;\n            }\n            const std::size_t lcp = std::min(\n                longest_common_prefix(slot.cached_tokens, prompt),\n                max_reusable);\n            if (lcp >= 32 && lcp > best_lcp) {\n                best_lcp = lcp;\n                best_lcp_slot = &slot;\n            }\n        }\n\n        SlotEntry* chosen = best_lcp_slot ? best_lcp_slot : lru_slot;\n        if (!chosen) {\n            return RouteDecision{};\n        }\n        const std::size_t lcp = best_lcp_slot ? best_lcp : std::min(\n            longest_common_prefix(chosen->cached_tokens, prompt), max_reusable);\n        chosen->busy = true;\n        chosen->session_key = std::string(session_key);\n        chosen->last_used_tick = clock_;\n        return RouteDecision{\n            .slot_id = chosen->slot_id,\n            .matched_prefix = lcp,\n            .tokens_to_prefill = prompt.size() - lcp,\n            .exact_key_hit = false,\n        };\n    }\n\n    void release(std::int32_t slot_id, std::vector<std::int32_t> full_sequence) {\n        for (auto& slot : slots_) {\n            if (slot.slot_id == slot_id) {\n                slot.cached_tokens = std::move(full_sequence);\n                slot.busy = false;\n                slot.last_used_tick = ++clock_;\n                return;\n            }\n        }\n    }\n\nprivate:\n    std::vector<SlotEntry> slots_;\n    std::uint64_t clock_ = 0;\n};\n\n} // namespace sonder::inference::kv\n\n// Module: adaptive_speculator.hpp — Self-Speculative N-Gram & Draft-MTP Controller\n#pragma once\n#include <array>\n#include <cstddef>\n#include <cstdint>\n#include <span>\n#include <vector>\n\nnamespace sonder::inference::spec {\n\nenum class SpecMode : std::uint8_t {\n    kNone = 0,\n    kNgramMod = 1,\n    kDraftMtp = 2,\n};\n\nstruct SpecTelemetry {\n    std::uint64_t draft_proposed = 0;\n    std::uint64_t draft_accepted = 0;\n    std::uint64_t verify_batches = 0;\n    std::uint64_t cooldown_skips = 0;\n\n    double acceptance_ratio() const noexcept {\n        return draft_proposed > 0\n            ? static_cast<double>(draft_accepted) / static_cast<double>(draft_proposed)\n            : 0.0;\n    }\n};\n\nclass AdaptiveDraftController {\npublic:\n    AdaptiveDraftController(SpecMode mode, std::int32_t max_draft)\n        : mode_(mode),\n          configured_max_(std::clamp(max_draft, 0, 32)),\n          current_max_(configured_max_ > 0 ? configured_max_ : (mode == SpecMode::kDraftMtp ? 3 : 8)) {}\n\n    std::int32_t next_draft_budget() noexcept {\n        if (mode_ == SpecMode::kNone || current_max_ <= 0) {\n            return 0;\n        }\n        if (cooldown_remaining_ > 0) {\n            --cooldown_remaining_;\n            ++telemetry_.cooldown_skips;\n            return 0;\n        }\n        return current_max_;\n    }\n\n    void record_step(std::int32_t proposed, std::int32_t accepted) noexcept {\n        if (proposed <= 0) {\n            return;\n        }\n        telemetry_.draft_proposed += static_cast<std::uint64_t>(proposed);\n        telemetry_.draft_accepted += static_cast<std::uint64_t>(accepted);\n        ++telemetry_.verify_batches;\n\n        // Exponential moving average of acceptance ratio.\n        const double step_acc = static_cast<double>(accepted) / static_cast<double>(proposed);\n        ema_acceptance_ = 0.80 * ema_acceptance_ + 0.20 * step_acc;\n\n        const std::int32_t ceiling = configured_max_ > 0\n            ? configured_max_\n            : (mode_ == SpecMode::kDraftMtp ? 3 : 8);\n\n        if (ema_acceptance_ < 0.18 && telemetry_.verify_batches >= 6) {\n            if (current_max_ > 2) {\n                current_max_ /= 2;\n            } else {\n                // Pause drafting briefly during unpredictable open-ended prose\n                // so rejected verification batches never regress decode tok/s.\n                cooldown_remaining_ = 8;\n            }\n        } else if (ema_acceptance_ > 0.65 && current_max_ < ceiling) {\n            current_max_ = std::min(ceiling, current_max_ + 1);\n        }\n    }\n\n    const SpecTelemetry& telemetry() const noexcept { return telemetry_; }\n    double ema_acceptance() const noexcept { return ema_acceptance_; }\n    std::int32_t current_max() const noexcept { return current_max_; }\n\nprivate:\n    SpecMode mode_ = SpecMode::kNone;\n    std::int32_t configured_max_ = 0;\n    std::int32_t current_max_ = 0;\n    std::int32_t cooldown_remaining_ = 0;\n    double ema_acceptance_ = 0.50;\n    SpecTelemetry telemetry_{};\n};\n\n// Hash-indexed 4-gram / 3-gram ring lookup table with O(1) incremental insert.\nclass NgramLookupTable {\npublic:\n    static constexpr std::size_t kBuckets = 4096;\n\n    void clear() noexcept {\n        entries4_.fill(Entry{});\n        entries3_.fill(Entry{});\n    }\n\n    void ingest(std::span<const std::int32_t> tokens, std::size_t start_pos = 0) noexcept {\n        for (std::size_t i = start_pos; i < tokens.size(); ++i) {\n            if (i >= 4) {\n                const std::uint32_t h4 = hash4(tokens[i - 4], tokens[i - 3], tokens[i - 2], tokens[i - 1]);\n                entries4_[h4 & (kBuckets - 1)] = Entry{.valid = true, .key_last = tokens[i - 1], .pos = static_cast<std::uint32_t>(i)};\n            }\n            if (i >= 3) {\n                const std::uint32_t h3 = hash3(tokens[i - 3], tokens[i - 2], tokens[i - 1]);\n                entries3_[h3 & (kBuckets - 1)] = Entry{.valid = true, .key_last = tokens[i - 1], .pos = static_cast<std::uint32_t>(i)};\n            }\n        }\n    }\n\n    std::vector<std::int32_t> draft(std::span<const std::int32_t> history, std::int32_t max_tokens) const {\n        std::vector<std::int32_t> out;\n        if (max_tokens <= 0 || history.size() < 4) {\n            return out;\n        }\n        const std::size_t n = history.size();\n        const std::uint32_t h4 = hash4(history[n - 4], history[n - 3], history[n - 2], history[n - 1]);\n        const Entry& e4 = entries4_[h4 & (kBuckets - 1)];\n        std::size_t match_pos = 0;\n        if (e4.valid && e4.key_last == history[n - 1] && e4.pos >= 4 && e4.pos < n) {\n            if (history[e4.pos - 4] == history[n - 4] &&\n                history[e4.pos - 3] == history[n - 3] &&\n                history[e4.pos - 2] == history[n - 2]) {\n                match_pos = e4.pos;\n            }\n        }\n        if (match_pos == 0) {\n            const std::uint32_t h3 = hash3(history[n - 3], history[n - 2], history[n - 1]);\n            const Entry& e3 = entries3_[h3 & (kBuckets - 1)];\n            if (e3.valid && e3.key_last == history[n - 1] && e3.pos >= 3 && e3.pos < n) {\n                if (history[e3.pos - 3] == history[n - 3] &&\n                    history[e3.pos - 2] == history[n - 2]) {\n                    match_pos = e3.pos;\n                }\n            }\n        }\n        if (match_pos > 0) {\n            out.reserve(static_cast<std::size_t>(max_tokens));\n            for (std::int32_t k = 0; k < max_tokens && (match_pos + static_cast<std::size_t>(k)) < n; ++k) {\n                out.push_back(history[match_pos + static_cast<std::size_t>(k)]);\n            }\n        }\n        return out;\n    }\n\nprivate:\n    struct Entry {\n        bool valid = false;\n        std::int32_t key_last = 0;\n        std::uint32_t pos = 0;\n    };\n\n    static constexpr std::uint32_t hash3(std::int32_t a, std::int32_t b, std::int32_t c) noexcept {\n        std::uint32_t h = static_cast<std::uint32_t>(a) * 2654435761u;\n        h = (h ^ static_cast<std::uint32_t>(b)) * 2246822519u;\n        h = (h ^ static_cast<std::uint32_t>(c)) * 3266489917u;\n        return h ^ (h >> 16);\n    }\n\n    static constexpr std::uint32_t hash4(std::int32_t a, std::int32_t b, std::int32_t c, std::int32_t d) noexcept {\n        std::uint32_t h = hash3(a, b, c);\n        h = (h ^ static_cast<std::uint32_t>(d)) * 668265263u;\n        return h ^ (h >> 15);\n    }\n\n    std::array<Entry, kBuckets> entries4_{};\n    std::array<Entry, kBuckets> entries3_{};\n};\n\n} // namespace sonder::inference::spec\n\n// Module: placement_audit_notes.md — Blackwell & Radeon RX XT VRAM Budget Ledger\n// 1. Bonsai-2 4B-MTP PQ2_0-MTP-Q8_0: weights ~1.35 GiB + MTP head ~0.42 GiB.\n//    At 32k context with q8_0 KV cache and 4 concurrent slots, total VRAM stays\n//    under 4.8 GiB on RTX 5070 Ti (16 GiB GDDR7, sm_120) and RX 9070 XT (16 GiB).\n// 2. Bonsai-2 9B-MTP PQ2_0-MTP-Q8_0: weights ~2.95 GiB + MTP head ~0.68 GiB.\n//    With FlashAttention enabled and kv_unified=true, 4 slots share a unified\n//    16,384-token KV pool without per-slot static reservation waste.\n// 3. Bonsai-2 27B-PQ2 & 27B-Q1: compact ternary/2-bit weights (~6.8 GiB PQ2_0,\n//    ~4.4 GiB Q1_0) fit comfortably in 16 GiB dedicated VRAM provided two 27B\n//    server processes are never co-resident simultaneously and OS WDDM/DRM\n//    headroom (~1.0 GiB on Windows 11, ~0.5 GiB on Linux) is respected.\n// 4. Hybrid Attention + DeltaNet Recurrent State: full-attention layers support\n//    arbitrary token-boundary KV truncation via llama_memory_seq_rm(mem, seq, lcp, -1),\n//    whereas recurrent SSM/DeltaNet layers require snapshot alignment when rolling\n//    back rejected draft tokens during draft-mtp verification batches.\n```",
+      "max_tokens": 32
+    }
+  ],
+  "prefix_cache": {
+    "id": "agent_3turn_shared_1500",
+    "description": "3-turn coding agent conversation sharing a ~1500-token system + C++20 source prefix.",
+    "target_shared_tokens": 1500,
+    "approx_shared_tokens": 1491,
+    "system_prefix": "You are a senior systems engineer reviewing Sonder-Inference's KV slot router and HTTP/1.1 keep-alive connection handler. Rely strictly on the reference code below and answer each turn concisely.\n\n```cpp\n// Module: kv_slot_table.hpp — Multi-slot Longest-Common-Prefix KV Router\n#pragma once\n#include <algorithm>\n#include <cstdint>\n#include <limits>\n#include <span>\n#include <string>\n#include <string_view>\n#include <vector>\n\nnamespace sonder::inference::kv {\n\nstruct SlotEntry {\n    std::int32_t slot_id = 0;\n    std::vector<std::int32_t> cached_tokens;\n    std::string session_key;\n    std::uint64_t last_used_tick = 0;\n    bool busy = false;\n};\n\nstruct RouteDecision {\n    std::int32_t slot_id = -1;\n    std::size_t matched_prefix = 0;\n    std::size_t tokens_to_prefill = 0;\n    bool exact_key_hit = false;\n};\n\ninline std::size_t longest_common_prefix(\n    std::span<const std::int32_t> a,\n    std::span<const std::int32_t> b) noexcept {\n    const std::size_t limit = std::min(a.size(), b.size());\n    std::size_t idx = 0;\n    while (idx < limit && a[idx] == b[idx]) {\n        ++idx;\n    }\n    return idx;\n}\n\nclass SlotRouter {\npublic:\n    explicit SlotRouter(std::int32_t num_slots) {\n        slots_.reserve(static_cast<std::size_t>(std::max(1, num_slots)));\n        for (std::int32_t i = 0; i < std::max(1, num_slots); ++i) {\n            slots_.push_back(SlotEntry{.slot_id = i});\n        }\n    }\n\n    RouteDecision acquire(std::span<const std::int32_t> prompt,\n                          std::string_view session_key) noexcept {\n        ++clock_;\n        if (prompt.empty()) {\n            return RouteDecision{};\n        }\n        // Always re-evaluate at least the final token so logits are fresh.\n        const std::size_t max_reusable = prompt.size() - 1;\n\n        // 1. Exact session_key match among idle slots.\n        if (!session_key.empty()) {\n            for (auto& slot : slots_) {\n                if (!slot.busy && slot.session_key == session_key) {\n                    const std::size_t lcp = std::min(\n                        longest_common_prefix(slot.cached_tokens, prompt),\n                        max_reusable);\n                    slot.busy = true;\n                    slot.last_used_tick = clock_;\n                    return RouteDecision{\n                        .slot_id = slot.slot_id,\n                        .matched_prefix = lcp,\n                        .tokens_to_prefill = prompt.size() - lcp,\n                        .exact_key_hit = true,\n                    };\n                }\n            }\n        }\n\n        // 2. Best LCP match (>= 32 tokens) among idle slots.\n        SlotEntry* best_lcp_slot = nullptr;\n        std::size_t best_lcp = 0;\n        SlotEntry* lru_slot = nullptr;\n        std::uint64_t oldest_tick = std::numeric_limits<std::uint64_t>::max();\n\n        for (auto& slot : slots_) {\n            if (slot.busy) {\n                continue;\n            }\n            if (slot.last_used_tick < oldest_tick) {\n                oldest_tick = slot.last_used_tick;\n                lru_slot = &slot;\n            }\n            const std::size_t lcp = std::min(\n                longest_common_prefix(slot.cached_tokens, prompt),\n                max_reusable);\n            if (lcp >= 32 && lcp > best_lcp) {\n                best_lcp = lcp;\n                best_lcp_slot = &slot;\n            }\n        }\n\n        SlotEntry* chosen = best_lcp_slot ? best_lcp_slot : lru_slot;\n        if (!chosen) {\n            return RouteDecision{};\n        }\n        const std::size_t lcp = best_lcp_slot ? best_lcp : std::min(\n            longest_common_prefix(chosen->cached_tokens, prompt), max_reusable);\n        chosen->busy = true;\n        chosen->session_key = std::string(session_key);\n        chosen->last_used_tick = clock_;\n        return RouteDecision{\n            .slot_id = chosen->slot_id,\n            .matched_prefix = lcp,\n            .tokens_to_prefill = prompt.size() - lcp,\n            .exact_key_hit = false,\n        };\n    }\n\n    void release(std::int32_t slot_id, std::vector<std::int32_t> full_sequence) {\n        for (auto& slot : slots_) {\n            if (slot.slot_id == slot_id) {\n                slot.cached_tokens = std::move(full_sequence);\n                slot.busy = false;\n                slot.last_used_tick = ++clock_;\n                return;\n            }\n        }\n    }\n\nprivate:\n    std::vector<SlotEntry> slots_;\n    std::uint64_t clock_ = 0;\n};\n\n} // namespace sonder::inference::kv\n\n// Module: keepalive_policy.hpp — Bounded HTTP/1.1 Persistent Socket Policy\nnamespace sonder::inference::http {\n\nstruct KeepAliveConfig {\n    bool enabled = true;\n    std::uint32_t idle_timeout_ms = 15000;\n    std::size_t max_requests_per_connection = 256;\n};\n\nstruct RequestFrameInfo {\n    int http_minor = 1;\n    bool client_requested_close = false;\n    bool is_sse_stream = false;\n    std::size_t unread_body_bytes = 0;\n    bool write_ok = true;\n};\n\ninline bool should_keep_alive(\n    const KeepAliveConfig& cfg,\n    const RequestFrameInfo& req,\n    bool server_stopping,\n    std::size_t requests_served_on_socket) noexcept {\n    if (!cfg.enabled || server_stopping) {\n        return false;\n    }\n    if (req.http_minor < 1 || req.client_requested_close || req.is_sse_stream) {\n        return false;\n    }\n    if (req.unread_body_bytes != 0 || !req.write_ok) {\n        return false;\n    }\n    return requests_served_on_socket < cfg.max_requests_per_connection;\n}\n\n// Residual pipelined bytes after `head_bytes + content_length` are preserved in\n// the per-connection ring buffer (`buffer.erase(0, consumed_bytes)`), while idle\n// sockets waiting for the next request mark `in_head = true` with `accepted_at`\n// refreshed so graceful server shutdown and slowloris eviction never block.\nstruct ConnectionCounters {\n    std::uint64_t sockets_accepted = 0;\n    std::uint64_t requests_served = 0;\n    std::uint64_t keepalive_reuses = 0;\n    std::uint64_t idle_timeouts = 0;\n};\n\n} // namespace sonder::inference::http\n```",
+    "max_tokens": 64,
+    "turns": [
+      {
+        "turn": 1,
+        "role_label": "cold",
+        "user": "Turn 1: In two concise sentences, explain why `SlotRouter::acquire` checks exact `session_key` before scanning for longest common prefix.",
+        "assistant_fallback": "`SlotRouter::acquire` checks `session_key` first so an active multi-turn session deterministically reclaims its dedicated slot even if its prefix is shorter than 32 tokens or shares tokens with another session. Only when no idle slot matches `session_key` does it fall back to LCP (>= 32 tokens) or LRU."
+      },
+      {
+        "turn": 2,
+        "role_label": "warm_turn_2",
+        "user": "Turn 2: Based on `should_keep_alive`, list the exact three conditions in `RequestFrameInfo` (excluding `write_ok` and `unread_body_bytes`) that force closing the socket.",
+        "assistant_fallback": "The three `RequestFrameInfo` conditions that force closing the socket are `http_minor < 1` (HTTP/1.0), `client_requested_close == true`, and `is_sse_stream == true`."
+      },
+      {
+        "turn": 3,
+        "role_label": "warm_turn_3",
+        "user": "Turn 3: In one or two sentences, state what `SlotRouter::release` updates on the matching `SlotEntry` when generation completes.",
+        "assistant_fallback": "`SlotRouter::release` moves `full_sequence` into `slot.cached_tokens`, clears `slot.busy = false`, and advances `slot.last_used_tick` to `++clock_`."
+      }
+    ]
+  },
+  "decode_regimes": [
+    {
+      "id": "code_edit",
+      "regime": "code_edit",
+      "description": "High-predictability refactoring patch preserving structure and identifiers (strong n-gram + MTP speculation acceptance).",
+      "prompt": "Refactor the Python class below to add thread safety with `threading.Lock`, add a `snapshot() -> dict[str, float]` method returning `count`, `total_ms`, `mean_ms`, and `acceptance_ratio`, and validate negative inputs with `ValueError`. Keep all existing method names and docstrings intact and return the complete updated class inside a ```python block.\n\n```python\nclass DecodeWindowStats:\n    \"\"\"Tracks rolling decode latency and speculative draft acceptance.\"\"\"\n\n    def __init__(self, window_name: str) -> None:\n        self.window_name = window_name\n        self.count = 0\n        self.total_ms = 0.0\n        self.draft_proposed = 0\n        self.draft_accepted = 0\n\n    def record(self, elapsed_ms: float, proposed: int = 0, accepted: int = 0) -> None:\n        self.count += 1\n        self.total_ms += elapsed_ms\n        self.draft_proposed += proposed\n        self.draft_accepted += accepted\n\n    def reset(self) -> None:\n        self.count = 0\n        self.total_ms = 0.0\n        self.draft_proposed = 0\n        self.draft_accepted = 0\n```",
+      "max_tokens": 256
+    },
+    {
+      "id": "structured_json",
+      "regime": "structured_json",
+      "description": "Constrained JSON object generation with response_format=json_object (tests GBNF grammar sampler + speculation).",
+      "response_format": {
+        "type": "json_object"
+      },
+      "prompt": "Produce a JSON object summarizing a 4-model Bonsai benchmark matrix with keys `suite_version` (string), `gpu` (object with `name`, `arch`, `vram_mib`), and `models` (array of 4 objects for `Bonsai-4B-MTP`, `Bonsai-9B-MTP`, `Bonsai-27B-PQ2`, `Bonsai-27B-Q1`, each having `id`, `quant`, `spec_mode`, `slots`, and `kv_cache_type`). Return valid JSON only.",
+      "max_tokens": 256
+    },
+    {
+      "id": "reasoning_math",
+      "regime": "reasoning_math",
+      "description": "Step-by-step systems performance arithmetic and Little's Law queueing derivation.",
+      "prompt": "An inference server has 4 concurrent KV slots serving a 32,768-token context pool. Each request prefills 1,600 uncached tokens at 3,200 tok/s (0.50 s) and decodes 240 tokens. Without speculation, decode runs at 60 tok/s. With `draft-mtp` (3 draft tokens per step, 70% acceptance -> 3.10 tokens per verification step taking 28 ms per step), compute step-by-step: (1) baseline single-request total latency, (2) `draft-mtp` decode time and total latency, (3) end-to-end speedup factor, and (4) steady-state requests/minute for 1 slot.",
+      "max_tokens": 256
+    },
+    {
+      "id": "open_prose",
+      "regime": "open_prose",
+      "description": "Low-repetition technical design essay — stresses low n-gram match rates to catch speculation regressions.",
+      "prompt": "Write a clear, varied technical design note (~200 words, continuous paragraphs, no bullet lists or code blocks) contrasting memory-bandwidth bottlenecks during single-batch autoregressive decoding against compute-bound matrix multiplications during large-chunk prompt prefill on modern GPUs, and explain why sub-2-bit weight quantization shifts the bottleneck toward KV cache traffic and kernel launch latency. Avoid repeating phrases.",
+      "max_tokens": 256
+    }
+  ],
+  "concurrency": {
+    "default_levels": [
+      1,
+      2,
+      4
+    ],
+    "max_tokens": 96,
+    "prompts": [
+      "Write a concise 4-line C++20 struct `KvBudget` with fields `weights_mib`, `kv_mib`, `headroom_mib`, and a `fits(uint64_t total_mib)` method.",
+      "Explain in three short sentences why KV prefix reuse lowers TTFT on multi-turn coding agents without changing decode token quality.",
+      "Return a compact Python function `clamp_int(val: int, lo: int, hi: int) -> int` and two `assert` lines testing boundary inputs.",
+      "In three bullet points, compare `ngram-mod` self-speculation with `draft-mtp` multi-token prediction regarding extra VRAM and prose fallback."
+    ]
+  },
+  "keepalive": {
+    "path": "/v1/models",
+    "method": "GET",
+    "requests": 10
+  },
+  "quality_probes": [
+    {
+      "id": "math_linear_comb",
+      "category": "math",
+      "prompt": "Calculate the exact value of (37 * 43) + (128 * 15) - 611. Show brief arithmetic and end your response with the exact line: FINAL_ANSWER: <integer>",
+      "max_tokens": 256,
+      "temperature": 0,
+      "seed": 42,
+      "grader": {
+        "type": "math",
+        "expected": 2900,
+        "tolerance": 1e-06
+      },
+      "reference_answer": "37 * 43 = 1591\n128 * 15 = 1920\n1591 + 1920 - 611 = 2900\nFINAL_ANSWER: 2900"
+    },
+    {
+      "id": "math_prefill_decode_ms",
+      "category": "math",
+      "prompt": "A server prefills 2,400 tokens at 1,600 tokens/second and then decodes 189 tokens at 63 tokens/second. Assuming zero network overhead, what is the total elapsed time in milliseconds? Show brief steps and end your response with the exact line: FINAL_ANSWER: <integer>",
+      "max_tokens": 256,
+      "temperature": 0,
+      "seed": 42,
+      "grader": {
+        "type": "math",
+        "expected": 4500,
+        "tolerance": 1e-06
+      },
+      "reference_answer": "Prefill: 2400 / 1600 = 1.5 s = 1500 ms.\nDecode: 189 / 63 = 3.0 s = 3000 ms.\nTotal: 4500 ms.\nFINAL_ANSWER: 4500"
+    },
+    {
+      "id": "math_arithmetic_series",
+      "category": "math",
+      "prompt": "Find the exact sum of the first 12 positive multiples of 7 (that is, 7 + 14 + 21 + ... + 84). Show brief work and end your response with the exact line: FINAL_ANSWER: <integer>",
+      "max_tokens": 256,
+      "temperature": 0,
+      "seed": 42,
+      "grader": {
+        "type": "math",
+        "expected": 546,
+        "tolerance": 1e-06
+      },
+      "reference_answer": "Sum = 7 * (12 * 13 / 2) = 7 * 78 = 546.\nFINAL_ANSWER: 546"
+    },
+    {
+      "id": "code_merge_intervals",
+      "category": "python_code",
+      "prompt": "Write a Python 3 function `merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]` that merges all overlapping or touching closed intervals `[start, end]` (for example `(1, 3)` and `(3, 5)` merge into `(1, 5)`) and returns the merged intervals sorted by start. Return ONLY valid Python code inside a ```python block, with no external imports outside stdlib.",
+      "max_tokens": 256,
+      "temperature": 0,
+      "seed": 42,
+      "grader": {
+        "type": "python_code",
+        "entry_point": "merge_intervals",
+        "timeout_s": 3.0,
+        "test_code": "def _norm(xs):\n    return [tuple(x) for x in xs]\n\nassert _norm(merge_intervals([])) == []\nassert _norm(merge_intervals([(5, 7)])) == [(5, 7)]\nassert _norm(merge_intervals([(1, 3), (3, 5), (8, 10), (9, 12)])) == [(1, 5), (8, 12)]\nassert _norm(merge_intervals([(10, 15), (1, 4), (2, 6), (8, 9)])) == [(1, 6), (8, 9), (10, 15)]\nassert _norm(merge_intervals([(1, 10), (2, 3), (4, 8)])) == [(1, 10)]\n"
+      },
+      "reference_answer": "```python\ndef merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:\n    if not intervals:\n        return []\n    ordered = sorted((int(a), int(b)) for a, b in intervals)\n    merged = [ordered[0]]\n    for start, end in ordered[1:]:\n        prev_s, prev_e = merged[-1]\n        if start <= prev_e:\n            merged[-1] = (prev_s, max(prev_e, end))\n        else:\n            merged.append((start, end))\n    return merged\n```"
+    },
+    {
+      "id": "code_lcp_tokens",
+      "category": "python_code",
+      "prompt": "Write a Python 3 function `lcp_length(a: list[int], b: list[int]) -> int` that returns the length of the longest common prefix of two integer token sequences `a` and `b`. Return ONLY valid Python code inside a ```python block.",
+      "max_tokens": 256,
+      "temperature": 0,
+      "seed": 42,
+      "grader": {
+        "type": "python_code",
+        "entry_point": "lcp_length",
+        "timeout_s": 3.0,
+        "test_code": "assert lcp_length([], []) == 0\nassert lcp_length([1, 2, 3], []) == 0\nassert lcp_length([9, 2, 3], [1, 2, 3]) == 0\nassert lcp_length([10, 20, 30, 40], [10, 20, 99, 40]) == 2\nassert lcp_length([4, 5, 6], [4, 5, 6, 7, 8]) == 3\nassert lcp_length([1, 1, 1], [1, 1, 1]) == 3\n"
+      },
+      "reference_answer": "```python\ndef lcp_length(a: list[int], b: list[int]) -> int:\n    limit = min(len(a), len(b))\n    i = 0\n    while i < limit and a[i] == b[i]:\n        i += 1\n    return i\n```"
+    },
+    {
+      "id": "code_tiny_lru",
+      "category": "python_code",
+      "prompt": "Write a Python 3 class `TinyLRU` implementing a fixed-capacity Least-Recently-Used cache:\n- `__init__(self, capacity: int)`: positive integer capacity.\n- `get(self, key: str) -> int`: returns the stored int value (and marks `key` most-recently-used), or `-1` if absent.\n- `put(self, key: str, value: int) -> None`: inserts or updates `key` as most-recently-used, evicting the least-recently-used key if size exceeds `capacity`.\nReturn ONLY valid Python code inside a ```python block.",
+      "max_tokens": 256,
+      "temperature": 0,
+      "seed": 42,
+      "grader": {
+        "type": "python_code",
+        "entry_point": "TinyLRU",
+        "timeout_s": 3.0,
+        "test_code": "c = TinyLRU(2)\nassert c.get('a') == -1\nc.put('a', 10)\nc.put('b', 20)\nassert c.get('a') == 10\nc.put('c', 30)\nassert c.get('b') == -1\nassert c.get('a') == 10\nassert c.get('c') == 30\nc.put('a', 99)\nc.put('d', 40)\nassert c.get('c') == -1\nassert c.get('a') == 99\nassert c.get('d') == 40\n"
+      },
+      "reference_answer": "```python\nfrom collections import OrderedDict\n\nclass TinyLRU:\n    def __init__(self, capacity: int) -> None:\n        self.capacity = capacity\n        self.data: OrderedDict[str, int] = OrderedDict()\n\n    def get(self, key: str) -> int:\n        if key not in self.data:\n            return -1\n        self.data.move_to_end(key)\n        return self.data[key]\n\n    def put(self, key: str, value: int) -> None:\n        if key in self.data:\n            self.data.move_to_end(key)\n        self.data[key] = value\n        if len(self.data) > self.capacity:\n            self.data.popitem(last=False)\n```"
+    },
+    {
+      "id": "json_gpu_telemetry",
+      "category": "json_schema",
+      "response_format": {
+        "type": "json_object"
+      },
+      "prompt": "Extract the hardware note below into a single JSON object with EXACT keys:\n- `vendor` (string, lowercase)\n- `device_name` (string)\n- `vram_mib` (integer)\n- `is_uma` (boolean)\n- `backends` (array of strings)\nReturn valid JSON only.\n\nNote: Detected discrete NVIDIA GeForce RTX 5070 Ti adapter with 16384 MiB dedicated GDDR7 memory (non-UMA) supporting cuda and vulkan backends.",
+      "max_tokens": 192,
+      "temperature": 0,
+      "seed": 42,
+      "grader": {
+        "type": "json_schema",
+        "required_keys": {
+          "vendor": "str",
+          "device_name": "str",
+          "vram_mib": "int",
+          "is_uma": "bool",
+          "backends": "list[str]"
+        },
+        "expected_values": {
+          "vendor": "nvidia",
+          "vram_mib": 16384,
+          "is_uma": false
+        }
+      },
+      "reference_answer": "{\"vendor\":\"nvidia\",\"device_name\":\"NVIDIA GeForce RTX 5070 Ti\",\"vram_mib\":16384,\"is_uma\":false,\"backends\":[\"cuda\",\"vulkan\"]}"
+    },
+    {
+      "id": "json_model_profile",
+      "category": "json_schema",
+      "response_format": {
+        "type": "json_object"
+      },
+      "prompt": "Extract the model launch record below into a single JSON object with EXACT keys:\n- `model_id` (string)\n- `quantization` (string)\n- `ctx_tokens` (integer)\n- `slots` (integer)\n- `mtp_enabled` (boolean)\nReturn valid JSON only.\n\nRecord: Loaded `Bonsai-2-9B-MTP` quantized as `PQ2_0` with context window `32768` across `4` parallel KV slots and native `draft-mtp` multi-token prediction active.",
+      "max_tokens": 192,
+      "temperature": 0,
+      "seed": 42,
+      "grader": {
+        "type": "json_schema",
+        "required_keys": {
+          "model_id": "str",
+          "quantization": "str",
+          "ctx_tokens": "int",
+          "slots": "int",
+          "mtp_enabled": "bool"
+        },
+        "expected_values": {
+          "model_id": "Bonsai-2-9B-MTP",
+          "quantization": "PQ2_0",
+          "ctx_tokens": 32768,
+          "slots": 4,
+          "mtp_enabled": true
+        }
+      },
+      "reference_answer": "{\"model_id\":\"Bonsai-2-9B-MTP\",\"quantization\":\"PQ2_0\",\"ctx_tokens\":32768,\"slots\":4,\"mtp_enabled\":true}"
+    },
+    {
+      "id": "json_bench_summary",
+      "category": "json_schema",
+      "response_format": {
+        "type": "json_object"
+      },
+      "prompt": "Convert this benchmark log line into a single JSON object with EXACT keys:\n- `run_id` (string)\n- `concurrency` (integer)\n- `ttft_p95_ms` (number)\n- `all_passed` (boolean)\n- `suites` (array of strings)\nReturn valid JSON only.\n\nLog: run_id=w1-h2h-0042 completed concurrency=4 with ttft_p95_ms=41.5 and 0 failures (all_passed=true) across suites prefill, decode, and quality.",
+      "max_tokens": 192,
+      "temperature": 0,
+      "seed": 42,
+      "grader": {
+        "type": "json_schema",
+        "required_keys": {
+          "run_id": "str",
+          "concurrency": "int",
+          "ttft_p95_ms": "number",
+          "all_passed": "bool",
+          "suites": "list[str]"
+        },
+        "expected_values": {
+          "run_id": "w1-h2h-0042",
+          "concurrency": 4,
+          "all_passed": true
+        }
+      },
+      "reference_answer": "{\"run_id\":\"w1-h2h-0042\",\"concurrency\":4,\"ttft_p95_ms\":41.5,\"all_passed\":true,\"suites\":[\"prefill\",\"decode\",\"quality\"]}"
+    },
+    {
+      "id": "logic_service_order",
+      "category": "logic",
+      "prompt": "Four services (`Alpha`, `Bravo`, `Charlie`, `Delta`) must start one at a time subject to all three rules:\n1. `Bravo` must start after `Delta`.\n2. `Alpha` must start after `Bravo`.\n3. `Charlie` must start before `Delta`.\nDetermine the unique valid startup order from first to fourth, and output ONLY that comma-separated list in exact format: `ORDER: First, Second, Third, Fourth`",
+      "max_tokens": 192,
+      "temperature": 0,
+      "seed": 42,
+      "grader": {
+        "type": "logic",
+        "regex_all": [
+          "ORDER:\\s*Charlie\\s*,\\s*Delta\\s*,\\s*Bravo\\s*,\\s*Alpha\\b"
+        ]
+      },
+      "reference_answer": "ORDER: Charlie, Delta, Bravo, Alpha"
+    },
+    {
+      "id": "logic_flag_deduction",
+      "category": "logic",
+      "prompt": "Deduce the unique boolean values (`true` or `false`) of three runtime flags `A`, `B`, `C` that satisfy all three rules:\n1. `C` is `true`.\n2. If `A` is `true`, then `C` is `false`.\n3. At least one of `A` or `B` is `true`.\nShow one sentence of reasoning and end with exact format: `FLAGS: A=<bool>, B=<bool>, C=<bool>` (lowercase `true`/`false`).",
+      "max_tokens": 256,
+      "temperature": 0,
+      "seed": 42,
+      "grader": {
+        "type": "logic",
+        "regex_all": [
+          "FLAGS:\\s*A=false\\s*,\\s*B=true\\s*,\\s*C=true\\b"
+        ]
+      },
+      "reference_answer": "Since C is true, Rule 2 implies A is false, and Rule 3 then implies B is true.\nFLAGS: A=false, B=true, C=true"
+    },
+    {
+      "id": "logic_strict_three_bullets",
+      "category": "logic",
+      "prompt": "Follow EVERY formatting constraint strictly:\n1. Output MUST have at least 3 lines, no blank lines, and EVERY line must start with `- `.\n2. Output EXACTLY 3 bullet lines total: line 1 naming `prefill`, line 2 naming `decode`, line 3 naming `speculation`.\n3. Do NOT use the words `however`, `furthermore`, or `moreover` anywhere.\n4. End each of the 3 lines with a period `.`.",
+      "max_tokens": 192,
+      "temperature": 0,
+      "seed": 42,
+      "grader": {
+        "type": "logic",
+        "non_empty_line_count": 3,
+        "no_blank_lines": true,
+        "line_regex": "^-\\s+.+\\.$",
+        "regex_all": [
+          "(?im)^-\\s+.*\\bprefill\\b.*\\.$",
+          "(?im)^-\\s+.*\\bdecode\\b.*\\.$",
+          "(?im)^-\\s+.*\\bspeculation\\b.*\\.$"
+        ],
+        "regex_none": [
+          "(?i)\\b(?:however|furthermore|moreover)\\b"
+        ]
+      },
+      "reference_answer": "- Prompt prefill processes input tokens in parallel matrix batches.\n- Autoregressive decode emits one step at a time using cached KV states.\n- Draft speculation verifies candidate tokens in a single target batch."
+    }
+  ],
+  "prompts": [
+    {
+      "id": "prefill_short_128",
+      "workload": "prefill_short",
+      "prompt": "Inspect this C++20 streaming benchmark helper and state in two concise sentences what edge case occurs when `total_tokens <= 1` or `total_s <= ttft_s` (for example on a single-token reply), and why `total_tokens - 1` is used in the numerator:\n\n```cpp\n#include <cstdint>\n#include <optional>\n\nstd::optional<double> wall_decode_tps(std::uint64_t total_tokens, double ttft_s, double total_s) {\n    if (total_tokens <= 1 || total_s <= ttft_s) return std::nullopt;\n    return static_cast<double>(total_tokens - 1) / (total_s - ttft_s);\n}\n```",
+      "max_tokens": 48
+    },
+    {
+      "id": "prefill_medium_1024",
+      "workload": "prefill_medium",
+      "prompt": "Review the `SlotRouter` C++20 header below and answer in three concise bullet points:\n(1) Why `max_reusable` clamps `matched_prefix` to `prompt.size() - 1`.\n(2) In what priority order `acquire()` selects an idle slot.\n(3) What happens when `session_key` matches no idle slot and all idle slots have `lcp < 32`.\n\n```cpp\n#pragma once\n#include <algorithm>\n#include <cstdint>\n#include <limits>\n#include <span>\n#include <string>\n#include <string_view>\n#include <vector>\n\nnamespace sonder::inference::kv {\n\nstruct SlotEntry {\n    std::int32_t slot_id = 0;\n    std::vector<std::int32_t> cached_tokens;\n    std::string session_key;\n    std::uint64_t last_used_tick = 0;\n    bool busy = false;\n};\n\nstruct RouteDecision {\n    std::int32_t slot_id = -1;\n    std::size_t matched_prefix = 0;\n    std::size_t tokens_to_prefill = 0;\n    bool exact_key_hit = false;\n};\n\ninline std::size_t longest_common_prefix(\n    std::span<const std::int32_t> a,\n    std::span<const std::int32_t> b) noexcept {\n    const std::size_t limit = std::min(a.size(), b.size());\n    std::size_t idx = 0;\n    while (idx < limit && a[idx] == b[idx]) {\n        ++idx;\n    }\n    return idx;\n}\n\nclass SlotRouter {\npublic:\n    explicit SlotRouter(std::int32_t num_slots) {\n        slots_.reserve(static_cast<std::size_t>(std::max(1, num_slots)));\n        for (std::int32_t i = 0; i < std::max(1, num_slots); ++i) {\n            slots_.push_back(SlotEntry{.slot_id = i});\n        }\n    }\n\n    RouteDecision acquire(std::span<const std::int32_t> prompt,\n                          std::string_view session_key) noexcept {\n        ++clock_;\n        if (prompt.empty()) {\n            return RouteDecision{};\n        }\n        const std::size_t max_reusable = prompt.size() - 1;\n\n        if (!session_key.empty()) {\n            for (auto& slot : slots_) {\n                if (!slot.busy && slot.session_key == session_key) {\n                    const std::size_t lcp = std::min(\n                        longest_common_prefix(slot.cached_tokens, prompt),\n                        max_reusable);\n                    slot.busy = true;\n                    slot.last_used_tick = clock_;\n                    return RouteDecision{\n                        .slot_id = slot.slot_id,\n                        .matched_prefix = lcp,\n                        .tokens_to_prefill = prompt.size() - lcp,\n                        .exact_key_hit = true,\n                    };\n                }\n            }\n        }\n\n        SlotEntry* best_lcp_slot = nullptr;\n        std::size_t best_lcp = 0;\n        SlotEntry* lru_slot = nullptr;\n        std::uint64_t oldest_tick = std::numeric_limits<std::uint64_t>::max();\n\n        for (auto& slot : slots_) {\n            if (slot.busy) {\n                continue;\n            }\n            if (slot.last_used_tick < oldest_tick) {\n                oldest_tick = slot.last_used_tick;\n                lru_slot = &slot;\n            }\n            const std::size_t lcp = std::min(\n                longest_common_prefix(slot.cached_tokens, prompt),\n                max_reusable);\n            if (lcp >= 32 && lcp > best_lcp) {\n                best_lcp = lcp;\n                best_lcp_slot = &slot;\n            }\n        }\n\n        SlotEntry* chosen = best_lcp_slot ? best_lcp_slot : lru_slot;\n        if (!chosen) {\n            return RouteDecision{};\n        }\n        const std::size_t lcp = best_lcp_slot ? best_lcp : std::min(\n            longest_common_prefix(chosen->cached_tokens, prompt), max_reusable);\n        chosen->busy = true;\n        chosen->session_key = std::string(session_key);\n        chosen->last_used_tick = clock_;\n        return RouteDecision{\n            .slot_id = chosen->slot_id,\n            .matched_prefix = lcp,\n            .tokens_to_prefill = prompt.size() - lcp,\n            .exact_key_hit = false,\n        };\n    }\n\n    void release(std::int32_t slot_id, std::vector<std::int32_t> full_sequence) {\n        for (auto& slot : slots_) {\n            if (slot.slot_id == slot_id) {\n                slot.cached_tokens = std::move(full_sequence);\n                slot.busy = false;\n                slot.last_used_tick = ++clock_;\n                return;\n            }\n        }\n    }\n\nprivate:\n    std::vector<SlotEntry> slots_;\n    std::uint64_t clock_ = 0;\n};\n\n} // namespace sonder::inference::kv\n```",
+      "max_tokens": 48
+    },
+    {
+      "id": "prefill_long_3072",
+      "workload": "long_context",
+      "prompt": "You are auditing the two inference runtime modules and placement ledger below. Answer in four numbered points (at most two sentences each):\n1. How `SlotRouter::acquire` prevents returning stale logits on an exact full-prompt cache hit.\n2. How `AdaptiveDraftController::record_step` protects open-ended prose from speculative verification regressions.\n3. How `NgramLookupTable::draft` resolves hash collisions before proposing tokens and what fallback it tries.\n4. Why `Bonsai-2 27B-PQ2` and `27B-Q1` benchmarks must run sequentially rather than concurrently on a 16 GiB GPU.\n\n```cpp\n// Module: kv_slot_table.hpp — Multi-slot Longest-Common-Prefix KV Router\n#pragma once\n#include <algorithm>\n#include <cstdint>\n#include <limits>\n#include <span>\n#include <string>\n#include <string_view>\n#include <vector>\n\nnamespace sonder::inference::kv {\n\nstruct SlotEntry {\n    std::int32_t slot_id = 0;\n    std::vector<std::int32_t> cached_tokens;\n    std::string session_key;\n    std::uint64_t last_used_tick = 0;\n    bool busy = false;\n};\n\nstruct RouteDecision {\n    std::int32_t slot_id = -1;\n    std::size_t matched_prefix = 0;\n    std::size_t tokens_to_prefill = 0;\n    bool exact_key_hit = false;\n};\n\ninline std::size_t longest_common_prefix(\n    std::span<const std::int32_t> a,\n    std::span<const std::int32_t> b) noexcept {\n    const std::size_t limit = std::min(a.size(), b.size());\n    std::size_t idx = 0;\n    while (idx < limit && a[idx] == b[idx]) {\n        ++idx;\n    }\n    return idx;\n}\n\nclass SlotRouter {\npublic:\n    explicit SlotRouter(std::int32_t num_slots) {\n        slots_.reserve(static_cast<std::size_t>(std::max(1, num_slots)));\n        for (std::int32_t i = 0; i < std::max(1, num_slots); ++i) {\n            slots_.push_back(SlotEntry{.slot_id = i});\n        }\n    }\n\n    RouteDecision acquire(std::span<const std::int32_t> prompt,\n                          std::string_view session_key) noexcept {\n        ++clock_;\n        if (prompt.empty()) {\n            return RouteDecision{};\n        }\n        // Always re-evaluate at least the final token so logits are fresh.\n        const std::size_t max_reusable = prompt.size() - 1;\n\n        // 1. Exact session_key match among idle slots.\n        if (!session_key.empty()) {\n            for (auto& slot : slots_) {\n                if (!slot.busy && slot.session_key == session_key) {\n                    const std::size_t lcp = std::min(\n                        longest_common_prefix(slot.cached_tokens, prompt),\n                        max_reusable);\n                    slot.busy = true;\n                    slot.last_used_tick = clock_;\n                    return RouteDecision{\n                        .slot_id = slot.slot_id,\n                        .matched_prefix = lcp,\n                        .tokens_to_prefill = prompt.size() - lcp,\n                        .exact_key_hit = true,\n                    };\n                }\n            }\n        }\n\n        // 2. Best LCP match (>= 32 tokens) among idle slots.\n        SlotEntry* best_lcp_slot = nullptr;\n        std::size_t best_lcp = 0;\n        SlotEntry* lru_slot = nullptr;\n        std::uint64_t oldest_tick = std::numeric_limits<std::uint64_t>::max();\n\n        for (auto& slot : slots_) {\n            if (slot.busy) {\n                continue;\n            }\n            if (slot.last_used_tick < oldest_tick) {\n                oldest_tick = slot.last_used_tick;\n                lru_slot = &slot;\n            }\n            const std::size_t lcp = std::min(\n                longest_common_prefix(slot.cached_tokens, prompt),\n                max_reusable);\n            if (lcp >= 32 && lcp > best_lcp) {\n                best_lcp = lcp;\n                best_lcp_slot = &slot;\n            }\n        }\n\n        SlotEntry* chosen = best_lcp_slot ? best_lcp_slot : lru_slot;\n        if (!chosen) {\n            return RouteDecision{};\n        }\n        const std::size_t lcp = best_lcp_slot ? best_lcp : std::min(\n            longest_common_prefix(chosen->cached_tokens, prompt), max_reusable);\n        chosen->busy = true;\n        chosen->session_key = std::string(session_key);\n        chosen->last_used_tick = clock_;\n        return RouteDecision{\n            .slot_id = chosen->slot_id,\n            .matched_prefix = lcp,\n            .tokens_to_prefill = prompt.size() - lcp,\n            .exact_key_hit = false,\n        };\n    }\n\n    void release(std::int32_t slot_id, std::vector<std::int32_t> full_sequence) {\n        for (auto& slot : slots_) {\n            if (slot.slot_id == slot_id) {\n                slot.cached_tokens = std::move(full_sequence);\n                slot.busy = false;\n                slot.last_used_tick = ++clock_;\n                return;\n            }\n        }\n    }\n\nprivate:\n    std::vector<SlotEntry> slots_;\n    std::uint64_t clock_ = 0;\n};\n\n} // namespace sonder::inference::kv\n\n// Module: adaptive_speculator.hpp — Self-Speculative N-Gram & Draft-MTP Controller\n#pragma once\n#include <array>\n#include <cstddef>\n#include <cstdint>\n#include <span>\n#include <vector>\n\nnamespace sonder::inference::spec {\n\nenum class SpecMode : std::uint8_t {\n    kNone = 0,\n    kNgramMod = 1,\n    kDraftMtp = 2,\n};\n\nstruct SpecTelemetry {\n    std::uint64_t draft_proposed = 0;\n    std::uint64_t draft_accepted = 0;\n    std::uint64_t verify_batches = 0;\n    std::uint64_t cooldown_skips = 0;\n\n    double acceptance_ratio() const noexcept {\n        return draft_proposed > 0\n            ? static_cast<double>(draft_accepted) / static_cast<double>(draft_proposed)\n            : 0.0;\n    }\n};\n\nclass AdaptiveDraftController {\npublic:\n    AdaptiveDraftController(SpecMode mode, std::int32_t max_draft)\n        : mode_(mode),\n          configured_max_(std::clamp(max_draft, 0, 32)),\n          current_max_(configured_max_ > 0 ? configured_max_ : (mode == SpecMode::kDraftMtp ? 3 : 8)) {}\n\n    std::int32_t next_draft_budget() noexcept {\n        if (mode_ == SpecMode::kNone || current_max_ <= 0) {\n            return 0;\n        }\n        if (cooldown_remaining_ > 0) {\n            --cooldown_remaining_;\n            ++telemetry_.cooldown_skips;\n            return 0;\n        }\n        return current_max_;\n    }\n\n    void record_step(std::int32_t proposed, std::int32_t accepted) noexcept {\n        if (proposed <= 0) {\n            return;\n        }\n        telemetry_.draft_proposed += static_cast<std::uint64_t>(proposed);\n        telemetry_.draft_accepted += static_cast<std::uint64_t>(accepted);\n        ++telemetry_.verify_batches;\n\n        // Exponential moving average of acceptance ratio.\n        const double step_acc = static_cast<double>(accepted) / static_cast<double>(proposed);\n        ema_acceptance_ = 0.80 * ema_acceptance_ + 0.20 * step_acc;\n\n        const std::int32_t ceiling = configured_max_ > 0\n            ? configured_max_\n            : (mode_ == SpecMode::kDraftMtp ? 3 : 8);\n\n        if (ema_acceptance_ < 0.18 && telemetry_.verify_batches >= 6) {\n            if (current_max_ > 2) {\n                current_max_ /= 2;\n            } else {\n                // Pause drafting briefly during unpredictable open-ended prose\n                // so rejected verification batches never regress decode tok/s.\n                cooldown_remaining_ = 8;\n            }\n        } else if (ema_acceptance_ > 0.65 && current_max_ < ceiling) {\n            current_max_ = std::min(ceiling, current_max_ + 1);\n        }\n    }\n\n    const SpecTelemetry& telemetry() const noexcept { return telemetry_; }\n    double ema_acceptance() const noexcept { return ema_acceptance_; }\n    std::int32_t current_max() const noexcept { return current_max_; }\n\nprivate:\n    SpecMode mode_ = SpecMode::kNone;\n    std::int32_t configured_max_ = 0;\n    std::int32_t current_max_ = 0;\n    std::int32_t cooldown_remaining_ = 0;\n    double ema_acceptance_ = 0.50;\n    SpecTelemetry telemetry_{};\n};\n\n// Hash-indexed 4-gram / 3-gram ring lookup table with O(1) incremental insert.\nclass NgramLookupTable {\npublic:\n    static constexpr std::size_t kBuckets = 4096;\n\n    void clear() noexcept {\n        entries4_.fill(Entry{});\n        entries3_.fill(Entry{});\n    }\n\n    void ingest(std::span<const std::int32_t> tokens, std::size_t start_pos = 0) noexcept {\n        for (std::size_t i = start_pos; i < tokens.size(); ++i) {\n            if (i >= 4) {\n                const std::uint32_t h4 = hash4(tokens[i - 4], tokens[i - 3], tokens[i - 2], tokens[i - 1]);\n                entries4_[h4 & (kBuckets - 1)] = Entry{.valid = true, .key_last = tokens[i - 1], .pos = static_cast<std::uint32_t>(i)};\n            }\n            if (i >= 3) {\n                const std::uint32_t h3 = hash3(tokens[i - 3], tokens[i - 2], tokens[i - 1]);\n                entries3_[h3 & (kBuckets - 1)] = Entry{.valid = true, .key_last = tokens[i - 1], .pos = static_cast<std::uint32_t>(i)};\n            }\n        }\n    }\n\n    std::vector<std::int32_t> draft(std::span<const std::int32_t> history, std::int32_t max_tokens) const {\n        std::vector<std::int32_t> out;\n        if (max_tokens <= 0 || history.size() < 4) {\n            return out;\n        }\n        const std::size_t n = history.size();\n        const std::uint32_t h4 = hash4(history[n - 4], history[n - 3], history[n - 2], history[n - 1]);\n        const Entry& e4 = entries4_[h4 & (kBuckets - 1)];\n        std::size_t match_pos = 0;\n        if (e4.valid && e4.key_last == history[n - 1] && e4.pos >= 4 && e4.pos < n) {\n            if (history[e4.pos - 4] == history[n - 4] &&\n                history[e4.pos - 3] == history[n - 3] &&\n                history[e4.pos - 2] == history[n - 2]) {\n                match_pos = e4.pos;\n            }\n        }\n        if (match_pos == 0) {\n            const std::uint32_t h3 = hash3(history[n - 3], history[n - 2], history[n - 1]);\n            const Entry& e3 = entries3_[h3 & (kBuckets - 1)];\n            if (e3.valid && e3.key_last == history[n - 1] && e3.pos >= 3 && e3.pos < n) {\n                if (history[e3.pos - 3] == history[n - 3] &&\n                    history[e3.pos - 2] == history[n - 2]) {\n                    match_pos = e3.pos;\n                }\n            }\n        }\n        if (match_pos > 0) {\n            out.reserve(static_cast<std::size_t>(max_tokens));\n            for (std::int32_t k = 0; k < max_tokens && (match_pos + static_cast<std::size_t>(k)) < n; ++k) {\n                out.push_back(history[match_pos + static_cast<std::size_t>(k)]);\n            }\n        }\n        return out;\n    }\n\nprivate:\n    struct Entry {\n        bool valid = false;\n        std::int32_t key_last = 0;\n        std::uint32_t pos = 0;\n    };\n\n    static constexpr std::uint32_t hash3(std::int32_t a, std::int32_t b, std::int32_t c) noexcept {\n        std::uint32_t h = static_cast<std::uint32_t>(a) * 2654435761u;\n        h = (h ^ static_cast<std::uint32_t>(b)) * 2246822519u;\n        h = (h ^ static_cast<std::uint32_t>(c)) * 3266489917u;\n        return h ^ (h >> 16);\n    }\n\n    static constexpr std::uint32_t hash4(std::int32_t a, std::int32_t b, std::int32_t c, std::int32_t d) noexcept {\n        std::uint32_t h = hash3(a, b, c);\n        h = (h ^ static_cast<std::uint32_t>(d)) * 668265263u;\n        return h ^ (h >> 15);\n    }\n\n    std::array<Entry, kBuckets> entries4_{};\n    std::array<Entry, kBuckets> entries3_{};\n};\n\n} // namespace sonder::inference::spec\n\n// Module: placement_audit_notes.md — Blackwell & Radeon RX XT VRAM Budget Ledger\n// 1. Bonsai-2 4B-MTP PQ2_0-MTP-Q8_0: weights ~1.35 GiB + MTP head ~0.42 GiB.\n//    At 32k context with q8_0 KV cache and 4 concurrent slots, total VRAM stays\n//    under 4.8 GiB on RTX 5070 Ti (16 GiB GDDR7, sm_120) and RX 9070 XT (16 GiB).\n// 2. Bonsai-2 9B-MTP PQ2_0-MTP-Q8_0: weights ~2.95 GiB + MTP head ~0.68 GiB.\n//    With FlashAttention enabled and kv_unified=true, 4 slots share a unified\n//    16,384-token KV pool without per-slot static reservation waste.\n// 3. Bonsai-2 27B-PQ2 & 27B-Q1: compact ternary/2-bit weights (~6.8 GiB PQ2_0,\n//    ~4.4 GiB Q1_0) fit comfortably in 16 GiB dedicated VRAM provided two 27B\n//    server processes are never co-resident simultaneously and OS WDDM/DRM\n//    headroom (~1.0 GiB on Windows 11, ~0.5 GiB on Linux) is respected.\n// 4. Hybrid Attention + DeltaNet Recurrent State: full-attention layers support\n//    arbitrary token-boundary KV truncation via llama_memory_seq_rm(mem, seq, lcp, -1),\n//    whereas recurrent SSM/DeltaNet layers require snapshot alignment when rolling\n//    back rejected draft tokens during draft-mtp verification batches.\n```",
+      "max_tokens": 64
+    },
+    {
+      "id": "decode_code_edit",
+      "workload": "code_edit",
+      "prompt": "Refactor the Python class below to add thread safety with `threading.Lock`, add a `snapshot() -> dict[str, float]` method returning `count`, `total_ms`, `mean_ms`, and `acceptance_ratio`, and validate negative inputs with `ValueError`. Keep all existing method names and docstrings intact and return the complete updated class inside a ```python block.\n\n```python\nclass DecodeWindowStats:\n    \"\"\"Tracks rolling decode latency and speculative draft acceptance.\"\"\"\n\n    def __init__(self, window_name: str) -> None:\n        self.window_name = window_name\n        self.count = 0\n        self.total_ms = 0.0\n        self.draft_proposed = 0\n        self.draft_accepted = 0\n\n    def record(self, elapsed_ms: float, proposed: int = 0, accepted: int = 0) -> None:\n        self.count += 1\n        self.total_ms += elapsed_ms\n        self.draft_proposed += proposed\n        self.draft_accepted += accepted\n\n    def reset(self) -> None:\n        self.count = 0\n        self.total_ms = 0.0\n        self.draft_proposed = 0\n        self.draft_accepted = 0\n```",
+      "max_tokens": 256
+    },
+    {
+      "id": "decode_structured_json",
+      "workload": "structured_json",
+      "prompt": "Produce a JSON object summarizing a 4-model Bonsai benchmark matrix with keys `suite_version` (string), `gpu` (object with `name`, `arch`, `vram_mib`), and `models` (array of 4 objects for `Bonsai-4B-MTP`, `Bonsai-9B-MTP`, `Bonsai-27B-PQ2`, `Bonsai-27B-Q1`, each having `id`, `quant`, `spec_mode`, `slots`, and `kv_cache_type`). Return valid JSON only.",
+      "max_tokens": 256
+    },
+    {
+      "id": "decode_reasoning_math",
+      "workload": "reasoning_math",
+      "prompt": "An inference server has 4 concurrent KV slots serving a 32,768-token context pool. Each request prefills 1,600 uncached tokens at 3,200 tok/s (0.50 s) and decodes 240 tokens. Without speculation, decode runs at 60 tok/s. With `draft-mtp` (3 draft tokens per step, 70% acceptance -> 3.10 tokens per verification step taking 28 ms per step), compute step-by-step: (1) baseline single-request total latency, (2) `draft-mtp` decode time and total latency, (3) end-to-end speedup factor, and (4) steady-state requests/minute for 1 slot.",
+      "max_tokens": 256
+    },
+    {
+      "id": "decode_open_prose",
+      "workload": "open_prose",
+      "prompt": "Write a clear, varied technical design note (~200 words, continuous paragraphs, no bullet lists or code blocks) contrasting memory-bandwidth bottlenecks during single-batch autoregressive decoding against compute-bound matrix multiplications during large-chunk prompt prefill on modern GPUs, and explain why sub-2-bit weight quantization shifts the bottleneck toward KV cache traffic and kernel launch latency. Avoid repeating phrases.",
+      "max_tokens": 256
+    },
+    {
+      "id": "concurrency_fanout_4way",
+      "workload": "agent_fanout",
+      "shared_prefix": "You are a parallel benchmark worker. Complete only your assigned prompt concisely.",
+      "children": [
+        "Write a concise 4-line C++20 struct `KvBudget` with fields `weights_mib`, `kv_mib`, `headroom_mib`, and a `fits(uint64_t total_mib)` method.",
+        "Explain in three short sentences why KV prefix reuse lowers TTFT on multi-turn coding agents without changing decode token quality.",
+        "Return a compact Python function `clamp_int(val: int, lo: int, hi: int) -> int` and two `assert` lines testing boundary inputs.",
+        "In three bullet points, compare `ngram-mod` self-speculation with `draft-mtp` multi-token prediction regarding extra VRAM and prose fallback."
+      ],
+      "max_tokens": 96
+    }
+  ]
+}
