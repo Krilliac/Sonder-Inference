@@ -4,6 +4,9 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <string>
+#include <string_view>
+#include <vector>
 
 #include "sonder/inference/benchmark.hpp"
 
@@ -73,6 +76,47 @@ std::string safe(std::string s) {
     return s.empty() ? std::string("unknown") : s;
 }
 
+std::string mib_cell(const json::Value* gpu, std::string_view primary, std::string_view fallback = {}) {
+    if (gpu == nullptr || !gpu->is_object()) return "-";
+    const json::Value* f = gpu->find(primary);
+    if ((f == nullptr || f->is_null()) && !fallback.empty()) {
+        f = gpu->find(fallback);
+    }
+    if (f == nullptr || f->is_null()) return "-";
+    if (f->is_integer()) return f->dump();
+    if (f->is_number()) return num(f->as_double(), 0);
+    return "-";
+}
+
+// Free VRAM cell: only shows a number when dedicated_free_mib is actually
+// reported (non-null), never substituting total VRAM when free is unknown.
+std::string free_mib_cell(const json::Value* gpu) {
+    if (gpu == nullptr || !gpu->is_object()) return "-";
+    const json::Value* dedicated_free = gpu->find("dedicated_free_mib");
+    if (dedicated_free == nullptr || dedicated_free->is_null()) return "-";
+    return mib_cell(gpu, "effective_free_vram_mib", "dedicated_free_mib");
+}
+
+const json::Value* find_gpu_entry(const json::Array& arr, const std::string& id, std::size_t idx) {
+    if (!id.empty()) {
+        for (const auto& item : arr) {
+            if (!item.is_object()) continue;
+            const json::Value* item_id = item.find("id");
+            if (item_id != nullptr && item_id->is_string() && item_id->as_string() == id) {
+                return &item;
+            }
+        }
+    }
+    if (idx < arr.size() && arr[idx].is_object()) {
+        const json::Value* item_id = arr[idx].find("id");
+        const std::string item_id_str = (item_id != nullptr && item_id->is_string()) ? item_id->as_string() : std::string{};
+        if (item_id_str == id) {
+            return &arr[idx];
+        }
+    }
+    return nullptr;
+}
+
 }  // namespace
 
 std::string render_markdown(const json::Value& r) {
@@ -110,6 +154,22 @@ std::string render_markdown(const json::Value& r) {
     o << "| Runs | warmup " << text(r, {"config", "warmup_runs"}) << " + measured "
       << text(r, {"config", "measured_runs"}) << " per prompt; temperature " << text(r, {"sampling", "temperature"})
       << ", seed " << text(r, {"sampling", "seed"}) << "; cache: " << text(r, {"config", "cache_state"}) << " |\n";
+    const json::Value* conc = path(r, {"config", "concurrency"});
+    if (conc == nullptr) conc = path(r, {"summary", "concurrency"});
+    if (conc == nullptr) conc = path(r, {"options", "concurrency"});
+    if (conc != nullptr && !conc->is_null()) {
+        std::string conc_text;
+        if (conc->is_integer()) {
+            conc_text = conc->dump();
+        } else if (conc->is_number()) {
+            conc_text = num(conc->as_double(), 0);
+        } else if (conc->is_string() && !conc->as_string().empty()) {
+            conc_text = md(conc->as_string());
+        }
+        if (!conc_text.empty()) {
+            o << "| Concurrency | " << conc_text << " |\n";
+        }
+    }
     const json::Value* cold = r.find("cold_first_request_ms");
     const json::Value* cold_load = r.find("cold_first_request_backend_load_ms");
     o << "| Cold first request | " << (cold ? num(cold->as_double()) : "-") << " ms (backend load "
@@ -118,13 +178,29 @@ std::string render_markdown(const json::Value& r) {
     o << "| Wall time | " << (wall ? num(wall->as_double()) : "-") << " s |\n\n";
 
     if (const json::Value* s = r.find("summary")) {
+        const json::Value* agg = s->find("aggregate_decode_tokens_per_sec");
+        const bool has_agg = agg != nullptr && agg->is_number();
         o << "## Overall (measured requests)\n\n";
         o << "| Requests | Failures | Cancelled | TTFT p50 ms | TTFT p95 ms | Total p50 ms | Total p95 ms | "
-             "Decode tok/s p50 | Prompt tok/s p50 |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n";
+             "Decode tok/s p50 |";
+        if (has_agg) {
+            o << " Aggregate decode tok/s |";
+        }
+        o << " Prompt tok/s p50 |\n|---:|---:|---:|---:|---:|---:|---:|---:|";
+        if (has_agg) {
+            o << "---:|";
+        }
+        o << "---:|\n";
         o << "| " << text(*s, {"measured_requests"}) << " | " << text(*s, {"failures"}) << " | "
           << text(*s, {"cancelled"}) << " | " << stat(*s, "ttft_ms", "p50") << " | " << stat(*s, "ttft_ms", "p95")
           << " | " << stat(*s, "total_ms", "p50") << " | " << stat(*s, "total_ms", "p95") << " | "
-          << stat(*s, "decode_tokens_per_sec", "p50") << " | " << stat(*s, "prompt_tokens_per_sec", "p50") << " |\n\n";
+          << stat(*s, "decode_tokens_per_sec", "p50") << " | ";
+        if (has_agg) {
+            const json::Value* mr = s->find("measured_requests");
+            const bool any_req = mr == nullptr || !mr->is_integer() || mr->as_uint(1) > 0;
+            o << (any_req ? num(agg->as_double()) : "-") << " | ";
+        }
+        o << stat(*s, "prompt_tokens_per_sec", "p50") << " |\n\n";
     }
 
     if (const json::Value* pp = r.find("per_prompt"); pp && !pp->as_array().empty()) {
@@ -155,6 +231,60 @@ std::string render_markdown(const json::Value& r) {
             }
         }
     }
+
+    const json::Value* gpus_before = r.find("gpus_before");
+    const json::Value* gpus_after = r.find("gpus_after");
+    const bool has_before = gpus_before != nullptr && gpus_before->is_array() && !gpus_before->as_array().empty();
+    const bool has_after = gpus_after != nullptr && gpus_after->is_array() && !gpus_after->as_array().empty();
+    if (has_before || has_after) {
+        struct GpuRow {
+            const json::Value* before = nullptr;
+            const json::Value* after = nullptr;
+        };
+        std::vector<GpuRow> gpu_rows;
+        const json::Array empty_gpus;
+        const json::Array& before_arr = has_before ? gpus_before->as_array() : empty_gpus;
+        const json::Array& after_arr = has_after ? gpus_after->as_array() : empty_gpus;
+        if (has_after) {
+            for (std::size_t idx = 0; idx < after_arr.size(); ++idx) {
+                const auto& g = after_arr[idx];
+                if (!g.is_object()) continue;
+                const json::Value* id_val = g.find("id");
+                const std::string id_str = (id_val != nullptr && id_val->is_string()) ? id_val->as_string() : std::string{};
+                gpu_rows.push_back(GpuRow{find_gpu_entry(before_arr, id_str, idx), &g});
+            }
+            for (std::size_t idx = 0; idx < before_arr.size(); ++idx) {
+                const auto& g = before_arr[idx];
+                if (!g.is_object()) continue;
+                const json::Value* id_val = g.find("id");
+                const std::string id_str = (id_val != nullptr && id_val->is_string()) ? id_val->as_string() : std::string{};
+                if (find_gpu_entry(after_arr, id_str, idx) == nullptr) {
+                    gpu_rows.push_back(GpuRow{&g, nullptr});
+                }
+            }
+        } else {
+            for (const auto& g : before_arr) {
+                if (!g.is_object()) continue;
+                gpu_rows.push_back(GpuRow{&g, nullptr});
+            }
+        }
+        if (!gpu_rows.empty()) {
+            o << "\n## GPUs\n\n";
+            o << "| ID | Name | Vendor | Total MiB | Free Before MiB | Free After MiB | Peak Delta MiB | Backend | "
+                 "Source |\n"
+                 "|---|---|---|---:|---:|---:|---:|---|---|\n";
+            for (const auto& row : gpu_rows) {
+                const json::Value& primary = row.after != nullptr ? *row.after : *row.before;
+                o << "| " << text(primary, {"id"}) << " | " << text(primary, {"name"}) << " | "
+                  << text(primary, {"vendor"}) << " | "
+                  << mib_cell(&primary, "effective_vram_mib", "dedicated_total_mib") << " | "
+                  << free_mib_cell(row.before) << " | " << free_mib_cell(row.after) << " | "
+                  << mib_cell(row.after, "peak_vram_delta_mib") << " | "
+                  << text(primary, {"backend_hint"}) << " | " << text(primary, {"source"}) << " |\n";
+            }
+        }
+    }
+
     o << "\nTTFT and total latency are client-measured by the session (request start to first chunk / completion). "
          "Backend decode tok/s = eval_count / eval_duration when the backend reports it. Client decode tok/s = "
          "(output tokens - 1) / (total - TTFT). Do not compare across prompt lengths, quantizations, or "

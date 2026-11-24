@@ -274,7 +274,7 @@ struct Server::Impl {
         std::string version;
         probe.status(available, version);
         const std::optional<std::string> probed = available ? std::optional<std::string>(version) : std::nullopt;
-        write_json(ex, 200, build_identity_body(*residency, *served_id, synthetic, probed));
+        write_json(ex, 200, build_identity_body(opts, *residency, *served_id, synthetic, probed));
     }
 
     void handle_node(Exchange& ex) {

@@ -3,6 +3,7 @@
 // checks) for `sonder-infer serve`.
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -15,6 +16,19 @@
 
 #include "sonder/inference/server.hpp"
 #include "sonder/inference/telemetry.hpp"
+
+namespace sonder::inference::server {
+
+// Multi-profile overload of profile_catalog() (see sonder/inference/server.hpp
+// for the single-profile entry point): wires every profile in `active_profiles`
+// into `options` (models, profile_bindings, catalog "served": true) and runs
+// both per-profile and aggregate co-residency VRAM fit checks.
+json::Array profile_catalog(const std::vector<LaunchProfile>& profiles,
+                            const std::vector<const LaunchProfile*>& active_profiles, ServerOptions& options,
+                            std::optional<std::uint64_t> budget_flag, bool allow_overcommit,
+                            std::vector<std::string>& notes, std::string& refusal);
+
+}  // namespace sonder::inference::server
 
 namespace sonder::inference::server::detail {
 

@@ -288,6 +288,36 @@ bool resolve_profile_paths(const ServerOptions& opts, const std::string& profile
     return false;
 }
 
+// Mirrors LlamaCppCoreBackend::Resolve() using UTF-8 std::filesystem paths:
+// direct regular file first, then the first matching regular file under
+// `model_dirs`. Never falls back to an unrelated CWD basename.
+std::string resolve_llamacpp_gguf_path(const std::string& load_name, const std::vector<std::string>& model_dirs) {
+    if (load_name.empty()) {
+        return {};
+    }
+    const std::filesystem::path direct = path_from_utf8(load_name);
+    std::error_code direct_ec;
+    const std::filesystem::file_status direct_st = std::filesystem::status(direct, direct_ec);
+    if (!direct_ec && std::filesystem::is_regular_file(direct_st)) {
+        return load_name;
+    }
+    if (direct.is_absolute()) {
+        return {};
+    }
+    for (const std::string& dir : model_dirs) {
+        if (dir.empty()) {
+            continue;
+        }
+        const std::filesystem::path candidate = path_from_utf8(dir) / direct;
+        std::error_code dir_ec;
+        const std::filesystem::file_status st = std::filesystem::status(candidate, dir_ec);
+        if (!dir_ec && std::filesystem::is_regular_file(st)) {
+            return path_to_utf8(candidate);
+        }
+    }
+    return {};
+}
+
 }  // namespace
 
 json::Object sonder_meta() { return json::Object{{"api_version", kApiVersion}}; }
@@ -749,6 +779,60 @@ std::variant<json::Object, ApiError> execute_plan_request(const ServerOptions& o
     return out;
 }
 
+json::Object build_identity_body(const ServerOptions& opts, const ModelResidency& residency,
+                                 const std::string& served_id, bool synthetic,
+                                 const std::optional<std::string>& probed) {
+    // Identity never loads a model (no backend I/O here): a model that is
+    // not resident reports the descriptor of its last load, if any.
+    IdentityResult id;
+    const std::shared_ptr<Model> resident = residency.resident_model(served_id);
+    std::string backend_name;
+    std::optional<ModelDescriptor> last_desc;
+    const ModelDescriptor* descriptor = nullptr;
+    if (resident != nullptr) {
+        backend_name = resident->backend_name();
+        descriptor = &resident->descriptor();
+    } else {
+        for (const auto& m : residency.snapshot()) {
+            if (m.id == served_id) {
+                backend_name = m.backend;
+            }
+        }
+        last_desc = residency.last_descriptor(served_id);
+        if (last_desc.has_value()) {
+            descriptor = &*last_desc;
+        }
+    }
+    if (backend_name == "llamacpp") {
+        if (descriptor == nullptr) {
+            id = backend_identity(backend_name, served_id, nullptr, probed);
+        } else {
+            std::string load_name = served_id;
+            if (const ModelProfileBinding* binding = find_profile_binding(opts, served_id);
+                binding != nullptr && !binding->load_name.empty()) {
+                load_name = binding->load_name;
+            }
+            const std::string gguf_path = resolve_llamacpp_gguf_path(load_name, opts.backend.model_dirs);
+            if (gguf_path.empty()) {
+                id.reason = "llamacpp: GGUF file '" + load_name + "' could not be resolved to a readable regular file";
+            } else {
+                const std::vector<GpuDeviceInfo> gpus = cached_gpu_inventory();
+                id = gguf_backend_identity(backend_name, served_id, gguf_path, descriptor->context_length, probed,
+                                           &gpus);
+            }
+        }
+    } else if (resident != nullptr) {
+        id = backend_identity(*resident, probed);
+    } else {
+        id = backend_identity(backend_name, served_id, descriptor, probed);
+    }
+    return json::Object{{"schema", "sonder.inference.identity/1"},
+                        {"model", served_id},
+                        {"synthetic", synthetic},
+                        {"backend_identity", id.backend_identity},
+                        {"reason", id.reason},
+                        {"sonder", sonder_meta()}};
+}
 json::Object build_discovery_document(const ServerOptions& opts, const LiveTelemetryHub& hub,
                                       const std::string& instance_id, const std::string& node_id, bool synthetic) {
     const HubStats hs = hub.stats();

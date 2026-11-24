@@ -17,6 +17,7 @@
 #include <string_view>
 #include <vector>
 
+#include "sonder/inference/device.hpp"
 #include "sonder/inference/engine.hpp"
 #include "sonder/inference/json.hpp"
 #include "sonder/inference/sampling.hpp"
@@ -57,6 +58,10 @@ struct Corpus {
 // Largest corpus JSON accepted (checked before reading or parsing it).
 inline constexpr std::size_t kMaxCorpusFileBytes = 64u << 20;
 
+// Bounds for Options::concurrency (and `sonder-bench --concurrency`).
+inline constexpr int kMinConcurrency = 1;
+inline constexpr int kMaxConcurrency = 64;
+
 Result<Corpus> parse_corpus(std::string_view json_text);
 Result<Corpus> load_corpus(const std::string& path);
 
@@ -78,7 +83,49 @@ struct Options {
     std::optional<std::string> task_id;
     WorkloadClass workload = WorkloadClass::implementation_worker;
     int priority = 0;
+    // Parallel worker sessions per measured iteration for non-fanout prompts
+    // (clamped to [kMinConcurrency, kMaxConcurrency], i.e. 1..64). Each worker
+    // uses its own fresh Session so true aggregate decode throughput and
+    // per-request TTFT/total latency under load are measured.
+    int concurrency = 1;
+    // Capture lightweight enumerate_gpu_devices() snapshots before and after
+    // the benchmark loop into top-level `gpus_before` and `gpus_after` arrays
+    // (with per-GPU `peak_vram_delta_mib` when free VRAM dropped).
+    bool capture_gpu_snapshot = true;
 };
+
+// Serializes a GPU inventory snapshot into the `gpus_before` / `gpus_after`
+// JSON array shape. When `before` is non-null, adds `peak_vram_delta_mib` to
+// each GPU whose known free VRAM dropped relative to the matching GPU in
+// `before`.
+json::Array gpu_snapshot_to_json(const std::vector<GpuDeviceInfo>& gpus,
+                                 const std::vector<GpuDeviceInfo>* before = nullptr);
+
+// Parsed command-line arguments for the standalone `sonder-bench` runner.
+struct BenchCliArgs {
+    bool help = false;
+    std::string backend = "ollama";
+    std::string ollama_url;
+    std::string model;
+    std::string corpus_path = "bench/corpus/baseline.json";
+    std::string out_dir = "bench/results";
+    std::string stem;
+    std::string telemetry_path;
+    bool list_models = false;
+    bool dry_run = false;
+    bool require_idle = false;
+    std::uint64_t seed = 42;
+    Options options;
+};
+
+// Generated help text for `sonder-bench`.
+std::string render_bench_cli_help();
+
+// Parses `sonder-bench` argv (excluding argv[0]) against its option spec and
+// validates numeric ranges (including --concurrency 1..64 and --no-gpu-snapshot).
+// Returns true on success (or when -h/--help is present, setting out.help = true);
+// returns false and writes a diagnostic into `error` on usage errors.
+bool parse_bench_cli_args(const std::vector<std::string>& args, BenchCliArgs& out, std::string& error);
 
 // Runs every prompt through fresh sessions on `model` and returns a results
 // document (schema sonder.inference.bench/1). Progress lines go to `progress`

@@ -10,11 +10,19 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <future>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <thread>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -24,8 +32,10 @@
 #include "src/live_hub.hpp"
 #include "src/log_queue.hpp"
 #include "src/openai.hpp"
+#include "src/server_endpoints.hpp"
 #include "src/sha256.hpp"
 #include "sonder/inference/backend_setup.hpp"
+#include "sonder/inference/launch_profile.hpp"
 
 using namespace sonder::inference;
 using namespace sonder::inference::server::detail;
@@ -1038,4 +1048,571 @@ TEST_CASE("openai: ingress JSON parser rejects high-node-count array bombs (M-17
     REQUIRE(err != nullptr);
     CHECK(err->status == 400);
     CHECK(err->code == "invalid_json");
+}
+
+namespace {
+
+class SyntheticGgufBuilder {
+public:
+    void kv_str(std::string_view key, std::string_view value) {
+        append_str(kv_bytes_, key);
+        append_u32(kv_bytes_, 8);
+        append_str(kv_bytes_, value);
+        ++kv_count_;
+    }
+    void kv_u32(std::string_view key, std::uint32_t value) {
+        append_str(kv_bytes_, key);
+        append_u32(kv_bytes_, 4);
+        append_u32(kv_bytes_, value);
+        ++kv_count_;
+    }
+    void kv_bool(std::string_view key, bool value) {
+        append_str(kv_bytes_, key);
+        append_u32(kv_bytes_, 7);
+        kv_bytes_.push_back(value ? static_cast<char>(1) : static_cast<char>(0));
+        ++kv_count_;
+    }
+    void kv_str_array(std::string_view key, const std::vector<std::string>& values) {
+        append_str(kv_bytes_, key);
+        append_u32(kv_bytes_, 9);
+        append_u32(kv_bytes_, 8);
+        append_u64(kv_bytes_, values.size());
+        for (const std::string& item : values) {
+            append_str(kv_bytes_, item);
+        }
+        ++kv_count_;
+    }
+    void kv_i32_array(std::string_view key, const std::vector<std::int32_t>& values) {
+        append_str(kv_bytes_, key);
+        append_u32(kv_bytes_, 9);
+        append_u32(kv_bytes_, 5);
+        append_u64(kv_bytes_, values.size());
+        for (const std::int32_t item : values) {
+            append_u32(kv_bytes_, static_cast<std::uint32_t>(item));
+        }
+        ++kv_count_;
+    }
+    void kv_f32_array(std::string_view key, const std::vector<float>& values) {
+        append_str(kv_bytes_, key);
+        append_u32(kv_bytes_, 9);
+        append_u32(kv_bytes_, 6);
+        append_u64(kv_bytes_, values.size());
+        for (const float item : values) {
+            std::uint32_t bits = 0;
+            std::memcpy(&bits, &item, sizeof(bits));
+            append_u32(kv_bytes_, bits);
+        }
+        ++kv_count_;
+    }
+    void tensor(std::string_view name, const std::vector<std::uint64_t>& dims, std::uint32_t ggml_type) {
+        append_str(tensor_bytes_, name);
+        append_u32(tensor_bytes_, static_cast<std::uint32_t>(dims.size()));
+        for (const std::uint64_t dim : dims) {
+            append_u64(tensor_bytes_, dim);
+        }
+        append_u32(tensor_bytes_, ggml_type);
+        append_u64(tensor_bytes_, 0);
+        ++tensor_count_;
+    }
+    std::string finish(std::string_view trailing_payload = {}) const {
+        std::string out = "GGUF";
+        append_u32(out, 3);
+        append_u64(out, tensor_count_);
+        append_u64(out, kv_count_);
+        out.append(kv_bytes_);
+        out.append(tensor_bytes_);
+        out.append(trailing_payload);
+        return out;
+    }
+
+private:
+    static void append_u32(std::string& dst, std::uint32_t v) {
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            dst.push_back(static_cast<char>((v >> shift) & 0xFFu));
+        }
+    }
+    static void append_u64(std::string& dst, std::uint64_t v) {
+        for (unsigned shift = 0; shift < 64; shift += 8) {
+            dst.push_back(static_cast<char>((v >> shift) & 0xFFu));
+        }
+    }
+    static void append_str(std::string& dst, std::string_view s) {
+        append_u64(dst, s.size());
+        dst.append(s);
+    }
+
+    std::string kv_bytes_;
+    std::string tensor_bytes_;
+    std::uint64_t kv_count_ = 0;
+    std::uint64_t tensor_count_ = 0;
+};
+
+struct TempGgufFile {
+    std::filesystem::path path;
+
+    explicit TempGgufFile(const std::string& content)
+        : path(std::filesystem::temp_directory_path() / (make_id("sonder-gguf-id") + ".gguf")) {
+        write(content);
+    }
+    ~TempGgufFile() {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+    TempGgufFile(const TempGgufFile&) = delete;
+    TempGgufFile& operator=(const TempGgufFile&) = delete;
+
+    void write(const std::string& content) const {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        REQUIRE(out.good());
+        out.write(content.data(), static_cast<std::streamsize>(content.size()));
+        REQUIRE(out.good());
+    }
+    std::string path_string() const { return path_to_utf8(path); }
+};
+
+struct TempGgufDir {
+    std::filesystem::path dir;
+
+    TempGgufDir() : dir(std::filesystem::temp_directory_path() / make_id("sonder-gguf-dir")) {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        REQUIRE_FALSE(ec);
+    }
+    ~TempGgufDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+    TempGgufDir(const TempGgufDir&) = delete;
+    TempGgufDir& operator=(const TempGgufDir&) = delete;
+
+    std::string write_file(std::string_view utf8_filename, const std::string& content) const {
+        const std::filesystem::path file_path = dir / path_from_utf8(utf8_filename);
+        std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(out.good());
+        out.write(content.data(), static_cast<std::streamsize>(content.size()));
+        REQUIRE(out.good());
+        return path_to_utf8(file_path);
+    }
+    std::string dir_string() const { return path_to_utf8(dir); }
+};
+
+class StubLlamaCppBackendModel final : public BackendModel {
+public:
+    explicit StubLlamaCppBackendModel(ModelDescriptor descriptor) : descriptor_(std::move(descriptor)) {}
+    [[nodiscard]] const ModelDescriptor& descriptor() const override { return descriptor_; }
+    Result<GenerateStats> generate(const GenerateRequest& request, const CancellationToken& cancel,
+                                   const TokenCallback& on_chunk) override {
+        (void)request;
+        (void)cancel;
+        (void)on_chunk;
+        return Status(ErrorCode::unsupported, "stub backend model");
+    }
+
+private:
+    ModelDescriptor descriptor_;
+};
+
+std::string build_complete_synthetic_gguf(const std::vector<std::string>& tokens, std::string_view chat_template,
+                                          std::string_view payload, bool reverse_tokenizer_order = false) {
+    SyntheticGgufBuilder b;
+    b.kv_str("general.architecture", "llama");
+    b.kv_u32("llama.block_count", 2);
+    b.kv_u32("llama.context_length", 8192);
+    b.kv_u32("general.file_type", 15);  // Q4_K_M
+    if (!reverse_tokenizer_order) {
+        b.kv_str("tokenizer.ggml.model", "llama");
+        b.kv_str("tokenizer.ggml.pre", "default");
+        b.kv_str_array("tokenizer.ggml.tokens", tokens);
+        b.kv_str_array("tokenizer.ggml.merges", {"h e", "he llo"});
+        b.kv_f32_array("tokenizer.ggml.scores", {0.0f, -1.0f, -2.0f, 0.0f});
+        b.kv_i32_array("tokenizer.ggml.token_type", {3, 1, 1, 3});
+        b.kv_u32("tokenizer.ggml.bos_token_id", 0);
+        b.kv_u32("tokenizer.ggml.eos_token_id", 3);
+        b.kv_bool("tokenizer.ggml.add_bos_token", true);
+    } else {
+        b.kv_bool("tokenizer.ggml.add_bos_token", true);
+        b.kv_u32("tokenizer.ggml.eos_token_id", 3);
+        b.kv_u32("tokenizer.ggml.bos_token_id", 0);
+        b.kv_i32_array("tokenizer.ggml.token_type", {3, 1, 1, 3});
+        b.kv_f32_array("tokenizer.ggml.scores", {0.0f, -1.0f, -2.0f, 0.0f});
+        b.kv_str_array("tokenizer.ggml.merges", {"h e", "he llo"});
+        b.kv_str_array("tokenizer.ggml.tokens", tokens);
+        b.kv_str("tokenizer.ggml.pre", "default");
+        b.kv_str("tokenizer.ggml.model", "llama");
+    }
+    if (!chat_template.empty()) {
+        b.kv_str("tokenizer.chat_template", chat_template);
+    }
+    b.tensor("blk.0.attn_q.weight", {64, 64}, 12);  // Q4_K
+    return b.finish(payload);
+}
+
+}  // namespace
+
+TEST_CASE("identity: llamacpp GGUF produces all nine keys with real SHA-256 digests and cache invalidation") {
+    const std::string chat_template = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}";
+    const std::vector<std::string> tokens_a = {"<s>", "hello", "world", "</s>"};
+    const std::string bytes_a = build_complete_synthetic_gguf(tokens_a, chat_template, "synthetic-weights-v1");
+    TempGgufFile file(bytes_a);
+
+    const IdentityResult id =
+        gguf_backend_identity("llamacpp", "tiny-llama", file.path_string(), 4096, std::string("llama.cpp b11195"));
+    REQUIRE_MESSAGE(id.backend_identity.is_object(), id.reason.value_or(""));
+    CHECK_FALSE(id.reason.has_value());
+    const auto& o = id.backend_identity.as_object();
+    CHECK(o.size() == 9);
+    for (const char* key : {"backend", "model", "model_digest", "quantization", "backend_version", "tokenizer_digest",
+                            "template_digest", "context_tokens", "hardware"}) {
+        CHECK_MESSAGE(o.contains(key), key);
+    }
+    CHECK(o.find("backend")->as_string() == "llamacpp");
+    CHECK(o.find("model")->as_string() == "tiny-llama");
+    CHECK(o.find("model_digest")->as_string() == sha256_hex(bytes_a));
+    CHECK(o.find("quantization")->as_string() == "Q4_K_M");
+    CHECK(o.find("backend_version")->as_string() == "llama.cpp b11195");
+    CHECK(o.find("template_digest")->as_string() == sha256_hex(chat_template));
+    const std::string tok_digest_a = o.find("tokenizer_digest")->as_string();
+    CHECK(tok_digest_a.size() == 64);
+    CHECK(tok_digest_a.find_first_not_of("0123456789abcdef") == std::string::npos);
+    CHECK(o.find("context_tokens")->as_int() == 4096);
+    CHECK_FALSE(o.find("hardware")->as_string().empty());
+
+    // Deterministic across repeated calls (cache hit).
+    const IdentityResult id_again =
+        gguf_backend_identity("llamacpp", "tiny-llama", file.path_string(), 4096, std::string("llama.cpp b11195"));
+    REQUIRE(id_again.backend_identity.is_object());
+    CHECK(id_again.backend_identity.dump() == id.backend_identity.dump());
+
+    // Zero runtime context falls back to <arch>.context_length from the GGUF.
+    const IdentityResult id_train_ctx =
+        gguf_backend_identity("llamacpp", "tiny-llama", file.path_string(), 0, std::string("llama.cpp b11195"));
+    REQUIRE(id_train_ctx.backend_identity.is_object());
+    CHECK(id_train_ctx.backend_identity.find("context_tokens")->as_int() == 8192);
+
+    // backend_identity resolves GGUF path from either model_id or descriptor->name.
+    ModelDescriptor desc;
+    desc.name = "tiny-llama.gguf";
+    desc.backend = "llamacpp";
+    desc.format = "gguf";
+    desc.context_length = 4096;
+    const IdentityResult via_model_id =
+        backend_identity("llamacpp", file.path_string(), &desc, std::string("llama.cpp b11195"));
+    REQUIRE_MESSAGE(via_model_id.backend_identity.is_object(), via_model_id.reason.value_or(""));
+    CHECK(via_model_id.backend_identity.find("model_digest")->as_string() == sha256_hex(bytes_a));
+    CHECK(via_model_id.backend_identity.find("tokenizer_digest")->as_string() == tok_digest_a);
+
+    desc.name = file.path_string();
+    const IdentityResult via_desc_name =
+        backend_identity("llamacpp", "served-alias", &desc, std::string("llama.cpp b11195"));
+    REQUIRE_MESSAGE(via_desc_name.backend_identity.is_object(), via_desc_name.reason.value_or(""));
+    CHECK(via_desc_name.backend_identity.find("model")->as_string() == "served-alias");
+    CHECK(via_desc_name.backend_identity.find("model_digest")->as_string() == sha256_hex(bytes_a));
+
+    // Tokenizer digest is canonical across KV order and sensitive to vocab elements.
+    const std::string bytes_reordered =
+        build_complete_synthetic_gguf(tokens_a, chat_template, "synthetic-weights-v1", true);
+    const auto parsed_reordered = parse_gguf_model_info(bytes_reordered);
+    REQUIRE(parsed_reordered.ok());
+    CHECK(parsed_reordered.value().tokenizer_digest == tok_digest_a);
+    CHECK(parsed_reordered.value().template_digest == sha256_hex(chat_template));
+    CHECK(parsed_reordered.value().training_context_length == 8192);
+    for (const auto& [meta_k, meta_v] : parsed_reordered.value().metadata) {
+        (void)meta_v;
+        CHECK(meta_k != "tokenizer.ggml.token_type");
+    }
+
+    const std::string bytes_diff_vocab =
+        build_complete_synthetic_gguf({"<s>", "hello", "sonder", "</s>"}, chat_template, "synthetic-weights-v1");
+    const auto parsed_diff_vocab = parse_gguf_model_info(bytes_diff_vocab);
+    REQUIRE(parsed_diff_vocab.ok());
+    CHECK(parsed_diff_vocab.value().tokenizer_digest.size() == 64);
+    CHECK(parsed_diff_vocab.value().tokenizer_digest != tok_digest_a);
+
+    // Cache invalidation on size change.
+    const std::string bytes_b =
+        build_complete_synthetic_gguf(tokens_a, chat_template, "synthetic-weights-v2-extended");
+    REQUIRE(bytes_b.size() != bytes_a.size());
+    file.write(bytes_b);
+    const IdentityResult id_b =
+        gguf_backend_identity("llamacpp", "tiny-llama", file.path_string(), 4096, std::string("llama.cpp b11195"));
+    REQUIRE(id_b.backend_identity.is_object());
+    CHECK(id_b.backend_identity.find("model_digest")->as_string() == sha256_hex(bytes_b));
+    CHECK(id_b.backend_identity.find("model_digest")->as_string() != sha256_hex(bytes_a));
+
+    // Cache invalidation on same-size content rewrite with updated mtime.
+    const std::string bytes_c =
+        build_complete_synthetic_gguf(tokens_a, chat_template, "synthetic-weights-v3-extended");
+    REQUIRE(bytes_c.size() == bytes_b.size());
+    std::error_code ec;
+    const auto prev_mtime = std::filesystem::last_write_time(file.path, ec);
+    REQUIRE_FALSE(ec);
+    file.write(bytes_c);
+    std::filesystem::last_write_time(file.path, prev_mtime + std::chrono::seconds(5), ec);
+    REQUIRE_FALSE(ec);
+    const IdentityResult id_c =
+        gguf_backend_identity("llamacpp", "tiny-llama", file.path_string(), 4096, std::string("llama.cpp b11195"));
+    REQUIRE(id_c.backend_identity.is_object());
+    CHECK(id_c.backend_identity.find("model_digest")->as_string() == sha256_hex(bytes_c));
+    CHECK(id_c.backend_identity.find("model_digest")->as_string() != sha256_hex(bytes_b));
+}
+
+TEST_CASE("identity: llamacpp GGUF missing chat template or tokenizer honestly returns null") {
+    // Missing tokenizer.chat_template must never fabricate template_digest.
+    const std::string no_template = build_complete_synthetic_gguf({"<s>", "hi", "there", "</s>"}, "", "payload");
+    TempGgufFile file_no_tpl(no_template);
+    const auto info_no_tpl = read_gguf_model_info(file_no_tpl.path_string());
+    REQUIRE(info_no_tpl.ok());
+    CHECK(info_no_tpl.value().tokenizer_digest.size() == 64);
+    CHECK(info_no_tpl.value().template_digest.empty());
+
+    const IdentityResult res_no_tpl =
+        gguf_backend_identity("llamacpp", "no-tpl", file_no_tpl.path_string(), 4096, std::string("llama.cpp"));
+    CHECK(res_no_tpl.backend_identity.is_null());
+    REQUIRE(res_no_tpl.reason.has_value());
+    CHECK(res_no_tpl.reason->find("tokenizer.chat_template missing in GGUF") != std::string::npos);
+
+    // Missing all tokenizer.ggml.* metadata must never fabricate tokenizer_digest.
+    SyntheticGgufBuilder b;
+    b.kv_str("general.architecture", "llama");
+    b.kv_u32("llama.block_count", 1);
+    b.kv_u32("llama.context_length", 4096);
+    b.kv_u32("general.file_type", 7);  // Q8_0
+    b.kv_str("tokenizer.chat_template", "{{ prompt }}");
+    b.tensor("blk.0.attn_q.weight", {32, 32}, 8);
+    TempGgufFile file_no_tok(b.finish("payload"));
+    const auto info_no_tok = read_gguf_model_info(file_no_tok.path_string());
+    REQUIRE(info_no_tok.ok());
+    CHECK(info_no_tok.value().tokenizer_digest.empty());
+    CHECK(info_no_tok.value().template_digest == sha256_hex("{{ prompt }}"));
+
+    const IdentityResult res_no_tok =
+        gguf_backend_identity("llamacpp", "no-tok", file_no_tok.path_string(), 4096, std::string("llama.cpp"));
+    CHECK(res_no_tok.backend_identity.is_null());
+    REQUIRE(res_no_tok.reason.has_value());
+    CHECK(res_no_tok.reason->find("tokenizer") != std::string::npos);
+
+    // Lazy residency (null descriptor) reports an honest null reason.
+    const IdentityResult lazy = backend_identity("llamacpp", "unloaded.gguf", nullptr, std::nullopt);
+    CHECK(lazy.backend_identity.is_null());
+    REQUIRE(lazy.reason.has_value());
+    CHECK(lazy.reason->find("lazy") != std::string::npos);
+}
+
+TEST_CASE("identity: llamacpp missing or non-regular GGUF path returns null with clear reason") {
+    const std::string missing_path =
+        path_to_utf8(std::filesystem::temp_directory_path() / (make_id("sonder-missing-gguf") + ".gguf"));
+    const IdentityResult missing_res =
+        gguf_backend_identity("llamacpp", "missing", missing_path, 4096, std::string("llama.cpp b11195"));
+    CHECK(missing_res.backend_identity.is_null());
+    REQUIRE(missing_res.reason.has_value());
+    CHECK_FALSE(missing_res.reason->empty());
+
+    std::string hex;
+    std::string err;
+    CHECK_FALSE(compute_gguf_file_sha256(missing_path, hex, err));
+    CHECK(hex.empty());
+    CHECK_FALSE(err.empty());
+
+    const IdentityResult empty_res =
+        gguf_backend_identity("llamacpp", "empty", "", 4096, std::string("llama.cpp b11195"));
+    CHECK(empty_res.backend_identity.is_null());
+    REQUIRE(empty_res.reason.has_value());
+    CHECK_FALSE(compute_gguf_file_sha256("", hex, err));
+    CHECK_FALSE(err.empty());
+
+    const std::string dir_path = path_to_utf8(std::filesystem::temp_directory_path());
+    const IdentityResult dir_res =
+        gguf_backend_identity("llamacpp", "dir", dir_path, 4096, std::string("llama.cpp b11195"));
+    CHECK(dir_res.backend_identity.is_null());
+    REQUIRE(dir_res.reason.has_value());
+    CHECK(dir_res.reason->find("regular") != std::string::npos);
+    CHECK_FALSE(compute_gguf_file_sha256(dir_path, hex, err));
+    CHECK(err.find("regular") != std::string::npos);
+}
+
+TEST_CASE("gguf header: quantization mapping, dominant tensor fallback and multi-chunk file hashing") {
+    // Without general.file_type, quantization falls back to the largest-footprint tensor type.
+    SyntheticGgufBuilder fallback_builder;
+    fallback_builder.kv_str("general.architecture", "llama");
+    fallback_builder.kv_u32("llama.block_count", 1);
+    fallback_builder.tensor("blk.0.attn_norm.weight", {64}, 0);         // F32: 256 B
+    fallback_builder.tensor("blk.0.ffn_gate.weight", {128, 32}, 142);   // PQ2_0: 32 * 34 = 1088 B
+    const auto fallback_info = parse_gguf_model_info(fallback_builder.finish());
+    REQUIRE(fallback_info.ok());
+    CHECK(fallback_info.value().quantization == "PQ2_0");
+
+    // Explicit general.file_type takes precedence, including 0 (F32) and ternary/1-bit values.
+    const std::vector<std::pair<std::uint32_t, std::string>> ftypes = {
+        {0, "F32"}, {1, "F16"}, {15, "Q4_K_M"}, {25, "IQ4_NL"}, {36, "TQ1_0"}, {37, "TQ2_0"}, {40, "Q1_0"},
+    };
+    for (const auto& [ftype, expected_name] : ftypes) {
+        CAPTURE(ftype);
+        SyntheticGgufBuilder b;
+        b.kv_str("general.architecture", "llama");
+        b.kv_u32("llama.block_count", 1);
+        b.kv_u32("general.file_type", ftype);
+        b.tensor("blk.0.attn_q.weight", {32, 32}, 8);  // Q8_0 tensor overridden by general.file_type
+        const auto info = parse_gguf_model_info(b.finish());
+        REQUIRE(info.ok());
+        CHECK(info.value().quantization == expected_name);
+    }
+
+    // Streaming file SHA-256 across multiple 64 KiB chunks matches in-memory SHA-256 exactly.
+    std::string big_payload(150000, '\0');
+    for (std::size_t idx = 0; idx < big_payload.size(); ++idx) {
+        big_payload[idx] = static_cast<char>((idx * 37u + 13u) & 0xFFu);
+    }
+    TempGgufFile big_file(big_payload);
+    std::string streamed_hex;
+    std::string hash_err;
+    REQUIRE(compute_gguf_file_sha256(big_file.path_string(), streamed_hex, hash_err));
+    CHECK(hash_err.empty());
+    CHECK(streamed_hex == sha256_hex(big_payload));
+}
+
+TEST_CASE("identity: llamacpp GGUF rejects missing or empty backend version honestly") {
+    const std::string bytes =
+        build_complete_synthetic_gguf({"<s>", "hello", "world", "</s>"}, "{{ prompt }}", "ver-check");
+    TempGgufFile file(bytes);
+
+    const IdentityResult null_ver =
+        gguf_backend_identity("llamacpp", "tiny-llama", file.path_string(), 4096, std::nullopt);
+    CHECK(null_ver.backend_identity.is_null());
+    REQUIRE(null_ver.reason.has_value());
+    CHECK(null_ver.reason->find("backend version") != std::string::npos);
+
+    const IdentityResult empty_ver =
+        gguf_backend_identity("llamacpp", "tiny-llama", file.path_string(), 4096, std::string(""));
+    CHECK(empty_ver.backend_identity.is_null());
+    REQUIRE(empty_ver.reason.has_value());
+    CHECK(empty_ver.reason->find("backend version") != std::string::npos);
+
+    // Caller-supplied cached GPU inventory is formatted into `hardware`.
+    GpuDeviceInfo fake_gpu;
+    fake_gpu.id = "gpu:0";
+    fake_gpu.name = "Synthetic Accelerator";
+    fake_gpu.dedicated_total = MemoryReading::known(16384ull << 20);
+    const std::vector<GpuDeviceInfo> gpus{fake_gpu};
+    const IdentityResult with_gpu =
+        gguf_backend_identity("llamacpp", "tiny-llama", file.path_string(), 4096, std::string("llama.cpp b11195"),
+                              &gpus);
+    REQUIRE_MESSAGE(with_gpu.backend_identity.is_object(), with_gpu.reason.value_or(""));
+    const std::string hw = with_gpu.backend_identity.find("hardware")->as_string();
+    CHECK(hw.find("gpu:0 Synthetic Accelerator (16384 MiB)") != std::string::npos);
+}
+
+TEST_CASE("identity: build_identity_body resolves llamacpp GGUF via model_dirs and profile bindings") {
+    TempGgufDir models_dir;
+    const std::string chat_template = "{% for m in messages %}{{ m.content }}{% endfor %}";
+    const std::string dir_bytes =
+        build_complete_synthetic_gguf({"<s>", "dir", "model", "</s>"}, chat_template, "dir-payload");
+    const std::string profile_bytes =
+        build_complete_synthetic_gguf({"<s>", "profile", "model", "</s>"}, chat_template, "profile-payload-v2");
+    (void)models_dir.write_file("dir-model.gguf", dir_bytes);
+    const std::string profile_full_path = models_dir.write_file("profile-model.gguf", profile_bytes);
+
+    auto residency = std::make_shared<ModelResidency>(
+        ResidencyConfig{},
+        [](const std::string& id) -> Result<std::shared_ptr<Model>> {
+            ModelDescriptor d;
+            d.backend = "llamacpp";
+            d.format = "gguf";
+            d.context_length = 4096;
+            // Match LlamaCppCoreBackend::load_model(), which stores only the filename in descriptor().name.
+            if (id == "dir-model.gguf") {
+                d.name = "dir-model.gguf";
+            } else if (id == "profile-alias") {
+                d.name = "profile-model.gguf";
+            } else {
+                d.name = "dir-model.gguf";
+            }
+            auto impl = std::make_shared<StubLlamaCppBackendModel>(std::move(d));
+            return std::make_shared<Model>("inst-" + id, "llamacpp", "cpu:0", std::move(impl));
+        },
+        [](Eviction&) {});
+
+    REQUIRE(residency->add("dir-model.gguf", "llamacpp", true));
+    REQUIRE(residency->add("profile-alias", "llamacpp", false));
+    REQUIRE(residency->add("stale-alias", "llamacpp", false));
+
+    auto pin_dir = residency->acquire("dir-model.gguf");
+    REQUIRE(pin_dir.ok());
+    auto pin_profile = residency->acquire("profile-alias");
+    REQUIRE(pin_profile.ok());
+    auto pin_stale = residency->acquire("stale-alias");
+    REQUIRE(pin_stale.ok());
+
+    server::ServerOptions opts;
+    opts.backend.backend = "llamacpp";
+    opts.backend.model_dirs = {models_dir.dir_string()};
+
+    server::ModelProfileBinding profile_binding;
+    profile_binding.model = "profile-alias";
+    profile_binding.load_name = profile_full_path;
+    opts.profile_bindings.push_back(std::move(profile_binding));
+
+    server::ModelProfileBinding stale_binding;
+    stale_binding.model = "stale-alias";
+    stale_binding.load_name =
+        path_to_utf8(std::filesystem::temp_directory_path() / (make_id("sonder-absent") + ".gguf"));
+    opts.profile_bindings.push_back(std::move(stale_binding));
+
+    // Case 1: basename served_id resolved via opts.backend.model_dirs (NOT in CWD).
+    const json::Object dir_body =
+        build_identity_body(opts, *residency, "dir-model.gguf", false, std::string("llama.cpp b11195"));
+    const json::Value* dir_id = dir_body.find("backend_identity");
+    REQUIRE(dir_id != nullptr);
+    REQUIRE(dir_id->is_object());
+    CHECK(dir_body.find("reason")->is_null());
+    CHECK(dir_id->find("model")->as_string() == "dir-model.gguf");
+    CHECK(dir_id->find("model_digest")->as_string() == sha256_hex(dir_bytes));
+    CHECK(dir_id->find("template_digest")->as_string() == sha256_hex(chat_template));
+
+    // Case 2: profile alias resolved via opts.profile_bindings[i].load_name.
+    const json::Object profile_body =
+        build_identity_body(opts, *residency, "profile-alias", false, std::string("llama.cpp b11195"));
+    const json::Value* profile_id = profile_body.find("backend_identity");
+    REQUIRE(profile_id != nullptr);
+    REQUIRE(profile_id->is_object());
+    CHECK(profile_body.find("reason")->is_null());
+    CHECK(profile_id->find("model")->as_string() == "profile-alias");
+    CHECK(profile_id->find("model_digest")->as_string() == sha256_hex(profile_bytes));
+
+    // Case 3: missing profile load_name must NOT fall back to descriptor->name in model_dirs or CWD.
+    const json::Object stale_body =
+        build_identity_body(opts, *residency, "stale-alias", false, std::string("llama.cpp b11195"));
+    const json::Value* stale_id = stale_body.find("backend_identity");
+    REQUIRE(stale_id != nullptr);
+    CHECK(stale_id->is_null());
+    REQUIRE(stale_body.find("reason") != nullptr);
+    CHECK(stale_body.find("reason")->is_string());
+    CHECK_FALSE(stale_body.find("reason")->as_string().empty());
+}
+
+TEST_CASE("identity: llamacpp GGUF handles non-ASCII UTF-8 filenames cleanly") {
+    TempGgufDir utf8_dir;
+    const std::string utf8_name = "sonder-caf\xC3\xA9-\xE6\xA8\xA1\xE5\x9E\x8B.gguf";
+    const std::string chat_template = "{% for m in messages %}{{ m.content }}{% endfor %}";
+    const std::string bytes =
+        build_complete_synthetic_gguf({"<s>", "utf8", "path", "</s>"}, chat_template, "utf8-payload");
+    const std::string utf8_path = utf8_dir.write_file(utf8_name, bytes);
+
+    const auto parsed = read_gguf_model_info(utf8_path);
+    REQUIRE_MESSAGE(parsed.ok(), parsed.status().message());
+    CHECK(parsed.value().template_digest == sha256_hex(chat_template));
+    CHECK(parsed.value().tokenizer_digest.size() == 64);
+
+    std::string hex;
+    std::string err;
+    REQUIRE_MESSAGE(compute_gguf_file_sha256(utf8_path, hex, err), err);
+    CHECK(hex == sha256_hex(bytes));
+
+    // Passing empty model_id also exercises UTF-8 filename extraction without ANSI narrowing.
+    const IdentityResult id =
+        gguf_backend_identity("llamacpp", "", utf8_path, 4096, std::string("llama.cpp b11195"));
+    REQUIRE_MESSAGE(id.backend_identity.is_object(), id.reason.value_or(""));
+    CHECK(id.backend_identity.find("model")->as_string() == utf8_name);
+    CHECK(id.backend_identity.find("model_digest")->as_string() == sha256_hex(bytes));
+    CHECK(id.backend_identity.find("template_digest")->as_string() == sha256_hex(chat_template));
+    CHECK(id.backend_identity.find("tokenizer_digest")->as_string() == parsed.value().tokenizer_digest);
 }

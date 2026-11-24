@@ -261,6 +261,19 @@ struct GgufModelInfo {
     bool has_one_bit_tensors = false;        // ggml type 41 (Q1_0)
     bool has_prism_private_tensors = false;  // ggml types 142 (PQ2_0), 143 (PTQ1_0), 145 (PQ2_0M)
     bool has_fp4_or_fp8_tensors = false;     // ggml types 39 (MXFP4), 40 (NVFP4), 43 (F8_E4M3)
+    // Identity metadata extracted during the single-pass header scan.
+    // `quantization` comes from `general.file_type` when recognized, or the
+    // dominant tensor ggml type name when `general.file_type` is absent; empty
+    // if unknown. `tokenizer_digest` is a deterministic lowercase 64-hex
+    // SHA-256 over present canonical GGUF tokenizer metadata keys (empty only
+    // when no tokenizer metadata is present). `template_digest` is the
+    // lowercase 64-hex SHA-256 of raw `tokenizer.chat_template` bytes (empty
+    // when absent; never fabricated). `training_context_length` comes from
+    // `<arch>.context_length` when present (0 otherwise).
+    std::string quantization;
+    std::string tokenizer_digest;
+    std::string template_digest;
+    std::uint64_t training_context_length = 0;
 };
 
 // Parses the GGUF header of `path` (versions 2 and 3). Errors: not_found,
