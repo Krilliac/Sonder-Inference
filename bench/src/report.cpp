@@ -1,5 +1,7 @@
 // Markdown rendering and file output for benchmark results documents.
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -175,7 +177,37 @@ std::string render_markdown(const json::Value& r) {
     o << "| Cold first request | " << (cold ? num(cold->as_double()) : "-") << " ms (backend load "
       << (cold_load ? num(cold_load->as_double()) : "-") << " ms) |\n";
     const json::Value* wall = r.find("wall_seconds");
-    o << "| Wall time | " << (wall ? num(wall->as_double()) : "-") << " s |\n\n";
+    o << "| Wall time | " << (wall ? num(wall->as_double()) : "-") << " s |\n";
+    if (const json::Value* s = r.find("summary")) {
+        const json::Value* draft_total_v = s->find("draft_tokens_total");
+        if (draft_total_v != nullptr && draft_total_v->is_integer() && draft_total_v->as_uint(0) > 0) {
+            const std::uint64_t draft_total = draft_total_v->as_uint(0);
+            std::uint64_t denom = draft_total;
+            const json::Value* draft_eval_v = s->find("draft_tokens_evaluated_total");
+            if (draft_eval_v != nullptr && draft_eval_v->is_integer() && draft_eval_v->as_uint(0) > 0) {
+                denom = draft_eval_v->as_uint(0);
+            }
+            const json::Value* draft_acc_v = s->find("draft_accepted_total");
+            const json::Value* rate_v = s->find("draft_acceptance_rate");
+            o << "| Speculation | ";
+            if (draft_acc_v != nullptr && draft_acc_v->is_integer() && draft_acc_v->as_double(-1.0) >= 0.0) {
+                const std::uint64_t draft_acc = std::min(draft_acc_v->as_uint(0), denom);
+                double pct = static_cast<double>(draft_acc) * 100.0 / static_cast<double>(denom);
+                if (rate_v != nullptr && rate_v->is_number()) {
+                    const double rate = rate_v->as_double();
+                    if (std::isfinite(rate) && rate >= 0.0 && rate <= 1.0) {
+                        pct = rate * 100.0;
+                    }
+                }
+                pct = std::clamp(pct, 0.0, 100.0);
+                o << draft_acc << " / " << denom << " (" << num(pct, 1) << "%)";
+            } else {
+                o << draft_total << " draft tokens";
+            }
+            o << " |\n";
+        }
+    }
+    o << "\n";
 
     if (const json::Value* s = r.find("summary")) {
         const json::Value* agg = s->find("aggregate_decode_tokens_per_sec");
