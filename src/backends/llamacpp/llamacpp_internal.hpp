@@ -214,4 +214,43 @@ inline bool ApplyNoThinkScaffolding(std::vector<ChatPromptSegment>& segments, bo
     return true;
 }
 
+// Pins `gpu:<index>` requests onto the matching llama.cpp GPU device when the
+// caller did not pass explicit ggml device names (prevents silent fallback to
+// GPU 0 or unintended layer splitting across discrete + integrated GPUs).
+inline Status ResolveGpuDevicePin(std::string_view device_id,
+                                  const std::vector<sonder::backends::llamacpp::DeviceInfo>& available_devices,
+                                  std::vector<std::string>& out_devices, std::int32_t& out_main_gpu) {
+    if (!out_devices.empty()) return Status::success();
+    if (device_id.rfind("gpu:", 0) != 0) return Status::success();
+    const std::string_view suffix = device_id.substr(4);
+    if (suffix.empty()) {
+        return Status(ErrorCode::invalid_argument, "invalid gpu device id: " + std::string(device_id));
+    }
+    std::size_t idx = 0;
+    for (char ch : suffix) {
+        if (ch < '0' || ch > '9') {
+            return Status(ErrorCode::invalid_argument, "invalid gpu device index in: " + std::string(device_id));
+        }
+        if (idx > 1000) {
+            return Status(ErrorCode::not_found, "gpu device index out of range: " + std::string(device_id));
+        }
+        idx = idx * 10 + static_cast<std::size_t>(ch - '0');
+    }
+    std::vector<std::string> gpus;
+    for (const auto& d : available_devices) {
+        if (d.kind == sonder::backends::llamacpp::DeviceKind::kGpu ||
+            d.kind == sonder::backends::llamacpp::DeviceKind::kIntegratedGpu) {
+            gpus.push_back(d.name);
+        }
+    }
+    if (idx >= gpus.size()) {
+        return Status(ErrorCode::not_found, "requested device '" + std::string(device_id) +
+                                                "' exceeds available llama.cpp GPU count (" +
+                                                std::to_string(gpus.size()) + ")");
+    }
+    out_devices = {gpus[idx]};
+    out_main_gpu = 0;
+    return Status::success();
+}
+
 }  // namespace sonder::inference::llamacpp_detail

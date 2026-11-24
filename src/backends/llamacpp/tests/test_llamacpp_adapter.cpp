@@ -328,3 +328,36 @@ TEST_CASE("llamacpp adapter: new tuning, slot, and speculation options validate"
     o.spec_draft_max = 3;
     CHECK(validate_llamacpp_options(o).ok());
 }
+
+TEST_CASE("llamacpp adapter: ResolveGpuDevicePin routes gpu:N to the matching ggml GPU") {
+    namespace lc = sonder::backends::llamacpp;
+    const std::vector<lc::DeviceInfo> devs{
+        {"CPU", "Ryzen", lc::DeviceKind::kCpu, 0, 0},
+        {"Vulkan0", "NVIDIA RTX 5070 Ti", lc::DeviceKind::kGpu, 16000, 15000},
+        {"Vulkan1", "AMD Radeon Graphics", lc::DeviceKind::kIntegratedGpu, 512, 512},
+    };
+    std::vector<std::string> pinned;
+    std::int32_t main_gpu = 1;
+    CHECK(llamacpp_detail::ResolveGpuDevicePin("gpu:1", devs, pinned, main_gpu).ok());
+    REQUIRE(pinned.size() == 1u);
+    CHECK(pinned[0] == "Vulkan1");
+    CHECK(main_gpu == 0);
+
+    pinned.clear();
+    CHECK(llamacpp_detail::ResolveGpuDevicePin("gpu:0", devs, pinned, main_gpu).ok());
+    REQUIRE(pinned.size() == 1u);
+    CHECK(pinned[0] == "Vulkan0");
+
+    // Out-of-range GPU index fails explicitly instead of silently falling back to GPU 0.
+    pinned.clear();
+    CHECK(llamacpp_detail::ResolveGpuDevicePin("gpu:2", devs, pinned, main_gpu).code() == ErrorCode::not_found);
+    CHECK(llamacpp_detail::ResolveGpuDevicePin("gpu:abc", devs, pinned, main_gpu).code() ==
+          ErrorCode::invalid_argument);
+
+    // Explicit caller devices list is preserved untouched.
+    pinned = {"CUDA0", "CUDA1"};
+    main_gpu = 1;
+    CHECK(llamacpp_detail::ResolveGpuDevicePin("gpu:0", devs, pinned, main_gpu).ok());
+    CHECK(pinned.size() == 2u);
+    CHECK(main_gpu == 1);
+}

@@ -513,14 +513,22 @@ public:
         }
         const std::string_view dev = options.device_id;
         bool has_gpu = false;
+        std::vector<lc::DeviceInfo> enumerated_devices;
         if (dev.rfind("gpu", 0) == 0) {
-            for (const auto& d : lc::LlamaCppBackend::EnumerateDevices()) {
+            enumerated_devices = lc::LlamaCppBackend::EnumerateDevices();
+            for (const auto& d : enumerated_devices) {
                 has_gpu = has_gpu || d.kind == lc::DeviceKind::kGpu || d.kind == lc::DeviceKind::kIntegratedGpu;
             }
         }
         const auto gpu_layers = llamacpp_detail::ResolveGpuLayers(options_, dev, has_gpu);
         if (!gpu_layers.ok()) return gpu_layers.status();
         lo.n_gpu_layers = gpu_layers.value();
+        if (lo.n_gpu_layers != 0) {
+            if (Status s = llamacpp_detail::ResolveGpuDevicePin(dev, enumerated_devices, lo.devices, lo.main_gpu);
+                !s.ok()) {
+                return s;
+            }
+        }
 
         lc::LlamaCppBackend runtime;
         double load_ms = 0.0;
