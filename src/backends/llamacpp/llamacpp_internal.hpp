@@ -35,7 +35,10 @@ inline sonder::backends::llamacpp::SamplingParams ToLlamaSampling(const Sampling
     p.top_k = c.top_k;
     p.top_p = c.top_p;
     p.min_p = c.min_p;
-    p.repeat_penalty = c.repeat_penalty;
+    // When explicit_only is set (HTTP OpenAI requests), leave repeat_penalty disabled (1.0)
+    // unless the caller explicitly asked for it — matching OpenAI / llama-server defaults
+    // and allowing pure GPU backend sampling on greedy/top-p requests.
+    p.repeat_penalty = (c.explicit_only && !c.is_explicit(SamplingConfig::kRepeatPenalty)) ? 1.0F : c.repeat_penalty;
     p.repeat_last_n = c.repeat_last_n;
     p.presence_penalty = c.presence_penalty;
     p.frequency_penalty = c.frequency_penalty;

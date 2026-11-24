@@ -131,6 +131,16 @@ if(EXISTS "${_sonder_llama_h}")
         list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_SET_SAMPLER=1)
     endif()
 
+    string(FIND "${_sonder_llama_h_content}" "n_outputs_max_per_seq" _idx_n_outputs_max)
+    if(NOT _idx_n_outputs_max EQUAL -1)
+        list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_N_OUTPUTS_MAX=1)
+    endif()
+
+    string(FIND "${_sonder_llama_h_content}" "llama_state_seq_get_data_ext" _idx_state_ext)
+    if(NOT _idx_state_ext EQUAL -1)
+        list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_STATE_SEQ_EXT=1)
+    endif()
+
     string(FIND "${_sonder_llama_h_content}" "LLAMA_CONTEXT_TYPE_MTP" _idx_ctx_mtp)
     string(FIND "${_sonder_llama_h_content}" "llama_model_n_layer_nextn" _idx_layer_nextn)
     string(FIND "${_sonder_llama_h_content}" "load_mtp" _idx_load_mtp)
