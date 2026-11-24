@@ -125,9 +125,9 @@ struct GenerateRequest {
     std::string prompt;
     SamplingConfig sampling;
     // Optional conversation/slot affinity key for backends with prefix caching.
-    std::string session_key;
+    std::string session_key{};
     // Optional GBNF grammar constraining output (empty = unconstrained).
-    std::string grammar;
+    std::string grammar{};
     // Optional non-owning atomic checkpoint exchange for hybrid/recurrent models.
     // Must outlive the generate() / open_token_stream() call when non-null.
     RecurrentCheckpointExchange* checkpoint = nullptr;
@@ -256,7 +256,7 @@ struct ChatRequest {
     // False preserves the historical text-only callback contract.
     bool separate_reasoning = false;
     // Optional GBNF grammar constraining output (empty = unconstrained).
-    std::string grammar;
+    std::string grammar{};
     // Optional OpenAI response_format hint ("text", "json_object", "json_schema")
     // and serialized JSON schema (when type == "json_schema") for upstreams that
     // handle response_format natively (e.g. llama-server).
