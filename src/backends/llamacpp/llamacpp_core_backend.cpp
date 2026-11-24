@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -131,7 +132,7 @@ public:
     [[nodiscard]] const ModelDescriptor& descriptor() const override { return desc_; }
 
     Result<std::vector<TokenId>> tokenize(std::string_view text) override {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);
         std::vector<lc::Token> tokens;
         if (lc::Status s = runtime_.Tokenize(text, /*add_special=*/true, tokens, /*parse_special=*/false); !s.ok()) {
             return ToStatus(s);
@@ -140,7 +141,7 @@ public:
     }
 
     Result<std::string> detokenize(std::span<const TokenId> tokens) override {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);
         std::string text;
         if (lc::Status s = runtime_.Detokenize(tokens, text); !s.ok()) {
             return ToStatus(s);
@@ -153,7 +154,7 @@ public:
         if (request.inputs.empty()) {
             return Status(ErrorCode::invalid_argument, "embed request inputs are empty");
         }
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         std::vector<std::vector<lc::Token>> tokenized;
         tokenized.reserve(request.inputs.size());
         for (const std::string& input : request.inputs) {
@@ -195,8 +196,8 @@ public:
                               "); reload with a larger context_length");
         }
         // One llama_context per model: serialize requests (including atomic
-        // checkpoint restore and prefill-boundary capture) under one lock.
-        std::lock_guard<std::mutex> lock(mutex_);
+        // checkpoint restore and prefill-boundary capture) under one exclusive lock.
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         std::vector<lc::Token> prompt_tokens;
         if (lc::Status s = runtime_.Tokenize(request.prompt, /*add_special=*/true, prompt_tokens, /*parse_special=*/false);
             !s.ok()) {
@@ -222,7 +223,7 @@ public:
                               " exceeds the loaded llama.cpp context (" + std::to_string(desc_.context_length) +
                               "); reload with a larger context_length");
         }
-        std::unique_lock<std::mutex> lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         bool template_unsupported = false;
         auto segments = build_chat_template_segments(
             request.messages,
@@ -262,7 +263,7 @@ public:
 
     [[nodiscard]] bool has_native_chat() const override {
         std::string ignored;
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);
         return runtime_.ApplyChatTemplate({lc::ChatTurn{"user", "x"}}, true, ignored).ok();
     }
 
@@ -270,7 +271,7 @@ public:
         if (token_position == 0) {
             return Status(ErrorCode::invalid_argument, "recurrent checkpoint token_position must be > 0");
         }
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         RecurrentStateSnapshot snapshot;
         snapshot.token_position = token_position;
         if (lc::Status s = runtime_.CaptureSequenceState(snapshot.bytes, kMaxRecurrentCheckpointBytes); !s.ok()) {
@@ -287,7 +288,7 @@ public:
             return Status(ErrorCode::invalid_argument,
                           "recurrent checkpoint snapshot exceeds kMaxRecurrentCheckpointBytes");
         }
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         return ToStatus(runtime_.RestoreSequenceState(bytes, kMaxRecurrentCheckpointBytes));
     }
 
@@ -449,7 +450,7 @@ private:
     ModelDescriptor desc_;
     lc::LlamaCppBackend runtime_;
     std::uint64_t load_ns_ = 0;
-    mutable std::mutex mutex_;
+    mutable std::shared_mutex mutex_;
 };
 
 class LlamaCppCoreBackend final : public Backend {

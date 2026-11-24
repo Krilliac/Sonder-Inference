@@ -105,6 +105,9 @@ if ($Jobs -gt 0) {
 
 Push-Location $repoRoot
 try {
+    if ($Preset -notmatch '^[A-Za-z0-9._-]+$') {
+        throw "invalid preset name '$Preset' (allowed: letters, digits, '.', '_', '-')"
+    }
     $binaryDir = Join-Path $repoRoot "build\$Preset"
     if ($Clean -and (Test-Path -LiteralPath $binaryDir)) {
         Remove-Item -Recurse -Force -LiteralPath $binaryDir

@@ -166,6 +166,10 @@ std::string_view ToString(SpeculativeType type) noexcept {
 }
 
 bool ParseKvCacheType(std::string_view name, KvCacheType& out) noexcept {
+    if (EqualsIgnoreCase(name, "pq2_0m")) {
+        out = KvCacheType::kPQ2_0;
+        return true;
+    }
     for (const KvCacheType t : kAllKvCacheTypes) {
         if (EqualsIgnoreCase(name, ToString(t))) {
             out = t;
@@ -621,7 +625,7 @@ void NgramModTable::BeginRequest(std::span<const Token> prompt) {
 }
 
 void NgramModTable::Draft(std::span<const Token> history, Token id_last, std::size_t max_draft,
-                          std::vector<Token>& out) const {
+                          std::vector<Token>& out) {
     out.clear();
     if (entries_.empty() || max_draft == 0) return;
     if (history.size() + 1 < n_match_) return;
@@ -657,8 +661,8 @@ void NgramModTable::Draft(std::span<const Token> history, Token id_last, std::si
                scratch_.begin() + static_cast<std::ptrdiff_t>(n_match_ + emit));
 }
 
-void NgramModTable::Observe(std::size_t drafted, std::size_t accepted) {
-    if (drafted == 0) return;
+bool NgramModTable::Observe(std::size_t drafted, std::size_t accepted) {
+    if (drafted == 0) return false;
     const std::size_t floor_len = std::min<std::size_t>(32, n_max_);
     if (accepted >= drafted) {
         n_cur_ = std::min<std::size_t>(n_cur_ * 2, n_max_);
@@ -670,10 +674,12 @@ void NgramModTable::Observe(std::size_t drafted, std::size_t accepted) {
         ++low_streak_;
         if (low_streak_ >= 5) {
             Reset();
+            return true;
         }
     } else {
         low_streak_ = 0;
     }
+    return false;
 }
 
 AdaptiveDraftController::AdaptiveDraftController(std::int32_t max_draft) { Reset(max_draft); }

@@ -69,7 +69,7 @@ Backend:
   --ubatch-size N         llama.cpp: physical micro-batch, <= --batch-size
                           (default: llama.cpp's 512, capped at --batch-size)
   --cache-type-k T        llama.cpp: K cache type f16 (default), f32, bf16, q8_0,
-                          q5_1, q5_0, q4_1, q4_0, iq4_nl (q8_0 ~ half the bytes)
+                          q5_1, q5_0, q4_1, q4_0, iq4_nl, f8_e4m3, q2_0, pq2_0/pq2_0m
   --cache-type-v T        llama.cpp: V cache type, same values; a quantized V
                           cache needs flash attention (on or auto)
   --flash-attn MODE       llama.cpp: auto (default), on or off

@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <mutex>
 #include <regex>
 #include <span>
@@ -986,6 +987,7 @@ struct LlamaCppBackend::Impl {
         }
 
         llama_memory_t mem_dft = llama_get_memory(ctx_dft);
+        llama_pos trim_from = static_cast<llama_pos>(n_past);
         for (int32_t step = 0; step < limit; ++step) {
             if (mtp_chain_heads) {
                 llama_memory_seq_rm(mem_dft, slot_id, static_cast<llama_pos>(n_past), -1);
@@ -993,7 +995,12 @@ struct LlamaCppBackend::Impl {
                 llama_set_nextn_layer_offset(ctx_dft, step);
 #endif
             }
-            if (llama_decode(ctx_dft, dft_batch) != 0) break;
+            if (llama_decode(ctx_dft, dft_batch) != 0) {
+                if (step == 0 && fused_catchup && !d.pos.empty()) {
+                    trim_from = d.pos.front();
+                }
+                break;
+            }
             if (step == 0 && fused_catchup) {
                 d.Clear();
             }
@@ -1044,7 +1051,10 @@ struct LlamaCppBackend::Impl {
         }
 #endif
         if (!mtp_mem_shared) {
-            llama_memory_seq_rm(mem_dft, slot_id, static_cast<llama_pos>(n_past), -1);
+            if (!llama_memory_seq_rm(mem_dft, slot_id, trim_from, -1)) {
+                llama_memory_seq_rm(mem_dft, slot_id, -1, -1);
+                d.Clear();
+            }
         }
     }
 #endif
@@ -1564,11 +1574,14 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, boo
     if (impl_->embed_ctx == nullptr) {
         llama_context_params cp_emb = llama_context_default_params();
         cp_emb.n_ctx = want_ctx;
-        cp_emb.n_batch = std::min<uint32_t>(want_ctx, 512u);
-        cp_emb.n_ubatch = cp_emb.n_batch;
+        // Keep n_batch == n_ubatch == want_ctx so inputs up to want_ctx are
+        // evaluated in a single pass (llama_decode/encode clears embd_seq per call).
+        cp_emb.n_batch = want_ctx;
+        cp_emb.n_ubatch = want_ctx;
         cp_emb.n_seq_max = 1;
         cp_emb.embeddings = true;
-        cp_emb.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+        cp_emb.pooling_type =
+            llama_model_has_encoder(impl_->model) ? LLAMA_POOLING_TYPE_UNSPECIFIED : LLAMA_POOLING_TYPE_MEAN;
         cp_emb.type_k = ToGgmlType(impl_->options.type_k);
         cp_emb.type_v = ToGgmlType(impl_->options.type_v);
         cp_emb.flash_attn_type = ToLlamaFlashAttn(impl_->options.flash_attn);
@@ -1615,29 +1628,30 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, boo
     const auto n_batch = static_cast<std::size_t>(std::max<int32_t>(1, impl_->embed_batch_cap));
     const auto start = Clock::now();
     out.embeddings.reserve(inputs.size());
+    std::int64_t total_prompt_tokens = 0;
 
     for (const auto& seq : inputs) {
         if (cancelled()) {
             return Status::Error(ErrorCode::kDecodeFailed, "embedding cancelled");
         }
-        llama_memory_clear(llama_get_memory(ectx), true);
+        if (llama_memory_t emem = llama_get_memory(ectx); emem != nullptr) {
+            llama_memory_clear(emem, true);
+        }
         const std::size_t n_tok = seq.size();
-        for (std::size_t off = 0; off < n_tok; off += n_batch) {
-            if (cancelled()) {
-                return Status::Error(ErrorCode::kDecodeFailed, "embedding cancelled");
-            }
-            const std::size_t step_end = std::min(n_tok, off + n_batch);
-            BatchClear(impl_->embed_batch);
-            for (std::size_t i = off; i < step_end; ++i) {
-                const bool want_out = (pooling != LLAMA_POOLING_TYPE_NONE) || (i + 1 == n_tok);
-                BatchAdd(impl_->embed_batch, seq[i], static_cast<llama_pos>(i), /*seq_id=*/0, want_out);
-            }
-            const int32_t rc = encoder_only ? llama_encode(ectx, impl_->embed_batch)
-                                            : llama_decode(ectx, impl_->embed_batch);
-            if (rc != 0) {
-                return Status::Error(ErrorCode::kDecodeFailed,
-                                     "llama embedding pass failed (rc=" + std::to_string(rc) + ")");
-            }
+        if (n_tok > n_batch) {
+            return Status::Error(ErrorCode::kContextOverflow,
+                                 "embedding input exceeds embedding batch capacity");
+        }
+        BatchClear(impl_->embed_batch);
+        for (std::size_t i = 0; i < n_tok; ++i) {
+            const bool want_out = (pooling != LLAMA_POOLING_TYPE_NONE) || (i + 1 == n_tok);
+            BatchAdd(impl_->embed_batch, seq[i], static_cast<llama_pos>(i), /*seq_id=*/0, want_out);
+        }
+        const int32_t rc = encoder_only ? llama_encode(ectx, impl_->embed_batch)
+                                        : llama_decode(ectx, impl_->embed_batch);
+        if (rc != 0) {
+            return Status::Error(ErrorCode::kDecodeFailed,
+                                 "llama embedding pass failed (rc=" + std::to_string(rc) + ")");
         }
 
         const float* raw = nullptr;
@@ -1665,9 +1679,11 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, boo
             }
         }
         out.embeddings.push_back(std::move(vec));
-        out.prompt_tokens += static_cast<std::int32_t>(n_tok);
+        total_prompt_tokens += static_cast<std::int64_t>(n_tok);
     }
 
+    out.prompt_tokens = static_cast<std::int32_t>(
+        std::min<std::int64_t>(total_prompt_tokens, static_cast<std::int64_t>(INT32_MAX)));
     out.eval_ms = MsSince(start);
     return Status::Ok();
 }
@@ -1951,7 +1967,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
     // Bind GPU backend sampling when supported (avoids copying full vocab logits
     // across PCIe on every decode & verification step). Disabled when a grammar
     // is active so CPU resampling can read raw logits on grammar rejection.
-    bool target_gpu_sampled = false;
+    [[maybe_unused]] bool target_gpu_sampled = false;
 #if defined(SONDER_LLAMACPP_HAS_SET_SAMPLER)
     if (!grammar_sampler) {
         target_gpu_sampled = llama_set_sampler(ctx, slot_id, sampler.get());
@@ -1988,9 +2004,13 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
         }
 
         // Fast grammar-based rejection sampling:
-        // 1. Sample candidate token without running GBNF across the full 248K vocab.
+        // 1. Sample candidate token WITHOUT mutating sampler penalty history and
+        //    without running GBNF across the full 248K vocab.
         const float* logits = llama_get_logits_ith(ctx, idx);
-        if (pure_greedy && logits != nullptr) {
+        if (logits == nullptr) {
+            return LLAMA_TOKEN_NULL;
+        }
+        if (pure_greedy) {
             int32_t best = 0;
             float best_val = logits[0];
             for (int32_t v = 1; v < n_vocab; ++v) {
@@ -2001,25 +2021,30 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
             }
             tok = best;
         } else {
-            tok = llama_sampler_sample(sampler.get(), ctx, idx);
+            auto& cand = impl_->grammar_candidates;
+            cand.resize(static_cast<std::size_t>(n_vocab));
+            for (int32_t v = 0; v < n_vocab; ++v) {
+                cand[static_cast<std::size_t>(v)] = llama_token_data{v, logits[v], 0.0F};
+            }
+            llama_token_data_array cur_p{cand.data(), cand.size(), -1, false};
+            llama_sampler_apply(sampler.get(), &cur_p);
+            if (cur_p.selected < 0 || static_cast<std::size_t>(cur_p.selected) >= cur_p.size) {
+                return LLAMA_TOKEN_NULL;
+            }
+            tok = cur_p.data[cur_p.selected].id;
         }
 
         // 2. Test ONLY the 1 candidate token against the GBNF grammar.
         llama_token_data single{tok, 1.0F, 0.0F};
         llama_token_data_array single_arr{&single, 1, -1, false};
         llama_sampler_apply(grammar_sampler.get(), &single_arr);
-        if (single.logit != -std::numeric_limits<float>::infinity()) {
+        if (std::isfinite(single.logit)) {
             llama_sampler_accept(grammar_sampler.get(), tok);
-            if (pure_greedy) {
-                llama_sampler_accept(sampler.get(), tok);
-            }
+            llama_sampler_accept(sampler.get(), tok);
             return tok;
         }
 
         // 3. Rare rejection fallback: mask full vocabulary with GBNF, then resample.
-        if (logits == nullptr) {
-            return tok;
-        }
         auto& cand = impl_->grammar_candidates;
         cand.resize(static_cast<std::size_t>(n_vocab));
         for (int32_t v = 0; v < n_vocab; ++v) {
@@ -2028,12 +2053,43 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
         llama_token_data_array cur_p{cand.data(), cand.size(), -1, false};
         llama_sampler_apply(grammar_sampler.get(), &cur_p);
         llama_sampler_apply(sampler.get(), &cur_p);
-        if (cur_p.selected >= 0 && static_cast<std::size_t>(cur_p.selected) < cur_p.size) {
-            tok = cur_p.data[cur_p.selected].id;
+        if (cur_p.selected < 0 || static_cast<std::size_t>(cur_p.selected) >= cur_p.size ||
+            !std::isfinite(cur_p.data[cur_p.selected].logit)) {
+            // Grammar deadlocked (no finite candidate survived); fail cleanly
+            // rather than triggering GGML_ABORT / throwing inside llama_grammar_accept.
+            return LLAMA_TOKEN_NULL;
         }
+        tok = cur_p.data[cur_p.selected].id;
         llama_sampler_accept(grammar_sampler.get(), tok);
         llama_sampler_accept(sampler.get(), tok);
         return tok;
+    };
+
+    bool slot_valid = true;
+    auto invalidate_slot = [&]() {
+        slot_valid = false;
+        llama_memory_seq_rm(mem, slot_id, -1, -1);
+        if (slot_idx < impl_->slots.size()) {
+            impl_->slots[slot_idx].tokens.clear();
+            impl_->slots[slot_idx].session_key.clear();
+            impl_->slots[slot_idx].last_used = 0;
+        }
+        if (slot_idx < impl_->slot_checkpoints.size()) {
+            impl_->slot_checkpoints[slot_idx].clear();
+        }
+#if defined(SONDER_LLAMACPP_HAS_MTP)
+        if (impl_->ctx_dft != nullptr) {
+            if (!impl_->mtp_mem_shared) {
+                llama_memory_seq_rm(llama_get_memory(impl_->ctx_dft), slot_id, -1, -1);
+            }
+            if (slot_idx < impl_->mtp_pending_h.size()) {
+                std::fill(impl_->mtp_pending_h[slot_idx].begin(), impl_->mtp_pending_h[slot_idx].end(), 0.0F);
+            }
+            if (slot_idx < impl_->mtp_deferred.size()) {
+                impl_->mtp_deferred[slot_idx].Clear();
+            }
+        }
+#endif
     };
 
     // ---- Prefill in n_batch chunks (split at n_ubatch when MTP is active so
@@ -2050,9 +2106,14 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
     // `<think>` scaffolding) so multi-turn continuations restore hybrid state
     // without recomputing the shared prefix — while short prompts pay zero
     // checkpoint overhead.
+#if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
     const bool want_hybrid_prefix_ckpt =
         impl_->options.prefix_cache && !has_capture && !result.state_restored &&
-        impl_->architecture == sonder::inference::ModelArchitecture::hybrid && n_prompt >= 512;
+        impl_->architecture == sonder::inference::ModelArchitecture::hybrid && n_prompt >= 512 &&
+        Impl::PartialCheckpointFlags() != 0;
+#else
+    const bool want_hybrid_prefix_ckpt = false;
+#endif
     const int64_t hybrid_ckpt_offset =
         (want_hybrid_prefix_ckpt && (n_prompt - 16) > prefill_start_offset) ? (n_prompt - 16) : -1;
     int64_t cur_pos = n_past;
@@ -2079,17 +2140,22 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
         }
         const int32_t rc = llama_decode(ctx, impl_->batch);
         if (rc == 2) {
-            llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(cur_pos), -1);
+            if (!llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(cur_pos), -1)) {
+                invalidate_slot();
+            }
             result.stop_reason = StopReason::kCancelled;
             result.prefill_ms = MsSince(prefill_start);
             return result;
         }
         if (rc != 0) {
-            llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(cur_pos), -1);
+            if (!llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(cur_pos), -1)) {
+                invalidate_slot();
+            }
             return fail(ErrorCode::kDecodeFailed, "llama_decode failed during prefill (rc=" + std::to_string(rc) + ")");
         }
 #if defined(SONDER_LLAMACPP_HAS_MTP)
         if (use_mtp && !impl_->MtpProcessPrefill(impl_->batch, slot_id)) {
+            invalidate_slot();
             return fail(ErrorCode::kDecodeFailed, "MTP draft context prefill sync failed");
         }
 #endif
@@ -2101,7 +2167,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
         cur_pos += n;
         off = step_end;
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
-        if (hybrid_ckpt_offset == off) {
+        if (hybrid_ckpt_offset == off && slot_valid) {
             impl_->CapturePartialCheckpoint(slot_idx, slot_id, static_cast<std::size_t>(cur_pos));
         }
 #endif
@@ -2131,15 +2197,21 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
             ngram_indexed = impl_->ngram_mod->IndexRange(impl_->ngram_history, ngram_indexed, impl_->ngram_history.size());
         }
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
-        if (want_hybrid_prefix_ckpt && reason != StopReason::kError && reason != StopReason::kCancelled &&
+        if (slot_valid && want_hybrid_prefix_ckpt && reason != StopReason::kError && reason != StopReason::kCancelled &&
             slot_idx < impl_->slots.size() && !impl_->slots[slot_idx].tokens.empty()) {
+            bool mtp_ok = true;
 #if defined(SONDER_LLAMACPP_HAS_MTP)
             if (use_mtp && !impl_->mtp_mem_shared && slot_idx < impl_->mtp_deferred.size() &&
                 impl_->mtp_deferred[slot_idx].pending) {
-                (void)impl_->MtpFlushDeferred(slot_id);
+                mtp_ok = impl_->MtpFlushDeferred(slot_id);
+                if (!mtp_ok) {
+                    invalidate_slot();
+                }
             }
 #endif
-            impl_->CapturePartialCheckpoint(slot_idx, slot_id, impl_->slots[slot_idx].tokens.size());
+            if (mtp_ok && slot_valid) {
+                impl_->CapturePartialCheckpoint(slot_idx, slot_id, impl_->slots[slot_idx].tokens.size());
+            }
         }
 #endif
         std::string tail = utf8.Flush();
@@ -2166,6 +2238,10 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
     // Sample first generated token from the prefill's final logits.
     const auto first_tok_start = Clock::now();
     Token cur_tok = sample_target(-1);
+    if (cur_tok == LLAMA_TOKEN_NULL) {
+        result.status = Status::Error(ErrorCode::kDecodeFailed, "sampler produced no valid token (grammar deadlock)");
+        return finish(StopReason::kError);
+    }
     if (llama_vocab_is_eog(impl_->vocab, cur_tok)) return finish(StopReason::kEndOfGeneration);
     {
         bool keep_going = true;
@@ -2247,7 +2323,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
         // the proposed draft (e.g. ngram-mod with n_rs_seq == 0), take a lightweight
         // PARTIAL_ONLY checkpoint before verification so partial acceptance rolls
         // back cleanly without reserving per-step GPU rollback slots.
-        bool have_spec_ckpt = false;
+        [[maybe_unused]] bool have_spec_ckpt = false;
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
         if (!draft_tokens.empty() && impl_->architecture == sonder::inference::ModelArchitecture::hybrid &&
             draft_tokens.size() > static_cast<std::size_t>(rs_cap)) {
@@ -2280,15 +2356,19 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
 
         const int32_t rc = llama_decode(ctx, impl_->batch);
         if (rc != 0) {
-            if (!llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1)) {
+            bool rolled_back = llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
+            if (!rolled_back) {
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
                 if (have_spec_ckpt) {
                     const llama_state_seq_flags flags = Impl::PartialCheckpointFlags();
-                    (void)llama_state_seq_set_data_ext(ctx, impl_->spec_ckpt_buf.data(), impl_->spec_ckpt_size, slot_id,
-                                                       flags);
-                    (void)llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
+                    const std::size_t read = llama_state_seq_set_data_ext(ctx, impl_->spec_ckpt_buf.data(),
+                                                                          impl_->spec_ckpt_size, slot_id, flags);
+                    rolled_back = (read > 0) && llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
                 }
 #endif
+            }
+            if (!rolled_back) {
+                invalidate_slot();
             }
             if (rc == 2) return finish(StopReason::kCancelled);
             if (rc == 1) return finish(StopReason::kContextFull);
@@ -2301,7 +2381,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
         if (draft_tokens.empty()) {
 #if defined(SONDER_LLAMACPP_HAS_MTP)
             if (use_mtp && !impl_->MtpCommitVerified(impl_->batch, slot_id, 0)) {
-                llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
+                invalidate_slot();
                 result.status = Status::Error(ErrorCode::kDecodeFailed, "MTP draft context sync failed");
                 return finish(StopReason::kError);
             }
@@ -2321,6 +2401,11 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
             ++pos;
 
             const Token next_tok = sample_target(0);
+            if (next_tok == LLAMA_TOKEN_NULL) {
+                result.status =
+                    Status::Error(ErrorCode::kDecodeFailed, "sampler produced no valid token (grammar deadlock)");
+                return finish(StopReason::kError);
+            }
             if (llama_vocab_is_eog(impl_->vocab, next_tok)) return finish(StopReason::kEndOfGeneration);
 
             bool keep_going = true;
@@ -2345,8 +2430,13 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
         result.draft_tokens += static_cast<std::int32_t>(k);
         accepted_tokens.clear();
         std::size_t n_accepted = 0;
+        bool sample_deadlock = false;
         for (std::size_t j = 0; j < k; ++j) {
             const Token sampled = sample_target(static_cast<int32_t>(j));
+            if (sampled == LLAMA_TOKEN_NULL) {
+                sample_deadlock = true;
+                break;
+            }
             accepted_tokens.push_back(sampled);
             if (sampled == draft_tokens[j]) {
                 ++n_accepted;
@@ -2354,13 +2444,25 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
                 break;
             }
         }
-        if (n_accepted == k) {
+        if (!sample_deadlock && n_accepted == k) {
             const Token bonus = sample_target(static_cast<int32_t>(k));
-            accepted_tokens.push_back(bonus);
+            if (bonus == LLAMA_TOKEN_NULL) {
+                sample_deadlock = true;
+            } else {
+                accepted_tokens.push_back(bonus);
+            }
+        }
+        if (sample_deadlock) {
+            invalidate_slot();
+            result.status =
+                Status::Error(ErrorCode::kDecodeFailed, "sampler produced no valid token (grammar deadlock)");
+            return finish(StopReason::kError);
         }
         result.draft_accepted_tokens += static_cast<std::int32_t>(n_accepted);
         if (use_ngram_mod && impl_->ngram_mod != nullptr) {
-            impl_->ngram_mod->Observe(k, n_accepted);
+            if (impl_->ngram_mod->Observe(k, n_accepted)) {
+                ngram_indexed = 0;
+            }
         } else if (use_ngram_short) {
             adaptive_ctrl.Observe(static_cast<std::int32_t>(k), static_cast<std::int32_t>(n_accepted));
         }
@@ -2378,7 +2480,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
         auto rollback_rejected = [&](int64_t keep_pos, std::size_t keep_drafts) -> bool {
 #if defined(SONDER_LLAMACPP_HAS_MTP)
             if (use_mtp && !impl_->MtpCommitVerified(impl_->batch, slot_id, static_cast<int32_t>(keep_drafts))) {
-                llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
+                invalidate_slot();
                 return false;
             }
 #endif
@@ -2391,6 +2493,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
                         const std::size_t read = llama_state_seq_set_data_ext(ctx, impl_->spec_ckpt_buf.data(),
                                                                               impl_->spec_ckpt_size, slot_id, flags);
                         if (read == 0 || !llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1)) {
+                            invalidate_slot();
                             return false;
                         }
                         // Replay only the 1 + keep_drafts accepted tokens (logits=false since
@@ -2403,6 +2506,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
                                      /*logits=*/false);
                         }
                         if (llama_decode(ctx, impl_->batch) != 0) {
+                            invalidate_slot();
                             return false;
                         }
                         return true;
@@ -2411,6 +2515,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
                     (void)step_base_tok;
                     (void)keep_drafts;
 #endif
+                    invalidate_slot();
                     return false;
                 }
             }

@@ -400,21 +400,24 @@ Status send_all(native_socket s, std::string_view data, std::chrono::millisecond
 }
 
 bool peer_gone(native_socket s) {
-    char buf[512];
-    for (int i = 0; i < 64; ++i) {
-        if (wait_once(s, false, 0) <= 0) {
-            return false;
-        }
-        const long long n = recv_some(s, buf, sizeof(buf));
-        if (n == 0 || n == -1) {
-            return true;
-        }
-        if (n == -2) {
-            return false;
-        }
-        // Bytes after the request (Connection: close, no pipelining): discard.
+    if (wait_once(s, false, 0) <= 0) {
+        return false;
     }
-    return false;
+    char probe = 0;
+#if defined(_WIN32)
+    const int n = ::recv(raw(s), &probe, 1, MSG_PEEK);
+#else
+    const auto n = ::recv(s, &probe, 1, MSG_PEEK);
+#endif
+    if (n > 0) {
+        // Leave unread bytes (e.g. a pipelined HTTP/1.1 keep-alive request)
+        // untouched in the socket buffer for serve_connection().
+        return false;
+    }
+    if (n == 0) {
+        return true;
+    }
+    return !would_block(last_error());
 }
 
 Result<Socket> connect_tcp(const std::string& host, std::uint16_t port, std::chrono::milliseconds timeout) {

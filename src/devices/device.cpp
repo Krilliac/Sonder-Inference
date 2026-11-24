@@ -665,7 +665,7 @@ std::vector<GpuDeviceInfo> live_gpu_devices() {
                     info.shared_total = MemoryReading::known(shared_total);
                     info.is_integrated_uma = is_integrated_uma_memory(info.vendor, dedicated_total, shared_total);
                     std::size_t cur_amd_ordinal = 0;
-                    if (info.vendor == GpuVendor::amd) {
+                    if (info.vendor == GpuVendor::amd && !info.is_integrated_uma) {
                         cur_amd_ordinal = amd_ordinal++;
                     }
                     info.backend_hint = resolve_windows_gpu_backend_hint(

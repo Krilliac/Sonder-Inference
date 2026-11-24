@@ -431,8 +431,8 @@ public:
     GenerateResult Generate(const GenerateRequest& request, const TokenCallback& on_token,
                             const CancelPredicate& should_cancel = {});
 
-    // Computes dense embeddings for one or more tokenized inputs.
-    // Clears active KV prefix cache entries while running.
+    // Computes dense embeddings for one or more tokenized inputs using an
+    // isolated lazy embedding context so live KV prefix caches stay intact.
     Status Embed(const std::vector<std::vector<Token>>& inputs, bool normalize, EmbedOutput& out,
                  const CancelPredicate& should_cancel = {});
 
@@ -549,9 +549,10 @@ public:
     // Chains up to `min(max_draft, n_max)` tokens starting from the trailing
     // `n_match - 1` tokens of `history` plus `id_last`. Returns empty if fewer
     // than `min(n_min, max_draft)` tokens chain from the table.
-    void Draft(std::span<const Token> history, Token id_last, std::size_t max_draft, std::vector<Token>& out) const;
+    void Draft(std::span<const Token> history, Token id_last, std::size_t max_draft, std::vector<Token>& out);
     // Updates adaptive draft length and low-acceptance streak guard.
-    void Observe(std::size_t drafted, std::size_t accepted);
+    // Returns true if the table was reset due to repeated low acceptance.
+    bool Observe(std::size_t drafted, std::size_t accepted);
 
     [[nodiscard]] std::size_t n_match() const noexcept { return n_match_; }
     [[nodiscard]] std::size_t n_min() const noexcept { return n_min_; }
@@ -573,7 +574,7 @@ private:
     std::size_t table_mask_ = 0;
     int low_streak_ = 0;
     std::vector<Token> entries_;
-    mutable std::vector<Token> scratch_;
+    std::vector<Token> scratch_;
 };
 
 // Adaptive speculative draft-length controller for n-gram self-speculation.

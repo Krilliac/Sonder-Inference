@@ -739,7 +739,7 @@ struct Server::Impl {
                           {"backend", pin.backend()},
                           {"synthetic", synthetic}};
         write_json(ex, 200,
-                   json::Object{{"content", res.value()}, {"model", pin.id()}, {"sonder", std::move(meta)}});
+                   json::Object{{"content", std::move(res).value()}, {"model", pin.id()}, {"sonder", std::move(meta)}});
     }
 
     // --------------------------------------------------------- connection
@@ -769,9 +769,10 @@ struct Server::Impl {
                         if (now >= idle_deadline) {
                             break;
                         }
-                        const auto slice = std::min(
-                            std::chrono::duration_cast<std::chrono::milliseconds>(idle_deadline - now),
-                            std::chrono::milliseconds(50));
+                        const auto rem_ms = std::max<std::chrono::milliseconds>(
+                            std::chrono::milliseconds(1),
+                            std::chrono::duration_cast<std::chrono::milliseconds>(idle_deadline - now));
+                        const auto slice = std::min(rem_ms, std::chrono::milliseconds(50));
                         const auto w = wait_socket(sock.get(), false, slice, &stopping);
                         if (w == WaitResult::timeout) {
                             continue;
@@ -794,6 +795,12 @@ struct Server::Impl {
                         break;
                     }
                 }
+                // Refresh head_started_ns once the next request actually begins
+                // arriving so idle keep-alive time does not cause spurious 408 eviction.
+                const auto req_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now().time_since_epoch())
+                                              .count();
+                flags.head_started_ns.store(req_start_ns, std::memory_order_release);
             }
             Exchange ex;
             ex.sock = sock.get();

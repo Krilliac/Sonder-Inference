@@ -95,9 +95,17 @@
     {
       "name": "windows-rocm-xt",
       "displayName": "Windows ROCm/HIP (AMD RX XT RDNA 2/3/4 & Ryzen APU)",
-      "description": "Direct llama.cpp with AMD HIP SDK on Windows targeting RDNA 2/3/4 discrete RX XT GPUs and RDNA 3 Ryzen APUs with HIP Graphs.",
-      "inherits": "msvc-release",
+      "description": "Direct llama.cpp with AMD HIP SDK Clang on Windows targeting RDNA 2/3/4 discrete RX XT GPUs and RDNA 3 Ryzen APUs with HIP Graphs.",
+      "inherits": "base",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
       "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
         "SONDER_WITH_LLAMA_CPP": "ON",
         "GGML_HIP": "ON",
         "GGML_HIP_GRAPHS": "ON",

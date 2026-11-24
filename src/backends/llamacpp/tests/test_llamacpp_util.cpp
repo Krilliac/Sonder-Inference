@@ -312,6 +312,8 @@ TEST_CASE("llamacpp wrapper: SpeculativeType names round-trip and new context op
     CHECK(ext == KvCacheType::kQ2_0);
     CHECK(ParseKvCacheType("PQ2_0", ext));
     CHECK(ext == KvCacheType::kPQ2_0);
+    CHECK(ParseKvCacheType("pq2_0m", ext));
+    CHECK(ext == KvCacheType::kPQ2_0);
     CHECK(IsQuantized(KvCacheType::kQ2_0));
     CHECK(IsQuantized(KvCacheType::kPQ2_0));
 
@@ -491,10 +493,10 @@ TEST_CASE("llamacpp wrapper: NgramModTable chains across turns, enforces n_min, 
 
     // Five consecutive low-acceptance rounds (<25%) reset the table cleanly.
     for (int i = 0; i < 4; ++i) {
-        table.Observe(12, 0);
+        CHECK_FALSE(table.Observe(12, 0));
         CHECK(table.used() > 0u);
     }
-    table.Observe(12, 0);
+    CHECK(table.Observe(12, 0));
     CHECK(table.used() == 0u);
     table.Draft(turn2_prompt, /*id_last=*/103, /*max_draft=*/12, draft);
     CHECK(draft.empty());

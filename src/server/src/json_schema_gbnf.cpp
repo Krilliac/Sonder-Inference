@@ -144,25 +144,50 @@ private:
     }
 
     Result<std::string> add_rule(std::string_view hint, std::string expr) {
-        if (rules_.size() >= kMaxRules) {
+        if (rules_.size() + reserved_rules_ >= kMaxRules) {
             return Status(ErrorCode::invalid_argument, "JSON schema produces too many grammar rules");
         }
         std::string name = alloc_rule_name(hint);
+        grammar_bytes_ += name.size() + expr.size() + 6;
+        if (grammar_bytes_ > kMaxGrammarBytes) {
+            return Status(ErrorCode::invalid_argument, "generated GBNF grammar exceeds maximum size");
+        }
         rules_.emplace_back(name, std::move(expr));
         return name;
+    }
+
+    static std::string unescape_json_pointer_token(std::string_view token) {
+        std::string out;
+        out.reserve(token.size());
+        for (std::size_t i = 0; i < token.size(); ++i) {
+            if (token[i] == '~' && i + 1 < token.size()) {
+                if (token[i + 1] == '1') {
+                    out.push_back('/');
+                    ++i;
+                    continue;
+                }
+                if (token[i + 1] == '0') {
+                    out.push_back('~');
+                    ++i;
+                    continue;
+                }
+            }
+            out.push_back(token[i]);
+        }
+        return out;
     }
 
     Result<const json::Value*> resolve_ref(std::string_view ref) const {
         constexpr std::string_view kDefsPrefix = "#/$defs/";
         constexpr std::string_view kLegacyPrefix = "#/definitions/";
         const json::Value* container = nullptr;
-        std::string_view key;
+        std::string_view raw_key;
         if (ref.rfind(kDefsPrefix, 0) == 0) {
             container = root_schema_.find("$defs");
-            key = ref.substr(kDefsPrefix.size());
+            raw_key = ref.substr(kDefsPrefix.size());
         } else if (ref.rfind(kLegacyPrefix, 0) == 0) {
             container = root_schema_.find("definitions");
-            key = ref.substr(kLegacyPrefix.size());
+            raw_key = ref.substr(kLegacyPrefix.size());
         } else {
             return Status(ErrorCode::invalid_argument,
                           "unsupported $ref '" + std::string(ref) + "' (only local #/$defs/... or #/definitions/... supported)");
@@ -170,6 +195,7 @@ private:
         if (container == nullptr || !container->is_object()) {
             return Status(ErrorCode::invalid_argument, "unresolved $ref '" + std::string(ref) + "'");
         }
+        const std::string key = unescape_json_pointer_token(raw_key);
         const json::Value* target = container->find(key);
         if (target == nullptr) {
             return Status(ErrorCode::invalid_argument, "unresolved $ref '" + std::string(ref) + "'");
@@ -196,6 +222,10 @@ private:
                 return Status(ErrorCode::invalid_argument, "$ref must be a string");
             }
             const std::string& ref_str = ref->as_string();
+            if (active_refs_.count(ref_str) != 0) {
+                return Status(ErrorCode::invalid_argument,
+                              "direct or left-recursive $ref cycle is not supported: '" + ref_str + "'");
+            }
             if (auto it = ref_rules_.find(ref_str); it != ref_rules_.end()) {
                 return it->second;
             }
@@ -203,15 +233,23 @@ private:
             if (!target.ok()) {
                 return target.status();
             }
-            if (rules_.size() >= kMaxRules) {
+            if (rules_.size() + reserved_rules_ >= kMaxRules) {
                 return Status(ErrorCode::invalid_argument, "JSON schema produces too many grammar rules");
             }
-            // Reserve rule name up front so recursive schemas can reference it safely.
+            // Reserve rule slot up front to prevent recursion overshoot past kMaxRules.
             const std::string rule_name = alloc_rule_name(ref_str);
             ref_rules_[ref_str] = rule_name;
+            active_refs_.insert(ref_str);
+            ++reserved_rules_;
             auto body = build_node(*target.value(), rule_name, depth + 1);
+            --reserved_rules_;
+            active_refs_.erase(ref_str);
             if (!body.ok()) {
                 return body.status();
+            }
+            grammar_bytes_ += rule_name.size() + body.value().size() + 6;
+            if (grammar_bytes_ > kMaxGrammarBytes) {
+                return Status(ErrorCode::invalid_argument, "generated GBNF grammar exceeds maximum size");
             }
             rules_.emplace_back(rule_name, std::move(body).value());
             return rule_name;
@@ -231,6 +269,9 @@ private:
                 if (!first) expr += " | ";
                 first = false;
                 expr += gbnf_literal(item.dump());
+                if (expr.size() + grammar_bytes_ > kMaxGrammarBytes) {
+                    return Status(ErrorCode::invalid_argument, "generated GBNF grammar exceeds maximum size");
+                }
             }
             expr += ") space";
             return expr;
@@ -252,6 +293,9 @@ private:
                     if (!first) expr += " | ";
                     first = false;
                     expr += "(" + built.value() + ")";
+                    if (expr.size() + grammar_bytes_ > kMaxGrammarBytes) {
+                        return Status(ErrorCode::invalid_argument, "generated GBNF grammar exceeds maximum size");
+                    }
                 }
                 expr += ")";
                 return expr;
@@ -265,17 +309,24 @@ private:
             }
             std::string expr = "(";
             bool first = true;
+            std::set<std::string> seen_types;
             for (const auto& t : type_v->as_array()) {
                 if (!t.is_string()) {
                     return Status(ErrorCode::invalid_argument, "type array entries must be strings");
                 }
-                auto built = build_for_type(schema, t.as_string(), hint, depth);
+                if (!seen_types.insert(t.as_string()).second) {
+                    continue;
+                }
+                auto built = build_for_type(schema, t.as_string(), hint, depth + 1);
                 if (!built.ok()) {
                     return built.status();
                 }
                 if (!first) expr += " | ";
                 first = false;
                 expr += "(" + built.value() + ")";
+                if (expr.size() + grammar_bytes_ > kMaxGrammarBytes) {
+                    return Status(ErrorCode::invalid_argument, "generated GBNF grammar exceeds maximum size");
+                }
             }
             expr += ")";
             return expr;
@@ -476,7 +527,9 @@ private:
 
         std::vector<std::string> req_rules;
         std::vector<std::string> opt_rules;
+        std::set<std::string> seen_props;
         for (const auto& [prop_name, prop_schema] : props_v->as_object()) {
+            seen_props.insert(prop_name);
             auto val_expr = build_node(prop_schema, std::string(hint) + "-" + prop_name, depth + 1);
             if (!val_expr.ok()) {
                 return val_expr.status();
@@ -492,6 +545,21 @@ private:
             } else {
                 opt_rules.push_back(std::move(kv_rule).value());
             }
+        }
+        // Honor any `required` keys not explicitly listed under `properties`.
+        for (const std::string& req_name : required_set) {
+            if (seen_props.count(req_name) != 0) continue;
+            if (!allow_additional) {
+                return Status(ErrorCode::invalid_argument,
+                              "required property '" + req_name + "' is absent from properties while additionalProperties is false");
+            }
+            const std::string key_json = json::Value(req_name).dump();
+            const std::string kv_expr = gbnf_literal(key_json) + " space \":\" space (" + additional_val_rule + ")";
+            auto kv_rule = add_rule(std::string(hint) + "-" + req_name + "-kv", kv_expr);
+            if (!kv_rule.ok()) {
+                return kv_rule.status();
+            }
+            req_rules.push_back(std::move(kv_rule).value());
         }
 
         std::string extra_kv_rule;
@@ -519,6 +587,7 @@ private:
             // All properties are optional: build exact comma-safe alternatives so any
             // subset (including empty {}) is valid JSON with no leading/trailing commas.
             std::vector<std::string> branches;
+            std::size_t total_branch_bytes = 0;
             for (std::size_t i = 0; i < opt_rules.size(); ++i) {
                 std::string branch = opt_rules[i];
                 for (std::size_t j = i + 1; j < opt_rules.size(); ++j) {
@@ -526,6 +595,10 @@ private:
                 }
                 if (!extra_kv_rule.empty()) {
                     branch += " (\",\" space " + extra_kv_rule + ")*";
+                }
+                total_branch_bytes += branch.size() + 5;
+                if (grammar_bytes_ + total_branch_bytes > kMaxGrammarBytes) {
+                    return Status(ErrorCode::invalid_argument, "generated GBNF grammar exceeds maximum size");
                 }
                 branches.push_back(std::move(branch));
             }
@@ -553,6 +626,9 @@ private:
     std::vector<std::pair<std::string, std::string>> rules_;
     std::set<std::string> used_names_;
     std::map<std::string, std::string> ref_rules_;
+    std::set<std::string> active_refs_;
+    std::size_t reserved_rules_ = 0;
+    std::size_t grammar_bytes_ = 0;
     std::size_t counter_ = 0;
 };
 

@@ -416,8 +416,19 @@ std::vector<std::size_t> select_best_multi_gpu_group(const std::vector<GpuDevice
     for (const GpuVendor v : kVendors) {
         std::vector<std::size_t> group;
         std::uint64_t total_usable = 0;
+        bool has_rocm_peer = false;
+        if (v == GpuVendor::amd) {
+            for (const auto& g : gpus) {
+                if (!g.is_integrated_uma && g.vendor == GpuVendor::amd &&
+                    (iequals(g.backend_hint, "rocm") || iequals(g.backend_hint, "hip"))) {
+                    has_rocm_peer = true;
+                    break;
+                }
+            }
+        }
         for (std::size_t i = 0; i < gpus.size() && group.size() < kMaxMultiGpu; ++i) {
             if (gpus[i].is_integrated_uma || gpus[i].vendor != v) continue;
+            if (has_rocm_peer && iequals(gpus[i].backend_hint, "vulkan")) continue;
             const auto budget = compute_gpu_budget(gpus[i], host, request);
             if (!budget || budget->usable_mib == 0) continue;
             group.push_back(i);
@@ -1328,6 +1339,7 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
             profile.main_gpu = std::nullopt;
             profile.vram_budget_mib = std::nullopt;
             plan.recommended_env.clear();
+            plan.recommended_backend_hint = "cpu";
             est = evaluate(profile, std::nullopt);
             plan.fits_in_vram = false;
             plan.reasons.push_back("even 1 GPU layer exceeds VRAM budget (" + std::to_string(plan.budget_mib) +
