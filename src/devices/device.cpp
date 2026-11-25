@@ -1519,6 +1519,122 @@ std::optional<std::uint64_t> select_gpu_vram_budget_mib(const std::vector<GpuDev
     return matched_any ? std::optional<std::uint64_t>(total_mib) : std::nullopt;
 }
 
+namespace {
+
+bool is_vulkan_pool_eligible(const GpuDeviceInfo& gpu) noexcept {
+    if (gpu.is_tcc_mode) {
+        return false;
+    }
+    if (gpu.vendor == GpuVendor::apple) {
+        return false;
+    }
+    const auto eff = gpu_effective_vram_mib(gpu, false);
+    return eff.has_value() && *eff > 0;
+}
+
+}  // namespace
+
+GpuPoolSummary summarize_gpu_pools(const std::vector<GpuDeviceInfo>& gpus, const HostMemory& host) {
+    GpuPoolSummary out;
+    std::vector<std::string> discrete_vk;
+    std::vector<std::string> uma_vk;
+
+    for (std::size_t i = 0; i < gpus.size(); ++i) {
+        const GpuDeviceInfo& g = gpus[i];
+        const auto total_mib = gpu_effective_vram_mib(g, false);
+        const auto free_mib = gpu_effective_vram_mib(g, true);
+        const bool vk_ok = is_vulkan_pool_eligible(g);
+
+        if (!g.is_integrated_uma) {
+            ++out.discrete_gpu_count;
+            if (total_mib) {
+                out.discrete_vram_mib = saturating_add(out.discrete_vram_mib, *total_mib);
+            }
+            if (free_mib) {
+                out.discrete_free_vram_mib = saturating_add(out.discrete_free_vram_mib, *free_mib);
+            }
+            if (vk_ok) {
+                discrete_vk.push_back("Vulkan" + std::to_string(i));
+            }
+        } else {
+            ++out.integrated_uma_gpu_count;
+            if (total_mib) {
+                out.integrated_uma_vram_mib = saturating_add(out.integrated_uma_vram_mib, *total_mib);
+            }
+            if (free_mib) {
+                out.integrated_uma_free_vram_mib = saturating_add(out.integrated_uma_free_vram_mib, *free_mib);
+            }
+            if (vk_ok) {
+                uma_vk.push_back("Vulkan" + std::to_string(i));
+            }
+        }
+    }
+
+    // All integrated UMA GPUs share the host's physical system RAM: cap their
+    // combined contribution against host total/available physical RAM when known.
+    if (host.total_physical.is_known()) {
+        const std::uint64_t host_total_mib = host.total_physical.bytes_or(0) / kMiB;
+        out.integrated_uma_vram_mib = std::min(out.integrated_uma_vram_mib, host_total_mib);
+    }
+    if (host.available_physical.is_known()) {
+        const std::uint64_t host_avail_mib = host.available_physical.bytes_or(0) / kMiB;
+        out.integrated_uma_free_vram_mib = std::min(out.integrated_uma_free_vram_mib, host_avail_mib);
+    }
+    if (out.integrated_uma_vram_mib > 0) {
+        out.integrated_uma_free_vram_mib = std::min(out.integrated_uma_free_vram_mib, out.integrated_uma_vram_mib);
+    } else {
+        out.integrated_uma_free_vram_mib = 0;
+    }
+
+    out.combined_gpu_vram_mib = saturating_add(out.discrete_vram_mib, out.integrated_uma_vram_mib);
+    out.combined_free_gpu_vram_mib = saturating_add(out.discrete_free_vram_mib, out.integrated_uma_free_vram_mib);
+
+    if (!discrete_vk.empty() && !uma_vk.empty() && out.discrete_vram_mib > 0 && out.integrated_uma_vram_mib > 0) {
+        out.hybrid_vulkan_pool_available = true;
+        out.hybrid_vulkan_devices.reserve(discrete_vk.size() + uma_vk.size());
+        for (auto& d : discrete_vk) {
+            out.hybrid_vulkan_devices.push_back(std::move(d));
+        }
+        for (auto& u : uma_vk) {
+            out.hybrid_vulkan_devices.push_back(std::move(u));
+        }
+    }
+    return out;
+}
+
+std::uint64_t combined_gpu_vram_mib(const std::vector<GpuDeviceInfo>& gpus, bool prefer_free,
+                                    const HostMemory& host) noexcept {
+    std::uint64_t discrete_mib = 0;
+    std::uint64_t uma_total_mib = 0;
+    std::uint64_t uma_free_mib = 0;
+    for (const auto& g : gpus) {
+        if (!g.is_integrated_uma) {
+            if (const auto mib = gpu_effective_vram_mib(g, prefer_free)) {
+                discrete_mib = saturating_add(discrete_mib, *mib);
+            }
+        } else {
+            if (const auto total = gpu_effective_vram_mib(g, false)) {
+                uma_total_mib = saturating_add(uma_total_mib, *total);
+            }
+            if (const auto free = gpu_effective_vram_mib(g, true)) {
+                uma_free_mib = saturating_add(uma_free_mib, *free);
+            }
+        }
+    }
+    if (host.total_physical.is_known()) {
+        uma_total_mib = std::min(uma_total_mib, host.total_physical.bytes_or(0) / kMiB);
+    }
+    if (host.available_physical.is_known()) {
+        uma_free_mib = std::min(uma_free_mib, host.available_physical.bytes_or(0) / kMiB);
+    }
+    if (uma_total_mib > 0) {
+        uma_free_mib = std::min(uma_free_mib, uma_total_mib);
+    } else {
+        uma_free_mib = 0;
+    }
+    return saturating_add(discrete_mib, prefer_free ? uma_free_mib : uma_total_mib);
+}
+
 std::string host_platform() {
 #if defined(_WIN32)
     std::string os = "windows";
