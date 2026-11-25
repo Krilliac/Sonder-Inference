@@ -46,6 +46,8 @@ inline sonder::backends::llamacpp::SamplingParams ToLlamaSampling(const Sampling
     p.typical_p = c.typical_p;
     p.logit_bias.reserve(c.logit_bias.size());
     for (const auto& b : c.logit_bias) p.logit_bias.emplace_back(b.token, b.bias);
+    p.compute_logprobs = c.logprobs;
+    p.top_logprobs = c.top_logprobs;
     if (c.seed.has_value()) {
         // llama.cpp seeds are 32-bit and 0xFFFFFFFF means "random": fold the
         // 64-bit seed and avoid the sentinel so explicit seeds stay reproducible.

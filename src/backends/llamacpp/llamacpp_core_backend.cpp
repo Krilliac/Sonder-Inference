@@ -246,9 +246,52 @@ public:
         } else {
             exclusive_guard = std::unique_lock<std::shared_mutex>(mutex_);
         }
+        std::vector<std::vector<std::uint8_t>> media_blobs;
+        std::vector<ChatMessage> normalized_messages;
+        const std::vector<ChatMessage>* template_messages = &request.messages;
+        bool needs_normalized = false;
+        for (const auto& m : request.messages) {
+            if (!m.media.empty() || !m.tool_calls.empty()) {
+                needs_normalized = true;
+                break;
+            }
+        }
+        if (needs_normalized) {
+            normalized_messages = request.messages;
+            for (auto& m : normalized_messages) {
+                if (!m.media.empty()) {
+                    std::string markers;
+                    for (const auto& blob : m.media) {
+                        media_blobs.push_back(blob.bytes);
+                        markers += "<__media__>\n";
+                    }
+                    m.content = markers + m.content;
+                }
+                if (m.role == "assistant" && !m.tool_calls.empty()) {
+                    std::string tool_text;
+                    for (const auto& tc : m.tool_calls) {
+                        if (!tool_text.empty()) tool_text.push_back('\n');
+                        tool_text += "<tool_call>{\"name\":\"";
+                        for (char ch : tc.name) {
+                            if (ch == '"' || ch == '\\') tool_text.push_back('\\');
+                            tool_text.push_back(ch);
+                        }
+                        tool_text += "\",\"arguments\":";
+                        tool_text += tc.arguments_json.empty() ? "{}" : tc.arguments_json;
+                        tool_text += "}</tool_call>";
+                    }
+                    if (!m.content.empty()) {
+                        m.content += "\n" + tool_text;
+                    } else {
+                        m.content = std::move(tool_text);
+                    }
+                }
+            }
+            template_messages = &normalized_messages;
+        }
         bool template_unsupported = false;
         auto segments = build_chat_template_segments(
-            request.messages,
+            *template_messages,
             [&](const std::vector<ChatMessage>& placeholder_msgs) -> Result<std::string> {
                 std::vector<lc::ChatTurn> turns;
                 turns.reserve(placeholder_msgs.size());
@@ -265,12 +308,22 @@ public:
             if (template_unsupported) {
                 if (shared_guard.owns_lock()) shared_guard.unlock();
                 if (exclusive_guard.owns_lock()) exclusive_guard.unlock();
+                if (!media_blobs.empty()) {
+                    return Status(ErrorCode::invalid_argument,
+                                  "multimodal chat requires a model with a chat template");
+                }
                 return BackendModel::chat(request, cancel, on_chunk);
             }
             return segments.status();
         }
         if (request.thinking.enable_thinking.has_value() && !*request.thinking.enable_thinking) {
             ApplyNoThinkScaffolding(segments.value(), /*enable_thinking=*/false);
+        }
+        std::string media_prompt_text;
+        if (!media_blobs.empty()) {
+            for (const auto& seg : segments.value()) {
+                media_prompt_text.append(seg.text);
+            }
         }
         std::vector<lc::Token> prompt_tokens;
         const Status tok_status = tokenize_chat_segments(
@@ -281,7 +334,8 @@ public:
             prompt_tokens);
         if (!tok_status.ok()) return tok_status;
         return run_tokens(std::move(prompt_tokens), request.sampling, cancel, on_chunk, request.session_key,
-                          request.grammar, request.separate_reasoning);
+                          request.grammar, request.separate_reasoning, /*checkpoint=*/nullptr,
+                          std::move(media_blobs), std::move(media_prompt_text));
     }
 
     [[nodiscard]] bool has_native_chat() const override {
@@ -322,7 +376,9 @@ private:
                                      const CancellationToken& cancel, const TokenCallback& on_chunk,
                                      std::string_view session_key = {}, std::string_view grammar = {},
                                      bool separate_reasoning = false,
-                                     RecurrentCheckpointExchange* checkpoint = nullptr) {
+                                     RecurrentCheckpointExchange* checkpoint = nullptr,
+                                     std::vector<std::vector<std::uint8_t>> media_blobs = {},
+                                     std::string media_prompt_text = {}) {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
 
         lc::GenerateRequest req;
@@ -332,6 +388,8 @@ private:
         req.sampling = ToLlamaSampling(sampling);
         req.sampling.grammar = std::string(grammar);
         req.session_key = std::string(session_key);
+        req.media_blobs = std::move(media_blobs);
+        req.media_prompt_text = std::move(media_prompt_text);
         if (checkpoint != nullptr) {
             if (!checkpoint->restore_bytes.empty() && checkpoint->restore_token_position > 0 &&
                 checkpoint->restore_token_position < req.prompt.size()) {
@@ -366,7 +424,9 @@ private:
         ThinkingStreamSplitter thinking_splitter;
         bool callback_stopped = false;
 
-        auto deliver_split = [&](std::string_view text_part, std::string_view reasoning_part) {
+        auto deliver_split = [&](std::string_view text_part, std::string_view reasoning_part,
+                                 std::optional<float> logprob = std::nullopt,
+                                 std::vector<TopLogprob> top_logprobs = {}) {
             if (!reasoning_part.empty() && !callback_stopped) {
                 if (on_chunk && !on_chunk(TokenChunk{std::string_view{}, stats.chunks, reasoning_part})) {
                     callback_stopped = true;
@@ -374,28 +434,48 @@ private:
                 ++stats.chunks;
             }
             if (!text_part.empty() && !callback_stopped) {
-                if (on_chunk && !on_chunk(TokenChunk{text_part, stats.chunks, std::string_view{}})) {
+                TokenChunk chunk{text_part, stats.chunks, std::string_view{}};
+                chunk.logprob = logprob;
+                chunk.top_logprobs = std::move(top_logprobs);
+                if (on_chunk && !on_chunk(chunk)) {
                     callback_stopped = true;
                 }
                 ++stats.chunks;
             }
         };
 
-        auto deliver = [&](std::string_view text) {
+        auto deliver = [&](std::string_view text, std::optional<float> logprob = std::nullopt,
+                           std::vector<TopLogprob> top_logprobs = {}) {
             if (text.empty() || callback_stopped) return;
             if (!separate_reasoning) {
-                if (on_chunk && !on_chunk(TokenChunk{text, stats.chunks})) callback_stopped = true;
+                TokenChunk chunk{text, stats.chunks};
+                chunk.logprob = logprob;
+                chunk.top_logprobs = std::move(top_logprobs);
+                if (on_chunk && !on_chunk(chunk)) callback_stopped = true;
                 ++stats.chunks;
                 return;
             }
             const ThinkingSplitResult split = thinking_splitter.Push(text);
-            deliver_split(split.text, split.reasoning);
+            deliver_split(split.text, split.reasoning, logprob, std::move(top_logprobs));
         };
 
         const lc::GenerateResult r = runtime_.Generate(
             req,
             [&](const lc::TokenEvent& ev) {
-                deliver(stop.Push(ev.text));
+                std::optional<float> lp = ev.has_logprob ? std::optional<float>(ev.logprob) : std::nullopt;
+                std::vector<TopLogprob> top_lps;
+                if (ev.has_logprob && !ev.top_logprobs.empty()) {
+                    top_lps.reserve(ev.top_logprobs.size());
+                    for (const auto& [tok, tok_lp] : ev.top_logprobs) {
+                        std::string piece;
+                        const lc::Token arr[1] = {tok};
+                        if (!runtime_.Detokenize(std::span<const lc::Token>(arr, 1), piece).ok()) {
+                            piece = "<tok:" + std::to_string(tok) + ">";
+                        }
+                        top_lps.push_back(TopLogprob{std::move(piece), tok_lp});
+                    }
+                }
+                deliver(stop.Push(ev.text), lp, std::move(top_lps));
                 return !callback_stopped && !stop.matched();
             },
             [&] { return cancel.cancelled(); });
@@ -495,9 +575,13 @@ public:
             .add(Capability::structured_output)
             .add(Capability::embeddings)
             .add(Capability::deterministic)
-            .add(Capability::recurrent_checkpoint);
+            .add(Capability::recurrent_checkpoint)
+            .add(Capability::logprobs);
         if (options_.slots > 1u) {
             caps.add(Capability::continuous_batch_decode);
+        }
+        if (!options_.mmproj_path.empty()) {
+            caps.add(Capability::multimodal);
         }
         return caps;
     }
