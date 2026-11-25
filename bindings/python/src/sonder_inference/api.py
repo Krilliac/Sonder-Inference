@@ -6,16 +6,19 @@ import codecs
 import contextlib
 import ctypes
 import enum
+import math
+import os
 import queue
 import re
 import threading
 import weakref
 from dataclasses import dataclass, fields, replace
-from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence, Union
+from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence, TypeVar, Union
 
 from . import _structs as S
-from ._lib import Library, get_library
+from ._lib import Library, PathLike, get_library
 from .errors import (
+    InternalError,
     InvalidArgumentError,
     InvalidStateError,
     SonderError,
@@ -30,6 +33,8 @@ LogitBiasInput = Union[Mapping[int, float], Sequence[tuple[int, float]]]
 
 _INT32_MIN, _INT32_MAX = -(2**31), 2**31 - 1
 _UINT64_MAX = 2**64 - 1
+_CORRELATION_ID_RE = re.compile(rf"[A-Za-z0-9._:-]{{1,{S.MAX_CORRELATION_ID_BYTES}}}", re.ASCII)
+_H = TypeVar("_H", bound="_Handle")
 
 
 class TelemetryLevel(enum.IntEnum):
@@ -61,7 +66,8 @@ class WorkloadClass(enum.IntEnum):
 
 def _check(lib: Library, rc: int) -> None:
     if rc != 0:
-        raise error_for_status(rc, lib.last_error() or f"sonder status {rc}")
+        detail = lib.last_error() or lib.status_string(rc) or f"sonder status {rc}"
+        raise error_for_status(rc, detail)
 
 
 def abi_version() -> int:
@@ -152,15 +158,30 @@ def _cstr(name: str, v: str) -> bytes:
     return v.encode("utf-8")
 
 
+def _cstr_path(name: str, v: PathLike) -> bytes:
+    """Encode a ``str`` or ``os.PathLike[str]`` for a ``const char*`` path parameter."""
+    if isinstance(v, os.PathLike):
+        raw = os.fspath(v)
+        if not isinstance(raw, str):
+            raise TypeError(f"{name} must be a str or str PathLike, got {type(v).__name__}")
+        return _cstr(name, raw)
+    return _cstr(name, v)
+
+
 def _float(name: str, v: float) -> float:
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         raise TypeError(f"{name} must be a number, got {type(v).__name__}")
-    return float(v)
+    f = float(v)
+    if math.isfinite(f) and math.isinf(ctypes.c_float(f).value):
+        raise InvalidArgumentError(f"{name} overflows float32 range: {v}")
+    return f
 
 
 def _bias_items(bias: Optional[LogitBiasInput]) -> list[tuple[int, float]]:
-    if not bias:
+    if bias is None:
         return []
+    if isinstance(bias, (str, bytes, bytearray)):
+        raise TypeError(f"logit_bias must be a mapping or sequence of (token, bias) pairs, got {type(bias).__name__}")
     items = bias.items() if isinstance(bias, Mapping) else bias
     out = []
     for i, entry in enumerate(items):
@@ -218,7 +239,8 @@ class SamplingConfig:
         c = S.CSamplingConfig()
         lib.init_sampling(c)
         cfg = cls(temperature=c.temperature, top_p=c.top_p, top_k=c.top_k, min_p=c.min_p,
-                  repeat_penalty=c.repeat_penalty, seed=None, max_tokens=c.max_tokens)
+                  repeat_penalty=c.repeat_penalty, seed=int(c.seed) if c.has_seed else None,
+                  max_tokens=c.max_tokens)
         if lib.supports_extended_sampling:
             cfg.typical_p = c.typical_p
             cfg.presence_penalty = c.presence_penalty
@@ -336,13 +358,16 @@ class _Handle:
     _INTERRUPT_INTERVAL_S = 0.05
 
     def __init__(self, lib: Library, ptr: int) -> None:
+        if not ptr:
+            raise InternalError(f"{type(self).__name__} received a null native handle")
         self._lib = lib
         self._ptr: Optional[int] = ptr
         self._cond = threading.Condition()
         self._closing = False
         self._active: dict[int, int] = {}  # thread ident -> nesting depth of in-flight calls
         self._destroy_lock = threading.Lock()
-        self._finalizer = weakref.finalize(self, getattr(lib.cdll, self._destroy_fn), ctypes.c_void_p(ptr))
+        self._finalizer: weakref.finalize[Any, Any] = weakref.finalize(
+            self, getattr(lib.cdll, self._destroy_fn), ctypes.c_void_p(ptr))
 
     @property
     def closed(self) -> bool:
@@ -415,7 +440,7 @@ class _Handle:
         self._drain()
         self._destroy()
 
-    def __enter__(self):
+    def __enter__(self: _H) -> _H:
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -447,7 +472,7 @@ class SessionMetadata:
         for field in fields(self):
             value = getattr(self, field.name)
             if value is not None and (not isinstance(value, str) or
-                                      re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", value) is None):
+                                      _CORRELATION_ID_RE.fullmatch(value) is None):
                 raise InvalidArgumentError(f"{field.name} must match [A-Za-z0-9._:-]{{1,128}}")
             setattr(record, field.name, value.encode("ascii") if value is not None else None)
         return record
@@ -470,7 +495,7 @@ class RequestMetadata:
     def _to_c(self) -> "S.CRequestMetadata":
         value = self.parent_request_id
         if value is not None and (not isinstance(value, str) or
-                                  re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", value) is None):
+                                  _CORRELATION_ID_RE.fullmatch(value) is None):
             raise InvalidArgumentError("parent_request_id must match [A-Za-z0-9._:-]{1,128}")
         if self.workload_class is None:
             workload = int(WorkloadClass.DEFAULT)
@@ -523,6 +548,7 @@ def _destroy_engine(destroy_fn: Any, ptr: ctypes.c_void_p,
         destroy_fn(ptr)
     finally:
         state["callback"] = None
+        state["native_registered"] = False
         trampoline_box.clear()
 
 
@@ -531,8 +557,8 @@ class Engine(_Handle):
 
     _destroy_fn = "sonder_engine_destroy"
 
-    def __init__(self, telemetry_level: Optional[TelemetryLevel] = None,
-                 telemetry_jsonl_path: Optional[str] = None, capture_text: bool = False,
+    def __init__(self, telemetry_level: Optional[Union[TelemetryLevel, int]] = None,
+                 telemetry_jsonl_path: Optional[PathLike] = None, capture_text: bool = False,
                  library: Optional[Library] = None,
                  telemetry_callback: Optional[TelemetryCallback] = None) -> None:
         lib = library or get_library()
@@ -544,17 +570,32 @@ class Engine(_Handle):
         opts = S.EngineOptions()
         lib.cdll.sonder_engine_options_init(ctypes.byref(opts))
         if telemetry_level is not None:
-            opts.telemetry_level = int(TelemetryLevel(telemetry_level))
-        path_bytes = _cstr("telemetry_jsonl_path", telemetry_jsonl_path) if telemetry_jsonl_path else None
+            if isinstance(telemetry_level, bool) or not isinstance(telemetry_level, int):
+                raise TypeError(
+                    f"telemetry_level must be TelemetryLevel, int, or None, got {type(telemetry_level).__name__}")
+            try:
+                opts.telemetry_level = int(TelemetryLevel(telemetry_level))
+            except ValueError:
+                raise InvalidArgumentError(f"invalid telemetry_level: {telemetry_level!r}") from None
+        path_bytes = (
+            (_cstr_path("telemetry_jsonl_path", telemetry_jsonl_path) or None)
+            if telemetry_jsonl_path is not None
+            else None
+        )
         opts.telemetry_jsonl_path = path_bytes
         opts.capture_text = 1 if capture_text else 0
         out = ctypes.c_void_p()
         _check(lib, lib.cdll.sonder_engine_create(ctypes.byref(opts), ctypes.byref(out)))
-        super().__init__(lib, out.value)  # type: ignore[arg-type]
+        if not out.value:
+            raise InternalError("sonder_engine_create returned a null handle")
+        super().__init__(lib, out.value)
         self._telemetry_cb_lock = threading.RLock()
         self._telemetry_set_lock = threading.RLock()
-        self._telemetry_state: dict[str, Any] = {"callback": None, "active_tid": None}
-        self._telemetry_registered = False
+        self._telemetry_state: dict[str, Any] = {
+            "callback": None,
+            "active_tid": None,
+            "native_registered": False,
+        }
         self._telemetry_trampoline_box: list[Any] = []
         # Keep the permanent ctypes trampoline pinned until sonder_engine_destroy()
         # has flushed and cleared the native sink.
@@ -575,7 +616,7 @@ class Engine(_Handle):
         if cb_lock is None:
             return False
         with cb_lock:
-            return self._telemetry_state["active_tid"] == threading.get_ident()
+            return bool(self._telemetry_state["active_tid"] == threading.get_ident())
 
     def _check_not_reentrant(self) -> None:
         super()._check_not_reentrant()
@@ -608,11 +649,33 @@ class Engine(_Handle):
             raise UnsupportedError("this library does not export sonder_engine_set_telemetry_callback")
         with self._use() as h:
             if self._in_telemetry_callback():
-                with self._telemetry_cb_lock:
-                    self._telemetry_state["callback"] = callback
                 if callback is None:
+                    with self._telemetry_cb_lock:
+                        self._telemetry_state["callback"] = None
                     _check(self._lib, self._lib.cdll.sonder_engine_set_telemetry_callback(
                         h, S.TELEMETRY_CALLBACK(), None))
+                    with self._telemetry_cb_lock:
+                        self._telemetry_state["native_registered"] = False
+                    return
+                with self._telemetry_cb_lock:
+                    self._telemetry_state["callback"] = callback
+                    need_register = not self._telemetry_state["native_registered"]
+                    if need_register:
+                        if not self._telemetry_trampoline_box:
+                            self._telemetry_trampoline_box.append(
+                                _make_telemetry_trampoline(self._telemetry_cb_lock, self._telemetry_state))
+                        trampoline = self._telemetry_trampoline_box[0]
+                    else:
+                        trampoline = None
+                if need_register:
+                    try:
+                        _check(self._lib, self._lib.cdll.sonder_engine_set_telemetry_callback(h, trampoline, None))
+                    except BaseException:
+                        with self._telemetry_cb_lock:
+                            self._telemetry_state["callback"] = None
+                        raise
+                    with self._telemetry_cb_lock:
+                        self._telemetry_state["native_registered"] = True
                 return
             with self._telemetry_set_lock:
                 if callback is None:
@@ -620,18 +683,21 @@ class Engine(_Handle):
                         h, S.TELEMETRY_CALLBACK(), None))
                     with self._telemetry_cb_lock:
                         self._telemetry_state["callback"] = None
-                    self._telemetry_registered = False
+                        self._telemetry_state["native_registered"] = False
                     return
                 if not self._telemetry_trampoline_box:
                     self._telemetry_trampoline_box.append(
                         _make_telemetry_trampoline(self._telemetry_cb_lock, self._telemetry_state))
                 trampoline = self._telemetry_trampoline_box[0]
-                if self._telemetry_registered:
+                with self._telemetry_cb_lock:
+                    was_registered = bool(self._telemetry_state["native_registered"])
+                if was_registered:
                     # Detach first so queued events flush to the previous Python
                     # callback and any in-flight trampoline call finishes before swap.
                     _check(self._lib, self._lib.cdll.sonder_engine_set_telemetry_callback(
                         h, S.TELEMETRY_CALLBACK(), None))
-                    self._telemetry_registered = False
+                    with self._telemetry_cb_lock:
+                        self._telemetry_state["native_registered"] = False
                 with self._telemetry_cb_lock:
                     self._telemetry_state["callback"] = callback
                 try:
@@ -640,7 +706,8 @@ class Engine(_Handle):
                     with self._telemetry_cb_lock:
                         self._telemetry_state["callback"] = None
                     raise
-                self._telemetry_registered = True
+                with self._telemetry_cb_lock:
+                    self._telemetry_state["native_registered"] = True
 
     def register_mock_backend(self) -> None:
         """Register the deterministic MOCK backend ("mock"). Tests only."""
@@ -648,7 +715,7 @@ class Engine(_Handle):
             _check(self._lib, self._lib.cdll.sonder_engine_register_mock_backend(h))
 
     def register_ollama_backend(self, base_url: Optional[str] = None) -> None:
-        url = _cstr("base_url", base_url) if base_url else None
+        url = (_cstr("base_url", base_url) or None) if base_url is not None else None
         with self._use() as h:
             _check(self._lib, self._lib.cdll.sonder_engine_register_ollama_backend(h, url))
 
@@ -657,15 +724,22 @@ class Engine(_Handle):
         out = ctypes.c_void_p()
         with self._use() as h:
             _check(self._lib, self._lib.cdll.sonder_model_load(h, backend_b, model_b, ctypes.byref(out)))
+            if not out.value:
+                raise InternalError("sonder_model_load returned a null handle")
             # Registered before the call is released, so close() cannot miss it.
-            m = Model(self, out.value)  # type: ignore[arg-type]
-            self._children.add(m)
+            m = Model(self, out.value)
+            with self._cond:
+                self._children.add(m)
         return m
 
     def create_session(self, model: "Model", sampling: Optional[SamplingConfig] = None,
                        *, metadata: Optional[SessionMetadata] = None) -> "Session":
+        if not isinstance(model, Model):
+            raise TypeError(f"model must be a Model, got {type(model).__name__}")
         if model.engine is not self:
             raise InvalidArgumentError("model belongs to a different engine")
+        if sampling is not None and not isinstance(sampling, SamplingConfig):
+            raise TypeError(f"sampling must be a SamplingConfig or None, got {type(sampling).__name__}")
         if metadata is not None:
             if not isinstance(metadata, SessionMetadata):
                 raise InvalidArgumentError("metadata must be SessionMetadata or None")
@@ -682,12 +756,16 @@ class Engine(_Handle):
                 code = self._lib.cdll.sonder_session_create_with_metadata(
                     h, mh, sampling_ptr, ctypes.byref(c_metadata), ctypes.byref(out))
             _check(self._lib, code)
-            s = Session(self, model, out.value, sampling)  # type: ignore[arg-type]
-            self._children.add(s)
+            if not out.value:
+                raise InternalError("sonder_session_create returned a null handle")
+            s = Session(self, model, out.value, sampling)
+            with self._cond:
+                self._children.add(s)
         return s
 
     def close(self) -> None:
-        children = list(self._children)
+        with self._cond:
+            children = list(self._children)
         self._check_not_reentrant()
         for child in children:
             child._check_not_reentrant()
@@ -695,7 +773,8 @@ class Engine(_Handle):
         # No new engine calls can start; wait for load_model/create_session in
         # flight so every child they create is registered before we snapshot.
         self._drain()
-        children = list(self._children)
+        with self._cond:
+            children = list(self._children)
         # Sessions (cancelling and waiting for their in-flight calls) before
         # models before the engine.
         for child in children:
@@ -755,6 +834,8 @@ class Session(_Handle):
 
     def _request(self, function: Any, args: tuple[Any, ...],
                  on_token: Optional[TokenCallback]) -> GenerationResult:
+        if on_token is not None and not callable(on_token):
+            raise TypeError("on_token must be callable or None")
         lib = self._lib
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         parts: list[str] = []
@@ -769,6 +850,8 @@ class Session(_Handle):
             return 0
 
         def trampoline(_user: Any, ptr: Optional[int], length: int) -> int:
+            if error or stopped[0]:
+                return 1
             try:
                 text = decoder.decode(ctypes.string_at(ptr, length)) if length and ptr else ""
                 return deliver(text) if text else 0
@@ -789,10 +872,11 @@ class Session(_Handle):
         tail = decoder.decode(b"", final=True)
         if tail and not stopped[0]:
             deliver(tail)
+        ttft_ms = None if stats.ttft_ms < 0 or math.isnan(stats.ttft_ms) else stats.ttft_ms
         return GenerationResult(
             text="".join(parts), outcome=Outcome(stats.outcome), prompt_tokens=stats.prompt_tokens,
             completion_tokens=stats.completion_tokens, chunks=stats.chunks,
-            ttft_ms=None if stats.ttft_ms < 0 else stats.ttft_ms, total_ms=stats.total_ms)
+            ttft_ms=ttft_ms, total_ms=stats.total_ms)
 
     def stream(self, prompt: str, *, metadata: Optional[RequestMetadata] = None) -> "TokenStream":
         """Iterate over chunks as they are produced (generation runs on a
@@ -857,6 +941,8 @@ class Session(_Handle):
     def _chat_args(self, messages: Iterable[Union[ChatMessage, Mapping[str, str]]]) -> tuple[Any, int]:
         if not self._lib.has_symbol("sonder_session_chat"):
             raise UnsupportedError("this library does not export sonder_session_chat")
+        if isinstance(messages, (str, bytes, bytearray, Mapping, ChatMessage)):
+            raise TypeError("messages must be an iterable of ChatMessage or role/content mappings")
         records: list[S.CChatMessage] = []
         for message in messages:
             if len(records) == S.MAX_CHAT_MESSAGES:
@@ -882,6 +968,103 @@ class Session(_Handle):
         return pointers, len(records)
 
 
+class _StreamState:
+    """Worker-side state for :class:`TokenStream`.
+
+    Holds no strong reference to the ``TokenStream`` instance so an abandoned
+    iterator can be garbage-collected and cancelled instead of leaking its
+    worker thread and wedging the session.
+    """
+
+    __slots__ = (
+        "session",
+        "queue",
+        "closed",
+        "done",
+        "cancel_epoch",
+        "exc",
+        "result",
+        "thread",
+        "_weak_stream",
+        "_call",
+    )
+
+    def __init__(self, stream: "TokenStream", session: Session,
+                 make_call: Callable[[TokenCallback], Callable[[], GenerationResult]]) -> None:
+        self.session = session
+        self.queue: "queue.Queue[Union[str, object]]" = queue.Queue(maxsize=TokenStream._MAX_BUFFERED_CHUNKS)
+        self.closed = threading.Event()
+        self.done = threading.Event()
+        with session._cond:
+            self.cancel_epoch = session._stream_cancel_epoch
+        self.exc: Optional[BaseException] = None
+        self.result: Optional[GenerationResult] = None
+        self._weak_stream = weakref.ref(stream)
+        self._call: Optional[Callable[[], GenerationResult]] = make_call(self._dispatch_push)
+        self.thread = threading.Thread(target=self.run, name="sonder-stream", daemon=True)
+
+    def _dispatch_push(self, text: str) -> Optional[bool]:
+        stream = self._weak_stream()
+        if stream is not None and (
+            type(stream)._push is not _DEFAULT_TOKEN_STREAM_PUSH or "_push" in stream.__dict__
+        ):
+            return stream._push(text)
+        # Drop the strong reference before potentially blocking on queue.put so
+        # GC can collect and cancel an abandoned stream while backpressured.
+        del stream
+        return self.push(text)
+
+    def push(self, text: str) -> Optional[bool]:
+        while not self.closed.is_set():
+            with self.session._cond:
+                cancelled = (self.session._closing or
+                             self.session._stream_cancel_epoch != self.cancel_epoch)
+            if cancelled:
+                break
+            try:
+                self.queue.put(text, timeout=TokenStream._POLL_INTERVAL_S)
+                return None
+            except queue.Full:
+                continue
+        # Cancellation may have arrived before the native request started.
+        # Reassert it while this callback is inside that request so its
+        # terminal outcome is cancelled, rather than callback-stop completed.
+        try:
+            self.session.cancel()
+        except SonderError:
+            pass  # session close has already cancelled the native handle
+        return False
+
+    def run(self) -> None:
+        call = self._call
+        self._call = None
+        try:
+            assert call is not None
+            self.result = call()
+        except BaseException as e:  # noqa: BLE001 - surfaced to the consumer
+            self.exc = e
+        finally:
+            # The native call has ended; retain its result, not its prepared
+            # input buffers.
+            del call
+            # Completion must never wait for a consumer: close() joins this
+            # worker even when the buffer is full. The event covers that case.
+            try:
+                self.queue.put_nowait(TokenStream._DONE)
+            except queue.Full:
+                pass
+            self.done.set()
+
+
+def _abandon_stream(state: _StreamState) -> None:
+    """Finalizer for an unclosed TokenStream: signal stop and cancel native work."""
+    state.closed.set()
+    if not state.done.is_set():
+        try:
+            state.session.cancel()
+        except BaseException:  # noqa: BLE001 - never escape a finalizer
+            pass
+
 
 class TokenStream:
     """Iterator over generated chunks; see :meth:`Session.stream` and :meth:`Session.chat_stream`."""
@@ -891,8 +1074,11 @@ class TokenStream:
     _POLL_INTERVAL_S = 0.025
 
     def __init__(self, session: Session, prompt: str) -> None:
+        _cstr("prompt", prompt)
+        if session.closed:
+            raise InvalidStateError("Session is closed")
         self._prompt = prompt
-        self._start(session, lambda: session.generate(self._prompt, on_token=self._push))
+        self._start(session, lambda on_token: (lambda: session.generate(prompt, on_token=on_token)))
 
     @classmethod
     def _from_chat(cls, session: Session, args: tuple[Any, int]) -> "TokenStream":
@@ -901,60 +1087,29 @@ class TokenStream:
     @classmethod
     def _from_request(cls, session: Session, function: Any, args: tuple[Any, ...]) -> "TokenStream":
         stream = cls.__new__(cls)
-        stream._start(session, lambda: session._request(function, args, stream._push))
+        stream._start(session, lambda on_token: (lambda: session._request(function, args, on_token)))
         return stream
 
-    def _start(self, session: Session, call: Callable[[], GenerationResult]) -> None:
+    def _start(self, session: Session,
+               make_call: Callable[[TokenCallback], Callable[[], GenerationResult]]) -> None:
+        state = _StreamState(self, session, make_call)
+        self._state = state
         self._session = session
-        self._call = call
-        self._queue: "queue.Queue[Any]" = queue.Queue(maxsize=self._MAX_BUFFERED_CHUNKS)
-        self._closed = threading.Event()
-        self._done = threading.Event()
-        with session._cond:
-            self._cancel_epoch = session._stream_cancel_epoch
-        self._exc: Optional[BaseException] = None
+        self._queue = state.queue
+        self._closed = state.closed
+        self._done = state.done
+        self._cancel_epoch = state.cancel_epoch
         self._finished = False
-        self.result: Optional[GenerationResult] = None
-        self._thread = threading.Thread(target=self._run, name="sonder-stream", daemon=True)
-        self._thread.start()
+        self._thread = state.thread
+        self._finalizer: weakref.finalize[Any, Any] = weakref.finalize(self, _abandon_stream, state)
+        state.thread.start()
 
-    def _run(self) -> None:
-        try:
-            self.result = self._call()
-        except BaseException as e:  # noqa: BLE001 - surfaced to the consumer
-            self._exc = e
-        finally:
-            # The native call has ended; retain its result, not its prepared
-            # input buffers or the callable's reference back to this iterator.
-            del self._call
-            # Completion must never wait for a consumer: close() joins this
-            # worker even when the buffer is full. The event covers that case.
-            try:
-                self._queue.put_nowait(self._DONE)
-            except queue.Full:
-                pass
-            self._done.set()
+    @property
+    def result(self) -> Optional[GenerationResult]:
+        return self._state.result
 
     def _push(self, text: str) -> Optional[bool]:
-        while not self._closed.is_set():
-            with self._session._cond:
-                cancelled = (self._session._closing or
-                             self._session._stream_cancel_epoch != self._cancel_epoch)
-            if cancelled:
-                break
-            try:
-                self._queue.put(text, timeout=self._POLL_INTERVAL_S)
-                return None
-            except queue.Full:
-                continue
-        # Cancellation may have arrived before the native request started.
-        # Reassert it while this callback is inside that request so its
-        # terminal outcome is cancelled, rather than callback-stop completed.
-        try:
-            self._session.cancel()
-        except SonderError:
-            pass  # session close has already cancelled the native handle
-        return False
+        return self._state.push(text)
 
     def __iter__(self) -> Iterator[str]:
         return self
@@ -966,7 +1121,7 @@ class TokenStream:
             if self._closed.is_set():
                 raise StopIteration
             if self._done.is_set() and self._queue.empty():
-                item = self._DONE
+                item: Union[str, object] = self._DONE
                 break
             try:
                 item = self._queue.get(timeout=self._POLL_INTERVAL_S)
@@ -974,23 +1129,31 @@ class TokenStream:
             except queue.Empty:
                 continue
         if item is self._DONE:
+            self._finalizer.detach()
+            if self._thread is not threading.current_thread():
+                self._thread.join()
             self._finished = True
-            self._thread.join()
-            if self._exc is not None:
-                raise self._exc
+            if self._state.exc is not None:
+                raise self._state.exc
             raise StopIteration
+        if self._closed.is_set():
+            raise StopIteration
+        assert isinstance(item, str)
         return item
 
     def close(self) -> None:
         """Stop early: cancels the request and waits for the worker."""
         if not self._finished:
             self._closed.set()
-            if self._thread.is_alive():
-                try:
-                    self._session.cancel()
-                except SonderError:
-                    pass
-            self._thread.join()
+            self._finalizer.detach()
+            if self._thread is not threading.current_thread():
+                while self._thread.is_alive():
+                    if not self._done.is_set():
+                        try:
+                            self._session.cancel()
+                        except SonderError:
+                            pass
+                    self._thread.join(self._POLL_INTERVAL_S)
             self._finished = True
 
     def __enter__(self) -> "TokenStream":
@@ -998,6 +1161,9 @@ class TokenStream:
 
     def __exit__(self, *exc: Any) -> None:
         self.close()
+
+
+_DEFAULT_TOKEN_STREAM_PUSH = TokenStream._push
 
 
 __all__ = [

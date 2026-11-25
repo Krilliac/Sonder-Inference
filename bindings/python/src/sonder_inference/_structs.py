@@ -16,30 +16,42 @@ class EngineOptions(c.Structure):
     ]
 
 
+ENGINE_OPTIONS_SIZE = c.sizeof(EngineOptions)
+
+
 class CLogitBias(c.Structure):
     _fields_ = [("token", c.c_int32), ("bias", c.c_float)]
 
 
+LOGIT_BIAS_SIZE = c.sizeof(CLogitBias)
+
+
 # Original layout (ABI v1 as first published): fields up to max_tokens.
-_SAMPLING_V1_FIELDS = [
-    ("struct_size", c.c_uint32),
-    ("temperature", c.c_float),
-    ("top_p", c.c_float),
-    ("top_k", c.c_int32),
-    ("min_p", c.c_float),
-    ("repeat_penalty", c.c_float),
-    ("has_seed", c.c_int32),
-    ("seed", c.c_uint64),
-    ("max_tokens", c.c_int32),
-]
-
-
 class CSamplingConfigV1(c.Structure):
-    _fields_ = _SAMPLING_V1_FIELDS
+    _fields_ = [
+        ("struct_size", c.c_uint32),
+        ("temperature", c.c_float),
+        ("top_p", c.c_float),
+        ("top_k", c.c_int32),
+        ("min_p", c.c_float),
+        ("repeat_penalty", c.c_float),
+        ("has_seed", c.c_int32),
+        ("seed", c.c_uint64),
+        ("max_tokens", c.c_int32),
+    ]
 
 
 class CSamplingConfig(c.Structure):
-    _fields_ = _SAMPLING_V1_FIELDS + [
+    _fields_ = [
+        ("struct_size", c.c_uint32),
+        ("temperature", c.c_float),
+        ("top_p", c.c_float),
+        ("top_k", c.c_int32),
+        ("min_p", c.c_float),
+        ("repeat_penalty", c.c_float),
+        ("has_seed", c.c_int32),
+        ("seed", c.c_uint64),
+        ("max_tokens", c.c_int32),
         ("typical_p", c.c_float),
         ("presence_penalty", c.c_float),
         ("frequency_penalty", c.c_float),
@@ -67,6 +79,9 @@ class CGenerationStats(c.Structure):
     ]
 
 
+GENERATION_STATS_SIZE = c.sizeof(CGenerationStats)
+
+
 # int (*)(void* user_data, const char* text, size_t length). The text is not
 # NUL-terminated, so it is received as a raw pointer (c_void_p), not c_char_p.
 TOKEN_CALLBACK = c.CFUNCTYPE(c.c_int, c.c_void_p, c.c_void_p, c.c_size_t)
@@ -76,6 +91,7 @@ TOKEN_CALLBACK = c.CFUNCTYPE(c.c_int, c.c_void_p, c.c_void_p, c.c_size_t)
 TELEMETRY_CALLBACK = c.CFUNCTYPE(None, c.c_void_p, c.c_void_p, c.c_size_t)
 
 
+MAX_CORRELATION_ID_BYTES = 128
 MAX_CHAT_MESSAGES = 1024
 
 
@@ -85,6 +101,9 @@ class CChatMessage(c.Structure):
         ("role", c.c_char_p),
         ("content", c.c_char_p),
     ]
+
+
+CHAT_MESSAGE_SIZE = c.sizeof(CChatMessage)
 
 
 class CSessionMetadata(c.Structure):
@@ -97,18 +116,20 @@ class CSessionMetadata(c.Structure):
     ]
 
 
-_REQUEST_METADATA_V1_FIELDS = [
-    ("struct_size", c.c_uint32),
-    ("parent_request_id", c.c_char_p),
-]
+SESSION_METADATA_SIZE = c.sizeof(CSessionMetadata)
 
 
 class CRequestMetadataV1(c.Structure):
-    _fields_ = _REQUEST_METADATA_V1_FIELDS
+    _fields_ = [
+        ("struct_size", c.c_uint32),
+        ("parent_request_id", c.c_char_p),
+    ]
 
 
 class CRequestMetadata(c.Structure):
-    _fields_ = _REQUEST_METADATA_V1_FIELDS + [
+    _fields_ = [
+        ("struct_size", c.c_uint32),
+        ("parent_request_id", c.c_char_p),
         ("workload_class", c.c_int32),
         ("priority", c.c_int32),
     ]

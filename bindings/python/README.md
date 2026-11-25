@@ -80,6 +80,9 @@ with si.Engine(telemetry_level=si.TelemetryLevel.OFF) as engine:
   guard. Stream capacity, polling and cancellation epochs are unchanged.
 - Strings passed to the C ABI (prompt, chat roles/content, backend, model, paths, URLs) must not
   contain NUL characters; they raise `ValueError` instead of being truncated.
+  `Engine(telemetry_jsonl_path=...)` accepts `str` or `os.PathLike[str]`.
+- The package ships `py.typed` and passes `mypy --strict`. Context managers
+  (`Engine`, `Model`, `Session`, `TokenStream`) preserve their concrete types.
 
 ## Struct versioning
 
@@ -155,8 +158,11 @@ first callback. Normal completion and worker errors drain queued chunks first.
 The bound counts chunks, not bytes: individual chunks may vary in size, and
 `TokenStream.result.text` still retains the completed response. A slow consumer
 can keep its session/admission resources occupied while delivery is paused;
-close an abandoned stream (prefer its context manager). This is application
-output backpressure; the engine telemetry queue remains nonblocking.
+prefer the context manager (`with session.stream(...) as s:`) for deterministic
+cleanup. If an iterator is abandoned without closing, its garbage-collection
+finalizer signals stop and cancels the active request so the worker thread does
+not leak. This is application output backpressure; the engine telemetry queue
+remains nonblocking.
 
 See [qualification and limits](../../docs/integration/python-stream-backpressure.md).
 
@@ -176,8 +182,17 @@ IDs themselves are telemetry metadata independent of text consent: do not put
 prompts, secrets or personal data in them. Keep caller session IDs unique.
 Older ABI-v1 libraries still support default sessions; explicitly requested
 metadata raises `UnsupportedError` when the additive export is absent.
-Scheduling hints and a telemetry callback are separate follow-ups. See
-[contract and qualification](../../docs/integration/cabi-session-metadata.md).
+See [contract and qualification](../../docs/integration/cabi-session-metadata.md).
+
+### Scheduling metadata, GPU inventory, and live telemetry callbacks
+
+- `RequestMetadata(parent_request_id=..., workload_class=WorkloadClass.INTERACTIVE_USER, priority=0)`
+  carries both parent lineage and ADR-020 scheduling hints (`priority` in `[-16, 16]`).
+- `list_gpu_devices()` returns frozen `GpuInfo` records from the native GPU inventory.
+- `Engine(..., telemetry_callback=fn)` and `Engine.set_telemetry_callback(fn)` attach,
+  replace, or detach (`None`) a live `sonder.observatory.event/1` JSONL sink; exceptions
+  inside callbacks are contained and re-entrant `Engine.close()` is rejected with
+  `InvalidStateError`.
 
 ### Per-request parent lineage
 
