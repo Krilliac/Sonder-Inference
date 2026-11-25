@@ -1170,3 +1170,35 @@ TEST_CASE("serve_main: multi-profile llamacpp applies merged shared options to V
     fs::remove(ls_profiles, ec);
     fs::remove(ls_cfg, ec);
 }
+
+TEST_CASE("serve_main: --stream-keepalive-ms parses, validates bounds, and appears in help") {
+    std::string out;
+    std::string err;
+    CHECK(run({"--help"}, out, err) == 0);
+    CHECK(out.find("--stream-keepalive-ms") != std::string::npos);
+
+    {
+        det::ServeCliConfig cfg;
+        const int rc = build_cli({"--backend", "mock", "--stream-keepalive-ms", "0"}, cfg, err);
+        CHECK_MESSAGE(rc == 0, err);
+        CHECK(cfg.options.stream_keepalive_interval == std::chrono::milliseconds(0));
+    }
+    {
+        det::ServeCliConfig cfg;
+        const int rc = build_cli({"--backend", "mock", "--stream-keepalive-ms", "600000"}, cfg, err);
+        CHECK_MESSAGE(rc == 0, err);
+        CHECK(cfg.options.stream_keepalive_interval == std::chrono::milliseconds(600000));
+    }
+    for (const char* bad_val : {"-1", "600001", "abc", ""}) {
+        CAPTURE(bad_val);
+        CHECK(run({"--backend", "mock", "--stream-keepalive-ms", bad_val}, out, err) == 2);
+        CHECK(err.find("--stream-keepalive-ms") != std::string::npos);
+    }
+
+    srv::ServerOptions opts;
+    opts.backend.backend = "mock";
+    opts.stream_keepalive_interval = std::chrono::milliseconds(-5);
+    const si::Status st = srv::validate_options(opts);
+    CHECK_FALSE(st.ok());
+    CHECK(st.message().find("--stream-keepalive-ms") != std::string::npos);
+}

@@ -204,3 +204,37 @@ TEST_CASE("backend chat: thinking control becomes think and cached prompt tokens
     REQUIRE(plain.ok());
     CHECK_FALSE(plain->cached_tokens.has_value());
 }
+
+TEST_CASE("backend chat: native tool calling forwards tools and streams tool_call_deltas") {
+    FakeOllamaServer srv;
+    StreamScript s;
+    s.body =
+        R"({"model":"qwen3:8b","message":{"role":"assistant","content":"","tool_calls":[{"id":"call_o1","function":{"name":"search","arguments":{"q":"sonder"}}}]},"done":false})" "\n"
+        R"({"model":"qwen3:8b","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":22,"eval_count":6})" "\n";
+    s.chunk_bytes = 11;
+    srv.set_chat(s);
+    auto m = load(srv, config_for(srv));
+
+    ChatRequest req;
+    req.messages = {{"user", "search for sonder"}};
+    req.tools = {ToolDefinition{"search", "Search docs", R"({"type":"object","properties":{"q":{"type":"string"}}})"}};
+    req.tool_choice = ToolChoice{ToolChoiceMode::required, ""};
+    std::vector<ToolCallDelta> deltas;
+    auto st = m->chat(req, {}, [&](const TokenChunk& c) {
+        for (const auto& d : c.tool_call_deltas) deltas.push_back(d);
+        return true;
+    });
+    REQUIRE_MESSAGE(st.ok(), st.status().to_string());
+    CHECK(st->stop_reason == StopReason::tool_calls);
+    REQUIRE(deltas.size() == 1u);
+    CHECK(deltas[0].index == 0u);
+    CHECK(deltas[0].id == "call_o1");
+    CHECK(deltas[0].name == "search");
+    CHECK(deltas[0].arguments_delta == R"({"q":"sonder"})");
+
+    auto sent = json::parse(srv.last_chat_body());
+    REQUIRE(sent.ok());
+    REQUIRE(sent->find("tools") != nullptr);
+    REQUIRE(sent->find("tools")->as_array().size() == 1u);
+    CHECK(sent->find("tools")->as_array()[0].find("function")->find("name")->as_string() == "search");
+}
