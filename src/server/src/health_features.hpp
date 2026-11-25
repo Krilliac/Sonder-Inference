@@ -14,6 +14,12 @@ namespace sonder::inference::server::detail {
 
 json::Object health_features(std::string_view backend, const ServerOptions& options, json::Object metadata);
 
+json::Object health_features(std::string_view backend, const BackendCapabilities& capabilities,
+                             const ServerOptions& options, json::Object metadata);
+
+json::Object health_features(const std::shared_ptr<Backend>& backend, const ServerOptions& options,
+                             json::Object metadata);
+
 // Additive top-level capability map for `/v1/sonder/health` and
 // `/v1/sonder/identity` (auto-detected by Sonder-runtime).
 json::Object server_capabilities(const std::shared_ptr<Backend>& backend, const ServerOptions& options);

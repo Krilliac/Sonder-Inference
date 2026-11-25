@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <variant>
 #include <vector>
@@ -2110,4 +2111,446 @@ TEST_CASE("responses previous_response_id: error paths and malformed JSON resili
 
     // Server remains healthy after malformed traffic burst.
     CHECK(get(f.port, "/v1/sonder/health").status == 200);
+}
+
+TEST_CASE("health_features HTTP: direct llamacpp advertises capability-derived sonder.features on health and models") {
+    struct FakeDirectLlamaCppBackend final : si::Backend {
+        struct Model final : si::BackendModel {
+            si::ModelDescriptor desc;
+            Model() {
+                desc.name = "direct:q4";
+                desc.backend = "llamacpp";
+                desc.context_length = 4096;
+            }
+            const si::ModelDescriptor& descriptor() const override { return desc; }
+            bool has_native_chat() const override { return true; }
+            si::Result<si::GenerateStats> generate(const si::GenerateRequest&, const si::CancellationToken&,
+                                                   const si::TokenCallback& on_chunk) override {
+                if (on_chunk) (void)on_chunk(si::TokenChunk{"ok", 0});
+                si::GenerateStats st;
+                st.prompt_tokens = 2;
+                st.completion_tokens = 1;
+                st.chunks = 1;
+                st.token_counts_from_backend = true;
+                st.stop_reason = si::StopReason::end_of_sequence;
+                return st;
+            }
+        };
+        bool enable_multimodal = false;
+        bool enable_multi_slot = false;
+        std::shared_ptr<Model> model = std::make_shared<Model>();
+        std::string name() const override { return "llamacpp"; }
+        std::string description() const override { return "fake direct llamacpp backend"; }
+        si::BackendCapabilities capabilities() const override {
+            si::BackendCapabilities caps;
+            caps.add(si::Capability::tokenization)
+                .add(si::Capability::streaming)
+                .add(si::Capability::batched_prefill)
+                .add(si::Capability::prefix_reuse)
+                .add(si::Capability::speculative_decode)
+                .add(si::Capability::structured_output)
+                .add(si::Capability::embeddings)
+                .add(si::Capability::deterministic)
+                .add(si::Capability::recurrent_checkpoint)
+                .add(si::Capability::logprobs);
+            if (enable_multi_slot) caps.add(si::Capability::continuous_batch_decode);
+            if (enable_multimodal) caps.add(si::Capability::multimodal);
+            return caps;
+        }
+        si::Result<std::string> probe() override { return std::string("llama.cpp test"); }
+        si::Result<std::vector<si::ModelDescriptor>> list_models() override {
+            return std::vector<si::ModelDescriptor>{model->descriptor()};
+        }
+        si::Result<std::shared_ptr<si::BackendModel>> load_model(const si::ModelLoadOptions&) override {
+            return std::static_pointer_cast<si::BackendModel>(model);
+        }
+    };
+
+    auto be = std::make_shared<FakeDirectLlamaCppBackend>();
+    be->enable_multimodal = true;
+    be->enable_multi_slot = true;
+    auto opts = Fixture::defaults();
+    opts.models = {"direct:q4"};
+    opts.backend.backend.clear();
+    opts.backend_instance = be;
+    Fixture f(opts);
+
+    auto has_feature = [](const json::Value& doc, std::string_view name) {
+        const auto* arr = doc.find("sonder")->find("features");
+        if (arr == nullptr || !arr->is_array()) return false;
+        for (const auto& item : arr->as_array()) {
+            if (item.is_string() && item.as_string() == name) return true;
+        }
+        return false;
+    };
+
+    for (const char* path : {"/v1/sonder/health", "/v1/models"}) {
+        CAPTURE(path);
+        const Reply r = get(f.port, path);
+        REQUIRE_MESSAGE(r.status == 200, r.body);
+        const auto doc = r.json();
+        CHECK(has_feature(doc, "native_tools"));
+        CHECK(has_feature(doc, "responses_api"));
+        CHECK(has_feature(doc, "priority_classes"));
+        CHECK(has_feature(doc, "structured_output"));
+        CHECK(has_feature(doc, "embeddings"));
+        CHECK(has_feature(doc, "logprobs"));
+        CHECK(has_feature(doc, "multimodal"));
+        CHECK(has_feature(doc, "continuous_batch_decode"));
+        CHECK(has_feature(doc, "prompt_cache_key"));
+        CHECK_FALSE(has_feature(doc, "backend_native_tools"));
+    }
+}
+
+TEST_CASE("responses parity: timings, logprobs, reasoning_budget, admission telemetry, scope isolation, TTL, disable") {
+    // 1. Timings, logprobs (non-streaming, include[], and streaming), and reasoning_budget warnings on mock.
+    {
+        Fixture f;
+        // Non-streaming with timings + logprobs + top_logprobs=3 + reasoning_budget warning.
+        {
+            const Reply r = post(
+                f.port, "/v1/responses",
+                R"({"input":"hello","max_output_tokens":4,"logprobs":true,"top_logprobs":3,"reasoning_budget_tokens":256,"reasoning_budget_message":"be brief"})");
+            REQUIRE_MESSAGE(r.status == 200, r.body);
+            const auto doc = r.json();
+            const auto* timings = doc.find("timings");
+            REQUIRE((timings != nullptr && timings->is_object()));
+            CHECK(timings->find("prompt_n")->as_uint() > 0u);
+            CHECK(timings->find("predicted_n")->as_uint() == 4u);
+            CHECK(timings->find("total_ms")->as_double() >= 0.0);
+
+            const auto& content0 = doc.find("output")->as_array()[0].find("content")->as_array()[0];
+            const auto* lp = content0.find("logprobs");
+            REQUIRE((lp != nullptr && lp->is_array()));
+            CHECK(lp->as_array().size() == 4u);
+            for (const auto& tok : lp->as_array()) {
+                CHECK_FALSE(tok.find("token")->as_string().empty());
+                CHECK(tok.find("logprob")->as_double() < 0.0);
+                CHECK_FALSE(tok.find("bytes")->as_array().empty());
+                CHECK(tok.find("top_logprobs")->as_array().size() == 3u);
+            }
+
+            const auto* warnings = doc.find("sonder")->find("warnings");
+            REQUIRE((warnings != nullptr && warnings->is_array()));
+            REQUIRE(warnings->as_array().size() == 2u);
+            CHECK(warnings->as_array()[0].as_string().find("reasoning_budget_tokens") != std::string::npos);
+            CHECK(warnings->as_array()[1].as_string().find("reasoning_budget_message") != std::string::npos);
+        }
+
+        // Responses-native include: ["message.output_text.logprobs"] + top_logprobs=2.
+        {
+            const Reply r = post(
+                f.port, "/v1/responses",
+                R"({"input":"hello","max_output_tokens":3,"include":["message.output_text.logprobs"],"top_logprobs":2})");
+            REQUIRE_MESSAGE(r.status == 200, r.body);
+            const auto doc = r.json();
+            const auto& content0 = doc.find("output")->as_array()[0].find("content")->as_array()[0];
+            const auto* lp = content0.find("logprobs");
+            REQUIRE((lp != nullptr && lp->is_array()));
+            CHECK(lp->as_array().size() == 3u);
+            CHECK(lp->as_array()[0].find("top_logprobs")->as_array().size() == 2u);
+        }
+
+        // Streaming with logprobs: delta events carry logprobs and response.completed carries timings + logprobs.
+        {
+            const Reply r = post(
+                f.port, "/v1/responses",
+                R"({"input":"hello","max_output_tokens":3,"stream":true,"logprobs":true,"top_logprobs":2})");
+            REQUIRE_MESSAGE(r.status == 200, r.body);
+            const auto frames = parse_named_sse(r.body);
+            std::size_t delta_lp_count = 0;
+            bool saw_completed_timings = false;
+            bool saw_completed_logprobs = false;
+            for (const auto& [ev, data] : frames) {
+                auto p = json::parse(data);
+                REQUIRE(p.ok());
+                if (ev == "response.output_text.delta") {
+                    const auto* lp = p.value().find("logprobs");
+                    REQUIRE((lp != nullptr && lp->is_array()));
+                    if (!lp->as_array().empty()) {
+                        ++delta_lp_count;
+                        CHECK(lp->as_array()[0].find("top_logprobs")->as_array().size() == 2u);
+                    }
+                }
+                if (ev == "response.completed") {
+                    const auto* resp = p.value().find("response");
+                    REQUIRE(resp != nullptr);
+                    const auto* timings = resp->find("timings");
+                    if (timings != nullptr && timings->is_object() && timings->find("predicted_n")->as_uint() == 3u) {
+                        saw_completed_timings = true;
+                    }
+                    const auto* lp = resp->find("output")->as_array()[0].find("content")->as_array()[0].find("logprobs");
+                    if (lp != nullptr && lp->is_array() && lp->as_array().size() == 3u) {
+                        saw_completed_logprobs = true;
+                    }
+                }
+            }
+            CHECK(delta_lp_count == 3u);
+            CHECK(saw_completed_timings);
+            CHECK(saw_completed_logprobs);
+        }
+    }
+
+    // 2. Backend without Capability::logprobs rejects /v1/responses logprobs with 400 unsupported_parameter.
+    {
+        auto backend = std::make_shared<CapturingBackend>();
+        Fixture cap(capturing_options(backend));
+        const Reply r = post(cap.port, "/v1/responses", R"({"input":"hi","logprobs":true})");
+        CHECK(r.status == 400);
+        CHECK(r.json().find("error")->find("code")->as_string() == "unsupported_parameter");
+        CHECK(r.json().find("error")->find("param")->as_string() == "logprobs");
+    }
+
+    // 3. reasoning_budget::apply() forwards budget fields to llamaserver backends (header > body > pin).
+    {
+        struct BudgetCaptureBackend final : si::Backend {
+            struct Model final : si::BackendModel {
+                si::ModelDescriptor desc;
+                std::mutex mu;
+                std::optional<std::int64_t> last_budget;
+                std::optional<std::string> last_budget_msg;
+                Model() {
+                    desc.name = "ls:test";
+                    desc.backend = "llamaserver";
+                    desc.context_length = 4096;
+                }
+                const si::ModelDescriptor& descriptor() const override { return desc; }
+                bool has_native_chat() const override { return true; }
+                si::Result<si::GenerateStats> generate(const si::GenerateRequest&, const si::CancellationToken&,
+                                                       const si::TokenCallback&) override {
+                    return si::Status(si::ErrorCode::unsupported, "unused");
+                }
+                si::Result<si::GenerateStats> chat(const si::ChatRequest& req, const si::CancellationToken&,
+                                                   const si::TokenCallback& on_chunk) override {
+                    {
+                        std::lock_guard<std::mutex> lock(mu);
+                        last_budget = req.reasoning_budget_tokens;
+                        last_budget_msg = req.reasoning_budget_message;
+                    }
+                    if (on_chunk) (void)on_chunk(si::TokenChunk{"ok", 0});
+                    si::GenerateStats st;
+                    st.prompt_tokens = 3;
+                    st.completion_tokens = 1;
+                    st.chunks = 1;
+                    st.token_counts_from_backend = true;
+                    st.stop_reason = si::StopReason::end_of_sequence;
+                    return st;
+                }
+            };
+            std::shared_ptr<Model> model = std::make_shared<Model>();
+            std::string name() const override { return "llamaserver"; }
+            std::string description() const override { return "budget capturing llamaserver"; }
+            si::BackendCapabilities capabilities() const override {
+                return si::BackendCapabilities{}.add(si::Capability::streaming).add(si::Capability::remote_process);
+            }
+            si::Result<std::string> probe() override { return std::string("ls-1"); }
+            si::Result<std::vector<si::ModelDescriptor>> list_models() override {
+                return std::vector<si::ModelDescriptor>{model->descriptor()};
+            }
+            si::Result<std::shared_ptr<si::BackendModel>> load_model(const si::ModelLoadOptions&) override {
+                return std::static_pointer_cast<si::BackendModel>(model);
+            }
+        };
+
+        auto be = std::make_shared<BudgetCaptureBackend>();
+        auto opts = Fixture::defaults();
+        opts.models = {"ls:test"};
+        opts.backend.backend.clear();
+        opts.backend_instance = be;
+        opts.pin_reasoning_budget_tokens = 500;
+        opts.pin_reasoning_budget_message = "pin-msg";
+        Fixture f(opts);
+
+        // Pin default applied when omitted.
+        const Reply r1 = post(f.port, "/v1/responses", R"({"input":"hi"})");
+        REQUIRE_MESSAGE(r1.status == 200, r1.body);
+        {
+            std::lock_guard<std::mutex> lock(be->model->mu);
+            CHECK(be->model->last_budget == std::optional<std::int64_t>(500));
+            CHECK(be->model->last_budget_msg == std::optional<std::string>("pin-msg"));
+        }
+
+        // Header X-Sonder-Reasoning-Budget overrides body reasoning_budget_tokens.
+        const Reply r2 = post(
+            f.port, "/v1/responses",
+            R"({"input":"hi","reasoning_budget_tokens":100,"reasoning_budget_message":"body-msg"})",
+            {{"X-Sonder-Reasoning-Budget", "42"}});
+        REQUIRE_MESSAGE(r2.status == 200, r2.body);
+        CHECK(r2.json().find("sonder")->find("warnings") == nullptr);
+        {
+            std::lock_guard<std::mutex> lock(be->model->mu);
+            CHECK(be->model->last_budget == std::optional<std::int64_t>(42));
+            CHECK(be->model->last_budget_msg == std::optional<std::string>("body-msg"));
+        }
+    }
+
+    // 4. Admission-rejection telemetry parity on /v1/responses (429 queue full & 504 deadline expired).
+    {
+        auto be = std::make_shared<SlowPrefillBackend>();
+        auto opts = Fixture::defaults();
+        opts.models = {"slow:test"};
+        opts.backend.backend.clear();
+        opts.backend_instance = be;
+        opts.priority_admission = srv::PriorityAdmissionPolicy::on;
+        opts.backend_capacity = 1;
+        opts.max_queue_per_class = 1;
+        Fixture f(opts);
+
+        be->reset();
+        Reply hold_reply;
+        std::thread t_hold([&] {
+            hold_reply = post(f.port, "/v1/responses", R"({"input":"hold slot"})");
+        });
+        REQUIRE(be->wait_entered());
+
+        Reply queued_reply;
+        std::thread t_queued([&] {
+            queued_reply = post(f.port, "/v1/responses", R"({"input":"queued bg","priority":"background"})");
+        });
+        REQUIRE(eventually([&] {
+            return get(f.port, "/v1/sonder/health").json().find("queued_by_class")->find("background")->as_uint() == 1;
+        }));
+
+        // Queue full -> 429 overloaded + request.failed telemetry.
+        const Reply full_reply = post(
+            f.port, "/v1/responses", R"({"input":"overflow","priority":"background"})",
+            {{"X-Sonder-Parent-Request-Id", "parent-resp-full"}});
+        CHECK(full_reply.status == 429);
+        CHECK(full_reply.header("retry-after") == "1");
+        const std::string full_req_id = full_reply.header("x-sonder-request-id");
+
+        // Queued deadline expiry -> 504 deadline_exceeded + request.failed telemetry.
+        const Reply expired_reply = post(
+            f.port, "/v1/responses", R"({"input":"short deadline","deadline_ms":60})",
+            {{"X-Sonder-Parent-Request-Id", "parent-resp-exp"}});
+        CHECK(expired_reply.status == 504);
+        const std::string exp_req_id = expired_reply.header("x-sonder-request-id");
+
+        be->release();
+        t_hold.join();
+        t_queued.join();
+        CHECK(hold_reply.status == 200);
+        CHECK(queued_reply.status == 200);
+
+        bool saw_full_telemetry = false;
+        bool saw_exp_telemetry = false;
+        for (const auto& ev : f.of_type("request.failed")) {
+            const auto* rid = ev.find("request_id");
+            const auto* attrs = ev.find("attributes");
+            if (rid == nullptr || attrs == nullptr || !rid->is_string() || !attrs->is_object()) continue;
+            if (rid->as_string() == full_req_id) {
+                CHECK(attrs->find("kind")->as_string() == "chat");
+                CHECK(attrs->find("error_code")->as_string() == "overloaded");
+                CHECK_FALSE(attrs->find("backend_started")->as_bool());
+                CHECK(attrs->find("priority_class")->as_string() == "background");
+                CHECK(attrs->find("admission")->find("priority")->as_string() == "background");
+                CHECK(attrs->find("parent_request_id")->as_string() == "parent-resp-full");
+                saw_full_telemetry = true;
+            }
+            if (rid->as_string() == exp_req_id) {
+                const std::string ec = attrs->find("error_code")->as_string();
+                CHECK((ec == "deadline_exceeded" || ec == "timeout"));
+                CHECK(attrs->find("parent_request_id")->as_string() == "parent-resp-exp");
+                saw_exp_telemetry = true;
+            }
+        }
+        CHECK(saw_full_telemetry);
+        CHECK(saw_exp_telemetry);
+        for (const auto& ev : f.of_type("request.cancelled")) {
+            const auto* rid = ev.find("request_id");
+            if (rid != nullptr && rid->is_string()) {
+                CHECK(rid->as_string() != exp_req_id);
+            }
+        }
+
+        // Running deadline expiry (after backend_started) still cooperatively cancels
+        // through the watcher and returns status == "incomplete".
+        be->reset();
+        const Reply running_exp = post(f.port, "/v1/responses", R"({"input":"slow run","deadline_ms":200})");
+        REQUIRE_MESSAGE(running_exp.status == 200, running_exp.body);
+        const auto run_doc = running_exp.json();
+        REQUIRE(run_doc.find("status") != nullptr);
+        CHECK(run_doc.find("status")->as_string() == "incomplete");
+        CHECK(be->wait_cancelled());
+    }
+
+    // 5. Caller-scope isolation over HTTP (agent/run headers and bearer scopes).
+    {
+        Fixture f;
+        const std::vector<std::pair<std::string, std::string>> caller_a = {
+            {"X-Sonder-Run-Id", "run-1"}, {"X-Sonder-Agent-Id", "agent-a"}};
+        const std::vector<std::pair<std::string, std::string>> caller_b = {
+            {"X-Sonder-Run-Id", "run-1"}, {"X-Sonder-Agent-Id", "agent-b"}};
+
+        const Reply r1 = post(f.port, "/v1/responses", R"({"input":"turn 1","max_output_tokens":4})", caller_a);
+        REQUIRE_MESSAGE(r1.status == 200, r1.body);
+        const std::string id_a = r1.json().find("id")->as_string();
+
+        // Same caller chains cleanly.
+        const Reply r2_ok = post(
+            f.port, "/v1/responses",
+            R"({"previous_response_id":")" + id_a + R"(","input":"turn 2","max_output_tokens":4})", caller_a);
+        CHECK(r2_ok.status == 200);
+
+        // Different agent and unauthenticated/unscoped caller both get uniform 404.
+        const Reply r2_other = post(
+            f.port, "/v1/responses",
+            R"({"previous_response_id":")" + id_a + R"(","input":"steal"})", caller_b);
+        CHECK(r2_other.status == 404);
+        CHECK(r2_other.json().find("error")->find("code")->as_string() == "not_found");
+
+        const Reply r2_anon = post(
+            f.port, "/v1/responses",
+            R"({"previous_response_id":")" + id_a + R"(","input":"steal anon"})");
+        CHECK(r2_anon.status == 404);
+
+        // Distinct Authorization bearer scopes are also isolated.
+        const Reply rt1 = post(f.port, "/v1/responses", R"({"input":"bearer 1","max_output_tokens":3})",
+                               {{"Authorization", "Bearer caller-token-1"}});
+        REQUIRE(rt1.status == 200);
+        const std::string id_tok1 = rt1.json().find("id")->as_string();
+        CHECK(post(f.port, "/v1/responses",
+                   R"({"previous_response_id":")" + id_tok1 + R"(","input":"ok","max_output_tokens":3})",
+                   {{"Authorization", "Bearer caller-token-1"}})
+                  .status == 200);
+        CHECK(post(f.port, "/v1/responses",
+                   R"({"previous_response_id":")" + id_tok1 + R"(","input":"nope"})",
+                   {{"Authorization", "Bearer caller-token-2"}})
+                  .status == 404);
+    }
+
+    // 6. Short TTL expires entries over HTTP.
+    {
+        auto opts = Fixture::defaults();
+        opts.response_history_ttl = std::chrono::milliseconds(80);
+        Fixture f(opts);
+        const Reply r1 = post(f.port, "/v1/responses", R"({"input":"ephemeral ttl","max_output_tokens":3})");
+        REQUIRE(r1.status == 200);
+        const std::string id = r1.json().find("id")->as_string();
+        std::this_thread::sleep_for(std::chrono::milliseconds(130));
+        const Reply r2 = post(f.port, "/v1/responses",
+                              R"({"previous_response_id":")" + id + R"(","input":"after ttl"})");
+        CHECK(r2.status == 404);
+        CHECK(r2.json().find("error")->find("code")->as_string() == "not_found");
+    }
+
+    // 7. --disable-response-store opts out cleanly: stateless works, previous_response_id returns 400, health advertises false.
+    {
+        auto opts = Fixture::defaults();
+        opts.disable_response_store = true;
+        Fixture f(opts);
+        const Reply hr = get(f.port, "/v1/sonder/health");
+        REQUIRE(hr.status == 200);
+        CHECK_FALSE(hr.json().find("capabilities")->find("response_store")->as_bool());
+
+        const Reply r1 = post(f.port, "/v1/responses", R"({"input":"stateless","store":true,"max_output_tokens":3})");
+        REQUIRE_MESSAGE(r1.status == 200, r1.body);
+        const std::string id = r1.json().find("id")->as_string();
+
+        const Reply r2 = post(f.port, "/v1/responses",
+                              R"({"previous_response_id":")" + id + R"(","input":"chain attempt"})");
+        CHECK(r2.status == 400);
+        CHECK(r2.json().find("error")->find("code")->as_string() == "unsupported_parameter");
+        CHECK(r2.json().find("error")->find("param")->as_string() == "previous_response_id");
+    }
 }

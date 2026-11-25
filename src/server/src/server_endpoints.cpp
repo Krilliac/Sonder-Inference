@@ -394,9 +394,7 @@ json::Object build_residency_summary(const ServerOptions& opts, const ModelResid
 
 json::Object build_health_body(const HealthSnapshot& s) {
     json::Array backends;
-    std::string bound_backend;
     if (s.backend) {
-        bound_backend = s.backend->name();
         json::Array caps;
         for (const auto& c : s.backend->capabilities().names()) {
             caps.emplace_back(c);
@@ -443,7 +441,7 @@ json::Object build_health_body(const HealthSnapshot& s) {
                              {"dropped", s.log_stats.dropped}}},
         {"gpus", gpu_inventory_json(cached_gpu_inventory())},
         {"capabilities", server_capabilities(s.backend, s.opts)},
-        {"sonder", health_features(bound_backend, s.opts, sonder_meta())}};
+        {"sonder", health_features(s.backend, s.opts, sonder_meta())}};
 }
 
 json::Object build_models_body(const ServerOptions& opts, const ModelResidency& residency,
@@ -471,7 +469,7 @@ json::Object build_models_body(const ServerOptions& opts, const ModelResidency& 
         data.emplace_back(json::Object{
             {"id", m.id}, {"object", "model"}, {"owned_by", "sonder-inference"}, {"sonder", std::move(ext)}});
     }
-    json::Object meta = health_features(backend ? backend->name() : "", opts, sonder_meta());
+    json::Object meta = health_features(backend, opts, sonder_meta());
     if (!opts.profile_catalog.empty()) {
         json::Array catalog;
         for (const auto& entry : opts.profile_catalog) {

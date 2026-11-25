@@ -17,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -27,6 +28,7 @@
 #include <vector>
 
 #include "server_test_support.hpp"
+#include "src/health_features.hpp"
 #include "src/http.hpp"
 #include "src/identity.hpp"
 #include "src/json_schema_gbnf.hpp"
@@ -34,6 +36,7 @@
 #include "src/log_queue.hpp"
 #include "src/openai.hpp"
 #include "src/responses_handler.hpp"
+#include "src/serve_options.hpp"
 #include "src/server_endpoints.hpp"
 #include "src/sha256.hpp"
 #include "src/tool_call_parser.hpp"
@@ -1941,4 +1944,270 @@ TEST_CASE("tool_call_parser: unclosed tags and malformed JSON fall back to visib
     for (const auto& ev : tail.tool_calls) events.push_back(ev);
     CHECK(events.empty());
     CHECK(visible == raw);
+}
+
+TEST_CASE("health_features: derives sonder.features from BackendCapabilities while preserving mock and llamaserver") {
+    auto contains_feature = [](const json::Object& meta, std::string_view name) {
+        const auto* arr = meta.find("features");
+        if (arr == nullptr || !arr->is_array()) return false;
+        for (const auto& item : arr->as_array()) {
+            if (item.is_string() && item.as_string() == name) return true;
+        }
+        return false;
+    };
+
+    // 1. Direct llamacpp backend derives features from its declared Capability flags.
+    {
+        BackendCapabilities llamacpp_caps;
+        llamacpp_caps.add(Capability::tokenization)
+            .add(Capability::streaming)
+            .add(Capability::batched_prefill)
+            .add(Capability::prefix_reuse)
+            .add(Capability::speculative_decode)
+            .add(Capability::structured_output)
+            .add(Capability::embeddings)
+            .add(Capability::deterministic)
+            .add(Capability::recurrent_checkpoint)
+            .add(Capability::logprobs);
+
+        const auto meta = health_features("llamacpp", llamacpp_caps, {}, {});
+        CHECK(contains_feature(meta, "native_tools"));
+        CHECK_FALSE(contains_feature(meta, "backend_native_tools"));
+        CHECK(contains_feature(meta, "responses_api"));
+        CHECK(contains_feature(meta, "priority_classes"));
+        CHECK(contains_feature(meta, "streaming"));
+        CHECK(contains_feature(meta, "tokenization"));
+        CHECK(contains_feature(meta, "batched_prefill"));
+        CHECK(contains_feature(meta, "prefix_reuse"));
+        CHECK(contains_feature(meta, "prompt_cache_key"));
+        CHECK(contains_feature(meta, "speculative_decode"));
+        CHECK(contains_feature(meta, "structured_output"));
+        CHECK(contains_feature(meta, "embeddings"));
+        CHECK(contains_feature(meta, "logprobs"));
+        CHECK(contains_feature(meta, "recurrent_checkpoint"));
+        CHECK_FALSE(contains_feature(meta, "continuous_batch_decode"));
+        CHECK_FALSE(contains_feature(meta, "multimodal"));
+
+        // Adding optional slots > 1 and mmproj flags reflects dynamically.
+        llamacpp_caps.add(Capability::continuous_batch_decode).add(Capability::multimodal);
+        const auto rich = health_features("llamacpp", llamacpp_caps, {}, {});
+        CHECK(contains_feature(rich, "continuous_batch_decode"));
+        CHECK(contains_feature(rich, "multimodal"));
+    }
+
+    // 2. Ollama backend reflects native tool_calling + structured_output + embeddings without logprobs.
+    {
+        BackendCapabilities ollama_caps;
+        ollama_caps.add(Capability::streaming)
+            .add(Capability::remote_process)
+            .add(Capability::embeddings)
+            .add(Capability::structured_output)
+            .add(Capability::tool_calling);
+        const auto meta = health_features("ollama", ollama_caps, {}, {});
+        CHECK(contains_feature(meta, "native_tools"));
+        CHECK(contains_feature(meta, "backend_native_tools"));
+        CHECK(contains_feature(meta, "responses_api"));
+        CHECK(contains_feature(meta, "structured_output"));
+        CHECK(contains_feature(meta, "embeddings"));
+        CHECK_FALSE(contains_feature(meta, "logprobs"));
+        CHECK_FALSE(contains_feature(meta, "multimodal"));
+    }
+
+    // 3. Mock stays explicitly empty and llamaserver keeps its exact 7 legacy strings.
+    {
+        BackendCapabilities all_caps;
+        all_caps.add(Capability::tool_calling)
+            .add(Capability::structured_output)
+            .add(Capability::embeddings)
+            .add(Capability::logprobs);
+        const auto mock = health_features("mock", all_caps, {}, {});
+        REQUIRE(mock.find("features") != nullptr);
+        CHECK(mock.find("features")->as_array().empty());
+
+        const auto ls = health_features("llamaserver", all_caps, {}, {});
+        const auto& ls_arr = ls.find("features")->as_array();
+        const std::vector<std::string> expected = {"thinking", "chat_template_kwargs", "enable_thinking",
+                                                   "reasoning_effort", "reasoning_budget", "prompt_cache_key",
+                                                   "priority_classes"};
+        REQUIRE(ls_arr.size() == expected.size());
+        for (std::size_t i = 0; i < expected.size(); ++i) {
+            CHECK(ls_arr[i].as_string() == expected[i]);
+        }
+    }
+}
+
+TEST_CASE("responses_handler: TTL expiry, caller-scope isolation, and disabled store") {
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point fake_now = Clock::now();
+    auto clock_fn = [&] { return fake_now; };
+
+    // 1. Deterministic TTL expiry + byte-budget reclamation.
+    {
+        ResponseHistoryStore store(8, 4096, std::chrono::seconds(30), clock_fn);
+        ResponseHistoryStore::Entry e1;
+        e1.id = "r1";
+        e1.session_key = "sk1";
+        e1.model = "m";
+        e1.caller_scope = "scope-a";
+        e1.messages.push_back(ChatMessage{"user", std::string(2800, 'a')});
+        store.put(std::move(e1));
+        CHECK(store.size() == 1u);
+        CHECK(store.get("r1", "scope-a").has_value());
+
+        // Advance just before TTL: still alive.
+        fake_now += std::chrono::seconds(29);
+        CHECK(store.get("r1", "scope-a").has_value());
+        CHECK(store.size() == 1u);
+
+        // Advance past absolute TTL: expired and reclaimed.
+        fake_now += std::chrono::seconds(2);
+        CHECK(store.size() == 0u);
+        CHECK_FALSE(store.get("r1", "scope-a").has_value());
+
+        // Adding another large entry succeeds without byte-budget leak.
+        ResponseHistoryStore::Entry e2;
+        e2.id = "r2";
+        e2.session_key = "sk2";
+        e2.model = "m";
+        e2.caller_scope = "scope-a";
+        e2.messages.push_back(ChatMessage{"user", std::string(2800, 'b')});
+        store.put(std::move(e2));
+        CHECK(store.size() == 1u);
+        CHECK(store.get("r2", "scope-a").has_value());
+    }
+
+    // 2. Caller-scope isolation: cross-scope reads fail and cannot overwrite or refresh LRU.
+    {
+        ResponseHistoryStore store(2, 65536, std::chrono::hours(1), clock_fn);
+        ResponseHistoryStore::Entry a;
+        a.id = "r_a";
+        a.session_key = "ska";
+        a.model = "m";
+        a.caller_scope = "scope-alpha";
+        a.messages.push_back(ChatMessage{"user", "secret alpha"});
+        store.put(a);
+
+        ResponseHistoryStore::Entry b;
+        b.id = "r_b";
+        b.session_key = "skb";
+        b.model = "m";
+        b.caller_scope = "scope-beta";
+        b.messages.push_back(ChatMessage{"user", "secret beta"});
+        store.put(b);
+
+        CHECK(store.get("r_a", "scope-alpha").has_value());
+        CHECK_FALSE(store.get("r_a", "scope-beta").has_value());
+        CHECK_FALSE(store.get("r_a", "").has_value());
+
+        // Cross-scope overwrite attempt with same id is ignored.
+        ResponseHistoryStore::Entry hijack = a;
+        hijack.caller_scope = "scope-beta";
+        hijack.session_key = "hijacked";
+        store.put(std::move(hijack));
+        auto still_a = store.get("r_a", "scope-alpha");
+        REQUIRE(still_a.has_value());
+        CHECK(still_a->session_key == "ska");
+    }
+
+    // 3. Zero TTL disables retention completely.
+    {
+        ResponseHistoryStore disabled(8, 65536, std::chrono::milliseconds(0), clock_fn);
+        ResponseHistoryStore::Entry e;
+        e.id = "r_off";
+        e.session_key = "sk";
+        e.model = "m";
+        e.messages.push_back(ChatMessage{"user", "hi"});
+        disabled.put(std::move(e));
+        CHECK(disabled.size() == 0u);
+        CHECK_FALSE(disabled.get("r_off").has_value());
+    }
+}
+
+TEST_CASE("responses_handler: caller scope hashing, logprobs/budget parsing, and CLI store flags") {
+    // 1. Caller scope derivation hashes tokens and prevents delimiter collisions.
+    {
+        RequestHead h1;
+        h1.headers = {{"authorization", "Bearer secret-alpha"}};
+        RequestHead h1_lower;
+        h1_lower.headers = {{"authorization", "bearer secret-alpha"}};
+        RequestHead h2;
+        h2.headers = {{"authorization", "Bearer secret-beta"}};
+        Correlation c_empty;
+        const std::string s1 = derive_responses_caller_scope(h1, c_empty);
+        const std::string s1_lower = derive_responses_caller_scope(h1_lower, c_empty);
+        const std::string s2 = derive_responses_caller_scope(h2, c_empty);
+        CHECK(s1.size() == 64u);
+        CHECK(s1 == s1_lower);
+        CHECK(s1 != s2);
+        CHECK(s1.find("secret-alpha") == std::string::npos);
+
+        // Length-prefixing avoids boundary collision between run_id and agent_id.
+        Correlation c_a;
+        c_a.run_id = "ab";
+        c_a.agent_id = "c";
+        Correlation c_b;
+        c_b.run_id = "a";
+        c_b.agent_id = "bc";
+        RequestHead empty_head;
+        CHECK(derive_responses_caller_scope(empty_head, c_a) != derive_responses_caller_scope(empty_head, c_b));
+    }
+
+    // 2. parse_responses_request parses logprobs, include, top_logprobs, and reasoning_budget fields.
+    {
+        const auto ok = parse_responses_request(
+            R"({"input":"hi","logprobs":true,"top_logprobs":5,"reasoning_budget_tokens":128,"reasoning_budget_message":"wrap up"})");
+        REQUIRE(std::holds_alternative<ResponsesJob>(ok));
+        const auto& job = std::get<ResponsesJob>(ok);
+        CHECK(job.sampling.logprobs);
+        CHECK(job.sampling.top_logprobs == 5);
+        CHECK(job.reasoning_budget_tokens == std::optional<std::int64_t>(128));
+        CHECK(job.reasoning_budget_message == std::optional<std::string>("wrap up"));
+
+        const auto via_include = parse_responses_request(
+            R"({"input":"hi","include":["message.output_text.logprobs"],"top_logprobs":3})");
+        REQUIRE(std::holds_alternative<ResponsesJob>(via_include));
+        CHECK(std::get<ResponsesJob>(via_include).sampling.logprobs);
+        CHECK(std::get<ResponsesJob>(via_include).sampling.top_logprobs == 3);
+
+        // Validation failures
+        CHECK(std::holds_alternative<ApiError>(parse_responses_request(R"({"input":"hi","top_logprobs":2})")));
+        CHECK(std::holds_alternative<ApiError>(
+            parse_responses_request(R"({"input":"hi","logprobs":true,"top_logprobs":21})")));
+        CHECK(std::holds_alternative<ApiError>(parse_responses_request(R"({"input":"hi","logprobs":"yes"})")));
+        CHECK(std::holds_alternative<ApiError>(parse_responses_request(R"({"input":"hi","include":"bad"})")));
+        CHECK(std::holds_alternative<ApiError>(
+            parse_responses_request(R"({"input":"hi","reasoning_budget_tokens":-2})")));
+    }
+
+    // 3. CLI options --disable-response-store and --response-history-ttl parse and validate cleanly.
+    {
+        ParsedServeArgs parsed;
+        std::string parse_err;
+        REQUIRE_MESSAGE(parse_serve_args(
+                            {"--backend", "mock", "--disable-response-store", "--response-history-ttl", "120"},
+                            parsed, parse_err),
+                        parse_err);
+        std::ostringstream err_stream;
+        auto log = std::make_shared<LockedLog>(err_stream);
+        ServeCliConfig cfg;
+        CHECK(build_serve_options(parsed, log, cfg) == 0);
+        log->close();
+        CHECK(cfg.options.disable_response_store);
+        CHECK(cfg.options.response_history_ttl == std::chrono::seconds(120));
+
+        // Out-of-range TTL rejected.
+        ParsedServeArgs bad_ttl;
+        REQUIRE(parse_serve_args({"--backend", "mock", "--response-history-ttl", "86401"}, bad_ttl, parse_err));
+        std::ostringstream bad_err;
+        auto bad_log = std::make_shared<LockedLog>(bad_err);
+        ServeCliConfig bad_cfg;
+        CHECK(build_serve_options(bad_ttl, bad_log, bad_cfg) == 2);
+        bad_log->close();
+
+        // Negative programmatic TTL rejected by validate_options.
+        server::ServerOptions neg;
+        neg.backend.backend = "mock";
+        neg.response_history_ttl = std::chrono::milliseconds(-1);
+        CHECK(server::validate_options(neg).code() == ErrorCode::invalid_argument);
+    }
 }
