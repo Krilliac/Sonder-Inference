@@ -425,7 +425,10 @@ CoResidencyPlan plan_coresident_models(const std::vector<CoResidencyEntry>& entr
         if (any_gpu_already_reserved) {
             // Apply per-GPU reserve selectively so occupied GPUs do not pay a
             // second OS reserve while unoccupied GPUs still reserve headroom once.
+            // Also avoid fragmenting subsequent models across an already-occupied
+            // discrete GPU when an unoccupied iGPU is available for clean spill.
             eval_req.vram_headroom_mib = 0;
+            eval_req.allow_hybrid_gpu_spread = false;
             for (std::size_t k = 0; k < candidate_gpus.size(); ++k) {
                 if (candidate_gpus[k].is_integrated_uma && working_host.available_physical.is_known()) {
                     const std::uint64_t host_avail_mib = working_host.available_physical.bytes_or(0) / kMiB;
@@ -539,12 +542,20 @@ CoResidencyPlan plan_coresident_models(const std::vector<CoResidencyEntry>& entr
             result.aggregate_vram_mib = saturating_add(result.aggregate_vram_mib, used_mib);
         }
 
-        // Deduct host RAM footprint (on UMA, GPU pool + host-side bytes both come
-        // from unified physical RAM without double-counting either component).
-        const std::uint64_t host_req_bytes =
-            model_plan.uma_mode
-                ? saturating_add(model_plan.estimate.total_bytes, model_plan.estimate.host_resident_bytes)
-                : model_plan.estimate.host_resident_bytes;
+        // Deduct host RAM footprint (on UMA or hybrid discrete+UMA, only the UMA
+        // GPU pool + host-side bytes come from unified physical RAM without
+        // double-counting discrete GDDR VRAM or either unified component).
+        std::uint64_t uma_gpu_bytes = 0;
+        if (model_plan.uma_mode) {
+            uma_gpu_bytes = model_plan.estimate.total_bytes;
+        } else {
+            for (std::size_t j = 0; j < placed_indices.size(); ++j) {
+                if (working_gpus[placed_indices[j]].is_integrated_uma) {
+                    uma_gpu_bytes = saturating_add(uma_gpu_bytes, saturating_mul(per_gpu_mib[j], kMiB));
+                }
+            }
+        }
+        const std::uint64_t host_req_bytes = saturating_add(uma_gpu_bytes, model_plan.estimate.host_resident_bytes);
         const std::uint64_t host_used_mib = bytes_to_mib_ceil(host_req_bytes);
         bool host_overflow = !model_plan.fits_in_host_ram;
         if (working_host.available_physical.is_known()) {

@@ -540,14 +540,25 @@ SlotSelection SelectPrefixSlot(std::span<const PrefixSlotMeta> slots, std::span<
     if (slots.empty()) return {};
     const std::size_t max_reuse = prompt.size() > 1 ? prompt.size() - 1 : 0;
 
-    // 1. Exact non-empty session_key match takes precedence.
+    // 1. Exact non-empty session_key match takes precedence (best LCP, then MRU).
     if (!session_key.empty()) {
+        bool found_sess = false;
+        std::size_t best_sess_idx = 0;
+        std::size_t best_sess_lcp = 0;
+        std::uint64_t best_sess_used = 0;
         for (std::size_t i = 0; i < slots.size(); ++i) {
             if (slots[i].session_key == session_key) {
                 const std::size_t lcp = std::min(LongestCommonPrefix(slots[i].tokens, prompt), max_reuse);
-                return {i, lcp};
+                if (!found_sess || lcp > best_sess_lcp ||
+                    (lcp == best_sess_lcp && slots[i].last_used > best_sess_used)) {
+                    found_sess = true;
+                    best_sess_idx = i;
+                    best_sess_lcp = lcp;
+                    best_sess_used = slots[i].last_used;
+                }
             }
         }
+        if (found_sess) return {best_sess_idx, best_sess_lcp};
     }
 
     // 2. Longest common prefix (> 0), tie-broken by most recently used.
@@ -744,7 +755,7 @@ void NgramModTable::BeginRequest(std::span<const Token> prompt) {
     low_streak_ = 0;
     if (entries_.empty()) return;
     // Reset only if occupancy exceeds 25% (preserves cross-request n-grams across turns).
-    if (used_ * 4 > entries_.size()) {
+    if (used_ > entries_.size() / 4u) {
         Reset();
     }
     (void)IndexRange(prompt, 0, prompt.size());
@@ -789,14 +800,16 @@ void NgramModTable::Draft(std::span<const Token> history, Token id_last, std::si
 
 bool NgramModTable::Observe(std::size_t drafted, std::size_t accepted) {
     if (drafted == 0) return false;
+    const std::size_t clamped_acc = std::min(accepted, drafted);
     const std::size_t floor_len = std::min<std::size_t>(32, n_max_);
-    if (accepted >= drafted) {
+    if (clamped_acc >= drafted) {
         n_cur_ = std::min<std::size_t>(n_cur_ * 2, n_max_);
     } else {
         n_cur_ = std::max<std::size_t>(floor_len, n_cur_ / 2);
     }
 
-    if (accepted * 4 < drafted) {
+    const std::size_t quarter_ceil = (drafted / 4u) + ((drafted % 4u) != 0u ? 1u : 0u);
+    if (clamped_acc < quarter_ceil) {
         ++low_streak_;
         if (low_streak_ >= 5) {
             Reset();
@@ -840,8 +853,14 @@ void AdaptiveDraftController::Observe(std::int32_t drafted, std::int32_t accepte
     const double rate = static_cast<double>(accepted) / static_cast<double>(drafted);
     constexpr double kAlpha = 0.25;
     acceptance_ema_ = (steps_observed_ == 0) ? rate : (1.0 - kAlpha) * acceptance_ema_ + kAlpha * rate;
-    ++steps_observed_;
-    total_drafted_ += drafted;
+    if (steps_observed_ < std::numeric_limits<std::int32_t>::max()) {
+        ++steps_observed_;
+    }
+    if (total_drafted_ <= std::numeric_limits<std::int32_t>::max() - drafted) {
+        total_drafted_ += drafted;
+    } else {
+        total_drafted_ = std::numeric_limits<std::int32_t>::max();
+    }
 
     if (accepted == drafted && current_draft_ < max_draft_) {
         current_draft_ = std::min<std::int32_t>(max_draft_, current_draft_ + 2);

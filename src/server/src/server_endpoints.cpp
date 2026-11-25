@@ -442,6 +442,7 @@ json::Object build_health_body(const HealthSnapshot& s) {
                              {"written", s.log_stats.written},
                              {"dropped", s.log_stats.dropped}}},
         {"gpus", gpu_inventory_json(cached_gpu_inventory())},
+        {"capabilities", server_capabilities(s.backend, s.opts)},
         {"sonder", health_features(bound_backend, s.opts, sonder_meta())}};
 }
 
@@ -508,6 +509,7 @@ json::Object build_identity_body(const ModelResidency& residency, const std::str
                         {"synthetic", synthetic},
                         {"backend_identity", id.backend_identity},
                         {"reason", id.reason},
+                        {"capabilities", server_capabilities(nullptr, ServerOptions{})},
                         {"sonder", sonder_meta()}};
 }
 
@@ -565,6 +567,9 @@ json::Object build_node_body(const NodeSnapshot& s) {
         }
     }
 
+    const std::vector<GpuDeviceInfo> gpus = cached_gpu_inventory();
+    const GpuPoolSummary gpu_pool = summarize_gpu_pools(gpus, host);
+
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
     constexpr bool kHasAdaptiveSpeculation = true;
 #else
@@ -574,6 +579,7 @@ json::Object build_node_body(const NodeSnapshot& s) {
                               {"placement_planner", true},
                               {"coresidency_planner", true},
                               {"multi_gpu", true},
+                              {"hybrid_gpu_spread", true},
                               {"uma_telemetry", true},
                               {"adaptive_speculation", kHasAdaptiveSpeculation}};
 
@@ -588,7 +594,9 @@ json::Object build_node_body(const NodeSnapshot& s) {
                         {"synthetic", s.synthetic},
                         {"host_memory", std::move(host_memory)},
                         {"devices", std::move(devices)},
-                        {"gpus", gpu_inventory_json(cached_gpu_inventory())},
+                        {"gpus", gpu_inventory_json(gpus)},
+                        {"combined_gpu_vram_mib", gpu_pool.combined_gpu_vram_mib},
+                        {"gpu_pool", gpu_pool_summary_to_json(gpu_pool)},
                         {"backends", std::move(backends)},
                         {"models", std::move(models)},
                         {"profiles", std::move(profiles)},
@@ -689,6 +697,12 @@ std::variant<PlanHttpRequest, ApiError> parse_plan_request(std::string_view body
                                   "allow_moe_cpu_offload");
             }
             out.plan_request.allow_moe_cpu_offload = val.as_bool();
+        } else if (key == "allow_hybrid_gpu_spread") {
+            if (!val.is_bool()) {
+                return make_error(400, "invalid_request", "allow_hybrid_gpu_spread must be a boolean",
+                                  "allow_hybrid_gpu_spread");
+            }
+            out.plan_request.allow_hybrid_gpu_spread = val.as_bool();
         } else {
             const std::string safe_key = sanitize_key_for_error(key);
             return make_error(400, "invalid_request", "unknown field '" + safe_key + "'", safe_key);
@@ -781,7 +795,8 @@ std::variant<json::Object, ApiError> execute_plan_request(const ServerOptions& o
 
 json::Object build_identity_body(const ServerOptions& opts, const ModelResidency& residency,
                                  const std::string& served_id, bool synthetic,
-                                 const std::optional<std::string>& probed) {
+                                 const std::optional<std::string>& probed,
+                                 const std::shared_ptr<Backend>& backend) {
     // Identity never loads a model (no backend I/O here): a model that is
     // not resident reports the descriptor of its last load, if any.
     IdentityResult id;
@@ -831,6 +846,7 @@ json::Object build_identity_body(const ServerOptions& opts, const ModelResidency
                         {"synthetic", synthetic},
                         {"backend_identity", id.backend_identity},
                         {"reason", id.reason},
+                        {"capabilities", server_capabilities(backend, opts)},
                         {"sonder", sonder_meta()}};
 }
 json::Object build_discovery_document(const ServerOptions& opts, const LiveTelemetryHub& hub,

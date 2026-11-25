@@ -1890,3 +1890,55 @@ TEST_CASE("security hardening: tool_call_parser embedded close tag, gbnf regex/s
         CHECK(got->messages[0].media.empty());
     }
 }
+
+TEST_CASE("responses_handler: overwriting same entry id updates LRU and byte budget safely") {
+    ResponseHistoryStore store(4, 4096);
+    for (int i = 0; i < 6; ++i) {
+        ResponseHistoryStore::Entry e;
+        e.id = "same_id";
+        e.session_key = "sk_" + std::to_string(i);
+        e.model = "m";
+        e.messages.push_back(ChatMessage{"user", std::string(static_cast<std::size_t>(200 + i * 100), 'x')});
+        store.put(std::move(e));
+        CHECK(store.size() == 1u);
+        auto got = store.get("same_id");
+        REQUIRE(got.has_value());
+        CHECK(got->session_key == "sk_" + std::to_string(i));
+    }
+
+    // Overwrite same_id with a small entry, then verify another large entry fits
+    // (proving old_b was subtracted cleanly without UAF or byte-budget drift).
+    ResponseHistoryStore::Entry tiny;
+    tiny.id = "same_id";
+    tiny.session_key = "sk_tiny";
+    tiny.model = "m";
+    tiny.messages.push_back(ChatMessage{"user", "hi"});
+    store.put(std::move(tiny));
+
+    ResponseHistoryStore::Entry big;
+    big.id = "other_id";
+    big.session_key = "sk_big";
+    big.model = "m";
+    big.messages.push_back(ChatMessage{"user", std::string(3500, 'y')});
+    store.put(std::move(big));
+    CHECK(store.size() == 2u);
+    CHECK(store.get("same_id").has_value());
+    CHECK(store.get("other_id").has_value());
+}
+
+TEST_CASE("tool_call_parser: unclosed tags and malformed JSON fall back to visible text") {
+    ToolCallStreamParser parser("call_u_");
+    std::string visible;
+    std::vector<ParsedToolEvent> events;
+    const std::string raw = "Hello <tool_call>{\"name\":\"fn\",\"arguments\":{\"k\":1}";
+    for (const char ch : raw) {
+        const auto out = parser.feed(std::string_view(&ch, 1));
+        visible += out.visible_text;
+        for (const auto& ev : out.tool_calls) events.push_back(ev);
+    }
+    const auto tail = parser.flush();
+    visible += tail.visible_text;
+    for (const auto& ev : tail.tool_calls) events.push_back(ev);
+    CHECK(events.empty());
+    CHECK(visible == raw);
+}
