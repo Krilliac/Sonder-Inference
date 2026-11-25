@@ -1,7 +1,9 @@
 #include "llamaserver_stream.hpp"
 
 #include <cmath>
+#include <cstddef>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -124,17 +126,41 @@ Status upstream_status(const Status &status) {
 
 Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat, bool native, bool separate_reasoning,
                                             const CancellationToken &cancel, const TokenCallback &callback,
-                                            std::uint64_t &progress_events) {
+                                            std::uint64_t &progress_events, bool tools_requested,
+                                            std::size_t max_tool_call_bytes) {
     int http_status = 0;
     request.on_status = [&](int status) { http_status = status; };
     GenerateStats stats;
     Status error;
     bool stopped = false, terminal = false, done = false;
     bool usage_prompt = false, usage_completion = false, usage_cache = false;
+    std::optional<std::uint64_t> timing_prompt_n = std::nullopt;
+    std::optional<std::uint64_t> timing_cache_n = std::nullopt;
+    std::optional<std::uint64_t> native_evaluated_n = std::nullopt;
+    std::optional<std::uint64_t> native_cached_n = std::nullopt;
     std::uint64_t observed_chunks = 0;
-    const bool tools_requested =
-        chat && (request.body.find("\"tools\":[") != std::string::npos ||
-                 request.body.find("\"tools\": [") != std::string::npos);
+    std::size_t accumulated_tool_call_bytes = 0;
+    std::size_t accumulated_output_bytes = 0;
+    const bool allow_tools = chat && tools_requested;
+
+    const auto recompute_prompt_tokens = [&]() -> bool {
+        if (usage_prompt)
+            return true;
+        if (!timing_prompt_n.has_value() && !timing_cache_n.has_value() && !native_evaluated_n.has_value() &&
+            !native_cached_n.has_value())
+            return true;
+        const std::uint64_t eval_n = timing_prompt_n.has_value() ? *timing_prompt_n : native_evaluated_n.value_or(0);
+        const std::uint64_t cache_n =
+            usage_cache ? stats.cached_tokens.value_or(0)
+                        : (timing_cache_n.has_value() ? *timing_cache_n : native_cached_n.value_or(0));
+        if (cache_n > std::numeric_limits<std::uint64_t>::max() - eval_n) {
+            error = protocol_error("inconsistent timing token counts");
+            return false;
+        }
+        stats.prompt_tokens = eval_n + cache_n;
+        stats.token_counts_from_backend = true;
+        return true;
+    };
 
     const auto count = [&](const json::Value &object, const char *key, std::uint64_t &dest) {
         const auto *value = object.find(key);
@@ -178,16 +204,20 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
         if (!error.ok())
             return false;
         merge_timings(stats.backend_timings, timing.backend_timings);
-        if (timing.prompt_present && !usage_prompt) {
-            stats.prompt_tokens = timing.prompt_tokens + timing.cached_tokens;
-            stats.token_counts_from_backend = true;
+        if (timing.prompt_present)
+            timing_prompt_n = timing.prompt_tokens;
+        if (timing.cache_present)
+            timing_cache_n = timing.cached_tokens;
+        if (timing.cache_present && !usage_cache)
+            stats.cached_tokens = timing.cached_tokens;
+        if (timing.prompt_present || timing.cache_present) {
+            if (!recompute_prompt_tokens())
+                return false;
         }
         if (timing.completion_present && !usage_completion) {
             stats.completion_tokens = timing.completion_tokens;
             stats.token_counts_from_backend = true;
         }
-        if (timing.cache_present && !usage_cache)
-            stats.cached_tokens = timing.cached_tokens;
         if (timing.draft_present)
             stats.draft_tokens = timing.draft_tokens;
         if (timing.draft_accepted_present)
@@ -205,7 +235,11 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
                 return false;
             }
             usage_prompt = count(*usage, "prompt_tokens", stats.prompt_tokens) || usage_prompt;
+            if (!error.ok())
+                return false;
             usage_completion = count(*usage, "completion_tokens", stats.completion_tokens) || usage_completion;
+            if (!error.ok())
+                return false;
             if (const auto *details = usage->find("prompt_tokens_details")) {
                 if (!details->is_object()) {
                     error = protocol_error("prompt_tokens_details must be an object");
@@ -216,15 +250,19 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
                     stats.cached_tokens = cached;
                     usage_cache = true;
                 }
+                if (!error.ok())
+                    return false;
             }
             if (usage_prompt || usage_completion)
                 stats.token_counts_from_backend = true;
+            if (usage_cache && !usage_prompt && !recompute_prompt_tokens())
+                return false;
         }
         std::string piece;
         std::string reasoning;
         std::string reason;
         bool saw_reasoning_text = false;
-        std::optional<float> chunk_logprob;
+        std::optional<float> chunk_logprob = std::nullopt;
         std::vector<TopLogprob> chunk_top_logprobs;
         std::vector<ToolCallDelta> chunk_tool_deltas;
         if (native) {
@@ -255,14 +293,31 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
                     }
                 }
             }
-            if (!usage_prompt && count(object, "tokens_evaluated", stats.prompt_tokens))
+            std::uint64_t evaluated = 0;
+            const bool has_evaluated = count(object, "tokens_evaluated", evaluated);
+            if (!error.ok())
+                return false;
+            std::uint64_t predicted = 0;
+            const bool has_predicted = count(object, "tokens_predicted", predicted);
+            if (!error.ok())
+                return false;
+            std::uint64_t cached = 0;
+            const bool has_cached = count(object, "tokens_cached", cached);
+            if (!error.ok())
+                return false;
+            if (has_evaluated)
+                native_evaluated_n = evaluated;
+            if (has_cached)
+                native_cached_n = cached;
+            if (has_cached && !timing_cache_n.has_value() && !usage_cache)
+                stats.cached_tokens = cached;
+            if (has_evaluated || has_cached) {
+                if (!recompute_prompt_tokens())
+                    return false;
+            }
+            if (has_predicted && !usage_completion && !timing.completion_present) {
+                stats.completion_tokens = predicted;
                 stats.token_counts_from_backend = true;
-            if (!usage_completion && count(object, "tokens_predicted", stats.completion_tokens))
-                stats.token_counts_from_backend = true;
-            if (const auto *cached = object.find("tokens_cached"); cached) {
-                std::uint64_t value = 0;
-                if (count(object, "tokens_cached", value) && !timing.cache_present && !usage_cache)
-                    stats.cached_tokens = value;
             }
             const auto *stop = object.find("stop");
             if (stop && stop->is_bool() && stop->as_bool()) {
@@ -304,8 +359,8 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
                         probe = delta->find("reasoning");
                     if (probe && probe->is_string() && !probe->as_string().empty())
                         saw_reasoning_text = true;
-                    // Parse native OpenAI delta.tool_calls when present.
-                    if (tools_requested) {
+                    // Parse native OpenAI delta.tool_calls when explicitly requested.
+                    if (allow_tools) {
                         if (const auto *tcs = delta->find("tool_calls"); tcs && tcs->is_array()) {
                             for (const auto &item : tcs->as_array()) {
                                 if (!item.is_object()) continue;
@@ -324,11 +379,27 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
                                     if (const auto *nm = fn->find("name"); nm && nm->is_string()) {
                                         tcd.name = nm->as_string();
                                     }
-                                    if (const auto *args = fn->find("arguments"); args && args->is_string()) {
-                                        tcd.arguments_delta = args->as_string();
+                                    if (const auto *args = fn->find("arguments"); args && !args->is_null()) {
+                                        if (args->is_string()) {
+                                            tcd.arguments_delta = args->as_string();
+                                        } else if (args->is_object()) {
+                                            tcd.arguments_delta = args->dump();
+                                        } else {
+                                            error = protocol_error("tool call arguments must be a string or object");
+                                            return false;
+                                        }
                                     }
                                 }
-                                if (!tcd.id.empty() || !tcd.name.empty() || !tcd.arguments_delta.empty()) {
+                                const std::size_t delta_bytes =
+                                    tcd.id.size() + tcd.name.size() + tcd.arguments_delta.size();
+                                if (delta_bytes > 0) {
+                                    if (max_tool_call_bytes > 0 &&
+                                        (delta_bytes > max_tool_call_bytes ||
+                                         accumulated_tool_call_bytes > max_tool_call_bytes - delta_bytes)) {
+                                        error = protocol_error("tool call deltas exceed cumulative byte limit");
+                                        return false;
+                                    }
+                                    accumulated_tool_call_bytes += delta_bytes;
                                     chunk_tool_deltas.push_back(std::move(tcd));
                                 }
                             }
@@ -404,7 +475,7 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
             return false;
         if (!reason.empty()) {
             if (reason == "tool_calls" || reason == "function_call") {
-                if (tools_requested) {
+                if (allow_tools) {
                     stats.stop_reason = StopReason::tool_calls;
                 } else {
                     error = {ErrorCode::unsupported,
@@ -420,6 +491,16 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
                 stats.stop_reason = mapped;
             }
         }
+        std::size_t chunk_output_bytes = piece.size() + reasoning.size();
+        for (const auto &tcd : chunk_tool_deltas) {
+            chunk_output_bytes += tcd.id.size() + tcd.name.size() + tcd.arguments_delta.size();
+        }
+        if (chunk_output_bytes > kMaxStreamOutputBytes ||
+            accumulated_output_bytes > kMaxStreamOutputBytes - chunk_output_bytes) {
+            error = protocol_error("stream output exceeds cumulative byte limit");
+            return false;
+        }
+        accumulated_output_bytes += chunk_output_bytes;
         if (!piece.empty() || !reasoning.empty() || saw_reasoning_text || !chunk_tool_deltas.empty())
             ++progress_events;
         if (!piece.empty() || !reasoning.empty() || !chunk_tool_deltas.empty()) {

@@ -34,15 +34,15 @@ struct Timings {
 
 // llama.cpp-only request fields (never sent to a generic OpenAI upstream).
 struct RequestExtras {
-    bool cache_prompt = false;             // "cache_prompt": true
-    std::optional<std::uint32_t> id_slot;  // "id_slot": pinned slot
+    bool cache_prompt = false;                             // "cache_prompt": true
+    std::optional<std::uint32_t> id_slot = std::nullopt;   // "id_slot": pinned slot
     // Declared-generic upstream: thinking controls go out as top-level
     // enable_thinking / reasoning_effort fields and chat_template_kwargs is
     // never sent. False keeps the llama.cpp chat_template_kwargs form.
     bool generic_thinking = false;
     // Per-request speculative draft length ("speculative.n_max" in llama-server
     // tools/server/server-task.cpp). Omitted when unset or in generic mode.
-    std::optional<std::uint32_t> spec_draft_n_max;
+    std::optional<std::uint32_t> spec_draft_n_max = std::nullopt;
 };
 
 // GET /props: the per-slot context (default_generation_settings.n_ctx, or a
@@ -55,6 +55,9 @@ struct ServerProps {
 json::Value build_completion_body(const std::string &model, const GenerateRequest &request,
                                   bool native_completion, std::string_view grammar = {},
                                   const RequestExtras &extras = {});
+// True when `request` actively enables upstream tool calling (non-empty tools
+// list and tool_choice is not explicitly "none").
+[[nodiscard]] bool chat_tools_requested(const ChatRequest &request) noexcept;
 // Also forwards request.thinking as chat_template_kwargs when set (or as
 // top-level fields with extras.generic_thinking), plus tools, tool_choice,
 // tool_calls, tool_call_id, multimodal image_url content blocks, and logprobs.

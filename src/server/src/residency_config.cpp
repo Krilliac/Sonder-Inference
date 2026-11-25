@@ -140,22 +140,46 @@ std::optional<std::size_t> match_single_gpu_hint(const std::vector<GpuDeviceInfo
         return g.vendor == GpuVendor::nvidia || iequals(g.backend_hint, "cuda");
     };
     const auto is_amd = [](const GpuDeviceInfo &g) noexcept {
-        return g.vendor == GpuVendor::amd || iequals(g.backend_hint, "rocm");
+        return g.vendor == GpuVendor::amd || iequals(g.backend_hint, "rocm") || iequals(g.backend_hint, "hip");
+    };
+    const bool any_explicit_rocm = std::any_of(gpus.begin(), gpus.end(), [](const GpuDeviceInfo &g) noexcept {
+        return iequals(g.backend_hint, "rocm") || iequals(g.backend_hint, "hip");
+    });
+    const auto is_rocm_target = [any_explicit_rocm, &is_amd](const GpuDeviceInfo &g) noexcept {
+        if (any_explicit_rocm)
+            return iequals(g.backend_hint, "rocm") || iequals(g.backend_hint, "hip");
+        return is_amd(g);
     };
     const auto is_intel = [](const GpuDeviceInfo &g) noexcept { return g.vendor == GpuVendor::intel; };
     const auto is_apple = [](const GpuDeviceInfo &g) noexcept {
         return g.vendor == GpuVendor::apple || iequals(g.backend_hint, "metal");
     };
+    const auto is_uma = [](const GpuDeviceInfo &g) noexcept { return g.is_integrated_uma; };
     const auto is_any = [](const GpuDeviceInfo &) noexcept { return true; };
+
+    if (iequals(token, "uma") || iequals(token, "igpu") || iequals(token, "apu"))
+        return select_best_gpu(gpus, is_uma);
 
     if (istarts_with(token, "cuda"))
         return match_vendor_hint(gpus, token.substr(4), is_nvidia);
     if (istarts_with(token, "nvidia"))
         return match_vendor_hint(gpus, token.substr(6), is_nvidia);
+    const auto match_rocm_hint = [&](std::string_view suffix) noexcept -> std::optional<std::size_t> {
+        std::string_view trimmed_suffix = trim_ascii(suffix);
+        if (!trimmed_suffix.empty() && trimmed_suffix.front() == ':')
+            trimmed_suffix.remove_prefix(1);
+        if (const auto target_idx = parse_index(trimmed_suffix)) {
+            for (std::size_t i = 0; i < gpus.size(); ++i) {
+                if (gpus[i].rocm_runtime_ordinal && *gpus[i].rocm_runtime_ordinal == *target_idx)
+                    return i;
+            }
+        }
+        return match_vendor_hint(gpus, suffix, is_rocm_target);
+    };
     if (istarts_with(token, "rocm"))
-        return match_vendor_hint(gpus, token.substr(4), is_amd);
+        return match_rocm_hint(token.substr(4));
     if (istarts_with(token, "hip"))
-        return match_vendor_hint(gpus, token.substr(3), is_amd);
+        return match_rocm_hint(token.substr(3));
     if (istarts_with(token, "amd"))
         return match_vendor_hint(gpus, token.substr(3), is_amd);
     if (istarts_with(token, "vulkan"))
@@ -238,6 +262,7 @@ bool resolve_uma_mode(std::string_view mode_or_auto,
     }
 
     bool matched_any = false;
+    bool any_uma = false;
     std::size_t pos = 0;
     while (pos <= trimmed.size()) {
         const auto comma = trimmed.find(',', pos);
@@ -249,11 +274,11 @@ bool resolve_uma_mode(std::string_view mode_or_auto,
         const auto idx = match_single_gpu_hint(gpus, token);
         if (!idx)
             return false;
-        if (!gpus[*idx].is_integrated_uma)
-            return false;
         matched_any = true;
+        if (gpus[*idx].is_integrated_uma)
+            any_uma = true;
     }
-    return matched_any;
+    return matched_any && any_uma;
 }
 
 Status parse_residency_config(const json::Value &value, BackendSetup &setup) {

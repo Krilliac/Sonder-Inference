@@ -370,11 +370,42 @@ Result<EmbedResult> Session::embed(const std::vector<std::string>& inputs, const
                                    : make_id("req");
     TelemetryBus& bus = engine_.telemetry();
     const auto ctx = telemetry_context(req_id);
+    const std::uint64_t input_count = static_cast<std::uint64_t>(inputs.size());
+    bool terminal_attempted = false;
+    auto t_start = std::chrono::steady_clock::now();
+    const auto current_queue_ms = [&]() {
+        return request_options.admission ? request_options.admission->queue_ms()
+                                         : request_options.admission_queue_ms;
+    };
+    const auto& parent = request_options.parent_request_id;
+    const auto with_parent = [&parent](json::Object attrs) {
+        if (parent) {
+            attrs.set("parent_request_id", *parent);
+        }
+        return attrs;
+    };
+    const auto with_admission = [&](json::Object attrs, double queue_ms = 0.0) {
+        if (request_options.priority_class) {
+            attrs.set("priority_class", to_string(*request_options.priority_class));
+            attrs.set("admission", json::Object{{"priority", to_string(*request_options.priority_class)},
+                                                {"queue_ms", queue_ms}});
+        }
+        return attrs;
+    };
     const auto recover_embed = [&]() noexcept {
         try {
-            bus.emit("request.failed", ctx,
-                     json::Object{{"kind", "embed"}, {"error_code", to_string(ErrorCode::internal)}},
-                     TelemetryLevel::metrics);
+            if (!terminal_attempted) {
+                terminal_attempted = true;
+                json::Object failed{{"kind", "embed"},
+                                    {"outcome", "failed"},
+                                    {"inputs", input_count},
+                                    {"total_ms", ms_between(t_start, std::chrono::steady_clock::now())},
+                                    {"error_code", to_string(ErrorCode::internal)},
+                                    {"error", "request aborted by exception"}};
+                bus.emit("request.failed", ctx,
+                         with_parent(with_admission(std::move(failed), current_queue_ms())),
+                         TelemetryLevel::metrics);
+            }
         } catch (...) {
         }
         try {
@@ -426,40 +457,78 @@ Result<EmbedResult> Session::embed(const std::vector<std::string>& inputs, const
         }
     };
 
-    const auto t_start = std::chrono::steady_clock::now();
+    auto emit_terminal = [&](RequestOutcome outcome, json::Object attrs) {
+        const double total_ms = ms_between(t_start, std::chrono::steady_clock::now());
+        attrs.set("kind", "embed");
+        attrs.set("outcome", to_string(outcome));
+        if (!attrs.find("inputs")) {
+            attrs.set("inputs", input_count);
+        }
+        if (!attrs.find("total_ms")) {
+            attrs.set("total_ms", total_ms);
+        }
+        if (outcome == RequestOutcome::cancelled) {
+            const std::uint64_t cancel_ns = cancel_requested_ns_.load();
+            const std::uint64_t now_ns = monotonic_ns();
+            if (cancel_ns != 0 && now_ns >= cancel_ns) {
+                attrs.set("cancel_latency_ms", static_cast<double>(now_ns - cancel_ns) / 1e6);
+            }
+        }
+        const char* event_type = outcome == RequestOutcome::completed ? "request.completed"
+                                 : outcome == RequestOutcome::cancelled ? "request.cancelled"
+                                                                        : "request.failed";
+        terminal_attempted = true;
+        bus.emit(event_type, ctx, with_parent(with_admission(std::move(attrs), current_queue_ms())),
+                 TelemetryLevel::metrics);
+        finish_state(outcome);
+    };
+
+    t_start = std::chrono::steady_clock::now();
     bus.emit("request.queued", ctx,
-             json::Object{{"kind", "embed"}, {"inputs", static_cast<std::uint64_t>(inputs.size())}},
+             with_parent(with_admission(
+                 json::Object{{"kind", "embed"},
+                              {"priority", options_.priority},
+                              {"workload", to_string(options_.workload)},
+                              {"inputs", input_count}},
+                 request_options.admission_queue_ms)),
+             TelemetryLevel::metrics);
+    bus.emit("request.started", ctx,
+             with_parent(with_admission(
+                 json::Object{{"kind", "embed"},
+                              {"inputs", input_count},
+                              {"scheduled", false}},
+                 request_options.admission_queue_ms)),
              TelemetryLevel::metrics);
 
     if (request_options.admission) {
         Status st = request_options.admission->wait(token);
         if (!st.ok()) {
             const bool cancelled = token.cancelled() || st.code() == ErrorCode::cancelled;
-            finish_state(cancelled ? RequestOutcome::cancelled : RequestOutcome::failed);
-            bus.emit(cancelled ? "request.cancelled" : "request.failed", ctx,
-                     json::Object{{"kind", "embed"}, {"error_code", to_string(st.code())}},
-                     TelemetryLevel::metrics);
+            json::Object attrs;
+            if (!cancelled) {
+                attrs.set("error_code", to_string(st.code()));
+                attrs.set("error", to_string(st.code()));
+            }
+            emit_terminal(cancelled ? RequestOutcome::cancelled : RequestOutcome::failed, std::move(attrs));
             return st;
         }
     }
 
     if (request_options.deadline && std::chrono::steady_clock::now() >= *request_options.deadline) {
-        finish_state(RequestOutcome::failed);
-        bus.emit("request.failed", ctx, json::Object{{"kind", "embed"}, {"error_code", to_string(ErrorCode::timeout)}},
-                 TelemetryLevel::metrics);
+        emit_terminal(RequestOutcome::failed,
+                      json::Object{{"error_code", to_string(ErrorCode::timeout)},
+                                   {"error", to_string(ErrorCode::timeout)}});
         return Status(ErrorCode::timeout, "request deadline exceeded before backend start");
     }
     if (token.cancelled()) {
-        finish_state(RequestOutcome::cancelled);
-        bus.emit("request.cancelled", ctx, json::Object{{"kind", "embed"}}, TelemetryLevel::metrics);
+        emit_terminal(RequestOutcome::cancelled, json::Object{});
         return Status(ErrorCode::cancelled, "cancelled before backend start");
     }
     if (request_options.on_backend_start) {
         request_options.on_backend_start();
     }
     if (token.cancelled()) {
-        finish_state(RequestOutcome::cancelled);
-        bus.emit("request.cancelled", ctx, json::Object{{"kind", "embed"}}, TelemetryLevel::metrics);
+        emit_terminal(RequestOutcome::cancelled, json::Object{});
         return Status(ErrorCode::cancelled, "cancelled before backend start");
     }
 
@@ -471,23 +540,21 @@ Result<EmbedResult> Session::embed(const std::vector<std::string>& inputs, const
 
     if (!embedded.ok()) {
         const bool cancelled = token.cancelled() || embedded.status().code() == ErrorCode::cancelled;
-        finish_state(cancelled ? RequestOutcome::cancelled : RequestOutcome::failed);
-        bus.emit(cancelled ? "request.cancelled" : "request.failed", ctx,
-                 json::Object{{"kind", "embed"},
-                              {"total_ms", total_ms},
-                              {"error_code", to_string(embedded.status().code())}},
-                 TelemetryLevel::metrics);
+        json::Object attrs{{"total_ms", total_ms}};
+        if (!cancelled) {
+            // Never emit raw upstream error text into shared Observatory
+            // telemetry (M-15): only record the safe structured error_code.
+            attrs.set("error_code", to_string(embedded.status().code()));
+            attrs.set("error", to_string(embedded.status().code()));
+        }
+        emit_terminal(cancelled ? RequestOutcome::cancelled : RequestOutcome::failed, std::move(attrs));
         return embedded.status();
     }
 
-    finish_state(RequestOutcome::completed);
-    bus.emit("request.completed", ctx,
-             json::Object{{"kind", "embed"},
-                          {"outcome", "completed"},
-                          {"prompt_tokens", embedded.value().prompt_tokens},
-                          {"inputs", static_cast<std::uint64_t>(embedded.value().embeddings.size())},
-                          {"total_ms", total_ms}},
-             TelemetryLevel::metrics);
+    emit_terminal(RequestOutcome::completed,
+                  json::Object{{"prompt_tokens", embedded.value().prompt_tokens},
+                               {"inputs", static_cast<std::uint64_t>(embedded.value().embeddings.size())},
+                               {"total_ms", total_ms}});
     return embedded;
 }
 
