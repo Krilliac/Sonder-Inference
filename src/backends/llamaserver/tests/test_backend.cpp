@@ -694,45 +694,109 @@ TEST_SUITE("llamaserver_backend") {
         ryzen_780m.is_integrated_uma = true;
         ryzen_780m.backend_hint = "vulkan";
 
+        GpuDeviceInfo rx_9060_xt;
+        rx_9060_xt.id = "gpu:0";
+        rx_9060_xt.name = "AMD Radeon RX 9060 XT";
+        rx_9060_xt.vendor = GpuVendor::amd;
+        rx_9060_xt.vendor_id = 0x1002u;
+        rx_9060_xt.dedicated_total = MemoryReading::known(16384 * kMiB);
+        rx_9060_xt.shared_total = MemoryReading::known(32 * kGiB);
+        rx_9060_xt.is_integrated_uma = false;
+        rx_9060_xt.backend_hint = "vulkan";
+
+        GpuDeviceInfo rx_9060_rocm = rx_9060_xt;
+        rx_9060_rocm.id = "gpu:1";
+        rx_9060_rocm.backend_hint = "rocm";
+        rx_9060_rocm.rocm_runtime_ordinal = 0u;
+
+        GpuDeviceInfo rx_second = rx_9060_xt;
+        rx_second.id = "gpu:1";
+
         GpuDeviceInfo apu_zero = ryzen_780m;
         apu_zero.id = "gpu:0";
         GpuDeviceInfo rtx_one = rtx;
         rtx_one.id = "gpu:1";
 
         const std::vector<GpuDeviceInfo> rtx_only{rtx};
+        const std::vector<GpuDeviceInfo> dual_discrete{rtx, rx_second};
         const std::vector<GpuDeviceInfo> mixed_rtx_first{rtx, ryzen_780m};
         const std::vector<GpuDeviceInfo> mixed_igpu_first{apu_zero, rtx_one};
+        const std::vector<GpuDeviceInfo> node1_hybrid{rx_9060_xt, ryzen_780m};
+        const std::vector<GpuDeviceInfo> node1_igpu_first{apu_zero, rx_9060_rocm};
         const std::vector<GpuDeviceInfo> apu_only{apu_zero};
         const std::vector<GpuDeviceInfo> empty_gpus;
 
         // Explicit modes
         CHECK(llamaserver::resolve_uma_mode("on", rtx_only));
+        CHECK(llamaserver::resolve_uma_selection("on", rtx_only) == llamaserver::UmaSelectionMode::uma_only);
         CHECK(llamaserver::resolve_uma_mode("true", empty_gpus));
         CHECK_FALSE(llamaserver::resolve_uma_mode("off", apu_only));
+        CHECK(llamaserver::resolve_uma_selection("off", apu_only) == llamaserver::UmaSelectionMode::discrete_only);
         CHECK_FALSE(llamaserver::resolve_uma_mode("false", apu_only));
 
-        // Discrete RTX only -> false
+        // Discrete RTX only and dual discrete -> discrete_only / false
         CHECK_FALSE(llamaserver::resolve_uma_mode("auto", rtx_only));
         CHECK_FALSE(llamaserver::resolve_uma_mode("auto", rtx_only, "CUDA0"));
+        CHECK(llamaserver::resolve_uma_selection("auto", dual_discrete, "Vulkan0,Vulkan1") ==
+              llamaserver::UmaSelectionMode::discrete_only);
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", dual_discrete, "Vulkan0,Vulkan1"));
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", dual_discrete, "CUDA0,Vulkan1"));
 
-        // Mixed RTX + Ryzen iGPU: default -> false, explicit Vulkan/AMD iGPU hint -> true
+        // Mixed RTX + Ryzen iGPU: default -> discrete_only, single iGPU -> uma_only, hybrid -> hybrid (true)
         CHECK_FALSE(llamaserver::resolve_uma_mode("auto", mixed_rtx_first));
         CHECK_FALSE(llamaserver::resolve_uma_mode("auto", mixed_igpu_first));
         CHECK_FALSE(llamaserver::resolve_uma_mode("auto", mixed_rtx_first, "Vulkan0"));
+        CHECK(llamaserver::resolve_uma_selection("auto", mixed_rtx_first, "Vulkan1") ==
+              llamaserver::UmaSelectionMode::uma_only);
         CHECK(llamaserver::resolve_uma_mode("auto", mixed_rtx_first, "Vulkan1"));
         CHECK(llamaserver::resolve_uma_mode("auto", mixed_igpu_first, "Vulkan0"));
         CHECK_FALSE(llamaserver::resolve_uma_mode("auto", mixed_igpu_first, "Vulkan1"));
         CHECK(llamaserver::resolve_uma_mode("auto", mixed_rtx_first, "ROCm0"));
         CHECK(llamaserver::resolve_uma_mode("auto", mixed_rtx_first, "gpu:1"));
-        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", mixed_rtx_first, "CUDA0,Vulkan1"));
+        CHECK(llamaserver::resolve_uma_selection("auto", mixed_rtx_first, "uma") ==
+              llamaserver::UmaSelectionMode::uma_only);
+        CHECK(llamaserver::resolve_uma_selection("auto", mixed_rtx_first, "CUDA0,Vulkan1") ==
+              llamaserver::UmaSelectionMode::hybrid);
+        CHECK(llamaserver::resolve_uma_mode("auto", mixed_rtx_first, "CUDA0,Vulkan1"));
+        CHECK(llamaserver::resolve_uma_selection("auto", mixed_rtx_first, "Vulkan0,Vulkan1") ==
+              llamaserver::UmaSelectionMode::hybrid);
+        CHECK(llamaserver::resolve_uma_mode("auto", mixed_rtx_first, "Vulkan0,Vulkan1"));
         CHECK_FALSE(llamaserver::resolve_uma_mode("auto", mixed_rtx_first, "none"));
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", mixed_rtx_first, "Vulkan1,bogus"));
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", mixed_rtx_first, ","));
 
-        // AMD Ryzen 780M APU-only -> true
+        // Node1 hybrid discrete RX 9060 XT + integrated Radeon 780M
+        CHECK(llamaserver::resolve_uma_selection("auto", node1_hybrid) == llamaserver::UmaSelectionMode::discrete_only);
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", node1_hybrid));
+        CHECK(llamaserver::resolve_uma_selection("auto", node1_hybrid, "Vulkan0") ==
+              llamaserver::UmaSelectionMode::discrete_only);
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", node1_hybrid, "Vulkan0"));
+        CHECK(llamaserver::resolve_uma_selection("auto", node1_hybrid, "Vulkan1") ==
+              llamaserver::UmaSelectionMode::uma_only);
+        CHECK(llamaserver::resolve_uma_mode("auto", node1_hybrid, "Vulkan1"));
+        CHECK(llamaserver::resolve_uma_selection("auto", node1_hybrid, "Vulkan0,Vulkan1") ==
+              llamaserver::UmaSelectionMode::hybrid);
+        CHECK(llamaserver::resolve_uma_mode("auto", node1_hybrid, "Vulkan0,Vulkan1"));
+        CHECK(llamaserver::resolve_uma_selection("auto", node1_hybrid, "Vulkan1, Vulkan0") ==
+              llamaserver::UmaSelectionMode::hybrid);
+        CHECK(llamaserver::resolve_uma_selection("auto", node1_hybrid, "gpu:0,gpu:1") ==
+              llamaserver::UmaSelectionMode::hybrid);
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", node1_hybrid, "Vulkan0,Vulkan2"));
+
+        // Explicit ROCm runtime ordinal selects discrete AMD card over integrated iGPU
+        CHECK(llamaserver::resolve_uma_selection("auto", node1_igpu_first, "ROCm0") ==
+              llamaserver::UmaSelectionMode::discrete_only);
+        CHECK_FALSE(llamaserver::resolve_uma_mode("auto", node1_igpu_first, "ROCm0"));
+        CHECK(llamaserver::resolve_uma_selection("auto", node1_igpu_first, "Vulkan1,Vulkan0") ==
+              llamaserver::UmaSelectionMode::hybrid);
+
+        // AMD Ryzen 780M APU-only -> uma_only / true
+        CHECK(llamaserver::resolve_uma_selection("auto", apu_only) == llamaserver::UmaSelectionMode::uma_only);
         CHECK(llamaserver::resolve_uma_mode("auto", apu_only));
         CHECK(llamaserver::resolve_uma_mode("auto", apu_only, "Vulkan0"));
         CHECK_FALSE(llamaserver::resolve_uma_mode("auto", apu_only, "CUDA0"));
 
-        // Empty GPU list (headless CI) -> false
+        // Empty GPU list (headless CI) -> discrete_only / false
         CHECK_FALSE(llamaserver::resolve_uma_mode("auto", empty_gpus));
         CHECK_FALSE(llamaserver::resolve_uma_mode("auto", empty_gpus, "Vulkan0"));
     }
@@ -782,18 +846,36 @@ TEST_SUITE("llamaserver_backend") {
             o.uma_mode_policy = "auto";
             const auto on_default = llamaserver::to_spill_guard_options(o, {}, mixed);
             CHECK_FALSE(on_default.uma_mode);
+            CHECK_FALSE(on_default.hybrid_uma_mode);
             CHECK_FALSE(on_default.residency.uma_mode);
 
             const auto on_vk1 = llamaserver::to_spill_guard_options(o, {"--device", "Vulkan1"}, mixed);
             CHECK(on_vk1.uma_mode);
+            CHECK_FALSE(on_vk1.hybrid_uma_mode);
             CHECK(on_vk1.residency.uma_mode);
+
+            const auto on_hybrid = llamaserver::to_spill_guard_options(o, {"--device", "Vulkan0,Vulkan1"}, mixed);
+            CHECK(on_hybrid.uma_mode);
+            CHECK(on_hybrid.hybrid_uma_mode);
+            CHECK(on_hybrid.residency.uma_mode);
+
+            LlamaServerSpillGuardOptions hybrid_override = o;
+            hybrid_override.residency.uma_mode = false;
+            hybrid_override.residency_uma_mode_explicit = true;
+            const auto on_hybrid_override =
+                llamaserver::to_spill_guard_options(hybrid_override, {"--device", "Vulkan0,Vulkan1"}, mixed);
+            CHECK(on_hybrid_override.uma_mode);
+            CHECK(on_hybrid_override.hybrid_uma_mode);
+            CHECK_FALSE(on_hybrid_override.residency.uma_mode);
 
             const auto on_dev_eq = llamaserver::to_spill_guard_options(o, {"-dev=Vulkan1"}, mixed);
             CHECK(on_dev_eq.uma_mode);
+            CHECK_FALSE(on_dev_eq.hybrid_uma_mode);
             CHECK(on_dev_eq.residency.uma_mode);
 
             const auto on_apu = llamaserver::to_spill_guard_options(o, {}, apu_only);
             CHECK(on_apu.uma_mode);
+            CHECK_FALSE(on_apu.hybrid_uma_mode);
             CHECK(on_apu.residency.uma_mode);
 
             // Last --device wins, and a dangling --device clears the hint (discrete RTX wins).

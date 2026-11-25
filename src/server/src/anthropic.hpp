@@ -43,6 +43,7 @@ class AnthropicStream {
         bool started = false;
         bool stopped = false;
     };
+    void close_active_tool_block(std::string& out);
     std::string flush_pending_tools();
 
     std::string id_;
@@ -51,6 +52,7 @@ class AnthropicStream {
     bool finished_ = false;
     bool thinking_block_ = false;
     bool text_block_ = false;
+    bool saw_text_ = false;
     bool tool_block_ = false;
     bool saw_tool_use_ = false;
     std::uint32_t active_tool_index_ = 0;

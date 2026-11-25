@@ -20,18 +20,8 @@ ApiError bad_req(std::string code, std::string message, std::optional<std::strin
     return make_error(400, std::move(code), std::move(message), std::move(param));
 }
 
-bool is_valid_tool_name(std::string_view name) noexcept {
-    if (name.empty() || name.size() > 128) {
-        return false;
-    }
-    for (const char c : name) {
-        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
-                        c == '-' || c == '.';
-        if (!ok) {
-            return false;
-        }
-    }
-    return true;
+bool is_fence_open_boundary(char c) noexcept {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '{' || c == '[';
 }
 
 std::string_view trim_ws(std::string_view s) noexcept {
@@ -72,33 +62,6 @@ std::size_t trailing_partial_open_len(std::string_view s) noexcept {
     return best;
 }
 
-// Finds closing ``` outside JSON double-quoted string literals.
-std::size_t find_closing_fence(std::string_view s) noexcept {
-    bool in_str = false;
-    bool esc = false;
-    for (std::size_t i = 0; i < s.size(); ++i) {
-        const char c = s[i];
-        if (in_str) {
-            if (esc) {
-                esc = false;
-            } else if (c == '\\') {
-                esc = true;
-            } else if (c == '"') {
-                in_str = false;
-            }
-            continue;
-        }
-        if (c == '"') {
-            in_str = true;
-            continue;
-        }
-        if (c == '`' && i + 3 <= s.size() && s.compare(i, 3, kFenceClose) == 0) {
-            return i;
-        }
-    }
-    return std::string_view::npos;
-}
-
 // Parses one tool call JSON object {"name": "...", "arguments": ...} or array of them.
 bool parse_tool_call_objects(std::string_view payload, std::vector<std::pair<std::string, std::string>>& out) {
     const std::string_view trimmed = trim_ws(payload);
@@ -112,14 +75,20 @@ bool parse_tool_call_objects(std::string_view payload, std::vector<std::pair<std
     auto extract_one = [&](const json::Value& obj) -> bool {
         if (!obj.is_object()) return false;
         const json::Value* name = obj.find("name");
-        if (name == nullptr || !name->is_string() || name->as_string().empty()) return false;
+        if (name == nullptr || !name->is_string() || !is_valid_tool_name(name->as_string())) return false;
         const json::Value* args = obj.find("arguments");
         std::string args_str = "{}";
         if (args != nullptr && !args->is_null()) {
             if (args->is_string()) {
+                auto parsed_args = json::parse(args->as_string(), json::ParseLimits{64, 16384});
+                if (!parsed_args.ok() || !parsed_args.value().is_object()) {
+                    return false;
+                }
                 args_str = args->as_string();
-            } else {
+            } else if (args->is_object()) {
                 args_str = args->dump();
+            } else {
+                return false;
             }
         }
         out.emplace_back(name->as_string(), std::move(args_str));
@@ -128,7 +97,8 @@ bool parse_tool_call_objects(std::string_view payload, std::vector<std::pair<std
     if (parsed.value().is_object()) {
         return extract_one(parsed.value());
     }
-    if (parsed.value().is_array() && !parsed.value().as_array().empty()) {
+    if (parsed.value().is_array() && !parsed.value().as_array().empty() &&
+        parsed.value().as_array().size() <= kMaxToolCallsPerMessage) {
         for (const auto& item : parsed.value().as_array()) {
             if (!extract_one(item)) {
                 out.clear();
@@ -150,6 +120,33 @@ json::Array utf8_bytes_json(std::string_view s) {
 }
 
 }  // namespace
+
+bool is_valid_tool_name(std::string_view name) noexcept {
+    if (name.empty() || name.size() > 128) {
+        return false;
+    }
+    for (const char c : name) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+                        c == '-' || c == '.';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool is_valid_tool_call_id(std::string_view id) noexcept {
+    if (id.empty() || id.size() > 128) {
+        return false;
+    }
+    for (const char c : id) {
+        const auto u = static_cast<unsigned char>(c);
+        if (u < 0x20u || u == 0x7Fu) {
+            return false;
+        }
+    }
+    return true;
+}
 
 bool is_supported_image_mime(std::string_view mime) noexcept {
     return mime == "image/png" || mime == "image/jpeg" || mime == "image/webp" || mime == "image/gif";
@@ -451,6 +448,12 @@ std::optional<ApiError> parse_openai_message_tool_calls(const json::Value& value
     if (!value.is_array()) {
         return bad_req("invalid_messages", std::string(param) + " must be an array", std::string(param));
     }
+    if (value.as_array().size() > kMaxToolCallsPerMessage) {
+        return bad_req("invalid_messages",
+                       std::string(param) + " exceeds maximum of " + std::to_string(kMaxToolCallsPerMessage) +
+                           " tool calls",
+                       std::string(param));
+    }
     out.clear();
     out.reserve(value.as_array().size());
     for (std::size_t i = 0; i < value.as_array().size(); ++i) {
@@ -460,8 +463,10 @@ std::optional<ApiError> parse_openai_message_tool_calls(const json::Value& value
             return bad_req("invalid_messages", where + " must be an object", where);
         }
         const json::Value* id = item.find("id");
-        if (id == nullptr || !id->is_string() || id->as_string().empty()) {
-            return bad_req("invalid_messages", where + ".id must be a non-empty string", where + ".id");
+        if (id == nullptr || !id->is_string() || !is_valid_tool_call_id(id->as_string())) {
+            return bad_req("invalid_messages",
+                           where + ".id must be a non-empty string of at most 128 bytes without control characters",
+                           where + ".id");
         }
         const json::Value* type = item.find("type");
         if (type != nullptr && !type->is_null() && (!type->is_string() || type->as_string() != "function")) {
@@ -472,8 +477,9 @@ std::optional<ApiError> parse_openai_message_tool_calls(const json::Value& value
             return bad_req("invalid_messages", where + ".function must be an object", where + ".function");
         }
         const json::Value* name = fn->find("name");
-        if (name == nullptr || !name->is_string() || name->as_string().empty()) {
-            return bad_req("invalid_messages", where + ".function.name must be a non-empty string",
+        if (name == nullptr || !name->is_string() || !is_valid_tool_name(name->as_string())) {
+            return bad_req("invalid_messages",
+                           where + ".function.name must be 1 to 128 characters of [A-Za-z0-9_.-]",
                            where + ".function.name");
         }
         const json::Value* args = fn->find("arguments");
@@ -481,6 +487,12 @@ std::optional<ApiError> parse_openai_message_tool_calls(const json::Value& value
         if (args != nullptr && !args->is_null()) {
             if (!args->is_string()) {
                 return bad_req("invalid_messages", where + ".function.arguments must be a JSON string",
+                               where + ".function.arguments");
+            }
+            if (args->as_string().size() > kMaxToolCallPayloadBytes) {
+                return bad_req("invalid_messages",
+                               where + ".function.arguments exceeds maximum size of " +
+                                   std::to_string(kMaxToolCallPayloadBytes) + " bytes",
                                where + ".function.arguments");
             }
             args_str = args->as_string();
@@ -757,6 +769,24 @@ ToolCallStreamOutput ToolCallStreamParser::feed(std::string_view chunk) {
                 break;
             }
 
+            if (!is_xml) {
+                const std::size_t after_fence = open_pos + kFenceOpen.size();
+                if (after_fence == buf_.size()) {
+                    // Wait for 1 more byte to distinguish ```tool_call\n from ```tool_call_notes.
+                    if (open_pos > 0) {
+                        out.visible_text.append(buf_.data(), open_pos);
+                        buf_.erase(0, open_pos);
+                    }
+                    break;
+                }
+                if (!is_fence_open_boundary(buf_[after_fence])) {
+                    // Ordinary markdown fence like ```tool_call_example: emit as plain text.
+                    out.visible_text.append(buf_.data(), after_fence);
+                    buf_.erase(0, after_fence);
+                    continue;
+                }
+            }
+
             if (open_pos > 0) {
                 out.visible_text.append(buf_.data(), open_pos);
             }
@@ -769,71 +799,71 @@ ToolCallStreamOutput ToolCallStreamParser::feed(std::string_view chunk) {
                 buf_.erase(0, open_pos + kFenceOpen.size());
                 state_ = State::in_fence;
             }
+            reset_scan_state();
             continue;
         }
 
-        if (state_ == State::in_xml) {
-            // Find `</tool_call>` outside JSON string literals so tool arguments
-            // mentioning `</tool_call>` inside quoted strings do not prematurely
-            // truncate the payload.
-            std::size_t close_pos = std::string::npos;
-            bool in_str = false;
-            bool esc = false;
-            for (std::size_t i = 0; i + kXmlClose.size() <= buf_.size(); ++i) {
-                const char c = buf_[i];
-                if (in_str) {
-                    if (esc) {
-                        esc = false;
-                    } else if (c == '\\') {
-                        esc = true;
-                    } else if (c == '"') {
-                        in_str = false;
+        // Incremental O(N) scan for closing tag (`</tool_call>` or `` ``` ``)
+        // outside JSON double-quoted string literals so embedded closing markers
+        // inside tool arguments do not prematurely truncate the payload and
+        // byte-by-byte streaming stays strictly linear time.
+        const std::string_view close_tag = (state_ == State::in_xml) ? kXmlClose : kFenceClose;
+        const char lead = close_tag.front();
+        std::size_t close_pos = std::string::npos;
+        const std::size_t scan_limit = std::min(buf_.size(), kMaxToolCallPayloadBytes + 1u);
+        while (scan_pos_ < scan_limit) {
+            const char c = buf_[scan_pos_];
+            if (in_str_) {
+                if (esc_) {
+                    esc_ = false;
+                } else if (c == '\\') {
+                    esc_ = true;
+                } else if (c == '"') {
+                    in_str_ = false;
+                }
+                ++scan_pos_;
+                continue;
+            }
+            if (c == '"') {
+                in_str_ = true;
+                ++scan_pos_;
+                continue;
+            }
+            if (c == lead) {
+                const std::size_t rem = buf_.size() - scan_pos_;
+                if (rem < close_tag.size()) {
+                    if (close_tag.compare(0, rem, buf_.data() + scan_pos_, rem) == 0) {
+                        // Partial closing marker right at the chunk boundary: pause here.
+                        break;
                     }
-                    continue;
-                }
-                if (c == '"') {
-                    in_str = true;
-                    continue;
-                }
-                if (std::string_view(buf_).substr(i, kXmlClose.size()) == kXmlClose) {
-                    close_pos = i;
+                } else if (std::string_view(buf_).substr(scan_pos_, close_tag.size()) == close_tag) {
+                    close_pos = scan_pos_;
                     break;
                 }
             }
-            if (close_pos == std::string::npos) {
-                if (buf_.size() > kMaxToolCallPayloadBytes) {
-                    out.visible_text += raw_open_;
-                    out.visible_text += buf_;
-                    buf_.clear();
-                    raw_open_.clear();
-                    state_ = State::text;
-                }
-                break;
-            }
-            const std::string payload = buf_.substr(0, close_pos);
-            buf_.erase(0, close_pos + kXmlClose.size());
-            try_emit_payload(payload, kXmlClose, out);
-            raw_open_.clear();
-            state_ = State::text;
-            continue;
+            ++scan_pos_;
         }
 
-        // State::in_fence
-        const std::size_t close_pos = find_closing_fence(buf_);
         if (close_pos == std::string::npos) {
-            if (buf_.size() > kMaxToolCallPayloadBytes) {
+            if (scan_pos_ > kMaxToolCallPayloadBytes) {
+                // Payload exceeded kMaxToolCallPayloadBytes without closing: flush only
+                // the bounded overflow prefix as plain text and re-enter text mode on
+                // the remainder so subsequent tool calls in the same chunk still parse.
                 out.visible_text += raw_open_;
-                out.visible_text += buf_;
-                buf_.clear();
+                out.visible_text.append(buf_.data(), kMaxToolCallPayloadBytes);
+                buf_.erase(0, kMaxToolCallPayloadBytes);
                 raw_open_.clear();
+                reset_scan_state();
                 state_ = State::text;
+                continue;
             }
             break;
         }
         const std::string payload = buf_.substr(0, close_pos);
-        buf_.erase(0, close_pos + kFenceClose.size());
-        try_emit_payload(payload, kFenceClose, out);
+        buf_.erase(0, close_pos + close_tag.size());
+        try_emit_payload(payload, close_tag, out);
         raw_open_.clear();
+        reset_scan_state();
         state_ = State::text;
     }
 
@@ -855,6 +885,7 @@ ToolCallStreamOutput ToolCallStreamParser::flush() {
             out.visible_text += raw_open_;
         }
         raw_open_.clear();
+        reset_scan_state();
         state_ = State::text;
     }
     return out;

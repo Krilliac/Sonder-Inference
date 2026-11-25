@@ -41,6 +41,21 @@ json::Object health_features(std::string_view backend, const ServerOptions& opti
     return metadata;
 }
 
+json::Object server_capabilities(const std::shared_ptr<Backend>& backend, const ServerOptions& options) {
+    const BackendCapabilities bc = backend ? backend->capabilities() : BackendCapabilities{};
+    return json::Object{
+        {"tools", true},
+        {"native_tools", true},
+        {"backend_native_tools", bc.has(Capability::tool_calling)},
+        {"tool_choice", true},
+        {"responses_api", true},
+        {"sse_keepalive", options.stream_keepalive_interval.count() > 0},
+        {"structured_output", bc.has(Capability::structured_output)},
+        {"multimodal", bc.has(Capability::multimodal)},
+        {"logprobs", bc.has(Capability::logprobs)},
+        {"embeddings", bc.has(Capability::embeddings)}};
+}
+
 json::Array gpu_inventory_json(const std::vector<GpuDeviceInfo>& gpus) {
     json::Array list;
     list.reserve(gpus.size());

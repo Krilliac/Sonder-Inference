@@ -442,6 +442,7 @@ json::Object build_health_body(const HealthSnapshot& s) {
                              {"written", s.log_stats.written},
                              {"dropped", s.log_stats.dropped}}},
         {"gpus", gpu_inventory_json(cached_gpu_inventory())},
+        {"capabilities", server_capabilities(s.backend, s.opts)},
         {"sonder", health_features(bound_backend, s.opts, sonder_meta())}};
 }
 
@@ -508,6 +509,7 @@ json::Object build_identity_body(const ModelResidency& residency, const std::str
                         {"synthetic", synthetic},
                         {"backend_identity", id.backend_identity},
                         {"reason", id.reason},
+                        {"capabilities", server_capabilities(nullptr, ServerOptions{})},
                         {"sonder", sonder_meta()}};
 }
 
@@ -793,7 +795,8 @@ std::variant<json::Object, ApiError> execute_plan_request(const ServerOptions& o
 
 json::Object build_identity_body(const ServerOptions& opts, const ModelResidency& residency,
                                  const std::string& served_id, bool synthetic,
-                                 const std::optional<std::string>& probed) {
+                                 const std::optional<std::string>& probed,
+                                 const std::shared_ptr<Backend>& backend) {
     // Identity never loads a model (no backend I/O here): a model that is
     // not resident reports the descriptor of its last load, if any.
     IdentityResult id;
@@ -843,6 +846,7 @@ json::Object build_identity_body(const ServerOptions& opts, const ModelResidency
                         {"synthetic", synthetic},
                         {"backend_identity", id.backend_identity},
                         {"reason", id.reason},
+                        {"capabilities", server_capabilities(backend, opts)},
                         {"sonder", sonder_meta()}};
 }
 json::Object build_discovery_document(const ServerOptions& opts, const LiveTelemetryHub& hub,

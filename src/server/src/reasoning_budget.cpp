@@ -1,10 +1,40 @@
 #include "reasoning_budget.hpp"
 
 #include <charconv>
+#include <cstddef>
 #include <limits>
 #include <system_error>
 
 namespace sonder::inference::server::detail::reasoning_budget {
+
+namespace {
+
+constexpr std::size_t kMaxBudgetMessageBytes = 512u;
+
+bool has_disallowed_control_chars(std::string_view text) noexcept {
+    for (const char ch : text) {
+        const auto u = static_cast<unsigned char>(ch);
+        if ((u < 0x20u && ch != '\n' && ch != '\t') || u == 0x7Fu) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Clamps `text` to at most `max_bytes` without splitting a multi-byte UTF-8
+// code point (backs off across trailing continuation bytes 0x80..0xBF).
+std::string clamp_utf8_bytes(std::string_view text, std::size_t max_bytes) {
+    if (text.size() <= max_bytes) {
+        return std::string(text);
+    }
+    std::size_t end = max_bytes;
+    while (end > 0 && (static_cast<unsigned char>(text[end]) & 0xC0u) == 0x80u) {
+        --end;
+    }
+    return std::string(text.substr(0, end));
+}
+
+}  // namespace
 
 std::optional<std::int64_t> parse_integer(std::string_view text) noexcept {
     if (text.empty()) return std::nullopt;
@@ -26,8 +56,13 @@ std::optional<ApiError> parse_body(const json::Object& body, ChatJob& job) {
         }
     }
     if (const auto* value = body.find("reasoning_budget_message")) {
-        if (!value->is_string() || value->as_string().size() > 512) {
+        if (!value->is_string() || value->as_string().size() > kMaxBudgetMessageBytes) {
             return make_error(400, "invalid_json", "reasoning_budget_message must be a string of at most 512 bytes",
+                              "reasoning_budget_message");
+        }
+        if (has_disallowed_control_chars(value->as_string())) {
+            return make_error(400, "invalid_json",
+                              "reasoning_budget_message must not contain control characters (except tab/newline)",
                               "reasoning_budget_message");
         }
         job.reasoning_budget_message = value->as_string();
@@ -51,10 +86,41 @@ std::optional<ApiError> parse_header(const RequestHead& head, Correlation& corre
 
 void apply(const ChatJob& job, const Correlation& correlation, const ServerOptions& pins,
            std::string_view backend, RequestOptions& request, std::vector<std::string>& warnings) {
-    request.reasoning_budget_tokens = correlation.reasoning_budget_tokens ? correlation.reasoning_budget_tokens
-        : job.reasoning_budget_tokens ? job.reasoning_budget_tokens : pins.pin_reasoning_budget_tokens;
-    request.reasoning_budget_message = job.reasoning_budget_message ? job.reasoning_budget_message
-                                                                  : pins.pin_reasoning_budget_message;
+    const bool explicit_thinking_off =
+        request.thinking.enable_thinking.has_value() && !*request.thinking.enable_thinking;
+    const bool request_set_budget =
+        correlation.reasoning_budget_tokens.has_value() || job.reasoning_budget_tokens.has_value();
+
+    if (correlation.reasoning_budget_tokens) {
+        request.reasoning_budget_tokens = correlation.reasoning_budget_tokens;
+    } else if (job.reasoning_budget_tokens) {
+        request.reasoning_budget_tokens = job.reasoning_budget_tokens;
+    } else if (pins.pin_reasoning_budget_tokens && !(explicit_thinking_off && *pins.pin_reasoning_budget_tokens > 0)) {
+        // Default server budget pins should not force a positive thinking budget
+        // when the request (or thinking pin) explicitly disabled thinking.
+        request.reasoning_budget_tokens = pins.pin_reasoning_budget_tokens;
+    } else {
+        request.reasoning_budget_tokens.reset();
+    }
+
+    if (job.reasoning_budget_message) {
+        request.reasoning_budget_message = job.reasoning_budget_message;
+    } else if (pins.pin_reasoning_budget_message && !(explicit_thinking_off && !request_set_budget)) {
+        request.reasoning_budget_message = pins.pin_reasoning_budget_message;
+    } else {
+        request.reasoning_budget_message.reset();
+    }
+
+    // Defensive clamping in case a programmatic caller bypassed CLI/HTTP validation.
+    if (request.reasoning_budget_tokens && *request.reasoning_budget_tokens < -1) {
+        warnings.emplace_back("reasoning_budget_tokens below -1 was clamped to -1");
+        request.reasoning_budget_tokens = -1;
+    }
+    if (request.reasoning_budget_message && request.reasoning_budget_message->size() > kMaxBudgetMessageBytes) {
+        warnings.emplace_back("reasoning_budget_message exceeded 512 bytes and was truncated");
+        request.reasoning_budget_message = clamp_utf8_bytes(*request.reasoning_budget_message, kMaxBudgetMessageBytes);
+    }
+
     if (backend != "llamaserver") {
         if (request.reasoning_budget_tokens) warnings.emplace_back("reasoning_budget_tokens is ignored by backend " + std::string(backend));
         if (request.reasoning_budget_message) warnings.emplace_back("reasoning_budget_message is ignored by backend " + std::string(backend));

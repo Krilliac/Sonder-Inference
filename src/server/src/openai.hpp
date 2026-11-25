@@ -168,11 +168,14 @@ const char* finish_reason(const GenerationResult& result) noexcept;
 // when the backend reported a cached-prompt count, and usage.sonder.timings
 // when raw llama-server timing fields are present. Existing cached counts win.
 json::Object usage_json(const GenerationResult& result);
-// prompt_n, predicted_n, total_ms, plus only measured values: ttft_ms,
-// prompt_ms, predicted_ms, prompt_per_second, predicted_per_second, and the
-// backend's cache_n, draft_n, draft_n_accepted and the scheduler's queue_ms
-// (scheduled requests only). A counter the backend did not report is
-// omitted, never emitted as 0.
+// prompt_n (uncached evaluated prompt tokens: backend_timings->prompt_n when
+// reported, else prompt_tokens minus cached tokens), predicted_n, total_ms,
+// plus only measured values: ttft_ms, prompt_ms, predicted_ms,
+// prompt_per_second (computed from prompt_n / prompt_ms, omitted when
+// prompt_n == 0), predicted_per_second, and the backend's cache_n
+// (stats.cached_tokens else backend_timings->cache_n), draft_n,
+// draft_n_accepted and the scheduler's queue_ms (scheduled requests only).
+// A counter the backend did not report is omitted, never emitted as 0.
 json::Object timings_json(const GenerationResult& result);
 
 }  // namespace sonder::inference::server::detail
