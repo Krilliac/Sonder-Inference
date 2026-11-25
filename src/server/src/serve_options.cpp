@@ -35,6 +35,8 @@ Server:
   --max-connections N     concurrent connections (default 64)
   --max-body-bytes N      request body limit (default 4194304)
   --shutdown-grace-ms N   time in-flight requests get on shutdown (default 5000)
+  --stream-keepalive-ms N SSE `: keep-alive` heartbeat interval during long
+                          prefill waits in ms (0..600000, default 15000; 0 = off)
   --ready-file PATH       write {"url","pid","instance_id","api_version"} once listening
                           (models may still be loading: poll /v1/sonder/health for
                           200); removed again when the server exits
@@ -146,7 +148,8 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"telemetry-level", Kind::value},        {"telemetry-buffer", Kind::value},
         {"telemetry", Kind::value},              {"capture-text", Kind::flag},
         {"max-connections", Kind::value},        {"max-body-bytes", Kind::value},
-        {"shutdown-grace-ms", Kind::value},      {"ready-file", Kind::value},
+        {"shutdown-grace-ms", Kind::value},      {"stream-keepalive-ms", Kind::value},
+        {"ready-file", Kind::value},
         {"mock-delay-ms", Kind::value},          {"log-format", Kind::value},
         {"llamaserver-config", Kind::value},     {"llamaserver-url", Kind::value},
         {"llamaserver-executable", Kind::value}, {"llamaserver-arg", Kind::repeat},
@@ -798,6 +801,10 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     if (auto v = a.get("shutdown-grace-ms")) {
         if (!parse_uint(*v, 600000, n)) return usage_error("--shutdown-grace-ms must be from 0 to 600000");
         o.shutdown_grace = std::chrono::milliseconds(n);
+    }
+    if (auto v = a.get("stream-keepalive-ms")) {
+        if (!parse_uint(*v, 600000, n)) return usage_error("--stream-keepalive-ms must be from 0 to 600000");
+        o.stream_keepalive_interval = std::chrono::milliseconds(n);
     }
     if (auto v = a.get("log-format")) {
         if (*v != "text" && *v != "json") return usage_error("--log-format must be text or json");

@@ -52,7 +52,7 @@ llamaserver::SpeculationWorkload classify_generate_workload(const GenerateReques
 
 llamaserver::SpeculationWorkload classify_chat_workload(const ChatRequest &request,
                                                         std::string_view grammar) noexcept {
-    if (!grammar.empty() || !request.grammar.empty() || !request.tools.empty() ||
+    if (!grammar.empty() || !request.grammar.empty() || llamaserver::chat_tools_requested(request) ||
         (request.response_format_type && *request.response_format_type != "text"))
         return llamaserver::SpeculationWorkload::tool_json;
     if (chat_thinking_enabled(request))
@@ -362,7 +362,8 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         return response_body;
     }
     Result<GenerateStats> stream(std::string_view path, std::string body, const CancellationToken &cancel,
-                                 const TokenCallback &callback, bool chat, bool separate_reasoning = false) {
+                                 const TokenCallback &callback, bool chat, bool separate_reasoning = false,
+                                 bool tools_requested = false) {
         auto activity = acquire_request(cancel);
         if (!activity.ok())
             return activity.status();
@@ -388,7 +389,7 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         }
         const bool native = !chat && options_.native_completion;
         return llamaserver::run_completion_stream(request, chat, native, separate_reasoning, cancel, callback,
-                                                  progress_events);
+                                                  progress_events, tools_requested);
     }
 
     // Generic-mode progress watchdog (warn policy), called from the request
@@ -598,9 +599,10 @@ class LlamaServerModel final : public BackendModel {
         auto req_extras = backend_->extras(props, request.session_key, lease);
         if (has_spec_decision)
             req_extras.spec_draft_n_max = spec_decision.draft_n_max;
+        const bool tools_requested = llamaserver::chat_tools_requested(request);
         auto body = llamaserver::build_chat_body(descriptor_.name, request, backend_->options().grammar, req_extras);
         auto result = backend_->stream("/v1/chat/completions", body.dump(), cancel, callback, true,
-                                       request.separate_reasoning);
+                                       request.separate_reasoning, tools_requested);
         if (result.ok() && has_spec_decision) {
             record_speculation_observation(policy, result.value(), workload, spec_decision.is_probe,
                                            spec_decision.probe_id, probe_guard);

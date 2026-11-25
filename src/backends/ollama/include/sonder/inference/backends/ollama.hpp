@@ -101,8 +101,9 @@ struct OllamaTimings {
 enum class StreamKind { generate, chat };
 
 struct StreamChunk {
-    std::string_view content;   // "response" or "message.content"
-    std::string_view thinking;  // reasoning text when the model emits it
+    std::string_view content;               // "response" or "message.content"
+    std::string_view thinking;              // reasoning text when the model emits it
+    std::vector<ToolCallDelta> tool_calls;  // "message.tool_calls" when emitted
     bool done = false;
     std::string_view done_reason;
     const json::Value* raw = nullptr;  // full parsed line (valid during callback)
@@ -115,11 +116,13 @@ struct StreamResult {
     std::string model;
     std::string text;
     std::string thinking;
+    std::vector<ToolCall> tool_calls;
     std::string done_reason;
     OllamaTimings timings;
     int http_status = 0;
     bool done = false;                 // saw the final "done": true chunk
     bool stopped_by_callback = false;  // callback returned false
+    bool saw_tool_calls = false;       // at least one message.tool_calls entry arrived
 };
 
 // Incremental NDJSON stream decoder. Bytes may be split at any boundary.
@@ -149,6 +152,7 @@ private:
     std::chrono::steady_clock::time_point start_;
     std::size_t max_output_bytes_ = 32u << 20;
     std::size_t output_bytes_ = 0;
+    std::uint32_t next_tool_call_index_ = 0;
     bool retain_text_ = true;
     std::string buffer_;
     StreamResult result_;
@@ -178,6 +182,8 @@ struct ChatParams {
     bool retain_text = true;        // false avoids buffering when caller only streams via callback
     std::optional<bool> think;
     std::optional<json::Value> format;  // Ollama "format" ("json" or JSON Schema object)
+    std::vector<ToolDefinition> tools;
+    std::optional<ToolChoice> tool_choice;
     std::string keep_alive;
     json::Object options;
 };

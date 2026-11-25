@@ -339,3 +339,83 @@ TEST_CASE("decoder: malformed NDJSON error does not echo raw payload (M-15)") {
     CHECK(d.error().code() == ErrorCode::protocol_error);
     CHECK(d.error().message().find(canary) == std::string::npos);
 }
+
+TEST_CASE("request bodies: chat tools, tool_choice filtering, assistant tool_calls, and tool role") {
+    ChatParams c;
+    c.model = "qwen3:8b";
+    ChatMessage assistant;
+    assistant.role = "assistant";
+    assistant.tool_calls.push_back(ToolCall{"call_1", "get_weather", R"({"city":"Austin"})"});
+    ChatMessage tool_reply;
+    tool_reply.role = "tool";
+    tool_reply.name = "get_weather";
+    tool_reply.tool_call_id = "call_1";
+    tool_reply.content = R"({"temp":78})";
+    c.messages = {ChatMessage{"user", "Weather?"}, assistant, tool_reply};
+    c.tools = {
+        ToolDefinition{"get_weather", "Lookup weather", R"({"type":"object","properties":{"city":{"type":"string"}}})"},
+        ToolDefinition{"get_time", "Lookup time", R"({"type":"object"})"},
+    };
+
+    // 1. Default auto tool_choice sends all tools, assistant tool_calls with object arguments,
+    //    and tool_name/tool_call_id on role=tool.
+    const json::Value body = build_chat_body(c);
+    REQUIRE(body.find("tools") != nullptr);
+    CHECK(body.find("tools")->as_array().size() == 2u);
+    CHECK(body.find("tools")->as_array()[0].find("function")->find("name")->as_string() == "get_weather");
+    const auto& msgs = body.find("messages")->as_array();
+    REQUIRE(msgs.size() == 3u);
+    const auto* atcs = msgs[1].find("tool_calls");
+    REQUIRE((atcs != nullptr && atcs->is_array() && atcs->as_array().size() == 1u));
+    CHECK(atcs->as_array()[0].find("id")->as_string() == "call_1");
+    CHECK(atcs->as_array()[0].find("function")->find("name")->as_string() == "get_weather");
+    CHECK(atcs->as_array()[0].find("function")->find("arguments")->find("city")->as_string() == "Austin");
+    CHECK(msgs[2].find("tool_name")->as_string() == "get_weather");
+    CHECK(msgs[2].find("tool_call_id")->as_string() == "call_1");
+
+    // 2. tool_choice: function filters the advertised tools list to the chosen function.
+    c.tool_choice = ToolChoice{ToolChoiceMode::function, "get_time"};
+    const json::Value filtered = build_chat_body(c);
+    REQUIRE(filtered.find("tools") != nullptr);
+    REQUIRE(filtered.find("tools")->as_array().size() == 1u);
+    CHECK(filtered.find("tools")->as_array()[0].find("function")->find("name")->as_string() == "get_time");
+
+    // 3. tool_choice: none omits tools from the Ollama request body.
+    c.tool_choice = ToolChoice{ToolChoiceMode::none, ""};
+    const json::Value none_body = build_chat_body(c);
+    CHECK(none_body.find("tools") == nullptr);
+}
+
+TEST_CASE("decoder: chat message.tool_calls decoding, malformed entry resilience, and byte cap") {
+    std::vector<ToolCallDelta> seen;
+    StreamDecoder d(StreamKind::chat, [&](const StreamChunk& c) {
+        for (const auto& tc : c.tool_calls) seen.push_back(tc);
+        return true;
+    });
+    const std::string stream =
+        R"({"model":"qwen3:8b","message":{"role":"assistant","content":"","tool_calls":[{"id":"c0","function":{"name":"get_weather","arguments":{"city":"Austin"}}},42,{"function":{"name":""}},{"function":{"name":"get_time","arguments":"{\"tz\":\"UTC\"}"}}]},"done":false})" "\n"
+        R"({"model":"qwen3:8b","message":{"role":"assistant","content":"","tool_calls":[{"function":{"index":2,"name":"ping","arguments":{}}}]},"done":false})" "\n"
+        R"({"model":"qwen3:8b","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":15,"eval_count":9})" "\n";
+    REQUIRE(d.feed(stream));
+    REQUIRE(d.finish().ok());
+    CHECK(d.result().saw_tool_calls);
+    CHECK(d.result().timings.ttft_ms >= 0.0);
+    REQUIRE(seen.size() == 3u);
+    CHECK(seen[0].index == 0u);
+    CHECK(seen[0].id == "c0");
+    CHECK(seen[0].name == "get_weather");
+    CHECK(seen[0].arguments_delta == R"({"city":"Austin"})");
+    CHECK(seen[1].index == 1u);
+    CHECK(seen[1].id.empty());
+    CHECK(seen[1].name == "get_time");
+    CHECK(seen[1].arguments_delta == R"({"tz":"UTC"})");
+    CHECK(seen[2].index == 2u);
+    CHECK(seen[2].name == "ping");
+    CHECK(seen[2].arguments_delta == "{}");
+
+    // Cumulative output byte cap (M-16) also bounds tool_calls payload bytes.
+    StreamDecoder capped(StreamKind::chat, {}, std::chrono::steady_clock::now(), 24u);
+    CHECK_FALSE(capped.feed(
+        R"({"model":"qwen3:8b","message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"huge_tool","arguments":{"payload":"0123456789abcdefghijklmnopqrstuvwxyz"}}}]},"done":true})" "\n"));
+    CHECK(capped.error().code() == ErrorCode::protocol_error);
+}
