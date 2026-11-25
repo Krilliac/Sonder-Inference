@@ -33,6 +33,21 @@ bool icontains_ascii(std::string_view haystack, std::string_view needle) noexcep
     }
     return false;
 }
+bool is_amd_rdna4(const GpuDeviceInfo &gpu) noexcept {
+    if (gpu.vendor != GpuVendor::amd || gpu.is_integrated_uma) return false;
+    if (gpu.device_id == 0x7550u || gpu.device_id == 0x7551u || gpu.device_id == 0x7590u) return true;
+    return icontains_ascii(gpu.name, "9070") || icontains_ascii(gpu.name, "9060") ||
+           icontains_ascii(gpu.name, "gfx1200") || icontains_ascii(gpu.name, "gfx1201") ||
+           icontains_ascii(gpu.name, "rdna 4") || icontains_ascii(gpu.name, "rdna4") ||
+           icontains_ascii(gpu.name, "navi 44") || icontains_ascii(gpu.name, "navi 48");
+}
+bool iequals_ascii(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (ascii_lower(a[i]) != ascii_lower(b[i])) return false;
+    }
+    return true;
+}
 std::uint64_t saturating_add_u64(std::uint64_t a, std::uint64_t b) noexcept {
     return a > std::numeric_limits<std::uint64_t>::max() - b ? std::numeric_limits<std::uint64_t>::max() : a + b;
 }
@@ -199,6 +214,13 @@ Grid grid_for_gpu(const GpuDeviceInfo &gpu, bool is_ternary) {
         } else if (gpu.vendor == GpuVendor::amd) {
             // Avoid unsupported FP8 KV kernels on RDNA3/4 discrete cards.
             grid.kv = {{"q8_0", "q8_0"}, {"q8_0", "q4_0"}, {"q4_0", "q4_0"}, {"f16", "f16"}};
+            // On RDNA 4 (gfx1200/gfx1201: RX 9060 / RX 9070 XT) or explicit Vulkan/ROCm
+            // backend hints, sweep both flash_attn=on and auto so Vulkan VK_KHR_cooperative_matrix
+            // and ROCm GGML_HIP_ROCWMMA_FATTN kernels are benchmarked against auto fallback.
+            if (is_amd_rdna4(gpu) || iequals_ascii(gpu.backend_hint, "vulkan") ||
+                iequals_ascii(gpu.backend_hint, "rocm") || iequals_ascii(gpu.backend_hint, "hip")) {
+                grid.flash_attn = {"on", "auto"};
+            }
         }
         if (dedicated_known && dedicated_bytes < 10ull * kGiB) {
             grid.ctx = context_ladder(8192, 65536);

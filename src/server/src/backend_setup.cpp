@@ -51,6 +51,24 @@ Result<LlamaCppBackendOptions> llamacpp_options(const BackendSetup& setup) {
     if (setup.llamacpp_slots) lo.slots = *setup.llamacpp_slots;
     if (setup.llamacpp_spec_type) lo.spec_type = *setup.llamacpp_spec_type;
     if (setup.llamacpp_spec_draft_max) lo.spec_draft_max = *setup.llamacpp_spec_draft_max;
+    // Guarded C++20 projection for extended llamacpp backend fields so server
+    // compiles against both current and Track 1-upgraded LlamaCppBackendOptions.
+    const auto wire_extended = [&setup](auto& dst) {
+        (void)setup;
+        if constexpr (requires { dst.moe_cache_mib; }) {
+            if (setup.llamacpp_moe_cache_mib) dst.moe_cache_mib = *setup.llamacpp_moe_cache_mib;
+        }
+        if constexpr (requires { dst.moe_cache_cpu_share; }) {
+            if (setup.llamacpp_moe_cache_cpu_share) dst.moe_cache_cpu_share = *setup.llamacpp_moe_cache_cpu_share;
+        }
+        if constexpr (requires { dst.cache_ram_mib; }) {
+            if (setup.llamacpp_cache_ram_mib) dst.cache_ram_mib = *setup.llamacpp_cache_ram_mib;
+        }
+        if constexpr (requires { dst.mmproj_path; }) {
+            if (setup.llamacpp_mmproj_path) dst.mmproj_path = *setup.llamacpp_mmproj_path;
+        }
+    };
+    wire_extended(lo);
     for (const std::string& spec : setup.llamacpp_tensor_overrides) {
         auto parsed = parse_tensor_override(spec);
         if (!parsed) return parsed.status();

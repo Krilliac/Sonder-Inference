@@ -10,10 +10,12 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "backends/llamaserver/env_policy.hpp"
+#include "vram_internal.hpp"
 
 namespace sonder::inference {
 
@@ -174,6 +176,60 @@ bool is_intel_gpu(const GpuDeviceInfo& g) noexcept {
 
 bool is_apple_gpu(const GpuDeviceInfo& g) noexcept {
     return g.vendor == GpuVendor::apple || iequals(g.backend_hint, "metal");
+}
+
+bool is_amd_rdna4_gpu(const GpuDeviceInfo& g) noexcept {
+    if (g.vendor != GpuVendor::amd || g.is_integrated_uma) return false;
+    // Navi 48 (gfx1201: RX 9070 / RX 9070 XT / R9700) and Navi 44 (gfx1200: RX 9060 / 9060 XT).
+    if (g.device_id == 0x7550u || g.device_id == 0x7551u || g.device_id == 0x7590u) return true;
+    const std::string lower = lower_copy(g.name);
+    return lower.find("9070") != std::string::npos || lower.find("9060") != std::string::npos ||
+           lower.find("gfx1200") != std::string::npos || lower.find("gfx1201") != std::string::npos ||
+           lower.find("rdna 4") != std::string::npos || lower.find("rdna4") != std::string::npos ||
+           lower.find("navi 44") != std::string::npos || lower.find("navi 48") != std::string::npos;
+}
+
+bool is_nvidia_blackwell_gpu(const GpuDeviceInfo& g) noexcept {
+    if (g.vendor != GpuVendor::nvidia || g.is_integrated_uma) return false;
+    // Blackwell consumer & workstation PCI IDs (e.g. RTX 5090 0x2B85, RTX 5080 0x2C02, RTX 5070 Ti 0x2C05).
+    if (g.device_id >= 0x2B80u && g.device_id <= 0x2CFFu) return true;
+    const std::string lower = lower_copy(g.name);
+    return lower.find("rtx 50") != std::string::npos || lower.find("blackwell") != std::string::npos ||
+           lower.find("sm_120") != std::string::npos || lower.find("rtx pro 6000") != std::string::npos;
+}
+
+std::uint32_t extract_n_cpu_moe_count(const LaunchProfile& p, std::uint32_t block_count) {
+    const auto parsed = parse_moe_placement(p.extra_args);
+    if (!parsed.ok()) return 0;
+    std::uint32_t max_n = 0;
+    for (const auto& rule : parsed->rules) {
+        if (rule.kind == TensorPlacementRule::Kind::all_experts) {
+            return block_count;
+        }
+        if (rule.kind == TensorPlacementRule::Kind::first_n_experts) {
+            max_n = std::max(max_n, std::min(rule.count, block_count));
+        }
+    }
+    return max_n;
+}
+
+std::optional<std::uint32_t> compute_physical_decode_threads(const PlacementPlanRequest& request,
+                                                             std::uint32_t& logical_out) noexcept {
+    logical_out = 0;
+    if (request.cpu_physical_cores > 0) {
+        logical_out = request.cpu_logical_cores > 0 ? request.cpu_logical_cores : request.cpu_physical_cores;
+        return std::clamp<std::uint32_t>(request.cpu_physical_cores, 1u, 256u);
+    }
+    const std::uint32_t logical = request.cpu_logical_cores > 0
+                                      ? request.cpu_logical_cores
+                                      : static_cast<std::uint32_t>(std::thread::hardware_concurrency());
+    if (logical == 0) return std::nullopt;
+    logical_out = logical;
+    // When SMT is present, cap CPU-offloaded MoE decode threads to physical core count
+    // (logical_cores / 2 clamped >= 4, never exceeding logical_cores) to avoid hyperthread
+    // contention on memory-bandwidth-bound DDR5 decode.
+    const std::uint32_t physical = std::min(logical, std::max<std::uint32_t>(4u, logical / 2u));
+    return std::clamp<std::uint32_t>(physical, 1u, 256u);
 }
 
 int vendor_priority(GpuVendor v) noexcept {
@@ -725,6 +781,15 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
         warn += "); requires PrismML's Hadamard-capable llama-server (stock llama-server cannot load it)";
         plan.warnings.push_back(std::move(warn));
     }
+    if (model.has_mxfp4_tensors) {
+        plan.reasons.emplace_back("detected block-scaled MXFP4 weight tensors (4.25 bpw, 17 B / 32 elems)");
+    }
+    if (model.has_nvfp4_tensors) {
+        plan.reasons.emplace_back("detected Blackwell NVFP4 weight tensors (4.50 bpw, 36 B / 64 elems)");
+    }
+    if (model.has_fp8_tensors) {
+        plan.reasons.emplace_back("detected OCP FP8 (F8_E4M3) weight tensors (8.00 bpw, 1.0 byte/elem)");
+    }
 
     if (request.allow_speculative) {
         if (model.nextn_layers > 0) {
@@ -807,6 +872,10 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
         } else {
             plan.reasons.emplace_back("no usable GPU available; configured CPU-only execution (n_gpu_layers=0)");
         }
+        if (request.prefer_fp8_kv && request.allow_quantized_kv) {
+            plan.warnings.emplace_back(
+                "prefer_fp8_kv (f8_e4m3) is not supported for CPU-only execution; using q8_0/q8_0 KV cache");
+        }
 
         VramEstimate est = evaluate(profile, std::nullopt);
         if (host.available_physical.is_known()) {
@@ -815,6 +884,19 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
             plan.reasons.push_back("sized CPU-only execution against " + std::to_string(plan.budget_mib) +
                                    " MiB available physical host RAM");
 
+            if (est.host_resident_bytes > avail_bytes && request.allow_quantized_kv &&
+                !(profile.cache_type_v && *profile.cache_type_v == "q4_0")) {
+                LaunchProfile q8_q4 = profile;
+                q8_q4.cache_type_k = "q8_0";
+                q8_q4.cache_type_v = "q4_0";
+                const VramEstimate est_q8_q4 = evaluate(q8_q4, std::nullopt);
+                if (est_q8_q4.host_kv_bytes < est.host_kv_bytes) {
+                    profile = std::move(q8_q4);
+                    est = est_q8_q4;
+                    plan.reasons.push_back("stepped host KV cache to asymmetric q8_0/q4_0 (host resident " +
+                                           std::to_string(est.host_resident_mib()) + " MiB)");
+                }
+            }
             if (est.host_resident_bytes > avail_bytes && request.allow_quantized_kv &&
                 !(profile.cache_type_k && *profile.cache_type_k == "q4_0")) {
                 LaunchProfile q4 = profile;
@@ -893,6 +975,17 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
             plan.warnings.emplace_back(
                 "4-bit V cache (q4_0) enabled to fit memory budget; verify generation quality on this model");
         }
+        plan.repack_policy = profile.no_repack.value_or(false) ? "disabled_no_repack" : "cpu_only_selective";
+        if (request.cpu_physical_cores > 0 || request.cpu_logical_cores > 0) {
+            std::uint32_t logical_cores = 0;
+            if (const auto phys = compute_physical_decode_threads(request, logical_cores)) {
+                plan.recommended_threads = *phys;
+                profile.threads = static_cast<std::int32_t>(*phys);
+                plan.reasons.push_back("recommended physical-core thread count (" + std::to_string(*phys) +
+                                       " threads from " + std::to_string(logical_cores) +
+                                       " logical cores) for memory-bandwidth-bound CPU decode");
+            }
+        }
 
         plan.profile = std::move(profile);
         plan.estimate = evaluate(plan.profile, std::nullopt);
@@ -935,23 +1028,57 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
         profile.load_mode = "none";
         plan.reasons.emplace_back(
             "NVIDIA RTX defaults: flash_attn=on, kv_unified=true, load_mode=none for resident VRAM weights");
+        if (request.prefer_fp8_kv && request.allow_quantized_kv) {
+            profile.cache_type_k = "f8_e4m3";
+            profile.cache_type_v = "f8_e4m3";
+            plan.reasons.emplace_back(
+                "enabled OCP FP8 KV cache (f8_e4m3/f8_e4m3, 1.0 byte/elem) on discrete NVIDIA RTX");
+        }
     } else if (plan.selected_vendor == GpuVendor::amd) {
         profile.flash_attn = "auto";
         profile.load_mode = "auto";
+        const bool rdna4 = is_amd_rdna4_gpu(primary_gpu);
         if (plan.recommended_backend_hint == "rocm") {
             add_allowed_env(plan.recommended_env, "GPU_MAX_ALLOC_PERCENT", "100");
             plan.reasons.emplace_back(
                 "AMD Radeon RX discrete defaults: flash_attn=auto, kv_unified=true, GPU_MAX_ALLOC_PERCENT=100 for "
                 "ROCm/HIP full VRAM allocation");
+            if (rdna4) {
+                plan.reasons.emplace_back(
+                    "AMD RDNA 4 (gfx1200/gfx1201) ROCm/HIP advisory: build with GGML_HIP_ROCWMMA_FATTN=ON for WMMA "
+                    "FlashAttention; Vulkan (VK_KHR_cooperative_matrix) is a competitive/preferred fallback via "
+                    "--device Vulkan0");
+            }
         } else {
             plan.reasons.emplace_back(
                 "AMD Radeon RX discrete Vulkan defaults: flash_attn=auto, kv_unified=true");
+            if (rdna4) {
+                plan.reasons.emplace_back(
+                    "AMD RDNA 4 (gfx1200/gfx1201) Vulkan CoopMat advisory: VK_KHR_cooperative_matrix provides "
+                    "competitive FlashAttention/GEMM performance and is the preferred fallback when ROCm/HIP is "
+                    "unavailable");
+            }
         }
     } else {
         profile.flash_attn = "auto";
         profile.load_mode = "auto";
         plan.reasons.push_back(std::string("GPU vendor ") + to_string(plan.selected_vendor) +
                                " defaults: flash_attn=auto, kv_unified=true");
+    }
+
+    if (request.prefer_fp8_kv && request.allow_quantized_kv &&
+        (plan.uma_mode || plan.selected_vendor != GpuVendor::nvidia)) {
+        plan.warnings.emplace_back(
+            "prefer_fp8_kv (f8_e4m3) is only enabled on discrete NVIDIA RTX GPUs; using q8_0/q8_0 KV cache");
+    }
+    if (model.has_nvfp4_tensors) {
+        if (is_nvidia_blackwell_gpu(primary_gpu)) {
+            plan.reasons.emplace_back("NVIDIA Blackwell (sm_120) hardware matches NVFP4 (4.50 bpw) weights natively");
+        } else {
+            plan.warnings.emplace_back(
+                "model contains Blackwell NVFP4 (4.50 bpw) weights; non-Blackwell GPU falls back to software "
+                "dequantization and requires llama.cpp >= b11556");
+        }
     }
 
     profile.n_gpu_layers = -1;
@@ -1027,8 +1154,9 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
             if (std::isfinite(w) && w > 0.0) weight_sum += w;
         }
         if (!(weight_sum > 0.0)) return false;
-        const std::uint64_t splittable =
-            saturating_add(e.weights_bytes, saturating_add(e.kv_bytes, e.recurrent_bytes));
+        const std::uint64_t splittable = saturating_add(
+            saturating_add(e.weights_bytes, e.kv_bytes),
+            saturating_add(e.recurrent_bytes, e.moe_cache_bytes));
         const std::size_t n = std::min(active_usable_mib.size(), p.tensor_split.size());
         for (std::size_t i = 0; i < n; ++i) {
             const double share = p.tensor_split[i] / weight_sum;
@@ -1082,11 +1210,38 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
 
     // ----------------------------------------- 7. Iterative fit solver
     bool moe_offload_active = false;
+    bool stepped_kv_asymmetric = false;
     bool stepped_kv_to_q4 = false;
+    const std::string initial_kv_k = profile.cache_type_k.value_or("f16");
+    const std::string initial_kv_v = profile.cache_type_v.value_or("f16");
 
-    // Step 1: quantize KV cache to q4_0/q4_0.
+    // Step 1a: asymmetric KV step-down (q8_0/q4_0) before symmetric 4-bit.
+    // Keys are far more quantization-sensitive than values; q8_0/q4_0 saves
+    // ~24% KV VRAM vs q8_0/q8_0 while keeping near-q8_0 quality.
+    if (!fits_vram(est, profile) && request.allow_quantized_kv &&
+        !(profile.cache_type_v && *profile.cache_type_v == "q4_0")) {
+        const std::string prev_k = profile.cache_type_k.value_or("f16");
+        const std::string prev_v = profile.cache_type_v.value_or("f16");
+        LaunchProfile q8_q4 = profile;
+        q8_q4.cache_type_k = "q8_0";
+        q8_q4.cache_type_v = "q4_0";
+        const VramEstimate est_q8_q4 = evaluate(q8_q4, q8_q4.vram_budget_mib);
+        if (est_q8_q4.kv_bytes < est.kv_bytes) {
+            profile = std::move(q8_q4);
+            est = est_q8_q4;
+            stepped_kv_asymmetric = true;
+            plan.reasons.push_back("stepped KV cache from " + prev_k + "/" + prev_v +
+                                   " to asymmetric q8_0/q4_0 (preserves key precision while saving ~24% KV VRAM; "
+                                   "estimated VRAM " +
+                                   std::to_string(est.total_mib()) + " MiB)");
+        }
+    }
+
+    // Step 1b: symmetric 4-bit KV cache (q4_0/q4_0) if asymmetric q8_0/q4_0 still overflows.
     if (!fits_vram(est, profile) && request.allow_quantized_kv &&
         !(profile.cache_type_k && *profile.cache_type_k == "q4_0")) {
+        const std::string prev_k = profile.cache_type_k.value_or("f16");
+        const std::string prev_v = profile.cache_type_v.value_or("f16");
         LaunchProfile q4 = profile;
         q4.cache_type_k = "q4_0";
         q4.cache_type_v = "q4_0";
@@ -1095,8 +1250,8 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
             profile = std::move(q4);
             est = est_q4;
             stepped_kv_to_q4 = true;
-            plan.reasons.push_back("stepped KV cache from q8_0/q8_0 to q4_0/q4_0 (estimated VRAM " +
-                                   std::to_string(est.total_mib()) + " MiB)");
+            plan.reasons.push_back("stepped KV cache from " + prev_k + "/" + prev_v +
+                                   " to q4_0/q4_0 (estimated VRAM " + std::to_string(est.total_mib()) + " MiB)");
         }
     }
 
@@ -1136,18 +1291,33 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
                     est = best_est;
                     moe_offload_active = true;
 
-                    // If we stepped KV to q4_0 earlier and q8_0 fits at the exact same N, restore q8_0 quality.
-                    if (stepped_kv_to_q4) {
-                        LaunchProfile try_q8 = profile;
-                        try_q8.cache_type_k = "q8_0";
-                        try_q8.cache_type_v = "q8_0";
-                        const VramEstimate est_q8 = evaluate(try_q8, try_q8.vram_budget_mib);
-                        if (fits_vram(est_q8, try_q8)) {
-                            profile = std::move(try_q8);
-                            est = est_q8;
+                    // If we stepped KV down earlier and higher KV quality fits at the exact same N,
+                    // restore initial KV (q8_0/q8_0 or f8_e4m3/f8_e4m3), else asymmetric q8_0/q4_0.
+                    if (stepped_kv_asymmetric || stepped_kv_to_q4) {
+                        LaunchProfile try_init = profile;
+                        try_init.cache_type_k = initial_kv_k;
+                        try_init.cache_type_v = initial_kv_v;
+                        const VramEstimate est_init = evaluate(try_init, try_init.vram_budget_mib);
+                        if (fits_vram(est_init, try_init)) {
+                            profile = std::move(try_init);
+                            est = est_init;
+                            stepped_kv_asymmetric = false;
                             stepped_kv_to_q4 = false;
-                            plan.reasons.emplace_back(
-                                "restored q8_0/q8_0 KV cache with sufficient headroom after --n-cpu-moe offload");
+                            plan.reasons.push_back("restored " + initial_kv_k + "/" + initial_kv_v +
+                                                   " KV cache with sufficient headroom after --n-cpu-moe offload");
+                        } else if (stepped_kv_to_q4) {
+                            LaunchProfile try_asym = profile;
+                            try_asym.cache_type_k = "q8_0";
+                            try_asym.cache_type_v = "q4_0";
+                            const VramEstimate est_asym = evaluate(try_asym, try_asym.vram_budget_mib);
+                            if (fits_vram(est_asym, try_asym)) {
+                                profile = std::move(try_asym);
+                                est = est_asym;
+                                stepped_kv_to_q4 = false;
+                                plan.reasons.emplace_back(
+                                    "restored asymmetric q8_0/q4_0 KV cache with sufficient headroom after "
+                                    "--n-cpu-moe offload");
+                            }
                         }
                     }
 
@@ -1255,6 +1425,7 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
                     if (m_best == 0) {
                         profile.extra_args = strip_n_cpu_moe_args(profile.extra_args);
                         est = m_est;
+                        moe_offload_active = false;
                         plan.reasons.emplace_back("removed --n-cpu-moe after ctx_size step-down");
                     } else if (m_best < model.block_count) {
                         profile = with_n_cpu_moe(profile, m_best);
@@ -1341,6 +1512,7 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
                 profile.mmproj_offload = false;
             }
             profile.extra_args = strip_n_cpu_moe_args(profile.extra_args);
+            moe_offload_active = false;
             profile.device = std::nullopt;
             profile.split_mode = std::nullopt;
             profile.tensor_split.clear();
@@ -1371,6 +1543,132 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
         plan.fits_in_vram = true;
     }
 
+    // Step 5: Dynamic SLRU MoE expert cache planning (--moe-cache-mib / --moe-cache-cpu-share).
+    // Anti-regression rules (upstream llama.cpp PR #29887 / #30966 / #30637):
+    //   (a) NEVER set moe_cache_mib when a MoE model fits 100% in VRAM (~10% graph-splitting overhead).
+    //   (b) When a MoE model overflows VRAM and uses --n-cpu-moe, ONLY enable moe_cache_mib when spare
+    //       VRAM >= 512 MiB and covers the active expert working set (avoiding <75% hit-rate PCIe thrash).
+    const auto spare_vram_for_cache_mib = [&](const VramEstimate& e, const LaunchProfile& p) -> std::uint64_t {
+        if (active_usable_mib.empty() || total_usable_mib == 0) return 0;
+        if (active_usable_mib.size() == 1 || p.tensor_split.size() < 2 ||
+            (p.split_mode && *p.split_mode == "none")) {
+            return active_usable_mib.front() > e.total_mib() ? active_usable_mib.front() - e.total_mib() : 0;
+        }
+        double weight_sum = 0.0;
+        double max_share = 0.0;
+        const std::size_t n = std::min(active_usable_mib.size(), p.tensor_split.size());
+        for (std::size_t i = 0; i < n; ++i) {
+            if (std::isfinite(p.tensor_split[i]) && p.tensor_split[i] > 0.0) {
+                weight_sum += p.tensor_split[i];
+            }
+        }
+        if (!(weight_sum > 0.0)) return 0;
+        const std::uint64_t splittable = saturating_add(
+            saturating_add(e.weights_bytes, e.kv_bytes),
+            saturating_add(e.recurrent_bytes, e.moe_cache_bytes));
+        std::uint64_t min_gpu_spare_mib = std::numeric_limits<std::uint64_t>::max();
+        for (std::size_t i = 0; i < n; ++i) {
+            const double share = p.tensor_split[i] / weight_sum;
+            max_share = std::max(max_share, share);
+            const std::uint64_t shard =
+                std::min(splittable, saturating_u64(std::ceil(static_cast<double>(splittable) * share)));
+            const std::uint64_t used_mib = bytes_to_mib_ceil(saturating_add(shard, e.compute_bytes));
+            const std::uint64_t spare = active_usable_mib[i] > used_mib ? active_usable_mib[i] - used_mib : 0;
+            min_gpu_spare_mib = std::min(min_gpu_spare_mib, spare);
+        }
+        const std::uint64_t total_spare = total_usable_mib > e.total_mib() ? total_usable_mib - e.total_mib() : 0;
+        if (min_gpu_spare_mib == 0 || !(max_share > 0.0)) return 0;
+        const std::uint64_t shard_bounded = saturating_u64(std::floor(static_cast<double>(min_gpu_spare_mib) / max_share));
+        return std::min(total_spare, shard_bounded);
+    };
+
+    const std::optional<std::uint64_t> avail_host_bytes = host.available_physical.value();
+    if (plan.fits_in_vram && est.gpu_layers > 0 && model_is_moe) {
+        if (est.host_expert_bytes == 0) {
+            profile.moe_cache_mib = std::nullopt;
+            profile.moe_cache_cpu_share = std::nullopt;
+            const detail::MoeExpertCacheSizing sizing =
+                detail::plan_moe_expert_cache(model, 0, spare_vram_for_cache_mib(est, profile), avail_host_bytes);
+            if (!sizing.reason.empty()) {
+                plan.reasons.push_back(sizing.reason);
+            }
+        } else if (plan.uma_mode) {
+            profile.moe_cache_mib = std::nullopt;
+            profile.moe_cache_cpu_share = std::nullopt;
+            plan.reasons.emplace_back(
+                "skipped dynamic SLRU MoE cache (--moe-cache-mib) on integrated UMA GPU (VRAM and host RAM share "
+                "physical memory)");
+        } else if (has_usable_expert_tensors(model)) {
+            const std::uint32_t current_n_cpu_moe = extract_n_cpu_moe_count(profile, model.block_count);
+            bool slru_applied = false;
+            // On heavily overflowing fine-grained sparse MoEs (e.g. 80B MoE on 8-16 GB VRAM where
+            // static --n-cpu-moe keeps <50% of blocks on GPU), trading static block pinning for
+            // full --n-cpu-moe + a large dynamic SLRU cache yields much higher cross-layer hit rates.
+            const bool sparse_heavy_overflow =
+                current_n_cpu_moe > 0 && current_n_cpu_moe < model.block_count &&
+                model.routed_experts.has_value() && model.routed_experts->total >= 16u &&
+                model.routed_experts->active * 4u <= model.routed_experts->total &&
+                current_n_cpu_moe * 2u > model.block_count;
+            if (sparse_heavy_overflow) {
+                LaunchProfile all_cpu = with_n_cpu_moe(profile, model.block_count);
+                if (all_cpu.load_mode && *all_cpu.load_mode == "none") all_cpu.load_mode = "auto";
+                const VramEstimate est_all = evaluate(all_cpu, all_cpu.vram_budget_mib);
+                bool host_ok = check_host_fit(est_all, plan.uma_mode);
+                if (!host_ok && !all_cpu.no_repack.value_or(false)) {
+                    LaunchProfile nr_probe = all_cpu;
+                    nr_probe.no_repack = true;
+                    host_ok = check_host_fit(evaluate(nr_probe, nr_probe.vram_budget_mib), plan.uma_mode);
+                }
+                if (host_ok && fits_vram(est_all, all_cpu)) {
+                    const std::uint64_t all_spare = spare_vram_for_cache_mib(est_all, all_cpu);
+                    const detail::MoeExpertCacheSizing all_sizing = detail::plan_moe_expert_cache(
+                        model, est_all.host_expert_bytes, all_spare, avail_host_bytes);
+                    if (all_sizing.eligible) {
+                        LaunchProfile cached_all = all_cpu;
+                        cached_all.moe_cache_mib = all_sizing.recommended_cache_mib;
+                        cached_all.moe_cache_cpu_share = all_sizing.recommended_cpu_share;
+                        const VramEstimate est_cached = evaluate(cached_all, cached_all.vram_budget_mib);
+                        if (fits_vram(est_cached, cached_all)) {
+                            const std::uint32_t static_gpu_blocks = model.block_count - current_n_cpu_moe;
+                            profile = std::move(cached_all);
+                            est = est_cached;
+                            moe_offload_active = true;
+                            slru_applied = true;
+                            plan.reasons.push_back(
+                                "switched sparse MoE from partial static pinning (" +
+                                std::to_string(static_gpu_blocks) + "/" + std::to_string(model.block_count) +
+                                " expert blocks) to full --n-cpu-moe " + std::to_string(model.block_count) +
+                                " + dynamic SLRU cache");
+                            plan.reasons.push_back(all_sizing.reason);
+                        }
+                    }
+                }
+            }
+            if (!slru_applied && current_n_cpu_moe > 0) {
+                const std::uint64_t spare = spare_vram_for_cache_mib(est, profile);
+                const detail::MoeExpertCacheSizing sizing =
+                    detail::plan_moe_expert_cache(model, est.host_expert_bytes, spare, avail_host_bytes);
+                if (sizing.eligible) {
+                    LaunchProfile cached = profile;
+                    cached.moe_cache_mib = sizing.recommended_cache_mib;
+                    cached.moe_cache_cpu_share = sizing.recommended_cpu_share;
+                    const VramEstimate est_cached = evaluate(cached, cached.vram_budget_mib);
+                    if (fits_vram(est_cached, cached)) {
+                        profile = std::move(cached);
+                        est = est_cached;
+                        plan.reasons.push_back(sizing.reason);
+                    } else {
+                        plan.reasons.emplace_back(
+                            "skipped dynamic SLRU MoE cache (--moe-cache-mib): per-GPU shard alignment left "
+                            "insufficient headroom");
+                    }
+                } else if (!sizing.reason.empty()) {
+                    plan.reasons.push_back(sizing.reason);
+                }
+            }
+        }
+    }
+
     // If host-resident weights exceed available host RAM (e.g. repackable MoE
     // experts or partial CPU layers), try no_repack to avoid private-RAM copies.
     if (!check_host_fit(est, plan.uma_mode) && !profile.no_repack.value_or(false)) {
@@ -1386,8 +1684,45 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
         }
     }
 
+    // Step 6: Selective CPU-only tensor repacking guard & physical-core thread recommendation.
+    // NEVER recommend global tensor repacking (--repack / no_repack=false) while GPU layers
+    // remain active (avoids row-interleaved GPU CPU-fallback regression).
+    if (est.gpu_layers > 0 && profile.no_repack.has_value() && !*profile.no_repack) {
+        profile.no_repack = std::nullopt;
+    }
+    const bool partial_gpu_layers =
+        profile.n_gpu_layers && *profile.n_gpu_layers >= 0 &&
+        static_cast<std::uint32_t>(*profile.n_gpu_layers) < model.block_count;
+    const std::uint32_t final_n_cpu_moe = extract_n_cpu_moe_count(profile, model.block_count);
+    if (profile.no_repack.value_or(false)) {
+        plan.repack_policy = "disabled_no_repack";
+    } else if (est.host_expert_bytes > 0 || partial_gpu_layers || est.gpu_layers == 0) {
+        plan.repack_policy = "cpu_only_selective";
+        if (est.gpu_layers > 0) {
+            plan.reasons.emplace_back(
+                "selective CPU-only repacking policy: omitted global --repack while GPU layers remain active "
+                "to avoid row-interleaved GPU CPU-fallback regression");
+        }
+    } else {
+        plan.repack_policy = "none";
+    }
+
+    if (final_n_cpu_moe > 0 && est.host_expert_bytes > 0) {
+        std::uint32_t logical_cores = 0;
+        if (const auto phys = compute_physical_decode_threads(request, logical_cores)) {
+            plan.recommended_threads = *phys;
+            profile.threads = static_cast<std::int32_t>(*phys);
+            plan.reasons.push_back("recommended physical-core thread count (" + std::to_string(*phys) +
+                                   " threads from " + std::to_string(logical_cores) +
+                                   " logical cores) for CPU-offloaded MoE decode to avoid SMT hyperthread "
+                                   "oversubscription on DDR5 bandwidth");
+        }
+    }
+
     // --------------------------------------------------- 8. Finalize & audit
     plan.profile = std::move(profile);
+    plan.moe_cache_mib = plan.profile.moe_cache_mib;
+    plan.moe_cache_cpu_share = plan.profile.moe_cache_cpu_share;
     plan.estimate = evaluate(plan.profile, plan.profile.vram_budget_mib);
     plan.fits_in_host_ram = check_host_fit(plan.estimate, plan.uma_mode);
 
@@ -1449,6 +1784,8 @@ json::Object placement_plan_to_json(const PlacementPlan& plan) {
     }
     if (plan.profile.load_mode) prof.set("load_mode", *plan.profile.load_mode);
     if (plan.profile.no_repack) prof.set("no_repack", *plan.profile.no_repack);
+    if (plan.profile.moe_cache_mib) prof.set("moe_cache_mib", *plan.profile.moe_cache_mib);
+    if (plan.profile.moe_cache_cpu_share) prof.set("moe_cache_cpu_share", *plan.profile.moe_cache_cpu_share);
     if (plan.profile.batch_size) prof.set("batch_size", *plan.profile.batch_size);
     if (plan.profile.ubatch_size) prof.set("ubatch_size", *plan.profile.ubatch_size);
     if (plan.profile.parallel) prof.set("parallel", *plan.profile.parallel);
@@ -1471,6 +1808,8 @@ json::Object placement_plan_to_json(const PlacementPlan& plan) {
         }
         prof.set("speculative", std::move(spec));
     }
+    if (plan.profile.threads) prof.set("threads", *plan.profile.threads);
+    if (plan.profile.threads_batch) prof.set("threads_batch", *plan.profile.threads_batch);
     if (!plan.profile.extra_args.empty()) {
         json::Array extra;
         extra.reserve(plan.profile.extra_args.size());
@@ -1486,6 +1825,7 @@ json::Object placement_plan_to_json(const PlacementPlan& plan) {
     est.set("kv_bytes", plan.estimate.kv_bytes);
     est.set("recurrent_bytes", plan.estimate.recurrent_bytes);
     est.set("compute_bytes", plan.estimate.compute_bytes);
+    est.set("moe_cache_bytes", plan.estimate.moe_cache_bytes);
     est.set("max_gpu_bytes", plan.estimate.max_gpu_bytes);
     est.set("max_gpu_mib", plan.estimate.max_gpu_mib());
     est.set("gpu_layers", plan.estimate.gpu_layers);
@@ -1530,6 +1870,10 @@ json::Object placement_plan_to_json(const PlacementPlan& plan) {
     out.set("requires_prism_runtime", plan.requires_prism_runtime);
     out.set("selected_vendor", to_string(plan.selected_vendor));
     out.set("recommended_backend_hint", plan.recommended_backend_hint);
+    if (plan.moe_cache_mib) out.set("moe_cache_mib", *plan.moe_cache_mib);
+    if (plan.moe_cache_cpu_share) out.set("moe_cache_cpu_share", *plan.moe_cache_cpu_share);
+    if (plan.recommended_threads) out.set("recommended_threads", *plan.recommended_threads);
+    if (!plan.repack_policy.empty()) out.set("repack_policy", plan.repack_policy);
     out.set("profile", std::move(prof));
     out.set("estimate", std::move(est));
     out.set("recommended_env", std::move(env_obj));

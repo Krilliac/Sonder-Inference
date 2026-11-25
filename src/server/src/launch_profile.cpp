@@ -89,6 +89,13 @@ std::string format_tensor_split(const std::vector<double>& weights) {
     return out.str();
 }
 
+std::string format_profile_double(double value) {
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << std::setprecision(6) << value;
+    return out.str();
+}
+
 // The flag lists below hold the names llama-server looks flags up by
 // (llamaserver_flag_name): hyphens, never underscores. check_extra_args
 // compares each extra argument under that name, so `--ctx_size` and
@@ -110,6 +117,8 @@ constexpr std::pair<std::string_view, std::string_view> kTypedFlags[] = {
     {"-ts", "tensor_split"}, {"--tensor-split", "tensor_split"},
     {"-lm", "load_mode"}, {"--load-mode", "load_mode"},
     {"-nr", "no_repack"}, {"--no-repack", "no_repack"}, {"--repack", "no_repack"},
+    {"--moe-cache-mib", "moe_cache_mib"},
+    {"--moe-cache-cpu-share", "moe_cache_cpu_share"},
     {"-b", "batch_size"}, {"--batch-size", "batch_size"},
     {"-ub", "ubatch_size"}, {"--ubatch-size", "ubatch_size"},
     {"-np", "parallel"}, {"--parallel", "parallel"},
@@ -317,6 +326,13 @@ public:
         out = static_cast<float>(v->as_double());
         return {};
     }
+    Status number(const char* key, std::optional<double>& out) const {
+        const auto* v = object_.find(key);
+        if (!v) return {};
+        if (!v->is_number() || !std::isfinite(v->as_double())) return bad(where_, std::string("'") + key + "' must be a number");
+        out = v->as_double();
+        return {};
+    }
     Status strings(const char* key, std::vector<std::string>& out) const {
         const auto* v = object_.find(key);
         if (!v) return {};
@@ -363,11 +379,11 @@ Result<LaunchProfile> parse_one(const json::Value& value, std::size_t index) {
     Reader r(value.as_object(), where);
     SONDER_TRY(r.check_keys({"name", "backend", "model", "mmproj", "mmproj_offload", "image_max_tokens", "ctx_size",
                              "n_gpu_layers", "device", "main_gpu", "split_mode", "tensor_split", "load_mode",
-                             "no_repack", "batch_size", "ubatch_size", "parallel", "kv_unified", "flash_attn",
-                             "cache_type_k", "cache_type_v", "ctx_checkpoints", "checkpoint_min_step", "cache_ram_mib",
-                             "context_shift", "fit", "speculative", "threads", "threads_batch", "jinja",
-                             "reasoning_format", "reasoning", "reasoning_budget", "sampling", "extra_args",
-                             "vram_budget_mib"}));
+                             "no_repack", "moe_cache_mib", "moe_cache_cpu_share", "batch_size", "ubatch_size",
+                             "parallel", "kv_unified", "flash_attn", "cache_type_k", "cache_type_v", "ctx_checkpoints",
+                             "checkpoint_min_step", "cache_ram_mib", "context_shift", "fit", "speculative", "threads",
+                             "threads_batch", "jinja", "reasoning_format", "reasoning", "reasoning_budget", "sampling",
+                             "extra_args", "vram_budget_mib"}));
     LaunchProfile p;
     SONDER_TRY(r.string("name", p.name, true));
     SONDER_TRY(r.string("backend", p.backend, true));
@@ -383,6 +399,8 @@ Result<LaunchProfile> parse_one(const json::Value& value, std::size_t index) {
     SONDER_TRY(r.numbers("tensor_split", p.tensor_split));
     SONDER_TRY(r.string("load_mode", p.load_mode));
     SONDER_TRY(r.boolean("no_repack", p.no_repack));
+    SONDER_TRY(r.integer("moe_cache_mib", p.moe_cache_mib, 0, 262144));
+    SONDER_TRY(r.number("moe_cache_cpu_share", p.moe_cache_cpu_share));
     SONDER_TRY(r.integer("batch_size", p.batch_size, 1, kMaxBatch));
     SONDER_TRY(r.integer("ubatch_size", p.ubatch_size, 1, kMaxBatch));
     SONDER_TRY(r.integer("parallel", p.parallel, 1, 256));
@@ -492,6 +510,13 @@ Status validate_launch_profile(const LaunchProfile& p) {
     }
     if (p.load_mode && !valid_load_mode(*p.load_mode)) {
         return bad(where, "'load_mode' must be one of auto, mmap, none, mlock, mmap+mlock, dio");
+    }
+    if (p.moe_cache_mib && *p.moe_cache_mib > 262144u) {
+        return bad(where, "'moe_cache_mib' must be from 0 to 262144");
+    }
+    if (p.moe_cache_cpu_share &&
+        (!std::isfinite(*p.moe_cache_cpu_share) || *p.moe_cache_cpu_share < 0.0 || *p.moe_cache_cpu_share > 1.0)) {
+        return bad(where, "'moe_cache_cpu_share' must be a finite number from 0.0 to 1.0");
     }
     if (p.flash_attn && canonical_flash_attn(*p.flash_attn) != *p.flash_attn) {
         return bad(where, "'flash_attn' must be on, off or auto");
@@ -641,6 +666,11 @@ Result<std::vector<std::string>> llamaserver_arguments(const LaunchProfile& p) {
         a.push_back(*p.load_mode);
     }
     toggle(p.no_repack, "--no-repack", "--repack");
+    if (p.moe_cache_mib) num("--moe-cache-mib", *p.moe_cache_mib);
+    if (p.moe_cache_cpu_share) {
+        a.emplace_back("--moe-cache-cpu-share");
+        a.push_back(format_profile_double(*p.moe_cache_cpu_share));
+    }
     if (p.batch_size) num("--batch-size", *p.batch_size);
     if (p.ubatch_size) num("--ubatch-size", *p.ubatch_size);
     if (p.parallel) num("--parallel", *p.parallel);
@@ -707,6 +737,8 @@ Status apply_llamacpp_profile(const LaunchProfile& p, BackendSetup& setup, std::
     if (!p.tensor_split.empty()) return unsupported("tensor_split");
     if (p.load_mode) return unsupported("load_mode");
     if (p.no_repack) return unsupported("no_repack");
+    if (p.moe_cache_mib) return unsupported("moe_cache_mib");
+    if (p.moe_cache_cpu_share) return unsupported("moe_cache_cpu_share");
     if (p.parallel) return unsupported("parallel");
     if (p.kv_unified) return unsupported("kv_unified");
     if (p.cache_type_k && !is_llamacpp_kv_cache_type(*p.cache_type_k)) {
@@ -819,6 +851,12 @@ json::Object launch_profile_metadata(const LaunchProfile& p, const std::optional
     if (estimate && (estimate->prism_hadamard || estimate->requires_prism_runtime)) {
         o.set("prism_hadamard", json::Value(estimate->prism_hadamard));
         o.set("requires_prism_runtime", json::Value(estimate->requires_prism_runtime));
+    }
+    if (p.moe_cache_mib) {
+        o.set("moe_cache_mib", json::Value(*p.moe_cache_mib));
+    }
+    if (p.moe_cache_cpu_share) {
+        o.set("moe_cache_cpu_share", json::Value(*p.moe_cache_cpu_share));
     }
     return o;
 }

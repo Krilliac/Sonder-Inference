@@ -476,12 +476,32 @@ TEST_CASE("placement planner: MoE overflowing 16 GB VRAM picks --n-cpu-moe to fi
     CHECK(any_contains(plan.reasons, "--n-cpu-moe"));
 }
 
-TEST_CASE("placement planner: solver steps KV to q4_0, aligns ctx_size to 4096, and falls back to partial layers") {
+TEST_CASE("placement planner: solver steps KV q8_0/q8_0 -> q8_0/q4_0 -> q4_0/q4_0, aligns ctx_size, and falls back to partial layers") {
     const std::vector<si::GpuDeviceInfo> rtx{make_rtx_5070_ti("gpu:0", 15360)};  // usable = 13824 MiB
 
-    // 1. Fits at target_ctx after stepping KV from q8_0/q8_0 to q4_0/q4_0.
+    // 1a. Fits at target_ctx via intermediate asymmetric KV step (q8_0 K / q4_0 V) before dropping K to q4_0.
     {
         const si::GgufModelInfo m = dense_model(32, 350, 8);
+        si::PlacementPlanRequest req;
+        req.profile_name = "kv-q8-q4-fit";
+        req.model_path = "m.gguf";
+        req.target_ctx_size = 32768;
+        const si::PlacementPlan plan = si::plan_model_placement(m, rtx, host_ram(32, 24), req);
+        verify_plan_contracts(plan);
+
+        CHECK(plan.fits_in_vram);
+        CHECK(plan.profile.n_gpu_layers == -1);
+        CHECK(plan.profile.ctx_size == 32768u);
+        CHECK(plan.profile.cache_type_k == std::string("q8_0"));
+        CHECK(plan.profile.cache_type_v == std::string("q4_0"));
+        CHECK(plan.estimate.total_mib() <= plan.budget_mib);
+        CHECK(any_contains(plan.reasons, "asymmetric q8_0/q4_0"));
+        CHECK(any_contains(plan.warnings, "q4_0"));
+    }
+
+    // 1b. Tighter model overflows asymmetric q8_0/q4_0 and steps both K and V to q4_0/q4_0.
+    {
+        const si::GgufModelInfo m = dense_model(32, 365, 8);
         si::PlacementPlanRequest req;
         req.profile_name = "kv-q4-fit";
         req.model_path = "m.gguf";
@@ -776,5 +796,343 @@ TEST_CASE("placement planner: cross-platform Linux/WSL Blackwell, hybrid AMD iGP
         CHECK(plan.recommended_backend_hint == "rocm");
         CHECK(plan.profile.device == std::optional<std::string>("ROCm0"));
         CHECK_FALSE(plan.profile.split_mode.has_value());
+    }
+}
+
+namespace {
+
+// 80B-class sparse MoE (~40 GiB Q4_K weights: 48 blocks, 128 routed experts / 8 active,
+// 40 MiB attention+shared + 800 MiB routed experts per block, 256 MiB embd + 256 MiB output).
+si::GgufModelInfo moe_80b_model(std::uint32_t expert_type = 12) {
+    si::GgufModelInfo m;
+    m.architecture = "qwen3moe";
+    m.kind = si::ModelArchitecture::attention_only;
+    m.block_count = 48;
+    m.embedding_length = 4096;
+    m.vocab_size = 152064;
+    m.key_length = 128;
+    m.value_length = 128;
+    m.kv_heads.assign(48, 4);
+    m.metadata = {{"general.architecture", "qwen3moe"}, {"qwen3moe.context_length", "131072"}};
+    m.routed_experts = si::RoutedExpertCounts{128, 8};
+    m.block_bytes.assign(48, 0);
+    const auto add = [&](const std::string& name, std::uint64_t mib, std::uint32_t blk, bool expert,
+                         std::uint32_t type) {
+        si::GgufTensorInfo t;
+        t.name = name;
+        t.bytes = mib * kMiB;
+        t.block = blk;
+        t.expert = expert;
+        t.type = type;
+        m.block_bytes[blk] += t.bytes;
+        m.tensors.push_back(std::move(t));
+    };
+    for (std::uint32_t b = 0; b < 48; ++b) {
+        const std::string p = "blk." + std::to_string(b) + ".";
+        add(p + "attn_q.weight", 40, b, false, 12);
+        add(p + "ffn_up_exps.weight", 400, b, true, expert_type);
+        add(p + "ffn_down_exps.weight", 400, b, true, expert_type);
+    }
+    m.output_bytes = 256 * kMiB;
+    m.embedding_bytes = 256 * kMiB;
+    return m;
+}
+
+// Compact 8B-class MoE (~4.7 GiB total) that fits 100% inside a 16 GB discrete GPU.
+si::GgufModelInfo compact_moe_model() {
+    si::GgufModelInfo m;
+    m.architecture = "qwen3moe";
+    m.kind = si::ModelArchitecture::attention_only;
+    m.block_count = 16;
+    m.embedding_length = 2048;
+    m.vocab_size = 32000;
+    m.key_length = 128;
+    m.value_length = 128;
+    m.kv_heads.assign(16, 4);
+    m.metadata = {{"general.architecture", "qwen3moe"}, {"qwen3moe.context_length", "65536"}};
+    m.routed_experts = si::RoutedExpertCounts{32, 4};
+    m.block_bytes.assign(16, 0);
+    const auto add = [&](const std::string& name, std::uint64_t mib, std::uint32_t blk, bool expert) {
+        si::GgufTensorInfo t;
+        t.name = name;
+        t.bytes = mib * kMiB;
+        t.block = blk;
+        t.expert = expert;
+        t.type = 12;
+        m.block_bytes[blk] += t.bytes;
+        m.tensors.push_back(std::move(t));
+    };
+    for (std::uint32_t b = 0; b < 16; ++b) {
+        const std::string p = "blk." + std::to_string(b) + ".";
+        add(p + "attn_q.weight", 40, b, false);
+        add(p + "ffn_up_exps.weight", 120, b, true);
+        add(p + "ffn_down_exps.weight", 120, b, true);
+    }
+    m.output_bytes = 128 * kMiB;
+    m.embedding_bytes = 128 * kMiB;
+    return m;
+}
+
+}  // namespace
+
+TEST_CASE("placement planner: 80B MoE on Node1 16 GB RX 9060 + 48 GB RAM enables SLRU cache, RDNA 4 advisory, and physical-core threads") {
+    const si::GgufModelInfo model = moe_80b_model();
+
+    for (const char* backend : {"vulkan", "rocm"}) {
+        CAPTURE(backend);
+        si::GpuDeviceInfo rx9060 = make_amd_discrete("gpu:0", "AMD Radeon RX 9060", 16, 15360, backend);
+        rx9060.device_id = 0x7590u;  // Navi 44 (gfx1200)
+
+        si::PlacementPlanRequest req;
+        req.profile_name = "node1-qwen3-80b-moe";
+        req.model_path = "D:/models/Qwen3-Next-80B-A3B-Q4_K_S.gguf";
+        req.target_ctx_size = 32768;
+        req.cpu_logical_cores = 24;
+
+        const si::PlacementPlan plan = si::plan_model_placement(model, {rx9060}, host_ram(48, 44), req);
+        verify_plan_contracts(plan);
+
+        CHECK(plan.fits_in_vram);
+        CHECK(plan.fits_in_host_ram);
+        CHECK_FALSE(plan.uma_mode);
+        CHECK(plan.selected_vendor == si::GpuVendor::amd);
+        CHECK(plan.recommended_backend_hint == backend);
+        CHECK(plan.profile.n_gpu_layers == -1);
+        CHECK(plan.estimate.host_expert_bytes > 0u);
+        CHECK(plan.estimate.total_mib() <= plan.budget_mib);
+
+        // Dynamic SLRU expert cache triggers cleanly from remaining spare VRAM headroom.
+        REQUIRE(plan.moe_cache_mib.has_value());
+        CHECK(*plan.moe_cache_mib >= 512u);
+        CHECK(plan.profile.moe_cache_mib == plan.moe_cache_mib);
+        REQUIRE(plan.moe_cache_cpu_share.has_value());
+        CHECK(*plan.moe_cache_cpu_share >= 0.25);
+        CHECK(*plan.moe_cache_cpu_share <= 0.50);
+        CHECK(plan.profile.moe_cache_cpu_share == plan.moe_cache_cpu_share);
+        CHECK(plan.estimate.moe_cache_bytes == static_cast<std::uint64_t>(*plan.moe_cache_mib) * kMiB);
+        CHECK(any_contains(plan.reasons, "--moe-cache-mib"));
+
+        // Emitted llama-server argv includes both SLRU flags and never global --repack.
+        const auto argv = si::llamaserver_arguments(plan.profile);
+        REQUIRE_MESSAGE(argv.ok(), argv.status().message());
+        CHECK(std::find(argv->begin(), argv->end(), "--moe-cache-mib") != argv->end());
+        CHECK(std::find(argv->begin(), argv->end(), "--moe-cache-cpu-share") != argv->end());
+        CHECK(std::find(argv->begin(), argv->end(), "--repack") == argv->end());
+
+        // Selective CPU repacking guard + physical-core thread recommendation (24 logical -> 12 physical).
+        CHECK(plan.repack_policy == "cpu_only_selective");
+        CHECK(plan.recommended_threads == std::optional<std::uint32_t>(12u));
+        CHECK(plan.profile.threads == std::optional<std::int32_t>(12));
+        CHECK(any_contains(plan.reasons, "selective CPU-only repacking"));
+        CHECK(any_contains(plan.reasons, "physical-core thread count"));
+
+        // RDNA 4 (gfx1200/gfx1201) Vulkan CoopMat vs ROCm WMMA FlashAttention advisory.
+        CHECK(any_contains(plan.reasons, "RDNA 4"));
+        CHECK(any_contains(plan.reasons, "VK_KHR_cooperative_matrix"));
+        if (std::string(backend) == "rocm") {
+            CHECK(any_contains(plan.reasons, "GGML_HIP_ROCWMMA_FATTN=ON"));
+        }
+
+        // JSON serialization carries the new top-level, profile, and estimate fields.
+        const json::Object doc = si::placement_plan_to_json(plan);
+        REQUIRE(doc.find("moe_cache_mib") != nullptr);
+        CHECK(doc.find("moe_cache_mib")->as_uint() == *plan.moe_cache_mib);
+        REQUIRE(doc.find("moe_cache_cpu_share") != nullptr);
+        CHECK(doc.find("moe_cache_cpu_share")->as_double() == doctest::Approx(*plan.moe_cache_cpu_share));
+        REQUIRE(doc.find("recommended_threads") != nullptr);
+        CHECK(doc.find("recommended_threads")->as_uint() == 12u);
+        REQUIRE(doc.find("repack_policy") != nullptr);
+        CHECK(doc.find("repack_policy")->as_string() == "cpu_only_selective");
+        REQUIRE(doc.find("estimate")->find("moe_cache_bytes") != nullptr);
+        CHECK(doc.find("estimate")->find("moe_cache_bytes")->as_uint() == plan.estimate.moe_cache_bytes);
+    }
+}
+
+TEST_CASE("placement planner: SLRU MoE cache anti-regression guards (100% VRAM fit, <75% thrash risk, and UMA)") {
+    // Rule (a): NEVER set moe_cache_mib when a MoE model fits 100% in VRAM.
+    {
+        const si::GgufModelInfo small_moe = compact_moe_model();
+        si::GpuDeviceInfo rx9060 = make_amd_discrete("gpu:0", "AMD Radeon RX 9060", 16, 15360, "vulkan");
+        rx9060.device_id = 0x7590u;
+
+        si::PlacementPlanRequest req;
+        req.profile_name = "compact-moe-vram";
+        req.model_path = "D:/models/compact-moe.gguf";
+        req.target_ctx_size = 32768;
+
+        const si::PlacementPlan plan = si::plan_model_placement(small_moe, {rx9060}, host_ram(48, 44), req);
+        verify_plan_contracts(plan);
+
+        CHECK(plan.fits_in_vram);
+        CHECK(plan.estimate.host_expert_bytes == 0u);
+        CHECK_FALSE(plan.moe_cache_mib.has_value());
+        CHECK_FALSE(plan.moe_cache_cpu_share.has_value());
+        CHECK_FALSE(plan.profile.moe_cache_mib.has_value());
+        CHECK_FALSE(plan.profile.moe_cache_cpu_share.has_value());
+        CHECK(plan.estimate.moe_cache_bytes == 0u);
+        CHECK(any_contains(plan.reasons, "graph-splitting overhead"));
+        CHECK(plan.repack_policy == "none");
+        CHECK_FALSE(plan.recommended_threads.has_value());
+
+        const auto argv = si::llamaserver_arguments(plan.profile);
+        REQUIRE(argv.ok());
+        CHECK(std::find(argv->begin(), argv->end(), "--moe-cache-mib") == argv->end());
+        CHECK(std::find(argv->begin(), argv->end(), "--moe-cache-cpu-share") == argv->end());
+    }
+
+    // Rule (b1): When spare VRAM after pinned layers + KV + compute is below the 512 MiB floor,
+    // keep moe_cache_mib OFF.
+    {
+        const si::GgufModelInfo big_moe = moe_80b_model();
+        si::GpuDeviceInfo rx_8g = make_amd_discrete("gpu:0", "AMD Radeon RX 9060 8GB", 8, 7680, "vulkan");
+        rx_8g.device_id = 0x7590u;
+
+        si::PlacementPlanRequest req;
+        req.profile_name = "moe-80b-8g-floor-guard";
+        req.model_path = "D:/models/Qwen3-80B-MoE.gguf";
+        req.target_ctx_size = 32768;
+
+        const si::PlacementPlan plan = si::plan_model_placement(big_moe, {rx_8g}, host_ram(48, 44), req);
+        verify_plan_contracts(plan);
+
+        CHECK(plan.fits_in_vram);
+        CHECK(plan.estimate.host_expert_bytes > 0u);
+        CHECK_FALSE(plan.moe_cache_mib.has_value());
+        CHECK_FALSE(plan.moe_cache_cpu_share.has_value());
+        CHECK(plan.estimate.moe_cache_bytes == 0u);
+        CHECK(any_contains(plan.reasons, "skipped dynamic SLRU MoE cache"));
+        CHECK(any_contains(plan.reasons, "< 512 MiB floor"));
+    }
+
+    // Rule (b2): When spare VRAM >= 512 MiB but still cannot cover the active CPU-offloaded expert
+    // working set (e.g. 3200 MiB/block experts on 8 GB GPU -> 0 expert blocks fit on GPU, ~1.5 GiB spare
+    // vs ~9.6 GiB active working set), keep moe_cache_mib OFF to avoid <75% hit-rate PCIe thrash.
+    {
+        si::GgufModelInfo wide_moe = moe_80b_model();
+        for (auto& t : wide_moe.tensors) {
+            if (t.expert) {
+                wide_moe.block_bytes[t.block] += t.bytes * 3u;  // 4x expert tensors: 800 -> 3200 MiB/block
+                t.bytes *= 4u;
+            }
+        }
+        si::GpuDeviceInfo rx_8g = make_amd_discrete("gpu:0", "AMD Radeon RX 9060 8GB", 8, 7680, "vulkan");
+        rx_8g.device_id = 0x7590u;
+
+        si::PlacementPlanRequest req;
+        req.profile_name = "moe-80b-8g-thrash-guard";
+        req.model_path = "D:/models/Qwen3-320B-MoE.gguf";
+        req.target_ctx_size = 32768;
+
+        const si::PlacementPlan plan = si::plan_model_placement(wide_moe, {rx_8g}, host_ram(256, 224), req);
+        verify_plan_contracts(plan);
+
+        CHECK(plan.fits_in_vram);
+        CHECK(plan.estimate.host_expert_bytes > 0u);
+        CHECK_FALSE(plan.moe_cache_mib.has_value());
+        CHECK_FALSE(plan.moe_cache_cpu_share.has_value());
+        CHECK(plan.estimate.moe_cache_bytes == 0u);
+        CHECK(any_contains(plan.reasons, "skipped dynamic SLRU MoE cache"));
+        CHECK(any_contains(plan.reasons, "PCIe thrash"));
+    }
+
+    // Integrated UMA: VRAM and host RAM share physical memory, so SLRU cache stays OFF.
+    {
+        const si::GgufModelInfo big_moe = moe_80b_model();
+        si::GpuDeviceInfo apu = make_ryzen_780m_apu("gpu:0", "vulkan");
+        apu.shared_total = si::MemoryReading::known(20 * kGiB);
+
+        si::PlacementPlanRequest req;
+        req.profile_name = "moe-uma-no-slru";
+        req.model_path = "D:/models/Qwen3-80B-MoE.gguf";
+        req.target_ctx_size = 8192;
+
+        const si::PlacementPlan plan = si::plan_model_placement(big_moe, {apu}, host_ram(64, 56), req);
+        verify_plan_contracts(plan);
+
+        CHECK(plan.uma_mode);
+        CHECK_FALSE(plan.moe_cache_mib.has_value());
+        CHECK_FALSE(plan.moe_cache_cpu_share.has_value());
+        CHECK(plan.estimate.moe_cache_bytes == 0u);
+    }
+}
+
+TEST_CASE("placement planner: Blackwell NVFP4/MXFP4/FP8 sizing, prefer_fp8_kv, and physical-core thread clamping") {
+    // 1. Blackwell RTX 5070 Ti (sm_120) with NVFP4 weights and prefer_fp8_kv=true.
+    {
+        si::GgufModelInfo m = dense_model(32, 220, 8);
+        m.has_nvfp4_tensors = true;
+        m.has_mxfp4_tensors = true;
+        m.has_fp8_tensors = true;
+        m.has_fp4_or_fp8_tensors = true;
+
+        si::PlacementPlanRequest req;
+        req.profile_name = "blackwell-fp4-fp8kv";
+        req.model_path = "D:/models/model-nvfp4.gguf";
+        req.target_ctx_size = 32768;
+        req.prefer_fp8_kv = true;
+
+        const si::PlacementPlan plan = si::plan_model_placement(m, {make_rtx_5070_ti()}, host_ram(32, 24), req);
+        verify_plan_contracts(plan);
+
+        CHECK(plan.fits_in_vram);
+        CHECK(plan.profile.cache_type_k == std::optional<std::string>("f8_e4m3"));
+        CHECK(plan.profile.cache_type_v == std::optional<std::string>("f8_e4m3"));
+        CHECK(any_contains(plan.reasons, "MXFP4"));
+        CHECK(any_contains(plan.reasons, "NVFP4"));
+        CHECK(any_contains(plan.reasons, "F8_E4M3"));
+        CHECK(any_contains(plan.reasons, "Blackwell (sm_120)"));
+        CHECK_FALSE(any_contains(plan.warnings, "non-Blackwell"));
+    }
+
+    // 2. Non-Blackwell AMD GPU with NVFP4 weights and prefer_fp8_kv=true warns and falls back to q8_0/q8_0.
+    {
+        si::GgufModelInfo m = dense_model(32, 220, 8);
+        m.has_nvfp4_tensors = true;
+        m.has_fp4_or_fp8_tensors = true;
+
+        si::GpuDeviceInfo rx9070 = make_amd_discrete("gpu:0", "AMD Radeon RX 9070 XT", 16, 15360, "rocm");
+        rx9070.device_id = 0x7550u;
+
+        si::PlacementPlanRequest req;
+        req.profile_name = "amd-fp8kv-fallback";
+        req.model_path = "D:/models/model-nvfp4.gguf";
+        req.target_ctx_size = 32768;
+        req.prefer_fp8_kv = true;
+
+        const si::PlacementPlan plan = si::plan_model_placement(m, {rx9070}, host_ram(32, 24), req);
+        verify_plan_contracts(plan);
+
+        CHECK(plan.profile.cache_type_k == std::optional<std::string>("q8_0"));
+        CHECK(plan.profile.cache_type_v == std::optional<std::string>("q8_0"));
+        CHECK(any_contains(plan.warnings, "non-Blackwell"));
+        CHECK(any_contains(plan.warnings, "prefer_fp8_kv"));
+    }
+
+    // 3. Physical-core thread recommendation clamping for CPU-offloaded MoE decode.
+    {
+        const si::GgufModelInfo model = large_moe_model();
+        const std::vector<si::GpuDeviceInfo> gpus{make_rtx_5070_ti("gpu:0", 15872)};
+        struct ThreadCase {
+            std::uint32_t logical;
+            std::uint32_t physical;
+            std::uint32_t expected;
+        };
+        for (const ThreadCase c : {ThreadCase{24, 0, 12}, ThreadCase{8, 0, 4}, ThreadCase{6, 0, 4},
+                                   ThreadCase{2, 0, 2}, ThreadCase{24, 10, 10}}) {
+            CAPTURE(c.logical);
+            CAPTURE(c.physical);
+            si::PlacementPlanRequest req;
+            req.profile_name = "moe-threads";
+            req.model_path = "D:/models/qwen3-moe.gguf";
+            req.target_ctx_size = 32768;
+            req.cpu_logical_cores = c.logical;
+            req.cpu_physical_cores = c.physical;
+
+            const si::PlacementPlan plan = si::plan_model_placement(model, gpus, host_ram(32, 28), req);
+            verify_plan_contracts(plan);
+            CHECK(plan.recommended_threads == std::optional<std::uint32_t>(c.expected));
+            CHECK(plan.profile.threads == std::optional<std::int32_t>(static_cast<std::int32_t>(c.expected)));
+            CHECK(plan.repack_policy == "cpu_only_selective");
+        }
     }
 }

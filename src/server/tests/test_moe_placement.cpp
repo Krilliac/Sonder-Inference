@@ -749,3 +749,106 @@ TEST_CASE("serve wiring: a fit-path profile feeds the VRAM budget into the host 
         MESSAGE("a GPU is detected here: the no-budget lower-bound wiring runs on CI without one");
     }
 }
+
+TEST_CASE("moe placement parser reads and validates --moe-cache-mib and --moe-cache-cpu-share") {
+    const auto parsed = si::parse_moe_placement(
+        {"--n-cpu-moe", "6", "--moe-cache-mib", "4096", "--moe-cache-cpu-share", "0.35"});
+    REQUIRE_MESSAGE(parsed.ok(), parsed.status().message());
+    CHECK(parsed->moe_cache_mib == 4096u);
+    CHECK(parsed->moe_cache_cpu_share == doctest::Approx(0.35));
+
+    const auto eq_parsed =
+        si::parse_moe_placement({"--moe-cache-mib=0", "--moe-cache-cpu-share=1.0", "--moe_cache_mib=2048"});
+    REQUIRE_MESSAGE(eq_parsed.ok(), eq_parsed.status().message());
+    CHECK(eq_parsed->moe_cache_mib == 2048u);
+    CHECK(eq_parsed->moe_cache_cpu_share == doctest::Approx(1.0));
+
+    const auto zero_share = si::parse_moe_placement({"--moe-cache-cpu-share", "0.0"});
+    REQUIRE(zero_share.ok());
+    CHECK(zero_share->moe_cache_cpu_share == doctest::Approx(0.0));
+
+    for (const std::vector<std::string>& bad : std::vector<std::vector<std::string>>{
+             {"--moe-cache-mib"},
+             {"--moe-cache-mib", "-1"},
+             {"--moe-cache-mib", "0512"},
+             {"--moe-cache-mib", "262145"},
+             {"--moe-cache-mib", "abc"},
+             {"--moe-cache-cpu-share"},
+             {"--moe-cache-cpu-share", "-0.1"},
+             {"--moe-cache-cpu-share", "1.01"},
+             {"--moe-cache-cpu-share", "nan"},
+             {"--moe-cache-cpu-share", "inf"},
+             {"--moe-cache-cpu-share", "1e-1"},
+         }) {
+        CAPTURE(bad);
+        const auto res = si::parse_moe_placement(bad);
+        CHECK_FALSE(res.ok());
+        CHECK(res.status().code() == si::ErrorCode::invalid_argument);
+    }
+}
+
+TEST_CASE("estimate: moe_cache_mib adds VRAM for CPU-offloaded experts and warns when experts are already in VRAM") {
+    const auto m = moe_model();
+
+    // With --cpu-moe and typed moe_cache_mib=2048, VRAM increases by exactly 2048 MiB.
+    si::LaunchProfile base_p = profile({"--cpu-moe"}, -1);
+    const si::VramEstimate base = si::estimate_vram(m, base_p);
+    REQUIRE(base.host_expert_bytes > 0u);
+    CHECK(base.moe_cache_bytes == 0u);
+
+    si::LaunchProfile cached_p = base_p;
+    cached_p.moe_cache_mib = 2048u;
+    cached_p.moe_cache_cpu_share = 0.35;
+    const si::VramEstimate cached = si::estimate_vram(m, cached_p);
+    CHECK(cached.moe_cache_bytes == 2048ull * kMiB);
+    CHECK(cached.total_bytes == base.total_bytes + 2048ull * kMiB);
+
+    // Multi-GPU split includes moe_cache_bytes in the splittable shard calculation.
+    si::LaunchProfile split_p = cached_p;
+    split_p.split_mode = "layer";
+    split_p.tensor_split = {0.5, 0.5};
+    const si::VramEstimate split_base = [&] {
+        si::LaunchProfile p = base_p;
+        p.split_mode = "layer";
+        p.tensor_split = {0.5, 0.5};
+        return si::estimate_vram(m, p);
+    }();
+    const si::VramEstimate split_cached = si::estimate_vram(m, split_p);
+    CHECK(split_cached.moe_cache_bytes == 2048ull * kMiB);
+    CHECK(split_cached.max_gpu_bytes == split_base.max_gpu_bytes + 1024ull * kMiB);
+
+    // Anti-regression diagnostic: setting moe_cache_mib when 0 experts are on host adds a note.
+    si::LaunchProfile full_vram_p = profile({}, -1);
+    full_vram_p.moe_cache_mib = 1024u;
+    const si::VramEstimate wasted = si::estimate_vram(m, full_vram_p);
+    CHECK(wasted.host_expert_bytes == 0u);
+    CHECK(wasted.moe_cache_bytes == 1024ull * kMiB);
+    bool noted_overhead = false;
+    for (const auto& n : wasted.notes) {
+        if (contains(n, "graph-splitting overhead")) noted_overhead = true;
+    }
+    CHECK(noted_overhead);
+}
+
+TEST_CASE("gguf reader detects and sizes MXFP4 (4.25 bpw), NVFP4 (4.50 bpw), and OCP FP8 (1 B/elem) tensors") {
+    Gguf g;
+    g.kv_str("general.architecture", "llama");
+    g.kv_u32("llama.block_count", 1);
+    g.kv_u32("llama.embedding_length", 128);
+    g.tensor("blk.0.ffn_gate.weight", 64, 4, 39);  // MXFP4: 256 elems / 32 * 17 = 136 B (4.25 bpw)
+    g.tensor("blk.0.ffn_up.weight", 64, 4, 40);    // NVFP4: 256 elems / 64 * 36 = 144 B (4.50 bpw)
+    g.tensor("blk.0.ffn_down.weight", 64, 4, 43);  // F8_E4M3: 256 elems * 1 = 256 B (8.00 bpw)
+
+    const auto parsed = si::parse_gguf_model_info(g.finish(3, 3));
+    REQUIRE_MESSAGE(parsed.ok(), parsed.status().message());
+    const auto& info = parsed.value();
+    CHECK(info.has_mxfp4_tensors);
+    CHECK(info.has_nvfp4_tensors);
+    CHECK(info.has_fp8_tensors);
+    CHECK(info.has_fp4_or_fp8_tensors);
+    REQUIRE(info.tensors.size() == 3u);
+    CHECK(info.tensors[0].bytes == 136u);
+    CHECK(info.tensors[1].bytes == 144u);
+    CHECK(info.tensors[2].bytes == 256u);
+    CHECK(info.block_bytes[0] == 136u + 144u + 256u);
+}
