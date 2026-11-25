@@ -212,9 +212,10 @@ VramKvCapacityEstimate estimate_kv_blocks_for_vram_budget(
 bool FixedKvCapacity::try_reserve(RequestId id, BlockCount blocks) {
     if (blocks == 0) return true;
     if (blocks > total_ - used_) return false;
+    BlockCount& entry = held_[id];
+    entry += blocks;
     used_ += blocks;
     peak_ = std::max(peak_, used_);
-    held_[id] += blocks;
     return true;
 }
 

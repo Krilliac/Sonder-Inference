@@ -37,6 +37,10 @@ Server:
   --shutdown-grace-ms N   time in-flight requests get on shutdown (default 5000)
   --stream-keepalive-ms N SSE `: keep-alive` heartbeat interval during long
                           prefill waits in ms (0..600000, default 15000; 0 = off)
+  --disable-response-store  disable in-memory /v1/responses history storage
+                          (rejects previous_response_id chaining)
+  --response-history-ttl S  TTL in seconds for /v1/responses history entries
+                          (0..86400, default 3600; 0 disables storage)
   --ready-file PATH       write {"url","pid","instance_id","api_version"} once listening
                           (models may still be loading: poll /v1/sonder/health for
                           200); removed again when the server exits
@@ -149,6 +153,7 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"telemetry", Kind::value},              {"capture-text", Kind::flag},
         {"max-connections", Kind::value},        {"max-body-bytes", Kind::value},
         {"shutdown-grace-ms", Kind::value},      {"stream-keepalive-ms", Kind::value},
+        {"disable-response-store", Kind::flag},  {"response-history-ttl", Kind::value},
         {"ready-file", Kind::value},
         {"mock-delay-ms", Kind::value},          {"log-format", Kind::value},
         {"llamaserver-config", Kind::value},     {"llamaserver-url", Kind::value},
@@ -805,6 +810,13 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     if (auto v = a.get("stream-keepalive-ms")) {
         if (!parse_uint(*v, 600000, n)) return usage_error("--stream-keepalive-ms must be from 0 to 600000");
         o.stream_keepalive_interval = std::chrono::milliseconds(n);
+    }
+    o.disable_response_store = a.flags.count("disable-response-store") != 0;
+    if (auto v = a.get("response-history-ttl")) {
+        if (!parse_uint(*v, 24u * 3600u, n)) {
+            return usage_error("--response-history-ttl must be an integer from 0 to 86400");
+        }
+        o.response_history_ttl = std::chrono::seconds(n);
     }
     if (auto v = a.get("log-format")) {
         if (*v != "text" && *v != "json") return usage_error("--log-format must be text or json");

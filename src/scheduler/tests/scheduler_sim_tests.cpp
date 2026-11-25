@@ -220,3 +220,27 @@ TEST_CASE("early_stop_shortens_generation") {
         CHECK(t.generated_tokens <= 11u);
     }
 }
+
+TEST_CASE("swap_preemption_completes_all_requests_in_simulator") {
+    SchedulerConfig cfg;
+    cfg.enable_swap = true;
+    cfg.swap_min_tokens = 32;
+    cfg.admission_watermark_blocks = 0;
+    cfg.enable_priority_preemption = false;
+
+    Simulator sim(cfg, 4, 16);
+    std::vector<Arrival> arrivals = {
+        {0, spec(1, WorkloadClass::InteractiveUser, 32, 2)},
+        {0, spec(2, WorkloadClass::BackgroundIndexing, 32, 3)},
+    };
+    const auto r = sim.run(arrivals);
+    CHECK(!r.hit_step_limit);
+    CHECK_EQ(r.kv_overcommits, 0u);
+    CHECK_EQ(r.stats.preemptions_swap, 1u);
+    REQUIRE_EQ(r.timelines.size(), 2u);
+    for (const auto& t : r.timelines) {
+        CHECK(t.final_state == RequestState::Completed);
+    }
+    CHECK_EQ(r.timelines[0].generated_tokens, 2u);
+    CHECK_EQ(r.timelines[1].generated_tokens, 3u);
+}

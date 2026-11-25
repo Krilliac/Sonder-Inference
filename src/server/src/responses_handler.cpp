@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -14,7 +15,9 @@
 #include <utility>
 
 #include "json_schema_gbnf.hpp"
+#include "reasoning_budget.hpp"
 #include "request_path.hpp"
+#include "sha256.hpp"
 #include "test_hooks.hpp"
 #include "tool_call_parser.hpp"
 
@@ -33,7 +36,8 @@ std::string sse_named_event(std::string_view event, const json::Object& payload)
 }
 
 json::Array build_output_items(const std::string& resp_id, const std::string& reasoning,
-                               const std::string& visible_text, const std::vector<ToolCall>& tool_calls) {
+                               const std::string& visible_text, const std::vector<ToolCall>& tool_calls,
+                               const GenerationResult* result, bool include_logprobs) {
     json::Array output;
     if (!reasoning.empty()) {
         output.emplace_back(json::Object{
@@ -43,14 +47,23 @@ json::Array build_output_items(const std::string& resp_id, const std::string& re
             {"summary", json::Array{json::Object{{"type", "summary_text"}, {"text", reasoning}}}}});
     }
     if (!visible_text.empty() || tool_calls.empty()) {
+        json::Object text_part{{"type", "output_text"},
+                               {"text", visible_text},
+                               {"annotations", json::Array{}}};
+        if (include_logprobs && result != nullptr) {
+            json::Array lp_arr;
+            lp_arr.reserve(result->logprobs.size());
+            for (const auto& lp : result->logprobs) {
+                lp_arr.emplace_back(chat_token_logprob_json(lp));
+            }
+            text_part.set("logprobs", std::move(lp_arr));
+        }
         output.emplace_back(json::Object{
             {"id", "msg_" + resp_id},
             {"type", "message"},
             {"status", "completed"},
             {"role", "assistant"},
-            {"content", json::Array{json::Object{{"type", "output_text"},
-                                                 {"text", visible_text},
-                                                 {"annotations", json::Array{}}}}}});
+            {"content", json::Array{std::move(text_part)}}});
     }
     for (std::size_t i = 0; i < tool_calls.size(); ++i) {
         const auto& tc = tool_calls[i];
@@ -69,7 +82,7 @@ json::Object build_response_object(const std::string& resp_id, std::int64_t crea
                                    const std::string& model, const std::optional<std::string>& prev_id,
                                    const std::string& reasoning, const std::string& visible_text,
                                    const std::vector<ToolCall>& tool_calls, const GenerationResult* result,
-                                   json::Object sonder_meta) {
+                                   bool include_logprobs, json::Object sonder_meta) {
     const std::uint64_t input_tokens = result ? result->stats.prompt_tokens : 0u;
     const std::uint64_t output_tokens = result ? result->stats.completion_tokens : 0u;
     json::Object usage{{"input_tokens", input_tokens},
@@ -78,6 +91,21 @@ json::Object build_response_object(const std::string& resp_id, std::int64_t crea
     if (result && result->stats.cached_tokens) {
         usage.set("input_tokens_details", json::Object{{"cached_tokens", *result->stats.cached_tokens}});
     }
+    if (result && result->stats.backend_timings) {
+        const auto& t = *result->stats.backend_timings;
+        json::Object upstream;
+        if (t.prompt_n) upstream.set("prompt_n", *t.prompt_n);
+        if (t.cache_n) upstream.set("cache_n", *t.cache_n);
+        if (t.prompt_ms) upstream.set("prompt_ms", *t.prompt_ms);
+        if (t.predicted_n) upstream.set("predicted_n", *t.predicted_n);
+        if (t.predicted_ms) upstream.set("predicted_ms", *t.predicted_ms);
+        if (t.draft_n) upstream.set("draft_n", *t.draft_n);
+        if (t.draft_n_accepted) upstream.set("draft_n_accepted", *t.draft_n_accepted);
+        usage.set("sonder", json::Object{{"timings", std::move(upstream)}});
+        if (!result->stats.cached_tokens && t.cache_n) {
+            usage.set("input_tokens_details", json::Object{{"cached_tokens", *t.cache_n}});
+        }
+    }
     json::Object obj{
         {"id", resp_id},
         {"object", "response"},
@@ -85,11 +113,15 @@ json::Object build_response_object(const std::string& resp_id, std::int64_t crea
         {"status", status},
         {"model", model},
         {"previous_response_id", prev_id},
-        {"output", status == "in_progress" ? json::Array{}
-                                           : build_output_items(resp_id, reasoning, visible_text, tool_calls)},
+        {"output", status == "in_progress"
+                       ? json::Array{}
+                       : build_output_items(resp_id, reasoning, visible_text, tool_calls, result, include_logprobs)},
         {"output_text", visible_text},
         {"usage", std::move(usage)},
         {"sonder", std::move(sonder_meta)}};
+    if (result != nullptr) {
+        obj.set("timings", timings_json(*result));
+    }
     return obj;
 }
 
@@ -153,7 +185,7 @@ std::optional<ApiError> read_text_format(const json::Object& body, ResponsesJob&
 }  // namespace
 
 std::size_t ResponseHistoryStore::estimate_entry_bytes(const Entry& e) noexcept {
-    std::size_t total = e.id.size() + e.session_key.size() + e.model.size() + 64;
+    std::size_t total = e.id.size() + e.session_key.size() + e.model.size() + e.caller_scope.size() + 64;
     for (const auto& m : e.messages) {
         total += m.role.size() + m.content.size() + 32;
         if (m.reasoning_content) total += m.reasoning_content->size();
@@ -169,6 +201,10 @@ std::size_t ResponseHistoryStore::estimate_entry_bytes(const Entry& e) noexcept 
     return total;
 }
 
+ResponseHistoryStore::TimePoint ResponseHistoryStore::now() const {
+    return clock_ ? clock_() : std::chrono::steady_clock::now();
+}
+
 void ResponseHistoryStore::evict_back_locked() noexcept {
     if (lru_.empty()) return;
     const std::size_t b = lru_.back().approx_bytes;
@@ -177,13 +213,39 @@ void ResponseHistoryStore::evict_back_locked() noexcept {
     lru_.pop_back();
 }
 
-ResponseHistoryStore::ResponseHistoryStore(std::size_t capacity, std::size_t max_bytes)
-    : capacity_(std::max<std::size_t>(1, capacity)), max_bytes_(std::max<std::size_t>(4096, max_bytes)) {}
+void ResponseHistoryStore::prune_expired_locked(TimePoint current) noexcept {
+    for (auto it = lru_.begin(); it != lru_.end();) {
+        if (current >= it->expires_at) {
+            const std::size_t b = it->approx_bytes;
+            used_bytes_ = used_bytes_ >= b ? (used_bytes_ - b) : 0;
+            index_.erase(it->id);
+            it = lru_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
 
-std::optional<ResponseHistoryStore::Entry> ResponseHistoryStore::get(const std::string& id) {
+ResponseHistoryStore::ResponseHistoryStore(std::size_t capacity, std::size_t max_bytes,
+                                           std::chrono::milliseconds ttl, ClockFn clock)
+    : capacity_(std::max<std::size_t>(1, capacity)),
+      max_bytes_(std::max<std::size_t>(4096, max_bytes)),
+      ttl_(ttl.count() <= 0 ? std::chrono::milliseconds(0) : std::min(ttl, kMaxTtl)),
+      clock_(std::move(clock)) {}
+
+std::optional<ResponseHistoryStore::Entry> ResponseHistoryStore::get(const std::string& id,
+                                                                     std::string_view caller_scope) {
+    if (ttl_.count() <= 0) {
+        return std::nullopt;
+    }
+    const TimePoint current = now();
     std::lock_guard<std::mutex> lock(mu_);
+    prune_expired_locked(current);
     auto it = index_.find(id);
     if (it == index_.end()) {
+        return std::nullopt;
+    }
+    if (!constant_time_equals(it->second->caller_scope, caller_scope)) {
         return std::nullopt;
     }
     lru_.splice(lru_.begin(), lru_, it->second);
@@ -191,6 +253,9 @@ std::optional<ResponseHistoryStore::Entry> ResponseHistoryStore::get(const std::
 }
 
 void ResponseHistoryStore::put(Entry entry) {
+    if (ttl_.count() <= 0) {
+        return;
+    }
     // Strip raw binary media blobs from retained history to prevent O(N^2) RAM
     // amplification across chained previous_response_id turns.
     for (auto& m : entry.messages) {
@@ -204,9 +269,15 @@ void ResponseHistoryStore::put(Entry entry) {
     if (entry.approx_bytes > kMaxEntryBytes || entry.approx_bytes > max_bytes_) {
         return;
     }
+    const TimePoint current = now();
+    entry.expires_at = current + ttl_;
     std::lock_guard<std::mutex> lock(mu_);
+    prune_expired_locked(current);
     auto it = index_.find(entry.id);
     if (it != index_.end()) {
+        if (!constant_time_equals(it->second->caller_scope, entry.caller_scope)) {
+            return;
+        }
         const auto list_it = it->second;
         const std::size_t old_b = list_it->approx_bytes;
         used_bytes_ = used_bytes_ >= old_b ? (used_bytes_ - old_b) : 0;
@@ -223,8 +294,55 @@ void ResponseHistoryStore::put(Entry entry) {
 }
 
 std::size_t ResponseHistoryStore::size() const {
+    if (ttl_.count() <= 0) {
+        return 0u;
+    }
+    const TimePoint current = now();
     std::lock_guard<std::mutex> lock(mu_);
-    return lru_.size();
+    std::size_t count = 0;
+    for (const auto& entry : lru_) {
+        if (current < entry.expires_at) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+std::string derive_responses_caller_scope(const RequestHead& head, const Correlation& corr) {
+    std::string auth_token;
+    if (const std::string* auth = head.header("authorization"); auth != nullptr && !auth->empty()) {
+        if (auth->size() >= 7) {
+            std::string scheme = auth->substr(0, 7);
+            std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (scheme == "bearer ") {
+                auth_token = "bearer:" + auth->substr(7);
+            } else {
+                auth_token = "auth:" + *auth;
+            }
+        } else {
+            auth_token = "auth:" + *auth;
+        }
+    } else if (const std::string* key = head.header("x-api-key"); key != nullptr && !key->empty()) {
+        auth_token = "apikey:" + *key;
+    }
+    const std::string_view run_id = corr.run_id ? std::string_view(*corr.run_id) : std::string_view{};
+    const std::string_view agent_id = corr.agent_id ? std::string_view(*corr.agent_id) : std::string_view{};
+    std::string canonical;
+    canonical.reserve(auth_token.size() + run_id.size() + agent_id.size() + 48);
+    canonical += "a=";
+    canonical += std::to_string(auth_token.size());
+    canonical.push_back(':');
+    canonical += auth_token;
+    canonical += ";r=";
+    canonical += std::to_string(run_id.size());
+    canonical.push_back(':');
+    canonical += run_id;
+    canonical += ";g=";
+    canonical += std::to_string(agent_id.size());
+    canonical.push_back(':');
+    canonical += agent_id;
+    return sha256_hex(canonical);
 }
 
 std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view body_text) {
@@ -464,6 +582,19 @@ std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view bo
         }
     }
 
+    {
+        ChatJob budget_stub;
+        if (auto e = reasoning_budget::parse_body(body, budget_stub)) {
+            return *e;
+        }
+        if (budget_stub.reasoning_budget_tokens) {
+            job.reasoning_budget_tokens.emplace(*budget_stub.reasoning_budget_tokens);
+        }
+        if (budget_stub.reasoning_budget_message) {
+            job.reasoning_budget_message.emplace(std::move(*budget_stub.reasoning_budget_message));
+        }
+    }
+
     if (const json::Value* p = body.find("priority"); present(p)) {
         if (!p->is_string() || !parse_request_priority(p->as_string())) {
             return bad("invalid_request", "priority must be interactive, subagent or background", "priority");
@@ -480,6 +611,21 @@ std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view bo
     job.sampling = SamplingConfig{};
     job.sampling.max_tokens = kDefaultMaxTokens;
     job.sampling.explicit_only = true;
+    if (const json::Value* inc = body.find("include"); present(inc)) {
+        if (!inc->is_array()) {
+            return bad("invalid_request", "include must be an array of strings", "include");
+        }
+        const auto& items = inc->as_array();
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            if (!items[i].is_string()) {
+                return bad("invalid_request", "include[" + std::to_string(i) + "] must be a string", "include");
+            }
+            if (items[i].as_string() == "message.output_text.logprobs") {
+                job.sampling.logprobs = true;
+                job.sampling.explicit_fields |= SamplingConfig::kLogprobs;
+            }
+        }
+    }
     if (const json::Value* t = body.find("temperature"); present(t)) {
         if (!t->is_number() || !std::isfinite(t->as_double()) || std::fabs(t->as_double()) > 1e6) {
             return bad("invalid_sampling", "temperature must be a finite number", "temperature");
@@ -510,6 +656,38 @@ std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view bo
         job.sampling.seed = seed->as_uint();
         job.sampling.explicit_fields |= SamplingConfig::kSeed;
     }
+    if (const json::Value* lp = body.find("logprobs"); present(lp)) {
+        if (!lp->is_bool()) {
+            return bad("invalid_sampling", "logprobs must be a boolean", "logprobs");
+        }
+        job.sampling.logprobs = lp->as_bool();
+        if (job.sampling.logprobs) {
+            job.sampling.explicit_fields |= SamplingConfig::kLogprobs;
+        } else {
+            job.sampling.explicit_fields &= ~SamplingConfig::kLogprobs;
+        }
+    }
+    if (const json::Value* tlp = body.find("top_logprobs"); present(tlp)) {
+        if (!tlp->is_integer()) {
+            return bad("invalid_sampling",
+                       "top_logprobs must be an integer between 0 and " +
+                           std::to_string(SamplingConfig::kMaxTopLogprobs),
+                       "top_logprobs");
+        }
+        const auto exact = tlp->try_as_int();
+        if (!exact || *exact < 0 || *exact > SamplingConfig::kMaxTopLogprobs) {
+            return bad("invalid_sampling",
+                       "top_logprobs must be between 0 and " + std::to_string(SamplingConfig::kMaxTopLogprobs),
+                       "top_logprobs");
+        }
+        if (!job.sampling.logprobs) {
+            return bad("invalid_sampling",
+                       "top_logprobs requires logprobs to be true or include: [\"message.output_text.logprobs\"]",
+                       "top_logprobs");
+        }
+        job.sampling.top_logprobs = static_cast<std::int32_t>(*exact);
+        job.sampling.explicit_fields |= SamplingConfig::kTopLogprobs;
+    }
     if (Status st = validate(job.sampling); !st.ok()) {
         return bad("invalid_sampling", st.message());
     }
@@ -518,12 +696,22 @@ std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view bo
 
 void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlation& corr, const std::string& model,
                        const std::string& backend, const std::shared_ptr<Session>& session,
-                       ResponseHistoryStore& history, bool backend_native_tools, bool backend_supports_multimodal) {
+                       ResponseHistoryStore& history, bool backend_native_tools, bool backend_supports_multimodal,
+                       std::string_view caller_scope) {
+    const bool store_enabled =
+        !ex.options.disable_response_store && ex.options.response_history_ttl.count() > 0 && history.ttl().count() > 0;
     // 1. Assemble conversation history from optional previous_response_id.
     std::vector<ChatMessage> conversation;
     std::string inherited_session_key;
     if (job.previous_response_id) {
-        auto prev = history.get(*job.previous_response_id);
+        if (!store_enabled) {
+            ex.leave_inflight();
+            session->close();
+            ex.send_error(make_error(400, "unsupported_parameter",
+                                     "response history store is disabled on this server", "previous_response_id"));
+            return;
+        }
+        auto prev = history.get(*job.previous_response_id, caller_scope);
         if (!prev) {
             ex.leave_inflight();
             session->close();
@@ -631,6 +819,16 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     ro.preserve_numeric_priority = corr.numeric_priority;
     if (deadline_ms) ro.deadline = deadline;
     std::vector<std::string> warnings = apply_thinking_pins(ex.options, ro.thinking);
+    {
+        ChatJob budget_job;
+        if (job.reasoning_budget_tokens) {
+            budget_job.reasoning_budget_tokens.emplace(*job.reasoning_budget_tokens);
+        }
+        if (job.reasoning_budget_message) {
+            budget_job.reasoning_budget_message.emplace(*job.reasoning_budget_message);
+        }
+        reasoning_budget::apply(budget_job, corr, ex.options, backend, ro, warnings);
+    }
 
     ex.request_id = *ro.request_id;
     const std::int64_t created_at = static_cast<std::int64_t>(std::time(nullptr));
@@ -688,7 +886,13 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
                 }
                 const auto now = std::chrono::steady_clock::now();
                 if (now >= deadline) {
-                    session->cancel();
+                    // Only cancel via the watcher once the backend has started; pre-start
+                    // queue/scheduler waits enforce ro.deadline directly so queued deadline
+                    // expirations report ErrorCode::timeout (request.failed) instead of
+                    // racing into request.cancelled.
+                    if (backend_started.load()) {
+                        session->cancel();
+                    }
                 } else if (job.stream && !disconnected.load() && !ex.hard_stop.load() &&
                            !sse.maybe_send_keepalive()) {
                     disconnected.store(true);
@@ -715,6 +919,19 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
             return disconnected.load() || session->state() == SessionState::closed || ex.hard_stop.load();
         }, deadline);
         if (ticket->outcome() != PriorityAdmission::Outcome::admitted) {
+            json::Object attrs{{"kind", "chat"},
+                               {"priority_class", to_string(priority)},
+                               {"admission", json::Object{{"priority", to_string(priority)},
+                                                          {"queue_ms", ticket->queue_ms()}}},
+                               {"error_code", ticket->outcome() == PriorityAdmission::Outcome::full
+                                                  ? "overloaded"
+                                                  : ticket->outcome() == PriorityAdmission::Outcome::expired
+                                                  ? "deadline_exceeded"
+                                                  : "cancelled"},
+                               {"backend_started", false}};
+            if (ro.parent_request_id) attrs.set("parent_request_id", *ro.parent_request_id);
+            ex.telemetry.emit(disconnected.load() ? "request.cancelled" : "request.failed",
+                              session->telemetry_context(ro.request_id), std::move(attrs), TelemetryLevel::metrics);
             end_request();
             if (disconnected.load()) {
                 ex.status = 499;
@@ -757,23 +974,29 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
         return sse.ensure_started([&]() -> std::string {
             json::Object created_resp =
                 build_response_object(response_id, created_at, "in_progress", model, job.previous_response_id, "", "",
-                                      {}, nullptr, make_meta(nullptr));
+                                      {}, nullptr, job.sampling.logprobs, make_meta(nullptr));
             return sse_named_event(
                 "response.created",
                 json::Object{{"type", "response.created"}, {"response", std::move(created_resp)}});
         });
     };
 
-    const auto emit_text_delta = [&](std::string_view delta) -> bool {
+    const auto emit_text_delta = [&](std::string_view delta, const TokenLogprob* token_lp = nullptr) -> bool {
         if (delta.empty()) return true;
         streamed_visible_text.append(delta.data(), delta.size());
-        return ensure_stream_head() &&
-               send_frame(sse_named_event("response.output_text.delta",
-                                          json::Object{{"type", "response.output_text.delta"},
-                                                       {"item_id", "msg_" + response_id},
-                                                       {"output_index", 0},
-                                                       {"content_index", 0},
-                                                       {"delta", std::string(delta)}}));
+        json::Object payload{{"type", "response.output_text.delta"},
+                             {"item_id", "msg_" + response_id},
+                             {"output_index", 0},
+                             {"content_index", 0},
+                             {"delta", std::string(delta)}};
+        if (job.sampling.logprobs) {
+            json::Array lp_arr;
+            if (token_lp != nullptr) {
+                lp_arr.emplace_back(chat_token_logprob_json(*token_lp));
+            }
+            payload.set("logprobs", std::move(lp_arr));
+        }
+        return ensure_stream_head() && send_frame(sse_named_event("response.output_text.delta", payload));
     };
     const auto emit_fn_delta = [&](std::uint32_t idx, const std::string& call_id, const std::string& name,
                                    std::string_view args_delta) -> bool {
@@ -812,9 +1035,17 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
             if (!chunk.text.empty()) {
                 if (parse_text_tools) {
                     const ToolCallStreamOutput out = stream_parser.feed(chunk.text);
-                    if (!emit_text_delta(out.visible_text)) {
-                        session->cancel();
-                        return false;
+                    if (!out.visible_text.empty()) {
+                        TokenLogprob lp;
+                        const TokenLogprob* lp_ptr = nullptr;
+                        if (job.sampling.logprobs && chunk.logprob.has_value()) {
+                            lp = TokenLogprob{out.visible_text, *chunk.logprob, chunk.top_logprobs};
+                            lp_ptr = &lp;
+                        }
+                        if (!emit_text_delta(out.visible_text, lp_ptr)) {
+                            session->cancel();
+                            return false;
+                        }
                     }
                     for (const auto& ev : out.tool_calls) {
                         streamed_tool_calls.push_back(ToolCall{ev.id, ev.name, ev.arguments_json});
@@ -824,7 +1055,13 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
                         }
                     }
                 } else {
-                    if (!emit_text_delta(chunk.text)) {
+                    TokenLogprob lp;
+                    const TokenLogprob* lp_ptr = nullptr;
+                    if (job.sampling.logprobs && chunk.logprob.has_value()) {
+                        lp = TokenLogprob{std::string(chunk.text), *chunk.logprob, chunk.top_logprobs};
+                        lp_ptr = &lp;
+                    }
+                    if (!emit_text_delta(chunk.text, lp_ptr)) {
                         session->cancel();
                         return false;
                     }
@@ -897,11 +1134,16 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
         final_visible = r.text;
     }
 
-    if (job.store && r.outcome == RequestOutcome::completed) {
+    if (final_visible.empty() && final_calls.empty() && r.stats.stop_reason == StopReason::max_tokens) {
+        warnings.emplace_back("empty_content_at_length");
+    }
+
+    if (store_enabled && job.store && r.outcome == RequestOutcome::completed) {
         ResponseHistoryStore::Entry entry;
         entry.id = response_id;
         entry.session_key = ro.session_key;
         entry.model = model;
+        entry.caller_scope = std::string(caller_scope);
         entry.messages = clean_history;
         ChatMessage assistant_turn;
         assistant_turn.role = "assistant";
@@ -915,7 +1157,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     const std::string status_str = r.outcome == RequestOutcome::cancelled ? "incomplete" : "completed";
     json::Object completed_resp =
         build_response_object(response_id, created_at, status_str, model, job.previous_response_id, r.reasoning,
-                              final_visible, final_calls, &r, make_meta(&r));
+                              final_visible, final_calls, &r, job.sampling.logprobs, make_meta(&r));
     session->close();
 
     if (!job.stream) {

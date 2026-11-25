@@ -620,6 +620,9 @@ Status validate_options(const ServerOptions& o) {
     if (o.stream_keepalive_interval.count() < 0) {
         return Status(ErrorCode::invalid_argument, "--stream-keepalive-ms must not be negative");
     }
+    if (o.response_history_ttl.count() < 0) {
+        return Status(ErrorCode::invalid_argument, "--response-history-ttl must not be negative");
+    }
     for (const auto& origin : o.cors_origins) {
         if (!detail::is_serialized_origin(origin)) {
             return Status(ErrorCode::invalid_argument,

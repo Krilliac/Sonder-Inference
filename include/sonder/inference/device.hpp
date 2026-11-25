@@ -199,6 +199,54 @@ std::optional<std::uint64_t> select_gpu_vram_budget_mib(const std::vector<GpuDev
                                                         std::string_view device_hint = {},
                                                         bool prefer_free = false) noexcept;
 
+// Matches a single device-hint token ("CUDA0", "ROCm0", "rocm:0", "HIP0",
+// "Vulkan1", "gpu:0", "uma", "igpu", "apu", "nvidia", "amd", "intel", "apple",
+// numeric index, or exact GPU id) against `gpus`.
+std::optional<std::size_t> match_single_gpu_hint(const std::vector<GpuDeviceInfo>& gpus,
+                                                 std::string_view token,
+                                                 bool prefer_free = false,
+                                                 bool require_known_vram = false) noexcept;
+
+// Classification of the selected GPU pool for UMA-aware spill and residency guards.
+enum class UmaSelectionMode {
+    discrete_only,  // No integrated UMA GPU selected (pure discrete or no GPU)
+    uma_only,       // Every selected GPU is integrated UMA (pure APU / iGPU)
+    hybrid          // Mixed discrete + integrated UMA pool (e.g. Vulkan0,Vulkan1)
+};
+
+// Normalizes a UMA mode string ("on"/"true" -> "on", "off"/"false" -> "off",
+// "auto" -> "auto"), returning nullopt for any other string.
+std::optional<std::string_view> normalize_uma_mode(std::string_view mode) noexcept;
+
+// True when `mode` is one of "on", "off", "auto", "true", "false".
+bool is_valid_uma_mode(std::string_view mode) noexcept;
+
+// Extracts the last --device / -dev argument value from `args`, or empty view.
+std::string_view extract_device_hint(const std::vector<std::string>& args) noexcept;
+
+// Pure UMA pool classifier:
+//  - "on" / "true"   -> UmaSelectionMode::uma_only
+//  - "off" / "false" -> UmaSelectionMode::discrete_only
+//  - "auto"          ->
+//      * Empty `device_hint`: `uma_only` when `gpus` is non-empty and every
+//        discovered GPU is integrated UMA; otherwise `discrete_only` (discrete
+//        GPUs win when unhinted).
+//      * Non-empty `device_hint`: parses comma-separated device tokens. Any
+//        unmatched token fails closed to `discrete_only`. Otherwise returns
+//        `uma_only` when all selected GPUs are integrated UMA, `hybrid` when
+//        both discrete and integrated UMA GPUs are selected (e.g.
+//        "Vulkan0,Vulkan1"), and `discrete_only` when only discrete GPUs are
+//        selected.
+UmaSelectionMode resolve_uma_selection(std::string_view mode_or_auto,
+                                       const std::vector<GpuDeviceInfo>& gpus,
+                                       std::string_view device_hint = {}) noexcept;
+
+// Pure UMA mode resolver: true when resolve_uma_selection(...) != discrete_only
+// (pure integrated UMA or hybrid discrete+iGPU pool).
+bool resolve_uma_mode(std::string_view mode_or_auto,
+                      const std::vector<GpuDeviceInfo>& gpus,
+                      std::string_view device_hint = {}) noexcept;
+
 // Summary of discrete, integrated UMA, and combined GPU VRAM pools on a host,
 // including hybrid discrete + integrated UMA Vulkan spread eligibility (e.g.
 // discrete RX 9060 XT + integrated Radeon 780M addressed jointly via

@@ -14,46 +14,11 @@
 
 namespace sonder::inference::llamaserver {
 
-// True when `mode` is one of "on", "off", "auto", "true", "false".
-bool is_valid_uma_mode(std::string_view mode) noexcept;
-
-// Extracts the last --device / -dev argument value from `args`, or empty view.
-std::string_view extract_device_hint(const std::vector<std::string> &args) noexcept;
-
-// Classification of the selected GPU pool for UMA-aware spill and residency guards.
-enum class UmaSelectionMode {
-    discrete_only,  // No integrated UMA GPU selected (pure discrete or no GPU)
-    uma_only,       // Every selected GPU is integrated UMA (pure APU / iGPU)
-    hybrid          // Mixed discrete + integrated UMA pool (e.g. Vulkan0,Vulkan1)
-};
-
-// Pure UMA pool classifier:
-//  - "on" / "true"   -> UmaSelectionMode::uma_only
-//  - "off" / "false" -> UmaSelectionMode::discrete_only
-//  - "auto"          ->
-//      * Empty `device_hint`: `uma_only` when `gpus` is non-empty and every
-//        discovered GPU is integrated UMA; otherwise `discrete_only` (discrete
-//        GPUs win when unhinted).
-//      * Non-empty `device_hint`: parses comma-separated device tokens. Any
-//        unmatched token fails closed to `discrete_only`. Otherwise returns
-//        `uma_only` when all selected GPUs are integrated UMA, `hybrid` when
-//        both discrete and integrated UMA GPUs are selected (e.g.
-//        "Vulkan0,Vulkan1"), and `discrete_only` when only discrete GPUs are
-//        selected.
-UmaSelectionMode resolve_uma_selection(std::string_view mode_or_auto,
-                                       const std::vector<GpuDeviceInfo> &gpus,
-                                       std::string_view device_hint = {}) noexcept;
-
-// Pure UMA mode resolver:
-//  - "on" / "true"   -> true
-//  - "off" / "false" -> false
-//  - "auto"          -> true when the selected GPU(s) include at least one
-//                       integrated UMA GPU (pure UMA or hybrid discrete+iGPU
-//                       pool), honoring `device_hint` or preferring discrete
-//                       over integrated UMA when unset.
-bool resolve_uma_mode(std::string_view mode_or_auto,
-                      const std::vector<GpuDeviceInfo> &gpus,
-                      std::string_view device_hint = {}) noexcept;
+using sonder::inference::extract_device_hint;
+using sonder::inference::is_valid_uma_mode;
+using sonder::inference::resolve_uma_mode;
+using sonder::inference::resolve_uma_selection;
+using sonder::inference::UmaSelectionMode;
 
 // Parse a JSON boolean (true/false) or string ("auto", "on", "off", "true",
 // "false") into the canonical UMA mode setting ("on", "off", or "auto").

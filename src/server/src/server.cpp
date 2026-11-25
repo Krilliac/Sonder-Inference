@@ -39,7 +39,9 @@ using namespace detail;  // NOLINT(google-build-using-namespace)
 struct Server::Impl {
     explicit Impl(ServerOptions o)
         : opts(std::move(o)),
-          log_queue(opts.log, opts.log_queue_capacity, log_drop_reporter(opts.log_format == LogFormat::json)) {
+          log_queue(opts.log, opts.log_queue_capacity, log_drop_reporter(opts.log_format == LogFormat::json)),
+          response_history(ResponseHistoryStore::kMaxEntries, ResponseHistoryStore::kMaxTotalBytes,
+                           opts.disable_response_store ? std::chrono::milliseconds(0) : opts.response_history_ttl) {
         if (!opts.token.empty()) {
             token_digest = sha256_digest(opts.token);
             has_token_digest = true;
@@ -534,6 +536,11 @@ struct Server::Impl {
                                        "text.format"));
             return;
         }
+        if (job.sampling.logprobs && !backend_has_capability(Capability::logprobs)) {
+            write_error(ex, make_error(400, "unsupported_parameter",
+                                       "backend '" + pin.backend() + "' does not support logprobs", "logprobs"));
+            return;
+        }
         const bool has_media = std::any_of(job.input_messages.begin(), job.input_messages.end(),
                                            [](const ChatMessage& m) { return !m.media.empty(); });
         if (has_media && !backend_has_capability(Capability::multimodal)) {
@@ -610,9 +617,10 @@ struct Server::Impl {
             [&](int status, const json::Object& doc) { write_json(ex, status, doc); },
             [&](const ApiError& error) { write_error(ex, error); },
             [&] { log_message("warning", "cannot start a request thread; responses request refused (503)"); }};
+        const std::string caller_scope = derive_responses_caller_scope(head, corr);
         execute_responses(exchange, job, corr, pin.id(), pin.backend(), session, response_history,
                           backend_has_capability(Capability::tool_calling),
-                          backend_has_capability(Capability::multimodal));
+                          backend_has_capability(Capability::multimodal), caller_scope);
     }
 
     void handle_completions(Exchange& ex, const RequestHead& head, const std::string& body) {

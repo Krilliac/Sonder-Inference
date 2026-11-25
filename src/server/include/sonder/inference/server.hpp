@@ -174,6 +174,13 @@ struct ServerOptions {
     // A nonzero override applies only when priority admission is enabled.
     std::size_t backend_capacity = 0;
     PriorityAdmissionPolicy priority_admission = PriorityAdmissionPolicy::automatic;
+
+    // Stateful /v1/responses previous_response_id history store controls.
+    // When disable_response_store is true (or response_history_ttl is 0),
+    // /v1/responses does not retain turns in memory and rejects
+    // previous_response_id chaining.
+    bool disable_response_store = false;
+    std::chrono::milliseconds response_history_ttl{std::chrono::hours(1)};
 };
 
 // Checks option combinations that the server refuses to start with

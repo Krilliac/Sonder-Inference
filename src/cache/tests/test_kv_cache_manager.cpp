@@ -1,6 +1,7 @@
 #include "sonder/inference/cache/kv_cache_manager.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <ostream>  // doctest stringifies std::string_view; MSVC needs the full definition
@@ -644,4 +645,33 @@ TEST_CASE("stress: randomized ops keep invariants and contents") {
         CHECK(m.stats().pinned_blocks == 0);
         CHECK(m.validate());
     }
+}
+
+TEST_CASE("overflow: blocks_for_tokens and can_append resist size_t wraparound") {
+    KvCacheManager m(cfg(8, 16));
+    REQUIRE(m.add_sequence(1, {kFp, 0}).ok());
+    constexpr std::size_t kMaxSz = std::numeric_limits<std::size_t>::max();
+    CHECK(m.blocks_for_tokens(kMaxSz) > 8u);
+    CHECK(m.blocks_needed(1, kMaxSz) > m.available_blocks());
+    CHECK_FALSE(m.can_append(1, kMaxSz));
+
+    REQUIRE(m.append_tokens(1, toks(0, 3)).ok());
+    CHECK(m.blocks_needed(1, kMaxSz) > m.available_blocks());
+    CHECK_FALSE(m.can_append(1, kMaxSz));
+    CHECK(m.validate());
+}
+
+TEST_CASE("overflow: stats byte gauges saturate instead of wrapping") {
+    auto c = cfg(4, 4);
+    c.bytes_per_token = std::numeric_limits<std::uint64_t>::max() / 2;
+    KvCacheManager m(c);
+    REQUIRE(m.add_sequence(1, {kFp, 0}).ok());
+    REQUIRE(m.append_tokens(1, toks(0, 8)).ok());
+    const auto s = m.stats();
+    CHECK_EQ(s.bytes_per_block, std::numeric_limits<std::uint64_t>::max());
+    CHECK_EQ(s.pinned_bytes, std::numeric_limits<std::uint64_t>::max());
+    REQUIRE(m.free_sequence(1).ok());
+    const auto s2 = m.stats();
+    CHECK_EQ(s2.cached_bytes, std::numeric_limits<std::uint64_t>::max());
+    CHECK(m.validate());
 }
