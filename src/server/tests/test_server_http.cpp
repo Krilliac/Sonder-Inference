@@ -1008,6 +1008,29 @@ TEST_CASE("node: capability inventory returns schema, hardware, backends, models
         REQUIRE(gpus != nullptr);
         CHECK(gpus->is_array());
 
+        const json::Value* combined_vram = doc.find("combined_gpu_vram_mib");
+        REQUIRE(combined_vram != nullptr);
+        CHECK(combined_vram->is_integer());
+
+        const json::Value* gpu_pool = doc.find("gpu_pool");
+        REQUIRE(gpu_pool != nullptr);
+        REQUIRE(gpu_pool->is_object());
+        REQUIRE(gpu_pool->find("discrete_vram_mib") != nullptr);
+        REQUIRE(gpu_pool->find("integrated_uma_vram_mib") != nullptr);
+        REQUIRE(gpu_pool->find("combined_gpu_vram_mib") != nullptr);
+        REQUIRE(gpu_pool->find("discrete_free_vram_mib") != nullptr);
+        REQUIRE(gpu_pool->find("integrated_uma_free_vram_mib") != nullptr);
+        REQUIRE(gpu_pool->find("combined_free_gpu_vram_mib") != nullptr);
+        REQUIRE(gpu_pool->find("discrete_gpu_count") != nullptr);
+        REQUIRE(gpu_pool->find("integrated_uma_gpu_count") != nullptr);
+        REQUIRE(gpu_pool->find("hybrid_vulkan_pool_available") != nullptr);
+        REQUIRE(gpu_pool->find("recommended_devices") != nullptr);
+        REQUIRE(gpu_pool->find("llama_arg_device") != nullptr);
+        CHECK(gpu_pool->find("combined_gpu_vram_mib")->as_uint() == combined_vram->as_uint());
+        CHECK(gpu_pool->find("hybrid_vulkan_pool_available")->is_bool());
+        CHECK(gpu_pool->find("recommended_devices")->is_array());
+        CHECK((gpu_pool->find("llama_arg_device")->is_null() || gpu_pool->find("llama_arg_device")->is_string()));
+
         const json::Value* backends = doc.find("backends");
         REQUIRE(backends != nullptr);
         REQUIRE(backends->is_array());
@@ -1039,6 +1062,7 @@ TEST_CASE("node: capability inventory returns schema, hardware, backends, models
         CHECK(caps->find("placement_planner")->as_bool());
         CHECK(caps->find("coresidency_planner")->as_bool());
         CHECK(caps->find("multi_gpu")->as_bool());
+        CHECK(caps->find("hybrid_gpu_spread")->as_bool());
         CHECK(caps->find("uma_telemetry")->as_bool());
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
         CHECK(caps->find("adaptive_speculation")->as_bool());
@@ -1165,6 +1189,7 @@ TEST_CASE("plan: rejects bad methods, oversized bodies, malformed JSON, unknown 
              R"({"model":"missing.gguf","allow_quantized_kv":1})",
              R"({"model":"missing.gguf","allow_speculative":null})",
              R"({"model":"missing.gguf","allow_moe_cpu_offload":"no"})",
+             R"({"model":"missing.gguf","allow_hybrid_gpu_spread":"yes"})",
              R"({"model":"missing.gguf","device_hint":7})",
          }) {
         CAPTURE(bad_override);
@@ -1232,7 +1257,7 @@ TEST_CASE("plan: plans a synthetic GGUF in model_dirs and via bound profile with
     // 1. Plan by clean basename inside model_dirs with explicit tuning overrides.
     const Reply r = post(
         f.port, "/v1/sonder/plan",
-        R"({"model":"synthetic-bonsai.gguf","ctx_size":2048,"min_ctx_size":1024,"parallel":2,"vram_headroom_mib":512,"prefer_free_vram":true,"allow_quantized_kv":false,"allow_speculative":false,"allow_moe_cpu_offload":true})");
+        R"({"model":"synthetic-bonsai.gguf","ctx_size":2048,"min_ctx_size":1024,"parallel":2,"vram_headroom_mib":512,"prefer_free_vram":true,"allow_quantized_kv":false,"allow_speculative":false,"allow_moe_cpu_offload":true,"allow_hybrid_gpu_spread":true})");
     REQUIRE(r.status == 200);
     check_common_headers(r);
     CHECK(r.header("content-type") == "application/json");
@@ -1240,10 +1265,29 @@ TEST_CASE("plan: plans a synthetic GGUF in model_dirs and via bound profile with
 
     CHECK(doc.find("schema")->as_string() == "sonder.inference.plan/1");
     CHECK(doc.find("sonder")->find("api_version")->as_int() == 1);
+    REQUIRE(doc.find("combined_gpu_vram_mib") != nullptr);
+    CHECK(doc.find("combined_gpu_vram_mib")->is_integer());
     REQUIRE(doc.find("fits_in_vram") != nullptr);
     CHECK(doc.find("fits_in_vram")->is_bool());
     REQUIRE(doc.find("fits_in_host_ram") != nullptr);
     CHECK(doc.find("fits_in_host_ram")->is_bool());
+    REQUIRE(doc.find("zero_cpu_spill") != nullptr);
+    CHECK(doc.find("zero_cpu_spill")->is_bool());
+    REQUIRE(doc.find("recommended_devices") != nullptr);
+    CHECK(doc.find("recommended_devices")->is_array());
+    const json::Value* spread = doc.find("multi_gpu_spread");
+    REQUIRE(spread != nullptr);
+    REQUIRE(spread->is_object());
+    REQUIRE(spread->find("active") != nullptr);
+    CHECK(spread->find("active")->is_bool());
+    REQUIRE(spread->find("hybrid_discrete_igpu") != nullptr);
+    CHECK(spread->find("hybrid_discrete_igpu")->is_bool());
+    REQUIRE(spread->find("zero_cpu_spill") != nullptr);
+    CHECK(spread->find("zero_cpu_spill")->is_bool());
+    REQUIRE(spread->find("recommended_devices") != nullptr);
+    CHECK(spread->find("recommended_devices")->is_array());
+    REQUIRE(spread->find("per_device_split") != nullptr);
+    CHECK(spread->find("per_device_split")->is_array());
 
     const json::Value* prof = doc.find("profile");
     REQUIRE(prof != nullptr);

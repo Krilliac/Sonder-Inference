@@ -199,6 +199,36 @@ std::optional<std::uint64_t> select_gpu_vram_budget_mib(const std::vector<GpuDev
                                                         std::string_view device_hint = {},
                                                         bool prefer_free = false) noexcept;
 
+// Summary of discrete, integrated UMA, and combined GPU VRAM pools on a host,
+// including hybrid discrete + integrated UMA Vulkan spread eligibility (e.g.
+// discrete RX 9060 XT + integrated Radeon 780M addressed jointly via
+// Vulkan0,Vulkan1). Pure value type computed from GpuDeviceInfo + HostMemory.
+struct GpuPoolSummary {
+    std::uint64_t discrete_vram_mib = 0;
+    std::uint64_t integrated_uma_vram_mib = 0;
+    std::uint64_t combined_gpu_vram_mib = 0;
+    std::uint64_t discrete_free_vram_mib = 0;
+    std::uint64_t integrated_uma_free_vram_mib = 0;
+    std::uint64_t combined_free_gpu_vram_mib = 0;
+    std::size_t discrete_gpu_count = 0;
+    std::size_t integrated_uma_gpu_count = 0;
+    bool hybrid_vulkan_pool_available = false;
+    // Ordered Vulkan device names ("Vulkan0", "Vulkan1", ...) placing discrete
+    // GPU(s) before integrated UMA GPU(s) when hybrid_vulkan_pool_available is true.
+    std::vector<std::string> hybrid_vulkan_devices;
+};
+
+// Summarizes discrete, integrated UMA, and combined GPU VRAM pools in MiB.
+// When `host` physical memory readings are known, integrated UMA pool totals
+// are capped at host total/available physical RAM so the combined pool never
+// overstates what physical memory can back.
+GpuPoolSummary summarize_gpu_pools(const std::vector<GpuDeviceInfo>& gpus, const HostMemory& host = {});
+
+// Convenience helper returning the combined effective GPU VRAM pool in MiB
+// across discrete and integrated UMA GPUs (honoring host RAM caps for UMA).
+std::uint64_t combined_gpu_vram_mib(const std::vector<GpuDeviceInfo>& gpus, bool prefer_free = false,
+                                    const HostMemory& host = {}) noexcept;
+
 // Current OS/arch label, e.g. "windows-x86_64".
 std::string host_platform();
 // Host name used as the telemetry producer node_id default.
