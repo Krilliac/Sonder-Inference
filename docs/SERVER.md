@@ -84,9 +84,20 @@ itself.
 | `--moe-experts cpu\|gpu` | `gpu` | `llamacpp` only. `cpu` keeps the mixture-of-experts expert tensors in system RAM while attention stays on the GPU; `gpu` leaves placement to `--gpu-layers`. |
 | `--tensor-override P=D` (repeatable) | none | `llamacpp` only. Places tensors whose name matches regex `P` on device `D` (`cpu`, or a llama.cpp device such as `Vulkan0`). The split is at the last `=`. |
 | `--batch-size N` | `512` | `llamacpp` only; 1 to 4194304. Maximum prompt tokens per decode call. |
-| `--ubatch-size N` | llama.cpp's 512, capped at `--batch-size` | `llamacpp` only; 1 to 4194304, and not above `--batch-size`. |
-| `--cache-type-k T`, `--cache-type-v T` | `f16` | `llamacpp` only. One of `f16`, `f32`, `bf16`, `q8_0`, `q5_1`, `q5_0`, `q4_1`, `q4_0`, `iq4_nl`. A quantized V cache needs flash attention `on` or `auto`. |
+| `--ubatch-size N` | llama.cpp's 512, capped at `--batch-size` | `llamacpp` only; 1 to 4194304, and not above `--batch-size`. Also bounds the chunked-prefill slice interleaved with decode tokens when `--slots > 1`. |
+| `--cache-type-k T`, `--cache-type-v T` | `f16` | `llamacpp` only. One of `f16`, `f32`, `bf16`, `q8_0`, `q5_1`, `q5_0`, `q4_1`, `q4_0`, `iq4_nl`, `f8_e4m3`, `q2_0`, `pq2_0`/`pq2_0m` (extended types require backend header support). A quantized V cache needs flash attention `on` or `auto`. Asymmetric `q8_0`/`q4_0` is supported for tight VRAM budgets. |
 | `--flash-attn auto\|on\|off` | `auto` | `llamacpp` only. |
+| `--threads N` | auto | `llamacpp` only; CPU thread count (`1` to `256`). |
+| `--no-mmap` | off | `llamacpp` only. Disable GGUF memory-mapping (direct read). |
+| `--no-kv-unified` | off | `llamacpp` only. Disable the unified KV cache buffer across slots. |
+| `--no-prefix-cache` | off | `llamacpp` only. Disable multi-slot prompt KV prefix reuse across turns. |
+| `--slots N` | `1` | `llamacpp` only; cached KV sequence slots (`1` to `16`). When `N > 1`, enables continuous batching and chunked-prefill interleaving across concurrent requests. |
+| `--spec-type TYPE` | `none` | `llamacpp` only. In-process speculative decoding: `none`, `auto`, `ngram`, `ngram-mod`, `draft-mtp`, or `suffix` (Arctic-style bounded suffix-tree matcher over prompt+output and cross-request session ring buffer; zero extra VRAM). With `draft-mtp`, long verbatim suffix matches (`>= 6` tokens) automatically burst-escalate through the suffix matcher. |
+| `--spec-draft-max N` | `0` (mode default) | `llamacpp` only; max draft tokens per speculative step (`0` to `64`). |
+| `--moe-cache-mib N` | `0` (off) | `llamacpp` only; dynamic SLRU MoE expert VRAM cache in MiB (`0` to `262144`) for CPU-offloaded MoE models. Leave unset/`0` when the model already fits 100% in VRAM to avoid graph-splitting overhead. |
+| `--moe-cache-cpu-share F` | unset | `llamacpp` only; fraction in `0.0..1.0` specifying the CPU share alongside `--moe-cache-mib` when host RAM bandwidth can assist offloaded MoE experts. |
+| `--cache-ram-mib N` | `0` (off) | `llamacpp` only; bounded L2 host-RAM Radix prefix KV/SSM state cache in MiB (`0` to `65536`) with strict global LRU eviction before allocation. Retains evicted VRAM slot prefixes for fast restore on later cache misses. |
+| `--mmproj PATH` | none | `llamacpp` only; multimodal projector GGUF path (`libmtmd`, when built with `SONDER_WITH_MTMD`) for evaluating inline base64 image blocks on the direct `llamacpp` backend. |
 | `--llamaserver-config PATH` | none | `llamaserver`: JSON config (mode, URL or executable, `args`, timeouts, guards including `spill_guard.uma_mode` (`true`\|`false`\|`"auto"`), opt-in `adaptive_speculation`, and a `tls` object); keys are in [integration/llama-server.md](integration/llama-server.md) and [GPU_SUPPORT.md](GPU_SUPPORT.md). An unreadable or invalid file is a usage error. |
 | `--llamaserver-mode attach\|spawn` | `attach` (`spawn` under a llamaserver profile) | Overrides the config's `mode`. |
 | `--llamaserver-url URL` | `http://127.0.0.1:8080` | Attach upstream URL. Refused with a single spawn `--profile`; permitted for multi-profile `llamaserver` attach mode. |
@@ -129,7 +140,10 @@ itself.
 
 The `llamacpp`-only options (`--gpu-layers`, `--context-length`,
 `--moe-experts`, `--tensor-override`, `--batch-size`, `--ubatch-size`,
-`--cache-type-k`, `--cache-type-v`, `--flash-attn`) are a usage error with any
+`--cache-type-k`, `--cache-type-v`, `--flash-attn`, `--threads`, `--no-mmap`,
+`--no-kv-unified`, `--no-prefix-cache`, `--slots`, `--spec-type`,
+`--spec-draft-max`, `--moe-cache-mib`, `--moe-cache-cpu-share`,
+`--cache-ram-mib`, `--mmproj`) are a usage error with any
 other backend, so a setting is never silently ignored. For `llamaserver` put
 the equivalent llama-server flags in the config's `args`, or use a profile.
 
@@ -571,12 +585,15 @@ and emits the full request, scheduler and inference telemetry with
 generic formatted prompt.
 
 Accepted fields: `model` (an id or `default`; absent means `default`),
-`messages` (`[{role: system|user|assistant|tool, content: string}]`, the last
-from `user` or `tool`), `stream`, `stream_options.include_usage`,
+`messages` (`[{role: system|user|assistant|tool, content: string | content_part[]}]`,
+including assistant `tool_calls`, tool-role `tool_call_id` / optional `name`, and
+inline base64 `image_url` parts; the last turn is from `user` or `tool`),
+`tools`, `tool_choice`, `stream`, `stream_options.include_usage`,
 `max_tokens` or `max_completion_tokens` (the latter wins; default 1024),
 `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `stop` (a string or at most
 4 strings), `presence_penalty`, `frequency_penalty`, `repeat_penalty`,
-`logit_bias` (`{"<token id>": bias}`), `n` (1 only), and the Sonder extensions
+`logit_bias` (`{"<token id>": bias}`), `logprobs`, `top_logprobs`,
+`response_format`, `grammar`, `n` (1 only), and the Sonder extensions
 `num_ctx`, `typical_p`, `repeat_last_n`, `reasoning_budget_tokens`,
 `thinking_budget_tokens`, and `reasoning_budget_message`. Other sampling defaults are
 `SamplingConfig`'s (temperature 0.8, top_p 0.95, top_k 40, repeat_penalty
@@ -661,15 +678,66 @@ false` (and use `--pin-mode default` if an operator pin should remain a
 fallback).
 
 Ignored: `user` and any unknown top-level field.
-Supported structured outputs (on backends advertising `structured_output`, such as `llamacpp`, `llamaserver`, and `ollama` for JSON formats): `response_format` (`{"type":"text"}`, `{"type":"json_object"}`, or `{"type":"json_schema","json_schema":{"name":"...","schema":{...}}}`) and per-request GBNF `grammar` (mutually exclusive with non-text `response_format`; raw GBNF is rejected with 400 `unsupported_parameter` on backends such as `ollama` that only accept JSON schema formats). Unenforceable JSON Schema keywords or bounds fail closed with 400 `invalid_request`.
-Rejected with 400 `unsupported_parameter`: `tools`, `tool_choice`,
-`functions`, `function_call`, `logprobs: true`,
-`top_logprobs`, `n` other than 1, non-string message `content`, and
-`tool_calls` on a message. Sampling values outside `validate(SamplingConfig)`
+Supported structured outputs (on backends advertising `structured_output`, such as `llamacpp`, `llamaserver`, and `ollama` for JSON formats): `response_format` (`{"type":"text"}`, `{"type":"json_object"}`, or `{"type":"json_schema","json_schema":{"name":"...","schema":{...}}}`) and per-request GBNF `grammar` (mutually exclusive with non-text `response_format`; raw GBNF is rejected with 400 `unsupported_parameter` on backends such as `ollama` that only accept JSON schema formats). The built-in JSON-Schema-to-GBNF engine supports provably disjoint `oneOf` branches (disjoint JSON types or disjoint `const`/`enum` literals), bounded regex `pattern` character-class subsets, and small exact integer `minimum`/`maximum` ranges while remaining strictly fail-closed (400 `invalid_request`) on overlapping `oneOf` or unenforceable keywords/bounds.
+Rejected with 400 `unsupported_parameter`: legacy `functions`, `function_call`,
+and `n` other than 1. Sampling values outside `validate(SamplingConfig)`
 ranges are 400 `invalid_sampling` naming the field.
 
+#### Agentic tool calling (`tools` / `tool_choice`)
+
+- Request `tools` accepts an array of OpenAI function definitions:
+  `{"type":"function","function":{"name":"...","description":"...","parameters":{...}}}`.
+- `tool_choice` accepts `"auto"`, `"none"`, `"required"`, or a specific tool
+  `{"type":"function","function":{"name":"..."}}`.
+- Multi-turn history accepts assistant messages with `tool_calls` and
+  `{"role":"tool","tool_call_id":"...","content":"..."}` result messages.
+- Non-streaming responses populate `choices[0].message.tool_calls`
+  (`[{"id":"call_...","type":"function","function":{"name":"...","arguments":"{...}"}}]`)
+  and set `finish_reason: "tool_calls"`.
+- Streaming responses (`"stream": true`) emit incremental `delta.tool_calls`
+  entries (`index`, `id`, `type: "function"`, `function: {name, arguments}`)
+  and `finish_reason: "tool_calls"`. On local backends without native tool
+  passthrough, the incremental parser recognizes `<tool_call>{...}</tool_call>`
+  (Qwen/Bonsai/Hermes) and fenced ```` ```tool_call ```` blocks while
+  suppressing raw markup from `delta.content`; when `tool_choice` is
+  `"required"` or names a specific function, a matching GBNF tool-call grammar
+  is generated automatically. On `llamaserver`, `tools`, `tool_choice`,
+  `tool_calls`, and `tool_call_id` are forwarded natively.
+
+#### Token logprobs (`logprobs` / `top_logprobs`)
+
+- `logprobs` (boolean, default `false`) enables per-token log-probabilities on
+  `POST /v1/chat/completions` and `POST /v1/completions`.
+- `top_logprobs` (integer `0..20`) returns the top-K candidate tokens and
+  log-probabilities at each step; setting `top_logprobs > 0` requires
+  `logprobs: true` (otherwise 400 `invalid_request`).
+- Non-streaming responses populate `choices[0].logprobs.content` with
+  `[{"token":"...","logprob":-0.12,"top_logprobs":[{"token":"...","logprob":-0.12}, ...]}]`;
+  streaming responses attach per-token entries on each chunk's
+  `choices[0].logprobs.content`.
+- On direct `llamacpp`, enabling `logprobs` disables GPU backend sampler
+  offload for that request so exact log-softmax probabilities are computed from
+  raw logits.
+
+#### Multimodal vision inputs (base64 `data:` URIs only)
+
+- `messages[].content` accepts OpenAI content-part arrays mixing
+  `{"type":"text","text":"..."}` and inline base64 images
+  `{"type":"image_url","image_url":{"url":"data:image/<png|jpeg|webp|gif>;base64,..."}}`.
+- **Strict SSRF protection:** remote or local URLs (`http://`, `https://`,
+  `file://`, or any non-`data:image/<png|jpeg|webp|gif>;base64,...` URI) are
+  strictly rejected with HTTP 400 `invalid_request`. The server never fetches
+  caller-supplied URLs.
+- **Validation limits:** strict base64 decoding, at most **16 MiB** decoded per
+  image, and at most **8 images** per request.
+- Forwarded natively on `llamaserver`; on direct `llamacpp`, evaluated through
+  `libmtmd` when built with `SONDER_WITH_MTMD` and started with `--mmproj PATH`
+  (requests containing media without a loaded multimodal projector are rejected
+  cleanly with HTTP 400).
+
 Additional OpenAI-compatible and utility endpoints served alongside `/v1/chat/completions`:
-- `POST /v1/completions`: raw prompt text completions (`prompt`, `max_tokens`, `echo`, `stream`, `stream_options.include_usage`, `grammar`, sampling parameters).
+- `POST /v1/responses`: OpenAI Responses API with stateful `previous_response_id` chaining, `tools`, `text.format`, and SSE events (see [below](#post-v1responses)).
+- `POST /v1/completions`: raw prompt text completions (`prompt`, `max_tokens`, `echo`, `logprobs`, `stream`, `stream_options.include_usage`, `grammar`, sampling parameters).
 - `POST /v1/embeddings`: dense float vector embeddings (`model`, `input` string or string array up to 256 items, `encoding_format: "float"`). Returns 501 `not_implemented` on backends without embedding support.
 - `POST /v1/tokenize` and `POST /v1/detokenize`: model vocabulary tokenization (`content` or `text`) and detokenization (`tokens` integer array). Returns 501 `not_implemented` on backends without tokenizer support.
 
@@ -705,9 +773,10 @@ Non-streaming response:
 
 With `"stream": true` the response is `text/event-stream`: `data:` lines
 carrying `chat.completion.chunk` objects (the first with
-`delta.role = "assistant"`, then `delta.content` pieces, and
-`delta.reasoning_content` pieces when reasoning is produced), a final chunk with
-`finish_reason` plus `timings` and `sonder` (and `usage` when
+`delta.role = "assistant"`, then `delta.content`, `delta.reasoning_content`,
+and/or incremental `delta.tool_calls` pieces, plus `logprobs.content` when
+requested), a final chunk with
+`finish_reason` (`"stop"`, `"length"`, `"tool_calls"`, or `"cancelled"`) plus `timings` and `sonder` (and `usage` when
 `stream_options.include_usage` is true), then `data: [DONE]`. Headers are sent
 with the first chunk, so a request rejected before generation still gets its
 proper status and error body. A backend failure after chunks were sent
@@ -846,24 +915,72 @@ The envelope `request_id` is always Inference's own id (`req-…`), also
 returned as `sonder.request_id`, in the completion id and in
 `X-Sonder-Request-Id`.
 
+### `POST /v1/responses`
+
+OpenAI Responses API endpoint sharing the same auth, CORS, scheduling, KV
+prefix-cache affinity, tool calling, structured output, and telemetry pipeline
+as `/v1/chat/completions`.
+
+Accepted request fields:
+
+- `model` (string; defaults to `default`), `input` (string OR array of message
+  / `function_call_output` items, supporting the same base64-only `image_url`
+  multimodal rules), `instructions` (system prompt string).
+- `previous_response_id` (string `resp_...`): stateful multi-turn chaining
+  backed by a bounded in-memory LRU chain (up to 256 stored responses) that
+  replays prior turn history and maps directly onto the backend `session_key`
+  so consecutive turns reuse cached KV prefixes automatically. Unknown or
+  evicted response IDs return 400 `invalid_request`.
+- `tools`, `tool_choice`, `text.format` (`{"type":"text"}`,
+  `{"type":"json_object"}`, or `{"type":"json_schema", ...}`),
+  `max_output_tokens`, `temperature`, `top_p`, `stream`, and `reasoning`.
+
+Non-streaming response shape:
+
+```json
+{"id":"resp_…","object":"response","status":"completed","model":"mock:tiny",
+ "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"…"}]}],
+ "output_text":"…",
+ "usage":{"input_tokens":12,"output_tokens":8,"total_tokens":20},
+ "sonder":{"api_version":1,"request_id":"req-…"}}
+```
+
+When reasoning or function tool calls are produced, `output` includes the
+corresponding `reasoning` and/or `function_call` items (`call_id`, `name`,
+`arguments`). With `"stream": true`, the endpoint streams `text/event-stream`
+SSE events in OpenAI Responses order: `response.created`,
+`response.output_text.delta`, `response.function_call_arguments.delta` (when
+tool calls occur), and `response.completed`.
+
+```sh
+curl -s http://127.0.0.1:11437/v1/responses -H 'Content-Type: application/json' \
+  -d '{"model":"default","instructions":"Be concise.","input":"Explain KV prefix caching.","max_output_tokens":64}'
+```
+
 ### `POST /v1/messages`
 
-The server also accepts the Anthropic Messages API shape for text-only local
-backends. `max_tokens` is required; `model` defaults to the served `default` alias. `messages`
+The server also accepts the Anthropic Messages API shape. `max_tokens` is required; `model` defaults to the served `default` alias. `messages`
 accepts user and assistant turns whose content is either a string or an array
-of `{ "type": "text", "text": "..." }` blocks; `system` accepts a string or
-the same text-block array. `temperature`, `top_p`, `top_k`, `stop_sequences`,
-`stream`, and `metadata.user_id` are supported. A `metadata.user_id` becomes
-the prompt-cache session key; when it is absent, the same
-`X-Sonder-Run-Id`/`X-Sonder-Agent-Id` headers used by chat provide affinity.
-The current session validator requires the final input turn to be from the
-user, so a request ending in an assistant turn is rejected with 400.
+of typed content blocks: `{ "type": "text", "text": "..." }`, inline base64
+images `{ "type": "image", "source": { "type": "base64", "media_type": "image/png|image/jpeg|image/webp|image/gif", "data": "..." } }`,
+assistant `{ "type": "tool_use", "id": "...", "name": "...", "input": {...} }`
+blocks, and user `{ "type": "tool_result", "tool_use_id": "...", "content": "..." }`
+blocks. `system` accepts a string or text-block array. `tools`, `tool_choice`
+(`auto`, `any`, `none`, `tool`), `temperature`, `top_p`, `top_k`,
+`stop_sequences`, `stream`, and `metadata.user_id` are supported. A
+`metadata.user_id` becomes the prompt-cache session key; when it is absent, the
+same `X-Sonder-Run-Id`/`X-Sonder-Agent-Id` headers used by chat provide
+affinity. The current session validator requires the final input turn to be
+from the user (including `tool_result` turns), so a request ending in an
+assistant turn is rejected with 400.
 
-Image blocks are rejected with 400 because the current backends are text-only.
-`tools` and `tool_choice` are also rejected with 400; tool execution is not
-implemented. Unknown fields are ignored. Authentication is the same as for
-the other `/v1` routes: a configured token may be sent as `Authorization:
-Bearer <token>` or, for Anthropic clients, in `x-api-key`.
+Multimodal images follow the same strict SSRF boundary as OpenAI chat: only
+inline base64 `image/png`, `image/jpeg`, `image/webp`, and `image/gif` blocks
+are accepted (URL image sources are strictly rejected with 400; max 16 MiB
+decoded per image, max 8 images per request). Unknown fields are ignored.
+Authentication is the same as for the other `/v1` routes: a configured token
+may be sent as `Authorization: Bearer <token>` or, for Anthropic clients, in
+`x-api-key`.
 
 Thinking controls map to the backend's existing chat-template controls:
 `thinking: {"type":"enabled","budget_tokens":N}` enables thinking and
@@ -880,8 +997,8 @@ request value; the response carries the same `sonder.warnings` entries as the
 chat endpoint when that happens.
 
 Non-streaming responses use Anthropic's `message` shape with `msg_` ids,
-`content` text blocks, `stop_reason` (`end_turn`, `max_tokens`, or
-`stop_sequence`), and `usage.input_tokens`/`output_tokens`. `input_tokens`
+`content` text and/or `tool_use` blocks, `stop_reason` (`end_turn`,
+`max_tokens`, `stop_sequence`, or `tool_use`), and `usage.input_tokens`/`output_tokens`. `input_tokens`
 starts from the backend's measured `prompt_tokens`; when cached tokens are
 reported, the cache count is subtracted and emitted separately as
 `cache_read_input_tokens`. No cache count is guessed or subtracted when it is
@@ -889,8 +1006,9 @@ unknown, and backend prompt-count conventions may differ from Anthropic's
 billing counters. `output_tokens` maps the backend's measured completion token
 count. The cache field is omitted when the backend does not report one.
 Separately returned reasoning is
-represented by a `thinking` block before the text block. `stream: true` emits
-Anthropic SSE events in order: `message_start`, content block start/deltas and
+represented by a `thinking` block before the text or `tool_use` block. `stream: true` emits
+Anthropic SSE events in order: `message_start`, content block start/deltas
+(`text_delta`, `thinking_delta`, or `input_json_delta` for `tool_use` blocks) and
 stop, `message_delta`, and `message_stop`. The existing chat stream has no
 keepalive timer. `message_start` uses zero preliminary usage; final measured
 counts and pin warnings are carried in `message_delta`. A midstream failure
@@ -918,7 +1036,10 @@ curl http://127.0.0.1:11437/v1/messages \
 
 ### `POST /v1/embeddings`
 
-501 `not_implemented`.
+Returns OpenAI-compatible dense float vector embeddings (`input` string or
+string array up to 256 items, `encoding_format: "float"`) on backends
+advertising `embeddings` (such as `llamacpp` and `llamaserver`), or 501
+`not_implemented` on backends without embedding support.
 
 ## Live telemetry
 
@@ -995,6 +1116,12 @@ curl -s http://127.0.0.1:11437/v1/chat/completions -H 'Content-Type: application
   -d '{"model":"default","messages":[{"role":"user","content":"hello"}],"max_tokens":16}'
 curl -sN http://127.0.0.1:11437/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"hello"}],"stream":true,"stream_options":{"include_usage":true}}'
+curl -s http://127.0.0.1:11437/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"default","messages":[{"role":"user","content":"Check weather in Austin"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"tool_choice":"required"}'
+curl -s http://127.0.0.1:11437/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"default","messages":[{"role":"user","content":"Reply with OK."}],"max_tokens":8,"logprobs":true,"top_logprobs":3}'
+curl -s http://127.0.0.1:11437/v1/responses -H 'Content-Type: application/json' \
+  -d '{"model":"default","input":"Reply with OK.","max_output_tokens":16}'
 curl -sN http://127.0.0.1:11437/v1/telemetry/sse
 curl -sN -H 'Last-Event-ID: tel-0123456789abcdef-41' http://127.0.0.1:11437/v1/telemetry/sse
 curl -sN 'http://127.0.0.1:11437/v1/telemetry/ndjson?since=now'
