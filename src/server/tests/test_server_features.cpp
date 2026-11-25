@@ -2456,6 +2456,22 @@ TEST_CASE("responses parity: timings, logprobs, reasoning_budget, admission tele
         }
         CHECK(saw_full_telemetry);
         CHECK(saw_exp_telemetry);
+        for (const auto& ev : f.of_type("request.cancelled")) {
+            const auto* rid = ev.find("request_id");
+            if (rid != nullptr && rid->is_string()) {
+                CHECK(rid->as_string() != exp_req_id);
+            }
+        }
+
+        // Running deadline expiry (after backend_started) still cooperatively cancels
+        // through the watcher and returns status == "incomplete".
+        be->reset();
+        const Reply running_exp = post(f.port, "/v1/responses", R"({"input":"slow run","deadline_ms":200})");
+        REQUIRE_MESSAGE(running_exp.status == 200, running_exp.body);
+        const auto run_doc = running_exp.json();
+        REQUIRE(run_doc.find("status") != nullptr);
+        CHECK(run_doc.find("status")->as_string() == "incomplete");
+        CHECK(be->wait_cancelled());
     }
 
     // 5. Caller-scope isolation over HTTP (agent/run headers and bearer scopes).
