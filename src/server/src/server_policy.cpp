@@ -617,6 +617,9 @@ Status validate_options(const ServerOptions& o) {
     if (o.keep_alive_timeout.count() < 0) {
         return Status(ErrorCode::invalid_argument, "keep_alive_timeout must not be negative");
     }
+    if (o.stream_keepalive_interval.count() < 0) {
+        return Status(ErrorCode::invalid_argument, "--stream-keepalive-ms must not be negative");
+    }
     for (const auto& origin : o.cors_origins) {
         if (!detail::is_serialized_origin(origin)) {
             return Status(ErrorCode::invalid_argument,
