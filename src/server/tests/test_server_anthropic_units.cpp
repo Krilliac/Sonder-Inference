@@ -195,20 +195,38 @@ TEST_CASE("anthropic request: malformed and unsupported content fails clearly") 
         CHECK(std::holds_alternative<ApiError>(parse_messages_request(body)));
     }
     auto body = request();
-    for (const char* field : {"tools", "tool_choice"}) {
-        body = request();
-        body.set(field, json::Array{});
-        rejected(body, field);
-    }
+    // Invalid tools / tool_choice fail clearly.
+    body = request();
+    body.set("tools", json::Object{});
+    rejected(body, "tools");
+    body = request();
+    body.set("tool_choice", json::Array{});
+    rejected(body, "tool_choice");
+    body = request();
+    body.set("tool_choice", json::Object{{"type", "tool"}, {"name", "missing"}});
+    rejected(body, "tool_choice");
+    // System prompts remain text-only; unsupported user blocks (audio, tool_use) still fail clearly.
     for (const char* type : {"image", "tool_use", "tool_result", "audio"}) {
         const json::Array blocks{json::Object{{"type", type}, {"source", json::Object{}}}};
-        body = request();
-        body.set("messages", json::Array{json::Object{{"role", "user"}, {"content", blocks}}});
-        rejected(body, type == std::string("image") ? "image" : "content block");
         body = request();
         body.set("system", blocks);
         rejected(body, type == std::string("image") ? "image" : "content block");
     }
+    for (const char* type : {"tool_use", "audio"}) {
+        const json::Array blocks{json::Object{{"type", type}, {"source", json::Object{}}}};
+        body = request();
+        body.set("messages", json::Array{json::Object{{"role", "user"}, {"content", blocks}}});
+        rejected(body, "content block");
+    }
+    // Remote URL image sources are strictly rejected (SSRF protection).
+    body = request();
+    body.set("messages",
+             json::Array{json::Object{
+                 {"role", "user"},
+                 {"content", json::Array{json::Object{
+                                 {"type", "image"},
+                                 {"source", json::Object{{"type", "url"}, {"url", "http://127.0.0.1/x.png"}}}}}}}});
+    rejected(body, "base64");
     body = request();
     body.set("system", json::Array{json::Object{{"type", "text"}, {"text", 42}}});
     rejected(body, "text");

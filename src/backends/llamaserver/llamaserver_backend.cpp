@@ -52,7 +52,7 @@ llamaserver::SpeculationWorkload classify_generate_workload(const GenerateReques
 
 llamaserver::SpeculationWorkload classify_chat_workload(const ChatRequest &request,
                                                         std::string_view grammar) noexcept {
-    if (!grammar.empty() || !request.grammar.empty() ||
+    if (!grammar.empty() || !request.grammar.empty() || !request.tools.empty() ||
         (request.response_format_type && *request.response_format_type != "text"))
         return llamaserver::SpeculationWorkload::tool_json;
     if (chat_thinking_enabled(request))
@@ -182,7 +182,12 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
     }
     BackendCapabilities capabilities() const override {
         BackendCapabilities c;
-        c.add(Capability::streaming).add(Capability::remote_process).add(Capability::embeddings);
+        c.add(Capability::streaming)
+            .add(Capability::remote_process)
+            .add(Capability::embeddings)
+            .add(Capability::tool_calling)
+            .add(Capability::multimodal)
+            .add(Capability::logprobs);
         if (!options_.grammar.empty())
             c.add(Capability::structured_output);
         // These indicate delegation support, not measured acceleration or KV ownership.

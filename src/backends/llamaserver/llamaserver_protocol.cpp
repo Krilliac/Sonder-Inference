@@ -1,10 +1,32 @@
 #include "llamaserver_protocol.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
+#include <span>
 
 namespace sonder::inference::llamaserver {
 namespace {
+std::string encode_base64_bytes(std::span<const std::uint8_t> bytes) {
+    static constexpr char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((bytes.size() + 2u) / 3u) * 4u);
+    for (std::size_t i = 0; i < bytes.size(); i += 3) {
+        const std::uint32_t b0 = bytes[i];
+        const bool has1 = (i + 1 < bytes.size());
+        const bool has2 = (i + 2 < bytes.size());
+        const std::uint32_t b1 = has1 ? bytes[i + 1] : 0u;
+        const std::uint32_t b2 = has2 ? bytes[i + 2] : 0u;
+        const std::uint32_t triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push_back(kAlphabet[(triple >> 18) & 0x3Fu]);
+        out.push_back(kAlphabet[(triple >> 12) & 0x3Fu]);
+        out.push_back(has1 ? kAlphabet[(triple >> 6) & 0x3Fu] : '=');
+        out.push_back(has2 ? kAlphabet[triple & 0x3Fu] : '=');
+    }
+    return out;
+}
+
 // A flagged field is always sent. Otherwise, unless explicit_only (set by
 // parsers that know exactly what the caller supplied), a field is sent only
 // when it differs from the local default, so the upstream keeps its own
@@ -12,7 +34,7 @@ namespace {
 bool supplied(const SamplingConfig &s, SamplingConfig::Field field, bool changed) {
     return s.is_explicit(field) || (!s.explicit_only && changed);
 }
-void put_sampling(json::Object &o, const SamplingConfig &s, bool native) {
+void put_sampling(json::Object &o, const SamplingConfig &s, bool native, bool is_chat = false) {
     const SamplingConfig d{};
     if (supplied(s, SamplingConfig::kTemperature, s.temperature != d.temperature))
         o.set("temperature", static_cast<double>(s.temperature));
@@ -55,6 +77,18 @@ void put_sampling(json::Object &o, const SamplingConfig &s, bool native) {
             for (const auto &v : s.logit_bias)
                 bias.set(std::to_string(v.token), std::isinf(v.bias) ? -100.0 : v.bias);
             o.set("logit_bias", std::move(bias));
+        }
+    }
+    if (s.logprobs) {
+        if (native) {
+            o.set("n_probs", std::max<std::int32_t>(1, s.top_logprobs));
+        } else if (is_chat) {
+            o.set("logprobs", true);
+            if (s.top_logprobs > 0) {
+                o.set("top_logprobs", s.top_logprobs);
+            }
+        } else {
+            o.set("logprobs", std::max<std::int32_t>(1, s.top_logprobs));
         }
     }
 }
@@ -108,14 +142,82 @@ json::Value build_chat_body(const std::string &model, const ChatRequest &request
     o.set("stream", true);
     json::Array messages;
     for (const auto &m : request.messages) {
-        json::Object message{{"role", m.role}, {"content", m.content}};
+        json::Object message{{"role", m.role}};
+        if (!m.media.empty()) {
+            json::Array parts;
+            if (!m.content.empty()) {
+                parts.emplace_back(json::Object{{"type", "text"}, {"text", m.content}});
+            }
+            for (const auto &img : m.media) {
+                const std::string data_uri = "data:" + img.mime_type + ";base64," + encode_base64_bytes(img.bytes);
+                parts.emplace_back(
+                    json::Object{{"type", "image_url"}, {"image_url", json::Object{{"url", data_uri}}}});
+            }
+            message.set("content", std::move(parts));
+        } else if (m.role == "assistant" && m.content.empty() && !m.tool_calls.empty()) {
+            message.set("content", nullptr);
+        } else {
+            message.set("content", m.content);
+        }
         if (m.role == "assistant" && m.reasoning_content)
             message.set("reasoning_content", *m.reasoning_content);
+        if (m.role == "assistant" && !m.tool_calls.empty()) {
+            json::Array tcs;
+            tcs.reserve(m.tool_calls.size());
+            for (const auto &tc : m.tool_calls) {
+                tcs.emplace_back(json::Object{
+                    {"id", tc.id},
+                    {"type", "function"},
+                    {"function", json::Object{{"name", tc.name},
+                                              {"arguments", tc.arguments_json.empty() ? "{}" : tc.arguments_json}}}});
+            }
+            message.set("tool_calls", std::move(tcs));
+        }
+        if (m.role == "tool" && m.tool_call_id && !m.tool_call_id->empty())
+            message.set("tool_call_id", *m.tool_call_id);
+        if (m.name && !m.name->empty())
+            message.set("name", *m.name);
         messages.emplace_back(std::move(message));
     }
     o.set("messages", std::move(messages));
     o.set("stream_options", json::Object{{"include_usage", true}});
-    put_sampling(o, request.sampling, false);
+    put_sampling(o, request.sampling, false, true);
+    if (!request.tools.empty()) {
+        json::Array tools;
+        tools.reserve(request.tools.size());
+        for (const auto &tool : request.tools) {
+            json::Object fn{{"name", tool.name}};
+            if (!tool.description.empty()) {
+                fn.set("description", tool.description);
+            }
+            if (!tool.parameters_json.empty()) {
+                auto parsed_params = json::parse(tool.parameters_json);
+                if (parsed_params.ok() && parsed_params.value().is_object()) {
+                    fn.set("parameters", std::move(parsed_params).value());
+                }
+            }
+            tools.emplace_back(json::Object{{"type", "function"}, {"function", std::move(fn)}});
+        }
+        o.set("tools", std::move(tools));
+    }
+    if (request.tool_choice) {
+        switch (request.tool_choice->mode) {
+            case ToolChoiceMode::auto_choice:
+                o.set("tool_choice", "auto");
+                break;
+            case ToolChoiceMode::none:
+                o.set("tool_choice", "none");
+                break;
+            case ToolChoiceMode::required:
+                o.set("tool_choice", "required");
+                break;
+            case ToolChoiceMode::function:
+                o.set("tool_choice",
+                      json::Object{{"type", "function"},
+                                   {"function", json::Object{{"name", request.tool_choice->function_name}}}});
+                break;
+        }
+    }
     bool emitted_response_format = false;
     if (request.response_format_type && !request.response_format_type->empty()) {
         const std::string &rf_type = *request.response_format_type;
@@ -134,7 +236,7 @@ json::Value build_chat_body(const std::string &model, const ChatRequest &request
             }
         }
     }
-    if (!emitted_response_format) {
+    if (!emitted_response_format && request.tools.empty()) {
         const std::string_view effective_grammar =
             !request.grammar.empty() ? std::string_view(request.grammar) : grammar;
         if (!effective_grammar.empty())

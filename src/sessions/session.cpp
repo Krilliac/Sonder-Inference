@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <limits>
+#include <numeric>
 #include <utility>
 
 #include "engine/accounting_tokens.hpp"
@@ -193,10 +196,10 @@ namespace {
 // token, so retrying the same request cannot succeed. EmptyLogits is a backend
 // fault (backend_error).
 template <class Gate, class Produced, class Deliver>
-Result<GenerateStats> run_sonder_sampling(TokenStream& stream, const SamplingConfig& config,
-                                          const CancellationToken& cancel, TelemetryBus& bus,
-                                          const TelemetryContext& ctx, const Gate& gate, const Produced& produced,
-                                          const Deliver& deliver) {
+Result<GenerateStats> run_sonder_sampling(TokenStream& stream, BackendModel& backend_model,
+                                          const SamplingConfig& config, const CancellationToken& cancel,
+                                          TelemetryBus& bus, const TelemetryContext& ctx, const Gate& gate,
+                                          const Produced& produced, const Deliver& deliver) {
     namespace smp = sampling;
     GenerateStats stats;
     stats.prompt_tokens = stream.prompt_tokens().size();
@@ -262,7 +265,50 @@ Result<GenerateStats> run_sonder_sampling(TokenStream& stream, const SamplingCon
         ++stats.completion_tokens;
         const smp::StopCheck check = stop.feed(piece);
         if (!check.emit.empty()) {
-            const TokenChunk chunk{check.emit, stats.chunks++};
+            TokenChunk chunk{check.emit, stats.chunks++};
+            if (config.logprobs) {
+                const auto raw = logits.value();
+                double max_l = -std::numeric_limits<double>::infinity();
+                for (const float v : raw) {
+                    if (std::isfinite(v) && static_cast<double>(v) > max_l) max_l = static_cast<double>(v);
+                }
+                double sum_exp = 0.0;
+                if (std::isfinite(max_l)) {
+                    for (const float v : raw) {
+                        if (std::isfinite(v)) sum_exp += std::exp(static_cast<double>(v) - max_l);
+                    }
+                }
+                const double lse = (std::isfinite(max_l) && sum_exp > 0.0) ? (max_l + std::log(sum_exp)) : 0.0;
+                if (sampled.token >= 0 && static_cast<std::size_t>(sampled.token) < raw.size() &&
+                    std::isfinite(raw[static_cast<std::size_t>(sampled.token)])) {
+                    chunk.logprob = static_cast<float>(static_cast<double>(raw[static_cast<std::size_t>(sampled.token)]) - lse);
+                } else {
+                    chunk.logprob = sampled.probability > 0.0f ? std::log(sampled.probability) : -1e9f;
+                }
+                if (config.top_logprobs > 0 && !raw.empty()) {
+                    const std::size_t k = std::min<std::size_t>(static_cast<std::size_t>(config.top_logprobs), raw.size());
+                    std::vector<std::size_t> order(raw.size());
+                    std::iota(order.begin(), order.end(), 0);
+                    std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(k), order.end(),
+                                      [&](std::size_t a, std::size_t b) { return raw[a] > raw[b]; });
+                    chunk.top_logprobs.reserve(k);
+                    for (std::size_t j = 0; j < k; ++j) {
+                        const TokenId tid = static_cast<TokenId>(order[j]);
+                        std::string tok_str;
+                        if (tid == sampled.token) {
+                            tok_str = piece;
+                        } else if (auto dt = backend_model.detokenize(std::span<const TokenId>(&tid, 1)); dt.ok()) {
+                            tok_str = std::move(dt).value();
+                        } else {
+                            tok_str = std::to_string(tid);
+                        }
+                        const float tlp = std::isfinite(raw[order[j]])
+                                              ? static_cast<float>(static_cast<double>(raw[order[j]]) - lse)
+                                              : -1e9f;
+                        chunk.top_logprobs.push_back(TopLogprob{std::move(tok_str), tlp});
+                    }
+                }
+            }
             if (!deliver(chunk, sampled.token, sampled.probability)) {
                 stats.stop_reason = StopReason::callback;
                 break;
@@ -559,9 +605,27 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     const bool emit_tokens = bus.enabled(TelemetryLevel::standard);
     const bool capture_text = bus.options().capture_text;
     BackendModel& backend_model = model_->backend_model();
+    const auto backend = engine_.find_backend(model_->backend_name());
+    bool has_media = false;
+    if (messages != nullptr) {
+        for (const auto& m : *messages) {
+            if (!m.media.empty()) {
+                has_media = true;
+                break;
+            }
+        }
+    }
     // Chat with a backend-native template bypasses the generic prompt (and
     // therefore Sonder's token-level sampler, which works on that prompt).
     const bool native_chat = messages != nullptr && backend_model.has_native_chat();
+    // Backends that advertise tool_calling or multimodal receive the structured
+    // ChatRequest via chat() when tools or media are present, even if their
+    // plain text chat path uses the generic template (e.g. MockBackend).
+    const bool backend_chat_call =
+        messages != nullptr &&
+        (native_chat ||
+         (backend && ((!request_options.tools.empty() && backend->capabilities().has(Capability::tool_calling)) ||
+                      (has_media && backend->capabilities().has(Capability::multimodal)))));
     const auto& parent = request_options.parent_request_id;
     const auto with_parent = [&parent](json::Object attrs) {
         if (parent) {
@@ -599,15 +663,14 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
 
     // Sampling path: Sonder's sampler chain when the backend exposes logits.
     std::unique_ptr<TokenStream> stream;
-    const auto backend = engine_.find_backend(model_->backend_name());
     const ModelArchitecture arch = model_->descriptor().architecture;
     const bool checkpoint_candidate =
-        runtime != nullptr && !native_chat &&
+        runtime != nullptr && !backend_chat_call &&
         (arch == ModelArchitecture::hybrid || arch == ModelArchitecture::recurrent) &&
         backend && backend->capabilities().has(Capability::recurrent_checkpoint);
 #if defined(SONDER_HAS_SAMPLER_CHAIN)
     const bool use_token_logits =
-        !native_chat && request.grammar.empty() && backend && backend->capabilities().has(Capability::token_logits);
+        !backend_chat_call && request.grammar.empty() && backend && backend->capabilities().has(Capability::token_logits);
     const bool defer_stream_open =
         (engine_.scheduling_options().strict_priority_admission || checkpoint_candidate) && use_token_logits;
     if (!defer_stream_open && use_token_logits) {
@@ -725,7 +788,10 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
 
     // Telemetry + user callback for one visible chunk (not gated).
     const auto deliver = [&](const TokenChunk& chunk, std::optional<TokenId> token_id, float probability) -> bool {
-        const std::size_t chunk_bytes = chunk.text.size() + chunk.reasoning.size();
+        std::size_t chunk_bytes = chunk.text.size() + chunk.reasoning.size();
+        for (const auto& tcd : chunk.tool_call_deltas) {
+            chunk_bytes += tcd.id.size() + tcd.name.size() + tcd.arguments_delta.size();
+        }
         if (request_options.max_response_bytes > 0 &&
             (chunk_bytes > request_options.max_response_bytes ||
              delivered_bytes > request_options.max_response_bytes - chunk_bytes)) {
@@ -747,6 +813,21 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
             }
             if (!chunk.reasoning.empty()) {
                 result.reasoning.append(chunk.reasoning.data(), chunk.reasoning.size());
+            }
+            if (chunk.logprob.has_value()) {
+                result.logprobs.push_back(
+                    TokenLogprob{std::string(chunk.text), *chunk.logprob, chunk.top_logprobs});
+            }
+            for (const auto& tcd : chunk.tool_call_deltas) {
+                if (tcd.index < 64u) {
+                    if (tcd.index >= result.tool_calls.size()) {
+                        result.tool_calls.resize(static_cast<std::size_t>(tcd.index) + 1);
+                    }
+                    ToolCall& dst = result.tool_calls[tcd.index];
+                    if (!tcd.id.empty()) dst.id = tcd.id;
+                    if (!tcd.name.empty()) dst.name = tcd.name;
+                    dst.arguments_json += tcd.arguments_delta;
+                }
             }
         }
         ++delivered;
@@ -918,7 +999,8 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
             generated = prepared;
         } else if (stream) {
 #if defined(SONDER_HAS_SAMPLER_CHAIN)
-            generated = run_sonder_sampling(*stream, sampling, token, bus, ctx, gate, produced, deliver);
+            generated =
+                run_sonder_sampling(*stream, backend_model, sampling, token, bus, ctx, gate, produced, deliver);
 #endif
         } else {
             const auto on_backend_chunk = [&](const TokenChunk& chunk) -> bool {
@@ -927,7 +1009,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                 produced(detail::accounting_chunk_token(chunk.text));
                 return deliver(chunk, std::nullopt, 0.0f);
             };
-            if (native_chat) {
+            if (backend_chat_call) {
                 ChatRequest chat_request;
                 chat_request.request_id = request.request_id;
                 chat_request.messages = *messages;
@@ -940,6 +1022,8 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                 chat_request.grammar = request_options.grammar;
                 chat_request.response_format_type = request_options.response_format_type;
                 chat_request.response_format_schema = request_options.response_format_schema;
+                chat_request.tools = request_options.tools;
+                chat_request.tool_choice = request_options.tool_choice;
                 generated = backend_model.chat(chat_request, token, on_backend_chunk);
             } else {
                 generated = backend_model.generate(request, token, on_backend_chunk);

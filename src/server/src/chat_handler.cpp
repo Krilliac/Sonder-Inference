@@ -15,12 +15,39 @@
 #include "request_path.hpp"
 #include "reasoning_budget.hpp"
 #include "test_hooks.hpp"
+#include "tool_call_parser.hpp"
 
 namespace sonder::inference::server::detail {
 
+namespace {
+
+json::Object openai_tool_call_json(const ToolCall& tc) {
+    return json::Object{{"id", tc.id},
+                        {"type", "function"},
+                        {"function", json::Object{{"name", tc.name},
+                                                  {"arguments", tc.arguments_json.empty() ? "{}" : tc.arguments_json}}}};
+}
+
+json::Object openai_tool_call_delta_json(std::uint32_t index, const std::string& id, const std::string& name,
+                                         const std::string& args_delta) {
+    json::Object fn;
+    if (!name.empty()) fn.set("name", name);
+    fn.set("arguments", args_delta);
+    json::Object entry{{"index", static_cast<std::int64_t>(index)}, {"function", std::move(fn)}};
+    if (!id.empty()) {
+        entry.set("id", id);
+        entry.set("type", "function");
+    } else if (!name.empty()) {
+        entry.set("type", "function");
+    }
+    return entry;
+}
+
+}  // namespace
+
 void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr, const std::string& model,
                   const std::string& backend, const std::shared_ptr<Session>& session,
-                  ChatProtocol protocol) {
+                  ChatProtocol protocol, bool backend_native_tools) {
     const bool anthropic = protocol == ChatProtocol::anthropic;
     const RequestPriority priority = corr.priority_class.value_or(
         job.priority_class.value_or(RequestPriority::interactive));
@@ -41,6 +68,8 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     ro.grammar = job.grammar;
     ro.response_format_type = job.response_format_type;
     ro.response_format_schema = job.response_format_schema;
+    ro.tools = job.tools;
+    ro.tool_choice = job.tool_choice;
     std::vector<std::string> warnings = apply_thinking_pins(ex.options, ro.thinking);
     reasoning_budget::apply(job, corr, ex.options, backend, ro, warnings);
     ro.priority_class = priority;
@@ -161,14 +190,16 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     AnthropicStream messages_stream(completion_id, model);
     bool headers_sent = false;
     bool write_failed = false;
-    const auto chunk_object = [&](json::Object delta, json::Value finish) {
+    const auto chunk_object = [&](json::Object delta, json::Value finish, json::Value logprobs_val = nullptr) {
+        json::Object choice{{"index", 0}, {"delta", std::move(delta)}, {"finish_reason", std::move(finish)}};
+        if (job.sampling.logprobs) {
+            choice.set("logprobs", std::move(logprobs_val));
+        }
         return json::Object{{"id", completion_id},
                             {"object", "chat.completion.chunk"},
                             {"created", created_at},
                             {"model", model},
-                            {"choices", json::Array{json::Object{{"index", 0},
-                                                                 {"delta", std::move(delta)},
-                                                                 {"finish_reason", std::move(finish)}}}}};
+                            {"choices", json::Array{std::move(choice)}}};
     };
     const auto send_frame = [&](std::string_view frame) {
         if (!write_failed && !frame.empty() && !ex.write(frame)) {
@@ -194,10 +225,98 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
         return send_event(chunk_object(json::Object{{"role", "assistant"}, {"content", ""}}, nullptr));
     };
 
+    const bool tools_enabled = !job.tools.empty();
+    ToolCallStreamParser tool_parser("call_" + *ro.request_id + "_");
     bool saw_text = false;
+    bool emitted_tool_calls = false;
+
+    const auto emit_parsed_tool = [&](const ParsedToolEvent& ev) -> bool {
+        emitted_tool_calls = true;
+        if (!ensure_stream_head()) return false;
+        if (anthropic) {
+            return send_frame(messages_stream.tool_call(ToolCall{ev.id, ev.name, ev.arguments_json}));
+        }
+        json::Array tcs;
+        tcs.emplace_back(openai_tool_call_delta_json(ev.index, ev.id, ev.name, ev.arguments_json));
+        return send_event(chunk_object(json::Object{{"tool_calls", std::move(tcs)}}, nullptr));
+    };
+
     TokenCallback on_chunk;
     if (job.stream) {
         on_chunk = [&](const TokenChunk& chunk) {
+            // 1. Native upstream tool call deltas (e.g. llama-server).
+            if (!chunk.tool_call_deltas.empty()) {
+                emitted_tool_calls = true;
+                if (!ensure_stream_head()) {
+                    session->cancel();
+                    return false;
+                }
+                if (anthropic) {
+                    for (const auto& tcd : chunk.tool_call_deltas) {
+                        if (!send_frame(messages_stream.tool_call_delta(tcd))) {
+                            session->cancel();
+                            return false;
+                        }
+                    }
+                } else {
+                    json::Array tcs;
+                    tcs.reserve(chunk.tool_call_deltas.size());
+                    for (const auto& tcd : chunk.tool_call_deltas) {
+                        tcs.emplace_back(openai_tool_call_delta_json(tcd.index, tcd.id, tcd.name, tcd.arguments_delta));
+                    }
+                    if (!send_event(chunk_object(json::Object{{"tool_calls", std::move(tcs)}}, nullptr))) {
+                        session->cancel();
+                        return false;
+                    }
+                }
+            }
+
+            // 2. Visible text & reasoning (with incremental <tool_call> tag parsing when tools are active).
+            if (tools_enabled) {
+                const ToolCallStreamOutput parsed = tool_parser.feed(chunk.text);
+                if (!parsed.visible_text.empty() || !chunk.reasoning.empty()) {
+                    if (!parsed.visible_text.empty()) saw_text = true;
+                    if (!ensure_stream_head()) {
+                        session->cancel();
+                        return false;
+                    }
+                    if (anthropic) {
+                        TokenChunk vis{parsed.visible_text, chunk.index, chunk.reasoning};
+                        if (!send_frame(messages_stream.chunk(vis))) {
+                            session->cancel();
+                            return false;
+                        }
+                    } else {
+                        json::Object delta;
+                        if (!parsed.visible_text.empty() || chunk.reasoning.empty()) {
+                            delta.set("content", parsed.visible_text);
+                        }
+                        if (!chunk.reasoning.empty()) {
+                            delta.set("reasoning_content", std::string(chunk.reasoning));
+                        }
+                        json::Value lp_val = nullptr;
+                        if (job.sampling.logprobs && chunk.logprob.has_value() && !parsed.visible_text.empty()) {
+                            lp_val = chat_logprobs_json(
+                                {TokenLogprob{parsed.visible_text, *chunk.logprob, chunk.top_logprobs}});
+                        }
+                        if (!send_event(chunk_object(std::move(delta), nullptr, std::move(lp_val)))) {
+                            session->cancel();
+                            return false;
+                        }
+                    }
+                }
+                for (const auto& ev : parsed.tool_calls) {
+                    if (!emit_parsed_tool(ev)) {
+                        session->cancel();
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            if (chunk.text.empty() && chunk.reasoning.empty()) {
+                return true;
+            }
             if (!chunk.text.empty()) {
                 saw_text = true;
             }
@@ -207,9 +326,13 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
                 if (!chunk.reasoning.empty()) delta.set("reasoning_content", std::string(chunk.reasoning));
                 return delta;
             };
+            json::Value lp_val = nullptr;
+            if (!anthropic && job.sampling.logprobs && chunk.logprob.has_value() && !chunk.text.empty()) {
+                lp_val = chat_logprobs_json({TokenLogprob{std::string(chunk.text), *chunk.logprob, chunk.top_logprobs}});
+            }
             if (!ensure_stream_head() ||
                 !(anthropic ? send_frame(messages_stream.chunk(chunk))
-                            : send_event(chunk_object(openai_delta(), nullptr)))) {
+                            : send_event(chunk_object(openai_delta(), nullptr, std::move(lp_val))))) {
                 session->cancel();
                 return false;
             }
@@ -217,7 +340,20 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
         };
     }
 
-    auto result = session->chat(job.messages, on_chunk, job.sampling, ro);
+    std::vector<ChatMessage> prepared_messages;
+    const std::vector<ChatMessage>* messages_to_send = &job.messages;
+    if (tools_enabled && !backend_native_tools) {
+        prepared_messages = job.messages;
+        const std::string tool_prompt = format_tools_system_prompt(job.tools, job.tool_choice);
+        if (!prepared_messages.empty() && prepared_messages.front().role == "system") {
+            prepared_messages.front().content += "\n\n" + tool_prompt;
+        } else {
+            prepared_messages.insert(prepared_messages.begin(), ChatMessage{"system", tool_prompt});
+        }
+        messages_to_send = &prepared_messages;
+    }
+
+    auto result = session->chat(*messages_to_send, on_chunk, job.sampling, ro);
     end_request();
     const bool rejected = session->last_scheduler_rejected();
 
@@ -247,8 +383,42 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
         return;
     }
     const GenerationResult& r = result.value();
-    const bool empty_text = job.stream ? !saw_text : r.text.empty();
-    if (empty_text && std::string_view(finish_reason(r)) == "length") warnings.emplace_back("empty_content_at_length");
+    if (job.stream && tools_enabled) {
+        const ToolCallStreamOutput tail = tool_parser.flush();
+        if (!tail.visible_text.empty()) {
+            saw_text = true;
+            if (ensure_stream_head()) {
+                if (anthropic) {
+                    (void)send_frame(messages_stream.chunk(TokenChunk{tail.visible_text, 0}));
+                } else {
+                    (void)send_event(chunk_object(json::Object{{"content", tail.visible_text}}, nullptr));
+                }
+            }
+        }
+        for (const auto& ev : tail.tool_calls) {
+            (void)emit_parsed_tool(ev);
+        }
+    }
+
+    std::string visible_text;
+    std::vector<ToolCall> final_tool_calls;
+    if (!job.stream) {
+        if (!r.tool_calls.empty()) {
+            visible_text = r.text;
+            final_tool_calls = r.tool_calls;
+        } else if (tools_enabled) {
+            ExtractedToolOutput extracted = extract_tool_calls(r.text, "call_" + *ro.request_id + "_");
+            visible_text = std::move(extracted.visible_text);
+            final_tool_calls = std::move(extracted.tool_calls);
+        } else {
+            visible_text = r.text;
+        }
+    }
+    const bool has_tool_calls = job.stream ? emitted_tool_calls : !final_tool_calls.empty();
+    const char* effective_finish = has_tool_calls ? "tool_calls" : finish_reason(r);
+
+    const bool empty_text = job.stream ? (!saw_text && !has_tool_calls) : (visible_text.empty() && !has_tool_calls);
+    if (empty_text && std::string_view(effective_finish) == "length") warnings.emplace_back("empty_content_at_length");
     json::Object meta{
         {"api_version", kApiVersion},  {"request_id", r.request_id},
         {"session_id", session->id()}, {"backend", backend},
@@ -259,22 +429,35 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     session->close();
     if (!job.stream) {
         if (anthropic) {
-            json::Object doc = anthropic_message_response(completion_id, model, r, warnings);
+            json::Object doc = anthropic_message_response(completion_id, model, r, warnings, final_tool_calls,
+                                                          std::string_view(visible_text));
             doc.set("sonder", std::move(meta));
             ex.send_json(200, doc);
             return;
         }
-        json::Object message{{"role", "assistant"}, {"content", r.text}};
+        json::Object message{{"role", "assistant"},
+                             {"content", (!final_tool_calls.empty() && visible_text.empty())
+                                             ? json::Value(nullptr)
+                                             : json::Value(visible_text)}};
         if (!r.reasoning.empty()) message.set("reasoning_content", r.reasoning);
+        if (!final_tool_calls.empty()) {
+            json::Array tcs;
+            tcs.reserve(final_tool_calls.size());
+            for (const auto& tc : final_tool_calls) {
+                tcs.emplace_back(openai_tool_call_json(tc));
+            }
+            message.set("tool_calls", std::move(tcs));
+        }
+        json::Object choice{{"index", 0}, {"message", std::move(message)}, {"finish_reason", effective_finish}};
+        if (job.sampling.logprobs) {
+            choice.set("logprobs", chat_logprobs_json(r.logprobs));
+        }
         json::Object doc{
             {"id", completion_id},
             {"object", "chat.completion"},
             {"created", created_at},
             {"model", model},
-            {"choices",
-             json::Array{json::Object{{"index", 0},
-                                      {"message", std::move(message)},
-                                      {"finish_reason", finish_reason(r)}}}},
+            {"choices", json::Array{std::move(choice)}},
             {"usage", usage_json(r)},
             {"timings", timings_json(r)},
             {"sonder", std::move(meta)}};
@@ -288,7 +471,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
         (void)send_frame(messages_stream.finish(r, warnings, std::move(meta)));
         return;
     }
-    json::Object last = chunk_object(json::Object{}, finish_reason(r));
+    json::Object last = chunk_object(json::Object{}, effective_finish);
     if (job.include_usage) {
         last.set("usage", usage_json(r));
     }
@@ -427,14 +610,14 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
 
     bool headers_sent = false;
     bool write_failed = false;
-    const auto chunk_object = [&](std::string text, json::Value finish) {
+    const auto chunk_object = [&](std::string text, json::Value finish, json::Value logprobs_val = nullptr) {
         return json::Object{{"id", completion_id},
                             {"object", "text_completion"},
                             {"created", created_at},
                             {"model", model},
                             {"choices", json::Array{json::Object{{"text", std::move(text)},
                                                                  {"index", 0},
-                                                                 {"logprobs", nullptr},
+                                                                 {"logprobs", std::move(logprobs_val)},
                                                                  {"finish_reason", std::move(finish)}}}}};
     };
     const auto send_frame = [&](std::string_view frame) {
@@ -461,13 +644,20 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
         return true;
     };
 
+    std::size_t text_offset = job.echo ? job.prompt.size() : 0;
     TokenCallback on_chunk;
     if (job.stream) {
         on_chunk = [&](const TokenChunk& chunk) {
             if (chunk.text.empty()) {
                 return true;
             }
-            if (!ensure_stream_head() || !send_event(chunk_object(std::string(chunk.text), nullptr))) {
+            json::Value lp_val = nullptr;
+            if (job.sampling.logprobs && chunk.logprob.has_value()) {
+                lp_val = completion_logprobs_json(
+                    {TokenLogprob{std::string(chunk.text), *chunk.logprob, chunk.top_logprobs}}, text_offset);
+            }
+            text_offset += chunk.text.size();
+            if (!ensure_stream_head() || !send_event(chunk_object(std::string(chunk.text), nullptr, std::move(lp_val)))) {
                 session->cancel();
                 return false;
             }
@@ -507,6 +697,10 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
     session->close();
     if (!job.stream) {
         std::string text = job.echo ? (job.prompt + r.text) : r.text;
+        json::Value lp_val =
+            job.sampling.logprobs
+                ? json::Value(completion_logprobs_json(r.logprobs, job.echo ? job.prompt.size() : 0))
+                : json::Value(nullptr);
         json::Object doc{
             {"id", completion_id},
             {"object", "text_completion"},
@@ -515,7 +709,7 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
             {"choices",
              json::Array{json::Object{{"text", std::move(text)},
                                       {"index", 0},
-                                      {"logprobs", nullptr},
+                                      {"logprobs", std::move(lp_val)},
                                       {"finish_reason", finish_reason(r)}}}},
             {"usage", usage_json(r)},
             {"timings", timings_json(r)},

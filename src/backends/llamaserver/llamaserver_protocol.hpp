@@ -56,7 +56,8 @@ json::Value build_completion_body(const std::string &model, const GenerateReques
                                   bool native_completion, std::string_view grammar = {},
                                   const RequestExtras &extras = {});
 // Also forwards request.thinking as chat_template_kwargs when set (or as
-// top-level fields with extras.generic_thinking).
+// top-level fields with extras.generic_thinking), plus tools, tool_choice,
+// tool_calls, tool_call_id, multimodal image_url content blocks, and logprobs.
 json::Value build_chat_body(const std::string &model, const ChatRequest &request,
                             std::string_view grammar = {}, const RequestExtras &extras = {});
 Status parse_timings(const json::Value &value, Timings &out);
