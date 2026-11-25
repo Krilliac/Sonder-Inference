@@ -166,6 +166,7 @@ struct GenerateParams {
     bool stream = true;
     bool retain_text = true;        // false avoids buffering when caller only streams via callback
     std::optional<bool> think;
+    std::optional<json::Value> format;  // Ollama "format" ("json" or JSON Schema object)
     std::string keep_alive;         // overrides OllamaConfig::keep_alive
     json::Object options;           // Ollama "options" (num_predict, seed, ...)
 };
@@ -176,6 +177,7 @@ struct ChatParams {
     bool stream = true;
     bool retain_text = true;        // false avoids buffering when caller only streams via callback
     std::optional<bool> think;
+    std::optional<json::Value> format;  // Ollama "format" ("json" or JSON Schema object)
     std::string keep_alive;
     json::Object options;
 };

@@ -124,9 +124,25 @@ struct GenerateRequest {
     std::string request_id;
     std::string prompt;
     SamplingConfig sampling;
+    // Optional conversation/slot affinity key for backends with prefix caching.
+    std::string session_key{};
+    // Optional GBNF grammar constraining output (empty = unconstrained).
+    std::string grammar{};
     // Optional non-owning atomic checkpoint exchange for hybrid/recurrent models.
     // Must outlive the generate() / open_token_stream() call when non-null.
     RecurrentCheckpointExchange* checkpoint = nullptr;
+};
+
+struct EmbedRequest {
+    std::string request_id;
+    std::vector<std::string> inputs;
+    bool normalize = true;
+};
+
+struct EmbedResult {
+    std::vector<std::vector<float>> embeddings;
+    std::uint64_t prompt_tokens = 0;
+    std::uint64_t eval_ns = 0;
 };
 
 struct TokenChunk {
@@ -239,6 +255,13 @@ struct ChatRequest {
     // Request reasoning as a separate stream from visible assistant text.
     // False preserves the historical text-only callback contract.
     bool separate_reasoning = false;
+    // Optional GBNF grammar constraining output (empty = unconstrained).
+    std::string grammar{};
+    // Optional OpenAI response_format hint ("text", "json_object", "json_schema")
+    // and serialized JSON schema (when type == "json_schema") for upstreams that
+    // handle response_format natively (e.g. llama-server).
+    std::optional<std::string> response_format_type = std::nullopt;
+    std::optional<std::string> response_format_schema = std::nullopt;
 };
 
 // True for "system", "user", "assistant" and "tool".
@@ -303,6 +326,17 @@ public:
     virtual Result<std::vector<TokenId>> tokenize(std::string_view text) {
         (void)text;
         return Status(ErrorCode::unsupported, "backend does not expose tokenization");
+    }
+    // Optional (Capability::tokenization): decode token ids back to UTF-8 text.
+    virtual Result<std::string> detokenize(std::span<const TokenId> tokens) {
+        (void)tokens;
+        return Status(ErrorCode::unsupported, "backend does not expose detokenization");
+    }
+    // Optional (Capability::embeddings): compute dense embeddings for one or more inputs.
+    virtual Result<EmbedResult> embed(const EmbedRequest& request, const CancellationToken& cancel) {
+        (void)request;
+        (void)cancel;
+        return Status(ErrorCode::unsupported, "backend does not expose embeddings");
     }
     // Optional (Capability::token_logits): open a token-level decode loop for
     // `request` (prompt prefilled). Sonder samples from the returned logits.

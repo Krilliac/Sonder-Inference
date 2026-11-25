@@ -45,6 +45,13 @@ struct BackendSetup {
     std::optional<std::string> llamacpp_kv_cache_type_k;
     std::optional<std::string> llamacpp_kv_cache_type_v;
     std::optional<std::string> llamacpp_flash_attention;
+    std::optional<std::int32_t> llamacpp_threads;
+    std::optional<bool> llamacpp_use_mmap;
+    std::optional<bool> llamacpp_kv_unified;
+    std::optional<bool> llamacpp_prefix_cache;
+    std::optional<std::uint32_t> llamacpp_slots;
+    std::optional<std::string> llamacpp_spec_type;
+    std::optional<std::int32_t> llamacpp_spec_draft_max;
     // MOCK backend: artificial per-token latency.
     std::chrono::microseconds mock_token_delay{0};
     // MOCK backend: >= 0 injects a backend error after that many tokens

@@ -159,3 +159,65 @@ TEST_CASE("backend: typical_p is rejected, not silently dropped") {
     CHECK(st.status().message().find("typical_p") != std::string::npos);
     CHECK(srv.last_generate_body().empty());
 }
+
+TEST_CASE("backend: forwards native JSON format on chat and rejects raw GBNF grammar") {
+    FakeOllamaServer srv;
+    srv.set_show("llama3.2:3b", fixture("show.json"));
+    StreamScript chat_script;
+    chat_script.body = fixture("chat_stream.ndjson");
+    srv.set_chat(chat_script);
+
+    auto be = make_ollama_backend(config_for(srv));
+    CHECK(be->capabilities().has(Capability::structured_output));
+    auto m = be->load_model({"llama3.2:3b", "cpu:0"});
+    REQUIRE(m.ok());
+
+    // Raw GBNF on generate() and chat() is rejected with ErrorCode::unsupported.
+    {
+        GenerateRequest greq;
+        greq.prompt = "hi";
+        greq.grammar = "root ::= \"ok\"";
+        auto st = m.value()->generate(greq, {}, {});
+        REQUIRE_FALSE(st.ok());
+        CHECK(st.status().code() == ErrorCode::unsupported);
+        CHECK(srv.last_generate_body().empty());
+    }
+    {
+        ChatRequest creq;
+        creq.messages = {{"user", "hi"}};
+        creq.grammar = "root ::= \"ok\"";
+        auto st = m.value()->chat(creq, {}, {});
+        REQUIRE_FALSE(st.ok());
+        CHECK(st.status().code() == ErrorCode::unsupported);
+        CHECK(srv.last_chat_body().empty());
+    }
+
+    // json_object forwards `"format": "json"`.
+    {
+        ChatRequest creq;
+        creq.messages = {{"user", "json"}};
+        creq.response_format_type = "json_object";
+        creq.grammar = "root ::= object";
+        auto st = m.value()->chat(creq, {}, {});
+        REQUIRE_MESSAGE(st.ok(), st.status().message());
+        auto sent = json::parse(srv.last_chat_body());
+        REQUIRE(sent.ok());
+        REQUIRE(sent->find("format") != nullptr);
+        CHECK(sent->find("format")->as_string() == "json");
+    }
+
+    // json_schema forwards `"format": { ...schema... }`.
+    {
+        ChatRequest creq;
+        creq.messages = {{"user", "schema"}};
+        creq.response_format_type = "json_schema";
+        creq.response_format_schema = R"({"type":"object","properties":{"x":{"type":"integer"}},"required":["x"]})";
+        auto st = m.value()->chat(creq, {}, {});
+        REQUIRE_MESSAGE(st.ok(), st.status().message());
+        auto sent = json::parse(srv.last_chat_body());
+        REQUIRE(sent.ok());
+        REQUIRE(sent->find("format") != nullptr);
+        CHECK(sent->find("format")->is_object());
+        CHECK(sent->find("format")->find("type")->as_string() == "object");
+    }
+}

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -49,9 +50,12 @@ namespace {
 
 namespace lc = sonder::backends::llamacpp;
 namespace fs = std::filesystem;
+using llamacpp_detail::ApplyNoThinkScaffolding;
 using llamacpp_detail::PathFromUtf8;
 using llamacpp_detail::PathToUtf8;
 using llamacpp_detail::StopSequenceFilter;
+using llamacpp_detail::ThinkingSplitResult;
+using llamacpp_detail::ThinkingStreamSplitter;
 using llamacpp_detail::ToLlamaSampling;
 
 ErrorCode MapError(lc::ErrorCode code) {
@@ -83,6 +87,12 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     lo.main_gpu = o.main_gpu;
     lo.tensor_split = o.tensor_split;
     lo.use_mlock = o.use_mlock;
+    lo.use_mmap = o.use_mmap;
+    lo.kv_unified = o.kv_unified;
+    lo.prefix_cache = o.prefix_cache;
+    lo.n_slots = o.slots;
+    lo.spec_type = o.spec_type;
+    lo.spec_draft_max = o.spec_draft_max;
     if (!lc::ParseSplitMode(o.split_mode, lo.split_mode)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown split mode '" + o.split_mode + "' (expected none, layer or row)");
@@ -90,12 +100,12 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     if (!lc::ParseKvCacheType(o.kv_cache_type_k, lo.type_k)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown K cache type '" + o.kv_cache_type_k +
-                          "' (expected f16, f32, bf16, q8_0, q5_1, q5_0, q4_1, q4_0 or iq4_nl)");
+                          "' (expected f16, f32, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl, f8_e4m3, q2_0 or pq2_0)");
     }
     if (!lc::ParseKvCacheType(o.kv_cache_type_v, lo.type_v)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown V cache type '" + o.kv_cache_type_v +
-                          "' (expected f16, f32, bf16, q8_0, q5_1, q5_0, q4_1, q4_0 or iq4_nl)");
+                          "' (expected f16, f32, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl, f8_e4m3, q2_0 or pq2_0)");
     }
     if (!lc::ParseFlashAttention(o.flash_attention, lo.flash_attn)) {
         return Status(ErrorCode::invalid_argument,
@@ -122,12 +132,54 @@ public:
     [[nodiscard]] const ModelDescriptor& descriptor() const override { return desc_; }
 
     Result<std::vector<TokenId>> tokenize(std::string_view text) override {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);
         std::vector<lc::Token> tokens;
         if (lc::Status s = runtime_.Tokenize(text, /*add_special=*/true, tokens, /*parse_special=*/false); !s.ok()) {
             return ToStatus(s);
         }
         return tokens;
+    }
+
+    Result<std::string> detokenize(std::span<const TokenId> tokens) override {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::string text;
+        if (lc::Status s = runtime_.Detokenize(tokens, text); !s.ok()) {
+            return ToStatus(s);
+        }
+        return text;
+    }
+
+    Result<EmbedResult> embed(const EmbedRequest& request, const CancellationToken& cancel) override {
+        if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
+        if (request.inputs.empty()) {
+            return Status(ErrorCode::invalid_argument, "embed request inputs are empty");
+        }
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        std::vector<std::vector<lc::Token>> tokenized;
+        tokenized.reserve(request.inputs.size());
+        for (const std::string& input : request.inputs) {
+            if (cancel.cancelled()) return Status(ErrorCode::cancelled, "embedding cancelled");
+            std::vector<lc::Token> toks;
+            if (lc::Status s = runtime_.Tokenize(input, /*add_special=*/true, toks, /*parse_special=*/false); !s.ok()) {
+                return ToStatus(s);
+            }
+            if (toks.empty()) {
+                return Status(ErrorCode::invalid_argument, "embed input produced no tokens");
+            }
+            tokenized.push_back(std::move(toks));
+        }
+        lc::EmbedOutput emb_out;
+        const lc::Status st =
+            runtime_.Embed(tokenized, request.normalize, emb_out, [&] { return cancel.cancelled(); });
+        if (!st.ok()) {
+            if (cancel.cancelled()) return Status(ErrorCode::cancelled, "embedding cancelled");
+            return ToStatus(st);
+        }
+        EmbedResult result;
+        result.embeddings = std::move(emb_out.embeddings);
+        result.prompt_tokens = static_cast<std::uint64_t>(emb_out.prompt_tokens);
+        result.eval_ns = MsToNs(emb_out.eval_ms);
+        return result;
     }
 
     Result<GenerateStats> generate(const GenerateRequest& request, const CancellationToken& cancel,
@@ -144,14 +196,15 @@ public:
                               "); reload with a larger context_length");
         }
         // One llama_context per model: serialize requests (including atomic
-        // checkpoint restore and prefill-boundary capture) under one lock.
-        std::lock_guard<std::mutex> lock(mutex_);
+        // checkpoint restore and prefill-boundary capture) under one exclusive lock.
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         std::vector<lc::Token> prompt_tokens;
         if (lc::Status s = runtime_.Tokenize(request.prompt, /*add_special=*/true, prompt_tokens, /*parse_special=*/false);
             !s.ok()) {
             return ToStatus(s);
         }
-        return run_tokens(std::move(prompt_tokens), request.sampling, cancel, on_chunk, request.checkpoint);
+        return run_tokens(std::move(prompt_tokens), request.sampling, cancel, on_chunk, request.session_key,
+                          request.grammar, /*separate_reasoning=*/false, request.checkpoint);
     }
 
     // Chat through the GGUF chat template (llama_chat_apply_template). Models
@@ -170,7 +223,7 @@ public:
                               " exceeds the loaded llama.cpp context (" + std::to_string(desc_.context_length) +
                               "); reload with a larger context_length");
         }
-        std::unique_lock<std::mutex> lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         bool template_unsupported = false;
         auto segments = build_chat_template_segments(
             request.messages,
@@ -193,6 +246,9 @@ public:
             }
             return segments.status();
         }
+        if (request.thinking.enable_thinking.has_value() && !*request.thinking.enable_thinking) {
+            ApplyNoThinkScaffolding(segments.value(), /*enable_thinking=*/false);
+        }
         std::vector<lc::Token> prompt_tokens;
         const Status tok_status = tokenize_chat_segments(
             segments.value(),
@@ -201,12 +257,13 @@ public:
             },
             prompt_tokens);
         if (!tok_status.ok()) return tok_status;
-        return run_tokens(std::move(prompt_tokens), request.sampling, cancel, on_chunk);
+        return run_tokens(std::move(prompt_tokens), request.sampling, cancel, on_chunk, request.session_key,
+                          request.grammar, request.separate_reasoning);
     }
 
     [[nodiscard]] bool has_native_chat() const override {
         std::string ignored;
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);
         return runtime_.ApplyChatTemplate({lc::ChatTurn{"user", "x"}}, true, ignored).ok();
     }
 
@@ -214,7 +271,7 @@ public:
         if (token_position == 0) {
             return Status(ErrorCode::invalid_argument, "recurrent checkpoint token_position must be > 0");
         }
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         RecurrentStateSnapshot snapshot;
         snapshot.token_position = token_position;
         if (lc::Status s = runtime_.CaptureSequenceState(snapshot.bytes, kMaxRecurrentCheckpointBytes); !s.ok()) {
@@ -231,7 +288,7 @@ public:
             return Status(ErrorCode::invalid_argument,
                           "recurrent checkpoint snapshot exceeds kMaxRecurrentCheckpointBytes");
         }
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         return ToStatus(runtime_.RestoreSequenceState(bytes, kMaxRecurrentCheckpointBytes));
     }
 
@@ -240,6 +297,8 @@ private:
     // trusted/untrusted tokenization boundary.
     Result<GenerateStats> run_tokens(std::vector<lc::Token> prompt_tokens, const SamplingConfig& sampling,
                                      const CancellationToken& cancel, const TokenCallback& on_chunk,
+                                     std::string_view session_key = {}, std::string_view grammar = {},
+                                     bool separate_reasoning = false,
                                      RecurrentCheckpointExchange* checkpoint = nullptr) {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
 
@@ -248,6 +307,8 @@ private:
         if (req.prompt.empty()) return Status(ErrorCode::invalid_argument, "prompt produced no tokens");
         req.max_new_tokens = sampling.max_tokens;
         req.sampling = ToLlamaSampling(sampling);
+        req.sampling.grammar = std::string(grammar);
+        req.session_key = std::string(session_key);
         if (checkpoint != nullptr) {
             if (!checkpoint->restore_bytes.empty() && checkpoint->restore_token_position > 0 &&
                 checkpoint->restore_token_position < req.prompt.size()) {
@@ -279,12 +340,33 @@ private:
         stats.load_ns = load_ns_;
         stats.token_counts_from_backend = true;
         StopSequenceFilter stop(sampling.stop);
+        ThinkingStreamSplitter thinking_splitter;
         bool callback_stopped = false;
+
+        auto deliver_split = [&](std::string_view text_part, std::string_view reasoning_part) {
+            if (!reasoning_part.empty() && !callback_stopped) {
+                if (on_chunk && !on_chunk(TokenChunk{std::string_view{}, stats.chunks, reasoning_part})) {
+                    callback_stopped = true;
+                }
+                ++stats.chunks;
+            }
+            if (!text_part.empty() && !callback_stopped) {
+                if (on_chunk && !on_chunk(TokenChunk{text_part, stats.chunks, std::string_view{}})) {
+                    callback_stopped = true;
+                }
+                ++stats.chunks;
+            }
+        };
 
         auto deliver = [&](std::string_view text) {
             if (text.empty() || callback_stopped) return;
-            if (on_chunk && !on_chunk(TokenChunk{text, stats.chunks})) callback_stopped = true;
-            ++stats.chunks;
+            if (!separate_reasoning) {
+                if (on_chunk && !on_chunk(TokenChunk{text, stats.chunks})) callback_stopped = true;
+                ++stats.chunks;
+                return;
+            }
+            const ThinkingSplitResult split = thinking_splitter.Push(text);
+            deliver_split(split.text, split.reasoning);
         };
 
         const lc::GenerateResult r = runtime_.Generate(
@@ -306,15 +388,30 @@ private:
             }
         }
 
-        const std::uint64_t restored_tokens =
-            r.state_restored ? static_cast<std::uint64_t>(req.restore_tokens) : 0;
-        stats.prompt_tokens = static_cast<std::uint64_t>(r.prompt_tokens) + restored_tokens;
-        if (r.state_restored) {
-            stats.cached_tokens = restored_tokens;
+        const std::uint64_t cached = r.state_restored ? static_cast<std::uint64_t>(req.restore_tokens)
+                                                      : static_cast<std::uint64_t>(r.cached_tokens);
+        stats.prompt_tokens = static_cast<std::uint64_t>(r.prompt_tokens) + cached;
+        stats.cached_tokens = cached;
+        if (r.draft_tokens > 0 || r.draft_accepted_tokens > 0) {
+            stats.draft_tokens = static_cast<std::uint64_t>(r.draft_tokens);
+            stats.draft_accepted_tokens = static_cast<std::uint64_t>(r.draft_accepted_tokens);
         }
         stats.completion_tokens = static_cast<std::uint64_t>(r.generated_tokens);
         stats.prompt_eval_ns = MsToNs(r.prefill_ms);
         stats.eval_ns = MsToNs(r.decode_ms);
+        if (r.decode_ms > 0.0 && r.generated_tokens > 0) {
+            stats.predicted_tokens_per_second = r.decode_tokens_per_second();
+        }
+        BackendTimings timings;
+        timings.prompt_n = static_cast<std::uint64_t>(r.prompt_tokens);
+        timings.cache_n = cached;
+        timings.prompt_ms = r.prefill_ms;
+        timings.predicted_n = static_cast<std::uint64_t>(r.generated_tokens);
+        timings.predicted_ms = r.decode_ms;
+        timings.draft_n = static_cast<std::uint64_t>(r.draft_tokens);
+        timings.draft_n_accepted = static_cast<std::uint64_t>(r.draft_accepted_tokens);
+        stats.backend_timings = timings;
+
         if (!r.status.ok()) return ToStatus(r.status);
 
         switch (r.stop_reason) {
@@ -339,6 +436,13 @@ private:
         }
         if (stats.stop_reason != StopReason::stop_sequence && stats.stop_reason != StopReason::callback) {
             deliver(stop.Flush());
+            if (separate_reasoning && !callback_stopped) {
+                const ThinkingSplitResult tail = thinking_splitter.Flush();
+                deliver_split(tail.text, tail.reasoning);
+            }
+        } else if (stats.stop_reason == StopReason::stop_sequence && separate_reasoning && !callback_stopped) {
+            const ThinkingSplitResult tail = thinking_splitter.Flush();
+            deliver_split(tail.text, tail.reasoning);
         }
         return stats;
     }
@@ -346,7 +450,7 @@ private:
     ModelDescriptor desc_;
     lc::LlamaCppBackend runtime_;
     std::uint64_t load_ns_ = 0;
-    mutable std::mutex mutex_;
+    mutable std::shared_mutex mutex_;
 };
 
 class LlamaCppCoreBackend final : public Backend {
@@ -362,6 +466,10 @@ public:
         caps.add(Capability::tokenization)
             .add(Capability::streaming)
             .add(Capability::batched_prefill)
+            .add(Capability::prefix_reuse)
+            .add(Capability::speculative_decode)
+            .add(Capability::structured_output)
+            .add(Capability::embeddings)
             .add(Capability::deterministic)
             .add(Capability::recurrent_checkpoint);
         return caps;
@@ -406,14 +514,27 @@ public:
         }
         const std::string_view dev = options.device_id;
         bool has_gpu = false;
+        std::vector<lc::DeviceInfo> enumerated_devices;
         if (dev.rfind("gpu", 0) == 0) {
-            for (const auto& d : lc::LlamaCppBackend::EnumerateDevices()) {
+            enumerated_devices = lc::LlamaCppBackend::EnumerateDevices();
+            for (const auto& d : enumerated_devices) {
                 has_gpu = has_gpu || d.kind == lc::DeviceKind::kGpu || d.kind == lc::DeviceKind::kIntegratedGpu;
             }
         }
         const auto gpu_layers = llamacpp_detail::ResolveGpuLayers(options_, dev, has_gpu);
         if (!gpu_layers.ok()) return gpu_layers.status();
         lo.n_gpu_layers = gpu_layers.value();
+        if (lo.n_gpu_layers != 0) {
+            const std::vector<GpuDeviceInfo> os_gpus =
+                (dev.rfind("gpu:", 0) == 0 && lo.devices.empty() && lo.tensor_split.empty())
+                    ? enumerate_gpu_devices()
+                    : std::vector<GpuDeviceInfo>{};
+            if (Status s = llamacpp_detail::ResolveGpuDevicePin(dev, enumerated_devices, lo.devices, lo.main_gpu,
+                                                                lo.tensor_split, os_gpus);
+                !s.ok()) {
+                return s;
+            }
+        }
 
         lc::LlamaCppBackend runtime;
         double load_ms = 0.0;

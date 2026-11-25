@@ -142,10 +142,12 @@ struct Server::Impl {
     }
 
     void write_json(Exchange& ex, int status, const json::Object& body, const Headers& extra = {}) const {
+        if (stopping.load()) ex.keep_alive = false;
         send_json(ex, status, body, opts.write_stall_timeout, hard_stop, extra);
     }
 
     void write_error(Exchange& ex, const ApiError& error, Headers extra = {}) const {
+        if (stopping.load()) ex.keep_alive = false;
         send_error(ex, error, opts.write_stall_timeout, hard_stop, std::move(extra));
     }
 
@@ -209,6 +211,11 @@ struct Server::Impl {
     }
 
     // ------------------------------------------------------------ routes
+
+    bool backend_has_capability(Capability cap) {
+        std::lock_guard<std::mutex> lock(engine_mu);
+        return backend && backend->capabilities().has(cap);
+    }
 
     bool require_ready(Exchange& ex) {
         const State s = state.load();
@@ -371,6 +378,14 @@ struct Server::Impl {
             return;
         }
         const ModelResidency::Pin pin = std::move(pinned).value();
+        if ((job.response_format_type.has_value() || !job.grammar.empty()) &&
+            !backend_has_capability(Capability::structured_output)) {
+            write_error(ex,
+                        make_error(400, "unsupported_parameter",
+                                   "backend '" + pin.backend() + "' does not support structured output / grammar constraints",
+                                   job.response_format_type ? "response_format" : "grammar"));
+            return;
+        }
         // Launch profile defaults fill only the fields the request left unset
         // (both chat protocols; "default" resolves to the served id first).
         if (const ModelProfileBinding* binding = find_profile_binding(opts, *served_id)) {
@@ -423,6 +438,7 @@ struct Server::Impl {
             [&](std::string_view data) { return write_raw(ex, data); },
             [&] {
                 ex.status = 200;
+                ex.keep_alive = false;
                 Headers h = base_headers(ex, "text/event-stream; charset=utf-8");
                 h.emplace_back("X-Accel-Buffering", "no");
                 return write_raw(ex, format_head(200, h));
@@ -433,40 +449,430 @@ struct Server::Impl {
         execute_chat(exchange, job, corr, pin.id(), pin.backend(), session, protocol);
     }
 
-    // --------------------------------------------------------- connection
+    void handle_completions(Exchange& ex, const RequestHead& head, const std::string& body) {
+        auto corr_v = parse_correlation(head);
+        if (auto* e = std::get_if<ApiError>(&corr_v)) {
+            write_error(ex, *e);
+            return;
+        }
+        const Correlation corr = std::get<Correlation>(corr_v);
+        std::variant<CompletionJob, ApiError> job_v = make_error(500, "internal_error", "uninitialized");
+        {
+            const auto parse_timeout = std::min(opts.read_timeout, std::chrono::milliseconds(2000));
+            auto parse_guard = parse_gate.acquire(body.size(), parse_timeout);
+            if (!parse_guard) {
+                if (!require_ready(ex)) {
+                    return;
+                }
+                ApiError e = make_error(503, "overloaded", "request parser concurrency limit reached; retry later");
+                e.retry_after = 1;
+                write_error(ex, e);
+                return;
+            }
+            job_v = parse_completion_request(body);
+        }
+        if (auto* e = std::get_if<ApiError>(&job_v)) {
+            write_error(ex, *e);
+            return;
+        }
+        CompletionJob job = std::move(std::get<CompletionJob>(job_v));
+        if (!require_ready(ex)) {
+            return;
+        }
+        const auto served_id = residency->resolve(job.model);
+        if (!served_id) {
+            write_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
+            return;
+        }
+        auto pinned = residency->acquire(*served_id);
+        if (!pinned.ok()) {
+            write_error(ex, load_failure_error(*served_id, pinned.status()));
+            return;
+        }
+        const ModelResidency::Pin pin = std::move(pinned).value();
+        if (!job.grammar.empty() && !backend_has_capability(Capability::structured_output)) {
+            write_error(ex, make_error(400, "unsupported_parameter",
+                                       "backend '" + pin.backend() + "' does not support grammar constraints",
+                                       "grammar"));
+            return;
+        }
+        if (const ModelProfileBinding* binding = find_profile_binding(opts, *served_id)) {
+            apply_sampling_defaults(binding->sampling_defaults, job.sampling);
+        }
 
-    void serve_connection(Socket sock, ConnFlags& flags) {
-        Exchange ex;
-        ex.sock = sock.get();
-        ex.started = std::chrono::steady_clock::now();
-        ex.request_id = make_id("http");
-        std::string buffer;
-        RequestHead head;
-        std::size_t head_bytes = 0;
-        const bool head_ok = read_head(ex, buffer, head, head_bytes, flags, opts, stopping, hard_stop);
-        flags.in_head.store(false);
-        if (!head_ok) {
-            if (ex.status != 0) {
-                access_log(ex);
-                sock.shutdown_write();
-                linger(ex, hard_stop);
+        SessionOptions so;
+        so.sampling = job.sampling;
+        so.run_id = corr.run_id;
+        so.agent_id = corr.agent_id;
+        so.task_id = corr.task_id;
+        so.workload = corr.workload;
+        so.priority = corr.priority;
+        std::shared_ptr<Session> session;
+        {
+            std::lock_guard<std::mutex> lock(engine_mu);
+            if (!engine) {
+                write_error(ex, make_error(503, "not_ready", "sonder-inference is draining"));
+                return;
+            }
+            auto created = engine->create_session(pin.model(), so);
+            if (!created.ok()) {
+                write_error(ex, map_session_failure(created.status(), false));
+                return;
+            }
+            session = created.value();
+        }
+        {
+            std::lock_guard<std::mutex> lock(inflight_mu);
+            if (state.load() != State::ready) {
+                session->close();
+                write_error(ex, make_error(503, "not_ready",
+                                           "sonder-inference is draining; nothing was executed, the request is safe "
+                                           "to send elsewhere"));
+                return;
+            }
+            inflight.insert(session);
+        }
+
+        ChatExchange exchange{
+            opts, ex.sock, ex.request_id, ex.status, synthetic,
+            ex.started, admission, hard_stop, engine_ptr()->telemetry(),
+            [&] {
+                {
+                    std::lock_guard<std::mutex> lock(inflight_mu);
+                    inflight.erase(session);
+                }
+                inflight_cv.notify_all();
+            },
+            [&](std::string_view data) { return write_raw(ex, data); },
+            [&] {
+                ex.status = 200;
+                ex.keep_alive = false;
+                Headers h = base_headers(ex, "text/event-stream; charset=utf-8");
+                h.emplace_back("X-Accel-Buffering", "no");
+                return write_raw(ex, format_head(200, h));
+            },
+            [&](int status, const json::Object& doc) { write_json(ex, status, doc); },
+            [&](const ApiError& error) { write_error(ex, error); },
+            [&] { log_message("warning", "cannot start a request thread; completion request refused (503)"); }};
+        execute_completion(exchange, job, corr, pin.id(), pin.backend(), session);
+    }
+
+    void handle_embeddings(Exchange& ex, const RequestHead& head, const std::string& body) {
+        auto corr_v = parse_correlation(head);
+        if (auto* e = std::get_if<ApiError>(&corr_v)) {
+            write_error(ex, *e);
+            return;
+        }
+        const Correlation corr = std::get<Correlation>(corr_v);
+        std::variant<EmbedJob, ApiError> job_v = make_error(500, "internal_error", "uninitialized");
+        {
+            const auto parse_timeout = std::min(opts.read_timeout, std::chrono::milliseconds(2000));
+            auto parse_guard = parse_gate.acquire(body.size(), parse_timeout);
+            if (!parse_guard) {
+                if (!require_ready(ex)) {
+                    return;
+                }
+                ApiError e = make_error(503, "overloaded", "request parser concurrency limit reached; retry later");
+                e.retry_after = 1;
+                write_error(ex, e);
+                return;
+            }
+            job_v = parse_embed_request(body);
+        }
+        if (auto* e = std::get_if<ApiError>(&job_v)) {
+            write_error(ex, *e);
+            return;
+        }
+        const EmbedJob job = std::move(std::get<EmbedJob>(job_v));
+        if (!require_ready(ex)) {
+            return;
+        }
+        const auto served_id = residency->resolve(job.model);
+        if (!served_id) {
+            write_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
+            return;
+        }
+        auto pinned = residency->acquire(*served_id);
+        if (!pinned.ok()) {
+            write_error(ex, load_failure_error(*served_id, pinned.status()));
+            return;
+        }
+        const ModelResidency::Pin pin = std::move(pinned).value();
+
+        SessionOptions so;
+        so.run_id = corr.run_id;
+        so.agent_id = corr.agent_id;
+        so.task_id = corr.task_id;
+        so.workload = corr.workload;
+        so.priority = corr.priority;
+        std::shared_ptr<Session> session;
+        {
+            std::lock_guard<std::mutex> lock(engine_mu);
+            if (!engine) {
+                write_error(ex, make_error(503, "not_ready", "sonder-inference is draining"));
+                return;
+            }
+            auto created = engine->create_session(pin.model(), so);
+            if (!created.ok()) {
+                write_error(ex, map_session_failure(created.status(), false));
+                return;
+            }
+            session = created.value();
+        }
+        {
+            std::lock_guard<std::mutex> lock(inflight_mu);
+            if (state.load() != State::ready) {
+                session->close();
+                write_error(ex, make_error(503, "not_ready",
+                                           "sonder-inference is draining; nothing was executed, the request is safe "
+                                           "to send elsewhere"));
+                return;
+            }
+            inflight.insert(session);
+        }
+
+        ChatExchange exchange{
+            opts, ex.sock, ex.request_id, ex.status, synthetic,
+            ex.started, admission, hard_stop, engine_ptr()->telemetry(),
+            [&] {
+                {
+                    std::lock_guard<std::mutex> lock(inflight_mu);
+                    inflight.erase(session);
+                }
+                inflight_cv.notify_all();
+            },
+            [&](std::string_view data) { return write_raw(ex, data); },
+            [&] { return false; },
+            [&](int status, const json::Object& doc) { write_json(ex, status, doc); },
+            [&](const ApiError& error) { write_error(ex, error); },
+            [&] { log_message("warning", "cannot start a request thread; embeddings request refused (503)"); }};
+        execute_embeddings(exchange, job, corr, pin.id(), pin.backend(), session);
+    }
+
+    void handle_tokenize(Exchange& ex, const std::string& body) {
+        std::variant<TokenizeJob, ApiError> job_v = make_error(500, "internal_error", "uninitialized");
+        {
+            const auto parse_timeout = std::min(opts.read_timeout, std::chrono::milliseconds(2000));
+            auto parse_guard = parse_gate.acquire(body.size(), parse_timeout);
+            if (!parse_guard) {
+                if (!require_ready(ex)) {
+                    return;
+                }
+                ApiError e = make_error(503, "overloaded", "request parser concurrency limit reached; retry later");
+                e.retry_after = 1;
+                write_error(ex, e);
+                return;
+            }
+            job_v = parse_tokenize_request(body);
+        }
+        if (auto* e = std::get_if<ApiError>(&job_v)) {
+            write_error(ex, *e);
+            return;
+        }
+        const TokenizeJob job = std::move(std::get<TokenizeJob>(job_v));
+        if (!require_ready(ex)) {
+            return;
+        }
+        const auto served_id = residency->resolve(job.model);
+        if (!served_id) {
+            write_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
+            return;
+        }
+        auto pinned = residency->acquire(*served_id);
+        if (!pinned.ok()) {
+            write_error(ex, load_failure_error(*served_id, pinned.status()));
+            return;
+        }
+        const ModelResidency::Pin pin = std::move(pinned).value();
+        auto res = pin.model()->backend_model().tokenize(job.content);
+        if (!res.ok()) {
+            if (res.status().code() == ErrorCode::unsupported) {
+                write_error(ex, make_error(501, "not_implemented", res.status().message()));
+            } else {
+                write_error(ex, map_session_failure(res.status(), false));
             }
             return;
         }
-        ex.method = head.method;
-        ex.path = head.path;
-        // Until read_body() consumes it, the declared body counts as unread.
-        const std::uint64_t buffered = buffer.size() - head_bytes;
-        if (head.has_transfer_encoding) {
-            ex.unread_input = kLingerUnknownLength;
-        } else if (head.content_length && *head.content_length > buffered) {
-            ex.unread_input = *head.content_length - buffered;
+        json::Array toks;
+        toks.reserve(res.value().size());
+        for (const TokenId id : res.value()) {
+            toks.emplace_back(static_cast<std::int64_t>(id));
         }
-        dispatch(ex, head, buffer, head_bytes, flags);
-        access_log(ex);
-        // Let the peer read everything before the socket closes.
-        sock.shutdown_write();
-        linger(ex, hard_stop);
+        json::Object meta{{"api_version", kApiVersion},
+                          {"request_id", ex.request_id},
+                          {"backend", pin.backend()},
+                          {"synthetic", synthetic}};
+        write_json(ex, 200,
+                   json::Object{{"tokens", std::move(toks)},
+                                {"count", static_cast<std::uint64_t>(res.value().size())},
+                                {"model", pin.id()},
+                                {"sonder", std::move(meta)}});
+    }
+
+    void handle_detokenize(Exchange& ex, const std::string& body) {
+        std::variant<DetokenizeJob, ApiError> job_v = make_error(500, "internal_error", "uninitialized");
+        {
+            const auto parse_timeout = std::min(opts.read_timeout, std::chrono::milliseconds(2000));
+            auto parse_guard = parse_gate.acquire(body.size(), parse_timeout);
+            if (!parse_guard) {
+                if (!require_ready(ex)) {
+                    return;
+                }
+                ApiError e = make_error(503, "overloaded", "request parser concurrency limit reached; retry later");
+                e.retry_after = 1;
+                write_error(ex, e);
+                return;
+            }
+            job_v = parse_detokenize_request(body);
+        }
+        if (auto* e = std::get_if<ApiError>(&job_v)) {
+            write_error(ex, *e);
+            return;
+        }
+        const DetokenizeJob job = std::move(std::get<DetokenizeJob>(job_v));
+        if (!require_ready(ex)) {
+            return;
+        }
+        const auto served_id = residency->resolve(job.model);
+        if (!served_id) {
+            write_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
+            return;
+        }
+        auto pinned = residency->acquire(*served_id);
+        if (!pinned.ok()) {
+            write_error(ex, load_failure_error(*served_id, pinned.status()));
+            return;
+        }
+        const ModelResidency::Pin pin = std::move(pinned).value();
+        auto res = pin.model()->backend_model().detokenize(job.tokens);
+        if (!res.ok()) {
+            if (res.status().code() == ErrorCode::unsupported) {
+                write_error(ex, make_error(501, "not_implemented", res.status().message()));
+            } else {
+                write_error(ex, map_session_failure(res.status(), false));
+            }
+            return;
+        }
+        json::Object meta{{"api_version", kApiVersion},
+                          {"request_id", ex.request_id},
+                          {"backend", pin.backend()},
+                          {"synthetic", synthetic}};
+        write_json(ex, 200,
+                   json::Object{{"content", std::move(res).value()}, {"model", pin.id()}, {"sonder", std::move(meta)}});
+    }
+
+    // --------------------------------------------------------- connection
+
+    void serve_connection(Socket sock, ConnFlags& flags) {
+        std::string buffer;
+        std::size_t requests_on_conn = 0;
+        for (;;) {
+            if (requests_on_conn > 0) {
+                if (stopping.load() || hard_stop.load()) {
+                    break;
+                }
+                const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch())
+                                        .count();
+                flags.head_started_ns.store(now_ns, std::memory_order_release);
+                flags.in_head.store(true, std::memory_order_release);
+                if (buffer.empty()) {
+                    const auto idle_deadline = std::chrono::steady_clock::now() + opts.keep_alive_timeout;
+                    bool got_bytes = false;
+                    char chunk[4096];
+                    for (;;) {
+                        if (stopping.load() || hard_stop.load() || flags.evict.load()) {
+                            break;
+                        }
+                        const auto now = std::chrono::steady_clock::now();
+                        if (now >= idle_deadline) {
+                            break;
+                        }
+                        const auto rem_ms = std::max<std::chrono::milliseconds>(
+                            std::chrono::milliseconds(1),
+                            std::chrono::duration_cast<std::chrono::milliseconds>(idle_deadline - now));
+                        const auto slice = std::min(rem_ms, std::chrono::milliseconds(50));
+                        const auto w = wait_socket(sock.get(), false, slice, &stopping);
+                        if (w == WaitResult::timeout) {
+                            continue;
+                        }
+                        if (w != WaitResult::ready) {
+                            break;
+                        }
+                        const long long n = recv_some(sock.get(), chunk, sizeof(chunk));
+                        if (n > 0) {
+                            buffer.append(chunk, static_cast<std::size_t>(n));
+                            got_bytes = true;
+                            break;
+                        }
+                        if (n == 0 || n == -1) {
+                            break;
+                        }
+                    }
+                    if (!got_bytes) {
+                        flags.in_head.store(false, std::memory_order_release);
+                        break;
+                    }
+                }
+                // Refresh head_started_ns once the next request actually begins
+                // arriving so idle keep-alive time does not cause spurious 408 eviction.
+                const auto req_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now().time_since_epoch())
+                                              .count();
+                flags.head_started_ns.store(req_start_ns, std::memory_order_release);
+            }
+            Exchange ex;
+            ex.sock = sock.get();
+            ex.started = std::chrono::steady_clock::now();
+            ex.request_id = make_id("http");
+            RequestHead head;
+            std::size_t head_bytes = 0;
+            const bool head_ok = read_head(ex, buffer, head, head_bytes, flags, opts, stopping, hard_stop);
+            flags.in_head.store(false, std::memory_order_release);
+            if (!head_ok) {
+                if (ex.status != 0) {
+                    access_log(ex);
+                    sock.shutdown_write();
+                    linger(ex, hard_stop);
+                }
+                break;
+            }
+            ++requests_on_conn;
+            ex.method = head.method;
+            ex.path = head.path;
+            const RouteInfo route_info = lookup_route(head.path);
+            const bool is_streaming_route = route_info.route == Route::telemetry ||
+                                            route_info.route == Route::telemetry_sse ||
+                                            route_info.route == Route::telemetry_ndjson;
+            const bool can_keep_alive = opts.keep_alive && !stopping.load() && !hard_stop.load() &&
+                                        head.minor_version >= 1 && !client_wants_close(head) &&
+                                        !is_streaming_route && requests_on_conn < opts.max_keep_alive_requests;
+            ex.keep_alive = can_keep_alive;
+            ex.keep_alive_timeout = opts.keep_alive_timeout;
+            ex.keep_alive_remaining =
+                opts.max_keep_alive_requests > requests_on_conn ? (opts.max_keep_alive_requests - requests_on_conn) : 0;
+
+            // Until read_body() consumes it, the declared body counts as unread.
+            const std::uint64_t buffered = buffer.size() - head_bytes;
+            if (head.has_transfer_encoding) {
+                ex.unread_input = kLingerUnknownLength;
+            } else if (head.content_length && *head.content_length > buffered) {
+                ex.unread_input = *head.content_length - buffered;
+            }
+            dispatch(ex, head, buffer, head_bytes, flags);
+            access_log(ex);
+
+            const bool continue_alive = ex.keep_alive && !stopping.load() && !hard_stop.load() &&
+                                        !flags.evict.load() && ex.unread_input == 0 && !ex.write_failed &&
+                                        !flags.streaming.load() && ex.status != 499 &&
+                                        requests_on_conn < opts.max_keep_alive_requests;
+            if (!continue_alive) {
+                // Let the peer read everything before the socket closes.
+                sock.shutdown_write();
+                linger(ex, hard_stop);
+                break;
+            }
+        }
     }
 
     void dispatch(Exchange& ex, const RequestHead& head, std::string& buffer, std::size_t head_bytes,
@@ -483,10 +889,11 @@ struct Server::Impl {
             case Route::sonder_node: handle_node(ex); break;
             case Route::sonder_plan: handle_plan(ex, checked.body); break;
             case Route::chat: handle_chat(ex, head, checked.body); break;
+            case Route::completions: handle_completions(ex, head, checked.body); break;
             case Route::messages: handle_chat(ex, head, checked.body, ChatProtocol::anthropic); break;
-            case Route::embeddings:
-                write_error(ex, make_error(501, "not_implemented", "embeddings are not implemented by sonder-inference"));
-                break;
+            case Route::embeddings: handle_embeddings(ex, head, checked.body); break;
+            case Route::tokenize: handle_tokenize(ex, checked.body); break;
+            case Route::detokenize: handle_detokenize(ex, checked.body); break;
             case Route::discovery:
                 write_json(ex, 200, build_discovery_document(opts, *hub, instance_id, node_id, synthetic));
                 break;
@@ -511,7 +918,12 @@ struct Server::Impl {
         std::lock_guard<std::mutex> lock(conns_mu);
         std::size_t evicting = 0;
         ConnFlags* oldest = nullptr;
-        const auto now = std::chrono::steady_clock::now();
+        std::int64_t oldest_ns = 0;
+        const std::int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch())
+                                        .count();
+        const std::int64_t min_age_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(kEvictableHeadAge).count();
         for (const auto& [conn_thread, flags] : conns) {
             (void)conn_thread;
             if (flags->done.load()) {
@@ -521,9 +933,12 @@ struct Server::Impl {
                 ++evicting;
                 continue;
             }
-            if (flags->in_head.load() && now - flags->accepted_at >= kEvictableHeadAge &&
-                (oldest == nullptr || flags->accepted_at < oldest->accepted_at)) {
-                oldest = flags.get();
+            if (flags->in_head.load(std::memory_order_acquire)) {
+                const std::int64_t started_ns = flags->head_started_ns.load(std::memory_order_acquire);
+                if (now_ns - started_ns >= min_age_ns && (oldest == nullptr || started_ns < oldest_ns)) {
+                    oldest = flags.get();
+                    oldest_ns = started_ns;
+                }
             }
         }
         if (evicting >= opts.max_connections) {

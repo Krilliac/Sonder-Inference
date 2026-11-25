@@ -1,4 +1,5 @@
 #include "openai.hpp"
+#include "json_schema_gbnf.hpp"
 #include "reasoning_budget.hpp"
 
 #include <cmath>
@@ -92,20 +93,90 @@ std::optional<std::uint64_t> parse_deadline_ms_impl(const json::Value& value) no
     return std::nullopt;
 }
 
-std::optional<ApiError> read_request_hints(const json::Object& body, ChatJob& job) {
+std::optional<ApiError> read_request_hints(const json::Object& body,
+                                           std::optional<RequestPriority>& priority_class,
+                                           std::optional<std::uint64_t>& deadline_ms) {
     if (const json::Value* p = body.find("priority")) {
         if (!p->is_string() || !parse_request_priority_impl(p->as_string())) {
             return bad("invalid_request", "priority must be interactive, subagent or background", "priority");
         }
-        job.priority_class = parse_request_priority_impl(p->as_string());
+        priority_class = parse_request_priority_impl(p->as_string());
     }
     if (const json::Value* d = body.find("deadline_ms")) {
-        job.deadline_ms = parse_deadline_ms_impl(*d);
-        if (!job.deadline_ms) {
+        deadline_ms = parse_deadline_ms_impl(*d);
+        if (!deadline_ms) {
             return bad("invalid_request", "deadline_ms must be a positive integer", "deadline_ms");
         }
     }
     return std::nullopt;
+}
+
+std::optional<ApiError> read_grammar_field(const json::Object& body, std::string& grammar_out) {
+    if (const json::Value* g = body.find("grammar"); present(g)) {
+        if (!g->is_string()) {
+            return bad("invalid_request", "grammar must be a string", "grammar");
+        }
+        if (g->as_string().size() > kMaxRequestGrammarBytes) {
+            return bad("invalid_request",
+                       "grammar exceeds maximum length of " + std::to_string(kMaxRequestGrammarBytes) + " bytes",
+                       "grammar");
+        }
+        grammar_out = g->as_string();
+    }
+    return std::nullopt;
+}
+
+std::optional<ApiError> read_response_format(const json::Object& body, ChatJob& job) {
+    const json::Value* rf = body.find("response_format");
+    if (!present(rf)) {
+        return std::nullopt;
+    }
+    if (!rf->is_object()) {
+        return bad("invalid_request", "response_format must be an object", "response_format");
+    }
+    const json::Value* type_v = rf->find("type");
+    if (!present(type_v) || !type_v->is_string()) {
+        return bad("invalid_request", "response_format.type must be a string", "response_format.type");
+    }
+    const std::string& type = type_v->as_string();
+    if (type == "text") {
+        return std::nullopt;
+    }
+    if (type == "json_object") {
+        job.grammar = json_object_gbnf();
+        job.response_format_type = "json_object";
+        return std::nullopt;
+    }
+    if (type == "json_schema") {
+        const json::Value* js = rf->find("json_schema");
+        if (!present(js) || !js->is_object()) {
+            return bad("invalid_request", "response_format.json_schema must be an object",
+                       "response_format.json_schema");
+        }
+        if (const json::Value* name_v = js->find("name"); present(name_v)) {
+            if (!name_v->is_string() || name_v->as_string().empty()) {
+                return bad("invalid_request", "response_format.json_schema.name must be a non-empty string",
+                           "response_format.json_schema.name");
+            }
+        }
+        const json::Value* schema_v = js->find("schema");
+        if (!present(schema_v) || !schema_v->is_object()) {
+            return bad("invalid_request", "response_format.json_schema.schema must be a JSON object",
+                       "response_format.json_schema.schema");
+        }
+        auto gbnf = json_schema_to_gbnf(*schema_v);
+        if (!gbnf.ok()) {
+            return bad("invalid_request", "invalid response_format.json_schema.schema: " + gbnf.status().message(),
+                       "response_format.json_schema.schema");
+        }
+        job.grammar = std::move(gbnf).value();
+        job.response_format_type = "json_schema";
+        job.response_format_schema = schema_v->dump();
+        return std::nullopt;
+    }
+    return bad("unsupported_parameter",
+               "response_format.type '" + type + "' is not supported (expected text, json_object or json_schema)",
+               "response_format");
 }
 
 // Numeric field as float; error when it is not a finite number.
@@ -334,8 +405,8 @@ std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body_text) {
     ChatJob job;
 
     // Features this API does not provide (rejected rather than ignored, so a
-    // client never silently loses tools or structured output).
-    for (const char* key : {"tools", "tool_choice", "functions", "function_call", "response_format", "top_logprobs"}) {
+    // client never silently loses tools or logprobs).
+    for (const char* key : {"tools", "tool_choice", "functions", "function_call", "top_logprobs"}) {
         if (present(body.find(key))) {
             return bad("unsupported_parameter", std::string(key) + " is not supported by sonder-inference", key);
         }
@@ -410,7 +481,19 @@ std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body_text) {
         return bad("invalid_messages", st.message(), "messages");
     }
     if (auto e = read_chat_extensions(body, job)) return *e;
-    if (auto e = read_request_hints(body, job)) {
+    if (auto e = read_response_format(body, job)) return *e;
+    {
+        std::string explicit_grammar;
+        if (auto e = read_grammar_field(body, explicit_grammar)) return *e;
+        if (!explicit_grammar.empty()) {
+            if (job.response_format_type.has_value()) {
+                return bad("invalid_request",
+                           "grammar cannot be combined with response_format other than 'text'", "grammar");
+            }
+            job.grammar = std::move(explicit_grammar);
+        }
+    }
+    if (auto e = read_request_hints(body, job.priority_class, job.deadline_ms)) {
         return *e;
     }
 
@@ -421,6 +504,204 @@ std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body_text) {
     }
     if (Status st = validate(job.sampling); !st.ok()) {
         return bad("invalid_sampling", st.message());
+    }
+    return job;
+}
+
+std::variant<EmbedJob, ApiError> parse_embed_request(std::string_view body_text) {
+    auto parsed = json::parse(body_text, json::ParseLimits{128, 65536});
+    if (!parsed.ok()) {
+        return bad("invalid_json", "request body is not valid JSON: " + parsed.status().message());
+    }
+    if (!parsed.value().is_object()) {
+        return bad("invalid_json", "request body must be a JSON object");
+    }
+    const json::Object& body = parsed.value().as_object();
+    EmbedJob job;
+    if (const json::Value* model = body.find("model"); present(model)) {
+        if (!model->is_string() || model->as_string().empty()) {
+            return bad("invalid_request", "model must be a non-empty string", "model");
+        }
+        job.model = model->as_string();
+    }
+    if (const json::Value* fmt = body.find("encoding_format"); present(fmt)) {
+        if (!fmt->is_string() || fmt->as_string() != "float") {
+            return bad("unsupported_parameter", "only encoding_format 'float' is supported", "encoding_format");
+        }
+    }
+    const json::Value* input = body.find("input");
+    if (!present(input)) {
+        return bad("invalid_request", "input is required (string or non-empty array of strings)", "input");
+    }
+    if (input->is_string()) {
+        job.inputs.push_back(input->as_string());
+    } else if (input->is_array()) {
+        const auto& arr = input->as_array();
+        if (arr.empty()) {
+            return bad("invalid_request", "input array must not be empty", "input");
+        }
+        if (arr.size() > kMaxEmbedInputs) {
+            return bad("invalid_request",
+                       "input array exceeds maximum of " + std::to_string(kMaxEmbedInputs) + " items", "input");
+        }
+        job.inputs.reserve(arr.size());
+        for (std::size_t i = 0; i < arr.size(); ++i) {
+            if (!arr[i].is_string()) {
+                return bad("invalid_request", "input[" + std::to_string(i) + "] must be a string", "input");
+            }
+            job.inputs.push_back(arr[i].as_string());
+        }
+    } else {
+        return bad("invalid_request", "input must be a string or a non-empty array of strings", "input");
+    }
+    if (auto e = read_request_hints(body, job.priority_class, job.deadline_ms)) {
+        return *e;
+    }
+    return job;
+}
+
+std::variant<CompletionJob, ApiError> parse_completion_request(std::string_view body_text) {
+    auto parsed = json::parse(body_text, json::ParseLimits{128, 65536});
+    if (!parsed.ok()) {
+        return bad("invalid_json", "request body is not valid JSON: " + parsed.status().message());
+    }
+    if (!parsed.value().is_object()) {
+        return bad("invalid_json", "request body must be a JSON object");
+    }
+    const json::Object& body = parsed.value().as_object();
+    CompletionJob job;
+
+    if (const json::Value* lp = body.find("logprobs");
+        present(lp) && !(lp->is_bool() && !lp->as_bool()) && !(lp->is_integer() && lp->as_int() == 0)) {
+        return bad("unsupported_parameter", "logprobs is not supported by sonder-inference", "logprobs");
+    }
+    if (const json::Value* n = body.find("n"); present(n)) {
+        if (!n->is_number() || n->as_double() != 1.0) {
+            return bad("unsupported_parameter", "only n = 1 is supported", "n");
+        }
+    }
+    if (const json::Value* best_of = body.find("best_of"); present(best_of)) {
+        if (!best_of->is_number() || best_of->as_double() != 1.0) {
+            return bad("unsupported_parameter", "only best_of = 1 is supported", "best_of");
+        }
+    }
+    if (present(body.find("suffix"))) {
+        return bad("unsupported_parameter", "suffix is not supported by sonder-inference", "suffix");
+    }
+
+    if (const json::Value* model = body.find("model"); present(model)) {
+        if (!model->is_string() || model->as_string().empty()) {
+            return bad("invalid_json", "model must be a non-empty string", "model");
+        }
+        job.model = model->as_string();
+    }
+    const json::Value* prompt = body.find("prompt");
+    if (!present(prompt) || !prompt->is_string() || prompt->as_string().empty()) {
+        return bad("invalid_request", "prompt must be a non-empty string", "prompt");
+    }
+    job.prompt = prompt->as_string();
+
+    if (const json::Value* stream = body.find("stream"); present(stream)) {
+        if (!stream->is_bool()) {
+            return bad("invalid_json", "stream must be a boolean", "stream");
+        }
+        job.stream = stream->as_bool();
+    }
+    if (const json::Value* so = body.find("stream_options"); present(so)) {
+        if (!so->is_object()) {
+            return bad("invalid_json", "stream_options must be an object", "stream_options");
+        }
+        if (const json::Value* iu = so->find("include_usage"); present(iu)) {
+            if (!iu->is_bool()) {
+                return bad("invalid_json", "stream_options.include_usage must be a boolean",
+                           "stream_options.include_usage");
+            }
+            job.include_usage = iu->as_bool();
+        }
+    }
+    if (const json::Value* echo = body.find("echo"); present(echo)) {
+        if (!echo->is_bool()) {
+            return bad("invalid_request", "echo must be a boolean", "echo");
+        }
+        job.echo = echo->as_bool();
+    }
+    if (const json::Value* key = body.find("prompt_cache_key"); present(key)) {
+        if (!key->is_string() || key->as_string().empty() || key->as_string().size() > 256) {
+            return bad("invalid_json", "prompt_cache_key must be a string of 1 to 256 bytes", "prompt_cache_key");
+        }
+        job.session_key = key->as_string();
+    }
+    if (auto e = read_grammar_field(body, job.grammar)) return *e;
+    if (auto e = read_request_hints(body, job.priority_class, job.deadline_ms)) return *e;
+
+    job.sampling = SamplingConfig{};
+    job.sampling.max_tokens = kDefaultMaxTokens;
+    if (auto e = read_sampling(body, job.sampling)) return *e;
+    if (Status st = validate(job.sampling); !st.ok()) {
+        return bad("invalid_sampling", st.message());
+    }
+    return job;
+}
+
+std::variant<TokenizeJob, ApiError> parse_tokenize_request(std::string_view body_text) {
+    auto parsed = json::parse(body_text, json::ParseLimits{128, 65536});
+    if (!parsed.ok()) {
+        return bad("invalid_json", "request body is not valid JSON: " + parsed.status().message());
+    }
+    if (!parsed.value().is_object()) {
+        return bad("invalid_json", "request body must be a JSON object");
+    }
+    const json::Object& body = parsed.value().as_object();
+    TokenizeJob job;
+    if (const json::Value* model = body.find("model"); present(model)) {
+        if (!model->is_string() || model->as_string().empty()) {
+            return bad("invalid_request", "model must be a non-empty string", "model");
+        }
+        job.model = model->as_string();
+    }
+    const json::Value* content = body.find("content");
+    if (!present(content)) {
+        content = body.find("text");
+    }
+    if (!present(content) || !content->is_string()) {
+        return bad("invalid_request", "content (or text) must be a string", "content");
+    }
+    job.content = content->as_string();
+    return job;
+}
+
+std::variant<DetokenizeJob, ApiError> parse_detokenize_request(std::string_view body_text) {
+    auto parsed = json::parse(body_text, json::ParseLimits{128, 65536});
+    if (!parsed.ok()) {
+        return bad("invalid_json", "request body is not valid JSON: " + parsed.status().message());
+    }
+    if (!parsed.value().is_object()) {
+        return bad("invalid_json", "request body must be a JSON object");
+    }
+    const json::Object& body = parsed.value().as_object();
+    DetokenizeJob job;
+    if (const json::Value* model = body.find("model"); present(model)) {
+        if (!model->is_string() || model->as_string().empty()) {
+            return bad("invalid_request", "model must be a non-empty string", "model");
+        }
+        job.model = model->as_string();
+    }
+    const json::Value* tokens = body.find("tokens");
+    if (!present(tokens) || !tokens->is_array()) {
+        return bad("invalid_request", "tokens must be an array of integers", "tokens");
+    }
+    const auto& arr = tokens->as_array();
+    job.tokens.reserve(arr.size());
+    for (std::size_t i = 0; i < arr.size(); ++i) {
+        if (!arr[i].is_integer()) {
+            return bad("invalid_request", "tokens[" + std::to_string(i) + "] must be an integer", "tokens");
+        }
+        const std::int64_t id = arr[i].as_int();
+        if (id < std::numeric_limits<TokenId>::min() || id > std::numeric_limits<TokenId>::max()) {
+            return bad("invalid_request", "tokens[" + std::to_string(i) + "] is out of 32-bit token id range",
+                       "tokens");
+        }
+        job.tokens.push_back(static_cast<TokenId>(id));
     }
     return job;
 }

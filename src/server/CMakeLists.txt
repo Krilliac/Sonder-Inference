@@ -13,6 +13,7 @@ sonder_module_sources(
     src/http.cpp
     src/health_features.cpp
     src/identity.cpp
+    src/json_schema_gbnf.cpp
     src/launch_profile.cpp
     src/live_hub.cpp
     src/log_queue.cpp
@@ -44,6 +45,7 @@ sonder_add_module_tests(server
     tests/test_server_units.cpp
     tests/test_server_http.cpp
     tests/test_server_chat.cpp
+    tests/test_server_features.cpp
     tests/test_server_telemetry.cpp
     tests/test_server_lifecycle.cpp
     tests/test_serve_main.cpp

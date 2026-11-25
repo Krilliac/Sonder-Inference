@@ -45,4 +45,14 @@ void execute_chat(ChatExchange& exchange, const ChatJob& job, const Correlation&
                   const std::string& model, const std::string& backend,
                   const std::shared_ptr<Session>& session, ChatProtocol protocol);
 
+// Synchronous execution for POST /v1/completions (non-streaming and SSE streaming).
+void execute_completion(ChatExchange& exchange, const CompletionJob& job, const Correlation& correlation,
+                        const std::string& model, const std::string& backend,
+                        const std::shared_ptr<Session>& session);
+
+// Synchronous execution for POST /v1/embeddings.
+void execute_embeddings(ChatExchange& exchange, const EmbedJob& job, const Correlation& correlation,
+                        const std::string& model, const std::string& backend,
+                        const std::shared_ptr<Session>& session);
+
 } // namespace sonder::inference::server::detail

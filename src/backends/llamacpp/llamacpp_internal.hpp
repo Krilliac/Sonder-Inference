@@ -12,6 +12,8 @@
 #include <vector>
 
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
+#include "sonder/inference/backend.hpp"
+#include "sonder/inference/device.hpp"
 #include "sonder/inference/sampling.hpp"
 
 namespace sonder::inference::llamacpp_detail {
@@ -34,7 +36,10 @@ inline sonder::backends::llamacpp::SamplingParams ToLlamaSampling(const Sampling
     p.top_k = c.top_k;
     p.top_p = c.top_p;
     p.min_p = c.min_p;
-    p.repeat_penalty = c.repeat_penalty;
+    // When explicit_only is set (HTTP OpenAI requests), leave repeat_penalty disabled (1.0)
+    // unless the caller explicitly asked for it — matching OpenAI / llama-server defaults
+    // and allowing pure GPU backend sampling on greedy/top-p requests.
+    p.repeat_penalty = (c.explicit_only && !c.is_explicit(SamplingConfig::kRepeatPenalty)) ? 1.0F : c.repeat_penalty;
     p.repeat_last_n = c.repeat_last_n;
     p.presence_penalty = c.presence_penalty;
     p.frequency_penalty = c.frequency_penalty;
@@ -105,5 +110,232 @@ private:
     bool matched_ = false;
     std::optional<std::string> matched_index_;
 };
+
+// Result of one incremental step of ThinkingStreamSplitter.
+struct ThinkingSplitResult {
+    std::string text;
+    std::string reasoning;
+};
+
+// Streaming splitter that routes text inside <think>...</think> tags to
+// `reasoning` and visible output outside tags to `text`. Safely buffers
+// partial tag prefixes across arbitrary token chunk boundaries.
+class ThinkingStreamSplitter {
+public:
+    ThinkingSplitResult Push(std::string_view chunk) {
+        ThinkingSplitResult out;
+        pending_.append(chunk);
+        while (!pending_.empty()) {
+            if (!in_thinking_) {
+                const std::size_t pos = pending_.find(kOpenTag);
+                if (pos != std::string::npos) {
+                    out.text.append(pending_, 0, pos);
+                    pending_.erase(0, pos + kOpenTag.size());
+                    in_thinking_ = true;
+                    continue;
+                }
+                const std::size_t keep = TrailingPrefixLength(pending_, kOpenTag);
+                const std::size_t emit = pending_.size() - keep;
+                if (emit > 0) {
+                    out.text.append(pending_, 0, emit);
+                    pending_.erase(0, emit);
+                }
+                break;
+            }
+            const std::size_t pos = pending_.find(kCloseTag);
+            if (pos != std::string::npos) {
+                out.reasoning.append(pending_, 0, pos);
+                pending_.erase(0, pos + kCloseTag.size());
+                in_thinking_ = false;
+                continue;
+            }
+            const std::size_t keep = TrailingPrefixLength(pending_, kCloseTag);
+            const std::size_t emit = pending_.size() - keep;
+            if (emit > 0) {
+                out.reasoning.append(pending_, 0, emit);
+                pending_.erase(0, emit);
+            }
+            break;
+        }
+        return out;
+    }
+
+    ThinkingSplitResult Flush() {
+        ThinkingSplitResult out;
+        if (!pending_.empty()) {
+            if (in_thinking_) {
+                out.reasoning = std::exchange(pending_, {});
+            } else {
+                out.text = std::exchange(pending_, {});
+            }
+        }
+        return out;
+    }
+
+    [[nodiscard]] bool in_thinking() const noexcept { return in_thinking_; }
+    [[nodiscard]] std::size_t pending() const noexcept { return pending_.size(); }
+
+private:
+    static constexpr std::string_view kOpenTag = "<think>";
+    static constexpr std::string_view kCloseTag = "</think>";
+
+    static std::size_t TrailingPrefixLength(std::string_view s, std::string_view tag) noexcept {
+        const std::size_t limit = std::min(s.size(), tag.size() - 1);
+        for (std::size_t k = limit; k > 0; --k) {
+            if (s.substr(s.size() - k) == tag.substr(0, k)) return k;
+        }
+        return 0;
+    }
+
+    std::string pending_;
+    bool in_thinking_ = false;
+};
+
+// When thinking is explicitly disabled on Qwen3/ChatML-style templates ending
+// in `<|im_start|>assistant\n` (and not already containing `<think>`), appends
+// `<think>\n\n</think>\n\n` as a parse_special=true scaffolding segment so the
+// model skips its reasoning block cleanly (matching Prism's reasoning = off).
+inline bool ApplyNoThinkScaffolding(std::vector<ChatPromptSegment>& segments, bool enable_thinking) {
+    if (enable_thinking || segments.empty()) return false;
+    static constexpr std::string_view kAssistantCue = "<|im_start|>assistant\n";
+    std::string trailing;
+    std::size_t idx = segments.size();
+    while (idx > 0 && segments[idx - 1].parse_special) {
+        --idx;
+    }
+    for (std::size_t i = idx; i < segments.size(); ++i) {
+        trailing.append(segments[i].text);
+    }
+    if (trailing.size() < kAssistantCue.size()) return false;
+    if (std::string_view(trailing).substr(trailing.size() - kAssistantCue.size()) != kAssistantCue) {
+        return false;
+    }
+    if (trailing.find("<think>") != std::string::npos) return false;
+    segments.push_back(ChatPromptSegment{"<think>\n\n</think>\n\n", /*parse_special=*/true});
+    return true;
+}
+
+inline std::string LowerAscii(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char ch : s) {
+        if (ch >= 'A' && ch <= 'Z') {
+            out.push_back(static_cast<char>(ch - 'A' + 'a'));
+        } else {
+            out.push_back(static_cast<char>(ch));
+        }
+    }
+    return out;
+}
+
+inline GpuVendor InferGgmlDeviceVendor(const sonder::backends::llamacpp::DeviceInfo& d) {
+    const std::string name = LowerAscii(d.name);
+    const std::string desc = LowerAscii(d.description);
+    if (name.rfind("cuda", 0) == 0 || desc.find("nvidia") != std::string::npos ||
+        desc.find("geforce") != std::string::npos || desc.find("rtx") != std::string::npos ||
+        desc.find("quadro") != std::string::npos || desc.find("tesla") != std::string::npos) {
+        return GpuVendor::nvidia;
+    }
+    if (name.rfind("rocm", 0) == 0 || name.rfind("hip", 0) == 0 || desc.find("amd") != std::string::npos ||
+        desc.find("radeon") != std::string::npos) {
+        return GpuVendor::amd;
+    }
+    if (name.rfind("sycl", 0) == 0 || desc.find("intel") != std::string::npos ||
+        desc.find("arc") != std::string::npos) {
+        return GpuVendor::intel;
+    }
+    if (name.rfind("metal", 0) == 0 || desc.find("apple") != std::string::npos) {
+        return GpuVendor::apple;
+    }
+    return GpuVendor::unknown;
+}
+
+// Pins `gpu:<index>` requests onto the matching llama.cpp GPU device when the
+// caller did not pass explicit ggml device names or multi-GPU tensor_split
+// (prevents silent fallback to GPU 0, unintended layer splitting across discrete
+// + integrated GPUs, or cross-vendor ordinal mismatch between OS and GGML lists).
+inline Status ResolveGpuDevicePin(std::string_view device_id,
+                                  const std::vector<sonder::backends::llamacpp::DeviceInfo>& available_devices,
+                                  std::vector<std::string>& out_devices, std::int32_t& out_main_gpu,
+                                  const std::vector<float>& tensor_split = {},
+                                  const std::vector<GpuDeviceInfo>& os_gpus = {}) {
+    if (!out_devices.empty() || !tensor_split.empty()) return Status::success();
+    if (device_id.rfind("gpu:", 0) != 0) return Status::success();
+    const std::string_view suffix = device_id.substr(4);
+    if (suffix.empty()) {
+        return Status(ErrorCode::invalid_argument, "invalid gpu device id: " + std::string(device_id));
+    }
+    std::size_t idx = 0;
+    for (char ch : suffix) {
+        if (ch < '0' || ch > '9') {
+            return Status(ErrorCode::invalid_argument, "invalid gpu device index in: " + std::string(device_id));
+        }
+        if (idx > 1000) {
+            return Status(ErrorCode::not_found, "gpu device index out of range: " + std::string(device_id));
+        }
+        idx = idx * 10 + static_cast<std::size_t>(ch - '0');
+    }
+    std::vector<const sonder::backends::llamacpp::DeviceInfo*> gpus;
+    for (const auto& d : available_devices) {
+        if (d.kind == sonder::backends::llamacpp::DeviceKind::kGpu ||
+            d.kind == sonder::backends::llamacpp::DeviceKind::kIntegratedGpu) {
+            gpus.push_back(&d);
+        }
+    }
+
+    // When OS GPU inventory is supplied, resolve `gpu:<idx>` in OS inventory space
+    // and match it against the compiled GGML devices by hardware identity (vendor
+    // + adapter name / intra-vendor ordinal) instead of assuming OS and GGML
+    // ordinal spaces are identical.
+    if (!os_gpus.empty()) {
+        if (idx >= os_gpus.size()) {
+            return Status(ErrorCode::not_found, "requested device '" + std::string(device_id) +
+                                                    "' exceeds detected OS GPU count (" +
+                                                    std::to_string(os_gpus.size()) + ")");
+        }
+        const GpuDeviceInfo& target = os_gpus[idx];
+        const std::string target_name = LowerAscii(target.name);
+        std::size_t vendor_ordinal = 0;
+        for (std::size_t i = 0; i < idx; ++i) {
+            if (os_gpus[i].vendor == target.vendor) ++vendor_ordinal;
+        }
+        std::vector<const sonder::backends::llamacpp::DeviceInfo*> same_vendor;
+        std::vector<const sonder::backends::llamacpp::DeviceInfo*> name_matches;
+        for (const auto* g : gpus) {
+            const GpuVendor gv = InferGgmlDeviceVendor(*g);
+            if (target.vendor != GpuVendor::unknown && gv == target.vendor) {
+                same_vendor.push_back(g);
+            }
+            const std::string gd = LowerAscii(g->description);
+            if (!target_name.empty() && !gd.empty() &&
+                (gd.find(target_name) != std::string::npos || target_name.find(gd) != std::string::npos)) {
+                name_matches.push_back(g);
+            }
+        }
+        if (name_matches.size() == 1) {
+            out_devices = {name_matches[0]->name};
+            out_main_gpu = 0;
+            return Status::success();
+        }
+        if (!same_vendor.empty() && vendor_ordinal < same_vendor.size()) {
+            out_devices = {same_vendor[vendor_ordinal]->name};
+            out_main_gpu = 0;
+            return Status::success();
+        }
+        return Status(ErrorCode::not_found,
+                      "requested device '" + std::string(device_id) + "' (" + target.name +
+                          ") has no matching compiled llama.cpp GPU backend device; specify an explicit "
+                          "backend device name such as CUDA0, ROCm0, or Vulkan0");
+    }
+
+    if (idx >= gpus.size()) {
+        return Status(ErrorCode::not_found, "requested device '" + std::string(device_id) +
+                                                "' exceeds available llama.cpp GPU count (" +
+                                                std::to_string(gpus.size()) + ")");
+    }
+    out_devices = {gpus[idx]->name};
+    out_main_gpu = 0;
+    return Status::success();
+}
 
 }  // namespace sonder::inference::llamacpp_detail

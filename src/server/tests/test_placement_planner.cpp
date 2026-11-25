@@ -334,7 +334,20 @@ TEST_CASE("placement planner: AMD RX 7900 XT and RX 9070 XT discrete defaults an
         CHECK(plan.recommended_backend_hint == "vulkan");
         CHECK(plan.profile.flash_attn == std::string("auto"));
         CHECK(plan.profile.device == std::string("Vulkan0"));
-        CHECK(find_env(plan.recommended_env, "GPU_MAX_ALLOC_PERCENT") == std::string("100"));
+        CHECK_FALSE(find_env(plan.recommended_env, "GPU_MAX_ALLOC_PERCENT").has_value());
+    }
+
+    // Reordered ROCm runtime ordinal (e.g. ROCR_VISIBLE_DEVICES=1,0) must emit the mapped ROCmN name.
+    {
+        si::GpuDeviceInfo card0 = make_amd_discrete("gpu:0", "AMD Radeon RX 7900 XT", 20, 19456, "rocm");
+        card0.rocm_runtime_ordinal = 1;
+        si::GpuDeviceInfo card1 = make_amd_discrete("gpu:1", "AMD Radeon RX 7900 XT", 20, 19456, "rocm");
+        card1.rocm_runtime_ordinal = 0;
+        si::PlacementPlanRequest pinned = req;
+        pinned.device_hint = "gpu:0";
+        const si::PlacementPlan plan = si::plan_model_placement(model, {card0, card1}, host_ram(64, 48), pinned);
+        verify_plan_contracts(plan);
+        CHECK(plan.profile.device == std::string("ROCm1"));
     }
 }
 
@@ -655,5 +668,113 @@ TEST_CASE("placement planner disables mmproj offload on CPU fallback and uses Vu
     for (const auto& w : ctrl_plan.warnings) {
         CHECK(w.find('\n') == std::string::npos);
         CHECK(w.find('\r') == std::string::npos);
+    }
+}
+
+TEST_CASE("placement planner: cross-platform Linux/WSL Blackwell, hybrid AMD iGPU+RX XT ROCm0, and no-KFD APU") {
+    // 1. Linux / WSL2 NVIDIA RTX 5070 Ti (Blackwell sm_120, NVML source) + Bonsai-2-9B-MTP.
+    {
+        si::GpuDeviceInfo linux_blackwell = make_rtx_5070_ti("gpu:0", 14848);
+        linux_blackwell.source = "nvml";
+        linux_blackwell.shared_total = si::MemoryReading::unknown();
+
+        si::PlacementPlanRequest req;
+        req.profile_name = "linux-blackwell-bonsai";
+        req.model_path = "/models/Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf";
+        req.target_ctx_size = 32768;
+
+        const si::PlacementPlan plan =
+            si::plan_model_placement(bonsai_2_9b_mtp_model(), {linux_blackwell}, host_ram(32, 22), req);
+        verify_plan_contracts(plan);
+        CHECK(plan.fits_in_vram);
+        CHECK(plan.requires_prism_runtime);
+        CHECK(plan.selected_vendor == si::GpuVendor::nvidia);
+        CHECK(plan.recommended_backend_hint == "cuda");
+        CHECK(plan.profile.device == std::optional<std::string>("CUDA0"));
+        CHECK(plan.profile.flash_attn == std::optional<std::string>("on"));
+        CHECK(plan.profile.load_mode == std::optional<std::string>("none"));
+        REQUIRE(plan.profile.speculative.has_value());
+        CHECK(plan.profile.speculative->types == std::vector<std::string>{"draft-mtp"});
+    }
+
+    // 2. Hybrid AMD workstation: gpu:0 = Ryzen 9 9900X3D iGPU (UMA, backend_hint="vulkan") +
+    //    gpu:1 = Radeon RX 9070 XT discrete (backend_hint="rocm").
+    //    Default AND explicit "ROCm0" must select gpu:1 and emit --device ROCm0 (never ROCm1!).
+    {
+        si::GpuDeviceInfo ryzen_igpu = make_ryzen_780m_apu("gpu:0", "vulkan");
+        ryzen_igpu.name = "AMD Radeon(TM) Graphics";
+        ryzen_igpu.device_id = 0x13C0u;
+        const si::GpuDeviceInfo rx9070xt = make_amd_discrete("gpu:1", "AMD Radeon RX 9070 XT", 16, 15360, "rocm");
+        const std::vector<si::GpuDeviceInfo> hybrid_amd{ryzen_igpu, rx9070xt};
+
+        si::PlacementPlanRequest req;
+        req.profile_name = "hybrid-amd-bonsai";
+        req.model_path = "D:/models/Ternary-Bonsai-2-27B-PQ2_0.gguf";
+        req.target_ctx_size = 32768;
+
+        const si::PlacementPlan auto_plan =
+            si::plan_model_placement(bonsai_2_27b_model(), hybrid_amd, host_ram(32, 24), req);
+        verify_plan_contracts(auto_plan);
+        CHECK(auto_plan.fits_in_vram);
+        CHECK_FALSE(auto_plan.uma_mode);
+        CHECK(auto_plan.selected_vendor == si::GpuVendor::amd);
+        CHECK(auto_plan.recommended_backend_hint == "rocm");
+        CHECK(auto_plan.profile.device == std::optional<std::string>("ROCm0"));
+        CHECK(find_env(auto_plan.recommended_env, "GPU_MAX_ALLOC_PERCENT") == std::optional<std::string>("100"));
+
+        si::PlacementPlanRequest rocm0_req = req;
+        rocm0_req.device_hint = "ROCm0";
+        const si::PlacementPlan rocm0_plan =
+            si::plan_model_placement(bonsai_2_27b_model(), hybrid_amd, host_ram(32, 24), rocm0_req);
+        verify_plan_contracts(rocm0_plan);
+        CHECK_FALSE(rocm0_plan.uma_mode);
+        CHECK(rocm0_plan.profile.device == std::optional<std::string>("ROCm0"));
+        CHECK(rocm0_plan.budget_mib == 15360u - 1536u);
+
+        si::PlacementPlanRequest uma_req = req;
+        uma_req.device_hint = "apu";
+        const si::PlacementPlan uma_plan =
+            si::plan_model_placement(bonsai_2_27b_model(), hybrid_amd, host_ram(32, 24), uma_req);
+        verify_plan_contracts(uma_plan);
+        CHECK(uma_plan.uma_mode);
+        CHECK(uma_plan.recommended_backend_hint == "vulkan");
+        CHECK(uma_plan.profile.device == std::optional<std::string>("Vulkan0"));
+    }
+
+    // 3. Linux AMD Ryzen 780M APU without /dev/kfd (amdgpu-sysfs with backend_hint="vulkan")
+    //    uses Vulkan0 UMA rather than emitting broken ROCm0.
+    {
+        si::GpuDeviceInfo linux_apu_no_kfd = make_ryzen_780m_apu("gpu:0", "vulkan");
+        linux_apu_no_kfd.source = "amdgpu-sysfs";
+
+        si::PlacementPlanRequest req;
+        req.profile_name = "linux-apu-vulkan";
+        req.model_path = "/models/Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf";
+        const si::PlacementPlan plan =
+            si::plan_model_placement(bonsai_2_9b_mtp_model(), {linux_apu_no_kfd}, host_ram(32, 24), req);
+        verify_plan_contracts(plan);
+        CHECK(plan.uma_mode);
+        CHECK(plan.fits_in_vram);
+        CHECK(plan.recommended_backend_hint == "vulkan");
+        CHECK(plan.profile.device == std::optional<std::string>("Vulkan0"));
+        CHECK_FALSE(find_env(plan.recommended_env, "GPU_MAX_ALLOC_PERCENT").has_value());
+    }
+
+    // 4. Dual discrete AMD cards where card1 is hidden from ROCm (gpu:0="rocm", gpu:1="vulkan"):
+    //    ROCm auto-expansion must NOT split across the Vulkan-only peer.
+    {
+        const std::vector<si::GpuDeviceInfo> masked_amd{
+            make_amd_discrete("gpu:0", "AMD Radeon RX 7900 XT", 20, 18432, "rocm"),
+            make_amd_discrete("gpu:1", "AMD Radeon RX 7900 XT", 20, 18432, "vulkan"),
+        };
+        const si::GgufModelInfo big = dense_model(44, 512, 4);  // 22 GiB > single 18 GiB budget
+        si::PlacementPlanRequest req;
+        req.profile_name = "masked-rocm";
+        req.model_path = "/models/model-22g.gguf";
+        const si::PlacementPlan plan = si::plan_model_placement(big, masked_amd, host_ram(64, 48), req);
+        verify_plan_contracts(plan);
+        CHECK(plan.recommended_backend_hint == "rocm");
+        CHECK(plan.profile.device == std::optional<std::string>("ROCm0"));
+        CHECK_FALSE(plan.profile.split_mode.has_value());
     }
 }

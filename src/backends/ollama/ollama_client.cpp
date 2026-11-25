@@ -136,11 +136,15 @@ Result<net::HttpRequest> make_request(const OllamaConfig& config, std::string me
 }
 
 void apply_common(json::Object& body, const std::string& model, bool stream, const std::optional<bool>& think,
-                  const std::string& keep_alive, const OllamaConfig& config, const json::Object& options) {
+                  const std::optional<json::Value>& format, const std::string& keep_alive, const OllamaConfig& config,
+                  const json::Object& options) {
     body.set("model", model);
     body.set("stream", stream);
     if (think) {
         body.set("think", *think);
+    }
+    if (format) {
+        body.set("format", *format);
     }
     const std::string& ka = keep_alive.empty() ? config.keep_alive : keep_alive;
     if (!ka.empty()) {
@@ -241,7 +245,7 @@ json::Object sampling_to_options(const SamplingConfig& s) {
 
 json::Value build_generate_body(const GenerateParams& p, const OllamaConfig& config) {
     json::Object body;
-    apply_common(body, p.model, p.stream, p.think, p.keep_alive, config, p.options);
+    apply_common(body, p.model, p.stream, p.think, p.format, p.keep_alive, config, p.options);
     body.set("prompt", p.prompt);
     if (!p.system.empty()) {
         body.set("system", p.system);
@@ -254,7 +258,7 @@ json::Value build_generate_body(const GenerateParams& p, const OllamaConfig& con
 
 json::Value build_chat_body(const ChatParams& p, const OllamaConfig& config) {
     json::Object body;
-    apply_common(body, p.model, p.stream, p.think, p.keep_alive, config, p.options);
+    apply_common(body, p.model, p.stream, p.think, p.format, p.keep_alive, config, p.options);
     json::Array msgs;
     for (const auto& m : p.messages) {
         msgs.emplace_back(json::Object{{"role", m.role}, {"content", m.content}});

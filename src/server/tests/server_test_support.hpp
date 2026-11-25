@@ -157,6 +157,45 @@ public:
         }
         return true;
     }
+    // Reads exactly one HTTP/1.1 response using Content-Length (leaving any
+    // pipelined bytes in `buffer`) without waiting for EOF.
+    Reply read_response(std::string& buffer,
+                        std::chrono::milliseconds timeout = std::chrono::milliseconds(15000)) {
+        if (!read_until(buffer, "\r\n\r\n", timeout)) {
+            return {};
+        }
+        const std::size_t head_end = buffer.find("\r\n\r\n");
+        const std::size_t body_start = head_end + 4;
+        Reply r = parse_reply(buffer.substr(0, body_start));
+        const std::string cl = r.header("content-length");
+        if (!cl.empty()) {
+            const std::size_t body_len = static_cast<std::size_t>(std::stoull(cl));
+            const auto deadline = std::chrono::steady_clock::now() + timeout;
+            char buf[8192];
+            while (buffer.size() - body_start < body_len) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) break;
+                const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+                if (det::wait_socket(sock_.get(), false, left, nullptr) != det::WaitResult::ready) break;
+                const long long n = det::recv_some(sock_.get(), buf, sizeof(buf));
+                if (n <= 0) {
+                    closed_ = true;
+                    break;
+                }
+                buffer.append(buf, static_cast<std::size_t>(n));
+            }
+            const std::size_t avail = std::min(body_len, buffer.size() - body_start);
+            r.body = buffer.substr(body_start, avail);
+            buffer.erase(0, body_start + avail);
+            r.complete = avail == body_len;
+        } else {
+            buffer += read_all(timeout);
+            r.body = buffer.substr(body_start);
+            buffer.clear();
+            r.complete = closed_;
+        }
+        return r;
+    }
     // Shrinks the client's receive buffer so a peer that stops reading fills
     // the path quickly (backpressure tests).
     void shrink_receive_buffer(int bytes = 4096) {
@@ -178,8 +217,13 @@ inline std::string build_request(const std::string& method, const std::string& t
     if (host_header) {
         req += "Host: 127.0.0.1:" + std::to_string(port) + "\r\n";
     }
+    bool has_connection = false;
     for (const auto& [k, v] : headers) {
+        if (lower(k) == "connection") has_connection = true;
         req += k + ": " + v + "\r\n";
+    }
+    if (!has_connection) {
+        req += "Connection: close\r\n";
     }
     if (body) {
         req += "Content-Type: application/json\r\nContent-Length: " + std::to_string(body->size()) + "\r\n";

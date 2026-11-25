@@ -238,6 +238,8 @@ Result<GenerateStats> BackendModel::chat(const ChatRequest& request, const Cance
     g.request_id = request.request_id;
     g.prompt = format_chat_prompt(request.messages);
     g.sampling = request.sampling;
+    g.session_key = request.session_key;
+    g.grammar = request.grammar;
     return generate(g, cancel, on_chunk);
 }
 

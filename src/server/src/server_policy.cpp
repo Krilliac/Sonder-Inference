@@ -34,13 +34,39 @@ RouteInfo lookup_route(std::string_view path) {
     if (path == "/v1/sonder/node") return {Route::sonder_node, "GET"};
     if (path == "/v1/sonder/plan") return {Route::sonder_plan, "POST"};
     if (path == "/v1/chat/completions") return {Route::chat, "POST"};
+    if (path == "/v1/completions") return {Route::completions, "POST"};
     if (path == "/v1/messages") return {Route::messages, "POST"};
     if (path == "/v1/embeddings") return {Route::embeddings, "POST"};
+    if (path == "/v1/tokenize") return {Route::tokenize, "POST"};
+    if (path == "/v1/detokenize") return {Route::detokenize, "POST"};
     if (path == "/.well-known/sonder-telemetry") return {Route::discovery, "GET"};
     if (path == "/v1/telemetry") return {Route::telemetry, "GET"};
     if (path == "/v1/telemetry/sse") return {Route::telemetry_sse, "GET"};
     if (path == "/v1/telemetry/ndjson") return {Route::telemetry_ndjson, "GET"};
     return {};
+}
+
+bool client_wants_close(const RequestHead& head) {
+    for (const auto& [k, v] : head.headers) {
+        if (k != "connection") continue;
+        std::size_t pos = 0;
+        while (pos <= v.size()) {
+            const std::size_t comma = v.find(',', pos);
+            std::string_view tok =
+                std::string_view(v).substr(pos, comma == std::string::npos ? std::string_view::npos : comma - pos);
+            while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t')) tok.remove_prefix(1);
+            while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t')) tok.remove_suffix(1);
+            if (tok.size() == 5) {
+                std::string lowered(tok);
+                std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (lowered == "close") return true;
+            }
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+        }
+    }
+    return false;
 }
 
 bool is_serialized_origin(std::string_view origin) {
@@ -180,7 +206,15 @@ Headers base_headers(const Exchange& ex, const std::string& content_type) {
     h.emplace_back("X-Sonder-Inference-Api", std::to_string(kApiVersion));
     h.emplace_back("X-Sonder-Request-Id", ex.request_id);
     h.emplace_back("Cache-Control", "no-store");
-    h.emplace_back("Connection", "close");
+    if (ex.keep_alive) {
+        h.emplace_back("Connection", "keep-alive");
+        const auto timeout_s =
+            ex.keep_alive_timeout.count() > 0 ? std::max<long long>(1, (ex.keep_alive_timeout.count() + 999) / 1000) : 0;
+        h.emplace_back("Keep-Alive",
+                       "timeout=" + std::to_string(timeout_s) + ", max=" + std::to_string(ex.keep_alive_remaining));
+    } else {
+        h.emplace_back("Connection", "close");
+    }
     for (const auto& kv : ex.cors) {
         h.push_back(kv);
     }
@@ -189,7 +223,11 @@ Headers base_headers(const Exchange& ex, const std::string& content_type) {
 
 bool send_raw(Exchange& ex, std::string_view data, std::chrono::milliseconds write_stall_timeout,
               const std::atomic<bool>& hard_stop) {
-    return send_all(ex.sock, data, write_stall_timeout, &hard_stop).ok();
+    const bool ok = send_all(ex.sock, data, write_stall_timeout, &hard_stop).ok();
+    if (!ok) {
+        ex.write_failed = true;
+    }
+    return ok;
 }
 
 void send_response(Exchange& ex, int status, const std::string& content_type, const std::string& body,
@@ -213,6 +251,12 @@ void send_json(Exchange& ex, int status, const json::Object& body, std::chrono::
 
 void send_error(Exchange& ex, const ApiError& error, std::chrono::milliseconds write_stall_timeout,
                 const std::atomic<bool>& hard_stop, Headers extra) {
+    // Close persistent connections on framing/transport errors or unread input so
+    // stream boundaries cannot desynchronize.
+    if (ex.unread_input > 0 || error.status == 400 || error.status == 408 || error.status == 411 ||
+        error.status == 413 || error.status == 431 || error.status == 503 || error.status == 505) {
+        ex.keep_alive = false;
+    }
     if (error.retry_after) {
         extra.emplace_back("Retry-After", std::to_string(*error.retry_after));
     }
@@ -228,6 +272,16 @@ bool read_head(Exchange& ex, std::string& buffer, RequestHead& head, std::size_t
     const auto deadline = ex.started + opts.read_timeout;
     char chunk[4096];
     for (;;) {
+        if (flags.evict.load()) {
+            // Evicted to make room for a new connection (at the limit) — refuse
+            // even a complete pipelined head already sitting in the read buffer.
+            ex.keep_alive = false;
+            send_error(ex,
+                       make_error(408, "request_timeout",
+                                  "request headers not received in time (the server is at its connection limit)"),
+                       opts.write_stall_timeout, hard_stop);
+            return false;
+        }
         const ParseResult pr = parse_request_head(buffer, head);
         if (pr.state == ParseState::complete) {
             head_bytes = pr.head_bytes;
@@ -242,14 +296,6 @@ bool read_head(Exchange& ex, std::string& buffer, RequestHead& head, std::size_t
             // Whatever else the client sends is unread: linger briefly.
             ex.unread_input = kLingerUnknownLength;
             send_error(ex, make_error(pr.status, code, pr.message), opts.write_stall_timeout, hard_stop);
-            return false;
-        }
-        if (flags.evict.load()) {
-            // Evicted to make room for a new connection (at the limit).
-            send_error(ex,
-                       make_error(408, "request_timeout",
-                                  "request headers not received in time (the server is at its connection limit)"),
-                       opts.write_stall_timeout, hard_stop);
             return false;
         }
         const auto now = std::chrono::steady_clock::now();
@@ -280,13 +326,16 @@ bool read_head(Exchange& ex, std::string& buffer, RequestHead& head, std::size_t
 
 bool read_body(Exchange& ex, std::string& buffer, std::size_t head_bytes, std::uint64_t length, std::string& body,
                const ServerOptions& opts, const std::atomic<bool>& hard_stop) {
-    body = buffer.substr(head_bytes);
-    if (body.size() > length) {
-        body.resize(static_cast<std::size_t>(length));  // extra bytes after the body are ignored
-    }
+    const std::size_t want_total = static_cast<std::size_t>(length);
+    const std::size_t available = buffer.size() >= head_bytes ? buffer.size() - head_bytes : 0;
+    const std::size_t take = std::min(available, want_total);
+    body.assign(buffer, head_bytes, take);
+    // Erase the consumed head and body prefix, leaving any pipelined bytes intact.
+    buffer.erase(0, head_bytes + take);
+    ex.unread_input = length - body.size();
     const auto deadline = std::chrono::steady_clock::now() + opts.read_timeout;
     char chunk[16384];
-    while (body.size() < length) {
+    while (body.size() < want_total) {
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
             send_error(ex, make_error(408, "request_timeout", "request body not received in time"),
@@ -308,8 +357,14 @@ bool read_body(Exchange& ex, std::string& buffer, std::size_t head_bytes, std::u
             return false;
         }
         if (n > 0) {
-            const std::size_t want = static_cast<std::size_t>(length) - body.size();
-            body.append(chunk, std::min<std::size_t>(want, static_cast<std::size_t>(n)));
+            const std::size_t want = want_total - body.size();
+            const std::size_t got = static_cast<std::size_t>(n);
+            const std::size_t use = std::min(want, got);
+            body.append(chunk, use);
+            if (got > use) {
+                // Preserve any pipelined bytes past the end of this request body.
+                buffer.append(chunk + use, got - use);
+            }
             ex.unread_input = length - body.size();
         }
     }
@@ -330,6 +385,8 @@ PreDispatchResult run_request_guards(Exchange& ex, const RequestHead& head, std:
                                      const std::array<std::uint8_t, 32>& token_digest,
                                      const std::atomic<bool>& hard_stop) {
     const auto fail = [&](const ApiError& error, Headers extra = {}) -> PreDispatchResult {
+        // Pre-dispatch rejections skip body reading; always close to avoid stream desync.
+        ex.keep_alive = false;
         send_error(ex, error, opts.write_stall_timeout, hard_stop, std::move(extra));
         return {};
     };
@@ -362,6 +419,11 @@ PreDispatchResult run_request_guards(Exchange& ex, const RequestHead& head, std:
         ex.cors.emplace_back("Access-Control-Expose-Headers", kExposeHeaders);
     }
     if (preflight) {
+        if ((head.content_length && *head.content_length > 0) || head.has_transfer_encoding) {
+            ex.keep_alive = false;
+        } else {
+            buffer.erase(0, head_bytes);
+        }
         Headers h = base_headers(ex, "");
         h.emplace_back("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
         h.emplace_back("Access-Control-Allow-Headers",
@@ -435,6 +497,12 @@ PreDispatchResult run_request_guards(Exchange& ex, const RequestHead& head, std:
         }
         if (!read_body(ex, buffer, head_bytes, *head.content_length, body, opts, hard_stop)) {
             return {};
+        }
+    } else {
+        if ((head.content_length && *head.content_length > 0) || head.has_transfer_encoding) {
+            ex.keep_alive = false;
+        } else {
+            buffer.erase(0, head_bytes);
         }
     }
     return PreDispatchResult{true, route.route, std::move(body)};
@@ -544,6 +612,9 @@ Status validate_options(const ServerOptions& o) {
     }
     if (o.model_idle_ttl.count() < 0) {
         return Status(ErrorCode::invalid_argument, "--model-idle-ttl must not be negative");
+    }
+    if (o.keep_alive_timeout.count() < 0) {
+        return Status(ErrorCode::invalid_argument, "keep_alive_timeout must not be negative");
     }
     for (const auto& origin : o.cors_origins) {
         if (!detail::is_serialized_origin(origin)) {

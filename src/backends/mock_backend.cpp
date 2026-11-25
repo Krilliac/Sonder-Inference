@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -176,6 +177,53 @@ public:
     const ModelDescriptor& descriptor() const override { return descriptor_; }
 
     Result<std::vector<TokenId>> tokenize(std::string_view text) override { return detail::accounting_tokenize(text); }
+
+    Result<std::string> detokenize(std::span<const TokenId> tokens) override {
+        std::string out;
+        for (std::size_t i = 0; i < tokens.size(); ++i) {
+            if (i > 0) out.push_back(' ');
+            const auto idx = static_cast<std::size_t>(tokens[i] < 0 ? -tokens[i] : tokens[i]) % kVocabularySize;
+            out += kVocabulary[idx];
+        }
+        return out;
+    }
+
+    Result<EmbedResult> embed(const EmbedRequest& request, const CancellationToken& cancel) override {
+        if (cancel.cancelled()) {
+            return Status(ErrorCode::cancelled, "cancelled by caller");
+        }
+        if (request.inputs.empty()) {
+            return Status(ErrorCode::invalid_argument, "embed inputs must be non-empty");
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        constexpr std::size_t kMockDims = 16;
+        EmbedResult result;
+        result.embeddings.reserve(request.inputs.size());
+        for (const std::string& input : request.inputs) {
+            if (cancel.cancelled()) {
+                return Status(ErrorCode::cancelled, "cancelled by caller");
+            }
+            const auto toks = detail::accounting_tokenize(input);
+            result.prompt_tokens += toks.size();
+            std::uint64_t seed = fnv1a(input) ^ fnv1a(descriptor_.name);
+            std::vector<float> vec(kMockDims, 0.0f);
+            double norm_sq = 0.0;
+            for (std::size_t i = 0; i < kMockDims; ++i) {
+                seed = splitmix64(seed + i * 0x9E3779B97F4A7C15ull);
+                const float v = static_cast<float>(static_cast<double>(seed >> 40) / static_cast<double>(1ull << 24) * 2.0 - 1.0);
+                vec[i] = v;
+                norm_sq += static_cast<double>(v) * static_cast<double>(v);
+            }
+            if (request.normalize && norm_sq > 0.0) {
+                const float inv = static_cast<float>(1.0 / std::sqrt(norm_sq));
+                for (float& v : vec) v *= inv;
+            }
+            result.embeddings.push_back(std::move(vec));
+        }
+        result.eval_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        return result;
+    }
 
     Result<std::unique_ptr<TokenStream>> open_token_stream(const GenerateRequest& request) override {
         if (!options_.token_logits) {
@@ -463,7 +511,10 @@ public:
     }
     BackendCapabilities capabilities() const override {
         BackendCapabilities c;
-        c.add(Capability::tokenization).add(Capability::streaming).add(Capability::deterministic);
+        c.add(Capability::tokenization)
+            .add(Capability::streaming)
+            .add(Capability::deterministic)
+            .add(Capability::embeddings);
         if (options_.token_logits) {
             c.add(Capability::token_logits);
         }

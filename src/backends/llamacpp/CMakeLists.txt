@@ -71,6 +71,15 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
     cmake_policy(SET CMP0135 NEW)
 endif()
 
+# Optional local llama.cpp source tree override (offline builds, newer mainline,
+# or forks such as PrismML-Eng/llama.cpp). Mirrors into FetchContent's standard
+# override variable when that variable is not already set.
+set(SONDER_LLAMACPP_SOURCE_DIR "" CACHE PATH
+    "Optional local llama.cpp source directory (sets FETCHCONTENT_SOURCE_DIR_LLAMACPP if unset)")
+if(SONDER_LLAMACPP_SOURCE_DIR AND NOT FETCHCONTENT_SOURCE_DIR_LLAMACPP)
+    set(FETCHCONTENT_SOURCE_DIR_LLAMACPP "${SONDER_LLAMACPP_SOURCE_DIR}")
+endif()
+
 # CMake >= 3.28: only the llama.cpp targets we link are built by default.
 set(SONDER_LLAMACPP_FETCH_EXTRA)
 if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.28")
@@ -95,6 +104,108 @@ foreach(sonder_llamacpp_upstream_target IN ITEMS llama)
     endif()
 endforeach()
 
+# Feature auto-detection against the resolved llama.cpp / ggml headers so both
+# pinned mainline b11195 and newer/forked trees (e.g. PrismML-Eng/llama.cpp)
+# build cleanly without breaking older APIs.
+set(SONDER_LLAMACPP_FEATURE_DEFS "")
+set(SONDER_LLAMACPP_PRIVATE_INCLUDES "")
+set(_sonder_llama_h "${llamacpp_SOURCE_DIR}/include/llama.h")
+set(_sonder_llama_ext_h "${llamacpp_SOURCE_DIR}/src/llama-ext.h")
+set(_sonder_ggml_h "${llamacpp_SOURCE_DIR}/ggml/include/ggml.h")
+
+if(EXISTS "${_sonder_llama_h}")
+    file(READ "${_sonder_llama_h}" _sonder_llama_h_content)
+
+    string(FIND "${_sonder_llama_h_content}" "kv_unified" _idx_kv_unified)
+    if(NOT _idx_kv_unified EQUAL -1)
+        list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_KV_UNIFIED=1)
+    endif()
+
+    string(FIND "${_sonder_llama_h_content}" "op_offload" _idx_op_offload)
+    if(NOT _idx_op_offload EQUAL -1)
+        list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_OP_OFFLOAD=1)
+    endif()
+
+    string(FIND "${_sonder_llama_h_content}" "llama_set_sampler" _idx_set_sampler)
+    if(NOT _idx_set_sampler EQUAL -1)
+        list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_SET_SAMPLER=1)
+    endif()
+
+    string(FIND "${_sonder_llama_h_content}" "n_outputs_max_per_seq" _idx_n_outputs_max)
+    if(NOT _idx_n_outputs_max EQUAL -1)
+        list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_N_OUTPUTS_MAX=1)
+    endif()
+
+    string(FIND "${_sonder_llama_h_content}" "llama_state_seq_get_data_ext" _idx_state_ext)
+    if(NOT _idx_state_ext EQUAL -1)
+        list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_STATE_SEQ_EXT=1)
+    endif()
+
+    string(FIND "${_sonder_llama_h_content}" "llama_model_n_embd_out" _idx_n_embd_out)
+    if(NOT _idx_n_embd_out EQUAL -1)
+        list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_N_EMBD_OUT=1)
+    endif()
+
+    string(FIND "${_sonder_llama_h_content}" "llama_n_ctx_seq" _idx_n_ctx_seq)
+    if(NOT _idx_n_ctx_seq EQUAL -1)
+        list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_N_CTX_SEQ=1)
+    endif()
+
+    string(FIND "${_sonder_llama_h_content}" "LLAMA_CONTEXT_TYPE_MTP" _idx_ctx_mtp)
+    string(FIND "${_sonder_llama_h_content}" "llama_model_n_layer_nextn" _idx_layer_nextn)
+    string(FIND "${_sonder_llama_h_content}" "load_mtp" _idx_load_mtp)
+    if(NOT _idx_ctx_mtp EQUAL -1
+       AND NOT _idx_layer_nextn EQUAL -1
+       AND NOT _idx_load_mtp EQUAL -1
+       AND EXISTS "${_sonder_llama_ext_h}")
+        file(READ "${_sonder_llama_ext_h}" _sonder_llama_ext_h_content)
+        string(FIND "${_sonder_llama_ext_h_content}" "llama_set_embeddings_nextn" _idx_embd_nextn)
+        if(NOT _idx_embd_nextn EQUAL -1)
+            list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_MTP=1)
+            list(APPEND SONDER_LLAMACPP_PRIVATE_INCLUDES "${llamacpp_SOURCE_DIR}/src")
+
+            string(FIND "${_sonder_llama_ext_h_content}" "llama_set_nextn_layer_offset" _idx_nextn_offset)
+            if(NOT _idx_nextn_offset EQUAL -1)
+                list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_NEXTN_LAYER_OFFSET=1)
+            endif()
+
+            string(FIND "${_sonder_llama_ext_h_content}" "llama_get_ctx_other" _idx_get_ctx_other)
+            string(FIND "${_sonder_llama_h_content}" "ctx_other" _idx_ctx_other)
+            if(NOT _idx_get_ctx_other EQUAL -1 AND NOT _idx_ctx_other EQUAL -1)
+                list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_CTX_OTHER=1)
+            endif()
+
+            string(FIND "${_sonder_llama_h_content}" "n_rs_seq" _idx_n_rs_seq)
+            if(NOT _idx_n_rs_seq EQUAL -1)
+                list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_N_RS_SEQ=1)
+            endif()
+        endif()
+    endif()
+endif()
+
+if(EXISTS "${_sonder_ggml_h}")
+    file(READ "${_sonder_ggml_h}" _sonder_ggml_h_content)
+
+    string(FIND "${_sonder_ggml_h_content}" "GGML_TYPE_F8_E4M3" _idx_f8)
+    if(NOT _idx_f8 EQUAL -1)
+        list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_GGML_F8_E4M3=1)
+    endif()
+
+    string(FIND "${_sonder_ggml_h_content}" "GGML_TYPE_Q2_0" _idx_q2_0)
+    if(NOT _idx_q2_0 EQUAL -1)
+        list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_GGML_Q2_0=1)
+    endif()
+
+    string(FIND "${_sonder_ggml_h_content}" "GGML_TYPE_PQ2_0" _idx_pq2_0)
+    if(NOT _idx_pq2_0 EQUAL -1)
+        list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_GGML_PQ2_0=1)
+    endif()
+endif()
+
+if(SONDER_LLAMACPP_FEATURE_DEFS)
+    message(STATUS "Sonder llamacpp detected features: ${SONDER_LLAMACPP_FEATURE_DEFS}")
+endif()
+
 add_library(sonder_backend_llamacpp STATIC
     llamacpp_backend.cpp
     llamacpp_util.cpp
@@ -103,11 +214,13 @@ add_library(sonder::backend_llamacpp ALIAS sonder_backend_llamacpp)
 target_include_directories(sonder_backend_llamacpp
     PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
            "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
+    PRIVATE ${SONDER_LLAMACPP_PRIVATE_INCLUDES}
 )
 target_compile_features(sonder_backend_llamacpp PUBLIC cxx_std_20)
 # llama.h stays private: nothing outside this directory sees llama.cpp types.
 target_link_libraries(sonder_backend_llamacpp PRIVATE llama ggml)
 target_compile_definitions(sonder_backend_llamacpp
+    PUBLIC  ${SONDER_LLAMACPP_FEATURE_DEFS}
     PRIVATE SONDER_LLAMACPP_TAG_STRING="${SONDER_LLAMACPP_TAG}"
 )
 if(COMMAND sonder_set_warnings)
