@@ -284,18 +284,20 @@ TEST_CASE("anthropic messages: stream pin warning is present in final event") {
     CHECK(warnings->as_array().size() >= 1);
 }
 
-TEST_CASE("anthropic messages: unsupported tools, images and missing max_tokens are clear errors") {
+TEST_CASE("anthropic messages: invalid tools, remote url images and missing max_tokens are clear errors") {
     Fixture f;
     check_anthropic_error(
         post(f.port, "/v1/messages", R"({"model":"default","messages":[{"role":"user","content":"x"}]})"),
         400, "invalid_request_error", "max_tokens");
-    check_anthropic_error(post(f.port, "/v1/messages", messages_body(R"(,"tools":[])")), 400,
+    check_anthropic_error(post(f.port, "/v1/messages", messages_body(R"(,"tools":"bad")")), 400,
                           "invalid_request_error", "tools");
-    check_anthropic_error(post(f.port, "/v1/messages", messages_body(R"(,"tool_choice":{"type":"auto"})")),
-                          400, "invalid_request_error", "tool_choice");
-    check_anthropic_error(post(f.port, "/v1/messages",
-                               R"({"model":"default","max_tokens":2,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}]}]})"),
-                          400, "invalid_request_error", "image");
+    check_anthropic_error(
+        post(f.port, "/v1/messages", messages_body(R"(,"tool_choice":{"type":"tool","name":"missing"})")), 400,
+        "invalid_request_error", "tool_choice");
+    check_anthropic_error(
+        post(f.port, "/v1/messages",
+             R"({"model":"default","max_tokens":2,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://evil.example/img.png"}}]}]})"),
+        400, "invalid_request_error", "base64");
 }
 
 TEST_CASE("anthropic messages: error envelope and x-api-key authentication") {

@@ -302,8 +302,10 @@ TEST_CASE("chat: request errors use the OpenAI error shape") {
     };
     CHECK(code_of("{not json") == std::make_pair(400, std::string("invalid_json")));
     CHECK(code_of(R"({"messages":"hi"})") == std::make_pair(400, std::string("invalid_messages")));
-    CHECK(code_of(chat_body(R"(,"tools":[{"type":"function"}])")) ==
+    CHECK(code_of(chat_body(R"(,"functions":[{"name":"f"}])")) ==
           std::make_pair(400, std::string("unsupported_parameter")));
+    CHECK(code_of(chat_body(R"(,"tools":[{"type":"function"}])")) ==
+          std::make_pair(400, std::string("invalid_request")));
     CHECK(code_of(chat_body(R"(,"n":3)")) == std::make_pair(400, std::string("unsupported_parameter")));
     CHECK(code_of(chat_body(R"(,"top_p":0)")) == std::make_pair(400, std::string("invalid_sampling")));
     CHECK(code_of(R"({"model":"gpt-4","messages":[{"role":"user","content":"x"}]})") ==

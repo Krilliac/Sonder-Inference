@@ -26,6 +26,9 @@ std::vector<std::string> BackendCapabilities::names() const {
         {Capability::remote_process, "remote_process"},
         {Capability::token_logits, "token_logits"},
         {Capability::recurrent_checkpoint, "recurrent_checkpoint"},
+        {Capability::tool_calling, "tool_calling"},
+        {Capability::multimodal, "multimodal"},
+        {Capability::logprobs, "logprobs"},
     };
     std::vector<std::string> out;
     for (const auto& [cap, name] : kNames) {
@@ -45,6 +48,7 @@ const char* to_string(StopReason reason) noexcept {
         case StopReason::cancelled: return "cancelled";
         case StopReason::callback: return "callback";
         case StopReason::error: return "error";
+        case StopReason::tool_calls: return "tool_calls";
     }
     return "unknown";
 }
@@ -66,6 +70,21 @@ Status validate_chat_messages(const std::vector<ChatMessage>& messages) {
         if (messages[i].content.find('\0') != std::string::npos) {
             return Status(ErrorCode::invalid_argument,
                           "chat: message " + std::to_string(i) + " content must not contain NUL");
+        }
+        if (messages[i].tool_call_id && messages[i].tool_call_id->find('\0') != std::string::npos) {
+            return Status(ErrorCode::invalid_argument,
+                          "chat: message " + std::to_string(i) + " tool_call_id must not contain NUL");
+        }
+        if (messages[i].name && messages[i].name->find('\0') != std::string::npos) {
+            return Status(ErrorCode::invalid_argument,
+                          "chat: message " + std::to_string(i) + " name must not contain NUL");
+        }
+        for (const auto& tc : messages[i].tool_calls) {
+            if (tc.id.find('\0') != std::string::npos || tc.name.find('\0') != std::string::npos ||
+                tc.arguments_json.find('\0') != std::string::npos) {
+                return Status(ErrorCode::invalid_argument,
+                              "chat: message " + std::to_string(i) + " tool_calls must not contain NUL");
+            }
         }
     }
     const std::string& last = messages.back().role;
@@ -221,8 +240,37 @@ std::string format_chat_prompt(const std::vector<ChatMessage>& messages) {
             label[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(label[0])));
         }
         out += label;
+        if (m.role == "tool" && m.tool_call_id && !m.tool_call_id->empty()) {
+            out += " (";
+            out += *m.tool_call_id;
+            out += ")";
+        }
         out += ": ";
         out += m.content;
+        if (!m.tool_calls.empty()) {
+            for (const auto& tc : m.tool_calls) {
+                if (!m.content.empty()) out.push_back('\n');
+                out += "<tool_call>{\"name\":";
+                json::append_escaped(out, tc.name);
+                out += ",\"arguments\":";
+                out += tc.arguments_json.empty() ? "{}" : tc.arguments_json;
+                out += "}</tool_call>";
+            }
+        }
+        if (!m.media.empty()) {
+            for (const auto& img : m.media) {
+                if (!m.content.empty()) out.push_back(' ');
+                std::uint64_t h = 1469598103934665603ull;
+                for (const std::uint8_t b : img.bytes) {
+                    h ^= b;
+                    h *= 1099511628211ull;
+                }
+                char tag[96];
+                std::snprintf(tag, sizeof(tag), "[image:%zu:%016llx]", img.bytes.size(),
+                              static_cast<unsigned long long>(h));
+                out += tag;
+            }
+        }
         out += "\n\n";
     }
     out += "Assistant:";

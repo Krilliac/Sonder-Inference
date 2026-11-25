@@ -2,6 +2,7 @@
 // It performs no inference and must never be used for quality/perf claims.
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -12,6 +13,7 @@
 
 #include "engine/accounting_tokens.hpp"
 #include "sonder/inference/backends.hpp"
+#include "sonder/inference/json.hpp"
 
 namespace sonder::inference {
 namespace {
@@ -88,6 +90,94 @@ std::uint64_t count_words(std::string_view s) {
         in_word = !space;
     }
     return n;
+}
+
+void attach_mock_logprobs(TokenChunk& chunk, std::string_view token_text, std::uint64_t state,
+                          const SamplingConfig& sampling) {
+    if (!sampling.logprobs) {
+        return;
+    }
+    const float primary_lp = -0.05f - static_cast<float>(state % 120u) * 0.01f;
+    chunk.logprob = primary_lp;
+    if (sampling.top_logprobs > 0) {
+        const std::size_t k = static_cast<std::size_t>(sampling.top_logprobs);
+        chunk.top_logprobs.reserve(k);
+        chunk.top_logprobs.push_back(TopLogprob{std::string(token_text), primary_lp});
+        std::size_t alt_idx = static_cast<std::size_t>(splitmix64(state) % kVocabularySize);
+        for (std::size_t j = 1; j < k; ++j) {
+            std::string alt_tok = kVocabulary[(alt_idx + j) % kVocabularySize];
+            if (alt_tok == token_text) {
+                alt_tok = kVocabulary[(alt_idx + j + 1) % kVocabularySize];
+            }
+            const float alt_lp = primary_lp - 0.35f * static_cast<float>(j);
+            chunk.top_logprobs.push_back(TopLogprob{std::move(alt_tok), alt_lp});
+        }
+    }
+}
+
+std::string lower_ascii(std::string_view sv) {
+    std::string out(sv);
+    for (char& c : out) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return out;
+}
+
+std::string build_mock_tool_arguments(const ToolDefinition& tool) {
+    if (tool.parameters_json.empty()) {
+        return "{}";
+    }
+    auto parsed = json::parse(tool.parameters_json);
+    if (!parsed.ok() || !parsed.value().is_object()) {
+        return "{}";
+    }
+    const json::Value* props = parsed.value().find("properties");
+    if (!props || !props->is_object() || props->as_object().empty()) {
+        return "{}";
+    }
+    std::vector<std::string> wanted;
+    if (const json::Value* req = parsed.value().find("required"); req && req->is_array()) {
+        for (const auto& item : req->as_array()) {
+            if (item.is_string()) {
+                wanted.push_back(item.as_string());
+            }
+        }
+    }
+    if (wanted.empty()) {
+        wanted.push_back(props->as_object().begin()->first);
+    }
+    json::Object args;
+    for (const auto& key : wanted) {
+        const json::Value* prop = props->find(key);
+        if (!prop || !prop->is_object()) {
+            args.set(key, "mock");
+            continue;
+        }
+        if (const json::Value* en = prop->find("enum"); en && en->is_array() && !en->as_array().empty()) {
+            args.set(key, en->as_array().front());
+            continue;
+        }
+        if (const json::Value* c = prop->find("const"); c != nullptr) {
+            args.set(key, *c);
+            continue;
+        }
+        const json::Value* t = prop->find("type");
+        const std::string type_name = (t && t->is_string()) ? t->as_string() : std::string("string");
+        if (type_name == "integer") {
+            args.set(key, 42);
+        } else if (type_name == "number") {
+            args.set(key, 3.14);
+        } else if (type_name == "boolean") {
+            args.set(key, true);
+        } else if (type_name == "array") {
+            args.set(key, json::Array{});
+        } else if (type_name == "object") {
+            args.set(key, json::Object{});
+        } else {
+            args.set(key, "mock_" + key);
+        }
+    }
+    return json::Value(std::move(args)).dump();
 }
 
 // Sleeps for `d` while polling the token; returns false if cancelled.
@@ -340,7 +430,8 @@ public:
             if (!piece.empty()) {
                 emitted += piece;
                 ++stats.completion_tokens;
-                const TokenChunk chunk{piece, stats.chunks++};
+                TokenChunk chunk{piece, stats.chunks++};
+                attach_mock_logprobs(chunk, piece, state, request.sampling);
                 if (on_chunk && !on_chunk(chunk)) {
                     stats.stop_reason = StopReason::callback;
                     break;
@@ -353,6 +444,112 @@ public:
         }
         if (stats.stop_reason == StopReason::none) {
             stats.stop_reason = limit < natural ? StopReason::max_tokens : StopReason::end_of_sequence;
+        }
+        stats.eval_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        return stats;
+    }
+
+    Result<GenerateStats> chat(const ChatRequest& request, const CancellationToken& cancel,
+                               const TokenCallback& on_chunk) override {
+        if (Status st = validate_chat_messages(request.messages); !st.ok()) {
+            return st;
+        }
+        if (request.tools.empty()) {
+            return BackendModel::chat(request, cancel, on_chunk);
+        }
+        const ToolChoiceMode mode = request.tool_choice ? request.tool_choice->mode : ToolChoiceMode::auto_choice;
+        if (mode == ToolChoiceMode::none) {
+            return BackendModel::chat(request, cancel, on_chunk);
+        }
+
+        const ToolDefinition* chosen = nullptr;
+        const ChatMessage& last_msg = request.messages.back();
+        const std::string last_lower = lower_ascii(last_msg.content);
+
+        if (mode == ToolChoiceMode::function) {
+            for (const auto& t : request.tools) {
+                if (t.name == request.tool_choice->function_name) {
+                    chosen = &t;
+                    break;
+                }
+            }
+            if (chosen == nullptr) {
+                return Status(ErrorCode::invalid_argument,
+                              "mock: requested tool_choice function '" + request.tool_choice->function_name +
+                                  "' is not in tools");
+            }
+        } else if (mode == ToolChoiceMode::required) {
+            for (const auto& t : request.tools) {
+                if (last_lower.find(lower_ascii(t.name)) != std::string::npos) {
+                    chosen = &t;
+                    break;
+                }
+            }
+            if (chosen == nullptr) {
+                chosen = &request.tools.front();
+            }
+        } else if (last_msg.role == "user") {
+            // Auto mode: trigger tool call deterministically when user prompt
+            // names a tool or asks to use/call a tool.
+            for (const auto& t : request.tools) {
+                if (last_lower.find(lower_ascii(t.name)) != std::string::npos) {
+                    chosen = &t;
+                    break;
+                }
+            }
+            if (chosen == nullptr && (last_lower.find("tool") != std::string::npos ||
+                                      last_lower.find("function") != std::string::npos ||
+                                      last_lower.find("weather") != std::string::npos ||
+                                      last_lower.find("calculate") != std::string::npos)) {
+                chosen = &request.tools.front();
+            }
+        }
+
+        if (chosen == nullptr) {
+            return BackendModel::chat(request, cancel, on_chunk);
+        }
+
+        const auto t0 = std::chrono::steady_clock::now();
+        GenerateStats stats;
+        const std::string prompt = format_chat_prompt(request.messages);
+        stats.prompt_tokens = count_words(prompt);
+        stats.token_counts_from_backend = true;
+        if (cancel.cancelled()) {
+            stats.stop_reason = StopReason::cancelled;
+            return Status(ErrorCode::cancelled, "cancelled by caller");
+        }
+
+        const std::string args_json = build_mock_tool_arguments(*chosen);
+        std::string name_json;
+        json::append_escaped(name_json, chosen->name);
+        // Split across multiple chunks including mid-tag boundaries to exercise
+        // incremental ToolCallStreamParser framing in tests.
+        const std::vector<std::string> pieces = {
+            "<tool",
+            "_call>{\"name\":",
+            name_json,
+            ",\"arguments\":",
+            args_json,
+            "}</tool_call>",
+        };
+        std::uint64_t state = fnv1a(prompt) ^ fnv1a(chosen->name);
+        for (const std::string& p : pieces) {
+            if (cancel.cancelled()) {
+                stats.stop_reason = StopReason::cancelled;
+                return Status(ErrorCode::cancelled, "cancelled by caller");
+            }
+            state = splitmix64(state);
+            ++stats.completion_tokens;
+            TokenChunk chunk{p, stats.chunks++};
+            attach_mock_logprobs(chunk, p, state, request.sampling);
+            if (on_chunk && !on_chunk(chunk)) {
+                stats.stop_reason = StopReason::callback;
+                break;
+            }
+        }
+        if (stats.stop_reason == StopReason::none) {
+            stats.stop_reason = StopReason::end_of_sequence;
         }
         stats.eval_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
@@ -514,7 +711,10 @@ public:
         c.add(Capability::tokenization)
             .add(Capability::streaming)
             .add(Capability::deterministic)
-            .add(Capability::embeddings);
+            .add(Capability::embeddings)
+            .add(Capability::tool_calling)
+            .add(Capability::multimodal)
+            .add(Capability::logprobs);
         if (options_.token_logits) {
             c.add(Capability::token_logits);
         }

@@ -35,6 +35,7 @@ RouteInfo lookup_route(std::string_view path) {
     if (path == "/v1/sonder/plan") return {Route::sonder_plan, "POST"};
     if (path == "/v1/chat/completions") return {Route::chat, "POST"};
     if (path == "/v1/completions") return {Route::completions, "POST"};
+    if (path == "/v1/responses") return {Route::responses, "POST"};
     if (path == "/v1/messages") return {Route::messages, "POST"};
     if (path == "/v1/embeddings") return {Route::embeddings, "POST"};
     if (path == "/v1/tokenize") return {Route::tokenize, "POST"};

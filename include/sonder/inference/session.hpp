@@ -120,6 +120,9 @@ struct RequestOptions {
     // and serialized JSON schema for native-format upstreams.
     std::optional<std::string> response_format_type = std::nullopt;
     std::optional<std::string> response_format_schema = std::nullopt;
+    // Optional tool definitions and tool_choice policy for chat requests.
+    std::vector<ToolDefinition> tools{};
+    std::optional<ToolChoice> tool_choice = std::nullopt;
 };
 
 struct GenerationResult {
@@ -131,6 +134,8 @@ struct GenerationResult {
     double total_ms = 0.0;
     SchedulingInfo scheduling;
     std::string reasoning{};
+    std::vector<TokenLogprob> logprobs{};
+    std::vector<ToolCall> tool_calls{};
 };
 
 class Engine;
