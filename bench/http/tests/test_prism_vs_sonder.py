@@ -70,6 +70,17 @@ class FakeH2HState:
         server_prefill_tps: float = 2800.0,
         reasoning_first_chunk: str = "",
         quality_overrides: dict[str, str] | None = None,
+        support_tools: bool | None = None,
+        support_responses: bool | None = None,
+        support_logprobs: bool | None = None,
+        malformed_tools: bool = False,
+        malformed_logprobs: bool = False,
+        serialize_requests: bool = False,
+        hol_blocking_prefill: bool = False,
+        hol_prefill_stall_s: float = 0.08,
+        target_tag: str = "",
+        order_log: list[str] | None = None,
+        order_log_lock: threading.Lock | None = None,
     ) -> None:
         self.model_id = model_id
         self.keep_alive = keep_alive
@@ -84,6 +95,17 @@ class FakeH2HState:
         self.server_prefill_tps = server_prefill_tps
         self.reasoning_first_chunk = reasoning_first_chunk
         self.quality_overrides = dict(quality_overrides or {})
+        self.support_tools = sonder_routes if support_tools is None else support_tools
+        self.support_responses = sonder_routes if support_responses is None else support_responses
+        self.support_logprobs = sonder_routes if support_logprobs is None else support_logprobs
+        self.malformed_tools = malformed_tools
+        self.malformed_logprobs = malformed_logprobs
+        self.serialize_requests = serialize_requests
+        self.hol_blocking_prefill = hol_blocking_prefill
+        self.hol_prefill_stall_s = hol_prefill_stall_s
+        self.target_tag = target_tag
+        self.order_log = order_log
+        self.order_log_lock = order_log_lock
 
         corpus, _ = bps.load_corpus_file(bps.DEFAULT_CORPUS_PATH)
         self.probe_answers_by_prompt: dict[str, str] = {}
@@ -92,10 +114,22 @@ class FakeH2HState:
             self.probe_answers_by_prompt[p["prompt"]] = ans
 
         self.lock = threading.Lock()
+        self.exec_lock = threading.Lock()
+        self.hol_pause_event = threading.Event()
+        self.hol_pause_event.set()
         self.slot_cache: dict[str, str] = {}
         self.last_rendered = ""
         self.chat_requests: list[dict[str, Any]] = []
+        self.responses_requests: list[dict[str, Any]] = []
         self.accepted_connections = 0
+
+    def record_order(self) -> None:
+        if self.order_log is not None and self.target_tag:
+            if self.order_log_lock is not None:
+                with self.order_log_lock:
+                    self.order_log.append(self.target_tag)
+            else:
+                self.order_log.append(self.target_tag)
 
     def match_reply(self, messages: list[dict[str, Any]], response_format: dict[str, Any] | None) -> list[str]:
         last_user = ""
@@ -211,9 +245,35 @@ def _make_handler(state: FakeH2HState) -> type[BaseHTTPRequestHandler]:
                     },
                 )
 
+            if self.path == "/v1/responses":
+                state.record_order()
+                with state.lock:
+                    state.responses_requests.append(body)
+                if not state.support_responses:
+                    return self._send_json(404, {"error": {"message": "not found"}})
+                return self._send_json(
+                    200,
+                    {
+                        "id": "resp_fake_0001",
+                        "object": "response",
+                        "status": "completed",
+                        "model": state.model_id,
+                        "output": [
+                            {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": "OK"}],
+                            }
+                        ],
+                        "output_text": "OK",
+                        "usage": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
+                    },
+                )
+
             if self.path != "/v1/chat/completions":
                 return self._send_json(404, {"error": {"message": f"unknown POST {self.path}"}})
 
+            state.record_order()
             messages = body.get("messages") or []
             resp_fmt = body.get("response_format")
             stream = bool(body.get("stream", False))
@@ -222,104 +282,200 @@ def _make_handler(state: FakeH2HState) -> type[BaseHTTPRequestHandler]:
 
             with state.lock:
                 state.chat_requests.append(body)
-                cache_key = str(body.get("prompt_cache_key") or "__default__")
-                prev = state.slot_cache.get(cache_key, state.last_rendered)
-                lcp_chars = _common_prefix_len(prev, rendered)
-                p_tok = _approx_tok(rendered)
-                cache_n = min(lcp_chars // 4, max(p_tok - 1, 0))
-                uncached = max(p_tok - cache_n, 1)
 
-            pieces = state.match_reply(messages, resp_fmt)[:max_tokens]
-            full_reply = "".join(pieces)
-            with state.lock:
-                state.slot_cache[cache_key] = rendered + full_reply
-                state.last_rendered = rendered + full_reply
-
-            if not stream:
+            if body.get("tools"):
+                if not state.support_tools:
+                    return self._send_json(
+                        400, {"error": {"message": "tools unsupported", "code": "unsupported_parameter"}}
+                    )
+                tool0 = (body.get("tools") or [{}])[0]
+                fn_name = ((tool0 or {}).get("function") or {}).get("name") or "get_weather"
+                if state.malformed_tools:
+                    msg_payload: dict[str, Any] = {"role": "assistant", "content": "No tool call emitted"}
+                    fin_reason = "stop"
+                else:
+                    msg_payload = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_fake_001",
+                                "type": "function",
+                                "function": {
+                                    "name": fn_name,
+                                    "arguments": json.dumps({"city": "Austin, TX"}),
+                                },
+                            }
+                        ],
+                    }
+                    fin_reason = "tool_calls"
                 return self._send_json(
                     200,
                     {
-                        "id": "chatcmpl-fake",
+                        "id": "chatcmpl-fake-tools",
                         "object": "chat.completion",
                         "model": state.model_id,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "message": {"role": "assistant", "content": full_reply},
-                                "finish_reason": "stop",
-                            }
-                        ],
-                        "usage": {
-                            "prompt_tokens": p_tok,
-                            "completion_tokens": len(pieces),
-                            "total_tokens": p_tok + len(pieces),
-                        },
+                        "choices": [{"index": 0, "message": msg_payload, "finish_reason": fin_reason}],
+                        "usage": {"prompt_tokens": 24, "completion_tokens": 12, "total_tokens": 36},
                     },
                 )
 
-            prefill_sleep = state.prefill_base_s + state.prefill_per_uncached_tok_s * uncached
-            if prefill_sleep > 0:
-                time.sleep(prefill_sleep)
-
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.close_connection = True
-
-            def send_sse(event_payload: Any) -> None:
-                txt = event_payload if isinstance(event_payload, str) else json.dumps(event_payload)
-                self.wfile.write(f"data: {txt}\n\n".encode("utf-8"))
-                self.wfile.flush()
-
-            send_sse({"choices": [{"index": 0, "delta": {"role": "assistant"}}], "model": state.model_id})
-
-            emitted_tokens = 0
-            if state.reasoning_first_chunk:
-                send_sse(
+            if body.get("logprobs"):
+                if not state.support_logprobs:
+                    return self._send_json(
+                        400, {"error": {"message": "logprobs unsupported", "code": "unsupported_parameter"}}
+                    )
+                top_k = max(1, min(int(body.get("top_logprobs") or 1), 5))
+                cand_lps = [
+                    {"token": "OK", "logprob": -0.04},
+                    {"token": "Yes", "logprob": -3.12},
+                    {"token": "Sure", "logprob": -4.25},
+                    {"token": "Done", "logprob": -5.01},
+                    {"token": "Fine", "logprob": -5.80},
+                ][:top_k]
+                choice_obj: dict[str, Any] = {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "OK"},
+                    "finish_reason": "stop",
+                }
+                if not state.malformed_logprobs:
+                    choice_obj["logprobs"] = {
+                        "content": [
+                            {
+                                "token": "OK",
+                                "logprob": -0.04,
+                                "top_logprobs": cand_lps,
+                            }
+                        ]
+                    }
+                return self._send_json(
+                    200,
                     {
-                        "choices": [{"index": 0, "delta": {"reasoning_content": state.reasoning_first_chunk}}],
+                        "id": "chatcmpl-fake-lp",
+                        "object": "chat.completion",
                         "model": state.model_id,
-                    }
+                        "choices": [choice_obj],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+                    },
                 )
-                emitted_tokens += 1
-                if state.chunk_delay_s > 0:
-                    time.sleep(state.chunk_delay_s)
 
-            for idx, piece in enumerate(pieces):
-                send_sse({"choices": [{"index": 0, "delta": {"content": piece}}], "model": state.model_id})
-                emitted_tokens += 1
-                if idx + 1 < len(pieces) and state.chunk_delay_s > 0:
-                    time.sleep(state.chunk_delay_s)
+            def _serve_chat_body() -> None:
+                with state.lock:
+                    cache_key = str(body.get("prompt_cache_key") or "__default__")
+                    prev = state.slot_cache.get(cache_key, state.last_rendered)
+                    lcp_chars = _common_prefix_len(prev, rendered)
+                    p_tok = _approx_tok(rendered)
+                    cache_n = min(lcp_chars // 4, max(p_tok - 1, 0))
+                    uncached = max(p_tok - cache_n, 1)
 
-            timings: dict[str, Any] = {
-                "prompt_n": uncached,
-                "cache_n": cache_n,
-                "prompt_ms": round(prefill_sleep * 1000.0, 3),
-                "prompt_per_second": state.server_prefill_tps,
-                "predicted_n": emitted_tokens,
-                "predicted_ms": round(max(emitted_tokens - 1, 1) * state.chunk_delay_s * 1000.0, 3),
-                "predicted_per_second": state.server_decode_tps,
-            }
-            if state.draft_n is not None:
-                timings["draft_n"] = state.draft_n
-                timings["draft_n_accepted"] = state.draft_n_accepted
+                pieces = state.match_reply(messages, resp_fmt)[:max_tokens]
+                full_reply = "".join(pieces)
+                with state.lock:
+                    state.slot_cache[cache_key] = rendered + full_reply
+                    state.last_rendered = rendered + full_reply
 
-            send_sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "timings": timings})
-            if (body.get("stream_options") or {}).get("include_usage"):
-                send_sse(
-                    {
-                        "choices": [],
-                        "usage": {
-                            "prompt_tokens": p_tok,
-                            "completion_tokens": emitted_tokens,
-                            "total_tokens": p_tok + emitted_tokens,
-                            "prompt_tokens_details": {"cached_tokens": cache_n},
+                if not stream:
+                    self._send_json(
+                        200,
+                        {
+                            "id": "chatcmpl-fake",
+                            "object": "chat.completion",
+                            "model": state.model_id,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "message": {"role": "assistant", "content": full_reply},
+                                    "finish_reason": "stop",
+                                }
+                            ],
+                            "usage": {
+                                "prompt_tokens": p_tok,
+                                "completion_tokens": len(pieces),
+                                "total_tokens": p_tok + len(pieces),
+                            },
                         },
-                    }
-                )
-            send_sse("[DONE]")
+                    )
+                    return
+
+                prefill_sleep = state.prefill_base_s + state.prefill_per_uncached_tok_s * uncached
+                if state.hol_blocking_prefill and uncached >= 1000:
+                    stall = max(prefill_sleep, state.hol_prefill_stall_s)
+                    state.hol_pause_event.clear()
+                    try:
+                        time.sleep(stall)
+                    finally:
+                        state.hol_pause_event.set()
+                    prefill_sleep = stall
+                elif prefill_sleep > 0:
+                    time.sleep(prefill_sleep)
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+
+                def send_sse(event_payload: Any) -> None:
+                    txt = event_payload if isinstance(event_payload, str) else json.dumps(event_payload)
+                    self.wfile.write(f"data: {txt}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+
+                send_sse({"choices": [{"index": 0, "delta": {"role": "assistant"}}], "model": state.model_id})
+
+                emitted_tokens = 0
+                if state.reasoning_first_chunk:
+                    send_sse(
+                        {
+                            "choices": [{"index": 0, "delta": {"reasoning_content": state.reasoning_first_chunk}}],
+                            "model": state.model_id,
+                        }
+                    )
+                    emitted_tokens += 1
+                    if state.chunk_delay_s > 0:
+                        time.sleep(state.chunk_delay_s)
+
+                for idx, piece in enumerate(pieces):
+                    if state.hol_blocking_prefill and uncached < 1000:
+                        state.hol_pause_event.wait(timeout=5.0)
+                    send_sse({"choices": [{"index": 0, "delta": {"content": piece}}], "model": state.model_id})
+                    emitted_tokens += 1
+                    if idx + 1 < len(pieces) and state.chunk_delay_s > 0:
+                        time.sleep(state.chunk_delay_s)
+
+                timings: dict[str, Any] = {
+                    "prompt_n": uncached,
+                    "cache_n": cache_n,
+                    "prompt_ms": round(prefill_sleep * 1000.0, 3),
+                    "prompt_per_second": state.server_prefill_tps,
+                    "predicted_n": emitted_tokens,
+                    "predicted_ms": round(max(emitted_tokens - 1, 1) * state.chunk_delay_s * 1000.0, 3),
+                    "predicted_per_second": state.server_decode_tps,
+                }
+                if state.draft_n is not None:
+                    timings["draft_n"] = state.draft_n
+                    timings["draft_n_accepted"] = state.draft_n_accepted
+
+                send_sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "timings": timings})
+                if (body.get("stream_options") or {}).get("include_usage"):
+                    send_sse(
+                        {
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": p_tok,
+                                "completion_tokens": emitted_tokens,
+                                "total_tokens": p_tok + emitted_tokens,
+                                "prompt_tokens_details": {"cached_tokens": cache_n},
+                            },
+                        }
+                    )
+                send_sse("[DONE]")
+
+            if state.serialize_requests:
+                with state.exec_lock:
+                    _serve_chat_body()
+            else:
+                _serve_chat_body()
 
     return Handler
 
@@ -371,10 +527,26 @@ def test_corpus_structure_and_all_12_reference_graders() -> None:
     assert len(pc["turns"]) == 3
     assert 1300 <= _approx_tok(pc["system_prefix"]) <= 1750
 
-    # 4 Decode regimes
+    # 5 Decode regimes (including multi-turn verbatim_code_patch for Arctic Suffix-Tree / hybrid draft-mtp)
     regimes = {r["id"]: r for r in corpus["decode_regimes"]}
-    assert set(regimes) == {"code_edit", "structured_json", "reasoning_math", "open_prose"}
+    assert set(regimes) == {
+        "code_edit",
+        "verbatim_code_patch",
+        "structured_json",
+        "reasoning_math",
+        "open_prose",
+    }
     assert regimes["structured_json"]["response_format"] == {"type": "json_object"}
+    vpatch = regimes["verbatim_code_patch"]
+    assert isinstance(vpatch.get("turns"), list) and len(vpatch["turns"]) >= 2
+    assert vpatch["turns"][0].get("assistant_fixed")
+
+    # Continuous batching & chunked-prefill corpus section
+    batch_cfg = corpus["batching"]
+    assert batch_cfg["default_levels"] == [1, 2, 4, 8]
+    assert len(batch_cfg["prompts"]) >= 4
+    cp_cfg = batch_cfg["chunked_prefill"]
+    assert 2048 <= _approx_tok(cp_cfg["prefill_prompt"]) <= 4096
 
     # 12 Quality probes across 4 categories (3 each), all passing their own deterministic graders
     # when unsafe python execution is explicitly opted in (and safely skipping python by default).
@@ -617,19 +789,49 @@ def test_quality_graders_positive_and_adversarial() -> None:
 
 
 def test_endpoint_parity_matrix_prism_vs_sonder() -> None:
-    with FakeH2HServer(sonder_routes=False) as prism_srv, FakeH2HServer(sonder_routes=True) as sonder_srv:
+    with (
+        FakeH2HServer(sonder_routes=False) as prism_srv,
+        FakeH2HServer(sonder_routes=True) as sonder_srv,
+        FakeH2HServer(sonder_routes=False, support_logprobs=True) as mixed_srv,
+    ):
         p_ep = bps.run_endpoints_suite(bps.BenchmarkClient(prism_srv.url), model="Bonsai-2-9B-MTP")
         s_ep = bps.run_endpoints_suite(bps.BenchmarkClient(sonder_srv.url), model="Bonsai-2-9B-MTP")
+        m_ep = bps.run_endpoints_suite(bps.BenchmarkClient(mixed_srv.url), model="Bonsai-2-9B-MTP")
 
+    assert p_ep["core_supported_count"] == 6
+    assert p_ep["core_total_count"] == 8
+    assert p_ep["frontier_supported_count"] == 0
+    assert p_ep["frontier_total_count"] == 3
     assert p_ep["supported_count"] == 6
-    assert p_ep["total_count"] == 8
+    assert p_ep["total_count"] == 11
     assert p_ep["by_id"]["tokenize"]["supported"] is False
     assert p_ep["by_id"]["tokenize"]["http_status"] == 404
     assert p_ep["by_id"]["sonder_health"]["supported"] is False
+    assert p_ep["by_id"]["chat_tools"]["supported"] is False
+    assert p_ep["by_id"]["chat_tools"]["http_status"] == 400
+    assert p_ep["by_id"]["responses"]["supported"] is False
+    assert p_ep["by_id"]["responses"]["http_status"] == 404
+    assert p_ep["by_id"]["chat_logprobs"]["supported"] is False
+    assert p_ep["by_id"]["chat_logprobs"]["http_status"] == 400
 
-    assert s_ep["supported_count"] == 8
-    assert s_ep["total_count"] == 8
+    assert s_ep["core_supported_count"] == 8
+    assert s_ep["core_total_count"] == 8
+    assert s_ep["frontier_supported_count"] == 3
+    assert s_ep["frontier_total_count"] == 3
+    assert s_ep["supported_count"] == 11
+    assert s_ep["total_count"] == 11
     assert all(item["supported"] for item in s_ep["probes"])
+    assert s_ep["by_id"]["chat_tools"]["supported"] is True
+    assert s_ep["by_id"]["responses"]["supported"] is True
+    assert s_ep["by_id"]["chat_logprobs"]["supported"] is True
+
+    # Mixed server: only logprobs among frontier probes is supported
+    assert m_ep["core_supported_count"] == 6
+    assert m_ep["frontier_supported_count"] == 1
+    assert m_ep["supported_count"] == 7
+    assert m_ep["by_id"]["chat_logprobs"]["supported"] is True
+    assert m_ep["by_id"]["chat_tools"]["supported"] is False
+    assert m_ep["by_id"]["responses"]["supported"] is False
 
 
 def test_attach_mode_cross_target_parity_and_reports(tmp_path: Path) -> None:
@@ -772,9 +974,13 @@ def test_managed_sequential_mode_tears_down_before_next_target(tmp_path: Path) -
 
     rep = json.loads(out_json.read_text(encoding="utf-8"))
     assert rep["config"]["mode"] == "managed"
+    assert rep["config"]["order_confounded"] is True
     assert [t["name"] for t in rep["targets"]] == ["prism", "sonder"]
+    assert rep["targets"][0]["suites"]["endpoints"]["core_supported_count"] == 6
     assert rep["targets"][0]["suites"]["endpoints"]["supported_count"] == 6
-    assert rep["targets"][1]["suites"]["endpoints"]["supported_count"] == 8
+    assert rep["targets"][1]["suites"]["endpoints"]["core_supported_count"] == 8
+    assert rep["targets"][1]["suites"]["endpoints"]["frontier_supported_count"] == 3
+    assert rep["targets"][1]["suites"]["endpoints"]["supported_count"] == 11
     # Both managed servers must have positive RSS measurements recorded while alive.
     for t in rep["targets"]:
         assert t["resources"]["peak_rss_mib"] is not None and t["resources"]["peak_rss_mib"] > 0.0
@@ -928,6 +1134,344 @@ def test_parity_excludes_failed_probes_and_nonstreaming_suppresses_wall_decode_t
     assert comp["excluded_failed_count"] == 1
     assert comp["exact_match_count"] == 1
     assert comp["exact_match_pct"] == 100.0
+
+
+def test_batching_suite_continuous_vs_serialized_and_hol_interference() -> None:
+    corpus, _ = bps.load_corpus_file(bps.DEFAULT_CORPUS_PATH)
+    with (
+        FakeH2HServer(
+            prefill_base_s=0.008,
+            chunk_delay_s=0.008,
+            default_chunks=8,
+            serialize_requests=True,
+            hol_blocking_prefill=False,
+        ) as serialized_srv,
+        FakeH2HServer(
+            prefill_base_s=0.008,
+            chunk_delay_s=0.008,
+            default_chunks=10,
+            serialize_requests=False,
+            hol_blocking_prefill=True,
+            hol_prefill_stall_s=0.095,
+        ) as hol_blocking_srv,
+        FakeH2HServer(
+            prefill_base_s=0.008,
+            chunk_delay_s=0.008,
+            default_chunks=10,
+            serialize_requests=False,
+            hol_blocking_prefill=False,
+        ) as batched_srv,
+    ):
+        s_res = bps.run_batching_suite(
+            bps.BenchmarkClient(serialized_srv.url, timeout=30.0),
+            corpus,
+            model="Bonsai-2-9B-MTP",
+            levels=[1, 2, 4, 8],
+            repeats=2,
+            max_tokens=8,
+            max_tokens_explicit=True,
+            disable_thinking=True,
+        )
+        hol_res = bps.run_batching_suite(
+            bps.BenchmarkClient(hol_blocking_srv.url, timeout=30.0),
+            corpus,
+            model="Bonsai-2-9B-MTP",
+            levels=[1, 2, 4, 8],
+            repeats=2,
+            max_tokens=10,
+            max_tokens_explicit=True,
+            disable_thinking=True,
+        )
+        c_res = bps.run_batching_suite(
+            bps.BenchmarkClient(batched_srv.url, timeout=30.0),
+            corpus,
+            model="Bonsai-2-9B-MTP",
+            levels=[1, 2, 4, 8],
+            repeats=2,
+            max_tokens=10,
+            max_tokens_explicit=True,
+            disable_thinking=True,
+        )
+
+    # Batched decode scaling (C=1, 2, 4, 8)
+    for res in (s_res, c_res):
+        levs = res["batched_decode"]["levels"]
+        assert list(levs.keys()) == ["1", "2", "4", "8"]
+        for c_str in ("1", "2", "4", "8"):
+            lv = levs[c_str]
+            assert lv["success_count"] == int(c_str) * 2
+            assert lv["itl_p50_ms"] is not None and lv["itl_p95_ms"] is not None and lv["max_itl_ms"] is not None
+            assert lv["itl_p50_ms"] <= lv["itl_p95_ms"] <= lv["max_itl_ms"]
+
+    # Continuous batching must deliver > 2.0x C=4/C=1 aggregate speedup vs ~1.0x serialized execution!
+    assert c_res["speedup_c4_vs_c1"] is not None and c_res["speedup_c4_vs_c1"] > 2.0
+    assert s_res["speedup_c4_vs_c1"] is not None and s_res["speedup_c4_vs_c1"] < 1.5
+    assert c_res["speedup_c4_vs_c1"] > s_res["speedup_c4_vs_c1"] * 1.6
+
+    # Chunked-prefill head-of-line interference: non-chunked HoL prefill causes large max_itl_ms & p95 spike!
+    b_hol = hol_res["chunked_prefill_interference"]
+    c_hol = c_res["chunked_prefill_interference"]
+    assert b_hol["ok_count"] == 2 and b_hol["prefill_ok_count"] == 2
+    assert c_hol["ok_count"] == 2 and c_hol["prefill_ok_count"] == 2
+    assert b_hol["injected_mid_stream_count"] >= 1
+    assert c_hol["injected_mid_stream_count"] >= 1
+    assert b_hol["max_itl_ms"]["median"] is not None and b_hol["max_itl_ms"]["median"] >= 65.0
+    assert b_hol["p95_itl_spike_ms"]["median"] is not None and b_hol["p95_itl_spike_ms"]["median"] >= 35.0
+    assert c_hol["max_itl_ms"]["median"] is not None
+    assert c_hol["max_itl_ms"]["median"] < b_hol["max_itl_ms"]["median"] * 0.6
+
+
+def test_decode_suite_verbatim_code_patch_multi_turn_and_frontier_probe_validation() -> None:
+    corpus, _ = bps.load_corpus_file(bps.DEFAULT_CORPUS_PATH)
+    with FakeH2HServer(
+        sonder_routes=True,
+        prefill_base_s=0.002,
+        chunk_delay_s=0.002,
+        default_chunks=6,
+    ) as srv:
+        client = bps.BenchmarkClient(srv.url, timeout=20.0)
+        dec = bps.run_decode_suite(
+            client,
+            corpus,
+            model="Bonsai-2-9B-MTP",
+            repeats=1,
+            max_tokens=16,
+            max_tokens_explicit=True,
+            disable_thinking=True,
+        )
+        vpatch = dec["regimes"]["verbatim_code_patch"]
+        assert vpatch["ok_count"] == 1
+        assert vpatch["multi_turn"] is True
+        assert vpatch["turn_count"] == 2
+        assert vpatch["wall_decode_tps"]["median"] is not None and vpatch["wall_decode_tps"]["median"] > 0.0
+        # Turn 2 of verbatim_code_patch carries system + turn1 user + turn1 assistant_fixed + turn2 user
+        patch_reqs = [
+            r for r in srv.state.chat_requests
+            if str(r.get("prompt_cache_key") or "").startswith("bonsai-decode-verbatim_code_patch-")
+        ]
+        assert len(patch_reqs) == 2
+        assert len(patch_reqs[0]["messages"]) == 2
+        assert len(patch_reqs[1]["messages"]) == 4
+        assert patch_reqs[1]["messages"][2]["role"] == "assistant"
+        assert patch_reqs[0]["prompt_cache_key"] == patch_reqs[1]["prompt_cache_key"]
+
+        # Verify frontier probe request payloads sent to the server
+        srv.state.chat_requests.clear()
+        srv.state.responses_requests.clear()
+        ep = bps.run_endpoints_suite(client, model="Bonsai-2-9B-MTP", disable_thinking=True)
+        assert ep["frontier_supported_count"] == 3
+        tools_reqs = [r for r in srv.state.chat_requests if r.get("tools")]
+        assert len(tools_reqs) == 1
+        assert tools_reqs[0]["tool_choice"] == "required"
+        lp_reqs = [r for r in srv.state.chat_requests if r.get("logprobs") is True]
+        assert len(lp_reqs) == 1
+        assert lp_reqs[0]["top_logprobs"] == 3
+        assert len(srv.state.responses_requests) == 1
+        assert srv.state.responses_requests[0]["input"] == "Reply with OK."
+
+    # Malformed HTTP 200 payloads lacking structured tool_calls or logprobs MUST report supported=False!
+    with FakeH2HServer(
+        sonder_routes=True,
+        malformed_tools=True,
+        malformed_logprobs=True,
+    ) as bad_srv:
+        bad_ep = bps.run_endpoints_suite(bps.BenchmarkClient(bad_srv.url, timeout=15.0), model="Bonsai-2-9B-MTP")
+    assert bad_ep["by_id"]["chat_tools"]["http_status"] == 200
+    assert bad_ep["by_id"]["chat_tools"]["supported"] is False
+    assert bad_ep["by_id"]["chat_logprobs"]["http_status"] == 200
+    assert bad_ep["by_id"]["chat_logprobs"]["supported"] is False
+    assert bad_ep["by_id"]["responses"]["supported"] is True
+    assert bad_ep["frontier_supported_count"] == 1
+
+
+def test_ab_ba_counterbalanced_multi_round_order_and_markdown(tmp_path: Path) -> None:
+    # Verify --rounds validation rejects 0
+    assert bps.main(["--target", "a=http://127.0.0.1:9", "--rounds", "0", "--quiet"]) == 2
+
+    order_log: list[str] = []
+    order_lock = threading.Lock()
+    out_confounded_json = tmp_path / "confounded.json"
+    out_confounded_md = tmp_path / "confounded.md"
+    out_abba_json = tmp_path / "abba.json"
+    out_abba_md = tmp_path / "abba.md"
+
+    with (
+        FakeH2HServer(
+            sonder_routes=False,
+            prefill_base_s=0.006,
+            chunk_delay_s=0.004,
+            default_chunks=6,
+            serialize_requests=True,
+            hol_blocking_prefill=True,
+            hol_prefill_stall_s=0.04,
+            target_tag="prism",
+            order_log=order_log,
+            order_log_lock=order_lock,
+        ) as prism_srv,
+        FakeH2HServer(
+            sonder_routes=True,
+            prefill_base_s=0.002,
+            chunk_delay_s=0.002,
+            default_chunks=6,
+            serialize_requests=False,
+            hol_blocking_prefill=False,
+            target_tag="sonder",
+            order_log=order_log,
+            order_log_lock=order_lock,
+        ) as sonder_srv,
+    ):
+        # 1. Fixed order (2 rounds without --alternate-order) -> STILL order_confounded!
+        rc_fixed = bps.main([
+            "--target", f"prism={prism_srv.url}",
+            "--target", f"sonder={sonder_srv.url}",
+            "--model", "Bonsai-2-9B-MTP",
+            "--suites", "keepalive,endpoints",
+            "--rounds", "2",
+            "--repeats", "1",
+            "--keepalive-requests", "3",
+            "--quiet",
+            "--output-json", str(out_confounded_json),
+            "--output-md", str(out_confounded_md),
+        ])
+        assert rc_fixed == 0
+        rep_fixed = json.loads(out_confounded_json.read_text(encoding="utf-8"))
+        assert rep_fixed["config"]["order_confounded"] is True
+        assert rep_fixed["config"]["round_schedule"] == [["prism", "sonder"], ["prism", "sonder"]]
+        md_fixed = out_confounded_md.read_text(encoding="utf-8")
+        assert "WARNING — order confounded" in md_fixed
+
+        # 2. AB/BA counterbalanced (--rounds 2 --alternate-order) across batching, endpoints, keepalive!
+        order_log.clear()
+        rc_abba = bps.main([
+            "--target", f"prism={prism_srv.url}",
+            "--target", f"sonder={sonder_srv.url}",
+            "--model", "Bonsai-2-9B-MTP",
+            "--suites", "batching,keepalive,endpoints",
+            "--batching-concurrency", "1,2,4",
+            "--rounds", "2",
+            "--alternate-order",
+            "--repeats", "1",
+            "--max-tokens", "6",
+            "--keepalive-requests", "3",
+            "--disable-thinking",
+            "--quiet",
+            "--output-json", str(out_abba_json),
+            "--output-md", str(out_abba_md),
+        ])
+        assert rc_abba == 0
+
+    # Collapse consecutive identical tags in order_log to verify strict AB/BA block execution:
+    # Round 1: prism -> sonder; Round 2: sonder -> prism  => collapsed sequence: ["prism", "sonder", "prism"]
+    collapsed: list[str] = []
+    for tag in order_log:
+        if not collapsed or collapsed[-1] != tag:
+            collapsed.append(tag)
+    assert collapsed == ["prism", "sonder", "prism"], f"Expected AB/BA block sequence, got {collapsed}"
+
+    rep = json.loads(out_abba_json.read_text(encoding="utf-8"))
+    assert rep["config"]["rounds"] == 2
+    assert rep["config"]["alternate_order"] is True
+    assert rep["config"]["order_confounded"] is False
+    assert rep["config"]["round_schedule"] == [["prism", "sonder"], ["sonder", "prism"]]
+    # Canonical target ordering is preserved even though Round 2 ran reversed!
+    assert [t["name"] for t in rep["targets"]] == ["prism", "sonder"]
+    assert rep["targets"][0]["rounds_count"] == 2
+    assert rep["targets"][1]["rounds_count"] == 2
+    assert rep["targets"][0]["suites"]["endpoints"]["supported_count"] == 6
+    assert rep["targets"][1]["suites"]["endpoints"]["supported_count"] == 11
+
+    paired = rep["paired_round_summary"]
+    assert paired is not None
+    assert paired["rounds"] == 2
+    assert paired["baseline"] == "prism"
+    metric_names = {m["metric"] for m in paired["comparisons"][0]["metrics"]}
+    assert "batching.speedup_c4_vs_c1" in metric_names
+    assert "batching.hol.max_itl_ms" in metric_names
+
+    md = out_abba_md.read_text(encoding="utf-8")
+    assert b"\r\n" not in out_abba_md.read_bytes()
+    assert "Counterbalanced (AB/BA)" in md
+    assert "### 5. Continuous Batching & Chunked-Prefill Interleaving" in md
+    assert "#### 5a. Batched Decode Scaling" in md
+    assert "#### 5b. Chunked-Prefill Head-of-Line Interference" in md
+    assert "### 7. Endpoint Parity Matrix" in md
+    assert "`POST /v1/chat/completions (tools)`" in md
+    assert "`POST /v1/responses`" in md
+    assert "`POST /v1/chat/completions (logprobs)`" in md
+    assert "### AB/BA Counterbalanced Paired-Round Summary" in md
+
+
+def test_managed_sequential_ab_ba_rounds_on_shared_port(tmp_path: Path) -> None:
+    shared_port = _find_free_port()
+    events_log = tmp_path / "abba_lifecycle.jsonl"
+    cfg_path = tmp_path / "abba_managed.json"
+    out_json = tmp_path / "abba_managed_out.json"
+    self_script = str(Path(__file__).resolve())
+
+    cfg = {
+        "targets": [
+            {
+                "name": "prism",
+                "url": f"http://127.0.0.1:{shared_port}",
+                "health_path": "/health",
+                "model": "Bonsai-2-27B-PQ2",
+                "startup_timeout_s": 15.0,
+                "cmd": [
+                    sys.executable,
+                    self_script,
+                    "--serve-fake",
+                    "--name",
+                    "prism",
+                    "--port",
+                    str(shared_port),
+                    "--events-file",
+                    str(events_log),
+                ],
+            },
+            {
+                "name": "sonder",
+                "url": f"http://127.0.0.1:{shared_port}",
+                "health_path": "/v1/sonder/health",
+                "model": "Bonsai-2-27B-PQ2",
+                "startup_timeout_s": 15.0,
+                "cmd": [
+                    sys.executable,
+                    self_script,
+                    "--serve-fake",
+                    "--name",
+                    "sonder",
+                    "--port",
+                    str(shared_port),
+                    "--sonder-routes",
+                    "--events-file",
+                    str(events_log),
+                ],
+            },
+        ]
+    }
+    cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+    rc = bps.main([
+        "--config", str(cfg_path),
+        "--suites", "endpoints",
+        "--rounds", "2",
+        "--alternate-order",
+        "--repeats", "1",
+        "--quiet",
+        "--output-json", str(out_json),
+    ])
+    assert rc == 0
+
+    rep = json.loads(out_json.read_text(encoding="utf-8"))
+    assert rep["config"]["order_confounded"] is False
+    assert rep["config"]["round_schedule"] == [["prism", "sonder"], ["sonder", "prism"]]
+    assert [t["name"] for t in rep["targets"]] == ["prism", "sonder"]
+
+    events = [json.loads(ln) for ln in events_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    starts = [e["name"] for e in events if e["event"] == "started"]
+    assert starts == ["prism", "sonder", "sonder", "prism"]
+    for t in rep["targets"]:
+        assert bps.sample_process_rss_mib(t["resources"]["pid"]) is None
 
 
 # ---------------------------------------------------------------------------
