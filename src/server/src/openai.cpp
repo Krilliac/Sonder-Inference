@@ -971,15 +971,20 @@ json::Object usage_json(const GenerationResult& result) {
 }
 
 json::Object timings_json(const GenerationResult& result) {
-    const std::optional<std::uint64_t> cached_tokens =
-        result.stats.cached_tokens
-            ? result.stats.cached_tokens
-            : (result.stats.backend_timings ? result.stats.backend_timings->cache_n : std::nullopt);
+    bool has_cached_tokens = false;
+    std::uint64_t cached_tokens = 0;
+    if (result.stats.cached_tokens) {
+        has_cached_tokens = true;
+        cached_tokens = *result.stats.cached_tokens;
+    } else if (result.stats.backend_timings && result.stats.backend_timings->cache_n) {
+        has_cached_tokens = true;
+        cached_tokens = *result.stats.backend_timings->cache_n;
+    }
     std::uint64_t evaluated_prompt_tokens = result.stats.prompt_tokens;
     if (result.stats.backend_timings && result.stats.backend_timings->prompt_n) {
         evaluated_prompt_tokens = *result.stats.backend_timings->prompt_n;
-    } else if (cached_tokens) {
-        evaluated_prompt_tokens -= std::min(evaluated_prompt_tokens, *cached_tokens);
+    } else if (has_cached_tokens) {
+        evaluated_prompt_tokens -= std::min(evaluated_prompt_tokens, cached_tokens);
     }
 
     json::Object t{{"prompt_n", evaluated_prompt_tokens},
@@ -1003,8 +1008,8 @@ json::Object timings_json(const GenerationResult& result) {
         }
     }
     // Backend observations: present only when reported (0 is a real value).
-    if (cached_tokens) {
-        t.set("cache_n", *cached_tokens);
+    if (has_cached_tokens) {
+        t.set("cache_n", cached_tokens);
     }
     if (result.stats.draft_tokens) {
         t.set("draft_n", *result.stats.draft_tokens);
