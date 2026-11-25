@@ -2914,7 +2914,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
 #endif
         std::string tail = utf8.Flush();
         if (!tail.empty() && on_token && reason != StopReason::kError) {
-            on_token(TokenEvent{-1, std::move(tail), result.generated_tokens});
+            on_token(TokenEvent{-1, std::move(tail), result.generated_tokens, false, 0.0F, {}});
         }
         Emit(TelemetryKind::kGenerationDone, result.generated_tokens, result.decode_ms,
              std::string(ToString(reason)));
@@ -3527,7 +3527,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 #endif
         std::string tail = s.utf8.Flush();
         if (!tail.empty() && s.task->on_token != nullptr && *s.task->on_token && reason != StopReason::kError) {
-            (*s.task->on_token)(TokenEvent{-1, std::move(tail), s.result.generated_tokens});
+            (*s.task->on_token)(TokenEvent{-1, std::move(tail), s.result.generated_tokens, false, 0.0F, {}});
         }
         Emit(TelemetryKind::kGenerationDone, s.result.generated_tokens, s.result.decode_ms,
              std::string(ToString(reason)));

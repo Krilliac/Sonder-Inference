@@ -301,7 +301,7 @@ struct TokenEvent {
     std::int32_t index = 0;   // 0-based index among generated tokens
     bool has_logprob = false;
     float logprob = 0.0F;
-    std::vector<std::pair<Token, float>> top_logprobs;
+    std::vector<std::pair<Token, float>> top_logprobs{};
 };
 
 // Return false to stop generation (treated as cancellation).
