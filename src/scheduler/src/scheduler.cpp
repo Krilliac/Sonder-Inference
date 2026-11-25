@@ -11,16 +11,48 @@ namespace {
 
 constexpr int kStarvingRank = std::numeric_limits<int>::min() / 2;
 
+[[nodiscard]] TimeUs elapsed_us(TimeUs from, TimeUs to) noexcept {
+    if (to <= from) return 0;
+    constexpr TimeUs kMax = std::numeric_limits<TimeUs>::max();
+    if (from < 0 && to > kMax + from) return kMax;
+    return to - from;
+}
+
+[[nodiscard]] TimeUs saturating_add_time(TimeUs a, TimeUs b) noexcept {
+    if (b <= 0) return a;
+    constexpr TimeUs kMax = std::numeric_limits<TimeUs>::max();
+    return a > kMax - b ? kMax : a + b;
+}
+
+[[nodiscard]] BlockCount saturating_add_blocks(BlockCount a, BlockCount b) noexcept {
+    constexpr BlockCount kMax = std::numeric_limits<BlockCount>::max();
+    return a > kMax - b ? kMax : a + b;
+}
+
+[[nodiscard]] bool fits_with_watermark(BlockCount free_blocks, BlockCount need,
+                                       BlockCount watermark) noexcept {
+    constexpr BlockCount kMax = std::numeric_limits<BlockCount>::max();
+    return watermark <= kMax - need && free_blocks >= need + watermark;
+}
+
 }  // namespace
 
 Scheduler::Scheduler(SchedulerConfig config, const Clock& clock, KvCapacity& kv)
     : config_(config), clock_(clock), kv_(kv) {
     if (config_.max_step_tokens == 0 || config_.max_step_sequences == 0 ||
-        config_.max_running_sequences == 0 || config_.prefill_chunk_tokens == 0) {
+        config_.max_running_sequences == 0 || config_.prefill_chunk_tokens == 0 ||
+        config_.max_step_prefill_tokens == 0) {
         throw std::invalid_argument("SchedulerConfig budgets must be non-zero");
     }
     if (config_.aging_interval_us <= 0) {
         throw std::invalid_argument("SchedulerConfig::aging_interval_us must be positive");
+    }
+    if (config_.starvation_threshold_us < 0) {
+        throw std::invalid_argument("SchedulerConfig::starvation_threshold_us must be non-negative");
+    }
+    if (config_.enable_priority_preemption && !config_.strict_priority_admission &&
+        config_.priority_preemption_min_rank_gap <= 0) {
+        throw std::invalid_argument("SchedulerConfig::priority_preemption_min_rank_gap must be positive");
     }
     if (kv_.block_size_tokens() == 0) {
         throw std::invalid_argument("KvCapacity block size must be non-zero");
@@ -32,6 +64,9 @@ Scheduler::Scheduler(SchedulerConfig config, const Clock& clock, KvCapacity& kv)
 SubmitResult Scheduler::submit(RequestSpec spec) {
     const TimeUs now = clock_.now();
     const auto cls = index_of(spec.workload);
+    if (cls >= kWorkloadClassCount) {
+        return SubmitResult{false, FailureReason::InvalidRequest};
+    }
     counters_.per_class[cls].submitted++;
 
     auto reject = [&](FailureReason why) {
@@ -105,16 +140,19 @@ bool Scheduler::running_better(const Sequence& a, const Sequence& b) const noexc
 }
 
 bool Scheduler::is_starving(const Sequence& s, TimeUs now) const noexcept {
-    return !config_.strict_priority_admission && now - s.enqueued_at >= config_.starvation_threshold_us;
+    return !config_.strict_priority_admission &&
+           elapsed_us(s.enqueued_at, now) >= config_.starvation_threshold_us;
 }
 
 int Scheduler::waiting_rank(const Sequence& s, TimeUs now) const noexcept {
     if (config_.strict_priority_admission) return s.base_rank;
-    if (is_starving(s, now)) return kStarvingRank;
-    const TimeUs age = std::max<TimeUs>(0, now - s.enqueued_at);
-    const auto boost = static_cast<int>(
-        std::min<TimeUs>(age / config_.aging_interval_us, std::numeric_limits<int>::max() / 4));
-    return s.base_rank - boost;
+    if (is_starving(s, now)) return std::min(s.base_rank, kStarvingRank);
+    const TimeUs age = elapsed_us(s.enqueued_at, now);
+    const std::int64_t boost =
+        std::min<TimeUs>(age / config_.aging_interval_us, std::numeric_limits<int>::max() / 4);
+    const std::int64_t ranked = static_cast<std::int64_t>(s.base_rank) - boost;
+    return static_cast<int>(std::clamp<std::int64_t>(
+        ranked, std::numeric_limits<int>::min(), std::numeric_limits<int>::max()));
 }
 
 std::vector<RequestId> Scheduler::sorted_waiting(TimeUs now) const {
@@ -126,7 +164,10 @@ std::vector<RequestId> Scheduler::sorted_waiting(TimeUs now) const {
         const int rb = waiting_rank(sb, now);
         if (ra != rb) return ra < rb;
         if (config_.strict_priority_admission) {
-            return sa.spec.admission_order.value_or(sa.submit_order) < sb.spec.admission_order.value_or(sb.submit_order);
+            const auto oa = sa.spec.admission_order.value_or(sa.submit_order);
+            const auto ob = sb.spec.admission_order.value_or(sb.submit_order);
+            if (oa != ob) return oa < ob;
+            return sa.submit_order < sb.submit_order;
         }
         if (sa.base_rank != sb.base_rank) return sa.base_rank < sb.base_rank;
         if (sa.enqueued_at != sb.enqueued_at) return sa.enqueued_at < sb.enqueued_at;
@@ -239,7 +280,7 @@ void Scheduler::emit_token(Sequence& s, TimeUs now) {
     if (s.tl.first_token < 0) {
         s.tl.first_token = now;
     } else if (s.last_token_time >= 0) {
-        const TimeUs gap = now - s.last_token_time;
+        const TimeUs gap = elapsed_us(s.last_token_time, now);
         s.tl.max_inter_token_gap = std::max(s.tl.max_inter_token_gap, gap);
         const auto cls = index_of(s.spec.workload);
         auto& samples = inter_token_samples_[cls];
@@ -295,8 +336,11 @@ void Scheduler::preempt(StepPlan& plan, Budget& budget, RequestId victim,
         s.kv_tokens = 0;
     }
 
-    s.requeues++;
-    if (s.requeues > config_.max_requeue_count) {
+    const bool exceeded = s.requeues >= config_.max_requeue_count;
+    if (s.requeues < std::numeric_limits<std::uint32_t>::max()) {
+        s.requeues++;
+    }
+    if (exceeded) {
         ev.failed = true;
         plan.failed.push_back(victim);
         finish(s, RequestState::Failed, FailureReason::RequeueLimit, now);
@@ -329,6 +373,29 @@ void Scheduler::schedule_decode(StepPlan& plan, Budget& budget, TimeUs now) {
             // this one). Newest, least urgent work yields first.
             const auto order = sorted_running_best_first();
             const RequestId victim = order.back();
+            if (victim != id) {
+                // Before evicting lower-priority work, check whether freeing
+                // every sequence worse than `id` could even satisfy `want`
+                // (e.g. after a DynamicKvCapacity shrink).
+                const BlockCount delta = want - held;
+                const BlockCount deficit = kv_.over_budget_blocks();
+                constexpr BlockCount kMaxBlocks = std::numeric_limits<BlockCount>::max();
+                bool can_recover = delta <= kMaxBlocks - deficit && want <= kv_.total_blocks();
+                if (can_recover) {
+                    const BlockCount target = delta + deficit;
+                    BlockCount freeable = kv_.free_blocks();
+                    for (auto rit = order.rbegin(); rit != order.rend() && *rit != id; ++rit) {
+                        freeable = saturating_add_blocks(freeable, kv_.blocks_held(*rit));
+                        if (freeable >= target) break;
+                    }
+                    can_recover = freeable >= target;
+                }
+                if (!can_recover) {
+                    preempt(plan, budget, id, PreemptionReason::KvPressure, id, now);
+                    self_preempted = true;
+                    break;
+                }
+            }
             preempt(plan, budget, victim, PreemptionReason::KvPressure, id, now);
             if (victim == id) {
                 self_preempted = true;
@@ -354,33 +421,65 @@ void Scheduler::schedule_prefill(StepPlan& plan, Budget& budget) {
 }
 
 bool Scheduler::try_priority_preemption(StepPlan& plan, Budget& budget, const Sequence& cand,
-                                        BlockCount need, TimeUs now) {
+                                        BlockCount need, bool need_slot, bool resumes_decode,
+                                        TimeUs now) {
     if (config_.strict_priority_admission || !config_.enable_priority_preemption) return false;
-    const int cand_rank = cand.base_rank;
+    const std::int64_t cand_rank = static_cast<std::int64_t>(cand.base_rank);
+    const std::int64_t min_gap = static_cast<std::int64_t>(config_.priority_preemption_min_rank_gap);
     auto order = sorted_running_best_first();
     std::vector<RequestId> victims;
-    constexpr BlockCount kMaxBlocks = std::numeric_limits<BlockCount>::max();
-    const auto saturating_add = [](BlockCount a, BlockCount b) noexcept -> BlockCount {
-        constexpr BlockCount kMax = std::numeric_limits<BlockCount>::max();
-        return a > kMax - b ? kMax : a + b;
-    };
     const BlockCount deficit = kv_.over_budget_blocks();
-    // If need + watermark + over-budget deficit exceeds BlockCount::max(), no
-    // valid set of releases can make the candidate fit; preempt nothing.
-    if (need > kMaxBlocks - config_.admission_watermark_blocks) return false;
-    const BlockCount required_free = need + config_.admission_watermark_blocks;
-    if (required_free > kMaxBlocks - deficit) return false;
-    const BlockCount target = required_free + deficit;
     BlockCount freeable = kv_.free_blocks();
-    for (auto it = order.rbegin(); it != order.rend() && freeable < target; ++it) {
+    std::uint32_t freed_seqs = 0;
+    std::uint64_t freed_tokens = 0;
+    std::uint64_t freed_prefill = 0;
+
+    auto satisfied = [&]() noexcept -> bool {
+        if (need_slot && running_.size() - victims.size() >= config_.max_running_sequences) {
+            return false;
+        }
+        if (budget.sequences + freed_seqs == 0 ||
+            static_cast<std::uint64_t>(budget.tokens) + freed_tokens == 0) {
+            return false;
+        }
+        if (!resumes_decode &&
+            static_cast<std::uint64_t>(budget.prefill_tokens) + freed_prefill == 0) {
+            return false;
+        }
+        // If preempting these victims empties running_, the decode watermark is waived.
+        const bool empties_running = (victims.size() == order.size());
+        const BlockCount eff_watermark =
+            empties_running ? BlockCount{0} : config_.admission_watermark_blocks;
+        constexpr BlockCount kMaxBlocks = std::numeric_limits<BlockCount>::max();
+        if (eff_watermark > kMaxBlocks - need) return false;
+        const BlockCount required_free = need + eff_watermark;
+        if (required_free > kMaxBlocks - deficit) return false;
+        return freeable >= required_free + deficit;
+    };
+
+    bool ok = false;
+    for (auto it = order.rbegin(); it != order.rend(); ++it) {
         const Sequence& v = seqs_.at(*it);
         // A request admitted earlier in this pass (including a starving one) must not be evicted again.
         if (std::find(plan.admitted.begin(), plan.admitted.end(), *it) != plan.admitted.end()) continue;
-        if (running_rank(v) - cand_rank < config_.priority_preemption_min_rank_gap) break;
+        if (static_cast<std::int64_t>(running_rank(v)) - cand_rank < min_gap) break;
         victims.push_back(*it);
-        freeable = saturating_add(freeable, kv_.blocks_held(*it));
+        freeable = saturating_add_blocks(freeable, kv_.blocks_held(*it));
+        const auto wit = std::find_if(plan.work.begin(), plan.work.end(),
+                                      [&](const ScheduledWork& w) { return w.id == *it; });
+        if (wit != plan.work.end()) {
+            freed_seqs += 1;
+            freed_tokens += wit->num_tokens;
+            if (wit->phase == Phase::Prefill) {
+                freed_prefill += wit->num_tokens;
+            }
+        }
+        if (satisfied()) {
+            ok = true;
+            break;
+        }
     }
-    if (freeable < target) return false;  // would not help; preempt nothing
+    if (!ok || victims.empty()) return false;  // would not help; preempt nothing
     for (RequestId v : victims) {
         preempt(plan, budget, v, PreemptionReason::PriorityAdmission, cand.spec.id, now);
     }
@@ -393,15 +492,26 @@ void Scheduler::admit(StepPlan& plan, Budget& budget, TimeUs now) {
     std::uint32_t bypassed = 0;
 
     for (RequestId id : sorted_waiting(now)) {
-        if (running_.size() >= config_.max_running_sequences) break;
-        if (budget.sequences == 0 || budget.tokens == 0) break;
         auto it = seqs_.find(id);
         if (it == seqs_.end() || is_terminal(it->second.state)) continue;
         Sequence& s = it->second;
         if (s.spec.admission_ready && !s.spec.admission_ready()) continue;
 
+        if (head_blocked) {
+            if (config_.strict_priority_admission || bypassed >= config_.admission_lookahead) break;
+            ++bypassed;
+        }
+
         const bool resumes_decode = s.swapped && s.prefill_done == s.prefill_target;
-        if (!resumes_decode && budget.prefill_tokens == 0) break;
+        const bool need_slot = running_.size() >= config_.max_running_sequences;
+        const bool need_budget = budget.sequences == 0 || budget.tokens == 0 ||
+                                 (!resumes_decode && budget.prefill_tokens == 0);
+
+        if (!need_slot && need_budget) break;
+        if (need_slot &&
+            (config_.strict_priority_admission || !config_.enable_priority_preemption)) {
+            break;
+        }
 
         // Reserve the whole (re)prefill context up front; decode growth is
         // reserved block-by-block, protected by the admission watermark.
@@ -412,9 +522,17 @@ void Scheduler::admit(StepPlan& plan, Budget& budget, TimeUs now) {
         const BlockCount watermark = config_.strict_priority_admission
                                          ? 0
                                          : (running_.empty() ? 0 : config_.admission_watermark_blocks);
-        bool fits = kv_.free_blocks() >= need + watermark;
-        if (!fits && try_priority_preemption(plan, budget, s, need, now)) {
-            fits = kv_.free_blocks() >= need + (running_.empty() ? 0 : watermark);
+        bool fits = !need_slot && !need_budget &&
+                    fits_with_watermark(kv_.free_blocks(), need, watermark);
+        if (!fits && try_priority_preemption(plan, budget, s, need, need_slot, resumes_decode, now)) {
+            const BlockCount post_watermark =
+                config_.strict_priority_admission
+                    ? 0
+                    : (running_.empty() ? 0 : config_.admission_watermark_blocks);
+            const bool post_budget_ok = budget.sequences > 0 && budget.tokens > 0 &&
+                                        (resumes_decode || budget.prefill_tokens > 0);
+            fits = running_.size() < config_.max_running_sequences && post_budget_ok &&
+                   fits_with_watermark(kv_.free_blocks(), need, post_watermark);
         }
         if (fits && kv_.try_reserve(id, need)) {
             if (s.spec.try_admit && !s.spec.try_admit()) {
@@ -428,13 +546,16 @@ void Scheduler::admit(StepPlan& plan, Budget& budget, TimeUs now) {
         }
 
         if (!fits) {
+            if (running_.size() >= config_.max_running_sequences) {
+                break;
+            }
             if (!head_blocked) {
                 head_blocked = true;
                 counters_.admission_kv_blocked++;
                 // Never bypass a starving or top-urgency request.
                 if (is_starving(s, now) || s.base_rank <= 0) break;
             }
-            if (config_.strict_priority_admission || ++bypassed > config_.admission_lookahead) break;
+            if (config_.strict_priority_admission || config_.admission_lookahead == 0) break;
             continue;
         }
 
@@ -442,7 +563,8 @@ void Scheduler::admit(StepPlan& plan, Budget& budget, TimeUs now) {
         erase_from(waiting_, id);
         running_.push_back(id);
         if (s.tl.first_admitted < 0) s.tl.first_admitted = now;
-        s.tl.total_queue_time += now - s.enqueued_at;
+        s.tl.total_queue_time =
+            saturating_add_time(s.tl.total_queue_time, elapsed_us(s.enqueued_at, now));
         plan.admitted.push_back(id);
 
         if (resumes_decode) {
@@ -471,7 +593,7 @@ StepPlan Scheduler::plan_step() {
     TimeUs oldest = 0;
     for (RequestId id : waiting_) {
         Sequence& s = seqs_.at(id);
-        oldest = std::max(oldest, now - s.enqueued_at);
+        oldest = std::max(oldest, elapsed_us(s.enqueued_at, now));
         if (!s.starving_counted && is_starving(s, now)) {
             s.starving_counted = true;
             counters_.starvation_promotions++;
@@ -577,12 +699,19 @@ SchedulerStats Scheduler::stats() const {
     out.active_sequences = running_.size();
     out.queued_sequences = waiting_.size();
 
+    TimeUs oldest = 0;
+    for (RequestId id : waiting_) {
+        oldest = std::max(oldest, elapsed_us(seqs_.at(id).enqueued_at, out.now));
+    }
+    out.current_oldest_queue_age = oldest;
+    out.max_starvation_age = std::max(out.max_starvation_age, oldest);
+
     PerClass<std::vector<TimeUs>> queue{}, ttft{}, e2e{};
     for (const auto& [id, s] : seqs_) {
         const auto c = index_of(s.spec.workload);
         if (s.tl.first_admitted >= 0) queue[c].push_back(s.tl.total_queue_time);
         if (s.tl.first_token >= 0) ttft[c].push_back(s.tl.ttft());
-        if (s.state == RequestState::Completed) e2e[c].push_back(s.tl.finished - s.tl.arrival);
+        if (s.state == RequestState::Completed) e2e[c].push_back(elapsed_us(s.tl.arrival, s.tl.finished));
     }
     for (std::size_t c = 0; c < kWorkloadClassCount; ++c) {
         auto& cs = out.per_class[c];
