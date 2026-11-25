@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "server_test_support.hpp"
+#include "src/openai.hpp"
 
 using namespace server_test;
 namespace json = sonder::inference::json;
@@ -425,4 +426,251 @@ TEST_CASE("drain: a chat that arrives after shutdown began gets 503 not_ready (n
     CHECK(err->find("code")->as_string() == "not_ready");
     CHECK(err->find("message")->as_string().find("safe to send elsewhere") != std::string::npos);
     CHECK(f.of_type("request.queued").empty());
+}
+
+TEST_CASE("timings_json computes prompt_per_second from uncached tokens and omits rate on full cache hit") {
+    // 1. 99% prefix cache hit (llamacpp / llamaserver with backend_timings):
+    //    1000 total prompt tokens, 990 cached, 10 uncached evaluated in 5 ms -> 2000 tok/s (not 200,000!).
+    {
+        si::GenerationResult r;
+        r.stats.prompt_tokens = 1000;
+        r.stats.cached_tokens = 990;
+        r.stats.completion_tokens = 20;
+        r.stats.prompt_eval_ns = 5'000'000;  // 5.0 ms
+        r.stats.eval_ns = 200'000'000;       // 200.0 ms
+        si::BackendTimings bt;
+        bt.prompt_n = 10;
+        bt.cache_n = 990;
+        bt.prompt_ms = 5.0;
+        r.stats.backend_timings = bt;
+
+        const auto usage = json::Value(det::usage_json(r));
+        const auto timings = json::Value(det::timings_json(r));
+        CHECK(usage.find("prompt_tokens")->as_uint() == 1000u);
+        CHECK(usage.find("prompt_tokens_details")->find("cached_tokens")->as_uint() == 990u);
+        CHECK(timings.find("prompt_n")->as_uint() == 10u);
+        CHECK(timings.find("cache_n")->as_uint() == 990u);
+        CHECK(timings.find("prompt_ms")->as_double() == doctest::Approx(5.0));
+        REQUIRE(timings.find("prompt_per_second") != nullptr);
+        CHECK(timings.find("prompt_per_second")->as_double() == doctest::Approx(2000.0));
+        REQUIRE(timings.find("predicted_per_second") != nullptr);
+        CHECK(timings.find("predicted_per_second")->as_double() == doctest::Approx(100.0));
+    }
+
+    // 2. 100% prefix cache hit (0 uncached tokens): prompt_n == 0 and prompt_per_second is omitted.
+    {
+        si::GenerationResult r;
+        r.stats.prompt_tokens = 1000;
+        r.stats.cached_tokens = 1000;
+        r.stats.prompt_eval_ns = 500'000;  // 0.5 ms overhead
+        si::BackendTimings bt;
+        bt.prompt_n = 0;
+        bt.cache_n = 1000;
+        r.stats.backend_timings = bt;
+
+        const auto timings = json::Value(det::timings_json(r));
+        CHECK(timings.find("prompt_n")->as_uint() == 0u);
+        CHECK(timings.find("cache_n")->as_uint() == 1000u);
+        CHECK(timings.find("prompt_ms")->as_double() == doctest::Approx(0.5));
+        CHECK(timings.find("prompt_per_second") == nullptr);
+    }
+
+    // 3. Partial and full cache hits without backend_timings (e.g. Ollama / checkpoint restore).
+    {
+        si::GenerationResult r;
+        r.stats.prompt_tokens = 500;
+        r.stats.cached_tokens = 450;
+        r.stats.prompt_eval_ns = 25'000'000;  // 25.0 ms
+
+        const auto timings = json::Value(det::timings_json(r));
+        CHECK(timings.find("prompt_n")->as_uint() == 50u);
+        CHECK(timings.find("cache_n")->as_uint() == 450u);
+        REQUIRE(timings.find("prompt_per_second") != nullptr);
+        CHECK(timings.find("prompt_per_second")->as_double() == doctest::Approx(2000.0));
+
+        // 100% cached and cached > prompt_tokens clamp cleanly to 0 without underflow.
+        r.stats.cached_tokens = 500;
+        const auto full_hit = json::Value(det::timings_json(r));
+        CHECK(full_hit.find("prompt_n")->as_uint() == 0u);
+        CHECK(full_hit.find("prompt_per_second") == nullptr);
+
+        r.stats.cached_tokens = 750;
+        const auto clamped = json::Value(det::timings_json(r));
+        CHECK(clamped.find("prompt_n")->as_uint() == 0u);
+        CHECK(clamped.find("prompt_per_second") == nullptr);
+    }
+
+    // 4. Cache miss (cached_tokens == 0 or unset) preserves full prompt_tokens and rate.
+    {
+        si::GenerationResult r;
+        r.stats.prompt_tokens = 200;
+        r.stats.cached_tokens = 0;
+        r.stats.prompt_eval_ns = 100'000'000;  // 100.0 ms
+        const auto miss = json::Value(det::timings_json(r));
+        CHECK(miss.find("prompt_n")->as_uint() == 200u);
+        CHECK(miss.find("cache_n")->as_uint() == 0u);
+        REQUIRE(miss.find("prompt_per_second") != nullptr);
+        CHECK(miss.find("prompt_per_second")->as_double() == doctest::Approx(2000.0));
+
+        r.stats.cached_tokens.reset();
+        const auto unreported = json::Value(det::timings_json(r));
+        CHECK(unreported.find("prompt_n")->as_uint() == 200u);
+        CHECK(unreported.find("cache_n") == nullptr);
+        REQUIRE(unreported.find("prompt_per_second") != nullptr);
+        CHECK(unreported.find("prompt_per_second")->as_double() == doctest::Approx(2000.0));
+    }
+
+    // 5. backend_timings.cache_n acts as fallback when cached_tokens is unset, while existing cached_tokens wins.
+    {
+        si::GenerationResult r;
+        r.stats.prompt_tokens = 40;
+        r.stats.prompt_eval_ns = 5'000'000;  // 5.0 ms
+        si::BackendTimings bt;
+        bt.cache_n = 30;
+        r.stats.backend_timings = bt;
+
+        const auto fallback = json::Value(det::timings_json(r));
+        CHECK(fallback.find("cache_n")->as_uint() == 30u);
+        CHECK(fallback.find("prompt_n")->as_uint() == 10u);
+        REQUIRE(fallback.find("prompt_per_second") != nullptr);
+        CHECK(fallback.find("prompt_per_second")->as_double() == doctest::Approx(2000.0));
+
+        r.stats.cached_tokens = 0;
+        bt.prompt_n = 20;
+        bt.cache_n = 19;
+        r.stats.backend_timings = bt;
+        r.stats.prompt_eval_ns = 4'000'000;  // 4.0 ms
+        const auto precedence = json::Value(det::timings_json(r));
+        CHECK(precedence.find("cache_n")->as_uint() == 0u);
+        CHECK(precedence.find("prompt_n")->as_uint() == 20u);
+        REQUIRE(precedence.find("prompt_per_second") != nullptr);
+        CHECK(precedence.find("prompt_per_second")->as_double() == doctest::Approx(5000.0));
+    }
+
+    // 6. Unmeasured prompt_eval_ns omits prompt_ms and prompt_per_second.
+    {
+        si::GenerationResult r;
+        r.stats.prompt_tokens = 128;
+        r.stats.cached_tokens = 64;
+        r.stats.prompt_eval_ns = 0;
+        const auto unmeasured = json::Value(det::timings_json(r));
+        CHECK(unmeasured.find("prompt_n")->as_uint() == 64u);
+        CHECK(unmeasured.find("cache_n")->as_uint() == 64u);
+        CHECK(unmeasured.find("prompt_ms") == nullptr);
+        CHECK(unmeasured.find("prompt_per_second") == nullptr);
+    }
+}
+
+TEST_CASE("embeddings: HTTP correlation headers emit request.queued, request.started and terminal telemetry") {
+    Fixture f;
+    const Reply r = post(f.port, "/v1/embeddings", R"({"input":["alpha","beta"]})",
+                         {{"X-Sonder-Run-Id", "embed-run-42"},
+                          {"X-Sonder-Parent-Request-Id", "turn-E42"},
+                          {"X-Sonder-Agent-Id", "agent-embed"},
+                          {"X-Sonder-Task-Id", "task-embed"},
+                          {"X-Sonder-Workload", "owner_orchestrator"},
+                          {"X-Sonder-Priority", "subagent"}});
+    REQUIRE_MESSAGE(r.status == 200, r.body);
+    const std::string request_id = r.json().find("sonder")->find("request_id")->as_string();
+    REQUIRE_FALSE(request_id.empty());
+
+    std::vector<std::string> lifecycle;
+    for (const auto& e : f.envelopes()) {
+        const json::Value* rid = e.find("request_id");
+        if (rid == nullptr || !rid->is_string() || rid->as_string() != request_id) continue;
+        const std::string type = e.find("event_type")->as_string();
+        if (type.rfind("request.", 0) != 0) continue;
+        lifecycle.push_back(type);
+        CHECK(e.find("run_id")->as_string() == "embed-run-42");
+        CHECK(e.find("agent_id")->as_string() == "agent-embed");
+        CHECK(e.find("task_id")->as_string() == "task-embed");
+        const json::Value* attrs = e.find("attributes");
+        REQUIRE(attrs != nullptr);
+        CHECK(attrs->find("kind")->as_string() == "embed");
+        REQUIRE(attrs->find("parent_request_id") != nullptr);
+        CHECK(attrs->find("parent_request_id")->as_string() == "turn-E42");
+        REQUIRE(attrs->find("priority_class") != nullptr);
+        CHECK(attrs->find("priority_class")->as_string() == "subagent");
+        REQUIRE(attrs->find("admission") != nullptr);
+        CHECK(attrs->find("admission")->find("priority")->as_string() == "subagent");
+        if (type == "request.started") {
+            CHECK(attrs->find("inputs")->as_uint() == 2u);
+            CHECK_FALSE(attrs->find("scheduled")->as_bool());
+        } else if (type == "request.completed") {
+            CHECK(attrs->find("outcome")->as_string() == "completed");
+            CHECK(attrs->find("inputs")->as_uint() == 2u);
+            CHECK(attrs->find("prompt_tokens")->as_uint() > 0u);
+            CHECK(attrs->find("total_ms")->as_double() >= 0.0);
+        }
+    }
+    CHECK(lifecycle == std::vector<std::string>{"request.queued", "request.started", "request.completed"});
+
+    // Plain /v1/embeddings without headers still emits request.started and omits parent_request_id.
+    const Reply plain = post(f.port, "/v1/embeddings", R"({"input":"plain"})");
+    REQUIRE(plain.status == 200);
+    const std::string plain_id = plain.json().find("sonder")->find("request_id")->as_string();
+    std::vector<std::string> plain_lifecycle;
+    for (const auto& e : f.envelopes()) {
+        const json::Value* rid = e.find("request_id");
+        if (rid == nullptr || !rid->is_string() || rid->as_string() != plain_id) continue;
+        const std::string type = e.find("event_type")->as_string();
+        if (type.rfind("request.", 0) != 0) continue;
+        plain_lifecycle.push_back(type);
+        CHECK(e.find("attributes")->find("parent_request_id") == nullptr);
+    }
+    CHECK(plain_lifecycle == std::vector<std::string>{"request.queued", "request.started", "request.completed"});
+
+    // Unsupported backend (501) still emits request.queued -> request.started -> request.failed with parent_request_id.
+    struct NoEmbedModel final : si::BackendModel {
+        si::ModelDescriptor desc;
+        NoEmbedModel() {
+            desc.name = "noembed:tiny";
+            desc.backend = "noembed";
+            desc.context_length = 4096;
+        }
+        const si::ModelDescriptor& descriptor() const override { return desc; }
+        si::Result<si::GenerateStats> generate(const si::GenerateRequest&, const si::CancellationToken&,
+                                               const si::TokenCallback&) override {
+            return si::Status(si::ErrorCode::unsupported, "unused");
+        }
+    };
+    struct NoEmbedBackend final : si::Backend {
+        std::shared_ptr<NoEmbedModel> model = std::make_shared<NoEmbedModel>();
+        std::string name() const override { return "noembed"; }
+        std::string description() const override { return "no-embed test backend"; }
+        si::BackendCapabilities capabilities() const override { return {}; }
+        si::Result<std::string> probe() override { return std::string("1"); }
+        si::Result<std::vector<si::ModelDescriptor>> list_models() override {
+            return std::vector<si::ModelDescriptor>{model->desc};
+        }
+        si::Result<std::shared_ptr<si::BackendModel>> load_model(const si::ModelLoadOptions&) override {
+            return std::shared_ptr<si::BackendModel>(model);
+        }
+    };
+    auto opts = Fixture::defaults();
+    opts.models = {"noembed:tiny"};
+    opts.backend.backend.clear();
+    opts.backend_instance = std::make_shared<NoEmbedBackend>();
+    Fixture noembed(opts);
+    const Reply fail = post(noembed.port, "/v1/embeddings", R"({"input":"x"})",
+                            {{"X-Sonder-Run-Id", "embed-run-501"},
+                             {"X-Sonder-Parent-Request-Id", "turn-E501"}});
+    CHECK(fail.status == 501);
+    std::vector<std::string> fail_lifecycle;
+    for (const auto& e : noembed.envelopes()) {
+        const json::Value* run = e.find("run_id");
+        if (run == nullptr || !run->is_string() || run->as_string() != "embed-run-501") continue;
+        const std::string type = e.find("event_type")->as_string();
+        if (type.rfind("request.", 0) != 0) continue;
+        fail_lifecycle.push_back(type);
+        const json::Value* attrs = e.find("attributes");
+        REQUIRE(attrs != nullptr);
+        CHECK(attrs->find("kind")->as_string() == "embed");
+        REQUIRE(attrs->find("parent_request_id") != nullptr);
+        CHECK(attrs->find("parent_request_id")->as_string() == "turn-E501");
+        if (type == "request.failed") {
+            CHECK(attrs->find("error_code")->as_string() == "unsupported");
+        }
+    }
+    CHECK(fail_lifecycle == std::vector<std::string>{"request.queued", "request.started", "request.failed"});
 }

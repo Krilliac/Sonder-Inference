@@ -134,6 +134,8 @@ public:
         }
         params.model = descriptor_.name;
         params.messages = request.messages;
+        params.tools = request.tools;
+        params.tool_choice = request.tool_choice;
         params.retain_text = false;
         params.options = ollama::sampling_to_options(request.sampling);
         // Ollama's own switch; reasoning_effort has no portable Ollama field.
@@ -277,12 +279,25 @@ private:
         const bool emit_thinking = client_->config().emit_thinking_chunks;
         std::uint64_t index = 0;
         bool stopped_by_callback = false;
+        bool saw_tool_calls = false;
         const ollama::ChunkCallback cb = [&](const StreamChunk& c) {
             if (cancel.cancelled()) {
                 return false;
             }
+            if (!c.tool_calls.empty()) {
+                saw_tool_calls = true;
+            }
             if (!on_chunk) {
                 return true;
+            }
+            if (!c.tool_calls.empty() && !stopped_by_callback) {
+                TokenChunk tc;
+                tc.index = index;
+                tc.tool_call_deltas = c.tool_calls;
+                if (!on_chunk(tc)) {
+                    stopped_by_callback = true;
+                }
+                ++index;
             }
             auto deliver = [&](std::string_view text, std::string_view reasoning = {}) {
                 if ((text.empty() && reasoning.empty()) || stopped_by_callback) {
@@ -330,8 +345,13 @@ private:
         } else {
             stats.completion_tokens = static_cast<std::uint64_t>(r.timings.content_chunks);
         }
-        stats.stop_reason = (stopped_by_callback || r.stopped_by_callback) ? StopReason::callback
-                                                                           : map_done_reason(r.done_reason);
+        if (stopped_by_callback || r.stopped_by_callback) {
+            stats.stop_reason = StopReason::callback;
+        } else if (saw_tool_calls || r.saw_tool_calls) {
+            stats.stop_reason = StopReason::tool_calls;
+        } else {
+            stats.stop_reason = map_done_reason(r.done_reason);
+        }
         return stats;
     }
 
@@ -352,7 +372,8 @@ public:
         caps.add(Capability::streaming)
             .add(Capability::remote_process)
             .add(Capability::embeddings)
-            .add(Capability::structured_output);
+            .add(Capability::structured_output)
+            .add(Capability::tool_calling);
         return caps;
     }
 

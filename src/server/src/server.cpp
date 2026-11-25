@@ -283,8 +283,13 @@ struct Server::Impl {
         bool available = false;
         std::string version;
         probe.status(available, version);
+        std::shared_ptr<Backend> b;
+        {
+            std::lock_guard<std::mutex> lock(engine_mu);
+            b = backend;
+        }
         const std::optional<std::string> probed = available ? std::optional<std::string>(version) : std::nullopt;
-        write_json(ex, 200, build_identity_body(opts, *residency, *served_id, synthetic, probed));
+        write_json(ex, 200, build_identity_body(opts, *residency, *served_id, synthetic, probed, b));
     }
 
     void handle_node(Exchange& ex) {
@@ -403,12 +408,15 @@ struct Server::Impl {
                                        "messages"));
             return;
         }
-        // When tool_choice forces a tool call on a grammar-capable non-llamaserver
-        // backend, synthesize a matching GBNF tool-call grammar automatically.
+        // When tool_choice forces a tool call on a grammar-capable backend
+        // without native tool calling (e.g. direct llamacpp), synthesize a
+        // matching GBNF tool-call grammar automatically.
         if (!job.tools.empty() && job.tool_choice &&
             (job.tool_choice->mode == ToolChoiceMode::required || job.tool_choice->mode == ToolChoiceMode::function) &&
             job.grammar.empty() && !job.response_format_type.has_value() &&
-            backend_has_capability(Capability::structured_output) && pin.backend() != "llamaserver") {
+            backend_has_capability(Capability::structured_output) &&
+            !backend_has_capability(Capability::tool_calling) && pin.backend() != "llamaserver" &&
+            pin.backend() != "ollama") {
             if (auto gbnf = build_tool_call_gbnf(job.tools, *job.tool_choice); gbnf.ok()) {
                 job.grammar = std::move(gbnf).value();
             }
@@ -537,7 +545,9 @@ struct Server::Impl {
         if (!job.tools.empty() && job.tool_choice &&
             (job.tool_choice->mode == ToolChoiceMode::required || job.tool_choice->mode == ToolChoiceMode::function) &&
             job.grammar.empty() && !job.response_format_type.has_value() &&
-            backend_has_capability(Capability::structured_output) && pin.backend() != "llamaserver") {
+            backend_has_capability(Capability::structured_output) &&
+            !backend_has_capability(Capability::tool_calling) && pin.backend() != "llamaserver" &&
+            pin.backend() != "ollama") {
             if (auto gbnf = build_tool_call_gbnf(job.tools, *job.tool_choice); gbnf.ok()) {
                 job.grammar = std::move(gbnf).value();
             }

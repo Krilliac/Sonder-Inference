@@ -1,8 +1,11 @@
 // Adapter: sonder::inference::Backend over the llama.cpp runtime wrapper.
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <mutex>
 #include <shared_mutex>
 #include <span>
@@ -12,14 +15,59 @@
 #include <utility>
 #include <vector>
 
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+#  if defined(_WIN32)
+#    ifndef WIN32_LEAN_AND_MEAN
+#      define WIN32_LEAN_AND_MEAN
+#    endif
+#    ifndef NOMINMAX
+#      define NOMINMAX
+#    endif
+#    include <windows.h>
+#  else
+#    include <unistd.h>
+#  endif
+#endif
+
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include "sonder/inference/backends/llamacpp.hpp"
 #include "sonder/inference/json.hpp"
 #include "llamacpp_internal.hpp"
 
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+#  include "backends/llamaserver/gpu_memory.hpp"
+#endif
+
 namespace sonder::inference {
 
 namespace llamacpp_detail {
+
+namespace {
+
+std::uint64_t SaturatingAddU64(std::uint64_t a, std::uint64_t b) noexcept {
+    return a > std::numeric_limits<std::uint64_t>::max() - b
+               ? std::numeric_limits<std::uint64_t>::max()
+               : a + b;
+}
+
+std::uint64_t SafeMsToNs(double ms) noexcept {
+    if (!std::isfinite(ms) || ms <= 0.0) return 0;
+    constexpr double kMaxMs = static_cast<double>(std::numeric_limits<std::uint64_t>::max()) / 1e6;
+    if (ms >= kMaxMs) return std::numeric_limits<std::uint64_t>::max();
+    return static_cast<std::uint64_t>(ms * 1e6);
+}
+
+bool DeviceMatchesConfigured(const sonder::backends::llamacpp::DeviceInfo& d,
+                             const std::vector<std::string>& configured_devices) {
+    if (configured_devices.empty()) return true;
+    const std::string name_lower = LowerAscii(d.name);
+    for (const auto& cfg : configured_devices) {
+        if (LowerAscii(cfg) == name_lower) return true;
+    }
+    return false;
+}
+
+}  // namespace
 
 // Resolves LoadOptions::n_gpu_layers from backend options and a load request's
 // device_id. Explicit "cpu:*" always uses 0; "gpu:*" requires a GPU backend
@@ -43,6 +91,114 @@ Result<std::int32_t> ResolveGpuLayers(const LlamaCppBackendOptions& options, std
         return options.gpu_layers;
     }
     return Status(ErrorCode::unsupported, "unsupported device id for llamacpp: " + std::string(device_id));
+}
+
+ProcessGpuMemoryReading SummarizeGgmlDeviceMemory(
+    const std::vector<sonder::backends::llamacpp::DeviceInfo>& devices,
+    const std::vector<std::string>& configured_devices) {
+    namespace lc = sonder::backends::llamacpp;
+    std::uint64_t dedicated_used = 0;
+    std::uint64_t shared_used = 0;
+    bool any_valid = false;
+    for (const auto& d : devices) {
+        if (d.kind != lc::DeviceKind::kGpu && d.kind != lc::DeviceKind::kIntegratedGpu) continue;
+        if (!DeviceMatchesConfigured(d, configured_devices)) continue;
+        if (d.memory_total_bytes == 0 || d.memory_free_bytes > d.memory_total_bytes) continue;
+        const std::uint64_t used = d.memory_total_bytes - d.memory_free_bytes;
+        if (d.kind == lc::DeviceKind::kGpu) {
+            dedicated_used = SaturatingAddU64(dedicated_used, used);
+        } else {
+            shared_used = SaturatingAddU64(shared_used, used);
+        }
+        any_valid = true;
+    }
+
+    ProcessGpuMemoryReading out;
+    if (any_valid) {
+        out.probe = "ggml";
+        out.status = "ok";
+        out.dedicated_bytes = dedicated_used;
+        out.shared_bytes = shared_used;
+    } else {
+        out.probe = "none";
+        out.status = "unsupported";
+        out.error = "per-process GPU memory counters are not available on this platform";
+    }
+    return out;
+}
+
+bool HasIntegratedUmaTarget(const std::vector<sonder::backends::llamacpp::DeviceInfo>& devices,
+                            const std::vector<std::string>& configured_devices) {
+    namespace lc = sonder::backends::llamacpp;
+    for (const auto& d : devices) {
+        if (d.kind == lc::DeviceKind::kIntegratedGpu && DeviceMatchesConfigured(d, configured_devices)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void PopulateGenerateStats(const sonder::backends::llamacpp::GenerateResult& result,
+                           std::size_t restore_tokens, std::uint64_t load_ns,
+                           GenerateStats& stats) noexcept {
+    stats.load_ns = load_ns;
+    stats.token_counts_from_backend = true;
+
+    const std::uint64_t evaluated =
+        result.prompt_tokens > 0 ? static_cast<std::uint64_t>(result.prompt_tokens) : 0u;
+    const std::uint64_t reported_cached =
+        result.cached_tokens > 0 ? static_cast<std::uint64_t>(result.cached_tokens) : 0u;
+    const std::uint64_t cached =
+        result.state_restored ? (restore_tokens > 0 ? static_cast<std::uint64_t>(restore_tokens) : reported_cached)
+                              : reported_cached;
+    const std::uint64_t total_prompt = SaturatingAddU64(evaluated, cached);
+    const std::uint64_t generated =
+        result.generated_tokens > 0 ? static_cast<std::uint64_t>(result.generated_tokens) : 0u;
+    const std::uint64_t draft =
+        result.draft_tokens > 0 ? static_cast<std::uint64_t>(result.draft_tokens) : 0u;
+    const std::uint64_t draft_accepted = std::min(
+        draft, result.draft_accepted_tokens > 0 ? static_cast<std::uint64_t>(result.draft_accepted_tokens) : 0u);
+
+    // Total prompt tokens (evaluated + cached) in stats.prompt_tokens, cached
+    // reuse in stats.cached_tokens, and strictly uncached evaluated prompt
+    // tokens in backend_timings.prompt_n.
+    stats.prompt_tokens = total_prompt;
+    stats.cached_tokens = cached;
+    if (draft > 0) {
+        stats.draft_tokens = draft;
+        stats.draft_accepted_tokens = draft_accepted;
+    } else {
+        stats.draft_tokens.reset();
+        stats.draft_accepted_tokens.reset();
+    }
+    stats.completion_tokens = generated;
+
+    const double prefill_ms = (std::isfinite(result.prefill_ms) && result.prefill_ms > 0.0) ? result.prefill_ms : 0.0;
+    const double decode_ms = (std::isfinite(result.decode_ms) && result.decode_ms > 0.0) ? result.decode_ms : 0.0;
+    stats.prompt_eval_ns = SafeMsToNs(prefill_ms);
+    stats.eval_ns = SafeMsToNs(decode_ms);
+    if (decode_ms > 0.0 && generated > 0) {
+        const double tps = static_cast<double>(generated) * 1000.0 / decode_ms;
+        if (std::isfinite(tps) && tps > 0.0) {
+            stats.predicted_tokens_per_second = tps;
+        } else {
+            stats.predicted_tokens_per_second.reset();
+        }
+    } else {
+        stats.predicted_tokens_per_second.reset();
+    }
+
+    BackendTimings timings;
+    timings.prompt_n = evaluated;
+    timings.cache_n = cached;
+    timings.prompt_ms = prefill_ms;
+    timings.predicted_n = generated;
+    timings.predicted_ms = decode_ms;
+    if (draft > 0) {
+        timings.draft_n = draft;
+        timings.draft_n_accepted = draft_accepted;
+    }
+    stats.backend_timings = timings;
 }
 
 }  // namespace llamacpp_detail
@@ -75,7 +231,235 @@ ErrorCode MapError(lc::ErrorCode code) {
 
 Status ToStatus(const lc::Status& s) { return s.ok() ? Status::success() : Status(MapError(s.code), s.message); }
 
-std::uint64_t MsToNs(double ms) { return ms > 0.0 ? static_cast<std::uint64_t>(ms * 1e6) : 0; }
+std::uint64_t MsToNs(double ms) noexcept {
+    if (!std::isfinite(ms) || ms <= 0.0) return 0;
+    constexpr double kMaxMs = static_cast<double>(std::numeric_limits<std::uint64_t>::max()) / 1e6;
+    if (ms >= kMaxMs) return std::numeric_limits<std::uint64_t>::max();
+    return static_cast<std::uint64_t>(ms * 1e6);
+}
+
+std::uint64_t SaturatingAddBytes(std::uint64_t a, std::uint64_t b) noexcept {
+    return a > std::numeric_limits<std::uint64_t>::max() - b
+               ? std::numeric_limits<std::uint64_t>::max()
+               : a + b;
+}
+
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+std::uint32_t CurrentProcessId() noexcept {
+#  if defined(_WIN32)
+    return static_cast<std::uint32_t>(GetCurrentProcessId());
+#  else
+    const auto pid = ::getpid();
+    return pid > 0 ? static_cast<std::uint32_t>(pid) : 0u;
+#  endif
+}
+#endif
+
+std::string FormatMiBText(std::uint64_t bytes) {
+    constexpr std::uint64_t kMiB = 1024ull * 1024ull;
+    return std::to_string(SaturatingAddBytes(bytes, kMiB / 2) / kMiB) + " MiB";
+}
+
+llamacpp_detail::ProcessGpuMemoryProbe MakeDefaultGpuMemoryProbe(std::vector<std::string> configured_devices) {
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+    auto os_source = llamaserver::make_gpu_counter_source();
+#endif
+    return [configured_devices = std::move(configured_devices)
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+            ,
+            os_source = std::move(os_source)
+#endif
+    ]() -> llamacpp_detail::ProcessGpuMemoryReading {
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+        if (os_source && os_source->supported()) {
+            const std::uint32_t pid = CurrentProcessId();
+            const auto counters = os_source->read(pid);
+            if (counters.ok()) {
+                const auto sample = llamaserver::summarize_gpu_counters(pid, counters.value());
+                llamacpp_detail::ProcessGpuMemoryReading reading;
+                reading.probe = os_source->name();
+                reading.status = "ok";
+                reading.dedicated_bytes = sample.dedicated_bytes;
+                reading.shared_bytes = sample.shared_bytes;
+                return reading;
+            }
+            if (counters.status().code() != ErrorCode::unsupported) {
+                llamacpp_detail::ProcessGpuMemoryReading reading;
+                reading.probe = os_source->name();
+                reading.status = "error";
+                reading.error = counters.status().message();
+                return reading;
+            }
+        }
+#endif
+        return llamacpp_detail::SummarizeGgmlDeviceMemory(lc::LlamaCppBackend::EnumerateDevices(), configured_devices);
+    };
+}
+
+struct ActiveModelEntry {
+    std::uint64_t id = 0;
+    std::uint32_t n_ctx = 0;
+    bool gpu_offload = false;
+    bool uma_target = false;
+};
+
+struct RuntimeState {
+    static constexpr std::uint64_t kDefaultSpillThresholdBytes = 256ull * 1024ull * 1024ull;
+
+    mutable std::mutex mutex;
+    llamacpp_detail::ProcessGpuMemoryProbe probe;
+    std::chrono::milliseconds sample_interval{1000};
+    std::uint32_t configured_ctx = 0;
+    bool force_uma_mode = false;
+    std::optional<bool> force_gpu_offload;
+
+    bool has_sampled = false;
+    bool probe_in_flight = false;
+    std::chrono::steady_clock::time_point last_sample_time{};
+    GpuMemoryStatus gpu_memory;
+    std::uint64_t next_model_id = 1;
+    std::vector<ActiveModelEntry> active_models;
+
+    RuntimeState(llamacpp_detail::ProcessGpuMemoryProbe probe_fn, std::chrono::milliseconds interval,
+                 std::uint32_t ctx_len, bool uma_override, std::optional<bool> gpu_offload_override)
+        : probe(std::move(probe_fn)),
+          sample_interval(interval.count() < 0 ? std::chrono::milliseconds{0} : interval),
+          configured_ctx(ctx_len),
+          force_uma_mode(uma_override),
+          force_gpu_offload(gpu_offload_override) {
+        gpu_memory.probe = "none";
+        gpu_memory.status = "not_sampled";
+        gpu_memory.spill_threshold_bytes = kDefaultSpillThresholdBytes;
+        gpu_memory.shared_baseline_bytes = 0;
+    }
+
+    std::uint64_t RegisterModel(std::uint32_t n_ctx, bool gpu_offload, bool uma_target) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const std::uint64_t id = next_model_id++;
+        active_models.push_back(ActiveModelEntry{id, n_ctx, gpu_offload, uma_target});
+        return id;
+    }
+
+    void UnregisterModel(std::uint64_t id) noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        active_models.erase(std::remove_if(active_models.begin(), active_models.end(),
+                                           [id](const ActiveModelEntry& e) noexcept { return e.id == id; }),
+                            active_models.end());
+    }
+
+    void RefreshGpuMemory(bool force) {
+        llamacpp_detail::ProcessGpuMemoryProbe probe_fn;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!probe || probe_in_flight) return;
+            const auto now = std::chrono::steady_clock::now();
+            if (!force && has_sampled && sample_interval.count() > 0 && (now - last_sample_time) < sample_interval) {
+                return;
+            }
+            probe_in_flight = true;
+            probe_fn = probe;
+        }
+
+        struct InFlightGuard {
+            RuntimeState& state;
+            bool committed = false;
+            ~InFlightGuard() noexcept {
+                if (!committed) {
+                    std::lock_guard<std::mutex> lock(state.mutex);
+                    state.probe_in_flight = false;
+                }
+            }
+        } guard{*this};
+
+        llamacpp_detail::ProcessGpuMemoryReading reading;
+        try {
+            reading = probe_fn();
+        } catch (const std::exception& ex) {
+            reading.probe = "none";
+            reading.status = "error";
+            reading.error = ex.what();
+        } catch (...) {
+            reading.probe = "none";
+            reading.status = "error";
+            reading.error = "GPU memory probe failed";
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            has_sampled = true;
+            last_sample_time = std::chrono::steady_clock::now();
+            gpu_memory.probe = reading.probe.empty() ? "none" : reading.probe;
+            if (reading.status == "ok") {
+                gpu_memory.status = "ok";
+                gpu_memory.error.clear();
+                gpu_memory.dedicated_bytes = reading.dedicated_bytes;
+                gpu_memory.shared_bytes = reading.shared_bytes;
+                gpu_memory.peak_shared_bytes = std::max(gpu_memory.peak_shared_bytes, reading.shared_bytes);
+                ++gpu_memory.samples;
+            } else if (reading.status == "unsupported") {
+                gpu_memory.status = "unsupported";
+                gpu_memory.error = reading.error;
+            } else {
+                gpu_memory.status = "error";
+                gpu_memory.error = reading.error.empty() ? "GPU memory probe failed" : reading.error;
+            }
+            probe_in_flight = false;
+            guard.committed = true;
+        }
+    }
+
+    BackendRuntimeStatus Snapshot() {
+        RefreshGpuMemory(/*force=*/false);
+        std::lock_guard<std::mutex> lock(mutex);
+
+        bool any_gpu_offload = false;
+        bool any_uma = false;
+        std::optional<std::uint64_t> fitted_ctx;
+        for (auto it = active_models.rbegin(); it != active_models.rend(); ++it) {
+            if (!fitted_ctx.has_value() && it->n_ctx > 0) {
+                fitted_ctx = it->n_ctx;
+            }
+            any_gpu_offload = any_gpu_offload || it->gpu_offload;
+            any_uma = any_uma || it->uma_target;
+        }
+        const bool gpu_offload = force_gpu_offload.value_or(any_gpu_offload);
+        const bool uma_mode = force_uma_mode || any_uma;
+
+        BackendRuntimeStatus status;
+        status.gpu_memory = gpu_memory;
+        const std::uint64_t spill_limit =
+            SaturatingAddBytes(status.gpu_memory.shared_baseline_bytes, status.gpu_memory.spill_threshold_bytes);
+        status.gpu_memory.spilled = (status.gpu_memory.status == "ok") && gpu_offload && !uma_mode &&
+                                    (status.gpu_memory.shared_bytes > spill_limit);
+
+        status.context.policy = "warn";
+        if (configured_ctx > 0) {
+            status.context.configured_ctx = configured_ctx;
+        }
+        status.context.fitted_ctx = fitted_ctx;
+        status.context.fit_attempts = 0;
+        status.context.outcome = "not_needed";
+
+        if (status.gpu_memory.spilled) {
+            std::vector<std::pair<std::string, std::string>> details{
+                {"dedicated_bytes", std::to_string(status.gpu_memory.dedicated_bytes)},
+                {"shared_bytes", std::to_string(status.gpu_memory.shared_bytes)},
+                {"shared_baseline_bytes", std::to_string(status.gpu_memory.shared_baseline_bytes)},
+                {"spill_threshold_bytes", std::to_string(status.gpu_memory.spill_threshold_bytes)}};
+            if (fitted_ctx) {
+                details.emplace_back("ctx", std::to_string(*fitted_ctx));
+            }
+            status.warnings.push_back(BackendWarning{
+                "vram_spill", "warning", "gpu_probe",
+                "llamacpp keeps " + FormatMiBText(status.gpu_memory.shared_bytes) +
+                    " in shared system memory (threshold " + FormatMiBText(status.gpu_memory.spill_threshold_bytes) +
+                    " above a " + FormatMiBText(status.gpu_memory.shared_baseline_bytes) +
+                    " baseline): VRAM overflowed into system RAM; lower context_length or KV cache precision",
+                std::move(details), 1});
+        }
+        return status;
+    }
+};
 
 // Copies the context and placement options into `lo` and validates them with
 // the wrapper's pure validators (the same checks Load() runs).
@@ -131,11 +515,20 @@ bool IsGguf(const fs::path& p) {
 
 class LlamaCppModel final : public BackendModel {
 public:
-    LlamaCppModel(ModelDescriptor desc, lc::LlamaCppBackend runtime, double load_ms, std::uint32_t slots)
+    LlamaCppModel(ModelDescriptor desc, lc::LlamaCppBackend runtime, double load_ms, std::uint32_t slots,
+                  std::shared_ptr<RuntimeState> runtime_state = nullptr, std::uint64_t runtime_model_id = 0)
         : desc_(std::move(desc)),
           runtime_(std::move(runtime)),
           load_ns_(MsToNs(load_ms)),
-          slots_(std::max<std::uint32_t>(1u, slots)) {}
+          slots_(std::max<std::uint32_t>(1u, slots)),
+          runtime_state_(std::move(runtime_state)),
+          runtime_model_id_(runtime_model_id) {}
+
+    ~LlamaCppModel() override {
+        if (runtime_state_ && runtime_model_id_ != 0) {
+            runtime_state_->UnregisterModel(runtime_model_id_);
+        }
+    }
 
     [[nodiscard]] const ModelDescriptor& descriptor() const override { return desc_; }
 
@@ -549,29 +942,7 @@ private:
             }
         }
 
-        const std::uint64_t cached = r.state_restored ? static_cast<std::uint64_t>(req.restore_tokens)
-                                                      : static_cast<std::uint64_t>(r.cached_tokens);
-        stats.prompt_tokens = static_cast<std::uint64_t>(r.prompt_tokens) + cached;
-        stats.cached_tokens = cached;
-        if (r.draft_tokens > 0 || r.draft_accepted_tokens > 0) {
-            stats.draft_tokens = static_cast<std::uint64_t>(r.draft_tokens);
-            stats.draft_accepted_tokens = static_cast<std::uint64_t>(r.draft_accepted_tokens);
-        }
-        stats.completion_tokens = static_cast<std::uint64_t>(r.generated_tokens);
-        stats.prompt_eval_ns = MsToNs(r.prefill_ms);
-        stats.eval_ns = MsToNs(r.decode_ms);
-        if (r.decode_ms > 0.0 && r.generated_tokens > 0) {
-            stats.predicted_tokens_per_second = r.decode_tokens_per_second();
-        }
-        BackendTimings timings;
-        timings.prompt_n = static_cast<std::uint64_t>(r.prompt_tokens);
-        timings.cache_n = cached;
-        timings.prompt_ms = r.prefill_ms;
-        timings.predicted_n = static_cast<std::uint64_t>(r.generated_tokens);
-        timings.predicted_ms = r.decode_ms;
-        timings.draft_n = static_cast<std::uint64_t>(r.draft_tokens);
-        timings.draft_n_accepted = static_cast<std::uint64_t>(r.draft_accepted_tokens);
-        stats.backend_timings = timings;
+        llamacpp_detail::PopulateGenerateStats(r, req.restore_tokens, load_ns_, stats);
 
         if (!r.status.ok()) return ToStatus(r.status);
 
@@ -612,12 +983,22 @@ private:
     lc::LlamaCppBackend runtime_;
     std::uint64_t load_ns_ = 0;
     std::uint32_t slots_ = 1;
+    std::shared_ptr<RuntimeState> runtime_state_;
+    std::uint64_t runtime_model_id_ = 0;
     mutable std::shared_mutex mutex_;
 };
 
 class LlamaCppCoreBackend final : public Backend {
 public:
-    explicit LlamaCppCoreBackend(LlamaCppBackendOptions options) : options_(std::move(options)) {}
+    explicit LlamaCppCoreBackend(LlamaCppBackendOptions options,
+                                 llamacpp_detail::ProcessGpuMemoryProbe probe = {},
+                                 std::chrono::milliseconds sample_interval = std::chrono::milliseconds{1000},
+                                 bool force_uma_mode = false,
+                                 std::optional<bool> force_gpu_offload = std::nullopt)
+        : options_(std::move(options)),
+          runtime_state_(std::make_shared<RuntimeState>(
+              probe ? std::move(probe) : MakeDefaultGpuMemoryProbe(options_.devices), sample_interval,
+              options_.context_length, force_uma_mode, force_gpu_offload)) {}
 
     [[nodiscard]] std::string name() const override { return kLlamaCppBackendName; }
     [[nodiscard]] std::string description() const override {
@@ -642,6 +1023,9 @@ public:
             caps.add(Capability::multimodal);
         }
         return caps;
+    }
+    [[nodiscard]] std::optional<BackendRuntimeStatus> runtime_status() const override {
+        return runtime_state_->Snapshot();
     }
     [[nodiscard]] std::size_t max_concurrent_requests() const override {
         return std::max<std::size_t>(1u, static_cast<std::size_t>(options_.slots));
@@ -733,9 +1117,18 @@ public:
             d.parameter_size = rest.substr(0, sp2);
             if (sp2 != std::string::npos) d.quantization = rest.substr(sp2 + 1);
         }
+        bool uma_target = false;
+        if (lo.n_gpu_layers != 0) {
+            if (enumerated_devices.empty()) {
+                enumerated_devices = lc::LlamaCppBackend::EnumerateDevices();
+            }
+            uma_target = llamacpp_detail::HasIntegratedUmaTarget(enumerated_devices, lo.devices);
+        }
         const std::uint32_t loaded_slots = std::max<std::uint32_t>(1u, runtime.SlotCount());
-        return std::shared_ptr<BackendModel>(
-            std::make_shared<LlamaCppModel>(std::move(d), std::move(runtime), load_ms, loaded_slots));
+        const std::uint64_t model_id = runtime_state_->RegisterModel(info.n_ctx, lo.n_gpu_layers != 0, uma_target);
+        runtime_state_->RefreshGpuMemory(/*force=*/true);
+        return std::shared_ptr<BackendModel>(std::make_shared<LlamaCppModel>(
+            std::move(d), std::move(runtime), load_ms, loaded_slots, runtime_state_, model_id));
     }
 
 private:
@@ -750,9 +1143,21 @@ private:
     }
 
     LlamaCppBackendOptions options_;
+    std::shared_ptr<RuntimeState> runtime_state_;
 };
 
 }  // namespace
+
+namespace llamacpp_detail {
+
+std::shared_ptr<Backend> MakeLlamaCppBackendForTest(LlamaCppBackendOptions options, ProcessGpuMemoryProbe probe,
+                                                    std::chrono::milliseconds sample_interval, bool force_uma_mode,
+                                                    std::optional<bool> force_gpu_offload) {
+    return std::make_shared<LlamaCppCoreBackend>(std::move(options), std::move(probe), sample_interval, force_uma_mode,
+                                                 force_gpu_offload);
+}
+
+}  // namespace llamacpp_detail
 
 Status validate_llamacpp_options(const LlamaCppBackendOptions& options) {
     lc::LoadOptions lo;

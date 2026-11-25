@@ -536,7 +536,7 @@ struct LlamaCppBackend::Impl {
         GenerateResult result{};
     };
 
-    LlamaCppBackend* owner = nullptr;
+    std::atomic<LlamaCppBackend*> owner{nullptr};
     std::mutex queue_mu;
     std::condition_variable worker_cv;
     std::deque<PendingRequest*> pending_queue;
@@ -810,7 +810,7 @@ struct LlamaCppBackend::Impl {
             total_checkpoint_bytes = (total_checkpoint_bytes >= b) ? (total_checkpoint_bytes - b) : 0;
             vec.erase(vec.begin());
         }
-        while (total_checkpoint_bytes + projected_bytes > kMaxTotalCheckpointBytes) {
+        while (total_checkpoint_bytes > kMaxTotalCheckpointBytes - projected_bytes) {
             if (!EvictOldestCheckpoint()) return;
         }
 
@@ -828,7 +828,8 @@ struct LlamaCppBackend::Impl {
         }
 #endif
         const std::size_t actual_bytes = ckpt.ByteSize();
-        while (total_checkpoint_bytes + actual_bytes > kMaxTotalCheckpointBytes) {
+        if (actual_bytes > kMaxTotalCheckpointBytes) return;
+        while (total_checkpoint_bytes > kMaxTotalCheckpointBytes - actual_bytes) {
             if (!EvictOldestCheckpoint()) return;
         }
         total_checkpoint_bytes += actual_bytes;
@@ -912,8 +913,8 @@ struct LlamaCppBackend::Impl {
 
         std::size_t dft_sz = 0;
         std::size_t pending_bytes = 0;
-        bool capture_mtp = false;
 #if defined(SONDER_LLAMACPP_HAS_MTP)
+        bool capture_mtp = false;
         if (ctx_dft != nullptr && slot_idx < slot_mtp_synced.size() && slot_mtp_synced[slot_idx]) {
             if (!mtp_mem_shared && slot_idx < mtp_deferred.size() && mtp_deferred[slot_idx].pending) {
                 if (!MtpFlushDeferred(slot_id)) {
@@ -989,9 +990,10 @@ struct LlamaCppBackend::Impl {
         if (!radix_cache.enabled() || ctx == nullptr || prompt.size() <= 1) return false;
         const std::size_t max_reuse = prompt.size() - 1;
         const bool allow_trim = (architecture == sonder::inference::ModelArchitecture::attention_only);
-        const RadixLookupResult hit = radix_cache.LookupLongestPrefix(prompt, max_reuse, allow_trim);
-        if (!hit.found() || hit.entry == nullptr || hit.matched_tokens <= min_beat_lcp ||
-            (hit.matched_tokens - min_beat_lcp) < kMinL2RestoreGainTokens) {
+        const PinnedRadixLookup hit = radix_cache.LookupAndPin(prompt, max_reuse, allow_trim);
+        const RadixCacheEntry* entry = hit.entry();
+        if (!hit.found() || entry == nullptr || hit.matched_tokens() <= min_beat_lcp ||
+            (hit.matched_tokens() - min_beat_lcp) < kMinL2RestoreGainTokens) {
             return false;
         }
 
@@ -1001,20 +1003,20 @@ struct LlamaCppBackend::Impl {
         llama_memory_seq_rm(mem, slot_id, -1, -1);
         ClearSlotCheckpoints(slot_idx);
 
-        const std::size_t read = llama_state_seq_set_data(ctx, hit.entry->state_blob.data(),
-                                                          hit.entry->state_blob.size(), slot_id);
+        const std::size_t read = llama_state_seq_set_data(ctx, entry->state_blob.data(),
+                                                          entry->state_blob.size(), slot_id);
         if (read == 0) {
             llama_memory_seq_rm(mem, slot_id, -1, -1);
             return false;
         }
-        if (hit.state_tokens > hit.matched_tokens) {
-            if (!llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(hit.matched_tokens), -1)) {
+        if (hit.state_tokens() > hit.matched_tokens()) {
+            if (!llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(hit.matched_tokens()), -1)) {
                 llama_memory_seq_rm(mem, slot_id, -1, -1);
                 return false;
             }
         }
         const int64_t restored_len = llama_memory_seq_pos_max(mem, slot_id) + 1;
-        if (restored_len != static_cast<int64_t>(hit.matched_tokens)) {
+        if (restored_len != static_cast<int64_t>(hit.matched_tokens())) {
             llama_memory_seq_rm(mem, slot_id, -1, -1);
             return false;
         }
@@ -1024,24 +1026,24 @@ struct LlamaCppBackend::Impl {
             mtp_deferred[slot_idx].Clear();
             std::fill(mtp_pending_h[slot_idx].begin(), mtp_pending_h[slot_idx].end(), 0.0F);
             if (mtp_mem_shared) {
-                if (hit.state_tokens == hit.matched_tokens &&
-                    hit.entry->mtp_pending_h.size() == mtp_pending_h[slot_idx].size()) {
-                    mtp_pending_h[slot_idx] = hit.entry->mtp_pending_h;
+                if (hit.state_tokens() == hit.matched_tokens() &&
+                    entry->mtp_pending_h.size() == mtp_pending_h[slot_idx].size()) {
+                    mtp_pending_h[slot_idx] = entry->mtp_pending_h;
                 }
                 out_mtp_synced = true;
-            } else if (!hit.entry->dft_state_blob.empty()) {
+            } else if (!entry->dft_state_blob.empty()) {
                 llama_memory_t mem_dft = llama_get_memory(ctx_dft);
                 llama_memory_seq_rm(mem_dft, slot_id, -1, -1);
-                const std::size_t dr = llama_state_seq_set_data(ctx_dft, hit.entry->dft_state_blob.data(),
-                                                                hit.entry->dft_state_blob.size(), slot_id);
+                const std::size_t dr = llama_state_seq_set_data(ctx_dft, entry->dft_state_blob.data(),
+                                                                entry->dft_state_blob.size(), slot_id);
                 bool dft_ok = (dr > 0);
-                if (dft_ok && hit.state_tokens > hit.matched_tokens) {
-                    dft_ok = llama_memory_seq_rm(mem_dft, slot_id, static_cast<llama_pos>(hit.matched_tokens), -1);
+                if (dft_ok && hit.state_tokens() > hit.matched_tokens()) {
+                    dft_ok = llama_memory_seq_rm(mem_dft, slot_id, static_cast<llama_pos>(hit.matched_tokens()), -1);
                 }
                 if (dft_ok && llama_memory_seq_pos_max(mem_dft, slot_id) + 1 == restored_len) {
-                    if (hit.state_tokens == hit.matched_tokens &&
-                        hit.entry->mtp_pending_h.size() == mtp_pending_h[slot_idx].size()) {
-                        mtp_pending_h[slot_idx] = hit.entry->mtp_pending_h;
+                    if (hit.state_tokens() == hit.matched_tokens() &&
+                        entry->mtp_pending_h.size() == mtp_pending_h[slot_idx].size()) {
+                        mtp_pending_h[slot_idx] = entry->mtp_pending_h;
                     }
                     out_mtp_synced = true;
                 } else {
@@ -1057,7 +1059,7 @@ struct LlamaCppBackend::Impl {
             }
         }
 #endif
-        out_lcp = hit.matched_tokens;
+        out_lcp = hit.matched_tokens();
         return true;
     }
 
@@ -1259,11 +1261,13 @@ struct LlamaCppBackend::Impl {
 #endif
         {
             std::string prompt_text = request.media_prompt_text;
-            if (prompt_text.empty() && owner != nullptr) {
-                if (Status s = owner->Detokenize(request.prompt, prompt_text, /*remove_special=*/false,
-                                                 /*unparse_special=*/true);
-                    !s.ok()) {
-                    return s;
+            if (prompt_text.empty()) {
+                if (LlamaCppBackend* ow = owner.load(std::memory_order_acquire); ow != nullptr) {
+                    if (Status s = ow->Detokenize(request.prompt, prompt_text, /*remove_special=*/false,
+                                                  /*unparse_special=*/true);
+                        !s.ok()) {
+                        return s;
+                    }
                 }
             }
             const char* raw_marker = mtmd_get_marker(mtmd_ctx);
@@ -1763,15 +1767,17 @@ ContextParamsSummary LlamaCppBackend::UpstreamContextDefaults() {
     return Summarize(llama_context_default_params());
 }
 
-LlamaCppBackend::LlamaCppBackend() : impl_(std::make_unique<Impl>()) { impl_->owner = this; }
+LlamaCppBackend::LlamaCppBackend() : impl_(std::make_unique<Impl>()) {
+    impl_->owner.store(this, std::memory_order_release);
+}
 LlamaCppBackend::~LlamaCppBackend() = default;
 LlamaCppBackend::LlamaCppBackend(LlamaCppBackend&& other) noexcept : impl_(std::move(other.impl_)) {
-    if (impl_) impl_->owner = this;
+    if (impl_) impl_->owner.store(this, std::memory_order_release);
 }
 LlamaCppBackend& LlamaCppBackend::operator=(LlamaCppBackend&& other) noexcept {
     if (this != &other) {
         impl_ = std::move(other.impl_);
-        if (impl_) impl_->owner = this;
+        if (impl_) impl_->owner.store(this, std::memory_order_release);
     }
     return *this;
 }
@@ -2551,7 +2557,8 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
     } else if (has_restore) {
         llama_memory_clear(mem, true);
         ResetAllSlots();
-        Status rst = owner->RestoreSequenceState(request.restore_state, request.max_capture_bytes);
+        Status rst = owner.load(std::memory_order_acquire)->RestoreSequenceState(request.restore_state,
+                                                                                 request.max_capture_bytes);
         if (rst.ok()) {
             const int64_t restored_pos = llama_memory_seq_pos_max(mem, 0) + 1;
             if (restored_pos == static_cast<int64_t>(request.restore_tokens)) {
@@ -2599,10 +2606,12 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
             SnapshotSlotToL2(slot_idx, slot_id);
         }
 
-        // Check L2 Radix cache if VRAM did not already cover the full prefix.
+        // Check L2 Radix cache if VRAM did not already cover the prefix by at least
+        // `kMinL2RestoreGainTokens` (avoids unnecessary LRU touches / stats churn).
         std::size_t l2_lcp = 0;
         bool l2_wiped = false;
-        if (radix_cache.enabled() && request.prompt.size() > 1 && lcp + 1 < request.prompt.size()) {
+        if (radix_cache.enabled() && request.prompt.size() > 1 && request.prompt.size() - 1 > lcp &&
+            (request.prompt.size() - 1 - lcp) >= kMinL2RestoreGainTokens) {
             if (TryRestoreSlotFromL2(slot_idx, slot_id, request.prompt, lcp, l2_lcp, l2_mtp_synced, l2_wiped)) {
                 lcp = l2_lcp;
                 restored_from_l2 = true;
@@ -2705,7 +2714,8 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         }
 
         prefill_start_offset = static_cast<int64_t>(lcp);
-        result.cached_tokens = static_cast<std::int32_t>(lcp);
+        result.cached_tokens = static_cast<std::int32_t>(
+            std::min<std::size_t>(lcp, static_cast<std::size_t>(INT32_MAX)));
         slots[slot_idx].tokens.resize(lcp);
         slots[slot_idx].session_key = request.session_key;
         slots[slot_idx].last_used = ++slot_clock;
@@ -2935,7 +2945,8 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
 #endif
             if (capture_offset == off) {
                 std::vector<std::uint8_t> captured;
-                result.capture_status = owner->CaptureSequenceState(captured, request.max_capture_bytes);
+                result.capture_status =
+                    owner.load(std::memory_order_acquire)->CaptureSequenceState(captured, request.max_capture_bytes);
                 if (result.capture_status.ok()) {
                     result.state_captured = true;
                     if (request.on_state_captured) {
@@ -2993,7 +3004,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
 
     auto emit_token = [&](Token tok, const TokenLogprobInfo& lp, bool& keep_going) -> Status {
         std::string piece;
-        if (Status s = owner->TokenToPiece(tok, piece); !s.ok()) return s;
+        if (Status s = owner.load(std::memory_order_acquire)->TokenToPiece(tok, piece); !s.ok()) return s;
         TokenEvent ev;
         ev.token = tok;
         ev.text = utf8.Push(piece);
@@ -3494,11 +3505,12 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 
     auto complete_task = [](PendingRequest* task, GenerateResult&& res) {
         if (task == nullptr) return;
-        {
-            std::lock_guard<std::mutex> dlock(task->done_mu);
-            task->result = std::move(res);
-            task->done = true;
-        }
+        // Notify while holding `done_mu` so the waiting caller cannot wake,
+        // return, and destroy its stack-allocated `PendingRequest` before
+        // `done_cv.notify_one()` finishes.
+        std::lock_guard<std::mutex> dlock(task->done_mu);
+        task->result = std::move(res);
+        task->done = true;
         task->done_cv.notify_one();
     };
 
@@ -3544,7 +3556,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 
     auto emit_slot_token = [&](ActiveBatchSlot& s, Token tok, const TokenLogprobInfo& lp, bool& keep_going) -> Status {
         std::string piece;
-        if (Status st = owner->TokenToPiece(tok, piece); !st.ok()) return st;
+        if (Status st = owner.load(std::memory_order_acquire)->TokenToPiece(tok, piece); !st.ok()) return st;
         TokenEvent ev;
         ev.token = tok;
         ev.text = s.utf8.Push(piece);
@@ -3724,7 +3736,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         std::size_t l2_lcp = 0;
         bool l2_wiped = false;
         if (!restored_from_l2 && options.prefix_cache && radix_cache.enabled() && req.prompt.size() > 1 &&
-            lcp + kMinL2RestoreGainTokens < req.prompt.size()) {
+            req.prompt.size() - 1 > lcp && (req.prompt.size() - 1 - lcp) >= kMinL2RestoreGainTokens) {
             if (TryRestoreSlotFromL2(s->slot_idx, s->slot_id, req.prompt, lcp, l2_lcp, l2_mtp_synced, l2_wiped)) {
                 lcp = l2_lcp;
                 restored_from_l2 = true;
@@ -3837,7 +3849,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 
         s->prefill_offset = lcp;
         s->pos = n_past;
-        s->result.cached_tokens = static_cast<std::int32_t>(lcp);
+        s->result.cached_tokens = static_cast<std::int32_t>(
+            std::min<std::size_t>(lcp, static_cast<std::size_t>(INT32_MAX)));
         slots[s->slot_idx].tokens.resize(lcp);
         slots[s->slot_idx].session_key = req.session_key;
         slots[s->slot_idx].last_used = ++slot_clock;
@@ -3937,6 +3950,21 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         return true;
     };
 
+    struct SampledStepOutcome {
+        std::size_t slot_index = 0;
+        Token tok = LLAMA_TOKEN_NULL;
+        TokenLogprobInfo lp;
+        bool has_sample = false;
+    };
+    std::vector<BatchSlotPlanView> views;
+    std::vector<SampledStepOutcome> outcomes;
+    views.reserve(slots.size());
+    outcomes.reserve(slots.size());
+
+    PendingRequest* inflight_exclusive = nullptr;
+    PendingRequest* inflight_admit = nullptr;
+    std::size_t inflight_admit_slot = slots.size();
+
     try {
     while (true) {
         // 0. Drain all active slots cleanly if StopBatchWorker() requested shutdown.
@@ -3986,17 +4014,23 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     }
                 }
                 if (exclusive_task != nullptr) {
+                    inflight_exclusive = exclusive_task;
                     GenerateResult res = GenerateSingleLocked(*exclusive_task->req, *exclusive_task->on_token,
                                                               *exclusive_task->should_cancel);
+                    inflight_exclusive = nullptr;
                     complete_task(exclusive_task, std::move(res));
                     continue;
                 }
                 if (admitted_task != nullptr) {
+                    inflight_admit = admitted_task;
+                    inflight_admit_slot = sel.slot_index;
                     const bool allow_l2_snapshot =
                         active.empty() && pending_count.load(std::memory_order_acquire) == 0;
                     if (auto slot_obj = admit_request(admitted_task, sel, allow_l2_snapshot)) {
                         active.push_back(std::move(slot_obj));
                     }
+                    inflight_admit = nullptr;
+                    inflight_admit_slot = slots.size();
                 }
             }
         }
@@ -4597,6 +4631,10 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         // chunked prefill <= n_ubatch packed into ONE llama_decode call!).
         // Keep per-seq_id GPU backend samplers attached (never detach mid-request).
         for (auto& sp : active) {
+            if (sp->spec_initialized && (sp->suffix_enabled || sp->hybrid_suffix_enabled) &&
+                suffix_matcher != nullptr) {
+                suffix_matcher->ClearActive();
+            }
             if (sp->mtp_enabled) {
                 sp->mtp_enabled = false;
                 sp->hybrid_suffix_enabled = false;
@@ -4611,8 +4649,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             sp->batch_logit_idx = -1;
         }
 
-        std::vector<BatchSlotPlanView> views;
-        views.reserve(active.size());
+        views.clear();
         std::size_t decoding_count = 0;
         for (const auto& sp : active) {
             if (!sp->IsCancelled() && sp->phase == BatchSlotPhase::kDecode) {
@@ -4736,20 +4773,14 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 
         // Extract every slot's sampled token + optional logprobs from this step's
         // logits BEFORE invoking user callbacks or mutating context state.
-        struct SampledStepOutcome {
-            std::size_t slot_index = 0;
-            Token tok = LLAMA_TOKEN_NULL;
-            TokenLogprobInfo lp;
-            bool has_sample = false;
-        };
-        std::vector<SampledStepOutcome> outcomes;
-        outcomes.reserve(plan.items.size());
+        // Keep `outcomes` strictly 1:1 aligned with `plan.items` so indexing
+        // `outcomes[idx]` can never go out of bounds.
+        outcomes.clear();
         for (const PlannedBatchItem& item : plan.items) {
-            ActiveBatchSlot* s = find_active_by_slot(item.slot_index);
-            if (s == nullptr) continue;
             SampledStepOutcome out;
             out.slot_index = item.slot_index;
-            if (s->batch_logit_idx >= 0) {
+            ActiveBatchSlot* s = find_active_by_slot(item.slot_index);
+            if (s != nullptr && s->task != nullptr && s->batch_logit_idx >= 0) {
                 out.has_sample = true;
                 out.tok = SampleTokenAt(s->batch_logit_idx, s->task->req->sampling, s->sampler.get(),
                                         s->grammar_sampler.get(), s->target_gpu_sampled, n_vocab,
@@ -4867,16 +4898,48 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
     } catch (const std::exception& ex) {
         batch_abort_fn = nullptr;
         active_cancel = nullptr;
+        const std::string err_msg = std::string("batch worker error: ") + ex.what();
+        if (inflight_exclusive != nullptr) {
+            GenerateResult res;
+            res.status = Status::Error(ErrorCode::kDecodeFailed, err_msg);
+            res.stop_reason = StopReason::kError;
+            complete_task(inflight_exclusive, std::move(res));
+            inflight_exclusive = nullptr;
+        }
+        if (inflight_admit != nullptr) {
+            if (inflight_admit_slot < slot_busy.size()) slot_busy[inflight_admit_slot] = 0u;
+            GenerateResult res;
+            res.status = Status::Error(ErrorCode::kDecodeFailed, err_msg);
+            res.stop_reason = StopReason::kError;
+            complete_task(inflight_admit, std::move(res));
+            inflight_admit = nullptr;
+        }
         for (auto& sp : active) {
             if (sp && sp->task != nullptr) {
-                sp->result.status = Status::Error(ErrorCode::kDecodeFailed, std::string("batch worker error: ") + ex.what());
+                sp->result.status = Status::Error(ErrorCode::kDecodeFailed, err_msg);
                 finish_slot(*sp, StopReason::kError);
             }
         }
         active.clear();
+        std::fill(slot_busy.begin(), slot_busy.end(), std::uint8_t{0});
     } catch (...) {
         batch_abort_fn = nullptr;
         active_cancel = nullptr;
+        if (inflight_exclusive != nullptr) {
+            GenerateResult res;
+            res.status = Status::Error(ErrorCode::kDecodeFailed, "batch worker internal exception");
+            res.stop_reason = StopReason::kError;
+            complete_task(inflight_exclusive, std::move(res));
+            inflight_exclusive = nullptr;
+        }
+        if (inflight_admit != nullptr) {
+            if (inflight_admit_slot < slot_busy.size()) slot_busy[inflight_admit_slot] = 0u;
+            GenerateResult res;
+            res.status = Status::Error(ErrorCode::kDecodeFailed, "batch worker internal exception");
+            res.stop_reason = StopReason::kError;
+            complete_task(inflight_admit, std::move(res));
+            inflight_admit = nullptr;
+        }
         for (auto& sp : active) {
             if (sp && sp->task != nullptr) {
                 sp->result.status = Status::Error(ErrorCode::kDecodeFailed, "batch worker internal exception");
@@ -4884,12 +4947,15 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             }
         }
         active.clear();
+        std::fill(slot_busy.begin(), slot_busy.end(), std::uint8_t{0});
     }
 
-    // Drain any remaining queued tasks cleanly on shutdown so callers never hang.
+    // Mark stopped under `queue_mu` BEFORE draining so no new caller can enqueue
+    // onto an exited worker thread after an abnormal termination.
     std::deque<PendingRequest*> leftover;
     {
         std::lock_guard<std::mutex> qlock(queue_mu);
+        worker_stop.store(true, std::memory_order_release);
         leftover.swap(pending_queue);
         pending_count.store(0, std::memory_order_relaxed);
     }

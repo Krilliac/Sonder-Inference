@@ -207,10 +207,11 @@ void ResponseHistoryStore::put(Entry entry) {
     std::lock_guard<std::mutex> lock(mu_);
     auto it = index_.find(entry.id);
     if (it != index_.end()) {
-        const std::size_t old_b = it->second->approx_bytes;
+        const auto list_it = it->second;
+        const std::size_t old_b = list_it->approx_bytes;
         used_bytes_ = used_bytes_ >= old_b ? (used_bytes_ - old_b) : 0;
         index_.erase(it);
-        lru_.erase(it->second);
+        lru_.erase(list_it);
     }
     while (!lru_.empty() && (lru_.size() >= capacity_ || used_bytes_ > max_bytes_ - entry.approx_bytes)) {
         evict_back_locked();
@@ -253,6 +254,13 @@ std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view bo
         if (!prev->is_string() || prev->as_string().empty() || prev->as_string().size() > 128) {
             return bad("invalid_request", "previous_response_id must be a non-empty string of at most 128 bytes",
                        "previous_response_id");
+        }
+        for (const char c : prev->as_string()) {
+            const auto u = static_cast<unsigned char>(c);
+            if (u < 0x20u || u == 0x7Fu) {
+                return bad("invalid_request", "previous_response_id must not contain control characters",
+                           "previous_response_id");
+            }
         }
         job.previous_response_id = prev->as_string();
     }
@@ -302,8 +310,13 @@ std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view bo
                 return bad("invalid_request", where + " must be an object", where);
             }
             const json::Value* type_v = items[i].find("type");
-            const std::string item_type =
-                (present(type_v) && type_v->is_string()) ? type_v->as_string() : std::string("message");
+            std::string item_type = "message";
+            if (present(type_v)) {
+                if (!type_v->is_string()) {
+                    return bad("invalid_request", where + ".type must be a string", where + ".type");
+                }
+                item_type = type_v->as_string();
+            }
 
             if (item_type == "function_call_output") {
                 const json::Value* cid = items[i].find("call_id");
@@ -362,6 +375,13 @@ std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view bo
             }
             ChatMessage msg;
             msg.role = std::move(role);
+            if (const json::Value* tcid = items[i].find("tool_call_id"); present(tcid)) {
+                if (!tcid->is_string() || tcid->as_string().empty()) {
+                    return bad("invalid_request", where + ".tool_call_id must be a non-empty string",
+                               where + ".tool_call_id");
+                }
+                msg.tool_call_id = tcid->as_string();
+            }
             if (content->is_string()) {
                 msg.content = content->as_string();
             } else if (content->is_array()) {
@@ -568,7 +588,9 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
 
     // Keep clean history copy before any non-native tool prompt injection.
     const std::vector<ChatMessage> clean_history = conversation;
-    if (!job.tools.empty() && !backend_native_tools) {
+    const bool tool_choice_none = job.tool_choice && job.tool_choice->mode == ToolChoiceMode::none;
+    const bool parse_text_tools = !job.tools.empty() && !backend_native_tools && !tool_choice_none;
+    if (parse_text_tools) {
         const std::string tool_prompt = format_tools_system_prompt(job.tools, job.tool_choice);
         if (!conversation.empty() && conversation.front().role == "system") {
             conversation.front().content += "\n\n" + tool_prompt;
@@ -614,6 +636,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     const std::int64_t created_at = static_cast<std::int64_t>(std::time(nullptr));
 
     std::atomic<bool> backend_started{false};
+    SseStreamWriter sse(ex, ex.options.stream_keepalive_interval);
     std::mutex watch_mu;
     std::condition_variable watch_cv;
     bool watch_done = false;
@@ -624,11 +647,15 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
             return;
         }
         backend_started.store(true);
+        if (job.stream) {
+            sse.arm_keepalive();
+        }
     };
     std::shared_ptr<PriorityAdmission::Ticket> ticket;
     std::thread watcher;
     bool left_inflight = false;
     const auto end_request = [&] {
+        sse.disarm_keepalive();
         if (ticket) ticket->release();
         {
             std::lock_guard<std::mutex> lock(watch_mu);
@@ -659,7 +686,14 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
                     disconnected.store(true);
                     session->cancel();
                 }
-                if (std::chrono::steady_clock::now() >= deadline) session->cancel();
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) {
+                    session->cancel();
+                } else if (job.stream && !disconnected.load() && !ex.hard_stop.load() &&
+                           !sse.maybe_send_keepalive()) {
+                    disconnected.store(true);
+                    session->cancel();
+                }
                 lock.lock();
                 watch_cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return watch_done; });
             }
@@ -699,19 +733,11 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
         ro.admission = ticket;
     }
 
-    const bool tools_enabled = !job.tools.empty();
     ToolCallStreamParser stream_parser("call_" + *ro.request_id + "_");
     std::string streamed_visible_text;
     std::vector<ToolCall> streamed_tool_calls;
-    bool headers_sent = false;
-    bool write_failed = false;
 
-    const auto send_frame = [&](std::string_view frame) {
-        if (!write_failed && !frame.empty() && !ex.write(frame)) {
-            write_failed = true;
-        }
-        return !write_failed;
-    };
+    const auto send_frame = [&](std::string_view frame) { return sse.write_frame(frame); };
     const auto make_meta = [&](const GenerationResult* r) {
         json::Object meta{{"api_version", kApiVersion},
                           {"request_id", *ro.request_id},
@@ -728,18 +754,14 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
         return meta;
     };
     const auto ensure_stream_head = [&]() {
-        if (headers_sent) return !write_failed;
-        headers_sent = true;
-        if (!ex.start_stream()) {
-            write_failed = true;
-            return false;
-        }
-        json::Object created_resp =
-            build_response_object(response_id, created_at, "in_progress", model, job.previous_response_id, "", "", {},
-                                  nullptr, make_meta(nullptr));
-        return send_frame(sse_named_event(
-            "response.created",
-            json::Object{{"type", "response.created"}, {"response", std::move(created_resp)}}));
+        return sse.ensure_started([&]() -> std::string {
+            json::Object created_resp =
+                build_response_object(response_id, created_at, "in_progress", model, job.previous_response_id, "", "",
+                                      {}, nullptr, make_meta(nullptr));
+            return sse_named_event(
+                "response.created",
+                json::Object{{"type", "response.created"}, {"response", std::move(created_resp)}});
+        });
     };
 
     const auto emit_text_delta = [&](std::string_view delta) -> bool {
@@ -767,7 +789,6 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
                                                        {"delta", std::string(args_delta)}}));
     };
 
-    const bool parse_text_tools = tools_enabled && !backend_native_tools;
     TokenCallback on_chunk;
     if (job.stream) {
         on_chunk = [&](const TokenChunk& chunk) -> bool {
@@ -817,7 +838,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     end_request();
     const bool rejected = session->last_scheduler_rejected();
 
-    if (disconnected.load() || write_failed) {
+    if (disconnected.load() || sse.write_failed()) {
         ex.status = 499;
         session->close();
         return;
@@ -830,7 +851,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     if (!result.ok()) {
         session->close();
         const ApiError e = map_session_failure(result.status(), rejected);
-        if (headers_sent) {
+        if (sse.headers_sent()) {
             (void)send_frame(sse_named_event("error", error_body(e)));
         } else {
             ex.send_error(e);
@@ -853,10 +874,21 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
             }
         }
         final_visible = streamed_visible_text;
-        final_calls = streamed_tool_calls;
+        for (const auto& tc : streamed_tool_calls) {
+            if (!tc.name.empty() || !tc.arguments_json.empty()) {
+                final_calls.push_back(tc);
+            }
+        }
     } else if (!r.tool_calls.empty()) {
         final_visible = r.text;
-        final_calls = r.tool_calls;
+        for (const auto& tc : r.tool_calls) {
+            if (tc.name.empty() && tc.arguments_json.empty()) continue;
+            ToolCall normalized = tc;
+            if (normalized.id.empty()) {
+                normalized.id = "call_" + *ro.request_id + "_" + std::to_string(final_calls.size());
+            }
+            final_calls.push_back(std::move(normalized));
+        }
     } else if (parse_text_tools) {
         ExtractedToolOutput ext = extract_tool_calls(r.text, "call_" + *ro.request_id + "_");
         final_visible = std::move(ext.visible_text);

@@ -2,13 +2,18 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "llamacpp_internal.hpp"
 #include "sonder/inference/backends/llamacpp.hpp"
+#include "sonder/inference/engine.hpp"
+#include "sonder/inference/json.hpp"
 
 using namespace sonder::inference;
 using llamacpp_detail::ApplyNoThinkScaffolding;
@@ -394,4 +399,363 @@ TEST_CASE("llamacpp adapter: ResolveGpuDevicePin routes gpu:N to the matching gg
     pinned.clear();
     CHECK(llamacpp_detail::ResolveGpuDevicePin("gpu:0", cuda_only, pinned, main_gpu, {}, os_gpus).code() ==
           ErrorCode::not_found);
+}
+
+TEST_CASE("llamacpp adapter: PopulateGenerateStats separates total, cached, and uncached prompt tokens") {
+    namespace lc = sonder::backends::llamacpp;
+
+    // 1. Cold prompt (0 cached tokens).
+    {
+        lc::GenerateResult r;
+        r.prompt_tokens = 128;
+        r.cached_tokens = 0;
+        r.generated_tokens = 32;
+        r.prefill_ms = 20.0;
+        r.decode_ms = 400.0;
+        GenerateStats stats;
+        stats.chunks = 32;
+        llamacpp_detail::PopulateGenerateStats(r, /*restore_tokens=*/0, /*load_ns=*/12345u, stats);
+        CHECK(stats.token_counts_from_backend);
+        CHECK(stats.load_ns == 12345u);
+        CHECK(stats.chunks == 32u);
+        CHECK(stats.prompt_tokens == 128u);
+        REQUIRE(stats.cached_tokens.has_value());
+        CHECK(*stats.cached_tokens == 0u);
+        CHECK(stats.completion_tokens == 32u);
+        CHECK(stats.prompt_eval_ns == 20000000u);
+        CHECK(stats.eval_ns == 400000000u);
+        REQUIRE(stats.predicted_tokens_per_second.has_value());
+        CHECK(*stats.predicted_tokens_per_second == doctest::Approx(80.0));
+        CHECK_FALSE(stats.draft_tokens.has_value());
+        CHECK_FALSE(stats.draft_accepted_tokens.has_value());
+        REQUIRE(stats.backend_timings.has_value());
+        CHECK(stats.backend_timings->prompt_n == std::optional<std::uint64_t>(128u));
+        CHECK(stats.backend_timings->cache_n == std::optional<std::uint64_t>(0u));
+        CHECK(stats.backend_timings->prompt_ms == std::optional<double>(20.0));
+        CHECK(stats.backend_timings->predicted_n == std::optional<std::uint64_t>(32u));
+        CHECK(stats.backend_timings->predicted_ms == std::optional<double>(400.0));
+        CHECK_FALSE(stats.backend_timings->draft_n.has_value());
+        CHECK_FALSE(stats.backend_timings->draft_n_accepted.has_value());
+    }
+
+    // 2. 99% KV prefix cache hit: prompt_tokens is total (1000), cached_tokens is 990,
+    //    and backend_timings.prompt_n is strictly uncached evaluated tokens (10).
+    {
+        lc::GenerateResult r;
+        r.prompt_tokens = 10;
+        r.cached_tokens = 990;
+        r.generated_tokens = 50;
+        r.prefill_ms = 5.0;
+        r.decode_ms = 500.0;
+        GenerateStats stats;
+        llamacpp_detail::PopulateGenerateStats(r, 0, 0, stats);
+        CHECK(stats.prompt_tokens == 1000u);
+        REQUIRE(stats.cached_tokens.has_value());
+        CHECK(*stats.cached_tokens == 990u);
+        REQUIRE(stats.backend_timings.has_value());
+        CHECK(stats.backend_timings->prompt_n == std::optional<std::uint64_t>(10u));
+        CHECK(stats.backend_timings->cache_n == std::optional<std::uint64_t>(990u));
+        CHECK(stats.prompt_tokens == *stats.backend_timings->prompt_n + *stats.backend_timings->cache_n);
+    }
+
+    // 3. 100% cache hit (0 newly evaluated tokens).
+    {
+        lc::GenerateResult r;
+        r.prompt_tokens = 0;
+        r.cached_tokens = 512;
+        r.generated_tokens = 8;
+        r.prefill_ms = 0.25;
+        r.decode_ms = 80.0;
+        GenerateStats stats;
+        llamacpp_detail::PopulateGenerateStats(r, 0, 0, stats);
+        CHECK(stats.prompt_tokens == 512u);
+        CHECK(stats.cached_tokens == std::optional<std::uint64_t>(512u));
+        REQUIRE(stats.backend_timings.has_value());
+        CHECK(stats.backend_timings->prompt_n == std::optional<std::uint64_t>(0u));
+        CHECK(stats.backend_timings->cache_n == std::optional<std::uint64_t>(512u));
+    }
+
+    // 4. Recurrent checkpoint restore attributes restore_tokens to cache_n / cached_tokens.
+    {
+        lc::GenerateResult r;
+        r.state_restored = true;
+        r.prompt_tokens = 44;
+        r.cached_tokens = 0;
+        r.generated_tokens = 16;
+        r.prefill_ms = 10.0;
+        r.decode_ms = 160.0;
+        GenerateStats stats;
+        llamacpp_detail::PopulateGenerateStats(r, /*restore_tokens=*/256, 0, stats);
+        CHECK(stats.prompt_tokens == 300u);
+        CHECK(stats.cached_tokens == std::optional<std::uint64_t>(256u));
+        REQUIRE(stats.backend_timings.has_value());
+        CHECK(stats.backend_timings->prompt_n == std::optional<std::uint64_t>(44u));
+        CHECK(stats.backend_timings->cache_n == std::optional<std::uint64_t>(256u));
+    }
+
+    // 5. Speculative decoding active populates draft counts and clamps accepted <= drafted.
+    {
+        lc::GenerateResult r;
+        r.prompt_tokens = 20;
+        r.generated_tokens = 30;
+        r.draft_tokens = 24;
+        r.draft_accepted_tokens = 18;
+        GenerateStats stats;
+        llamacpp_detail::PopulateGenerateStats(r, 0, 0, stats);
+        CHECK(stats.draft_tokens == std::optional<std::uint64_t>(24u));
+        CHECK(stats.draft_accepted_tokens == std::optional<std::uint64_t>(18u));
+        REQUIRE(stats.backend_timings.has_value());
+        CHECK(stats.backend_timings->draft_n == std::optional<std::uint64_t>(24u));
+        CHECK(stats.backend_timings->draft_n_accepted == std::optional<std::uint64_t>(18u));
+    }
+
+    // 6. Negative counts, accepted > drafted, and NaN/Inf durations are clamped safely.
+    {
+        lc::GenerateResult r;
+        r.prompt_tokens = -7;
+        r.cached_tokens = -3;
+        r.generated_tokens = -1;
+        r.draft_tokens = 5;
+        r.draft_accepted_tokens = 99;
+        r.prefill_ms = std::numeric_limits<double>::quiet_NaN();
+        r.decode_ms = std::numeric_limits<double>::infinity();
+        GenerateStats stats;
+        llamacpp_detail::PopulateGenerateStats(r, 0, 0, stats);
+        CHECK(stats.prompt_tokens == 0u);
+        CHECK(stats.cached_tokens == std::optional<std::uint64_t>(0u));
+        CHECK(stats.completion_tokens == 0u);
+        CHECK(stats.prompt_eval_ns == 0u);
+        CHECK(stats.eval_ns == 0u);
+        CHECK_FALSE(stats.predicted_tokens_per_second.has_value());
+        CHECK(stats.draft_tokens == std::optional<std::uint64_t>(5u));
+        CHECK(stats.draft_accepted_tokens == std::optional<std::uint64_t>(5u));
+        REQUIRE(stats.backend_timings.has_value());
+        CHECK(stats.backend_timings->prompt_n == std::optional<std::uint64_t>(0u));
+        CHECK(stats.backend_timings->cache_n == std::optional<std::uint64_t>(0u));
+        CHECK(stats.backend_timings->draft_n == std::optional<std::uint64_t>(5u));
+        CHECK(stats.backend_timings->draft_n_accepted == std::optional<std::uint64_t>(5u));
+    }
+}
+
+TEST_CASE("llamacpp adapter: SummarizeGgmlDeviceMemory and HasIntegratedUmaTarget classify discrete and UMA GPUs") {
+    namespace lc = sonder::backends::llamacpp;
+    constexpr std::uint64_t kGiB = 1024ull * 1024ull * 1024ull;
+
+    // CPU-only devices report unsupported rather than fabricating zeroes.
+    const std::vector<lc::DeviceInfo> cpu_only{
+        {"CPU", "Ryzen 9", lc::DeviceKind::kCpu, 0, 0},
+    };
+    const auto cpu_reading = llamacpp_detail::SummarizeGgmlDeviceMemory(cpu_only, {});
+    CHECK(cpu_reading.probe == "none");
+    CHECK(cpu_reading.status == "unsupported");
+    CHECK_FALSE(llamacpp_detail::HasIntegratedUmaTarget(cpu_only, {}));
+
+    // Hybrid Node1 layout: discrete RX 9060 XT (Vulkan0) + integrated Radeon 780M (Vulkan1).
+    const std::vector<lc::DeviceInfo> hybrid{
+        {"CPU", "Ryzen 7", lc::DeviceKind::kCpu, 0, 0},
+        {"Vulkan0", "AMD Radeon RX 9060 XT", lc::DeviceKind::kGpu, 4 * kGiB, 16 * kGiB},
+        {"Vulkan1", "AMD Radeon 780M Graphics", lc::DeviceKind::kIntegratedGpu, 22 * kGiB, 32 * kGiB},
+    };
+    const auto all_reading = llamacpp_detail::SummarizeGgmlDeviceMemory(hybrid, {});
+    CHECK(all_reading.probe == "ggml");
+    CHECK(all_reading.status == "ok");
+    CHECK(all_reading.dedicated_bytes == 12 * kGiB);
+    CHECK(all_reading.shared_bytes == 10 * kGiB);
+    CHECK(llamacpp_detail::HasIntegratedUmaTarget(hybrid, {}));
+    CHECK(llamacpp_detail::HasIntegratedUmaTarget(hybrid, {"Vulkan0", "Vulkan1"}));
+
+    // Discrete-only configured device excludes integrated GPU.
+    const auto discrete_only = llamacpp_detail::SummarizeGgmlDeviceMemory(hybrid, {"vulkan0"});
+    CHECK(discrete_only.probe == "ggml");
+    CHECK(discrete_only.status == "ok");
+    CHECK(discrete_only.dedicated_bytes == 12 * kGiB);
+    CHECK(discrete_only.shared_bytes == 0u);
+    CHECK_FALSE(llamacpp_detail::HasIntegratedUmaTarget(hybrid, {"vulkan0"}));
+
+    // Anomalous free > total device is skipped cleanly without underflow.
+    const std::vector<lc::DeviceInfo> anomalous{
+        {"Vulkan0", "Anomalous GPU", lc::DeviceKind::kGpu, 20 * kGiB, 16 * kGiB},
+    };
+    const auto anom_reading = llamacpp_detail::SummarizeGgmlDeviceMemory(anomalous, {});
+    CHECK(anom_reading.status == "unsupported");
+}
+
+TEST_CASE("llamacpp adapter: runtime_status populates gpu_memory, spill guard, UMA suppression, and engine telemetry") {
+    constexpr std::uint64_t kMiB = 1024ull * 1024ull;
+    constexpr std::uint64_t kGiB = 1024ull * kMiB;
+
+    // 1. Default production backend returns non-nullopt runtime_status safely across threads.
+    {
+        LlamaCppBackendOptions opts;
+        opts.context_length = 8192;
+        auto be = make_llamacpp_backend(opts);
+        const auto st = be->runtime_status();
+        REQUIRE(st.has_value());
+        CHECK((st->gpu_memory.status == "ok" || st->gpu_memory.status == "unsupported" ||
+               st->gpu_memory.status == "error"));
+        CHECK(st->context.policy == "warn");
+        CHECK(st->context.configured_ctx == std::optional<std::uint64_t>(8192u));
+        CHECK_FALSE(st->context.fitted_ctx.has_value());
+        CHECK(st->context.outcome == "not_needed");
+
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 4; ++i) {
+            threads.emplace_back([&be] {
+                for (int j = 0; j < 8; ++j) {
+                    const auto s = be->runtime_status();
+                    CHECK(s.has_value());
+                }
+            });
+        }
+        for (auto& t : threads) t.join();
+    }
+
+    // 2. Discrete GPU spill detection, peak_shared_bytes high-water mark, error/recovery, and throttle.
+    {
+        std::atomic<int> call{0};
+        LlamaCppBackendOptions opts;
+        opts.context_length = 32768;
+        auto be = llamacpp_detail::MakeLlamaCppBackendForTest(
+            opts,
+            [&call]() -> llamacpp_detail::ProcessGpuMemoryReading {
+                const int n = call.fetch_add(1);
+                if (n == 0) return {"pdh", "ok", "", 12 * kGiB, 128 * kMiB};
+                if (n == 1) return {"pdh", "ok", "", 15 * kGiB, 400 * kMiB};
+                if (n == 2) return {"pdh", "error", "transient pdh failure", 0, 0};
+                return {"pdh", "ok", "", 14 * kGiB, 100 * kMiB};
+            },
+            std::chrono::milliseconds{0}, /*force_uma_mode=*/false, /*force_gpu_offload=*/true);
+
+        const auto s1 = be->runtime_status();
+        REQUIRE(s1.has_value());
+        CHECK(s1->gpu_memory.probe == "pdh");
+        CHECK(s1->gpu_memory.status == "ok");
+        CHECK(s1->gpu_memory.dedicated_bytes == 12 * kGiB);
+        CHECK(s1->gpu_memory.shared_bytes == 128 * kMiB);
+        CHECK(s1->gpu_memory.peak_shared_bytes == 128 * kMiB);
+        CHECK(s1->gpu_memory.samples == 1u);
+        CHECK_FALSE(s1->gpu_memory.spilled);
+        CHECK(s1->warnings.empty());
+
+        const auto s2 = be->runtime_status();
+        REQUIRE(s2.has_value());
+        CHECK(s2->gpu_memory.dedicated_bytes == 15 * kGiB);
+        CHECK(s2->gpu_memory.shared_bytes == 400 * kMiB);
+        CHECK(s2->gpu_memory.peak_shared_bytes == 400 * kMiB);
+        CHECK(s2->gpu_memory.samples == 2u);
+        CHECK(s2->gpu_memory.spilled);
+        REQUIRE(s2->warnings.size() == 1u);
+        CHECK(s2->warnings[0].code == "vram_spill");
+
+        // Error reading preserves sample count and peak_shared_bytes without claiming spill.
+        const auto s3 = be->runtime_status();
+        REQUIRE(s3.has_value());
+        CHECK(s3->gpu_memory.status == "error");
+        CHECK(s3->gpu_memory.error == "transient pdh failure");
+        CHECK(s3->gpu_memory.samples == 2u);
+        CHECK(s3->gpu_memory.peak_shared_bytes == 400 * kMiB);
+        CHECK_FALSE(s3->gpu_memory.spilled);
+
+        // Recovery increments samples while retaining peak_shared_bytes high-water mark.
+        const auto s4 = be->runtime_status();
+        REQUIRE(s4.has_value());
+        CHECK(s4->gpu_memory.status == "ok");
+        CHECK(s4->gpu_memory.error.empty());
+        CHECK(s4->gpu_memory.samples == 3u);
+        CHECK(s4->gpu_memory.shared_bytes == 100 * kMiB);
+        CHECK(s4->gpu_memory.peak_shared_bytes == 400 * kMiB);
+        CHECK_FALSE(s4->gpu_memory.spilled);
+    }
+
+    // 3. Throttling keeps rapid health calls O(1) cached without re-invoking the probe.
+    {
+        std::atomic<int> probes{0};
+        auto be = llamacpp_detail::MakeLlamaCppBackendForTest(
+            {},
+            [&probes]() -> llamacpp_detail::ProcessGpuMemoryReading {
+                ++probes;
+                return {"pdh", "ok", "", 4 * kGiB, 64 * kMiB};
+            },
+            std::chrono::milliseconds{60000}, false, true);
+        const auto a = be->runtime_status();
+        const auto b = be->runtime_status();
+        REQUIRE(a.has_value());
+        REQUIRE(b.has_value());
+        CHECK(probes.load() == 1);
+        CHECK(a->gpu_memory.samples == 1u);
+        CHECK(b->gpu_memory.samples == 1u);
+    }
+
+    // 4. Integrated UMA / hybrid mode suppresses false VRAM spill alerts on high shared usage.
+    {
+        auto be = llamacpp_detail::MakeLlamaCppBackendForTest(
+            {},
+            []() -> llamacpp_detail::ProcessGpuMemoryReading {
+                return {"pdh", "ok", "", 15 * kGiB, 25 * kGiB};
+            },
+            std::chrono::milliseconds{0}, /*force_uma_mode=*/true, /*force_gpu_offload=*/true);
+        const auto st = be->runtime_status();
+        REQUIRE(st.has_value());
+        CHECK(st->gpu_memory.status == "ok");
+        CHECK(st->gpu_memory.dedicated_bytes == 15 * kGiB);
+        CHECK(st->gpu_memory.shared_bytes == 25 * kGiB);
+        CHECK_FALSE(st->gpu_memory.spilled);
+        CHECK(st->warnings.empty());
+    }
+
+    // 5. End-to-end Engine periodic sampler emits backend.gpu_memory.sample for direct llamacpp.
+    {
+        auto sink = std::make_shared<MemoryTelemetrySink>();
+        std::atomic<std::uint64_t> step{0};
+        auto be = llamacpp_detail::MakeLlamaCppBackendForTest(
+            {},
+            [&step]() -> llamacpp_detail::ProcessGpuMemoryReading {
+                const std::uint64_t k = step.fetch_add(1);
+                return {"pdh", "ok", "", (10 + k) * kGiB, 320 * kMiB};
+            },
+            std::chrono::milliseconds{0}, /*force_uma_mode=*/false, /*force_gpu_offload=*/true);
+
+        EngineOptions eo;
+        eo.telemetry_sinks.push_back(sink);
+        eo.sample_devices_on_start = false;
+        eo.sample_gpu_devices = false;
+        eo.device_sample_interval = std::chrono::milliseconds{15};
+
+        std::vector<json::Value> gpu_samples;
+        std::vector<json::Value> warnings;
+        {
+            Engine engine(eo);
+            REQUIRE(engine.register_backend(be).ok());
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (std::chrono::steady_clock::now() < deadline) {
+                engine.telemetry().flush();
+                gpu_samples.clear();
+                warnings.clear();
+                for (const auto& line : sink->lines()) {
+                    const auto parsed = json::parse(line);
+                    if (!parsed.ok()) continue;
+                    const auto type = parsed->find("event_type")->as_string();
+                    if (type == "backend.gpu_memory.sample") gpu_samples.push_back(parsed.value());
+                    if (type == "backend.warning") warnings.push_back(parsed.value());
+                }
+                if (gpu_samples.size() >= 2 && !warnings.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds{10});
+            }
+        }
+        REQUIRE(gpu_samples.size() >= 2u);
+        const auto* first_attrs = gpu_samples[0].find("attributes");
+        REQUIRE(first_attrs != nullptr);
+        CHECK(first_attrs->find("backend")->as_string() == kLlamaCppBackendName);
+        CHECK(first_attrs->find("probe")->as_string() == "pdh");
+        CHECK(first_attrs->find("status")->as_string() == "ok");
+        CHECK(first_attrs->find("dedicated_bytes")->as_uint() >= 10 * kGiB);
+        CHECK(first_attrs->find("shared_bytes")->as_uint() == 320 * kMiB);
+        CHECK(first_attrs->find("spilled")->as_bool());
+        CHECK(first_attrs->find("samples")->as_uint() == 1u);
+        CHECK(gpu_samples[1].find("attributes")->find("samples")->as_uint() >
+              first_attrs->find("samples")->as_uint());
+        REQUIRE(warnings.size() == 1u);
+        CHECK(warnings[0].find("attributes")->find("backend")->as_string() == kLlamaCppBackendName);
+        CHECK(warnings[0].find("attributes")->find("code")->as_string() == "vram_spill");
+    }
 }

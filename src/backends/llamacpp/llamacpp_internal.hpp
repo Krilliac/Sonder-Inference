@@ -3,8 +3,12 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -13,6 +17,7 @@
 
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include "sonder/inference/backend.hpp"
+#include "sonder/inference/backends/llamacpp.hpp"
 #include "sonder/inference/device.hpp"
 #include "sonder/inference/sampling.hpp"
 
@@ -339,5 +344,43 @@ inline Status ResolveGpuDevicePin(std::string_view device_id,
     out_main_gpu = 0;
     return Status::success();
 }
+
+// One snapshot from the in-process GPU memory probe used by LlamaCppCoreBackend.
+struct ProcessGpuMemoryReading {
+    std::string probe;   // e.g. "pdh", "amdgpu-fdinfo", "nvml", "ggml", "none"
+    std::string status;  // "ok", "unsupported", or "error"
+    std::string error;
+    std::uint64_t dedicated_bytes = 0;
+    std::uint64_t shared_bytes = 0;
+};
+
+using ProcessGpuMemoryProbe = std::function<ProcessGpuMemoryReading()>;
+
+// Aggregates GGML GPU device memory usage as a cross-platform fallback when
+// OS per-process GPU memory counters are unavailable.
+ProcessGpuMemoryReading SummarizeGgmlDeviceMemory(
+    const std::vector<sonder::backends::llamacpp::DeviceInfo>& devices,
+    const std::vector<std::string>& configured_devices);
+
+// Returns true when any active GGML GPU target is an integrated UMA device
+// (shared/GTT allocations are expected rather than a PCIe VRAM spill).
+bool HasIntegratedUmaTarget(
+    const std::vector<sonder::backends::llamacpp::DeviceInfo>& devices,
+    const std::vector<std::string>& configured_devices);
+
+// Populates Sonder GenerateStats from a llama.cpp GenerateResult, keeping
+// total prompt tokens (`stats.prompt_tokens = evaluated + cached`), cached
+// tokens (`stats.cached_tokens = cached`), and uncached evaluated prompt tokens
+// (`stats.backend_timings->prompt_n = evaluated`) strictly separated.
+void PopulateGenerateStats(const sonder::backends::llamacpp::GenerateResult& result,
+                           std::size_t restore_tokens, std::uint64_t load_ns,
+                           GenerateStats& stats) noexcept;
+
+// Deterministic test factory allowing unit tests to inject a fake per-process
+// GPU memory probe and refresh cadence without live GPU counters or weights.
+std::shared_ptr<Backend> MakeLlamaCppBackendForTest(
+    LlamaCppBackendOptions options, ProcessGpuMemoryProbe probe,
+    std::chrono::milliseconds sample_interval = std::chrono::milliseconds{0},
+    bool force_uma_mode = false, std::optional<bool> force_gpu_offload = std::nullopt);
 
 }  // namespace sonder::inference::llamacpp_detail

@@ -19,6 +19,7 @@ TEST_CASE("backend: capabilities, probe, list_models") {
     CHECK(be->name() == "ollama");
     CHECK(be->capabilities().has(Capability::streaming));
     CHECK(be->capabilities().has(Capability::remote_process));
+    CHECK(be->capabilities().has(Capability::tool_calling));
     CHECK_FALSE(be->capabilities().has(Capability::kv_export));
     auto v = be->probe();
     REQUIRE_MESSAGE(v.ok(), v.status().to_string());

@@ -97,6 +97,7 @@ struct ServerOptions {
     std::chrono::milliseconds read_timeout{10000};          // headers and body (408)
     std::chrono::milliseconds shutdown_grace{5000};         // in-flight requests on stop()
     std::chrono::milliseconds heartbeat_interval{15000};    // idle telemetry streams
+    std::chrono::milliseconds stream_keepalive_interval{15000};  // SSE `: keep-alive` during prefill/idle (0 = off)
     std::chrono::milliseconds write_stall_timeout{60000};   // peer not reading at all
     // Bounded HTTP/1.1 persistent connections (keep-alive).
     bool keep_alive = true;

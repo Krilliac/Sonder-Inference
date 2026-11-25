@@ -261,9 +261,65 @@ json::Value build_chat_body(const ChatParams& p, const OllamaConfig& config) {
     apply_common(body, p.model, p.stream, p.think, p.format, p.keep_alive, config, p.options);
     json::Array msgs;
     for (const auto& m : p.messages) {
-        msgs.emplace_back(json::Object{{"role", m.role}, {"content", m.content}});
+        json::Object msg{{"role", m.role}, {"content", m.content}};
+        if (m.role == "assistant" && !m.tool_calls.empty()) {
+            json::Array tcs;
+            tcs.reserve(m.tool_calls.size());
+            for (const auto& tc : m.tool_calls) {
+                json::Value args_val = json::Object{};
+                if (!tc.arguments_json.empty()) {
+                    auto parsed_args = json::parse(tc.arguments_json);
+                    if (parsed_args.ok() && parsed_args.value().is_object()) {
+                        args_val = std::move(parsed_args).value();
+                    }
+                }
+                json::Object fn{{"name", tc.name}, {"arguments", std::move(args_val)}};
+                json::Object entry{{"function", std::move(fn)}};
+                if (!tc.id.empty()) {
+                    entry.set("id", tc.id);
+                }
+                tcs.emplace_back(std::move(entry));
+            }
+            msg.set("tool_calls", std::move(tcs));
+        }
+        if (m.role == "tool") {
+            if (m.name && !m.name->empty()) {
+                msg.set("tool_name", *m.name);
+            }
+            if (m.tool_call_id && !m.tool_call_id->empty()) {
+                msg.set("tool_call_id", *m.tool_call_id);
+            }
+        }
+        msgs.emplace_back(std::move(msg));
     }
     body.set("messages", std::move(msgs));
+    const bool tool_choice_none = p.tool_choice && p.tool_choice->mode == ToolChoiceMode::none;
+    if (!p.tools.empty() && !tool_choice_none) {
+        const bool filter_single =
+            p.tool_choice && p.tool_choice->mode == ToolChoiceMode::function && !p.tool_choice->function_name.empty();
+        json::Array tools_arr;
+        for (const auto& t : p.tools) {
+            if (filter_single && t.name != p.tool_choice->function_name) {
+                continue;
+            }
+            json::Object fn{{"name", t.name}};
+            if (!t.description.empty()) {
+                fn.set("description", t.description);
+            }
+            json::Value params_val = json::Object{{"type", "object"}, {"properties", json::Object{}}};
+            if (!t.parameters_json.empty()) {
+                auto parsed_params = json::parse(t.parameters_json);
+                if (parsed_params.ok() && parsed_params.value().is_object()) {
+                    params_val = std::move(parsed_params).value();
+                }
+            }
+            fn.set("parameters", std::move(params_val));
+            tools_arr.emplace_back(json::Object{{"type", "function"}, {"function", std::move(fn)}});
+        }
+        if (!tools_arr.empty()) {
+            body.set("tools", std::move(tools_arr));
+        }
+    }
     return body;
 }
 
@@ -342,27 +398,72 @@ bool StreamDecoder::on_line(std::string_view line) {
     } else if (const json::Value* m = j.find("message"); m != nullptr && m->is_object()) {
         c.content = str_view(*m, "content");
         c.thinking = str_view(*m, "thinking");
+        if (const json::Value* tcs = m->find("tool_calls"); tcs != nullptr && tcs->is_array()) {
+            for (const auto& item : tcs->as_array()) {
+                if (!item.is_object()) {
+                    continue;
+                }
+                const json::Value* fn = item.find("function");
+                if (fn == nullptr || !fn->is_object()) {
+                    continue;
+                }
+                const std::string name = str_field(*fn, "name");
+                if (name.empty()) {
+                    continue;
+                }
+                ToolCallDelta delta;
+                if (const json::Value* idx_v = fn->find("index");
+                    idx_v != nullptr && idx_v->is_integer() && idx_v->as_int() >= 0 && idx_v->as_int() < 64) {
+                    delta.index = static_cast<std::uint32_t>(idx_v->as_int());
+                    next_tool_call_index_ = std::max(next_tool_call_index_, delta.index + 1);
+                } else if (const json::Value* idx_v2 = item.find("index");
+                           idx_v2 != nullptr && idx_v2->is_integer() && idx_v2->as_int() >= 0 &&
+                           idx_v2->as_int() < 64) {
+                    delta.index = static_cast<std::uint32_t>(idx_v2->as_int());
+                    next_tool_call_index_ = std::max(next_tool_call_index_, delta.index + 1);
+                } else {
+                    delta.index = next_tool_call_index_++;
+                }
+                delta.id = str_field(item, "id");
+                delta.name = name;
+                if (const json::Value* args = fn->find("arguments"); args != nullptr && !args->is_null()) {
+                    delta.arguments_delta = args->is_string() ? args->as_string() : args->dump();
+                } else {
+                    delta.arguments_delta = "{}";
+                }
+                c.tool_calls.push_back(std::move(delta));
+            }
+        }
     }
     if (const json::Value* d = j.find("done"); d != nullptr && d->is_bool()) {
         c.done = d->as_bool();
     }
     c.done_reason = str_view(j, "done_reason");
-    const std::size_t chunk_bytes = c.content.size() + c.thinking.size();
+    std::size_t chunk_bytes = c.content.size() + c.thinking.size();
+    for (const auto& tc : c.tool_calls) {
+        chunk_bytes += tc.id.size() + tc.name.size() + tc.arguments_delta.size();
+    }
     if (max_output_bytes_ > 0 &&
         (chunk_bytes > max_output_bytes_ || output_bytes_ > max_output_bytes_ - chunk_bytes)) {
         error_ = Status(ErrorCode::protocol_error, "ollama: stream output exceeds cumulative byte limit");
         return false;
     }
     output_bytes_ += chunk_bytes;
-    if (!c.content.empty() || !c.thinking.empty()) {
+    if (!c.content.empty() || !c.thinking.empty() || !c.tool_calls.empty()) {
         if (result_.timings.ttft_ms < 0) {
             result_.timings.ttft_ms = ms_between(start_, Clock::now());
         }
         ++result_.timings.content_chunks;
     }
+    if (!c.tool_calls.empty()) {
+        result_.saw_tool_calls = true;
+    }
     if (retain_text_) {
         result_.text.append(c.content);
         result_.thinking.append(c.thinking);
+        for (const auto& tc : c.tool_calls) {
+            result_.tool_calls.push_back(ToolCall{tc.id, tc.name, tc.arguments_delta});
+        }
     }
     if (result_.model.empty()) {
         result_.model = str_field(j, "model");
