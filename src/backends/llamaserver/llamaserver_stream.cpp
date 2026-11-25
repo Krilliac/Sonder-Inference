@@ -1,8 +1,11 @@
 #include "llamaserver_stream.hpp"
 
+#include <cmath>
 #include <functional>
+#include <optional>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "llamaserver_protocol.hpp"
 #include "sonder/inference/json.hpp"
@@ -129,6 +132,9 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
     bool stopped = false, terminal = false, done = false;
     bool usage_prompt = false, usage_completion = false, usage_cache = false;
     std::uint64_t observed_chunks = 0;
+    const bool tools_requested =
+        chat && (request.body.find("\"tools\":[") != std::string::npos ||
+                 request.body.find("\"tools\": [") != std::string::npos);
 
     const auto count = [&](const json::Value &object, const char *key, std::uint64_t &dest) {
         const auto *value = object.find(key);
@@ -218,6 +224,9 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
         std::string reasoning;
         std::string reason;
         bool saw_reasoning_text = false;
+        std::optional<float> chunk_logprob;
+        std::vector<TopLogprob> chunk_top_logprobs;
+        std::vector<ToolCallDelta> chunk_tool_deltas;
         if (native) {
             if (const auto *content = object.find("content")) {
                 if (!content->is_string()) {
@@ -225,6 +234,26 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
                     return false;
                 }
                 piece = content->as_string();
+            }
+            if (const auto *probs = object.find("completion_probabilities");
+                probs && probs->is_array() && !probs->as_array().empty()) {
+                const auto &p0 = probs->as_array().front();
+                if (p0.is_object()) {
+                    if (const auto *lp = p0.find("logprob"); lp && lp->is_number() && std::isfinite(lp->as_double())) {
+                        chunk_logprob = static_cast<float>(lp->as_double());
+                    }
+                    if (const auto *tops = p0.find("top_logprobs"); tops && tops->is_array()) {
+                        for (const auto &entry : tops->as_array()) {
+                            if (!entry.is_object()) continue;
+                            const auto *tok = entry.find("token");
+                            const auto *lp = entry.find("logprob");
+                            if (tok && tok->is_string() && lp && lp->is_number() && std::isfinite(lp->as_double())) {
+                                chunk_top_logprobs.push_back(
+                                    TopLogprob{tok->as_string(), static_cast<float>(lp->as_double())});
+                            }
+                        }
+                    }
+                }
             }
             if (!usage_prompt && count(object, "tokens_evaluated", stats.prompt_tokens))
                 stats.token_counts_from_backend = true;
@@ -275,6 +304,36 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
                         probe = delta->find("reasoning");
                     if (probe && probe->is_string() && !probe->as_string().empty())
                         saw_reasoning_text = true;
+                    // Parse native OpenAI delta.tool_calls when present.
+                    if (tools_requested) {
+                        if (const auto *tcs = delta->find("tool_calls"); tcs && tcs->is_array()) {
+                            for (const auto &item : tcs->as_array()) {
+                                if (!item.is_object()) continue;
+                                ToolCallDelta tcd;
+                                if (const auto *idx = item.find("index"); idx != nullptr) {
+                                    const auto parsed_idx = idx->try_as_int();
+                                    if (!parsed_idx || *parsed_idx < 0 || *parsed_idx >= 64) {
+                                        continue;
+                                    }
+                                    tcd.index = static_cast<std::uint32_t>(*parsed_idx);
+                                }
+                                if (const auto *id = item.find("id"); id && id->is_string()) {
+                                    tcd.id = id->as_string();
+                                }
+                                if (const auto *fn = item.find("function"); fn && fn->is_object()) {
+                                    if (const auto *nm = fn->find("name"); nm && nm->is_string()) {
+                                        tcd.name = nm->as_string();
+                                    }
+                                    if (const auto *args = fn->find("arguments"); args && args->is_string()) {
+                                        tcd.arguments_delta = args->as_string();
+                                    }
+                                }
+                                if (!tcd.id.empty() || !tcd.name.empty() || !tcd.arguments_delta.empty()) {
+                                    chunk_tool_deltas.push_back(std::move(tcd));
+                                }
+                            }
+                        }
+                    }
                 }
                 if (separate_reasoning && delta && delta->is_object()) {
                     // llama-server's OpenAI-compatible reasoning extension is
@@ -291,6 +350,46 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
                         reasoning = value->as_string();
                     }
                 }
+                if (const auto *lp_obj = choice.find("logprobs"); lp_obj && lp_obj->is_object()) {
+                    if (const auto *lp_content = lp_obj->find("content");
+                        lp_content && lp_content->is_array() && !lp_content->as_array().empty()) {
+                        const auto &entry = lp_content->as_array().front();
+                        if (entry.is_object()) {
+                            if (const auto *lp = entry.find("logprob");
+                                lp && lp->is_number() && std::isfinite(lp->as_double())) {
+                                chunk_logprob = static_cast<float>(lp->as_double());
+                            }
+                            if (const auto *tops = entry.find("top_logprobs"); tops && tops->is_array()) {
+                                for (const auto &t : tops->as_array()) {
+                                    if (!t.is_object()) continue;
+                                    const auto *tok = t.find("token");
+                                    const auto *tlp = t.find("logprob");
+                                    if (tok && tok->is_string() && tlp && tlp->is_number() &&
+                                        std::isfinite(tlp->as_double())) {
+                                        chunk_top_logprobs.push_back(
+                                            TopLogprob{tok->as_string(), static_cast<float>(tlp->as_double())});
+                                    }
+                                }
+                            }
+                        }
+                    } else if (const auto *tlps = lp_obj->find("token_logprobs");
+                               tlps && tlps->is_array() && !tlps->as_array().empty()) {
+                        const auto &v0 = tlps->as_array().front();
+                        if (v0.is_number() && std::isfinite(v0.as_double())) {
+                            chunk_logprob = static_cast<float>(v0.as_double());
+                        }
+                        if (const auto *tops = lp_obj->find("top_logprobs");
+                            tops && tops->is_array() && !tops->as_array().empty() &&
+                            tops->as_array().front().is_object()) {
+                            for (const auto &[tok, val] : tops->as_array().front().as_object()) {
+                                if (val.is_number() && std::isfinite(val.as_double())) {
+                                    chunk_top_logprobs.push_back(
+                                        TopLogprob{tok, static_cast<float>(val.as_double())});
+                                }
+                            }
+                        }
+                    }
+                }
                 if (const auto *finish = choice.find("finish_reason"); finish && !finish->is_null()) {
                     if (!finish->is_string()) {
                         error = protocol_error("invalid finish reason");
@@ -305,23 +404,32 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
             return false;
         if (!reason.empty()) {
             if (reason == "tool_calls" || reason == "function_call") {
-                error = {ErrorCode::unsupported,
-                         "llamaserver: tool calls are not represented by the text backend API"};
-                return false;
+                if (tools_requested) {
+                    stats.stop_reason = StopReason::tool_calls;
+                } else {
+                    error = {ErrorCode::unsupported,
+                             "llamaserver: tool calls are not represented by the text backend API"};
+                    return false;
+                }
+            } else {
+                const auto mapped = map_finish_reason(reason);
+                if (mapped == StopReason::none) {
+                    error = protocol_error("unsupported finish reason");
+                    return false;
+                }
+                stats.stop_reason = mapped;
             }
-            const auto mapped = map_finish_reason(reason);
-            if (mapped == StopReason::none) {
-                error = protocol_error("unsupported finish reason");
-                return false;
-            }
-            stats.stop_reason = mapped;
         }
-        if (!piece.empty() || !reasoning.empty() || saw_reasoning_text)
+        if (!piece.empty() || !reasoning.empty() || saw_reasoning_text || !chunk_tool_deltas.empty())
             ++progress_events;
-        if (!piece.empty() || !reasoning.empty()) {
+        if (!piece.empty() || !reasoning.empty() || !chunk_tool_deltas.empty()) {
             ++observed_chunks;
             if (callback) {
-                const bool keep = callback(TokenChunk{piece, stats.chunks, reasoning});
+                TokenChunk chunk{piece, stats.chunks, reasoning};
+                chunk.logprob = chunk_logprob;
+                chunk.top_logprobs = std::move(chunk_top_logprobs);
+                chunk.tool_call_deltas = std::move(chunk_tool_deltas);
+                const bool keep = callback(chunk);
                 ++stats.chunks;
                 if (!keep) {
                     stopped = true;

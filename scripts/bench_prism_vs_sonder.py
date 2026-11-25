@@ -52,6 +52,7 @@ ALL_SUITES = (
     "prefix",
     "decode",
     "concurrency",
+    "batching",
     "keepalive",
     "endpoints",
     "quality",
@@ -614,6 +615,8 @@ class BenchmarkClient:
         extra_body: dict[str, Any] | None = None,
         timeout: float | None = None,
         on_ready: threading.Barrier | None = None,
+        on_first_token: threading.Event | None = None,
+        on_token_n: tuple[int, threading.Event] | None = None,
     ) -> dict[str, Any]:
         """Run one SSE streaming POST /v1/chat/completions and derive exact timing & speculation metrics."""
         req_timeout = self.timeout if timeout is None else float(timeout)
@@ -654,6 +657,7 @@ class BenchmarkClient:
         t0 = time.perf_counter()
         t_first: float | None = None
         token_chunks = 0
+        token_timestamps_s: list[float] = []
         saw_done = False
         finish_reason: str | None = None
         http_status: int | None = None
@@ -675,6 +679,7 @@ class BenchmarkClient:
             if isinstance(top_t, dict):
                 timings_merged.update(top_t)
 
+        streamed = False
         try:
             conn.connect()
             sock = conn.sock
@@ -769,7 +774,12 @@ class BenchmarkClient:
                                 ):
                                     if t_first is None:
                                         t_first = now
+                                        if on_first_token is not None:
+                                            on_first_token.set()
                                     token_chunks += 1
+                                    token_timestamps_s.append(now)
+                                    if on_token_n is not None and token_chunks >= on_token_n[0]:
+                                        on_token_n[1].set()
                                     if isinstance(c_piece, str) and c_piece:
                                         content_parts.append(c_piece)
                                     if isinstance(r_piece, str) and r_piece:
@@ -781,11 +791,19 @@ class BenchmarkClient:
         except (OSError, TimeoutError, http.client.HTTPException, ValueError) as exc:
             error = f"{type(exc).__name__}: {exc}"
         finally:
+            if on_first_token is not None:
+                on_first_token.set()
+            if on_token_n is not None:
+                on_token_n[1].set()
             conn.close()
 
         t_end = time.perf_counter()
         total_s = max(t_end - t0, 0.0)
         ttft_s = (t_first - t0) if (t_first is not None and streamed) else None
+        itl_ms_samples = [
+            max(0.0, (token_timestamps_s[i] - token_timestamps_s[i - 1]) * 1000.0)
+            for i in range(1, len(token_timestamps_s))
+        ]
         if error is None and not saw_done:
             error = "truncated SSE stream (missing [DONE])"
         ok = error is None and http_status == 200 and saw_done
@@ -802,6 +820,7 @@ class BenchmarkClient:
             reasoning="".join(reasoning_parts),
             finish_reason=finish_reason,
             streamed=streamed,
+            itl_ms_samples=itl_ms_samples,
         )
 
 
@@ -819,6 +838,7 @@ def _finalize_stream_metrics(
     reasoning: str,
     finish_reason: str | None,
     streamed: bool = True,
+    itl_ms_samples: list[float] | None = None,
 ) -> dict[str, Any]:
     # Token count resolution: usage.completion_tokens -> timings.predicted_n -> SSE chunk count.
     tokens = token_chunks
@@ -877,6 +897,8 @@ def _finalize_stream_metrics(
         "acceptance_ratio": acceptance_ratio,
     }
 
+    itl_list = [float(x) for x in (itl_ms_samples or []) if _num(x) is not None]
+    itl_stats = summarize_metric(itl_list)
     clean_content = strip_think_blocks(content)
     return {
         "ok": ok,
@@ -892,6 +914,11 @@ def _finalize_stream_metrics(
         "prompt_tokens": prompt_tokens,
         "wall_decode_tps": wall_decode_tps,
         "total_wall_tps": total_wall_tps,
+        "itl_ms": itl_stats,
+        "itl_p50_ms": itl_stats["p50"],
+        "itl_p95_ms": itl_stats["p95"],
+        "max_itl_ms": itl_stats["max"],
+        "itl_samples_ms": itl_list,
         "timings": timings_out,
         "acceptance_ratio": acceptance_ratio,
         "content": content,
@@ -1268,8 +1295,15 @@ def _summarize_stream_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
         "draft_n": summarize_metric((r.get("timings") or {}).get("draft_n") for r in ok_runs),
         "draft_n_accepted": summarize_metric((r.get("timings") or {}).get("draft_n_accepted") for r in ok_runs),
         "acceptance_ratio": summarize_metric(r.get("acceptance_ratio") for r in ok_runs),
+        "itl_p50_ms": summarize_metric(r.get("itl_p50_ms") for r in ok_runs),
+        "itl_p95_ms": summarize_metric(r.get("itl_p95_ms") for r in ok_runs),
+        "max_itl_ms": summarize_metric(r.get("max_itl_ms") for r in ok_runs),
         "runs": [
-            {k: v for k, v in r.items() if k not in ("content", "clean_content", "reasoning_content")}
+            {
+                k: v
+                for k, v in r.items()
+                if k not in ("content", "clean_content", "reasoning_content", "itl_samples_ms")
+            }
             for r in runs
         ],
     }
@@ -1405,28 +1439,89 @@ def run_decode_suite(
     model: str,
     repeats: int,
     max_tokens: int,
-    disable_thinking: bool,
+    max_tokens_explicit: bool = False,
+    disable_thinking: bool = False,
 ) -> dict[str, Any]:
     regimes_out: dict[str, Any] = {}
     for item in corpus.get("decode_regimes") or []:
         rid = str(item["id"])
         resp_fmt = item.get("response_format")
+        turns_cfg = item.get("turns")
+        cap = int(max_tokens) if max_tokens_explicit else int(item.get("max_tokens", max_tokens))
         runs: list[dict[str, Any]] = []
-        for _ in range(repeats):
-            res = client.stream_chat(
-                [{"role": "user", "content": str(item["prompt"])}],
-                model=model,
-                max_tokens=int(max_tokens),
-                temperature=0.0,
-                seed=42,
-                disable_thinking=disable_thinking,
-                response_format=resp_fmt,
-            )
-            runs.append(res)
+        if isinstance(turns_cfg, list) and turns_cfg:
+            sys_prefix = item.get("system_prefix")
+            for r_idx in range(repeats):
+                session_tag = f"bonsai-decode-{rid}-{r_idx + 1:04d}"
+                nonce = hashlib.sha256(session_tag.encode("utf-8")).hexdigest()[:12]
+                messages: list[dict[str, str]] = []
+                if sys_prefix:
+                    messages.append({"role": "system", "content": f"[{nonce} session={session_tag}]\n{sys_prefix}"})
+                last_res: dict[str, Any] | None = None
+                for t_idx, t_cfg in enumerate(turns_cfg):
+                    is_final = t_idx == len(turns_cfg) - 1
+                    user_txt = str(t_cfg["user"])
+                    if not sys_prefix and t_idx == 0:
+                        user_txt = f"[{nonce} session={session_tag}]\n{user_txt}"
+                    messages.append({"role": "user", "content": user_txt})
+                    turn_cap = (
+                        cap
+                        if is_final
+                        else (
+                            min(int(max_tokens), int(t_cfg.get("max_tokens", 48)))
+                            if max_tokens_explicit
+                            else int(t_cfg.get("max_tokens", 48))
+                        )
+                    )
+                    res = client.stream_chat(
+                        list(messages),
+                        model=model,
+                        max_tokens=max(1, turn_cap),
+                        temperature=0.0,
+                        seed=42,
+                        disable_thinking=disable_thinking,
+                        response_format=resp_fmt if is_final else None,
+                        prompt_cache_key=session_tag,
+                    )
+                    last_res = res
+                    if not is_final:
+                        fixed_reply = str(
+                            t_cfg.get("assistant_fixed") or t_cfg.get("assistant_fallback") or "OK."
+                        )
+                        messages.append({"role": "assistant", "content": fixed_reply})
+                if last_res is not None:
+                    runs.append(last_res)
+        elif isinstance(item.get("messages"), list) and item["messages"]:
+            for _ in range(repeats):
+                res = client.stream_chat(
+                    list(item["messages"]),
+                    model=model,
+                    max_tokens=cap,
+                    temperature=0.0,
+                    seed=42,
+                    disable_thinking=disable_thinking,
+                    response_format=resp_fmt,
+                )
+                runs.append(res)
+        else:
+            for _ in range(repeats):
+                res = client.stream_chat(
+                    [{"role": "user", "content": str(item["prompt"])}],
+                    model=model,
+                    max_tokens=cap,
+                    temperature=0.0,
+                    seed=42,
+                    disable_thinking=disable_thinking,
+                    response_format=resp_fmt,
+                )
+                runs.append(res)
         summary = _summarize_stream_runs(runs)
         summary["id"] = rid
         summary["regime"] = item.get("regime", rid)
         summary["response_format"] = resp_fmt
+        if isinstance(turns_cfg, list) and turns_cfg:
+            summary["multi_turn"] = True
+            summary["turn_count"] = len(turns_cfg)
         regimes_out[rid] = summary
     return {"regimes": regimes_out}
 
@@ -1497,6 +1592,271 @@ def run_concurrency_suite(
             "errors": [r.get("error") for r in all_reqs if not r.get("ok")][:3],
         }
     return {"levels": levels_out}
+
+
+def run_batching_suite(
+    client: BenchmarkClient,
+    corpus: dict[str, Any],
+    *,
+    model: str,
+    levels: list[int] | None = None,
+    repeats: int = 2,
+    max_tokens: int = 64,
+    max_tokens_explicit: bool = False,
+    disable_thinking: bool = False,
+) -> dict[str, Any]:
+    """Measure continuous-batching decode scaling (C=1,2,4,8) and chunked-prefill HoL interference."""
+    bcfg = corpus.get("batching") or {}
+    default_levels = [int(x) for x in (bcfg.get("default_levels") or [1, 2, 4, 8])]
+    effective_levels = [max(1, int(x)) for x in (levels if levels else default_levels)]
+    shared_prefix = str(
+        bcfg.get("shared_prefix")
+        or "You are a systems performance engineer advising on continuous batching. Answer concisely."
+    )
+    prompts: list[str] = list(
+        bcfg.get("prompts") or ["Explain why continuous batching improves aggregate decode throughput."]
+    )
+    cap = int(max_tokens) if max_tokens_explicit else int(bcfg.get("max_tokens", min(max_tokens, 64)))
+
+    # ------------------------------------------------------------------
+    # (a) Batched Decode Scaling with Shared Prefix (C=1, 2, 4, 8)
+    # ------------------------------------------------------------------
+    levels_out: dict[str, Any] = {}
+    for c in effective_levels:
+        wave_agg_tps: list[float] = []
+        wave_makespans_ms: list[float] = []
+        all_reqs: list[dict[str, Any]] = []
+
+        for r_idx in range(repeats):
+            barrier = threading.Barrier(c) if c > 1 else None
+
+            def _batch_worker(slot_idx: int) -> dict[str, Any]:
+                base_p = prompts[slot_idx % len(prompts)]
+                messages = [
+                    {"role": "system", "content": shared_prefix},
+                    {"role": "user", "content": f"[Batch-C{c}-R{r_idx + 1}-S{slot_idx + 1}]\n{base_p}"},
+                ]
+                return client.stream_chat(
+                    messages,
+                    model=model,
+                    max_tokens=cap,
+                    temperature=0.0,
+                    seed=42,
+                    disable_thinking=disable_thinking,
+                    on_ready=barrier,
+                )
+
+            t_wave0 = time.perf_counter()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=c) as pool:
+                futs = [pool.submit(_batch_worker, i) for i in range(c)]
+                wave_results = [f.result() for f in futs]
+            makespan_s = max(time.perf_counter() - t_wave0, 1e-9)
+            wave_makespans_ms.append(makespan_s * 1000.0)
+            ok_wave = [w for w in wave_results if w.get("ok")]
+            total_toks = sum(int(w.get("tokens") or 0) for w in ok_wave)
+            if ok_wave and total_toks > 0:
+                wave_agg_tps.append(total_toks / makespan_s)
+            all_reqs.extend(wave_results)
+
+        ok_reqs = [r for r in all_reqs if r.get("ok")]
+        ttft_stats = summarize_metric(r.get("ttft_ms") for r in ok_reqs)
+        pooled_itl = [ms for r in ok_reqs for ms in (r.get("itl_samples_ms") or [])]
+        itl_stats = summarize_metric(pooled_itl)
+        per_stream_p50 = summarize_metric(r.get("itl_p50_ms") for r in ok_reqs)
+        per_stream_p95 = summarize_metric(r.get("itl_p95_ms") for r in ok_reqs)
+        levels_out[str(c)] = {
+            "concurrency": c,
+            "repeats": repeats,
+            "success_count": len(ok_reqs),
+            "total_count": len(all_reqs),
+            "aggregate_tps": summarize_metric(wave_agg_tps),
+            "makespan_ms": summarize_metric(wave_makespans_ms),
+            "ttft_ms": ttft_stats,
+            "ttft_p50_ms": ttft_stats["p50"],
+            "ttft_p95_ms": ttft_stats["p95"],
+            "itl_ms": itl_stats,
+            "itl_p50_ms": itl_stats["p50"],
+            "itl_p95_ms": itl_stats["p95"],
+            "max_itl_ms": itl_stats["max"],
+            "per_stream_itl_p50_ms": per_stream_p50,
+            "per_stream_itl_p95_ms": per_stream_p95,
+            "per_stream_decode_tps": summarize_metric(r.get("wall_decode_tps") for r in ok_reqs),
+            "errors": [r.get("error") for r in all_reqs if not r.get("ok")][:3],
+        }
+
+    c1_med = _num(((levels_out.get("1") or {}).get("aggregate_tps") or {}).get("median"))
+    scaling_factors: dict[str, float | None] = {}
+    for lk, lv in levels_out.items():
+        lv_med = _num((lv.get("aggregate_tps") or {}).get("median"))
+        scaling_factors[lk] = (lv_med / c1_med) if (c1_med and c1_med > 0.0 and lv_med is not None) else None
+
+    speedup_c4_vs_c1 = scaling_factors.get("4")
+    speedup_c8_vs_c1 = scaling_factors.get("8")
+
+    # ------------------------------------------------------------------
+    # (b) Chunked-Prefill Head-of-Line Interference
+    # ------------------------------------------------------------------
+    cp_cfg = bcfg.get("chunked_prefill") or {}
+    decode_prompt = str(
+        cp_cfg.get("decode_prompt")
+        or "List 16 numbered systems principles for low-latency continuous batching, one sentence each."
+    )
+    prefill_prompt = str(
+        cp_cfg.get("prefill_prompt")
+        or ((corpus.get("prefill") or [{}])[-1].get("prompt") or ("Context block. " * 900))
+    )
+    decode_cap = int(max_tokens) if max_tokens_explicit else int(cp_cfg.get("decode_max_tokens", 96))
+    prefill_cap = int(cp_cfg.get("prefill_max_tokens", 16))
+    inject_after = max(1, min(int(cp_cfg.get("inject_after_tokens", 2)), max(1, decode_cap - 1)))
+
+    baseline_all_itl: list[float] = []
+    interfered_all_itl: list[float] = []
+    b_p50s: list[float | None] = []
+    b_p95s: list[float | None] = []
+    b_maxs: list[float | None] = []
+    i_p50s: list[float | None] = []
+    i_p95s: list[float | None] = []
+    i_maxs: list[float | None] = []
+    p95_spikes_ms: list[float] = []
+    p95_spike_ratios: list[float] = []
+    max_spikes_ms: list[float] = []
+    prefill_ttfts: list[float | None] = []
+    hol_runs: list[dict[str, Any]] = []
+    hol_ok_count = 0
+    prefill_ok_count = 0
+    injected_mid_stream_count = 0
+
+    for r_idx in range(repeats):
+        base_res = client.stream_chat(
+            [{"role": "user", "content": f"[HolBase-R{r_idx + 1}]\n{decode_prompt}"}],
+            model=model,
+            max_tokens=decode_cap,
+            temperature=0.0,
+            seed=42,
+            disable_thinking=disable_thinking,
+        )
+
+        trigger_ev = threading.Event()
+        decode_done_ev = threading.Event()
+        injected_mid_stream = False
+        nonce = hashlib.sha256(f"hol-prefill:{r_idx + 1}".encode("utf-8")).hexdigest()[:12]
+        cold_long_prompt = f"[{nonce} hol-run={r_idx + 1}]\n{prefill_prompt}"
+
+        def _run_active_decode() -> dict[str, Any]:
+            try:
+                return client.stream_chat(
+                    [{"role": "user", "content": f"[HolIntr-R{r_idx + 1}]\n{decode_prompt}"}],
+                    model=model,
+                    max_tokens=decode_cap,
+                    temperature=0.0,
+                    seed=42,
+                    disable_thinking=disable_thinking,
+                    on_token_n=(inject_after, trigger_ev),
+                )
+            finally:
+                decode_done_ev.set()
+
+        def _run_injected_prefill() -> dict[str, Any]:
+            nonlocal injected_mid_stream
+            triggered = trigger_ev.wait(timeout=min(client.timeout, 30.0))
+            injected_mid_stream = bool(triggered and not decode_done_ev.is_set())
+            return client.stream_chat(
+                [{"role": "user", "content": cold_long_prompt}],
+                model=model,
+                max_tokens=prefill_cap,
+                temperature=0.0,
+                seed=42,
+                disable_thinking=disable_thinking,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            f_dec = pool.submit(_run_active_decode)
+            f_pre = pool.submit(_run_injected_prefill)
+            intr_res = f_dec.result()
+            pre_res = f_pre.result()
+
+        if injected_mid_stream:
+            injected_mid_stream_count += 1
+        if pre_res.get("ok"):
+            prefill_ok_count += 1
+            prefill_ttfts.append(pre_res.get("ttft_ms"))
+
+        b_p95 = _num(base_res.get("itl_p95_ms")) if base_res.get("ok") else None
+        b_max = _num(base_res.get("max_itl_ms")) if base_res.get("ok") else None
+        i_p95 = _num(intr_res.get("itl_p95_ms")) if intr_res.get("ok") else None
+        i_max = _num(intr_res.get("max_itl_ms")) if intr_res.get("ok") else None
+
+        if base_res.get("ok"):
+            baseline_all_itl.extend(base_res.get("itl_samples_ms") or [])
+            b_p50s.append(base_res.get("itl_p50_ms"))
+            b_p95s.append(b_p95)
+            b_maxs.append(b_max)
+        if intr_res.get("ok"):
+            hol_ok_count += 1
+            interfered_all_itl.extend(intr_res.get("itl_samples_ms") or [])
+            i_p50s.append(intr_res.get("itl_p50_ms"))
+            i_p95s.append(i_p95)
+            i_maxs.append(i_max)
+
+        p95_spike_ms = (i_p95 - b_p95) if (i_p95 is not None and b_p95 is not None) else None
+        p95_spike_ratio = (i_p95 / b_p95) if (i_p95 is not None and b_p95 is not None and b_p95 > 0.0) else None
+        max_spike_ms = (i_max - b_max) if (i_max is not None and b_max is not None) else None
+        if p95_spike_ms is not None:
+            p95_spikes_ms.append(p95_spike_ms)
+        if p95_spike_ratio is not None:
+            p95_spike_ratios.append(p95_spike_ratio)
+        if max_spike_ms is not None:
+            max_spikes_ms.append(max_spike_ms)
+
+        hol_runs.append({
+            "repeat": r_idx + 1,
+            "baseline_ok": bool(base_res.get("ok")),
+            "interfered_ok": bool(intr_res.get("ok")),
+            "prefill_ok": bool(pre_res.get("ok")),
+            "injected_mid_stream": injected_mid_stream,
+            "baseline_itl_p95_ms": b_p95,
+            "baseline_max_itl_ms": b_max,
+            "interfered_itl_p95_ms": i_p95,
+            "interfered_max_itl_ms": i_max,
+            "p95_itl_spike_ms": p95_spike_ms,
+            "p95_itl_spike_ratio": p95_spike_ratio,
+            "max_itl_spike_ms": max_spike_ms,
+            "prefill_ttft_ms": pre_res.get("ttft_ms"),
+            "prefill_prompt_tokens": pre_res.get("prompt_tokens"),
+        })
+
+    return {
+        "batched_decode": {
+            "levels": levels_out,
+            "scaling_factors": scaling_factors,
+            "speedup_c4_vs_c1": speedup_c4_vs_c1,
+            "speedup_c8_vs_c1": speedup_c8_vs_c1,
+        },
+        "speedup_c4_vs_c1": speedup_c4_vs_c1,
+        "chunked_prefill_interference": {
+            "repeats": repeats,
+            "inject_after_tokens": inject_after,
+            "prefill_approx_tokens": int(cp_cfg.get("prefill_approx_tokens") or max(1, (len(prefill_prompt) + 3) // 4)),
+            "decode_max_tokens": decode_cap,
+            "prefill_max_tokens": prefill_cap,
+            "ok_count": hol_ok_count,
+            "prefill_ok_count": prefill_ok_count,
+            "injected_mid_stream_count": injected_mid_stream_count,
+            "baseline_itl_ms": summarize_metric(baseline_all_itl),
+            "baseline_itl_p50_ms": summarize_metric(b_p50s),
+            "baseline_itl_p95_ms": summarize_metric(b_p95s),
+            "baseline_max_itl_ms": summarize_metric(b_maxs),
+            "interfered_itl_ms": summarize_metric(interfered_all_itl),
+            "interfered_itl_p50_ms": summarize_metric(i_p50s),
+            "interfered_itl_p95_ms": summarize_metric(i_p95s),
+            "max_itl_ms": summarize_metric(i_maxs),
+            "p95_itl_spike_ms": summarize_metric(p95_spikes_ms),
+            "p95_itl_spike_ratio": summarize_metric(p95_spike_ratios),
+            "max_itl_spike_ms": summarize_metric(max_spikes_ms),
+            "prefill_ttft_ms": summarize_metric(prefill_ttfts),
+            "runs": hol_runs,
+        },
+    }
 
 
 def run_keepalive_suite(
@@ -1636,6 +1996,7 @@ def run_endpoints_suite(
     ok_models = st == 200 and isinstance(body, dict) and isinstance(body.get("data"), list)
     probes.append({
         "id": "models",
+        "category": "core",
         "endpoint": "GET /v1/models",
         "http_status": st,
         "supported": ok_models,
@@ -1654,6 +2015,7 @@ def run_endpoints_suite(
     )
     probes.append({
         "id": "chat_stream",
+        "category": "core",
         "endpoint": "POST /v1/chat/completions (stream)",
         "http_status": stream_res["http_status"],
         "supported": bool(stream_res["ok"]),
@@ -1675,6 +2037,7 @@ def run_endpoints_suite(
     ok_chat_ns = st == 200 and isinstance(body, dict) and isinstance(body.get("choices"), list) and len(body["choices"]) > 0
     probes.append({
         "id": "chat_non_stream",
+        "category": "core",
         "endpoint": "POST /v1/chat/completions (non-stream)",
         "http_status": st,
         "supported": ok_chat_ns,
@@ -1697,6 +2060,7 @@ def run_endpoints_suite(
             ok_json_fmt = False
     probes.append({
         "id": "chat_json_object",
+        "category": "core",
         "endpoint": "POST /v1/chat/completions (json_object)",
         "http_status": st,
         "supported": ok_json_fmt,
@@ -1715,6 +2079,7 @@ def run_endpoints_suite(
     ok_cmpl = st == 200 and isinstance(body, dict) and isinstance(body.get("choices"), list) and len(body["choices"]) > 0
     probes.append({
         "id": "completions",
+        "category": "core",
         "endpoint": "POST /v1/completions",
         "http_status": st,
         "supported": ok_cmpl,
@@ -1733,6 +2098,7 @@ def run_endpoints_suite(
     )
     probes.append({
         "id": "embeddings",
+        "category": "core",
         "endpoint": "POST /v1/embeddings",
         "http_status": st,
         "supported": ok_emb,
@@ -1745,6 +2111,7 @@ def run_endpoints_suite(
     ok_tok = st == 200 and isinstance(body, dict) and isinstance(body.get("tokens"), list)
     probes.append({
         "id": "tokenize",
+        "category": "core",
         "endpoint": "POST /v1/tokenize",
         "http_status": st,
         "supported": ok_tok,
@@ -1756,17 +2123,126 @@ def run_endpoints_suite(
     ok_shealth = st == 200 and isinstance(body, dict)
     probes.append({
         "id": "sonder_health",
+        "category": "core",
         "endpoint": "GET /v1/sonder/health",
         "http_status": st,
         "supported": ok_shealth,
         "latency_ms": ms,
     })
 
+    # 9. [Frontier] POST /v1/chat/completions (tools + tool_choice="required")
+    tools_body = dict(chat_body)
+    tools_body["messages"] = [
+        {"role": "user", "content": "Check the weather in Austin, TX using the get_weather tool."}
+    ]
+    tools_body["max_tokens"] = 64
+    tools_body["tools"] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the current weather for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string", "description": "City name"},
+                    },
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+    tools_body["tool_choice"] = "required"
+    st, body, ms, _ = client.request_json("POST", client.oai_path("/chat/completions"), tools_body, timeout=30.0)
+    ok_tools = False
+    if st == 200 and isinstance(body, dict) and isinstance(body.get("choices"), list) and body["choices"]:
+        msg_obj = (body["choices"][0] or {}).get("message") or {}
+        tcalls = msg_obj.get("tool_calls")
+        if isinstance(tcalls, list) and len(tcalls) > 0 and isinstance(tcalls[0], dict):
+            fn = tcalls[0].get("function")
+            if isinstance(fn, dict) and isinstance(fn.get("name"), str) and fn["name"].strip():
+                raw_args = fn.get("arguments")
+                if isinstance(raw_args, str):
+                    try:
+                        json.loads(raw_args)
+                        ok_tools = True
+                    except ValueError:
+                        ok_tools = False
+    probes.append({
+        "id": "chat_tools",
+        "category": "frontier",
+        "endpoint": "POST /v1/chat/completions (tools)",
+        "http_status": st,
+        "supported": ok_tools,
+        "latency_ms": ms,
+    })
+
+    # 10. [Frontier] POST /v1/responses (OpenAI Responses API)
+    resp_api_body: dict[str, Any] = {
+        "model": model,
+        "input": "Reply with OK.",
+        "max_output_tokens": 16,
+        "temperature": 0.0,
+        "stream": False,
+    }
+    st, body, ms, _ = client.request_json("POST", client.oai_path("/responses"), resp_api_body, timeout=30.0)
+    ok_responses = (
+        st == 200
+        and isinstance(body, dict)
+        and body.get("object") == "response"
+        and isinstance(body.get("id"), str)
+        and bool(body["id"].strip())
+        and isinstance(body.get("output"), list)
+    )
+    probes.append({
+        "id": "responses",
+        "category": "frontier",
+        "endpoint": "POST /v1/responses",
+        "http_status": st,
+        "supported": ok_responses,
+        "latency_ms": ms,
+    })
+
+    # 11. [Frontier] POST /v1/chat/completions (logprobs=true, top_logprobs=3)
+    lp_body = dict(chat_body)
+    lp_body["messages"] = [{"role": "user", "content": "Reply with OK."}]
+    lp_body["max_tokens"] = 8
+    lp_body["logprobs"] = True
+    lp_body["top_logprobs"] = 3
+    st, body, ms, _ = client.request_json("POST", client.oai_path("/chat/completions"), lp_body, timeout=30.0)
+    ok_logprobs = False
+    if st == 200 and isinstance(body, dict) and isinstance(body.get("choices"), list) and body["choices"]:
+        lp_obj = (body["choices"][0] or {}).get("logprobs")
+        if isinstance(lp_obj, dict) and isinstance(lp_obj.get("content"), list) and len(lp_obj["content"]) > 0:
+            tok0 = lp_obj["content"][0]
+            if (
+                isinstance(tok0, dict)
+                and _num(tok0.get("logprob")) is not None
+                and isinstance(tok0.get("top_logprobs"), list)
+                and len(tok0["top_logprobs"]) >= 1
+            ):
+                ok_logprobs = True
+    probes.append({
+        "id": "chat_logprobs",
+        "category": "frontier",
+        "endpoint": "POST /v1/chat/completions (logprobs)",
+        "http_status": st,
+        "supported": ok_logprobs,
+        "latency_ms": ms,
+    })
+
+    core_probes = [p for p in probes if p.get("category") == "core"]
+    frontier_probes = [p for p in probes if p.get("category") == "frontier"]
     supported_count = sum(1 for p in probes if p["supported"])
     return {
         "supported_count": supported_count,
         "total_count": len(probes),
+        "core_supported_count": sum(1 for p in core_probes if p["supported"]),
+        "core_total_count": len(core_probes),
+        "frontier_supported_count": sum(1 for p in frontier_probes if p["supported"]),
+        "frontier_total_count": len(frontier_probes),
         "probes": probes,
+        "frontier_probes": frontier_probes,
         "by_id": {p["id"]: p for p in probes},
     }
 
@@ -2313,9 +2789,28 @@ def render_markdown_report(report: dict[str, Any], *, tie_pct: float = 1.0) -> s
     )
     lines.append(
         f"- **Settings**: mode=`{cfg_meta.get('mode')}`, suites=`{','.join(cfg_meta.get('suites') or [])}`, "
-        f"repeats=`{cfg_meta.get('repeats')}`, max_tokens=`{cfg_meta.get('max_tokens')}`, "
+        f"repeats=`{cfg_meta.get('repeats')}`, rounds=`{cfg_meta.get('rounds', 1)}`, "
+        f"alternate_order=`{cfg_meta.get('alternate_order', False)}`, max_tokens=`{cfg_meta.get('max_tokens')}`, "
         f"disable_thinking=`{cfg_meta.get('disable_thinking')}`, tie_band=`±{tie_pct:.1f}%`"
     )
+    order_confounded = cfg_meta.get("order_confounded")
+    round_schedule = cfg_meta.get("round_schedule") or []
+    if order_confounded:
+        lines.append(
+            "- **Order Confounding**: **WARNING — order confounded** (targets ran in a fixed order without "
+            "AB/BA counterbalancing; pass `--rounds 2 --alternate-order` to counterbalance page-cache and thermal drift)"
+        )
+    elif len(targets) > 1:
+        sched_txt = ", ".join(
+            f"R{idx + 1}: `{' -> '.join(order)}`" for idx, order in enumerate(round_schedule)
+        )
+        sched_note = f" (schedule: {sched_txt})" if sched_txt else ""
+        lines.append(
+            f"- **Order Confounding**: **Counterbalanced (AB/BA)** across `{cfg_meta.get('rounds', 1)}` rounds"
+            f"{sched_note}; target tables report paired medians across rounds"
+        )
+    else:
+        lines.append("- **Order Confounding**: `false` (single target)")
     lines.append(f"- **Generated**: `{report.get('timestamp')}` on `{report.get('platform')}`")
     lines.append("")
 
@@ -2494,9 +2989,98 @@ def render_markdown_report(report: dict[str, Any], *, tie_pct: float = 1.0) -> s
                     )
             lines.append("")
 
-        # 5. Keep-Alive vs Fresh Socket Overhead
+        # 5. Continuous Batching & Chunked-Prefill Interleaving
+        if "batching" in bsuites:
+            lines.append("### 5. Continuous Batching & Chunked-Prefill Interleaving")
+            lines.append("")
+            bb = bsuites["batching"]
+            cb = csuites.get("batching") or {}
+            b_bd = bb.get("batched_decode") or {}
+            c_bd = cb.get("batched_decode") or {}
+            b_blevs = b_bd.get("levels") or {}
+            c_blevs = c_bd.get("levels") or {}
+            lines.append("#### 5a. Batched Decode Scaling (Shared Prefix — higher Agg tok/s, lower ITL is better)")
+            lines.append("")
+            if cand_t:
+                lines.append(
+                    f"| Level | `{bname}` Agg tok/s (med) | `{cname}` Agg tok/s (med) | `% Delta` | Verdict | "
+                    f"`{bname}` ITL p50/p95 ms | `{cname}` ITL p50/p95 ms | OK (`{bname}` / `{cname}`) |"
+                )
+                lines.append("|---|---:|---:|---:|---|---:|---:|---:|")
+                for lk, bl in b_blevs.items():
+                    cl = c_blevs.get(lk) or {}
+                    d_str, verd = _delta_verdict(
+                        (bl.get("aggregate_tps") or {}).get("median"),
+                        (cl.get("aggregate_tps") or {}).get("median"),
+                        lower_is_better=False,
+                        tie_pct=tie_pct,
+                    )
+                    lines.append(
+                        f"| `C={lk}` | {_fmt((bl.get('aggregate_tps') or {}).get('median'))} | "
+                        f"{_fmt((cl.get('aggregate_tps') or {}).get('median'))} | {d_str} | **{verd}** | "
+                        f"{_fmt(bl.get('itl_p50_ms'))} / {_fmt(bl.get('itl_p95_ms'))} | "
+                        f"{_fmt(cl.get('itl_p50_ms'))} / {_fmt(cl.get('itl_p95_ms'))} | "
+                        f"{bl.get('success_count')}/{bl.get('total_count')} vs "
+                        f"{cl.get('success_count', 0)}/{cl.get('total_count', 0)} |"
+                    )
+                b_spd4 = b_bd.get("speedup_c4_vs_c1")
+                c_spd4 = c_bd.get("speedup_c4_vs_c1")
+                d_s4, v_s4 = _delta_verdict(b_spd4, c_spd4, lower_is_better=False, tie_pct=tie_pct)
+                lines.append("")
+                lines.append(
+                    f"- Continuous batching scaling speedup `agg_tps(C=4) / agg_tps(C=1)`: "
+                    f"`{bname}` = `{_fmt(b_spd4, 2)}x`, `{cname}` = `{_fmt(c_spd4, 2)}x` (`{d_s4}`, **{v_s4}**)"
+                )
+            else:
+                lines.append(f"| Level | `{bname}` Agg tok/s (med) | ITL p50 / p95 / Max (ms) | OK |")
+                lines.append("|---|---:|---:|---:|")
+                for lk, bl in b_blevs.items():
+                    lines.append(
+                        f"| `C={lk}` | {_fmt((bl.get('aggregate_tps') or {}).get('median'))} | "
+                        f"{_fmt(bl.get('itl_p50_ms'))} / {_fmt(bl.get('itl_p95_ms'))} / {_fmt(bl.get('max_itl_ms'))} | "
+                        f"{bl.get('success_count')}/{bl.get('total_count')} |"
+                    )
+                lines.append("")
+                lines.append(
+                    f"- Continuous batching scaling speedup `agg_tps(C=4) / agg_tps(C=1)`: "
+                    f"`{_fmt(b_bd.get('speedup_c4_vs_c1'), 2)}x`"
+                )
+            lines.append("")
+
+            b_cp = bb.get("chunked_prefill_interference") or {}
+            c_cp = cb.get("chunked_prefill_interference") or {}
+            lines.append(
+                f"#### 5b. Chunked-Prefill Head-of-Line Interference "
+                f"(~{b_cp.get('prefill_approx_tokens', 2800)}-tok injected prefill — lower ITL gap is better)"
+            )
+            lines.append("")
+            if cand_t:
+                lines.append(f"| Metric | `{bname}` | `{cname}` | `% Delta` | Verdict |")
+                lines.append("|---|---:|---:|---:|---|")
+                hol_rows = [
+                    ("Baseline Decode ITL p95 (ms)", (b_cp.get("baseline_itl_p95_ms") or {}).get("median"), (c_cp.get("baseline_itl_p95_ms") or {}).get("median"), True, 1),
+                    ("Interfered Decode ITL p95 (ms)", (b_cp.get("interfered_itl_p95_ms") or {}).get("median"), (c_cp.get("interfered_itl_p95_ms") or {}).get("median"), True, 1),
+                    ("p95 ITL Spike (ms)", (b_cp.get("p95_itl_spike_ms") or {}).get("median"), (c_cp.get("p95_itl_spike_ms") or {}).get("median"), True, 1),
+                    ("p95 ITL Spike Ratio (x)", (b_cp.get("p95_itl_spike_ratio") or {}).get("median"), (c_cp.get("p95_itl_spike_ratio") or {}).get("median"), True, 2),
+                    ("Max Inter-Token Gap (`max_itl_ms`)", (b_cp.get("max_itl_ms") or {}).get("median"), (c_cp.get("max_itl_ms") or {}).get("median"), True, 1),
+                    ("Injected Prefill TTFT (ms)", (b_cp.get("prefill_ttft_ms") or {}).get("median"), (c_cp.get("prefill_ttft_ms") or {}).get("median"), True, 1),
+                ]
+                for label, bv, cv, lower_better, digs in hol_rows:
+                    d_str, verd = _delta_verdict(bv, cv, lower_is_better=lower_better, tie_pct=tie_pct)
+                    lines.append(f"| {label} | {_fmt(bv, digs)} | {_fmt(cv, digs)} | {d_str} | **{verd}** |")
+            else:
+                lines.append(f"| Metric | `{bname}` |")
+                lines.append("|---|---:|")
+                lines.append(f"| Baseline Decode ITL p95 (ms) | {_fmt((b_cp.get('baseline_itl_p95_ms') or {}).get('median'))} |")
+                lines.append(f"| Interfered Decode ITL p95 (ms) | {_fmt((b_cp.get('interfered_itl_p95_ms') or {}).get('median'))} |")
+                lines.append(f"| p95 ITL Spike (ms / ratio) | {_fmt((b_cp.get('p95_itl_spike_ms') or {}).get('median'))} / {_fmt((b_cp.get('p95_itl_spike_ratio') or {}).get('median'), 2)}x |")
+                lines.append(f"| Max Inter-Token Gap (`max_itl_ms`) | {_fmt((b_cp.get('max_itl_ms') or {}).get('median'))} |")
+                lines.append(f"| Injected Prefill TTFT (ms) | {_fmt((b_cp.get('prefill_ttft_ms') or {}).get('median'))} |")
+            lines.append("")
+
+        # 6. Keep-Alive vs Fresh Socket Overhead
         if "keepalive" in bsuites:
-            lines.append("### 5. HTTP Keep-Alive vs Fresh-Socket Overhead (ms — lower is better)")
+            lines.append("### 6. HTTP Keep-Alive vs Fresh-Socket Overhead (ms — lower is better)")
             lines.append("")
             bka = bsuites["keepalive"]
             lines.append("| Target | Keep-Alive med/mean (ms) | Fresh-Socket med/mean (ms) | Reuse Speedup | Reused / Conns |")
@@ -2525,31 +3109,45 @@ def render_markdown_report(report: dict[str, Any], *, tie_pct: float = 1.0) -> s
                 lines.append(f"- Keep-alive median latency delta (`{cname}` vs `{bname}`): `{d_str}` (**{verd}**)")
             lines.append("")
 
-        # 6. Endpoint Parity Matrix
+        # 7. Endpoint Parity Matrix
         if "endpoints" in bsuites:
-            lines.append("### 6. Endpoint Parity Matrix")
+            lines.append("### 7. Endpoint Parity Matrix")
             lines.append("")
-            beps = bsuites["endpoints"].get("probes") or []
-            ceps_by_id = ((csuites.get("endpoints") or {}).get("by_id")) or {}
+            bep_suite = bsuites["endpoints"]
+            cep_suite = csuites.get("endpoints") or {}
+            beps = bep_suite.get("probes") or []
+            ceps_by_id = (cep_suite.get("by_id")) or {}
             if cand_t:
-                lines.append(f"| Endpoint | `{bname}` | `{cname}` |")
-                lines.append("|---|---|---|")
+                lines.append(f"| Endpoint | Tier | `{bname}` | `{cname}` |")
+                lines.append("|---|---|---|---|")
                 for bp_ep in beps:
                     cp_ep = ceps_by_id.get(bp_ep["id"]) or {}
+                    tier = str(bp_ep.get("category") or "core")
                     b_cell = f"{'PASS' if bp_ep['supported'] else 'UNSUPPORTED'} (`{bp_ep.get('http_status')}`)"
                     c_cell = f"{'PASS' if cp_ep.get('supported') else 'UNSUPPORTED'} (`{cp_ep.get('http_status')}`)"
-                    lines.append(f"| `{bp_ep['endpoint']}` | {b_cell} | {c_cell} |")
+                    lines.append(f"| `{bp_ep['endpoint']}` | `{tier}` | {b_cell} | {c_cell} |")
+                lines.append("")
+                lines.append(
+                    f"- Total endpoints supported: `{bname}` = "
+                    f"`{bep_suite.get('supported_count')}/{bep_suite.get('total_count')}` "
+                    f"(core `{bep_suite.get('core_supported_count', '-')}/{bep_suite.get('core_total_count', '-')}`, "
+                    f"frontier `{bep_suite.get('frontier_supported_count', '-')}/{bep_suite.get('frontier_total_count', '-')}`), "
+                    f"`{cname}` = `{cep_suite.get('supported_count', 0)}/{cep_suite.get('total_count', 0)}` "
+                    f"(core `{cep_suite.get('core_supported_count', '-')}/{cep_suite.get('core_total_count', '-')}`, "
+                    f"frontier `{cep_suite.get('frontier_supported_count', '-')}/{cep_suite.get('frontier_total_count', '-')}`)"
+                )
             else:
-                lines.append(f"| Endpoint | `{bname}` |")
-                lines.append("|---|---|")
+                lines.append(f"| Endpoint | Tier | `{bname}` |")
+                lines.append("|---|---|---|")
                 for bp_ep in beps:
+                    tier = str(bp_ep.get("category") or "core")
                     b_cell = f"{'PASS' if bp_ep['supported'] else 'UNSUPPORTED'} (`{bp_ep.get('http_status')}`)"
-                    lines.append(f"| `{bp_ep['endpoint']}` | {b_cell} |")
+                    lines.append(f"| `{bp_ep['endpoint']}` | `{tier}` | {b_cell} |")
             lines.append("")
 
-        # 7. Quality & Cross-Target Output Parity
+        # 8. Quality & Cross-Target Output Parity
         if "quality" in bsuites:
-            lines.append("### 7. Quality & Cross-Target Output Parity (`temperature=0, seed=42`)")
+            lines.append("### 8. Quality & Cross-Target Output Parity (`temperature=0, seed=42`)")
             lines.append("")
             bq = bsuites["quality"]
             cq = csuites.get("quality") or {}
@@ -2596,7 +3194,510 @@ def render_markdown_report(report: dict[str, Any], *, tie_pct: float = 1.0) -> s
             )
         lines.append("")
 
+    paired_summary = report.get("paired_round_summary")
+    if isinstance(paired_summary, dict) and paired_summary.get("comparisons"):
+        lines.append("### AB/BA Counterbalanced Paired-Round Summary")
+        lines.append("")
+        lines.append(
+            f"| Baseline | Challenger | Metric | Rounds | `{paired_summary['baseline']}` Med | "
+            "Challenger Med | Paired `% Delta` (med) | Verdict |"
+        )
+        lines.append("|---|---|---|---:|---:|---:|---:|---|")
+        for comp in paired_summary["comparisons"]:
+            for mrow in comp.get("metrics") or []:
+                d_pct = _num(mrow.get("paired_delta_pct_median"))
+                if d_pct is None:
+                    d_str, verd = "—", "—"
+                else:
+                    d_str = f"{d_pct:+.1f}%"
+                    if abs(d_pct) < tie_pct:
+                        verd = "TIE"
+                    else:
+                        improved = (d_pct < 0.0) if mrow.get("lower_is_better") else (d_pct > 0.0)
+                        verd = "WIN" if improved else "LOSS"
+                lines.append(
+                    f"| `{comp['baseline']}` | `{comp['target']}` | `{mrow['metric']}` | "
+                    f"{mrow['paired_rounds']} | {_fmt(mrow.get('baseline_median'), 2)} | "
+                    f"{_fmt(mrow.get('target_median'), 2)} | {d_str} | **{verd}** |"
+                )
+        lines.append("")
+
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Multi-Round AB/BA Aggregation & Paired Median Summary
+# ---------------------------------------------------------------------------
+
+
+def _metric_center(stat: Any) -> float | None:
+    if not isinstance(stat, dict):
+        return _num(stat)
+    val = _num(stat.get("median"))
+    return val if val is not None else _num(stat.get("mean"))
+
+
+def _aggregate_metric_dicts(metrics: Iterable[dict[str, Any] | None]) -> dict[str, Any]:
+    centers = [_metric_center(m) for m in metrics]
+    return summarize_metric(centers)
+
+
+def _aggregate_stream_summary_rounds(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    metric_keys = (
+        "ttft_ms",
+        "wall_decode_tps",
+        "total_wall_tps",
+        "total_ms",
+        "tokens",
+        "prompt_tokens",
+        "server_prompt_ms",
+        "server_prompt_tps",
+        "server_decode_ms",
+        "server_decode_tps",
+        "cache_n",
+        "draft_n",
+        "draft_n_accepted",
+        "acceptance_ratio",
+        "itl_p50_ms",
+        "itl_p95_ms",
+        "max_itl_ms",
+    )
+    out: dict[str, Any] = {
+        "ok_count": sum(int(s.get("ok_count") or 0) for s in summaries),
+        "total_count": sum(int(s.get("total_count") or 0) for s in summaries),
+        "errors": [e for s in summaries for e in (s.get("errors") or [])][:3],
+        "rounds": len(summaries),
+    }
+    for mk in metric_keys:
+        out[mk] = _aggregate_metric_dicts(s.get(mk) for s in summaries)
+    all_runs: list[dict[str, Any]] = []
+    for r_idx, s in enumerate(summaries, start=1):
+        for run in s.get("runs") or []:
+            entry = dict(run)
+            entry["round"] = r_idx
+            all_runs.append(entry)
+    out["runs"] = all_runs
+    return out
+
+
+def _aggregate_suite_rounds(suite_name: str, suite_rounds: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(suite_rounds) == 1:
+        return suite_rounds[0]
+
+    if suite_name == "prefill":
+        cases_out: dict[str, Any] = {}
+        case_ids = list((suite_rounds[0].get("cases") or {}).keys())
+        for cid in case_ids:
+            c_list = [(sr.get("cases") or {}).get(cid) for sr in suite_rounds]
+            valid = [c for c in c_list if isinstance(c, dict)]
+            if not valid:
+                continue
+            agg = _aggregate_stream_summary_rounds(valid)
+            for k in ("id", "label", "target_tokens", "approx_tokens"):
+                if k in valid[0]:
+                    agg[k] = valid[0][k]
+            cases_out[cid] = agg
+        return {"cases": cases_out, "rounds": len(suite_rounds)}
+
+    if suite_name == "prefix":
+        cold_agg = _aggregate_stream_summary_rounds([sr["cold"] for sr in suite_rounds if isinstance(sr.get("cold"), dict)])
+        warm_agg = _aggregate_stream_summary_rounds([sr["warm"] for sr in suite_rounds if isinstance(sr.get("warm"), dict)])
+        turn_keys = list((suite_rounds[0].get("turns") or {}).keys())
+        turns_agg = {
+            tk: _aggregate_stream_summary_rounds(
+                [(sr.get("turns") or {})[tk] for sr in suite_rounds if tk in (sr.get("turns") or {})]
+            )
+            for tk in turn_keys
+        }
+        return {
+            "id": suite_rounds[0].get("id", "prefix_3turn"),
+            "target_shared_tokens": suite_rounds[0].get("target_shared_tokens"),
+            "rounds": len(suite_rounds),
+            "cold": cold_agg,
+            "warm": warm_agg,
+            "turns": turns_agg,
+            "cold_ttft_ms": _aggregate_metric_dicts(sr.get("cold_ttft_ms") for sr in suite_rounds),
+            "warm_ttft_ms": _aggregate_metric_dicts(sr.get("warm_ttft_ms") for sr in suite_rounds),
+            "warm_cache_n": _aggregate_metric_dicts(sr.get("warm_cache_n") for sr in suite_rounds),
+            "cold_cache_n": _aggregate_metric_dicts(sr.get("cold_cache_n") for sr in suite_rounds),
+            "speedup": _aggregate_metric_dicts(sr.get("speedup") for sr in suite_rounds),
+            "speedup_median_ratio": median_of(sr.get("speedup_median_ratio") for sr in suite_rounds),
+            "speedup_mean_ratio": median_of(sr.get("speedup_mean_ratio") for sr in suite_rounds),
+        }
+
+    if suite_name == "decode":
+        regs_out: dict[str, Any] = {}
+        rids = list((suite_rounds[0].get("regimes") or {}).keys())
+        for rid in rids:
+            r_list = [(sr.get("regimes") or {}).get(rid) for sr in suite_rounds]
+            valid = [r for r in r_list if isinstance(r, dict)]
+            if not valid:
+                continue
+            agg = _aggregate_stream_summary_rounds(valid)
+            for k in ("id", "regime", "response_format", "multi_turn", "turn_count"):
+                if k in valid[0]:
+                    agg[k] = valid[0][k]
+            regs_out[rid] = agg
+        return {"regimes": regs_out, "rounds": len(suite_rounds)}
+
+    if suite_name == "concurrency":
+        levels_out: dict[str, Any] = {}
+        lks = list((suite_rounds[0].get("levels") or {}).keys())
+        for lk in lks:
+            l_list = [(sr.get("levels") or {}).get(lk) for sr in suite_rounds]
+            valid = [lv for lv in l_list if isinstance(lv, dict)]
+            if not valid:
+                continue
+            levels_out[lk] = {
+                "concurrency": valid[0]["concurrency"],
+                "repeats": sum(int(lv.get("repeats") or 0) for lv in valid),
+                "rounds": len(valid),
+                "success_count": sum(int(lv.get("success_count") or 0) for lv in valid),
+                "total_count": sum(int(lv.get("total_count") or 0) for lv in valid),
+                "aggregate_tps": _aggregate_metric_dicts(lv.get("aggregate_tps") for lv in valid),
+                "makespan_ms": _aggregate_metric_dicts(lv.get("makespan_ms") for lv in valid),
+                "ttft_ms": _aggregate_metric_dicts(lv.get("ttft_ms") for lv in valid),
+                "ttft_p50_ms": median_of(lv.get("ttft_p50_ms") for lv in valid),
+                "ttft_p95_ms": median_of(lv.get("ttft_p95_ms") for lv in valid),
+                "per_stream_decode_tps": _aggregate_metric_dicts(lv.get("per_stream_decode_tps") for lv in valid),
+                "errors": [e for lv in valid for e in (lv.get("errors") or [])][:3],
+            }
+        return {"levels": levels_out, "rounds": len(suite_rounds)}
+
+    if suite_name == "batching":
+        bd_rounds = [sr.get("batched_decode") or {} for sr in suite_rounds]
+        lks = list((bd_rounds[0].get("levels") or {}).keys())
+        levels_out = {}
+        for lk in lks:
+            valid = [(bd.get("levels") or {}).get(lk) for bd in bd_rounds if isinstance((bd.get("levels") or {}).get(lk), dict)]
+            if not valid:
+                continue
+            levels_out[lk] = {
+                "concurrency": valid[0]["concurrency"],
+                "repeats": sum(int(lv.get("repeats") or 0) for lv in valid),
+                "rounds": len(valid),
+                "success_count": sum(int(lv.get("success_count") or 0) for lv in valid),
+                "total_count": sum(int(lv.get("total_count") or 0) for lv in valid),
+                "aggregate_tps": _aggregate_metric_dicts(lv.get("aggregate_tps") for lv in valid),
+                "makespan_ms": _aggregate_metric_dicts(lv.get("makespan_ms") for lv in valid),
+                "ttft_ms": _aggregate_metric_dicts(lv.get("ttft_ms") for lv in valid),
+                "ttft_p50_ms": median_of(lv.get("ttft_p50_ms") for lv in valid),
+                "ttft_p95_ms": median_of(lv.get("ttft_p95_ms") for lv in valid),
+                "itl_ms": _aggregate_metric_dicts(lv.get("itl_ms") for lv in valid),
+                "itl_p50_ms": median_of(lv.get("itl_p50_ms") for lv in valid),
+                "itl_p95_ms": median_of(lv.get("itl_p95_ms") for lv in valid),
+                "max_itl_ms": median_of(lv.get("max_itl_ms") for lv in valid),
+                "per_stream_itl_p50_ms": _aggregate_metric_dicts(lv.get("per_stream_itl_p50_ms") for lv in valid),
+                "per_stream_itl_p95_ms": _aggregate_metric_dicts(lv.get("per_stream_itl_p95_ms") for lv in valid),
+                "per_stream_decode_tps": _aggregate_metric_dicts(lv.get("per_stream_decode_tps") for lv in valid),
+                "errors": [e for lv in valid for e in (lv.get("errors") or [])][:3],
+            }
+        scaling_factors = {
+            lk: median_of((bd.get("scaling_factors") or {}).get(lk) for bd in bd_rounds)
+            for lk in lks
+        }
+        spd4 = median_of(bd.get("speedup_c4_vs_c1") for bd in bd_rounds)
+        spd8 = median_of(bd.get("speedup_c8_vs_c1") for bd in bd_rounds)
+
+        cp_rounds = [sr.get("chunked_prefill_interference") or {} for sr in suite_rounds]
+        cp_metric_keys = (
+            "baseline_itl_ms",
+            "baseline_itl_p50_ms",
+            "baseline_itl_p95_ms",
+            "baseline_max_itl_ms",
+            "interfered_itl_ms",
+            "interfered_itl_p50_ms",
+            "interfered_itl_p95_ms",
+            "max_itl_ms",
+            "p95_itl_spike_ms",
+            "p95_itl_spike_ratio",
+            "max_itl_spike_ms",
+            "prefill_ttft_ms",
+        )
+        cp_agg: dict[str, Any] = {
+            "repeats": sum(int(cp.get("repeats") or 0) for cp in cp_rounds),
+            "rounds": len(cp_rounds),
+            "inject_after_tokens": cp_rounds[0].get("inject_after_tokens"),
+            "prefill_approx_tokens": cp_rounds[0].get("prefill_approx_tokens"),
+            "decode_max_tokens": cp_rounds[0].get("decode_max_tokens"),
+            "prefill_max_tokens": cp_rounds[0].get("prefill_max_tokens"),
+            "ok_count": sum(int(cp.get("ok_count") or 0) for cp in cp_rounds),
+            "prefill_ok_count": sum(int(cp.get("prefill_ok_count") or 0) for cp in cp_rounds),
+            "injected_mid_stream_count": sum(int(cp.get("injected_mid_stream_count") or 0) for cp in cp_rounds),
+        }
+        for mk in cp_metric_keys:
+            cp_agg[mk] = _aggregate_metric_dicts(cp.get(mk) for cp in cp_rounds)
+        cp_runs: list[dict[str, Any]] = []
+        for r_idx, cp in enumerate(cp_rounds, start=1):
+            for run in cp.get("runs") or []:
+                entry = dict(run)
+                entry["round"] = r_idx
+                cp_runs.append(entry)
+        cp_agg["runs"] = cp_runs
+
+        return {
+            "rounds": len(suite_rounds),
+            "batched_decode": {
+                "levels": levels_out,
+                "scaling_factors": scaling_factors,
+                "speedup_c4_vs_c1": spd4,
+                "speedup_c8_vs_c1": spd8,
+            },
+            "speedup_c4_vs_c1": spd4,
+            "chunked_prefill_interference": cp_agg,
+        }
+
+    if suite_name == "keepalive":
+        def _agg_ka_part(part_key: str) -> dict[str, Any]:
+            parts = [sr[part_key] for sr in suite_rounds if isinstance(sr.get(part_key), dict)]
+            return {
+                "ok_count": sum(int(p.get("ok_count") or 0) for p in parts),
+                "total_count": sum(int(p.get("total_count") or 0) for p in parts),
+                "connections_opened": sum(int(p.get("connections_opened") or 0) for p in parts),
+                "reused_requests": sum(int(p.get("reused_requests") or 0) for p in parts),
+                "latency_ms": _aggregate_metric_dicts(p.get("latency_ms") for p in parts),
+                "total_ms": median_of(p.get("total_ms") for p in parts),
+            }
+
+        return {
+            "path": suite_rounds[0].get("path"),
+            "requests_per_mode": suite_rounds[0].get("requests_per_mode"),
+            "rounds": len(suite_rounds),
+            "keepalive": _agg_ka_part("keepalive"),
+            "fresh_socket": _agg_ka_part("fresh_socket"),
+            "speedup_mean": median_of(sr.get("speedup_mean") for sr in suite_rounds),
+            "speedup_median": median_of(sr.get("speedup_median") for sr in suite_rounds),
+            "latency_saved_mean_ms": median_of(sr.get("latency_saved_mean_ms") for sr in suite_rounds),
+        }
+
+    if suite_name == "endpoints":
+        probe_ids = [p["id"] for p in (suite_rounds[0].get("probes") or [])]
+        probes_agg: list[dict[str, Any]] = []
+        for pid in probe_ids:
+            plist = [(sr.get("by_id") or {}).get(pid) for sr in suite_rounds]
+            valid = [p for p in plist if isinstance(p, dict)]
+            if not valid:
+                continue
+            probes_agg.append({
+                "id": pid,
+                "category": valid[0].get("category", "core"),
+                "endpoint": valid[0].get("endpoint", pid),
+                "http_status": valid[-1].get("http_status"),
+                "supported": all(bool(p.get("supported")) for p in valid),
+                "latency_ms": median_of(p.get("latency_ms") for p in valid),
+            })
+        core_probes = [p for p in probes_agg if p.get("category") == "core"]
+        frontier_probes = [p for p in probes_agg if p.get("category") == "frontier"]
+        return {
+            "rounds": len(suite_rounds),
+            "supported_count": sum(1 for p in probes_agg if p["supported"]),
+            "total_count": len(probes_agg),
+            "core_supported_count": sum(1 for p in core_probes if p["supported"]),
+            "core_total_count": len(core_probes),
+            "frontier_supported_count": sum(1 for p in frontier_probes if p["supported"]),
+            "frontier_total_count": len(frontier_probes),
+            "probes": probes_agg,
+            "frontier_probes": frontier_probes,
+            "by_id": {p["id"]: p for p in probes_agg},
+        }
+
+    if suite_name == "quality":
+        probe_ids = [p["id"] for p in (suite_rounds[0].get("probes") or [])]
+        probes_agg = []
+        by_category: dict[str, dict[str, Any]] = {
+            cat: {"passed": 0, "total": 0, "skipped": 0, "pass_rate_pct": 0.0} for cat in QUALITY_CATEGORIES
+        }
+        for pid in probe_ids:
+            plist = [(sr.get("by_id") or {}).get(pid) for sr in suite_rounds]
+            valid = [p for p in plist if isinstance(p, dict)]
+            if not valid:
+                continue
+            cat = str(valid[0]["category"])
+            by_category.setdefault(cat, {"passed": 0, "total": 0, "skipped": 0, "pass_rate_pct": 0.0})
+            skipped = all(bool(p.get("skipped")) for p in valid)
+            pass_cnt = sum(1 for p in valid if p.get("passed") and not p.get("skipped"))
+            passed = (not skipped) and (pass_cnt * 2 >= len(valid))
+            if skipped:
+                by_category[cat]["skipped"] += 1
+            else:
+                by_category[cat]["total"] += 1
+                if passed:
+                    by_category[cat]["passed"] += 1
+            ok_samples = [p for p in valid if p.get("request_ok")]
+            rep_sample = ok_samples[-1] if ok_samples else valid[-1]
+            probes_agg.append({
+                "id": pid,
+                "category": cat,
+                "request_ok": bool(ok_samples),
+                "passed": passed,
+                "skipped": skipped,
+                "round_pass_count": pass_cnt,
+                "rounds_total": len(valid),
+                "detail": rep_sample.get("detail", ""),
+                "ttft_ms": median_of(p.get("ttft_ms") for p in ok_samples),
+                "total_ms": median_of(p.get("total_ms") for p in ok_samples),
+                "tokens": median_of(p.get("tokens") for p in ok_samples),
+                "wall_decode_tps": median_of(p.get("wall_decode_tps") for p in ok_samples),
+                "clean_content": rep_sample.get("clean_content", ""),
+                "output_sha256": rep_sample.get("output_sha256", ""),
+            })
+        for stats in by_category.values():
+            stats["pass_rate_pct"] = (100.0 * stats["passed"] / stats["total"]) if stats["total"] > 0 else 0.0
+        total_passed = sum(1 for p in probes_agg if p["passed"] and not p["skipped"])
+        total_skipped = sum(1 for p in probes_agg if p["skipped"])
+        total_graded = sum(1 for p in probes_agg if not p["skipped"])
+        overall_pct = (100.0 * total_passed / total_graded) if total_graded > 0 else 0.0
+        return {
+            "rounds": len(suite_rounds),
+            "passed": total_passed,
+            "total": total_graded,
+            "skipped": total_skipped,
+            "probe_count": len(probes_agg),
+            "unsafe_python_exec_enabled": bool(suite_rounds[0].get("unsafe_python_exec_enabled", False)),
+            "pass_rate_pct": overall_pct,
+            "per_round_pass_rates_pct": [float(sr.get("pass_rate_pct", 0.0)) for sr in suite_rounds],
+            "categories": by_category,
+            "probes": probes_agg,
+            "by_id": {p["id"]: p for p in probes_agg},
+        }
+
+    return suite_rounds[-1]
+
+
+def aggregate_target_rounds(round_runs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate multiple rounds of a single target using paired medians across rounds."""
+    if not round_runs:
+        raise ValueError("aggregate_target_rounds requires at least one round")
+    if len(round_runs) == 1:
+        return round_runs[0]
+
+    first = round_runs[0]
+    vram_all: list[float] = []
+    rss_all: list[float] = []
+    vram_scope = "unavailable"
+    last_pid = None
+    for rr in round_runs:
+        res = rr.get("resources") or {}
+        if res.get("pid") is not None:
+            last_pid = res["pid"]
+        if res.get("vram_scope") and res["vram_scope"] != "unavailable":
+            vram_scope = str(res["vram_scope"])
+        vram_all.extend(float(v) for v in (res.get("vram_samples_mib") or []) if _num(v) is not None)
+        rss_all.extend(float(v) for v in (res.get("rss_samples_mib") or []) if _num(v) is not None)
+
+    suite_names = list((first.get("suites") or {}).keys())
+    suites_agg: dict[str, Any] = {}
+    for sname in suite_names:
+        slist = [(rr.get("suites") or {}).get(sname) for rr in round_runs]
+        valid = [s for s in slist if isinstance(s, dict)]
+        if valid:
+            suites_agg[sname] = _aggregate_suite_rounds(sname, valid)
+
+    return {
+        "name": first["name"],
+        "mode": first["mode"],
+        "url": first["url"],
+        "model": first["model"],
+        "rounds_count": len(round_runs),
+        "startup_ms": median_of(rr.get("startup_ms") for rr in round_runs),
+        "warmup_ok": all(bool(rr.get("warmup_ok")) for rr in round_runs),
+        "wall_s": sum(float(rr.get("wall_s") or 0.0) for rr in round_runs),
+        "round_wall_s": summarize_metric(rr.get("wall_s") for rr in round_runs),
+        "resources": {
+            "pid": last_pid,
+            "vram_scope": vram_scope,
+            "vram_samples_mib": vram_all,
+            "peak_vram_mib": max(vram_all) if vram_all else None,
+            "rss_samples_mib": rss_all,
+            "peak_rss_mib": max(rss_all) if rss_all else None,
+        },
+        "suites": suites_agg,
+    }
+
+
+def _extract_paired_metrics(target_res: dict[str, Any]) -> list[tuple[str, float | None, bool]]:
+    """Extract (metric_name, value, lower_is_better) pairs for within-round paired deltas."""
+    suites = target_res.get("suites") or {}
+    out: list[tuple[str, float | None, bool]] = []
+    if isinstance(suites.get("prefill"), dict):
+        for cid, case in (suites["prefill"].get("cases") or {}).items():
+            out.append((f"prefill.{cid}.ttft_ms", _metric_center(case.get("ttft_ms")), True))
+    if isinstance(suites.get("prefix"), dict):
+        out.append(("prefix.warm_ttft_ms", _metric_center(suites["prefix"].get("warm_ttft_ms")), True))
+        out.append(("prefix.speedup_x", _num(suites["prefix"].get("speedup_median_ratio")), False))
+    if isinstance(suites.get("decode"), dict):
+        for rid, reg in (suites["decode"].get("regimes") or {}).items():
+            out.append((f"decode.{rid}.wall_tps", _metric_center(reg.get("wall_decode_tps")), False))
+    if isinstance(suites.get("concurrency"), dict):
+        for lk, lv in (suites["concurrency"].get("levels") or {}).items():
+            out.append((f"concurrency.C{lk}.agg_tps", _metric_center(lv.get("aggregate_tps")), False))
+    if isinstance(suites.get("batching"), dict):
+        bd = suites["batching"].get("batched_decode") or {}
+        for lk, lv in (bd.get("levels") or {}).items():
+            out.append((f"batching.C{lk}.agg_tps", _metric_center(lv.get("aggregate_tps")), False))
+        out.append(("batching.speedup_c4_vs_c1", _num(bd.get("speedup_c4_vs_c1")), False))
+        cp = suites["batching"].get("chunked_prefill_interference") or {}
+        out.append(("batching.hol.max_itl_ms", _metric_center(cp.get("max_itl_ms")), True))
+        out.append(("batching.hol.p95_itl_spike_ms", _metric_center(cp.get("p95_itl_spike_ms")), True))
+    if isinstance(suites.get("keepalive"), dict):
+        ka = (suites["keepalive"].get("keepalive") or {}).get("latency_ms")
+        out.append(("keepalive.latency_ms", _metric_center(ka), True))
+    return out
+
+
+def compute_paired_round_summary(
+    per_round_by_target: list[dict[str, dict[str, Any]]],
+    canonical_names: list[str],
+) -> dict[str, Any] | None:
+    """Compute within-round paired deltas and paired medians across >= 2 rounds."""
+    if len(per_round_by_target) < 2 or len(canonical_names) < 2:
+        return None
+    base_name = canonical_names[0]
+    comparisons: list[dict[str, Any]] = []
+    for cand_name in canonical_names[1:]:
+        metric_order: list[str] = []
+        lower_map: dict[str, bool] = {}
+        paired_vals: dict[str, list[tuple[float, float]]] = {}
+        for r_map in per_round_by_target:
+            b_res = r_map.get(base_name)
+            c_res = r_map.get(cand_name)
+            if not b_res or not c_res:
+                continue
+            b_metrics = {m: (v, lb) for m, v, lb in _extract_paired_metrics(b_res)}
+            c_metrics = {m: (v, lb) for m, v, lb in _extract_paired_metrics(c_res)}
+            for m, (bv, lb) in b_metrics.items():
+                if m not in metric_order:
+                    metric_order.append(m)
+                    lower_map[m] = lb
+                cv = (c_metrics.get(m) or (None, lb))[0]
+                if bv is not None and cv is not None:
+                    paired_vals.setdefault(m, []).append((bv, cv))
+        rows: list[dict[str, Any]] = []
+        for m in metric_order:
+            pairs = paired_vals.get(m) or []
+            if not pairs:
+                continue
+            b_list = [p[0] for p in pairs]
+            c_list = [p[1] for p in pairs]
+            deltas = [((cv - bv) / abs(bv)) * 100.0 for bv, cv in pairs if bv != 0.0]
+            rows.append({
+                "metric": m,
+                "lower_is_better": lower_map[m],
+                "paired_rounds": len(pairs),
+                "baseline_median": median_of(b_list),
+                "target_median": median_of(c_list),
+                "paired_delta_pct_median": median_of(deltas),
+            })
+        comparisons.append({
+            "baseline": base_name,
+            "target": cand_name,
+            "metrics": rows,
+        })
+    return {
+        "rounds": len(per_round_by_target),
+        "baseline": base_name,
+        "comparisons": comparisons,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2680,6 +3781,7 @@ def execute_single_target(
     max_tokens: int,
     max_tokens_explicit: bool,
     concurrency_levels: list[int],
+    batching_levels: list[int] | None = None,
     disable_thinking: bool,
     keepalive_requests: int | None,
     timeout: float,
@@ -2755,6 +3857,7 @@ def execute_single_target(
                 model=resolved_model,
                 repeats=repeats,
                 max_tokens=max_tokens,
+                max_tokens_explicit=max_tokens_explicit,
                 disable_thinking=disable_thinking,
             )
             record_resources(active_pid)
@@ -2764,6 +3867,18 @@ def execute_single_target(
                 corpus,
                 model=resolved_model,
                 levels=concurrency_levels,
+                repeats=repeats,
+                max_tokens=max_tokens,
+                max_tokens_explicit=max_tokens_explicit,
+                disable_thinking=disable_thinking,
+            )
+            record_resources(active_pid)
+        if "batching" in suites:
+            suites_out["batching"] = run_batching_suite(
+                client,
+                corpus,
+                model=resolved_model,
+                levels=batching_levels,
                 repeats=repeats,
                 max_tokens=max_tokens,
                 max_tokens_explicit=max_tokens_explicit,
@@ -2862,11 +3977,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--suites",
         default="all",
-        help="all or comma-separated subset of: prefill,prefix,decode,concurrency,keepalive,endpoints,quality",
+        help="all or comma-separated subset of: prefill,prefix,decode,concurrency,batching,keepalive,endpoints,quality",
     )
     ap.add_argument("--repeats", type=int, default=2, help="Timed repeats per benchmark case (default: 2)")
+    ap.add_argument(
+        "--rounds",
+        type=int,
+        default=1,
+        help="Full benchmark rounds across all targets (default: 1; use >=2 with --alternate-order for AB/BA counterbalancing)",
+    )
+    ap.add_argument(
+        "--alternate-order",
+        action="store_true",
+        help="Reverse target execution order on odd-indexed rounds (Round 1: A->B, Round 2: B->A) to eliminate order confounding",
+    )
     ap.add_argument("--max-tokens", type=int, default=None, help="Max generated tokens (default: 256)")
     ap.add_argument("--concurrency", default="1,2,4", help="Comma-separated concurrency levels (default: 1,2,4)")
+    ap.add_argument(
+        "--batching-concurrency",
+        default=None,
+        help="Comma-separated concurrency levels for the batching suite (default: 1,2,4,8 from corpus)",
+    )
     ap.add_argument(
         "--disable-thinking",
         action="store_true",
@@ -2903,6 +4034,10 @@ def run_benchmark_from_args(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("specify exactly one of --config <json> (managed mode) or --target NAME=URL (attach mode)")
     if args.repeats < 1:
         raise ValueError("--repeats must be >= 1")
+    rounds = int(getattr(args, "rounds", 1))
+    if rounds < 1:
+        raise ValueError("--rounds must be >= 1")
+    alternate_order = bool(getattr(args, "alternate_order", False))
 
     max_tokens_explicit = args.max_tokens is not None
     effective_max_tokens = int(args.max_tokens) if max_tokens_explicit else 256
@@ -2911,6 +4046,8 @@ def run_benchmark_from_args(args: argparse.Namespace) -> dict[str, Any]:
 
     suites = parse_suites(args.suites)
     concurrency_levels = parse_concurrency(args.concurrency)
+    raw_batching_conc = getattr(args, "batching_concurrency", None)
+    batching_levels = parse_concurrency(raw_batching_conc) if raw_batching_conc else None
 
     cli_headers: dict[str, str] = {}
     for h_raw in args.header or []:
@@ -2963,25 +4100,56 @@ def run_benchmark_from_args(args: argparse.Namespace) -> dict[str, Any]:
     corpus, corpus_fnv1a = load_corpus_file(args.corpus)
     log_fn = (lambda _m: None) if args.quiet else (lambda m: print(m, file=sys.stderr, flush=True))
 
-    target_results: list[dict[str, Any]] = []
-    for t_spec in target_specs:
-        res = execute_single_target(
-            t_spec,
-            corpus,
-            suites=suites,
-            repeats=args.repeats,
-            max_tokens=effective_max_tokens,
-            max_tokens_explicit=max_tokens_explicit,
-            concurrency_levels=concurrency_levels,
-            disable_thinking=bool(args.disable_thinking),
-            keepalive_requests=args.keepalive_requests,
-            timeout=float(args.timeout),
-            log_fn=log_fn,
-            allow_unsafe_python_exec=bool(getattr(args, "allow_unsafe_python_exec", False)),
-        )
-        target_results.append(res)
+    canonical_names = [str(spec["name"]) for spec in target_specs]
+    per_target_rounds: dict[str, list[dict[str, Any]]] = {name: [] for name in canonical_names}
+    per_round_by_target: list[dict[str, dict[str, Any]]] = []
+    round_schedule: list[list[str]] = []
+    rounds_execution: list[dict[str, Any]] = []
 
+    for round_idx in range(rounds):
+        reversed_round = alternate_order and (round_idx % 2 == 1)
+        round_specs = list(reversed(target_specs)) if reversed_round else list(target_specs)
+        order_names = [str(spec["name"]) for spec in round_specs]
+        round_schedule.append(order_names)
+        if rounds > 1:
+            log_fn(f"=== Round {round_idx + 1}/{rounds} (order: {' -> '.join(order_names)}) ===")
+        round_map: dict[str, dict[str, Any]] = {}
+        wall_by_target: dict[str, float] = {}
+        for t_spec in round_specs:
+            res = execute_single_target(
+                t_spec,
+                corpus,
+                suites=suites,
+                repeats=args.repeats,
+                max_tokens=effective_max_tokens,
+                max_tokens_explicit=max_tokens_explicit,
+                concurrency_levels=concurrency_levels,
+                batching_levels=batching_levels,
+                disable_thinking=bool(args.disable_thinking),
+                keepalive_requests=args.keepalive_requests,
+                timeout=float(args.timeout),
+                log_fn=log_fn,
+                allow_unsafe_python_exec=bool(getattr(args, "allow_unsafe_python_exec", False)),
+            )
+            tname = str(t_spec["name"])
+            per_target_rounds[tname].append(res)
+            round_map[tname] = res
+            wall_by_target[tname] = float(res.get("wall_s") or 0.0)
+        per_round_by_target.append(round_map)
+        rounds_execution.append({
+            "round": round_idx + 1,
+            "reversed": reversed_round,
+            "order": order_names,
+            "wall_s_by_target": wall_by_target,
+        })
+
+    target_results = [aggregate_target_rounds(per_target_rounds[name]) for name in canonical_names]
     parity = compute_cross_target_parity(target_results)
+    paired_round_summary = compute_paired_round_summary(per_round_by_target, canonical_names)
+    order_confounded = len(target_specs) > 1 and not (rounds >= 2 and alternate_order)
+    effective_batching_levels = batching_levels or [
+        int(x) for x in ((corpus.get("batching") or {}).get("default_levels") or [1, 2, 4, 8])
+    ]
     report: dict[str, Any] = {
         "schema": SCHEMA_VERSION,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -2996,15 +4164,21 @@ def run_benchmark_from_args(args: argparse.Namespace) -> dict[str, Any]:
             "mode": mode,
             "suites": suites,
             "repeats": args.repeats,
+            "rounds": rounds,
+            "alternate_order": alternate_order,
+            "round_schedule": round_schedule,
             "max_tokens": effective_max_tokens,
             "max_tokens_explicit": max_tokens_explicit,
             "concurrency": concurrency_levels,
+            "batching_concurrency": effective_batching_levels,
             "disable_thinking": bool(args.disable_thinking),
             "allow_unsafe_python_exec": bool(getattr(args, "allow_unsafe_python_exec", False)),
-            "order_confounded": len(target_specs) > 1,
+            "order_confounded": order_confounded,
         },
+        "rounds_execution": rounds_execution,
         "targets": target_results,
         "cross_target_parity": parity,
+        "paired_round_summary": paired_round_summary,
     }
     return report
 

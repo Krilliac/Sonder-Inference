@@ -43,7 +43,8 @@ struct ChatExchange {
 // (including response writes), and destroys the session before releasing it.
 void execute_chat(ChatExchange& exchange, const ChatJob& job, const Correlation& correlation,
                   const std::string& model, const std::string& backend,
-                  const std::shared_ptr<Session>& session, ChatProtocol protocol);
+                  const std::shared_ptr<Session>& session, ChatProtocol protocol,
+                  bool backend_native_tools = true);
 
 // Synchronous execution for POST /v1/completions (non-streaming and SSE streaming).
 void execute_completion(ChatExchange& exchange, const CompletionJob& job, const Correlation& correlation,

@@ -65,6 +65,9 @@ struct ChatJob {
     // and serialized JSON schema when type == "json_schema".
     std::optional<std::string> response_format_type;
     std::optional<std::string> response_format_schema;
+    // Optional tool definitions and tool_choice policy.
+    std::vector<ToolDefinition> tools;
+    std::optional<ToolChoice> tool_choice;
 };
 
 struct EmbedJob {
@@ -104,10 +107,12 @@ struct DetokenizeJob {
 // with enable_thinking when both are set; prompt_cache_key is a 1-256 byte
 // string (invalid_json otherwise). Supports response_format ("text",
 // "json_object", "json_schema") and optional grammar (up to 64 KiB).
-// Rejected with unsupported_parameter: tools, tool_choice, functions,
-// function_call, logprobs (true), top_logprobs, n != 1, non-string message
-// content, tool_calls on a message. Sonder extensions: num_ctx, typical_p,
-// repeat_last_n, repeat_penalty, top_k, min_p.
+// Rejected with unsupported_parameter: functions, function_call, n != 1,
+// unsupported content part types. Supports tools, tool_choice, tool_calls,
+// role "tool" with tool_call_id, logprobs, top_logprobs (0..20), and
+// inline base64 data:image/* content blocks (remote URLs rejected for SSRF).
+// Sonder extensions: num_ctx, typical_p, repeat_last_n, repeat_penalty,
+// top_k, min_p.
 std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body);
 std::variant<EmbedJob, ApiError> parse_embed_request(std::string_view body);
 std::variant<CompletionJob, ApiError> parse_completion_request(std::string_view body);

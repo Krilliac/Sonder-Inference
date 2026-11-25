@@ -912,7 +912,16 @@ Result<GgufModelInfo> parse(std::istream& in, ObservationReader* observer = null
         if (type == 142 || type == 143 || type == 145) {
             info.has_prism_private_tensors = true;
         }
-        if (type == 39 || type == 40 || type == 43) {
+        if (type == 39) {
+            info.has_mxfp4_tensors = true;
+            info.has_fp4_or_fp8_tensors = true;
+        }
+        if (type == 40) {
+            info.has_nvfp4_tensors = true;
+            info.has_fp4_or_fp8_tensors = true;
+        }
+        if (type == 43) {
+            info.has_fp8_tensors = true;
             info.has_fp4_or_fp8_tensors = true;
         }
         const std::uint64_t num_blocks = elements / block_elems + (elements % block_elems != 0 ? 1u : 0u);

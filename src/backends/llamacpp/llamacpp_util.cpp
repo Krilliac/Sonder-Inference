@@ -71,6 +71,14 @@ Status Validate(const SamplingParams& params) {
             return Status::Error(ErrorCode::kInvalidArgument, "logit_bias values must be finite or -inf");
         }
     }
+    if (params.top_logprobs < 0 || params.top_logprobs > kMaxTopLogprobs) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "top_logprobs (" + std::to_string(params.top_logprobs) + ") must be in [0, " +
+                                 std::to_string(kMaxTopLogprobs) + "]");
+    }
+    if (params.top_logprobs > 0 && !params.compute_logprobs) {
+        return Status::Error(ErrorCode::kInvalidArgument, "top_logprobs > 0 requires compute_logprobs = true");
+    }
     return Status::Ok();
 }
 
@@ -160,6 +168,7 @@ std::string_view ToString(SpeculativeType type) noexcept {
         case SpeculativeType::kAuto: return "auto";
         case SpeculativeType::kNgram: return "ngram";
         case SpeculativeType::kNgramMod: return "ngram-mod";
+        case SpeculativeType::kSuffix: return "suffix";
         case SpeculativeType::kDraftMtp: return "draft-mtp";
     }
     return "unknown";
@@ -214,6 +223,8 @@ bool ParseSpeculativeType(std::string_view name, SpeculativeType& out) noexcept 
         out = SpeculativeType::kNgram;
     } else if (EqualsIgnoreCase(name, "ngram-mod")) {
         out = SpeculativeType::kNgramMod;
+    } else if (EqualsIgnoreCase(name, "suffix")) {
+        out = SpeculativeType::kSuffix;
     } else if (EqualsIgnoreCase(name, "draft-mtp")) {
         out = SpeculativeType::kDraftMtp;
     } else {
@@ -329,12 +340,29 @@ Status ValidateContextOptions(const LoadOptions& options) {
     if (!ParseSpeculativeType(options.spec_type, spec)) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "unknown spec_type '" + options.spec_type +
-                                 "' (expected none, auto, ngram, ngram-mod or draft-mtp)");
+                                 "' (expected none, auto, ngram, ngram-mod, suffix or draft-mtp)");
     }
     if (options.spec_draft_max < 0 || options.spec_draft_max > kMaxSpecDraftTokens) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "spec_draft_max (" + std::to_string(options.spec_draft_max) + ") must be in [0, " +
                                  std::to_string(kMaxSpecDraftTokens) + "]");
+    }
+    if (options.cache_ram_mib > kMaxCacheRamMiB) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "cache_ram_mib (" + std::to_string(options.cache_ram_mib) + ") must be <= " +
+                                 std::to_string(kMaxCacheRamMiB));
+    }
+    if (options.moe_cache_mib > kMaxMoeCacheMiB) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "moe_cache_mib (" + std::to_string(options.moe_cache_mib) + ") must be <= " +
+                                 std::to_string(kMaxMoeCacheMiB));
+    }
+    if (options.mmproj_path.find('\0') != std::string::npos) {
+        return Status::Error(ErrorCode::kInvalidArgument, "mmproj_path contains NUL");
+    }
+    if (!std::isfinite(options.moe_cache_cpu_share) || options.moe_cache_cpu_share < 0.0 ||
+        options.moe_cache_cpu_share > 1.0) {
+        return Status::Error(ErrorCode::kInvalidArgument, "moe_cache_cpu_share must be finite in [0.0, 1.0]");
     }
     // n_batch == 0 keeps its own, older error in Load().
     if (options.n_batch > 0 && options.n_ubatch > options.n_batch) {
@@ -407,6 +435,104 @@ std::size_t LongestCommonPrefix(std::span<const Token> a, std::span<const Token>
     std::size_t n = 0;
     while (n < limit && a[n] == b[n]) ++n;
     return n;
+}
+
+TokenLogprobInfo ComputeTokenLogprobs(std::span<const float> logits, Token chosen_token, std::int32_t top_k) {
+    TokenLogprobInfo info;
+    if (logits.empty() || chosen_token < 0 || static_cast<std::size_t>(chosen_token) >= logits.size()) {
+        return info;
+    }
+
+    float max_logit = -std::numeric_limits<float>::infinity();
+    bool any_finite = false;
+    for (float v : logits) {
+        if (std::isfinite(v)) {
+            if (!any_finite || v > max_logit) {
+                max_logit = v;
+                any_finite = true;
+            }
+        }
+    }
+    if (!any_finite) {
+        return info;
+    }
+
+    const float chosen_raw = logits[static_cast<std::size_t>(chosen_token)];
+    if (!std::isfinite(chosen_raw)) {
+        return info;
+    }
+
+    const std::size_t k = top_k > 0 ? std::min<std::size_t>(static_cast<std::size_t>(top_k),
+                                                            std::min<std::size_t>(logits.size(),
+                                                                                  static_cast<std::size_t>(kMaxTopLogprobs)))
+                                    : 0u;
+    std::vector<std::pair<Token, float>> best;
+    if (k > 0) {
+        best.reserve(k);
+    }
+
+    double sum_exp = 0.0;
+    for (std::size_t i = 0; i < logits.size(); ++i) {
+        const float v = logits[i];
+        if (!std::isfinite(v)) continue;
+        sum_exp += std::exp(static_cast<double>(v) - static_cast<double>(max_logit));
+        if (k > 0) {
+            const auto tok = static_cast<Token>(i);
+            if (best.size() < k) {
+                best.emplace_back(tok, v);
+                // Keep descending by logit, tie-broken by smaller token id.
+                std::size_t j = best.size() - 1;
+                while (j > 0 && (best[j].second > best[j - 1].second ||
+                                 (best[j].second == best[j - 1].second && best[j].first < best[j - 1].first))) {
+                    std::swap(best[j], best[j - 1]);
+                    --j;
+                }
+            } else if (v > best.back().second || (v == best.back().second && tok < best.back().first)) {
+                best.back() = {tok, v};
+                std::size_t j = k - 1;
+                while (j > 0 && (best[j].second > best[j - 1].second ||
+                                 (best[j].second == best[j - 1].second && best[j].first < best[j - 1].first))) {
+                    std::swap(best[j], best[j - 1]);
+                    --j;
+                }
+            }
+        }
+    }
+
+    if (!(sum_exp > 0.0) || !std::isfinite(sum_exp)) {
+        return info;
+    }
+
+    const double log_z = static_cast<double>(max_logit) + std::log(sum_exp);
+    info.valid = true;
+    info.logprob = std::isfinite(chosen_raw) ? static_cast<float>(static_cast<double>(chosen_raw) - log_z)
+                                             : -std::numeric_limits<float>::infinity();
+    info.top_logprobs.reserve(best.size());
+    for (const auto& [tok, raw] : best) {
+        info.top_logprobs.emplace_back(tok, static_cast<float>(static_cast<double>(raw) - log_z));
+    }
+    return info;
+}
+
+Status ValidateMediaBlobs(const std::vector<std::vector<std::uint8_t>>& media_blobs) {
+    if (media_blobs.size() > kMaxMediaImages) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "too many media blobs (" + std::to_string(media_blobs.size()) + ", maximum is " +
+                                 std::to_string(kMaxMediaImages) + ")");
+    }
+    for (std::size_t i = 0; i < media_blobs.size(); ++i) {
+        if (media_blobs[i].empty()) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "media blob at index " + std::to_string(i) + " is empty");
+        }
+        if (media_blobs[i].size() > kMaxMediaBlobBytes) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "media blob at index " + std::to_string(i) + " (" +
+                                     std::to_string(media_blobs[i].size()) + " bytes) exceeds maximum (" +
+                                     std::to_string(kMaxMediaBlobBytes) + " bytes)");
+        }
+    }
+    return Status::Ok();
 }
 
 SlotSelection SelectPrefixSlot(std::span<const PrefixSlotMeta> slots, std::span<const Token> prompt,

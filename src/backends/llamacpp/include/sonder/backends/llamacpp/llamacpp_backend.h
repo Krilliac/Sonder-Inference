@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -88,7 +89,7 @@ enum class FlashAttention { kAuto, kDisabled, kEnabled };
 enum class SplitMode { kNone, kLayer, kRow };
 
 // In-process speculative decoding strategy.
-enum class SpeculativeType { kNone, kAuto, kNgram, kNgramMod, kDraftMtp };
+enum class SpeculativeType { kNone, kAuto, kNgram, kNgramMod, kSuffix, kDraftMtp };
 
 // Maximum number of GPU entries accepted in LoadOptions::tensor_split and
 // LoadOptions::devices (matches llama_max_devices() in pinned llama.cpp).
@@ -101,7 +102,19 @@ inline constexpr std::uint32_t kMaxSlots = 16;
 inline constexpr std::int32_t kMaxSpecDraftTokens = 64;
 inline constexpr std::int32_t kDefaultNgramDraftMax = 8;
 inline constexpr std::int32_t kDefaultNgramModDraftMax = 64;
+inline constexpr std::int32_t kDefaultSuffixDraftMax = 16;
 inline constexpr std::int32_t kDefaultMtpDraftMax = 3;
+
+// Bounded L2 host-RAM KV/SSM prefix cache cap (MiB) and dynamic MoE expert cache cap (MiB).
+inline constexpr std::uint32_t kMaxCacheRamMiB = 65536;
+inline constexpr std::uint32_t kMaxMoeCacheMiB = 262144;
+
+// Maximum top-K alternative logprobs returned per generated token.
+inline constexpr std::int32_t kMaxTopLogprobs = 20;
+
+// Strict multimodal media payload limits (max 8 images, max 16 MiB each).
+inline constexpr std::size_t kMaxMediaImages = 8;
+inline constexpr std::size_t kMaxMediaBlobBytes = std::size_t{16} << 20;
 
 [[nodiscard]] std::string_view ToString(KvCacheType type) noexcept;
 [[nodiscard]] std::string_view ToString(FlashAttention mode) noexcept;
@@ -113,7 +126,7 @@ inline constexpr std::int32_t kDefaultMtpDraftMax = 3;
 [[nodiscard]] bool ParseFlashAttention(std::string_view name, FlashAttention& out) noexcept;
 // Accepts "none", "layer", and "row" (case-insensitive); leaves `out` untouched on failure.
 [[nodiscard]] bool ParseSplitMode(std::string_view name, SplitMode& out) noexcept;
-// Accepts "none", "auto", "ngram", "ngram-mod", and "draft-mtp" (case-insensitive).
+// Accepts "none", "auto", "ngram", "ngram-mod", "suffix", and "draft-mtp" (case-insensitive).
 [[nodiscard]] bool ParseSpeculativeType(std::string_view name, SpeculativeType& out) noexcept;
 // True for block-quantized types (everything except f32, f16 and bf16).
 [[nodiscard]] bool IsQuantized(KvCacheType type) noexcept;
@@ -164,10 +177,18 @@ struct LoadOptions {
     // Number of cached KV sequence slots (1..kMaxSlots).
     std::uint32_t n_slots = 1;
     // In-process speculative decoding strategy: "none", "auto", "ngram",
-    // "ngram-mod", or "draft-mtp".
+    // "ngram-mod", "suffix", or "draft-mtp".
     std::string spec_type = "none";
     // Max draft tokens per speculative step (0 = automatic default for spec_type).
     std::int32_t spec_draft_max = 0;
+    // Bounded L2 host-RAM prefix state cache budget in MiB (0 = disabled, max kMaxCacheRamMiB).
+    std::uint32_t cache_ram_mib = 0;
+    // Dynamic GPU cache in MiB for host-resident MoE experts (0 = disabled, max kMaxMoeCacheMiB).
+    std::uint32_t moe_cache_mib = 0;
+    // Fraction of MoE cache capacity reserved for CPU-shared tier (0.0..1.0).
+    double moe_cache_cpu_share = 0.0;
+    // Optional multimodal projector GGUF path (--mmproj); requires SONDER_WITH_MTMD=ON.
+    std::string mmproj_path;
 };
 
 // Checks placement options (main_gpu >= 0, split_mode, tensor_split finite /
@@ -212,6 +233,7 @@ struct ContextParamsSummary {
     bool no_perf = true;
     bool kv_unified = false;
     bool op_offload = false;
+    std::uint64_t moe_cache_size = 0;
 };
 
 struct SamplingParams {
@@ -227,6 +249,8 @@ struct SamplingParams {
     std::vector<std::pair<Token, float>> logit_bias;  // token -> additive bias (-inf bans)
     std::uint32_t seed = 0xC0FFEEU;    // 0xFFFFFFFF = random
     std::string grammar;               // optional GBNF grammar constraining output (root rule)
+    bool compute_logprobs = false;     // compute exact log-softmax logprob for each emitted token
+    std::int32_t top_logprobs = 0;     // number of top alternative logprobs (0..kMaxTopLogprobs)
 };
 
 [[nodiscard]] Status Validate(const SamplingParams& params);
@@ -264,6 +288,21 @@ struct GenerateRequest {
     std::size_t capture_at_tokens = 0;
     std::size_t max_capture_bytes = kMaxSequenceStateBytes;
     std::function<void(std::vector<std::uint8_t>)> on_state_captured;
+    // Optional multimodal media blobs (e.g. PNG/JPEG bytes, max kMaxMediaImages,
+    // max kMaxMediaBlobBytes each). Requires mmproj_path loaded with libmtmd.
+    std::vector<std::vector<std::uint8_t>> media_blobs;
+    // Optional prompt text with media markers when media_blobs is non-empty.
+    // When empty, `prompt` is detokenized and missing markers are prepended.
+    std::string media_prompt_text;
+    // Preferred G0028-safe structured multimodal segments preserving per-part
+    // `parse_special` boundaries and explicit media bitmap indices (no marker
+    // string parsing on untrusted user text).
+    struct MediaPromptPart {
+        std::string text;
+        bool parse_special = false;
+        std::optional<std::size_t> media_index = std::nullopt;
+    };
+    std::vector<MediaPromptPart> media_prompt_parts;
 };
 
 // One event per generated token. After the last token a final event with
@@ -272,6 +311,9 @@ struct TokenEvent {
     Token token = 0;
     std::string text;         // UTF-8 complete text released by this token (may be empty)
     std::int32_t index = 0;   // 0-based index among generated tokens
+    bool has_logprob = false;
+    float logprob = 0.0F;
+    std::vector<std::pair<Token, float>> top_logprobs{};
 };
 
 // Return false to stop generation (treated as cancellation).
@@ -364,6 +406,8 @@ struct Capabilities {
     bool structured_output = true;
     bool embeddings = true;
     bool recurrent_checkpoint = true;
+    bool continuous_batch_decode = true;
+    bool logprobs = true;
 };
 
 class LlamaCppBackend {
@@ -404,6 +448,8 @@ public:
     Status Load(const LoadOptions& options);
     void Unload() noexcept;
     [[nodiscard]] bool IsLoaded() const noexcept;
+    [[nodiscard]] bool HasMmproj() const noexcept;
+    [[nodiscard]] std::uint32_t SlotCount() const noexcept;
     [[nodiscard]] ModelInfo GetModelInfo() const;
 
     // parse_special: treat control-token text (e.g. "<|im_start|>") as the
@@ -473,6 +519,23 @@ private:
 
 // Length of the longest common prefix between two token spans.
 [[nodiscard]] std::size_t LongestCommonPrefix(std::span<const Token> a, std::span<const Token> b) noexcept;
+
+// Per-token exact log-softmax probability and top-K alternatives.
+struct TokenLogprobInfo {
+    bool valid = false;
+    float logprob = 0.0F;
+    std::vector<std::pair<Token, float>> top_logprobs;
+};
+
+// Computes exact log-softmax logprob for `chosen_token` and up to `top_k`
+// highest-probability (token, logprob) pairs (descending logprob, tie-broken
+// by smaller token id) using numerically stable max-subtraction.
+[[nodiscard]] TokenLogprobInfo ComputeTokenLogprobs(std::span<const float> logits, Token chosen_token,
+                                                    std::int32_t top_k);
+
+// Validates multimodal media payloads against kMaxMediaImages (8) and
+// kMaxMediaBlobBytes (16 MiB per image), rejecting empty blobs.
+[[nodiscard]] Status ValidateMediaBlobs(const std::vector<std::vector<std::uint8_t>>& media_blobs);
 
 // Per-slot prefix cache metadata used for slot selection.
 struct PrefixSlotMeta {

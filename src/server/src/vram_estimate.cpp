@@ -94,7 +94,12 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
         }
         e.notes.emplace_back("ctx_size unset: the model's training context is assumed");
     }
-    ctx = (ctx + 255) / 256 * 256;  // llama.cpp pads the context to 256
+    const auto pad256 = [](std::uint64_t x) -> std::uint64_t {
+        constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
+        if (x > kMax - 255u) return kMax - (kMax % 256u);
+        return ((x + 255u) / 256u) * 256u;
+    };
+    ctx = pad256(ctx);  // llama.cpp pads the context to 256
     e.context = ctx;
     // Without `parallel`, llama-server runs its automatic default: 4 slots
     // (n_seq_max 4, so 4 recurrent states) with a unified KV cache
@@ -111,7 +116,7 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
     // n_ctx_seq x parallel, not ctx x parallel. Unified: one pool of ctx.
     std::uint64_t ctx_per_sequence = ctx;
     if (e.sequences > 1) {
-        ctx_per_sequence = (ctx / e.sequences + 255) / 256 * 256;
+        ctx_per_sequence = pad256(ctx / e.sequences);
     }
     e.context_per_sequence = ctx_per_sequence;
 
@@ -168,6 +173,12 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
     if (p.no_repack) {
         placement.repack = !*p.no_repack;
     }
+    if (p.moe_cache_mib) {
+        placement.moe_cache_mib = *p.moe_cache_mib;
+    }
+    if (p.moe_cache_cpu_share) {
+        placement.moe_cache_cpu_share = *p.moe_cache_cpu_share;
+    }
     detail::TensorPlacementBreakdown placed =
         detail::evaluate_tensor_placement(m, placement, n_layer, first_gpu, first_nextn, mtp, e.notes);
     const bool fit_path = p.backend == kLaunchProfileBackendLlamaServer && p.fit.value_or(true) && !p.n_gpu_layers &&
@@ -177,7 +188,8 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
     double swa_kv_per_token = 0.0;  // sliding-window layers on the GPU
     for (std::uint32_t i = first_gpu; i < n_layer; ++i) {
         if (i >= first_nextn && !mtp) continue;  // MTP blocks load only for draft-mtp
-        e.weights_bytes += m.block_bytes[i] - std::min(m.block_bytes[i], placed.moved_to_host[i]);
+        e.weights_bytes =
+            saturating_add(e.weights_bytes, m.block_bytes[i] - std::min(m.block_bytes[i], placed.moved_to_host[i]));
         ++e.gpu_layers;
         if (m.kv_heads[i] > 0) {
             ++e.attention_layers;
@@ -193,14 +205,15 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
                 kv_per_token += bytes;
             }
         } else if (m.kind != ModelArchitecture::attention_only) {
-            e.recurrent_bytes += m.recurrent_state_values * 4 * recurrent_rows;
+            e.recurrent_bytes =
+                saturating_add(e.recurrent_bytes, saturating_mul(saturating_mul(m.recurrent_state_values, 4u), recurrent_rows));
         }
     }
     for (std::uint32_t i = 0; i < first_gpu; ++i) {
         if (i >= first_nextn && !mtp) continue;
         e.weights_bytes = saturating_add(e.weights_bytes, placed.moved_to_gpu[i]);
     }
-    if (all) e.weights_bytes += m.output_bytes;
+    if (all) e.weights_bytes = saturating_add(e.weights_bytes, m.output_bytes);
     e.kv_bytes_per_token = saturating_u64(kv_per_token);
     e.swa_kv_bytes_per_token = saturating_u64(swa_kv_per_token);
     double kv = kv_per_token * static_cast<double>(ctx_per_sequence) * e.sequences;
@@ -228,7 +241,7 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
             // ctx_per_sequence, a multiple of 256, so the padding cannot wrap.
             const std::uint64_t window = saturating_add(saturating_mul(m.sliding_window, unified ? slots : 1u), ubatch);
             const std::uint64_t cells = std::min(ctx_per_sequence, window);
-            e.swa_context_per_sequence = (cells + 255) / 256 * 256;
+            e.swa_context_per_sequence = pad256(cells);
         }
         kv += swa_kv_per_token * static_cast<double>(e.swa_context_per_sequence) * e.sequences;
     }
@@ -241,18 +254,23 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
 
     const bool mmproj_on_gpu = !p.mmproj.empty() && !device_none && p.mmproj_offload.value_or(true);
     if (mmproj_on_gpu) {
-        e.weights_bytes += inputs.mmproj_bytes;
+        e.weights_bytes = saturating_add(e.weights_bytes, inputs.mmproj_bytes);
         e.notes.emplace_back("vision encoder compute buffers are not included");
     }
     if (!device_none && p.speculative && !p.speculative->draft_model.empty()) {
-        e.weights_bytes += inputs.draft_model_bytes;
+        e.weights_bytes = saturating_add(e.weights_bytes, inputs.draft_model_bytes);
         e.notes.emplace_back("the draft model's KV cache is not included");
     }
     if (mtp && m.nextn_layers > 0) {
         e.notes.emplace_back("the MTP draft context's compute buffer, which grows with the context, is not included");
     }
     if (offloaded > 0) {
-        e.compute_bytes = m.vocab_size * ubatch * 4 + 4 * m.embedding_length * ubatch * 4 + 256 * kMiB;
+        const std::uint64_t logits_buf = saturating_mul(saturating_mul(m.vocab_size, ubatch), 4u);
+        const std::uint64_t act_buf = saturating_mul(saturating_mul(m.embedding_length, ubatch), 16u);
+        e.compute_bytes = saturating_add(saturating_add(logits_buf, act_buf), 256u * kMiB);
+        if (placement.moe_cache_mib > 0) {
+            e.moe_cache_bytes = saturating_mul(static_cast<std::uint64_t>(placement.moe_cache_mib), kMiB);
+        }
     }
     for (const auto& arg : p.extra_args) {
         // The name llama-server reads (`--override_tensor` is `--override-tensor`).
@@ -276,7 +294,9 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
     if (auto_parallel && e.recurrent_bytes > 0) {
         e.notes.emplace_back("parallel unset: llama-server's automatic 4 slots keep 4 recurrent states");
     }
-    e.total_bytes = e.weights_bytes + e.kv_bytes + e.recurrent_bytes + e.compute_bytes;
+    e.total_bytes = saturating_add(
+        saturating_add(e.weights_bytes, e.kv_bytes),
+        saturating_add(saturating_add(e.recurrent_bytes, e.compute_bytes), e.moe_cache_bytes));
     e.prism_hadamard = m.prism_hadamard;
     e.requires_prism_runtime = m.has_prism_private_tensors || m.prism_hadamard;
     if (e.requires_prism_runtime) {
@@ -307,7 +327,8 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
                 // llama.cpp --split-mode row splits weights/rows across GPUs
                 // but keeps the KV cache unsplit on main_gpu.
                 const double max_share = weight_max / weight_sum;
-                const std::uint64_t splittable = saturating_add(e.weights_bytes, e.recurrent_bytes);
+                const std::uint64_t splittable =
+                    saturating_add(e.weights_bytes, saturating_add(e.recurrent_bytes, e.moe_cache_bytes));
                 const std::uint64_t shard = std::min(
                     splittable, saturating_u64(std::ceil(static_cast<double>(splittable) * max_share)));
                 e.max_gpu_bytes = saturating_add(shard, saturating_add(e.kv_bytes, e.compute_bytes));
@@ -317,8 +338,9 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
                                      " MiB (proportional weights/recurrent + unsplit KV + compute)");
             } else if (mode != "none") {
                 const double max_share = weight_max / weight_sum;
-                const std::uint64_t splittable =
-                    saturating_add(e.weights_bytes, saturating_add(e.kv_bytes, e.recurrent_bytes));
+                const std::uint64_t splittable = saturating_add(
+                    saturating_add(e.weights_bytes, e.kv_bytes),
+                    saturating_add(e.recurrent_bytes, e.moe_cache_bytes));
                 const std::uint64_t shard = std::min(
                     splittable, saturating_u64(std::ceil(static_cast<double>(splittable) * max_share)));
                 e.max_gpu_bytes = saturating_add(shard, e.compute_bytes);
@@ -491,6 +513,11 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
                              "fraction), not as private memory, except host Q4_0/Q4_K/Q8_0/IQ4_NL tensors, "
                              "which llama.cpp repacks into private memory unless -nr/--no-repack; "
                              "--no-kv-offload is not modelled");
+    }
+    if (e.moe_cache_bytes > 0 && e.host_expert_bytes == 0) {
+        e.notes.emplace_back(
+            "moe_cache_mib is set while no routed experts are CPU-offloaded; disable it to avoid ~10% "
+            "graph-splitting overhead");
     }
     return e;
 }

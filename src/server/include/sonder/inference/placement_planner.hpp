@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -39,6 +40,12 @@ struct PlacementPlanRequest {
     bool allow_speculative = true;
     bool allow_moe_cpu_offload = true;
     std::string device_hint;  // optional e.g. "CUDA0", "ROCm0", "Vulkan0", "multi", "cpu"
+    // Opt-in OCP FP8 (f8_e4m3, 1.0 byte/elem) initial KV cache on supported GPUs (Ada/Blackwell).
+    bool prefer_fp8_kv = false;
+    // Optional CPU topology hints for physical-core thread recommendations on CPU-offloaded MoE
+    // decode (0 = unknown; when both are 0, falls back to std::thread::hardware_concurrency()).
+    std::uint32_t cpu_logical_cores = 0;
+    std::uint32_t cpu_physical_cores = 0;
 };
 
 struct PlacementPlan {
@@ -51,6 +58,17 @@ struct PlacementPlan {
     bool requires_prism_runtime = false;
     GpuVendor selected_vendor = GpuVendor::unknown;
     std::string recommended_backend_hint;  // "cuda", "rocm", "vulkan", "metal", "sycl", "cpu"
+    // Dynamic SLRU MoE expert VRAM cache planned for CPU-offloaded MoE models
+    // (mirrors profile.moe_cache_mib / profile.moe_cache_cpu_share; always unset
+    // when the MoE model fits 100% in VRAM or spare VRAM cannot cover the working set).
+    std::optional<std::uint32_t> moe_cache_mib;
+    std::optional<double> moe_cache_cpu_share;
+    // Recommended CPU decode thread count (physical cores when MoE experts are CPU-offloaded,
+    // avoiding hyperthread oversubscription on memory-bandwidth-bound DDR5 decode).
+    std::optional<std::uint32_t> recommended_threads;
+    // Selective tensor repacking policy: "none", "cpu_only_selective", or "disabled_no_repack".
+    // Global repacking (--repack) is never recommended while GPU layers remain active.
+    std::string repack_policy;
     // Strictly env vars permitted by backends/llamaserver/env_policy.hpp.
     std::vector<std::pair<std::string, std::string>> recommended_env;
     std::vector<std::string> reasons;   // concrete measured/arithmetic rationale for every decision

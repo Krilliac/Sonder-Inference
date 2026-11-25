@@ -195,20 +195,38 @@ TEST_CASE("anthropic request: malformed and unsupported content fails clearly") 
         CHECK(std::holds_alternative<ApiError>(parse_messages_request(body)));
     }
     auto body = request();
-    for (const char* field : {"tools", "tool_choice"}) {
-        body = request();
-        body.set(field, json::Array{});
-        rejected(body, field);
-    }
+    // Invalid tools / tool_choice fail clearly.
+    body = request();
+    body.set("tools", json::Object{});
+    rejected(body, "tools");
+    body = request();
+    body.set("tool_choice", json::Array{});
+    rejected(body, "tool_choice");
+    body = request();
+    body.set("tool_choice", json::Object{{"type", "tool"}, {"name", "missing"}});
+    rejected(body, "tool_choice");
+    // System prompts remain text-only; unsupported user blocks (audio, tool_use) still fail clearly.
     for (const char* type : {"image", "tool_use", "tool_result", "audio"}) {
         const json::Array blocks{json::Object{{"type", type}, {"source", json::Object{}}}};
-        body = request();
-        body.set("messages", json::Array{json::Object{{"role", "user"}, {"content", blocks}}});
-        rejected(body, type == std::string("image") ? "image" : "content block");
         body = request();
         body.set("system", blocks);
         rejected(body, type == std::string("image") ? "image" : "content block");
     }
+    for (const char* type : {"tool_use", "audio"}) {
+        const json::Array blocks{json::Object{{"type", type}, {"source", json::Object{}}}};
+        body = request();
+        body.set("messages", json::Array{json::Object{{"role", "user"}, {"content", blocks}}});
+        rejected(body, "content block");
+    }
+    // Remote URL image sources are strictly rejected (SSRF protection).
+    body = request();
+    body.set("messages",
+             json::Array{json::Object{
+                 {"role", "user"},
+                 {"content", json::Array{json::Object{
+                                 {"type", "image"},
+                                 {"source", json::Object{{"type", "url"}, {"url", "http://127.0.0.1/x.png"}}}}}}}});
+    rejected(body, "base64");
     body = request();
     body.set("system", json::Array{json::Object{{"type", "text"}, {"text", 42}}});
     rejected(body, "text");
@@ -372,4 +390,43 @@ TEST_CASE("anthropic errors: protocol type and HTTP status stay distinct") {
         CHECK(document.find("error")->find("type")->as_string() == type);
         CHECK(document.find("error")->find("message")->as_string() == "detail");
     }
+}
+
+TEST_CASE("anthropic stream: deferred tool name and interleaved parallel tool deltas emit valid blocks") {
+    AnthropicStream stream("msg_tools", "mock:tiny");
+    std::string wire = stream.start();
+    // Arguments arrive before name on index 0; index 1 interleaves before index 0 completes.
+    wire += stream.tool_call_delta(ToolCallDelta{0, "call_0", "", "{\"a\":"});
+    wire += stream.tool_call_delta(ToolCallDelta{1, "call_1", "second_fn", "{\"b\":2}"});
+    wire += stream.tool_call_delta(ToolCallDelta{0, "", "first_fn", "1}"});
+    wire += stream.finish(GenerationResult{});
+
+    const auto frames = events(wire);
+    std::vector<std::string> started_names;
+    std::vector<std::string> partial_jsons;
+    std::size_t stops = 0;
+    bool stop_reason_tool_use = false;
+    for (const auto& f : frames) {
+        const std::string t = f.find("type")->as_string();
+        if (t == "content_block_start") {
+            const auto* blk = f.find("content_block");
+            REQUIRE(blk != nullptr);
+            CHECK(blk->find("type")->as_string() == "tool_use");
+            started_names.push_back(blk->find("name")->as_string());
+        } else if (t == "content_block_delta") {
+            partial_jsons.push_back(f.find("delta")->find("partial_json")->as_string());
+        } else if (t == "content_block_stop") {
+            ++stops;
+        } else if (t == "message_delta") {
+            stop_reason_tool_use = f.find("delta")->find("stop_reason")->as_string() == "tool_use";
+        }
+    }
+    REQUIRE(started_names.size() == 2u);
+    CHECK(started_names[0] == "first_fn");
+    CHECK(started_names[1] == "second_fn");
+    REQUIRE(partial_jsons.size() == 2u);
+    CHECK(partial_jsons[0] == "{\"a\":1}");
+    CHECK(partial_jsons[1] == "{\"b\":2}");
+    CHECK(stops == 2u);
+    CHECK(stop_reason_tool_use);
 }

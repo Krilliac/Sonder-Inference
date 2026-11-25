@@ -66,10 +66,18 @@ struct LlamaCppBackendOptions {
     std::uint32_t slots = 1;
     // In-process speculative decoding strategy: "none" (default), "auto"
     // (draft-mtp if model has MTP layers, else ngram-mod), "ngram",
-    // "ngram-mod", or "draft-mtp".
+    // "ngram-mod", "suffix", or "draft-mtp".
     std::string spec_type = "none";
     // Max draft tokens per speculative step (0 = automatic default for spec_type).
     std::int32_t spec_draft_max = 0;
+    // Bounded L2 host-RAM prefix state cache budget in MiB (0 = disabled, max 65536).
+    std::uint32_t cache_ram_mib = 0;
+    // Dynamic GPU cache in MiB for host-resident MoE experts (0 = disabled, max 262144).
+    std::uint32_t moe_cache_mib = 0;
+    // Fraction of MoE cache capacity reserved for CPU-shared tier (0.0..1.0).
+    double moe_cache_cpu_share = 0.0;
+    // Optional multimodal projector GGUF path (--mmproj); requires libmtmd build.
+    std::string mmproj_path;
 };
 
 // Checks the llama.cpp context and placement options (KV cache types,

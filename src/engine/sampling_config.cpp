@@ -88,6 +88,12 @@ Status validate(const SamplingConfig& c) {
             return invalid("stop sequence exceeds " + std::to_string(SamplingConfig::kMaxStopSequenceBytes) + " bytes");
         }
     }
+    if (c.top_logprobs < 0 || c.top_logprobs > SamplingConfig::kMaxTopLogprobs) {
+        return invalid("top_logprobs must be within [0, " + std::to_string(SamplingConfig::kMaxTopLogprobs) + "]");
+    }
+    if (c.top_logprobs > 0 && !c.logprobs) {
+        return invalid("top_logprobs requires logprobs to be true");
+    }
     return Status::success();
 }
 

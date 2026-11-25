@@ -24,7 +24,9 @@ sonder_module_sources(
     src/residency.cpp
     src/request_path.cpp
     src/reasoning_budget.cpp
+    src/responses_handler.cpp
     src/thinking_pins.cpp
+    src/tool_call_parser.cpp
     src/residency_config.cpp
     src/serve_main.cpp
     src/serve_options.cpp

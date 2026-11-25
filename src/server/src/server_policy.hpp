@@ -50,6 +50,7 @@ enum class Route {
     sonder_plan,
     chat,
     completions,
+    responses,
     messages,
     embeddings,
     tokenize,

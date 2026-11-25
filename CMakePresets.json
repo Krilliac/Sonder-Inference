@@ -95,7 +95,7 @@
     {
       "name": "windows-rocm-xt",
       "displayName": "Windows ROCm/HIP (AMD RX XT RDNA 2/3/4 & Ryzen APU)",
-      "description": "Direct llama.cpp with AMD HIP SDK Clang on Windows targeting RDNA 2/3/4 discrete RX XT GPUs and RDNA 3 Ryzen APUs with HIP Graphs.",
+      "description": "Direct llama.cpp with AMD HIP SDK Clang on Windows targeting RDNA 2/3/4 discrete RX XT GPUs and RDNA 3 Ryzen APUs with HIP Graphs and rocWMMA FlashAttention.",
       "inherits": "base",
       "condition": {
         "type": "equals",
@@ -109,6 +109,7 @@
         "SONDER_WITH_LLAMA_CPP": "ON",
         "GGML_HIP": "ON",
         "GGML_HIP_GRAPHS": "ON",
+        "GGML_HIP_ROCWMMA_FATTN": "ON",
         "AMDGPU_TARGETS": "gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1200;gfx1201"
       }
     },
@@ -161,12 +162,13 @@
     {
       "name": "linux-rocm-xt",
       "displayName": "Linux ROCm/HIP (AMD RX XT RDNA 2/3/4 & Ryzen APU)",
-      "description": "Direct llama.cpp with ROCm/HIP targeting AMD RDNA 2/3/4 discrete RX XT GPUs and RDNA 3 Ryzen APUs with HIP Graphs.",
+      "description": "Direct llama.cpp with ROCm/HIP targeting AMD RDNA 2/3/4 discrete RX XT GPUs and RDNA 3 Ryzen APUs with HIP Graphs and rocWMMA FlashAttention.",
       "inherits": "linux-release",
       "cacheVariables": {
         "SONDER_WITH_LLAMA_CPP": "ON",
         "GGML_HIP": "ON",
         "GGML_HIP_GRAPHS": "ON",
+        "GGML_HIP_ROCWMMA_FATTN": "ON",
         "AMDGPU_TARGETS": "gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1200;gfx1201"
       }
     },

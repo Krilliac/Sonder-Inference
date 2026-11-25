@@ -29,11 +29,14 @@
 #include "server_test_support.hpp"
 #include "src/http.hpp"
 #include "src/identity.hpp"
+#include "src/json_schema_gbnf.hpp"
 #include "src/live_hub.hpp"
 #include "src/log_queue.hpp"
 #include "src/openai.hpp"
+#include "src/responses_handler.hpp"
 #include "src/server_endpoints.hpp"
 #include "src/sha256.hpp"
+#include "src/tool_call_parser.hpp"
 #include "sonder/inference/backend_setup.hpp"
 #include "sonder/inference/launch_profile.hpp"
 
@@ -203,7 +206,7 @@ TEST_CASE("openai: rejected and invalid requests name the field") {
     const std::string msgs = R"("messages":[{"role":"user","content":"hi"}])";
     CHECK(error_of("{").code == "invalid_json");
     CHECK(error_of("[]").code == "invalid_json");
-    for (const char* key : {"tools", "tool_choice", "functions", "function_call", "top_logprobs"}) {
+    for (const char* key : {"functions", "function_call"}) {
         const ApiError e = error_of("{" + msgs + R"(,")" + key + R"(":[1]})");
         CHECK(e.status == 400);
         CHECK(e.code == "unsupported_parameter");
@@ -218,12 +221,37 @@ TEST_CASE("openai: rejected and invalid requests name the field") {
     }
     CHECK(error_of("{" + msgs + R"(,"response_format":{"type":"xml"}})").code == "unsupported_parameter");
     CHECK(error_of("{" + msgs + R"(,"response_format":[1]})").code == "invalid_request");
-    CHECK(error_of("{" + msgs + R"(,"logprobs":true})").code == "unsupported_parameter");
+    // Valid logprobs + top_logprobs accepted; top_logprobs without logprobs:true or >20 rejected.
+    {
+        const auto lp_ok = parse_chat_request("{" + msgs + R"(,"logprobs":true,"top_logprobs":5})");
+        REQUIRE(std::holds_alternative<ChatJob>(lp_ok));
+        CHECK(std::get<ChatJob>(lp_ok).sampling.logprobs);
+        CHECK(std::get<ChatJob>(lp_ok).sampling.top_logprobs == 5);
+    }
+    CHECK(error_of("{" + msgs + R"(,"top_logprobs":3})").code == "invalid_sampling");
+    CHECK(error_of("{" + msgs + R"(,"logprobs":true,"top_logprobs":21})").code == "invalid_sampling");
+    CHECK(error_of("{" + msgs + R"(,"logprobs":"yes"})").code == "invalid_sampling");
     CHECK(error_of("{" + msgs + R"(,"n":2})").code == "unsupported_parameter");
-    CHECK(error_of(R"({"messages":[{"role":"user","content":[{"type":"text","text":"x"}]}]})").code ==
+    // Text/image content parts and assistant tool_calls are supported; unknown parts / SSRF URLs rejected.
+    {
+        const auto parts_ok =
+            parse_chat_request(R"({"messages":[{"role":"user","content":[{"type":"text","text":"x"}]}]})");
+        REQUIRE(std::holds_alternative<ChatJob>(parts_ok));
+        CHECK(std::get<ChatJob>(parts_ok).messages[0].content == "x");
+    }
+    CHECK(error_of(R"({"messages":[{"role":"user","content":[{"type":"input_audio","data":"x"}]}]})").code ==
           "unsupported_parameter");
-    CHECK(error_of(R"({"messages":[{"role":"assistant","content":null,"tool_calls":[]},{"role":"user","content":"x"}]})")
-              .code == "unsupported_parameter");
+    CHECK(error_of(R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://127.0.0.1/a.png"}}]}]})")
+              .code == "invalid_request");
+    {
+        const auto tc_ok = parse_chat_request(
+            R"({"messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c1","content":"ok"}]})");
+        REQUIRE(std::holds_alternative<ChatJob>(tc_ok));
+        REQUIRE(std::get<ChatJob>(tc_ok).messages.size() == 2u);
+        REQUIRE(std::get<ChatJob>(tc_ok).messages[0].tool_calls.size() == 1u);
+        CHECK(std::get<ChatJob>(tc_ok).messages[1].tool_call_id == std::optional<std::string>("c1"));
+    }
+    CHECK(error_of("{" + msgs + R"(,"tool_choice":"required"})").code == "invalid_request");
     CHECK(error_of(R"({"messages":[]})").code == "invalid_messages");
     CHECK(error_of(R"({"messages":[{"role":"narrator","content":"x"}]})").code == "invalid_messages");
     CHECK(error_of(R"({"messages":[{"role":"user","content":"x"},{"role":"assistant","content":"y"}]})").code ==
@@ -1629,4 +1657,236 @@ TEST_CASE("identity: llamacpp GGUF handles non-ASCII UTF-8 filenames cleanly") {
     CHECK(id.backend_identity.find("model_digest")->as_string() == sha256_hex(bytes));
     CHECK(id.backend_identity.find("template_digest")->as_string() == sha256_hex(chat_template));
     CHECK(id.backend_identity.find("tokenizer_digest")->as_string() == parsed.value().tokenizer_digest);
+}
+
+TEST_CASE("tool_call_parser: incremental byte-by-byte XML and fenced blocks, fallback, and GBNF") {
+    // 1. Byte-by-byte feed across <tool_call> and </tool_call> never leaks markup into visible_text.
+    {
+        const std::string raw =
+            "Before <tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"NYC\"}}</tool_call> after";
+        ToolCallStreamParser parser("call_t_");
+        std::string visible;
+        std::vector<ParsedToolEvent> events;
+        for (const char ch : raw) {
+            const auto out = parser.feed(std::string_view(&ch, 1));
+            visible += out.visible_text;
+            for (const auto& ev : out.tool_calls) events.push_back(ev);
+        }
+        const auto tail = parser.flush();
+        visible += tail.visible_text;
+        for (const auto& ev : tail.tool_calls) events.push_back(ev);
+
+        CHECK(visible == "Before  after");
+        REQUIRE(events.size() == 1u);
+        CHECK(events[0].index == 0u);
+        CHECK(events[0].id == "call_t_0");
+        CHECK(events[0].name == "get_weather");
+        CHECK(events[0].arguments_json == R"({"city":"NYC"})");
+    }
+
+    // 2. Fenced ```tool_call blocks + multiple sequential calls
+    {
+        const std::string raw =
+            "```tool_call\n{\"name\":\"a\",\"arguments\":{\"k\":1}}\n```\n"
+            "<tool_call>{\"name\":\"b\",\"arguments\":{\"k\":2}}</tool_call>";
+        const auto ext = extract_tool_calls(raw, "c_");
+        REQUIRE(ext.tool_calls.size() == 2u);
+        CHECK(ext.tool_calls[0].name == "a");
+        CHECK(ext.tool_calls[0].id == "c_0");
+        CHECK(ext.tool_calls[1].name == "b");
+        CHECK(ext.tool_calls[1].id == "c_1");
+        CHECK(ext.visible_text.find("tool_call") == std::string::npos);
+    }
+
+    // 3. Invalid JSON inside <tool_call> falls back to visible text safely (never drops output).
+    {
+        const auto ext = extract_tool_calls("<tool_call>not json</tool_call>");
+        CHECK(ext.tool_calls.empty());
+        CHECK(ext.visible_text == "<tool_call>not json</tool_call>");
+    }
+
+    // 4. build_tool_call_gbnf for required and named function
+    {
+        const std::vector<ToolDefinition> tools = {
+            {"alpha", "desc a", R"({"type":"object","properties":{"n":{"type":"integer"}},"required":["n"],"additionalProperties":false})"},
+            {"beta", "desc b", R"({"type":"object","properties":{"s":{"type":"string"}},"additionalProperties":false})"},
+        };
+        const auto g_req = build_tool_call_gbnf(tools, ToolChoice{ToolChoiceMode::required, ""});
+        REQUIRE_MESSAGE(g_req.ok(), g_req.status().message());
+        CHECK(g_req.value().find("<tool_call>") != std::string::npos);
+        CHECK(g_req.value().find("alpha") != std::string::npos);
+        CHECK(g_req.value().find("beta") != std::string::npos);
+
+        const auto g_fn = build_tool_call_gbnf(tools, ToolChoice{ToolChoiceMode::function, "beta"});
+        REQUIRE_MESSAGE(g_fn.ok(), g_fn.status().message());
+        CHECK(g_fn.value().find("beta") != std::string::npos);
+        CHECK(g_fn.value().find("alpha") == std::string::npos);
+    }
+}
+
+TEST_CASE("multimodal base64: strict RFC 4648 decode, size limit, and SSRF URI rejection") {
+    const std::vector<std::uint8_t> raw = {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
+    const std::string b64 = encode_base64(raw);
+    const auto uri_ok = parse_data_image_uri("data:image/png;base64," + b64, "url");
+    REQUIRE(std::holds_alternative<MediaContent>(uri_ok));
+    CHECK(std::get<MediaContent>(uri_ok).mime_type == "image/png");
+    CHECK(std::get<MediaContent>(uri_ok).bytes == raw);
+
+    // Enforces max decoded size cap
+    const auto too_big = decode_strict_base64(b64, 4, "img");
+    REQUIRE(std::holds_alternative<ApiError>(too_big));
+    CHECK(std::get<ApiError>(too_big).code == "invalid_request");
+
+    // Rejects non-canonical padding bits and whitespace
+    CHECK(std::holds_alternative<ApiError>(decode_strict_base64("AB==", 16, "img")));
+    CHECK(std::holds_alternative<ApiError>(decode_strict_base64("AA == ", 16, "img")));
+
+    // Rejects remote & file URLs strictly
+    for (const char* url : {"http://example.com/a.png", "https://example.com/a.png", "file:///etc/passwd",
+                            "data:text/plain;base64,SGVsbG8="}) {
+        CAPTURE(url);
+        const auto res = parse_data_image_uri(url, "url");
+        REQUIRE(std::holds_alternative<ApiError>(res));
+        CHECK(std::get<ApiError>(res).status == 400);
+        CHECK(std::get<ApiError>(res).code == "invalid_request");
+    }
+}
+
+TEST_CASE("responses_handler: LRU history store eviction and request parsing") {
+    ResponseHistoryStore store(3);
+    store.put({"r1", "sk1", "m", {{"user", "1"}}});
+    store.put({"r2", "sk2", "m", {{"user", "2"}}});
+    store.put({"r3", "sk3", "m", {{"user", "3"}}});
+    CHECK(store.size() == 3u);
+    // Touch r1 so r2 becomes LRU victim.
+    REQUIRE(store.get("r1").has_value());
+    store.put({"r4", "sk4", "m", {{"user", "4"}}});
+    CHECK(store.size() == 3u);
+    CHECK(store.get("r1").has_value());
+    CHECK_FALSE(store.get("r2").has_value());
+    CHECK(store.get("r3").has_value());
+    CHECK(store.get("r4").has_value());
+
+    // Valid responses request parsing (flat tool + text.format + reasoning + input array)
+    const auto parsed = parse_responses_request(
+        R"({"model":"m","instructions":"sys","previous_response_id":"resp_1",
+            "input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],
+            "tools":[{"type":"function","name":"fn1","parameters":{"type":"object"}}],
+            "tool_choice":{"type":"function","name":"fn1"},
+            "text":{"format":{"type":"json_object"}},
+            "reasoning":{"effort":"medium"},
+            "max_output_tokens":32,"temperature":0.2,"stream":true})");
+    REQUIRE(std::holds_alternative<ResponsesJob>(parsed));
+    const auto& job = std::get<ResponsesJob>(parsed);
+    CHECK(job.model == "m");
+    CHECK(job.instructions == std::optional<std::string>("sys"));
+    CHECK(job.previous_response_id == std::optional<std::string>("resp_1"));
+    REQUIRE(job.tools.size() == 1u);
+    CHECK(job.tools[0].name == "fn1");
+    REQUIRE(job.tool_choice.has_value());
+    CHECK(job.tool_choice->mode == ToolChoiceMode::function);
+    CHECK(job.tool_choice->function_name == "fn1");
+    CHECK(job.response_format_type == std::optional<std::string>("json_object"));
+    CHECK(job.sampling.max_tokens == 32);
+    CHECK(job.thinking.reasoning_effort == std::optional<std::string>("medium"));
+    CHECK(job.stream);
+
+    // SamplingConfig validation for logprobs / top_logprobs
+    SamplingConfig sc;
+    sc.logprobs = false;
+    sc.top_logprobs = 2;
+    CHECK_FALSE(validate(sc).ok());
+    sc.logprobs = true;
+    sc.top_logprobs = 20;
+    CHECK(validate(sc).ok());
+    sc.top_logprobs = 21;
+    CHECK_FALSE(validate(sc).ok());
+}
+
+TEST_CASE("security hardening: tool_call_parser embedded close tag, gbnf regex/sibling/DAG guards, history byte cap") {
+    // 1. Embedded </tool_call> inside JSON string literal must not prematurely close the block.
+    {
+        const std::string raw =
+            R"(<tool_call>{"name":"write_doc","arguments":{"text":"literal </tool_call> marker"}}</tool_call> done)";
+        const auto ext = extract_tool_calls(raw, "c_");
+        REQUIRE(ext.tool_calls.size() == 1u);
+        CHECK(ext.tool_calls[0].name == "write_doc");
+        auto args = json::parse(ext.tool_calls[0].arguments_json);
+        REQUIRE(args.ok());
+        CHECK(args.value().find("text")->as_string() == "literal </tool_call> marker");
+        CHECK(ext.visible_text == " done");
+    }
+
+    // 2. json_schema_gbnf rejects nested unbounded quantifiers, explosive nested repeats, and sibling constraints.
+    {
+        auto p1 = json::parse(R"({"type":"string","pattern":"^(a+)+$"})");
+        REQUIRE(p1.ok());
+        CHECK_FALSE(json_schema_to_gbnf(p1.value()).ok());
+
+        auto p2 = json::parse(R"({"type":"string","pattern":"^((a{10}){10}){10}$"})");
+        REQUIRE(p2.ok());
+        CHECK_FALSE(json_schema_to_gbnf(p2.value()).ok());
+
+        // Top-level anchored alternation compiles cleanly.
+        auto p3 = json::parse(R"({"type":"string","pattern":"^(foo|bar)$"})");
+        REQUIRE(p3.ok());
+        CHECK(json_schema_to_gbnf(p3.value()).ok());
+
+        // Sibling constraint next to $ref fails closed; annotation keywords remain allowed.
+        auto p4 = json::parse(R"({"$defs":{"s":{"type":"string"}},"$ref":"#/$defs/s","minLength":3})");
+        REQUIRE(p4.ok());
+        CHECK_FALSE(json_schema_to_gbnf(p4.value()).ok());
+
+        auto p5 = json::parse(R"({"$defs":{"s":{"type":"string"}},"$ref":"#/$defs/s","description":"ok","deprecated":true})");
+        REQUIRE(p5.ok());
+        CHECK(json_schema_to_gbnf(p5.value()).ok());
+
+        // Deep shared-$defs DAG in oneOf terminates quickly via memoization instead of exponential walk.
+        auto dag = json::parse(R"({
+            "$defs": {
+                "d0": {"const": "x"},
+                "d1": {"anyOf": [{"$ref":"#/$defs/d0"}, {"$ref":"#/$defs/d0"}]},
+                "d2": {"anyOf": [{"$ref":"#/$defs/d1"}, {"$ref":"#/$defs/d1"}]},
+                "d3": {"anyOf": [{"$ref":"#/$defs/d2"}, {"$ref":"#/$defs/d2"}]},
+                "d4": {"anyOf": [{"$ref":"#/$defs/d3"}, {"$ref":"#/$defs/d3"}]}
+            },
+            "oneOf": [{"$ref":"#/$defs/d4"}, {"type":"integer"}]
+        })");
+        REQUIRE(dag.ok());
+        CHECK(json_schema_to_gbnf(dag.value()).ok());
+    }
+
+    // 3. ResponseHistoryStore enforces total byte budget and drops oversized single entries.
+    {
+        ResponseHistoryStore store(64, 4096);
+        ResponseHistoryStore::Entry big;
+        big.id = "r_big";
+        big.session_key = "sk";
+        big.model = "m";
+        big.messages.push_back(ChatMessage{"user", std::string(3000, 'a')});
+        store.put(big);
+        CHECK(store.size() == 1u);
+
+        ResponseHistoryStore::Entry second = big;
+        second.id = "r_big2";
+        store.put(second);
+        // Second 3000-byte entry evicts r_big to stay within the 4096-byte cap.
+        CHECK(store.size() == 1u);
+        CHECK_FALSE(store.get("r_big").has_value());
+        CHECK(store.get("r_big2").has_value());
+
+        // Media blobs are stripped before retention.
+        ResponseHistoryStore::Entry with_media;
+        with_media.id = "r_media";
+        with_media.session_key = "sk";
+        with_media.model = "m";
+        ChatMessage m{"user", "look"};
+        m.media.push_back(MediaContent{"image/png", {1, 2, 3, 4}});
+        with_media.messages.push_back(std::move(m));
+        store.put(with_media);
+        auto got = store.get("r_media");
+        REQUIRE(got.has_value());
+        REQUIRE(got->messages.size() == 1u);
+        CHECK(got->messages[0].media.empty());
+    }
 }

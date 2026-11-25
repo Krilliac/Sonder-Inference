@@ -14,11 +14,11 @@ Sonder's header-only GGUF reader (`src/server/src/gguf_header.cpp`) recognizes t
 | --- | --- | ---: | ---: | ---: | --- | --- |
 | `34` | `TQ1_0` | 256 | 54 | 1.6875 | `has_ternary_tensors` | Pinned `llama.cpp b11195` or newer |
 | `35` | `TQ2_0` | 256 | 66 | 2.0625 | `has_ternary_tensors` | Pinned `llama.cpp b11195` or newer |
-| `39` | `MXFP4` | 32 | 17 | 4.25 | `has_fp4_or_fp8_tensors` | Pinned `llama.cpp b11195` or newer |
-| `40` | `NVFP4` | 64 | 36 | 4.50 | `has_fp4_or_fp8_tensors` | Mainline `ggml-org/llama.cpp >= b11556` (Blackwell FP4) |
+| `39` | `MXFP4` | 32 | 17 | 4.25 | `has_mxfp4_tensors`, `has_fp4_or_fp8_tensors` | Pinned `llama.cpp b11195` or newer (block-scaled FP4) |
+| `40` | `NVFP4` | 64 | 36 | 4.50 | `has_nvfp4_tensors`, `has_fp4_or_fp8_tensors` | Mainline `ggml-org/llama.cpp >= b11556` (Blackwell native FP4; software dequant on older GPUs) |
 | `41` | `Q1_0` | 128 | 18 | 1.125 | `has_one_bit_tensors` | Mainline `ggml-org/llama.cpp >= b11556` (1-bit Bonsai-1) |
 | `42` | `Q2_0` | 64 | 18 | 2.25 | `has_ternary_tensors` | Mainline `ggml-org/llama.cpp >= b11556` (2-bit ternary) |
-| `43` | `F8_E4M3` | 1 | 1 | 8.00 | `has_fp4_or_fp8_tensors` | Mainline `ggml-org/llama.cpp >= b11556` (Ada/Blackwell/RDNA 4 FP8) |
+| `43` | `F8_E4M3` | 1 | 1 | 8.00 | `has_fp8_tensors`, `has_fp4_or_fp8_tensors` | Mainline `ggml-org/llama.cpp >= b11556` (Ada/Blackwell/RDNA 4 FP8) |
 | `142` | `PQ2_0` | 128 | 34 | 2.125 | `has_ternary_tensors`, `has_prism_private_tensors` | `PrismML-Eng/llama.cpp` (`prism` branch; Bonsai-2) |
 | `143` | `PTQ1_0` | 128 | 28 | 1.75 | `has_ternary_tensors`, `has_prism_private_tensors` | `PrismML-Eng/llama.cpp` (`prism` branch; dense ternary) |
 | `145` | `PQ2_0M` | 128 | 36 | 2.25 | `has_ternary_tensors`, `has_prism_private_tensors` | `PrismML-Eng/llama.cpp` (`prism` branch; KV-only) |
@@ -90,8 +90,8 @@ The `llamaserver` backend requires no `llama.cpp` compile-time linkage: point `-
 | Windows 11 | NVIDIA RTX (`sm_86;89;120`, RTX 30/40/50) | `windows-cuda-rtx` | CUDA 12.8+ / 13.x + MSVC (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp`) |
 | Linux / WSL2 | NVIDIA Blackwell (`sm_120`, RTX 50-series) | `linux-cuda-blackwell` | CUDA 12.8+ / 13.x + GCC/Clang (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp`) |
 | Linux / WSL2 | NVIDIA RTX (`sm_86;89;120`, RTX 30/40/50) | `linux-cuda-rtx` | CUDA 12.8+ / 13.x + GCC/Clang (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp`) |
-| Windows 11 | AMD Radeon RX XT (RDNA 2/3/4) & Ryzen APU | `windows-rocm-xt` | AMD HIP SDK (`HIP_PATH`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (with matching `llama.cpp` tree) |
-| Linux | AMD Radeon RX XT (RDNA 2/3/4) & Ryzen APU | `linux-rocm-xt` | ROCm 6.x+ (`/dev/kfd`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (with matching `llama.cpp` tree) |
+| Windows 11 | AMD Radeon RX XT (RDNA 2/3/4) & Ryzen APU | `windows-rocm-xt` | AMD HIP SDK (`HIP_PATH`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `GGML_HIP_ROCWMMA_FATTN=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (with matching `llama.cpp` tree) |
+| Linux | AMD Radeon RX XT (RDNA 2/3/4) & Ryzen APU | `linux-rocm-xt` | ROCm 6.x+ (`/dev/kfd`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `GGML_HIP_ROCWMMA_FATTN=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (with matching `llama.cpp` tree) |
 | Windows / Linux | AMD RX XT, Ryzen APU UMA, Intel, Cross-Vendor | `windows-vulkan-xt` / `linux-vulkan-xt` | Vulkan SDK (`GGML_VULKAN=ON`) | Cross-vendor Vulkan compute (including systems without `/dev/kfd` or HIP SDK) |
 | Linux / WSL2 | CPU (x86_64 / ARM64) | `linux-llamacpp` | GCC/Clang + Ninja (`SONDER_WITH_LLAMA_CPP=ON`) | Direct CPU execution and CI compile/test verification |
 
@@ -122,8 +122,10 @@ The `llamaserver` backend requires no `llama.cpp` compile-time linkage: point `-
 For discrete NVIDIA RTX adapters, `plan_model_placement()` selects:
 
 - `flash_attn: "on"`, `kv_unified: true`, and `load_mode: "none"` for fully VRAM-resident models (automatically relaxed to `load_mode: "auto"` when `--n-cpu-moe`, `no_repack`, or partial `n_gpu_layers` is applied).
-- Initial KV cache `q8_0/q8_0` (stepping to `q4_0/q4_0` before context step-down if VRAM is tight, unless `--no-quantized-kv` is set).
-- Speculative decoding: `draft-mtp` (`draft_n_max: 3`) when GGUF `<arch>.nextn_predict_layers > 0` (such as `Ternary-Bonsai-2-4B-PQ2_0-MTP-Q8_0.gguf` and `Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf`), or lightweight `ngram-mod` for ternary/1-bit models without MTP layers (unless `--no-speculative` is set). Tied LM-head embeddings (`prism.hadamard.tied_output = 1` / `token_embd.weight` without `output.weight`) and trailing dense-attention MTP blocks are sized accurately in `estimate_vram()`.
+- Initial KV cache `q8_0/q8_0` (or `f8_e4m3/f8_e4m3` when `PlacementPlanRequest::prefer_fp8_kv` is enabled on discrete NVIDIA RTX GPUs with upstream `llama-server >= b11556`), stepping down through the 3-step ladder **`q8_0/q8_0` -> asymmetric `q8_0/q4_0` -> `q4_0/q4_0`** before shrinking context so keys retain 8-bit precision whenever the ~24% value-only savings are enough to fit VRAM (unless `--no-quantized-kv` is set).
+- **Blackwell (`sm_120`) FP4/FP8 sizing**: `gguf_header.cpp` and `vram_estimate.cpp` identify `MXFP4` (`4.25 bpw`, 17 B / 32 elems), `NVFP4` (`4.50 bpw`, 36 B / 64 elems), and `F8_E4M3` (`8.00 bpw` weights / `1.0 byte/elem` KV). On Blackwell GPUs (`sm_120`, RTX 50-series), `plan_model_placement()` notes native FP4 tensor-core acceleration for `NVFP4`; on older or non-NVIDIA GPUs it emits a software-dequantization warning.
+- **Dynamic SLRU MoE Expert Cache (`--moe-cache-mib` + `--moe-cache-cpu-share`) & Selective CPU Repacking**: when a MoE model fits 100% in VRAM, `--moe-cache-mib` is **never** enabled (avoiding ~10% graph-splitting overhead). When a MoE overflows VRAM via `--n-cpu-moe`, the planner computes remaining spare VRAM headroom after pinned GPU layers + KV + compute buffers and enables `--moe-cache-mib` + `--moe-cache-cpu-share` (`0.25–0.50` when host DDR5 RAM is ample) **only** when spare VRAM >= 512 MiB and covers the active CPU-offloaded expert working set (avoiding <75% hit-rate PCIe thrash). Global `--repack` is never emitted while GPU layers remain active (`repack_policy: "cpu_only_selective"`), and CPU-offloaded MoE decode recommends physical core count (`recommended_threads`, e.g. `logical_cores / 2` clamped >= 4) rather than oversubscribing SMT threads on DDR5 bandwidth.
+- Speculative decoding: `draft-mtp` (`draft_n_max: 3`) when GGUF `<arch>.nextn_predict_layers > 0` (such as `Ternary-Bonsai-2-4B-PQ2_0-MTP-Q8_0.gguf` and `Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf`), or lightweight `ngram-mod` for ternary/1-bit models without MTP layers (unless `--no-speculative` is set); launch profiles and `serve --spec-type` also support `suffix` (Arctic Suffix-Tree speculation). Tied LM-head embeddings (`prism.hadamard.tied_output = 1` / `token_embd.weight` without `output.weight`) and trailing dense-attention MTP blocks are sized accurately in `estimate_vram()`.
 - **Multi-GPU (`split_mode: "layer"` + `tensor_split`)**: when two or more discrete NVIDIA GPUs are available and a single GPU cannot fit the model (or when `--device multi` / `--device CUDA0,CUDA1` is requested), the planner sets `device: "CUDA0,CUDA1"`, `split_mode: "layer"`, proportional `tensor_split` weights sized to each GPU's usable VRAM budget, and `main_gpu` to the largest shard when index > 0. `VramEstimate::max_gpu_mib()` validates the heaviest single-GPU shard plus compute buffers. Direct `llamacpp` users can configure the same `devices`, `main_gpu`, `split_mode`, `tensor_split`, and `use_mlock` fields on `LlamaCppBackendOptions` / `LoadOptions` (see [PLACEMENT.md](PLACEMENT.md#multi-gpu-vendor-targeting-and-memory-locking-implemented)).
 
 ---
@@ -134,12 +136,19 @@ For discrete NVIDIA RTX adapters, `plan_model_placement()` selects:
 
 | Preset | Platform | Accelerator | Flags |
 | --- | --- | --- | --- |
-| `windows-rocm-xt` | Windows (AMD HIP SDK Clang + Ninja) | ROCm/HIP (`ROCm0`, ...) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `AMDGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1200;gfx1201` |
-| `linux-rocm-xt` | Linux (GCC/Clang + Ninja) | ROCm/HIP (`ROCm0`, ...) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `AMDGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1200;gfx1201` |
+| `windows-rocm-xt` | Windows (AMD HIP SDK Clang + Ninja) | ROCm/HIP (`ROCm0`, ...) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `GGML_HIP_ROCWMMA_FATTN=ON`, `AMDGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1200;gfx1201` |
+| `linux-rocm-xt` | Linux (GCC/Clang + Ninja) | ROCm/HIP (`ROCm0`, ...) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `GGML_HIP_ROCWMMA_FATTN=ON`, `AMDGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1200;gfx1201` |
 | `windows-vulkan-xt` | Windows (MSVC + Ninja) | Vulkan (`Vulkan0`, ...) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_VULKAN=ON` |
 | `linux-vulkan-xt` | Linux (GCC/Clang + Ninja) | Vulkan (`Vulkan0`, ...) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_VULKAN=ON` |
 
-`AMDGPU_TARGETS` covers RDNA 2 (`gfx1030`, RX 6800/6900 XT), RDNA 3 discrete (`gfx1100`, `gfx1101`, `gfx1102`, RX 7900/7800/7700/7600 XT), RDNA 3/3.5 Ryzen APUs (`gfx1103` Radeon 780M, `gfx1150` Radeon 890M), and RDNA 4 (`gfx1200`, `gfx1201`, RX 9070 XT). `GGML_HIP_GRAPHS=ON` enables HIP graph capture for lower kernel-launch overhead during decode.
+`AMDGPU_TARGETS` covers RDNA 2 (`gfx1030`, RX 6800/6900 XT), RDNA 3 discrete (`gfx1100`, `gfx1101`, `gfx1102`, RX 7900/7800/7700/7600 XT), RDNA 3/3.5 Ryzen APUs (`gfx1103` Radeon 780M, `gfx1150` Radeon 890M), and RDNA 4 (`gfx1200`, `gfx1201`, RX 9060 / RX 9070 XT). `GGML_HIP_GRAPHS=ON` enables HIP graph capture for lower kernel-launch overhead during decode, and `GGML_HIP_ROCWMMA_FATTN=ON` enables rocWMMA FlashAttention kernels on RDNA 3/4 (`gfx1100`–`gfx1201`).
+
+### RDNA 4 (`gfx1200`/`gfx1201`) Vulkan Cooperative Matrix vs ROCm Advisory
+
+On RDNA 4 discrete cards (RX 9060 `gfx1200`, RX 9070 / 9070 XT `gfx1201`), Vulkan's `VK_KHR_cooperative_matrix` path is a competitive or preferred fallback alongside ROCm (especially on Windows hosts without the HIP SDK or when evaluating FlashAttention kernel parity):
+
+- `plan_model_placement()` recognizes RDNA 4 PCI IDs (`0x7550`, `0x7551`, `0x7590`) and names (`9060`, `9070`, `gfx1200`, `gfx1201`, `RDNA 4`) and adds an explicit backend advisory in `plan.reasons` (noting `VK_KHR_cooperative_matrix` under Vulkan and `GGML_HIP_ROCWMMA_FATTN=ON` plus the Vulkan CoopMat fallback under ROCm).
+- `sonder-infer tune` (`grid_for_gpu()`) is aware of RDNA 4 and explicit `vulkan`/`rocm` GPU hints, sweeping `flash_attn` across `{"on", "auto"}` so operators can benchmark Vulkan CoopMat against ROCm WMMA FlashAttention head-to-head on their target model.
 
 ### Discovery, Per-Process Counters, and Environment Policy
 

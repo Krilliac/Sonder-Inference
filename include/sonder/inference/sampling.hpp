@@ -50,6 +50,11 @@ struct SamplingConfig {
     std::int32_t max_tokens = 256;
     // Stop sequences (each non-empty, at most kMaxStopSequences).
     std::vector<std::string> stop;
+    // Request per-token log probabilities.
+    bool logprobs = false;
+    // Number of top alternative token logprobs per step, [0, kMaxTopLogprobs].
+    // Requires logprobs == true when > 0.
+    std::int32_t top_logprobs = 0;
 
     // Which sampler fields the caller set explicitly. C++ only (not in the C ABI).
     // When `explicit_only` is true, a backend that has its own per-model defaults
@@ -71,6 +76,8 @@ struct SamplingConfig {
         kStop = 1u << 11,
         kLogitBias = 1u << 12,
         kNumCtx = 1u << 13,
+        kLogprobs = 1u << 14,
+        kTopLogprobs = 1u << 15,
     };
     bool explicit_only = false;
     std::uint32_t explicit_fields = 0;
@@ -83,6 +90,7 @@ struct SamplingConfig {
     static constexpr std::size_t kMaxLogitBiasEntries = 1024;
     static constexpr float kMaxPenaltyMagnitude = 2.0f;
     static constexpr float kMaxLogitBiasMagnitude = 100.0f;
+    static constexpr std::int32_t kMaxTopLogprobs = 20;
 
     // Deterministic preset used by tests and benchmarks.
     static SamplingConfig greedy(std::int32_t max_tokens = 128, std::uint64_t seed = 42);

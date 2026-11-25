@@ -1,6 +1,7 @@
 #include "openai.hpp"
 #include "json_schema_gbnf.hpp"
 #include "reasoning_budget.hpp"
+#include "tool_call_parser.hpp"
 
 #include <cmath>
 #include <limits>
@@ -205,8 +206,11 @@ std::optional<ApiError> read_int(const json::Object& body, const char* key, std:
         return std::nullopt;
     }
     std::int64_t n = 0;
-    if (v->is_integer()) {
-        n = v->as_int();
+    if (const auto exact = v->try_as_int()) {
+        n = *exact;
+    } else if (v->is_integer()) {
+        return bad("invalid_sampling",
+                   std::string(key) + " must be between " + std::to_string(lo) + " and " + std::to_string(hi), key);
     } else if (v->is_number() && std::isfinite(v->as_double()) && std::floor(v->as_double()) == v->as_double() &&
                std::fabs(v->as_double()) < 9.0e15) {
         n = static_cast<std::int64_t>(v->as_double());
@@ -404,20 +408,28 @@ std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body_text) {
     const json::Object& body = parsed.value().as_object();
     ChatJob job;
 
-    // Features this API does not provide (rejected rather than ignored, so a
-    // client never silently loses tools or logprobs).
-    for (const char* key : {"tools", "tool_choice", "functions", "function_call", "top_logprobs"}) {
+    // Legacy/unsupported OpenAI fields rejected explicitly rather than ignored.
+    for (const char* key : {"functions", "function_call"}) {
         if (present(body.find(key))) {
             return bad("unsupported_parameter", std::string(key) + " is not supported by sonder-inference", key);
         }
-    }
-    if (const json::Value* lp = body.find("logprobs"); present(lp) && !(lp->is_bool() && !lp->as_bool())) {
-        return bad("unsupported_parameter", "logprobs is not supported by sonder-inference", "logprobs");
     }
     if (const json::Value* n = body.find("n"); present(n)) {
         if (!n->is_number() || n->as_double() != 1.0) {
             return bad("unsupported_parameter", "only n = 1 is supported", "n");
         }
+    }
+    if (const json::Value* tools_v = body.find("tools"); present(tools_v)) {
+        if (auto e = parse_openai_tools(*tools_v, job.tools, false)) {
+            return *e;
+        }
+    }
+    if (const json::Value* tc_v = body.find("tool_choice"); present(tc_v)) {
+        ToolChoice tc;
+        if (auto e = parse_openai_tool_choice(*tc_v, job.tools, tc, false)) {
+            return *e;
+        }
+        job.tool_choice = std::move(tc);
     }
 
     if (const json::Value* model = body.find("model"); present(model)) {
@@ -449,6 +461,7 @@ std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body_text) {
     if (!present(messages) || !messages->is_array() || messages->as_array().empty()) {
         return bad("invalid_messages", "messages must be a non-empty array", "messages");
     }
+    std::size_t total_images = 0;
     for (std::size_t i = 0; i < messages->as_array().size(); ++i) {
         const json::Value& m = messages->as_array()[i];
         const std::string where = "messages[" + std::to_string(i) + "]";
@@ -459,23 +472,97 @@ std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body_text) {
         if (!present(role) || !role->is_string() || !is_known_chat_role(role->as_string())) {
             return bad("invalid_messages", where + ".role must be system, user, assistant or tool", where + ".role");
         }
-        if (present(m.find("tool_calls"))) {
-            return bad("unsupported_parameter", where + ".tool_calls is not supported", where + ".tool_calls");
+        ChatMessage msg;
+        msg.role = role->as_string();
+        if (const json::Value* name_v = m.find("name"); present(name_v)) {
+            if (!name_v->is_string()) {
+                return bad("invalid_messages", where + ".name must be a string", where + ".name");
+            }
+            msg.name = name_v->as_string();
         }
-        const json::Value* content = m.find("content");
-        if (!present(content) || !content->is_string()) {
-            return bad("unsupported_parameter", where + ".content must be a string (content parts are not supported)",
-                       where + ".content");
-        }
-        job.messages.push_back(ChatMessage{role->as_string(), content->as_string()});
-        if (role->as_string() == "assistant") {
-            if (const auto* reasoning = m.find("reasoning_content")) {
-                if (!reasoning->is_string()) {
-                    return bad("invalid_messages", where + ".reasoning_content must be a string", where + ".reasoning_content");
-                }
-                job.messages.back().reasoning_content = reasoning->as_string();
+        if (const json::Value* tcs = m.find("tool_calls"); present(tcs)) {
+            if (msg.role != "assistant") {
+                return bad("invalid_messages", where + ".tool_calls is only valid on assistant messages",
+                           where + ".tool_calls");
+            }
+            if (auto e = parse_openai_message_tool_calls(*tcs, msg.tool_calls, where + ".tool_calls")) {
+                return *e;
             }
         }
+        if (const json::Value* tcid = m.find("tool_call_id"); present(tcid)) {
+            if (msg.role != "tool") {
+                return bad("invalid_messages", where + ".tool_call_id is only valid on tool messages",
+                           where + ".tool_call_id");
+            }
+            if (!tcid->is_string() || tcid->as_string().empty()) {
+                return bad("invalid_messages", where + ".tool_call_id must be a non-empty string",
+                           where + ".tool_call_id");
+            }
+            msg.tool_call_id = tcid->as_string();
+        }
+        const json::Value* content = m.find("content");
+        if (!present(content)) {
+            if (msg.role == "assistant" && !msg.tool_calls.empty()) {
+                msg.content.clear();
+            } else {
+                return bad("invalid_messages", where + ".content must be a string or content parts array",
+                           where + ".content");
+            }
+        } else if (content->is_string()) {
+            msg.content = content->as_string();
+        } else if (content->is_array()) {
+            const auto& parts = content->as_array();
+            for (std::size_t j = 0; j < parts.size(); ++j) {
+                const std::string pwhere = where + ".content[" + std::to_string(j) + "]";
+                if (!parts[j].is_object()) {
+                    return bad("invalid_messages", pwhere + " must be an object", pwhere);
+                }
+                const json::Value* ptype = parts[j].find("type");
+                if (!present(ptype) || !ptype->is_string()) {
+                    return bad("invalid_messages", pwhere + ".type must be a string", pwhere + ".type");
+                }
+                if (ptype->as_string() == "text") {
+                    const json::Value* text = parts[j].find("text");
+                    if (!present(text) || !text->is_string()) {
+                        return bad("invalid_messages", pwhere + ".text must be a string", pwhere + ".text");
+                    }
+                    msg.content += text->as_string();
+                } else if (ptype->as_string() == "image_url") {
+                    const json::Value* iu = parts[j].find("image_url");
+                    const json::Value* url = (iu != nullptr && iu->is_object()) ? iu->find("url") : nullptr;
+                    if (!present(url) || !url->is_string()) {
+                        return bad("invalid_request", pwhere + ".image_url.url must be a string",
+                                   pwhere + ".image_url.url");
+                    }
+                    if (++total_images > kMaxImagesPerRequest) {
+                        return bad("invalid_request",
+                                   "request exceeds maximum of " + std::to_string(kMaxImagesPerRequest) + " images",
+                                   "messages");
+                    }
+                    auto media = parse_data_image_uri(url->as_string(), pwhere + ".image_url.url");
+                    if (auto* err = std::get_if<ApiError>(&media)) {
+                        return *err;
+                    }
+                    msg.media.push_back(std::move(std::get<MediaContent>(media)));
+                } else {
+                    return bad("unsupported_parameter",
+                               pwhere + ".type '" + ptype->as_string() + "' is not supported", pwhere + ".type");
+                }
+            }
+        } else {
+            return bad("invalid_messages", where + ".content must be a string or content parts array",
+                       where + ".content");
+        }
+        if (msg.role == "assistant") {
+            if (const auto* reasoning = m.find("reasoning_content"); present(reasoning)) {
+                if (!reasoning->is_string()) {
+                    return bad("invalid_messages", where + ".reasoning_content must be a string",
+                               where + ".reasoning_content");
+                }
+                msg.reasoning_content = reasoning->as_string();
+            }
+        }
+        job.messages.push_back(std::move(msg));
     }
     if (Status st = validate_chat_messages(job.messages); !st.ok()) {
         return bad("invalid_messages", st.message(), "messages");
@@ -501,6 +588,27 @@ std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body_text) {
     job.sampling.max_tokens = kDefaultMaxTokens;
     if (auto e = read_sampling(body, job.sampling)) {
         return *e;
+    }
+    if (const json::Value* lp = body.find("logprobs"); present(lp)) {
+        if (!lp->is_bool()) {
+            return bad("invalid_sampling", "logprobs must be a boolean", "logprobs");
+        }
+        job.sampling.logprobs = lp->as_bool();
+        if (job.sampling.logprobs) {
+            job.sampling.explicit_fields |= SamplingConfig::kLogprobs;
+        }
+    }
+    if (const json::Value* tlp = body.find("top_logprobs"); present(tlp)) {
+        std::int64_t k = 0;
+        bool set = false;
+        if (auto e = read_int(body, "top_logprobs", 0, SamplingConfig::kMaxTopLogprobs, k, set)) {
+            return *e;
+        }
+        if (!job.sampling.logprobs) {
+            return bad("invalid_sampling", "top_logprobs requires logprobs to be true", "top_logprobs");
+        }
+        job.sampling.top_logprobs = static_cast<std::int32_t>(k);
+        job.sampling.explicit_fields |= SamplingConfig::kTopLogprobs;
     }
     if (Status st = validate(job.sampling); !st.ok()) {
         return bad("invalid_sampling", st.message());
@@ -571,10 +679,6 @@ std::variant<CompletionJob, ApiError> parse_completion_request(std::string_view 
     const json::Object& body = parsed.value().as_object();
     CompletionJob job;
 
-    if (const json::Value* lp = body.find("logprobs");
-        present(lp) && !(lp->is_bool() && !lp->as_bool()) && !(lp->is_integer() && lp->as_int() == 0)) {
-        return bad("unsupported_parameter", "logprobs is not supported by sonder-inference", "logprobs");
-    }
     if (const json::Value* n = body.find("n"); present(n)) {
         if (!n->is_number() || n->as_double() != 1.0) {
             return bad("unsupported_parameter", "only n = 1 is supported", "n");
@@ -637,6 +741,42 @@ std::variant<CompletionJob, ApiError> parse_completion_request(std::string_view 
     job.sampling = SamplingConfig{};
     job.sampling.max_tokens = kDefaultMaxTokens;
     if (auto e = read_sampling(body, job.sampling)) return *e;
+    if (const json::Value* lp = body.find("logprobs"); present(lp)) {
+        if (lp->is_bool()) {
+            job.sampling.logprobs = lp->as_bool();
+            if (job.sampling.logprobs) {
+                job.sampling.explicit_fields |= SamplingConfig::kLogprobs;
+            }
+        } else if (lp->is_integer()) {
+            const auto exact = lp->try_as_int();
+            if (!exact || *exact < 0 || *exact > SamplingConfig::kMaxTopLogprobs) {
+                return bad("invalid_sampling",
+                           "logprobs must be a boolean or an integer between 0 and " +
+                               std::to_string(SamplingConfig::kMaxTopLogprobs),
+                           "logprobs");
+            }
+            const std::int64_t k = *exact;
+            if (k > 0) {
+                job.sampling.logprobs = true;
+                job.sampling.top_logprobs = static_cast<std::int32_t>(k);
+                job.sampling.explicit_fields |= SamplingConfig::kLogprobs | SamplingConfig::kTopLogprobs;
+            }
+        } else {
+            return bad("invalid_sampling", "logprobs must be a boolean or an integer between 0 and 20", "logprobs");
+        }
+    }
+    if (const json::Value* tlp = body.find("top_logprobs"); present(tlp)) {
+        std::int64_t k = 0;
+        bool set = false;
+        if (auto e = read_int(body, "top_logprobs", 0, SamplingConfig::kMaxTopLogprobs, k, set)) {
+            return *e;
+        }
+        if (!job.sampling.logprobs) {
+            return bad("invalid_sampling", "top_logprobs requires logprobs to be true", "top_logprobs");
+        }
+        job.sampling.top_logprobs = static_cast<std::int32_t>(k);
+        job.sampling.explicit_fields |= SamplingConfig::kTopLogprobs;
+    }
     if (Status st = validate(job.sampling); !st.ok()) {
         return bad("invalid_sampling", st.message());
     }
@@ -696,12 +836,12 @@ std::variant<DetokenizeJob, ApiError> parse_detokenize_request(std::string_view 
         if (!arr[i].is_integer()) {
             return bad("invalid_request", "tokens[" + std::to_string(i) + "] must be an integer", "tokens");
         }
-        const std::int64_t id = arr[i].as_int();
-        if (id < std::numeric_limits<TokenId>::min() || id > std::numeric_limits<TokenId>::max()) {
+        const auto exact = arr[i].try_as_int();
+        if (!exact || *exact < std::numeric_limits<TokenId>::min() || *exact > std::numeric_limits<TokenId>::max()) {
             return bad("invalid_request", "tokens[" + std::to_string(i) + "] is out of 32-bit token id range",
                        "tokens");
         }
-        job.tokens.push_back(static_cast<TokenId>(id));
+        job.tokens.push_back(static_cast<TokenId>(*exact));
     }
     return job;
 }
@@ -794,6 +934,9 @@ std::variant<Correlation, ApiError> parse_correlation(const RequestHead& head) {
 const char* finish_reason(const GenerationResult& result) noexcept {
     if (result.outcome == RequestOutcome::cancelled) {
         return "cancelled";
+    }
+    if (result.stats.stop_reason == StopReason::tool_calls || !result.tool_calls.empty()) {
+        return "tool_calls";
     }
     if (result.stats.stop_reason == StopReason::max_tokens) {
         return "length";

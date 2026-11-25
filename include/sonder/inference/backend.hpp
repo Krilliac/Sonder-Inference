@@ -44,6 +44,9 @@ enum class Capability : std::uint32_t {
     remote_process = 1u << 15, // execution happens in another process/server
     token_logits = 1u << 16,   // exposes per-step logits (open_token_stream); Sonder samples
     recurrent_checkpoint = 1u << 17,  // supports recurrent/hybrid sequence state capture & restore
+    tool_calling = 1u << 18,   // supports native function/tool calling
+    multimodal = 1u << 19,     // supports multimodal media inputs (validated base64 images)
+    logprobs = 1u << 20,       // supports per-token logprobs / top_logprobs
 };
 
 // Maximum serialized byte size permitted for a single recurrent-state snapshot.
@@ -145,6 +148,53 @@ struct EmbedResult {
     std::uint64_t eval_ns = 0;
 };
 
+struct TopLogprob {
+    std::string token;
+    float logprob = 0.0f;
+};
+
+struct TokenLogprob {
+    std::string token;
+    float logprob = 0.0f;
+    std::vector<TopLogprob> top_logprobs{};
+};
+
+// Tool/function definition advertised to a model.
+struct ToolDefinition {
+    std::string name;
+    std::string description;
+    // Serialized JSON Schema object for function parameters (empty = unconstrained object).
+    std::string parameters_json;
+};
+
+enum class ToolChoiceMode { auto_choice, none, required, function };
+
+struct ToolChoice {
+    ToolChoiceMode mode = ToolChoiceMode::auto_choice;
+    // Populated when mode == ToolChoiceMode::function.
+    std::string function_name;
+};
+
+struct ToolCall {
+    std::string id;
+    std::string name;
+    std::string arguments_json;
+};
+
+// Incremental streaming delta for a tool call (OpenAI delta.tool_calls item).
+struct ToolCallDelta {
+    std::uint32_t index = 0;
+    std::string id;
+    std::string name;
+    std::string arguments_delta;
+};
+
+// Validated in-memory binary media attachment (decoded from data: base64 URI).
+struct MediaContent {
+    std::string mime_type;
+    std::vector<std::uint8_t> bytes;
+};
+
 struct TokenChunk {
     std::string_view text;
     std::uint64_t index = 0;  // 0-based chunk index within the request
@@ -152,6 +202,11 @@ struct TokenChunk {
     // caller explicitly requests separate reasoning; legacy callers continue
     // to receive text-only chunks.
     std::string_view reasoning{};
+    // Optional per-token log probability and top-K alternatives when requested.
+    std::optional<float> logprob = std::nullopt;
+    std::vector<TopLogprob> top_logprobs{};
+    // Optional native upstream tool call deltas (e.g. from llama-server).
+    std::vector<ToolCallDelta> tool_call_deltas{};
 };
 
 // Per-request timing observations reported by llama-server. Each member is
@@ -167,7 +222,7 @@ struct BackendTimings {
     std::optional<std::uint64_t> draft_n_accepted = std::nullopt;
 };
 
-enum class StopReason { none, max_tokens, stop_sequence, end_of_sequence, cancelled, callback, error };
+enum class StopReason { none, max_tokens, stop_sequence, end_of_sequence, cancelled, callback, error, tool_calls };
 const char* to_string(StopReason reason) noexcept;
 
 struct GenerateStats {
@@ -228,6 +283,14 @@ struct ChatMessage {
     // Native reasoning history is optional and is ignored by backends that do
     // not have a separate reasoning channel.
     std::optional<std::string> reasoning_content = std::nullopt;
+    // Optional assistant tool calls (role == "assistant").
+    std::vector<ToolCall> tool_calls{};
+    // Optional tool result correlation id (role == "tool").
+    std::optional<std::string> tool_call_id = std::nullopt;
+    // Optional participant / tool name.
+    std::optional<std::string> name = std::nullopt;
+    // Optional validated in-memory media attachments (base64 images).
+    std::vector<MediaContent> media{};
 };
 
 // Reasoning ("thinking") controls for native-chat backends. Unset fields are
@@ -262,6 +325,9 @@ struct ChatRequest {
     // handle response_format natively (e.g. llama-server).
     std::optional<std::string> response_format_type = std::nullopt;
     std::optional<std::string> response_format_schema = std::nullopt;
+    // Optional tool definitions and tool_choice policy.
+    std::vector<ToolDefinition> tools{};
+    std::optional<ToolChoice> tool_choice = std::nullopt;
 };
 
 // True for "system", "user", "assistant" and "tool".
