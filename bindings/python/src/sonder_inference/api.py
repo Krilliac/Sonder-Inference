@@ -28,10 +28,12 @@ from .errors import (
 )
 
 TokenCallback = Callable[[str], Optional[bool]]
+ReasoningCallback = Callable[[str], Optional[bool]]
 TelemetryCallback = Callable[[str], None]
 LogitBiasInput = Union[Mapping[int, float], Sequence[tuple[int, float]]]
 
 _INT32_MIN, _INT32_MAX = -(2**31), 2**31 - 1
+_INT64_MAX = 2**63 - 1
 _UINT64_MAX = 2**64 - 1
 _CORRELATION_ID_RE = re.compile(rf"[A-Za-z0-9._:-]{{1,{S.MAX_CORRELATION_ID_BYTES}}}", re.ASCII)
 _H = TypeVar("_H", bound="_Handle")
@@ -49,6 +51,86 @@ class Outcome(enum.IntEnum):
     COMPLETED = 1
     CANCELLED = 2
     FAILED = 3
+
+
+class StopReason(enum.IntEnum):
+    """Mirror of ``sonder_stop_reason``."""
+
+    NONE = 0
+    MAX_TOKENS = 1
+    STOP_SEQUENCE = 2
+    END_OF_SEQUENCE = 3
+    CANCELLED = 4
+    CALLBACK = 5
+    ERROR = 6
+    TOOL_CALLS = 7
+
+
+class ToolChoiceMode(enum.IntEnum):
+    """Mirror of ``sonder_tool_choice_mode``."""
+
+    UNSET = 0
+    AUTO = 1
+    NONE = 2
+    REQUIRED = 3
+    FUNCTION = 4
+
+
+class ChunkKind(enum.IntEnum):
+    """Mirror of ``sonder_chunk_kind``."""
+
+    TEXT = 0
+    REASONING = 1
+    TOOL_CALL_DELTA = 2
+
+
+@dataclass(frozen=True)
+class ToolDefinition:
+    """Function/tool schema advertised to native tool-calling backends."""
+
+    name: str
+    description: str = ""
+    parameters_json: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ToolChoice:
+    """Tool selection policy for chat requests."""
+
+    mode: ToolChoiceMode = ToolChoiceMode.AUTO
+    function_name: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ToolCallDelta:
+    """One streamed tool-call delta emitted by a native tool-calling backend."""
+
+    index: int
+    id: Optional[str] = None
+    name: Optional[str] = None
+    arguments_delta: str = ""
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """Reassembled tool call produced during generation."""
+
+    id: str
+    name: str
+    arguments_json: str
+
+
+ToolCallDeltaCallback = Callable[[ToolCallDelta], Optional[bool]]
+
+
+@dataclass(frozen=True)
+class EmbedResult:
+    """Result of :meth:`Session.embed`."""
+
+    embeddings: tuple[tuple[float, ...], ...]
+    prompt_tokens: int
+    eval_ns: int
+    dimensions: int
 
 
 class WorkloadClass(enum.IntEnum):
@@ -323,6 +405,18 @@ class GenerationResult:
     chunks: int
     ttft_ms: Optional[float]  # None when no output was produced
     total_ms: float
+    reasoning: str = ""
+    tool_calls: tuple[ToolCall, ...] = ()
+    cached_tokens: Optional[int] = None
+    stop_reason: StopReason = StopReason.NONE
+    load_ns: int = 0
+    prompt_eval_ns: int = 0
+    eval_ns: int = 0
+    prompt_ms: Optional[float] = None
+    predicted_ms: Optional[float] = None
+    predicted_tokens_per_second: Optional[float] = None
+    draft_tokens: Optional[int] = None
+    draft_accepted_tokens: Optional[int] = None
 
     @property
     def completed(self) -> bool:
@@ -478,9 +572,15 @@ class SessionMetadata:
         return record
 
 
+@dataclass
+class _CRequestMetadata:
+    struct: S.CRequestMetadata
+    keepalive: tuple[Any, ...] = ()
+
+
 @dataclass(frozen=True)
 class RequestMetadata:
-    """Caller parent lineage and ADR-020 scheduling metadata for one request.
+    """Caller parent lineage, ADR-020 scheduling metadata, and v1.x controls.
 
     None leaves the parent absent and workload_class at the session default.
     Identifiers must not contain prompts, secrets or personal data. Explicit
@@ -491,8 +591,30 @@ class RequestMetadata:
     parent_request_id: Optional[str] = None
     workload_class: Optional[Union[WorkloadClass, int]] = None
     priority: int = 0
+    grammar: Optional[str] = None
+    response_format_type: Optional[str] = None
+    response_format_schema: Optional[str] = None
+    separate_reasoning: bool = False
+    enable_thinking: Optional[bool] = None
+    reasoning_effort: Optional[str] = None
+    reasoning_budget_tokens: Optional[int] = None
+    tools: Optional[Sequence[ToolDefinition]] = None
+    tool_choice: Optional[ToolChoice] = None
 
-    def _to_c(self) -> "S.CRequestMetadata":
+    def uses_v1x_controls(self) -> bool:
+        return (
+            self.grammar is not None
+            or self.response_format_type is not None
+            or self.response_format_schema is not None
+            or bool(self.separate_reasoning)
+            or self.enable_thinking is not None
+            or self.reasoning_effort is not None
+            or self.reasoning_budget_tokens is not None
+            or bool(self.tools)
+            or self.tool_choice is not None
+        )
+
+    def _marshal(self, *, struct_size: Optional[int] = None) -> _CRequestMetadata:
         value = self.parent_request_id
         if value is not None and (not isinstance(value, str) or
                                   _CORRELATION_ID_RE.fullmatch(value) is None):
@@ -509,12 +631,99 @@ class RequestMetadata:
             raise InvalidArgumentError("priority must be an int in [-16, 16]")
         if not -16 <= self.priority <= 16:
             raise InvalidArgumentError("priority must be an int in [-16, 16]")
+
+        keepalive: list[Any] = []
         record = S.CRequestMetadata()
-        record.struct_size = ctypes.sizeof(record)
-        record.parent_request_id = value.encode("ascii") if value is not None else None
+        record.struct_size = ctypes.sizeof(record) if struct_size is None else struct_size
+        parent_b = value.encode("ascii") if value is not None else None
+        if parent_b is not None:
+            keepalive.append(parent_b)
+        record.parent_request_id = parent_b
         record.workload_class = workload
         record.priority = self.priority
-        return record
+
+        if self.grammar is not None:
+            grammar_b = _cstr("grammar", self.grammar)
+            keepalive.append(grammar_b)
+            record.grammar = grammar_b
+        if self.response_format_type is not None:
+            fmt_b = _cstr("response_format_type", self.response_format_type)
+            if self.response_format_type not in ("text", "json_object", "json_schema"):
+                raise InvalidArgumentError("response_format_type must be 'text', 'json_object', or 'json_schema'")
+            keepalive.append(fmt_b)
+            record.response_format_type = fmt_b
+        if self.response_format_schema is not None:
+            if self.response_format_type != "json_schema":
+                raise InvalidArgumentError("response_format_schema requires response_format_type == 'json_schema'")
+            schema_b = _cstr("response_format_schema", self.response_format_schema)
+            keepalive.append(schema_b)
+            record.response_format_schema = schema_b
+        if not isinstance(self.separate_reasoning, bool):
+            raise TypeError(f"separate_reasoning must be a bool, got {type(self.separate_reasoning).__name__}")
+        record.separate_reasoning = 1 if self.separate_reasoning else 0
+        if self.enable_thinking is not None:
+            if not isinstance(self.enable_thinking, bool):
+                raise TypeError(f"enable_thinking must be a bool or None, got {type(self.enable_thinking).__name__}")
+            record.enable_thinking = 1 if self.enable_thinking else -1
+        if self.reasoning_effort is not None:
+            effort_b = _cstr("reasoning_effort", self.reasoning_effort)
+            keepalive.append(effort_b)
+            record.reasoning_effort = effort_b
+        if self.reasoning_budget_tokens is not None:
+            if (isinstance(self.reasoning_budget_tokens, bool)
+                    or not isinstance(self.reasoning_budget_tokens, int)
+                    or self.reasoning_budget_tokens < 0
+                    or self.reasoning_budget_tokens > _INT64_MAX):
+                raise InvalidArgumentError("reasoning_budget_tokens must be a non-negative int64")
+            record.has_reasoning_budget = 1
+            record.reasoning_budget_tokens = self.reasoning_budget_tokens
+        if self.tools is not None:
+            if isinstance(self.tools, (str, bytes, bytearray)):
+                raise TypeError("tools must be a sequence of ToolDefinition")
+            tool_list = list(self.tools)
+            if len(tool_list) > S.MAX_TOOLS:
+                raise InvalidArgumentError(f"tools accepts at most {S.MAX_TOOLS} definitions")
+            if tool_list:
+                c_tools = (S.CToolDefinition * len(tool_list))()
+                for i, td in enumerate(tool_list):
+                    if not isinstance(td, ToolDefinition):
+                        raise TypeError(f"tools[{i}] must be a ToolDefinition, got {type(td).__name__}")
+                    name_b = _cstr(f"tools[{i}].name", td.name)
+                    if not name_b:
+                        raise InvalidArgumentError(f"tools[{i}].name must be non-empty")
+                    desc_b = _cstr(f"tools[{i}].description", td.description) if td.description else None
+                    params_b = (
+                        _cstr(f"tools[{i}].parameters_json", td.parameters_json)
+                        if td.parameters_json is not None
+                        else None
+                    )
+                    keepalive.extend(b for b in (name_b, desc_b, params_b) if b is not None)
+                    c_tools[i] = S.CToolDefinition(
+                        S.TOOL_DEFINITION_SIZE, 0, name_b, desc_b, params_b
+                    )
+                keepalive.append(c_tools)
+                record.tools = ctypes.cast(c_tools, ctypes.POINTER(S.CToolDefinition))
+                record.tool_count = len(tool_list)
+        if self.tool_choice is not None:
+            if not isinstance(self.tool_choice, ToolChoice):
+                raise TypeError(f"tool_choice must be a ToolChoice or None, got {type(self.tool_choice).__name__}")
+            mode = ToolChoiceMode(self.tool_choice.mode)
+            record.tool_choice_mode = int(mode)
+            if mode == ToolChoiceMode.FUNCTION:
+                if not self.tool_choice.function_name:
+                    raise InvalidArgumentError("tool_choice.function_name is required when mode == FUNCTION")
+                fn_b = _cstr("tool_choice.function_name", self.tool_choice.function_name)
+                keepalive.append(fn_b)
+                record.tool_choice_function = fn_b
+            elif self.tool_choice.function_name is not None:
+                fn_b = _cstr("tool_choice.function_name", self.tool_choice.function_name)
+                keepalive.append(fn_b)
+                record.tool_choice_function = fn_b
+        record._keepalive = tuple(keepalive)
+        return _CRequestMetadata(record, tuple(keepalive))
+
+    def _to_c(self) -> "S.CRequestMetadata":
+        return self._marshal().struct
 
 
 def _make_telemetry_trampoline(cb_lock: threading.RLock, state: dict[str, Any]) -> Any:
@@ -808,7 +1017,9 @@ class Session(_Handle):
         self._stream_cancel_epoch = 0
 
     def generate(self, prompt: str, on_token: Optional[TokenCallback] = None, *,
-                 metadata: Optional[RequestMetadata] = None) -> GenerationResult:
+                 metadata: Optional[RequestMetadata] = None,
+                 on_reasoning: Optional[ReasoningCallback] = None,
+                 on_tool_call_delta: Optional[ToolCallDeltaCallback] = None) -> GenerationResult:
         """Run a request to completion.
 
         ``on_token(text)`` is called for each streamed chunk (UTF-8 decoded
@@ -817,8 +1028,42 @@ class Session(_Handle):
         generation and is re-raised here.
         """
         prompt_b = _cstr("prompt", prompt)
+        if self._should_use_ex("sonder_session_generate_ex", metadata, on_reasoning, on_tool_call_delta):
+            marshalled = self._marshal_metadata(metadata)
+            meta_ptr = ctypes.pointer(marshalled.struct) if marshalled is not None else None
+            return self._request_ex(
+                getattr(self._lib.cdll, "sonder_session_generate_ex"),
+                (prompt_b, meta_ptr),
+                on_token,
+                on_reasoning=on_reasoning,
+                on_tool_call_delta=on_tool_call_delta,
+                keepalive=marshalled,
+            )
         function, args = self._request_args("sonder_session_generate", (prompt_b,), metadata)
         return self._request(function, args, on_token)
+
+    def _should_use_ex(self, ex_symbol: str, metadata: Optional[RequestMetadata],
+                       on_reasoning: Optional[ReasoningCallback],
+                       on_tool_call_delta: Optional[ToolCallDeltaCallback]) -> bool:
+        if metadata is not None and not isinstance(metadata, RequestMetadata):
+            raise InvalidArgumentError("metadata must be RequestMetadata or None")
+        needs_ex = (
+            on_reasoning is not None
+            or on_tool_call_delta is not None
+            or (metadata is not None and metadata.uses_v1x_controls())
+        )
+        if not needs_ex:
+            return False
+        if not self._lib.has_symbol(ex_symbol):
+            raise UnsupportedError(f"this library does not export {ex_symbol}")
+        return True
+
+    def _marshal_metadata(self, metadata: Optional[RequestMetadata]) -> Optional[_CRequestMetadata]:
+        if metadata is None:
+            return None
+        if not isinstance(metadata, RequestMetadata):
+            raise InvalidArgumentError("metadata must be RequestMetadata or None")
+        return metadata._marshal()
 
     def _request_args(self, name: str, args: tuple[Any, ...],
                       metadata: Optional[RequestMetadata]) -> tuple[Any, tuple[Any, ...]]:
@@ -826,11 +1071,51 @@ class Session(_Handle):
             return getattr(self._lib.cdll, name), args
         if not isinstance(metadata, RequestMetadata):
             raise InvalidArgumentError("metadata must be RequestMetadata or None")
+        if metadata.uses_v1x_controls() and not self._lib.has_symbol(name + "_ex"):
+            raise UnsupportedError(f"this library does not export {name}_ex for v1.x request controls")
         record = metadata._to_c()  # prepare owned bytes before any worker starts
         export = name + "_with_metadata"
         if not self._lib.has_symbol(export):
             raise UnsupportedError(f"this library does not export {export}")
         return getattr(self._lib.cdll, export), (*args, ctypes.pointer(record))
+
+    @staticmethod
+    def _result_from_stats(text: str, stats: S.CGenerationStats, *, extended: bool,
+                           reasoning: str = "", tool_calls: tuple[ToolCall, ...] = ()) -> GenerationResult:
+        ttft_ms = None if stats.ttft_ms < 0 or math.isnan(stats.ttft_ms) else stats.ttft_ms
+        if not extended:
+            return GenerationResult(
+                text=text, outcome=Outcome(stats.outcome), prompt_tokens=stats.prompt_tokens,
+                completion_tokens=stats.completion_tokens, chunks=stats.chunks,
+                ttft_ms=ttft_ms, total_ms=stats.total_ms, reasoning=reasoning, tool_calls=tool_calls)
+        prompt_ms = None if stats.prompt_ms < 0 or math.isnan(stats.prompt_ms) else stats.prompt_ms
+        predicted_ms = None if stats.predicted_ms < 0 or math.isnan(stats.predicted_ms) else stats.predicted_ms
+        tps = (
+            None
+            if stats.predicted_tokens_per_second < 0 or math.isnan(stats.predicted_tokens_per_second)
+            else stats.predicted_tokens_per_second
+        )
+        try:
+            stop_reason = StopReason(stats.stop_reason)
+        except ValueError:
+            stop_reason = StopReason.NONE
+        return GenerationResult(
+            text=text, outcome=Outcome(stats.outcome), prompt_tokens=stats.prompt_tokens,
+            completion_tokens=stats.completion_tokens, chunks=stats.chunks,
+            ttft_ms=ttft_ms, total_ms=stats.total_ms,
+            reasoning=reasoning,
+            tool_calls=tool_calls,
+            cached_tokens=int(stats.cached_tokens) if stats.has_cached_tokens else None,
+            stop_reason=stop_reason,
+            load_ns=int(stats.load_ns),
+            prompt_eval_ns=int(stats.prompt_eval_ns),
+            eval_ns=int(stats.eval_ns),
+            prompt_ms=prompt_ms,
+            predicted_ms=predicted_ms,
+            predicted_tokens_per_second=tps,
+            draft_tokens=int(stats.draft_tokens) if stats.has_draft_tokens else None,
+            draft_accepted_tokens=int(stats.draft_accepted_tokens) if stats.has_draft_tokens else None,
+        )
 
     def _request(self, function: Any, args: tuple[Any, ...],
                  on_token: Optional[TokenCallback]) -> GenerationResult:
@@ -860,8 +1145,13 @@ class Session(_Handle):
                 return 1
 
         c_callback = S.TOKEN_CALLBACK(trampoline)
+        extended = lib.has_symbol("sonder_session_generate_ex")
         stats = S.CGenerationStats()
-        stats.struct_size = ctypes.sizeof(S.CGenerationStats)
+        stats.struct_size = S.GENERATION_STATS_SIZE if extended else S.GENERATION_STATS_V1_SIZE
+        stats.ttft_ms = -1.0
+        stats.prompt_ms = -1.0
+        stats.predicted_ms = -1.0
+        stats.predicted_tokens_per_second = -1.0
         # close() on another thread cancels this call and destroys the C
         # session only after it returns (see _Handle).
         with self._use() as handle:
@@ -872,11 +1162,106 @@ class Session(_Handle):
         tail = decoder.decode(b"", final=True)
         if tail and not stopped[0]:
             deliver(tail)
-        ttft_ms = None if stats.ttft_ms < 0 or math.isnan(stats.ttft_ms) else stats.ttft_ms
-        return GenerationResult(
-            text="".join(parts), outcome=Outcome(stats.outcome), prompt_tokens=stats.prompt_tokens,
-            completion_tokens=stats.completion_tokens, chunks=stats.chunks,
-            ttft_ms=ttft_ms, total_ms=stats.total_ms)
+        return self._result_from_stats("".join(parts), stats, extended=extended)
+
+    def _request_ex(self, function: Any, args: tuple[Any, ...],
+                    on_token: Optional[TokenCallback], *,
+                    on_reasoning: Optional[ReasoningCallback] = None,
+                    on_tool_call_delta: Optional[ToolCallDeltaCallback] = None,
+                    keepalive: Any = None) -> GenerationResult:
+        if on_token is not None and not callable(on_token):
+            raise TypeError("on_token must be callable or None")
+        if on_reasoning is not None and not callable(on_reasoning):
+            raise TypeError("on_reasoning must be callable or None")
+        if on_tool_call_delta is not None and not callable(on_tool_call_delta):
+            raise TypeError("on_tool_call_delta must be callable or None")
+        lib = self._lib
+        text_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        reasoning_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tc_acc: dict[int, tuple[str, str, list[str]]] = {}
+        error: list[BaseException] = []
+        stopped = [False]
+
+        def deliver_text(text: str) -> int:
+            parts.append(text)
+            if on_token is not None and on_token(text) is False:
+                stopped[0] = True
+                return 1
+            return 0
+
+        def deliver_reasoning(text: str) -> int:
+            reasoning_parts.append(text)
+            if on_reasoning is not None and on_reasoning(text) is False:
+                stopped[0] = True
+                return 1
+            return 0
+
+        def trampoline(_user: Any, ev_ptr: Any) -> int:
+            if error or stopped[0] or not ev_ptr:
+                return 1
+            try:
+                ev = ev_ptr.contents
+                kind = int(ev.kind)
+                raw_bytes = ctypes.string_at(ev.text, ev.text_length) if ev.text_length and ev.text else b""
+                if kind == int(ChunkKind.TEXT):
+                    text = text_decoder.decode(raw_bytes) if raw_bytes else ""
+                    return deliver_text(text) if text else 0
+                if kind == int(ChunkKind.REASONING):
+                    text = reasoning_decoder.decode(raw_bytes) if raw_bytes else ""
+                    return deliver_reasoning(text) if text else 0
+                if kind == int(ChunkKind.TOOL_CALL_DELTA):
+                    idx = int(ev.index)
+                    tc_id = ev.tool_call_id.decode("utf-8", "replace") if ev.tool_call_id else None
+                    tc_name = ev.tool_call_name.decode("utf-8", "replace") if ev.tool_call_name else None
+                    args_delta = raw_bytes.decode("utf-8", "replace") if raw_bytes else ""
+                    cur_id, cur_name, cur_args = tc_acc.get(idx, ("", "", []))
+                    if tc_id:
+                        cur_id = tc_id
+                    if tc_name:
+                        cur_name = tc_name
+                    if args_delta:
+                        cur_args.append(args_delta)
+                    tc_acc[idx] = (cur_id, cur_name, cur_args)
+                    if on_tool_call_delta is not None:
+                        delta = ToolCallDelta(index=idx, id=tc_id, name=tc_name, arguments_delta=args_delta)
+                        if on_tool_call_delta(delta) is False:
+                            stopped[0] = True
+                            return 1
+                    return 0
+                return 0
+            except BaseException as e:  # noqa: BLE001 - re-raised after the C call returns
+                error.append(e)
+                return 1
+
+        c_callback = S.CHUNK_CALLBACK(trampoline)
+        stats = S.CGenerationStats()
+        stats.struct_size = S.GENERATION_STATS_SIZE
+        stats.ttft_ms = -1.0
+        stats.prompt_ms = -1.0
+        stats.predicted_ms = -1.0
+        stats.predicted_tokens_per_second = -1.0
+        with self._use() as handle:
+            rc = function(handle, *args, c_callback, None, ctypes.byref(stats))
+        del keepalive
+        if error:
+            raise error[0]
+        _check(lib, rc)
+        tail = text_decoder.decode(b"", final=True)
+        if tail and not stopped[0]:
+            deliver_text(tail)
+        r_tail = reasoning_decoder.decode(b"", final=True)
+        if r_tail and not stopped[0]:
+            deliver_reasoning(r_tail)
+        tool_calls = tuple(
+            ToolCall(id=tc_id, name=tc_name, arguments_json="".join(tc_args))
+            for _, (tc_id, tc_name, tc_args) in sorted(tc_acc.items())
+        )
+        return self._result_from_stats(
+            "".join(parts), stats, extended=True,
+            reasoning="".join(reasoning_parts), tool_calls=tool_calls,
+        )
 
     def stream(self, prompt: str, *, metadata: Optional[RequestMetadata] = None) -> "TokenStream":
         """Iterate over chunks as they are produced (generation runs on a
@@ -914,7 +1299,9 @@ class Session(_Handle):
 
     def chat(self, messages: Iterable[Union[ChatMessage, Mapping[str, str]]],
              on_token: Optional[TokenCallback] = None, *,
-             metadata: Optional[RequestMetadata] = None) -> GenerationResult:
+             metadata: Optional[RequestMetadata] = None,
+             on_reasoning: Optional[ReasoningCallback] = None,
+             on_tool_call_delta: Optional[ToolCallDeltaCallback] = None) -> GenerationResult:
         """Run text chat with 1 to 1024 messages, ending in user or tool.
 
         Accepts ChatMessage or mappings containing only role/content. Native
@@ -923,8 +1310,19 @@ class Session(_Handle):
         Older ABI v1 libraries without the chat export raise UnsupportedError.
         """
         args = self._chat_args(messages)
-        function, args = self._request_args("sonder_session_chat", args, metadata)
-        return self._request(function, args, on_token)
+        if self._should_use_ex("sonder_session_chat_ex", metadata, on_reasoning, on_tool_call_delta):
+            marshalled = self._marshal_metadata(metadata)
+            meta_ptr = ctypes.pointer(marshalled.struct) if marshalled is not None else None
+            return self._request_ex(
+                getattr(self._lib.cdll, "sonder_session_chat_ex"),
+                (*args, meta_ptr),
+                on_token,
+                on_reasoning=on_reasoning,
+                on_tool_call_delta=on_tool_call_delta,
+                keepalive=(args, marshalled),
+            )
+        function, full_args = self._request_args("sonder_session_chat", args, metadata)
+        return self._request(function, full_args, on_token)
 
     def chat_stream(self, messages: Iterable[Union[ChatMessage, Mapping[str, str]]], *,
                     metadata: Optional[RequestMetadata] = None) -> "TokenStream":
@@ -933,10 +1331,58 @@ class Session(_Handle):
         are prepared before starting the worker. Close an abandoned iterator.
         """
         args = self._chat_args(messages)
-        function, args = self._request_args("sonder_session_chat", args, metadata)
+        function, full_args = self._request_args("sonder_session_chat", args, metadata)
         if self.closed:
             raise InvalidStateError("Session is closed")
-        return TokenStream._from_request(self, function, args)
+        return TokenStream._from_request(self, function, full_args)
+
+    def embed(self, inputs: Sequence[str], *,
+              metadata: Optional[RequestMetadata] = None) -> EmbedResult:
+        """Compute embedding vectors for 1 to 1024 text inputs."""
+        if not self._lib.has_symbol("sonder_session_embed"):
+            raise UnsupportedError("this library does not export sonder_session_embed")
+        if isinstance(inputs, (str, bytes, bytearray)):
+            raise TypeError("inputs must be a sequence of str")
+        encoded = [_cstr(f"inputs[{i}]", text) for i, text in enumerate(inputs)]
+        if not encoded:
+            raise InvalidArgumentError("embed requires at least one input")
+        if len(encoded) > S.MAX_EMBED_INPUTS:
+            raise InvalidArgumentError(f"embed accepts at most {S.MAX_EMBED_INPUTS} inputs")
+        marshalled = self._marshal_metadata(metadata)
+        meta_ptr = ctypes.pointer(marshalled.struct) if marshalled is not None else None
+        c_inputs = (ctypes.c_char_p * len(encoded))(*encoded)
+        vectors: list[tuple[float, ...]] = []
+        error: list[BaseException] = []
+
+        def on_embed(_user: Any, _index: int, values_ptr: Any, dims: int) -> int:
+            if error:
+                return 1
+            try:
+                if dims and values_ptr:
+                    vectors.append(tuple(float(values_ptr[i]) for i in range(dims)))
+                else:
+                    vectors.append(())
+                return 0
+            except BaseException as e:  # noqa: BLE001
+                error.append(e)
+                return 1
+
+        c_cb = S.EMBED_CALLBACK(on_embed)
+        stats = S.CEmbedStats()
+        stats.struct_size = S.EMBED_STATS_SIZE
+        with self._use() as handle:
+            rc = self._lib.cdll.sonder_session_embed(
+                handle, c_inputs, len(encoded), meta_ptr, c_cb, None, ctypes.byref(stats))
+        del marshalled, encoded, c_inputs
+        if error:
+            raise error[0]
+        _check(self._lib, rc)
+        return EmbedResult(
+            embeddings=tuple(vectors),
+            prompt_tokens=int(stats.prompt_tokens),
+            eval_ns=int(stats.eval_ns),
+            dimensions=int(stats.dimensions),
+        )
 
     def _chat_args(self, messages: Iterable[Union[ChatMessage, Mapping[str, str]]]) -> tuple[Any, int]:
         if not self._lib.has_symbol("sonder_session_chat"):
@@ -1167,7 +1613,8 @@ _DEFAULT_TOKEN_STREAM_PUSH = TokenStream._push
 
 
 __all__ = [
-    "ChatMessage", "Engine", "GenerationResult", "GpuInfo", "Model", "Outcome", "SamplingConfig", "Session",
-    "RequestMetadata", "SessionMetadata", "TelemetryLevel", "TokenStream", "WorkloadClass",
+    "ChatMessage", "ChunkKind", "EmbedResult", "Engine", "GenerationResult", "GpuInfo", "Model", "Outcome",
+    "RequestMetadata", "SamplingConfig", "Session", "SessionMetadata", "StopReason", "TelemetryLevel",
+    "TokenStream", "ToolCall", "ToolCallDelta", "ToolChoice", "ToolChoiceMode", "ToolDefinition", "WorkloadClass",
     "abi_version", "list_gpu_devices", "version",
 ]

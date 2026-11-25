@@ -45,7 +45,13 @@ def test_struct_layout_matches_header():
     assert S.SAMPLING_CONFIG_V1_SIZE == 48
     assert S.SAMPLING_CONFIG_SIZE == 80
     assert ctypes.sizeof(S.CLogitBias) == 8
-    assert ctypes.sizeof(S.CGenerationStats) == 48
+    assert S.GENERATION_STATS_V1_SIZE == 48
+    assert ctypes.sizeof(S.CGenerationStats) == 136
+    assert S.REQUEST_METADATA_V1_SIZE == 16
+    assert S.REQUEST_METADATA_V1_SCHED_SIZE == 24
+    assert ctypes.sizeof(S.CRequestMetadata) == 104
+    assert ctypes.sizeof(S.CToolDefinition) == 32
+    assert ctypes.sizeof(S.CEmbedStats) == 40
 
 
 def test_library_supports_extended_sampling(lib):

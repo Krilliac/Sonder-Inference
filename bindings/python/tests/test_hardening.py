@@ -53,7 +53,8 @@ def test_all_c_abi_struct_layouts_and_sizes():
         assert S.CSamplingConfig.logit_bias.offset == 64
         assert S.CSamplingConfig.logit_bias_count.offset == 72
 
-        assert ctypes.sizeof(S.CGenerationStats) == S.GENERATION_STATS_SIZE == 48
+        assert ctypes.sizeof(S.CGenerationStatsV1) == S.GENERATION_STATS_V1_SIZE == 48
+        assert ctypes.sizeof(S.CGenerationStats) == S.GENERATION_STATS_SIZE == 136
         assert S.CGenerationStats.struct_size.offset == 0
         assert S.CGenerationStats.outcome.offset == 4
         assert S.CGenerationStats.prompt_tokens.offset == 8
@@ -61,6 +62,8 @@ def test_all_c_abi_struct_layouts_and_sizes():
         assert S.CGenerationStats.chunks.offset == 24
         assert S.CGenerationStats.ttft_ms.offset == 32
         assert S.CGenerationStats.total_ms.offset == 40
+        assert S.CGenerationStats.cached_tokens.offset == 48
+        assert S.CGenerationStats.stop_reason.offset == 60
 
         assert ctypes.sizeof(S.CChatMessage) == S.CHAT_MESSAGE_SIZE == 24
         assert S.CChatMessage.struct_size.offset == 0
@@ -75,11 +78,18 @@ def test_all_c_abi_struct_layouts_and_sizes():
         assert S.CSessionMetadata.task_id.offset == 32
 
         assert ctypes.sizeof(S.CRequestMetadataV1) == S.REQUEST_METADATA_V1_SIZE == 16
-        assert ctypes.sizeof(S.CRequestMetadata) == S.REQUEST_METADATA_SIZE == 24
+        assert ctypes.sizeof(S.CRequestMetadataV1Sched) == S.REQUEST_METADATA_V1_SCHED_SIZE == 24
+        assert ctypes.sizeof(S.CRequestMetadata) == S.REQUEST_METADATA_SIZE == 104
         assert S.CRequestMetadata.struct_size.offset == 0
         assert S.CRequestMetadata.parent_request_id.offset == 8
         assert S.CRequestMetadata.workload_class.offset == 16
         assert S.CRequestMetadata.priority.offset == 20
+        assert S.CRequestMetadata.grammar.offset == 24
+        assert S.CRequestMetadata.tools.offset == 88
+        assert S.CRequestMetadata.tool_count.offset == 96
+
+        assert ctypes.sizeof(S.CToolDefinition) == S.TOOL_DEFINITION_SIZE == 32
+        assert ctypes.sizeof(S.CEmbedStats) == S.EMBED_STATS_SIZE == 40
 
         assert ctypes.sizeof(S.CGpuInfo) == S.GPU_INFO_SIZE == 496
 

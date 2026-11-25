@@ -22,7 +22,8 @@ def test_gpu_and_request_metadata_struct_layouts():
     assert S.CGpuInfo.has_dedicated_total.offset == 472
     assert S.CGpuInfo.is_integrated_uma.offset == 492
     assert S.REQUEST_METADATA_V1_SIZE == 16
-    assert S.REQUEST_METADATA_SIZE == 24
+    assert S.REQUEST_METADATA_V1_SCHED_SIZE == 24
+    assert S.REQUEST_METADATA_SIZE == 104
     assert S.CRequestMetadata.parent_request_id.offset == 8
     assert S.CRequestMetadata.workload_class.offset == 16
     assert S.CRequestMetadata.priority.offset == 20

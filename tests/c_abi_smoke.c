@@ -116,6 +116,7 @@ int main(void) {
                                                  NULL, NULL, &stats) != SONDER_OK) return 24;
 
         /* Explicit ADR-020 workload_class and priority values. */
+        memset(&sched_meta, 0, sizeof(sched_meta));
         sched_meta.struct_size = sizeof(sched_meta);
         sched_meta.parent_request_id = "c-sched:1";
         sched_meta.workload_class = SONDER_WORKLOAD_INTERACTIVE_USER;
