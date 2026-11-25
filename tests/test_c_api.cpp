@@ -754,4 +754,297 @@ TEST_CASE("telemetry callback contains exceptions and detaches on engine destroy
     CHECK(clean_calls.load(std::memory_order_relaxed) == calls_at_destroy);
 }
 
+TEST_CASE("C ABI v1.x generation stats backward compatibility and extended timings") {
+    struct LegacyGenerationStats {
+        uint32_t struct_size;
+        sonder_outcome outcome;
+        uint64_t prompt_tokens;
+        uint64_t completion_tokens;
+        uint64_t chunks;
+        double ttft_ms;
+        double total_ms;
+    };
+    static_assert(sizeof(LegacyGenerationStats) == 48);
+    static_assert(sizeof(sonder_generation_stats) == 136);
+    static_assert(sizeof(sonder_request_metadata) == 104);
+    static_assert(sizeof(sonder_tool_definition) == 32);
+    static_assert(sizeof(sonder_embed_stats) == 40);
+
+    sonder_engine_options eo;
+    sonder_engine_options_init(&eo);
+    eo.telemetry_level = SONDER_TELEMETRY_OFF;
+    sonder_engine* raw_engine = nullptr;
+    REQUIRE(sonder_engine_create(&eo, &raw_engine) == SONDER_OK);
+    const std::unique_ptr<sonder_engine, decltype(&sonder_engine_destroy)> engine(raw_engine, &sonder_engine_destroy);
+    REQUIRE(sonder_engine_register_mock_backend(engine.get()) == SONDER_OK);
+
+    sonder_model* raw_model = nullptr;
+    REQUIRE(sonder_model_load(engine.get(), "mock", "mock:tiny", &raw_model) == SONDER_OK);
+    const std::unique_ptr<sonder_model, decltype(&sonder_model_release)> model(raw_model, &sonder_model_release);
+
+    sonder_sampling_config cfg;
+    sonder_sampling_config_init(&cfg);
+    cfg.temperature = 0.0f;
+    cfg.max_tokens = 4;
+    sonder_session* raw_session = nullptr;
+    REQUIRE(sonder_session_create(engine.get(), model.get(), &cfg, &raw_session) == SONDER_OK);
+    const std::unique_ptr<sonder_session, decltype(&sonder_session_destroy)> session(raw_session,
+                                                                                     &sonder_session_destroy);
+
+    // Caller compiled against v1 48-byte struct_size must never have trailing bytes overwritten.
+    alignas(sonder_generation_stats) unsigned char buf[sizeof(sonder_generation_stats) + 16];
+    std::memset(buf, 0x5A, sizeof(buf));
+    auto* legacy_stats = reinterpret_cast<sonder_generation_stats*>(buf);
+    legacy_stats->struct_size = sizeof(LegacyGenerationStats);
+    REQUIRE(sonder_session_generate(session.get(), "v1 stats compatibility", nullptr, nullptr, legacy_stats) ==
+            SONDER_OK);
+    CHECK(legacy_stats->outcome == SONDER_OUTCOME_COMPLETED);
+    CHECK(legacy_stats->completion_tokens == 4);
+    for (std::size_t i = sizeof(LegacyGenerationStats); i < sizeof(buf); ++i) {
+        CAPTURE(i);
+        REQUIRE(buf[i] == 0x5A);
+    }
+
+    // Undersized stats struct is rejected.
+    sonder_generation_stats tiny_stats{};
+    tiny_stats.struct_size = static_cast<uint32_t>(sizeof(LegacyGenerationStats) - 1);
+    CHECK(sonder_session_generate(session.get(), "tiny stats", nullptr, nullptr, &tiny_stats) ==
+          SONDER_ERROR_INVALID_ARGUMENT);
+
+    // Full v1.x stats populates stop_reason and timing fields cleanly.
+    sonder_generation_stats full_stats;
+    std::memset(&full_stats, 0xA5, sizeof(full_stats));
+    full_stats.struct_size = sizeof(sonder_generation_stats);
+    REQUIRE(sonder_session_generate(session.get(), "v1x full stats", nullptr, nullptr, &full_stats) == SONDER_OK);
+    CHECK(full_stats.outcome == SONDER_OUTCOME_COMPLETED);
+    CHECK(full_stats.completion_tokens == 4);
+    CHECK(full_stats.stop_reason == SONDER_STOP_MAX_TOKENS);
+    CHECK(full_stats.has_cached_tokens == 0);
+    CHECK(full_stats.cached_tokens == 0);
+    CHECK(full_stats.has_draft_tokens == 0);
+    CHECK(full_stats.draft_tokens == 0);
+    CHECK(full_stats.draft_accepted_tokens == 0);
+    CHECK(full_stats.reserved_flags == 0);
+}
+
+TEST_CASE("C ABI v1.x generate_ex, chat_ex tool calling, and request controls validation") {
+    sonder_engine_options eo;
+    sonder_engine_options_init(&eo);
+    eo.telemetry_level = SONDER_TELEMETRY_OFF;
+    sonder_engine* raw_engine = nullptr;
+    REQUIRE(sonder_engine_create(&eo, &raw_engine) == SONDER_OK);
+    const std::unique_ptr<sonder_engine, decltype(&sonder_engine_destroy)> engine(raw_engine, &sonder_engine_destroy);
+    REQUIRE(sonder_engine_register_mock_backend(engine.get()) == SONDER_OK);
+
+    sonder_model* raw_model = nullptr;
+    REQUIRE(sonder_model_load(engine.get(), "mock", "mock:tiny", &raw_model) == SONDER_OK);
+    const std::unique_ptr<sonder_model, decltype(&sonder_model_release)> model(raw_model, &sonder_model_release);
+
+    sonder_sampling_config cfg;
+    sonder_sampling_config_init(&cfg);
+    cfg.temperature = 0.0f;
+    cfg.max_tokens = 6;
+    sonder_session* raw_session = nullptr;
+    REQUIRE(sonder_session_create(engine.get(), model.get(), &cfg, &raw_session) == SONDER_OK);
+    const std::unique_ptr<sonder_session, decltype(&sonder_session_destroy)> session(raw_session,
+                                                                                     &sonder_session_destroy);
+
+    struct ChunkCollector {
+        std::string text;
+        std::string reasoning;
+        std::string tool_id;
+        std::string tool_name;
+        std::string tool_args;
+        int text_events = 0;
+        int tool_events = 0;
+        int stop_after = -1;
+    };
+    const auto on_chunk = [](void* user, const sonder_chunk_event* ev) -> int {
+        auto* c = static_cast<ChunkCollector*>(user);
+        if (ev->kind == SONDER_CHUNK_TEXT) {
+            c->text.append(ev->text, ev->text_length);
+            ++c->text_events;
+        } else if (ev->kind == SONDER_CHUNK_REASONING) {
+            c->reasoning.append(ev->text, ev->text_length);
+        } else if (ev->kind == SONDER_CHUNK_TOOL_CALL_DELTA) {
+            if (ev->tool_call_id) {
+                c->tool_id = ev->tool_call_id;
+            }
+            if (ev->tool_call_name) {
+                c->tool_name = ev->tool_call_name;
+            }
+            if (ev->text && ev->text_length > 0) {
+                c->tool_args.append(ev->text, ev->text_length);
+            }
+            ++c->tool_events;
+        }
+        return (c->stop_after > 0 && (c->text_events + c->tool_events) >= c->stop_after) ? 1 : 0;
+    };
+
+    // generate_ex with v1.x request controls (response_format + reasoning hints)
+    sonder_request_metadata meta{};
+    meta.struct_size = sizeof(sonder_request_metadata);
+    meta.parent_request_id = "v1x-gen:1";
+    meta.response_format_type = "json_object";
+    meta.separate_reasoning = 1;
+    meta.enable_thinking = 1;
+    meta.reasoning_effort = "medium";
+    meta.has_reasoning_budget = 1;
+    meta.reasoning_budget_tokens = 256;
+
+    ChunkCollector gen_col;
+    sonder_generation_stats stats{};
+    stats.struct_size = sizeof(stats);
+    REQUIRE(sonder_session_generate_ex(session.get(), "structured generate", &meta, on_chunk, &gen_col, &stats) ==
+            SONDER_OK);
+    CHECK(stats.outcome == SONDER_OUTCOME_COMPLETED);
+    CHECK(gen_col.text_events == 6);
+    CHECK_FALSE(gen_col.text.empty());
+
+    // Early callback stop through generate_ex sets SONDER_STOP_CALLBACK.
+    ChunkCollector early_col;
+    early_col.stop_after = 2;
+    REQUIRE(sonder_session_generate_ex(session.get(), "stop early ex", nullptr, on_chunk, &early_col, &stats) ==
+            SONDER_OK);
+    CHECK(early_col.text_events == 2);
+    CHECK(stats.stop_reason == SONDER_STOP_CALLBACK);
+
+    // chat_ex with native tool definition and function tool_choice triggers MockBackend tool_call_deltas.
+    const sonder_tool_definition tool{
+        sizeof(sonder_tool_definition),
+        0,
+        "get_weather",
+        "Look up current weather",
+        R"({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]})",
+    };
+    sonder_request_metadata tool_meta{};
+    tool_meta.struct_size = sizeof(sonder_request_metadata);
+    tool_meta.tools = &tool;
+    tool_meta.tool_count = 1;
+    tool_meta.tool_choice_mode = SONDER_TOOL_CHOICE_FUNCTION;
+    tool_meta.tool_choice_function = "get_weather";
+
+    const sonder_chat_message msg{sizeof(sonder_chat_message), "user", "What is the weather in Austin?"};
+    const sonder_chat_message* messages[] = {&msg};
+    ChunkCollector tool_col;
+    REQUIRE(sonder_session_chat_ex(session.get(), messages, 1, &tool_meta, on_chunk, &tool_col, &stats) == SONDER_OK);
+    CHECK(stats.outcome == SONDER_OUTCOME_COMPLETED);
+    CHECK(tool_col.tool_events == 2);
+    CHECK(tool_col.tool_name == "get_weather");
+    CHECK(tool_col.tool_id.rfind("call_mock_", 0) == 0);
+    CHECK(tool_col.tool_args.find("city") != std::string::npos);
+
+    // Invalid v1.x request controls are rejected before submission.
+    sonder_request_metadata bad{};
+    bad.struct_size = sizeof(sonder_request_metadata);
+    bad.response_format_type = "xml";
+    CHECK(sonder_session_generate_ex(session.get(), "bad", &bad, nullptr, nullptr, nullptr) ==
+          SONDER_ERROR_INVALID_ARGUMENT);
+
+    bad = sonder_request_metadata{};
+    bad.struct_size = sizeof(sonder_request_metadata);
+    bad.response_format_type = "json_object";
+    bad.response_format_schema = R"({"type":"object"})";
+    CHECK(sonder_session_generate_ex(session.get(), "bad", &bad, nullptr, nullptr, nullptr) ==
+          SONDER_ERROR_INVALID_ARGUMENT);
+
+    bad = sonder_request_metadata{};
+    bad.struct_size = sizeof(sonder_request_metadata);
+    bad.enable_thinking = 2;
+    CHECK(sonder_session_generate_ex(session.get(), "bad", &bad, nullptr, nullptr, nullptr) ==
+          SONDER_ERROR_INVALID_ARGUMENT);
+
+    bad = sonder_request_metadata{};
+    bad.struct_size = sizeof(sonder_request_metadata);
+    bad.has_reasoning_budget = 1;
+    bad.reasoning_budget_tokens = -5;
+    CHECK(sonder_session_generate_ex(session.get(), "bad", &bad, nullptr, nullptr, nullptr) ==
+          SONDER_ERROR_INVALID_ARGUMENT);
+
+    bad = sonder_request_metadata{};
+    bad.struct_size = sizeof(sonder_request_metadata);
+    bad.tool_count = 1;
+    bad.tools = nullptr;
+    CHECK(sonder_session_chat_ex(session.get(), messages, 1, &bad, nullptr, nullptr, nullptr) ==
+          SONDER_ERROR_INVALID_ARGUMENT);
+
+    bad = sonder_request_metadata{};
+    bad.struct_size = sizeof(sonder_request_metadata);
+    bad.tool_choice_mode = SONDER_TOOL_CHOICE_FUNCTION;
+    bad.tool_choice_function = nullptr;
+    CHECK(sonder_session_chat_ex(session.get(), messages, 1, &bad, nullptr, nullptr, nullptr) ==
+          SONDER_ERROR_INVALID_ARGUMENT);
+
+    // v1_sched struct_size ignores garbage in appended v1.x control fields.
+    struct V1SchedMeta {
+        uint32_t struct_size;
+        const char* parent_request_id;
+        int32_t workload_class;
+        int32_t priority;
+    };
+    bad = sonder_request_metadata{};
+    bad.struct_size = sizeof(V1SchedMeta);
+    bad.enable_thinking = 99;
+    bad.response_format_type = "invalid";
+    bad.tool_count = 99999;
+    REQUIRE(sonder_session_generate_ex(session.get(), "legacy sched size", &bad, nullptr, nullptr, nullptr) ==
+            SONDER_OK);
+}
+
+TEST_CASE("C ABI v1.x session embed returns deterministic vectors and validates arguments") {
+    sonder_engine_options eo;
+    sonder_engine_options_init(&eo);
+    eo.telemetry_level = SONDER_TELEMETRY_OFF;
+    sonder_engine* raw_engine = nullptr;
+    REQUIRE(sonder_engine_create(&eo, &raw_engine) == SONDER_OK);
+    const std::unique_ptr<sonder_engine, decltype(&sonder_engine_destroy)> engine(raw_engine, &sonder_engine_destroy);
+    REQUIRE(sonder_engine_register_mock_backend(engine.get()) == SONDER_OK);
+
+    sonder_model* raw_model = nullptr;
+    REQUIRE(sonder_model_load(engine.get(), "mock", "mock:tiny", &raw_model) == SONDER_OK);
+    const std::unique_ptr<sonder_model, decltype(&sonder_model_release)> model(raw_model, &sonder_model_release);
+
+    sonder_session* raw_session = nullptr;
+    REQUIRE(sonder_session_create(engine.get(), model.get(), nullptr, &raw_session) == SONDER_OK);
+    const std::unique_ptr<sonder_session, decltype(&sonder_session_destroy)> session(raw_session,
+                                                                                     &sonder_session_destroy);
+
+    struct EmbedCollector {
+        std::vector<std::vector<float>> vectors;
+    };
+    const auto on_embed = [](void* user, size_t index, const float* values, size_t dims) -> int {
+        auto* c = static_cast<EmbedCollector*>(user);
+        CHECK(index == c->vectors.size());
+        c->vectors.emplace_back(values, values + dims);
+        return 0;
+    };
+
+    const char* inputs[] = {"alpha beta", "gamma delta epsilon"};
+    sonder_embed_stats stats{};
+    stats.struct_size = sizeof(sonder_embed_stats);
+    EmbedCollector col;
+    REQUIRE(sonder_session_embed(session.get(), inputs, 2, nullptr, on_embed, &col, &stats) == SONDER_OK);
+    CHECK(stats.embedding_count == 2);
+    CHECK(stats.dimensions == 16);
+    CHECK(stats.prompt_tokens >= 2);
+    REQUIRE(col.vectors.size() == 2);
+    CHECK(col.vectors[0].size() == 16);
+    CHECK(col.vectors[1].size() == 16);
+    CHECK(col.vectors[0] != col.vectors[1]);
+
+    // Argument validation
+    CHECK(sonder_session_embed(nullptr, inputs, 2, nullptr, on_embed, &col, &stats) == SONDER_ERROR_INVALID_ARGUMENT);
+    CHECK(sonder_session_embed(session.get(), nullptr, 2, nullptr, on_embed, &col, &stats) ==
+          SONDER_ERROR_INVALID_ARGUMENT);
+    CHECK(sonder_session_embed(session.get(), inputs, 0, nullptr, on_embed, &col, &stats) ==
+          SONDER_ERROR_INVALID_ARGUMENT);
+    const char* with_null[] = {"ok", nullptr};
+    CHECK(sonder_session_embed(session.get(), with_null, 2, nullptr, on_embed, &col, &stats) ==
+          SONDER_ERROR_INVALID_ARGUMENT);
+    sonder_embed_stats tiny{};
+    tiny.struct_size = sizeof(sonder_embed_stats) - 1;
+    CHECK(sonder_session_embed(session.get(), inputs, 2, nullptr, on_embed, &col, &tiny) ==
+          SONDER_ERROR_INVALID_ARGUMENT);
+}
+
 }

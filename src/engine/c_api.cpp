@@ -218,22 +218,57 @@ bool valid_correlation_id(const char* value) {
     return false;
 }
 
+// Original (v1) layout of sonder_generation_stats: up to total_ms (48 bytes).
+struct sonder_generation_stats_v1 {
+    uint32_t struct_size;
+    sonder_outcome outcome;
+    uint64_t prompt_tokens;
+    uint64_t completion_tokens;
+    uint64_t chunks;
+    double ttft_ms;
+    double total_ms;
+};
+static_assert(std::is_standard_layout_v<sonder_generation_stats>);
+static_assert(std::is_trivial_v<sonder_generation_stats>);
+static_assert(std::is_trivially_copyable_v<sonder_generation_stats>);
+static_assert(offsetof(sonder_generation_stats, total_ms) == offsetof(sonder_generation_stats_v1, total_ms));
+static_assert(sizeof(sonder_generation_stats) > sizeof(sonder_generation_stats_v1));
+
+constexpr std::size_t kGenerationStatsMinSize = sizeof(sonder_generation_stats_v1);
+constexpr std::size_t kGenerationStatsExtendedMinSize = sizeof(sonder_generation_stats);
+
 // Original (v1) layout of sonder_request_metadata: struct_size + parent_request_id.
-// Appended scheduling fields (workload_class, priority) are only read when
-// struct_size >= sizeof(sonder_request_metadata).
+// First extension added (workload_class, priority); v1.x extension adds
+// grammar, response_format, reasoning, tools, and tool_choice.
 struct sonder_request_metadata_v1 {
     uint32_t struct_size;
     const char* parent_request_id;
 };
+struct sonder_request_metadata_v1_sched {
+    uint32_t struct_size;
+    const char* parent_request_id;
+    int32_t workload_class;
+    int32_t priority;
+};
 static_assert(std::is_standard_layout_v<sonder_request_metadata>);
 static_assert(std::is_trivial_v<sonder_request_metadata>);
 static_assert(std::is_trivially_copyable_v<sonder_request_metadata>);
+static_assert(std::is_standard_layout_v<sonder_tool_definition>);
+static_assert(std::is_trivial_v<sonder_tool_definition>);
+static_assert(std::is_trivially_copyable_v<sonder_tool_definition>);
+static_assert(std::is_standard_layout_v<sonder_chunk_event>);
+static_assert(std::is_trivial_v<sonder_chunk_event>);
+static_assert(std::is_trivially_copyable_v<sonder_chunk_event>);
+static_assert(std::is_standard_layout_v<sonder_embed_stats>);
+static_assert(std::is_trivial_v<sonder_embed_stats>);
+static_assert(std::is_trivially_copyable_v<sonder_embed_stats>);
 static_assert(offsetof(sonder_request_metadata, struct_size) ==
               offsetof(sonder_request_metadata_v1, struct_size));
 static_assert(offsetof(sonder_request_metadata, parent_request_id) ==
               offsetof(sonder_request_metadata_v1, parent_request_id));
-static_assert(sizeof(sonder_request_metadata) > sizeof(sonder_request_metadata_v1));
+static_assert(sizeof(sonder_request_metadata) > sizeof(sonder_request_metadata_v1_sched));
 static_assert(offsetof(sonder_request_metadata, workload_class) >= sizeof(sonder_request_metadata_v1));
+static_assert(offsetof(sonder_request_metadata, grammar) >= sizeof(sonder_request_metadata_v1_sched));
 
 static_assert(std::is_standard_layout_v<sonder_gpu_info>);
 static_assert(std::is_trivial_v<sonder_gpu_info>);
@@ -242,14 +277,19 @@ static_assert(std::is_trivially_copyable_v<sonder_gpu_info>);
 constexpr std::size_t kRequestMetadataMinSize = sizeof(sonder_request_metadata_v1);
 constexpr std::size_t kRequestMetadataExtendedMinSize =
     offsetof(sonder_request_metadata, priority) + sizeof(int32_t);
+constexpr std::size_t kRequestMetadataControlsMinSize = sizeof(sonder_request_metadata);
 static_assert(kRequestMetadataExtendedMinSize > kRequestMetadataMinSize);
-static_assert(kRequestMetadataExtendedMinSize <= sizeof(sonder_request_metadata));
+static_assert(kRequestMetadataControlsMinSize > kRequestMetadataExtendedMinSize);
 
 constexpr int32_t kMinRequestPriority = -16;
 constexpr int32_t kMaxRequestPriority = 16;
 
 bool has_extended_request_metadata(const sonder_request_metadata& m) noexcept {
     return m.struct_size >= kRequestMetadataExtendedMinSize;
+}
+
+bool has_v1x_request_controls(const sonder_request_metadata& m) noexcept {
+    return m.struct_size >= kRequestMetadataControlsMinSize;
 }
 
 RequestPriority map_scheduling_to_priority_class(int32_t workload_class, int32_t priority) noexcept {
@@ -307,6 +347,95 @@ const char* request_options_from_c(const sonder_request_metadata* metadata, Requ
             options.priority_class = map_scheduling_to_priority_class(metadata->workload_class, metadata->priority);
         }
     }
+    if (has_v1x_request_controls(*metadata)) {
+        if (metadata->grammar && metadata->grammar[0] != '\0') {
+            options.grammar = metadata->grammar;
+        }
+        if (metadata->response_format_type && metadata->response_format_type[0] != '\0') {
+            const std::string_view fmt(metadata->response_format_type);
+            if (fmt != "text" && fmt != "json_object" && fmt != "json_schema") {
+                return "response_format_type must be \"text\", \"json_object\", or \"json_schema\"";
+            }
+            options.response_format_type = std::string(fmt);
+        }
+        if (metadata->response_format_schema && metadata->response_format_schema[0] != '\0') {
+            if (!options.response_format_type || *options.response_format_type != "json_schema") {
+                return "response_format_schema requires response_format_type == \"json_schema\"";
+            }
+            options.response_format_schema = metadata->response_format_schema;
+        }
+        options.separate_reasoning = metadata->separate_reasoning != 0;
+        if (metadata->enable_thinking < -1 || metadata->enable_thinking > 1) {
+            return "enable_thinking must be -1 (disable), 0 (unset), or 1 (enable)";
+        }
+        if (metadata->enable_thinking != 0) {
+            options.thinking.enable_thinking = metadata->enable_thinking > 0;
+        }
+        if (metadata->reasoning_effort && metadata->reasoning_effort[0] != '\0') {
+            options.thinking.reasoning_effort = metadata->reasoning_effort;
+        }
+        if (metadata->has_reasoning_budget != 0) {
+            if (metadata->reasoning_budget_tokens < 0) {
+                return "reasoning_budget_tokens must be >= 0";
+            }
+            options.reasoning_budget_tokens = metadata->reasoning_budget_tokens;
+        }
+        if (metadata->tool_count > SONDER_MAX_TOOLS) {
+            return "tool_count exceeds SONDER_MAX_TOOLS";
+        }
+        if (metadata->tool_count > 0 && metadata->tools == nullptr) {
+            return "tools is null but tool_count > 0";
+        }
+        if (metadata->tool_count > 0) {
+            options.tools.reserve(metadata->tool_count);
+            for (std::size_t i = 0; i < metadata->tool_count; ++i) {
+                const auto& td = metadata->tools[i];
+                if (td.struct_size < sizeof(sonder_tool_definition)) {
+                    return "sonder_tool_definition.struct_size too small";
+                }
+                if (!td.name || td.name[0] == '\0') {
+                    return "tool definition name must be non-empty";
+                }
+                ToolDefinition def;
+                def.name = td.name;
+                if (td.description) {
+                    def.description = td.description;
+                }
+                if (td.parameters_json) {
+                    def.parameters_json = td.parameters_json;
+                }
+                options.tools.push_back(std::move(def));
+            }
+        }
+        if (metadata->tool_choice_mode < static_cast<int32_t>(SONDER_TOOL_CHOICE_UNSET) ||
+            metadata->tool_choice_mode > static_cast<int32_t>(SONDER_TOOL_CHOICE_FUNCTION)) {
+            return "tool_choice_mode must be in [0, 4]";
+        }
+        if (metadata->tool_choice_mode != static_cast<int32_t>(SONDER_TOOL_CHOICE_UNSET)) {
+            ToolChoice tc;
+            switch (static_cast<sonder_tool_choice_mode>(metadata->tool_choice_mode)) {
+            case SONDER_TOOL_CHOICE_AUTO:
+                tc.mode = ToolChoiceMode::auto_choice;
+                break;
+            case SONDER_TOOL_CHOICE_NONE:
+                tc.mode = ToolChoiceMode::none;
+                break;
+            case SONDER_TOOL_CHOICE_REQUIRED:
+                tc.mode = ToolChoiceMode::required;
+                break;
+            case SONDER_TOOL_CHOICE_FUNCTION:
+                if (!metadata->tool_choice_function || metadata->tool_choice_function[0] == '\0') {
+                    return "tool_choice_function is required when tool_choice_mode == SONDER_TOOL_CHOICE_FUNCTION";
+                }
+                tc.mode = ToolChoiceMode::function;
+                tc.function_name = metadata->tool_choice_function;
+                break;
+            case SONDER_TOOL_CHOICE_UNSET:
+                break;
+            }
+            options.tool_choice = std::move(tc);
+        }
+    }
     if (metadata->parent_request_id) {
         options.parent_request_id = metadata->parent_request_id;
     }
@@ -319,6 +448,50 @@ TokenCallback c_callback(sonder_token_callback callback, void* user_data) {
     }
     return [callback, user_data](const TokenChunk& chunk) {
         return callback(user_data, chunk.text.data(), chunk.text.size()) == 0;
+    };
+}
+
+TokenCallback c_chunk_callback(sonder_chunk_callback callback, void* user_data) {
+    if (!callback) {
+        return {};
+    }
+    return [callback, user_data](const TokenChunk& chunk) {
+        if (!chunk.reasoning.empty()) {
+            sonder_chunk_event ev{};
+            ev.struct_size = sizeof(sonder_chunk_event);
+            ev.kind = SONDER_CHUNK_REASONING;
+            ev.index = chunk.index;
+            ev.text = chunk.reasoning.data();
+            ev.text_length = chunk.reasoning.size();
+            if (callback(user_data, &ev) != 0) {
+                return false;
+            }
+        }
+        if (!chunk.text.empty()) {
+            sonder_chunk_event ev{};
+            ev.struct_size = sizeof(sonder_chunk_event);
+            ev.kind = SONDER_CHUNK_TEXT;
+            ev.index = chunk.index;
+            ev.text = chunk.text.data();
+            ev.text_length = chunk.text.size();
+            if (callback(user_data, &ev) != 0) {
+                return false;
+            }
+        }
+        for (const auto& tcd : chunk.tool_call_deltas) {
+            sonder_chunk_event ev{};
+            ev.struct_size = sizeof(sonder_chunk_event);
+            ev.kind = SONDER_CHUNK_TOOL_CALL_DELTA;
+            ev.index = tcd.index;
+            ev.text = tcd.arguments_delta.empty() ? "" : tcd.arguments_delta.data();
+            ev.text_length = tcd.arguments_delta.size();
+            ev.tool_call_id = tcd.id.empty() ? nullptr : tcd.id.c_str();
+            ev.tool_call_name = tcd.name.empty() ? nullptr : tcd.name.c_str();
+            if (callback(user_data, &ev) != 0) {
+                return false;
+            }
+        }
+        return true;
     };
 }
 
@@ -337,6 +510,38 @@ sonder_status finish_request(const Result<GenerationResult>& res, sonder_generat
         out_stats->chunks = r.stats.chunks;
         out_stats->ttft_ms = r.ttft_ms;
         out_stats->total_ms = r.total_ms;
+        if (out_stats->struct_size >= kGenerationStatsExtendedMinSize) {
+            const auto cached = r.stats.cached_tokens
+                                    ? r.stats.cached_tokens
+                                    : (r.stats.backend_timings ? r.stats.backend_timings->cache_n : std::nullopt);
+            out_stats->has_cached_tokens = cached.has_value() ? 1 : 0;
+            out_stats->cached_tokens = cached.value_or(0);
+            out_stats->stop_reason = static_cast<int32_t>(static_cast<int>(r.stats.stop_reason));
+            out_stats->load_ns = r.stats.load_ns;
+            out_stats->prompt_eval_ns = r.stats.prompt_eval_ns;
+            out_stats->eval_ns = r.stats.eval_ns;
+            out_stats->prompt_ms =
+                (r.stats.backend_timings && r.stats.backend_timings->prompt_ms)
+                    ? *r.stats.backend_timings->prompt_ms
+                    : (r.stats.prompt_eval_ns > 0 ? static_cast<double>(r.stats.prompt_eval_ns) / 1e6 : -1.0);
+            out_stats->predicted_ms =
+                (r.stats.backend_timings && r.stats.backend_timings->predicted_ms)
+                    ? *r.stats.backend_timings->predicted_ms
+                    : (r.stats.eval_ns > 0 ? static_cast<double>(r.stats.eval_ns) / 1e6 : -1.0);
+            out_stats->predicted_tokens_per_second =
+                r.stats.predicted_tokens_per_second.value_or(-1.0);
+            const auto draft_n = r.stats.draft_tokens
+                                     ? r.stats.draft_tokens
+                                     : (r.stats.backend_timings ? r.stats.backend_timings->draft_n : std::nullopt);
+            const auto draft_acc =
+                r.stats.draft_accepted_tokens
+                    ? r.stats.draft_accepted_tokens
+                    : (r.stats.backend_timings ? r.stats.backend_timings->draft_n_accepted : std::nullopt);
+            out_stats->has_draft_tokens = (draft_n.has_value() || draft_acc.has_value()) ? 1 : 0;
+            out_stats->draft_tokens = draft_n.value_or(0);
+            out_stats->draft_accepted_tokens = draft_acc.value_or(0);
+            out_stats->reserved_flags = 0;
+        }
     }
     return ok();
 }
@@ -687,7 +892,7 @@ sonder_status sonder_session_generate_with_metadata(sonder_session* session, con
         if (!session || !prompt) {
             return fail(SONDER_ERROR_INVALID_ARGUMENT, "null argument");
         }
-        if (out_stats && out_stats->struct_size < sizeof(sonder_generation_stats)) {
+        if (out_stats && out_stats->struct_size < kGenerationStatsMinSize) {
             return fail(SONDER_ERROR_INVALID_ARGUMENT, "sonder_generation_stats.struct_size too small");
         }
         RequestOptions options;
@@ -696,6 +901,26 @@ sonder_status sonder_session_generate_with_metadata(sonder_session* session, con
         }
         return finish_request(session->session->generate(prompt, c_callback(callback, user_data), std::nullopt, options),
                               out_stats);
+    });
+}
+
+sonder_status sonder_session_generate_ex(sonder_session* session, const char* prompt,
+                                         const sonder_request_metadata* metadata, sonder_chunk_callback callback,
+                                         void* user_data, sonder_generation_stats* out_stats) {
+    return guarded([&] {
+        if (!session || !prompt) {
+            return fail(SONDER_ERROR_INVALID_ARGUMENT, "null argument");
+        }
+        if (out_stats && out_stats->struct_size < kGenerationStatsMinSize) {
+            return fail(SONDER_ERROR_INVALID_ARGUMENT, "sonder_generation_stats.struct_size too small");
+        }
+        RequestOptions options;
+        if (const char* err = request_options_from_c(metadata, options)) {
+            return fail(SONDER_ERROR_INVALID_ARGUMENT, err);
+        }
+        return finish_request(
+            session->session->generate(prompt, c_chunk_callback(callback, user_data), std::nullopt, options),
+            out_stats);
     });
 }
 
@@ -713,7 +938,7 @@ sonder_status sonder_session_chat_with_metadata(sonder_session* session, const s
         if (!session || !messages || message_count == 0 || message_count > SONDER_MAX_CHAT_MESSAGES) {
             return fail(SONDER_ERROR_INVALID_ARGUMENT, "chat requires a session and 1 to 1024 messages");
         }
-        if (out_stats && out_stats->struct_size < sizeof(sonder_generation_stats)) {
+        if (out_stats && out_stats->struct_size < kGenerationStatsMinSize) {
             return fail(SONDER_ERROR_INVALID_ARGUMENT, "sonder_generation_stats.struct_size too small");
         }
         RequestOptions options;
@@ -736,6 +961,89 @@ sonder_status sonder_session_chat_with_metadata(sonder_session* session, const s
         }
         return finish_request(session->session->chat(copied, c_callback(callback, user_data), std::nullopt, options),
                               out_stats);
+    });
+}
+
+sonder_status sonder_session_chat_ex(sonder_session* session, const sonder_chat_message* const* messages,
+                                     size_t message_count, const sonder_request_metadata* metadata,
+                                     sonder_chunk_callback callback, void* user_data,
+                                     sonder_generation_stats* out_stats) {
+    return guarded([&] {
+        if (!session || !messages || message_count == 0 || message_count > SONDER_MAX_CHAT_MESSAGES) {
+            return fail(SONDER_ERROR_INVALID_ARGUMENT, "chat requires a session and 1 to 1024 messages");
+        }
+        if (out_stats && out_stats->struct_size < kGenerationStatsMinSize) {
+            return fail(SONDER_ERROR_INVALID_ARGUMENT, "sonder_generation_stats.struct_size too small");
+        }
+        RequestOptions options;
+        if (const char* err = request_options_from_c(metadata, options)) {
+            return fail(SONDER_ERROR_INVALID_ARGUMENT, err);
+        }
+        constexpr std::size_t min_size = offsetof(sonder_chat_message, content) + sizeof(const char*);
+        std::vector<ChatMessage> copied;
+        copied.reserve(message_count);
+        for (std::size_t i = 0; i < message_count; ++i) {
+            const auto* message = messages[i];
+            if (!message || message->struct_size < min_size) {
+                return fail(SONDER_ERROR_INVALID_ARGUMENT, "null chat message or struct_size too small");
+            }
+            if (!message->role || !message->content) {
+                return fail(SONDER_ERROR_INVALID_ARGUMENT, "chat role and content must be non-null");
+            }
+            copied.push_back(ChatMessage{message->role, message->content});
+        }
+        return finish_request(
+            session->session->chat(copied, c_chunk_callback(callback, user_data), std::nullopt, options), out_stats);
+    });
+}
+
+sonder_status sonder_session_embed(sonder_session* session, const char* const* inputs, size_t input_count,
+                                   const sonder_request_metadata* metadata, sonder_embed_callback callback,
+                                   void* user_data, sonder_embed_stats* out_stats) {
+    return guarded([&] {
+        if (!session || !inputs || input_count == 0 || input_count > SONDER_MAX_EMBED_INPUTS) {
+            return fail(SONDER_ERROR_INVALID_ARGUMENT, "embed requires a session and 1 to 1024 inputs");
+        }
+        if (out_stats && out_stats->struct_size < sizeof(sonder_embed_stats)) {
+            return fail(SONDER_ERROR_INVALID_ARGUMENT, "sonder_embed_stats.struct_size too small");
+        }
+        RequestOptions options;
+        if (const char* err = request_options_from_c(metadata, options)) {
+            return fail(SONDER_ERROR_INVALID_ARGUMENT, err);
+        }
+        std::vector<std::string> copied;
+        copied.reserve(input_count);
+        for (std::size_t i = 0; i < input_count; ++i) {
+            if (!inputs[i]) {
+                return fail(SONDER_ERROR_INVALID_ARGUMENT, "embed input pointer must be non-null");
+            }
+            copied.emplace_back(inputs[i]);
+        }
+        auto res = session->session->embed(copied, options);
+        if (!res.ok()) {
+            return fail(res.status());
+        }
+        const auto& er = res.value();
+        if (callback) {
+            for (std::size_t i = 0; i < er.embeddings.size(); ++i) {
+                const auto& vec = er.embeddings[i];
+                const float* data = vec.empty() ? nullptr : vec.data();
+                if (callback(user_data, i, data, vec.size()) != 0) {
+                    break;
+                }
+            }
+        }
+        if (out_stats) {
+            sonder_embed_stats st{};
+            st.struct_size = out_stats->struct_size;
+            st.reserved = 0;
+            st.prompt_tokens = er.prompt_tokens;
+            st.eval_ns = er.eval_ns;
+            st.embedding_count = er.embeddings.size();
+            st.dimensions = er.embeddings.empty() ? 0 : er.embeddings.front().size();
+            std::memcpy(out_stats, &st, sizeof(sonder_embed_stats));
+        }
+        return ok();
     });
 }
 

@@ -122,6 +122,18 @@ def _declare(lib: ctypes.CDLL, path: str) -> None:
         fn("sonder_session_chat_with_metadata", status, c.c_void_p, c.POINTER(c.POINTER(S.CChatMessage)),
            c.c_size_t, c.POINTER(S.CRequestMetadata), S.TOKEN_CALLBACK, c.c_void_p,
            c.POINTER(S.CGenerationStats))
+    if hasattr(lib, "sonder_session_generate_ex"):
+        fn("sonder_session_generate_ex", status, c.c_void_p, c.c_char_p,
+           c.POINTER(S.CRequestMetadata), S.CHUNK_CALLBACK, c.c_void_p,
+           c.POINTER(S.CGenerationStats))
+    if hasattr(lib, "sonder_session_chat_ex"):
+        fn("sonder_session_chat_ex", status, c.c_void_p, c.POINTER(c.POINTER(S.CChatMessage)),
+           c.c_size_t, c.POINTER(S.CRequestMetadata), S.CHUNK_CALLBACK, c.c_void_p,
+           c.POINTER(S.CGenerationStats))
+    if hasattr(lib, "sonder_session_embed"):
+        fn("sonder_session_embed", status, c.c_void_p, c.POINTER(c.c_char_p), c.c_size_t,
+           c.POINTER(S.CRequestMetadata), S.EMBED_CALLBACK, c.c_void_p,
+           c.POINTER(S.CEmbedStats))
     if hasattr(lib, "sonder_gpu_device_count"):
         fn("sonder_gpu_device_count", c.c_size_t)
     if hasattr(lib, "sonder_gpu_device_info"):
@@ -231,19 +243,29 @@ def load_library(path: Optional[PathLike] = None) -> Library:
         for cand in _candidates(path):
             tried.append(str(cand))
             if cand.is_file():
-                _library = Library(_open(cand), str(cand.resolve()))
+                cdll, dll_dir = _open_with_dll_dir(cand)
+                try:
+                    lib = Library(cdll, str(cand.resolve()))
+                except BaseException:
+                    if dll_dir is not None:
+                        dll_dir.close()
+                    raise
+                if dll_dir is not None:
+                    _dll_dir_handles.append(dll_dir)
+                _library = lib
                 return _library
         if path is None:
             found = ctypes.util.find_library("sonder_inference")
             if found:
                 tried.append(found)
+                found_cdll: Optional[ctypes.CDLL]
                 try:
-                    cdll = ctypes.CDLL(found)
+                    found_cdll = ctypes.CDLL(found)
                 except OSError:
-                    cdll = None
-                if cdll is not None:
+                    found_cdll = None
+                if found_cdll is not None:
                     # Do not swallow LibraryNotFoundError (e.g. ABI mismatch).
-                    _library = Library(cdll, found)
+                    _library = Library(found_cdll, found)
                     return _library
         raise LibraryNotFoundError(
             "could not find the Sonder Inference shared library. Set "
@@ -251,7 +273,7 @@ def load_library(path: Optional[PathLike] = None) -> Library:
             + ", ".join(tried))
 
 
-def _open(path: Path) -> ctypes.CDLL:
+def _open_with_dll_dir(path: Path) -> tuple[ctypes.CDLL, Any]:
     resolved = path.resolve()
     dll_dir: Any = None
     if sys.platform == "win32":
@@ -263,8 +285,22 @@ def _open(path: Path) -> ctypes.CDLL:
         if dll_dir is not None:
             dll_dir.close()
         raise LibraryNotFoundError(f"failed to load {path}: {e}") from e
-    if dll_dir is not None:
-        _dll_dir_handles.append(dll_dir)
+    except BaseException:
+        if dll_dir is not None:
+            dll_dir.close()
+        raise
+    return cdll, dll_dir
+
+
+def _open(path: Path) -> ctypes.CDLL:
+    cdll, dll_dir = _open_with_dll_dir(path)
+    try:
+        if dll_dir is not None:
+            _dll_dir_handles.append(dll_dir)
+    except BaseException:
+        if dll_dir is not None:
+            dll_dir.close()
+        raise
     return cdll
 
 

@@ -16,6 +16,8 @@ from ._lib import (
 )
 from .api import (
     ChatMessage,
+    ChunkKind,
+    EmbedResult,
     Engine,
     GenerationResult,
     GpuInfo,
@@ -25,8 +27,14 @@ from .api import (
     SamplingConfig,
     Session,
     SessionMetadata,
+    StopReason,
     TelemetryLevel,
     TokenStream,
+    ToolCall,
+    ToolCallDelta,
+    ToolChoice,
+    ToolChoiceMode,
+    ToolDefinition,
     WorkloadClass,
     abi_version,
     list_gpu_devices,
@@ -52,11 +60,11 @@ from .errors import (
 __version__ = "0.1.0"
 
 __all__ = [
-    "BackendError", "CancelledError", "ChatMessage", "ENV_LIBRARY", "ENV_LIB_DIR", "Engine",
-    "GenerationResult", "GpuInfo", "InternalError", "InvalidArgumentError", "InvalidStateError", "Library",
+    "BackendError", "CancelledError", "ChatMessage", "ChunkKind", "ENV_LIBRARY", "ENV_LIB_DIR", "EmbedResult",
+    "Engine", "GenerationResult", "GpuInfo", "InternalError", "InvalidArgumentError", "InvalidStateError", "Library",
     "LibraryNotFoundError", "Model", "NotFoundError", "Outcome", "ProtocolError", "RequestMetadata",
     "SUPPORTED_ABI_VERSION", "SamplingConfig", "Session", "SessionMetadata", "SonderError", "SonderIOError",
-    "SonderTimeoutError", "Status", "TelemetryLevel", "TokenStream", "UnavailableError",
-    "UnsupportedError", "WorkloadClass", "abi_version", "error_for_status", "get_library",
-    "list_gpu_devices", "load_library", "version",
+    "SonderTimeoutError", "Status", "StopReason", "TelemetryLevel", "TokenStream", "ToolCall", "ToolCallDelta",
+    "ToolChoice", "ToolChoiceMode", "ToolDefinition", "UnavailableError", "UnsupportedError", "WorkloadClass",
+    "abi_version", "error_for_status", "get_library", "list_gpu_devices", "load_library", "version",
 ]

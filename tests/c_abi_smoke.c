@@ -94,12 +94,16 @@ int main(void) {
         if (tokens != 4 || stats.chunks != 4 || stats.outcome != SONDER_OUTCOME_COMPLETED) return 9;
     }
     {
-        const sonder_request_metadata metadata = {
-            sizeof(sonder_request_metadata), "c-parent:1", SONDER_WORKLOAD_DEFAULT, 0};
+        sonder_request_metadata metadata;
         const sonder_chat_message message = {sizeof(sonder_chat_message), "user", "c parent chat"};
         const sonder_chat_message* messages[] = {&message};
         sonder_request_metadata zero_meta;
         sonder_request_metadata sched_meta;
+        memset(&metadata, 0, sizeof(metadata));
+        metadata.struct_size = sizeof(sonder_request_metadata);
+        metadata.parent_request_id = "c-parent:1";
+        metadata.workload_class = SONDER_WORKLOAD_DEFAULT;
+        metadata.priority = 0;
         tokens = 0;
         if (sonder_session_generate_with_metadata(session, "c parent generate", &metadata,
                                                  count_tokens, &tokens, &stats) != SONDER_OK) return 13;
@@ -116,6 +120,7 @@ int main(void) {
                                                  NULL, NULL, &stats) != SONDER_OK) return 24;
 
         /* Explicit ADR-020 workload_class and priority values. */
+        memset(&sched_meta, 0, sizeof(sched_meta));
         sched_meta.struct_size = sizeof(sched_meta);
         sched_meta.parent_request_id = "c-sched:1";
         sched_meta.workload_class = SONDER_WORKLOAD_INTERACTIVE_USER;

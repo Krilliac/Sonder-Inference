@@ -76,7 +76,11 @@ TEST_SUITE("c_abi_request_metadata") {
 TEST_CASE("parent lineage is request local across generate chat cancellation and defaults") {
     ParentFixture f;
     char parent[] = "parent-turn:generate";
-    sonder_request_metadata metadata{sizeof(sonder_request_metadata), parent, SONDER_WORKLOAD_DEFAULT, 0};
+    sonder_request_metadata metadata{};
+    metadata.struct_size = sizeof(sonder_request_metadata);
+    metadata.parent_request_id = parent;
+    metadata.workload_class = SONDER_WORKLOAD_DEFAULT;
+    metadata.priority = 0;
     REQUIRE(sonder_session_generate_with_metadata(f.session.get(), "parent-private-prompt-canary", &metadata,
                                                  nullptr, nullptr, nullptr) == SONDER_OK);
     parent[0] = 'X';  // after return: queued telemetry owns its copy
@@ -147,8 +151,9 @@ TEST_CASE("parent lineage is request local across generate chat cancellation and
 
 TEST_CASE("parent metadata rejects incomplete prefixes and invalid IDs before submission") {
     ParentFixture f;
-    sonder_request_metadata metadata{offsetof(sonder_request_metadata, parent_request_id), nullptr,
-                                     SONDER_WORKLOAD_DEFAULT, 0};
+    sonder_request_metadata metadata{};
+    metadata.struct_size = static_cast<uint32_t>(offsetof(sonder_request_metadata, parent_request_id));
+    metadata.workload_class = SONDER_WORKLOAD_DEFAULT;
     int callbacks = 0;
     const sonder_chat_message message{sizeof(sonder_chat_message), "user", "hi"};
     const sonder_chat_message* messages[] = {&message};
@@ -186,7 +191,11 @@ TEST_CASE("parent metadata accepts exact identifier boundary and extended record
     struct Extended {
         sonder_request_metadata prefix;
         const char* ignored;
-    } metadata{{sizeof(Extended), longest.c_str(), SONDER_WORKLOAD_DEFAULT, 0}, "ignored/private/value"};
+    } metadata{};
+    metadata.prefix.struct_size = sizeof(Extended);
+    metadata.prefix.parent_request_id = longest.c_str();
+    metadata.prefix.workload_class = SONDER_WORKLOAD_DEFAULT;
+    metadata.ignored = "ignored/private/value";
     REQUIRE(sonder_session_generate_with_metadata(f.session.get(), "hi", &metadata.prefix,
                                                  nullptr, nullptr, nullptr) == SONDER_OK);
     const sonder_chat_message message{sizeof(sonder_chat_message), "user", "hi"};

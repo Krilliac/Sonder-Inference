@@ -64,6 +64,18 @@ typedef enum sonder_outcome {
     SONDER_OUTCOME_FAILED = 3
 } sonder_outcome;
 
+/* Mirrors sonder::inference::StopReason (append-only, ABI version 1). */
+typedef enum sonder_stop_reason {
+    SONDER_STOP_NONE = 0,
+    SONDER_STOP_MAX_TOKENS = 1,
+    SONDER_STOP_STOP_SEQUENCE = 2,
+    SONDER_STOP_END_OF_SEQUENCE = 3,
+    SONDER_STOP_CANCELLED = 4,
+    SONDER_STOP_CALLBACK = 5,
+    SONDER_STOP_ERROR = 6,
+    SONDER_STOP_TOOL_CALLS = 7
+} sonder_stop_reason;
+
 typedef struct sonder_engine sonder_engine;
 typedef struct sonder_model sonder_model;
 typedef struct sonder_session sonder_session;
@@ -115,6 +127,22 @@ typedef struct sonder_generation_stats {
     uint64_t chunks;
     double ttft_ms;        /* -1 when no output was produced */
     double total_ms;
+    /* ---- Appended v1.x counters & timings (still ABI version 1).
+     * Written only when struct_size >= sizeof(sonder_generation_stats);
+     * callers built against the original 48-byte layout keep working. ---- */
+    uint64_t cached_tokens;             /* 0 when has_cached_tokens == 0 */
+    int32_t has_cached_tokens;          /* nonzero when cached_tokens is known */
+    int32_t stop_reason;                /* sonder_stop_reason */
+    uint64_t load_ns;                   /* 0 when unknown */
+    uint64_t prompt_eval_ns;            /* 0 when unknown */
+    uint64_t eval_ns;                   /* 0 when unknown */
+    double prompt_ms;                   /* -1 when unknown */
+    double predicted_ms;                /* -1 when unknown */
+    double predicted_tokens_per_second; /* -1 when unknown */
+    uint64_t draft_tokens;              /* 0 when has_draft_tokens == 0 */
+    uint64_t draft_accepted_tokens;     /* 0 when has_draft_tokens == 0 */
+    int32_t has_draft_tokens;           /* nonzero when draft counters are known */
+    int32_t reserved_flags;             /* always 0 */
 } sonder_generation_stats;
 
 /* Return nonzero to stop generation early. `text` is not NUL-terminated. */
@@ -232,6 +260,26 @@ typedef enum sonder_workload_class {
     SONDER_WORKLOAD_MAINTENANCE = 7
 } sonder_workload_class;
 
+#define SONDER_MAX_TOOLS 256u
+#define SONDER_MAX_EMBED_INPUTS 1024u
+
+/* Additive ABI-v1 tool definition (borrowed for the duration of the call). */
+typedef struct sonder_tool_definition {
+    uint32_t struct_size;        /* sizeof(sonder_tool_definition) */
+    uint32_t reserved;           /* must be 0 */
+    const char* name;            /* UTF-8, NUL-terminated, non-empty */
+    const char* description;     /* UTF-8, NUL-terminated; NULL = empty */
+    const char* parameters_json; /* UTF-8 JSON Schema object; NULL = unconstrained */
+} sonder_tool_definition;
+
+typedef enum sonder_tool_choice_mode {
+    SONDER_TOOL_CHOICE_UNSET = 0,
+    SONDER_TOOL_CHOICE_AUTO = 1,
+    SONDER_TOOL_CHOICE_NONE = 2,
+    SONDER_TOOL_CHOICE_REQUIRED = 3,
+    SONDER_TOOL_CHOICE_FUNCTION = 4
+} sonder_tool_choice_mode;
+
 typedef struct sonder_request_metadata {
     uint32_t struct_size;  /* sizeof(sonder_request_metadata) */
     const char* parent_request_id;
@@ -247,6 +295,21 @@ typedef struct sonder_request_metadata {
      * admission is enabled). ---- */
     int32_t workload_class;
     int32_t priority;
+    /* ---- Appended v1.x request controls (still ABI version 1).
+     * Read only when struct_size >= sizeof(sonder_request_metadata).
+     * Zero-initialization leaves every control unset / backend default. ---- */
+    const char* grammar;                  /* optional GBNF grammar; NULL = unconstrained */
+    const char* response_format_type;     /* "text", "json_object", "json_schema", or NULL */
+    const char* response_format_schema;   /* JSON Schema string for "json_schema", or NULL */
+    int32_t separate_reasoning;           /* nonzero: deliver reasoning on separate channel */
+    int32_t enable_thinking;              /* 0 = unset, 1 = enable, -1 = disable */
+    const char* reasoning_effort;         /* optional effort hint, or NULL */
+    int32_t has_reasoning_budget;         /* nonzero: apply reasoning_budget_tokens (>= 0) */
+    int32_t tool_choice_mode;             /* sonder_tool_choice_mode (0..4) */
+    int64_t reasoning_budget_tokens;      /* valid when has_reasoning_budget != 0 */
+    const char* tool_choice_function;     /* required when tool_choice_mode == FUNCTION */
+    const sonder_tool_definition* tools;  /* borrowed array of tool_count entries; NULL if 0 */
+    size_t tool_count;                    /* 0..SONDER_MAX_TOOLS */
 } sonder_request_metadata;
 
 /* metadata may be NULL. Request, callback, stats, cancellation and handle
@@ -259,6 +322,53 @@ SONDER_API sonder_status sonder_session_chat_with_metadata(
     sonder_session* session, const sonder_chat_message* const* messages, size_t message_count,
     const sonder_request_metadata* metadata, sonder_token_callback callback, void* user_data,
     sonder_generation_stats* out_stats);
+
+/* Additive ABI-v1.x structured chunk streaming (text, reasoning, tool_calls).
+ * Return nonzero from sonder_chunk_callback to stop generation early. */
+typedef enum sonder_chunk_kind {
+    SONDER_CHUNK_TEXT = 0,
+    SONDER_CHUNK_REASONING = 1,
+    SONDER_CHUNK_TOOL_CALL_DELTA = 2
+} sonder_chunk_kind;
+
+typedef struct sonder_chunk_event {
+    uint32_t struct_size;       /* sizeof(sonder_chunk_event) */
+    sonder_chunk_kind kind;
+    uint64_t index;             /* chunk index (text/reasoning) or tool_call index */
+    const char* text;           /* UTF-8 bytes (not NUL-terminated): text, reasoning, or arguments_delta */
+    size_t text_length;
+    const char* tool_call_id;   /* NUL-terminated UTF-8 when kind == TOOL_CALL_DELTA, else NULL */
+    const char* tool_call_name; /* NUL-terminated UTF-8 when kind == TOOL_CALL_DELTA, else NULL */
+} sonder_chunk_event;
+
+typedef int (*sonder_chunk_callback)(void* user_data, const sonder_chunk_event* event);
+
+SONDER_API sonder_status sonder_session_generate_ex(
+    sonder_session* session, const char* prompt, const sonder_request_metadata* metadata,
+    sonder_chunk_callback callback, void* user_data, sonder_generation_stats* out_stats);
+SONDER_API sonder_status sonder_session_chat_ex(
+    sonder_session* session, const sonder_chat_message* const* messages, size_t message_count,
+    const sonder_request_metadata* metadata, sonder_chunk_callback callback, void* user_data,
+    sonder_generation_stats* out_stats);
+
+/* Additive ABI-v1.x embeddings export.
+ * Invokes `callback` once per input vector (index 0..embedding_count-1) with
+ * borrowed float pointers before returning. Return nonzero to abort delivery. */
+typedef struct sonder_embed_stats {
+    uint32_t struct_size;  /* sizeof(sonder_embed_stats) */
+    uint32_t reserved;     /* always 0 */
+    uint64_t prompt_tokens;
+    uint64_t eval_ns;
+    size_t embedding_count;
+    size_t dimensions;
+} sonder_embed_stats;
+
+typedef int (*sonder_embed_callback)(void* user_data, size_t index, const float* values, size_t dimensions);
+
+SONDER_API sonder_status sonder_session_embed(
+    sonder_session* session, const char* const* inputs, size_t input_count,
+    const sonder_request_metadata* metadata, sonder_embed_callback callback, void* user_data,
+    sonder_embed_stats* out_stats);
 
 /* Additive ABI-v1 GPU device inventory.
  * Fixed UTF-8 NUL-terminated strings avoid caller-freed heap allocations.
