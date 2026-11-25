@@ -380,3 +380,84 @@ TEST_CASE("checkpoint: count cap emits the full evicted snapshot and clear reset
     CHECK(manager.stats().free_blocks == manager.stats().total_blocks);
     CHECK(manager.validate());
 }
+
+TEST_CASE("checkpoint: selected interior checkpoint is not self-evicted during append") {
+    KvCacheManager manager(config(4, 4));
+    // Low-priority hybrid sequence creates two cached blocks and an interior checkpoint at pos 6.
+    REQUIRE(manager.add_sequence(1, {fp(), 1, ModelArchitecture::hybrid}).ok());
+    REQUIRE(manager.append_tokens(1, tokens(0, 8)).ok());
+    REQUIRE(manager.save_checkpoint(1, 6, 64).ok());
+    REQUIRE(manager.free_sequence(1).ok());
+
+    // High-priority attention sequence fills remaining 2 blocks and releases them to cache.
+    REQUIRE(manager.add_sequence(3, {fp(), 9, ModelArchitecture::attention_only}).ok());
+    REQUIRE(manager.append_tokens(3, tokens(50, 8)).ok());
+    REQUIRE(manager.free_sequence(3).ok());
+
+    std::vector<RecurrentStateCheckpoint> evicted;
+    manager.set_event_listener([&](const CacheEvent& e) {
+        if (e.kind == CacheEvent::Kind::checkpoint_evicted && e.checkpoint) {
+            evicted.push_back(*e.checkpoint);
+        }
+    });
+
+    // Appending 12 tokens (need=3 < available=4) reuses through cp@6, COWs block 1, then
+    // allocates block 2. The append must NOT evict the very checkpoint it returns!
+    REQUIRE(manager.add_sequence(2, {fp(), 1, ModelArchitecture::hybrid}).ok());
+    std::vector<TokenId> prompt = tokens(0, 8);
+    const auto tail = tokens(90, 4);
+    prompt.insert(prompt.end(), tail.begin(), tail.end());
+    AppendResult res;
+    REQUIRE(manager.append_tokens(2, prompt, &res).ok());
+    REQUIRE(res.checkpoint.has_value());
+    CHECK_EQ(res.checkpoint->owner, 1u);
+    CHECK_EQ(res.checkpoint->position, 6u);
+    CHECK_EQ(res.tokens_reused, 6u);
+    CHECK(evicted.empty());
+    CHECK_EQ(manager.stats().checkpoints, 1u);
+    CHECK(contents(manager, 2) == prompt);
+    CHECK(manager.validate());
+}
+
+TEST_CASE("checkpoint: fork succeeds with recycled child id when parent has its own checkpoint") {
+    KvCacheManager manager(config());
+    REQUIRE(manager.add_sequence(2, recurrent()).ok());
+    REQUIRE(manager.append_tokens(2, tokens(0, 4)).ok());
+    REQUIRE(manager.save_checkpoint(2, 4, 32).ok());
+    REQUIRE(manager.free_sequence(2).ok());
+
+    REQUIRE(manager.add_sequence(1, recurrent()).ok());
+    REQUIRE(manager.append_tokens(1, tokens(0, 4)).ok());
+    REQUIRE(manager.save_checkpoint(1, 4, 32).ok());
+
+    const auto cp = manager.checkpoint_at(1, 4);
+    REQUIRE(cp.has_value());
+    CHECK_EQ(cp->owner, 1u);
+
+    CHECK(manager.fork_sequence(1, 2).ok());
+    CHECK(manager.has_sequence(2));
+    CHECK(contents(manager, 2) == tokens(0, 4));
+    REQUIRE(manager.checkpoint_at(1, 4).has_value());
+    CHECK_EQ(manager.checkpoint_at(1, 4)->owner, 1u);
+    CHECK_EQ(manager.stats().checkpoints, 1u);
+    CHECK(manager.validate());
+}
+
+TEST_CASE("checkpoint: tight pool falls back from unaligned checkpoint to aligned checkpoint") {
+    KvCacheManager manager(config(3, 4));
+    REQUIRE(manager.add_sequence(1, recurrent()).ok());
+    REQUIRE(manager.append_tokens(1, tokens(0, 12)).ok());
+    REQUIRE(manager.save_checkpoint(1, 4, 32).ok());
+    REQUIRE(manager.save_checkpoint(1, 6, 32).ok());
+    REQUIRE(manager.free_sequence(1).ok());
+
+    REQUIRE(manager.add_sequence(2, recurrent()).ok());
+    AppendResult res;
+    REQUIRE(manager.append_tokens(2, tokens(0, 12), &res).ok());
+    CHECK_EQ(res.tokens_reused, 4u);
+    REQUIRE(res.checkpoint.has_value());
+    CHECK_EQ(res.checkpoint->position, 4u);
+    CHECK_LE(manager.stats().pinned_blocks, 3u);
+    CHECK(contents(manager, 2) == tokens(0, 12));
+    CHECK(manager.validate());
+}

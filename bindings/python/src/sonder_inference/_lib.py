@@ -16,7 +16,7 @@ import os
 import sys
 import threading
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from . import _structs as S
 
@@ -58,12 +58,27 @@ def _candidates(path: Optional[PathLike]) -> list[Path]:
     return out
 
 
-def _declare(lib: ctypes.CDLL) -> None:
+def _declare_abi_version(lib: ctypes.CDLL, path: str) -> int:
+    try:
+        abi_fn = getattr(lib, "sonder_abi_version")
+    except AttributeError as e:
+        raise LibraryNotFoundError(
+            f"{path}: missing required C ABI symbol 'sonder_abi_version'") from e
+    abi_fn.restype = ctypes.c_uint32
+    abi_fn.argtypes = []
+    return int(abi_fn())
+
+
+def _declare(lib: ctypes.CDLL, path: str) -> None:
     c = ctypes
     status = c.c_int
 
-    def fn(name: str, restype, *argtypes) -> None:
-        f = getattr(lib, name)
+    def fn(name: str, restype: Any, *argtypes: Any) -> None:
+        try:
+            f = getattr(lib, name)
+        except AttributeError as e:
+            raise LibraryNotFoundError(
+                f"{path}: missing required C ABI symbol '{name}'") from e
         f.restype = restype
         f.argtypes = list(argtypes)
 
@@ -121,13 +136,17 @@ class Library:
     def __init__(self, cdll: ctypes.CDLL, path: str) -> None:
         self.cdll = cdll
         self.path = path
-        _declare(cdll)
-        self.abi_version = int(cdll.sonder_abi_version())
+        # Verify ABI version before declaring symbols so an incompatible ABI
+        # raises a clear version-mismatch LibraryNotFoundError rather than an
+        # AttributeError on a renamed/removed symbol.
+        self.abi_version = _declare_abi_version(cdll, path)
         if self.abi_version != SUPPORTED_ABI_VERSION:
             raise LibraryNotFoundError(
                 f"{path}: C ABI version {self.abi_version} is not supported "
                 f"(these bindings target version {SUPPORTED_ABI_VERSION})")
+        _declare(cdll, path)
         self._extended_sampling: Optional[bool] = None
+        self._probe_lock = threading.Lock()
 
     @property
     def version(self) -> str:
@@ -159,13 +178,23 @@ class Library:
         invalid ``typical_p`` is rejected only by a library that reads it.
         """
         if self._extended_sampling is None:
-            cfg = S.CSamplingConfig()
-            self.init_sampling(cfg)
-            cfg.struct_size = ctypes.sizeof(S.CSamplingConfig)
-            cfg.typical_p = 0.0  # invalid when read
-            rc = self.cdll.sonder_sampling_config_validate(ctypes.byref(cfg))
-            self._extended_sampling = rc != 0
+            with self._probe_lock:
+                if self._extended_sampling is None:
+                    cfg = S.CSamplingConfig()
+                    self.init_sampling(cfg)
+                    cfg.struct_size = ctypes.sizeof(S.CSamplingConfig)
+                    cfg.typical_p = 0.0  # invalid when read
+                    rc = self.cdll.sonder_sampling_config_validate(ctypes.byref(cfg))
+                    if rc != 0:
+                        # Clear the thread-local error written by the intentional probe failure.
+                        clean = S.CSamplingConfig()
+                        self.init_sampling(clean)
+                        self.cdll.sonder_sampling_config_validate(ctypes.byref(clean))
+                    self._extended_sampling = rc != 0
         return self._extended_sampling
+
+    def status_string(self, status: int) -> str:
+        return (self.cdll.sonder_status_string(int(status)) or b"").decode("utf-8", "replace")
 
     def last_error(self) -> str:
         return (self.cdll.sonder_last_error_message() or b"").decode("utf-8", "replace")
@@ -173,6 +202,14 @@ class Library:
 
 _lock = threading.Lock()
 _library: Optional[Library] = None
+_dll_dir_handles: list[Any] = []
+
+
+def _same_path(loaded: str, candidate: Path) -> bool:
+    try:
+        return os.path.samefile(loaded, candidate)
+    except OSError:
+        return os.path.normcase(str(Path(loaded).resolve())) == os.path.normcase(str(candidate.resolve()))
 
 
 def load_library(path: Optional[PathLike] = None) -> Library:
@@ -186,8 +223,7 @@ def load_library(path: Optional[PathLike] = None) -> Library:
     with _lock:
         if _library is not None:
             if path is not None:
-                wanted = {str(c.resolve()) for c in _candidates(path) if c.is_file()}
-                if _library.path not in wanted:
+                if not any(_same_path(_library.path, c) for c in _candidates(path) if c.is_file()):
                     raise LibraryNotFoundError(
                         f"library already loaded from {_library.path}; cannot switch to {path}")
             return _library
@@ -202,10 +238,13 @@ def load_library(path: Optional[PathLike] = None) -> Library:
             if found:
                 tried.append(found)
                 try:
-                    _library = Library(ctypes.CDLL(found), found)
-                    return _library
+                    cdll = ctypes.CDLL(found)
                 except OSError:
-                    pass
+                    cdll = None
+                if cdll is not None:
+                    # Do not swallow LibraryNotFoundError (e.g. ABI mismatch).
+                    _library = Library(cdll, found)
+                    return _library
         raise LibraryNotFoundError(
             "could not find the Sonder Inference shared library. Set "
             f"{ENV_LIBRARY} to the file or {ENV_LIB_DIR} to its directory. Tried: "
@@ -213,13 +252,20 @@ def load_library(path: Optional[PathLike] = None) -> Library:
 
 
 def _open(path: Path) -> ctypes.CDLL:
+    resolved = path.resolve()
+    dll_dir: Any = None
     if sys.platform == "win32":
         # Let the DLL's own directory satisfy its dependencies.
-        os.add_dll_directory(str(path.resolve().parent))
+        dll_dir = os.add_dll_directory(str(resolved.parent))
     try:
-        return ctypes.CDLL(str(path.resolve()))
+        cdll = ctypes.CDLL(str(resolved))
     except OSError as e:
+        if dll_dir is not None:
+            dll_dir.close()
         raise LibraryNotFoundError(f"failed to load {path}: {e}") from e
+    if dll_dir is not None:
+        _dll_dir_handles.append(dll_dir)
+    return cdll
 
 
 def get_library() -> Library:

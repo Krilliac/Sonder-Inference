@@ -4,6 +4,7 @@
 #include "sonder/inference/scheduler/types.hpp"
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace sonder::inference::scheduler {
@@ -37,7 +38,11 @@ struct RequestTimeline {
     TimeUs total_queue_time = 0;  // includes requeue waits after preemption
 
     [[nodiscard]] TimeUs ttft() const noexcept {
-        return first_token < 0 ? -1 : first_token - arrival;
+        if (first_token < 0) return -1;
+        if (first_token <= arrival) return 0;
+        constexpr TimeUs kMax = std::numeric_limits<TimeUs>::max();
+        if (arrival < 0 && first_token > kMax + arrival) return kMax;
+        return first_token - arrival;
     }
 };
 

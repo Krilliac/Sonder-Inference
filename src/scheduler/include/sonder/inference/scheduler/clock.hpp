@@ -4,6 +4,8 @@
 
 #include "sonder/inference/scheduler/types.hpp"
 
+#include <limits>
+
 namespace sonder::inference::scheduler {
 
 class Clock {
@@ -19,7 +21,9 @@ public:
     explicit SimClock(TimeUs start = 0) noexcept : now_(start) {}
     [[nodiscard]] TimeUs now() const noexcept override { return now_; }
     void advance(TimeUs delta) noexcept {
-        if (delta > 0) now_ += delta;
+        if (delta <= 0) return;
+        constexpr TimeUs kMax = std::numeric_limits<TimeUs>::max();
+        now_ = now_ > kMax - delta ? kMax : now_ + delta;
     }
     void advance_to(TimeUs t) noexcept {
         if (t > now_) now_ = t;

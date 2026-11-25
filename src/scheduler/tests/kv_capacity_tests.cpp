@@ -724,3 +724,45 @@ TEST_CASE("dynamic_kv_capacity_priority_preemption_accounts_for_over_budget_defi
     clock.advance(1000);
     sched.complete_step(p3);
 }
+
+TEST_CASE("dynamic_kv_capacity_decode_pressure_avoids_spurious_victim_preemption") {
+    SchedulerConfig cfg;
+    cfg.admission_watermark_blocks = 0;
+    cfg.enable_priority_preemption = false;
+
+    SimClock clock;
+    DynamicKvCapacity kv(10, 16);
+    Scheduler sched(cfg, clock, kv);
+
+    RequestSpec high = make_spec(1, 60, 4);   // 4 blocks; stays <= 64 tokens (no growth)
+    high.workload = WorkloadClass::InteractiveUser;
+    RequestSpec mid = make_spec(2, 64, 4);    // 4 blocks; next decode wants 5th block
+    mid.workload = WorkloadClass::ImplementationWorker;
+    RequestSpec low = make_spec(3, 12, 4);    // 1 block; stays <= 16 tokens (no growth)
+    low.workload = WorkloadClass::BackgroundIndexing;
+
+    REQUIRE(sched.submit(high).accepted);
+    REQUIRE(sched.submit(mid).accepted);
+    REQUIRE(sched.submit(low).accepted);
+
+    const StepPlan p1 = sched.plan_step();
+    CHECK_EQ(p1.admitted.size(), 3u);
+    CHECK_EQ(kv.used_blocks(), 9ull);
+    clock.advance(1000);
+    sched.complete_step(p1);
+
+    // Shrink total to 6 (used=9, over_budget=3, free=0).
+    // mid needs +1 block plus clearing deficit 3 => 4 blocks to free.
+    // Worse victim low only holds 1 block (< 4), so preempting low cannot save mid;
+    // mid must self-preempt directly without spuriously evicting low.
+    kv.set_total_blocks(6);
+    const StepPlan p2 = sched.plan_step();
+    REQUIRE_EQ(p2.preempted.size(), 1u);
+    CHECK_EQ(p2.preempted[0].id, 2ull);
+    CHECK(sched.state(2) == RequestState::Preempted);
+    CHECK(sched.state(3) == RequestState::Decode);
+    CHECK_EQ(kv.used_blocks(), 5ull);
+    CHECK_FALSE(kv.is_over_budget());
+    clock.advance(1000);
+    sched.complete_step(p2);
+}
