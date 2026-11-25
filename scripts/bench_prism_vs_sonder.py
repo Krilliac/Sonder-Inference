@@ -19,6 +19,7 @@ Supports two execution modes (stdlib-only Python 3.10+, Windows & Linux):
 from __future__ import annotations
 
 import argparse
+import ast
 import concurrent.futures
 import difflib
 import hashlib
@@ -28,6 +29,7 @@ import math
 import os
 import platform
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -390,11 +392,54 @@ def sample_process_rss_mib(pid: int | None) -> float | None:
     return round(total_bytes / (1024.0 * 1024.0), 2)
 
 
-def sample_gpu_vram_mib() -> float | None:
-    """Query used GPU VRAM in MiB via nvidia-smi; gracefully returns None if unavailable."""
+def sample_process_vram_mib(pid: int | None) -> float | None:
+    """Query per-process NVIDIA compute VRAM in MiB across pid and descendants, or None."""
+    if pid is None or pid <= 0:
+        return None
     exe = shutil.which("nvidia-smi")
     if not exe:
         return None
+    pids = set(_descendant_pids(pid))
+    if not pids:
+        return None
+    try:
+        proc = subprocess.run(
+            [exe, "--query-compute-apps=pid,used_gpu_memory", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            stdin=subprocess.DEVNULL,
+        )
+        if proc.returncode != 0:
+            return None
+        total = 0.0
+        matched = False
+        for line in proc.stdout.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 2:
+                continue
+            try:
+                app_pid = int(parts[0])
+                mem = float(parts[1])
+            except ValueError:
+                continue
+            if app_pid in pids:
+                total += mem
+                matched = True
+        return round(total, 1) if matched else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def sample_gpu_vram_mib(pid: int | None = None) -> tuple[float | None, str]:
+    """Query GPU VRAM in MiB; prefers per-process compute apps when available, else system-wide NVIDIA."""
+    if pid is not None:
+        per_proc = sample_process_vram_mib(pid)
+        if per_proc is not None:
+            return per_proc, "process"
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return None, "unavailable"
     try:
         proc = subprocess.run(
             [exe, "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
@@ -404,11 +449,11 @@ def sample_gpu_vram_mib() -> float | None:
             stdin=subprocess.DEVNULL,
         )
         if proc.returncode != 0:
-            return None
+            return None, "unavailable"
         vals = [float(line.strip()) for line in proc.stdout.splitlines() if line.strip()]
-        return round(sum(vals), 1) if vals else None
+        return (round(sum(vals), 1), "system_nvidia") if vals else (None, "unavailable")
     except (OSError, ValueError, subprocess.SubprocessError):
-        return None
+        return None, "unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -667,11 +712,13 @@ class BenchmarkClient:
                 )
 
             ctype = (resp.getheader("Content-Type") or "").lower()
-            if "event-stream" not in ctype:
+            streamed = "event-stream" in ctype
+            if not streamed:
                 # Graceful fallback if server answered with a plain JSON completion body.
+                # Non-streaming responses have no genuine first-token timestamp, so leave
+                # t_first=None to avoid manufacturing a bogus wall_decode_tps.
                 arm_deadline()
                 raw = resp.read()
-                t_now = time.perf_counter()
                 obj = json.loads(raw.decode("utf-8"))
                 if isinstance(obj, dict):
                     absorb_timings_and_usage(obj)
@@ -685,7 +732,6 @@ class BenchmarkClient:
                         if r_txt:
                             reasoning_parts.append(str(r_txt))
                         if c_txt or r_txt:
-                            t_first = t_now
                             token_chunks = 1
                         finish_reason = choices[0].get("finish_reason")
                     saw_done = True
@@ -739,7 +785,7 @@ class BenchmarkClient:
 
         t_end = time.perf_counter()
         total_s = max(t_end - t0, 0.0)
-        ttft_s = (t_first - t0) if t_first is not None else None
+        ttft_s = (t_first - t0) if (t_first is not None and streamed) else None
         if error is None and not saw_done:
             error = "truncated SSE stream (missing [DONE])"
         ok = error is None and http_status == 200 and saw_done
@@ -755,6 +801,7 @@ class BenchmarkClient:
             content="".join(content_parts),
             reasoning="".join(reasoning_parts),
             finish_reason=finish_reason,
+            streamed=streamed,
         )
 
 
@@ -771,6 +818,7 @@ def _finalize_stream_metrics(
     content: str,
     reasoning: str,
     finish_reason: str | None,
+    streamed: bool = True,
 ) -> dict[str, Any]:
     # Token count resolution: usage.completion_tokens -> timings.predicted_n -> SSE chunk count.
     tokens = token_chunks
@@ -811,7 +859,7 @@ def _finalize_stream_metrics(
     total_ms = total_s * 1000.0
 
     wall_decode_tps: float | None = None
-    if ttft_s is not None and tokens > 1 and total_s > ttft_s:
+    if streamed and token_source != "chunks" and ttft_s is not None and tokens > 1 and total_s > ttft_s:
         wall_decode_tps = (tokens - 1) / (total_s - ttft_s)
 
     total_wall_tps: float | None = None
@@ -903,55 +951,147 @@ def extract_python_code(text: str, entry_point: str | None = None) -> str:
     return cleaned
 
 
-def grade_python_code(text: str, spec: dict[str, Any], timeout_s: float | None = None) -> dict[str, Any]:
-    """Execute extracted Python candidate + unit test assertions in an isolated subprocess."""
+def _scrubbed_python_env() -> dict[str, str]:
+    """Minimal environment for opted-in Python assertion runs (never forwards secrets)."""
+    env: dict[str, str] = {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUTF8": "1",
+    }
+    if IS_WINDOWS:
+        for key in ("SYSTEMROOT", "WINDIR", "COMSPEC"):
+            val = os.environ.get(key)
+            if val:
+                env[key] = val
+    return env
+
+
+def grade_python_code(
+    text: str,
+    spec: dict[str, Any],
+    timeout_s: float | None = None,
+    *,
+    allow_unsafe_exec: bool = False,
+) -> dict[str, Any]:
+    """Grade extracted Python candidate.
+
+    By default (`allow_unsafe_exec=False`), untrusted model output is NEVER executed
+    on the host: only static AST syntax and entry-point checks run, and the probe is
+    marked `skipped=True`. Pass `allow_unsafe_exec=True` (CLI `--allow-unsafe-python-exec`)
+    only in an already-isolated environment to execute unit assertions with a scrubbed
+    environment, parent-verified completion sentinel, and process-tree cleanup.
+    """
     entry_point = spec.get("entry_point")
     candidate_code = extract_python_code(text, entry_point=entry_point)
     if not candidate_code:
-        return {"passed": False, "extracted": "", "detail": "empty Python candidate"}
+        return {"passed": False, "skipped": not allow_unsafe_exec, "extracted": "", "detail": "empty Python candidate"}
 
     test_code = str(spec.get("test_code", "")).strip()
     if not test_code:
-        return {"passed": False, "extracted": candidate_code, "detail": "probe missing test_code"}
+        return {
+            "passed": False,
+            "skipped": not allow_unsafe_exec,
+            "extracted": candidate_code,
+            "detail": "probe missing test_code",
+        }
 
-    effective_timeout = float(timeout_s if timeout_s is not None else spec.get("timeout_s", 3.0))
-    combined_script = f"{candidate_code}\n\n# --- Harness Unit Assertions ---\n{test_code}\n"
-
-    env = dict(os.environ)
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-
-    with tempfile.TemporaryDirectory(prefix="bonsai_pygrade_") as tmp_cwd:
-        try:
-            proc = subprocess.run(
-                [sys.executable, "-I", "-B", "-c", combined_script],
-                input="",
-                capture_output=True,
-                text=True,
-                timeout=effective_timeout,
-                cwd=tmp_cwd,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
+    # Static AST check runs safely in-process without executing candidate code.
+    try:
+        tree = ast.parse(candidate_code)
+    except SyntaxError as exc:
+        return {
+            "passed": False,
+            "skipped": not allow_unsafe_exec,
+            "extracted": candidate_code,
+            "detail": f"SyntaxError: {exc.msg}",
+        }
+    if entry_point:
+        has_entry = any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == entry_point
+            for node in tree.body
+        )
+        if not has_entry:
             return {
                 "passed": False,
+                "skipped": not allow_unsafe_exec,
                 "extracted": candidate_code,
-                "detail": f"timeout after {effective_timeout:.1f}s",
+                "detail": f"missing entry point {entry_point!r}",
             }
+
+    if not allow_unsafe_exec:
+        return {
+            "passed": False,
+            "skipped": True,
+            "static_ok": True,
+            "extracted": candidate_code,
+            "detail": "python execution disabled by default (pass --allow-unsafe-python-exec to run assertions); static AST check passed",
+        }
+
+    effective_timeout = float(timeout_s if timeout_s is not None else spec.get("timeout_s", 3.0))
+    sentinel = f"__SONDER_PYGRADE_OK_{secrets.token_hex(16)}__"
+    combined_script = (
+        f"{candidate_code}\n\n"
+        "# --- Harness Unit Assertions ---\n"
+        f"{test_code}\n"
+        f"print({sentinel!r}, flush=True)\n"
+    )
+    env = _scrubbed_python_env()
+
+    with tempfile.TemporaryDirectory(prefix="bonsai_pygrade_") as tmp_cwd:
+        popen_kwargs: dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "cwd": tmp_cwd,
+            "env": env,
+        }
+        if IS_WINDOWS:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+        try:
+            proc = subprocess.Popen([sys.executable, "-I", "-B", "-c", combined_script], **popen_kwargs)
+            job_handle = _attach_windows_kill_job(proc) if IS_WINDOWS else None
+            try:
+                stdout, stderr = proc.communicate(timeout=effective_timeout)
+            except subprocess.TimeoutExpired:
+                terminate_process_tree(proc, grace_s=0.2, job_handle=job_handle)
+                try:
+                    proc.communicate(timeout=1.0)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                return {
+                    "passed": False,
+                    "skipped": False,
+                    "extracted": candidate_code,
+                    "detail": f"timeout after {effective_timeout:.1f}s",
+                }
+            finally:
+                _close_windows_job(job_handle)
         except OSError as exc:
             return {
                 "passed": False,
+                "skipped": False,
                 "extracted": candidate_code,
                 "detail": f"subprocess launch failed: {exc}",
             }
 
+    if proc.returncode == 0 and sentinel in (stdout or "").splitlines():
+        return {"passed": True, "skipped": False, "extracted": candidate_code, "detail": "all unit assertions passed"}
     if proc.returncode == 0:
-        return {"passed": True, "extracted": candidate_code, "detail": "all unit assertions passed"}
+        return {
+            "passed": False,
+            "skipped": False,
+            "extracted": candidate_code,
+            "detail": "candidate exited early before harness assertions completed",
+        }
 
-    stderr_lines = [ln.strip() for ln in (proc.stderr or "").splitlines() if ln.strip()]
+    stderr_lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
     tail = stderr_lines[-1] if stderr_lines else f"exit code {proc.returncode}"
     return {
         "passed": False,
+        "skipped": False,
         "extracted": candidate_code,
         "detail": f"test failed: {tail[:240]}",
     }
@@ -1006,6 +1146,14 @@ def grade_json_schema(text: str, spec: dict[str, Any]) -> dict[str, Any]:
         return {"passed": False, "extracted": obj, "detail": f"expected JSON object, got {type(obj).__name__}"}
 
     required_keys: dict[str, str] = spec.get("required_keys") or {}
+    if spec.get("exact_keys") or spec.get("additional_properties") is False:
+        extra = sorted(set(obj.keys()) - set(required_keys.keys()))
+        if extra:
+            return {
+                "passed": False,
+                "extracted": obj,
+                "detail": f"unexpected extra key(s): {', '.join(repr(k) for k in extra)}",
+            }
     for key, type_spec in required_keys.items():
         if key not in obj:
             return {"passed": False, "extracted": obj, "detail": f"missing required key {key!r}"}
@@ -1081,13 +1229,13 @@ def grade_logic(text: str, spec: dict[str, Any]) -> dict[str, Any]:
     return {"passed": True, "extracted": cleaned, "detail": "all logic/instruction checks passed"}
 
 
-def grade_probe(text: str, probe: dict[str, Any]) -> dict[str, Any]:
+def grade_probe(text: str, probe: dict[str, Any], *, allow_unsafe_python_exec: bool = False) -> dict[str, Any]:
     spec = probe.get("grader") or {}
     gtype = spec.get("type") or probe.get("category")
     if gtype == "math":
         return grade_math(text, spec)
     if gtype == "python_code":
-        return grade_python_code(text, spec)
+        return grade_python_code(text, spec, allow_unsafe_exec=allow_unsafe_python_exec)
     if gtype == "json_schema":
         return grade_json_schema(text, spec)
     if gtype == "logic":
@@ -1214,8 +1362,10 @@ def run_prefix_suite(
                 if res.get("ok") and _num(res.get("ttft_ms")) is not None:
                     repeat_warm_ttfts.append(float(res["ttft_ms"]))
 
-            reply_text = (res.get("clean_content") or "").strip() or str(t_cfg.get("assistant_fallback", "OK."))
-            messages.append({"role": "assistant", "content": reply_text})
+            # Replay identical corpus assistant replies across every target so
+            # turns 2..N test exact prefix-cache reuse on identical prompt tokens.
+            fixed_reply = str(t_cfg.get("assistant_fixed") or t_cfg.get("assistant_fallback") or "OK.")
+            messages.append({"role": "assistant", "content": fixed_reply})
 
         if repeat_cold_ttft is not None and repeat_warm_ttfts:
             warm_avg = statistics.fmean(repeat_warm_ttfts)
@@ -1629,16 +1779,17 @@ def run_quality_suite(
     max_tokens: int,
     max_tokens_explicit: bool,
     disable_thinking: bool,
+    allow_unsafe_python_exec: bool = False,
 ) -> dict[str, Any]:
     probes_out: list[dict[str, Any]] = []
     by_category: dict[str, dict[str, Any]] = {
-        cat: {"passed": 0, "total": 0, "pass_rate_pct": 0.0} for cat in QUALITY_CATEGORIES
+        cat: {"passed": 0, "total": 0, "skipped": 0, "pass_rate_pct": 0.0} for cat in QUALITY_CATEGORIES
     }
 
     for probe in corpus.get("quality_probes") or []:
         pid = str(probe["id"])
         cat = str(probe["category"])
-        by_category.setdefault(cat, {"passed": 0, "total": 0, "pass_rate_pct": 0.0})
+        by_category.setdefault(cat, {"passed": 0, "total": 0, "skipped": 0, "pass_rate_pct": 0.0})
         cap = int(max_tokens) if max_tokens_explicit else int(probe.get("max_tokens", max_tokens))
         resp_fmt = probe.get("response_format")
 
@@ -1651,20 +1802,27 @@ def run_quality_suite(
             disable_thinking=disable_thinking,
             response_format=resp_fmt,
         )
-        if not res["ok"]:
-            grade = {"passed": False, "extracted": None, "detail": f"request error: {res['error']}"}
+        req_ok = bool(res["ok"])
+        if not req_ok:
+            grade = {"passed": False, "skipped": False, "extracted": None, "detail": f"request error: {res['error']}"}
         else:
-            grade = grade_probe(res["clean_content"], probe)
+            grade = grade_probe(res["clean_content"], probe, allow_unsafe_python_exec=allow_unsafe_python_exec)
 
-        passed = bool(grade["passed"])
-        by_category[cat]["total"] += 1
-        if passed:
-            by_category[cat]["passed"] += 1
+        passed = bool(grade.get("passed"))
+        skipped = bool(grade.get("skipped"))
+        if skipped:
+            by_category[cat]["skipped"] += 1
+        else:
+            by_category[cat]["total"] += 1
+            if passed:
+                by_category[cat]["passed"] += 1
 
         probes_out.append({
             "id": pid,
             "category": cat,
+            "request_ok": req_ok,
             "passed": passed,
+            "skipped": skipped,
             "detail": grade["detail"],
             "ttft_ms": res["ttft_ms"],
             "total_ms": res["total_ms"],
@@ -1679,13 +1837,17 @@ def run_quality_suite(
             (100.0 * stats["passed"] / stats["total"]) if stats["total"] > 0 else 0.0
         )
 
-    total_passed = sum(1 for p in probes_out if p["passed"])
-    total_probes = len(probes_out)
-    overall_pct = (100.0 * total_passed / total_probes) if total_probes > 0 else 0.0
+    total_passed = sum(1 for p in probes_out if p["passed"] and not p["skipped"])
+    total_skipped = sum(1 for p in probes_out if p["skipped"])
+    total_graded = sum(1 for p in probes_out if not p["skipped"])
+    overall_pct = (100.0 * total_passed / total_graded) if total_graded > 0 else 0.0
 
     return {
         "passed": total_passed,
-        "total": total_probes,
+        "total": total_graded,
+        "skipped": total_skipped,
+        "probe_count": len(probes_out),
+        "unsafe_python_exec_enabled": allow_unsafe_python_exec,
         "pass_rate_pct": overall_pct,
         "categories": by_category,
         "probes": probes_out,
@@ -1735,19 +1897,36 @@ def compute_cross_target_parity(target_results: list[dict[str, Any]]) -> dict[st
         common_ids = [pid for pid in base_by_id if pid in cand_by_id]
         exact_matches = 0
         outcome_agreements = 0
+        compared_outputs = 0
+        excluded_failed = 0
         similarities: list[float] = []
         per_probe: list[dict[str, Any]] = []
 
         for pid in common_ids:
             bp = base_by_id[pid]
             cp = cand_by_id[pid]
+            b_ok = bool(bp.get("request_ok", True))
+            c_ok = bool(cp.get("request_ok", True))
             b_txt = str(bp.get("clean_content") or "").strip()
             c_txt = str(cp.get("clean_content") or "").strip()
+            if bool(bp.get("passed")) == bool(cp.get("passed")):
+                outcome_agreements += 1
+            if not b_ok or not c_ok or (not b_txt and not c_txt):
+                excluded_failed += 1
+                per_probe.append({
+                    "id": pid,
+                    "category": bp.get("category"),
+                    "baseline_passed": bool(bp.get("passed")),
+                    "candidate_passed": bool(cp.get("passed")),
+                    "excluded": True,
+                    "exact_match": False,
+                    "token_similarity_pct": None,
+                })
+                continue
+            compared_outputs += 1
             is_exact = b_txt == c_txt
             if is_exact:
                 exact_matches += 1
-            if bool(bp.get("passed")) == bool(cp.get("passed")):
-                outcome_agreements += 1
             sim_pct = token_similarity_ratio(b_txt, c_txt) * 100.0
             similarities.append(sim_pct)
             per_probe.append({
@@ -1755,6 +1934,7 @@ def compute_cross_target_parity(target_results: list[dict[str, Any]]) -> dict[st
                 "category": bp.get("category"),
                 "baseline_passed": bool(bp.get("passed")),
                 "candidate_passed": bool(cp.get("passed")),
+                "excluded": False,
                 "exact_match": is_exact,
                 "token_similarity_pct": sim_pct,
             })
@@ -1763,9 +1943,11 @@ def compute_cross_target_parity(target_results: list[dict[str, Any]]) -> dict[st
         comparisons.append({
             "baseline": base_name,
             "target": cand_name,
-            "probes_compared": n,
+            "probes_compared": compared_outputs,
+            "probes_total": n,
+            "excluded_failed_count": excluded_failed,
             "exact_match_count": exact_matches,
-            "exact_match_pct": (100.0 * exact_matches / n) if n > 0 else 0.0,
+            "exact_match_pct": (100.0 * exact_matches / compared_outputs) if compared_outputs > 0 else 0.0,
             "token_similarity_pct": float(statistics.fmean(similarities)) if similarities else 0.0,
             "baseline_pass_rate_pct": float(base_qual.get("pass_rate_pct", 0.0)),
             "target_pass_rate_pct": float(cand_qual.get("pass_rate_pct", 0.0)),
@@ -1786,51 +1968,161 @@ def compute_cross_target_parity(target_results: list[dict[str, Any]]) -> dict[st
 # ---------------------------------------------------------------------------
 
 
-def terminate_process_tree(proc: subprocess.Popen[Any], grace_s: float = 4.0) -> None:
-    """Cleanly terminate a managed server and all child processes before starting the next target."""
-    if proc.poll() is not None:
-        return
-    pid = proc.pid
+def _attach_windows_kill_job(proc: subprocess.Popen[Any]) -> int | None:
+    """Attach a Windows Job Object with KILL_ON_JOB_CLOSE so descendants can never be orphaned."""
+    if not IS_WINDOWS:
+        return None
     try:
-        if IS_WINDOWS:
-            proc.terminate()
-        else:
-            try:
-                os.killpg(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                return
-    except OSError:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_uint64),
+                ("WriteOperationCount", ctypes.c_uint64),
+                ("OtherOperationCount", ctypes.c_uint64),
+                ("ReadTransferCount", ctypes.c_uint64),
+                ("WriteTransferCount", ctypes.c_uint64),
+                ("OtherTransferCount", ctypes.c_uint64),
+            ]
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000)
+        info.BasicLimitInformation.LimitFlags = 0x2000
+        # JobObjectExtendedLimitInformation = 9
+        ok = kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))
+        if not ok:
+            kernel32.CloseHandle(job)
+            return None
+        proc_handle = getattr(proc, "_handle", None)
+        if not proc_handle or not kernel32.AssignProcessToJobObject(job, wintypes.HANDLE(int(proc_handle))):
+            kernel32.CloseHandle(job)
+            return None
+        return int(job)
+    except Exception:
+        return None
+
+
+def _close_windows_job(job_handle: int | None) -> None:
+    if not IS_WINDOWS or not job_handle:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(wintypes.HANDLE(job_handle))
+    except Exception:
         pass
 
-    try:
-        proc.wait(timeout=grace_s)
-    except subprocess.TimeoutExpired:
-        pass
+
+def terminate_process_tree(
+    proc: subprocess.Popen[Any],
+    grace_s: float = 4.0,
+    *,
+    job_handle: int | None = None,
+) -> None:
+    """Cleanly terminate a managed server and all descendants even if the parent already exited."""
+    pid = proc.pid
+    # Snapshot descendants BEFORE terminating the parent so we can reap orphans even
+    # if the parent exits before taskkill runs.
+    descendants = _descendant_pids(pid)
 
     if IS_WINDOWS:
-        # Always reap any child processes (e.g., sonder-infer's llamaserver child) via taskkill /T /F.
+        # First request tree shutdown via taskkill /T /F (preserves parent->child linkage),
+        # then close any attached Job Object so the kernel guarantees zero surviving children.
         taskkill = shutil.which("taskkill") or "taskkill"
-        try:
-            subprocess.run(
-                [taskkill, "/PID", str(pid), "/T", "/F"],
-                capture_output=True,
-                text=True,
-                timeout=10.0,
-                stdin=subprocess.DEVNULL,
-            )
-        except (OSError, subprocess.SubprocessError):
+        if proc.poll() is None:
             try:
-                proc.kill()
-            except OSError:
-                pass
-    elif proc.poll() is None:
+                subprocess.run(
+                    [taskkill, "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10.0,
+                    stdin=subprocess.DEVNULL,
+                )
+            except (OSError, subprocess.SubprocessError):
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+        for child_pid in descendants:
+            if child_pid != pid:
+                try:
+                    subprocess.run(
+                        [taskkill, "/PID", str(child_pid), "/T", "/F"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5.0,
+                        stdin=subprocess.DEVNULL,
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    pass
+        _close_windows_job(job_handle)
+    else:
+        # On POSIX always signal the entire process group even if the leader exited first.
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+        try:
+            proc.wait(timeout=grace_s)
+        except subprocess.TimeoutExpired:
+            pass
         try:
             os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         except OSError:
-            try:
-                proc.kill()
-            except OSError:
-                pass
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
 
     try:
         proc.wait(timeout=5.0)
@@ -1859,6 +2151,7 @@ class ManagedServer:
             raise ValueError(f"target {self.name!r}: 'cmd' cannot be empty")
         self.log_fn = log_fn or (lambda _msg: None)
         self.proc: subprocess.Popen[Any] | None = None
+        self._job_handle: int | None = None
         self._log_file: Any = None
         self.log_path: str | None = None
         self.startup_ms: float | None = None
@@ -1887,6 +2180,8 @@ class ManagedServer:
         t0 = time.perf_counter()
         try:
             self.proc = subprocess.Popen(self.cmd, **popen_kwargs)
+            if IS_WINDOWS:
+                self._job_handle = _attach_windows_kill_job(self.proc)
             self._wait_for_health(t0)
             self.startup_ms = (time.perf_counter() - t0) * 1000.0
             return self
@@ -1943,8 +2238,12 @@ class ManagedServer:
     def stop(self) -> None:
         if self.proc is not None:
             self.log_fn(f"[{self.name}] terminating process tree (pid={self.proc.pid})")
-            terminate_process_tree(self.proc)
+            terminate_process_tree(self.proc, job_handle=self._job_handle)
+            self._job_handle = None
             self.proc = None
+        elif self._job_handle is not None:
+            _close_windows_job(self._job_handle)
+            self._job_handle = None
         if self._log_file is not None:
             try:
                 self._log_file.close()
@@ -2385,6 +2684,7 @@ def execute_single_target(
     keepalive_requests: int | None,
     timeout: float,
     log_fn: Any,
+    allow_unsafe_python_exec: bool = False,
 ) -> dict[str, Any]:
     name = str(target_spec["name"])
     url = str(target_spec["url"])
@@ -2394,12 +2694,15 @@ def execute_single_target(
     pid_hint: int | None = target_spec.get("pid")
 
     vram_samples: list[float] = []
+    vram_scope = "unavailable"
     rss_samples: list[float] = []
 
     def record_resources(active_pid: int | None) -> None:
-        v = sample_gpu_vram_mib()
+        nonlocal vram_scope
+        v, scope = sample_gpu_vram_mib(active_pid)
         if v is not None:
             vram_samples.append(v)
+            vram_scope = scope
         r = sample_process_rss_mib(active_pid)
         if r is not None:
             rss_samples.append(r)
@@ -2487,6 +2790,7 @@ def execute_single_target(
                 max_tokens=max_tokens,
                 max_tokens_explicit=max_tokens_explicit,
                 disable_thinking=disable_thinking,
+                allow_unsafe_python_exec=allow_unsafe_python_exec,
             )
             record_resources(active_pid)
 
@@ -2501,6 +2805,7 @@ def execute_single_target(
             "wall_s": wall_s,
             "resources": {
                 "pid": active_pid,
+                "vram_scope": vram_scope,
                 "vram_samples_mib": vram_samples,
                 "peak_vram_mib": max(vram_samples) if vram_samples else None,
                 "rss_samples_mib": rss_samples,
@@ -2581,6 +2886,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="K=V",
         help="Extra HTTP header (repeatable)",
+    )
+    ap.add_argument(
+        "--allow-unsafe-python-exec",
+        action="store_true",
+        help="UNSAFE: execute model-generated Python quality probes locally (disabled by default; static AST check only)",
     )
     ap.add_argument("--output-json", default=None, help="Write structured benchmark report JSON to PATH")
     ap.add_argument("--output-md", default=None, help="Write side-by-side Markdown report to PATH")
@@ -2667,6 +2977,7 @@ def run_benchmark_from_args(args: argparse.Namespace) -> dict[str, Any]:
             keepalive_requests=args.keepalive_requests,
             timeout=float(args.timeout),
             log_fn=log_fn,
+            allow_unsafe_python_exec=bool(getattr(args, "allow_unsafe_python_exec", False)),
         )
         target_results.append(res)
 
@@ -2689,6 +3000,8 @@ def run_benchmark_from_args(args: argparse.Namespace) -> dict[str, Any]:
             "max_tokens_explicit": max_tokens_explicit,
             "concurrency": concurrency_levels,
             "disable_thinking": bool(args.disable_thinking),
+            "allow_unsafe_python_exec": bool(getattr(args, "allow_unsafe_python_exec", False)),
+            "order_confounded": len(target_specs) > 1,
         },
         "targets": target_results,
         "cross_target_parity": parity,

@@ -400,15 +400,59 @@ Status send_all(native_socket s, std::string_view data, std::chrono::millisecond
 }
 
 bool peer_gone(native_socket s) {
-    if (wait_once(s, false, 0) <= 0) {
+#if defined(_WIN32)
+    WSAPOLLFD pfd{};
+    pfd.fd = raw(s);
+    pfd.events = POLLRDNORM;
+    const int pr = WSAPoll(&pfd, 1, 0);
+    if (pr < 0) {
+        return !would_block(last_error());
+    }
+    if (pr == 0) {
+        return false;
+    }
+    if ((pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
+        return true;
+    }
+    if ((pfd.revents & POLLRDNORM) == 0) {
         return false;
     }
     char probe = 0;
-#if defined(_WIN32)
     const int n = ::recv(raw(s), &probe, 1, MSG_PEEK);
+    if (n > 0) {
+        return false;
+    }
+    if (n == 0) {
+        return true;
+    }
+    return !would_block(last_error());
 #else
+    pollfd pfd{};
+    pfd.fd = s;
+    pfd.events = POLLIN
+#  if defined(POLLRDHUP)
+                 | POLLRDHUP
+#  endif
+        ;
+    const int pr = ::poll(&pfd, 1, 0);
+    if (pr < 0) {
+        return errno != EINTR && !would_block(errno);
+    }
+    if (pr == 0) {
+        return false;
+    }
+    if ((pfd.revents & (POLLHUP | POLLERR | POLLNVAL
+#  if defined(POLLRDHUP)
+                        | POLLRDHUP
+#  endif
+                        )) != 0) {
+        return true;
+    }
+    if ((pfd.revents & POLLIN) == 0) {
+        return false;
+    }
+    char probe = 0;
     const auto n = ::recv(s, &probe, 1, MSG_PEEK);
-#endif
     if (n > 0) {
         // Leave unread bytes (e.g. a pipelined HTTP/1.1 keep-alive request)
         // untouched in the socket buffer for serve_connection().
@@ -418,6 +462,7 @@ bool peer_gone(native_socket s) {
         return true;
     }
     return !would_block(last_error());
+#endif
 }
 
 Result<Socket> connect_tcp(const std::string& host, std::uint16_t port, std::chrono::milliseconds timeout) {

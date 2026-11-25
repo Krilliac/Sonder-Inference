@@ -334,7 +334,20 @@ TEST_CASE("placement planner: AMD RX 7900 XT and RX 9070 XT discrete defaults an
         CHECK(plan.recommended_backend_hint == "vulkan");
         CHECK(plan.profile.flash_attn == std::string("auto"));
         CHECK(plan.profile.device == std::string("Vulkan0"));
-        CHECK(find_env(plan.recommended_env, "GPU_MAX_ALLOC_PERCENT") == std::string("100"));
+        CHECK_FALSE(find_env(plan.recommended_env, "GPU_MAX_ALLOC_PERCENT").has_value());
+    }
+
+    // Reordered ROCm runtime ordinal (e.g. ROCR_VISIBLE_DEVICES=1,0) must emit the mapped ROCmN name.
+    {
+        si::GpuDeviceInfo card0 = make_amd_discrete("gpu:0", "AMD Radeon RX 7900 XT", 20, 19456, "rocm");
+        card0.rocm_runtime_ordinal = 1;
+        si::GpuDeviceInfo card1 = make_amd_discrete("gpu:1", "AMD Radeon RX 7900 XT", 20, 19456, "rocm");
+        card1.rocm_runtime_ordinal = 0;
+        si::PlacementPlanRequest pinned = req;
+        pinned.device_hint = "gpu:0";
+        const si::PlacementPlan plan = si::plan_model_placement(model, {card0, card1}, host_ram(64, 48), pinned);
+        verify_plan_contracts(plan);
+        CHECK(plan.profile.device == std::string("ROCm1"));
     }
 }
 

@@ -661,11 +661,17 @@ false` (and use `--pin-mode default` if an operator pin should remain a
 fallback).
 
 Ignored: `user` and any unknown top-level field.
+Supported structured outputs (on backends advertising `structured_output`, such as `llamacpp`, `llamaserver`, and `ollama` for JSON formats): `response_format` (`{"type":"text"}`, `{"type":"json_object"}`, or `{"type":"json_schema","json_schema":{"name":"...","schema":{...}}}`) and per-request GBNF `grammar` (mutually exclusive with non-text `response_format`; raw GBNF is rejected with 400 `unsupported_parameter` on backends such as `ollama` that only accept JSON schema formats). Unenforceable JSON Schema keywords or bounds fail closed with 400 `invalid_request`.
 Rejected with 400 `unsupported_parameter`: `tools`, `tool_choice`,
-`functions`, `function_call`, `response_format`, `logprobs: true`,
+`functions`, `function_call`, `logprobs: true`,
 `top_logprobs`, `n` other than 1, non-string message `content`, and
 `tool_calls` on a message. Sampling values outside `validate(SamplingConfig)`
 ranges are 400 `invalid_sampling` naming the field.
+
+Additional OpenAI-compatible and utility endpoints served alongside `/v1/chat/completions`:
+- `POST /v1/completions`: raw prompt text completions (`prompt`, `max_tokens`, `echo`, `stream`, `stream_options.include_usage`, `grammar`, sampling parameters).
+- `POST /v1/embeddings`: dense float vector embeddings (`model`, `input` string or string array up to 256 items, `encoding_format: "float"`). Returns 501 `not_implemented` on backends without embedding support.
+- `POST /v1/tokenize` and `POST /v1/detokenize`: model vocabulary tokenization (`content` or `text`) and detokenization (`tokens` integer array). Returns 501 `not_implemented` on backends without tokenizer support.
 
 Non-streaming response:
 

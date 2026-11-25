@@ -134,12 +134,12 @@ For discrete NVIDIA RTX adapters, `plan_model_placement()` selects:
 
 | Preset | Platform | Accelerator | Flags |
 | --- | --- | --- | --- |
-| `windows-rocm-xt` | Windows (MSVC + Ninja) | ROCm/HIP (`ROCm0`, ...) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `AMDGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1200;gfx1201` |
-| `linux-rocm-xt` | Linux (GCC/Clang + Ninja) | ROCm/HIP (`ROCm0`, ...) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `AMDGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1200;gfx1201` |
+| `windows-rocm-xt` | Windows (AMD HIP SDK Clang + Ninja) | ROCm/HIP (`ROCm0`, ...) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `AMDGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1200;gfx1201` |
+| `linux-rocm-xt` | Linux (GCC/Clang + Ninja) | ROCm/HIP (`ROCm0`, ...) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `AMDGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1200;gfx1201` |
 | `windows-vulkan-xt` | Windows (MSVC + Ninja) | Vulkan (`Vulkan0`, ...) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_VULKAN=ON` |
 | `linux-vulkan-xt` | Linux (GCC/Clang + Ninja) | Vulkan (`Vulkan0`, ...) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_VULKAN=ON` |
 
-`AMDGPU_TARGETS` covers RDNA 2 (`gfx1030`, RX 6800/6900 XT), RDNA 3 discrete (`gfx1100`, `gfx1101`, `gfx1102`, RX 7900/7800/7700/7600 XT), RDNA 3 Ryzen APU (`gfx1103`, Radeon 780M/890M), and RDNA 4 (`gfx1200`, `gfx1201`, RX 9070 XT). `GGML_HIP_GRAPHS=ON` enables HIP graph capture for lower kernel-launch overhead during decode.
+`AMDGPU_TARGETS` covers RDNA 2 (`gfx1030`, RX 6800/6900 XT), RDNA 3 discrete (`gfx1100`, `gfx1101`, `gfx1102`, RX 7900/7800/7700/7600 XT), RDNA 3/3.5 Ryzen APUs (`gfx1103` Radeon 780M, `gfx1150` Radeon 890M), and RDNA 4 (`gfx1200`, `gfx1201`, RX 9070 XT). `GGML_HIP_GRAPHS=ON` enables HIP graph capture for lower kernel-launch overhead during decode.
 
 ### Discovery, Per-Process Counters, and Environment Policy
 
@@ -166,7 +166,7 @@ When `log_file` (or `--log-file` in `args`) is enabled on a spawned `llamaserver
 
 ## 4. AMD Ryzen APU / Integrated UMA
 
-Integrated APUs such as Ryzen 780M/890M (`gfx1103`) expose only a small BIOS dedicated carveout (commonly 512 MiB–2 GiB) while allocating GPU buffers from a much larger shared/GTT system memory pool.
+Integrated APUs such as Ryzen 780M (`gfx1103`) and 890M (`gfx1150`) expose only a small BIOS dedicated carveout (commonly 512 MiB–2 GiB) while allocating GPU buffers from a much larger shared/GTT system memory pool.
 
 ### Detection and Host-RAM Pool Cap
 

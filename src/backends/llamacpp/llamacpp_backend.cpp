@@ -438,14 +438,22 @@ struct LlamaCppBackend::Impl {
     // Multi-slot KV prefix cache metadata (1..kMaxSlots).
     struct PartialCheckpoint {
         std::size_t n_tokens = 0;
+        std::uint64_t last_used = 0;
         std::vector<std::uint8_t> tgt_state;
         std::vector<float> pending_h;
+
+        std::size_t ByteSize() const noexcept {
+            return tgt_state.size() + pending_h.size() * sizeof(float);
+        }
     };
     static constexpr std::size_t kMaxCheckpointsPerSlot = 3;
     static constexpr std::size_t kMaxPartialCheckpointBytes = std::size_t{256} << 20;
+    static constexpr std::size_t kMaxTotalCheckpointBytes = std::size_t{512} << 20;
 
     std::vector<PrefixSlotMeta> slots;
     std::vector<std::vector<PartialCheckpoint>> slot_checkpoints;
+    std::size_t total_checkpoint_bytes = 0;
+    std::uint64_t checkpoint_clock = 0;
     std::vector<std::uint8_t> spec_ckpt_buf;
     std::size_t spec_ckpt_size = 0;
     std::uint64_t slot_clock = 0;
@@ -498,6 +506,62 @@ struct LlamaCppBackend::Impl {
 
     ~Impl() { Release(); }
 
+    static uint32_t EffectiveCtxSeq(const llama_context* c) noexcept {
+        if (c == nullptr) return 0;
+#if defined(SONDER_LLAMACPP_HAS_N_CTX_SEQ)
+        const uint32_t per_seq = llama_n_ctx_seq(c);
+        if (per_seq > 0) return per_seq;
+#endif
+        return llama_n_ctx(c);
+    }
+
+    void ClearSlotCheckpoints(std::size_t slot_idx) noexcept {
+        if (slot_idx >= slot_checkpoints.size()) return;
+        for (const auto& c : slot_checkpoints[slot_idx]) {
+            const std::size_t b = c.ByteSize();
+            total_checkpoint_bytes = (total_checkpoint_bytes >= b) ? (total_checkpoint_bytes - b) : 0;
+        }
+        slot_checkpoints[slot_idx].clear();
+    }
+
+    void PruneSlotCheckpointsAfter(std::size_t slot_idx, std::size_t max_tokens) noexcept {
+        if (slot_idx >= slot_checkpoints.size()) return;
+        auto& vec = slot_checkpoints[slot_idx];
+        vec.erase(std::remove_if(vec.begin(), vec.end(),
+                                 [&](const PartialCheckpoint& c) {
+                                     if (c.n_tokens > max_tokens) {
+                                         const std::size_t b = c.ByteSize();
+                                         total_checkpoint_bytes =
+                                             (total_checkpoint_bytes >= b) ? (total_checkpoint_bytes - b) : 0;
+                                         return true;
+                                     }
+                                     return false;
+                                 }),
+                  vec.end());
+    }
+
+    bool EvictOldestCheckpoint() noexcept {
+        std::size_t best_slot = slot_checkpoints.size();
+        std::size_t best_idx = 0;
+        std::uint64_t oldest = UINT64_MAX;
+        for (std::size_t s = 0; s < slot_checkpoints.size(); ++s) {
+            const auto& vec = slot_checkpoints[s];
+            for (std::size_t i = 0; i < vec.size(); ++i) {
+                if (best_slot == slot_checkpoints.size() || vec[i].last_used < oldest) {
+                    best_slot = s;
+                    best_idx = i;
+                    oldest = vec[i].last_used;
+                }
+            }
+        }
+        if (best_slot >= slot_checkpoints.size()) return false;
+        auto& vec = slot_checkpoints[best_slot];
+        const std::size_t b = vec[best_idx].ByteSize();
+        total_checkpoint_bytes = (total_checkpoint_bytes >= b) ? (total_checkpoint_bytes - b) : 0;
+        vec.erase(vec.begin() + static_cast<std::ptrdiff_t>(best_idx));
+        return true;
+    }
+
     void ResetAllSlots() noexcept {
         for (std::size_t i = 0; i < slots.size(); ++i) {
             slots[i].tokens.clear();
@@ -507,6 +571,8 @@ struct LlamaCppBackend::Impl {
         for (auto& ckpts : slot_checkpoints) {
             ckpts.clear();
         }
+        total_checkpoint_bytes = 0;
+        checkpoint_clock = 0;
 #if defined(SONDER_LLAMACPP_HAS_MTP)
         if (ctx_dft != nullptr) {
             if (!mtp_mem_shared) {
@@ -585,6 +651,8 @@ struct LlamaCppBackend::Impl {
         vocab = nullptr;
         slots.clear();
         slot_checkpoints.clear();
+        total_checkpoint_bytes = 0;
+        checkpoint_clock = 0;
         spec_ckpt_buf.clear();
         spec_ckpt_size = 0;
         slot_clock = 0;
@@ -611,25 +679,57 @@ struct LlamaCppBackend::Impl {
         if (flags == 0) return;
         const std::size_t sz = llama_state_seq_get_size_ext(ctx, slot_id, flags);
         if (sz == 0 || sz > kMaxPartialCheckpointBytes) return;
+        std::size_t pending_bytes = 0;
+#if defined(SONDER_LLAMACPP_HAS_MTP)
+        if (ctx_dft != nullptr && slot_idx < mtp_pending_h.size()) {
+            pending_bytes = mtp_pending_h[slot_idx].size() * sizeof(float);
+        }
+#endif
+        if (sz > kMaxTotalCheckpointBytes || pending_bytes > kMaxTotalCheckpointBytes - sz) return;
+        const std::size_t projected_bytes = sz + pending_bytes;
+
+        // Prune superseded checkpoints at >= n_tokens and enforce per-slot and
+        // model-wide byte budgets BEFORE allocating the new state buffer.
+        auto& vec = slot_checkpoints[slot_idx];
+        vec.erase(std::remove_if(vec.begin(), vec.end(),
+                                 [&](const PartialCheckpoint& c) {
+                                     if (c.n_tokens >= n_tokens) {
+                                         const std::size_t b = c.ByteSize();
+                                         total_checkpoint_bytes =
+                                             (total_checkpoint_bytes >= b) ? (total_checkpoint_bytes - b) : 0;
+                                         return true;
+                                     }
+                                     return false;
+                                 }),
+                  vec.end());
+        while (vec.size() >= kMaxCheckpointsPerSlot) {
+            const std::size_t b = vec.front().ByteSize();
+            total_checkpoint_bytes = (total_checkpoint_bytes >= b) ? (total_checkpoint_bytes - b) : 0;
+            vec.erase(vec.begin());
+        }
+        while (total_checkpoint_bytes + projected_bytes > kMaxTotalCheckpointBytes) {
+            if (!EvictOldestCheckpoint()) return;
+        }
+
         PartialCheckpoint ckpt;
         ckpt.n_tokens = n_tokens;
+        ckpt.last_used = ++checkpoint_clock;
         ckpt.tgt_state.resize(sz);
         const std::size_t written = llama_state_seq_get_data_ext(ctx, ckpt.tgt_state.data(), sz, slot_id, flags);
         if (written == 0) return;
         ckpt.tgt_state.resize(written);
+        ckpt.tgt_state.shrink_to_fit();
 #if defined(SONDER_LLAMACPP_HAS_MTP)
         if (ctx_dft != nullptr && slot_idx < mtp_pending_h.size()) {
             ckpt.pending_h = mtp_pending_h[slot_idx];
         }
 #endif
-        auto& vec = slot_checkpoints[slot_idx];
-        vec.erase(std::remove_if(vec.begin(), vec.end(),
-                                 [n_tokens](const PartialCheckpoint& c) { return c.n_tokens >= n_tokens; }),
-                  vec.end());
-        vec.push_back(std::move(ckpt));
-        if (vec.size() > kMaxCheckpointsPerSlot) {
-            vec.erase(vec.begin());
+        const std::size_t actual_bytes = ckpt.ByteSize();
+        while (total_checkpoint_bytes + actual_bytes > kMaxTotalCheckpointBytes) {
+            if (!EvictOldestCheckpoint()) return;
         }
+        total_checkpoint_bytes += actual_bytes;
+        slot_checkpoints[slot_idx].push_back(std::move(ckpt));
     }
 
     bool RestorePartialCheckpoint(std::size_t slot_idx, llama_seq_id slot_id, std::size_t max_lcp,
@@ -640,8 +740,8 @@ struct LlamaCppBackend::Impl {
         const llama_state_seq_flags flags = PartialCheckpointFlags();
         if (flags == 0) return false;
         auto& vec = slot_checkpoints[slot_idx];
-        const PartialCheckpoint* best = nullptr;
-        for (const auto& c : vec) {
+        PartialCheckpoint* best = nullptr;
+        for (auto& c : vec) {
             if (c.n_tokens > 0 && c.n_tokens <= max_lcp) {
                 if (best == nullptr || c.n_tokens > best->n_tokens) {
                     best = &c;
@@ -656,6 +756,7 @@ struct LlamaCppBackend::Impl {
         if (!llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(best->n_tokens), -1)) {
             return false;
         }
+        best->last_used = ++checkpoint_clock;
         restored_tokens = best->n_tokens;
 #if defined(SONDER_LLAMACPP_HAS_MTP)
         if (ctx_dft != nullptr && slot_idx < mtp_pending_h.size() &&
@@ -667,10 +768,7 @@ struct LlamaCppBackend::Impl {
             mtp_deferred[slot_idx].Clear();
         }
 #endif
-        const std::size_t keep_pos = restored_tokens;
-        vec.erase(std::remove_if(vec.begin(), vec.end(),
-                                 [keep_pos](const PartialCheckpoint& c) { return c.n_tokens > keep_pos; }),
-                  vec.end());
+        PruneSlotCheckpointsAfter(slot_idx, restored_tokens);
         return true;
     }
 #endif
@@ -946,12 +1044,14 @@ struct LlamaCppBackend::Impl {
     // Drafts up to `max_draft` tokens from `ctx_dft` starting at `(id_last, n_past)`.
     // When deferred catch-up rows lead directly into `n_past`, fuses them into
     // step 0's `llama_decode(ctx_dft)` so catch-up + first draft cost a single pass.
-    void MtpDraft(llama_seq_id slot_id, Token id_last, int64_t n_past, int32_t max_draft,
+    // Returns false if draft KV synchronization was lost (caller must disable MTP
+    // on this slot until the slot is reset).
+    bool MtpDraft(llama_seq_id slot_id, Token id_last, int64_t n_past, int32_t max_draft,
                   std::vector<Token>& draft_out) {
         draft_out.clear();
-        if (ctx_dft == nullptr || max_draft <= 0) return;
+        if (ctx_dft == nullptr || max_draft <= 0) return true;
         const auto sidx = static_cast<std::size_t>(slot_id);
-        if (sidx >= slots.size()) return;
+        if (sidx >= slots.size()) return false;
 
         const int32_t limit = mtp_chain_heads ? std::min(max_draft, mtp_n_layers) : max_draft;
         const std::size_t row_bytes = static_cast<std::size_t>(mtp_n_embd) * sizeof(float);
@@ -962,7 +1062,11 @@ struct LlamaCppBackend::Impl {
             const bool leads_in = !d.pos.empty() && (d.pos.back() + 1 == static_cast<llama_pos>(n_past)) &&
                                   (static_cast<int32_t>(d.tokens.size()) + 1 <= dft_batch_cap);
             if (!leads_in) {
-                if (!MtpFlushDeferred(slot_id)) return;
+                if (!MtpFlushDeferred(slot_id)) {
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), slot_id, -1, -1);
+                    d.Clear();
+                    return false;
+                }
             }
         }
 
@@ -1054,8 +1158,11 @@ struct LlamaCppBackend::Impl {
             if (!llama_memory_seq_rm(mem_dft, slot_id, trim_from, -1)) {
                 llama_memory_seq_rm(mem_dft, slot_id, -1, -1);
                 d.Clear();
+                draft_out.clear();
+                return false;
             }
         }
+        return true;
     }
 #endif
 };
@@ -1341,7 +1448,7 @@ ModelInfo LlamaCppBackend::GetModelInfo() const {
     info.size_bytes = llama_model_size(impl_->model);
     info.n_params = llama_model_n_params(impl_->model);
     info.n_vocab = llama_vocab_n_tokens(impl_->vocab);
-    info.n_ctx = impl_->ctx != nullptr ? llama_n_ctx(impl_->ctx) : 0;
+    info.n_ctx = Impl::EffectiveCtxSeq(impl_->ctx);
     info.architecture = impl_->architecture;
     return info;
 }
@@ -1534,12 +1641,19 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, boo
     if (inputs.empty()) return Status::Error(ErrorCode::kInvalidArgument, "embedding inputs are empty");
 
     const int32_t n_vocab = llama_vocab_n_tokens(impl_->vocab);
+#if defined(SONDER_LLAMACPP_HAS_N_EMBD_OUT)
+    int32_t n_embd = llama_model_n_embd_out(impl_->model);
+    if (n_embd <= 0) {
+        n_embd = llama_model_n_embd(impl_->model);
+    }
+#else
     const int32_t n_embd = llama_model_n_embd(impl_->model);
+#endif
     if (n_embd <= 0) {
         return Status::Error(ErrorCode::kDecodeFailed, "model reports invalid embedding dimension");
     }
 
-    const uint32_t base_ctx = std::max<uint32_t>(256u, llama_n_ctx(impl_->ctx));
+    const uint32_t base_ctx = std::max<uint32_t>(256u, Impl::EffectiveCtxSeq(impl_->ctx));
     std::size_t max_input_len = 0;
     for (const auto& seq : inputs) {
         if (seq.empty()) return Status::Error(ErrorCode::kInvalidArgument, "embedding input is empty");
@@ -1624,6 +1738,10 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, boo
     };
 
     const enum llama_pooling_type pooling = llama_pooling_type(ectx);
+    if (pooling == LLAMA_POOLING_TYPE_RANK) {
+        return Status::Error(ErrorCode::kDecodeFailed,
+                             "reranking/classification pooling is not supported for dense embeddings");
+    }
     const bool encoder_only = llama_model_has_encoder(impl_->model) && !llama_model_has_decoder(impl_->model);
     const auto n_batch = static_cast<std::size_t>(std::max<int32_t>(1, impl_->embed_batch_cap));
     const auto start = Clock::now();
@@ -1715,7 +1833,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
 
     llama_context* ctx = impl_->ctx;
     llama_memory_t mem = llama_get_memory(ctx);
-    const auto n_ctx = static_cast<int64_t>(llama_n_ctx(ctx));
+    const auto n_ctx = static_cast<int64_t>(Impl::EffectiveCtxSeq(ctx));
     const auto n_prompt = static_cast<int64_t>(request.prompt.size());
 
     // Build and validate the sampler chain (and separate GBNF grammar for fast
@@ -1728,6 +1846,20 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
         !s.ok()) {
         return fail(s.code, s.message);
     }
+
+    // Wire cancellation into llama.cpp's abort callback BEFORE prefix cache
+    // restoration or deferred MTP catch-up flushes so a prior cancelled request
+    // never leaves a stale abort flag active.
+    impl_->abort_requested.store(false, std::memory_order_relaxed);
+    impl_->active_cancel = &should_cancel;
+    struct ClearCancel {
+        Impl* impl;
+        ~ClearCancel() { impl->active_cancel = nullptr; }
+    } clear_cancel{impl_.get()};
+
+    auto cancelled = [&] {
+        return impl_->abort_requested.load(std::memory_order_relaxed) || (should_cancel && should_cancel());
+    };
 
     // ---- Slot selection, recurrent checkpoint restore, and prefix cache reuse ----
     std::size_t slot_idx = 0;
@@ -1786,9 +1918,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
 
         if (lcp == 0) {
             llama_memory_seq_rm(mem, slot_id, -1, -1);
-            if (slot_idx < impl_->slot_checkpoints.size()) {
-                impl_->slot_checkpoints[slot_idx].clear();
-            }
+            impl_->ClearSlotCheckpoints(slot_idx);
 #if defined(SONDER_LLAMACPP_HAS_MTP)
             if (impl_->ctx_dft != nullptr) {
                 if (!impl_->mtp_mem_shared) {
@@ -1801,7 +1931,12 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
         } else {
             bool restored_pending_h = false;
             if (lcp < kv_len) {
-                if (!llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(lcp), -1)) {
+                if (llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(lcp), -1)) {
+                    // Discard any hybrid checkpoints beyond the retained prefix so a
+                    // later divergent prompt cannot restore recurrent state from the
+                    // trimmed suffix.
+                    impl_->PruneSlotCheckpointsAfter(slot_idx, lcp);
+                } else {
                     // Model memory does not support arbitrary partial suffix removal
                     // (e.g. hybrid recurrent/SSM beyond n_rs_seq): attempt fast partial
                     // checkpoint restore before falling back to a full slot clear.
@@ -1815,9 +1950,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
 #endif
                     if (!restored_from_ckpt) {
                         llama_memory_seq_rm(mem, slot_id, -1, -1);
-                        if (slot_idx < impl_->slot_checkpoints.size()) {
-                            impl_->slot_checkpoints[slot_idx].clear();
-                        }
+                        impl_->ClearSlotCheckpoints(slot_idx);
                         lcp = 0;
                     }
                 }
@@ -1850,9 +1983,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
                             // Draft KV is behind target KV; clear both to stay synchronized.
                             llama_memory_seq_rm(mem, slot_id, -1, -1);
                             llama_memory_seq_rm(llama_get_memory(impl_->ctx_dft), slot_id, -1, -1);
-                            if (slot_idx < impl_->slot_checkpoints.size()) {
-                                impl_->slot_checkpoints[slot_idx].clear();
-                            }
+                            impl_->ClearSlotCheckpoints(slot_idx);
                             std::fill(impl_->mtp_pending_h[slot_idx].begin(), impl_->mtp_pending_h[slot_idx].end(),
                                       0.0F);
                             lcp = 0;
@@ -1861,9 +1992,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
                                                      static_cast<llama_pos>(lcp), -1)) {
                                 llama_memory_seq_rm(mem, slot_id, -1, -1);
                                 llama_memory_seq_rm(llama_get_memory(impl_->ctx_dft), slot_id, -1, -1);
-                                if (slot_idx < impl_->slot_checkpoints.size()) {
-                                    impl_->slot_checkpoints[slot_idx].clear();
-                                }
+                                impl_->ClearSlotCheckpoints(slot_idx);
                                 std::fill(impl_->mtp_pending_h[slot_idx].begin(), impl_->mtp_pending_h[slot_idx].end(),
                                           0.0F);
                                 lcp = 0;
@@ -1901,19 +2030,6 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
     if (n_past + remaining_prompt > n_ctx) {
         return fail(ErrorCode::kContextOverflow, "prompt does not fit in the context window");
     }
-
-    // Wire cancellation into llama.cpp's abort callback for the duration of
-    // this call so a long prefill batch can also be interrupted.
-    impl_->abort_requested.store(false, std::memory_order_relaxed);
-    impl_->active_cancel = &should_cancel;
-    struct ClearCancel {
-        Impl* impl;
-        ~ClearCancel() { impl->active_cancel = nullptr; }
-    } clear_cancel{impl_.get()};
-
-    auto cancelled = [&] {
-        return impl_->abort_requested.load(std::memory_order_relaxed) || (should_cancel && should_cancel());
-    };
 
 #if defined(SONDER_LLAMACPP_HAS_MTP)
     bool use_mtp = (impl_->active_spec == SpeculativeType::kDraftMtp) && (impl_->ctx_dft != nullptr) &&
@@ -2074,9 +2190,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
             impl_->slots[slot_idx].session_key.clear();
             impl_->slots[slot_idx].last_used = 0;
         }
-        if (slot_idx < impl_->slot_checkpoints.size()) {
-            impl_->slot_checkpoints[slot_idx].clear();
-        }
+        impl_->ClearSlotCheckpoints(slot_idx);
 #if defined(SONDER_LLAMACPP_HAS_MTP)
         if (impl_->ctx_dft != nullptr) {
             if (!impl_->mtp_mem_shared) {
@@ -2156,6 +2270,11 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
 #if defined(SONDER_LLAMACPP_HAS_MTP)
         if (use_mtp && !impl_->MtpProcessPrefill(impl_->batch, slot_id)) {
             invalidate_slot();
+            if (cancelled()) {
+                result.stop_reason = StopReason::kCancelled;
+                result.prefill_ms = MsSince(prefill_start);
+                return result;
+            }
             return fail(ErrorCode::kDecodeFailed, "MTP draft context prefill sync failed");
         }
 #endif
@@ -2286,7 +2405,19 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
 #if defined(SONDER_LLAMACPP_HAS_MTP)
             if (use_mtp) {
                 const auto k_lim = static_cast<int32_t>(std::min<int64_t>(max_k, effective_draft_max));
-                impl_->MtpDraft(slot_id, cur_tok, pos, k_lim, draft_tokens);
+                if (!impl_->MtpDraft(slot_id, cur_tok, pos, k_lim, draft_tokens)) {
+                    if (cancelled()) return finish(StopReason::kCancelled);
+                    // Draft KV sequence was cleared after a trim/flush failure; disable MTP
+                    // for the rest of this request and prevent stale cache reuse on this slot.
+                    use_mtp = false;
+                    slot_valid = false;
+                    if (slot_idx < impl_->slots.size()) {
+                        impl_->slots[slot_idx].tokens.clear();
+                        impl_->slots[slot_idx].session_key.clear();
+                    }
+                    impl_->ClearSlotCheckpoints(slot_idx);
+                    draft_tokens.clear();
+                }
             } else
 #endif
             if (use_ngram_mod && impl_->ngram_mod != nullptr) {
@@ -2564,6 +2695,9 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
         }
 
         if (!rollback_rejected(new_pos, committed_drafts)) {
+            if (cancelled()) {
+                return finish(StopReason::kCancelled);
+            }
             result.status = Status::Error(ErrorCode::kDecodeFailed, "failed to trim rejected speculative KV tail");
             return finish(StopReason::kError);
         }

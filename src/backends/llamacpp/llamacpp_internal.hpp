@@ -13,6 +13,7 @@
 
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include "sonder/inference/backend.hpp"
+#include "sonder/inference/device.hpp"
 #include "sonder/inference/sampling.hpp"
 
 namespace sonder::inference::llamacpp_detail {
@@ -214,13 +215,51 @@ inline bool ApplyNoThinkScaffolding(std::vector<ChatPromptSegment>& segments, bo
     return true;
 }
 
+inline std::string LowerAscii(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char ch : s) {
+        if (ch >= 'A' && ch <= 'Z') {
+            out.push_back(static_cast<char>(ch - 'A' + 'a'));
+        } else {
+            out.push_back(static_cast<char>(ch));
+        }
+    }
+    return out;
+}
+
+inline GpuVendor InferGgmlDeviceVendor(const sonder::backends::llamacpp::DeviceInfo& d) {
+    const std::string name = LowerAscii(d.name);
+    const std::string desc = LowerAscii(d.description);
+    if (name.rfind("cuda", 0) == 0 || desc.find("nvidia") != std::string::npos ||
+        desc.find("geforce") != std::string::npos || desc.find("rtx") != std::string::npos ||
+        desc.find("quadro") != std::string::npos || desc.find("tesla") != std::string::npos) {
+        return GpuVendor::nvidia;
+    }
+    if (name.rfind("rocm", 0) == 0 || name.rfind("hip", 0) == 0 || desc.find("amd") != std::string::npos ||
+        desc.find("radeon") != std::string::npos) {
+        return GpuVendor::amd;
+    }
+    if (name.rfind("sycl", 0) == 0 || desc.find("intel") != std::string::npos ||
+        desc.find("arc") != std::string::npos) {
+        return GpuVendor::intel;
+    }
+    if (name.rfind("metal", 0) == 0 || desc.find("apple") != std::string::npos) {
+        return GpuVendor::apple;
+    }
+    return GpuVendor::unknown;
+}
+
 // Pins `gpu:<index>` requests onto the matching llama.cpp GPU device when the
-// caller did not pass explicit ggml device names (prevents silent fallback to
-// GPU 0 or unintended layer splitting across discrete + integrated GPUs).
+// caller did not pass explicit ggml device names or multi-GPU tensor_split
+// (prevents silent fallback to GPU 0, unintended layer splitting across discrete
+// + integrated GPUs, or cross-vendor ordinal mismatch between OS and GGML lists).
 inline Status ResolveGpuDevicePin(std::string_view device_id,
                                   const std::vector<sonder::backends::llamacpp::DeviceInfo>& available_devices,
-                                  std::vector<std::string>& out_devices, std::int32_t& out_main_gpu) {
-    if (!out_devices.empty()) return Status::success();
+                                  std::vector<std::string>& out_devices, std::int32_t& out_main_gpu,
+                                  const std::vector<float>& tensor_split = {},
+                                  const std::vector<GpuDeviceInfo>& os_gpus = {}) {
+    if (!out_devices.empty() || !tensor_split.empty()) return Status::success();
     if (device_id.rfind("gpu:", 0) != 0) return Status::success();
     const std::string_view suffix = device_id.substr(4);
     if (suffix.empty()) {
@@ -236,19 +275,65 @@ inline Status ResolveGpuDevicePin(std::string_view device_id,
         }
         idx = idx * 10 + static_cast<std::size_t>(ch - '0');
     }
-    std::vector<std::string> gpus;
+    std::vector<const sonder::backends::llamacpp::DeviceInfo*> gpus;
     for (const auto& d : available_devices) {
         if (d.kind == sonder::backends::llamacpp::DeviceKind::kGpu ||
             d.kind == sonder::backends::llamacpp::DeviceKind::kIntegratedGpu) {
-            gpus.push_back(d.name);
+            gpus.push_back(&d);
         }
     }
+
+    // When OS GPU inventory is supplied, resolve `gpu:<idx>` in OS inventory space
+    // and match it against the compiled GGML devices by hardware identity (vendor
+    // + adapter name / intra-vendor ordinal) instead of assuming OS and GGML
+    // ordinal spaces are identical.
+    if (!os_gpus.empty()) {
+        if (idx >= os_gpus.size()) {
+            return Status(ErrorCode::not_found, "requested device '" + std::string(device_id) +
+                                                    "' exceeds detected OS GPU count (" +
+                                                    std::to_string(os_gpus.size()) + ")");
+        }
+        const GpuDeviceInfo& target = os_gpus[idx];
+        const std::string target_name = LowerAscii(target.name);
+        std::size_t vendor_ordinal = 0;
+        for (std::size_t i = 0; i < idx; ++i) {
+            if (os_gpus[i].vendor == target.vendor) ++vendor_ordinal;
+        }
+        std::vector<const sonder::backends::llamacpp::DeviceInfo*> same_vendor;
+        std::vector<const sonder::backends::llamacpp::DeviceInfo*> name_matches;
+        for (const auto* g : gpus) {
+            const GpuVendor gv = InferGgmlDeviceVendor(*g);
+            if (target.vendor != GpuVendor::unknown && gv == target.vendor) {
+                same_vendor.push_back(g);
+            }
+            const std::string gd = LowerAscii(g->description);
+            if (!target_name.empty() && !gd.empty() &&
+                (gd.find(target_name) != std::string::npos || target_name.find(gd) != std::string::npos)) {
+                name_matches.push_back(g);
+            }
+        }
+        if (name_matches.size() == 1) {
+            out_devices = {name_matches[0]->name};
+            out_main_gpu = 0;
+            return Status::success();
+        }
+        if (!same_vendor.empty() && vendor_ordinal < same_vendor.size()) {
+            out_devices = {same_vendor[vendor_ordinal]->name};
+            out_main_gpu = 0;
+            return Status::success();
+        }
+        return Status(ErrorCode::not_found,
+                      "requested device '" + std::string(device_id) + "' (" + target.name +
+                          ") has no matching compiled llama.cpp GPU backend device; specify an explicit "
+                          "backend device name such as CUDA0, ROCm0, or Vulkan0");
+    }
+
     if (idx >= gpus.size()) {
         return Status(ErrorCode::not_found, "requested device '" + std::string(device_id) +
                                                 "' exceeds available llama.cpp GPU count (" +
                                                 std::to_string(gpus.size()) + ")");
     }
-    out_devices = {gpus[idx]};
+    out_devices = {gpus[idx]->name};
     out_main_gpu = 0;
     return Status::success();
 }

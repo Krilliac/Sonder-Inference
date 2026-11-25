@@ -360,4 +360,38 @@ TEST_CASE("llamacpp adapter: ResolveGpuDevicePin routes gpu:N to the matching gg
     CHECK(llamacpp_detail::ResolveGpuDevicePin("gpu:0", devs, pinned, main_gpu).ok());
     CHECK(pinned.size() == 2u);
     CHECK(main_gpu == 1);
+
+    // Explicit multi-GPU tensor_split is preserved untouched (never overwritten by single-GPU pin).
+    pinned.clear();
+    main_gpu = 1;
+    const std::vector<float> split{1.0f, 1.0f};
+    CHECK(llamacpp_detail::ResolveGpuDevicePin("gpu:0", devs, pinned, main_gpu, split).ok());
+    CHECK(pinned.empty());
+    CHECK(main_gpu == 1);
+
+    // Cross-vendor OS vs CUDA-only GGML inventory: OS gpu:0 = AMD iGPU, OS gpu:1 = NVIDIA RTX 5070 Ti.
+    // CUDA-only llama.cpp exposes only CUDA0 -> OS gpu:1 resolves to CUDA0, while OS gpu:0 fails closed!
+    const std::vector<lc::DeviceInfo> cuda_only{
+        {"CPU", "Ryzen", lc::DeviceKind::kCpu, 0, 0},
+        {"CUDA0", "NVIDIA GeForce RTX 5070 Ti", lc::DeviceKind::kGpu, 16000, 15000},
+    };
+    GpuDeviceInfo os_amd;
+    os_amd.id = "gpu:0";
+    os_amd.name = "AMD Radeon(TM) Graphics";
+    os_amd.vendor = GpuVendor::amd;
+    GpuDeviceInfo os_nv;
+    os_nv.id = "gpu:1";
+    os_nv.name = "NVIDIA GeForce RTX 5070 Ti";
+    os_nv.vendor = GpuVendor::nvidia;
+    const std::vector<GpuDeviceInfo> os_gpus{os_amd, os_nv};
+
+    pinned.clear();
+    main_gpu = 0;
+    CHECK(llamacpp_detail::ResolveGpuDevicePin("gpu:1", cuda_only, pinned, main_gpu, {}, os_gpus).ok());
+    REQUIRE(pinned.size() == 1u);
+    CHECK(pinned[0] == "CUDA0");
+
+    pinned.clear();
+    CHECK(llamacpp_detail::ResolveGpuDevicePin("gpu:0", cuda_only, pinned, main_gpu, {}, os_gpus).code() ==
+          ErrorCode::not_found);
 }

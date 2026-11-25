@@ -84,6 +84,9 @@ public:
         if (request.sampling.typical_p != 1.0f) {
             return Status(ErrorCode::invalid_argument, "the ollama backend does not support typical_p");
         }
+        if (!request.grammar.empty()) {
+            return Status(ErrorCode::unsupported, "the ollama backend does not support raw GBNF grammar constraints");
+        }
         ollama::GenerateParams params;
         params.model = descriptor_.name;
         params.prompt = request.prompt;
@@ -107,6 +110,28 @@ public:
             return Status(ErrorCode::invalid_argument, "the ollama backend does not support typical_p");
         }
         ollama::ChatParams params;
+        if (request.response_format_type) {
+            if (*request.response_format_type == "json_object") {
+                params.format = json::Value("json");
+            } else if (*request.response_format_type == "json_schema") {
+                if (!request.response_format_schema || request.response_format_schema->empty()) {
+                    return Status(ErrorCode::invalid_argument,
+                                  "ollama: json_schema response_format is missing its schema");
+                }
+                auto parsed = json::parse(*request.response_format_schema);
+                if (!parsed.ok() || !parsed.value().is_object()) {
+                    return Status(ErrorCode::invalid_argument,
+                                  "ollama: json_schema response_format schema must be a JSON object");
+                }
+                params.format = std::move(parsed).value();
+            } else {
+                return Status(ErrorCode::unsupported,
+                              "the ollama backend does not support response_format type '" +
+                                  *request.response_format_type + "'");
+            }
+        } else if (!request.grammar.empty()) {
+            return Status(ErrorCode::unsupported, "the ollama backend does not support raw GBNF grammar constraints");
+        }
         params.model = descriptor_.name;
         params.messages = request.messages;
         params.retain_text = false;
@@ -324,7 +349,10 @@ public:
     }
     BackendCapabilities capabilities() const override {
         BackendCapabilities caps;
-        caps.add(Capability::streaming).add(Capability::remote_process).add(Capability::embeddings);
+        caps.add(Capability::streaming)
+            .add(Capability::remote_process)
+            .add(Capability::embeddings)
+            .add(Capability::structured_output);
         return caps;
     }
 

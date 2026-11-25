@@ -272,6 +272,16 @@ bool read_head(Exchange& ex, std::string& buffer, RequestHead& head, std::size_t
     const auto deadline = ex.started + opts.read_timeout;
     char chunk[4096];
     for (;;) {
+        if (flags.evict.load()) {
+            // Evicted to make room for a new connection (at the limit) — refuse
+            // even a complete pipelined head already sitting in the read buffer.
+            ex.keep_alive = false;
+            send_error(ex,
+                       make_error(408, "request_timeout",
+                                  "request headers not received in time (the server is at its connection limit)"),
+                       opts.write_stall_timeout, hard_stop);
+            return false;
+        }
         const ParseResult pr = parse_request_head(buffer, head);
         if (pr.state == ParseState::complete) {
             head_bytes = pr.head_bytes;
@@ -286,14 +296,6 @@ bool read_head(Exchange& ex, std::string& buffer, RequestHead& head, std::size_t
             // Whatever else the client sends is unread: linger briefly.
             ex.unread_input = kLingerUnknownLength;
             send_error(ex, make_error(pr.status, code, pr.message), opts.write_stall_timeout, hard_stop);
-            return false;
-        }
-        if (flags.evict.load()) {
-            // Evicted to make room for a new connection (at the limit).
-            send_error(ex,
-                       make_error(408, "request_timeout",
-                                  "request headers not received in time (the server is at its connection limit)"),
-                       opts.write_stall_timeout, hard_stop);
             return false;
         }
         const auto now = std::chrono::steady_clock::now();

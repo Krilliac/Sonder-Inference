@@ -137,8 +137,11 @@ struct GpuDeviceInfo {
     MemoryReading dedicated_free;     // free/available budget VRAM when known
     MemoryReading shared_total;       // shared/GTT system memory pool when known
     bool is_integrated_uma = false;   // true on Ryzen APU/iGPU unified memory
+    bool is_tcc_mode = false;         // true for Windows NVIDIA TCC-mode compute adapters
     std::string backend_hint;         // "cuda", "rocm", "vulkan", "metal", or ""
     std::string source;               // "dxgi", "amdgpu-sysfs", "nvml", etc.
+    std::string pci_bus_id;           // optional PCI BDF (e.g. "0000:01:00.0")
+    std::optional<std::size_t> rocm_runtime_ordinal;  // mapped ROCm/HIP ordinal after visibility masks
 };
 
 // Pure Linux amdgpu sysfs parser (/sys/class/drm/<card_id>/device/*).
@@ -147,14 +150,27 @@ std::optional<GpuDeviceInfo> parse_amdgpu_sysfs_device(std::string_view card_id,
 std::optional<GpuDeviceInfo> parse_amdgpu_sysfs_device(std::string_view card_id, const FileReader& read_file,
                                                        bool rocm_available);
 
-// Pure ROCm/HIP device visibility check for AMD adapter ordinal `amd_ordinal`
-// given optional HIP_VISIBLE_DEVICES and ROCR_VISIBLE_DEVICES values
-// (std::nullopt when unset). Empty, "-1", "none", or "NoDevFiles" disables
-// ROCm; comma-separated integer lists filter by ordinal (ROCR applied before
-// HIP when both are set); UUID tokens ("GPU-...") are treated as visible.
+// Pure ROCm/HIP device visibility & runtime ordinal mapping for AMD adapter
+// ordinal `amd_ordinal` given optional HIP_VISIBLE_DEVICES and
+// ROCR_VISIBLE_DEVICES values (std::nullopt when unset) and optional ROCm
+// device UUID (e.g. "GPU-0123456789abcdef"). Empty, "-1", "none", or
+// "NoDevFiles" disables ROCm; comma-separated integer lists filter and remap
+// ordinals (ROCR applied before HIP when both are set); UUID tokens fail closed
+// unless `device_uuid` is supplied and matches a token.
+std::optional<std::size_t> map_rocm_device_ordinal(
+    std::size_t amd_ordinal, std::optional<std::string_view> hip_visible_devices = std::nullopt,
+    std::optional<std::string_view> rocr_visible_devices = std::nullopt,
+    std::optional<std::string_view> device_uuid = std::nullopt) noexcept;
+
 bool is_rocm_device_visible(std::size_t amd_ordinal,
                             std::optional<std::string_view> hip_visible_devices = std::nullopt,
-                            std::optional<std::string_view> rocr_visible_devices = std::nullopt) noexcept;
+                            std::optional<std::string_view> rocr_visible_devices = std::nullopt,
+                            std::optional<std::string_view> device_uuid = std::nullopt) noexcept;
+
+// Pure Windows DXGI + NVML merger: preserves all DXGI adapters and appends any
+// NVML NVIDIA GPUs missing from DXGI (such as TCC-mode / headless cards on a
+// mixed WDDM + TCC host) without duplicating WDDM cards already enumerated.
+void merge_win32_nvml_devices(std::vector<GpuDeviceInfo>& gpus, const std::vector<GpuDeviceInfo>& nvml_gpus);
 
 // Pure Windows GPU backend hint resolver: "cuda" for NVIDIA, "rocm" for
 // discrete AMD RX XT when AMD HIP SDK is installed and the device is visible

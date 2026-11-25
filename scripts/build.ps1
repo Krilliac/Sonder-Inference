@@ -105,10 +105,23 @@ if ($Jobs -gt 0) {
 
 Push-Location $repoRoot
 try {
-    if ($Preset -notmatch '^[A-Za-z0-9._-]+$') {
-        throw "invalid preset name '$Preset' (allowed: letters, digits, '.', '_', '-')"
+    if ($Preset -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$' -or $Preset -eq '.' -or $Preset -eq '..' -or $Preset.Contains('..')) {
+        throw "invalid preset name '$Preset' (allowed: letters, digits, '.', '_', '-' without path traversal)"
     }
-    $binaryDir = Join-Path $repoRoot "build\$Preset"
+    $presetsJsonPath = Join-Path $repoRoot 'CMakePresets.json'
+    if (Test-Path -LiteralPath $presetsJsonPath) {
+        $presetsDoc = Get-Content -LiteralPath $presetsJsonPath -Raw | ConvertFrom-Json
+        $knownPresets = @($presetsDoc.configurePresets | ForEach-Object { $_.name })
+        if ($knownPresets.Count -gt 0 -and ($knownPresets -notcontains $Preset)) {
+            throw "unknown configure preset '$Preset' (not found in CMakePresets.json)"
+        }
+    }
+    $buildRoot = [System.IO.Path]::GetFullPath((Join-Path $repoRoot 'build'))
+    $binaryDir = [System.IO.Path]::GetFullPath((Join-Path $buildRoot $Preset))
+    $buildRootPrefix = $buildRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $binaryDir.StartsWith($buildRootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "refusing to operate outside build root: '$binaryDir'"
+    }
     if ($Clean -and (Test-Path -LiteralPath $binaryDir)) {
         Remove-Item -Recurse -Force -LiteralPath $binaryDir
     }

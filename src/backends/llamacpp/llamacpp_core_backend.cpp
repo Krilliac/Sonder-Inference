@@ -525,7 +525,12 @@ public:
         if (!gpu_layers.ok()) return gpu_layers.status();
         lo.n_gpu_layers = gpu_layers.value();
         if (lo.n_gpu_layers != 0) {
-            if (Status s = llamacpp_detail::ResolveGpuDevicePin(dev, enumerated_devices, lo.devices, lo.main_gpu);
+            const std::vector<GpuDeviceInfo> os_gpus =
+                (dev.rfind("gpu:", 0) == 0 && lo.devices.empty() && lo.tensor_split.empty())
+                    ? enumerate_gpu_devices()
+                    : std::vector<GpuDeviceInfo>{};
+            if (Status s = llamacpp_detail::ResolveGpuDevicePin(dev, enumerated_devices, lo.devices, lo.main_gpu,
+                                                                lo.tensor_split, os_gpus);
                 !s.ok()) {
                 return s;
             }

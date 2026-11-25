@@ -557,6 +557,9 @@ std::string ggml_device_name_for(const std::vector<GpuDeviceInfo>& gpus, std::si
         return "CUDA" + std::to_string(local);
     }
     if (backend_hint == "rocm") {
+        if (idx < gpus.size() && gpus[idx].rocm_runtime_ordinal.has_value()) {
+            return "ROCm" + std::to_string(*gpus[idx].rocm_runtime_ordinal);
+        }
         const bool explicit_rocm = has_explicit_rocm_gpu(gpus);
         std::size_t local = 0;
         for (std::size_t i = 0; i < idx && i < gpus.size(); ++i) {
@@ -935,10 +938,15 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
     } else if (plan.selected_vendor == GpuVendor::amd) {
         profile.flash_attn = "auto";
         profile.load_mode = "auto";
-        add_allowed_env(plan.recommended_env, "GPU_MAX_ALLOC_PERCENT", "100");
-        plan.reasons.emplace_back(
-            "AMD Radeon RX discrete defaults: flash_attn=auto, kv_unified=true, GPU_MAX_ALLOC_PERCENT=100 for "
-            "ROCm/HIP full VRAM allocation");
+        if (plan.recommended_backend_hint == "rocm") {
+            add_allowed_env(plan.recommended_env, "GPU_MAX_ALLOC_PERCENT", "100");
+            plan.reasons.emplace_back(
+                "AMD Radeon RX discrete defaults: flash_attn=auto, kv_unified=true, GPU_MAX_ALLOC_PERCENT=100 for "
+                "ROCm/HIP full VRAM allocation");
+        } else {
+            plan.reasons.emplace_back(
+                "AMD Radeon RX discrete Vulkan defaults: flash_attn=auto, kv_unified=true");
+        }
     } else {
         profile.flash_attn = "auto";
         profile.load_mode = "auto";

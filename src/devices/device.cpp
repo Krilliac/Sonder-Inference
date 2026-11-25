@@ -305,11 +305,22 @@ std::optional<std::size_t> match_single_gpu_hint(const std::vector<GpuDeviceInfo
     if (istarts_with(token, "nvidia")) {
         return match_vendor_hint(gpus, token.substr(6), is_nvidia, prefer_free);
     }
+    const auto match_rocm_hint = [&](std::string_view suffix) -> std::optional<std::size_t> {
+        const auto target_idx = parse_index(trim_view(suffix));
+        if (target_idx) {
+            for (std::size_t i = 0; i < gpus.size(); ++i) {
+                if (gpus[i].rocm_runtime_ordinal && *gpus[i].rocm_runtime_ordinal == *target_idx) {
+                    return i;
+                }
+            }
+        }
+        return match_vendor_hint(gpus, suffix, is_rocm_target, prefer_free);
+    };
     if (istarts_with(token, "rocm")) {
-        return match_vendor_hint(gpus, token.substr(4), is_rocm_target, prefer_free);
+        return match_rocm_hint(token.substr(4));
     }
     if (istarts_with(token, "hip")) {
-        return match_vendor_hint(gpus, token.substr(3), is_rocm_target, prefer_free);
+        return match_rocm_hint(token.substr(3));
     }
     if (istarts_with(token, "amd")) {
         return match_vendor_hint(gpus, token.substr(3), is_amd, prefer_free);
@@ -335,13 +346,14 @@ std::optional<std::size_t> match_single_gpu_hint(const std::vector<GpuDeviceInfo
     return std::nullopt;
 }
 
-std::optional<std::size_t> map_rocm_visible_ordinal(std::size_t ordinal, std::string_view raw) noexcept {
+std::optional<std::size_t> map_rocm_visible_ordinal(std::size_t ordinal, std::string_view raw,
+                                                    std::optional<std::string_view> device_uuid) noexcept {
     const std::string_view val = trim_view(raw);
     if (val.empty() || iequals(val, "-1") || iequals(val, "none") || iequals(val, "nodevfiles")) {
         return std::nullopt;
     }
+    const std::string_view norm_uuid = device_uuid ? trim_view(*device_uuid) : std::string_view{};
     std::size_t mapped_pos = 0;
-    bool saw_uuid = false;
     std::size_t pos = 0;
     while (pos <= val.size()) {
         const std::size_t comma = val.find(',', pos);
@@ -360,13 +372,15 @@ std::optional<std::size_t> map_rocm_visible_ordinal(std::size_t ordinal, std::st
             }
             ++mapped_pos;
         } else if (istarts_with(tok, "gpu-")) {
-            saw_uuid = true;
+            if (!norm_uuid.empty() && iequals(tok, norm_uuid)) {
+                return mapped_pos;
+            }
             ++mapped_pos;
         } else {
             break;
         }
     }
-    return saw_uuid ? std::optional<std::size_t>(ordinal) : std::nullopt;
+    return std::nullopt;
 }
 
 #if defined(_WIN32)
@@ -516,10 +530,11 @@ bool detect_windows_hip_sdk() {
     return false;
 }
 
-void append_win32_nvml_fallback_devices(std::vector<GpuDeviceInfo>& gpus) {
+std::vector<GpuDeviceInfo> enumerate_win32_nvml_devices() {
+    std::vector<GpuDeviceInfo> out;
     ScopedLibrary nvml(LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32));
     if (!nvml.handle) {
-        return;
+        return out;
     }
     using NvmlReturn = int;
     struct NvmlDeviceOpaque;
@@ -539,6 +554,7 @@ void append_win32_nvml_fallback_devices(std::vector<GpuDeviceInfo>& gpus) {
         char bus_id[32];
     };
     constexpr NvmlReturn kNvmlSuccess = 0;
+    constexpr int kNvmlDriverTcc = 1;
 
     NvmlReturn (*nvml_init)() = nullptr;
     NvmlReturn (*nvml_shutdown)() = nullptr;
@@ -547,6 +563,7 @@ void append_win32_nvml_fallback_devices(std::vector<GpuDeviceInfo>& gpus) {
     NvmlReturn (*nvml_get_name)(NvmlDevice, char*, unsigned int) = nullptr;
     NvmlReturn (*nvml_get_memory)(NvmlDevice, NvmlMemory*) = nullptr;
     NvmlReturn (*nvml_get_pci)(NvmlDevice, NvmlPciInfo*) = nullptr;
+    NvmlReturn (*nvml_get_driver_model)(NvmlDevice, int*, int*) = nullptr;
 
     if (!load_win32_symbol(nvml.handle, "nvmlInit_v2", nvml_init) ||
         !load_win32_symbol(nvml.handle, "nvmlShutdown", nvml_shutdown) ||
@@ -554,13 +571,16 @@ void append_win32_nvml_fallback_devices(std::vector<GpuDeviceInfo>& gpus) {
         !load_win32_symbol(nvml.handle, "nvmlDeviceGetHandleByIndex_v2", nvml_get_handle) ||
         !load_win32_symbol(nvml.handle, "nvmlDeviceGetName", nvml_get_name) ||
         !load_win32_symbol(nvml.handle, "nvmlDeviceGetMemoryInfo", nvml_get_memory)) {
-        return;
+        return out;
     }
     if (!load_win32_symbol(nvml.handle, "nvmlDeviceGetPciInfo_v3", nvml_get_pci)) {
         (void)load_win32_symbol(nvml.handle, "nvmlDeviceGetPciInfo", nvml_get_pci);
     }
+    if (!load_win32_symbol(nvml.handle, "nvmlDeviceGetDriverModel_v2", nvml_get_driver_model)) {
+        (void)load_win32_symbol(nvml.handle, "nvmlDeviceGetDriverModel", nvml_get_driver_model);
+    }
     if (nvml_init() != kNvmlSuccess) {
-        return;
+        return out;
     }
     struct ScopedNvml {
         NvmlReturn (*shutdown)() = nullptr;
@@ -576,7 +596,7 @@ void append_win32_nvml_fallback_devices(std::vector<GpuDeviceInfo>& gpus) {
 
     unsigned int count = 0;
     if (nvml_get_count(&count) != kNvmlSuccess || count == 0) {
-        return;
+        return out;
     }
     count = std::min<unsigned int>(count, 64u);
     for (unsigned int i = 0; i < count; ++i) {
@@ -585,7 +605,7 @@ void append_win32_nvml_fallback_devices(std::vector<GpuDeviceInfo>& gpus) {
             continue;
         }
         GpuDeviceInfo info;
-        info.id = "gpu:" + std::to_string(gpus.size());
+        info.id = "gpu:" + std::to_string(out.size());
         char name_buf[128] = {};
         if (nvml_get_name(dev, name_buf, static_cast<unsigned int>(sizeof(name_buf))) == kNvmlSuccess) {
             name_buf[sizeof(name_buf) - 1] = '\0';
@@ -600,6 +620,15 @@ void append_win32_nvml_fallback_devices(std::vector<GpuDeviceInfo>& gpus) {
             NvmlPciInfo pci{};
             if (nvml_get_pci(dev, &pci) == kNvmlSuccess) {
                 info.device_id = static_cast<std::uint32_t>(pci.pci_device_id >> 16);
+                pci.bus_id[sizeof(pci.bus_id) - 1] = '\0';
+                info.pci_bus_id = trim(pci.bus_id);
+            }
+        }
+        if (nvml_get_driver_model) {
+            int cur_model = 0;
+            int pending_model = 0;
+            if (nvml_get_driver_model(dev, &cur_model, &pending_model) == kNvmlSuccess) {
+                info.is_tcc_mode = (cur_model == kNvmlDriverTcc);
             }
         }
         NvmlMemory mem{};
@@ -612,8 +641,9 @@ void append_win32_nvml_fallback_devices(std::vector<GpuDeviceInfo>& gpus) {
         info.is_integrated_uma = false;
         info.backend_hint = "cuda";
         info.source = "nvml";
-        gpus.push_back(std::move(info));
+        out.push_back(std::move(info));
     }
+    return out;
 }
 
 std::vector<GpuDeviceInfo> live_gpu_devices() {
@@ -626,7 +656,6 @@ std::vector<GpuDeviceInfo> live_gpu_devices() {
     const std::optional<std::string_view> rocr_vis_view =
         rocr_vis ? std::optional<std::string_view>(*rocr_vis) : std::nullopt;
 
-    bool saw_nvidia_dxgi = false;
     ScopedLibrary dxgi(LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32));
     if (dxgi.handle) {
         using CreateDXGIFactory1Fn = HRESULT(WINAPI*)(REFIID, void**);
@@ -656,9 +685,6 @@ std::vector<GpuDeviceInfo> live_gpu_devices() {
                     info.vendor_id = static_cast<std::uint32_t>(desc.VendorId);
                     info.device_id = static_cast<std::uint32_t>(desc.DeviceId);
                     info.vendor = gpu_vendor_from_pci_id(info.vendor_id);
-                    if (info.vendor == GpuVendor::nvidia) {
-                        saw_nvidia_dxgi = true;
-                    }
                     const auto dedicated_total = static_cast<std::uint64_t>(desc.DedicatedVideoMemory);
                     const auto shared_total = static_cast<std::uint64_t>(desc.SharedSystemMemory);
                     info.dedicated_total = MemoryReading::known(dedicated_total);
@@ -667,6 +693,10 @@ std::vector<GpuDeviceInfo> live_gpu_devices() {
                     std::size_t cur_amd_ordinal = 0;
                     if (info.vendor == GpuVendor::amd && !info.is_integrated_uma) {
                         cur_amd_ordinal = amd_ordinal++;
+                        if (hip_sdk_available) {
+                            info.rocm_runtime_ordinal =
+                                map_rocm_device_ordinal(cur_amd_ordinal, hip_vis_view, rocr_vis_view);
+                        }
                     }
                     info.backend_hint = resolve_windows_gpu_backend_hint(
                         info.vendor, info.is_integrated_uma, hip_sdk_available, cur_amd_ordinal, hip_vis_view,
@@ -712,11 +742,10 @@ std::vector<GpuDeviceInfo> live_gpu_devices() {
         }
     }
 
-    // Headless / TCC-mode NVIDIA GPUs on Windows are not enumerated by DXGI;
-    // fall back to System32 nvml.dll when DXGI reported no NVIDIA adapters.
-    if (!saw_nvidia_dxgi) {
-        append_win32_nvml_fallback_devices(gpus);
-    }
+    // Always query System32 nvml.dll and merge any headless / TCC-mode NVIDIA
+    // GPUs that DXGI does not enumerate, even when a WDDM NVIDIA card is present.
+    const auto nvml_gpus = enumerate_win32_nvml_devices();
+    merge_win32_nvml_devices(gpus, nvml_gpus);
     for (std::size_t i = 0; i < gpus.size(); ++i) {
         gpus[i].id = "gpu:" + std::to_string(i);
     }
@@ -830,8 +859,22 @@ void append_amdgpu_sysfs_devices(std::vector<GpuDeviceInfo>& gpus) {
     const FileReader reader = [](const std::string& path) { return read_small_file(path, 4096); };
     std::size_t amd_ordinal = 0;
     for (const auto& card : cards) {
-        const bool rocm_ok = kfd_accessible && is_rocm_device_visible(amd_ordinal, hip_vis, rocr_vis);
-        if (auto gpu = parse_amdgpu_sysfs_device(card.second, reader, rocm_ok)) {
+        std::string uuid_str;
+        std::optional<std::string_view> uuid_view;
+        if (const auto uid = reader("/sys/class/drm/" + card.second + "/device/unique_id")) {
+            std::string_view hex = trim_view(*uid);
+            if (hex.size() >= 2 && hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) {
+                hex.remove_prefix(2);
+            }
+            if (!hex.empty()) {
+                uuid_str = "GPU-" + std::string(hex);
+                uuid_view = uuid_str;
+            }
+        }
+        const auto rocm_ord =
+            kfd_accessible ? map_rocm_device_ordinal(amd_ordinal, hip_vis, rocr_vis, uuid_view) : std::nullopt;
+        if (auto gpu = parse_amdgpu_sysfs_device(card.second, reader, rocm_ord.has_value())) {
+            gpu->rocm_runtime_ordinal = rocm_ord;
             ++amd_ordinal;
             gpus.push_back(std::move(*gpu));
         }
@@ -1167,23 +1210,73 @@ std::vector<DeviceInfo> enumerate_devices() {
     return {cpu};
 }
 
-bool is_rocm_device_visible(std::size_t amd_ordinal,
-                            std::optional<std::string_view> hip_visible_devices,
-                            std::optional<std::string_view> rocr_visible_devices) noexcept {
+std::optional<std::size_t> map_rocm_device_ordinal(std::size_t amd_ordinal,
+                                                   std::optional<std::string_view> hip_visible_devices,
+                                                   std::optional<std::string_view> rocr_visible_devices,
+                                                   std::optional<std::string_view> device_uuid) noexcept {
     std::size_t current = amd_ordinal;
     if (rocr_visible_devices.has_value()) {
-        const auto mapped = map_rocm_visible_ordinal(current, *rocr_visible_devices);
+        const auto mapped = map_rocm_visible_ordinal(current, *rocr_visible_devices, device_uuid);
         if (!mapped) {
-            return false;
+            return std::nullopt;
         }
         current = *mapped;
     }
     if (hip_visible_devices.has_value()) {
-        if (!map_rocm_visible_ordinal(current, *hip_visible_devices)) {
-            return false;
+        const auto mapped = map_rocm_visible_ordinal(current, *hip_visible_devices, device_uuid);
+        if (!mapped) {
+            return std::nullopt;
+        }
+        current = *mapped;
+    }
+    return current;
+}
+
+bool is_rocm_device_visible(std::size_t amd_ordinal,
+                            std::optional<std::string_view> hip_visible_devices,
+                            std::optional<std::string_view> rocr_visible_devices,
+                            std::optional<std::string_view> device_uuid) noexcept {
+    return map_rocm_device_ordinal(amd_ordinal, hip_visible_devices, rocr_visible_devices, device_uuid).has_value();
+}
+
+void merge_win32_nvml_devices(std::vector<GpuDeviceInfo>& gpus, const std::vector<GpuDeviceInfo>& nvml_gpus) {
+    if (nvml_gpus.empty()) {
+        return;
+    }
+    // Track which existing DXGI NVIDIA entries have already been matched to a
+    // non-TCC NVML entry so identical dual-GPU setups are not collapsed while
+    // WDDM cards already reported by DXGI are never duplicated.
+    std::vector<bool> dxgi_matched(gpus.size(), false);
+    for (const auto& nv : nvml_gpus) {
+        if (nv.is_tcc_mode) {
+            // TCC-mode adapters are never enumerated by DXGI; always append.
+            gpus.push_back(nv);
+            dxgi_matched.push_back(true);
+            continue;
+        }
+        bool matched = false;
+        for (std::size_t i = 0; i < gpus.size(); ++i) {
+            if (dxgi_matched[i] || gpus[i].vendor != GpuVendor::nvidia) {
+                continue;
+            }
+            const bool same_bus = !nv.pci_bus_id.empty() && !gpus[i].pci_bus_id.empty() &&
+                                  iequals(nv.pci_bus_id, gpus[i].pci_bus_id);
+            const bool same_dev = (nv.device_id != 0 && gpus[i].device_id == nv.device_id);
+            const bool same_name = !nv.name.empty() && iequals(nv.name, gpus[i].name);
+            if (same_bus || same_dev || same_name) {
+                dxgi_matched[i] = true;
+                if (gpus[i].pci_bus_id.empty() && !nv.pci_bus_id.empty()) {
+                    gpus[i].pci_bus_id = nv.pci_bus_id;
+                }
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            gpus.push_back(nv);
+            dxgi_matched.push_back(true);
         }
     }
-    return true;
 }
 
 std::string resolve_windows_gpu_backend_hint(GpuVendor vendor, bool is_integrated_uma, bool hip_sdk_available,

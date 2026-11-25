@@ -377,6 +377,7 @@ def test_corpus_structure_and_all_12_reference_graders() -> None:
     assert regimes["structured_json"]["response_format"] == {"type": "json_object"}
 
     # 12 Quality probes across 4 categories (3 each), all passing their own deterministic graders
+    # when unsafe python execution is explicitly opted in (and safely skipping python by default).
     probes = corpus["quality_probes"]
     assert len(probes) == 12
     counts: dict[str, int] = {}
@@ -384,8 +385,14 @@ def test_corpus_structure_and_all_12_reference_graders() -> None:
         assert probe["temperature"] == 0
         assert probe["seed"] == 42
         counts[probe["category"]] = counts.get(probe["category"], 0) + 1
-        grade = bps.grade_probe(probe["reference_answer"], probe)
-        assert grade["passed"] is True, f"Reference answer failed for {probe['id']}: {grade}"
+        default_grade = bps.grade_probe(probe["reference_answer"], probe)
+        if probe["category"] == "python_code":
+            assert default_grade["skipped"] is True
+            assert default_grade["passed"] is False
+            grade = bps.grade_probe(probe["reference_answer"], probe, allow_unsafe_python_exec=True)
+            assert grade["passed"] is True, f"Reference answer failed for {probe['id']}: {grade}"
+        else:
+            assert default_grade["passed"] is True, f"Reference answer failed for {probe['id']}: {default_grade}"
     assert counts == {"math": 3, "python_code": 3, "json_schema": 3, "logic": 3}
 
 
@@ -527,16 +534,43 @@ def test_quality_graders_positive_and_adversarial() -> None:
     assert bps.grade_math("FINAL_ANSWER: 2901", m_spec)["passed"] is False
     assert bps.grade_math("No digits at all.", m_spec)["passed"] is False
 
-    # 2. Python subprocess grader (pass, assertion fail, syntax error, infinite loop timeout)
+    # 2. Python grader: disabled by default (never executes untrusted code!),
+    #    and when opted in, validates scrubbed env, early-exit sentinel, syntax, and timeout.
     py_spec = {
         "entry_point": "add_pair",
         "timeout_s": 0.4,
         "test_code": "assert add_pair(2, 3) == 5\nassert add_pair(-1, 1) == 0\n",
     }
-    assert bps.grade_python_code("```python\ndef add_pair(a, b):\n    return a + b\n```", py_spec)["passed"] is True
-    bad_ans = bps.grade_python_code("```python\ndef add_pair(a, b):\n    return a * b\n```", py_spec)
+    # Default mode does NOT execute candidate code!
+    default_py = bps.grade_python_code(
+        "```python\nimport sys\nsys.exit(99)\ndef add_pair(a, b):\n    return a + b\n```",
+        py_spec,
+    )
+    assert default_py["skipped"] is True and default_py["passed"] is False
+    # Opted-in execution checks sentinel (sys.exit(0) cannot spoof pass!) and strips env secrets.
+    early_exit = bps.grade_python_code(
+        "```python\nimport sys\ndef add_pair(a, b):\n    sys.exit(0)\n```",
+        py_spec,
+        allow_unsafe_exec=True,
+    )
+    assert early_exit["passed"] is False and "exited early" in early_exit["detail"].lower()
+
+    assert bps.grade_python_code(
+        "```python\ndef add_pair(a, b):\n    return a + b\n```",
+        py_spec,
+        allow_unsafe_exec=True,
+    )["passed"] is True
+    bad_ans = bps.grade_python_code(
+        "```python\ndef add_pair(a, b):\n    return a * b\n```",
+        py_spec,
+        allow_unsafe_exec=True,
+    )
     assert bad_ans["passed"] is False and "AssertionError" in bad_ans["detail"]
-    syn_err = bps.grade_python_code("```python\ndef add_pair(a, b)\n    return a + b\n```", py_spec)
+    syn_err = bps.grade_python_code(
+        "```python\ndef add_pair(a, b)\n    return a + b\n```",
+        py_spec,
+        allow_unsafe_exec=True,
+    )
     assert syn_err["passed"] is False and "SyntaxError" in syn_err["detail"]
 
     t0 = time.perf_counter()
@@ -544,19 +578,23 @@ def test_quality_graders_positive_and_adversarial() -> None:
         "```python\ndef add_pair(a, b):\n    while True:\n        pass\n```",
         py_spec,
         timeout_s=0.4,
+        allow_unsafe_exec=True,
     )
     elapsed = time.perf_counter() - t0
     assert hang_res["passed"] is False
     assert "timeout" in hang_res["detail"].lower()
     assert elapsed < 4.0
 
-    # 3. JSON schema validator (including Python bool-is-subclass-of-int trap!)
+    # 3. JSON schema validator (including Python bool-is-subclass-of-int trap & exact_keys!)
     j_spec = {
+        "exact_keys": True,
         "required_keys": {"name": "str", "slots": "int", "active": "bool", "tags": "list[str]"},
         "expected_values": {"slots": 4, "active": True},
     }
     assert bps.grade_json_schema('{"name":"sonder","slots":4,"active":true,"tags":["cuda"]}', j_spec)["passed"] is True
     assert bps.grade_json_schema('```json\n{"name":"sonder","slots":4,"active":true,"tags":[]}\n```', j_spec)["passed"] is True
+    extra_k = bps.grade_json_schema('{"name":"sonder","slots":4,"active":true,"tags":[],"extra":1}', j_spec)
+    assert extra_k["passed"] is False and "unexpected extra key" in extra_k["detail"]
     # Bool passed for int key MUST fail!
     bool_as_int = bps.grade_json_schema('{"name":"sonder","slots":true,"active":true,"tags":[]}', j_spec)
     assert bool_as_int["passed"] is False and "slots" in bool_as_int["detail"]
@@ -628,6 +666,7 @@ def test_attach_mode_cross_target_parity_and_reports(tmp_path: Path) -> None:
             "--concurrency", "1,2",
             "--keepalive-requests", "5",
             "--disable-thinking",
+            "--allow-unsafe-python-exec",
             "--quiet",
             "--output-json", str(out_json),
             "--output-md", str(out_md),
@@ -836,6 +875,59 @@ def test_cli_validation_errors(tmp_path: Path) -> None:
     assert bps.main(["--target", "a=http://127.0.0.1:9", "--config", str(dummy_cfg), "--quiet"]) == 2
     # Unknown suite name
     assert bps.main(["--target", "a=http://127.0.0.1:9", "--suites", "nonexistent", "--quiet"]) == 2
+
+
+def test_parity_excludes_failed_probes_and_nonstreaming_suppresses_wall_decode_tps() -> None:
+    # Non-streaming fallback must NOT manufacture a wall_decode_tps from read() cleanup interval.
+    m = bps._finalize_stream_metrics(
+        ok=True,
+        http_status=200,
+        error=None,
+        ttft_s=None,
+        total_s=0.5,
+        token_chunks=1,
+        usage={"completion_tokens": 50, "prompt_tokens": 10},
+        raw_timings={},
+        content="hello",
+        reasoning="",
+        finish_reason="stop",
+        streamed=False,
+    )
+    assert m["wall_decode_tps"] is None
+    assert m["total_wall_tps"] == 100.0
+
+    # Two failed/empty probes must NOT count as a 100% exact match in cross-target parity.
+    t1 = {
+        "name": "prism",
+        "suites": {
+            "quality": {
+                "pass_rate_pct": 50.0,
+                "probes": [
+                    {"id": "p1", "category": "math", "request_ok": True, "passed": True, "clean_content": "42"},
+                    {"id": "p2", "category": "math", "request_ok": False, "passed": False, "clean_content": ""},
+                ],
+            }
+        },
+    }
+    t2 = {
+        "name": "sonder",
+        "suites": {
+            "quality": {
+                "pass_rate_pct": 50.0,
+                "probes": [
+                    {"id": "p1", "category": "math", "request_ok": True, "passed": True, "clean_content": "42"},
+                    {"id": "p2", "category": "math", "request_ok": False, "passed": False, "clean_content": ""},
+                ],
+            }
+        },
+    }
+    parity = bps.compute_cross_target_parity([t1, t2])
+    assert parity is not None
+    comp = parity["comparisons"][0]
+    assert comp["probes_compared"] == 1
+    assert comp["excluded_failed_count"] == 1
+    assert comp["exact_match_count"] == 1
+    assert comp["exact_match_pct"] == 100.0
 
 
 # ---------------------------------------------------------------------------

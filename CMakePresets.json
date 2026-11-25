@@ -109,7 +109,7 @@
         "SONDER_WITH_LLAMA_CPP": "ON",
         "GGML_HIP": "ON",
         "GGML_HIP_GRAPHS": "ON",
-        "AMDGPU_TARGETS": "gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1200;gfx1201"
+        "AMDGPU_TARGETS": "gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1200;gfx1201"
       }
     },
     {
@@ -167,7 +167,7 @@
         "SONDER_WITH_LLAMA_CPP": "ON",
         "GGML_HIP": "ON",
         "GGML_HIP_GRAPHS": "ON",
-        "AMDGPU_TARGETS": "gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1200;gfx1201"
+        "AMDGPU_TARGETS": "gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1200;gfx1201"
       }
     },
     {

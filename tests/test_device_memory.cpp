@@ -497,8 +497,49 @@ TEST_CASE("ROCm/KFD availability, visible-device filtering, and Windows AMD back
     CHECK_FALSE(is_rocm_device_visible(0, std::string_view("1"), std::string_view("1,2")));
     CHECK_FALSE(is_rocm_device_visible(1, std::string_view("1"), std::string_view("1,2")));
     CHECK(is_rocm_device_visible(2, std::string_view("1"), std::string_view("1,2")));
-    // ROCr UUID tokens stay permissive.
-    CHECK(is_rocm_device_visible(0, std::nullopt, std::string_view("GPU-0123456789abcdef")));
+    // Reordered ROCR_VISIBLE_DEVICES preserves mapped runtime ordinal: card 1 -> ROCm0, card 0 -> ROCm1.
+    CHECK(map_rocm_device_ordinal(1, std::nullopt, std::string_view("1,0")) == std::optional<std::size_t>(0));
+    CHECK(map_rocm_device_ordinal(0, std::nullopt, std::string_view("1,0")) == std::optional<std::size_t>(1));
+    // ROCr UUID tokens fail closed without a matching device UUID and match only the named card.
+    CHECK_FALSE(is_rocm_device_visible(0, std::nullopt, std::string_view("GPU-0123456789abcdef")));
+    CHECK_FALSE(is_rocm_device_visible(1, std::nullopt, std::string_view("GPU-0123456789abcdef"),
+                                       std::string_view("GPU-fedcba9876543210")));
+    CHECK(map_rocm_device_ordinal(1, std::nullopt, std::string_view("GPU-0123456789abcdef"),
+                                  std::string_view("GPU-0123456789abcdef")) == std::optional<std::size_t>(0));
+
+    // Windows mixed WDDM + TCC NVIDIA enumeration merges TCC adapters without duplicating WDDM cards.
+    {
+        GpuDeviceInfo dxgi_wddm;
+        dxgi_wddm.id = "gpu:0";
+        dxgi_wddm.name = "NVIDIA GeForce RTX 5070 Ti";
+        dxgi_wddm.vendor = GpuVendor::nvidia;
+        dxgi_wddm.vendor_id = 0x10DEu;
+        dxgi_wddm.device_id = 0x2C05u;
+        dxgi_wddm.source = "dxgi";
+
+        GpuDeviceInfo nvml_wddm = dxgi_wddm;
+        nvml_wddm.source = "nvml";
+        nvml_wddm.pci_bus_id = "0000:01:00.0";
+        nvml_wddm.is_tcc_mode = false;
+
+        GpuDeviceInfo nvml_tcc;
+        nvml_tcc.name = "NVIDIA L40S";
+        nvml_tcc.vendor = GpuVendor::nvidia;
+        nvml_tcc.vendor_id = 0x10DEu;
+        nvml_tcc.device_id = 0x26B9u;
+        nvml_tcc.pci_bus_id = "0000:02:00.0";
+        nvml_tcc.is_tcc_mode = true;
+        nvml_tcc.backend_hint = "cuda";
+        nvml_tcc.source = "nvml";
+
+        std::vector<GpuDeviceInfo> merged{dxgi_wddm};
+        merge_win32_nvml_devices(merged, {nvml_wddm, nvml_tcc});
+        REQUIRE(merged.size() == 2u);
+        CHECK(merged[0].source == "dxgi");
+        CHECK(merged[0].pci_bus_id == "0000:01:00.0");
+        CHECK(merged[1].name == "NVIDIA L40S");
+        CHECK(merged[1].is_tcc_mode);
+    }
 
     // 3. Windows GPU backend hint matrix (NVIDIA, AMD discrete w/ and w/o HIP SDK, AMD Ryzen iGPU UMA).
     CHECK(resolve_windows_gpu_backend_hint(GpuVendor::nvidia, false, false) == "cuda");

@@ -220,6 +220,7 @@
       "seed": 42,
       "grader": {
         "type": "json_schema",
+        "exact_keys": true,
         "required_keys": {
           "vendor": "str",
           "device_name": "str",
@@ -229,8 +230,10 @@
         },
         "expected_values": {
           "vendor": "nvidia",
+          "device_name": "NVIDIA GeForce RTX 5070 Ti",
           "vram_mib": 16384,
-          "is_uma": false
+          "is_uma": false,
+          "backends": ["cuda", "vulkan"]
         }
       },
       "reference_answer": "{\"vendor\":\"nvidia\",\"device_name\":\"NVIDIA GeForce RTX 5070 Ti\",\"vram_mib\":16384,\"is_uma\":false,\"backends\":[\"cuda\",\"vulkan\"]}"
@@ -247,6 +250,7 @@
       "seed": 42,
       "grader": {
         "type": "json_schema",
+        "exact_keys": true,
         "required_keys": {
           "model_id": "str",
           "quantization": "str",
@@ -276,6 +280,7 @@
       "seed": 42,
       "grader": {
         "type": "json_schema",
+        "exact_keys": true,
         "required_keys": {
           "run_id": "str",
           "concurrency": "int",
@@ -286,7 +291,9 @@
         "expected_values": {
           "run_id": "w1-h2h-0042",
           "concurrency": 4,
-          "all_passed": true
+          "ttft_p95_ms": 41.5,
+          "all_passed": true,
+          "suites": ["prefill", "decode", "quality"]
         }
       },
       "reference_answer": "{\"run_id\":\"w1-h2h-0042\",\"concurrency\":4,\"ttft_p95_ms\":41.5,\"all_passed\":true,\"suites\":[\"prefill\",\"decode\",\"quality\"]}"

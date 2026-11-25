@@ -324,6 +324,33 @@ Result<EmbedResult> Session::embed(const std::vector<std::string>& inputs, const
                                    : make_id("req");
     TelemetryBus& bus = engine_.telemetry();
     const auto ctx = telemetry_context(req_id);
+    const auto recover_embed = [&]() noexcept {
+        try {
+            bus.emit("request.failed", ctx,
+                     json::Object{{"kind", "embed"}, {"error_code", to_string(ErrorCode::internal)}},
+                     TelemetryLevel::metrics);
+        } catch (...) {
+        }
+        try {
+            std::lock_guard<std::mutex> lock(mutex_);
+            active_cancel_.reset();
+            cancel_requested_ns_.store(0);
+            last_outcome_ = RequestOutcome::failed;
+            last_scheduler_rejected_ = false;
+            if (state_ == SessionState::running) {
+                state_ = SessionState::idle;
+            }
+        } catch (...) {
+        }
+    };
+    struct EmbedFailureGuard {
+        const decltype(recover_embed)& recover;
+        bool armed = false;
+        ~EmbedFailureGuard() noexcept {
+            if (armed) recover();
+        }
+    } failure_guard{recover_embed};
+
     CancellationToken token;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -338,9 +365,11 @@ Result<EmbedResult> Session::embed(const std::vector<std::string>& inputs, const
         state_ = SessionState::running;
         cancel_requested_ns_.store(0);
         ++requests_started_;
+        failure_guard.armed = true;
     }
 
     auto finish_state = [&](RequestOutcome outcome) {
+        failure_guard.armed = false;
         std::lock_guard<std::mutex> lock(mutex_);
         active_cancel_.reset();
         cancel_requested_ns_.store(0);
@@ -356,11 +385,28 @@ Result<EmbedResult> Session::embed(const std::vector<std::string>& inputs, const
              json::Object{{"kind", "embed"}, {"inputs", static_cast<std::uint64_t>(inputs.size())}},
              TelemetryLevel::metrics);
 
+    if (request_options.admission) {
+        Status st = request_options.admission->wait(token);
+        if (!st.ok()) {
+            const bool cancelled = token.cancelled() || st.code() == ErrorCode::cancelled;
+            finish_state(cancelled ? RequestOutcome::cancelled : RequestOutcome::failed);
+            bus.emit(cancelled ? "request.cancelled" : "request.failed", ctx,
+                     json::Object{{"kind", "embed"}, {"error_code", to_string(st.code())}},
+                     TelemetryLevel::metrics);
+            return st;
+        }
+    }
+
     if (request_options.deadline && std::chrono::steady_clock::now() >= *request_options.deadline) {
         finish_state(RequestOutcome::failed);
         bus.emit("request.failed", ctx, json::Object{{"kind", "embed"}, {"error_code", to_string(ErrorCode::timeout)}},
                  TelemetryLevel::metrics);
         return Status(ErrorCode::timeout, "request deadline exceeded before backend start");
+    }
+    if (token.cancelled()) {
+        finish_state(RequestOutcome::cancelled);
+        bus.emit("request.cancelled", ctx, json::Object{{"kind", "embed"}}, TelemetryLevel::metrics);
+        return Status(ErrorCode::cancelled, "cancelled before backend start");
     }
     if (request_options.on_backend_start) {
         request_options.on_backend_start();

@@ -20,6 +20,23 @@ constexpr std::size_t kMaxSchemaDepth = 32;
 constexpr std::size_t kMaxGrammarBytes = 256u * 1024u;
 constexpr std::size_t kMaxRules = 1024;
 constexpr std::size_t kMaxUnrolledBounds = 32;
+constexpr std::size_t kMaxSchemaNodes = 2048;
+
+bool is_supported_schema_keyword(std::string_view key) noexcept {
+    // Functional keywords enforced by the converter:
+    if (key == "$ref" || key == "$defs" || key == "definitions" || key == "type" || key == "const" || key == "enum" ||
+        key == "anyOf" || key == "properties" || key == "required" || key == "additionalProperties" || key == "items" ||
+        key == "minLength" || key == "maxLength" || key == "minItems" || key == "maxItems") {
+        return true;
+    }
+    // Non-validating JSON Schema annotation/metadata keywords:
+    if (key == "$schema" || key == "$id" || key == "$anchor" || key == "$comment" || key == "title" ||
+        key == "description" || key == "default" || key == "examples" || key == "readOnly" || key == "writeOnly" ||
+        key == "deprecated") {
+        return true;
+    }
+    return false;
+}
 
 const char* const kCommonRules =
     "space ::= | \" \" | \"\\n\" [ \\t]{0,20}\n"
@@ -129,7 +146,8 @@ public:
 
 private:
     std::string alloc_rule_name(std::string_view hint) {
-        std::string base = sanitize_rule_name(hint);
+        const std::string_view short_hint = hint.size() > 24 ? hint.substr(0, 24) : hint;
+        std::string base = sanitize_rule_name(short_hint);
         if (base == "root" || base == "space" || base == "string" || base == "char" || base == "integer" ||
             base == "number" || base == "boolean" || base == "null" || base == "value" || base == "object" ||
             base == "array") {
@@ -141,6 +159,10 @@ private:
         }
         used_names_.insert(candidate);
         return candidate;
+    }
+
+    std::string next_hint(std::string_view tag) {
+        return std::string(tag) + "-" + std::to_string(++hint_counter_);
     }
 
     Result<std::string> add_rule(std::string_view hint, std::string expr) {
@@ -204,6 +226,9 @@ private:
     }
 
     Result<std::string> build_node(const json::Value& schema, std::string_view hint, std::size_t depth) {
+        if (++node_visits_ > kMaxSchemaNodes) {
+            return Status(ErrorCode::invalid_argument, "JSON schema traversal exceeds maximum complexity budget");
+        }
         if (depth > kMaxSchemaDepth) {
             return Status(ErrorCode::invalid_argument, "JSON schema nesting exceeds maximum depth");
         }
@@ -215,6 +240,15 @@ private:
         }
         if (!schema.is_object()) {
             return Status(ErrorCode::invalid_argument, "JSON schema node must be an object or boolean");
+        }
+
+        // Fail closed on any validation keyword this GBNF converter cannot faithfully enforce.
+        for (const auto& [k, v] : schema.as_object()) {
+            (void)v;
+            if (!is_supported_schema_keyword(k)) {
+                return Status(ErrorCode::invalid_argument,
+                              "unsupported JSON schema validation keyword '" + k + "'");
+            }
         }
 
         if (const json::Value* ref = schema.find("$ref"); ref != nullptr) {
@@ -277,29 +311,26 @@ private:
             return expr;
         }
 
-        for (const char* comb : {"anyOf", "oneOf"}) {
-            if (const json::Value* alts = schema.find(comb); alts != nullptr) {
-                if (!alts->is_array() || alts->as_array().empty()) {
-                    return Status(ErrorCode::invalid_argument, std::string(comb) + " must be a non-empty array");
-                }
-                std::string expr = "(";
-                bool first = true;
-                std::size_t idx = 0;
-                for (const auto& branch : alts->as_array()) {
-                    auto built = build_node(branch, std::string(hint) + "-" + std::to_string(idx++), depth + 1);
-                    if (!built.ok()) {
-                        return built.status();
-                    }
-                    if (!first) expr += " | ";
-                    first = false;
-                    expr += "(" + built.value() + ")";
-                    if (expr.size() + grammar_bytes_ > kMaxGrammarBytes) {
-                        return Status(ErrorCode::invalid_argument, "generated GBNF grammar exceeds maximum size");
-                    }
-                }
-                expr += ")";
-                return expr;
+        if (const json::Value* alts = schema.find("anyOf"); alts != nullptr) {
+            if (!alts->is_array() || alts->as_array().empty()) {
+                return Status(ErrorCode::invalid_argument, "anyOf must be a non-empty array");
             }
+            std::string expr = "(";
+            bool first = true;
+            for (const auto& branch : alts->as_array()) {
+                auto built = build_node(branch, next_hint("alt"), depth + 1);
+                if (!built.ok()) {
+                    return built.status();
+                }
+                if (!first) expr += " | ";
+                first = false;
+                expr += "(" + built.value() + ")";
+                if (expr.size() + grammar_bytes_ > kMaxGrammarBytes) {
+                    return Status(ErrorCode::invalid_argument, "generated GBNF grammar exceeds maximum size");
+                }
+            }
+            expr += ")";
+            return expr;
         }
 
         const json::Value* type_v = schema.find("type");
@@ -341,8 +372,11 @@ private:
         } else if (schema.find("properties") != nullptr || schema.find("additionalProperties") != nullptr ||
                    schema.find("required") != nullptr) {
             type_name = "object";
-        } else if (schema.find("items") != nullptr) {
+        } else if (schema.find("items") != nullptr || schema.find("minItems") != nullptr ||
+                   schema.find("maxItems") != nullptr) {
             type_name = "array";
+        } else if (schema.find("minLength") != nullptr || schema.find("maxLength") != nullptr) {
+            type_name = "string";
         } else {
             return std::string("value");
         }
@@ -404,17 +438,21 @@ private:
             rep += "}";
             return "\"\\\"\" " + rep + " \"\\\"\" space";
         }
-        return std::string("string");
+        return Status(ErrorCode::invalid_argument,
+                      "minLength/maxLength above " + std::to_string(kMaxUnrolledBounds) +
+                          " is not supported by GBNF conversion");
     }
 
     Result<std::string> build_array(const json::Value& schema, std::string_view hint, std::size_t depth) {
+        (void)hint;
         std::string item_rule = "value";
         if (const json::Value* items = schema.find("items"); items != nullptr) {
-            auto built = build_node(*items, std::string(hint) + "-item", depth + 1);
+            const std::string item_hint = next_hint("item");
+            auto built = build_node(*items, item_hint, depth + 1);
             if (!built.ok()) {
                 return built.status();
             }
-            auto named = add_rule(std::string(hint) + "-item", std::move(built).value());
+            auto named = add_rule(item_hint, std::move(built).value());
             if (!named.ok()) {
                 return named.status();
             }
@@ -467,18 +505,18 @@ private:
             }
             return "\"[\" space " + body + " \"]\" space";
         }
-        // Fallback for large bounds: non-empty if min_items > 0, else arbitrary.
-        if (min_items > 0) {
-            return "\"[\" space " + item_rule + " (\",\" space " + item_rule + ")* \"]\" space";
-        }
-        return "\"[\" space ( " + item_rule + " (\",\" space " + item_rule + ")* )? \"]\" space";
+        return Status(ErrorCode::invalid_argument,
+                      "minItems/maxItems above " + std::to_string(kMaxUnrolledBounds) +
+                          " is not supported by GBNF conversion");
     }
 
     Result<std::string> build_object(const json::Value& schema, std::string_view hint, std::size_t depth) {
+        (void)hint;
         const json::Value* props_v = schema.find("properties");
         if (props_v != nullptr && !props_v->is_object()) {
             return Status(ErrorCode::invalid_argument, "properties must be an object");
         }
+        const bool has_declared_props = (props_v != nullptr && !props_v->as_object().empty());
         std::set<std::string> required_set;
         if (const json::Value* req_v = schema.find("required"); req_v != nullptr) {
             if (!req_v->is_array()) {
@@ -492,19 +530,20 @@ private:
             }
         }
 
-        // additionalProperties: default true when no properties are declared, false if explicitly false.
-        bool allow_additional = (props_v == nullptr || props_v->as_object().empty());
+        // additionalProperties: default true only when no properties are declared.
+        bool allow_additional = !has_declared_props;
         std::string additional_val_rule = "value";
         if (const json::Value* ap = schema.find("additionalProperties"); ap != nullptr) {
             if (ap->is_bool()) {
                 allow_additional = ap->as_bool();
             } else if (ap->is_object()) {
                 allow_additional = true;
-                auto built = build_node(*ap, std::string(hint) + "-extra", depth + 1);
+                const std::string extra_hint = next_hint("extra");
+                auto built = build_node(*ap, extra_hint, depth + 1);
                 if (!built.ok()) {
                     return built.status();
                 }
-                auto named = add_rule(std::string(hint) + "-extra", std::move(built).value());
+                auto named = add_rule(extra_hint, std::move(built).value());
                 if (!named.ok()) {
                     return named.status();
                 }
@@ -514,7 +553,16 @@ private:
             }
         }
 
-        if (props_v == nullptr || props_v->as_object().empty()) {
+        // GBNF cannot express "any string EXCEPT declared property names" cleanly without
+        // exponential negation; fail closed instead of letting generic additionalProperties
+        // bypass a declared property's schema.
+        if (has_declared_props && allow_additional) {
+            return Status(ErrorCode::invalid_argument,
+                          "combining declared properties with permissive additionalProperties is not supported by "
+                          "GBNF conversion; set additionalProperties to false");
+        }
+
+        if (!has_declared_props && required_set.empty()) {
             if (!allow_additional) {
                 return std::string("\"{\" space \"}\" space");
             }
@@ -528,22 +576,25 @@ private:
         std::vector<std::string> req_rules;
         std::vector<std::string> opt_rules;
         std::set<std::string> seen_props;
-        for (const auto& [prop_name, prop_schema] : props_v->as_object()) {
-            seen_props.insert(prop_name);
-            auto val_expr = build_node(prop_schema, std::string(hint) + "-" + prop_name, depth + 1);
-            if (!val_expr.ok()) {
-                return val_expr.status();
-            }
-            const std::string key_json = json::Value(prop_name).dump();
-            const std::string kv_expr = gbnf_literal(key_json) + " space \":\" space (" + val_expr.value() + ")";
-            auto kv_rule = add_rule(std::string(hint) + "-" + prop_name + "-kv", kv_expr);
-            if (!kv_rule.ok()) {
-                return kv_rule.status();
-            }
-            if (required_set.count(prop_name) != 0) {
-                req_rules.push_back(std::move(kv_rule).value());
-            } else {
-                opt_rules.push_back(std::move(kv_rule).value());
+        if (has_declared_props) {
+            for (const auto& [prop_name, prop_schema] : props_v->as_object()) {
+                seen_props.insert(prop_name);
+                const std::string prop_hint = next_hint("prop");
+                auto val_expr = build_node(prop_schema, prop_hint, depth + 1);
+                if (!val_expr.ok()) {
+                    return val_expr.status();
+                }
+                const std::string key_json = json::Value(prop_name).dump();
+                const std::string kv_expr = gbnf_literal(key_json) + " space \":\" space (" + val_expr.value() + ")";
+                auto kv_rule = add_rule(next_hint("kv"), kv_expr);
+                if (!kv_rule.ok()) {
+                    return kv_rule.status();
+                }
+                if (required_set.count(prop_name) != 0) {
+                    req_rules.push_back(std::move(kv_rule).value());
+                } else {
+                    opt_rules.push_back(std::move(kv_rule).value());
+                }
             }
         }
         // Honor any `required` keys not explicitly listed under `properties`.
@@ -555,7 +606,7 @@ private:
             }
             const std::string key_json = json::Value(req_name).dump();
             const std::string kv_expr = gbnf_literal(key_json) + " space \":\" space (" + additional_val_rule + ")";
-            auto kv_rule = add_rule(std::string(hint) + "-" + req_name + "-kv", kv_expr);
+            auto kv_rule = add_rule(next_hint("kv"), kv_expr);
             if (!kv_rule.ok()) {
                 return kv_rule.status();
             }
@@ -564,7 +615,7 @@ private:
 
         std::string extra_kv_rule;
         if (allow_additional) {
-            auto kv = add_rule(std::string(hint) + "-additional-kv", "string \":\" space " + additional_val_rule);
+            auto kv = add_rule(next_hint("extra-kv"), "string \":\" space " + additional_val_rule);
             if (!kv.ok()) {
                 return kv.status();
             }
@@ -615,7 +666,7 @@ private:
             }
         }
         obj += " \"}\" space";
-        auto named = add_rule(std::string(hint) + "-obj", std::move(obj));
+        auto named = add_rule(next_hint("obj"), std::move(obj));
         if (!named.ok()) {
             return named.status();
         }
@@ -630,6 +681,8 @@ private:
     std::size_t reserved_rules_ = 0;
     std::size_t grammar_bytes_ = 0;
     std::size_t counter_ = 0;
+    std::size_t hint_counter_ = 0;
+    std::size_t node_visits_ = 0;
 };
 
 }  // namespace

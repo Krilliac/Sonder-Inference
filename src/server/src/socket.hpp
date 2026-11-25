@@ -122,8 +122,9 @@ long long recv_some(native_socket s, char* buf, std::size_t len);
 Status send_all(native_socket s, std::string_view data, std::chrono::milliseconds stall_timeout,
                 const std::atomic<bool>* stop);
 
-// True when the peer closed or reset the connection. Discards (bounded)
-// unexpected bytes the client sent after its request. Never blocks.
+// True when the peer closed or reset the connection (checked via poll/WSAPoll
+// HUP/RDHUP/ERR plus non-destructive MSG_PEEK so pipelined bytes stay intact).
+// Never blocks.
 bool peer_gone(native_socket s);
 
 // Blocking-with-timeout client connect (used by tests and diagnostics).

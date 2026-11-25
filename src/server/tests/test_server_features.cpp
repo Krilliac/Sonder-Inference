@@ -105,7 +105,7 @@ struct CapturingBackend final : si::Backend {
     std::string name() const override { return "capture-test"; }
     std::string description() const override { return "capturing test backend without embeddings/tokenization"; }
     si::BackendCapabilities capabilities() const override {
-        return si::BackendCapabilities{}.add(si::Capability::streaming);
+        return si::BackendCapabilities{}.add(si::Capability::streaming).add(si::Capability::structured_output);
     }
     si::Result<std::string> probe() override { return std::string("capture-1"); }
     si::Result<std::vector<si::ModelDescriptor>> list_models() override {
@@ -186,6 +186,71 @@ TEST_CASE("json_schema_gbnf: json_object_gbnf and primitive/object/array/enum/re
     const auto bad_ref = json::parse(R"({"$ref": "#/$defs/Missing"})");
     REQUIRE(bad_ref.ok());
     CHECK_FALSE(det::json_schema_to_gbnf(bad_ref.value()).ok());
+
+    // Bounds boundary: 32 accepted, 33 rejected (never silently dropped).
+    {
+        const auto s32 = json::parse(R"({"type":"string","minLength":32,"maxLength":32})");
+        const auto s33 = json::parse(R"({"type":"string","minLength":33})");
+        const auto a32 = json::parse(R"({"type":"array","items":{"type":"integer"},"minItems":32,"maxItems":32})");
+        const auto a33 = json::parse(R"({"type":"array","items":{"type":"integer"},"maxItems":33})");
+        REQUIRE((s32.ok() && s33.ok() && a32.ok() && a33.ok()));
+        CHECK(det::json_schema_to_gbnf(s32.value()).ok());
+        CHECK_FALSE(det::json_schema_to_gbnf(s33.value()).ok());
+        CHECK(det::json_schema_to_gbnf(a32.value()).ok());
+        CHECK_FALSE(det::json_schema_to_gbnf(a33.value()).ok());
+    }
+
+    // Fail closed on unenforceable validation keywords & oneOf; allow metadata annotations.
+    {
+        for (const char* bad_json : {
+                 R"({"oneOf":[{"type":"string"},{"type":"integer"}]})",
+                 R"({"type":"string","pattern":"^[a-z]+$"})",
+                 R"({"type":"integer","minimum":0,"maximum":10})",
+                 R"({"allOf":[{"type":"object"}]})",
+                 R"({"type":"array","uniqueItems":true})",
+                 R"({"type":"object","properties":{"role":{"const":"admin"}},"additionalProperties":true})",
+             }) {
+            const auto v = json::parse(bad_json);
+            REQUIRE(v.ok());
+            CHECK_FALSE(det::json_schema_to_gbnf(v.value()).ok());
+        }
+        const auto annotated = json::parse(R"({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Sample",
+            "description": "Metadata annotations are permitted",
+            "type": "object",
+            "properties": {"ok": {"type": "boolean", "default": true}},
+            "required": ["ok"],
+            "additionalProperties": false
+        })");
+        REQUIRE(annotated.ok());
+        CHECK(det::json_schema_to_gbnf(annotated.value()).ok());
+    }
+
+    // Required keys without `properties` must still enforce the required key (not shortcut to `{}` / `object`).
+    {
+        const auto req_only = json::parse(R"({"type":"object","required":["id"]})");
+        REQUIRE(req_only.ok());
+        const auto g = det::json_schema_to_gbnf(req_only.value());
+        REQUIRE_MESSAGE(g.ok(), g.status().message());
+        CHECK(g.value().find("\\\"id\\\"") != std::string::npos);
+    }
+
+    // Long property names + wide anyOf must stay O(1) in generated rule-name length.
+    {
+        std::string long_key(2000, 'a');
+        std::string alts;
+        for (int i = 0; i < 64; ++i) {
+            if (i > 0) alts += ",";
+            alts += R"({"const":)" + std::to_string(i) + "}";
+        }
+        const auto wide = json::parse(R"({"type":"object","properties":{")" + long_key + R"(":{"anyOf":[)" + alts +
+                                      R"(]}},"required":[")" + long_key + R"("],"additionalProperties":false})");
+        REQUIRE(wide.ok());
+        const auto g = det::json_schema_to_gbnf(wide.value());
+        REQUIRE_MESSAGE(g.ok(), g.status().message());
+        CHECK(g.value().size() < 8192u);
+    }
 }
 
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
@@ -449,6 +514,141 @@ TEST_CASE("chat response_format: text, json_object, json_schema and grammar wiri
         CHECK(r.status == 400);
         CHECK(r.json().find("error")->find("code")->as_string() == "invalid_request");
     }
+    // Backend without Capability::structured_output (e.g. mock) rejects constrained requests cleanly (400).
+    {
+        Fixture mock_fix;
+        const Reply r_chat = post(
+            mock_fix.port, "/v1/chat/completions",
+            R"({"messages":[{"role":"user","content":"json"}],"response_format":{"type":"json_object"}})");
+        CHECK(r_chat.status == 400);
+        CHECK(r_chat.json().find("error")->find("code")->as_string() == "unsupported_parameter");
+        const Reply r_cmpl = post(
+            mock_fix.port, "/v1/completions",
+            R"({"prompt":"hi","grammar":"root ::= \"ok\""})");
+        CHECK(r_cmpl.status == 400);
+        CHECK(r_cmpl.json().find("error")->find("code")->as_string() == "unsupported_parameter");
+    }
+}
+
+TEST_CASE("embeddings: respects priority admission capacity and recovers session on backend exception") {
+    // 1. Capacity=1 admission test: an in-flight chat holds the sole permit;
+    //    /v1/embeddings MUST wait until chat releases the permit (never bypass!).
+    struct GatedEmbedBackend final : si::Backend {
+        struct Model final : si::BackendModel {
+            si::ModelDescriptor desc;
+            std::atomic<bool> chat_entered{false};
+            std::atomic<bool> release_chat{false};
+            std::atomic<bool> embed_entered_while_chat_active{false};
+            std::atomic<bool> throw_on_embed{false};
+            std::atomic<bool> chat_active{false};
+
+            Model() {
+                desc.name = "gated:test";
+                desc.backend = "gated-test";
+                desc.context_length = 4096;
+            }
+            const si::ModelDescriptor& descriptor() const override { return desc; }
+            bool has_native_chat() const override { return true; }
+
+            si::Result<si::GenerateStats> generate(const si::GenerateRequest&, const si::CancellationToken&,
+                                                   const si::TokenCallback&) override {
+                return si::GenerateStats{};
+            }
+            si::Result<si::GenerateStats> chat(const si::ChatRequest&, const si::CancellationToken& cancel,
+                                               const si::TokenCallback& on_chunk) override {
+                chat_active.store(true);
+                chat_entered.store(true);
+                while (!release_chat.load() && !cancel.cancelled()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                chat_active.store(false);
+                if (on_chunk) (void)on_chunk(si::TokenChunk{"ok", 0});
+                si::GenerateStats st;
+                st.prompt_tokens = 2;
+                st.completion_tokens = 1;
+                st.chunks = 1;
+                st.token_counts_from_backend = true;
+                st.stop_reason = si::StopReason::end_of_sequence;
+                return st;
+            }
+            si::Result<si::EmbedResult> embed(const si::EmbedRequest& req, const si::CancellationToken&) override {
+                if (throw_on_embed.load()) {
+                    throw std::runtime_error("simulated embed backend exception");
+                }
+                if (chat_active.load()) {
+                    embed_entered_while_chat_active.store(true);
+                }
+                si::EmbedResult out;
+                out.prompt_tokens = static_cast<std::uint64_t>(req.inputs.size());
+                out.embeddings.assign(req.inputs.size(), std::vector<float>{0.5f, 0.5f});
+                return out;
+            }
+        };
+
+        std::shared_ptr<Model> model = std::make_shared<Model>();
+        std::string name() const override { return "gated-test"; }
+        std::string description() const override { return "gated admission test backend"; }
+        si::BackendCapabilities capabilities() const override {
+            return si::BackendCapabilities{}.add(si::Capability::streaming).add(si::Capability::embeddings);
+        }
+        std::size_t max_concurrent_requests() const override { return 1; }
+        si::Result<std::string> probe() override { return std::string("gated-1"); }
+        si::Result<std::vector<si::ModelDescriptor>> list_models() override {
+            return std::vector<si::ModelDescriptor>{model->descriptor()};
+        }
+        si::Result<std::shared_ptr<si::BackendModel>> load_model(const si::ModelLoadOptions&) override {
+            return std::static_pointer_cast<si::BackendModel>(model);
+        }
+    };
+
+    auto be = std::make_shared<GatedEmbedBackend>();
+    auto o = Fixture::defaults();
+    o.models = {"gated:test"};
+    o.backend.backend.clear();
+    o.backend_instance = be;
+    o.priority_admission = srv::PriorityAdmissionPolicy::on;
+    o.backend_capacity = 1;
+    Fixture f(o);
+
+    Reply chat_reply;
+    std::thread t_chat([&] {
+        chat_reply = post(f.port, "/v1/chat/completions", R"({"messages":[{"role":"user","content":"hold"}]})");
+    });
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!be->model->chat_entered.load() && std::chrono::steady_clock::now() < wait_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    REQUIRE(be->model->chat_entered.load());
+
+    Reply embed_reply;
+    std::thread t_embed([&] { embed_reply = post(f.port, "/v1/embeddings", R"({"input":"queued"})"); });
+    // Give /v1/embeddings time to queue behind the occupied permit.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK_FALSE(be->model->embed_entered_while_chat_active.load());
+
+    be->model->release_chat.store(true);
+    t_chat.join();
+    t_embed.join();
+    REQUIRE_MESSAGE(chat_reply.status == 200, chat_reply.body);
+    REQUIRE_MESSAGE(embed_reply.status == 200, embed_reply.body);
+    CHECK_FALSE(be->model->embed_entered_while_chat_active.load());
+
+    // 2. Session::embed() throwing backend must recover SessionState::idle (never wedge in running).
+    si::EngineOptions eo;
+    eo.scheduling.enabled = false;
+    si::Engine engine(eo);
+    REQUIRE(engine.register_backend(be).ok());
+    auto loaded = engine.load_model("gated-test", si::ModelLoadOptions{"gated:test", "cpu:0"});
+    REQUIRE(loaded.ok());
+    auto sess = engine.create_session(loaded.value());
+    REQUIRE(sess.ok());
+    be->model->throw_on_embed.store(true);
+    CHECK_THROWS_AS((void)sess.value()->embed({"boom"}), std::runtime_error);
+    CHECK(sess.value()->state() == si::SessionState::idle);
+    be->model->throw_on_embed.store(false);
+    auto ok_after = sess.value()->embed({"recovered"});
+    REQUIRE_MESSAGE(ok_after.ok(), ok_after.status().message());
+    CHECK(ok_after.value().embeddings.size() == 1u);
 }
 
 // ================================================================= HTTP/1.1 Keep-Alive
@@ -557,4 +757,39 @@ TEST_CASE("http keep-alive: streaming SSE forces Connection: close and keep_aliv
         CHECK(r.header("connection") == "close");
         CHECK(c.closed());
     }
+}
+
+TEST_CASE("socket peer_gone: preserves live pipelined byte and detects peer FIN") {
+    bool in_use = false;
+    auto listener = det::listen_tcp("127.0.0.1", 0, in_use);
+    REQUIRE(listener.ok());
+    const std::uint16_t port = listener.value().port;
+
+    auto client = det::connect_tcp("127.0.0.1", port, std::chrono::milliseconds(2000));
+    REQUIRE(client.ok());
+    std::atomic<bool> stop{false};
+    REQUIRE(det::wait_socket(listener.value().socket.get(), false, std::chrono::milliseconds(2000), &stop) ==
+            det::WaitResult::ready);
+    auto accepted = det::accept_client(listener.value().socket);
+    REQUIRE(accepted.status == det::AcceptStatus::accepted);
+
+    // Live connection with a buffered pipelined byte: peer_gone() must return false
+    // and leave the byte intact in the kernel receive buffer.
+    const std::string pipelined = "G";
+    REQUIRE(det::send_all(client.value().get(), pipelined, std::chrono::milliseconds(1000), &stop).ok());
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK_FALSE(det::peer_gone(accepted.socket.get()));
+
+    // Peer sends FIN while that pipelined byte is still unread.
+    client.value().shutdown_write();
+    client.value().close();
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+#if defined(__linux__)
+    CHECK(det::peer_gone(accepted.socket.get()));
+#endif
+    // Drain the 1 pipelined byte; now peer_gone() MUST detect EOF on every OS.
+    char ch = 0;
+    CHECK(det::recv_some(accepted.socket.get(), &ch, 1) == 1);
+    CHECK(ch == 'G');
+    CHECK(det::peer_gone(accepted.socket.get()));
 }

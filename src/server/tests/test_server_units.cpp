@@ -1602,8 +1602,13 @@ TEST_CASE("identity: llamacpp GGUF handles non-ASCII UTF-8 filenames cleanly") {
     TempGgufDir utf8_dir;
     const std::string utf8_name = "sonder-caf\xC3\xA9-\xE6\xA8\xA1\xE5\x9E\x8B.gguf";
     const std::string chat_template = "{% for m in messages %}{{ m.content }}{% endfor %}";
-    const std::string bytes =
-        build_complete_synthetic_gguf({"<s>", "utf8", "path", "</s>"}, chat_template, "utf8-payload");
+    std::vector<std::string> vocab;
+    vocab.reserve(4);
+    vocab.emplace_back("<s>");
+    vocab.emplace_back("utf8");
+    vocab.emplace_back("path");
+    vocab.emplace_back("</s>");
+    const std::string bytes = build_complete_synthetic_gguf(vocab, chat_template, "utf8-payload");
     const std::string utf8_path = utf8_dir.write_file(utf8_name, bytes);
 
     const auto parsed = read_gguf_model_info(utf8_path);

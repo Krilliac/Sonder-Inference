@@ -212,6 +212,11 @@ struct Server::Impl {
 
     // ------------------------------------------------------------ routes
 
+    bool backend_has_capability(Capability cap) {
+        std::lock_guard<std::mutex> lock(engine_mu);
+        return backend && backend->capabilities().has(cap);
+    }
+
     bool require_ready(Exchange& ex) {
         const State s = state.load();
         if (s == State::ready) {
@@ -373,6 +378,14 @@ struct Server::Impl {
             return;
         }
         const ModelResidency::Pin pin = std::move(pinned).value();
+        if ((job.response_format_type.has_value() || !job.grammar.empty()) &&
+            !backend_has_capability(Capability::structured_output)) {
+            write_error(ex,
+                        make_error(400, "unsupported_parameter",
+                                   "backend '" + pin.backend() + "' does not support structured output / grammar constraints",
+                                   job.response_format_type ? "response_format" : "grammar"));
+            return;
+        }
         // Launch profile defaults fill only the fields the request left unset
         // (both chat protocols; "default" resolves to the served id first).
         if (const ModelProfileBinding* binding = find_profile_binding(opts, *served_id)) {
@@ -477,6 +490,12 @@ struct Server::Impl {
             return;
         }
         const ModelResidency::Pin pin = std::move(pinned).value();
+        if (!job.grammar.empty() && !backend_has_capability(Capability::structured_output)) {
+            write_error(ex, make_error(400, "unsupported_parameter",
+                                       "backend '" + pin.backend() + "' does not support grammar constraints",
+                                       "grammar"));
+            return;
+        }
         if (const ModelProfileBinding* binding = find_profile_binding(opts, *served_id)) {
             apply_sampling_defaults(binding->sampling_defaults, job.sampling);
         }
@@ -844,8 +863,9 @@ struct Server::Impl {
             access_log(ex);
 
             const bool continue_alive = ex.keep_alive && !stopping.load() && !hard_stop.load() &&
-                                        ex.unread_input == 0 && !ex.write_failed && !flags.streaming.load() &&
-                                        ex.status != 499 && requests_on_conn < opts.max_keep_alive_requests;
+                                        !flags.evict.load() && ex.unread_input == 0 && !ex.write_failed &&
+                                        !flags.streaming.load() && ex.status != 499 &&
+                                        requests_on_conn < opts.max_keep_alive_requests;
             if (!continue_alive) {
                 // Let the peer read everything before the socket closes.
                 sock.shutdown_write();
