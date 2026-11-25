@@ -529,6 +529,61 @@ TEST_CASE("queued deadlines return 504 without starting the backend") {
     finish_and_join(*control, first);
 }
 
+TEST_CASE("queued scheduler deadlines report request.failed rather than racing into request.cancelled") {
+    auto control = std::make_shared<SlowControl>();
+    auto backend = std::make_shared<SlowBackend>(control, 1);
+    auto options = options_for(backend, srv::SchedulerPolicy::account);
+    options.priority_admission = srv::PriorityAdmissionPolicy::on;
+    Fixture fixture(std::move(options));
+    auto first = launch(fixture.port, control, request_body("first"));
+    REQUIRE(control->wait_for_starts(1));
+
+    const auto expired_chat = post(fixture.port, "/v1/chat/completions",
+                                   request_body("expired-chat", false, R"(,"deadline_ms":60)"),
+                                   {{"X-Sonder-Run-Id", "chat-sched-deadline"}});
+    CHECK(expired_chat.status == 504);
+    const std::string chat_rid = expired_chat.header("x-sonder-request-id");
+    REQUIRE_FALSE(chat_rid.empty());
+
+    const auto expired_comp = post(fixture.port, "/v1/completions",
+                                   R"({"model":"slow:tiny","prompt":"expired-comp","deadline_ms":60})",
+                                   {{"X-Sonder-Run-Id", "comp-sched-deadline"}});
+    CHECK(expired_comp.status == 504);
+    const std::string comp_rid = expired_comp.header("x-sonder-request-id");
+    REQUIRE_FALSE(comp_rid.empty());
+
+    CHECK(control->starts().size() == 1);
+    finish_and_join(*control, first);
+
+    bool saw_chat_failed = false;
+    bool saw_comp_failed = false;
+    for (const auto& ev : fixture.of_type("request.failed")) {
+        const auto* rid = ev.find("request_id");
+        const auto* attrs = ev.find("attributes");
+        if (rid == nullptr || attrs == nullptr || !rid->is_string() || !attrs->is_object()) continue;
+        const std::string ec = attrs->find("error_code")->as_string();
+        if (rid->as_string() == chat_rid) {
+            CHECK((ec == "deadline_exceeded" || ec == "timeout"));
+            CHECK_FALSE(attrs->find("backend_started")->as_bool());
+            saw_chat_failed = true;
+        }
+        if (rid->as_string() == comp_rid) {
+            CHECK((ec == "deadline_exceeded" || ec == "timeout"));
+            CHECK_FALSE(attrs->find("backend_started")->as_bool());
+            saw_comp_failed = true;
+        }
+    }
+    CHECK(saw_chat_failed);
+    CHECK(saw_comp_failed);
+    for (const auto& ev : fixture.of_type("request.cancelled")) {
+        const auto* rid = ev.find("request_id");
+        if (rid != nullptr && rid->is_string()) {
+            CHECK(rid->as_string() != chat_rid);
+            CHECK(rid->as_string() != comp_rid);
+        }
+    }
+}
+
 TEST_CASE("running deadlines cancel nonstream and SSE requests") {
     for (const bool stream : {false, true}) {
         auto control = std::make_shared<SlowControl>();

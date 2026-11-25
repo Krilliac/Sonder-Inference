@@ -203,7 +203,7 @@ bool is_integrated_uma_memory(GpuVendor vendor, std::uint64_t dedicated_bytes, s
 
 template <typename Pred>
 std::optional<std::size_t> select_best_gpu(const std::vector<GpuDeviceInfo>& gpus, const Pred& pred,
-                                           bool prefer_free) noexcept {
+                                           bool prefer_free, bool require_known_vram = true) noexcept {
     std::optional<std::size_t> best_discrete;
     std::uint64_t best_discrete_mib = 0;
     std::optional<std::size_t> best_uma;
@@ -212,19 +212,20 @@ std::optional<std::size_t> select_best_gpu(const std::vector<GpuDeviceInfo>& gpu
         if (!pred(gpus[i])) {
             continue;
         }
-        const auto mib = gpu_effective_vram_mib(gpus[i], prefer_free);
-        if (!mib) {
+        const auto mib_opt = gpu_effective_vram_mib(gpus[i], prefer_free);
+        if (require_known_vram && !mib_opt) {
             continue;
         }
+        const std::uint64_t mib = mib_opt.value_or(0);
         if (!gpus[i].is_integrated_uma) {
-            if (!best_discrete || *mib > best_discrete_mib) {
+            if (!best_discrete || mib > best_discrete_mib) {
                 best_discrete = i;
-                best_discrete_mib = *mib;
+                best_discrete_mib = mib;
             }
         } else {
-            if (!best_uma || *mib > best_uma_mib) {
+            if (!best_uma || mib > best_uma_mib) {
                 best_uma = i;
-                best_uma_mib = *mib;
+                best_uma_mib = mib;
             }
         }
     }
@@ -233,9 +234,10 @@ std::optional<std::size_t> select_best_gpu(const std::vector<GpuDeviceInfo>& gpu
 
 template <typename Pred>
 std::optional<std::size_t> match_vendor_hint(const std::vector<GpuDeviceInfo>& gpus, std::string_view suffix,
-                                             const Pred& pred, bool prefer_free) noexcept {
+                                             const Pred& pred, bool prefer_free,
+                                             bool require_known_vram = true) noexcept {
     if (suffix.empty()) {
-        return select_best_gpu(gpus, pred, prefer_free);
+        return select_best_gpu(gpus, pred, prefer_free, require_known_vram);
     }
     if (suffix.front() == ':') {
         suffix.remove_prefix(1);
@@ -257,8 +259,8 @@ std::optional<std::size_t> match_vendor_hint(const std::vector<GpuDeviceInfo>& g
     return std::nullopt;
 }
 
-std::optional<std::size_t> match_single_gpu_hint(const std::vector<GpuDeviceInfo>& gpus, std::string_view token,
-                                                 bool prefer_free) noexcept {
+std::optional<std::size_t> match_single_gpu_hint_impl(const std::vector<GpuDeviceInfo>& gpus, std::string_view token,
+                                                      bool prefer_free, bool require_known_vram) noexcept {
     token = trim_view(token);
     if (token.empty()) {
         return std::nullopt;
@@ -297,24 +299,32 @@ std::optional<std::size_t> match_single_gpu_hint(const std::vector<GpuDeviceInfo
     const auto is_apple = [](const GpuDeviceInfo& g) noexcept {
         return g.vendor == GpuVendor::apple || iequals(g.backend_hint, "metal");
     };
+    const auto is_uma = [](const GpuDeviceInfo& g) noexcept { return g.is_integrated_uma; };
     const auto is_any = [](const GpuDeviceInfo&) noexcept { return true; };
 
+    if (iequals(token, "uma") || iequals(token, "igpu") || iequals(token, "apu")) {
+        return select_best_gpu(gpus, is_uma, prefer_free, require_known_vram);
+    }
+
     if (istarts_with(token, "cuda")) {
-        return match_vendor_hint(gpus, token.substr(4), is_nvidia, prefer_free);
+        return match_vendor_hint(gpus, token.substr(4), is_nvidia, prefer_free, require_known_vram);
     }
     if (istarts_with(token, "nvidia")) {
-        return match_vendor_hint(gpus, token.substr(6), is_nvidia, prefer_free);
+        return match_vendor_hint(gpus, token.substr(6), is_nvidia, prefer_free, require_known_vram);
     }
-    const auto match_rocm_hint = [&](std::string_view suffix) -> std::optional<std::size_t> {
-        const auto target_idx = parse_index(trim_view(suffix));
-        if (target_idx) {
+    const auto match_rocm_hint = [&](std::string_view suffix) noexcept -> std::optional<std::size_t> {
+        std::string_view trimmed_suffix = trim_view(suffix);
+        if (!trimmed_suffix.empty() && trimmed_suffix.front() == ':') {
+            trimmed_suffix.remove_prefix(1);
+        }
+        if (const auto target_idx = parse_index(trimmed_suffix)) {
             for (std::size_t i = 0; i < gpus.size(); ++i) {
                 if (gpus[i].rocm_runtime_ordinal && *gpus[i].rocm_runtime_ordinal == *target_idx) {
                     return i;
                 }
             }
         }
-        return match_vendor_hint(gpus, suffix, is_rocm_target, prefer_free);
+        return match_vendor_hint(gpus, suffix, is_rocm_target, prefer_free, require_known_vram);
     };
     if (istarts_with(token, "rocm")) {
         return match_rocm_hint(token.substr(4));
@@ -323,25 +333,25 @@ std::optional<std::size_t> match_single_gpu_hint(const std::vector<GpuDeviceInfo
         return match_rocm_hint(token.substr(3));
     }
     if (istarts_with(token, "amd")) {
-        return match_vendor_hint(gpus, token.substr(3), is_amd, prefer_free);
+        return match_vendor_hint(gpus, token.substr(3), is_amd, prefer_free, require_known_vram);
     }
     if (istarts_with(token, "vulkan")) {
-        return match_vendor_hint(gpus, token.substr(6), is_any, prefer_free);
+        return match_vendor_hint(gpus, token.substr(6), is_any, prefer_free, require_known_vram);
     }
     if (istarts_with(token, "vk")) {
-        return match_vendor_hint(gpus, token.substr(2), is_any, prefer_free);
+        return match_vendor_hint(gpus, token.substr(2), is_any, prefer_free, require_known_vram);
     }
     if (istarts_with(token, "intel")) {
-        return match_vendor_hint(gpus, token.substr(5), is_intel, prefer_free);
+        return match_vendor_hint(gpus, token.substr(5), is_intel, prefer_free, require_known_vram);
     }
     if (istarts_with(token, "sycl")) {
-        return match_vendor_hint(gpus, token.substr(4), is_intel, prefer_free);
+        return match_vendor_hint(gpus, token.substr(4), is_intel, prefer_free, require_known_vram);
     }
     if (istarts_with(token, "metal")) {
-        return match_vendor_hint(gpus, token.substr(5), is_apple, prefer_free);
+        return match_vendor_hint(gpus, token.substr(5), is_apple, prefer_free, require_known_vram);
     }
     if (istarts_with(token, "apple")) {
-        return match_vendor_hint(gpus, token.substr(5), is_apple, prefer_free);
+        return match_vendor_hint(gpus, token.substr(5), is_apple, prefer_free, require_known_vram);
     }
     return std::nullopt;
 }
@@ -1500,7 +1510,7 @@ std::optional<std::uint64_t> select_gpu_vram_budget_mib(const std::vector<GpuDev
         if (token.empty()) {
             continue;
         }
-        const auto idx = match_single_gpu_hint(gpus, token, prefer_free);
+        const auto idx = match_single_gpu_hint_impl(gpus, token, prefer_free, /*require_known_vram=*/true);
         if (!idx) {
             return std::nullopt;
         }
@@ -1517,6 +1527,111 @@ std::optional<std::uint64_t> select_gpu_vram_budget_mib(const std::vector<GpuDev
         matched_any = true;
     }
     return matched_any ? std::optional<std::uint64_t>(total_mib) : std::nullopt;
+}
+
+std::optional<std::size_t> match_single_gpu_hint(const std::vector<GpuDeviceInfo>& gpus,
+                                                 std::string_view token,
+                                                 bool prefer_free,
+                                                 bool require_known_vram) noexcept {
+    return match_single_gpu_hint_impl(gpus, token, prefer_free, require_known_vram);
+}
+
+std::optional<std::string_view> normalize_uma_mode(std::string_view mode) noexcept {
+    if (mode == "on" || mode == "true") {
+        return std::string_view{"on"};
+    }
+    if (mode == "off" || mode == "false") {
+        return std::string_view{"off"};
+    }
+    if (mode == "auto") {
+        return std::string_view{"auto"};
+    }
+    return std::nullopt;
+}
+
+bool is_valid_uma_mode(std::string_view mode) noexcept {
+    return normalize_uma_mode(mode).has_value();
+}
+
+std::string_view extract_device_hint(const std::vector<std::string>& args) noexcept {
+    std::string_view result;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string_view arg = args[i];
+        if (arg == "--device" || arg == "-dev") {
+            if (i + 1 < args.size()) {
+                result = args[++i];
+            } else {
+                result = {};
+            }
+        } else if (arg.size() > 9 && arg.compare(0, 9, "--device=") == 0) {
+            result = arg.substr(9);
+        } else if (arg.size() > 5 && arg.compare(0, 5, "-dev=") == 0) {
+            result = arg.substr(5);
+        } else if (arg == "--device=" || arg == "-dev=") {
+            result = {};
+        }
+    }
+    return result;
+}
+
+UmaSelectionMode resolve_uma_selection(std::string_view mode_or_auto,
+                                       const std::vector<GpuDeviceInfo>& gpus,
+                                       std::string_view device_hint) noexcept {
+    if (mode_or_auto == "on" || mode_or_auto == "true") {
+        return UmaSelectionMode::uma_only;
+    }
+    if (mode_or_auto != "auto") {
+        return UmaSelectionMode::discrete_only;
+    }
+    if (gpus.empty()) {
+        return UmaSelectionMode::discrete_only;
+    }
+
+    const std::string_view trimmed = trim_view(device_hint);
+    if (trimmed.empty()) {
+        // Discrete GPU wins whenever present; return uma_only only when all
+        // discovered GPUs are integrated UMA (e.g. Ryzen 780M/890M APU-only).
+        for (const auto& gpu : gpus) {
+            if (!gpu.is_integrated_uma) {
+                return UmaSelectionMode::discrete_only;
+            }
+        }
+        return UmaSelectionMode::uma_only;
+    }
+
+    bool matched_any = false;
+    bool any_uma = false;
+    bool any_discrete = false;
+    std::size_t pos = 0;
+    while (pos <= trimmed.size()) {
+        const auto comma = trimmed.find(',', pos);
+        const std::string_view token =
+            trim_view(trimmed.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos));
+        pos = comma == std::string_view::npos ? trimmed.size() + 1 : comma + 1;
+        if (token.empty()) {
+            continue;
+        }
+        const auto idx = match_single_gpu_hint_impl(gpus, token, /*prefer_free=*/false, /*require_known_vram=*/false);
+        if (!idx) {
+            return UmaSelectionMode::discrete_only;
+        }
+        matched_any = true;
+        if (gpus[*idx].is_integrated_uma) {
+            any_uma = true;
+        } else {
+            any_discrete = true;
+        }
+    }
+    if (!matched_any || !any_uma) {
+        return UmaSelectionMode::discrete_only;
+    }
+    return any_discrete ? UmaSelectionMode::hybrid : UmaSelectionMode::uma_only;
+}
+
+bool resolve_uma_mode(std::string_view mode_or_auto,
+                      const std::vector<GpuDeviceInfo>& gpus,
+                      std::string_view device_hint) noexcept {
+    return resolve_uma_selection(mode_or_auto, gpus, device_hint) != UmaSelectionMode::discrete_only;
 }
 
 namespace {
