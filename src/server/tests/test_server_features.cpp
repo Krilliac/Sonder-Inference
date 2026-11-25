@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -1393,3 +1394,720 @@ TEST_CASE("llamaserver protocol: forwards tools, tool_choice, tool_calls, multim
     CHECK(msgs[2].find("tool_call_id")->as_string() == "call_1");
 }
 #endif
+
+namespace {
+
+// Backend that blocks in prefill until `release()` (or cancellation), so tests
+// can deterministically observe SSE `: keep-alive\n\n` heartbeats before the
+// first token arrives.
+struct SlowPrefillBackend final : si::Backend {
+    struct State {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool entered = false;
+        bool released = false;
+        bool fail_after_release = false;
+        bool saw_cancel = false;
+        std::string reply_text = "ok";
+    };
+
+    struct Model final : si::BackendModel {
+        std::shared_ptr<State> st;
+        si::ModelDescriptor desc;
+
+        explicit Model(std::shared_ptr<State> s) : st(std::move(s)) {
+            desc.name = "slow:test";
+            desc.backend = "slow-test";
+            desc.context_length = 4096;
+        }
+
+        const si::ModelDescriptor& descriptor() const override { return desc; }
+        bool has_native_chat() const override { return true; }
+
+        si::Result<si::GenerateStats> wait_and_emit(const si::CancellationToken& cancel,
+                                                    const si::TokenCallback& on_chunk) {
+            {
+                std::unique_lock<std::mutex> lock(st->mu);
+                st->entered = true;
+                st->cv.notify_all();
+                while (!st->released && !cancel.cancelled()) {
+                    st->cv.wait_for(lock, std::chrono::milliseconds(10));
+                }
+                if (cancel.cancelled()) {
+                    st->saw_cancel = true;
+                    st->cv.notify_all();
+                    return si::Status(si::ErrorCode::cancelled, "cancelled in prefill");
+                }
+                if (st->fail_after_release) {
+                    return si::Status(si::ErrorCode::backend_error, "prefill boom");
+                }
+            }
+            if (on_chunk) {
+                (void)on_chunk(si::TokenChunk{st->reply_text, 0});
+            }
+            si::GenerateStats gs;
+            gs.prompt_tokens = 12;
+            gs.completion_tokens = 1;
+            gs.chunks = 1;
+            gs.token_counts_from_backend = true;
+            gs.stop_reason = si::StopReason::end_of_sequence;
+            return gs;
+        }
+
+        si::Result<si::GenerateStats> generate(const si::GenerateRequest&, const si::CancellationToken& cancel,
+                                               const si::TokenCallback& on_chunk) override {
+            return wait_and_emit(cancel, on_chunk);
+        }
+
+        si::Result<si::GenerateStats> chat(const si::ChatRequest&, const si::CancellationToken& cancel,
+                                           const si::TokenCallback& on_chunk) override {
+            return wait_and_emit(cancel, on_chunk);
+        }
+    };
+
+    std::shared_ptr<State> state = std::make_shared<State>();
+    std::shared_ptr<Model> model = std::make_shared<Model>(state);
+
+    void reset(bool fail = false) {
+        std::lock_guard<std::mutex> lock(state->mu);
+        state->entered = false;
+        state->released = false;
+        state->fail_after_release = fail;
+        state->saw_cancel = false;
+    }
+
+    bool wait_entered(std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+        std::unique_lock<std::mutex> lock(state->mu);
+        return state->cv.wait_for(lock, timeout, [&] { return state->entered; });
+    }
+
+    bool wait_cancelled(std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+        std::unique_lock<std::mutex> lock(state->mu);
+        return state->cv.wait_for(lock, timeout, [&] { return state->saw_cancel; });
+    }
+
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(state->mu);
+            state->released = true;
+        }
+        state->cv.notify_all();
+    }
+
+    std::string name() const override { return "slow-test"; }
+    std::string description() const override { return "slow prefill test backend"; }
+    si::BackendCapabilities capabilities() const override {
+        return si::BackendCapabilities{}.add(si::Capability::streaming).add(si::Capability::tool_calling);
+    }
+    si::Result<std::string> probe() override { return std::string("slow-1"); }
+    si::Result<std::vector<si::ModelDescriptor>> list_models() override {
+        return std::vector<si::ModelDescriptor>{model->descriptor()};
+    }
+    si::Result<std::shared_ptr<si::BackendModel>> load_model(const si::ModelLoadOptions&) override {
+        return std::static_pointer_cast<si::BackendModel>(model);
+    }
+};
+
+// Native-tool-capable backend that replays scripted TokenChunks and records
+// incoming ChatRequest fields for contract assertions.
+struct ScriptedToolBackend final : si::Backend {
+    struct Model final : si::BackendModel {
+        si::ModelDescriptor desc;
+        std::mutex mu;
+        std::vector<si::TokenChunk> chunks;
+        std::vector<std::string> owned_text;
+        si::StopReason stop_reason = si::StopReason::tool_calls;
+        std::string last_grammar;
+        std::vector<si::ChatMessage> last_messages;
+        std::vector<si::ToolDefinition> last_tools;
+        std::optional<si::ToolChoice> last_tool_choice;
+
+        Model() {
+            desc.name = "tool:test";
+            desc.backend = "tool-test";
+            desc.context_length = 4096;
+        }
+
+        const si::ModelDescriptor& descriptor() const override { return desc; }
+        bool has_native_chat() const override { return true; }
+
+        si::Result<si::GenerateStats> generate(const si::GenerateRequest&, const si::CancellationToken&,
+                                               const si::TokenCallback&) override {
+            return si::Status(si::ErrorCode::unsupported, "unused");
+        }
+
+        si::Result<si::GenerateStats> chat(const si::ChatRequest& req, const si::CancellationToken&,
+                                           const si::TokenCallback& on_chunk) override {
+            std::vector<si::TokenChunk> script;
+            si::StopReason sr = si::StopReason::end_of_sequence;
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                last_grammar = req.grammar;
+                last_messages = req.messages;
+                last_tools = req.tools;
+                last_tool_choice = req.tool_choice;
+                script = chunks;
+                sr = stop_reason;
+            }
+            std::uint64_t idx = 0;
+            for (auto c : script) {
+                c.index = idx++;
+                if (on_chunk && !on_chunk(c)) {
+                    break;
+                }
+            }
+            si::GenerateStats st;
+            st.prompt_tokens = 10;
+            st.completion_tokens = idx;
+            st.chunks = idx;
+            st.token_counts_from_backend = true;
+            st.stop_reason = sr;
+            return st;
+        }
+    };
+
+    bool advertise_native_tools = true;
+    std::shared_ptr<Model> model = std::make_shared<Model>();
+
+    std::string name() const override { return "tool-test"; }
+    std::string description() const override { return "scripted tool backend"; }
+    si::BackendCapabilities capabilities() const override {
+        si::BackendCapabilities caps;
+        caps.add(si::Capability::streaming).add(si::Capability::structured_output);
+        if (advertise_native_tools) {
+            caps.add(si::Capability::tool_calling);
+        }
+        return caps;
+    }
+    si::Result<std::string> probe() override { return std::string("tool-1"); }
+    si::Result<std::vector<si::ModelDescriptor>> list_models() override {
+        return std::vector<si::ModelDescriptor>{model->descriptor()};
+    }
+    si::Result<std::shared_ptr<si::BackendModel>> load_model(const si::ModelLoadOptions&) override {
+        return std::static_pointer_cast<si::BackendModel>(model);
+    }
+};
+
+}  // namespace
+
+TEST_CASE("capabilities: health and identity advertise native_tools, tools, and sse_keepalive") {
+    // 1. Default mock backend (native tool_calling + default 15s keep-alive enabled).
+    {
+        Fixture f;
+        const Reply hr = get(f.port, "/v1/sonder/health");
+        REQUIRE_MESSAGE(hr.status == 200, hr.body);
+        const auto h = hr.json();
+        const auto* hcaps = h.find("capabilities");
+        REQUIRE((hcaps != nullptr && hcaps->is_object()));
+        CHECK(hcaps->find("tools")->as_bool());
+        CHECK(hcaps->find("native_tools")->as_bool());
+        CHECK(hcaps->find("backend_native_tools")->as_bool());
+        CHECK(hcaps->find("tool_choice")->as_bool());
+        CHECK(hcaps->find("responses_api")->as_bool());
+        CHECK(hcaps->find("sse_keepalive")->as_bool());
+        CHECK_FALSE(hcaps->find("structured_output")->as_bool());
+        CHECK(hcaps->find("multimodal")->as_bool());
+        CHECK(hcaps->find("logprobs")->as_bool());
+        CHECK(hcaps->find("embeddings")->as_bool());
+        // Preserve existing sonder.features contract for non-llamaserver backends.
+        CHECK(h.find("sonder")->find("features")->as_array().empty());
+
+        const Reply ir = get(f.port, "/v1/sonder/identity");
+        REQUIRE_MESSAGE(ir.status == 200, ir.body);
+        const auto id = ir.json();
+        const auto* icaps = id.find("capabilities");
+        REQUIRE((icaps != nullptr && icaps->is_object()));
+        CHECK(icaps->find("tools")->as_bool());
+        CHECK(icaps->find("native_tools")->as_bool());
+        CHECK(icaps->find("backend_native_tools")->as_bool());
+        CHECK(icaps->find("tool_choice")->as_bool());
+        CHECK(icaps->find("responses_api")->as_bool());
+        CHECK(icaps->find("sse_keepalive")->as_bool());
+        // Preserve exact 9-key backend_identity schema.
+        CHECK(id.find("backend_identity")->as_object().size() == 9u);
+    }
+
+    // 2. Non-native backend (CapturingBackend) with SSE keep-alive disabled (0ms).
+    {
+        auto backend = std::make_shared<CapturingBackend>();
+        auto opts = capturing_options(backend);
+        opts.stream_keepalive_interval = std::chrono::milliseconds(0);
+        Fixture cap(opts);
+
+        for (const char* path : {"/v1/sonder/health", "/v1/sonder/identity"}) {
+            CAPTURE(path);
+            const Reply r = get(cap.port, path);
+            REQUIRE_MESSAGE(r.status == 200, r.body);
+            const auto doc = r.json();
+            const auto* caps = doc.find("capabilities");
+            REQUIRE((caps != nullptr && caps->is_object()));
+            CHECK(caps->find("tools")->as_bool());
+            CHECK(caps->find("native_tools")->as_bool());
+            CHECK_FALSE(caps->find("backend_native_tools")->as_bool());
+            CHECK_FALSE(caps->find("sse_keepalive")->as_bool());
+            CHECK(caps->find("structured_output")->as_bool());
+            CHECK_FALSE(caps->find("multimodal")->as_bool());
+            CHECK_FALSE(caps->find("logprobs")->as_bool());
+            CHECK_FALSE(caps->find("embeddings")->as_bool());
+        }
+    }
+}
+
+TEST_CASE("sse keepalive: emits keep-alive comments during long prefill across streaming endpoints") {
+    auto backend = std::make_shared<SlowPrefillBackend>();
+    auto opts = Fixture::defaults();
+    opts.models = {"slow:test"};
+    opts.backend.backend.clear();
+    opts.backend_instance = backend;
+    opts.stream_keepalive_interval = std::chrono::milliseconds(30);
+    Fixture f(opts);
+
+    // 1. /v1/chat/completions streaming receives `: keep-alive\n\n` during prefill,
+    //    then receives valid OpenAI SSE chunks + [DONE] once released.
+    {
+        backend->reset();
+        Conn c(f.port);
+        c.send(build_request("POST", "/v1/chat/completions", f.port, {},
+                             R"({"messages":[{"role":"user","content":"long prompt"}],"stream":true})"));
+        REQUIRE(backend->wait_entered());
+        std::string acc;
+        REQUIRE(c.read_until(acc, ": keep-alive\n\n", std::chrono::milliseconds(5000)));
+        CHECK(acc.find("HTTP/1.1 200 OK") == 0);
+        CHECK(acc.find("text/event-stream") != std::string::npos);
+        CHECK(acc.find("chat.completion.chunk") == std::string::npos);
+        backend->release();
+        acc += c.read_all();
+        const Reply r = parse_reply(acc);
+        CHECK(r.status == 200);
+        CHECK(r.body.find(": keep-alive\n\n") != std::string::npos);
+        const auto events = sse_data(r.body);
+        REQUIRE(events.size() >= 4u);
+        CHECK(events.back() == "[DONE]");
+        std::string text;
+        bool saw_role = false;
+        for (std::size_t i = 0; i + 1 < events.size(); ++i) {
+            auto p = json::parse(events[i]);
+            REQUIRE_MESSAGE(p.ok(), events[i]);
+            const auto& delta = p.value().find("choices")->as_array()[0].find("delta")->as_object();
+            if (const auto* role = delta.find("role"); role && role->is_string() && role->as_string() == "assistant") {
+                saw_role = true;
+            }
+            if (const auto* ct = delta.find("content"); ct && ct->is_string()) {
+                text += ct->as_string();
+            }
+        }
+        CHECK(saw_role);
+        CHECK(text == "ok");
+    }
+
+    // 2. /v1/messages (Anthropic) streaming receives `: keep-alive\n\n` during prefill,
+    //    then receives message_start -> content_block_delta -> message_stop cleanly.
+    {
+        backend->reset();
+        Conn c(f.port);
+        c.send(build_request("POST", "/v1/messages", f.port, {{"anthropic-version", "2023-06-01"}},
+                             R"({"model":"slow:test","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]})"));
+        REQUIRE(backend->wait_entered());
+        std::string acc;
+        REQUIRE(c.read_until(acc, ": keep-alive\n\n", std::chrono::milliseconds(5000)));
+        CHECK(acc.find("event: message_start") == std::string::npos);
+        backend->release();
+        acc += c.read_all();
+        const Reply r = parse_reply(acc);
+        CHECK(r.status == 200);
+        CHECK(r.body.find(": keep-alive\n\n") != std::string::npos);
+        CHECK(r.body.find("event: message_start") != std::string::npos);
+        CHECK(r.body.find("event: content_block_delta") != std::string::npos);
+        CHECK(r.body.find("event: message_stop") != std::string::npos);
+    }
+
+    // 3. /v1/completions streaming receives `: keep-alive\n\n` during prefill,
+    //    then receives text completion chunk + [DONE].
+    {
+        backend->reset();
+        Conn c(f.port);
+        c.send(build_request("POST", "/v1/completions", f.port, {},
+                             R"({"prompt":"long prompt","stream":true})"));
+        REQUIRE(backend->wait_entered());
+        std::string acc;
+        REQUIRE(c.read_until(acc, ": keep-alive\n\n", std::chrono::milliseconds(5000)));
+        backend->release();
+        acc += c.read_all();
+        const Reply r = parse_reply(acc);
+        CHECK(r.status == 200);
+        CHECK(r.body.find(": keep-alive\n\n") != std::string::npos);
+        const auto events = sse_data(r.body);
+        REQUIRE(events.size() >= 2u);
+        CHECK(events.back() == "[DONE]");
+    }
+
+    // 4. /v1/responses streaming receives `: keep-alive\n\n` during prefill,
+    //    then receives response.created -> output_text.delta -> response.completed.
+    {
+        backend->reset();
+        Conn c(f.port);
+        c.send(build_request("POST", "/v1/responses", f.port, {},
+                             R"({"input":"long prompt","stream":true})"));
+        REQUIRE(backend->wait_entered());
+        std::string acc;
+        REQUIRE(c.read_until(acc, ": keep-alive\n\n", std::chrono::milliseconds(5000)));
+        CHECK(acc.find("event: response.created") == std::string::npos);
+        backend->release();
+        acc += c.read_all();
+        const Reply r = parse_reply(acc);
+        CHECK(r.status == 200);
+        CHECK(r.body.find(": keep-alive\n\n") != std::string::npos);
+        CHECK(r.body.find("event: response.created") != std::string::npos);
+        CHECK(r.body.find("event: response.output_text.delta") != std::string::npos);
+        CHECK(r.body.find("event: response.completed") != std::string::npos);
+    }
+
+    // 5. Prefill error after keep-alive already committed headers emits a clean SSE
+    //    error frame without fake assistant preamble or [DONE].
+    {
+        backend->reset(/*fail=*/true);
+        Conn c(f.port);
+        c.send(build_request("POST", "/v1/chat/completions", f.port, {},
+                             R"({"messages":[{"role":"user","content":"will fail"}],"stream":true})"));
+        REQUIRE(backend->wait_entered());
+        std::string acc;
+        REQUIRE(c.read_until(acc, ": keep-alive\n\n", std::chrono::milliseconds(5000)));
+        backend->release();
+        acc += c.read_all();
+        const Reply r = parse_reply(acc);
+        CHECK(r.status == 200);
+        CHECK(r.body.find("chat.completion.chunk") == std::string::npos);
+        CHECK(r.body.find("[DONE]") == std::string::npos);
+        const auto events = sse_data(r.body);
+        REQUIRE(events.size() == 1u);
+        auto err_doc = json::parse(events[0]);
+        REQUIRE(err_doc.ok());
+        CHECK(err_doc.value().find("error") != nullptr);
+    }
+
+    // 6. Client disconnect after keep-alive cancels backend cleanly.
+    {
+        backend->reset();
+        {
+            Conn c(f.port);
+            c.send(build_request("POST", "/v1/chat/completions", f.port, {},
+                                 R"({"messages":[{"role":"user","content":"drop me"}],"stream":true})"));
+            REQUIRE(backend->wait_entered());
+            std::string acc;
+            REQUIRE(c.read_until(acc, ": keep-alive\n\n", std::chrono::milliseconds(5000)));
+            c.close();
+        }
+        CHECK(backend->wait_cancelled(std::chrono::milliseconds(5000)));
+    }
+
+    // 7. Disabled when stream_keepalive_interval is 0ms.
+    {
+        auto b2 = std::make_shared<SlowPrefillBackend>();
+        auto opts2 = Fixture::defaults();
+        opts2.models = {"slow:test"};
+        opts2.backend.backend.clear();
+        opts2.backend_instance = b2;
+        opts2.stream_keepalive_interval = std::chrono::milliseconds(0);
+        Fixture f2(opts2);
+
+        b2->reset();
+        Conn c(f2.port);
+        c.send(build_request("POST", "/v1/chat/completions", f2.port, {},
+                             R"({"messages":[{"role":"user","content":"quiet"}],"stream":true})"));
+        REQUIRE(b2->wait_entered());
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        b2->release();
+        const Reply r = parse_reply(c.read_all());
+        CHECK(r.status == 200);
+        CHECK(r.body.find(": keep-alive") == std::string::npos);
+        CHECK(r.body.find("[DONE]") != std::string::npos);
+    }
+}
+
+TEST_CASE("streaming tool_calls: incremental deltas, parallel calls, id synthesis, and tool_choice") {
+    auto backend = std::make_shared<ScriptedToolBackend>();
+    auto opts = Fixture::defaults();
+    opts.models = {"tool:test"};
+    opts.backend.backend.clear();
+    opts.backend_instance = backend;
+    Fixture f(opts);
+
+    const std::string tools_json =
+        R"([{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}},)"
+        R"({"type":"function","function":{"name":"get_time","parameters":{"type":"object","properties":{"tz":{"type":"string"}}}}}])";
+
+    // 1. Multi-chunk streaming deltas across 2 parallel tool calls (one explicit id,
+    //    one omitted id that must be auto-synthesized on its first delta only).
+    {
+        std::lock_guard<std::mutex> lock(backend->model->mu);
+        backend->model->stop_reason = si::StopReason::tool_calls;
+        backend->model->chunks.clear();
+        si::TokenChunk c0;
+        c0.tool_call_deltas.push_back(si::ToolCallDelta{0, "call_explicit_0", "get_weather", R"({"city":)"});
+        si::TokenChunk c1;
+        c1.tool_call_deltas.push_back(si::ToolCallDelta{0, "", "", R"("NYC"})"});
+        si::TokenChunk c2;
+        c2.tool_call_deltas.push_back(si::ToolCallDelta{1, "", "get_time", R"({"tz":)"});
+        si::TokenChunk c3;
+        c3.tool_call_deltas.push_back(si::ToolCallDelta{1, "", "", R"("UTC"})"});
+        backend->model->chunks = {c0, c1, c2, c3};
+    }
+    {
+        const Reply r = post(f.port, "/v1/chat/completions",
+                             R"({"messages":[{"role":"user","content":"weather and time"}],"tools":)" + tools_json +
+                                 R"(,"tool_choice":"required","stream":true})");
+        REQUIRE_MESSAGE(r.status == 200, r.body);
+        // Native tool-capable backend must NOT receive synthesized raw GBNF grammar.
+        {
+            std::lock_guard<std::mutex> lock(backend->model->mu);
+            CHECK(backend->model->last_grammar.empty());
+        }
+        const auto events = sse_data(r.body);
+        REQUIRE(events.size() >= 6u);
+        CHECK(events.back() == "[DONE]");
+
+        std::string id0, id1, name0, name1, args0, args1;
+        int id1_emissions = 0;
+        std::string finish;
+        for (std::size_t i = 0; i + 1 < events.size(); ++i) {
+            auto p = json::parse(events[i]);
+            REQUIRE_MESSAGE(p.ok(), events[i]);
+            const auto& choice = p.value().find("choices")->as_array()[0];
+            if (const auto* fr = choice.find("finish_reason"); fr && fr->is_string()) {
+                finish = fr->as_string();
+            }
+            const auto& delta = choice.find("delta")->as_object();
+            if (const auto* tcs = delta.find("tool_calls"); tcs && tcs->is_array()) {
+                for (const auto& tc : tcs->as_array()) {
+                    const auto idx = tc.find("index")->as_int();
+                    const auto* idv = tc.find("id");
+                    const auto& fn = tc.find("function")->as_object();
+                    const auto* nv = fn.find("name");
+                    const auto* av = fn.find("arguments");
+                    if (idx == 0) {
+                        if (idv && idv->is_string()) id0 = idv->as_string();
+                        if (nv && nv->is_string()) name0 = nv->as_string();
+                        if (av && av->is_string()) args0 += av->as_string();
+                    } else if (idx == 1) {
+                        if (idv && idv->is_string()) {
+                            id1 = idv->as_string();
+                            ++id1_emissions;
+                        }
+                        if (nv && nv->is_string()) name1 = nv->as_string();
+                        if (av && av->is_string()) args1 += av->as_string();
+                    }
+                }
+            }
+        }
+        CHECK(id0 == "call_explicit_0");
+        CHECK(name0 == "get_weather");
+        CHECK(args0 == R"({"city":"NYC"})");
+        CHECK(id1.rfind("call_", 0) == 0);
+        CHECK(id1_emissions == 1);  // synthesized on first delta only, not repeated
+        CHECK(name1 == "get_time");
+        CHECK(args1 == R"({"tz":"UTC"})");
+        CHECK(finish == "tool_calls");
+    }
+
+    // 2. Non-streaming chat synthesizes non-empty id when backend omits tool_call id.
+    {
+        std::lock_guard<std::mutex> lock(backend->model->mu);
+        backend->model->chunks.clear();
+        si::TokenChunk c;
+        c.tool_call_deltas.push_back(si::ToolCallDelta{0, "", "get_weather", R"({"city":"Paris"})"});
+        backend->model->chunks = {c};
+    }
+    {
+        const Reply r = post(f.port, "/v1/chat/completions",
+                             R"({"messages":[{"role":"user","content":"paris"}],"tools":)" + tools_json + R"(})");
+        REQUIRE_MESSAGE(r.status == 200, r.body);
+        const auto doc = r.json();
+        const auto& choice = doc.find("choices")->as_array()[0];
+        CHECK(choice.find("finish_reason")->as_string() == "tool_calls");
+        const auto& tcs = choice.find("message")->find("tool_calls")->as_array();
+        REQUIRE(tcs.size() == 1u);
+        CHECK(tcs[0].find("id")->as_string().rfind("call_", 0) == 0);
+        CHECK(tcs[0].find("function")->find("name")->as_string() == "get_weather");
+        CHECK(tcs[0].find("function")->find("arguments")->as_string() == R"({"city":"Paris"})");
+    }
+
+    // 3. /v1/responses streaming with sparse tool call index (index 2 only) filters
+    //    out empty placeholder slots before response.completed.
+    {
+        std::lock_guard<std::mutex> lock(backend->model->mu);
+        backend->model->chunks.clear();
+        si::TokenChunk c;
+        c.tool_call_deltas.push_back(si::ToolCallDelta{2, "", "get_time", R"({"tz":"CST"})"});
+        backend->model->chunks = {c};
+    }
+    {
+        const Reply r = post(
+            f.port, "/v1/responses",
+            R"({"input":"time?","stream":true,"tools":[{"type":"function","name":"get_time","parameters":{"type":"object"}}]})");
+        REQUIRE_MESSAGE(r.status == 200, r.body);
+        CHECK(r.body.find("event: response.function_call_arguments.delta") != std::string::npos);
+        const auto completed_pos = r.body.find("event: response.completed\ndata: ");
+        REQUIRE(completed_pos != std::string::npos);
+        const auto data_start = completed_pos + std::string("event: response.completed\ndata: ").size();
+        const auto data_end = r.body.find("\n\n", data_start);
+        auto parsed = json::parse(r.body.substr(data_start, data_end - data_start));
+        REQUIRE(parsed.ok());
+        const auto& output = parsed.value().find("response")->find("output")->as_array();
+        REQUIRE(output.size() == 1u);
+        CHECK(output[0].find("type")->as_string() == "function_call");
+        CHECK(output[0].find("name")->as_string() == "get_time");
+        CHECK(output[0].find("call_id")->as_string().rfind("call_", 0) == 0);
+    }
+
+    // 4. Non-native backend with tool_choice: "none" must NOT inject tool prompts or
+    //    parse literal <tool_call> tags into structured tool_calls.
+    {
+        auto non_native = std::make_shared<ScriptedToolBackend>();
+        non_native->advertise_native_tools = false;
+        non_native->model->owned_text.push_back(R"(<tool_call>{"name":"get_weather","arguments":{"city":"LA"}}</tool_call>)");
+        non_native->model->stop_reason = si::StopReason::end_of_sequence;
+        non_native->model->chunks = {si::TokenChunk{non_native->model->owned_text.back(), 0}};
+        auto nn_opts = Fixture::defaults();
+        nn_opts.models = {"tool:test"};
+        nn_opts.backend.backend.clear();
+        nn_opts.backend_instance = non_native;
+        Fixture f_nn(nn_opts);
+
+        const Reply r = post(f_nn.port, "/v1/chat/completions",
+                             R"({"messages":[{"role":"user","content":"echo tag"}],"tools":)" + tools_json +
+                                 R"(,"tool_choice":"none"})");
+        REQUIRE_MESSAGE(r.status == 200, r.body);
+        const auto doc = r.json();
+        const auto& choice = doc.find("choices")->as_array()[0];
+        CHECK(choice.find("finish_reason")->as_string() == "stop");
+        CHECK(choice.find("message")->find("tool_calls") == nullptr);
+        CHECK(choice.find("message")->find("content")->as_string().find("<tool_call>") != std::string::npos);
+        std::lock_guard<std::mutex> lock(non_native->model->mu);
+        CHECK(non_native->model->last_messages.size() == 1u);  // no synthetic system tool prompt added
+    }
+
+    // 5. tool_choice and tools validation error paths on chat and responses.
+    for (const char* bad_body : {
+             R"({"messages":[{"role":"user","content":"hi"}],"tool_choice":"required"})",
+             R"({"messages":[{"role":"user","content":"hi"}],"tool_choice":"bogus"})",
+             R"({"messages":[{"role":"user","content":"hi"}],"tool_choice":123})",
+             R"({"messages":[{"role":"user","content":"hi"}],"tools":"not-array"})",
+             R"({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"bad name!"}}]})",
+             R"({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"dup"}},{"type":"function","function":{"name":"dup"}}]})",
+             R"({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"a"}}],"tool_choice":{"type":"function","function":{"name":"missing"}}})",
+         }) {
+        CAPTURE(bad_body);
+        const Reply r = post(f.port, "/v1/chat/completions", bad_body);
+        CHECK(r.status == 400);
+        CHECK(r.json().find("error") != nullptr);
+    }
+    {
+        const Reply r = post(
+            f.port, "/v1/responses",
+            R"({"input":"hi","tools":[{"type":"function","name":"a"}],"tool_choice":{"type":"function","name":"missing"}})");
+        CHECK(r.status == 400);
+        CHECK(r.json().find("error")->find("param")->as_string() == "tool_choice");
+    }
+}
+
+TEST_CASE("responses previous_response_id: error paths and malformed JSON resilience") {
+    auto opts = Fixture::defaults();
+    opts.models = {"mock:a", "mock:b"};
+    Fixture f(opts);
+
+    // 1. Unknown previous_response_id -> 404 not_found
+    {
+        const Reply r = post(f.port, "/v1/responses",
+                             R"({"model":"mock:a","previous_response_id":"resp_nonexistent","input":"hi"})");
+        CHECK(r.status == 404);
+        CHECK(r.json().find("error")->find("code")->as_string() == "not_found");
+        CHECK(r.json().find("error")->find("param")->as_string() == "previous_response_id");
+    }
+
+    // 2. Create stored response on mock:a, then chain on mock:b -> 400 cross-model error
+    {
+        const Reply r1 = post(f.port, "/v1/responses",
+                              R"({"model":"mock:a","input":"turn 1","max_output_tokens":4})");
+        REQUIRE_MESSAGE(r1.status == 200, r1.body);
+        const std::string resp_id = r1.json().find("id")->as_string();
+
+        const Reply r_cross = post(f.port, "/v1/responses",
+                                   R"({"model":"mock:b","previous_response_id":")" + resp_id + R"(","input":"turn 2"})");
+        CHECK(r_cross.status == 400);
+        CHECK(r_cross.json().find("error")->find("code")->as_string() == "invalid_request");
+        CHECK(r_cross.json().find("error")->find("param")->as_string() == "previous_response_id");
+    }
+
+    // 3. store: false turn is NOT retained -> chaining its ID returns 404
+    {
+        const Reply r_nostore = post(f.port, "/v1/responses",
+                                     R"({"model":"mock:a","input":"ephemeral","store":false,"max_output_tokens":4})");
+        REQUIRE_MESSAGE(r_nostore.status == 200, r_nostore.body);
+        const std::string ephem_id = r_nostore.json().find("id")->as_string();
+
+        const Reply r_chain = post(f.port, "/v1/responses",
+                                   R"({"model":"mock:a","previous_response_id":")" + ephem_id + R"(","input":"follow"})");
+        CHECK(r_chain.status == 404);
+        CHECK(r_chain.json().find("error")->find("code")->as_string() == "not_found");
+    }
+
+    // 4. Malformed previous_response_id values (empty, >128 bytes, non-string, control char) -> 400
+    const std::string long_id(129, 'x');
+    for (const std::string& bad_prev : {
+             std::string(R"({"input":"hi","previous_response_id":""})"),
+             std::string(R"({"input":"hi","previous_response_id":")") + long_id + R"("})",
+             std::string(R"({"input":"hi","previous_response_id":42})"),
+             std::string(R"({"input":"hi","previous_response_id":"resp_1\n"})"),
+         }) {
+        CAPTURE(bad_prev);
+        const Reply r = post(f.port, "/v1/responses", bad_prev);
+        CHECK(r.status == 400);
+        CHECK(r.json().find("error")->find("param")->as_string() == "previous_response_id");
+    }
+
+    // 5. Non-string input[0].type and invalid role=tool tool_call_id -> 400, valid tool_call_id -> 200
+    {
+        const Reply r_type = post(f.port, "/v1/responses",
+                                  R"({"input":[{"type":123,"role":"user","content":"hi"}]})");
+        CHECK(r_type.status == 400);
+        CHECK(r_type.json().find("error")->find("param")->as_string() == "input[0].type");
+
+        const Reply r_bad_tcid = post(f.port, "/v1/responses",
+                                      R"({"input":[{"role":"user","content":"hi"},{"role":"tool","tool_call_id":"","content":"out"}]})");
+        CHECK(r_bad_tcid.status == 400);
+        CHECK(r_bad_tcid.json().find("error")->find("param")->as_string() == "input[1].tool_call_id");
+
+        const Reply r_ok_tcid = post(
+            f.port, "/v1/responses",
+            R"({"input":[{"role":"user","content":"hi"},{"type":"function_call","call_id":"c1","name":"fn","arguments":"{}"},{"role":"tool","tool_call_id":"c1","content":"ok"}],"max_output_tokens":4})");
+        CHECK(r_ok_tcid.status == 200);
+    }
+
+    // 6. Malformed JSON resilience across all JSON POST endpoints (truncated, non-object,
+    //    deeply nested >128, wrong field types).
+    std::string deep_json;
+    for (int i = 0; i < 160; ++i) deep_json += "{\"a\":";
+    deep_json += "1";
+    for (int i = 0; i < 160; ++i) deep_json += "}";
+
+    for (const char* path :
+         {"/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/completions", "/v1/embeddings"}) {
+        for (const std::string& payload :
+             {std::string(R"({"truncated":[)"), std::string("[1,2,3]"), std::string(R"("scalar")"),
+              std::string("null"), deep_json}) {
+            CAPTURE(path);
+            const Reply r = post(f.port, path, payload);
+            CHECK(r.status == 400);
+            const auto doc = r.json();
+            CHECK(doc.find("error") != nullptr);
+        }
+    }
+    // Wrong field types return structured 400s without crashing.
+    CHECK(post(f.port, "/v1/chat/completions", R"({"messages":"not-an-array"})").status == 400);
+    CHECK(post(f.port, "/v1/chat/completions", R"({"messages":[{"role":"user","content":"hi"}],"stream":"yes"})").status == 400);
+    CHECK(post(f.port, "/v1/responses", R"({"input":[]})").status == 400);
+    CHECK(post(f.port, "/v1/completions", R"({"prompt":123})").status == 400);
+
+    // Server remains healthy after malformed traffic burst.
+    CHECK(get(f.port, "/v1/sonder/health").status == 200);
+}

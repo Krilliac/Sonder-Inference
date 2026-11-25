@@ -39,6 +39,10 @@ struct PlacementPlanRequest {
     bool allow_quantized_kv = true;
     bool allow_speculative = true;
     bool allow_moe_cpu_offload = true;
+    // Allow automatic hybrid discrete + integrated UMA Vulkan spread
+    // (e.g. Vulkan0,Vulkan1) when a model exceeds discrete VRAM alone but fits
+    // inside discrete + iGPU UMA with zero CPU spill.
+    bool allow_hybrid_gpu_spread = true;
     std::string device_hint;  // optional e.g. "CUDA0", "ROCm0", "Vulkan0", "multi", "cpu"
     // Opt-in OCP FP8 (f8_e4m3, 1.0 byte/elem) initial KV cache on supported GPUs (Ada/Blackwell).
     bool prefer_fp8_kv = false;
@@ -48,16 +52,55 @@ struct PlacementPlanRequest {
     std::uint32_t cpu_physical_cores = 0;
 };
 
+// Estimated VRAM/UMA allocation for one GPU in a multi-GPU or hybrid
+// discrete+iGPU placement plan.
+struct DeviceAllocationEstimate {
+    std::string device;               // ggml device name, e.g. "Vulkan0", "Vulkan1", "CUDA0"
+    std::string gpu_id;               // inventory id, e.g. "gpu:0", "gpu:1"
+    std::string name;                 // human-readable adapter name
+    bool is_integrated_uma = false;   // true for integrated APU/iGPU UMA device
+    std::uint64_t budget_mib = 0;     // usable per-device budget after reserve/host cap
+    std::uint64_t estimated_mib = 0;  // estimated weights+KV+recurrent+compute MiB on this device
+    double tensor_split_weight = 0.0; // normalized weight in [0, 1]
+};
+
+// Structured multi-GPU spread recommendation produced when placement spans
+// multiple GPUs (including hybrid discrete + integrated UMA Vulkan spread,
+// e.g. LLAMA_ARG_DEVICE=Vulkan0,Vulkan1 on discrete RX 9060 XT + Radeon 780M).
+struct MultiGpuSpreadRecommendation {
+    bool active = false;
+    bool hybrid_discrete_igpu = false;
+    bool zero_cpu_spill = false;
+    std::string backend;                     // e.g. "vulkan", "cuda", "rocm"
+    std::string llama_arg_device;            // comma-separated device list, e.g. "Vulkan0,Vulkan1"
+    std::uint64_t combined_gpu_vram_mib = 0; // combined usable VRAM budget of spread devices (MiB)
+    std::uint64_t total_estimated_mib = 0;   // sum of per-device estimated MiB
+    std::vector<std::string> recommended_devices;            // e.g. ["Vulkan0", "Vulkan1"]
+    std::vector<DeviceAllocationEstimate> per_device_split;  // estimated per-device MiB split
+};
+
 struct PlacementPlan {
     LaunchProfile profile;  // ready-to-validate LaunchProfile (passes validate_launch_profile)
     VramEstimate estimate;  // exact estimate_vram() output for profile
     std::uint64_t budget_mib = 0;  // selected per-GPU, aggregate multi-GPU, UMA, or CPU host budget
+    // Host combined effective GPU VRAM pool in MiB (discrete + integrated UMA,
+    // honoring prefer_free_vram and host physical RAM cap for UMA).
+    std::uint64_t combined_gpu_vram_mib = 0;
     bool fits_in_vram = false;
     bool fits_in_host_ram = true;
     bool uma_mode = false;
+    // True when every model layer and MoE expert fits on GPU(s) with zero CPU
+    // layer/expert/KV spill (excludes token_embd which llama.cpp keeps on host).
+    bool zero_cpu_spill = false;
     bool requires_prism_runtime = false;
     GpuVendor selected_vendor = GpuVendor::unknown;
     std::string recommended_backend_hint;  // "cuda", "rocm", "vulkan", "metal", "sycl", "cpu"
+    // Ordered recommended ggml devices for this plan (e.g. ["Vulkan0"],
+    // ["Vulkan0", "Vulkan1"], ["CUDA0", "CUDA1"], or empty for CPU-only).
+    std::vector<std::string> recommended_devices;
+    // Structured multi-GPU spread recommendation (active for hybrid discrete+iGPU
+    // Vulkan spread and multi-GPU layer splits; inactive for single-GPU or CPU).
+    MultiGpuSpreadRecommendation multi_gpu_spread;
     // Dynamic SLRU MoE expert VRAM cache planned for CPU-offloaded MoE models
     // (mirrors profile.moe_cache_mib / profile.moe_cache_cpu_share; always unset
     // when the MoE model fits 100% in VRAM or spare VRAM cannot cover the working set).
@@ -79,5 +122,9 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
                                    const HostMemory& host, const PlacementPlanRequest& request = {});
 
 json::Object placement_plan_to_json(const PlacementPlan& plan);
+
+// Serializes a host GpuPoolSummary (discrete, integrated UMA, combined pool,
+// and hybrid Vulkan spread devices) for `/v1/sonder/node` JSON.
+json::Object gpu_pool_summary_to_json(const GpuPoolSummary& pool);
 
 }  // namespace sonder::inference

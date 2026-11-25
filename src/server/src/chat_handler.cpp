@@ -82,6 +82,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     const std::int64_t created_at = static_cast<std::int64_t>(std::time(nullptr));
 
     // Client disconnect cancels the request (request.cancelled).
+    SseStreamWriter sse(ex, ex.options.stream_keepalive_interval);
     std::mutex watch_mu;
     std::condition_variable watch_cv;
     bool watch_done = false;
@@ -92,6 +93,9 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
             return;
         }
         backend_started.store(true);
+        if (job.stream) {
+            sse.arm_keepalive();
+        }
     };
     std::shared_ptr<PriorityAdmission::Ticket> ticket;
     std::thread watcher;
@@ -100,6 +104,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     // destroyed during unwinding would call std::terminate.
     bool left_inflight = false;
     const auto end_request = [&] {
+        sse.disarm_keepalive();
         if (ticket) ticket->release();
         {
             std::lock_guard<std::mutex> lock(watch_mu);
@@ -131,7 +136,14 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
                     disconnected.store(true);
                     session->cancel();
                 }
-                if (std::chrono::steady_clock::now() >= deadline) session->cancel();
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) {
+                    session->cancel();
+                } else if (job.stream && !disconnected.load() && !ex.hard_stop.load() &&
+                           !sse.maybe_send_keepalive()) {
+                    disconnected.store(true);
+                    session->cancel();
+                }
                 lock.lock();
                 watch_cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return watch_done; });
             }
@@ -188,8 +200,6 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     }
 
     AnthropicStream messages_stream(completion_id, model);
-    bool headers_sent = false;
-    bool write_failed = false;
     const auto chunk_object = [&](json::Object delta, json::Value finish, json::Value logprobs_val = nullptr) {
         json::Object choice{{"index", 0}, {"delta", std::move(delta)}, {"finish_reason", std::move(finish)}};
         if (job.sampling.logprobs) {
@@ -201,32 +211,25 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
                             {"model", model},
                             {"choices", json::Array{std::move(choice)}}};
     };
-    const auto send_frame = [&](std::string_view frame) {
-        if (!write_failed && !frame.empty() && !ex.write(frame)) {
-            write_failed = true;
-        }
-        return !write_failed;
-    };
+    const auto send_frame = [&](std::string_view frame) { return sse.write_frame(frame); };
     const auto send_event = [&](const json::Object& obj) {
-        return send_frame("data: " + json::Value(obj).dump() + "\n\n");
+        return sse.write_frame("data: " + json::Value(obj).dump() + "\n\n");
     };
     const auto ensure_stream_head = [&]() {
-        if (headers_sent) {
-            return !write_failed;
-        }
-        headers_sent = true;
-        if (!ex.start_stream()) {
-            write_failed = true;
-            return false;
-        }
-        if (anthropic) {
-            return send_frame(messages_stream.start());
-        }
-        return send_event(chunk_object(json::Object{{"role", "assistant"}, {"content", ""}}, nullptr));
+        return sse.ensure_started([&]() -> std::string {
+            if (anthropic) {
+                return messages_stream.start();
+            }
+            return "data: " +
+                   json::Value(chunk_object(json::Object{{"role", "assistant"}, {"content", ""}}, nullptr)).dump() +
+                   "\n\n";
+        });
     };
 
-    const bool tools_enabled = !job.tools.empty() && !backend_native_tools;
+    const bool tool_choice_none = job.tool_choice && job.tool_choice->mode == ToolChoiceMode::none;
+    const bool tools_enabled = !job.tools.empty() && !backend_native_tools && !tool_choice_none;
     ToolCallStreamParser tool_parser("call_" + *ro.request_id + "_");
+    std::vector<bool> seen_native_tool_indices;
     bool saw_text = false;
     bool emitted_tool_calls = false;
 
@@ -244,7 +247,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     TokenCallback on_chunk;
     if (job.stream) {
         on_chunk = [&](const TokenChunk& chunk) {
-            // 1. Native upstream tool call deltas (e.g. llama-server).
+            // 1. Native upstream tool call deltas (e.g. llama-server, Ollama).
             if (!chunk.tool_call_deltas.empty()) {
                 emitted_tool_calls = true;
                 if (!ensure_stream_head()) {
@@ -262,7 +265,19 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
                     json::Array tcs;
                     tcs.reserve(chunk.tool_call_deltas.size());
                     for (const auto& tcd : chunk.tool_call_deltas) {
-                        tcs.emplace_back(openai_tool_call_delta_json(tcd.index, tcd.id, tcd.name, tcd.arguments_delta));
+                        std::string id = tcd.id;
+                        if (tcd.index < 64u) {
+                            if (tcd.index >= seen_native_tool_indices.size()) {
+                                seen_native_tool_indices.resize(static_cast<std::size_t>(tcd.index) + 1, false);
+                            }
+                            if (!seen_native_tool_indices[tcd.index]) {
+                                seen_native_tool_indices[tcd.index] = true;
+                                if (id.empty()) {
+                                    id = "call_" + *ro.request_id + "_" + std::to_string(tcd.index);
+                                }
+                            }
+                        }
+                        tcs.emplace_back(openai_tool_call_delta_json(tcd.index, id, tcd.name, tcd.arguments_delta));
                     }
                     if (!send_event(chunk_object(json::Object{{"tool_calls", std::move(tcs)}}, nullptr))) {
                         session->cancel();
@@ -342,7 +357,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
 
     std::vector<ChatMessage> prepared_messages;
     const std::vector<ChatMessage>* messages_to_send = &job.messages;
-    if (!job.tools.empty() && !backend_native_tools) {
+    if (tools_enabled) {
         prepared_messages = job.messages;
         const std::string tool_prompt = format_tools_system_prompt(job.tools, job.tool_choice);
         if (!prepared_messages.empty() && prepared_messages.front().role == "system") {
@@ -357,7 +372,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     end_request();
     const bool rejected = session->last_scheduler_rejected();
 
-    if (disconnected.load() || write_failed) {
+    if (disconnected.load() || sse.write_failed()) {
         ex.status = 499; // client closed the request (access log only)
         session->close();
         return;
@@ -370,7 +385,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     if (!result.ok()) {
         session->close();
         const ApiError e = map_session_failure(result.status(), rejected);
-        if (headers_sent) {
+        if (sse.headers_sent()) {
             if (anthropic) {
                 (void)send_frame("event: error\ndata: " + json::Value(anthropic_error_body(e)).dump() +
                                  "\n\n");
@@ -405,7 +420,14 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     if (!job.stream) {
         if (!r.tool_calls.empty()) {
             visible_text = r.text;
-            final_tool_calls = r.tool_calls;
+            for (const auto& tc : r.tool_calls) {
+                if (tc.name.empty() && tc.arguments_json.empty()) continue;
+                ToolCall normalized = tc;
+                if (normalized.id.empty()) {
+                    normalized.id = "call_" + *ro.request_id + "_" + std::to_string(final_tool_calls.size());
+                }
+                final_tool_calls.push_back(std::move(normalized));
+            }
         } else if (tools_enabled) {
             ExtractedToolOutput extracted = extract_tool_calls(r.text, "call_" + *ro.request_id + "_");
             visible_text = std::move(extracted.visible_text);
@@ -478,7 +500,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     last.set("timings", timings_json(r));
     last.set("sonder", std::move(meta));
     if (send_event(last)) {
-        (void)ex.write("data: [DONE]\n\n");
+        (void)send_frame("data: [DONE]\n\n");
     }
 }
 
@@ -509,6 +531,7 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
     ex.request_id = *ro.request_id;
     const std::int64_t created_at = static_cast<std::int64_t>(std::time(nullptr));
 
+    SseStreamWriter sse(ex, ex.options.stream_keepalive_interval);
     std::mutex watch_mu;
     std::condition_variable watch_cv;
     bool watch_done = false;
@@ -519,11 +542,15 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
             return;
         }
         backend_started.store(true);
+        if (job.stream) {
+            sse.arm_keepalive();
+        }
     };
     std::shared_ptr<PriorityAdmission::Ticket> ticket;
     std::thread watcher;
     bool left_inflight = false;
     const auto end_request = [&] {
+        sse.disarm_keepalive();
         if (ticket) ticket->release();
         {
             std::lock_guard<std::mutex> lock(watch_mu);
@@ -555,7 +582,14 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
                     disconnected.store(true);
                     session->cancel();
                 }
-                if (std::chrono::steady_clock::now() >= deadline) session->cancel();
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) {
+                    session->cancel();
+                } else if (job.stream && !disconnected.load() && !ex.hard_stop.load() &&
+                           !sse.maybe_send_keepalive()) {
+                    disconnected.store(true);
+                    session->cancel();
+                }
                 lock.lock();
                 watch_cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return watch_done; });
             }
@@ -608,8 +642,6 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
         ro.admission = ticket;
     }
 
-    bool headers_sent = false;
-    bool write_failed = false;
     const auto chunk_object = [&](std::string text, json::Value finish, json::Value logprobs_val = nullptr) {
         return json::Object{{"id", completion_id},
                             {"object", "text_completion"},
@@ -620,28 +652,17 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
                                                                  {"logprobs", std::move(logprobs_val)},
                                                                  {"finish_reason", std::move(finish)}}}}};
     };
-    const auto send_frame = [&](std::string_view frame) {
-        if (!write_failed && !frame.empty() && !ex.write(frame)) {
-            write_failed = true;
-        }
-        return !write_failed;
-    };
+    const auto send_frame = [&](std::string_view frame) { return sse.write_frame(frame); };
     const auto send_event = [&](const json::Object& obj) {
-        return send_frame("data: " + json::Value(obj).dump() + "\n\n");
+        return sse.write_frame("data: " + json::Value(obj).dump() + "\n\n");
     };
     const auto ensure_stream_head = [&]() {
-        if (headers_sent) {
-            return !write_failed;
-        }
-        headers_sent = true;
-        if (!ex.start_stream()) {
-            write_failed = true;
-            return false;
-        }
-        if (job.echo) {
-            return send_event(chunk_object(job.prompt, nullptr));
-        }
-        return true;
+        return sse.ensure_started([&]() -> std::string {
+            if (job.echo) {
+                return "data: " + json::Value(chunk_object(job.prompt, nullptr)).dump() + "\n\n";
+            }
+            return {};
+        });
     };
 
     std::size_t text_offset = job.echo ? job.prompt.size() : 0;
@@ -669,7 +690,7 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
     end_request();
     const bool rejected = session->last_scheduler_rejected();
 
-    if (disconnected.load() || write_failed) {
+    if (disconnected.load() || sse.write_failed()) {
         ex.status = 499;
         session->close();
         return;
@@ -682,7 +703,7 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
     if (!result.ok()) {
         session->close();
         const ApiError e = map_session_failure(result.status(), rejected);
-        if (headers_sent) {
+        if (sse.headers_sent()) {
             (void)send_event(error_body(e));
         } else {
             ex.send_error(e);
@@ -727,7 +748,7 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
     last.set("timings", timings_json(r));
     last.set("sonder", std::move(meta));
     if (send_event(last)) {
-        (void)ex.write("data: [DONE]\n\n");
+        (void)send_frame("data: [DONE]\n\n");
     }
 }
 

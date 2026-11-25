@@ -1136,3 +1136,364 @@ TEST_CASE("placement planner: Blackwell NVFP4/MXFP4/FP8 sizing, prefer_fp8_kv, a
         }
     }
 }
+
+namespace {
+
+// Node1 hardware: discrete AMD Radeon RX 9060 XT (Vulkan0, 15.9 GiB) +
+// integrated AMD Radeon 780M (Vulkan1, 31.8 GiB UMA).
+std::vector<si::GpuDeviceInfo> make_node1_hybrid_gpus(std::string discrete_hint = "vulkan") {
+    si::GpuDeviceInfo rx9060xt = make_amd_discrete("gpu:0", "AMD Radeon RX 9060 XT", 16, 15900, std::move(discrete_hint));
+    rx9060xt.device_id = 0x7590u;
+    rx9060xt.dedicated_total = si::MemoryReading::known(16288ull * kMiB);  // ~15.9 GiB
+    rx9060xt.source = "dxgi";
+
+    si::GpuDeviceInfo radeon780m = make_ryzen_780m_apu("gpu:1", "vulkan");
+    radeon780m.dedicated_total = si::MemoryReading::known(512ull * kMiB);
+    radeon780m.shared_total = si::MemoryReading::known(32051ull * kMiB);   // total 32563 MiB (~31.8 GiB)
+    radeon780m.dedicated_free = si::MemoryReading::known(31800ull * kMiB);
+    return {rx9060xt, radeon780m};
+}
+
+}  // namespace
+
+TEST_CASE("placement planner: hybrid Node1 host keeps fitting models discrete-only without unnecessary spread") {
+    const std::vector<si::GpuDeviceInfo> node1 = make_node1_hybrid_gpus("vulkan");
+    const si::HostMemory host48 = host_ram(48, 44);
+
+    // 1. Compact MoE (~4.7 GiB) fits easily on discrete RX 9060 XT alone.
+    {
+        si::PlacementPlanRequest req;
+        req.profile_name = "node1-compact-discrete";
+        req.model_path = "D:/models/compact-moe.gguf";
+        req.target_ctx_size = 32768;
+
+        const si::PlacementPlan plan = si::plan_model_placement(compact_moe_model(), node1, host48, req);
+        verify_plan_contracts(plan);
+
+        CHECK(plan.fits_in_vram);
+        CHECK(plan.fits_in_host_ram);
+        CHECK(plan.zero_cpu_spill);
+        CHECK_FALSE(plan.uma_mode);
+        CHECK(plan.combined_gpu_vram_mib == 15900u + 31800u);
+        CHECK(plan.recommended_backend_hint == "vulkan");
+        CHECK(plan.profile.device == std::optional<std::string>("Vulkan0"));
+        CHECK_FALSE(plan.profile.split_mode.has_value());
+        CHECK(plan.profile.tensor_split.empty());
+        CHECK(plan.recommended_devices == std::vector<std::string>{"Vulkan0"});
+        CHECK_FALSE(plan.multi_gpu_spread.active);
+        CHECK_FALSE(plan.multi_gpu_spread.hybrid_discrete_igpu);
+        CHECK(plan.multi_gpu_spread.per_device_split.empty());
+    }
+
+    // 2. Tight dense model fitting discrete alone via asymmetric q8_0/q4_0 KV stays discrete-only.
+    {
+        const si::GgufModelInfo tight_dense = dense_model(32, 360, 8);
+        si::PlacementPlanRequest req;
+        req.profile_name = "node1-tight-discrete";
+        req.model_path = "D:/models/tight-dense.gguf";
+        req.target_ctx_size = 32768;
+
+        const si::PlacementPlan plan = si::plan_model_placement(tight_dense, node1, host48, req);
+        verify_plan_contracts(plan);
+
+        CHECK(plan.fits_in_vram);
+        CHECK(plan.zero_cpu_spill);
+        CHECK(plan.profile.device == std::optional<std::string>("Vulkan0"));
+        CHECK(plan.recommended_devices == std::vector<std::string>{"Vulkan0"});
+        CHECK_FALSE(plan.multi_gpu_spread.active);
+    }
+}
+
+TEST_CASE("placement planner: Node1 80B MoE and 24 GiB dense trigger discrete+iGPU Vulkan spread with zero CPU spill") {
+    const std::vector<si::GpuDeviceInfo> node1 = make_node1_hybrid_gpus("vulkan");
+    const si::HostMemory host48 = host_ram(48, 44);
+
+    // 1. 80B MoE (~40 GiB) exceeds RX 9060 XT (15.9 GiB) alone but fits inside RX 9060 XT + 780M UMA (47.7 GiB).
+    {
+        si::PlacementPlanRequest req;
+        req.profile_name = "node1-80b-hybrid-spread";
+        req.model_path = "D:/models/Qwen3-Next-80B-A3B-Q4_K_S.gguf";
+        req.target_ctx_size = 32768;
+        req.cpu_logical_cores = 24;
+
+        const si::PlacementPlan plan = si::plan_model_placement(moe_80b_model(), node1, host48, req);
+        verify_plan_contracts(plan);
+
+        CHECK(plan.fits_in_vram);
+        CHECK(plan.fits_in_host_ram);
+        CHECK(plan.zero_cpu_spill);
+        CHECK_FALSE(plan.uma_mode);
+        CHECK(plan.combined_gpu_vram_mib == 15900u + 31800u);
+        CHECK(plan.recommended_backend_hint == "vulkan");
+        CHECK(plan.profile.n_gpu_layers == std::optional<std::int32_t>(-1));
+        CHECK(plan.profile.device == std::optional<std::string>("Vulkan0,Vulkan1"));
+        CHECK(plan.profile.split_mode == std::optional<std::string>("layer"));
+        CHECK_FALSE(plan.profile.main_gpu.has_value());  // discrete Vulkan0 stays main GPU (index 0)
+        CHECK(plan.profile.load_mode == std::optional<std::string>("auto"));
+        CHECK(plan.profile.flash_attn == std::optional<std::string>("auto"));
+        CHECK(plan.profile.cache_type_k == std::optional<std::string>("q8_0"));
+        CHECK(plan.profile.cache_type_v == std::optional<std::string>("q8_0"));
+        CHECK(plan.estimate.host_expert_bytes == 0u);
+        CHECK_FALSE(plan.moe_cache_mib.has_value());
+        CHECK(plan.repack_policy == "none");
+        CHECK(plan.recommended_devices == std::vector<std::string>{"Vulkan0", "Vulkan1"});
+
+        // Structured multi_gpu_spread recommendation.
+        CHECK(plan.multi_gpu_spread.active);
+        CHECK(plan.multi_gpu_spread.hybrid_discrete_igpu);
+        CHECK(plan.multi_gpu_spread.zero_cpu_spill);
+        CHECK(plan.multi_gpu_spread.backend == "vulkan");
+        CHECK(plan.multi_gpu_spread.llama_arg_device == "Vulkan0,Vulkan1");
+        CHECK(plan.multi_gpu_spread.combined_gpu_vram_mib == plan.budget_mib);
+        CHECK(plan.multi_gpu_spread.recommended_devices == std::vector<std::string>{"Vulkan0", "Vulkan1"});
+        REQUIRE(plan.multi_gpu_spread.per_device_split.size() == 2u);
+
+        const auto& dev0 = plan.multi_gpu_spread.per_device_split[0];
+        const auto& dev1 = plan.multi_gpu_spread.per_device_split[1];
+        CHECK(dev0.device == "Vulkan0");
+        CHECK(dev0.gpu_id == "gpu:0");
+        CHECK_FALSE(dev0.is_integrated_uma);
+        CHECK(dev0.budget_mib == 15900u - 1536u);
+        CHECK(dev0.estimated_mib > 0u);
+        CHECK(dev0.estimated_mib <= dev0.budget_mib);
+
+        CHECK(dev1.device == "Vulkan1");
+        CHECK(dev1.gpu_id == "gpu:1");
+        CHECK(dev1.is_integrated_uma);
+        CHECK(dev1.budget_mib == 31800u - 1536u);
+        CHECK(dev1.estimated_mib > 0u);
+        CHECK(dev1.estimated_mib <= dev1.budget_mib);
+
+        CHECK(dev0.tensor_split_weight + dev1.tensor_split_weight == doctest::Approx(1.0));
+        CHECK(plan.multi_gpu_spread.total_estimated_mib == dev0.estimated_mib + dev1.estimated_mib);
+        CHECK(any_contains(plan.reasons, "hybrid discrete+iGPU Vulkan spread"));
+        CHECK(any_contains(plan.reasons, "zero CPU spill"));
+
+        // Verify llama-server argv emits --device Vulkan0,Vulkan1 --split-mode layer --tensor-split ...
+        const auto argv = si::llamaserver_arguments(plan.profile);
+        REQUIRE_MESSAGE(argv.ok(), argv.status().message());
+        CHECK(std::find(argv->begin(), argv->end(), "--device") != argv->end());
+        CHECK(std::find(argv->begin(), argv->end(), "Vulkan0,Vulkan1") != argv->end());
+        CHECK(std::find(argv->begin(), argv->end(), "--split-mode") != argv->end());
+        CHECK(std::find(argv->begin(), argv->end(), "--tensor-split") != argv->end());
+        CHECK(std::find(argv->begin(), argv->end(), "--n-cpu-moe") == argv->end());
+
+        // Full JSON schema serialization & round-trip verification.
+        const json::Object doc = si::placement_plan_to_json(plan);
+        const auto reparsed = json::parse(json::Value(doc).dump());
+        REQUIRE_MESSAGE(reparsed.ok(), reparsed.status().message());
+        const json::Object& root = reparsed->as_object();
+        CHECK(root.find("combined_gpu_vram_mib")->as_uint() == plan.combined_gpu_vram_mib);
+        CHECK(root.find("zero_cpu_spill")->as_bool());
+        REQUIRE(root.find("recommended_devices") != nullptr);
+        REQUIRE(root.find("recommended_devices")->as_array().size() == 2u);
+        CHECK(root.find("recommended_devices")->as_array()[0].as_string() == "Vulkan0");
+        CHECK(root.find("recommended_devices")->as_array()[1].as_string() == "Vulkan1");
+
+        const json::Value* spread_val = root.find("multi_gpu_spread");
+        REQUIRE(spread_val != nullptr);
+        REQUIRE(spread_val->is_object());
+        CHECK(spread_val->find("active")->as_bool());
+        CHECK(spread_val->find("hybrid_discrete_igpu")->as_bool());
+        CHECK(spread_val->find("zero_cpu_spill")->as_bool());
+        CHECK(spread_val->find("backend")->as_string() == "vulkan");
+        CHECK(spread_val->find("llama_arg_device")->as_string() == "Vulkan0,Vulkan1");
+        CHECK(spread_val->find("combined_gpu_vram_mib")->as_uint() == plan.multi_gpu_spread.combined_gpu_vram_mib);
+        CHECK(spread_val->find("total_estimated_mib")->as_uint() == plan.multi_gpu_spread.total_estimated_mib);
+        REQUIRE(spread_val->find("per_device_split")->as_array().size() == 2u);
+        CHECK(spread_val->find("per_device_split")->as_array()[0].find("device")->as_string() == "Vulkan0");
+        CHECK(spread_val->find("per_device_split")->as_array()[1].find("device")->as_string() == "Vulkan1");
+    }
+
+    // 2. 22 GiB dense model fills fast discrete Vulkan0 first (>50% share) and puts only overflow on Vulkan1.
+    {
+        const si::GgufModelInfo dense_22g = dense_model(44, 512, 4);
+        si::PlacementPlanRequest req;
+        req.profile_name = "node1-dense-22g";
+        req.model_path = "D:/models/dense-22g.gguf";
+        req.target_ctx_size = 16384;
+
+        const si::PlacementPlan plan = si::plan_model_placement(dense_22g, node1, host48, req);
+        verify_plan_contracts(plan);
+
+        CHECK(plan.fits_in_vram);
+        CHECK(plan.fits_in_host_ram);
+        CHECK(plan.zero_cpu_spill);
+        CHECK(plan.multi_gpu_spread.active);
+        CHECK(plan.multi_gpu_spread.hybrid_discrete_igpu);
+        REQUIRE(plan.multi_gpu_spread.per_device_split.size() == 2u);
+        // Discrete-first split puts more weight on fast discrete Vulkan0 than slower iGPU Vulkan1.
+        CHECK(plan.multi_gpu_spread.per_device_split[0].tensor_split_weight >
+              plan.multi_gpu_spread.per_device_split[1].tensor_split_weight);
+        CHECK(plan.multi_gpu_spread.per_device_split[0].estimated_mib <=
+              plan.multi_gpu_spread.per_device_split[0].budget_mib);
+        CHECK(plan.multi_gpu_spread.per_device_split[1].estimated_mib <=
+              plan.multi_gpu_spread.per_device_split[1].budget_mib);
+    }
+
+    // 3. Reversed adapter order (iGPU at gpu:0, discrete RX 9060 XT ROCm at gpu:1) places discrete first
+    //    (Vulkan1,Vulkan0), keeps main_gpu on index 0 (discrete), and clears ROCm-only GPU_MAX_ALLOC_PERCENT.
+    {
+        const auto raw = make_node1_hybrid_gpus("rocm");
+        si::GpuDeviceInfo igpu0 = raw[1];
+        igpu0.id = "gpu:0";
+        si::GpuDeviceInfo dgpu1 = raw[0];
+        dgpu1.id = "gpu:1";
+
+        si::PlacementPlanRequest req;
+        req.profile_name = "node1-reversed-rocm-to-vulkan";
+        req.model_path = "D:/models/Qwen3-Next-80B-A3B-Q4_K_S.gguf";
+        req.target_ctx_size = 32768;
+
+        const si::PlacementPlan plan = si::plan_model_placement(moe_80b_model(), {igpu0, dgpu1}, host48, req);
+        verify_plan_contracts(plan);
+
+        CHECK(plan.fits_in_vram);
+        CHECK(plan.zero_cpu_spill);
+        CHECK(plan.recommended_backend_hint == "vulkan");
+        CHECK(plan.profile.device == std::optional<std::string>("Vulkan1,Vulkan0"));
+        CHECK(plan.recommended_devices == std::vector<std::string>{"Vulkan1", "Vulkan0"});
+        CHECK_FALSE(plan.profile.main_gpu.has_value());
+        CHECK_FALSE(find_env(plan.recommended_env, "GPU_MAX_ALLOC_PERCENT").has_value());
+        REQUIRE(plan.multi_gpu_spread.per_device_split.size() == 2u);
+        CHECK_FALSE(plan.multi_gpu_spread.per_device_split[0].is_integrated_uma);
+        CHECK(plan.multi_gpu_spread.per_device_split[1].is_integrated_uma);
+    }
+
+    // 4. Opt-out via allow_hybrid_gpu_spread=false and pinned single device_hint keep discrete + --n-cpu-moe.
+    {
+        si::PlacementPlanRequest no_spread;
+        no_spread.profile_name = "node1-no-spread";
+        no_spread.model_path = "D:/models/Qwen3-Next-80B-A3B-Q4_K_S.gguf";
+        no_spread.target_ctx_size = 32768;
+        no_spread.allow_hybrid_gpu_spread = false;
+
+        const si::PlacementPlan plan = si::plan_model_placement(moe_80b_model(), node1, host48, no_spread);
+        verify_plan_contracts(plan);
+        CHECK_FALSE(plan.multi_gpu_spread.active);
+        CHECK_FALSE(plan.zero_cpu_spill);
+        CHECK(plan.profile.device == std::optional<std::string>("Vulkan0"));
+        CHECK(plan.estimate.host_expert_bytes > 0u);
+
+        si::PlacementPlanRequest pinned = no_spread;
+        pinned.allow_hybrid_gpu_spread = true;
+        pinned.device_hint = "Vulkan0";
+        const si::PlacementPlan pinned_plan = si::plan_model_placement(moe_80b_model(), node1, host48, pinned);
+        verify_plan_contracts(pinned_plan);
+        CHECK_FALSE(pinned_plan.multi_gpu_spread.active);
+        CHECK(pinned_plan.profile.device == std::optional<std::string>("Vulkan0"));
+    }
+
+    // 5. Explicit device_hint="multi" on hybrid Node1 selects Vulkan0,Vulkan1.
+    {
+        si::PlacementPlanRequest multi_req;
+        multi_req.profile_name = "node1-explicit-multi";
+        multi_req.model_path = "D:/models/Qwen3-Next-80B-A3B-Q4_K_S.gguf";
+        multi_req.device_hint = "multi";
+        const si::PlacementPlan plan = si::plan_model_placement(moe_80b_model(), node1, host48, multi_req);
+        verify_plan_contracts(plan);
+        CHECK(plan.fits_in_vram);
+        CHECK(plan.zero_cpu_spill);
+        CHECK(plan.recommended_backend_hint == "vulkan");
+        CHECK(plan.profile.device == std::optional<std::string>("Vulkan0,Vulkan1"));
+        CHECK(plan.multi_gpu_spread.active);
+        CHECK(plan.multi_gpu_spread.hybrid_discrete_igpu);
+    }
+
+    // 6. gpu_pool_summary_to_json round-trips cleanly for hybrid Node1 and discrete-only hosts.
+    {
+        const si::GpuPoolSummary pool = si::summarize_gpu_pools(node1, host48);
+        const json::Object obj = si::gpu_pool_summary_to_json(pool);
+        const auto parsed = json::parse(json::Value(obj).dump());
+        REQUIRE_MESSAGE(parsed.ok(), parsed.status().message());
+        CHECK(parsed->find("discrete_vram_mib")->as_uint() == 16288u);
+        CHECK(parsed->find("integrated_uma_vram_mib")->as_uint() == 32563u);
+        CHECK(parsed->find("combined_gpu_vram_mib")->as_uint() == 16288u + 32563u);
+        CHECK(parsed->find("hybrid_vulkan_pool_available")->as_bool());
+        CHECK(parsed->find("llama_arg_device")->as_string() == "Vulkan0,Vulkan1");
+        REQUIRE(parsed->find("recommended_devices")->as_array().size() == 2u);
+        CHECK(parsed->find("recommended_devices")->as_array()[0].as_string() == "Vulkan0");
+        CHECK(parsed->find("recommended_devices")->as_array()[1].as_string() == "Vulkan1");
+
+        const si::GpuPoolSummary disc_only = si::summarize_gpu_pools({node1[0]}, host48);
+        const json::Object disc_obj = si::gpu_pool_summary_to_json(disc_only);
+        CHECK_FALSE(disc_obj.find("hybrid_vulkan_pool_available")->as_bool());
+        CHECK(disc_obj.find("llama_arg_device")->is_null());
+        CHECK(disc_obj.find("recommended_devices")->as_array().empty());
+    }
+}
+
+TEST_CASE("placement planner: insufficient combined discrete+UMA VRAM or host RAM falls back cleanly") {
+    const std::vector<si::GpuDeviceInfo> node1 = make_node1_hybrid_gpus("vulkan");
+
+    // 1. Oversized 65 GiB MoE exceeds combined discrete (15.9 GiB) + UMA (31.8 GiB) pool (~45 GiB usable):
+    //    must NOT falsely claim zero-CPU-spill hybrid spread; falls back to discrete + --n-cpu-moe + SLRU cache.
+    {
+        si::GgufModelInfo huge_moe = moe_80b_model();
+        for (auto& t : huge_moe.tensors) {
+            if (t.expert) {
+                const std::uint64_t extra = t.bytes / 2u + t.bytes / 4u;  // 1.75x expert size (~68 GiB total)
+                huge_moe.block_bytes[t.block] += extra;
+                t.bytes += extra;
+            }
+        }
+        si::PlacementPlanRequest req;
+        req.profile_name = "node1-huge-moe-fallback";
+        req.model_path = "D:/models/Qwen3-140B-MoE.gguf";
+        req.target_ctx_size = 32768;
+        req.cpu_logical_cores = 24;
+
+        const si::PlacementPlan plan = si::plan_model_placement(huge_moe, node1, host_ram(96, 84), req);
+        verify_plan_contracts(plan);
+
+        CHECK(plan.fits_in_vram);
+        CHECK(plan.fits_in_host_ram);
+        CHECK_FALSE(plan.zero_cpu_spill);
+        CHECK_FALSE(plan.multi_gpu_spread.active);
+        CHECK(plan.profile.device == std::optional<std::string>("Vulkan0"));
+        CHECK(plan.recommended_devices == std::vector<std::string>{"Vulkan0"});
+        CHECK(plan.estimate.host_expert_bytes > 0u);
+        CHECK(any_contains(plan.reasons, "could not fit model with zero CPU spill"));
+        CHECK(any_contains(plan.reasons, "--n-cpu-moe"));
+    }
+
+    // 2. Oversized 60 GiB dense model exceeds combined pool -> falls back to partial n_gpu_layers on discrete GPU.
+    {
+        const si::GgufModelInfo huge_dense = dense_model(60, 1024, 4);  // 60 GiB weights
+        si::PlacementPlanRequest req;
+        req.profile_name = "node1-huge-dense-fallback";
+        req.model_path = "D:/models/dense-60g.gguf";
+        req.target_ctx_size = 16384;
+        req.min_ctx_size = 8192;
+
+        const si::PlacementPlan plan = si::plan_model_placement(huge_dense, node1, host_ram(96, 80), req);
+        verify_plan_contracts(plan);
+
+        CHECK(plan.fits_in_vram);
+        CHECK_FALSE(plan.zero_cpu_spill);
+        CHECK_FALSE(plan.multi_gpu_spread.active);
+        CHECK(plan.profile.device == std::optional<std::string>("Vulkan0"));
+        REQUIRE(plan.profile.n_gpu_layers.has_value());
+        CHECK(*plan.profile.n_gpu_layers > 0);
+        CHECK(*plan.profile.n_gpu_layers < 60);
+        CHECK(any_contains(plan.warnings, "partial GPU offload"));
+    }
+
+    // 3. Host-RAM-capped UMA fallback: 40 GiB MoE on Node1 GPUs with only 16 GiB available host RAM
+    //    cannot back the ~28 GiB UMA shard in physical RAM, so hybrid spread refuses and falls back.
+    {
+        si::PlacementPlanRequest req;
+        req.profile_name = "node1-tight-host-ram-fallback";
+        req.model_path = "D:/models/Qwen3-Next-80B-A3B-Q4_K_S.gguf";
+        req.target_ctx_size = 16384;
+
+        const si::PlacementPlan plan = si::plan_model_placement(moe_80b_model(), node1, host_ram(24, 16), req);
+        verify_plan_contracts(plan);
+
+        CHECK_FALSE(plan.multi_gpu_spread.active);
+        CHECK_FALSE(plan.zero_cpu_spill);
+        CHECK(plan.profile.device == std::optional<std::string>("Vulkan0"));
+        CHECK(plan.combined_gpu_vram_mib == 15900u + 16u * 1024u);
+        CHECK(any_contains(plan.reasons, "could not fit model with zero CPU spill"));
+    }
+}
