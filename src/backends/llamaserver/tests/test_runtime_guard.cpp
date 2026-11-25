@@ -2,6 +2,7 @@
 // (docs/integration/vram-spill.md). GPU counters come from a fake source and
 // children from the fake launcher; nothing here needs a GPU or llama-server.
 #include "../gpu_memory.hpp"
+#include "../llamaserver_options.hpp"
 #include "../log_diagnostics.hpp"
 #include "../supervisor.hpp"
 #include "fake_process.hpp"
@@ -976,4 +977,165 @@ TEST_CASE("runtime status JSON shape") {
     CHECK(e.find("context")->find("configured_ctx")->is_null());
     CHECK(e.find("context")->find("fitted_ctx")->is_null());
     CHECK(e.find("gpu_memory")->find("error") == nullptr);
+}
+
+TEST_CASE("hybrid discrete+iGPU Vulkan0,Vulkan1 pool avoids false-positive spill kills while catching true discrete spill") {
+    constexpr std::uint64_t GiB = 1024ull * MiB;
+    constexpr AdapterLuid kRxLuid{0x00000000u, 0x000104A4u};
+    constexpr AdapterLuid kIgpuLuid{0x00000000u, 0x000118C2u};
+    const std::vector<AdapterLuidInfo> adapters{
+        {kRxLuid, false},
+        {kIgpuLuid, true},
+    };
+
+    GpuDeviceInfo rx9060xt;
+    rx9060xt.id = "gpu:0";
+    rx9060xt.name = "AMD Radeon RX 9060 XT";
+    rx9060xt.vendor = GpuVendor::amd;
+    rx9060xt.vendor_id = 0x1002u;
+    rx9060xt.dedicated_total = MemoryReading::known(16 * GiB);
+    rx9060xt.shared_total = MemoryReading::known(32 * GiB);
+    rx9060xt.is_integrated_uma = false;
+    rx9060xt.backend_hint = "vulkan";
+
+    GpuDeviceInfo radeon780m;
+    radeon780m.id = "gpu:1";
+    radeon780m.name = "AMD Radeon 780M Graphics";
+    radeon780m.vendor = GpuVendor::amd;
+    radeon780m.vendor_id = 0x1002u;
+    radeon780m.dedicated_total = MemoryReading::known(512 * MiB);
+    radeon780m.shared_total = MemoryReading::known(32 * GiB);
+    radeon780m.is_integrated_uma = true;
+    radeon780m.backend_hint = "vulkan";
+
+    const std::vector<GpuDeviceInfo> node1_gpus{rx9060xt, radeon780m};
+    const std::vector<std::string> hybrid_args{"--model", "qwen-80b.gguf", "--ctx-size", "32768",
+                                               "--device", "Vulkan0,Vulkan1", "-ngl", "999"};
+
+    const auto make_hybrid_counters = [&](std::uint32_t pid, std::uint64_t discrete_shared_bytes,
+                                          std::uint64_t uma_shared_bytes) {
+        GpuProcessCounters c;
+        c.dedicated = {{instance(pid, "0x000104A4"), 15 * GiB}, {instance(pid, "0x000118C2"), 512 * MiB}};
+        c.shared = {{instance(pid, "0x000104A4"), discrete_shared_bytes},
+                    {instance(pid, "0x000118C2"), uma_shared_bytes}};
+        classify_pdh_counters(c, adapters);
+        return c;
+    };
+
+    // 1. Healthy hybrid spread (~25 GiB intentional UMA shared on 780M, 160 MiB clean on RX 9060 XT):
+    //    must serve under BOTH policy=refuse and policy=auto_fit with zero context shrink.
+    for (const auto policy : {LlamaServerSpillPolicy::refuse, LlamaServerSpillPolicy::auto_fit}) {
+        auto state = pid_state();
+        auto source = std::make_shared<FakeCounters>([&](std::uint32_t pid) -> Result<GpuProcessCounters> {
+            return make_hybrid_counters(pid, 160 * MiB, 25 * GiB);
+        });
+        LlamaServerSpillGuardOptions guard_in;
+        guard_in.policy = policy;
+        guard_in.uma_mode_policy = "auto";
+
+        auto o = base_options();
+        o.arguments = hybrid_args;
+        o.health_check = [](std::uint16_t, std::chrono::milliseconds) { return true; };
+        o.gpu_counters = source;
+        o.spill_guard = to_spill_guard_options(guard_in, hybrid_args, node1_gpus);
+        REQUIRE(o.spill_guard.uma_mode);
+        REQUIRE(o.spill_guard.hybrid_uma_mode);
+
+        Supervisor s(o, std::make_unique<FakeLauncher>(state));
+        const auto started = s.start();
+        REQUIRE_MESSAGE(started.ok(), started.status().to_string());
+        const auto status = s.runtime_status();
+        CHECK_FALSE(status.gpu_memory.spilled);
+        CHECK_FALSE(find_warning(status, "vram_spill"));
+        CHECK(status.context.fit_attempts == 0);
+        CHECK(status.context.fitted_ctx == 32768u);
+        CHECK(launched_contexts(state) == std::vector<std::uint64_t>{32768u});
+        s.stop();
+    }
+
+    // 2. Genuine discrete VRAM spill inside a hybrid spread (RX 9060 XT 950 MiB shared + 780M 25 GiB UMA):
+    //    refuse policy still fails startup, and auto_fit reduces ctx until discrete shared drops clean.
+    {
+        auto state = pid_state();
+        auto source = std::make_shared<FakeCounters>([&](std::uint32_t pid) -> Result<GpuProcessCounters> {
+            return make_hybrid_counters(pid, 950 * MiB, 25 * GiB);
+        });
+        LlamaServerSpillGuardOptions guard_in;
+        guard_in.policy = LlamaServerSpillPolicy::refuse;
+        guard_in.uma_mode_policy = "auto";
+
+        auto o = base_options();
+        o.arguments = hybrid_args;
+        o.health_check = [](std::uint16_t, std::chrono::milliseconds) { return true; };
+        o.gpu_counters = source;
+        o.spill_guard = to_spill_guard_options(guard_in, hybrid_args, node1_gpus);
+
+        Supervisor s(o, std::make_unique<FakeLauncher>(state));
+        const auto started = s.start();
+        REQUIRE_FALSE(started.ok());
+        CHECK(started.status().code() == ErrorCode::unavailable);
+        CHECK(s.runtime_status().context.outcome == "refused");
+        CHECK(s.runtime_status().gpu_memory.spilled);
+    }
+
+    {
+        auto state = pid_state();
+        auto source = std::make_shared<FakeCounters>([state, &make_hybrid_counters](std::uint32_t pid) -> Result<GpuProcessCounters> {
+            std::lock_guard lock(state->mutex);
+            const auto index = static_cast<std::size_t>(pid - 1000);
+            if (pid < 1000 || index >= state->specs.size())
+                return Status(ErrorCode::internal, "unknown fake pid");
+            const auto ctx = find_context_size(state->specs[index].arguments);
+            if (!ctx)
+                return Status(ErrorCode::internal, "missing ctx");
+            const std::uint64_t discrete_shared = *ctx > 24576u ? 950 * MiB : 160 * MiB;
+            return make_hybrid_counters(pid, discrete_shared, 25 * GiB);
+        });
+        LlamaServerSpillGuardOptions guard_in;
+        guard_in.policy = LlamaServerSpillPolicy::auto_fit;
+        guard_in.uma_mode_policy = "auto";
+
+        auto o = base_options();
+        o.arguments = hybrid_args;
+        o.health_check = [](std::uint16_t, std::chrono::milliseconds) { return true; };
+        o.gpu_counters = source;
+        o.spill_guard = to_spill_guard_options(guard_in, hybrid_args, node1_gpus);
+
+        Supervisor s(o, std::make_unique<FakeLauncher>(state));
+        const auto started = s.start();
+        REQUIRE_MESSAGE(started.ok(), started.status().to_string());
+        const auto status = s.runtime_status();
+        CHECK_FALSE(status.gpu_memory.spilled);
+        CHECK(status.context.outcome == "fitted");
+        CHECK(status.context.fit_attempts >= 1);
+        CHECK(status.context.fitted_ctx.value_or(0) <= 24576u);
+        s.stop();
+    }
+
+    // 3. Unclassified aggregate counters in hybrid mode (e.g. Linux combined amdgpu-fdinfo):
+    //    must NOT false-positive kill or shrink a healthy hybrid spread.
+    {
+        auto state = pid_state();
+        auto source = std::make_shared<FakeCounters>([](std::uint32_t pid) -> Result<GpuProcessCounters> {
+            GpuProcessCounters c;
+            c.dedicated = {{"pid_" + std::to_string(pid) + "_drm_fdinfo", 15 * GiB + 512 * MiB}};
+            c.shared = {{"pid_" + std::to_string(pid) + "_drm_fdinfo", 25 * GiB + 160 * MiB}};
+            return c;
+        });
+        LlamaServerSpillGuardOptions guard_in;
+        guard_in.policy = LlamaServerSpillPolicy::refuse;
+        guard_in.uma_mode_policy = "auto";
+
+        auto o = base_options();
+        o.arguments = hybrid_args;
+        o.health_check = [](std::uint16_t, std::chrono::milliseconds) { return true; };
+        o.gpu_counters = source;
+        o.spill_guard = to_spill_guard_options(guard_in, hybrid_args, node1_gpus);
+
+        Supervisor s(o, std::make_unique<FakeLauncher>(state));
+        const auto started = s.start();
+        REQUIRE_MESSAGE(started.ok(), started.status().to_string());
+        CHECK_FALSE(s.runtime_status().gpu_memory.spilled);
+        s.stop();
+    }
 }

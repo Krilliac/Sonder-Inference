@@ -2,11 +2,13 @@
 #include "gpu_residency.hpp"
 
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <unordered_set>
 #include <utility>
 
 #if defined(_WIN32)
+#include <mutex>
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -14,13 +16,13 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <dxgi.h>
 // windows.h must precede the PDH headers.
 #include <pdh.h>
 #include <pdhmsg.h>
 #elif defined(__linux__)
 #include <algorithm>
 #include <cerrno>
-#include <cstring>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <fstream>
@@ -83,7 +85,121 @@ std::optional<std::uint64_t> parse_drm_memory_bytes(std::string_view text) noexc
     return *count * multiplier;
 }
 
+char ascii_lower_ch(char c) noexcept {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+bool parse_hex_u32_token(std::string_view text, std::size_t &pos, std::uint32_t &out) noexcept {
+    if (pos + 2 >= text.size() || text[pos] != '0' || (text[pos + 1] != 'x' && text[pos + 1] != 'X'))
+        return false;
+    pos += 2;
+    std::uint32_t value = 0;
+    std::size_t digits = 0;
+    while (pos < text.size()) {
+        const char c = text[pos];
+        std::uint32_t nibble = 0;
+        if (c >= '0' && c <= '9') {
+            nibble = static_cast<std::uint32_t>(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            nibble = static_cast<std::uint32_t>(10 + (c - 'a'));
+        } else if (c >= 'A' && c <= 'F') {
+            nibble = static_cast<std::uint32_t>(10 + (c - 'A'));
+        } else {
+            break;
+        }
+        if (++digits > 8)
+            return false;
+        value = (value << 4) | nibble;
+        ++pos;
+    }
+    if (digits == 0)
+        return false;
+    out = value;
+    return true;
+}
+
 #if defined(_WIN32)
+constexpr GUID kIidDxgiFactory1 = {0x770aae78u, 0xf26fu, 0x4dbau, {0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87}};
+
+struct ScopedWin32Library {
+    HMODULE handle = nullptr;
+    explicit ScopedWin32Library(HMODULE h) noexcept : handle(h) {}
+    ~ScopedWin32Library() {
+        if (handle)
+            FreeLibrary(handle);
+    }
+    ScopedWin32Library(const ScopedWin32Library &) = delete;
+    ScopedWin32Library &operator=(const ScopedWin32Library &) = delete;
+};
+
+template <typename T>
+struct ScopedComPtr {
+    T *ptr = nullptr;
+    ScopedComPtr() noexcept = default;
+    ~ScopedComPtr() {
+        if (ptr)
+            ptr->Release();
+    }
+    ScopedComPtr(const ScopedComPtr &) = delete;
+    ScopedComPtr &operator=(const ScopedComPtr &) = delete;
+};
+
+template <typename Fn>
+bool load_win32_symbol(HMODULE handle, const char *symbol, Fn &out) noexcept {
+    static_assert(sizeof(Fn) == sizeof(FARPROC));
+    const FARPROC raw = GetProcAddress(handle, symbol);
+    if (!raw)
+        return false;
+    std::memcpy(&out, &raw, sizeof(out));
+    return true;
+}
+
+// Mirrors src/devices/device.cpp is_integrated_uma_memory() so DXGI LUID
+// classification stays identical to GPU inventory discovery.
+bool is_dxgi_integrated_uma(UINT vendor_id, std::uint64_t dedicated_bytes, std::uint64_t shared_bytes) noexcept {
+    if (dedicated_bytes == 0 && shared_bytes > 0)
+        return true;
+    if (vendor_id == 0x106Bu && shared_bytes > 0)
+        return true;
+    constexpr std::uint64_t kTwoGiB = 2ull * 1024ull * kMiB;
+    if ((vendor_id == 0x1002u || vendor_id == 0x8086u) && dedicated_bytes <= kTwoGiB &&
+        shared_bytes >= 4ull * dedicated_bytes && shared_bytes > 0)
+        return true;
+    return false;
+}
+
+void query_dxgi_adapter_luids(std::vector<AdapterLuidInfo> &hardware, std::vector<AdapterLuid> &non_hardware) {
+    hardware.clear();
+    non_hardware.clear();
+    ScopedWin32Library dxgi(LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32));
+    if (!dxgi.handle)
+        return;
+    using CreateDXGIFactory1Fn = HRESULT(WINAPI *)(REFIID, void **);
+    CreateDXGIFactory1Fn create_factory = nullptr;
+    if (!load_win32_symbol(dxgi.handle, "CreateDXGIFactory1", create_factory))
+        return;
+    ScopedComPtr<IDXGIFactory1> factory;
+    if (FAILED(create_factory(kIidDxgiFactory1, reinterpret_cast<void **>(&factory.ptr))) || !factory.ptr)
+        return;
+    for (UINT i = 0; i < 64u; ++i) {
+        ScopedComPtr<IDXGIAdapter1> adapter;
+        if (FAILED(factory.ptr->EnumAdapters1(i, &adapter.ptr)) || !adapter.ptr)
+            break;
+        DXGI_ADAPTER_DESC1 desc{};
+        if (FAILED(adapter.ptr->GetDesc1(&desc)))
+            continue;
+        const AdapterLuid luid{static_cast<std::uint32_t>(desc.AdapterLuid.HighPart),
+                               static_cast<std::uint32_t>(desc.AdapterLuid.LowPart)};
+        if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 || desc.VendorId == 0x1414u) {
+            non_hardware.push_back(luid);
+            continue;
+        }
+        const bool is_uma = is_dxgi_integrated_uma(desc.VendorId, static_cast<std::uint64_t>(desc.DedicatedVideoMemory),
+                                                   static_cast<std::uint64_t>(desc.SharedSystemMemory));
+        hardware.push_back(AdapterLuidInfo{luid, is_uma});
+    }
+}
+
 std::string hex_status(PDH_STATUS status) {
     static constexpr char kDigits[] = "0123456789ABCDEF";
     std::string out = "0x";
@@ -187,8 +303,59 @@ class PdhCounterSource final : public GpuCounterSource {
             return st;
         if (auto st = read_array(shared, counters.shared); !st.ok())
             return st;
+        classify_live(counters);
         return counters;
     }
+
+  private:
+    void classify_live(GpuProcessCounters &counters) {
+        if (counters.dedicated.empty() && counters.shared.empty())
+            return;
+        std::lock_guard lock(dxgi_mutex_);
+        if (!dxgi_loaded_) {
+            query_dxgi_adapter_luids(hardware_luids_, non_hardware_luids_);
+            dxgi_loaded_ = true;
+        }
+        const auto is_known = [&](const AdapterLuid &luid) noexcept {
+            for (const auto &hw : hardware_luids_) {
+                if (hw.luid == luid)
+                    return true;
+            }
+            for (const auto &other : non_hardware_luids_) {
+                if (other == luid)
+                    return true;
+            }
+            return false;
+        };
+        const auto has_unseen_luid = [&](const std::vector<CounterInstance> &items) noexcept {
+            for (const auto &item : items) {
+                const auto luid = parse_pdh_adapter_luid(item.name);
+                if (luid && !is_known(*luid))
+                    return true;
+            }
+            return false;
+        };
+        if (has_unseen_luid(counters.dedicated) || has_unseen_luid(counters.shared)) {
+            query_dxgi_adapter_luids(hardware_luids_, non_hardware_luids_);
+            const auto record_remaining = [&](const std::vector<CounterInstance> &items) {
+                for (const auto &item : items) {
+                    if (non_hardware_luids_.size() >= 64u)
+                        break;
+                    const auto luid = parse_pdh_adapter_luid(item.name);
+                    if (luid && !is_known(*luid))
+                        non_hardware_luids_.push_back(*luid);
+                }
+            };
+            record_remaining(counters.dedicated);
+            record_remaining(counters.shared);
+        }
+        classify_pdh_counters(counters, hardware_luids_);
+    }
+
+    std::mutex dxgi_mutex_;
+    bool dxgi_loaded_ = false;
+    std::vector<AdapterLuidInfo> hardware_luids_;
+    std::vector<AdapterLuid> non_hardware_luids_;
 };
 #else
 class UnsupportedCounterSource final : public GpuCounterSource {
@@ -388,8 +555,8 @@ class NvmlProcessProbe {
                 has_valid_bytes |= query_list<NvmlProcessInfoV1>(graphics_v1_, dev, pid, used_bytes);
             if (has_valid_bytes) {
                 const std::string instance = "pid_" + std::to_string(pid) + "_nvml_" + std::to_string(i);
-                out.dedicated.push_back({instance, used_bytes});
-                out.shared.push_back({instance, 0});
+                out.dedicated.push_back({instance, used_bytes, CounterAdapterKind::discrete});
+                out.shared.push_back({instance, 0, CounterAdapterKind::discrete});
             }
         }
     }
@@ -628,6 +795,62 @@ bool parse_linux_drm_fdinfo(std::string_view fdinfo_text, std::uint64_t &vram_by
     return parsed_any;
 }
 
+std::optional<AdapterLuid> parse_pdh_adapter_luid(std::string_view instance_name) noexcept {
+    constexpr std::string_view kTag = "_luid_";
+    if (instance_name.size() < kTag.size() + 7)
+        return std::nullopt;
+    std::size_t tag_pos = std::string_view::npos;
+    for (std::size_t i = 0; i + kTag.size() <= instance_name.size(); ++i) {
+        bool match = true;
+        for (std::size_t j = 0; j < kTag.size(); ++j) {
+            if (ascii_lower_ch(instance_name[i + j]) != kTag[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            tag_pos = i;
+            break;
+        }
+    }
+    if (tag_pos == std::string_view::npos)
+        return std::nullopt;
+    std::size_t pos = tag_pos + kTag.size();
+    std::uint32_t high = 0;
+    std::uint32_t low = 0;
+    if (!parse_hex_u32_token(instance_name, pos, high))
+        return std::nullopt;
+    if (pos >= instance_name.size() || instance_name[pos] != '_')
+        return std::nullopt;
+    ++pos;
+    if (!parse_hex_u32_token(instance_name, pos, low))
+        return std::nullopt;
+    if (pos < instance_name.size() && instance_name[pos] != '_')
+        return std::nullopt;
+    return AdapterLuid{high, low};
+}
+
+void classify_pdh_counters(GpuProcessCounters &counters, const std::vector<AdapterLuidInfo> &adapters) noexcept {
+    if (adapters.empty())
+        return;
+    const auto classify_vec = [&](std::vector<CounterInstance> &items) noexcept {
+        for (auto &item : items) {
+            const auto luid = parse_pdh_adapter_luid(item.name);
+            if (!luid)
+                continue;
+            for (const auto &adapter : adapters) {
+                if (adapter.luid == *luid) {
+                    item.adapter_kind = adapter.is_integrated_uma ? CounterAdapterKind::integrated_uma
+                                                                  : CounterAdapterKind::discrete;
+                    break;
+                }
+            }
+        }
+    };
+    classify_vec(counters.dedicated);
+    classify_vec(counters.shared);
+}
+
 bool is_process_instance(std::string_view name, std::uint32_t pid) {
     const std::string prefix = "pid_" + std::to_string(pid) + "_";
     return name.size() > prefix.size() && name.compare(0, prefix.size(), prefix) == 0;
@@ -637,19 +860,65 @@ GpuMemorySample summarize_gpu_counters(std::uint32_t pid, const GpuProcessCounte
     GpuMemorySample sample;
     std::size_t dedicated_instances = 0;
     std::size_t shared_instances = 0;
+    std::size_t discrete_dedicated_instances = 0;
+    std::size_t discrete_shared_instances = 0;
+    std::size_t uma_dedicated_instances = 0;
+    std::size_t uma_shared_instances = 0;
+    bool any_classified = false;
+    bool any_nonzero_unknown = false;
+
     for (const auto &item : counters.dedicated) {
         if (!is_process_instance(item.name, pid))
             continue;
         sample.dedicated_bytes = saturating_add(sample.dedicated_bytes, item.value);
         ++dedicated_instances;
+        switch (item.adapter_kind) {
+        case CounterAdapterKind::discrete:
+            sample.discrete_dedicated_bytes = saturating_add(sample.discrete_dedicated_bytes, item.value);
+            ++discrete_dedicated_instances;
+            any_classified = true;
+            break;
+        case CounterAdapterKind::integrated_uma:
+            sample.uma_dedicated_bytes = saturating_add(sample.uma_dedicated_bytes, item.value);
+            ++uma_dedicated_instances;
+            any_classified = true;
+            break;
+        case CounterAdapterKind::unknown:
+            if (item.value > 0)
+                any_nonzero_unknown = true;
+            break;
+        }
     }
     for (const auto &item : counters.shared) {
         if (!is_process_instance(item.name, pid))
             continue;
         sample.shared_bytes = saturating_add(sample.shared_bytes, item.value);
         ++shared_instances;
+        switch (item.adapter_kind) {
+        case CounterAdapterKind::discrete:
+            sample.discrete_shared_bytes = saturating_add(sample.discrete_shared_bytes, item.value);
+            ++discrete_shared_instances;
+            any_classified = true;
+            break;
+        case CounterAdapterKind::integrated_uma:
+            sample.uma_shared_bytes = saturating_add(sample.uma_shared_bytes, item.value);
+            ++uma_shared_instances;
+            any_classified = true;
+            break;
+        case CounterAdapterKind::unknown:
+            if (item.value > 0)
+                any_nonzero_unknown = true;
+            break;
+        }
     }
     sample.instances = dedicated_instances > shared_instances ? dedicated_instances : shared_instances;
+    sample.discrete_instances = discrete_dedicated_instances > discrete_shared_instances
+                                    ? discrete_dedicated_instances
+                                    : discrete_shared_instances;
+    sample.uma_instances = uma_dedicated_instances > uma_shared_instances
+                               ? uma_dedicated_instances
+                               : uma_shared_instances;
+    sample.has_adapter_classification = any_classified && !any_nonzero_unknown;
     return sample;
 }
 
@@ -713,12 +982,28 @@ std::uint64_t effective_baseline(const SpillGuardOptions &options, std::optional
     return saturating_add(options.baseline_bytes, growth);
 }
 
+std::uint64_t effective_spill_shared_bytes(const GpuMemorySample &sample,
+                                           const SpillGuardOptions &options) noexcept {
+    if (options.uma_mode && !options.hybrid_uma_mode)
+        return 0;
+    if (sample.has_adapter_classification) {
+        if (options.hybrid_uma_mode || sample.discrete_instances > 0)
+            return sample.discrete_shared_bytes;
+    }
+    if (options.uma_mode || options.hybrid_uma_mode)
+        return 0;
+    return sample.shared_bytes;
+}
+
 bool is_spilled(const GpuMemorySample &sample, const SpillGuardOptions &options,
                 std::optional<std::uint64_t> ctx) {
-    if (options.uma_mode)
+    if (options.uma_mode && !options.hybrid_uma_mode)
         return false;
+    if (options.hybrid_uma_mode && !sample.has_adapter_classification)
+        return false;
+    const std::uint64_t spill_shared = effective_spill_shared_bytes(sample, options);
     const auto limit = saturating_add(effective_baseline(options, ctx), options.threshold_bytes);
-    return sample.shared_bytes > limit;
+    return spill_shared > limit;
 }
 
 std::optional<std::uint64_t> next_fit_context(std::uint64_t current, const SpillGuardOptions &o) {

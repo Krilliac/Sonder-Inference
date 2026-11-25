@@ -526,6 +526,9 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
             needs_live_gpus ? enumerate_gpu_devices() : std::vector<GpuDeviceInfo>{};
         lo.spill_guard.uma_mode =
             detail::resolve_uma_mode(setup.llamaserver_spill_uma_mode, live_gpus, device_hint);
+        if (is_spawn && setup.llamaserver_spill_uma_mode == "auto") {
+            lo.spill_guard.uma_mode_policy = "auto";
+        }
         lo.spill_guard.residency_uma_mode_explicit = !setup.llamaserver_residency.uma_mode.empty();
         if (auto st = detail::apply_residency_config(setup, lo.spill_guard.residency, live_gpus); !st.ok()) return st;
         lo.stall_guard.enabled = setup.llamaserver_stall_guard;
