@@ -23,7 +23,14 @@ namespace sonder::inference::server::detail {
 inline constexpr std::size_t kMaxImageDecodedBytes = 16u * 1024u * 1024u;
 inline constexpr std::size_t kMaxImagesPerRequest = 8u;
 inline constexpr std::size_t kMaxToolsPerRequest = 128u;
+inline constexpr std::size_t kMaxToolCallsPerMessage = 64u;
 inline constexpr std::size_t kMaxToolCallPayloadBytes = 256u * 1024u;
+
+// True for 1..128 bytes of [A-Za-z0-9_.-].
+[[nodiscard]] bool is_valid_tool_name(std::string_view name) noexcept;
+
+// True for 1..128 bytes without ASCII control characters (< 0x20 or 0x7F).
+[[nodiscard]] bool is_valid_tool_call_id(std::string_view id) noexcept;
 
 // True for image/png, image/jpeg, image/webp, image/gif.
 [[nodiscard]] bool is_supported_image_mime(std::string_view mime) noexcept;
@@ -103,6 +110,11 @@ public:
 private:
     enum class State { text, in_xml, in_fence };
 
+    void reset_scan_state() noexcept {
+        scan_pos_ = 0;
+        in_str_ = false;
+        esc_ = false;
+    }
     void try_emit_payload(std::string_view payload, std::string_view raw_close, ToolCallStreamOutput& out);
     std::string next_call_id();
 
@@ -110,6 +122,9 @@ private:
     State state_ = State::text;
     std::string buf_;
     std::string raw_open_;
+    std::size_t scan_pos_ = 0;
+    bool in_str_ = false;
+    bool esc_ = false;
     std::uint32_t next_index_ = 0;
     std::vector<ToolCall> completed_;
 };
