@@ -138,7 +138,13 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
                 }
                 const auto now = std::chrono::steady_clock::now();
                 if (now >= deadline) {
-                    session->cancel();
+                    // Only cancel via the watcher once the backend has started; pre-start
+                    // queue/scheduler waits enforce ro.deadline directly so queued deadline
+                    // expirations report ErrorCode::timeout (request.failed) instead of
+                    // racing into request.cancelled.
+                    if (backend_started.load()) {
+                        session->cancel();
+                    }
                 } else if (job.stream && !disconnected.load() && !ex.hard_stop.load() &&
                            !sse.maybe_send_keepalive()) {
                     disconnected.store(true);
@@ -584,7 +590,13 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
                 }
                 const auto now = std::chrono::steady_clock::now();
                 if (now >= deadline) {
-                    session->cancel();
+                    // Only cancel via the watcher once the backend has started; pre-start
+                    // queue/scheduler waits enforce ro.deadline directly so queued deadline
+                    // expirations report ErrorCode::timeout (request.failed) instead of
+                    // racing into request.cancelled.
+                    if (backend_started.load()) {
+                        session->cancel();
+                    }
                 } else if (job.stream && !disconnected.load() && !ex.hard_stop.load() &&
                            !sse.maybe_send_keepalive()) {
                     disconnected.store(true);
@@ -815,7 +827,9 @@ void execute_embeddings(ChatExchange& ex, const EmbedJob& job, const Correlation
                     disconnected.store(true);
                     session->cancel();
                 }
-                if (std::chrono::steady_clock::now() >= deadline) session->cancel();
+                if (std::chrono::steady_clock::now() >= deadline && backend_started.load()) {
+                    session->cancel();
+                }
                 lock.lock();
                 watch_cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return watch_done; });
             }

@@ -725,3 +725,54 @@ TEST_CASE("summarize_gpu_pools and combined_gpu_vram_mib model discrete-only, UM
         CHECK(tcc_pool.hybrid_vulkan_devices.empty());
     }
 }
+
+TEST_CASE("shared match_single_gpu_hint and resolve_uma_selection unify GPU-hint and UMA classification") {
+    constexpr std::uint64_t kMiB = 1024ull * 1024ull;
+
+    GpuDeviceInfo rx9060xt;
+    rx9060xt.id = "gpu:0";
+    rx9060xt.name = "AMD Radeon RX 9060 XT";
+    rx9060xt.vendor = GpuVendor::amd;
+    rx9060xt.dedicated_total = MemoryReading::known(16384ull * kMiB);
+    rx9060xt.is_integrated_uma = false;
+    rx9060xt.backend_hint = "rocm";
+    rx9060xt.rocm_runtime_ordinal = 0;
+
+    GpuDeviceInfo radeon780m;
+    radeon780m.id = "gpu:1";
+    radeon780m.name = "AMD Radeon 780M Graphics";
+    radeon780m.vendor = GpuVendor::amd;
+    radeon780m.is_integrated_uma = true;
+    radeon780m.backend_hint = "vulkan";
+
+    const std::vector<GpuDeviceInfo> hybrid{rx9060xt, radeon780m};
+
+    CHECK(match_single_gpu_hint(hybrid, "uma") == std::optional<std::size_t>(1));
+    CHECK(match_single_gpu_hint(hybrid, "igpu") == std::optional<std::size_t>(1));
+    CHECK(match_single_gpu_hint(hybrid, "apu") == std::optional<std::size_t>(1));
+    CHECK(match_single_gpu_hint(hybrid, "rocm:0") == std::optional<std::size_t>(0));
+    CHECK(match_single_gpu_hint(hybrid, "Vulkan0") == std::optional<std::size_t>(0));
+    CHECK(match_single_gpu_hint(hybrid, "Vulkan1") == std::optional<std::size_t>(1));
+    CHECK_FALSE(match_single_gpu_hint(hybrid, "bogus").has_value());
+    // require_known_vram=true skips unknown-VRAM GPUs (used by select_gpu_vram_budget_mib).
+    CHECK_FALSE(match_single_gpu_hint(hybrid, "uma", false, true).has_value());
+
+    CHECK(normalize_uma_mode("on") == std::optional<std::string_view>("on"));
+    CHECK(normalize_uma_mode("true") == std::optional<std::string_view>("on"));
+    CHECK(normalize_uma_mode("off") == std::optional<std::string_view>("off"));
+    CHECK(normalize_uma_mode("false") == std::optional<std::string_view>("off"));
+    CHECK(normalize_uma_mode("auto") == std::optional<std::string_view>("auto"));
+    CHECK_FALSE(normalize_uma_mode("maybe").has_value());
+    CHECK(is_valid_uma_mode("auto"));
+    CHECK_FALSE(is_valid_uma_mode("invalid"));
+
+    CHECK(extract_device_hint({"--port", "8080", "--device", "Vulkan0", "-dev=Vulkan0,Vulkan1"}) ==
+          "Vulkan0,Vulkan1");
+    CHECK(resolve_uma_selection("auto", hybrid) == UmaSelectionMode::discrete_only);
+    CHECK(resolve_uma_selection("auto", hybrid, "Vulkan0") == UmaSelectionMode::discrete_only);
+    CHECK(resolve_uma_selection("auto", hybrid, "Vulkan1") == UmaSelectionMode::uma_only);
+    CHECK(resolve_uma_selection("auto", hybrid, "Vulkan0,Vulkan1") == UmaSelectionMode::hybrid);
+    CHECK(resolve_uma_selection("auto", hybrid, "Vulkan0,bogus") == UmaSelectionMode::discrete_only);
+    CHECK(resolve_uma_mode("auto", hybrid, "Vulkan0,Vulkan1"));
+    CHECK_FALSE(resolve_uma_mode("auto", hybrid, "Vulkan0"));
+}
