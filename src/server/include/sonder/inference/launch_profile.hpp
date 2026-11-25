@@ -77,6 +77,10 @@ struct LaunchProfile {
     std::vector<double> tensor_split;            // -ts/--tensor-split: positive finite weights (<= 16 GPUs)
     std::optional<std::string> load_mode;        // -lm/--load-mode: auto, mmap, none, mlock, mmap+mlock or dio
     std::optional<bool> no_repack;               // -nr/--no-repack
+    // Dynamic SLRU MoE expert VRAM cache (llama-server --moe-cache-mib / --moe-cache-cpu-share).
+    // Leave unset when a MoE model fits 100% in VRAM to avoid ~10% graph-splitting overhead.
+    std::optional<std::uint32_t> moe_cache_mib;      // 0..262144 MiB
+    std::optional<double> moe_cache_cpu_share;       // [0.0, 1.0]
     std::optional<std::uint32_t> batch_size;
     std::optional<std::uint32_t> ubatch_size;
     std::optional<std::uint32_t> parallel;
@@ -144,7 +148,7 @@ double kv_cache_type_bytes(std::string_view type) noexcept;
 // llama-server --spec-type values (verified against `llama-server --help`).
 inline constexpr std::string_view kSpeculativeTypes[] = {
     "none",         "draft-simple", "draft-eagle3", "draft-mtp",     "draft-dflash", "draft-dspark",
-    "ngram-simple", "ngram-map-k",  "ngram-map-k4v", "ngram-mod",    "ngram-cache"};
+    "ngram-simple", "ngram-map-k",  "ngram-map-k4v", "ngram-mod",    "ngram-cache",  "suffix"};
 
 // Strict parsing: unknown keys, wrong types and out-of-range values are
 // errors (invalid_argument naming the profile and field). `document` is
@@ -261,6 +265,9 @@ struct GgufModelInfo {
     bool has_one_bit_tensors = false;        // ggml type 41 (Q1_0)
     bool has_prism_private_tensors = false;  // ggml types 142 (PQ2_0), 143 (PTQ1_0), 145 (PQ2_0M)
     bool has_fp4_or_fp8_tensors = false;     // ggml types 39 (MXFP4), 40 (NVFP4), 43 (F8_E4M3)
+    bool has_mxfp4_tensors = false;          // ggml type 39 (MXFP4: 32 elems, 17 B, 4.25 bpw)
+    bool has_nvfp4_tensors = false;          // ggml type 40 (NVFP4: 64 elems, 36 B, 4.50 bpw, Blackwell)
+    bool has_fp8_tensors = false;            // ggml type 43 (F8_E4M3: 1 elem, 1 B, 8.00 bpw, OCP FP8)
     // Identity metadata extracted during the single-pass header scan.
     // `quantization` comes from `general.file_type` when recognized, or the
     // dominant tensor ggml type name when `general.file_type` is absent; empty
@@ -321,6 +328,9 @@ struct MoePlacement {
     bool repack = true;
     // --n-cpu-ffn/-ncffn N (recorded only; its placement is not modelled).
     std::uint32_t n_cpu_ffn = 0;
+    // Dynamic SLRU MoE expert VRAM cache (--moe-cache-mib / --moe-cache-cpu-share).
+    std::uint32_t moe_cache_mib = 0;
+    double moe_cache_cpu_share = 0.0;
     [[nodiscard]] bool has_tensor_rules() const noexcept { return !rules.empty(); }
 };
 
@@ -347,6 +357,7 @@ struct VramEstimate {
     std::uint64_t kv_bytes = 0;
     std::uint64_t recurrent_bytes = 0;  // recurrent state of GPU blocks x recurrent_sequences x recurrent_snapshots
     std::uint64_t compute_bytes = 0;    // compute buffers and runtime allowance
+    std::uint64_t moe_cache_bytes = 0;  // dynamic SLRU MoE expert VRAM cache (--moe-cache-mib)
     std::uint64_t total_bytes = 0;
     std::uint32_t gpu_layers = 0;
     std::uint32_t attention_layers = 0;      // attention layers whose KV is on the GPU (full and sliding-window)

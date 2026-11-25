@@ -2557,3 +2557,145 @@ TEST_CASE("profile_catalog: multi-profile llamaserver attach and shared-model sp
     std::filesystem::remove(m1_file, ec);
     std::filesystem::remove(m2_file, ec);
 }
+
+TEST_CASE("launch profile: moe_cache_mib, moe_cache_cpu_share, and suffix speculation parse, validate, and emit argv") {
+    const LaunchProfile p = parse_single(R"({
+        "name": "moe-slru-suffix", "backend": "llamaserver", "model": "qwen3-80b.gguf",
+        "n_gpu_layers": -1, "ctx_size": 32768, "cache_type_k": "q8_0", "cache_type_v": "q4_0",
+        "flash_attn": "on", "moe_cache_mib": 4096, "moe_cache_cpu_share": 0.35,
+        "speculative": {"types": ["suffix"], "draft_n_max": 4},
+        "extra_args": ["--n-cpu-moe", "48"]
+    })");
+    CHECK(p.moe_cache_mib == std::optional<std::uint32_t>(4096u));
+    REQUIRE(p.moe_cache_cpu_share.has_value());
+    CHECK(*p.moe_cache_cpu_share == doctest::Approx(0.35));
+    REQUIRE(p.speculative.has_value());
+    CHECK(p.speculative->types == std::vector<std::string>{"suffix"});
+
+    const auto argv = si::llamaserver_arguments(p);
+    REQUIRE_MESSAGE(argv.ok(), argv.status().message());
+    const std::vector<std::string> expected{
+        "--model", "qwen3-80b.gguf", "--alias", "moe-slru-suffix", "--ctx-size", "32768", "--n-gpu-layers", "all",
+        "--moe-cache-mib", "4096", "--moe-cache-cpu-share", "0.35", "--flash-attn", "on", "--cache-type-k", "q8_0",
+        "--cache-type-v", "q4_0", "--spec-type", "suffix", "--spec-draft-n-max", "4", "--n-cpu-moe", "48"};
+    CHECK(argv.value() == expected);
+
+    // Metadata projection emits moe_cache_mib and moe_cache_cpu_share.
+    const json::Object meta = si::launch_profile_metadata(p, std::nullopt, std::nullopt);
+    REQUIRE(meta.find("moe_cache_mib") != nullptr);
+    CHECK(meta.find("moe_cache_mib")->as_uint() == 4096u);
+    REQUIRE(meta.find("moe_cache_cpu_share") != nullptr);
+    CHECK(meta.find("moe_cache_cpu_share")->as_double() == doctest::Approx(0.35));
+
+    // Range & type rejections.
+    const std::string base = R"("name":"p","backend":"llamaserver","model":"m.gguf")";
+    CHECK(contains(parse_error("{" + base + R"(,"moe_cache_mib":262145})"), "'moe_cache_mib'"));
+    CHECK(contains(parse_error("{" + base + R"(,"moe_cache_mib":-1})"), "'moe_cache_mib'"));
+    CHECK(contains(parse_error("{" + base + R"(,"moe_cache_cpu_share":-0.1})"), "'moe_cache_cpu_share'"));
+    CHECK(contains(parse_error("{" + base + R"(,"moe_cache_cpu_share":1.5})"), "'moe_cache_cpu_share'"));
+    CHECK(contains(parse_error("{" + base + R"(,"moe_cache_cpu_share":"0.5"})"), "'moe_cache_cpu_share'"));
+
+    // extra_args refuses typed moe_cache flags (hyphen and underscore forms).
+    for (const auto& [flag, field] : std::vector<std::pair<std::string, std::string>>{
+             {R"("--moe-cache-mib","2048")", "moe_cache_mib"},
+             {R"("--moe_cache_mib=2048")", "moe_cache_mib"},
+             {R"("--moe-cache-cpu-share","0.4")", "moe_cache_cpu_share"},
+             {R"("--moe_cache_cpu_share=0.4")", "moe_cache_cpu_share"}}) {
+        CAPTURE(flag);
+        CHECK(contains(parse_error("{" + base + R"(,"extra_args":[)" + flag + "]}"),
+                       "use the typed field '" + field + "'"));
+    }
+
+    // Programmatic NaN / Inf validation.
+    LaunchProfile bad_share = p;
+    bad_share.moe_cache_cpu_share = std::numeric_limits<double>::quiet_NaN();
+    CHECK_FALSE(si::validate_launch_profile(bad_share).ok());
+    bad_share.moe_cache_cpu_share = std::numeric_limits<double>::infinity();
+    CHECK_FALSE(si::validate_launch_profile(bad_share).ok());
+
+    // Direct llamacpp profile rejects moe_cache_mib and moe_cache_cpu_share rather than silently dropping them.
+    for (const auto& [fields, name] : std::vector<std::pair<std::string, std::string>>{
+             {R"("moe_cache_mib":2048)", "moe_cache_mib"},
+             {R"("moe_cache_cpu_share":0.5)", "moe_cache_cpu_share"}}) {
+        CAPTURE(fields);
+        const LaunchProfile direct = parse_single(R"({"name":"d","backend":"llamacpp","model":"m.gguf",)" + fields + "}");
+        si::BackendSetup setup;
+        std::string device;
+        const si::Status st = si::apply_llamacpp_profile(direct, setup, device);
+        REQUIRE_FALSE(st.ok());
+        CHECK(contains(st.message(), "'" + name + "' is not supported by the llamacpp backend"));
+    }
+}
+
+TEST_CASE("serve_options: --moe-cache-mib, --moe-cache-cpu-share, --cache-ram-mib, --mmproj, and --spec-type suffix") {
+    const auto parse_and_build = [](const std::vector<std::string>& cli, srv::detail::ServeCliConfig& out,
+                                    std::string& err_text) -> int {
+        srv::detail::ParsedServeArgs parsed;
+        if (!srv::detail::parse_serve_args(cli, parsed, err_text)) return 2;
+        std::ostringstream os;
+        auto log = std::make_shared<srv::detail::LockedLog>(os);
+        const int rc = srv::detail::build_serve_options(parsed, log, out);
+        err_text = os.str();
+        return rc;
+    };
+
+    // Valid direct llamacpp options populate BackendSetup cleanly.
+    {
+        srv::detail::ServeCliConfig cfg;
+        std::string err;
+        const int rc = parse_and_build(
+            {"--backend", "llamacpp", "--model", "qwen3-80b.gguf", "--moe-cache-mib", "4096",
+             "--moe-cache-cpu-share", "0.35", "--cache-ram-mib", "8192", "--mmproj", "D:/models/mmproj.gguf",
+             "--spec-type", "suffix"},
+            cfg, err);
+#if defined(SONDER_HAS_LLAMACPP_BACKEND)
+        CHECK_MESSAGE(rc == 0, err);
+#else
+        CHECK(rc == 2);
+        CHECK(contains(err, "unavailable backend 'llamacpp'"));
+#endif
+        CHECK(cfg.options.backend.llamacpp_moe_cache_mib == std::optional<std::uint32_t>(4096u));
+        REQUIRE(cfg.options.backend.llamacpp_moe_cache_cpu_share.has_value());
+        CHECK(*cfg.options.backend.llamacpp_moe_cache_cpu_share == doctest::Approx(0.35));
+        CHECK(cfg.options.backend.llamacpp_cache_ram_mib == std::optional<std::uint32_t>(8192u));
+        CHECK(cfg.options.backend.llamacpp_mmproj_path == "D:/models/mmproj.gguf");
+        CHECK(cfg.options.backend.llamacpp_spec_type == std::optional<std::string>("suffix"));
+    }
+
+    // Non-llamacpp backends reject each of these flags cleanly.
+    for (const auto& [flag, value] : std::vector<std::pair<std::string, std::string>>{
+             {"--moe-cache-mib", "2048"},
+             {"--moe-cache-cpu-share", "0.5"},
+             {"--cache-ram-mib", "4096"},
+             {"--mmproj", "mmproj.gguf"},
+             {"--spec-type", "suffix"}}) {
+        CAPTURE(flag);
+        srv::detail::ServeCliConfig cfg;
+        std::string err;
+        CHECK(parse_and_build({"--backend", "mock", flag, value}, cfg, err) == 2);
+        CHECK(contains(err, "applies only to --backend llamacpp"));
+    }
+
+    // Out-of-range / malformed values fail cleanly.
+    {
+        srv::detail::ServeCliConfig cfg;
+        std::string err;
+        CHECK(parse_and_build({"--backend", "llamacpp", "--model", "m.gguf", "--moe-cache-mib", "262145"}, cfg, err) ==
+              2);
+        CHECK(contains(err, "--moe-cache-mib"));
+
+        err.clear();
+        CHECK(parse_and_build({"--backend", "llamacpp", "--model", "m.gguf", "--moe-cache-cpu-share", "1.5"}, cfg,
+                              err) == 2);
+        CHECK(contains(err, "--moe-cache-cpu-share"));
+
+        err.clear();
+        CHECK(parse_and_build({"--backend", "llamacpp", "--model", "m.gguf", "--cache-ram-mib", "65537"}, cfg, err) ==
+              2);
+        CHECK(contains(err, "--cache-ram-mib"));
+
+        err.clear();
+        CHECK(parse_and_build({"--backend", "llamacpp", "--model", "m.gguf", "--mmproj", ""}, cfg, err) == 2);
+        CHECK(contains(err, "--mmproj"));
+    }
+}

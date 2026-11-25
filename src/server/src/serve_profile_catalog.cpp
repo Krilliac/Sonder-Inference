@@ -308,7 +308,7 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles,
             // llama-server reads these; the estimates do not model them.
             for (const char* name : {"LLAMA_ARG_FIT", "LLAMA_ARG_N_GPU_LAYERS", "LLAMA_ARG_REPACK", "LLAMA_ARG_N_CPU_MOE",
                                      "LLAMA_ARG_CPU_MOE", "LLAMA_ARG_N_CPU_FFN", "LLAMA_ARG_OVERRIDE_TENSOR",
-                                     "LLAMA_ARG_LOAD_MODE"}) {
+                                     "LLAMA_ARG_LOAD_MODE", "LLAMA_ARG_MOE_CACHE_MIB"}) {
                 const char* value = std::getenv(name);
                 if (value != nullptr && *value != '\0') {
                     notes.push_back("launch profile '" + p.name + "': inherited " + name +
@@ -366,7 +366,8 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles,
         std::string summary = "launch profile '" + p.name + "': estimated VRAM " + std::to_string(e.total_mib()) +
                               " MiB (weights " + mib_text(e.weights_bytes) + ", KV " + kv + " x " +
                               std::to_string(e.sequences) + " sequence(s), recurrent " + recurrent + ", compute " +
-                              mib_text(e.compute_bytes) + ")";
+                              mib_text(e.compute_bytes) +
+                              (e.moe_cache_bytes > 0 ? ", moe_cache " + mib_text(e.moe_cache_bytes) : "") + ")";
         if (multi_gpu_split) summary += ", per-GPU max " + std::to_string(e.max_gpu_mib()) + " MiB";
         if (budget) summary += " vs budget " + std::to_string(*budget) + " MiB";
         for (const auto& note : e.notes) summary += "; " + note;

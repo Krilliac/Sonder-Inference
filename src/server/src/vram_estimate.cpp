@@ -168,6 +168,12 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
     if (p.no_repack) {
         placement.repack = !*p.no_repack;
     }
+    if (p.moe_cache_mib) {
+        placement.moe_cache_mib = *p.moe_cache_mib;
+    }
+    if (p.moe_cache_cpu_share) {
+        placement.moe_cache_cpu_share = *p.moe_cache_cpu_share;
+    }
     detail::TensorPlacementBreakdown placed =
         detail::evaluate_tensor_placement(m, placement, n_layer, first_gpu, first_nextn, mtp, e.notes);
     const bool fit_path = p.backend == kLaunchProfileBackendLlamaServer && p.fit.value_or(true) && !p.n_gpu_layers &&
@@ -253,6 +259,9 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
     }
     if (offloaded > 0) {
         e.compute_bytes = m.vocab_size * ubatch * 4 + 4 * m.embedding_length * ubatch * 4 + 256 * kMiB;
+        if (placement.moe_cache_mib > 0) {
+            e.moe_cache_bytes = static_cast<std::uint64_t>(placement.moe_cache_mib) * kMiB;
+        }
     }
     for (const auto& arg : p.extra_args) {
         // The name llama-server reads (`--override_tensor` is `--override-tensor`).
@@ -276,7 +285,9 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
     if (auto_parallel && e.recurrent_bytes > 0) {
         e.notes.emplace_back("parallel unset: llama-server's automatic 4 slots keep 4 recurrent states");
     }
-    e.total_bytes = e.weights_bytes + e.kv_bytes + e.recurrent_bytes + e.compute_bytes;
+    e.total_bytes = saturating_add(
+        saturating_add(e.weights_bytes, e.kv_bytes),
+        saturating_add(saturating_add(e.recurrent_bytes, e.compute_bytes), e.moe_cache_bytes));
     e.prism_hadamard = m.prism_hadamard;
     e.requires_prism_runtime = m.has_prism_private_tensors || m.prism_hadamard;
     if (e.requires_prism_runtime) {
@@ -307,7 +318,8 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
                 // llama.cpp --split-mode row splits weights/rows across GPUs
                 // but keeps the KV cache unsplit on main_gpu.
                 const double max_share = weight_max / weight_sum;
-                const std::uint64_t splittable = saturating_add(e.weights_bytes, e.recurrent_bytes);
+                const std::uint64_t splittable =
+                    saturating_add(e.weights_bytes, saturating_add(e.recurrent_bytes, e.moe_cache_bytes));
                 const std::uint64_t shard = std::min(
                     splittable, saturating_u64(std::ceil(static_cast<double>(splittable) * max_share)));
                 e.max_gpu_bytes = saturating_add(shard, saturating_add(e.kv_bytes, e.compute_bytes));
@@ -317,8 +329,9 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
                                      " MiB (proportional weights/recurrent + unsplit KV + compute)");
             } else if (mode != "none") {
                 const double max_share = weight_max / weight_sum;
-                const std::uint64_t splittable =
-                    saturating_add(e.weights_bytes, saturating_add(e.kv_bytes, e.recurrent_bytes));
+                const std::uint64_t splittable = saturating_add(
+                    saturating_add(e.weights_bytes, e.kv_bytes),
+                    saturating_add(e.recurrent_bytes, e.moe_cache_bytes));
                 const std::uint64_t shard = std::min(
                     splittable, saturating_u64(std::ceil(static_cast<double>(splittable) * max_share)));
                 e.max_gpu_bytes = saturating_add(shard, e.compute_bytes);
@@ -491,6 +504,11 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
                              "fraction), not as private memory, except host Q4_0/Q4_K/Q8_0/IQ4_NL tensors, "
                              "which llama.cpp repacks into private memory unless -nr/--no-repack; "
                              "--no-kv-offload is not modelled");
+    }
+    if (e.moe_cache_bytes > 0 && e.host_expert_bytes == 0) {
+        e.notes.emplace_back(
+            "moe_cache_mib is set while no routed experts are CPU-offloaded; disable it to avoid ~10% "
+            "graph-splitting overhead");
     }
     return e;
 }

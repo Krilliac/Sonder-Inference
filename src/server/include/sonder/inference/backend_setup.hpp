@@ -52,6 +52,10 @@ struct BackendSetup {
     std::optional<std::uint32_t> llamacpp_slots;
     std::optional<std::string> llamacpp_spec_type;
     std::optional<std::int32_t> llamacpp_spec_draft_max;
+    std::optional<std::uint32_t> llamacpp_moe_cache_mib;
+    std::optional<double> llamacpp_moe_cache_cpu_share;
+    std::optional<std::uint32_t> llamacpp_cache_ram_mib;
+    std::optional<std::string> llamacpp_mmproj_path;
     // MOCK backend: artificial per-token latency.
     std::chrono::microseconds mock_token_delay{0};
     // MOCK backend: >= 0 injects a backend error after that many tokens

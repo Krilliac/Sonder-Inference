@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -71,5 +72,21 @@ TensorPlacementBreakdown evaluate_tensor_placement(const GgufModelInfo& m, MoePl
                                                    std::uint32_t n_layer, std::uint32_t first_gpu,
                                                    std::uint32_t first_nextn, bool mtp,
                                                    std::vector<std::string>& notes);
+
+// Dynamic SLRU MoE expert VRAM cache sizing decision (llama.cpp PR #29887 /
+// #30966 / #30637 anti-regression rules).
+struct MoeExpertCacheSizing {
+    bool eligible = false;
+    std::uint32_t recommended_cache_mib = 0;
+    double recommended_cpu_share = 0.0;
+    std::uint64_t offloaded_expert_mib = 0;
+    std::uint64_t active_working_set_mib = 0;
+    std::uint64_t spare_vram_mib = 0;
+    std::string reason;
+};
+
+MoeExpertCacheSizing plan_moe_expert_cache(const GgufModelInfo& model, std::uint64_t host_expert_bytes,
+                                           std::uint64_t spare_vram_mib,
+                                           std::optional<std::uint64_t> available_host_ram_bytes);
 
 }  // namespace sonder::inference::detail

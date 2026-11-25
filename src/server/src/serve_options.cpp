@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
+#include <locale>
 #include <sstream>
 
 #if !defined(_WIN32)
@@ -79,9 +81,15 @@ Backend:
   --no-prefix-cache       llama.cpp: disable prompt KV prefix reuse across turns
   --slots N               llama.cpp: cached KV sequence slots (1..16, default 1)
   --spec-type TYPE        llama.cpp: in-process speculative decoding
-                          (none|auto|ngram|ngram-mod|draft-mtp, default none)
+                          (none|auto|ngram|ngram-mod|suffix|draft-mtp, default none)
   --spec-draft-max N      llama.cpp: max draft tokens per speculative step (0..64)
-                          (--batch-size through --spec-draft-max: --backend
+  --moe-cache-mib N       llama.cpp: dynamic SLRU MoE expert VRAM cache in MiB
+                          (0..262144, default 0 = off)
+  --moe-cache-cpu-share F llama.cpp: CPU share for dynamic SLRU MoE cache (0.0..1.0)
+  --cache-ram-mib N       llama.cpp: bounded L2 host-RAM prefix state cache in MiB
+                          (0..65536, default 0 = off)
+  --mmproj PATH           llama.cpp: multimodal projector GGUF path
+                          (--batch-size through --mmproj: --backend
                           llamacpp only; llama-server takes them in its spawn args)
   --mock-delay-ms N       mock backend per-token delay
   --llamaserver-config PATH  JSON config (mode, URL/executable, args, TLS and timeouts)
@@ -153,6 +161,8 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"no-mmap", Kind::flag},                 {"no-kv-unified", Kind::flag},
         {"no-prefix-cache", Kind::flag},         {"slots", Kind::value},
         {"spec-type", Kind::value},              {"spec-draft-max", Kind::value},
+        {"moe-cache-mib", Kind::value},          {"moe-cache-cpu-share", Kind::value},
+        {"cache-ram-mib", Kind::value},          {"mmproj", Kind::value},
         {"profiles", Kind::value},
         {"profile", Kind::repeat},               {"all-profiles", Kind::flag},
         {"vram-budget-mib", Kind::value},        {"allow-overcommit", Kind::flag},
@@ -177,6 +187,27 @@ bool parse_uint(const std::string& text, std::uint64_t max, std::uint64_t& out) 
         return false;
     }
     out = n;
+    return true;
+}
+
+bool parse_unit_double(const std::string& text, double& out) {
+    if (text.empty() || text.size() > 32) {
+        return false;
+    }
+    for (const char c : text) {
+        const bool ok = (c >= '0' && c <= '9') || c == '.';
+        if (!ok) {
+            return false;
+        }
+    }
+    std::istringstream in(text);
+    in.imbue(std::locale::classic());
+    double parsed = 0.0;
+    in >> parsed;
+    if (!in || !in.eof() || !std::isfinite(parsed) || parsed < 0.0 || parsed > 1.0) {
+        return false;
+    }
+    out = parsed;
     return true;
 }
 
@@ -333,7 +364,8 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
                                    " conflicts with active launch profiles (models are selected by --profile)");
             }
         }
-        for (const char* flag : {"gpu-layers", "context-length", "llamaserver-arg"}) {
+        for (const char* flag : {"gpu-layers", "context-length", "llamaserver-arg", "moe-cache-mib",
+                                 "moe-cache-cpu-share", "cache-ram-mib", "mmproj"}) {
             if (a.get(flag)) {
                 return usage_error(std::string("--") + flag + " conflicts with --profile (set the profile's typed fields)");
             }
@@ -526,7 +558,8 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     if (o.backend.backend != "llamacpp") {
         for (const char* flag : {"gpu-layers", "context-length", "moe-experts", "tensor-override",
                                  "batch-size", "ubatch-size", "cache-type-k", "cache-type-v", "flash-attn",
-                                 "threads", "slots", "spec-type", "spec-draft-max"}) {
+                                 "threads", "slots", "spec-type", "spec-draft-max",
+                                 "moe-cache-mib", "moe-cache-cpu-share", "cache-ram-mib", "mmproj"}) {
             if (a.get(flag)) {
                 return usage_error(std::string("option --") + flag +
                                    " applies only to --backend llamacpp; for llamaserver set it in the JSON args");
@@ -569,14 +602,37 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
         o.backend.llamacpp_slots = static_cast<std::uint32_t>(n);
     }
     if (auto v = a.get("spec-type")) {
-        if (*v != "none" && *v != "auto" && *v != "ngram" && *v != "ngram-mod" && *v != "draft-mtp") {
-            return usage_error("--spec-type must be none, auto, ngram, ngram-mod or draft-mtp");
+        if (*v != "none" && *v != "auto" && *v != "ngram" && *v != "ngram-mod" && *v != "suffix" &&
+            *v != "draft-mtp") {
+            return usage_error("--spec-type must be none, auto, ngram, ngram-mod, suffix or draft-mtp");
         }
         o.backend.llamacpp_spec_type = *v;
     }
     if (auto v = a.get("spec-draft-max")) {
         if (!parse_uint(*v, 64, n)) return usage_error("--spec-draft-max must be an integer from 0 to 64");
         o.backend.llamacpp_spec_draft_max = static_cast<std::int32_t>(n);
+    }
+    if (auto v = a.get("moe-cache-mib")) {
+        if (!parse_uint(*v, 262144, n)) return usage_error("--moe-cache-mib must be an integer from 0 to 262144");
+        o.backend.llamacpp_moe_cache_mib = static_cast<std::uint32_t>(n);
+    }
+    if (auto v = a.get("moe-cache-cpu-share")) {
+        double share = 0.0;
+        if (!parse_unit_double(*v, share)) {
+            return usage_error("--moe-cache-cpu-share must be a finite number from 0.0 to 1.0");
+        }
+        o.backend.llamacpp_moe_cache_cpu_share = share;
+    }
+    if (auto v = a.get("cache-ram-mib")) {
+        if (!parse_uint(*v, 65536, n)) return usage_error("--cache-ram-mib must be an integer from 0 to 65536");
+        o.backend.llamacpp_cache_ram_mib = static_cast<std::uint32_t>(n);
+    }
+    if (auto v = a.get("mmproj")) {
+        if (v->empty() || v->find('\0') != std::string::npos || v->find('\r') != std::string::npos ||
+            v->find('\n') != std::string::npos) {
+            return usage_error("--mmproj must be a non-empty path without NUL or newline characters");
+        }
+        o.backend.llamacpp_mmproj_path = *v;
     }
     if (primary && primary->backend == kLaunchProfileBackendLlamaCpp) {
         const BackendSetup base_backend = o.backend;
