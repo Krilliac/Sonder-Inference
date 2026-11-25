@@ -2,11 +2,22 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 
 #include "engine/request_runtime.hpp"
 #include "sonder/inference/backends.hpp"
 
 namespace sonder::inference {
+
+namespace {
+
+std::uint64_t saturating_add(std::uint64_t a, std::uint64_t b) noexcept {
+    return a > std::numeric_limits<std::uint64_t>::max() - b
+               ? std::numeric_limits<std::uint64_t>::max()
+               : a + b;
+}
+
+}  // namespace
 
 #ifndef SONDER_INFERENCE_VERSION
 #define SONDER_INFERENCE_VERSION "0.0.0"
@@ -36,17 +47,25 @@ json::Object gpu_memory_sample_attributes(const GpuDeviceInfo& gpu) {
                        {"is_integrated_uma", gpu.is_integrated_uma},
                        {"backend_hint", gpu.backend_hint},
                        {"source", gpu.source}};
+    if (!gpu.id.empty()) {
+        attrs.set("gpu_id", gpu.id);
+    }
     if (gpu.dedicated_total.is_known()) {
-        const std::uint64_t total_bytes = gpu.dedicated_total.bytes_or(0);
-        attrs.set("dedicated_total_bytes", total_bytes);
-        if (!gpu.is_integrated_uma) {
-            attrs.set("total_bytes", total_bytes);
-        }
+        attrs.set("dedicated_total_bytes", gpu.dedicated_total.bytes_or(0));
     }
     if (gpu.dedicated_free.is_known()) {
-        const std::uint64_t free_bytes = gpu.dedicated_free.bytes_or(0);
-        attrs.set("dedicated_free_bytes", free_bytes);
-        if (!gpu.is_integrated_uma) {
+        attrs.set("dedicated_free_bytes", gpu.dedicated_free.bytes_or(0));
+    }
+    if (gpu.shared_total.is_known()) {
+        attrs.set("shared_total_bytes", gpu.shared_total.bytes_or(0));
+    }
+
+    if (!gpu.is_integrated_uma) {
+        if (gpu.dedicated_total.is_known()) {
+            attrs.set("total_bytes", gpu.dedicated_total.bytes_or(0));
+        }
+        if (gpu.dedicated_free.is_known()) {
+            const std::uint64_t free_bytes = gpu.dedicated_free.bytes_or(0);
             attrs.set("available_bytes", free_bytes);
             if (gpu.dedicated_total.is_known()) {
                 const std::uint64_t total_bytes = gpu.dedicated_total.bytes_or(0);
@@ -55,10 +74,30 @@ json::Object gpu_memory_sample_attributes(const GpuDeviceInfo& gpu) {
                 }
             }
         }
+    } else {
+        // Integrated UMA GPUs (e.g. AMD Radeon 780M APU) pool dedicated BIOS
+        // carveout and shared/GTT system memory together (matching
+        // gpu_effective_vram_mib()). Emit total/available/used bytes against
+        // that unified pool (preserving the total_pool cap on free bytes and
+        // omitting used_bytes on anomalous free > total readings) so
+        // Observatory never drops UMA GPU samples.
+        const bool has_pool = gpu.dedicated_total.is_known() || gpu.shared_total.is_known();
+        const std::uint64_t total_pool =
+            has_pool ? saturating_add(gpu.dedicated_total.bytes_or(0), gpu.shared_total.bytes_or(0)) : 0;
+        if (has_pool && total_pool > 0) {
+            attrs.set("total_bytes", total_pool);
+        }
+        if (gpu.dedicated_free.is_known()) {
+            const std::uint64_t raw_free = gpu.dedicated_free.bytes_or(0);
+            const std::uint64_t capped_free =
+                (has_pool && total_pool > 0) ? std::min(raw_free, total_pool) : raw_free;
+            attrs.set("available_bytes", capped_free);
+            if (has_pool && total_pool > 0 && raw_free <= total_pool) {
+                attrs.set("used_bytes", total_pool - raw_free);
+            }
+        }
     }
-    if (gpu.shared_total.is_known()) {
-        attrs.set("shared_total_bytes", gpu.shared_total.bytes_or(0));
-    }
+
     if (const auto effective_mib = gpu_effective_vram_mib(gpu, false)) {
         attrs.set("effective_vram_mib", *effective_mib);
     }
@@ -130,10 +169,12 @@ std::vector<GpuDeviceInfo> Engine::gpu_devices() const {
 }
 
 void Engine::sample_devices(const std::vector<DeviceInfo>& devices) {
-    for (const auto& d : devices) {
+    for (std::size_t i = 0; i < devices.size(); ++i) {
+        const auto& d = devices[i];
         auto dctx = engine_context();
-        dctx.device_id = d.id;
-        json::Object attrs{{"kind", to_string(d.kind)},
+        const std::string kind_str = to_string(d.kind);
+        dctx.device_id = d.id.empty() ? (kind_str + ":" + std::to_string(i)) : d.id;
+        json::Object attrs{{"kind", kind_str},
                            {"name", d.name},
                            {"logical_cores", d.logical_cores},
                            {"total_bytes", d.total_memory_bytes},
@@ -146,12 +187,16 @@ void Engine::sample_devices(const std::vector<DeviceInfo>& devices) {
 }
 
 void Engine::sample_gpu_devices(const std::vector<GpuDeviceInfo>& gpus) {
-    for (const auto& gpu : gpus) {
+    for (std::size_t i = 0; i < gpus.size(); ++i) {
+        const auto& gpu = gpus[i];
         auto dctx = engine_context();
-        if (!gpu.id.empty()) {
-            dctx.device_id = gpu.id;
+        const std::string resolved_id = gpu.id.empty() ? ("gpu:" + std::to_string(i)) : gpu.id;
+        dctx.device_id = resolved_id;
+        json::Object attrs = gpu_memory_sample_attributes(gpu);
+        if (attrs.find("gpu_id") == nullptr) {
+            attrs.set("gpu_id", resolved_id);
         }
-        telemetry_->emit("device.memory.sample", dctx, gpu_memory_sample_attributes(gpu), TelemetryLevel::metrics);
+        telemetry_->emit("device.memory.sample", dctx, std::move(attrs), TelemetryLevel::metrics);
     }
 }
 
