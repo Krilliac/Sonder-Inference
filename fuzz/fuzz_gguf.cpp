@@ -18,6 +18,7 @@
 //     sliding-window cache never has more cells than the full one.
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 #include "fuzz_common.hpp"
@@ -66,8 +67,17 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
             p.extra_args = {"--swa-full"};
         }
         const si::VramEstimate e = si::estimate_vram(m, p);
-        // Unsigned sums wrap identically, so this holds for any input.
-        SONDER_FUZZ_CHECK(e.total_bytes == e.weights_bytes + e.kv_bytes + e.recurrent_bytes + e.compute_bytes);
+        // `estimate_vram` uses saturating 64-bit addition so adversarial GGUF
+        // dimensions never wrap `total_bytes` to a small misleading figure.
+        const auto sat_add = [](std::uint64_t a, std::uint64_t b) noexcept -> std::uint64_t {
+            return a > std::numeric_limits<std::uint64_t>::max() - b
+                       ? std::numeric_limits<std::uint64_t>::max()
+                       : a + b;
+        };
+        const std::uint64_t expected_total = sat_add(
+            sat_add(e.weights_bytes, e.kv_bytes),
+            sat_add(sat_add(e.recurrent_bytes, e.compute_bytes), e.moe_cache_bytes));
+        SONDER_FUZZ_CHECK(e.total_bytes == expected_total);
         SONDER_FUZZ_CHECK(e.gpu_layers <= m.block_count);
         SONDER_FUZZ_CHECK(e.attention_layers <= e.gpu_layers);
         SONDER_FUZZ_CHECK(e.swa_attention_layers <= e.attention_layers);
