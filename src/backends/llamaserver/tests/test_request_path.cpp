@@ -2,13 +2,17 @@
 // affinity, thinking controls and the OpenAI usage/timings they surface.
 #include <doctest/doctest.h>
 
-#include <optional>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <vector>
 
 #include "../llamaserver_protocol.hpp"
+#include "../llamaserver_stream.hpp"
 #include "../slot_affinity.hpp"
 #include "fake_server.hpp"
 #include "sonder/inference/backends/llamaserver.hpp"
@@ -891,5 +895,353 @@ TEST_SUITE("llamaserver_slot_affinity") {
         CHECK_FALSE(affinity.owned_slot("old"));
         current.reset();
         CHECK(affinity.acquire("current", 2).slot() == std::optional<std::uint32_t>(0));
+    }
+}
+
+TEST_SUITE("llamaserver_tool_calling_and_stream") {
+    TEST_CASE("build_chat_body emits default tool parameter schema when empty or omitted") {
+        ChatRequest r = chat();
+        r.tools.push_back(ToolDefinition{"no_params", "No parameters", ""});
+        r.tools.push_back(ToolDefinition{"empty_obj", "Empty object schema", "{}"});
+        r.tools.push_back(ToolDefinition{"bad_json", "Unparseable schema", "{not-json"});
+        r.tools.push_back(ToolDefinition{
+            "with_schema", "Explicit schema",
+            R"({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]})"});
+
+        CHECK(llamaserver::chat_tools_requested(r));
+        const auto body = llamaserver::build_chat_body("m", r);
+        const auto *tools = body.find("tools");
+        REQUIRE(tools != nullptr);
+        REQUIRE(tools->is_array());
+        REQUIRE(tools->as_array().size() == 4u);
+
+        for (std::size_t i = 0; i < 3u; ++i) {
+            const auto *fn = tools->as_array()[i].find("function");
+            REQUIRE(fn != nullptr);
+            const auto *params = fn->find("parameters");
+            REQUIRE(params != nullptr);
+            REQUIRE(params->is_object());
+            REQUIRE(params->find("type") != nullptr);
+            CHECK(params->find("type")->as_string() == "object");
+            REQUIRE(params->find("properties") != nullptr);
+            CHECK(params->find("properties")->is_object());
+            CHECK(params->find("properties")->as_object().empty());
+        }
+
+        const auto *explicit_params = tools->as_array()[3].find("function")->find("parameters");
+        REQUIRE(explicit_params != nullptr);
+        REQUIRE(explicit_params->find("properties") != nullptr);
+        REQUIRE(explicit_params->find("properties")->find("city") != nullptr);
+        REQUIRE(explicit_params->find("required") != nullptr);
+        CHECK(explicit_params->find("required")->as_array().size() == 1u);
+    }
+
+    TEST_CASE("build_chat_body omits tools and tool_choice when tool_choice is none or tools empty") {
+        ChatRequest r = chat();
+        r.tools.push_back(ToolDefinition{"get_weather", "Get weather", ""});
+        r.tool_choice = ToolChoice{ToolChoiceMode::none, ""};
+        r.grammar = "root ::= \"ok\"";
+
+        CHECK_FALSE(llamaserver::chat_tools_requested(r));
+        const auto none_body = llamaserver::build_chat_body("m", r);
+        CHECK(none_body.find("tools") == nullptr);
+        CHECK(none_body.find("tool_choice") == nullptr);
+        REQUIRE(none_body.find("grammar") != nullptr);
+        CHECK(none_body.find("grammar")->as_string() == "root ::= \"ok\"");
+
+        // Orphan tool_choice without tools is also omitted.
+        ChatRequest empty_tools = chat();
+        empty_tools.tool_choice = ToolChoice{ToolChoiceMode::auto_choice, ""};
+        CHECK_FALSE(llamaserver::chat_tools_requested(empty_tools));
+        const auto empty_body = llamaserver::build_chat_body("m", empty_tools);
+        CHECK(empty_body.find("tools") == nullptr);
+        CHECK(empty_body.find("tool_choice") == nullptr);
+
+        // Active modes transmit both tools and tool_choice and suppress grammar.
+        r.tool_choice = ToolChoice{ToolChoiceMode::required, ""};
+        CHECK(llamaserver::chat_tools_requested(r));
+        const auto req_body = llamaserver::build_chat_body("m", r);
+        REQUIRE(req_body.find("tools") != nullptr);
+        REQUIRE(req_body.find("tool_choice") != nullptr);
+        CHECK(req_body.find("tool_choice")->as_string() == "required");
+        CHECK(req_body.find("grammar") == nullptr);
+
+        r.tool_choice = ToolChoice{ToolChoiceMode::auto_choice, ""};
+        const auto auto_body = llamaserver::build_chat_body("m", r);
+        REQUIRE(auto_body.find("tools") != nullptr);
+        REQUIRE(auto_body.find("tool_choice") != nullptr);
+        CHECK(auto_body.find("tool_choice")->as_string() == "auto");
+    }
+
+    TEST_CASE("stream tool parsing relies on explicit tools_requested, never prompt substring matching") {
+        sonder_test::FakeLlamaServer server;
+        LlamaServerBackendOptions o;
+        o.base_url = server.url();
+        auto model = load(make_llamaserver_backend(o));
+
+        // 1. User prompt containing literal `"tools":[` must NOT enable tool calling.
+        ChatRequest spoofed;
+        spoofed.messages = {{"user", R"(Explain {"tools":[{"type":"function"}]} and "tools": [] in JSON.)"}};
+        server.set_body(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\","
+            "\"function\":{\"name\":\"evil\",\"arguments\":\"{}\"}}]}}]}\n\n"
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
+            "data: [DONE]\n\n");
+        std::vector<ToolCallDelta> seen_deltas;
+        auto spoofed_res = model->chat(spoofed, {}, [&](const TokenChunk &c) {
+            seen_deltas.insert(seen_deltas.end(), c.tool_call_deltas.begin(), c.tool_call_deltas.end());
+            return true;
+        });
+        REQUIRE_FALSE(spoofed_res.ok());
+        CHECK(spoofed_res.status().code() == ErrorCode::unsupported);
+        CHECK(seen_deltas.empty());
+
+        // 2. tools non-empty + tool_choice="none" must NOT transmit tools or accept tool calls.
+        ChatRequest disabled = chat();
+        disabled.tools.push_back(ToolDefinition{"lookup", "Lookup", ""});
+        disabled.tool_choice = ToolChoice{ToolChoiceMode::none, ""};
+        seen_deltas.clear();
+        auto disabled_res = model->chat(disabled, {}, [&](const TokenChunk &c) {
+            seen_deltas.insert(seen_deltas.end(), c.tool_call_deltas.begin(), c.tool_call_deltas.end());
+            return true;
+        });
+        REQUIRE_FALSE(disabled_res.ok());
+        CHECK(disabled_res.status().code() == ErrorCode::unsupported);
+        CHECK(seen_deltas.empty());
+        const auto disabled_wire = parse(server.last_body());
+        CHECK(disabled_wire.find("tools") == nullptr);
+        CHECK(disabled_wire.find("tool_choice") == nullptr);
+
+        // 3. Explicit active tools succeed and deliver tool_call_deltas.
+        ChatRequest active = chat();
+        active.tools.push_back(ToolDefinition{"lookup", "Lookup", ""});
+        active.tool_choice = ToolChoice{ToolChoiceMode::auto_choice, ""};
+        seen_deltas.clear();
+        auto active_res = model->chat(active, {}, [&](const TokenChunk &c) {
+            seen_deltas.insert(seen_deltas.end(), c.tool_call_deltas.begin(), c.tool_call_deltas.end());
+            return true;
+        });
+        REQUIRE_MESSAGE(active_res.ok(), active_res.status().to_string());
+        CHECK(active_res->stop_reason == StopReason::tool_calls);
+        REQUIRE(seen_deltas.size() == 1u);
+        CHECK(seen_deltas[0].id == "call_1");
+        CHECK(seen_deltas[0].name == "evil");
+        CHECK(seen_deltas[0].arguments_delta == "{}");
+    }
+
+    TEST_CASE("stream serializes object-typed function.arguments and rejects invalid argument types") {
+        sonder_test::FakeLlamaServer server;
+        LlamaServerBackendOptions o;
+        o.base_url = server.url();
+        auto model = load(make_llamaserver_backend(o));
+
+        ChatRequest req = chat();
+        req.tools.push_back(ToolDefinition{"get_weather", "Weather", ""});
+        req.tools.push_back(ToolDefinition{"ping", "Ping", ""});
+
+        server.set_body(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":["
+            "{\"index\":0,\"id\":\"call_obj\",\"function\":{\"name\":\"get_weather\","
+            "\"arguments\":{\"city\":\"Austin\",\"units\":\"c\"}}},"
+            "{\"index\":1,\"id\":\"call_empty\",\"function\":{\"name\":\"ping\",\"arguments\":{}}}"
+            "]}}]}\n\n"
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
+            "data: [DONE]\n\n");
+
+        std::vector<ToolCallDelta> deltas;
+        auto res = model->chat(req, {}, [&](const TokenChunk &c) {
+            deltas.insert(deltas.end(), c.tool_call_deltas.begin(), c.tool_call_deltas.end());
+            return true;
+        });
+        REQUIRE_MESSAGE(res.ok(), res.status().to_string());
+        CHECK(res->stop_reason == StopReason::tool_calls);
+        REQUIRE(deltas.size() == 2u);
+        CHECK(deltas[0].index == 0u);
+        CHECK(deltas[0].id == "call_obj");
+        CHECK(deltas[0].name == "get_weather");
+        const auto parsed_args = parse(deltas[0].arguments_delta);
+        REQUIRE(parsed_args.is_object());
+        REQUIRE(parsed_args.find("city") != nullptr);
+        CHECK(parsed_args.find("city")->as_string() == "Austin");
+        REQUIRE(parsed_args.find("units") != nullptr);
+        CHECK(parsed_args.find("units")->as_string() == "c");
+        CHECK(deltas[1].index == 1u);
+        CHECK(deltas[1].id == "call_empty");
+        CHECK(deltas[1].name == "ping");
+        CHECK(deltas[1].arguments_delta == "{}");
+
+        // Non-string, non-object, non-null arguments fail closed with protocol_error.
+        server.set_body(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":["
+            "{\"index\":0,\"id\":\"call_bad\",\"function\":{\"name\":\"ping\",\"arguments\":[1,2]}}"
+            "]}}]}\n\n"
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
+            "data: [DONE]\n\n");
+        auto bad_res = model->chat(req, {}, {});
+        REQUIRE_FALSE(bad_res.ok());
+        CHECK(bad_res.status().code() == ErrorCode::protocol_error);
+    }
+
+    TEST_CASE("stream enforces M-16 cumulative byte cap on accumulated tool_call_deltas") {
+        sonder_test::FakeLlamaServer server;
+        const auto url = net::parse_url(server.url());
+        REQUIRE(url.ok());
+
+        const auto run_direct = [&](std::size_t cap, std::size_t &delivered_bytes) {
+            net::HttpRequest http;
+            http.method = "POST";
+            http.host = url->host;
+            http.port = url->port;
+            http.target = "/v1/chat/completions";
+            http.body = "{}";
+            std::uint64_t progress = 0;
+            delivered_bytes = 0;
+            return llamaserver::run_completion_stream(
+                http, /*chat=*/true, /*native=*/false, /*separate_reasoning=*/false, {},
+                [&](const TokenChunk &c) {
+                    for (const auto &d : c.tool_call_deltas)
+                        delivered_bytes += d.id.size() + d.name.size() + d.arguments_delta.size();
+                    return true;
+                },
+                progress, /*tools_requested=*/true, cap);
+        };
+
+        // Two deltas: ("c1" + "fn" + "{\"a\":1}") = 2 + 2 + 7 = 11 bytes, then ("{\"b\":2}") = 7 bytes => 18 bytes.
+        server.set_body(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\","
+            "\"function\":{\"name\":\"fn\",\"arguments\":\"{\\\"a\\\":1}\"}}]}}]}\n\n"
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,"
+            "\"function\":{\"arguments\":{\"b\":2}}}]}}]}\n\n"
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
+            "data: [DONE]\n\n");
+
+        std::size_t delivered = 0;
+        auto exact_ok = run_direct(18u, delivered);
+        REQUIRE_MESSAGE(exact_ok.ok(), exact_ok.status().to_string());
+        CHECK(delivered == 18u);
+
+        auto over_cap = run_direct(17u, delivered);
+        REQUIRE_FALSE(over_cap.ok());
+        CHECK(over_cap.status().code() == ErrorCode::protocol_error);
+        CHECK(delivered == 11u);  // overflowing second delta was never delivered
+
+        // End-to-end BackendModel::chat() enforces the default kMaxToolCallDeltaBytes cap across frames.
+        const std::string chunk_arg(32u * 1024u, 'a');
+        std::string big_stream;
+        big_stream.reserve(llamaserver::kMaxToolCallDeltaBytes + 128u * 1024u);
+        const std::size_t frames = (llamaserver::kMaxToolCallDeltaBytes / chunk_arg.size()) + 2u;
+        for (std::size_t i = 0; i < frames; ++i) {
+            big_stream += "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"";
+            big_stream += chunk_arg;
+            big_stream += "\"}}]}}]}\n\n";
+        }
+        big_stream += "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
+                      "data: [DONE]\n\n";
+        server.set_body(std::move(big_stream));
+
+        LlamaServerBackendOptions o;
+        o.base_url = server.url();
+        auto model = load(make_llamaserver_backend(o));
+        ChatRequest req = chat();
+        req.tools.push_back(ToolDefinition{"big_tool", "Big", ""});
+        std::size_t chat_bytes = 0;
+        auto big_res = model->chat(req, {}, [&](const TokenChunk &c) {
+            for (const auto &d : c.tool_call_deltas)
+                chat_bytes += d.id.size() + d.name.size() + d.arguments_delta.size();
+            return true;
+        });
+        REQUIRE_FALSE(big_res.ok());
+        CHECK(big_res.status().code() == ErrorCode::protocol_error);
+        CHECK(chat_bytes <= llamaserver::kMaxToolCallDeltaBytes);
+    }
+
+    TEST_CASE("native completion preserves total prompt_tokens and cached_tokens <= prompt_tokens invariant") {
+        sonder_test::FakeLlamaServer server;
+        LlamaServerBackendOptions o;
+        o.base_url = server.url();
+        auto model = load(make_llamaserver_backend(o));
+
+        GenerateRequest req;
+        req.prompt = "hello";
+
+        // 1. Both timings (prompt_n + cache_n) and top-level tokens_evaluated/tokens_cached present.
+        server.set_body(
+            "data: {\"content\":\"ok\",\"stop\":true,\"tokens_evaluated\":3,\"tokens_cached\":14,"
+            "\"tokens_predicted\":2,\"timings\":{\"prompt_n\":3,\"cache_n\":9,\"predicted_n\":2}}\n\n");
+        auto r = model->generate(req, {}, {});
+        REQUIRE_MESSAGE(r.ok(), r.status().to_string());
+        CHECK(r->prompt_tokens == 12u);
+        REQUIRE(r->cached_tokens.has_value());
+        CHECK(*r->cached_tokens == 9u);
+        CHECK(*r->cached_tokens <= r->prompt_tokens);
+        CHECK(r->completion_tokens == 2u);
+        REQUIRE(r->backend_timings.has_value());
+        CHECK(r->backend_timings->prompt_n == std::optional<std::uint64_t>(3u));
+        CHECK(r->backend_timings->cache_n == std::optional<std::uint64_t>(9u));
+
+        // 2. 100% cache hit: timings.prompt_n == 0, cache_n == 16, tokens_evaluated == 0.
+        server.set_body(
+            "data: {\"content\":\"ok\",\"stop\":true,\"tokens_evaluated\":0,\"tokens_predicted\":1,"
+            "\"timings\":{\"prompt_n\":0,\"cache_n\":16,\"predicted_n\":1}}\n\n");
+        r = model->generate(req, {}, {});
+        REQUIRE_MESSAGE(r.ok(), r.status().to_string());
+        CHECK(r->prompt_tokens == 16u);
+        REQUIRE(r->cached_tokens.has_value());
+        CHECK(*r->cached_tokens == 16u);
+        CHECK(*r->cached_tokens <= r->prompt_tokens);
+
+        // 3. Top-level tokens_evaluated + tokens_cached without timings.
+        server.set_body(
+            "data: {\"content\":\"ok\",\"stop\":true,\"tokens_evaluated\":4,\"tokens_cached\":9,"
+            "\"tokens_predicted\":2}\n\n");
+        r = model->generate(req, {}, {});
+        REQUIRE_MESSAGE(r.ok(), r.status().to_string());
+        CHECK(r->prompt_tokens == 13u);
+        REQUIRE(r->cached_tokens.has_value());
+        CHECK(*r->cached_tokens == 9u);
+        CHECK(*r->cached_tokens <= r->prompt_tokens);
+        CHECK(r->completion_tokens == 2u);
+
+        // 4. Timings prompt_n without cache_n + top-level tokens_cached.
+        server.set_body(
+            "data: {\"content\":\"ok\",\"stop\":true,\"tokens_evaluated\":4,\"tokens_cached\":9,"
+            "\"timings\":{\"prompt_n\":4,\"predicted_n\":1}}\n\n");
+        r = model->generate(req, {}, {});
+        REQUIRE_MESSAGE(r.ok(), r.status().to_string());
+        CHECK(r->prompt_tokens == 13u);
+        REQUIRE(r->cached_tokens.has_value());
+        CHECK(*r->cached_tokens == 9u);
+        CHECK(*r->cached_tokens <= r->prompt_tokens);
+
+        // 5. Split frames: tokens_evaluated repeated, tokens_cached arrives later (idempotent, no double-add).
+        server.set_body(
+            "data: {\"content\":\"a\",\"stop\":false,\"tokens_evaluated\":3,\"tokens_predicted\":1}\n\n"
+            "data: {\"content\":\"b\",\"stop\":true,\"tokens_evaluated\":3,\"tokens_cached\":9,"
+            "\"tokens_predicted\":2}\n\n");
+        r = model->generate(req, {}, {});
+        REQUIRE_MESSAGE(r.ok(), r.status().to_string());
+        CHECK(r->prompt_tokens == 12u);
+        REQUIRE(r->cached_tokens.has_value());
+        CHECK(*r->cached_tokens == 9u);
+        CHECK(r->completion_tokens == 2u);
+
+        // 6. Timings on earlier frame, later stop frame carries only tokens_evaluated + tokens_predicted.
+        server.set_body(
+            "data: {\"content\":\"a\",\"stop\":false,\"timings\":{\"prompt_n\":3,\"cache_n\":9,\"predicted_n\":1}}\n\n"
+            "data: {\"content\":\"b\",\"stop\":true,\"tokens_evaluated\":3,\"tokens_predicted\":2}\n\n");
+        r = model->generate(req, {}, {});
+        REQUIRE_MESSAGE(r.ok(), r.status().to_string());
+        CHECK(r->prompt_tokens == 12u);
+        REQUIRE(r->cached_tokens.has_value());
+        CHECK(*r->cached_tokens == 9u);
+        CHECK(r->completion_tokens == 2u);
+
+        // 7. Overflowing tokens_evaluated + tokens_cached fails closed.
+        const std::string max_u64 = std::to_string(std::numeric_limits<std::uint64_t>::max());
+        server.set_body("data: {\"content\":\"x\",\"stop\":true,\"tokens_evaluated\":" + max_u64 +
+                        ",\"tokens_cached\":1}\n\n");
+        r = model->generate(req, {}, {});
+        REQUIRE_FALSE(r.ok());
+        CHECK(r.status().code() == ErrorCode::protocol_error);
     }
 }
