@@ -93,6 +93,9 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     lo.n_slots = o.slots;
     lo.spec_type = o.spec_type;
     lo.spec_draft_max = o.spec_draft_max;
+    lo.cache_ram_mib = o.cache_ram_mib;
+    lo.moe_cache_mib = o.moe_cache_mib;
+    lo.mmproj_path = o.mmproj_path;
     if (!lc::ParseSplitMode(o.split_mode, lo.split_mode)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown split mode '" + o.split_mode + "' (expected none, layer or row)");
@@ -126,8 +129,11 @@ bool IsGguf(const fs::path& p) {
 
 class LlamaCppModel final : public BackendModel {
 public:
-    LlamaCppModel(ModelDescriptor desc, lc::LlamaCppBackend runtime, double load_ms)
-        : desc_(std::move(desc)), runtime_(std::move(runtime)), load_ns_(MsToNs(load_ms)) {}
+    LlamaCppModel(ModelDescriptor desc, lc::LlamaCppBackend runtime, double load_ms, std::uint32_t slots)
+        : desc_(std::move(desc)),
+          runtime_(std::move(runtime)),
+          load_ns_(MsToNs(load_ms)),
+          slots_(std::max<std::uint32_t>(1u, slots)) {}
 
     [[nodiscard]] const ModelDescriptor& descriptor() const override { return desc_; }
 
@@ -195,9 +201,18 @@ public:
                               " exceeds the loaded llama.cpp context (" + std::to_string(desc_.context_length) +
                               "); reload with a larger context_length");
         }
-        // One llama_context per model: serialize requests (including atomic
-        // checkpoint restore and prefill-boundary capture) under one exclusive lock.
-        std::unique_lock<std::shared_mutex> lock(mutex_);
+        // When n_slots > 1 and no atomic checkpoint exchange is requested,
+        // take a shared_lock so concurrent HTTP requests enter Generate()
+        // simultaneously and are packed by the backend's continuous-batching
+        // worker loop. Keep unique_lock for n_slots == 1 or atomic checkpoints.
+        const bool concurrent_batch = (slots_ > 1u) && (request.checkpoint == nullptr);
+        std::shared_lock<std::shared_mutex> shared_guard;
+        std::unique_lock<std::shared_mutex> exclusive_guard;
+        if (concurrent_batch) {
+            shared_guard = std::shared_lock<std::shared_mutex>(mutex_);
+        } else {
+            exclusive_guard = std::unique_lock<std::shared_mutex>(mutex_);
+        }
         std::vector<lc::Token> prompt_tokens;
         if (lc::Status s = runtime_.Tokenize(request.prompt, /*add_special=*/true, prompt_tokens, /*parse_special=*/false);
             !s.ok()) {
@@ -223,7 +238,14 @@ public:
                               " exceeds the loaded llama.cpp context (" + std::to_string(desc_.context_length) +
                               "); reload with a larger context_length");
         }
-        std::unique_lock<std::shared_mutex> lock(mutex_);
+        const bool concurrent_batch = (slots_ > 1u);
+        std::shared_lock<std::shared_mutex> shared_guard;
+        std::unique_lock<std::shared_mutex> exclusive_guard;
+        if (concurrent_batch) {
+            shared_guard = std::shared_lock<std::shared_mutex>(mutex_);
+        } else {
+            exclusive_guard = std::unique_lock<std::shared_mutex>(mutex_);
+        }
         bool template_unsupported = false;
         auto segments = build_chat_template_segments(
             request.messages,
@@ -241,7 +263,8 @@ public:
             });
         if (!segments.ok()) {
             if (template_unsupported) {
-                lock.unlock();
+                if (shared_guard.owns_lock()) shared_guard.unlock();
+                if (exclusive_guard.owns_lock()) exclusive_guard.unlock();
                 return BackendModel::chat(request, cancel, on_chunk);
             }
             return segments.status();
@@ -450,6 +473,7 @@ private:
     ModelDescriptor desc_;
     lc::LlamaCppBackend runtime_;
     std::uint64_t load_ns_ = 0;
+    std::uint32_t slots_ = 1;
     mutable std::shared_mutex mutex_;
 };
 
@@ -472,7 +496,13 @@ public:
             .add(Capability::embeddings)
             .add(Capability::deterministic)
             .add(Capability::recurrent_checkpoint);
+        if (options_.slots > 1u) {
+            caps.add(Capability::continuous_batch_decode);
+        }
         return caps;
+    }
+    [[nodiscard]] std::size_t max_concurrent_requests() const override {
+        return std::max<std::size_t>(1u, static_cast<std::size_t>(options_.slots));
     }
 
     Result<std::string> probe() override {
@@ -561,7 +591,9 @@ public:
             d.parameter_size = rest.substr(0, sp2);
             if (sp2 != std::string::npos) d.quantization = rest.substr(sp2 + 1);
         }
-        return std::shared_ptr<BackendModel>(std::make_shared<LlamaCppModel>(std::move(d), std::move(runtime), load_ms));
+        const std::uint32_t loaded_slots = std::max<std::uint32_t>(1u, runtime.SlotCount());
+        return std::shared_ptr<BackendModel>(
+            std::make_shared<LlamaCppModel>(std::move(d), std::move(runtime), load_ms, loaded_slots));
     }
 
 private:

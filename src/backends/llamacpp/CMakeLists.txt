@@ -50,6 +50,7 @@ set(SONDER_LLAMACPP_SHA256
 # Consume llama.cpp as a library only: no tools, server, examples, tests, or
 # networking. CPU backend is always available; accelerators are opt-in by the
 # caller through the usual GGML_* cache variables (e.g. -DGGML_CUDA=ON).
+option(SONDER_WITH_MTMD "Build optional llama.cpp libmtmd multimodal projector support" OFF)
 set(LLAMA_BUILD_COMMON   OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
@@ -61,6 +62,12 @@ set(LLAMA_OPENSSL        OFF CACHE BOOL "" FORCE)
 set(LLAMA_ALL_WARNINGS   OFF CACHE BOOL "" FORCE)
 set(LLAMA_TOOLS_INSTALL  OFF CACHE BOOL "" FORCE)
 set(LLAMA_TESTS_INSTALL  OFF CACHE BOOL "" FORCE)
+if(SONDER_WITH_MTMD)
+    set(LLAMA_BUILD_MTMD ON CACHE BOOL "" FORCE)
+    set(MTMD_VIDEO OFF CACHE BOOL "" FORCE)
+elseif(LLAMA_BUILD_MTMD)
+    set(MTMD_VIDEO OFF CACHE BOOL "" FORCE)
+endif()
 # Static linkage keeps the test executables self-contained on every platform.
 # (Directory-scoped: these do not leak to the rest of the project.) PIC lets
 # the static archives be linked into a shared sonder_inference.
@@ -151,6 +158,11 @@ if(EXISTS "${_sonder_llama_h}")
         list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_N_CTX_SEQ=1)
     endif()
 
+    string(FIND "${_sonder_llama_h_content}" "moe_cache_size" _idx_moe_cache_size)
+    if(NOT _idx_moe_cache_size EQUAL -1)
+        list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_MOE_CACHE_SIZE=1)
+    endif()
+
     string(FIND "${_sonder_llama_h_content}" "LLAMA_CONTEXT_TYPE_MTP" _idx_ctx_mtp)
     string(FIND "${_sonder_llama_h_content}" "llama_model_n_layer_nextn" _idx_layer_nextn)
     string(FIND "${_sonder_llama_h_content}" "load_mtp" _idx_load_mtp)
@@ -202,6 +214,35 @@ if(EXISTS "${_sonder_ggml_h}")
     endif()
 endif()
 
+set(SONDER_LLAMACPP_EXTRA_LIBS "")
+set(_sonder_mtmd_h "${llamacpp_SOURCE_DIR}/tools/mtmd/mtmd.h")
+set(_sonder_mtmd_helper_h "${llamacpp_SOURCE_DIR}/tools/mtmd/mtmd-helper.h")
+if((SONDER_WITH_MTMD OR LLAMA_BUILD_MTMD)
+   AND TARGET mtmd
+   AND EXISTS "${_sonder_mtmd_h}"
+   AND EXISTS "${_sonder_mtmd_helper_h}")
+    set_target_properties(mtmd PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON)
+    list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_MTMD=1)
+    list(APPEND SONDER_LLAMACPP_PRIVATE_INCLUDES "${llamacpp_SOURCE_DIR}/tools/mtmd")
+    list(APPEND SONDER_LLAMACPP_EXTRA_LIBS mtmd)
+
+    file(READ "${_sonder_mtmd_helper_h}" _sonder_mtmd_helper_h_content)
+    string(FIND "${_sonder_mtmd_helper_h_content}" "mtmd_helper_bitmap_wrapper" _idx_mtmd_wrapper)
+    if(NOT _idx_mtmd_wrapper EQUAL -1)
+        list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_MTMD_WRAPPER_API=1)
+    endif()
+
+    file(READ "${_sonder_mtmd_h}" _sonder_mtmd_h_content)
+    string(FIND "${_sonder_mtmd_h_content}" "text_len" _idx_mtmd_text_len)
+    if(NOT _idx_mtmd_text_len EQUAL -1)
+        list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_MTMD_TEXT_LEN=1)
+    endif()
+elseif(SONDER_WITH_MTMD)
+    message(WARNING "SONDER_WITH_MTMD=ON requested, but upstream llama.cpp tree does not expose standalone mtmd target")
+endif()
+
 if(SONDER_LLAMACPP_FEATURE_DEFS)
     message(STATUS "Sonder llamacpp detected features: ${SONDER_LLAMACPP_FEATURE_DEFS}")
 endif()
@@ -218,7 +259,7 @@ target_include_directories(sonder_backend_llamacpp
 )
 target_compile_features(sonder_backend_llamacpp PUBLIC cxx_std_20)
 # llama.h stays private: nothing outside this directory sees llama.cpp types.
-target_link_libraries(sonder_backend_llamacpp PRIVATE llama ggml)
+target_link_libraries(sonder_backend_llamacpp PRIVATE llama ggml ${SONDER_LLAMACPP_EXTRA_LIBS})
 target_compile_definitions(sonder_backend_llamacpp
     PUBLIC  ${SONDER_LLAMACPP_FEATURE_DEFS}
     PRIVATE SONDER_LLAMACPP_TAG_STRING="${SONDER_LLAMACPP_TAG}"
