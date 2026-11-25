@@ -198,6 +198,10 @@ TEST_CASE("residency config mapping propagates spill_guard uma_mode and honors o
         REQUIRE(detail::apply_residency_config(setup, out, mixed).ok());
         CHECK(out.uma_mode);
 
+        setup.llamaserver_args = {"--device", "Vulkan0,Vulkan1"};
+        REQUIRE(detail::apply_residency_config(setup, out, mixed).ok());
+        CHECK(out.uma_mode);
+
         setup.llamaserver_args = {"-dev=CUDA0"};
         REQUIRE(detail::apply_residency_config(setup, out, mixed).ok());
         CHECK_FALSE(out.uma_mode);
@@ -346,9 +350,21 @@ TEST_CASE("llamaserver JSON config parses spill_guard uma_mode and residency ove
 
 TEST_CASE("detail resolve_uma_mode handles RTX, mixed RTX plus iGPU, Ryzen 780M APU, and empty GPU lists") {
     const std::vector<GpuDeviceInfo> rtx_only{make_rtx_gpu("gpu:0")};
+    const std::vector<GpuDeviceInfo> dual_discrete{make_rtx_gpu("gpu:0"), make_rtx_gpu("gpu:1")};
     const std::vector<GpuDeviceInfo> apu_only{make_ryzen_780m_gpu("gpu:0")};
     const std::vector<GpuDeviceInfo> rtx_first{make_rtx_gpu("gpu:0"), make_ryzen_780m_gpu("gpu:1")};
     const std::vector<GpuDeviceInfo> igpu_first{make_ryzen_780m_gpu("gpu:0"), make_rtx_gpu("gpu:1")};
+    GpuDeviceInfo rx9060xt;
+    rx9060xt.id = "gpu:1";
+    rx9060xt.name = "AMD Radeon RX 9060 XT";
+    rx9060xt.vendor = GpuVendor::amd;
+    rx9060xt.vendor_id = 0x1002u;
+    rx9060xt.dedicated_total = MemoryReading::known(16 * kGiB);
+    rx9060xt.shared_total = MemoryReading::known(32 * kGiB);
+    rx9060xt.is_integrated_uma = false;
+    rx9060xt.backend_hint = "rocm";
+    rx9060xt.rocm_runtime_ordinal = 0u;
+    const std::vector<GpuDeviceInfo> node1_igpu_first{make_ryzen_780m_gpu("gpu:0"), rx9060xt};
     const std::vector<GpuDeviceInfo> empty_gpus;
 
     // Explicit on/true and off/false ignore GPU inventory.
@@ -357,10 +373,11 @@ TEST_CASE("detail resolve_uma_mode handles RTX, mixed RTX plus iGPU, Ryzen 780M 
     CHECK_FALSE(detail::resolve_uma_mode("off", apu_only));
     CHECK_FALSE(detail::resolve_uma_mode("false", apu_only));
 
-    // Discrete RTX only -> false.
+    // Discrete RTX only and dual discrete -> false.
     CHECK_FALSE(detail::resolve_uma_mode("auto", rtx_only));
     CHECK_FALSE(detail::resolve_uma_mode("auto", rtx_only, "CUDA0"));
     CHECK_FALSE(detail::resolve_uma_mode("auto", rtx_only, "Vulkan0"));
+    CHECK_FALSE(detail::resolve_uma_mode("auto", dual_discrete, "Vulkan0,Vulkan1"));
 
     // Mixed RTX + Ryzen iGPU: default hint -> false (discrete RTX wins regardless of order).
     CHECK_FALSE(detail::resolve_uma_mode("auto", rtx_first));
@@ -368,17 +385,23 @@ TEST_CASE("detail resolve_uma_mode handles RTX, mixed RTX plus iGPU, Ryzen 780M 
     CHECK_FALSE(detail::resolve_uma_mode("auto", rtx_first, "CUDA0"));
     CHECK_FALSE(detail::resolve_uma_mode("auto", rtx_first, "Vulkan0"));
     CHECK_FALSE(detail::resolve_uma_mode("auto", igpu_first, "Vulkan1"));
-    CHECK_FALSE(detail::resolve_uma_mode("auto", rtx_first, "CUDA0,Vulkan1"));
     CHECK_FALSE(detail::resolve_uma_mode("auto", rtx_first, "none"));
     CHECK_FALSE(detail::resolve_uma_mode("auto", rtx_first, "CPU"));
+    CHECK_FALSE(detail::resolve_uma_mode("auto", rtx_first, "Vulkan1,bogus"));
 
-    // Mixed RTX + Ryzen iGPU: explicit Vulkan/AMD/id iGPU hint -> true.
+    // Mixed RTX/AMD + Ryzen iGPU: single iGPU or hybrid discrete+iGPU pool -> true.
     CHECK(detail::resolve_uma_mode("auto", rtx_first, "Vulkan1"));
+    CHECK(detail::resolve_uma_mode("auto", rtx_first, "Vulkan0,Vulkan1"));
+    CHECK(detail::resolve_uma_mode("auto", rtx_first, "CUDA0,Vulkan1"));
     CHECK(detail::resolve_uma_mode("auto", rtx_first, "gpu:1"));
+    CHECK(detail::resolve_uma_mode("auto", rtx_first, "uma"));
     CHECK(detail::resolve_uma_mode("auto", rtx_first, "ROCm0"));
     CHECK(detail::resolve_uma_mode("auto", rtx_first, "amd"));
     CHECK(detail::resolve_uma_mode("auto", igpu_first, "Vulkan0"));
+    CHECK(detail::resolve_uma_mode("auto", igpu_first, "Vulkan1,Vulkan0"));
     CHECK(detail::resolve_uma_mode("auto", igpu_first, "gpu:0"));
+    CHECK_FALSE(detail::resolve_uma_mode("auto", node1_igpu_first, "ROCm0"));
+    CHECK(detail::resolve_uma_mode("auto", node1_igpu_first, "Vulkan0,Vulkan1"));
 
     // AMD Ryzen 780M APU-only -> true.
     CHECK(detail::resolve_uma_mode("auto", apu_only));

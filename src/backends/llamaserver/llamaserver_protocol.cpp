@@ -135,6 +135,11 @@ json::Value build_completion_body(const std::string &model, const GenerateReques
     return o;
 }
 
+bool chat_tools_requested(const ChatRequest &request) noexcept {
+    return !request.tools.empty() &&
+           (!request.tool_choice.has_value() || request.tool_choice->mode != ToolChoiceMode::none);
+}
+
 json::Value build_chat_body(const std::string &model, const ChatRequest &request, std::string_view grammar,
                             const RequestExtras &extras) {
     json::Object o;
@@ -182,7 +187,8 @@ json::Value build_chat_body(const std::string &model, const ChatRequest &request
     o.set("messages", std::move(messages));
     o.set("stream_options", json::Object{{"include_usage", true}});
     put_sampling(o, request.sampling, false, true);
-    if (!request.tools.empty()) {
+    const bool tools_active = chat_tools_requested(request);
+    if (tools_active) {
         json::Array tools;
         tools.reserve(request.tools.size());
         for (const auto &tool : request.tools) {
@@ -190,32 +196,37 @@ json::Value build_chat_body(const std::string &model, const ChatRequest &request
             if (!tool.description.empty()) {
                 fn.set("description", tool.description);
             }
+            bool has_params = false;
             if (!tool.parameters_json.empty()) {
                 auto parsed_params = json::parse(tool.parameters_json);
-                if (parsed_params.ok() && parsed_params.value().is_object()) {
+                if (parsed_params.ok() && parsed_params.value().is_object() &&
+                    !parsed_params.value().as_object().empty()) {
                     fn.set("parameters", std::move(parsed_params).value());
+                    has_params = true;
                 }
+            }
+            if (!has_params) {
+                fn.set("parameters", json::Object{{"type", "object"}, {"properties", json::Object{}}});
             }
             tools.emplace_back(json::Object{{"type", "function"}, {"function", std::move(fn)}});
         }
         o.set("tools", std::move(tools));
-    }
-    if (request.tool_choice) {
-        switch (request.tool_choice->mode) {
-            case ToolChoiceMode::auto_choice:
-                o.set("tool_choice", "auto");
-                break;
-            case ToolChoiceMode::none:
-                o.set("tool_choice", "none");
-                break;
-            case ToolChoiceMode::required:
-                o.set("tool_choice", "required");
-                break;
-            case ToolChoiceMode::function:
-                o.set("tool_choice",
-                      json::Object{{"type", "function"},
-                                   {"function", json::Object{{"name", request.tool_choice->function_name}}}});
-                break;
+        if (request.tool_choice) {
+            switch (request.tool_choice->mode) {
+                case ToolChoiceMode::auto_choice:
+                    o.set("tool_choice", "auto");
+                    break;
+                case ToolChoiceMode::none:
+                    break;
+                case ToolChoiceMode::required:
+                    o.set("tool_choice", "required");
+                    break;
+                case ToolChoiceMode::function:
+                    o.set("tool_choice",
+                          json::Object{{"type", "function"},
+                                       {"function", json::Object{{"name", request.tool_choice->function_name}}}});
+                    break;
+            }
         }
     }
     bool emitted_response_format = false;
@@ -236,7 +247,7 @@ json::Value build_chat_body(const std::string &model, const ChatRequest &request
             }
         }
     }
-    if (!emitted_response_format && request.tools.empty()) {
+    if (!emitted_response_format && !tools_active) {
         const std::string_view effective_grammar =
             !request.grammar.empty() ? std::string_view(request.grammar) : grammar;
         if (!effective_grammar.empty())

@@ -36,7 +36,7 @@ class SonderError(Exception):
                 self.status = Status(status)
             except ValueError:
                 self.status = None
-        self.code = int(status) if status is not None else (int(self.status) if self.status else None)
+        self.code = int(status) if status is not None else (int(self.status) if self.status is not None else None)
 
 
 class InvalidArgumentError(SonderError, ValueError):
@@ -84,7 +84,7 @@ class InternalError(SonderError, RuntimeError):
 
 
 _BY_STATUS: dict[int, type[SonderError]] = {
-    cls.status.value: cls  # type: ignore[union-attr]
+    cls.status.value: cls
     for cls in (InvalidArgumentError, InvalidStateError, NotFoundError, UnavailableError,
                 CancelledError, SonderTimeoutError, BackendError, ProtocolError, SonderIOError,
                 UnsupportedError, InternalError)

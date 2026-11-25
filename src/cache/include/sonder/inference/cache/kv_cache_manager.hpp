@@ -242,10 +242,12 @@ private:
                                                 ModelArchitecture architecture) const;
     [[nodiscard]] std::size_t match_blocks(const CacheFingerprint& fingerprint,
                                          std::span<const TokenId> tokens, ModelArchitecture architecture) const;
-    [[nodiscard]] std::optional<std::size_t> find_checkpoint(const CacheFingerprint& fingerprint,
-                                                           ModelArchitecture architecture,
-                                                           std::span<const TokenId> tokens,
-                                                           std::size_t limit) const;
+    [[nodiscard]] std::optional<std::size_t> find_checkpoint(
+        const CacheFingerprint& fingerprint, ModelArchitecture architecture,
+        std::span<const TokenId> tokens, std::size_t limit,
+        std::optional<SequenceId> preferred_owner = std::nullopt,
+        std::optional<SequenceId> excluded_owner = std::nullopt,
+        bool aligned_only = false) const;
     [[nodiscard]] std::vector<TokenId> sequence_tokens(const Sequence& seq) const;
     [[nodiscard]] bool checkpoint_uses_block(BlockId block) const noexcept;
 

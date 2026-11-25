@@ -1,8 +1,8 @@
-// Arctic-style bounded Suffix Automaton (SAM) speculative drafter.
+// Arctic-style bounded Generalized Suffix Automaton (GSAM) speculative drafter.
 //
 // Stdlib-only C++20, zero extra VRAM. Maintains:
-//   1. An active-request SAM over the current prompt + generated output.
-//   2. A bounded cross-request session ring buffer SAM (~64K-256K tokens) with
+//   1. An active-request GSAM over the current prompt + generated output.
+//   2. A bounded cross-request session ring buffer GSAM (~64K-256K tokens) with
 //      explicit sentinel separators so drafts never bleed across requests.
 //
 // Supports both standalone `SpeculativeType::kSuffix` drafting and hybrid
@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <unordered_map>
 #include <utility>
@@ -31,7 +32,7 @@ struct SuffixMatchResult {
     bool from_session_ring = false;
 };
 
-// Bounded online Suffix Automaton over a contiguous token buffer.
+// Bounded online Generalized Suffix Automaton over a contiguous token buffer.
 // When the buffer reaches `max_tokens`, compacts to the most recent half and
 // rebuilds in O(N) time (amortized O(1) per token, strictly bounded RAM).
 class BoundedSuffixAutomaton {
@@ -67,6 +68,35 @@ public:
     }
 
     void AppendSpan(std::span<const Token> toks) {
+        if (toks.empty()) return;
+        // Fast path for huge spans (>= max_tokens_): retain only the trailing
+        // `max_tokens_` window and rebuild once in O(max_tokens_) instead of
+        // triggering repeated compactions over discarded tokens.
+        if (toks.size() >= max_tokens_) {
+            const bool had_tokens = !tokens_.empty();
+            const std::size_t start = toks.size() - max_tokens_;
+            tokens_.clear();
+            tokens_.reserve(max_tokens_);
+            for (std::size_t i = start; i < toks.size(); ++i) {
+                const Token t = toks[i] < 0 ? kSeparator : toks[i];
+                if (t == kSeparator && (tokens_.empty() || tokens_.back() == kSeparator)) {
+                    continue;
+                }
+                tokens_.push_back(t);
+            }
+            ResetAutomatonOnly();
+            for (std::size_t i = 0; i < tokens_.size(); ++i) {
+                if (tokens_[i] == kSeparator) {
+                    last_state_ = 0;
+                } else {
+                    ExtendSam(tokens_[i], static_cast<std::int32_t>(i));
+                }
+            }
+            if (had_tokens || toks.size() > max_tokens_) {
+                ++compactions_;
+            }
+            return;
+        }
         for (Token t : toks) {
             Append(t);
         }
@@ -81,18 +111,28 @@ public:
         if (tokens_.size() >= max_tokens_) {
             Compact();
         }
+        if (tokens_.empty() || tokens_.back() == kSeparator) {
+            last_state_ = 0;
+            return;
+        }
         tokens_.push_back(kSeparator);
         last_state_ = 0;
     }
 
     // Finds the longest suffix of `tail` present in this automaton that has at
-    // least one valid non-separator continuation token strictly before
-    // `tokens_.size() - exclude_tail_tokens`.
+    // least `min_draft_len` valid non-separator continuation tokens strictly
+    // before `tokens_.size() - exclude_tail_tokens`.
     [[nodiscard]] SuffixMatchResult MatchLongestSuffix(std::span<const Token> tail, std::size_t min_match_len,
                                                        std::size_t max_draft, std::size_t exclude_tail_tokens = 0,
-                                                       double draft_factor = 2.0) const {
+                                                       double draft_factor = 2.0,
+                                                       std::size_t min_draft_len = 1) const {
         SuffixMatchResult res;
-        if (tail.empty() || max_draft == 0 || tokens_.size() <= exclude_tail_tokens + 1) {
+        if (tail.empty() || max_draft == 0 || exclude_tail_tokens >= tokens_.size()) {
+            return res;
+        }
+        const std::size_t usable_limit = tokens_.size() - exclude_tail_tokens;
+        const std::size_t eff_min_draft = std::max<std::size_t>(1, min_draft_len);
+        if (usable_limit <= eff_min_draft || max_draft < eff_min_draft) {
             return res;
         }
         const std::size_t eff_min = std::max<std::size_t>(1, min_match_len);
@@ -130,7 +170,6 @@ public:
             return res;
         }
 
-        const std::size_t usable_limit = tokens_.size() - exclude_tail_tokens;
         std::int32_t u = st;
         std::size_t u_match_len = matched;
         std::int32_t chosen_pos = -1;
@@ -141,9 +180,12 @@ public:
             const auto candidate_valid = [&](std::int32_t p) -> bool {
                 if (p < 0) return false;
                 const auto up = static_cast<std::size_t>(p);
-                if (up + 1 >= usable_limit) return false;
-                if (tokens_[up + 1] == kSeparator) return false;
                 if (up + 1 < u_match_len) return false;
+                if (up + 1 >= usable_limit) return false;
+                if (usable_limit - (up + 1) < eff_min_draft) return false;
+                for (std::size_t d = 0; d < eff_min_draft; ++d) {
+                    if (tokens_[up + 1 + d] == kSeparator) return false;
+                }
                 return true;
             };
 
@@ -159,7 +201,8 @@ public:
             }
             u = s.link;
             if (u <= 0) break;
-            u_match_len = std::min<std::size_t>(u_match_len, static_cast<std::size_t>(states_[static_cast<std::size_t>(u)].len));
+            u_match_len =
+                std::min<std::size_t>(u_match_len, static_cast<std::size_t>(states_[static_cast<std::size_t>(u)].len));
         }
 
         if (chosen_pos < 0 || u_match_len < eff_min) {
@@ -181,19 +224,22 @@ public:
         }
 
         const std::size_t start = static_cast<std::size_t>(chosen_pos) + 1;
+        const std::size_t max_avail_cap = std::min(max_draft, usable_limit - start);
         std::size_t avail = 0;
-        while (start + avail < usable_limit && tokens_[start + avail] != kSeparator) {
+        while (avail < max_avail_cap && tokens_[start + avail] != kSeparator) {
             ++avail;
-            if (avail >= max_draft) break;
         }
-        if (avail == 0) {
+        if (avail < eff_min_draft) {
             return res;
         }
 
-        const double scaled = std::max(1.0, std::floor(static_cast<double>(full_match) * draft_factor));
-        const auto dynamic_cap = static_cast<std::size_t>(
-            std::min<double>(scaled, static_cast<double>(max_draft)));
-        const std::size_t count = std::min<std::size_t>({avail, max_draft, std::max<std::size_t>(1, dynamic_cap)});
+        const double safe_factor = (!std::isfinite(draft_factor) || draft_factor <= 0.0) ? 1.0 : draft_factor;
+        const double cap_d = static_cast<double>(avail);
+        const double raw_scaled = static_cast<double>(full_match) * safe_factor;
+        const double clamped_d =
+            (!std::isfinite(raw_scaled) || raw_scaled >= cap_d) ? cap_d : std::max(1.0, std::floor(raw_scaled));
+        const std::size_t dynamic_cap = static_cast<std::size_t>(clamped_d);
+        const std::size_t count = std::min<std::size_t>(avail, std::max<std::size_t>(eff_min_draft, dynamic_cap));
 
         res.draft.assign(tokens_.begin() + static_cast<std::ptrdiff_t>(start),
                          tokens_.begin() + static_cast<std::ptrdiff_t>(start + count));
@@ -216,7 +262,25 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return tokens_.size(); }
     [[nodiscard]] std::size_t capacity() const noexcept { return max_tokens_; }
+    [[nodiscard]] std::size_t state_count() const noexcept { return states_.size(); }
     [[nodiscard]] std::uint64_t compactions() const noexcept { return compactions_; }
+
+    // Verifies core GSAM invariants (strictly decreasing suffix link lengths,
+    // bounded state count <= 2 * max_tokens_ + 1, valid token positions).
+    [[nodiscard]] bool CheckInvariants() const noexcept {
+        if (tokens_.size() > max_tokens_) return false;
+        if (states_.empty() || states_[0].len != 0 || states_[0].link != -1) return false;
+        if (states_.size() > 2u * max_tokens_ + 1u) return false;
+        if (last_state_ < 0 || static_cast<std::size_t>(last_state_) >= states_.size()) return false;
+        for (std::size_t i = 1; i < states_.size(); ++i) {
+            const State& s = states_[i];
+            if (s.len <= 0 || s.link < 0 || static_cast<std::size_t>(s.link) >= states_.size()) return false;
+            if (states_[static_cast<std::size_t>(s.link)].len >= s.len) return false;
+            if (s.last_pos < 0 || static_cast<std::size_t>(s.last_pos) >= tokens_.size()) return false;
+            if (s.prev_pos >= 0 && static_cast<std::size_t>(s.prev_pos) >= tokens_.size()) return false;
+        }
+        return true;
+    }
 
 private:
     struct State {
@@ -286,7 +350,62 @@ private:
         }
     }
 
+    // Refreshes recency and occurrence counts along a bounded number of suffix
+    // links (strictly O(1) worst-case per appended token), preserving valid
+    // non-separator continuations in `prev_pos`.
+    void RefreshLinks(std::int32_t start_state, std::int32_t pos) noexcept {
+        std::int32_t u = start_state;
+        for (int hops = 0; u > 0 && hops < kMaxLinkRefresh; ++hops) {
+            State& su = states_[static_cast<std::size_t>(u)];
+            if (su.last_pos == pos) break;
+            if (su.last_pos >= 0) {
+                const auto prev_up = static_cast<std::size_t>(su.last_pos);
+                if (prev_up + 1 < tokens_.size() && tokens_[prev_up + 1] != kSeparator) {
+                    su.prev_pos = su.last_pos;
+                }
+            }
+            su.last_pos = pos;
+            if (su.hits < std::numeric_limits<std::uint32_t>::max()) {
+                ++su.hits;
+            }
+            u = su.link;
+        }
+    }
+
     void ExtendSam(Token tok, std::int32_t pos) {
+        // Proper Generalized SAM handling when `last_state_` already has a
+        // transition on `tok` (e.g. after `AppendSeparator()` resets `last_state_ = 0`):
+        // reuse or clone without creating unreachable equal-length ghost states.
+        const std::int32_t existing_q = FindEdge(last_state_, tok);
+        if (existing_q >= 0) {
+            const std::int32_t next_len = states_[static_cast<std::size_t>(last_state_)].len + 1;
+            if (next_len == states_[static_cast<std::size_t>(existing_q)].len) {
+                RefreshLinks(existing_q, pos);
+                last_state_ = existing_q;
+                return;
+            }
+            const auto clone = static_cast<std::int32_t>(states_.size());
+            const State q_copy = states_[static_cast<std::size_t>(existing_q)];
+            states_.push_back(State{
+                next_len,
+                q_copy.link,
+                q_copy.last_pos,
+                q_copy.prev_pos,
+                -1,
+                q_copy.hits,
+            });
+            CopyEdges(existing_q, clone);
+            std::int32_t p = last_state_;
+            while (p != -1 && FindEdge(p, tok) == existing_q) {
+                SetEdge(p, tok, clone);
+                p = states_[static_cast<std::size_t>(p)].link;
+            }
+            states_[static_cast<std::size_t>(existing_q)].link = clone;
+            RefreshLinks(clone, pos);
+            last_state_ = clone;
+            return;
+        }
+
         const auto cur = static_cast<std::int32_t>(states_.size());
         const std::int32_t prev_len = states_[static_cast<std::size_t>(last_state_)].len;
         states_.push_back(State{prev_len + 1, 0, pos, -1, -1, 1});
@@ -301,13 +420,14 @@ private:
             states_[static_cast<std::size_t>(cur)].link = 0;
         } else {
             const std::int32_t q = FindEdge(p, tok);
-            if (states_[static_cast<std::size_t>(p)].len + 1 == states_[static_cast<std::size_t>(q)].len) {
+            const std::int32_t split_len = states_[static_cast<std::size_t>(p)].len + 1;
+            if (split_len == states_[static_cast<std::size_t>(q)].len) {
                 states_[static_cast<std::size_t>(cur)].link = q;
             } else {
                 const auto clone = static_cast<std::int32_t>(states_.size());
                 const State q_copy = states_[static_cast<std::size_t>(q)];
                 states_.push_back(State{
-                    states_[static_cast<std::size_t>(p)].len + 1,
+                    split_len,
                     q_copy.link,
                     q_copy.last_pos,
                     q_copy.prev_pos,
@@ -324,30 +444,18 @@ private:
             }
         }
 
-        // Refresh recency and occurrence counts along a bounded number of suffix
-        // links (strictly O(1) worst-case per appended token).
-        std::int32_t u = states_[static_cast<std::size_t>(cur)].link;
-        for (int hops = 0; u > 0 && hops < kMaxLinkRefresh; ++hops) {
-            State& su = states_[static_cast<std::size_t>(u)];
-            if (su.last_pos == pos) break;
-            su.prev_pos = su.last_pos;
-            su.last_pos = pos;
-            ++su.hits;
-            u = su.link;
-        }
-
+        RefreshLinks(states_[static_cast<std::size_t>(cur)].link, pos);
         last_state_ = cur;
     }
 
     void Compact() {
         const std::size_t keep = std::max<std::size_t>(1, max_tokens_ / 2);
-        const std::size_t drop = tokens_.size() > keep ? (tokens_.size() - keep) : 0;
+        std::size_t drop = tokens_.size() > keep ? (tokens_.size() - keep) : 0;
+        while (drop < tokens_.size() && tokens_[drop] == kSeparator) {
+            ++drop;
+        }
         if (drop > 0) {
             tokens_.erase(tokens_.begin(), tokens_.begin() + static_cast<std::ptrdiff_t>(drop));
-        }
-        // Drop leading separators after trimming.
-        while (!tokens_.empty() && tokens_.front() == kSeparator) {
-            tokens_.erase(tokens_.begin());
         }
         ResetAutomatonOnly();
         for (std::size_t i = 0; i < tokens_.size(); ++i) {
@@ -383,7 +491,10 @@ public:
 
     explicit SuffixMatcher(std::size_t session_ring_capacity = BoundedSuffixAutomaton::kDefaultCapacity,
                            std::size_t active_capacity = BoundedSuffixAutomaton::kDefaultCapacity)
-        : active_(active_capacity), session_ring_(session_ring_capacity) {}
+        : active_(active_capacity),
+          session_ring_(session_ring_capacity),
+          max_request_history_(
+              std::max<std::size_t>(session_ring_.capacity(), BoundedSuffixAutomaton::kMaxQueryLookback)) {}
 
     void ResetAll() {
         active_.Reset();
@@ -392,9 +503,19 @@ public:
         ResetAdaptive();
     }
 
+    // Discards active-request state without ingesting it into the cross-request
+    // session ring (used when a single-request fast path transitions to batch mode).
+    void ClearActive() {
+        active_.Reset();
+        current_request_.clear();
+        ResetAdaptive();
+    }
+
     void BeginRequest(std::span<const Token> prompt) {
         active_.Reset();
-        current_request_.assign(prompt.begin(), prompt.end());
+        const std::size_t keep = std::min(prompt.size(), max_request_history_);
+        const std::size_t start = prompt.size() - keep;
+        current_request_.assign(prompt.begin() + static_cast<std::ptrdiff_t>(start), prompt.end());
         active_.AppendSpan(prompt);
         ResetAdaptive();
     }
@@ -402,6 +523,11 @@ public:
     // Commits a verified token into the active request SAM.
     void CommitToken(Token tok) {
         if (tok < 0) return;
+        if (current_request_.size() >= max_request_history_ * 2u) {
+            const std::size_t drop = current_request_.size() - max_request_history_;
+            current_request_.erase(current_request_.begin(),
+                                   current_request_.begin() + static_cast<std::ptrdiff_t>(drop));
+        }
         current_request_.push_back(tok);
         active_.Append(tok);
     }
@@ -426,22 +552,24 @@ public:
         session_ring_.AppendSeparator();
     }
 
-    // Proposes a confidence-scored dynamic draft sequence (`1..max_draft`)
+    // Proposes a confidence-scored dynamic draft sequence (`min_draft_len..max_draft`)
     // matching the longest suffix of `tail` (or `current_request_` + `id_last`
-    // via DraftWithNextToken).
+    // via DraftForCurrent).
     [[nodiscard]] SuffixMatchResult Draft(std::span<const Token> tail, std::size_t max_draft,
-                                          std::size_t min_match_len = kDefaultMinMatchLen) const {
+                                          std::size_t min_match_len = kDefaultMinMatchLen,
+                                          std::size_t min_draft_len = 1) const {
         if (max_draft == 0 || tail.empty()) return {};
         const std::size_t capped_max = std::min<std::size_t>(max_draft, static_cast<std::size_t>(kMaxSpecDraftTokens));
-        if (cooldown_remaining_ > 0) {
+        const std::size_t eff_min_draft = std::max<std::size_t>(1, min_draft_len);
+        if (capped_max < eff_min_draft || cooldown_remaining_ > 0) {
             return {};
         }
 
         const std::size_t eff_min = std::max(min_match_len, adaptive_min_match_);
-        SuffixMatchResult local_match =
-            active_.MatchLongestSuffix(tail, eff_min, capped_max, /*exclude_tail_tokens=*/0, draft_factor_);
-        SuffixMatchResult ring_match =
-            session_ring_.MatchLongestSuffix(tail, eff_min, capped_max, /*exclude_tail_tokens=*/0, draft_factor_);
+        SuffixMatchResult local_match = active_.MatchLongestSuffix(
+            tail, eff_min, capped_max, /*exclude_tail_tokens=*/0, draft_factor_, eff_min_draft);
+        SuffixMatchResult ring_match = session_ring_.MatchLongestSuffix(
+            tail, eff_min, capped_max, /*exclude_tail_tokens=*/0, draft_factor_, eff_min_draft);
         if (!ring_match.draft.empty()) {
             ring_match.from_session_ring = true;
             ring_match.confidence =
@@ -462,7 +590,8 @@ public:
     [[nodiscard]] SuffixMatchResult DraftForCurrent(Token id_last, std::size_t max_draft,
                                                     std::size_t min_match_len = kDefaultMinMatchLen) {
         query_scratch_.clear();
-        const std::size_t keep = std::min<std::size_t>(current_request_.size(), BoundedSuffixAutomaton::kMaxQueryLookback - 1);
+        const std::size_t keep =
+            std::min<std::size_t>(current_request_.size(), BoundedSuffixAutomaton::kMaxQueryLookback - 1);
         const std::size_t start = current_request_.size() - keep;
         query_scratch_.insert(query_scratch_.end(),
                               current_request_.begin() + static_cast<std::ptrdiff_t>(start), current_request_.end());
@@ -480,7 +609,7 @@ public:
             return {};
         }
         const std::size_t burst_cap = std::min<std::size_t>(max_k, kHybridMtpMaxBurstDraft);
-        SuffixMatchResult match = Draft(tail, burst_cap, kHybridMtpMinMatchLen);
+        SuffixMatchResult match = Draft(tail, burst_cap, kHybridMtpMinMatchLen, kHybridMtpMinBurstDraft);
         if (match.match_len < kHybridMtpMinMatchLen || match.confidence < kHybridMtpMinConfidence ||
             match.draft.size() < kHybridMtpMinBurstDraft) {
             return {};
@@ -496,7 +625,8 @@ public:
             return {};
         }
         query_scratch_.clear();
-        const std::size_t keep = std::min<std::size_t>(current_request_.size(), BoundedSuffixAutomaton::kMaxQueryLookback - 1);
+        const std::size_t keep =
+            std::min<std::size_t>(current_request_.size(), BoundedSuffixAutomaton::kMaxQueryLookback - 1);
         const std::size_t start = current_request_.size() - keep;
         query_scratch_.insert(query_scratch_.end(),
                               current_request_.begin() + static_cast<std::ptrdiff_t>(start), current_request_.end());
@@ -516,15 +646,21 @@ public:
         const double rate = static_cast<double>(clamped_acc) / static_cast<double>(drafted);
         constexpr double kAlpha = 0.25;
         acceptance_ema_ = (steps_observed_ == 0) ? rate : (1.0 - kAlpha) * acceptance_ema_ + kAlpha * rate;
-        ++steps_observed_;
+        if (steps_observed_ < std::numeric_limits<std::uint32_t>::max()) {
+            ++steps_observed_;
+        }
 
         if (clamped_acc == drafted) {
             draft_factor_ = std::min(3.0, draft_factor_ + 0.35);
             adaptive_min_match_ = kDefaultMinMatchLen;
+            cooldown_period_ = 4;
             low_streak_ = 0;
         } else if (acceptance_ema_ >= 0.50) {
-            draft_factor_ = std::min(2.75, draft_factor_ + 0.15);
+            if (draft_factor_ < 2.75) {
+                draft_factor_ = std::min(2.75, draft_factor_ + 0.15);
+            }
             adaptive_min_match_ = kDefaultMinMatchLen;
+            cooldown_period_ = 4;
             low_streak_ = 0;
         } else if (rate < 0.20) {
             draft_factor_ = std::max(1.0, draft_factor_ * 0.75);
@@ -545,7 +681,13 @@ public:
     [[nodiscard]] std::size_t session_ring_capacity() const noexcept { return session_ring_.capacity(); }
     [[nodiscard]] std::uint64_t session_ring_compactions() const noexcept { return session_ring_.compactions(); }
     [[nodiscard]] double acceptance_ema() const noexcept { return acceptance_ema_; }
+    [[nodiscard]] double draft_factor() const noexcept { return draft_factor_; }
+    [[nodiscard]] std::int32_t cooldown_period() const noexcept { return cooldown_period_; }
     [[nodiscard]] bool paused() const noexcept { return cooldown_remaining_ > 0; }
+    [[nodiscard]] bool CheckInvariants() const noexcept {
+        return active_.CheckInvariants() && session_ring_.CheckInvariants() &&
+               current_request_.size() <= max_request_history_ * 2u;
+    }
 
 private:
     void ResetAdaptive() noexcept {
@@ -560,6 +702,7 @@ private:
 
     BoundedSuffixAutomaton active_;
     BoundedSuffixAutomaton session_ring_;
+    std::size_t max_request_history_ = BoundedSuffixAutomaton::kDefaultCapacity;
     std::vector<Token> current_request_;
     std::vector<Token> query_scratch_;
 

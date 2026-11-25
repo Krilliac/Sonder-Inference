@@ -186,8 +186,9 @@ std::variant<ChatJob, ApiError> parse_messages_request(std::string_view body_tex
             out.messages.push_back(ChatMessage{role->as_string(), content->as_string()});
             continue;
         }
-        if (!content->is_array())
-            return bad("invalid_messages", p + ".content must be a string or content block array", p + ".content");
+        if (!content->is_array() || content->as_array().empty())
+            return bad("invalid_messages", p + ".content must be a string or non-empty content block array",
+                       p + ".content");
 
         const std::string& role_str = role->as_string();
         if (role_str == "user") {
@@ -222,9 +223,12 @@ std::variant<ChatJob, ApiError> parse_messages_request(std::string_view body_tex
                     has_user_content = true;
                 } else if (btype == "tool_result") {
                     const auto* tuid = b.find("tool_use_id");
-                    if (!present(tuid) || !tuid->is_string() || tuid->as_string().empty())
-                        return bad("invalid_messages", bp + ".tool_use_id must be a non-empty string",
+                    if (!present(tuid) || !tuid->is_string() || !is_valid_tool_call_id(tuid->as_string()))
+                        return bad("invalid_messages",
+                                   bp + ".tool_use_id must be a non-empty string of at most 128 bytes without control characters",
                                    bp + ".tool_use_id");
+                    if (const auto* is_err = b.find("is_error"); present(is_err) && !is_err->is_bool())
+                        return bad("invalid_messages", bp + ".is_error must be a boolean", bp + ".is_error");
                     std::string result_text;
                     if (const auto* rc = b.find("content"); present(rc)) {
                         if (auto e = text_content(*rc, result_text, bp + ".content"))
@@ -269,17 +273,30 @@ std::variant<ChatJob, ApiError> parse_messages_request(std::string_view body_tex
                     else
                         *asst_msg.reasoning_content += t->as_string();
                 } else if (btype == "tool_use") {
+                    if (asst_msg.tool_calls.size() >= kMaxToolCallsPerMessage)
+                        return bad("invalid_messages",
+                                   p + " exceeds maximum of " + std::to_string(kMaxToolCallsPerMessage) +
+                                       " tool_use blocks",
+                                   p);
                     const auto* id = b.find("id");
-                    if (!present(id) || !id->is_string() || id->as_string().empty())
-                        return bad("invalid_messages", bp + ".id must be a non-empty string", bp + ".id");
+                    if (!present(id) || !id->is_string() || !is_valid_tool_call_id(id->as_string()))
+                        return bad("invalid_messages",
+                                   bp + ".id must be a non-empty string of at most 128 bytes without control characters",
+                                   bp + ".id");
                     const auto* name = b.find("name");
-                    if (!present(name) || !name->is_string() || name->as_string().empty())
-                        return bad("invalid_messages", bp + ".name must be a non-empty string", bp + ".name");
+                    if (!present(name) || !name->is_string() || !is_valid_tool_name(name->as_string()))
+                        return bad("invalid_messages", bp + ".name must be 1 to 128 characters of [A-Za-z0-9_.-]",
+                                   bp + ".name");
                     std::string args_json = "{}";
                     if (const auto* input = b.find("input"); present(input)) {
                         if (!input->is_object())
                             return bad("invalid_messages", bp + ".input must be an object", bp + ".input");
                         args_json = input->dump();
+                        if (args_json.size() > kMaxToolCallPayloadBytes)
+                            return bad("invalid_messages",
+                                       bp + ".input exceeds maximum size of " +
+                                           std::to_string(kMaxToolCallPayloadBytes) + " bytes",
+                                       bp + ".input");
                     }
                     asst_msg.tool_calls.push_back(ToolCall{id->as_string(), name->as_string(), std::move(args_json)});
                 } else {
@@ -346,6 +363,7 @@ std::variant<ChatJob, ApiError> parse_messages_request(std::string_view body_tex
             if (!present(thinking->find("budget_tokens")))
                 return bad("invalid_json", "thinking.budget_tokens is required when enabled",
                            "thinking.budget_tokens");
+            out.reasoning_budget_tokens = budget;
         }
     }
     const auto* direct_effort = body.find("reasoning_effort");
@@ -431,22 +449,31 @@ json::Object anthropic_message_response(std::string_view id, std::string_view mo
                                         const std::vector<std::string>& warnings,
                                         const std::vector<ToolCall>& tool_calls,
                                         std::optional<std::string_view> visible_text_override) {
-    const std::vector<ToolCall>& calls = tool_calls.empty() ? result.tool_calls : tool_calls;
+    const std::vector<ToolCall>& raw_calls = tool_calls.empty() ? result.tool_calls : tool_calls;
+    std::vector<const ToolCall*> valid_calls;
+    valid_calls.reserve(raw_calls.size());
+    for (const auto& tc : raw_calls) {
+        if (!tc.name.empty()) {
+            valid_calls.push_back(&tc);
+        }
+    }
     const std::string_view visible_text = visible_text_override.value_or(std::string_view(result.text));
     json::Array content;
     if (!result.reasoning.empty())
         content.push_back(json::Object{{"type", "thinking"}, {"thinking", result.reasoning}});
-    if (!visible_text.empty() || calls.empty())
+    if (!visible_text.empty() || valid_calls.empty())
         content.push_back(json::Object{{"type", "text"}, {"text", std::string(visible_text)}});
-    for (const auto& tc : calls) {
+    for (std::size_t idx = 0; idx < valid_calls.size(); ++idx) {
+        const ToolCall& tc = *valid_calls[idx];
         json::Value input_val = json::Object{};
         if (!tc.arguments_json.empty()) {
             auto parsed = json::parse(tc.arguments_json);
             if (parsed.ok() && parsed.value().is_object())
                 input_val = std::move(parsed).value();
         }
+        const std::string call_id = tc.id.empty() ? ("toolu_" + std::to_string(idx)) : tc.id;
         content.push_back(json::Object{{"type", "tool_use"},
-                                       {"id", tc.id},
+                                       {"id", call_id},
                                        {"name", tc.name},
                                        {"input", std::move(input_val)}});
     }
@@ -455,7 +482,7 @@ json::Object anthropic_message_response(std::string_view id, std::string_view mo
                      {"role", "assistant"},
                      {"model", std::string(model)},
                      {"content", std::move(content)},
-                     {"stop_reason", stop_reason(result, !calls.empty())},
+                     {"stop_reason", stop_reason(result, !valid_calls.empty())},
                      {"stop_sequence", nullptr},
                      {"usage", usage(result)}};
     if (result.stats.stop_reason == StopReason::stop_sequence && result.stats.matched_stop)
@@ -486,6 +513,15 @@ std::string AnthropicStream::start() {
                                                        {"usage", json::Object{{"input_tokens", 0},
                                                                               {"output_tokens", 0}}}}}});
 }
+void AnthropicStream::close_active_tool_block(std::string& out) {
+    if (!tool_block_) return;
+    out += frame("content_block_stop", json::Object{{"index", block_index_++}});
+    tool_block_ = false;
+    if (auto it = pending_tools_.find(active_tool_index_); it != pending_tools_.end()) {
+        it->second.stopped = true;
+        it->second.pending_args.clear();
+    }
+}
 std::string AnthropicStream::token(const TokenChunk& chunk) {
     if (!started_ || finished_)
         return {};
@@ -496,10 +532,7 @@ std::string AnthropicStream::token(const TokenChunk& chunk) {
                 out += frame("content_block_stop", json::Object{{"index", block_index_++}});
                 text_block_ = false;
             }
-            if (tool_block_) {
-                out += frame("content_block_stop", json::Object{{"index", block_index_++}});
-                tool_block_ = false;
-            }
+            close_active_tool_block(out);
             out +=
                 frame("content_block_start",
                       json::Object{{"index", block_index_},
@@ -516,15 +549,13 @@ std::string AnthropicStream::token(const TokenChunk& chunk) {
             out += frame("content_block_stop", json::Object{{"index", block_index_++}});
             thinking_block_ = false;
         }
-        if (tool_block_) {
-            out += frame("content_block_stop", json::Object{{"index", block_index_++}});
-            tool_block_ = false;
-        }
+        close_active_tool_block(out);
         if (!text_block_) {
             out += frame("content_block_start",
                          json::Object{{"index", block_index_},
                                       {"content_block", json::Object{{"type", "text"}, {"text", ""}}}});
             text_block_ = true;
+            saw_text_ = true;
         }
         out += frame(
             "content_block_delta",
@@ -534,7 +565,7 @@ std::string AnthropicStream::token(const TokenChunk& chunk) {
     return out;
 }
 std::string AnthropicStream::tool_call(const ToolCall& call) {
-    if (!started_ || finished_)
+    if (!started_ || finished_ || call.name.empty())
         return {};
     std::string out;
     if (thinking_block_) {
@@ -545,15 +576,13 @@ std::string AnthropicStream::tool_call(const ToolCall& call) {
         out += frame("content_block_stop", json::Object{{"index", block_index_++}});
         text_block_ = false;
     }
-    if (tool_block_) {
-        out += frame("content_block_stop", json::Object{{"index", block_index_++}});
-        tool_block_ = false;
-    }
+    close_active_tool_block(out);
     saw_tool_use_ = true;
+    const std::string call_id = call.id.empty() ? ("toolu_" + std::to_string(block_index_)) : call.id;
     out += frame("content_block_start",
                  json::Object{{"index", block_index_},
                               {"content_block", json::Object{{"type", "tool_use"},
-                                                             {"id", call.id},
+                                                             {"id", call_id},
                                                              {"name", call.name},
                                                              {"input", json::Object{}}}}});
     const std::string& partial = call.arguments_json.empty() ? std::string("{}") : call.arguments_json;
@@ -565,15 +594,14 @@ std::string AnthropicStream::tool_call(const ToolCall& call) {
 }
 std::string AnthropicStream::flush_pending_tools() {
     std::string out;
-    if (tool_block_) {
-        out += frame("content_block_stop", json::Object{{"index", block_index_++}});
-        tool_block_ = false;
-        if (auto it = pending_tools_.find(active_tool_index_); it != pending_tools_.end()) {
-            it->second.stopped = true;
-        }
-    }
+    close_active_tool_block(out);
     for (auto& [idx, slot] : pending_tools_) {
         if (slot.stopped) continue;
+        if (slot.name.empty()) {
+            slot.stopped = true;
+            slot.pending_args.clear();
+            continue;
+        }
         saw_tool_use_ = true;
         const std::string call_id = slot.id.empty() ? ("toolu_" + std::to_string(idx)) : slot.id;
         out += frame("content_block_start",
@@ -596,19 +624,13 @@ std::string AnthropicStream::flush_pending_tools() {
     return out;
 }
 std::string AnthropicStream::tool_call_delta(const ToolCallDelta& delta) {
-    if (!started_ || finished_ || delta.index >= 64u)
+    if (!started_ || finished_ || delta.index >= kMaxToolCallsPerMessage)
         return {};
     std::string out;
-    if (thinking_block_) {
-        out += frame("content_block_stop", json::Object{{"index", block_index_++}});
-        thinking_block_ = false;
-    }
-    if (text_block_) {
-        out += frame("content_block_stop", json::Object{{"index", block_index_++}});
-        text_block_ = false;
-    }
-    saw_tool_use_ = true;
     auto& slot = pending_tools_[delta.index];
+    if (slot.stopped) {
+        return out;
+    }
     if (!delta.id.empty()) slot.id = delta.id;
     if (!delta.name.empty()) slot.name = delta.name;
 
@@ -626,6 +648,15 @@ std::string AnthropicStream::tool_call_delta(const ToolCallDelta& delta) {
         return out;
     }
     if (!tool_block_ && !slot.started && !slot.stopped && !slot.name.empty() && pending_tools_.size() == 1u) {
+        if (thinking_block_) {
+            out += frame("content_block_stop", json::Object{{"index", block_index_++}});
+            thinking_block_ = false;
+        }
+        if (text_block_) {
+            out += frame("content_block_stop", json::Object{{"index", block_index_++}});
+            text_block_ = false;
+        }
+        saw_tool_use_ = true;
         tool_block_ = true;
         active_tool_index_ = delta.index;
         slot.started = true;
@@ -647,7 +678,10 @@ std::string AnthropicStream::tool_call_delta(const ToolCallDelta& delta) {
         }
         return out;
     }
-    slot.pending_args += delta.arguments_delta;
+    if (!delta.arguments_delta.empty() && slot.pending_args.size() < kMaxToolCallPayloadBytes) {
+        const std::size_t budget = kMaxToolCallPayloadBytes - slot.pending_args.size();
+        slot.pending_args.append(delta.arguments_delta.data(), std::min(budget, delta.arguments_delta.size()));
+    }
     return out;
 }
 std::string AnthropicStream::finish(const GenerationResult& result, const std::vector<std::string>& warnings,
@@ -658,23 +692,17 @@ std::string AnthropicStream::finish(const GenerationResult& result, const std::v
     if (thinking_block_) {
         out += frame("content_block_stop", json::Object{{"index", block_index_++}});
         thinking_block_ = false;
-        if (!text_block_ && !saw_tool_use_) {
-            out += frame("content_block_start",
-                         json::Object{{"index", block_index_},
-                                      {"content_block", json::Object{{"type", "text"}, {"text", ""}}}});
-            text_block_ = true;
-        }
-    }
-    out += flush_pending_tools();
-    if (!text_block_ && !saw_tool_use_) {
-        out += frame("content_block_start",
-                     json::Object{{"index", block_index_},
-                                  {"content_block", json::Object{{"type", "text"}, {"text", ""}}}});
-        text_block_ = true;
     }
     if (text_block_) {
         out += frame("content_block_stop", json::Object{{"index", block_index_++}});
         text_block_ = false;
+    }
+    out += flush_pending_tools();
+    if (!saw_text_ && !saw_tool_use_) {
+        out += frame("content_block_start",
+                     json::Object{{"index", block_index_},
+                                  {"content_block", json::Object{{"type", "text"}, {"text", ""}}}});
+        out += frame("content_block_stop", json::Object{{"index", block_index_++}});
     }
     const json::Value matched = result.stats.stop_reason == StopReason::stop_sequence
                                     ? json::Value(result.stats.matched_stop)

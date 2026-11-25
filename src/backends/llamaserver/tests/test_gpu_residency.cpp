@@ -352,3 +352,188 @@ TEST_CASE("residency guard counts shared memory as active GPU memory only in uma
     CHECK(dgpu.gpu_offload_missing());
     CHECK(dgpu.peak_dedicated_bytes() == 100 * MiB);
 }
+
+TEST_CASE("parse_pdh_adapter_luid extracts WDDM high/low LUID pairs and rejects malformed names") {
+    const auto std_luid = parse_pdh_adapter_luid("pid_1234_luid_0x00000000_0x000104A4_phys_0");
+    REQUIRE(std_luid.has_value());
+    CHECK(std_luid->high == 0x00000000u);
+    CHECK(std_luid->low == 0x000104A4u);
+
+    const auto short_luid = parse_pdh_adapter_luid("pid_9_LUID_0x0_0x1");
+    REQUIRE(short_luid.has_value());
+    CHECK(short_luid->high == 0u);
+    CHECK(short_luid->low == 1u);
+
+    const auto upper_luid = parse_pdh_adapter_luid("pid_77_luid_0XFFFFFFFF_0x1234abcd_phys_1");
+    REQUIRE(upper_luid.has_value());
+    CHECK(upper_luid->high == 0xFFFFFFFFu);
+    CHECK(upper_luid->low == 0x1234ABCDu);
+
+    CHECK_FALSE(parse_pdh_adapter_luid("").has_value());
+    CHECK_FALSE(parse_pdh_adapter_luid("pid_1234_luid_test").has_value());
+    CHECK_FALSE(parse_pdh_adapter_luid("pid_1234_drm_fdinfo").has_value());
+    CHECK_FALSE(parse_pdh_adapter_luid("pid_1234_nvml_0").has_value());
+    CHECK_FALSE(parse_pdh_adapter_luid("pid_1234_luid_0x123456789_0x1_phys_0").has_value());
+    CHECK_FALSE(parse_pdh_adapter_luid("pid_1234_luid_0x0_0x1xyz").has_value());
+    CHECK_FALSE(parse_pdh_adapter_luid("pid_1234_luid_0x_0x1_phys_0").has_value());
+    CHECK_FALSE(parse_pdh_adapter_luid("pid_1234_luid_0x0_phys_0").has_value());
+}
+
+TEST_CASE("classify_pdh_counters and summarize_gpu_counters separate discrete and UMA adapters") {
+    constexpr AdapterLuid kDiscreteLuid{0x00000000u, 0x000104A4u};  // e.g. RX 9060 XT
+    constexpr AdapterLuid kUmaLuid{0x00000000u, 0x000118C2u};       // e.g. Radeon 780M
+    const std::vector<AdapterLuidInfo> adapters{
+        {kDiscreteLuid, false},
+        {kUmaLuid, true},
+    };
+
+    GpuProcessCounters c;
+    c.dedicated = {
+        {"pid_42_luid_0x00000000_0x000104A4_phys_0", 15 * GiB},
+        {"pid_42_luid_0x00000000_0x000118C2_phys_0", 512 * MiB},
+        {"pid_42_luid_0x00000000_0x00099999_phys_0", 0},         // 0-byte software/WARP adapter
+        {"pid_420_luid_0x00000000_0x000104A4_phys_0", 10 * GiB}, // different PID
+    };
+    c.shared = {
+        {"pid_42_luid_0x00000000_0x000104A4_phys_0", 160 * MiB},
+        {"pid_42_luid_0x00000000_0x000118C2_phys_0", 25 * GiB},
+        {"pid_42_luid_0x00000000_0x00099999_phys_0", 0},
+        {"pid_420_luid_0x00000000_0x000118C2_phys_0", 8 * GiB},
+    };
+
+    classify_pdh_counters(c, adapters);
+    const auto s = summarize_gpu_counters(42, c);
+    CHECK(s.has_adapter_classification);
+    CHECK(s.instances == 3);
+    CHECK(s.discrete_instances == 1);
+    CHECK(s.uma_instances == 1);
+    CHECK(s.dedicated_bytes == 15 * GiB + 512 * MiB);
+    CHECK(s.shared_bytes == 25 * GiB + 160 * MiB);
+    CHECK(s.discrete_dedicated_bytes == 15 * GiB);
+    CHECK(s.discrete_shared_bytes == 160 * MiB);
+    CHECK(s.uma_dedicated_bytes == 512 * MiB);
+    CHECK(s.uma_shared_bytes == 25 * GiB);
+
+    // Non-zero unknown adapter fails safe and disables per-adapter classification.
+    c.shared.push_back({"pid_42_luid_0x00000000_0x00088888_phys_0", 400 * MiB});
+    const auto partial = summarize_gpu_counters(42, c);
+    CHECK_FALSE(partial.has_adapter_classification);
+    CHECK(partial.shared_bytes == 25 * GiB + 560 * MiB);
+}
+
+TEST_CASE("is_spilled distinguishes pure discrete, pure UMA, and hybrid discrete+iGPU pools") {
+    constexpr AdapterLuid kDiscreteLuid{0x00000000u, 0x000104A4u};
+    constexpr AdapterLuid kDiscrete2Luid{0x00000000u, 0x000105B5u};
+    constexpr AdapterLuid kUmaLuid{0x00000000u, 0x000118C2u};
+
+    const auto make_classified = [](std::uint32_t pid,
+                                    const std::vector<AdapterLuidInfo> &adapters,
+                                    std::vector<CounterInstance> dedicated,
+                                    std::vector<CounterInstance> shared) {
+        GpuProcessCounters c{std::move(dedicated), std::move(shared)};
+        classify_pdh_counters(c, adapters);
+        return summarize_gpu_counters(pid, c);
+    };
+
+    const std::vector<AdapterLuidInfo> hybrid_adapters{{kDiscreteLuid, false}, {kUmaLuid, true}};
+    const std::vector<AdapterLuidInfo> dual_discrete_adapters{{kDiscreteLuid, false}, {kDiscrete2Luid, false}};
+
+    // 1. Pure discrete (single GPU & dual discrete): clean passes, spill triggers.
+    {
+        SpillGuardOptions discrete;
+        const auto clean = make_classified(
+            10, hybrid_adapters,
+            {{"pid_10_luid_0x00000000_0x000104A4_phys_0", 15 * GiB}},
+            {{"pid_10_luid_0x00000000_0x000104A4_phys_0", 180 * MiB}});
+        CHECK(clean.has_adapter_classification);
+        CHECK(effective_spill_shared_bytes(clean, discrete) == 180 * MiB);
+        CHECK_FALSE(is_spilled(clean, discrete));
+
+        const auto spilled = make_classified(
+            10, hybrid_adapters,
+            {{"pid_10_luid_0x00000000_0x000104A4_phys_0", 15 * GiB}},
+            {{"pid_10_luid_0x00000000_0x000104A4_phys_0", 388 * MiB}});
+        CHECK(effective_spill_shared_bytes(spilled, discrete) == 388 * MiB);
+        CHECK(is_spilled(spilled, discrete));
+
+        const auto dual_spilled = make_classified(
+            10, dual_discrete_adapters,
+            {{"pid_10_luid_0x00000000_0x000104A4_phys_0", 15 * GiB},
+             {"pid_10_luid_0x00000000_0x000105B5_phys_0", 15 * GiB}},
+            {{"pid_10_luid_0x00000000_0x000104A4_phys_0", 120 * MiB},
+             {"pid_10_luid_0x00000000_0x000105B5_phys_0", 300 * MiB}});
+        CHECK(effective_spill_shared_bytes(dual_spilled, discrete) == 420 * MiB);
+        CHECK(is_spilled(dual_spilled, discrete));
+    }
+
+    // 2. Pure iGPU UMA: uma_mode=true suppresses spill; explicit uma_mode=false keeps legacy check.
+    {
+        const auto apu_sample = make_classified(
+            20, hybrid_adapters,
+            {{"pid_20_luid_0x00000000_0x000118C2_phys_0", 512 * MiB}},
+            {{"pid_20_luid_0x00000000_0x000118C2_phys_0", 25 * GiB}});
+        CHECK(apu_sample.has_adapter_classification);
+        CHECK(apu_sample.discrete_instances == 0);
+        CHECK(apu_sample.uma_instances == 1);
+
+        SpillGuardOptions uma;
+        uma.uma_mode = true;
+        CHECK(effective_spill_shared_bytes(apu_sample, uma) == 0);
+        CHECK_FALSE(is_spilled(apu_sample, uma));
+
+        SpillGuardOptions explicit_off;
+        explicit_off.uma_mode = false;
+        CHECK(effective_spill_shared_bytes(apu_sample, explicit_off) == 25 * GiB);
+        CHECK(is_spilled(apu_sample, explicit_off));
+    }
+
+    // 3. Hybrid discrete + iGPU pool (Node1 RX 9060 XT + Radeon 780M):
+    //    ~25 GiB intentional iGPU UMA shared allocation does NOT trigger spill,
+    //    while genuine discrete-GPU PCIe spill (> threshold) STILL triggers!
+    {
+        SpillGuardOptions hybrid;
+        hybrid.uma_mode = true;
+        hybrid.hybrid_uma_mode = true;
+
+        const auto healthy_hybrid = make_classified(
+            30, hybrid_adapters,
+            {{"pid_30_luid_0x00000000_0x000104A4_phys_0", 15 * GiB},
+             {"pid_30_luid_0x00000000_0x000118C2_phys_0", 512 * MiB}},
+            {{"pid_30_luid_0x00000000_0x000104A4_phys_0", 160 * MiB},
+             {"pid_30_luid_0x00000000_0x000118C2_phys_0", 25 * GiB}});
+        CHECK(effective_spill_shared_bytes(healthy_hybrid, hybrid) == 160 * MiB);
+        CHECK_FALSE(is_spilled(healthy_hybrid, hybrid));
+
+        // Defense in depth: even when uma_mode=false on a dual-adapter sample,
+        // per-adapter classification attributes spill solely to discrete adapters.
+        SpillGuardOptions legacy_discrete;
+        CHECK(effective_spill_shared_bytes(healthy_hybrid, legacy_discrete) == 160 * MiB);
+        CHECK_FALSE(is_spilled(healthy_hybrid, legacy_discrete));
+
+        const auto discrete_spilled_hybrid = make_classified(
+            30, hybrid_adapters,
+            {{"pid_30_luid_0x00000000_0x000104A4_phys_0", 15 * GiB},
+             {"pid_30_luid_0x00000000_0x000118C2_phys_0", 512 * MiB}},
+            {{"pid_30_luid_0x00000000_0x000104A4_phys_0", 950 * MiB},
+             {"pid_30_luid_0x00000000_0x000118C2_phys_0", 25 * GiB}});
+        CHECK(effective_spill_shared_bytes(discrete_spilled_hybrid, hybrid) == 950 * MiB);
+        CHECK(is_spilled(discrete_spilled_hybrid, hybrid));
+        CHECK(is_spilled(discrete_spilled_hybrid, legacy_discrete));
+
+        // Explicit pure uma_mode=true (hybrid_uma_mode=false, e.g. user set "on")
+        // suppresses spill unconditionally.
+        SpillGuardOptions forced_on;
+        forced_on.uma_mode = true;
+        forced_on.hybrid_uma_mode = false;
+        CHECK_FALSE(is_spilled(discrete_spilled_hybrid, forced_on));
+
+        // Unclassified aggregate counters in hybrid mode suppress false-positive kills.
+        GpuMemorySample aggregate_hybrid;
+        aggregate_hybrid.dedicated_bytes = 15 * GiB + 512 * MiB;
+        aggregate_hybrid.shared_bytes = 25 * GiB + 160 * MiB;
+        aggregate_hybrid.instances = 2;
+        CHECK_FALSE(aggregate_hybrid.has_adapter_classification);
+        CHECK(effective_spill_shared_bytes(aggregate_hybrid, hybrid) == 0);
+        CHECK_FALSE(is_spilled(aggregate_hybrid, hybrid));
+    }
+}

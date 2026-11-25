@@ -26,10 +26,31 @@ namespace sonder::inference::llamaserver {
 
 inline constexpr std::uint64_t kMiB = 1024ull * 1024ull;
 
+// Per-adapter classification carried by counter instances when the counter
+// source (e.g. Windows PDH + DXGI LUID matching, or Linux NVML) can distinguish
+// discrete GPUs from integrated UMA GPUs.
+enum class CounterAdapterKind {
+    unknown,
+    discrete,
+    integrated_uma
+};
+
 // One counter instance, e.g. {"pid_1234_luid_0x00000000_0x0000D1F5_phys_0", 351272960}.
 struct CounterInstance {
     std::string name;
     std::uint64_t value = 0;
+    CounterAdapterKind adapter_kind = CounterAdapterKind::unknown;
+};
+
+struct AdapterLuid {
+    std::uint32_t high = 0;
+    std::uint32_t low = 0;
+    friend constexpr bool operator==(const AdapterLuid &, const AdapterLuid &) noexcept = default;
+};
+
+struct AdapterLuidInfo {
+    AdapterLuid luid;
+    bool is_integrated_uma = false;
 };
 
 struct GpuProcessCounters {
@@ -65,10 +86,31 @@ std::shared_ptr<GpuCounterSource> make_gpu_counter_source();
 // platforms so it is testable everywhere.
 bool parse_linux_drm_fdinfo(std::string_view fdinfo_text, std::uint64_t &vram_bytes, std::uint64_t &gtt_bytes);
 
+// Extracts the WDDM adapter LUID from a Windows PDH GPU Process Memory
+// instance name (e.g. "pid_1234_luid_0x00000000_0x000104A4_phys_0"). Compiled
+// on all platforms so per-adapter attribution is testable everywhere.
+std::optional<AdapterLuid> parse_pdh_adapter_luid(std::string_view instance_name) noexcept;
+
+// Pure helper: tags CounterInstance::adapter_kind on matching PDH LUID
+// instances using `adapters`. Instances whose LUID is not in `adapters` remain
+// unchanged.
+void classify_pdh_counters(GpuProcessCounters &counters, const std::vector<AdapterLuidInfo> &adapters) noexcept;
+
 struct GpuMemorySample {
     std::uint64_t dedicated_bytes = 0;
     std::uint64_t shared_bytes = 0;
     std::size_t instances = 0;  // matching adapter instances (max over the two counters)
+    // Per-adapter breakdown when counter instances are classified into discrete
+    // vs integrated UMA adapters. `has_adapter_classification` is true when at
+    // least one matching instance is classified and no unclassified instance
+    // reports non-zero usage.
+    std::uint64_t discrete_dedicated_bytes = 0;
+    std::uint64_t discrete_shared_bytes = 0;
+    std::uint64_t uma_dedicated_bytes = 0;
+    std::uint64_t uma_shared_bytes = 0;
+    std::size_t discrete_instances = 0;
+    std::size_t uma_instances = 0;
+    bool has_adapter_classification = false;
 };
 
 // Sums the instances that belong to `pid` exactly ("pid_12_..." never
@@ -115,9 +157,17 @@ struct SpillGuardOptions {
     std::size_t max_attempts = 4;
     LlamaServerResidencyGuardOptions residency;
     // Integrated UMA GPUs (e.g. Ryzen APUs) legitimately allocate GPU buffers
-    // in shared/GTT system memory; when true, is_spilled() never flags shared
-    // usage as a PCIe VRAM spill.
+    // in shared/GTT system memory; when true (and not hybrid_uma_mode),
+    // is_spilled() never flags shared usage as a PCIe VRAM spill.
     bool uma_mode = false;
+    // Hybrid discrete + integrated UMA pool (e.g. --device Vulkan0,Vulkan1 on
+    // discrete RX 9060 XT + integrated Radeon 780M). When per-adapter counter
+    // classification is available, is_spilled() evaluates ONLY the discrete
+    // adapter(s)' shared usage against baseline + threshold, ignoring
+    // intentional shared allocation on integrated UMA adapters. When only
+    // aggregate unclassified counters are available, hybrid_uma_mode suppresses
+    // false-positive spills caused by intentional UMA shared memory.
+    bool hybrid_uma_mode = false;
 };
 
 Status validate_spill_guard(const SpillGuardOptions &options);
@@ -125,6 +175,14 @@ Status validate_spill_guard(const SpillGuardOptions &options);
 // baseline_bytes + baseline_bytes_per_1k_ctx * ctx / 1024 (saturating); the
 // fixed baseline when the context size is unknown.
 std::uint64_t effective_baseline(const SpillGuardOptions &options, std::optional<std::uint64_t> ctx);
+
+// Shared bytes attributable to discrete-GPU VRAM spill under `options`.
+// Returns 0 for pure UMA mode (or hybrid mode without per-adapter separation),
+// `sample.discrete_shared_bytes` when per-adapter classification distinguishes
+// discrete adapters from integrated UMA adapters, and `sample.shared_bytes`
+// otherwise.
+std::uint64_t effective_spill_shared_bytes(const GpuMemorySample &sample,
+                                           const SpillGuardOptions &options) noexcept;
 
 bool is_spilled(const GpuMemorySample &sample, const SpillGuardOptions &options,
                 std::optional<std::uint64_t> ctx = std::nullopt);

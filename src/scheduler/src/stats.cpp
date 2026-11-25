@@ -25,8 +25,9 @@ LatencySummary LatencySummary::from(std::vector<TimeUs> samples) {
     s.count = samples.size();
     s.min = samples.front();
     s.max = samples.back();
-    const long double sum = std::accumulate(samples.begin(), samples.end(), 0.0L,
-                                            [](long double a, TimeUs b) { return a + b; });
+    const long double sum = std::accumulate(
+        samples.begin(), samples.end(), 0.0L,
+        [](long double a, TimeUs b) { return a + static_cast<long double>(b); });
     s.mean = static_cast<double>(sum / static_cast<long double>(samples.size()));
     s.p50 = percentile(samples, 0.50);
     s.p95 = percentile(samples, 0.95);

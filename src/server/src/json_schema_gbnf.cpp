@@ -56,13 +56,76 @@ const char* const kCommonRules =
     "object ::= \"{\" space ( string \":\" space value (\",\" space string \":\" space value)* )? \"}\" space\n"
     "array ::= \"[\" space ( value (\",\" space value)* )? \"]\" space\n";
 
+// Strict RFC 3629 UTF-8 code-point decoder (rejects overlongs, UTF-16
+// surrogates U+D800..U+DFFF, code points > U+10FFFF, and truncated sequences).
+bool decode_utf8_cp(std::string_view s, std::size_t pos, std::uint32_t& cp, std::size_t& len) noexcept {
+    if (pos >= s.size()) return false;
+    const auto b0 = static_cast<unsigned char>(s[pos]);
+    if (b0 < 0x80u) {
+        cp = b0;
+        len = 1;
+        return true;
+    }
+    if (b0 >= 0xC2u && b0 <= 0xDFu) {
+        if (pos + 2 > s.size()) return false;
+        const auto b1 = static_cast<unsigned char>(s[pos + 1]);
+        if (b1 < 0x80u || b1 > 0xBFu) return false;
+        cp = (static_cast<std::uint32_t>(b0 & 0x1Fu) << 6) | static_cast<std::uint32_t>(b1 & 0x3Fu);
+        len = 2;
+        return true;
+    }
+    if (b0 >= 0xE0u && b0 <= 0xEFu) {
+        if (pos + 3 > s.size()) return false;
+        const auto b1 = static_cast<unsigned char>(s[pos + 1]);
+        const auto b2 = static_cast<unsigned char>(s[pos + 2]);
+        const unsigned char lo = (b0 == 0xE0u) ? 0xA0u : 0x80u;
+        const unsigned char hi = (b0 == 0xEDu) ? 0x9Fu : 0xBFu;
+        if (b1 < lo || b1 > hi || b2 < 0x80u || b2 > 0xBFu) return false;
+        cp = (static_cast<std::uint32_t>(b0 & 0x0Fu) << 12) | (static_cast<std::uint32_t>(b1 & 0x3Fu) << 6) |
+             static_cast<std::uint32_t>(b2 & 0x3Fu);
+        len = 3;
+        return true;
+    }
+    if (b0 >= 0xF0u && b0 <= 0xF4u) {
+        if (pos + 4 > s.size()) return false;
+        const auto b1 = static_cast<unsigned char>(s[pos + 1]);
+        const auto b2 = static_cast<unsigned char>(s[pos + 2]);
+        const auto b3 = static_cast<unsigned char>(s[pos + 3]);
+        const unsigned char lo = (b0 == 0xF0u) ? 0x90u : 0x80u;
+        const unsigned char hi = (b0 == 0xF4u) ? 0x8Fu : 0xBFu;
+        if (b1 < lo || b1 > hi || b2 < 0x80u || b2 > 0xBFu || b3 < 0x80u || b3 > 0xBFu) return false;
+        cp = (static_cast<std::uint32_t>(b0 & 0x07u) << 18) | (static_cast<std::uint32_t>(b1 & 0x3Fu) << 12) |
+             (static_cast<std::uint32_t>(b2 & 0x3Fu) << 6) | static_cast<std::uint32_t>(b3 & 0x3Fu);
+        len = 4;
+        return true;
+    }
+    return false;
+}
+
 // Escapes raw bytes as a GBNF double-quoted string literal (including quotes).
 std::string gbnf_literal(std::string_view text) {
+    static constexpr char kHex[] = "0123456789abcdef";
     std::string out;
     out.reserve(text.size() + 4);
     out.push_back('"');
-    for (const char ch : text) {
+    for (std::size_t i = 0; i < text.size();) {
+        const char ch = text[i];
         const auto u = static_cast<unsigned char>(ch);
+        if (u >= 0x80u) {
+            std::uint32_t cp = 0;
+            std::size_t len = 0;
+            if (decode_utf8_cp(text, i, cp, len)) {
+                out.append(text.data() + i, len);
+                i += len;
+            } else {
+                out += "\\x";
+                out.push_back(kHex[(u >> 4) & 0x0Fu]);
+                out.push_back(kHex[u & 0x0Fu]);
+                ++i;
+            }
+            continue;
+        }
+        ++i;
         switch (ch) {
             case '"': out += "\\\""; break;
             case '\\': out += "\\\\"; break;
@@ -70,11 +133,10 @@ std::string gbnf_literal(std::string_view text) {
             case '\r': out += "\\r"; break;
             case '\t': out += "\\t"; break;
             default:
-                if (u < 0x20 || u == 0x7F) {
-                    static constexpr char kHex[] = "0123456789abcdef";
+                if (u < 0x20u || u == 0x7Fu) {
                     out += "\\x";
-                    out.push_back(kHex[(u >> 4) & 0x0F]);
-                    out.push_back(kHex[u & 0x0F]);
+                    out.push_back(kHex[(u >> 4) & 0x0Fu]);
+                    out.push_back(kHex[u & 0x0Fu]);
                 } else {
                     out.push_back(ch);
                 }
@@ -159,18 +221,87 @@ std::uint32_t type_bit_for_value(const json::Value& v) noexcept {
     return kTypeAll;
 }
 
-bool json_values_equal(const json::Value& a, const json::Value& b) {
+bool value_matches_type_mask(const json::Value& v, std::uint32_t mask) noexcept {
+    const std::uint32_t bit = type_bit_for_value(v);
+    if ((bit & mask) != 0u) {
+        return true;
+    }
+    // JSON Schema "number" accepts JSON integers (and whole-valued floats satisfy "integer").
+    if (bit == kTypeInt && (mask & kTypeNum) != 0u) {
+        return true;
+    }
+    if (bit == kTypeNum && (mask & kTypeInt) != 0u && std::isfinite(v.as_double()) &&
+        std::floor(v.as_double()) == v.as_double()) {
+        return true;
+    }
+    return false;
+}
+
+Result<std::uint32_t> parse_type_mask(const json::Value& type_v) {
+    if (type_v.is_string()) {
+        const std::uint32_t bit = type_bit_for_name(type_v.as_string());
+        if (bit == 0u) {
+            return Status(ErrorCode::invalid_argument, "unsupported JSON schema type '" + type_v.as_string() + "'");
+        }
+        return bit;
+    }
+    if (type_v.is_array() && !type_v.as_array().empty()) {
+        std::uint32_t mask = 0u;
+        for (const auto& item : type_v.as_array()) {
+            if (!item.is_string()) {
+                return Status(ErrorCode::invalid_argument, "type array entries must be strings");
+            }
+            const std::uint32_t bit = type_bit_for_name(item.as_string());
+            if (bit == 0u) {
+                return Status(ErrorCode::invalid_argument, "unsupported JSON schema type '" + item.as_string() + "'");
+            }
+            mask |= bit;
+        }
+        return mask;
+    }
+    return Status(ErrorCode::invalid_argument, "type must be a string or non-empty array of strings");
+}
+
+bool int_equals_double(const json::Value& int_val, double d) noexcept {
+    if (!std::isfinite(d) || std::floor(d) != d) {
+        return false;
+    }
+    if (const auto exact = int_val.try_as_int()) {
+        // IEEE-754 double represents all integers in [-2^53, 2^53] exactly.
+        // Beyond that, only exact powers/multiples of 2 are representable; check
+        // by converting `d` back when in int64 range, otherwise compare via uint64.
+        constexpr double kMinInt64 = -9223372036854775808.0;  // -2^63 (exact in double)
+        constexpr double kMaxInt64Exclusive = 9223372036854775808.0;  // +2^63 (exact in double)
+        if (d < kMinInt64 || d >= kMaxInt64Exclusive) {
+            return false;
+        }
+        return *exact == static_cast<std::int64_t>(d);
+    }
+    constexpr double kMaxUint64Exclusive = 18446744073709551616.0;  // 2^64 (exact in double)
+    if (d < 0.0 || d >= kMaxUint64Exclusive) {
+        return false;
+    }
+    return int_val.as_uint() == static_cast<std::uint64_t>(d);
+}
+
+bool json_values_equal(const json::Value& a, const json::Value& b, std::size_t depth = 0) {
+    if (depth > 128u) {
+        // Fail closed for disjointness checks (treat overly deep values as potentially equal).
+        return true;
+    }
     if (a.is_null() && b.is_null()) return true;
     if (a.is_bool() && b.is_bool()) return a.as_bool() == b.as_bool();
     if (a.is_number() && b.is_number()) {
         if (a.is_integer() && b.is_integer()) {
-            // Exact integer comparison where representable in int64/uint64.
-            const double da = a.as_double();
-            const double db = b.as_double();
-            if (da < 0.0 && db < 0.0) return a.as_int() == b.as_int();
-            if (da >= 0.0 && db >= 0.0) return a.as_uint() == b.as_uint();
-            return false;
+            const auto ia = a.try_as_int();
+            const auto ib = b.try_as_int();
+            if (ia && ib) return *ia == *ib;
+            if (ia && *ia < 0) return false;
+            if (ib && *ib < 0) return false;
+            return a.as_uint() == b.as_uint();
         }
+        if (a.is_integer()) return int_equals_double(a, b.as_double());
+        if (b.is_integer()) return int_equals_double(b, a.as_double());
         return a.as_double() == b.as_double();
     }
     if (a.is_string() && b.is_string()) return a.as_string() == b.as_string();
@@ -179,7 +310,7 @@ bool json_values_equal(const json::Value& a, const json::Value& b) {
         const auto& ba = b.as_array();
         if (aa.size() != ba.size()) return false;
         for (std::size_t i = 0; i < aa.size(); ++i) {
-            if (!json_values_equal(aa[i], ba[i])) return false;
+            if (!json_values_equal(aa[i], ba[i], depth + 1)) return false;
         }
         return true;
     }
@@ -189,7 +320,7 @@ bool json_values_equal(const json::Value& a, const json::Value& b) {
         if (ao.size() != bo.size()) return false;
         for (const auto& [k, av] : ao) {
             const json::Value* bv = bo.find(k);
-            if (bv == nullptr || !json_values_equal(av, *bv)) return false;
+            if (bv == nullptr || !json_values_equal(av, *bv, depth + 1)) return false;
         }
         return true;
     }
@@ -356,11 +487,17 @@ public:
             return Status(ErrorCode::invalid_argument,
                           "pattern exceeds maximum supported length of " + std::to_string(kMaxPatternBytes) + " bytes");
         }
-        for (const char ch : pat_) {
-            const auto u = static_cast<unsigned char>(ch);
-            if (u < 0x20u || u == 0x7Fu) {
+        for (std::size_t i = 0; i < pat_.size();) {
+            std::uint32_t cp = 0;
+            std::size_t len = 0;
+            if (!decode_utf8_cp(pat_, i, cp, len)) {
+                return Status(ErrorCode::invalid_argument,
+                              "pattern must be valid UTF-8 without surrogate or truncated sequences");
+            }
+            if (cp < 0x20u || cp == 0x7Fu) {
                 return Status(ErrorCode::invalid_argument, "pattern must not contain control characters");
             }
+            i += len;
         }
         if (pat_.empty()) {
             return std::string("string");
@@ -389,6 +526,7 @@ private:
     struct ParsedAtom {
         std::string gbnf;
         bool has_unbounded_quantifier = false;
+        bool can_match_empty = false;
         std::size_t max_repeat_factor = 1;
     };
 
@@ -429,13 +567,16 @@ private:
         return out;
     }
 
-    static std::string escape_gbnf_class_char(char ch) {
-        if (ch == ']' || ch == '\\' || ch == '^' || ch == '-') {
-            std::string s = "\\";
-            s.push_back(ch);
-            return s;
+    static std::string escape_gbnf_class_atom(std::string_view utf8_cp) {
+        if (utf8_cp.size() == 1) {
+            const char ch = utf8_cp[0];
+            if (ch == ']' || ch == '\\' || ch == '^' || ch == '-') {
+                std::string s = "\\";
+                s.push_back(ch);
+                return s;
+            }
         }
-        return std::string(1, ch);
+        return std::string(utf8_cp);
     }
 
     Result<ParsedAtom> parse_alternation(std::size_t depth) {
@@ -448,6 +589,7 @@ private:
             if (!next.ok()) return next.status();
             out.gbnf += " | " + next.value().gbnf;
             out.has_unbounded_quantifier = out.has_unbounded_quantifier || next.value().has_unbounded_quantifier;
+            out.can_match_empty = out.can_match_empty || next.value().can_match_empty;
             out.max_repeat_factor = std::max(out.max_repeat_factor, next.value().max_repeat_factor);
         }
         return out;
@@ -455,6 +597,7 @@ private:
 
     Result<ParsedAtom> parse_sequence(std::size_t depth, bool allow_trailing_dollar) {
         ParsedAtom out;
+        out.can_match_empty = true;
         while (pos_ < pat_.size() && pat_[pos_] != ')' && pat_[pos_] != '|') {
             if (allow_trailing_dollar && pat_[pos_] == '$' &&
                 (pos_ + 1 == pat_.size() || pat_[pos_ + 1] == '|')) {
@@ -463,13 +606,21 @@ private:
             auto atom = parse_atom(depth);
             if (!atom.ok()) return atom.status();
             bool q_unbounded = false;
+            bool q_can_be_zero = false;
             std::size_t q_max = 1;
-            auto quant = parse_quantifier(q_unbounded, q_max);
+            auto quant = parse_quantifier(q_unbounded, q_can_be_zero, q_max);
             if (!quant.ok()) return quant.status();
             if (!quant.value().empty()) {
-                // Reject nested unbounded quantifiers (`(a+)+`, `(a*)+`, `(a+)*`)
-                // and multiplicative blowup (`((a?){32}){32}`) to prevent Earley DoS.
-                if (atom.value().has_unbounded_quantifier && (q_unbounded || q_max > 1)) {
+                // Reject nested unbounded quantifiers (`(a+)+`, `(a*)+`, `(a+)*`,
+                // `(a?)+`, `(|a)+`, `(a{0,5})+`) and multiplicative blowup
+                // (`((a?){32}){32}`) to prevent Earley/backtracking DoS.
+                if (q_unbounded &&
+                    (atom.value().has_unbounded_quantifier || atom.value().max_repeat_factor > 1 ||
+                     atom.value().can_match_empty)) {
+                    return Status(ErrorCode::invalid_argument,
+                                  "nested or nullable unbounded regex quantifier is not supported in GBNF");
+                }
+                if (atom.value().has_unbounded_quantifier && q_max > 1) {
                     return Status(ErrorCode::invalid_argument,
                                   "nested unbounded regex quantifiers are not supported in GBNF");
                 }
@@ -478,12 +629,14 @@ private:
                                   "nested regex quantifier expansion exceeds maximum complexity");
                 }
                 atom.value().has_unbounded_quantifier = atom.value().has_unbounded_quantifier || q_unbounded;
+                atom.value().can_match_empty = atom.value().can_match_empty || q_can_be_zero;
                 atom.value().max_repeat_factor *= q_max;
             }
             if (!out.gbnf.empty()) out.gbnf.push_back(' ');
             out.gbnf += atom.value().gbnf;
             out.gbnf += quant.value();
             out.has_unbounded_quantifier = out.has_unbounded_quantifier || atom.value().has_unbounded_quantifier;
+            out.can_match_empty = out.can_match_empty && atom.value().can_match_empty;
             out.max_repeat_factor = std::max(out.max_repeat_factor, atom.value().max_repeat_factor);
         }
         return out;
@@ -522,28 +675,34 @@ private:
             }
             ++pos_;
             ParsedAtom grouped = std::move(inner).value();
-            grouped.gbnf = "(" + grouped.gbnf + ")";
+            grouped.gbnf = grouped.gbnf.empty() ? std::string("\"\"") : ("(" + grouped.gbnf + ")");
             return grouped;
         }
         if (ch == '[') {
             auto cc = parse_char_class();
             if (!cc.ok()) return cc.status();
-            return ParsedAtom{std::move(cc).value(), false, 1};
+            return ParsedAtom{std::move(cc).value(), false, false, 1};
         }
         if (ch == '.') {
             ++pos_;
-            return ParsedAtom{std::string("[^\"\\\\\\x7F\\x00-\\x1F]"), false, 1};
+            return ParsedAtom{std::string("[^\"\\\\\\x7F\\x00-\\x1F]"), false, false, 1};
         }
         if (ch == '\\') {
             auto esc = parse_escape();
             if (!esc.ok()) return esc.status();
-            return ParsedAtom{std::move(esc).value(), false, 1};
+            return ParsedAtom{std::move(esc).value(), false, false, 1};
         }
-        ++pos_;
-        if (ch == '"') {
-            return ParsedAtom{std::string("\"\\\\\\\"\""), false, 1};
+        std::uint32_t cp = 0;
+        std::size_t len = 0;
+        if (!decode_utf8_cp(pat_, pos_, cp, len)) {
+            return Status(ErrorCode::invalid_argument, "invalid UTF-8 sequence in regex pattern");
         }
-        return ParsedAtom{gbnf_literal(std::string_view(&ch, 1)), false, 1};
+        const std::string_view atom_sv = pat_.substr(pos_, len);
+        pos_ += len;
+        if (cp == '"') {
+            return ParsedAtom{std::string("\"\\\\\\\"\""), false, false, 1};
+        }
+        return ParsedAtom{gbnf_literal(atom_sv), false, false, 1};
     }
 
     Result<std::string> parse_escape() {
@@ -558,7 +717,12 @@ private:
         }
         if (e == 'd') return std::string("[0-9]");
         if (e == 'w') return std::string("[a-zA-Z0-9_]");
-        if (e == 's') return std::string("[ \\t]");
+        // RFC 8259 forbids raw unescaped 0x09/0x0A/0x0D inside JSON strings;
+        // match space or JSON-escaped whitespace sequences instead.
+        if (e == 's') return std::string("(\" \" | \"\\\\t\" | \"\\\\n\" | \"\\\\r\")");
+        if (e == 't') return std::string("\"\\\\t\"");
+        if (e == 'n') return std::string("\"\\\\n\"");
+        if (e == 'r') return std::string("\"\\\\r\"");
         if (e == '\\') return std::string("\"\\\\\\\\\"");
         if (e == '"') return std::string("\"\\\\\\\"\"");
         switch (e) {
@@ -589,13 +753,17 @@ private:
             content += "\"\\\\\\x7F\\x00-\\x1F";
         }
         bool any = false;
-        auto read_class_atom = [&](char& out_ch, std::string& out_shorthand) -> Status {
+        bool saw_ws_shorthand = false;
+        auto read_class_atom = [&](std::uint32_t& out_cp, std::string& out_utf8, std::string& out_shorthand) -> Status {
+            out_cp = 0;
+            out_utf8.clear();
             out_shorthand.clear();
             if (pos_ >= pat_.size()) {
                 return Status(ErrorCode::invalid_argument, "unclosed '[' in regex pattern");
             }
-            const char c = pat_[pos_++];
+            const char c = pat_[pos_];
             if (c == '\\') {
+                ++pos_;
                 if (pos_ >= pat_.size()) {
                     return Status(ErrorCode::invalid_argument, "trailing backslash in character class");
                 }
@@ -609,12 +777,17 @@ private:
                     return Status::success();
                 }
                 if (e == 's') {
-                    out_shorthand = " \\t";
+                    // Never emit raw 0x09 tab into a JSON string character class:
+                    // negated classes already exclude \x00-\x1F; positive classes
+                    // add space here and lift JSON "\\t" into an alternation below.
+                    out_shorthand = " ";
+                    if (!negated) saw_ws_shorthand = true;
                     return Status::success();
                 }
                 if (e == '-' || e == ']' || e == '[' || e == '^' || e == '.' || e == '/' || e == '_' || e == '+' ||
                     e == '*' || e == '?' || e == ':' || e == '@') {
-                    out_ch = e;
+                    out_cp = static_cast<unsigned char>(e);
+                    out_utf8.assign(1, e);
                     return Status::success();
                 }
                 return Status(ErrorCode::invalid_argument,
@@ -624,14 +797,20 @@ private:
                 return Status(ErrorCode::invalid_argument,
                               "unescaped quote or backslash inside regex character class is not supported");
             }
-            out_ch = c;
+            std::size_t len = 0;
+            if (!decode_utf8_cp(pat_, pos_, out_cp, len)) {
+                return Status(ErrorCode::invalid_argument, "invalid UTF-8 sequence inside regex character class");
+            }
+            out_utf8.assign(pat_.data() + pos_, len);
+            pos_ += len;
             return Status::success();
         };
 
         while (pos_ < pat_.size() && pat_[pos_] != ']') {
-            char first = 0;
+            std::uint32_t first_cp = 0;
+            std::string first_utf8;
             std::string sh;
-            if (Status st = read_class_atom(first, sh); !st.ok()) return st;
+            if (Status st = read_class_atom(first_cp, first_utf8, sh); !st.ok()) return st;
             any = true;
             if (!sh.empty()) {
                 content += sh;
@@ -639,29 +818,33 @@ private:
             }
             if (pos_ + 1 < pat_.size() && pat_[pos_] == '-' && pat_[pos_ + 1] != ']') {
                 ++pos_;  // consume '-'
-                char second = 0;
+                std::uint32_t second_cp = 0;
+                std::string second_utf8;
                 std::string sh2;
-                if (Status st = read_class_atom(second, sh2); !st.ok()) return st;
+                if (Status st = read_class_atom(second_cp, second_utf8, sh2); !st.ok()) return st;
                 if (!sh2.empty()) {
                     return Status(ErrorCode::invalid_argument, "invalid character class range with shorthand");
                 }
-                if (static_cast<unsigned char>(first) > static_cast<unsigned char>(second)) {
+                if (first_cp > second_cp) {
                     return Status(ErrorCode::invalid_argument, "inverted range in regex character class");
                 }
                 if (!negated) {
-                    const auto u1 = static_cast<unsigned char>(first);
-                    const auto u2 = static_cast<unsigned char>(second);
-                    if ((u1 <= static_cast<unsigned char>('"') && static_cast<unsigned char>('"') <= u2) ||
-                        (u1 <= static_cast<unsigned char>('\\') && static_cast<unsigned char>('\\') <= u2)) {
+                    if ((first_cp <= static_cast<std::uint32_t>('"') && static_cast<std::uint32_t>('"') <= second_cp) ||
+                        (first_cp <= static_cast<std::uint32_t>('\\') && static_cast<std::uint32_t>('\\') <= second_cp) ||
+                        (first_cp <= 0x7Fu && 0x7Fu <= second_cp)) {
                         return Status(ErrorCode::invalid_argument,
-                                      "character class range crossing '\"' or '\\\\' is not supported in GBNF");
+                                      "character class range crossing '\"', '\\\\', or DEL is not supported in GBNF");
+                    }
+                    if (first_cp <= 0xDFFFu && second_cp >= 0xD800u) {
+                        return Status(ErrorCode::invalid_argument,
+                                      "character class range crossing UTF-16 surrogates is not supported in GBNF");
                     }
                 }
-                content += escape_gbnf_class_char(first);
+                content += escape_gbnf_class_atom(first_utf8);
                 content.push_back('-');
-                content += escape_gbnf_class_char(second);
+                content += escape_gbnf_class_atom(second_utf8);
             } else {
-                content += escape_gbnf_class_char(first);
+                content += escape_gbnf_class_atom(first_utf8);
             }
         }
         if (pos_ >= pat_.size() || pat_[pos_] != ']') {
@@ -671,11 +854,16 @@ private:
         if (!any) {
             return Status(ErrorCode::invalid_argument, "empty character class '[]' in regex pattern");
         }
-        return std::string("[") + (negated ? "^" : "") + content + "]";
+        const std::string cls = std::string("[") + (negated ? "^" : "") + content + "]";
+        if (saw_ws_shorthand && !negated) {
+            return "(" + cls + " | \"\\\\t\")";
+        }
+        return cls;
     }
 
-    Result<std::string> parse_quantifier(bool& out_unbounded, std::size_t& out_max_repeat) {
+    Result<std::string> parse_quantifier(bool& out_unbounded, bool& out_can_be_zero, std::size_t& out_max_repeat) {
         out_unbounded = false;
+        out_can_be_zero = false;
         out_max_repeat = 1;
         if (pos_ >= pat_.size()) return std::string();
         const char q = pat_[pos_];
@@ -686,6 +874,7 @@ private:
                               "lazy/possessive regex quantifiers are not supported in GBNF");
             }
             out_unbounded = (q == '*' || q == '+');
+            out_can_be_zero = (q == '*' || q == '?');
             out_max_repeat = (q == '?') ? 2u : 1u;
             return std::string(1, q);
         }
@@ -731,6 +920,7 @@ private:
                 return Status(ErrorCode::invalid_argument,
                               "lazy/possessive regex quantifiers are not supported in GBNF");
             }
+            out_can_be_zero = (lo == 0u);
             if (!has_comma) {
                 out_max_repeat = std::max<std::size_t>(1u, lo);
                 return "{" + std::to_string(lo) + "}";
@@ -855,6 +1045,14 @@ private:
             return res;
         }
         if (const json::Value* c = schema.find("const"); c != nullptr) {
+            if (Status st = reject_siblings("const", /*allow_type=*/true); !st.ok()) return st;
+            if (const json::Value* type_v = schema.find("type"); type_v != nullptr) {
+                auto mask = parse_type_mask(*type_v);
+                if (!mask.ok()) return mask.status();
+                if (!value_matches_type_mask(*c, mask.value())) {
+                    return Status(ErrorCode::invalid_argument, "const value does not match declared schema type");
+                }
+            }
             BranchDomain d;
             d.is_literal_only = true;
             d.literals.push_back(*c);
@@ -862,13 +1060,23 @@ private:
             return d;
         }
         if (const json::Value* en = schema.find("enum"); en != nullptr) {
+            if (Status st = reject_siblings("enum", /*allow_type=*/true); !st.ok()) return st;
             if (!en->is_array() || en->as_array().empty()) {
                 return Status(ErrorCode::invalid_argument, "enum must be a non-empty array");
+            }
+            std::optional<std::uint32_t> required_type_mask;
+            if (const json::Value* type_v = schema.find("type"); type_v != nullptr) {
+                auto mask = parse_type_mask(*type_v);
+                if (!mask.ok()) return mask.status();
+                required_type_mask = mask.value();
             }
             BranchDomain d;
             d.is_literal_only = true;
             d.type_mask = 0u;
             for (const auto& item : en->as_array()) {
+                if (required_type_mask && !value_matches_type_mask(item, *required_type_mask)) {
+                    return Status(ErrorCode::invalid_argument, "enum value does not match declared schema type");
+                }
                 if (d.literals.size() >= kMaxClassifyLiterals) {
                     d.is_literal_only = false;
                     d.literals.clear();
@@ -1055,7 +1263,7 @@ private:
             return Status(ErrorCode::invalid_argument,
                           "unsupported $ref '" + std::string(ref) + "' (only local #/$defs/... or #/definitions/... supported)");
         }
-        if (container == nullptr || !container->is_object()) {
+        if (container == nullptr || !container->is_object() || raw_key.empty()) {
             return Status(ErrorCode::invalid_argument, "unresolved $ref '" + std::string(ref) + "'");
         }
         const std::string key = unescape_json_pointer_token(raw_key);
@@ -1136,10 +1344,12 @@ private:
             --reserved_rules_;
             active_refs_.erase(ref_str);
             if (!body.ok()) {
+                ref_rules_.erase(ref_str);
                 return body.status();
             }
             grammar_bytes_ += rule_name.size() + body.value().size() + 6;
             if (grammar_bytes_ > kMaxGrammarBytes) {
+                ref_rules_.erase(ref_str);
                 return Status(ErrorCode::invalid_argument, "generated GBNF grammar exceeds maximum size");
             }
             rules_.emplace_back(rule_name, std::move(body).value());
@@ -1148,6 +1358,13 @@ private:
 
         if (const json::Value* c = schema.find("const"); c != nullptr) {
             if (Status st = reject_siblings("const", /*allow_type=*/true); !st.ok()) return st;
+            if (const json::Value* type_v = schema.find("type"); type_v != nullptr) {
+                auto mask = parse_type_mask(*type_v);
+                if (!mask.ok()) return mask.status();
+                if (!value_matches_type_mask(*c, mask.value())) {
+                    return Status(ErrorCode::invalid_argument, "const value does not match declared schema type");
+                }
+            }
             return gbnf_literal(c->dump()) + " space";
         }
 
@@ -1156,9 +1373,18 @@ private:
             if (!en->is_array() || en->as_array().empty()) {
                 return Status(ErrorCode::invalid_argument, "enum must be a non-empty array");
             }
+            std::optional<std::uint32_t> required_type_mask;
+            if (const json::Value* type_v = schema.find("type"); type_v != nullptr) {
+                auto mask = parse_type_mask(*type_v);
+                if (!mask.ok()) return mask.status();
+                required_type_mask = mask.value();
+            }
             std::string expr = "(";
             bool first = true;
             for (const auto& item : en->as_array()) {
+                if (required_type_mask && !value_matches_type_mask(item, *required_type_mask)) {
+                    return Status(ErrorCode::invalid_argument, "enum value does not match declared schema type");
+                }
                 if (!first) expr += " | ";
                 first = false;
                 expr += gbnf_literal(item.dump());
@@ -1409,6 +1635,9 @@ private:
         }
         if (min_len == 0 && !max_len) {
             return std::string("string");
+        }
+        if (max_len && *max_len == 0) {
+            return std::string("\"\\\"\\\"\" space");
         }
         if (min_len <= kMaxUnrolledBounds && (!max_len || *max_len <= kMaxUnrolledBounds)) {
             std::string rep = "char{" + std::to_string(min_len) + ",";
