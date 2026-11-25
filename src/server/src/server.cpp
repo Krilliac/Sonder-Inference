@@ -601,7 +601,8 @@ struct Server::Impl {
             [&](const ApiError& error) { write_error(ex, error); },
             [&] { log_message("warning", "cannot start a request thread; responses request refused (503)"); }};
         execute_responses(exchange, job, corr, pin.id(), pin.backend(), session, response_history,
-                          backend_has_capability(Capability::tool_calling));
+                          backend_has_capability(Capability::tool_calling),
+                          backend_has_capability(Capability::multimodal));
     }
 
     void handle_completions(Exchange& ex, const RequestHead& head, const std::string& body) {

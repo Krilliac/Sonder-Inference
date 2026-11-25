@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -184,6 +185,8 @@ struct LoadOptions {
     std::uint32_t cache_ram_mib = 0;
     // Dynamic GPU cache in MiB for host-resident MoE experts (0 = disabled, max kMaxMoeCacheMiB).
     std::uint32_t moe_cache_mib = 0;
+    // Fraction of MoE cache capacity reserved for CPU-shared tier (0.0..1.0).
+    double moe_cache_cpu_share = 0.0;
     // Optional multimodal projector GGUF path (--mmproj); requires SONDER_WITH_MTMD=ON.
     std::string mmproj_path;
 };
@@ -291,6 +294,15 @@ struct GenerateRequest {
     // Optional prompt text with media markers when media_blobs is non-empty.
     // When empty, `prompt` is detokenized and missing markers are prepended.
     std::string media_prompt_text;
+    // Preferred G0028-safe structured multimodal segments preserving per-part
+    // `parse_special` boundaries and explicit media bitmap indices (no marker
+    // string parsing on untrusted user text).
+    struct MediaPromptPart {
+        std::string text;
+        bool parse_special = false;
+        std::optional<std::size_t> media_index = std::nullopt;
+    };
+    std::vector<MediaPromptPart> media_prompt_parts;
 };
 
 // One event per generated token. After the last token a final event with

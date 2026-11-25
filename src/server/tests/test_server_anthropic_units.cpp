@@ -391,3 +391,42 @@ TEST_CASE("anthropic errors: protocol type and HTTP status stay distinct") {
         CHECK(document.find("error")->find("message")->as_string() == "detail");
     }
 }
+
+TEST_CASE("anthropic stream: deferred tool name and interleaved parallel tool deltas emit valid blocks") {
+    AnthropicStream stream("msg_tools", "mock:tiny");
+    std::string wire = stream.start();
+    // Arguments arrive before name on index 0; index 1 interleaves before index 0 completes.
+    wire += stream.tool_call_delta(ToolCallDelta{0, "call_0", "", "{\"a\":"});
+    wire += stream.tool_call_delta(ToolCallDelta{1, "call_1", "second_fn", "{\"b\":2}"});
+    wire += stream.tool_call_delta(ToolCallDelta{0, "", "first_fn", "1}"});
+    wire += stream.finish(GenerationResult{});
+
+    const auto frames = events(wire);
+    std::vector<std::string> started_names;
+    std::vector<std::string> partial_jsons;
+    std::size_t stops = 0;
+    bool stop_reason_tool_use = false;
+    for (const auto& f : frames) {
+        const std::string t = f.find("type")->as_string();
+        if (t == "content_block_start") {
+            const auto* blk = f.find("content_block");
+            REQUIRE(blk != nullptr);
+            CHECK(blk->find("type")->as_string() == "tool_use");
+            started_names.push_back(blk->find("name")->as_string());
+        } else if (t == "content_block_delta") {
+            partial_jsons.push_back(f.find("delta")->find("partial_json")->as_string());
+        } else if (t == "content_block_stop") {
+            ++stops;
+        } else if (t == "message_delta") {
+            stop_reason_tool_use = f.find("delta")->find("stop_reason")->as_string() == "tool_use";
+        }
+    }
+    REQUIRE(started_names.size() == 2u);
+    CHECK(started_names[0] == "first_fn");
+    CHECK(started_names[1] == "second_fn");
+    REQUIRE(partial_jsons.size() == 2u);
+    CHECK(partial_jsons[0] == "{\"a\":1}");
+    CHECK(partial_jsons[1] == "{\"b\":2}");
+    CHECK(stops == 2u);
+    CHECK(stop_reason_tool_use);
+}

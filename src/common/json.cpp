@@ -110,6 +110,13 @@ std::int64_t Value::as_int(std::int64_t fallback) const noexcept {
     return fallback;
 }
 
+std::optional<std::int64_t> Value::try_as_int() const noexcept {
+    if (const auto* i = std::get_if<std::int64_t>(&data_)) {
+        return *i;
+    }
+    return std::nullopt;
+}
+
 std::uint64_t Value::as_uint(std::uint64_t fallback) const noexcept {
     if (const auto* u = std::get_if<std::uint64_t>(&data_)) {
         return *u;

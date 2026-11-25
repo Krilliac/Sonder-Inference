@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -35,6 +36,15 @@ class AnthropicStream {
                        json::Object metadata = {});
 
   private:
+    struct PendingToolUse {
+        std::string id;
+        std::string name;
+        std::string pending_args;
+        bool started = false;
+        bool stopped = false;
+    };
+    std::string flush_pending_tools();
+
     std::string id_;
     std::string model_;
     bool started_ = false;
@@ -45,6 +55,7 @@ class AnthropicStream {
     bool saw_tool_use_ = false;
     std::uint32_t active_tool_index_ = 0;
     std::uint64_t block_index_ = 0;
+    std::map<std::uint32_t, PendingToolUse> pending_tools_;
 };
 
 } // namespace sonder::inference::server::detail

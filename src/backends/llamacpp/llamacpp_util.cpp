@@ -360,6 +360,10 @@ Status ValidateContextOptions(const LoadOptions& options) {
     if (options.mmproj_path.find('\0') != std::string::npos) {
         return Status::Error(ErrorCode::kInvalidArgument, "mmproj_path contains NUL");
     }
+    if (!std::isfinite(options.moe_cache_cpu_share) || options.moe_cache_cpu_share < 0.0 ||
+        options.moe_cache_cpu_share > 1.0) {
+        return Status::Error(ErrorCode::kInvalidArgument, "moe_cache_cpu_share must be finite in [0.0, 1.0]");
+    }
     // n_batch == 0 keeps its own, older error in Load().
     if (options.n_batch > 0 && options.n_ubatch > options.n_batch) {
         return Status::Error(ErrorCode::kInvalidArgument,
@@ -454,7 +458,7 @@ TokenLogprobInfo ComputeTokenLogprobs(std::span<const float> logits, Token chose
     }
 
     const float chosen_raw = logits[static_cast<std::size_t>(chosen_token)];
-    if (std::isnan(chosen_raw)) {
+    if (!std::isfinite(chosen_raw)) {
         return info;
     }
 

@@ -644,33 +644,47 @@ Result<std::string> build_tool_call_gbnf(const std::vector<ToolDefinition>& tool
                             {"additionalProperties", false}};
     };
 
-    json::Value call_schema;
-    if (choice.mode == ToolChoiceMode::function) {
-        const ToolDefinition* found = nullptr;
-        for (const auto& t : tools) {
-            if (t.name == choice.function_name) {
-                found = &t;
-                break;
+    auto build_call_schema = [&](bool strict_params) -> Result<json::Value> {
+        if (choice.mode == ToolChoiceMode::function) {
+            const ToolDefinition* found = nullptr;
+            for (const auto& t : tools) {
+                if (t.name == choice.function_name) {
+                    found = &t;
+                    break;
+                }
             }
+            if (found == nullptr) {
+                return Status(ErrorCode::invalid_argument,
+                              "tool_choice function '" + choice.function_name + "' not found");
+            }
+            return make_call_schema(*found, strict_params);
         }
-        if (found == nullptr) {
-            return Status(ErrorCode::invalid_argument,
-                          "tool_choice function '" + choice.function_name + "' not found");
-        }
-        call_schema = make_call_schema(*found, true);
-    } else {
         json::Array branches;
         branches.reserve(tools.size());
         for (const auto& t : tools) {
-            branches.push_back(make_call_schema(t, true));
+            branches.push_back(make_call_schema(t, strict_params));
         }
-        call_schema = branches.size() == 1 ? std::move(branches.front())
-                                           : json::Value(json::Object{{"anyOf", std::move(branches)}});
-    }
+        return branches.size() == 1 ? std::move(branches.front())
+                                    : json::Value(json::Object{{"anyOf", std::move(branches)}});
+    };
 
-    auto base = json_schema_to_gbnf(call_schema);
+    auto call_schema = build_call_schema(true);
+    if (!call_schema.ok()) {
+        return call_schema.status();
+    }
+    auto base = json_schema_to_gbnf(call_schema.value());
     if (!base.ok()) {
-        return base.status();
+        // Retry with non-strict object arguments (e.g., if nested parameter schema
+        // contained root-relative $defs/$ref) while still strictly enforcing the
+        // forced `<tool_call>{"name":...,"arguments":{...}}</tool_call>` wrapper.
+        auto relaxed_schema = build_call_schema(false);
+        if (!relaxed_schema.ok()) {
+            return relaxed_schema.status();
+        }
+        base = json_schema_to_gbnf(relaxed_schema.value());
+        if (!base.ok()) {
+            return base.status();
+        }
     }
     // Rewrite `root ::= <expr>\n` into `root ::= "<tool_call>" space <expr> "</tool_call>" space\n`.
     std::string gbnf = std::move(base).value();
@@ -759,7 +773,33 @@ ToolCallStreamOutput ToolCallStreamParser::feed(std::string_view chunk) {
         }
 
         if (state_ == State::in_xml) {
-            const std::size_t close_pos = buf_.find(kXmlClose);
+            // Find `</tool_call>` outside JSON string literals so tool arguments
+            // mentioning `</tool_call>` inside quoted strings do not prematurely
+            // truncate the payload.
+            std::size_t close_pos = std::string::npos;
+            bool in_str = false;
+            bool esc = false;
+            for (std::size_t i = 0; i + kXmlClose.size() <= buf_.size(); ++i) {
+                const char c = buf_[i];
+                if (in_str) {
+                    if (esc) {
+                        esc = false;
+                    } else if (c == '\\') {
+                        esc = true;
+                    } else if (c == '"') {
+                        in_str = false;
+                    }
+                    continue;
+                }
+                if (c == '"') {
+                    in_str = true;
+                    continue;
+                }
+                if (std::string_view(buf_).substr(i, kXmlClose.size()) == kXmlClose) {
+                    close_pos = i;
+                    break;
+                }
+            }
             if (close_pos == std::string::npos) {
                 if (buf_.size() > kMaxToolCallPayloadBytes) {
                     out.visible_text += raw_open_;

@@ -29,6 +29,7 @@
 #include "server_test_support.hpp"
 #include "src/http.hpp"
 #include "src/identity.hpp"
+#include "src/json_schema_gbnf.hpp"
 #include "src/live_hub.hpp"
 #include "src/log_queue.hpp"
 #include "src/openai.hpp"
@@ -1800,4 +1801,92 @@ TEST_CASE("responses_handler: LRU history store eviction and request parsing") {
     CHECK(validate(sc).ok());
     sc.top_logprobs = 21;
     CHECK_FALSE(validate(sc).ok());
+}
+
+TEST_CASE("security hardening: tool_call_parser embedded close tag, gbnf regex/sibling/DAG guards, history byte cap") {
+    // 1. Embedded </tool_call> inside JSON string literal must not prematurely close the block.
+    {
+        const std::string raw =
+            R"(<tool_call>{"name":"write_doc","arguments":{"text":"literal </tool_call> marker"}}</tool_call> done)";
+        const auto ext = extract_tool_calls(raw, "c_");
+        REQUIRE(ext.tool_calls.size() == 1u);
+        CHECK(ext.tool_calls[0].name == "write_doc");
+        auto args = json::parse(ext.tool_calls[0].arguments_json);
+        REQUIRE(args.ok());
+        CHECK(args.value().find("text")->as_string() == "literal </tool_call> marker");
+        CHECK(ext.visible_text == " done");
+    }
+
+    // 2. json_schema_gbnf rejects nested unbounded quantifiers, explosive nested repeats, and sibling constraints.
+    {
+        auto p1 = json::parse(R"({"type":"string","pattern":"^(a+)+$"})");
+        REQUIRE(p1.ok());
+        CHECK_FALSE(json_schema_to_gbnf(p1.value()).ok());
+
+        auto p2 = json::parse(R"({"type":"string","pattern":"^((a{10}){10}){10}$"})");
+        REQUIRE(p2.ok());
+        CHECK_FALSE(json_schema_to_gbnf(p2.value()).ok());
+
+        // Top-level anchored alternation compiles cleanly.
+        auto p3 = json::parse(R"({"type":"string","pattern":"^(foo|bar)$"})");
+        REQUIRE(p3.ok());
+        CHECK(json_schema_to_gbnf(p3.value()).ok());
+
+        // Sibling constraint next to $ref fails closed; annotation keywords remain allowed.
+        auto p4 = json::parse(R"({"$defs":{"s":{"type":"string"}},"$ref":"#/$defs/s","minLength":3})");
+        REQUIRE(p4.ok());
+        CHECK_FALSE(json_schema_to_gbnf(p4.value()).ok());
+
+        auto p5 = json::parse(R"({"$defs":{"s":{"type":"string"}},"$ref":"#/$defs/s","description":"ok","deprecated":true})");
+        REQUIRE(p5.ok());
+        CHECK(json_schema_to_gbnf(p5.value()).ok());
+
+        // Deep shared-$defs DAG in oneOf terminates quickly via memoization instead of exponential walk.
+        auto dag = json::parse(R"({
+            "$defs": {
+                "d0": {"const": "x"},
+                "d1": {"anyOf": [{"$ref":"#/$defs/d0"}, {"$ref":"#/$defs/d0"}]},
+                "d2": {"anyOf": [{"$ref":"#/$defs/d1"}, {"$ref":"#/$defs/d1"}]},
+                "d3": {"anyOf": [{"$ref":"#/$defs/d2"}, {"$ref":"#/$defs/d2"}]},
+                "d4": {"anyOf": [{"$ref":"#/$defs/d3"}, {"$ref":"#/$defs/d3"}]}
+            },
+            "oneOf": [{"$ref":"#/$defs/d4"}, {"type":"integer"}]
+        })");
+        REQUIRE(dag.ok());
+        CHECK(json_schema_to_gbnf(dag.value()).ok());
+    }
+
+    // 3. ResponseHistoryStore enforces total byte budget and drops oversized single entries.
+    {
+        ResponseHistoryStore store(64, 4096);
+        ResponseHistoryStore::Entry big;
+        big.id = "r_big";
+        big.session_key = "sk";
+        big.model = "m";
+        big.messages.push_back(ChatMessage{"user", std::string(3000, 'a')});
+        store.put(big);
+        CHECK(store.size() == 1u);
+
+        ResponseHistoryStore::Entry second = big;
+        second.id = "r_big2";
+        store.put(second);
+        // Second 3000-byte entry evicts r_big to stay within the 4096-byte cap.
+        CHECK(store.size() == 1u);
+        CHECK_FALSE(store.get("r_big").has_value());
+        CHECK(store.get("r_big2").has_value());
+
+        // Media blobs are stripped before retention.
+        ResponseHistoryStore::Entry with_media;
+        with_media.id = "r_media";
+        with_media.session_key = "sk";
+        with_media.model = "m";
+        ChatMessage m{"user", "look"};
+        m.media.push_back(MediaContent{"image/png", {1, 2, 3, 4}});
+        with_media.messages.push_back(std::move(m));
+        store.put(with_media);
+        auto got = store.get("r_media");
+        REQUIRE(got.has_value());
+        REQUIRE(got->messages.size() == 1u);
+        CHECK(got->messages[0].media.empty());
+    }
 }

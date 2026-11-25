@@ -135,11 +135,13 @@ struct PlannedBatchStep {
     const std::size_t start_idx = rr_cursor % n;
 
     // Pass 1: Pack 1 decode token per decoding slot (low inter-token latency).
-    for (std::size_t off = 0; off < n; ++off) {
+    // Keep decoding slots in stable canonical order so CUDA graphs see
+    // consistent seq_id ordering across consecutive decode steps.
+    for (std::size_t idx = 0; idx < n; ++idx) {
         if (step.total_tokens >= token_budget || step.total_outputs >= output_budget) {
             break;
         }
-        const BatchSlotPlanView& s = active_slots[(start_idx + off) % n];
+        const BatchSlotPlanView& s = active_slots[idx];
         if (s.cancelled || s.phase != BatchSlotPhase::kDecode) continue;
         PlannedBatchItem item;
         item.slot_index = s.slot_index;

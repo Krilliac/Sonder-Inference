@@ -225,7 +225,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
         return send_event(chunk_object(json::Object{{"role", "assistant"}, {"content", ""}}, nullptr));
     };
 
-    const bool tools_enabled = !job.tools.empty();
+    const bool tools_enabled = !job.tools.empty() && !backend_native_tools;
     ToolCallStreamParser tool_parser("call_" + *ro.request_id + "_");
     bool saw_text = false;
     bool emitted_tool_calls = false;
@@ -342,7 +342,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
 
     std::vector<ChatMessage> prepared_messages;
     const std::vector<ChatMessage>* messages_to_send = &job.messages;
-    if (tools_enabled && !backend_native_tools) {
+    if (!job.tools.empty() && !backend_native_tools) {
         prepared_messages = job.messages;
         const std::string tool_prompt = format_tools_system_prompt(job.tools, job.tool_choice);
         if (!prepared_messages.empty() && prepared_messages.front().role == "system") {

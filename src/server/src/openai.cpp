@@ -206,8 +206,11 @@ std::optional<ApiError> read_int(const json::Object& body, const char* key, std:
         return std::nullopt;
     }
     std::int64_t n = 0;
-    if (v->is_integer()) {
-        n = v->as_int();
+    if (const auto exact = v->try_as_int()) {
+        n = *exact;
+    } else if (v->is_integer()) {
+        return bad("invalid_sampling",
+                   std::string(key) + " must be between " + std::to_string(lo) + " and " + std::to_string(hi), key);
     } else if (v->is_number() && std::isfinite(v->as_double()) && std::floor(v->as_double()) == v->as_double() &&
                std::fabs(v->as_double()) < 9.0e15) {
         n = static_cast<std::int64_t>(v->as_double());
@@ -745,13 +748,14 @@ std::variant<CompletionJob, ApiError> parse_completion_request(std::string_view 
                 job.sampling.explicit_fields |= SamplingConfig::kLogprobs;
             }
         } else if (lp->is_integer()) {
-            const std::int64_t k = lp->as_int();
-            if (k < 0 || k > SamplingConfig::kMaxTopLogprobs) {
+            const auto exact = lp->try_as_int();
+            if (!exact || *exact < 0 || *exact > SamplingConfig::kMaxTopLogprobs) {
                 return bad("invalid_sampling",
                            "logprobs must be a boolean or an integer between 0 and " +
                                std::to_string(SamplingConfig::kMaxTopLogprobs),
                            "logprobs");
             }
+            const std::int64_t k = *exact;
             if (k > 0) {
                 job.sampling.logprobs = true;
                 job.sampling.top_logprobs = static_cast<std::int32_t>(k);
@@ -832,12 +836,12 @@ std::variant<DetokenizeJob, ApiError> parse_detokenize_request(std::string_view 
         if (!arr[i].is_integer()) {
             return bad("invalid_request", "tokens[" + std::to_string(i) + "] must be an integer", "tokens");
         }
-        const std::int64_t id = arr[i].as_int();
-        if (id < std::numeric_limits<TokenId>::min() || id > std::numeric_limits<TokenId>::max()) {
+        const auto exact = arr[i].try_as_int();
+        if (!exact || *exact < std::numeric_limits<TokenId>::min() || *exact > std::numeric_limits<TokenId>::max()) {
             return bad("invalid_request", "tokens[" + std::to_string(i) + "] is out of 32-bit token id range",
                        "tokens");
         }
-        job.tokens.push_back(static_cast<TokenId>(id));
+        job.tokens.push_back(static_cast<TokenId>(*exact));
     }
     return job;
 }

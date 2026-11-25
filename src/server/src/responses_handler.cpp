@@ -152,7 +152,33 @@ std::optional<ApiError> read_text_format(const json::Object& body, ResponsesJob&
 
 }  // namespace
 
-ResponseHistoryStore::ResponseHistoryStore(std::size_t capacity) : capacity_(std::max<std::size_t>(1, capacity)) {}
+std::size_t ResponseHistoryStore::estimate_entry_bytes(const Entry& e) noexcept {
+    std::size_t total = e.id.size() + e.session_key.size() + e.model.size() + 64;
+    for (const auto& m : e.messages) {
+        total += m.role.size() + m.content.size() + 32;
+        if (m.reasoning_content) total += m.reasoning_content->size();
+        if (m.tool_call_id) total += m.tool_call_id->size();
+        if (m.name) total += m.name->size();
+        for (const auto& tc : m.tool_calls) {
+            total += tc.id.size() + tc.name.size() + tc.arguments_json.size() + 24;
+        }
+        for (const auto& blob : m.media) {
+            total += blob.mime_type.size() + blob.bytes.size() + 16;
+        }
+    }
+    return total;
+}
+
+void ResponseHistoryStore::evict_back_locked() noexcept {
+    if (lru_.empty()) return;
+    const std::size_t b = lru_.back().approx_bytes;
+    used_bytes_ = used_bytes_ >= b ? (used_bytes_ - b) : 0;
+    index_.erase(lru_.back().id);
+    lru_.pop_back();
+}
+
+ResponseHistoryStore::ResponseHistoryStore(std::size_t capacity, std::size_t max_bytes)
+    : capacity_(std::max<std::size_t>(1, capacity)), max_bytes_(std::max<std::size_t>(4096, max_bytes)) {}
 
 std::optional<ResponseHistoryStore::Entry> ResponseHistoryStore::get(const std::string& id) {
     std::lock_guard<std::mutex> lock(mu_);
@@ -165,18 +191,31 @@ std::optional<ResponseHistoryStore::Entry> ResponseHistoryStore::get(const std::
 }
 
 void ResponseHistoryStore::put(Entry entry) {
+    // Strip raw binary media blobs from retained history to prevent O(N^2) RAM
+    // amplification across chained previous_response_id turns.
+    for (auto& m : entry.messages) {
+        m.media.clear();
+        m.media.shrink_to_fit();
+    }
+    if (entry.messages.size() > kMaxMessagesPerEntry) {
+        return;
+    }
+    entry.approx_bytes = estimate_entry_bytes(entry);
+    if (entry.approx_bytes > kMaxEntryBytes || entry.approx_bytes > max_bytes_) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(mu_);
     auto it = index_.find(entry.id);
     if (it != index_.end()) {
-        *(it->second) = std::move(entry);
-        lru_.splice(lru_.begin(), lru_, it->second);
-        return;
+        const std::size_t old_b = it->second->approx_bytes;
+        used_bytes_ = used_bytes_ >= old_b ? (used_bytes_ - old_b) : 0;
+        index_.erase(it);
+        lru_.erase(it->second);
     }
-    while (lru_.size() >= capacity_) {
-        const std::string& victim = lru_.back().id;
-        index_.erase(victim);
-        lru_.pop_back();
+    while (!lru_.empty() && (lru_.size() >= capacity_ || used_bytes_ > max_bytes_ - entry.approx_bytes)) {
+        evict_back_locked();
     }
+    used_bytes_ += entry.approx_bytes;
     const std::string key = entry.id;
     lru_.push_front(std::move(entry));
     index_[key] = lru_.begin();
@@ -459,7 +498,7 @@ std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view bo
 
 void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlation& corr, const std::string& model,
                        const std::string& backend, const std::shared_ptr<Session>& session,
-                       ResponseHistoryStore& history, bool backend_native_tools) {
+                       ResponseHistoryStore& history, bool backend_native_tools, bool backend_supports_multimodal) {
     // 1. Assemble conversation history from optional previous_response_id.
     std::vector<ChatMessage> conversation;
     std::string inherited_session_key;
@@ -471,6 +510,14 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
             ex.send_error(make_error(404, "not_found",
                                      "previous_response_id '" + *job.previous_response_id + "' was not found",
                                      "previous_response_id"));
+            return;
+        }
+        if (!prev->model.empty() && prev->model != model) {
+            ex.leave_inflight();
+            session->close();
+            ex.send_error(bad("invalid_request",
+                              "previous_response_id belongs to a different model ('" + prev->model + "')",
+                              "previous_response_id"));
             return;
         }
         conversation = std::move(prev->messages);
@@ -485,6 +532,32 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     }
     for (const auto& m : job.input_messages) {
         conversation.push_back(m);
+    }
+    if (conversation.size() > ResponseHistoryStore::kMaxMessagesPerEntry) {
+        ex.leave_inflight();
+        session->close();
+        ex.send_error(bad("invalid_messages",
+                          "conversation exceeds maximum of " +
+                              std::to_string(ResponseHistoryStore::kMaxMessagesPerEntry) + " messages",
+                          "input"));
+        return;
+    }
+    std::size_t accumulated_images = 0;
+    for (const auto& m : conversation) {
+        accumulated_images += m.media.size();
+    }
+    if (accumulated_images > 8u) {
+        ex.leave_inflight();
+        session->close();
+        ex.send_error(bad("invalid_messages", "conversation exceeds maximum of 8 images", "input"));
+        return;
+    }
+    if (accumulated_images > 0 && !backend_supports_multimodal) {
+        ex.leave_inflight();
+        session->close();
+        ex.send_error(make_error(400, "unsupported_parameter",
+                                 "backend '" + backend + "' does not support multimodal image inputs", "input"));
+        return;
     }
     if (Status st = validate_chat_messages(conversation); !st.ok()) {
         ex.leave_inflight();
@@ -682,20 +755,26 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     };
     const auto emit_fn_delta = [&](std::uint32_t idx, const std::string& call_id, const std::string& name,
                                    std::string_view args_delta) -> bool {
+        const std::int64_t out_idx =
+            static_cast<std::int64_t>(idx) + (streamed_visible_text.empty() ? 0 : 1);
         return ensure_stream_head() &&
                send_frame(sse_named_event("response.function_call_arguments.delta",
                                           json::Object{{"type", "response.function_call_arguments.delta"},
                                                        {"item_id", "fc_" + response_id + "_" + std::to_string(idx)},
-                                                       {"output_index", static_cast<std::int64_t>(idx)},
+                                                       {"output_index", out_idx},
                                                        {"call_id", call_id},
                                                        {"name", name},
                                                        {"delta", std::string(args_delta)}}));
     };
 
+    const bool parse_text_tools = tools_enabled && !backend_native_tools;
     TokenCallback on_chunk;
     if (job.stream) {
         on_chunk = [&](const TokenChunk& chunk) -> bool {
             for (const auto& tcd : chunk.tool_call_deltas) {
+                if (tcd.index >= 64u) {
+                    continue;
+                }
                 if (tcd.index >= streamed_tool_calls.size()) {
                     streamed_tool_calls.resize(static_cast<std::size_t>(tcd.index) + 1);
                 }
@@ -710,7 +789,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
                 }
             }
             if (!chunk.text.empty()) {
-                if (tools_enabled) {
+                if (parse_text_tools) {
                     const ToolCallStreamOutput out = stream_parser.feed(chunk.text);
                     if (!emit_text_delta(out.visible_text)) {
                         session->cancel();
@@ -763,7 +842,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     std::string final_visible;
     std::vector<ToolCall> final_calls;
     if (job.stream) {
-        if (tools_enabled) {
+        if (parse_text_tools) {
             const ToolCallStreamOutput tail = stream_parser.flush();
             if (!tail.visible_text.empty()) {
                 (void)emit_text_delta(tail.visible_text);
@@ -778,7 +857,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     } else if (!r.tool_calls.empty()) {
         final_visible = r.text;
         final_calls = r.tool_calls;
-    } else if (tools_enabled) {
+    } else if (parse_text_tools) {
         ExtractedToolOutput ext = extract_tool_calls(r.text, "call_" + *ro.request_id + "_");
         final_visible = std::move(ext.visible_text);
         final_calls = std::move(ext.tool_calls);

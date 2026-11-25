@@ -81,30 +81,32 @@ public:
         if (max_bytes_ == 0 || incoming_bytes == 0 || incoming_bytes > max_bytes_) {
             return false;
         }
-        Node* existing = overwrite_prefix.empty() ? nullptr : FindExactNode(overwrite_prefix);
-        const std::size_t reclaimable = (existing != nullptr && existing->has_entry) ? existing->entry.ByteSize() : 0;
-        const std::size_t effective_used = used_bytes_ >= reclaimable ? (used_bytes_ - reclaimable) : 0;
-        if (effective_used + incoming_bytes <= max_bytes_) {
+        const std::size_t budget_limit = max_bytes_ - incoming_bytes;
+        if (used_bytes_ <= budget_limit) {
             return true;
         }
-        while (true) {
-            const std::size_t cur_reclaim =
-                (existing != nullptr && existing->has_entry) ? existing->entry.ByteSize() : 0;
-            const std::size_t cur_eff = used_bytes_ >= cur_reclaim ? (used_bytes_ - cur_reclaim) : 0;
-            if (cur_eff + incoming_bytes <= max_bytes_) {
-                return true;
+        // Release any existing payload at `overwrite_prefix` FIRST so peak RAM
+        // stays strictly <= max_bytes_ while the caller allocates the replacement.
+        if (!overwrite_prefix.empty()) {
+            if (Node* existing = FindExactNode(overwrite_prefix); existing != nullptr && existing->has_entry) {
+                const std::size_t old_bytes = existing->entry.ByteSize();
+                used_bytes_ = used_bytes_ >= old_bytes ? (used_bytes_ - old_bytes) : 0;
+                lru_list_.erase(existing->lru_it);
+                existing->entry = {};
+                existing->has_entry = false;
+                --entry_count_;
+                PruneIfEmpty(existing);
+                if (used_bytes_ <= budget_limit) {
+                    return true;
+                }
             }
-            if (lru_list_.empty()) {
-                return false;
-            }
-            // If the oldest entry is the target prefix itself, release it too.
-            if (lru_list_.front() == existing) {
-                existing = nullptr;
-            }
-            if (!EvictOldest()) {
+        }
+        while (used_bytes_ > budget_limit) {
+            if (lru_list_.empty() || !EvictOldest()) {
                 return false;
             }
         }
+        return true;
     }
 
     // Inserts or overwrites the state blob for `prefix`. Enforces strict global
@@ -115,8 +117,8 @@ public:
             return false;
         }
 
-        // First evict LRU entries BEFORE modifying/inserting if needed, accounting
-        // for any existing entry at `prefix` that we are about to replace.
+        // First evict LRU entries BEFORE modifying/inserting if needed, releasing
+        // any existing entry at `prefix` that we are about to replace.
         if (!ReserveBeforeAlloc(new_bytes, prefix)) {
             return false;
         }
@@ -135,7 +137,8 @@ public:
             --entry_count_;
         }
 
-        while (used_bytes_ + new_bytes > max_bytes_) {
+        const std::size_t budget_limit = max_bytes_ - new_bytes;
+        while (used_bytes_ > budget_limit) {
             if (!EvictOldest()) {
                 PruneIfEmpty(node);
                 return false;

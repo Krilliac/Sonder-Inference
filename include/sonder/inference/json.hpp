@@ -94,6 +94,8 @@ public:
     [[nodiscard]] bool as_bool(bool fallback = false) const noexcept;
     // An integer above INT64_MAX is out of range: returns `fallback`.
     [[nodiscard]] std::int64_t as_int(std::int64_t fallback = 0) const noexcept;
+    // Exact signed 64-bit integer only (rejects kBigUnsigned, doubles, and non-numbers).
+    [[nodiscard]] std::optional<std::int64_t> try_as_int() const noexcept;
     // Non-negative integers up to UINT64_MAX; `fallback` otherwise.
     [[nodiscard]] std::uint64_t as_uint(std::uint64_t fallback = 0) const noexcept;
     [[nodiscard]] double as_double(double fallback = 0.0) const noexcept;

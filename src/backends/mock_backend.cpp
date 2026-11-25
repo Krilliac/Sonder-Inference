@@ -521,28 +521,28 @@ public:
         }
 
         const std::string args_json = build_mock_tool_arguments(*chosen);
-        std::string name_json;
-        json::append_escaped(name_json, chosen->name);
-        // Split across multiple chunks including mid-tag boundaries to exercise
-        // incremental ToolCallStreamParser framing in tests.
-        const std::vector<std::string> pieces = {
-            "<tool",
-            "_call>{\"name\":",
-            name_json,
-            ",\"arguments\":",
-            args_json,
-            "}</tool_call>",
-        };
-        std::uint64_t state = fnv1a(prompt) ^ fnv1a(chosen->name);
-        for (const std::string& p : pieces) {
+        const std::uint64_t seed = fnv1a(prompt) ^ fnv1a(chosen->name);
+        const std::string call_id = "call_mock_" + std::to_string(seed);
+        // Emit native structured tool_call_deltas across two chunks (header then
+        // arguments) matching MockBackend's advertised Capability::tool_calling.
+        std::uint64_t state = seed;
+        for (std::size_t step = 0; step < 2; ++step) {
             if (cancel.cancelled()) {
                 stats.stop_reason = StopReason::cancelled;
                 return Status(ErrorCode::cancelled, "cancelled by caller");
             }
             state = splitmix64(state);
             ++stats.completion_tokens;
-            TokenChunk chunk{p, stats.chunks++};
-            attach_mock_logprobs(chunk, p, state, request.sampling);
+            TokenChunk chunk{"", stats.chunks++};
+            ToolCallDelta tcd;
+            tcd.index = 0;
+            if (step == 0) {
+                tcd.id = call_id;
+                tcd.name = chosen->name;
+            } else {
+                tcd.arguments_delta = args_json;
+            }
+            chunk.tool_call_deltas.push_back(std::move(tcd));
             if (on_chunk && !on_chunk(chunk)) {
                 stats.stop_reason = StopReason::callback;
                 break;

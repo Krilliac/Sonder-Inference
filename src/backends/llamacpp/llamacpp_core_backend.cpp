@@ -14,6 +14,7 @@
 
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include "sonder/inference/backends/llamacpp.hpp"
+#include "sonder/inference/json.hpp"
 #include "llamacpp_internal.hpp"
 
 namespace sonder::inference {
@@ -95,6 +96,7 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     lo.spec_draft_max = o.spec_draft_max;
     lo.cache_ram_mib = o.cache_ram_mib;
     lo.moe_cache_mib = o.moe_cache_mib;
+    lo.moe_cache_cpu_share = o.moe_cache_cpu_share;
     lo.mmproj_path = o.mmproj_path;
     if (!lc::ParseSplitMode(o.split_mode, lo.split_mode)) {
         return Status(ErrorCode::invalid_argument,
@@ -247,6 +249,7 @@ public:
             exclusive_guard = std::unique_lock<std::shared_mutex>(mutex_);
         }
         std::vector<std::vector<std::uint8_t>> media_blobs;
+        std::vector<std::pair<std::string, std::size_t>> media_sentinels;
         std::vector<ChatMessage> normalized_messages;
         const std::vector<ChatMessage>* template_messages = &request.messages;
         bool needs_normalized = false;
@@ -258,12 +261,32 @@ public:
         }
         if (needs_normalized) {
             normalized_messages = request.messages;
+            std::uint64_t media_nonce = 0x51a7c9e2f03b8d11ULL;
+            auto next_media_prefix = [&]() {
+                char buf[36];
+                std::snprintf(buf, sizeof(buf), "SNDRMM%016llxM", static_cast<unsigned long long>(media_nonce));
+                media_nonce = media_nonce * 6364136223846793005ULL + 1442695040888963407ULL;
+                return std::string(buf);
+            };
+            std::string sentinel_prefix = next_media_prefix();
+            auto prefix_collides = [&](std::string_view pfx) {
+                for (const auto& m : normalized_messages) {
+                    if (m.content.find(pfx) != std::string::npos || m.role.find(pfx) != std::string::npos) return true;
+                }
+                return false;
+            };
+            while (prefix_collides(sentinel_prefix)) {
+                sentinel_prefix = next_media_prefix();
+            }
             for (auto& m : normalized_messages) {
                 if (!m.media.empty()) {
                     std::string markers;
                     for (const auto& blob : m.media) {
+                        const std::size_t blob_idx = media_blobs.size();
                         media_blobs.push_back(blob.bytes);
-                        markers += "<__media__>\n";
+                        std::string tag = sentinel_prefix + "_" + std::to_string(blob_idx) + "_END";
+                        media_sentinels.emplace_back(tag, blob_idx);
+                        markers += tag;
                     }
                     m.content = markers + m.content;
                 }
@@ -271,12 +294,9 @@ public:
                     std::string tool_text;
                     for (const auto& tc : m.tool_calls) {
                         if (!tool_text.empty()) tool_text.push_back('\n');
-                        tool_text += "<tool_call>{\"name\":\"";
-                        for (char ch : tc.name) {
-                            if (ch == '"' || ch == '\\') tool_text.push_back('\\');
-                            tool_text.push_back(ch);
-                        }
-                        tool_text += "\",\"arguments\":";
+                        tool_text += "<tool_call>{\"name\":";
+                        tool_text += json::Value(tc.name).dump();
+                        tool_text += ",\"arguments\":";
                         tool_text += tc.arguments_json.empty() ? "{}" : tc.arguments_json;
                         tool_text += "}</tool_call>";
                     }
@@ -319,10 +339,46 @@ public:
         if (request.thinking.enable_thinking.has_value() && !*request.thinking.enable_thinking) {
             ApplyNoThinkScaffolding(segments.value(), /*enable_thinking=*/false);
         }
-        std::string media_prompt_text;
+        // Build G0028-safe structured multimodal parts preserving per-segment
+        // parse_special boundaries: trusted template scaffolding stays
+        // parse_special=true, untrusted message text stays parse_special=false,
+        // and media sentinels become explicit bitmap parts (zero marker parsing).
+        std::vector<lc::GenerateRequest::MediaPromptPart> media_prompt_parts;
         if (!media_blobs.empty()) {
             for (const auto& seg : segments.value()) {
-                media_prompt_text.append(seg.text);
+                if (seg.parse_special) {
+                    if (!seg.text.empty()) {
+                        media_prompt_parts.push_back(
+                            lc::GenerateRequest::MediaPromptPart{seg.text, /*parse_special=*/true, std::nullopt});
+                    }
+                    continue;
+                }
+                std::size_t cursor = 0;
+                while (cursor < seg.text.size()) {
+                    std::size_t best_pos = std::string::npos;
+                    std::size_t best_len = 0;
+                    std::size_t best_blob = 0;
+                    for (const auto& [tag, bidx] : media_sentinels) {
+                        const std::size_t p = seg.text.find(tag, cursor);
+                        if (p != std::string::npos && p < best_pos) {
+                            best_pos = p;
+                            best_len = tag.size();
+                            best_blob = bidx;
+                        }
+                    }
+                    if (best_pos == std::string::npos) {
+                        media_prompt_parts.push_back(lc::GenerateRequest::MediaPromptPart{
+                            seg.text.substr(cursor), /*parse_special=*/false, std::nullopt});
+                        break;
+                    }
+                    if (best_pos > cursor) {
+                        media_prompt_parts.push_back(lc::GenerateRequest::MediaPromptPart{
+                            seg.text.substr(cursor, best_pos - cursor), /*parse_special=*/false, std::nullopt});
+                    }
+                    media_prompt_parts.push_back(
+                        lc::GenerateRequest::MediaPromptPart{{}, /*parse_special=*/false, best_blob});
+                    cursor = best_pos + best_len;
+                }
             }
         }
         std::vector<lc::Token> prompt_tokens;
@@ -335,7 +391,7 @@ public:
         if (!tok_status.ok()) return tok_status;
         return run_tokens(std::move(prompt_tokens), request.sampling, cancel, on_chunk, request.session_key,
                           request.grammar, request.separate_reasoning, /*checkpoint=*/nullptr,
-                          std::move(media_blobs), std::move(media_prompt_text));
+                          std::move(media_blobs), {}, std::move(media_prompt_parts));
     }
 
     [[nodiscard]] bool has_native_chat() const override {
@@ -378,7 +434,8 @@ private:
                                      bool separate_reasoning = false,
                                      RecurrentCheckpointExchange* checkpoint = nullptr,
                                      std::vector<std::vector<std::uint8_t>> media_blobs = {},
-                                     std::string media_prompt_text = {}) {
+                                     std::string media_prompt_text = {},
+                                     std::vector<lc::GenerateRequest::MediaPromptPart> media_prompt_parts = {}) {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
 
         lc::GenerateRequest req;
@@ -390,6 +447,7 @@ private:
         req.session_key = std::string(session_key);
         req.media_blobs = std::move(media_blobs);
         req.media_prompt_text = std::move(media_prompt_text);
+        req.media_prompt_parts = std::move(media_prompt_parts);
         if (checkpoint != nullptr) {
             if (!checkpoint->restore_bytes.empty() && checkpoint->restore_token_position > 0 &&
                 checkpoint->restore_token_position < req.prompt.size()) {

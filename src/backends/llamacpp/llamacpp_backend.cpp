@@ -311,7 +311,8 @@ llama_context_params MakeContextParams(const LoadOptions& options) {
 #endif
 #if defined(SONDER_LLAMACPP_HAS_MOE_CACHE_SIZE)
     if (options.moe_cache_mib > 0) {
-        cp.moe_cache_size = static_cast<size_t>(options.moe_cache_mib) << 20;
+        const std::uint64_t bytes64 = static_cast<std::uint64_t>(options.moe_cache_mib) << 20;
+        cp.moe_cache_size = static_cast<size_t>(std::min<std::uint64_t>(bytes64, std::numeric_limits<size_t>::max()));
     }
 #endif
 #if defined(SONDER_LLAMACPP_HAS_N_RS_SEQ) || defined(SONDER_LLAMACPP_HAS_N_OUTPUTS_MAX)
@@ -365,7 +366,7 @@ llama_context_params MakeContextParams(const LoadOptions& options) {
         if (planned_spec == SpeculativeType::kDraftMtp || planned_spec == SpeculativeType::kAuto) {
             max_burst = std::max<uint32_t>(max_burst, static_cast<uint32_t>(SuffixMatcher::kHybridMtpMaxBurstDraft));
         }
-        const uint32_t per_seq = std::max<uint32_t>(1u, max_burst + 1u);
+        const uint32_t per_seq = std::min<uint32_t>(cp.n_batch, std::max<uint32_t>(1u, max_burst + 1u));
         cp.n_outputs_max_per_seq = per_seq;
         cp.n_outputs_max = std::min<uint32_t>(cp.n_batch, cp.n_seq_max * per_seq);
     }
@@ -483,7 +484,8 @@ struct LlamaCppBackend::Impl {
     static constexpr std::size_t kMaxCheckpointsPerSlot = 3;
     static constexpr std::size_t kMaxPartialCheckpointBytes = std::size_t{256} << 20;
     static constexpr std::size_t kMaxTotalCheckpointBytes = std::size_t{512} << 20;
-    static constexpr std::size_t kMinL2SnapshotTokens = 16;
+    static constexpr std::size_t kMinL2SnapshotTokens = 256;
+    static constexpr std::size_t kMinL2RestoreGainTokens = 128;
 
     std::vector<PrefixSlotMeta> slots;
     std::vector<std::uint8_t> slot_busy;
@@ -540,7 +542,7 @@ struct LlamaCppBackend::Impl {
     std::deque<PendingRequest*> pending_queue;
     std::atomic<std::size_t> pending_count{0};
     std::atomic<bool> worker_stop{false};
-    bool batch_worker_running = false;
+    std::atomic<bool> batch_worker_running{false};
     std::thread batch_worker;
 
 #if defined(SONDER_LLAMACPP_HAS_MTP)
@@ -655,7 +657,7 @@ struct LlamaCppBackend::Impl {
     }
 
     void StopBatchWorker() noexcept {
-        if (!batch_worker_running) return;
+        if (!batch_worker_running.load(std::memory_order_acquire)) return;
         {
             std::lock_guard<std::mutex> lock(queue_mu);
             worker_stop.store(true, std::memory_order_release);
@@ -664,7 +666,7 @@ struct LlamaCppBackend::Impl {
         if (batch_worker.joinable()) {
             batch_worker.join();
         }
-        batch_worker_running = false;
+        batch_worker_running.store(false, std::memory_order_release);
         worker_stop.store(false, std::memory_order_relaxed);
         pending_count.store(0, std::memory_order_relaxed);
     }
@@ -817,7 +819,7 @@ struct LlamaCppBackend::Impl {
         ckpt.last_used = ++checkpoint_clock;
         ckpt.tgt_state.resize(sz);
         const std::size_t written = llama_state_seq_get_data_ext(ctx, ckpt.tgt_state.data(), sz, slot_id, flags);
-        if (written == 0) return;
+        if (written == 0 || written > sz) return;
         ckpt.tgt_state.resize(written);
         ckpt.tgt_state.shrink_to_fit();
 #if defined(SONDER_LLAMACPP_HAS_MTP)
@@ -946,7 +948,7 @@ struct LlamaCppBackend::Impl {
         RadixCacheEntry entry;
         entry.state_blob.resize(sz);
         const std::size_t written = llama_state_seq_get_data(ctx, entry.state_blob.data(), sz, slot_id);
-        if (written == 0) return;
+        if (written == 0 || written > sz) return;
         entry.state_blob.resize(written);
         entry.state_blob.shrink_to_fit();
 
@@ -956,7 +958,7 @@ struct LlamaCppBackend::Impl {
                 entry.dft_state_blob.resize(dft_sz);
                 const std::size_t dw =
                     llama_state_seq_get_data(ctx_dft, entry.dft_state_blob.data(), dft_sz, slot_id);
-                if (dw > 0) {
+                if (dw > 0 && dw <= dft_sz) {
                     entry.dft_state_blob.resize(dw);
                     entry.dft_state_blob.shrink_to_fit();
                 } else {
@@ -976,20 +978,26 @@ struct LlamaCppBackend::Impl {
     // Attempts to restore a longer matching prefix from the L2 Radix host-RAM
     // cache directly into `slot_id`. Callers must snapshot any evicted VRAM
     // slot BEFORE calling this so the returned Radix entry pointer stays valid.
+    // Sets `out_wiped = true` if VRAM KV for `slot_id` was cleared prior to a
+    // failed restore so callers reset `lcp = 0` and slot metadata cleanly.
     bool TryRestoreSlotFromL2(std::size_t slot_idx, llama_seq_id slot_id, std::span<const Token> prompt,
-                              std::size_t min_beat_lcp, std::size_t& out_lcp, bool& out_mtp_synced) {
+                              std::size_t min_beat_lcp, std::size_t& out_lcp, bool& out_mtp_synced,
+                              bool& out_wiped) {
         out_lcp = 0;
         out_mtp_synced = false;
+        out_wiped = false;
         if (!radix_cache.enabled() || ctx == nullptr || prompt.size() <= 1) return false;
         const std::size_t max_reuse = prompt.size() - 1;
         const bool allow_trim = (architecture == sonder::inference::ModelArchitecture::attention_only);
         const RadixLookupResult hit = radix_cache.LookupLongestPrefix(prompt, max_reuse, allow_trim);
-        if (!hit.found() || hit.matched_tokens <= min_beat_lcp || hit.entry == nullptr) {
+        if (!hit.found() || hit.entry == nullptr || hit.matched_tokens <= min_beat_lcp ||
+            (hit.matched_tokens - min_beat_lcp) < kMinL2RestoreGainTokens) {
             return false;
         }
 
         llama_memory_t mem = llama_get_memory(ctx);
         if (mem == nullptr) return false;
+        out_wiped = true;
         llama_memory_seq_rm(mem, slot_id, -1, -1);
         ClearSlotCheckpoints(slot_idx);
 
@@ -1093,14 +1101,16 @@ struct LlamaCppBackend::Impl {
 
         // 1. Sample candidate token without mutating sampler penalty history.
         if (pure_greedy) {
-            int32_t best = 0;
-            float best_val = logits[0];
-            for (int32_t v = 1; v < n_vocab; ++v) {
-                if (logits[v] > best_val) {
-                    best_val = logits[v];
+            int32_t best = -1;
+            float best_val = -std::numeric_limits<float>::infinity();
+            for (int32_t v = 0; v < n_vocab; ++v) {
+                const float val = logits[v];
+                if (std::isfinite(val) && (best < 0 || val > best_val)) {
+                    best_val = val;
                     best = v;
                 }
             }
+            if (best < 0) return LLAMA_TOKEN_NULL;
             tok = best;
         } else {
             auto& cand = grammar_candidates;
@@ -1193,40 +1203,6 @@ struct LlamaCppBackend::Impl {
             bitmaps.push_back(bmp);
         }
 
-        std::string prompt_text = request.media_prompt_text;
-        if (prompt_text.empty() && owner != nullptr) {
-            if (Status s = owner->Detokenize(request.prompt, prompt_text, /*remove_special=*/false,
-                                             /*unparse_special=*/true);
-                !s.ok()) {
-                return s;
-            }
-        }
-
-        const char* raw_marker = mtmd_get_marker(mtmd_ctx);
-        const std::string marker =
-            (raw_marker != nullptr && raw_marker[0] != '\0') ? std::string(raw_marker) : std::string(mtmd_default_marker());
-        std::size_t marker_count = 0;
-        if (!marker.empty()) {
-            std::size_t search_pos = 0;
-            while ((search_pos = prompt_text.find(marker, search_pos)) != std::string::npos) {
-                ++marker_count;
-                search_pos += marker.size();
-            }
-        }
-        if (marker_count > bitmaps.size()) {
-            return Status::Error(ErrorCode::kInvalidArgument,
-                                 "prompt contains more media markers (" + std::to_string(marker_count) +
-                                     ") than media_blobs (" + std::to_string(bitmaps.size()) + ")");
-        }
-        if (marker_count < bitmaps.size()) {
-            std::string prefix_markers;
-            for (std::size_t m = marker_count; m < bitmaps.size(); ++m) {
-                prefix_markers += marker;
-                prefix_markers.push_back('\n');
-            }
-            prompt_text.insert(0, prefix_markers);
-        }
-
         mtmd_input_chunks* chunks = mtmd_input_chunks_init();
         if (chunks == nullptr) {
             return Status::Error(ErrorCode::kDecodeFailed, "mtmd_input_chunks_init failed");
@@ -1238,16 +1214,94 @@ struct LlamaCppBackend::Impl {
             }
         } chunks_guard{chunks};
 
-        mtmd_input_text text_inp{};
-        text_inp.text = prompt_text.c_str();
+        int32_t tok_rc = 0;
+#if defined(SONDER_LLAMACPP_HAS_MTMD_PARTS)
+        if (!request.media_prompt_parts.empty()) {
+            // G0028-safe structured multimodal tokenization: trusted chat-template
+            // scaffolding uses parse_special=true, untrusted message content uses
+            // parse_special=false, and bitmaps are passed directly without marker
+            // string substitution (zero special-token or marker injection).
+            std::vector<mtmd_input_text> text_storage;
+            std::vector<mtmd_input_part> part_storage;
+            text_storage.reserve(request.media_prompt_parts.size());
+            part_storage.reserve(request.media_prompt_parts.size());
+            for (const auto& seg : request.media_prompt_parts) {
+                if (seg.media_index.has_value()) {
+                    if (*seg.media_index >= bitmaps.size()) {
+                        return Status::Error(ErrorCode::kInvalidArgument,
+                                             "multimodal media_index out of range");
+                    }
+                    mtmd_input_part p{};
+                    p.text = nullptr;
+                    p.bitmap = bitmaps[*seg.media_index];
+                    part_storage.push_back(p);
+                } else if (!seg.text.empty()) {
+                    mtmd_input_text t{};
+                    t.text = seg.text.c_str();
 #if defined(SONDER_LLAMACPP_MTMD_TEXT_LEN)
-        text_inp.text_len = prompt_text.size();
+                    t.text_len = seg.text.size();
 #endif
-        text_inp.add_special = true;
-        text_inp.parse_special = true;
+                    t.add_special = false;
+                    t.parse_special = seg.parse_special;
+                    text_storage.push_back(t);
+                    mtmd_input_part p{};
+                    p.text = &text_storage.back();
+                    p.bitmap = nullptr;
+                    part_storage.push_back(p);
+                }
+            }
+            std::vector<const mtmd_input_part*> part_ptrs;
+            part_ptrs.reserve(part_storage.size());
+            for (const auto& p : part_storage) part_ptrs.push_back(&p);
+            tok_rc = mtmd_tokenize_from_parts(mtmd_ctx, chunks, part_ptrs.data(), part_ptrs.size(),
+                                              /*add_special=*/true);
+        } else
+#endif
+        {
+            std::string prompt_text = request.media_prompt_text;
+            if (prompt_text.empty() && owner != nullptr) {
+                if (Status s = owner->Detokenize(request.prompt, prompt_text, /*remove_special=*/false,
+                                                 /*unparse_special=*/true);
+                    !s.ok()) {
+                    return s;
+                }
+            }
+            const char* raw_marker = mtmd_get_marker(mtmd_ctx);
+            const std::string marker =
+                (raw_marker != nullptr && raw_marker[0] != '\0') ? std::string(raw_marker) : std::string(mtmd_default_marker());
+            std::size_t marker_count = 0;
+            if (!marker.empty()) {
+                std::size_t search_pos = 0;
+                while ((search_pos = prompt_text.find(marker, search_pos)) != std::string::npos) {
+                    ++marker_count;
+                    search_pos += marker.size();
+                }
+            }
+            if (marker_count > bitmaps.size()) {
+                return Status::Error(ErrorCode::kInvalidArgument,
+                                     "prompt contains more media markers (" + std::to_string(marker_count) +
+                                         ") than media_blobs (" + std::to_string(bitmaps.size()) + ")");
+            }
+            if (marker_count < bitmaps.size()) {
+                std::string prefix_markers;
+                for (std::size_t m = marker_count; m < bitmaps.size(); ++m) {
+                    prefix_markers += marker;
+                    prefix_markers.push_back('\n');
+                }
+                prompt_text.insert(0, prefix_markers);
+            }
 
-        std::vector<const mtmd_bitmap*> const_bmps(bitmaps.begin(), bitmaps.end());
-        const int32_t tok_rc = mtmd_tokenize(mtmd_ctx, chunks, &text_inp, const_bmps.data(), const_bmps.size());
+            mtmd_input_text text_inp{};
+            text_inp.text = prompt_text.c_str();
+#if defined(SONDER_LLAMACPP_MTMD_TEXT_LEN)
+            text_inp.text_len = prompt_text.size();
+#endif
+            text_inp.add_special = true;
+            text_inp.parse_special = true;
+
+            std::vector<const mtmd_bitmap*> const_bmps(bitmaps.begin(), bitmaps.end());
+            tok_rc = mtmd_tokenize(mtmd_ctx, chunks, &text_inp, const_bmps.data(), const_bmps.size());
+        }
         if (tok_rc != 0) {
             return Status::Error(ErrorCode::kDecodeFailed,
                                  "mtmd_tokenize failed (rc=" + std::to_string(tok_rc) + ")");
@@ -1888,7 +1942,9 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
             impl_->slots[i].last_used = 0;
         }
         impl_->slot_clock = 0;
-        impl_->radix_cache.SetMaxBytes(static_cast<std::size_t>(options.cache_ram_mib) << 20);
+        const std::uint64_t l2_bytes64 = static_cast<std::uint64_t>(options.cache_ram_mib) << 20;
+        impl_->radix_cache.SetMaxBytes(
+            static_cast<std::size_t>(std::min<std::uint64_t>(l2_bytes64, std::numeric_limits<std::size_t>::max())));
 
 #if defined(SONDER_LLAMACPP_HAS_MTMD)
         if (!options.mmproj_path.empty()) {
@@ -2362,9 +2418,9 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, boo
 }
 
 void LlamaCppBackend::Impl::StartBatchWorker() {
-    if (batch_worker_running) return;
+    if (batch_worker_running.load(std::memory_order_acquire)) return;
     worker_stop.store(false, std::memory_order_relaxed);
-    batch_worker_running = true;
+    batch_worker_running.store(true, std::memory_order_release);
     batch_worker = std::thread([this] { BatchWorkerLoop(); });
 }
 
@@ -2400,7 +2456,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
 
     // When n_slots > 1, dispatch through the single-owner continuous-batching
     // worker loop so concurrent callers share the llama_context in lockstep.
-    if (impl_->batch_worker_running) {
+    if (impl_->batch_worker_running.load(std::memory_order_acquire)) {
         const bool has_restore = !request.restore_state.empty() && request.restore_tokens > 0 &&
                                  request.restore_tokens < request.prompt.size();
         const bool has_capture = request.capture_at_tokens > 0 && request.capture_at_tokens <= request.prompt.size();
@@ -2545,12 +2601,18 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
 
         // Check L2 Radix cache if VRAM did not already cover the full prefix.
         std::size_t l2_lcp = 0;
-        if (radix_cache.enabled() && request.prompt.size() > 1 && lcp + 1 < request.prompt.size() &&
-            TryRestoreSlotFromL2(slot_idx, slot_id, request.prompt, lcp, l2_lcp, l2_mtp_synced)) {
-            lcp = l2_lcp;
-            restored_from_l2 = true;
-            slots[slot_idx].tokens.assign(request.prompt.begin(),
-                                          request.prompt.begin() + static_cast<std::ptrdiff_t>(lcp));
+        bool l2_wiped = false;
+        if (radix_cache.enabled() && request.prompt.size() > 1 && lcp + 1 < request.prompt.size()) {
+            if (TryRestoreSlotFromL2(slot_idx, slot_id, request.prompt, lcp, l2_lcp, l2_mtp_synced, l2_wiped)) {
+                lcp = l2_lcp;
+                restored_from_l2 = true;
+                slots[slot_idx].tokens.assign(request.prompt.begin(),
+                                              request.prompt.begin() + static_cast<std::ptrdiff_t>(lcp));
+            } else if (l2_wiped) {
+                lcp = 0;
+                slots[slot_idx].tokens.clear();
+                if (slot_idx < slot_mtp_synced.size()) slot_mtp_synced[slot_idx] = false;
+            }
         }
 
         if (!restored_from_l2) {
@@ -2798,6 +2860,11 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                                                 mm_prompt_tokens);
             !s.ok()) {
             invalidate_slot();
+            if (cancelled()) {
+                result.stop_reason = StopReason::kCancelled;
+                result.prefill_ms = MsSince(prefill_start);
+                return result;
+            }
             return fail(s.code, s.message);
         }
         result.prompt_tokens = mm_prompt_tokens;
@@ -3001,20 +3068,24 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                 if (use_hybrid_suffix && suffix_matcher != nullptr &&
                     (architecture != sonder::inference::ModelArchitecture::hybrid || can_hybrid_spec_ckpt ||
                      rs_cap >= SuffixMatcher::kHybridMtpMinBurstDraft)) {
-                    const std::size_t hybrid_cap =
-                        (architecture == sonder::inference::ModelArchitecture::hybrid && !can_hybrid_spec_ckpt)
-                            ? std::min<std::size_t>(static_cast<std::size_t>(max_k), static_cast<std::size_t>(rs_cap))
-                            : static_cast<std::size_t>(max_k);
-                    SuffixMatchResult burst = suffix_matcher->TryHybridMtpBurstForCurrent(cur_tok, hybrid_cap);
-                    if (!burst.draft.empty()) {
-                        draft_tokens = std::move(burst.draft);
-                        for (std::size_t j = 0; j < draft_tokens.size(); ++j) {
-                            if (llama_vocab_is_eog(vocab, draft_tokens[j])) {
-                                draft_tokens.resize(j + 1);
-                                break;
+                    if (suffix_matcher->paused()) {
+                        suffix_matcher->NoteSkippedStep();
+                    } else {
+                        const std::size_t hybrid_cap =
+                            (architecture == sonder::inference::ModelArchitecture::hybrid && !can_hybrid_spec_ckpt)
+                                ? std::min<std::size_t>(static_cast<std::size_t>(max_k), static_cast<std::size_t>(rs_cap))
+                                : static_cast<std::size_t>(max_k);
+                        SuffixMatchResult burst = suffix_matcher->TryHybridMtpBurstForCurrent(cur_tok, hybrid_cap);
+                        if (!burst.draft.empty()) {
+                            draft_tokens = std::move(burst.draft);
+                            for (std::size_t j = 0; j < draft_tokens.size(); ++j) {
+                                if (llama_vocab_is_eog(vocab, draft_tokens[j])) {
+                                    draft_tokens.resize(j + 1);
+                                    break;
+                                }
                             }
+                            step_used_suffix = !draft_tokens.empty();
                         }
-                        step_used_suffix = !draft_tokens.empty();
                     }
                 }
                 if (!step_used_suffix) {
@@ -3092,7 +3163,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                 }
                 const std::size_t written =
                     llama_state_seq_get_data_ext(ctx, spec_ckpt_buf.data(), sz, slot_id, flags);
-                if (written > 0) {
+                if (written > 0 && written <= sz) {
                     spec_ckpt_size = written;
                     have_spec_ckpt = true;
                 }
@@ -3538,7 +3609,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         s.task = nullptr;
     };
 
-    auto admit_request = [&](PendingRequest* task, const SlotSelection& sel) -> std::unique_ptr<ActiveBatchSlot> {
+    auto admit_request = [&](PendingRequest* task, const SlotSelection& sel,
+                             bool allow_l2_snapshot) -> std::unique_ptr<ActiveBatchSlot> {
         auto s = std::make_unique<ActiveBatchSlot>();
         s->task = task;
         s->slot_idx = sel.slot_index;
@@ -3554,6 +3626,16 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             finish_slot(*s, StopReason::kError);
             return nullptr;
         }
+#if defined(SONDER_LLAMACPP_HAS_SET_SAMPLER)
+        // Attach the backend GPU sampler ONCE for the entire lifetime of this
+        // request (matching llama-server's per-seq_id lifecycle). Never detach
+        // mid-request: llama_sampler_chain_backend_init marks chain stages with
+        // is_backend=true, so detaching and calling CPU llama_sampler_sample()
+        // later would skip stages and trip GGML_ASSERT(cur_p.selected >= 0).
+        if (!s->grammar_sampler && !req.sampling.compute_logprobs) {
+            s->target_gpu_sampled = llama_set_sampler(ctx, s->slot_id, s->sampler.get());
+        }
+#endif
 
         std::size_t lcp = options.prefix_cache ? sel.matched_prefix : 0u;
         const int64_t kv_len_raw = llama_memory_seq_pos_max(mem, s->slot_id) + 1;
@@ -3563,20 +3645,96 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 #endif
         lcp = std::min(lcp, kv_len);
 
-        if (options.prefix_cache && radix_cache.enabled() && slots[s->slot_idx].tokens.size() >= kMinL2SnapshotTokens &&
-            lcp < slots[s->slot_idx].tokens.size()) {
+        if (allow_l2_snapshot && options.prefix_cache && radix_cache.enabled() &&
+            slots[s->slot_idx].tokens.size() >= kMinL2SnapshotTokens && lcp < slots[s->slot_idx].tokens.size()) {
             SnapshotSlotToL2(s->slot_idx, s->slot_id);
         }
 
-        bool restored_from_l2 = false;
+        // Zero-copy VRAM-to-VRAM shared prefix clone on attention-only unified
+        // KV caches: if another slot (active or idle) already holds a materially
+        // longer matching prefix in VRAM, share its [0, best_lcp) cells via
+        // llama_memory_seq_cp instead of paying PCIe L2 restore or re-prefill.
+        bool cloned_from_vram = false;
         bool l2_mtp_synced = false;
+        if (options.prefix_cache && architecture == sonder::inference::ModelArchitecture::attention_only &&
+            req.prompt.size() > 1 && lcp + 32 < req.prompt.size()) {
+            const std::size_t max_reuse = req.prompt.size() - 1;
+            std::size_t best_src_idx = slots.size();
+            std::size_t best_src_lcp = lcp;
+            for (std::size_t j = 0; j < slots.size(); ++j) {
+                if (j == s->slot_idx || slots[j].tokens.empty()) continue;
+                const std::size_t cand = std::min(LongestCommonPrefix(slots[j].tokens, req.prompt), max_reuse);
+                if (cand <= best_src_lcp) continue;
+                const auto src_sid = static_cast<llama_seq_id>(slots[j].id);
+                const int64_t src_kv = llama_memory_seq_pos_max(mem, src_sid) + 1;
+                if (src_kv >= static_cast<int64_t>(cand)) {
+                    best_src_idx = j;
+                    best_src_lcp = cand;
+                }
+            }
+            if (best_src_idx < slots.size() && best_src_lcp >= lcp + 32u) {
+                const auto src_sid = static_cast<llama_seq_id>(slots[best_src_idx].id);
+                llama_memory_seq_rm(mem, s->slot_id, -1, -1);
+                ClearSlotCheckpoints(s->slot_idx);
+                llama_memory_seq_cp(mem, src_sid, s->slot_id, 0, static_cast<llama_pos>(best_src_lcp));
+                if (llama_memory_seq_pos_max(mem, s->slot_id) + 1 == static_cast<int64_t>(best_src_lcp)) {
+                    lcp = best_src_lcp;
+                    cloned_from_vram = true;
+                    slots[s->slot_idx].tokens.assign(req.prompt.begin(),
+                                                     req.prompt.begin() + static_cast<std::ptrdiff_t>(lcp));
+#if defined(SONDER_LLAMACPP_HAS_MTP)
+                    if (ctx_dft != nullptr && s->slot_idx < mtp_pending_h.size()) {
+                        mtp_deferred[s->slot_idx].Clear();
+                        std::fill(mtp_pending_h[s->slot_idx].begin(), mtp_pending_h[s->slot_idx].end(), 0.0F);
+                        if (mtp_mem_shared) {
+                            l2_mtp_synced = true;
+                        } else {
+                            llama_memory_t mem_dft = llama_get_memory(ctx_dft);
+                            llama_memory_seq_rm(mem_dft, s->slot_id, -1, -1);
+                            const bool src_dft_ready =
+                                best_src_idx < slot_mtp_synced.size() && slot_mtp_synced[best_src_idx] &&
+                                (best_src_idx >= mtp_deferred.size() || !mtp_deferred[best_src_idx].pending) &&
+                                (llama_memory_seq_pos_max(mem_dft, src_sid) + 1 >= static_cast<int64_t>(lcp));
+                            if (src_dft_ready) {
+                                llama_memory_seq_cp(mem_dft, src_sid, s->slot_id, 0, static_cast<llama_pos>(lcp));
+                                l2_mtp_synced =
+                                    (llama_memory_seq_pos_max(mem_dft, s->slot_id) + 1 == static_cast<int64_t>(lcp));
+                                if (!l2_mtp_synced) {
+                                    llama_memory_seq_rm(mem_dft, s->slot_id, -1, -1);
+                                }
+                            } else {
+                                l2_mtp_synced = false;
+                            }
+                        }
+                        if (s->slot_idx < slot_mtp_synced.size()) {
+                            slot_mtp_synced[s->slot_idx] = l2_mtp_synced;
+                        }
+                    }
+#endif
+                } else {
+                    llama_memory_seq_rm(mem, s->slot_id, -1, -1);
+                    lcp = 0;
+                    slots[s->slot_idx].tokens.clear();
+                    if (s->slot_idx < slot_mtp_synced.size()) slot_mtp_synced[s->slot_idx] = false;
+                }
+            }
+        }
+
+        bool restored_from_l2 = cloned_from_vram;
         std::size_t l2_lcp = 0;
-        if (options.prefix_cache && radix_cache.enabled() && req.prompt.size() > 1 && lcp + 1 < req.prompt.size() &&
-            TryRestoreSlotFromL2(s->slot_idx, s->slot_id, req.prompt, lcp, l2_lcp, l2_mtp_synced)) {
-            lcp = l2_lcp;
-            restored_from_l2 = true;
-            slots[s->slot_idx].tokens.assign(req.prompt.begin(),
-                                             req.prompt.begin() + static_cast<std::ptrdiff_t>(lcp));
+        bool l2_wiped = false;
+        if (!restored_from_l2 && options.prefix_cache && radix_cache.enabled() && req.prompt.size() > 1 &&
+            lcp + kMinL2RestoreGainTokens < req.prompt.size()) {
+            if (TryRestoreSlotFromL2(s->slot_idx, s->slot_id, req.prompt, lcp, l2_lcp, l2_mtp_synced, l2_wiped)) {
+                lcp = l2_lcp;
+                restored_from_l2 = true;
+                slots[s->slot_idx].tokens.assign(req.prompt.begin(),
+                                                 req.prompt.begin() + static_cast<std::ptrdiff_t>(lcp));
+            } else if (l2_wiped) {
+                lcp = 0;
+                slots[s->slot_idx].tokens.clear();
+                if (s->slot_idx < slot_mtp_synced.size()) slot_mtp_synced[s->slot_idx] = false;
+            }
         }
 
         if (!restored_from_l2) {
@@ -3671,6 +3829,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         const auto n_prompt = static_cast<int64_t>(req.prompt.size());
         const int64_t rem_prompt = n_prompt - static_cast<int64_t>(lcp);
         if (n_past + rem_prompt > n_ctx) {
+            invalidate_slot(*s);
             s->result.status = Status::Error(ErrorCode::kContextOverflow, "prompt does not fit in the context window");
             finish_slot(*s, StopReason::kError);
             return nullptr;
@@ -3737,7 +3896,60 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         return s;
     };
 
+    // Evicts the least-recently-used idle (`slot_busy[i] == 0`) slot that still
+    // holds cached KV tokens so unified KV pools (`kv_unified=true`) reclaim
+    // space before failing with rc == 1 (`kContextFull`).
+    auto evict_one_idle_slot = [&]() -> bool {
+        std::size_t victim = slots.size();
+        std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
+        for (std::size_t i = 0; i < slots.size(); ++i) {
+            if (i < slot_busy.size() && slot_busy[i] != 0u) continue;
+            const auto sid = static_cast<llama_seq_id>(slots[i].id);
+            const int64_t kv_max = llama_memory_seq_pos_max(mem, sid);
+            if (kv_max < 0 && slots[i].tokens.empty()) continue;
+            if (victim == slots.size() || slots[i].last_used < oldest) {
+                victim = i;
+                oldest = slots[i].last_used;
+            }
+        }
+        if (victim == slots.size()) return false;
+        const auto sid = static_cast<llama_seq_id>(slots[victim].id);
+        if (options.prefix_cache && radix_cache.enabled() && slots[victim].tokens.size() >= kMinL2SnapshotTokens) {
+            SnapshotSlotToL2(victim, sid);
+        }
+        llama_memory_seq_rm(mem, sid, -1, -1);
+        slots[victim].tokens.clear();
+        slots[victim].session_key.clear();
+        slots[victim].last_used = 0;
+        if (victim < slot_mtp_synced.size()) slot_mtp_synced[victim] = false;
+        ClearSlotCheckpoints(victim);
+#if defined(SONDER_LLAMACPP_HAS_MTP)
+        if (ctx_dft != nullptr) {
+            if (!mtp_mem_shared) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), sid, -1, -1);
+            }
+            if (victim < mtp_pending_h.size()) {
+                std::fill(mtp_pending_h[victim].begin(), mtp_pending_h[victim].end(), 0.0F);
+            }
+            if (victim < mtp_deferred.size()) mtp_deferred[victim].Clear();
+        }
+#endif
+        return true;
+    };
+
+    try {
     while (true) {
+        // 0. Drain all active slots cleanly if StopBatchWorker() requested shutdown.
+        if (worker_stop.load(std::memory_order_acquire)) {
+            for (auto& sp : active) {
+                if (sp && sp->task != nullptr) {
+                    finish_slot(*sp, StopReason::kCancelled);
+                }
+            }
+            active.clear();
+            break;
+        }
+
         // 1. Sleep cleanly when no active requests are in flight.
         if (active.empty()) {
             std::unique_lock<std::mutex> qlock(queue_mu);
@@ -3780,7 +3992,9 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     continue;
                 }
                 if (admitted_task != nullptr) {
-                    if (auto slot_obj = admit_request(admitted_task, sel)) {
+                    const bool allow_l2_snapshot =
+                        active.empty() && pending_count.load(std::memory_order_acquire) == 0;
+                    if (auto slot_obj = admit_request(admitted_task, sel, allow_l2_snapshot)) {
                         active.push_back(std::move(slot_obj));
                     }
                 }
@@ -3810,14 +4024,10 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             const GenerateRequest& req = *s.task->req;
 
             abort_requested.store(false, std::memory_order_relaxed);
-            active_cancel = s.task->should_cancel;
-            batch_abort_fn = nullptr;
-
-#if defined(SONDER_LLAMACPP_HAS_SET_SAMPLER)
-            if (!s.target_gpu_sampled && !s.grammar_sampler && !req.sampling.compute_logprobs) {
-                s.target_gpu_sampled = llama_set_sampler(ctx, s.slot_id, s.sampler.get());
-            }
-#endif
+            active_cancel = nullptr;
+            batch_abort_fn = [&]() -> bool {
+                return worker_stop.load(std::memory_order_relaxed) || s.IsCancelled();
+            };
 
             if (s.phase == BatchSlotPhase::kPrefill) {
                 const auto n_prompt = static_cast<int64_t>(req.prompt.size());
@@ -3833,7 +4043,12 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     BatchAdd(batch, req.prompt[static_cast<std::size_t>(off + j)],
                              static_cast<llama_pos>(s.pos + j), s.slot_id, is_last);
                 }
-                const int32_t rc = llama_decode(ctx, batch);
+                int32_t rc = llama_decode(ctx, batch);
+                while (rc == 1 && evict_one_idle_slot()) {
+                    abort_requested.store(false, std::memory_order_relaxed);
+                    rc = llama_decode(ctx, batch);
+                }
+                batch_abort_fn = nullptr;
                 active_cancel = nullptr;
                 if (rc != 0) {
                     if (!llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1)) {
@@ -3841,6 +4056,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     }
                     if (rc == 2) {
                         finish_slot(s, StopReason::kCancelled);
+                    } else if (rc == 1) {
+                        finish_slot(s, StopReason::kContextFull);
                     } else {
                         s.result.status = Status::Error(
                             ErrorCode::kDecodeFailed, "llama_decode failed during prefill (rc=" + std::to_string(rc) + ")");
@@ -3968,20 +4185,24 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     if (s.hybrid_suffix_enabled && suffix_matcher != nullptr &&
                         (architecture != sonder::inference::ModelArchitecture::hybrid || can_hybrid_spec_ckpt ||
                          rs_cap >= SuffixMatcher::kHybridMtpMinBurstDraft)) {
-                        const std::size_t hybrid_cap =
-                            (architecture == sonder::inference::ModelArchitecture::hybrid && !can_hybrid_spec_ckpt)
-                                ? std::min<std::size_t>(static_cast<std::size_t>(max_k), static_cast<std::size_t>(rs_cap))
-                                : static_cast<std::size_t>(max_k);
-                        SuffixMatchResult burst = suffix_matcher->TryHybridMtpBurstForCurrent(s.cur_tok, hybrid_cap);
-                        if (!burst.draft.empty()) {
-                            draft_tokens = std::move(burst.draft);
-                            for (std::size_t j = 0; j < draft_tokens.size(); ++j) {
-                                if (llama_vocab_is_eog(vocab, draft_tokens[j])) {
-                                    draft_tokens.resize(j + 1);
-                                    break;
+                        if (suffix_matcher->paused()) {
+                            suffix_matcher->NoteSkippedStep();
+                        } else {
+                            const std::size_t hybrid_cap =
+                                (architecture == sonder::inference::ModelArchitecture::hybrid && !can_hybrid_spec_ckpt)
+                                    ? std::min<std::size_t>(static_cast<std::size_t>(max_k), static_cast<std::size_t>(rs_cap))
+                                    : static_cast<std::size_t>(max_k);
+                            SuffixMatchResult burst = suffix_matcher->TryHybridMtpBurstForCurrent(s.cur_tok, hybrid_cap);
+                            if (!burst.draft.empty()) {
+                                draft_tokens = std::move(burst.draft);
+                                for (std::size_t j = 0; j < draft_tokens.size(); ++j) {
+                                    if (llama_vocab_is_eog(vocab, draft_tokens[j])) {
+                                        draft_tokens.resize(j + 1);
+                                        break;
+                                    }
                                 }
+                                step_used_suffix = !draft_tokens.empty();
                             }
-                            step_used_suffix = !draft_tokens.empty();
                         }
                     }
                     if (!step_used_suffix) {
@@ -4062,7 +4283,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     if (spec_ckpt_buf.size() < sz) spec_ckpt_buf.resize(sz);
                     const std::size_t written =
                         llama_state_seq_get_data_ext(ctx, spec_ckpt_buf.data(), sz, s.slot_id, flags);
-                    if (written > 0) {
+                    if (written > 0 && written <= sz) {
                         spec_ckpt_size = written;
                         have_spec_ckpt = true;
                     }
@@ -4081,7 +4302,12 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                          /*logits=*/true);
             }
 
-            const int32_t rc = llama_decode(ctx, batch);
+            int32_t rc = llama_decode(ctx, batch);
+            while (rc == 1 && evict_one_idle_slot()) {
+                abort_requested.store(false, std::memory_order_relaxed);
+                rc = llama_decode(ctx, batch);
+            }
+            batch_abort_fn = nullptr;
             active_cancel = nullptr;
             if (rc != 0) {
                 bool rolled_back = llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1);
@@ -4369,8 +4595,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         // 5. Case B: True Continuous Batching + Chunked Prefill across multiple
         // concurrent slots in lockstep (1 decode token per decoding slot +
         // chunked prefill <= n_ubatch packed into ONE llama_decode call!).
+        // Keep per-seq_id GPU backend samplers attached (never detach mid-request).
         for (auto& sp : active) {
-            detach_gpu_sampler(*sp);
             if (sp->mtp_enabled) {
                 sp->mtp_enabled = false;
                 sp->hybrid_suffix_enabled = false;
@@ -4387,7 +4613,11 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 
         std::vector<BatchSlotPlanView> views;
         views.reserve(active.size());
+        std::size_t decoding_count = 0;
         for (const auto& sp : active) {
+            if (!sp->IsCancelled() && sp->phase == BatchSlotPhase::kDecode) {
+                ++decoding_count;
+            }
             views.push_back(BatchSlotPlanView{
                 sp->slot_idx,
                 static_cast<std::int32_t>(sp->slot_id),
@@ -4399,7 +4629,14 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             });
         }
 
-        PlannedBatchStep plan = PlanContinuousBatchStep(views, step_token_budget, step_output_budget, rr_cursor);
+        // Prioritize low inter-token latency when any slot is decoding (cap
+        // mixed prefill chunks to <= 256 tokens per step), while letting pure
+        // prefill waves utilize the full `n_batch` window in one GPU pass.
+        const int32_t case_b_budget =
+            decoding_count > 0
+                ? std::min<int32_t>(step_token_budget, static_cast<int32_t>(decoding_count) + 256)
+                : n_batch;
+        PlannedBatchStep plan = PlanContinuousBatchStep(views, case_b_budget, step_output_budget, rr_cursor);
         if (plan.items.empty()) {
             continue;
         }
@@ -4447,8 +4684,15 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         const auto step_start = Clock::now();
         int32_t rc = llama_decode(ctx, batch);
 
-        // If a mixed prefill+decode batch returned rc==1 (no KV slot for full
-        // batch), retry decode-only tokens so active decoders complete and free KV.
+        // Under unified KV (`kv_unified=true`), idle prefix-cached slots share
+        // the same n_ctx pool; evict LRU idle slots before retrying on rc==1.
+        while (rc == 1 && evict_one_idle_slot()) {
+            abort_requested.store(false, std::memory_order_relaxed);
+            rc = llama_decode(ctx, batch);
+        }
+
+        // If a mixed prefill+decode batch still returned rc==1 (no KV slot for
+        // full batch), retry decode-only tokens so active decoders complete and free KV.
         if (rc == 1 && plan.prefill_slots > 0 && plan.decode_slots > 0) {
             PlannedBatchStep decode_only;
             for (const PlannedBatchItem& item : plan.items) {
@@ -4467,13 +4711,14 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         batch_abort_fn = nullptr;
 
         if (rc != 0) {
+            const bool stopping = worker_stop.load(std::memory_order_acquire);
             for (const PlannedBatchItem& item : plan.items) {
                 ActiveBatchSlot* s = find_active_by_slot(item.slot_index);
                 if (s == nullptr) continue;
                 if (!llama_memory_seq_rm(mem, s->slot_id, static_cast<llama_pos>(s->pos), -1)) {
                     invalidate_slot(*s);
                 }
-                if (rc == 2 && s->IsCancelled()) {
+                if (rc == 2 && (s->IsCancelled() || stopping)) {
                     finish_slot(*s, StopReason::kCancelled);
                 } else if (rc == 1) {
                     finish_slot(*s, StopReason::kContextFull);
@@ -4507,7 +4752,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             if (s->batch_logit_idx >= 0) {
                 out.has_sample = true;
                 out.tok = SampleTokenAt(s->batch_logit_idx, s->task->req->sampling, s->sampler.get(),
-                                        s->grammar_sampler.get(), /*gpu_sampled=*/false, n_vocab,
+                                        s->grammar_sampler.get(), s->target_gpu_sampled, n_vocab,
                                         s->task->req->sampling.compute_logprobs ? &out.lp : nullptr);
             }
             outcomes.push_back(std::move(out));
@@ -4618,6 +4863,27 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         active.erase(std::remove_if(active.begin(), active.end(),
                                     [](const auto& sp) { return sp->task == nullptr; }),
                      active.end());
+    }
+    } catch (const std::exception& ex) {
+        batch_abort_fn = nullptr;
+        active_cancel = nullptr;
+        for (auto& sp : active) {
+            if (sp && sp->task != nullptr) {
+                sp->result.status = Status::Error(ErrorCode::kDecodeFailed, std::string("batch worker error: ") + ex.what());
+                finish_slot(*sp, StopReason::kError);
+            }
+        }
+        active.clear();
+    } catch (...) {
+        batch_abort_fn = nullptr;
+        active_cancel = nullptr;
+        for (auto& sp : active) {
+            if (sp && sp->task != nullptr) {
+                sp->result.status = Status::Error(ErrorCode::kDecodeFailed, "batch worker internal exception");
+                finish_slot(*sp, StopReason::kError);
+            }
+        }
+        active.clear();
     }
 
     // Drain any remaining queued tasks cleanly on shutdown so callers never hang.

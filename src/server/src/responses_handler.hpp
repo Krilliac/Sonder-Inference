@@ -26,22 +26,31 @@ namespace sonder::inference::server::detail {
 class ResponseHistoryStore {
 public:
     static constexpr std::size_t kMaxEntries = 256;
+    static constexpr std::size_t kMaxTotalBytes = std::size_t{32} << 20;  // 32 MiB total cap
+    static constexpr std::size_t kMaxEntryBytes = std::size_t{4} << 20;   // 4 MiB per entry cap
+    static constexpr std::size_t kMaxMessagesPerEntry = 256;
 
     struct Entry {
         std::string id;
         std::string session_key;
         std::string model;
         std::vector<ChatMessage> messages;
+        std::size_t approx_bytes = 0;
     };
 
-    explicit ResponseHistoryStore(std::size_t capacity = kMaxEntries);
+    explicit ResponseHistoryStore(std::size_t capacity = kMaxEntries, std::size_t max_bytes = kMaxTotalBytes);
 
     [[nodiscard]] std::optional<Entry> get(const std::string& id);
     void put(Entry entry);
     [[nodiscard]] std::size_t size() const;
 
 private:
+    static std::size_t estimate_entry_bytes(const Entry& e) noexcept;
+    void evict_back_locked() noexcept;
+
     std::size_t capacity_ = kMaxEntries;
+    std::size_t max_bytes_ = kMaxTotalBytes;
+    std::size_t used_bytes_ = 0;
     mutable std::mutex mu_;
     std::list<Entry> lru_;
     std::unordered_map<std::string, std::list<Entry>::iterator> index_;
@@ -71,6 +80,6 @@ struct ResponsesJob {
 void execute_responses(ChatExchange& exchange, const ResponsesJob& job, const Correlation& correlation,
                        const std::string& model, const std::string& backend,
                        const std::shared_ptr<Session>& session, ResponseHistoryStore& history,
-                       bool backend_native_tools = true);
+                       bool backend_native_tools = true, bool backend_supports_multimodal = true);
 
 }  // namespace sonder::inference::server::detail

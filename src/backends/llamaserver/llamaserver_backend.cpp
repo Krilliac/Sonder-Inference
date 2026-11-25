@@ -188,7 +188,7 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             .add(Capability::tool_calling)
             .add(Capability::multimodal)
             .add(Capability::logprobs);
-        if (!options_.grammar.empty())
+        if (options_.upstream_grammar || !options_.grammar.empty())
             c.add(Capability::structured_output);
         // These indicate delegation support, not measured acceleration or KV ownership.
         if (options_.native_completion)

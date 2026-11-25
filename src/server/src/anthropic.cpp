@@ -563,8 +563,40 @@ std::string AnthropicStream::tool_call(const ToolCall& call) {
     out += frame("content_block_stop", json::Object{{"index", block_index_++}});
     return out;
 }
+std::string AnthropicStream::flush_pending_tools() {
+    std::string out;
+    if (tool_block_) {
+        out += frame("content_block_stop", json::Object{{"index", block_index_++}});
+        tool_block_ = false;
+        if (auto it = pending_tools_.find(active_tool_index_); it != pending_tools_.end()) {
+            it->second.stopped = true;
+        }
+    }
+    for (auto& [idx, slot] : pending_tools_) {
+        if (slot.stopped) continue;
+        saw_tool_use_ = true;
+        const std::string call_id = slot.id.empty() ? ("toolu_" + std::to_string(idx)) : slot.id;
+        out += frame("content_block_start",
+                     json::Object{{"index", block_index_},
+                                  {"content_block", json::Object{{"type", "tool_use"},
+                                                                 {"id", call_id},
+                                                                 {"name", slot.name},
+                                                                 {"input", json::Object{}}}}});
+        if (!slot.pending_args.empty()) {
+            out += frame("content_block_delta",
+                         json::Object{{"index", block_index_},
+                                      {"delta", json::Object{{"type", "input_json_delta"},
+                                                             {"partial_json", slot.pending_args}}}});
+            slot.pending_args.clear();
+        }
+        out += frame("content_block_stop", json::Object{{"index", block_index_++}});
+        slot.started = true;
+        slot.stopped = true;
+    }
+    return out;
+}
 std::string AnthropicStream::tool_call_delta(const ToolCallDelta& delta) {
-    if (!started_ || finished_)
+    if (!started_ || finished_ || delta.index >= 64u)
         return {};
     std::string out;
     if (thinking_block_) {
@@ -575,27 +607,47 @@ std::string AnthropicStream::tool_call_delta(const ToolCallDelta& delta) {
         out += frame("content_block_stop", json::Object{{"index", block_index_++}});
         text_block_ = false;
     }
-    if (!tool_block_ || delta.index != active_tool_index_) {
-        if (tool_block_) {
-            out += frame("content_block_stop", json::Object{{"index", block_index_++}});
+    saw_tool_use_ = true;
+    auto& slot = pending_tools_[delta.index];
+    if (!delta.id.empty()) slot.id = delta.id;
+    if (!delta.name.empty()) slot.name = delta.name;
+
+    // Stream directly when this index is the currently open block (or no other
+    // tool block is open yet and we already have a non-empty tool name).
+    // Interleaved parallel deltas or chunks arriving before `name` buffer per
+    // index and flush cleanly in index order without duplicate starts.
+    if (tool_block_ && delta.index == active_tool_index_) {
+        if (!delta.arguments_delta.empty()) {
+            out += frame("content_block_delta",
+                         json::Object{{"index", block_index_},
+                                      {"delta", json::Object{{"type", "input_json_delta"},
+                                                             {"partial_json", delta.arguments_delta}}}});
         }
+        return out;
+    }
+    if (!tool_block_ && !slot.started && !slot.stopped && !slot.name.empty() && pending_tools_.size() == 1u) {
         tool_block_ = true;
-        saw_tool_use_ = true;
         active_tool_index_ = delta.index;
-        const std::string call_id = delta.id.empty() ? ("toolu_" + std::to_string(delta.index)) : delta.id;
+        slot.started = true;
+        const std::string call_id = slot.id.empty() ? ("toolu_" + std::to_string(delta.index)) : slot.id;
         out += frame("content_block_start",
                      json::Object{{"index", block_index_},
                                   {"content_block", json::Object{{"type", "tool_use"},
                                                                  {"id", call_id},
-                                                                 {"name", delta.name},
+                                                                 {"name", slot.name},
                                                                  {"input", json::Object{}}}}});
+        std::string initial_args = std::move(slot.pending_args);
+        slot.pending_args.clear();
+        initial_args += delta.arguments_delta;
+        if (!initial_args.empty()) {
+            out += frame("content_block_delta",
+                         json::Object{{"index", block_index_},
+                                      {"delta", json::Object{{"type", "input_json_delta"},
+                                                             {"partial_json", initial_args}}}});
+        }
+        return out;
     }
-    if (!delta.arguments_delta.empty()) {
-        out += frame("content_block_delta",
-                     json::Object{{"index", block_index_},
-                                  {"delta", json::Object{{"type", "input_json_delta"},
-                                                         {"partial_json", delta.arguments_delta}}}});
-    }
+    slot.pending_args += delta.arguments_delta;
     return out;
 }
 std::string AnthropicStream::finish(const GenerationResult& result, const std::vector<std::string>& warnings,
@@ -613,10 +665,7 @@ std::string AnthropicStream::finish(const GenerationResult& result, const std::v
             text_block_ = true;
         }
     }
-    if (tool_block_) {
-        out += frame("content_block_stop", json::Object{{"index", block_index_++}});
-        tool_block_ = false;
-    }
+    out += flush_pending_tools();
     if (!text_block_ && !saw_tool_use_) {
         out += frame("content_block_start",
                      json::Object{{"index", block_index_},

@@ -310,8 +310,12 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
                             for (const auto &item : tcs->as_array()) {
                                 if (!item.is_object()) continue;
                                 ToolCallDelta tcd;
-                                if (const auto *idx = item.find("index"); idx && idx->is_integer() && idx->as_int() >= 0) {
-                                    tcd.index = static_cast<std::uint32_t>(idx->as_uint());
+                                if (const auto *idx = item.find("index"); idx != nullptr) {
+                                    const auto parsed_idx = idx->try_as_int();
+                                    if (!parsed_idx || *parsed_idx < 0 || *parsed_idx >= 64) {
+                                        continue;
+                                    }
+                                    tcd.index = static_cast<std::uint32_t>(*parsed_idx);
                                 }
                                 if (const auto *id = item.find("id"); id && id->is_string()) {
                                     tcd.id = id->as_string();

@@ -27,6 +27,12 @@ constexpr std::size_t kMaxPatternAtoms = 256;
 constexpr std::size_t kMaxPatternGroupDepth = 8;
 constexpr std::int64_t kMaxBoundedIntegerAbs = 999999;
 
+bool is_schema_annotation_keyword(std::string_view key) noexcept {
+    return key == "$schema" || key == "$id" || key == "$anchor" || key == "$comment" || key == "title" ||
+           key == "description" || key == "default" || key == "examples" || key == "readOnly" ||
+           key == "writeOnly" || key == "deprecated";
+}
+
 bool is_supported_schema_keyword(std::string_view key) noexcept {
     // Functional keywords enforced by the converter:
     if (key == "$ref" || key == "$defs" || key == "definitions" || key == "type" || key == "const" || key == "enum" ||
@@ -35,13 +41,7 @@ bool is_supported_schema_keyword(std::string_view key) noexcept {
         key == "minItems" || key == "maxItems" || key == "pattern" || key == "minimum" || key == "maximum") {
         return true;
     }
-    // Non-validating JSON Schema annotation/metadata keywords:
-    if (key == "$schema" || key == "$id" || key == "$anchor" || key == "$comment" || key == "title" ||
-        key == "description" || key == "default" || key == "examples" || key == "readOnly" || key == "writeOnly" ||
-        key == "deprecated") {
-        return true;
-    }
-    return false;
+    return is_schema_annotation_keyword(key);
 }
 
 const char* const kCommonRules =
@@ -366,51 +366,69 @@ public:
             return std::string("string");
         }
 
-        bool anchored_start = false;
-        bool anchored_end = false;
-        std::string_view body = pat_;
-        if (!body.empty() && body.front() == '^') {
-            anchored_start = true;
-            body.remove_prefix(1);
-        }
-        if (!body.empty() && body.back() == '$') {
-            // Check whether trailing '$' is escaped by an odd run of backslashes.
-            std::size_t slashes = 0;
-            for (std::size_t i = body.size() - 1; i > 0 && body[i - 1] == '\\'; --i) {
-                ++slashes;
-            }
-            if ((slashes % 2u) == 0u) {
-                anchored_end = true;
-                body.remove_suffix(1);
-            }
-        }
-        pat_ = body;
+        // Split top-level alternations BEFORE stripping ^/$ anchors so patterns
+        // like `^foo|bar$` keep per-branch anchoring instead of turning into
+        // `^(foo|bar)$`.
         pos_ = 0;
-
-        auto expr = parse_alternation(0);
+        auto expr = parse_top_alternation();
         if (!expr.ok()) {
             return expr.status();
         }
         if (pos_ != pat_.size()) {
             return Status(ErrorCode::invalid_argument, "unexpected trailing character in regex pattern");
         }
-
-        std::string full;
-        if (!anchored_start) full += "char* ";
-        if (!expr.value().empty()) {
-            full += "(" + expr.value() + ")";
-        }
-        if (!anchored_end) {
-            if (!full.empty()) full += " ";
-            full += "char*";
-        }
-        if (full.empty()) {
+        if (expr.value().empty()) {
             return std::string("\"\\\"\\\"\" space");
         }
-        return "\"\\\"\" " + full + " \"\\\"\" space";
+        return "\"\\\"\" (" + expr.value() + ") \"\\\"\" space";
     }
 
 private:
+    static constexpr std::size_t kMaxQuantifierExpansion = 64;
+
+    struct ParsedAtom {
+        std::string gbnf;
+        bool has_unbounded_quantifier = false;
+        std::size_t max_repeat_factor = 1;
+    };
+
+    Result<std::string> parse_top_alternation() {
+        auto parse_branch = [&]() -> Result<std::string> {
+            bool anchored_start = false;
+            if (pos_ < pat_.size() && pat_[pos_] == '^') {
+                anchored_start = true;
+                ++pos_;
+            }
+            auto seq = parse_sequence(0, /*allow_trailing_dollar=*/true);
+            if (!seq.ok()) return seq.status();
+            bool anchored_end = false;
+            if (pos_ < pat_.size() && pat_[pos_] == '$') {
+                anchored_end = true;
+                ++pos_;
+            }
+            std::string branch;
+            if (!anchored_start) branch += "char* ";
+            if (!seq.value().gbnf.empty()) {
+                branch += "(" + seq.value().gbnf + ")";
+            }
+            if (!anchored_end) {
+                if (!branch.empty()) branch += " ";
+                branch += "char*";
+            }
+            return branch;
+        };
+        auto first = parse_branch();
+        if (!first.ok()) return first.status();
+        std::string out = std::move(first).value();
+        while (pos_ < pat_.size() && pat_[pos_] == '|') {
+            ++pos_;
+            auto next = parse_branch();
+            if (!next.ok()) return next.status();
+            out += " | " + next.value();
+        }
+        return out;
+    }
+
     static std::string escape_gbnf_class_char(char ch) {
         if (ch == ']' || ch == '\\' || ch == '^' || ch == '-') {
             std::string s = "\\";
@@ -420,34 +438,58 @@ private:
         return std::string(1, ch);
     }
 
-    Result<std::string> parse_alternation(std::size_t depth) {
-        auto first = parse_sequence(depth);
+    Result<ParsedAtom> parse_alternation(std::size_t depth) {
+        auto first = parse_sequence(depth, false);
         if (!first.ok()) return first.status();
-        std::string out = std::move(first).value();
+        ParsedAtom out = std::move(first).value();
         while (pos_ < pat_.size() && pat_[pos_] == '|') {
             ++pos_;
-            auto next = parse_sequence(depth);
+            auto next = parse_sequence(depth, false);
             if (!next.ok()) return next.status();
-            out += " | " + next.value();
+            out.gbnf += " | " + next.value().gbnf;
+            out.has_unbounded_quantifier = out.has_unbounded_quantifier || next.value().has_unbounded_quantifier;
+            out.max_repeat_factor = std::max(out.max_repeat_factor, next.value().max_repeat_factor);
         }
         return out;
     }
 
-    Result<std::string> parse_sequence(std::size_t depth) {
-        std::string seq;
+    Result<ParsedAtom> parse_sequence(std::size_t depth, bool allow_trailing_dollar) {
+        ParsedAtom out;
         while (pos_ < pat_.size() && pat_[pos_] != ')' && pat_[pos_] != '|') {
+            if (allow_trailing_dollar && pat_[pos_] == '$' &&
+                (pos_ + 1 == pat_.size() || pat_[pos_ + 1] == '|')) {
+                break;
+            }
             auto atom = parse_atom(depth);
             if (!atom.ok()) return atom.status();
-            auto quant = parse_quantifier();
+            bool q_unbounded = false;
+            std::size_t q_max = 1;
+            auto quant = parse_quantifier(q_unbounded, q_max);
             if (!quant.ok()) return quant.status();
-            if (!seq.empty()) seq.push_back(' ');
-            seq += atom.value();
-            seq += quant.value();
+            if (!quant.value().empty()) {
+                // Reject nested unbounded quantifiers (`(a+)+`, `(a*)+`, `(a+)*`)
+                // and multiplicative blowup (`((a?){32}){32}`) to prevent Earley DoS.
+                if (atom.value().has_unbounded_quantifier && (q_unbounded || q_max > 1)) {
+                    return Status(ErrorCode::invalid_argument,
+                                  "nested unbounded regex quantifiers are not supported in GBNF");
+                }
+                if (q_max > 1 && atom.value().max_repeat_factor > kMaxQuantifierExpansion / q_max) {
+                    return Status(ErrorCode::invalid_argument,
+                                  "nested regex quantifier expansion exceeds maximum complexity");
+                }
+                atom.value().has_unbounded_quantifier = atom.value().has_unbounded_quantifier || q_unbounded;
+                atom.value().max_repeat_factor *= q_max;
+            }
+            if (!out.gbnf.empty()) out.gbnf.push_back(' ');
+            out.gbnf += atom.value().gbnf;
+            out.gbnf += quant.value();
+            out.has_unbounded_quantifier = out.has_unbounded_quantifier || atom.value().has_unbounded_quantifier;
+            out.max_repeat_factor = std::max(out.max_repeat_factor, atom.value().max_repeat_factor);
         }
-        return seq;
+        return out;
     }
 
-    Result<std::string> parse_atom(std::size_t depth) {
+    Result<ParsedAtom> parse_atom(std::size_t depth) {
         if (++atoms_ > kMaxPatternAtoms) {
             return Status(ErrorCode::invalid_argument, "regex pattern exceeds maximum complexity");
         }
@@ -479,23 +521,29 @@ private:
                 return Status(ErrorCode::invalid_argument, "unclosed '(' in regex pattern");
             }
             ++pos_;
-            return "(" + inner.value() + ")";
+            ParsedAtom grouped = std::move(inner).value();
+            grouped.gbnf = "(" + grouped.gbnf + ")";
+            return grouped;
         }
         if (ch == '[') {
-            return parse_char_class();
+            auto cc = parse_char_class();
+            if (!cc.ok()) return cc.status();
+            return ParsedAtom{std::move(cc).value(), false, 1};
         }
         if (ch == '.') {
             ++pos_;
-            return std::string("[^\"\\\\\\x7F\\x00-\\x1F]");
+            return ParsedAtom{std::string("[^\"\\\\\\x7F\\x00-\\x1F]"), false, 1};
         }
         if (ch == '\\') {
-            return parse_escape();
+            auto esc = parse_escape();
+            if (!esc.ok()) return esc.status();
+            return ParsedAtom{std::move(esc).value(), false, 1};
         }
         ++pos_;
         if (ch == '"') {
-            return std::string("\"\\\\\\\"\"");
+            return ParsedAtom{std::string("\"\\\\\\\"\""), false, 1};
         }
-        return gbnf_literal(std::string_view(&ch, 1));
+        return ParsedAtom{gbnf_literal(std::string_view(&ch, 1)), false, 1};
     }
 
     Result<std::string> parse_escape() {
@@ -626,7 +674,9 @@ private:
         return std::string("[") + (negated ? "^" : "") + content + "]";
     }
 
-    Result<std::string> parse_quantifier() {
+    Result<std::string> parse_quantifier(bool& out_unbounded, std::size_t& out_max_repeat) {
+        out_unbounded = false;
+        out_max_repeat = 1;
         if (pos_ >= pat_.size()) return std::string();
         const char q = pat_[pos_];
         if (q == '*' || q == '+' || q == '?') {
@@ -635,6 +685,8 @@ private:
                 return Status(ErrorCode::invalid_argument,
                               "lazy/possessive regex quantifiers are not supported in GBNF");
             }
+            out_unbounded = (q == '*' || q == '+');
+            out_max_repeat = (q == '?') ? 2u : 1u;
             return std::string(1, q);
         }
         if (q == '{') {
@@ -680,11 +732,15 @@ private:
                               "lazy/possessive regex quantifiers are not supported in GBNF");
             }
             if (!has_comma) {
+                out_max_repeat = std::max<std::size_t>(1u, lo);
                 return "{" + std::to_string(lo) + "}";
             }
             if (!hi) {
+                out_unbounded = true;
+                out_max_repeat = std::max<std::size_t>(1u, lo);
                 return "{" + std::to_string(lo) + ",}";
             }
+            out_max_repeat = std::max<std::size_t>(1u, *hi);
             return "{" + std::to_string(lo) + "," + std::to_string(*hi) + "}";
         }
         return std::string();
@@ -740,10 +796,15 @@ private:
         std::map<std::string, std::vector<json::Value>> required_const_props;
     };
 
+    static constexpr std::size_t kMaxClassifyLiterals = 256;
+
     Result<BranchDomain> classify_branch(const json::Value& schema, std::size_t depth,
                                          std::set<std::string>& ref_guard) const {
         if (depth > kMaxSchemaDepth) {
             return Status(ErrorCode::invalid_argument, "JSON schema nesting exceeds maximum depth");
+        }
+        if (++classify_visits_ > kMaxSchemaNodes) {
+            return Status(ErrorCode::invalid_argument, "JSON schema oneOf analysis exceeds maximum node budget");
         }
         if (schema.is_bool()) {
             BranchDomain d;
@@ -753,11 +814,30 @@ private:
         if (!schema.is_object()) {
             return Status(ErrorCode::invalid_argument, "JSON schema node must be an object or boolean");
         }
+        auto reject_siblings = [&](const char* primary, bool allow_type) -> Status {
+            for (const auto& [k, _] : schema.as_object()) {
+                if (k == primary || k == "$defs" || k == "definitions" || is_schema_annotation_keyword(k)) {
+                    continue;
+                }
+                if (allow_type && k == "type") {
+                    continue;
+                }
+                return Status(ErrorCode::invalid_argument,
+                              std::string("sibling JSON schema constraint '") + k + "' next to '" + primary +
+                                  "' cannot be safely enforced by GBNF");
+            }
+            return Status::success();
+        };
+
         if (const json::Value* ref = schema.find("$ref"); ref != nullptr) {
+            if (Status st = reject_siblings("$ref", /*allow_type=*/false); !st.ok()) return st;
             if (!ref->is_string()) {
                 return Status(ErrorCode::invalid_argument, "$ref must be a string");
             }
             const std::string& r = ref->as_string();
+            if (auto cached = classify_ref_cache_.find(r); cached != classify_ref_cache_.end()) {
+                return cached->second;
+            }
             if (!ref_guard.insert(r).second) {
                 return Status(ErrorCode::invalid_argument,
                               "direct or left-recursive $ref cycle is not supported: '" + r + "'");
@@ -769,6 +849,9 @@ private:
             }
             auto res = classify_branch(*target.value(), depth + 1, ref_guard);
             ref_guard.erase(r);
+            if (res.ok()) {
+                classify_ref_cache_.emplace(r, res.value());
+            }
             return res;
         }
         if (const json::Value* c = schema.find("const"); c != nullptr) {
@@ -786,7 +869,12 @@ private:
             d.is_literal_only = true;
             d.type_mask = 0u;
             for (const auto& item : en->as_array()) {
-                d.literals.push_back(item);
+                if (d.literals.size() >= kMaxClassifyLiterals) {
+                    d.is_literal_only = false;
+                    d.literals.clear();
+                } else if (d.is_literal_only) {
+                    d.literals.push_back(item);
+                }
                 d.type_mask |= type_bit_for_value(item);
             }
             return d;
@@ -805,8 +893,14 @@ private:
                 combined.type_mask |= sd.value().type_mask;
                 if (!sd.value().is_literal_only) {
                     combined.is_literal_only = false;
+                    combined.literals.clear();
                 } else if (combined.is_literal_only) {
                     for (const auto& lit : sd.value().literals) {
+                        if (combined.literals.size() >= kMaxClassifyLiterals) {
+                            combined.is_literal_only = false;
+                            combined.literals.clear();
+                            break;
+                        }
                         combined.literals.push_back(lit);
                     }
                 }
@@ -998,7 +1092,23 @@ private:
             }
         }
 
+        auto reject_siblings = [&](const char* primary, bool allow_type) -> Status {
+            for (const auto& [k, _] : schema.as_object()) {
+                if (k == primary || k == "$defs" || k == "definitions" || is_schema_annotation_keyword(k)) {
+                    continue;
+                }
+                if (allow_type && k == "type") {
+                    continue;
+                }
+                return Status(ErrorCode::invalid_argument,
+                              std::string("sibling JSON schema constraint '") + k + "' next to '" + primary +
+                                  "' cannot be safely enforced by GBNF");
+            }
+            return Status::success();
+        };
+
         if (const json::Value* ref = schema.find("$ref"); ref != nullptr) {
+            if (Status st = reject_siblings("$ref", /*allow_type=*/false); !st.ok()) return st;
             if (!ref->is_string()) {
                 return Status(ErrorCode::invalid_argument, "$ref must be a string");
             }
@@ -1037,10 +1147,12 @@ private:
         }
 
         if (const json::Value* c = schema.find("const"); c != nullptr) {
+            if (Status st = reject_siblings("const", /*allow_type=*/true); !st.ok()) return st;
             return gbnf_literal(c->dump()) + " space";
         }
 
         if (const json::Value* en = schema.find("enum"); en != nullptr) {
+            if (Status st = reject_siblings("enum", /*allow_type=*/true); !st.ok()) return st;
             if (!en->is_array() || en->as_array().empty()) {
                 return Status(ErrorCode::invalid_argument, "enum must be a non-empty array");
             }
@@ -1059,6 +1171,7 @@ private:
         }
 
         if (const json::Value* alts = schema.find("anyOf"); alts != nullptr) {
+            if (Status st = reject_siblings("anyOf", /*allow_type=*/false); !st.ok()) return st;
             if (!alts->is_array() || alts->as_array().empty()) {
                 return Status(ErrorCode::invalid_argument, "anyOf must be a non-empty array");
             }
@@ -1081,6 +1194,7 @@ private:
         }
 
         if (const json::Value* one = schema.find("oneOf"); one != nullptr) {
+            if (Status st = reject_siblings("oneOf", /*allow_type=*/false); !st.ok()) return st;
             if (!one->is_array() || one->as_array().empty()) {
                 return Status(ErrorCode::invalid_argument, "oneOf must be a non-empty array");
             }
@@ -1216,11 +1330,18 @@ private:
         std::optional<std::int64_t> max_v;
         auto read_bound = [](const json::Value* v, const char* name, std::optional<std::int64_t>& out) -> Status {
             if (v == nullptr) return Status::success();
-            if (v->is_integer()) {
-                out = v->as_int();
+            if (const auto exact = v->try_as_int()) {
+                if (*exact < -kMaxBoundedIntegerAbs || *exact > kMaxBoundedIntegerAbs) {
+                    return Status(ErrorCode::invalid_argument,
+                                  std::string(name) + " must be an integer within [-" +
+                                      std::to_string(kMaxBoundedIntegerAbs) + ", " +
+                                      std::to_string(kMaxBoundedIntegerAbs) + "]");
+                }
+                out = *exact;
                 return Status::success();
             }
-            if (v->is_number() && std::isfinite(v->as_double()) && std::floor(v->as_double()) == v->as_double() &&
+            if (!v->is_integer() && v->is_number() && std::isfinite(v->as_double()) &&
+                std::floor(v->as_double()) == v->as_double() &&
                 std::fabs(v->as_double()) <= static_cast<double>(kMaxBoundedIntegerAbs)) {
                 out = static_cast<std::int64_t>(v->as_double());
                 return Status::success();
@@ -1542,6 +1663,8 @@ private:
     std::size_t counter_ = 0;
     std::size_t hint_counter_ = 0;
     std::size_t node_visits_ = 0;
+    mutable std::size_t classify_visits_ = 0;
+    mutable std::map<std::string, BranchDomain> classify_ref_cache_;
 };
 
 class GbnfStructuredGrammarEngine final : public StructuredGrammarEngine {

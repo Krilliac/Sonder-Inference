@@ -74,6 +74,8 @@ struct LlamaCppBackendOptions {
     std::uint32_t cache_ram_mib = 0;
     // Dynamic GPU cache in MiB for host-resident MoE experts (0 = disabled, max 262144).
     std::uint32_t moe_cache_mib = 0;
+    // Fraction of MoE cache capacity reserved for CPU-shared tier (0.0..1.0).
+    double moe_cache_cpu_share = 0.0;
     // Optional multimodal projector GGUF path (--mmproj); requires libmtmd build.
     std::string mmproj_path;
 };
