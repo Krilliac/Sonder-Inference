@@ -9,6 +9,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -55,7 +56,7 @@ struct PlannedBatchStep {
 };
 
 // Selects the best FREE (`busy[i] == 0`) KV slot for `prompt` and `session_key`:
-//   1. Exact non-empty `session_key` match among free slots
+//   1. Exact non-empty `session_key` match among free slots (longest LCP, then MRU)
 //   2. Longest common token prefix (> 0) among free slots, tie-broken by MRU
 //   3. Least recently used free slot (lowest `last_used`)
 // Returns std::nullopt when every slot is currently busy.
@@ -66,15 +67,26 @@ struct PlannedBatchStep {
     if (slots.empty() || slots.size() != busy.size()) return std::nullopt;
     const std::size_t max_reuse = prompt.size() > 1 ? prompt.size() - 1 : 0;
 
-    // 1. Exact non-empty session_key match among free slots.
+    // 1. Exact non-empty session_key match among free slots (best LCP, then MRU).
     if (!session_key.empty()) {
+        bool found_sess = false;
+        std::size_t best_sess_idx = 0;
+        std::size_t best_sess_lcp = 0;
+        std::uint64_t best_sess_used = 0;
         for (std::size_t i = 0; i < slots.size(); ++i) {
             if (busy[i] != 0u) continue;
             if (slots[i].session_key == session_key) {
                 const std::size_t lcp = std::min(LongestCommonPrefix(slots[i].tokens, prompt), max_reuse);
-                return SlotSelection{i, lcp};
+                if (!found_sess || lcp > best_sess_lcp ||
+                    (lcp == best_sess_lcp && slots[i].last_used > best_sess_used)) {
+                    found_sess = true;
+                    best_sess_idx = i;
+                    best_sess_lcp = lcp;
+                    best_sess_used = slots[i].last_used;
+                }
             }
         }
+        if (found_sess) return SlotSelection{best_sess_idx, best_sess_lcp};
     }
 
     // 2. Longest common prefix (> 0) among free slots, tie-broken by MRU.
@@ -119,7 +131,9 @@ struct PlannedBatchStep {
 }
 
 // Plans ONE lockstep `llama_decode` step packing:
-//   1. Up to 1 decode token per active `kDecode` slot (priority for low ITL)
+//   1. Up to 1 decode token per active `kDecode` slot (priority for low ITL;
+//      fairly round-robined if decode slots exceed min(token_budget, output_budget),
+//      emitted in canonical ascending index order for CUDA graph stability)
 //   2. Chunked prefill tokens from active `kPrefill` slots into the remaining
 //      `token_budget` (<= n_ubatch), rotating fairly via `rr_cursor`.
 // Enforces `total_tokens <= token_budget` and `total_outputs <= output_budget`.
@@ -133,36 +147,75 @@ struct PlannedBatchStep {
 
     const std::size_t n = active_slots.size();
     const std::size_t start_idx = rr_cursor % n;
+    step.items.reserve(n);
+
+    // Inline stack scratch avoids hot-path heap allocations for the normal
+    // n <= kMaxSlots (16) continuous-batching case.
+    std::array<std::int32_t, kMaxSlots> inline_assigned{};
+    std::array<std::uint8_t, kMaxSlots> inline_flags{};
+    std::vector<std::int32_t> heap_assigned;
+    std::vector<std::uint8_t> heap_flags;
+    std::int32_t* assigned = inline_assigned.data();
+    std::uint8_t* flags = inline_flags.data();
+    if (n > kMaxSlots) {
+        heap_assigned.assign(n, 0);
+        heap_flags.assign(n, 0u);
+        assigned = heap_assigned.data();
+        flags = heap_flags.data();
+    }
 
     // Pass 1: Pack 1 decode token per decoding slot (low inter-token latency).
-    // Keep decoding slots in stable canonical order so CUDA graphs see
-    // consistent seq_id ordering across consecutive decode steps.
-    for (std::size_t idx = 0; idx < n; ++idx) {
-        if (step.total_tokens >= token_budget || step.total_outputs >= output_budget) {
-            break;
+    std::size_t decode_waiting = 0;
+    for (const BatchSlotPlanView& s : active_slots) {
+        if (!s.cancelled && s.phase == BatchSlotPhase::kDecode) {
+            ++decode_waiting;
         }
-        const BatchSlotPlanView& s = active_slots[idx];
-        if (s.cancelled || s.phase != BatchSlotPhase::kDecode) continue;
-        PlannedBatchItem item;
-        item.slot_index = s.slot_index;
-        item.seq_id = s.seq_id;
-        item.is_prefill = false;
-        item.token_offset = 0;
-        item.token_count = 1;
-        item.pos_start = s.pos;
-        item.request_logits = true;
-        step.items.push_back(item);
-        step.total_tokens += 1;
-        step.total_outputs += 1;
-        step.decode_slots += 1;
+    }
+    const auto decode_cap = static_cast<std::size_t>(std::min(token_budget, output_budget));
+    if (decode_waiting > 0) {
+        if (decode_waiting <= decode_cap) {
+            // All decoding slots fit: mark in canonical order.
+            for (std::size_t idx = 0; idx < n; ++idx) {
+                const BatchSlotPlanView& s = active_slots[idx];
+                if (!s.cancelled && s.phase == BatchSlotPhase::kDecode) {
+                    flags[idx] = 1u;
+                }
+            }
+        } else {
+            // Tight budget: round-robin selection from start_idx so tail decode
+            // slots are never starved, then emit in canonical ascending order.
+            std::size_t picked = 0;
+            for (std::size_t off = 0; off < n && picked < decode_cap; ++off) {
+                const std::size_t idx = (start_idx + off) % n;
+                const BatchSlotPlanView& s = active_slots[idx];
+                if (!s.cancelled && s.phase == BatchSlotPhase::kDecode) {
+                    flags[idx] = 1u;
+                    ++picked;
+                }
+            }
+        }
+        for (std::size_t idx = 0; idx < n; ++idx) {
+            if (flags[idx] == 0u) continue;
+            flags[idx] = 0u;
+            const BatchSlotPlanView& s = active_slots[idx];
+            PlannedBatchItem item;
+            item.slot_index = s.slot_index;
+            item.seq_id = s.seq_id;
+            item.is_prefill = false;
+            item.token_offset = 0;
+            item.token_count = 1;
+            item.pos_start = s.pos;
+            item.request_logits = true;
+            step.items.push_back(item);
+            step.total_tokens += 1;
+            step.total_outputs += 1;
+            step.decode_slots += 1;
+        }
     }
 
     // Pass 2: Pack chunked prefill tokens into remaining token budget.
     std::int32_t rem_budget = token_budget - step.total_tokens;
     if (rem_budget > 0) {
-        // Count eligible prefilling slots so multiple concurrent prefills share
-        // the remaining micro-batch budget fairly instead of one giant prompt
-        // starving another.
         std::size_t prefill_waiting = 0;
         for (const BatchSlotPlanView& s : active_slots) {
             if (!s.cancelled && s.phase == BatchSlotPhase::kPrefill && s.prefill_offset < s.prompt_len) {
@@ -170,32 +223,29 @@ struct PlannedBatchStep {
             }
         }
         if (prefill_waiting > 0) {
-            const std::int32_t fair_slice =
-                std::max<std::int32_t>(1, rem_budget / static_cast<std::int32_t>(prefill_waiting));
-            std::vector<std::int32_t> assigned(n, 0);
-            std::vector<bool> need_logits(n, false);
+            const std::size_t rem_budget_sz = static_cast<std::size_t>(rem_budget);
+            const std::size_t fair_slice_sz = std::max<std::size_t>(1u, rem_budget_sz / prefill_waiting);
 
-            // First pass gives each prefilling slot up to `fair_slice`.
+            // First pass gives each prefilling slot up to `fair_slice_sz`.
             for (std::size_t off = 0; off < n && rem_budget > 0; ++off) {
                 const std::size_t idx = (start_idx + off) % n;
                 const BatchSlotPlanView& s = active_slots[idx];
                 if (s.cancelled || s.phase != BatchSlotPhase::kPrefill || s.prefill_offset >= s.prompt_len) continue;
-                const auto rem_prompt = static_cast<std::int64_t>(s.prompt_len - s.prefill_offset);
-                std::int32_t take = static_cast<std::int32_t>(
-                    std::min<std::int64_t>({rem_prompt, static_cast<std::int64_t>(fair_slice),
-                                            static_cast<std::int64_t>(rem_budget)}));
-                const bool finishes = (static_cast<std::int64_t>(take) == rem_prompt);
+                const std::size_t rem_prompt = s.prompt_len - s.prefill_offset;
+                std::size_t take_sz = std::min({rem_prompt, fair_slice_sz, static_cast<std::size_t>(rem_budget)});
+                const bool finishes = (take_sz == rem_prompt);
                 if (finishes && step.total_outputs >= output_budget) {
-                    if (take > 1) {
-                        --take;
+                    if (take_sz > 1u) {
+                        --take_sz;
                     } else {
                         continue;
                     }
                 }
+                const auto take = static_cast<std::int32_t>(take_sz);
                 assigned[idx] = take;
                 rem_budget -= take;
-                if (static_cast<std::int64_t>(take) == rem_prompt) {
-                    need_logits[idx] = true;
+                if (take_sz == rem_prompt) {
+                    flags[idx] = 1u;
                     step.total_outputs += 1;
                 }
             }
@@ -206,22 +256,24 @@ struct PlannedBatchStep {
                 const std::size_t idx = (start_idx + off) % n;
                 const BatchSlotPlanView& s = active_slots[idx];
                 if (s.cancelled || s.phase != BatchSlotPhase::kPrefill || s.prefill_offset >= s.prompt_len) continue;
-                const auto rem_prompt = static_cast<std::int64_t>(s.prompt_len - s.prefill_offset) - assigned[idx];
-                if (rem_prompt <= 0) continue;
-                std::int32_t extra = static_cast<std::int32_t>(
-                    std::min<std::int64_t>(rem_prompt, static_cast<std::int64_t>(rem_budget)));
-                const bool finishes = (static_cast<std::int64_t>(extra) == rem_prompt);
+                const std::size_t total_rem = s.prompt_len - s.prefill_offset;
+                const auto already = static_cast<std::size_t>(assigned[idx]);
+                if (total_rem <= already) continue;
+                const std::size_t rem_prompt = total_rem - already;
+                std::size_t extra_sz = std::min(rem_prompt, static_cast<std::size_t>(rem_budget));
+                const bool finishes = (extra_sz == rem_prompt);
                 if (finishes && step.total_outputs >= output_budget) {
-                    if (extra > 1) {
-                        --extra;
+                    if (extra_sz > 1u) {
+                        --extra_sz;
                     } else {
                         continue;
                     }
                 }
+                const auto extra = static_cast<std::int32_t>(extra_sz);
                 assigned[idx] += extra;
                 rem_budget -= extra;
-                if (static_cast<std::int64_t>(extra) == rem_prompt) {
-                    need_logits[idx] = true;
+                if (extra_sz == rem_prompt) {
+                    flags[idx] = 1u;
                     step.total_outputs += 1;
                 }
             }
@@ -237,7 +289,7 @@ struct PlannedBatchStep {
                 item.token_offset = s.prefill_offset;
                 item.token_count = assigned[idx];
                 item.pos_start = s.pos;
-                item.request_logits = need_logits[idx];
+                item.request_logits = (flags[idx] != 0u);
                 step.items.push_back(item);
                 step.total_tokens += assigned[idx];
                 step.prefill_slots += 1;
