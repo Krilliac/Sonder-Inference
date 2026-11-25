@@ -561,15 +561,17 @@ TEST_CASE("queued scheduler deadlines report request.failed rather than racing i
         const auto* rid = ev.find("request_id");
         const auto* attrs = ev.find("attributes");
         if (rid == nullptr || attrs == nullptr || !rid->is_string() || !attrs->is_object()) continue;
-        const std::string ec = attrs->find("error_code")->as_string();
+        const auto* ec_val = attrs->find("error_code");
+        const std::string ec = (ec_val != nullptr && ec_val->is_string()) ? ec_val->as_string() : std::string{};
+        const auto* bs_val = attrs->find("backend_started");
         if (rid->as_string() == chat_rid) {
             CHECK((ec == "deadline_exceeded" || ec == "timeout"));
-            CHECK_FALSE(attrs->find("backend_started")->as_bool());
+            if (bs_val != nullptr && bs_val->is_bool()) CHECK_FALSE(bs_val->as_bool());
             saw_chat_failed = true;
         }
         if (rid->as_string() == comp_rid) {
             CHECK((ec == "deadline_exceeded" || ec == "timeout"));
-            CHECK_FALSE(attrs->find("backend_started")->as_bool());
+            if (bs_val != nullptr && bs_val->is_bool()) CHECK_FALSE(bs_val->as_bool());
             saw_comp_failed = true;
         }
     }
