@@ -1,6 +1,8 @@
 #include "sonder/inference/scheduler/simulator.hpp"
 
 #include <algorithm>
+#include <limits>
+#include <optional>
 
 namespace sonder::inference::scheduler {
 
@@ -10,8 +12,22 @@ TimeUs StepCostModel::step_time(const StepPlan& plan) const noexcept {
     for (const auto& w : plan.work) {
         if (w.phase == Phase::Decode) ++decode_seqs;
     }
-    return step_overhead_us + prefill_us_per_token * static_cast<TimeUs>(plan.prefill_tokens) +
-           decode_us_per_sequence * static_cast<TimeUs>(decode_seqs);
+    constexpr TimeUs kMax = std::numeric_limits<TimeUs>::max();
+    auto sat_add = [](TimeUs a, TimeUs b) noexcept -> TimeUs {
+        if (b <= 0) return a;
+        return a > kMax - b ? kMax : a + b;
+    };
+    auto sat_mul = [](TimeUs a, std::uint64_t count) noexcept -> TimeUs {
+        if (a <= 0 || count == 0) return 0;
+        const auto ua = static_cast<std::uint64_t>(a);
+        const auto umax = static_cast<std::uint64_t>(kMax);
+        if (ua > umax / count) return kMax;
+        return static_cast<TimeUs>(ua * count);
+    };
+    TimeUs total = std::max<TimeUs>(0, step_overhead_us);
+    total = sat_add(total, sat_mul(prefill_us_per_token, plan.prefill_tokens));
+    total = sat_add(total, sat_mul(decode_us_per_sequence, static_cast<std::uint64_t>(decode_seqs)));
+    return total;
 }
 
 double SimulationResult::generated_tokens_per_second() const noexcept {
@@ -35,15 +51,14 @@ SimulationResult Simulator::run(std::vector<Arrival> arrivals,
                          return a.at < b.at;
                      });
 
-    SimClock clock;
+    const TimeUs start = arrivals.empty() ? 0 : arrivals.front().at;
+    SimClock clock(start);
     FixedKvCapacity kv(kv_blocks_, block_size_);
     Scheduler sched(config_, clock, kv);
     SimulationResult result;
 
     std::size_t next_arrival = 0;
     std::size_t next_cancel = 0;
-    const TimeUs start = arrivals.empty() ? 0 : arrivals.front().at;
-    clock.advance_to(start);
 
     while (result.steps < max_steps) {
         while (next_arrival < arrivals.size() && arrivals[next_arrival].at <= clock.now()) {
@@ -65,16 +80,17 @@ SimulationResult Simulator::run(std::vector<Arrival> arrivals,
         result.max_step_tokens_seen = std::max(result.max_step_tokens_seen, plan.total_tokens());
         result.max_step_sequences_seen = std::max(result.max_step_sequences_seen, seqs);
         result.max_running_seen = std::max(result.max_running_seen, sched.running().size());
-        if (plan.total_tokens() > config_.max_step_tokens ||
-            plan.prefill_tokens > config_.max_step_prefill_tokens ||
-            seqs > config_.max_step_sequences) {
-            result.budget_violations++;
-        }
+        bool violated = plan.total_tokens() > config_.max_step_tokens ||
+                        plan.prefill_tokens > config_.max_step_prefill_tokens ||
+                        seqs > config_.max_step_sequences ||
+                        sched.running().size() > config_.max_running_sequences;
         for (const auto& w : plan.work) {
             if (w.phase == Phase::Prefill) {
                 result.max_prefill_chunk_seen = std::max(result.max_prefill_chunk_seen, w.num_tokens);
+                if (w.num_tokens > config_.prefill_chunk_tokens) violated = true;
             }
         }
+        if (violated) result.budget_violations++;
         if (kv.used_blocks() > kv.total_blocks()) result.kv_overcommits++;
         if (on_step) on_step(plan, sched);
 
@@ -87,15 +103,18 @@ SimulationResult Simulator::run(std::vector<Arrival> arrivals,
 
         if (plan.empty()) {
             sched.complete_step(plan, outcome);
+            if (!plan.admitted.empty() || !plan.preempted.empty() || !plan.failed.empty()) {
+                continue;  // state advanced (e.g. swap-in resume); plan again
+            }
             // Nothing runnable: jump to the next external event.
-            TimeUs next = -1;
+            std::optional<TimeUs> next;
             if (next_arrival < arrivals.size()) next = arrivals[next_arrival].at;
             if (next_cancel < cancellations.size() &&
-                (next < 0 || cancellations[next_cancel].at < next)) {
+                (!next || cancellations[next_cancel].at < *next)) {
                 next = cancellations[next_cancel].at;
             }
-            if (next < 0) break;  // stuck with no future events (should not happen)
-            clock.advance_to(next);
+            if (!next) break;  // stuck with no future events (should not happen)
+            clock.advance_to(*next);
             continue;
         }
         clock.advance(cost_.step_time(plan));

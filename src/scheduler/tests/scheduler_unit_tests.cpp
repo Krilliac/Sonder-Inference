@@ -5,6 +5,7 @@
 #include "sonder/inference/scheduler/scheduler.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -644,4 +645,227 @@ TEST_CASE("stalled_work_is_not_accounted_and_is_planned_again") {
     const StepPlan retry = step(sched, clock);
     CHECK_EQ(find_work(retry, 1)->context_offset, w->context_offset);
     CHECK_EQ(sched.timeline(1)->generated_tokens, 2u);
+}
+
+TEST_CASE("admission_watermark_overflow_does_not_bypass_kv_guard") {
+    SchedulerConfig cfg;
+    cfg.admission_watermark_blocks = std::numeric_limits<BlockCount>::max();
+    cfg.enable_priority_preemption = false;
+    SimClock clock;
+    FixedKvCapacity kv(10, 16);
+    Scheduler sched(cfg, clock, kv);
+
+    REQUIRE(sched.submit(spec(1, WorkloadClass::ImplementationWorker, 64, 10)).accepted);
+    step(sched, clock);  // admitted when running_ was empty (watermark waived), holds 4 blocks
+
+    REQUIRE(sched.submit(spec(2, WorkloadClass::ImplementationWorker, 32, 4)).accepted);  // needs 2 blocks
+    const StepPlan plan = step(sched, clock);
+    CHECK(plan.admitted.empty());
+    CHECK(sched.state(2) == RequestState::WaitingAdmission);
+}
+
+TEST_CASE("priority_preemption_waives_watermark_when_emptying_running") {
+    SchedulerConfig cfg;
+    cfg.admission_watermark_blocks = 4;
+    cfg.enable_priority_preemption = true;
+    SimClock clock;
+    FixedKvCapacity kv(8, 16);
+    Scheduler sched(cfg, clock, kv);
+
+    REQUIRE(sched.submit(spec(1, WorkloadClass::BackgroundIndexing, 118, 10)).accepted);  // 8 blocks
+    step(sched, clock);
+    REQUIRE_EQ(kv.free_blocks(), 0u);
+
+    REQUIRE(sched.submit(spec(2, WorkloadClass::InteractiveUser, 96, 4)).accepted);  // 6 blocks
+    const StepPlan plan = step(sched, clock);
+    CHECK(was_preempted(plan, 1));
+    CHECK(plan.admitted == (std::vector<RequestId>{2}));
+    CHECK_EQ(sched.stats().preemptions_priority, 1u);
+}
+
+TEST_CASE("priority_preemption_displaces_lower_class_at_max_running_sequences") {
+    SchedulerConfig cfg;
+    cfg.max_running_sequences = 1;
+    cfg.max_step_sequences = 1;
+    cfg.admission_watermark_blocks = 0;
+    cfg.enable_priority_preemption = true;
+    SimClock clock;
+    FixedKvCapacity kv(100, 16);
+    Scheduler sched(cfg, clock, kv);
+
+    REQUIRE(sched.submit(spec(1, WorkloadClass::Maintenance, 32, 10)).accepted);
+    step(sched, clock);
+    REQUIRE(sched.state(1) == RequestState::Decode);
+
+    REQUIRE(sched.submit(spec(2, WorkloadClass::InteractiveUser, 32, 4)).accepted);
+    const StepPlan plan = step(sched, clock);
+    CHECK(was_preempted(plan, 1));
+    CHECK(plan.admitted == (std::vector<RequestId>{2}));
+    CHECK(find_work(plan, 2) != nullptr);
+    CHECK_EQ(sched.stats().preemptions_priority, 1u);
+}
+
+TEST_CASE("extreme_priority_overrides_do_not_overflow_aging_or_preemption") {
+    SchedulerConfig cfg;
+    cfg.aging_interval_us = 1000;
+    cfg.starvation_threshold_us = 5000;
+    cfg.admission_watermark_blocks = 0;
+    cfg.enable_priority_preemption = true;
+    cfg.priority_preemption_min_rank_gap = 2;
+    SimClock clock;
+    FixedKvCapacity kv(4, 16);
+    Scheduler sched(cfg, clock, kv);
+
+    RequestSpec ultra = spec(1, WorkloadClass::InteractiveUser, 32, 4);
+    ultra.priority_override = std::numeric_limits<int>::min();
+    RequestSpec normal = spec(2, WorkloadClass::Maintenance, 32, 4);
+    REQUIRE(sched.submit(ultra).accepted);
+    REQUIRE(sched.submit(normal).accepted);
+
+    clock.advance(2000);  // aging boost applied: must not underflow INT_MIN
+    REQUIRE(sched.effective_rank(1).has_value());
+    CHECK_EQ(*sched.effective_rank(1), std::numeric_limits<int>::min());
+    CHECK(sched.queue_order() == (std::vector<RequestId>{1, 2}));
+
+    // Even when starving, INT_MIN must not be demoted behind a less urgent override.
+    clock.advance(10'000);
+    RequestSpec less_urgent = spec(3, WorkloadClass::InteractiveUser, 32, 4);
+    less_urgent.priority_override = std::numeric_limits<int>::min() + 1;
+    REQUIRE(sched.submit(less_urgent).accepted);
+    CHECK_EQ(*sched.effective_rank(1), std::numeric_limits<int>::min());
+    CHECK(sched.queue_order().front() == 1u);
+
+    // Admit req 1 (2 blocks) and req 3 (2 blocks), filling KV.
+    // Wait: submit a separate scheduler to isolate rank-gap preemption overflow cleanly.
+    SimClock clock2;
+    FixedKvCapacity kv2(4, 16);
+    Scheduler sched2(cfg, clock2, kv2);
+    RequestSpec running_ultra = spec(10, WorkloadClass::InteractiveUser, 60, 4);
+    running_ultra.priority_override = std::numeric_limits<int>::min();
+    REQUIRE(sched2.submit(running_ultra).accepted);
+    step(sched2, clock2);  // req 10 holds all 4 blocks
+
+    // A low-priority request must NEVER preempt INT_MIN via signed subtraction wrap.
+    REQUIRE(sched2.submit(spec(11, WorkloadClass::Maintenance, 32, 4)).accepted);
+    const StepPlan no_preempt = step(sched2, clock2);
+    CHECK(no_preempt.preempted.empty());
+    CHECK(no_preempt.admitted.empty());
+
+    // Conversely, INT_MIN MUST preempt a running Maintenance request without overflow.
+    SimClock clock3;
+    FixedKvCapacity kv3(4, 16);
+    Scheduler sched3(cfg, clock3, kv3);
+    REQUIRE(sched3.submit(spec(20, WorkloadClass::Maintenance, 60, 4)).accepted);
+    step(sched3, clock3);  // req 20 holds all 4 blocks
+    RequestSpec waiting_ultra = spec(21, WorkloadClass::InteractiveUser, 32, 4);
+    waiting_ultra.priority_override = std::numeric_limits<int>::min();
+    REQUIRE(sched3.submit(waiting_ultra).accepted);
+    const StepPlan did_preempt = step(sched3, clock3);
+    CHECK(was_preempted(did_preempt, 20));
+    CHECK(did_preempt.admitted == (std::vector<RequestId>{21}));
+}
+
+TEST_CASE("admission_lookahead_bounds_admitted_bypasses_past_blocked_head") {
+    SchedulerConfig cfg;
+    cfg.admission_lookahead = 2;
+    cfg.admission_watermark_blocks = 0;
+    cfg.enable_priority_preemption = false;
+    SimClock clock;
+    FixedKvCapacity kv(10, 16);
+    Scheduler sched(cfg, clock, kv);
+
+    REQUIRE(sched.submit(spec(1, WorkloadClass::ResearchWorker, 80, 20)).accepted);  // 5 blocks
+    step(sched, clock);
+    REQUIRE_EQ(kv.free_blocks(), 5u);
+
+    // Blocked head needs 6 blocks; five 1-block requests sit behind it.
+    REQUIRE(sched.submit(spec(2, WorkloadClass::ImplementationWorker, 96, 4)).accepted);
+    for (RequestId id = 3; id <= 7; ++id) {
+        REQUIRE(sched.submit(spec(id, WorkloadClass::ImplementationWorker, 16, 4)).accepted);
+    }
+
+    const StepPlan plan = step(sched, clock);
+    CHECK(plan.admitted == (std::vector<RequestId>{3, 4}));
+    CHECK_EQ(sched.stats().lookahead_admissions, 2u);
+    CHECK(sched.state(5) == RequestState::WaitingAdmission);
+}
+
+TEST_CASE("invalid_workload_and_zero_prefill_or_negative_starvation_rejected") {
+    SimClock clock;
+    FixedKvCapacity kv(10, 16);
+
+    {
+        SchedulerConfig bad;
+        bad.max_step_prefill_tokens = 0;
+        CHECK_THROWS_AS(Scheduler(bad, clock, kv), std::invalid_argument);
+    }
+    {
+        SchedulerConfig bad;
+        bad.starvation_threshold_us = -1;
+        CHECK_THROWS_AS(Scheduler(bad, clock, kv), std::invalid_argument);
+    }
+    {
+        SchedulerConfig bad;
+        bad.enable_priority_preemption = true;
+        bad.priority_preemption_min_rank_gap = 0;
+        CHECK_THROWS_AS(Scheduler(bad, clock, kv), std::invalid_argument);
+    }
+
+    Scheduler sched({}, clock, kv);
+    RequestSpec bad_cls = spec(1, static_cast<WorkloadClass>(99), 16, 2);
+    const SubmitResult res = sched.submit(bad_cls);
+    CHECK_FALSE(res.accepted);
+    CHECK(res.reason == FailureReason::InvalidRequest);
+    CHECK(sched.idle());
+}
+
+TEST_CASE("stats_current_oldest_queue_age_reflects_live_queue_and_clock") {
+    SimClock clock(1000);
+    FixedKvCapacity kv(100, 16);
+    Scheduler sched({}, clock, kv);
+
+    REQUIRE(sched.submit(spec(1, WorkloadClass::BackgroundIndexing, 32, 2)).accepted);
+    clock.advance(6000);
+    CHECK_EQ(sched.stats().current_oldest_queue_age, 6000);
+    CHECK_EQ(sched.stats().max_starvation_age, 6000);
+
+    step(sched, clock, 1000);  // req 1 admitted; waiting_ is now empty
+    CHECK_EQ(sched.stats().queued_sequences, 0u);
+    CHECK_EQ(sched.stats().current_oldest_queue_age, 0);
+    CHECK_EQ(sched.stats().max_starvation_age, 6000);
+}
+
+TEST_CASE("sim_clock_saturates_and_backward_clock_never_produces_negative_latencies") {
+    SimClock max_clock(std::numeric_limits<TimeUs>::max() - 5);
+    max_clock.advance(100);
+    CHECK_EQ(max_clock.now(), std::numeric_limits<TimeUs>::max());
+
+    class SkewClock final : public Clock {
+    public:
+        TimeUs t = 10'000;
+        [[nodiscard]] TimeUs now() const noexcept override { return t; }
+    };
+    SkewClock skew;
+    FixedKvCapacity kv(100, 16);
+    Scheduler sched({}, skew, kv);
+    REQUIRE(sched.submit(spec(1, WorkloadClass::InteractiveUser, 16, 3)).accepted);
+    skew.t = 5'000;  // clock stepped backward before admission
+    auto p1 = sched.plan_step();
+    skew.t = 4'000;
+    sched.complete_step(p1);
+    auto p2 = sched.plan_step();
+    skew.t = 3'000;
+    sched.complete_step(p2);
+    auto p3 = sched.plan_step();
+    skew.t = 2'000;
+    sched.complete_step(p3);
+
+    const auto tl = sched.timeline(1);
+    REQUIRE(tl.has_value());
+    CHECK(tl->total_queue_time >= 0);
+    CHECK(tl->ttft() >= 0);
+    CHECK(tl->max_inter_token_gap >= 0);
+    const auto st = sched.stats();
+    CHECK(st.per_class[0].end_to_end.min >= 0);
+    CHECK(st.per_class[0].inter_token.min >= 0);
 }

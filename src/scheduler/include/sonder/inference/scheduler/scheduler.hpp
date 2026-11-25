@@ -168,7 +168,8 @@ private:
     void erase_from(std::vector<RequestId>& v, RequestId id);
     void emit_token(Sequence& s, TimeUs now);
     bool try_priority_preemption(StepPlan& plan, Budget& budget, const Sequence& cand,
-                                 BlockCount need, TimeUs now);
+                                 BlockCount need, bool need_slot, bool resumes_decode,
+                                 TimeUs now);
     void schedule_decode(StepPlan& plan, Budget& budget, TimeUs now);
     void schedule_prefill(StepPlan& plan, Budget& budget);
     void admit(StepPlan& plan, Budget& budget, TimeUs now);
