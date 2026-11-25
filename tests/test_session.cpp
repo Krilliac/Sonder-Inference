@@ -452,4 +452,294 @@ TEST_CASE("session enforces cumulative response byte cap (M-16)") {
     CHECK(session->state() == SessionState::idle);
 }
 
+TEST_CASE("embed emits request.queued, request.started and request.completed with parent_request_id and admission") {
+    sonder_test::Harness h({}, TelemetryLevel::metrics);
+    REQUIRE(h.model);
+    SessionOptions so;
+    so.run_id = "embed-run-1";
+    so.agent_id = "agent-embed";
+    so.task_id = "task-embed";
+    so.workload = WorkloadClass::owner_orchestrator;
+    so.priority = 3;
+    auto created = h.engine->create_session(h.model, so);
+    REQUIRE(created.ok());
+    auto session = created.value();
+
+    RequestOptions opts;
+    opts.request_id = "embed-req-1";
+    opts.parent_request_id = "turn-E1";
+    opts.priority_class = RequestPriority::subagent;
+    opts.admission_queue_ms = 4.5;
+    auto r = session->embed({"hello", "world"}, opts);
+    REQUIRE(r.ok());
+    CHECK(r.value().embeddings.size() == 2u);
+    CHECK(r.value().prompt_tokens > 0u);
+    CHECK(session->state() == SessionState::idle);
+    CHECK(session->last_outcome() == RequestOutcome::completed);
+
+    std::vector<std::string> lifecycle;
+    for (const auto& e : h.events()) {
+        const json::Value* rid = e.find("request_id");
+        if (!rid || rid->as_string() != "embed-req-1") continue;
+        const std::string type = e.find("event_type")->as_string();
+        if (type.rfind("request.", 0) != 0) continue;
+        lifecycle.push_back(type);
+        CHECK(e.find("session_id")->as_string() == session->id());
+        CHECK(e.find("model_instance_id")->as_string() == h.model->instance_id());
+        CHECK(e.find("device_id")->as_string() == "cpu:0");
+        CHECK(e.find("run_id")->as_string() == "embed-run-1");
+        CHECK(e.find("agent_id")->as_string() == "agent-embed");
+        CHECK(e.find("task_id")->as_string() == "task-embed");
+        const auto* attrs = e.find("attributes");
+        REQUIRE(attrs != nullptr);
+        CHECK(attrs->find("kind")->as_string() == "embed");
+        REQUIRE(attrs->find("parent_request_id") != nullptr);
+        CHECK(attrs->find("parent_request_id")->as_string() == "turn-E1");
+        REQUIRE(attrs->find("priority_class") != nullptr);
+        CHECK(attrs->find("priority_class")->as_string() == "subagent");
+        const auto* adm = attrs->find("admission");
+        REQUIRE(adm != nullptr);
+        CHECK(adm->find("priority")->as_string() == "subagent");
+        CHECK(adm->find("queue_ms")->as_double() == doctest::Approx(4.5));
+        if (type == "request.queued") {
+            CHECK(attrs->find("inputs")->as_uint() == 2u);
+            CHECK(attrs->find("workload")->as_string() == "owner_orchestrator");
+            CHECK(attrs->find("priority")->as_int() == 3);
+        } else if (type == "request.started") {
+            CHECK(attrs->find("inputs")->as_uint() == 2u);
+            CHECK_FALSE(attrs->find("scheduled")->as_bool());
+        } else if (type == "request.completed") {
+            CHECK(attrs->find("outcome")->as_string() == "completed");
+            CHECK(attrs->find("inputs")->as_uint() == 2u);
+            CHECK(attrs->find("prompt_tokens")->as_uint() == r.value().prompt_tokens);
+            CHECK(attrs->find("total_ms")->as_double() >= 0.0);
+        }
+    }
+    CHECK(lifecycle == std::vector<std::string>{"request.queued", "request.started", "request.completed"});
+
+    // Without optional metadata, parent_request_id and priority_class are omitted.
+    RequestOptions plain;
+    plain.request_id = "embed-req-plain";
+    REQUIRE(session->embed({"plain"}, plain).ok());
+    std::vector<std::string> plain_lifecycle;
+    for (const auto& e : h.events()) {
+        const json::Value* rid = e.find("request_id");
+        if (!rid || rid->as_string() != "embed-req-plain") continue;
+        const std::string type = e.find("event_type")->as_string();
+        if (type.rfind("request.", 0) != 0) continue;
+        plain_lifecycle.push_back(type);
+        const auto* attrs = e.find("attributes");
+        REQUIRE(attrs != nullptr);
+        CHECK(attrs->find("parent_request_id") == nullptr);
+        CHECK(attrs->find("priority_class") == nullptr);
+    }
+    CHECK(plain_lifecycle == std::vector<std::string>{"request.queued", "request.started", "request.completed"});
+}
+
+TEST_CASE("embed emits request.started and propagates parent_request_id on failure, timeout, cancel, admission and exception") {
+    enum class Mode { ok, fail_backend, throw_runtime };
+    struct EmbedFaultModel final : BackendModel {
+        Mode mode = Mode::ok;
+        std::string secret;
+        ModelDescriptor desc;
+
+        EmbedFaultModel() {
+            desc.name = "fault-embed";
+            desc.backend = "fault-embed-backend";
+            desc.context_length = 4096;
+        }
+
+        const ModelDescriptor& descriptor() const override { return desc; }
+        Result<GenerateStats> generate(const GenerateRequest&, const CancellationToken&,
+                                       const TokenCallback&) override {
+            return Status(ErrorCode::unsupported, "generate unused");
+        }
+        Result<EmbedResult> embed(const EmbedRequest& req, const CancellationToken&) override {
+            if (mode == Mode::fail_backend) {
+                return Status(ErrorCode::backend_error, "embed failed: " + secret);
+            }
+            if (mode == Mode::throw_runtime) {
+                throw std::runtime_error("embed threw: " + secret);
+            }
+            EmbedResult out;
+            out.embeddings.assign(req.inputs.size(), {0.25f, 0.75f});
+            out.prompt_tokens = static_cast<std::uint64_t>(req.inputs.size()) * 2u;
+            return out;
+        }
+    };
+    struct EmbedFaultBackend final : Backend {
+        std::shared_ptr<EmbedFaultModel> model = std::make_shared<EmbedFaultModel>();
+        std::string name() const override { return "fault-embed-backend"; }
+        std::string description() const override { return "test embed fault backend"; }
+        BackendCapabilities capabilities() const override {
+            BackendCapabilities caps;
+            caps.add(Capability::embeddings);
+            return caps;
+        }
+        Result<std::string> probe() override { return std::string("1"); }
+        Result<std::vector<ModelDescriptor>> list_models() override { return std::vector<ModelDescriptor>{model->desc}; }
+        Result<std::shared_ptr<BackendModel>> load_model(const ModelLoadOptions&) override {
+            return std::shared_ptr<BackendModel>(model);
+        }
+    };
+    struct StubAdmission final : RequestAdmission {
+        Status wait_status = Status::success();
+        double measured_queue_ms = 0.0;
+        bool ready() const override { return wait_status.ok(); }
+        std::uint64_t order() const noexcept override { return 0; }
+        bool try_acquire() override { return wait_status.ok(); }
+        Status wait(const CancellationToken&) override { return wait_status; }
+        double queue_ms() const override { return measured_queue_ms; }
+    };
+
+    EngineOptions eo;
+    eo.scheduling.enabled = false;
+    eo.telemetry.level = TelemetryLevel::metrics;
+    auto sink = std::make_shared<MemoryTelemetrySink>();
+    Engine engine(eo);
+    engine.telemetry().add_sink(sink);
+    auto backend = std::make_shared<EmbedFaultBackend>();
+    REQUIRE(engine.register_backend(backend).ok());
+    auto loaded = engine.load_model("fault-embed-backend", ModelLoadOptions{"fault-embed", "cpu:0"});
+    REQUIRE(loaded.ok());
+    auto created = engine.create_session(loaded.value());
+    REQUIRE(created.ok());
+    auto session = created.value();
+
+    const auto lifecycle_for = [&](const std::string& req_id, const std::string& expected_parent) {
+        engine.telemetry().flush();
+        std::vector<std::string> types;
+        std::vector<json::Value> events;
+        for (const auto& line : sink->lines()) {
+            auto parsed = json::parse(line);
+            REQUIRE(parsed.ok());
+            const auto* rid = parsed->find("request_id");
+            if (!rid || rid->as_string() != req_id) continue;
+            const std::string type = parsed->find("event_type")->as_string();
+            if (type.rfind("request.", 0) != 0) continue;
+            const auto* attrs = parsed->find("attributes");
+            REQUIRE(attrs != nullptr);
+            CHECK(attrs->find("kind")->as_string() == "embed");
+            REQUIRE(attrs->find("parent_request_id") != nullptr);
+            CHECK(attrs->find("parent_request_id")->as_string() == expected_parent);
+            types.push_back(type);
+            events.push_back(std::move(parsed).value());
+        }
+        return std::make_pair(std::move(types), std::move(events));
+    };
+
+    // 1. Backend failure (with M-15 redaction of raw upstream message).
+    const std::string fail_secret = "CANARY_EMBED_FAIL_SECRET_777";
+    backend->model->mode = Mode::fail_backend;
+    backend->model->secret = fail_secret;
+    {
+        RequestOptions ro;
+        ro.request_id = "embed-fail";
+        ro.parent_request_id = "turn-fail";
+        auto res = session->embed({"a"}, ro);
+        REQUIRE_FALSE(res.ok());
+        CHECK(res.status().code() == ErrorCode::backend_error);
+        const auto [types, events] = lifecycle_for("embed-fail", "turn-fail");
+        CHECK(types == std::vector<std::string>{"request.queued", "request.started", "request.failed"});
+        REQUIRE(events.size() == 3u);
+        const auto* failed_attrs = events[2].find("attributes");
+        CHECK(failed_attrs->find("outcome")->as_string() == "failed");
+        CHECK(failed_attrs->find("error_code")->as_string() == "backend_error");
+        CHECK(failed_attrs->find("error")->as_string() == "backend_error");
+        CHECK(failed_attrs->find("total_ms")->as_double() >= 0.0);
+    }
+
+    // 2. Deadline exceeded before backend start.
+    backend->model->mode = Mode::ok;
+    {
+        RequestOptions ro;
+        ro.request_id = "embed-timeout";
+        ro.parent_request_id = "turn-timeout";
+        ro.deadline = std::chrono::steady_clock::now() - 1ms;
+        auto res = session->embed({"a"}, ro);
+        REQUIRE_FALSE(res.ok());
+        CHECK(res.status().code() == ErrorCode::timeout);
+        const auto [types, events] = lifecycle_for("embed-timeout", "turn-timeout");
+        CHECK(types == std::vector<std::string>{"request.queued", "request.started", "request.failed"});
+        REQUIRE(events.size() == 3u);
+        CHECK(events[2].find("attributes")->find("error_code")->as_string() == "timeout");
+    }
+
+    // 3. Cancelled at on_backend_start boundary.
+    {
+        RequestOptions ro;
+        ro.request_id = "embed-cancel";
+        ro.parent_request_id = "turn-cancel";
+        ro.on_backend_start = [&] { session->cancel(); };
+        auto res = session->embed({"a"}, ro);
+        REQUIRE_FALSE(res.ok());
+        CHECK(res.status().code() == ErrorCode::cancelled);
+        const auto [types, events] = lifecycle_for("embed-cancel", "turn-cancel");
+        CHECK(types == std::vector<std::string>{"request.queued", "request.started", "request.cancelled"});
+        REQUIRE(events.size() == 3u);
+        const auto* cancel_attrs = events[2].find("attributes");
+        CHECK(cancel_attrs->find("outcome")->as_string() == "cancelled");
+        REQUIRE(cancel_attrs->find("cancel_latency_ms") != nullptr);
+        CHECK(cancel_attrs->find("cancel_latency_ms")->as_double() >= 0.0);
+    }
+
+    // 4. Admission wait failure reports measured admission queue_ms and error_code.
+    {
+        auto adm = std::make_shared<StubAdmission>();
+        adm->wait_status = Status(ErrorCode::timeout, "admission expired");
+        adm->measured_queue_ms = 17.25;
+        RequestOptions ro;
+        ro.request_id = "embed-admit-fail";
+        ro.parent_request_id = "turn-admit";
+        ro.priority_class = RequestPriority::background;
+        ro.admission = adm;
+        auto res = session->embed({"a"}, ro);
+        REQUIRE_FALSE(res.ok());
+        CHECK(res.status().code() == ErrorCode::timeout);
+        const auto [types, events] = lifecycle_for("embed-admit-fail", "turn-admit");
+        CHECK(types == std::vector<std::string>{"request.queued", "request.started", "request.failed"});
+        REQUIRE(events.size() == 3u);
+        const auto* failed_attrs = events[2].find("attributes");
+        CHECK(failed_attrs->find("error_code")->as_string() == "timeout");
+        REQUIRE(failed_attrs->find("admission") != nullptr);
+        CHECK(failed_attrs->find("admission")->find("priority")->as_string() == "background");
+        CHECK(failed_attrs->find("admission")->find("queue_ms")->as_double() == doctest::Approx(17.25));
+    }
+
+    // 5. Exception recovery emits request.failed with parent_request_id, redacts message, and leaves session idle.
+    const std::string throw_secret = "CANARY_EMBED_THROW_SECRET_999";
+    backend->model->mode = Mode::throw_runtime;
+    backend->model->secret = throw_secret;
+    {
+        RequestOptions ro;
+        ro.request_id = "embed-throw";
+        ro.parent_request_id = "turn-throw";
+        ro.priority_class = RequestPriority::interactive;
+        ro.admission_queue_ms = 2.5;
+        CHECK_THROWS_AS((void)session->embed({"a"}, ro), std::runtime_error);
+        CHECK(session->state() == SessionState::idle);
+        CHECK(session->last_outcome() == RequestOutcome::failed);
+        const auto [types, events] = lifecycle_for("embed-throw", "turn-throw");
+        CHECK(types == std::vector<std::string>{"request.queued", "request.started", "request.failed"});
+        REQUIRE(events.size() == 3u);
+        const auto* failed_attrs = events[2].find("attributes");
+        CHECK(failed_attrs->find("outcome")->as_string() == "failed");
+        CHECK(failed_attrs->find("error_code")->as_string() == "internal");
+        REQUIRE(failed_attrs->find("admission") != nullptr);
+        CHECK(failed_attrs->find("admission")->find("queue_ms")->as_double() == doctest::Approx(2.5));
+    }
+
+    engine.telemetry().flush();
+    for (const auto& line : sink->lines()) {
+        CHECK(line.find(fail_secret) == std::string::npos);
+        CHECK(line.find(throw_secret) == std::string::npos);
+    }
+
+    // Session stays reusable after all fault modes.
+    backend->model->mode = Mode::ok;
+    auto ok = session->embed({"recovered"});
+    REQUIRE(ok.ok());
+    CHECK(ok.value().embeddings.size() == 1u);
+}
+
 }

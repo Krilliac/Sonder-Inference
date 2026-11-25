@@ -3,6 +3,7 @@
 #include "reasoning_budget.hpp"
 #include "tool_call_parser.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <string_view>
@@ -970,7 +971,18 @@ json::Object usage_json(const GenerationResult& result) {
 }
 
 json::Object timings_json(const GenerationResult& result) {
-    json::Object t{{"prompt_n", result.stats.prompt_tokens},
+    const std::optional<std::uint64_t> cached_tokens =
+        result.stats.cached_tokens
+            ? result.stats.cached_tokens
+            : (result.stats.backend_timings ? result.stats.backend_timings->cache_n : std::nullopt);
+    std::uint64_t evaluated_prompt_tokens = result.stats.prompt_tokens;
+    if (result.stats.backend_timings && result.stats.backend_timings->prompt_n) {
+        evaluated_prompt_tokens = *result.stats.backend_timings->prompt_n;
+    } else if (cached_tokens) {
+        evaluated_prompt_tokens -= std::min(evaluated_prompt_tokens, *cached_tokens);
+    }
+
+    json::Object t{{"prompt_n", evaluated_prompt_tokens},
                    {"predicted_n", result.stats.completion_tokens},
                    {"total_ms", result.total_ms}};
     if (result.ttft_ms >= 0.0) {
@@ -979,20 +991,20 @@ json::Object timings_json(const GenerationResult& result) {
     if (result.stats.prompt_eval_ns > 0) {
         const double ms = static_cast<double>(result.stats.prompt_eval_ns) / 1e6;
         t.set("prompt_ms", ms);
-        if (result.stats.prompt_tokens > 0) {
-            t.set("prompt_per_second", static_cast<double>(result.stats.prompt_tokens) * 1e3 / ms);
+        if (evaluated_prompt_tokens > 0 && ms > 0.0) {
+            t.set("prompt_per_second", static_cast<double>(evaluated_prompt_tokens) * 1e3 / ms);
         }
     }
     if (result.stats.eval_ns > 0) {
         const double ms = static_cast<double>(result.stats.eval_ns) / 1e6;
         t.set("predicted_ms", ms);
-        if (result.stats.completion_tokens > 0) {
+        if (result.stats.completion_tokens > 0 && ms > 0.0) {
             t.set("predicted_per_second", static_cast<double>(result.stats.completion_tokens) * 1e3 / ms);
         }
     }
     // Backend observations: present only when reported (0 is a real value).
-    if (result.stats.cached_tokens) {
-        t.set("cache_n", *result.stats.cached_tokens);
+    if (cached_tokens) {
+        t.set("cache_n", *cached_tokens);
     }
     if (result.stats.draft_tokens) {
         t.set("draft_n", *result.stats.draft_tokens);
