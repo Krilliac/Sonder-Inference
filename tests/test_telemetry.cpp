@@ -1186,36 +1186,120 @@ TEST_CASE("gpu_memory_sample_attributes covers discrete RTX, AMD RX XT, Ryzen AP
 
     const json::Object apu_attrs = gpu_memory_sample_attributes(apu);
     CHECK(apu_attrs.find("kind")->as_string() == "gpu");
+    REQUIRE(apu_attrs.find("gpu_id") != nullptr);
+    CHECK(apu_attrs.find("gpu_id")->as_string() == "gpu:1");
     CHECK(apu_attrs.find("name")->as_string() == "AMD Radeon 780M Graphics");
     CHECK(apu_attrs.find("vendor")->as_string() == "amd");
+    CHECK(apu_attrs.find("device_id")->as_uint() == std::uint64_t{0x15BFu});
     CHECK(apu_attrs.find("is_integrated_uma")->as_bool());
     REQUIRE(apu_attrs.find("dedicated_total_bytes") != nullptr);
     CHECK(apu_attrs.find("dedicated_total_bytes")->as_uint() == 512 * kMiB);
     REQUIRE(apu_attrs.find("dedicated_free_bytes") != nullptr);
     CHECK(apu_attrs.find("dedicated_free_bytes")->as_uint() == 384 * kMiB + 14 * kGiB);
-    // UMA free spans dedicated + shared GTT, so generic total/available/used
-    // bytes are omitted rather than pairing unified free against a BIOS carveout.
-    CHECK(apu_attrs.find("total_bytes") == nullptr);
-    CHECK(apu_attrs.find("available_bytes") == nullptr);
-    CHECK(apu_attrs.find("used_bytes") == nullptr);
+    // UMA total/available/used bytes are paired consistently against the
+    // unified pool (dedicated BIOS carveout + shared/GTT), matching
+    // effective_vram_mib and effective_free_vram_mib so Observatory tracks
+    // Radeon 780M iGPU samples without dropping them.
+    const std::uint64_t expected_uma_total = 512 * kMiB + 16 * kGiB;
+    const std::uint64_t expected_uma_free = 384 * kMiB + 14 * kGiB;
+    REQUIRE(apu_attrs.find("total_bytes") != nullptr);
+    CHECK(apu_attrs.find("total_bytes")->as_uint() == expected_uma_total);
+    REQUIRE(apu_attrs.find("available_bytes") != nullptr);
+    CHECK(apu_attrs.find("available_bytes")->as_uint() == expected_uma_free);
+    REQUIRE(apu_attrs.find("used_bytes") != nullptr);
+    CHECK(apu_attrs.find("used_bytes")->as_uint() == expected_uma_total - expected_uma_free);
     REQUIRE(apu_attrs.find("shared_total_bytes") != nullptr);
     CHECK(apu_attrs.find("shared_total_bytes")->as_uint() == 16 * kGiB);
     REQUIRE(apu_attrs.find("effective_vram_mib") != nullptr);
     CHECK(apu_attrs.find("effective_vram_mib")->as_uint() == std::uint64_t{512 + 16384});
     REQUIRE(apu_attrs.find("effective_free_vram_mib") != nullptr);
     CHECK(apu_attrs.find("effective_free_vram_mib")->as_uint() == std::uint64_t{384 + 14336});
+    CHECK(apu_attrs.find("total_bytes")->as_uint() / kMiB == apu_attrs.find("effective_vram_mib")->as_uint());
+    CHECK(apu_attrs.find("available_bytes")->as_uint() / kMiB == apu_attrs.find("effective_free_vram_mib")->as_uint());
 
-    // UMA with unknown free reading keeps effective_vram_mib but omits effective_free_vram_mib.
+    // UMA envelope round-trip carries distinct device_id ("gpu:1") and kind ("gpu").
+    auto uma_ctx = ctx_s();
+    uma_ctx.device_id = apu.id;
+    const auto parsed_uma_env =
+        json::parse(json::Value(bus.make_envelope("device.memory.sample", uma_ctx, apu_attrs, 1)).dump());
+    REQUIRE(parsed_uma_env.ok());
+    check_envelope(parsed_uma_env.value());
+    CHECK(parsed_uma_env.value().find("device_id")->as_string() == "gpu:1");
+    CHECK(parsed_uma_env.value().find("attributes")->find("kind")->as_string() == "gpu");
+    CHECK(parsed_uma_env.value().find("attributes")->find("total_bytes")->as_uint() == expected_uma_total);
+    CHECK(parsed_uma_env.value().find("attributes")->find("used_bytes")->as_uint() ==
+          expected_uma_total - expected_uma_free);
+
+    // UMA with known-zero free reports available_bytes=0 and full used_bytes.
+    GpuDeviceInfo apu_full = apu;
+    apu_full.dedicated_free = MemoryReading::known(0);
+    const json::Object apu_full_attrs = gpu_memory_sample_attributes(apu_full);
+    REQUIRE(apu_full_attrs.find("total_bytes") != nullptr);
+    CHECK(apu_full_attrs.find("total_bytes")->as_uint() == expected_uma_total);
+    REQUIRE(apu_full_attrs.find("available_bytes") != nullptr);
+    CHECK(apu_full_attrs.find("available_bytes")->as_uint() == std::uint64_t{0});
+    REQUIRE(apu_full_attrs.find("used_bytes") != nullptr);
+    CHECK(apu_full_attrs.find("used_bytes")->as_uint() == expected_uma_total);
+
+    // Anomalous UMA free > total caps available_bytes to total_pool (matching
+    // effective_free_vram_mib) and omits used_bytes rather than underflowing,
+    // while preserving raw dedicated_free_bytes.
+    GpuDeviceInfo apu_anomalous = apu;
+    apu_anomalous.dedicated_free = MemoryReading::known(expected_uma_total + 2 * kGiB);
+    const json::Object apu_anomalous_attrs = gpu_memory_sample_attributes(apu_anomalous);
+    REQUIRE(apu_anomalous_attrs.find("dedicated_free_bytes") != nullptr);
+    CHECK(apu_anomalous_attrs.find("dedicated_free_bytes")->as_uint() == expected_uma_total + 2 * kGiB);
+    REQUIRE(apu_anomalous_attrs.find("total_bytes") != nullptr);
+    CHECK(apu_anomalous_attrs.find("total_bytes")->as_uint() == expected_uma_total);
+    REQUIRE(apu_anomalous_attrs.find("available_bytes") != nullptr);
+    CHECK(apu_anomalous_attrs.find("available_bytes")->as_uint() == expected_uma_total);
+    CHECK(apu_anomalous_attrs.find("used_bytes") == nullptr);
+    REQUIRE(apu_anomalous_attrs.find("effective_free_vram_mib") != nullptr);
+    CHECK(apu_anomalous_attrs.find("effective_free_vram_mib")->as_uint() == std::uint64_t{512 + 16384});
+
+    // UMA with shared_total only (no dedicated carveout) still emits total_bytes.
+    GpuDeviceInfo apu_shared_only;
+    apu_shared_only.id = "gpu:1";
+    apu_shared_only.name = "AMD Radeon 780M Graphics";
+    apu_shared_only.vendor = GpuVendor::amd;
+    apu_shared_only.shared_total = MemoryReading::known(32 * kGiB);
+    apu_shared_only.dedicated_free = MemoryReading::known(28 * kGiB);
+    apu_shared_only.is_integrated_uma = true;
+    apu_shared_only.backend_hint = "vulkan";
+    apu_shared_only.source = "dxgi";
+    const json::Object apu_shared_attrs = gpu_memory_sample_attributes(apu_shared_only);
+    REQUIRE(apu_shared_attrs.find("total_bytes") != nullptr);
+    CHECK(apu_shared_attrs.find("total_bytes")->as_uint() == 32 * kGiB);
+    REQUIRE(apu_shared_attrs.find("available_bytes") != nullptr);
+    CHECK(apu_shared_attrs.find("available_bytes")->as_uint() == 28 * kGiB);
+    REQUIRE(apu_shared_attrs.find("used_bytes") != nullptr);
+    CHECK(apu_shared_attrs.find("used_bytes")->as_uint() == 4 * kGiB);
+
+    // UMA with unknown free reading emits total_bytes and effective_vram_mib,
+    // while omitting available_bytes, used_bytes, and effective_free_vram_mib.
     GpuDeviceInfo apu_no_free = apu;
     apu_no_free.dedicated_free = MemoryReading::unknown();
     const json::Object apu_no_free_attrs = gpu_memory_sample_attributes(apu_no_free);
-    CHECK(apu_no_free_attrs.find("total_bytes") == nullptr);
+    REQUIRE(apu_no_free_attrs.find("total_bytes") != nullptr);
+    CHECK(apu_no_free_attrs.find("total_bytes")->as_uint() == expected_uma_total);
     CHECK(apu_no_free_attrs.find("dedicated_free_bytes") == nullptr);
     CHECK(apu_no_free_attrs.find("available_bytes") == nullptr);
     CHECK(apu_no_free_attrs.find("used_bytes") == nullptr);
     REQUIRE(apu_no_free_attrs.find("effective_vram_mib") != nullptr);
     CHECK(apu_no_free_attrs.find("effective_vram_mib")->as_uint() == std::uint64_t{512 + 16384});
     CHECK(apu_no_free_attrs.find("effective_free_vram_mib") == nullptr);
+
+    // UMA with unknown dedicated & shared totals omits total_bytes and used_bytes.
+    GpuDeviceInfo apu_unknown_pool;
+    apu_unknown_pool.id = "gpu:1";
+    apu_unknown_pool.name = "Unknown UMA";
+    apu_unknown_pool.is_integrated_uma = true;
+    const json::Object apu_unknown_attrs = gpu_memory_sample_attributes(apu_unknown_pool);
+    CHECK(apu_unknown_attrs.find("total_bytes") == nullptr);
+    CHECK(apu_unknown_attrs.find("available_bytes") == nullptr);
+    CHECK(apu_unknown_attrs.find("used_bytes") == nullptr);
+    CHECK(apu_unknown_attrs.find("effective_vram_mib") == nullptr);
+    CHECK(apu_unknown_attrs.find("effective_free_vram_mib") == nullptr);
 
     // 4. Unknown memory readings omit all optional byte and MiB metrics.
     GpuDeviceInfo unknown_gpu;
