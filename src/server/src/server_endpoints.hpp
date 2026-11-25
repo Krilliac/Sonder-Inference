@@ -126,6 +126,7 @@ void handle_telemetry_stream(Exchange& ex, const RequestHead& head, Route route,
 // cached GPU inventory.
 json::Object build_identity_body(const ServerOptions& opts, const ModelResidency& residency,
                                  const std::string& served_id, bool synthetic,
-                                 const std::optional<std::string>& probed);
+                                 const std::optional<std::string>& probed,
+                                 const std::shared_ptr<Backend>& backend = nullptr);
 
 }  // namespace sonder::inference::server::detail

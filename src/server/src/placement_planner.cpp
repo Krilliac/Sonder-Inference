@@ -461,6 +461,242 @@ std::vector<std::size_t> collect_same_vendor_discrete_peers(const std::vector<Gp
     return peers;
 }
 
+bool is_vulkan_spread_eligible(const GpuDeviceInfo& g) noexcept {
+    return !g.is_tcc_mode && g.vendor != GpuVendor::apple;
+}
+
+std::vector<std::size_t> collect_hybrid_vulkan_group(const std::vector<GpuDeviceInfo>& gpus, const HostMemory& host,
+                                                     const PlacementPlanRequest& request,
+                                                     const std::vector<std::size_t>& preferred_discrete) {
+    std::vector<std::size_t> discrete;
+    std::vector<std::size_t> uma;
+
+    const auto push_unique = [](std::vector<std::size_t>& dst, std::size_t idx) {
+        if (std::find(dst.begin(), dst.end(), idx) == dst.end()) {
+            dst.push_back(idx);
+        }
+    };
+
+    for (const std::size_t idx : preferred_discrete) {
+        if (idx >= gpus.size() || gpus[idx].is_integrated_uma || !is_vulkan_spread_eligible(gpus[idx])) continue;
+        const auto b = compute_gpu_budget(gpus[idx], host, request);
+        if (!b || b->usable_mib == 0) continue;
+        push_unique(discrete, idx);
+    }
+    for (std::size_t i = 0; i < gpus.size(); ++i) {
+        if (!is_vulkan_spread_eligible(gpus[i])) continue;
+        const auto b = compute_gpu_budget(gpus[i], host, request);
+        if (!b || b->usable_mib == 0) continue;
+        if (!gpus[i].is_integrated_uma) {
+            push_unique(discrete, i);
+        } else {
+            push_unique(uma, i);
+        }
+    }
+
+    if (discrete.empty() || uma.empty()) {
+        return {};
+    }
+    std::vector<std::size_t> group;
+    group.reserve(std::min<std::size_t>(discrete.size() + uma.size(), kMaxMultiGpu));
+    for (const std::size_t idx : discrete) {
+        if (group.size() >= kMaxMultiGpu) break;
+        group.push_back(idx);
+    }
+    for (const std::size_t idx : uma) {
+        if (group.size() >= kMaxMultiGpu) break;
+        group.push_back(idx);
+    }
+    return group;
+}
+
+bool group_is_hybrid_discrete_igpu(const std::vector<GpuDeviceInfo>& gpus,
+                                   const std::vector<std::size_t>& indices) noexcept {
+    bool has_discrete = false;
+    bool has_uma = false;
+    for (const std::size_t idx : indices) {
+        if (idx >= gpus.size()) continue;
+        if (gpus[idx].is_integrated_uma) {
+            has_uma = true;
+        } else {
+            has_discrete = true;
+        }
+    }
+    return has_discrete && has_uma;
+}
+
+struct PerDeviceBytes {
+    std::vector<std::uint64_t> bytes;
+    std::vector<double> weights;
+};
+
+PerDeviceBytes estimate_per_device_bytes(const VramEstimate& e, const LaunchProfile& p, std::size_t device_count) {
+    PerDeviceBytes out;
+    out.bytes.assign(device_count, 0);
+    out.weights.assign(device_count, 0.0);
+    if (device_count == 0 || e.total_bytes == 0) return out;
+
+    const std::string mode = p.split_mode.value_or("layer");
+    if (device_count == 1 || p.tensor_split.size() < 2 || mode == "none") {
+        std::size_t target = 0;
+        if (device_count > 1 && p.main_gpu.has_value() && *p.main_gpu >= 0 &&
+            static_cast<std::size_t>(*p.main_gpu) < device_count) {
+            target = static_cast<std::size_t>(*p.main_gpu);
+        }
+        out.bytes[target] = e.total_bytes;
+        out.weights[target] = 1.0;
+        return out;
+    }
+
+    const std::size_t n = std::min(device_count, p.tensor_split.size());
+    double weight_sum = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double w = p.tensor_split[i];
+        if (std::isfinite(w) && w > 0.0) weight_sum += w;
+    }
+    if (!(weight_sum > 0.0)) return out;
+
+    if (mode == "row") {
+        const std::uint64_t splittable =
+            saturating_add(e.weights_bytes, saturating_add(e.recurrent_bytes, e.moe_cache_bytes));
+        const std::size_t main_pos =
+            (p.main_gpu.has_value() && *p.main_gpu >= 0 && static_cast<std::size_t>(*p.main_gpu) < n)
+                ? static_cast<std::size_t>(*p.main_gpu)
+                : 0u;
+        for (std::size_t i = 0; i < n; ++i) {
+            const double share = p.tensor_split[i] / weight_sum;
+            out.weights[i] = share;
+            const std::uint64_t shard =
+                std::min(splittable, saturating_u64(std::ceil(static_cast<double>(splittable) * share)));
+            std::uint64_t gpu_bytes = saturating_add(shard, e.compute_bytes);
+            if (i == main_pos) {
+                gpu_bytes = saturating_add(gpu_bytes, e.kv_bytes);
+            }
+            out.bytes[i] = gpu_bytes;
+        }
+        return out;
+    }
+
+    const std::uint64_t splittable = saturating_add(
+        saturating_add(e.weights_bytes, e.kv_bytes),
+        saturating_add(e.recurrent_bytes, e.moe_cache_bytes));
+    for (std::size_t i = 0; i < n; ++i) {
+        const double share = p.tensor_split[i] / weight_sum;
+        out.weights[i] = share;
+        const std::uint64_t shard =
+            std::min(splittable, saturating_u64(std::ceil(static_cast<double>(splittable) * share)));
+        out.bytes[i] = saturating_add(shard, e.compute_bytes);
+    }
+    return out;
+}
+
+std::uint64_t required_host_bytes_for(const std::vector<GpuDeviceInfo>& gpus,
+                                      const std::vector<std::size_t>& active_indices, const VramEstimate& e,
+                                      const LaunchProfile& p) {
+    std::uint64_t uma_gpu_bytes = 0;
+    if (active_indices.size() == 1 && active_indices[0] < gpus.size() && gpus[active_indices[0]].is_integrated_uma) {
+        uma_gpu_bytes = e.total_bytes;
+    } else if (active_indices.size() >= 2) {
+        const PerDeviceBytes per_dev = estimate_per_device_bytes(e, p, active_indices.size());
+        for (std::size_t i = 0; i < active_indices.size() && i < per_dev.bytes.size(); ++i) {
+            if (active_indices[i] < gpus.size() && gpus[active_indices[i]].is_integrated_uma) {
+                uma_gpu_bytes = saturating_add(uma_gpu_bytes, per_dev.bytes[i]);
+            }
+        }
+    }
+    return saturating_add(uma_gpu_bytes, e.host_resident_bytes);
+}
+
+// Computes discrete-first tensor_split weights for a hybrid discrete + UMA
+// group so fast discrete VRAM fills first and only overflow spills onto iGPU
+// UMA. Returns nullopt if the group cannot fit `e` within `usable_mib`.
+std::optional<std::vector<double>> compute_hybrid_tensor_split(const std::vector<GpuDeviceInfo>& gpus,
+                                                               const std::vector<std::size_t>& indices,
+                                                               const std::vector<std::uint64_t>& usable_mib,
+                                                               const VramEstimate& e) {
+    const std::size_t n = std::min(indices.size(), usable_mib.size());
+    if (n < 2) return std::nullopt;
+
+    const std::uint64_t splittable = saturating_add(
+        saturating_add(e.weights_bytes, e.kv_bytes),
+        saturating_add(e.recurrent_bytes, e.moe_cache_bytes));
+    std::vector<std::uint64_t> cap(n, 0);
+    std::uint64_t sum_cap = 0;
+    std::uint64_t discrete_cap = 0;
+    std::uint64_t uma_cap = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::uint64_t budget_bytes =
+            usable_mib[i] > (std::numeric_limits<std::uint64_t>::max() >> 20)
+                ? std::numeric_limits<std::uint64_t>::max()
+                : (usable_mib[i] << 20);
+        if (budget_bytes <= e.compute_bytes) return std::nullopt;
+        cap[i] = budget_bytes - e.compute_bytes;
+        sum_cap = saturating_add(sum_cap, cap[i]);
+        if (gpus[indices[i]].is_integrated_uma) {
+            uma_cap = saturating_add(uma_cap, cap[i]);
+        } else {
+            discrete_cap = saturating_add(discrete_cap, cap[i]);
+        }
+    }
+    if (sum_cap == 0 || sum_cap < splittable) return std::nullopt;
+
+    std::vector<double> weights(n, 0.0);
+    if (splittable == 0 || discrete_cap == 0 || uma_cap == 0 || splittable <= discrete_cap) {
+        for (std::size_t i = 0; i < n; ++i) {
+            const double w = static_cast<double>(cap[i]) / static_cast<double>(sum_cap);
+            weights[i] = w > 0.0 ? w : 1e-6;
+        }
+        return weights;
+    }
+
+    // Discrete-first: fill discrete VRAM up to cap (leaving a small <=1 MiB
+    // rounding cushion when slack permits so ceil() stays within budget) and
+    // place the remaining splittable bytes on the integrated UMA GPU(s).
+    std::uint64_t rem_slack = sum_cap - splittable;
+    std::vector<std::uint64_t> alloc(n, 0);
+    std::uint64_t discrete_alloc_sum = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (!gpus[indices[i]].is_integrated_uma) {
+            const std::uint64_t cushion = std::min(rem_slack, std::min<std::uint64_t>(kMiB, cap[i] / 64u));
+            alloc[i] = cap[i] - cushion;
+            rem_slack -= cushion;
+            discrete_alloc_sum = saturating_add(discrete_alloc_sum, alloc[i]);
+        }
+    }
+    const std::uint64_t uma_needed = splittable > discrete_alloc_sum ? splittable - discrete_alloc_sum : 0;
+    std::uint64_t uma_assigned = 0;
+    std::size_t last_uma = n;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (gpus[indices[i]].is_integrated_uma) {
+            last_uma = i;
+            const double frac = static_cast<double>(cap[i]) / static_cast<double>(uma_cap);
+            alloc[i] = std::min(cap[i], saturating_u64(std::floor(static_cast<double>(uma_needed) * frac)));
+            uma_assigned = saturating_add(uma_assigned, alloc[i]);
+        }
+    }
+    if (last_uma < n && uma_needed > uma_assigned) {
+        const std::uint64_t diff = uma_needed - uma_assigned;
+        alloc[last_uma] = std::min(cap[last_uma], saturating_add(alloc[last_uma], diff));
+    }
+
+    std::uint64_t alloc_total = 0;
+    for (const std::uint64_t a : alloc) alloc_total = saturating_add(alloc_total, a);
+    if (alloc_total == 0) return std::nullopt;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double w = static_cast<double>(alloc[i]) / static_cast<double>(alloc_total);
+        weights[i] = w > 0.0 ? w : 1e-6;
+    }
+    return weights;
+}
+
+void remove_env_key(std::vector<std::pair<std::string, std::string>>& env, std::string_view key) {
+    env.erase(std::remove_if(env.begin(), env.end(),
+                             [key](const std::pair<std::string, std::string>& kv) noexcept {
+                                 return iequals(kv.first, key);
+                             }),
+              env.end());
+}
+
 std::vector<std::size_t> select_best_multi_gpu_group(const std::vector<GpuDeviceInfo>& gpus, const HostMemory& host,
                                                      const PlacementPlanRequest& request) {
     std::vector<std::size_t> best_group;
@@ -529,6 +765,13 @@ DeviceSelection resolve_device_selection(const std::vector<GpuDeviceInfo>& gpus,
     if (iequals(hint, "multi")) {
         sel.explicit_multi = true;
         sel.indices = select_best_multi_gpu_group(gpus, host, request);
+        if (sel.indices.size() < 2 && request.allow_hybrid_gpu_spread) {
+            const auto hybrid = collect_hybrid_vulkan_group(gpus, host, request, {});
+            if (hybrid.size() >= 2) {
+                sel.indices = hybrid;
+                sel.backend_override = "vulkan";
+            }
+        }
         if (sel.indices.size() < 2) {
             sel.multi_unavailable = true;
             sel.indices.clear();
@@ -723,6 +966,7 @@ std::string format_mib_list(const std::vector<std::uint64_t>& values) {
 PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector<GpuDeviceInfo>& gpus,
                                    const HostMemory& host, const PlacementPlanRequest& request) {
     PlacementPlan plan;
+    plan.combined_gpu_vram_mib = combined_gpu_vram_mib(gpus, request.prefer_free_vram, host);
 
     // --------------------------------------------------------- 1. Base profile
     LaunchProfile profile;
@@ -841,12 +1085,11 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
         return estimate_vram(model, p, inputs);
     };
 
-    const auto check_host_fit = [&](const VramEstimate& e, bool is_uma) -> bool {
+    const auto check_host_fit_for = [&](const std::vector<std::size_t>& indices, const VramEstimate& e,
+                                        const LaunchProfile& p) -> bool {
         if (!host.available_physical.is_known()) return true;
         const std::uint64_t avail = host.available_physical.bytes_or(0);
-        const std::uint64_t required =
-            is_uma ? saturating_add(e.total_bytes, e.host_resident_bytes) : e.host_resident_bytes;
-        return required <= avail;
+        return required_host_bytes_for(gpus, indices, e, p) <= avail;
     };
 
     // ------------------------------------------------- 4. CPU-only fallback
@@ -998,6 +1241,7 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
     plan.selected_vendor = primary_gpu.vendor;
     plan.uma_mode = active_indices.size() == 1 && primary_gpu.is_integrated_uma;
     plan.recommended_backend_hint = resolve_backend_hint(primary_gpu, sel.backend_override);
+    const bool initial_hybrid_group = active_indices.size() >= 2 && group_is_hybrid_discrete_igpu(gpus, active_indices);
     if (active_indices.size() >= 2 && plan.recommended_backend_hint != "vulkan") {
         bool mixed_vendors = false;
         for (std::size_t k = 1; k < active_indices.size(); ++k) {
@@ -1010,6 +1254,8 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
             plan.recommended_backend_hint = "vulkan";
             plan.warnings.emplace_back(
                 "selected GPUs span multiple vendors; using Vulkan multi-GPU device naming");
+        } else if (initial_hybrid_group) {
+            plan.recommended_backend_hint = "vulkan";
         }
     }
 
@@ -1081,6 +1327,16 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
         }
     }
 
+    if (initial_hybrid_group && plan.recommended_backend_hint == "vulkan") {
+        profile.flash_attn = "auto";
+        profile.load_mode = "auto";
+        if (profile.cache_type_k && *profile.cache_type_k == "f8_e4m3") {
+            profile.cache_type_k = request.allow_quantized_kv ? "q8_0" : "f16";
+            profile.cache_type_v = request.allow_quantized_kv ? "q8_0" : "f16";
+        }
+        remove_env_key(plan.recommended_env, "GPU_MAX_ALLOC_PERCENT");
+    }
+
     profile.n_gpu_layers = -1;
 
     std::vector<std::uint64_t> active_usable_mib;
@@ -1097,7 +1353,16 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
         max_single_usable_mib = 0;
         any_uma_capped_by_host = false;
 
-        std::size_t largest_pos = 0;
+        bool has_discrete = false;
+        for (const std::size_t idx : active_indices) {
+            if (!gpus[idx].is_integrated_uma) {
+                has_discrete = true;
+                break;
+            }
+        }
+        std::size_t best_main_pos = 0;
+        std::uint64_t best_main_usable = 0;
+        bool found_main = false;
         for (std::size_t k = 0; k < active_indices.size(); ++k) {
             const auto b = compute_gpu_budget(gpus[active_indices[k]], host, request);
             const std::uint64_t usable = b ? b->usable_mib : 0;
@@ -1108,7 +1373,12 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
             total_usable_mib = saturating_add(total_usable_mib, usable);
             if (usable > max_single_usable_mib) {
                 max_single_usable_mib = usable;
-                largest_pos = k;
+            }
+            const bool candidate_for_main = !has_discrete || !gpus[active_indices[k]].is_integrated_uma;
+            if (candidate_for_main && (!found_main || usable > best_main_usable)) {
+                best_main_pos = k;
+                best_main_usable = usable;
+                found_main = true;
             }
         }
 
@@ -1121,8 +1391,8 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
                 const double w = static_cast<double>(usable) / static_cast<double>(total_usable_mib);
                 profile.tensor_split.push_back(w > 0.0 ? w : 1e-6);
             }
-            if (largest_pos > 0) {
-                profile.main_gpu = static_cast<std::int32_t>(largest_pos);
+            if (best_main_pos > 0) {
+                profile.main_gpu = static_cast<std::int32_t>(best_main_pos);
             } else {
                 profile.main_gpu = std::nullopt;
             }
@@ -1142,30 +1412,29 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
         }
     };
 
-    const auto fits_vram = [&](const VramEstimate& e, const LaunchProfile& p) -> bool {
-        if (active_usable_mib.empty() || total_usable_mib == 0) return false;
+    const auto fits_vram_for = [&](const VramEstimate& e, const LaunchProfile& p,
+                                   const std::vector<std::uint64_t>& usable_mib,
+                                   std::uint64_t max_single_mib) -> bool {
+        std::uint64_t sum_usable = 0;
+        for (const std::uint64_t u : usable_mib) sum_usable = saturating_add(sum_usable, u);
+        if (usable_mib.empty() || sum_usable == 0) return false;
         if (e.total_bytes == 0) return true;
-        if (active_usable_mib.size() == 1 || p.tensor_split.size() < 2 ||
-            (p.split_mode && *p.split_mode == "none")) {
-            return e.total_mib() <= active_usable_mib.front();
+        if (usable_mib.size() == 1 || p.tensor_split.size() < 2 || (p.split_mode && *p.split_mode == "none")) {
+            return e.total_mib() <= usable_mib.front();
         }
-        double weight_sum = 0.0;
-        for (const double w : p.tensor_split) {
-            if (std::isfinite(w) && w > 0.0) weight_sum += w;
-        }
-        if (!(weight_sum > 0.0)) return false;
-        const std::uint64_t splittable = saturating_add(
-            saturating_add(e.weights_bytes, e.kv_bytes),
-            saturating_add(e.recurrent_bytes, e.moe_cache_bytes));
-        const std::size_t n = std::min(active_usable_mib.size(), p.tensor_split.size());
+        const PerDeviceBytes per_dev = estimate_per_device_bytes(e, p, usable_mib.size());
+        const std::size_t n = std::min(usable_mib.size(), per_dev.bytes.size());
+        bool any_positive = false;
         for (std::size_t i = 0; i < n; ++i) {
-            const double share = p.tensor_split[i] / weight_sum;
-            const std::uint64_t shard =
-                std::min(splittable, saturating_u64(std::ceil(static_cast<double>(splittable) * share)));
-            const std::uint64_t gpu_bytes = saturating_add(shard, e.compute_bytes);
-            if (bytes_to_mib_ceil(gpu_bytes) > active_usable_mib[i]) return false;
+            if (per_dev.weights[i] > 0.0) any_positive = true;
+            if (bytes_to_mib_ceil(per_dev.bytes[i]) > usable_mib[i]) return false;
         }
-        return e.max_gpu_mib() <= max_single_usable_mib;
+        if (!any_positive) return false;
+        return e.max_gpu_mib() <= max_single_mib;
+    };
+
+    const auto fits_vram = [&](const VramEstimate& e, const LaunchProfile& p) -> bool {
+        return fits_vram_for(e, p, active_usable_mib, max_single_usable_mib);
     };
 
     apply_active_devices(active_indices);
@@ -1192,6 +1461,17 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
 
     // ----------------------------------------- 6. Auto multi-GPU expansion
     VramEstimate est = evaluate(profile, profile.vram_budget_mib);
+    if (initial_hybrid_group && !fits_vram(est, profile)) {
+        if (const auto split = compute_hybrid_tensor_split(gpus, active_indices, active_usable_mib, est)) {
+            LaunchProfile probe = profile;
+            probe.tensor_split = *split;
+            const VramEstimate probe_est = evaluate(probe, probe.vram_budget_mib);
+            if (fits_vram(probe_est, probe)) {
+                profile = std::move(probe);
+                est = probe_est;
+            }
+        }
+    }
     if (active_indices.size() == 1 && !sel.pinned_single && !plan.uma_mode && !fits_vram(est, profile)) {
         const auto peers = collect_same_vendor_discrete_peers(gpus, host, request, active_indices[0]);
         if (peers.size() >= 2) {
@@ -1205,6 +1485,278 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
                                    "-GPU layer split (" + *profile.device + ", total usable " +
                                    std::to_string(total_usable_mib) + " MiB, per-GPU budgets: " +
                                    format_mib_list(active_usable_mib) + " MiB)");
+        }
+    }
+
+    // ----------------------------------------- 6b. Hybrid discrete + iGPU UMA Vulkan spread
+    // When the model exceeds discrete VRAM alone (even after quantized KV at target_ctx)
+    // but fits inside discrete + integrated UMA via Vulkan with zero CPU spill,
+    // recommend a structured multi-GPU spread (e.g. Vulkan0,Vulkan1) with discrete-first
+    // weighting instead of spilling weights/experts to CPU.
+    if (!fits_vram(est, profile) && request.allow_hybrid_gpu_spread && !sel.pinned_single && !sel.explicit_multi &&
+        !plan.uma_mode) {
+        bool discrete_fits_with_qkv = false;
+        if (request.allow_quantized_kv) {
+            if (!(profile.cache_type_v && *profile.cache_type_v == "q4_0")) {
+                LaunchProfile q8_q4 = profile;
+                q8_q4.cache_type_k = "q8_0";
+                q8_q4.cache_type_v = "q4_0";
+                if (fits_vram(evaluate(q8_q4, q8_q4.vram_budget_mib), q8_q4)) {
+                    discrete_fits_with_qkv = true;
+                }
+            }
+            if (!discrete_fits_with_qkv && !(profile.cache_type_k && *profile.cache_type_k == "q4_0")) {
+                LaunchProfile q4 = profile;
+                q4.cache_type_k = "q4_0";
+                q4.cache_type_v = "q4_0";
+                if (fits_vram(evaluate(q4, q4.vram_budget_mib), q4)) {
+                    discrete_fits_with_qkv = true;
+                }
+            }
+        }
+
+        if (!discrete_fits_with_qkv) {
+            const auto hybrid_indices = collect_hybrid_vulkan_group(gpus, host, request, active_indices);
+            if (hybrid_indices.size() >= 2) {
+                std::vector<std::uint64_t> hybrid_usable_mib;
+                hybrid_usable_mib.reserve(hybrid_indices.size());
+                std::uint64_t hybrid_total_usable_mib = 0;
+                std::uint64_t hybrid_max_single_usable_mib = 0;
+                std::size_t hybrid_main_pos = 0;
+                std::uint64_t hybrid_main_usable = 0;
+                bool found_hybrid_main = false;
+                for (std::size_t k = 0; k < hybrid_indices.size(); ++k) {
+                    const auto b = compute_gpu_budget(gpus[hybrid_indices[k]], host, request);
+                    const std::uint64_t usable = b ? b->usable_mib : 0;
+                    hybrid_usable_mib.push_back(usable);
+                    hybrid_total_usable_mib = saturating_add(hybrid_total_usable_mib, usable);
+                    if (usable > hybrid_max_single_usable_mib) {
+                        hybrid_max_single_usable_mib = usable;
+                    }
+                    if (!gpus[hybrid_indices[k]].is_integrated_uma &&
+                        (!found_hybrid_main || usable > hybrid_main_usable)) {
+                        hybrid_main_pos = k;
+                        hybrid_main_usable = usable;
+                        found_hybrid_main = true;
+                    }
+                }
+
+                const std::string hybrid_dev_names = join_device_names(gpus, hybrid_indices, "vulkan");
+                std::vector<double> proportional_split;
+                proportional_split.reserve(hybrid_usable_mib.size());
+                for (const std::uint64_t u : hybrid_usable_mib) {
+                    const double w = hybrid_total_usable_mib > 0
+                                         ? static_cast<double>(u) / static_cast<double>(hybrid_total_usable_mib)
+                                         : 1.0 / static_cast<double>(hybrid_usable_mib.size());
+                    proportional_split.push_back(w > 0.0 ? w : 1e-6);
+                }
+
+                LaunchProfile h_base = profile;
+                h_base.device = hybrid_dev_names;
+                h_base.split_mode = "layer";
+                h_base.tensor_split = proportional_split;
+                h_base.main_gpu = hybrid_main_pos > 0
+                                      ? std::optional<std::int32_t>(static_cast<std::int32_t>(hybrid_main_pos))
+                                      : std::nullopt;
+                h_base.vram_budget_mib =
+                    hybrid_max_single_usable_mib > 0
+                        ? std::optional<std::uint64_t>(std::min(hybrid_max_single_usable_mib, kMaxVramBudgetMib))
+                        : std::nullopt;
+                h_base.flash_attn = "auto";
+                h_base.load_mode = "auto";
+                h_base.n_gpu_layers = -1;
+                if (request.allow_quantized_kv) {
+                    h_base.cache_type_k = "q8_0";
+                    h_base.cache_type_v = "q8_0";
+                } else {
+                    h_base.cache_type_k = "f16";
+                    h_base.cache_type_v = "f16";
+                }
+
+                const auto try_hybrid_fit = [&](LaunchProfile& cand, VramEstimate& cand_est) -> bool {
+                    cand.tensor_split = proportional_split;
+                    cand_est = evaluate(cand, cand.vram_budget_mib);
+                    if (const auto split =
+                            compute_hybrid_tensor_split(gpus, hybrid_indices, hybrid_usable_mib, cand_est)) {
+                        cand.tensor_split = *split;
+                        const VramEstimate split_est = evaluate(cand, cand.vram_budget_mib);
+                        if (fits_vram_for(split_est, cand, hybrid_usable_mib, hybrid_max_single_usable_mib) &&
+                            check_host_fit_for(hybrid_indices, split_est, cand)) {
+                            cand_est = split_est;
+                            return true;
+                        }
+                    }
+                    cand.tensor_split = proportional_split;
+                    cand_est = evaluate(cand, cand.vram_budget_mib);
+                    return fits_vram_for(cand_est, cand, hybrid_usable_mib, hybrid_max_single_usable_mib) &&
+                           check_host_fit_for(hybrid_indices, cand_est, cand);
+                };
+
+                LaunchProfile h_cur = h_base;
+                VramEstimate h_est;
+                std::vector<std::string> h_reasons;
+                std::vector<std::string> h_warnings;
+                bool hybrid_fitted = try_hybrid_fit(h_cur, h_est);
+
+                if (!hybrid_fitted && request.allow_quantized_kv) {
+                    LaunchProfile q8_q4 = h_cur;
+                    q8_q4.cache_type_k = "q8_0";
+                    q8_q4.cache_type_v = "q4_0";
+                    VramEstimate e_q8_q4;
+                    if (try_hybrid_fit(q8_q4, e_q8_q4)) {
+                        h_cur = std::move(q8_q4);
+                        h_est = e_q8_q4;
+                        hybrid_fitted = true;
+                        h_reasons.push_back(
+                            "stepped hybrid spread KV cache to asymmetric q8_0/q4_0 (estimated VRAM " +
+                            std::to_string(h_est.total_mib()) + " MiB)");
+                    } else if (e_q8_q4.kv_bytes < h_est.kv_bytes) {
+                        h_cur = std::move(q8_q4);
+                        h_est = e_q8_q4;
+                    }
+                }
+                if (!hybrid_fitted && request.allow_quantized_kv) {
+                    LaunchProfile q4 = h_cur;
+                    q4.cache_type_k = "q4_0";
+                    q4.cache_type_v = "q4_0";
+                    VramEstimate e_q4;
+                    if (try_hybrid_fit(q4, e_q4)) {
+                        h_cur = std::move(q4);
+                        h_est = e_q4;
+                        hybrid_fitted = true;
+                        h_reasons.push_back("stepped hybrid spread KV cache to q4_0/q4_0 (estimated VRAM " +
+                                            std::to_string(h_est.total_mib()) + " MiB)");
+                    } else if (e_q4.kv_bytes < h_est.kv_bytes) {
+                        h_cur = std::move(q4);
+                        h_est = e_q4;
+                    }
+                }
+                if (!hybrid_fitted && h_cur.speculative && h_est.recurrent_snapshots > 1 &&
+                    h_cur.speculative->draft_n_max && *h_cur.speculative->draft_n_max > 1) {
+                    const std::uint32_t orig_n = *h_cur.speculative->draft_n_max;
+                    for (std::uint32_t n = orig_n - 1; n >= 1; --n) {
+                        LaunchProfile probe = h_cur;
+                        probe.speculative->draft_n_max = n;
+                        VramEstimate e_probe;
+                        if (try_hybrid_fit(probe, e_probe)) {
+                            h_cur = std::move(probe);
+                            h_est = e_probe;
+                            hybrid_fitted = true;
+                            h_reasons.push_back("reduced speculative draft_n_max from " + std::to_string(orig_n) +
+                                                " to " + std::to_string(n) + " for hybrid discrete+iGPU spread");
+                            break;
+                        }
+                        if (e_probe.recurrent_bytes < h_est.recurrent_bytes) {
+                            h_cur = std::move(probe);
+                            h_est = e_probe;
+                        }
+                        if (n == 1) break;
+                    }
+                }
+                if (!hybrid_fitted && *h_cur.ctx_size > min_ctx) {
+                    const std::uint32_t prev_ctx = *h_cur.ctx_size;
+                    const auto candidates = context_stepdown_candidates(min_ctx, prev_ctx);
+                    if (!candidates.empty()) {
+                        LaunchProfile try_min = h_cur;
+                        try_min.ctx_size = candidates.front();
+                        VramEstimate est_min;
+                        if (try_hybrid_fit(try_min, est_min)) {
+                            std::size_t lo = 0;
+                            std::size_t hi = candidates.size() - 1;
+                            LaunchProfile best_prof = try_min;
+                            VramEstimate best_est = est_min;
+                            while (lo <= hi) {
+                                const std::size_t mid = lo + (hi - lo) / 2;
+                                LaunchProfile probe = h_cur;
+                                probe.ctx_size = candidates[mid];
+                                VramEstimate e_probe;
+                                if (try_hybrid_fit(probe, e_probe)) {
+                                    best_prof = std::move(probe);
+                                    best_est = e_probe;
+                                    lo = mid + 1;
+                                } else {
+                                    if (mid == 0) break;
+                                    hi = mid - 1;
+                                }
+                            }
+                            h_cur = std::move(best_prof);
+                            h_est = best_est;
+                            hybrid_fitted = true;
+                            h_reasons.push_back("stepped ctx_size down from " + std::to_string(prev_ctx) + " to " +
+                                                std::to_string(*h_cur.ctx_size) +
+                                                " (4096-aligned) to fit hybrid discrete+iGPU Vulkan pool (" +
+                                                std::to_string(h_est.total_mib()) + " MiB)");
+                        } else {
+                            h_cur = std::move(try_min);
+                            h_est = est_min;
+                        }
+                    }
+                }
+                if (!hybrid_fitted && h_cur.speculative &&
+                    std::find(h_cur.speculative->types.begin(), h_cur.speculative->types.end(), "draft-mtp") !=
+                        h_cur.speculative->types.end()) {
+                    LaunchProfile no_mtp = h_cur;
+                    if (model.has_ternary_tensors || model.has_one_bit_tensors) {
+                        SpeculativeSettings ngram;
+                        ngram.types = {"ngram-mod"};
+                        no_mtp.speculative = std::move(ngram);
+                    } else {
+                        no_mtp.speculative = std::nullopt;
+                    }
+                    VramEstimate e_no_mtp;
+                    if (try_hybrid_fit(no_mtp, e_no_mtp)) {
+                        h_cur = std::move(no_mtp);
+                        h_est = e_no_mtp;
+                        hybrid_fitted = true;
+                        h_reasons.emplace_back(
+                            "disabled draft-mtp to fit hybrid discrete+iGPU Vulkan pool without CPU spill");
+                        h_warnings.emplace_back("draft-mtp disabled due to tight hybrid discrete+iGPU VRAM budget");
+                    } else if (e_no_mtp.total_bytes < h_est.total_bytes) {
+                        h_cur = std::move(no_mtp);
+                        h_est = e_no_mtp;
+                    }
+                }
+
+                if (hybrid_fitted) {
+                    const std::uint64_t discrete_usable = total_usable_mib;
+                    const std::uint64_t discrete_needed = est.total_mib();
+                    plan.recommended_backend_hint = "vulkan";
+                    remove_env_key(plan.recommended_env, "GPU_MAX_ALLOC_PERCENT");
+                    apply_active_devices(hybrid_indices);
+                    profile = std::move(h_cur);
+                    est = h_est;
+
+                    const PerDeviceBytes split_bytes = estimate_per_device_bytes(est, profile, active_indices.size());
+                    std::vector<std::uint64_t> split_mib;
+                    split_mib.reserve(split_bytes.bytes.size());
+                    for (const std::uint64_t b : split_bytes.bytes) {
+                        split_mib.push_back(bytes_to_mib_ceil(b));
+                    }
+                    plan.reasons.push_back(
+                        "discrete GPU budget (" + std::to_string(discrete_usable) +
+                        " MiB) could not fit model (" + std::to_string(discrete_needed) +
+                        " MiB); enabled hybrid discrete+iGPU Vulkan spread (" + *profile.device +
+                        ", combined usable " + std::to_string(total_usable_mib) +
+                        " MiB, estimated per-device split: " + format_mib_list(split_mib) +
+                        " MiB, zero CPU spill)");
+                    for (auto& r : h_reasons) plan.reasons.push_back(std::move(r));
+                    for (auto& w : h_warnings) plan.warnings.push_back(std::move(w));
+                    plan.warnings.emplace_back(
+                        "hybrid discrete+iGPU Vulkan spread places overflow layers on integrated UMA (shared DDR "
+                        "memory bandwidth); discrete GPU fills first while avoiding CPU spill");
+                } else {
+                    const bool host_blocked =
+                        host.available_physical.is_known() &&
+                        !check_host_fit_for(hybrid_indices, h_est, h_cur);
+                    plan.reasons.push_back(
+                        "hybrid discrete+iGPU Vulkan pool (" + hybrid_dev_names + ", combined usable " +
+                        std::to_string(hybrid_total_usable_mib) +
+                        " MiB) could not fit model with zero CPU spill (minimum GPU need " +
+                        std::to_string(h_est.total_mib()) + " MiB" +
+                        (host_blocked ? ", exceeds available physical host RAM for UMA shard" : "") +
+                        "); falling back to discrete GPU offload");
+                }
+            }
         }
     }
 
@@ -1520,6 +2072,11 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
             profile.vram_budget_mib = std::nullopt;
             plan.recommended_env.clear();
             plan.recommended_backend_hint = "cpu";
+            active_indices.clear();
+            active_usable_mib.clear();
+            active_raw_mib.clear();
+            total_usable_mib = 0;
+            max_single_usable_mib = 0;
             est = evaluate(profile, std::nullopt);
             plan.fits_in_vram = false;
             plan.reasons.push_back("even 1 GPU layer exceeds VRAM budget (" + std::to_string(plan.budget_mib) +
@@ -1613,11 +2170,11 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
                 LaunchProfile all_cpu = with_n_cpu_moe(profile, model.block_count);
                 if (all_cpu.load_mode && *all_cpu.load_mode == "none") all_cpu.load_mode = "auto";
                 const VramEstimate est_all = evaluate(all_cpu, all_cpu.vram_budget_mib);
-                bool host_ok = check_host_fit(est_all, plan.uma_mode);
+                bool host_ok = check_host_fit_for(active_indices, est_all, all_cpu);
                 if (!host_ok && !all_cpu.no_repack.value_or(false)) {
                     LaunchProfile nr_probe = all_cpu;
                     nr_probe.no_repack = true;
-                    host_ok = check_host_fit(evaluate(nr_probe, nr_probe.vram_budget_mib), plan.uma_mode);
+                    host_ok = check_host_fit_for(active_indices, evaluate(nr_probe, nr_probe.vram_budget_mib), nr_probe);
                 }
                 if (host_ok && fits_vram(est_all, all_cpu)) {
                     const std::uint64_t all_spare = spare_vram_for_cache_mib(est_all, all_cpu);
@@ -1671,7 +2228,7 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
 
     // If host-resident weights exceed available host RAM (e.g. repackable MoE
     // experts or partial CPU layers), try no_repack to avoid private-RAM copies.
-    if (!check_host_fit(est, plan.uma_mode) && !profile.no_repack.value_or(false)) {
+    if (!check_host_fit_for(active_indices, est, profile) && !profile.no_repack.value_or(false)) {
         LaunchProfile nr = profile;
         nr.no_repack = true;
         if (nr.load_mode && *nr.load_mode == "none") nr.load_mode = "auto";
@@ -1724,13 +2281,58 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
     plan.moe_cache_mib = plan.profile.moe_cache_mib;
     plan.moe_cache_cpu_share = plan.profile.moe_cache_cpu_share;
     plan.estimate = evaluate(plan.profile, plan.profile.vram_budget_mib);
-    plan.fits_in_host_ram = check_host_fit(plan.estimate, plan.uma_mode);
+    plan.fits_in_host_ram = check_host_fit_for(active_indices, plan.estimate, plan.profile);
+
+    const bool all_layers_on_gpu =
+        plan.fits_in_vram &&
+        (model.block_count == 0 ||
+         (plan.estimate.gpu_layers > 0 &&
+          (!plan.profile.n_gpu_layers.has_value() || *plan.profile.n_gpu_layers < 0 ||
+           static_cast<std::uint32_t>(*plan.profile.n_gpu_layers) >= model.block_count)));
+    const bool mmproj_spilled_to_cpu =
+        !plan.profile.mmproj.empty() && plan.profile.mmproj_offload.has_value() && !*plan.profile.mmproj_offload;
+    plan.zero_cpu_spill = all_layers_on_gpu && plan.estimate.host_expert_bytes == 0 &&
+                          plan.estimate.host_kv_bytes == 0 && plan.estimate.host_recurrent_bytes == 0 &&
+                          plan.estimate.host_fit_overflow_bytes == 0 && !mmproj_spilled_to_cpu;
+
+    if (!active_indices.empty() && plan.recommended_backend_hint != "cpu" && plan.profile.device.has_value()) {
+        plan.recommended_devices.reserve(active_indices.size());
+        for (const std::size_t idx : active_indices) {
+            plan.recommended_devices.push_back(ggml_device_name_for(gpus, idx, plan.recommended_backend_hint));
+        }
+        if (active_indices.size() >= 2 && plan.fits_in_vram) {
+            MultiGpuSpreadRecommendation spread;
+            spread.active = true;
+            spread.hybrid_discrete_igpu = group_is_hybrid_discrete_igpu(gpus, active_indices);
+            spread.zero_cpu_spill = plan.zero_cpu_spill;
+            spread.backend = plan.recommended_backend_hint;
+            spread.llama_arg_device = *plan.profile.device;
+            spread.combined_gpu_vram_mib = total_usable_mib;
+            spread.recommended_devices = plan.recommended_devices;
+            const PerDeviceBytes per_dev =
+                estimate_per_device_bytes(plan.estimate, plan.profile, active_indices.size());
+            spread.per_device_split.reserve(active_indices.size());
+            for (std::size_t k = 0; k < active_indices.size(); ++k) {
+                const GpuDeviceInfo& g = gpus[active_indices[k]];
+                DeviceAllocationEstimate alloc;
+                alloc.device = plan.recommended_devices[k];
+                alloc.gpu_id = g.id.empty() ? ("gpu:" + std::to_string(active_indices[k])) : g.id;
+                alloc.name = g.name;
+                alloc.is_integrated_uma = g.is_integrated_uma;
+                alloc.budget_mib = k < active_usable_mib.size() ? active_usable_mib[k] : 0;
+                alloc.estimated_mib = k < per_dev.bytes.size() ? bytes_to_mib_ceil(per_dev.bytes[k]) : 0;
+                alloc.tensor_split_weight = k < per_dev.weights.size() ? per_dev.weights[k] : 0.0;
+                spread.total_estimated_mib = saturating_add(spread.total_estimated_mib, alloc.estimated_mib);
+                spread.per_device_split.push_back(std::move(alloc));
+            }
+            plan.multi_gpu_spread = std::move(spread);
+        }
+    }
 
     if (!plan.fits_in_host_ram && host.available_physical.is_known()) {
         const std::uint64_t avail_mib = host.available_physical.bytes_or(0) / kMiB;
         const std::uint64_t required_mib =
-            plan.uma_mode ? bytes_to_mib_ceil(saturating_add(plan.estimate.total_bytes, plan.estimate.host_resident_bytes))
-                          : plan.estimate.host_resident_mib();
+            bytes_to_mib_ceil(required_host_bytes_for(gpus, active_indices, plan.estimate, plan.profile));
         plan.warnings.push_back("estimated host RAM demand (" + std::to_string(required_mib) +
                                 " MiB) exceeds available physical RAM (" + std::to_string(avail_mib) + " MiB)");
     }
@@ -1862,14 +2464,53 @@ json::Object placement_plan_to_json(const PlacementPlan& plan) {
     warnings.reserve(plan.warnings.size());
     for (const auto& w : plan.warnings) warnings.emplace_back(w);
 
+    json::Array rec_devices;
+    rec_devices.reserve(plan.recommended_devices.size());
+    for (const auto& d : plan.recommended_devices) rec_devices.emplace_back(d);
+
+    json::Array spread_devices;
+    spread_devices.reserve(plan.multi_gpu_spread.recommended_devices.size());
+    for (const auto& d : plan.multi_gpu_spread.recommended_devices) spread_devices.emplace_back(d);
+
+    json::Array per_device_split;
+    per_device_split.reserve(plan.multi_gpu_spread.per_device_split.size());
+    for (const auto& dev : plan.multi_gpu_spread.per_device_split) {
+        per_device_split.emplace_back(json::Object{
+            {"device", dev.device},
+            {"gpu_id", dev.gpu_id},
+            {"name", dev.name},
+            {"is_integrated_uma", dev.is_integrated_uma},
+            {"budget_mib", dev.budget_mib},
+            {"estimated_mib", dev.estimated_mib},
+            {"tensor_split_weight", dev.tensor_split_weight}});
+    }
+
+    json::Object spread_obj;
+    spread_obj.set("active", plan.multi_gpu_spread.active);
+    spread_obj.set("hybrid_discrete_igpu", plan.multi_gpu_spread.hybrid_discrete_igpu);
+    spread_obj.set("zero_cpu_spill", plan.multi_gpu_spread.zero_cpu_spill);
+    spread_obj.set("backend", plan.multi_gpu_spread.backend.empty() ? json::Value(nullptr)
+                                                                    : json::Value(plan.multi_gpu_spread.backend));
+    spread_obj.set("llama_arg_device", plan.multi_gpu_spread.llama_arg_device.empty()
+                                           ? json::Value(nullptr)
+                                           : json::Value(plan.multi_gpu_spread.llama_arg_device));
+    spread_obj.set("combined_gpu_vram_mib", plan.multi_gpu_spread.combined_gpu_vram_mib);
+    spread_obj.set("total_estimated_mib", plan.multi_gpu_spread.total_estimated_mib);
+    spread_obj.set("recommended_devices", std::move(spread_devices));
+    spread_obj.set("per_device_split", std::move(per_device_split));
+
     json::Object out;
     out.set("budget_mib", plan.budget_mib);
+    out.set("combined_gpu_vram_mib", plan.combined_gpu_vram_mib);
     out.set("fits_in_vram", plan.fits_in_vram);
     out.set("fits_in_host_ram", plan.fits_in_host_ram);
     out.set("uma_mode", plan.uma_mode);
+    out.set("zero_cpu_spill", plan.zero_cpu_spill);
     out.set("requires_prism_runtime", plan.requires_prism_runtime);
     out.set("selected_vendor", to_string(plan.selected_vendor));
     out.set("recommended_backend_hint", plan.recommended_backend_hint);
+    out.set("recommended_devices", std::move(rec_devices));
+    out.set("multi_gpu_spread", std::move(spread_obj));
     if (plan.moe_cache_mib) out.set("moe_cache_mib", *plan.moe_cache_mib);
     if (plan.moe_cache_cpu_share) out.set("moe_cache_cpu_share", *plan.moe_cache_cpu_share);
     if (plan.recommended_threads) out.set("recommended_threads", *plan.recommended_threads);
@@ -1879,6 +2520,30 @@ json::Object placement_plan_to_json(const PlacementPlan& plan) {
     out.set("recommended_env", std::move(env_obj));
     out.set("reasons", std::move(reasons));
     out.set("warnings", std::move(warnings));
+    return out;
+}
+
+json::Object gpu_pool_summary_to_json(const GpuPoolSummary& pool) {
+    json::Array rec_devices;
+    rec_devices.reserve(pool.hybrid_vulkan_devices.size());
+    std::string llama_arg;
+    for (std::size_t i = 0; i < pool.hybrid_vulkan_devices.size(); ++i) {
+        if (i > 0) llama_arg.push_back(',');
+        llama_arg += pool.hybrid_vulkan_devices[i];
+        rec_devices.emplace_back(pool.hybrid_vulkan_devices[i]);
+    }
+    json::Object out;
+    out.set("discrete_vram_mib", pool.discrete_vram_mib);
+    out.set("integrated_uma_vram_mib", pool.integrated_uma_vram_mib);
+    out.set("combined_gpu_vram_mib", pool.combined_gpu_vram_mib);
+    out.set("discrete_free_vram_mib", pool.discrete_free_vram_mib);
+    out.set("integrated_uma_free_vram_mib", pool.integrated_uma_free_vram_mib);
+    out.set("combined_free_gpu_vram_mib", pool.combined_free_gpu_vram_mib);
+    out.set("discrete_gpu_count", static_cast<std::uint64_t>(pool.discrete_gpu_count));
+    out.set("integrated_uma_gpu_count", static_cast<std::uint64_t>(pool.integrated_uma_gpu_count));
+    out.set("hybrid_vulkan_pool_available", pool.hybrid_vulkan_pool_available);
+    out.set("recommended_devices", std::move(rec_devices));
+    out.set("llama_arg_device", llama_arg.empty() ? json::Value(nullptr) : json::Value(llama_arg));
     return out;
 }
 

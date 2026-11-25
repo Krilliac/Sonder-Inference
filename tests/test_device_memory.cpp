@@ -586,3 +586,142 @@ TEST_CASE("ROCm/KFD availability, visible-device filtering, and Windows AMD back
     CHECK(select_gpu_vram_budget_mib(hybrid_amd, "Vulkan0") == std::optional<std::uint64_t>(512 + 16384));
     CHECK(select_gpu_vram_budget_mib(hybrid_amd, "Vulkan1") == std::optional<std::uint64_t>(16384));
 }
+
+TEST_CASE("summarize_gpu_pools and combined_gpu_vram_mib model discrete-only, UMA-only, and hybrid Vulkan pools") {
+    constexpr std::uint64_t kMiB = 1024ull * 1024ull;
+    constexpr std::uint64_t kGiB = 1024ull * kMiB;
+
+    auto make_host = [&](std::uint64_t total_gib, std::uint64_t avail_gib) {
+        HostMemory h;
+        h.total_physical = MemoryReading::known(total_gib * kGiB);
+        h.available_physical = MemoryReading::known(avail_gib * kGiB);
+        h.source = "test";
+        return h;
+    };
+
+    GpuDeviceInfo rx9060xt;
+    rx9060xt.id = "gpu:0";
+    rx9060xt.name = "AMD Radeon RX 9060 XT";
+    rx9060xt.vendor = GpuVendor::amd;
+    rx9060xt.vendor_id = 0x1002u;
+    rx9060xt.device_id = 0x7590u;
+    rx9060xt.dedicated_total = MemoryReading::known(16288ull * kMiB);  // ~15.9 GiB
+    rx9060xt.dedicated_free = MemoryReading::known(15900ull * kMiB);
+    rx9060xt.shared_total = MemoryReading::known(24ull * kGiB);
+    rx9060xt.is_integrated_uma = false;
+    rx9060xt.backend_hint = "vulkan";
+    rx9060xt.source = "dxgi";
+
+    GpuDeviceInfo radeon780m;
+    radeon780m.id = "gpu:1";
+    radeon780m.name = "AMD Radeon 780M Graphics";
+    radeon780m.vendor = GpuVendor::amd;
+    radeon780m.vendor_id = 0x1002u;
+    radeon780m.device_id = 0x15BFu;
+    radeon780m.dedicated_total = MemoryReading::known(512ull * kMiB);
+    radeon780m.shared_total = MemoryReading::known(32051ull * kMiB);   // total 32563 MiB (~31.8 GiB)
+    radeon780m.dedicated_free = MemoryReading::known(31800ull * kMiB);
+    radeon780m.is_integrated_uma = true;
+    radeon780m.backend_hint = "vulkan";
+    radeon780m.source = "dxgi";
+
+    // 1. Empty GPU list.
+    {
+        const GpuPoolSummary empty = summarize_gpu_pools({}, make_host(48, 44));
+        CHECK(empty.discrete_vram_mib == 0u);
+        CHECK(empty.integrated_uma_vram_mib == 0u);
+        CHECK(empty.combined_gpu_vram_mib == 0u);
+        CHECK(empty.combined_free_gpu_vram_mib == 0u);
+        CHECK(empty.discrete_gpu_count == 0u);
+        CHECK(empty.integrated_uma_gpu_count == 0u);
+        CHECK_FALSE(empty.hybrid_vulkan_pool_available);
+        CHECK(empty.hybrid_vulkan_devices.empty());
+        CHECK(combined_gpu_vram_mib({}, false, make_host(48, 44)) == 0u);
+    }
+
+    // 2. Discrete-only host (no integrated UMA).
+    {
+        const GpuPoolSummary disc = summarize_gpu_pools({rx9060xt}, make_host(48, 44));
+        CHECK(disc.discrete_vram_mib == 16288u);
+        CHECK(disc.discrete_free_vram_mib == 15900u);
+        CHECK(disc.integrated_uma_vram_mib == 0u);
+        CHECK(disc.combined_gpu_vram_mib == 16288u);
+        CHECK(disc.combined_free_gpu_vram_mib == 15900u);
+        CHECK(disc.discrete_gpu_count == 1u);
+        CHECK(disc.integrated_uma_gpu_count == 0u);
+        CHECK_FALSE(disc.hybrid_vulkan_pool_available);
+        CHECK(disc.hybrid_vulkan_devices.empty());
+        CHECK(combined_gpu_vram_mib({rx9060xt}, false, make_host(48, 44)) == 16288u);
+        CHECK(combined_gpu_vram_mib({rx9060xt}, true, make_host(48, 44)) == 15900u);
+    }
+
+    // 3. Integrated UMA-only host.
+    {
+        const GpuPoolSummary uma = summarize_gpu_pools({radeon780m}, make_host(48, 44));
+        CHECK(uma.discrete_vram_mib == 0u);
+        CHECK(uma.integrated_uma_vram_mib == 32563u);
+        CHECK(uma.integrated_uma_free_vram_mib == 31800u);
+        CHECK(uma.combined_gpu_vram_mib == 32563u);
+        CHECK(uma.combined_free_gpu_vram_mib == 31800u);
+        CHECK(uma.discrete_gpu_count == 0u);
+        CHECK(uma.integrated_uma_gpu_count == 1u);
+        CHECK_FALSE(uma.hybrid_vulkan_pool_available);
+        CHECK(uma.hybrid_vulkan_devices.empty());
+    }
+
+    // 4. Node1 hybrid discrete RX 9060 XT (Vulkan0) + integrated Radeon 780M (Vulkan1, UMA).
+    {
+        const std::vector<GpuDeviceInfo> node1{rx9060xt, radeon780m};
+        const HostMemory host48 = make_host(48, 44);
+        const GpuPoolSummary pool = summarize_gpu_pools(node1, host48);
+        CHECK(pool.discrete_vram_mib == 16288u);
+        CHECK(pool.integrated_uma_vram_mib == 32563u);
+        CHECK(pool.combined_gpu_vram_mib == 16288u + 32563u);
+        CHECK(pool.discrete_free_vram_mib == 15900u);
+        CHECK(pool.integrated_uma_free_vram_mib == 31800u);
+        CHECK(pool.combined_free_gpu_vram_mib == 15900u + 31800u);
+        CHECK(pool.discrete_gpu_count == 1u);
+        CHECK(pool.integrated_uma_gpu_count == 1u);
+        CHECK(pool.hybrid_vulkan_pool_available);
+        CHECK(pool.hybrid_vulkan_devices == std::vector<std::string>{"Vulkan0", "Vulkan1"});
+        CHECK(combined_gpu_vram_mib(node1, false, host48) == 16288u + 32563u);
+        CHECK(combined_gpu_vram_mib(node1, true, host48) == 15900u + 31800u);
+    }
+
+    // 5. Reversed adapter order places discrete GPU first in hybrid_vulkan_devices.
+    {
+        GpuDeviceInfo igpu0 = radeon780m;
+        igpu0.id = "gpu:0";
+        GpuDeviceInfo dgpu1 = rx9060xt;
+        dgpu1.id = "gpu:1";
+        const GpuPoolSummary pool = summarize_gpu_pools({igpu0, dgpu1}, make_host(48, 44));
+        CHECK(pool.hybrid_vulkan_pool_available);
+        CHECK(pool.hybrid_vulkan_devices == std::vector<std::string>{"Vulkan1", "Vulkan0"});
+    }
+
+    // 6. Tight host RAM caps UMA contribution in combined_gpu_vram_mib (both total and free).
+    {
+        const std::vector<GpuDeviceInfo> node1{rx9060xt, radeon780m};
+        const HostMemory tight_host = make_host(24, 16);
+        const GpuPoolSummary capped = summarize_gpu_pools(node1, tight_host);
+        CHECK(capped.discrete_vram_mib == 16288u);
+        CHECK(capped.integrated_uma_vram_mib == 24u * 1024u);
+        CHECK(capped.combined_gpu_vram_mib == 16288u + 24u * 1024u);
+        CHECK(capped.integrated_uma_free_vram_mib == 16u * 1024u);
+        CHECK(capped.combined_free_gpu_vram_mib == 15900u + 16u * 1024u);
+        CHECK(combined_gpu_vram_mib(node1, false, tight_host) == 16288u + 24u * 1024u);
+        CHECK(combined_gpu_vram_mib(node1, true, tight_host) == 15900u + 16u * 1024u);
+    }
+
+    // 7. TCC-mode discrete GPU and Apple Metal GPU are excluded from Vulkan hybrid spread.
+    {
+        GpuDeviceInfo tcc_gpu = rx9060xt;
+        tcc_gpu.vendor = GpuVendor::nvidia;
+        tcc_gpu.vendor_id = 0x10DEu;
+        tcc_gpu.is_tcc_mode = true;
+        tcc_gpu.backend_hint = "cuda";
+        const GpuPoolSummary tcc_pool = summarize_gpu_pools({tcc_gpu, radeon780m}, make_host(48, 44));
+        CHECK_FALSE(tcc_pool.hybrid_vulkan_pool_available);
+        CHECK(tcc_pool.hybrid_vulkan_devices.empty());
+    }
+}
