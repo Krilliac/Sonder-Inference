@@ -325,6 +325,10 @@ inline const CommandSpec& tune_command() {
         {{"Calibration", {
             {"executable", OptionKind::value, "PATH", "trusted llama-server executable"},
             {"model", OptionKind::value, "GGUF", "local single-file model"},
+            {"draft-model", OptionKind::value, "GGUF", "optional local single-file external draft model"},
+            {"target-model-sha256", OptionKind::value, "HEX", "expected 64-hex SHA-256 digest of --model"},
+            {"draft-model-sha256", OptionKind::value, "HEX", "expected 64-hex SHA-256 digest of --draft-model"},
+            {"trained-block-limit", OptionKind::value, "N", "maximum trained block/draft length of --draft-model (1 to 16)"},
             {"mmproj", OptionKind::value, "PATH", "optional multimodal projector"},
             {"out", OptionKind::value, "PATH", "spawn configuration and results (default tuned.json)"},
             {"budget-minutes", OptionKind::value, "N", "wall-clock work budget, 0.1 to 1440 (default 20)"},

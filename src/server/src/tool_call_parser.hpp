@@ -12,6 +12,7 @@
 #include <variant>
 #include <vector>
 
+#include "json_schema_gbnf.hpp"
 #include "openai.hpp"
 #include "sonder/inference/backend.hpp"
 #include "sonder/inference/error.hpp"
@@ -75,13 +76,50 @@ inline constexpr std::size_t kMaxToolCallPayloadBytes = 256u * 1024u;
 
 // Formats tool definitions cleanly as a system instruction block for backends
 // without native tool-template passthrough.
-[[nodiscard]] std::string format_tools_system_prompt(const std::vector<ToolDefinition>& tools,
-                                                     const std::optional<ToolChoice>& choice);
+[[nodiscard]] std::string format_tools_system_prompt(
+    const std::vector<ToolDefinition>& tools, const std::optional<ToolChoice>& choice,
+    std::optional<bool> parallel_tool_calls = std::nullopt);
+
+// Validates that any active tool marked `strict == true` has a parameters schema
+// that compiles cleanly via `engine` (fail-closed before generation).
+[[nodiscard]] Status validate_strict_tool_schemas(
+    const std::vector<ToolDefinition>& tools, const std::optional<ToolChoice>& choice,
+    const StructuredGrammarEngine& engine = default_structured_grammar_engine());
 
 // Builds a GBNF grammar constraining output to `<tool_call>{"name":...,"arguments":...}</tool_call>`
 // when tool_choice is `required` or a specific named `function`.
+// Fails closed with invalid_argument if a `strict == true` tool schema cannot be compiled.
 [[nodiscard]] Result<std::string> build_tool_call_gbnf(const std::vector<ToolDefinition>& tools,
                                                        const ToolChoice& choice);
+
+// Compiled + cached counterpart for `build_tool_call_gbnf`, keyed by normalized
+// tool definitions/parameters, choice mode/function, tokenizer identity, and engine.
+[[nodiscard]] Result<std::shared_ptr<const CompiledGrammar>> build_tool_call_grammar(
+    const std::vector<ToolDefinition>& tools, const ToolChoice& choice,
+    CompiledGrammarCache* cache = nullptr, std::string_view tokenizer_identity = "default",
+    const StructuredGrammarEngine& engine = default_structured_grammar_engine());
+
+struct PreparedStructuredGrammar {
+    std::shared_ptr<const CompiledGrammar> compiled;
+    std::string grammar;
+};
+
+// Shared structured-grammar resolution helper used by both Chat and Responses handlers.
+// Handles json_object, json_schema, explicit raw GBNF grammar, and forced tool_call synthesis.
+[[nodiscard]] Result<PreparedStructuredGrammar> resolve_structured_grammar(
+    std::string_view schema_param_prefix,
+    std::string_view explicit_grammar,
+    const std::optional<std::string>& response_format_type,
+    const std::optional<json::Value>& pending_response_schema,
+    const std::optional<std::string>& response_format_schema,
+    const std::vector<ToolDefinition>& tools,
+    const std::optional<ToolChoice>& tool_choice,
+    bool backend_supports_structured_output,
+    bool backend_native_tools,
+    std::string_view backend_name,
+    std::string_view tokenizer_identity,
+    CompiledGrammarCache* cache = nullptr,
+    const StructuredGrammarEngine& engine = default_structured_grammar_engine());
 
 // Incremental streaming parser recognizing `<tool_call>...</tool_call>`
 // (Qwen/Bonsai/Hermes) and fenced ```tool_call ... ``` blocks across arbitrary
@@ -100,7 +138,7 @@ struct ToolCallStreamOutput {
 
 class ToolCallStreamParser {
 public:
-    explicit ToolCallStreamParser(std::string id_prefix = "call_");
+    explicit ToolCallStreamParser(std::string id_prefix = "call_", bool allow_parallel = true);
 
     [[nodiscard]] ToolCallStreamOutput feed(std::string_view chunk);
     [[nodiscard]] ToolCallStreamOutput flush();
@@ -119,6 +157,7 @@ private:
     std::string next_call_id();
 
     std::string id_prefix_;
+    bool allow_parallel_ = true;
     State state_ = State::text;
     std::string buf_;
     std::string raw_open_;
@@ -134,7 +173,8 @@ struct ExtractedToolOutput {
     std::vector<ToolCall> tool_calls;
 };
 
-[[nodiscard]] ExtractedToolOutput extract_tool_calls(std::string_view full_text, std::string id_prefix = "call_");
+[[nodiscard]] ExtractedToolOutput extract_tool_calls(std::string_view full_text, std::string id_prefix = "call_",
+                                                     bool allow_parallel = true);
 
 // Spec-compliant OpenAI logprobs JSON formatters.
 [[nodiscard]] json::Object chat_token_logprob_json(const TokenLogprob& lp);

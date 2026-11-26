@@ -125,7 +125,7 @@ json::Object build_response_object(const std::string& resp_id, std::int64_t crea
     return obj;
 }
 
-std::optional<ApiError> read_text_format(const json::Object& body, ResponsesJob& job) {
+std::optional<ApiError> read_text_format(const json::Object& body, ResponsesJob& job, StructuredParseMode schema_mode) {
     const json::Value* text_v = body.find("text");
     if (!present(text_v)) {
         return std::nullopt;
@@ -149,12 +149,15 @@ std::optional<ApiError> read_text_format(const json::Object& body, ResponsesJob&
         return std::nullopt;
     }
     if (type == "json_object") {
-        auto compiled = default_structured_grammar_engine().compile_json_object();
-        if (!compiled.ok()) {
-            return bad("invalid_request", compiled.status().message(), "text.format");
-        }
-        job.grammar = std::move(compiled.value().gbnf);
         job.response_format_type = "json_object";
+        if (schema_mode == StructuredParseMode::compile_eagerly) {
+            auto compiled = default_structured_grammar_engine().compile_json_object();
+            if (!compiled.ok()) {
+                return bad("invalid_request", compiled.status().message(), "text.format");
+            }
+            job.compiled_grammar = std::make_shared<const CompiledGrammar>(std::move(compiled).value());
+            job.grammar = job.compiled_grammar->gbnf;
+        }
         return std::nullopt;
     }
     if (type == "json_schema") {
@@ -167,14 +170,18 @@ std::optional<ApiError> read_text_format(const json::Object& body, ResponsesJob&
         if (!present(schema_v) || !schema_v->is_object()) {
             return bad("invalid_request", "text.format.schema must be a JSON object", "text.format.schema");
         }
-        auto compiled = default_structured_grammar_engine().compile_json_schema(*schema_v);
-        if (!compiled.ok()) {
-            return bad("invalid_request", "invalid text.format.schema: " + compiled.status().message(),
-                       "text.format.schema");
-        }
-        job.grammar = std::move(compiled.value().gbnf);
         job.response_format_type = "json_schema";
         job.response_format_schema = schema_v->dump();
+        job.pending_response_schema = *schema_v;
+        if (schema_mode == StructuredParseMode::compile_eagerly) {
+            auto compiled = default_structured_grammar_engine().compile_json_schema(*schema_v);
+            if (!compiled.ok()) {
+                return bad("invalid_request", "invalid text.format.schema: " + compiled.status().message(),
+                           "text.format.schema");
+            }
+            job.compiled_grammar = std::make_shared<const CompiledGrammar>(std::move(compiled).value());
+            job.grammar = job.compiled_grammar->gbnf;
+        }
         return std::nullopt;
     }
     return bad("unsupported_parameter",
@@ -196,6 +203,13 @@ std::size_t ResponseHistoryStore::estimate_entry_bytes(const Entry& e) noexcept 
         }
         for (const auto& blob : m.media) {
             total += blob.mime_type.size() + blob.bytes.size() + 16;
+        }
+        for (const auto& part : m.parts) {
+            if (const auto* tp = std::get_if<TextContentPart>(&part)) {
+                total += tp->text.size() + 8;
+            } else if (const auto* ip = std::get_if<ImageContentPart>(&part)) {
+                total += ip->media.mime_type.size() + ip->media.bytes.size() + 16;
+            }
         }
     }
     return total;
@@ -259,6 +273,13 @@ void ResponseHistoryStore::put(Entry entry) {
     // Strip raw binary media blobs from retained history to prevent O(N^2) RAM
     // amplification across chained previous_response_id turns.
     for (auto& m : entry.messages) {
+        if (!m.parts.empty()) {
+            m.content = message_text_content(m);
+            std::erase_if(m.parts, [](const ContentPart& part) {
+                return std::holds_alternative<ImageContentPart>(part);
+            });
+            m.parts.shrink_to_fit();
+        }
         m.media.clear();
         m.media.shrink_to_fit();
     }
@@ -346,6 +367,11 @@ std::string derive_responses_caller_scope(const RequestHead& head, const Correla
 }
 
 std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view body_text) {
+    return parse_responses_request_with_mode(body_text, StructuredParseMode::compile_eagerly);
+}
+
+std::variant<ResponsesJob, ApiError> parse_responses_request_with_mode(std::string_view body_text,
+                                                                       StructuredParseMode schema_mode) {
     auto parsed = json::parse(body_text, json::ParseLimits{128, 65536});
     if (!parsed.ok()) {
         return bad("invalid_json", "request body is not valid JSON: " + parsed.status().message());
@@ -411,6 +437,12 @@ std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view bo
             return *e;
         }
         job.tool_choice = std::move(tc);
+    }
+    if (const json::Value* ptc = body.find("parallel_tool_calls"); present(ptc)) {
+        if (!ptc->is_bool()) {
+            return bad("invalid_request", "parallel_tool_calls must be a boolean", "parallel_tool_calls");
+        }
+        job.parallel_tool_calls = ptc->as_bool();
     }
 
     const json::Value* input = body.find("input");
@@ -520,6 +552,7 @@ std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view bo
                             return bad("invalid_request", pwhere + ".text must be a string", pwhere + ".text");
                         }
                         msg.content += tv->as_string();
+                        msg.parts.push_back(TextContentPart{tv->as_string()});
                     } else if (pt == "input_image" || pt == "image_url") {
                         const json::Value* iu = part.find("image_url");
                         std::string_view url_str;
@@ -542,7 +575,9 @@ std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view bo
                         if (auto* err = std::get_if<ApiError>(&media)) {
                             return *err;
                         }
-                        msg.media.push_back(std::move(std::get<MediaContent>(media)));
+                        MediaContent parsed_media = std::move(std::get<MediaContent>(media));
+                        msg.parts.push_back(ImageContentPart{parsed_media});
+                        msg.media.push_back(std::move(parsed_media));
                     } else {
                         return bad("unsupported_parameter", pwhere + ".type '" + pt + "' is not supported",
                                    pwhere + ".type");
@@ -557,7 +592,7 @@ std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view bo
         return bad("invalid_request", "input must be a string or a non-empty array of input items", "input");
     }
 
-    if (auto e = read_text_format(body, job)) {
+    if (auto e = read_text_format(body, job, schema_mode)) {
         return *e;
     }
 
@@ -694,10 +729,41 @@ std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view bo
     return job;
 }
 
+std::optional<ApiError> prepare_responses_grammar(
+    ResponsesJob& job, std::string_view tokenizer_identity,
+    bool backend_supports_structured_output, bool backend_native_tools,
+    std::string_view backend_name, CompiledGrammarCache* cache,
+    const StructuredGrammarEngine& engine) {
+    auto resolved = resolve_structured_grammar(
+        "text.format.schema", job.grammar, job.response_format_type,
+        job.pending_response_schema, job.response_format_schema, job.tools, job.tool_choice,
+        backend_supports_structured_output, backend_native_tools, backend_name, tokenizer_identity,
+        cache, engine);
+    if (!resolved.ok()) {
+        const std::string code = resolved.status().code() == ErrorCode::unsupported
+                                     ? "unsupported_parameter"
+                                     : "invalid_request";
+        const bool from_tools = !job.response_format_type.has_value() && job.grammar.empty() && !job.tools.empty();
+        const std::optional<std::string> param =
+            from_tools
+                ? std::optional<std::string>("tools")
+                : (job.response_format_type && *job.response_format_type == "json_schema"
+                       ? std::optional<std::string>("text.format.schema")
+                       : (job.response_format_type ? std::optional<std::string>("text.format") : std::nullopt));
+        const std::string msg =
+            from_tools ? resolved.status().message() : ("invalid text.format.schema: " + resolved.status().message());
+        return make_error(400, code, msg, param);
+    }
+    job.compiled_grammar = std::move(resolved.value().compiled);
+    job.grammar = std::move(resolved.value().grammar);
+    return std::nullopt;
+}
+
 void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlation& corr, const std::string& model,
                        const std::string& backend, const std::shared_ptr<Session>& session,
                        ResponseHistoryStore& history, bool backend_native_tools, bool backend_supports_multimodal,
-                       std::string_view caller_scope) {
+                       std::string_view caller_scope, CompiledGrammarCache* grammar_cache,
+                       std::string_view tokenizer_identity, bool backend_supports_structured_output) {
     const bool store_enabled =
         !ex.options.disable_response_store && ex.options.response_history_ttl.count() > 0 && history.ttl().count() > 0;
     // 1. Assemble conversation history from optional previous_response_id.
@@ -733,7 +799,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     }
     if (job.instructions && !job.instructions->empty()) {
         if (!conversation.empty() && conversation.front().role == "system") {
-            conversation.front().content = *job.instructions;
+            conversation.front() = ChatMessage{"system", *job.instructions};
         } else {
             conversation.insert(conversation.begin(), ChatMessage{"system", *job.instructions});
         }
@@ -752,7 +818,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     }
     std::size_t accumulated_images = 0;
     for (const auto& m : conversation) {
-        accumulated_images += m.media.size();
+        accumulated_images += count_message_images(m);
     }
     if (accumulated_images > 8u) {
         ex.leave_inflight();
@@ -779,9 +845,9 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     const bool tool_choice_none = job.tool_choice && job.tool_choice->mode == ToolChoiceMode::none;
     const bool parse_text_tools = !job.tools.empty() && !backend_native_tools && !tool_choice_none;
     if (parse_text_tools) {
-        const std::string tool_prompt = format_tools_system_prompt(job.tools, job.tool_choice);
+        const std::string tool_prompt = format_tools_system_prompt(job.tools, job.tool_choice, job.parallel_tool_calls);
         if (!conversation.empty() && conversation.front().role == "system") {
-            conversation.front().content += "\n\n" + tool_prompt;
+            append_chat_message_text(conversation.front(), "\n\n" + tool_prompt);
         } else {
             conversation.insert(conversation.begin(), ChatMessage{"system", tool_prompt});
         }
@@ -810,11 +876,47 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     ro.thinking = job.thinking;
     ro.separate_reasoning = true;
     ro.retain_text = true;  // retain for response.completed + previous_response_id history
-    ro.grammar = job.grammar;
+    std::shared_ptr<const CompiledGrammar> compiled_grammar = job.compiled_grammar;
+    std::string fallback_grammar = job.grammar;
+    if (!compiled_grammar && grammar_cache != nullptr &&
+        (job.response_format_type.has_value() || (!job.tools.empty() && job.tool_choice))) {
+        const std::string fallback_tok =
+            tokenizer_identity.empty() ? build_tokenizer_identity_key(backend, model) : std::string(tokenizer_identity);
+        auto resolved = resolve_structured_grammar(
+            "text.format.schema", job.grammar, job.response_format_type,
+            job.pending_response_schema, job.response_format_schema, job.tools, job.tool_choice,
+            backend_supports_structured_output, backend_native_tools, backend, fallback_tok, grammar_cache);
+        if (!resolved.ok()) {
+            ex.leave_inflight();
+            session->close();
+            const std::string code = resolved.status().code() == ErrorCode::unsupported
+                                         ? "unsupported_parameter"
+                                         : "invalid_request";
+            const bool from_tools =
+                !job.response_format_type.has_value() && job.grammar.empty() && !job.tools.empty();
+            ex.send_error(make_error(400, code, resolved.status().message(),
+                                     from_tools ? "tools" : "text.format"));
+            return;
+        }
+        compiled_grammar = std::move(resolved.value().compiled);
+        fallback_grammar = std::move(resolved.value().grammar);
+    }
+    auto matcher_res = bind_request_grammar_matcher(compiled_grammar, ro.grammar, fallback_grammar);
+    if (!matcher_res.ok()) {
+        ex.leave_inflight();
+        session->close();
+        const std::string code = matcher_res.status().code() == ErrorCode::unsupported
+                                     ? "unsupported_parameter"
+                                     : "invalid_request";
+        ex.send_error(make_error(400, code, matcher_res.status().message(), "text.format"));
+        return;
+    }
+    std::unique_ptr<GrammarMatcher> grammar_matcher = std::move(matcher_res).value();
     ro.response_format_type = job.response_format_type;
     ro.response_format_schema = job.response_format_schema;
     ro.tools = job.tools;
     ro.tool_choice = job.tool_choice;
+    ro.parallel_tool_calls = job.parallel_tool_calls;
     ro.priority_class = priority;
     ro.preserve_numeric_priority = corr.numeric_priority;
     if (deadline_ms) ro.deadline = deadline;
@@ -950,7 +1052,9 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
         ro.admission = ticket;
     }
 
-    ToolCallStreamParser stream_parser("call_" + *ro.request_id + "_");
+    const bool allow_parallel = job.parallel_tool_calls.value_or(true);
+    ToolCallStreamParser stream_parser("call_" + *ro.request_id + "_", allow_parallel);
+    std::optional<std::uint32_t> single_native_tool_index;
     std::string streamed_visible_text;
     std::vector<ToolCall> streamed_tool_calls;
 
@@ -1015,9 +1119,19 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     TokenCallback on_chunk;
     if (job.stream) {
         on_chunk = [&](const TokenChunk& chunk) -> bool {
+            if (grammar_matcher && !chunk.text.empty()) {
+                (void)grammar_matcher->accept_chunk(chunk.text);
+            }
             for (const auto& tcd : chunk.tool_call_deltas) {
                 if (tcd.index >= 64u) {
                     continue;
+                }
+                if (!allow_parallel) {
+                    if (!single_native_tool_index) {
+                        single_native_tool_index = tcd.index;
+                    } else if (tcd.index != *single_native_tool_index) {
+                        continue;
+                    }
                 }
                 if (tcd.index >= streamed_tool_calls.size()) {
                     streamed_tool_calls.resize(static_cast<std::size_t>(tcd.index) + 1);
@@ -1097,6 +1211,12 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     }
 
     const GenerationResult& r = result.value();
+    if (grammar_matcher) {
+        if (!job.stream && !r.text.empty()) {
+            (void)grammar_matcher->accept_chunk(r.text);
+        }
+        grammar_matcher->mark_finished();
+    }
     std::string final_visible;
     std::vector<ToolCall> final_calls;
     if (job.stream) {
@@ -1120,6 +1240,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
         final_visible = r.text;
         for (const auto& tc : r.tool_calls) {
             if (tc.name.empty() && tc.arguments_json.empty()) continue;
+            if (!allow_parallel && !final_calls.empty()) break;
             ToolCall normalized = tc;
             if (normalized.id.empty()) {
                 normalized.id = "call_" + *ro.request_id + "_" + std::to_string(final_calls.size());
@@ -1127,7 +1248,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
             final_calls.push_back(std::move(normalized));
         }
     } else if (parse_text_tools) {
-        ExtractedToolOutput ext = extract_tool_calls(r.text, "call_" + *ro.request_id + "_");
+        ExtractedToolOutput ext = extract_tool_calls(r.text, "call_" + *ro.request_id + "_", allow_parallel);
         final_visible = std::move(ext.visible_text);
         final_calls = std::move(ext.tool_calls);
     } else {

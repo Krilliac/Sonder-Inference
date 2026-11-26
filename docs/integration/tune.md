@@ -35,6 +35,10 @@ Options:
 |---|---|
 | `--executable PATH` | Required trusted llama-server executable. Paths with spaces must be quoted. |
 | `--model GGUF` | Required single-file GGUF v2/v3 model. |
+| `--draft-model GGUF` | Optional local single-file external draft GGUF; required when calibrating external draft modes (`dflash`, `draft-dflash`, `draft-eagle3`, `draft`, `draft-simple`, `draft-dspark`). Emitted as `--spec-draft-model` in generated spawn configs and validated for tokenizer/architecture/digest compatibility before any probe runs. |
+| `--target-model-sha256 HEX` | Optional 64-hex SHA-256 expectation verified against `--model` before probing. |
+| `--draft-model-sha256 HEX` | Optional 64-hex SHA-256 expectation verified against `--draft-model` before probing. |
+| `--trained-block-limit N` | Optional maximum trained draft/block length (`1` to `16`) enforced against `grid.mtp` before probing. |
 | `--mmproj PATH` | Load the optional projector in every candidate and include it in the output. Workloads remain text-only. |
 | `--out PATH` | Output spawn config, default `tuned.json`. Parent directory must exist. |
 | `--budget-minutes N` | Work budget, default 20; accepts decimals from 0.1 to 1440. |

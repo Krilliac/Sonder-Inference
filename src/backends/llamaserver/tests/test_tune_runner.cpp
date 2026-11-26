@@ -681,6 +681,7 @@ TEST_CASE("tune runner UMA qualification checks host pool ceiling instead of dis
     // 6. dflash / draft-dflash speculation with mtp=8 emits draft flags and ignores unused nextn log warnings.
     for (const auto *spec_name : {"dflash", "draft-dflash"}) {
         Fixture f;
+        f.options.draft_model = "fake-draft-model.gguf";
         f.candidate = {{"f8_e4m3", "f8_e4m3"}, 65536, 1024, 8, spec_name, 0.5, "on"};
         const auto base_exchange = f.dependencies.exchange;
         f.dependencies.exchange = [&](std::uint16_t port, const std::string &method, const std::string &path,
@@ -696,6 +697,10 @@ TEST_CASE("tune runner UMA qualification checks host pool ceiling instead of dis
         REQUIRE_MESSAGE(res.verdict == tune::Verdict::clean, res.detail);
         REQUIRE(f.state->specs.size() == 1);
         const auto &argv = f.state->specs[0].arguments;
+        const auto draft_it = std::find(argv.begin(), argv.end(), "--spec-draft-model");
+        REQUIRE(draft_it != argv.end());
+        REQUIRE(std::next(draft_it) != argv.end());
+        CHECK(*std::next(draft_it) == "fake-draft-model.gguf");
         const auto spec_it = std::find(argv.begin(), argv.end(), "--spec-type");
         REQUIRE(spec_it != argv.end());
         REQUIRE(std::next(spec_it) != argv.end());

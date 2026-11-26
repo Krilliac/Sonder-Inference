@@ -21,8 +21,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from httpbench import __version__  # noqa: E402
 from httpbench.client import Target, parse_header  # noqa: E402
 from httpbench.gpumem import GpuSampler, expected_clean_shared  # noqa: E402
+from httpbench.observation import validate_sha256_hex  # noqa: E402
 from httpbench.report import compare, render_markdown  # noqa: E402
-from httpbench.runner import BUILTIN_SCENARIOS, Runner, default_out_prefix, load_config  # noqa: E402
+from httpbench.runner import (ACCEPTANCE_MATRIX_SCENARIOS, BUILTIN_SCENARIOS, Runner,  # noqa: E402
+                              default_out_prefix, load_config)
 
 
 def _csv_ints(s: str) -> list[int]:
@@ -82,6 +84,20 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--metrics-url", help="full child /metrics URL, scraped around each request (no auth forwarded)")
     r.add_argument("--child-log", metavar="PATH", help="count new child log events during the run")
     r.add_argument("--timeout", type=float, default=900.0, help="per-request socket timeout, seconds")
+    p = r.add_argument_group("reproducible provenance")
+    p.add_argument("--source-commit", help="override git source commit SHA in provenance")
+    p.add_argument("--upstream-revision", help="override upstream engine revision or digest in provenance")
+    p.add_argument("--upstream-exe", metavar="PATH",
+                   help="compute SHA-256 of the upstream server binary for provenance")
+    p.add_argument("--model-file", metavar="PATH", help="compute SHA-256 of the target model GGUF for provenance")
+    p.add_argument("--model-sha256", help="explicit 64-hex SHA-256 of the target model")
+    p.add_argument("--draft-file", metavar="PATH", help="compute SHA-256 of the standalone draft model for provenance")
+    p.add_argument("--draft-sha256", help="explicit 64-hex SHA-256 of the draft model, or 'none'")
+    p.add_argument("--corpus-revision", help="override deterministic scenario corpus revision string")
+    p.add_argument("--resolved-settings", help="JSON object merged into provenance.resolved_settings")
+    p.add_argument("--effective-settings", help="JSON object merged into provenance.effective_settings")
+    p.add_argument("--require-provenance", action="store_true",
+                   help="fail the run unless source_commit, upstream_revision_or_digest, model_sha256, and draft_sha256 are known")
     g = r.add_argument_group("GPU memory (Windows PDH)")
     g.add_argument("--pid", type=int, help="server process id to sample")
     g.add_argument("--process-name", help="server image name to sample, e.g. llama-server")
@@ -99,7 +115,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--out", help="also write the markdown diff here")
     c.add_argument("--json", action="store_true", help="print rows as JSON instead of markdown")
 
-    sub.add_parser("scenarios", help="print the built-in scenario config as JSON")
+    sc_cmd = sub.add_parser("scenarios", help="print the built-in scenario config as JSON")
+    sc_cmd.add_argument("--preset", choices=["all", "acceptance"], default="all",
+                        help="scenario preset to print (default: all)")
     return ap
 
 
@@ -148,12 +166,48 @@ def cmd_run(args: argparse.Namespace) -> int:
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    provenance_opts: dict = {}
+    try:
+        if args.source_commit:
+            provenance_opts["source_commit"] = args.source_commit
+        if args.upstream_revision:
+            provenance_opts["upstream_revision_or_digest"] = args.upstream_revision
+        if args.upstream_exe:
+            if not os.path.isfile(args.upstream_exe):
+                raise ValueError(f"--upstream-exe does not exist: {args.upstream_exe}")
+            provenance_opts["upstream_exe"] = args.upstream_exe
+        if args.model_sha256:
+            provenance_opts["model_sha256"] = validate_sha256_hex(args.model_sha256, allow_special=("unknown",))
+        if args.model_file:
+            if not os.path.isfile(args.model_file):
+                raise ValueError(f"--model-file does not exist: {args.model_file}")
+            provenance_opts["model_file"] = args.model_file
+        if args.draft_sha256:
+            provenance_opts["draft_sha256"] = validate_sha256_hex(args.draft_sha256, allow_special=("none", "unknown"))
+        if args.draft_file:
+            if not os.path.isfile(args.draft_file):
+                raise ValueError(f"--draft-file does not exist: {args.draft_file}")
+            provenance_opts["draft_file"] = args.draft_file
+        if args.corpus_revision:
+            provenance_opts["corpus_revision"] = args.corpus_revision
+        for opt_name, attr in (("--resolved-settings", "resolved_settings"), ("--effective-settings", "effective_settings")):
+            raw_json = getattr(args, attr)
+            if raw_json:
+                parsed = json.loads(raw_json)
+                if not isinstance(parsed, dict):
+                    raise ValueError(f"{opt_name} must be a JSON object")
+                provenance_opts[attr] = parsed
+    except (OSError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
     sampler = GpuSampler(pid=args.pid, process_name=args.process_name)
     baseline = args.shared_baseline_mib
     try:
         runner = Runner(target, model=args.model, extra_body=extra, sampler=sampler, ctx_size=args.ctx_size,
                         shared_baseline_mib=baseline, log=(lambda m: None) if args.quiet else None,
-                        metrics_url=args.metrics_url, child_log=args.child_log)
+                        metrics_url=args.metrics_url, child_log=args.child_log,
+                        provenance=provenance_opts, require_provenance=args.require_provenance)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -211,7 +265,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_run(args)
     if args.cmd == "compare":
         return cmd_compare(args)
-    print(json.dumps(BUILTIN_SCENARIOS, indent=1))
+    preset = ACCEPTANCE_MATRIX_SCENARIOS if getattr(args, "preset", "all") == "acceptance" else BUILTIN_SCENARIOS
+    print(json.dumps(preset, indent=1))
     return 0
 
 

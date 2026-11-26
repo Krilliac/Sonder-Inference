@@ -366,6 +366,23 @@ Status ValidateContextOptions(const LoadOptions& options) {
                              "n_slots (" + std::to_string(options.n_slots) + ") must be in [1, " +
                                  std::to_string(kMaxSlots) + "]");
     }
+    if (options.prefix_coalesce) {
+        if (options.min_coalesce_prefix_tokens == 0) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "min_coalesce_prefix_tokens must be >= 1 when prefix_coalesce is enabled");
+        }
+        if (options.max_followers_per_producer == 0 || options.max_followers_per_producer > kMaxSlots) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "max_followers_per_producer (" +
+                                     std::to_string(options.max_followers_per_producer) + ") must be in [1, " +
+                                     std::to_string(kMaxSlots) + "]");
+        }
+        if (options.max_coalesce_wait_ms == 0 || options.max_coalesce_wait_ms > kMaxCoalesceWaitMs) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "max_coalesce_wait_ms (" + std::to_string(options.max_coalesce_wait_ms) +
+                                     ") must be in [1, " + std::to_string(kMaxCoalesceWaitMs) + "]");
+        }
+    }
     SpeculativeType spec = SpeculativeType::kNone;
     if (!ParseSpeculativeType(options.spec_type, spec)) {
         return Status::Error(ErrorCode::kInvalidArgument,
@@ -394,9 +411,10 @@ Status ValidateContextOptions(const LoadOptions& options) {
     if (options.mmproj_path.find('\0') != std::string::npos) {
         return Status::Error(ErrorCode::kInvalidArgument, "mmproj_path contains NUL");
     }
-    if (!std::isfinite(options.moe_cache_cpu_share) || options.moe_cache_cpu_share < 0.0 ||
-        options.moe_cache_cpu_share > 1.0) {
-        return Status::Error(ErrorCode::kInvalidArgument, "moe_cache_cpu_share must be finite in [0.0, 1.0]");
+    if (!std::isfinite(options.moe_cache_cpu_share) || options.moe_cache_cpu_share != 0.0) {
+        return Status::Error(
+            ErrorCode::kInvalidArgument,
+            "moe_cache_cpu_share is not supported by the direct llamacpp backend (no execution consumer)");
     }
     // n_batch == 0 keeps its own, older error in Load().
     if (options.n_batch > 0 && options.n_ubatch > options.n_batch) {

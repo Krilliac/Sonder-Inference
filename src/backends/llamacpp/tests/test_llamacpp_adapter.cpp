@@ -789,3 +789,24 @@ TEST_CASE("llamacpp adapter: llama.cpp log lines go through the non-blocking dia
     sonder::inference::diag::set_sink(nullptr);
     sonder::backends::llamacpp::SetLogSink(nullptr);
 }
+
+TEST_CASE("llamacpp adapter: capabilities report structured_output cleanly without misreporting native tool_calling") {
+    LlamaCppBackendOptions opts;
+    opts.slots = 2;
+    auto be = llamacpp_detail::MakeLlamaCppBackendForTest(
+        opts, []() -> llamacpp_detail::ProcessGpuMemoryReading { return {"none", "unsupported", "", 0, 0}; });
+    REQUIRE(be);
+    const BackendCapabilities caps = be->capabilities();
+    CHECK(caps.has(Capability::structured_output));
+    CHECK(caps.has(Capability::continuous_batch_decode));
+    CHECK_FALSE(caps.has(Capability::tool_calling));
+    CHECK_FALSE(caps.has(Capability::multimodal));
+
+    LlamaCppBackendOptions mm_opts;
+    mm_opts.mmproj_path = "mmproj.gguf";
+    auto mm_be = llamacpp_detail::MakeLlamaCppBackendForTest(
+        mm_opts, []() -> llamacpp_detail::ProcessGpuMemoryReading { return {"none", "unsupported", "", 0, 0}; });
+    REQUIRE(mm_be);
+    CHECK(mm_be->capabilities().has(Capability::multimodal));
+    CHECK_FALSE(mm_be->capabilities().has(Capability::tool_calling));
+}

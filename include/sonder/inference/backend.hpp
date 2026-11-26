@@ -13,6 +13,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 #include "sonder/inference/backend_runtime.hpp"
@@ -165,6 +166,8 @@ struct ToolDefinition {
     std::string description;
     // Serialized JSON Schema object for function parameters (empty = unconstrained object).
     std::string parameters_json;
+    // Optional strict schema enforcement flag (true fails closed if schema cannot be enforced).
+    std::optional<bool> strict = std::nullopt;
 };
 
 enum class ToolChoiceMode { auto_choice, none, required, function };
@@ -277,6 +280,17 @@ public:
 // inherits the default, which flattens the conversation with
 // format_chat_prompt() and calls generate().
 // ---------------------------------------------------------------------------
+// Ordered multimodal content part inside a ChatMessage.
+struct TextContentPart {
+    std::string text;
+};
+
+struct ImageContentPart {
+    MediaContent media;
+};
+
+using ContentPart = std::variant<TextContentPart, ImageContentPart>;
+
 struct ChatMessage {
     std::string role;
     std::string content;
@@ -291,6 +305,11 @@ struct ChatMessage {
     std::optional<std::string> name = std::nullopt;
     // Optional validated in-memory media attachments (base64 images).
     std::vector<MediaContent> media{};
+    // Preferred ordered content parts (TextContentPart / ImageContentPart). When
+    // non-empty, preserves exact interleaved text/image ordering across ingress,
+    // templating, direct execution, and external forwarding. When empty, readers
+    // fall back cleanly to legacy `content` + `media`.
+    std::vector<ContentPart> parts{};
 };
 
 // Reasoning ("thinking") controls for native-chat backends. Unset fields are
@@ -325,9 +344,10 @@ struct ChatRequest {
     // handle response_format natively (e.g. llama-server).
     std::optional<std::string> response_format_type = std::nullopt;
     std::optional<std::string> response_format_schema = std::nullopt;
-    // Optional tool definitions and tool_choice policy.
+    // Optional tool definitions, tool_choice policy, and parallel tool-call flag.
     std::vector<ToolDefinition> tools{};
     std::optional<ToolChoice> tool_choice = std::nullopt;
+    std::optional<bool> parallel_tool_calls = std::nullopt;
 };
 
 // True for "system", "user", "assistant" and "tool".
@@ -337,6 +357,19 @@ struct ChatRequest {
 // contains an embedded NUL byte, or the final message is not from "user" or
 // "tool" (there would be nothing to answer).
 Status validate_chat_messages(const std::vector<ChatMessage>& messages);
+
+// Number of image attachments in `message` (uses ordered `parts` when
+// non-empty, otherwise legacy `media`).
+[[nodiscard]] std::size_t count_message_images(const ChatMessage& message) noexcept;
+
+// True if any message carries image attachments in `parts` or `media`.
+[[nodiscard]] bool has_chat_media(const std::vector<ChatMessage>& messages) noexcept;
+
+// Concatenated text of `message` (from `parts` when non-empty, else `content`).
+[[nodiscard]] std::string message_text_content(const ChatMessage& message);
+
+// Appends `suffix` to both `content` and `parts` (when non-empty).
+void append_chat_message_text(ChatMessage& message, std::string_view suffix);
 
 // One segment of a chat-templated prompt, preserving the boundary between
 // template-owned scaffolding (parse_special == true) and untrusted message

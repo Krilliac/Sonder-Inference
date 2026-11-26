@@ -12,6 +12,7 @@
 
 #include "gpu_memory.hpp"
 #include "process.hpp"
+#include "tune_model.hpp"
 #include "sonder/inference/device.hpp"
 #include "sonder/inference/json.hpp"
 
@@ -65,20 +66,45 @@ enum class UmaMode { off, on, auto_detect };
 const char *to_string(UmaMode mode) noexcept;
 std::optional<UmaMode> parse_uma_mode(std::string_view text) noexcept;
 
+struct ArtifactIdentity {
+    std::string path;
+    std::string sha256;
+    std::string architecture;
+    std::string tokenizer_model;
+    std::optional<std::uint64_t> vocab_size;
+    std::optional<std::uint64_t> file_bytes;
+    std::optional<std::uint32_t> trained_block_limit;
+};
+struct ExecutableIdentity {
+    std::string path;
+    std::string sha256;
+    bool supports_spec_type = false;
+    bool supports_mtp = false;
+    bool supports_draft_model = false;
+};
+
 struct Options {
     std::string executable;
     std::string model;
+    std::string draft_model;
+    std::string target_model_sha256;
+    std::string draft_model_sha256;
+    std::optional<std::uint32_t> trained_block_limit;
     std::string mmproj;
     std::string out = "tuned.json";
     std::vector<std::pair<std::string, std::string>> environment;
     Grid grid;
     std::chrono::milliseconds budget{std::chrono::minutes(20)};
     bool thorough = false;
-    bool spec_type_supported = false; // set only after the executable's --help
+    bool spec_type_supported = false;   // set only after the executable's --help
+    bool draft_model_supported = false; // set only after the executable's --help
     UmaMode uma_mode = UmaMode::off;
     bool emit_adaptive_speculation = false;
     // Optional UMA host-RAM pool ceiling override in bytes (0 = auto-detect from host RAM and UMA GPU pool).
     std::uint64_t uma_pool_ceiling_bytes = 0;
+    std::optional<ArtifactIdentity> target_identity;
+    std::optional<ArtifactIdentity> draft_identity;
+    std::optional<ExecutableIdentity> executable_identity;
 };
 struct Candidate {
     KvPair kv;
@@ -104,6 +130,12 @@ struct Candidate {
 inline bool uses_mtp(const Candidate &candidate) noexcept {
     return candidate.mtp != 0 &&
            (candidate.spec_type == "draft-mtp" || candidate.spec_type == "draft-mtp,ngram-mod");
+}
+// True when `spec_type` selects an external standalone draft model
+// (as opposed to embedded target MTP weights or n-gram/suffix self-drafting).
+inline bool uses_draft_model(std::string_view spec_type) noexcept {
+    return spec_type == "dflash" || spec_type == "draft-dflash" || spec_type == "draft-eagle3" ||
+           spec_type == "draft" || spec_type == "draft-simple" || spec_type == "draft-dspark";
 }
 // True when `candidate` uses draft-probability speculation flags
 // (`--spec-draft-n-max` / `--spec-draft-p-min`), i.e. any non-zero draft
@@ -153,6 +185,9 @@ struct Report {
     std::optional<std::size_t> long_context;
     bool budget_exhausted = false;
     std::string stopped_reason;
+    std::optional<ArtifactIdentity> target_identity;
+    std::optional<ArtifactIdentity> draft_identity;
+    std::optional<ExecutableIdentity> executable_identity;
 };
 
 // A binary search over sorted context candidates. Only clean/spill are
@@ -171,6 +206,25 @@ class Bisection {
 };
 
 Status validate_grid(const Grid &grid);
+Status validate_options_for_grid(const Options &options, bool dry_run = false);
+Status validate_draft_pair_compatibility(const ModelInfo &target, const ModelInfo &draft);
+struct PreparedArtifacts {
+    bool mtp_available = false;
+    ModelInfo target_info;
+    std::optional<ModelInfo> draft_info;
+};
+// Reads, hashes, and validates model (and optional draft_model) GGUFs plus
+// pair compatibility and trained_block_limit bounds before launching processes.
+Status prepare_model_and_draft_artifacts(Options &options, PreparedArtifacts &out,
+                                         const std::function<bool()> &cancelled = [] { return false; });
+// Checks executable --help capabilities and computes executable provenance
+// against the already-inspected target/draft artifacts and configured grid.
+Status apply_executable_capabilities(Options &options, PreparedArtifacts &artifacts,
+                                     std::string_view executable_help_text,
+                                     const std::function<bool()> &cancelled = [] { return false; });
+// Pre-grid eligibility and artifact identity verification: runs both steps above.
+Result<PreparedArtifacts> prepare_live_artifacts(Options &options, std::string_view executable_help_text,
+                                                 const std::function<bool()> &cancelled = [] { return false; });
 Result<Grid> parse_grid(const json::Value &value);
 Grid grid_for_gpu(const GpuDeviceInfo &gpu, bool is_ternary = false);
 bool resolve_tune_uma_mode(UmaMode mode, const std::vector<GpuDeviceInfo> &gpus,

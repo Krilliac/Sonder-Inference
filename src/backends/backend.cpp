@@ -86,12 +86,74 @@ Status validate_chat_messages(const std::vector<ChatMessage>& messages) {
                               "chat: message " + std::to_string(i) + " tool_calls must not contain NUL");
             }
         }
+        for (const auto& part : messages[i].parts) {
+            if (const auto* tp = std::get_if<TextContentPart>(&part)) {
+                if (tp->text.find('\0') != std::string::npos) {
+                    return Status(ErrorCode::invalid_argument,
+                                  "chat: message " + std::to_string(i) + " content parts must not contain NUL");
+                }
+            } else if (const auto* ip = std::get_if<ImageContentPart>(&part)) {
+                if (ip->media.mime_type.find('\0') != std::string::npos) {
+                    return Status(ErrorCode::invalid_argument,
+                                  "chat: message " + std::to_string(i) + " media mime_type must not contain NUL");
+                }
+            }
+        }
     }
     const std::string& last = messages.back().role;
     if (last != "user" && last != "tool") {
         return Status(ErrorCode::invalid_argument, "chat: the last message must be from user or tool, got " + last);
     }
     return Status::success();
+}
+
+std::size_t count_message_images(const ChatMessage& message) noexcept {
+    if (!message.parts.empty()) {
+        std::size_t count = 0;
+        for (const auto& part : message.parts) {
+            if (std::holds_alternative<ImageContentPart>(part)) {
+                ++count;
+            }
+        }
+        return count;
+    }
+    return message.media.size();
+}
+
+bool has_chat_media(const std::vector<ChatMessage>& messages) noexcept {
+    for (const auto& m : messages) {
+        if (count_message_images(m) > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string message_text_content(const ChatMessage& message) {
+    if (message.parts.empty()) {
+        return message.content;
+    }
+    std::string text;
+    for (const auto& part : message.parts) {
+        if (const auto* tp = std::get_if<TextContentPart>(&part)) {
+            text += tp->text;
+        }
+    }
+    return text;
+}
+
+void append_chat_message_text(ChatMessage& message, std::string_view suffix) {
+    if (suffix.empty()) {
+        return;
+    }
+    message.content.append(suffix);
+    if (!message.parts.empty()) {
+        if (auto* last_text = std::get_if<TextContentPart>(&message.parts.back())) {
+            last_text->text.append(suffix);
+        } else {
+            message.parts.push_back(TextContentPart{std::string(suffix)});
+        }
+    }
 }
 
 Result<std::vector<ChatPromptSegment>> build_chat_template_segments(
@@ -232,6 +294,21 @@ Status tokenize_chat_segments(
     return Status::success();
 }
 
+namespace {
+
+std::string format_image_tag(const MediaContent& img) {
+    std::uint64_t h = 1469598103934665603ull;
+    for (const std::uint8_t b : img.bytes) {
+        h ^= b;
+        h *= 1099511628211ull;
+    }
+    char tag[96];
+    std::snprintf(tag, sizeof(tag), "[image:%zu:%016llx]", img.bytes.size(), static_cast<unsigned long long>(h));
+    return std::string(tag);
+}
+
+}  // namespace
+
 std::string format_chat_prompt(const std::vector<ChatMessage>& messages) {
     std::string out;
     for (const auto& m : messages) {
@@ -246,29 +323,50 @@ std::string format_chat_prompt(const std::vector<ChatMessage>& messages) {
             out += ")";
         }
         out += ": ";
-        out += m.content;
+        bool has_body = false;
+        if (!m.parts.empty()) {
+            bool prev_was_image = false;
+            for (const auto& part : m.parts) {
+                if (const auto* tp = std::get_if<TextContentPart>(&part)) {
+                    if (!tp->text.empty()) {
+                        if (prev_was_image && tp->text.front() != ' ' && tp->text.front() != '\n') {
+                            out.push_back(' ');
+                        }
+                        out += tp->text;
+                        has_body = true;
+                        prev_was_image = false;
+                    }
+                } else if (const auto* ip = std::get_if<ImageContentPart>(&part)) {
+                    if (has_body && out.back() != ' ' && out.back() != '\n') {
+                        out.push_back(' ');
+                    }
+                    out += format_image_tag(ip->media);
+                    has_body = true;
+                    prev_was_image = true;
+                }
+            }
+        } else {
+            out += m.content;
+            has_body = !m.content.empty();
+            if (!m.media.empty()) {
+                for (const auto& img : m.media) {
+                    if (has_body && out.back() != ' ' && out.back() != '\n') {
+                        out.push_back(' ');
+                    }
+                    out += format_image_tag(img);
+                    has_body = true;
+                }
+            }
+        }
         if (!m.tool_calls.empty()) {
             for (const auto& tc : m.tool_calls) {
-                if (!m.content.empty()) out.push_back('\n');
+                if (has_body) out.push_back('\n');
                 out += "<tool_call>{\"name\":";
                 json::append_escaped(out, tc.name);
                 out += ",\"arguments\":";
                 out += tc.arguments_json.empty() ? "{}" : tc.arguments_json;
                 out += "}</tool_call>";
-            }
-        }
-        if (!m.media.empty()) {
-            for (const auto& img : m.media) {
-                if (!m.content.empty()) out.push_back(' ');
-                std::uint64_t h = 1469598103934665603ull;
-                for (const std::uint8_t b : img.bytes) {
-                    h ^= b;
-                    h *= 1099511628211ull;
-                }
-                char tag[96];
-                std::snprintf(tag, sizeof(tag), "[image:%zu:%016llx]", img.bytes.size(),
-                              static_cast<unsigned long long>(h));
-                out += tag;
+                has_body = true;
             }
         }
         out += "\n\n";

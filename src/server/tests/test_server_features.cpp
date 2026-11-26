@@ -49,10 +49,16 @@ struct CapturingBackend final : si::Backend {
     struct Model final : si::BackendModel {
         si::ModelDescriptor desc;
         std::mutex mu;
+        std::atomic<std::size_t> chat_calls{0};
+        std::atomic<std::size_t> generate_calls{0};
         std::string last_grammar;
         std::optional<std::string> last_rf_type;
         std::optional<std::string> last_rf_schema;
+        std::vector<si::ToolDefinition> last_tools;
+        std::optional<si::ToolChoice> last_tool_choice;
+        std::optional<bool> last_parallel_tool_calls;
         std::string last_prompt;
+        std::vector<si::ChatMessage> last_messages;
 
         Model() {
             desc.name = "capture:test";
@@ -64,6 +70,7 @@ struct CapturingBackend final : si::Backend {
 
         si::Result<si::GenerateStats> generate(const si::GenerateRequest& req, const si::CancellationToken&,
                                                const si::TokenCallback& on_chunk) override {
+            generate_calls.fetch_add(1);
             {
                 std::lock_guard<std::mutex> lock(mu);
                 last_grammar = req.grammar;
@@ -84,11 +91,16 @@ struct CapturingBackend final : si::Backend {
 
         si::Result<si::GenerateStats> chat(const si::ChatRequest& req, const si::CancellationToken&,
                                            const si::TokenCallback& on_chunk) override {
+            chat_calls.fetch_add(1);
             {
                 std::lock_guard<std::mutex> lock(mu);
                 last_grammar = req.grammar;
                 last_rf_type = req.response_format_type;
                 last_rf_schema = req.response_format_schema;
+                last_messages = req.messages;
+                last_tools = req.tools;
+                last_tool_choice = req.tool_choice;
+                last_parallel_tool_calls = req.parallel_tool_calls;
             }
             if (on_chunk) {
                 (void)on_chunk(si::TokenChunk{R"({"ok":true})", 0});
@@ -104,10 +116,13 @@ struct CapturingBackend final : si::Backend {
     };
 
     std::shared_ptr<Model> model = std::make_shared<Model>();
+    bool support_multimodal = false;
     std::string name() const override { return "capture-test"; }
     std::string description() const override { return "capturing test backend without embeddings/tokenization"; }
     si::BackendCapabilities capabilities() const override {
-        return si::BackendCapabilities{}.add(si::Capability::streaming).add(si::Capability::structured_output);
+        auto caps = si::BackendCapabilities{}.add(si::Capability::streaming).add(si::Capability::structured_output);
+        if (support_multimodal) caps.add(si::Capability::multimodal);
+        return caps;
     }
     si::Result<std::string> probe() override { return std::string("capture-1"); }
     si::Result<std::vector<si::ModelDescriptor>> list_models() override {
@@ -1515,6 +1530,7 @@ struct ScriptedToolBackend final : si::Backend {
     struct Model final : si::BackendModel {
         si::ModelDescriptor desc;
         std::mutex mu;
+        std::atomic<std::size_t> chat_calls{0};
         std::vector<si::TokenChunk> chunks;
         std::vector<std::string> owned_text;
         si::StopReason stop_reason = si::StopReason::tool_calls;
@@ -1522,6 +1538,7 @@ struct ScriptedToolBackend final : si::Backend {
         std::vector<si::ChatMessage> last_messages;
         std::vector<si::ToolDefinition> last_tools;
         std::optional<si::ToolChoice> last_tool_choice;
+        std::optional<bool> last_parallel_tool_calls;
 
         Model() {
             desc.name = "tool:test";
@@ -1539,6 +1556,7 @@ struct ScriptedToolBackend final : si::Backend {
 
         si::Result<si::GenerateStats> chat(const si::ChatRequest& req, const si::CancellationToken&,
                                            const si::TokenCallback& on_chunk) override {
+            chat_calls.fetch_add(1);
             std::vector<si::TokenChunk> script;
             si::StopReason sr = si::StopReason::end_of_sequence;
             {
@@ -1547,6 +1565,7 @@ struct ScriptedToolBackend final : si::Backend {
                 last_messages = req.messages;
                 last_tools = req.tools;
                 last_tool_choice = req.tool_choice;
+                last_parallel_tool_calls = req.parallel_tool_calls;
                 script = chunks;
                 sr = stop_reason;
             }
@@ -2552,5 +2571,373 @@ TEST_CASE("responses parity: timings, logprobs, reasoning_budget, admission tele
         CHECK(r2.status == 400);
         CHECK(r2.json().find("error")->find("code")->as_string() == "unsupported_parameter");
         CHECK(r2.json().find("error")->find("param")->as_string() == "previous_response_id");
+    }
+}
+
+TEST_CASE("multimodal vision: interleaved text and multiple images preserve order across Chat, Responses, and Anthropic ingress") {
+    constexpr const char* kTinyJpegBase64 = "/9j/4AAQ";  // bytes: FF D8 FF E0 00 10
+
+    auto backend = std::make_shared<CapturingBackend>();
+    backend->support_multimodal = true;
+    Fixture cap(capturing_options(backend));
+
+    const auto assert_interleaved_parts = [&](const si::ChatMessage& m) {
+        CHECK(m.content == "first middle last");
+        REQUIRE(m.media.size() == 2u);
+        REQUIRE(m.parts.size() == 5u);
+
+        const auto* t0 = std::get_if<si::TextContentPart>(&m.parts[0]);
+        const auto* i1 = std::get_if<si::ImageContentPart>(&m.parts[1]);
+        const auto* t2 = std::get_if<si::TextContentPart>(&m.parts[2]);
+        const auto* i3 = std::get_if<si::ImageContentPart>(&m.parts[3]);
+        const auto* t4 = std::get_if<si::TextContentPart>(&m.parts[4]);
+        REQUIRE(t0 != nullptr);
+        REQUIRE(i1 != nullptr);
+        REQUIRE(t2 != nullptr);
+        REQUIRE(i3 != nullptr);
+        REQUIRE(t4 != nullptr);
+        CHECK(t0->text == "first ");
+        CHECK(i1->media.mime_type == "image/png");
+        REQUIRE_FALSE(i1->media.bytes.empty());
+        CHECK(i1->media.bytes[0] == 0x89u);
+        CHECK(t2->text == "middle ");
+        CHECK(i3->media.mime_type == "image/jpeg");
+        CHECK(i3->media.bytes == std::vector<std::uint8_t>({0xFFu, 0xD8u, 0xFFu, 0xE0u, 0x00u, 0x10u}));
+        CHECK(t4->text == "last");
+    };
+
+    // 1. OpenAI /v1/chat/completions
+    {
+        const std::string body =
+            std::string(R"({"messages":[{"role":"user","content":[)") +
+            R"({"type":"text","text":"first "},)" +
+            R"({"type":"image_url","image_url":{"url":"data:image/png;base64,)" + kTinyPngBase64 + R"("}},)" +
+            R"({"type":"text","text":"middle "},)" +
+            R"({"type":"image_url","image_url":{"url":"data:image/jpeg;base64,)" + kTinyJpegBase64 + R"("}},)" +
+            R"({"type":"text","text":"last"})" +
+            R"(]}],"max_tokens":4})";
+        const Reply r = post(cap.port, "/v1/chat/completions", body);
+        REQUIRE_MESSAGE(r.status == 200, r.body);
+        std::lock_guard<std::mutex> lock(backend->model->mu);
+        REQUIRE(backend->model->last_messages.size() == 1u);
+        assert_interleaved_parts(backend->model->last_messages[0]);
+    }
+
+    // 2. OpenAI /v1/responses
+    {
+        const std::string body =
+            std::string(R"({"input":[{"role":"user","content":[)") +
+            R"({"type":"input_text","text":"first "},)" +
+            R"({"type":"input_image","image_url":"data:image/png;base64,)" + kTinyPngBase64 + R"("},)" +
+            R"({"type":"input_text","text":"middle "},)" +
+            R"({"type":"input_image","image_url":"data:image/jpeg;base64,)" + kTinyJpegBase64 + R"("},)" +
+            R"({"type":"input_text","text":"last"})" +
+            R"(]}],"max_output_tokens":4})";
+        const Reply r = post(cap.port, "/v1/responses", body);
+        REQUIRE_MESSAGE(r.status == 200, r.body);
+        std::lock_guard<std::mutex> lock(backend->model->mu);
+        REQUIRE(backend->model->last_messages.size() == 1u);
+        assert_interleaved_parts(backend->model->last_messages[0]);
+    }
+
+    // 3. Anthropic /v1/messages
+    {
+        const std::string body =
+            std::string(R"({"model":"capture:test","max_tokens":4,"messages":[{"role":"user","content":[)") +
+            R"({"type":"text","text":"first "},)" +
+            R"({"type":"image","source":{"type":"base64","media_type":"image/png","data":")" + kTinyPngBase64 + R"("}},)" +
+            R"({"type":"text","text":"middle "},)" +
+            R"({"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":")" + kTinyJpegBase64 + R"("}},)" +
+            R"({"type":"text","text":"last"})" +
+            R"(]}]})";
+        const Reply r = post(cap.port, "/v1/messages", body);
+        REQUIRE_MESSAGE(r.status == 200, r.body);
+        std::lock_guard<std::mutex> lock(backend->model->mu);
+        REQUIRE(backend->model->last_messages.size() == 1u);
+        assert_interleaved_parts(backend->model->last_messages[0]);
+    }
+
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+    // 4. External llamaserver serialization end-to-end preserves exact captured order.
+    {
+        si::ChatRequest forward;
+        {
+            std::lock_guard<std::mutex> lock(backend->model->mu);
+            forward.messages = backend->model->last_messages;
+        }
+        const auto payload = si::llamaserver::build_chat_body("m", forward);
+        const auto& content_arr = payload.find("messages")->as_array()[0].find("content")->as_array();
+        REQUIRE(content_arr.size() == 5u);
+        CHECK(content_arr[0].find("text")->as_string() == "first ");
+        CHECK(content_arr[1].find("image_url")->find("url")->as_string().rfind("data:image/png;base64,", 0) == 0);
+        CHECK(content_arr[2].find("text")->as_string() == "middle ");
+        CHECK(content_arr[3].find("image_url")->find("url")->as_string().rfind("data:image/jpeg;base64,", 0) == 0);
+        CHECK(content_arr[4].find("text")->as_string() == "last");
+    }
+#endif
+}
+
+TEST_CASE("tool calling: strict schemas fail closed pre-generation, parallel_tool_calls, and reasoning+tool boundary") {
+    // 1. Non-native structured-output backend rejects unsupported strict:true schemas BEFORE generation,
+    //    accepts compilable strict:true schemas, and preserves non-strict fallback for strict:false.
+    {
+        auto backend = std::make_shared<CapturingBackend>();
+        Fixture cap(capturing_options(backend));
+
+        // Unsupported strict:true (allOf + permissive additionalProperties) rejected across auto/required/function and Responses.
+        for (const char* tc_frag : {R"("auto")", R"("required")", R"({"type":"function","function":{"name":"bad_strict"}})"}) {
+            CAPTURE(tc_frag);
+            const std::string body =
+                R"({"messages":[{"role":"user","content":"call tool"}],"tools":[{"type":"function","function":{"name":"bad_strict","parameters":{"type":"object","allOf":[{"properties":{"a":{"type":"string"}}}]},"strict":true}}],"tool_choice":)" +
+                std::string(tc_frag) + R"(})";
+            const Reply r = post(cap.port, "/v1/chat/completions", body);
+            CHECK(r.status == 400);
+            CHECK(r.json().find("error")->find("code")->as_string() == "invalid_request");
+            CHECK(r.json().find("error")->find("param")->as_string() == "tools");
+        }
+        {
+            const Reply r = post(
+                cap.port, "/v1/responses",
+                R"({"input":"call tool","tools":[{"type":"function","name":"bad_ap","parameters":{"type":"object","properties":{"x":{"type":"integer"}},"additionalProperties":true},"strict":true}],"tool_choice":"required"})");
+            CHECK(r.status == 400);
+            CHECK(r.json().find("error")->find("code")->as_string() == "invalid_request");
+            CHECK(r.json().find("error")->find("param")->as_string() == "tools");
+        }
+        CHECK(backend->model->chat_calls.load() == 0u);
+        CHECK(backend->model->generate_calls.load() == 0u);
+
+        // strict:false preserves fallback and runs generation cleanly.
+        {
+            const Reply r = post(
+                cap.port, "/v1/chat/completions",
+                R"({"messages":[{"role":"user","content":"call loose"}],"tools":[{"type":"function","function":{"name":"loose_fn","parameters":{"type":"object","allOf":[{"properties":{"a":{"type":"string"}}}]},"strict":false}}],"tool_choice":"required"})");
+            REQUIRE_MESSAGE(r.status == 200, r.body);
+            CHECK(backend->model->chat_calls.load() == 1u);
+            std::lock_guard<std::mutex> lock(backend->model->mu);
+            CHECK(backend->model->last_grammar.find("<tool_call>") != std::string::npos);
+            REQUIRE(backend->model->last_tools.size() == 1u);
+            CHECK(backend->model->last_tools[0].strict == std::optional<bool>(false));
+        }
+
+        // Same tool name & unsupported schema with strict:true MUST NOT reuse cached loose grammar (400 before generation).
+        {
+            const std::size_t before_chats = backend->model->chat_calls.load();
+            const Reply r = post(
+                cap.port, "/v1/chat/completions",
+                R"({"messages":[{"role":"user","content":"call strict"}],"tools":[{"type":"function","function":{"name":"loose_fn","parameters":{"type":"object","allOf":[{"properties":{"a":{"type":"string"}}}]},"strict":true}}],"tool_choice":"required"})");
+            CHECK(r.status == 400);
+            CHECK(r.json().find("error")->find("code")->as_string() == "invalid_request");
+            CHECK(r.json().find("error")->find("param")->as_string() == "tools");
+            CHECK(backend->model->chat_calls.load() == before_chats);
+        }
+
+        // strict:true with valid schema compiles strict grammar & forwards strict flag + parallel_tool_calls.
+        {
+            const Reply r = post(
+                cap.port, "/v1/chat/completions",
+                R"({"messages":[{"role":"user","content":"call strict"}],"tools":[{"type":"function","function":{"name":"strict_ok","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false},"strict":true}}],"tool_choice":"required","parallel_tool_calls":false})");
+            REQUIRE_MESSAGE(r.status == 200, r.body);
+            std::lock_guard<std::mutex> lock(backend->model->mu);
+            CHECK(backend->model->last_grammar.find("strict_ok") != std::string::npos);
+            CHECK(backend->model->last_grammar.find("city") != std::string::npos);
+            REQUIRE(backend->model->last_tools.size() == 1u);
+            CHECK(backend->model->last_tools[0].strict == std::optional<bool>(true));
+            CHECK(backend->model->last_parallel_tool_calls == std::optional<bool>(false));
+        }
+    }
+
+    // 2. Non-native backend without structured_output capability rejects strict:true BEFORE generation.
+    {
+        struct PlainNonToolBackend final : si::Backend {
+            struct Model final : si::BackendModel {
+                si::ModelDescriptor desc;
+                std::atomic<std::size_t> chat_calls{0};
+                Model() {
+                    desc.name = "plain:test";
+                    desc.backend = "plain-test";
+                    desc.context_length = 1024;
+                }
+                const si::ModelDescriptor& descriptor() const override { return desc; }
+                bool has_native_chat() const override { return true; }
+                si::Result<si::GenerateStats> generate(const si::GenerateRequest&, const si::CancellationToken&,
+                                                       const si::TokenCallback&) override {
+                    return si::Status(si::ErrorCode::unsupported, "unused");
+                }
+                si::Result<si::GenerateStats> chat(const si::ChatRequest&, const si::CancellationToken&,
+                                                   const si::TokenCallback&) override {
+                    chat_calls.fetch_add(1);
+                    return si::Status(si::ErrorCode::unsupported, "unused");
+                }
+            };
+            std::shared_ptr<Model> model = std::make_shared<Model>();
+            std::string name() const override { return "plain-test"; }
+            std::string description() const override { return "plain"; }
+            si::BackendCapabilities capabilities() const override {
+                return si::BackendCapabilities{}.add(si::Capability::streaming);
+            }
+            si::Result<std::string> probe() override { return std::string("plain-1"); }
+            si::Result<std::vector<si::ModelDescriptor>> list_models() override {
+                return std::vector<si::ModelDescriptor>{model->descriptor()};
+            }
+            si::Result<std::shared_ptr<si::BackendModel>> load_model(const si::ModelLoadOptions&) override {
+                return std::static_pointer_cast<si::BackendModel>(model);
+            }
+        };
+
+        auto plain = std::make_shared<PlainNonToolBackend>();
+        auto opts = Fixture::defaults();
+        opts.models = {"plain:test"};
+        opts.backend.backend.clear();
+        opts.backend_instance = plain;
+        Fixture f_plain(opts);
+
+        const Reply r = post(
+            f_plain.port, "/v1/chat/completions",
+            R"({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object","additionalProperties":false},"strict":true}}]})");
+        CHECK(r.status == 400);
+        CHECK(r.json().find("error")->find("code")->as_string() == "unsupported_parameter");
+        CHECK(plain->model->chat_calls.load() == 0u);
+    }
+
+    // 3. parallel_tool_calls: false vs true on BOTH native tool_call_deltas AND non-native text <tool_call> tags,
+    //    plus reasoning+tool boundary and tool_call_id correlation.
+    {
+        auto backend = std::make_shared<ScriptedToolBackend>();
+        auto opts = Fixture::defaults();
+        opts.models = {"tool:test"};
+        opts.backend.backend.clear();
+        opts.backend_instance = backend;
+        Fixture f(opts);
+
+        const std::string two_tools_json =
+            R"([{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"},"strict":true}},
+                 {"type":"function","function":{"name":"get_time","parameters":{"type":"object"}}}])";
+        {
+            std::lock_guard<std::mutex> lock(backend->model->mu);
+            backend->model->stop_reason = si::StopReason::tool_calls;
+            si::TokenChunk c0;
+            c0.tool_call_deltas.push_back(si::ToolCallDelta{0, "call_a", "get_weather", R"({"city":"NYC"})"});
+            si::TokenChunk c1;
+            c1.tool_call_deltas.push_back(si::ToolCallDelta{1, "call_b", "get_time", R"({"tz":"UTC"})"});
+            backend->model->chunks = {c0, c1};
+        }
+
+        // parallel_tool_calls: true keeps both tool calls.
+        {
+            const Reply r = post(
+                f.port, "/v1/chat/completions",
+                R"({"messages":[{"role":"user","content":"both"}],"tools":)" + two_tools_json +
+                    R"(,"parallel_tool_calls":true})");
+            REQUIRE_MESSAGE(r.status == 200, r.body);
+            const auto tcs = r.json().find("choices")->as_array()[0].find("message")->find("tool_calls")->as_array();
+            CHECK(tcs.size() == 2u);
+        }
+
+        // parallel_tool_calls: false clamps native deltas to single tool call in BOTH non-streaming and streaming chat & responses.
+        {
+            const Reply r = post(
+                f.port, "/v1/chat/completions",
+                R"({"messages":[{"role":"user","content":"one"}],"tools":)" + two_tools_json +
+                    R"(,"parallel_tool_calls":false})");
+            REQUIRE_MESSAGE(r.status == 200, r.body);
+            const auto tcs = r.json().find("choices")->as_array()[0].find("message")->find("tool_calls")->as_array();
+            REQUIRE(tcs.size() == 1u);
+            CHECK(tcs[0].find("id")->as_string() == "call_a");
+            std::lock_guard<std::mutex> lock(backend->model->mu);
+            CHECK(backend->model->last_parallel_tool_calls == std::optional<bool>(false));
+        }
+        {
+            const Reply r = post(
+                f.port, "/v1/responses",
+                R"({"input":"one","stream":true,"tools":[{"type":"function","name":"get_weather"},{"type":"function","name":"get_time"}],"parallel_tool_calls":false})");
+            REQUIRE_MESSAGE(r.status == 200, r.body);
+            const auto completed_pos = r.body.find("event: response.completed\ndata: ");
+            REQUIRE(completed_pos != std::string::npos);
+            const auto data_start = completed_pos + std::string("event: response.completed\ndata: ").size();
+            const auto data_end = r.body.find("\n\n", data_start);
+            auto parsed = json::parse(r.body.substr(data_start, data_end - data_start));
+            REQUIRE(parsed.ok());
+            const auto& output = parsed.value().find("response")->find("output")->as_array();
+            REQUIRE(output.size() == 1u);
+            CHECK(output[0].find("call_id")->as_string() == "call_a");
+        }
+    }
+
+    // 4. Non-native backend: reasoning + tool boundary (streaming + non-streaming) and parallel_tool_calls:false clamping.
+    {
+        auto non_native = std::make_shared<ScriptedToolBackend>();
+        non_native->advertise_native_tools = false;
+        non_native->model->owned_text.push_back("Plan ");
+        non_native->model->owned_text.push_back("step 1");
+        non_native->model->owned_text.push_back("<tool_call>{\"name\":\"get_weather\",");
+        non_native->model->owned_text.push_back(R"("arguments":{"city":"Boston"}}</tool_call>)");
+        non_native->model->owned_text.push_back(R"(<tool_call>{"name":"get_time","arguments":{"tz":"EST"}}</tool_call>)");
+        non_native->model->stop_reason = si::StopReason::end_of_sequence;
+        {
+            si::TokenChunk r_chunk;
+            r_chunk.reasoning = non_native->model->owned_text[0];
+            si::TokenChunk r_and_open{"", 1, non_native->model->owned_text[1]};
+            si::TokenChunk t0{non_native->model->owned_text[2], 2};
+            si::TokenChunk t1{non_native->model->owned_text[3], 3};
+            si::TokenChunk t2{non_native->model->owned_text[4], 4};
+            non_native->model->chunks = {r_chunk, r_and_open, t0, t1, t2};
+        }
+        auto nn_opts = Fixture::defaults();
+        nn_opts.models = {"tool:test"};
+        nn_opts.backend.backend.clear();
+        nn_opts.backend_instance = non_native;
+        Fixture f_nn(nn_opts);
+
+        // Streaming splits reasoning_content and clamps to 1 tool call without leaking <tool_call> into content.
+        const Reply r_stream = post(
+            f_nn.port, "/v1/chat/completions",
+            R"({"messages":[{"role":"user","content":"weather in Boston"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}},{"type":"function","function":{"name":"get_time","parameters":{"type":"object"}}}],"parallel_tool_calls":false,"stream":true})");
+        REQUIRE_MESSAGE(r_stream.status == 200, r_stream.body);
+        const auto events = sse_data(r_stream.body);
+        std::string reasoning_acc;
+        std::string content_acc;
+        int streamed_tool_count = 0;
+        std::string finish;
+        for (std::size_t i = 0; i + 1 < events.size(); ++i) {
+            auto p = json::parse(events[i]);
+            REQUIRE_MESSAGE(p.ok(), events[i]);
+            const auto& choice = p.value().find("choices")->as_array()[0];
+            if (const auto* fr = choice.find("finish_reason"); fr && fr->is_string()) finish = fr->as_string();
+            const auto& delta = choice.find("delta")->as_object();
+            if (const auto* rc = delta.find("reasoning_content"); rc && rc->is_string()) {
+                reasoning_acc += rc->as_string();
+            }
+            if (const auto* ct = delta.find("content"); ct && ct->is_string()) {
+                content_acc += ct->as_string();
+            }
+            if (const auto* tcs = delta.find("tool_calls"); tcs && tcs->is_array()) {
+                streamed_tool_count += static_cast<int>(tcs->as_array().size());
+            }
+        }
+        CHECK(reasoning_acc == "Plan step 1");
+        CHECK(content_acc.find("<tool_call>") == std::string::npos);
+        CHECK(streamed_tool_count == 1);
+        CHECK(finish == "tool_calls");
+
+        // Non-streaming multi-turn with tool_result correlation id preserves reasoning_content & tool_call_id cleanly.
+        const Reply r_nonstream = post(
+            f_nn.port, "/v1/chat/completions",
+            R"({"messages":[{"role":"user","content":"weather in Boston"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_res_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Boston\"}"}}]},{"role":"tool","tool_call_id":"call_res_1","content":"{\"temp_c\":12}"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}],"parallel_tool_calls":false})");
+        REQUIRE_MESSAGE(r_nonstream.status == 200, r_nonstream.body);
+        const auto nr_doc = r_nonstream.json();
+        const auto& nr_msg = nr_doc.find("choices")->as_array()[0].find("message")->as_object();
+        CHECK(nr_msg.find("reasoning_content")->as_string() == "Plan step 1");
+        REQUIRE(nr_msg.find("tool_calls") != nullptr);
+        CHECK(nr_msg.find("tool_calls")->as_array().size() == 1u);
+        {
+            std::lock_guard<std::mutex> lock(non_native->model->mu);
+            bool saw_tool_res_id = false;
+            for (const auto& m : non_native->model->last_messages) {
+                if (m.role == "tool" && m.tool_call_id == std::optional<std::string>("call_res_1")) {
+                    saw_tool_res_id = true;
+                }
+            }
+            CHECK(saw_tool_res_id);
+        }
     }
 }

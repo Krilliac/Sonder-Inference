@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "batch_scheduler.hpp"
+#include "prefix_coalescer.hpp"
 #include "radix_cache.hpp"
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include "sonder/inference/backends/llamacpp.hpp"
@@ -479,6 +480,19 @@ TEST_CASE("llamacpp frontier: suffix, cache_ram_mib, moe_cache_mib, mmproj_path,
     lo.moe_cache_mib = kMaxMoeCacheMiB + 1;
     CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
     lo.moe_cache_mib = 2048;
+    lo.moe_cache_cpu_share = 0.0;
+    CHECK(ValidateContextOptions(lo).ok());
+    lo.moe_cache_cpu_share = 0.25;
+    CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
+    lo.moe_cache_cpu_share = std::numeric_limits<double>::quiet_NaN();
+    CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
+    lo.moe_cache_cpu_share = 0.0;
+
+    sonder::inference::LlamaCppBackendOptions backend_opts;
+    backend_opts.moe_cache_cpu_share = 0.5;
+    CHECK(sonder::inference::validate_llamacpp_options(backend_opts).code() ==
+          sonder::inference::ErrorCode::invalid_argument);
+
     std::string bad_mm = "mmproj.gguf";
     bad_mm[6] = '\0';
     lo.mmproj_path = bad_mm;
@@ -1212,4 +1226,691 @@ TEST_CASE("llamacpp frontier: SuffixMatcher GSAM invariants, separator dead-end 
             }
         }
     }
+}
+
+namespace {
+
+std::vector<Token> MakePrefixedPrompt(std::size_t shared_len, Token shared_base, std::size_t suffix_len,
+                                      Token suffix_base) {
+    std::vector<Token> p;
+    p.reserve(shared_len + suffix_len);
+    for (std::size_t i = 0; i < shared_len; ++i) {
+        p.push_back(shared_base + static_cast<Token>(i));
+    }
+    for (std::size_t i = 0; i < suffix_len; ++i) {
+        p.push_back(suffix_base + static_cast<Token>(i));
+    }
+    return p;
+}
+
+}  // namespace
+
+TEST_CASE("llamacpp frontier: PrefixCoalescer simultaneous cold siblings exact token-work savings") {
+    PrefixCoalescerConfig cfg;
+    cfg.enabled = true;
+    cfg.architecture = sonder::inference::ModelArchitecture::attention_only;
+    cfg.min_coalesce_prefix_tokens = 64;
+    cfg.max_followers_per_producer = 8;
+    cfg.max_coalesce_wait_ms = 5000;
+    PrefixCoalescer coalescer(cfg);
+    REQUIRE(coalescer.IsEnabled());
+
+    // 4 simultaneous cold siblings sharing a 256-token prefix + distinct 64-token suffixes.
+    constexpr std::size_t kSharedLen = 256;
+    constexpr std::size_t kSuffixLen = 64;
+    constexpr std::size_t kSiblings = 4;
+    std::vector<std::vector<Token>> prompts;
+    std::vector<BatchSlotPlanView> slots;
+    std::vector<std::size_t> evaluated_tokens(kSiblings, 0);
+    std::vector<std::size_t> cached_tokens(kSiblings, 0);
+    for (std::size_t i = 0; i < kSiblings; ++i) {
+        prompts.push_back(MakePrefixedPrompt(kSharedLen, 1000, kSuffixLen, static_cast<Token>(50000 + i * 1000)));
+        slots.push_back(BatchSlotPlanView{i, static_cast<std::int32_t>(i), BatchSlotPhase::kPrefill,
+                                          prompts[i].size(), 0, 0, false});
+    }
+
+    // Simultaneous cold admission at t = 0: slot 0 becomes producer, slots 1..3 become held followers.
+    const CoalesceAdmitResult r0 = coalescer.OnAdmit(0, prompts[0], 0, /*now_ms=*/0);
+    CHECK(r0.role == CoalesceRole::kIndependent);
+    CHECK_FALSE(r0.producer_slot.has_value());
+
+    for (std::size_t i = 1; i < kSiblings; ++i) {
+        const CoalesceAdmitResult ri = coalescer.OnAdmit(i, prompts[i], 0, /*now_ms=*/0);
+        CHECK(ri.role == CoalesceRole::kHeldFollower);
+        REQUIRE(ri.producer_slot.has_value());
+        CHECK(*ri.producer_slot == 0u);
+        CHECK(ri.target_shared_len == kSharedLen);
+        CHECK(coalescer.IsFollowerHeld(i));
+    }
+    CHECK(coalescer.RoleOf(0) == CoalesceRole::kProducer);
+    CHECK(coalescer.ActiveGroupCount() == 1u);
+    CHECK(coalescer.HeldFollowerCount() == 3u);
+    CHECK(coalescer.SuggestedProducerPublishBoundary(0) == std::optional<std::size_t>(kSharedLen));
+    CHECK(coalescer.CheckInvariants());
+
+    // Drive continuous batching steps with chunk budget = 128 until all 4 prompts finish prefill.
+    std::size_t rr = 0;
+    int steps = 0;
+    while (steps < 64) {
+        std::vector<BatchSlotPlanView> views;
+        for (const auto& s : slots) {
+            if (s.phase == BatchSlotPhase::kPrefill && !coalescer.IsFollowerHeld(s.slot_index)) {
+                views.push_back(s);
+            }
+        }
+        if (views.empty()) break;
+
+        // While producer hasn't reached kSharedLen yet, ONLY slot 0 may be scheduled!
+        if (slots[0].prefill_offset < kSharedLen) {
+            REQUIRE(views.size() == 1u);
+            CHECK(views[0].slot_index == 0u);
+        }
+
+        const PlannedBatchStep plan = PlanContinuousBatchStep(views, /*token_budget=*/128, /*output_budget=*/4, rr);
+        REQUIRE_FALSE(plan.items.empty());
+        for (const PlannedBatchItem& item : plan.items) {
+            REQUIRE(item.is_prefill);
+            BatchSlotPlanView& st = slots[item.slot_index];
+            st.prefill_offset += static_cast<std::size_t>(item.token_count);
+            st.pos += item.token_count;
+            evaluated_tokens[item.slot_index] += static_cast<std::size_t>(item.token_count);
+
+            const auto released = coalescer.OnProducerProgress(item.slot_index, st.prefill_offset);
+            for (const CoalesceReleaseAction& act : released) {
+                CHECK(act.reason == CoalesceReleaseReason::kPrefixPublished);
+                CHECK(act.producer_slot == 0u);
+                CHECK(act.clone_prefix_len == kSharedLen);
+                CHECK(act.tokens_saved == kSharedLen);
+                BatchSlotPlanView& f = slots[act.follower_slot];
+                f.prefill_offset = act.clone_prefix_len;
+                f.pos = static_cast<std::int64_t>(act.clone_prefix_len);
+                cached_tokens[act.follower_slot] += act.tokens_saved;
+            }
+            if (st.prefill_offset >= st.prompt_len) {
+                st.phase = BatchSlotPhase::kDecode;
+            }
+            REQUIRE(coalescer.CheckInvariants());
+        }
+        ++steps;
+    }
+
+    // Verify exact work accounting: producer evaluated full 320, each follower evaluated ONLY its 64-token suffix!
+    CHECK(evaluated_tokens[0] == kSharedLen + kSuffixLen);
+    CHECK(cached_tokens[0] == 0u);
+    std::size_t total_evaluated = evaluated_tokens[0];
+    for (std::size_t i = 1; i < kSiblings; ++i) {
+        CHECK(slots[i].phase == BatchSlotPhase::kDecode);
+        CHECK(evaluated_tokens[i] == kSuffixLen);
+        CHECK(cached_tokens[i] == kSharedLen);
+        CHECK(evaluated_tokens[i] + cached_tokens[i] == prompts[i].size());
+        total_evaluated += evaluated_tokens[i];
+    }
+    const std::size_t uncoalesced_total = kSiblings * (kSharedLen + kSuffixLen);
+    const std::size_t expected_saved = (kSiblings - 1u) * kSharedLen;
+    CHECK(total_evaluated == uncoalesced_total - expected_saved);
+
+    const PrefixCoalescerStats st = coalescer.stats();
+    CHECK(st.coalesced_groups == 1u);
+    CHECK(st.coalesced_followers == 3u);
+    CHECK(st.coalesced_tokens_saved == expected_saved);
+    CHECK(st.coalesce_fallbacks_timeout == 0u);
+    CHECK(st.coalesce_fallbacks_producer_failed == 0u);
+    CHECK(coalescer.ActiveSlotCount() == 0u);
+    CHECK(coalescer.ActiveGroupCount() == 0u);
+    CHECK(coalescer.HeldFollowerCount() == 0u);
+}
+
+TEST_CASE("llamacpp frontier: PrefixCoalescer identical prompts, asymmetric boundaries, partial cache, and follower cap") {
+    // 1. 100% identical prompts clamp target_shared_len to prompt.size() - 1 so follower still gets final logits.
+    {
+        PrefixCoalescerConfig cfg;
+        cfg.min_coalesce_prefix_tokens = 32;
+        PrefixCoalescer c(cfg);
+        const std::vector<Token> identical = MakePrefixedPrompt(100, 10, 0, 0);
+        CHECK(c.OnAdmit(0, identical, 0, 0).role == CoalesceRole::kIndependent);
+        const CoalesceAdmitResult f = c.OnAdmit(1, identical, 0, 0);
+        CHECK(f.role == CoalesceRole::kHeldFollower);
+        CHECK(f.target_shared_len == 99u);  // leaves token index 99 for logits!
+        const auto rel = c.OnProducerProgress(0, 100);
+        REQUIRE(rel.size() == 1u);
+        CHECK(rel[0].clone_prefix_len == 99u);
+        CHECK(rel[0].tokens_saved == 99u);
+        CHECK(c.CheckInvariants());
+    }
+
+    // 2. Asymmetric shared prefixes: F1 shares 128 tokens, F2 shares 256 tokens -> chunked staggered release.
+    {
+        PrefixCoalescerConfig cfg;
+        cfg.min_coalesce_prefix_tokens = 64;
+        PrefixCoalescer c(cfg);
+        const auto p0 = MakePrefixedPrompt(256, 100, 100, 10000);
+        const auto f1 = MakePrefixedPrompt(128, 100, 40, 20000);
+        const auto f2 = MakePrefixedPrompt(256, 100, 40, 30000);
+        CHECK(c.OnAdmit(0, p0, 0, 0).role == CoalesceRole::kIndependent);
+        CHECK(c.OnAdmit(1, f1, 0, 0).target_shared_len == 128u);
+        CHECK(c.OnAdmit(2, f2, 0, 0).target_shared_len == 256u);
+        CHECK(c.SuggestedProducerPublishBoundary(0) == std::optional<std::size_t>(128u));
+
+        // Chunk 1 reaches 128 -> releases F1 immediately while F2 stays held for 256!
+        const auto rel1 = c.OnProducerProgress(0, 128);
+        REQUIRE(rel1.size() == 1u);
+        CHECK(rel1[0].follower_slot == 1u);
+        CHECK(rel1[0].clone_prefix_len == 128u);
+        CHECK_FALSE(c.IsFollowerHeld(1));
+        CHECK(c.IsFollowerHeld(2));
+        CHECK(c.SuggestedProducerPublishBoundary(0) == std::optional<std::size_t>(256u));
+
+        // Chunk 2 reaches 256 -> releases F2!
+        const auto rel2 = c.OnProducerProgress(0, 256);
+        REQUIRE(rel2.size() == 1u);
+        CHECK(rel2[0].follower_slot == 2u);
+        CHECK(rel2[0].clone_prefix_len == 256u);
+        CHECK(c.stats().coalesced_tokens_saved == 384u);
+        CHECK(c.CheckInvariants());
+    }
+
+    // 3. Partially warm arrival counts only incremental tokens saved (shared_len - initial_offset).
+    {
+        PrefixCoalescerConfig cfg;
+        cfg.min_coalesce_prefix_tokens = 64;
+        PrefixCoalescer c(cfg);
+        const auto p0 = MakePrefixedPrompt(300, 500, 50, 1000);
+        const auto f1 = MakePrefixedPrompt(300, 500, 50, 2000);
+        CHECK(c.OnAdmit(0, p0, 100, 0).role == CoalesceRole::kIndependent);
+        const CoalesceAdmitResult r = c.OnAdmit(1, f1, 100, 0);
+        CHECK(r.role == CoalesceRole::kHeldFollower);
+        CHECK(r.target_shared_len == 300u);
+        const auto rel = c.OnProducerProgress(0, 300);
+        REQUIRE(rel.size() == 1u);
+        CHECK(rel[0].clone_prefix_len == 300u);
+        CHECK(rel[0].tokens_saved == 200u);  // 300 - 100 already warm
+        CHECK(c.stats().coalesced_tokens_saved == 200u);
+    }
+
+    // 4. Bounded `max_followers_per_producer`: excess siblings start independent (and form a second group).
+    {
+        PrefixCoalescerConfig cfg;
+        cfg.min_coalesce_prefix_tokens = 64;
+        cfg.max_followers_per_producer = 2;
+        PrefixCoalescer c(cfg);
+        const auto p0 = MakePrefixedPrompt(128, 1, 20, 1000);
+        const auto p1 = MakePrefixedPrompt(128, 1, 20, 2000);
+        const auto p2 = MakePrefixedPrompt(128, 1, 20, 3000);
+        const auto p3 = MakePrefixedPrompt(128, 1, 20, 4000);
+        const auto p4 = MakePrefixedPrompt(128, 1, 20, 5000);
+        CHECK(c.OnAdmit(0, p0, 0, 0).role == CoalesceRole::kIndependent);
+        CHECK(c.OnAdmit(1, p1, 0, 0).producer_slot == std::optional<std::size_t>(0u));
+        CHECK(c.OnAdmit(2, p2, 0, 0).producer_slot == std::optional<std::size_t>(0u));
+        // Slot 0 is full (2/2 followers) -> slot 3 proceeds independently, and slot 4 follows slot 3!
+        CHECK(c.OnAdmit(3, p3, 0, 0).role == CoalesceRole::kIndependent);
+        const CoalesceAdmitResult r4 = c.OnAdmit(4, p4, 0, 0);
+        CHECK(r4.role == CoalesceRole::kHeldFollower);
+        CHECK(r4.producer_slot == std::optional<std::size_t>(3u));
+        CHECK(c.ActiveGroupCount() == 2u);
+        CHECK(c.stats().coalesced_groups == 2u);
+        CHECK(c.stats().coalesced_followers == 3u);
+        CHECK(c.CheckInvariants());
+    }
+}
+
+TEST_CASE("llamacpp frontier: PrefixCoalescer never delays unrelated concurrent requests") {
+    PrefixCoalescerConfig cfg;
+    cfg.min_coalesce_prefix_tokens = 64;
+    PrefixCoalescer c(cfg);
+
+    const auto sib_a = MakePrefixedPrompt(256, 100, 32, 1000);
+    const auto sib_b = MakePrefixedPrompt(256, 100, 32, 2000);
+    const auto unrelated = MakePrefixedPrompt(200, 9000, 40, 9900);
+
+    CHECK(c.OnAdmit(0, sib_a, 0, 0).role == CoalesceRole::kIndependent);
+    CHECK(c.OnAdmit(1, sib_b, 0, 0).role == CoalesceRole::kHeldFollower);
+    const CoalesceAdmitResult u_res = c.OnAdmit(2, unrelated, 0, 0);
+    CHECK(u_res.role == CoalesceRole::kIndependent);
+    CHECK_FALSE(u_res.producer_slot.has_value());
+    CHECK_FALSE(c.IsFollowerHeld(2));
+
+    // Step 1 continuous batch view includes active decode slot 3, producer 0, and unrelated 2 — skips ONLY held follower 1!
+    std::vector<BatchSlotPlanView> all{
+        {0, 0, BatchSlotPhase::kPrefill, sib_a.size(), 0, 0, false},
+        {1, 1, BatchSlotPhase::kPrefill, sib_b.size(), 0, 0, false},
+        {2, 2, BatchSlotPhase::kPrefill, unrelated.size(), 0, 0, false},
+        {3, 3, BatchSlotPhase::kDecode, 64, 64, 70, false},
+    };
+    std::vector<BatchSlotPlanView> runnable;
+    for (const auto& s : all) {
+        if (!c.IsFollowerHeld(s.slot_index)) runnable.push_back(s);
+    }
+    REQUIRE(runnable.size() == 3u);
+    std::size_t rr = 0;
+    const PlannedBatchStep step = PlanContinuousBatchStep(runnable, /*token_budget=*/256, /*output_budget=*/4, rr);
+    bool saw_decode = false;
+    bool saw_producer = false;
+    bool saw_unrelated = false;
+    bool saw_held_follower = false;
+    for (const auto& item : step.items) {
+        if (item.slot_index == 3u) saw_decode = true;
+        if (item.slot_index == 0u) saw_producer = true;
+        if (item.slot_index == 2u) saw_unrelated = true;
+        if (item.slot_index == 1u) saw_held_follower = true;
+    }
+    CHECK(saw_decode);
+    CHECK(saw_producer);
+    CHECK(saw_unrelated);
+    CHECK_FALSE(saw_held_follower);
+    CHECK(c.CheckInvariants());
+}
+
+TEST_CASE("llamacpp frontier: PrefixCoalescer producer cancellation/failure promotes next follower without deadlock") {
+    // 1. Producer P0 cancels with 2 followers F1, F2 -> F1 promoted to producer, F2 re-attached to F1!
+    {
+        PrefixCoalescerConfig cfg;
+        cfg.min_coalesce_prefix_tokens = 64;
+        cfg.max_coalesce_wait_ms = 500;
+        PrefixCoalescer c(cfg);
+
+        const auto p0 = MakePrefixedPrompt(200, 10, 40, 1000);
+        const auto f1 = MakePrefixedPrompt(200, 10, 40, 2000);
+        const auto f2 = MakePrefixedPrompt(200, 10, 40, 3000);
+        CHECK(c.OnAdmit(0, p0, 0, 0).role == CoalesceRole::kIndependent);
+        CHECK(c.OnAdmit(1, f1, 0, 10).role == CoalesceRole::kHeldFollower);
+        CHECK(c.OnAdmit(2, f2, 0, 20).role == CoalesceRole::kHeldFollower);
+
+        // Producer 0 fails/cancels at t = 100 before publishing anything.
+        const auto fail_actions = c.OnSlotRemoved(0);
+        REQUIRE(fail_actions.size() == 1u);
+        CHECK(fail_actions[0].follower_slot == 1u);
+        CHECK(fail_actions[0].reason == CoalesceReleaseReason::kPromotedToProducer);
+        CHECK(fail_actions[0].clone_prefix_len == 0u);
+        CHECK_FALSE(c.IsFollowerHeld(1));
+        CHECK(c.RoleOf(1) == CoalesceRole::kProducer);
+        CHECK(c.IsFollowerHeld(2));
+        CHECK(c.ProducerOf(2) == std::optional<std::size_t>(1u));
+        CHECK(c.TargetSharedLen(2) == 200u);
+        CHECK(c.stats().coalesce_fallbacks_producer_failed == 1u);
+        CHECK(c.stats().coalesced_groups == 1u);  // promotion preserves the group, doesn't double-count
+        CHECK(c.CheckInvariants());
+
+        // Promoted producer F1 finishes [0..200) -> F2 clones from F1 and saves 200 tokens!
+        const auto rel = c.OnProducerProgress(1, 200);
+        REQUIRE(rel.size() == 1u);
+        CHECK(rel[0].follower_slot == 2u);
+        CHECK(rel[0].producer_slot == 1u);
+        CHECK(rel[0].clone_prefix_len == 200u);
+        CHECK(rel[0].tokens_saved == 200u);
+        CHECK(c.stats().coalesced_tokens_saved == 200u);
+        CHECK(c.CheckInvariants());
+    }
+
+    // 2. Single follower: producer fails -> follower immediately falls back to independent prefill.
+    {
+        PrefixCoalescerConfig cfg;
+        cfg.min_coalesce_prefix_tokens = 64;
+        PrefixCoalescer c(cfg);
+        const auto p0 = MakePrefixedPrompt(128, 10, 20, 1000);
+        const auto f1 = MakePrefixedPrompt(128, 10, 20, 2000);
+        CHECK(c.OnAdmit(0, p0, 0, 0).role == CoalesceRole::kIndependent);
+        CHECK(c.OnAdmit(1, f1, 0, 0).role == CoalesceRole::kHeldFollower);
+
+        const auto actions = c.OnSlotRemoved(0);
+        REQUIRE(actions.size() == 1u);
+        CHECK(actions[0].follower_slot == 1u);
+        CHECK(actions[0].reason == CoalesceReleaseReason::kProducerFailed);
+        CHECK(actions[0].clone_prefix_len == 0u);
+        CHECK_FALSE(c.IsFollowerHeld(1));
+        CHECK(c.RoleOf(1) == CoalesceRole::kIndependent);
+        CHECK(c.stats().coalesce_fallbacks_producer_failed == 1u);
+        CHECK(c.CheckInvariants());
+    }
+
+    // 3. Chain promotion preserves original wait_start_ms so timeout ceilings never reset.
+    {
+        PrefixCoalescerConfig cfg;
+        cfg.min_coalesce_prefix_tokens = 64;
+        cfg.max_coalesce_wait_ms = 500;
+        PrefixCoalescer c(cfg);
+        const auto p0 = MakePrefixedPrompt(128, 10, 20, 1000);
+        const auto f1 = MakePrefixedPrompt(128, 10, 20, 2000);
+        const auto f2 = MakePrefixedPrompt(128, 10, 20, 3000);
+        (void)c.OnAdmit(0, p0, 0, 0);
+        (void)c.OnAdmit(1, f1, 0, 0);
+        (void)c.OnAdmit(2, f2, 0, 100);  // wait_start_ms = 100
+
+        (void)c.OnSlotRemoved(0);  // promotes F1, F2 keeps wait_start_ms = 100
+        CHECK(c.PollTimeouts(599).empty());
+        const auto expired = c.PollTimeouts(600);  // 600 - 100 == 500 >= max_coalesce_wait_ms!
+        REQUIRE(expired.size() == 1u);
+        CHECK(expired[0].follower_slot == 2u);
+        CHECK(expired[0].reason == CoalesceReleaseReason::kTimeout);
+        CHECK_FALSE(c.IsFollowerHeld(2));
+        CHECK(c.stats().coalesce_fallbacks_timeout == 1u);
+        CHECK(c.CheckInvariants());
+    }
+
+    // 4. Runtime clone failure rollback restores honest saved-token accounting.
+    {
+        PrefixCoalescerConfig cfg;
+        cfg.min_coalesce_prefix_tokens = 64;
+        PrefixCoalescer c(cfg);
+        const auto p0 = MakePrefixedPrompt(128, 10, 20, 1000);
+        const auto f1 = MakePrefixedPrompt(128, 10, 20, 2000);
+        (void)c.OnAdmit(0, p0, 0, 0);
+        (void)c.OnAdmit(1, f1, 0, 0);
+        const auto rel = c.OnProducerProgress(0, 128);
+        REQUIRE(rel.size() == 1u);
+        CHECK(c.stats().coalesced_tokens_saved == 128u);
+        c.OnCloneFailed(1, /*fallback_prefill_offset=*/0, rel[0].tokens_saved);
+        CHECK(c.stats().coalesced_tokens_saved == 0u);
+        CHECK(c.CheckInvariants());
+    }
+}
+
+TEST_CASE("llamacpp frontier: PrefixCoalescer follower timeout falls back cleanly to independent prefill") {
+    // 1. Timeout before any producer progress -> clean independent prefill from offset 0.
+    {
+        PrefixCoalescerConfig cfg;
+        cfg.min_coalesce_prefix_tokens = 64;
+        cfg.max_coalesce_wait_ms = 250;
+        PrefixCoalescer c(cfg);
+
+        const auto p0 = MakePrefixedPrompt(256, 10, 32, 1000);
+        const auto f1 = MakePrefixedPrompt(256, 10, 32, 2000);
+        CHECK(c.OnAdmit(0, p0, 0, 1000).role == CoalesceRole::kIndependent);
+        CHECK(c.OnAdmit(1, f1, 0, 1000).role == CoalesceRole::kHeldFollower);
+
+        // Before deadline: still held (also safe against monotonic-clock-skew now < wait_start).
+        CHECK(c.PollTimeouts(900).empty());
+        CHECK(c.PollTimeouts(1249).empty());
+        CHECK(c.IsFollowerHeld(1));
+
+        // At deadline (1250 - 1000 == 250): released with kTimeout and 0 cloned tokens.
+        const auto expired = c.PollTimeouts(1250);
+        REQUIRE(expired.size() == 1u);
+        CHECK(expired[0].follower_slot == 1u);
+        CHECK(expired[0].reason == CoalesceReleaseReason::kTimeout);
+        CHECK(expired[0].clone_prefix_len == 0u);
+        CHECK(expired[0].tokens_saved == 0u);
+        CHECK_FALSE(c.IsFollowerHeld(1));
+        CHECK(c.RoleOf(0) == CoalesceRole::kIndependent);
+        CHECK(c.ActiveGroupCount() == 0u);
+        CHECK(c.stats().coalesce_fallbacks_timeout == 1u);
+        CHECK(c.stats().coalesced_tokens_saved == 0u);
+        CHECK(c.CheckInvariants());
+    }
+
+    // 2. Timeout after producer already computed a partial chunk -> harvests partial KV before independent tail!
+    {
+        PrefixCoalescerConfig cfg;
+        cfg.min_coalesce_prefix_tokens = 64;
+        cfg.max_coalesce_wait_ms = 250;
+        PrefixCoalescer c(cfg);
+
+        const auto p0 = MakePrefixedPrompt(256, 10, 32, 1000);
+        const auto f1 = MakePrefixedPrompt(256, 10, 32, 2000);
+        (void)c.OnAdmit(0, p0, 0, 100);
+        (void)c.OnAdmit(1, f1, 0, 100);
+        CHECK(c.OnProducerProgress(0, 128).empty());  // chunk 1 computed, target 256 not yet reached
+
+        const auto expired = c.PollTimeouts(350);
+        REQUIRE(expired.size() == 1u);
+        CHECK(expired[0].follower_slot == 1u);
+        CHECK(expired[0].producer_slot == 0u);
+        CHECK(expired[0].reason == CoalesceReleaseReason::kTimeout);
+        CHECK(expired[0].clone_prefix_len == 128u);
+        CHECK(expired[0].tokens_saved == 128u);
+        CHECK(c.stats().coalesce_fallbacks_timeout == 1u);
+        CHECK(c.stats().coalesced_tokens_saved == 128u);
+        CHECK(c.CheckInvariants());
+    }
+}
+
+TEST_CASE("llamacpp frontier: PrefixCoalescer follower cancellation cleans up without leaking group state") {
+    PrefixCoalescerConfig cfg;
+    cfg.min_coalesce_prefix_tokens = 64;
+    PrefixCoalescer c(cfg);
+
+    const auto p0 = MakePrefixedPrompt(200, 10, 30, 1000);
+    const auto f1 = MakePrefixedPrompt(200, 10, 30, 2000);
+    const auto f2 = MakePrefixedPrompt(200, 10, 30, 3000);
+    (void)c.OnAdmit(0, p0, 0, 0);
+    (void)c.OnAdmit(1, f1, 0, 0);
+    (void)c.OnAdmit(2, f2, 0, 0);
+    CHECK(c.ActiveGroupCount() == 1u);
+    CHECK(c.HeldFollowerCount() == 2u);
+
+    // Cancel follower 1 while held: group stays intact with only follower 2.
+    CHECK(c.OnSlotRemoved(1).empty());
+    CHECK_FALSE(c.IsFollowerHeld(1));
+    CHECK(c.HeldFollowerCount() == 1u);
+    CHECK(c.ActiveGroupCount() == 1u);
+    CHECK(c.FollowersOf(0) == std::vector<std::size_t>{2u});
+    CHECK(c.stats().coalesce_fallbacks_producer_failed == 0u);
+    CHECK(c.stats().coalesce_fallbacks_timeout == 0u);
+    CHECK(c.CheckInvariants());
+
+    // Cancel follower 2 while held: producer cleanly reverts to kIndependent with zero group leak.
+    CHECK(c.OnSlotRemoved(2).empty());
+    CHECK_FALSE(c.IsFollowerHeld(2));
+    CHECK(c.RoleOf(0) == CoalesceRole::kIndependent);
+    CHECK(c.FollowersOf(0).empty());
+    CHECK(c.ActiveGroupCount() == 0u);
+    CHECK(c.HeldFollowerCount() == 0u);
+    CHECK(c.ActiveSlotCount() == 1u);
+    CHECK(c.CheckInvariants());
+
+    // Producer completes its prompt -> zero active slots remaining.
+    CHECK(c.OnProducerProgress(0, p0.size()).empty());
+    CHECK(c.ActiveSlotCount() == 0u);
+    CHECK(c.ActiveGroupCount() == 0u);
+    CHECK(c.HeldFollowerCount() == 0u);
+    CHECK(c.CheckInvariants());
+}
+
+TEST_CASE("llamacpp frontier: PrefixCoalescer bypasses hybrid/recurrent models and validates options") {
+    const auto p0 = MakePrefixedPrompt(256, 10, 32, 1000);
+    const auto p1 = MakePrefixedPrompt(256, 10, 32, 2000);
+
+    // 1. Hybrid without valid checkpoint -> safely bypassed!
+    {
+        PrefixCoalescerConfig cfg;
+        cfg.enabled = true;
+        cfg.architecture = sonder::inference::ModelArchitecture::hybrid;
+        cfg.has_valid_checkpoint = false;
+        cfg.min_coalesce_prefix_tokens = 64;
+        PrefixCoalescer c(cfg);
+        CHECK_FALSE(c.IsEnabled());
+        CHECK(c.OnAdmit(0, p0, 0, 0).role == CoalesceRole::kIndependent);
+        CHECK(c.OnAdmit(1, p1, 0, 0).role == CoalesceRole::kIndependent);
+        CHECK_FALSE(c.IsFollowerHeld(1));
+        CHECK(c.ActiveSlotCount() == 0u);
+        CHECK(c.stats().coalesced_groups == 0u);
+        CHECK(c.stats().coalesced_followers == 0u);
+    }
+
+    // 2. Recurrent without valid checkpoint -> safely bypassed!
+    {
+        PrefixCoalescerConfig cfg;
+        cfg.enabled = true;
+        cfg.architecture = sonder::inference::ModelArchitecture::recurrent;
+        cfg.has_valid_checkpoint = false;
+        cfg.min_coalesce_prefix_tokens = 64;
+        PrefixCoalescer c(cfg);
+        CHECK_FALSE(c.IsEnabled());
+        CHECK(c.OnAdmit(0, p0, 0, 0).role == CoalesceRole::kIndependent);
+        CHECK(c.OnAdmit(1, p1, 0, 0).role == CoalesceRole::kIndependent);
+        CHECK_FALSE(c.IsFollowerHeld(1));
+        CHECK(c.ActiveSlotCount() == 0u);
+    }
+
+    // 3. Explicit checkpoint flag allows hybrid opt-in; enabled=false bypasses attention_only.
+    CHECK(PrefixCoalescer::IsArchitectureEligible(sonder::inference::ModelArchitecture::attention_only, false));
+    CHECK_FALSE(PrefixCoalescer::IsArchitectureEligible(sonder::inference::ModelArchitecture::hybrid, false));
+    CHECK_FALSE(PrefixCoalescer::IsArchitectureEligible(sonder::inference::ModelArchitecture::recurrent, false));
+    CHECK(PrefixCoalescer::IsArchitectureEligible(sonder::inference::ModelArchitecture::hybrid, true));
+
+    {
+        PrefixCoalescerConfig cfg;
+        cfg.enabled = false;
+        cfg.architecture = sonder::inference::ModelArchitecture::attention_only;
+        PrefixCoalescer c(cfg);
+        CHECK_FALSE(c.IsEnabled());
+        CHECK(c.OnAdmit(0, p0, 0, 0).role == CoalesceRole::kIndependent);
+        CHECK(c.OnAdmit(1, p1, 0, 0).role == CoalesceRole::kIndependent);
+    }
+
+    // 4. LoadOptions & LlamaCppBackendOptions validation for prefix coalescing knobs.
+    LoadOptions lo;
+    CHECK(lo.prefix_coalesce);
+    CHECK(lo.min_coalesce_prefix_tokens == kDefaultMinCoalescePrefixTokens);
+    CHECK(lo.max_followers_per_producer == kDefaultMaxCoalesceFollowers);
+    CHECK(lo.max_coalesce_wait_ms == kDefaultMaxCoalesceWaitMs);
+    CHECK(ValidateContextOptions(lo).ok());
+
+    lo.min_coalesce_prefix_tokens = 0;
+    CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
+    lo.min_coalesce_prefix_tokens = 64;
+
+    lo.max_followers_per_producer = 0;
+    CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
+    lo.max_followers_per_producer = kMaxSlots + 1;
+    CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
+    lo.max_followers_per_producer = kMaxSlots;
+    CHECK(ValidateContextOptions(lo).ok());
+
+    lo.max_coalesce_wait_ms = 0;
+    CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
+    lo.max_coalesce_wait_ms = kMaxCoalesceWaitMs + 1;
+    CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
+    lo.max_coalesce_wait_ms = 1000;
+    CHECK(ValidateContextOptions(lo).ok());
+
+    // When prefix_coalesce is disabled, zeroed tuning fields are ignored cleanly.
+    lo.prefix_coalesce = false;
+    lo.min_coalesce_prefix_tokens = 0;
+    lo.max_followers_per_producer = 0;
+    lo.max_coalesce_wait_ms = 0;
+    CHECK(ValidateContextOptions(lo).ok());
+
+    namespace si = sonder::inference;
+    si::LlamaCppBackendOptions bo;
+    bo.prefix_coalesce = true;
+    bo.min_coalesce_prefix_tokens = 128;
+    bo.max_followers_per_producer = 4;
+    bo.max_coalesce_wait_ms = 2000;
+    CHECK(si::validate_llamacpp_options(bo).ok());
+    bo.max_followers_per_producer = kMaxSlots + 1;
+    CHECK(si::validate_llamacpp_options(bo).code() == si::ErrorCode::invalid_argument);
+
+    LlamaCppBackend be;
+    const PrefixCoalescerStats initial_stats = be.GetPrefixCoalescerStats();
+    CHECK(initial_stats.coalesced_groups == 0u);
+    CHECK(initial_stats.coalesced_followers == 0u);
+    CHECK(initial_stats.coalesced_tokens_saved == 0u);
+    CHECK(initial_stats.coalesce_fallbacks_timeout == 0u);
+    CHECK(initial_stats.coalesce_fallbacks_producer_failed == 0u);
+}
+
+TEST_CASE("llamacpp frontier: PrefixCoalescer randomized stress guarantees zero deadlock and strict invariants") {
+    PrefixCoalescerConfig cfg;
+    cfg.enabled = true;
+    cfg.architecture = sonder::inference::ModelArchitecture::attention_only;
+    cfg.min_coalesce_prefix_tokens = 16;
+    cfg.max_followers_per_producer = 3;
+    cfg.max_coalesce_wait_ms = 200;
+    PrefixCoalescer c(cfg);
+
+    constexpr std::size_t kSlots = 12;
+    std::array<bool, kSlots> active{};
+    std::array<std::vector<Token>, kSlots> prompts{};
+    std::array<std::size_t, kSlots> offsets{};
+
+    std::uint64_t rng = 0xC0A1E5CE00000001ULL;
+    auto rnd = [&]() -> std::uint64_t {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        return rng;
+    };
+
+    std::uint64_t now_ms = 0;
+    for (int step = 0; step < 1000; ++step) {
+        now_ms += 10u + (rnd() % 40u);
+        const std::uint64_t op = rnd() % 100u;
+
+        if (op < 40u) {
+            // Admit into a random free slot using one of 3 shared prefix families (or unrelated).
+            const std::size_t s = static_cast<std::size_t>(rnd() % kSlots);
+            if (!active[s]) {
+                const std::uint64_t family = rnd() % 4u;
+                const std::size_t shared = family < 3u ? (32u + static_cast<std::size_t>((rnd() % 3u) * 16u)) : 0u;
+                const std::size_t suffix = 16u + static_cast<std::size_t>(rnd() % 32u);
+                prompts[s] = MakePrefixedPrompt(shared, static_cast<Token>(1000 * (family + 1u)), suffix,
+                                                static_cast<Token>(100000 + step * 64));
+                offsets[s] = 0;
+                active[s] = true;
+                (void)c.OnAdmit(s, prompts[s], 0, now_ms);
+            }
+        } else if (op < 75u) {
+            // Advance a runnable (unheld) active slot by 16..48 tokens.
+            std::vector<std::size_t> runnable;
+            for (std::size_t s = 0; s < kSlots; ++s) {
+                if (active[s] && !c.IsFollowerHeld(s)) runnable.push_back(s);
+            }
+            if (!runnable.empty()) {
+                const std::size_t s = runnable[static_cast<std::size_t>(rnd() % runnable.size())];
+                const std::size_t adv = 16u + static_cast<std::size_t>(rnd() % 33u);
+                offsets[s] = std::min(prompts[s].size(), offsets[s] + adv);
+                const auto released = c.OnProducerProgress(s, offsets[s]);
+                for (const auto& act : released) {
+                    REQUIRE(active[act.follower_slot]);
+                    REQUIRE(act.clone_prefix_len < prompts[act.follower_slot].size());
+                    offsets[act.follower_slot] = act.clone_prefix_len;
+                }
+                if (offsets[s] >= prompts[s].size()) {
+                    active[s] = false;
+                }
+            }
+        } else if (op < 90u) {
+            // Cancel/fail a random active slot (producer OR held follower).
+            const std::size_t s = static_cast<std::size_t>(rnd() % kSlots);
+            if (active[s]) {
+                (void)c.OnSlotRemoved(s);
+                active[s] = false;
+            }
+        } else {
+            // Poll follower timeouts.
+            const auto timed_out = c.PollTimeouts(now_ms);
+            for (const auto& act : timed_out) {
+                REQUIRE(active[act.follower_slot]);
+                if (act.clone_prefix_len > 0) {
+                    offsets[act.follower_slot] = act.clone_prefix_len;
+                }
+            }
+        }
+
+        REQUIRE(c.CheckInvariants());
+
+        // Zero-deadlock invariant: whenever any active slot is held, at least one active slot MUST be runnable!
+        std::size_t any_active = 0;
+        std::size_t any_runnable = 0;
+        for (std::size_t s = 0; s < kSlots; ++s) {
+            if (!active[s]) continue;
+            ++any_active;
+            if (!c.IsFollowerHeld(s)) ++any_runnable;
+        }
+        if (any_active > 0) {
+            REQUIRE(any_runnable > 0);
+        }
+    }
+
+    // Drain all remaining active slots cleanly and verify zero leaked state.
+    for (std::size_t s = 0; s < kSlots; ++s) {
+        if (active[s]) {
+            (void)c.OnSlotRemoved(s);
+            active[s] = false;
+        }
+    }
+    CHECK(c.ActiveSlotCount() == 0u);
+    CHECK(c.ActiveGroupCount() == 0u);
+    CHECK(c.HeldFollowerCount() == 0u);
+    CHECK(c.CheckInvariants());
 }

@@ -1,4 +1,5 @@
 #include "health_features.hpp"
+#include "json_schema_gbnf.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -67,6 +68,24 @@ json::Object health_features_impl(std::string_view backend, const BackendCapabil
     return metadata;
 }
 
+json::Object grammar_engine_cap_json(const GrammarEngineCapabilities& caps) {
+    return json::Object{
+        {"name", caps.engine_name},
+        {"compiled_in", caps.compiled_in},
+        {"sampler_linked", caps.sampler_linked},
+        {"active", caps.active},
+        {"supports_json_object", caps.supports_json_object},
+        {"supports_json_schema", caps.supports_json_schema},
+        {"supports_regex", caps.supports_regex},
+        {"supports_regex_subset", caps.supports_regex_subset},
+        {"supports_structural_tags", caps.supports_structural_tags},
+        {"max_schema_depth", static_cast<std::uint64_t>(caps.max_schema_depth)},
+        {"max_unrolled_bounds", static_cast<std::uint64_t>(caps.max_unrolled_bounds)},
+        {"max_bounded_integer_abs", caps.max_bounded_integer_abs},
+        {"max_grammar_bytes", static_cast<std::uint64_t>(caps.max_grammar_bytes)},
+        {"detail", caps.detail}};
+}
+
 }  // namespace
 
 json::Object health_features(std::string_view backend, const ServerOptions& options, json::Object metadata) {
@@ -89,6 +108,9 @@ json::Object health_features(const std::shared_ptr<Backend>& backend, const Serv
 
 json::Object server_capabilities(const std::shared_ptr<Backend>& backend, const ServerOptions& options) {
     const BackendCapabilities bc = backend ? backend->capabilities() : BackendCapabilities{};
+    const auto gbnf_caps = gbnf_structured_grammar_engine().capabilities();
+    const auto llg_caps = llguidance_structured_grammar_engine().capabilities();
+    const auto active_caps = default_structured_grammar_engine().capabilities();
     return json::Object{
         {"tools", true},
         {"native_tools", true},
@@ -100,7 +122,20 @@ json::Object server_capabilities(const std::shared_ptr<Backend>& backend, const 
         {"structured_output", bc.has(Capability::structured_output)},
         {"multimodal", bc.has(Capability::multimodal)},
         {"logprobs", bc.has(Capability::logprobs)},
-        {"embeddings", bc.has(Capability::embeddings)}};
+        {"embeddings", bc.has(Capability::embeddings)},
+        {"grammar_engine", json::Object{
+            {"active_engine", active_caps.engine_name},
+            {"sampler_linked", active_caps.sampler_linked},
+            {"supports_json_object", active_caps.supports_json_object},
+            {"supports_json_schema", active_caps.supports_json_schema},
+            {"supports_regex", active_caps.supports_regex},
+            {"supports_regex_subset", active_caps.supports_regex_subset},
+            {"supports_structural_tags", active_caps.supports_structural_tags},
+            {"engines", json::Object{
+                {"gbnf", grammar_engine_cap_json(gbnf_caps)},
+                {"llguidance", grammar_engine_cap_json(llg_caps)},
+            }},
+        }}};
 }
 
 json::Array gpu_inventory_json(const std::vector<GpuDeviceInfo>& gpus) {

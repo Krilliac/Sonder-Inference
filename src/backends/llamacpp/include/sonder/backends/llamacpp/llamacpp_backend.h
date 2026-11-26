@@ -113,6 +113,12 @@ inline constexpr std::int32_t kDefaultMtpDraftMax = 3;
 inline constexpr std::uint32_t kMaxCacheRamMiB = 65536;
 inline constexpr std::uint32_t kMaxMoeCacheMiB = 262144;
 
+// Cold shared-prefix prefill coalescing defaults and bounds.
+inline constexpr std::uint32_t kDefaultMinCoalescePrefixTokens = 64;
+inline constexpr std::uint32_t kDefaultMaxCoalesceFollowers = 8;
+inline constexpr std::uint32_t kDefaultMaxCoalesceWaitMs = 5000;
+inline constexpr std::uint32_t kMaxCoalesceWaitMs = 600000;
+
 // Maximum top-K alternative logprobs returned per generated token.
 inline constexpr std::int32_t kMaxTopLogprobs = 20;
 
@@ -189,6 +195,13 @@ struct LoadOptions {
     bool kv_unified = true;
     // Reuse longest matching prompt KV prefix across consecutive turns.
     bool prefix_cache = true;
+    // Coalesce simultaneous cold shared-prefix prefills on attention-only models
+    // (when n_slots > 1 and prefix_cache is enabled). Explicitly bypassed on
+    // hybrid/recurrent models without a valid checkpoint.
+    bool prefix_coalesce = true;
+    std::uint32_t min_coalesce_prefix_tokens = kDefaultMinCoalescePrefixTokens;
+    std::uint32_t max_followers_per_producer = kDefaultMaxCoalesceFollowers;
+    std::uint32_t max_coalesce_wait_ms = kDefaultMaxCoalesceWaitMs;
     // Number of cached KV sequence slots (1..kMaxSlots).
     std::uint32_t n_slots = 1;
     // In-process speculative decoding strategy: "none", "auto", "ngram",
@@ -203,7 +216,8 @@ struct LoadOptions {
     std::uint32_t cache_ram_mib = 0;
     // Dynamic GPU cache in MiB for host-resident MoE experts (0 = disabled, max kMaxMoeCacheMiB).
     std::uint32_t moe_cache_mib = 0;
-    // Fraction of MoE cache capacity reserved for CPU-shared tier (0.0..1.0).
+    // Unused/rejected by the direct llamacpp backend (no execution consumer):
+    // must remain 0.0; non-zero or non-finite values fail with invalid_argument.
     double moe_cache_cpu_share = 0.0;
     // Optional multimodal projector GGUF path (--mmproj); requires SONDER_WITH_MTMD=ON.
     std::string mmproj_path;
@@ -408,6 +422,15 @@ struct TelemetryEvent {
 
 using TelemetrySink = std::function<void(const TelemetryEvent&)>;
 
+// Telemetry counters for cold shared-prefix prefill coalescing.
+struct PrefixCoalescerStats {
+    std::uint64_t coalesced_groups = 0;
+    std::uint64_t coalesced_followers = 0;
+    std::uint64_t coalesced_tokens_saved = 0;
+    std::uint64_t coalesce_fallbacks_timeout = 0;
+    std::uint64_t coalesce_fallbacks_producer_failed = 0;
+};
+
 // One chat message for chat-template formatting (role: system, user,
 // assistant, tool).
 struct ChatTurn {
@@ -530,6 +553,7 @@ public:
                                 std::size_t max_bytes = kMaxSequenceStateBytes);
 
     void SetTelemetrySink(TelemetrySink sink);
+    [[nodiscard]] PrefixCoalescerStats GetPrefixCoalescerStats() const noexcept;
 
 private:
     struct Impl;

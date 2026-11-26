@@ -116,21 +116,6 @@ std::optional<GpuDeviceInfo> select_primary_gpu(const std::vector<GpuDeviceInfo>
 }
 } // namespace
 
-bool help_supports_spec_type(std::string_view help) {
-    static constexpr std::string_view kFlag = "--spec-type";
-    std::size_t pos = 0;
-    while ((pos = help.find(kFlag, pos)) != std::string_view::npos) {
-        const bool start_ok = pos == 0 || help[pos - 1] == ' ' || help[pos - 1] == '\t' ||
-                              help[pos - 1] == '\n' || help[pos - 1] == '\r' || help[pos - 1] == ',';
-        const std::size_t end = pos + kFlag.size();
-        const bool end_ok = end == help.size() || help[end] == ' ' || help[end] == '\t' ||
-                            help[end] == '=' || help[end] == '\n' || help[end] == '\r' || help[end] == ',';
-        if (start_ok && end_ok) return true;
-        pos = end;
-    }
-    return false;
-}
-
 int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostream &err) {
     namespace cli = sonder::cli;
     const auto usage_error = [&](const std::string &message) {
@@ -151,6 +136,9 @@ int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostr
         Options options;
         options.executable = parsed->get("executable").value_or("");
         options.model = parsed->get("model").value_or("");
+        options.draft_model = parsed->get("draft-model").value_or("");
+        options.target_model_sha256 = parsed->get("target-model-sha256").value_or("");
+        options.draft_model_sha256 = parsed->get("draft-model-sha256").value_or("");
         options.mmproj = parsed->get("mmproj").value_or("");
         options.out = parsed->get("out").value_or("tuned.json");
         options.thorough = parsed->has("thorough");
@@ -158,6 +146,13 @@ int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostr
         const bool auto_gpu = parsed->has("auto-gpu");
         const bool is_ternary = parsed->has("ternary");
         bool explicit_uma_mode = false;
+        if (auto limit_arg = parsed->get("trained-block-limit")) {
+            std::uint32_t limit_val = 0;
+            if (!cli::parse_integer<std::uint32_t>("trained-block-limit", *limit_arg, 1u, 16u, limit_val, error)) {
+                return usage_error(error);
+            }
+            options.trained_block_limit = limit_val;
+        }
         if (auto uma_arg = parsed->get("uma-mode")) {
             const auto parsed_uma = parse_uma_mode(*uma_arg);
             if (!parsed_uma) return usage_error("--uma-mode must be auto, on, or off");
@@ -166,8 +161,10 @@ int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostr
         }
         if (options.executable.empty() || options.model.empty() || options.out.empty())
             return usage_error("--executable and --model are required; paths must not be empty");
-        for (const auto *path : {&options.executable, &options.model, &options.mmproj, &options.out})
-            if (path->find('\0') != std::string::npos) return usage_error("paths must not contain NUL");
+        for (const auto *path : {&options.executable, &options.model, &options.draft_model, &options.mmproj, &options.out})
+            if (path->find('\0') != std::string::npos || path->find('\r') != std::string::npos ||
+                path->find('\n') != std::string::npos)
+                return usage_error("paths must not contain NUL or newline characters");
         if (auto budget = parsed->get("budget-minutes")) {
             double minutes = 0;
             if (!cli::parse_number("budget-minutes", *budget, 0.1, 1440, minutes, error)) return usage_error(error);
@@ -217,10 +214,13 @@ int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostr
                 options.grid.spill_mtp.uma_mode = false;
             }
         }
+        if (auto opt_status = validate_options_for_grid(options, parsed->has("dry-run")); !opt_status.ok()) {
+            return usage_error(opt_status.message());
+        }
         if (parsed->has("dry-run")) {
             out << "# Planned calibration search space\n\n"
                    "Adaptive bisection probes context first; only leaders receive throughput measurements.\n"
-                   "MTP >0 rows are conditional on nextn tensors and executable --help; neither is probed here.\n"
+                   "MTP >0 rows require nextn tensors; external draft modes require --draft-model and executable --help support; neither is probed here.\n"
                    "Benchmarks also include 65536 and clean-edge minus 4096; every recommendation gets a +4096 safety probe.\n\n"
                    "| K/V | FA | ctx | ubatch | MTP | spec_type | p_min |\n|---|---|---:|---:|---:|---|---:|\n";
             for (const auto &c : planned_candidates(options.grid, true)) {
@@ -241,24 +241,22 @@ int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostr
         Signals signals;
         dependencies.interrupted = [] { return interrupted.load() != 0; };
         const auto deadline = Clock::now() + options.budget;
-        std::ifstream model(utf8_path(options.model), std::ios::binary);
-        if (!model) return usage_error("cannot open model GGUF");
-        auto info = read_model_info(model, [&] { return dependencies.interrupted() || Clock::now() >= deadline; });
-        if (!info.ok()) {
-            if (dependencies.interrupted()) return cli::kExitCancelled;
-            if (Clock::now() >= deadline) { err << "error: tune: budget exhausted inspecting GGUF\n"; return cli::kExitFailure; }
-            return usage_error(info.status().message());
-        }
-        model.close();
-        if (!options.mmproj.empty() && !std::filesystem::is_regular_file(utf8_path(options.mmproj)))
-            return usage_error("mmproj is not a readable local file");
+        const auto cancelled = [&] { return dependencies.interrupted() || Clock::now() >= deadline; };
         for (const auto &destination : {options.out, options.out + ".results.json"}) {
-            for (const auto &input : {options.model, options.executable, options.mmproj}) {
+            for (const auto &input : {options.model, options.draft_model, options.executable, options.mmproj}) {
                 if (input.empty()) continue;
                 std::error_code ec;
                 if (std::filesystem::equivalent(utf8_path(destination), utf8_path(input), ec) && !ec)
-                    return usage_error("output must not replace a model, projector or executable");
+                    return usage_error("output must not replace a model, draft model, projector or executable");
             }
+        }
+        if (!options.mmproj.empty() && !std::filesystem::is_regular_file(utf8_path(options.mmproj)))
+            return usage_error("mmproj is not a readable local file");
+        PreparedArtifacts artifacts;
+        if (auto art_status = prepare_model_and_draft_artifacts(options, artifacts, cancelled); !art_status.ok()) {
+            if (dependencies.interrupted()) return cli::kExitCancelled;
+            if (Clock::now() >= deadline) { err << "error: tune: budget exhausted inspecting GGUF\n"; return cli::kExitFailure; }
+            return art_status.code() == ErrorCode::io_error ? [&] { err << "error: tune: " << art_status.message() << '\n'; return cli::kExitFailure; }() : usage_error(art_status.message());
         }
         auto parent = utf8_path(options.out).parent_path();
         if (parent.empty()) parent = std::filesystem::current_path();
@@ -268,10 +266,18 @@ int tune_main(const std::vector<std::string> &args, std::ostream &out, std::ostr
             err << "error: tune: " << help.status().message() << '\n';
             return dependencies.interrupted() ? cli::kExitCancelled : cli::kExitFailure;
         }
-        const bool mtp = info.value().has_nextn && help_supports_mtp(help.value());
-        options.spec_type_supported = help_supports_spec_type(help.value());
-        err << "[tune] architecture=" << sonder::inference::to_string(info.value().architecture)
-            << "; MTP=" << (mtp ? "eligible" : "disabled (needs nextn tensors and --help support)") << '\n';
+        if (auto cap_status = apply_executable_capabilities(options, artifacts, help.value(), cancelled); !cap_status.ok()) {
+            if (dependencies.interrupted()) return cli::kExitCancelled;
+            if (Clock::now() >= deadline) { err << "error: tune: budget exhausted validating executable capabilities\n"; return cli::kExitFailure; }
+            return usage_error(cap_status.message());
+        }
+        const bool mtp = artifacts.mtp_available;
+        err << "[tune] architecture=" << sonder::inference::to_string(artifacts.target_info.architecture)
+            << "; MTP=" << (mtp ? "eligible" : "disabled (needs nextn tensors and --help support)");
+        if (!options.draft_model.empty()) {
+            err << "; draft=" << options.draft_model << " (help=" << (options.draft_model_supported ? "supported" : "missing") << ')';
+        }
+        err << '\n';
         auto report = search(options, mtp, deadline, [&](const Candidate &c, Phase phase, Deadline until) {
             err << "[tune] " << (phase == Phase::probe ? "probe " : "bench ") << c.kv.k << '/' << c.kv.v
                 << " fa=" << c.flash_attn << " ctx=" << c.ctx << " ubatch=" << c.ubatch << " mtp=" << c.mtp

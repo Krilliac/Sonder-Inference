@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "batch_scheduler.hpp"
+#include "prefix_coalescer.hpp"
 #include "radix_cache.hpp"
 #include "suffix_matcher.hpp"
 
@@ -526,6 +527,25 @@ struct LlamaCppBackend::Impl {
     // Bounded L2 host-RAM Radix prefix cache (`cache_ram_mib`).
     RadixPrefixCache radix_cache;
 
+    // Cold shared-prefix prefill coalescer (attention-only multi-slot admission)
+    // and lock-free atomic telemetry mirrors for cross-thread inspection.
+    PrefixCoalescer prefix_coalescer;
+    std::atomic<std::uint64_t> stat_coalesced_groups{0};
+    std::atomic<std::uint64_t> stat_coalesced_followers{0};
+    std::atomic<std::uint64_t> stat_coalesced_tokens_saved{0};
+    std::atomic<std::uint64_t> stat_coalesce_fallbacks_timeout{0};
+    std::atomic<std::uint64_t> stat_coalesce_fallbacks_producer_failed{0};
+
+    void SyncCoalescerStats() noexcept {
+        const PrefixCoalescerStats st = prefix_coalescer.stats();
+        stat_coalesced_groups.store(st.coalesced_groups, std::memory_order_relaxed);
+        stat_coalesced_followers.store(st.coalesced_followers, std::memory_order_relaxed);
+        stat_coalesced_tokens_saved.store(st.coalesced_tokens_saved, std::memory_order_relaxed);
+        stat_coalesce_fallbacks_timeout.store(st.coalesce_fallbacks_timeout, std::memory_order_relaxed);
+        stat_coalesce_fallbacks_producer_failed.store(st.coalesce_fallbacks_producer_failed,
+                                                      std::memory_order_relaxed);
+    }
+
     // Isolated lazy embedding context so Embed() never disturbs live KV prefix
     // caches or MTP/backend-sampler graph reservations on `ctx`.
     llama_context* embed_ctx = nullptr;
@@ -672,6 +692,7 @@ struct LlamaCppBackend::Impl {
         for (auto& ckpts : slot_checkpoints) {
             ckpts.clear();
         }
+        prefix_coalescer.ResetActive();
         total_checkpoint_bytes = 0;
         checkpoint_clock = 0;
 #if defined(SONDER_LLAMACPP_HAS_MTP)
@@ -782,6 +803,8 @@ struct LlamaCppBackend::Impl {
         slot_mtp_synced.clear();
         slot_checkpoints.clear();
         radix_cache.Clear();
+        prefix_coalescer.Reset();
+        SyncCoalescerStats();
         total_checkpoint_bytes = 0;
         checkpoint_clock = 0;
         spec_ckpt_buf.clear();
@@ -2172,6 +2195,15 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
         const std::uint64_t l2_bytes64 = static_cast<std::uint64_t>(options.cache_ram_mib) << 20;
         impl_->radix_cache.SetMaxBytes(
             static_cast<std::size_t>(std::min<std::uint64_t>(l2_bytes64, std::numeric_limits<std::size_t>::max())));
+        PrefixCoalescerConfig coalesce_cfg;
+        coalesce_cfg.enabled = options.prefix_cache && options.prefix_coalesce && (n_slots > 1);
+        coalesce_cfg.architecture = impl_->architecture;
+        coalesce_cfg.has_valid_checkpoint = false;
+        coalesce_cfg.min_coalesce_prefix_tokens = options.min_coalesce_prefix_tokens;
+        coalesce_cfg.max_followers_per_producer = options.max_followers_per_producer;
+        coalesce_cfg.max_coalesce_wait_ms = options.max_coalesce_wait_ms;
+        impl_->prefix_coalescer.Configure(coalesce_cfg);
+        impl_->SyncCoalescerStats();
 
 #if defined(SONDER_LLAMACPP_HAS_MTMD)
         if (!options.mmproj_path.empty()) {
@@ -2432,6 +2464,18 @@ Status LlamaCppBackend::FormatChat(std::string_view chat_template, const std::ve
 }
 
 void LlamaCppBackend::SetTelemetrySink(TelemetrySink sink) { impl_->telemetry = std::move(sink); }
+
+PrefixCoalescerStats LlamaCppBackend::GetPrefixCoalescerStats() const noexcept {
+    PrefixCoalescerStats out;
+    if (!impl_) return out;
+    out.coalesced_groups = impl_->stat_coalesced_groups.load(std::memory_order_relaxed);
+    out.coalesced_followers = impl_->stat_coalesced_followers.load(std::memory_order_relaxed);
+    out.coalesced_tokens_saved = impl_->stat_coalesced_tokens_saved.load(std::memory_order_relaxed);
+    out.coalesce_fallbacks_timeout = impl_->stat_coalesce_fallbacks_timeout.load(std::memory_order_relaxed);
+    out.coalesce_fallbacks_producer_failed =
+        impl_->stat_coalesce_fallbacks_producer_failed.load(std::memory_order_relaxed);
+    return out;
+}
 
 Status LlamaCppBackend::CaptureSequenceState(std::vector<std::uint8_t>& out_bytes, std::size_t max_bytes) {
     out_bytes.clear();
@@ -3720,6 +3764,92 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 
     std::vector<std::unique_ptr<ActiveBatchSlot>> active;
     std::size_t rr_cursor = 0;
+    const auto coalesce_clock_origin = Clock::now();
+    auto coalesce_now_ms = [&]() -> std::uint64_t {
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - coalesce_clock_origin).count();
+        return elapsed > 0 ? static_cast<std::uint64_t>(elapsed) : 0u;
+    };
+
+    auto find_active_by_slot = [&](std::size_t slot_index) -> ActiveBatchSlot* {
+        for (auto& sp : active) {
+            if (sp->slot_idx == slot_index) return sp.get();
+        }
+        return nullptr;
+    };
+
+    // Materializes zero-copy VRAM KV clones for followers released by a
+    // producer publishing `[0, clone_prefix_len)` (or a partial chunk on
+    // timeout). Falls back safely to independent prefill if the clone fails.
+    auto apply_coalesce_releases = [&](const std::vector<CoalesceReleaseAction>& actions) {
+        if (actions.empty()) return;
+        for (const CoalesceReleaseAction& act : actions) {
+            if (act.clone_prefix_len == 0) continue;
+            ActiveBatchSlot* follower = find_active_by_slot(act.follower_slot);
+            ActiveBatchSlot* producer = find_active_by_slot(act.producer_slot);
+            if (follower == nullptr || follower->task == nullptr || follower->IsCancelled()) {
+                prefix_coalescer.OnCloneFailed(act.follower_slot,
+                                               follower != nullptr ? follower->prefill_offset : 0u,
+                                               act.tokens_saved);
+                continue;
+            }
+            const bool can_clone =
+                architecture == sonder::inference::ModelArchitecture::attention_only &&
+                producer != nullptr && producer->slot_valid &&
+                act.clone_prefix_len < follower->task->req->prompt.size();
+            bool cloned_ok = false;
+            if (can_clone) {
+                const int64_t src_kv = llama_memory_seq_pos_max(mem, producer->slot_id) + 1;
+                if (src_kv >= static_cast<int64_t>(act.clone_prefix_len)) {
+                    llama_memory_seq_rm(mem, follower->slot_id, -1, -1);
+                    ClearSlotCheckpoints(follower->slot_idx);
+                    llama_memory_seq_cp(mem, producer->slot_id, follower->slot_id, 0,
+                                        static_cast<llama_pos>(act.clone_prefix_len));
+                    if (llama_memory_seq_pos_max(mem, follower->slot_id) + 1 ==
+                        static_cast<int64_t>(act.clone_prefix_len)) {
+                        cloned_ok = true;
+                        const auto& fprompt = follower->task->req->prompt;
+                        slots[follower->slot_idx].tokens.assign(
+                            fprompt.begin(),
+                            fprompt.begin() + static_cast<std::ptrdiff_t>(act.clone_prefix_len));
+                        slots[follower->slot_idx].last_used = ++slot_clock;
+                        follower->prefill_offset = act.clone_prefix_len;
+                        follower->pos = static_cast<int64_t>(act.clone_prefix_len);
+                        follower->result.cached_tokens = static_cast<std::int32_t>(
+                            std::min<std::size_t>(act.clone_prefix_len, static_cast<std::size_t>(INT32_MAX)));
+                        if (follower->slot_idx < slot_mtp_synced.size()) {
+                            slot_mtp_synced[follower->slot_idx] = false;
+                        }
+#if defined(SONDER_LLAMACPP_HAS_MTP)
+                        if (ctx_dft != nullptr && follower->slot_idx < mtp_pending_h.size()) {
+                            if (!mtp_mem_shared) {
+                                llama_memory_seq_rm(llama_get_memory(ctx_dft), follower->slot_id, -1, -1);
+                            }
+                            std::fill(mtp_pending_h[follower->slot_idx].begin(),
+                                      mtp_pending_h[follower->slot_idx].end(), 0.0F);
+                            if (follower->slot_idx < mtp_deferred.size()) {
+                                mtp_deferred[follower->slot_idx].Clear();
+                            }
+                        }
+#endif
+                    } else {
+                        llama_memory_seq_rm(mem, follower->slot_id, -1, -1);
+                        slots[follower->slot_idx].tokens.clear();
+                        follower->prefill_offset = 0;
+                        follower->pos = 0;
+                        follower->result.cached_tokens = 0;
+                        if (follower->slot_idx < slot_mtp_synced.size()) {
+                            slot_mtp_synced[follower->slot_idx] = false;
+                        }
+                    }
+                }
+            }
+            if (!cloned_ok) {
+                prefix_coalescer.OnCloneFailed(follower->slot_idx, follower->prefill_offset, act.tokens_saved);
+            }
+        }
+        SyncCoalescerStats();
+    };
 
     auto complete_task = [](PendingRequest* task, GenerateResult&& res) {
         if (task == nullptr) return;
@@ -3747,6 +3877,10 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         s.slot_valid = false;
         s.mtp_enabled = false;
         s.hybrid_suffix_enabled = false;
+        if (prefix_coalescer.IsEnabled()) {
+            (void)prefix_coalescer.OnSlotRemoved(s.slot_idx);
+            SyncCoalescerStats();
+        }
         llama_memory_seq_rm(mem, s.slot_id, -1, -1);
         if (s.slot_idx < slots.size()) {
             slots[s.slot_idx].tokens.clear();
@@ -3790,6 +3924,10 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
     };
 
     auto finish_slot = [&](ActiveBatchSlot& s, StopReason reason) {
+        if (prefix_coalescer.IsEnabled()) {
+            (void)prefix_coalescer.OnSlotRemoved(s.slot_idx);
+            SyncCoalescerStats();
+        }
         detach_gpu_sampler(s);
         s.result.stop_reason = reason;
         if (s.prefill_done) {
@@ -4197,6 +4335,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 }
             }
             active.clear();
+            prefix_coalescer.ResetActive();
+            SyncCoalescerStats();
             break;
         }
 
@@ -4249,6 +4389,12 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     const bool allow_l2_snapshot =
                         active.empty() && pending_count.load(std::memory_order_acquire) == 0;
                     if (auto slot_obj = admit_request(admitted_task, sel, allow_l2_snapshot)) {
+                        if (prefix_coalescer.IsEnabled() && slot_obj->phase == BatchSlotPhase::kPrefill &&
+                            slot_obj->prefill_offset < admitted_task->req->prompt.size()) {
+                            (void)prefix_coalescer.OnAdmit(slot_obj->slot_idx, admitted_task->req->prompt,
+                                                           slot_obj->prefill_offset, coalesce_now_ms());
+                            SyncCoalescerStats();
+                        }
                         active.push_back(std::move(slot_obj));
                     }
                     inflight_admit = nullptr;
@@ -4342,6 +4488,10 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 s.result.prompt_tokens += n;
                 s.pos += n;
                 s.prefill_offset = static_cast<std::size_t>(step_end);
+                if (prefix_coalescer.IsEnabled() && s.slot_valid) {
+                    const auto published = prefix_coalescer.OnProducerProgress(s.slot_idx, s.prefill_offset);
+                    apply_coalesce_releases(published);
+                }
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
                 if (s.hybrid_ckpt_offset == step_end && s.slot_valid) {
                     CapturePartialCheckpoint(s.slot_idx, s.slot_id, static_cast<std::size_t>(s.pos));
@@ -4843,21 +4993,39 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             sp->batch_logit_idx = -1;
         }
 
-        views.clear();
+        if (prefix_coalescer.IsEnabled()) {
+            const auto timed_out = prefix_coalescer.PollTimeouts(coalesce_now_ms());
+            apply_coalesce_releases(timed_out);
+        }
+
         std::size_t decoding_count = 0;
-        for (const auto& sp : active) {
-            if (!sp->IsCancelled() && sp->phase == BatchSlotPhase::kDecode) {
-                ++decoding_count;
+        auto build_views = [&]() {
+            views.clear();
+            decoding_count = 0;
+            for (const auto& sp : active) {
+                if (prefix_coalescer.IsFollowerHeld(sp->slot_idx)) {
+                    continue;
+                }
+                if (!sp->IsCancelled() && sp->phase == BatchSlotPhase::kDecode) {
+                    ++decoding_count;
+                }
+                views.push_back(BatchSlotPlanView{
+                    sp->slot_idx,
+                    static_cast<std::int32_t>(sp->slot_id),
+                    sp->phase,
+                    sp->task->req->prompt.size(),
+                    sp->prefill_offset,
+                    sp->pos,
+                    sp->IsCancelled(),
+                });
             }
-            views.push_back(BatchSlotPlanView{
-                sp->slot_idx,
-                static_cast<std::int32_t>(sp->slot_id),
-                sp->phase,
-                sp->task->req->prompt.size(),
-                sp->prefill_offset,
-                sp->pos,
-                sp->IsCancelled(),
-            });
+        };
+        build_views();
+        if (views.empty() && !active.empty() && prefix_coalescer.HeldFollowerCount() > 0) {
+            // Defensive anti-deadlock guard (unreachable under coalescer invariants).
+            (void)prefix_coalescer.ReleaseAllFollowers();
+            SyncCoalescerStats();
+            build_views();
         }
 
         // Prioritize low inter-token latency when any slot is decoding (cap
@@ -4872,12 +5040,28 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             continue;
         }
 
-        auto find_active_by_slot = [&](std::size_t slot_index) -> ActiveBatchSlot* {
-            for (auto& sp : active) {
-                if (sp->slot_idx == slot_index) return sp.get();
+        // When a producer has waiting followers and a material non-shared
+        // suffix tail in this chunk, align the chunk to the earliest follower
+        // publish boundary so followers can clone and join the very next step.
+        if (prefix_coalescer.IsEnabled()) {
+            const std::size_t min_split_tail = prefix_coalescer.config().min_coalesce_prefix_tokens;
+            for (PlannedBatchItem& item : plan.items) {
+                if (!item.is_prefill) continue;
+                const auto boundary = prefix_coalescer.SuggestedProducerPublishBoundary(item.slot_index);
+                if (!boundary.has_value()) continue;
+                const std::size_t step_end = item.token_offset + static_cast<std::size_t>(item.token_count);
+                if (item.token_offset < *boundary && step_end > *boundary &&
+                    (step_end - *boundary) >= min_split_tail) {
+                    const auto trimmed = static_cast<std::int32_t>(*boundary - item.token_offset);
+                    plan.total_tokens -= (item.token_count - trimmed);
+                    item.token_count = trimmed;
+                    if (item.request_logits) {
+                        item.request_logits = false;
+                        plan.total_outputs -= 1;
+                    }
+                }
             }
-            return nullptr;
-        };
+        }
 
         auto pack_plan = [&](const PlannedBatchStep& p) {
             BatchClear(batch);
@@ -5003,6 +5187,14 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 s->pos += item.token_count;
                 s->result.prompt_tokens += item.token_count;
 
+                // Publish newly computed prefix KV to waiting followers BEFORE
+                // this producer could finish (max_new_tokens==0 / EOG / error)
+                // or release its slot.
+                if (prefix_coalescer.IsEnabled() && s->slot_valid) {
+                    const auto published = prefix_coalescer.OnProducerProgress(s->slot_idx, s->prefill_offset);
+                    apply_coalesce_releases(published);
+                }
+
                 if (s->prefill_offset >= req.prompt.size()) {
                     s->prefill_done = true;
                     s->result.prefill_ms = MsSince(s->prefill_start);
@@ -5115,6 +5307,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             }
         }
         active.clear();
+        prefix_coalescer.ResetActive();
+        SyncCoalescerStats();
         std::fill(slot_busy.begin(), slot_busy.end(), std::uint8_t{0});
     } catch (...) {
         batch_abort_fn = nullptr;
@@ -5141,6 +5335,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             }
         }
         active.clear();
+        prefix_coalescer.ResetActive();
+        SyncCoalescerStats();
         std::fill(slot_busy.begin(), slot_busy.end(), std::uint8_t{0});
     }
 

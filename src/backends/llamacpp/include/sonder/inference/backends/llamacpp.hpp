@@ -61,6 +61,12 @@ struct LlamaCppBackendOptions {
     bool kv_unified = true;
     // Reuse longest matching prompt KV prefix across consecutive turns.
     bool prefix_cache = true;
+    // Coalesce simultaneous cold shared-prefix prefills on attention-only models
+    // (requires slots > 1 and prefix_cache = true; bypassed on hybrid/recurrent).
+    bool prefix_coalesce = true;
+    std::uint32_t min_coalesce_prefix_tokens = 64;
+    std::uint32_t max_followers_per_producer = 8;
+    std::uint32_t max_coalesce_wait_ms = 5000;
     // Number of cached KV sequence slots (1..16). Values > 1 allow interleaved
     // conversations (matched by session_key or longest common prefix) without
     // evicting each other's prefix cache.
@@ -81,7 +87,8 @@ struct LlamaCppBackendOptions {
     std::uint32_t cache_ram_mib = 0;
     // Dynamic GPU cache in MiB for host-resident MoE experts (0 = disabled, max 262144).
     std::uint32_t moe_cache_mib = 0;
-    // Fraction of MoE cache capacity reserved for CPU-shared tier (0.0..1.0).
+    // Unused/rejected by the direct llamacpp backend (no execution consumer):
+    // must remain 0.0; non-zero or non-finite values fail with invalid_argument.
     double moe_cache_cpu_share = 0.0;
     // Optional multimodal projector GGUF path (--mmproj); requires libmtmd build.
     std::string mmproj_path;

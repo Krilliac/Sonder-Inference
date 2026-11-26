@@ -1244,4 +1244,106 @@ TEST_SUITE("llamaserver_tool_calling_and_stream") {
         REQUIRE_FALSE(r.ok());
         CHECK(r.status().code() == ErrorCode::protocol_error);
     }
+
+    TEST_CASE("build_chat_body preserves interleaved content part ordering and legacy compatibility") {
+        // 1. Interleaved (text1, image1, text2, image2, text3) preserves exact order and MIME types.
+        ChatRequest r;
+        ChatMessage user;
+        user.role = "user";
+        user.content = "text1text2text3";
+        MediaContent img1{"image/png", {1, 2, 3}};
+        MediaContent img2{"image/jpeg", {4, 5, 6}};
+        user.media = {img1, img2};
+        user.parts = {
+            TextContentPart{"text1"},
+            ImageContentPart{img1},
+            TextContentPart{""},  // skipped when images exist
+            TextContentPart{"text2"},
+            ImageContentPart{img2},
+            TextContentPart{"text3"},
+        };
+        r.messages.push_back(user);
+
+        const auto body = llamaserver::build_chat_body("m", r);
+        const auto& msgs = body.find("messages")->as_array();
+        REQUIRE(msgs.size() == 1u);
+        const auto* content = msgs[0].find("content");
+        REQUIRE(content != nullptr);
+        REQUIRE(content->is_array());
+        const auto& parts = content->as_array();
+        REQUIRE(parts.size() == 5u);
+        CHECK(parts[0].find("type")->as_string() == "text");
+        CHECK(parts[0].find("text")->as_string() == "text1");
+        CHECK(parts[1].find("type")->as_string() == "image_url");
+        CHECK(parts[1].find("image_url")->find("url")->as_string() == "data:image/png;base64,AQID");
+        CHECK(parts[2].find("type")->as_string() == "text");
+        CHECK(parts[2].find("text")->as_string() == "text2");
+        CHECK(parts[3].find("type")->as_string() == "image_url");
+        CHECK(parts[3].find("image_url")->find("url")->as_string() == "data:image/jpeg;base64,BAUG");
+        CHECK(parts[4].find("type")->as_string() == "text");
+        CHECK(parts[4].find("text")->as_string() == "text3");
+
+        // 2. Text-only parts collapse cleanly to a plain string.
+        ChatRequest text_only;
+        ChatMessage txt_msg;
+        txt_msg.role = "user";
+        txt_msg.parts = {TextContentPart{"hello "}, TextContentPart{"world"}};
+        text_only.messages.push_back(txt_msg);
+        const auto txt_body = llamaserver::build_chat_body("m", text_only);
+        const auto* txt_content = txt_body.find("messages")->as_array()[0].find("content");
+        REQUIRE(txt_content != nullptr);
+        REQUIRE(txt_content->is_string());
+        CHECK(txt_content->as_string() == "hello world");
+
+        // 3. Image-only parts omit text items.
+        ChatRequest img_only;
+        ChatMessage io_msg;
+        io_msg.role = "user";
+        io_msg.parts = {ImageContentPart{img1}};
+        img_only.messages.push_back(io_msg);
+        const auto io_body = llamaserver::build_chat_body("m", img_only);
+        const auto& io_parts = io_body.find("messages")->as_array()[0].find("content")->as_array();
+        REQUIRE(io_parts.size() == 1u);
+        CHECK(io_parts[0].find("type")->as_string() == "image_url");
+
+        // 4. Legacy fallback (empty parts, content + media) preserves [text, media...] layout.
+        ChatRequest legacy;
+        ChatMessage leg_msg;
+        leg_msg.role = "user";
+        leg_msg.content = "legacy";
+        leg_msg.media = {img1, img2};
+        legacy.messages.push_back(leg_msg);
+        const auto leg_body = llamaserver::build_chat_body("m", legacy);
+        const auto& leg_parts = leg_body.find("messages")->as_array()[0].find("content")->as_array();
+        REQUIRE(leg_parts.size() == 3u);
+        CHECK(leg_parts[0].find("text")->as_string() == "legacy");
+        CHECK(leg_parts[1].find("image_url")->find("url")->as_string() == "data:image/png;base64,AQID");
+        CHECK(leg_parts[2].find("image_url")->find("url")->as_string() == "data:image/jpeg;base64,BAUG");
+    }
+
+    TEST_CASE("build_chat_body preserves ToolDefinition.strict and ChatRequest.parallel_tool_calls when active") {
+        ChatRequest req = chat();
+        ToolDefinition strict_tool{"strict_fn", "Strict", R"({"type":"object","additionalProperties":false})", true};
+        ToolDefinition loose_tool{"loose_fn", "Loose", R"({"type":"object"})", false};
+        ToolDefinition default_tool{"default_fn", "Default", R"({"type":"object"})"};
+        req.tools = {strict_tool, loose_tool, default_tool};
+        req.tool_choice = ToolChoice{ToolChoiceMode::auto_choice, ""};
+        req.parallel_tool_calls = false;
+
+        const auto body = llamaserver::build_chat_body("m", req);
+        REQUIRE(body.find("parallel_tool_calls") != nullptr);
+        CHECK_FALSE(body.find("parallel_tool_calls")->as_bool());
+        const auto *tools = body.find("tools");
+        REQUIRE(tools != nullptr);
+        REQUIRE(tools->as_array().size() == 3u);
+        CHECK(tools->as_array()[0].find("function")->find("strict")->as_bool());
+        CHECK_FALSE(tools->as_array()[1].find("function")->find("strict")->as_bool());
+        CHECK(tools->as_array()[2].find("function")->find("strict") == nullptr);
+
+        // When tool_choice == none, tools and parallel_tool_calls are both omitted cleanly.
+        req.tool_choice = ToolChoice{ToolChoiceMode::none, ""};
+        const auto suppressed = llamaserver::build_chat_body("m", req);
+        CHECK(suppressed.find("tools") == nullptr);
+        CHECK(suppressed.find("parallel_tool_calls") == nullptr);
+    }
 }

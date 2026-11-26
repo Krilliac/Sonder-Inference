@@ -15,6 +15,8 @@
 #include <thread>
 #include <variant>
 
+#include "http.hpp"
+#include "json_schema_gbnf.hpp"
 #include "live_hub.hpp"
 #include "common/log_queue.hpp"
 #include "residency.hpp"
@@ -59,6 +61,7 @@ struct HealthSnapshot {
     const std::string& node_id;
     std::chrono::steady_clock::time_point started_at;
     bool synthetic = false;
+    CompiledGrammarCacheStats grammar_cache{};
 };
 
 json::Object build_health_body(const HealthSnapshot& snapshot);

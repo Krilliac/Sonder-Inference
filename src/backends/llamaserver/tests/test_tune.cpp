@@ -2,6 +2,7 @@
 #include "../tune_model.hpp"
 #include "../adaptive_speculation.hpp"
 #include "../log_diagnostics.hpp"
+#include "common/sha256.hpp"
 #include <doctest/doctest.h>
 #include <algorithm>
 #include <filesystem>
@@ -1173,5 +1174,235 @@ TEST_CASE("tune CLI accepts auto-gpu ternary uma-mode and adaptive-speculation f
                                "--grid", R"({"kv":[["q4_0","q4_0"]],"ctx":[65536],"ubatch":[512],"mtp":[0]})",
                                conflict_flag, "--dry-run"}, out, err) == 2);
         CHECK(err.str().find("--grid cannot be combined") != std::string::npos);
+    }
+}
+
+TEST_CASE("tune draft artifact validation, compatibility, SHA-256 provenance, and CLI options") {
+    const auto make_pair_gguf = [](const std::string &arch, const std::string &tok_model,
+                                   std::uint64_t vocab_count, std::uint32_t split_count = 1) {
+        std::string out = "GGUF";
+        integer(out, 3, 4); // version
+        integer(out, 1, 8); // 1 tensor
+        std::uint64_t kv_count = 2 + (tok_model.empty() ? 0 : 1) + (split_count != 1 ? 1 : 0);
+        integer(out, kv_count, 8);
+        string(out, "general.architecture"); integer(out, 8, 4); string(out, arch);
+        string(out, arch + ".vocab_size"); integer(out, 4, 4); integer(out, vocab_count, 4);
+        if (!tok_model.empty()) {
+            string(out, "tokenizer.ggml.model"); integer(out, 8, 4); string(out, tok_model);
+        }
+        if (split_count != 1) {
+            string(out, "split.count"); integer(out, 4, 4); integer(out, split_count, 4);
+        }
+        string(out, "blk.0.attn_q.weight");
+        integer(out, 2, 4); integer(out, 32, 8); integer(out, 32, 8); integer(out, 0, 4); integer(out, 0, 8);
+        return out;
+    };
+
+    // Help detection for draft-model flags and enumerated spec_type values.
+    CHECK(tune::help_supports_draft_model(
+        "--spec-type TYPE\n    possible: none, draft-dflash, draft-eagle3\n--spec-draft-model FNAME\n--spec-draft-n-max N\n"));
+    CHECK(tune::help_supports_draft_model("--spec-type TYPE\n--model-draft PATH\n--spec-draft-n-max N\n"));
+    CHECK(tune::help_supports_draft_model("--spec-type TYPE\n  -md FNAME\n--spec-draft-n-max N\n"));
+    CHECK_FALSE(tune::help_supports_draft_model("--spec-type TYPE\n--md5 HEX\n--spec-draft-n-max N\n"));
+    CHECK_FALSE(tune::help_supports_draft_model("--spec-type TYPE\n--spec-draft-model FNAME\n"));
+    CHECK(tune::help_supports_spec_type_value("--spec-type TYPE\n    possible: none, draft-dflash, draft-eagle3\n", "dflash"));
+    CHECK(tune::help_supports_spec_type_value("--spec-type TYPE\n    possible: none, draft-dflash, draft-eagle3\n", "draft-eagle3"));
+    CHECK_FALSE(tune::help_supports_spec_type_value("--spec-type TYPE\n    possible: none, draft-mtp\n", "draft-dflash"));
+
+    // External-draft spec_type + --spec-draft-model emission in arguments().
+    CHECK(tune::uses_draft_model("dflash"));
+    CHECK(tune::uses_draft_model("draft-dflash"));
+    CHECK(tune::uses_draft_model("draft-eagle3"));
+    CHECK_FALSE(tune::uses_draft_model("draft-mtp"));
+    CHECK_FALSE(tune::uses_draft_model("ngram-mod"));
+
+    // search() fails closed BEFORE probing if external draft lacks draft_model or exceeds trained_block_limit.
+    {
+        tune::Options bad;
+        bad.model = "m.gguf";
+        bad.grid.ctx = {65536};
+        bad.grid.ubatch = {512};
+        bad.grid.mtp = {0, 8};
+        bad.grid.spec_type = {"dflash"};
+        int probes = 0;
+        const auto rep = tune::search(
+            bad, false, tune::Clock::now() + std::chrono::minutes(1),
+            [&](const tune::Candidate &, tune::Phase, tune::Deadline) { ++probes; return tune::Measurement{}; });
+        CHECK(probes == 0);
+        CHECK(rep.stopped_reason.find("draft_model") != std::string::npos);
+
+        bad.draft_model = "d.gguf";
+        bad.trained_block_limit = 4;
+        const auto rep_limit = tune::search(
+            bad, false, tune::Clock::now() + std::chrono::minutes(1),
+            [&](const tune::Candidate &, tune::Phase, tune::Deadline) { ++probes; return tune::Measurement{}; });
+        CHECK(probes == 0);
+        CHECK(rep_limit.stopped_reason.find("trained_block_limit") != std::string::npos);
+    }
+
+    // Read GGUF metadata + pre-grid compatibility + SHA-256 verification + report provenance.
+    const auto tmp_dir = std::filesystem::temp_directory_path() /
+                         ("sonder-tune-draft-" + std::to_string(tune::Clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(tmp_dir);
+    struct DirCleanup {
+        std::filesystem::path dir;
+        ~DirCleanup() { std::error_code ec; std::filesystem::remove_all(dir, ec); }
+    } dir_cleanup{tmp_dir};
+
+    const auto write_bin = [&](const std::string &name, const std::string &bytes) {
+        const auto p = tmp_dir / name;
+        std::ofstream out(p, std::ios::binary);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        return p.string();
+    };
+
+    const std::string target_bytes = make_pair_gguf("qwen3", "gpt2", 151936);
+    const std::string ok_draft_bytes = make_pair_gguf("qwen3_dflash", "gpt2", 151936);
+    const std::string bad_vocab_bytes = make_pair_gguf("qwen3_dflash", "gpt2", 32000);
+    const std::string bad_tok_bytes = make_pair_gguf("qwen3_dflash", "llama", 151936);
+    const std::string bad_arch_bytes = make_pair_gguf("llama", "gpt2", 151936);
+    const std::string sharded_bytes = make_pair_gguf("qwen3_dflash", "gpt2", 151936, 2);
+
+    const std::string target_path = write_bin("target.gguf", target_bytes);
+    const std::string ok_draft_path = write_bin("draft.gguf", ok_draft_bytes);
+    const std::string bad_vocab_path = write_bin("bad_vocab.gguf", bad_vocab_bytes);
+    const std::string bad_tok_path = write_bin("bad_tok.gguf", bad_tok_bytes);
+    const std::string bad_arch_path = write_bin("bad_arch.gguf", bad_arch_bytes);
+    const std::string sharded_path = write_bin("sharded.gguf", sharded_bytes);
+    const std::string exe_path = write_bin("fake-llama-server.exe", "MZ-fake-server");
+
+    const std::string target_sha = sonder::inference::detail::sha256_hex(target_bytes);
+    const std::string draft_sha = sonder::inference::detail::sha256_hex(ok_draft_bytes);
+    const std::string exe_sha = sonder::inference::detail::sha256_hex("MZ-fake-server");
+    const std::string full_help =
+        "--spec-type TYPE\n    possible: none, draft-dflash, draft-eagle3\n--spec-draft-model FNAME\n--spec-draft-n-max N\n";
+
+    tune::Options valid;
+    valid.executable = exe_path;
+    valid.model = target_path;
+    valid.draft_model = ok_draft_path;
+    valid.target_model_sha256 = target_sha;
+    valid.draft_model_sha256 = draft_sha;
+    valid.trained_block_limit = 8;
+    valid.grid.ctx = {65536};
+    valid.grid.ubatch = {512};
+    valid.grid.mtp = {0, 4, 8};
+    valid.grid.spec_type = {"draft-dflash", "draft-eagle3"};
+
+    auto prepared = tune::prepare_live_artifacts(valid, full_help);
+    REQUIRE_MESSAGE(prepared.ok(), prepared.status().message());
+    CHECK(valid.draft_model_supported);
+    REQUIRE(valid.target_identity.has_value());
+    REQUIRE(valid.draft_identity.has_value());
+    REQUIRE(valid.executable_identity.has_value());
+    CHECK(valid.target_identity->sha256 == target_sha);
+    CHECK(valid.target_identity->architecture == "qwen3");
+    CHECK(valid.target_identity->vocab_size == std::optional<std::uint64_t>(151936));
+    CHECK(valid.draft_identity->sha256 == draft_sha);
+    CHECK(valid.draft_identity->architecture == "qwen3_dflash");
+    CHECK(valid.draft_identity->trained_block_limit == std::optional<std::uint32_t>(8u));
+    CHECK(valid.executable_identity->sha256 == exe_sha);
+    CHECK(valid.executable_identity->supports_draft_model);
+
+    // arguments() emits --spec-draft-model only for external draft modes with mtp > 0.
+    const auto eagle_argv = tune::arguments(valid, {{"q4_0", "q4_0"}, 65536, 512, 8, "draft-eagle3", 0.5, "on"});
+    const auto draft_flag = std::find(eagle_argv.begin(), eagle_argv.end(), "--spec-draft-model");
+    REQUIRE(draft_flag != eagle_argv.end());
+    CHECK(*std::next(draft_flag) == ok_draft_path);
+    const auto base_argv = tune::arguments(valid, {{"q4_0", "q4_0"}, 65536, 512, 0, "draft-mtp", 0.0, "on"});
+    CHECK(std::find(base_argv.begin(), base_argv.end(), "--spec-draft-model") == base_argv.end());
+
+    // Report JSON records provenance inside results and stays load_llamaserver_config compatible.
+    tune::Report report;
+    report.target_identity = valid.target_identity;
+    report.draft_identity = valid.draft_identity;
+    report.executable_identity = valid.executable_identity;
+    report.results = {clean({{"q4_0", "q4_0"}, 65536, 512, 8, "draft-dflash", 0.5})};
+    tune::rank(report);
+    const auto doc = tune::report_json(valid, report);
+    const auto *res_obj = doc.find("results");
+    REQUIRE(res_obj != nullptr);
+    REQUIRE(res_obj->find("target_model") != nullptr);
+    CHECK(res_obj->find("target_model")->find("sha256")->as_string() == target_sha);
+    REQUIRE(res_obj->find("draft_model") != nullptr);
+    CHECK(res_obj->find("draft_model")->find("sha256")->as_string() == draft_sha);
+    CHECK(res_obj->find("draft_model")->find("trained_block_limit")->as_uint() == 8u);
+    REQUIRE(res_obj->find("executable") != nullptr);
+    CHECK(res_obj->find("executable")->find("sha256")->as_string() == exe_sha);
+    CHECK(res_obj->find("executable")->find("supports_draft_model")->as_bool());
+#if defined(SONDER_HAS_SERVER)
+    {
+        const auto cfg_path = write_bin("tuned-draft.json", doc.dump());
+        BackendSetup setup;
+        const auto loaded = load_llamaserver_config(cfg_path, setup);
+        REQUIRE_MESSAGE(loaded.ok(), loaded.message());
+    }
+#endif
+
+    // Rejection cases: missing file, self-draft, shard, vocab/tok/arch mismatch, sha mismatch, --help mismatch.
+    {
+        tune::Options bad = valid;
+        bad.draft_model = (tmp_dir / "missing.gguf").string();
+        CHECK_FALSE(tune::prepare_live_artifacts(bad, full_help).ok());
+
+        bad = valid;
+        bad.draft_model = target_path;
+        bad.draft_model_sha256.clear();
+        const auto self_res = tune::prepare_live_artifacts(bad, full_help);
+        REQUIRE_FALSE(self_res.ok());
+        CHECK(self_res.status().message().find("distinct") != std::string::npos);
+
+        for (const auto &case_pair : std::vector<std::pair<std::string, std::string>>{
+                 {sharded_path, "single-file"},
+                 {bad_vocab_path, "vocabulary size"},
+                 {bad_tok_path, "tokenizer"},
+                 {bad_arch_path, "architecture"},
+             }) {
+            CAPTURE(case_pair.second);
+            tune::Options mismatch = valid;
+            mismatch.draft_model = case_pair.first;
+            mismatch.draft_model_sha256.clear();
+            const auto res = tune::prepare_live_artifacts(mismatch, full_help);
+            REQUIRE_FALSE(res.ok());
+            CHECK(res.status().message().find(case_pair.second) != std::string::npos);
+        }
+
+        bad = valid;
+        bad.draft_model_sha256 = std::string(64, '0');
+        const auto sha_res = tune::prepare_live_artifacts(bad, full_help);
+        REQUIRE_FALSE(sha_res.ok());
+        CHECK(sha_res.status().message().find("SHA-256 mismatch") != std::string::npos);
+
+        bad = valid;
+        const auto help_no_flag = tune::prepare_live_artifacts(bad, "--spec-type TYPE\n--spec-draft-n-max N\n");
+        REQUIRE_FALSE(help_no_flag.ok());
+        CHECK(help_no_flag.status().message().find("--spec-draft-model") != std::string::npos);
+
+        const auto help_no_mode =
+            tune::prepare_live_artifacts(bad, "--spec-type TYPE\n    possible: none, draft-mtp\n--spec-draft-model F\n--spec-draft-n-max N\n");
+        REQUIRE_FALSE(help_no_mode.ok());
+        CHECK(help_no_mode.status().message().find("draft-dflash") != std::string::npos);
+    }
+
+    // CLI help and usage validation for new flags.
+    std::ostringstream out, err;
+    CHECK(tune::tune_main({"--help"}, out, err) == 0);
+    CHECK(out.str().find("--draft-model") != std::string::npos);
+    CHECK(out.str().find("--draft-model-sha256") != std::string::npos);
+    CHECK(out.str().find("--target-model-sha256") != std::string::npos);
+    CHECK(out.str().find("--trained-block-limit") != std::string::npos);
+
+    for (const auto &bad_cli : std::vector<std::vector<std::string>>{
+             {"--executable", "x", "--model", "m", "--target-model-sha256", "not-hex", "--dry-run"},
+             {"--executable", "x", "--model", "m", "--draft-model-sha256", std::string(64, 'a'), "--dry-run"},
+             {"--executable", "x", "--model", "m", "--trained-block-limit", "4", "--dry-run"},
+             {"--executable", "x", "--model", "m", "--draft-model", "d.gguf", "--trained-block-limit", "0", "--dry-run"},
+             {"--executable", "x", "--model", "m", "--draft-model", "d.gguf", "--trained-block-limit", "4",
+              "--grid", R"({"kv":[["q4_0","q4_0"]],"ctx":[65536],"ubatch":[512],"mtp":[0,8],"spec_type":["dflash"]})",
+              "--dry-run"},
+         }) {
+        out.str("");
+        err.str("");
+        CHECK(tune::tune_main(bad_cli, out, err) == 2);
     }
 }

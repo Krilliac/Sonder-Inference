@@ -91,7 +91,7 @@ Backend:
   --spec-draft-max N      llama.cpp: max draft tokens per speculative step (0..64)
   --moe-cache-mib N       llama.cpp: dynamic SLRU MoE expert VRAM cache in MiB
                           (0..262144, default 0 = off)
-  --moe-cache-cpu-share F llama.cpp: CPU share for dynamic SLRU MoE cache (0.0..1.0)
+  --moe-cache-cpu-share F unused on llamacpp (rejected; use llamaserver profile/args)
   --cache-ram-mib N       llama.cpp: bounded L2 host-RAM prefix state cache in MiB
                           (0..65536, default 0 = off)
   --mmproj PATH           llama.cpp: multimodal projector GGUF path
@@ -195,27 +195,6 @@ bool parse_uint(const std::string& text, std::uint64_t max, std::uint64_t& out) 
         return false;
     }
     out = n;
-    return true;
-}
-
-bool parse_unit_double(const std::string& text, double& out) {
-    if (text.empty() || text.size() > 32) {
-        return false;
-    }
-    for (const char c : text) {
-        const bool ok = (c >= '0' && c <= '9') || c == '.';
-        if (!ok) {
-            return false;
-        }
-    }
-    std::istringstream in(text);
-    in.imbue(std::locale::classic());
-    double parsed = 0.0;
-    in >> parsed;
-    if (!in || !in.eof() || !std::isfinite(parsed) || parsed < 0.0 || parsed > 1.0) {
-        return false;
-    }
-    out = parsed;
     return true;
 }
 
@@ -373,10 +352,14 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
             }
         }
         for (const char* flag : {"gpu-layers", "context-length", "llamaserver-arg", "moe-cache-mib",
-                                 "moe-cache-cpu-share", "cache-ram-mib", "mmproj"}) {
+                                 "moe-cache-cpu-share", "cache-ram-mib", "mmproj", "slots", "threads",
+                                 "spec-type", "spec-draft-max"}) {
             if (a.get(flag)) {
                 return usage_error(std::string("--") + flag + " conflicts with --profile (set the profile's typed fields)");
             }
+        }
+        if (a.flags.count("no-kv-unified") != 0) {
+            return usage_error("--no-kv-unified conflicts with --profile (set the profile's typed fields)");
         }
         if (a.get("llamaserver-url") && (!multi_profile || primary->backend != kLaunchProfileBackendLlamaServer)) {
             return usage_error("--llamaserver-url conflicts with --profile (set the profile's typed fields)");
@@ -563,11 +546,15 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     // Only the direct llamacpp backend reads these. Any other backend would
     // run without them and say nothing; llama-server takes them in its spawn
     // arguments (the --llamaserver-config "args", or a launch profile).
+    if (a.get("moe-cache-cpu-share")) {
+        return usage_error("--moe-cache-cpu-share is not supported on serve CLI (no execution consumer in llamacpp); "
+                           "set moe_cache_cpu_share on a llamaserver launch profile or JSON args");
+    }
     if (o.backend.backend != "llamacpp") {
         for (const char* flag : {"gpu-layers", "context-length", "moe-experts", "tensor-override",
                                  "batch-size", "ubatch-size", "cache-type-k", "cache-type-v", "flash-attn",
                                  "threads", "slots", "spec-type", "spec-draft-max",
-                                 "moe-cache-mib", "moe-cache-cpu-share", "cache-ram-mib", "mmproj"}) {
+                                 "moe-cache-mib", "cache-ram-mib", "mmproj"}) {
             if (a.get(flag)) {
                 return usage_error(std::string("option --") + flag +
                                    " applies only to --backend llamacpp; for llamaserver set it in the JSON args");
@@ -624,13 +611,6 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
         if (!parse_uint(*v, 262144, n)) return usage_error("--moe-cache-mib must be an integer from 0 to 262144");
         o.backend.llamacpp_moe_cache_mib = static_cast<std::uint32_t>(n);
     }
-    if (auto v = a.get("moe-cache-cpu-share")) {
-        double share = 0.0;
-        if (!parse_unit_double(*v, share)) {
-            return usage_error("--moe-cache-cpu-share must be a finite number from 0.0 to 1.0");
-        }
-        o.backend.llamacpp_moe_cache_cpu_share = share;
-    }
     if (auto v = a.get("cache-ram-mib")) {
         if (!parse_uint(*v, 65536, n)) return usage_error("--cache-ram-mib must be an integer from 0 to 65536");
         o.backend.llamacpp_cache_ram_mib = static_cast<std::uint32_t>(n);
@@ -655,7 +635,15 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
         std::string owner_k = o.backend.llamacpp_kv_cache_type_k ? primary->name : std::string{};
         std::string owner_v = o.backend.llamacpp_kv_cache_type_v ? primary->name : std::string{};
         std::string owner_fa = o.backend.llamacpp_flash_attention ? primary->name : std::string{};
+        std::string owner_slots = o.backend.llamacpp_slots ? primary->name : std::string{};
+        std::string owner_kv_unified = o.backend.llamacpp_kv_unified ? primary->name : std::string{};
+        std::string owner_cache_ram = o.backend.llamacpp_cache_ram_mib ? primary->name : std::string{};
+        std::string owner_threads = o.backend.llamacpp_threads ? primary->name : std::string{};
+        std::string owner_spec_type = o.backend.llamacpp_spec_type ? primary->name : std::string{};
+        std::string owner_spec_max = o.backend.llamacpp_spec_draft_max ? primary->name : std::string{};
+        std::string owner_mmproj = o.backend.llamacpp_mmproj_path ? primary->name : std::string{};
         const auto int_text = [](auto v) { return std::to_string(v); };
+        const auto bool_text = [](bool b) -> std::string { return b ? "true" : "false"; };
         const auto str_text = [](const std::string& s) { return s; };
         for (std::size_t i = 1; i < active_profiles.size(); ++i) {
             const LaunchProfile& secondary = *active_profiles[i];
@@ -728,6 +716,41 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
                 !err.empty()) {
                 return usage_error(err);
             }
+            if (const std::string err = merge_opt("parallel", o.backend.llamacpp_slots,
+                                                  candidate_backend.llamacpp_slots, owner_slots, int_text);
+                !err.empty()) {
+                return usage_error(err);
+            }
+            if (const std::string err = merge_opt("kv_unified", o.backend.llamacpp_kv_unified,
+                                                  candidate_backend.llamacpp_kv_unified, owner_kv_unified, bool_text);
+                !err.empty()) {
+                return usage_error(err);
+            }
+            if (const std::string err = merge_opt("cache_ram_mib", o.backend.llamacpp_cache_ram_mib,
+                                                  candidate_backend.llamacpp_cache_ram_mib, owner_cache_ram, int_text);
+                !err.empty()) {
+                return usage_error(err);
+            }
+            if (const std::string err = merge_opt("threads", o.backend.llamacpp_threads,
+                                                  candidate_backend.llamacpp_threads, owner_threads, int_text);
+                !err.empty()) {
+                return usage_error(err);
+            }
+            if (const std::string err = merge_opt("speculative.types", o.backend.llamacpp_spec_type,
+                                                  candidate_backend.llamacpp_spec_type, owner_spec_type, str_text);
+                !err.empty()) {
+                return usage_error(err);
+            }
+            if (const std::string err = merge_opt("speculative.draft_n_max", o.backend.llamacpp_spec_draft_max,
+                                                  candidate_backend.llamacpp_spec_draft_max, owner_spec_max, int_text);
+                !err.empty()) {
+                return usage_error(err);
+            }
+            if (const std::string err = merge_opt("mmproj", o.backend.llamacpp_mmproj_path,
+                                                  candidate_backend.llamacpp_mmproj_path, owner_mmproj, str_text);
+                !err.empty()) {
+                return usage_error(err);
+            }
             if (o.device.empty() && !candidate_device.empty()) {
                 o.device = candidate_device;
             }
@@ -745,7 +768,35 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
                 return usage_error("combined llamacpp launch profiles set quantized cache_type_v ('" +
                                    *o.backend.llamacpp_kv_cache_type_v + "') with flash_attn 'off'");
             }
+            if (o.backend.llamacpp_spec_type && *o.backend.llamacpp_spec_type == "none" &&
+                o.backend.llamacpp_spec_draft_max) {
+                return usage_error(
+                    "combined llamacpp launch profiles set speculative.draft_n_max alongside speculative type 'none'");
+            }
         }
+        std::string resolved = "llamacpp resolved settings:";
+        const auto add_resolved = [&](const char* k, const std::string& v) {
+            resolved += " ";
+            resolved += k;
+            resolved += "=";
+            resolved += v;
+        };
+        if (o.backend.llamacpp_context_length) add_resolved("ctx_size", std::to_string(*o.backend.llamacpp_context_length));
+        if (o.backend.llamacpp_gpu_layers) add_resolved("n_gpu_layers", std::to_string(*o.backend.llamacpp_gpu_layers));
+        if (o.backend.llamacpp_batch_size) add_resolved("batch_size", std::to_string(*o.backend.llamacpp_batch_size));
+        if (o.backend.llamacpp_ubatch_size) add_resolved("ubatch_size", std::to_string(*o.backend.llamacpp_ubatch_size));
+        if (o.backend.llamacpp_kv_cache_type_k) add_resolved("cache_type_k", *o.backend.llamacpp_kv_cache_type_k);
+        if (o.backend.llamacpp_kv_cache_type_v) add_resolved("cache_type_v", *o.backend.llamacpp_kv_cache_type_v);
+        if (o.backend.llamacpp_flash_attention) add_resolved("flash_attn", *o.backend.llamacpp_flash_attention);
+        if (o.backend.llamacpp_slots) add_resolved("slots", std::to_string(*o.backend.llamacpp_slots));
+        if (o.backend.llamacpp_kv_unified) add_resolved("kv_unified", *o.backend.llamacpp_kv_unified ? "true" : "false");
+        if (o.backend.llamacpp_cache_ram_mib) add_resolved("cache_ram_mib", std::to_string(*o.backend.llamacpp_cache_ram_mib));
+        if (o.backend.llamacpp_threads) add_resolved("threads", std::to_string(*o.backend.llamacpp_threads));
+        if (o.backend.llamacpp_spec_type) add_resolved("spec_type", *o.backend.llamacpp_spec_type);
+        if (o.backend.llamacpp_spec_draft_max) add_resolved("spec_draft_max", std::to_string(*o.backend.llamacpp_spec_draft_max));
+        if (o.backend.llamacpp_mmproj_path) add_resolved("mmproj", *o.backend.llamacpp_mmproj_path);
+        if (!o.device.empty()) add_resolved("device", o.device);
+        out.profile_notes.push_back(std::move(resolved));
     }
     std::optional<std::uint64_t> budget_flag;
     if (auto v = a.get("vram-budget-mib")) {
