@@ -16,6 +16,7 @@
 #include "anthropic.hpp"
 #include "chat_handler.hpp"
 #include "http.hpp"
+#include "json_schema_gbnf.hpp"
 #include "live_hub.hpp"
 #include "common/log_queue.hpp"
 #include "openai.hpp"
@@ -116,6 +117,7 @@ struct Server::Impl {
     std::set<std::shared_ptr<Session>> inflight;
     PriorityAdmission admission;
     ResponseHistoryStore response_history;
+    mutable CompiledGrammarCache grammar_cache;
 
     std::once_flag stop_once;
     std::mutex stopped_mu;
@@ -251,7 +253,8 @@ struct Server::Impl {
         }
         const HealthSnapshot snapshot{
             opts, s, available, std::move(version), std::move(b), *residency, hub->stats(), emitted, dropped,
-            admission.queued(), log_queue.stats(), instance_id, node_id, started_at, synthetic};
+            admission.queued(), log_queue.stats(), instance_id, node_id, started_at, synthetic,
+            grammar_cache.stats()};
         write_json(ex, s == State::ready ? 200 : 503, build_health_body(snapshot));
     }
 
@@ -363,7 +366,9 @@ struct Server::Impl {
                 write_error(ex, e);
                 return;
             }
-            job_v = protocol == ChatProtocol::anthropic ? parse_messages_request(body) : parse_chat_request(body);
+            job_v = protocol == ChatProtocol::anthropic
+                        ? parse_messages_request(body)
+                        : parse_chat_request_with_mode(body, StructuredParseMode::defer_grammar_compile);
         }
         if (auto* e = std::get_if<ApiError>(&job_v)) {
             write_error(ex, *e);
@@ -410,18 +415,14 @@ struct Server::Impl {
                                        "messages"));
             return;
         }
-        // When tool_choice forces a tool call on a grammar-capable backend
-        // without native tool calling (e.g. direct llamacpp), synthesize a
-        // matching GBNF tool-call grammar automatically.
-        if (!job.tools.empty() && job.tool_choice &&
-            (job.tool_choice->mode == ToolChoiceMode::required || job.tool_choice->mode == ToolChoiceMode::function) &&
-            job.grammar.empty() && !job.response_format_type.has_value() &&
-            backend_has_capability(Capability::structured_output) &&
-            !backend_has_capability(Capability::tool_calling) && pin.backend() != "llamaserver" &&
-            pin.backend() != "ollama") {
-            if (auto gbnf = build_tool_call_gbnf(job.tools, *job.tool_choice); gbnf.ok()) {
-                job.grammar = std::move(gbnf).value();
-            }
+        const ModelDescriptor* desc_ptr = pin.model() ? &pin.model()->descriptor() : nullptr;
+        const std::string tokenizer_id = build_tokenizer_identity_key(pin.backend(), pin.id(), desc_ptr);
+        if (auto err = prepare_chat_grammar(job, tokenizer_id,
+                                            backend_has_capability(Capability::structured_output),
+                                            backend_has_capability(Capability::tool_calling),
+                                            pin.backend(), &grammar_cache)) {
+            write_error(ex, *err);
+            return;
         }
         // Launch profile defaults fill only the fields the request left unset
         // (both chat protocols; "default" resolves to the served id first).
@@ -484,7 +485,8 @@ struct Server::Impl {
             [&](const ApiError& error) { write_error(ex, error); },
             [&] { log_message("warning", "cannot start a request thread; chat request refused (503)"); }};
         execute_chat(exchange, job, corr, pin.id(), pin.backend(), session, protocol,
-                     backend_has_capability(Capability::tool_calling));
+                     backend_has_capability(Capability::tool_calling), &grammar_cache, tokenizer_id,
+                     backend_has_capability(Capability::structured_output));
     }
 
     void handle_responses(Exchange& ex, const RequestHead& head, const std::string& body) {
@@ -507,7 +509,7 @@ struct Server::Impl {
                 write_error(ex, e);
                 return;
             }
-            job_v = parse_responses_request(body);
+            job_v = parse_responses_request_with_mode(body, StructuredParseMode::defer_grammar_compile);
         }
         if (auto* e = std::get_if<ApiError>(&job_v)) {
             write_error(ex, *e);
@@ -549,15 +551,14 @@ struct Server::Impl {
                                        "input"));
             return;
         }
-        if (!job.tools.empty() && job.tool_choice &&
-            (job.tool_choice->mode == ToolChoiceMode::required || job.tool_choice->mode == ToolChoiceMode::function) &&
-            job.grammar.empty() && !job.response_format_type.has_value() &&
-            backend_has_capability(Capability::structured_output) &&
-            !backend_has_capability(Capability::tool_calling) && pin.backend() != "llamaserver" &&
-            pin.backend() != "ollama") {
-            if (auto gbnf = build_tool_call_gbnf(job.tools, *job.tool_choice); gbnf.ok()) {
-                job.grammar = std::move(gbnf).value();
-            }
+        const ModelDescriptor* desc_ptr = pin.model() ? &pin.model()->descriptor() : nullptr;
+        const std::string tokenizer_id = build_tokenizer_identity_key(pin.backend(), pin.id(), desc_ptr);
+        if (auto err = prepare_responses_grammar(job, tokenizer_id,
+                                                 backend_has_capability(Capability::structured_output),
+                                                 backend_has_capability(Capability::tool_calling),
+                                                 pin.backend(), &grammar_cache)) {
+            write_error(ex, *err);
+            return;
         }
         if (const ModelProfileBinding* binding = find_profile_binding(opts, *served_id)) {
             apply_sampling_defaults(binding->sampling_defaults, job.sampling);
@@ -620,7 +621,8 @@ struct Server::Impl {
         const std::string caller_scope = derive_responses_caller_scope(head, corr);
         execute_responses(exchange, job, corr, pin.id(), pin.backend(), session, response_history,
                           backend_has_capability(Capability::tool_calling),
-                          backend_has_capability(Capability::multimodal), caller_scope);
+                          backend_has_capability(Capability::multimodal), caller_scope, &grammar_cache,
+                          tokenizer_id, backend_has_capability(Capability::structured_output));
     }
 
     void handle_completions(Exchange& ex, const RequestHead& head, const std::string& body) {

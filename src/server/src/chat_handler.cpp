@@ -45,9 +45,36 @@ json::Object openai_tool_call_delta_json(std::uint32_t index, const std::string&
 
 }  // namespace
 
+std::optional<ApiError> prepare_chat_grammar(
+    ChatJob& job, std::string_view tokenizer_identity,
+    bool backend_supports_structured_output, bool backend_native_tools,
+    std::string_view backend_name, CompiledGrammarCache* cache,
+    const StructuredGrammarEngine& engine) {
+    auto resolved = resolve_structured_grammar(
+        "response_format.json_schema.schema", job.grammar, job.response_format_type,
+        job.pending_response_schema, job.response_format_schema, job.tools, job.tool_choice,
+        backend_supports_structured_output, backend_native_tools, backend_name, tokenizer_identity,
+        cache, engine);
+    if (!resolved.ok()) {
+        const std::string code = resolved.status().code() == ErrorCode::unsupported
+                                     ? "unsupported_parameter"
+                                     : "invalid_request";
+        const std::optional<std::string> param =
+            job.response_format_type && *job.response_format_type == "json_schema"
+                ? std::optional<std::string>("response_format.json_schema.schema")
+                : (job.response_format_type ? std::optional<std::string>("response_format") : std::nullopt);
+        return make_error(400, code, "invalid response_format: " + resolved.status().message(), param);
+    }
+    job.compiled_grammar = std::move(resolved.value().compiled);
+    job.grammar = std::move(resolved.value().grammar);
+    return std::nullopt;
+}
+
 void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr, const std::string& model,
                   const std::string& backend, const std::shared_ptr<Session>& session,
-                  ChatProtocol protocol, bool backend_native_tools) {
+                  ChatProtocol protocol, bool backend_native_tools,
+                  CompiledGrammarCache* grammar_cache, std::string_view tokenizer_identity,
+                  bool backend_supports_structured_output) {
     const bool anthropic = protocol == ChatProtocol::anthropic;
     const RequestPriority priority = corr.priority_class.value_or(
         job.priority_class.value_or(RequestPriority::interactive));
@@ -65,7 +92,36 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     // (llama-server's convention); neither adds a field when it is empty.
     ro.separate_reasoning = true;
     ro.retain_text = !job.stream;
-    ro.grammar = job.grammar;
+    std::shared_ptr<const CompiledGrammar> compiled_grammar = job.compiled_grammar;
+    std::string fallback_grammar = job.grammar;
+    if (!compiled_grammar && grammar_cache != nullptr &&
+        (job.response_format_type.has_value() || (!job.tools.empty() && job.tool_choice))) {
+        const std::string fallback_tok =
+            tokenizer_identity.empty() ? build_tokenizer_identity_key(backend, model) : std::string(tokenizer_identity);
+        auto resolved = resolve_structured_grammar(
+            "response_format.json_schema.schema", job.grammar, job.response_format_type,
+            job.pending_response_schema, job.response_format_schema, job.tools, job.tool_choice,
+            backend_supports_structured_output, backend_native_tools, backend, fallback_tok, grammar_cache);
+        if (!resolved.ok()) {
+            ex.leave_inflight();
+            session->close();
+            ex.send_error(make_error(400, "invalid_request", resolved.status().message(), "response_format"));
+            return;
+        }
+        compiled_grammar = std::move(resolved.value().compiled);
+        fallback_grammar = std::move(resolved.value().grammar);
+    }
+    auto matcher_res = bind_request_grammar_matcher(compiled_grammar, ro.grammar, fallback_grammar);
+    if (!matcher_res.ok()) {
+        ex.leave_inflight();
+        session->close();
+        const std::string code = matcher_res.status().code() == ErrorCode::unsupported
+                                     ? "unsupported_parameter"
+                                     : "invalid_request";
+        ex.send_error(make_error(400, code, matcher_res.status().message(), "response_format"));
+        return;
+    }
+    std::unique_ptr<GrammarMatcher> grammar_matcher = std::move(matcher_res).value();
     ro.response_format_type = job.response_format_type;
     ro.response_format_schema = job.response_format_schema;
     ro.tools = job.tools;
@@ -253,6 +309,9 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     TokenCallback on_chunk;
     if (job.stream) {
         on_chunk = [&](const TokenChunk& chunk) {
+            if (grammar_matcher && !chunk.text.empty()) {
+                (void)grammar_matcher->accept_chunk(chunk.text);
+            }
             // 1. Native upstream tool call deltas (e.g. llama-server, Ollama).
             if (!chunk.tool_call_deltas.empty()) {
                 emitted_tool_calls = true;
@@ -404,6 +463,12 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
         return;
     }
     const GenerationResult& r = result.value();
+    if (grammar_matcher) {
+        if (!job.stream && !r.text.empty()) {
+            (void)grammar_matcher->accept_chunk(r.text);
+        }
+        grammar_matcher->mark_finished();
+    }
     if (job.stream && tools_enabled) {
         const ToolCallStreamOutput tail = tool_parser.flush();
         if (!tail.visible_text.empty()) {

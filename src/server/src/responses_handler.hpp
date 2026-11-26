@@ -99,16 +99,29 @@ struct ResponsesJob {
     std::string grammar;
     std::optional<std::string> response_format_type = std::nullopt;
     std::optional<std::string> response_format_schema = std::nullopt;
+    std::optional<json::Value> pending_response_schema = std::nullopt;
+    std::shared_ptr<const CompiledGrammar> compiled_grammar;
     std::optional<RequestPriority> priority_class = std::nullopt;
     std::optional<std::uint64_t> deadline_ms = std::nullopt;
 };
 
 [[nodiscard]] std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view body);
+[[nodiscard]] std::variant<ResponsesJob, ApiError> parse_responses_request_with_mode(
+    std::string_view body, StructuredParseMode schema_mode);
+
+[[nodiscard]] std::optional<ApiError> prepare_responses_grammar(
+    ResponsesJob& job, std::string_view tokenizer_identity,
+    bool backend_supports_structured_output, bool backend_native_tools,
+    std::string_view backend_name, CompiledGrammarCache* cache = nullptr,
+    const StructuredGrammarEngine& engine = default_structured_grammar_engine());
 
 void execute_responses(ChatExchange& exchange, const ResponsesJob& job, const Correlation& correlation,
                        const std::string& model, const std::string& backend,
                        const std::shared_ptr<Session>& session, ResponseHistoryStore& history,
                        bool backend_native_tools = true, bool backend_supports_multimodal = true,
-                       std::string_view caller_scope = {});
+                       std::string_view caller_scope = {},
+                       CompiledGrammarCache* grammar_cache = nullptr,
+                       std::string_view tokenizer_identity = {},
+                       bool backend_supports_structured_output = true);
 
 }  // namespace sonder::inference::server::detail

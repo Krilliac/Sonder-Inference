@@ -2,16 +2,20 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include "sha256.hpp"
 
 namespace sonder::inference::server::detail {
 
@@ -1896,69 +1900,321 @@ private:
     mutable std::map<std::string, BranchDomain> classify_ref_cache_;
 };
 
+json::Value canonicalize_value(const json::Value& v) {
+    if (v.is_array()) {
+        json::Array arr;
+        const auto& src = v.as_array();
+        arr.reserve(src.size());
+        for (const auto& item : src) {
+            arr.push_back(canonicalize_value(item));
+        }
+        return json::Value(std::move(arr));
+    }
+    if (v.is_object()) {
+        std::vector<json::Member> members;
+        const auto& obj = v.as_object();
+        members.reserve(obj.size());
+        for (const auto& [k, val] : obj) {
+            members.emplace_back(k, canonicalize_value(val));
+        }
+        std::sort(members.begin(), members.end(),
+                  [](const json::Member& a, const json::Member& b) { return a.first < b.first; });
+        return json::Value(json::Object::from_members(std::move(members)));
+    }
+    return v;
+}
+
+void hash_combine(std::size_t& seed, std::size_t h) noexcept {
+    seed ^= h + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2);
+}
+
 class GbnfStructuredGrammarEngine final : public StructuredGrammarEngine {
 public:
     GrammarEngineKind kind() const noexcept override { return GrammarEngineKind::gbnf; }
     std::string_view name() const noexcept override { return "gbnf"; }
 
+    GrammarEngineCapabilities capabilities() const noexcept override {
+        GrammarEngineCapabilities caps;
+        caps.engine = GrammarEngineKind::gbnf;
+        caps.engine_name = "gbnf";
+        caps.compiled_in = true;
+        caps.sampler_linked = true;
+        caps.active = true;
+        caps.supports_json_object = true;
+        caps.supports_json_schema = true;
+        caps.supports_regex = false;
+        caps.supports_regex_subset = true;
+        caps.supports_structural_tags = false;
+        caps.max_schema_depth = kMaxSchemaDepth;
+        caps.max_unrolled_bounds = kMaxUnrolledBounds;
+        caps.max_bounded_integer_abs = kMaxBoundedIntegerAbs;
+        caps.max_grammar_bytes = kMaxGrammarBytes;
+        caps.detail =
+            "built-in GBNF engine backed by backend GBNF sampler (bounded anchored JSON Schema regex subset only; "
+            "no standalone regex or structural tags)";
+        return caps;
+    }
+
     Result<CompiledGrammar> compile_json_object() const override {
+        const auto t0 = std::chrono::steady_clock::now();
         CompiledGrammar out;
         out.engine = GrammarEngineKind::gbnf;
+        out.constraint_kind = GrammarConstraintKind::json_object;
+        out.normalized_schema_key = R"({"type":"object"})";
+        out.normalized_schema_hash =
+            normalized_schema_hash(GrammarConstraintKind::json_object, out.normalized_schema_key);
         out.gbnf = json_object_gbnf();
-        out.raw_schema = R"({"type":"object"})";
+        out.payload = out.gbnf;
+        out.raw_schema = out.normalized_schema_key;
+        out.capabilities.engine = GrammarEngineKind::gbnf;
+        out.capabilities.constraint_kind = GrammarConstraintKind::json_object;
+        out.capabilities.enforces_strict_schema = true;
+        out.capabilities.requires_gbnf_sampler = true;
+        out.capabilities.sampler_linked = true;
+        out.compile_duration = std::chrono::steady_clock::now() - t0;
         return out;
     }
 
     Result<CompiledGrammar> compile_json_schema(const json::Value& schema) const override {
+        const auto t0 = std::chrono::steady_clock::now();
         auto gbnf = json_schema_to_gbnf(schema);
         if (!gbnf.ok()) {
             return gbnf.status();
         }
         CompiledGrammar out;
         out.engine = GrammarEngineKind::gbnf;
+        out.constraint_kind = GrammarConstraintKind::json_schema;
+        out.normalized_schema_key = canonical_json_dump(schema);
+        out.normalized_schema_hash =
+            normalized_schema_hash(GrammarConstraintKind::json_schema, out.normalized_schema_key);
         out.gbnf = std::move(gbnf).value();
+        out.payload = out.gbnf;
         out.raw_schema = schema.dump();
+        out.capabilities.engine = GrammarEngineKind::gbnf;
+        out.capabilities.constraint_kind = GrammarConstraintKind::json_schema;
+        out.capabilities.enforces_strict_schema = true;
+        out.capabilities.requires_gbnf_sampler = true;
+        out.capabilities.sampler_linked = true;
+        out.compile_duration = std::chrono::steady_clock::now() - t0;
         return out;
+    }
+
+    Result<CompiledGrammar> compile_regex(std::string_view pattern) const override {
+        (void)pattern;
+        return Status(ErrorCode::unsupported,
+                      "gbnf grammar engine does not support standalone regex compilation (only bounded anchored "
+                      "JSON Schema `pattern` strings via compile_json_schema)");
+    }
+
+    Result<CompiledGrammar> compile_structural_tag(std::string_view spec) const override {
+        (void)spec;
+        return Status(ErrorCode::unsupported, "gbnf grammar engine does not support structural_tag constraints");
+    }
+
+    Result<std::unique_ptr<GrammarMatcher>> create_matcher(
+        std::shared_ptr<const CompiledGrammar> compiled) const override {
+        if (!compiled) {
+            return Status(ErrorCode::invalid_argument, "compiled grammar is null");
+        }
+        if (compiled->engine != GrammarEngineKind::gbnf) {
+            return Status(ErrorCode::unsupported, "compiled grammar does not target gbnf engine");
+        }
+        if (compiled->gbnf.empty() || !compiled->capabilities.sampler_linked) {
+            return Status(ErrorCode::invalid_argument, "compiled GBNF grammar has no linked payload");
+        }
+        return std::make_unique<GrammarMatcher>(std::move(compiled), kMaxGrammarBytes);
     }
 };
 
-#if defined(SONDER_WITH_LLGUIDANCE)
-// Compile-time plug-in seam for Rust `llguidance` structured decoding.
-// When SONDER_WITH_LLGUIDANCE is enabled, callers continue using
-// default_structured_grammar_engine() with zero API changes.
+// Compile-time plug-in wrapper for an external `llguidance` structured decoding engine.
+// Honest capability contract: unless an actual native llguidance runtime library is
+// compiled AND linked (`SONDER_HAS_LINKED_LLGUIDANCE_SAMPLER`), `sampler_linked`
+// and `active` remain false and compilation/matcher requests fail closed with
+// ErrorCode::unsupported rather than claiming a guidance sampler is active.
 class LlguidanceStructuredGrammarEngine final : public StructuredGrammarEngine {
 public:
     GrammarEngineKind kind() const noexcept override { return GrammarEngineKind::llguidance; }
     std::string_view name() const noexcept override { return "llguidance"; }
 
+    GrammarEngineCapabilities capabilities() const noexcept override {
+        GrammarEngineCapabilities caps;
+        caps.engine = GrammarEngineKind::llguidance;
+        caps.engine_name = "llguidance";
+#if defined(SONDER_WITH_LLGUIDANCE)
+        caps.compiled_in = true;
+#else
+        caps.compiled_in = false;
+#endif
+#if defined(SONDER_HAS_LINKED_LLGUIDANCE_SAMPLER) && SONDER_HAS_LINKED_LLGUIDANCE_SAMPLER
+        caps.sampler_linked = true;
+#else
+        caps.sampler_linked = false;
+#endif
+        caps.active = caps.compiled_in && caps.sampler_linked;
+        caps.supports_json_object = false;
+        caps.supports_json_schema = false;
+        caps.supports_regex = false;
+        caps.supports_regex_subset = false;
+        caps.supports_structural_tags = false;
+        caps.detail = caps.compiled_in
+            ? "SONDER_WITH_LLGUIDANCE compile-time hook is enabled, but no llguidance engine/sampler library is "
+              "linked in this build"
+            : "llguidance grammar engine is not compiled or linked in this build";
+        return caps;
+    }
+
     Result<CompiledGrammar> compile_json_object() const override {
-        CompiledGrammar out;
-        out.engine = GrammarEngineKind::llguidance;
-        out.raw_schema = R"({"type":"object"})";
-        out.gbnf = json_object_gbnf();
-        return out;
+        return Status(ErrorCode::unsupported, capabilities().detail);
     }
 
     Result<CompiledGrammar> compile_json_schema(const json::Value& schema) const override {
-        if (!schema.is_object() && !schema.is_bool()) {
-            return Status(ErrorCode::invalid_argument, "JSON schema must be an object or boolean");
-        }
-        if (schema.is_bool() && !schema.as_bool()) {
-            return Status(ErrorCode::invalid_argument, "JSON schema 'false' allows no valid values");
-        }
-        CompiledGrammar out;
-        out.engine = GrammarEngineKind::llguidance;
-        out.raw_schema = schema.dump();
-        // Best-effort GBNF fallback for backends that still consume GBNF directly.
-        if (auto fallback = json_schema_to_gbnf(schema); fallback.ok()) {
-            out.gbnf = std::move(fallback).value();
-        }
-        return out;
+        (void)schema;
+        return Status(ErrorCode::unsupported, capabilities().detail);
+    }
+
+    Result<CompiledGrammar> compile_regex(std::string_view pattern) const override {
+        (void)pattern;
+        return Status(ErrorCode::unsupported, capabilities().detail);
+    }
+
+    Result<CompiledGrammar> compile_structural_tag(std::string_view spec) const override {
+        (void)spec;
+        return Status(ErrorCode::unsupported, capabilities().detail);
+    }
+
+    Result<std::unique_ptr<GrammarMatcher>> create_matcher(
+        std::shared_ptr<const CompiledGrammar> compiled) const override {
+        (void)compiled;
+        return Status(ErrorCode::unsupported, capabilities().detail);
     }
 };
-#endif
 
 }  // namespace
+
+const char* to_string(GrammarEngineKind kind) noexcept {
+    switch (kind) {
+        case GrammarEngineKind::gbnf: return "gbnf";
+        case GrammarEngineKind::llguidance: return "llguidance";
+    }
+    return "unknown";
+}
+
+const char* to_string(GrammarConstraintKind kind) noexcept {
+    switch (kind) {
+        case GrammarConstraintKind::json_object: return "json_object";
+        case GrammarConstraintKind::json_schema: return "json_schema";
+        case GrammarConstraintKind::regex: return "regex";
+        case GrammarConstraintKind::structural_tag: return "structural_tag";
+        case GrammarConstraintKind::tool_call: return "tool_call";
+    }
+    return "unknown";
+}
+
+std::string canonical_json_dump(const json::Value& value) {
+    return canonicalize_value(value).dump();
+}
+
+std::string build_tokenizer_identity_key(std::string_view backend_name, std::string_view model_id,
+                                         const ModelDescriptor* descriptor,
+                                         std::optional<std::uint64_t> vocab_size) {
+    std::string out = "backend=";
+    out.append(backend_name);
+    out += "|model=";
+    out.append(model_id);
+    if (descriptor != nullptr) {
+        out += "|fmt=" + descriptor->format;
+        out += "|fam=" + descriptor->family;
+        out += "|param=" + descriptor->parameter_size;
+        out += "|quant=" + descriptor->quantization;
+        out += "|bytes=" + std::to_string(descriptor->size_bytes);
+        out += "|ctx=" + std::to_string(descriptor->context_length);
+        out += "|arch=" + std::to_string(static_cast<int>(descriptor->architecture));
+    }
+    if (vocab_size) {
+        out += "|vocab=" + std::to_string(*vocab_size);
+    }
+    return out;
+}
+
+std::string GrammarCompileOptions::cache_key_fragment() const {
+    return std::string("strict=") + (strict ? "1" : "0") +
+           "|coerce=" + (coerce_unsupported_tool_args ? "1" : "0") +
+           "|fmt=" + grammar_format;
+}
+
+std::size_t CompiledGrammar::approx_bytes() const noexcept {
+    return sizeof(CompiledGrammar) + normalized_schema_key.size() + normalized_schema_hash.size() +
+           tokenizer_identity.size() + gbnf.size() + payload.size() + raw_schema.size();
+}
+
+std::string normalized_schema_hash(GrammarConstraintKind kind, std::string_view normalized_key,
+                                   const GrammarCompileOptions& options) {
+    std::string canonical = std::string(to_string(kind));
+    canonical.push_back('\n');
+    canonical.append(options.cache_key_fragment());
+    canonical.push_back('\n');
+    canonical.append(normalized_key);
+    return sha256_hex(canonical);
+}
+
+GrammarMatcher::GrammarMatcher(std::shared_ptr<const CompiledGrammar> compiled, std::size_t max_bytes)
+    : compiled_(std::move(compiled)), max_bytes_(max_bytes) {}
+
+Result<std::string> GrammarMatcher::bind_for_request() {
+    if (!compiled_) {
+        rejected_ = true;
+        last_error_ = "compiled grammar artifact is null";
+        return Status(ErrorCode::invalid_argument, last_error_);
+    }
+    if (!compiled_->capabilities.sampler_linked) {
+        rejected_ = true;
+        last_error_ = std::string("grammar engine '") + to_string(compiled_->engine) + "' has no linked sampler";
+        return Status(ErrorCode::unsupported, last_error_);
+    }
+    if (compiled_->capabilities.requires_gbnf_sampler && compiled_->gbnf.empty()) {
+        rejected_ = true;
+        last_error_ = "compiled grammar artifact is missing required GBNF payload";
+        return Status(ErrorCode::invalid_argument, last_error_);
+    }
+    active_ = true;
+    finished_ = false;
+    rejected_ = false;
+    last_error_.clear();
+    return compiled_->gbnf;
+}
+
+Status GrammarMatcher::accept_chunk(std::string_view piece) {
+    if (!active_) {
+        last_error_ = "grammar matcher is not bound to an active request";
+        return Status(ErrorCode::invalid_argument, last_error_);
+    }
+    if (finished_ || rejected_) {
+        return Status(ErrorCode::invalid_argument, "grammar matcher has already finished or rejected");
+    }
+    if (bytes_fed_ > max_bytes_ || piece.size() > max_bytes_ - bytes_fed_) {
+        rejected_ = true;
+        last_error_ = "grammar matcher byte limit exceeded";
+        return Status(ErrorCode::invalid_argument, last_error_);
+    }
+    bytes_fed_ += piece.size();
+    ++token_steps_;
+    return Status::success();
+}
+
+void GrammarMatcher::mark_finished() noexcept {
+    if (active_) {
+        finished_ = true;
+    }
+}
+
+void GrammarMatcher::reset() noexcept {
+    active_ = false;
+    finished_ = false;
+    rejected_ = false;
+    bytes_fed_ = 0;
+    token_steps_ = 0;
+    last_error_.clear();
+}
 
 std::string json_object_gbnf() {
     return std::string("root ::= object\n") + kCommonRules;
@@ -1974,13 +2230,228 @@ const StructuredGrammarEngine& gbnf_structured_grammar_engine() noexcept {
     return kEngine;
 }
 
-const StructuredGrammarEngine& default_structured_grammar_engine() noexcept {
-#if defined(SONDER_WITH_LLGUIDANCE)
+const StructuredGrammarEngine& llguidance_structured_grammar_engine() noexcept {
     static const LlguidanceStructuredGrammarEngine kEngine;
     return kEngine;
-#else
+}
+
+const StructuredGrammarEngine& structured_grammar_engine(GrammarEngineKind kind) noexcept {
+    switch (kind) {
+        case GrammarEngineKind::gbnf: return gbnf_structured_grammar_engine();
+        case GrammarEngineKind::llguidance: return llguidance_structured_grammar_engine();
+    }
     return gbnf_structured_grammar_engine();
-#endif
+}
+
+const StructuredGrammarEngine& default_structured_grammar_engine() noexcept {
+    const auto& ll = llguidance_structured_grammar_engine();
+    if (ll.capabilities().active) {
+        return ll;
+    }
+    return gbnf_structured_grammar_engine();
+}
+
+Result<std::unique_ptr<GrammarMatcher>> bind_request_grammar_matcher(
+    const std::shared_ptr<const CompiledGrammar>& compiled,
+    std::string& out_grammar,
+    std::string_view explicit_fallback_grammar) {
+    if (!compiled) {
+        out_grammar.assign(explicit_fallback_grammar.data(), explicit_fallback_grammar.size());
+        return std::unique_ptr<GrammarMatcher>{nullptr};
+    }
+    auto matcher_res = structured_grammar_engine(compiled->engine).create_matcher(compiled);
+    if (!matcher_res.ok()) {
+        return matcher_res.status();
+    }
+    std::unique_ptr<GrammarMatcher> matcher = std::move(matcher_res).value();
+    auto bound = matcher->bind_for_request();
+    if (!bound.ok()) {
+        return bound.status();
+    }
+    out_grammar = std::move(bound).value();
+    return matcher;
+}
+
+std::size_t CompiledGrammarCacheKeyHash::operator()(const CompiledGrammarCacheKey& k) const noexcept {
+    std::size_t seed = std::hash<int>{}(static_cast<int>(k.engine));
+    hash_combine(seed, std::hash<int>{}(static_cast<int>(k.constraint_kind)));
+    hash_combine(seed, std::hash<std::string>{}(k.tokenizer_identity));
+    hash_combine(seed, std::hash<std::string>{}(k.normalized_schema_key));
+    hash_combine(seed, std::hash<std::string>{}(k.options_key));
+    return seed;
+}
+
+CompiledGrammarCache::CompiledGrammarCache(std::size_t max_entries, std::size_t max_bytes, std::size_t max_entry_bytes)
+    : max_entries_(max_entries), max_bytes_(max_bytes), max_entry_bytes_(max_entry_bytes) {}
+
+void CompiledGrammarCache::evict_until_fit_locked(std::size_t needed_bytes) noexcept {
+    while (!lru_.empty() &&
+           (lru_.size() >= max_entries_ || used_bytes_ + needed_bytes > max_bytes_)) {
+        const Slot& back = lru_.back();
+        used_bytes_ -= back.bytes;
+        index_.erase(back.key);
+        lru_.pop_back();
+        ++evictions_;
+    }
+}
+
+std::shared_ptr<const CompiledGrammar> CompiledGrammarCache::find(const CompiledGrammarCacheKey& key) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = index_.find(key);
+    if (it == index_.end()) {
+        ++misses_;
+        return nullptr;
+    }
+    lru_.splice(lru_.begin(), lru_, it->second);
+    ++hits_;
+    return it->second->artifact;
+}
+
+void CompiledGrammarCache::insert(const CompiledGrammarCacheKey& key,
+                                  const std::shared_ptr<const CompiledGrammar>& artifact) {
+    if (!artifact) {
+        return;
+    }
+    const std::size_t bytes = artifact->approx_bytes();
+    std::lock_guard<std::mutex> lock(mu_);
+    if (max_entries_ == 0 || max_bytes_ == 0 || bytes > max_entry_bytes_ || bytes > max_bytes_) {
+        ++bypassed_oversize_;
+        return;
+    }
+    if (auto it = index_.find(key); it != index_.end()) {
+        used_bytes_ -= it->second->bytes;
+        it->second->artifact = artifact;
+        it->second->bytes = bytes;
+        lru_.splice(lru_.begin(), lru_, it->second);
+        evict_until_fit_locked(bytes);
+        used_bytes_ += bytes;
+        return;
+    }
+    evict_until_fit_locked(bytes);
+    lru_.push_front(Slot{key, artifact, bytes});
+    index_.emplace(key, lru_.begin());
+    used_bytes_ += bytes;
+    ++inserts_;
+}
+
+Result<std::shared_ptr<const CompiledGrammar>> CompiledGrammarCache::get_or_compile(
+    const CompiledGrammarCacheKey& key,
+    const std::function<Result<CompiledGrammar>()>& compiler) {
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (auto it = index_.find(key); it != index_.end()) {
+            lru_.splice(lru_.begin(), lru_, it->second);
+            ++hits_;
+            return it->second->artifact;
+        }
+        ++misses_;
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    auto compiled = compiler();
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    if (!compiled.ok()) {
+        std::lock_guard<std::mutex> lock(mu_);
+        ++compile_failures_;
+        return compiled.status();
+    }
+
+    CompiledGrammar artifact = std::move(compiled).value();
+    if (artifact.normalized_schema_key.empty()) {
+        artifact.normalized_schema_key = key.normalized_schema_key;
+    }
+    if (artifact.tokenizer_identity.empty()) {
+        artifact.tokenizer_identity = key.tokenizer_identity;
+    }
+    if (artifact.normalized_schema_hash.empty()) {
+        GrammarCompileOptions default_opts;
+        artifact.normalized_schema_hash =
+            normalized_schema_hash(key.constraint_kind, artifact.normalized_schema_key, default_opts);
+    }
+    if (artifact.payload.empty() && !artifact.gbnf.empty()) {
+        artifact.payload = artifact.gbnf;
+    }
+    if (artifact.compile_duration.count() == 0) {
+        artifact.compile_duration = elapsed;
+    }
+
+    auto immutable = std::make_shared<const CompiledGrammar>(std::move(artifact));
+    const std::size_t bytes = immutable->approx_bytes();
+
+    std::lock_guard<std::mutex> lock(mu_);
+    if (auto it = index_.find(key); it != index_.end()) {
+        lru_.splice(lru_.begin(), lru_, it->second);
+        return it->second->artifact;
+    }
+    if (max_entries_ == 0 || max_bytes_ == 0 || bytes > max_entry_bytes_ || bytes > max_bytes_) {
+        ++bypassed_oversize_;
+        return immutable;
+    }
+    evict_until_fit_locked(bytes);
+    lru_.push_front(Slot{key, immutable, bytes});
+    index_.emplace(key, lru_.begin());
+    used_bytes_ += bytes;
+    ++inserts_;
+    return immutable;
+}
+
+Result<std::shared_ptr<const CompiledGrammar>> CompiledGrammarCache::get_or_compile_json_object(
+    const StructuredGrammarEngine& engine, std::string_view tokenizer_identity,
+    const GrammarCompileOptions& options) {
+    CompiledGrammarCacheKey key;
+    key.engine = engine.kind();
+    key.constraint_kind = GrammarConstraintKind::json_object;
+    key.tokenizer_identity = tokenizer_identity.empty() ? std::string("default") : std::string(tokenizer_identity);
+    key.normalized_schema_key = R"({"type":"object"})";
+    key.options_key = options.cache_key_fragment();
+    return get_or_compile(key, [&]() -> Result<CompiledGrammar> {
+        auto res = engine.compile_json_object();
+        if (!res.ok()) {
+            return res.status();
+        }
+        res.value().tokenizer_identity = key.tokenizer_identity;
+        res.value().normalized_schema_hash =
+            normalized_schema_hash(GrammarConstraintKind::json_object, key.normalized_schema_key, options);
+        return res;
+    });
+}
+
+Result<std::shared_ptr<const CompiledGrammar>> CompiledGrammarCache::get_or_compile_schema(
+    const StructuredGrammarEngine& engine, const json::Value& schema, std::string_view tokenizer_identity,
+    const GrammarCompileOptions& options) {
+    const std::string canonical = canonical_json_dump(schema);
+    CompiledGrammarCacheKey key;
+    key.engine = engine.kind();
+    key.constraint_kind = GrammarConstraintKind::json_schema;
+    key.tokenizer_identity = tokenizer_identity.empty() ? std::string("default") : std::string(tokenizer_identity);
+    key.normalized_schema_key = canonical;
+    key.options_key = options.cache_key_fragment();
+    return get_or_compile(key, [&]() -> Result<CompiledGrammar> {
+        auto res = engine.compile_json_schema(schema);
+        if (!res.ok()) {
+            return res.status();
+        }
+        res.value().normalized_schema_key = canonical;
+        res.value().normalized_schema_hash =
+            normalized_schema_hash(GrammarConstraintKind::json_schema, canonical, options);
+        res.value().tokenizer_identity = key.tokenizer_identity;
+        return res;
+    });
+}
+
+CompiledGrammarCacheStats CompiledGrammarCache::stats() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return CompiledGrammarCacheStats{
+        lru_.size(), used_bytes_, max_entries_, max_bytes_, max_entry_bytes_,
+        hits_, misses_, inserts_, evictions_, bypassed_oversize_, compile_failures_,
+    };
+}
+
+void CompiledGrammarCache::clear() {
+    std::lock_guard<std::mutex> lock(mu_);
+    lru_.clear();
+    index_.clear();
+    used_bytes_ = 0;
 }
 
 }  // namespace sonder::inference::server::detail
