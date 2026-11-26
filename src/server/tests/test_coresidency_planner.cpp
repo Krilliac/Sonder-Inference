@@ -15,6 +15,8 @@
 #include "sonder/inference/json.hpp"
 #include "sonder/inference/launch_profile.hpp"
 #include "sonder/inference/placement_planner.hpp"
+#include "src/residency.hpp"
+#include "src/residency_config.hpp"
 
 namespace si = sonder::inference;
 namespace json = sonder::inference::json;
@@ -542,4 +544,57 @@ TEST_CASE("coresidency planner: empty entries list and coresidency_plan_to_json 
         REQUIRE(root.find("warnings") != nullptr);
         CHECK(root.find("warnings")->is_array());
     }
+}
+
+TEST_CASE("coresidency planner: footprints_from_coresidency_plan feeds live ModelResidency byte reservations") {
+    const std::vector<si::GpuDeviceInfo> gpus{make_rtx_5070_ti("gpu:0", 15360)};
+    const si::HostMemory host = host_ram(64, 48);
+
+    si::PlacementPlanRequest r1;
+    r1.profile_name = "primary-27b";
+    r1.model_path = "bonsai27b.gguf";
+    r1.target_ctx_size = 8192;
+    r1.parallel = 1;
+
+    si::PlacementPlanRequest r2 = r1;
+    r2.profile_name = "sidecar-27b";
+    r2.model_path = "bonsai27b_b.gguf";
+
+    const si::CoResidencyPlan co_plan =
+        si::plan_coresident_models({{bonsai_2_27b_model(), r1}, {bonsai_2_27b_model(), r2}}, gpus, host);
+    const auto footprints = si::detail::footprints_from_coresidency_plan(co_plan);
+    REQUIRE(footprints.size() == 2u);
+    CHECK(footprints[0].first == "primary-27b");
+    CHECK(footprints[1].first == "sidecar-27b");
+    CHECK(footprints[0].second.vram_bytes() == co_plan.models[0].estimate.total_bytes);
+    CHECK(footprints[0].second.ram_bytes() == co_plan.models[0].estimate.host_resident_bytes);
+    CHECK(footprints[0].second.vram.weights_bytes > 0u);
+    CHECK(footprints[0].second.vram.kv_cache_bytes > 0u);
+    CHECK(footprints[0].second.vram.workspace_bytes > 0u);
+
+    // Projector bytes are split out of weights_bytes without double-counting.
+    si::VramEstimate with_proj = co_plan.models[0].estimate;
+    const std::uint64_t proj_bytes = 512 * kMiB;
+    with_proj.weights_bytes += proj_bytes;
+    with_proj.total_bytes += proj_bytes;
+    const auto proj_fp = si::detail::footprint_from_vram_estimate(with_proj, proj_bytes, 0, 64 * kMiB, 0);
+    CHECK(proj_fp.vram.projector_bytes == proj_bytes);
+    CHECK(proj_fp.vram.adapter_bytes == 64 * kMiB);
+    CHECK(proj_fp.vram.weights_bytes == co_plan.models[0].estimate.weights_bytes);
+    CHECK(proj_fp.vram_bytes() == with_proj.total_bytes + 64 * kMiB);
+
+    // parse_live_residency_budgets parses MiB/bytes and rejects conflicting or unknown fields.
+    std::uint64_t max_vram = 0;
+    std::uint64_t max_ram = 0;
+    const auto ok_json = json::parse(R"({"max_resident_vram_mib":12288,"max_resident_ram_mib":24576})");
+    REQUIRE(ok_json.ok());
+    REQUIRE(si::detail::parse_live_residency_budgets(ok_json.value(), max_vram, max_ram).ok());
+    CHECK(max_vram == 12288ull * kMiB);
+    CHECK(max_ram == 24576ull * kMiB);
+
+    const auto conflict_json =
+        json::parse(R"({"max_resident_vram_mib":1024,"max_resident_vram_bytes":1073741824})");
+    REQUIRE(conflict_json.ok());
+    CHECK(si::detail::parse_live_residency_budgets(conflict_json.value(), max_vram, max_ram).code() ==
+          si::ErrorCode::invalid_argument);
 }

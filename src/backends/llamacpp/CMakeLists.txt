@@ -163,6 +163,16 @@ if(EXISTS "${_sonder_llama_h}")
         list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_MOE_CACHE_SIZE=1)
     endif()
 
+    string(FIND "${_sonder_llama_h_content}" "swa_full" _idx_swa_full)
+    if(NOT _idx_swa_full EQUAL -1)
+        list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_SWA_FULL=1)
+    endif()
+
+    string(FIND "${_sonder_llama_h_content}" "llama_model_n_swa" _idx_model_n_swa)
+    if(NOT _idx_model_n_swa EQUAL -1)
+        list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_MODEL_N_SWA=1)
+    endif()
+
     string(FIND "${_sonder_llama_h_content}" "LLAMA_CONTEXT_TYPE_MTP" _idx_ctx_mtp)
     string(FIND "${_sonder_llama_h_content}" "llama_model_n_layer_nextn" _idx_layer_nextn)
     string(FIND "${_sonder_llama_h_content}" "load_mtp" _idx_load_mtp)

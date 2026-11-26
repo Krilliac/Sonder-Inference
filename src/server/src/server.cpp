@@ -49,10 +49,17 @@ struct Server::Impl {
         }
         parse_gate.max_active = std::clamp<std::size_t>(opts.max_connections / 4, 4, 16);
         parse_gate.max_bytes = std::max<std::size_t>(opts.max_body_bytes * 4, 16u << 20);
+        ResidencyConfig residency_cfg;
+        residency_cfg.idle_ttl = opts.model_idle_ttl;
+        residency_cfg.max_resident = opts.max_resident_models;
+        residency_cfg.max_resident_vram_bytes = opts.max_resident_vram_bytes;
+        residency_cfg.max_resident_ram_bytes = opts.max_resident_ram_bytes;
         residency = std::make_shared<ModelResidency>(
-            ResidencyConfig{opts.model_idle_ttl, opts.max_resident_models},
+            residency_cfg,
             [this](const std::string& id) { return load_served_model(id); },
-            [this](Eviction& ev) { on_model_evicted(ev); });
+            [this](Eviction& ev) { on_model_evicted(ev); },
+            [this](const std::string& id, const std::shared_ptr<Model>& model,
+                   const ModelResourceFootprint& reserved) { return observe_model_footprint(id, model, reserved); });
     }
 
     ServerOptions opts;
@@ -190,6 +197,50 @@ struct Server::Impl {
         return e->load_model(backend_name, lo);
     }
 
+    // Reconciles a freshly loaded model's pre-load byte reservation against
+    // backend runtime GPU memory observations and model descriptor metadata.
+    std::optional<ModelResourceFootprint> observe_model_footprint(const std::string& id,
+                                                                  const std::shared_ptr<Model>& model,
+                                                                  const ModelResourceFootprint& reserved) {
+        (void)id;
+        ModelResourceFootprint observed = reserved;
+        if (model && observed.vram.weights_bytes == 0 && observed.ram.weights_bytes == 0 &&
+            model->descriptor().size_bytes > 0) {
+            if (model->device_id().rfind("gpu:", 0) == 0) {
+                observed.vram.weights_bytes = model->descriptor().size_bytes;
+            } else {
+                observed.ram.weights_bytes = model->descriptor().size_bytes;
+            }
+        }
+        std::shared_ptr<Backend> b;
+        {
+            std::lock_guard<std::mutex> lock(engine_mu);
+            b = backend;
+        }
+        if (b) {
+            if (const auto runtime = b->runtime_status()) {
+                if (runtime->gpu_memory.status == "ok" && runtime->gpu_memory.dedicated_bytes > 0) {
+                    const std::uint64_t other_vram = residency ? residency->totals().resident_vram_bytes : 0;
+                    if (runtime->gpu_memory.dedicated_bytes > other_vram) {
+                        const std::uint64_t observed_delta = runtime->gpu_memory.dedicated_bytes - other_vram;
+                        const std::uint64_t est_vram = observed.vram_bytes();
+                        if (est_vram == 0) {
+                            observed.vram.weights_bytes = observed_delta;
+                        } else if (observed_delta > est_vram) {
+                            const std::uint64_t extra = observed_delta - est_vram;
+                            const std::uint64_t max_u64 = std::numeric_limits<std::uint64_t>::max();
+                            observed.vram.workspace_bytes =
+                                observed.vram.workspace_bytes > max_u64 - extra
+                                    ? max_u64
+                                    : observed.vram.workspace_bytes + extra;
+                        }
+                    }
+                }
+            }
+        }
+        return observed;
+    }
+
     // Residency evictor: `model.evicted`, then the engine's `model.unload`.
     void on_model_evicted(Eviction& ev) {
         if (!ev.model) {
@@ -211,7 +262,10 @@ struct Server::Impl {
                             json::Object{{"backend", ev.backend},
                                          {"model", ev.id},
                                          {"reason", std::string(ev.reason)},
-                                         {"idle_ms", ev.idle_ms}},
+                                         {"idle_ms", ev.idle_ms},
+                                         {"freed_vram_bytes", ev.freed_footprint.vram_bytes()},
+                                         {"freed_ram_bytes", ev.freed_footprint.ram_bytes()},
+                                         {"eviction_cost", ev.eviction_cost}},
                             TelemetryLevel::metrics);
         (void)e->unload_model(model_instance);
         log_message("info", "unloaded model '" + ev.id + "' (" + ev.reason + ")");
@@ -1402,7 +1456,11 @@ struct Server::Impl {
                 return cancelled_start();
             }
             StepGuard step{*this};
-            (void)residency->add(ids[i], backend_name, i == 0);
+            ModelResourceFootprint estimated;
+            if (const ModelProfileBinding* binding = find_profile_binding(opts, ids[i])) {
+                estimated = binding->estimated_footprint;
+            }
+            (void)residency->add(ids[i], backend_name, i == 0, std::move(estimated));
             if (opts.lazy_models || (opts.max_resident_models != 0 && i >= opts.max_resident_models)) {
                 continue;
             }

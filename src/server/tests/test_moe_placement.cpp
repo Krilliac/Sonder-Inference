@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "sonder/inference/launch_profile.hpp"
+#include "sonder/inference/moe_routing_telemetry.hpp"
 #include "sonder/inference/server.hpp"
 
 namespace si = sonder::inference;
@@ -851,4 +852,124 @@ TEST_CASE("gguf reader detects and sizes MXFP4 (4.25 bpw), NVFP4 (4.50 bpw), and
     CHECK(info.tensors[1].bytes == 144u);
     CHECK(info.tensors[2].bytes == 256u);
     CHECK(info.block_bytes[0] == 136u + 144u + 256u);
+}
+
+TEST_CASE("moe routing telemetry: inactive when all experts reside in VRAM, active when offloaded") {
+    const auto m = moe_model();
+    const si::VramEstimate full_vram = si::estimate_vram(m, profile({}, -1));
+    const si::VramEstimate cpu_offload = si::estimate_vram(m, profile({"--cpu-moe"}, -1));
+
+    const auto inactive_cfg = si::make_moe_routing_telemetry_config(full_vram);
+    CHECK_FALSE(inactive_cfg.offload_active);
+    si::MoeRoutingTelemetry inactive(inactive_cfg);
+    CHECK_FALSE(inactive.offload_active());
+    inactive.record_expert_access(0, 3, false, 64 * kMiB, 1.5);
+    inactive.record_routing_batch(0, {si::MoeExpertObservation{1, true, 0, 0.0}});
+    const auto inactive_snap = inactive.snapshot();
+    CHECK_FALSE(inactive_snap.offload_active);
+    CHECK(inactive_snap.total_routes == 0u);
+    CHECK(inactive_snap.tracked_layers == 0u);
+    CHECK(inactive_snap.layers.empty());
+
+    const auto active_cfg = si::make_moe_routing_telemetry_config(cpu_offload, /*top_k=*/3);
+    CHECK(active_cfg.offload_active);
+    si::MoeRoutingTelemetry active(active_cfg);
+    CHECK(active.offload_active());
+
+    // Record hits, misses, transfer bytes, and waits (including negative/NaN wait sanitization).
+    active.record_expert_access(2, 5, true, 0, 0.0);
+    active.record_expert_access(2, 5, true, 0, 0.0);
+    active.record_expert_access(2, 5, false, 16 * kMiB, 2.5);
+    active.record_expert_access(2, 1, false, 16 * kMiB, 4.0);
+    active.record_expert_access(2, 7, false, 16 * kMiB, std::numeric_limits<double>::quiet_NaN());
+    active.record_expert_access(2, 7, true, 0, -5.0);
+    active.record_routing_batch(0, {
+        si::MoeExpertObservation{2, true, 0, 0.0},
+        si::MoeExpertObservation{2, false, 8 * kMiB, 1.25},
+        si::MoeExpertObservation{4, true, 0, 0.0},
+    });
+
+    const auto snap = active.snapshot();
+    CHECK(snap.offload_active);
+    CHECK(snap.total_routes == 9u);
+    CHECK(snap.expert_hits == 5u);
+    CHECK(snap.expert_misses == 4u);
+    CHECK(snap.hit_rate() == doctest::Approx(5.0 / 9.0));
+    CHECK(snap.transfer_count == 4u);
+    CHECK(snap.transfer_bytes == 56 * kMiB);
+    CHECK(snap.transfer_wait_ms == doctest::Approx(7.75));
+    CHECK(snap.max_transfer_wait_ms == doctest::Approx(4.0));
+    REQUIRE(snap.layers.size() == 2u);
+    CHECK(snap.layers[0].layer_id == 0u);
+    CHECK(snap.layers[1].layer_id == 2u);
+
+    const auto hot_l2 = active.hot_experts_for_layer(2, 2);
+    REQUIRE(hot_l2.size() == 2u);
+    CHECK(hot_l2[0].expert_id == 5u);
+    CHECK(hot_l2[0].activations == 3u);
+    CHECK(hot_l2[0].hits == 2u);
+    CHECK(hot_l2[0].misses == 1u);
+    CHECK(hot_l2[0].overestimate_error == 0u);
+    CHECK(hot_l2[0].share == doctest::Approx(0.5));
+    CHECK(hot_l2[1].expert_id == 7u);
+    CHECK(hot_l2[1].activations == 2u);
+
+    const auto doc = si::moe_routing_telemetry_to_json(snap);
+    CHECK(doc.find("schema")->as_string() == "sonder.inference.moe_routing_telemetry/1");
+    CHECK(doc.find("expert_hits")->as_uint() == 5u);
+    CHECK(doc.find("expert_misses")->as_uint() == 4u);
+    CHECK(doc.find("transfer_bytes")->as_uint() == 56 * kMiB);
+    CHECK(doc.find("layers")->as_array().size() == 2u);
+
+    active.reset();
+    CHECK(active.snapshot().total_routes == 0u);
+    CHECK(active.snapshot().tracked_layers == 0u);
+}
+
+TEST_CASE("moe routing telemetry: layer and per-layer expert tables stay strictly bounded while retaining hot experts") {
+    si::MoeRoutingTelemetryConfig cfg;
+    cfg.offload_active = true;
+    cfg.max_layers = 4;
+    cfg.max_experts_per_layer = 8;
+    cfg.top_k = 3;
+    si::MoeRoutingTelemetry tracker(cfg);
+
+    // Hammer 20 distinct layers into a 4-layer cap.
+    for (std::uint32_t layer = 0; layer < 20; ++layer) {
+        tracker.record_expert_access(layer, 0, true);
+    }
+    {
+        const auto snap = tracker.snapshot();
+        CHECK(snap.tracked_layers == 4u);
+        CHECK(snap.dropped_layer_observations == 16u);
+        CHECK(snap.total_routes == 20u);
+    }
+
+    // Hammer 200 distinct experts into layer 0's 8-slot Space-Saving table,
+    // with experts {7, 42, 99} genuinely hot (50 accesses each).
+    for (int round = 0; round < 50; ++round) {
+        tracker.record_expert_access(0, 7, true);
+        tracker.record_expert_access(0, 42, true);
+        tracker.record_expert_access(0, 99, false, 4 * kMiB, 0.5);
+    }
+    for (std::uint32_t cold = 100; cold < 297; ++cold) {
+        tracker.record_expert_access(0, cold, false, 1 * kMiB, 0.1);
+    }
+
+    const auto snap = tracker.snapshot();
+    REQUIRE(snap.layers.size() == 4u);
+    CHECK(snap.layers[0].layer_id == 0u);
+    CHECK(snap.layers[0].tracked_experts == 8u);  // strictly bounded at max_experts_per_layer
+    CHECK(snap.layers[0].table_evictions > 0u);
+    REQUIRE(snap.layers[0].top_experts.size() == 3u);
+
+    // All three genuinely hot experts stay in the top-3 despite 197 cold evictors!
+    std::vector<std::uint32_t> top_ids;
+    for (const auto& e : snap.layers[0].top_experts) {
+        top_ids.push_back(e.expert_id);
+        CHECK(e.activations == 50u);
+        CHECK(e.overestimate_error == 0u);
+    }
+    std::sort(top_ids.begin(), top_ids.end());
+    CHECK(top_ids == std::vector<std::uint32_t>{7u, 42u, 99u});
 }

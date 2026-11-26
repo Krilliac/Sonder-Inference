@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -46,6 +47,35 @@ enum class PinMode { override_request, default_value };
 // enables it when an explicit class or queue cap is configured.
 enum class PriorityAdmissionPolicy { automatic, on, off };
 
+// Per-tier (VRAM or host RAM) memory footprint breakdown for one served model
+// (Item #18: weights, KV/recurrent cache, compute/scratch workspaces,
+// multimodal projectors, and adapters accounted separately).
+struct ResourceFootprint {
+    std::uint64_t weights_bytes = 0;
+    std::uint64_t kv_cache_bytes = 0;
+    std::uint64_t workspace_bytes = 0;
+    std::uint64_t projector_bytes = 0;
+    std::uint64_t adapter_bytes = 0;
+
+    [[nodiscard]] std::uint64_t total_bytes() const noexcept {
+        const auto sadd = [](std::uint64_t a, std::uint64_t b) noexcept {
+            return a > std::numeric_limits<std::uint64_t>::max() - b ? std::numeric_limits<std::uint64_t>::max()
+                                                                     : a + b;
+        };
+        return sadd(sadd(sadd(weights_bytes, kv_cache_bytes), sadd(workspace_bytes, projector_bytes)), adapter_bytes);
+    }
+    [[nodiscard]] bool empty() const noexcept { return total_bytes() == 0; }
+};
+
+struct ModelResourceFootprint {
+    ResourceFootprint vram;
+    ResourceFootprint ram;
+
+    [[nodiscard]] std::uint64_t vram_bytes() const noexcept { return vram.total_bytes(); }
+    [[nodiscard]] std::uint64_t ram_bytes() const noexcept { return ram.total_bytes(); }
+    [[nodiscard]] bool empty() const noexcept { return vram.empty() && ram.empty(); }
+};
+
 // A served model backed by a launch profile (launch_profile.hpp).
 struct ModelProfileBinding {
     std::string model;      // served id; must also be listed in ServerOptions::models
@@ -54,6 +84,9 @@ struct ModelProfileBinding {
     SamplingDefaults sampling_defaults;
     // Added to the model's /v1/models entry as `sonder.profile`.
     json::Object metadata;
+    // Pre-load VRAM/RAM byte estimate derived from vram_estimate /
+    // coresidency_planner for live residency reservation.
+    ModelResourceFootprint estimated_footprint;
 };
 
 struct ServerOptions {
@@ -150,6 +183,13 @@ struct ServerOptions {
     // in flight can exceed it until they finish. With eager loading only the
     // first N models load during start(). 0 = no cap.
     std::size_t max_resident_models = 0;
+    // Byte budgets for live model residency (0 = unlimited). Pre-load byte
+    // reservations are reconciled against observed allocations after load and
+    // released immediately on error; unpinned victims are chosen by
+    // (demand_score * reload_ms) / max(1, bytes_freed). Pinned models are
+    // never evicted.
+    std::uint64_t max_resident_vram_bytes = 0;
+    std::uint64_t max_resident_ram_bytes = 0;
     // Request path (docs/SERVER.md "Scheduling" and "Thinking control").
     // --scheduler: automatic gates in-process backends per token and only
     // admits/accounts remote-process ones (llamaserver, ollama); off disables

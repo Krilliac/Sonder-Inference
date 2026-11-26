@@ -492,6 +492,7 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     lo.moe_cache_mib = o.moe_cache_mib;
     lo.moe_cache_cpu_share = o.moe_cache_cpu_share;
     lo.mmproj_path = o.mmproj_path;
+    lo.swa_kv_mode = o.swa_kv_mode;
     if (!lc::ParseSplitMode(o.split_mode, lo.split_mode)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown split mode '" + o.split_mode + "' (expected none, layer or row)");

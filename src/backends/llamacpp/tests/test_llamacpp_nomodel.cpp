@@ -581,3 +581,30 @@ TEST_CASE("llamacpp wrapper: log lines go to the installed sink, not to stderr")
     CHECK(captured_log()[1] == "an error\n");
     if (!verbose) CHECK(captured_log().size() == 2);
 }
+
+TEST_CASE("llamacpp wrapper: SwaKvMode defaults to Full, opts into compact swa_full, and validates cleanly") {
+    sonder::inference::LlamaCppBackendOptions backend_opts;
+    CHECK(backend_opts.swa_kv_mode == sonder::inference::SwaKvMode::Full);
+    CHECK(sonder::inference::validate_llamacpp_options(backend_opts).ok());
+
+    backend_opts.swa_kv_mode = sonder::inference::SwaKvMode::CompactIfQualified;
+    CHECK(sonder::inference::validate_llamacpp_options(backend_opts).ok());
+
+    LoadOptions full_opts;
+    CHECK(full_opts.swa_kv_mode == sonder::inference::SwaKvMode::Full);
+    CHECK(ValidateContextOptions(full_opts).ok());
+    CHECK(LlamaCppBackend::ContextParamsFor(full_opts).swa_full);
+
+    LoadOptions compact_opts;
+    compact_opts.swa_kv_mode = sonder::inference::SwaKvMode::CompactIfQualified;
+    CHECK(ValidateContextOptions(compact_opts).ok());
+#if defined(SONDER_LLAMACPP_HAS_SWA_FULL)
+    CHECK_FALSE(LlamaCppBackend::ContextParamsFor(compact_opts).swa_full);
+#else
+    CHECK(LlamaCppBackend::ContextParamsFor(compact_opts).swa_full);
+#endif
+
+    LoadOptions bad_swa;
+    bad_swa.swa_kv_mode = static_cast<sonder::inference::SwaKvMode>(99);
+    CHECK(ValidateContextOptions(bad_swa).code == ErrorCode::kInvalidArgument);
+}

@@ -20,6 +20,7 @@
 
 #include "sonder/inference/model_architecture.hpp"
 #include "sonder/inference/speculative_verifier.hpp"
+#include "sonder/inference/swa_policy.hpp"
 
 namespace sonder::backends::llamacpp {
 
@@ -221,6 +222,9 @@ struct LoadOptions {
     double moe_cache_cpu_share = 0.0;
     // Optional multimodal projector GGUF path (--mmproj); requires SONDER_WITH_MTMD=ON.
     std::string mmproj_path;
+    // Sliding-window attention KV policy: Full (default, swa_full = true) or
+    // CompactIfQualified (opt-in compact SWA with min_retained_pos rollback guard).
+    sonder::inference::SwaKvMode swa_kv_mode = sonder::inference::SwaKvMode::Full;
 };
 
 // Checks placement options (main_gpu >= 0, split_mode, tensor_split finite /
@@ -265,6 +269,7 @@ struct ContextParamsSummary {
     bool no_perf = true;
     bool kv_unified = false;
     bool op_offload = false;
+    bool swa_full = true;
     std::uint64_t moe_cache_size = 0;
 };
 

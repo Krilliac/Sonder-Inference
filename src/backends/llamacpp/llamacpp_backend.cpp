@@ -305,7 +305,7 @@ ModelParamsSummary SummarizeModelParams(const llama_model_params& mp) {
 
 // The single place that turns LoadOptions into llama_context_params; Load()
 // and ContextParamsFor() both use it. The abort callback is set by Load().
-llama_context_params MakeContextParams(const LoadOptions& options) {
+llama_context_params MakeContextParams(const LoadOptions& options, bool swa_compact_qualified = true) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = options.n_ctx;
     cp.n_batch = options.n_batch;
@@ -335,6 +335,11 @@ llama_context_params MakeContextParams(const LoadOptions& options) {
 #endif
 #if defined(SONDER_LLAMACPP_HAS_OP_OFFLOAD)
     cp.op_offload = true;
+#endif
+#if defined(SONDER_LLAMACPP_HAS_SWA_FULL)
+    cp.swa_full = !(options.swa_kv_mode == sonder::inference::SwaKvMode::CompactIfQualified && swa_compact_qualified);
+#else
+    (void)swa_compact_qualified;
 #endif
 #if defined(SONDER_LLAMACPP_HAS_MOE_CACHE_SIZE)
     if (options.moe_cache_mib > 0) {
@@ -417,6 +422,11 @@ ContextParamsSummary Summarize(const llama_context_params& cp) {
 #endif
 #if defined(SONDER_LLAMACPP_HAS_OP_OFFLOAD)
     s.op_offload = cp.op_offload;
+#endif
+#if defined(SONDER_LLAMACPP_HAS_SWA_FULL)
+    s.swa_full = cp.swa_full;
+#else
+    s.swa_full = true;
 #endif
 #if defined(SONDER_LLAMACPP_HAS_MOE_CACHE_SIZE)
     s.moe_cache_size = static_cast<std::uint64_t>(cp.moe_cache_size);
@@ -517,6 +527,10 @@ struct LlamaCppBackend::Impl {
     std::vector<PrefixSlotMeta> slots;
     std::vector<std::uint8_t> slot_busy;
     std::vector<bool> slot_mtp_synced;
+    std::vector<sonder::inference::SwaRollbackGuard> slot_swa_guards;
+    std::uint64_t swa_window = 0;
+    std::uint64_t swa_retained_slack = 0;
+    bool swa_compact_active = false;
     std::vector<std::vector<PartialCheckpoint>> slot_checkpoints;
     std::size_t total_checkpoint_bytes = 0;
     std::uint64_t checkpoint_clock = 0;
@@ -682,12 +696,59 @@ struct LlamaCppBackend::Impl {
         return true;
     }
 
+    void ResetSwaSlot(std::size_t slot_idx) noexcept {
+        if (slot_idx < slot_swa_guards.size()) {
+            slot_swa_guards[slot_idx].Reset();
+        }
+    }
+
+    void AdvanceSwaSlot(std::size_t slot_idx, llama_memory_t mem, llama_seq_id slot_id,
+                        std::uint64_t new_seq_len) noexcept {
+        if (slot_idx >= slot_swa_guards.size()) return;
+        slot_swa_guards[slot_idx].OnAdvance(new_seq_len);
+        if (mem != nullptr && swa_compact_active) {
+            slot_swa_guards[slot_idx].ObserveBackendPosMin(
+                static_cast<std::int64_t>(llama_memory_seq_pos_min(mem, slot_id)));
+        }
+    }
+
+    bool CheckSwaRollback(std::size_t slot_idx, llama_memory_t mem, llama_seq_id slot_id,
+                          std::uint64_t target_pos) noexcept {
+        if (slot_idx >= slot_swa_guards.size()) return true;
+        if (mem != nullptr && swa_compact_active) {
+            slot_swa_guards[slot_idx].ObserveBackendPosMin(
+                static_cast<std::int64_t>(llama_memory_seq_pos_min(mem, slot_id)));
+        }
+        return slot_swa_guards[slot_idx].CheckAndApplyRollback(target_pos);
+    }
+
+    bool CanCloneSwaSource(std::size_t src_idx, llama_memory_t mem, llama_seq_id src_sid,
+                           std::uint64_t target_pos) noexcept {
+        if (!swa_compact_active || src_idx >= slot_swa_guards.size()) return true;
+        if (mem != nullptr) {
+            slot_swa_guards[src_idx].ObserveBackendPosMin(
+                static_cast<std::int64_t>(llama_memory_seq_pos_min(mem, src_sid)));
+        }
+        return target_pos >= slot_swa_guards[src_idx].min_retained_pos();
+    }
+
+    void SyncClonedSwaSlot(std::size_t dst_idx, std::size_t src_idx, llama_memory_t mem, llama_seq_id dst_sid,
+                           std::uint64_t cloned_len) noexcept {
+        ResetSwaSlot(dst_idx);
+        if (swa_compact_active && dst_idx < slot_swa_guards.size() && src_idx < slot_swa_guards.size()) {
+            slot_swa_guards[dst_idx].ObserveBackendPosMin(
+                static_cast<std::int64_t>(slot_swa_guards[src_idx].oldest_retained_row()));
+        }
+        AdvanceSwaSlot(dst_idx, mem, dst_sid, cloned_len);
+    }
+
     void ResetAllSlots() noexcept {
         for (std::size_t i = 0; i < slots.size(); ++i) {
             slots[i].tokens.clear();
             slots[i].session_key.clear();
             slots[i].last_used = 0;
             if (i < slot_mtp_synced.size()) slot_mtp_synced[i] = false;
+            if (i < slot_swa_guards.size()) slot_swa_guards[i].Reset();
         }
         for (auto& ckpts : slot_checkpoints) {
             ckpts.clear();
@@ -1057,25 +1118,34 @@ struct LlamaCppBackend::Impl {
         if (mem == nullptr) return false;
         out_wiped = true;
         llama_memory_seq_rm(mem, slot_id, -1, -1);
+        ResetSwaSlot(slot_idx);
         ClearSlotCheckpoints(slot_idx);
 
         const std::size_t read = llama_state_seq_set_data(ctx, entry->state_blob.data(),
                                                           entry->state_blob.size(), slot_id);
         if (read == 0) {
             llama_memory_seq_rm(mem, slot_id, -1, -1);
+            ResetSwaSlot(slot_idx);
             return false;
         }
+        AdvanceSwaSlot(slot_idx, mem, slot_id, static_cast<std::uint64_t>(hit.state_tokens()));
         if (hit.state_tokens() > hit.matched_tokens()) {
-            if (!llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(hit.matched_tokens()), -1)) {
+            const bool swa_ok = CheckSwaRollback(slot_idx, mem, slot_id, static_cast<std::uint64_t>(hit.matched_tokens()));
+            if (!swa_ok || !llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(hit.matched_tokens()), -1)) {
                 llama_memory_seq_rm(mem, slot_id, -1, -1);
+                ResetSwaSlot(slot_idx);
                 return false;
             }
         }
         const int64_t restored_len = llama_memory_seq_pos_max(mem, slot_id) + 1;
         if (restored_len != static_cast<int64_t>(hit.matched_tokens())) {
             llama_memory_seq_rm(mem, slot_id, -1, -1);
+            ResetSwaSlot(slot_idx);
             return false;
         }
+        // Observe backend pos_min after any trim while preserving the monotonic
+        // watermark established from `hit.state_tokens()`.
+        AdvanceSwaSlot(slot_idx, mem, slot_id, static_cast<std::uint64_t>(hit.matched_tokens()));
 
 #if defined(SONDER_LLAMACPP_HAS_MTP)
         if (ctx_dft != nullptr && slot_idx < mtp_pending_h.size()) {
@@ -2164,7 +2234,18 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
     impl_->architecture = ReadModelArchitecture(model);
 
     if (!options.vocab_only) {
-        llama_context_params cp = MakeContextParams(options);
+        std::uint64_t model_n_swa = 0;
+#if defined(SONDER_LLAMACPP_HAS_MODEL_N_SWA)
+        if (const int32_t raw_swa = llama_model_n_swa(model); raw_swa > 0) {
+            model_n_swa = static_cast<std::uint64_t>(raw_swa);
+        }
+#endif
+#if defined(SONDER_LLAMACPP_HAS_SWA_FULL)
+        const bool swa_qualified = (model_n_swa > 0);
+#else
+        const bool swa_qualified = false;
+#endif
+        llama_context_params cp = MakeContextParams(options, swa_qualified);
         cp.abort_callback = &Impl::AbortCallback;
         cp.abort_callback_data = impl_.get();
         impl_->ctx = llama_init_from_model(model, cp);
@@ -2184,6 +2265,14 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
         impl_->slots.resize(n_slots);
         impl_->slot_busy.assign(n_slots, 0u);
         impl_->slot_mtp_synced.assign(n_slots, false);
+        impl_->swa_window = model_n_swa;
+        impl_->swa_retained_slack = static_cast<std::uint64_t>(llama_n_ubatch(impl_->ctx));
+        impl_->swa_compact_active =
+            (options.swa_kv_mode == sonder::inference::SwaKvMode::CompactIfQualified) && swa_qualified;
+        impl_->slot_swa_guards.resize(n_slots);
+        for (auto& guard : impl_->slot_swa_guards) {
+            guard.Configure(options.swa_kv_mode, impl_->swa_window, impl_->swa_retained_slack, swa_qualified);
+        }
         impl_->slot_checkpoints.assign(n_slots, {});
         for (std::uint32_t i = 0; i < n_slots; ++i) {
             impl_->slots[i].id = static_cast<std::int32_t>(i);
@@ -2906,6 +2995,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         if (!restored_from_l2) {
             if (lcp == 0) {
                 llama_memory_seq_rm(mem, slot_id, -1, -1);
+                ResetSwaSlot(slot_idx);
                 ClearSlotCheckpoints(slot_idx);
                 if (slot_idx < slot_mtp_synced.size()) slot_mtp_synced[slot_idx] = true;
 #if defined(SONDER_LLAMACPP_HAS_MTP)
@@ -2920,19 +3010,22 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
             } else {
                 bool restored_pending_h = false;
                 if (lcp < kv_len) {
-                    if (llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(lcp), -1)) {
+                    const bool swa_ok = CheckSwaRollback(slot_idx, mem, slot_id, static_cast<std::uint64_t>(lcp));
+                    if (swa_ok && llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(lcp), -1)) {
                         PruneSlotCheckpointsAfter(slot_idx, lcp);
                     } else {
                         bool restored_from_ckpt = false;
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
                         std::size_t ckpt_pos = 0;
-                        if (RestorePartialCheckpoint(slot_idx, slot_id, lcp, ckpt_pos, restored_pending_h)) {
+                        if (!swa_compact_active &&
+                            RestorePartialCheckpoint(slot_idx, slot_id, lcp, ckpt_pos, restored_pending_h)) {
                             lcp = ckpt_pos;
                             restored_from_ckpt = true;
                         }
 #endif
                         if (!restored_from_ckpt) {
                             llama_memory_seq_rm(mem, slot_id, -1, -1);
+                            ResetSwaSlot(slot_idx);
                             ClearSlotCheckpoints(slot_idx);
                             lcp = 0;
                         }
@@ -3100,6 +3193,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
     auto invalidate_slot = [&]() {
         slot_valid = false;
         llama_memory_seq_rm(mem, slot_id, -1, -1);
+        ResetSwaSlot(slot_idx);
         if (slot_idx < slots.size()) {
             slots[slot_idx].tokens.clear();
             slots[slot_idx].session_key.clear();
@@ -3218,6 +3312,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
             }
             result.prompt_tokens += n;
             cur_pos += n;
+            AdvanceSwaSlot(slot_idx, mem, slot_id, static_cast<std::uint64_t>(cur_pos));
             off = step_end;
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
             if (hybrid_ckpt_offset == off && slot_valid) {
@@ -3479,10 +3574,11 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
 
         const int32_t rc = llama_decode(ctx, batch);
         if (rc != 0) {
-            bool rolled_back = llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
+            bool rolled_back = CheckSwaRollback(slot_idx, mem, slot_id, static_cast<std::uint64_t>(pos)) &&
+                               llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
             if (!rolled_back) {
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
-                if (have_spec_ckpt) {
+                if (have_spec_ckpt && !swa_compact_active) {
                     const llama_state_seq_flags flags = PartialCheckpointFlags();
                     const std::size_t read =
                         llama_state_seq_set_data_ext(ctx, spec_ckpt_buf.data(), spec_ckpt_size, slot_id, flags);
@@ -3512,6 +3608,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
             if (slot_valid && slot_idx < slots.size()) {
                 slots[slot_idx].tokens.push_back(cur_tok);
             }
+            AdvanceSwaSlot(slot_idx, mem, slot_id, static_cast<std::uint64_t>(pos + 1));
             if ((use_suffix || use_hybrid_suffix) && suffix_matcher != nullptr) {
                 suffix_matcher->CommitToken(cur_tok);
             }
@@ -3602,10 +3699,12 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
             }
 #endif
             const int64_t batch_end_pos = pos + 1 + static_cast<int64_t>(k);
+            AdvanceSwaSlot(slot_idx, mem, slot_id, static_cast<std::uint64_t>(batch_end_pos));
             if (keep_pos < batch_end_pos) {
-                if (!llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(keep_pos), -1)) {
+                const bool swa_ok = CheckSwaRollback(slot_idx, mem, slot_id, static_cast<std::uint64_t>(keep_pos));
+                if (!swa_ok || !llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(keep_pos), -1)) {
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
-                    if (have_spec_ckpt) {
+                    if (have_spec_ckpt && !swa_compact_active) {
                         const llama_state_seq_flags flags = PartialCheckpointFlags();
                         const std::size_t read = llama_state_seq_set_data_ext(ctx, spec_ckpt_buf.data(), spec_ckpt_size,
                                                                               slot_id, flags);
@@ -3796,18 +3895,23 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             const bool can_clone =
                 architecture == sonder::inference::ModelArchitecture::attention_only &&
                 producer != nullptr && producer->slot_valid &&
-                act.clone_prefix_len < follower->task->req->prompt.size();
+                act.clone_prefix_len < follower->task->req->prompt.size() &&
+                CanCloneSwaSource(producer->slot_idx, mem, producer->slot_id,
+                                  static_cast<std::uint64_t>(act.clone_prefix_len));
             bool cloned_ok = false;
             if (can_clone) {
                 const int64_t src_kv = llama_memory_seq_pos_max(mem, producer->slot_id) + 1;
                 if (src_kv >= static_cast<int64_t>(act.clone_prefix_len)) {
                     llama_memory_seq_rm(mem, follower->slot_id, -1, -1);
+                    ResetSwaSlot(follower->slot_idx);
                     ClearSlotCheckpoints(follower->slot_idx);
                     llama_memory_seq_cp(mem, producer->slot_id, follower->slot_id, 0,
                                         static_cast<llama_pos>(act.clone_prefix_len));
                     if (llama_memory_seq_pos_max(mem, follower->slot_id) + 1 ==
                         static_cast<int64_t>(act.clone_prefix_len)) {
                         cloned_ok = true;
+                        SyncClonedSwaSlot(follower->slot_idx, producer->slot_idx, mem, follower->slot_id,
+                                          static_cast<std::uint64_t>(act.clone_prefix_len));
                         const auto& fprompt = follower->task->req->prompt;
                         slots[follower->slot_idx].tokens.assign(
                             fprompt.begin(),
@@ -3882,6 +3986,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             SyncCoalescerStats();
         }
         llama_memory_seq_rm(mem, s.slot_id, -1, -1);
+        ResetSwaSlot(s.slot_idx);
         if (s.slot_idx < slots.size()) {
             slots[s.slot_idx].tokens.clear();
             slots[s.slot_idx].session_key.clear();
@@ -4039,7 +4144,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 if (cand <= best_src_lcp) continue;
                 const auto src_sid = static_cast<llama_seq_id>(slots[j].id);
                 const int64_t src_kv = llama_memory_seq_pos_max(mem, src_sid) + 1;
-                if (src_kv >= static_cast<int64_t>(cand)) {
+                if (src_kv >= static_cast<int64_t>(cand) &&
+                    CanCloneSwaSource(j, mem, src_sid, static_cast<std::uint64_t>(cand))) {
                     best_src_idx = j;
                     best_src_lcp = cand;
                 }
@@ -4047,11 +4153,13 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             if (best_src_idx < slots.size() && best_src_lcp >= lcp + 32u) {
                 const auto src_sid = static_cast<llama_seq_id>(slots[best_src_idx].id);
                 llama_memory_seq_rm(mem, s->slot_id, -1, -1);
+                ResetSwaSlot(s->slot_idx);
                 ClearSlotCheckpoints(s->slot_idx);
                 llama_memory_seq_cp(mem, src_sid, s->slot_id, 0, static_cast<llama_pos>(best_src_lcp));
                 if (llama_memory_seq_pos_max(mem, s->slot_id) + 1 == static_cast<int64_t>(best_src_lcp)) {
                     lcp = best_src_lcp;
                     cloned_from_vram = true;
+                    SyncClonedSwaSlot(s->slot_idx, best_src_idx, mem, s->slot_id, static_cast<std::uint64_t>(lcp));
                     slots[s->slot_idx].tokens.assign(req.prompt.begin(),
                                                      req.prompt.begin() + static_cast<std::ptrdiff_t>(lcp));
 #if defined(SONDER_LLAMACPP_HAS_MTP)
@@ -4112,6 +4220,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         if (!restored_from_l2) {
             if (lcp == 0) {
                 llama_memory_seq_rm(mem, s->slot_id, -1, -1);
+                ResetSwaSlot(s->slot_idx);
                 ClearSlotCheckpoints(s->slot_idx);
                 if (s->slot_idx < slot_mtp_synced.size()) slot_mtp_synced[s->slot_idx] = true;
 #if defined(SONDER_LLAMACPP_HAS_MTP)
@@ -4126,19 +4235,22 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             } else {
                 bool restored_pending_h = false;
                 if (lcp < kv_len) {
-                    if (llama_memory_seq_rm(mem, s->slot_id, static_cast<llama_pos>(lcp), -1)) {
+                    const bool swa_ok = CheckSwaRollback(s->slot_idx, mem, s->slot_id, static_cast<std::uint64_t>(lcp));
+                    if (swa_ok && llama_memory_seq_rm(mem, s->slot_id, static_cast<llama_pos>(lcp), -1)) {
                         PruneSlotCheckpointsAfter(s->slot_idx, lcp);
                     } else {
                         bool restored_from_ckpt = false;
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
                         std::size_t ckpt_pos = 0;
-                        if (RestorePartialCheckpoint(s->slot_idx, s->slot_id, lcp, ckpt_pos, restored_pending_h)) {
+                        if (!swa_compact_active &&
+                            RestorePartialCheckpoint(s->slot_idx, s->slot_id, lcp, ckpt_pos, restored_pending_h)) {
                             lcp = ckpt_pos;
                             restored_from_ckpt = true;
                         }
 #endif
                         if (!restored_from_ckpt) {
                             llama_memory_seq_rm(mem, s->slot_id, -1, -1);
+                            ResetSwaSlot(s->slot_idx);
                             ClearSlotCheckpoints(s->slot_idx);
                             lcp = 0;
                         }
@@ -4291,6 +4403,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             SnapshotSlotToL2(victim, sid);
         }
         llama_memory_seq_rm(mem, sid, -1, -1);
+        ResetSwaSlot(victim);
         slots[victim].tokens.clear();
         slots[victim].session_key.clear();
         slots[victim].last_used = 0;
@@ -4487,6 +4600,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 }
                 s.result.prompt_tokens += n;
                 s.pos += n;
+                AdvanceSwaSlot(s.slot_idx, mem, s.slot_id, static_cast<std::uint64_t>(s.pos));
                 s.prefill_offset = static_cast<std::size_t>(step_end);
                 if (prefix_coalescer.IsEnabled() && s.slot_valid) {
                     const auto published = prefix_coalescer.OnProducerProgress(s.slot_idx, s.prefill_offset);
@@ -4716,10 +4830,12 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             batch_abort_fn = nullptr;
             active_cancel = nullptr;
             if (rc != 0) {
-                bool rolled_back = llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1);
+                bool rolled_back =
+                    CheckSwaRollback(s.slot_idx, mem, s.slot_id, static_cast<std::uint64_t>(s.pos)) &&
+                    llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1);
                 if (!rolled_back) {
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
-                    if (have_spec_ckpt) {
+                    if (have_spec_ckpt && !swa_compact_active) {
                         const llama_state_seq_flags flags = PartialCheckpointFlags();
                         const std::size_t read = llama_state_seq_set_data_ext(ctx, spec_ckpt_buf.data(), spec_ckpt_size,
                                                                               s.slot_id, flags);
@@ -4854,10 +4970,13 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 }
 #endif
                 const int64_t batch_end_pos = s.pos + 1 + static_cast<int64_t>(k);
+                AdvanceSwaSlot(s.slot_idx, mem, s.slot_id, static_cast<std::uint64_t>(batch_end_pos));
                 if (keep_pos < batch_end_pos) {
-                    if (!llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(keep_pos), -1)) {
+                    const bool swa_ok =
+                        CheckSwaRollback(s.slot_idx, mem, s.slot_id, static_cast<std::uint64_t>(keep_pos));
+                    if (!swa_ok || !llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(keep_pos), -1)) {
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
-                        if (have_spec_ckpt) {
+                        if (have_spec_ckpt && !swa_compact_active) {
                             const llama_state_seq_flags flags = PartialCheckpointFlags();
                             const std::size_t read = llama_state_seq_set_data_ext(ctx, spec_ckpt_buf.data(),
                                                                                   spec_ckpt_size, s.slot_id, flags);
@@ -5130,7 +5249,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             for (const PlannedBatchItem& item : plan.items) {
                 ActiveBatchSlot* s = find_active_by_slot(item.slot_index);
                 if (s == nullptr) continue;
-                if (!llama_memory_seq_rm(mem, s->slot_id, static_cast<llama_pos>(s->pos), -1)) {
+                const bool swa_ok = CheckSwaRollback(s->slot_idx, mem, s->slot_id, static_cast<std::uint64_t>(s->pos));
+                if (!swa_ok || !llama_memory_seq_rm(mem, s->slot_id, static_cast<llama_pos>(s->pos), -1)) {
                     invalidate_slot(*s);
                 }
                 if (rc == 2 && (s->IsCancelled() || stopping)) {
@@ -5185,6 +5305,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 }
                 s->prefill_offset += static_cast<std::size_t>(item.token_count);
                 s->pos += item.token_count;
+                AdvanceSwaSlot(s->slot_idx, mem, s->slot_id, static_cast<std::uint64_t>(s->pos));
                 s->result.prompt_tokens += item.token_count;
 
                 // Publish newly computed prefix KV to waiting followers BEFORE
@@ -5242,6 +5363,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     slots[s->slot_idx].tokens.push_back(s->cur_tok);
                 }
                 s->pos += 1;
+                AdvanceSwaSlot(s->slot_idx, mem, s->slot_id, static_cast<std::uint64_t>(s->pos));
 
                 if (!outcomes[idx].has_sample || outcomes[idx].tok == LLAMA_TOKEN_NULL) {
                     s->result.status =

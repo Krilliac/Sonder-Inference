@@ -33,6 +33,7 @@
 #include "sonder/inference/json.hpp"
 #include "sonder/inference/model_architecture.hpp"
 #include "sonder/inference/sampling.hpp"
+#include "sonder/inference/swa_policy.hpp"
 
 namespace sonder::inference {
 
@@ -85,6 +86,11 @@ struct LaunchProfile {
     std::optional<std::uint32_t> ubatch_size;
     std::optional<std::uint32_t> parallel;
     std::optional<bool> kv_unified;
+    // Sliding-window attention KV policy: unset preserves backend defaults
+    // (`Full` on direct llamacpp, compact on llamaserver unless `--swa-full`).
+    // Explicit `Full` forces full-context SWA caches; `CompactIfQualified`
+    // opts in only for qualified SWA architectures with rollback guarding.
+    std::optional<SwaKvMode> swa_kv_mode;
     // KV cache and flash attention: the llamacpp backend's option names and
     // values (LlamaCppBackendOptions::kv_cache_type_k/_v, flash_attention).
     // llamaserver profiles also accept f8_e4m3, q2_0 and pq2_0m.
@@ -463,6 +469,10 @@ struct VramEstimate {
     // Propagated from GgufModelInfo for /v1/models metadata.
     bool prism_hadamard = false;
     bool requires_prism_runtime = false;
+    // Effective SWA KV mode chosen by estimate_vram() and whether the model's
+    // SWA layout qualified for compact sliding-window caching.
+    SwaKvMode effective_swa_kv_mode = SwaKvMode::Full;
+    bool swa_compact_qualified = false;
 };
 
 // Extra files the estimate needs sizes of (mmproj, draft model); 0 = absent.
@@ -477,9 +487,12 @@ struct VramEstimateInputs {
     // expert counts (1.0 when absent). Above 1 is clamped to 1.
     double expert_resident_fraction = 0.0;
     // VRAM budget (bytes) llama-server's --fit sizes the offload against;
-    // nullopt = unknown. Keep this the last field: callers initialise the
-    // struct positionally.
+    // nullopt = unknown.
     std::optional<std::uint64_t> fit_vram_budget_bytes;
+    // Optional explicit override for sliding-window KV mode (overrides
+    // profile.swa_kv_mode; `--swa-full` and `inherited_swa_full` still force
+    // `Full`). Keep at the end so positional initializers remain valid.
+    std::optional<SwaKvMode> swa_kv_mode;
 };
 
 // llama-server's default --fit-target margin (b11195 fit_params_target, 1 GiB).
