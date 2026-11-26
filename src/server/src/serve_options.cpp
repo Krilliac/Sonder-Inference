@@ -198,27 +198,6 @@ bool parse_uint(const std::string& text, std::uint64_t max, std::uint64_t& out) 
     return true;
 }
 
-bool parse_unit_double(const std::string& text, double& out) {
-    if (text.empty() || text.size() > 32) {
-        return false;
-    }
-    for (const char c : text) {
-        const bool ok = (c >= '0' && c <= '9') || c == '.';
-        if (!ok) {
-            return false;
-        }
-    }
-    std::istringstream in(text);
-    in.imbue(std::locale::classic());
-    double parsed = 0.0;
-    in >> parsed;
-    if (!in || !in.eof() || !std::isfinite(parsed) || parsed < 0.0 || parsed > 1.0) {
-        return false;
-    }
-    out = parsed;
-    return true;
-}
-
 std::string trim(std::string s) {
     const auto first = s.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) {
