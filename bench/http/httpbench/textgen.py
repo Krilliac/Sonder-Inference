@@ -182,3 +182,63 @@ def tool_result_block(rnd: random.Random, turn: int, approx_tokens: int, chars_p
         lines.append(line)
         chars += len(line) + 1
     return f"Tool result ({tool}, turn {turn}):\n" + "\n".join(lines)
+
+
+def corpus_prompt(tag: str, sizer: Sizer, target_tokens: int, seed: int, variant: int = 0) -> str:
+    """Build a deterministic prompt representative of one acceptance corpus class."""
+    rnd = random.Random(seed + variant * 97 + sum(ord(c) for c in tag))
+    if tag == "prose":
+        head = (
+            f"Corpus class: prose (variant {variant}).\n"
+            "Draft a clear engineering status memo summarizing the operational notes below.\n\n"
+        )
+        tail = "\n\nTask: Write a concise plain-prose summary covering cache health and latency trends."
+        budget = max(0, target_tokens - sizer.measure(head) - sizer.measure(tail))
+        lines = sizer.fit(record_list(rnd, budget, sizer.chars_per_token), budget) if budget else []
+        return head + "\n".join(lines) + tail
+    if tag == "code":
+        head = (
+            f"Corpus class: code (variant {variant}).\n"
+            "Review the following module and emit a minimal unified-style code edit preserving invariants:\n"
+            "```python\n"
+            "def compute_slot_budget(n_ctx: int, slots: int, reserve: int = 64) -> int:\n"
+            "    if n_ctx <= reserve or slots <= 0:\n"
+            "        return 0\n"
+            "    return (n_ctx - reserve) // slots\n"
+            "```\n"
+            "Reference records:\n"
+        )
+        tail = "\n\nTask: Update `compute_slot_budget` to clamp negative `reserve` to 0 and return the patched function."
+        budget = max(0, target_tokens - sizer.measure(head) - sizer.measure(tail))
+        lines = sizer.fit(record_list(rnd, budget, sizer.chars_per_token), budget) if budget else []
+        return head + "\n".join(lines) + tail
+    if tag == "tool_json":
+        head = (
+            f"Corpus class: tool_json (variant {variant}).\n"
+            "Available tools:\n"
+            + json.dumps(tool_schemas(4), indent=1, sort_keys=True)
+            + "\nWorkspace observations:\n"
+        )
+        tail = (
+            '\n\nTask: Respond with a single JSON object {"tool": "<name>", "arguments": {"path": "<path>"}} '
+            "selecting the right tool and arguments."
+        )
+        budget = max(0, target_tokens - sizer.measure(head) - sizer.measure(tail))
+        lines = sizer.fit(record_list(rnd, budget, sizer.chars_per_token), budget) if budget else []
+        return head + "\n".join(lines) + tail
+    if tag == "reasoning":
+        a = 17 + (variant % 13)
+        b = 23 + (variant % 11)
+        head = (
+            f"Corpus class: reasoning (variant {variant}).\n"
+            f"Given a batch server with {a} queued prompts and {b} active tokens per slot, "
+            "verify the scheduling constraints documented in the ledger below.\n"
+        )
+        tail = (
+            f"\n\nTask: Reason step by step and compute ({a} * {b}) + {variant}, "
+            "stating the final integer result clearly."
+        )
+        budget = max(0, target_tokens - sizer.measure(head) - sizer.measure(tail))
+        lines = sizer.fit(record_list(rnd, budget, sizer.chars_per_token), budget) if budget else []
+        return head + "\n".join(lines) + tail
+    raise ValueError(f"unknown corpus tag: {tag!r}")

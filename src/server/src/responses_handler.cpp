@@ -125,7 +125,7 @@ json::Object build_response_object(const std::string& resp_id, std::int64_t crea
     return obj;
 }
 
-std::optional<ApiError> read_text_format(const json::Object& body, ResponsesJob& job) {
+std::optional<ApiError> read_text_format(const json::Object& body, ResponsesJob& job, StructuredParseMode schema_mode) {
     const json::Value* text_v = body.find("text");
     if (!present(text_v)) {
         return std::nullopt;
@@ -149,12 +149,15 @@ std::optional<ApiError> read_text_format(const json::Object& body, ResponsesJob&
         return std::nullopt;
     }
     if (type == "json_object") {
-        auto compiled = default_structured_grammar_engine().compile_json_object();
-        if (!compiled.ok()) {
-            return bad("invalid_request", compiled.status().message(), "text.format");
-        }
-        job.grammar = std::move(compiled.value().gbnf);
         job.response_format_type = "json_object";
+        if (schema_mode == StructuredParseMode::compile_eagerly) {
+            auto compiled = default_structured_grammar_engine().compile_json_object();
+            if (!compiled.ok()) {
+                return bad("invalid_request", compiled.status().message(), "text.format");
+            }
+            job.compiled_grammar = std::make_shared<const CompiledGrammar>(std::move(compiled).value());
+            job.grammar = job.compiled_grammar->gbnf;
+        }
         return std::nullopt;
     }
     if (type == "json_schema") {
@@ -167,14 +170,18 @@ std::optional<ApiError> read_text_format(const json::Object& body, ResponsesJob&
         if (!present(schema_v) || !schema_v->is_object()) {
             return bad("invalid_request", "text.format.schema must be a JSON object", "text.format.schema");
         }
-        auto compiled = default_structured_grammar_engine().compile_json_schema(*schema_v);
-        if (!compiled.ok()) {
-            return bad("invalid_request", "invalid text.format.schema: " + compiled.status().message(),
-                       "text.format.schema");
-        }
-        job.grammar = std::move(compiled.value().gbnf);
         job.response_format_type = "json_schema";
         job.response_format_schema = schema_v->dump();
+        job.pending_response_schema = *schema_v;
+        if (schema_mode == StructuredParseMode::compile_eagerly) {
+            auto compiled = default_structured_grammar_engine().compile_json_schema(*schema_v);
+            if (!compiled.ok()) {
+                return bad("invalid_request", "invalid text.format.schema: " + compiled.status().message(),
+                           "text.format.schema");
+            }
+            job.compiled_grammar = std::make_shared<const CompiledGrammar>(std::move(compiled).value());
+            job.grammar = job.compiled_grammar->gbnf;
+        }
         return std::nullopt;
     }
     return bad("unsupported_parameter",
@@ -360,6 +367,11 @@ std::string derive_responses_caller_scope(const RequestHead& head, const Correla
 }
 
 std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view body_text) {
+    return parse_responses_request_with_mode(body_text, StructuredParseMode::compile_eagerly);
+}
+
+std::variant<ResponsesJob, ApiError> parse_responses_request_with_mode(std::string_view body_text,
+                                                                       StructuredParseMode schema_mode) {
     auto parsed = json::parse(body_text, json::ParseLimits{128, 65536});
     if (!parsed.ok()) {
         return bad("invalid_json", "request body is not valid JSON: " + parsed.status().message());
@@ -574,7 +586,7 @@ std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view bo
         return bad("invalid_request", "input must be a string or a non-empty array of input items", "input");
     }
 
-    if (auto e = read_text_format(body, job)) {
+    if (auto e = read_text_format(body, job, schema_mode)) {
         return *e;
     }
 
@@ -711,10 +723,36 @@ std::variant<ResponsesJob, ApiError> parse_responses_request(std::string_view bo
     return job;
 }
 
+std::optional<ApiError> prepare_responses_grammar(
+    ResponsesJob& job, std::string_view tokenizer_identity,
+    bool backend_supports_structured_output, bool backend_native_tools,
+    std::string_view backend_name, CompiledGrammarCache* cache,
+    const StructuredGrammarEngine& engine) {
+    auto resolved = resolve_structured_grammar(
+        "text.format.schema", job.grammar, job.response_format_type,
+        job.pending_response_schema, job.response_format_schema, job.tools, job.tool_choice,
+        backend_supports_structured_output, backend_native_tools, backend_name, tokenizer_identity,
+        cache, engine);
+    if (!resolved.ok()) {
+        const std::string code = resolved.status().code() == ErrorCode::unsupported
+                                     ? "unsupported_parameter"
+                                     : "invalid_request";
+        const std::optional<std::string> param =
+            job.response_format_type && *job.response_format_type == "json_schema"
+                ? std::optional<std::string>("text.format.schema")
+                : (job.response_format_type ? std::optional<std::string>("text.format") : std::nullopt);
+        return make_error(400, code, "invalid text.format.schema: " + resolved.status().message(), param);
+    }
+    job.compiled_grammar = std::move(resolved.value().compiled);
+    job.grammar = std::move(resolved.value().grammar);
+    return std::nullopt;
+}
+
 void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlation& corr, const std::string& model,
                        const std::string& backend, const std::shared_ptr<Session>& session,
                        ResponseHistoryStore& history, bool backend_native_tools, bool backend_supports_multimodal,
-                       std::string_view caller_scope) {
+                       std::string_view caller_scope, CompiledGrammarCache* grammar_cache,
+                       std::string_view tokenizer_identity, bool backend_supports_structured_output) {
     const bool store_enabled =
         !ex.options.disable_response_store && ex.options.response_history_ttl.count() > 0 && history.ttl().count() > 0;
     // 1. Assemble conversation history from optional previous_response_id.
@@ -827,7 +865,36 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     ro.thinking = job.thinking;
     ro.separate_reasoning = true;
     ro.retain_text = true;  // retain for response.completed + previous_response_id history
-    ro.grammar = job.grammar;
+    std::shared_ptr<const CompiledGrammar> compiled_grammar = job.compiled_grammar;
+    std::string fallback_grammar = job.grammar;
+    if (!compiled_grammar && grammar_cache != nullptr &&
+        (job.response_format_type.has_value() || (!job.tools.empty() && job.tool_choice))) {
+        const std::string fallback_tok =
+            tokenizer_identity.empty() ? build_tokenizer_identity_key(backend, model) : std::string(tokenizer_identity);
+        auto resolved = resolve_structured_grammar(
+            "text.format.schema", job.grammar, job.response_format_type,
+            job.pending_response_schema, job.response_format_schema, job.tools, job.tool_choice,
+            backend_supports_structured_output, backend_native_tools, backend, fallback_tok, grammar_cache);
+        if (!resolved.ok()) {
+            ex.leave_inflight();
+            session->close();
+            ex.send_error(make_error(400, "invalid_request", resolved.status().message(), "text.format"));
+            return;
+        }
+        compiled_grammar = std::move(resolved.value().compiled);
+        fallback_grammar = std::move(resolved.value().grammar);
+    }
+    auto matcher_res = bind_request_grammar_matcher(compiled_grammar, ro.grammar, fallback_grammar);
+    if (!matcher_res.ok()) {
+        ex.leave_inflight();
+        session->close();
+        const std::string code = matcher_res.status().code() == ErrorCode::unsupported
+                                     ? "unsupported_parameter"
+                                     : "invalid_request";
+        ex.send_error(make_error(400, code, matcher_res.status().message(), "text.format"));
+        return;
+    }
+    std::unique_ptr<GrammarMatcher> grammar_matcher = std::move(matcher_res).value();
     ro.response_format_type = job.response_format_type;
     ro.response_format_schema = job.response_format_schema;
     ro.tools = job.tools;
@@ -1032,6 +1099,9 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     TokenCallback on_chunk;
     if (job.stream) {
         on_chunk = [&](const TokenChunk& chunk) -> bool {
+            if (grammar_matcher && !chunk.text.empty()) {
+                (void)grammar_matcher->accept_chunk(chunk.text);
+            }
             for (const auto& tcd : chunk.tool_call_deltas) {
                 if (tcd.index >= 64u) {
                     continue;
@@ -1114,6 +1184,12 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     }
 
     const GenerationResult& r = result.value();
+    if (grammar_matcher) {
+        if (!job.stream && !r.text.empty()) {
+            (void)grammar_matcher->accept_chunk(r.text);
+        }
+        grammar_matcher->mark_finished();
+    }
     std::string final_visible;
     std::vector<ToolCall> final_calls;
     if (job.stream) {

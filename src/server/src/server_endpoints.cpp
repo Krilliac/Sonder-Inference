@@ -440,6 +440,16 @@ json::Object build_health_body(const HealthSnapshot& s) {
                              {"written", s.log_stats.written},
                              {"dropped", s.log_stats.dropped}}},
         {"gpus", gpu_inventory_json(cached_gpu_inventory())},
+        {"grammar_cache", json::Object{{"entries", static_cast<std::uint64_t>(s.grammar_cache.entries)},
+                                       {"used_bytes", static_cast<std::uint64_t>(s.grammar_cache.used_bytes)},
+                                       {"max_entries", static_cast<std::uint64_t>(s.grammar_cache.max_entries)},
+                                       {"max_bytes", static_cast<std::uint64_t>(s.grammar_cache.max_bytes)},
+                                       {"hits", s.grammar_cache.hits},
+                                       {"misses", s.grammar_cache.misses},
+                                       {"inserts", s.grammar_cache.inserts},
+                                       {"evictions", s.grammar_cache.evictions},
+                                       {"bypassed_oversize", s.grammar_cache.bypassed_oversize},
+                                       {"compile_failures", s.grammar_cache.compile_failures}}},
         {"capabilities", server_capabilities(s.backend, s.opts)},
         {"sonder", health_features(s.backend, s.opts, sonder_meta())}};
 }
