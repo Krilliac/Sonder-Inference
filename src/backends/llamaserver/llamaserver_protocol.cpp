@@ -227,9 +227,15 @@ json::Value build_chat_body(const std::string &model, const ChatRequest &request
             if (!has_params) {
                 fn.set("parameters", json::Object{{"type", "object"}, {"properties", json::Object{}}});
             }
+            if (tool.strict.has_value()) {
+                fn.set("strict", *tool.strict);
+            }
             tools.emplace_back(json::Object{{"type", "function"}, {"function", std::move(fn)}});
         }
         o.set("tools", std::move(tools));
+        if (request.parallel_tool_calls.has_value()) {
+            o.set("parallel_tool_calls", *request.parallel_tool_calls);
+        }
         if (request.tool_choice) {
             switch (request.tool_choice->mode) {
                 case ToolChoiceMode::auto_choice:

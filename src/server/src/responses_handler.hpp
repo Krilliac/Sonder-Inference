@@ -89,6 +89,7 @@ struct ResponsesJob {
     std::vector<ChatMessage> input_messages;
     std::vector<ToolDefinition> tools;
     std::optional<ToolChoice> tool_choice = std::nullopt;
+    std::optional<bool> parallel_tool_calls = std::nullopt;
     SamplingConfig sampling;
     ThinkingOptions thinking;
     std::optional<std::int64_t> reasoning_budget_tokens = std::nullopt;
