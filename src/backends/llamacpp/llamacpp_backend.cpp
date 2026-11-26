@@ -592,12 +592,22 @@ struct LlamaCppBackend::Impl {
         const TokenCallback* on_token = nullptr;
         const CancelPredicate* should_cancel = nullptr;
         bool exclusive = false;
+        std::int64_t enqueue_time_us = 0;
 
         std::mutex done_mu;
         std::condition_variable done_cv;
         bool done = false;
         GenerateResult result{};
     };
+
+    Clock::time_point clock_origin = Clock::now();
+    StepCostEstimator step_cost_estimator{};
+    BatchPlannerConfig batch_planner_config{};
+
+    [[nodiscard]] std::int64_t NowUs() const noexcept {
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - clock_origin).count();
+        return us >= 0 ? (static_cast<std::int64_t>(us) + 1) : std::int64_t{1};
+    }
 
     std::atomic<LlamaCppBackend*> owner{nullptr};
     std::mutex queue_mu;
@@ -880,6 +890,8 @@ struct LlamaCppBackend::Impl {
         spec_verifier.reset_metrics();
         ngram_mod.reset();
         suffix_matcher.reset();
+        step_cost_estimator.Reset();
+        batch_planner_config = BatchPlannerConfig{};
     }
 
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
@@ -2387,6 +2399,11 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
             impl_->active_draft_max = 0;
         }
 
+        impl_->clock_origin = Clock::now();
+        impl_->step_cost_estimator.Reset();
+        impl_->batch_planner_config = BatchPlannerConfig{};
+        impl_->batch_planner_config.default_foreground_itl_ms = options.default_foreground_itl_ms;
+
         if (n_slots > 1) {
             impl_->StartBatchWorker();
         }
@@ -2833,6 +2850,14 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
     if (request.prompt.empty()) return fail(ErrorCode::kInvalidArgument, "prompt is empty");
     if (request.max_new_tokens < 0) return fail(ErrorCode::kInvalidArgument, "max_new_tokens < 0");
     if (Status s = Validate(request.sampling); !s.ok()) return fail(s.code, s.message);
+    if (request.target_ttft_ms.has_value() &&
+        (!std::isfinite(*request.target_ttft_ms) || *request.target_ttft_ms <= 0.0)) {
+        return fail(ErrorCode::kInvalidArgument, "target_ttft_ms must be finite and > 0");
+    }
+    if (request.target_itl_ms.has_value() &&
+        (!std::isfinite(*request.target_itl_ms) || *request.target_itl_ms <= 0.0)) {
+        return fail(ErrorCode::kInvalidArgument, "target_itl_ms must be finite and > 0");
+    }
     if (Status s = ValidateMediaBlobs(request.media_blobs); !s.ok()) return fail(s.code, s.message);
     if (!request.media_blobs.empty() && !HasMmproj()) {
         return fail(ErrorCode::kInvalidArgument,
@@ -2863,6 +2888,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
         task.on_token = &on_token;
         task.should_cancel = &should_cancel;
         task.exclusive = exclusive;
+        task.enqueue_time_us = impl_->NowUs();
         {
             std::lock_guard<std::mutex> lock(impl_->queue_mu);
             if (impl_->worker_stop.load(std::memory_order_acquire)) {
@@ -3841,6 +3867,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         Utf8StreamBuffer utf8;
         Clock::time_point prefill_start{};
         Clock::time_point decode_start{};
+        std::int64_t enqueue_time_us = 0;
+        std::int64_t last_service_time_us = 0;
         bool prefill_done = false;
         bool slot_valid = true;
         bool mtp_enabled = false;
@@ -4114,6 +4142,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         s->slot_idx = sel.slot_index;
         s->slot_id = static_cast<llama_seq_id>(slots[s->slot_idx].id);
         s->prefill_start = Clock::now();
+        s->enqueue_time_us = task->enqueue_time_us;
+        s->last_service_time_us = 0;
         slot_busy[s->slot_idx] = 1u;
 
         const GenerateRequest& req = *task->req;
@@ -4456,6 +4486,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         bool has_sample = false;
     };
     std::vector<BatchSlotPlanView> views;
+    std::vector<PendingQueueSlotView> pending_views;
     std::vector<SampledStepOutcome> outcomes;
     views.reserve(slots.size());
     outcomes.reserve(slots.size());
@@ -4497,19 +4528,31 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 {
                     std::lock_guard<std::mutex> qlock(queue_mu);
                     if (pending_queue.empty()) break;
-                    PendingRequest* front = pending_queue.front();
-                    if (front->exclusive) {
-                        if (!active.empty()) break;  // drain active batch before exclusive request
-                        pending_queue.pop_front();
+                    pending_views.clear();
+                    pending_views.reserve(pending_queue.size());
+                    for (const PendingRequest* p : pending_queue) {
+                        PendingQueueSlotView pv;
+                        pv.priority = p->req->priority;
+                        pv.enqueue_time_us = p->enqueue_time_us;
+                        pv.target_ttft_ms = p->req->target_ttft_ms;
+                        pv.exclusive = p->exclusive;
+                        pending_views.push_back(pv);
+                    }
+                    const auto pick =
+                        SelectNextPendingRequest(pending_views, !active.empty(), NowUs(), batch_planner_config);
+                    if (!pick.has_value()) break;
+                    PendingRequest* picked = pending_queue[*pick];
+                    if (picked->exclusive) {
+                        pending_queue.erase(pending_queue.begin() + static_cast<std::ptrdiff_t>(*pick));
                         pending_count.fetch_sub(1, std::memory_order_release);
-                        exclusive_task = front;
+                        exclusive_task = picked;
                     } else {
-                        const auto chosen =
-                            SelectAvailablePrefixSlot(slots, slot_busy, front->req->prompt, front->req->session_key);
+                        const auto chosen = SelectAvailablePrefixSlot(slots, slot_busy, picked->req->prompt,
+                                                                      picked->req->session_key);
                         if (!chosen.has_value()) break;  // all n_slots busy
-                        pending_queue.pop_front();
+                        pending_queue.erase(pending_queue.begin() + static_cast<std::ptrdiff_t>(*pick));
                         pending_count.fetch_sub(1, std::memory_order_release);
-                        admitted_task = front;
+                        admitted_task = picked;
                         sel = *chosen;
                         slot_busy[sel.slot_index] = 1u;
                     }
@@ -4584,11 +4627,14 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     BatchAdd(batch, req.prompt[static_cast<std::size_t>(off + j)],
                              static_cast<llama_pos>(s.pos + j), s.slot_id, is_last);
                 }
+                auto decode_start = Clock::now();
                 int32_t rc = llama_decode(ctx, batch);
                 while (rc == 1 && evict_one_idle_slot()) {
                     abort_requested.store(false, std::memory_order_relaxed);
+                    decode_start = Clock::now();
                     rc = llama_decode(ctx, batch);
                 }
+                const double prefill_decode_ms = MsSince(decode_start);
                 batch_abort_fn = nullptr;
                 active_cancel = nullptr;
                 if (rc != 0) {
@@ -4607,6 +4653,9 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     active.clear();
                     continue;
                 }
+                step_cost_estimator.Observe(
+                    StepCostObservation{0, n, std::max<std::int64_t>(0, s.pos), prefill_decode_ms});
+                s.last_service_time_us = NowUs();
 #if defined(SONDER_LLAMACPP_HAS_MTP)
                 if (s.mtp_enabled && !MtpProcessPrefill(batch, s.slot_id)) {
                     invalidate_slot(s);
@@ -4852,11 +4901,14 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                          /*logits=*/true);
             }
 
+            auto decode_start = Clock::now();
             int32_t rc = llama_decode(ctx, batch);
             while (rc == 1 && evict_one_idle_slot()) {
                 abort_requested.store(false, std::memory_order_relaxed);
+                decode_start = Clock::now();
                 rc = llama_decode(ctx, batch);
             }
+            const double decode_call_ms = MsSince(decode_start);
             batch_abort_fn = nullptr;
             active_cancel = nullptr;
             if (rc != 0) {
@@ -4886,6 +4938,11 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 active.clear();
                 continue;
             }
+            if (draft_tokens.empty()) {
+                step_cost_estimator.Observe(
+                    StepCostObservation{1, 0, std::max<std::int64_t>(0, s.pos), decode_call_ms});
+            }
+            s.last_service_time_us = NowUs();
 
             if (draft_tokens.empty()) {
 #if defined(SONDER_LLAMACPP_HAS_MTP)
@@ -5147,26 +5204,28 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             apply_coalesce_releases(timed_out);
         }
 
-        std::size_t decoding_count = 0;
+        const std::int64_t plan_now_us = NowUs();
         auto build_views = [&]() {
             views.clear();
-            decoding_count = 0;
             for (const auto& sp : active) {
                 if (prefix_coalescer.IsFollowerHeld(sp->slot_idx)) {
                     continue;
                 }
-                if (!sp->IsCancelled() && sp->phase == BatchSlotPhase::kDecode) {
-                    ++decoding_count;
-                }
-                views.push_back(BatchSlotPlanView{
-                    sp->slot_idx,
-                    static_cast<std::int32_t>(sp->slot_id),
-                    sp->phase,
-                    sp->task->req->prompt.size(),
-                    sp->prefill_offset,
-                    sp->pos,
-                    sp->IsCancelled(),
-                });
+                BatchSlotPlanView view;
+                view.slot_index = sp->slot_idx;
+                view.seq_id = static_cast<std::int32_t>(sp->slot_id);
+                view.phase = sp->phase;
+                view.prompt_len = sp->task->req->prompt.size();
+                view.prefill_offset = sp->prefill_offset;
+                view.pos = sp->pos;
+                view.cancelled = sp->IsCancelled();
+                view.priority = sp->task->req->priority;
+                view.target_ttft_ms = sp->task->req->target_ttft_ms;
+                view.target_itl_ms = sp->task->req->target_itl_ms;
+                view.enqueue_time_us = sp->enqueue_time_us;
+                view.last_service_time_us = sp->last_service_time_us;
+                view.kv_context_tokens = std::max<std::int64_t>(0, sp->pos);
+                views.push_back(view);
             }
         };
         build_views();
@@ -5177,14 +5236,13 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             build_views();
         }
 
-        // Prioritize low inter-token latency when any slot is decoding (cap
-        // mixed prefill chunks to <= 256 tokens per step), while letting pure
-        // prefill waves utilize the full `n_batch` window in one GPU pass.
-        const int32_t case_b_budget =
-            decoding_count > 0
-                ? std::min<int32_t>(step_token_budget, static_cast<int32_t>(decoding_count) + 256)
-                : n_batch;
-        PlannedBatchStep plan = PlanContinuousBatchStep(views, case_b_budget, step_output_budget, rr_cursor);
+        // Adapt mixed decode+prefill chunk size from measured step cost and
+        // active foreground ITL targets (protecting decode ITL while aging
+        // queued prefills/background work), while letting pure-prefill waves
+        // utilize the full `n_batch` window in one GPU pass.
+        PlannedBatchStep plan =
+            PlanLatencyAwareBatchStep(views, step_token_budget, n_batch, step_output_budget, rr_cursor, plan_now_us,
+                                      step_cost_estimator, batch_planner_config);
         if (plan.items.empty()) {
             continue;
         }
@@ -5246,12 +5304,14 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         };
 
         const auto step_start = Clock::now();
+        auto decode_start = step_start;
         int32_t rc = llama_decode(ctx, batch);
 
         // Under unified KV (`kv_unified=true`), idle prefix-cached slots share
         // the same n_ctx pool; evict LRU idle slots before retrying on rc==1.
         while (rc == 1 && evict_one_idle_slot()) {
             abort_requested.store(false, std::memory_order_relaxed);
+            decode_start = Clock::now();
             rc = llama_decode(ctx, batch);
         }
 
@@ -5270,8 +5330,10 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             plan = std::move(decode_only);
             pack_plan(plan);
             abort_requested.store(false, std::memory_order_relaxed);
+            decode_start = Clock::now();
             rc = llama_decode(ctx, batch);
         }
+        const double decode_call_ms = MsSince(decode_start);
         batch_abort_fn = nullptr;
 
         if (rc != 0) {
@@ -5299,6 +5361,21 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             continue;
         }
 
+        {
+            std::int32_t exec_decode = 0;
+            std::int32_t exec_prefill = 0;
+            std::int64_t exec_kv = 0;
+            for (const PlannedBatchItem& item : plan.items) {
+                if (item.is_prefill) {
+                    exec_prefill += item.token_count;
+                } else {
+                    exec_decode += item.token_count;
+                }
+                exec_kv = detail::SaturatingAddI64(exec_kv, std::max<std::int64_t>(0, item.pos_start));
+            }
+            step_cost_estimator.Observe(StepCostObservation{exec_decode, exec_prefill, exec_kv, decode_call_ms});
+        }
+
         // Extract every slot's sampled token + optional logprobs from this step's
         // logits BEFORE invoking user callbacks or mutating context state.
         // Keep `outcomes` strictly 1:1 aligned with `plan.items` so indexing
@@ -5319,10 +5396,12 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 
         // Advance each planned slot and stream tokens to callbacks.
         const double step_ms = MsSince(step_start);
+        const std::int64_t serviced_us = NowUs();
         for (std::size_t idx = 0; idx < plan.items.size(); ++idx) {
             const PlannedBatchItem& item = plan.items[idx];
             ActiveBatchSlot* s = find_active_by_slot(item.slot_index);
             if (s == nullptr || s->task == nullptr) continue;
+            s->last_service_time_us = serviced_us;
             const GenerateRequest& req = *s->task->req;
 
             if (item.is_prefill) {

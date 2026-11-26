@@ -20,6 +20,7 @@
 #include "sonder/inference/cancellation.hpp"
 #include "sonder/inference/error.hpp"
 #include "sonder/inference/model_architecture.hpp"
+#include "sonder/inference/request_priority.hpp"
 #include "sonder/inference/sampling.hpp"
 
 namespace sonder::inference {
@@ -135,6 +136,11 @@ struct GenerateRequest {
     // Optional non-owning atomic checkpoint exchange for hybrid/recurrent models.
     // Must outlive the generate() / open_token_stream() call when non-null.
     RecurrentCheckpointExchange* checkpoint = nullptr;
+    // Optional scheduling priority class and latency targets (ms) forwarded to
+    // backends with latency-aware physical batch planning.
+    std::optional<RequestPriority> priority_class = std::nullopt;
+    std::optional<double> target_ttft_ms = std::nullopt;
+    std::optional<double> target_itl_ms = std::nullopt;
 };
 
 struct EmbedRequest {
@@ -348,6 +354,11 @@ struct ChatRequest {
     std::vector<ToolDefinition> tools{};
     std::optional<ToolChoice> tool_choice = std::nullopt;
     std::optional<bool> parallel_tool_calls = std::nullopt;
+    // Optional scheduling priority class and latency targets (ms) forwarded to
+    // backends with latency-aware physical batch planning.
+    std::optional<RequestPriority> priority_class = std::nullopt;
+    std::optional<double> target_ttft_ms = std::nullopt;
+    std::optional<double> target_itl_ms = std::nullopt;
 };
 
 // True for "system", "user", "assistant" and "tool".

@@ -124,6 +124,10 @@ struct RequestOptions {
     std::vector<ToolDefinition> tools{};
     std::optional<ToolChoice> tool_choice = std::nullopt;
     std::optional<bool> parallel_tool_calls = std::nullopt;
+    // Optional latency targets (milliseconds) forwarded to execution backends
+    // that support latency-aware physical batch planning.
+    std::optional<double> target_ttft_ms = std::nullopt;
+    std::optional<double> target_itl_ms = std::nullopt;
 };
 
 struct GenerationResult {

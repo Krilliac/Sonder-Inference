@@ -2438,3 +2438,190 @@ TEST_CASE("llamacpp frontier: RadixPrefixCache exact byte accounting and hard-pi
     CHECK(cache.used_bytes() <= cache.max_bytes());
     CHECK(cache.CheckInvariants());
 }
+
+TEST_CASE("llamacpp frontier: latency-target-aware batch planner, StepCostEstimator, aging, and option validation") {
+    namespace si = sonder::inference;
+
+    // 1. LoadOptions & LlamaCppBackendOptions default_foreground_itl_ms validation.
+    {
+        LoadOptions lo;
+        CHECK(lo.default_foreground_itl_ms == doctest::Approx(50.0));
+        CHECK(ValidateContextOptions(lo).ok());
+        lo.default_foreground_itl_ms = 0.0;
+        CHECK(ValidateContextOptions(lo).ok());
+        lo.default_foreground_itl_ms = -1.0;
+        CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
+        lo.default_foreground_itl_ms = std::numeric_limits<double>::quiet_NaN();
+        CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
+        lo.default_foreground_itl_ms = std::numeric_limits<double>::infinity();
+        CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
+
+        si::LlamaCppBackendOptions bo;
+        CHECK(bo.default_foreground_itl_ms == doctest::Approx(50.0));
+        CHECK(si::validate_llamacpp_options(bo).ok());
+        bo.default_foreground_itl_ms = -5.0;
+        CHECK(si::validate_llamacpp_options(bo).code() == si::ErrorCode::invalid_argument);
+    }
+
+    auto make_slot = [](std::size_t idx, BatchSlotPhase phase, std::size_t prompt_len, std::size_t prefill_offset,
+                        std::int64_t pos, si::RequestPriority prio,
+                        std::optional<double> itl = std::nullopt, std::optional<double> ttft = std::nullopt,
+                        std::int64_t enq_us = 1000, std::int64_t svc_us = 1000, std::int64_t kv_ctx = 0) {
+        BatchSlotPlanView s;
+        s.slot_index = idx;
+        s.seq_id = static_cast<std::int32_t>(idx);
+        s.phase = phase;
+        s.prompt_len = prompt_len;
+        s.prefill_offset = prefill_offset;
+        s.pos = pos;
+        s.cancelled = false;
+        s.priority = prio;
+        s.target_itl_ms = itl;
+        s.target_ttft_ms = ttft;
+        s.enqueue_time_us = enq_us;
+        s.last_service_time_us = svc_us;
+        s.kv_context_tokens = kv_ctx;
+        return s;
+    };
+
+    // 2. Fallback to safe bounded default before min_samples (3) are measured.
+    {
+        StepCostEstimator est(StepCostEstimatorConfig{0.25, 3});
+        const std::vector<BatchSlotPlanView> mixed{
+            make_slot(0, BatchSlotPhase::kDecode, 100, 100, 100, si::RequestPriority::interactive, 25.0),
+            make_slot(1, BatchSlotPhase::kPrefill, 1000, 0, 0, si::RequestPriority::background),
+        };
+        std::size_t rr = 0;
+        AdaptiveBudgetDecision dec;
+        const PlannedBatchStep s0 = PlanLatencyAwareBatchStep(mixed, 512, 1024, 4, rr, 10000, est, {}, &dec);
+        CHECK(dec.used_fallback_default);
+        CHECK_FALSE(dec.used_cost_estimator);
+        CHECK(dec.prefill_token_budget == 256);
+        CHECK(s0.total_tokens == 257);
+
+        est.Observe({1, 0, 100, 15.0});
+        est.Observe({1, 64, 100, 79.0});
+        CHECK_FALSE(est.IsCalibrated());
+        const PlannedBatchStep s2 = PlanLatencyAwareBatchStep(mixed, 512, 1024, 4, rr, 20000, est, {}, &dec);
+        CHECK(dec.used_fallback_default);
+        CHECK(dec.prefill_token_budget == 256);
+        CHECK(s2.total_tokens == 257);
+    }
+
+    // 3. Calibrated high step cost with tight foreground ITL shrinks mixed prefill chunk well below 256.
+    {
+        StepCostEstimator est(StepCostEstimatorConfig{0.25, 3});
+        est.Observe({1, 0, 2048, 10.0});
+        est.Observe({1, 0, 2048, 10.0});
+        est.Observe({1, 0, 2048, 10.0});
+        est.Observe({1, 100, 2048, 60.0});  // 0.50 ms/prefill token
+        REQUIRE(est.IsCalibrated());
+
+        BatchPlannerConfig cfg;
+        cfg.itl_safety_factor = 0.90;
+        const std::vector<BatchSlotPlanView> mixed{
+            make_slot(0, BatchSlotPhase::kDecode, 2048, 2048, 2048, si::RequestPriority::interactive, 30.0,
+                      std::nullopt, 1000, 1000, 2048),
+            make_slot(1, BatchSlotPhase::kPrefill, 2000, 0, 0, si::RequestPriority::background, std::nullopt,
+                      std::nullopt, 1000, 1000, 0),
+        };
+        std::size_t rr = 0;
+        AdaptiveBudgetDecision dec;
+        const PlannedBatchStep step = PlanLatencyAwareBatchStep(mixed, 512, 1024, 4, rr, 20000, est, cfg, &dec);
+        // effective_itl = 30 * 0.90 = 27ms; headroom = 17ms; 17 / 0.50 = 34 tokens!
+        CHECK(dec.used_cost_estimator);
+        CHECK(dec.prefill_token_budget == 34);
+        CHECK(step.decode_slots == 1u);
+        CHECK(step.prefill_slots == 1u);
+        REQUIRE(step.items.size() == 2u);
+        CHECK(step.items[1].token_count == 34);
+    }
+
+    // 4. Higher-priority prefill ordered ahead of background prefill.
+    {
+        const std::vector<BatchSlotPlanView> prefills{
+            make_slot(0, BatchSlotPhase::kPrefill, 500, 0, 0, si::RequestPriority::background),
+            make_slot(1, BatchSlotPhase::kPrefill, 60, 0, 0, si::RequestPriority::interactive),
+        };
+        std::size_t rr = 0;
+        const PlannedBatchStep step = PlanContinuousBatchStep(prefills, 128, 4, rr, 5000, BatchPlannerConfig{});
+        REQUIRE(step.items.size() == 2u);
+        CHECK(step.items[0].slot_index == 1u);  // interactive ordered FIRST
+        CHECK(step.items[0].token_count == 60);
+        CHECK(step.items[0].request_logits);
+        CHECK(step.items[1].slot_index == 0u);  // background takes leftover 68 tokens
+        CHECK(step.items[1].token_count == 68);
+        CHECK_FALSE(step.items[1].request_logits);
+    }
+
+    // 5. Anti-starvation aging elevates long-waiting background prefill under tight foreground ITL.
+    {
+        StepCostEstimator est(StepCostEstimatorConfig{0.25, 3});
+        est.Observe({1, 0, 4096, 30.0});
+        est.Observe({1, 0, 4096, 30.0});
+        est.Observe({1, 0, 4096, 30.0});
+        est.Observe({1, 64, 4096, 62.0});
+
+        BatchPlannerConfig cfg;
+        cfg.starvation_threshold_ms = 500.0;
+        cfg.starvation_prefill_tokens = 32;
+
+        std::vector<BatchSlotPlanView> slots{
+            make_slot(0, BatchSlotPhase::kDecode, 4096, 4096, 4096, si::RequestPriority::interactive, 25.0,
+                      std::nullopt, 1000, 1000, 4096),
+            make_slot(1, BatchSlotPhase::kPrefill, 96, 0, 0, si::RequestPriority::background, std::nullopt,
+                      std::nullopt, 1000, 0, 0),
+        };
+        std::size_t rr = 0;
+        std::int64_t now_us = 1000;
+        int decode_only_steps = 0;
+        int bg_progress_steps = 0;
+        for (int iter = 0; iter < 60 && slots[1].prefill_offset < slots[1].prompt_len; ++iter) {
+            now_us += 100000;  // +100ms
+            AdaptiveBudgetDecision dec;
+            const PlannedBatchStep step = PlanLatencyAwareBatchStep(slots, 512, 1024, 4, rr, now_us, est, cfg, &dec);
+            REQUIRE(step.decode_slots == 1u);
+            slots[0].pos += 1;
+            slots[0].kv_context_tokens += 1;
+            slots[0].last_service_time_us = now_us;
+            if (step.prefill_slots == 0u) {
+                ++decode_only_steps;
+            } else {
+                CHECK(dec.starvation_floor_applied);
+                for (const auto& item : step.items) {
+                    if (item.is_prefill && item.slot_index == 1u) {
+                        slots[1].prefill_offset += static_cast<std::size_t>(item.token_count);
+                        slots[1].pos += item.token_count;
+                        slots[1].last_service_time_us = now_us;
+                        ++bg_progress_steps;
+                    }
+                }
+            }
+        }
+        CHECK(decode_only_steps > 0);
+        CHECK(bg_progress_steps == 3);  // 96 tokens / 32 floor = 3 anti-starvation bursts
+        CHECK(slots[1].prefill_offset == 96u);
+    }
+
+    // 6. Zero-decode (prefill-only) wave uses full configured prefill_only_token_budget (n_batch).
+    {
+        StepCostEstimator est(StepCostEstimatorConfig{0.25, 3});
+        est.Observe({1, 0, 1024, 40.0});
+        est.Observe({1, 0, 1024, 40.0});
+        est.Observe({1, 0, 1024, 40.0});
+        est.Observe({1, 32, 1024, 72.0});
+
+        const std::vector<BatchSlotPlanView> prefill_only{
+            make_slot(0, BatchSlotPhase::kPrefill, 4096, 0, 0, si::RequestPriority::background),
+        };
+        std::size_t rr = 0;
+        AdaptiveBudgetDecision dec;
+        const PlannedBatchStep step = PlanLatencyAwareBatchStep(prefill_only, /*mixed=*/512, /*prefill_only=*/2048,
+                                                                /*outputs=*/4, rr, 10000, est, {}, &dec);
+        CHECK(dec.decode_slots == 0u);
+        CHECK(dec.prefill_token_budget == 2048);
+        CHECK(step.total_tokens == 2048);
+        REQUIRE(step.items.size() == 1u);
+        CHECK(step.items[0].token_count == 2048);
+    }
+}
