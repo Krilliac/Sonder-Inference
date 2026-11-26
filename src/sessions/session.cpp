@@ -673,15 +673,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     const bool capture_text = bus.options().capture_text;
     BackendModel& backend_model = model_->backend_model();
     const auto backend = engine_.find_backend(model_->backend_name());
-    bool has_media = false;
-    if (messages != nullptr) {
-        for (const auto& m : *messages) {
-            if (!m.media.empty()) {
-                has_media = true;
-                break;
-            }
-        }
-    }
+    const bool has_media = (messages != nullptr) && has_chat_media(*messages);
     // Chat with a backend-native template bypasses the generic prompt (and
     // therefore Sonder's token-level sampler, which works on that prompt).
     const bool native_chat = messages != nullptr && backend_model.has_native_chat();

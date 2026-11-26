@@ -486,3 +486,67 @@ TEST_CASE("chat security (G0028): template scaffolding vs untrusted message cont
         [](const std::vector<ChatMessage>&) -> Result<std::string> { return std::string("<|im_start|>user\n<|im_end|>"); });
     CHECK(dropped.status().code() == ErrorCode::invalid_argument);
 }
+
+TEST_CASE("chat: ordered multimodal content parts helpers and format_chat_prompt") {
+    MediaContent img1{"image/png", {0x89, 0x50, 0x4E, 0x47, 0x01}};
+    MediaContent img2{"image/jpeg", {0xFF, 0xD8, 0xFF, 0xE0, 0x02}};
+
+    ChatMessage ordered;
+    ordered.role = "user";
+    ordered.parts = {
+        TextContentPart{"before"},
+        ImageContentPart{img1},
+        TextContentPart{"between"},
+        ImageContentPart{img2},
+        TextContentPart{"after"},
+    };
+    CHECK(count_message_images(ordered) == 2u);
+    CHECK(has_chat_media({ordered}));
+    CHECK(message_text_content(ordered) == "beforebetweenafter");
+
+    append_chat_message_text(ordered, " tail");
+    CHECK(message_text_content(ordered) == "beforebetweenafter tail");
+    CHECK(ordered.parts.size() == 5u);
+
+    const std::string rendered = format_chat_prompt({ordered});
+    const auto p_before = rendered.find("before");
+    const auto p_between = rendered.find("between");
+    const auto p_after = rendered.find("after tail");
+    const auto p_img_first = rendered.find("[image:5:");
+    REQUIRE(p_before != std::string::npos);
+    REQUIRE(p_img_first != std::string::npos);
+    REQUIRE(p_between != std::string::npos);
+    const auto p_img_second = rendered.find("[image:5:", p_between);
+    REQUIRE(p_img_second != std::string::npos);
+    REQUIRE(p_after != std::string::npos);
+    CHECK(p_before < p_img_first);
+    CHECK(p_img_first < p_between);
+    CHECK(p_between < p_img_second);
+    CHECK(p_img_second < p_after);
+    CHECK(rendered.substr(p_img_first, 27) != rendered.substr(p_img_second, 27));
+
+    // Legacy content + media (empty parts) preserves legacy order (content then images).
+    ChatMessage legacy;
+    legacy.role = "user";
+    legacy.content = "legacy_text";
+    legacy.media = {img1, img2};
+    CHECK(count_message_images(legacy) == 2u);
+    CHECK(message_text_content(legacy) == "legacy_text");
+    const std::string legacy_rendered = format_chat_prompt({legacy});
+    const auto p_leg_text = legacy_rendered.find("legacy_text");
+    const auto p_leg_img1 = legacy_rendered.find("[image:5:", p_leg_text);
+    const auto p_leg_img2 = legacy_rendered.find("[image:5:", p_leg_img1 + 1);
+    CHECK(p_leg_text < p_leg_img1);
+    CHECK(p_leg_img1 < p_leg_img2);
+
+    // Reject NUL in parts text and media mime_type.
+    ChatMessage nul_text;
+    nul_text.role = "user";
+    nul_text.parts = {TextContentPart{std::string("x\0y", 3)}};
+    CHECK(validate_chat_messages({nul_text}).code() == ErrorCode::invalid_argument);
+
+    ChatMessage nul_mime;
+    nul_mime.role = "user";
+    nul_mime.parts = {ImageContentPart{MediaContent{std::string("image/\0png", 10), {1, 2, 3}}}};
+    CHECK(validate_chat_messages({nul_mime}).code() == ErrorCode::invalid_argument);
+}
