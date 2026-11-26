@@ -120,6 +120,13 @@ AdaptiveSpeculationConfig to_adaptive_speculation_config(const LlamaServerAdapti
     cfg.cooldown_requests = o.cooldown_requests;
     cfg.probe_draft_n = o.probe_draft_n;
     cfg.min_draft_tokens_per_sample = o.min_draft_tokens_per_sample;
+    cfg.max_entries = o.max_entries;
+    cfg.min_baseline_samples = o.min_baseline_samples;
+    cfg.cost_step_down_ratio = o.cost_step_down_ratio;
+    cfg.cost_pause_ratio = o.cost_pause_ratio;
+    cfg.cost_probe_recover_ratio = o.cost_probe_recover_ratio;
+    cfg.cost_step_cooldown = o.cost_step_cooldown;
+    cfg.baseline_probe_interval = o.baseline_probe_interval;
     return cfg;
 }
 

@@ -1914,3 +1914,67 @@ TEST_CASE("llamacpp frontier: PrefixCoalescer randomized stress guarantees zero 
     CHECK(c.HeldFollowerCount() == 0u);
     CHECK(c.CheckInvariants());
 }
+
+TEST_CASE("llamacpp frontier: SuffixMatcher optional measured-cost tracking overrides high acceptance") {
+    SuffixMatcher matcher(/*session_ring_capacity=*/4096, /*active_capacity=*/4096);
+    std::vector<Token> prompt;
+    for (Token t = 10; t < 40; ++t) prompt.push_back(t);
+    matcher.BeginRequest(prompt);
+    const std::vector<Token> tail{10, 11, 12, 13};
+
+    // 1. Seed ordinary non-speculative decode baseline: 10.0 ms / committed token.
+    matcher.ObserveBaselineStep(10.0, 1);
+    matcher.ObserveBaselineStep(20.0, 2);
+    // Invalid inputs are ignored safely without corrupting baseline EMA.
+    matcher.ObserveBaselineStep(std::numeric_limits<double>::quiet_NaN(), 1);
+    matcher.ObserveBaselineStep(-5.0, 1);
+    matcher.ObserveBaselineStep(10.0, 0);
+    CHECK(matcher.baseline_ms_per_token() == doctest::Approx(10.0));
+    CHECK(matcher.cost_stats().baseline_cost_samples == 2u);
+
+    // 2. When suffix verify beats baseline (4.0 ms/tok: 36ms / 9 committed tokens at 100% accept),
+    //    draft_factor grows and suffix stays active.
+    const double initial_factor = matcher.draft_factor();
+    matcher.ObserveWithCost(/*drafted=*/8, /*accepted=*/8, /*elapsed_ms=*/36.0);
+    matcher.ObserveWithCost(/*drafted=*/8, /*accepted=*/8, /*elapsed_ms=*/36.0);
+    CHECK(matcher.suffix_ms_per_token() == doctest::Approx(4.0));
+    CHECK(matcher.draft_factor() > initial_factor);
+    CHECK_FALSE(matcher.paused());
+    CHECK_FALSE(matcher.cost_paused());
+
+    // 3. Reset request and test break-even hysteresis deadband (10.1 ms/tok vs 10.0 ms/tok):
+    //    even at 100% acceptance, draft_factor must NOT inflate while break-even.
+    matcher.BeginRequest(prompt);
+    matcher.ObserveBaselineStep(10.0, 1);
+    matcher.ObserveBaselineStep(10.0, 1);
+    matcher.ObserveWithCost(/*drafted=*/8, /*accepted=*/8, /*elapsed_ms=*/90.9);  // 10.1 ms/tok
+    const double factor_after_s1 = matcher.draft_factor();
+    matcher.ObserveWithCost(/*drafted=*/8, /*accepted=*/8, /*elapsed_ms=*/90.9);  // 10.1 ms/tok
+    CHECK(matcher.draft_factor() <= factor_after_s1);
+    CHECK_FALSE(matcher.cost_paused());
+
+    // 4. High acceptance (100%!) with WORSE ms/committed-token (13.0 ms/tok = 117ms / 9 committed
+    //    vs 10.0 ms/tok baseline, ratio 1.30 >= 1.12) MUST shrink draft_factor and trigger cost pause!
+    matcher.BeginRequest(prompt);
+    matcher.ObserveBaselineStep(10.0, 1);
+    matcher.ObserveBaselineStep(10.0, 1);
+    matcher.ObserveWithCost(/*drafted=*/8, /*accepted=*/8, /*elapsed_ms=*/117.0);  // 13.0 ms/tok
+    const double factor_before_regress = matcher.draft_factor();
+    matcher.ObserveWithCost(/*drafted=*/8, /*accepted=*/8, /*elapsed_ms=*/117.0);  // 13.0 ms/tok
+    CHECK(matcher.acceptance_ema() == doctest::Approx(1.0));
+    CHECK(matcher.suffix_ms_per_token() == doctest::Approx(13.0));
+    CHECK(matcher.draft_factor() < factor_before_regress);
+    CHECK(matcher.paused());
+    CHECK(matcher.cost_paused());
+    CHECK(matcher.cost_stats().cost_regressions == 1u);
+    CHECK(matcher.Draft(tail, 8).draft.empty());
+
+    // 5. Draining cooldown via NoteSkippedStep clears cost_paused and restores drafting.
+    for (int i = 0; i < 16 && matcher.paused(); ++i) {
+        matcher.NoteSkippedStep();
+    }
+    CHECK_FALSE(matcher.paused());
+    CHECK_FALSE(matcher.cost_paused());
+    CHECK_FALSE(matcher.Draft(tail, 8).draft.empty());
+    CHECK(matcher.CheckInvariants());
+}

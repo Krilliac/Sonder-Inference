@@ -135,9 +135,10 @@ struct LlamaServerHostMemoryOptions {
     } floor;
 };
 
-// Workload-aware adaptive speculation controller (opt-in; native llama-server
-// mode only). Mirrors AdaptiveSpeculationConfig with `enabled = false` by
-// default so existing behavior stays unchanged unless explicitly opted in.
+// Time- and load-aware adaptive speculation controller (opt-in; native
+// llama-server mode only). Mirrors AdaptiveSpeculationConfig with
+// `enabled = false` by default so existing behavior stays unchanged unless
+// explicitly opted in.
 struct LlamaServerAdaptiveSpeculationOptions {
     bool enabled = false;
     std::uint32_t min_draft_n = 0;
@@ -151,6 +152,14 @@ struct LlamaServerAdaptiveSpeculationOptions {
     std::uint32_t cooldown_requests = 8;
     std::uint32_t probe_draft_n = 1;
     std::uint64_t min_draft_tokens_per_sample = 4;
+    // Measured-cost and bounded-LRU policy controls.
+    std::size_t max_entries = 128;
+    std::size_t min_baseline_samples = 2;
+    double cost_step_down_ratio = 1.05;
+    double cost_pause_ratio = 1.12;
+    double cost_probe_recover_ratio = 0.98;
+    std::uint32_t cost_step_cooldown = 4;
+    std::uint32_t baseline_probe_interval = 0;
 };
 
 struct LlamaServerBackendOptions {

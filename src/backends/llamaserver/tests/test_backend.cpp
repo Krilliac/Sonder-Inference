@@ -1261,6 +1261,168 @@ TEST_SUITE("llamaserver_backend") {
         CHECK(gworkloads->find("general")->find("total_observations")->as_uint() == 0u);
     }
 
+    TEST_CASE("adaptive speculation live loopback reaches prose steps down on cost regression and separates context and concurrency bands") {
+        sonder_test::FakeLlamaServer server;
+        const auto last_spec_n_max = [&server]() -> std::optional<std::int64_t> {
+            const auto parsed = json::parse(server.last_body());
+            REQUIRE(parsed.ok());
+            const auto *v = parsed->find("speculative.n_max");
+            if (!v)
+                return std::nullopt;
+            return v->as_int(-1);
+        };
+
+        // 1. Live prose classification + measured-cost regression overriding 90% acceptance!
+        //    Configure baseline_probe_interval=2 and min_baseline_samples=1 so the backend
+        //    automatically measures K=0 baseline, then detects that speculative K=3 (20 ms/tok
+        //    at 90% acceptance) is slower than K=0 baseline (10 ms/tok) and chooses K=0!
+        LlamaServerBackendOptions opts;
+        opts.base_url = server.url();
+        opts.adaptive_speculation.enabled = true;
+        opts.adaptive_speculation.min_draft_n = 0;
+        opts.adaptive_speculation.initial_draft_n = 3;
+        opts.adaptive_speculation.max_draft_n = 5;
+        opts.adaptive_speculation.window_size = 8;
+        opts.adaptive_speculation.min_samples = 2;
+        opts.adaptive_speculation.min_baseline_samples = 1;
+        opts.adaptive_speculation.cost_step_down_ratio = 1.05;
+        opts.adaptive_speculation.cost_pause_ratio = 1.12;
+        opts.adaptive_speculation.cooldown_requests = 2;
+        opts.adaptive_speculation.probe_draft_n = 1;
+        opts.adaptive_speculation.baseline_probe_interval = 3;
+
+        auto backend = make_llamaserver_backend(opts);
+        auto model = backend->load_model({"fake-model", "cpu:0"});
+        REQUIRE(model.ok());
+
+        // High acceptance (90%), SLOW decode (20 ms/tok = 400ms / 20 tokens).
+        const std::string slow_high_acc_gen =
+            "data: {\"content\":\"ok\",\"stop\":true,"
+            "\"timings\":{\"prompt_n\":12,\"prompt_ms\":50.0,\"predicted_n\":20,\"predicted_ms\":400.0,"
+            "\"draft_n\":20,\"draft_n_accepted\":18}}\n\n";
+        // K=0 baseline, FAST decode (10 ms/tok = 200ms / 20 tokens).
+        const std::string fast_baseline_gen =
+            "data: {\"content\":\"ok\",\"stop\":true,"
+            "\"timings\":{\"prompt_n\":12,\"prompt_ms\":50.0,\"predicted_n\":20,\"predicted_ms\":200.0,"
+            "\"draft_n\":0,\"draft_n_accepted\":0}}\n\n";
+        // High acceptance (90%), FAST decode (6 ms/tok = 120ms / 20 tokens), huge prompt_ms (5000ms).
+        const std::string fast_spec_heavy_prompt_chat =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],"
+            "\"timings\":{\"prompt_n\":12,\"prompt_ms\":5000.0,\"predicted_n\":20,\"predicted_ms\":120.0,"
+            "\"draft_n\":20,\"draft_n_accepted\":18}}\n\n"
+            "data: [DONE]\n\n";
+
+        // Prose prompt hits prose bucket in live serving!
+        GenerateRequest prose_req{"", "Write a short story about an astronomer tracking comets.", {}};
+        server.set_body(slow_high_acc_gen);
+        REQUIRE(model.value()->generate(prose_req, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(3));
+        REQUIRE(model.value()->generate(prose_req, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(3));
+
+        // 3rd request triggers automatic K=0 baseline calibration probe (speculative.n_max == 0).
+        // Baseline reports 10 ms/tok vs K=3's 20 ms/tok -> immediately pauses to K=0 despite 90% acceptance!
+        server.set_body(fast_baseline_gen);
+        REQUIRE(model.value()->generate(prose_req, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(0));
+
+        // 4th request receives speculative.n_max == 0 (paused on cost regression!).
+        REQUIRE(model.value()->generate(prose_req, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(0));
+
+        // 2. Context-band separation on code_edit: short prompt ramps UP even with 5000ms prompt_ms
+        //    (proving prompt restore time stays outside decode-only speed), while long prompt (>16K bytes)
+        //    uses a separate medium_ctx entry!
+        server.set_body(fast_spec_heavy_prompt_chat);
+        ChatRequest short_code;
+        short_code.messages = {{"user", "Refactor:\n```cpp\nint a = 1;\n```"}};
+        REQUIRE(model.value()->chat(short_code, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(3));
+        REQUIRE(model.value()->chat(short_code, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(3));
+        // Disable baseline probe firing on short_code by checking next step-up after 2 samples:
+        // (3rd request on short_code runs K=0 baseline probe; 4th uses K=4!)
+        server.set_body(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],"
+            "\"timings\":{\"prompt_n\":12,\"prompt_ms\":5000.0,\"predicted_n\":20,\"predicted_ms\":200.0,"
+            "\"draft_n\":0,\"draft_n_accepted\":0}}\n\n"
+            "data: [DONE]\n\n");
+        REQUIRE(model.value()->chat(short_code, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(0));
+        server.set_body(fast_spec_heavy_prompt_chat);
+        REQUIRE(model.value()->chat(short_code, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(4));
+
+        // Long context code_edit (> 20KB -> ~5000 est tokens -> medium_ctx) starts in its own band at K=3!
+        ChatRequest medium_code;
+        medium_code.messages = {{"user", "Refactor:\n```cpp\n" + std::string(24000, 'x') + "\n```"}};
+        REQUIRE(model.value()->chat(medium_code, {}, {}).ok());
+        CHECK(last_spec_n_max() == std::optional<std::int64_t>(3));
+
+        // 3. Concurrency-band separation: hold one request in flight so a concurrent request
+        //    executes in concurrency_band="low" (B=2) separate from "solo" (B=1).
+        server.set_body(fast_spec_heavy_prompt_chat);
+        server.hold_prefill(true);
+        std::thread bg_req([&] {
+            ChatRequest holder;
+            holder.messages = {{"user", "Write a poem about rain."}};
+            (void)model.value()->chat(holder, {}, {});
+        });
+        REQUIRE(server.wait_for_prefill(1));
+
+        // While holder is in flight, run a second request on a fresh server? No, FakeLlamaServer
+        // shares hold_prefill across connections, so release right after observing entry in flight!
+        // Instead use a second thread that calls chat and then release hold_prefill once both enter.
+        std::thread bg_req2([&] {
+            ChatRequest concurrent_prose;
+            concurrent_prose.messages = {{"user", "Write a poem about snow."}};
+            (void)model.value()->chat(concurrent_prose, {}, {});
+        });
+        REQUIRE(server.wait_for_prefill(2));
+        server.hold_prefill(false);
+        bg_req.join();
+        bg_req2.join();
+
+        // Inspect diagnostics: prose reached, cost_pauses >= 1, multiple context/concurrency entries,
+        // and non-empty target/draft identities (not merely mutable model name).
+        const auto rt = backend->runtime_status();
+        REQUIRE(rt.has_value());
+        REQUIRE(rt->diagnostics.has_value());
+        const auto *spec = rt->diagnostics->find("adaptive_speculation");
+        REQUIRE(spec != nullptr);
+        const auto *workloads = spec->find("workloads");
+        REQUIRE(workloads != nullptr);
+        const auto *prose_bucket = workloads->find("prose");
+        REQUIRE(prose_bucket != nullptr);
+        CHECK(prose_bucket->find("total_observations")->as_uint() >= 1u);
+
+        const auto *entries = spec->find("entries");
+        REQUIRE(entries != nullptr);
+        REQUIRE(entries->is_array());
+        bool saw_prose_cost_pause = false;
+        bool saw_medium_ctx = false;
+        bool saw_low_concurrency = false;
+        for (const auto &entry : entries->as_array()) {
+            const auto *tid = entry.find("target_identity");
+            REQUIRE(tid != nullptr);
+            CHECK(tid->as_string().find("attach|url=") == 0u);
+            if (entry.find("workload")->as_string() == "prose" &&
+                entry.find("cost_pauses")->as_uint() >= 1u &&
+                entry.find("paused")->as_bool()) {
+                saw_prose_cost_pause = true;
+            }
+            if (entry.find("context_band")->as_string() == "medium") {
+                saw_medium_ctx = true;
+            }
+            if (entry.find("concurrency_band")->as_string() == "low") {
+                saw_low_concurrency = true;
+            }
+        }
+        CHECK(saw_prose_cost_pause);
+        CHECK(saw_medium_ctx);
+        CHECK(saw_low_concurrency);
+    }
+
 #if defined(SONDER_HAS_SERVER)
     TEST_CASE("llamaserver JSON config parses adaptive_speculation strictly and wires into backend") {
         const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
