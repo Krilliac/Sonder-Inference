@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "sonder/inference/backend.hpp"
+#include "sonder/inference/speculative_verifier.hpp"
 
 namespace sonder::inference {
 
@@ -76,6 +77,12 @@ struct LlamaCppBackendOptions {
     std::string spec_type = "none";
     // Max draft tokens per speculative step (0 = automatic default for spec_type).
     std::int32_t spec_draft_max = 0;
+    // Speculative decoding verification policy: TargetMatch (default reference
+    // path) vs opt-in StochasticRejection (Leviathan et al. sum min(p, q) +
+    // residual (p - q)_+ resampling). StochasticRejection activates only when
+    // a stochastic proposer supplies real post-processor proposal probabilities;
+    // greedy MTP and deterministic suffix/n-gram proposers stay on TargetMatch.
+    SpeculativeVerificationMode spec_verification_mode = SpeculativeVerificationMode::TargetMatch;
     // Bounded L2 host-RAM prefix state cache budget in MiB (0 = disabled, max 65536).
     std::uint32_t cache_ram_mib = 0;
     // Dynamic GPU cache in MiB for host-resident MoE experts (0 = disabled, max 262144).

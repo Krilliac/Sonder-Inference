@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "sonder/inference/model_architecture.hpp"
+#include "sonder/inference/speculative_verifier.hpp"
 
 namespace sonder::backends::llamacpp {
 
@@ -91,6 +92,9 @@ enum class SplitMode { kNone, kLayer, kRow };
 // In-process speculative decoding strategy.
 enum class SpeculativeType { kNone, kAuto, kNgram, kNgramMod, kSuffix, kDraftMtp };
 
+// Verification coupling policy for speculative decoding.
+using SpeculativeVerificationMode = sonder::inference::SpeculativeVerificationMode;
+
 // Maximum number of GPU entries accepted in LoadOptions::tensor_split and
 // LoadOptions::devices (matches llama_max_devices() in pinned llama.cpp).
 inline constexpr std::size_t kMaxTensorSplitDevices = 16;
@@ -126,6 +130,7 @@ inline constexpr std::size_t kMaxMediaBlobBytes = std::size_t{16} << 20;
 [[nodiscard]] std::string_view ToString(FlashAttention mode) noexcept;
 [[nodiscard]] std::string_view ToString(SplitMode mode) noexcept;
 [[nodiscard]] std::string_view ToString(SpeculativeType type) noexcept;
+[[nodiscard]] std::string_view ToString(SpeculativeVerificationMode mode) noexcept;
 // Case-insensitive; returns false and leaves `out` untouched for an unknown name.
 [[nodiscard]] bool ParseKvCacheType(std::string_view name, KvCacheType& out) noexcept;
 // Accepts "auto", "on"/"enabled" and "off"/"disabled" (case-insensitive).
@@ -134,6 +139,16 @@ inline constexpr std::size_t kMaxMediaBlobBytes = std::size_t{16} << 20;
 [[nodiscard]] bool ParseSplitMode(std::string_view name, SplitMode& out) noexcept;
 // Accepts "none", "auto", "ngram", "ngram-mod", "suffix", and "draft-mtp" (case-insensitive).
 [[nodiscard]] bool ParseSpeculativeType(std::string_view name, SpeculativeType& out) noexcept;
+// Accepts "target_match"/"target-match" and "stochastic_rejection"/"stochastic-rejection".
+[[nodiscard]] bool ParseSpeculativeVerificationMode(std::string_view name,
+                                                    SpeculativeVerificationMode& out) noexcept;
+// True when the built-in proposer for `type` produces real stochastic proposal
+// probability distributions `q` (false for deterministic suffix/n-gram and greedy MTP).
+[[nodiscard]] bool ProposerSuppliesStochasticProbabilities(SpeculativeType type) noexcept;
+// Resolves the effective verification mode for a loaded speculative proposer.
+[[nodiscard]] SpeculativeVerificationMode ResolveSpeculativeVerificationMode(
+    SpeculativeVerificationMode requested, SpeculativeType active_spec,
+    bool proposer_has_probabilities = false) noexcept;
 // True for block-quantized types (everything except f32, f16 and bf16).
 [[nodiscard]] bool IsQuantized(KvCacheType type) noexcept;
 // True if this llama.cpp/ggml build defines the corresponding GGML_TYPE_*.
@@ -194,6 +209,9 @@ struct LoadOptions {
     std::string spec_type = "none";
     // Max draft tokens per speculative step (0 = automatic default for spec_type).
     std::int32_t spec_draft_max = 0;
+    // Verification policy for speculative decoding (TargetMatch default vs
+    // opt-in StochasticRejection when a stochastic proposer supplies real q).
+    SpeculativeVerificationMode spec_verification_mode = SpeculativeVerificationMode::TargetMatch;
     // Bounded L2 host-RAM prefix state cache budget in MiB (0 = disabled, max kMaxCacheRamMiB).
     std::uint32_t cache_ram_mib = 0;
     // Dynamic GPU cache in MiB for host-resident MoE experts (0 = disabled, max kMaxMoeCacheMiB).
@@ -344,6 +362,9 @@ struct GenerateResult {
     std::int32_t generated_tokens = 0;
     std::int32_t draft_tokens = 0;           // speculative draft tokens proposed
     std::int32_t draft_accepted_tokens = 0;  // speculative draft tokens accepted
+    SpeculativeVerificationMode spec_verifier_mode = SpeculativeVerificationMode::TargetMatch;
+    std::uint64_t spec_residual_resamples = 0;
+    double spec_verify_overhead_us = 0.0;
     double prefill_ms = 0.0;
     double decode_ms = 0.0;
     bool state_restored = false;
@@ -353,6 +374,7 @@ struct GenerateResult {
 
     [[nodiscard]] double decode_tokens_per_second() const noexcept;
     [[nodiscard]] double prefill_tokens_per_second() const noexcept;
+    [[nodiscard]] double spec_accept_rate() const noexcept;
 };
 
 struct EmbedOutput {
@@ -489,6 +511,8 @@ public:
     [[nodiscard]] bool IsLoaded() const noexcept;
     [[nodiscard]] bool HasMmproj() const noexcept;
     [[nodiscard]] std::uint32_t SlotCount() const noexcept;
+    [[nodiscard]] SpeculativeVerificationMode RequestedSpecVerificationMode() const noexcept;
+    [[nodiscard]] SpeculativeVerificationMode EffectiveSpecVerificationMode() const noexcept;
     [[nodiscard]] ModelInfo GetModelInfo() const;
 
     // parse_special: treat control-token text (e.g. "<|im_start|>") as the
