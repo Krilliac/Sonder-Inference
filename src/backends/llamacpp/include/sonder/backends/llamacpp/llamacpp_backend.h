@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "sonder/inference/model_architecture.hpp"
+#include "sonder/inference/request_priority.hpp"
 #include "sonder/inference/speculative_verifier.hpp"
 #include "sonder/inference/swa_policy.hpp"
 
@@ -225,6 +226,10 @@ struct LoadOptions {
     // Sliding-window attention KV policy: Full (default, swa_full = true) or
     // CompactIfQualified (opt-in compact SWA with min_retained_pos rollback guard).
     sonder::inference::SwaKvMode swa_kv_mode = sonder::inference::SwaKvMode::Full;
+    // Default inter-token latency (ITL) target in milliseconds applied to
+    // interactive/foreground decoding slots when a request does not specify an
+    // explicit `target_itl_ms` (0 disables the implicit foreground ITL cap).
+    double default_foreground_itl_ms = 50.0;
 };
 
 // Checks placement options (main_gpu >= 0, split_mode, tensor_split finite /
@@ -340,6 +345,11 @@ struct GenerateRequest {
         std::optional<std::size_t> media_index = std::nullopt;
     };
     std::vector<MediaPromptPart> media_prompt_parts;
+    // Scheduling priority class and optional latency targets (ms) for the
+    // latency-aware continuous-batching physical planner.
+    sonder::inference::RequestPriority priority = sonder::inference::RequestPriority::subagent;
+    std::optional<double> target_ttft_ms = std::nullopt;
+    std::optional<double> target_itl_ms = std::nullopt;
 };
 
 // One event per generated token. After the last token a final event with

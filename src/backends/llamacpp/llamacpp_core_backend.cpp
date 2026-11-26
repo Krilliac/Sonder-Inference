@@ -493,6 +493,7 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     lo.moe_cache_cpu_share = o.moe_cache_cpu_share;
     lo.mmproj_path = o.mmproj_path;
     lo.swa_kv_mode = o.swa_kv_mode;
+    lo.default_foreground_itl_ms = o.default_foreground_itl_ms;
     if (!lc::ParseSplitMode(o.split_mode, lo.split_mode)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown split mode '" + o.split_mode + "' (expected none, layer or row)");
@@ -630,7 +631,8 @@ public:
             return ToStatus(s);
         }
         return run_tokens(std::move(prompt_tokens), request.sampling, cancel, on_chunk, request.session_key,
-                          request.grammar, /*separate_reasoning=*/false, request.checkpoint);
+                          request.grammar, /*separate_reasoning=*/false, request.checkpoint, {}, {}, {},
+                          request.priority_class, request.target_ttft_ms, request.target_itl_ms);
     }
 
     // Chat through the GGUF chat template (llama_chat_apply_template). Models
@@ -687,7 +689,8 @@ public:
         if (!tok_status.ok()) return tok_status;
         return run_tokens(std::move(prompt_tokens), request.sampling, cancel, on_chunk, request.session_key,
                           request.grammar, request.separate_reasoning, /*checkpoint=*/nullptr,
-                          std::move(plan.media_blobs), {}, std::move(plan.media_prompt_parts));
+                          std::move(plan.media_blobs), {}, std::move(plan.media_prompt_parts),
+                          request.priority_class, request.target_ttft_ms, request.target_itl_ms);
     }
 
     [[nodiscard]] bool has_native_chat() const override { return native_chat_; }
@@ -727,7 +730,10 @@ private:
                                      RecurrentCheckpointExchange* checkpoint = nullptr,
                                      std::vector<std::vector<std::uint8_t>> media_blobs = {},
                                      std::string media_prompt_text = {},
-                                     std::vector<lc::GenerateRequest::MediaPromptPart> media_prompt_parts = {}) {
+                                     std::vector<lc::GenerateRequest::MediaPromptPart> media_prompt_parts = {},
+                                     std::optional<RequestPriority> priority_class = std::nullopt,
+                                     std::optional<double> target_ttft_ms = std::nullopt,
+                                     std::optional<double> target_itl_ms = std::nullopt) {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
 
         lc::GenerateRequest req;
@@ -740,6 +746,9 @@ private:
         req.media_blobs = std::move(media_blobs);
         req.media_prompt_text = std::move(media_prompt_text);
         req.media_prompt_parts = std::move(media_prompt_parts);
+        req.priority = priority_class.value_or(RequestPriority::subagent);
+        req.target_ttft_ms = target_ttft_ms;
+        req.target_itl_ms = target_itl_ms;
         if (checkpoint != nullptr) {
             if (!checkpoint->restore_bytes.empty() && checkpoint->restore_token_position > 0 &&
                 checkpoint->restore_token_position < req.prompt.size()) {

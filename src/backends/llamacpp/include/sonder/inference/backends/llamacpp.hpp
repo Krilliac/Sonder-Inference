@@ -97,6 +97,10 @@ struct LlamaCppBackendOptions {
     // prefix trims/rewinds/speculative rollbacks) or CompactIfQualified
     // (opt-in compact SWA cache guarded by min_retained_pos watermark checks).
     SwaKvMode swa_kv_mode = SwaKvMode::Full;
+    // Default inter-token latency (ITL) target in milliseconds for foreground
+    // (`interactive`) decoding requests without an explicit `target_itl_ms`
+    // (0 disables the implicit foreground ITL cap).
+    double default_foreground_itl_ms = 50.0;
 };
 
 // Checks the llama.cpp context and placement options (KV cache types,

@@ -566,6 +566,27 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     if (auto st = validate(sampling); !st.ok()) {
         return st;
     }
+    if (request_options.target_ttft_ms.has_value() &&
+        (!std::isfinite(*request_options.target_ttft_ms) || *request_options.target_ttft_ms <= 0.0)) {
+        return Status(ErrorCode::invalid_argument, "target_ttft_ms must be finite and > 0");
+    }
+    if (request_options.target_itl_ms.has_value() &&
+        (!std::isfinite(*request_options.target_itl_ms) || *request_options.target_itl_ms <= 0.0)) {
+        return Status(ErrorCode::invalid_argument, "target_itl_ms must be finite and > 0");
+    }
+    const RequestPriority effective_priority = [&]() noexcept -> RequestPriority {
+        if (request_options.priority_class.has_value()) {
+            return *request_options.priority_class;
+        }
+        const int effective_rank = static_cast<int>(options_.workload) - options_.priority;
+        if (effective_rank <= static_cast<int>(WorkloadClass::owner_orchestrator)) {
+            return RequestPriority::interactive;
+        }
+        if (effective_rank <= static_cast<int>(WorkloadClass::research_worker)) {
+            return RequestPriority::subagent;
+        }
+        return RequestPriority::background;
+    }();
     GenerateRequest request;
     request.request_id = request_options.request_id && !request_options.request_id->empty()
                              ? *request_options.request_id
@@ -574,6 +595,9 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     request.sampling = sampling;
     request.session_key = request_options.session_key;
     request.grammar = request_options.grammar;
+    request.priority_class = effective_priority;
+    request.target_ttft_ms = request_options.target_ttft_ms;
+    request.target_itl_ms = request_options.target_itl_ms;
 
     // Prepare failure recovery before publishing running. No cleanup action
     // can replace an exception from a public C++ callback.
@@ -1084,6 +1108,9 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                 chat_request.tools = request_options.tools;
                 chat_request.tool_choice = request_options.tool_choice;
                 chat_request.parallel_tool_calls = request_options.parallel_tool_calls;
+                chat_request.priority_class = effective_priority;
+                chat_request.target_ttft_ms = request_options.target_ttft_ms;
+                chat_request.target_itl_ms = request_options.target_itl_ms;
                 generated = backend_model.chat(chat_request, token, on_backend_chunk);
             } else {
                 generated = backend_model.generate(request, token, on_backend_chunk);

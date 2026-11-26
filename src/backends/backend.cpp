@@ -386,6 +386,9 @@ Result<GenerateStats> BackendModel::chat(const ChatRequest& request, const Cance
     g.sampling = request.sampling;
     g.session_key = request.session_key;
     g.grammar = request.grammar;
+    g.priority_class = request.priority_class;
+    g.target_ttft_ms = request.target_ttft_ms;
+    g.target_itl_ms = request.target_itl_ms;
     return generate(g, cancel, on_chunk);
 }
 

@@ -26,7 +26,14 @@ sonder_add_module_tests(core
     test_http_client.cpp
     test_recurrent_checkpoints.cpp
     test_speculative_verifier.cpp
+    test_batch_scheduler.cpp
 )
+
+if(TARGET sonder_core_tests)
+    target_include_directories(sonder_core_tests PRIVATE
+        "${PROJECT_SOURCE_DIR}/src/backends/llamacpp"
+        "${PROJECT_SOURCE_DIR}/src/backends/llamacpp/include")
+endif()
 
 if(WIN32 AND TARGET sonder_core_tests)
     target_link_libraries(sonder_core_tests PRIVATE ws2_32)

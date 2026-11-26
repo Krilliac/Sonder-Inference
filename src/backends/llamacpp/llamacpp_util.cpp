@@ -420,6 +420,10 @@ Status ValidateContextOptions(const LoadOptions& options) {
             ErrorCode::kInvalidArgument,
             "moe_cache_cpu_share is not supported by the direct llamacpp backend (no execution consumer)");
     }
+    if (!std::isfinite(options.default_foreground_itl_ms) || options.default_foreground_itl_ms < 0.0) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "default_foreground_itl_ms must be finite and >= 0.0");
+    }
     // n_batch == 0 keeps its own, older error in Load().
     if (options.n_batch > 0 && options.n_ubatch > options.n_batch) {
         return Status::Error(ErrorCode::kInvalidArgument,
