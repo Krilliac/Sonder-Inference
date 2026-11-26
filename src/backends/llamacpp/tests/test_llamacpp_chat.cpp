@@ -394,17 +394,13 @@ TEST_CASE("llamacpp chat: BuildDirectChatPromptPlan preserves interleaved multim
 }
 
 TEST_CASE("llamacpp chat: splitter starts inside <think> when the generation prompt opened it") {
-    using llamacpp_detail::ChatPromptSegment;
-    using llamacpp_detail::PromptEndsInsideThink;
-    using llamacpp_detail::ThinkingStreamSplitter;
+    using sonder::inference::llamacpp_detail::ChatPromptSegment;
+    using sonder::inference::llamacpp_detail::PromptEndsInsideThink;
+    using sonder::inference::llamacpp_detail::ThinkingStreamSplitter;
 
-    const std::vector<ChatPromptSegment> open_prompt{{"<|im_start|>user
-", true},
+    const std::vector<ChatPromptSegment> open_prompt{{"<|im_start|>user\n", true},
                                                      {"Hi", false},
-                                                     {"<|im_end|>
-<|im_start|>assistant
-<think>
-", true}};
+                                                     {"<|im_end|>\n<|im_start|>assistant\n<think>\n", true}};
     REQUIRE(PromptEndsInsideThink(open_prompt));
 
     ThinkingStreamSplitter s(PromptEndsInsideThink(open_prompt));
@@ -429,8 +425,7 @@ TEST_CASE("llamacpp chat: splitter starts inside <think> when the generation pro
     CHECK(text == "answer");
 
     // Prompt that does not open <think>: default splitter behaviour unchanged.
-    const std::vector<ChatPromptSegment> plain{{"<|im_start|>assistant
-", true}};
+    const std::vector<ChatPromptSegment> plain{{"<|im_start|>assistant\n", true}};
     CHECK_FALSE(PromptEndsInsideThink(plain));
     ThinkingStreamSplitter d(PromptEndsInsideThink(plain));
     auto dr = d.Push("abc</think>answer");
@@ -438,12 +433,7 @@ TEST_CASE("llamacpp chat: splitter starts inside <think> when the generation pro
     CHECK(dr.text == "abc</think>answer");
 
     // A closed think block in the prompt (no-think scaffolding) is not open.
-    const std::vector<ChatPromptSegment> closed{{"<|im_start|>assistant
-<think>
-
-</think>
-
-", true}};
+    const std::vector<ChatPromptSegment> closed{{"<|im_start|>assistant\n<think>\n\n</think>\n\n", true}};
     CHECK_FALSE(PromptEndsInsideThink(closed));
     CHECK_FALSE(PromptEndsInsideThink({}));
 }
