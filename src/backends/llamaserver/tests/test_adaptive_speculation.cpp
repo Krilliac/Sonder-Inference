@@ -813,4 +813,600 @@ TEST_CASE("concurrent non-probe and stale probe observations cannot hijack activ
     CHECK(probe3.probe_id > probe2.probe_id);
 }
 
+TEST_CASE("measured cost config validation rejects invalid ratios and bounds") {
+    const AdaptiveSpeculationConfig valid{};
+    CHECK(validate_adaptive_speculation_config(valid).ok());
+
+    const auto expect_invalid = [](const AdaptiveSpeculationConfig &cfg) {
+        const Status st = validate_adaptive_speculation_config(cfg);
+        CHECK_FALSE(st.ok());
+        CHECK(st.code() == ErrorCode::invalid_argument);
+    };
+
+    {
+        auto cfg = valid;
+        cfg.max_entries = 0;
+        expect_invalid(cfg);
+    }
+    {
+        auto cfg = valid;
+        cfg.max_entries = AdaptiveSpeculationConfig::kMaxEntries + 1;
+        expect_invalid(cfg);
+    }
+    {
+        auto cfg = valid;
+        cfg.min_baseline_samples = 0;
+        expect_invalid(cfg);
+    }
+    {
+        auto cfg = valid;
+        cfg.cost_step_down_ratio = 0.99;
+        expect_invalid(cfg);
+    }
+    {
+        auto cfg = valid;
+        cfg.cost_step_down_ratio = std::numeric_limits<double>::quiet_NaN();
+        expect_invalid(cfg);
+    }
+    {
+        auto cfg = valid;
+        cfg.cost_step_down_ratio = 1.20;
+        cfg.cost_pause_ratio = 1.10;
+        expect_invalid(cfg);
+    }
+    {
+        auto cfg = valid;
+        cfg.cost_probe_recover_ratio = 0.0;
+        expect_invalid(cfg);
+    }
+    {
+        auto cfg = valid;
+        cfg.cost_probe_recover_ratio = cfg.cost_step_down_ratio + 0.05;
+        expect_invalid(cfg);
+    }
+    {
+        auto cfg = valid;
+        cfg.cost_step_cooldown = 2000;
+        expect_invalid(cfg);
+    }
+    {
+        auto cfg = valid;
+        cfg.baseline_probe_interval = 200000;
+        expect_invalid(cfg);
+    }
+}
+
+TEST_CASE("high acceptance with worse ms per committed token steps down and chooses K=0") {
+    AdaptiveSpeculationConfig cfg;
+    cfg.min_draft_n = 0;
+    cfg.initial_draft_n = 3;
+    cfg.max_draft_n = 6;
+    cfg.window_size = 8;
+    cfg.min_samples = 4;
+    cfg.min_baseline_samples = 2;
+    cfg.cost_step_down_ratio = 1.05;
+    cfg.cost_pause_ratio = 1.12;
+    cfg.cost_probe_recover_ratio = 0.98;
+    cfg.cooldown_requests = 2;
+    cfg.probe_draft_n = 1;
+    cfg.cost_step_cooldown = 4;
+    REQUIRE(validate_adaptive_speculation_config(cfg).ok());
+    AdaptiveSpeculationPolicy policy(cfg);
+
+    SpeculationContextKey key;
+    key.target_identity = "spawn|exe=llama-server|model_path=/models/qwen.gguf|ctx=32768|slots=4";
+    key.draft_identity = "type=draft-mtp";
+    key.context_band = ContextBand::short_ctx;
+    key.concurrency_band = ConcurrencyBand::solo;
+    key.workload = SpeculationWorkload::code_edit;
+
+    auto make_cost_obs = [&](std::uint32_t k_used, std::uint64_t draft_n, std::uint64_t accepted,
+                             std::uint64_t committed, double decode_ms, double prompt_ms = 0.0) {
+        SpeculationObservation obs;
+        obs.workload = key.workload;
+        obs.context_key = key;
+        obs.has_context_key = true;
+        obs.draft_n_used = k_used;
+        obs.draft_n = draft_n;
+        obs.draft_n_accepted = accepted;
+        obs.predicted_n = committed;
+        obs.decode_elapsed_ms = decode_ms;
+        obs.prompt_or_restore_ms = prompt_ms;
+        return obs;
+    };
+
+    // Seed K=0 baseline: 20 committed tokens in 200 ms = 10.0 ms/committed-token.
+    const auto b1 = policy.observe(make_cost_obs(0, 0, 0, 20, 200.0, /*prompt_ms=*/4000.0));
+    CHECK(b1.reason == "baseline_observed");
+    CHECK(b1.baseline_ms_per_token == doctest::Approx(10.0));
+    const auto b2 = policy.observe(make_cost_obs(0, 0, 0, 20, 200.0, /*prompt_ms=*/4000.0));
+    CHECK(b2.baseline_ms_per_token == doctest::Approx(10.0));
+
+    // Mild cost regression (10.8 ms/tok = 1.08x baseline) at 85% acceptance steps DOWN 3 -> 2!
+    SpeculationDecision mild;
+    for (int i = 0; i < 4; ++i) {
+        mild = policy.observe(make_cost_obs(3, 20, 17, 20, 216.0));  // 85% acceptance, 10.8 ms/tok
+    }
+    CHECK_FALSE(mild.paused);
+    CHECK(mild.draft_n_max == 2u);
+    CHECK(mild.rolling_acceptance == doctest::Approx(0.85));
+    CHECK(mild.rolling_ms_per_token == doctest::Approx(10.8));
+    CHECK(mild.baseline_ms_per_token == doctest::Approx(10.0));
+    CHECK(mild.cost_ratio == doctest::Approx(1.08));
+    CHECK(mild.reason == "step_down_cost");
+
+    // Strong cost regression (13.0 ms/tok = 1.30x baseline) at 85% acceptance chooses K=0!
+    const auto k2_s1 = policy.observe(make_cost_obs(2, 20, 17, 20, 260.0));
+    CHECK_FALSE(k2_s1.paused);  // waits for 2nd sample at K=2 before reversing
+    const auto k2_s2 = policy.observe(make_cost_obs(2, 20, 17, 20, 260.0));
+    CHECK(k2_s2.paused);
+    CHECK(k2_s2.draft_n_max == 0u);
+    CHECK(k2_s2.rolling_acceptance == doctest::Approx(0.85));
+    CHECK(k2_s2.reason == "paused_cost_regression");
+
+    // Cooldown skips 2 requests, then issues a single probe at K=1.
+    CHECK(policy.recommend(key).reason == "paused_cooldown");
+    CHECK(policy.recommend(key).reason == "paused_cooldown");
+    const auto probe1 = policy.recommend(key);
+    REQUIRE(probe1.is_probe);
+    CHECK(probe1.draft_n_max == 1u);
+
+    // Probe has 85% acceptance, yet still slower than K=0 baseline (12.0 ms/tok vs 10.0): stays K=0!
+    auto bad_probe = make_cost_obs(1, 20, 17, 20, 240.0);
+    bad_probe.is_probe = true;
+    bad_probe.probe_id = probe1.probe_id;
+    const auto repaused = policy.observe(bad_probe);
+    CHECK(repaused.paused);
+    CHECK(repaused.draft_n_max == 0u);
+    CHECK(repaused.reason == "probe_failed_cost_repaused");
+
+    // Next cooldown probe beats baseline (8.0 ms/tok vs 10.0) even with huge prompt_or_restore_ms!
+    CHECK(policy.recommend(key).reason == "paused_cooldown");
+    CHECK(policy.recommend(key).reason == "paused_cooldown");
+    const auto probe2 = policy.recommend(key);
+    REQUIRE(probe2.is_probe);
+    auto good_probe = make_cost_obs(1, 20, 16, 20, 160.0, /*prompt_ms=*/9500.0);
+    good_probe.is_probe = true;
+    good_probe.probe_id = probe2.probe_id;
+    const auto recovered = policy.observe(good_probe);
+    CHECK_FALSE(recovered.paused);
+    CHECK(recovered.draft_n_max == 1u);
+    CHECK(recovered.rolling_ms_per_token == doctest::Approx(8.0));  // prompt_ms excluded!
+    CHECK(recovered.cost_ratio == doctest::Approx(0.80));
+    CHECK(recovered.reason == "probe_recovered");
+}
+
+TEST_CASE("phase critical path avoids double counting overlapped draft and verify") {
+    AdaptiveSpeculationConfig cfg;
+    cfg.min_samples = 2;
+    cfg.min_baseline_samples = 2;
+    cfg.cost_step_down_ratio = 1.05;
+    cfg.cost_pause_ratio = 1.12;
+    AdaptiveSpeculationPolicy policy(cfg);
+
+    SpeculationContextKey overlapped_key;
+    overlapped_key.target_identity = "target-phase";
+    overlapped_key.draft_identity = "draft-overlap";
+    overlapped_key.workload = SpeculationWorkload::code_edit;
+
+    SpeculationContextKey sequential_key = overlapped_key;
+    sequential_key.draft_identity = "draft-sequential";
+
+    // Seed identical 10.0 ms/tok K=0 baseline for both keys.
+    for (const auto &k : {overlapped_key, sequential_key}) {
+        for (int i = 0; i < 2; ++i) {
+            SpeculationObservation b;
+            b.context_key = k;
+            b.has_context_key = true;
+            b.draft_n_used = 0;
+            b.predicted_n = 20;
+            b.decode_elapsed_ms = 200.0;
+            policy.observe(b);
+        }
+    }
+
+    // Overlapped draft=120ms, verify=140ms, rollback=10ms, coord=10ms -> critical path 160ms / 20 = 8.0ms/tok.
+    SpeculationDecision ov_dec;
+    for (int i = 0; i < 2; ++i) {
+        SpeculationObservation obs;
+        obs.context_key = overlapped_key;
+        obs.has_context_key = true;
+        obs.draft_n_used = 3;
+        obs.draft_n = 20;
+        obs.draft_n_accepted = 17;
+        obs.predicted_n = 20;
+        obs.draft_ms = 120.0;
+        obs.verify_ms = 140.0;
+        obs.rollback_ms = 10.0;
+        obs.coordination_ms = 10.0;
+        obs.draft_verify_overlapped = true;
+        obs.prompt_or_restore_ms = 5000.0;  // excluded from decode speed
+        ov_dec = policy.observe(obs);
+    }
+    CHECK_FALSE(ov_dec.paused);
+    CHECK(ov_dec.draft_n_max == 4u);  // stepped up because 8.0ms/tok beats 10.0ms/tok
+    CHECK(ov_dec.rolling_ms_per_token == doctest::Approx(8.0));
+
+    // Sequential draft+verify = 280ms / 20 = 14.0ms/tok -> worse than 10.0ms/tok -> chooses K=0!
+    SpeculationDecision seq_dec;
+    for (int i = 0; i < 2; ++i) {
+        SpeculationObservation obs;
+        obs.context_key = sequential_key;
+        obs.has_context_key = true;
+        obs.draft_n_used = 3;
+        obs.draft_n = 20;
+        obs.draft_n_accepted = 17;
+        obs.predicted_n = 20;
+        obs.draft_ms = 120.0;
+        obs.verify_ms = 140.0;
+        obs.rollback_ms = 10.0;
+        obs.coordination_ms = 10.0;
+        obs.draft_verify_overlapped = false;
+        seq_dec = policy.observe(obs);
+    }
+    CHECK(seq_dec.paused);
+    CHECK(seq_dec.draft_n_max == 0u);
+    CHECK(seq_dec.rolling_ms_per_token == doctest::Approx(14.0));
+    CHECK(seq_dec.reason == "paused_cost_regression");
+}
+
+TEST_CASE("concurrency band context band and target draft identities isolate policy state") {
+    AdaptiveSpeculationConfig cfg;
+    cfg.initial_draft_n = 3;
+    cfg.max_draft_n = 6;
+    cfg.min_samples = 2;
+    cfg.min_baseline_samples = 2;
+    AdaptiveSpeculationPolicy policy(cfg);
+
+    CHECK(classify_context_band(0) == ContextBand::short_ctx);
+    CHECK(classify_context_band(4096) == ContextBand::short_ctx);
+    CHECK(classify_context_band(4097) == ContextBand::medium_ctx);
+    CHECK(classify_context_band(16384) == ContextBand::medium_ctx);
+    CHECK(classify_context_band(16385) == ContextBand::long_ctx);
+    CHECK(classify_context_band(65536) == ContextBand::long_ctx);
+    CHECK(classify_context_band(65537) == ContextBand::very_long_ctx);
+
+    CHECK(classify_concurrency_band(0) == ConcurrencyBand::solo);
+    CHECK(classify_concurrency_band(1) == ConcurrencyBand::solo);
+    CHECK(classify_concurrency_band(2) == ConcurrencyBand::low);
+    CHECK(classify_concurrency_band(3) == ConcurrencyBand::low);
+    CHECK(classify_concurrency_band(4) == ConcurrencyBand::medium);
+    CHECK(classify_concurrency_band(7) == ConcurrencyBand::medium);
+    CHECK(classify_concurrency_band(8) == ConcurrencyBand::high);
+
+    const SpeculationContextKey solo_short{"sha256:model-a|ctx=65536", "type=draft-mtp", ContextBand::short_ctx,
+                                           ConcurrencyBand::solo, SpeculationWorkload::code_edit};
+    const SpeculationContextKey high_conc{"sha256:model-a|ctx=65536", "type=draft-mtp", ContextBand::short_ctx,
+                                          ConcurrencyBand::high, SpeculationWorkload::code_edit};
+    const SpeculationContextKey long_ctx{"sha256:model-a|ctx=65536", "type=draft-mtp", ContextBand::long_ctx,
+                                         ConcurrencyBand::solo, SpeculationWorkload::code_edit};
+    const SpeculationContextKey other_draft{"sha256:model-a|ctx=65536", "type=ngram-mod", ContextBand::short_ctx,
+                                            ConcurrencyBand::solo, SpeculationWorkload::code_edit};
+
+    auto seed_baseline = [&](const SpeculationContextKey &k, double ms_per_tok) {
+        for (int i = 0; i < 2; ++i) {
+            SpeculationObservation b;
+            b.context_key = k;
+            b.has_context_key = true;
+            b.draft_n_used = 0;
+            b.predicted_n = 20;
+            b.decode_elapsed_ms = ms_per_tok * 20.0;
+            policy.observe(b);
+        }
+    };
+    auto observe_spec = [&](const SpeculationContextKey &k, std::uint32_t k_used, double ms_per_tok) {
+        SpeculationObservation o;
+        o.context_key = k;
+        o.has_context_key = true;
+        o.draft_n_used = k_used;
+        o.draft_n = 20;
+        o.draft_n_accepted = 17;  // 85% acceptance in all bands
+        o.predicted_n = 20;
+        o.decode_elapsed_ms = ms_per_tok * 20.0;
+        return policy.observe(o);
+    };
+
+    seed_baseline(solo_short, 10.0);
+    seed_baseline(high_conc, 10.0);
+    seed_baseline(long_ctx, 10.0);
+    seed_baseline(other_draft, 10.0);
+
+    // Solo + short context wins strongly (6 ms/tok): ramps up to K=6.
+    for (int i = 0; i < 5; ++i) {
+        const auto rec = policy.recommend(solo_short);
+        observe_spec(solo_short, rec.draft_n_max, 6.0);
+    }
+    CHECK(policy.recommend(solo_short).draft_n_max == 6u);
+
+    // High concurrency (B >= 8): slow at 14 ms/tok even with 85% acceptance -> chooses K=0!
+    for (int i = 0; i < 2; ++i) {
+        observe_spec(high_conc, 3, 14.0);
+    }
+    CHECK(policy.recommend(high_conc).paused);
+    CHECK(policy.recommend(high_conc).draft_n_max == 0u);
+
+    // Long context (C > 16K): mildly slow at K=3 (10.8 ms/tok) -> steps down to K=2 while solo+short stays K=6.
+    for (int i = 0; i < 2; ++i) {
+        observe_spec(long_ctx, 3, 10.8);
+    }
+    CHECK_FALSE(policy.recommend(long_ctx).paused);
+    CHECK(policy.recommend(long_ctx).draft_n_max == 2u);
+
+    // Same target & bands with different draft_identity remains independent at initial_draft_n.
+    CHECK(policy.recommend(other_draft).draft_n_max == cfg.initial_draft_n);
+    CHECK(policy.recommend(solo_short).draft_n_max == 6u);
+}
+
+TEST_CASE("per-K cost hysteresis prevents oscillation and foreground requests defer probes") {
+    AdaptiveSpeculationConfig cfg;
+    cfg.initial_draft_n = 3;
+    cfg.max_draft_n = 6;
+    cfg.min_samples = 2;
+    cfg.cooldown_requests = 2;
+    cfg.cost_step_down_ratio = 1.05;
+    cfg.cost_step_cooldown = 4;
+    cfg.baseline_probe_interval = 3;
+    REQUIRE(validate_adaptive_speculation_config(cfg).ok());
+    AdaptiveSpeculationPolicy policy(cfg);
+
+    const SpeculationContextKey key{"target-hyst", "draft-hyst", ContextBand::short_ctx, ConcurrencyBand::solo,
+                                    SpeculationWorkload::code_edit};
+
+    auto obs_k = [&](std::uint32_t k_used, double ms_per_tok) {
+        SpeculationObservation o;
+        o.context_key = key;
+        o.has_context_key = true;
+        o.draft_n_used = k_used;
+        o.draft_n = 20;
+        o.draft_n_accepted = 18;  // 90% acceptance
+        o.predicted_n = 20;
+        o.decode_elapsed_ms = ms_per_tok * 20.0;
+        return policy.observe(o);
+    };
+
+    // 1. K=3 runs at 10.0 ms/tok -> steps up to K=4.
+    CHECK(obs_k(3, 10.0).draft_n_max == 3u);
+    const auto up = obs_k(3, 10.0);
+    CHECK(up.draft_n_max == 4u);
+    CHECK(up.reason == "step_up");
+
+    // 2. K=4 regresses to 12.5 ms/tok (even with 90% acceptance!):
+    //    Sample 1 holds (does not overshoot to 5); Sample 2 steps down 4 -> 3!
+    const auto k4_s1 = obs_k(4, 12.5);
+    CHECK(k4_s1.draft_n_max == 4u);
+    CHECK(k4_s1.reason == "hold_cost_hysteresis");
+    const auto k4_s2 = obs_k(4, 12.5);
+    CHECK(k4_s2.draft_n_max == 3u);
+    CHECK(k4_s2.reason == "step_down_cost_vs_shorter");
+
+    // 3. Hysteresis holdoff keeps K steady at 3 for cost_step_cooldown observations (no 3<->4 oscillation).
+    for (std::uint32_t i = 0; i < cfg.cost_step_cooldown - 1u; ++i) {
+        const auto held = obs_k(3, 10.0);
+        CHECK(held.draft_n_max == 3u);
+        CHECK(held.reason == "hold_cost_cooldown");
+    }
+
+    // 4. Baseline calibration probe respects foreground allow_probe=false and single-probe ownership.
+    //    After 2 calls, the 3rd request hits baseline_probe_interval=3.
+    CHECK_FALSE(policy.recommend(key, true).is_probe);
+    CHECK_FALSE(policy.recommend(key, true).is_probe);
+    // Foreground request (allow_probe=false) must NOT be diverted into a K=0 calibration probe.
+    const auto fg = policy.recommend(key, /*allow_probe=*/false);
+    CHECK_FALSE(fg.is_probe);
+    CHECK_FALSE(fg.is_baseline_probe);
+    CHECK(fg.draft_n_max == 3u);
+    // Probe-eligible request claims the single baseline calibration probe.
+    const auto bp = policy.recommend(key, /*allow_probe=*/true);
+    CHECK(bp.is_probe);
+    CHECK(bp.is_baseline_probe);
+    CHECK(bp.draft_n_max == 0u);
+    CHECK(bp.paused);
+    CHECK(bp.probe_id > 0u);
+    CHECK(bp.reason == "baseline_calibration_probe");
+    // Concurrent request while baseline probe is in flight gets normal K=3 (no probe storm).
+    const auto conc = policy.recommend(key, /*allow_probe=*/true);
+    CHECK_FALSE(conc.is_probe);
+    CHECK(conc.draft_n_max == 3u);
+    // Stale cancel_probe is ignored; matching cancel_probe releases cleanly.
+    policy.cancel_probe(key, bp.probe_id + 100u);
+    CHECK_FALSE(policy.recommend(key, true).is_probe);
+    policy.cancel_probe(key, bp.probe_id);
+
+    // 5. Paused cooldown probe also defers when allow_probe=false and issues once when allow_probe=true.
+    AdaptiveSpeculationConfig pause_cfg;
+    pause_cfg.min_samples = 2;
+    pause_cfg.cooldown_requests = 1;
+    AdaptiveSpeculationPolicy pause_policy(pause_cfg);
+    for (int i = 0; i < 2; ++i) {
+        SpeculationObservation low;
+        low.context_key = key;
+        low.has_context_key = true;
+        low.draft_n = 20;
+        low.draft_n_accepted = 2;
+        low.predicted_n = 20;
+        low.decode_elapsed_ms = 200.0;
+        pause_policy.observe(low);
+    }
+    CHECK(pause_policy.recommend(key, true).reason == "paused_cooldown");
+    const auto deferred = pause_policy.recommend(key, /*allow_probe=*/false);
+    CHECK(deferred.paused);
+    CHECK_FALSE(deferred.is_probe);
+    CHECK(deferred.probe_id == 0u);
+    CHECK(deferred.reason == "paused_probe_deferred");
+    const auto granted = pause_policy.recommend(key, /*allow_probe=*/true);
+    CHECK(granted.is_probe);
+    CHECK(granted.probe_id > 0u);
+    CHECK(granted.reason == "cooldown_probe");
+    // Concurrent probe storm prevented.
+    for (int i = 0; i < 5; ++i) {
+        const auto storm = pause_policy.recommend(key, /*allow_probe=*/true);
+        CHECK(storm.paused);
+        CHECK_FALSE(storm.is_probe);
+        CHECK(storm.reason == "paused_probe_in_flight");
+    }
+}
+
+TEST_CASE("bounded LRU state table enforces strict capacity under thousands of synthetic keys") {
+    AdaptiveSpeculationConfig cfg;
+    cfg.max_entries = 64;
+    cfg.window_size = 8;
+    cfg.min_samples = 2;
+    REQUIRE(validate_adaptive_speculation_config(cfg).ok());
+    AdaptiveSpeculationPolicy policy(cfg);
+
+    // Verify over-length identities are bounded to kMaxIdentityLength while staying distinct.
+    const std::string long_prefix(400, 'a');
+    const std::string norm1 = normalize_speculation_identity(long_prefix + "-model-one");
+    const std::string norm2 = normalize_speculation_identity(long_prefix + "-model-two");
+    CHECK(norm1.size() <= SpeculationContextKey::kMaxIdentityLength);
+    CHECK(norm2.size() <= SpeculationContextKey::kMaxIdentityLength);
+    CHECK(norm1 != norm2);
+
+    // Insert 4,000 synthetic keys and assert hard cap <= 64 on every step.
+    constexpr std::size_t kTotalKeys = 4000;
+    for (std::size_t i = 0; i < kTotalKeys; ++i) {
+        SpeculationContextKey k;
+        k.target_identity =
+            (i % 100 == 0) ? (long_prefix + "-target-" + std::to_string(i)) : ("target-" + std::to_string(i));
+        k.draft_identity = "draft-" + std::to_string(i % 7);
+        k.context_band = static_cast<ContextBand>(i % kContextBandCount);
+        k.concurrency_band = static_cast<ConcurrencyBand>((i / 4) % kConcurrencyBandCount);
+        k.workload = static_cast<SpeculationWorkload>((i / 16) % kSpeculationWorkloadCount);
+
+        (void)policy.recommend(k);
+        SpeculationObservation obs;
+        obs.context_key = k;
+        obs.has_context_key = true;
+        obs.draft_n = 20;
+        obs.draft_n_accepted = 16;
+        obs.predicted_n = 20;
+        obs.decode_elapsed_ms = 180.0;
+        (void)policy.observe(obs);
+        REQUIRE(policy.entry_count() <= cfg.max_entries);
+    }
+
+    CHECK(policy.entry_count() == cfg.max_entries);
+    CHECK(policy.table_evictions() == kTotalKeys - cfg.max_entries);
+
+    const json::Object snap = policy.status_json();
+    const auto *table = snap.find("table");
+    REQUIRE(table != nullptr);
+    CHECK(table->find("size")->as_uint() == cfg.max_entries);
+    CHECK(table->find("capacity")->as_uint() == cfg.max_entries);
+    CHECK(table->find("evictions")->as_uint() == kTotalKeys - cfg.max_entries);
+    const auto *entries = snap.find("entries");
+    REQUIRE(entries != nullptr);
+    REQUIRE(entries->is_array());
+    CHECK(entries->as_array().size() == cfg.max_entries);
+    for (const auto &entry : entries->as_array()) {
+        const auto *tid = entry.find("target_identity");
+        REQUIRE(tid != nullptr);
+        CHECK(tid->as_string().size() <= SpeculationContextKey::kMaxIdentityLength);
+    }
+
+    // Verify LRU recency: touching key_hot keeps it resident while an older key is evicted.
+    policy.reset();
+    CHECK(policy.entry_count() == 0u);
+    CHECK(policy.table_evictions() == 0u);
+
+    AdaptiveSpeculationConfig small_cfg;
+    small_cfg.max_entries = 2;
+    small_cfg.min_samples = 2;
+    AdaptiveSpeculationPolicy small(small_cfg);
+    const SpeculationContextKey k1{"t1", "d1", ContextBand::short_ctx, ConcurrencyBand::solo,
+                                   SpeculationWorkload::code_edit};
+    const SpeculationContextKey k2{"t2", "d1", ContextBand::short_ctx, ConcurrencyBand::solo,
+                                   SpeculationWorkload::code_edit};
+    const SpeculationContextKey k3{"t3", "d1", ContextBand::short_ctx, ConcurrencyBand::solo,
+                                   SpeculationWorkload::code_edit};
+
+    for (int i = 0; i < 3; ++i) {
+        SpeculationObservation o;
+        o.context_key = k1;
+        o.has_context_key = true;
+        o.draft_n = 20;
+        o.draft_n_accepted = 18;
+        o.predicted_n = 20;
+        o.decode_elapsed_ms = 160.0;
+        small.observe(o);
+    }
+    CHECK(small.recommend(k1).draft_n_max == 5u);
+    (void)small.recommend(k2);
+    // Refresh k1 so k2 is now LRU.
+    CHECK(small.recommend(k1).draft_n_max == 5u);
+    // Inserting k3 evicts k2, preserving k1's learned draft_n_max == 5.
+    (void)small.recommend(k3);
+    CHECK(small.entry_count() == 2u);
+    CHECK(small.table_evictions() == 1u);
+    CHECK(small.recommend(k1).draft_n_max == 5u);
+}
+
+TEST_CASE("live workload classifiers genuinely reach all five buckets including prose") {
+    // 1. tool_json via grammar, tools, or non-text response_format.
+    {
+        GenerateRequest req{"", "Write an essay about oceans.", {}};
+        CHECK(classify_generate_workload(req, "root ::= \"ok\"") == SpeculationWorkload::tool_json);
+        req.grammar = "root ::= \"ok\"";
+        CHECK(classify_generate_workload(req, {}) == SpeculationWorkload::tool_json);
+    }
+    {
+        ChatRequest req;
+        req.messages = {{"user", "Write a short story about dawn."}};
+        req.response_format_type = "json_object";
+        CHECK(classify_chat_workload(req, {}) == SpeculationWorkload::tool_json);
+    }
+
+    // 2. reasoning via thinking or separate_reasoning.
+    {
+        ChatRequest req;
+        req.messages = {{"user", "Write an essay on thermodynamics."}};
+        req.separate_reasoning = true;
+        CHECK(classify_chat_workload(req, {}) == SpeculationWorkload::reasoning);
+    }
+
+    // 3. code_edit beats prose when code/diff fences are present.
+    {
+        GenerateRequest req{"", "Write an article showing this patch:\n```cpp\nint main() { return 0; }\n```", {}};
+        CHECK(classify_generate_workload(req, {}) == SpeculationWorkload::code_edit);
+    }
+
+    // 4. prose is genuinely reachable via explicit prose cues AND multi-sentence natural text.
+    {
+        GenerateRequest story{"", "Write a short story about a lighthouse keeper during a winter storm.", {}};
+        CHECK(classify_generate_workload(story, {}) == SpeculationWorkload::prose);
+
+        GenerateRequest essay{"", "Draft an essay explaining coastal navigation history.", {}};
+        CHECK(classify_generate_workload(essay, {}) == SpeculationWorkload::prose);
+
+        GenerateRequest passage{
+            "",
+            "The afternoon light drifted slowly across the harbor while fishing boats returned along the breakwater. "
+            "Merchants packed crates of salt and cedar near the stone steps before dusk settled over the quay. "
+            "Farther inland, lanterns flickered in the bakery windows as neighbors gathered along the cobbled street.",
+            {}};
+        CHECK(classify_generate_workload(passage, {}) == SpeculationWorkload::prose);
+
+        ChatRequest chat_prose;
+        chat_prose.messages = {
+            {"system", "You are a helpful assistant."},
+            {"user", "Proofread this blog post draft and tighten the narrative flow."},
+        };
+        CHECK(classify_chat_workload(chat_prose, {}) == SpeculationWorkload::prose);
+    }
+
+    // 5. general remains default for short plain prompts and code-like text without fences.
+    {
+        GenerateRequest plain{"", "Write a brief summary of cloud formations.", {}};
+        CHECK(classify_generate_workload(plain, {}) == SpeculationWorkload::general);
+
+        GenerateRequest code_no_fence{
+            "",
+            "Explain why std::vector<int> fn(int x) { return x + 1; } avoids heap allocation here. "
+            "Also compare against struct Foo { int a; }; in C++20. "
+            "Finally list the assembly emitted for this function.",
+            {}};
+        CHECK(classify_generate_workload(code_no_fence, {}) == SpeculationWorkload::general);
+    }
+}
+
 }  // TEST_SUITE("llamaserver_adaptive_speculation")

@@ -32,6 +32,17 @@ struct SuffixMatchResult {
     bool from_session_ring = false;
 };
 
+// Optional measured-cost telemetry comparing suffix verification elapsed
+// ms/committed-token against ordinary (non-speculative) decode baseline.
+struct SuffixCostStats {
+    double suffix_ms_per_committed_token = 0.0;
+    double baseline_ms_per_committed_token = 0.0;
+    std::uint32_t suffix_cost_samples = 0;
+    std::uint32_t baseline_cost_samples = 0;
+    std::uint32_t cost_regressions = 0;
+    bool cost_paused = false;
+};
+
 // Bounded online Generalized Suffix Automaton over a contiguous token buffer.
 // When the buffer reaches `max_tokens`, compacts to the most recent half and
 // rebuilds in O(N) time (amortized O(1) per token, strictly bounded RAM).
@@ -488,6 +499,10 @@ public:
     static constexpr std::size_t kHybridMtpMinBurstDraft = 6;
     static constexpr std::size_t kHybridMtpMaxBurstDraft = 16;
     static constexpr float kHybridMtpMinConfidence = 0.75F;
+    static constexpr std::uint32_t kMinCostSamples = 2u;
+    static constexpr double kCostStepDownRatio = 1.05;
+    static constexpr double kCostPauseRatio = 1.12;
+    static constexpr double kCostImproveRatio = 0.98;
 
     explicit SuffixMatcher(std::size_t session_ring_capacity = BoundedSuffixAutomaton::kDefaultCapacity,
                            std::size_t active_capacity = BoundedSuffixAutomaton::kDefaultCapacity)
@@ -637,6 +652,27 @@ public:
     void NoteSkippedStep() noexcept {
         if (cooldown_remaining_ > 0) {
             --cooldown_remaining_;
+            if (cooldown_remaining_ == 0) {
+                cost_paused_ = false;
+            }
+        }
+    }
+
+    // Optional measured-cost hook: records an ordinary non-speculative decode
+    // step's elapsed ms per committed token as the K=0 baseline.
+    void ObserveBaselineStep(double elapsed_ms, std::size_t committed_tokens = 1) noexcept {
+        if (!std::isfinite(elapsed_ms) || elapsed_ms <= 0.0 || committed_tokens == 0) return;
+        const double ms_per_tok = elapsed_ms / static_cast<double>(committed_tokens);
+        if (!std::isfinite(ms_per_tok) || ms_per_tok <= 0.0) return;
+        if (baseline_cost_samples_ < 4u) {
+            const double prev = static_cast<double>(baseline_cost_samples_);
+            baseline_ms_per_token_ema_ = (baseline_ms_per_token_ema_ * prev + ms_per_tok) / (prev + 1.0);
+        } else {
+            constexpr double kAlpha = 0.25;
+            baseline_ms_per_token_ema_ = (1.0 - kAlpha) * baseline_ms_per_token_ema_ + kAlpha * ms_per_tok;
+        }
+        if (baseline_cost_samples_ < std::numeric_limits<std::uint32_t>::max()) {
+            ++baseline_cost_samples_;
         }
     }
 
@@ -676,6 +712,69 @@ public:
         }
     }
 
+    // Optional measured-cost hook: updates acceptance tracking AND compares
+    // suffix verify elapsed ms per committed token against the measured
+    // ordinary-decode baseline. When `committed_tokens == 0`, defaults to
+    // `min(accepted, drafted) + 1` (verified drafts + correction/bonus token).
+    // Measured latency regression overrides high acceptance by shrinking
+    // `draft_factor_` and triggering cooldown pause.
+    void ObserveWithCost(std::size_t drafted, std::size_t accepted, double elapsed_ms,
+                         std::size_t committed_tokens = 0) noexcept {
+        if (drafted == 0) return;
+        const double prev_draft_factor = draft_factor_;
+        const std::size_t prev_min_match = adaptive_min_match_;
+        const std::int32_t prev_cooldown_period = cooldown_period_;
+        Observe(drafted, accepted);
+
+        const std::size_t clamped_acc = std::min(accepted, drafted);
+        const std::size_t eff_committed = committed_tokens > 0 ? committed_tokens : (clamped_acc + 1u);
+        if (!std::isfinite(elapsed_ms) || elapsed_ms <= 0.0 || eff_committed == 0) return;
+        const double step_ms_per_tok = elapsed_ms / static_cast<double>(eff_committed);
+        if (!std::isfinite(step_ms_per_tok) || step_ms_per_tok <= 0.0) return;
+
+        if (suffix_cost_samples_ < 4u) {
+            const double prev = static_cast<double>(suffix_cost_samples_);
+            suffix_ms_per_token_ema_ = (suffix_ms_per_token_ema_ * prev + step_ms_per_tok) / (prev + 1.0);
+        } else {
+            constexpr double kAlpha = 0.25;
+            suffix_ms_per_token_ema_ = (1.0 - kAlpha) * suffix_ms_per_token_ema_ + kAlpha * step_ms_per_tok;
+        }
+        if (suffix_cost_samples_ < std::numeric_limits<std::uint32_t>::max()) {
+            ++suffix_cost_samples_;
+        }
+
+        if (baseline_cost_samples_ < kMinCostSamples || suffix_cost_samples_ < kMinCostSamples ||
+            baseline_ms_per_token_ema_ <= 0.0) {
+            return;
+        }
+
+        const double ratio = suffix_ms_per_token_ema_ / baseline_ms_per_token_ema_;
+        if (ratio >= kCostStepDownRatio) {
+            draft_factor_ = std::max(1.0, prev_draft_factor * 0.75);
+            cooldown_period_ = prev_cooldown_period;
+            ++cost_regress_streak_;
+            if (ratio >= kCostPauseRatio || cost_regress_streak_ >= 3) {
+                cooldown_remaining_ = std::min<std::int32_t>(cooldown_period_, 16);
+                cooldown_period_ = std::min<std::int32_t>(cooldown_period_ * 2, 16);
+                adaptive_min_match_ = std::min<std::size_t>(std::max(prev_min_match, adaptive_min_match_) + 1u, 6u);
+                cost_paused_ = true;
+                cost_regress_streak_ = 0;
+                if (cost_regressions_ < std::numeric_limits<std::uint32_t>::max()) {
+                    ++cost_regressions_;
+                }
+            }
+        } else if (ratio <= kCostImproveRatio) {
+            cost_regress_streak_ = 0;
+            cost_paused_ = false;
+        } else {
+            // Break-even hysteresis deadband: do not inflate draft_factor_ even on
+            // high acceptance until suffix verify clearly beats baseline.
+            draft_factor_ = std::min(draft_factor_, prev_draft_factor);
+            cost_regress_streak_ = 0;
+            cost_paused_ = false;
+        }
+    }
+
     [[nodiscard]] std::size_t active_size() const noexcept { return active_.size(); }
     [[nodiscard]] std::size_t session_ring_size() const noexcept { return session_ring_.size(); }
     [[nodiscard]] std::size_t session_ring_capacity() const noexcept { return session_ring_.capacity(); }
@@ -684,6 +783,19 @@ public:
     [[nodiscard]] double draft_factor() const noexcept { return draft_factor_; }
     [[nodiscard]] std::int32_t cooldown_period() const noexcept { return cooldown_period_; }
     [[nodiscard]] bool paused() const noexcept { return cooldown_remaining_ > 0; }
+    [[nodiscard]] bool cost_paused() const noexcept { return cost_paused_ && cooldown_remaining_ > 0; }
+    [[nodiscard]] double suffix_ms_per_token() const noexcept { return suffix_ms_per_token_ema_; }
+    [[nodiscard]] double baseline_ms_per_token() const noexcept { return baseline_ms_per_token_ema_; }
+    [[nodiscard]] SuffixCostStats cost_stats() const noexcept {
+        return SuffixCostStats{
+            suffix_ms_per_token_ema_,
+            baseline_ms_per_token_ema_,
+            suffix_cost_samples_,
+            baseline_cost_samples_,
+            cost_regressions_,
+            cost_paused(),
+        };
+    }
     [[nodiscard]] bool CheckInvariants() const noexcept {
         return active_.CheckInvariants() && session_ring_.CheckInvariants() &&
                current_request_.size() <= max_request_history_ * 2u;
@@ -698,6 +810,13 @@ private:
         low_streak_ = 0;
         cooldown_remaining_ = 0;
         cooldown_period_ = 4;
+        suffix_ms_per_token_ema_ = 0.0;
+        baseline_ms_per_token_ema_ = 0.0;
+        suffix_cost_samples_ = 0;
+        baseline_cost_samples_ = 0;
+        cost_regress_streak_ = 0;
+        cost_regressions_ = 0;
+        cost_paused_ = false;
     }
 
     BoundedSuffixAutomaton active_;
@@ -713,6 +832,14 @@ private:
     std::int32_t low_streak_ = 0;
     std::int32_t cooldown_remaining_ = 0;
     std::int32_t cooldown_period_ = 4;
+
+    double suffix_ms_per_token_ema_ = 0.0;
+    double baseline_ms_per_token_ema_ = 0.0;
+    std::uint32_t suffix_cost_samples_ = 0;
+    std::uint32_t baseline_cost_samples_ = 0;
+    std::int32_t cost_regress_streak_ = 0;
+    std::uint32_t cost_regressions_ = 0;
+    bool cost_paused_ = false;
 };
 
 }  // namespace sonder::backends::llamacpp
