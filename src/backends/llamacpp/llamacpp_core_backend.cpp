@@ -483,6 +483,7 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     lo.n_slots = o.slots;
     lo.spec_type = o.spec_type;
     lo.spec_draft_max = o.spec_draft_max;
+    lo.spec_verification_mode = o.spec_verification_mode;
     lo.cache_ram_mib = o.cache_ram_mib;
     lo.moe_cache_mib = o.moe_cache_mib;
     lo.moe_cache_cpu_share = o.moe_cache_cpu_share;

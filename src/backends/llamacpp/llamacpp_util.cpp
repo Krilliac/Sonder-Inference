@@ -174,6 +174,10 @@ std::string_view ToString(SpeculativeType type) noexcept {
     return "unknown";
 }
 
+std::string_view ToString(SpeculativeVerificationMode mode) noexcept {
+    return sonder::inference::to_string(mode);
+}
+
 bool ParseKvCacheType(std::string_view name, KvCacheType& out) noexcept {
     if (EqualsIgnoreCase(name, "pq2_0m")) {
         out = KvCacheType::kPQ2_0;
@@ -231,6 +235,32 @@ bool ParseSpeculativeType(std::string_view name, SpeculativeType& out) noexcept 
         return false;
     }
     return true;
+}
+
+bool ParseSpeculativeVerificationMode(std::string_view name, SpeculativeVerificationMode& out) noexcept {
+    return sonder::inference::parse_speculative_verification_mode(name, out);
+}
+
+bool ProposerSuppliesStochasticProbabilities(SpeculativeType type) noexcept {
+    // Current built-in direct proposers are either deterministic history
+    // matchers (ngram, ngram-mod, suffix) or greedy MTP heads, where
+    // sum min(p, q) == p(x*) identically.
+    switch (type) {
+        case SpeculativeType::kNone:
+        case SpeculativeType::kAuto:
+        case SpeculativeType::kNgram:
+        case SpeculativeType::kNgramMod:
+        case SpeculativeType::kSuffix:
+        case SpeculativeType::kDraftMtp: return false;
+    }
+    return false;
+}
+
+SpeculativeVerificationMode ResolveSpeculativeVerificationMode(SpeculativeVerificationMode requested,
+                                                             SpeculativeType active_spec,
+                                                             bool proposer_has_probabilities) noexcept {
+    return sonder::inference::resolve_speculative_verification_mode(
+        requested, proposer_has_probabilities || ProposerSuppliesStochasticProbabilities(active_spec));
 }
 
 bool IsQuantized(KvCacheType type) noexcept {
@@ -347,6 +377,10 @@ Status ValidateContextOptions(const LoadOptions& options) {
                              "spec_draft_max (" + std::to_string(options.spec_draft_max) + ") must be in [0, " +
                                  std::to_string(kMaxSpecDraftTokens) + "]");
     }
+    if (!sonder::inference::is_valid_speculative_verification_mode(options.spec_verification_mode)) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "unknown spec_verification_mode (expected target_match or stochastic_rejection)");
+    }
     if (options.cache_ram_mib > kMaxCacheRamMiB) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "cache_ram_mib (" + std::to_string(options.cache_ram_mib) + ") must be <= " +
@@ -386,6 +420,12 @@ double GenerateResult::decode_tokens_per_second() const noexcept {
 
 double GenerateResult::prefill_tokens_per_second() const noexcept {
     return prefill_ms > 0.0 ? prompt_tokens * 1000.0 / prefill_ms : 0.0;
+}
+
+double GenerateResult::spec_accept_rate() const noexcept {
+    if (draft_tokens <= 0) return 0.0;
+    const std::int32_t clamped = std::clamp(draft_accepted_tokens, 0, draft_tokens);
+    return static_cast<double>(clamped) / static_cast<double>(draft_tokens);
 }
 
 namespace {
