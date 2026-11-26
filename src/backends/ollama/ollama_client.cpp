@@ -261,7 +261,7 @@ json::Value build_chat_body(const ChatParams& p, const OllamaConfig& config) {
     apply_common(body, p.model, p.stream, p.think, p.format, p.keep_alive, config, p.options);
     json::Array msgs;
     for (const auto& m : p.messages) {
-        json::Object msg{{"role", m.role}, {"content", m.content}};
+        json::Object msg{{"role", m.role}, {"content", message_text_content(m)}};
         if (m.role == "assistant" && !m.tool_calls.empty()) {
             json::Array tcs;
             tcs.reserve(m.tool_calls.size());

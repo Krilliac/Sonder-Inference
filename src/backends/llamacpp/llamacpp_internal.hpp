@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <functional>
 #include <limits>
@@ -13,12 +14,14 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include "sonder/inference/backend.hpp"
 #include "sonder/inference/backends/llamacpp.hpp"
 #include "sonder/inference/device.hpp"
+#include "sonder/inference/json.hpp"
 #include "sonder/inference/sampling.hpp"
 
 namespace sonder::inference::llamacpp_detail {
@@ -375,6 +378,183 @@ bool HasIntegratedUmaTarget(
 void PopulateGenerateStats(const sonder::backends::llamacpp::GenerateResult& result,
                            std::size_t restore_tokens, std::uint64_t load_ns,
                            GenerateStats& stats) noexcept;
+
+struct DirectChatPromptPlan {
+    Status status = Status::success();
+    bool template_unsupported = false;
+    std::vector<ChatPromptSegment> segments;
+    std::vector<std::vector<std::uint8_t>> media_blobs;
+    std::vector<sonder::backends::llamacpp::GenerateRequest::MediaPromptPart> media_prompt_parts;
+};
+
+// Normalizes chat messages (ordered `parts`, legacy `media`, assistant `tool_calls`),
+// renders template segments with G0028 `parse_special` boundaries, applies optional
+// `enable_thinking=false` scaffolding, and builds structured multimodal prompt parts
+// matching `EvaluateMultimodalPrompt` execution order.
+inline DirectChatPromptPlan BuildDirectChatPromptPlan(
+    const ChatRequest& request,
+    const std::function<Result<std::string>(const std::vector<sonder::backends::llamacpp::ChatTurn>&, bool)>&
+        apply_template) {
+    namespace lc = sonder::backends::llamacpp;
+    DirectChatPromptPlan plan;
+    if (Status st = validate_chat_messages(request.messages); !st.ok()) {
+        plan.status = st;
+        return plan;
+    }
+
+    std::vector<std::pair<std::string, std::size_t>> media_sentinels;
+    std::vector<ChatMessage> normalized_messages;
+    const std::vector<ChatMessage>* template_messages = &request.messages;
+    bool needs_normalized = false;
+    for (const auto& m : request.messages) {
+        if (count_message_images(m) > 0 || !m.parts.empty() || !m.tool_calls.empty()) {
+            needs_normalized = true;
+            break;
+        }
+    }
+    if (needs_normalized) {
+        normalized_messages = request.messages;
+        std::uint64_t media_nonce = 0x51a7c9e2f03b8d11ULL;
+        auto next_media_prefix = [&]() {
+            char buf[36];
+            std::snprintf(buf, sizeof(buf), "SNDRMM%016llxM", static_cast<unsigned long long>(media_nonce));
+            media_nonce = media_nonce * 6364136223846793005ULL + 1442695040888963407ULL;
+            return std::string(buf);
+        };
+        std::string sentinel_prefix = next_media_prefix();
+        auto prefix_collides = [&](std::string_view pfx) {
+            for (const auto& m : normalized_messages) {
+                if (m.content.find(pfx) != std::string::npos || m.role.find(pfx) != std::string::npos) return true;
+                for (const auto& part : m.parts) {
+                    if (const auto* tp = std::get_if<TextContentPart>(&part)) {
+                        if (tp->text.find(pfx) != std::string::npos) return true;
+                    }
+                }
+                for (const auto& tc : m.tool_calls) {
+                    if (tc.name.find(pfx) != std::string::npos || tc.arguments_json.find(pfx) != std::string::npos) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+        while (prefix_collides(sentinel_prefix)) {
+            sentinel_prefix = next_media_prefix();
+        }
+        for (auto& m : normalized_messages) {
+            if (!m.parts.empty()) {
+                std::string combined;
+                for (const auto& part : m.parts) {
+                    if (const auto* tp = std::get_if<TextContentPart>(&part)) {
+                        combined += tp->text;
+                    } else if (const auto* ip = std::get_if<ImageContentPart>(&part)) {
+                        const std::size_t blob_idx = plan.media_blobs.size();
+                        plan.media_blobs.push_back(ip->media.bytes);
+                        std::string tag = sentinel_prefix + "_" + std::to_string(blob_idx) + "_END";
+                        media_sentinels.emplace_back(tag, blob_idx);
+                        combined += tag;
+                    }
+                }
+                m.content = std::move(combined);
+            } else if (!m.media.empty()) {
+                std::string markers;
+                for (const auto& blob : m.media) {
+                    const std::size_t blob_idx = plan.media_blobs.size();
+                    plan.media_blobs.push_back(blob.bytes);
+                    std::string tag = sentinel_prefix + "_" + std::to_string(blob_idx) + "_END";
+                    media_sentinels.emplace_back(tag, blob_idx);
+                    markers += tag;
+                }
+                m.content = markers + m.content;
+            }
+            if (m.role == "assistant" && !m.tool_calls.empty()) {
+                std::string tool_text;
+                for (const auto& tc : m.tool_calls) {
+                    if (!tool_text.empty()) tool_text.push_back('\n');
+                    tool_text += "<tool_call>{\"name\":";
+                    tool_text += json::Value(tc.name).dump();
+                    tool_text += ",\"arguments\":";
+                    tool_text += tc.arguments_json.empty() ? "{}" : tc.arguments_json;
+                    tool_text += "}</tool_call>";
+                }
+                if (!m.content.empty()) {
+                    m.content += "\n" + tool_text;
+                } else {
+                    m.content = std::move(tool_text);
+                }
+            }
+        }
+        template_messages = &normalized_messages;
+    }
+
+    auto segments = build_chat_template_segments(
+        *template_messages,
+        [&](const std::vector<ChatMessage>& placeholder_msgs) -> Result<std::string> {
+            std::vector<lc::ChatTurn> turns;
+            turns.reserve(placeholder_msgs.size());
+            for (const auto& m : placeholder_msgs) turns.push_back(lc::ChatTurn{m.role, m.content});
+            auto rendered = apply_template ? apply_template(turns, /*add_assistant=*/true)
+                                           : Result<std::string>(Status(ErrorCode::invalid_argument,
+                                                                        "chat: template callback is empty"));
+            if (!rendered.ok()) {
+                plan.template_unsupported = true;
+                return rendered.status();
+            }
+            return rendered;
+        });
+    if (!segments.ok()) {
+        plan.status = segments.status();
+        return plan;
+    }
+
+    plan.segments = std::move(segments.value());
+    if (request.thinking.enable_thinking.has_value() && !*request.thinking.enable_thinking) {
+        ApplyNoThinkScaffolding(plan.segments, /*enable_thinking=*/false);
+    }
+
+    // Build G0028-safe structured multimodal parts preserving per-segment
+    // parse_special boundaries: trusted template scaffolding stays
+    // parse_special=true, untrusted message text stays parse_special=false,
+    // and media sentinels become explicit bitmap parts (zero marker parsing).
+    if (!plan.media_blobs.empty()) {
+        for (const auto& seg : plan.segments) {
+            if (seg.parse_special) {
+                if (!seg.text.empty()) {
+                    plan.media_prompt_parts.push_back(
+                        lc::GenerateRequest::MediaPromptPart{seg.text, /*parse_special=*/true, std::nullopt});
+                }
+                continue;
+            }
+            std::size_t cursor = 0;
+            while (cursor < seg.text.size()) {
+                std::size_t best_pos = std::string::npos;
+                std::size_t best_len = 0;
+                std::size_t best_blob = 0;
+                for (const auto& [tag, bidx] : media_sentinels) {
+                    const std::size_t p = seg.text.find(tag, cursor);
+                    if (p != std::string::npos && p < best_pos) {
+                        best_pos = p;
+                        best_len = tag.size();
+                        best_blob = bidx;
+                    }
+                }
+                if (best_pos == std::string::npos) {
+                    plan.media_prompt_parts.push_back(lc::GenerateRequest::MediaPromptPart{
+                        seg.text.substr(cursor), /*parse_special=*/false, std::nullopt});
+                    break;
+                }
+                if (best_pos > cursor) {
+                    plan.media_prompt_parts.push_back(lc::GenerateRequest::MediaPromptPart{
+                        seg.text.substr(cursor, best_pos - cursor), /*parse_special=*/false, std::nullopt});
+                }
+                plan.media_prompt_parts.push_back(
+                    lc::GenerateRequest::MediaPromptPart{{}, /*parse_special=*/false, best_blob});
+                cursor = best_pos + best_len;
+            }
+        }
+    }
+    return plan;
+}
 
 // Deterministic test factory allowing unit tests to inject a fake per-process
 // GPU memory probe and refresh cadence without live GPU counters or weights.

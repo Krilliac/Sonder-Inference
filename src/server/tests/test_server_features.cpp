@@ -53,6 +53,7 @@ struct CapturingBackend final : si::Backend {
         std::optional<std::string> last_rf_type;
         std::optional<std::string> last_rf_schema;
         std::string last_prompt;
+        std::vector<si::ChatMessage> last_messages;
 
         Model() {
             desc.name = "capture:test";
@@ -89,6 +90,7 @@ struct CapturingBackend final : si::Backend {
                 last_grammar = req.grammar;
                 last_rf_type = req.response_format_type;
                 last_rf_schema = req.response_format_schema;
+                last_messages = req.messages;
             }
             if (on_chunk) {
                 (void)on_chunk(si::TokenChunk{R"({"ok":true})", 0});
@@ -104,10 +106,13 @@ struct CapturingBackend final : si::Backend {
     };
 
     std::shared_ptr<Model> model = std::make_shared<Model>();
+    bool support_multimodal = false;
     std::string name() const override { return "capture-test"; }
     std::string description() const override { return "capturing test backend without embeddings/tokenization"; }
     si::BackendCapabilities capabilities() const override {
-        return si::BackendCapabilities{}.add(si::Capability::streaming).add(si::Capability::structured_output);
+        auto caps = si::BackendCapabilities{}.add(si::Capability::streaming).add(si::Capability::structured_output);
+        if (support_multimodal) caps.add(si::Capability::multimodal);
+        return caps;
     }
     si::Result<std::string> probe() override { return std::string("capture-1"); }
     si::Result<std::vector<si::ModelDescriptor>> list_models() override {
@@ -2553,4 +2558,107 @@ TEST_CASE("responses parity: timings, logprobs, reasoning_budget, admission tele
         CHECK(r2.json().find("error")->find("code")->as_string() == "unsupported_parameter");
         CHECK(r2.json().find("error")->find("param")->as_string() == "previous_response_id");
     }
+}
+
+TEST_CASE("multimodal vision: interleaved text and multiple images preserve order across Chat, Responses, and Anthropic ingress") {
+    constexpr const char* kTinyJpegBase64 = "/9j/4AAQ";  // bytes: FF D8 FF E0 00 10
+
+    auto backend = std::make_shared<CapturingBackend>();
+    backend->support_multimodal = true;
+    Fixture cap(capturing_options(backend));
+
+    const auto assert_interleaved_parts = [&](const si::ChatMessage& m) {
+        CHECK(m.content == "first middle last");
+        REQUIRE(m.media.size() == 2u);
+        REQUIRE(m.parts.size() == 5u);
+
+        const auto* t0 = std::get_if<si::TextContentPart>(&m.parts[0]);
+        const auto* i1 = std::get_if<si::ImageContentPart>(&m.parts[1]);
+        const auto* t2 = std::get_if<si::TextContentPart>(&m.parts[2]);
+        const auto* i3 = std::get_if<si::ImageContentPart>(&m.parts[3]);
+        const auto* t4 = std::get_if<si::TextContentPart>(&m.parts[4]);
+        REQUIRE(t0 != nullptr);
+        REQUIRE(i1 != nullptr);
+        REQUIRE(t2 != nullptr);
+        REQUIRE(i3 != nullptr);
+        REQUIRE(t4 != nullptr);
+        CHECK(t0->text == "first ");
+        CHECK(i1->media.mime_type == "image/png");
+        REQUIRE_FALSE(i1->media.bytes.empty());
+        CHECK(i1->media.bytes[0] == 0x89u);
+        CHECK(t2->text == "middle ");
+        CHECK(i3->media.mime_type == "image/jpeg");
+        CHECK(i3->media.bytes == std::vector<std::uint8_t>({0xFFu, 0xD8u, 0xFFu, 0xE0u, 0x00u, 0x10u}));
+        CHECK(t4->text == "last");
+    };
+
+    // 1. OpenAI /v1/chat/completions
+    {
+        const std::string body =
+            std::string(R"({"messages":[{"role":"user","content":[)") +
+            R"({"type":"text","text":"first "},)" +
+            R"({"type":"image_url","image_url":{"url":"data:image/png;base64,)" + kTinyPngBase64 + R"("}},)" +
+            R"({"type":"text","text":"middle "},)" +
+            R"({"type":"image_url","image_url":{"url":"data:image/jpeg;base64,)" + kTinyJpegBase64 + R"("}},)" +
+            R"({"type":"text","text":"last"})" +
+            R"(]}],"max_tokens":4})";
+        const Reply r = post(cap.port, "/v1/chat/completions", body);
+        REQUIRE_MESSAGE(r.status == 200, r.body);
+        std::lock_guard<std::mutex> lock(backend->model->mu);
+        REQUIRE(backend->model->last_messages.size() == 1u);
+        assert_interleaved_parts(backend->model->last_messages[0]);
+    }
+
+    // 2. OpenAI /v1/responses
+    {
+        const std::string body =
+            std::string(R"({"input":[{"role":"user","content":[)") +
+            R"({"type":"input_text","text":"first "},)" +
+            R"({"type":"input_image","image_url":"data:image/png;base64,)" + kTinyPngBase64 + R"("},)" +
+            R"({"type":"input_text","text":"middle "},)" +
+            R"({"type":"input_image","image_url":"data:image/jpeg;base64,)" + kTinyJpegBase64 + R"("},)" +
+            R"({"type":"input_text","text":"last"})" +
+            R"(]}],"max_output_tokens":4})";
+        const Reply r = post(cap.port, "/v1/responses", body);
+        REQUIRE_MESSAGE(r.status == 200, r.body);
+        std::lock_guard<std::mutex> lock(backend->model->mu);
+        REQUIRE(backend->model->last_messages.size() == 1u);
+        assert_interleaved_parts(backend->model->last_messages[0]);
+    }
+
+    // 3. Anthropic /v1/messages
+    {
+        const std::string body =
+            std::string(R"({"model":"capture:test","max_tokens":4,"messages":[{"role":"user","content":[)") +
+            R"({"type":"text","text":"first "},)" +
+            R"({"type":"image","source":{"type":"base64","media_type":"image/png","data":")" + kTinyPngBase64 + R"("}},)" +
+            R"({"type":"text","text":"middle "},)" +
+            R"({"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":")" + kTinyJpegBase64 + R"("}},)" +
+            R"({"type":"text","text":"last"})" +
+            R"(]}]})";
+        const Reply r = post(cap.port, "/v1/messages", body);
+        REQUIRE_MESSAGE(r.status == 200, r.body);
+        std::lock_guard<std::mutex> lock(backend->model->mu);
+        REQUIRE(backend->model->last_messages.size() == 1u);
+        assert_interleaved_parts(backend->model->last_messages[0]);
+    }
+
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+    // 4. External llamaserver serialization end-to-end preserves exact captured order.
+    {
+        si::ChatRequest forward;
+        {
+            std::lock_guard<std::mutex> lock(backend->model->mu);
+            forward.messages = backend->model->last_messages;
+        }
+        const auto payload = si::llamaserver::build_chat_body("m", forward);
+        const auto& content_arr = payload.find("messages")->as_array()[0].find("content")->as_array();
+        REQUIRE(content_arr.size() == 5u);
+        CHECK(content_arr[0].find("text")->as_string() == "first ");
+        CHECK(content_arr[1].find("image_url")->find("url")->as_string().rfind("data:image/png;base64,", 0) == 0);
+        CHECK(content_arr[2].find("text")->as_string() == "middle ");
+        CHECK(content_arr[3].find("image_url")->find("url")->as_string().rfind("data:image/jpeg;base64,", 0) == 0);
+        CHECK(content_arr[4].find("text")->as_string() == "last");
+    }
+#endif
 }
