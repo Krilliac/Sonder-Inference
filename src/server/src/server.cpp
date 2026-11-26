@@ -407,8 +407,7 @@ struct Server::Impl {
                                    "backend '" + pin.backend() + "' does not support logprobs", "logprobs"));
             return;
         }
-        const bool has_media = std::any_of(job.messages.begin(), job.messages.end(),
-                                           [](const ChatMessage& m) { return !m.media.empty(); });
+        const bool has_media = has_chat_media(job.messages);
         if (has_media && !backend_has_capability(Capability::multimodal)) {
             write_error(ex, make_error(400, "unsupported_parameter",
                                        "backend '" + pin.backend() + "' does not support multimodal image inputs",
@@ -543,8 +542,7 @@ struct Server::Impl {
                                        "backend '" + pin.backend() + "' does not support logprobs", "logprobs"));
             return;
         }
-        const bool has_media = std::any_of(job.input_messages.begin(), job.input_messages.end(),
-                                           [](const ChatMessage& m) { return !m.media.empty(); });
+        const bool has_media = has_chat_media(job.input_messages);
         if (has_media && !backend_has_capability(Capability::multimodal)) {
             write_error(ex, make_error(400, "unsupported_parameter",
                                        "backend '" + pin.backend() + "' does not support multimodal image inputs",

@@ -204,6 +204,13 @@ std::size_t ResponseHistoryStore::estimate_entry_bytes(const Entry& e) noexcept 
         for (const auto& blob : m.media) {
             total += blob.mime_type.size() + blob.bytes.size() + 16;
         }
+        for (const auto& part : m.parts) {
+            if (const auto* tp = std::get_if<TextContentPart>(&part)) {
+                total += tp->text.size() + 8;
+            } else if (const auto* ip = std::get_if<ImageContentPart>(&part)) {
+                total += ip->media.mime_type.size() + ip->media.bytes.size() + 16;
+            }
+        }
     }
     return total;
 }
@@ -266,6 +273,13 @@ void ResponseHistoryStore::put(Entry entry) {
     // Strip raw binary media blobs from retained history to prevent O(N^2) RAM
     // amplification across chained previous_response_id turns.
     for (auto& m : entry.messages) {
+        if (!m.parts.empty()) {
+            m.content = message_text_content(m);
+            std::erase_if(m.parts, [](const ContentPart& part) {
+                return std::holds_alternative<ImageContentPart>(part);
+            });
+            m.parts.shrink_to_fit();
+        }
         m.media.clear();
         m.media.shrink_to_fit();
     }
@@ -532,6 +546,7 @@ std::variant<ResponsesJob, ApiError> parse_responses_request_with_mode(std::stri
                             return bad("invalid_request", pwhere + ".text must be a string", pwhere + ".text");
                         }
                         msg.content += tv->as_string();
+                        msg.parts.push_back(TextContentPart{tv->as_string()});
                     } else if (pt == "input_image" || pt == "image_url") {
                         const json::Value* iu = part.find("image_url");
                         std::string_view url_str;
@@ -554,7 +569,9 @@ std::variant<ResponsesJob, ApiError> parse_responses_request_with_mode(std::stri
                         if (auto* err = std::get_if<ApiError>(&media)) {
                             return *err;
                         }
-                        msg.media.push_back(std::move(std::get<MediaContent>(media)));
+                        MediaContent parsed_media = std::move(std::get<MediaContent>(media));
+                        msg.parts.push_back(ImageContentPart{parsed_media});
+                        msg.media.push_back(std::move(parsed_media));
                     } else {
                         return bad("unsupported_parameter", pwhere + ".type '" + pt + "' is not supported",
                                    pwhere + ".type");
@@ -771,7 +788,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     }
     if (job.instructions && !job.instructions->empty()) {
         if (!conversation.empty() && conversation.front().role == "system") {
-            conversation.front().content = *job.instructions;
+            conversation.front() = ChatMessage{"system", *job.instructions};
         } else {
             conversation.insert(conversation.begin(), ChatMessage{"system", *job.instructions});
         }
@@ -790,7 +807,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     }
     std::size_t accumulated_images = 0;
     for (const auto& m : conversation) {
-        accumulated_images += m.media.size();
+        accumulated_images += count_message_images(m);
     }
     if (accumulated_images > 8u) {
         ex.leave_inflight();
@@ -819,7 +836,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     if (parse_text_tools) {
         const std::string tool_prompt = format_tools_system_prompt(job.tools, job.tool_choice);
         if (!conversation.empty() && conversation.front().role == "system") {
-            conversation.front().content += "\n\n" + tool_prompt;
+            append_chat_message_text(conversation.front(), "\n\n" + tool_prompt);
         } else {
             conversation.insert(conversation.begin(), ChatMessage{"system", tool_prompt});
         }

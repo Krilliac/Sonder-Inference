@@ -426,7 +426,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
         prepared_messages = job.messages;
         const std::string tool_prompt = format_tools_system_prompt(job.tools, job.tool_choice);
         if (!prepared_messages.empty() && prepared_messages.front().role == "system") {
-            prepared_messages.front().content += "\n\n" + tool_prompt;
+            append_chat_message_text(prepared_messages.front(), "\n\n" + tool_prompt);
         } else {
             prepared_messages.insert(prepared_messages.begin(), ChatMessage{"system", tool_prompt});
         }

@@ -544,6 +544,7 @@ std::variant<ChatJob, ApiError> parse_chat_request_with_mode(std::string_view bo
                         return bad("invalid_messages", pwhere + ".text must be a string", pwhere + ".text");
                     }
                     msg.content += text->as_string();
+                    msg.parts.push_back(TextContentPart{text->as_string()});
                 } else if (ptype->as_string() == "image_url") {
                     const json::Value* iu = parts[j].find("image_url");
                     const json::Value* url = (iu != nullptr && iu->is_object()) ? iu->find("url") : nullptr;
@@ -560,7 +561,9 @@ std::variant<ChatJob, ApiError> parse_chat_request_with_mode(std::string_view bo
                     if (auto* err = std::get_if<ApiError>(&media)) {
                         return *err;
                     }
-                    msg.media.push_back(std::move(std::get<MediaContent>(media)));
+                    MediaContent parsed_media = std::move(std::get<MediaContent>(media));
+                    msg.parts.push_back(ImageContentPart{parsed_media});
+                    msg.media.push_back(std::move(parsed_media));
                 } else {
                     return bad("unsupported_parameter",
                                pwhere + ".type '" + ptype->as_string() + "' is not supported", pwhere + ".type");

@@ -480,6 +480,10 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     lo.use_mmap = o.use_mmap;
     lo.kv_unified = o.kv_unified;
     lo.prefix_cache = o.prefix_cache;
+    lo.prefix_coalesce = o.prefix_coalesce;
+    lo.min_coalesce_prefix_tokens = o.min_coalesce_prefix_tokens;
+    lo.max_followers_per_producer = o.max_followers_per_producer;
+    lo.max_coalesce_wait_ms = o.max_coalesce_wait_ms;
     lo.n_slots = o.slots;
     lo.spec_type = o.spec_type;
     lo.spec_draft_max = o.spec_draft_max;
@@ -651,142 +655,29 @@ public:
         } else {
             exclusive_guard = std::unique_lock<std::shared_mutex>(mutex_);
         }
-        std::vector<std::vector<std::uint8_t>> media_blobs;
-        std::vector<std::pair<std::string, std::size_t>> media_sentinels;
-        std::vector<ChatMessage> normalized_messages;
-        const std::vector<ChatMessage>* template_messages = &request.messages;
-        bool needs_normalized = false;
-        for (const auto& m : request.messages) {
-            if (!m.media.empty() || !m.tool_calls.empty()) {
-                needs_normalized = true;
-                break;
-            }
-        }
-        if (needs_normalized) {
-            normalized_messages = request.messages;
-            std::uint64_t media_nonce = 0x51a7c9e2f03b8d11ULL;
-            auto next_media_prefix = [&]() {
-                char buf[36];
-                std::snprintf(buf, sizeof(buf), "SNDRMM%016llxM", static_cast<unsigned long long>(media_nonce));
-                media_nonce = media_nonce * 6364136223846793005ULL + 1442695040888963407ULL;
-                return std::string(buf);
-            };
-            std::string sentinel_prefix = next_media_prefix();
-            auto prefix_collides = [&](std::string_view pfx) {
-                for (const auto& m : normalized_messages) {
-                    if (m.content.find(pfx) != std::string::npos || m.role.find(pfx) != std::string::npos) return true;
-                }
-                return false;
-            };
-            while (prefix_collides(sentinel_prefix)) {
-                sentinel_prefix = next_media_prefix();
-            }
-            for (auto& m : normalized_messages) {
-                if (!m.media.empty()) {
-                    std::string markers;
-                    for (const auto& blob : m.media) {
-                        const std::size_t blob_idx = media_blobs.size();
-                        media_blobs.push_back(blob.bytes);
-                        std::string tag = sentinel_prefix + "_" + std::to_string(blob_idx) + "_END";
-                        media_sentinels.emplace_back(tag, blob_idx);
-                        markers += tag;
-                    }
-                    m.content = markers + m.content;
-                }
-                if (m.role == "assistant" && !m.tool_calls.empty()) {
-                    std::string tool_text;
-                    for (const auto& tc : m.tool_calls) {
-                        if (!tool_text.empty()) tool_text.push_back('\n');
-                        tool_text += "<tool_call>{\"name\":";
-                        tool_text += json::Value(tc.name).dump();
-                        tool_text += ",\"arguments\":";
-                        tool_text += tc.arguments_json.empty() ? "{}" : tc.arguments_json;
-                        tool_text += "}</tool_call>";
-                    }
-                    if (!m.content.empty()) {
-                        m.content += "\n" + tool_text;
-                    } else {
-                        m.content = std::move(tool_text);
-                    }
-                }
-            }
-            template_messages = &normalized_messages;
-        }
-        bool template_unsupported = false;
-        auto segments = build_chat_template_segments(
-            *template_messages,
-            [&](const std::vector<ChatMessage>& placeholder_msgs) -> Result<std::string> {
-                std::vector<lc::ChatTurn> turns;
-                turns.reserve(placeholder_msgs.size());
-                for (const auto& m : placeholder_msgs) turns.push_back(lc::ChatTurn{m.role, m.content});
+        llamacpp_detail::DirectChatPromptPlan plan = llamacpp_detail::BuildDirectChatPromptPlan(
+            request,
+            [&](const std::vector<lc::ChatTurn>& turns, bool add_assistant) -> Result<std::string> {
                 std::string rendered;
-                const lc::Status s = runtime_.ApplyChatTemplate(turns, /*add_assistant=*/true, rendered);
-                if (!s.ok()) {
-                    template_unsupported = true;
-                    return ToStatus(s);
-                }
+                const lc::Status s = runtime_.ApplyChatTemplate(turns, add_assistant, rendered);
+                if (!s.ok()) return ToStatus(s);
                 return rendered;
             });
-        if (!segments.ok()) {
-            if (template_unsupported) {
+        if (!plan.status.ok()) {
+            if (plan.template_unsupported) {
                 if (shared_guard.owns_lock()) shared_guard.unlock();
                 if (exclusive_guard.owns_lock()) exclusive_guard.unlock();
-                if (!media_blobs.empty()) {
+                if (!plan.media_blobs.empty()) {
                     return Status(ErrorCode::invalid_argument,
                                   "multimodal chat requires a model with a chat template");
                 }
                 return BackendModel::chat(request, cancel, on_chunk);
             }
-            return segments.status();
-        }
-        if (request.thinking.enable_thinking.has_value() && !*request.thinking.enable_thinking) {
-            ApplyNoThinkScaffolding(segments.value(), /*enable_thinking=*/false);
-        }
-        // Build G0028-safe structured multimodal parts preserving per-segment
-        // parse_special boundaries: trusted template scaffolding stays
-        // parse_special=true, untrusted message text stays parse_special=false,
-        // and media sentinels become explicit bitmap parts (zero marker parsing).
-        std::vector<lc::GenerateRequest::MediaPromptPart> media_prompt_parts;
-        if (!media_blobs.empty()) {
-            for (const auto& seg : segments.value()) {
-                if (seg.parse_special) {
-                    if (!seg.text.empty()) {
-                        media_prompt_parts.push_back(
-                            lc::GenerateRequest::MediaPromptPart{seg.text, /*parse_special=*/true, std::nullopt});
-                    }
-                    continue;
-                }
-                std::size_t cursor = 0;
-                while (cursor < seg.text.size()) {
-                    std::size_t best_pos = std::string::npos;
-                    std::size_t best_len = 0;
-                    std::size_t best_blob = 0;
-                    for (const auto& [tag, bidx] : media_sentinels) {
-                        const std::size_t p = seg.text.find(tag, cursor);
-                        if (p != std::string::npos && p < best_pos) {
-                            best_pos = p;
-                            best_len = tag.size();
-                            best_blob = bidx;
-                        }
-                    }
-                    if (best_pos == std::string::npos) {
-                        media_prompt_parts.push_back(lc::GenerateRequest::MediaPromptPart{
-                            seg.text.substr(cursor), /*parse_special=*/false, std::nullopt});
-                        break;
-                    }
-                    if (best_pos > cursor) {
-                        media_prompt_parts.push_back(lc::GenerateRequest::MediaPromptPart{
-                            seg.text.substr(cursor, best_pos - cursor), /*parse_special=*/false, std::nullopt});
-                    }
-                    media_prompt_parts.push_back(
-                        lc::GenerateRequest::MediaPromptPart{{}, /*parse_special=*/false, best_blob});
-                    cursor = best_pos + best_len;
-                }
-            }
+            return plan.status;
         }
         std::vector<lc::Token> prompt_tokens;
         const Status tok_status = tokenize_chat_segments(
-            segments.value(),
+            plan.segments,
             [&](std::string_view piece, bool add_special, bool parse_special, std::vector<TokenId>& out) -> Status {
                 return ToStatus(runtime_.Tokenize(piece, add_special, out, parse_special));
             },
@@ -794,7 +685,7 @@ public:
         if (!tok_status.ok()) return tok_status;
         return run_tokens(std::move(prompt_tokens), request.sampling, cancel, on_chunk, request.session_key,
                           request.grammar, request.separate_reasoning, /*checkpoint=*/nullptr,
-                          std::move(media_blobs), {}, std::move(media_prompt_parts));
+                          std::move(plan.media_blobs), {}, std::move(plan.media_prompt_parts));
     }
 
     [[nodiscard]] bool has_native_chat() const override { return native_chat_; }

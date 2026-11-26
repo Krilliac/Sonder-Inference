@@ -60,6 +60,12 @@ struct LlamaCppBackendOptions {
     bool kv_unified = true;
     // Reuse longest matching prompt KV prefix across consecutive turns.
     bool prefix_cache = true;
+    // Coalesce simultaneous cold shared-prefix prefills on attention-only models
+    // (requires slots > 1 and prefix_cache = true; bypassed on hybrid/recurrent).
+    bool prefix_coalesce = true;
+    std::uint32_t min_coalesce_prefix_tokens = 64;
+    std::uint32_t max_followers_per_producer = 8;
+    std::uint32_t max_coalesce_wait_ms = 5000;
     // Number of cached KV sequence slots (1..16). Values > 1 allow interleaved
     // conversations (matched by session_key or longest common prefix) without
     // evicting each other's prefix cache.

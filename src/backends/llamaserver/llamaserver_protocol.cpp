@@ -148,21 +148,40 @@ json::Value build_chat_body(const std::string &model, const ChatRequest &request
     json::Array messages;
     for (const auto &m : request.messages) {
         json::Object message{{"role", m.role}};
-        if (!m.media.empty()) {
+        const auto append_image_part = [](json::Array &parts, const MediaContent &img) {
+            const std::string data_uri = "data:" + img.mime_type + ";base64," + encode_base64_bytes(img.bytes);
+            parts.emplace_back(
+                json::Object{{"type", "image_url"}, {"image_url", json::Object{{"url", data_uri}}}});
+        };
+        const bool has_images = count_message_images(m) > 0;
+        if (has_images && !m.parts.empty()) {
+            json::Array parts;
+            for (const auto &part : m.parts) {
+                if (const auto *tp = std::get_if<TextContentPart>(&part)) {
+                    if (!tp->text.empty()) {
+                        parts.emplace_back(json::Object{{"type", "text"}, {"text", tp->text}});
+                    }
+                } else if (const auto *ip = std::get_if<ImageContentPart>(&part)) {
+                    append_image_part(parts, ip->media);
+                }
+            }
+            message.set("content", std::move(parts));
+        } else if (!m.media.empty()) {
             json::Array parts;
             if (!m.content.empty()) {
                 parts.emplace_back(json::Object{{"type", "text"}, {"text", m.content}});
             }
             for (const auto &img : m.media) {
-                const std::string data_uri = "data:" + img.mime_type + ";base64," + encode_base64_bytes(img.bytes);
-                parts.emplace_back(
-                    json::Object{{"type", "image_url"}, {"image_url", json::Object{{"url", data_uri}}}});
+                append_image_part(parts, img);
             }
             message.set("content", std::move(parts));
-        } else if (m.role == "assistant" && m.content.empty() && !m.tool_calls.empty()) {
-            message.set("content", nullptr);
         } else {
-            message.set("content", m.content);
+            const std::string text_content = message_text_content(m);
+            if (m.role == "assistant" && text_content.empty() && !m.tool_calls.empty()) {
+                message.set("content", nullptr);
+            } else {
+                message.set("content", text_content);
+            }
         }
         if (m.role == "assistant" && m.reasoning_content)
             message.set("reasoning_content", *m.reasoning_content);

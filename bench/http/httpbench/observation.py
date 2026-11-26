@@ -8,15 +8,52 @@ unknown data and file truncation honestly.
 
 from __future__ import annotations
 
+import hashlib
 import http.client
+import json
 import math
 import os
 import re
+import subprocess
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+
+from .metrics import classify_cache_state
+
+
+PROVENANCE_SCHEMA = "sonder.bench.http.provenance/1"
+
+REQUIRED_PROVENANCE_FIELDS = (
+    "source_commit",
+    "upstream_revision_or_digest",
+    "model_sha256",
+    "draft_sha256",
+    "resolved_settings",
+    "effective_settings",
+    "corpus_revision",
+    "sample_count",
+    "timing_definition",
+    "validation_outcome",
+)
+
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+DEFAULT_TIMING_DEFINITION: dict[str, str] = {
+    "client_ttft_ms": "monotonic elapsed ms from HTTP request write to first token-bearing SSE delta (content, reasoning_content, or tool_calls)",
+    "client_itl_ms": "monotonic gap ms between consecutive token-bearing SSE chunks divided by tokens carried in the arriving chunk",
+    "client_e2e_ms": "monotonic elapsed ms from HTTP request write to stream completion ([DONE] or final stop event)",
+    "backend_prefill_ms": "server-reported timings.prompt_ms (backend prompt evaluation compute, excluding network/queue)",
+    "backend_decode_ms": "server-reported timings.predicted_ms (backend token generation compute, excluding network/queue)",
+    "backend_compute_ms": "backend_prefill_ms + backend_decode_ms when both are reported by the server (null/unknown when absent)",
+    "committed_output_tokens": "target-verified output tokens emitted to the client (usage.completion_tokens / timings.predicted_n)",
+    "proposed_draft_tokens": "speculative draft tokens proposed before verification (timings.draft_n; null/unknown when unreported)",
+    "cold_vs_warm_rule": "explicit cache_state/cold flag, else turn/repeat index (1=cold, >=2=warm), else reported cached tokens (>0=warm, 0=cold, null=unclassified)",
+    "percentiles": "linear interpolation (numpy default linear method) over ok requests; ITL pooled across token gaps of ok requests",
+}
 
 
 _METRIC = re.compile(
@@ -225,3 +262,325 @@ class ChildLogProbe:
 def child_log_delta(probe: ChildLogProbe, before: dict[str, Any], after: dict[str, Any] | None = None) -> dict[str, Any]:
     """Functional alias useful to callers that keep probes in a registry."""
     return probe.delta(before, after)
+
+
+# ------------------------------------------------------------------ provenance
+
+def sha256_file(path: str | os.PathLike[str], chunk_size: int = 1024 * 1024) -> str:
+    """Compute a streaming lowercase SHA-256 hex digest of a local file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while True:
+            chunk = stream.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def validate_sha256_hex(value: str, *, allow_special: tuple[str, ...] = ()) -> str:
+    """Validate a 64-char SHA-256 hex digest (or an explicitly allowed sentinel)."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("SHA-256 digest must be a non-empty string")
+    cleaned = value.strip().lower()
+    if cleaned in allow_special:
+        return cleaned
+    if not _SHA256_RE.fullmatch(cleaned):
+        allowed = f" or one of {allow_special}" if allow_special else ""
+        raise ValueError(f"invalid SHA-256 digest {value!r}: expected 64 hex chars{allowed}")
+    return cleaned
+
+
+def corpus_revision_for(cfg: dict[str, Any]) -> str:
+    """Deterministic SHA-256 revision tag over canonical scenario configuration JSON."""
+    canonical = json.dumps(cfg, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def detect_git_commit(cwd: str | None = None) -> str:
+    """Best-effort current git HEAD commit SHA, or ``unknown`` when unavailable."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=cwd or os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    if proc.returncode != 0:
+        return "unknown"
+    sha = proc.stdout.strip().lower()
+    return sha if _GIT_SHA_RE.fullmatch(sha) else "unknown"
+
+
+def _extract_sonder_identity(server: dict[str, Any]) -> dict[str, Any]:
+    sid = (server.get("sonder_identity") or {}).get("body")
+    return sid if isinstance(sid, dict) else {}
+
+
+def _extract_props_body(server: dict[str, Any]) -> dict[str, Any]:
+    props = (server.get("props") or {}).get("body")
+    return props if isinstance(props, dict) else {}
+
+
+def _missing_provenance_fields(record: dict[str, Any]) -> list[str]:
+    missing = []
+    for key in ("source_commit", "upstream_revision_or_digest", "model_sha256", "draft_sha256"):
+        val = record.get(key)
+        if not isinstance(val, str) or not val.strip() or val.strip().lower() == "unknown":
+            missing.append(key)
+    return missing
+
+
+def summarize_validation_outcome(
+    checks: list[dict[str, Any]],
+    verdict_value: str,
+    provenance: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the structured ``validation_outcome`` sub-record from final checks."""
+    passed = [c["check"] for c in checks if c.get("status") == "pass"]
+    warned = [c["check"] for c in checks if c.get("status") == "warn"]
+    failed = [c["check"] for c in checks if c.get("status") == "fail"]
+    skipped = [c["check"] for c in checks if c.get("status") == "skip"]
+    missing = _missing_provenance_fields(provenance)
+    return {
+        "verdict": verdict_value,
+        "checks_total": len(checks),
+        "checks_passed": len(passed),
+        "checks_warned": len(warned),
+        "checks_failed": len(failed),
+        "checks_skipped": len(skipped),
+        "failed_checks": failed,
+        "warned_checks": warned,
+        "provenance_complete": len(missing) == 0,
+        "missing_provenance_fields": missing,
+    }
+
+
+def _sample_counts(results: dict[str, Any]) -> dict[str, int]:
+    scenarios = results.get("scenarios") or []
+    expected = sum(int(s.get("expected_requests") or 0) for s in scenarios)
+    reqs = [r for s in scenarios for r in (s.get("requests") or [])]
+    ok_reqs = [r for r in reqs if r.get("ok")]
+    cold = 0
+    warm = 0
+    unclassified = 0
+    for r in ok_reqs:
+        state = classify_cache_state(r)
+        if state == "cold":
+            cold += 1
+        elif state == "warm":
+            warm += 1
+        else:
+            unclassified += 1
+    return {
+        "expected": expected,
+        "completed": len(reqs),
+        "ok": len(ok_reqs),
+        "failed": len(reqs) - len(ok_reqs),
+        "cold": cold,
+        "warm": warm,
+        "unclassified": unclassified,
+    }
+
+
+def build_provenance(
+    results: dict[str, Any],
+    cfg: dict[str, Any],
+    *,
+    checks: list[dict[str, Any]] | None = None,
+    verdict_value: str = "pass",
+    overrides: dict[str, Any] | None = None,
+    cwd: str | None = None,
+) -> dict[str, Any]:
+    """Assemble the strict reproducible benchmark provenance record."""
+    ov = dict(overrides or {})
+    server = results.get("server") or {}
+    target = results.get("target") or {}
+    props = _extract_props_body(server)
+    sid = _extract_sonder_identity(server)
+    backend_id = sid.get("backend_identity") if isinstance(sid.get("backend_identity"), dict) else {}
+
+    source_commit = str(ov.get("source_commit") or "").strip() or detect_git_commit(cwd)
+
+    upstream = str(ov.get("upstream_revision_or_digest") or "").strip()
+    if not upstream and ov.get("upstream_exe"):
+        upstream = "sha256:" + sha256_file(ov["upstream_exe"])
+    if not upstream:
+        for candidate in (
+            server.get("build_info"),
+            backend_id.get("upstream_revision"),
+            backend_id.get("executable_sha256"),
+            backend_id.get("version"),
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                upstream = candidate.strip()
+                break
+    if not upstream:
+        upstream = "unknown"
+
+    model_sha256 = "unknown"
+    if ov.get("model_sha256"):
+        model_sha256 = validate_sha256_hex(str(ov["model_sha256"]), allow_special=("unknown",))
+    elif ov.get("model_file"):
+        model_sha256 = sha256_file(ov["model_file"])
+    else:
+        for candidate in (backend_id.get("model_sha256"), sid.get("model_sha256")):
+            if isinstance(candidate, str) and _SHA256_RE.fullmatch(candidate.strip()):
+                model_sha256 = candidate.strip().lower()
+                break
+
+    draft_sha256 = "none"
+    if ov.get("draft_sha256"):
+        draft_sha256 = validate_sha256_hex(str(ov["draft_sha256"]), allow_special=("none", "unknown"))
+    elif ov.get("draft_file"):
+        draft_sha256 = sha256_file(ov["draft_file"])
+    else:
+        found_digest = None
+        for candidate in (backend_id.get("draft_sha256"), sid.get("draft_sha256")):
+            if isinstance(candidate, str) and _SHA256_RE.fullmatch(candidate.strip()):
+                found_digest = candidate.strip().lower()
+                break
+        if found_digest is not None:
+            draft_sha256 = found_digest
+        elif backend_id.get("draft_model") or backend_id.get("draft_model_path") or props.get("draft_model_path"):
+            draft_sha256 = "unknown"
+
+    resolved_settings: dict[str, Any] = {
+        "base_url": target.get("base_url"),
+        "model": target.get("model"),
+        "ctx_size": server.get("n_ctx"),
+        "ctx_source": server.get("ctx_source"),
+        "defaults": dict(target.get("defaults") or {}),
+        "extra_body": dict(target.get("extra_body") or {}),
+        "prompt_sizing": results.get("prompt_sizing"),
+        "total_slots": props.get("total_slots"),
+        "server_default_generation_settings": props.get("default_generation_settings"),
+    }
+    if isinstance(ov.get("resolved_settings"), dict):
+        resolved_settings.update(ov["resolved_settings"])
+
+    all_reqs = [r for s in (results.get("scenarios") or []) for r in (s.get("requests") or [])]
+    ok_reqs = [r for r in all_reqs if r.get("ok")]
+    observed_models = sorted({str(r["model"]) for r in ok_reqs if r.get("model")})
+    observed_warnings: list[Any] = []
+    for r in all_reqs:
+        w = r.get("sonder_warnings")
+        if isinstance(w, list):
+            for item in w:
+                if item not in observed_warnings:
+                    observed_warnings.append(item)
+        elif w and w not in observed_warnings:
+            observed_warnings.append(w)
+
+    proposed_vals = [r.get("proposed_draft_tokens") for r in ok_reqs if r.get("proposed_draft_tokens") is not None]
+    if not proposed_vals:
+        draft_active: Any = "unknown"
+    else:
+        draft_active = any(v > 0 for v in proposed_vals)
+
+    cached_vals = [r.get("cached_tokens") for r in ok_reqs if r.get("cached_tokens") is not None]
+    if not cached_vals:
+        cache_active: Any = "unknown"
+    else:
+        cache_active = any(v > 0 for v in cached_vals)
+
+    dgs = props.get("default_generation_settings") if isinstance(props.get("default_generation_settings"), dict) else {}
+    effective_settings: dict[str, Any] = {
+        "observed_models": observed_models,
+        "server_n_ctx": server.get("n_ctx"),
+        "server_total_slots": props.get("total_slots"),
+        "server_speculative": dgs.get("speculative", "unknown"),
+        "sonder_warnings": observed_warnings,
+        "draft_observed_active": draft_active,
+        "prefix_cache_observed_active": cache_active,
+    }
+    if isinstance(ov.get("effective_settings"), dict):
+        effective_settings.update(ov["effective_settings"])
+
+    corpus_rev = str(ov.get("corpus_revision") or cfg.get("corpus_revision") or "").strip()
+    if not corpus_rev:
+        corpus_rev = corpus_revision_for(cfg)
+
+    record: dict[str, Any] = {
+        "schema": PROVENANCE_SCHEMA,
+        "source_commit": source_commit,
+        "upstream_revision_or_digest": upstream,
+        "model_sha256": model_sha256,
+        "draft_sha256": draft_sha256,
+        "resolved_settings": resolved_settings,
+        "effective_settings": effective_settings,
+        "corpus_revision": corpus_rev,
+        "sample_count": _sample_counts(results),
+        "timing_definition": dict(DEFAULT_TIMING_DEFINITION),
+    }
+    record["validation_outcome"] = summarize_validation_outcome(checks or [], verdict_value, record)
+    return record
+
+
+def validate_provenance(record: Any, *, strict: bool = False) -> list[str]:
+    """Validate a benchmark provenance record against the strict schema contract."""
+    if not isinstance(record, dict):
+        return ["provenance must be a JSON object"]
+    errs: list[str] = []
+    if record.get("schema") != PROVENANCE_SCHEMA:
+        errs.append(f"provenance.schema must be {PROVENANCE_SCHEMA!r}, got {record.get('schema')!r}")
+    for key in REQUIRED_PROVENANCE_FIELDS:
+        if key not in record:
+            errs.append(f"provenance missing required field {key!r}")
+    for key in ("source_commit", "upstream_revision_or_digest", "corpus_revision"):
+        val = record.get(key)
+        if not isinstance(val, str) or not val.strip():
+            errs.append(f"provenance.{key} must be a non-empty string")
+    model_sha = record.get("model_sha256")
+    if not isinstance(model_sha, str):
+        errs.append("provenance.model_sha256 must be a string")
+    else:
+        try:
+            validate_sha256_hex(model_sha, allow_special=("unknown",))
+        except ValueError as exc:
+            errs.append(f"provenance.model_sha256 invalid: {exc}")
+    draft_sha = record.get("draft_sha256")
+    if not isinstance(draft_sha, str):
+        errs.append("provenance.draft_sha256 must be a string")
+    else:
+        try:
+            validate_sha256_hex(draft_sha, allow_special=("none", "unknown"))
+        except ValueError as exc:
+            errs.append(f"provenance.draft_sha256 invalid: {exc}")
+    for key in ("resolved_settings", "effective_settings", "timing_definition"):
+        if not isinstance(record.get(key), dict) or not record[key]:
+            errs.append(f"provenance.{key} must be a non-empty object")
+    sc = record.get("sample_count")
+    if not isinstance(sc, dict):
+        errs.append("provenance.sample_count must be an object")
+    else:
+        for k in ("expected", "completed", "ok", "failed", "cold", "warm", "unclassified"):
+            v = sc.get(k)
+            if type(v) is not int or v < 0:
+                errs.append(f"provenance.sample_count.{k} must be a non-negative integer")
+        if all(type(sc.get(k)) is int for k in ("completed", "ok", "failed")):
+            if sc["ok"] + sc["failed"] != sc["completed"]:
+                errs.append("provenance.sample_count ok + failed must equal completed")
+        if all(type(sc.get(k)) is int for k in ("ok", "cold", "warm", "unclassified")):
+            if sc["cold"] + sc["warm"] + sc["unclassified"] != sc["ok"]:
+                errs.append("provenance.sample_count cold + warm + unclassified must equal ok")
+    vo = record.get("validation_outcome")
+    if not isinstance(vo, dict):
+        errs.append("provenance.validation_outcome must be an object")
+    else:
+        if vo.get("verdict") not in ("pass", "warn", "fail"):
+            errs.append(f"provenance.validation_outcome.verdict invalid: {vo.get('verdict')!r}")
+        for k in ("checks_total", "checks_passed", "checks_warned", "checks_failed", "checks_skipped"):
+            if type(vo.get(k)) is not int or vo[k] < 0:
+                errs.append(f"provenance.validation_outcome.{k} must be a non-negative integer")
+        if not isinstance(vo.get("provenance_complete"), bool):
+            errs.append("provenance.validation_outcome.provenance_complete must be a boolean")
+    if strict:
+        missing = _missing_provenance_fields(record)
+        if missing:
+            errs.append(f"strict provenance requires known values for {missing}")
+    return errs
