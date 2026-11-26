@@ -465,7 +465,7 @@ public:
 
         const ToolDefinition* chosen = nullptr;
         const ChatMessage& last_msg = request.messages.back();
-        const std::string last_lower = lower_ascii(last_msg.content);
+        const std::string last_lower = lower_ascii(message_text_content(last_msg));
 
         if (mode == ToolChoiceMode::function) {
             for (const auto& t : request.tools) {

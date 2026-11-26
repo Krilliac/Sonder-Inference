@@ -1878,19 +1878,26 @@ TEST_CASE("security hardening: tool_call_parser embedded close tag, gbnf regex/s
         CHECK_FALSE(store.get("r_big").has_value());
         CHECK(store.get("r_big2").has_value());
 
-        // Media blobs are stripped before retention.
+        // Media blobs are stripped before retention (both legacy media and ordered ImageContentPart).
         ResponseHistoryStore::Entry with_media;
         with_media.id = "r_media";
         with_media.session_key = "sk";
         with_media.model = "m";
-        ChatMessage m{"user", "look"};
+        ChatMessage m{"user", "look after"};
         m.media.push_back(MediaContent{"image/png", {1, 2, 3, 4}});
+        m.parts = {
+            TextContentPart{"look"},
+            ImageContentPart{MediaContent{"image/png", {1, 2, 3, 4}}},
+            TextContentPart{" after"},
+        };
         with_media.messages.push_back(std::move(m));
         store.put(with_media);
         auto got = store.get("r_media");
         REQUIRE(got.has_value());
         REQUIRE(got->messages.size() == 1u);
         CHECK(got->messages[0].media.empty());
+        CHECK(count_message_images(got->messages[0]) == 0u);
+        CHECK(message_text_content(got->messages[0]) == "look after");
     }
 }
 
