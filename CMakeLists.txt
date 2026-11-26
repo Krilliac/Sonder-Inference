@@ -38,21 +38,7 @@ option(SONDER_WITH_LLAMA_CPP "Build the direct llama.cpp backend" OFF)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(SonderWarnings)
 include(SonderModules)
-
-# Record the source commit for telemetry/benchmark provenance.
-set(SONDER_GIT_COMMIT "unknown")
-find_package(Git QUIET)
-if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
-    execute_process(
-        COMMAND "${GIT_EXECUTABLE}" rev-parse --short=12 HEAD
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        OUTPUT_VARIABLE SONDER_GIT_COMMIT
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET)
-    if(NOT SONDER_GIT_COMMIT)
-        set(SONDER_GIT_COMMIT "unknown")
-    endif()
-endif()
+include(SonderBuildInfo)
 
 add_library(sonder_inference
     src/common/error.cpp
@@ -80,8 +66,9 @@ target_compile_features(sonder_inference PUBLIC cxx_std_20)
 target_compile_definitions(sonder_inference
     PRIVATE
         SONDER_INFERENCE_BUILDING
-        SONDER_INFERENCE_VERSION="${PROJECT_VERSION}"
-        SONDER_INFERENCE_GIT_COMMIT="${SONDER_GIT_COMMIT}")
+        SONDER_INFERENCE_VERSION="${PROJECT_VERSION}")
+# The commit lives in one generated TU, not a compile definition (cmake/SonderBuildInfo.cmake).
+sonder_add_build_commit(sonder_inference)
 if(BUILD_SHARED_LIBS)
     target_compile_definitions(sonder_inference PUBLIC SONDER_INFERENCE_SHARED)
 endif()
