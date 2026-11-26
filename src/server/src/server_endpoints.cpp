@@ -356,6 +356,20 @@ ApiError load_failure_error(const std::string& id, const Status& st) {
                           "; nothing was executed, the request is safe to send elsewhere");
 }
 
+json::Object resource_footprint_json(const ResourceFootprint& f) {
+    return json::Object{{"weights_bytes", f.weights_bytes},
+                        {"kv_cache_bytes", f.kv_cache_bytes},
+                        {"workspace_bytes", f.workspace_bytes},
+                        {"projector_bytes", f.projector_bytes},
+                        {"adapter_bytes", f.adapter_bytes},
+                        {"total_bytes", f.total_bytes()}};
+}
+
+json::Object model_footprint_json(const ModelResourceFootprint& fp) {
+    return json::Object{{"vram", resource_footprint_json(fp.vram)},
+                        {"ram", resource_footprint_json(fp.ram)}};
+}
+
 json::Array build_health_models(const ModelResidency& residency) {
     json::Array models;
     for (const auto& m : residency.snapshot()) {
@@ -367,7 +381,14 @@ json::Array build_health_models(const ModelResidency& residency) {
         entry.set("loads", m.loads);
         entry.set("load_failures", m.load_failures);
         entry.set("evictions", m.evictions);
+        entry.set("admission_rejections", m.admission_rejections);
         entry.set("idle_s", m.idle_s ? json::Value(*m.idle_s) : json::Value(nullptr));
+        entry.set("reload_ms", m.reload_ms);
+        entry.set("demand_score", m.demand_score);
+        entry.set("demand_rate_per_min", m.demand_rate_per_min);
+        entry.set("footprint",
+                  model_footprint_json(m.state == ResidencyState::loading ? m.reserved_footprint
+                                                                          : m.observed_footprint));
         entry.set("model_instance_id",
                   m.model_instance_id.empty() ? json::Value(nullptr) : json::Value(m.model_instance_id));
         models.emplace_back(std::move(entry));
@@ -383,13 +404,22 @@ json::Object build_residency_summary(const ServerOptions& opts, const ModelResid
         {"idle_ttl_s", c.idle_ttl.count() > 0 ? json::Value(std::chrono::duration<double>(c.idle_ttl).count())
                                               : json::Value(nullptr)},
         {"max_resident", c.max_resident > 0 ? json::Value(c.max_resident) : json::Value(nullptr)},
+        {"max_resident_vram_bytes",
+         c.max_resident_vram_bytes > 0 ? json::Value(c.max_resident_vram_bytes) : json::Value(nullptr)},
+        {"max_resident_ram_bytes",
+         c.max_resident_ram_bytes > 0 ? json::Value(c.max_resident_ram_bytes) : json::Value(nullptr)},
         {"registered", t.registered},
         {"resident", t.resident},
         {"loading", t.loading},
         {"unloading", t.unloading},
         {"loads", t.loads},
         {"load_failures", t.load_failures},
-        {"evictions", t.evictions}};
+        {"evictions", t.evictions},
+        {"admission_rejections", t.admission_rejections},
+        {"resident_vram_bytes", t.resident_vram_bytes},
+        {"resident_ram_bytes", t.resident_ram_bytes},
+        {"reserved_vram_bytes", t.reserved_vram_bytes},
+        {"reserved_ram_bytes", t.reserved_ram_bytes}};
 }
 
 json::Object build_health_body(const HealthSnapshot& s) {

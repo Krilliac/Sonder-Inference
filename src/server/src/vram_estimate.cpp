@@ -217,24 +217,48 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
     e.kv_bytes_per_token = saturating_u64(kv_per_token);
     e.swa_kv_bytes_per_token = saturating_u64(swa_kv_per_token);
     double kv = kv_per_token * static_cast<double>(ctx_per_sequence) * e.sequences;
+    bool swa_full_flag = false;
+    for (const auto& arg : p.extra_args) {
+        swa_full_flag = swa_full_flag || llamaserver_flag_name(arg) == "--swa-full";
+    }
+    const bool direct = p.backend == kLaunchProfileBackendLlamaCpp;
+    const bool has_modelled_swa =
+        m.sliding_window > 0 && !m.sliding_window_unmodelled &&
+        std::any_of(m.swa_layers.begin(), m.swa_layers.end(), [](bool is_swa) { return is_swa; });
+    const SwaKvMode requested_swa_mode =
+        (swa_full_flag || inputs.inherited_swa_full)
+            ? SwaKvMode::Full
+            : inputs.swa_kv_mode.value_or(p.swa_kv_mode.value_or(
+                  direct ? SwaKvMode::Full : SwaKvMode::CompactIfQualified));
+    e.swa_compact_qualified = has_modelled_swa;
+    const bool use_compact_swa =
+        (requested_swa_mode == SwaKvMode::CompactIfQualified) && e.swa_compact_qualified;
+    e.effective_swa_kv_mode = use_compact_swa ? SwaKvMode::CompactIfQualified : SwaKvMode::Full;
     if (e.swa_attention_layers > 0) {
         // Full size with --swa-full (judged under the name llama-server
-        // reads), a caller-supplied inherited setting, and on the direct backend, which keeps the llama.cpp
-        // library's default swa_full = true (llama_context_default_params,
-        // b11195). llama-server's own default is false.
-        bool swa_full_flag = false;
-        for (const auto& arg : p.extra_args) {
-            swa_full_flag = swa_full_flag || llamaserver_flag_name(arg) == "--swa-full";
-        }
-        const bool direct = p.backend == kLaunchProfileBackendLlamaCpp;
-        if (direct || swa_full_flag || inputs.inherited_swa_full) {
+        // reads), a caller-supplied inherited setting, an explicit SwaKvMode::Full
+        // policy, or on the direct backend when compact SWA was not opted into
+        // (llama.cpp library default swa_full = true, b11195). llama-server's
+        // own default is compact unless forced full.
+        if (!use_compact_swa) {
             e.swa_context_per_sequence = ctx_per_sequence;
-            e.notes.emplace_back(direct
-                                     ? "the llamacpp backend allocates full-size sliding-window caches (llama.cpp's "
-                                       "default swa_full); sliding-window layers are counted at full context"
-                                 : swa_full_flag ? "--swa-full: sliding-window layers are counted at full context"
-                                                 : "LLAMA_ARG_SWA_FULL is set: sliding-window layers are counted at "
-                                                   "full context");
+            if (swa_full_flag) {
+                e.notes.emplace_back("--swa-full: sliding-window layers are counted at full context");
+            } else if (inputs.inherited_swa_full) {
+                e.notes.emplace_back(
+                    "LLAMA_ARG_SWA_FULL is set: sliding-window layers are counted at full context");
+            } else if (direct && !inputs.swa_kv_mode.has_value() && !p.swa_kv_mode.has_value()) {
+                e.notes.emplace_back(
+                    "the llamacpp backend allocates full-size sliding-window caches (llama.cpp's "
+                    "default swa_full); sliding-window layers are counted at full context");
+            } else if (requested_swa_mode == SwaKvMode::Full) {
+                e.notes.emplace_back(
+                    "swa_kv_mode=full: sliding-window layers are counted at full context");
+            } else {
+                e.notes.emplace_back(
+                    "swa_kv_mode=compact_if_qualified: model is not qualified for compact SWA; "
+                    "falling back to full context");
+            }
         } else {
             // size_swa: window x n_seq_max for one unified stream, the window
             // for each stream of a split cache, plus the micro-batch. Below
@@ -242,6 +266,11 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
             const std::uint64_t window = saturating_add(saturating_mul(m.sliding_window, unified ? slots : 1u), ubatch);
             const std::uint64_t cells = std::min(ctx_per_sequence, window);
             e.swa_context_per_sequence = pad256(cells);
+            if (direct) {
+                e.notes.emplace_back(
+                    "swa_kv_mode=compact_if_qualified: direct llamacpp backend uses compact "
+                    "sliding-window caches guarded by min_retained_pos rollback checks");
+            }
         }
         kv += swa_kv_per_token * static_cast<double>(e.swa_context_per_sequence) * e.sequences;
     }
@@ -456,16 +485,12 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
     if (host_swa_kv_per_token > 0.0) {
         std::uint64_t cells = e.swa_context_per_sequence;
         if (e.swa_attention_layers == 0) {
-            bool swa_full_flag = false;
-            for (const auto& arg : p.extra_args) {
-                swa_full_flag = swa_full_flag || llamaserver_flag_name(arg) == "--swa-full";
-            }
-            if (p.backend == kLaunchProfileBackendLlamaCpp || swa_full_flag || inputs.inherited_swa_full) {
+            if (!use_compact_swa) {
                 cells = ctx_per_sequence;
             } else {
                 const std::uint64_t window =
                     saturating_add(saturating_mul(m.sliding_window, unified ? slots : 1u), ubatch);
-                cells = (std::min(ctx_per_sequence, window) + 255) / 256 * 256;
+                cells = pad256(std::min(ctx_per_sequence, window));
             }
         }
         host_kv += host_swa_kv_per_token * static_cast<double>(cells) * e.sequences;

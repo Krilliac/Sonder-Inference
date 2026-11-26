@@ -18,6 +18,7 @@
 #include "sonder/inference/backend.hpp"
 #include "sonder/inference/error.hpp"
 #include "sonder/inference/json.hpp"
+#include "sonder/inference/swa_policy.hpp"
 
 namespace sonder::inference {
 
@@ -56,6 +57,7 @@ struct BackendSetup {
     std::optional<double> llamacpp_moe_cache_cpu_share;
     std::optional<std::uint32_t> llamacpp_cache_ram_mib;
     std::optional<std::string> llamacpp_mmproj_path;
+    std::optional<SwaKvMode> llamacpp_swa_kv_mode;
     // MOCK backend: artificial per-token latency.
     std::chrono::microseconds mock_token_delay{0};
     // MOCK backend: >= 0 injects a backend error after that many tokens

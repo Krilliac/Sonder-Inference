@@ -380,10 +380,10 @@ Result<LaunchProfile> parse_one(const json::Value& value, std::size_t index) {
     SONDER_TRY(r.check_keys({"name", "backend", "model", "mmproj", "mmproj_offload", "image_max_tokens", "ctx_size",
                              "n_gpu_layers", "device", "main_gpu", "split_mode", "tensor_split", "load_mode",
                              "no_repack", "moe_cache_mib", "moe_cache_cpu_share", "batch_size", "ubatch_size",
-                             "parallel", "kv_unified", "flash_attn", "cache_type_k", "cache_type_v", "ctx_checkpoints",
-                             "checkpoint_min_step", "cache_ram_mib", "context_shift", "fit", "speculative", "threads",
-                             "threads_batch", "jinja", "reasoning_format", "reasoning", "reasoning_budget", "sampling",
-                             "extra_args", "vram_budget_mib"}));
+                             "parallel", "kv_unified", "swa_kv_mode", "flash_attn", "cache_type_k", "cache_type_v",
+                             "ctx_checkpoints", "checkpoint_min_step", "cache_ram_mib", "context_shift", "fit",
+                             "speculative", "threads", "threads_batch", "jinja", "reasoning_format", "reasoning",
+                             "reasoning_budget", "sampling", "extra_args", "vram_budget_mib"}));
     LaunchProfile p;
     SONDER_TRY(r.string("name", p.name, true));
     SONDER_TRY(r.string("backend", p.backend, true));
@@ -405,6 +405,17 @@ Result<LaunchProfile> parse_one(const json::Value& value, std::size_t index) {
     SONDER_TRY(r.integer("ubatch_size", p.ubatch_size, 1, kMaxBatch));
     SONDER_TRY(r.integer("parallel", p.parallel, 1, 256));
     SONDER_TRY(r.boolean("kv_unified", p.kv_unified));
+    {
+        std::optional<std::string> swa_mode_str;
+        SONDER_TRY(r.string("swa_kv_mode", swa_mode_str));
+        if (swa_mode_str) {
+            SwaKvMode parsed_mode = SwaKvMode::Full;
+            if (!parse_swa_kv_mode(*swa_mode_str, parsed_mode)) {
+                return bad(where, "'swa_kv_mode' must be full or compact_if_qualified");
+            }
+            p.swa_kv_mode = parsed_mode;
+        }
+    }
     SONDER_TRY(r.string("flash_attn", p.flash_attn));
     SONDER_TRY(r.string("cache_type_k", p.cache_type_k));
     SONDER_TRY(r.string("cache_type_v", p.cache_type_v));
@@ -517,6 +528,9 @@ Status validate_launch_profile(const LaunchProfile& p) {
     if (p.moe_cache_cpu_share &&
         (!std::isfinite(*p.moe_cache_cpu_share) || *p.moe_cache_cpu_share < 0.0 || *p.moe_cache_cpu_share > 1.0)) {
         return bad(where, "'moe_cache_cpu_share' must be a finite number from 0.0 to 1.0");
+    }
+    if (p.swa_kv_mode && to_string(*p.swa_kv_mode) == "unknown") {
+        return bad(where, "'swa_kv_mode' must be full or compact_if_qualified");
     }
     if (p.flash_attn && canonical_flash_attn(*p.flash_attn) != *p.flash_attn) {
         return bad(where, "'flash_attn' must be on, off or auto");
@@ -680,6 +694,14 @@ Result<std::vector<std::string>> llamaserver_arguments(const LaunchProfile& p) {
     if (p.ubatch_size) num("--ubatch-size", *p.ubatch_size);
     if (p.parallel) num("--parallel", *p.parallel);
     toggle(p.kv_unified, "--kv-unified", "--no-kv-unified");
+    if (p.swa_kv_mode && *p.swa_kv_mode == SwaKvMode::Full) {
+        const bool already_swa_full = std::any_of(p.extra_args.begin(), p.extra_args.end(), [](const std::string& arg) {
+            return llamaserver_flag_name(arg) == "--swa-full";
+        });
+        if (!already_swa_full) {
+            a.emplace_back("--swa-full");
+        }
+    }
     if (p.flash_attn) {
         a.emplace_back("--flash-attn");
         a.push_back(*p.flash_attn);
@@ -823,6 +845,7 @@ Status apply_llamacpp_profile(const LaunchProfile& p, BackendSetup& setup, std::
     if (p.cache_type_k) next.llamacpp_kv_cache_type_k = *p.cache_type_k;
     if (p.cache_type_v) next.llamacpp_kv_cache_type_v = *p.cache_type_v;
     if (p.flash_attn) next.llamacpp_flash_attention = *p.flash_attn;
+    if (p.swa_kv_mode) next.llamacpp_swa_kv_mode = *p.swa_kv_mode;
     if (p.ctx_size) next.llamacpp_context_length = *p.ctx_size;
     if (p.parallel) next.llamacpp_slots = *p.parallel;
     if (p.kv_unified) next.llamacpp_kv_unified = *p.kv_unified;

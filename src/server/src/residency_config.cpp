@@ -157,4 +157,127 @@ Status apply_residency_config(const BackendSetup &setup, LlamaServerResidencyGua
 }
 #endif
 
+namespace {
+
+std::uint64_t sat_add(std::uint64_t a, std::uint64_t b) noexcept {
+    return a > std::numeric_limits<std::uint64_t>::max() - b ? std::numeric_limits<std::uint64_t>::max() : a + b;
+}
+
+std::uint64_t sat_sub(std::uint64_t a, std::uint64_t b) noexcept { return a >= b ? (a - b) : 0; }
+
+}  // namespace
+
+server::ModelResourceFootprint footprint_from_vram_estimate(const VramEstimate &estimate,
+                                                            std::uint64_t projector_vram_bytes,
+                                                            std::uint64_t projector_ram_bytes,
+                                                            std::uint64_t adapter_vram_bytes,
+                                                            std::uint64_t adapter_ram_bytes) noexcept {
+    server::ModelResourceFootprint fp;
+
+    // VRAM tier: VramEstimate::weights_bytes already includes offloaded mmproj
+    // bytes when present, so split projector_vram_bytes out cleanly without
+    // double-counting.
+    const std::uint64_t vram_proj = std::min(projector_vram_bytes, estimate.weights_bytes);
+    fp.vram.weights_bytes = sat_sub(estimate.weights_bytes, vram_proj);
+    fp.vram.kv_cache_bytes = sat_add(estimate.kv_bytes, estimate.recurrent_bytes);
+    fp.vram.workspace_bytes = sat_add(estimate.compute_bytes, estimate.moe_cache_bytes);
+    fp.vram.projector_bytes = projector_vram_bytes;
+    fp.vram.adapter_bytes = adapter_vram_bytes;
+
+    // Host RAM tier: preserve exact conservation with host_resident_bytes.
+    const std::uint64_t host_non_weight =
+        sat_add(sat_add(estimate.host_kv_bytes, estimate.host_recurrent_bytes), estimate.host_compute_bytes);
+    const std::uint64_t host_weight_resident = sat_sub(estimate.host_resident_bytes, host_non_weight);
+    const std::uint64_t ram_proj = std::min(projector_ram_bytes, host_weight_resident);
+    fp.ram.weights_bytes = sat_sub(host_weight_resident, ram_proj);
+    fp.ram.kv_cache_bytes = sat_add(estimate.host_kv_bytes, estimate.host_recurrent_bytes);
+    fp.ram.workspace_bytes = estimate.host_compute_bytes;
+    fp.ram.projector_bytes = projector_ram_bytes;
+    fp.ram.adapter_bytes = adapter_ram_bytes;
+    return fp;
+}
+
+server::ModelResourceFootprint footprint_from_placement_plan(const PlacementPlan &plan,
+                                                             std::uint64_t projector_bytes,
+                                                             std::uint64_t adapter_vram_bytes,
+                                                             std::uint64_t adapter_ram_bytes) noexcept {
+    const bool mmproj_on_gpu = !plan.profile.mmproj.empty() && plan.estimate.gpu_layers > 0 &&
+                               plan.profile.mmproj_offload.value_or(true);
+    const std::uint64_t proj_vram = mmproj_on_gpu ? projector_bytes : 0;
+    const std::uint64_t proj_ram = (!plan.profile.mmproj.empty() && !mmproj_on_gpu) ? projector_bytes : 0;
+    server::ModelResourceFootprint fp =
+        footprint_from_vram_estimate(plan.estimate, proj_vram, proj_ram, adapter_vram_bytes, adapter_ram_bytes);
+    if (plan.uma_mode) {
+        // Integrated UMA allocations come out of unified physical RAM as well
+        // as the logical GPU pool.
+        fp.ram.weights_bytes = sat_add(fp.ram.weights_bytes, fp.vram.weights_bytes);
+        fp.ram.kv_cache_bytes = sat_add(fp.ram.kv_cache_bytes, fp.vram.kv_cache_bytes);
+        fp.ram.workspace_bytes = sat_add(fp.ram.workspace_bytes, fp.vram.workspace_bytes);
+        fp.ram.projector_bytes = sat_add(fp.ram.projector_bytes, fp.vram.projector_bytes);
+        fp.ram.adapter_bytes = sat_add(fp.ram.adapter_bytes, fp.vram.adapter_bytes);
+    }
+    return fp;
+}
+
+std::vector<std::pair<std::string, server::ModelResourceFootprint>> footprints_from_coresidency_plan(
+    const CoResidencyPlan &plan) {
+    std::vector<std::pair<std::string, server::ModelResourceFootprint>> out;
+    out.reserve(plan.models.size());
+    for (const auto &model_plan : plan.models) {
+        out.emplace_back(model_plan.profile.name, footprint_from_placement_plan(model_plan));
+    }
+    return out;
+}
+
+Status parse_live_residency_budgets(const json::Value &value, std::uint64_t &max_vram_bytes,
+                                    std::uint64_t &max_ram_bytes) {
+    if (!value.is_object()) {
+        return Status(ErrorCode::invalid_argument, "residency budget config must be a JSON object");
+    }
+    static constexpr std::string_view kKeys[] = {"max_resident_vram_mib", "max_resident_ram_mib",
+                                                 "max_resident_vram_bytes", "max_resident_ram_bytes"};
+    for (const auto &member : value.as_object()) {
+        if (std::find(std::begin(kKeys), std::end(kKeys), member.first) == std::end(kKeys)) {
+            return Status(ErrorCode::invalid_argument,
+                          "residency budget config: unknown field '" + bounded_for_message(member.first) + "'");
+        }
+    }
+    const bool has_vram_mib = value.find("max_resident_vram_mib") != nullptr;
+    const bool has_vram_bytes = value.find("max_resident_vram_bytes") != nullptr;
+    if (has_vram_mib && has_vram_bytes) {
+        return Status(ErrorCode::invalid_argument,
+                      "residency budget config: specify only one of max_resident_vram_mib or max_resident_vram_bytes");
+    }
+    const bool has_ram_mib = value.find("max_resident_ram_mib") != nullptr;
+    const bool has_ram_bytes = value.find("max_resident_ram_bytes") != nullptr;
+    if (has_ram_mib && has_ram_bytes) {
+        return Status(ErrorCode::invalid_argument,
+                      "residency budget config: specify only one of max_resident_ram_mib or max_resident_ram_bytes");
+    }
+    constexpr std::uint64_t kMiB = 1024ull * 1024ull;
+    constexpr std::uint64_t kMaxMiB = 16777216ull;  // 16 TiB
+    constexpr std::uint64_t kMaxBytes = kMaxMiB * kMiB;
+
+    std::uint64_t parsed_vram = max_vram_bytes;
+    std::uint64_t parsed_ram = max_ram_bytes;
+    const auto parse_u64 = [&](const char *key, std::uint64_t hi, std::uint64_t scale, std::uint64_t &dst) -> Status {
+        if (const auto *v = value.find(key)) {
+            if (!v->is_integer() || v->as_int(-1) < 0 || v->as_uint() > hi) {
+                return Status(ErrorCode::invalid_argument,
+                              std::string("residency budget config: ") + key + " must be an integer in [0, " +
+                                  std::to_string(hi) + "]");
+            }
+            dst = v->as_uint() * scale;
+        }
+        return {};
+    };
+    if (auto st = parse_u64("max_resident_vram_mib", kMaxMiB, kMiB, parsed_vram); !st.ok()) return st;
+    if (auto st = parse_u64("max_resident_ram_mib", kMaxMiB, kMiB, parsed_ram); !st.ok()) return st;
+    if (auto st = parse_u64("max_resident_vram_bytes", kMaxBytes, 1u, parsed_vram); !st.ok()) return st;
+    if (auto st = parse_u64("max_resident_ram_bytes", kMaxBytes, 1u, parsed_ram); !st.ok()) return st;
+    max_vram_bytes = parsed_vram;
+    max_ram_bytes = parsed_ram;
+    return {};
+}
+
 }  // namespace sonder::inference::detail

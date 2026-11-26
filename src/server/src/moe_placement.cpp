@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "sonder/inference/launch_profile.hpp"
+#include "sonder/inference/moe_routing_telemetry.hpp"
 #include "vram_internal.hpp"
 
 namespace sonder::inference {
@@ -424,5 +425,292 @@ MoeExpertCacheSizing plan_moe_expert_cache(const GgufModelInfo& model, std::uint
 }
 
 }  // namespace detail
+
+// ------------------------------------------------ Bounded MoE routing telemetry
+
+MoeRoutingTelemetry::MoeRoutingTelemetry(MoeRoutingTelemetryConfig config)
+    : offload_active_(config.offload_active),
+      max_layers_(std::min(config.max_layers, MoeRoutingTelemetryConfig::kMaxTrackedLayers)),
+      max_experts_per_layer_(std::min(config.max_experts_per_layer, MoeRoutingTelemetryConfig::kMaxExpertsPerLayer)),
+      default_top_k_(config.top_k == 0 ? 1u : std::min(config.top_k, MoeRoutingTelemetryConfig::kMaxExpertsPerLayer)) {}
+
+void MoeRoutingTelemetry::set_offload_active(bool active) noexcept {
+    offload_active_.store(active, std::memory_order_release);
+}
+
+MoeRoutingTelemetry::LayerTable* MoeRoutingTelemetry::find_or_create_layer_locked(std::uint32_t layer_id) {
+    for (auto& layer : layers_) {
+        if (layer.layer_id == layer_id) {
+            return &layer;
+        }
+    }
+    if (layers_.size() >= max_layers_) {
+        ++dropped_layer_observations_;
+        return nullptr;
+    }
+    LayerTable created;
+    created.layer_id = layer_id;
+    layers_.push_back(std::move(created));
+    return &layers_.back();
+}
+
+void MoeRoutingTelemetry::record_locked(LayerTable* layer, std::uint32_t expert_id, bool cache_hit,
+                                        std::uint64_t transfer_bytes, double wait_ms) {
+    const double clean_wait_ms = (std::isfinite(wait_ms) && wait_ms > 0.0) ? wait_ms : 0.0;
+    ++total_routes_;
+    if (cache_hit) {
+        ++expert_hits_;
+    } else {
+        ++expert_misses_;
+    }
+    if (transfer_bytes > 0 || clean_wait_ms > 0.0) {
+        ++transfer_count_;
+        transfer_bytes_ = detail::saturating_add(transfer_bytes_, transfer_bytes);
+        transfer_wait_ms_ += clean_wait_ms;
+        if (clean_wait_ms > max_transfer_wait_ms_) {
+            max_transfer_wait_ms_ = clean_wait_ms;
+        }
+    }
+
+    if (layer == nullptr) {
+        return;
+    }
+
+    ++layer->total_routes;
+    if (cache_hit) {
+        ++layer->hits;
+    } else {
+        ++layer->misses;
+    }
+    layer->transfer_bytes = detail::saturating_add(layer->transfer_bytes, transfer_bytes);
+    layer->transfer_wait_ms += clean_wait_ms;
+
+    if (max_experts_per_layer_ == 0) {
+        return;
+    }
+
+    for (auto& slot : layer->slots) {
+        if (slot.expert_id == expert_id) {
+            ++slot.activations;
+            if (cache_hit) {
+                ++slot.hits;
+            } else {
+                ++slot.misses;
+            }
+            return;
+        }
+    }
+
+    if (layer->slots.size() < max_experts_per_layer_) {
+        ExpertSlot created;
+        created.expert_id = expert_id;
+        created.activations = 1;
+        created.hits = cache_hit ? 1u : 0u;
+        created.misses = cache_hit ? 0u : 1u;
+        created.overestimate_error = 0;
+        layer->slots.push_back(created);
+        return;
+    }
+
+    // Space-Saving heavy-hitter replacement: evict the minimum-activation slot
+    // (tie-broken by highest overestimate_error, then largest expert_id) so
+    // memory stays strictly bounded to `max_experts_per_layer_` while true hot
+    // experts remain tracked with bounded error.
+    std::size_t victim = 0;
+    for (std::size_t i = 1; i < layer->slots.size(); ++i) {
+        const ExpertSlot& cand = layer->slots[i];
+        const ExpertSlot& cur = layer->slots[victim];
+        if (cand.activations < cur.activations ||
+            (cand.activations == cur.activations && cand.overestimate_error > cur.overestimate_error) ||
+            (cand.activations == cur.activations && cand.overestimate_error == cur.overestimate_error &&
+             cand.expert_id > cur.expert_id)) {
+            victim = i;
+        }
+    }
+    ExpertSlot& replaced = layer->slots[victim];
+    const std::uint64_t inherited = replaced.activations;
+    replaced.expert_id = expert_id;
+    replaced.overestimate_error = inherited;
+    replaced.activations = detail::saturating_add(inherited, 1u);
+    replaced.hits = cache_hit ? 1u : 0u;
+    replaced.misses = cache_hit ? 0u : 1u;
+    ++layer->table_evictions;
+}
+
+void MoeRoutingTelemetry::record_expert_access(std::uint32_t layer_id, std::uint32_t expert_id, bool cache_hit,
+                                               std::uint64_t transfer_bytes, double wait_ms) {
+    if (!offload_active()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!offload_active()) {
+        return;
+    }
+    LayerTable* layer = find_or_create_layer_locked(layer_id);
+    record_locked(layer, expert_id, cache_hit, transfer_bytes, wait_ms);
+}
+
+void MoeRoutingTelemetry::record_routing_batch(std::uint32_t layer_id,
+                                               const std::vector<MoeExpertObservation>& observations) {
+    if (observations.empty() || !offload_active()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!offload_active()) {
+        return;
+    }
+    LayerTable* layer = find_or_create_layer_locked(layer_id);
+    for (const auto& obs : observations) {
+        record_locked(layer, obs.expert_id, obs.cache_hit, obs.transfer_bytes, obs.wait_ms);
+    }
+    if (layer == nullptr && observations.size() > 1) {
+        dropped_layer_observations_ =
+            detail::saturating_add(dropped_layer_observations_, static_cast<std::uint64_t>(observations.size() - 1));
+    }
+}
+
+std::vector<MoeExpertFrequency> MoeRoutingTelemetry::build_top_k_locked(const LayerTable& layer, std::size_t k) const {
+    const std::size_t limit = k == 0 ? default_top_k_ : k;
+    std::vector<ExpertSlot> sorted = layer.slots;
+    std::sort(sorted.begin(), sorted.end(), [](const ExpertSlot& a, const ExpertSlot& b) {
+        if (a.activations != b.activations) return a.activations > b.activations;
+        return a.expert_id < b.expert_id;
+    });
+    if (sorted.size() > limit) {
+        sorted.resize(limit);
+    }
+    std::vector<MoeExpertFrequency> out;
+    out.reserve(sorted.size());
+    const double denom = layer.total_routes > 0 ? static_cast<double>(layer.total_routes) : 1.0;
+    for (const auto& slot : sorted) {
+        MoeExpertFrequency f;
+        f.expert_id = slot.expert_id;
+        f.activations = slot.activations;
+        f.hits = slot.hits;
+        f.misses = slot.misses;
+        f.overestimate_error = slot.overestimate_error;
+        f.share = std::min(1.0, static_cast<double>(slot.activations) / denom);
+        out.push_back(f);
+    }
+    return out;
+}
+
+MoeRoutingSnapshot MoeRoutingTelemetry::snapshot(std::size_t top_k_override) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    MoeRoutingSnapshot out;
+    out.offload_active = offload_active();
+    out.total_routes = total_routes_;
+    out.expert_hits = expert_hits_;
+    out.expert_misses = expert_misses_;
+    out.transfer_count = transfer_count_;
+    out.transfer_bytes = transfer_bytes_;
+    out.transfer_wait_ms = transfer_wait_ms_;
+    out.max_transfer_wait_ms = max_transfer_wait_ms_;
+    out.dropped_layer_observations = dropped_layer_observations_;
+    out.tracked_layers = layers_.size();
+    out.max_layers = max_layers_;
+    out.max_experts_per_layer = max_experts_per_layer_;
+
+    std::vector<const LayerTable*> ordered;
+    ordered.reserve(layers_.size());
+    for (const auto& l : layers_) {
+        ordered.push_back(&l);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const LayerTable* a, const LayerTable* b) { return a->layer_id < b->layer_id; });
+
+    out.layers.reserve(ordered.size());
+    for (const LayerTable* l : ordered) {
+        MoeLayerTelemetry lt;
+        lt.layer_id = l->layer_id;
+        lt.total_routes = l->total_routes;
+        lt.hits = l->hits;
+        lt.misses = l->misses;
+        lt.transfer_bytes = l->transfer_bytes;
+        lt.transfer_wait_ms = l->transfer_wait_ms;
+        lt.tracked_experts = l->slots.size();
+        lt.table_evictions = l->table_evictions;
+        lt.top_experts = build_top_k_locked(*l, top_k_override);
+        out.layers.push_back(std::move(lt));
+    }
+    return out;
+}
+
+std::vector<MoeExpertFrequency> MoeRoutingTelemetry::hot_experts_for_layer(std::uint32_t layer_id,
+                                                                           std::size_t top_k_override) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (const auto& l : layers_) {
+        if (l.layer_id == layer_id) {
+            return build_top_k_locked(l, top_k_override);
+        }
+    }
+    return {};
+}
+
+void MoeRoutingTelemetry::reset() {
+    std::lock_guard<std::mutex> lock(mu_);
+    total_routes_ = 0;
+    expert_hits_ = 0;
+    expert_misses_ = 0;
+    transfer_count_ = 0;
+    transfer_bytes_ = 0;
+    transfer_wait_ms_ = 0.0;
+    max_transfer_wait_ms_ = 0.0;
+    dropped_layer_observations_ = 0;
+    layers_.clear();
+}
+
+MoeRoutingTelemetryConfig make_moe_routing_telemetry_config(const VramEstimate& estimate, std::size_t top_k,
+                                                            std::size_t max_layers,
+                                                            std::size_t max_experts_per_layer) noexcept {
+    MoeRoutingTelemetryConfig cfg;
+    cfg.offload_active = estimate.host_expert_bytes > 0;
+    cfg.max_layers = std::min(max_layers, MoeRoutingTelemetryConfig::kMaxTrackedLayers);
+    cfg.max_experts_per_layer = std::min(max_experts_per_layer, MoeRoutingTelemetryConfig::kMaxExpertsPerLayer);
+    cfg.top_k = top_k == 0 ? 1u : std::min(top_k, MoeRoutingTelemetryConfig::kMaxExpertsPerLayer);
+    return cfg;
+}
+
+json::Object moe_routing_telemetry_to_json(const MoeRoutingSnapshot& snapshot) {
+    json::Array layers_arr;
+    layers_arr.reserve(snapshot.layers.size());
+    for (const auto& l : snapshot.layers) {
+        json::Array experts_arr;
+        experts_arr.reserve(l.top_experts.size());
+        for (const auto& e : l.top_experts) {
+            experts_arr.emplace_back(json::Object{{"expert_id", static_cast<std::uint64_t>(e.expert_id)},
+                                                  {"activations", e.activations},
+                                                  {"hits", e.hits},
+                                                  {"misses", e.misses},
+                                                  {"overestimate_error", e.overestimate_error},
+                                                  {"share", e.share}});
+        }
+        layers_arr.emplace_back(json::Object{{"layer_id", static_cast<std::uint64_t>(l.layer_id)},
+                                             {"total_routes", l.total_routes},
+                                             {"hits", l.hits},
+                                             {"misses", l.misses},
+                                             {"transfer_bytes", l.transfer_bytes},
+                                             {"transfer_wait_ms", l.transfer_wait_ms},
+                                             {"tracked_experts", static_cast<std::uint64_t>(l.tracked_experts)},
+                                             {"table_evictions", l.table_evictions},
+                                             {"top_experts", std::move(experts_arr)}});
+    }
+
+    return json::Object{{"schema", "sonder.inference.moe_routing_telemetry/1"},
+                        {"offload_active", snapshot.offload_active},
+                        {"total_routes", snapshot.total_routes},
+                        {"expert_hits", snapshot.expert_hits},
+                        {"expert_misses", snapshot.expert_misses},
+                        {"hit_rate", snapshot.hit_rate()},
+                        {"transfer_count", snapshot.transfer_count},
+                        {"transfer_bytes", snapshot.transfer_bytes},
+                        {"transfer_wait_ms", snapshot.transfer_wait_ms},
+                        {"max_transfer_wait_ms", snapshot.max_transfer_wait_ms},
+                        {"dropped_layer_observations", snapshot.dropped_layer_observations},
+                        {"tracked_layers", static_cast<std::uint64_t>(snapshot.tracked_layers)},
+                        {"max_layers", static_cast<std::uint64_t>(snapshot.max_layers)},
+                        {"max_experts_per_layer", static_cast<std::uint64_t>(snapshot.max_experts_per_layer)},
+                        {"layers", std::move(layers_arr)}};
+}
 
 }  // namespace sonder::inference

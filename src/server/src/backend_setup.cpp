@@ -69,6 +69,9 @@ Result<LlamaCppBackendOptions> llamacpp_options(const BackendSetup& setup) {
         if constexpr (requires { dst.mmproj_path; }) {
             if (setup.llamacpp_mmproj_path) dst.mmproj_path = *setup.llamacpp_mmproj_path;
         }
+        if constexpr (requires { dst.swa_kv_mode; }) {
+            if (setup.llamacpp_swa_kv_mode) dst.swa_kv_mode = *setup.llamacpp_swa_kv_mode;
+        }
     };
     wire_extended(lo);
     for (const std::string& spec : setup.llamacpp_tensor_overrides) {

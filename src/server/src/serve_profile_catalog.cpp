@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "residency_config.hpp"
 #include "serve_options.hpp"
 #include "sonder/inference/device.hpp"
 #include "sonder/inference/json.hpp"
@@ -44,6 +45,7 @@ LaunchProfile effective_llamacpp_profile(const LaunchProfile& p, const BackendSe
     if (!eff.cache_type_k && backend.llamacpp_kv_cache_type_k) eff.cache_type_k = *backend.llamacpp_kv_cache_type_k;
     if (!eff.cache_type_v && backend.llamacpp_kv_cache_type_v) eff.cache_type_v = *backend.llamacpp_kv_cache_type_v;
     if (!eff.flash_attn && backend.llamacpp_flash_attention) eff.flash_attn = *backend.llamacpp_flash_attention;
+    if (!eff.swa_kv_mode && backend.llamacpp_swa_kv_mode) eff.swa_kv_mode = *backend.llamacpp_swa_kv_mode;
     if (!eff.parallel && backend.llamacpp_slots) eff.parallel = *backend.llamacpp_slots;
     if (!eff.kv_unified && backend.llamacpp_kv_unified) eff.kv_unified = *backend.llamacpp_kv_unified;
     if (!eff.cache_ram_mib && backend.llamacpp_cache_ram_mib) {
@@ -292,6 +294,13 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles,
         }
         binding.sampling_defaults = p.sampling;
         binding.metadata = std::move(meta);
+        if (estimate) {
+            const std::uint64_t proj_bytes = file_bytes(eff.mmproj);
+            const bool proj_on_gpu =
+                !eff.mmproj.empty() && !is_device_none(eff.device) && eff.mmproj_offload.value_or(true);
+            binding.estimated_footprint = sonder::inference::detail::footprint_from_vram_estimate(
+                *estimate, proj_on_gpu ? proj_bytes : 0u, proj_on_gpu ? 0u : proj_bytes);
+        }
 
         ActiveProfileData& slot = active_data[active_idx];
         slot.profile = &p;

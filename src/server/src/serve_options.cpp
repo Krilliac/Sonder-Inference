@@ -66,6 +66,12 @@ Backend:
   --max-resident-models N keep at most N models loaded, evicting the least recently
                           used idle one (default 0 = no cap; in-flight requests
                           always keep their model)
+  --max-resident-vram-mib N
+                          byte budget for resident model VRAM in MiB (default 0 =
+                          unlimited; evicts unpinned models by reload cost/byte)
+  --max-resident-ram-mib N
+                          byte budget for resident model host RAM in MiB (default
+                          0 = unlimited; evicts unpinned models by reload cost/byte)
   --gpu-layers N          llama.cpp: layers offloaded to the GPU (-1 = all, default)
   --context-length N      llama.cpp: context length (0 = model training context)
   --moe-experts WHERE     llama.cpp: cpu keeps MoE expert weights in system RAM
@@ -81,6 +87,8 @@ Backend:
   --cache-type-v T        llama.cpp: V cache type, same values; a quantized V
                           cache needs flash attention (on or auto)
   --flash-attn MODE       llama.cpp: auto (default), on or off
+  --swa-kv-mode MODE      llama.cpp: sliding-window KV policy full (default) or
+                          compact_if_qualified (guarded by min_retained_pos)
   --threads N             llama.cpp: CPU thread count (1..256)
   --no-mmap               llama.cpp: disable GGUF memory-mapping (direct read)
   --no-kv-unified         llama.cpp: disable unified KV buffer across slots
@@ -134,7 +142,7 @@ enum class Kind { value, repeat, flag };
 // KV cache types, flash attention). serve refuses them for any other backend,
 // which would ignore them, and next to --profile, whose typed fields set them.
 constexpr const char* kLlamaCppContextFlags[] = {"batch-size", "ubatch-size", "cache-type-k", "cache-type-v",
-                                                 "flash-attn"};
+                                                 "flash-attn", "swa-kv-mode"};
 // Tensor placement options of the direct llamacpp backend
 // (BackendSetup::llamacpp_tensor_overrides). A llamaserver launch profile
 // refuses them, because the spawned llama-server never sees them; a llamacpp
@@ -162,10 +170,12 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"gpu-layers", Kind::value},             {"context-length", Kind::value},
         {"device", Kind::value},                 {"lazy-models", Kind::flag},
         {"model-idle-ttl", Kind::value},         {"max-resident-models", Kind::value},
+        {"max-resident-vram-mib", Kind::value},  {"max-resident-ram-mib", Kind::value},
         {"moe-experts", Kind::value},            {"tensor-override", Kind::repeat},
         {"batch-size", Kind::value},             {"ubatch-size", Kind::value},
         {"cache-type-k", Kind::value},           {"cache-type-v", Kind::value},
-        {"flash-attn", Kind::value},             {"threads", Kind::value},
+        {"flash-attn", Kind::value},             {"swa-kv-mode", Kind::value},
+        {"threads", Kind::value},
         {"no-mmap", Kind::flag},                 {"no-kv-unified", Kind::flag},
         {"no-prefix-cache", Kind::flag},         {"slots", Kind::value},
         {"spec-type", Kind::value},              {"spec-draft-max", Kind::value},
@@ -540,6 +550,18 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
         if (!parse_uint(*v, 4096, n)) return usage_error("--max-resident-models must be an integer from 0 to 4096");
         o.max_resident_models = static_cast<std::size_t>(n);
     }
+    if (auto v = a.get("max-resident-vram-mib")) {
+        if (!parse_uint(*v, 16777216, n)) {
+            return usage_error("--max-resident-vram-mib must be an integer from 0 to 16777216");
+        }
+        o.max_resident_vram_bytes = n << 20;
+    }
+    if (auto v = a.get("max-resident-ram-mib")) {
+        if (!parse_uint(*v, 16777216, n)) {
+            return usage_error("--max-resident-ram-mib must be an integer from 0 to 16777216");
+        }
+        o.max_resident_ram_bytes = n << 20;
+    }
     if (Status st = parse_request_path_flags([&a](const std::string& k) { return a.get(k); }, o); !st.ok()) {
         return usage_error(st.message());
     }
@@ -553,7 +575,7 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     if (o.backend.backend != "llamacpp") {
         for (const char* flag : {"gpu-layers", "context-length", "moe-experts", "tensor-override",
                                  "batch-size", "ubatch-size", "cache-type-k", "cache-type-v", "flash-attn",
-                                 "threads", "slots", "spec-type", "spec-draft-max",
+                                 "swa-kv-mode", "threads", "slots", "spec-type", "spec-draft-max",
                                  "moe-cache-mib", "cache-ram-mib", "mmproj"}) {
             if (a.get(flag)) {
                 return usage_error(std::string("option --") + flag +
@@ -579,6 +601,13 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     if (auto v = a.get("cache-type-k")) o.backend.llamacpp_kv_cache_type_k = *v;
     if (auto v = a.get("cache-type-v")) o.backend.llamacpp_kv_cache_type_v = *v;
     if (auto v = a.get("flash-attn")) o.backend.llamacpp_flash_attention = *v;
+    if (auto v = a.get("swa-kv-mode")) {
+        SwaKvMode parsed_swa = SwaKvMode::Full;
+        if (!parse_swa_kv_mode(*v, parsed_swa)) {
+            return usage_error("--swa-kv-mode must be full or compact_if_qualified");
+        }
+        o.backend.llamacpp_swa_kv_mode = parsed_swa;
+    }
     if (auto v = a.get("threads")) {
         if (!parse_uint(*v, 256, n) || n == 0) return usage_error("--threads must be an integer from 1 to 256");
         o.backend.llamacpp_threads = static_cast<std::int32_t>(n);
@@ -635,6 +664,7 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
         std::string owner_k = o.backend.llamacpp_kv_cache_type_k ? primary->name : std::string{};
         std::string owner_v = o.backend.llamacpp_kv_cache_type_v ? primary->name : std::string{};
         std::string owner_fa = o.backend.llamacpp_flash_attention ? primary->name : std::string{};
+        std::string owner_swa = o.backend.llamacpp_swa_kv_mode ? primary->name : std::string{};
         std::string owner_slots = o.backend.llamacpp_slots ? primary->name : std::string{};
         std::string owner_kv_unified = o.backend.llamacpp_kv_unified ? primary->name : std::string{};
         std::string owner_cache_ram = o.backend.llamacpp_cache_ram_mib ? primary->name : std::string{};
@@ -645,6 +675,7 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
         const auto int_text = [](auto v) { return std::to_string(v); };
         const auto bool_text = [](bool b) -> std::string { return b ? "true" : "false"; };
         const auto str_text = [](const std::string& s) { return s; };
+        const auto swa_text = [](SwaKvMode m) { return std::string(to_string(m)); };
         for (std::size_t i = 1; i < active_profiles.size(); ++i) {
             const LaunchProfile& secondary = *active_profiles[i];
             BackendSetup candidate_backend = base_backend;
@@ -713,6 +744,11 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
             }
             if (const std::string err = merge_opt("flash_attn", o.backend.llamacpp_flash_attention,
                                                   candidate_backend.llamacpp_flash_attention, owner_fa, str_text);
+                !err.empty()) {
+                return usage_error(err);
+            }
+            if (const std::string err = merge_opt("swa_kv_mode", o.backend.llamacpp_swa_kv_mode,
+                                                  candidate_backend.llamacpp_swa_kv_mode, owner_swa, swa_text);
                 !err.empty()) {
                 return usage_error(err);
             }

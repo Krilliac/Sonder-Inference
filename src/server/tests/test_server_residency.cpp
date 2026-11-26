@@ -542,3 +542,313 @@ TEST_CASE("residency: validate_options refuses a negative idle TTL") {
     o.model_idle_ttl = std::chrono::milliseconds(0);
     CHECK(srv::validate_options(o).ok());
 }
+
+// ------------------------------------------------------------ Item #18: byte-aware & reload-cost residency
+
+namespace {
+
+constexpr std::uint64_t kMiB = 1ull << 20;
+constexpr std::uint64_t kGiB = 1024ull * kMiB;
+
+det::ModelResourceFootprint make_vram_fp(std::uint64_t weights_mib, std::uint64_t kv_mib = 0,
+                                         std::uint64_t workspace_mib = 0, std::uint64_t projector_mib = 0,
+                                         std::uint64_t adapter_mib = 0, std::uint64_t ram_weights_mib = 0) {
+    det::ModelResourceFootprint fp;
+    fp.vram.weights_bytes = weights_mib * kMiB;
+    fp.vram.kv_cache_bytes = kv_mib * kMiB;
+    fp.vram.workspace_bytes = workspace_mib * kMiB;
+    fp.vram.projector_bytes = projector_mib * kMiB;
+    fp.vram.adapter_bytes = adapter_mib * kMiB;
+    fp.ram.weights_bytes = ram_weights_mib * kMiB;
+    return fp;
+}
+
+}  // namespace
+
+TEST_CASE("residency unit: ResourceFootprint accounts for weights, KV, workspace, projector, and adapter bytes") {
+    det::ResourceFootprint fp;
+    CHECK(fp.empty());
+    CHECK(fp.total_bytes() == 0u);
+    fp.weights_bytes = 2000 * kMiB;
+    fp.kv_cache_bytes = 500 * kMiB;
+    fp.workspace_bytes = 256 * kMiB;
+    fp.projector_bytes = 128 * kMiB;
+    fp.adapter_bytes = 64 * kMiB;
+    CHECK_FALSE(fp.empty());
+    CHECK(fp.total_bytes() == (2000 + 500 + 256 + 128 + 64) * kMiB);
+}
+
+TEST_CASE("residency unit: pre-load byte reservation admits or refuses concurrently and rolls back immediately on load error") {
+    EngineModels em;
+    auto gate = std::make_shared<Gate>();
+    gate->close();
+    std::atomic<bool> fail_a{true};
+    det::ResidencyConfig cfg;
+    cfg.max_resident_vram_bytes = 8 * kGiB;
+
+    auto r = std::make_shared<det::ModelResidency>(
+        cfg,
+        [&](const std::string& id) -> si::Result<std::shared_ptr<si::Model>> {
+            if (id == "mock:a") {
+                gate->pass();
+                if (fail_a.load()) {
+                    return si::Status(si::ErrorCode::unavailable, "simulated OOM during cold load");
+                }
+            }
+            return em.load(id);
+        },
+        [](det::Eviction&) {});
+
+    REQUIRE(r->add("mock:a", "mock", true, make_vram_fp(5120, 512, 256, 128, 128)));  // 6 GiB total VRAM
+    REQUIRE(r->add("mock:b", "mock", false, make_vram_fp(3072, 1024)));              // 4 GiB total VRAM
+
+    si::Status status_a;
+    std::thread loader_a([&] {
+        auto pin = r->acquire("mock:a");
+        status_a = pin.ok() ? si::Status::success() : pin.status();
+    });
+    REQUIRE(gate->wait_for_waiter(std::chrono::milliseconds(5000)));
+    REQUIRE(eventually([&] { return r->totals().loading == 1u; }));
+
+    // While mock:a is mid-load, its 6 GiB reservation is held in totals and snapshot.
+    const auto mid_totals = r->totals();
+    CHECK(mid_totals.reserved_vram_bytes == 6 * kGiB);
+    CHECK(mid_totals.resident_vram_bytes == 0u);
+    CHECK(r->snapshot()[0].reserved_footprint.vram_bytes() == 6 * kGiB);
+
+    // Concurrent cold load of mock:b (4 GiB) sees 6 + 4 = 10 GiB > 8 GiB budget and is refused cleanly.
+    const auto refused = r->acquire("mock:b");
+    CHECK_FALSE(refused.ok());
+    CHECK(refused.status().code() == si::ErrorCode::unavailable);
+    CHECK(r->totals().admission_rejections == 1u);
+    CHECK(r->totals().reserved_vram_bytes == 6 * kGiB);  // mock:b leaked zero reservation
+
+    // Let mock:a fail: its 6 GiB reservation must be released immediately.
+    gate->open();
+    loader_a.join();
+    CHECK_FALSE(status_a.ok());
+    const auto after_fail = r->totals();
+    CHECK(after_fail.loading == 0u);
+    CHECK(after_fail.resident == 0u);
+    CHECK(after_fail.reserved_vram_bytes == 0u);
+    CHECK(after_fail.resident_vram_bytes == 0u);
+    CHECK(after_fail.load_failures == 1u);
+    CHECK(r->snapshot()[0].reserved_footprint.empty());
+
+    // Now mock:b (4 GiB) admits and loads cleanly.
+    auto pin_b = r->acquire("mock:b");
+    REQUIRE(pin_b.ok());
+    CHECK(r->totals().resident_vram_bytes == 4 * kGiB);
+    CHECK(r->totals().reserved_vram_bytes == 0u);
+}
+
+TEST_CASE("residency unit: post-load reconciliation updates observed bytes and enforces budget on overflow") {
+    EngineModels em;
+    std::vector<std::string> evicted;
+    det::ResidencyConfig cfg;
+    cfg.max_resident_vram_bytes = 8 * kGiB;
+
+    auto r = std::make_shared<det::ModelResidency>(
+        cfg, [&](const std::string& id) { return em.load(id); },
+        [&](det::Eviction& ev) { evicted.push_back(ev.id + ":" + ev.reason); },
+        [](const std::string& id, const std::shared_ptr<si::Model>&,
+           const det::ModelResourceFootprint& reserved) -> std::optional<det::ModelResourceFootprint> {
+            if (id == "mock:grow") {
+                // Pre-load estimated 2 GiB, actual observed allocation is 6 GiB (with projector + adapter).
+                return make_vram_fp(4096, 1024, 512, 256, 256);
+            }
+            return reserved;
+        });
+
+    REQUIRE(r->add("mock:base", "mock", true, make_vram_fp(4096)));   // 4 GiB
+    REQUIRE(r->add("mock:grow", "mock", false, make_vram_fp(2048)));  // 2 GiB est -> 6 GiB observed
+
+    // Load mock:base (4 GiB) and release pin so it is evictable.
+    REQUIRE(r->acquire("mock:base").ok());
+    CHECK(r->totals().resident_vram_bytes == 4 * kGiB);
+
+    // Load mock:grow: pre-load 4 + 2 = 6 GiB fits without pre-eviction, then post-load
+    // observer reconciles mock:grow to 6 GiB -> 4 + 6 = 10 GiB > 8 GiB -> evicts unpinned mock:base!
+    auto pin_grow = r->acquire("mock:grow");
+    REQUIRE(pin_grow.ok());
+    REQUIRE(evicted.size() == 1u);
+    CHECK(evicted[0] == "mock:base:vram_budget");
+    CHECK(r->totals().resident == 1u);
+    CHECK(r->totals().resident_vram_bytes == 6 * kGiB);
+    CHECK(r->totals().reserved_vram_bytes == 0u);
+
+    const auto snap = r->snapshot();
+    CHECK(snap[1].observed_footprint.vram.weights_bytes == 4096 * kMiB);
+    CHECK(snap[1].observed_footprint.vram.kv_cache_bytes == 1024 * kMiB);
+    CHECK(snap[1].observed_footprint.vram.workspace_bytes == 512 * kMiB);
+    CHECK(snap[1].observed_footprint.vram.projector_bytes == 256 * kMiB);
+    CHECK(snap[1].observed_footprint.vram.adapter_bytes == 256 * kMiB);
+
+    // Explicit live reconcile_footprint() updates resident bytes immediately (e.g. adapter attach).
+    CHECK(r->reconcile_footprint("mock:grow", make_vram_fp(4096, 1024, 512, 256, 512)));
+    CHECK(r->totals().resident_vram_bytes == (4096 + 1024 + 512 + 256 + 512) * kMiB);
+    CHECK_FALSE(r->reconcile_footprint("mock:base", make_vram_fp(1024)));  // not resident
+}
+
+TEST_CASE("residency unit: cost-per-byte victim selection keeps three small hot models over one huge cheap-reload model and never evicts pins") {
+    EngineModels em;
+    std::vector<std::string> evicted_ids;
+    std::vector<std::string> evicted_reasons;
+    det::ResidencyConfig cfg;
+    cfg.max_resident_vram_bytes = 10 * kGiB;
+
+    auto r = std::make_shared<det::ModelResidency>(
+        cfg, [&](const std::string& id) { return em.load(id); },
+        [&](det::Eviction& ev) {
+            evicted_ids.push_back(ev.id);
+            evicted_reasons.push_back(ev.reason);
+        });
+
+    REQUIRE(r->add("mock:small1", "mock", true, make_vram_fp(1024)));   // 1 GiB
+    REQUIRE(r->add("mock:small2", "mock", false, make_vram_fp(1024)));  // 1 GiB
+    REQUIRE(r->add("mock:small3", "mock", false, make_vram_fp(1024)));  // 1 GiB
+    REQUIRE(r->add("mock:huge", "mock", false, make_vram_fp(6144)));    // 6 GiB
+    REQUIRE(r->add("mock:incoming", "mock", false, make_vram_fp(4096))); // 4 GiB
+
+    // Load all three small models + the one huge model (total 9 GiB <= 10 GiB).
+    REQUIRE(r->acquire("mock:small1").ok());
+    REQUIRE(r->acquire("mock:small2").ok());
+    REQUIRE(r->acquire("mock:small3").ok());
+    // Make mock:small1..3 hot (higher demand + expensive reload), and load mock:huge LAST
+    // so pure LRU would have evicted mock:small1..3 instead of mock:huge!
+    for (int i = 0; i < 8; ++i) {
+        REQUIRE(r->acquire("mock:small1").ok());
+        REQUIRE(r->acquire("mock:small2").ok());
+        REQUIRE(r->acquire("mock:small3").ok());
+    }
+    REQUIRE(r->acquire("mock:huge").ok());
+    REQUIRE(r->set_reload_ms("mock:small1", 500.0));
+    REQUIRE(r->set_reload_ms("mock:small2", 500.0));
+    REQUIRE(r->set_reload_ms("mock:small3", 500.0));
+    REQUIRE(r->set_reload_ms("mock:huge", 50.0));
+    CHECK(r->totals().resident == 4u);
+    CHECK(r->totals().resident_vram_bytes == 9 * kGiB);
+
+    // Confirm eviction cost formula ordering: mock:huge has far lower cost/byte.
+    const double cost_small = det::ModelResidency::compute_eviction_cost(9.0, 500.0, 1 * kGiB);
+    const double cost_huge = det::ModelResidency::compute_eviction_cost(1.0, 50.0, 6 * kGiB);
+    CHECK(cost_huge < cost_small);
+
+    // Loading mock:incoming (4 GiB) needs 3 GiB freed: MUST evict ONLY mock:huge (6 GiB),
+    // keeping all three small hot models resident!
+    {
+        auto pin_in = r->acquire("mock:incoming");
+        REQUIRE(pin_in.ok());
+    }
+    REQUIRE(evicted_ids.size() == 1u);
+    CHECK(evicted_ids[0] == "mock:huge");
+    CHECK(evicted_reasons[0] == det::kEvictVramBudget);
+    CHECK(r->resident_model("mock:small1") != nullptr);
+    CHECK(r->resident_model("mock:small2") != nullptr);
+    CHECK(r->resident_model("mock:small3") != nullptr);
+    CHECK(r->resident_model("mock:incoming") != nullptr);
+    CHECK(r->resident_model("mock:huge") == nullptr);
+    CHECK(r->totals().resident_vram_bytes == 7 * kGiB);
+
+    // Pins are NEVER evicted: pin mock:small1..3 and mock:incoming (7 GiB pinned total).
+    // Reloading mock:huge (6 GiB) needs 7 + 6 = 13 GiB > 10 GiB -> refused without evicting any pin!
+    auto p1 = r->acquire("mock:small1");
+    auto p2 = r->acquire("mock:small2");
+    auto p3 = r->acquire("mock:small3");
+    auto pin_in = r->acquire("mock:incoming");
+    REQUIRE((p1.ok() && p2.ok() && p3.ok() && pin_in.ok()));
+    const auto blocked = r->acquire("mock:huge");
+    CHECK_FALSE(blocked.ok());
+    CHECK(blocked.status().code() == si::ErrorCode::unavailable);
+    CHECK(evicted_ids.size() == 1u);  // zero pinned models evicted
+    CHECK(r->resident_model("mock:small1") != nullptr);
+    CHECK(r->resident_model("mock:incoming") != nullptr);
+
+    // Release mock:incoming (4 GiB) while mock:small1..3 (3 GiB) stay pinned:
+    // now 3 GiB pinned + 6 GiB incoming = 9 GiB <= 10 GiB -> evicts unpinned mock:incoming, keeps pinned mock:small1..3!
+    pin_in.value().release();
+    auto pin_huge = r->acquire("mock:huge");
+    REQUIRE(pin_huge.ok());
+    REQUIRE(evicted_ids.size() == 2u);
+    CHECK(evicted_ids[1] == "mock:incoming");
+    CHECK(r->resident_model("mock:small1") != nullptr);
+    CHECK(r->resident_model("mock:small2") != nullptr);
+    CHECK(r->resident_model("mock:small3") != nullptr);
+}
+
+TEST_CASE("residency unit: reload_ms is measured automatically and RAM budget evicts RAM victims without touching GPU-only models") {
+    EngineModels em;
+    std::vector<std::string> evicted;
+    det::ResidencyConfig cfg;
+    cfg.max_resident_ram_bytes = 4 * kGiB;
+
+    auto r = std::make_shared<det::ModelResidency>(
+        cfg,
+        [&](const std::string& id) {
+            if (id == "mock:ram_slow") {
+                std::this_thread::sleep_for(std::chrono::milliseconds(15));
+            }
+            return em.load(id);
+        },
+        [&](det::Eviction& ev) { evicted.push_back(ev.id + ":" + ev.reason); });
+
+    REQUIRE(r->add("mock:gpu_only", "mock", true, make_vram_fp(4096, 0, 0, 0, 0, 0)));  // 4 GiB VRAM, 0 RAM
+    REQUIRE(r->add("mock:ram_slow", "mock", false, make_vram_fp(0, 0, 0, 0, 0, 2048))); // 2 GiB RAM
+    REQUIRE(r->add("mock:ram_fast", "mock", false, make_vram_fp(0, 0, 0, 0, 0, 2048))); // 2 GiB RAM
+    REQUIRE(r->add("mock:ram_new", "mock", false, make_vram_fp(0, 0, 0, 0, 0, 2048)));  // 2 GiB RAM
+
+    REQUIRE(r->acquire("mock:gpu_only").ok());
+    REQUIRE(r->acquire("mock:ram_slow").ok());
+    REQUIRE(r->acquire("mock:ram_fast").ok());
+
+    const auto snaps = r->snapshot();
+    CHECK(snaps[1].reload_ms >= 10.0);  // measured wall-clock load time
+
+    // Make mock:ram_slow strictly more expensive to reload than mock:ram_fast so mock:ram_fast is evicted first,
+    // and mock:gpu_only (0 RAM) is never touched for RAM budget pressure.
+    REQUIRE(r->set_reload_ms("mock:ram_slow", 400.0));
+    REQUIRE(r->set_reload_ms("mock:ram_fast", 10.0));
+    REQUIRE(r->acquire("mock:ram_new").ok());
+
+    REQUIRE(evicted.size() == 1u);
+    CHECK(evicted[0] == "mock:ram_fast:ram_budget");
+    CHECK(r->resident_model("mock:gpu_only") != nullptr);
+    CHECK(r->resident_model("mock:ram_slow") != nullptr);
+    CHECK(r->resident_model("mock:ram_new") != nullptr);
+    CHECK(r->totals().resident_ram_bytes == 4 * kGiB);
+}
+
+TEST_CASE("residency: server enforces max_resident_vram_bytes using profile footprints and exposes byte totals in health") {
+    auto backend = std::make_shared<CountingBackend>();
+    auto o = counting_options(backend);
+    o.models = {"mock:a", "mock:b"};
+    o.lazy_models = true;
+    o.max_resident_vram_bytes = 5 * kGiB;
+
+    srv::ModelProfileBinding ba;
+    ba.model = "mock:a";
+    ba.estimated_footprint = make_vram_fp(3072, 512, 512);  // 4 GiB
+    srv::ModelProfileBinding bb;
+    bb.model = "mock:b";
+    bb.estimated_footprint = make_vram_fp(2560, 512, 0);    // 3 GiB
+    o.profile_bindings = {ba, bb};
+
+    Fixture f(o);
+    CHECK(post(f.port, "/v1/chat/completions", chat_for("mock:a")).status == 200);
+    const json::Value h1 = get(f.port, "/v1/sonder/health").json();
+    CHECK(h1.find("residency")->find("max_resident_vram_bytes")->as_uint() == 5 * kGiB);
+    CHECK(h1.find("residency")->find("resident_vram_bytes")->as_uint() == 4 * kGiB);
+    const json::Value* ma = health_model(h1, "mock:a");
+    REQUIRE(ma != nullptr);
+    CHECK(ma->find("footprint")->find("vram")->find("total_bytes")->as_uint() == 4 * kGiB);
+
+    // Loading mock:b (3 GiB) exceeds 5 GiB with mock:a (4 GiB) -> evicts mock:a with vram_budget.
+    CHECK(post(f.port, "/v1/chat/completions", chat_for("mock:b")).status == 200);
+    CHECK(model_state(f.port, "mock:a") == "unloaded");
+    CHECK(model_state(f.port, "mock:b") == "resident");
+    const auto evicted = f.of_type("model.evicted");
+    REQUIRE(evicted.size() == 1u);
+    const json::Value* attrs = evicted[0].find("attributes");
+    CHECK(attrs->find("reason")->as_string() == "vram_budget");
+    CHECK(attrs->find("freed_vram_bytes")->as_uint() == 4 * kGiB);
+}

@@ -12,6 +12,7 @@
 
 #include "sonder/inference/backend.hpp"
 #include "sonder/inference/speculative_verifier.hpp"
+#include "sonder/inference/swa_policy.hpp"
 
 namespace sonder::inference {
 
@@ -92,6 +93,10 @@ struct LlamaCppBackendOptions {
     double moe_cache_cpu_share = 0.0;
     // Optional multimodal projector GGUF path (--mmproj); requires libmtmd build.
     std::string mmproj_path;
+    // Sliding-window attention KV policy: Full (default, safe for arbitrary
+    // prefix trims/rewinds/speculative rollbacks) or CompactIfQualified
+    // (opt-in compact SWA cache guarded by min_retained_pos watermark checks).
+    SwaKvMode swa_kv_mode = SwaKvMode::Full;
 };
 
 // Checks the llama.cpp context and placement options (KV cache types,

@@ -2817,3 +2817,128 @@ TEST_CASE("serve_options: --moe-cache-mib, --moe-cache-cpu-share rejection, --ca
         std::filesystem::remove(pf_path, ec);
     }
 }
+
+TEST_CASE("VRAM estimate & SWA policy: explicit Full vs CompactIfQualified and qualification fallback") {
+    const si::GgufModelInfo gemma4 = parse_fixture(gemma4_fixture());
+    const std::uint64_t full_kv = (16384ull + 327680ull) * 262144;
+    const std::uint64_t compact_kv = 16384ull * 262144 + 327680ull * 1536;
+
+    // Direct llamacpp defaults to Full (safe default).
+    LaunchProfile direct = parse_single(R"({"name":"d","backend":"llamacpp","model":"g4.gguf","ctx_size":262144})");
+    const si::VramEstimate d_default = si::estimate_vram(gemma4, direct);
+    CHECK(d_default.effective_swa_kv_mode == si::SwaKvMode::Full);
+    CHECK(d_default.swa_compact_qualified);
+    CHECK(d_default.kv_bytes == full_kv);
+
+    // Opt-in CompactIfQualified via LaunchProfile JSON shrinks SWA KV to window + ubatch.
+    LaunchProfile direct_compact = parse_single(
+        R"({"name":"dc","backend":"llamacpp","model":"g4.gguf","ctx_size":262144,"swa_kv_mode":"compact_if_qualified"})");
+    REQUIRE(direct_compact.swa_kv_mode == std::optional<si::SwaKvMode>(si::SwaKvMode::CompactIfQualified));
+    const si::VramEstimate d_compact = si::estimate_vram(gemma4, direct_compact);
+    CHECK(d_compact.effective_swa_kv_mode == si::SwaKvMode::CompactIfQualified);
+    CHECK(d_compact.swa_compact_qualified);
+    CHECK(d_compact.swa_context_per_sequence == 1536u);
+    CHECK(d_compact.kv_bytes == compact_kv);
+    CHECK(d_compact.kv_bytes < d_default.kv_bytes);
+    bool noted_guard = false;
+    for (const auto& note : d_compact.notes) noted_guard = noted_guard || contains(note, "min_retained_pos");
+    CHECK(noted_guard);
+
+    // Explicit VramEstimateInputs::swa_kv_mode overrides profile mode; inherited_swa_full still forces Full.
+    si::VramEstimateInputs force_full;
+    force_full.swa_kv_mode = si::SwaKvMode::Full;
+    const si::VramEstimate ls_forced_full = si::estimate_vram(gemma4, gemma4_profile(), force_full);
+    CHECK(ls_forced_full.effective_swa_kv_mode == si::SwaKvMode::Full);
+    CHECK(ls_forced_full.kv_bytes == full_kv);
+
+    si::VramEstimateInputs inherited_wins;
+    inherited_wins.swa_kv_mode = si::SwaKvMode::CompactIfQualified;
+    inherited_wins.inherited_swa_full = true;
+    CHECK(si::estimate_vram(gemma4, direct_compact, inherited_wins).effective_swa_kv_mode == si::SwaKvMode::Full);
+
+    // Unqualified / unmodelled SWA architecture falls back to Full even when CompactIfQualified is requested.
+    const si::GgufModelInfo unqualified = swa_header("llama", 4, {{"attention.sliding_window", 4096}});
+    const si::VramEstimate unq_est = si::estimate_vram(unqualified, direct_compact);
+    CHECK_FALSE(unq_est.swa_compact_qualified);
+    CHECK(unq_est.effective_swa_kv_mode == si::SwaKvMode::Full);
+
+    // llamaserver_arguments emits --swa-full when swa_kv_mode is explicitly Full.
+    LaunchProfile ls_full = parse_single(
+        R"({"name":"lsf","backend":"llamaserver","model":"g4.gguf","ctx_size":4096,"swa_kv_mode":"full"})");
+    const auto ls_argv = si::llamaserver_arguments(ls_full);
+    REQUIRE(ls_argv.ok());
+    CHECK(std::find(ls_argv->begin(), ls_argv->end(), "--swa-full") != ls_argv->end());
+
+    // apply_llamacpp_profile wires swa_kv_mode into BackendSetup.
+    si::BackendSetup setup;
+    std::string device;
+    REQUIRE(si::apply_llamacpp_profile(direct_compact, setup, device).ok());
+    CHECK(setup.llamacpp_swa_kv_mode == std::optional<si::SwaKvMode>(si::SwaKvMode::CompactIfQualified));
+
+    // Invalid swa_kv_mode JSON value is rejected strictly.
+    CHECK(contains(parse_error(R"({"name":"bad","backend":"llamacpp","model":"m.gguf","swa_kv_mode":"sliding"})"),
+                   "'swa_kv_mode'"));
+}
+
+TEST_CASE("SWA rollback guard: fails closed on cuts below min_retained_pos and stays open in Full mode") {
+    // 1. Full mode: min_retained_pos stays 0 regardless of sequence advance; all rewinds allowed.
+    si::SwaRollbackGuard full_guard;
+    full_guard.Configure(si::SwaKvMode::Full, 1024, 512, /*architecture_qualified=*/true);
+    CHECK_FALSE(full_guard.compact_active());
+    full_guard.OnAdvance(10000);
+    CHECK(full_guard.min_retained_pos() == 0u);
+    CHECK(full_guard.CheckAndApplyRollback(100));
+    CHECK(full_guard.rollback_rejections() == 0u);
+
+    // 2. CompactIfQualified on unqualified model: stays inactive (Full fallback).
+    si::SwaRollbackGuard unq_guard;
+    unq_guard.Configure(si::SwaKvMode::CompactIfQualified, 1024, 512, /*architecture_qualified=*/false);
+    CHECK_FALSE(unq_guard.compact_active());
+    unq_guard.OnAdvance(10000);
+    CHECK(unq_guard.min_retained_pos() == 0u);
+    CHECK(unq_guard.CheckAndApplyRollback(50));
+
+    // 3. CompactIfQualified on qualified model (W=1024, slack=512 -> retained_capacity=1536).
+    si::SwaRollbackGuard guard;
+    guard.Configure(si::SwaKvMode::CompactIfQualified, 1024, 512, /*architecture_qualified=*/true);
+    CHECK(guard.compact_active());
+    CHECK(guard.retained_capacity() == 1536u);
+
+    // Within retained capacity (<= 1536): no rows overwritten yet -> min_retained_pos == 0.
+    guard.OnAdvance(1536);
+    CHECK(guard.oldest_retained_row() == 0u);
+    CHECK(guard.min_retained_pos() == 0u);
+    CHECK(guard.CheckAndApplyRollback(256));
+    CHECK(guard.seq_len() == 256u);
+
+    // Advance past retained capacity to seq_len = 2000:
+    // oldest_retained_row = 2000 - 1536 = 464, min_retained_pos = 464 + 1024 = 1488.
+    guard.OnAdvance(2000);
+    CHECK(guard.oldest_retained_row() == 464u);
+    CHECK(guard.min_retained_pos() == 1488u);
+
+    // Speculative rejection rolling back 10 tokens to 1990 (>= 1488): SAFE, watermark stays monotonic.
+    CHECK(guard.CheckAndApplyRollback(1990));
+    CHECK(guard.seq_len() == 1990u);
+    CHECK(guard.min_retained_pos() == 1488u);
+
+    // Exact boundary cut at 1488: SAFE (window [464..1487] is intact).
+    CHECK(guard.CheckAndApplyRollback(1488));
+    CHECK(guard.seq_len() == 1488u);
+    CHECK(guard.rollback_rejections() == 0u);
+
+    // Cut targeting 1487 (< min_retained_pos 1488): FAILS CLOSED and resets for full recomputation!
+    CHECK_FALSE(guard.CheckAndApplyRollback(1487));
+    CHECK(guard.rollback_rejections() == 1u);
+    CHECK(guard.seq_len() == 0u);
+    CHECK(guard.min_retained_pos() == 0u);
+
+    // Backend llama_memory_seq_pos_min observation monotonically raises watermark fail-closed.
+    guard.OnAdvance(1200);
+    CHECK(guard.min_retained_pos() == 0u);
+    guard.ObserveBackendPosMin(300);  // backend evicted rows < 300
+    CHECK(guard.oldest_retained_row() == 300u);
+    CHECK(guard.min_retained_pos() == 1324u);
+    CHECK_FALSE(guard.CheckAndApplyRollback(1200));  // < 1324 -> rejected!
+    CHECK(guard.rollback_rejections() == 2u);
+}

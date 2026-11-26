@@ -361,6 +361,10 @@ Status ValidateContextOptions(const LoadOptions& options) {
     if (ToString(options.flash_attn) == "unknown") {
         return Status::Error(ErrorCode::kInvalidArgument, "unknown flash attention mode");
     }
+    if (sonder::inference::to_string(options.swa_kv_mode) == "unknown") {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "unknown swa_kv_mode (expected full or compact_if_qualified)");
+    }
     if (options.n_slots < 1 || options.n_slots > kMaxSlots) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "n_slots (" + std::to_string(options.n_slots) + ") must be in [1, " +
