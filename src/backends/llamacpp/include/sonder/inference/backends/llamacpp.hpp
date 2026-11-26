@@ -110,6 +110,10 @@ struct LlamaCppBackendOptions {
     std::uint32_t spec_batch_max_slots = 4;
     // Maximum aggregate draft tokens verified across all concurrent slots per step (0 = default 16).
     std::int32_t spec_batch_max_aggregate_draft_tokens = 16;
+    // Configurable multi-sequence embedding/rerank batch token budget (0 = auto).
+    std::uint32_t embed_batch_tokens = 2048;
+    // Maximum sequences packed per embedding/rerank forward pass (0 = auto, max 64).
+    std::uint32_t embed_max_sequences = 16;
 };
 
 // Checks the llama.cpp context and placement options (KV cache types,

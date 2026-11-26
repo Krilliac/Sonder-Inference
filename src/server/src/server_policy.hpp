@@ -53,6 +53,8 @@ enum class Route {
     responses,
     messages,
     embeddings,
+    rerank,
+    score,
     tokenize,
     detokenize,
     discovery,

@@ -1685,4 +1685,87 @@ TEST_SUITE("llamaserver_backend") {
             CHECK_FALSE(res->effective_execution->cache.device_prefix_reused_tokens.has_value());
         }
     }
+
+    TEST_CASE("rerank and score forward to /v1/rerank and preserve indices and fail-closed embed dimensions") {
+        sonder_test::FakeLlamaServer server;
+        server.set_props(R"({"default_generation_settings":{"n_ctx":1024},"total_slots":2})");
+
+        LlamaServerBackendOptions options;
+        options.base_url = server.url();
+        options.native_completion = true;
+        auto backend = make_llamaserver_backend(options);
+        CHECK(backend->capabilities().has(Capability::reranking));
+        auto model = backend->load_model({"fake-model", "cpu:0"});
+        REQUIRE_MESSAGE(model.ok(), model.status().to_string());
+
+        // 1. /v1/rerank forwards query, documents, top_n and sorts descending while preserving original index.
+        server.set_rerank(
+            R"({"results":[{"index":2,"relevance_score":0.91},{"index":0,"relevance_score":0.15},{"index":1,"relevance_score":0.62}],"usage":{"prompt_tokens":19}})");
+        RerankRequest rr;
+        rr.query = "vulkan memory";
+        rr.documents = {"d0", "d1", "d2"};
+        rr.top_n = 2;
+        rr.return_documents = true;
+        auto ranked = model.value()->rerank(rr, {});
+        REQUIRE_MESSAGE(ranked.ok(), ranked.status().to_string());
+        REQUIRE(ranked.value().results.size() == 2u);
+        CHECK(ranked.value().model == "fake-model");
+        CHECK(ranked.value().prompt_tokens == 19u);
+        CHECK(ranked.value().results[0].index == 2u);
+        CHECK(ranked.value().results[0].relevance_score == doctest::Approx(0.91));
+        CHECK(ranked.value().results[0].document == "d2");
+        CHECK(ranked.value().results[1].index == 1u);
+        CHECK(ranked.value().results[1].relevance_score == doctest::Approx(0.62));
+        CHECK(ranked.value().results[1].document == "d1");
+
+        // 2. /v1/score groups pairs by text_1 and scatters scores back to exact original pair indices.
+        server.enqueue_rerank(
+            R"({"results":[{"index":1,"relevance_score":0.80},{"index":0,"relevance_score":0.20}],"usage":{"prompt_tokens":10}})");
+        server.enqueue_rerank(
+            R"({"results":[{"index":0,"relevance_score":0.55}],"usage":{"prompt_tokens":5}})");
+        ScoreRequest sr;
+        sr.pairs = {{"qA", "doc0"}, {"qB", "doc1"}, {"qA", "doc2"}};
+        auto scored = model.value()->score(sr, {});
+        REQUIRE_MESSAGE(scored.ok(), scored.status().to_string());
+        REQUIRE(scored.value().scores.size() == 3u);
+        CHECK(scored.value().prompt_tokens == 15u);
+        CHECK(scored.value().scores[0].index == 0u);
+        CHECK(scored.value().scores[0].score == doctest::Approx(0.20));
+        CHECK(scored.value().scores[1].index == 1u);
+        CHECK(scored.value().scores[1].score == doctest::Approx(0.55));
+        CHECK(scored.value().scores[2].index == 2u);
+        CHECK(scored.value().scores[2].score == doctest::Approx(0.80));
+
+        // 3. Upstream 501/404 maps cleanly to ErrorCode::unsupported.
+        server.set_rerank(R"({"error":"not a reranker"})", 501);
+        auto unsup = model.value()->rerank(rr, {});
+        CHECK(unsup.status().code() == ErrorCode::unsupported);
+
+        // 4. Native llama-server mode fails closed on embed dimensions reduction.
+        EmbedRequest er;
+        er.inputs = {"hello"};
+        er.dimensions = 4;
+        auto bad_dim = model.value()->embed(er, {});
+        CHECK(bad_dim.status().code() == ErrorCode::invalid_argument);
+        CHECK(bad_dim.status().message().find("dimensions") != std::string::npos);
+
+        // 5. Generic OpenAI mode forwards dimensions and rejects mismatched vector length.
+        LlamaServerBackendOptions generic_opts;
+        generic_opts.base_url = server.url();
+        generic_opts.native_completion = false;
+        auto generic_be = make_llamaserver_backend(generic_opts);
+        CHECK_FALSE(generic_be->capabilities().has(Capability::reranking));
+        auto generic_model = generic_be->load_model({"fake-model", "cpu:0"});
+        REQUIRE(generic_model.ok());
+        server.set_embeddings(R"({"data":[{"index":0,"embedding":[0.1,0.2,0.3,0.4]}],"usage":{"prompt_tokens":3}})", 200);
+        auto ok_dim = generic_model.value()->embed(er, {});
+        REQUIRE_MESSAGE(ok_dim.ok(), ok_dim.status().to_string());
+        CHECK(ok_dim.value().dimensions == 4u);
+        CHECK(ok_dim.value().model == "fake-model");
+        CHECK(ok_dim.value().encoding_format == "float");
+
+        er.dimensions = 2;
+        auto mismatch_dim = generic_model.value()->embed(er, {});
+        CHECK(mismatch_dim.status().code() == ErrorCode::invalid_argument);
+    }
 }

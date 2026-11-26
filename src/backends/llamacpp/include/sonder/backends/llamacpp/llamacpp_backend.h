@@ -36,6 +36,7 @@ enum class ErrorCode {
     kTokenizeFailed,
     kContextOverflow,
     kDecodeFailed,
+    kUnsupported,
 };
 
 struct Status {
@@ -103,6 +104,11 @@ inline constexpr std::size_t kMaxTensorSplitDevices = 16;
 
 // Maximum number of cached KV sequence slots (1..kMaxSlots).
 inline constexpr std::uint32_t kMaxSlots = 16;
+
+// Maximum sequences packed into a single multi-sequence embedding/rerank batch.
+inline constexpr std::uint32_t kMaxEmbedSequences = 64;
+inline constexpr std::uint32_t kDefaultEmbedBatchTokens = 2048;
+inline constexpr std::uint32_t kDefaultEmbedMaxSequences = 16;
 
 // Maximum draft tokens per speculative step and per-strategy defaults.
 inline constexpr std::int32_t kMaxSpecDraftTokens = 64;
@@ -239,6 +245,10 @@ struct LoadOptions {
     std::uint32_t spec_batch_max_slots = 4;
     // Maximum aggregate draft tokens verified across all concurrent slots per step (0 = default 16).
     std::int32_t spec_batch_max_aggregate_draft_tokens = 16;
+    // Configurable multi-sequence embedding/rerank batch token budget (0 = auto).
+    std::uint32_t embed_batch_tokens = kDefaultEmbedBatchTokens;
+    // Maximum sequences packed per embedding/rerank forward pass (0 = auto, max kMaxEmbedSequences).
+    std::uint32_t embed_max_sequences = kDefaultEmbedMaxSequences;
 };
 
 // Checks placement options (main_gpu >= 0, split_mode, tensor_split finite /
@@ -451,10 +461,37 @@ struct SpeculativeLoadInfo {
     bool l2_cache_enabled = false;
 };
 
+enum class PoolingType {
+    kUnspecified = -1,
+    kNone = 0,
+    kMean = 1,
+    kCls = 2,
+    kLast = 3,
+    kRank = 4,
+};
+
+struct EmbedOptions {
+    bool normalize = true;
+    std::optional<std::size_t> dimensions = std::nullopt;
+    PoolingType pooling = PoolingType::kUnspecified;
+    std::uint32_t max_batch_tokens = 0;   // 0 = LoadOptions / auto budget
+    std::uint32_t max_sequences = 0;      // 0 = LoadOptions / auto cap
+};
+
 struct EmbedOutput {
     std::vector<std::vector<float>> embeddings;
     std::int32_t prompt_tokens = 0;
     double eval_ms = 0.0;
+    std::size_t dimensions = 0;
+    PoolingType pooling = PoolingType::kUnspecified;
+    std::size_t batches_executed = 0;
+};
+
+struct ScoreOutput {
+    std::vector<double> scores;  // raw RANK pooling score per pair in exact input order
+    std::int32_t prompt_tokens = 0;
+    double eval_ms = 0.0;
+    std::size_t batches_executed = 0;
 };
 
 enum class DeviceKind { kCpu, kGpu, kIntegratedGpu, kAccelerator, kOther };
@@ -527,6 +564,7 @@ struct Capabilities {
     bool recurrent_checkpoint = true;
     bool continuous_batch_decode = true;
     bool logprobs = true;
+    bool reranking = true;
 };
 
 // Severity of a llama.cpp/ggml log line. The values mirror ggml_log_level.
@@ -618,9 +656,26 @@ public:
                             const CancelPredicate& should_cancel = {});
 
     // Computes dense embeddings for one or more tokenized inputs using an
-    // isolated lazy embedding context so live KV prefix caches stay intact.
+    // isolated lazy multi-sequence embedding context so live KV prefix caches stay intact.
     Status Embed(const std::vector<std::vector<Token>>& inputs, bool normalize, EmbedOutput& out,
                  const CancelPredicate& should_cancel = {});
+    Status Embed(const std::vector<std::vector<Token>>& inputs, const EmbedOptions& options, EmbedOutput& out,
+                 const CancelPredicate& should_cancel = {});
+
+    // True when the loaded model supports native RANK pooling / cross-encoder scoring.
+    [[nodiscard]] bool SupportsReranking() const noexcept;
+    // Native embedding output dimension of the loaded model (0 when unloaded).
+    [[nodiscard]] std::int32_t EmbeddingDimensions() const noexcept;
+    // Formats a (query, document) pair into tokens for a cross-encoder reranker
+    // (honoring a GGUF `rerank` template with G0028 special-token isolation, or
+    // standard BOS/EOS/SEP framing).
+    Status FormatRerankPair(std::string_view query, std::string_view document, std::vector<Token>& out) const;
+    // Scores pre-tokenized (query, document) pairs using an isolated lazy RANK
+    // pooling context with length-aware multi-sequence batching, preserving exact
+    // original input order. Fails closed with kUnsupported on non-reranker models.
+    Status ScorePairs(const std::vector<std::vector<Token>>& pairs, ScoreOutput& out,
+                      const CancelPredicate& should_cancel = {}, std::uint32_t max_batch_tokens = 0,
+                      std::uint32_t max_sequences = 0);
 
     // Captures sequence 0 state (KV + recurrent/SSM state) via llama_state_seq_get_*.
     Status CaptureSequenceState(std::vector<std::uint8_t>& out_bytes,

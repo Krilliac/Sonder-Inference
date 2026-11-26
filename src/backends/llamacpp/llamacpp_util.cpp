@@ -17,6 +17,7 @@ std::string_view ToString(ErrorCode code) noexcept {
         case ErrorCode::kTokenizeFailed: return "tokenize_failed";
         case ErrorCode::kContextOverflow: return "context_overflow";
         case ErrorCode::kDecodeFailed: return "decode_failed";
+        case ErrorCode::kUnsupported: return "unsupported";
     }
     return "unknown";
 }
@@ -441,6 +442,11 @@ Status ValidateContextOptions(const LoadOptions& options) {
     if (!std::isfinite(options.default_foreground_itl_ms) || options.default_foreground_itl_ms < 0.0) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "default_foreground_itl_ms must be finite and >= 0.0");
+    }
+    if (options.embed_max_sequences > kMaxEmbedSequences) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "embed_max_sequences (" + std::to_string(options.embed_max_sequences) +
+                                 ") must be <= " + std::to_string(kMaxEmbedSequences));
     }
     // n_batch == 0 keeps its own, older error in Load().
     if (options.n_batch > 0 && options.n_ubatch > options.n_batch) {

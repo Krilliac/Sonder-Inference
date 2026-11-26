@@ -299,6 +299,7 @@ ErrorCode MapError(lc::ErrorCode code) {
         case lc::ErrorCode::kTokenizeFailed: return ErrorCode::backend_error;
         case lc::ErrorCode::kContextOverflow: return ErrorCode::invalid_argument;
         case lc::ErrorCode::kDecodeFailed: return ErrorCode::backend_error;
+        case lc::ErrorCode::kUnsupported: return ErrorCode::unsupported;
     }
     return ErrorCode::internal;
 }
@@ -559,7 +560,7 @@ struct RuntimeState {
             if (!mtmd_build) s.note = "libmtmd_not_in_build";
             out.emplace_back("multimodal", std::move(s));
         }
-        for (const char* cap_name : {"structured_output", "embeddings", "logprobs", "recurrent_checkpoint"}) {
+        for (const char* cap_name : {"structured_output", "embeddings", "reranking", "logprobs", "recurrent_checkpoint"}) {
             CapabilityStatus s;
             s.adapter_supports = CapabilityState::yes;
             s.build_supports = CapabilityState::yes;
@@ -769,6 +770,8 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     lo.spec_batch_enabled = o.spec_batch_enabled;
     lo.spec_batch_max_slots = o.spec_batch_max_slots;
     lo.spec_batch_max_aggregate_draft_tokens = o.spec_batch_max_aggregate_draft_tokens;
+    lo.embed_batch_tokens = o.embed_batch_tokens;
+    lo.embed_max_sequences = o.embed_max_sequences;
     if (!lc::ParseSplitMode(o.split_mode, lo.split_mode)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown split mode '" + o.split_mode + "' (expected none, layer or row)");
@@ -842,10 +845,38 @@ public:
         return text;
     }
 
+    static lc::PoolingType ToLcPooling(EmbedPoolingType pooling) noexcept {
+        switch (pooling) {
+            case EmbedPoolingType::unspecified: return lc::PoolingType::kUnspecified;
+            case EmbedPoolingType::none: return lc::PoolingType::kNone;
+            case EmbedPoolingType::mean: return lc::PoolingType::kMean;
+            case EmbedPoolingType::cls: return lc::PoolingType::kCls;
+            case EmbedPoolingType::last: return lc::PoolingType::kLast;
+            case EmbedPoolingType::rank: return lc::PoolingType::kRank;
+        }
+        return lc::PoolingType::kUnspecified;
+    }
+
+    static EmbedPoolingType FromLcPooling(lc::PoolingType pooling) noexcept {
+        switch (pooling) {
+            case lc::PoolingType::kNone: return EmbedPoolingType::none;
+            case lc::PoolingType::kMean: return EmbedPoolingType::mean;
+            case lc::PoolingType::kCls: return EmbedPoolingType::cls;
+            case lc::PoolingType::kLast: return EmbedPoolingType::last;
+            case lc::PoolingType::kRank: return EmbedPoolingType::rank;
+            case lc::PoolingType::kUnspecified:
+            default: return EmbedPoolingType::unspecified;
+        }
+    }
+
     Result<EmbedResult> embed(const EmbedRequest& request, const CancellationToken& cancel) override {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
         if (request.inputs.empty()) {
             return Status(ErrorCode::invalid_argument, "embed request inputs are empty");
+        }
+        if (request.pooling_type == EmbedPoolingType::rank) {
+            return Status(ErrorCode::invalid_argument,
+                          "llamacpp backend does not support pooling_type 'rank' for dense embeddings");
         }
         std::unique_lock<std::shared_mutex> lock(mutex_);
         std::vector<std::vector<lc::Token>> tokenized;
@@ -861,9 +892,13 @@ public:
             }
             tokenized.push_back(std::move(toks));
         }
+        lc::EmbedOptions emb_opts;
+        emb_opts.normalize = request.normalize;
+        emb_opts.dimensions = request.dimensions;
+        emb_opts.pooling = ToLcPooling(request.pooling_type);
         lc::EmbedOutput emb_out;
         const lc::Status st =
-            runtime_.Embed(tokenized, request.normalize, emb_out, [&] { return cancel.cancelled(); });
+            runtime_.Embed(tokenized, emb_opts, emb_out, [&] { return cancel.cancelled(); });
         if (!st.ok()) {
             if (cancel.cancelled()) return Status(ErrorCode::cancelled, "embedding cancelled");
             return ToStatus(st);
@@ -872,6 +907,95 @@ public:
         result.embeddings = std::move(emb_out.embeddings);
         result.prompt_tokens = static_cast<std::uint64_t>(emb_out.prompt_tokens);
         result.eval_ns = MsToNs(emb_out.eval_ms);
+        result.dimensions = emb_out.dimensions;
+        result.pooling_type = FromLcPooling(emb_out.pooling);
+        result.encoding_format = request.encoding_format.empty() ? std::string("float") : request.encoding_format;
+        result.model = desc_.name;
+        return result;
+    }
+
+    Result<RerankResult> rerank(const RerankRequest& request, const CancellationToken& cancel) override {
+        if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
+        if (Status st = validate_rerank_request(request); !st.ok()) return st;
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        if (!runtime_.SupportsReranking()) {
+            return Status(ErrorCode::unsupported,
+                          "model '" + desc_.name + "' does not support reranking (RANK pooling is required)");
+        }
+        std::vector<std::vector<lc::Token>> tokenized_pairs;
+        tokenized_pairs.reserve(request.documents.size());
+        for (const std::string& doc : request.documents) {
+            if (cancel.cancelled()) return Status(ErrorCode::cancelled, "reranking cancelled");
+            std::vector<lc::Token> toks;
+            if (lc::Status s = runtime_.FormatRerankPair(request.query, doc, toks); !s.ok()) {
+                return ToStatus(s);
+            }
+            tokenized_pairs.push_back(std::move(toks));
+        }
+        lc::ScoreOutput score_out;
+        const lc::Status st =
+            runtime_.ScorePairs(tokenized_pairs, score_out, [&] { return cancel.cancelled(); });
+        if (!st.ok()) {
+            if (cancel.cancelled()) return Status(ErrorCode::cancelled, "reranking cancelled");
+            return ToStatus(st);
+        }
+        if (score_out.scores.size() != request.documents.size()) {
+            return Status(ErrorCode::backend_error, "llamacpp returned mismatched rerank score count");
+        }
+        RerankResult result;
+        result.model = desc_.name;
+        result.prompt_tokens = static_cast<std::uint64_t>(score_out.prompt_tokens);
+        result.eval_ns = MsToNs(score_out.eval_ms);
+        result.results.reserve(request.documents.size());
+        for (std::size_t i = 0; i < request.documents.size(); ++i) {
+            RerankItem item;
+            item.index = i;
+            item.relevance_score = score_out.scores[i];
+            if (request.return_documents) {
+                item.document = request.documents[i];
+            }
+            result.results.push_back(std::move(item));
+        }
+        finalize_rerank_items(result.results, request.top_n);
+        return result;
+    }
+
+    Result<ScoreResult> score(const ScoreRequest& request, const CancellationToken& cancel) override {
+        if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
+        if (Status st = validate_score_request(request); !st.ok()) return st;
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        if (!runtime_.SupportsReranking()) {
+            return Status(ErrorCode::unsupported,
+                          "model '" + desc_.name + "' does not support pair scoring (RANK pooling is required)");
+        }
+        std::vector<std::vector<lc::Token>> tokenized_pairs;
+        tokenized_pairs.reserve(request.pairs.size());
+        for (const auto& pair : request.pairs) {
+            if (cancel.cancelled()) return Status(ErrorCode::cancelled, "pair scoring cancelled");
+            std::vector<lc::Token> toks;
+            if (lc::Status s = runtime_.FormatRerankPair(pair.text_1, pair.text_2, toks); !s.ok()) {
+                return ToStatus(s);
+            }
+            tokenized_pairs.push_back(std::move(toks));
+        }
+        lc::ScoreOutput score_out;
+        const lc::Status st =
+            runtime_.ScorePairs(tokenized_pairs, score_out, [&] { return cancel.cancelled(); });
+        if (!st.ok()) {
+            if (cancel.cancelled()) return Status(ErrorCode::cancelled, "pair scoring cancelled");
+            return ToStatus(st);
+        }
+        if (score_out.scores.size() != request.pairs.size()) {
+            return Status(ErrorCode::backend_error, "llamacpp returned mismatched pair score count");
+        }
+        ScoreResult result;
+        result.model = desc_.name;
+        result.prompt_tokens = static_cast<std::uint64_t>(score_out.prompt_tokens);
+        result.eval_ns = MsToNs(score_out.eval_ms);
+        result.scores.reserve(request.pairs.size());
+        for (std::size_t i = 0; i < request.pairs.size(); ++i) {
+            result.scores.push_back(ScoreItem{i, score_out.scores[i]});
+        }
         return result;
     }
 
@@ -1218,7 +1342,8 @@ public:
             .add(Capability::embeddings)
             .add(Capability::deterministic)
             .add(Capability::recurrent_checkpoint)
-            .add(Capability::logprobs);
+            .add(Capability::logprobs)
+            .add(Capability::reranking);
         if (options_.slots > 1u) {
             caps.add(Capability::continuous_batch_decode);
         }

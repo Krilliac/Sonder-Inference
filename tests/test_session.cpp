@@ -742,4 +742,222 @@ TEST_CASE("embed emits request.started and propagates parent_request_id on failu
     CHECK(ok.value().embeddings.size() == 1u);
 }
 
+TEST_CASE("session rerank and score lifecycle, sorting, index preservation, cancellation, and exception recovery") {
+    // 1. Default mock backend: deterministic rerank + score parity and telemetry.
+    {
+        sonder_test::Harness h({}, TelemetryLevel::metrics);
+        REQUIRE(h.model);
+        auto session = h.session();
+        REQUIRE(session);
+
+        RerankRequest rreq;
+        rreq.query = "sonder kv prefix cache";
+        rreq.documents = {"unrelated text", "sonder kv prefix cache reuse", "prefix notes"};
+        rreq.return_documents = true;
+        RequestOptions ro;
+        ro.request_id = "req-rerank-1";
+        ro.parent_request_id = "turn-r1";
+        auto rr = session->rerank(rreq, ro);
+        REQUIRE_MESSAGE(rr.ok(), rr.status().message());
+        CHECK(rr->model == "mock:tiny");
+        CHECK(rr->prompt_tokens > 0u);
+        REQUIRE(rr->results.size() == 3u);
+        CHECK(rr->results[0].index == 1u);
+        REQUIRE(rr->results[0].document.has_value());
+        CHECK(*rr->results[0].document == "sonder kv prefix cache reuse");
+        CHECK(rr->results[2].index == 0u);
+        CHECK(rr->results[0].relevance_score > rr->results[1].relevance_score);
+        CHECK(rr->results[1].relevance_score > rr->results[2].relevance_score);
+
+        // top_n truncation keeps top 2 highest-scoring original indices.
+        rreq.top_n = 2;
+        rreq.return_documents = false;
+        auto rr2 = session->rerank(rreq);
+        REQUIRE(rr2.ok());
+        REQUIRE(rr2->results.size() == 2u);
+        CHECK(rr2->results[0].index == 1u);
+        CHECK_FALSE(rr2->results[0].document.has_value());
+
+        // Score preserves exact original pair order (not sorted) with identical scores.
+        ScoreRequest sreq;
+        sreq.pairs = {
+            {"sonder kv prefix cache", "unrelated text"},
+            {"sonder kv prefix cache", "sonder kv prefix cache reuse"},
+            {"sonder kv prefix cache", "prefix notes"},
+        };
+        RequestOptions sro;
+        sro.request_id = "req-score-1";
+        auto sr = session->score(sreq, sro);
+        REQUIRE_MESSAGE(sr.ok(), sr.status().message());
+        CHECK(sr->model == "mock:tiny");
+        REQUIRE(sr->scores.size() == 3u);
+        CHECK(sr->scores[0].index == 0u);
+        CHECK(sr->scores[1].index == 1u);
+        CHECK(sr->scores[2].index == 2u);
+        CHECK(sr->scores[1].score == doctest::Approx(rr->results[0].relevance_score));
+        CHECK(sr->scores[0].score == doctest::Approx(rr->results[2].relevance_score));
+
+        // Validation errors rejected before backend execution.
+        RerankRequest bad_r;
+        bad_r.query = "";
+        bad_r.documents = {"a"};
+        CHECK(session->rerank(bad_r).status().code() == ErrorCode::invalid_argument);
+        bad_r.query = "q";
+        bad_r.documents.clear();
+        CHECK(session->rerank(bad_r).status().code() == ErrorCode::invalid_argument);
+        bad_r.documents = {"a"};
+        bad_r.top_n = 0;
+        CHECK(session->rerank(bad_r).status().code() == ErrorCode::invalid_argument);
+
+        ScoreRequest bad_s;
+        CHECK(session->score(bad_s).status().code() == ErrorCode::invalid_argument);
+
+        // EmbedRequest fail-closed dimensions validation on default mock (native 16).
+        EmbedRequest ereq;
+        ereq.inputs = {"alpha", "beta"};
+        ereq.dimensions = 16;
+        auto eok = session->embed(ereq);
+        REQUIRE(eok.ok());
+        CHECK(eok->dimensions == 16u);
+        CHECK(eok->model == "mock:tiny");
+
+        ereq.dimensions = 8;
+        CHECK(session->embed(ereq).status().code() == ErrorCode::invalid_argument);
+        ereq.dimensions = 32;
+        CHECK(session->embed(ereq).status().code() == ErrorCode::invalid_argument);
+        ereq.dimensions.reset();
+        ereq.pooling_type = EmbedPoolingType::rank;
+        CHECK(session->embed(ereq).status().code() == ErrorCode::invalid_argument);
+
+        // Verify telemetry recorded kind="rerank" and kind="score".
+        h.engine->telemetry().flush();
+        bool saw_rerank = false;
+        bool saw_score = false;
+        for (const auto& ev : h.events_of("request.completed")) {
+            const auto* attrs = ev.find("attributes");
+            if (!attrs) continue;
+            if (const auto* k = attrs->find("kind"); k && k->is_string()) {
+                if (k->as_string() == "rerank") saw_rerank = true;
+                if (k->as_string() == "score") saw_score = true;
+            }
+        }
+        CHECK(saw_rerank);
+        CHECK(saw_score);
+    }
+
+    // 2. Mock backend with enable_reranking=false returns ErrorCode::unsupported.
+    {
+        MockBackendOptions mo;
+        mo.enable_reranking = false;
+        sonder_test::Harness h(mo);
+        auto session = h.session();
+        REQUIRE(session);
+        CHECK_FALSE(h.engine->find_backend("mock")->capabilities().has(Capability::reranking));
+        RerankRequest rreq;
+        rreq.query = "q";
+        rreq.documents = {"d"};
+        CHECK(session->rerank(rreq).status().code() == ErrorCode::unsupported);
+        ScoreRequest sreq;
+        sreq.pairs = {{"q", "d"}};
+        CHECK(session->score(sreq).status().code() == ErrorCode::unsupported);
+    }
+
+    // 3. Cancellation and exception recovery leave Session idle and reusable.
+    {
+        struct FaultRerankBackend final : Backend {
+            struct Model final : BackendModel {
+                ModelDescriptor desc{"fault:rerank", "fault-rerank", "mock", "mock", "0", "none", 0, 4096, true};
+                std::atomic<bool> should_throw{false};
+                std::atomic<bool> hold{false};
+                std::atomic<bool> entered{false};
+                const ModelDescriptor& descriptor() const override { return desc; }
+                Result<GenerateStats> generate(const GenerateRequest&, const CancellationToken&,
+                                               const TokenCallback&) override {
+                    return GenerateStats{};
+                }
+                Result<RerankResult> rerank(const RerankRequest&, const CancellationToken& cancel) override {
+                    entered.store(true);
+                    if (should_throw.load()) throw std::runtime_error("CANARY_RERANK_EXCEPTION");
+                    while (hold.load() && !cancel.cancelled()) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    }
+                    if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled");
+                    RerankResult out;
+                    out.results.push_back(RerankItem{0, 1.0, std::nullopt});
+                    return out;
+                }
+                Result<ScoreResult> score(const ScoreRequest&, const CancellationToken&) override {
+                    if (should_throw.load()) throw std::runtime_error("CANARY_SCORE_EXCEPTION");
+                    ScoreResult out;
+                    out.scores.push_back(ScoreItem{0, 1.0});
+                    return out;
+                }
+            };
+            std::shared_ptr<Model> model = std::make_shared<Model>();
+            std::string name() const override { return "fault-rerank"; }
+            std::string description() const override { return "fault test"; }
+            BackendCapabilities capabilities() const override {
+                return BackendCapabilities{}.add(Capability::reranking);
+            }
+            Result<std::string> probe() override { return std::string("fault-1"); }
+            Result<std::vector<ModelDescriptor>> list_models() override {
+                return std::vector<ModelDescriptor>{model->descriptor()};
+            }
+            Result<std::shared_ptr<BackendModel>> load_model(const ModelLoadOptions&) override {
+                return std::static_pointer_cast<BackendModel>(model);
+            }
+        };
+
+        auto sink = std::make_shared<MemoryTelemetrySink>();
+        EngineOptions eo;
+        eo.telemetry_sinks.push_back(sink);
+        eo.scheduling.enabled = false;
+        Engine engine(eo);
+        auto be = std::make_shared<FaultRerankBackend>();
+        REQUIRE(engine.register_backend(be).ok());
+        auto loaded = engine.load_model("fault-rerank", {"fault:rerank", "cpu:0"});
+        REQUIRE(loaded.ok());
+        auto sess = engine.create_session(loaded.value());
+        REQUIRE(sess.ok());
+
+        // Exception in rerank & score recovers SessionState::idle and never leaks raw exception text to telemetry.
+        be->model->should_throw.store(true);
+        RerankRequest rreq;
+        rreq.query = "q";
+        rreq.documents = {"d"};
+        CHECK_THROWS_AS((void)sess.value()->rerank(rreq), std::runtime_error);
+        CHECK(sess.value()->state() == SessionState::idle);
+        ScoreRequest sreq;
+        sreq.pairs = {{"q", "d"}};
+        CHECK_THROWS_AS((void)sess.value()->score(sreq), std::runtime_error);
+        CHECK(sess.value()->state() == SessionState::idle);
+
+        // Cooperative cancellation mid-rerank.
+        be->model->should_throw.store(false);
+        be->model->hold.store(true);
+        be->model->entered.store(false);
+        Result<RerankResult> cancel_res = Status(ErrorCode::internal, "unset");
+        std::thread worker([&] { cancel_res = sess.value()->rerank(rreq); });
+        const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!be->model->entered.load() && std::chrono::steady_clock::now() < dl) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        sess.value()->cancel();
+        worker.join();
+        CHECK(cancel_res.status().code() == ErrorCode::cancelled);
+        CHECK(sess.value()->state() == SessionState::idle);
+
+        // Usable again afterwards.
+        be->model->hold.store(false);
+        CHECK(sess.value()->rerank(rreq).ok());
+        CHECK(sess.value()->score(sreq).ok());
+
+        engine.telemetry().flush();
+        for (const auto& line : sink->lines()) {
+            CHECK(line.find("CANARY_RERANK_EXCEPTION") == std::string::npos);
+            CHECK(line.find("CANARY_SCORE_EXCEPTION") == std::string::npos);
+        }
+    }
+}
+
 }

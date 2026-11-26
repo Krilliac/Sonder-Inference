@@ -185,4 +185,14 @@ void execute_embeddings(ChatExchange& exchange, const EmbedJob& job, const Corre
                         const std::string& model, const std::string& backend,
                         const std::shared_ptr<Session>& session);
 
+// Synchronous execution for POST /v1/rerank.
+void execute_rerank(ChatExchange& exchange, const RerankJob& job, const Correlation& correlation,
+                    const std::string& model, const std::string& backend,
+                    const std::shared_ptr<Session>& session);
+
+// Synchronous execution for POST /v1/score.
+void execute_score(ChatExchange& exchange, const ScoreJob& job, const Correlation& correlation,
+                   const std::string& model, const std::string& backend,
+                   const std::shared_ptr<Session>& session);
+
 } // namespace sonder::inference::server::detail

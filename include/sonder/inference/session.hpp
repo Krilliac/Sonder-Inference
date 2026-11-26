@@ -3,12 +3,14 @@
 
 #include <atomic>
 #include <chrono>
+#include <concepts>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "sonder/inference/backend.hpp"
@@ -191,8 +193,24 @@ public:
                                   const RequestOptions& request_options = {});
 
     // Embedding generation for one or more text inputs on backends that support
-    // Capability::embeddings.
+    // Capability::embeddings. The template overload constrains on EmbedRequest so
+    // braced-init calls like embed({"hello"}) unambiguously bind to the vector overload.
     Result<EmbedResult> embed(const std::vector<std::string>& inputs, const RequestOptions& request_options = {});
+    Result<EmbedResult> embed_request(const EmbedRequest& request, const RequestOptions& request_options = {});
+    template <typename Req>
+        requires std::same_as<std::remove_cvref_t<Req>, EmbedRequest>
+    Result<EmbedResult> embed(const Req& request, const RequestOptions& request_options = {}) {
+        return embed_request(request, request_options);
+    }
+
+    // Cross-encoder reranking for (query, documents[]) on backends that support
+    // Capability::reranking. Preserves original document indices, sorts descending
+    // by relevance_score, and honors bounded top_n and return_documents.
+    Result<RerankResult> rerank(const RerankRequest& request, const RequestOptions& request_options = {});
+
+    // Cross-encoder pair scoring for ordered (text_1, text_2) pairs on backends
+    // that support Capability::reranking. Preserves exact input pair order.
+    Result<ScoreResult> score(const ScoreRequest& request, const RequestOptions& request_options = {});
 
     // True when the last request failed because the engine scheduler rejected
     // it before any backend work started (nothing executed).

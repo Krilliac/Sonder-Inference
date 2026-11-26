@@ -147,6 +147,25 @@ class FakeLlamaServer {
         svr_.Post("/completion", stream);
         svr_.Post("/v1/completions", stream);
         svr_.Post("/v1/chat/completions", stream);
+        svr_.Post("/v1/embeddings", [this](const httplib::Request &req, httplib::Response &r) {
+            std::lock_guard<std::mutex> lock(mu_);
+            embeddings_bodies_.push_back(req.body);
+            r.status = embeddings_status_;
+            r.set_content(embeddings_body_, "application/json");
+        });
+        svr_.Post("/v1/rerank", [this](const httplib::Request &req, httplib::Response &r) {
+            std::lock_guard<std::mutex> lock(mu_);
+            rerank_bodies_.push_back(req.body);
+            if (!rerank_queue_.empty()) {
+                auto next = std::move(rerank_queue_.front());
+                rerank_queue_.erase(rerank_queue_.begin());
+                r.status = next.first;
+                r.set_content(next.second, "application/json");
+                return;
+            }
+            r.status = rerank_status_;
+            r.set_content(rerank_body_, "application/json");
+        });
         svr_.Post(R"(/slots/(\d+))", [this](const httplib::Request &req, httplib::Response &r) {
             std::lock_guard<std::mutex> lock(mu_);
             last_slot_ = req.target;
@@ -270,6 +289,29 @@ class FakeLlamaServer {
         std::lock_guard<std::mutex> lock(mu_);
         return prefill_entries_;
     }
+    void set_embeddings(std::string body, int status = 200) {
+        std::lock_guard<std::mutex> lock(mu_);
+        embeddings_body_ = std::move(body);
+        embeddings_status_ = status;
+    }
+    std::vector<std::string> embeddings_bodies() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return embeddings_bodies_;
+    }
+    void set_rerank(std::string body, int status = 200) {
+        std::lock_guard<std::mutex> lock(mu_);
+        rerank_body_ = std::move(body);
+        rerank_status_ = status;
+        rerank_queue_.clear();
+    }
+    void enqueue_rerank(std::string body, int status = 200) {
+        std::lock_guard<std::mutex> lock(mu_);
+        rerank_queue_.emplace_back(status, std::move(body));
+    }
+    std::vector<std::string> rerank_bodies() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return rerank_bodies_;
+    }
 
   private:
     httplib::Server svr_;
@@ -281,6 +323,13 @@ class FakeLlamaServer {
     std::string last_body_;
     std::vector<std::string> bodies_;
     std::vector<std::string> nonstream_bodies_;
+    std::string embeddings_body_;
+    int embeddings_status_ = 501;
+    std::vector<std::string> embeddings_bodies_;
+    std::string rerank_body_;
+    int rerank_status_ = 501;
+    std::vector<std::pair<int, std::string>> rerank_queue_;
+    std::vector<std::string> rerank_bodies_;
     mutable std::condition_variable changed_;
     bool hold_nonstream_ = false;
     bool hold_prefill_ = false;

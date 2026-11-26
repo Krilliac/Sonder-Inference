@@ -49,6 +49,7 @@ enum class Capability : std::uint32_t {
     tool_calling = 1u << 18,   // supports native function/tool calling
     multimodal = 1u << 19,     // supports multimodal media inputs (validated base64 images)
     logprobs = 1u << 20,       // supports per-token logprobs / top_logprobs
+    reranking = 1u << 21,      // supports native cross-encoder reranking and pair scoring
 };
 
 // Maximum serialized byte size permitted for a single recurrent-state snapshot.
@@ -145,17 +146,84 @@ struct GenerateRequest {
     bool enable_stage_profiling = false;
 };
 
+// Bounded batch limits for embedding, reranking, and pair-scoring requests.
+inline constexpr std::size_t kMaxEmbedInputs = 256u;
+inline constexpr std::size_t kMaxRerankDocuments = 256u;
+inline constexpr std::size_t kMaxScorePairs = 256u;
+
+enum class EmbedPoolingType { unspecified, none, mean, cls, last, rank };
+const char* to_string(EmbedPoolingType pooling) noexcept;
+
 struct EmbedRequest {
     std::string request_id;
     std::vector<std::string> inputs;
     bool normalize = true;
+    // Optional requested output dimension. Backends must fail closed if
+    // unsupported or > native dimension; never silently truncate arbitrary models.
+    std::optional<std::size_t> dimensions = std::nullopt;
+    EmbedPoolingType pooling_type = EmbedPoolingType::unspecified;
+    std::string encoding_format = "float";
 };
 
 struct EmbedResult {
     std::vector<std::vector<float>> embeddings;
     std::uint64_t prompt_tokens = 0;
     std::uint64_t eval_ns = 0;
+    std::size_t dimensions = 0;
+    EmbedPoolingType pooling_type = EmbedPoolingType::unspecified;
+    std::string encoding_format = "float";
+    std::string model{};
 };
+
+struct RerankRequest {
+    std::string request_id;
+    std::string query;
+    std::vector<std::string> documents;
+    // Optional limit on returned top-ranked results (nullopt = return all documents).
+    std::optional<std::size_t> top_n = std::nullopt;
+    bool return_documents = false;
+};
+
+struct RerankItem {
+    std::size_t index = 0;  // 0-based index into original RerankRequest::documents
+    double relevance_score = 0.0;
+    std::optional<std::string> document = std::nullopt;
+};
+
+struct RerankResult {
+    std::vector<RerankItem> results;  // sorted descending by relevance_score (tie-broken by index asc)
+    std::uint64_t prompt_tokens = 0;
+    std::uint64_t eval_ns = 0;
+    std::string model{};
+};
+
+struct ScorePair {
+    std::string text_1;
+    std::string text_2;
+};
+
+struct ScoreRequest {
+    std::string request_id;
+    std::vector<ScorePair> pairs;
+};
+
+struct ScoreItem {
+    std::size_t index = 0;  // preserves exact input pair order 0..pairs.size()-1
+    double score = 0.0;
+};
+
+struct ScoreResult {
+    std::vector<ScoreItem> scores;  // exact original input pair order (never re-sorted)
+    std::uint64_t prompt_tokens = 0;
+    std::uint64_t eval_ns = 0;
+    std::string model{};
+};
+
+Status validate_rerank_request(const RerankRequest& request);
+Status validate_score_request(const ScoreRequest& request);
+// Sorts items descending by relevance_score (NaN/non-finite last, tie-broken by
+// ascending original index) and applies optional top_n truncation.
+void finalize_rerank_items(std::vector<RerankItem>& items, std::optional<std::size_t> top_n);
 
 struct TopLogprob {
     std::string token;
@@ -456,6 +524,18 @@ public:
         (void)request;
         (void)cancel;
         return Status(ErrorCode::unsupported, "backend does not expose embeddings");
+    }
+    // Optional (Capability::reranking): rank documents against a query with a cross-encoder.
+    virtual Result<RerankResult> rerank(const RerankRequest& request, const CancellationToken& cancel) {
+        (void)request;
+        (void)cancel;
+        return Status(ErrorCode::unsupported, "backend does not expose reranking");
+    }
+    // Optional (Capability::reranking): score ordered (text_1, text_2) pairs preserving input order.
+    virtual Result<ScoreResult> score(const ScoreRequest& request, const CancellationToken& cancel) {
+        (void)request;
+        (void)cancel;
+        return Status(ErrorCode::unsupported, "backend does not expose pair scoring");
     }
     // Optional (Capability::token_logits): open a token-level decode loop for
     // `request` (prompt prefilled). Sonder samples from the returned logits.

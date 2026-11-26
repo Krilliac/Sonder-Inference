@@ -882,6 +882,190 @@ struct Server::Impl {
         execute_embeddings(exchange, job, corr, pin.id(), pin.backend(), session);
     }
 
+    void handle_rerank(Exchange& ex, const RequestHead& head, const std::string& body) {
+        auto corr_v = parse_correlation(head);
+        if (auto* e = std::get_if<ApiError>(&corr_v)) {
+            write_error(ex, *e);
+            return;
+        }
+        const Correlation corr = std::get<Correlation>(corr_v);
+        std::variant<RerankJob, ApiError> job_v = make_error(500, "internal_error", "uninitialized");
+        {
+            const auto parse_timeout = std::min(opts.read_timeout, std::chrono::milliseconds(2000));
+            auto parse_guard = parse_gate.acquire(body.size(), parse_timeout);
+            if (!parse_guard) {
+                if (!require_ready(ex)) {
+                    return;
+                }
+                ApiError e = make_error(503, "overloaded", "request parser concurrency limit reached; retry later");
+                e.retry_after = 1;
+                write_error(ex, e);
+                return;
+            }
+            job_v = parse_rerank_request(body);
+        }
+        if (auto* e = std::get_if<ApiError>(&job_v)) {
+            write_error(ex, *e);
+            return;
+        }
+        const RerankJob job = std::move(std::get<RerankJob>(job_v));
+        if (!require_ready(ex)) {
+            return;
+        }
+        const auto served_id = residency->resolve(job.model);
+        if (!served_id) {
+            write_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
+            return;
+        }
+        auto pinned = residency->acquire(*served_id);
+        if (!pinned.ok()) {
+            write_error(ex, load_failure_error(*served_id, pinned.status()));
+            return;
+        }
+        const ModelResidency::Pin pin = std::move(pinned).value();
+
+        SessionOptions so;
+        so.run_id = corr.run_id;
+        so.agent_id = corr.agent_id;
+        so.task_id = corr.task_id;
+        so.workload = corr.workload;
+        so.priority = corr.priority;
+        std::shared_ptr<Session> session;
+        {
+            std::lock_guard<std::mutex> lock(engine_mu);
+            if (!engine) {
+                write_error(ex, make_error(503, "not_ready", "sonder-inference is draining"));
+                return;
+            }
+            auto created = engine->create_session(pin.model(), so);
+            if (!created.ok()) {
+                write_error(ex, map_session_failure(created.status(), false));
+                return;
+            }
+            session = created.value();
+        }
+        {
+            std::lock_guard<std::mutex> lock(inflight_mu);
+            if (state.load() != State::ready) {
+                session->close();
+                write_error(ex, make_error(503, "not_ready",
+                                           "sonder-inference is draining; nothing was executed, the request is safe "
+                                           "to send elsewhere"));
+                return;
+            }
+            inflight.insert(session);
+        }
+
+        ChatExchange exchange{
+            opts, ex.sock, ex.request_id, ex.status, synthetic,
+            ex.started, admission, hard_stop, engine_ptr()->telemetry(),
+            [&] {
+                {
+                    std::lock_guard<std::mutex> lock(inflight_mu);
+                    inflight.erase(session);
+                }
+                inflight_cv.notify_all();
+            },
+            [&](std::string_view data) { return write_raw(ex, data); },
+            [&] { return false; },
+            [&](int status, const json::Object& doc) { write_json(ex, status, doc); },
+            [&](const ApiError& error) { write_error(ex, error); },
+            [&] { log_message("warning", "cannot start a request thread; rerank request refused (503)"); }};
+        execute_rerank(exchange, job, corr, pin.id(), pin.backend(), session);
+    }
+
+    void handle_score(Exchange& ex, const RequestHead& head, const std::string& body) {
+        auto corr_v = parse_correlation(head);
+        if (auto* e = std::get_if<ApiError>(&corr_v)) {
+            write_error(ex, *e);
+            return;
+        }
+        const Correlation corr = std::get<Correlation>(corr_v);
+        std::variant<ScoreJob, ApiError> job_v = make_error(500, "internal_error", "uninitialized");
+        {
+            const auto parse_timeout = std::min(opts.read_timeout, std::chrono::milliseconds(2000));
+            auto parse_guard = parse_gate.acquire(body.size(), parse_timeout);
+            if (!parse_guard) {
+                if (!require_ready(ex)) {
+                    return;
+                }
+                ApiError e = make_error(503, "overloaded", "request parser concurrency limit reached; retry later");
+                e.retry_after = 1;
+                write_error(ex, e);
+                return;
+            }
+            job_v = parse_score_request(body);
+        }
+        if (auto* e = std::get_if<ApiError>(&job_v)) {
+            write_error(ex, *e);
+            return;
+        }
+        const ScoreJob job = std::move(std::get<ScoreJob>(job_v));
+        if (!require_ready(ex)) {
+            return;
+        }
+        const auto served_id = residency->resolve(job.model);
+        if (!served_id) {
+            write_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
+            return;
+        }
+        auto pinned = residency->acquire(*served_id);
+        if (!pinned.ok()) {
+            write_error(ex, load_failure_error(*served_id, pinned.status()));
+            return;
+        }
+        const ModelResidency::Pin pin = std::move(pinned).value();
+
+        SessionOptions so;
+        so.run_id = corr.run_id;
+        so.agent_id = corr.agent_id;
+        so.task_id = corr.task_id;
+        so.workload = corr.workload;
+        so.priority = corr.priority;
+        std::shared_ptr<Session> session;
+        {
+            std::lock_guard<std::mutex> lock(engine_mu);
+            if (!engine) {
+                write_error(ex, make_error(503, "not_ready", "sonder-inference is draining"));
+                return;
+            }
+            auto created = engine->create_session(pin.model(), so);
+            if (!created.ok()) {
+                write_error(ex, map_session_failure(created.status(), false));
+                return;
+            }
+            session = created.value();
+        }
+        {
+            std::lock_guard<std::mutex> lock(inflight_mu);
+            if (state.load() != State::ready) {
+                session->close();
+                write_error(ex, make_error(503, "not_ready",
+                                           "sonder-inference is draining; nothing was executed, the request is safe "
+                                           "to send elsewhere"));
+                return;
+            }
+            inflight.insert(session);
+        }
+
+        ChatExchange exchange{
+            opts, ex.sock, ex.request_id, ex.status, synthetic,
+            ex.started, admission, hard_stop, engine_ptr()->telemetry(),
+            [&] {
+                {
+                    std::lock_guard<std::mutex> lock(inflight_mu);
+                    inflight.erase(session);
+                }
+                inflight_cv.notify_all();
+            },
+            [&](std::string_view data) { return write_raw(ex, data); },
+            [&] { return false; },
+            [&](int status, const json::Object& doc) { write_json(ex, status, doc); },
+            [&](const ApiError& error) { write_error(ex, error); },
+            [&] { log_message("warning", "cannot start a request thread; score request refused (503)"); }};
+        execute_score(exchange, job, corr, pin.id(), pin.backend(), session);
+    }
+
     void handle_tokenize(Exchange& ex, const std::string& body) {
         std::variant<TokenizeJob, ApiError> job_v = make_error(500, "internal_error", "uninitialized");
         {
@@ -1126,6 +1310,8 @@ struct Server::Impl {
             case Route::responses: handle_responses(ex, head, checked.body); break;
             case Route::messages: handle_chat(ex, head, checked.body, ChatProtocol::anthropic); break;
             case Route::embeddings: handle_embeddings(ex, head, checked.body); break;
+            case Route::rerank: handle_rerank(ex, head, checked.body); break;
+            case Route::score: handle_score(ex, head, checked.body); break;
             case Route::tokenize: handle_tokenize(ex, checked.body); break;
             case Route::detokenize: handle_detokenize(ex, checked.body); break;
             case Route::discovery:

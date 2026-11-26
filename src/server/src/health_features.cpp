@@ -53,6 +53,7 @@ json::Object health_features_impl(std::string_view backend, const BackendCapabil
             if (capabilities->has(Capability::speculative_decode)) features.emplace_back("speculative_decode");
             if (capabilities->has(Capability::structured_output)) features.emplace_back("structured_output");
             if (capabilities->has(Capability::embeddings)) features.emplace_back("embeddings");
+            if (capabilities->has(Capability::reranking)) features.emplace_back("reranking");
             if (capabilities->has(Capability::logprobs)) features.emplace_back("logprobs");
             if (capabilities->has(Capability::multimodal)) features.emplace_back("multimodal");
             if (capabilities->has(Capability::recurrent_checkpoint)) features.emplace_back("recurrent_checkpoint");
@@ -123,6 +124,7 @@ json::Object server_capabilities(const std::shared_ptr<Backend>& backend, const 
         {"multimodal", bc.has(Capability::multimodal)},
         {"logprobs", bc.has(Capability::logprobs)},
         {"embeddings", bc.has(Capability::embeddings)},
+        {"reranking", bc.has(Capability::reranking)},
         {"grammar_engine", json::Object{
             {"active_engine", active_caps.engine_name},
             {"sampler_linked", active_caps.sampler_linked},
@@ -190,6 +192,7 @@ json::Object capability_status_matrix(const std::shared_ptr<Backend>& backend, c
     ensure_from_flag("multimodal", bc.has(Capability::multimodal), "not_supported");
     ensure_from_flag("logprobs", bc.has(Capability::logprobs), "not_supported");
     ensure_from_flag("embeddings", bc.has(Capability::embeddings), "not_supported");
+    ensure_from_flag("reranking", bc.has(Capability::reranking), "not_supported");
     ensure_from_flag("tool_calling", bc.has(Capability::tool_calling), "not_supported");
     ensure_from_flag("recurrent_checkpoint", bc.has(Capability::recurrent_checkpoint), "not_supported");
 

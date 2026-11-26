@@ -34,6 +34,11 @@ struct MockBackendOptions {
     // (defaults to kMaxRecurrentCheckpointBytes; tests may lower it to exercise
     // oversized-snapshot rejection without large allocations).
     std::size_t max_checkpoint_bytes = kMaxRecurrentCheckpointBytes;
+    // Enable deterministic cross-encoder reranking and pair scoring on MockBackend.
+    bool enable_reranking = true;
+    // Opt-in Matryoshka-style reduced embedding dimensions for mock tests;
+    // false (default) fails closed on dimensions < native width.
+    bool allow_embed_dimension_truncation = false;
 };
 inline constexpr const char* kMockBackendName = "mock";
 std::shared_ptr<Backend> make_mock_backend(MockBackendOptions options = {});

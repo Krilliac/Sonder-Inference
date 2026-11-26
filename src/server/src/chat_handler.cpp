@@ -977,7 +977,14 @@ void execute_embeddings(ChatExchange& ex, const EmbedJob& job, const Correlation
         ro.admission = ticket;
     }
 
-    auto result = session->embed(job.inputs, ro);
+    EmbedRequest embed_req;
+    embed_req.request_id = *ro.request_id;
+    embed_req.inputs = job.inputs;
+    embed_req.normalize = job.normalize;
+    embed_req.dimensions = job.dimensions;
+    embed_req.pooling_type = job.pooling_type;
+    embed_req.encoding_format = job.encoding_format;
+    auto result = session->embed(embed_req, ro);
     end_request();
 
     if (disconnected.load()) {
@@ -1013,13 +1020,357 @@ void execute_embeddings(ChatExchange& ex, const EmbedJob& job, const Correlation
                                        {"index", static_cast<std::int64_t>(i)},
                                        {"embedding", std::move(vec)}});
     }
+    const std::size_t effective_dims =
+        r.dimensions > 0 ? r.dimensions : (!r.embeddings.empty() ? r.embeddings.front().size() : 0u);
     json::Object meta{{"api_version", kApiVersion},
                       {"request_id", *ro.request_id},
                       {"backend", backend},
-                      {"synthetic", ex.synthetic}};
+                      {"model", model},
+                      {"synthetic", ex.synthetic},
+                      {"dimensions", static_cast<std::uint64_t>(effective_dims)},
+                      {"pooling_type", to_string(r.pooling_type)},
+                      {"encoding_format", r.encoding_format.empty() ? job.encoding_format : r.encoding_format}};
     json::Object doc{{"object", "list"},
                      {"data", std::move(data)},
                      {"model", model},
+                     {"usage", json::Object{{"prompt_tokens", r.prompt_tokens}, {"total_tokens", r.prompt_tokens}}},
+                     {"sonder", std::move(meta)}};
+    session->close();
+    ex.send_json(200, doc);
+}
+
+void execute_rerank(ChatExchange& ex, const RerankJob& job, const Correlation& corr, const std::string& model,
+                    const std::string& backend, const std::shared_ptr<Session>& session) {
+    const RequestPriority priority = corr.priority_class.value_or(
+        job.priority_class.value_or(RequestPriority::interactive));
+    const auto deadline_ms = corr.deadline_ms ? corr.deadline_ms : job.deadline_ms;
+    const auto deadline = deadline_ms
+        ? ex.started + std::chrono::milliseconds(static_cast<std::int64_t>(*deadline_ms))
+        : std::chrono::steady_clock::time_point::max();
+    RequestOptions ro;
+    ro.request_id = make_id("req");
+    ro.parent_request_id = corr.parent_request_id;
+    ro.priority_class = priority;
+    ro.preserve_numeric_priority = corr.numeric_priority;
+    if (deadline_ms) ro.deadline = deadline;
+    std::atomic<bool> backend_started{false};
+    ex.request_id = *ro.request_id;
+
+    std::mutex watch_mu;
+    std::condition_variable watch_cv;
+    bool watch_done = false;
+    std::atomic<bool> disconnected{false};
+    ro.on_backend_start = [&] {
+        if (disconnected.load() || ex.hard_stop.load() || std::chrono::steady_clock::now() >= deadline) {
+            session->cancel();
+            return;
+        }
+        backend_started.store(true);
+    };
+    std::shared_ptr<PriorityAdmission::Ticket> ticket;
+    std::thread watcher;
+    bool left_inflight = false;
+    const auto end_request = [&] {
+        if (ticket) ticket->release();
+        {
+            std::lock_guard<std::mutex> lock(watch_mu);
+            watch_done = true;
+        }
+        watch_cv.notify_all();
+        if (watcher.joinable()) {
+            watcher.join();
+        }
+        if (!left_inflight) {
+            left_inflight = true;
+            ex.leave_inflight();
+        }
+    };
+    struct EndRequestGuard {
+        const decltype(end_request)& end;
+        ~EndRequestGuard() { end(); }
+    } end_guard{end_request};
+    try {
+        if (take_watcher_spawn_failure()) {
+            throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+                                    "test hook: watcher thread creation refused");
+        }
+        watcher = std::thread([&] {
+            std::unique_lock<std::mutex> lock(watch_mu);
+            while (!watch_done) {
+                lock.unlock();
+                if (peer_gone(ex.socket)) {
+                    disconnected.store(true);
+                    session->cancel();
+                }
+                if (std::chrono::steady_clock::now() >= deadline && backend_started.load()) {
+                    session->cancel();
+                }
+                lock.lock();
+                watch_cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return watch_done; });
+            }
+        });
+    } catch (const std::system_error&) {
+        end_request();
+        session->close();
+        ex.watcher_failure();
+        ApiError e =
+            make_error(503, "overloaded",
+                       "sonder-inference cannot start a request thread right now; nothing was executed, retry later");
+        e.retry_after = 1;
+        ex.send_error(e);
+        return;
+    }
+
+    if (priority_admission_enabled(ex.options)) {
+        ticket = ex.admission.enqueue(priority, [&] {
+            return disconnected.load() || session->state() == SessionState::closed || ex.hard_stop.load();
+        }, deadline);
+        if (ticket->outcome() != PriorityAdmission::Outcome::admitted) {
+            json::Object attrs{{"kind", "rerank"},
+                               {"priority_class", to_string(priority)},
+                               {"admission", json::Object{{"priority", to_string(priority)},
+                                                          {"queue_ms", ticket->queue_ms()}}},
+                               {"error_code", ticket->outcome() == PriorityAdmission::Outcome::full
+                                                  ? "overloaded"
+                                                  : ticket->outcome() == PriorityAdmission::Outcome::expired
+                                                  ? "deadline_exceeded"
+                                                  : "cancelled"},
+                               {"backend_started", false}};
+            if (ro.parent_request_id) attrs.set("parent_request_id", *ro.parent_request_id);
+            ex.telemetry.emit(disconnected.load() ? "request.cancelled" : "request.failed",
+                              session->telemetry_context(ro.request_id), std::move(attrs), TelemetryLevel::metrics);
+            end_request();
+            if (disconnected.load()) {
+                ex.status = 499;
+            } else {
+                ApiError error = ticket->outcome() == PriorityAdmission::Outcome::expired
+                    ? make_error(504, "deadline_exceeded", "request deadline expired while queued; nothing was executed")
+                    : ticket->outcome() == PriorityAdmission::Outcome::full
+                    ? make_error(429, "overloaded", "request priority queue is full; nothing was executed")
+                    : make_error(503, "not_ready", "request cancelled while queued; nothing was executed");
+                if (error.status == 429) error.retry_after = 1;
+                ex.send_error(error);
+            }
+            session->close();
+            return;
+        }
+        ro.admission = ticket;
+    }
+
+    RerankRequest req;
+    req.request_id = *ro.request_id;
+    req.query = job.query;
+    req.documents = job.documents;
+    req.top_n = job.top_n;
+    req.return_documents = job.return_documents;
+    auto result = session->rerank(req, ro);
+    end_request();
+
+    if (disconnected.load()) {
+        ex.status = 499;
+        session->close();
+        return;
+    }
+    if (deadline_ms && !backend_started.load() && std::chrono::steady_clock::now() >= deadline) {
+        session->close();
+        ex.send_error(make_error(504, "deadline_exceeded", "request deadline expired while queued; nothing was executed"));
+        return;
+    }
+    if (!result.ok()) {
+        session->close();
+        if (result.status().code() == ErrorCode::unsupported) {
+            ex.send_error(make_error(501, "not_implemented", result.status().message()));
+        } else {
+            ex.send_error(map_session_failure(result.status(), false));
+        }
+        return;
+    }
+
+    const RerankResult& r = result.value();
+    json::Array results_arr;
+    results_arr.reserve(r.results.size());
+    for (const auto& item : r.results) {
+        json::Object entry{{"index", static_cast<std::int64_t>(item.index)},
+                           {"relevance_score", item.relevance_score}};
+        if (item.document.has_value()) {
+            entry.set("document", json::Object{{"text", *item.document}});
+        }
+        results_arr.emplace_back(std::move(entry));
+    }
+    json::Object meta{{"api_version", kApiVersion},
+                      {"request_id", *ro.request_id},
+                      {"backend", backend},
+                      {"model", model},
+                      {"synthetic", ex.synthetic}};
+    json::Object doc{{"object", "list"},
+                     {"model", model},
+                     {"results", std::move(results_arr)},
+                     {"usage", json::Object{{"prompt_tokens", r.prompt_tokens}, {"total_tokens", r.prompt_tokens}}},
+                     {"sonder", std::move(meta)}};
+    session->close();
+    ex.send_json(200, doc);
+}
+
+void execute_score(ChatExchange& ex, const ScoreJob& job, const Correlation& corr, const std::string& model,
+                   const std::string& backend, const std::shared_ptr<Session>& session) {
+    const RequestPriority priority = corr.priority_class.value_or(
+        job.priority_class.value_or(RequestPriority::interactive));
+    const auto deadline_ms = corr.deadline_ms ? corr.deadline_ms : job.deadline_ms;
+    const auto deadline = deadline_ms
+        ? ex.started + std::chrono::milliseconds(static_cast<std::int64_t>(*deadline_ms))
+        : std::chrono::steady_clock::time_point::max();
+    RequestOptions ro;
+    ro.request_id = make_id("req");
+    ro.parent_request_id = corr.parent_request_id;
+    ro.priority_class = priority;
+    ro.preserve_numeric_priority = corr.numeric_priority;
+    if (deadline_ms) ro.deadline = deadline;
+    std::atomic<bool> backend_started{false};
+    ex.request_id = *ro.request_id;
+
+    std::mutex watch_mu;
+    std::condition_variable watch_cv;
+    bool watch_done = false;
+    std::atomic<bool> disconnected{false};
+    ro.on_backend_start = [&] {
+        if (disconnected.load() || ex.hard_stop.load() || std::chrono::steady_clock::now() >= deadline) {
+            session->cancel();
+            return;
+        }
+        backend_started.store(true);
+    };
+    std::shared_ptr<PriorityAdmission::Ticket> ticket;
+    std::thread watcher;
+    bool left_inflight = false;
+    const auto end_request = [&] {
+        if (ticket) ticket->release();
+        {
+            std::lock_guard<std::mutex> lock(watch_mu);
+            watch_done = true;
+        }
+        watch_cv.notify_all();
+        if (watcher.joinable()) {
+            watcher.join();
+        }
+        if (!left_inflight) {
+            left_inflight = true;
+            ex.leave_inflight();
+        }
+    };
+    struct EndRequestGuard {
+        const decltype(end_request)& end;
+        ~EndRequestGuard() { end(); }
+    } end_guard{end_request};
+    try {
+        if (take_watcher_spawn_failure()) {
+            throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+                                    "test hook: watcher thread creation refused");
+        }
+        watcher = std::thread([&] {
+            std::unique_lock<std::mutex> lock(watch_mu);
+            while (!watch_done) {
+                lock.unlock();
+                if (peer_gone(ex.socket)) {
+                    disconnected.store(true);
+                    session->cancel();
+                }
+                if (std::chrono::steady_clock::now() >= deadline && backend_started.load()) {
+                    session->cancel();
+                }
+                lock.lock();
+                watch_cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return watch_done; });
+            }
+        });
+    } catch (const std::system_error&) {
+        end_request();
+        session->close();
+        ex.watcher_failure();
+        ApiError e =
+            make_error(503, "overloaded",
+                       "sonder-inference cannot start a request thread right now; nothing was executed, retry later");
+        e.retry_after = 1;
+        ex.send_error(e);
+        return;
+    }
+
+    if (priority_admission_enabled(ex.options)) {
+        ticket = ex.admission.enqueue(priority, [&] {
+            return disconnected.load() || session->state() == SessionState::closed || ex.hard_stop.load();
+        }, deadline);
+        if (ticket->outcome() != PriorityAdmission::Outcome::admitted) {
+            json::Object attrs{{"kind", "score"},
+                               {"priority_class", to_string(priority)},
+                               {"admission", json::Object{{"priority", to_string(priority)},
+                                                          {"queue_ms", ticket->queue_ms()}}},
+                               {"error_code", ticket->outcome() == PriorityAdmission::Outcome::full
+                                                  ? "overloaded"
+                                                  : ticket->outcome() == PriorityAdmission::Outcome::expired
+                                                  ? "deadline_exceeded"
+                                                  : "cancelled"},
+                               {"backend_started", false}};
+            if (ro.parent_request_id) attrs.set("parent_request_id", *ro.parent_request_id);
+            ex.telemetry.emit(disconnected.load() ? "request.cancelled" : "request.failed",
+                              session->telemetry_context(ro.request_id), std::move(attrs), TelemetryLevel::metrics);
+            end_request();
+            if (disconnected.load()) {
+                ex.status = 499;
+            } else {
+                ApiError error = ticket->outcome() == PriorityAdmission::Outcome::expired
+                    ? make_error(504, "deadline_exceeded", "request deadline expired while queued; nothing was executed")
+                    : ticket->outcome() == PriorityAdmission::Outcome::full
+                    ? make_error(429, "overloaded", "request priority queue is full; nothing was executed")
+                    : make_error(503, "not_ready", "request cancelled while queued; nothing was executed");
+                if (error.status == 429) error.retry_after = 1;
+                ex.send_error(error);
+            }
+            session->close();
+            return;
+        }
+        ro.admission = ticket;
+    }
+
+    ScoreRequest req;
+    req.request_id = *ro.request_id;
+    req.pairs = job.pairs;
+    auto result = session->score(req, ro);
+    end_request();
+
+    if (disconnected.load()) {
+        ex.status = 499;
+        session->close();
+        return;
+    }
+    if (deadline_ms && !backend_started.load() && std::chrono::steady_clock::now() >= deadline) {
+        session->close();
+        ex.send_error(make_error(504, "deadline_exceeded", "request deadline expired while queued; nothing was executed"));
+        return;
+    }
+    if (!result.ok()) {
+        session->close();
+        if (result.status().code() == ErrorCode::unsupported) {
+            ex.send_error(make_error(501, "not_implemented", result.status().message()));
+        } else {
+            ex.send_error(map_session_failure(result.status(), false));
+        }
+        return;
+    }
+
+    const ScoreResult& r = result.value();
+    json::Array data;
+    data.reserve(r.scores.size());
+    for (const auto& item : r.scores) {
+        data.emplace_back(json::Object{{"object", "score"},
+                                       {"index", static_cast<std::int64_t>(item.index)},
+                                       {"score", item.score}});
+    }
+    json::Object meta{{"api_version", kApiVersion},
+                      {"request_id", *ro.request_id},
+                      {"backend", backend},
+                      {"model", model},
+                      {"synthetic", ex.synthetic}};
+    json::Object doc{{"object", "list"},
+                     {"model", model},
+                     {"data", std::move(data)},
                      {"usage", json::Object{{"prompt_tokens", r.prompt_tokens}, {"total_tokens", r.prompt_tokens}}},
                      {"sonder", std::move(meta)}};
     session->close();

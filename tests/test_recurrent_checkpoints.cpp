@@ -246,7 +246,8 @@ TEST_CASE("mock backend preserves default capability list when recurrent checkpo
     const auto caps = plain_mock->capabilities();
     CHECK_FALSE(caps.has(Capability::recurrent_checkpoint));
     const std::vector<std::string> expected_names{
-        "tokenization", "streaming", "embeddings", "deterministic", "tool_calling", "multimodal", "logprobs"};
+        "tokenization", "streaming", "embeddings", "deterministic", "tool_calling", "multimodal", "logprobs",
+        "reranking"};
     CHECK(caps.names() == expected_names);
 
     ModelLoadOptions lo;

@@ -123,6 +123,54 @@ std::string lower_ascii(std::string_view sv) {
     return out;
 }
 
+std::vector<std::string> extract_ascii_words(std::string_view sv) {
+    std::vector<std::string> words;
+    std::string cur;
+    for (const char c : sv) {
+        const auto u = static_cast<unsigned char>(c);
+        if (std::isalnum(u)) {
+            cur.push_back(static_cast<char>(std::tolower(u)));
+        } else if (!cur.empty()) {
+            words.push_back(std::move(cur));
+            cur.clear();
+        }
+    }
+    if (!cur.empty()) {
+        words.push_back(std::move(cur));
+    }
+    std::sort(words.begin(), words.end());
+    words.erase(std::unique(words.begin(), words.end()), words.end());
+    return words;
+}
+
+// Deterministic synthetic relevance score for mock cross-encoder testing:
+// favors lexical word overlap and exact substring containment with a tiny
+// deterministic tie-breaker hash so relevant documents strictly outrank
+// unrelated ones and identical pairs always produce identical scores.
+double compute_mock_pair_score(std::string_view model_name, std::string_view text_1, std::string_view text_2) {
+    const std::vector<std::string> q_words = extract_ascii_words(text_1);
+    const std::vector<std::string> d_words = extract_ascii_words(text_2);
+    double overlap = 0.0;
+    if (!q_words.empty() && !d_words.empty()) {
+        std::size_t matched = 0;
+        for (const auto& w : q_words) {
+            if (std::binary_search(d_words.begin(), d_words.end(), w)) {
+                ++matched;
+            }
+        }
+        overlap = static_cast<double>(matched) / static_cast<double>(q_words.size());
+    }
+    double bonus = 0.0;
+    const std::string q_low = lower_ascii(text_1);
+    const std::string d_low = lower_ascii(text_2);
+    if (!q_low.empty() && d_low.find(q_low) != std::string::npos) {
+        bonus = 0.25;
+    }
+    const std::uint64_t h = splitmix64(fnv1a(text_1) ^ splitmix64(fnv1a(text_2) ^ fnv1a(model_name)));
+    const double tie = static_cast<double>(h & 0xFFFFu) * 1e-7;
+    return overlap + bonus + tie;
+}
+
 std::string build_mock_tool_arguments(const ToolDefinition& tool) {
     if (tool.parameters_json.empty()) {
         return "{}";
@@ -285,10 +333,38 @@ public:
         if (request.inputs.empty()) {
             return Status(ErrorCode::invalid_argument, "embed inputs must be non-empty");
         }
-        const auto t0 = std::chrono::steady_clock::now();
+        if (request.pooling_type == EmbedPoolingType::rank) {
+            return Status(ErrorCode::invalid_argument,
+                          "mock backend does not support pooling_type 'rank' for dense embeddings");
+        }
         constexpr std::size_t kMockDims = 16;
+        std::size_t out_dims = kMockDims;
+        if (request.dimensions.has_value()) {
+            const std::size_t requested = *request.dimensions;
+            if (requested == 0) {
+                return Status(ErrorCode::invalid_argument, "embed dimensions must be positive");
+            }
+            if (requested > kMockDims) {
+                return Status(ErrorCode::invalid_argument,
+                              "requested dimensions (" + std::to_string(requested) +
+                                  ") exceeds native embedding dimension (" + std::to_string(kMockDims) + ")");
+            }
+            if (requested < kMockDims && !options_.allow_embed_dimension_truncation) {
+                return Status(ErrorCode::invalid_argument,
+                              "mock model '" + descriptor_.name +
+                                  "' does not support dimensions reduction below native dimension " +
+                                  std::to_string(kMockDims));
+            }
+            out_dims = requested;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
         EmbedResult result;
         result.embeddings.reserve(request.inputs.size());
+        result.dimensions = out_dims;
+        result.pooling_type =
+            request.pooling_type == EmbedPoolingType::unspecified ? EmbedPoolingType::mean : request.pooling_type;
+        result.encoding_format = request.encoding_format.empty() ? std::string("float") : request.encoding_format;
+        result.model = descriptor_.name;
         for (const std::string& input : request.inputs) {
             if (cancel.cancelled()) {
                 return Status(ErrorCode::cancelled, "cancelled by caller");
@@ -296,9 +372,9 @@ public:
             const auto toks = detail::accounting_tokenize(input);
             result.prompt_tokens += toks.size();
             std::uint64_t seed = fnv1a(input) ^ fnv1a(descriptor_.name);
-            std::vector<float> vec(kMockDims, 0.0f);
+            std::vector<float> vec(out_dims, 0.0f);
             double norm_sq = 0.0;
-            for (std::size_t i = 0; i < kMockDims; ++i) {
+            for (std::size_t i = 0; i < out_dims; ++i) {
                 seed = splitmix64(seed + i * 0x9E3779B97F4A7C15ull);
                 const float v = static_cast<float>(static_cast<double>(seed >> 40) / static_cast<double>(1ull << 24) * 2.0 - 1.0);
                 vec[i] = v;
@@ -309,6 +385,75 @@ public:
                 for (float& v : vec) v *= inv;
             }
             result.embeddings.push_back(std::move(vec));
+        }
+        result.eval_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        return result;
+    }
+
+    Result<RerankResult> rerank(const RerankRequest& request, const CancellationToken& cancel) override {
+        if (!options_.enable_reranking) {
+            return Status(ErrorCode::unsupported, "mock backend created without reranking support");
+        }
+        if (cancel.cancelled()) {
+            return Status(ErrorCode::cancelled, "cancelled by caller");
+        }
+        if (Status st = validate_rerank_request(request); !st.ok()) {
+            return st;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::uint64_t query_tokens = detail::accounting_tokenize(request.query).size();
+        RerankResult result;
+        result.model = descriptor_.name;
+        result.results.reserve(request.documents.size());
+        for (std::size_t i = 0; i < request.documents.size(); ++i) {
+            if (cancel.cancelled()) {
+                return Status(ErrorCode::cancelled, "cancelled by caller");
+            }
+            if (options_.token_delay.count() > 0 && !cancellable_sleep(options_.token_delay, cancel)) {
+                return Status(ErrorCode::cancelled, "cancelled by caller");
+            }
+            result.prompt_tokens += query_tokens + detail::accounting_tokenize(request.documents[i]).size();
+            RerankItem item;
+            item.index = i;
+            item.relevance_score = compute_mock_pair_score(descriptor_.name, request.query, request.documents[i]);
+            if (request.return_documents) {
+                item.document = request.documents[i];
+            }
+            result.results.push_back(std::move(item));
+        }
+        finalize_rerank_items(result.results, request.top_n);
+        result.eval_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        return result;
+    }
+
+    Result<ScoreResult> score(const ScoreRequest& request, const CancellationToken& cancel) override {
+        if (!options_.enable_reranking) {
+            return Status(ErrorCode::unsupported, "mock backend created without reranking support");
+        }
+        if (cancel.cancelled()) {
+            return Status(ErrorCode::cancelled, "cancelled by caller");
+        }
+        if (Status st = validate_score_request(request); !st.ok()) {
+            return st;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        ScoreResult result;
+        result.model = descriptor_.name;
+        result.scores.reserve(request.pairs.size());
+        for (std::size_t i = 0; i < request.pairs.size(); ++i) {
+            if (cancel.cancelled()) {
+                return Status(ErrorCode::cancelled, "cancelled by caller");
+            }
+            if (options_.token_delay.count() > 0 && !cancellable_sleep(options_.token_delay, cancel)) {
+                return Status(ErrorCode::cancelled, "cancelled by caller");
+            }
+            const auto& pair = request.pairs[i];
+            result.prompt_tokens +=
+                detail::accounting_tokenize(pair.text_1).size() + detail::accounting_tokenize(pair.text_2).size();
+            result.scores.push_back(
+                ScoreItem{i, compute_mock_pair_score(descriptor_.name, pair.text_1, pair.text_2)});
         }
         result.eval_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
@@ -720,6 +865,9 @@ public:
         }
         if (options_.enable_recurrent_checkpoints) {
             c.add(Capability::recurrent_checkpoint);
+        }
+        if (options_.enable_reranking) {
+            c.add(Capability::reranking);
         }
         return c;
     }

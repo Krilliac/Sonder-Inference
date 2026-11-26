@@ -38,6 +38,8 @@ RouteInfo lookup_route(std::string_view path) {
     if (path == "/v1/responses") return {Route::responses, "POST"};
     if (path == "/v1/messages") return {Route::messages, "POST"};
     if (path == "/v1/embeddings") return {Route::embeddings, "POST"};
+    if (path == "/v1/rerank") return {Route::rerank, "POST"};
+    if (path == "/v1/score") return {Route::score, "POST"};
     if (path == "/v1/tokenize") return {Route::tokenize, "POST"};
     if (path == "/v1/detokenize") return {Route::detokenize, "POST"};
     if (path == "/.well-known/sonder-telemetry") return {Route::discovery, "GET"};

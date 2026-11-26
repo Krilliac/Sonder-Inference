@@ -45,6 +45,7 @@ sonder_add_module_tests(server
     tests/test_server_anthropic_http.cpp
     tests/test_server_units.cpp
     tests/test_server_http.cpp
+    tests/test_server_rerank_embed.cpp
     tests/test_server_chat.cpp
     tests/test_server_features.cpp
     tests/test_grammar_cache.cpp

@@ -346,7 +346,7 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             c.add(Capability::structured_output);
         // These indicate delegation support, not measured acceleration or KV ownership.
         if (options_.native_completion)
-            c.add(Capability::speculative_decode).add(Capability::prefix_reuse);
+            c.add(Capability::speculative_decode).add(Capability::prefix_reuse).add(Capability::reranking);
         return c;
     }
     std::vector<CapabilityStatusEntry> capability_statuses() const override {
@@ -422,6 +422,16 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             s.qualified_beneficial = CapabilityState::unknown;
             s.note = "delegated_upstream";
             out.emplace_back(cap_name, std::move(s));
+        }
+        {
+            CapabilityStatus s;
+            s.adapter_supports = capability_state_from_bool(options_.native_completion);
+            s.build_supports = options_.native_completion ? CapabilityState::unknown : CapabilityState::no;
+            s.configured = options_.native_completion ? CapabilityState::unknown : CapabilityState::no;
+            s.observed_active = options_.native_completion ? CapabilityState::unknown : CapabilityState::no;
+            s.qualified_beneficial = CapabilityState::unknown;
+            s.note = options_.native_completion ? "delegated_upstream" : "generic_openai_mode";
+            out.emplace_back("reranking", std::move(s));
         }
         {
             CapabilityStatus s;
@@ -634,6 +644,27 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             return response.status();
         if (response->status == 501)
             return Status(ErrorCode::unsupported, "llamaserver: upstream does not support embeddings");
+        if (response->status != 200)
+            return llamaserver::status_for_http(response->status);
+        return response_body;
+    }
+    Result<std::string> request_rerank(std::string body, const CancellationToken &cancel) {
+        auto activity = acquire_request(cancel);
+        if (!activity.ok())
+            return activity.status();
+        auto prepared = prepare("POST", "/v1/rerank", std::move(body), cancel, activity->port());
+        if (!prepared.ok())
+            return prepared.status();
+        std::string response_body;
+        const auto response = net::http_request_buffered(prepared.value(), response_body, cancel, 64u * 1024u * 1024u);
+        if (cancel.cancelled())
+            return Status(ErrorCode::cancelled, "llamaserver: request cancelled");
+        if (!response.ok())
+            return response.status();
+        if (response->status == 501 || response->status == 404)
+            return Status(ErrorCode::unsupported, "llamaserver: upstream does not support reranking");
+        if (response->status == 400)
+            return Status(ErrorCode::invalid_argument, "llamaserver: upstream rejected rerank request");
         if (response->status != 200)
             return llamaserver::status_for_http(response->status);
         return response_body;
@@ -1032,11 +1063,27 @@ class LlamaServerModel final : public BackendModel {
             return Status(ErrorCode::cancelled, "llamaserver: request cancelled");
         if (request.inputs.empty())
             return Status(ErrorCode::invalid_argument, "llamaserver: embed inputs must be non-empty");
+        if (request.pooling_type == EmbedPoolingType::rank)
+            return Status(ErrorCode::invalid_argument,
+                          "llamaserver backend does not support pooling_type 'rank' for dense embeddings");
+        if (request.dimensions.has_value()) {
+            if (*request.dimensions == 0)
+                return Status(ErrorCode::invalid_argument, "llamaserver: embed dimensions must be positive");
+            if (backend_->options().native_completion)
+                return Status(ErrorCode::invalid_argument,
+                              "llamaserver backend does not support dimensions reduction");
+        }
         json::Array input_arr;
         input_arr.reserve(request.inputs.size());
         for (const auto &text : request.inputs)
             input_arr.emplace_back(text);
         json::Object req_body{{"model", descriptor_.name}, {"input", std::move(input_arr)}};
+        if (request.dimensions.has_value()) {
+            req_body.set("dimensions", static_cast<std::uint64_t>(*request.dimensions));
+        }
+        if (!request.encoding_format.empty()) {
+            req_body.set("encoding_format", request.encoding_format);
+        }
         const auto t0 = std::chrono::steady_clock::now();
         auto response = backend_->request_embeddings(json::Value(std::move(req_body)).dump(), cancel);
         if (!response.ok())
@@ -1051,6 +1098,9 @@ class LlamaServerModel final : public BackendModel {
         if (items.size() != request.inputs.size())
             return llamaserver::protocol_error("embedding count mismatch in /v1/embeddings response");
         EmbedResult result;
+        result.model = descriptor_.name;
+        result.pooling_type = request.pooling_type;
+        result.encoding_format = request.encoding_format.empty() ? std::string("float") : request.encoding_format;
         result.embeddings.resize(items.size());
         std::vector<bool> populated(items.size(), false);
         for (std::size_t i = 0; i < items.size(); ++i) {
@@ -1076,8 +1126,15 @@ class LlamaServerModel final : public BackendModel {
                     return llamaserver::protocol_error("non-finite value in embedding vector");
                 vec.push_back(static_cast<float>(num.as_double()));
             }
+            if (request.dimensions.has_value() && vec.size() != *request.dimensions)
+                return Status(ErrorCode::invalid_argument,
+                              "upstream does not support dimensions=" + std::to_string(*request.dimensions) +
+                                  " (returned " + std::to_string(vec.size()) + ")");
             result.embeddings[slot] = std::move(vec);
             populated[slot] = true;
+        }
+        if (!result.embeddings.empty()) {
+            result.dimensions = result.embeddings.front().size();
         }
         if (const auto *usage = parsed->find("usage"); usage && usage->is_object()) {
             if (const auto *pt = usage->find("prompt_tokens"); pt && pt->is_integer() && pt->as_int(-1) >= 0) {
@@ -1089,7 +1146,124 @@ class LlamaServerModel final : public BackendModel {
         return result;
     }
 
+    Result<RerankResult> rerank(const RerankRequest &request, const CancellationToken &cancel) override {
+        if (cancel.cancelled())
+            return Status(ErrorCode::cancelled, "llamaserver: request cancelled");
+        if (Status st = validate_rerank_request(request); !st.ok())
+            return st;
+        return rerank_unchecked(request, cancel);
+    }
+
+    Result<ScoreResult> score(const ScoreRequest &request, const CancellationToken &cancel) override {
+        if (cancel.cancelled())
+            return Status(ErrorCode::cancelled, "llamaserver: request cancelled");
+        if (Status st = validate_score_request(request); !st.ok())
+            return st;
+        const auto t0 = std::chrono::steady_clock::now();
+        ScoreResult result;
+        result.model = descriptor_.name;
+        result.scores.resize(request.pairs.size());
+        // Group pairs sharing the same text_1 into one upstream /v1/rerank call
+        // and scatter scores back to their exact original input pair indices.
+        std::vector<bool> done(request.pairs.size(), false);
+        for (std::size_t i = 0; i < request.pairs.size(); ++i) {
+            if (done[i])
+                continue;
+            if (cancel.cancelled())
+                return Status(ErrorCode::cancelled, "llamaserver: request cancelled");
+            RerankRequest sub;
+            sub.request_id = request.request_id;
+            sub.query = request.pairs[i].text_1;
+            std::vector<std::size_t> orig_indices;
+            for (std::size_t j = i; j < request.pairs.size(); ++j) {
+                if (!done[j] && request.pairs[j].text_1 == sub.query) {
+                    done[j] = true;
+                    orig_indices.push_back(j);
+                    sub.documents.push_back(request.pairs[j].text_2);
+                }
+            }
+            auto ranked = rerank_unchecked(sub, cancel);
+            if (!ranked.ok())
+                return ranked.status();
+            if (ranked.value().results.size() != orig_indices.size())
+                return llamaserver::protocol_error("upstream /v1/rerank returned incomplete score group");
+            result.prompt_tokens += ranked.value().prompt_tokens;
+            for (const auto &item : ranked.value().results) {
+                if (item.index >= orig_indices.size())
+                    return llamaserver::protocol_error("out-of-range group index in /v1/rerank score");
+                const std::size_t orig = orig_indices[item.index];
+                result.scores[orig] = ScoreItem{orig, item.relevance_score};
+            }
+        }
+        result.eval_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        return result;
+    }
+
   private:
+    Result<RerankResult> rerank_unchecked(const RerankRequest &request, const CancellationToken &cancel) {
+        json::Array docs_arr;
+        docs_arr.reserve(request.documents.size());
+        for (const auto &doc : request.documents)
+            docs_arr.emplace_back(doc);
+        json::Object req_body{{"model", descriptor_.name},
+                              {"query", request.query},
+                              {"documents", std::move(docs_arr)}};
+        if (request.top_n.has_value()) {
+            req_body.set("top_n", static_cast<std::uint64_t>(std::min(*request.top_n, request.documents.size())));
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        auto response = backend_->request_rerank(json::Value(std::move(req_body)).dump(), cancel);
+        if (!response.ok())
+            return response.status();
+        auto parsed = json::parse(response.value());
+        if (!parsed.ok() || !parsed->is_object())
+            return llamaserver::protocol_error("malformed /v1/rerank response");
+        const auto *results_v = parsed->find("results");
+        if (!results_v || !results_v->is_array())
+            return llamaserver::protocol_error("missing results array in /v1/rerank response");
+        RerankResult result;
+        result.model = descriptor_.name;
+        const auto &items = results_v->as_array();
+        std::vector<bool> seen(request.documents.size(), false);
+        result.results.reserve(items.size());
+        for (const auto &entry : items) {
+            if (!entry.is_object())
+                return llamaserver::protocol_error("malformed rerank result entry");
+            const auto *idx_v = entry.find("index");
+            if (!idx_v || !idx_v->is_integer())
+                return llamaserver::protocol_error("missing integer index in /v1/rerank response");
+            const std::int64_t idx_i = idx_v->as_int(-1);
+            if (idx_i < 0 || static_cast<std::size_t>(idx_i) >= request.documents.size())
+                return llamaserver::protocol_error("out-of-range index in /v1/rerank response");
+            const std::size_t idx = static_cast<std::size_t>(idx_i);
+            if (seen[idx])
+                return llamaserver::protocol_error("duplicate index in /v1/rerank response");
+            seen[idx] = true;
+            const auto *score_v = entry.find("relevance_score");
+            if (!score_v)
+                score_v = entry.find("score");
+            if (!score_v || !score_v->is_number() || !std::isfinite(score_v->as_double()))
+                return llamaserver::protocol_error("missing finite relevance_score in /v1/rerank response");
+            RerankItem item;
+            item.index = idx;
+            item.relevance_score = score_v->as_double();
+            if (request.return_documents) {
+                item.document = request.documents[idx];
+            }
+            result.results.push_back(std::move(item));
+        }
+        finalize_rerank_items(result.results, request.top_n);
+        if (const auto *usage = parsed->find("usage"); usage && usage->is_object()) {
+            if (const auto *pt = usage->find("prompt_tokens"); pt && pt->is_integer() && pt->as_int(-1) >= 0) {
+                result.prompt_tokens = pt->as_uint();
+            }
+        }
+        result.eval_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        return result;
+    }
+
     std::shared_ptr<LlamaServerBackendImpl> backend_;
     ModelDescriptor descriptor_;
 };
