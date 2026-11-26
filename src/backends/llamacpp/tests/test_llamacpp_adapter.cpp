@@ -4,12 +4,15 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "common/diag_log.hpp"
 #include "llamacpp_internal.hpp"
 #include "sonder/inference/backends/llamacpp.hpp"
 #include "sonder/inference/engine.hpp"
@@ -758,4 +761,31 @@ TEST_CASE("llamacpp adapter: runtime_status populates gpu_memory, spill guard, U
         CHECK(warnings[0].find("attributes")->find("backend")->as_string() == kLlamaCppBackendName);
         CHECK(warnings[0].find("attributes")->find("code")->as_string() == "vram_spill");
     }
+}
+
+namespace {
+struct DiagCapture {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<std::string> lines;
+};
+}  // namespace
+
+TEST_CASE("llamacpp adapter: llama.cpp log lines go through the non-blocking diagnostic queue") {
+    auto cap = std::make_shared<DiagCapture>();
+    sonder::inference::diag::set_sink([cap](const std::string& line) {
+        std::lock_guard<std::mutex> lock(cap->mu);
+        cap->lines.push_back(line);
+        cap->cv.notify_all();
+    });
+    auto backend = make_llamacpp_backend();  // installs the diagnostic-queue sink
+    REQUIRE(backend);
+    sonder::backends::llamacpp::RouteLog(sonder::backends::llamacpp::LogLevel::kError, "ggml exploded\n");
+    std::unique_lock<std::mutex> lock(cap->mu);
+    const bool got = cap->cv.wait_for(lock, std::chrono::seconds(5), [&cap] { return !cap->lines.empty(); });
+    REQUIRE_MESSAGE(got, "the llama.cpp log line never reached the diagnostic queue");
+    CHECK(cap->lines.front() == "ggml exploded\n");
+    lock.unlock();
+    sonder::inference::diag::set_sink(nullptr);
+    sonder::backends::llamacpp::SetLogSink(nullptr);
 }

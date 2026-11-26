@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -193,6 +194,41 @@ TEST_CASE("bounded queue drops under pressure and reports it") {
     CHECK(static_cast<std::uint64_t>(last.value().find("attributes")->find("dropped_events")->as_int()) ==
           bus->dropped_events());
     CHECK(lines.size() == static_cast<std::size_t>(accepted) + 1);
+}
+
+TEST_CASE("shutdown is bounded when a sink never returns") {
+    auto gate = std::make_shared<GateSink>();
+    TelemetryOptions opts;
+    opts.shutdown_timeout = std::chrono::milliseconds(200);
+    auto bus = std::make_unique<TelemetryBus>(opts);
+    bus->add_sink(gate);
+    TelemetryContext ctx;
+    ctx.session_id = "sess-bounded-shutdown";
+    REQUIRE(bus->emit("test.event", ctx, json::Object{}));
+    REQUIRE(gate->wait_until_entered());  // the writer is now stuck inside the sink
+
+    // Run on a helper thread so a regression fails instead of hanging the suite.
+    auto result = std::async(std::launch::async, [&bus] { return bus->shutdown(); });
+    const auto status = result.wait_for(std::chrono::seconds(10));
+    CHECK(status == std::future_status::ready);
+    gate->open();  // releases the abandoned writer (and the helper on a regression)
+    REQUIRE(result.get() == false);
+    CHECK(bus->shutdown() == false);  // idempotent: repeats the first result
+    bus.reset();  // destroying the bus while the abandoned writer winds down must be safe
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+}
+
+TEST_CASE("shutdown_timeout does not cut a healthy drain short") {
+    auto sink = std::make_shared<MemoryTelemetrySink>();
+    TelemetryOptions opts;
+    opts.shutdown_timeout = std::chrono::milliseconds(5000);
+    TelemetryBus bus(opts);
+    bus.add_sink(sink);
+    TelemetryContext ctx;
+    ctx.session_id = "sess-healthy-shutdown";
+    for (int i = 0; i < 20; ++i) REQUIRE(bus.emit("test.event", ctx, json::Object{{"i", i}}));
+    CHECK(bus.shutdown() == true);
+    CHECK(sink->lines().size() == 20);
 }
 
 TEST_CASE("jsonl file sink writes one event per line") {

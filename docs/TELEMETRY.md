@@ -99,6 +99,14 @@ survives; `shutdown()` still drains and terminates the writer. Processing does
 not guarantee delivery to a sink that failed. Stream/file factories retain
 their existing open-error behavior.
 
+`shutdown()` waits at most `TelemetryOptions::shutdown_timeout` (default 5 s; zero or negative
+means do not wait) for the writer. A sink stuck inside `write()` or `flush()` (a stalled
+disk or pipe) therefore cannot hang the process: on expiry `shutdown()` returns `false`,
+discards the events still queued, and detaches the writer. The detached writer owns the
+queue state and the sinks it was handed, starts no further sink call, and exits when the
+stuck call returns; it never touches the destroyed bus. A repeated call returns the first
+result.
+
 Built-in file and ostream sinks check stream state after writing the line and
 newline, and after flushing. A failed operation retires the sink even with the
 default exception mask; caller-owned ostream masks are never changed. This

@@ -17,7 +17,7 @@
 #include "chat_handler.hpp"
 #include "http.hpp"
 #include "live_hub.hpp"
-#include "log_queue.hpp"
+#include "common/log_queue.hpp"
 #include "openai.hpp"
 #include "priority_admission.hpp"
 #include "request_path.hpp"

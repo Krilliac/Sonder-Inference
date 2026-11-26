@@ -410,6 +410,22 @@ struct Capabilities {
     bool logprobs = true;
 };
 
+// Severity of a llama.cpp/ggml log line. The values mirror ggml_log_level.
+enum class LogLevel : int { kNone = 0, kDebug = 1, kInfo = 2, kWarn = 3, kError = 4, kCont = 5 };
+
+// Destination of the llama.cpp log lines that pass the filter (warnings and
+// errors; everything with SONDER_LLAMACPP_VERBOSE=1). `text` is a complete
+// piece of text including its newline, valid for the call only. The sink is
+// called from whatever thread llama.cpp logs on, so it must not block (queue
+// the text and return) and must not throw. A null sink (the default) writes
+// to stderr synchronously. Any thread.
+using LogSink = void (*)(const char* text);
+void SetLogSink(LogSink sink) noexcept;
+
+// What llama.cpp's log callback does with one line: filters by `level`, then
+// hands the text to the sink. Public so tests can drive it without a model.
+void RouteLog(LogLevel level, const char* text);
+
 class LlamaCppBackend {
 public:
     LlamaCppBackend();

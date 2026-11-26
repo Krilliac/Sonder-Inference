@@ -1,4 +1,4 @@
-#include "log_queue.hpp"
+#include "common/log_queue.hpp"
 
 #include <atomic>
 #include <condition_variable>

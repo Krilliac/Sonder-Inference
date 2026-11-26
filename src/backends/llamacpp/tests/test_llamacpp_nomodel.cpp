@@ -1,6 +1,7 @@
 // Backend tests that need llama.cpp linked but no model weights. Tokenization
 // uses llama.cpp's bundled vocab-only GGUF fixtures (tokenizer metadata only).
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <regex>
 #include <string>
@@ -556,4 +557,27 @@ TEST_CASE("llamacpp wrapper: Detokenize, Embed preconditions, and tuning params"
     bad.model_path = "this/file/does/not/exist.gguf";
     bad.spec_type = "unknown";
     CHECK(be.Load(bad).code == ErrorCode::kInvalidArgument);
+}
+
+namespace {
+std::vector<std::string>& captured_log() {
+    static std::vector<std::string> lines;
+    return lines;
+}
+void capture_log(const char* text) { captured_log().emplace_back(text); }
+}  // namespace
+
+TEST_CASE("llamacpp wrapper: log lines go to the installed sink, not to stderr") {
+    captured_log().clear();
+    SetLogSink(&capture_log);
+    RouteLog(LogLevel::kWarn, "a warning\n");
+    RouteLog(LogLevel::kError, "an error\n");
+    RouteLog(LogLevel::kInfo, "chatter\n");  // filtered out unless SONDER_LLAMACPP_VERBOSE is set
+    SetLogSink(nullptr);
+    RouteLog(LogLevel::kInfo, "after reset\n");
+    const bool verbose = std::getenv("SONDER_LLAMACPP_VERBOSE") != nullptr;
+    REQUIRE(captured_log().size() >= 2);
+    CHECK(captured_log()[0] == "a warning\n");
+    CHECK(captured_log()[1] == "an error\n");
+    if (!verbose) CHECK(captured_log().size() == 2);
 }

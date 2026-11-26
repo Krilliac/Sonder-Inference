@@ -16,7 +16,6 @@ sonder_module_sources(
     src/json_schema_gbnf.cpp
     src/launch_profile.cpp
     src/live_hub.cpp
-    src/log_queue.cpp
     src/moe_placement.cpp
     src/openai.cpp
     src/placement_planner.cpp

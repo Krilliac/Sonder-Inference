@@ -4,7 +4,10 @@
 #include <fstream>
 #include <iterator>
 #include <sstream>
+#include <string>
+#include <utility>
 
+#include "common/diag_log.hpp"
 #include "tls_stream.hpp"
 
 #if defined(_WIN32)
@@ -65,12 +68,14 @@ bool is_ip_literal(std::string_view host) {
 }
 
 void warn_insecure_tls(const std::string& host, std::uint16_t port) {
-    std::fprintf(stderr,
-                 "[sonder-tls] WARNING: insecure_skip_verify is set: TLS certificate verification is DISABLED for "
-                 "%s:%u. The connection is encrypted but NOT authenticated and can be intercepted. Use a CA bundle "
-                 "or a certificate pin instead.\n",
-                 host.c_str(), static_cast<unsigned>(port));
-    std::fflush(stderr);
+    // Through the non-blocking diagnostic queue: a stalled stderr must not
+    // stall the connect that is about to proceed.
+    std::string line =
+        "[sonder-tls] WARNING: insecure_skip_verify is set: TLS certificate verification is DISABLED for " + host +
+        ":" + std::to_string(static_cast<unsigned>(port)) +
+        ". The connection is encrypted but NOT authenticated and can be intercepted. Use a CA bundle or a "
+        "certificate pin instead.\n";
+    (void)diag::log(std::move(line));
 }
 
 Status wait_native_socket(NativeSocket socket, bool for_write, Deadline deadline, const CancellationToken& cancel) {
