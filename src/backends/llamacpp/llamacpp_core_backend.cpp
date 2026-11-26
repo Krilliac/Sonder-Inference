@@ -480,6 +480,10 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     lo.use_mmap = o.use_mmap;
     lo.kv_unified = o.kv_unified;
     lo.prefix_cache = o.prefix_cache;
+    lo.prefix_coalesce = o.prefix_coalesce;
+    lo.min_coalesce_prefix_tokens = o.min_coalesce_prefix_tokens;
+    lo.max_followers_per_producer = o.max_followers_per_producer;
+    lo.max_coalesce_wait_ms = o.max_coalesce_wait_ms;
     lo.n_slots = o.slots;
     lo.spec_type = o.spec_type;
     lo.spec_draft_max = o.spec_draft_max;
