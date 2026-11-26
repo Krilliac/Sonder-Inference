@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "http.hpp"
+#include "json_schema_gbnf.hpp"
 #include "sonder/inference/backend.hpp"
 #include "sonder/inference/json.hpp"
 #include "sonder/inference/sampling.hpp"
@@ -65,6 +66,9 @@ struct ChatJob {
     // and serialized JSON schema when type == "json_schema".
     std::optional<std::string> response_format_type;
     std::optional<std::string> response_format_schema;
+    // Deferred schema value + immutable compiled grammar artifact resolved against model/tokenizer identity.
+    std::optional<json::Value> pending_response_schema;
+    std::shared_ptr<const CompiledGrammar> compiled_grammar;
     // Optional tool definitions and tool_choice policy.
     std::vector<ToolDefinition> tools;
     std::optional<ToolChoice> tool_choice;
@@ -114,6 +118,7 @@ struct DetokenizeJob {
 // Sonder extensions: num_ctx, typical_p, repeat_last_n, repeat_penalty,
 // top_k, min_p.
 std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body);
+std::variant<ChatJob, ApiError> parse_chat_request_with_mode(std::string_view body, StructuredParseMode schema_mode);
 std::variant<EmbedJob, ApiError> parse_embed_request(std::string_view body);
 std::variant<CompletionJob, ApiError> parse_completion_request(std::string_view body);
 std::variant<TokenizeJob, ApiError> parse_tokenize_request(std::string_view body);

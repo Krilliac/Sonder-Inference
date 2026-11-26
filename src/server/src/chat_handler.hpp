@@ -157,12 +157,23 @@ private:
     bool write_failed_ = false;
 };
 
+// Resolves/compiles chat structured-output or forced tool-call grammars via
+// CompiledGrammarCache keyed by normalized schema & tokenizer identity.
+[[nodiscard]] std::optional<ApiError> prepare_chat_grammar(
+    ChatJob& job, std::string_view tokenizer_identity,
+    bool backend_supports_structured_output, bool backend_native_tools,
+    std::string_view backend_name, CompiledGrammarCache* cache = nullptr,
+    const StructuredGrammarEngine& engine = default_structured_grammar_engine());
+
 // The caller holds the model's residency pin through this synchronous call
 // (including response writes), and destroys the session before releasing it.
 void execute_chat(ChatExchange& exchange, const ChatJob& job, const Correlation& correlation,
                   const std::string& model, const std::string& backend,
                   const std::shared_ptr<Session>& session, ChatProtocol protocol,
-                  bool backend_native_tools = true);
+                  bool backend_native_tools = true,
+                  CompiledGrammarCache* grammar_cache = nullptr,
+                  std::string_view tokenizer_identity = {},
+                  bool backend_supports_structured_output = true);
 
 // Synchronous execution for POST /v1/completions (non-streaming and SSE streaming).
 void execute_completion(ChatExchange& exchange, const CompletionJob& job, const Correlation& correlation,

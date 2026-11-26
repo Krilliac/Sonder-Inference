@@ -128,7 +128,7 @@ std::optional<ApiError> read_grammar_field(const json::Object& body, std::string
     return std::nullopt;
 }
 
-std::optional<ApiError> read_response_format(const json::Object& body, ChatJob& job) {
+std::optional<ApiError> read_response_format(const json::Object& body, ChatJob& job, StructuredParseMode schema_mode) {
     const json::Value* rf = body.find("response_format");
     if (!present(rf)) {
         return std::nullopt;
@@ -145,8 +145,15 @@ std::optional<ApiError> read_response_format(const json::Object& body, ChatJob& 
         return std::nullopt;
     }
     if (type == "json_object") {
-        job.grammar = json_object_gbnf();
         job.response_format_type = "json_object";
+        if (schema_mode == StructuredParseMode::compile_eagerly) {
+            auto compiled = default_structured_grammar_engine().compile_json_object();
+            if (!compiled.ok()) {
+                return bad("invalid_request", compiled.status().message(), "response_format");
+            }
+            job.compiled_grammar = std::make_shared<const CompiledGrammar>(std::move(compiled).value());
+            job.grammar = job.compiled_grammar->gbnf;
+        }
         return std::nullopt;
     }
     if (type == "json_schema") {
@@ -166,14 +173,18 @@ std::optional<ApiError> read_response_format(const json::Object& body, ChatJob& 
             return bad("invalid_request", "response_format.json_schema.schema must be a JSON object",
                        "response_format.json_schema.schema");
         }
-        auto gbnf = json_schema_to_gbnf(*schema_v);
-        if (!gbnf.ok()) {
-            return bad("invalid_request", "invalid response_format.json_schema.schema: " + gbnf.status().message(),
-                       "response_format.json_schema.schema");
-        }
-        job.grammar = std::move(gbnf).value();
         job.response_format_type = "json_schema";
         job.response_format_schema = schema_v->dump();
+        job.pending_response_schema = *schema_v;
+        if (schema_mode == StructuredParseMode::compile_eagerly) {
+            auto compiled = default_structured_grammar_engine().compile_json_schema(*schema_v);
+            if (!compiled.ok()) {
+                return bad("invalid_request", "invalid response_format.json_schema.schema: " + compiled.status().message(),
+                           "response_format.json_schema.schema");
+            }
+            job.compiled_grammar = std::make_shared<const CompiledGrammar>(std::move(compiled).value());
+            job.grammar = job.compiled_grammar->gbnf;
+        }
         return std::nullopt;
     }
     return bad("unsupported_parameter",
@@ -398,6 +409,11 @@ std::optional<std::uint64_t> parse_deadline_ms(const json::Value& value) noexcep
 }
 
 std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body_text) {
+    return parse_chat_request_with_mode(body_text, StructuredParseMode::compile_eagerly);
+}
+
+std::variant<ChatJob, ApiError> parse_chat_request_with_mode(std::string_view body_text,
+                                                             StructuredParseMode schema_mode) {
     // Cap parsed value nodes on ingress requests to limit allocation/CPU amplification (M-17).
     auto parsed = json::parse(body_text, json::ParseLimits{128, 65536});
     if (!parsed.ok()) {
@@ -572,7 +588,7 @@ std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body_text) {
         return bad("invalid_messages", st.message(), "messages");
     }
     if (auto e = read_chat_extensions(body, job)) return *e;
-    if (auto e = read_response_format(body, job)) return *e;
+    if (auto e = read_response_format(body, job, schema_mode)) return *e;
     {
         std::string explicit_grammar;
         if (auto e = read_grammar_field(body, explicit_grammar)) return *e;

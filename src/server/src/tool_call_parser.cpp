@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <set>
@@ -629,25 +630,73 @@ std::string format_tools_system_prompt(const std::vector<ToolDefinition>& tools,
     return out;
 }
 
-Result<std::string> build_tool_call_gbnf(const std::vector<ToolDefinition>& tools, const ToolChoice& choice) {
-    if (tools.empty()) {
-        return Status(ErrorCode::invalid_argument, "cannot build tool call grammar without tools");
-    }
-    if (choice.mode != ToolChoiceMode::required && choice.mode != ToolChoiceMode::function) {
-        return Status(ErrorCode::invalid_argument,
-                      "tool call grammar is only built for required or named function tool_choice");
-    }
+namespace {
 
-    auto make_call_schema = [](const ToolDefinition& tool, bool strict_params) -> json::Value {
+std::string canonical_tool_parameters(const ToolDefinition& tool) {
+    if (tool.parameters_json.empty()) {
+        return R"({"type":"object"})";
+    }
+    auto parsed = json::parse(tool.parameters_json);
+    if (parsed.ok()) {
+        return canonical_json_dump(parsed.value());
+    }
+    return tool.parameters_json;
+}
+
+std::string build_tool_call_cache_key(const std::vector<ToolDefinition>& tools, const ToolChoice& choice) {
+    json::Array tool_entries;
+    if (choice.mode == ToolChoiceMode::function) {
+        for (const auto& t : tools) {
+            if (t.name == choice.function_name) {
+                tool_entries.emplace_back(json::Object{
+                    {"name", t.name},
+                    {"parameters", canonical_tool_parameters(t)},
+                });
+                break;
+            }
+        }
+    } else {
+        tool_entries.reserve(tools.size());
+        for (const auto& t : tools) {
+            tool_entries.emplace_back(json::Object{
+                {"name", t.name},
+                {"parameters", canonical_tool_parameters(t)},
+            });
+        }
+    }
+    json::Object key_doc{
+        {"mode", choice.mode == ToolChoiceMode::function ? "function" : "required"},
+        {"function_name", choice.function_name},
+        {"tools", std::move(tool_entries)},
+    };
+    return canonical_json_dump(json::Value(std::move(key_doc)));
+}
+
+Result<CompiledGrammar> compile_tool_call_grammar_uncached(const std::vector<ToolDefinition>& tools,
+                                                           const ToolChoice& choice,
+                                                           std::string_view canonical_key,
+                                                           std::string_view tokenizer_identity,
+                                                           const StructuredGrammarEngine& engine) {
+    if (!engine.capabilities().active || !engine.capabilities().supports_json_schema) {
+        return Status(ErrorCode::unsupported, engine.capabilities().detail);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    bool relaxed_any = false;
+
+    auto make_call_schema = [&](const ToolDefinition& tool, bool strict_params) -> json::Value {
         json::Value params_schema = json::Object{{"type", "object"}};
         if (strict_params && !tool.parameters_json.empty()) {
             auto parsed = json::parse(tool.parameters_json);
             if (parsed.ok() && parsed.value().is_object()) {
-                // Verify the parameter schema itself converts cleanly; if not, caller can retry non-strict.
-                if (json_schema_to_gbnf(parsed.value()).ok()) {
+                // Verify the parameter schema itself converts cleanly; if not, caller retries non-strict.
+                if (engine.compile_json_schema(parsed.value()).ok()) {
                     params_schema = std::move(parsed).value();
+                } else {
+                    relaxed_any = true;
                 }
             }
+        } else if (!strict_params && !tool.parameters_json.empty()) {
+            relaxed_any = true;
         }
         return json::Object{{"type", "object"},
                             {"properties", json::Object{{"name", json::Object{{"const", tool.name}}},
@@ -684,7 +733,7 @@ Result<std::string> build_tool_call_gbnf(const std::vector<ToolDefinition>& tool
     if (!call_schema.ok()) {
         return call_schema.status();
     }
-    auto base = json_schema_to_gbnf(call_schema.value());
+    auto base = engine.compile_json_schema(call_schema.value());
     if (!base.ok()) {
         // Retry with non-strict object arguments (e.g., if nested parameter schema
         // contained root-relative $defs/$ref) while still strictly enforcing the
@@ -693,20 +742,162 @@ Result<std::string> build_tool_call_gbnf(const std::vector<ToolDefinition>& tool
         if (!relaxed_schema.ok()) {
             return relaxed_schema.status();
         }
-        base = json_schema_to_gbnf(relaxed_schema.value());
+        base = engine.compile_json_schema(relaxed_schema.value());
         if (!base.ok()) {
             return base.status();
         }
+        relaxed_any = true;
     }
-    // Rewrite `root ::= <expr>\n` into `root ::= "<tool_call>" space <expr> "</tool_call>" space\n`.
-    std::string gbnf = std::move(base).value();
-    const std::size_t nl = gbnf.find('\n');
-    if (nl == std::string::npos || gbnf.rfind("root ::= ", 0) != 0) {
+
+    CompiledGrammar out = std::move(base).value();
+    const std::size_t nl = out.gbnf.find('\n');
+    if (nl == std::string::npos || out.gbnf.rfind("root ::= ", 0) != 0) {
         return Status(ErrorCode::internal, "unexpected GBNF root layout");
     }
-    const std::string root_rhs = gbnf.substr(9, nl - 9);
-    return std::string("root ::= \"<tool_call>\" space (") + root_rhs + ") \"</tool_call>\" space\n" +
-           gbnf.substr(nl + 1);
+    const std::string root_rhs = out.gbnf.substr(9, nl - 9);
+    out.gbnf = std::string("root ::= \"<tool_call>\" space (") + root_rhs + ") \"</tool_call>\" space\n" +
+               out.gbnf.substr(nl + 1);
+    out.payload = out.gbnf;
+    out.constraint_kind = GrammarConstraintKind::tool_call;
+    out.normalized_schema_key = std::string(canonical_key);
+    out.normalized_schema_hash = normalized_schema_hash(GrammarConstraintKind::tool_call, canonical_key);
+    out.tokenizer_identity =
+        tokenizer_identity.empty() ? std::string("default") : std::string(tokenizer_identity);
+    out.capabilities.constraint_kind = GrammarConstraintKind::tool_call;
+    out.capabilities.enforces_strict_schema = !relaxed_any;
+    out.capabilities.uses_fallback_relaxation = relaxed_any;
+    out.compile_duration = std::chrono::steady_clock::now() - t0;
+    return out;
+}
+
+}  // namespace
+
+Result<std::shared_ptr<const CompiledGrammar>> build_tool_call_grammar(
+    const std::vector<ToolDefinition>& tools, const ToolChoice& choice,
+    CompiledGrammarCache* cache, std::string_view tokenizer_identity,
+    const StructuredGrammarEngine& engine) {
+    if (tools.empty()) {
+        return Status(ErrorCode::invalid_argument, "cannot build tool call grammar without tools");
+    }
+    if (choice.mode != ToolChoiceMode::required && choice.mode != ToolChoiceMode::function) {
+        return Status(ErrorCode::invalid_argument,
+                      "tool call grammar is only built for required or named function tool_choice");
+    }
+    const std::string canonical_key = build_tool_call_cache_key(tools, choice);
+    const std::string tok_id =
+        tokenizer_identity.empty() ? std::string("default") : std::string(tokenizer_identity);
+    if (cache != nullptr) {
+        CompiledGrammarCacheKey key;
+        key.engine = engine.kind();
+        key.constraint_kind = GrammarConstraintKind::tool_call;
+        key.tokenizer_identity = tok_id;
+        key.normalized_schema_key = canonical_key;
+        key.options_key = GrammarCompileOptions{}.cache_key_fragment();
+        return cache->get_or_compile(key, [&]() {
+            return compile_tool_call_grammar_uncached(tools, choice, canonical_key, tok_id, engine);
+        });
+    }
+    auto compiled = compile_tool_call_grammar_uncached(tools, choice, canonical_key, tok_id, engine);
+    if (!compiled.ok()) {
+        return compiled.status();
+    }
+    return std::make_shared<const CompiledGrammar>(std::move(compiled).value());
+}
+
+Result<std::string> build_tool_call_gbnf(const std::vector<ToolDefinition>& tools, const ToolChoice& choice) {
+    auto compiled = build_tool_call_grammar(tools, choice);
+    if (!compiled.ok()) {
+        return compiled.status();
+    }
+    return compiled.value()->gbnf;
+}
+
+Result<PreparedStructuredGrammar> resolve_structured_grammar(
+    std::string_view schema_param_prefix,
+    std::string_view explicit_grammar,
+    const std::optional<std::string>& response_format_type,
+    const std::optional<json::Value>& pending_response_schema,
+    const std::optional<std::string>& response_format_schema,
+    const std::vector<ToolDefinition>& tools,
+    const std::optional<ToolChoice>& tool_choice,
+    bool backend_supports_structured_output,
+    bool backend_native_tools,
+    std::string_view backend_name,
+    std::string_view tokenizer_identity,
+    CompiledGrammarCache* cache,
+    const StructuredGrammarEngine& engine) {
+    PreparedStructuredGrammar out;
+    const std::string tok_id =
+        tokenizer_identity.empty() ? std::string("default") : std::string(tokenizer_identity);
+
+    if (response_format_type && *response_format_type == "json_object") {
+        if (cache != nullptr) {
+            auto res = cache->get_or_compile_json_object(engine, tok_id);
+            if (!res.ok()) {
+                return res.status();
+            }
+            out.compiled = std::move(res).value();
+        } else {
+            auto res = engine.compile_json_object();
+            if (!res.ok()) {
+                return res.status();
+            }
+            res.value().tokenizer_identity = tok_id;
+            out.compiled = std::make_shared<const CompiledGrammar>(std::move(res).value());
+        }
+        out.grammar = out.compiled->gbnf;
+        return out;
+    }
+
+    if (response_format_type && *response_format_type == "json_schema") {
+        std::optional<json::Value> parsed_storage;
+        const json::Value* schema_ptr = pending_response_schema ? &*pending_response_schema : nullptr;
+        if (schema_ptr == nullptr && response_format_schema) {
+            auto parsed = json::parse(*response_format_schema);
+            if (!parsed.ok() || !parsed.value().is_object()) {
+                return Status(ErrorCode::invalid_argument,
+                              "invalid " + std::string(schema_param_prefix) + ": schema must be a JSON object");
+            }
+            parsed_storage = std::move(parsed).value();
+            schema_ptr = &*parsed_storage;
+        }
+        if (schema_ptr == nullptr) {
+            return Status(ErrorCode::invalid_argument,
+                          "invalid " + std::string(schema_param_prefix) + ": schema is missing");
+        }
+        if (cache != nullptr) {
+            auto res = cache->get_or_compile_schema(engine, *schema_ptr, tok_id);
+            if (!res.ok()) {
+                return res.status();
+            }
+            out.compiled = std::move(res).value();
+        } else {
+            auto res = engine.compile_json_schema(*schema_ptr);
+            if (!res.ok()) {
+                return res.status();
+            }
+            res.value().tokenizer_identity = tok_id;
+            out.compiled = std::make_shared<const CompiledGrammar>(std::move(res).value());
+        }
+        out.grammar = out.compiled->gbnf;
+        return out;
+    }
+
+    if (!explicit_grammar.empty()) {
+        out.grammar.assign(explicit_grammar.data(), explicit_grammar.size());
+        return out;
+    }
+
+    if (!tools.empty() && tool_choice &&
+        (tool_choice->mode == ToolChoiceMode::required || tool_choice->mode == ToolChoiceMode::function) &&
+        backend_supports_structured_output && !backend_native_tools &&
+        backend_name != "llamaserver" && backend_name != "ollama") {
+        if (auto compiled = build_tool_call_grammar(tools, *tool_choice, cache, tok_id, engine); compiled.ok()) {
+            out.compiled = std::move(compiled).value();
+            out.grammar = out.compiled->gbnf;
+        }
+    }
+    return out;
 }
 
 // ================================================================= ToolCallStreamParser
