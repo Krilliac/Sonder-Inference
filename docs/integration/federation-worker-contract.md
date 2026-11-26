@@ -50,8 +50,9 @@ generation handlers):
 on another endpoint.
 
 Not safe to replay: `503 backend_unavailable` (the backend failed while
-executing), any error after streaming started, and `5xx` without a body from
-the proxy hop.
+executing), any error after streaming started, and any proxy-hop 5xx other
+than the exact `503` + `X-Sonder-Proxy-Upstream: unreachable` pair below
+(including a bare 502 and a 504).
 
 ## Draining
 
@@ -73,10 +74,19 @@ choose an endpoint. `X-Sonder-Deadline-Ms` carries the remaining budget.
 ## Proxy dial-failure contract
 
 When a reverse proxy (Caddy) fronts an SI endpoint, a failed dial means the
-request never reached SI, so it is also "nothing executed". The exact status
-and body are defined by POOL-06 and are not restated here; until that lands,
-the router treats a dial failure as retry-elsewhere only when the proxy
-response is distinguishable from an SI response.
+request never reached SI, so it is also "nothing executed". The contract
+(this page is the source; POOL-06 implements it in the Caddy config) is
+Caddy `handle_errors` on an upstream dial failure returning:
+
+| Status | Header | Code | Retry elsewhere |
+| --- | --- | --- | --- |
+| 503 | `X-Sonder-Proxy-Upstream: unreachable` | `upstream_unreachable` | yes |
+
+Only that exact pair (503 with the header and JSON code `upstream_unreachable`)
+is retryable elsewhere. A bare 502 (it may follow an upstream reset after the
+request was sent), a 504, and any other proxy 5xx are final: the request may
+already have run, so the router must not replay it. SI never sends 502, so a
+proxy 502 is not evidence that nothing executed.
 
 ## Out of scope
 
