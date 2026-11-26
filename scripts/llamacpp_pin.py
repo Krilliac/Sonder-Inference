@@ -6,7 +6,7 @@ Subcommands
           temporary directory.
   verify  Check a source tarball against the manifest: the tarball SHA-256, then
           the git blob SHA-1 of every file against `git ls-tree -r <commit>`
-          read from --git-dir. Nothing from the tarball is written to disk or
+          read from --git-dir (a worktree, a .git directory or a bare repository). Nothing from the tarball is written to disk or
           executed; entries are read in memory.
   check   Fail when a literal llama.cpp tag, commit or SHA-256 in the docs
           disagrees with the manifest.
@@ -79,7 +79,7 @@ def git_tree(git_dir: Path, commit: str) -> dict[str, tuple[str, str]]:
     """path -> (mode, blob sha) for every blob/symlink in the commit."""
     try:
         out = subprocess.run(
-            ["git", "--git-dir", str(git_dir), "ls-tree", "-r", "-z", commit],
+            ["git", "-C", str(git_dir), "ls-tree", "-r", "-z", commit],
             check=True, capture_output=True, timeout=120,
         ).stdout
     except (OSError, subprocess.SubprocessError) as exc:
@@ -99,30 +99,44 @@ def git_tree(git_dir: Path, commit: str) -> dict[str, tuple[str, str]]:
     return tree
 
 
-def safe_relpath(name: str) -> str:
-    """Strip the single top-level directory and reject unsafe paths."""
+def split_member(name: str) -> tuple[str, str]:
+    """Return (top-level directory name, path below it; '' for the top entry).
+
+    Rejects absolute, backslash, drive-letter and dot/empty-component paths.
+    """
     if "\\" in name or name.startswith("/") or re.match(r"^[A-Za-z]:", name):
         raise PinError(f"unsafe path in tarball: {name!r}")
     parts = name.rstrip("/").split("/")
     if any(p in ("..", ".", "") for p in parts):
         raise PinError(f"unsafe path in tarball: {name!r}")
-    if len(parts) < 2:
-        return ""
-    return "/".join(parts[1:])
+    return parts[0], "/".join(parts[1:])
 
 
 def tarball_blobs(tarball: Path) -> dict[str, str]:
-    """relative path -> git blob sha1, read in memory (no extraction to disk)."""
+    """relative path -> git blob sha1, read in memory (no extraction to disk).
+
+    The archive must have exactly one top-level directory shared by every
+    member: CMake's extract step uses the extraction root as the source dir when
+    there is more than one top-level entry, so anything else is rejected.
+    """
     blobs: dict[str, str] = {}
+    tops: set[str] = set()
     try:
         tf = tarfile.open(tarball, "r:*")
     except (OSError, tarfile.TarError) as exc:
         raise PinError(f"cannot open tarball {tarball}: {exc}") from exc
     with tf:
         for member in tf:
-            rel = safe_relpath(member.name)
-            if member.isdir() or not rel:
+            top, rel = split_member(member.name)
+            if not rel and not member.isdir():
+                raise PinError(f"non-directory entry at the top level of the tarball: {member.name!r}")
+            tops.add(top)
+            if len(tops) > 1:
+                raise PinError(f"tarball has more than one top-level entry: {sorted(tops)!r}")
+            if member.isdir():
                 continue
+            if rel in blobs:
+                raise PinError(f"duplicate entry in tarball: {rel!r}")
             if member.issym():
                 blobs[rel] = git_blob_sha1(member.linkname.encode("utf-8"))
             elif member.isreg():
@@ -132,6 +146,8 @@ def tarball_blobs(tarball: Path) -> dict[str, str]:
                 blobs[rel] = git_blob_sha1(f.read())
             else:
                 raise PinError(f"unsupported tar entry type for {member.name!r}")
+    if len(tops) != 1:
+        raise PinError("tarball must contain exactly one top-level directory")
     return blobs
 
 

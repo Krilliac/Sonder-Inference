@@ -53,6 +53,16 @@ jobs:
       - name: Test
         run: ctest --preset ${{ matrix.preset }}
 
+      # Gating (this job is not continue-on-error): docs/manifest drift or a
+      # broken pin verifier must fail CI. Needs only python3 and cmake.
+      - name: llama.cpp pin manifest check and tests (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I scripts/llamacpp_pin.py check
+          python3 -m unittest scripts.test_llamacpp_pin
+
       - name: CLI smoke (mock backend + telemetry)
         shell: bash
         run: |
@@ -144,13 +154,6 @@ jobs:
           "tag=$($e.tag)" >> $env:GITHUB_OUTPUT
           "url=$($e.url)" >> $env:GITHUB_OUTPUT
           "sha256=$($e.sha256)" >> $env:GITHUB_OUTPUT
-
-      - name: Pin manifest tests
-        shell: pwsh
-        run: |
-          python -I scripts/llamacpp_pin.py check
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m unittest scripts.test_llamacpp_pin
 
       # The tarball file is cached (not an extracted tree) and handed to
       # FetchContent as a file:// URL, so URL_HASH is re-checked on every

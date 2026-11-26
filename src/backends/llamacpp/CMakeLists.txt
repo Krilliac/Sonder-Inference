@@ -37,6 +37,7 @@ endif()
 
 include(FetchContent)
 
+# --- pin resolution begin (extracted by scripts/test_llamacpp_pin.py) ---
 # Pin manifest: cmake/llamacpp-pin.json holds one entry per track (tag, peeled
 # commit, URL, SHA-256). It is the single source of truth; CI, the docs check
 # (scripts/llamacpp_pin.py check) and the test expectations all read it.
@@ -54,12 +55,20 @@ set(SONDER_LLAMACPP_URL "" CACHE STRING
     "Override llama.cpp source archive URL (default: manifest URL with the tag substituted)")
 set(SONDER_LLAMACPP_SHA256 "" CACHE STRING
     "Override expected SHA-256 of the llama.cpp source archive")
-# Manifest SHA-256 applied by the last configure of this build directory.
-set(SONDER_LLAMACPP_APPLIED_SHA256 "" CACHE INTERNAL "")
-# SHA-256 values that earlier revisions of this file stored in the cache as the
-# default (b11195); a cached value equal to one of these was never an override.
+# Manifest values applied by the last configure of this build directory: SHA-256,
+# tag and the archive URL derived from them.
+# (INTERNAL cache entries imply FORCE, so they are only written at the end and
+# copied into locals here.)
+set(_sonder_llamacpp_applied_sha256 "${SONDER_LLAMACPP_APPLIED_SHA256}")
+set(_sonder_llamacpp_applied_tag    "${SONDER_LLAMACPP_APPLIED_TAG}")
+set(_sonder_llamacpp_applied_url    "${SONDER_LLAMACPP_APPLIED_URL}")
+# Values that earlier revisions of this file stored in the cache as the defaults
+# (b11195); a cached value equal to one of these was never an override.
 set(_sonder_llamacpp_legacy_sha256
     "d9818b7786c8a3b063bac7eb7dc8710e275638f1e288e206720c9e22e7ca216a")
+set(_sonder_llamacpp_legacy_tag "b11195")
+set(_sonder_llamacpp_legacy_url
+    "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b11195.tar.gz")
 
 if(NOT EXISTS "${SONDER_LLAMACPP_PIN_FILE}")
     message(FATAL_ERROR "llama.cpp pin manifest not found: ${SONDER_LLAMACPP_PIN_FILE}")
@@ -76,19 +85,29 @@ string(JSON _sonder_llamacpp_m_tag    GET "${_sonder_llamacpp_entry}" tag)
 string(JSON _sonder_llamacpp_m_url    GET "${_sonder_llamacpp_entry}" url)
 string(JSON _sonder_llamacpp_m_sha256 GET "${_sonder_llamacpp_entry}" sha256)
 
-# Stale-cache handling: a cached SHA equal to the last applied manifest SHA, or
-# to a legacy default, was the default and moves to the manifest value.
+# Stale-cache handling. A cached value equal to what an earlier configure applied
+# from the manifest (or to a legacy default) was a default, not an override, and
+# moves to the manifest. Each variable is judged on its own: an explicit TAG or
+# URL override survives a SHA-256 that happens to equal the manifest value.
 if(SONDER_LLAMACPP_SHA256 AND
-   (SONDER_LLAMACPP_SHA256 STREQUAL SONDER_LLAMACPP_APPLIED_SHA256
+   (SONDER_LLAMACPP_SHA256 STREQUAL _sonder_llamacpp_applied_sha256
     OR SONDER_LLAMACPP_SHA256 IN_LIST _sonder_llamacpp_legacy_sha256))
     if(NOT SONDER_LLAMACPP_SHA256 STREQUAL _sonder_llamacpp_m_sha256)
         message(STATUS "llama.cpp pin: cached SHA-256 ${SONDER_LLAMACPP_SHA256} was the "
                        "previous default; moving to manifest ${_sonder_llamacpp_m_sha256} "
                        "(${_sonder_llamacpp_m_tag})")
     endif()
-    set(SONDER_LLAMACPP_TAG    "" CACHE STRING "" FORCE)
-    set(SONDER_LLAMACPP_URL    "" CACHE STRING "" FORCE)
     set(SONDER_LLAMACPP_SHA256 "" CACHE STRING "" FORCE)
+endif()
+if(SONDER_LLAMACPP_TAG AND
+   (SONDER_LLAMACPP_TAG STREQUAL _sonder_llamacpp_applied_tag
+    OR SONDER_LLAMACPP_TAG IN_LIST _sonder_llamacpp_legacy_tag))
+    set(SONDER_LLAMACPP_TAG "" CACHE STRING "" FORCE)
+endif()
+if(SONDER_LLAMACPP_URL AND
+   (SONDER_LLAMACPP_URL STREQUAL _sonder_llamacpp_applied_url
+    OR SONDER_LLAMACPP_URL IN_LIST _sonder_llamacpp_legacy_url))
+    set(SONDER_LLAMACPP_URL "" CACHE STRING "" FORCE)
 endif()
 
 set(SONDER_LLAMACPP_RESOLVED_TAG    "${_sonder_llamacpp_m_tag}")
@@ -115,8 +134,12 @@ if(SONDER_LLAMACPP_URL)
     set(SONDER_LLAMACPP_RESOLVED_URL "${SONDER_LLAMACPP_URL}")
 endif()
 set(SONDER_LLAMACPP_APPLIED_SHA256 "${_sonder_llamacpp_m_sha256}" CACHE INTERNAL "")
+set(SONDER_LLAMACPP_APPLIED_TAG    "${_sonder_llamacpp_m_tag}"    CACHE INTERNAL "")
+set(SONDER_LLAMACPP_APPLIED_URL    "${_sonder_llamacpp_m_url}"    CACHE INTERNAL "")
 message(STATUS "llama.cpp pin: track=${SONDER_LLAMACPP_TRACK} tag=${SONDER_LLAMACPP_RESOLVED_TAG} "
                "url=${SONDER_LLAMACPP_RESOLVED_URL} sha256=${SONDER_LLAMACPP_RESOLVED_SHA256}")
+
+# --- pin resolution end ---
 
 # Consume llama.cpp as a library only: no tools, server, examples, tests, or
 # networking. CPU backend is always available; accelerators are opt-in by the
