@@ -286,12 +286,9 @@ endif()
 # functions never throw, can drop our try/catch around those calls and the exception then hits a
 # noexcept frame (std::terminate). /EHs (without the "c") keeps the catch. Scoped to this target.
 if(MSVC)
-    get_target_property(_sonder_llamacpp_opts sonder_backend_llamacpp COMPILE_OPTIONS)
-    if(_sonder_llamacpp_opts)
-        list(REMOVE_ITEM _sonder_llamacpp_opts /EHsc)
-        set_target_properties(sonder_backend_llamacpp PROPERTIES COMPILE_OPTIONS "${_sonder_llamacpp_opts}")
-    endif()
-    # /EH flags are additive: an earlier /EHsc still sets "c" unless it is turned off explicitly.
+    # /EHsc arrives from both CMAKE_CXX_FLAGS and sonder_set_warnings. Each /EH letter is independent
+    # and the last instance wins, so appending /EHc- turns off only the "c" (keeping "s"). This also
+    # applies to clang-cl, whose driver parses the letters the same way.
     target_compile_options(sonder_backend_llamacpp PRIVATE /EHs /EHc-)
 endif()
 

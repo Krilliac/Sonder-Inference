@@ -442,10 +442,10 @@ struct SamplerDeleter {
 };
 using SamplerPtr = std::unique_ptr<llama_sampler, SamplerDeleter>;
 
-// llama.cpp's grammar code reports failure by throwing: a lazy grammar replays the text captured
-// since its trigger fired into the grammar stack and throws std::runtime_error (via
-// llama_grammar_accept_str / llama_grammar_accept_token in llama-grammar.cpp) when that text does
-// not fit the grammar, and any allocation can throw std::bad_alloc. The exception unwinds through
+// llama.cpp's grammar code reports failure by throwing: when a lazy grammar's trigger matches, it
+// replays the text buffered from the match point into the grammar stack and throws
+// std::runtime_error (from llama_grammar_accept_token in llama-grammar.cpp) when that text does not
+// fit the grammar, and any allocation can throw std::bad_alloc. The exception unwinds through
 // llama_sampler_accept / llama_sampler_apply, which are declared extern "C". Under MSVC /EHsc the
 // compiler assumes extern "C" functions never throw and may drop the try/catch around the call, so
 // the exception then reaches a noexcept frame and calls std::terminate. This target is therefore
@@ -1560,6 +1560,12 @@ struct LlamaCppBackend::Impl {
             const sonder::inference::SpeculativeSequenceResult seq = spec_verifier.verify_sequence_lazy(
                 draft_tokens, /*has_proposal_dists=*/true,
                 [&](std::size_t pos, std::vector<double>& out_p) -> bool {
+                    // A failed grammar accept leaves the grammar with no stacks; applying it again would
+                    // reach GGML_ASSERT(!stacks.empty()) in llama_grammar_reject_candidates, which aborts
+                    // the process and cannot be caught. Stop the sequence instead.
+                    if (grammar_accept_failed) {
+                        return false;
+                    }
                     return ExtractPostProcessorTargetProbs(static_cast<int32_t>(pos), sp, sampler, grammar_sampler,
                                                            n_vocab, out_p);
                 },
