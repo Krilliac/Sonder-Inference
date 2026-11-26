@@ -18,11 +18,35 @@ from typing import Any, Callable
 from . import RESULTS_SCHEMA, SCENARIOS_SCHEMA, __version__
 from .client import Target, trace_text, validate_headers
 from .gpumem import GpuSampler, spill_check
-from .metrics import derive, group_summary, summarize
-from .observation import ChildLogProbe, MetricsProbe, metrics_delta
-from .scenarios import alternate_reuse, max_tokens_for, pinned_thinking, scenario_headers, stall_failures
-from .textgen import (Sizer, agent_system_prompt, plant, planted_facts, record_list,
-                      tool_result_block, tool_schemas)
+from .metrics import (classify_cache_state, derive, group_summary, split_cold_warm_summary,
+                      summarize, summarize_by_corpus_tag)
+from .observation import (ChildLogProbe, MetricsProbe, build_provenance, metrics_delta,
+                          summarize_validation_outcome, validate_provenance)
+from .scenarios import (CORPUS_TAGS, alternate_reuse, max_tokens_for, overlap_count,
+                        pinned_thinking, scenario_headers, stall_failures, trailing_summary,
+                        validate_corpus_tag, warm_tool_return_reuse)
+from .textgen import (Sizer, agent_system_prompt, corpus_prompt, plant, planted_facts,
+                      record_list, tool_result_block, tool_schemas)
+
+ACCEPTANCE_MATRIX_SCENARIOS: dict[str, Any] = {
+    "schema": SCENARIOS_SCHEMA,
+    "defaults": {"max_tokens": 48, "temperature": 0, "seed": 42},
+    "scenarios": [
+        {"name": "single-request", "kind": "single_request",
+         "corpus_tags": ["prose", "code", "tool_json", "reasoning"],
+         "prompt_tokens": 512, "warm_repeat": True, "max_tokens": 48},
+        {"name": "simultaneous-siblings", "kind": "simultaneous_siblings", "siblings": 3,
+         "shared_prefix_tokens": 2000, "corpus_tag": "code", "max_tokens": 48},
+        {"name": "staggered-arrivals", "kind": "staggered_arrivals", "arrivals": 3,
+         "stagger_ms": 25.0, "prompt_tokens": 1000, "corpus_tag": "prose", "max_tokens": 48},
+        {"name": "long-trailing", "kind": "long_trailing", "short_peers": 2,
+         "short_max_tokens": 16, "long_max_tokens": 96, "shared_prefix_tokens": 1000,
+         "corpus_tag": "code"},
+        {"name": "warm-tool-return", "kind": "warm_tool_return", "turns": 4,
+         "system_tokens": 4000, "tools": 12, "turn_tokens": 300,
+         "corpus_tag": "tool_json", "max_tokens": 48},
+    ],
+}
 
 BUILTIN_SCENARIOS: dict[str, Any] = {
     "schema": SCENARIOS_SCHEMA,
@@ -42,11 +66,13 @@ BUILTIN_SCENARIOS: dict[str, Any] = {
         {"name": "priority-contention", "kind": "priority_contention", "background_tokens": 20000,
          "interactive_tokens": 500, "max_tokens": 48},
         {"name": "concurrency-stall", "kind": "concurrency_stall", "clients": 3, "max_tokens": 48},
+        *copy.deepcopy(ACCEPTANCE_MATRIX_SCENARIOS["scenarios"]),
     ],
 }
 
 KINDS = ("agent_session", "concurrency_sweep", "long_context", "repeat_prompt", "agent_alternate",
-         "priority_contention", "concurrency_stall")
+         "priority_contention", "concurrency_stall", "single_request", "simultaneous_siblings",
+         "staggered_arrivals", "long_trailing", "warm_tool_return")
 
 
 def validate_config(cfg: dict) -> list[str]:
@@ -82,6 +108,12 @@ def validate_config(cfg: dict) -> list[str]:
             errs.append(f"scenarios[{i}].priority must be interactive, subagent, or background")
         if s.get("prompt_cache_key") is not None and not isinstance(s.get("prompt_cache_key"), str):
             errs.append(f"scenarios[{i}].prompt_cache_key must be a string")
+        if s.get("corpus_tag") is not None and not validate_corpus_tag(s.get("corpus_tag")):
+            errs.append(f"scenarios[{i}].corpus_tag must be one of {CORPUS_TAGS}, got {s.get('corpus_tag')!r}")
+        if s.get("corpus_tags") is not None:
+            tags = s.get("corpus_tags")
+            if not isinstance(tags, list) or not tags or not all(validate_corpus_tag(t) for t in tags):
+                errs.append(f"scenarios[{i}].corpus_tags must be a non-empty list of {CORPUS_TAGS}")
         if s.get("kind") == "agent_alternate":
             tokens = s.get("agent_tokens", {"A": 22000, "B": 5000, "C": 30000})
             if (not isinstance(tokens, dict) or set(tokens) != {"A", "B", "C"}
@@ -91,7 +123,28 @@ def validate_config(cfg: dict) -> list[str]:
                 errs.append(f"scenarios[{i}].turns must be a positive integer")
         if s.get("kind") == "concurrency_stall" and s.get("clients", 3) != 3:
             errs.append(f"scenarios[{i}].clients must be exactly 3")
-        for field in ("prefix_tokens", "background_tokens", "interactive_tokens"):
+        if s.get("kind") == "simultaneous_siblings":
+            if type(s.get("siblings", 3)) is not int or s.get("siblings", 3) < 2:
+                errs.append(f"scenarios[{i}].siblings must be an integer >= 2")
+        if s.get("kind") == "staggered_arrivals":
+            if type(s.get("arrivals", 3)) is not int or s.get("arrivals", 3) < 2:
+                errs.append(f"scenarios[{i}].arrivals must be an integer >= 2")
+            stagger = s.get("stagger_ms", 25.0)
+            if type(stagger) not in (int, float) or not math.isfinite(stagger) or stagger < 0:
+                errs.append(f"scenarios[{i}].stagger_ms must be finite and >= 0")
+        if s.get("kind") == "long_trailing":
+            if type(s.get("short_peers", 2)) is not int or s.get("short_peers", 2) < 1:
+                errs.append(f"scenarios[{i}].short_peers must be a positive integer")
+            for field in ("short_max_tokens", "long_max_tokens"):
+                if field in s and (type(s[field]) is not int or s[field] <= 0):
+                    errs.append(f"scenarios[{i}].{field} must be a positive integer")
+        if s.get("kind") == "warm_tool_return":
+            if type(s.get("turns", 4)) is not int or s.get("turns", 4) < 2:
+                errs.append(f"scenarios[{i}].turns must be an integer >= 2")
+        if "warm_repeat" in s and not isinstance(s["warm_repeat"], bool):
+            errs.append(f"scenarios[{i}].warm_repeat must be a boolean")
+        for field in ("prefix_tokens", "background_tokens", "interactive_tokens",
+                      "prompt_tokens", "shared_prefix_tokens"):
             if field in s and (type(s[field]) is not int or s[field] <= 0):
                 errs.append(f"scenarios[{i}].{field} must be a positive integer")
         for field in ("wall_limit_s", "interactive_start_timeout_s", "timeout", "wall_timeout"):
@@ -109,7 +162,8 @@ class Runner:
                  extra_body: dict | None = None, sampler: GpuSampler | None = None,
                  ctx_size: int | None = None, shared_baseline_mib: float | None = None,
                  log: Callable[[str], None] | None = None,
-                 metrics_url: str | None = None, child_log: str | None = None):
+                 metrics_url: str | None = None, child_log: str | None = None,
+                 provenance: dict[str, Any] | None = None, require_provenance: bool = False):
         self.t = target
         self.model = model
         self.defaults = dict(defaults or {})
@@ -125,6 +179,8 @@ class Runner:
         self.server_warnings: Any = None
         self.metrics_probe = MetricsProbe(metrics_url) if metrics_url else None
         self.child_log_probe = ChildLogProbe(child_log) if child_log else None
+        self.provenance_overrides = dict(provenance or {})
+        self.require_provenance = bool(require_provenance)
         self.run_id = uuid.uuid4().hex
 
     def _observe_before(self) -> dict:
@@ -279,7 +335,11 @@ class Runner:
         fn = {"agent_session": self._agent, "concurrency_sweep": self._sweep,
               "long_context": self._long, "repeat_prompt": self._repeat,
               "agent_alternate": self._alternate, "priority_contention": self._priority,
-              "concurrency_stall": self._stall}[kind]
+              "concurrency_stall": self._stall, "single_request": self._single_request,
+              "simultaneous_siblings": self._simultaneous_siblings,
+              "staggered_arrivals": self._staggered_arrivals,
+              "long_trailing": self._long_trailing,
+              "warm_tool_return": self._warm_tool_return}[kind]
         try:
             fn(sc, name, res, t_run0)
         except Exception as e:  # keep the partial scenario; the checks will fail it
@@ -290,10 +350,18 @@ class Runner:
         res["gpu_after"] = self.sampler.sample(f"{name}:after")
         res["spill"] = spill_check(res["gpu_after"], self.shared_baseline_mib)
         reqs = res.setdefault("requests", [])
+        scenario_tag = sc.get("corpus_tag")
         for r in reqs:
             r.pop("_content", None)
             r.pop("_reasoning", None)
+            if scenario_tag and not r.get("corpus_tag"):
+                r["corpus_tag"] = scenario_tag
+            r["cache_state"] = classify_cache_state(r)
         res["summary"] = group_summary(reqs)
+        res["cold_vs_warm"] = split_cold_warm_summary(reqs)
+        by_tag = summarize_by_corpus_tag(reqs)
+        if by_tag:
+            res["by_corpus_tag"] = by_tag
         groups: dict[str, list] = {}
         for r in reqs:
             groups.setdefault(r["group"], []).append(r)
@@ -333,6 +401,7 @@ class Runner:
             msgs = [{"role": "system", "content": sys_text}] + history
             r = self.one(name, f"turn{turn}", api, sc, t_run0, messages=msgs, tools=tools)
             r["turn"] = turn
+            r["cache_state"] = "cold" if (turn == 1 or sc.get("volatile_top")) else "warm"
             res.setdefault("requests", []).append(r)
             self.log(f"[{name}] turn {turn}: ok={r['ok']} ttft={_fmt(r['ttft_s'])} hit={_fmt(r['prefix_hit'])} "
                      f"prompt={r['prompt_tokens']} gen={r['completion_tokens']}" + (f" err={r['error']}" if r["error"] else ""))
@@ -354,6 +423,7 @@ class Runner:
         reqs = res.setdefault("requests", [])
         # Warm the shared prefix once, as the parent agent would have.
         w = self.one(name, "warmup", api, sc, t_run0, messages=msgs(0))
+        w["cache_state"] = "cold"
         reqs.append(w)
         res["expected_requests"] = 1 + sum(level * waves for level in levels)
         extra: dict[str, dict] = {}
@@ -368,6 +438,7 @@ class Runner:
             makespan = time.perf_counter() - t0
             for r in out:
                 r["concurrency"] = level
+                r["cache_state"] = "warm"
             reqs.extend(out)
             toks = sum(r["completion_tokens"] or 0 for r in out if r["ok"])
             extra[f"c{level}"] = {"concurrency": level, "makespan_s": makespan,
@@ -493,6 +564,8 @@ class Runner:
             out.extend([future.result(), ir])
         for r, group in zip(out, ("background", "interactive")):
             r["priority"] = group
+            r["cache_state"] = "cold"
+            r["cold"] = True
         res["requests"] = out
         res["expected_requests"] = 2
         res["interactive_ttft_s"] = out[1].get("ttft_s")
@@ -528,10 +601,199 @@ class Runner:
             r.update({"key": f"stall-client-{i}", "marker": f"STALL_CANARY_{i}"})
             r["marker_present"] = r["marker"] in ((r.get("_content") or "") + "\n" + (r.get("_reasoning") or ""))
         # Keep content private until checks have inspected it.
+        for r in out:
+            r["cache_state"] = "cold"
         res["requests"] = out
         res["expected_requests"] = clients
         res["stall_failures"] = stall_failures(out, wall, min(float(sc.get("wall_limit_s", 250)), 250.0))
         res["stall_wall_s"] = wall
+
+    def _single_request(self, sc: dict, name: str, res: dict, t_run0: float) -> None:
+        tags = list(sc.get("corpus_tags") or CORPUS_TAGS)
+        warm_repeat = bool(sc.get("warm_repeat", True))
+        target_tokens = int(sc.get("prompt_tokens", 512))
+        api = sc.get("api", "chat")
+        seed = int(sc.get("seed_text", 3100))
+        base_key = sc.get("prompt_cache_key", f"{self.run_id}:{name}")
+        reqs = res.setdefault("requests", [])
+        res["expected_requests"] = len(tags) * (2 if warm_repeat else 1)
+        for idx, tag in enumerate(tags):
+            prompt = corpus_prompt(tag, self.sizer, target_tokens, seed, variant=idx)
+            sub = dict(sc, prompt_cache_key=f"{base_key}:{tag}")
+            kw = {"prompt": prompt + "\nAnswer:"} if api == "completion" else {
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            r_cold = self.one(name, f"{tag}-cold", api, sub, t_run0, **kw)
+            r_cold.update({"corpus_tag": tag, "cache_state": "cold", "cold": True, "repeat": 1})
+            reqs.append(r_cold)
+            if warm_repeat:
+                r_warm = self.one(name, f"{tag}-warm", api, sub, t_run0, **kw)
+                r_warm.update({"corpus_tag": tag, "cache_state": "warm", "cold": False, "repeat": 2})
+                reqs.append(r_warm)
+
+    def _simultaneous_siblings(self, sc: dict, name: str, res: dict, t_run0: float) -> None:
+        siblings = int(sc.get("siblings", 3))
+        api = sc.get("api", "chat")
+        tag = str(sc.get("corpus_tag") or "code")
+        shared_tokens = int(sc.get("shared_prefix_tokens", 2000))
+        seed = int(sc.get("seed_text", 3200))
+        rnd = random.Random(seed)
+        prefix_lines = self.sizer.fit(record_list(rnd, shared_tokens, self.sizer.chars_per_token), shared_tokens)
+        prefix = f"Shared sibling parent context ({self.run_id}:{name}).\n" + "\n".join(prefix_lines)
+        base_key = sc.get("prompt_cache_key", f"{self.run_id}:{name}")
+        reqs = res.setdefault("requests", [])
+        res["expected_requests"] = 1 + siblings
+
+        warm_sc = dict(sc, prompt_cache_key=f"{base_key}:warmup")
+        w = self.one(name, "warmup", api, warm_sc, t_run0,
+                     messages=[{"role": "system", "content": prefix},
+                               {"role": "user", "content": "Warm shared prefix. Reply ready."}])
+        w.update({"cache_state": "cold", "cold": True, "corpus_tag": tag})
+        reqs.append(w)
+
+        barrier = threading.Barrier(siblings)
+        wall_limit = min(float(sc.get("wall_limit_s", 250)), 250.0)
+
+        def run_sibling(i: int) -> dict:
+            marker = f"SIBLING_CANARY_{i}"
+            sub = dict(sc, prompt_cache_key=f"{base_key}:sibling-{i}", wall_timeout=wall_limit)
+            task = f"marker={marker}; " + corpus_prompt(tag, self.sizer, 64, seed + 50, variant=i)
+            barrier.wait(timeout=10)
+            row = self.one(name, "siblings", api, sub, t_run0,
+                           messages=[{"role": "system", "content": prefix}, {"role": "user", "content": task}])
+            row.update({"sibling": i, "key": f"sibling-{i}", "marker": marker,
+                        "cache_state": "warm", "cold": False, "corpus_tag": tag})
+            return row
+
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=siblings) as ex:
+            out = list(ex.map(run_sibling, range(siblings)))
+        makespan = time.perf_counter() - t0
+        reqs.extend(out)
+        committed = sum(r.get("committed_output_tokens") or 0 for r in out if r.get("ok"))
+        res["overlapped_siblings"] = overlap_count(out)
+        res["sibling_failures"] = stall_failures(out, makespan, wall_limit)
+        res["_group_extra"] = {
+            "siblings": {
+                "concurrency": siblings,
+                "makespan_s": makespan,
+                "aggregate_decode_tps": committed / makespan if makespan > 0 else None,
+                "overlapped_pairs": res["overlapped_siblings"],
+            }
+        }
+
+    def _staggered_arrivals(self, sc: dict, name: str, res: dict, t_run0: float) -> None:
+        arrivals = int(sc.get("arrivals", 3))
+        stagger_ms = float(sc.get("stagger_ms", 25.0))
+        stagger_s = stagger_ms / 1000.0
+        api = sc.get("api", "chat")
+        tag = str(sc.get("corpus_tag") or "prose")
+        target_tokens = int(sc.get("prompt_tokens", 1000))
+        seed = int(sc.get("seed_text", 3300))
+        base_key = sc.get("prompt_cache_key", f"{self.run_id}:{name}")
+        sent_events = [threading.Event() for _ in range(arrivals)]
+
+        def run_arrival(i: int) -> dict:
+            if i > 0:
+                sent_events[i - 1].wait(timeout=5.0)
+                if stagger_s > 0:
+                    time.sleep(stagger_s)
+            prompt = corpus_prompt(tag, self.sizer, target_tokens, seed, variant=i)
+            sub = dict(sc, prompt_cache_key=f"{base_key}:arrival-{i}")
+            row = self.one(name, f"arrival{i}", api, sub, t_run0,
+                           messages=[{"role": "user", "content": prompt}],
+                           on_sent=sent_events[i].set)
+            row.update({"arrival_index": i, "intended_stagger_ms": i * stagger_ms,
+                        "cache_state": "cold", "cold": True, "corpus_tag": tag})
+            return row
+
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=arrivals) as ex:
+            out = list(ex.map(run_arrival, range(arrivals)))
+        makespan = time.perf_counter() - t0
+        res["requests"] = out
+        res["expected_requests"] = arrivals
+        res["stagger_ms"] = stagger_ms
+        res["overlapped_pairs"] = overlap_count(out)
+        res["makespan_s"] = makespan
+
+    def _long_trailing(self, sc: dict, name: str, res: dict, t_run0: float) -> None:
+        short_peers = int(sc.get("short_peers", 2))
+        short_max = int(sc.get("short_max_tokens", 16))
+        long_max = int(sc.get("long_max_tokens", 96))
+        api = sc.get("api", "chat")
+        tag = str(sc.get("corpus_tag") or "code")
+        shared_tokens = int(sc.get("shared_prefix_tokens", 1000))
+        seed = int(sc.get("seed_text", 3400))
+        rnd = random.Random(seed)
+        prefix_lines = self.sizer.fit(record_list(rnd, shared_tokens, self.sizer.chars_per_token), shared_tokens)
+        prefix = f"Trailing batch context ({self.run_id}:{name}).\n" + "\n".join(prefix_lines)
+        base_key = sc.get("prompt_cache_key", f"{self.run_id}:{name}")
+        total = short_peers + 1
+        barrier = threading.Barrier(total)
+
+        def run_worker(idx: int) -> dict:
+            is_trailing = idx == short_peers
+            group = "trailing" if is_trailing else "short-peer"
+            cap = long_max if is_trailing else short_max
+            sub = dict(sc, prompt_cache_key=f"{base_key}:{group}-{idx}",
+                       max_tokens=cap, _max_tokens_explicit=True)
+            task = corpus_prompt(tag, self.sizer, 96 if is_trailing else 48, seed + 20, variant=idx)
+            barrier.wait(timeout=10)
+            row = self.one(name, group, api, sub, t_run0,
+                           messages=[{"role": "system", "content": prefix}, {"role": "user", "content": task}])
+            row.update({"role": "trailing" if is_trailing else "short_peer",
+                        "cache_state": "cold", "cold": True, "corpus_tag": tag})
+            return row
+
+        with ThreadPoolExecutor(max_workers=total) as ex:
+            out = list(ex.map(run_worker, range(total)))
+        peers = [r for r in out if r.get("role") == "short_peer"]
+        trailing_row = next((r for r in out if r.get("role") == "trailing"), None)
+        res["requests"] = out
+        res["expected_requests"] = total
+        res["trailing"] = trailing_summary(peers, trailing_row)
+        res["overlapped_pairs"] = overlap_count(out)
+
+    def _warm_tool_return(self, sc: dict, name: str, res: dict, t_run0: float) -> None:
+        turns = int(sc.get("turns", 4))
+        api = sc.get("api", "chat")
+        tag = str(sc.get("corpus_tag") or "tool_json")
+        seed = int(sc.get("seed_text", 3500))
+        tools_mode = sc.get("tools_mode", "system")
+        system = agent_system_prompt(self.sizer, int(sc.get("system_tokens", 4000)),
+                                     int(sc.get("tools", 12)) if tools_mode == "system" else 0, seed)
+        tools = tool_schemas(int(sc.get("tools", 12))) if tools_mode == "native" else None
+        rnd = random.Random(seed + 1)
+        history: list[dict] = []
+        base_key = sc.get("prompt_cache_key", f"{self.run_id}:{name}")
+        sub = dict(sc, prompt_cache_key=base_key)
+        res["expected_requests"] = turns
+        res["system_prompt_tokens"] = self.sizer.measure(system)
+        reqs = res.setdefault("requests", [])
+        for turn in range(1, turns + 1):
+            if turn == 1:
+                user_msg = (
+                    "Inspect the workspace ledger and emit the first tool call as strict JSON "
+                    '{"tool": "<name>", "arguments": {"path": "<path>"}}.'
+                )
+                group = "cold-turn1"
+                state = "cold"
+            else:
+                block = tool_result_block(rnd, turn, int(sc.get("turn_tokens", 300)), self.sizer.chars_per_token)
+                user_msg = (
+                    block
+                    + '\n\nTool return received. Emit the next JSON tool call or final status object.'
+                )
+                group = f"warm-return{turn}"
+                state = "warm"
+            history.append({"role": "user", "content": user_msg})
+            msgs = [{"role": "system", "content": system}] + history
+            r = self.one(name, group, api, sub, t_run0, messages=msgs, tools=tools)
+            r.update({"turn": turn, "cache_state": state, "cold": turn == 1, "corpus_tag": tag})
+            reqs.append(r)
+            history.append(_assistant_history(r))
+        res["warm_tool_reuse"] = warm_tool_return_reuse(reqs)
 
     # ------------------------------------------------------------------ run
 
@@ -551,6 +813,7 @@ class Runner:
         for sc in cfg["scenarios"]:
             self.log(f"== scenario {sc.get('name') or sc['kind']} ({sc['kind']})")
             scenarios.append(self.run_scenario(sc, t_run0))
+        all_reqs = [r for s in scenarios for r in (s.get("requests") or [])]
         results: dict[str, Any] = {
             "schema": RESULTS_SCHEMA,
             "label": label,
@@ -567,11 +830,19 @@ class Runner:
                     "pid": self.sampler.pid, "process_name": self.sampler.process_name,
                     "shared_baseline_mib": self.shared_baseline_mib, "baseline_source": self.baseline_source,
                     "samples": self.sampler.samples},
+            "cold_vs_warm": split_cold_warm_summary(all_reqs),
             "scenarios": scenarios,
         }
+        by_corpus = summarize_by_corpus_tag(all_reqs)
+        if by_corpus:
+            results["by_corpus_tag"] = by_corpus
         self._observe_after(observation_before, results)
-        results["checks"] = run_checks(results)
-        results["verdict"] = verdict(results["checks"])
+        results["provenance"] = build_provenance(results, cfg, overrides=self.provenance_overrides)
+        checks = run_checks(results, require_provenance=self.require_provenance)
+        results["checks"] = checks
+        results["verdict"] = verdict(checks)
+        results["provenance"]["validation_outcome"] = summarize_validation_outcome(
+            checks, results["verdict"], results["provenance"])
         return results
 
 
@@ -635,7 +906,7 @@ def _check(name: str, status: str, detail: str, scenario: str | None = None) -> 
     return {"check": name, "status": status, "detail": detail, "scenario": scenario}
 
 
-def run_checks(results: dict) -> list[dict]:
+def run_checks(results: dict, *, require_provenance: bool = False) -> list[dict]:
     """Non-vacuity assertions. A check that cannot observe its signal says so; it never passes silently."""
     checks: list[dict] = []
     scen = results.get("scenarios") or []
@@ -743,6 +1014,34 @@ def run_checks(results: dict) -> list[dict]:
             detail = (f"interactive TTFT {interactive}s; overlapped={s.get('overlapped')}" if interactive is not None
                       else "interactive request missing")
             checks.append(_check("priority_contention", "pass" if okay else "fail", detail, name))
+        if s["kind"] == "simultaneous_siblings":
+            failures = s.get("sibling_failures") or []
+            checks.append(_check("simultaneous_siblings", "fail" if failures else "pass",
+                                 "; ".join(failures) if failures else
+                                 f"all siblings completed cleanly (overlapped_pairs={s.get('overlapped_siblings', 0)})",
+                                 name))
+        if s["kind"] == "long_trailing":
+            tr = s.get("trailing") or {}
+            okay = bool(tr.get("trailing_ok")) and tr.get("peers_ok") == tr.get("peers") and tr.get("peers", 0) > 0
+            detail = (f"peers_ok={tr.get('peers_ok')}/{tr.get('peers')}, trailing_ok={tr.get('trailing_ok')}, "
+                      f"peers_before_trailing={tr.get('peers_finished_before_trailing')}, "
+                      f"solo_tail_s={_fmt(tr.get('solo_tail_s'))}")
+            checks.append(_check("long_trailing", "pass" if okay else "fail", detail, name))
+        if s["kind"] == "warm_tool_return":
+            reuse = s.get("warm_tool_reuse") or warm_tool_return_reuse(reqs)
+            if reuse.get("failed_turns") or reuse.get("turns", 0) == 0:
+                checks.append(_check("warm_tool_return_reuse", "fail",
+                                     f"warm tool-return turns failed or missing: {reuse.get('failed_turns')}", name))
+            elif not reuse.get("known"):
+                checks.append(_check("warm_tool_return_reuse", "warn",
+                                     f"prefix reuse unknown on warm tool-return turns {reuse.get('unknown_turns')}", name))
+            elif not reuse.get("pass"):
+                checks.append(_check("warm_tool_return_reuse", "warn",
+                                     f"warm tool-return prefix hit ratios {reuse.get('ratios')} below {reuse.get('minimum')}",
+                                     name))
+            else:
+                checks.append(_check("warm_tool_return_reuse", "pass",
+                                     f"warm tool-return prefix hit ratios {reuse.get('ratios')}", name))
         sp = s.get("spill")
         if sp and sp.get("spill"):
             checks.append(_check("vram_spill", "warn",
@@ -781,6 +1080,13 @@ def run_checks(results: dict) -> list[dict]:
                 if (srv.get(k) or {}).get("status") == 200]
     checks.append(_check("server_identity", "pass" if answered else "warn",
                          ("recorded " + ", ".join(answered)) if answered else "no identity endpoint answered 200"))
+    if "provenance" in results or require_provenance:
+        prov_errs = validate_provenance(results.get("provenance"), strict=require_provenance)
+        checks.append(_check(
+            "provenance_schema" if not require_provenance else "provenance_complete",
+            "fail" if prov_errs else "pass",
+            "; ".join(prov_errs) if prov_errs else "reproducible provenance schema valid",
+        ))
     if scen and total_ok == 0:
         checks.append(_check("any_request", "fail", "no request succeeded"))
     return checks

@@ -89,6 +89,28 @@ def render_markdown(res: dict) -> str:
         L.append(f"- GPU sampling: off ({gpu.get('reason')})")
     L.append(f"- **Verdict: {res.get('verdict', '?').upper()}**")
     L.append("")
+    prov = res.get("provenance")
+    if isinstance(prov, dict):
+        L.append("## Provenance")
+        L.append("")
+        L.append(f"- Source commit: `{prov.get('source_commit')}`")
+        L.append(f"- Upstream revision/digest: `{prov.get('upstream_revision_or_digest')}`")
+        L.append(f"- Model SHA-256: `{prov.get('model_sha256')}`; Draft SHA-256: `{prov.get('draft_sha256')}`")
+        L.append(f"- Corpus revision: `{prov.get('corpus_revision')}`")
+        sc = prov.get("sample_count") or {}
+        L.append(f"- Samples: ok `{sc.get('ok')}/{sc.get('completed')}` (expected `{sc.get('expected')}`; "
+                 f"cold `{sc.get('cold')}`, warm `{sc.get('warm')}`, unclassified `{sc.get('unclassified')}`)")
+        eff = prov.get("effective_settings") or {}
+        L.append(f"- Effective settings: models `{eff.get('observed_models')}`, "
+                 f"speculative `{eff.get('server_speculative')}`, "
+                 f"draft active `{eff.get('draft_observed_active')}`, "
+                 f"prefix cache active `{eff.get('prefix_cache_observed_active')}`")
+        vo = prov.get("validation_outcome") or {}
+        L.append(f"- Validation outcome: `{vo.get('verdict')}` "
+                 f"(pass `{vo.get('checks_passed')}`, warn `{vo.get('checks_warned')}`, "
+                 f"fail `{vo.get('checks_failed')}`, skip `{vo.get('checks_skipped')}`; "
+                 f"provenance_complete `{vo.get('provenance_complete')}`)")
+        L.append("")
     L.append("## Checks")
     L.append("")
     L.append("| status | check | scenario | detail |")
@@ -97,6 +119,33 @@ def render_markdown(res: dict) -> str:
         st = c["status"].upper() if c["status"] in ("fail", "warn") else c["status"]
         L.append(f"| {st} | {c['check']} | {c.get('scenario') or ''} | {c['detail']} |")
     L.append("")
+    cw_top = res.get("cold_vs_warm")
+    if isinstance(cw_top, dict) and any((cw_top.get(k) or {}).get("requests") for k in ("cold", "warm", "unclassified")):
+        L.append("## Cold vs Warm Summary")
+        L.append("")
+        L.append("Client-observed latency (TTFT / ITL) is reported separately from server backend compute (ms), "
+                 "and committed output tokens are reported separately from proposed draft tokens.")
+        L.append("")
+        L.append("| cache state | ok/n | committed tok | proposed draft tok | client TTFT p50/p95 ms | "
+                 "client ITL p50/p95 ms | backend compute p50/p95 ms | prefix hit |")
+        L.append("|---|---|---|---|---|---|---|---|")
+        for state in ("cold", "warm", "unclassified"):
+            gs = cw_top.get(state) or {}
+            if not gs.get("requests"):
+                continue
+            cli = gs.get("client_observed_ms") or {}
+            be = gs.get("backend_compute_ms") or {}
+            L.append("| " + " | ".join([
+                state,
+                f"{gs.get('ok')}/{gs.get('requests')}",
+                _f(gs.get("committed_output_tokens_total"), digits=0),
+                _f(gs.get("proposed_draft_tokens_total"), digits=0),
+                f"{_f(_p(cli.get('ttft_ms'), 'p50'))} / {_f(_p(cli.get('ttft_ms'), 'p95'))}",
+                f"{_f(_p(cli.get('itl_ms'), 'p50'), digits=2)} / {_f(_p(cli.get('itl_ms'), 'p95'), digits=2)}",
+                f"{_f(_p(be.get('total_ms'), 'p50'))} / {_f(_p(be.get('total_ms'), 'p95'))}",
+                _hit(gs),
+            ]) + " |")
+        L.append("")
     L.append("## Results")
     L.append("")
     L.append("Times in ms unless marked. ITL is per token (chunk gap / tokens in chunk). "
@@ -110,6 +159,11 @@ def render_markdown(res: dict) -> str:
             extra = []
             if "aggregate_decode_tps" in gs:
                 extra.append(f"agg {_f(gs['aggregate_decode_tps'])} tok/s, makespan {_f(gs.get('makespan_s'), digits=2)} s")
+            if gs.get("proposed_draft_tokens_total") is not None:
+                extra.append(f"proposed {_f(gs['proposed_draft_tokens_total'], digits=0)} draft tok")
+            be = (gs.get("backend_compute_ms") or {}).get("total_ms")
+            if _p(be, "p50") is not None:
+                extra.append(f"backend {_f(_p(be, 'p50'))} ms")
             da = gs.get("draft_acceptance") or {}
             if da.get("n"):
                 extra.append(f"draft acc {da['mean']:.2f}")
@@ -163,6 +217,12 @@ COMPARE_METRICS = [
     ("ITL p95 ms", ("itl_s", "p95"), 1000, True),
     ("ITL p99 ms", ("itl_s", "p99"), 1000, True),
     ("e2e p50 s", ("e2e_s", "p50"), 1, True),
+    ("backend compute p50 ms", ("backend_compute_ms", "total_ms", "p50"), 1, True),
+    ("backend compute p95 ms", ("backend_compute_ms", "total_ms", "p95"), 1, True),
+    ("backend prefill p50 ms", ("backend_compute_ms", "prefill_ms", "p50"), 1, True),
+    ("backend decode p50 ms", ("backend_compute_ms", "decode_ms", "p50"), 1, True),
+    ("committed output tokens", ("committed_output_tokens_total",), 1, False),
+    ("proposed draft tokens", ("proposed_draft_tokens_total",), 1, False),
     ("prefill tok/s (client)", ("prefill_tps_client", "mean"), 1, False),
     ("prefill tok/s (server)", ("prefill_tps_server", "mean"), 1, False),
     ("decode tok/s (client)", ("decode_tps_client", "mean"), 1, False),
@@ -222,12 +282,37 @@ def compare(a: dict, b: dict) -> tuple[str, list[dict]]:
     sb = {s["name"]: s for s in b.get("scenarios") or []}
     for name in sorted(set(sa) & set(sb)):
         rows.extend(_compare_observations(sa[name], sb[name], name, "scenario"))
+        cwa = sa[name].get("cold_vs_warm") or {}
+        cwb = sb[name].get("cold_vs_warm") or {}
+        for state in ("cold", "warm"):
+            gsa, gsb = cwa.get(state) or {}, cwb.get(state) or {}
+            if not (gsa.get("ok") or gsb.get("ok")):
+                continue
+            for label, path, scale, lower in COMPARE_METRICS:
+                va, vb = _get(gsa, path), _get(gsb, path)
+                if va is None and vb is None:
+                    continue
+                row = {"scenario": name, "group": f"({state})", "metric": label,
+                       "a": va * scale if va is not None else None, "b": vb * scale if vb is not None else None,
+                       "delta": None, "delta_pct": None, "better": None}
+                if va is not None and vb is not None:
+                    row["delta"] = (vb - va) * scale
+                    row["delta_pct"] = (vb - va) / va * 100 if va else None
+                    if vb != va:
+                        row["better"] = (vb < va) if lower else (vb > va)
+                rows.append(row)
     rows.extend(_compare_observations(a, b, "(run)", "observations"))
     L = [f"# A/B: `{a.get('label') or 'A'}` vs `{b.get('label') or 'B'}`", ""]
     L.append(f"- A: `{a['target']['base_url']}` model `{a['target'].get('model')}` build "
              f"`{(a.get('server') or {}).get('build_info')}` verdict {a.get('verdict')}")
     L.append(f"- B: `{b['target']['base_url']}` model `{b['target'].get('model')}` build "
              f"`{(b.get('server') or {}).get('build_info')}` verdict {b.get('verdict')}")
+    pa, pb = a.get("provenance") or {}, b.get("provenance") or {}
+    if pa or pb:
+        L.append(f"- Provenance A: commit `{pa.get('source_commit')}`, model `{pa.get('model_sha256')}`, "
+                 f"draft `{pa.get('draft_sha256')}`, corpus `{pa.get('corpus_revision')}`")
+        L.append(f"- Provenance B: commit `{pb.get('source_commit')}`, model `{pb.get('model_sha256')}`, "
+                 f"draft `{pb.get('draft_sha256')}`, corpus `{pb.get('corpus_revision')}`")
     only_a = sorted({k for k in ga if k not in gb})
     only_b = sorted({k for k in gb if k not in ga})
     if only_a or only_b:
