@@ -336,6 +336,23 @@ Status ValidateContextOptions(const LoadOptions& options) {
                              "n_slots (" + std::to_string(options.n_slots) + ") must be in [1, " +
                                  std::to_string(kMaxSlots) + "]");
     }
+    if (options.prefix_coalesce) {
+        if (options.min_coalesce_prefix_tokens == 0) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "min_coalesce_prefix_tokens must be >= 1 when prefix_coalesce is enabled");
+        }
+        if (options.max_followers_per_producer == 0 || options.max_followers_per_producer > kMaxSlots) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "max_followers_per_producer (" +
+                                     std::to_string(options.max_followers_per_producer) + ") must be in [1, " +
+                                     std::to_string(kMaxSlots) + "]");
+        }
+        if (options.max_coalesce_wait_ms == 0 || options.max_coalesce_wait_ms > kMaxCoalesceWaitMs) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "max_coalesce_wait_ms (" + std::to_string(options.max_coalesce_wait_ms) +
+                                     ") must be in [1, " + std::to_string(kMaxCoalesceWaitMs) + "]");
+        }
+    }
     SpeculativeType spec = SpeculativeType::kNone;
     if (!ParseSpeculativeType(options.spec_type, spec)) {
         return Status::Error(ErrorCode::kInvalidArgument,
