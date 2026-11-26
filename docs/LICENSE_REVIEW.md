@@ -71,6 +71,8 @@ No license conclusions from the initial broad web sweep are considered authorita
 - revision/tag: `b11195` (commit `d834d44e643681f7b046a22d357335f6f4ff6107`); fetched by
   CMake FetchContent from the GitHub tag tarball, SHA-256
   `d9818b7786c8a3b063bac7eb7dc8710e275638f1e288e206720c9e22e7ca216a`
+- pin manifest: `cmake/llamacpp-pin.json` is the single source of the tag, commit and SHA-256 above;
+  `python -I scripts/llamacpp_pin.py check` fails when this entry disagrees with it
 - evaluated: 2026-09-26
 - license: MIT ("Copyright (c) 2023-2026 The ggml authors"), top-level `LICENSE` at that tag;
   ggml has no separate license file in-tree (covered by the same MIT license)

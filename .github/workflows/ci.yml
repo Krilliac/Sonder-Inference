@@ -117,8 +117,8 @@ jobs:
     runs-on: windows-latest
     continue-on-error: true
     env:
-      LLAMACPP_TAG: b11195
-      LLAMACPP_SHA256: d9818b7786c8a3b063bac7eb7dc8710e275638f1e288e206720c9e22e7ca216a
+      # Floor for registered sonder.llamacpp.* tests (3012e5a registers 98).
+      LLAMACPP_MIN_TESTS: 98
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -131,34 +131,60 @@ jobs:
         shell: pwsh
         run: if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
 
-      - name: Cache llama.cpp source
+      # cmake/llamacpp-pin.json is the single source of the pin; no literals here.
+      - name: Read llama.cpp pin manifest
+        id: pin
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $m = Get-Content -Raw cmake/llamacpp-pin.json | ConvertFrom-Json
+          $e = $m.tracks.($m.default_track)
+          if (-not $e.tag -or -not $e.url -or $e.sha256 -notmatch '^[0-9a-f]{64}$') { throw "bad pin manifest entry" }
+          Write-Host "llama.cpp pin: track=$($m.default_track) tag=$($e.tag) sha256=$($e.sha256)"
+          "tag=$($e.tag)" >> $env:GITHUB_OUTPUT
+          "url=$($e.url)" >> $env:GITHUB_OUTPUT
+          "sha256=$($e.sha256)" >> $env:GITHUB_OUTPUT
+
+      - name: Pin manifest tests
+        shell: pwsh
+        run: |
+          python -I scripts/llamacpp_pin.py check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest scripts.test_llamacpp_pin
+
+      # The tarball file is cached (not an extracted tree) and handed to
+      # FetchContent as a file:// URL, so URL_HASH is re-checked on every
+      # configure, cache hit or not.
+      - name: Cache llama.cpp tarball
         id: llamacpp-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
-          path: ${{ runner.temp }}/llamacpp-src
-          key: llamacpp-src-${{ env.LLAMACPP_TAG }}-${{ env.LLAMACPP_SHA256 }}
+          path: ${{ runner.temp }}/llamacpp.tar.gz
+          key: llamacpp-tarball-${{ steps.pin.outputs.sha256 }}
 
-      - name: Download llama.cpp source (pinned, hash-checked)
+      - name: Download llama.cpp tarball
         if: steps.llamacpp-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $tmp = Join-Path $env:RUNNER_TEMP 'llamacpp.tar.gz'
-          $dst = Join-Path $env:RUNNER_TEMP 'llamacpp-src'
-          Invoke-WebRequest -Uri "https://github.com/ggml-org/llama.cpp/archive/refs/tags/$env:LLAMACPP_TAG.tar.gz" -OutFile $tmp
-          $hash = (Get-FileHash -Algorithm SHA256 $tmp).Hash.ToLower()
-          if ($hash -ne $env:LLAMACPP_SHA256) { throw "llama.cpp tarball hash mismatch: $hash" }
-          New-Item -ItemType Directory -Force -Path $dst | Out-Null
-          tar -xzf $tmp -C $dst --strip-components=1
+          Invoke-WebRequest -Uri '${{ steps.pin.outputs.url }}' -OutFile (Join-Path $env:RUNNER_TEMP 'llamacpp.tar.gz')
 
       - name: Configure
         shell: pwsh
         run: |
-          $src = (Join-Path $env:RUNNER_TEMP 'llamacpp-src') -replace '\\','/'
-          cmake --preset ci-windows -DSONDER_WITH_LLAMA_CPP=ON -DGGML_NATIVE=OFF "-DFETCHCONTENT_SOURCE_DIR_LLAMACPP=$src"
+          $tar = (Join-Path $env:RUNNER_TEMP 'llamacpp.tar.gz') -replace '\\','/'
+          cmake --preset ci-windows -DSONDER_WITH_LLAMA_CPP=ON -DGGML_NATIVE=OFF "-DSONDER_LLAMACPP_URL=file:///$tar"
 
       - name: Build
         run: cmake --build --preset ci-windows
+
+      # A llama.cpp lane that silently registers no llama.cpp tests would still pass.
+      - name: llama.cpp tests are registered
+        shell: pwsh
+        run: |
+          $n = @(ctest --preset ci-windows -N | Select-String -Pattern 'sonder\.llamacpp\.').Count
+          Write-Host "sonder.llamacpp.* tests: $n"
+          if ($n -lt [int]$env:LLAMACPP_MIN_TESTS) { throw "expected at least $env:LLAMACPP_MIN_TESTS sonder.llamacpp.* tests, found $n" }
 
       - name: Test
         run: ctest --preset ci-windows

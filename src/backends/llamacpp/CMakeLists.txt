@@ -11,9 +11,9 @@
 #                            sonder_inference (sonder/inference/backends/llamacpp.hpp)
 #   SONDER_HAS_LLAMACPP_BACKEND=1 on sonder_inference
 #
-# llama.cpp is pulled with FetchContent at a pinned release tag (b11195 by
-# default; recorded in docs/LICENSE_REVIEW.md — change both together on default
-# upgrades).
+# llama.cpp is pulled with FetchContent at the tag pinned in
+# cmake/llamacpp-pin.json (SONDER_LLAMACPP_TRACK selects the entry). The record
+# in docs/LICENSE_REVIEW.md must match: `python -I scripts/llamacpp_pin.py check`.
 #
 # Building against a local checkout (offline builds, newer mainline, or forks):
 #   -DFETCHCONTENT_SOURCE_DIR_LLAMACPP=/path/to/llama.cpp
@@ -24,8 +24,9 @@
 #     ternary formats (PQ2_0, PTQ1_0, PQ2_0M) and prism.hadamard.* support.
 #
 # To override the fetched tarball tag instead of using a local checkout, pass
-# SONDER_LLAMACPP_TAG and the matching SONDER_LLAMACPP_SHA256 (and optionally
-# SONDER_LLAMACPP_URL) together; SHA-256 verification fails closed on mismatch.
+# SONDER_LLAMACPP_TAG and the matching, different SONDER_LLAMACPP_SHA256 (and
+# optionally SONDER_LLAMACPP_URL) together; configure fails when the tag differs
+# but the SHA-256 does not, and SHA-256 verification fails closed on mismatch.
 #
 # Opt-in GPU presets live in CMakePresets.json: windows-cuda-rtx,
 # windows-vulkan-xt, linux-cuda-rtx, linux-rocm-xt, and linux-vulkan-xt.
@@ -36,16 +37,86 @@ endif()
 
 include(FetchContent)
 
-# Tag and hash move together; bump both (and docs/LICENSE_REVIEW.md) on upgrade.
-set(SONDER_LLAMACPP_TAG "b11195" CACHE STRING
-    "Upstream llama.cpp tag for FetchContent (default pinned b11195)")
-set(SONDER_LLAMACPP_URL
-    "https://github.com/ggml-org/llama.cpp/archive/refs/tags/${SONDER_LLAMACPP_TAG}.tar.gz"
-    CACHE STRING "Source archive URL for llama.cpp FetchContent")
-# SHA-256 of the GitHub source tarball for tag b11195 (commit d834d44e6436).
-set(SONDER_LLAMACPP_SHA256
-    "d9818b7786c8a3b063bac7eb7dc8710e275638f1e288e206720c9e22e7ca216a"
-    CACHE STRING "Expected SHA-256 of SONDER_LLAMACPP_URL")
+# Pin manifest: cmake/llamacpp-pin.json holds one entry per track (tag, peeled
+# commit, URL, SHA-256). It is the single source of truth; CI, the docs check
+# (scripts/llamacpp_pin.py check) and the test expectations all read it.
+set(SONDER_LLAMACPP_TRACK "mainline" CACHE STRING
+    "llama.cpp pin track from cmake/llamacpp-pin.json (mainline|prism)")
+set_property(CACHE SONDER_LLAMACPP_TRACK PROPERTY STRINGS mainline prism)
+set(SONDER_LLAMACPP_PIN_FILE "${CMAKE_CURRENT_LIST_DIR}/../../../cmake/llamacpp-pin.json" CACHE FILEPATH
+    "Pin manifest to read (override for experiments only)")
+
+# Override-only variables: empty means "use the manifest value". Manifest values
+# are never stored in the cache, so a manifest bump reaches existing build dirs.
+set(SONDER_LLAMACPP_TAG "" CACHE STRING
+    "Override llama.cpp tag (must be paired with a different SONDER_LLAMACPP_SHA256)")
+set(SONDER_LLAMACPP_URL "" CACHE STRING
+    "Override llama.cpp source archive URL (default: manifest URL with the tag substituted)")
+set(SONDER_LLAMACPP_SHA256 "" CACHE STRING
+    "Override expected SHA-256 of the llama.cpp source archive")
+# Manifest SHA-256 applied by the last configure of this build directory.
+set(SONDER_LLAMACPP_APPLIED_SHA256 "" CACHE INTERNAL "")
+# SHA-256 values that earlier revisions of this file stored in the cache as the
+# default (b11195); a cached value equal to one of these was never an override.
+set(_sonder_llamacpp_legacy_sha256
+    "d9818b7786c8a3b063bac7eb7dc8710e275638f1e288e206720c9e22e7ca216a")
+
+if(NOT EXISTS "${SONDER_LLAMACPP_PIN_FILE}")
+    message(FATAL_ERROR "llama.cpp pin manifest not found: ${SONDER_LLAMACPP_PIN_FILE}")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${SONDER_LLAMACPP_PIN_FILE}")
+file(READ "${SONDER_LLAMACPP_PIN_FILE}" _sonder_llamacpp_pin_json)
+string(JSON _sonder_llamacpp_entry ERROR_VARIABLE _sonder_llamacpp_err
+       GET "${_sonder_llamacpp_pin_json}" tracks "${SONDER_LLAMACPP_TRACK}")
+if(_sonder_llamacpp_err)
+    message(FATAL_ERROR "SONDER_LLAMACPP_TRACK='${SONDER_LLAMACPP_TRACK}' is not a track in "
+                        "${SONDER_LLAMACPP_PIN_FILE}: ${_sonder_llamacpp_err}")
+endif()
+string(JSON _sonder_llamacpp_m_tag    GET "${_sonder_llamacpp_entry}" tag)
+string(JSON _sonder_llamacpp_m_url    GET "${_sonder_llamacpp_entry}" url)
+string(JSON _sonder_llamacpp_m_sha256 GET "${_sonder_llamacpp_entry}" sha256)
+
+# Stale-cache handling: a cached SHA equal to the last applied manifest SHA, or
+# to a legacy default, was the default and moves to the manifest value.
+if(SONDER_LLAMACPP_SHA256 AND
+   (SONDER_LLAMACPP_SHA256 STREQUAL SONDER_LLAMACPP_APPLIED_SHA256
+    OR SONDER_LLAMACPP_SHA256 IN_LIST _sonder_llamacpp_legacy_sha256))
+    if(NOT SONDER_LLAMACPP_SHA256 STREQUAL _sonder_llamacpp_m_sha256)
+        message(STATUS "llama.cpp pin: cached SHA-256 ${SONDER_LLAMACPP_SHA256} was the "
+                       "previous default; moving to manifest ${_sonder_llamacpp_m_sha256} "
+                       "(${_sonder_llamacpp_m_tag})")
+    endif()
+    set(SONDER_LLAMACPP_TAG    "" CACHE STRING "" FORCE)
+    set(SONDER_LLAMACPP_URL    "" CACHE STRING "" FORCE)
+    set(SONDER_LLAMACPP_SHA256 "" CACHE STRING "" FORCE)
+endif()
+
+set(SONDER_LLAMACPP_RESOLVED_TAG    "${_sonder_llamacpp_m_tag}")
+set(SONDER_LLAMACPP_RESOLVED_URL    "${_sonder_llamacpp_m_url}")
+set(SONDER_LLAMACPP_RESOLVED_SHA256 "${_sonder_llamacpp_m_sha256}")
+if(SONDER_LLAMACPP_TAG AND NOT SONDER_LLAMACPP_TAG STREQUAL _sonder_llamacpp_m_tag)
+    if(NOT SONDER_LLAMACPP_SHA256 OR SONDER_LLAMACPP_SHA256 STREQUAL _sonder_llamacpp_m_sha256)
+        message(FATAL_ERROR "SONDER_LLAMACPP_TAG=${SONDER_LLAMACPP_TAG} differs from the manifest tag "
+                            "${_sonder_llamacpp_m_tag}, so SONDER_LLAMACPP_SHA256 must be set to the "
+                            "new tarball's SHA-256 (it is unset or still the manifest value).")
+    endif()
+    set(SONDER_LLAMACPP_RESOLVED_TAG "${SONDER_LLAMACPP_TAG}")
+    string(REPLACE "${_sonder_llamacpp_m_tag}" "${SONDER_LLAMACPP_TAG}"
+           SONDER_LLAMACPP_RESOLVED_URL "${_sonder_llamacpp_m_url}")
+endif()
+if(SONDER_LLAMACPP_SHA256)
+    if(NOT SONDER_LLAMACPP_SHA256 STREQUAL _sonder_llamacpp_m_sha256)
+        message(WARNING "llama.cpp pin override: SONDER_LLAMACPP_SHA256=${SONDER_LLAMACPP_SHA256} "
+                        "replaces the manifest value ${_sonder_llamacpp_m_sha256}")
+    endif()
+    set(SONDER_LLAMACPP_RESOLVED_SHA256 "${SONDER_LLAMACPP_SHA256}")
+endif()
+if(SONDER_LLAMACPP_URL)
+    set(SONDER_LLAMACPP_RESOLVED_URL "${SONDER_LLAMACPP_URL}")
+endif()
+set(SONDER_LLAMACPP_APPLIED_SHA256 "${_sonder_llamacpp_m_sha256}" CACHE INTERNAL "")
+message(STATUS "llama.cpp pin: track=${SONDER_LLAMACPP_TRACK} tag=${SONDER_LLAMACPP_RESOLVED_TAG} "
+               "url=${SONDER_LLAMACPP_RESOLVED_URL} sha256=${SONDER_LLAMACPP_RESOLVED_SHA256}")
 
 # Consume llama.cpp as a library only: no tools, server, examples, tests, or
 # networking. CPU backend is always available; accelerators are opt-in by the
@@ -93,8 +164,8 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.28")
     list(APPEND SONDER_LLAMACPP_FETCH_EXTRA EXCLUDE_FROM_ALL)
 endif()
 FetchContent_Declare(llamacpp
-    URL      "${SONDER_LLAMACPP_URL}"
-    URL_HASH "SHA256=${SONDER_LLAMACPP_SHA256}"
+    URL      "${SONDER_LLAMACPP_RESOLVED_URL}"
+    URL_HASH "SHA256=${SONDER_LLAMACPP_RESOLVED_SHA256}"
     ${SONDER_LLAMACPP_FETCH_EXTRA}
 )
 FetchContent_MakeAvailable(llamacpp)
@@ -276,7 +347,7 @@ target_compile_features(sonder_backend_llamacpp PUBLIC cxx_std_20)
 target_link_libraries(sonder_backend_llamacpp PRIVATE llama ggml ${SONDER_LLAMACPP_EXTRA_LIBS})
 target_compile_definitions(sonder_backend_llamacpp
     PUBLIC  ${SONDER_LLAMACPP_FEATURE_DEFS}
-    PRIVATE SONDER_LLAMACPP_TAG_STRING="${SONDER_LLAMACPP_TAG}"
+    PRIVATE SONDER_LLAMACPP_TAG_STRING="${SONDER_LLAMACPP_RESOLVED_TAG}"
 )
 if(COMMAND sonder_set_warnings)
     sonder_set_warnings(sonder_backend_llamacpp)

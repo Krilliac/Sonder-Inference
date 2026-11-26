@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "default_track": "mainline",
+  "tracks": {
+    "mainline": {
+      "repository": "https://github.com/ggml-org/llama.cpp",
+      "tag": "b11195",
+      "commit": "d834d44e643681f7b046a22d357335f6f4ff6107",
+      "url": "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b11195.tar.gz",
+      "sha256": "d9818b7786c8a3b063bac7eb7dc8710e275638f1e288e206720c9e22e7ca216a",
+      "expected_features": []
+    }
+  }
+}

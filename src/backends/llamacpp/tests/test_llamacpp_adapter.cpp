@@ -115,7 +115,7 @@ TEST_CASE("llamacpp adapter: backend identity, capabilities, probe") {
     auto be = make_llamacpp_backend();
     REQUIRE(be != nullptr);
     CHECK(be->name() == kLlamaCppBackendName);
-    CHECK(be->description().find("b11195") != std::string::npos);
+    CHECK(be->description().find(SONDER_EXPECTED_LLAMACPP_TAG) != std::string::npos);
     const auto caps = be->capabilities();
     CHECK(caps.has(Capability::tokenization));
     CHECK(caps.has(Capability::streaming));
@@ -132,7 +132,8 @@ TEST_CASE("llamacpp adapter: backend identity, capabilities, probe") {
     CHECK_FALSE(caps.has(Capability::kv_export));
     auto probe = be->probe();
     REQUIRE(probe.ok());
-    CHECK(probe.value().find("llama.cpp b11195") != std::string::npos);
+    CHECK(probe.value().find(std::string("llama.cpp ") + SONDER_EXPECTED_LLAMACPP_TAG) !=
+          std::string::npos);
     CHECK(probe.value().find("cpu") != std::string::npos);
 }
 

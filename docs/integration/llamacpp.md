@@ -102,6 +102,13 @@ abort path. Set `SONDER_LLAMACPP_VERBOSE=1` to see llama.cpp's info logs.
 
 Offline builds: `-DFETCHCONTENT_SOURCE_DIR_LLAMACPP=/path/to/llama.cpp-b11195`.
 
+The pin lives in `cmake/llamacpp-pin.json` (one entry per track; select with
+`-DSONDER_LLAMACPP_TRACK=mainline`). `SONDER_LLAMACPP_TAG`, `_URL` and `_SHA256` are
+override-only (empty by default): a tag override needs a different SHA-256 or configure
+fails, and a cached SHA-256 that equals the last applied or a legacy default moves to the
+manifest value with a STATUS line. `python -I scripts/llamacpp_pin.py verify --tarball T
+--git-dir G --commit C` compares every tarball file against the git tree.
+
 ## 4. Entry for docs/LICENSE_REVIEW.md
 
 ```markdown
@@ -110,6 +117,8 @@ Offline builds: `-DFETCHCONTENT_SOURCE_DIR_LLAMACPP=/path/to/llama.cpp-b11195`.
 - revision/tag: `b11195` (commit `d834d44e643681f7b046a22d357335f6f4ff6107`); fetched by
   CMake FetchContent from the GitHub tag tarball, SHA-256
   `d9818b7786c8a3b063bac7eb7dc8710e275638f1e288e206720c9e22e7ca216a`
+- pin manifest: `cmake/llamacpp-pin.json` is the single source of the tag, commit and SHA-256 above;
+  `python -I scripts/llamacpp_pin.py check` fails when this entry disagrees with it
 - evaluated: 2026-09-26
 - license: MIT ("Copyright (c) 2023-2026 The ggml authors"), top-level `LICENSE` at that tag;
   ggml has no separate license file in-tree (covered by the same MIT license)
