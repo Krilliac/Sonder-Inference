@@ -141,6 +141,8 @@ struct GenerateRequest {
     std::optional<RequestPriority> priority_class = std::nullopt;
     std::optional<double> target_ttft_ms = std::nullopt;
     std::optional<double> target_itl_ms = std::nullopt;
+    // Opt-in per-request stage timing hooks (false by default: zero extra clocks).
+    bool enable_stage_profiling = false;
 };
 
 struct EmbedRequest {
@@ -255,6 +257,11 @@ struct GenerateStats {
     // Raw llama-server timing counters, when the upstream supplied them.
     // This is additive to the legacy aggregate fields above.
     std::optional<BackendTimings> backend_timings = std::nullopt;
+    // Bounded effective execution report (configured vs effective speculation,
+    // fallback reasons, committed vs proposed counts, and 3-tier cache reuse).
+    std::optional<EffectiveExecutionReport> effective_execution = std::nullopt;
+    // Opt-in per-request stage timing breakdown (populated only when opted in).
+    std::optional<StageTimings> stage_timings = std::nullopt;
 };
 
 // Return false to stop generation early (StopReason::callback).
@@ -359,6 +366,8 @@ struct ChatRequest {
     std::optional<RequestPriority> priority_class = std::nullopt;
     std::optional<double> target_ttft_ms = std::nullopt;
     std::optional<double> target_itl_ms = std::nullopt;
+    // Opt-in per-request stage timing hooks (false by default: zero extra clocks).
+    bool enable_stage_profiling = false;
 };
 
 // True for "system", "user", "assistant" and "tool".
@@ -497,6 +506,10 @@ public:
     // safe to call from any thread. nullopt (the default) means the backend
     // reports nothing, and hosts then add no runtime fields to their output.
     [[nodiscard]] virtual std::optional<BackendRuntimeStatus> runtime_status() const { return std::nullopt; }
+    // Optional structured 5-state capability evidence (cheap, non-blocking,
+    // safe from any thread). Empty by default; callers fall back to honest
+    // adapter_supports + unknown for unmeasured states.
+    [[nodiscard]] virtual std::vector<CapabilityStatusEntry> capability_statuses() const { return {}; }
     // Cheap, thread-safe snapshot of simultaneous generation slots. Zero means
     // unknown; HTTP hosts use this to keep waiting work out of upstream queues.
     [[nodiscard]] virtual std::size_t max_concurrent_requests() const { return 0; }

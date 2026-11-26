@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <ctime>
 #include <fstream>
+#include <limits>
 #include <random>
 
 #include "sonder/inference/device.hpp"
@@ -28,6 +30,215 @@ std::optional<TelemetryLevel> parse_telemetry_level(std::string_view text) noexc
     if (text == "standard") return TelemetryLevel::standard;
     if (text == "deep") return TelemetryLevel::deep;
     return std::nullopt;
+}
+
+const char* to_string(CapabilityState state) noexcept {
+    switch (state) {
+        case CapabilityState::unknown: return "unknown";
+        case CapabilityState::no: return "no";
+        case CapabilityState::yes: return "yes";
+    }
+    return "unknown";
+}
+
+std::optional<CapabilityState> parse_capability_state(std::string_view text) noexcept {
+    if (text == "unknown") return CapabilityState::unknown;
+    if (text == "no" || text == "false") return CapabilityState::no;
+    if (text == "yes" || text == "true") return CapabilityState::yes;
+    return std::nullopt;
+}
+
+std::string sanitize_bounded_evidence_string(std::string_view text, std::size_t max_bytes) {
+    if (text.empty() || max_bytes == 0) {
+        return {};
+    }
+    const std::size_t limit = std::min(text.size(), max_bytes);
+    std::string out;
+    out.reserve(limit);
+    for (std::size_t i = 0; i < limit; ++i) {
+        const auto ch = static_cast<unsigned char>(text[i]);
+        if (ch < 0x20u || ch == 0x7Fu) {
+            out.push_back(' ');
+        } else {
+            out.push_back(static_cast<char>(ch));
+        }
+    }
+    return out;
+}
+
+namespace {
+
+std::optional<double> sanitize_nonneg_ms(std::optional<double> value) noexcept {
+    if (!value.has_value() || !std::isfinite(*value) || *value < 0.0) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+std::uint64_t saturating_add_u64(std::uint64_t a, std::uint64_t b) noexcept {
+    return a > std::numeric_limits<std::uint64_t>::max() - b
+               ? std::numeric_limits<std::uint64_t>::max()
+               : a + b;
+}
+
+json::Value optional_string_or_null(std::string_view text, std::size_t max_bytes = kMaxEvidenceStringBytes) {
+    std::string clean = sanitize_bounded_evidence_string(text, max_bytes);
+    if (clean.empty()) {
+        return json::Value(nullptr);
+    }
+    return json::Value(std::move(clean));
+}
+
+json::Value method_or_unknown(std::string_view text) {
+    std::string clean = sanitize_bounded_evidence_string(text, kMaxEvidenceStringBytes);
+    if (clean.empty()) {
+        return json::Value(std::string(kSpecReasonUnknown));
+    }
+    return json::Value(std::move(clean));
+}
+
+}  // namespace
+
+std::optional<std::uint64_t> CacheTierCounters::physical_reused_tokens() const noexcept {
+    if (!device_prefix_reused_tokens.has_value() && !host_l2_restored_tokens.has_value()) {
+        return std::nullopt;
+    }
+    return saturating_add_u64(device_prefix_reused_tokens.value_or(0u), host_l2_restored_tokens.value_or(0u));
+}
+
+void StageTimings::add_ms(std::optional<double>& slot, double delta_ms) noexcept {
+    if (!std::isfinite(delta_ms) || delta_ms < 0.0) {
+        return;
+    }
+    if (slot.has_value()) {
+        *slot += delta_ms;
+    } else {
+        slot = delta_ms;
+    }
+}
+
+void StageTimings::note_overlap(std::string_view label) {
+    stages_may_overlap = true;
+    std::string clean = sanitize_bounded_evidence_string(label, 96);
+    if (clean.empty() || overlap_notes.size() >= kMaxStageOverlapNotes) {
+        return;
+    }
+    if (std::find(overlap_notes.begin(), overlap_notes.end(), clean) == overlap_notes.end()) {
+        overlap_notes.push_back(std::move(clean));
+    }
+}
+
+bool StageTimings::has_any_measurement() const noexcept {
+    return queue_wait_ms.has_value() || cache_lookup_ms.has_value() || l2_restore_ms.has_value() ||
+           prefill_ms.has_value() || draft_ms.has_value() || verify_ms.has_value() || rollback_ms.has_value() ||
+           sampling_ms.has_value() || callback_gate_wait_ms.has_value() || total_elapsed_ms.has_value();
+}
+
+EffectiveExecutionReport bound_effective_execution_report(EffectiveExecutionReport report) {
+    report.configured_spec_method = sanitize_bounded_evidence_string(report.configured_spec_method);
+    report.effective_spec_method = sanitize_bounded_evidence_string(report.effective_spec_method);
+    report.fallback_reason = sanitize_bounded_evidence_string(report.fallback_reason);
+    report.target_identity = sanitize_bounded_evidence_string(report.target_identity);
+    report.draft_identity = sanitize_bounded_evidence_string(report.draft_identity);
+    report.backend_version = sanitize_bounded_evidence_string(report.backend_version);
+    if (report.proposed_draft_tokens.has_value() && report.accepted_draft_tokens.has_value() &&
+        *report.accepted_draft_tokens > *report.proposed_draft_tokens) {
+        report.accepted_draft_tokens = report.proposed_draft_tokens;
+    }
+    report.cache.host_l2_restore_ms = sanitize_nonneg_ms(report.cache.host_l2_restore_ms);
+    if (report.cache.device_prefix_reused_tokens.has_value() &&
+        report.cache.device_cross_slot_reused_tokens.has_value() &&
+        *report.cache.device_cross_slot_reused_tokens > *report.cache.device_prefix_reused_tokens) {
+        report.cache.device_cross_slot_reused_tokens = report.cache.device_prefix_reused_tokens;
+    }
+    return report;
+}
+
+json::Object to_json(const CapabilityStatus& status) {
+    json::Object out;
+    out.set("adapter_supports", to_string(status.adapter_supports));
+    out.set("build_supports", to_string(status.build_supports));
+    out.set("configured", to_string(status.configured));
+    out.set("observed_active", to_string(status.observed_active));
+    out.set("qualified_beneficial", to_string(status.qualified_beneficial));
+    std::string note = sanitize_bounded_evidence_string(status.note);
+    if (!note.empty()) {
+        out.set("note", std::move(note));
+    }
+    return out;
+}
+
+json::Object to_json_capability_statuses(const std::vector<CapabilityStatusEntry>& entries) {
+    json::Object out;
+    const std::size_t limit = std::min(entries.size(), kMaxCapabilityStatusEntries);
+    for (std::size_t i = 0; i < limit; ++i) {
+        std::string key = sanitize_bounded_evidence_string(entries[i].first, 96);
+        if (key.empty()) continue;
+        out.set(std::move(key), to_json(entries[i].second));
+    }
+    return out;
+}
+
+json::Object to_json(const CacheTierCounters& cache) {
+    const auto restore_ms = sanitize_nonneg_ms(cache.host_l2_restore_ms);
+    const auto physical = cache.physical_reused_tokens();
+    json::Object out;
+    out.set("logical_cache_hit_tokens", json::Value(cache.logical_cache_hit_tokens));
+    out.set("device_prefix_reused_tokens", json::Value(cache.device_prefix_reused_tokens));
+    if (cache.device_cross_slot_reused_tokens.has_value()) {
+        out.set("device_cross_slot_reused_tokens", json::Value(cache.device_cross_slot_reused_tokens));
+    }
+    out.set("host_l2_restored_tokens", json::Value(cache.host_l2_restored_tokens));
+    out.set("host_l2_restore_ms", json::Value(restore_ms));
+    out.set("physical_reused_tokens", json::Value(physical));
+    return out;
+}
+
+json::Object to_json(const EffectiveExecutionReport& raw_report) {
+    const EffectiveExecutionReport r = bound_effective_execution_report(raw_report);
+    json::Object out;
+    out.set("configured_spec_method", method_or_unknown(r.configured_spec_method));
+    out.set("effective_spec_method", method_or_unknown(r.effective_spec_method));
+    out.set("configured_draft_limit", json::Value(r.configured_draft_limit));
+    out.set("effective_draft_limit", json::Value(r.effective_draft_limit));
+    out.set("fallback_reason", optional_string_or_null(r.fallback_reason));
+    out.set("target_identity", optional_string_or_null(r.target_identity));
+    out.set("draft_identity", optional_string_or_null(r.draft_identity));
+    out.set("backend_version", optional_string_or_null(r.backend_version));
+    out.set("committed_tokens", json::Value(r.committed_tokens));
+    out.set("proposed_draft_tokens", json::Value(r.proposed_draft_tokens));
+    out.set("accepted_draft_tokens", json::Value(r.accepted_draft_tokens));
+    out.set("speculation_observed_active", to_string(r.speculation_observed_active));
+    out.set("transitioned_during_request", r.transitioned_during_request);
+    out.set("cache", to_json(r.cache));
+    return out;
+}
+
+json::Object to_json(const StageTimings& timings) {
+    json::Object out;
+    out.set("enabled", timings.enabled);
+    out.set("queue_wait_ms", json::Value(sanitize_nonneg_ms(timings.queue_wait_ms)));
+    out.set("cache_lookup_ms", json::Value(sanitize_nonneg_ms(timings.cache_lookup_ms)));
+    out.set("l2_restore_ms", json::Value(sanitize_nonneg_ms(timings.l2_restore_ms)));
+    out.set("prefill_ms", json::Value(sanitize_nonneg_ms(timings.prefill_ms)));
+    out.set("draft_ms", json::Value(sanitize_nonneg_ms(timings.draft_ms)));
+    out.set("verify_ms", json::Value(sanitize_nonneg_ms(timings.verify_ms)));
+    out.set("rollback_ms", json::Value(sanitize_nonneg_ms(timings.rollback_ms)));
+    out.set("sampling_ms", json::Value(sanitize_nonneg_ms(timings.sampling_ms)));
+    out.set("callback_gate_wait_ms", json::Value(sanitize_nonneg_ms(timings.callback_gate_wait_ms)));
+    out.set("total_elapsed_ms", json::Value(sanitize_nonneg_ms(timings.total_elapsed_ms)));
+    out.set("stages_may_overlap", timings.stages_may_overlap);
+    json::Array notes;
+    const std::size_t limit = std::min(timings.overlap_notes.size(), kMaxStageOverlapNotes);
+    notes.reserve(limit);
+    for (std::size_t i = 0; i < limit; ++i) {
+        std::string clean = sanitize_bounded_evidence_string(timings.overlap_notes[i], 96);
+        if (!clean.empty()) {
+            notes.emplace_back(std::move(clean));
+        }
+    }
+    out.set("overlap_notes", std::move(notes));
+    return out;
 }
 
 std::string utc_timestamp_now() {
@@ -283,6 +494,32 @@ bool TelemetryBus::emit(std::string_view event_type, const TelemetryContext& con
     lock.unlock();
     s.cv.notify_one();
     return true;
+}
+
+bool TelemetryBus::emit_effective_execution(const TelemetryContext& context, const EffectiveExecutionReport& report,
+                                            TelemetryLevel level) {
+    if (!enabled(level)) {
+        return false;
+    }
+    return emit("inference.effective_execution", context, to_json(report), level);
+}
+
+bool TelemetryBus::emit_stage_timings(const TelemetryContext& context, const StageTimings& timings,
+                                      std::string_view backend, std::string_view backend_version,
+                                      TelemetryLevel level) {
+    if (!timings.enabled || !timings.has_any_measurement() || !enabled(level)) {
+        return false;
+    }
+    json::Object attrs = to_json(timings);
+    std::string clean_backend = sanitize_bounded_evidence_string(backend, 96);
+    if (!clean_backend.empty()) {
+        attrs.set("backend", std::move(clean_backend));
+    }
+    std::string clean_version = sanitize_bounded_evidence_string(backend_version, kMaxEvidenceStringBytes);
+    if (!clean_version.empty()) {
+        attrs.set("backend_version", std::move(clean_version));
+    }
+    return emit("inference.stage.timings", context, std::move(attrs), level);
 }
 
 void TelemetryBus::Shared::writer_loop(const std::shared_ptr<Shared>& shared) {

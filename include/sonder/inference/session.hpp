@@ -128,6 +128,9 @@ struct RequestOptions {
     // that support latency-aware physical batch planning.
     std::optional<double> target_ttft_ms = std::nullopt;
     std::optional<double> target_itl_ms = std::nullopt;
+    // Opt-in per-request stage timing hooks (Doc 2 #25). False by default so
+    // unprofiled requests incur zero extra stage clocks or timing events.
+    bool enable_stage_profiling = false;
 };
 
 struct GenerationResult {
@@ -141,6 +144,11 @@ struct GenerationResult {
     std::string reasoning{};
     std::vector<TokenLogprob> logprobs{};
     std::vector<ToolCall> tool_calls{};
+    // Bounded configured-vs-effective execution report with distinct 3-tier
+    // cache counters (logical vs physical device vs physical host L2).
+    std::optional<EffectiveExecutionReport> effective_execution = std::nullopt;
+    // Opt-in per-request stage timing breakdown (absent when profiling is off).
+    std::optional<StageTimings> stage_timings = std::nullopt;
 };
 
 class Engine;

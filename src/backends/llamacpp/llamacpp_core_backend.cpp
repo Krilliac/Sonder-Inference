@@ -200,6 +200,79 @@ void PopulateGenerateStats(const sonder::backends::llamacpp::GenerateResult& res
         timings.draft_n_accepted = draft_accepted;
     }
     stats.backend_timings = timings;
+
+    EffectiveExecutionReport eff;
+    eff.configured_spec_method = result.configured_spec_method;
+    eff.effective_spec_method = result.effective_spec_method;
+    if (result.configured_draft_limit > 0 || !result.configured_spec_method.empty()) {
+        eff.configured_draft_limit =
+            static_cast<std::uint32_t>(std::max<std::int32_t>(0, result.configured_draft_limit));
+    }
+    if (result.effective_draft_limit > 0 || !result.effective_spec_method.empty()) {
+        eff.effective_draft_limit =
+            static_cast<std::uint32_t>(std::max<std::int32_t>(0, result.effective_draft_limit));
+    }
+    eff.fallback_reason = result.spec_fallback_reason;
+    eff.draft_identity = result.draft_identity;
+    eff.backend_version = "llama.cpp " + std::string(sonder::backends::llamacpp::LlamaCppBackend::UpstreamVersion());
+    eff.committed_tokens = generated;
+    if (draft > 0 || !result.effective_spec_method.empty()) {
+        eff.proposed_draft_tokens = draft;
+        eff.accepted_draft_tokens = draft_accepted;
+    }
+    if (draft > 0) {
+        eff.speculation_observed_active = CapabilityState::yes;
+    } else if (!result.effective_spec_method.empty()) {
+        eff.speculation_observed_active = CapabilityState::no;
+    } else {
+        eff.speculation_observed_active = CapabilityState::unknown;
+    }
+    eff.transitioned_during_request = result.spec_transitioned_during_request;
+
+    // Physical 3-tier cache breakdown (logical_cache_hit_tokens stays unset
+    // here because Session owns engine KvCacheManager accounting).
+    if (result.host_l2_restored_tokens > 0) {
+        eff.cache.host_l2_restored_tokens = static_cast<std::uint64_t>(result.host_l2_restored_tokens);
+        if (std::isfinite(result.host_l2_restore_ms) && result.host_l2_restore_ms >= 0.0) {
+            eff.cache.host_l2_restore_ms = result.host_l2_restore_ms;
+        }
+        eff.cache.device_prefix_reused_tokens =
+            static_cast<std::uint64_t>(std::max<std::int32_t>(0, result.device_prefix_reused_tokens));
+        if (result.device_cross_slot_reused_tokens > 0) {
+            eff.cache.device_cross_slot_reused_tokens =
+                static_cast<std::uint64_t>(result.device_cross_slot_reused_tokens);
+        }
+    } else if (result.device_prefix_reused_tokens > 0) {
+        eff.cache.device_prefix_reused_tokens = static_cast<std::uint64_t>(result.device_prefix_reused_tokens);
+        if (result.device_cross_slot_reused_tokens > 0) {
+            eff.cache.device_cross_slot_reused_tokens =
+                static_cast<std::uint64_t>(result.device_cross_slot_reused_tokens);
+        }
+        eff.cache.host_l2_restored_tokens = 0u;
+    } else if (result.state_restored) {
+        eff.cache.device_prefix_reused_tokens = 0u;
+        eff.cache.host_l2_restored_tokens = cached;
+    } else {
+        eff.cache.device_prefix_reused_tokens = reported_cached;
+        eff.cache.host_l2_restored_tokens = 0u;
+    }
+    stats.effective_execution = bound_effective_execution_report(std::move(eff));
+
+    if (result.stage_timings.enabled) {
+        StageTimings st;
+        st.enabled = true;
+        st.cache_lookup_ms = result.stage_timings.cache_lookup_ms;
+        st.l2_restore_ms = result.stage_timings.l2_restore_ms;
+        st.prefill_ms = result.stage_timings.prefill_ms;
+        st.draft_ms = result.stage_timings.draft_ms;
+        st.verify_ms = result.stage_timings.verify_ms;
+        st.rollback_ms = result.stage_timings.rollback_ms;
+        st.sampling_ms = result.stage_timings.sampling_ms;
+        st.stages_may_overlap = result.stage_timings.stages_may_overlap;
+        stats.stage_timings = std::move(st);
+    } else {
+        stats.stage_timings.reset();
+    }
 }
 
 }  // namespace llamacpp_detail
@@ -306,6 +379,8 @@ struct ActiveModelEntry {
     std::uint32_t n_ctx = 0;
     bool gpu_offload = false;
     bool uma_target = false;
+    std::string target_identity;
+    lc::SpeculativeLoadInfo spec_info;
 };
 
 struct RuntimeState {
@@ -318,6 +393,14 @@ struct RuntimeState {
     bool force_uma_mode = false;
     std::optional<bool> force_gpu_offload;
 
+    // Configured direct-backend feature knobs for honest 5-state capability reporting.
+    std::string configured_spec_type = "none";
+    std::int32_t configured_spec_draft_max = 0;
+    bool configured_prefix_cache = true;
+    std::uint32_t configured_slots = 1;
+    std::uint32_t configured_cache_ram_mib = 0;
+    bool configured_mmproj = false;
+
     bool has_sampled = false;
     bool probe_in_flight = false;
     std::chrono::steady_clock::time_point last_sample_time{};
@@ -325,23 +408,38 @@ struct RuntimeState {
     std::uint64_t next_model_id = 1;
     std::vector<ActiveModelEntry> active_models;
 
+    // Observed runtime evidence (updated on actual request completions).
+    bool observed_speculation_active = false;
+    bool observed_device_prefix_reuse = false;
+    bool observed_host_l2_restore = false;
+    bool observed_concurrent_batch = false;
+    std::optional<EffectiveExecutionReport> last_execution_report;
+
     RuntimeState(llamacpp_detail::ProcessGpuMemoryProbe probe_fn, std::chrono::milliseconds interval,
-                 std::uint32_t ctx_len, bool uma_override, std::optional<bool> gpu_offload_override)
+                 const LlamaCppBackendOptions& opts, bool uma_override, std::optional<bool> gpu_offload_override)
         : probe(std::move(probe_fn)),
           sample_interval(interval.count() < 0 ? std::chrono::milliseconds{0} : interval),
-          configured_ctx(ctx_len),
+          configured_ctx(opts.context_length),
           force_uma_mode(uma_override),
-          force_gpu_offload(gpu_offload_override) {
+          force_gpu_offload(gpu_offload_override),
+          configured_spec_type(opts.spec_type),
+          configured_spec_draft_max(opts.spec_draft_max),
+          configured_prefix_cache(opts.prefix_cache),
+          configured_slots(opts.slots),
+          configured_cache_ram_mib(opts.cache_ram_mib),
+          configured_mmproj(!opts.mmproj_path.empty()) {
         gpu_memory.probe = "none";
         gpu_memory.status = "not_sampled";
         gpu_memory.spill_threshold_bytes = kDefaultSpillThresholdBytes;
         gpu_memory.shared_baseline_bytes = 0;
     }
 
-    std::uint64_t RegisterModel(std::uint32_t n_ctx, bool gpu_offload, bool uma_target) {
+    std::uint64_t RegisterModel(std::uint32_t n_ctx, bool gpu_offload, bool uma_target, std::string target_identity,
+                                lc::SpeculativeLoadInfo spec_info) {
         std::lock_guard<std::mutex> lock(mutex);
         const std::uint64_t id = next_model_id++;
-        active_models.push_back(ActiveModelEntry{id, n_ctx, gpu_offload, uma_target});
+        active_models.push_back(
+            ActiveModelEntry{id, n_ctx, gpu_offload, uma_target, std::move(target_identity), std::move(spec_info)});
         return id;
     }
 
@@ -350,6 +448,177 @@ struct RuntimeState {
         active_models.erase(std::remove_if(active_models.begin(), active_models.end(),
                                            [id](const ActiveModelEntry& e) noexcept { return e.id == id; }),
                             active_models.end());
+    }
+
+    void RecordExecution(const EffectiveExecutionReport& report) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (report.speculation_observed_active == CapabilityState::yes) {
+            observed_speculation_active = true;
+        }
+        if (report.cache.device_prefix_reused_tokens.has_value() && *report.cache.device_prefix_reused_tokens > 0u) {
+            observed_device_prefix_reuse = true;
+        }
+        if (report.cache.host_l2_restored_tokens.has_value() && *report.cache.host_l2_restored_tokens > 0u) {
+            observed_host_l2_restore = true;
+        }
+        if (report.fallback_reason == kSpecReasonConcurrencyBatch) {
+            observed_concurrent_batch = true;
+        }
+        last_execution_report = bound_effective_execution_report(report);
+    }
+
+    std::vector<CapabilityStatusEntry> BuildCapabilityStatusesLocked() const {
+        const ActiveModelEntry* latest = active_models.empty() ? nullptr : &active_models.back();
+        const bool spec_configured = !configured_spec_type.empty() && configured_spec_type != "none";
+        const bool mtp_requested = configured_spec_type == "draft-mtp";
+        const bool mtp_build = lc::LlamaCppBackend::HasMtpBuildSupport();
+        const bool mtmd_build = lc::LlamaCppBackend::HasMtmdBuildSupport();
+
+        std::vector<CapabilityStatusEntry> out;
+        {
+            CapabilityStatus s;
+            s.adapter_supports = CapabilityState::yes;
+            if (mtp_requested) {
+                s.build_supports = capability_state_from_bool(mtp_build);
+                if (!mtp_build) {
+                    s.note = "mtp_not_in_build";
+                } else if (latest != nullptr && !latest->spec_info.mtp_model_supported) {
+                    s.note = "mtp_not_in_model";
+                }
+            } else {
+                s.build_supports = CapabilityState::yes;
+            }
+            s.configured = capability_state_from_bool(spec_configured);
+            if (observed_speculation_active) {
+                s.observed_active = CapabilityState::yes;
+            } else if (!spec_configured) {
+                s.observed_active = CapabilityState::no;
+            } else if (latest != nullptr && latest->spec_info.effective_method == "none") {
+                s.observed_active = CapabilityState::no;
+                if (s.note.empty() && !latest->spec_info.fallback_reason.empty()) {
+                    s.note = latest->spec_info.fallback_reason;
+                }
+            } else {
+                s.observed_active = CapabilityState::unknown;
+            }
+            s.qualified_beneficial = CapabilityState::unknown;
+            out.emplace_back("speculative_decode", std::move(s));
+        }
+        {
+            CapabilityStatus s;
+            s.adapter_supports = CapabilityState::yes;
+            s.build_supports = CapabilityState::yes;
+            s.configured = capability_state_from_bool(configured_prefix_cache);
+            if (observed_device_prefix_reuse) {
+                s.observed_active = CapabilityState::yes;
+            } else if (!configured_prefix_cache) {
+                s.observed_active = CapabilityState::no;
+            } else {
+                s.observed_active = CapabilityState::unknown;
+            }
+            s.qualified_beneficial = CapabilityState::unknown;
+            out.emplace_back("prefix_reuse", std::move(s));
+        }
+        {
+            CapabilityStatus s;
+            s.adapter_supports = CapabilityState::yes;
+            s.build_supports = CapabilityState::yes;
+            s.configured = capability_state_from_bool(configured_cache_ram_mib > 0u);
+            if (observed_host_l2_restore) {
+                s.observed_active = CapabilityState::yes;
+            } else if (configured_cache_ram_mib == 0u) {
+                s.observed_active = CapabilityState::no;
+            } else {
+                s.observed_active = CapabilityState::unknown;
+            }
+            s.qualified_beneficial = CapabilityState::unknown;
+            out.emplace_back("host_l2_cache", std::move(s));
+        }
+        {
+            CapabilityStatus s;
+            s.adapter_supports = CapabilityState::yes;
+            s.build_supports = CapabilityState::yes;
+            s.configured = capability_state_from_bool(configured_slots > 1u);
+            if (observed_concurrent_batch) {
+                s.observed_active = CapabilityState::yes;
+            } else if (configured_slots <= 1u) {
+                s.observed_active = CapabilityState::no;
+            } else {
+                s.observed_active = CapabilityState::unknown;
+            }
+            s.qualified_beneficial = CapabilityState::unknown;
+            out.emplace_back("continuous_batch_decode", std::move(s));
+        }
+        {
+            CapabilityStatus s;
+            s.adapter_supports = CapabilityState::yes;
+            s.build_supports = capability_state_from_bool(mtmd_build);
+            s.configured = capability_state_from_bool(configured_mmproj);
+            s.observed_active = (configured_mmproj && mtmd_build) ? CapabilityState::unknown : CapabilityState::no;
+            s.qualified_beneficial = CapabilityState::unknown;
+            if (!mtmd_build) s.note = "libmtmd_not_in_build";
+            out.emplace_back("multimodal", std::move(s));
+        }
+        for (const char* cap_name : {"structured_output", "embeddings", "logprobs", "recurrent_checkpoint"}) {
+            CapabilityStatus s;
+            s.adapter_supports = CapabilityState::yes;
+            s.build_supports = CapabilityState::yes;
+            s.configured = CapabilityState::yes;
+            s.observed_active = CapabilityState::unknown;
+            s.qualified_beneficial = CapabilityState::unknown;
+            out.emplace_back(cap_name, std::move(s));
+        }
+        {
+            CapabilityStatus s;
+            s.adapter_supports = CapabilityState::no;
+            s.build_supports = CapabilityState::no;
+            s.configured = CapabilityState::no;
+            s.observed_active = CapabilityState::no;
+            s.qualified_beneficial = CapabilityState::unknown;
+            s.note = "server_prompt_injected_tools";
+            out.emplace_back("tool_calling", std::move(s));
+        }
+        return out;
+    }
+
+    std::vector<CapabilityStatusEntry> CapabilityStatuses() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return BuildCapabilityStatusesLocked();
+    }
+
+    EffectiveExecutionReport BuildEffectiveExecutionLocked() const {
+        if (last_execution_report.has_value()) {
+            return *last_execution_report;
+        }
+        EffectiveExecutionReport eff;
+        eff.backend_version = "llama.cpp " + std::string(lc::LlamaCppBackend::UpstreamVersion());
+        eff.configured_spec_method = configured_spec_type.empty() ? "none" : configured_spec_type;
+        if (configured_spec_draft_max > 0) {
+            eff.configured_draft_limit = static_cast<std::uint32_t>(configured_spec_draft_max);
+        }
+        if (!active_models.empty()) {
+            const ActiveModelEntry& latest = active_models.back();
+            eff.target_identity = latest.target_identity;
+            eff.configured_spec_method = latest.spec_info.configured_method;
+            eff.effective_spec_method = latest.spec_info.effective_method;
+            eff.configured_draft_limit =
+                static_cast<std::uint32_t>(std::max<std::int32_t>(0, latest.spec_info.configured_draft_max));
+            eff.effective_draft_limit =
+                static_cast<std::uint32_t>(std::max<std::int32_t>(0, latest.spec_info.effective_draft_max));
+            eff.fallback_reason = latest.spec_info.fallback_reason;
+            eff.draft_identity = latest.spec_info.draft_identity;
+            eff.speculation_observed_active =
+                (latest.spec_info.effective_method == "none") ? CapabilityState::no : CapabilityState::unknown;
+        } else if (eff.configured_spec_method == "none") {
+            eff.effective_spec_method = "none";
+            eff.configured_draft_limit = 0u;
+            eff.effective_draft_limit = 0u;
+            eff.speculation_observed_active = CapabilityState::no;
+        } else {
+            // Model not yet loaded: effective method is unknown until load resolves it.
+            eff.speculation_observed_active = CapabilityState::unknown;
+        }
+        return bound_effective_execution_report(std::move(eff));
     }
 
     void RefreshGpuMemory(bool force) {
@@ -462,6 +731,8 @@ struct RuntimeState {
                     " baseline): VRAM overflowed into system RAM; lower context_length or KV cache precision",
                 std::move(details), 1});
         }
+        status.capability_statuses = BuildCapabilityStatusesLocked();
+        status.effective_execution = BuildEffectiveExecutionLocked();
         return status;
     }
 };
@@ -636,7 +907,8 @@ public:
         }
         return run_tokens(std::move(prompt_tokens), request.sampling, cancel, on_chunk, request.session_key,
                           request.grammar, /*separate_reasoning=*/false, request.checkpoint, {}, {}, {},
-                          request.priority_class, request.target_ttft_ms, request.target_itl_ms);
+                          request.priority_class, request.target_ttft_ms, request.target_itl_ms,
+                          request.enable_stage_profiling);
     }
 
     // Chat through the GGUF chat template (llama_chat_apply_template). Models
@@ -694,7 +966,8 @@ public:
         return run_tokens(std::move(prompt_tokens), request.sampling, cancel, on_chunk, request.session_key,
                           request.grammar, request.separate_reasoning, /*checkpoint=*/nullptr,
                           std::move(plan.media_blobs), {}, std::move(plan.media_prompt_parts),
-                          request.priority_class, request.target_ttft_ms, request.target_itl_ms);
+                          request.priority_class, request.target_ttft_ms, request.target_itl_ms,
+                          request.enable_stage_profiling);
     }
 
     [[nodiscard]] bool has_native_chat() const override { return native_chat_; }
@@ -737,7 +1010,8 @@ private:
                                      std::vector<lc::GenerateRequest::MediaPromptPart> media_prompt_parts = {},
                                      std::optional<RequestPriority> priority_class = std::nullopt,
                                      std::optional<double> target_ttft_ms = std::nullopt,
-                                     std::optional<double> target_itl_ms = std::nullopt) {
+                                     std::optional<double> target_itl_ms = std::nullopt,
+                                     bool enable_stage_profiling = false) {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
 
         lc::GenerateRequest req;
@@ -753,6 +1027,7 @@ private:
         req.priority = priority_class.value_or(RequestPriority::subagent);
         req.target_ttft_ms = target_ttft_ms;
         req.target_itl_ms = target_itl_ms;
+        req.enable_stage_profiling = enable_stage_profiling;
         if (checkpoint != nullptr) {
             if (!checkpoint->restore_bytes.empty() && checkpoint->restore_token_position > 0 &&
                 checkpoint->restore_token_position < req.prompt.size()) {
@@ -855,6 +1130,12 @@ private:
         }
 
         llamacpp_detail::PopulateGenerateStats(r, req.restore_tokens, load_ns_, stats);
+        if (stats.effective_execution) {
+            stats.effective_execution->target_identity = desc_.name;
+            if (runtime_state_) {
+                runtime_state_->RecordExecution(*stats.effective_execution);
+            }
+        }
 
         if (!r.status.ok()) return ToStatus(r.status);
 
@@ -910,8 +1191,8 @@ public:
                                  std::optional<bool> force_gpu_offload = std::nullopt)
         : options_(std::move(options)),
           runtime_state_(std::make_shared<RuntimeState>(
-              probe ? std::move(probe) : MakeDefaultGpuMemoryProbe(options_.devices), sample_interval,
-              options_.context_length, force_uma_mode, force_gpu_offload)) {
+              probe ? std::move(probe) : MakeDefaultGpuMemoryProbe(options_.devices), sample_interval, options_,
+              force_uma_mode, force_gpu_offload)) {
         // llama.cpp's log callback runs on inference threads: send its lines
         // through the non-blocking diagnostic queue, never to stderr directly.
         lc::SetLogSink(&ForwardLogToDiagnosticQueue);
@@ -948,6 +1229,9 @@ public:
     }
     [[nodiscard]] std::optional<BackendRuntimeStatus> runtime_status() const override {
         return runtime_state_->Snapshot();
+    }
+    [[nodiscard]] std::vector<CapabilityStatusEntry> capability_statuses() const override {
+        return runtime_state_->CapabilityStatuses();
     }
     [[nodiscard]] std::size_t max_concurrent_requests() const override {
         return std::max<std::size_t>(1u, static_cast<std::size_t>(options_.slots));
@@ -1047,7 +1331,9 @@ public:
             uma_target = llamacpp_detail::HasIntegratedUmaTarget(enumerated_devices, lo.devices);
         }
         const std::uint32_t loaded_slots = std::max<std::uint32_t>(1u, runtime.SlotCount());
-        const std::uint64_t model_id = runtime_state_->RegisterModel(info.n_ctx, lo.n_gpu_layers != 0, uma_target);
+        const lc::SpeculativeLoadInfo spec_info = runtime.GetSpeculativeInfo();
+        const std::uint64_t model_id =
+            runtime_state_->RegisterModel(info.n_ctx, lo.n_gpu_layers != 0, uma_target, d.name, spec_info);
         runtime_state_->RefreshGpuMemory(/*force=*/true);
         return std::shared_ptr<BackendModel>(std::make_shared<LlamaCppModel>(
             std::move(d), std::move(runtime), load_ms, loaded_slots, runtime_state_, model_id));

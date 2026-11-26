@@ -1547,4 +1547,142 @@ TEST_SUITE("llamaserver_backend") {
         }
     }
 #endif
+
+    TEST_CASE("llamaserver 5-state capabilities, effective execution, and 3-tier cache stay honest") {
+        auto find_cap = [](const std::vector<CapabilityStatusEntry> &entries, std::string_view key)
+            -> const CapabilityStatus * {
+            for (const auto &e : entries) {
+                if (e.first == key) return &e.second;
+            }
+            return nullptr;
+        };
+
+        // 1. Native mode: delegated support stays unknown until real draft/cache timings are observed.
+        {
+            sonder_test::FakeLlamaServer server;
+            server.set_body(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],"
+                "\"timings\":{\"prompt_n\":10,\"cache_n\":24,\"predicted_n\":3,\"prompt_ms\":2.5,"
+                "\"predicted_ms\":5.0,\"draft_n\":6,\"draft_n_accepted\":4}}\n\n"
+                "data: [DONE]\n\n");
+
+            LlamaServerBackendOptions opts;
+            opts.base_url = server.url();
+            opts.args = {"--spec-type", "ngram-mod", "--draft-max", "16", "--model-draft", "/secret/dir/draft.gguf"};
+            auto backend = make_llamaserver_backend(opts);
+            const auto before = backend->capability_statuses();
+            const auto *spec_before = find_cap(before, "speculative_decode");
+            REQUIRE(spec_before != nullptr);
+            CHECK(spec_before->adapter_supports == CapabilityState::yes);
+            CHECK(spec_before->build_supports == CapabilityState::unknown);
+            CHECK(spec_before->configured == CapabilityState::yes);
+            CHECK(spec_before->observed_active == CapabilityState::unknown);
+            CHECK(spec_before->qualified_beneficial == CapabilityState::unknown);
+
+            auto model = backend->load_model({"fake-model", "cpu:0"});
+            REQUIRE(model.ok());
+            ChatRequest req;
+            req.messages = {{"user", "hello"}};
+            req.enable_stage_profiling = true;
+            auto res = model.value()->chat(req, {}, {});
+            REQUIRE(res.ok());
+            REQUIRE(res->effective_execution.has_value());
+            const auto &eff = *res->effective_execution;
+            CHECK(eff.configured_spec_method == "ngram-mod");
+            CHECK(eff.effective_spec_method == "ngram-mod");
+            CHECK(eff.configured_draft_limit == std::optional<std::uint32_t>(16u));
+            CHECK(eff.draft_identity == "draft.gguf");  // host path stripped to basename only
+            CHECK(eff.target_identity == "fake-model");
+            CHECK(eff.committed_tokens == std::optional<std::uint64_t>(3u));
+            CHECK(eff.proposed_draft_tokens == std::optional<std::uint64_t>(6u));
+            CHECK(eff.accepted_draft_tokens == std::optional<std::uint64_t>(4u));
+            CHECK(eff.speculation_observed_active == CapabilityState::yes);
+            CHECK_FALSE(eff.cache.logical_cache_hit_tokens.has_value());
+            CHECK(eff.cache.device_prefix_reused_tokens == std::optional<std::uint64_t>(24u));
+            CHECK_FALSE(eff.cache.host_l2_restored_tokens.has_value());
+            CHECK_FALSE(eff.cache.host_l2_restore_ms.has_value());
+            CHECK(eff.cache.physical_reused_tokens() == std::optional<std::uint64_t>(24u));
+
+            // Opt-in stage profiling populates upstream prompt_ms while leaving opaque remote stages nullopt.
+            REQUIRE(res->stage_timings.has_value());
+            CHECK(res->stage_timings->enabled);
+            CHECK(res->stage_timings->prefill_ms == std::optional<double>(2.5));
+            CHECK_FALSE(res->stage_timings->draft_ms.has_value());
+            CHECK_FALSE(res->stage_timings->verify_ms.has_value());
+            CHECK_FALSE(res->stage_timings->l2_restore_ms.has_value());
+
+            // After observing real counters, observed_active transitions to yes while qualified_beneficial stays unknown.
+            const auto after = backend->capability_statuses();
+            const auto *spec_after = find_cap(after, "speculative_decode");
+            REQUIRE(spec_after != nullptr);
+            CHECK(spec_after->observed_active == CapabilityState::yes);
+            CHECK(spec_after->qualified_beneficial == CapabilityState::unknown);
+            const auto *pfx_after = find_cap(after, "prefix_reuse");
+            REQUIRE(pfx_after != nullptr);
+            CHECK(pfx_after->observed_active == CapabilityState::yes);
+        }
+
+        // 2. Adaptive policy pause records disabled_by_policy and effective_draft_limit == 0.
+        {
+            sonder_test::FakeLlamaServer server;
+            server.set_body(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],"
+                "\"timings\":{\"prompt_n\":4,\"predicted_n\":2,\"draft_n\":8,\"draft_n_accepted\":0}}\n\n"
+                "data: [DONE]\n\n");
+            LlamaServerBackendOptions opts;
+            opts.base_url = server.url();
+            opts.adaptive_speculation.enabled = true;
+            opts.adaptive_speculation.min_samples = 1;
+            opts.adaptive_speculation.window_size = 4;
+            opts.adaptive_speculation.min_draft_n = 0;
+            opts.adaptive_speculation.initial_draft_n = 4;
+            opts.adaptive_speculation.pause_acceptance_threshold = 0.25;
+            opts.adaptive_speculation.cooldown_requests = 10;
+
+            auto backend = make_llamaserver_backend(opts);
+            auto model = backend->load_model({"fake-model", "cpu:0"});
+            REQUIRE(model.ok());
+            // First request observes 0/8 acceptance -> pauses workload bucket.
+            ChatRequest req1;
+            req1.messages = {{"user", "a"}};
+            REQUIRE(model.value()->chat(req1, {}, {}).ok());
+            // Second request runs under paused policy -> effective_spec_method == "none", disabled_by_policy.
+            ChatRequest req2;
+            req2.messages = {{"user", "b"}};
+            auto r2 = model.value()->chat(req2, {}, {});
+            REQUIRE(r2.ok());
+            REQUIRE(r2->effective_execution.has_value());
+            CHECK(r2->effective_execution->effective_spec_method == "none");
+            CHECK(r2->effective_execution->effective_draft_limit == std::optional<std::uint32_t>(0u));
+            CHECK(r2->effective_execution->fallback_reason == "disabled_by_policy");
+        }
+
+        // 3. Generic OpenAI mode (native_completion = false) reports not_supported and keeps runtime_status nullopt.
+        {
+            sonder_test::FakeLlamaServer server;
+            server.set_body("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"
+                            "data: [DONE]\n\n");
+            LlamaServerBackendOptions opts;
+            opts.base_url = server.url();
+            opts.native_completion = false;
+            auto backend = make_llamaserver_backend(opts);
+            CHECK_FALSE(backend->runtime_status().has_value());
+            const auto caps = backend->capability_statuses();
+            const auto *spec = find_cap(caps, "speculative_decode");
+            REQUIRE(spec != nullptr);
+            CHECK(spec->adapter_supports == CapabilityState::no);
+            CHECK(spec->observed_active == CapabilityState::no);
+            auto model = backend->load_model({"fake-model", "cpu:0"});
+            REQUIRE(model.ok());
+            ChatRequest req;
+            req.messages = {{"user", "hi"}};
+            auto res = model.value()->chat(req, {}, {});
+            REQUIRE(res.ok());
+            REQUIRE(res->effective_execution.has_value());
+            CHECK(res->effective_execution->effective_spec_method == "none");
+            CHECK(res->effective_execution->fallback_reason == "not_supported");
+            CHECK(res->effective_execution->speculation_observed_active == CapabilityState::no);
+            CHECK_FALSE(res->effective_execution->cache.device_prefix_reused_tokens.has_value());
+        }
+    }
 }

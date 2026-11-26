@@ -359,6 +359,8 @@ struct GenerateRequest {
     sonder::inference::RequestPriority priority = sonder::inference::RequestPriority::subagent;
     std::optional<double> target_ttft_ms = std::nullopt;
     std::optional<double> target_itl_ms = std::nullopt;
+    // Opt-in per-request stage timing hooks (false by default: zero extra clocks).
+    bool enable_stage_profiling = false;
 };
 
 // One event per generated token. After the last token a final event with
@@ -378,11 +380,25 @@ using TokenCallback = std::function<bool(const TokenEvent&)>;
 // callback inside llama_decode; return true to cancel. Must be thread-safe.
 using CancelPredicate = std::function<bool()>;
 
+// Opt-in per-request stage timing breakdown captured inside LlamaCppBackend.
+// Unmeasured phases remain std::nullopt.
+struct GenerateStageTimings {
+    bool enabled = false;
+    std::optional<double> cache_lookup_ms;
+    std::optional<double> l2_restore_ms;
+    std::optional<double> prefill_ms;
+    std::optional<double> draft_ms;
+    std::optional<double> verify_ms;
+    std::optional<double> rollback_ms;
+    std::optional<double> sampling_ms;
+    bool stages_may_overlap = false;
+};
+
 struct GenerateResult {
     Status status{};
     StopReason stop_reason = StopReason::kNone;
     std::int32_t prompt_tokens = 0;          // newly evaluated prompt tokens
-    std::int32_t cached_tokens = 0;          // prompt tokens reused from KV prefix cache
+    std::int32_t cached_tokens = 0;          // total physical prompt tokens reused (device + host L2)
     std::int32_t generated_tokens = 0;
     std::int32_t draft_tokens = 0;           // speculative draft tokens proposed
     std::int32_t draft_accepted_tokens = 0;  // speculative draft tokens accepted
@@ -396,9 +412,43 @@ struct GenerateResult {
     bool state_captured = false;
     Status capture_status{};
 
+    // Separate physical cache tier accounting:
+    // - device_prefix_reused_tokens: in-VRAM same-slot or cross-slot seq_cp reuse
+    // - device_cross_slot_reused_tokens: subset reused via cross-slot seq_cp
+    // - host_l2_restored_tokens / host_l2_restore_ms: physical L2 host-RAM restore
+    std::int32_t device_prefix_reused_tokens = 0;
+    std::int32_t device_cross_slot_reused_tokens = 0;
+    std::int32_t host_l2_restored_tokens = 0;
+    double host_l2_restore_ms = 0.0;
+
+    // Effective speculative execution evidence for this request.
+    std::string configured_spec_method;
+    std::string effective_spec_method;
+    std::int32_t configured_draft_limit = 0;
+    std::int32_t effective_draft_limit = 0;
+    std::string spec_fallback_reason;
+    std::string draft_identity;
+    bool spec_transitioned_during_request = false;
+
+    // Opt-in stage timing breakdown (enabled == false unless requested).
+    GenerateStageTimings stage_timings{};
+
     [[nodiscard]] double decode_tokens_per_second() const noexcept;
     [[nodiscard]] double prefill_tokens_per_second() const noexcept;
     [[nodiscard]] double spec_accept_rate() const noexcept;
+};
+
+// Resolved load-time speculative decoding state for diagnostics/capability checks.
+struct SpeculativeLoadInfo {
+    std::string configured_method = "none";
+    std::string effective_method = "none";
+    std::int32_t configured_draft_max = 0;
+    std::int32_t effective_draft_max = 0;
+    std::string fallback_reason;
+    std::string draft_identity;
+    bool mtp_build_supported = false;
+    bool mtp_model_supported = false;
+    bool l2_cache_enabled = false;
 };
 
 struct EmbedOutput {
@@ -507,6 +557,8 @@ public:
     [[nodiscard]] static std::string_view Name() noexcept { return "llama.cpp"; }
     [[nodiscard]] static std::string_view UpstreamVersion() noexcept;  // pinned tag
     [[nodiscard]] static Capabilities GetCapabilities() noexcept { return {}; }
+    [[nodiscard]] static bool HasMtpBuildSupport() noexcept;
+    [[nodiscard]] static bool HasMtmdBuildSupport() noexcept;
     // Devices ggml can see in this build (CPU always; CUDA/Vulkan/Metal when compiled in).
     [[nodiscard]] static std::vector<DeviceInfo> EnumerateDevices();
     // Checks each ggml device name (non-empty, registered in this build via
@@ -538,6 +590,7 @@ public:
     [[nodiscard]] SpeculativeVerificationMode RequestedSpecVerificationMode() const noexcept;
     [[nodiscard]] SpeculativeVerificationMode EffectiveSpecVerificationMode() const noexcept;
     [[nodiscard]] ModelInfo GetModelInfo() const;
+    [[nodiscard]] SpeculativeLoadInfo GetSpeculativeInfo() const;
 
     // parse_special: treat control-token text (e.g. "<|im_start|>") as the
     // special token rather than plain text; needed for chat-templated prompts.

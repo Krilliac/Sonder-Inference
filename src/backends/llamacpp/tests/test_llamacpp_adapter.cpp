@@ -810,3 +810,164 @@ TEST_CASE("llamacpp adapter: capabilities report structured_output cleanly witho
     CHECK(mm_be->capabilities().has(Capability::multimodal));
     CHECK_FALSE(mm_be->capabilities().has(Capability::tool_calling));
 }
+
+TEST_CASE("llamacpp adapter: PopulateGenerateStats records effective mode transitions, 3-tier cache, and opt-in stage timings") {
+    namespace lc = sonder::backends::llamacpp;
+
+    // 1. Cross-slot VRAM reuse + auto->ngram-mod transition + opt-in stage timings.
+    {
+        lc::GenerateResult r;
+        r.prompt_tokens = 32;
+        r.cached_tokens = 256;
+        r.device_prefix_reused_tokens = 256;
+        r.device_cross_slot_reused_tokens = 256;
+        r.host_l2_restored_tokens = 0;
+        r.generated_tokens = 48;
+        r.draft_tokens = 36;
+        r.draft_accepted_tokens = 24;
+        r.prefill_ms = 4.0;
+        r.decode_ms = 120.0;
+        r.configured_spec_method = "auto";
+        r.effective_spec_method = "ngram-mod";
+        r.configured_draft_limit = 64;
+        r.effective_draft_limit = 64;
+        r.spec_fallback_reason = "auto_fallback_ngram_mod";
+        r.draft_identity = "ngram-mod";
+        r.stage_timings.enabled = true;
+        r.stage_timings.cache_lookup_ms = 0.25;
+        r.stage_timings.prefill_ms = 4.0;
+        r.stage_timings.draft_ms = 1.5;
+        r.stage_timings.verify_ms = 90.0;
+        r.stage_timings.rollback_ms = 0.75;
+        r.stage_timings.sampling_ms = 2.0;
+
+        GenerateStats stats;
+        llamacpp_detail::PopulateGenerateStats(r, 0, 0, stats);
+        REQUIRE(stats.effective_execution.has_value());
+        const auto& eff = *stats.effective_execution;
+        CHECK(eff.configured_spec_method == "auto");
+        CHECK(eff.effective_spec_method == "ngram-mod");
+        CHECK(eff.configured_draft_limit == std::optional<std::uint32_t>(64u));
+        CHECK(eff.effective_draft_limit == std::optional<std::uint32_t>(64u));
+        CHECK(eff.fallback_reason == "auto_fallback_ngram_mod");
+        CHECK(eff.draft_identity == "ngram-mod");
+        CHECK(eff.committed_tokens == std::optional<std::uint64_t>(48u));
+        CHECK(eff.proposed_draft_tokens == std::optional<std::uint64_t>(36u));
+        CHECK(eff.accepted_draft_tokens == std::optional<std::uint64_t>(24u));
+        CHECK(eff.speculation_observed_active == CapabilityState::yes);
+        CHECK_FALSE(eff.cache.logical_cache_hit_tokens.has_value());
+        CHECK(eff.cache.device_prefix_reused_tokens == std::optional<std::uint64_t>(256u));
+        CHECK(eff.cache.device_cross_slot_reused_tokens == std::optional<std::uint64_t>(256u));
+        CHECK(eff.cache.host_l2_restored_tokens == std::optional<std::uint64_t>(0u));
+        CHECK(eff.cache.physical_reused_tokens() == std::optional<std::uint64_t>(256u));
+
+        REQUIRE(stats.stage_timings.has_value());
+        CHECK(stats.stage_timings->enabled);
+        CHECK(stats.stage_timings->cache_lookup_ms == std::optional<double>(0.25));
+        CHECK_FALSE(stats.stage_timings->l2_restore_ms.has_value());
+        CHECK(stats.stage_timings->draft_ms == std::optional<double>(1.5));
+        CHECK(stats.stage_timings->verify_ms == std::optional<double>(90.0));
+        CHECK(stats.stage_timings->rollback_ms == std::optional<double>(0.75));
+        CHECK(stats.stage_timings->sampling_ms == std::optional<double>(2.0));
+    }
+
+    // 2. Host L2 Radix restore + mid-request concurrency disable transition.
+    {
+        lc::GenerateResult r;
+        r.prompt_tokens = 16;
+        r.cached_tokens = 512;
+        r.device_prefix_reused_tokens = 0;
+        r.host_l2_restored_tokens = 512;
+        r.host_l2_restore_ms = 6.25;
+        r.generated_tokens = 20;
+        r.configured_spec_method = "draft-mtp";
+        r.effective_spec_method = "none";
+        r.configured_draft_limit = 3;
+        r.effective_draft_limit = 0;
+        r.spec_fallback_reason = "concurrency_batch";
+        r.spec_transitioned_during_request = true;
+
+        GenerateStats stats;
+        llamacpp_detail::PopulateGenerateStats(r, 0, 0, stats);
+        REQUIRE(stats.effective_execution.has_value());
+        const auto& eff = *stats.effective_execution;
+        CHECK(eff.configured_spec_method == "draft-mtp");
+        CHECK(eff.effective_spec_method == "none");
+        CHECK(eff.fallback_reason == "concurrency_batch");
+        CHECK(eff.transitioned_during_request);
+        CHECK(eff.speculation_observed_active == CapabilityState::no);
+        CHECK(eff.cache.device_prefix_reused_tokens == std::optional<std::uint64_t>(0u));
+        CHECK(eff.cache.host_l2_restored_tokens == std::optional<std::uint64_t>(512u));
+        CHECK(eff.cache.host_l2_restore_ms == std::optional<double>(6.25));
+        CHECK(eff.cache.physical_reused_tokens() == std::optional<std::uint64_t>(512u));
+        CHECK_FALSE(stats.stage_timings.has_value());  // opt-in was false
+    }
+}
+
+TEST_CASE("llamacpp adapter: 5-state capability_statuses and runtime_status effective execution stay honest") {
+    auto find_cap = [](const std::vector<CapabilityStatusEntry>& entries, std::string_view key)
+        -> const CapabilityStatus* {
+        for (const auto& e : entries) {
+            if (e.first == key) return &e.second;
+        }
+        return nullptr;
+    };
+
+    // 1. Default options: speculation=none, cache_ram_mib=0, slots=1.
+    {
+        auto be = make_llamacpp_backend();
+        const auto caps = be->capability_statuses();
+        const auto* spec = find_cap(caps, "speculative_decode");
+        REQUIRE(spec != nullptr);
+        CHECK(spec->adapter_supports == CapabilityState::yes);
+        CHECK(spec->build_supports == CapabilityState::yes);
+        CHECK(spec->configured == CapabilityState::no);
+        CHECK(spec->observed_active == CapabilityState::no);
+        CHECK(spec->qualified_beneficial == CapabilityState::unknown);
+
+        const auto* l2 = find_cap(caps, "host_l2_cache");
+        REQUIRE(l2 != nullptr);
+        CHECK(l2->adapter_supports == CapabilityState::yes);
+        CHECK(l2->configured == CapabilityState::no);
+        CHECK(l2->observed_active == CapabilityState::no);
+
+        const auto rt = be->runtime_status();
+        REQUIRE(rt.has_value());
+        REQUIRE(rt->effective_execution.has_value());
+        CHECK(rt->effective_execution->configured_spec_method == "none");
+        CHECK(rt->effective_execution->effective_spec_method == "none");
+        CHECK(rt->effective_execution->speculation_observed_active == CapabilityState::no);
+    }
+
+    // 2. Configured options: spec_type=auto, cache_ram_mib=512, slots=4 -> configured=yes, observed_active=unknown.
+    {
+        LlamaCppBackendOptions opts;
+        opts.spec_type = "auto";
+        opts.cache_ram_mib = 512;
+        opts.slots = 4;
+        auto be = make_llamacpp_backend(opts);
+        const auto caps = be->capability_statuses();
+        const auto* spec = find_cap(caps, "speculative_decode");
+        REQUIRE(spec != nullptr);
+        CHECK(spec->configured == CapabilityState::yes);
+        CHECK(spec->observed_active == CapabilityState::unknown);
+        CHECK(spec->qualified_beneficial == CapabilityState::unknown);
+
+        const auto* l2 = find_cap(caps, "host_l2_cache");
+        REQUIRE(l2 != nullptr);
+        CHECK(l2->configured == CapabilityState::yes);
+        CHECK(l2->observed_active == CapabilityState::unknown);
+
+        const auto* batch = find_cap(caps, "continuous_batch_decode");
+        REQUIRE(batch != nullptr);
+        CHECK(batch->configured == CapabilityState::yes);
+        CHECK(batch->observed_active == CapabilityState::unknown);
+
+        const auto rt = be->runtime_status();
+        REQUIRE(rt.has_value());
+        REQUIRE(rt->effective_execution.has_value());
+        CHECK(rt->effective_execution->configured_spec_method == "auto");
+        CHECK(rt->effective_execution->effective_spec_method.empty());  // unknown until model loads
+        CHECK(rt->effective_execution->speculation_observed_active == CapabilityState::unknown);
+    }
+}

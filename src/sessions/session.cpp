@@ -199,7 +199,8 @@ template <class Gate, class Produced, class Deliver>
 Result<GenerateStats> run_sonder_sampling(TokenStream& stream, BackendModel& backend_model,
                                           const SamplingConfig& config, const CancellationToken& cancel,
                                           TelemetryBus& bus, const TelemetryContext& ctx, const Gate& gate,
-                                          const Produced& produced, const Deliver& deliver) {
+                                          const Produced& produced, const Deliver& deliver,
+                                          StageTimings* stage_timings = nullptr) {
     namespace smp = sampling;
     GenerateStats stats;
     stats.prompt_tokens = stream.prompt_tokens().size();
@@ -239,7 +240,9 @@ Result<GenerateStats> run_sonder_sampling(TokenStream& stream, BackendModel& bac
         if (!logits.ok()) {
             return logits.status();
         }
+        ScopedStageTimer sample_timer(stage_timings != nullptr ? &stage_timings->sampling_ms : nullptr);
         const smp::SampleResult sampled = chain.sample(logits.value());
+        sample_timer.stop();
         if (!sampled.ok()) {
             const bool no_viable = sampled.status == smp::SampleStatus::NoViableCandidates;
             const ErrorCode code = no_viable ? ErrorCode::invalid_argument : ErrorCode::backend_error;
@@ -695,6 +698,10 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
 
     const bool emit_tokens = bus.enabled(TelemetryLevel::standard);
     const bool capture_text = bus.options().capture_text;
+    const bool stage_profiling = request_options.enable_stage_profiling || bus.stage_profiling_enabled();
+    request.enable_stage_profiling = stage_profiling;
+    StageTimings session_stages;
+    session_stages.enabled = stage_profiling;
     BackendModel& backend_model = model_->backend_model();
     const auto backend = engine_.find_backend(model_->backend_name());
     const bool has_media = (messages != nullptr) && has_chat_media(*messages);
@@ -757,7 +764,9 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     const bool defer_stream_open =
         (engine_.scheduling_options().strict_priority_admission || checkpoint_candidate) && use_token_logits;
     if (!defer_stream_open && use_token_logits) {
+        ScopedStageTimer prefill_timer(stage_profiling ? &session_stages.prefill_ms : nullptr);
         auto opened = backend_model.open_token_stream(request);
+        prefill_timer.stop();
         if (opened.ok()) {
             stream = std::move(opened).value();
         } else {
@@ -968,7 +977,12 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         if (!sched_id || !gated) {
             return true;
         }
+        ScopedStageTimer gate_timer(stage_profiling ? &session_stages.callback_gate_wait_ms : nullptr);
         Status st = runtime->acquire_token(*sched_id, token);
+        gate_timer.stop();
+        if (stage_profiling) {
+            session_stages.note_overlap("callback_gate_wait_in_decode");
+        }
         if (st.ok()) {
             return true;
         }
@@ -1065,7 +1079,9 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         }
 #if defined(SONDER_HAS_SAMPLER_CHAIN)
         if (defer_stream_open) {
+            ScopedStageTimer prefill_timer(stage_profiling ? &session_stages.prefill_ms : nullptr);
             auto opened = backend_model.open_token_stream(request);
+            prefill_timer.stop();
             request.checkpoint = nullptr;
             if (checkpoint_attached && sched_id && !gated && !capture_registered_or_attempted) {
                 runtime->release_checkpoint_retention(*sched_id);
@@ -1082,8 +1098,8 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
             generated = prepared;
         } else if (stream) {
 #if defined(SONDER_HAS_SAMPLER_CHAIN)
-            generated =
-                run_sonder_sampling(*stream, backend_model, sampling, token, bus, ctx, gate, produced, deliver);
+            generated = run_sonder_sampling(*stream, backend_model, sampling, token, bus, ctx, gate, produced, deliver,
+                                            stage_profiling ? &session_stages : nullptr);
 #endif
         } else {
             const auto on_backend_chunk = [&](const TokenChunk& chunk) -> bool {
@@ -1111,6 +1127,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                 chat_request.priority_class = effective_priority;
                 chat_request.target_ttft_ms = request_options.target_ttft_ms;
                 chat_request.target_itl_ms = request_options.target_itl_ms;
+                chat_request.enable_stage_profiling = stage_profiling;
                 generated = backend_model.chat(chat_request, token, on_backend_chunk);
             } else {
                 generated = backend_model.generate(request, token, on_backend_chunk);
@@ -1200,6 +1217,79 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
 
     if (request_options.admission) result.scheduling.queue_ms = request_options.admission->queue_ms();
 
+    {
+        EffectiveExecutionReport eff = result.stats.effective_execution.value_or(EffectiveExecutionReport{});
+        if (eff.target_identity.empty()) {
+            eff.target_identity = model_->descriptor().name;
+        }
+        if (!eff.committed_tokens.has_value() &&
+            (result.stats.token_counts_from_backend || result.stats.completion_tokens > 0)) {
+            eff.committed_tokens = result.stats.completion_tokens;
+        }
+        if (!eff.proposed_draft_tokens.has_value() && result.stats.draft_tokens.has_value()) {
+            eff.proposed_draft_tokens = result.stats.draft_tokens;
+        }
+        if (!eff.accepted_draft_tokens.has_value() && result.stats.draft_accepted_tokens.has_value()) {
+            eff.accepted_draft_tokens = result.stats.draft_accepted_tokens;
+        }
+        // Strict 3-tier cache separation: engine KvCacheManager accounting
+        // stays exclusively in logical_cache_hit_tokens and is never copied
+        // into physical device_prefix_reused_tokens or host_l2_restored_tokens.
+        if (result.scheduling.scheduled) {
+            eff.cache.logical_cache_hit_tokens = result.scheduling.reused_prompt_tokens;
+        }
+        if (eff.speculation_observed_active == CapabilityState::unknown) {
+            if (eff.proposed_draft_tokens.has_value() && *eff.proposed_draft_tokens > 0u) {
+                eff.speculation_observed_active = CapabilityState::yes;
+            } else if (backend && !backend->capabilities().has(Capability::speculative_decode)) {
+                eff.speculation_observed_active = CapabilityState::no;
+                if (eff.configured_spec_method.empty()) {
+                    eff.configured_spec_method = "none";
+                }
+                if (eff.effective_spec_method.empty()) {
+                    eff.effective_spec_method = "none";
+                }
+                if (eff.fallback_reason.empty()) {
+                    eff.fallback_reason = std::string(kSpecReasonNotSupported);
+                }
+            }
+        }
+        result.effective_execution = bound_effective_execution_report(std::move(eff));
+    }
+
+    if (stage_profiling) {
+        StageTimings merged = result.stats.stage_timings.value_or(StageTimings{});
+        merged.enabled = true;
+        if (result.scheduling.scheduled || request_options.admission || request_options.admission_queue_ms > 0.0) {
+            merged.queue_wait_ms = std::max(0.0, result.scheduling.queue_ms);
+        }
+        if (!merged.l2_restore_ms.has_value() && result.effective_execution &&
+            result.effective_execution->cache.host_l2_restore_ms.has_value()) {
+            merged.l2_restore_ms = result.effective_execution->cache.host_l2_restore_ms;
+        }
+        if (!merged.prefill_ms.has_value()) {
+            if (session_stages.prefill_ms.has_value()) {
+                merged.prefill_ms = session_stages.prefill_ms;
+            } else if (result.stats.prompt_eval_ns > 0) {
+                merged.prefill_ms = static_cast<double>(result.stats.prompt_eval_ns) / 1e6;
+            }
+        }
+        if (session_stages.sampling_ms.has_value()) {
+            StageTimings::add_ms(merged.sampling_ms, *session_stages.sampling_ms);
+        }
+        if (session_stages.callback_gate_wait_ms.has_value()) {
+            StageTimings::add_ms(merged.callback_gate_wait_ms, *session_stages.callback_gate_wait_ms);
+        }
+        for (const auto& note : session_stages.overlap_notes) {
+            merged.note_overlap(note);
+        }
+        if (session_stages.stages_may_overlap) {
+            merged.stages_may_overlap = true;
+        }
+        merged.total_elapsed_ms = std::max(0.0, result.total_ms);
+        result.stage_timings = std::move(merged);
+    }
+
     const std::uint64_t cancel_ns = cancel_requested_ns_.load();
     const std::uint64_t now_ns = monotonic_ns();
 
@@ -1214,6 +1304,16 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                          {"scheduled", result.scheduling.scheduled},
                          {"sampler", result.scheduling.sonder_sampled ? "sonder" : "backend"}};
     backend_observations(summary, result.stats);
+    if (result.effective_execution) {
+        summary.set("effective_execution", to_json(*result.effective_execution));
+    }
+    if (result.stage_timings) {
+        summary.set("stage_timings", to_json(*result.stage_timings));
+        bus.emit_stage_timings(ctx, *result.stage_timings, model_->backend_name(),
+                               result.effective_execution ? std::string_view(result.effective_execution->backend_version)
+                                                          : std::string_view{},
+                               TelemetryLevel::metrics);
+    }
     if (request_options.reasoning_budget_tokens) summary.set("reasoning_budget", *request_options.reasoning_budget_tokens);
     if (result.stats.backend_timings) {
         const auto& t = *result.stats.backend_timings;
