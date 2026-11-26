@@ -1978,3 +1978,463 @@ TEST_CASE("llamacpp frontier: SuffixMatcher optional measured-cost tracking over
     CHECK_FALSE(matcher.Draft(tail, 8).draft.empty());
     CHECK(matcher.CheckInvariants());
 }
+
+TEST_CASE("llamacpp frontier: RadixPrefixCache value-aware eviction ranks high-reuse shared prefix above larger one-off") {
+    std::uint64_t now_ms = 10'000;
+    RadixCachePolicy policy;
+    policy.default_soft_lease_ttl_ms = 0;  // isolate pure value score without soft leases
+    RadixPrefixCache cache(/*max_bytes=*/1000, policy, [&] { return now_ms; });
+
+    auto make_entry = [](std::size_t n_bytes, std::uint8_t fill) {
+        RadixCacheEntry e;
+        e.state_blob.assign(n_bytes, fill);
+        return e;
+    };
+
+    // Shared system prefix (200B) with two cached child branches (150B each) and repeated reuse.
+    const std::vector<Token> shared_prefix{1, 2, 3, 4, 5, 6, 7, 8};
+    const std::vector<Token> branch_a{1, 2, 3, 4, 5, 6, 7, 8, 101, 102};
+    const std::vector<Token> branch_b{1, 2, 3, 4, 5, 6, 7, 8, 201, 202};
+    const std::vector<Token> big_oneoff{90, 91, 92, 93, 94, 95, 96, 97};
+    const std::vector<Token> incoming{70, 71, 72, 73, 74, 75, 76, 77};
+
+    REQUIRE(cache.Insert(shared_prefix, make_entry(200, 0x10)));
+    REQUIRE(cache.Insert(branch_a, make_entry(150, 0x11)));
+    REQUIRE(cache.Insert(branch_b, make_entry(150, 0x12)));
+
+    // Simulate repeated reuse on shared_prefix before big_oneoff arrives later.
+    for (int i = 0; i < 4; ++i) {
+        now_ms += 100;
+        const RadixLookupResult hit = cache.LookupLongestPrefix(shared_prefix, shared_prefix.size(), false);
+        REQUIRE(hit.found());
+    }
+
+    // Insert a much larger, more recent one-off entry (500B). Total used = 1000B.
+    now_ms += 100;
+    REQUIRE(cache.Insert(big_oneoff, make_entry(500, 0x99)));
+    CHECK(cache.used_bytes() == 1000u);
+    CHECK(cache.retained_bytes() == cache.used_bytes() + cache.metadata_overhead_bytes());
+    CHECK(cache.metadata_overhead_bytes() > 0u);
+    CHECK(cache.CheckInvariants());
+
+    // Inspect retention signals: shared_prefix tracks branching children, reuse_count,
+    // retained_bytes (payload + metadata overhead), and strictly outranks big_oneoff.
+    const auto shared_m = cache.InspectEntry(shared_prefix);
+    const auto oneoff_m = cache.InspectEntry(big_oneoff);
+    REQUIRE(shared_m.has_value());
+    REQUIRE(oneoff_m.has_value());
+    CHECK(shared_m->payload_bytes == 200u);
+    CHECK(shared_m->metadata_overhead_bytes > 0u);
+    CHECK(shared_m->retained_bytes == shared_m->payload_bytes + shared_m->metadata_overhead_bytes);
+    CHECK(shared_m->token_count == shared_prefix.size());
+    CHECK(shared_m->reuse_count == 4u);
+    CHECK(shared_m->shared_prefix_children == 2u);
+    CHECK(oneoff_m->reuse_count == 0u);
+    CHECK(oneoff_m->shared_prefix_children == 0u);
+    CHECK(shared_m->value_score > oneoff_m->value_score);
+
+    // Budget pressure: inserting 300B must evict the newer larger one-off entry
+    // rather than the older high-reuse shared prefix!
+    now_ms += 100;
+    REQUIRE(cache.Insert(incoming, make_entry(300, 0x77)));
+    CHECK(cache.CheckInvariants());
+    CHECK(cache.LookupLongestPrefix(shared_prefix, shared_prefix.size(), false).found());
+    CHECK_FALSE(cache.LookupLongestPrefix(big_oneoff, big_oneoff.size(), false).found());
+    CHECK(cache.LookupLongestPrefix(incoming, incoming.size(), false).found());
+
+    // Unprofitable entry (observed last_restore_ms >= estimated_recompute_ms) scores 0.0
+    // and is evicted first even if smaller and brand-new.
+    RadixCacheEntry unprofitable = make_entry(100, 0xEE);
+    unprofitable.estimated_recompute_ms = 5.0;
+    unprofitable.last_restore_ms = 12.0;  // T_restore > T_recompute => net savings = 0
+    const std::vector<Token> unprof_key{50, 51, 52, 53};
+    REQUIRE(cache.Insert(unprof_key, std::move(unprofitable)));
+    const auto unprof_m = cache.InspectEntry(unprof_key);
+    REQUIRE(unprof_m.has_value());
+    CHECK(unprof_m->value_score == doctest::Approx(0.0));
+    CHECK(cache.used_bytes() == 900u);
+
+    // Inserting 200B triggers eviction of the 0-value unprofitable entry first.
+    REQUIRE(cache.Insert(std::vector<Token>{60, 61, 62, 63}, make_entry(200, 0x66)));
+    CHECK_FALSE(cache.LookupLongestPrefix(unprof_key, unprof_key.size(), false).found());
+    CHECK(cache.LookupLongestPrefix(shared_prefix, shared_prefix.size(), false).found());
+    CHECK(cache.CheckInvariants());
+}
+
+TEST_CASE("llamacpp frontier: RadixPrefixCache soft session lease protects returning agent then expires cleanly") {
+    std::uint64_t now_ms = 5'000;
+    RadixCachePolicy policy;
+    policy.default_soft_lease_ttl_ms = 20'000;
+    policy.max_soft_lease_ttl_ms = 30'000;
+    policy.max_session_soft_lease_fraction = 0.50;
+    policy.soft_lease_boost = 5.0;
+    policy.recency_half_life_ms = 60'000.0;
+    RadixPrefixCache cache(/*max_bytes=*/1000, policy, [&] { return now_ms; });
+
+    const std::vector<Token> agent_prefix{10, 11, 12, 13, 14, 15};
+    const std::vector<Token> anon_prefix{20, 21, 22, 23, 24, 25};
+    const std::vector<Token> pressure_1{30, 31, 32, 33, 34, 35};
+    const std::vector<Token> pressure_2{40, 41, 42, 43, 44, 45};
+
+    // Returning tool-using agent stores prefix with a requested TTL exceeding max_soft_lease_ttl_ms;
+    // cache must clamp expiry strictly to max_soft_lease_ttl_ms.
+    RadixCacheEntry agent_entry;
+    agent_entry.state_blob.assign(400, 0xAA);
+    agent_entry.session_key = "tool-agent-1";
+    agent_entry.soft_lease_ttl_ms = 999'999;  // clamped to 30'000 ms
+    REQUIRE(cache.Insert(agent_prefix, std::move(agent_entry)));
+
+    const auto m0 = cache.InspectEntry(agent_prefix);
+    REQUIRE(m0.has_value());
+    CHECK(m0->session_id == "tool-agent-1");
+    CHECK(m0->soft_lease_active);
+    CHECK(m0->soft_lease_expires_ms == 5'000u + 30'000u);
+    CHECK(cache.active_soft_leases() == 1u);
+    CHECK(cache.session_soft_leased_bytes("tool-agent-1") == 400u);
+
+    // An unleased entry of identical token length and size arrives later (more recent!).
+    now_ms += 5'000;  // t = 10'000
+    RadixCacheEntry anon_entry;
+    anon_entry.state_blob.assign(400, 0xBB);
+    REQUIRE(cache.Insert(anon_prefix, std::move(anon_entry)));
+    CHECK(cache.used_bytes() == 800u);
+
+    // While tool-agent-1's soft lease is unexpired (t = 15'000 < 35'000), budget pressure
+    // must evict the unleased anon_prefix and protect tool-agent-1!
+    now_ms += 5'000;  // t = 15'000
+    RadixCacheEntry p1_entry;
+    p1_entry.state_blob.assign(400, 0xCC);
+    REQUIRE(cache.Insert(pressure_1, std::move(p1_entry)));
+    CHECK(cache.CheckInvariants());
+    CHECK(cache.LookupLongestPrefix(agent_prefix, agent_prefix.size(), false, "tool-agent-1").found());
+    CHECK_FALSE(cache.LookupLongestPrefix(anon_prefix, anon_prefix.size(), false).found());
+
+    // That lookup by "tool-agent-1" at t = 15'000 renewed the soft lease to 15'000 + 30'000 = 45'000!
+    const auto m_renewed = cache.InspectEntry(agent_prefix);
+    REQUIRE(m_renewed.has_value());
+    CHECK(m_renewed->soft_lease_active);
+    CHECK(m_renewed->soft_lease_expires_ms == 15'000u + 30'000u);
+    const double boosted_score = m_renewed->value_score;
+
+    // Advance past TTL expiry (t = 120'000 > 45'000): lease expires automatically!
+    now_ms = 120'000;
+    const auto m_expired = cache.InspectEntry(agent_prefix);
+    REQUIRE(m_expired.has_value());
+    CHECK_FALSE(m_expired->soft_lease_active);
+    CHECK(m_expired->soft_lease_expires_ms == 0u);
+    CHECK(m_expired->value_score < boosted_score);
+
+    // Touch pressure_1 repeatedly so pressure_1 has higher fresh value than expired agent_prefix.
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(cache.LookupLongestPrefix(pressure_1, pressure_1.size(), false).found());
+    }
+    // Automatic expiry cleanup ran during lookup and reclaimed the expired soft lease.
+    CHECK(cache.active_soft_leases() == 0u);
+    CHECK(cache.soft_leases_expired() >= 1u);
+    CHECK(cache.session_soft_leased_bytes("tool-agent-1") == 0u);
+    CHECK(cache.CheckInvariants());
+
+    // Now under new budget pressure, the expired agent_prefix is cleanly evicted.
+    RadixCacheEntry p2_entry;
+    p2_entry.state_blob.assign(400, 0xDD);
+    REQUIRE(cache.Insert(pressure_2, std::move(p2_entry)));
+    CHECK_FALSE(cache.LookupLongestPrefix(agent_prefix, agent_prefix.size(), false).found());
+    CHECK(cache.LookupLongestPrefix(pressure_1, pressure_1.size(), false).found());
+    CHECK(cache.LookupLongestPrefix(pressure_2, pressure_2.size(), false).found());
+    CHECK(cache.CheckInvariants());
+}
+
+TEST_CASE("llamacpp frontier: RadixPrefixCache per-session fairness cap prevents cache monopolization") {
+    std::uint64_t now_ms = 1'000;
+    RadixCachePolicy policy;
+    policy.default_soft_lease_ttl_ms = 60'000;
+    policy.max_soft_lease_ttl_ms = 60'000;
+    policy.max_session_soft_lease_fraction = 0.50;  // strict 500B soft-lease cap out of 1000B
+    policy.soft_lease_boost = 4.0;
+    RadixPrefixCache cache(/*max_bytes=*/1000, policy, [&] { return now_ms; });
+    CHECK(cache.session_soft_lease_cap_bytes() == 500u);
+
+    auto make_sess_entry = [](std::size_t n_bytes, std::uint8_t fill, std::string sid) {
+        RadixCacheEntry e;
+        e.state_blob.assign(n_bytes, fill);
+        e.session_key = std::move(sid);
+        return e;
+    };
+
+    // 1. Peer session stores a 400B entry (within its 500B soft-lease share).
+    const std::vector<Token> peer_prefix{1, 2, 3, 4, 5, 6};
+    REQUIRE(cache.Insert(peer_prefix, make_sess_entry(400, 0xAA, "peer-session")));
+    CHECK(cache.session_soft_leased_bytes("peer-session") == 400u);
+    CHECK(cache.CheckInvariants());
+
+    // 2. Greedy session floods 8 distinct 250B entries (2000B total, all requesting soft leases).
+    // Strict fairness cap must bound greedy's soft leases <= 500B and keep peer-session intact!
+    for (int i = 0; i < 8; ++i) {
+        now_ms += 10;
+        const std::vector<Token> gp{100 + i, 200 + i, 300 + i, 400 + i, 500 + i, 600 + i};
+        REQUIRE(cache.Insert(gp, make_sess_entry(250, static_cast<std::uint8_t>(0x10 + i), "greedy-session")));
+        CHECK(cache.session_soft_leased_bytes("greedy-session") <= 500u);
+        CHECK(cache.used_bytes() <= 1000u);
+        CHECK(cache.CheckInvariants());
+    }
+    CHECK(cache.soft_leases_capped() > 0u);
+    // Peer session survived the entire greedy flood!
+    const auto peer_m = cache.InspectEntry(peer_prefix);
+    REQUIRE(peer_m.has_value());
+    CHECK(peer_m->soft_lease_active);
+    CHECK(cache.session_bytes("peer-session") == 400u);
+
+    // 3. Greedy session also attempts a giant 600B entry (> 500B cap): entry may fit without
+    // a soft lease by evicting greedy's own older entries, still preserving peer-session!
+    now_ms += 10;
+    const std::vector<Token> greedy_giant{900, 901, 902, 903, 904, 905};
+    REQUIRE(cache.Insert(greedy_giant, make_sess_entry(600, 0xFE, "greedy-session")));
+    CHECK(cache.session_soft_leased_bytes("greedy-session") <= 500u);
+    const auto giant_m = cache.InspectEntry(greedy_giant);
+    REQUIRE(giant_m.has_value());
+    CHECK_FALSE(giant_m->soft_lease_active);  // oversized entry denied soft lease
+    CHECK(cache.InspectEntry(peer_prefix).has_value());  // peer STILL protected!
+    CHECK(cache.CheckInvariants());
+
+    // 4. Shrinking max_bytes dynamically enforces the tighter soft-lease cap immediately.
+    cache.SetMaxBytes(600);
+    CHECK(cache.session_soft_lease_cap_bytes() == 300u);
+    CHECK(cache.session_soft_leased_bytes("peer-session") <= 300u);
+    CHECK(cache.session_soft_leased_bytes("greedy-session") <= 300u);
+    CHECK(cache.CheckInvariants());
+
+    // 5. Optional strict total-byte per-session cap (`max_session_cache_fraction = 0.50`)
+    // bounds a single session's total resident bytes even in an otherwise empty cache.
+    RadixCachePolicy strict_policy = policy;
+    strict_policy.max_session_cache_fraction = 0.50;
+    RadixPrefixCache strict_cache(/*max_bytes=*/1000, strict_policy, [&] { return now_ms; });
+    REQUIRE(strict_cache.Insert(std::vector<Token>{1, 2, 3}, make_sess_entry(250, 0x01, "solo")));
+    REQUIRE(strict_cache.Insert(std::vector<Token>{4, 5, 6}, make_sess_entry(250, 0x02, "solo")));
+    REQUIRE(strict_cache.Insert(std::vector<Token>{7, 8, 9}, make_sess_entry(250, 0x03, "solo")));
+    CHECK(strict_cache.session_bytes("solo") <= 500u);
+    CHECK(strict_cache.used_bytes() == 500u);
+    CHECK_FALSE(strict_cache.Insert(std::vector<Token>{10, 11, 12}, make_sess_entry(600, 0x04, "solo")));
+    CHECK(strict_cache.CheckInvariants());
+}
+
+TEST_CASE("llamacpp frontier: RestoreCostGate measured restore-vs-recompute gating and telemetry") {
+    // 1. Cold-start safe defaults before any measurements arrive.
+    RestoreCostGateConfig cfg;
+    cfg.default_ms_per_mib_restore = 2.0;    // 512 MiB/s
+    cfg.default_ms_per_token_prefill = 0.25; // 4000 tok/s
+    cfg.ewma_alpha = 0.50;
+    RestoreCostGate gate(cfg);
+
+    CHECK(gate.ms_per_mib_restore() == doctest::Approx(2.0));
+    CHECK(gate.ms_per_token_prefill() == doctest::Approx(0.25));
+    CHECK(gate.restore_samples() == 0u);
+    CHECK(gate.prefill_samples() == 0u);
+
+    constexpr std::size_t kMiB = std::size_t{1} << 20;
+
+    // Cold-start profitable case: 256 tokens (64 ms recompute) vs 4 MiB (8 ms restore) -> accept.
+    CHECK(gate.should_restore(/*matched_tokens=*/256, /*payload_bytes=*/4u * kMiB));
+    CHECK(gate.restore_accepted() == 1u);
+    CHECK(gate.restore_skipped_unprofitable() == 0u);
+
+    // Cold-start unprofitable case: 32 tokens (8 ms recompute) vs 16 MiB (32 ms restore) -> reject.
+    CHECK_FALSE(gate.should_restore(/*matched_tokens=*/32, /*payload_bytes=*/16u * kMiB));
+    CHECK(gate.restore_accepted() == 1u);
+    CHECK(gate.restore_skipped_unprofitable() == 1u);
+
+    // Boundary & degenerate inputs: 0 tokens, 0 bytes, or exact break-even (T_restore == T_recompute) -> reject.
+    CHECK_FALSE(gate.should_restore(0, 1u * kMiB));
+    CHECK_FALSE(gate.should_restore(128, 0));
+    CHECK_FALSE(gate.should_restore(/*matched_tokens=*/8, /*payload_bytes=*/1u * kMiB));  // 2.0 ms == 2.0 ms
+    CHECK(gate.restore_skipped_unprofitable() == 4u);
+
+    // 2. Non-finite / non-positive observations are ignored cleanly without poisoning EWMA.
+    gate.ObserveRestore(kMiB, 0.0);
+    gate.ObserveRestore(kMiB, -5.0);
+    gate.ObserveRestore(kMiB, std::numeric_limits<double>::quiet_NaN());
+    gate.ObserveRestore(0, 10.0);
+    gate.ObservePrefill(100, 0.0);
+    gate.ObservePrefill(100, std::numeric_limits<double>::infinity());
+    gate.ObservePrefill(0, 10.0);
+    CHECK(gate.restore_samples() == 0u);
+    CHECK(gate.prefill_samples() == 0u);
+
+    // 3. Measure slow host restore (10 ms/MiB) + fast GPU prefill (0.02 ms/token).
+    // First observation calibrates immediately from measured reality.
+    gate.ObserveRestore(/*payload_bytes=*/4u * kMiB, /*restore_ms=*/40.0);  // 10.0 ms/MiB
+    gate.ObservePrefill(/*prefilled_tokens=*/1000, /*prefill_ms=*/20.0);    // 0.02 ms/tok
+    CHECK(gate.restore_samples() == 1u);
+    CHECK(gate.prefill_samples() == 1u);
+    CHECK(gate.ms_per_mib_restore() == doctest::Approx(10.0));
+    CHECK(gate.ms_per_token_prefill() == doctest::Approx(0.02));
+
+    // 500 tokens => T_recompute = 10 ms; 2 MiB => T_restore = 20 ms -> REJECT!
+    const RestoreCostDecision slow_dec = gate.Evaluate(500, 2u * kMiB);
+    CHECK_FALSE(slow_dec.should_restore);
+    CHECK(slow_dec.predicted_recompute_ms == doctest::Approx(10.0));
+    CHECK(slow_dec.predicted_restore_ms == doctest::Approx(20.0));
+    CHECK(slow_dec.net_savings_ms == doctest::Approx(-10.0));
+    CHECK_FALSE(gate.should_restore(500, 2u * kMiB));
+
+    // 4. Rolling EWMA adapts when restore gets faster and prefill gets more expensive.
+    for (int i = 0; i < 8; ++i) {
+        gate.ObserveRestore(/*payload_bytes=*/10u * kMiB, /*restore_ms=*/5.0);   // 0.5 ms/MiB
+        gate.ObservePrefill(/*prefilled_tokens=*/256, /*prefill_ms=*/64.0);      // 0.25 ms/tok
+    }
+    CHECK(gate.ms_per_mib_restore() < 1.0);
+    CHECK(gate.ms_per_token_prefill() > 0.20);
+    CHECK(gate.should_restore(500, 2u * kMiB));
+
+    const RestoreCostGateStats st = gate.stats();
+    CHECK(st.restore_accepted == 2u);
+    CHECK(st.restore_skipped_unprofitable == 5u);
+    CHECK(st.restore_samples == 9u);
+    CHECK(st.prefill_samples == 9u);
+
+    // 5. Integration with RadixPrefixCache: ObserveRestore updates both gate and entry metadata.
+    RadixPrefixCache cache(/*max_bytes=*/8u * kMiB);
+    const std::vector<Token> p{1, 2, 3, 4, 5};
+    RadixCacheEntry e;
+    e.state_blob.assign(1u * kMiB, 0x42);
+    REQUIRE(cache.Insert(p, std::move(e)));
+    cache.ObservePrefill(512, 128.0);
+    {
+        PinnedRadixLookup pin = cache.LookupAndPin(p, p.size(), false);
+        REQUIRE(pin.found());
+        cache.ObserveRestore(pin, 1u * kMiB, 3.5);
+    }
+    CHECK(cache.restore_cost_gate().ms_per_mib_restore() == doctest::Approx(3.5));
+    CHECK(cache.restore_cost_gate().ms_per_token_prefill() == doctest::Approx(0.25));
+    const auto em = cache.InspectEntry(p);
+    REQUIRE(em.has_value());
+    CHECK(em->last_restore_ms == doctest::Approx(3.5));
+    CHECK(cache.CheckInvariants());
+}
+
+TEST_CASE("llamacpp frontier: RadixPrefixCache exact byte accounting and hard-pin invariants under value eviction") {
+    std::uint64_t now_ms = 1'000;
+    RadixCachePolicy policy;
+    policy.default_soft_lease_ttl_ms = 5'000;
+    policy.max_soft_lease_ttl_ms = 10'000;
+    policy.max_session_soft_lease_fraction = 0.50;
+    RadixPrefixCache cache(/*max_bytes=*/200, policy, [&] { return now_ms; });
+
+    // 1. Hard-pinned entry with 0.0 value score (unprofitable + expired lease) MUST NOT be evicted,
+    //    while a higher-value unpinned entry IS evicted instead; releasing the pin after budget shrink
+    //    reclaims it with exact byte/metadata accounting.
+    const std::vector<Token> p_low{1, 2, 3};
+    const std::vector<Token> p_high{4, 5, 6, 7, 8, 9};
+    const std::vector<Token> p_new{10, 11, 12};
+
+    RadixCacheEntry low_entry;
+    low_entry.state_blob.assign(100, 0x11);
+    low_entry.session_key = "s-low";
+    low_entry.estimated_recompute_ms = 1.0;
+    low_entry.last_restore_ms = 50.0;  // V = 0.0
+    REQUIRE(cache.Insert(p_low, std::move(low_entry)));
+
+    RadixCacheEntry high_entry;
+    high_entry.state_blob.assign(100, 0x22);
+    high_entry.session_key = "s-high";
+    high_entry.estimated_recompute_ms = 100.0;
+    high_entry.last_restore_ms = 1.0;  // high V
+    REQUIRE(cache.Insert(p_high, std::move(high_entry)));
+
+    PinnedRadixLookup hard_pin = cache.LookupAndPin(p_low, p_low.size(), false);
+    REQUIRE(hard_pin.found());
+    now_ms += 20'000;  // expire both soft leases
+
+    // Inserting 100B must respect hard_pin on 0-value p_low and evict unpinned p_high instead!
+    RadixCacheEntry new_entry;
+    new_entry.state_blob.assign(100, 0x33);
+    new_entry.session_key = "s-new";
+    REQUIRE(cache.Insert(p_new, std::move(new_entry)));
+    CHECK(cache.used_bytes() == 200u);
+    CHECK(cache.pinned_bytes() == 100u);
+    CHECK(cache.LookupLongestPrefix(p_low, p_low.size(), false).found());
+    CHECK_FALSE(cache.LookupLongestPrefix(p_high, p_high.size(), false).found());
+    CHECK(cache.LookupLongestPrefix(p_new, p_new.size(), false).found());
+    CHECK(cache.CheckInvariants());
+
+    // Shrink max_bytes while p_low is pinned -> evicts unpinned p_new immediately, keeps pinned p_low;
+    // releasing hard_pin then evicts p_low cleanly down to <= max_bytes.
+    cache.SetMaxBytes(50);
+    CHECK(cache.used_bytes() == 100u);  // only hard-pinned p_low remains
+    CHECK(cache.entry_count() == 1u);
+    CHECK(cache.CheckInvariants());
+    hard_pin.Release();
+    CHECK(cache.used_bytes() == 0u);
+    CHECK(cache.metadata_overhead_bytes() == 0u);
+    CHECK(cache.retained_bytes() == 0u);
+    CHECK(cache.entry_count() == 0u);
+    CHECK(cache.pinned_entries() == 0u);
+    CHECK(cache.active_soft_leases() == 0u);
+    CHECK(cache.CheckInvariants());
+
+    // 2. Randomized multi-session stress with advancing clock, soft leases, hard pins,
+    //    overwrites, Erase, ErasePrefix, SetMaxBytes, and ObserveRestore.
+    cache.SetMaxBytes(512);
+    const std::array<std::string, 4> sessions{"", "sess-A", "sess-B", "sess-C"};
+    std::uint64_t rng = 0xC0FFEE123456789BULL;
+    auto next_u64 = [&]() -> std::uint64_t {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        return rng;
+    };
+    auto gen_prefix = [&]() -> std::vector<Token> {
+        const std::size_t len = 1u + static_cast<std::size_t>(next_u64() % 5u);
+        std::vector<Token> out;
+        out.reserve(len);
+        for (std::size_t i = 0; i < len; ++i) {
+            out.push_back(static_cast<Token>(1 + (next_u64() % 3u)));
+        }
+        return out;
+    };
+
+    std::vector<PinnedRadixLookup> pins;
+    for (int step = 0; step < 800; ++step) {
+        now_ms += static_cast<std::uint64_t>(next_u64() % 2'500u);
+        const std::uint64_t op = next_u64() % 100u;
+        const std::vector<Token> pref = gen_prefix();
+        const std::string& sid = sessions[static_cast<std::size_t>(next_u64() % sessions.size())];
+
+        if (op < 40u) {
+            RadixCacheEntry e;
+            e.state_blob.assign(24u + static_cast<std::size_t>(next_u64() % 160u),
+                                static_cast<std::uint8_t>(step & 0xFF));
+            e.session_key = sid;
+            e.soft_lease_ttl_ms = static_cast<std::uint64_t>(1'000u + (next_u64() % 12'000u));
+            (void)cache.Insert(pref, std::move(e));
+        } else if (op < 55u) {
+            auto pin = cache.LookupAndPin(pref, pref.size(), (next_u64() & 1u) != 0u, sid);
+            if (pin.found()) {
+                if ((next_u64() & 1u) != 0u) {
+                    cache.ObserveRestore(pin, pin.entry()->ByteSize(),
+                                         0.5 + static_cast<double>(next_u64() % 10u));
+                }
+                if (pins.size() < 3u) {
+                    pins.push_back(std::move(pin));
+                }
+            }
+        } else if (op < 65u) {
+            if (!pins.empty()) pins.pop_back();
+        } else if (op < 75u) {
+            (void)cache.Erase(pref);
+        } else if (op < 83u) {
+            (void)cache.ErasePrefix(pref);
+        } else if (op < 90u) {
+            (void)cache.PurgeExpiredSoftLeases();
+        } else if (op < 95u) {
+            (void)cache.RefreshSoftLease(pref, sid);
+        } else {
+            cache.SetMaxBytes(128u + static_cast<std::size_t>(next_u64() % 512u));
+        }
+        REQUIRE(cache.CheckInvariants());
+    }
+    pins.clear();
+    CHECK(cache.pinned_entries() == 0u);
+    CHECK(cache.retired_pinned_bytes() == 0u);
+    CHECK(cache.used_bytes() <= cache.max_bytes());
+    CHECK(cache.CheckInvariants());
+}
