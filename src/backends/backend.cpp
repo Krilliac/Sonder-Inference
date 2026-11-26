@@ -389,6 +389,7 @@ Result<GenerateStats> BackendModel::chat(const ChatRequest& request, const Cance
     g.priority_class = request.priority_class;
     g.target_ttft_ms = request.target_ttft_ms;
     g.target_itl_ms = request.target_itl_ms;
+    g.enable_stage_profiling = request.enable_stage_profiling;
     return generate(g, cancel, on_chunk);
 }
 
@@ -460,6 +461,12 @@ json::Object to_json(const BackendRuntimeStatus& status) {
     if (status.child) out.set("child", *status.child);
     if (status.stall) out.set("stall", *status.stall);
     if (status.diagnostics) out.set("diagnostics", *status.diagnostics);
+    if (!status.capability_statuses.empty()) {
+        out.set("capability_statuses", to_json_capability_statuses(status.capability_statuses));
+    }
+    if (status.effective_execution) {
+        out.set("effective_execution", to_json(*status.effective_execution));
+    }
     return out;
 }
 

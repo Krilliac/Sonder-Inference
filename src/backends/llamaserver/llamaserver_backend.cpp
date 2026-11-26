@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -180,12 +181,97 @@ void record_speculation_observation(llamaserver::AdaptiveSpeculationPolicy *poli
     policy->observe(obs);
 }
 
+std::string path_basename_only(std::string_view path) {
+    const std::size_t slash = path.find_last_of("/\\");
+    return std::string(slash == std::string_view::npos ? path : path.substr(slash + 1));
+}
+
+struct ParsedUpstreamSpecConfig {
+    bool has_spec_flag = false;
+    std::string configured_method;
+    std::optional<std::uint32_t> configured_draft_limit;
+    std::string draft_identity;
+};
+
+ParsedUpstreamSpecConfig parse_upstream_spec_config(const LlamaServerBackendOptions &options) {
+    ParsedUpstreamSpecConfig out;
+    if (!options.native_completion) {
+        out.configured_method = "none";
+        return out;
+    }
+    const auto &args = options.args;
+    const auto take_value = [&args](std::size_t &idx) -> std::string_view {
+        const std::string &raw = args[idx];
+        const std::size_t eq = raw.find('=');
+        if (eq != std::string::npos) {
+            return std::string_view(raw).substr(eq + 1);
+        }
+        if (idx + 1 < args.size()) {
+            return args[++idx];
+        }
+        return {};
+    };
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string_view raw = args[i];
+        const std::size_t eq = raw.find('=');
+        const std::string_view flag = eq == std::string_view::npos ? raw : raw.substr(0, eq);
+        if (flag == "--spec-type") {
+            const std::string_view val = take_value(i);
+            if (!val.empty()) {
+                out.has_spec_flag = true;
+                out.configured_method = std::string(val);
+            }
+        } else if (flag == "--model-draft" || flag == "-md") {
+            const std::string_view val = take_value(i);
+            if (!val.empty()) {
+                out.has_spec_flag = true;
+                out.draft_identity = path_basename_only(val);
+                if (out.configured_method.empty()) {
+                    out.configured_method = "draft-model";
+                }
+            }
+        } else if (flag == "--draft" || flag == "--draft-max") {
+            const std::string_view val = take_value(i);
+            std::uint32_t parsed = 0;
+            const auto res = std::from_chars(val.data(), val.data() + val.size(), parsed);
+            if (res.ec == std::errc{} && res.ptr == val.data() + val.size()) {
+                out.has_spec_flag = true;
+                out.configured_draft_limit = parsed;
+            }
+        } else if (flag == "--lookup-cache-static" || flag == "--lookup-cache-dynamic") {
+            (void)take_value(i);
+            out.has_spec_flag = true;
+            if (out.configured_method.empty()) {
+                out.configured_method = "ngram-cache";
+            }
+        } else if (flag == "--spec-ngram-size-n") {
+            (void)take_value(i);
+            out.has_spec_flag = true;
+            if (out.configured_method.empty()) {
+                out.configured_method = "ngram";
+            }
+        }
+    }
+    if (options.adaptive_speculation.enabled) {
+        out.has_spec_flag = true;
+        if (out.configured_method.empty()) {
+            out.configured_method = "adaptive";
+        }
+        if (!out.configured_draft_limit.has_value()) {
+            out.configured_draft_limit = options.adaptive_speculation.initial_draft_n;
+        }
+    }
+    return out;
+}
+
 class LlamaServerModel;
 class LlamaServerBackendImpl final : public LlamaServerBackend,
                                      public std::enable_shared_from_this<LlamaServerBackendImpl> {
   public:
     explicit LlamaServerBackendImpl(LlamaServerBackendOptions options)
-        : options_(std::move(options)), validation_(llamaserver::validate_backend_options(options_)) {
+        : options_(std::move(options)),
+          validation_(llamaserver::validate_backend_options(options_)),
+          parsed_spec_(parse_upstream_spec_config(options_)) {
         if (validation_.ok() && options_.adaptive_speculation.enabled && options_.native_completion) {
             adaptive_spec_ = std::make_unique<llamaserver::AdaptiveSpeculationPolicy>(
                 llamaserver::to_adaptive_speculation_config(options_.adaptive_speculation));
@@ -262,6 +348,123 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         if (options_.native_completion)
             c.add(Capability::speculative_decode).add(Capability::prefix_reuse);
         return c;
+    }
+    std::vector<CapabilityStatusEntry> capability_statuses() const override {
+        std::vector<CapabilityStatusEntry> out;
+        {
+            CapabilityStatus s;
+            s.adapter_supports = capability_state_from_bool(options_.native_completion);
+            s.build_supports = CapabilityState::unknown;  // external executable capability is not proven by adapter
+            if (!options_.native_completion) {
+                s.configured = CapabilityState::no;
+                s.observed_active = CapabilityState::no;
+                s.note = "generic_openai_mode";
+            } else {
+                if (parsed_spec_.has_spec_flag) {
+                    s.configured = CapabilityState::yes;
+                } else if (options_.mode == LlamaServerMode::spawn) {
+                    s.configured = CapabilityState::no;
+                } else {
+                    s.configured = CapabilityState::unknown;
+                }
+                s.observed_active =
+                    observed_speculation_active_.load(std::memory_order_relaxed) ? CapabilityState::yes
+                                                                                 : CapabilityState::unknown;
+                s.note = "delegated_upstream";
+            }
+            s.qualified_beneficial = CapabilityState::unknown;
+            out.emplace_back("speculative_decode", std::move(s));
+        }
+        {
+            CapabilityStatus s;
+            s.adapter_supports = capability_state_from_bool(options_.native_completion);
+            s.build_supports = CapabilityState::unknown;
+            s.configured = capability_state_from_bool(options_.native_completion);
+            if (!options_.native_completion) {
+                s.observed_active = CapabilityState::no;
+                s.note = "generic_openai_mode";
+            } else {
+                s.observed_active =
+                    observed_prefix_reuse_.load(std::memory_order_relaxed) ? CapabilityState::yes
+                                                                           : CapabilityState::unknown;
+                s.note = "delegated_upstream";
+            }
+            s.qualified_beneficial = CapabilityState::unknown;
+            out.emplace_back("prefix_reuse", std::move(s));
+        }
+        {
+            CapabilityStatus s;
+            s.adapter_supports = CapabilityState::no;
+            s.build_supports = CapabilityState::unknown;
+            s.configured = CapabilityState::unknown;
+            s.observed_active = CapabilityState::unknown;
+            s.qualified_beneficial = CapabilityState::unknown;
+            s.note = "upstream_owned";
+            out.emplace_back("host_l2_cache", std::move(s));
+        }
+        {
+            const bool grammar_ok = options_.upstream_grammar || !options_.grammar.empty();
+            CapabilityStatus s;
+            s.adapter_supports = capability_state_from_bool(grammar_ok);
+            s.build_supports = grammar_ok ? CapabilityState::unknown : CapabilityState::no;
+            s.configured = capability_state_from_bool(!options_.grammar.empty() || grammar_ok);
+            s.observed_active = grammar_ok ? CapabilityState::unknown : CapabilityState::no;
+            s.qualified_beneficial = CapabilityState::unknown;
+            s.note = "delegated_upstream";
+            out.emplace_back("structured_output", std::move(s));
+        }
+        for (const char *cap_name : {"embeddings", "tool_calling", "multimodal", "logprobs"}) {
+            CapabilityStatus s;
+            s.adapter_supports = CapabilityState::yes;
+            s.build_supports = CapabilityState::unknown;
+            s.configured = CapabilityState::unknown;
+            s.observed_active = CapabilityState::unknown;
+            s.qualified_beneficial = CapabilityState::unknown;
+            s.note = "delegated_upstream";
+            out.emplace_back(cap_name, std::move(s));
+        }
+        {
+            CapabilityStatus s;
+            s.adapter_supports = CapabilityState::no;
+            s.build_supports = CapabilityState::no;
+            s.configured = CapabilityState::no;
+            s.observed_active = CapabilityState::no;
+            s.qualified_beneficial = CapabilityState::unknown;
+            out.emplace_back("recurrent_checkpoint", std::move(s));
+        }
+        return out;
+    }
+    const ParsedUpstreamSpecConfig &parsed_spec_config() const noexcept { return parsed_spec_; }
+    void record_execution_observation(const EffectiveExecutionReport &report) {
+        if (report.speculation_observed_active == CapabilityState::yes) {
+            observed_speculation_active_.store(true, std::memory_order_relaxed);
+        }
+        if (report.cache.device_prefix_reused_tokens.has_value() && *report.cache.device_prefix_reused_tokens > 0u) {
+            observed_prefix_reuse_.store(true, std::memory_order_relaxed);
+        }
+        std::lock_guard<std::mutex> lock(exec_report_mutex_);
+        last_execution_report_ = bound_effective_execution_report(report);
+    }
+    EffectiveExecutionReport snapshot_effective_execution() const {
+        {
+            std::lock_guard<std::mutex> lock(exec_report_mutex_);
+            if (last_execution_report_.has_value()) {
+                return *last_execution_report_;
+            }
+        }
+        EffectiveExecutionReport eff;
+        if (!options_.native_completion) {
+            eff.configured_spec_method = "none";
+            eff.effective_spec_method = "none";
+            eff.fallback_reason = std::string(kSpecReasonNotSupported);
+            eff.speculation_observed_active = CapabilityState::no;
+        } else {
+            eff.configured_spec_method = parsed_spec_.configured_method;
+            eff.configured_draft_limit = parsed_spec_.configured_draft_limit;
+            eff.draft_identity = parsed_spec_.draft_identity;
+            eff.speculation_observed_active = CapabilityState::unknown;
+        }
+        return bound_effective_execution_report(std::move(eff));
     }
     // /props is fetched during model discovery and cached per upstream
     // instance.  Admission may use this snapshot without issuing network I/O
@@ -350,6 +553,8 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             const auto warnings = warmup_->warnings();
             status.warnings.insert(status.warnings.end(), warnings.begin(), warnings.end());
         }
+        status.capability_statuses = capability_statuses();
+        status.effective_execution = snapshot_effective_execution();
         return status;
     }
 
@@ -608,7 +813,88 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
     mutable std::mutex stall_mutex_;
     std::uint64_t stall_events_ = 0;
     BackendWarning stall_warning_;
+    ParsedUpstreamSpecConfig parsed_spec_;
+    std::atomic<bool> observed_speculation_active_{false};
+    std::atomic<bool> observed_prefix_reuse_{false};
+    mutable std::mutex exec_report_mutex_;
+    std::optional<EffectiveExecutionReport> last_execution_report_;
 };
+
+void populate_llamaserver_effective_execution(LlamaServerBackendImpl &backend,
+                                              const std::string &target_model,
+                                              bool has_spec_decision,
+                                              const llamaserver::SpeculationDecision &spec_decision,
+                                              bool enable_stage_profiling,
+                                              GenerateStats &stats) {
+    const auto &opts = backend.options();
+    const auto &parsed = backend.parsed_spec_config();
+    EffectiveExecutionReport eff;
+    eff.target_identity = target_model;
+    eff.draft_identity = parsed.draft_identity;
+    eff.configured_spec_method = parsed.configured_method;
+    eff.configured_draft_limit = parsed.configured_draft_limit;
+
+    if (!opts.native_completion) {
+        eff.configured_spec_method = "none";
+        eff.effective_spec_method = "none";
+        eff.configured_draft_limit = 0u;
+        eff.effective_draft_limit = 0u;
+        eff.fallback_reason = std::string(kSpecReasonNotSupported);
+        eff.speculation_observed_active = CapabilityState::no;
+    } else if (has_spec_decision) {
+        eff.effective_draft_limit = spec_decision.draft_n_max;
+        if (spec_decision.is_baseline_probe && spec_decision.draft_n_max == 0u) {
+            eff.effective_spec_method = "none";
+            eff.fallback_reason = "baseline_calibration_probe";
+        } else if (!spec_decision.is_probe && spec_decision.draft_n_max == 0u) {
+            eff.effective_spec_method = "none";
+            eff.fallback_reason = std::string(kSpecReasonDisabledByPolicy);
+        } else {
+            eff.effective_spec_method =
+                parsed.configured_method.empty() ? std::string("adaptive") : parsed.configured_method;
+        }
+    } else if (parsed.has_spec_flag) {
+        eff.effective_spec_method = parsed.configured_method;
+        eff.effective_draft_limit = parsed.configured_draft_limit;
+    }
+
+    if (stats.token_counts_from_backend || stats.completion_tokens > 0u) {
+        eff.committed_tokens = stats.completion_tokens;
+    }
+    eff.proposed_draft_tokens = stats.draft_tokens;
+    eff.accepted_draft_tokens = stats.draft_accepted_tokens;
+    if (opts.native_completion) {
+        if (stats.draft_tokens.has_value()) {
+            eff.speculation_observed_active =
+                (*stats.draft_tokens > 0u) ? CapabilityState::yes : CapabilityState::no;
+        } else {
+            eff.speculation_observed_active = CapabilityState::unknown;
+        }
+    }
+
+    // Physical device prefix reuse when reported by upstream (`cache_n` / `cached_tokens`);
+    // host L2 restore is not separately reported by llama-server and remains explicitly unknown.
+    eff.cache.device_prefix_reused_tokens = stats.cached_tokens;
+    eff.cache.host_l2_restored_tokens = std::nullopt;
+    eff.cache.host_l2_restore_ms = std::nullopt;
+
+    EffectiveExecutionReport bounded = bound_effective_execution_report(std::move(eff));
+    backend.record_execution_observation(bounded);
+    stats.effective_execution = std::move(bounded);
+
+    if (enable_stage_profiling) {
+        StageTimings st;
+        st.enabled = true;
+        if (stats.backend_timings && stats.backend_timings->prompt_ms.has_value()) {
+            st.prefill_ms = stats.backend_timings->prompt_ms;
+        } else if (stats.prompt_eval_ns > 0u) {
+            st.prefill_ms = static_cast<double>(stats.prompt_eval_ns) / 1e6;
+        }
+        // Remote upstream phases (cache_lookup, l2_restore, draft, verify,
+        // rollback, sampling) are not separately observable and stay nullopt.
+        stats.stage_timings = std::move(st);
+    }
+}
 
 class LlamaServerModel final : public BackendModel {
   public:
@@ -663,13 +949,17 @@ class LlamaServerModel final : public BackendModel {
         auto result = backend_->stream(native ? "/completion" : "/v1/completions", body.dump(), cancel,
                                        timed_callback ? timed_callback : callback, false);
         const auto stream_end = std::chrono::steady_clock::now();
-        if (result.ok() && has_spec_decision) {
-            const double decode_span_ms =
-                saw_first_token
-                    ? std::chrono::duration<double, std::milli>(stream_end - first_token_at).count()
-                    : 0.0;
-            record_speculation_observation(policy, result.value(), spec_key, spec_decision, decode_span_ms,
-                                           probe_guard);
+        if (result.ok()) {
+            if (has_spec_decision) {
+                const double decode_span_ms =
+                    saw_first_token
+                        ? std::chrono::duration<double, std::milli>(stream_end - first_token_at).count()
+                        : 0.0;
+                record_speculation_observation(policy, result.value(), spec_key, spec_decision, decode_span_ms,
+                                               probe_guard);
+            }
+            populate_llamaserver_effective_execution(*backend_, descriptor_.name, has_spec_decision, spec_decision,
+                                                     request.enable_stage_profiling, result.value());
         }
         return result;
     }
@@ -723,13 +1013,17 @@ class LlamaServerModel final : public BackendModel {
                                        timed_callback ? timed_callback : callback, true,
                                        request.separate_reasoning, tools_requested);
         const auto stream_end = std::chrono::steady_clock::now();
-        if (result.ok() && has_spec_decision) {
-            const double decode_span_ms =
-                saw_first_token
-                    ? std::chrono::duration<double, std::milli>(stream_end - first_token_at).count()
-                    : 0.0;
-            record_speculation_observation(policy, result.value(), spec_key, spec_decision, decode_span_ms,
-                                           probe_guard);
+        if (result.ok()) {
+            if (has_spec_decision) {
+                const double decode_span_ms =
+                    saw_first_token
+                        ? std::chrono::duration<double, std::milli>(stream_end - first_token_at).count()
+                        : 0.0;
+                record_speculation_observation(policy, result.value(), spec_key, spec_decision, decode_span_ms,
+                                               probe_guard);
+            }
+            populate_llamaserver_effective_execution(*backend_, descriptor_.name, has_spec_decision, spec_decision,
+                                                     request.enable_stage_profiling, result.value());
         }
         return result;
     }

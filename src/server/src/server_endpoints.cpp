@@ -423,6 +423,7 @@ json::Object build_residency_summary(const ServerOptions& opts, const ModelResid
 }
 
 json::Object build_health_body(const HealthSnapshot& s) {
+    const std::optional<BackendRuntimeStatus> runtime = s.backend ? s.backend->runtime_status() : std::nullopt;
     json::Array backends;
     if (s.backend) {
         json::Array caps;
@@ -436,7 +437,7 @@ json::Object build_health_body(const HealthSnapshot& s) {
         }
         // Additive: only backends that report runtime observations
         // (e.g. a spawned llama-server) get this field.
-        if (const auto runtime = s.backend->runtime_status()) {
+        if (runtime) {
             entry.set("runtime", to_json(*runtime));
         }
         backends.emplace_back(std::move(entry));
@@ -481,6 +482,7 @@ json::Object build_health_body(const HealthSnapshot& s) {
                                        {"bypassed_oversize", s.grammar_cache.bypassed_oversize},
                                        {"compile_failures", s.grammar_cache.compile_failures}}},
         {"capabilities", server_capabilities(s.backend, s.opts)},
+        {"diagnostics", effective_execution_diagnostics(s.backend, s.opts, runtime)},
         {"sonder", health_features(s.backend, s.opts, sonder_meta())}};
 }
 

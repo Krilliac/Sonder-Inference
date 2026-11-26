@@ -138,6 +138,79 @@ json::Object server_capabilities(const std::shared_ptr<Backend>& backend, const 
         }}};
 }
 
+json::Object capability_status_matrix(const std::shared_ptr<Backend>& backend, const ServerOptions& options,
+                                      const std::optional<BackendRuntimeStatus>& runtime) {
+    (void)options;
+    const BackendCapabilities bc = backend ? backend->capabilities() : BackendCapabilities{};
+    std::vector<CapabilityStatusEntry> merged;
+    if (backend) {
+        merged = backend->capability_statuses();
+    }
+    if (merged.empty() && runtime && !runtime->capability_statuses.empty()) {
+        merged = runtime->capability_statuses;
+    }
+
+    auto has_entry = [&](std::string_view name) {
+        for (const auto& entry : merged) {
+            if (entry.first == name) {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto ensure_from_flag = [&](const char* name, bool supported, const char* unsupported_note = nullptr) {
+        if (has_entry(name)) {
+            return;
+        }
+        CapabilityStatus st;
+        st.adapter_supports = capability_state_from_bool(supported);
+        st.build_supports = supported ? CapabilityState::unknown : CapabilityState::no;
+        st.configured = supported ? CapabilityState::unknown : CapabilityState::no;
+        st.observed_active = supported ? CapabilityState::unknown : CapabilityState::no;
+        st.qualified_beneficial = CapabilityState::unknown;
+        if (!supported && unsupported_note != nullptr) {
+            st.note = unsupported_note;
+        }
+        merged.emplace_back(name, std::move(st));
+    };
+
+    ensure_from_flag("speculative_decode", bc.has(Capability::speculative_decode), "not_supported");
+    ensure_from_flag("prefix_reuse", bc.has(Capability::prefix_reuse), "not_supported");
+    if (!has_entry("host_l2_cache")) {
+        CapabilityStatus l2;
+        l2.adapter_supports = CapabilityState::no;
+        l2.build_supports = CapabilityState::no;
+        l2.configured = CapabilityState::no;
+        l2.observed_active = CapabilityState::no;
+        l2.qualified_beneficial = CapabilityState::unknown;
+        merged.emplace_back("host_l2_cache", std::move(l2));
+    }
+    ensure_from_flag("continuous_batch_decode", bc.has(Capability::continuous_batch_decode), "not_supported");
+    ensure_from_flag("structured_output", bc.has(Capability::structured_output), "not_supported");
+    ensure_from_flag("multimodal", bc.has(Capability::multimodal), "not_supported");
+    ensure_from_flag("logprobs", bc.has(Capability::logprobs), "not_supported");
+    ensure_from_flag("embeddings", bc.has(Capability::embeddings), "not_supported");
+    ensure_from_flag("tool_calling", bc.has(Capability::tool_calling), "not_supported");
+    ensure_from_flag("recurrent_checkpoint", bc.has(Capability::recurrent_checkpoint), "not_supported");
+
+    return to_json_capability_statuses(merged);
+}
+
+json::Object effective_execution_diagnostics(const std::shared_ptr<Backend>& backend, const ServerOptions& options,
+                                             const std::optional<BackendRuntimeStatus>& runtime) {
+    EffectiveExecutionReport report;
+    if (runtime && runtime->effective_execution) {
+        report = *runtime->effective_execution;
+    } else if (backend && !backend->capabilities().has(Capability::speculative_decode)) {
+        report.configured_spec_method = "none";
+        report.effective_spec_method = "none";
+        report.fallback_reason = std::string(kSpecReasonNotSupported);
+        report.speculation_observed_active = CapabilityState::no;
+    }
+    return json::Object{{"capability_status", capability_status_matrix(backend, options, runtime)},
+                        {"effective_execution", to_json(report)}};
+}
+
 json::Array gpu_inventory_json(const std::vector<GpuDeviceInfo>& gpus) {
     json::Array list;
     list.reserve(gpus.size());

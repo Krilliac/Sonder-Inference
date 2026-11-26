@@ -579,11 +579,15 @@ struct LlamaCppBackend::Impl {
 #endif
 
     // Resolved in-process speculative decoding state.
+    SpeculativeType requested_spec = SpeculativeType::kNone;
     SpeculativeType active_spec = SpeculativeType::kNone;
     std::int32_t active_draft_max = 0;
     SpeculativeVerificationMode requested_spec_verification_mode = SpeculativeVerificationMode::TargetMatch;
     SpeculativeVerificationMode effective_spec_verification_mode = SpeculativeVerificationMode::TargetMatch;
     sonder::inference::SpeculativeVerifier spec_verifier{};
+    std::string load_spec_fallback_reason;
+    std::string load_draft_identity;
+    bool mtp_model_supported = false;
     NgramMatcher ngram_matcher{false};
     std::unique_ptr<NgramModTable> ngram_mod;
     std::unique_ptr<SuffixMatcher> suffix_matcher;
@@ -898,12 +902,16 @@ struct LlamaCppBackend::Impl {
         spec_ckpt_buf.clear();
         spec_ckpt_size = 0;
         slot_clock = 0;
+        requested_spec = SpeculativeType::kNone;
         active_spec = SpeculativeType::kNone;
         active_draft_max = 0;
         requested_spec_verification_mode = SpeculativeVerificationMode::TargetMatch;
         effective_spec_verification_mode = SpeculativeVerificationMode::TargetMatch;
         spec_verifier.set_mode(SpeculativeVerificationMode::TargetMatch);
         spec_verifier.reset_metrics();
+        load_spec_fallback_reason.clear();
+        load_draft_identity.clear();
+        mtp_model_supported = false;
         ngram_mod.reset();
         suffix_matcher.reset();
         step_cost_estimator.Reset();
@@ -2395,12 +2403,17 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
         // Resolve speculative decoding strategy.
         SpeculativeType requested_spec = SpeculativeType::kNone;
         (void)ParseSpeculativeType(options.spec_type, requested_spec);
+        impl_->requested_spec = requested_spec;
         impl_->active_spec = SpeculativeType::kNone;
+        impl_->load_spec_fallback_reason.clear();
+        impl_->load_draft_identity.clear();
+        impl_->mtp_model_supported = false;
 
         if (requested_spec == SpeculativeType::kDraftMtp || requested_spec == SpeculativeType::kAuto) {
 #if defined(SONDER_LLAMACPP_HAS_MTP)
             const int32_t n_nextn = llama_model_n_layer_nextn(model);
             if (n_nextn > 0) {
+                impl_->mtp_model_supported = true;
                 if (impl_->InitMtp(options, n_nextn)) {
                     impl_->active_spec = SpeculativeType::kDraftMtp;
                 } else if (requested_spec == SpeculativeType::kDraftMtp) {
@@ -2411,6 +2424,9 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
 #endif
             if (impl_->active_spec == SpeculativeType::kNone && requested_spec == SpeculativeType::kAuto) {
                 impl_->active_spec = SpeculativeType::kNgramMod;
+                impl_->load_spec_fallback_reason = "auto_fallback_ngram_mod";
+            } else if (impl_->active_spec == SpeculativeType::kNone && requested_spec == SpeculativeType::kDraftMtp) {
+                impl_->load_spec_fallback_reason = "not_supported";
             }
         } else {
             impl_->active_spec = requested_spec;
@@ -2426,9 +2442,11 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
             // Hybrid draft-mtp + suffix escalation maintains a bounded zero-VRAM
             // SuffixMatcher alongside MTP to burst 6..16 tokens on verbatim matches.
             impl_->suffix_matcher = std::make_unique<SuffixMatcher>();
+            impl_->load_draft_identity = "mtp:native+suffix";
         } else if (impl_->active_spec == SpeculativeType::kSuffix) {
             impl_->active_draft_max = options.spec_draft_max > 0 ? options.spec_draft_max : kDefaultSuffixDraftMax;
             impl_->suffix_matcher = std::make_unique<SuffixMatcher>();
+            impl_->load_draft_identity = "suffix";
         } else if (impl_->active_spec == SpeculativeType::kNgramMod) {
             impl_->active_draft_max = options.spec_draft_max > 0 ? options.spec_draft_max : kDefaultNgramModDraftMax;
             const std::size_t min_draft =
@@ -2439,9 +2457,11 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
             impl_->ngram_mod = std::make_unique<NgramModTable>(NgramModTable::kDefaultMatchLen,
                                                                NgramModTable::kDefaultTableSize, min_draft,
                                                                static_cast<std::size_t>(impl_->active_draft_max));
+            impl_->load_draft_identity = "ngram-mod";
         } else if (impl_->active_spec == SpeculativeType::kNgram) {
             impl_->active_draft_max = options.spec_draft_max > 0 ? options.spec_draft_max : kDefaultNgramDraftMax;
             impl_->ngram_matcher = NgramMatcher(/*exact_scan_fallback=*/true);
+            impl_->load_draft_identity = "ngram";
         } else {
             impl_->active_draft_max = 0;
         }
@@ -2476,6 +2496,22 @@ void LlamaCppBackend::Unload() noexcept {
     }
 }
 
+bool LlamaCppBackend::HasMtpBuildSupport() noexcept {
+#if defined(SONDER_LLAMACPP_HAS_MTP)
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool LlamaCppBackend::HasMtmdBuildSupport() noexcept {
+#if defined(SONDER_LLAMACPP_HAS_MTMD)
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool LlamaCppBackend::IsLoaded() const noexcept { return impl_ && impl_->model != nullptr; }
 
 bool LlamaCppBackend::HasMmproj() const noexcept {
@@ -2508,6 +2544,25 @@ ModelInfo LlamaCppBackend::GetModelInfo() const {
     info.n_vocab = llama_vocab_n_tokens(impl_->vocab);
     info.n_ctx = Impl::EffectiveCtxSeq(impl_->ctx);
     info.architecture = impl_->architecture;
+    return info;
+}
+
+SpeculativeLoadInfo LlamaCppBackend::GetSpeculativeInfo() const {
+    SpeculativeLoadInfo info;
+    info.mtp_build_supported = HasMtpBuildSupport();
+    if (!IsLoaded()) return info;
+    info.configured_method = std::string(ToString(impl_->requested_spec));
+    info.effective_method = std::string(ToString(impl_->active_spec));
+    if (impl_->active_spec == SpeculativeType::kDraftMtp && impl_->suffix_matcher != nullptr) {
+        info.effective_method = "draft-mtp+suffix";
+    }
+    info.configured_draft_max =
+        impl_->options.spec_draft_max > 0 ? impl_->options.spec_draft_max : impl_->active_draft_max;
+    info.effective_draft_max = impl_->active_draft_max;
+    info.fallback_reason = impl_->load_spec_fallback_reason;
+    info.draft_identity = impl_->load_draft_identity;
+    info.mtp_model_supported = impl_->mtp_model_supported;
+    info.l2_cache_enabled = impl_->radix_cache.enabled();
     return info;
 }
 
@@ -2967,6 +3022,13 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         return result;
     };
 
+    const bool stage_prof = request.enable_stage_profiling;
+    result.stage_timings.enabled = stage_prof;
+    auto add_stage_ms = [](std::optional<double>& slot, double ms) noexcept {
+        if (!std::isfinite(ms) || ms < 0.0) return;
+        slot = slot.has_value() ? (*slot + ms) : ms;
+    };
+
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
     llama_memory_t mem = llama_get_memory(ctx);
     const auto n_ctx = static_cast<int64_t>(EffectiveCtxSeq(ctx));
@@ -3052,6 +3114,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
             result.restore_status = std::move(rst);
         }
     } else if (options.prefix_cache && request.reset_context && !has_capture && !slots.empty()) {
+        const Clock::time_point lookup_start = stage_prof ? Clock::now() : Clock::time_point{};
         const SlotSelection sel = SelectPrefixSlot(slots, request.prompt, request.session_key);
         slot_idx = sel.slot_index;
         slot_id = static_cast<llama_seq_id>(slots[slot_idx].id);
@@ -3063,6 +3126,9 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         const std::size_t prev_slot_len = slots[slot_idx].tokens.size();
 #endif
         lcp = std::min(lcp, kv_len);
+        if (stage_prof) {
+            add_stage_ms(result.stage_timings.cache_lookup_ms, MsSince(lookup_start));
+        }
 
         // Snapshot an evicted/diverged VRAM slot into the L2 Radix host-RAM
         // cache BEFORE overwriting or looking up L2 (prevents dangling pointers).
@@ -3077,10 +3143,18 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         bool l2_wiped = false;
         if (radix_cache.enabled() && request.prompt.size() > 1 && request.prompt.size() - 1 > lcp &&
             (request.prompt.size() - 1 - lcp) >= kMinL2RestoreGainTokens) {
+            const auto l2_start = Clock::now();
             if (TryRestoreSlotFromL2(slot_idx, slot_id, request.prompt, request.session_key, lcp, l2_lcp,
                                      l2_mtp_synced, l2_wiped)) {
+                const double l2_ms = MsSince(l2_start);
                 lcp = l2_lcp;
                 restored_from_l2 = true;
+                result.host_l2_restored_tokens =
+                    static_cast<std::int32_t>(std::min<std::size_t>(l2_lcp, static_cast<std::size_t>(INT32_MAX)));
+                result.host_l2_restore_ms = l2_ms;
+                if (stage_prof) {
+                    add_stage_ms(result.stage_timings.l2_restore_ms, l2_ms);
+                }
                 slots[slot_idx].tokens.assign(request.prompt.begin(),
                                               request.prompt.begin() + static_cast<std::ptrdiff_t>(lcp));
             } else if (l2_wiped) {
@@ -3189,8 +3263,12 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         }
 
         prefill_start_offset = static_cast<int64_t>(lcp);
-        result.cached_tokens = static_cast<std::int32_t>(
-            std::min<std::size_t>(lcp, static_cast<std::size_t>(INT32_MAX)));
+        const std::int32_t reused_i32 =
+            static_cast<std::int32_t>(std::min<std::size_t>(lcp, static_cast<std::size_t>(INT32_MAX)));
+        result.cached_tokens = reused_i32;
+        if (!restored_from_l2) {
+            result.device_prefix_reused_tokens = reused_i32;
+        }
         slots[slot_idx].tokens.resize(lcp);
         slots[slot_idx].session_key = request.session_key;
         slots[slot_idx].last_used = ++slot_clock;
@@ -3266,6 +3344,50 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         }
     }
 
+    // Record configured vs effective speculation strategy and disable/fallback reason.
+    result.configured_spec_method = std::string(ToString(requested_spec));
+    result.configured_draft_limit = options.spec_draft_max > 0 ? options.spec_draft_max : active_draft_max;
+    if (use_mtp) {
+        result.effective_spec_method = use_hybrid_suffix ? "draft-mtp+suffix" : "draft-mtp";
+        result.effective_draft_limit = effective_draft_max;
+        result.draft_identity = use_hybrid_suffix ? "mtp:native+suffix" : "mtp:native";
+        result.spec_fallback_reason = load_spec_fallback_reason;
+    } else if (use_suffix) {
+        result.effective_spec_method = "suffix";
+        result.effective_draft_limit = effective_draft_max;
+        result.draft_identity = "suffix";
+        result.spec_fallback_reason = load_spec_fallback_reason;
+    } else if (use_ngram_mod) {
+        result.effective_spec_method = "ngram-mod";
+        result.effective_draft_limit = effective_draft_max;
+        result.draft_identity = "ngram-mod";
+        result.spec_fallback_reason = load_spec_fallback_reason;
+    } else if (use_ngram_short) {
+        result.effective_spec_method = "ngram";
+        result.effective_draft_limit = effective_draft_max;
+        result.draft_identity = "ngram";
+        result.spec_fallback_reason = load_spec_fallback_reason;
+    } else {
+        result.effective_spec_method = "none";
+        result.effective_draft_limit = 0;
+        if (active_spec != SpeculativeType::kNone) {
+            if (has_media) {
+                result.spec_fallback_reason = "media_exclusive";
+            } else if (architecture == sonder::inference::ModelArchitecture::recurrent) {
+                result.spec_fallback_reason = "recurrent_unsupported";
+            } else if (architecture == sonder::inference::ModelArchitecture::hybrid) {
+                result.spec_fallback_reason = "hybrid_unsupported";
+            } else if (result.state_restored) {
+                result.spec_fallback_reason = "state_restored";
+            } else {
+                result.spec_fallback_reason =
+                    load_spec_fallback_reason.empty() ? "not_supported" : load_spec_fallback_reason;
+            }
+        } else {
+            result.spec_fallback_reason = load_spec_fallback_reason;
+        }
+    }
+
     // Bind GPU backend sampling when supported. Disabled when a grammar,
     // per-token logprobs, or stochastic rejection verification is active so
     // raw logits remain readable on CPU.
@@ -3288,8 +3410,13 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
 #endif
 
     auto sample_target = [&](int32_t idx, TokenLogprobInfo* out_lp = nullptr) -> Token {
-        return SampleTokenAt(idx, request.sampling, sampler.get(), grammar_sampler.get(), target_gpu_sampled, n_vocab,
-                             out_lp);
+        const Clock::time_point t_samp = stage_prof ? Clock::now() : Clock::time_point{};
+        const Token tok = SampleTokenAt(idx, request.sampling, sampler.get(), grammar_sampler.get(), target_gpu_sampled,
+                                        n_vocab, out_lp);
+        if (stage_prof) {
+            add_stage_ms(result.stage_timings.sampling_ms, MsSince(t_samp));
+        }
+        return tok;
     };
 
     bool slot_valid = true;
@@ -3452,6 +3579,9 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
     auto finish = [&](StopReason reason) {
         result.stop_reason = reason;
         result.decode_ms = MsSince(decode_start);
+        if (stage_prof) {
+            result.stage_timings.prefill_ms = result.prefill_ms;
+        }
         if (use_ngram_mod && ngram_mod != nullptr && reason != StopReason::kError) {
             ngram_indexed = ngram_mod->IndexRange(ngram_history, ngram_indexed, ngram_history.size());
         }
@@ -3559,6 +3689,9 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
 
         draft_tokens.clear();
         bool step_used_suffix = false;
+        const bool spec_enabled_step = use_mtp || use_suffix || use_ngram_mod || use_ngram_short;
+        const Clock::time_point draft_start =
+            (stage_prof && spec_enabled_step && max_k > 0) ? Clock::now() : Clock::time_point{};
         if (max_k > 0) {
 #if defined(SONDER_LLAMACPP_HAS_MTP)
             if (use_mtp) {
@@ -3593,6 +3726,10 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                         if (cancelled()) return finish(StopReason::kCancelled);
                         use_mtp = false;
                         use_hybrid_suffix = false;
+                        result.spec_transitioned_during_request = true;
+                        result.effective_spec_method = "none";
+                        result.effective_draft_limit = 0;
+                        result.spec_fallback_reason = "draft_sync_failed";
                         slot_valid = false;
                         if (slot_idx < slots.size()) {
                             slots[slot_idx].tokens.clear();
@@ -3649,6 +3786,9 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                 }
             }
         }
+        if (stage_prof && spec_enabled_step && max_k > 0) {
+            add_stage_ms(result.stage_timings.draft_ms, MsSince(draft_start));
+        }
 
         [[maybe_unused]] bool have_spec_ckpt = false;
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
@@ -3681,7 +3821,12 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                      /*logits=*/true);
         }
 
+        const Clock::time_point verify_start =
+            (stage_prof && !draft_tokens.empty()) ? Clock::now() : Clock::time_point{};
         const int32_t rc = llama_decode(ctx, batch);
+        if (stage_prof && !draft_tokens.empty()) {
+            add_stage_ms(result.stage_timings.verify_ms, MsSince(verify_start));
+        }
         if (rc != 0) {
             bool rolled_back = CheckSwaRollback(slot_idx, mem, slot_id, static_cast<std::uint64_t>(pos)) &&
                                llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
@@ -3768,9 +3913,13 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         result.draft_tokens += static_cast<std::int32_t>(k);
         std::size_t n_accepted = 0;
         const std::span<const std::vector<double>> no_proposal_dists{};
+        const Clock::time_point spec_samp_start = stage_prof ? Clock::now() : Clock::time_point{};
         const bool sample_deadlock = !VerifySpeculativeBatch(
             draft_tokens, no_proposal_dists, request.sampling, sampler.get(), grammar_sampler.get(),
             target_gpu_sampled, n_vocab, verify_rng, accepted_tokens, accepted_lps, n_accepted, result);
+        if (stage_prof) {
+            add_stage_ms(result.stage_timings.sampling_ms, MsSince(spec_samp_start));
+        }
         if (sample_deadlock) {
             invalidate_slot();
             result.status =
@@ -3801,10 +3950,17 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         std::size_t committed_drafts = 0;
 
         auto rollback_rejected = [&](int64_t keep_pos, std::size_t keep_drafts) -> bool {
+            const Clock::time_point rb_start = stage_prof ? Clock::now() : Clock::time_point{};
+            auto finish_rb = [&](bool ok) {
+                if (stage_prof) {
+                    add_stage_ms(result.stage_timings.rollback_ms, MsSince(rb_start));
+                }
+                return ok;
+            };
 #if defined(SONDER_LLAMACPP_HAS_MTP)
             if (use_mtp && !MtpCommitVerified(batch, slot_id, static_cast<int32_t>(keep_drafts))) {
                 invalidate_slot();
-                return false;
+                return finish_rb(false);
             }
 #endif
             const int64_t batch_end_pos = pos + 1 + static_cast<int64_t>(k);
@@ -3819,7 +3975,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                                                                               slot_id, flags);
                         if (read == 0 || !llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1)) {
                             invalidate_slot();
-                            return false;
+                            return finish_rb(false);
                         }
                         BatchClear(batch);
                         BatchAdd(batch, step_base_tok, static_cast<llama_pos>(pos), slot_id, /*logits=*/false);
@@ -3830,19 +3986,19 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                         }
                         if (llama_decode(ctx, batch) != 0) {
                             invalidate_slot();
-                            return false;
+                            return finish_rb(false);
                         }
-                        return true;
+                        return finish_rb(true);
                     }
 #else
                     (void)step_base_tok;
                     (void)keep_drafts;
 #endif
                     invalidate_slot();
-                    return false;
+                    return finish_rb(false);
                 }
             }
-            return true;
+            return finish_rb(true);
         };
 
         for (std::size_t m = 0; m < accepted_tokens.size(); ++m) {
@@ -3965,6 +4121,11 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         }
     };
 
+    auto add_stage_ms = [](std::optional<double>& slot, double ms) noexcept {
+        if (!std::isfinite(ms) || ms < 0.0) return;
+        slot = slot.has_value() ? (*slot + ms) : ms;
+    };
+
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
     llama_memory_t mem = llama_get_memory(ctx);
     const auto n_ctx = static_cast<int64_t>(EffectiveCtxSeq(ctx));
@@ -4065,6 +4226,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                         follower->pos = static_cast<int64_t>(act.clone_prefix_len);
                         follower->result.cached_tokens = static_cast<std::int32_t>(
                             std::min<std::size_t>(act.clone_prefix_len, static_cast<std::size_t>(INT32_MAX)));
+                        follower->result.device_prefix_reused_tokens = follower->result.cached_tokens;
+                        follower->result.device_cross_slot_reused_tokens = follower->result.cached_tokens;
                         if (follower->slot_idx < slot_mtp_synced.size()) {
                             slot_mtp_synced[follower->slot_idx] = false;
                         }
@@ -4090,6 +4253,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                         follower->prefill_offset = 0;
                         follower->pos = 0;
                         follower->result.cached_tokens = 0;
+                        follower->result.device_prefix_reused_tokens = 0;
+                        follower->result.device_cross_slot_reused_tokens = 0;
                         if (follower->slot_idx < slot_mtp_synced.size()) {
                             slot_mtp_synced[follower->slot_idx] = false;
                         }
@@ -4297,6 +4462,9 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         } else {
             s.result.prefill_ms = MsSince(s.prefill_start);
         }
+        if (s.result.stage_timings.enabled) {
+            s.result.stage_timings.prefill_ms = s.result.prefill_ms;
+        }
         if (reason != StopReason::kError) {
             if ((s.ngram_mod_enabled || s.spec_transition.configured_mode() == SlotSpecMode::kNgramMod) &&
                 ngram_mod != nullptr && !s.committed_tokens.empty()) {
@@ -4389,6 +4557,9 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             SnapshotSlotToL2(s->slot_idx, s->slot_id);
         }
 
+        const bool stage_prof = req.enable_stage_profiling;
+        s->result.stage_timings.enabled = stage_prof;
+        const Clock::time_point lookup_start = stage_prof ? Clock::now() : Clock::time_point{};
         // Zero-copy VRAM-to-VRAM shared prefix clone on attention-only unified
         // KV caches: if another slot (active or idle) already holds a materially
         // longer matching prefix in VRAM, share its [0, best_lcp) cells via
@@ -4464,15 +4635,29 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             }
         }
 
+        if (stage_prof) {
+            add_stage_ms(s->result.stage_timings.cache_lookup_ms, MsSince(lookup_start));
+        }
+
         bool restored_from_l2 = cloned_from_vram;
+        bool physically_restored_from_l2 = false;
         std::size_t l2_lcp = 0;
         bool l2_wiped = false;
         if (!restored_from_l2 && options.prefix_cache && radix_cache.enabled() && req.prompt.size() > 1 &&
             req.prompt.size() - 1 > lcp && (req.prompt.size() - 1 - lcp) >= kMinL2RestoreGainTokens) {
+            const auto l2_start = Clock::now();
             if (TryRestoreSlotFromL2(s->slot_idx, s->slot_id, req.prompt, req.session_key, lcp, l2_lcp, l2_mtp_synced,
                                      l2_wiped)) {
+                const double l2_ms = MsSince(l2_start);
                 lcp = l2_lcp;
                 restored_from_l2 = true;
+                physically_restored_from_l2 = true;
+                s->result.host_l2_restored_tokens =
+                    static_cast<std::int32_t>(std::min<std::size_t>(l2_lcp, static_cast<std::size_t>(INT32_MAX)));
+                s->result.host_l2_restore_ms = l2_ms;
+                if (stage_prof) {
+                    add_stage_ms(s->result.stage_timings.l2_restore_ms, l2_ms);
+                }
                 slots[s->slot_idx].tokens.assign(req.prompt.begin(),
                                                  req.prompt.begin() + static_cast<std::ptrdiff_t>(lcp));
             } else if (l2_wiped) {
@@ -4592,8 +4777,15 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 
         s->prefill_offset = lcp;
         s->pos = n_past;
-        s->result.cached_tokens = static_cast<std::int32_t>(
-            std::min<std::size_t>(lcp, static_cast<std::size_t>(INT32_MAX)));
+        const std::int32_t reused_i32 =
+            static_cast<std::int32_t>(std::min<std::size_t>(lcp, static_cast<std::size_t>(INT32_MAX)));
+        s->result.cached_tokens = reused_i32;
+        if (!physically_restored_from_l2) {
+            s->result.device_prefix_reused_tokens = reused_i32;
+            if (cloned_from_vram) {
+                s->result.device_cross_slot_reused_tokens = reused_i32;
+            }
+        }
         slots[s->slot_idx].tokens.resize(lcp);
         slots[s->slot_idx].session_key = req.session_key;
         slots[s->slot_idx].last_used = ++slot_clock;
@@ -4633,6 +4825,44 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         s->spec_transition.Configure(cap);
         sync_slot_flags_from_transition(*s);
         s->adaptive_ctrl.Reset(s->effective_draft_max);
+        s->result.configured_spec_method = std::string(ToString(requested_spec));
+        s->result.configured_draft_limit = options.spec_draft_max > 0 ? options.spec_draft_max : active_draft_max;
+        if (s->mtp_enabled) {
+            s->result.effective_spec_method = s->hybrid_suffix_enabled ? "draft-mtp+suffix" : "draft-mtp";
+            s->result.effective_draft_limit = s->effective_draft_max;
+            s->result.draft_identity = s->hybrid_suffix_enabled ? "mtp:native+suffix" : "mtp:native";
+            s->result.spec_fallback_reason = load_spec_fallback_reason;
+        } else if (s->suffix_enabled) {
+            s->result.effective_spec_method = "suffix";
+            s->result.effective_draft_limit = s->effective_draft_max;
+            s->result.draft_identity = "suffix";
+            s->result.spec_fallback_reason = load_spec_fallback_reason;
+        } else if (s->ngram_mod_enabled) {
+            s->result.effective_spec_method = "ngram-mod";
+            s->result.effective_draft_limit = s->effective_draft_max;
+            s->result.draft_identity = "ngram-mod";
+            s->result.spec_fallback_reason = load_spec_fallback_reason;
+        } else if (s->ngram_short_enabled) {
+            s->result.effective_spec_method = "ngram";
+            s->result.effective_draft_limit = s->effective_draft_max;
+            s->result.draft_identity = "ngram";
+            s->result.spec_fallback_reason = load_spec_fallback_reason;
+        } else {
+            s->result.effective_spec_method = "none";
+            s->result.effective_draft_limit = 0;
+            if (active_spec != SpeculativeType::kNone) {
+                if (architecture == sonder::inference::ModelArchitecture::recurrent) {
+                    s->result.spec_fallback_reason = "recurrent_unsupported";
+                } else if (architecture == sonder::inference::ModelArchitecture::hybrid) {
+                    s->result.spec_fallback_reason = "hybrid_unsupported";
+                } else {
+                    s->result.spec_fallback_reason =
+                        load_spec_fallback_reason.empty() ? "not_supported" : load_spec_fallback_reason;
+                }
+            } else {
+                s->result.spec_fallback_reason = load_spec_fallback_reason;
+            }
+        }
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
         s->want_hybrid_prefix_ckpt = options.prefix_cache &&
                                      architecture == sonder::inference::ModelArchitecture::hybrid && n_prompt >= 512 &&
@@ -4991,6 +5221,28 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                         s.spec_transition.CommitReactivation(dec);
                         sync_slot_flags_from_transition(s);
                         s.adaptive_ctrl.Reset(s.effective_draft_max);
+                        s.result.spec_transitioned_during_request = true;
+                        s.result.effective_draft_limit = s.effective_draft_max;
+                        if (s.mtp_enabled) {
+                            s.result.effective_spec_method = s.hybrid_suffix_enabled ? "draft-mtp+suffix" : "draft-mtp";
+                            s.result.draft_identity = s.hybrid_suffix_enabled ? "mtp:native+suffix" : "mtp:native";
+                            s.result.spec_fallback_reason = load_spec_fallback_reason;
+                        } else if (s.suffix_enabled) {
+                            s.result.effective_spec_method = "suffix";
+                            s.result.draft_identity = "suffix";
+                            s.result.spec_fallback_reason =
+                                (s.spec_transition.configured_mode() == SlotSpecMode::kDraftMtp)
+                                    ? "mtp_drifted_fallback_suffix"
+                                    : load_spec_fallback_reason;
+                        } else if (s.ngram_mod_enabled) {
+                            s.result.effective_spec_method = "ngram-mod";
+                            s.result.draft_identity = "ngram-mod";
+                            s.result.spec_fallback_reason = load_spec_fallback_reason;
+                        } else if (s.ngram_short_enabled) {
+                            s.result.effective_spec_method = "ngram";
+                            s.result.draft_identity = "ngram";
+                            s.result.spec_fallback_reason = load_spec_fallback_reason;
+                        }
                     }
                 }
             } else if (!s.spec_initialized && s.spec_transition.active_mode() != SlotSpecMode::kNone) {
@@ -5015,6 +5267,11 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             bool step_used_suffix = false;
             const BoundedSuffixAutomaton* shared_ring =
                 (suffix_matcher != nullptr) ? &suffix_matcher->session_ring() : nullptr;
+            const bool slot_stage_prof = s.result.stage_timings.enabled;
+            const bool slot_spec_active =
+                s.mtp_enabled || s.suffix_enabled || s.ngram_mod_enabled || s.ngram_short_enabled;
+            const Clock::time_point draft_start =
+                (slot_stage_prof && slot_spec_active && max_k > 0) ? Clock::now() : Clock::time_point{};
 
             if (max_k > 0) {
 #if defined(SONDER_LLAMACPP_HAS_MTP)
@@ -5055,6 +5312,10 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                             s.spec_transition.MarkMtpRuntimeFailure();
                             s.spec_transition.MarkSlotInvalidated();
                             sync_slot_flags_from_transition(s);
+                            s.result.spec_transitioned_during_request = true;
+                            s.result.effective_spec_method = "none";
+                            s.result.effective_draft_limit = 0;
+                            s.result.spec_fallback_reason = "draft_sync_failed";
                             s.slot_valid = false;
                             s.committed_tokens.clear();
                             if (s.slot_idx < slots.size()) {
@@ -5113,6 +5374,9 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     }
                 }
             }
+            if (slot_stage_prof && slot_spec_active && max_k > 0) {
+                add_stage_ms(s.result.stage_timings.draft_ms, MsSince(draft_start));
+            }
 
             [[maybe_unused]] bool have_spec_ckpt = false;
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
@@ -5151,6 +5415,9 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 rc = llama_decode(ctx, batch);
             }
             const double decode_call_ms = MsSince(decode_start);
+            if (slot_stage_prof && !draft_tokens.empty()) {
+                add_stage_ms(s.result.stage_timings.verify_ms, decode_call_ms);
+            }
             batch_abort_fn = nullptr;
             active_cancel = nullptr;
             if (rc != 0) {
@@ -5215,9 +5482,13 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 AdvanceSwaSlot(s.slot_idx, mem, s.slot_id, static_cast<std::uint64_t>(s.pos));
 
                 TokenLogprobInfo step_lp;
+                const Clock::time_point samp_start = slot_stage_prof ? Clock::now() : Clock::time_point{};
                 const Token next_tok = SampleTokenAt(0, req.sampling, s.sampler.get(), s.grammar_sampler.get(),
                                                      s.target_gpu_sampled, n_vocab,
                                                      req.sampling.compute_logprobs ? &step_lp : nullptr);
+                if (slot_stage_prof) {
+                    add_stage_ms(s.result.stage_timings.sampling_ms, MsSince(samp_start));
+                }
                 if (next_tok == LLAMA_TOKEN_NULL) {
                     s.result.status =
                         Status::Error(ErrorCode::kDecodeFailed, "sampler produced no valid token (grammar deadlock)");
@@ -5267,9 +5538,13 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             s.result.draft_tokens += static_cast<std::int32_t>(k);
             std::size_t n_accepted = 0;
             const std::span<const std::vector<double>> no_proposal_dists{};
+            const Clock::time_point spec_samp_start = slot_stage_prof ? Clock::now() : Clock::time_point{};
             const bool sample_deadlock = !VerifySpeculativeBatch(
                 draft_tokens, no_proposal_dists, req.sampling, s.sampler.get(), s.grammar_sampler.get(),
                 s.target_gpu_sampled, n_vocab, s.verify_rng, accepted_tokens, accepted_lps, n_accepted, s.result);
+            if (slot_stage_prof) {
+                add_stage_ms(s.result.stage_timings.sampling_ms, MsSince(spec_samp_start));
+            }
             if (sample_deadlock) {
                 invalidate_slot(s);
                 s.result.status =
@@ -5296,10 +5571,17 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             int64_t new_pos = s.pos + 1;
             std::size_t committed_drafts = 0;
             auto rollback_rejected = [&](int64_t keep_pos, std::size_t keep_drafts) -> bool {
+                const Clock::time_point rb_start = slot_stage_prof ? Clock::now() : Clock::time_point{};
+                auto finish_rb = [&](bool ok) {
+                    if (slot_stage_prof) {
+                        add_stage_ms(s.result.stage_timings.rollback_ms, MsSince(rb_start));
+                    }
+                    return ok;
+                };
 #if defined(SONDER_LLAMACPP_HAS_MTP)
                 if (s.mtp_enabled && !MtpCommitVerified(batch, s.slot_id, static_cast<int32_t>(keep_drafts))) {
                     invalidate_slot(s);
-                    return false;
+                    return finish_rb(false);
                 }
                 if (!s.mtp_enabled) {
                     mark_slot_mtp_drifted(s);
@@ -5319,7 +5601,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                                                                                   spec_ckpt_size, s.slot_id, flags);
                             if (read == 0 || !llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1)) {
                                 invalidate_slot(s);
-                                return false;
+                                return finish_rb(false);
                             }
                             BatchClear(batch);
                             BatchAdd(batch, step_base_tok, static_cast<llama_pos>(s.pos), s.slot_id, /*logits=*/false);
@@ -5330,19 +5612,19 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                             }
                             if (llama_decode(ctx, batch) != 0) {
                                 invalidate_slot(s);
-                                return false;
+                                return finish_rb(false);
                             }
-                            return true;
+                            return finish_rb(true);
                         }
 #else
                         (void)step_base_tok;
                         (void)keep_drafts;
 #endif
                         invalidate_slot(s);
-                        return false;
+                        return finish_rb(false);
                     }
                 }
-                return true;
+                return finish_rb(true);
             };
 
             bool slot_finished = false;
@@ -5720,6 +6002,26 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                         if (k_i > 0) {
                             s->result.draft_tokens += static_cast<std::int32_t>(k_i);
                             s->result.draft_accepted_tokens += static_cast<std::int32_t>(s->step_n_accepted);
+                            if (s->concurrent_step_mode == SlotSpecMode::kSuffix) {
+                                s->result.effective_spec_method = "suffix";
+                                s->result.draft_identity = "suffix";
+                            } else if (s->concurrent_step_mode == SlotSpecMode::kNgramMod) {
+                                s->result.effective_spec_method = "ngram-mod";
+                                s->result.draft_identity = "ngram-mod";
+                            } else if (s->concurrent_step_mode == SlotSpecMode::kNgramShort) {
+                                s->result.effective_spec_method = "ngram";
+                                s->result.draft_identity = "ngram";
+                            }
+                            s->result.effective_draft_limit =
+                                std::max(s->result.effective_draft_limit, static_cast<std::int32_t>(k_i));
+                            if (s->spec_transition.configured_mode() == SlotSpecMode::kDraftMtp) {
+                                s->result.spec_transitioned_during_request = true;
+                                s->result.spec_fallback_reason = "concurrency_batch";
+                            }
+                            if (s->result.stage_timings.enabled) {
+                                add_stage_ms(s->result.stage_timings.verify_ms, decode_call_ms);
+                                s->result.stage_timings.stages_may_overlap = true;
+                            }
                             total_drafted_step += k_i;
                             total_accepted_step += s->step_n_accepted;
                             if (s->concurrent_step_mode == SlotSpecMode::kSuffix && s->local_suffix_matcher != nullptr) {
@@ -5870,7 +6172,18 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             return SpecSuspendReason::kMultiRequestBatch;
         }();
         for (auto& sp : active) {
+            const bool had_spec_enabled =
+                sp->mtp_enabled || sp->suffix_enabled || sp->ngram_mod_enabled || sp->ngram_short_enabled;
             suspend_slot_for_batch(*sp, batch_suspend_reason);
+            if (had_spec_enabled) {
+                sp->result.spec_transitioned_during_request = true;
+                sp->result.effective_spec_method = "none";
+                sp->result.effective_draft_limit = 0;
+                sp->result.spec_fallback_reason =
+                    (batch_suspend_reason == SpecSuspendReason::kVerifyCostRegression)
+                        ? "disabled_by_policy"
+                        : "concurrency_batch";
+            }
         }
 
         if (prefix_coalescer.IsEnabled()) {

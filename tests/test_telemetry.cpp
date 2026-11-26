@@ -1605,3 +1605,284 @@ TEST_CASE("periodic device sampler updates gpu_devices snapshot and respects sam
         }
     }
 }
+
+TEST_CASE("5-state capability status model serializes all dimensions without conflating speedups") {
+    CHECK(std::string(to_string(CapabilityState::unknown)) == "unknown");
+    CHECK(std::string(to_string(CapabilityState::no)) == "no");
+    CHECK(std::string(to_string(CapabilityState::yes)) == "yes");
+    CHECK(parse_capability_state("unknown") == CapabilityState::unknown);
+    CHECK(parse_capability_state("yes") == CapabilityState::yes);
+    CHECK(parse_capability_state("true") == CapabilityState::yes);
+    CHECK(parse_capability_state("no") == CapabilityState::no);
+    CHECK(parse_capability_state("false") == CapabilityState::no);
+    CHECK_FALSE(parse_capability_state("maybe").has_value());
+
+    CapabilityStatus st;
+    st.adapter_supports = CapabilityState::yes;
+    st.build_supports = CapabilityState::yes;
+    st.configured = CapabilityState::yes;
+    st.observed_active = CapabilityState::unknown;
+    st.qualified_beneficial = CapabilityState::unknown;
+    st.note = std::string("line1\nline2\t") + std::string(400, 'x');
+
+    const json::Object obj = to_json(st);
+    CHECK(obj.find("adapter_supports")->as_string() == "yes");
+    CHECK(obj.find("build_supports")->as_string() == "yes");
+    CHECK(obj.find("configured")->as_string() == "yes");
+    CHECK(obj.find("observed_active")->as_string() == "unknown");
+    CHECK(obj.find("qualified_beneficial")->as_string() == "unknown");
+    REQUIRE(obj.find("note") != nullptr);
+    CHECK(obj.find("note")->as_string().size() == kMaxEvidenceStringBytes);
+    CHECK(obj.find("note")->as_string().find('\n') == std::string::npos);
+
+    // Entry map is bounded at kMaxCapabilityStatusEntries.
+    std::vector<CapabilityStatusEntry> many;
+    for (std::size_t i = 0; i < kMaxCapabilityStatusEntries + 10; ++i) {
+        many.emplace_back("cap_" + std::to_string(i), CapabilityStatus{});
+    }
+    const json::Object map = to_json_capability_statuses(many);
+    CHECK(map.size() == kMaxCapabilityStatusEntries);
+}
+
+TEST_CASE("EffectiveExecutionReport keeps configured vs effective modes and 3-tier cache counters distinct") {
+    // 1. Pure logical accounting hit MUST NEVER count as physical prefill savings.
+    {
+        EffectiveExecutionReport rep;
+        rep.configured_spec_method = "auto";
+        rep.effective_spec_method = "ngram-mod";
+        rep.configured_draft_limit = 64u;
+        rep.effective_draft_limit = 64u;
+        rep.fallback_reason = std::string(kSpecReasonAutoFallbackNgramMod);
+        rep.target_identity = "qwen3-coder.gguf";
+        rep.draft_identity = "ngram-mod";
+        rep.committed_tokens = 40u;
+        rep.proposed_draft_tokens = 30u;
+        rep.accepted_draft_tokens = 99u;  // malformed > proposed must clamp
+        rep.speculation_observed_active = CapabilityState::yes;
+        rep.cache.logical_cache_hit_tokens = 512u;
+        rep.cache.device_prefix_reused_tokens = std::nullopt;
+        rep.cache.host_l2_restored_tokens = std::nullopt;
+
+        CHECK_FALSE(rep.cache.physical_reused_tokens().has_value());
+        const json::Object j = to_json(rep);
+        CHECK(j.find("configured_spec_method")->as_string() == "auto");
+        CHECK(j.find("effective_spec_method")->as_string() == "ngram-mod");
+        CHECK(j.find("fallback_reason")->as_string() == "auto_fallback_ngram_mod");
+        CHECK(j.find("committed_tokens")->as_uint() == 40u);
+        CHECK(j.find("proposed_draft_tokens")->as_uint() == 30u);
+        CHECK(j.find("accepted_draft_tokens")->as_uint() == 30u);
+        CHECK(j.find("speculation_observed_active")->as_string() == "yes");
+
+        const auto* cache = j.find("cache");
+        REQUIRE(cache != nullptr);
+        CHECK(cache->find("logical_cache_hit_tokens")->as_uint() == 512u);
+        CHECK(cache->find("device_prefix_reused_tokens")->is_null());
+        CHECK(cache->find("host_l2_restored_tokens")->is_null());
+        CHECK(cache->find("host_l2_restore_ms")->is_null());
+        CHECK(cache->find("physical_reused_tokens")->is_null());
+    }
+
+    // 2. Physical device + L2 restore stay separate from logical accounting and sum cleanly.
+    {
+        EffectiveExecutionReport rep;
+        rep.configured_spec_method = "draft-mtp";
+        rep.effective_spec_method = "none";
+        rep.configured_draft_limit = 3u;
+        rep.effective_draft_limit = 0u;
+        rep.fallback_reason = std::string(kSpecReasonConcurrencyBatch);
+        rep.transitioned_during_request = true;
+        rep.speculation_observed_active = CapabilityState::no;
+        rep.cache.logical_cache_hit_tokens = 1000u;
+        rep.cache.device_prefix_reused_tokens = 256u;
+        rep.cache.device_cross_slot_reused_tokens = 256u;
+        rep.cache.host_l2_restored_tokens = 128u;
+        rep.cache.host_l2_restore_ms = 3.5;
+
+        REQUIRE(rep.cache.physical_reused_tokens().has_value());
+        CHECK(*rep.cache.physical_reused_tokens() == 384u);  // strictly excludes logical 1000
+        const json::Object j = to_json(rep);
+        CHECK(j.find("fallback_reason")->as_string() == "concurrency_batch");
+        CHECK(j.find("transitioned_during_request")->as_bool());
+        const auto* cache = j.find("cache");
+        REQUIRE(cache != nullptr);
+        CHECK(cache->find("logical_cache_hit_tokens")->as_uint() == 1000u);
+        CHECK(cache->find("device_prefix_reused_tokens")->as_uint() == 256u);
+        CHECK(cache->find("device_cross_slot_reused_tokens")->as_uint() == 256u);
+        CHECK(cache->find("host_l2_restored_tokens")->as_uint() == 128u);
+        CHECK(cache->find("host_l2_restore_ms")->as_double() == doctest::Approx(3.5));
+        CHECK(cache->find("physical_reused_tokens")->as_uint() == 384u);
+    }
+
+    // 3. Unpopulated report uses explicit "unknown" / null rather than fabricating zeroes.
+    {
+        const json::Object j = to_json(EffectiveExecutionReport{});
+        CHECK(j.find("configured_spec_method")->as_string() == "unknown");
+        CHECK(j.find("effective_spec_method")->as_string() == "unknown");
+        CHECK(j.find("configured_draft_limit")->is_null());
+        CHECK(j.find("effective_draft_limit")->is_null());
+        CHECK(j.find("fallback_reason")->is_null());
+        CHECK(j.find("committed_tokens")->is_null());
+        CHECK(j.find("proposed_draft_tokens")->is_null());
+        CHECK(j.find("speculation_observed_active")->as_string() == "unknown");
+    }
+}
+
+TEST_CASE("session separates logical KvCacheManager reuse from physical tiers and supports opt-in stage profiling") {
+    // 1. Default run (stage profiling OFF): zero stage.timings events, logical cache hits never claim physical reuse.
+    {
+        auto sink = std::make_shared<MemoryTelemetrySink>();
+        EngineOptions eo;
+        eo.telemetry_sinks.push_back(sink);
+        eo.sample_devices_on_start = false;
+        eo.sample_gpu_devices = false;
+        eo.device_sample_interval = std::chrono::milliseconds(0);
+        eo.scheduling.enabled = true;
+        eo.scheduling.kv_block_size_tokens = 4;
+        eo.scheduling.prefix_caching = true;
+        Engine engine(std::move(eo));
+        REQUIRE(engine.register_backend(make_mock_backend()).ok());
+        auto model = engine.load_model(kMockBackendName, ModelLoadOptions{"mock:tiny", "cpu:0"});
+        REQUIRE(model.ok());
+
+        const std::string shared_prompt =
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi";
+        SessionOptions so1;
+        so1.sampling = SamplingConfig::greedy(3);
+        auto s1 = engine.create_session(model.value(), so1);
+        REQUIRE(s1.ok());
+        auto r1 = s1.value()->generate(shared_prompt);
+        REQUIRE(r1.ok());
+        CHECK_FALSE(r1->stage_timings.has_value());
+
+        SessionOptions so2;
+        so2.sampling = SamplingConfig::greedy(3);
+        auto s2 = engine.create_session(model.value(), so2);
+        REQUIRE(s2.ok());
+        auto r2 = s2.value()->generate(shared_prompt + " rho sigma");
+        REQUIRE(r2.ok());
+        CHECK_FALSE(r2->stage_timings.has_value());
+        REQUIRE(r2->effective_execution.has_value());
+        REQUIRE(r2->effective_execution->cache.logical_cache_hit_tokens.has_value());
+        CHECK(*r2->effective_execution->cache.logical_cache_hit_tokens > 0u);
+        CHECK_FALSE(r2->effective_execution->cache.device_prefix_reused_tokens.has_value());
+        CHECK_FALSE(r2->effective_execution->cache.host_l2_restored_tokens.has_value());
+        CHECK_FALSE(r2->effective_execution->cache.physical_reused_tokens().has_value());
+
+        engine.telemetry().flush();
+        for (const auto& line : sink->lines()) {
+            const auto ev = json::parse(line);
+            REQUIRE(ev.ok());
+            CHECK(ev->find("event_type")->as_string() != "inference.stage.timings");
+        }
+    }
+
+    // 2. Opt-in stage profiling ON (per-request): measures active stages, marks overlaps, leaves unmeasured null.
+    {
+        auto sink = std::make_shared<MemoryTelemetrySink>();
+        EngineOptions eo;
+        eo.telemetry_sinks.push_back(sink);
+        eo.sample_devices_on_start = false;
+        eo.sample_gpu_devices = false;
+        eo.device_sample_interval = std::chrono::milliseconds(0);
+        eo.scheduling.enabled = true;
+        Engine engine(std::move(eo));
+        MockBackendOptions mopt;
+        mopt.token_logits = true;
+        REQUIRE(engine.register_backend(make_mock_backend(mopt)).ok());
+        auto model = engine.load_model(kMockBackendName, ModelLoadOptions{"mock:tiny", "cpu:0"});
+        REQUIRE(model.ok());
+        SessionOptions so;
+        so.sampling = SamplingConfig::greedy(4);
+        auto sess = engine.create_session(model.value(), so);
+        REQUIRE(sess.ok());
+
+        RequestOptions ro;
+        ro.enable_stage_profiling = true;
+        auto r = sess.value()->generate("stage timing profiling probe", {}, std::nullopt, ro);
+        REQUIRE(r.ok());
+        REQUIRE(r->stage_timings.has_value());
+        CHECK(r->stage_timings->enabled);
+        CHECK(r->stage_timings->queue_wait_ms.has_value());
+        CHECK(r->stage_timings->prefill_ms.has_value());
+        CHECK(r->stage_timings->sampling_ms.has_value());
+        CHECK(r->stage_timings->callback_gate_wait_ms.has_value());
+        CHECK(r->stage_timings->total_elapsed_ms.has_value());
+        CHECK(r->stage_timings->stages_may_overlap);
+        CHECK_FALSE(r->stage_timings->l2_restore_ms.has_value());
+        CHECK_FALSE(r->stage_timings->draft_ms.has_value());
+        CHECK_FALSE(r->stage_timings->verify_ms.has_value());
+        CHECK_FALSE(r->stage_timings->rollback_ms.has_value());
+
+        engine.telemetry().flush();
+        bool saw_stage_event = false;
+        bool saw_completed_after_stage = false;
+        for (const auto& line : sink->lines()) {
+            const auto ev = json::parse(line);
+            REQUIRE(ev.ok());
+            check_envelope(ev.value());
+            const std::string type = ev->find("event_type")->as_string();
+            if (type == "inference.stage.timings") {
+                saw_stage_event = true;
+                const auto* attrs = ev->find("attributes");
+                REQUIRE(attrs != nullptr);
+                CHECK(attrs->find("enabled")->as_bool());
+                CHECK(attrs->find("queue_wait_ms")->is_number());
+                CHECK(attrs->find("sampling_ms")->is_number());
+                CHECK(attrs->find("callback_gate_wait_ms")->is_number());
+                CHECK(attrs->find("total_elapsed_ms")->is_number());
+                CHECK(attrs->find("draft_ms")->is_null());
+                CHECK(attrs->find("l2_restore_ms")->is_null());
+                CHECK(attrs->find("stages_may_overlap")->as_bool());
+            } else if (type == "request.completed" && saw_stage_event) {
+                saw_completed_after_stage = true;
+                CHECK(ev->find("attributes")->find("stage_timings") != nullptr);
+                CHECK(ev->find("attributes")->find("effective_execution") != nullptr);
+            }
+        }
+        CHECK(saw_stage_event);
+        CHECK(saw_completed_after_stage);
+    }
+
+    // 3. Stage timing emission uses the bounded non-blocking queue and drops under pressure without stalling.
+    {
+        auto gate = std::make_shared<GateSink>();
+        TelemetryOptions opts;
+        opts.queue_capacity = 2;
+        TelemetryBus bus(opts);
+        bus.add_sink(gate);
+
+        StageTimings st;
+        st.enabled = true;
+        st.prefill_ms = 2.0;
+        st.total_elapsed_ms = 5.0;
+        TelemetryContext ctx;
+        ctx.session_id = "sess-stage-pressure";
+        int accepted = 0;
+        for (int i = 0; i < 64; ++i) {
+            if (bus.emit_stage_timings(ctx, st, "mock")) ++accepted;
+        }
+        CHECK(bus.dropped_events() > 0u);
+        CHECK(static_cast<std::uint64_t>(accepted) + bus.dropped_events() == 64u);
+        gate->open();
+        CHECK(bus.shutdown());
+    }
+
+    // 4. ScopedStageTimer accuracy when active and zero measurement when disabled (nullptr).
+    {
+        StageTimings disabled;
+        for (int i = 0; i < 10000; ++i) {
+            ScopedStageTimer noop(nullptr);
+        }
+        CHECK_FALSE(disabled.has_any_measurement());
+
+        StageTimings active;
+        active.enabled = true;
+        {
+            ScopedStageTimer timer(&active.prefill_ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        REQUIRE(active.prefill_ms.has_value());
+        CHECK(*active.prefill_ms >= 5.0);
+        CHECK(*active.prefill_ms < 2000.0);
+    }
+}

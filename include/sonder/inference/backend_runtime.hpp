@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "sonder/inference/json.hpp"
+#include "sonder/inference/telemetry.hpp"
 
 namespace sonder::inference {
 
@@ -92,6 +93,10 @@ struct BackendRuntimeStatus {
     std::optional<json::Object> child;
     std::optional<json::Object> stall;
     std::optional<json::Object> diagnostics;
+    // Optional 5-state capability evidence and bounded effective execution
+    // summary. Empty/absent preserves the historical runtime JSON shape.
+    std::vector<CapabilityStatusEntry> capability_statuses;
+    std::optional<EffectiveExecutionReport> effective_execution;
     // Internal event source; only the engine sampler drains it. Health and
     // model serialization must never consume it. Captures shared state only.
     std::function<std::vector<std::pair<std::string, json::Object>>()> take_events;

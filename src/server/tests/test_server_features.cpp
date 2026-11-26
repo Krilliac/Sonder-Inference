@@ -2941,3 +2941,166 @@ TEST_CASE("tool calling: strict schemas fail closed pre-generation, parallel_too
         }
     }
 }
+
+TEST_CASE("health diagnostics expose 5-state capabilities and effective execution without breaking legacy fields") {
+    // 1. Default mock backend: existing health + /v1/models contracts preserved, diagnostics honest.
+    {
+        Fixture f;
+        const Reply hr = get(f.port, "/v1/sonder/health");
+        REQUIRE_MESSAGE(hr.status == 200, hr.body);
+        const auto h = hr.json();
+        // Verify merged #114 grammar_cache + capabilities.grammar_engine and #117 residency footprints stay intact.
+        CHECK((h.find("grammar_cache") != nullptr && h.find("grammar_cache")->is_object()));
+        CHECK((h.find("residency") != nullptr && h.find("residency")->is_object()));
+        CHECK((h.find("capabilities") != nullptr && h.find("capabilities")->find("grammar_engine") != nullptr));
+
+        const auto* diag = h.find("diagnostics");
+        REQUIRE((diag != nullptr && diag->is_object()));
+        const auto* cap_status = diag->find("capability_status");
+        REQUIRE((cap_status != nullptr && cap_status->is_object()));
+        const auto* spec = cap_status->find("speculative_decode");
+        REQUIRE((spec != nullptr && spec->is_object()));
+        CHECK(spec->find("adapter_supports")->as_string() == "no");
+        CHECK(spec->find("build_supports")->as_string() == "no");
+        CHECK(spec->find("configured")->as_string() == "no");
+        CHECK(spec->find("observed_active")->as_string() == "no");
+        CHECK(spec->find("qualified_beneficial")->as_string() == "unknown");
+
+        const auto* eff = diag->find("effective_execution");
+        REQUIRE((eff != nullptr && eff->is_object()));
+        CHECK(eff->find("configured_spec_method")->as_string() == "none");
+        CHECK(eff->find("effective_spec_method")->as_string() == "none");
+        CHECK(eff->find("fallback_reason")->as_string() == "not_supported");
+        CHECK(eff->find("speculation_observed_active")->as_string() == "no");
+        const auto* cache = eff->find("cache");
+        REQUIRE((cache != nullptr && cache->is_object()));
+        CHECK(cache->find("logical_cache_hit_tokens")->is_null());
+        CHECK(cache->find("device_prefix_reused_tokens")->is_null());
+        CHECK(cache->find("host_l2_restored_tokens")->is_null());
+        CHECK(cache->find("physical_reused_tokens")->is_null());
+
+        // /v1/models sonder metadata remains exactly 3 keys (api_version, features, pins).
+        const Reply mr = get(f.port, "/v1/models");
+        REQUIRE(mr.status == 200);
+        CHECK(mr.json().find("sonder")->as_object().size() == 3u);
+    }
+
+    // 2. Backend supplying real 5-state capability statuses and effective execution transition.
+    {
+        struct EvidenceBackend final : si::Backend {
+            struct Model final : si::BackendModel {
+                si::ModelDescriptor desc;
+                Model() {
+                    desc.name = "qwen3:q4";
+                    desc.backend = "llamacpp";
+                    desc.context_length = 8192;
+                }
+                const si::ModelDescriptor& descriptor() const override { return desc; }
+                si::Result<si::GenerateStats> generate(const si::GenerateRequest&, const si::CancellationToken&,
+                                                       const si::TokenCallback& on_chunk) override {
+                    if (on_chunk) (void)on_chunk(si::TokenChunk{"ok", 0});
+                    si::GenerateStats st;
+                    st.prompt_tokens = 4;
+                    st.completion_tokens = 1;
+                    st.chunks = 1;
+                    st.token_counts_from_backend = true;
+                    st.stop_reason = si::StopReason::end_of_sequence;
+                    return st;
+                }
+            };
+            std::shared_ptr<Model> model = std::make_shared<Model>();
+            std::string name() const override { return "llamacpp"; }
+            std::string description() const override { return "evidence test backend"; }
+            si::BackendCapabilities capabilities() const override {
+                return si::BackendCapabilities{}
+                    .add(si::Capability::streaming)
+                    .add(si::Capability::prefix_reuse)
+                    .add(si::Capability::speculative_decode)
+                    .add(si::Capability::continuous_batch_decode);
+            }
+            std::vector<si::CapabilityStatusEntry> capability_statuses() const override {
+                si::CapabilityStatus spec;
+                spec.adapter_supports = si::CapabilityState::yes;
+                spec.build_supports = si::CapabilityState::yes;
+                spec.configured = si::CapabilityState::yes;
+                spec.observed_active = si::CapabilityState::yes;
+                spec.qualified_beneficial = si::CapabilityState::unknown;
+                si::CapabilityStatus l2;
+                l2.adapter_supports = si::CapabilityState::yes;
+                l2.build_supports = si::CapabilityState::yes;
+                l2.configured = si::CapabilityState::yes;
+                l2.observed_active = si::CapabilityState::yes;
+                l2.qualified_beneficial = si::CapabilityState::unknown;
+                return {{"speculative_decode", spec}, {"host_l2_cache", l2}};
+            }
+            std::optional<si::BackendRuntimeStatus> runtime_status() const override {
+                si::BackendRuntimeStatus rt;
+                rt.gpu_memory.probe = "none";
+                rt.gpu_memory.status = "unsupported";
+                rt.context.policy = "warn";
+                rt.context.outcome = "not_needed";
+                rt.capability_statuses = capability_statuses();
+                si::EffectiveExecutionReport eff;
+                eff.configured_spec_method = "auto";
+                eff.effective_spec_method = "ngram-mod";
+                eff.configured_draft_limit = 64u;
+                eff.effective_draft_limit = 64u;
+                eff.fallback_reason = "auto_fallback_ngram_mod";
+                eff.target_identity = "qwen3:q4";
+                eff.draft_identity = "ngram-mod";
+                eff.committed_tokens = 32u;
+                eff.proposed_draft_tokens = 24u;
+                eff.accepted_draft_tokens = 18u;
+                eff.speculation_observed_active = si::CapabilityState::yes;
+                eff.cache.device_prefix_reused_tokens = 128u;
+                eff.cache.host_l2_restored_tokens = 64u;
+                eff.cache.host_l2_restore_ms = 2.5;
+                rt.effective_execution = eff;
+                return rt;
+            }
+            si::Result<std::string> probe() override { return std::string("llama.cpp test"); }
+            si::Result<std::vector<si::ModelDescriptor>> list_models() override {
+                return std::vector<si::ModelDescriptor>{model->descriptor()};
+            }
+            si::Result<std::shared_ptr<si::BackendModel>> load_model(const si::ModelLoadOptions&) override {
+                return std::static_pointer_cast<si::BackendModel>(model);
+            }
+        };
+
+        auto be = std::make_shared<EvidenceBackend>();
+        auto opts = Fixture::defaults();
+        opts.models = {"qwen3:q4"};
+        opts.backend.backend.clear();
+        opts.backend_instance = be;
+        Fixture f(opts);
+
+        const Reply hr = get(f.port, "/v1/sonder/health");
+        REQUIRE_MESSAGE(hr.status == 200, hr.body);
+        const auto h = hr.json();
+        const auto* diag = h.find("diagnostics");
+        REQUIRE((diag != nullptr && diag->is_object()));
+        const auto* spec = diag->find("capability_status")->find("speculative_decode");
+        REQUIRE(spec != nullptr);
+        CHECK(spec->find("adapter_supports")->as_string() == "yes");
+        CHECK(spec->find("build_supports")->as_string() == "yes");
+        CHECK(spec->find("configured")->as_string() == "yes");
+        CHECK(spec->find("observed_active")->as_string() == "yes");
+        CHECK(spec->find("qualified_beneficial")->as_string() == "unknown");
+
+        const auto* eff = diag->find("effective_execution");
+        REQUIRE(eff != nullptr);
+        CHECK(eff->find("configured_spec_method")->as_string() == "auto");
+        CHECK(eff->find("effective_spec_method")->as_string() == "ngram-mod");
+        CHECK(eff->find("fallback_reason")->as_string() == "auto_fallback_ngram_mod");
+        CHECK(eff->find("committed_tokens")->as_uint() == 32u);
+        CHECK(eff->find("proposed_draft_tokens")->as_uint() == 24u);
+        CHECK(eff->find("accepted_draft_tokens")->as_uint() == 18u);
+        const auto* cache = eff->find("cache");
+        REQUIRE(cache != nullptr);
+        CHECK(cache->find("logical_cache_hit_tokens")->is_null());
+        CHECK(cache->find("device_prefix_reused_tokens")->as_uint() == 128u);
+        CHECK(cache->find("host_l2_restored_tokens")->as_uint() == 64u);
+        CHECK(cache->find("host_l2_restore_ms")->as_double() == doctest::Approx(2.5));
+        CHECK(cache->find("physical_reused_tokens")->as_uint() == 192u);
+    }
+}

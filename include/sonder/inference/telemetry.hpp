@@ -34,6 +34,177 @@ enum class TelemetryLevel { off = 0, metrics = 1, standard = 2, deep = 3 };
 const char* to_string(TelemetryLevel level) noexcept;
 std::optional<TelemetryLevel> parse_telemetry_level(std::string_view text) noexcept;
 
+// ---------------------------------------------------------------------------
+// Structured 5-state capability evidence, 3-tier cache accounting, effective
+// execution reporting, and opt-in stage profiling (Doc 1 Package A + Doc 2 #25).
+// ---------------------------------------------------------------------------
+
+// Maximum byte length retained for bounded diagnostic strings in evidence
+// records (model/draft identities, reasons, capability notes, overlap tags).
+inline constexpr std::size_t kMaxEvidenceStringBytes = 256;
+inline constexpr std::size_t kMaxCapabilityStatusEntries = 64;
+inline constexpr std::size_t kMaxStageOverlapNotes = 16;
+
+// Tri-state evidence value for one capability dimension. Unmeasured dimensions
+// stay explicitly `unknown` rather than being fabricated as false or true.
+enum class CapabilityState { unknown = 0, no = 1, yes = 2 };
+
+[[nodiscard]] const char* to_string(CapabilityState state) noexcept;
+[[nodiscard]] std::optional<CapabilityState> parse_capability_state(std::string_view text) noexcept;
+[[nodiscard]] constexpr CapabilityState capability_state_from_bool(bool value) noexcept {
+    return value ? CapabilityState::yes : CapabilityState::no;
+}
+
+// 5-state capability evidence model: never conflates adapter plumbing with
+// upstream build support, active configuration, runtime observation, or
+// measured workload speedup.
+struct CapabilityStatus {
+    CapabilityState adapter_supports = CapabilityState::unknown;
+    CapabilityState build_supports = CapabilityState::unknown;
+    CapabilityState configured = CapabilityState::unknown;
+    CapabilityState observed_active = CapabilityState::unknown;
+    CapabilityState qualified_beneficial = CapabilityState::unknown;
+    // Optional short diagnostic note (bounded and control-char sanitized).
+    std::string note;
+};
+
+using CapabilityStatusEntry = std::pair<std::string, CapabilityStatus>;
+
+// Canonical disable/fallback reason labels for EffectiveExecutionReport.
+inline constexpr std::string_view kSpecReasonNone = "none";
+inline constexpr std::string_view kSpecReasonConcurrencyBatch = "concurrency_batch";
+inline constexpr std::string_view kSpecReasonHybridUnsupported = "hybrid_unsupported";
+inline constexpr std::string_view kSpecReasonRecurrentUnsupported = "recurrent_unsupported";
+inline constexpr std::string_view kSpecReasonDisabledByPolicy = "disabled_by_policy";
+inline constexpr std::string_view kSpecReasonNotSupported = "not_supported";
+inline constexpr std::string_view kSpecReasonNotConfigured = "not_configured";
+inline constexpr std::string_view kSpecReasonAutoFallbackNgramMod = "auto_fallback_ngram_mod";
+inline constexpr std::string_view kSpecReasonMediaExclusive = "media_exclusive";
+inline constexpr std::string_view kSpecReasonStateRestored = "state_restored";
+inline constexpr std::string_view kSpecReasonDraftSyncFailed = "draft_sync_failed";
+inline constexpr std::string_view kSpecReasonUnknown = "unknown";
+
+// Separate 3-tier cache reuse counters. Unmeasured tiers stay std::nullopt.
+//
+// Invariant: `logical_cache_hit_tokens` (engine KvCacheManager accounting)
+// MUST NEVER be copied into `device_prefix_reused_tokens` or
+// `host_l2_restored_tokens`, and is strictly excluded from
+// `physical_reused_tokens()`.
+struct CacheTierCounters {
+    // Tier 0 (accounting only): engine KvCacheManager logical prefix reuse.
+    std::optional<std::uint64_t> logical_cache_hit_tokens = std::nullopt;
+    // Tier 1 (physical device): in-VRAM same-slot or cross-slot seq_cp reuse.
+    std::optional<std::uint64_t> device_prefix_reused_tokens = std::nullopt;
+    // Optional sub-breakdown of device_prefix_reused_tokens via cross-slot seq_cp.
+    std::optional<std::uint64_t> device_cross_slot_reused_tokens = std::nullopt;
+    // Tier 2 (physical host RAM): serialized state restored from host L2 cache.
+    std::optional<std::uint64_t> host_l2_restored_tokens = std::nullopt;
+    std::optional<double> host_l2_restore_ms = std::nullopt;
+
+    // Physical prefill tokens reused on the backend (device + host L2 only).
+    // Returns std::nullopt when neither physical tier was measured; never
+    // counts logical accounting hits as physical prefill savings.
+    [[nodiscard]] std::optional<std::uint64_t> physical_reused_tokens() const noexcept;
+};
+
+// Bounded record of configured vs effective speculative execution, fallback
+// reasons, target/draft identity, committed vs proposed token counts, and
+// 3-tier cache reuse accounting.
+struct EffectiveExecutionReport {
+    std::string configured_spec_method;  // empty => "unknown"
+    std::string effective_spec_method;   // empty => "unknown"
+    std::optional<std::uint32_t> configured_draft_limit = std::nullopt;
+    std::optional<std::uint32_t> effective_draft_limit = std::nullopt;
+    // Explicit disable/fallback reason when effective differs from configured
+    // or speculation was disabled/paused (empty when none).
+    std::string fallback_reason;
+
+    std::string target_identity;  // model name / GGUF basename; empty => unknown
+    std::string draft_identity;   // draft artifact / mechanism id; empty => none/unknown
+    std::string backend_version;  // upstream version/build tag; empty => unknown
+
+    // Target-verified committed output tokens MUST stay separate from proposed
+    // speculative draft tokens.
+    std::optional<std::uint64_t> committed_tokens = std::nullopt;
+    std::optional<std::uint64_t> proposed_draft_tokens = std::nullopt;
+    std::optional<std::uint64_t> accepted_draft_tokens = std::nullopt;
+
+    CacheTierCounters cache;
+
+    CapabilityState speculation_observed_active = CapabilityState::unknown;
+    // True when speculation was eligible at admission and transitioned to
+    // disabled mid-request (e.g. concurrency batch transition).
+    bool transitioned_during_request = false;
+};
+
+// Opt-in per-request execution stage timings (milliseconds).
+// Unmeasured stages stay std::nullopt (never fabricated as 0.0).
+//
+// `total_elapsed_ms` is the wall-clock end-to-end span. Individual stage
+// accumulators may overlap or nest (e.g. callback_gate_wait inside decode, or
+// async GPU overlap); `stages_may_overlap` and `overlap_notes` keep overlapping
+// phases clearly distinguished so consumers never double-count them.
+struct StageTimings {
+    bool enabled = false;
+    std::optional<double> queue_wait_ms = std::nullopt;
+    std::optional<double> cache_lookup_ms = std::nullopt;
+    std::optional<double> l2_restore_ms = std::nullopt;
+    std::optional<double> prefill_ms = std::nullopt;
+    std::optional<double> draft_ms = std::nullopt;
+    std::optional<double> verify_ms = std::nullopt;
+    std::optional<double> rollback_ms = std::nullopt;
+    std::optional<double> sampling_ms = std::nullopt;
+    std::optional<double> callback_gate_wait_ms = std::nullopt;
+    std::optional<double> total_elapsed_ms = std::nullopt;
+
+    bool stages_may_overlap = false;
+    std::vector<std::string> overlap_notes;
+
+    // Adds a non-negative finite millisecond delta into `slot`.
+    static void add_ms(std::optional<double>& slot, double delta_ms) noexcept;
+    // Records a bounded, deduplicated overlap tag (capped at kMaxStageOverlapNotes).
+    void note_overlap(std::string_view label);
+    // True when at least one stage measurement is populated.
+    [[nodiscard]] bool has_any_measurement() const noexcept;
+};
+
+// Zero-overhead opt-in RAII timer: touches steady_clock only when `slot != nullptr`.
+class ScopedStageTimer {
+public:
+    ScopedStageTimer() noexcept = default;
+    explicit ScopedStageTimer(std::optional<double>* slot) noexcept
+        : slot_(slot),
+          start_(slot != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    ~ScopedStageTimer() noexcept { stop(); }
+    ScopedStageTimer(const ScopedStageTimer&) = delete;
+    ScopedStageTimer& operator=(const ScopedStageTimer&) = delete;
+
+    void stop() noexcept {
+        if (slot_ != nullptr) {
+            const auto end = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(end - start_).count();
+            StageTimings::add_ms(*slot_, ms);
+            slot_ = nullptr;
+        }
+    }
+
+private:
+    std::optional<double>* slot_ = nullptr;
+    std::chrono::steady_clock::time_point start_{};
+};
+
+// Strips control characters and caps length to `max_bytes` so diagnostic
+// records stay bounded and safe for JSON/log emission.
+[[nodiscard]] std::string sanitize_bounded_evidence_string(std::string_view text,
+                                                           std::size_t max_bytes = kMaxEvidenceStringBytes);
+[[nodiscard]] EffectiveExecutionReport bound_effective_execution_report(EffectiveExecutionReport report);
+
+[[nodiscard]] json::Object to_json(const CapabilityStatus& status);
+[[nodiscard]] json::Object to_json_capability_statuses(const std::vector<CapabilityStatusEntry>& entries);
+[[nodiscard]] json::Object to_json(const CacheTierCounters& cache);
+[[nodiscard]] json::Object to_json(const EffectiveExecutionReport& report);
+[[nodiscard]] json::Object to_json(const StageTimings& timings);
+
 // Correlation identifiers carried on every event (OBSERVATORY_CONTRACT.md).
 struct TelemetryContext {
     std::string session_id;  // required by the envelope; must be non-empty
@@ -90,6 +261,9 @@ struct TelemetryOptions {
     // Include generated text in token events. Off by default: raw text capture
     // is independent from structural events per the Observatory contract.
     bool capture_text = false;
+    // Opt-in per-request stage timing hooks (Doc 2 #25). Off by default so
+    // unprofiled runs incur zero extra stage clock reads or timing events.
+    bool enable_stage_profiling = false;
     std::string producer_name = "sonder-inference";
     std::string node_id;  // defaults to host name
     // Envelope producer.role (additive field, contract sonder.observatory.event/1).
@@ -125,10 +299,19 @@ public:
     [[nodiscard]] const TelemetryOptions& options() const noexcept { return options_; }
     // True when an event of `level` would be recorded (level != off, sinks present).
     [[nodiscard]] bool enabled(TelemetryLevel level) const noexcept;
+    [[nodiscard]] bool stage_profiling_enabled() const noexcept { return options_.enable_stage_profiling; }
 
     // Non-blocking. Returns false if the event was filtered or dropped.
     bool emit(std::string_view event_type, const TelemetryContext& context, json::Object attributes,
               TelemetryLevel level = TelemetryLevel::metrics);
+
+    // Bounded, non-blocking helpers for structured effective execution evidence
+    // and opt-in per-request stage timings.
+    bool emit_effective_execution(const TelemetryContext& context, const EffectiveExecutionReport& report,
+                                  TelemetryLevel level = TelemetryLevel::metrics);
+    bool emit_stage_timings(const TelemetryContext& context, const StageTimings& timings,
+                            std::string_view backend = {}, std::string_view backend_version = {},
+                            TelemetryLevel level = TelemetryLevel::metrics);
 
     // Blocks until the writer has processed everything queued so far. Failed
     // sinks are retired; draining completes even when no healthy sink remains.
