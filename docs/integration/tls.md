@@ -129,7 +129,7 @@ Small hooks in existing files (please review):
 | `ca_bundle_path` | PEM file of trusted CA certificates. Empty means the system trust store. When set, **only** the bundle is trusted (both backends). |
 | `pinned_sha256` | SHA-256 fingerprint of the leaf certificate (DER), as printed by `openssl x509 -noout -fingerprint -sha256`. Hex, case-insensitive, `:` optional. |
 | `pinned_cert_path` | PEM file of the exact expected leaf certificate. If both pins are set, both must match. |
-| `insecure_skip_verify` | Turns off chain and host-name checks. Every handshake prints a loud `[sonder-tls] WARNING` to stderr. A configured pin is still enforced. |
+| `insecure_skip_verify` | Turns off chain and host-name checks. Every handshake queues a loud `[sonder-tls] WARNING` for stderr through the non-blocking diagnostic log (a stalled stderr never delays the handshake; lines are dropped and counted when its queue of 1024 is full). A configured pin is still enforced. |
 | `server_name` | Overrides the name used for SNI and verification (default: the URL host). |
 | `handshake_timeout` | Bound on the handshake (default 10 s). The request's `connect_timeout` and total `request_timeout` still apply. |
 

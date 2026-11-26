@@ -105,6 +105,11 @@ struct TelemetryOptions {
     // The first drop is reported as soon as the writer catches up; a final
     // report is emitted at shutdown if anything is still unreported.
     std::chrono::milliseconds drop_report_interval{1000};
+    // Longest shutdown() (and so the destructor) waits for the writer thread
+    // to drain and exit. A sink stuck in write()/flush() (a stalled disk or
+    // pipe) must not hang the process: on expiry the writer is detached and
+    // shutdown() returns false. Zero or negative means do not wait at all.
+    std::chrono::milliseconds shutdown_timeout{5000};
 };
 
 class TelemetryBus {
@@ -130,13 +135,17 @@ public:
     void flush();
     // Emits a final telemetry.dropped event if anything was dropped, drains, and
     // stops the writer. Idempotent; called by the destructor.
-    void shutdown();
+    // Waits at most TelemetryOptions::shutdown_timeout for the writer. Returns
+    // true when the writer drained and was joined; false when a sink did not
+    // return in time: the writer is then detached and the events not yet
+    // written to sinks are abandoned (a repeated call returns the first result).
+    bool shutdown();
 
-    [[nodiscard]] std::uint64_t emitted_events() const noexcept { return emitted_.load(); }
-    [[nodiscard]] std::uint64_t dropped_events() const noexcept { return dropped_.load(); }
+    [[nodiscard]] std::uint64_t emitted_events() const noexcept;
+    [[nodiscard]] std::uint64_t dropped_events() const noexcept;
     // Distinct sink objects retired after a write/flush exception, counted once
     // even if registered more than once. Separate from queue-pressure drops.
-    [[nodiscard]] std::uint64_t failed_sinks() const noexcept { return failed_sinks_.load(); }
+    [[nodiscard]] std::uint64_t failed_sinks() const noexcept;
 
     // Stream identity: event_id is "<instance_id>-<sequence>" and
     // producer.instance_id carries the same value (docs/TELEMETRY.md).
@@ -149,29 +158,15 @@ public:
                                TelemetryLevel level = TelemetryLevel::metrics) const;
 
 private:
-    void writer_loop();
-    // Queues a telemetry.dropped report (bypasses the capacity limit). Lock held.
-    void enqueue_drop_report_locked(bool final_report);
+    // Queue, sinks, counters and flags, shared with the writer thread so a
+    // writer abandoned by shutdown() never touches this object (defined in
+    // telemetry.cpp).
+    struct Shared;
 
     TelemetryOptions options_;
     std::string instance_id_;
-    std::vector<std::shared_ptr<TelemetrySink>> sinks_;
-
-    mutable std::mutex mutex_;
-    std::condition_variable cv_;
-    std::condition_variable drained_cv_;
-    // (sequence, serialized envelope) in emission order.
-    std::deque<std::pair<std::uint64_t, std::string>> queue_;
-    std::uint64_t next_sequence_ = 0;
-    std::uint64_t written_sequence_ = 0;  // count of lines handed to sinks
-    std::uint64_t enqueued_count_ = 0;
-    bool stopping_ = false;
-    bool stopped_ = false;
-    std::atomic<std::uint64_t> emitted_{0};
-    std::atomic<std::uint64_t> dropped_{0};
-    std::atomic<std::uint64_t> failed_sinks_{0};
-    std::uint64_t reported_dropped_ = 0;
-    std::chrono::steady_clock::time_point last_drop_report_{};
+    std::shared_ptr<Shared> shared_;
+    // Touched by the constructor and shutdown() only.
     std::thread writer_;
 };
 

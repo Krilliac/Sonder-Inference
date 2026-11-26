@@ -33,7 +33,7 @@
 #include "src/identity.hpp"
 #include "src/json_schema_gbnf.hpp"
 #include "src/live_hub.hpp"
-#include "src/log_queue.hpp"
+#include "common/log_queue.hpp"
 #include "src/openai.hpp"
 #include "src/responses_handler.hpp"
 #include "src/serve_options.hpp"

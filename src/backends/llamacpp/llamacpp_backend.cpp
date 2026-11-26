@@ -47,6 +47,38 @@
 #endif
 
 namespace sonder::backends::llamacpp {
+
+static_assert(static_cast<int>(LogLevel::kNone) == GGML_LOG_LEVEL_NONE);
+static_assert(static_cast<int>(LogLevel::kDebug) == GGML_LOG_LEVEL_DEBUG);
+static_assert(static_cast<int>(LogLevel::kInfo) == GGML_LOG_LEVEL_INFO);
+static_assert(static_cast<int>(LogLevel::kWarn) == GGML_LOG_LEVEL_WARN);
+static_assert(static_cast<int>(LogLevel::kError) == GGML_LOG_LEVEL_ERROR);
+static_assert(static_cast<int>(LogLevel::kCont) == GGML_LOG_LEVEL_CONT);
+
+namespace {
+
+std::atomic<LogSink> g_log_sink{nullptr};
+
+}  // namespace
+
+void SetLogSink(LogSink sink) noexcept { g_log_sink.store(sink, std::memory_order_release); }
+
+// llama.cpp logs verbosely to stderr by default. Keep warnings and errors;
+// set SONDER_LLAMACPP_VERBOSE=1 to see everything.
+void RouteLog(LogLevel level, const char* text) {
+    static const bool verbose = [] {
+        const char* v = std::getenv("SONDER_LLAMACPP_VERBOSE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if (verbose || level == LogLevel::kWarn || level == LogLevel::kError) {
+        if (const LogSink sink = g_log_sink.load(std::memory_order_acquire)) {
+            sink(text);
+        } else {
+            std::fputs(text, stderr);
+        }
+    }
+}
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -109,16 +141,9 @@ double MsSince(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
 
-// llama.cpp logs verbosely to stderr by default. Keep warnings and errors;
-// set SONDER_LLAMACPP_VERBOSE=1 to see everything.
+// Forwards llama.cpp log lines to RouteLog (filter and sink).
 void LogCallback(ggml_log_level level, const char* text, void* /*user*/) {
-    static const bool verbose = [] {
-        const char* v = std::getenv("SONDER_LLAMACPP_VERBOSE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    if (verbose || level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
-        std::fputs(text, stderr);
-    }
+    RouteLog(static_cast<LogLevel>(level), text);
 }
 
 void EnsureBackendInitialized() {

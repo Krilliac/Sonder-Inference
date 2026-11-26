@@ -29,6 +29,7 @@
 #  endif
 #endif
 
+#include "common/diag_log.hpp"
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include "sonder/inference/backends/llamacpp.hpp"
 #include "sonder/inference/json.hpp"
@@ -230,6 +231,10 @@ ErrorCode MapError(lc::ErrorCode code) {
 }
 
 Status ToStatus(const lc::Status& s) { return s.ok() ? Status::success() : Status(MapError(s.code), s.message); }
+
+void ForwardLogToDiagnosticQueue(const char* text) {
+    if (text != nullptr) (void)diag::log(std::string(text));
+}
 
 std::uint64_t MsToNs(double ms) noexcept {
     if (!std::isfinite(ms) || ms <= 0.0) return 0;
@@ -522,7 +527,12 @@ public:
           load_ns_(MsToNs(load_ms)),
           slots_(std::max<std::uint32_t>(1u, slots)),
           runtime_state_(std::move(runtime_state)),
-          runtime_model_id_(runtime_model_id) {}
+          runtime_model_id_(runtime_model_id) {
+        // The chat template is fixed once the model is loaded, so decide here
+        // rather than under mutex_, which is held for a whole generation.
+        std::string ignored;
+        native_chat_ = runtime_.ApplyChatTemplate({lc::ChatTurn{"user", "x"}}, true, ignored).ok();
+    }
 
     ~LlamaCppModel() override {
         if (runtime_state_ && runtime_model_id_ != 0) {
@@ -787,11 +797,7 @@ public:
                           std::move(media_blobs), {}, std::move(media_prompt_parts));
     }
 
-    [[nodiscard]] bool has_native_chat() const override {
-        std::string ignored;
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        return runtime_.ApplyChatTemplate({lc::ChatTurn{"user", "x"}}, true, ignored).ok();
-    }
+    [[nodiscard]] bool has_native_chat() const override { return native_chat_; }
 
     Result<RecurrentStateSnapshot> capture_recurrent_state(std::uint64_t token_position) override {
         if (token_position == 0) {
@@ -985,6 +991,7 @@ private:
     std::uint32_t slots_ = 1;
     std::shared_ptr<RuntimeState> runtime_state_;
     std::uint64_t runtime_model_id_ = 0;
+    bool native_chat_ = false;  // set in the constructor, read-only afterwards
     mutable std::shared_mutex mutex_;
 };
 
@@ -998,7 +1005,11 @@ public:
         : options_(std::move(options)),
           runtime_state_(std::make_shared<RuntimeState>(
               probe ? std::move(probe) : MakeDefaultGpuMemoryProbe(options_.devices), sample_interval,
-              options_.context_length, force_uma_mode, force_gpu_offload)) {}
+              options_.context_length, force_uma_mode, force_gpu_offload)) {
+        // llama.cpp's log callback runs on inference threads: send its lines
+        // through the non-blocking diagnostic queue, never to stderr directly.
+        lc::SetLogSink(&ForwardLogToDiagnosticQueue);
+    }
 
     [[nodiscard]] std::string name() const override { return kLlamaCppBackendName; }
     [[nodiscard]] std::string description() const override {

@@ -17,7 +17,7 @@
 #include <vector>
 
 #include "http.hpp"
-#include "log_queue.hpp"
+#include "common/log_queue.hpp"
 #include "openai.hpp"
 #include "socket.hpp"
 #include "sonder/inference/json.hpp"

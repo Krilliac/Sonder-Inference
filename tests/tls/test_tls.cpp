@@ -3,8 +3,14 @@
 #include <doctest/doctest.h>
 
 #include <chrono>
+#include <condition_variable>
+#include <future>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
+#include "common/diag_log.hpp"
 #include "net/http_client.hpp"
 #include "net/tls_stream.hpp"
 #include "sonder/inference/error.hpp"
@@ -15,6 +21,7 @@
 #endif
 
 using namespace sonder::inference;
+namespace diag = sonder::inference::diag;
 
 namespace {
 
@@ -199,6 +206,39 @@ TEST_CASE("insecure_skip_verify connects to an untrusted server") {
     auto res = fetch(req, body);
     REQUIRE_MESSAGE(res.ok(), res.status().to_string());
     CHECK(res.value().status == 200);
+}
+
+TEST_CASE("the insecure_skip_verify warning goes through the diagnostic log queue") {
+    struct Capture {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool open = false;
+        std::vector<std::string> lines;
+    };
+    auto cap = std::make_shared<Capture>();
+    // A sink stuck until released models a stalled stderr.
+    diag::set_sink([cap](const std::string& line) {
+        std::unique_lock<std::mutex> lock(cap->mu);
+        cap->cv.wait(lock, [&cap] { return cap->open; });
+        cap->lines.push_back(line);
+        cap->cv.notify_all();
+    });
+    auto call = std::async(std::launch::async, [] { net::warn_insecure_tls("tls-warning.invalid", 8443); });
+    const bool returned = call.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    CHECK_MESSAGE(returned, "warn_insecure_tls waited for the log sink");
+    {
+        std::lock_guard<std::mutex> lock(cap->mu);
+        cap->open = true;
+    }
+    cap->cv.notify_all();
+    call.get();
+    std::unique_lock<std::mutex> lock(cap->mu);
+    const bool got = cap->cv.wait_for(lock, std::chrono::seconds(5), [&cap] { return !cap->lines.empty(); });
+    REQUIRE_MESSAGE(got, "the warning never reached the diagnostic log sink");
+    CHECK(contains(cap->lines.front(), "insecure_skip_verify"));
+    CHECK(contains(cap->lines.front(), "tls-warning.invalid:8443"));
+    lock.unlock();
+    diag::set_sink(nullptr);
 }
 
 TEST_CASE("bad TLS options are rejected before any request") {

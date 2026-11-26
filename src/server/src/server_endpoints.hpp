@@ -16,7 +16,7 @@
 #include <variant>
 
 #include "live_hub.hpp"
-#include "log_queue.hpp"
+#include "common/log_queue.hpp"
 #include "residency.hpp"
 #include "server_policy.hpp"
 #include "sonder/inference/backend.hpp"

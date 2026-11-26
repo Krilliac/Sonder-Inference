@@ -1,5 +1,6 @@
 #include "sonder/inference/telemetry.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <ctime>
@@ -140,43 +141,54 @@ std::vector<std::string> MemoryTelemetrySink::lines() const {
 
 // -------------------------------------------------------------------- bus
 
-TelemetryBus::TelemetryBus(TelemetryOptions options) : options_(std::move(options)), instance_id_(make_id("tel")) {
-    if (options_.node_id.empty()) {
-        options_.node_id = host_name();
-    }
-    if (options_.queue_capacity == 0) {
-        options_.queue_capacity = 1;
-    }
-    writer_ = std::thread([this] { writer_loop(); });
-}
+// State shared between the bus and its writer thread. The thread co-owns it,
+// so shutdown() can give up on a writer stuck inside a sink and detach it: the
+// detached thread only touches this object and its own sink references, never
+// the TelemetryBus.
+struct TelemetryBus::Shared {
+    Shared(TelemetryOptions opts, std::string id) : options(std::move(opts)), instance_id(std::move(id)) {}
 
-TelemetryBus::~TelemetryBus() { shutdown(); }
+    // Immutable after construction.
+    const TelemetryOptions options;
+    const std::string instance_id;
 
-void TelemetryBus::add_sink(std::shared_ptr<TelemetrySink> sink) {
-    if (!sink) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(mutex_);
-    sinks_.push_back(std::move(sink));
-}
+    mutable std::mutex mutex;
+    std::condition_variable cv;
+    std::condition_variable drained_cv;
+    std::condition_variable exit_cv;  // shutdown(): the writer has left its loop
+    std::vector<std::shared_ptr<TelemetrySink>> sinks;
+    // (sequence, serialized envelope) in emission order.
+    std::deque<std::pair<std::uint64_t, std::string>> queue;
+    std::uint64_t next_sequence = 0;
+    std::uint64_t written_sequence = 0;  // count of lines handed to sinks
+    std::uint64_t enqueued_count = 0;
+    bool stopping = false;
+    bool stopped = false;
+    bool exited = false;
+    bool clean = true;  // false once shutdown() abandoned the writer
+    // Set by shutdown() when the writer did not exit in time; the writer then
+    // starts no further sink call. Atomic because the writer reads it with
+    // the mutex released.
+    std::atomic<bool> abandoned{false};
+    std::atomic<std::uint64_t> emitted{0};
+    std::atomic<std::uint64_t> dropped{0};
+    std::atomic<std::uint64_t> failed_sinks{0};
+    std::uint64_t reported_dropped = 0;
+    std::chrono::steady_clock::time_point last_drop_report{};
 
-bool TelemetryBus::enabled(TelemetryLevel level) const noexcept {
-    if (options_.level == TelemetryLevel::off || level == TelemetryLevel::off) {
-        return false;
-    }
-    if (static_cast<int>(level) > static_cast<int>(options_.level)) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(mutex_);
-    return !sinks_.empty() && !stopping_;
-}
+    // Queues a telemetry.dropped report (bypasses the capacity limit). Lock held.
+    void enqueue_drop_report_locked(bool final_report);
+    static void writer_loop(const std::shared_ptr<Shared>& shared);
+};
 
-json::Object TelemetryBus::make_envelope(std::string_view event_type, const TelemetryContext& context,
-                                         json::Object attributes, std::uint64_t sequence,
-                                         TelemetryLevel level) const {
+namespace {
+
+json::Object build_envelope(const TelemetryOptions& options, const std::string& instance_id,
+                            std::string_view event_type, const TelemetryContext& context, json::Object attributes,
+                            std::uint64_t sequence, TelemetryLevel level) {
     json::Object env;
     env.set("schema", std::string(kObservatorySchema));
-    env.set("event_id", instance_id_ + "-" + std::to_string(sequence));
+    env.set("event_id", instance_id + "-" + std::to_string(sequence));
     env.set("sequence", sequence);
     env.set("event_type", std::string(event_type));
     env.set("wall_time", utc_timestamp_now());
@@ -188,14 +200,14 @@ json::Object TelemetryBus::make_envelope(std::string_view event_type, const Tele
     env.set("task_id", context.task_id);
     env.set("model_instance_id", context.model_instance_id);
     env.set("device_id", context.device_id);
-    json::Object producer{{"name", options_.producer_name},
+    json::Object producer{{"name", options.producer_name},
                           {"version", version_string()},
-                          {"node_id", options_.node_id},
-                          {"instance_id", instance_id_}};
-    if (!options_.role.empty()) {
-        producer.set("role", options_.role);
+                          {"node_id", options.node_id},
+                          {"instance_id", instance_id}};
+    if (!options.role.empty()) {
+        producer.set("role", options.role);
     }
-    const auto synthetic = context.synthetic_work ? std::optional<bool>(true) : options_.synthetic;
+    const auto synthetic = context.synthetic_work ? std::optional<bool>(true) : options.synthetic;
     if (synthetic) {
         producer.set("synthetic", *synthetic);
     }
@@ -205,43 +217,90 @@ json::Object TelemetryBus::make_envelope(std::string_view event_type, const Tele
     return env;
 }
 
+}  // namespace
+
+TelemetryBus::TelemetryBus(TelemetryOptions options) : options_(std::move(options)), instance_id_(make_id("tel")) {
+    if (options_.node_id.empty()) {
+        options_.node_id = host_name();
+    }
+    if (options_.queue_capacity == 0) {
+        options_.queue_capacity = 1;
+    }
+    shared_ = std::make_shared<Shared>(options_, instance_id_);
+    writer_ = std::thread([shared = shared_] { Shared::writer_loop(shared); });
+}
+
+TelemetryBus::~TelemetryBus() { shutdown(); }
+
+void TelemetryBus::add_sink(std::shared_ptr<TelemetrySink> sink) {
+    if (!sink) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(shared_->mutex);
+    shared_->sinks.push_back(std::move(sink));
+}
+
+bool TelemetryBus::enabled(TelemetryLevel level) const noexcept {
+    if (options_.level == TelemetryLevel::off || level == TelemetryLevel::off) {
+        return false;
+    }
+    if (static_cast<int>(level) > static_cast<int>(options_.level)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(shared_->mutex);
+    return !shared_->sinks.empty() && !shared_->stopping;
+}
+
+std::uint64_t TelemetryBus::emitted_events() const noexcept { return shared_->emitted.load(); }
+std::uint64_t TelemetryBus::dropped_events() const noexcept { return shared_->dropped.load(); }
+std::uint64_t TelemetryBus::failed_sinks() const noexcept { return shared_->failed_sinks.load(); }
+
+json::Object TelemetryBus::make_envelope(std::string_view event_type, const TelemetryContext& context,
+                                         json::Object attributes, std::uint64_t sequence,
+                                         TelemetryLevel level) const {
+    return build_envelope(options_, instance_id_, event_type, context, std::move(attributes), sequence, level);
+}
+
 bool TelemetryBus::emit(std::string_view event_type, const TelemetryContext& context, json::Object attributes,
                         TelemetryLevel level) {
     if (!enabled(level)) {
         return false;
     }
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (stopping_ || sinks_.empty()) {
+    Shared& s = *shared_;
+    std::unique_lock<std::mutex> lock(s.mutex);
+    if (s.stopping || s.sinks.empty()) {
         return false;
     }
-    if (queue_.size() >= options_.queue_capacity) {
-        dropped_.fetch_add(1, std::memory_order_relaxed);
+    if (s.queue.size() >= options_.queue_capacity) {
+        s.dropped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    const std::uint64_t seq = next_sequence_++;
-    queue_.emplace_back(seq, json::Value(make_envelope(event_type, context, std::move(attributes), seq, level)).dump());
-    ++enqueued_count_;
-    emitted_.fetch_add(1, std::memory_order_relaxed);
+    const std::uint64_t seq = s.next_sequence++;
+    s.queue.emplace_back(
+        seq, json::Value(make_envelope(event_type, context, std::move(attributes), seq, level)).dump());
+    ++s.enqueued_count;
+    s.emitted.fetch_add(1, std::memory_order_relaxed);
     lock.unlock();
-    cv_.notify_one();
+    s.cv.notify_one();
     return true;
 }
 
-void TelemetryBus::writer_loop() {
-    std::unique_lock<std::mutex> lock(mutex_);
+void TelemetryBus::Shared::writer_loop(const std::shared_ptr<Shared>& shared) {
+    Shared& s = *shared;
+    std::unique_lock<std::mutex> lock(s.mutex);
     while (true) {
-        cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
-        if (queue_.empty() && stopping_) {
+        s.cv.wait(lock, [&s] { return s.stopping || s.abandoned.load() || !s.queue.empty(); });
+        if (s.abandoned.load() || (s.queue.empty() && s.stopping)) {
             break;
         }
         std::deque<std::pair<std::uint64_t, std::string>> batch;
-        batch.swap(queue_);
-        auto sinks = sinks_;
+        batch.swap(s.queue);
+        auto sinks = s.sinks;
         lock.unlock();
         auto retire_sink = [&](std::shared_ptr<TelemetrySink> failed) {
             lock.lock();
-            std::erase(sinks_, failed);
-            failed_sinks_.fetch_add(1, std::memory_order_relaxed);
+            std::erase(s.sinks, failed);
+            s.failed_sinks.fetch_add(1, std::memory_order_relaxed);
             lock.unlock();
             // Retain shared ownership through registry removal, then discard
             // every snapshot alias outside the mutex. User destruction must
@@ -253,6 +312,8 @@ void TelemetryBus::writer_loop() {
         for (const auto& [sequence, line] : batch) {
             for (const auto& sink : sinks) {
                 if (!sink) continue;
+                // shutdown() gave up on this writer: start no further sink call.
+                if (s.abandoned.load()) break;
                 try {
                     sink->write_event(sequence, line);
                 } catch (...) {
@@ -262,6 +323,7 @@ void TelemetryBus::writer_loop() {
         }
         for (const auto& sink : sinks) {
             if (!sink) continue;
+            if (s.abandoned.load()) break;
             try {
                 sink->flush();
             } catch (...) {
@@ -269,62 +331,88 @@ void TelemetryBus::writer_loop() {
             }
         }
         lock.lock();
-        written_sequence_ += batch.size();
+        if (s.abandoned.load()) {
+            break;
+        }
+        s.written_sequence += batch.size();
         // Live drop reporting: first drop immediately, then rate limited.
-        if (!stopping_ && !sinks_.empty() && dropped_.load() > reported_dropped_ && options_.level != TelemetryLevel::off) {
+        if (!s.stopping && !s.sinks.empty() && s.dropped.load() > s.reported_dropped &&
+            s.options.level != TelemetryLevel::off) {
             const auto now = std::chrono::steady_clock::now();
-            if (reported_dropped_ == 0 || now - last_drop_report_ >= options_.drop_report_interval) {
-                enqueue_drop_report_locked(false);
+            if (s.reported_dropped == 0 || now - s.last_drop_report >= s.options.drop_report_interval) {
+                s.enqueue_drop_report_locked(false);
             }
         }
-        drained_cv_.notify_all();
+        s.drained_cv.notify_all();
     }
-    drained_cv_.notify_all();
+    s.exited = true;
+    s.exit_cv.notify_all();
+    s.drained_cv.notify_all();
 }
 
-void TelemetryBus::enqueue_drop_report_locked(bool final_report) {
-    const std::uint64_t dropped = dropped_.load();
+void TelemetryBus::Shared::enqueue_drop_report_locked(bool final_report) {
+    const std::uint64_t dropped_now = dropped.load();
     TelemetryContext ctx;
-    ctx.session_id = instance_id_;
-    const std::uint64_t seq = next_sequence_++;
-    queue_.emplace_back(seq, json::Value(make_envelope("telemetry.dropped", ctx,
-                                               json::Object{{"dropped_events", dropped},
-                                                            {"emitted_events", emitted_.load()},
-                                                            {"queue_capacity", options_.queue_capacity},
+    ctx.session_id = instance_id;
+    const std::uint64_t seq = next_sequence++;
+    queue.emplace_back(seq, json::Value(build_envelope(options, instance_id, "telemetry.dropped", ctx,
+                                               json::Object{{"dropped_events", dropped_now},
+                                                            {"emitted_events", emitted.load()},
+                                                            {"queue_capacity", options.queue_capacity},
                                                             {"final", final_report}},
                                                seq, TelemetryLevel::metrics))
                          .dump());
-    ++enqueued_count_;
-    reported_dropped_ = dropped;
-    last_drop_report_ = std::chrono::steady_clock::now();
+    ++enqueued_count;
+    reported_dropped = dropped_now;
+    last_drop_report = std::chrono::steady_clock::now();
 }
 
 void TelemetryBus::flush() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    const std::uint64_t target = enqueued_count_;
-    drained_cv_.wait(lock, [this, target] { return written_sequence_ >= target || stopped_; });
+    Shared& s = *shared_;
+    std::unique_lock<std::mutex> lock(s.mutex);
+    const std::uint64_t target = s.enqueued_count;
+    s.drained_cv.wait(lock, [&s, target] { return s.written_sequence >= target || s.stopped; });
 }
 
-void TelemetryBus::shutdown() {
-    {
-        std::unique_lock<std::mutex> lock(mutex_);
-        if (stopped_ || stopping_) {
-            return;
-        }
-        if (dropped_.load() > reported_dropped_ && !sinks_.empty() && options_.level != TelemetryLevel::off) {
-            // Final accounting event for drops not reported live yet;
-            // bypasses the capacity limit on purpose.
-            enqueue_drop_report_locked(true);
-        }
-        stopping_ = true;
+bool TelemetryBus::shutdown() {
+    Shared& s = *shared_;
+    std::unique_lock<std::mutex> lock(s.mutex);
+    if (s.stopped || s.stopping) {
+        return s.clean;
     }
-    cv_.notify_all();
-    if (writer_.joinable()) {
-        writer_.join();
+    if (s.dropped.load() > s.reported_dropped && !s.sinks.empty() && s.options.level != TelemetryLevel::off) {
+        // Final accounting event for drops not reported live yet;
+        // bypasses the capacity limit on purpose.
+        s.enqueue_drop_report_locked(true);
     }
-    std::lock_guard<std::mutex> lock(mutex_);
-    stopped_ = true;
-    drained_cv_.notify_all();
+    s.stopping = true;
+    s.cv.notify_all();
+    const auto timeout = std::max(options_.shutdown_timeout, std::chrono::milliseconds(0));
+    const bool exited = s.exit_cv.wait_for(lock, timeout, [&s] { return s.exited; });
+    if (exited) {
+        lock.unlock();
+        if (writer_.joinable()) {
+            writer_.join();
+        }
+        lock.lock();
+    } else {
+        // A sink did not return within the timeout. Abandon what is still
+        // queued and leave the writer to finish its current sink call on its
+        // own: it holds the shared state and the sinks it snapshotted, and
+        // starts no further sink call once `abandoned` is set.
+        s.abandoned.store(true);
+        s.clean = false;
+        std::deque<std::pair<std::uint64_t, std::string>> discarded;
+        discarded.swap(s.queue);
+        s.cv.notify_all();
+        lock.unlock();
+        discarded.clear();  // freed with the mutex released
+        writer_.detach();
+        lock.lock();
+    }
+    s.stopped = true;
+    s.drained_cv.notify_all();
+    return s.clean;
 }
 
 }  // namespace sonder::inference
