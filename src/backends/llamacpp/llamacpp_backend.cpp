@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <regex>
 #include <span>
 #include <string>
@@ -560,6 +561,9 @@ struct LlamaCppBackend::Impl {
     // Resolved in-process speculative decoding state.
     SpeculativeType active_spec = SpeculativeType::kNone;
     std::int32_t active_draft_max = 0;
+    SpeculativeVerificationMode requested_spec_verification_mode = SpeculativeVerificationMode::TargetMatch;
+    SpeculativeVerificationMode effective_spec_verification_mode = SpeculativeVerificationMode::TargetMatch;
+    sonder::inference::SpeculativeVerifier spec_verifier{};
     NgramMatcher ngram_matcher{false};
     std::unique_ptr<NgramModTable> ngram_mod;
     std::unique_ptr<SuffixMatcher> suffix_matcher;
@@ -808,6 +812,10 @@ struct LlamaCppBackend::Impl {
         slot_clock = 0;
         active_spec = SpeculativeType::kNone;
         active_draft_max = 0;
+        requested_spec_verification_mode = SpeculativeVerificationMode::TargetMatch;
+        effective_spec_verification_mode = SpeculativeVerificationMode::TargetMatch;
+        spec_verifier.set_mode(SpeculativeVerificationMode::TargetMatch);
+        spec_verifier.reset_metrics();
         ngram_mod.reset();
         suffix_matcher.reset();
     }
@@ -1211,6 +1219,194 @@ struct LlamaCppBackend::Impl {
                 std::span<const float>(logits, static_cast<std::size_t>(n_vocab)), tok, sp.top_logprobs);
         }
         return tok;
+    }
+
+    // Extracts the post-processor target probability distribution `p` at
+    // `batch_idx` (applying grammar mask + all non-terminal sampler stages in
+    // `sampler`, without invoking the terminal dist/greedy selector). Used
+    // only when opt-in `StochasticRejection` activates with real proposal probs.
+    bool ExtractPostProcessorTargetProbs(int32_t batch_idx, const SamplingParams& sp, llama_sampler* sampler,
+                                         llama_sampler* grammar_sampler, int32_t n_vocab,
+                                         std::vector<double>& out_probs) {
+        if (ctx == nullptr || sampler == nullptr || n_vocab <= 0) {
+            return false;
+        }
+        const float* logits = llama_get_logits_ith(ctx, batch_idx);
+        if (logits == nullptr) {
+            return false;
+        }
+        auto& cand = grammar_candidates;
+        cand.resize(static_cast<std::size_t>(n_vocab));
+        for (int32_t v = 0; v < n_vocab; ++v) {
+            cand[static_cast<std::size_t>(v)] = llama_token_data{v, logits[v], 0.0F};
+        }
+        llama_token_data_array cur_p{cand.data(), cand.size(), -1, false};
+        if (grammar_sampler != nullptr) {
+            llama_sampler_apply(grammar_sampler, &cur_p);
+        }
+        const int32_t n_stages = llama_sampler_chain_n(sampler);
+        // Apply all processor stages (logit_bias, penalties, top_k, typical_p,
+        // top_p, min_p, temp) while skipping the final greedy/dist selector.
+        const int32_t n_processors = n_stages > 0 ? (n_stages - 1) : 0;
+        for (int32_t s_idx = 0; s_idx < n_processors; ++s_idx) {
+            if (llama_sampler* stage = llama_sampler_chain_get(sampler, s_idx); stage != nullptr) {
+                llama_sampler_apply(stage, &cur_p);
+            }
+        }
+        if (cur_p.size == 0) {
+            return false;
+        }
+        out_probs.assign(static_cast<std::size_t>(n_vocab), 0.0);
+        if (sp.temperature <= 0.0F) {
+            int32_t best_id = -1;
+            float best_val = -std::numeric_limits<float>::infinity();
+            for (std::size_t i = 0; i < cur_p.size; ++i) {
+                const llama_token_data& td = cur_p.data[i];
+                if (td.id < 0 || td.id >= n_vocab || !std::isfinite(td.logit)) continue;
+                if (best_id < 0 || td.logit > best_val) {
+                    best_val = td.logit;
+                    best_id = td.id;
+                }
+            }
+            if (best_id < 0) return false;
+            out_probs[static_cast<std::size_t>(best_id)] = 1.0;
+            return true;
+        }
+
+        double max_logit = -std::numeric_limits<double>::infinity();
+        bool any_finite = false;
+        for (std::size_t i = 0; i < cur_p.size; ++i) {
+            const llama_token_data& td = cur_p.data[i];
+            if (td.id < 0 || td.id >= n_vocab || !std::isfinite(td.logit)) continue;
+            const double val = static_cast<double>(td.logit);
+            if (!any_finite || val > max_logit) {
+                max_logit = val;
+                any_finite = true;
+            }
+        }
+        if (!any_finite) return false;
+
+        double sum_exp = 0.0;
+        for (std::size_t i = 0; i < cur_p.size; ++i) {
+            const llama_token_data& td = cur_p.data[i];
+            if (td.id < 0 || td.id >= n_vocab || !std::isfinite(td.logit)) continue;
+            const double w = std::exp(static_cast<double>(td.logit) - max_logit);
+            out_probs[static_cast<std::size_t>(td.id)] = w;
+            sum_exp += w;
+        }
+        if (!(sum_exp > 0.0) || !std::isfinite(sum_exp)) return false;
+        const double inv_sum = 1.0 / sum_exp;
+        for (std::size_t i = 0; i < cur_p.size; ++i) {
+            const llama_token_data& td = cur_p.data[i];
+            if (td.id >= 0 && td.id < n_vocab) {
+                out_probs[static_cast<std::size_t>(td.id)] *= inv_sum;
+            }
+        }
+        return true;
+    }
+
+    // Verifies a speculative draft batch of length `k >= 1` using either the
+    // default `TargetMatch` reference path (always used for deterministic
+    // suffix/n-gram and greedy MTP proposals) or opt-in `StochasticRejection`
+    // (activated only when configured AND `proposal_dists` carries real q_j).
+    // Returns false on sampler/grammar deadlock or invalid distribution.
+    bool VerifySpeculativeBatch(std::span<const Token> draft_tokens,
+                                std::span<const std::vector<double>> proposal_dists, const SamplingParams& sp,
+                                llama_sampler* sampler, llama_sampler* grammar_sampler, bool gpu_sampled,
+                                int32_t n_vocab, std::mt19937_64& verify_rng, std::vector<Token>& accepted_tokens,
+                                std::vector<TokenLogprobInfo>& accepted_lps, std::size_t& n_accepted,
+                                GenerateResult& result) {
+        const std::size_t k = draft_tokens.size();
+        accepted_tokens.clear();
+        accepted_lps.clear();
+        n_accepted = 0;
+        if (!proposal_dists.empty() && proposal_dists.size() != k) {
+            return false;
+        }
+
+        const SpeculativeVerificationMode step_mode = sonder::inference::resolve_speculative_verification_mode(
+            requested_spec_verification_mode, !proposal_dists.empty() && k > 0u);
+        result.spec_verifier_mode = step_mode;
+
+        if (step_mode == SpeculativeVerificationMode::StochasticRejection) {
+            spec_verifier.set_mode(SpeculativeVerificationMode::StochasticRejection);
+            const sonder::inference::SpeculativeSequenceResult seq = spec_verifier.verify_sequence_lazy(
+                draft_tokens, /*has_proposal_dists=*/true,
+                [&](std::size_t pos, std::vector<double>& out_p) -> bool {
+                    return ExtractPostProcessorTargetProbs(static_cast<int32_t>(pos), sp, sampler, grammar_sampler,
+                                                           n_vocab, out_p);
+                },
+                [&](std::size_t pos, std::vector<double>& out_q) -> bool {
+                    out_q = proposal_dists[pos];
+                    return !out_q.empty();
+                },
+                [&](std::size_t pos, std::int32_t committed_tok) {
+                    if (grammar_sampler != nullptr) {
+                        llama_sampler_accept(grammar_sampler, committed_tok);
+                    }
+                    llama_sampler_accept(sampler, committed_tok);
+                    TokenLogprobInfo lp;
+                    if (sp.compute_logprobs) {
+                        if (const float* logits = llama_get_logits_ith(ctx, static_cast<int32_t>(pos));
+                            logits != nullptr) {
+                            lp = ComputeTokenLogprobs(
+                                std::span<const float>(logits, static_cast<std::size_t>(n_vocab)), committed_tok,
+                                sp.top_logprobs);
+                        }
+                    }
+                    accepted_lps.push_back(std::move(lp));
+                },
+                verify_rng);
+            if (!seq.ok) {
+                return false;
+            }
+            accepted_tokens = seq.emitted_tokens;
+            n_accepted = seq.accepted_draft_tokens;
+            if (seq.used_residual_resample) {
+                ++result.spec_residual_resamples;
+            }
+            result.spec_verify_overhead_us += seq.verify_overhead_us;
+            return true;
+        }
+
+        // Default reference path: exact target-sample matching (preserves GPU
+        // backend sampling and fast 1-token grammar rejection with zero extra
+        // distribution-extraction overhead).
+        const auto verify_start = Clock::now();
+        for (std::size_t j = 0; j < k; ++j) {
+            TokenLogprobInfo lp;
+            const Token sampled = SampleTokenAt(static_cast<int32_t>(j), sp, sampler, grammar_sampler, gpu_sampled,
+                                                n_vocab, sp.compute_logprobs ? &lp : nullptr);
+            if (sampled == LLAMA_TOKEN_NULL) {
+                return false;
+            }
+            accepted_tokens.push_back(sampled);
+            accepted_lps.push_back(std::move(lp));
+            if (sampled == draft_tokens[j]) {
+                ++n_accepted;
+            } else {
+                break;
+            }
+        }
+        bool sampled_bonus = false;
+        if (n_accepted == k) {
+            TokenLogprobInfo bonus_lp;
+            const Token bonus = SampleTokenAt(static_cast<int32_t>(k), sp, sampler, grammar_sampler, gpu_sampled,
+                                              n_vocab, sp.compute_logprobs ? &bonus_lp : nullptr);
+            if (bonus == LLAMA_TOKEN_NULL) {
+                return false;
+            }
+            accepted_tokens.push_back(bonus);
+            accepted_lps.push_back(std::move(bonus_lp));
+            sampled_bonus = true;
+        }
+        const double verify_us =
+            std::chrono::duration<double, std::micro>(Clock::now() - verify_start).count();
+        const double safe_us = (std::isfinite(verify_us) && verify_us > 0.0) ? verify_us : 0.0;
+        result.spec_verify_overhead_us += safe_us;
+        spec_verifier.record_external_step(SpeculativeVerificationMode::TargetMatch, k, n_accepted,
+                                           n_accepted < k, sampled_bonus, safe_us);
+        return true;
     }
 
 #if defined(SONDER_LLAMACPP_HAS_MTMD)
@@ -2086,6 +2282,12 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
         }
     }
 
+    impl_->requested_spec_verification_mode = options.spec_verification_mode;
+    impl_->effective_spec_verification_mode = ResolveSpeculativeVerificationMode(
+        options.spec_verification_mode, impl_->active_spec, /*proposer_has_probabilities=*/false);
+    impl_->spec_verifier.set_mode(impl_->requested_spec_verification_mode);
+    impl_->spec_verifier.reset_metrics();
+
     impl_->Emit(TelemetryKind::kModelLoaded, 0, MsSince(start), options.model_path);
     return Status::Ok();
 }
@@ -2112,6 +2314,14 @@ bool LlamaCppBackend::HasMmproj() const noexcept {
 
 std::uint32_t LlamaCppBackend::SlotCount() const noexcept {
     return impl_ ? static_cast<std::uint32_t>(impl_->slots.size()) : 0u;
+}
+
+SpeculativeVerificationMode LlamaCppBackend::RequestedSpecVerificationMode() const noexcept {
+    return impl_ ? impl_->requested_spec_verification_mode : SpeculativeVerificationMode::TargetMatch;
+}
+
+SpeculativeVerificationMode LlamaCppBackend::EffectiveSpecVerificationMode() const noexcept {
+    return impl_ ? impl_->effective_spec_verification_mode : SpeculativeVerificationMode::TargetMatch;
 }
 
 ModelInfo LlamaCppBackend::GetModelInfo() const {
@@ -2860,11 +3070,13 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         }
     }
 
-    // Bind GPU backend sampling when supported. Disabled when a grammar OR
-    // per-token logprobs are active so raw logits are readable on CPU.
+    // Bind GPU backend sampling when supported. Disabled when a grammar,
+    // per-token logprobs, or stochastic rejection verification is active so
+    // raw logits remain readable on CPU.
     [[maybe_unused]] bool target_gpu_sampled = false;
 #if defined(SONDER_LLAMACPP_HAS_SET_SAMPLER)
-    if (!grammar_sampler && !request.sampling.compute_logprobs) {
+    if (!grammar_sampler && !request.sampling.compute_logprobs &&
+        effective_spec_verification_mode != SpeculativeVerificationMode::StochasticRejection) {
         target_gpu_sampled = llama_set_sampler(ctx, slot_id, sampler.get());
     }
     struct ClearTargetSampler {
@@ -3129,6 +3341,9 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
     auto& draft_tokens = draft_scratch;
     auto& accepted_tokens = accepted_scratch;
     auto& accepted_lps = accepted_logprobs_scratch;
+    const std::uint64_t verify_seed =
+        request.sampling.seed == 0xFFFFFFFFU ? std::random_device{}() : static_cast<std::uint64_t>(request.sampling.seed);
+    std::mt19937_64 verify_rng(verify_seed ^ 0x517CC1B727220A95ULL);
 
     while (true) {
         if (cancelled()) return finish(StopReason::kCancelled);
@@ -3338,41 +3553,18 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
             continue;
         }
 
-        // Speculative verification: sample from indices 0..k and accept matched prefix + 1 bonus token.
+        // Speculative verification: verify draft tokens [0..k) + bonus token at k.
+        // Built-in deterministic/greedy proposers pass empty proposal_dists and
+        // stay on the exact TargetMatch reference path; StochasticRejection
+        // activates only when opted in AND a stochastic proposer supplies real q.
         const std::size_t k = draft_tokens.size();
         const Token step_base_tok = cur_tok;
         result.draft_tokens += static_cast<std::int32_t>(k);
-        accepted_tokens.clear();
-        accepted_lps.clear();
         std::size_t n_accepted = 0;
-        bool sample_deadlock = false;
-        for (std::size_t j = 0; j < k; ++j) {
-            TokenLogprobInfo lp;
-            const Token sampled =
-                sample_target(static_cast<int32_t>(j), request.sampling.compute_logprobs ? &lp : nullptr);
-            if (sampled == LLAMA_TOKEN_NULL) {
-                sample_deadlock = true;
-                break;
-            }
-            accepted_tokens.push_back(sampled);
-            accepted_lps.push_back(std::move(lp));
-            if (sampled == draft_tokens[j]) {
-                ++n_accepted;
-            } else {
-                break;
-            }
-        }
-        if (!sample_deadlock && n_accepted == k) {
-            TokenLogprobInfo bonus_lp;
-            const Token bonus =
-                sample_target(static_cast<int32_t>(k), request.sampling.compute_logprobs ? &bonus_lp : nullptr);
-            if (bonus == LLAMA_TOKEN_NULL) {
-                sample_deadlock = true;
-            } else {
-                accepted_tokens.push_back(bonus);
-                accepted_lps.push_back(std::move(bonus_lp));
-            }
-        }
+        const std::span<const std::vector<double>> no_proposal_dists{};
+        const bool sample_deadlock = !VerifySpeculativeBatch(
+            draft_tokens, no_proposal_dists, request.sampling, sampler.get(), grammar_sampler.get(),
+            target_gpu_sampled, n_vocab, verify_rng, accepted_tokens, accepted_lps, n_accepted, result);
         if (sample_deadlock) {
             invalidate_slot();
             result.status =
@@ -3538,6 +3730,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         int64_t hybrid_ckpt_offset = -1;
         int32_t effective_draft_max = 0;
         AdaptiveDraftController adaptive_ctrl{0};
+        std::mt19937_64 verify_rng{};
         std::size_t ngram_indexed = 0;
         int32_t batch_logit_idx = -1;
         GenerateResult result{};
@@ -3794,6 +3987,9 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         slot_busy[s->slot_idx] = 1u;
 
         const GenerateRequest& req = *task->req;
+        const std::uint64_t verify_seed =
+            req.sampling.seed == 0xFFFFFFFFU ? std::random_device{}() : static_cast<std::uint64_t>(req.sampling.seed);
+        s->verify_rng.seed(verify_seed ^ 0x517CC1B727220A95ULL);
         if (Status st = BuildSampler(req.sampling, vocab, n_vocab, static_cast<int32_t>(n_ctx), s->sampler,
                                      s->grammar_sampler);
             !st.ok()) {
@@ -3807,7 +4003,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         // mid-request: llama_sampler_chain_backend_init marks chain stages with
         // is_backend=true, so detaching and calling CPU llama_sampler_sample()
         // later would skip stages and trip GGML_ASSERT(cur_p.selected >= 0).
-        if (!s->grammar_sampler && !req.sampling.compute_logprobs) {
+        if (!s->grammar_sampler && !req.sampling.compute_logprobs &&
+            effective_spec_verification_mode != SpeculativeVerificationMode::StochasticRejection) {
             s->target_gpu_sampled = llama_set_sampler(ctx, s->slot_id, s->sampler.get());
         }
 #endif
@@ -4619,39 +4816,11 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             const std::size_t k = draft_tokens.size();
             const Token step_base_tok = s.cur_tok;
             s.result.draft_tokens += static_cast<std::int32_t>(k);
-            accepted_tokens.clear();
-            accepted_lps.clear();
             std::size_t n_accepted = 0;
-            bool sample_deadlock = false;
-            for (std::size_t j = 0; j < k; ++j) {
-                TokenLogprobInfo lp;
-                const Token sampled = SampleTokenAt(static_cast<int32_t>(j), req.sampling, s.sampler.get(),
-                                                    s.grammar_sampler.get(), s.target_gpu_sampled, n_vocab,
-                                                    req.sampling.compute_logprobs ? &lp : nullptr);
-                if (sampled == LLAMA_TOKEN_NULL) {
-                    sample_deadlock = true;
-                    break;
-                }
-                accepted_tokens.push_back(sampled);
-                accepted_lps.push_back(std::move(lp));
-                if (sampled == draft_tokens[j]) {
-                    ++n_accepted;
-                } else {
-                    break;
-                }
-            }
-            if (!sample_deadlock && n_accepted == k) {
-                TokenLogprobInfo bonus_lp;
-                const Token bonus = SampleTokenAt(static_cast<int32_t>(k), req.sampling, s.sampler.get(),
-                                                  s.grammar_sampler.get(), s.target_gpu_sampled, n_vocab,
-                                                  req.sampling.compute_logprobs ? &bonus_lp : nullptr);
-                if (bonus == LLAMA_TOKEN_NULL) {
-                    sample_deadlock = true;
-                } else {
-                    accepted_tokens.push_back(bonus);
-                    accepted_lps.push_back(std::move(bonus_lp));
-                }
-            }
+            const std::span<const std::vector<double>> no_proposal_dists{};
+            const bool sample_deadlock = !VerifySpeculativeBatch(
+                draft_tokens, no_proposal_dists, req.sampling, s.sampler.get(), s.grammar_sampler.get(),
+                s.target_gpu_sampled, n_vocab, s.verify_rng, accepted_tokens, accepted_lps, n_accepted, s.result);
             if (sample_deadlock) {
                 invalidate_slot(s);
                 s.result.status =

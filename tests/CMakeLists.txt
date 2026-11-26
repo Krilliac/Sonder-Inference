@@ -25,6 +25,7 @@ sonder_add_module_tests(core
     test_device_memory.cpp
     test_http_client.cpp
     test_recurrent_checkpoints.cpp
+    test_speculative_verifier.cpp
 )
 
 if(WIN32 AND TARGET sonder_core_tests)
