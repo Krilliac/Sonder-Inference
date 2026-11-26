@@ -120,9 +120,10 @@ struct RequestOptions {
     // and serialized JSON schema for native-format upstreams.
     std::optional<std::string> response_format_type = std::nullopt;
     std::optional<std::string> response_format_schema = std::nullopt;
-    // Optional tool definitions and tool_choice policy for chat requests.
+    // Optional tool definitions, tool_choice policy, and parallel tool-call flag for chat requests.
     std::vector<ToolDefinition> tools{};
     std::optional<ToolChoice> tool_choice = std::nullopt;
+    std::optional<bool> parallel_tool_calls = std::nullopt;
 };
 
 struct GenerationResult {

@@ -69,9 +69,10 @@ struct ChatJob {
     // Deferred schema value + immutable compiled grammar artifact resolved against model/tokenizer identity.
     std::optional<json::Value> pending_response_schema;
     std::shared_ptr<const CompiledGrammar> compiled_grammar;
-    // Optional tool definitions and tool_choice policy.
+    // Optional tool definitions, tool_choice policy, and parallel tool-call flag.
     std::vector<ToolDefinition> tools;
     std::optional<ToolChoice> tool_choice;
+    std::optional<bool> parallel_tool_calls;
 };
 
 struct EmbedJob {

@@ -908,6 +908,11 @@ public:
     }
     [[nodiscard]] BackendCapabilities capabilities() const override {
         BackendCapabilities caps;
+        // Intentionally omit Capability::tool_calling: direct llama.cpp renders
+        // chat via llama_chat_apply_template() and executes tool constraints when
+        // the server layer synthesizes tool prompts + GBNF grammars on top of
+        // Capability::structured_output (so health reports native_tools=true and
+        // backend_native_tools=false accurately).
         caps.add(Capability::tokenization)
             .add(Capability::streaming)
             .add(Capability::batched_prefill)

@@ -2218,3 +2218,160 @@ TEST_CASE("responses_handler: caller scope hashing, logprobs/budget parsing, and
         CHECK(server::validate_options(neg).code() == ErrorCode::invalid_argument);
     }
 }
+
+TEST_CASE("tool_calling: strict schema validation, non-strict fallback, and parallel_tool_calls") {
+    // 1. parse_openai_tools & parse_anthropic_tools preserve strict flag and reject non-bool strict.
+    {
+        std::vector<ToolDefinition> chat_tools;
+        const auto parsed = json::parse(
+            R"([
+                {"type":"function","function":{"name":"strict_ok","parameters":{"type":"object","properties":{"q":{"type":"string"}},"additionalProperties":false},"strict":true}},
+                {"type":"function","function":{"name":"loose_fn","parameters":{"type":"object"},"strict":false}},
+                {"type":"function","function":{"name":"default_fn","parameters":{"type":"object"}}}
+            ])");
+        REQUIRE(parsed.ok());
+        CHECK_FALSE(parse_openai_tools(parsed.value(), chat_tools, false).has_value());
+        REQUIRE(chat_tools.size() == 3u);
+        CHECK(chat_tools[0].strict == std::optional<bool>(true));
+        CHECK(chat_tools[1].strict == std::optional<bool>(false));
+        CHECK_FALSE(chat_tools[2].strict.has_value());
+
+        std::vector<ToolDefinition> resp_tools;
+        const auto resp_parsed = json::parse(
+            R"([{"type":"function","name":"flat_strict","parameters":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false},"strict":true}])");
+        REQUIRE(resp_parsed.ok());
+        CHECK_FALSE(parse_openai_tools(resp_parsed.value(), resp_tools, true).has_value());
+        REQUIRE(resp_tools.size() == 1u);
+        CHECK(resp_tools[0].strict == std::optional<bool>(true));
+
+        const auto bad_strict = json::parse(R"([{"type":"function","function":{"name":"bad","strict":"yes"}}])");
+        REQUIRE(bad_strict.ok());
+        const auto err = parse_openai_tools(bad_strict.value(), chat_tools, false);
+        REQUIRE(err.has_value());
+        CHECK(err->status == 400);
+        CHECK(err->param == std::optional<std::string>("tools[0].function.strict"));
+
+        std::vector<ToolDefinition> ant_tools;
+        const auto ant_ok = json::parse(
+            R"([{"name":"lookup","input_schema":{"type":"object","properties":{"id":{"type":"string"}},"additionalProperties":false},"strict":true}])");
+        REQUIRE(ant_ok.ok());
+        CHECK_FALSE(parse_anthropic_tools(ant_ok.value(), ant_tools).has_value());
+        REQUIRE(ant_tools.size() == 1u);
+        CHECK(ant_tools[0].strict == std::optional<bool>(true));
+    }
+
+    // 2. parse_chat_request & parse_responses_request preserve parallel_tool_calls and reject non-boolean values.
+    {
+        const auto chat_false = parse_chat_request(
+            R"({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}],"parallel_tool_calls":false})");
+        REQUIRE(std::holds_alternative<ChatJob>(chat_false));
+        CHECK(std::get<ChatJob>(chat_false).parallel_tool_calls == std::optional<bool>(false));
+
+        const auto chat_bad = parse_chat_request(R"({"messages":[{"role":"user","content":"hi"}],"parallel_tool_calls":"no"})");
+        REQUIRE(std::holds_alternative<ApiError>(chat_bad));
+        CHECK(std::get<ApiError>(chat_bad).param == std::optional<std::string>("parallel_tool_calls"));
+
+        const auto resp_false = parse_responses_request(
+            R"({"input":"hi","tools":[{"type":"function","name":"f"}],"parallel_tool_calls":false})");
+        REQUIRE(std::holds_alternative<ResponsesJob>(resp_false));
+        CHECK(std::get<ResponsesJob>(resp_false).parallel_tool_calls == std::optional<bool>(false));
+
+        const auto resp_bad = parse_responses_request(R"({"input":"hi","parallel_tool_calls":1})");
+        REQUIRE(std::holds_alternative<ApiError>(resp_bad));
+        CHECK(std::get<ApiError>(resp_bad).param == std::optional<std::string>("parallel_tool_calls"));
+    }
+
+    // 3. Strict schema enforcement fails closed BEFORE generation (no silent unrestricted fallback).
+    {
+        const ToolDefinition strict_valid{
+            "strict_valid", "d",
+            R"({"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false})",
+            true};
+        const ToolDefinition strict_defs{
+            "strict_defs", "d",
+            R"({"$defs":{"Loc":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false}},"type":"object","properties":{"loc":{"$ref":"#/$defs/Loc"}},"required":["loc"],"additionalProperties":false})",
+            true};
+        const ToolDefinition strict_allof{
+            "strict_allof", "d",
+            R"({"type":"object","allOf":[{"properties":{"a":{"type":"string"}}},{"required":["a"]}]})",
+            true};
+        const ToolDefinition strict_permissive_ap{
+            "strict_ap", "d",
+            R"({"type":"object","properties":{"a":{"type":"string"}},"additionalProperties":true})",
+            true};
+        const ToolDefinition strict_bad_json{"strict_bad", "d", "{not-json", true};
+        const ToolDefinition non_strict_allof{
+            "loose_allof", "d",
+            R"({"type":"object","allOf":[{"properties":{"a":{"type":"string"}}},{"required":["a"]}]})",
+            false};
+        const ToolDefinition unset_allof{
+            "unset_allof", "d",
+            R"({"type":"object","allOf":[{"properties":{"a":{"type":"string"}}},{"required":["a"]}]})",
+            std::nullopt};
+
+        // Valid strict schemas (including $defs/$ref) compile cleanly.
+        CHECK(validate_strict_tool_schemas({strict_valid, strict_defs}, std::nullopt).ok());
+        const auto g_valid = build_tool_call_gbnf({strict_valid}, ToolChoice{ToolChoiceMode::required, ""});
+        REQUIRE_MESSAGE(g_valid.ok(), g_valid.status().message());
+        CHECK(g_valid.value().find("city") != std::string::npos);
+
+        const auto g_defs = build_tool_call_gbnf({strict_defs}, ToolChoice{ToolChoiceMode::function, "strict_defs"});
+        REQUIRE_MESSAGE(g_defs.ok(), g_defs.status().message());
+        CHECK(g_defs.value().find("city") != std::string::npos);
+
+        // Unsupported strict:true schemas fail closed with invalid_argument.
+        for (const auto& bad_tool : {strict_allof, strict_permissive_ap, strict_bad_json}) {
+            CAPTURE(bad_tool.name);
+            const Status st = validate_strict_tool_schemas({bad_tool}, ToolChoice{ToolChoiceMode::auto_choice, ""});
+            CHECK(st.code() == ErrorCode::invalid_argument);
+            const auto g_req = build_tool_call_gbnf({bad_tool}, ToolChoice{ToolChoiceMode::required, ""});
+            CHECK_FALSE(g_req.ok());
+            CHECK(g_req.status().code() == ErrorCode::invalid_argument);
+            const auto g_fn = build_tool_call_gbnf({bad_tool}, ToolChoice{ToolChoiceMode::function, bad_tool.name});
+            CHECK_FALSE(g_fn.ok());
+            CHECK(g_fn.status().code() == ErrorCode::invalid_argument);
+        }
+
+        // tool_choice: none bypasses strict schema enforcement.
+        CHECK(validate_strict_tool_schemas({strict_allof}, ToolChoice{ToolChoiceMode::none, ""}).ok());
+
+        // Non-strict (false or unset) preserves legacy object fallback.
+        for (const auto& loose_tool : {non_strict_allof, unset_allof}) {
+            CAPTURE(loose_tool.name);
+            CHECK(validate_strict_tool_schemas({loose_tool}, std::nullopt).ok());
+            const auto g_req = build_tool_call_gbnf({loose_tool}, ToolChoice{ToolChoiceMode::required, ""});
+            REQUIRE_MESSAGE(g_req.ok(), g_req.status().message());
+            CHECK(g_req.value().find(loose_tool.name) != std::string::npos);
+        }
+    }
+
+    // 4. format_tools_system_prompt and ToolCallStreamParser / extract_tool_calls honor parallel_tool_calls == false.
+    {
+        const std::vector<ToolDefinition> tools = {{"a", "desc a", ""}, {"b", "desc b", ""}};
+        const std::string prompt_single =
+            format_tools_system_prompt(tools, ToolChoice{ToolChoiceMode::auto_choice, ""}, false);
+        CHECK(prompt_single.find("at most one tool") != std::string::npos);
+
+        const std::string prompt_none = format_tools_system_prompt(tools, ToolChoice{ToolChoiceMode::none, ""}, false);
+        CHECK(prompt_none.find("at most one tool") == std::string::npos);
+
+        const std::string two_tags =
+            "Intro <tool_call>{\"name\":\"a\",\"arguments\":{\"x\":1}}</tool_call> mid "
+            "<tool_call>{\"name\":\"b\",\"arguments\":{\"y\":2}}</tool_call> end";
+        const auto ext_single = extract_tool_calls(two_tags, "c_", /*allow_parallel=*/false);
+        REQUIRE(ext_single.tool_calls.size() == 1u);
+        CHECK(ext_single.tool_calls[0].name == "a");
+        CHECK(ext_single.visible_text == "Intro  mid  end");
+
+        const auto ext_parallel = extract_tool_calls(two_tags, "c_", /*allow_parallel=*/true);
+        REQUIRE(ext_parallel.tool_calls.size() == 2u);
+
+        // JSON array inside a single <tool_call> tag is also capped to 1 when allow_parallel == false.
+        const std::string arr_tag =
+            R"(<tool_call>[{"name":"a","arguments":{"x":1}},{"name":"b","arguments":{"y":2}}]</tool_call>)";
+        const auto ext_arr_single = extract_tool_calls(arr_tag, "c_", /*allow_parallel=*/false);
+        REQUIRE(ext_arr_single.tool_calls.size() == 1u);
+        CHECK(ext_arr_single.tool_calls[0].name == "a");
+        CHECK(ext_arr_single.visible_text.empty());
+    }
+}

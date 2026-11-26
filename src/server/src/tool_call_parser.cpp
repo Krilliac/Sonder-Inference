@@ -386,6 +386,13 @@ std::optional<ApiError> parse_openai_tools(const json::Value& value, std::vector
             }
             def.parameters_json = params->dump();
         }
+        if (const json::Value* strict_v = spec->find("strict"); strict_v != nullptr && !strict_v->is_null()) {
+            if (!strict_v->is_bool()) {
+                return bad_req("invalid_request", spec_prefix + ".strict must be a boolean",
+                               spec_prefix + ".strict");
+            }
+            def.strict = strict_v->as_bool();
+        }
         out.push_back(std::move(def));
     }
     return std::nullopt;
@@ -542,6 +549,12 @@ std::optional<ApiError> parse_anthropic_tools(const json::Value& value, std::vec
             }
             def.parameters_json = schema->dump();
         }
+        if (const json::Value* strict_v = arr[i].find("strict"); strict_v != nullptr && !strict_v->is_null()) {
+            if (!strict_v->is_bool()) {
+                return bad_req("invalid_request", where + ".strict must be a boolean", where + ".strict");
+            }
+            def.strict = strict_v->as_bool();
+        }
         out.push_back(std::move(def));
     }
     return std::nullopt;
@@ -592,7 +605,8 @@ std::optional<ApiError> parse_anthropic_tool_choice(const json::Value& value, co
 }
 
 std::string format_tools_system_prompt(const std::vector<ToolDefinition>& tools,
-                                       const std::optional<ToolChoice>& choice) {
+                                       const std::optional<ToolChoice>& choice,
+                                       std::optional<bool> parallel_tool_calls) {
     if (tools.empty()) {
         return {};
     }
@@ -612,6 +626,7 @@ std::string format_tools_system_prompt(const std::vector<ToolDefinition>& tools,
         }
         out += "\n";
     }
+    const bool suppress_calls = choice && choice->mode == ToolChoiceMode::none;
     if (choice) {
         switch (choice->mode) {
             case ToolChoiceMode::none:
@@ -626,6 +641,9 @@ std::string format_tools_system_prompt(const std::vector<ToolDefinition>& tools,
             case ToolChoiceMode::auto_choice:
                 break;
         }
+    }
+    if (!suppress_calls && parallel_tool_calls && !*parallel_tool_calls) {
+        out += "\nCall at most one tool in this response; do not emit multiple or parallel tool calls.\n";
     }
     return out;
 }
@@ -645,23 +663,24 @@ std::string canonical_tool_parameters(const ToolDefinition& tool) {
 
 std::string build_tool_call_cache_key(const std::vector<ToolDefinition>& tools, const ToolChoice& choice) {
     json::Array tool_entries;
+    auto push_tool = [&](const ToolDefinition& t) {
+        tool_entries.emplace_back(json::Object{
+            {"name", t.name},
+            {"parameters", canonical_tool_parameters(t)},
+            {"strict", t.strict ? json::Value(*t.strict) : json::Value(nullptr)},
+        });
+    };
     if (choice.mode == ToolChoiceMode::function) {
         for (const auto& t : tools) {
             if (t.name == choice.function_name) {
-                tool_entries.emplace_back(json::Object{
-                    {"name", t.name},
-                    {"parameters", canonical_tool_parameters(t)},
-                });
+                push_tool(t);
                 break;
             }
         }
     } else {
         tool_entries.reserve(tools.size());
         for (const auto& t : tools) {
-            tool_entries.emplace_back(json::Object{
-                {"name", t.name},
-                {"parameters", canonical_tool_parameters(t)},
-            });
+            push_tool(t);
         }
     }
     json::Object key_doc{
@@ -670,6 +689,48 @@ std::string build_tool_call_cache_key(const std::vector<ToolDefinition>& tools, 
         {"tools", std::move(tool_entries)},
     };
     return canonical_json_dump(json::Value(std::move(key_doc)));
+}
+
+Result<json::Value> validate_tool_params_for_engine(const ToolDefinition& tool, bool relax_nonstrict,
+                                                  const StructuredGrammarEngine& engine, bool& relaxed_any) {
+    const bool is_strict = tool.strict.value_or(false);
+    if (tool.parameters_json.empty()) {
+        return json::Value(json::Object{{"type", "object"}});
+    }
+    auto parsed = json::parse(tool.parameters_json);
+    if (!parsed.ok() || !parsed.value().is_object()) {
+        if (is_strict) {
+            return Status(ErrorCode::invalid_argument,
+                          "strict tool '" + tool.name + "' parameters schema is not a valid JSON object");
+        }
+        relaxed_any = true;
+        return json::Value(json::Object{{"type", "object"}});
+    }
+    if (relax_nonstrict && !is_strict) {
+        relaxed_any = true;
+        return json::Value(json::Object{{"type", "object"}});
+    }
+    auto compiled = engine.compile_json_schema(parsed.value());
+    if (!compiled.ok()) {
+        if (is_strict) {
+            return Status(ErrorCode::invalid_argument,
+                          "strict tool '" + tool.name + "' parameters schema could not be compiled to strict grammar: " +
+                              compiled.status().message());
+        }
+        relaxed_any = true;
+        return json::Value(json::Object{{"type", "object"}});
+    }
+    return std::move(parsed).value();
+}
+
+void hoist_single_branch_defs(const json::Value& params_schema, json::Object& wrapper) {
+    if (!params_schema.is_object()) return;
+    const auto& p_obj = params_schema.as_object();
+    for (const char* def_key : {"$defs", "definitions"}) {
+        if (const json::Value* defs = p_obj.find(def_key); defs != nullptr && defs->is_object()) {
+            wrapper.set(def_key, *defs);
+        }
+    }
 }
 
 Result<CompiledGrammar> compile_tool_call_grammar_uncached(const std::vector<ToolDefinition>& tools,
@@ -683,29 +744,30 @@ Result<CompiledGrammar> compile_tool_call_grammar_uncached(const std::vector<Too
     const auto t0 = std::chrono::steady_clock::now();
     bool relaxed_any = false;
 
-    auto make_call_schema = [&](const ToolDefinition& tool, bool strict_params) -> json::Value {
-        json::Value params_schema = json::Object{{"type", "object"}};
-        if (strict_params && !tool.parameters_json.empty()) {
-            auto parsed = json::parse(tool.parameters_json);
-            if (parsed.ok() && parsed.value().is_object()) {
-                // Verify the parameter schema itself converts cleanly; if not, caller retries non-strict.
-                if (engine.compile_json_schema(parsed.value()).ok()) {
-                    params_schema = std::move(parsed).value();
-                } else {
-                    relaxed_any = true;
-                }
-            }
-        } else if (!strict_params && !tool.parameters_json.empty()) {
-            relaxed_any = true;
+    auto make_call_schema = [&](const ToolDefinition& tool, bool relax_nonstrict,
+                                bool hoist_defs) -> Result<json::Value> {
+        auto params = validate_tool_params_for_engine(tool, relax_nonstrict, engine, relaxed_any);
+        if (!params.ok()) {
+            return params.status();
         }
-        return json::Object{{"type", "object"},
-                            {"properties", json::Object{{"name", json::Object{{"const", tool.name}}},
-                                                        {"arguments", std::move(params_schema)}}},
-                            {"required", json::Array{"name", "arguments"}},
-                            {"additionalProperties", false}};
+        json::Object wrapper{
+            {"type", "object"},
+            {"required", json::Array{"name", "arguments"}},
+            {"additionalProperties", false}};
+        if (hoist_defs) {
+            hoist_single_branch_defs(params.value(), wrapper);
+        }
+        wrapper.set("properties",
+                    json::Object{{"name", json::Object{{"const", tool.name}}},
+                                 {"arguments", std::move(params).value()}});
+        return json::Value(std::move(wrapper));
     };
 
-    auto build_call_schema = [&](bool strict_params) -> Result<json::Value> {
+    bool any_strict = false;
+    bool any_nonstrict = false;
+    auto build_call_schema = [&](bool relax_nonstrict) -> Result<json::Value> {
+        any_strict = false;
+        any_nonstrict = false;
         if (choice.mode == ToolChoiceMode::function) {
             const ToolDefinition* found = nullptr;
             for (const auto& t : tools) {
@@ -718,32 +780,47 @@ Result<CompiledGrammar> compile_tool_call_grammar_uncached(const std::vector<Too
                 return Status(ErrorCode::invalid_argument,
                               "tool_choice function '" + choice.function_name + "' not found");
             }
-            return make_call_schema(*found, strict_params);
+            any_strict = found->strict.value_or(false);
+            any_nonstrict = !any_strict;
+            return make_call_schema(*found, relax_nonstrict, /*hoist_defs=*/true);
         }
         json::Array branches;
         branches.reserve(tools.size());
+        const bool single = tools.size() == 1;
         for (const auto& t : tools) {
-            branches.push_back(make_call_schema(t, strict_params));
+            if (t.strict.value_or(false)) any_strict = true;
+            else any_nonstrict = true;
+            auto branch = make_call_schema(t, relax_nonstrict, /*hoist_defs=*/single);
+            if (!branch.ok()) {
+                return branch.status();
+            }
+            branches.push_back(std::move(branch).value());
         }
         return branches.size() == 1 ? std::move(branches.front())
                                     : json::Value(json::Object{{"anyOf", std::move(branches)}});
     };
 
-    auto call_schema = build_call_schema(true);
+    auto call_schema = build_call_schema(/*relax_nonstrict=*/false);
     if (!call_schema.ok()) {
         return call_schema.status();
     }
     auto base = engine.compile_json_schema(call_schema.value());
     if (!base.ok()) {
-        // Retry with non-strict object arguments (e.g., if nested parameter schema
-        // contained root-relative $defs/$ref) while still strictly enforcing the
-        // forced `<tool_call>{"name":...,"arguments":{...}}</tool_call>` wrapper.
-        auto relaxed_schema = build_call_schema(false);
+        if (!any_nonstrict) {
+            return Status(ErrorCode::invalid_argument,
+                          "strict tool schema grammar compilation failed: " + base.status().message());
+        }
+        // Retry relaxing only non-strict tools while preserving strict:true schemas.
+        auto relaxed_schema = build_call_schema(/*relax_nonstrict=*/true);
         if (!relaxed_schema.ok()) {
             return relaxed_schema.status();
         }
         base = engine.compile_json_schema(relaxed_schema.value());
         if (!base.ok()) {
+            if (any_strict) {
+                return Status(ErrorCode::invalid_argument,
+                              "strict tool schema grammar compilation failed: " + base.status().message());
+            }
             return base.status();
         }
         relaxed_any = true;
@@ -771,6 +848,22 @@ Result<CompiledGrammar> compile_tool_call_grammar_uncached(const std::vector<Too
 }
 
 }  // namespace
+
+Status validate_strict_tool_schemas(const std::vector<ToolDefinition>& tools, const std::optional<ToolChoice>& choice,
+                                    const StructuredGrammarEngine& engine) {
+    if (tools.empty() || (choice && choice->mode == ToolChoiceMode::none)) {
+        return Status::success();
+    }
+    bool unused_relaxed = false;
+    for (const auto& t : tools) {
+        if (!t.strict.value_or(false)) continue;
+        auto validated = validate_tool_params_for_engine(t, /*relax_nonstrict=*/false, engine, unused_relaxed);
+        if (!validated.ok()) {
+            return validated.status();
+        }
+    }
+    return Status::success();
+}
 
 Result<std::shared_ptr<const CompiledGrammar>> build_tool_call_grammar(
     const std::vector<ToolDefinition>& tools, const ToolChoice& choice,
@@ -829,6 +922,22 @@ Result<PreparedStructuredGrammar> resolve_structured_grammar(
     PreparedStructuredGrammar out;
     const std::string tok_id =
         tokenizer_identity.empty() ? std::string("default") : std::string(tokenizer_identity);
+
+    const bool tool_choice_none = tool_choice && tool_choice->mode == ToolChoiceMode::none;
+    const bool backend_handles_tools =
+        backend_native_tools || backend_name == "llamaserver" || backend_name == "ollama";
+    if (!tools.empty() && !tool_choice_none && !backend_handles_tools) {
+        const bool has_strict_tool = std::any_of(
+            tools.begin(), tools.end(), [](const ToolDefinition& t) { return t.strict.value_or(false); });
+        if (has_strict_tool && !backend_supports_structured_output) {
+            return Status(ErrorCode::unsupported,
+                          "backend '" + std::string(backend_name) +
+                              "' does not support strict tool schemas without structured_output capability");
+        }
+        if (Status st = validate_strict_tool_schemas(tools, tool_choice, engine); !st.ok()) {
+            return st;
+        }
+    }
 
     if (response_format_type && *response_format_type == "json_object") {
         if (cache != nullptr) {
@@ -890,19 +999,21 @@ Result<PreparedStructuredGrammar> resolve_structured_grammar(
 
     if (!tools.empty() && tool_choice &&
         (tool_choice->mode == ToolChoiceMode::required || tool_choice->mode == ToolChoiceMode::function) &&
-        backend_supports_structured_output && !backend_native_tools &&
-        backend_name != "llamaserver" && backend_name != "ollama") {
-        if (auto compiled = build_tool_call_grammar(tools, *tool_choice, cache, tok_id, engine); compiled.ok()) {
-            out.compiled = std::move(compiled).value();
-            out.grammar = out.compiled->gbnf;
+        backend_supports_structured_output && !backend_handles_tools) {
+        auto compiled = build_tool_call_grammar(tools, *tool_choice, cache, tok_id, engine);
+        if (!compiled.ok()) {
+            return compiled.status();
         }
+        out.compiled = std::move(compiled).value();
+        out.grammar = out.compiled->gbnf;
     }
     return out;
 }
 
 // ================================================================= ToolCallStreamParser
 
-ToolCallStreamParser::ToolCallStreamParser(std::string id_prefix) : id_prefix_(std::move(id_prefix)) {}
+ToolCallStreamParser::ToolCallStreamParser(std::string id_prefix, bool allow_parallel)
+    : id_prefix_(std::move(id_prefix)), allow_parallel_(allow_parallel) {}
 
 std::string ToolCallStreamParser::next_call_id() {
     return id_prefix_ + std::to_string(next_index_);
@@ -918,13 +1029,15 @@ void ToolCallStreamParser::try_emit_payload(std::string_view payload, std::strin
         out.visible_text += raw_close;
         return;
     }
-    for (auto& [name, args] : calls) {
+    const std::size_t allowed =
+        allow_parallel_ ? calls.size() : std::min<std::size_t>(calls.size(), next_index_ == 0u ? 1u : 0u);
+    for (std::size_t i = 0; i < allowed; ++i) {
         ParsedToolEvent ev;
         ev.index = next_index_;
         ev.id = next_call_id();
         ++next_index_;
-        ev.name = std::move(name);
-        ev.arguments_json = std::move(args);
+        ev.name = std::move(calls[i].first);
+        ev.arguments_json = std::move(calls[i].second);
         completed_.push_back(ToolCall{ev.id, ev.name, ev.arguments_json});
         out.tool_calls.push_back(std::move(ev));
     }
@@ -1082,8 +1195,8 @@ ToolCallStreamOutput ToolCallStreamParser::flush() {
     return out;
 }
 
-ExtractedToolOutput extract_tool_calls(std::string_view full_text, std::string id_prefix) {
-    ToolCallStreamParser parser(std::move(id_prefix));
+ExtractedToolOutput extract_tool_calls(std::string_view full_text, std::string id_prefix, bool allow_parallel) {
+    ToolCallStreamParser parser(std::move(id_prefix), allow_parallel);
     const ToolCallStreamOutput part1 = parser.feed(full_text);
     const ToolCallStreamOutput part2 = parser.flush();
     ExtractedToolOutput out;
