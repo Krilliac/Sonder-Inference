@@ -438,6 +438,12 @@ std::variant<ResponsesJob, ApiError> parse_responses_request_with_mode(std::stri
         }
         job.tool_choice = std::move(tc);
     }
+    if (const json::Value* ptc = body.find("parallel_tool_calls"); present(ptc)) {
+        if (!ptc->is_bool()) {
+            return bad("invalid_request", "parallel_tool_calls must be a boolean", "parallel_tool_calls");
+        }
+        job.parallel_tool_calls = ptc->as_bool();
+    }
 
     const json::Value* input = body.find("input");
     if (!present(input)) {
@@ -737,11 +743,16 @@ std::optional<ApiError> prepare_responses_grammar(
         const std::string code = resolved.status().code() == ErrorCode::unsupported
                                      ? "unsupported_parameter"
                                      : "invalid_request";
+        const bool from_tools = !job.response_format_type.has_value() && job.grammar.empty() && !job.tools.empty();
         const std::optional<std::string> param =
-            job.response_format_type && *job.response_format_type == "json_schema"
-                ? std::optional<std::string>("text.format.schema")
-                : (job.response_format_type ? std::optional<std::string>("text.format") : std::nullopt);
-        return make_error(400, code, "invalid text.format.schema: " + resolved.status().message(), param);
+            from_tools
+                ? std::optional<std::string>("tools")
+                : (job.response_format_type && *job.response_format_type == "json_schema"
+                       ? std::optional<std::string>("text.format.schema")
+                       : (job.response_format_type ? std::optional<std::string>("text.format") : std::nullopt));
+        const std::string msg =
+            from_tools ? resolved.status().message() : ("invalid text.format.schema: " + resolved.status().message());
+        return make_error(400, code, msg, param);
     }
     job.compiled_grammar = std::move(resolved.value().compiled);
     job.grammar = std::move(resolved.value().grammar);
@@ -834,7 +845,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     const bool tool_choice_none = job.tool_choice && job.tool_choice->mode == ToolChoiceMode::none;
     const bool parse_text_tools = !job.tools.empty() && !backend_native_tools && !tool_choice_none;
     if (parse_text_tools) {
-        const std::string tool_prompt = format_tools_system_prompt(job.tools, job.tool_choice);
+        const std::string tool_prompt = format_tools_system_prompt(job.tools, job.tool_choice, job.parallel_tool_calls);
         if (!conversation.empty() && conversation.front().role == "system") {
             append_chat_message_text(conversation.front(), "\n\n" + tool_prompt);
         } else {
@@ -878,7 +889,13 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
         if (!resolved.ok()) {
             ex.leave_inflight();
             session->close();
-            ex.send_error(make_error(400, "invalid_request", resolved.status().message(), "text.format"));
+            const std::string code = resolved.status().code() == ErrorCode::unsupported
+                                         ? "unsupported_parameter"
+                                         : "invalid_request";
+            const bool from_tools =
+                !job.response_format_type.has_value() && job.grammar.empty() && !job.tools.empty();
+            ex.send_error(make_error(400, code, resolved.status().message(),
+                                     from_tools ? "tools" : "text.format"));
             return;
         }
         compiled_grammar = std::move(resolved.value().compiled);
@@ -899,6 +916,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     ro.response_format_schema = job.response_format_schema;
     ro.tools = job.tools;
     ro.tool_choice = job.tool_choice;
+    ro.parallel_tool_calls = job.parallel_tool_calls;
     ro.priority_class = priority;
     ro.preserve_numeric_priority = corr.numeric_priority;
     if (deadline_ms) ro.deadline = deadline;
@@ -1034,7 +1052,9 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
         ro.admission = ticket;
     }
 
-    ToolCallStreamParser stream_parser("call_" + *ro.request_id + "_");
+    const bool allow_parallel = job.parallel_tool_calls.value_or(true);
+    ToolCallStreamParser stream_parser("call_" + *ro.request_id + "_", allow_parallel);
+    std::optional<std::uint32_t> single_native_tool_index;
     std::string streamed_visible_text;
     std::vector<ToolCall> streamed_tool_calls;
 
@@ -1105,6 +1125,13 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
             for (const auto& tcd : chunk.tool_call_deltas) {
                 if (tcd.index >= 64u) {
                     continue;
+                }
+                if (!allow_parallel) {
+                    if (!single_native_tool_index) {
+                        single_native_tool_index = tcd.index;
+                    } else if (tcd.index != *single_native_tool_index) {
+                        continue;
+                    }
                 }
                 if (tcd.index >= streamed_tool_calls.size()) {
                     streamed_tool_calls.resize(static_cast<std::size_t>(tcd.index) + 1);
@@ -1213,6 +1240,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
         final_visible = r.text;
         for (const auto& tc : r.tool_calls) {
             if (tc.name.empty() && tc.arguments_json.empty()) continue;
+            if (!allow_parallel && !final_calls.empty()) break;
             ToolCall normalized = tc;
             if (normalized.id.empty()) {
                 normalized.id = "call_" + *ro.request_id + "_" + std::to_string(final_calls.size());
@@ -1220,7 +1248,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
             final_calls.push_back(std::move(normalized));
         }
     } else if (parse_text_tools) {
-        ExtractedToolOutput ext = extract_tool_calls(r.text, "call_" + *ro.request_id + "_");
+        ExtractedToolOutput ext = extract_tool_calls(r.text, "call_" + *ro.request_id + "_", allow_parallel);
         final_visible = std::move(ext.visible_text);
         final_calls = std::move(ext.tool_calls);
     } else {

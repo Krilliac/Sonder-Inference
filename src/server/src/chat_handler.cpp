@@ -59,11 +59,16 @@ std::optional<ApiError> prepare_chat_grammar(
         const std::string code = resolved.status().code() == ErrorCode::unsupported
                                      ? "unsupported_parameter"
                                      : "invalid_request";
+        const bool from_tools = !job.response_format_type.has_value() && job.grammar.empty() && !job.tools.empty();
         const std::optional<std::string> param =
-            job.response_format_type && *job.response_format_type == "json_schema"
-                ? std::optional<std::string>("response_format.json_schema.schema")
-                : (job.response_format_type ? std::optional<std::string>("response_format") : std::nullopt);
-        return make_error(400, code, "invalid response_format: " + resolved.status().message(), param);
+            from_tools
+                ? std::optional<std::string>("tools")
+                : (job.response_format_type && *job.response_format_type == "json_schema"
+                       ? std::optional<std::string>("response_format.json_schema.schema")
+                       : (job.response_format_type ? std::optional<std::string>("response_format") : std::nullopt));
+        const std::string msg =
+            from_tools ? resolved.status().message() : ("invalid response_format: " + resolved.status().message());
+        return make_error(400, code, msg, param);
     }
     job.compiled_grammar = std::move(resolved.value().compiled);
     job.grammar = std::move(resolved.value().grammar);
@@ -105,7 +110,13 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
         if (!resolved.ok()) {
             ex.leave_inflight();
             session->close();
-            ex.send_error(make_error(400, "invalid_request", resolved.status().message(), "response_format"));
+            const std::string code = resolved.status().code() == ErrorCode::unsupported
+                                         ? "unsupported_parameter"
+                                         : "invalid_request";
+            const bool from_tools =
+                !job.response_format_type.has_value() && job.grammar.empty() && !job.tools.empty();
+            ex.send_error(make_error(400, code, resolved.status().message(),
+                                     from_tools ? "tools" : "response_format"));
             return;
         }
         compiled_grammar = std::move(resolved.value().compiled);
@@ -126,6 +137,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     ro.response_format_schema = job.response_format_schema;
     ro.tools = job.tools;
     ro.tool_choice = job.tool_choice;
+    ro.parallel_tool_calls = job.parallel_tool_calls;
     std::vector<std::string> warnings = apply_thinking_pins(ex.options, ro.thinking);
     reasoning_budget::apply(job, corr, ex.options, backend, ro, warnings);
     ro.priority_class = priority;
@@ -290,8 +302,10 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
 
     const bool tool_choice_none = job.tool_choice && job.tool_choice->mode == ToolChoiceMode::none;
     const bool tools_enabled = !job.tools.empty() && !backend_native_tools && !tool_choice_none;
-    ToolCallStreamParser tool_parser("call_" + *ro.request_id + "_");
+    const bool allow_parallel = job.parallel_tool_calls.value_or(true);
+    ToolCallStreamParser tool_parser("call_" + *ro.request_id + "_", allow_parallel);
     std::vector<bool> seen_native_tool_indices;
+    std::optional<std::uint32_t> single_native_tool_index;
     bool saw_text = false;
     bool emitted_tool_calls = false;
 
@@ -314,39 +328,54 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
             }
             // 1. Native upstream tool call deltas (e.g. llama-server, Ollama).
             if (!chunk.tool_call_deltas.empty()) {
-                emitted_tool_calls = true;
-                if (!ensure_stream_head()) {
-                    session->cancel();
-                    return false;
+                std::vector<const ToolCallDelta*> accepted;
+                accepted.reserve(chunk.tool_call_deltas.size());
+                for (const auto& tcd : chunk.tool_call_deltas) {
+                    if (!allow_parallel) {
+                        if (!single_native_tool_index) {
+                            single_native_tool_index = tcd.index;
+                        } else if (tcd.index != *single_native_tool_index) {
+                            continue;
+                        }
+                    }
+                    accepted.push_back(&tcd);
                 }
-                if (anthropic) {
-                    for (const auto& tcd : chunk.tool_call_deltas) {
-                        if (!send_frame(messages_stream.tool_call_delta(tcd))) {
+                if (!accepted.empty()) {
+                    emitted_tool_calls = true;
+                    if (!ensure_stream_head()) {
+                        session->cancel();
+                        return false;
+                    }
+                    if (anthropic) {
+                        for (const ToolCallDelta* tcd : accepted) {
+                            if (!send_frame(messages_stream.tool_call_delta(*tcd))) {
+                                session->cancel();
+                                return false;
+                            }
+                        }
+                    } else {
+                        json::Array tcs;
+                        tcs.reserve(accepted.size());
+                        for (const ToolCallDelta* tcd : accepted) {
+                            std::string id = tcd->id;
+                            if (tcd->index < 64u) {
+                                if (tcd->index >= seen_native_tool_indices.size()) {
+                                    seen_native_tool_indices.resize(static_cast<std::size_t>(tcd->index) + 1, false);
+                                }
+                                if (!seen_native_tool_indices[tcd->index]) {
+                                    seen_native_tool_indices[tcd->index] = true;
+                                    if (id.empty()) {
+                                        id = "call_" + *ro.request_id + "_" + std::to_string(tcd->index);
+                                    }
+                                }
+                            }
+                            tcs.emplace_back(
+                                openai_tool_call_delta_json(tcd->index, id, tcd->name, tcd->arguments_delta));
+                        }
+                        if (!send_event(chunk_object(json::Object{{"tool_calls", std::move(tcs)}}, nullptr))) {
                             session->cancel();
                             return false;
                         }
-                    }
-                } else {
-                    json::Array tcs;
-                    tcs.reserve(chunk.tool_call_deltas.size());
-                    for (const auto& tcd : chunk.tool_call_deltas) {
-                        std::string id = tcd.id;
-                        if (tcd.index < 64u) {
-                            if (tcd.index >= seen_native_tool_indices.size()) {
-                                seen_native_tool_indices.resize(static_cast<std::size_t>(tcd.index) + 1, false);
-                            }
-                            if (!seen_native_tool_indices[tcd.index]) {
-                                seen_native_tool_indices[tcd.index] = true;
-                                if (id.empty()) {
-                                    id = "call_" + *ro.request_id + "_" + std::to_string(tcd.index);
-                                }
-                            }
-                        }
-                        tcs.emplace_back(openai_tool_call_delta_json(tcd.index, id, tcd.name, tcd.arguments_delta));
-                    }
-                    if (!send_event(chunk_object(json::Object{{"tool_calls", std::move(tcs)}}, nullptr))) {
-                        session->cancel();
-                        return false;
                     }
                 }
             }
@@ -424,7 +453,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     const std::vector<ChatMessage>* messages_to_send = &job.messages;
     if (tools_enabled) {
         prepared_messages = job.messages;
-        const std::string tool_prompt = format_tools_system_prompt(job.tools, job.tool_choice);
+        const std::string tool_prompt = format_tools_system_prompt(job.tools, job.tool_choice, job.parallel_tool_calls);
         if (!prepared_messages.empty() && prepared_messages.front().role == "system") {
             append_chat_message_text(prepared_messages.front(), "\n\n" + tool_prompt);
         } else {
@@ -493,6 +522,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
             visible_text = r.text;
             for (const auto& tc : r.tool_calls) {
                 if (tc.name.empty() && tc.arguments_json.empty()) continue;
+                if (!allow_parallel && !final_tool_calls.empty()) break;
                 ToolCall normalized = tc;
                 if (normalized.id.empty()) {
                     normalized.id = "call_" + *ro.request_id + "_" + std::to_string(final_tool_calls.size());
@@ -500,7 +530,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
                 final_tool_calls.push_back(std::move(normalized));
             }
         } else if (tools_enabled) {
-            ExtractedToolOutput extracted = extract_tool_calls(r.text, "call_" + *ro.request_id + "_");
+            ExtractedToolOutput extracted = extract_tool_calls(r.text, "call_" + *ro.request_id + "_", allow_parallel);
             visible_text = std::move(extracted.visible_text);
             final_tool_calls = std::move(extracted.tool_calls);
         } else {

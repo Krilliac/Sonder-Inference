@@ -1320,4 +1320,30 @@ TEST_SUITE("llamaserver_tool_calling_and_stream") {
         CHECK(leg_parts[1].find("image_url")->find("url")->as_string() == "data:image/png;base64,AQID");
         CHECK(leg_parts[2].find("image_url")->find("url")->as_string() == "data:image/jpeg;base64,BAUG");
     }
+
+    TEST_CASE("build_chat_body preserves ToolDefinition.strict and ChatRequest.parallel_tool_calls when active") {
+        ChatRequest req = chat();
+        ToolDefinition strict_tool{"strict_fn", "Strict", R"({"type":"object","additionalProperties":false})", true};
+        ToolDefinition loose_tool{"loose_fn", "Loose", R"({"type":"object"})", false};
+        ToolDefinition default_tool{"default_fn", "Default", R"({"type":"object"})"};
+        req.tools = {strict_tool, loose_tool, default_tool};
+        req.tool_choice = ToolChoice{ToolChoiceMode::auto_choice, ""};
+        req.parallel_tool_calls = false;
+
+        const auto body = llamaserver::build_chat_body("m", req);
+        REQUIRE(body.find("parallel_tool_calls") != nullptr);
+        CHECK_FALSE(body.find("parallel_tool_calls")->as_bool());
+        const auto *tools = body.find("tools");
+        REQUIRE(tools != nullptr);
+        REQUIRE(tools->as_array().size() == 3u);
+        CHECK(tools->as_array()[0].find("function")->find("strict")->as_bool());
+        CHECK_FALSE(tools->as_array()[1].find("function")->find("strict")->as_bool());
+        CHECK(tools->as_array()[2].find("function")->find("strict") == nullptr);
+
+        // When tool_choice == none, tools and parallel_tool_calls are both omitted cleanly.
+        req.tool_choice = ToolChoice{ToolChoiceMode::none, ""};
+        const auto suppressed = llamaserver::build_chat_body("m", req);
+        CHECK(suppressed.find("tools") == nullptr);
+        CHECK(suppressed.find("parallel_tool_calls") == nullptr);
+    }
 }

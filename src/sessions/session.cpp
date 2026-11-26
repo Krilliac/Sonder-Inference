@@ -1083,6 +1083,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                 chat_request.response_format_schema = request_options.response_format_schema;
                 chat_request.tools = request_options.tools;
                 chat_request.tool_choice = request_options.tool_choice;
+                chat_request.parallel_tool_calls = request_options.parallel_tool_calls;
                 generated = backend_model.chat(chat_request, token, on_backend_chunk);
             } else {
                 generated = backend_model.generate(request, token, on_backend_chunk);

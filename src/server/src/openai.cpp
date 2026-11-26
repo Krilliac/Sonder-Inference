@@ -448,6 +448,12 @@ std::variant<ChatJob, ApiError> parse_chat_request_with_mode(std::string_view bo
         }
         job.tool_choice = std::move(tc);
     }
+    if (const json::Value* ptc = body.find("parallel_tool_calls"); present(ptc)) {
+        if (!ptc->is_bool()) {
+            return bad("invalid_request", "parallel_tool_calls must be a boolean", "parallel_tool_calls");
+        }
+        job.parallel_tool_calls = ptc->as_bool();
+    }
 
     if (const json::Value* model = body.find("model"); present(model)) {
         if (!model->is_string() || model->as_string().empty()) {
