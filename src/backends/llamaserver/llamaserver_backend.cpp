@@ -1,6 +1,7 @@
 #include "sonder/inference/backends/llamaserver.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -24,60 +25,94 @@
 namespace sonder::inference {
 namespace {
 
-bool contains_code_or_diff_markers(std::string_view text) noexcept {
-    return text.find("```") != std::string_view::npos ||
-           text.find("diff --git") != std::string_view::npos ||
-           text.find("@@ ") != std::string_view::npos;
-}
-
-bool chat_thinking_enabled(const ChatRequest &request) noexcept {
-    if (request.separate_reasoning)
-        return true;
-    if (request.thinking.enable_thinking.has_value())
-        return *request.thinking.enable_thinking;
-    if (request.thinking.reasoning_effort.has_value() && !request.thinking.reasoning_effort->empty() &&
-        *request.thinking.reasoning_effort != "none")
-        return true;
-    return false;
-}
-
-llamaserver::SpeculationWorkload classify_generate_workload(const GenerateRequest &request,
-                                                            std::string_view grammar) noexcept {
-    if (!grammar.empty() || !request.grammar.empty())
-        return llamaserver::SpeculationWorkload::tool_json;
-    if (contains_code_or_diff_markers(request.prompt))
-        return llamaserver::SpeculationWorkload::code_edit;
-    return llamaserver::SpeculationWorkload::general;
-}
-
-llamaserver::SpeculationWorkload classify_chat_workload(const ChatRequest &request,
-                                                        std::string_view grammar) noexcept {
-    if (!grammar.empty() || !request.grammar.empty() || llamaserver::chat_tools_requested(request) ||
-        (request.response_format_type && *request.response_format_type != "text"))
-        return llamaserver::SpeculationWorkload::tool_json;
-    if (chat_thinking_enabled(request))
-        return llamaserver::SpeculationWorkload::reasoning;
-    for (auto it = request.messages.rbegin(); it != request.messages.rend(); ++it) {
-        if (it->role == "user") {
-            if (contains_code_or_diff_markers(it->content))
-                return llamaserver::SpeculationWorkload::code_edit;
-            break;
+std::string find_arg_value(const std::vector<std::string> &args, std::string_view short_flag,
+                           std::string_view long_flag) {
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string_view arg = args[i];
+        if ((!short_flag.empty() && arg == short_flag) || (!long_flag.empty() && arg == long_flag)) {
+            if (i + 1u < args.size())
+                return args[i + 1u];
+            return {};
+        }
+        if (!long_flag.empty() && arg.size() > long_flag.size() + 1u &&
+            arg.compare(0, long_flag.size(), long_flag) == 0 && arg[long_flag.size()] == '=') {
+            return std::string(arg.substr(long_flag.size() + 1u));
         }
     }
-    return llamaserver::SpeculationWorkload::general;
+    return {};
 }
+
+std::string build_target_identity(const LlamaServerBackendOptions &options,
+                                  const std::vector<std::string> &launch_args,
+                                  const ModelDescriptor &descriptor,
+                                  const llamaserver::ServerProps &props) {
+    std::string raw;
+    if (options.mode == LlamaServerMode::spawn) {
+        raw = "spawn|exe=" + options.executable;
+        if (std::string model_arg = find_arg_value(launch_args, "-m", "--model"); !model_arg.empty())
+            raw += "|model_path=" + model_arg;
+        else if (std::string hf_arg = find_arg_value(launch_args, "-hf", "--hf-repo"); !hf_arg.empty())
+            raw += "|hf=" + hf_arg;
+    } else {
+        raw = "attach|url=" + options.base_url;
+    }
+    raw += "|id=" + descriptor.name;
+    if (!descriptor.quantization.empty())
+        raw += "|q=" + descriptor.quantization;
+    if (descriptor.size_bytes > 0u)
+        raw += "|bytes=" + std::to_string(descriptor.size_bytes);
+    if (props.n_ctx > 0u)
+        raw += "|ctx=" + std::to_string(props.n_ctx);
+    if (props.total_slots > 0u)
+        raw += "|slots=" + std::to_string(props.total_slots);
+    return llamaserver::normalize_speculation_identity(raw);
+}
+
+std::string build_draft_identity(const LlamaServerBackendOptions &options,
+                                 const std::vector<std::string> &launch_args) {
+    std::string raw;
+    const std::string spec_type = find_arg_value(launch_args, "", "--spec-type");
+    const std::string draft_model = find_arg_value(launch_args, "-md", "--model-draft");
+    if (!spec_type.empty())
+        raw += "type=" + spec_type;
+    if (!draft_model.empty()) {
+        if (!raw.empty())
+            raw += '|';
+        raw += "draft_path=" + draft_model;
+    }
+    if (raw.empty())
+        raw = (options.mode == LlamaServerMode::spawn) ? "spawn_default" : "upstream_default";
+    return llamaserver::normalize_speculation_identity(raw);
+}
+
+class ActiveGenerationGuard {
+  public:
+    explicit ActiveGenerationGuard(std::atomic<std::uint32_t> &counter) noexcept
+        : counter_(&counter), active_count_(counter.fetch_add(1u, std::memory_order_acq_rel) + 1u) {}
+    ~ActiveGenerationGuard() noexcept {
+        if (counter_ != nullptr)
+            counter_->fetch_sub(1u, std::memory_order_acq_rel);
+    }
+    ActiveGenerationGuard(const ActiveGenerationGuard &) = delete;
+    ActiveGenerationGuard &operator=(const ActiveGenerationGuard &) = delete;
+    [[nodiscard]] std::uint32_t active_count() const noexcept { return active_count_; }
+
+  private:
+    std::atomic<std::uint32_t> *counter_ = nullptr;
+    std::uint32_t active_count_ = 1u;
+};
 
 class ProbeGuard {
   public:
     ProbeGuard(llamaserver::AdaptiveSpeculationPolicy *policy,
-               llamaserver::SpeculationWorkload workload,
+               llamaserver::SpeculationContextKey key,
                bool active,
                std::uint64_t probe_id) noexcept
-        : policy_(policy), workload_(workload), active_(active), probe_id_(probe_id) {}
+        : policy_(policy), key_(std::move(key)), active_(active), probe_id_(probe_id) {}
     ~ProbeGuard() noexcept {
         if (active_ && policy_ != nullptr) {
             try {
-                policy_->cancel_probe(workload_, probe_id_);
+                policy_->cancel_probe(key_, probe_id_);
             } catch (...) {
             }
         }
@@ -88,26 +123,59 @@ class ProbeGuard {
 
   private:
     llamaserver::AdaptiveSpeculationPolicy *policy_ = nullptr;
-    llamaserver::SpeculationWorkload workload_ = llamaserver::SpeculationWorkload::general;
+    llamaserver::SpeculationContextKey key_;
     bool active_ = false;
     std::uint64_t probe_id_ = 0;
 };
 
 void record_speculation_observation(llamaserver::AdaptiveSpeculationPolicy *policy,
                                     const GenerateStats &stats,
-                                    llamaserver::SpeculationWorkload workload,
-                                    bool is_probe,
-                                    std::uint64_t probe_id,
+                                    const llamaserver::SpeculationContextKey &key,
+                                    const llamaserver::SpeculationDecision &decision,
+                                    double measured_decode_span_ms,
                                     ProbeGuard &probe_guard) {
-    if (policy == nullptr || !stats.backend_timings.has_value())
+    if (policy == nullptr)
         return;
-    auto obs = llamaserver::observation_from_timings(*stats.backend_timings, workload);
+    const bool has_timings = stats.backend_timings.has_value();
+    if (!has_timings && stats.eval_ns == 0u && measured_decode_span_ms <= 0.0 &&
+        !stats.predicted_tokens_per_second.has_value()) {
+        return;
+    }
+
+    llamaserver::SpeculationObservation obs;
+    if (has_timings) {
+        obs = llamaserver::observation_from_timings(*stats.backend_timings, key.workload);
+    } else {
+        obs.workload = key.workload;
+        obs.predicted_n = stats.completion_tokens;
+        obs.draft_n = stats.draft_tokens.value_or(0u);
+        obs.draft_n_accepted = std::min(stats.draft_accepted_tokens.value_or(0u), obs.draft_n);
+        if (stats.prompt_eval_ns > 0u)
+            obs.prompt_or_restore_ms = static_cast<double>(stats.prompt_eval_ns) / 1e6;
+    }
+    obs.context_key = key;
+    obs.has_context_key = true;
+    obs.draft_n_used = decision.draft_n_max;
+
+    // Prefer non-overlapping decode-only duration: backend predicted_ms, then
+    // backend eval_ns, then observed post-TTFT decode wall span (strictly
+    // excluding prompt prefill / prefix-restore latency).
+    if (obs.decode_elapsed_ms <= 0.0) {
+        if (stats.eval_ns > 0u) {
+            obs.decode_elapsed_ms = static_cast<double>(stats.eval_ns) / 1e6;
+        } else if (std::isfinite(measured_decode_span_ms) && measured_decode_span_ms > 0.0 &&
+                   obs.predicted_n > 1u) {
+            obs.decode_elapsed_ms = measured_decode_span_ms;
+        }
+    }
+    if (obs.prompt_or_restore_ms <= 0.0 && stats.prompt_eval_ns > 0u)
+        obs.prompt_or_restore_ms = static_cast<double>(stats.prompt_eval_ns) / 1e6;
     if (obs.decode_tps <= 0.0 && stats.predicted_tokens_per_second.has_value() &&
         std::isfinite(*stats.predicted_tokens_per_second) && *stats.predicted_tokens_per_second > 0.0) {
         obs.decode_tps = *stats.predicted_tokens_per_second;
     }
-    obs.is_probe = is_probe;
-    obs.probe_id = probe_id;
+    obs.is_probe = decision.is_probe;
+    obs.probe_id = decision.probe_id;
     probe_guard.disarm();
     policy->observe(obs);
 }
@@ -240,6 +308,10 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
     }
     const LlamaServerBackendOptions &options() const { return options_; }
     llamaserver::AdaptiveSpeculationPolicy *adaptive_speculation() const noexcept { return adaptive_spec_.get(); }
+    std::atomic<std::uint32_t> &active_generations() noexcept { return active_generations_; }
+    std::vector<std::string> effective_launch_args() const {
+        return supervisor_ ? supervisor_->launch_arguments() : options_.args;
+    }
     // Native attach observes the upstream without owning its process. Generic
     // OpenAI attach stays silent unless prefix warm-up was configured.
     std::optional<BackendRuntimeStatus> runtime_status() const override {
@@ -532,6 +604,7 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
     llamaserver::SlotAffinity slots_;
     std::shared_ptr<llamaserver::PrefixWarmup> warmup_;
     std::unique_ptr<llamaserver::AdaptiveSpeculationPolicy> adaptive_spec_;
+    std::atomic<std::uint32_t> active_generations_{0};
     mutable std::mutex stall_mutex_;
     std::uint64_t stall_events_ = 0;
     BackendWarning stall_warning_;
@@ -550,16 +623,24 @@ class LlamaServerModel final : public BackendModel {
         const auto props = backend_->served_props(cancel);
         if (auto status = llamaserver::validate_sampling(request.sampling, props.n_ctx); !status.ok())
             return status;
+        ActiveGenerationGuard active_guard(backend_->active_generations());
         const bool native = backend_->options().native_completion;
-        const auto workload = classify_generate_workload(request, backend_->options().grammar);
         auto *policy = backend_->adaptive_speculation();
+        llamaserver::SpeculationContextKey spec_key;
         bool has_spec_decision = false;
         llamaserver::SpeculationDecision spec_decision;
         if (policy != nullptr && !cancel.cancelled()) {
-            spec_decision = policy->recommend(workload);
+            const auto launch_args = backend_->effective_launch_args();
+            spec_key.target_identity = build_target_identity(backend_->options(), launch_args, descriptor_, props);
+            spec_key.draft_identity = build_draft_identity(backend_->options(), launch_args);
+            spec_key.context_band =
+                llamaserver::classify_context_band(llamaserver::estimate_generate_context_tokens(request));
+            spec_key.concurrency_band = llamaserver::classify_concurrency_band(active_guard.active_count());
+            spec_key.workload = llamaserver::classify_generate_workload(request, backend_->options().grammar);
+            spec_decision = policy->recommend(spec_key);
             has_spec_decision = true;
         }
-        ProbeGuard probe_guard(policy, workload, has_spec_decision && spec_decision.is_probe,
+        ProbeGuard probe_guard(policy, spec_key, has_spec_decision && spec_decision.is_probe,
                                has_spec_decision ? spec_decision.probe_id : 0u);
         llamaserver::SlotAffinity::Lease lease;
         auto req_extras = backend_->extras(props, {}, lease);
@@ -567,11 +648,28 @@ class LlamaServerModel final : public BackendModel {
             req_extras.spec_draft_n_max = spec_decision.draft_n_max;
         auto body = llamaserver::build_completion_body(descriptor_.name, request, native, backend_->options().grammar,
                                                        req_extras);
-        auto result =
-            backend_->stream(native ? "/completion" : "/v1/completions", body.dump(), cancel, callback, false);
+        bool saw_first_token = false;
+        std::chrono::steady_clock::time_point first_token_at{};
+        TokenCallback timed_callback;
+        if (has_spec_decision && callback) {
+            timed_callback = [&](const TokenChunk &chunk) {
+                if (!saw_first_token) {
+                    saw_first_token = true;
+                    first_token_at = std::chrono::steady_clock::now();
+                }
+                return callback(chunk);
+            };
+        }
+        auto result = backend_->stream(native ? "/completion" : "/v1/completions", body.dump(), cancel,
+                                       timed_callback ? timed_callback : callback, false);
+        const auto stream_end = std::chrono::steady_clock::now();
         if (result.ok() && has_spec_decision) {
-            record_speculation_observation(policy, result.value(), workload, spec_decision.is_probe,
-                                           spec_decision.probe_id, probe_guard);
+            const double decode_span_ms =
+                saw_first_token
+                    ? std::chrono::duration<double, std::milli>(stream_end - first_token_at).count()
+                    : 0.0;
+            record_speculation_observation(policy, result.value(), spec_key, spec_decision, decode_span_ms,
+                                           probe_guard);
         }
         return result;
     }
@@ -584,15 +682,23 @@ class LlamaServerModel final : public BackendModel {
         const auto props = backend_->served_props(cancel);
         if (auto status = llamaserver::validate_sampling(request.sampling, props.n_ctx); !status.ok())
             return status;
-        const auto workload = classify_chat_workload(request, backend_->options().grammar);
+        ActiveGenerationGuard active_guard(backend_->active_generations());
         auto *policy = backend_->adaptive_speculation();
+        llamaserver::SpeculationContextKey spec_key;
         bool has_spec_decision = false;
         llamaserver::SpeculationDecision spec_decision;
         if (policy != nullptr && !cancel.cancelled()) {
-            spec_decision = policy->recommend(workload);
+            const auto launch_args = backend_->effective_launch_args();
+            spec_key.target_identity = build_target_identity(backend_->options(), launch_args, descriptor_, props);
+            spec_key.draft_identity = build_draft_identity(backend_->options(), launch_args);
+            spec_key.context_band =
+                llamaserver::classify_context_band(llamaserver::estimate_chat_context_tokens(request));
+            spec_key.concurrency_band = llamaserver::classify_concurrency_band(active_guard.active_count());
+            spec_key.workload = llamaserver::classify_chat_workload(request, backend_->options().grammar);
+            spec_decision = policy->recommend(spec_key);
             has_spec_decision = true;
         }
-        ProbeGuard probe_guard(policy, workload, has_spec_decision && spec_decision.is_probe,
+        ProbeGuard probe_guard(policy, spec_key, has_spec_decision && spec_decision.is_probe,
                                has_spec_decision ? spec_decision.probe_id : 0u);
         // The lease keeps the slot marked busy until the stream ends.
         llamaserver::SlotAffinity::Lease lease;
@@ -601,11 +707,29 @@ class LlamaServerModel final : public BackendModel {
             req_extras.spec_draft_n_max = spec_decision.draft_n_max;
         const bool tools_requested = llamaserver::chat_tools_requested(request);
         auto body = llamaserver::build_chat_body(descriptor_.name, request, backend_->options().grammar, req_extras);
-        auto result = backend_->stream("/v1/chat/completions", body.dump(), cancel, callback, true,
+        bool saw_first_token = false;
+        std::chrono::steady_clock::time_point first_token_at{};
+        TokenCallback timed_callback;
+        if (has_spec_decision && callback) {
+            timed_callback = [&](const TokenChunk &chunk) {
+                if (!saw_first_token) {
+                    saw_first_token = true;
+                    first_token_at = std::chrono::steady_clock::now();
+                }
+                return callback(chunk);
+            };
+        }
+        auto result = backend_->stream("/v1/chat/completions", body.dump(), cancel,
+                                       timed_callback ? timed_callback : callback, true,
                                        request.separate_reasoning, tools_requested);
+        const auto stream_end = std::chrono::steady_clock::now();
         if (result.ok() && has_spec_decision) {
-            record_speculation_observation(policy, result.value(), workload, spec_decision.is_probe,
-                                           spec_decision.probe_id, probe_guard);
+            const double decode_span_ms =
+                saw_first_token
+                    ? std::chrono::duration<double, std::milli>(stream_end - first_token_at).count()
+                    : 0.0;
+            record_speculation_observation(policy, result.value(), spec_key, spec_decision, decode_span_ms,
+                                           probe_guard);
         }
         return result;
     }
