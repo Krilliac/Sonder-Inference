@@ -365,15 +365,32 @@ Result<GenerationResult> Session::chat(const std::vector<ChatMessage>& messages,
 }
 
 Result<EmbedResult> Session::embed(const std::vector<std::string>& inputs, const RequestOptions& request_options) {
-    if (inputs.empty()) {
+    EmbedRequest req;
+    req.inputs = inputs;
+    return embed_request(req, request_options);
+}
+
+Result<EmbedResult> Session::embed_request(const EmbedRequest& request, const RequestOptions& request_options) {
+    if (request.inputs.empty()) {
         return Status(ErrorCode::invalid_argument, "embed inputs must be non-empty");
+    }
+    if (request.inputs.size() > kMaxEmbedInputs) {
+        return Status(ErrorCode::invalid_argument,
+                      "embed inputs exceeds maximum of " + std::to_string(kMaxEmbedInputs) + " items");
+    }
+    if (request.dimensions.has_value() && *request.dimensions == 0) {
+        return Status(ErrorCode::invalid_argument, "embed dimensions must be positive");
+    }
+    if (request.pooling_type == EmbedPoolingType::rank) {
+        return Status(ErrorCode::invalid_argument,
+                      "backend does not support pooling_type 'rank' for dense embeddings");
     }
     const std::string req_id = request_options.request_id && !request_options.request_id->empty()
                                    ? *request_options.request_id
-                                   : make_id("req");
+                                   : (!request.request_id.empty() ? request.request_id : make_id("req"));
     TelemetryBus& bus = engine_.telemetry();
     const auto ctx = telemetry_context(req_id);
-    const std::uint64_t input_count = static_cast<std::uint64_t>(inputs.size());
+    const std::uint64_t input_count = static_cast<std::uint64_t>(request.inputs.size());
     bool terminal_attempted = false;
     auto t_start = std::chrono::steady_clock::now();
     const auto current_queue_ms = [&]() {
@@ -535,9 +552,8 @@ Result<EmbedResult> Session::embed(const std::vector<std::string>& inputs, const
         return Status(ErrorCode::cancelled, "cancelled before backend start");
     }
 
-    EmbedRequest req;
+    EmbedRequest req = request;
     req.request_id = req_id;
-    req.inputs = inputs;
     auto embedded = model_->backend_model().embed(req, token);
     const double total_ms = ms_between(t_start, std::chrono::steady_clock::now());
 
@@ -554,11 +570,418 @@ Result<EmbedResult> Session::embed(const std::vector<std::string>& inputs, const
         return embedded.status();
     }
 
+    if (embedded.value().model.empty()) {
+        embedded.value().model = model_->descriptor().name;
+    }
+    if (embedded.value().dimensions == 0 && !embedded.value().embeddings.empty()) {
+        embedded.value().dimensions = embedded.value().embeddings.front().size();
+    }
+    if (embedded.value().encoding_format.empty()) {
+        embedded.value().encoding_format = req.encoding_format.empty() ? std::string("float") : req.encoding_format;
+    }
+
     emit_terminal(RequestOutcome::completed,
                   json::Object{{"prompt_tokens", embedded.value().prompt_tokens},
                                {"inputs", static_cast<std::uint64_t>(embedded.value().embeddings.size())},
                                {"total_ms", total_ms}});
     return embedded;
+}
+
+Result<RerankResult> Session::rerank(const RerankRequest& request, const RequestOptions& request_options) {
+    if (Status st = validate_rerank_request(request); !st.ok()) {
+        return st;
+    }
+    const std::string req_id = request_options.request_id && !request_options.request_id->empty()
+                                   ? *request_options.request_id
+                                   : (!request.request_id.empty() ? request.request_id : make_id("req"));
+    TelemetryBus& bus = engine_.telemetry();
+    const auto ctx = telemetry_context(req_id);
+    const std::uint64_t doc_count = static_cast<std::uint64_t>(request.documents.size());
+    bool terminal_attempted = false;
+    auto t_start = std::chrono::steady_clock::now();
+    const auto current_queue_ms = [&]() {
+        return request_options.admission ? request_options.admission->queue_ms()
+                                         : request_options.admission_queue_ms;
+    };
+    const auto& parent = request_options.parent_request_id;
+    const auto with_parent = [&parent](json::Object attrs) {
+        if (parent) {
+            attrs.set("parent_request_id", *parent);
+        }
+        return attrs;
+    };
+    const auto with_admission = [&](json::Object attrs, double queue_ms = 0.0) {
+        if (request_options.priority_class) {
+            attrs.set("priority_class", to_string(*request_options.priority_class));
+            attrs.set("admission", json::Object{{"priority", to_string(*request_options.priority_class)},
+                                                {"queue_ms", queue_ms}});
+        }
+        return attrs;
+    };
+    const auto recover_rerank = [&]() noexcept {
+        try {
+            if (!terminal_attempted) {
+                terminal_attempted = true;
+                json::Object failed{{"kind", "rerank"},
+                                    {"outcome", "failed"},
+                                    {"documents", doc_count},
+                                    {"total_ms", ms_between(t_start, std::chrono::steady_clock::now())},
+                                    {"error_code", to_string(ErrorCode::internal)},
+                                    {"error", "request aborted by exception"}};
+                bus.emit("request.failed", ctx,
+                         with_parent(with_admission(std::move(failed), current_queue_ms())),
+                         TelemetryLevel::metrics);
+            }
+        } catch (...) {
+        }
+        try {
+            std::lock_guard<std::mutex> lock(mutex_);
+            active_cancel_.reset();
+            cancel_requested_ns_.store(0);
+            last_outcome_ = RequestOutcome::failed;
+            last_scheduler_rejected_ = false;
+            if (state_ == SessionState::running) {
+                state_ = SessionState::idle;
+            }
+        } catch (...) {
+        }
+    };
+    struct RerankFailureGuard {
+        const decltype(recover_rerank)& recover;
+        bool armed = false;
+        ~RerankFailureGuard() noexcept {
+            if (armed) recover();
+        }
+    } failure_guard{recover_rerank};
+
+    CancellationToken token;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == SessionState::closed) {
+            return Status(ErrorCode::invalid_state, "session is closed");
+        }
+        if (state_ == SessionState::running) {
+            return Status(ErrorCode::invalid_state, "session already has a request in flight");
+        }
+        active_cancel_.emplace();
+        token = active_cancel_->token();
+        state_ = SessionState::running;
+        cancel_requested_ns_.store(0);
+        ++requests_started_;
+        failure_guard.armed = true;
+    }
+
+    auto finish_state = [&](RequestOutcome outcome) {
+        failure_guard.armed = false;
+        std::lock_guard<std::mutex> lock(mutex_);
+        active_cancel_.reset();
+        cancel_requested_ns_.store(0);
+        last_outcome_ = outcome;
+        last_scheduler_rejected_ = false;
+        if (state_ == SessionState::running) {
+            state_ = SessionState::idle;
+        }
+    };
+
+    auto emit_terminal = [&](RequestOutcome outcome, json::Object attrs) {
+        const double total_ms = ms_between(t_start, std::chrono::steady_clock::now());
+        attrs.set("kind", "rerank");
+        attrs.set("outcome", to_string(outcome));
+        if (!attrs.find("documents")) {
+            attrs.set("documents", doc_count);
+        }
+        if (!attrs.find("total_ms")) {
+            attrs.set("total_ms", total_ms);
+        }
+        if (outcome == RequestOutcome::cancelled) {
+            const std::uint64_t cancel_ns = cancel_requested_ns_.load();
+            const std::uint64_t now_ns = monotonic_ns();
+            if (cancel_ns != 0 && now_ns >= cancel_ns) {
+                attrs.set("cancel_latency_ms", static_cast<double>(now_ns - cancel_ns) / 1e6);
+            }
+        }
+        const char* event_type = outcome == RequestOutcome::completed ? "request.completed"
+                                 : outcome == RequestOutcome::cancelled ? "request.cancelled"
+                                                                        : "request.failed";
+        terminal_attempted = true;
+        bus.emit(event_type, ctx, with_parent(with_admission(std::move(attrs), current_queue_ms())),
+                 TelemetryLevel::metrics);
+        finish_state(outcome);
+    };
+
+    t_start = std::chrono::steady_clock::now();
+    bus.emit("request.queued", ctx,
+             with_parent(with_admission(
+                 json::Object{{"kind", "rerank"},
+                              {"priority", options_.priority},
+                              {"workload", to_string(options_.workload)},
+                              {"documents", doc_count}},
+                 request_options.admission_queue_ms)),
+             TelemetryLevel::metrics);
+    bus.emit("request.started", ctx,
+             with_parent(with_admission(
+                 json::Object{{"kind", "rerank"},
+                              {"documents", doc_count},
+                              {"scheduled", false}},
+                 request_options.admission_queue_ms)),
+             TelemetryLevel::metrics);
+
+    if (request_options.admission) {
+        Status st = request_options.admission->wait(token);
+        if (!st.ok()) {
+            const bool cancelled = token.cancelled() || st.code() == ErrorCode::cancelled;
+            json::Object attrs;
+            if (!cancelled) {
+                attrs.set("error_code", to_string(st.code()));
+                attrs.set("error", to_string(st.code()));
+            }
+            emit_terminal(cancelled ? RequestOutcome::cancelled : RequestOutcome::failed, std::move(attrs));
+            return st;
+        }
+    }
+
+    if (request_options.deadline && std::chrono::steady_clock::now() >= *request_options.deadline) {
+        emit_terminal(RequestOutcome::failed,
+                      json::Object{{"error_code", to_string(ErrorCode::timeout)},
+                                   {"error", to_string(ErrorCode::timeout)}});
+        return Status(ErrorCode::timeout, "request deadline exceeded before backend start");
+    }
+    if (token.cancelled()) {
+        emit_terminal(RequestOutcome::cancelled, json::Object{});
+        return Status(ErrorCode::cancelled, "cancelled before backend start");
+    }
+    if (request_options.on_backend_start) {
+        request_options.on_backend_start();
+    }
+    if (token.cancelled()) {
+        emit_terminal(RequestOutcome::cancelled, json::Object{});
+        return Status(ErrorCode::cancelled, "cancelled before backend start");
+    }
+
+    RerankRequest req = request;
+    req.request_id = req_id;
+    auto ranked = model_->backend_model().rerank(req, token);
+    const double total_ms = ms_between(t_start, std::chrono::steady_clock::now());
+
+    if (!ranked.ok()) {
+        const bool cancelled = token.cancelled() || ranked.status().code() == ErrorCode::cancelled;
+        json::Object attrs{{"total_ms", total_ms}};
+        if (!cancelled) {
+            attrs.set("error_code", to_string(ranked.status().code()));
+            attrs.set("error", to_string(ranked.status().code()));
+        }
+        emit_terminal(cancelled ? RequestOutcome::cancelled : RequestOutcome::failed, std::move(attrs));
+        return ranked.status();
+    }
+
+    if (ranked.value().model.empty()) {
+        ranked.value().model = model_->descriptor().name;
+    }
+
+    emit_terminal(RequestOutcome::completed,
+                  json::Object{{"prompt_tokens", ranked.value().prompt_tokens},
+                               {"documents", doc_count},
+                               {"results", static_cast<std::uint64_t>(ranked.value().results.size())},
+                               {"total_ms", total_ms}});
+    return ranked;
+}
+
+Result<ScoreResult> Session::score(const ScoreRequest& request, const RequestOptions& request_options) {
+    if (Status st = validate_score_request(request); !st.ok()) {
+        return st;
+    }
+    const std::string req_id = request_options.request_id && !request_options.request_id->empty()
+                                   ? *request_options.request_id
+                                   : (!request.request_id.empty() ? request.request_id : make_id("req"));
+    TelemetryBus& bus = engine_.telemetry();
+    const auto ctx = telemetry_context(req_id);
+    const std::uint64_t pair_count = static_cast<std::uint64_t>(request.pairs.size());
+    bool terminal_attempted = false;
+    auto t_start = std::chrono::steady_clock::now();
+    const auto current_queue_ms = [&]() {
+        return request_options.admission ? request_options.admission->queue_ms()
+                                         : request_options.admission_queue_ms;
+    };
+    const auto& parent = request_options.parent_request_id;
+    const auto with_parent = [&parent](json::Object attrs) {
+        if (parent) {
+            attrs.set("parent_request_id", *parent);
+        }
+        return attrs;
+    };
+    const auto with_admission = [&](json::Object attrs, double queue_ms = 0.0) {
+        if (request_options.priority_class) {
+            attrs.set("priority_class", to_string(*request_options.priority_class));
+            attrs.set("admission", json::Object{{"priority", to_string(*request_options.priority_class)},
+                                                {"queue_ms", queue_ms}});
+        }
+        return attrs;
+    };
+    const auto recover_score = [&]() noexcept {
+        try {
+            if (!terminal_attempted) {
+                terminal_attempted = true;
+                json::Object failed{{"kind", "score"},
+                                    {"outcome", "failed"},
+                                    {"pairs", pair_count},
+                                    {"total_ms", ms_between(t_start, std::chrono::steady_clock::now())},
+                                    {"error_code", to_string(ErrorCode::internal)},
+                                    {"error", "request aborted by exception"}};
+                bus.emit("request.failed", ctx,
+                         with_parent(with_admission(std::move(failed), current_queue_ms())),
+                         TelemetryLevel::metrics);
+            }
+        } catch (...) {
+        }
+        try {
+            std::lock_guard<std::mutex> lock(mutex_);
+            active_cancel_.reset();
+            cancel_requested_ns_.store(0);
+            last_outcome_ = RequestOutcome::failed;
+            last_scheduler_rejected_ = false;
+            if (state_ == SessionState::running) {
+                state_ = SessionState::idle;
+            }
+        } catch (...) {
+        }
+    };
+    struct ScoreFailureGuard {
+        const decltype(recover_score)& recover;
+        bool armed = false;
+        ~ScoreFailureGuard() noexcept {
+            if (armed) recover();
+        }
+    } failure_guard{recover_score};
+
+    CancellationToken token;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == SessionState::closed) {
+            return Status(ErrorCode::invalid_state, "session is closed");
+        }
+        if (state_ == SessionState::running) {
+            return Status(ErrorCode::invalid_state, "session already has a request in flight");
+        }
+        active_cancel_.emplace();
+        token = active_cancel_->token();
+        state_ = SessionState::running;
+        cancel_requested_ns_.store(0);
+        ++requests_started_;
+        failure_guard.armed = true;
+    }
+
+    auto finish_state = [&](RequestOutcome outcome) {
+        failure_guard.armed = false;
+        std::lock_guard<std::mutex> lock(mutex_);
+        active_cancel_.reset();
+        cancel_requested_ns_.store(0);
+        last_outcome_ = outcome;
+        last_scheduler_rejected_ = false;
+        if (state_ == SessionState::running) {
+            state_ = SessionState::idle;
+        }
+    };
+
+    auto emit_terminal = [&](RequestOutcome outcome, json::Object attrs) {
+        const double total_ms = ms_between(t_start, std::chrono::steady_clock::now());
+        attrs.set("kind", "score");
+        attrs.set("outcome", to_string(outcome));
+        if (!attrs.find("pairs")) {
+            attrs.set("pairs", pair_count);
+        }
+        if (!attrs.find("total_ms")) {
+            attrs.set("total_ms", total_ms);
+        }
+        if (outcome == RequestOutcome::cancelled) {
+            const std::uint64_t cancel_ns = cancel_requested_ns_.load();
+            const std::uint64_t now_ns = monotonic_ns();
+            if (cancel_ns != 0 && now_ns >= cancel_ns) {
+                attrs.set("cancel_latency_ms", static_cast<double>(now_ns - cancel_ns) / 1e6);
+            }
+        }
+        const char* event_type = outcome == RequestOutcome::completed ? "request.completed"
+                                 : outcome == RequestOutcome::cancelled ? "request.cancelled"
+                                                                        : "request.failed";
+        terminal_attempted = true;
+        bus.emit(event_type, ctx, with_parent(with_admission(std::move(attrs), current_queue_ms())),
+                 TelemetryLevel::metrics);
+        finish_state(outcome);
+    };
+
+    t_start = std::chrono::steady_clock::now();
+    bus.emit("request.queued", ctx,
+             with_parent(with_admission(
+                 json::Object{{"kind", "score"},
+                              {"priority", options_.priority},
+                              {"workload", to_string(options_.workload)},
+                              {"pairs", pair_count}},
+                 request_options.admission_queue_ms)),
+             TelemetryLevel::metrics);
+    bus.emit("request.started", ctx,
+             with_parent(with_admission(
+                 json::Object{{"kind", "score"},
+                              {"pairs", pair_count},
+                              {"scheduled", false}},
+                 request_options.admission_queue_ms)),
+             TelemetryLevel::metrics);
+
+    if (request_options.admission) {
+        Status st = request_options.admission->wait(token);
+        if (!st.ok()) {
+            const bool cancelled = token.cancelled() || st.code() == ErrorCode::cancelled;
+            json::Object attrs;
+            if (!cancelled) {
+                attrs.set("error_code", to_string(st.code()));
+                attrs.set("error", to_string(st.code()));
+            }
+            emit_terminal(cancelled ? RequestOutcome::cancelled : RequestOutcome::failed, std::move(attrs));
+            return st;
+        }
+    }
+
+    if (request_options.deadline && std::chrono::steady_clock::now() >= *request_options.deadline) {
+        emit_terminal(RequestOutcome::failed,
+                      json::Object{{"error_code", to_string(ErrorCode::timeout)},
+                                   {"error", to_string(ErrorCode::timeout)}});
+        return Status(ErrorCode::timeout, "request deadline exceeded before backend start");
+    }
+    if (token.cancelled()) {
+        emit_terminal(RequestOutcome::cancelled, json::Object{});
+        return Status(ErrorCode::cancelled, "cancelled before backend start");
+    }
+    if (request_options.on_backend_start) {
+        request_options.on_backend_start();
+    }
+    if (token.cancelled()) {
+        emit_terminal(RequestOutcome::cancelled, json::Object{});
+        return Status(ErrorCode::cancelled, "cancelled before backend start");
+    }
+
+    ScoreRequest req = request;
+    req.request_id = req_id;
+    auto scored = model_->backend_model().score(req, token);
+    const double total_ms = ms_between(t_start, std::chrono::steady_clock::now());
+
+    if (!scored.ok()) {
+        const bool cancelled = token.cancelled() || scored.status().code() == ErrorCode::cancelled;
+        json::Object attrs{{"total_ms", total_ms}};
+        if (!cancelled) {
+            attrs.set("error_code", to_string(scored.status().code()));
+            attrs.set("error", to_string(scored.status().code()));
+        }
+        emit_terminal(cancelled ? RequestOutcome::cancelled : RequestOutcome::failed, std::move(attrs));
+        return scored.status();
+    }
+
+    if (scored.value().model.empty()) {
+        scored.value().model = model_->descriptor().name;
+    }
+
+    emit_terminal(RequestOutcome::completed,
+                  json::Object{{"prompt_tokens", scored.value().prompt_tokens},
+                               {"pairs", pair_count},
+                               {"total_ms", total_ms}});
+    return scored;
 }
 
 Result<GenerationResult> Session::run_request(const char* kind, const std::string& prompt,

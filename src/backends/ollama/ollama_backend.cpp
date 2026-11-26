@@ -153,6 +153,14 @@ public:
         if (request.inputs.empty()) {
             return Status(ErrorCode::invalid_argument, "ollama: embed inputs must be non-empty");
         }
+        if (request.pooling_type == EmbedPoolingType::rank) {
+            return Status(ErrorCode::invalid_argument,
+                          "ollama backend does not support pooling_type 'rank' for dense embeddings");
+        }
+        if (request.dimensions.has_value()) {
+            return Status(ErrorCode::invalid_argument,
+                          "ollama backend does not support dimensions reduction");
+        }
         const auto& cfg = client_->config();
         auto url = net::parse_url(cfg.base_url);
         if (!url.ok()) {
@@ -243,6 +251,9 @@ public:
             return Status(ErrorCode::protocol_error, "ollama: /api/embed returned unexpected embedding count");
         }
         EmbedResult result;
+        result.model = descriptor_.name;
+        result.encoding_format = request.encoding_format.empty() ? std::string("float") : request.encoding_format;
+        result.pooling_type = request.pooling_type;
         result.embeddings.reserve(rows.size());
         for (const auto& row : rows) {
             if (!row.is_array()) {
@@ -257,6 +268,9 @@ public:
                 vec.push_back(static_cast<float>(val.as_double()));
             }
             result.embeddings.push_back(std::move(vec));
+        }
+        if (!result.embeddings.empty()) {
+            result.dimensions = result.embeddings.front().size();
         }
         if (const json::Value* pe = parsed.value().find("prompt_eval_count"); pe != nullptr && pe->is_number()) {
             result.prompt_tokens = to_u64(pe->as_int());

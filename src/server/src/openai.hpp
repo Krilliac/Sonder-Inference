@@ -41,7 +41,10 @@ json::Object error_body(const ApiError& error);
 // max_completion_tokens.
 inline constexpr std::int32_t kDefaultMaxTokens = 1024;
 inline constexpr std::size_t kMaxRequestGrammarBytes = 64u * 1024u;
-inline constexpr std::size_t kMaxEmbedInputs = 256u;
+inline constexpr std::size_t kMaxEmbedInputs = sonder::inference::kMaxEmbedInputs;
+inline constexpr std::size_t kMaxRerankDocuments = sonder::inference::kMaxRerankDocuments;
+inline constexpr std::size_t kMaxScorePairs = sonder::inference::kMaxScorePairs;
+inline constexpr std::size_t kMaxEmbedDimensions = 65536u;
 
 struct ChatJob {
     std::string model = "default";
@@ -78,6 +81,27 @@ struct ChatJob {
 struct EmbedJob {
     std::string model = "default";
     std::vector<std::string> inputs;
+    std::optional<std::size_t> dimensions;
+    EmbedPoolingType pooling_type = EmbedPoolingType::unspecified;
+    std::string encoding_format = "float";
+    bool normalize = true;
+    std::optional<RequestPriority> priority_class;
+    std::optional<std::uint64_t> deadline_ms;
+};
+
+struct RerankJob {
+    std::string model = "default";
+    std::string query;
+    std::vector<std::string> documents;
+    std::optional<std::size_t> top_n;
+    bool return_documents = false;
+    std::optional<RequestPriority> priority_class;
+    std::optional<std::uint64_t> deadline_ms;
+};
+
+struct ScoreJob {
+    std::string model = "default";
+    std::vector<ScorePair> pairs;
     std::optional<RequestPriority> priority_class;
     std::optional<std::uint64_t> deadline_ms;
 };
@@ -121,6 +145,8 @@ struct DetokenizeJob {
 std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body);
 std::variant<ChatJob, ApiError> parse_chat_request_with_mode(std::string_view body, StructuredParseMode schema_mode);
 std::variant<EmbedJob, ApiError> parse_embed_request(std::string_view body);
+std::variant<RerankJob, ApiError> parse_rerank_request(std::string_view body);
+std::variant<ScoreJob, ApiError> parse_score_request(std::string_view body);
 std::variant<CompletionJob, ApiError> parse_completion_request(std::string_view body);
 std::variant<TokenizeJob, ApiError> parse_tokenize_request(std::string_view body);
 std::variant<DetokenizeJob, ApiError> parse_detokenize_request(std::string_view body);

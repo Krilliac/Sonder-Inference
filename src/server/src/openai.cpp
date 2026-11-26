@@ -662,6 +662,49 @@ std::variant<EmbedJob, ApiError> parse_embed_request(std::string_view body_text)
         if (!fmt->is_string() || fmt->as_string() != "float") {
             return bad("unsupported_parameter", "only encoding_format 'float' is supported", "encoding_format");
         }
+        job.encoding_format = fmt->as_string();
+    }
+    if (const json::Value* dims = body.find("dimensions"); present(dims)) {
+        if (!dims->is_integer()) {
+            return bad("invalid_request", "dimensions must be a positive integer", "dimensions");
+        }
+        const auto exact = dims->try_as_int();
+        if (!exact || *exact < 1 || static_cast<std::size_t>(*exact) > kMaxEmbedDimensions) {
+            return bad("invalid_request",
+                       "dimensions must be an integer between 1 and " + std::to_string(kMaxEmbedDimensions),
+                       "dimensions");
+        }
+        job.dimensions = static_cast<std::size_t>(*exact);
+    }
+    if (const json::Value* pool = body.find("pooling_type"); present(pool)) {
+        if (!pool->is_string()) {
+            return bad("invalid_request", "pooling_type must be a string", "pooling_type");
+        }
+        const std::string& p = pool->as_string();
+        if (p == "unspecified") {
+            job.pooling_type = EmbedPoolingType::unspecified;
+        } else if (p == "mean") {
+            job.pooling_type = EmbedPoolingType::mean;
+        } else if (p == "cls") {
+            job.pooling_type = EmbedPoolingType::cls;
+        } else if (p == "last") {
+            job.pooling_type = EmbedPoolingType::last;
+        } else if (p == "none") {
+            job.pooling_type = EmbedPoolingType::none;
+        } else if (p == "rank") {
+            return bad("unsupported_parameter",
+                       "pooling_type 'rank' is not supported for /v1/embeddings; use /v1/rerank or /v1/score",
+                       "pooling_type");
+        } else {
+            return bad("invalid_request",
+                       "pooling_type must be one of unspecified, mean, cls, last or none", "pooling_type");
+        }
+    }
+    if (const json::Value* norm = body.find("normalize"); present(norm)) {
+        if (!norm->is_bool()) {
+            return bad("invalid_request", "normalize must be a boolean", "normalize");
+        }
+        job.normalize = norm->as_bool();
     }
     const json::Value* input = body.find("input");
     if (!present(input)) {
@@ -688,6 +731,208 @@ std::variant<EmbedJob, ApiError> parse_embed_request(std::string_view body_text)
     } else {
         return bad("invalid_request", "input must be a string or a non-empty array of strings", "input");
     }
+    if (auto e = read_request_hints(body, job.priority_class, job.deadline_ms)) {
+        return *e;
+    }
+    return job;
+}
+
+std::variant<RerankJob, ApiError> parse_rerank_request(std::string_view body_text) {
+    auto parsed = json::parse(body_text, json::ParseLimits{128, 65536});
+    if (!parsed.ok()) {
+        return bad("invalid_json", "request body is not valid JSON: " + parsed.status().message());
+    }
+    if (!parsed.value().is_object()) {
+        return bad("invalid_json", "request body must be a JSON object");
+    }
+    const json::Object& body = parsed.value().as_object();
+    RerankJob job;
+    if (const json::Value* model = body.find("model"); present(model)) {
+        if (!model->is_string() || model->as_string().empty()) {
+            return bad("invalid_request", "model must be a non-empty string", "model");
+        }
+        job.model = model->as_string();
+    }
+    const json::Value* query = body.find("query");
+    if (!present(query) || !query->is_string() || query->as_string().empty()) {
+        return bad("invalid_request", "query must be a non-empty string", "query");
+    }
+    if (query->as_string().find('\0') != std::string::npos) {
+        return bad("invalid_request", "query must not contain NUL bytes", "query");
+    }
+    job.query = query->as_string();
+
+    const json::Value* docs = body.find("documents");
+    if (!present(docs) || !docs->is_array() || docs->as_array().empty()) {
+        return bad("invalid_request", "documents must be a non-empty array of strings", "documents");
+    }
+    const auto& arr = docs->as_array();
+    if (arr.size() > kMaxRerankDocuments) {
+        return bad("invalid_request",
+                   "documents exceeds maximum of " + std::to_string(kMaxRerankDocuments) + " items", "documents");
+    }
+    job.documents.reserve(arr.size());
+    for (std::size_t i = 0; i < arr.size(); ++i) {
+        if (!arr[i].is_string()) {
+            return bad("invalid_request", "documents[" + std::to_string(i) + "] must be a string", "documents");
+        }
+        if (arr[i].as_string().find('\0') != std::string::npos) {
+            return bad("invalid_request", "documents[" + std::to_string(i) + "] must not contain NUL bytes",
+                       "documents");
+        }
+        job.documents.push_back(arr[i].as_string());
+    }
+
+    if (const json::Value* top_n = body.find("top_n"); present(top_n)) {
+        if (!top_n->is_integer()) {
+            return bad("invalid_request", "top_n must be a positive integer", "top_n");
+        }
+        const auto exact = top_n->try_as_int();
+        if (!exact || *exact < 1 || static_cast<std::size_t>(*exact) > kMaxRerankDocuments) {
+            return bad("invalid_request",
+                       "top_n must be an integer between 1 and " + std::to_string(kMaxRerankDocuments), "top_n");
+        }
+        job.top_n = static_cast<std::size_t>(*exact);
+    }
+    if (const json::Value* ret_docs = body.find("return_documents"); present(ret_docs)) {
+        if (!ret_docs->is_bool()) {
+            return bad("invalid_request", "return_documents must be a boolean", "return_documents");
+        }
+        job.return_documents = ret_docs->as_bool();
+    }
+    if (auto e = read_request_hints(body, job.priority_class, job.deadline_ms)) {
+        return *e;
+    }
+    return job;
+}
+
+std::variant<ScoreJob, ApiError> parse_score_request(std::string_view body_text) {
+    auto parsed = json::parse(body_text, json::ParseLimits{128, 65536});
+    if (!parsed.ok()) {
+        return bad("invalid_json", "request body is not valid JSON: " + parsed.status().message());
+    }
+    if (!parsed.value().is_object()) {
+        return bad("invalid_json", "request body must be a JSON object");
+    }
+    const json::Object& body = parsed.value().as_object();
+    ScoreJob job;
+    if (const json::Value* model = body.find("model"); present(model)) {
+        if (!model->is_string() || model->as_string().empty()) {
+            return bad("invalid_request", "model must be a non-empty string", "model");
+        }
+        job.model = model->as_string();
+    }
+
+    const json::Value* pairs_v = body.find("pairs");
+    const json::Value* t1_v = body.find("text_1");
+    const json::Value* t2_v = body.find("text_2");
+    const bool has_pairs = present(pairs_v);
+    const bool has_texts = present(t1_v) || present(t2_v);
+
+    if (has_pairs && has_texts) {
+        return bad("invalid_request", "provide either pairs or text_1/text_2, not both", "pairs");
+    }
+    if (!has_pairs && !has_texts) {
+        return bad("invalid_request", "either pairs or text_1 and text_2 are required", "pairs");
+    }
+
+    if (has_pairs) {
+        if (!pairs_v->is_array() || pairs_v->as_array().empty()) {
+            return bad("invalid_request", "pairs must be a non-empty array", "pairs");
+        }
+        const auto& arr = pairs_v->as_array();
+        if (arr.size() > kMaxScorePairs) {
+            return bad("invalid_request", "pairs exceeds maximum of " + std::to_string(kMaxScorePairs) + " items",
+                       "pairs");
+        }
+        job.pairs.reserve(arr.size());
+        for (std::size_t i = 0; i < arr.size(); ++i) {
+            const std::string where = "pairs[" + std::to_string(i) + "]";
+            ScorePair p;
+            if (arr[i].is_object()) {
+                const json::Value* a = arr[i].find("text_1");
+                const json::Value* b = arr[i].find("text_2");
+                if (!present(a) || !a->is_string() || !present(b) || !b->is_string()) {
+                    return bad("invalid_request", where + " must contain string fields text_1 and text_2", where);
+                }
+                p.text_1 = a->as_string();
+                p.text_2 = b->as_string();
+            } else if (arr[i].is_array()) {
+                const auto& tup = arr[i].as_array();
+                if (tup.size() != 2u || !tup[0].is_string() || !tup[1].is_string()) {
+                    return bad("invalid_request", where + " must be a 2-element array of strings", where);
+                }
+                p.text_1 = tup[0].as_string();
+                p.text_2 = tup[1].as_string();
+            } else {
+                return bad("invalid_request", where + " must be an object {text_1, text_2} or [text_1, text_2]", where);
+            }
+            if (p.text_1.find('\0') != std::string::npos || p.text_2.find('\0') != std::string::npos) {
+                return bad("invalid_request", where + " must not contain NUL bytes", where);
+            }
+            job.pairs.push_back(std::move(p));
+        }
+    } else {
+        if (!present(t1_v) || !present(t2_v)) {
+            return bad("invalid_request", "both text_1 and text_2 are required", present(t1_v) ? "text_2" : "text_1");
+        }
+        auto extract_list = [](const json::Value& v, const char* name,
+                               std::vector<std::string>& out) -> std::optional<ApiError> {
+            if (v.is_string()) {
+                if (v.as_string().find('\0') != std::string::npos) {
+                    return bad("invalid_request", std::string(name) + " must not contain NUL bytes", name);
+                }
+                out.push_back(v.as_string());
+                return std::nullopt;
+            }
+            if (v.is_array()) {
+                const auto& arr = v.as_array();
+                if (arr.empty()) {
+                    return bad("invalid_request", std::string(name) + " array must not be empty", name);
+                }
+                if (arr.size() > kMaxScorePairs) {
+                    return bad("invalid_request",
+                               std::string(name) + " exceeds maximum of " + std::to_string(kMaxScorePairs) + " items",
+                               name);
+                }
+                out.reserve(arr.size());
+                for (std::size_t i = 0; i < arr.size(); ++i) {
+                    if (!arr[i].is_string()) {
+                        return bad("invalid_request",
+                                   std::string(name) + "[" + std::to_string(i) + "] must be a string", name);
+                    }
+                    if (arr[i].as_string().find('\0') != std::string::npos) {
+                        return bad("invalid_request",
+                                   std::string(name) + "[" + std::to_string(i) + "] must not contain NUL bytes", name);
+                    }
+                    out.push_back(arr[i].as_string());
+                }
+                return std::nullopt;
+            }
+            return bad("invalid_request", std::string(name) + " must be a string or a non-empty array of strings",
+                       name);
+        };
+        std::vector<std::string> left;
+        std::vector<std::string> right;
+        if (auto e = extract_list(*t1_v, "text_1", left)) return *e;
+        if (auto e = extract_list(*t2_v, "text_2", right)) return *e;
+        if (left.size() != right.size() && left.size() != 1u && right.size() != 1u) {
+            return bad("invalid_request",
+                       "text_1 and text_2 arrays must have equal length (or one must be a single string/element)",
+                       "text_2");
+        }
+        const std::size_t count = std::max(left.size(), right.size());
+        if (count > kMaxScorePairs) {
+            return bad("invalid_request",
+                       "score pair count exceeds maximum of " + std::to_string(kMaxScorePairs) + " items", "text_2");
+        }
+        job.pairs.reserve(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            job.pairs.push_back(ScorePair{left.size() == 1u ? left[0] : left[i],
+                                          right.size() == 1u ? right[0] : right[i]});
+        }
+    }
+
     if (auto e = read_request_hints(body, job.priority_class, job.deadline_ms)) {
         return *e;
     }

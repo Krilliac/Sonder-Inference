@@ -1,6 +1,8 @@
 #include "sonder/inference/backend.hpp"
 
+#include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <utility>
 
@@ -29,6 +31,7 @@ std::vector<std::string> BackendCapabilities::names() const {
         {Capability::tool_calling, "tool_calling"},
         {Capability::multimodal, "multimodal"},
         {Capability::logprobs, "logprobs"},
+        {Capability::reranking, "reranking"},
     };
     std::vector<std::string> out;
     for (const auto& [cap, name] : kNames) {
@@ -37,6 +40,78 @@ std::vector<std::string> BackendCapabilities::names() const {
         }
     }
     return out;
+}
+
+const char* to_string(EmbedPoolingType pooling) noexcept {
+    switch (pooling) {
+        case EmbedPoolingType::unspecified: return "unspecified";
+        case EmbedPoolingType::none: return "none";
+        case EmbedPoolingType::mean: return "mean";
+        case EmbedPoolingType::cls: return "cls";
+        case EmbedPoolingType::last: return "last";
+        case EmbedPoolingType::rank: return "rank";
+    }
+    return "unknown";
+}
+
+Status validate_rerank_request(const RerankRequest& request) {
+    if (request.query.empty()) {
+        return Status(ErrorCode::invalid_argument, "rerank query must be non-empty");
+    }
+    if (request.query.find('\0') != std::string::npos) {
+        return Status(ErrorCode::invalid_argument, "rerank query must not contain NUL");
+    }
+    if (request.documents.empty()) {
+        return Status(ErrorCode::invalid_argument, "rerank documents must be non-empty");
+    }
+    if (request.documents.size() > kMaxRerankDocuments) {
+        return Status(ErrorCode::invalid_argument,
+                      "rerank documents exceeds maximum of " + std::to_string(kMaxRerankDocuments) + " items");
+    }
+    for (std::size_t i = 0; i < request.documents.size(); ++i) {
+        if (request.documents[i].find('\0') != std::string::npos) {
+            return Status(ErrorCode::invalid_argument,
+                          "rerank document[" + std::to_string(i) + "] must not contain NUL");
+        }
+    }
+    if (request.top_n.has_value()) {
+        if (*request.top_n == 0 || *request.top_n > kMaxRerankDocuments) {
+            return Status(ErrorCode::invalid_argument,
+                          "rerank top_n must be between 1 and " + std::to_string(kMaxRerankDocuments));
+        }
+    }
+    return Status::success();
+}
+
+Status validate_score_request(const ScoreRequest& request) {
+    if (request.pairs.empty()) {
+        return Status(ErrorCode::invalid_argument, "score pairs must be non-empty");
+    }
+    if (request.pairs.size() > kMaxScorePairs) {
+        return Status(ErrorCode::invalid_argument,
+                      "score pairs exceeds maximum of " + std::to_string(kMaxScorePairs) + " items");
+    }
+    for (std::size_t i = 0; i < request.pairs.size(); ++i) {
+        if (request.pairs[i].text_1.find('\0') != std::string::npos ||
+            request.pairs[i].text_2.find('\0') != std::string::npos) {
+            return Status(ErrorCode::invalid_argument,
+                          "score pair[" + std::to_string(i) + "] must not contain NUL");
+        }
+    }
+    return Status::success();
+}
+
+void finalize_rerank_items(std::vector<RerankItem>& items, std::optional<std::size_t> top_n) {
+    std::stable_sort(items.begin(), items.end(), [](const RerankItem& a, const RerankItem& b) {
+        const bool af = std::isfinite(a.relevance_score);
+        const bool bf = std::isfinite(b.relevance_score);
+        if (af != bf) return af;
+        if (af && a.relevance_score != b.relevance_score) return a.relevance_score > b.relevance_score;
+        return a.index < b.index;
+    });
+    if (top_n.has_value() && *top_n < items.size()) {
+        items.resize(*top_n);
+    }
 }
 
 const char* to_string(StopReason reason) noexcept {

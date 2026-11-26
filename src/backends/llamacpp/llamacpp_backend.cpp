@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "batch_scheduler.hpp"
+#include "embed_batch_planner.hpp"
 #include "prefix_coalescer.hpp"
 #include "radix_cache.hpp"
 #include "speculation_transition.hpp"
@@ -571,7 +572,16 @@ struct LlamaCppBackend::Impl {
     llama_context* embed_ctx = nullptr;
     llama_batch embed_batch{};
     int32_t embed_batch_cap = 0;
+    uint32_t embed_seq_max = 0;
+    enum llama_pooling_type embed_pooling_requested = LLAMA_POOLING_TYPE_UNSPECIFIED;
     bool embed_batch_allocated = false;
+
+    // Isolated lazy RANK-pooling context for cross-encoder reranking/scoring.
+    llama_context* rank_ctx = nullptr;
+    llama_batch rank_batch{};
+    int32_t rank_batch_cap = 0;
+    uint32_t rank_seq_max = 0;
+    bool rank_batch_allocated = false;
 
     // Optional libmtmd multimodal projector context (`mmproj_path`).
 #if defined(SONDER_LLAMACPP_HAS_MTMD)
@@ -861,11 +871,24 @@ struct LlamaCppBackend::Impl {
             llama_batch_free(embed_batch);
             embed_batch = {};
             embed_batch_cap = 0;
+            embed_seq_max = 0;
+            embed_pooling_requested = LLAMA_POOLING_TYPE_UNSPECIFIED;
             embed_batch_allocated = false;
         }
         if (embed_ctx != nullptr) {
             llama_free(embed_ctx);
             embed_ctx = nullptr;
+        }
+        if (rank_batch_allocated) {
+            llama_batch_free(rank_batch);
+            rank_batch = {};
+            rank_batch_cap = 0;
+            rank_seq_max = 0;
+            rank_batch_allocated = false;
+        }
+        if (rank_ctx != nullptr) {
+            llama_free(rank_ctx);
+            rank_ctx = nullptr;
         }
         if (batch_allocated) {
             llama_batch_free(batch);
@@ -2758,53 +2781,243 @@ Status LlamaCppBackend::RestoreSequenceState(std::span<const std::uint8_t> bytes
     return Status::Ok();
 }
 
+namespace {
+
+enum llama_pooling_type ToLlamaPooling(PoolingType pooling) noexcept {
+    switch (pooling) {
+        case PoolingType::kUnspecified: return LLAMA_POOLING_TYPE_UNSPECIFIED;
+        case PoolingType::kNone: return LLAMA_POOLING_TYPE_NONE;
+        case PoolingType::kMean: return LLAMA_POOLING_TYPE_MEAN;
+        case PoolingType::kCls: return LLAMA_POOLING_TYPE_CLS;
+        case PoolingType::kLast: return LLAMA_POOLING_TYPE_LAST;
+        case PoolingType::kRank: return LLAMA_POOLING_TYPE_RANK;
+    }
+    return LLAMA_POOLING_TYPE_UNSPECIFIED;
+}
+
+PoolingType FromLlamaPooling(enum llama_pooling_type pooling) noexcept {
+    switch (pooling) {
+        case LLAMA_POOLING_TYPE_NONE: return PoolingType::kNone;
+        case LLAMA_POOLING_TYPE_MEAN: return PoolingType::kMean;
+        case LLAMA_POOLING_TYPE_CLS: return PoolingType::kCls;
+        case LLAMA_POOLING_TYPE_LAST: return PoolingType::kLast;
+        case LLAMA_POOLING_TYPE_RANK: return PoolingType::kRank;
+        case LLAMA_POOLING_TYPE_UNSPECIFIED:
+        default: return PoolingType::kUnspecified;
+    }
+}
+
+std::int32_t QueryModelEmbeddingDim(const llama_model* model) noexcept {
+    if (model == nullptr) return 0;
+#if defined(SONDER_LLAMACPP_HAS_N_EMBD_OUT)
+    int32_t n_embd = llama_model_n_embd_out(model);
+    if (n_embd <= 0) {
+        n_embd = llama_model_n_embd(model);
+    }
+    return n_embd;
+#else
+    return llama_model_n_embd(model);
+#endif
+}
+
+}  // namespace
+
+bool LlamaCppBackend::SupportsReranking() const noexcept {
+    if (!IsLoaded()) return false;
+    if (impl_->ctx != nullptr && llama_pooling_type(impl_->ctx) == LLAMA_POOLING_TYPE_RANK) {
+        return true;
+    }
+    if (impl_->model != nullptr) {
+        if (llama_model_chat_template(impl_->model, "rerank") != nullptr) {
+            return true;
+        }
+        if (llama_model_cls_label(impl_->model, 0) != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::int32_t LlamaCppBackend::EmbeddingDimensions() const noexcept {
+    if (!IsLoaded()) return 0;
+    return std::max<std::int32_t>(0, QueryModelEmbeddingDim(impl_->model));
+}
+
+Status LlamaCppBackend::FormatRerankPair(std::string_view query, std::string_view document,
+                                         std::vector<Token>& out) const {
+    out.clear();
+    if (!IsLoaded()) return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
+    if (impl_->vocab == nullptr) return Status::Error(ErrorCode::kNotLoaded, "model vocab is unavailable");
+
+    const char* rerank_prompt = llama_model_chat_template(impl_->model, "rerank");
+    if (rerank_prompt != nullptr) {
+        const auto segments = SplitRerankTemplate(rerank_prompt, query, document);
+        bool first_non_empty = true;
+        std::vector<Token> piece;
+        for (const auto& seg : segments) {
+            if (seg.text.empty()) continue;
+            piece.clear();
+            const bool add_special = first_non_empty;
+            first_non_empty = false;
+            if (Status s = Tokenize(seg.text, add_special, piece, seg.parse_special); !s.ok()) {
+                out.clear();
+                return s;
+            }
+            out.insert(out.end(), piece.begin(), piece.end());
+        }
+        if (out.empty()) {
+            return Status::Error(ErrorCode::kInvalidArgument, "rerank pair produced no tokens");
+        }
+        return Status::Ok();
+    }
+
+    std::vector<Token> query_tokens;
+    std::vector<Token> doc_tokens;
+    if (!query.empty()) {
+        if (Status s = Tokenize(query, /*add_special=*/false, query_tokens, /*parse_special=*/false); !s.ok()) {
+            return s;
+        }
+    }
+    if (!document.empty()) {
+        if (Status s = Tokenize(document, /*add_special=*/false, doc_tokens, /*parse_special=*/false); !s.ok()) {
+            return s;
+        }
+    }
+
+    const llama_vocab* vocab = impl_->vocab;
+    const llama_token bos_token = llama_vocab_bos(vocab);
+    const llama_token sep_token = llama_vocab_sep(vocab);
+    llama_token eos_token = llama_vocab_eos(vocab);
+    if (eos_token == LLAMA_TOKEN_NULL) {
+        eos_token = sep_token;
+    }
+
+    out.reserve(query_tokens.size() + doc_tokens.size() + 4u);
+    if (llama_vocab_get_add_bos(vocab) && bos_token != LLAMA_TOKEN_NULL) {
+        out.push_back(bos_token);
+    }
+    out.insert(out.end(), query_tokens.begin(), query_tokens.end());
+    if (llama_vocab_get_add_eos(vocab) && eos_token != LLAMA_TOKEN_NULL) {
+        out.push_back(eos_token);
+    }
+    if (llama_vocab_get_add_sep(vocab) && sep_token != LLAMA_TOKEN_NULL) {
+        out.push_back(sep_token);
+    }
+    out.insert(out.end(), doc_tokens.begin(), doc_tokens.end());
+    if (llama_vocab_get_add_eos(vocab) && eos_token != LLAMA_TOKEN_NULL) {
+        out.push_back(eos_token);
+    }
+    if (out.empty()) {
+        return Status::Error(ErrorCode::kInvalidArgument, "rerank pair produced no tokens");
+    }
+    return Status::Ok();
+}
+
 Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, bool normalize, EmbedOutput& out,
                               const CancelPredicate& should_cancel) {
+    EmbedOptions opts;
+    opts.normalize = normalize;
+    return Embed(inputs, opts, out, should_cancel);
+}
+
+Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, const EmbedOptions& options,
+                              EmbedOutput& out, const CancelPredicate& should_cancel) {
     out = {};
     if (!IsLoaded()) return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
     if (impl_->ctx == nullptr) return Status::Error(ErrorCode::kNotLoaded, "model loaded vocab-only; no context");
     if (inputs.empty()) return Status::Error(ErrorCode::kInvalidArgument, "embedding inputs are empty");
+    if (options.pooling == PoolingType::kRank) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "reranking/classification pooling is not supported for dense embeddings");
+    }
 
     const int32_t n_vocab = llama_vocab_n_tokens(impl_->vocab);
-#if defined(SONDER_LLAMACPP_HAS_N_EMBD_OUT)
-    int32_t n_embd = llama_model_n_embd_out(impl_->model);
-    if (n_embd <= 0) {
-        n_embd = llama_model_n_embd(impl_->model);
-    }
-#else
-    const int32_t n_embd = llama_model_n_embd(impl_->model);
-#endif
+    const int32_t n_embd = QueryModelEmbeddingDim(impl_->model);
     if (n_embd <= 0) {
         return Status::Error(ErrorCode::kDecodeFailed, "model reports invalid embedding dimension");
     }
 
+    // Fail closed on dimensions: never silently truncate arbitrary models.
+    if (options.dimensions.has_value()) {
+        const std::size_t req_dims = *options.dimensions;
+        if (req_dims == 0) {
+            return Status::Error(ErrorCode::kInvalidArgument, "embedding dimensions must be positive");
+        }
+        if (req_dims > static_cast<std::size_t>(n_embd)) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "requested dimensions (" + std::to_string(req_dims) +
+                                     ") exceeds native embedding dimension (" + std::to_string(n_embd) + ")");
+        }
+        if (req_dims < static_cast<std::size_t>(n_embd)) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "model does not support dimensions reduction below native dimension " +
+                                     std::to_string(n_embd));
+        }
+    }
+
     const uint32_t base_ctx = std::max<uint32_t>(256u, Impl::EffectiveCtxSeq(impl_->ctx));
-    std::size_t max_input_len = 0;
+    std::vector<std::size_t> lengths;
+    lengths.reserve(inputs.size());
     for (const auto& seq : inputs) {
         if (seq.empty()) return Status::Error(ErrorCode::kInvalidArgument, "embedding input is empty");
-        if (seq.size() > static_cast<std::size_t>(base_ctx)) {
-            return Status::Error(ErrorCode::kContextOverflow, "embedding input exceeds embedding context window");
-        }
         for (Token t : seq) {
             if (t < 0 || t >= n_vocab) {
                 return Status::Error(ErrorCode::kInvalidArgument, "embedding token out of range");
             }
         }
-        max_input_len = std::max(max_input_len, seq.size());
+        lengths.push_back(seq.size());
     }
 
-    // Lazily allocate an isolated lightweight embedding context sized to demand
-    // (using the model's configured KV cache type & flash attention) so Embed()
-    // never disturbs live KV prefix caches or MTP/backend-sampler graphs and
-    // minimizes extra VRAM footprint.
+    const uint32_t configured_budget =
+        options.max_batch_tokens > 0
+            ? options.max_batch_tokens
+            : (impl_->options.embed_batch_tokens > 0 ? impl_->options.embed_batch_tokens
+                                                     : std::min<uint32_t>(base_ctx, kDefaultEmbedBatchTokens));
+    uint32_t configured_seqs =
+        options.max_sequences > 0
+            ? options.max_sequences
+            : (impl_->options.embed_max_sequences > 0 ? impl_->options.embed_max_sequences
+                                                      : kDefaultEmbedMaxSequences);
+    configured_seqs = std::clamp<uint32_t>(configured_seqs, 1u, kMaxEmbedSequences);
+#if !defined(SONDER_LLAMACPP_HAS_KV_UNIFIED)
+    // Without kv_unified, llama.cpp partitions n_ctx across n_seq_max; keep single-seq fallback.
+    configured_seqs = 1u;
+#endif
+
+    EmbedBatchPlanConfig plan_cfg;
+    plan_cfg.max_batch_tokens = std::max<std::size_t>(1u, static_cast<std::size_t>(configured_budget));
+    plan_cfg.max_sequences_per_batch = static_cast<std::size_t>(configured_seqs);
+    plan_cfg.max_single_input_tokens = static_cast<std::size_t>(base_ctx);
+    plan_cfg.allow_oversized_single_batch = true;
+
+    const EmbedBatchPlan plan = PlanEmbedBatches(lengths, plan_cfg);
+    if (!plan.ok) {
+        return Status::Error(plan.context_overflow ? ErrorCode::kContextOverflow : ErrorCode::kInvalidArgument,
+                             plan.error);
+    }
+
+    // Lazily allocate an isolated multi-sequence embedding context sized to
+    // the planned batch budget so Embed() never disturbs live KV prefix caches
+    // or MTP/backend-sampler graphs.
+    const enum llama_pooling_type requested_pooling =
+        options.pooling == PoolingType::kUnspecified
+            ? (llama_model_has_encoder(impl_->model) ? LLAMA_POOLING_TYPE_UNSPECIFIED : LLAMA_POOLING_TYPE_MEAN)
+            : ToLlamaPooling(options.pooling);
     const uint32_t aligned_need =
-        static_cast<uint32_t>(((max_input_len + 255u) / 256u) * 256u);
-    const uint32_t want_ctx = std::min<uint32_t>(base_ctx, std::max<uint32_t>(256u, aligned_need));
-    if (impl_->embed_ctx != nullptr && llama_n_ctx(impl_->embed_ctx) < want_ctx) {
+        static_cast<uint32_t>(((plan.max_batch_tokens_used + 255u) / 256u) * 256u);
+    const uint32_t want_ctx = std::max<uint32_t>(256u, aligned_need);
+    const uint32_t want_seqs = static_cast<uint32_t>(std::max<std::size_t>(1u, plan.max_batch_sequences_used));
+    const bool need_recreate = impl_->embed_ctx == nullptr ||
+                               llama_n_ctx(impl_->embed_ctx) < want_ctx ||
+                               impl_->embed_seq_max < want_seqs ||
+                               impl_->embed_batch_cap < static_cast<int32_t>(want_ctx) ||
+                               impl_->embed_pooling_requested != requested_pooling;
+    if (need_recreate && impl_->embed_ctx != nullptr) {
         if (impl_->embed_batch_allocated) {
             llama_batch_free(impl_->embed_batch);
             impl_->embed_batch = {};
             impl_->embed_batch_cap = 0;
+            impl_->embed_seq_max = 0;
             impl_->embed_batch_allocated = false;
         }
         llama_free(impl_->embed_ctx);
@@ -2813,19 +3026,21 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, boo
     if (impl_->embed_ctx == nullptr) {
         llama_context_params cp_emb = llama_context_default_params();
         cp_emb.n_ctx = want_ctx;
-        // Keep n_batch == n_ubatch == want_ctx so inputs up to want_ctx are
-        // evaluated in a single pass (llama_decode/encode clears embd_seq per call).
+        // Keep n_batch == n_ubatch == want_ctx so non-causal encoder models and
+        // multi-sequence batches evaluate in a single forward pass.
         cp_emb.n_batch = want_ctx;
         cp_emb.n_ubatch = want_ctx;
-        cp_emb.n_seq_max = 1;
+        cp_emb.n_seq_max = want_seqs;
         cp_emb.embeddings = true;
-        cp_emb.pooling_type =
-            llama_model_has_encoder(impl_->model) ? LLAMA_POOLING_TYPE_UNSPECIFIED : LLAMA_POOLING_TYPE_MEAN;
+        cp_emb.pooling_type = requested_pooling;
         cp_emb.type_k = ToGgmlType(impl_->options.type_k);
         cp_emb.type_v = ToGgmlType(impl_->options.type_v);
         cp_emb.flash_attn_type = ToLlamaFlashAttn(impl_->options.flash_attn);
         cp_emb.offload_kqv = true;
         cp_emb.no_perf = true;
+#if defined(SONDER_LLAMACPP_HAS_KV_UNIFIED)
+        cp_emb.kv_unified = true;
+#endif
         if (impl_->options.n_threads > 0) {
             cp_emb.n_threads = impl_->options.n_threads;
             cp_emb.n_threads_batch = impl_->options.n_threads;
@@ -2846,6 +3061,8 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, boo
         const auto cap = static_cast<int32_t>(std::max<uint32_t>(1, llama_n_batch(impl_->embed_ctx)));
         impl_->embed_batch = llama_batch_init(cap, /*embd=*/0, /*n_seq_max=*/1);
         impl_->embed_batch_cap = cap;
+        impl_->embed_seq_max = want_seqs;
+        impl_->embed_pooling_requested = requested_pooling;
         impl_->embed_batch_allocated = true;
     }
 
@@ -2864,70 +3081,308 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, boo
 
     const enum llama_pooling_type pooling = llama_pooling_type(ectx);
     if (pooling == LLAMA_POOLING_TYPE_RANK) {
-        return Status::Error(ErrorCode::kDecodeFailed,
+        return Status::Error(ErrorCode::kInvalidArgument,
                              "reranking/classification pooling is not supported for dense embeddings");
     }
     const bool encoder_only = llama_model_has_encoder(impl_->model) && !llama_model_has_decoder(impl_->model);
     const auto n_batch = static_cast<std::size_t>(std::max<int32_t>(1, impl_->embed_batch_cap));
     const auto start = Clock::now();
-    out.embeddings.reserve(inputs.size());
     std::int64_t total_prompt_tokens = 0;
+    Status batch_error = Status::Ok();
+    std::size_t batches_executed = 0;
 
-    for (const auto& seq : inputs) {
-        if (cancelled()) {
-            return Status::Error(ErrorCode::kDecodeFailed, "embedding cancelled");
-        }
-        if (llama_memory_t emem = llama_get_memory(ectx); emem != nullptr) {
-            llama_memory_clear(emem, true);
-        }
-        const std::size_t n_tok = seq.size();
-        if (n_tok > n_batch) {
-            return Status::Error(ErrorCode::kContextOverflow,
-                                 "embedding input exceeds embedding batch capacity");
-        }
-        BatchClear(impl_->embed_batch);
-        for (std::size_t i = 0; i < n_tok; ++i) {
-            const bool want_out = (pooling != LLAMA_POOLING_TYPE_NONE) || (i + 1 == n_tok);
-            BatchAdd(impl_->embed_batch, seq[i], static_cast<llama_pos>(i), /*seq_id=*/0, want_out);
-        }
-        const int32_t rc = encoder_only ? llama_encode(ectx, impl_->embed_batch)
-                                        : llama_decode(ectx, impl_->embed_batch);
-        if (rc != 0) {
-            return Status::Error(ErrorCode::kDecodeFailed,
-                                 "llama embedding pass failed (rc=" + std::to_string(rc) + ")");
-        }
-
-        const float* raw = nullptr;
-        if (pooling != LLAMA_POOLING_TYPE_NONE) {
-            raw = llama_get_embeddings_seq(ectx, 0);
-        }
-        if (raw == nullptr) {
-            raw = llama_get_embeddings_ith(ectx, -1);
-        }
-        if (raw == nullptr) {
-            raw = llama_get_embeddings(ectx);
-        }
-        if (raw == nullptr) {
-            return Status::Error(ErrorCode::kDecodeFailed, "llama.cpp returned null embeddings");
-        }
-
-        std::vector<float> vec(raw, raw + static_cast<std::size_t>(n_embd));
-        if (normalize) {
-            double sq_sum = 0.0;
-            for (float v : vec) sq_sum += static_cast<double>(v) * static_cast<double>(v);
-            const double norm = std::sqrt(sq_sum);
-            if (norm > 0.0) {
-                const auto inv = static_cast<float>(1.0 / norm);
-                for (float& v : vec) v *= inv;
+    const EmbedBatchExecStatus exec_status = ExecuteEmbedBatchPlan<std::vector<float>>(
+        plan, cancelled,
+        [&](const PlannedEmbedBatch& planned_batch, std::vector<std::vector<float>>& batch_out) -> bool {
+            if (planned_batch.total_tokens > n_batch) {
+                batch_error =
+                    Status::Error(ErrorCode::kContextOverflow, "embedding batch exceeds embedding batch capacity");
+                return false;
             }
-        }
-        out.embeddings.push_back(std::move(vec));
-        total_prompt_tokens += static_cast<std::int64_t>(n_tok);
+            if (llama_memory_t emem = llama_get_memory(ectx); emem != nullptr) {
+                llama_memory_clear(emem, true);
+            }
+            BatchClear(impl_->embed_batch);
+            std::vector<int32_t> last_tok_idx;
+            last_tok_idx.reserve(planned_batch.items.size());
+            for (const EmbedBatchItem& item : planned_batch.items) {
+                const auto& seq = inputs[item.original_index];
+                const std::size_t n_tok = seq.size();
+                for (std::size_t t = 0; t < n_tok; ++t) {
+                    const bool want_out = (pooling != LLAMA_POOLING_TYPE_NONE) || (t + 1 == n_tok);
+                    BatchAdd(impl_->embed_batch, seq[t], static_cast<llama_pos>(t),
+                             static_cast<llama_seq_id>(item.seq_id), want_out);
+                }
+                last_tok_idx.push_back(impl_->embed_batch.n_tokens - 1);
+            }
+            const int32_t rc = encoder_only ? llama_encode(ectx, impl_->embed_batch)
+                                            : llama_decode(ectx, impl_->embed_batch);
+            if (rc != 0) {
+                if (!cancelled()) {
+                    batch_error = Status::Error(ErrorCode::kDecodeFailed,
+                                                "llama embedding pass failed (rc=" + std::to_string(rc) + ")");
+                }
+                return false;
+            }
+
+            batch_out.reserve(planned_batch.items.size());
+            for (std::size_t k = 0; k < planned_batch.items.size(); ++k) {
+                const EmbedBatchItem& item = planned_batch.items[k];
+                const float* raw = nullptr;
+                if (pooling != LLAMA_POOLING_TYPE_NONE) {
+                    raw = llama_get_embeddings_seq(ectx, static_cast<llama_seq_id>(item.seq_id));
+                }
+                if (raw == nullptr) {
+                    raw = llama_get_embeddings_ith(ectx, last_tok_idx[k]);
+                }
+                if (raw == nullptr && planned_batch.items.size() == 1u) {
+                    raw = llama_get_embeddings(ectx);
+                }
+                if (raw == nullptr) {
+                    batch_error = Status::Error(ErrorCode::kDecodeFailed, "llama.cpp returned null embeddings");
+                    return false;
+                }
+                std::vector<float> vec(raw, raw + static_cast<std::size_t>(n_embd));
+                if (options.normalize) {
+                    double sq_sum = 0.0;
+                    for (float v : vec) sq_sum += static_cast<double>(v) * static_cast<double>(v);
+                    const double norm = std::sqrt(sq_sum);
+                    if (norm > 0.0) {
+                        const auto inv = static_cast<float>(1.0 / norm);
+                        for (float& v : vec) v *= inv;
+                    }
+                }
+                batch_out.push_back(std::move(vec));
+                total_prompt_tokens += static_cast<std::int64_t>(item.token_count);
+            }
+            return true;
+        },
+        out.embeddings, &batches_executed);
+
+    if (exec_status == EmbedBatchExecStatus::kCancelled) {
+        out = {};
+        return Status::Error(ErrorCode::kDecodeFailed, "embedding cancelled");
+    }
+    if (exec_status != EmbedBatchExecStatus::kOk) {
+        out = {};
+        return !batch_error.ok() ? batch_error
+                                 : Status::Error(ErrorCode::kDecodeFailed, "embedding batch execution failed");
     }
 
     out.prompt_tokens = static_cast<std::int32_t>(
         std::min<std::int64_t>(total_prompt_tokens, static_cast<std::int64_t>(INT32_MAX)));
     out.eval_ms = MsSince(start);
+    out.dimensions = static_cast<std::size_t>(n_embd);
+    out.pooling = FromLlamaPooling(pooling);
+    out.batches_executed = batches_executed;
+    return Status::Ok();
+}
+
+Status LlamaCppBackend::ScorePairs(const std::vector<std::vector<Token>>& pairs, ScoreOutput& out,
+                                   const CancelPredicate& should_cancel, std::uint32_t max_batch_tokens,
+                                   std::uint32_t max_sequences) {
+    out = {};
+    if (!IsLoaded()) return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
+    if (impl_->ctx == nullptr) return Status::Error(ErrorCode::kNotLoaded, "model loaded vocab-only; no context");
+    if (pairs.empty()) return Status::Error(ErrorCode::kInvalidArgument, "rerank/score pairs are empty");
+    if (!SupportsReranking()) {
+        return Status::Error(ErrorCode::kUnsupported,
+                             "loaded model does not support reranking (RANK pooling is required)");
+    }
+
+    const int32_t n_vocab = llama_vocab_n_tokens(impl_->vocab);
+    const uint32_t base_ctx = std::max<uint32_t>(256u, Impl::EffectiveCtxSeq(impl_->ctx));
+    std::vector<std::size_t> lengths;
+    lengths.reserve(pairs.size());
+    for (const auto& seq : pairs) {
+        if (seq.empty()) return Status::Error(ErrorCode::kInvalidArgument, "rerank/score pair is empty");
+        for (Token t : seq) {
+            if (t < 0 || t >= n_vocab) {
+                return Status::Error(ErrorCode::kInvalidArgument, "rerank/score token out of range");
+            }
+        }
+        lengths.push_back(seq.size());
+    }
+
+    const uint32_t configured_budget =
+        max_batch_tokens > 0
+            ? max_batch_tokens
+            : (impl_->options.embed_batch_tokens > 0 ? impl_->options.embed_batch_tokens
+                                                     : std::min<uint32_t>(base_ctx, kDefaultEmbedBatchTokens));
+    uint32_t configured_seqs =
+        max_sequences > 0
+            ? max_sequences
+            : (impl_->options.embed_max_sequences > 0 ? impl_->options.embed_max_sequences
+                                                      : kDefaultEmbedMaxSequences);
+    configured_seqs = std::clamp<uint32_t>(configured_seqs, 1u, kMaxEmbedSequences);
+#if !defined(SONDER_LLAMACPP_HAS_KV_UNIFIED)
+    configured_seqs = 1u;
+#endif
+
+    EmbedBatchPlanConfig plan_cfg;
+    plan_cfg.max_batch_tokens = std::max<std::size_t>(1u, static_cast<std::size_t>(configured_budget));
+    plan_cfg.max_sequences_per_batch = static_cast<std::size_t>(configured_seqs);
+    plan_cfg.max_single_input_tokens = static_cast<std::size_t>(base_ctx);
+    plan_cfg.allow_oversized_single_batch = true;
+
+    const EmbedBatchPlan plan = PlanEmbedBatches(lengths, plan_cfg);
+    if (!plan.ok) {
+        return Status::Error(plan.context_overflow ? ErrorCode::kContextOverflow : ErrorCode::kInvalidArgument,
+                             plan.error);
+    }
+
+    const uint32_t aligned_need =
+        static_cast<uint32_t>(((plan.max_batch_tokens_used + 255u) / 256u) * 256u);
+    const uint32_t want_ctx = std::max<uint32_t>(256u, aligned_need);
+    const uint32_t want_seqs = static_cast<uint32_t>(std::max<std::size_t>(1u, plan.max_batch_sequences_used));
+    const bool need_recreate = impl_->rank_ctx == nullptr ||
+                               llama_n_ctx(impl_->rank_ctx) < want_ctx ||
+                               impl_->rank_seq_max < want_seqs ||
+                               impl_->rank_batch_cap < static_cast<int32_t>(want_ctx);
+    if (need_recreate && impl_->rank_ctx != nullptr) {
+        if (impl_->rank_batch_allocated) {
+            llama_batch_free(impl_->rank_batch);
+            impl_->rank_batch = {};
+            impl_->rank_batch_cap = 0;
+            impl_->rank_seq_max = 0;
+            impl_->rank_batch_allocated = false;
+        }
+        llama_free(impl_->rank_ctx);
+        impl_->rank_ctx = nullptr;
+    }
+    if (impl_->rank_ctx == nullptr) {
+        llama_context_params cp_rank = llama_context_default_params();
+        cp_rank.n_ctx = want_ctx;
+        cp_rank.n_batch = want_ctx;
+        cp_rank.n_ubatch = want_ctx;
+        cp_rank.n_seq_max = want_seqs;
+        cp_rank.embeddings = true;
+        cp_rank.pooling_type = LLAMA_POOLING_TYPE_RANK;
+        cp_rank.type_k = ToGgmlType(impl_->options.type_k);
+        cp_rank.type_v = ToGgmlType(impl_->options.type_v);
+        cp_rank.flash_attn_type = ToLlamaFlashAttn(impl_->options.flash_attn);
+        cp_rank.offload_kqv = true;
+        cp_rank.no_perf = true;
+#if defined(SONDER_LLAMACPP_HAS_KV_UNIFIED)
+        cp_rank.kv_unified = true;
+#endif
+        if (impl_->options.n_threads > 0) {
+            cp_rank.n_threads = impl_->options.n_threads;
+            cp_rank.n_threads_batch = impl_->options.n_threads;
+        }
+#if defined(SONDER_LLAMACPP_HAS_N_RS_SEQ)
+        cp_rank.n_rs_seq = 0;
+#endif
+#if defined(SONDER_LLAMACPP_HAS_N_OUTPUTS_MAX)
+        cp_rank.n_outputs_max = cp_rank.n_batch;
+        cp_rank.n_outputs_max_per_seq = cp_rank.n_batch;
+#endif
+        cp_rank.abort_callback = &Impl::AbortCallback;
+        cp_rank.abort_callback_data = impl_.get();
+        impl_->rank_ctx = llama_init_from_model(impl_->model, cp_rank);
+        if (impl_->rank_ctx == nullptr) {
+            return Status::Error(ErrorCode::kDecodeFailed, "failed to create reranking context");
+        }
+        const auto cap = static_cast<int32_t>(std::max<uint32_t>(1, llama_n_batch(impl_->rank_ctx)));
+        impl_->rank_batch = llama_batch_init(cap, /*embd=*/0, /*n_seq_max=*/1);
+        impl_->rank_batch_cap = cap;
+        impl_->rank_seq_max = want_seqs;
+        impl_->rank_batch_allocated = true;
+    }
+
+    llama_context* rctx = impl_->rank_ctx;
+    if (llama_pooling_type(rctx) != LLAMA_POOLING_TYPE_RANK) {
+        return Status::Error(ErrorCode::kUnsupported,
+                             "reranking context did not activate RANK pooling for loaded model");
+    }
+
+    impl_->abort_requested.store(false, std::memory_order_relaxed);
+    impl_->active_cancel = &should_cancel;
+    struct RankGuard {
+        Impl* impl;
+        ~RankGuard() { impl->active_cancel = nullptr; }
+    } guard{impl_.get()};
+
+    auto cancelled = [&] {
+        return impl_->abort_requested.load(std::memory_order_relaxed) || (should_cancel && should_cancel());
+    };
+
+    const bool encoder_only = llama_model_has_encoder(impl_->model) && !llama_model_has_decoder(impl_->model);
+    const auto n_batch = static_cast<std::size_t>(std::max<int32_t>(1, impl_->rank_batch_cap));
+    const auto start = Clock::now();
+    std::int64_t total_prompt_tokens = 0;
+    Status batch_error = Status::Ok();
+    std::size_t batches_executed = 0;
+
+    const EmbedBatchExecStatus exec_status = ExecuteEmbedBatchPlan<double>(
+        plan, cancelled,
+        [&](const PlannedEmbedBatch& planned_batch, std::vector<double>& batch_out) -> bool {
+            if (planned_batch.total_tokens > n_batch) {
+                batch_error =
+                    Status::Error(ErrorCode::kContextOverflow, "rerank batch exceeds rerank batch capacity");
+                return false;
+            }
+            if (llama_memory_t rmem = llama_get_memory(rctx); rmem != nullptr) {
+                llama_memory_clear(rmem, true);
+            }
+            BatchClear(impl_->rank_batch);
+            std::vector<int32_t> last_tok_idx;
+            last_tok_idx.reserve(planned_batch.items.size());
+            for (const EmbedBatchItem& item : planned_batch.items) {
+                const auto& seq = pairs[item.original_index];
+                for (std::size_t t = 0; t < seq.size(); ++t) {
+                    BatchAdd(impl_->rank_batch, seq[t], static_cast<llama_pos>(t),
+                             static_cast<llama_seq_id>(item.seq_id), /*logits=*/true);
+                }
+                last_tok_idx.push_back(impl_->rank_batch.n_tokens - 1);
+            }
+            const int32_t rc = encoder_only ? llama_encode(rctx, impl_->rank_batch)
+                                            : llama_decode(rctx, impl_->rank_batch);
+            if (rc != 0) {
+                if (!cancelled()) {
+                    batch_error = Status::Error(ErrorCode::kDecodeFailed,
+                                                "llama reranking pass failed (rc=" + std::to_string(rc) + ")");
+                }
+                return false;
+            }
+
+            batch_out.reserve(planned_batch.items.size());
+            for (std::size_t k = 0; k < planned_batch.items.size(); ++k) {
+                const EmbedBatchItem& item = planned_batch.items[k];
+                const float* raw = llama_get_embeddings_seq(rctx, static_cast<llama_seq_id>(item.seq_id));
+                if (raw == nullptr) {
+                    raw = llama_get_embeddings_ith(rctx, last_tok_idx[k]);
+                }
+                if (raw == nullptr) {
+                    batch_error = Status::Error(ErrorCode::kDecodeFailed, "llama.cpp returned null rerank score");
+                    return false;
+                }
+                const double score = static_cast<double>(raw[0]);
+                if (!std::isfinite(score)) {
+                    batch_error = Status::Error(ErrorCode::kDecodeFailed, "llama.cpp returned non-finite rerank score");
+                    return false;
+                }
+                batch_out.push_back(score);
+                total_prompt_tokens += static_cast<std::int64_t>(item.token_count);
+            }
+            return true;
+        },
+        out.scores, &batches_executed);
+
+    if (exec_status == EmbedBatchExecStatus::kCancelled) {
+        out = {};
+        return Status::Error(ErrorCode::kDecodeFailed, "reranking cancelled");
+    }
+    if (exec_status != EmbedBatchExecStatus::kOk) {
+        out = {};
+        return !batch_error.ok() ? batch_error
+                                 : Status::Error(ErrorCode::kDecodeFailed, "rerank batch execution failed");
+    }
+
+    out.prompt_tokens = static_cast<std::int32_t>(
+        std::min<std::int64_t>(total_prompt_tokens, static_cast<std::int64_t>(INT32_MAX)));
+    out.eval_ms = MsSince(start);
+    out.batches_executed = batches_executed;
     return Status::Ok();
 }
 
