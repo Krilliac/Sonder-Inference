@@ -394,7 +394,7 @@ TEST_CASE("llamacpp chat: BuildDirectChatPromptPlan preserves interleaved multim
 }
 
 TEST_CASE("llamacpp chat: splitter starts inside <think> when the generation prompt opened it") {
-    using sonder::inference::llamacpp_detail::ChatPromptSegment;
+    using sonder::inference::ChatPromptSegment;
     using sonder::inference::llamacpp_detail::PromptEndsInsideThink;
     using sonder::inference::llamacpp_detail::ThinkingStreamSplitter;
 

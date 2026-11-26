@@ -212,8 +212,14 @@ private:
 };
 
 // True when the trailing trusted (parse_special) run of the prompt ends inside an
-// unclosed <think> block (Qwen3.5 / R1-Distill style generation prompts), so the
-// model's first output is reasoning and the splitter must start in thinking mode.
+// unclosed <think> block, so the model's first output is reasoning and the
+// splitter must start in thinking mode. On the legacy llama_chat_apply_template
+// path only a template whose generation prompt ends in an open <think> (the
+// built-in bailing-think renderer) triggers this. The ChatML renderer (Qwen3.5)
+// ends in `<|im_start|>assistant
+` and the DeepSeek-3 renderer (R1-Distill) ends
+// in the Assistant token, neither writes <think>, so a bare leading </think> from
+// those models still leaks into content until Jinja/common_chat rendering lands.
 inline bool PromptEndsInsideThink(const std::vector<ChatPromptSegment>& segments) {
     std::string trailing;
     std::size_t idx = segments.size();
