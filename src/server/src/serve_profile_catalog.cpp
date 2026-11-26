@@ -44,6 +44,21 @@ LaunchProfile effective_llamacpp_profile(const LaunchProfile& p, const BackendSe
     if (!eff.cache_type_k && backend.llamacpp_kv_cache_type_k) eff.cache_type_k = *backend.llamacpp_kv_cache_type_k;
     if (!eff.cache_type_v && backend.llamacpp_kv_cache_type_v) eff.cache_type_v = *backend.llamacpp_kv_cache_type_v;
     if (!eff.flash_attn && backend.llamacpp_flash_attention) eff.flash_attn = *backend.llamacpp_flash_attention;
+    if (!eff.parallel && backend.llamacpp_slots) eff.parallel = *backend.llamacpp_slots;
+    if (!eff.kv_unified && backend.llamacpp_kv_unified) eff.kv_unified = *backend.llamacpp_kv_unified;
+    if (!eff.cache_ram_mib && backend.llamacpp_cache_ram_mib) {
+        eff.cache_ram_mib = static_cast<std::int64_t>(*backend.llamacpp_cache_ram_mib);
+    }
+    if (!eff.threads && backend.llamacpp_threads) eff.threads = *backend.llamacpp_threads;
+    if (eff.mmproj.empty() && backend.llamacpp_mmproj_path) eff.mmproj = *backend.llamacpp_mmproj_path;
+    if (!eff.speculative && backend.llamacpp_spec_type) {
+        SpeculativeSettings spec;
+        spec.types = {*backend.llamacpp_spec_type};
+        spec.draft_n_max = backend.llamacpp_spec_draft_max;
+        eff.speculative = std::move(spec);
+    } else if (eff.speculative && !eff.speculative->draft_n_max && backend.llamacpp_spec_draft_max) {
+        eff.speculative->draft_n_max = backend.llamacpp_spec_draft_max;
+    }
     return eff;
 }
 

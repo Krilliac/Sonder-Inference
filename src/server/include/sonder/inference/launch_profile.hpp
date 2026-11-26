@@ -150,6 +150,20 @@ inline constexpr std::string_view kSpeculativeTypes[] = {
     "none",         "draft-simple", "draft-eagle3", "draft-mtp",     "draft-dflash", "draft-dspark",
     "ngram-simple", "ngram-map-k",  "ngram-map-k4v", "ngram-mod",    "ngram-cache",  "suffix"};
 
+// Direct llamacpp backend in-process --spec-type values (matches validate_llamacpp_options).
+inline constexpr std::string_view kLlamaCppSpeculativeTypes[] = {
+    "none", "auto", "ngram", "ngram-mod", "suffix", "draft-mtp"};
+
+struct LlamaCppSpeculativeMapping {
+    std::string spec_type = "none";
+    std::optional<std::int32_t> draft_max;
+};
+
+// Maps a LaunchProfile's speculative settings onto direct llamacpp backend options.
+// Rejects external-only drafters, speculative.draft_model, or multi-type lists.
+Result<LlamaCppSpeculativeMapping> map_llamacpp_speculative(
+    const SpeculativeSettings& spec, std::string_view profile_where = "(direct)");
+
 // Strict parsing: unknown keys, wrong types and out-of-range values are
 // errors (invalid_argument naming the profile and field). `document` is
 // {"profiles": [ {...}, ... ]}. Profile names must be unique.
@@ -168,12 +182,12 @@ const LaunchProfile* find_launch_profile(const std::vector<LaunchProfile>& profi
 Result<std::vector<std::string>> llamaserver_arguments(const LaunchProfile& profile);
 
 // Maps a llamacpp profile onto `setup`: context length, GPU layers, batch and
-// micro-batch sizes, K and V cache types and flash attention (the
-// BackendSetup::llamacpp_* fields `serve`'s --batch-size, --ubatch-size,
-// --cache-type-k/-v and --flash-attn set, with the same value names). Nothing
-// is applied on error. Returns invalid_argument for any field the direct
-// backend cannot honour. `device` is serve's --device: a profile that offloads
-// layers sets "gpu:0" when it is empty and refuses a cpu device.
+// micro-batch sizes, K and V cache types, flash attention, slots (`parallel`),
+// unified KV (`kv_unified`), host prefix cache (`cache_ram_mib`), `threads`,
+// `mmproj`, and in-process `speculative` settings (same BackendSetup::llamacpp_*
+// fields serve's CLI sets). Nothing is applied on error. Returns invalid_argument
+// for any unsupported or out-of-range field. `device` is serve's --device: a
+// profile that offloads layers sets "gpu:0" when empty and refuses cpu*.
 Status apply_llamacpp_profile(const LaunchProfile& profile, BackendSetup& setup, std::string& device);
 
 // Sets every default the request did not set explicitly and marks it

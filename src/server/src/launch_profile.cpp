@@ -561,8 +561,13 @@ Status validate_launch_profile(const LaunchProfile& p) {
     if (p.speculative) {
         if (p.speculative->types.empty()) return bad(where, "'speculative.types' must not be empty");
         std::set<std::string> seen;
+        const auto in_list = [](const auto& list, std::string_view v) {
+            return std::find(std::begin(list), std::end(list), v) != std::end(list);
+        };
         for (const auto& t : p.speculative->types) {
-            if (std::find(std::begin(kSpeculativeTypes), std::end(kSpeculativeTypes), t) == std::end(kSpeculativeTypes)) {
+            const bool valid = in_list(kSpeculativeTypes, t) ||
+                               (p.backend == kLaunchProfileBackendLlamaCpp && in_list(kLlamaCppSpeculativeTypes, t));
+            if (!valid) {
                 return bad(where, "unknown speculative type '" + detail::bounded_for_message(t) + "'");
             }
             if (!seen.insert(t).second) return bad(where, "speculative type '" + t + "' is listed twice");
@@ -722,13 +727,45 @@ Result<std::vector<std::string>> llamaserver_arguments(const LaunchProfile& p) {
     return a;
 }
 
+Result<LlamaCppSpeculativeMapping> map_llamacpp_speculative(const SpeculativeSettings& spec,
+                                                          std::string_view profile_where) {
+    const std::string where = profile_where.empty() ? std::string("(direct)") : std::string(profile_where);
+    if (spec.types.empty()) {
+        return bad(where, "'speculative.types' must not be empty");
+    }
+    if (spec.types.size() > 1) {
+        return bad(where, "'speculative.types' has multiple entries; the llamacpp backend supports only a single "
+                          "speculative type (use llamaserver)");
+    }
+    if (!spec.draft_model.empty()) {
+        return bad(where, "'speculative.draft_model' is not supported by the llamacpp backend "
+                          "(direct backend supports in-process speculation only); use llamaserver");
+    }
+    const std::string& mode = spec.types.front();
+    const bool supported =
+        std::find(std::begin(kLlamaCppSpeculativeTypes), std::end(kLlamaCppSpeculativeTypes), mode) !=
+        std::end(kLlamaCppSpeculativeTypes);
+    if (!supported) {
+        return bad(where, "'speculative.types' ('" + detail::bounded_for_message(mode) +
+                              "') is not supported by the llamacpp backend; use llamaserver");
+    }
+    if (spec.draft_n_max) {
+        if (*spec.draft_n_max < 1 || *spec.draft_n_max > 64) {
+            return bad(where, "'speculative.draft_n_max' must be from 1 to 64");
+        }
+        if (mode == "none") {
+            return bad(where, "'speculative.draft_n_max' cannot be set when speculative type is 'none'");
+        }
+    }
+    return LlamaCppSpeculativeMapping{mode, spec.draft_n_max};
+}
+
 Status apply_llamacpp_profile(const LaunchProfile& p, BackendSetup& setup, std::string& device) {
     if (Status st = validate_launch_profile(p); !st.ok()) return st;
     if (p.backend != kLaunchProfileBackendLlamaCpp) return bad(where_of(p), "backend is not llamacpp");
     const auto unsupported = [&p](const char* field) {
         return bad(where_of(p), std::string("'") + field + "' is not supported by the llamacpp backend; use llamaserver");
     };
-    if (!p.mmproj.empty()) return unsupported("mmproj");
     if (p.mmproj_offload) return unsupported("mmproj_offload");
     if (p.image_max_tokens) return unsupported("image_max_tokens");
     if (p.device) return unsupported("device");
@@ -739,8 +776,10 @@ Status apply_llamacpp_profile(const LaunchProfile& p, BackendSetup& setup, std::
     if (p.no_repack) return unsupported("no_repack");
     if (p.moe_cache_mib) return unsupported("moe_cache_mib");
     if (p.moe_cache_cpu_share) return unsupported("moe_cache_cpu_share");
-    if (p.parallel) return unsupported("parallel");
-    if (p.kv_unified) return unsupported("kv_unified");
+    if (p.parallel && (*p.parallel < 1 || *p.parallel > 16)) {
+        return bad(where_of(p), "'parallel' (" + std::to_string(*p.parallel) +
+                                    ") must be from 1 to 16 on the llamacpp backend; use llamaserver");
+    }
     if (p.cache_type_k && !is_llamacpp_kv_cache_type(*p.cache_type_k)) {
         return bad(where_of(p), "'cache_type_k' (" + *p.cache_type_k +
                                     ") is not supported by the llamacpp backend; use llamaserver");
@@ -751,11 +790,22 @@ Status apply_llamacpp_profile(const LaunchProfile& p, BackendSetup& setup, std::
     }
     if (p.ctx_checkpoints) return unsupported("ctx_checkpoints");
     if (p.checkpoint_min_step) return unsupported("checkpoint_min_step");
-    if (p.cache_ram_mib) return unsupported("cache_ram_mib");
+    if (p.cache_ram_mib && (*p.cache_ram_mib < 0 || *p.cache_ram_mib > 65536)) {
+        return bad(where_of(p), "'cache_ram_mib' (" + std::to_string(*p.cache_ram_mib) +
+                                    ") must be from 0 to 65536 on the llamacpp backend; use llamaserver");
+    }
     if (p.context_shift) return unsupported("context_shift");
     if (p.fit) return unsupported("fit");
-    if (p.speculative) return unsupported("speculative");
-    if (p.threads) return unsupported("threads");
+    std::optional<LlamaCppSpeculativeMapping> spec_mapping;
+    if (p.speculative) {
+        auto mapped = map_llamacpp_speculative(*p.speculative, where_of(p));
+        if (!mapped.ok()) return mapped.status();
+        spec_mapping = std::move(mapped).value();
+    }
+    if (p.threads && (*p.threads < 1 || *p.threads > 256)) {
+        return bad(where_of(p), "'threads' (" + std::to_string(*p.threads) +
+                                    ") must be from 1 to 256 on the llamacpp backend; use llamaserver");
+    }
     if (p.threads_batch) return unsupported("threads_batch");
     if (p.jinja) return unsupported("jinja");
     if (p.reasoning_format) return unsupported("reasoning_format");
@@ -766,15 +816,23 @@ Status apply_llamacpp_profile(const LaunchProfile& p, BackendSetup& setup, std::
         return bad(where_of(p), "'ctx_size' above 4194304 is not supported by the llamacpp backend; use llamaserver");
     }
     BackendSetup next = setup;
-    // Same option names and values as serve's --batch-size, --ubatch-size,
-    // --cache-type-k/-v and --flash-attn; validate_options() checks them
-    // with validate_llamacpp_options() in builds that have the backend.
+    // Same option names and values as serve's direct llamacpp CLI flags;
+    // validate_options() checks them with validate_llamacpp_options() when built.
     if (p.batch_size) next.llamacpp_batch_size = *p.batch_size;
     if (p.ubatch_size) next.llamacpp_ubatch_size = *p.ubatch_size;
     if (p.cache_type_k) next.llamacpp_kv_cache_type_k = *p.cache_type_k;
     if (p.cache_type_v) next.llamacpp_kv_cache_type_v = *p.cache_type_v;
     if (p.flash_attn) next.llamacpp_flash_attention = *p.flash_attn;
     if (p.ctx_size) next.llamacpp_context_length = *p.ctx_size;
+    if (p.parallel) next.llamacpp_slots = *p.parallel;
+    if (p.kv_unified) next.llamacpp_kv_unified = *p.kv_unified;
+    if (p.cache_ram_mib) next.llamacpp_cache_ram_mib = static_cast<std::uint32_t>(*p.cache_ram_mib);
+    if (p.threads) next.llamacpp_threads = *p.threads;
+    if (!p.mmproj.empty()) next.llamacpp_mmproj_path = p.mmproj;
+    if (spec_mapping) {
+        next.llamacpp_spec_type = spec_mapping->spec_type;
+        if (spec_mapping->draft_max) next.llamacpp_spec_draft_max = *spec_mapping->draft_max;
+    }
     std::string next_device = device;
     if (p.n_gpu_layers) {
         next.llamacpp_gpu_layers = *p.n_gpu_layers;
@@ -842,6 +900,18 @@ json::Object launch_profile_metadata(const LaunchProfile& p, const std::optional
         json::Array types;
         for (const auto& t : p.speculative->types) types.emplace_back(t);
         o.set("speculative_types", std::move(types));
+        if (p.speculative->draft_n_max) {
+            o.set("speculative_draft_n_max", json::Value(*p.speculative->draft_n_max));
+        }
+    }
+    if (p.kv_unified.has_value()) {
+        o.set("kv_unified", json::Value(*p.kv_unified));
+    }
+    if (p.cache_ram_mib.has_value()) {
+        o.set("cache_ram_mib", json::Value(*p.cache_ram_mib));
+    }
+    if (p.threads.has_value()) {
+        o.set("threads", json::Value(*p.threads));
     }
     o.set("estimated_vram_mib", estimate ? json::Value(estimate->total_mib()) : json::Value());
     o.set("vram_budget_mib", budget_mib ? json::Value(*budget_mib) : json::Value());

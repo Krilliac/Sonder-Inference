@@ -437,17 +437,12 @@ TEST_CASE("launch profile llamacpp: context and GPU layers map onto the backend 
 
 TEST_CASE("launch profile llamacpp: fields the direct backend cannot honour are rejected and never dropped") {
     const std::vector<std::pair<std::string, std::string>> cases{
-        {R"("mmproj":"p.gguf")", "mmproj"},
-        {R"("mmproj":"p.gguf","image_max_tokens":100)", "mmproj"},
-        {R"("parallel":2)", "parallel"},
-        {R"("kv_unified":false)", "kv_unified"},
+        {R"("mmproj":"p.gguf","image_max_tokens":100)", "image_max_tokens"},
+        {R"("mmproj":"p.gguf","mmproj_offload":false)", "mmproj_offload"},
         {R"("ctx_checkpoints":4)", "ctx_checkpoints"},
         {R"("checkpoint_min_step":8192)", "checkpoint_min_step"},
-        {R"("cache_ram_mib":4096)", "cache_ram_mib"},
         {R"("context_shift":false)", "context_shift"},
         {R"("fit":false)", "fit"},
-        {R"("speculative":{"types":["draft-mtp"]})", "speculative"},
-        {R"("threads":8)", "threads"},
         {R"("threads_batch":8)", "threads_batch"},
         {R"("jinja":true)", "jinja"},
         {R"("reasoning_format":"deepseek")", "reasoning_format"},
@@ -463,6 +458,85 @@ TEST_CASE("launch profile llamacpp: fields the direct backend cannot honour are 
         CHECK(st.code() == si::ErrorCode::invalid_argument);
         CHECK(contains(st.message(), "'" + name + "' is not supported by the llamacpp backend; use llamaserver"));
     }
+}
+
+TEST_CASE("launch profile llamacpp: direct parity maps parallel, kv_unified, cache_ram_mib, threads, mmproj, and speculative") {
+    const LaunchProfile full = parse_single(
+        R"({"name":"d","backend":"llamacpp","model":"m.gguf","mmproj":"mm.gguf",
+            "ctx_size":32768,"n_gpu_layers":99,"parallel":4,"kv_unified":false,
+            "cache_ram_mib":8192,"threads":12,"batch_size":1024,"ubatch_size":512,
+            "cache_type_k":"q8_0","cache_type_v":"q8_0","flash_attn":"on",
+            "speculative":{"types":["draft-mtp"],"draft_n_max":4}})");
+    si::BackendSetup setup;
+    std::string device;
+    REQUIRE_MESSAGE(si::apply_llamacpp_profile(full, setup, device).ok(),
+                    si::apply_llamacpp_profile(full, setup, device).message());
+    CHECK(setup.llamacpp_context_length == 32768u);
+    CHECK(setup.llamacpp_gpu_layers == 99);
+    CHECK(setup.llamacpp_slots == 4u);
+    CHECK(setup.llamacpp_kv_unified == std::optional<bool>(false));
+    CHECK(setup.llamacpp_cache_ram_mib == 8192u);
+    CHECK(setup.llamacpp_threads == 12);
+    CHECK(setup.llamacpp_mmproj_path == std::optional<std::string>("mm.gguf"));
+    CHECK(setup.llamacpp_spec_type == std::optional<std::string>("draft-mtp"));
+    CHECK(setup.llamacpp_spec_draft_max == std::optional<std::int32_t>(4));
+    CHECK(device == "gpu:0");
+
+    // In-process speculative modes supported natively by llamacpp (including auto and ngram).
+    for (const auto* spec_mode : {"none", "auto", "ngram", "ngram-mod", "suffix", "draft-mtp"}) {
+        CAPTURE(spec_mode);
+        const LaunchProfile sp = parse_single(
+            std::string(R"({"name":"d","backend":"llamacpp","model":"m.gguf","speculative":{"types":[")") +
+            spec_mode + R"("]}})");
+        si::BackendSetup sp_setup;
+        std::string sp_dev;
+        const auto st = si::apply_llamacpp_profile(sp, sp_setup, sp_dev);
+        REQUIRE_MESSAGE(st.ok(), st.message());
+        CHECK(sp_setup.llamacpp_spec_type == std::optional<std::string>(spec_mode));
+        CHECK_FALSE(sp_setup.llamacpp_spec_draft_max.has_value());
+    }
+
+    // Metadata emits mapped optional settings cleanly when present.
+    const json::Object meta = si::launch_profile_metadata(full, std::nullopt, std::nullopt);
+    CHECK(meta.find("parallel")->as_uint() == 4u);
+    CHECK(meta.find("kv_unified")->as_bool() == false);
+    CHECK(meta.find("cache_ram_mib")->as_uint() == 8192u);
+    CHECK(meta.find("threads")->as_uint() == 12u);
+    CHECK(meta.find("speculative_draft_n_max")->as_uint() == 4u);
+
+    // Unsupported/out-of-range parity bounds and invalid speculative modes fail closed transactionally.
+    const std::vector<std::pair<std::string, std::string>> rejected_cases{
+        {R"("parallel":17)", "parallel"},
+        {R"("cache_ram_mib":-1)", "cache_ram_mib"},
+        {R"("cache_ram_mib":65537)", "cache_ram_mib"},
+        {R"("threads":0)", "threads"},
+        {R"("threads":-1)", "threads"},
+        {R"("threads":257)", "threads"},
+        {R"("speculative":{"types":["draft-mtp","ngram-mod"]})", "speculative.types"},
+        {R"("speculative":{"types":["draft-simple"],"draft_model":"draft.gguf"})", "speculative.draft_model"},
+        {R"("speculative":{"types":["draft-eagle3"]})", "draft-eagle3"},
+        {R"("speculative":{"types":["draft-dflash"]})", "draft-dflash"},
+        {R"("speculative":{"types":["ngram-simple"]})", "ngram-simple"},
+        {R"("speculative":{"types":["none"],"draft_n_max":4})", "draft_n_max"},
+    };
+    for (const auto& [fields, needle] : rejected_cases) {
+        CAPTURE(fields);
+        const LaunchProfile bad = parse_single(R"({"name":"d","backend":"llamacpp","model":"m.gguf",)" + fields + "}");
+        si::BackendSetup clean;
+        std::string clean_dev;
+        const si::Status st = si::apply_llamacpp_profile(bad, clean, clean_dev);
+        REQUIRE_FALSE(st.ok());
+        CHECK(st.code() == si::ErrorCode::invalid_argument);
+        CHECK(contains(st.message(), needle));
+        CHECK_FALSE(clean.llamacpp_slots.has_value());
+        CHECK_FALSE(clean.llamacpp_spec_type.has_value());
+    }
+
+    // llamaserver remains strict against llamacpp-only auto/ngram speculative names.
+    CHECK(contains(parse_error(R"({"name":"s","backend":"llamaserver","model":"m.gguf","speculative":{"types":["auto"]}})"),
+                   "unknown speculative type 'auto'"));
+    CHECK(contains(parse_error(R"({"name":"s","backend":"llamaserver","model":"m.gguf","speculative":{"types":["ngram"]}})"),
+                   "unknown speculative type 'ngram'"));
 }
 
 TEST_CASE("launch profile llamacpp: KV cache types and flash attention and batch use the backend's option names") {
@@ -496,7 +570,7 @@ TEST_CASE("launch profile llamacpp: KV cache types and flash attention and batch
 
     // A rejected profile applies nothing, these fields included.
     const LaunchProfile rejected = parse_single(
-        R"({"name":"d","backend":"llamacpp","model":"m.gguf","cache_type_k":"q8_0","parallel":2})");
+        R"({"name":"d","backend":"llamacpp","model":"m.gguf","cache_type_k":"q8_0","fit":false})");
     si::BackendSetup clean;
     CHECK_FALSE(si::apply_llamacpp_profile(rejected, clean, device).ok());
     CHECK_FALSE(clean.llamacpp_kv_cache_type_k.has_value());
@@ -2168,7 +2242,7 @@ TEST_CASE("serve_main: launch profile usage errors exit 2 before starting anythi
     const std::string m = model.generic_string();
     const auto profiles = write_temp("profiles.json", R"({"profiles":[
         {"name":"big","backend":"llamaserver","model":")" + m + R"(","ctx_size":512,"n_gpu_layers":-1,"fit":false},
-        {"name":"direct","backend":"llamacpp","model":")" + m + R"(","parallel":2},
+        {"name":"direct","backend":"llamacpp","model":")" + m + R"(","fit":false},
         {"name":"auto","backend":"llamaserver","model":"missing-model.gguf"}]})");
     const std::string pf = profiles.string();
     std::string err;
@@ -2187,7 +2261,7 @@ TEST_CASE("serve_main: launch profile usage errors exit 2 before starting anythi
     CHECK(serve({"--profiles", pf, "--profile", "big", "--llamaserver-mode", "attach"}, err) == 2);
     CHECK(contains(err, "needs llamaserver spawn mode"));
     CHECK(serve({"--profiles", pf, "--profile", "direct"}, err) == 2);
-    CHECK(contains(err, "'parallel' is not supported by the llamacpp backend; use llamaserver"));
+    CHECK(contains(err, "'fit' is not supported by the llamacpp backend; use llamaserver"));
     // Over budget: refused unless --allow-overcommit (the fixture needs the
     // 256 MiB runtime allowance, so a 100 MiB budget cannot fit).
     CHECK(serve({"--profiles", pf, "--profile", "big", "--vram-budget-mib", "100", "--llamaserver-executable",
@@ -2627,7 +2701,7 @@ TEST_CASE("launch profile: moe_cache_mib, moe_cache_cpu_share, and suffix specul
     }
 }
 
-TEST_CASE("serve_options: --moe-cache-mib, --moe-cache-cpu-share, --cache-ram-mib, --mmproj, and --spec-type suffix") {
+TEST_CASE("serve_options: --moe-cache-mib, --moe-cache-cpu-share rejection, --cache-ram-mib, --mmproj, and --spec-type suffix") {
     const auto parse_and_build = [](const std::vector<std::string>& cli, srv::detail::ServeCliConfig& out,
                                     std::string& err_text) -> int {
         srv::detail::ParsedServeArgs parsed;
@@ -2645,7 +2719,7 @@ TEST_CASE("serve_options: --moe-cache-mib, --moe-cache-cpu-share, --cache-ram-mi
         std::string err;
         const int rc = parse_and_build(
             {"--backend", "llamacpp", "--model", "qwen3-80b.gguf", "--moe-cache-mib", "4096",
-             "--moe-cache-cpu-share", "0.35", "--cache-ram-mib", "8192", "--mmproj", "D:/models/mmproj.gguf",
+             "--cache-ram-mib", "8192", "--mmproj", "D:/models/mmproj.gguf",
              "--spec-type", "suffix"},
             cfg, err);
 #if defined(SONDER_HAS_LLAMACPP_BACKEND)
@@ -2655,17 +2729,39 @@ TEST_CASE("serve_options: --moe-cache-mib, --moe-cache-cpu-share, --cache-ram-mi
         CHECK(contains(err, "unavailable backend 'llamacpp'"));
 #endif
         CHECK(cfg.options.backend.llamacpp_moe_cache_mib == std::optional<std::uint32_t>(4096u));
-        REQUIRE(cfg.options.backend.llamacpp_moe_cache_cpu_share.has_value());
-        CHECK(*cfg.options.backend.llamacpp_moe_cache_cpu_share == doctest::Approx(0.35));
+        CHECK_FALSE(cfg.options.backend.llamacpp_moe_cache_cpu_share.has_value());
         CHECK(cfg.options.backend.llamacpp_cache_ram_mib == std::optional<std::uint32_t>(8192u));
         CHECK(cfg.options.backend.llamacpp_mmproj_path == "D:/models/mmproj.gguf");
         CHECK(cfg.options.backend.llamacpp_spec_type == std::optional<std::string>("suffix"));
     }
 
-    // Non-llamacpp backends reject each of these flags cleanly.
+    // --moe-cache-cpu-share fails closed on both serve CLI (llamacpp/mock) and BackendSetup.
+    for (const auto* backend : {"llamacpp", "mock"}) {
+        CAPTURE(backend);
+        srv::detail::ServeCliConfig cfg;
+        std::string err;
+        CHECK(parse_and_build({"--backend", backend, "--model", "m.gguf", "--moe-cache-cpu-share", "0.35"}, cfg, err) ==
+              2);
+        CHECK(contains(err, "--moe-cache-cpu-share is not supported"));
+        CHECK_FALSE(cfg.options.backend.llamacpp_moe_cache_cpu_share.has_value());
+    }
+    {
+#if defined(SONDER_HAS_LLAMACPP_BACKEND)
+        srv::ServerOptions cpp_opts;
+        cpp_opts.backend.backend = "llamacpp";
+        cpp_opts.backend.llamacpp_moe_cache_cpu_share = 0.25;
+        const auto valid_st = si::validate_backend_setup(cpp_opts.backend);
+        REQUIRE_FALSE(valid_st.ok());
+        CHECK(contains(valid_st.message(), "llamacpp_moe_cache_cpu_share"));
+        auto built = si::make_backend(cpp_opts.backend);
+        REQUIRE_FALSE(built.ok());
+        CHECK(contains(built.status().message(), "llamacpp_moe_cache_cpu_share"));
+#endif
+    }
+
+    // Non-llamacpp backends reject each supported llamacpp flag cleanly.
     for (const auto& [flag, value] : std::vector<std::pair<std::string, std::string>>{
              {"--moe-cache-mib", "2048"},
-             {"--moe-cache-cpu-share", "0.5"},
              {"--cache-ram-mib", "4096"},
              {"--mmproj", "mmproj.gguf"},
              {"--spec-type", "suffix"}}) {
@@ -2685,11 +2781,6 @@ TEST_CASE("serve_options: --moe-cache-mib, --moe-cache-cpu-share, --cache-ram-mi
         CHECK(contains(err, "--moe-cache-mib"));
 
         err.clear();
-        CHECK(parse_and_build({"--backend", "llamacpp", "--model", "m.gguf", "--moe-cache-cpu-share", "1.5"}, cfg,
-                              err) == 2);
-        CHECK(contains(err, "--moe-cache-cpu-share"));
-
-        err.clear();
         CHECK(parse_and_build({"--backend", "llamacpp", "--model", "m.gguf", "--cache-ram-mib", "65537"}, cfg, err) ==
               2);
         CHECK(contains(err, "--cache-ram-mib"));
@@ -2697,5 +2788,32 @@ TEST_CASE("serve_options: --moe-cache-mib, --moe-cache-cpu-share, --cache-ram-mi
         err.clear();
         CHECK(parse_and_build({"--backend", "llamacpp", "--model", "m.gguf", "--mmproj", ""}, cfg, err) == 2);
         CHECK(contains(err, "--mmproj"));
+    }
+
+    // Direct llamacpp flags owned by typed profile fields refuse --profile combination.
+    {
+        const auto pf_path = write_temp("serve-profile-direct-conflict.json", R"({"profiles":[
+            {"name":"d","backend":"llamacpp","model":"m.gguf","parallel":2,"kv_unified":false,
+             "threads":4,"cache_ram_mib":4096,"speculative":{"types":["ngram-mod"],"draft_n_max":4}}]})");
+        const std::string pf = pf_path.string();
+        for (const auto& [flag, val] : std::vector<std::pair<std::string, std::string>>{
+                 {"--slots", "2"},
+                 {"--threads", "4"},
+                 {"--spec-type", "suffix"},
+                 {"--spec-draft-max", "4"}}) {
+            CAPTURE(flag);
+            srv::detail::ServeCliConfig cfg;
+            std::string err;
+            CHECK(parse_and_build({"--profiles", pf, "--profile", "d", flag, val, "--max-connections", "0"}, cfg, err) ==
+                  2);
+            CHECK(contains(err, flag + " conflicts with --profile"));
+        }
+        srv::detail::ServeCliConfig cfg;
+        std::string err;
+        CHECK(parse_and_build({"--profiles", pf, "--profile", "d", "--no-kv-unified", "--max-connections", "0"}, cfg,
+                              err) == 2);
+        CHECK(contains(err, "--no-kv-unified conflicts with --profile"));
+        std::error_code ec;
+        std::filesystem::remove(pf_path, ec);
     }
 }

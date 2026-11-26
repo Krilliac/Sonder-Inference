@@ -889,7 +889,7 @@ TEST_CASE("serve_main: multi-profile llamacpp validates shared options and check
             {"name":"conflict","backend":"llamacpp","model":")" << b_str
                                 << R"(","ctx_size":1024,"n_gpu_layers":-1},
             {"name":"unsupported","backend":"llamacpp","model":")" << b_str
-                                << R"(","parallel":2}
+                                << R"(","threads_batch":8}
         ]})";
     }
     const std::string pf = profiles.string();
@@ -916,7 +916,7 @@ TEST_CASE("serve_main: multi-profile llamacpp validates shared options and check
     CHECK(run({"--profiles", pf, "--profile", "alpha", "--profile", "unsupported", "--vram-budget-mib",
                std::to_string(fit_budget)},
               out, err) == 2);
-    CHECK(err.find("'parallel' is not supported by the llamacpp backend") != std::string::npos);
+    CHECK(err.find("'threads_batch' is not supported by the llamacpp backend") != std::string::npos);
 
     // Eager multi-profile overcommit refuses with both profile names, sum vs budget, and suggestions.
     CHECK(run({"--profiles", pf, "--profile", "alpha", "--profile", "beta", "--vram-budget-mib",
@@ -1201,4 +1201,87 @@ TEST_CASE("serve_main: --stream-keepalive-ms parses, validates bounds, and appea
     const si::Status st = srv::validate_options(opts);
     CHECK_FALSE(st.ok());
     CHECK(st.message().find("--stream-keepalive-ms") != std::string::npos);
+}
+
+TEST_CASE("serve_main: multi-profile llamacpp merges and conflicts on direct parity fields cleanly") {
+    const auto g_path = temp_path("parity-direct.gguf");
+    {
+        std::string head = "GGUF";
+        const std::uint32_t version = 3u;
+        const std::uint64_t tensors = 0u;
+        const std::uint64_t kvs = 1u;
+        head.append(reinterpret_cast<const char*>(&version), 4);
+        head.append(reinterpret_cast<const char*>(&tensors), 8);
+        head.append(reinterpret_cast<const char*>(&kvs), 8);
+        const std::string key = "general.architecture";
+        const std::uint64_t kl = key.size();
+        const std::uint32_t ty = 8u;
+        const std::string val = "llama";
+        const std::uint64_t vl = val.size();
+        head.append(reinterpret_cast<const char*>(&kl), 8);
+        head.append(key);
+        head.append(reinterpret_cast<const char*>(&ty), 4);
+        head.append(reinterpret_cast<const char*>(&vl), 8);
+        head.append(val);
+        std::ofstream(g_path, std::ios::binary) << head;
+    }
+    const std::string g_str = g_path.generic_string();
+    const auto profiles = temp_path("parity-direct-profiles.json");
+    {
+        std::ofstream(profiles) << R"({"profiles":[
+            {"name":"rich","backend":"llamacpp","model":")" << g_str << R"(",
+             "n_gpu_layers":0,"parallel":3,"kv_unified":false,"cache_ram_mib":4096,
+             "threads":8,"mmproj":"mm.gguf","speculative":{"types":["draft-mtp"],"draft_n_max":4}},
+            {"name":"plain","backend":"llamacpp","model":")" << g_str << R"(","n_gpu_layers":0},
+            {"name":"conflict-slots","backend":"llamacpp","model":")" << g_str << R"(","n_gpu_layers":0,"parallel":5},
+            {"name":"conflict-spec","backend":"llamacpp","model":")" << g_str << R"(","n_gpu_layers":0,"speculative":{"types":["suffix"]}}
+        ]})";
+    }
+    const std::string pf = profiles.string();
+
+    std::string out;
+    std::string err;
+    CHECK(run({"--profiles", pf, "--profile", "rich", "--profile", "conflict-slots"}, out, err) == 2);
+    CHECK(err.find("conflicts with 'rich' on shared llamacpp option 'parallel'") != std::string::npos);
+
+    out.clear();
+    err.clear();
+    CHECK(run({"--profiles", pf, "--profile", "rich", "--profile", "conflict-spec"}, out, err) == 2);
+    CHECK(err.find("conflicts with 'rich' on shared llamacpp option 'speculative.types'") != std::string::npos);
+
+    det::ServeCliConfig cfg;
+    const int rc = build_cli({"--profiles", pf, "--profile", "rich", "--profile", "plain", "--max-connections", "0"},
+                             cfg, err);
+    CHECK(rc == 2);
+    CHECK(err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+    CHECK(cfg.options.backend.llamacpp_slots == 3u);
+    CHECK(cfg.options.backend.llamacpp_kv_unified == std::optional<bool>(false));
+    CHECK(cfg.options.backend.llamacpp_cache_ram_mib == 4096u);
+    CHECK(cfg.options.backend.llamacpp_threads == 8);
+    CHECK(cfg.options.backend.llamacpp_mmproj_path == std::optional<std::string>("mm.gguf"));
+    CHECK(cfg.options.backend.llamacpp_spec_type == std::optional<std::string>("draft-mtp"));
+    CHECK(cfg.options.backend.llamacpp_spec_draft_max == std::optional<std::int32_t>(4));
+
+    REQUIRE(cfg.options.profile_bindings.size() == 2u);
+    const auto& plain_meta = cfg.options.profile_bindings[1].metadata;
+    CHECK(plain_meta.find("parallel")->as_uint() == 3u);
+    CHECK(plain_meta.find("kv_unified")->as_bool() == false);
+    CHECK(plain_meta.find("cache_ram_mib")->as_uint() == 4096u);
+    CHECK(plain_meta.find("threads")->as_uint() == 8u);
+    REQUIRE(plain_meta.find("speculative_types") != nullptr);
+    CHECK(plain_meta.find("speculative_types")->as_array()[0].as_string() == "draft-mtp");
+    CHECK(plain_meta.find("speculative_draft_n_max")->as_uint() == 4u);
+
+    bool has_resolved_note = false;
+    for (const auto& note : cfg.profile_notes) {
+        if (note.find("llamacpp resolved settings:") != std::string::npos &&
+            note.find("slots=3") != std::string::npos && note.find("spec_type=draft-mtp") != std::string::npos) {
+            has_resolved_note = true;
+        }
+    }
+    CHECK(has_resolved_note);
+
+    std::error_code ec;
+    fs::remove(g_path, ec);
+    fs::remove(profiles, ec);
 }
