@@ -57,6 +57,8 @@ json::Object health_features_impl(std::string_view backend, const BackendCapabil
             if (capabilities->has(Capability::logprobs)) features.emplace_back("logprobs");
             if (capabilities->has(Capability::multimodal)) features.emplace_back("multimodal");
             if (capabilities->has(Capability::recurrent_checkpoint)) features.emplace_back("recurrent_checkpoint");
+            if (capabilities->has(Capability::execution_checkpoint)) features.emplace_back("execution_checkpoint");
+            if (capabilities->has(Capability::selective_preemption)) features.emplace_back("selective_preemption");
         }
     }
     metadata.set("features", std::move(features));
@@ -195,6 +197,8 @@ json::Object capability_status_matrix(const std::shared_ptr<Backend>& backend, c
     ensure_from_flag("reranking", bc.has(Capability::reranking), "not_supported");
     ensure_from_flag("tool_calling", bc.has(Capability::tool_calling), "not_supported");
     ensure_from_flag("recurrent_checkpoint", bc.has(Capability::recurrent_checkpoint), "not_supported");
+    ensure_from_flag("execution_checkpoint", bc.has(Capability::execution_checkpoint), "not_supported");
+    ensure_from_flag("selective_preemption", bc.has(Capability::selective_preemption), "not_supported");
 
     return to_json_capability_statuses(merged);
 }

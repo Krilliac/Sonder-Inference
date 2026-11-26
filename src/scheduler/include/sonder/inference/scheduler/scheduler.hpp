@@ -39,12 +39,16 @@ struct PreemptionEvent {
     RequestId id = 0;
     PreemptionReason reason = PreemptionReason::KvPressure;
     PreemptionMode mode = PreemptionMode::Recompute;
-    /// KV tokens discarded (recompute) or moved (swap).
+    /// KV tokens discarded (recompute) or spilled (SpillToCheckpoint / Swap).
     TokenCount kv_tokens = 0;
     /// Request whose progress required the preemption (0 if none).
     RequestId beneficiary = 0;
     /// True if the request hit the requeue limit and failed instead.
     bool failed = false;
+    /// Cost-model estimates recorded at decision time.
+    double recompute_cost_us = 0.0;
+    double spill_restore_cost_us = 0.0;
+    std::uint64_t estimated_spill_bytes = 0;
 };
 
 struct StepPlan {
@@ -123,8 +127,22 @@ public:
     [[nodiscard]] std::vector<RequestId> queue_order() const;
     [[nodiscard]] const std::vector<RequestId>& running() const noexcept { return running_; }
 
-    /// Pure decision stub: how a victim would be preempted right now.
+    /// Cost-aware preemption policy evaluation (Recompute default vs SpillToCheckpoint
+    /// when enabled, budget permits, and spill+restore cost < recompute cost).
+    [[nodiscard]] PreemptionDecision evaluate_preemption(TokenCount kv_tokens,
+                                                         std::uint64_t spill_budget_free_bytes = 0) const noexcept;
+
+    /// Convenience wrapper returning the chosen PreemptionMode for `kv_tokens`.
     [[nodiscard]] PreemptionMode decide_preemption_mode(TokenCount kv_tokens) const noexcept;
+
+    /// Update live measured cost-model parameters (prefill throughput, spill/restore
+    /// bandwidth, free spill-tier bytes).
+    void update_preemption_cost_model(const PreemptionCostModel& model) noexcept {
+        config_.preemption_cost = model;
+    }
+
+    /// Number of times `id` has been preempted and requeued (0 if unknown).
+    [[nodiscard]] std::uint32_t requeue_count(RequestId id) const noexcept;
 
     [[nodiscard]] SchedulerStats stats() const;
     [[nodiscard]] const SchedulerConfig& config() const noexcept { return config_; }

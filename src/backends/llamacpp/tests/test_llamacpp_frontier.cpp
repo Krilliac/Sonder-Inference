@@ -3169,3 +3169,168 @@ TEST_CASE("llamacpp frontier: reranking capabilities, options validation, and no
     CHECK(vocab_be.Embed({pair_toks}, eo, emb_out).code == ErrorCode::kNotLoaded);
     vocab_be.Unload();
 }
+
+TEST_CASE("llamacpp frontier: Item 8 and 9 execution checkpoint capabilities and selective physical preemption") {
+    namespace si = sonder::inference;
+
+    // 1. Core backend adapter and raw LlamaCppBackend advertise execution_checkpoint & selective_preemption
+    //    both on capabilities() and in the 5-state capability_statuses() matrix.
+    {
+        si::LlamaCppBackendOptions bo;
+        bo.slots = 2;
+        auto core_be = si::make_llamacpp_backend(bo);
+        REQUIRE(core_be != nullptr);
+        CHECK(core_be->capabilities().has(si::Capability::execution_checkpoint));
+        CHECK(core_be->capabilities().has(si::Capability::selective_preemption));
+        CHECK(core_be->capabilities().has(si::Capability::continuous_batch_decode));
+        CHECK(core_be->capabilities().has(si::Capability::reranking));
+
+        bool found_exec_ckpt = false;
+        bool found_sel_preempt = false;
+        for (const auto& [cap_name, st] : core_be->capability_statuses()) {
+            if (cap_name == "execution_checkpoint") {
+                found_exec_ckpt = true;
+                CHECK(st.adapter_supports == si::CapabilityState::yes);
+                CHECK(st.build_supports == si::CapabilityState::yes);
+            } else if (cap_name == "selective_preemption") {
+                found_sel_preempt = true;
+                CHECK(st.adapter_supports == si::CapabilityState::yes);
+                CHECK(st.build_supports == si::CapabilityState::yes);
+            }
+        }
+        CHECK(found_exec_ckpt);
+        CHECK(found_sel_preempt);
+
+        LlamaCppBackend raw_be;
+        const Capabilities raw_caps = raw_be.GetCapabilities();
+        CHECK(raw_caps.execution_checkpoint);
+        CHECK(raw_caps.selective_preemption);
+        CHECK(std::string(ToString(StopReason::kSuspended)) == "suspended");
+    }
+
+    // 2. Cost-aware physical preemption policy: Recompute default vs SpillToCheckpoint when cheaper & within budget.
+    {
+        PhysicalPreemptionCostParams params;
+        params.bytes_per_token = 4096;
+        params.prefill_tokens_per_sec = 2000.0;
+        params.spill_bytes_per_sec = 4.0 * 1024.0 * 1024.0 * 1024.0;
+        params.restore_bytes_per_sec = 4.0 * 1024.0 * 1024.0 * 1024.0;
+        params.min_spill_tokens = 256;
+        params.max_requeue_count = 4;
+
+        // Default (allow_spill == false) -> Recompute.
+        const auto def_choice = EvaluatePhysicalPreemptionCost(1024, /*allow_spill=*/false, 0, params);
+        CHECK(def_choice.policy == PhysicalPreemptionPolicy::kRecompute);
+        CHECK_FALSE(def_choice.hit_requeue_limit);
+        CHECK(def_choice.recompute_cost_us > 0.0);
+
+        // Enabled + enough tokens + fast spill/restore -> SpillToCheckpoint wins over Recompute.
+        const auto spill_choice = EvaluatePhysicalPreemptionCost(1024, /*allow_spill=*/true, 1, params);
+        CHECK(spill_choice.policy == PhysicalPreemptionPolicy::kSpillToCheckpoint);
+        CHECK(spill_choice.spill_restore_cost_us < spill_choice.recompute_cost_us);
+        CHECK_FALSE(spill_choice.budget_exceeded);
+
+        // Below min_spill_tokens -> stays Recompute.
+        const auto small_choice = EvaluatePhysicalPreemptionCost(128, /*allow_spill=*/true, 0, params);
+        CHECK(small_choice.policy == PhysicalPreemptionPolicy::kRecompute);
+
+        // Tight spill byte budget exceeded -> falls back cleanly to Recompute with budget_exceeded == true.
+        PhysicalPreemptionCostParams tight_budget = params;
+        tight_budget.available_spill_bytes = 512u * 1024u;  // 512 KiB < 1024 * 4096 (4 MiB)
+        const auto budget_choice = EvaluatePhysicalPreemptionCost(1024, /*allow_spill=*/true, 0, tight_budget);
+        CHECK(budget_choice.policy == PhysicalPreemptionPolicy::kRecompute);
+        CHECK(budget_choice.budget_exceeded);
+
+        // Slow spill bandwidth (spill+restore > recompute) -> chooses Recompute.
+        PhysicalPreemptionCostParams slow_bw = params;
+        slow_bw.spill_bytes_per_sec = 1.0 * 1024.0 * 1024.0;    // 1 MiB/s
+        slow_bw.restore_bytes_per_sec = 1.0 * 1024.0 * 1024.0;  // 1 MiB/s
+        const auto slow_choice = EvaluatePhysicalPreemptionCost(1024, /*allow_spill=*/true, 0, slow_bw);
+        CHECK(slow_choice.policy == PhysicalPreemptionPolicy::kRecompute);
+        CHECK(slow_choice.spill_restore_cost_us > slow_choice.recompute_cost_us);
+
+        // Requeue limit detection.
+        const auto limit_choice = EvaluatePhysicalPreemptionCost(1024, /*allow_spill=*/true, 4, params);
+        CHECK(limit_choice.hit_requeue_limit);
+    }
+
+    // 3. Selective victim choice under KV pressure: priority, anti-starvation shielding, and sole-slot guard.
+    {
+        PhysicalPreemptionCostParams params;
+        params.min_spill_tokens = 256;
+        params.anti_starvation_cap = 3;
+
+        // Sole live slot is NOT preempted unless allow_last_slot == true.
+        std::vector<PreemptionVictimView> single{
+            PreemptionVictimView{0, 0, /*priority_rank=*/5, /*kv_tokens=*/512, 1, 0, false, false, true},
+        };
+        CHECK_FALSE(SelectSelectivePreemptionVictim(single, params, /*allow_last_slot=*/false).has_value());
+        CHECK(SelectSelectivePreemptionVictim(single, params, /*allow_last_slot=*/true).has_value());
+
+        // Interactive (rank 0) vs background (rank 5) -> picks background victim and chooses SpillToCheckpoint.
+        std::vector<PreemptionVictimView> pair{
+            PreemptionVictimView{0, 0, /*priority_rank=*/0, 512, 1, 0, false, false, true},
+            PreemptionVictimView{1, 1, /*priority_rank=*/5, 512, 2, 0, false, false, true},
+        };
+        const auto v1 = SelectSelectivePreemptionVictim(pair, params, false);
+        REQUIRE(v1.has_value());
+        CHECK(v1->victim_slot_index == 1u);
+        CHECK(v1->policy == PhysicalPreemptionPolicy::kSpillToCheckpoint);
+        CHECK_FALSE(v1->bypassed_protected_peer);
+
+        // Anti-starvation cap: when background slot 1 has hit requeue_count == 3,
+        // bypass it in favor of unprotected peer slot 2 (rank 3).
+        std::vector<PreemptionVictimView> anti_starve{
+            PreemptionVictimView{0, 0, /*priority_rank=*/0, 512, 1, 0, false, false, false},
+            PreemptionVictimView{1, 1, /*priority_rank=*/5, 512, 2, 3, false, false, true},  // protected
+            PreemptionVictimView{2, 2, /*priority_rank=*/3, 512, 3, 0, false, false, false}, // unprotected
+        };
+        const auto v2 = SelectSelectivePreemptionVictim(anti_starve, params, false);
+        REQUIRE(v2.has_value());
+        CHECK(v2->victim_slot_index == 2u);
+        CHECK(v2->bypassed_protected_peer);
+        CHECK(v2->policy == PhysicalPreemptionPolicy::kRecompute);
+    }
+
+    // 4. PlanContinuousBatchStep and PlanLatencyAwareBatchStep skip selectively suspended slots
+    //    while keeping peer slots advancing uninterrupted.
+    {
+        auto make_view = [](std::size_t idx, std::int32_t seq, BatchSlotPhase ph, std::size_t plen, std::size_t poff,
+                            std::int64_t pos, bool susp) {
+            BatchSlotPlanView v;
+            v.slot_index = idx;
+            v.seq_id = seq;
+            v.phase = ph;
+            v.prompt_len = plen;
+            v.prefill_offset = poff;
+            v.pos = pos;
+            v.suspended = susp;
+            return v;
+        };
+        std::vector<BatchSlotPlanView> mixed{
+            make_view(0, 0, BatchSlotPhase::kDecode, 32, 32, 40, false),
+            make_view(1, 1, BatchSlotPhase::kDecode, 32, 32, 40, true),  // selectively suspended
+            make_view(2, 2, BatchSlotPhase::kPrefill, 64, 16, 16, false),
+        };
+        std::size_t rr = 0;
+        const PlannedBatchStep step = PlanContinuousBatchStep(mixed, /*token_budget=*/128, /*output_budget=*/4, rr);
+        CHECK(step.decode_slots == 1u);
+        CHECK(step.prefill_slots == 1u);
+        REQUIRE(step.items.size() == 2u);
+        CHECK(step.items[0].slot_index == 0u);
+        CHECK(step.items[1].slot_index == 2u);
+
+        StepCostEstimator est;
+        AdaptiveBudgetDecision dec;
+        const PlannedBatchStep lat_step =
+            PlanLatencyAwareBatchStep(mixed, /*mixed_token_budget=*/128, /*prefill_only_token_budget=*/256,
+                                      /*output_budget=*/4, rr, /*now_us=*/1000, est, BatchPlannerConfig{}, &dec);
+        CHECK(dec.decode_slots == 1u);
+        CHECK(dec.prefill_slots == 1u);
+        CHECK(lat_step.decode_slots == 1u);
+        CHECK(lat_step.prefill_slots == 1u);
+        REQUIRE(lat_step.items.size() == 2u);
+        CHECK(lat_step.items[0].slot_index == 0u);
+        CHECK(lat_step.items[1].slot_index == 2u);
+    }
+}

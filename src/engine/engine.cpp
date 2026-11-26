@@ -111,7 +111,8 @@ json::Object gpu_memory_sample_attributes(const GpuDeviceInfo& gpu) {
 
 Engine::Engine(EngineOptions options)
     : options_(std::move(options)), engine_id_(make_id("engine")),
-      telemetry_(std::make_unique<TelemetryBus>(options_.telemetry)), devices_(enumerate_devices()) {
+      telemetry_(std::make_unique<TelemetryBus>(options_.telemetry)), devices_(enumerate_devices()),
+      checkpoint_store_(options_.checkpoints) {
     for (auto& sink : options_.telemetry_sinks) {
         telemetry_->add_sink(sink);
     }
@@ -136,6 +137,11 @@ Engine::Engine(EngineOptions options)
     }
     telemetry_->emit("engine.started", ctx, std::move(started), TelemetryLevel::metrics);
     runtime_ = detail::make_request_runtime(options_.scheduling, *telemetry_, ctx);
+    checkpoint_store_.set_evict_callback([this](const ExecutionCheckpointRecord& rec) {
+        if (runtime_ && rec.logical_kv_sequence_id != 0) {
+            runtime_->release_logical_sequence(rec.logical_kv_sequence_id);
+        }
+    });
     if (runtime_) {
         const auto& so = options_.scheduling;
         telemetry_->emit("scheduler.configured", ctx,
@@ -296,6 +302,9 @@ Engine::~Engine() {
     if (sampler_.joinable()) {
         sampler_.join();
     }
+    // Release checkpoint-owned logical KV sequences before tearing down runtime_.
+    checkpoint_store_.clear();
+    checkpoint_store_.set_evict_callback({});
     // Stop the scheduler thread first; it emits telemetry and references models.
     runtime_.reset();
     {

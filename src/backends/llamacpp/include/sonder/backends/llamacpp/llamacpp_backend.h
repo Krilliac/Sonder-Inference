@@ -323,9 +323,36 @@ enum class StopReason {
     kCancelled,
     kContextFull,
     kError,
+    kSuspended,        // parked at a backend safe point with physical slot reclaimed
 };
 
 [[nodiscard]] std::string_view ToString(StopReason reason) noexcept;
+
+// Non-blocking selective suspension action returned at backend-owned safe points.
+enum class SuspendAction : std::uint8_t {
+    kContinue = 0,
+    kYieldRecompute = 1,
+    kYieldSpill = 2,
+};
+
+struct SafePointInfo {
+    std::size_t slot_index = 0;
+    std::size_t prompt_tokens = 0;
+    std::size_t prefill_completed_tokens = 0;
+    std::int32_t generated_tokens = 0;
+    std::int64_t kv_pos = 0;
+    std::size_t active_peers = 0;
+    bool in_prefill = false;
+};
+
+struct SafePointDecision {
+    SuspendAction action = SuspendAction::kContinue;
+    std::size_t max_spill_bytes = std::size_t{512} << 20;
+};
+
+// Polled inline on the execution / batch worker thread between prefill chunks
+// and after emitting tokens. MUST NOT BLOCK.
+using SafePointCallback = std::function<SafePointDecision(const SafePointInfo&)>;
 
 // Maximum serialized byte size accepted by CaptureSequenceState / RestoreSequenceState.
 inline constexpr std::size_t kMaxSequenceStateBytes = std::size_t{512} << 20;
@@ -371,6 +398,15 @@ struct GenerateRequest {
     std::optional<double> target_itl_ms = std::nullopt;
     // Opt-in per-request stage timing hooks (false by default: zero extra clocks).
     bool enable_stage_profiling = false;
+    // Optional non-blocking safe-point suspension hook (Item #9).
+    SafePointCallback on_safe_point;
+    // Scheduler priority rank (lower = more urgent) for physical KV-pressure
+    // selective victim selection when idle eviction is insufficient.
+    int priority_rank = 0;
+    // Allow cost-aware spill to serialized sequence state when preempted.
+    bool allow_preempt_spill = false;
+    // Prior requeue count (for anti-starvation protection on physical pressure).
+    std::uint32_t requeue_count = 0;
 };
 
 // One event per generated token. After the last token a final event with
@@ -421,6 +457,13 @@ struct GenerateResult {
     Status restore_status{};
     bool state_captured = false;
     Status capture_status{};
+    // Selective safe-point suspension / physical preemption metadata.
+    bool suspended = false;
+    bool physical_slot_reclaimed = false;
+    SuspendAction suspend_action = SuspendAction::kContinue;
+    std::size_t suspended_token_position = 0;
+    std::vector<Token> suspended_tokens;
+    std::vector<std::uint8_t> suspended_state_blob;
 
     // Separate physical cache tier accounting:
     // - device_prefix_reused_tokens: in-VRAM same-slot or cross-slot seq_cp reuse
@@ -565,6 +608,8 @@ struct Capabilities {
     bool continuous_batch_decode = true;
     bool logprobs = true;
     bool reranking = true;
+    bool execution_checkpoint = true;
+    bool selective_preemption = true;
 };
 
 // Severity of a llama.cpp/ggml log line. The values mirror ggml_log_level.

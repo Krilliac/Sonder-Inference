@@ -1,16 +1,22 @@
 // Sonder Inference: generation session.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #include "sonder/inference/backend.hpp"
@@ -67,6 +73,180 @@ struct SchedulingInfo {
     std::uint32_t preemptions = 0;
     double queue_ms = 0.0;               // submit -> first admission
     bool sonder_sampled = false;         // sampled by Sonder's sampler chain (token_logits)
+    bool suspended = false;              // parked cleanly at a backend safe point
+    bool physical_slot_reclaimed = false;  // verified backend released physical slot/KV
+    SuspendAction suspend_action = SuspendAction::continue_running;
+};
+
+// ---------------------------------------------------------------------------
+// Caller-visible Execution-State Checkpoints (Package 4 / Item #8).
+//
+// Scope: strictly SAME-PROCESS, SAME-BUILD, SAME-MODEL, SAME-TOKENIZER only.
+// Execution checkpoints are NOT cross-host or cross-process portable; any
+// compatibility mismatch is rejected on resume.
+// ---------------------------------------------------------------------------
+
+// Explicit continuation contract:
+//   Branch:      Start a fresh branch from a valid token/prefix boundary.
+//                Fresh sampler/RNG/penalty/stop/grammar state; isolated forked
+//                logical KV via KvCacheManager::fork_sequence (+ truncate on rewind).
+//   ExactResume: Resume an interrupted generation preserving model/build
+//                compatibility fingerprint, token history, delivered output
+//                offset, sampler RNG/penalty history, grammar matcher state,
+//                stop-filter pending buffer, pending draft tokens, and
+//                process-local backend physical/recurrent state blob.
+enum class CheckpointMode : std::uint8_t {
+    Branch = 0,
+    ExactResume = 1,
+};
+
+const char* to_string(CheckpointMode mode) noexcept;
+
+// Process-local compatibility identity enforced on checkpoint resume.
+struct ModelCompatibilityFingerprint {
+    std::uint64_t process_epoch = 0;
+    std::string backend_name;
+    std::string build_commit;
+    std::string model_name;
+    std::string model_format;
+    std::string model_family;
+    std::string parameter_size;
+    std::string quantization;
+    std::uint64_t model_size_bytes = 0;
+    std::uint64_t context_length = 0;
+    ModelArchitecture architecture = ModelArchitecture::attention_only;
+    std::uint64_t tokenizer_hash = 0;
+    std::uint64_t digest = 0;
+
+    [[nodiscard]] bool compatible_with(const ModelCompatibilityFingerprint& other) const noexcept;
+    [[nodiscard]] std::string mismatch_reason(const ModelCompatibilityFingerprint& other) const;
+};
+
+// Computes the process-local compatibility fingerprint for `model`.
+[[nodiscard]] ModelCompatibilityFingerprint compute_model_compatibility_fingerprint(const Model& model);
+
+// Bounded, owned, expirable caller-visible checkpoint handle.
+struct ExecutionCheckpointHandle {
+    std::string checkpoint_id;
+    std::string owner_session_id;
+    CheckpointMode mode = CheckpointMode::Branch;
+    ModelCompatibilityFingerprint compatibility;
+    std::uint64_t token_position = 0;
+    std::uint64_t delivered_offset_bytes = 0;
+    std::uint64_t delivered_chunks = 0;
+    std::uint64_t delivered_completion_tokens = 0;
+    std::size_t approx_bytes = 0;
+    std::chrono::steady_clock::time_point created_at{};
+    std::chrono::steady_clock::time_point expires_at{};
+    // Documented & enforced scope: checkpoints are process-local only.
+    bool same_process_only = true;
+
+    [[nodiscard]] bool valid() const noexcept { return !checkpoint_id.empty(); }
+    [[nodiscard]] bool expired(
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const noexcept {
+        return expires_at != std::chrono::steady_clock::time_point{} && now >= expires_at;
+    }
+};
+
+// Complete continuation snapshot stored in CheckpointStore.
+struct ExecutionCheckpointRecord {
+    ExecutionCheckpointHandle handle;
+
+    // Context & token history.
+    std::string prompt;
+    std::vector<TokenId> prompt_tokens;
+    std::vector<std::string> context_token_pieces;
+    std::vector<TokenId> generated_tokens;
+    std::uint64_t logical_kv_sequence_id = 0;
+    bool exact_tokens = false;
+
+    // Delivered output continuity (ExactResume only; zeroed for Branch).
+    std::uint64_t delivered_offset_bytes = 0;
+    std::uint64_t delivered_chunks = 0;
+    std::uint64_t delivered_completion_tokens = 0;
+    std::string delivered_text;
+
+    // Exact sampling / grammar / stop-filter / draft continuation state
+    // (populated for ExactResume; fresh/empty for Branch).
+    SamplingConfig sampling;
+    std::array<std::uint64_t, 4> sampler_rng_state{};
+    bool has_sampler_rng_state = false;
+    std::vector<TokenId> sampler_penalty_history;
+    std::string grammar;
+    std::vector<std::uint8_t> grammar_matcher_state;
+    std::string stop_filter_pending;
+    bool stop_filter_stopped = false;
+    std::vector<TokenId> pending_draft_tokens;
+
+    // Process-local backend physical/recurrent state blob (never portable).
+    std::vector<std::uint8_t> backend_state_blob;
+    std::uint64_t backend_state_token_position = 0;
+    std::uint64_t backend_step_index = 0;
+
+    [[nodiscard]] std::size_t accounted_bytes() const noexcept;
+};
+
+struct ExecutionCheckpointStoreOptions {
+    std::size_t max_bytes = std::size_t{64} << 20;  // 64 MiB bounded cap
+    std::size_t max_entries = 256;
+    std::chrono::milliseconds default_ttl{std::chrono::minutes{10}};
+};
+
+struct ExecutionCheckpointStoreStats {
+    std::size_t entries = 0;
+    std::size_t total_bytes = 0;
+    std::size_t max_bytes = 0;
+    std::size_t max_entries = 0;
+    std::uint64_t evictions_capacity = 0;
+    std::uint64_t evictions_expired = 0;
+    std::uint64_t releases = 0;
+};
+
+// Bounded, thread-safe, TTL-expiring, LRU-evicting execution checkpoint store.
+class CheckpointStore {
+public:
+    using ClockFn = std::function<std::chrono::steady_clock::time_point()>;
+    using EvictCallback = std::function<void(const ExecutionCheckpointRecord&)>;
+
+    explicit CheckpointStore(ExecutionCheckpointStoreOptions options = {}, ClockFn clock = {});
+    ~CheckpointStore() = default;
+    CheckpointStore(const CheckpointStore&) = delete;
+    CheckpointStore& operator=(const CheckpointStore&) = delete;
+
+    Result<ExecutionCheckpointHandle> put(ExecutionCheckpointRecord record,
+                                          std::optional<std::chrono::milliseconds> ttl = std::nullopt);
+    Result<ExecutionCheckpointRecord> get(const std::string& checkpoint_id);
+    bool release(const std::string& checkpoint_id);
+    std::size_t release_owned_by(std::string_view session_id);
+    std::size_t sweep_expired();
+    void clear();
+    void set_evict_callback(EvictCallback cb);
+
+    [[nodiscard]] ExecutionCheckpointStoreStats stats() const;
+    [[nodiscard]] const ExecutionCheckpointStoreOptions& options() const noexcept { return options_; }
+
+private:
+    struct Entry {
+        std::string id;
+        ExecutionCheckpointRecord record;
+        std::size_t bytes = 0;
+    };
+
+    std::chrono::steady_clock::time_point now() const;
+    void collect_expired_locked(std::chrono::steady_clock::time_point ts,
+                                std::vector<ExecutionCheckpointRecord>& evicted);
+    void invoke_evicted(const std::vector<ExecutionCheckpointRecord>& evicted);
+
+    ExecutionCheckpointStoreOptions options_;
+    ClockFn clock_;
+    mutable std::mutex mutex_;
+    std::list<Entry> lru_;
+    std::unordered_map<std::string, std::list<Entry>::iterator> index_;
+    std::size_t total_bytes_ = 0;
+    std::uint64_t evictions_capacity_ = 0;
+    std::uint64_t evictions_expired_ = 0;
+    std::uint64_t releases_ = 0;
+    EvictCallback evict_callback_;
 };
 
 // Per-request options that are not part of the session's configuration.
@@ -133,6 +313,55 @@ struct RequestOptions {
     // Opt-in per-request stage timing hooks (Doc 2 #25). False by default so
     // unprofiled requests incur zero extra stage clocks or timing events.
     bool enable_stage_profiling = false;
+    // Optional non-blocking safe-point suspension hook (Item #9). Must not block.
+    SuspendSafePointCallback on_safe_point{};
+    // Force non-blocking scheduler gating inside backend callbacks (automatically
+    // enabled on backends declaring selective_preemption or continuous_batch_decode).
+    bool nonblocking_gate = false;
+    // Automatically store an ExactResume checkpoint in Engine::checkpoint_store()
+    // when generation stops cleanly with StopReason::suspended.
+    bool auto_checkpoint_on_suspend = true;
+    // Optional TTL override for auto-exported suspend checkpoints.
+    std::optional<std::chrono::milliseconds> suspend_checkpoint_ttl = std::nullopt;
+    // Allow cost-aware spill-to-checkpoint when selectively preempted under pressure.
+    bool allow_preempt_spill = false;
+    // Optional stateful grammar matcher hooks (for ExactResume state snapshot/restore
+    // and Branch reset on token_logits backends).
+    std::optional<GrammarMatcherHooks> grammar_hooks = std::nullopt;
+};
+
+struct ForkOptions {
+    SessionOptions session_options{};
+    bool inherit_session_options = true;
+    // Optional token offset to fork from (<= parent context_token_count()).
+    // std::nullopt forks from the full current context length.
+    std::optional<std::size_t> prefix_token_offset = std::nullopt;
+};
+
+struct CheckpointExportOptions {
+    CheckpointMode mode = CheckpointMode::Branch;
+    // For Branch mode: optional prefix token boundary (<= current context length).
+    std::optional<std::size_t> token_offset = std::nullopt;
+    // Optional TTL override (defaults to CheckpointStoreOptions::default_ttl).
+    std::optional<std::chrono::milliseconds> ttl = std::nullopt;
+    // Optional pending speculative draft tokens to preserve in ExactResume mode.
+    std::vector<TokenId> pending_draft_tokens{};
+    // Optional external grammar matcher state snapshot override (ExactResume).
+    std::vector<std::uint8_t> grammar_matcher_state{};
+};
+
+struct ResumeOptions {
+    // Optional sampling override (valid for Branch mode; ExactResume preserves
+    // the checkpointed sampling/RNG/penalty/stop/grammar state).
+    std::optional<SamplingConfig> sampling_override = std::nullopt;
+    // Optional prompt suffix appended in Branch mode (rejected in ExactResume).
+    std::string branch_prompt_suffix{};
+    // Optional remaining token budget override for ExactResume (unset continues
+    // up to original sampling.max_tokens - delivered_completion_tokens).
+    std::optional<std::int32_t> max_additional_tokens = std::nullopt;
+    RequestOptions request_options{};
+    // When true, releases the checkpoint from CheckpointStore once consumed.
+    bool consume_checkpoint = false;
 };
 
 struct GenerationResult {
@@ -151,6 +380,11 @@ struct GenerationResult {
     std::optional<EffectiveExecutionReport> effective_execution = std::nullopt;
     // Opt-in per-request stage timing breakdown (absent when profiling is off).
     std::optional<StageTimings> stage_timings = std::nullopt;
+    // Populated when generation parked at a safe point (StopReason::suspended)
+    // and auto_checkpoint_on_suspend was true.
+    std::optional<ExecutionCheckpointHandle> suspended_checkpoint = std::nullopt;
+    std::uint64_t delivered_offset_bytes = 0;
+    std::uint64_t delivered_chunks = 0;
 };
 
 class Engine;
@@ -219,8 +453,45 @@ public:
     // Cancels the in-flight request, if any. Safe from any thread, including
     // from inside the chunk callback. No effect on future requests.
     void cancel();
-    // Cancels any in-flight request and makes the session terminal.
+    // Requests cooperative selective suspension of the in-flight request at
+    // the backend's next safe point (non-blocking; parks & reclaims THAT
+    // request's physical slot without stalling peer requests).
+    void request_suspend(SuspendAction action = SuspendAction::yield_spill);
+    // Cancels any in-flight request, releases owned checkpoints and logical KV
+    // sequence state, and makes the session terminal.
     void close();
+
+    // Execution-state inspection & lifecycle (Package 4 / Item #8).
+    [[nodiscard]] std::size_t context_token_count() const;
+    [[nodiscard]] std::vector<TokenId> context_tokens() const;
+    [[nodiscard]] std::string context_prompt() const;
+    [[nodiscard]] std::uint64_t logical_kv_sequence_id() const;
+    [[nodiscard]] ModelCompatibilityFingerprint compatibility_fingerprint() const;
+
+    // Creates an isolated child Session branched from this session's current
+    // context (or `options.prefix_token_offset`) using CheckpointMode::Branch
+    // semantics: fresh sampler/stop/grammar state and isolated forked logical KV
+    // via KvCacheManager::fork_sequence (+ truncate on rewind).
+    Result<std::shared_ptr<Session>> fork(const ForkOptions& options = {});
+
+    // Rewinds this session's tracked context and logical KV sequence to
+    // `token_offset` (via KvCacheManager::truncate). Clears any stale
+    // ExactResume continuation state past the rewind point.
+    Status rewind(std::size_t token_offset);
+
+    // Exports a bounded, owned, expirable checkpoint into Engine::checkpoint_store().
+    // Strictly same-process / same-model-fingerprint only.
+    Result<ExecutionCheckpointHandle> export_checkpoint(const CheckpointExportOptions& options = {});
+
+    // Resumes execution from a checkpoint handle, enforcing same-process & exact
+    // ModelCompatibilityFingerprint matching, expiry, and Branch vs ExactResume
+    // semantics.
+    Result<GenerationResult> resume_from_checkpoint(const ExecutionCheckpointHandle& handle,
+                                                    const TokenCallback& on_chunk = {},
+                                                    const ResumeOptions& resume_options = {});
+
+    // Releases a checkpoint handle (freeing its memory and any forked logical KV).
+    bool release_checkpoint(const ExecutionCheckpointHandle& handle);
 
     [[nodiscard]] TelemetryContext telemetry_context(const std::optional<std::string>& request_id = std::nullopt) const;
 
@@ -228,7 +499,9 @@ private:
     Result<GenerationResult> run_request(const char* kind, const std::string& prompt,
                                          const std::vector<ChatMessage>* messages, const TokenCallback& on_chunk,
                                          const std::optional<SamplingConfig>& sampling_override,
-                                         const RequestOptions& request_options);
+                                         const RequestOptions& request_options,
+                                         const ExecutionCheckpointRecord* exact_resume = nullptr,
+                                         std::optional<std::int32_t> max_additional_tokens = std::nullopt);
 
     Engine& engine_;
     std::shared_ptr<Model> model_;
@@ -241,6 +514,17 @@ private:
     std::optional<CancellationSource> active_cancel_;
     std::uint64_t requests_started_ = 0;
     std::atomic<std::uint64_t> cancel_requested_ns_{0};
+    std::atomic<std::uint8_t> suspend_requested_{0};
+
+    // Tracked context & continuation state (protected by mutex_).
+    std::string context_prompt_;
+    std::vector<TokenId> context_tokens_;
+    std::vector<std::string> context_token_pieces_;
+    bool exact_context_tokens_ = false;
+    bool branched_context_ = false;
+    std::uint64_t logical_kv_seq_id_ = 0;
+    std::optional<ExecutionCheckpointRecord> last_continuation_;
+    std::vector<std::uint8_t> last_recurrent_state_blob_;
 };
 
 }  // namespace sonder::inference

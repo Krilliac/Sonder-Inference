@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+#include <span>
 #include <string_view>
 #include <unordered_set>
 #include <vector>
@@ -32,6 +34,11 @@ public:
 
     /// Return to the initial state (new generation).
     virtual void reset() = 0;
+
+    /// Optional process-local state snapshot/restore for ExactResume continuation.
+    /// Stateless constraints return empty and accept only an empty state span.
+    [[nodiscard]] virtual std::vector<std::uint8_t> snapshot_state() const { return {}; }
+    [[nodiscard]] virtual bool restore_state(std::span<const std::uint8_t> state) { return state.empty(); }
 
     /// True when the structure is complete and generation may stop.
     [[nodiscard]] virtual bool is_complete() const noexcept { return false; }

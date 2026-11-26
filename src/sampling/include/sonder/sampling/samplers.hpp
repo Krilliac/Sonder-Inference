@@ -36,6 +36,8 @@ public:
     void apply(Candidates& c) override;
     void accept(TokenId token) override;
     void reset() override;
+    [[nodiscard]] std::vector<TokenId> snapshot_history() const override;
+    void restore_history(std::span<const TokenId> tokens) override;
     [[nodiscard]] std::unique_ptr<Sampler> clone() const override;
 
     [[nodiscard]] std::int32_t count(TokenId token) const;

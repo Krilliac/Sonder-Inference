@@ -28,6 +28,7 @@ sonder_add_module_tests(core
     test_speculative_verifier.cpp
     test_batch_scheduler.cpp
     test_speculation_transition.cpp
+    test_execution_state_lifecycle.cpp
 )
 
 if(TARGET sonder_core_tests)

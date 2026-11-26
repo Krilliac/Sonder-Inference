@@ -4018,6 +4018,46 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                     }
                 }
             }
+            if (request.on_safe_point && off < n_prompt) {
+                SafePointInfo sp;
+                sp.slot_index = slot_idx;
+                sp.prompt_tokens = request.prompt.size();
+                sp.prefill_completed_tokens = static_cast<std::size_t>(off);
+                sp.generated_tokens = 0;
+                sp.kv_pos = cur_pos;
+                sp.active_peers = 0;
+                sp.in_prefill = true;
+                const SafePointDecision dec = request.on_safe_point(sp);
+                if (dec.action != SuspendAction::kContinue) {
+                    result.suspended = true;
+                    result.suspend_action = dec.action;
+                    if (slot_idx < slots.size()) {
+                        result.suspended_tokens = slots[slot_idx].tokens;
+                    }
+                    result.suspended_token_position = result.suspended_tokens.size();
+                    if (dec.action == SuspendAction::kYieldSpill) {
+                        const std::size_t state_sz = llama_state_seq_get_size(ctx, slot_id);
+                        const std::size_t cap = std::min(dec.max_spill_bytes, kMaxSequenceStateBytes);
+                        if (state_sz > 0 && state_sz <= cap) {
+                            result.suspended_state_blob.resize(state_sz);
+                            const std::size_t wrote = llama_state_seq_get_data(
+                                ctx, result.suspended_state_blob.data(), result.suspended_state_blob.size(), slot_id);
+                            if (wrote > 0 && wrote <= state_sz) {
+                                result.suspended_state_blob.resize(wrote);
+                            } else {
+                                result.suspended_state_blob.clear();
+                            }
+                        }
+                    }
+                    invalidate_slot();
+                    result.physical_slot_reclaimed = (llama_memory_seq_pos_max(mem, slot_id) < 0);
+                    result.stop_reason = StopReason::kSuspended;
+                    result.prefill_ms = MsSince(prefill_start);
+                    Emit(TelemetryKind::kGenerationDone, result.generated_tokens, 0.0,
+                         std::string(ToString(StopReason::kSuspended)));
+                    return result;
+                }
+            }
         }
     }
     result.prefill_ms = MsSince(prefill_start);
@@ -4110,6 +4150,49 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         if (pos >= n_ctx) return finish(StopReason::kContextFull);
     }
 
+    auto poll_single_safe_point = [&](Token pending_tok) -> bool {
+        if (!request.on_safe_point) return false;
+        SafePointInfo sp;
+        sp.slot_index = slot_idx;
+        sp.prompt_tokens = request.prompt.size();
+        sp.prefill_completed_tokens = request.prompt.size();
+        sp.generated_tokens = result.generated_tokens;
+        sp.kv_pos = pos;
+        sp.active_peers = 0;
+        sp.in_prefill = false;
+        const SafePointDecision dec = request.on_safe_point(sp);
+        if (dec.action == SuspendAction::kContinue) return false;
+
+        result.suspended = true;
+        result.suspend_action = dec.action;
+        if (slot_idx < slots.size()) {
+            result.suspended_tokens = slots[slot_idx].tokens;
+        }
+        if (pending_tok != LLAMA_TOKEN_NULL) {
+            result.suspended_tokens.push_back(pending_tok);
+        }
+        result.suspended_token_position = result.suspended_tokens.size();
+        if (dec.action == SuspendAction::kYieldSpill) {
+            const std::size_t state_sz = llama_state_seq_get_size(ctx, slot_id);
+            const std::size_t cap = std::min(dec.max_spill_bytes, kMaxSequenceStateBytes);
+            if (state_sz > 0 && state_sz <= cap) {
+                result.suspended_state_blob.resize(state_sz);
+                const std::size_t wrote = llama_state_seq_get_data(
+                    ctx, result.suspended_state_blob.data(), result.suspended_state_blob.size(), slot_id);
+                if (wrote > 0 && wrote <= state_sz) {
+                    result.suspended_state_blob.resize(wrote);
+                } else {
+                    result.suspended_state_blob.clear();
+                }
+            }
+        }
+        invalidate_slot();
+        result.physical_slot_reclaimed = (llama_memory_seq_pos_max(mem, slot_id) < 0);
+        return true;
+    };
+
+    if (poll_single_safe_point(cur_tok)) return finish(StopReason::kSuspended);
+
     // Initialize suffix / n-gram index over prompt tokens.
     AdaptiveDraftController adaptive_ctrl(effective_draft_max);
     if ((use_suffix || use_hybrid_suffix) && suffix_matcher != nullptr) {
@@ -4136,6 +4219,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
 
     while (true) {
         if (cancelled()) return finish(StopReason::kCancelled);
+        if (poll_single_safe_point(cur_tok)) return finish(StopReason::kSuspended);
 
         const auto step_start = Clock::now();
         const int64_t rem_gen =
@@ -4568,6 +4652,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         std::size_t step_n_accepted = 0;
         bool step_sample_deadlock = false;
         SlotSpecMode concurrent_step_mode = SlotSpecMode::kNone;
+        std::uint64_t admit_order = 0;
         GenerateResult result{};
 
         [[nodiscard]] bool IsCancelled() const {
@@ -4823,6 +4908,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         s.local_matcher_synced = false;
         s.batch_logit_idx = -1;
     };
+    std::uint64_t next_admit_order = 1;
 
     auto complete_task = [](PendingRequest* task, GenerateResult&& res) {
         if (task == nullptr) return;
@@ -4965,12 +5051,70 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         s.task = nullptr;
     };
 
+    // Backend-owned safe-point suspension: parks ONE slot, optionally spills its
+    // sequence state blob (bounded by max_spill_bytes), actively reclaims THAT
+    // slot's physical KV memory, and completes its task without stalling peers.
+    auto suspend_slot = [&](ActiveBatchSlot& s, SuspendAction action, std::size_t max_spill_bytes) {
+        detach_gpu_sampler(s);
+        s.result.suspended = true;
+        s.result.suspend_action = action;
+        if (s.slot_idx < slots.size()) {
+            s.result.suspended_tokens = slots[s.slot_idx].tokens;
+        }
+        if (s.phase == BatchSlotPhase::kDecode && s.cur_tok != LLAMA_TOKEN_NULL) {
+            s.result.suspended_tokens.push_back(s.cur_tok);
+        }
+        s.result.suspended_token_position = s.result.suspended_tokens.size();
+        if (action == SuspendAction::kYieldSpill && s.slot_valid) {
+            const std::size_t state_sz = llama_state_seq_get_size(ctx, s.slot_id);
+            const std::size_t cap = std::min(max_spill_bytes, kMaxSequenceStateBytes);
+            if (state_sz > 0 && state_sz <= cap) {
+                s.result.suspended_state_blob.resize(state_sz);
+                const std::size_t wrote = llama_state_seq_get_data(
+                    ctx, s.result.suspended_state_blob.data(), s.result.suspended_state_blob.size(), s.slot_id);
+                if (wrote > 0 && wrote <= state_sz) {
+                    s.result.suspended_state_blob.resize(wrote);
+                } else {
+                    s.result.suspended_state_blob.clear();
+                }
+            }
+            if (options.prefix_cache && radix_cache.enabled() && s.slot_idx < slots.size() &&
+                slots[s.slot_idx].tokens.size() >= kMinL2SnapshotTokens) {
+                SnapshotSlotToL2(s.slot_idx, s.slot_id);
+            }
+        }
+        invalidate_slot(s);
+        s.result.physical_slot_reclaimed = (llama_memory_seq_pos_max(mem, s.slot_id) < 0);
+        finish_slot(s, StopReason::kSuspended);
+    };
+
+    auto poll_slot_safe_point = [&](ActiveBatchSlot& s) -> bool {
+        if (s.task == nullptr || s.task->req == nullptr || !s.task->req->on_safe_point) {
+            return false;
+        }
+        SafePointInfo sp;
+        sp.slot_index = s.slot_idx;
+        sp.prompt_tokens = s.task->req->prompt.size();
+        sp.prefill_completed_tokens = s.prefill_offset;
+        sp.generated_tokens = s.result.generated_tokens;
+        sp.kv_pos = s.pos;
+        sp.active_peers = active.size() > 1 ? (active.size() - 1) : 0;
+        sp.in_prefill = (s.phase == BatchSlotPhase::kPrefill);
+        const SafePointDecision dec = s.task->req->on_safe_point(sp);
+        if (dec.action == SuspendAction::kContinue) {
+            return false;
+        }
+        suspend_slot(s, dec.action, dec.max_spill_bytes);
+        return true;
+    };
+
     auto admit_request = [&](PendingRequest* task, const SlotSelection& sel,
                              bool allow_l2_snapshot) -> std::unique_ptr<ActiveBatchSlot> {
         auto s = std::make_unique<ActiveBatchSlot>();
         s->task = task;
         s->slot_idx = sel.slot_index;
         s->slot_id = static_cast<llama_seq_id>(slots[s->slot_idx].id);
+        s->admit_order = next_admit_order++;
         s->prefill_start = Clock::now();
         s->enqueue_time_us = task->enqueue_time_us;
         s->last_service_time_us = 0;
@@ -5480,10 +5624,12 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             }
         }
 
-        // 3. Evict cancelled slots before running the next batch step.
+        // 3. Evict cancelled or selectively suspended slots before running the next batch step.
         for (auto it = active.begin(); it != active.end();) {
             if ((*it)->IsCancelled()) {
                 finish_slot(**it, StopReason::kCancelled);
+                it = active.erase(it);
+            } else if (poll_slot_safe_point(**it)) {
                 it = active.erase(it);
             } else {
                 ++it;
@@ -6756,6 +6902,71 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             rc = llama_decode(ctx, batch);
         }
 
+        // If KV is still full after idle eviction and multiple active slots
+        // share the pool, selectively preempt the lowest-priority victim slot
+        // (cost-aware Recompute vs SpillToCheckpoint, respecting anti-starvation)
+        // so higher-priority peers continue uninterrupted instead of all failing.
+        while (rc == 1 && active.size() > 1u) {
+            std::vector<PreemptionVictimView> victim_views;
+            victim_views.reserve(active.size());
+            for (const auto& sp : active) {
+                if (!sp || sp->task == nullptr) continue;
+                if (prefix_coalescer.IsFollowerHeld(sp->slot_idx)) continue;
+                PreemptionVictimView vv;
+                vv.slot_index = sp->slot_idx;
+                vv.seq_id = static_cast<std::int32_t>(sp->slot_id);
+                vv.priority_rank = sp->task->req->priority_rank;
+                vv.kv_tokens = sp->pos > 0 ? static_cast<std::size_t>(sp->pos) : 0u;
+                vv.admit_order = sp->admit_order;
+                vv.requeue_count = sp->task->req->requeue_count;
+                vv.cancelled = sp->IsCancelled();
+                vv.suspended = false;
+                vv.allow_spill = sp->task->req->allow_preempt_spill;
+                victim_views.push_back(vv);
+            }
+            PhysicalPreemptionCostParams cost_params;
+            if (radix_cache.enabled() && radix_cache.max_bytes() > radix_cache.used_bytes()) {
+                cost_params.available_spill_bytes = radix_cache.max_bytes() - radix_cache.used_bytes();
+            }
+            const auto choice = SelectSelectivePreemptionVictim(victim_views, cost_params, /*allow_last_slot=*/false);
+            if (!choice.has_value()) {
+                break;
+            }
+            ActiveBatchSlot* victim_slot = find_active_by_slot(choice->victim_slot_index);
+            if (victim_slot == nullptr || victim_slot->task == nullptr) {
+                break;
+            }
+            const SuspendAction act = choice->policy == PhysicalPreemptionPolicy::kSpillToCheckpoint
+                                          ? SuspendAction::kYieldSpill
+                                          : SuspendAction::kYieldRecompute;
+            suspend_slot(*victim_slot, act, kMaxSequenceStateBytes);
+            active.erase(std::remove_if(active.begin(), active.end(),
+                                        [](const auto& sp) { return sp->task == nullptr; }),
+                         active.end());
+            // Remove the victim from the planned batch and retry for surviving peers.
+            PlannedBatchStep trimmed;
+            for (const PlannedBatchItem& item : plan.items) {
+                if (item.slot_index == choice->victim_slot_index) continue;
+                trimmed.items.push_back(item);
+                trimmed.total_tokens += item.token_count;
+                if (item.request_logits) trimmed.total_outputs += 1;
+                if (item.is_prefill) {
+                    trimmed.prefill_slots += 1;
+                } else {
+                    trimmed.decode_slots += 1;
+                }
+            }
+            if (trimmed.items.empty()) {
+                rc = 0;
+                break;
+            }
+            plan = std::move(trimmed);
+            pack_plan(plan);
+            abort_requested.store(false, std::memory_order_relaxed);
+            decode_start = Clock::now();
+            rc = llama_decode(ctx, batch);
+        }
+
         // If a mixed prefill+decode batch still returned rc==1 (no KV slot for
         // full batch), retry decode-only tokens so active decoders complete and free KV.
         if (rc == 1 && plan.prefill_slots > 0 && plan.decode_slots > 0) {
@@ -6920,6 +7131,9 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     }
                     s->cur_tok = first_tok;
                     s->phase = BatchSlotPhase::kDecode;
+                    (void)poll_slot_safe_point(*s);
+                } else {
+                    (void)poll_slot_safe_point(*s);
                 }
             } else {
                 if (s->slot_valid && s->slot_idx < slots.size()) {
@@ -6961,6 +7175,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     continue;
                 }
                 s->cur_tok = next_tok;
+                (void)poll_slot_safe_point(*s);
             }
         }
 

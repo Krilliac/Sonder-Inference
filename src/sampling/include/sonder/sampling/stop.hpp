@@ -33,7 +33,12 @@ public:
     void reset();
 
     [[nodiscard]] bool stopped() const noexcept { return stopped_; }
+    [[nodiscard]] const std::string& pending() const noexcept { return pending_; }
     [[nodiscard]] const std::vector<std::string>& stops() const noexcept { return stops_; }
+    void restore_state(std::string pending, bool stopped = false) {
+        pending_ = std::move(pending);
+        stopped_ = stopped;
+    }
 
 private:
     std::vector<std::string> stops_;

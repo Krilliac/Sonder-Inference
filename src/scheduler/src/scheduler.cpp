@@ -1,6 +1,7 @@
 #include "sonder/inference/scheduler/scheduler.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -148,9 +149,13 @@ int Scheduler::waiting_rank(const Sequence& s, TimeUs now) const noexcept {
     if (config_.strict_priority_admission) return s.base_rank;
     if (is_starving(s, now)) return std::min(s.base_rank, kStarvingRank);
     const TimeUs age = elapsed_us(s.enqueued_at, now);
-    const std::int64_t boost =
+    const std::int64_t age_boost =
         std::min<TimeUs>(age / config_.aging_interval_us, std::numeric_limits<int>::max() / 4);
-    const std::int64_t ranked = static_cast<std::int64_t>(s.base_rank) - boost;
+    const std::int64_t requeue_boost =
+        config_.anti_starvation_preemption_cap > 0
+            ? static_cast<std::int64_t>(std::min(s.requeues, config_.anti_starvation_preemption_cap))
+            : 0;
+    const std::int64_t ranked = static_cast<std::int64_t>(s.base_rank) - age_boost - requeue_boost;
     return static_cast<int>(std::clamp<std::int64_t>(
         ranked, std::numeric_limits<int>::min(), std::numeric_limits<int>::max()));
 }
@@ -193,14 +198,76 @@ std::optional<int> Scheduler::effective_rank(RequestId id) const {
 
 std::vector<RequestId> Scheduler::queue_order() const { return sorted_waiting(clock_.now()); }
 
-PreemptionMode Scheduler::decide_preemption_mode(TokenCount kv_tokens) const noexcept {
-    // Stub policy: swapping large contexts is assumed cheaper than recompute.
-    // A real cost model (transfer bandwidth vs prefill throughput, tier
-    // pressure) belongs here once the cache exposes spill tiers.
-    if (config_.enable_swap && kv_tokens >= config_.swap_min_tokens) {
-        return PreemptionMode::Swap;
+PreemptionDecision Scheduler::evaluate_preemption(TokenCount kv_tokens,
+                                                  std::uint64_t spill_budget_free_bytes) const noexcept {
+    PreemptionDecision decision;
+    decision.mode = PreemptionMode::Recompute;
+
+    const PreemptionCostModel& cm = config_.preemption_cost;
+    const std::uint64_t tokens = static_cast<std::uint64_t>(kv_tokens);
+    const std::uint64_t max_u64 = std::numeric_limits<std::uint64_t>::max();
+    if (cm.kv_bytes_per_token > 0 && tokens > max_u64 / cm.kv_bytes_per_token) {
+        decision.estimated_spill_bytes = max_u64;
+    } else {
+        decision.estimated_spill_bytes = tokens * cm.kv_bytes_per_token;
     }
-    return PreemptionMode::Recompute;
+
+    const bool valid_prefill = std::isfinite(cm.prefill_tokens_per_sec) && cm.prefill_tokens_per_sec > 0.0;
+    const bool valid_spill_bw =
+        std::isfinite(cm.spill_bandwidth_bytes_per_sec) && cm.spill_bandwidth_bytes_per_sec > 0.0;
+    const bool valid_restore_bw =
+        std::isfinite(cm.restore_bandwidth_bytes_per_sec) && cm.restore_bandwidth_bytes_per_sec > 0.0;
+    const double fixed_recompute =
+        (std::isfinite(cm.fixed_recompute_overhead_us) && cm.fixed_recompute_overhead_us >= 0.0)
+            ? cm.fixed_recompute_overhead_us
+            : 0.0;
+    const double fixed_spill =
+        (std::isfinite(cm.fixed_spill_overhead_us) && cm.fixed_spill_overhead_us >= 0.0)
+            ? cm.fixed_spill_overhead_us
+            : 0.0;
+
+    if (valid_prefill) {
+        decision.recompute_cost_us =
+            fixed_recompute + (static_cast<double>(tokens) / cm.prefill_tokens_per_sec) * 1'000'000.0;
+    }
+    if (valid_spill_bw && valid_restore_bw && decision.estimated_spill_bytes > 0) {
+        const double bytes = static_cast<double>(decision.estimated_spill_bytes);
+        const double spill_us = (bytes / cm.spill_bandwidth_bytes_per_sec) * 1'000'000.0;
+        const double restore_us = (bytes / cm.restore_bandwidth_bytes_per_sec) * 1'000'000.0;
+        decision.spill_restore_cost_us = fixed_spill + spill_us + restore_us;
+    } else {
+        decision.spill_restore_cost_us = fixed_spill;
+    }
+
+    // Recompute is always the default when spill/swap is disabled or below floor.
+    if (!config_.enable_swap || kv_tokens < config_.swap_min_tokens || !valid_prefill ||
+        !valid_spill_bw || !valid_restore_bw || decision.estimated_spill_bytes == 0) {
+        return decision;
+    }
+
+    const std::uint64_t effective_budget =
+        spill_budget_free_bytes > 0 ? spill_budget_free_bytes : cm.spill_budget_free_bytes;
+    if (effective_budget > 0 && decision.estimated_spill_bytes > effective_budget) {
+        decision.budget_exceeded = true;
+        return decision;
+    }
+
+    const double margin = (std::isfinite(cm.spill_cost_margin) && cm.spill_cost_margin >= 1.0)
+                              ? cm.spill_cost_margin
+                              : 1.0;
+    if (decision.spill_restore_cost_us * margin < decision.recompute_cost_us) {
+        decision.mode = PreemptionMode::SpillToCheckpoint;
+    }
+    return decision;
+}
+
+PreemptionMode Scheduler::decide_preemption_mode(TokenCount kv_tokens) const noexcept {
+    return evaluate_preemption(kv_tokens).mode;
+}
+
+std::uint32_t Scheduler::requeue_count(RequestId id) const noexcept {
+    const auto it = seqs_.find(id);
+    return it == seqs_.end() ? 0 : it->second.requeues;
 }
 
 // ---------------------------------------------------------------- helpers
@@ -303,12 +370,19 @@ void Scheduler::preempt(StepPlan& plan, Budget& budget, RequestId victim,
     Sequence& s = seqs_.at(victim);
     remove_work(plan, budget, victim);
 
+    const PreemptionDecision decision = evaluate_preemption(s.kv_tokens);
     PreemptionEvent ev;
     ev.id = victim;
     ev.reason = reason;
     ev.kv_tokens = s.kv_tokens;
     ev.beneficiary = beneficiary;
-    ev.mode = decide_preemption_mode(s.kv_tokens);
+    ev.mode = decision.mode;
+    ev.recompute_cost_us = decision.recompute_cost_us;
+    ev.spill_restore_cost_us = decision.spill_restore_cost_us;
+    ev.estimated_spill_bytes = decision.estimated_spill_bytes;
+    if (decision.budget_exceeded) {
+        counters_.spill_budget_fallbacks++;
+    }
 
     kv_.release(victim);
     erase_from(running_, victim);
@@ -462,6 +536,13 @@ bool Scheduler::try_priority_preemption(StepPlan& plan, Budget& budget, const Se
         const Sequence& v = seqs_.at(*it);
         // A request admitted earlier in this pass (including a starving one) must not be evicted again.
         if (std::find(plan.admitted.begin(), plan.admitted.end(), *it) != plan.admitted.end()) continue;
+        // Anti-starvation cap: shield repeatedly preempted work from further
+        // priority displacement so it can make forward progress and finish.
+        if (config_.anti_starvation_preemption_cap > 0 &&
+            v.requeues >= config_.anti_starvation_preemption_cap) {
+            counters_.anti_starvation_protections++;
+            continue;
+        }
         if (static_cast<std::int64_t>(running_rank(v)) - cand_rank < min_gap) break;
         victims.push_back(*it);
         freeable = saturating_add_blocks(freeable, kv_.blocks_held(*it));

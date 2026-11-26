@@ -137,7 +137,14 @@ sch::SchedulerConfig make_scheduler_config(const SchedulingOptions& o) {
     c.max_step_prefill_tokens = std::max(c.prefill_chunk_tokens, c.max_step_tokens / 2);
     c.admission_watermark_blocks = o.admission_watermark_blocks;
     c.max_requeue_count = o.max_requeue_count;
+    c.anti_starvation_preemption_cap = o.anti_starvation_preemption_cap;
     c.enable_priority_preemption = o.enable_priority_preemption;
+    c.enable_swap = o.enable_spill_preemption;
+    c.swap_min_tokens = o.spill_min_tokens;
+    c.preemption_cost.kv_bytes_per_token = o.kv_bytes_per_token;
+    c.preemption_cost.prefill_tokens_per_sec = o.prefill_tokens_per_sec;
+    c.preemption_cost.spill_bandwidth_bytes_per_sec = o.spill_bandwidth_bytes_per_sec;
+    c.preemption_cost.restore_bandwidth_bytes_per_sec = o.restore_bandwidth_bytes_per_sec;
     if (o.strict_priority_admission) {
         c.admission_lookahead = 0;
         c.aging_interval_us = std::numeric_limits<sch::TimeUs>::max();
@@ -178,6 +185,9 @@ struct Req {
     bool gated = true;
     bool retain_for_checkpoint = false;
     std::optional<RestoredCheckpoint> restored_checkpoint;
+    bool preempted_pending = false;
+    sch::PreemptionMode last_preemption_mode = sch::PreemptionMode::Recompute;
+    const char* last_preemption_reason = nullptr;
     RuntimeRequestSummary summary;
 };
 
@@ -357,6 +367,65 @@ public:
         return wait_for_grant(id, cancel, deadline, true);
     }
 
+    GatePollResult try_acquire_token_nonblocking(std::uint64_t id, const CancellationToken& cancel) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = reqs_.find(id);
+        if (it == reqs_.end()) {
+            return GatePollResult{GatePollStatus::failed, Status(ErrorCode::internal, "unknown scheduled request"),
+                                  "unknown_request"};
+        }
+        Req& r = it->second;
+        if (r.failure) {
+            return GatePollResult{GatePollStatus::failed, *r.failure, "scheduler_failed"};
+        }
+        if (cancel.cancelled()) {
+            return GatePollResult{GatePollStatus::cancelled,
+                                  Status(ErrorCode::cancelled, "cancelled during non-blocking gate poll"),
+                                  "cancelled"};
+        }
+        if (r.preempted_pending) {
+            const GatePollStatus st = r.last_preemption_mode == sch::PreemptionMode::SpillToCheckpoint
+                                          ? GatePollStatus::yield_spill
+                                          : GatePollStatus::yield_recompute;
+            return GatePollResult{st, Status::success(),
+                                  r.last_preemption_reason ? r.last_preemption_reason : "preempted"};
+        }
+        if (r.passthrough) {
+            return GatePollResult{GatePollStatus::granted, Status::success(), nullptr};
+        }
+        if (r.credits > 0) {
+            --r.credits;
+            return GatePollResult{GatePollStatus::granted, Status::success(), nullptr};
+        }
+        if (stopping_) {
+            return GatePollResult{GatePollStatus::failed, Status(ErrorCode::unavailable, "engine is shutting down"),
+                                  "stopping"};
+        }
+        // No credit immediately available; do NOT block shared worker threads.
+        return GatePollResult{GatePollStatus::yield_recompute, Status::success(), "gate_wait"};
+    }
+
+    SuspendDecision poll_suspend_decision(std::uint64_t id, const CancellationToken& cancel) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (cancel.cancelled() || stopping_) {
+            return SuspendDecision{};
+        }
+        auto it = reqs_.find(id);
+        if (it == reqs_.end()) {
+            return SuspendDecision{};
+        }
+        const Req& r = it->second;
+        if (!r.preempted_pending) {
+            return SuspendDecision{};
+        }
+        SuspendDecision d;
+        d.action = r.last_preemption_mode == sch::PreemptionMode::SpillToCheckpoint
+                       ? SuspendAction::yield_spill
+                       : SuspendAction::yield_recompute;
+        d.reason = r.last_preemption_reason ? r.last_preemption_reason : "preempted";
+        return d;
+    }
+
     Status admit_backend(std::uint64_t id, const CancellationToken& cancel,
                          std::optional<std::chrono::steady_clock::time_point> deadline) override {
         return wait_for_grant(id, cancel, deadline, false);
@@ -519,6 +588,111 @@ public:
     }
 
     CheckpointStoreUsage checkpoint_store_usage() const override { return blob_store_.usage(); }
+
+    Result<LogicalBranchInfo> ensure_logical_sequence(
+        std::uint64_t existing_seq_id, std::span<const TokenId> tokens, std::uint64_t fingerprint,
+        ModelArchitecture architecture, std::int32_t priority,
+        std::span<const std::uint8_t> recurrent_checkpoint_blob) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        kvc::SequenceId seq_id = existing_seq_id;
+        if (seq_id != 0 && cache_.has_sequence(seq_id)) {
+            if (cache_.num_tokens(seq_id) == tokens.size()) {
+                return branch_info_locked(seq_id, 0);
+            }
+            (void)cache_.free_sequence(seq_id);
+        }
+        seq_id = next_branch_seq_id_++;
+        kvc::SequenceOptions so;
+        so.fingerprint = kvc::CacheFingerprint{fingerprint};
+        so.priority = static_cast<kvc::Priority>(std::clamp(priority, 0, 255));
+        so.architecture = architecture;
+        if (Status st = cache_.add_sequence(seq_id, so); !st.ok()) {
+            return st;
+        }
+        kvc::AppendResult ar;
+        if (!tokens.empty()) {
+            if (Status st = cache_.append_tokens(seq_id, tokens, &ar); !st.ok()) {
+                (void)cache_.free_sequence(seq_id);
+                return st;
+            }
+            if (architecture != ModelArchitecture::attention_only && !recurrent_checkpoint_blob.empty()) {
+                (void)cache_.save_checkpoint(seq_id, tokens.size(),
+                                             static_cast<std::uint64_t>(recurrent_checkpoint_blob.size()));
+            }
+        }
+        return branch_info_locked(seq_id, ar.copy_on_write);
+    }
+
+    Result<LogicalBranchInfo> fork_logical_sequence(
+        std::uint64_t parent_seq_id, std::optional<std::size_t> rewind_to_tokens,
+        std::optional<std::int32_t> child_priority) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (parent_seq_id == 0 || !cache_.has_sequence(parent_seq_id)) {
+            return Status(ErrorCode::not_found, "parent logical KV sequence not found");
+        }
+        const kvc::SequenceId child_id = next_branch_seq_id_++;
+        std::optional<kvc::Priority> prio;
+        if (child_priority) {
+            prio = static_cast<kvc::Priority>(std::clamp(*child_priority, 0, 255));
+        }
+        if (Status st = cache_.fork_sequence(parent_seq_id, child_id, prio); !st.ok()) {
+            return st;
+        }
+        if (rewind_to_tokens.has_value()) {
+            if (Status st = cache_.truncate(child_id, *rewind_to_tokens); !st.ok()) {
+                (void)cache_.free_sequence(child_id);
+                return st;
+            }
+        }
+        return branch_info_locked(child_id, 0);
+    }
+
+    Result<LogicalBranchInfo> truncate_logical_sequence(std::uint64_t seq_id, std::size_t new_length) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (seq_id == 0 || !cache_.has_sequence(seq_id)) {
+            return Status(ErrorCode::not_found, "logical KV sequence not found");
+        }
+        if (Status st = cache_.truncate(seq_id, new_length); !st.ok()) {
+            return st;
+        }
+        return branch_info_locked(seq_id, 0);
+    }
+
+    Result<LogicalBranchInfo> append_logical_sequence(std::uint64_t seq_id,
+                                                      std::span<const TokenId> suffix_tokens) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (seq_id == 0 || !cache_.has_sequence(seq_id)) {
+            return Status(ErrorCode::not_found, "logical KV sequence not found");
+        }
+        kvc::AppendResult ar;
+        if (!suffix_tokens.empty()) {
+            if (Status st = cache_.append_tokens(seq_id, suffix_tokens, &ar); !st.ok()) {
+                return st;
+            }
+        }
+        return branch_info_locked(seq_id, ar.copy_on_write);
+    }
+
+    void release_logical_sequence(std::uint64_t seq_id) override {
+        if (seq_id == 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mu_);
+        if (cache_.has_sequence(seq_id)) {
+            (void)cache_.free_sequence(seq_id);
+        }
+    }
+
+    std::optional<LogicalBranchInfo> inspect_logical_sequence(std::uint64_t seq_id) const override {
+        if (seq_id == 0) {
+            return std::nullopt;
+        }
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!cache_.has_sequence(seq_id)) {
+            return std::nullopt;
+        }
+        return branch_info_locked(seq_id, 0);
+    }
 
     std::size_t tracked_requests() const override {
         std::lock_guard<std::mutex> lock(mu_);
@@ -692,6 +866,10 @@ private:
                 continue;
             }
             ++r->summary.preemptions;
+            r->preempted_pending = true;
+            r->last_preemption_mode = ev.mode;
+            r->last_preemption_reason =
+                ev.reason == sch::PreemptionReason::KvPressure ? "kv_pressure" : "priority_admission";
             r->restored_checkpoint.reset();
             free_cache(*r, "preempted");
             bus_.emit("scheduler.preempted", r->ctx,
@@ -699,6 +877,9 @@ private:
                                    {"reason", str(sch::to_string(ev.reason))},
                                    {"mode", str(sch::to_string(ev.mode))},
                                    {"kv_tokens", ev.kv_tokens},
+                                   {"recompute_cost_us", ev.recompute_cost_us},
+                                   {"spill_restore_cost_us", ev.spill_restore_cost_us},
+                                   {"estimated_spill_bytes", ev.estimated_spill_bytes},
                                    {"beneficiary_scheduler_request_id", ev.beneficiary},
                                    {"preemptions", r->summary.preemptions},
                                    {"queue_ms", r->summary.queue_ms},
@@ -714,6 +895,8 @@ private:
             if (r == nullptr) {
                 continue;
             }
+            r->preempted_pending = false;
+            r->last_preemption_reason = nullptr;
             const double queue_ms = ms_since(r->submitted_at, now);
             if (!r->admitted_once) {
                 r->admitted_once = true;
@@ -967,6 +1150,21 @@ private:
         cv_.notify_all();
     }
 
+    LogicalBranchInfo branch_info_locked(kvc::SequenceId seq_id, std::size_t cow_count) const {
+        LogicalBranchInfo info;
+        info.sequence_id = static_cast<std::uint64_t>(seq_id);
+        info.num_tokens = cache_.num_tokens(seq_id);
+        const auto bt = cache_.block_table(seq_id);
+        info.block_count = bt.size();
+        for (const kvc::BlockId b : bt) {
+            if (cache_.ref_count(b) > 1) {
+                ++info.shared_block_count;
+            }
+        }
+        info.copy_on_write_count = cow_count;
+        return info;
+    }
+
     TelemetryBus& bus_;
     TelemetryContext engine_ctx_;
     SteadyClock clock_;
@@ -979,6 +1177,7 @@ private:
     std::condition_variable cv_;
     std::map<sch::RequestId, Req> reqs_;
     sch::RequestId next_id_ = 1;
+    kvc::SequenceId next_branch_seq_id_ = (std::uint64_t{1} << 62) + 1;
     std::uint64_t generation_ = 0;
     std::size_t evicted_pending_ = 0;
     std::size_t checkpoint_evicted_pending_ = 0;

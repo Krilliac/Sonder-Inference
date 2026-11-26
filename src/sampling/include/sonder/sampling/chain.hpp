@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -72,6 +73,15 @@ public:
 
     void reset();
     void reseed(std::uint64_t seed) noexcept { rng_.reseed(seed); }
+
+    /// Process-local snapshot of mutable sampler state for ExactResume continuation.
+    struct StateSnapshot {
+        std::array<std::uint64_t, 4> rng_state{};
+        std::vector<TokenId> penalty_history;
+        std::vector<std::uint8_t> constraint_state;
+    };
+    [[nodiscard]] StateSnapshot snapshot_state() const;
+    [[nodiscard]] bool restore_state(const StateSnapshot& state);
 
     [[nodiscard]] bool is_stop_token(TokenId token) const;
     [[nodiscard]] const Candidates& last_candidates() const noexcept { return cur_; }

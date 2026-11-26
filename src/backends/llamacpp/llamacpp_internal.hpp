@@ -111,6 +111,11 @@ public:
         return out;
     }
     std::string Flush() { return matched_ ? std::string() : std::exchange(held_, {}); }
+    [[nodiscard]] const std::string& held() const noexcept { return held_; }
+    void RestoreState(std::string held, bool matched = false) {
+        held_ = std::move(held);
+        matched_ = matched;
+    }
     [[nodiscard]] bool matched() const noexcept { return matched_; }
     [[nodiscard]] const std::optional<std::string>& matched_stop() const noexcept { return matched_index_; }
 

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <memory>
+#include <span>
 #include <string_view>
+#include <vector>
 
 #include "sonder/sampling/types.hpp"
 
@@ -24,6 +26,10 @@ public:
 
     /// Clear per-sequence state. Default: stateless.
     virtual void reset() {}
+
+    /// Snapshot/restore token history for ExactResume continuation. Default: stateless.
+    [[nodiscard]] virtual std::vector<TokenId> snapshot_history() const { return {}; }
+    virtual void restore_history(std::span<const TokenId> /*tokens*/) {}
 
     /// Deep copy including state (used to fork sessions).
     [[nodiscard]] virtual std::unique_ptr<Sampler> clone() const = 0;

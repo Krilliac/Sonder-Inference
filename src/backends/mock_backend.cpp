@@ -2,6 +2,7 @@
 // It performs no inference and must never be used for quality/perf claims.
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -42,7 +43,59 @@ std::uint64_t splitmix64(std::uint64_t x) {
 }
 
 constexpr std::array<std::uint8_t, 8> kMockCheckpointMagic = {'S', 'N', 'D', 'R', 'C', 'K', 'P', '1'};
+constexpr std::array<std::uint8_t, 8> kMockStreamStateMagic = {'S', 'N', 'D', 'R', 'M', 'S', 'T', '1'};
+constexpr std::array<std::uint8_t, 8> kMockGenStateMagic = {'S', 'N', 'D', 'R', 'M', 'G', 'N', '1'};
 constexpr std::size_t kMockCheckpointBytes = 64;
+
+struct MockSlotTracker {
+    std::atomic<std::size_t> active{0};
+    std::atomic<std::uint64_t> reclaimed{0};
+};
+
+class ScopedMockPhysicalSlot {
+public:
+    explicit ScopedMockPhysicalSlot(std::shared_ptr<MockSlotTracker> tracker) : tracker_(std::move(tracker)) {
+        if (tracker_) {
+            tracker_->active.fetch_add(1, std::memory_order_acq_rel);
+            held_ = true;
+        }
+    }
+    ~ScopedMockPhysicalSlot() { release(false); }
+    ScopedMockPhysicalSlot(const ScopedMockPhysicalSlot&) = delete;
+    ScopedMockPhysicalSlot& operator=(const ScopedMockPhysicalSlot&) = delete;
+
+    bool reclaim() { return release(true); }
+    [[nodiscard]] std::size_t active_peers() const noexcept {
+        if (!tracker_) return 0;
+        const std::size_t cur = tracker_->active.load(std::memory_order_acquire);
+        return (held_ && cur > 0) ? (cur - 1) : cur;
+    }
+
+private:
+    bool release(bool mark_reclaimed) {
+        if (!held_ || !tracker_) return false;
+        held_ = false;
+        tracker_->active.fetch_sub(1, std::memory_order_acq_rel);
+        if (mark_reclaimed) {
+            tracker_->reclaimed.fetch_add(1, std::memory_order_acq_rel);
+        }
+        return true;
+    }
+
+    std::shared_ptr<MockSlotTracker> tracker_;
+    bool held_ = false;
+};
+
+std::vector<TokenId> mock_tokenize_with_salt(std::string_view text, std::uint64_t salt) {
+    auto toks = detail::accounting_tokenize(text);
+    if (salt != 0) {
+        const auto mix = static_cast<std::uint32_t>(splitmix64(salt) & 0x1FFFFFFFull);
+        for (std::size_t i = 1; i < toks.size(); ++i) {
+            toks[i] = static_cast<TokenId>((static_cast<std::uint32_t>(toks[i]) ^ mix) & 0x3FFFFFFFu) + 2;
+        }
+    }
+    return toks;
+}
 
 void write_u64_le(std::uint8_t* dst, std::uint64_t v) noexcept {
     for (int i = 0; i < 8; ++i) {
@@ -248,11 +301,15 @@ class MockTokenStream final : public TokenStream {
 public:
     static constexpr TokenId kEos = static_cast<TokenId>(kVocabularySize);
 
-    MockTokenStream(const GenerateRequest& request, const std::string& model_name, MockBackendOptions options)
-        : prompt_(detail::accounting_tokenize(request.prompt)),
+    MockTokenStream(const GenerateRequest& request, const std::string& model_name, std::uint64_t model_hash,
+                    MockBackendOptions options, std::shared_ptr<MockSlotTracker> tracker)
+        : prompt_(mock_tokenize_with_salt(request.prompt, options.tokenizer_salt)),
+          prompt_hash_(hash_token_prefix(prompt_)),
+          model_hash_(model_hash),
           state_(fnv1a(request.prompt) ^ fnv1a(model_name)),
           options_(options),
-          logits_(kVocabularySize + 1, 0.0f) {}
+          logits_(kVocabularySize + 1, 0.0f),
+          slot_(std::move(tracker)) {}
 
     std::size_t vocab_size() const override { return logits_.size(); }
     const std::vector<TokenId>& prompt_tokens() const override { return prompt_; }
@@ -300,21 +357,77 @@ public:
 
     bool is_end_of_generation(TokenId token) const override { return token == kEos; }
 
+    Result<std::vector<std::uint8_t>> capture_state(std::size_t max_bytes) override {
+        const std::size_t limit = std::min(max_bytes, std::min(options_.max_checkpoint_bytes, kMaxRecurrentCheckpointBytes));
+        if (limit < kMockCheckpointBytes) {
+            return Status(ErrorCode::invalid_argument, "mock token stream state exceeds max_bytes");
+        }
+        std::vector<std::uint8_t> bytes(kMockCheckpointBytes, 0);
+        std::memcpy(bytes.data(), kMockStreamStateMagic.data(), kMockStreamStateMagic.size());
+        write_u64_le(bytes.data() + 8, model_hash_);
+        write_u64_le(bytes.data() + 16, static_cast<std::uint64_t>(prompt_.size()) + position_);
+        write_u64_le(bytes.data() + 24, position_);
+        write_u64_le(bytes.data() + 32, state_);
+        write_u64_le(bytes.data() + 40, prompt_hash_);
+        write_u64_le(bytes.data() + 48, 0);
+        const std::uint64_t checksum = fnv1a_bytes(std::span<const std::uint8_t>(bytes.data(), 56));
+        write_u64_le(bytes.data() + 56, checksum);
+        return bytes;
+    }
+
+    Status restore_state(std::span<const std::uint8_t> bytes, std::uint64_t token_position) override {
+        if (bytes.size() != kMockCheckpointBytes ||
+            std::memcmp(bytes.data(), kMockStreamStateMagic.data(), kMockStreamStateMagic.size()) != 0) {
+            return Status(ErrorCode::invalid_argument, "invalid mock token stream execution state");
+        }
+        const std::uint64_t expected_checksum = fnv1a_bytes(bytes.subspan(0, 56));
+        if (read_u64_le(bytes.data() + 56) != expected_checksum) {
+            return Status(ErrorCode::invalid_argument, "mock token stream execution state checksum mismatch");
+        }
+        if (read_u64_le(bytes.data() + 8) != model_hash_) {
+            return Status(ErrorCode::invalid_argument, "mock token stream execution state model mismatch");
+        }
+        const std::uint64_t blob_tok_pos = read_u64_le(bytes.data() + 16);
+        const std::uint64_t blob_gen_pos = read_u64_le(bytes.data() + 24);
+        const std::uint64_t blob_state = read_u64_le(bytes.data() + 32);
+        const std::uint64_t blob_prompt_hash = read_u64_le(bytes.data() + 40);
+        if (blob_prompt_hash != prompt_hash_) {
+            return Status(ErrorCode::invalid_argument, "mock token stream execution state prompt mismatch");
+        }
+        if (token_position != 0 && blob_tok_pos != token_position) {
+            return Status(ErrorCode::invalid_argument, "mock token stream execution state token_position mismatch");
+        }
+        if (blob_tok_pos != static_cast<std::uint64_t>(prompt_.size()) + blob_gen_pos) {
+            return Status(ErrorCode::invalid_argument, "mock token stream execution state length mismatch");
+        }
+        state_ = blob_state;
+        position_ = blob_gen_pos;
+        return Status::success();
+    }
+
+    bool reclaim_physical_state() override { return slot_.reclaim(); }
+
 private:
     std::vector<TokenId> prompt_;
+    std::uint64_t prompt_hash_ = 0;
+    std::uint64_t model_hash_ = 0;
     std::uint64_t state_;
     MockBackendOptions options_;
     std::vector<float> logits_;
     std::uint64_t position_ = 0;
+    ScopedMockPhysicalSlot slot_;
 };
 
 class MockModel final : public BackendModel {
 public:
-    MockModel(ModelDescriptor d, MockBackendOptions o) : descriptor_(std::move(d)), options_(o) {}
+    MockModel(ModelDescriptor d, MockBackendOptions o)
+        : descriptor_(std::move(d)), options_(o), slot_tracker_(std::make_shared<MockSlotTracker>()) {}
 
     const ModelDescriptor& descriptor() const override { return descriptor_; }
 
-    Result<std::vector<TokenId>> tokenize(std::string_view text) override { return detail::accounting_tokenize(text); }
+    Result<std::vector<TokenId>> tokenize(std::string_view text) override {
+        return mock_tokenize_with_salt(text, options_.tokenizer_salt);
+    }
 
     Result<std::string> detokenize(std::span<const TokenId> tokens) override {
         std::string out;
@@ -465,7 +578,52 @@ public:
             return Status(ErrorCode::unsupported, "mock backend created without token_logits");
         }
         apply_checkpoint_exchange(request);
-        return std::unique_ptr<TokenStream>(std::make_unique<MockTokenStream>(request, descriptor_.name, options_));
+        return std::unique_ptr<TokenStream>(std::make_unique<MockTokenStream>(
+            request, descriptor_.name, checkpoint_model_hash(), options_, slot_tracker_));
+    }
+
+    Result<std::vector<std::uint8_t>> capture_execution_state(std::uint64_t token_position,
+                                                              std::size_t max_bytes) override {
+        if (!options_.enable_execution_checkpoints && !options_.enable_recurrent_checkpoints) {
+            return Status(ErrorCode::unsupported, "mock backend created without execution checkpoints");
+        }
+        const std::size_t limit = std::min(max_bytes, effective_checkpoint_limit());
+        if (limit < kMockCheckpointBytes) {
+            return Status(ErrorCode::invalid_argument, "mock execution state exceeds max_bytes");
+        }
+        std::uint64_t prefix_hash = 0;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            prefix_hash = last_prompt_hash_;
+        }
+        return build_checkpoint_bytes(token_position, prefix_hash);
+    }
+
+    Status restore_execution_state(std::span<const std::uint8_t> bytes, std::uint64_t token_position) override {
+        if (!options_.enable_execution_checkpoints && !options_.enable_recurrent_checkpoints) {
+            return Status(ErrorCode::unsupported, "mock backend created without execution checkpoints");
+        }
+        std::uint64_t restored_pos = 0;
+        std::uint64_t restored_prefix_hash = 0;
+        if (Status st = validate_checkpoint_bytes(bytes, restored_pos, restored_prefix_hash); !st.ok()) {
+            return st;
+        }
+        if (token_position != 0 && restored_pos != token_position) {
+            return Status(ErrorCode::invalid_argument, "mock execution state token_position mismatch");
+        }
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            last_prompt_hash_ = restored_prefix_hash;
+        }
+        return Status::success();
+    }
+
+    std::size_t active_physical_slots() const override {
+        return slot_tracker_ ? slot_tracker_->active.load(std::memory_order_acquire) : 0;
+    }
+
+    std::uint64_t reclaimed_physical_slots() const override {
+        return slot_tracker_ ? slot_tracker_->reclaimed.load(std::memory_order_acquire) : 0;
     }
 
     Result<RecurrentStateSnapshot> capture_recurrent_state(std::uint64_t token_position) override {
@@ -515,10 +673,14 @@ public:
             return Status(ErrorCode::cancelled, "cancelled by caller");
         }
 
+        ScopedMockPhysicalSlot slot_guard(slot_tracker_);
         apply_checkpoint_exchange(request);
         if (request.checkpoint != nullptr && request.checkpoint->restored) {
             stats.cached_tokens = request.checkpoint->restore_token_position;
         }
+
+        const std::vector<TokenId> prompt_tokens = mock_tokenize_with_salt(request.prompt, options_.tokenizer_salt);
+        const std::uint64_t prompt_hash = hash_token_prefix(prompt_tokens);
 
         // Greedy decoding ignores the seed, like a real sampler would.
         std::uint64_t state = fnv1a(request.prompt) ^ fnv1a(descriptor_.name);
@@ -527,11 +689,81 @@ public:
         }
 
         const std::int32_t natural = std::max<std::int32_t>(1, options_.default_completion_tokens);
-        const std::int32_t limit = std::min(natural, request.sampling.max_tokens);
+        std::int32_t start_step = 0;
+        std::int32_t limit = std::min(natural, request.sampling.max_tokens);
         std::string emitted;
-        std::string piece;
+        std::vector<TokenId> generated_ids;
 
-        for (std::int32_t i = 0; i < limit; ++i) {
+        if (request.execution_resume != nullptr) {
+            const auto& er = *request.execution_resume;
+            generated_ids = er.generated_token_ids;
+            if (!er.backend_state_blob.empty()) {
+                std::uint64_t blob_step = 0;
+                std::uint64_t blob_state = 0;
+                if (Status st = validate_gen_state_blob(er.backend_state_blob, prompt_hash, blob_step, blob_state);
+                    !st.ok()) {
+                    return st;
+                }
+                start_step = static_cast<std::int32_t>(
+                    std::min<std::uint64_t>(blob_step, static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())));
+                state = blob_state;
+                stats.cached_tokens = er.token_position;
+            } else if (er.backend_step_index > 0) {
+                start_step = static_cast<std::int32_t>(std::min<std::uint64_t>(
+                    er.backend_step_index, static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())));
+                for (std::int32_t r = 0; r < start_step; ++r) {
+                    state = splitmix64(state + static_cast<std::uint64_t>(r));
+                }
+            }
+            emitted = er.stop_filter_pending;
+            const std::int32_t remaining_natural = natural > start_step ? (natural - start_step) : 0;
+            limit = start_step + std::min(remaining_natural, request.sampling.max_tokens);
+        }
+
+        auto check_safe_point = [&](bool in_prefill, std::int32_t next_step) -> bool {
+            if (!request.on_safe_point) return false;
+            SafePointContext sp;
+            sp.prompt_tokens = prompt_tokens.size();
+            sp.prefill_completed_tokens = prompt_tokens.size();
+            sp.generated_tokens = static_cast<std::uint64_t>(next_step);
+            sp.kv_tokens = prompt_tokens.size() + static_cast<std::uint64_t>(next_step);
+            sp.active_peers = slot_guard.active_peers();
+            sp.in_prefill = in_prefill;
+            const SuspendDecision dec = request.on_safe_point(sp);
+            if (dec.action == SuspendAction::continue_running) return false;
+
+            const bool reclaimed = slot_guard.reclaim();
+            if (request.suspended_state != nullptr) {
+                auto& ss = *request.suspended_state;
+                ss.action = dec.action;
+                ss.token_position = prompt_tokens.size() + static_cast<std::uint64_t>(next_step);
+                ss.generated_tokens = static_cast<std::uint64_t>(next_step);
+                ss.backend_step_index = static_cast<std::uint64_t>(next_step);
+                ss.tokens = prompt_tokens;
+                ss.tokens.insert(ss.tokens.end(), generated_ids.begin(), generated_ids.end());
+                ss.physical_slot_reclaimed = reclaimed;
+                ss.stop_filter_pending = !request.sampling.stop.empty() ? emitted : std::string();
+                ss.backend_state_blob.clear();
+                if (dec.action == SuspendAction::yield_spill) {
+                    auto blob = build_gen_state_blob(ss.token_position, static_cast<std::uint64_t>(next_step), state,
+                                                     prompt_hash, dec.max_spill_bytes);
+                    if (blob.ok()) {
+                        ss.backend_state_blob = std::move(blob).value();
+                    }
+                }
+            }
+            stats.stop_reason = StopReason::suspended;
+            return true;
+        };
+
+        if (check_safe_point(/*in_prefill=*/true, start_step)) {
+            stats.eval_ns = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+            return stats;
+        }
+
+        std::string piece;
+        for (std::int32_t i = start_step; i < limit; ++i) {
             if (cancel.cancelled()) {
                 stats.stop_reason = StopReason::cancelled;
                 return Status(ErrorCode::cancelled, "cancelled by caller");
@@ -547,7 +779,9 @@ public:
             if (i > 0) {
                 piece.push_back(' ');
             }
-            piece += kVocabulary[state % kVocabularySize];
+            const auto vocab_idx = static_cast<TokenId>(state % kVocabularySize);
+            piece += kVocabulary[static_cast<std::size_t>(vocab_idx)];
+            generated_ids.push_back(vocab_idx);
 
             // Stop-sequence handling over the accumulated text.
             bool hit_stop = false;
@@ -584,6 +818,9 @@ public:
             }
             if (hit_stop) {
                 stats.stop_reason = StopReason::stop_sequence;
+                break;
+            }
+            if (check_safe_point(/*in_prefill=*/false, i + 1)) {
                 break;
             }
         }
@@ -774,7 +1011,7 @@ private:
         if (!options_.enable_recurrent_checkpoints) {
             return;
         }
-        const std::vector<TokenId> prompt_tokens = detail::accounting_tokenize(request.prompt);
+        const std::vector<TokenId> prompt_tokens = mock_tokenize_with_salt(request.prompt, options_.tokenizer_salt);
         if (request.checkpoint == nullptr) {
             std::lock_guard<std::mutex> lock(state_mutex_);
             last_prompt_hash_ = hash_token_prefix(prompt_tokens);
@@ -837,8 +1074,50 @@ private:
         }
     }
 
+    Result<std::vector<std::uint8_t>> build_gen_state_blob(std::uint64_t token_position, std::uint64_t step_index,
+                                                           std::uint64_t gen_state, std::uint64_t prompt_hash,
+                                                           std::size_t max_bytes) const {
+        const std::size_t limit = std::min(max_bytes, effective_checkpoint_limit());
+        if (limit < kMockCheckpointBytes) {
+            return Status(ErrorCode::invalid_argument, "mock generator state exceeds max_bytes");
+        }
+        std::vector<std::uint8_t> bytes(kMockCheckpointBytes, 0);
+        std::memcpy(bytes.data(), kMockGenStateMagic.data(), kMockGenStateMagic.size());
+        write_u64_le(bytes.data() + 8, checkpoint_model_hash());
+        write_u64_le(bytes.data() + 16, token_position);
+        write_u64_le(bytes.data() + 24, step_index);
+        write_u64_le(bytes.data() + 32, gen_state);
+        write_u64_le(bytes.data() + 40, prompt_hash);
+        write_u64_le(bytes.data() + 48, 0);
+        const std::uint64_t checksum = fnv1a_bytes(std::span<const std::uint8_t>(bytes.data(), 56));
+        write_u64_le(bytes.data() + 56, checksum);
+        return bytes;
+    }
+
+    Status validate_gen_state_blob(std::span<const std::uint8_t> bytes, std::uint64_t expected_prompt_hash,
+                                   std::uint64_t& out_step, std::uint64_t& out_state) const {
+        if (bytes.size() != kMockCheckpointBytes ||
+            std::memcmp(bytes.data(), kMockGenStateMagic.data(), kMockGenStateMagic.size()) != 0) {
+            return Status(ErrorCode::invalid_argument, "invalid mock generator execution state");
+        }
+        const std::uint64_t expected_checksum = fnv1a_bytes(bytes.subspan(0, 56));
+        if (read_u64_le(bytes.data() + 56) != expected_checksum) {
+            return Status(ErrorCode::invalid_argument, "mock generator execution state checksum mismatch");
+        }
+        if (read_u64_le(bytes.data() + 8) != checkpoint_model_hash()) {
+            return Status(ErrorCode::invalid_argument, "mock generator execution state model mismatch");
+        }
+        if (read_u64_le(bytes.data() + 40) != expected_prompt_hash) {
+            return Status(ErrorCode::invalid_argument, "mock generator execution state prompt mismatch");
+        }
+        out_step = read_u64_le(bytes.data() + 24);
+        out_state = read_u64_le(bytes.data() + 32);
+        return Status::success();
+    }
+
     ModelDescriptor descriptor_;
     MockBackendOptions options_;
+    std::shared_ptr<MockSlotTracker> slot_tracker_;
     mutable std::mutex state_mutex_;
     std::uint64_t last_prompt_hash_ = 0;
 };
@@ -868,6 +1147,12 @@ public:
         }
         if (options_.enable_reranking) {
             c.add(Capability::reranking);
+        }
+        if (options_.enable_execution_checkpoints) {
+            c.add(Capability::execution_checkpoint);
+        }
+        if (options_.enable_selective_preemption) {
+            c.add(Capability::selective_preemption);
         }
         return c;
     }

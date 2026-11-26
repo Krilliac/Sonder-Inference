@@ -43,14 +43,175 @@ struct BatchSlotPlanView {
     std::int64_t pos = 0;
     bool cancelled = false;
     // Scheduling priority, optional latency targets (ms), monotonic aging
-    // timestamps (microseconds), and current KV context length.
+    // timestamps (microseconds), current KV context length, and selective
+    // safe-point suspension flag.
     sonder::inference::RequestPriority priority = sonder::inference::RequestPriority::subagent;
     std::optional<double> target_ttft_ms = std::nullopt;
     std::optional<double> target_itl_ms = std::nullopt;
     std::int64_t enqueue_time_us = 0;
     std::int64_t last_service_time_us = 0;
     std::int64_t kv_context_tokens = 0;  // <= 0 falls back to max(0, pos)
+    bool suspended = false;
 };
+
+// Cost-aware physical preemption policy for direct llama.cpp slots (Item #9).
+enum class PhysicalPreemptionPolicy : std::uint8_t {
+    kRecompute = 0,
+    kSpillToCheckpoint = 1,
+};
+
+struct PreemptionVictimView {
+    std::size_t slot_index = 0;
+    std::int32_t seq_id = 0;
+    int priority_rank = 0;          // higher = less urgent = preferred victim
+    std::size_t kv_tokens = 0;
+    std::uint64_t admit_order = 0;  // newer = preferred victim on equal priority
+    std::uint32_t requeue_count = 0;
+    bool cancelled = false;
+    bool suspended = false;
+    bool allow_spill = false;
+};
+
+struct PhysicalPreemptionCostParams {
+    std::uint64_t bytes_per_token = 4096;
+    double prefill_tokens_per_sec = 2000.0;
+    double spill_bytes_per_sec = 4.0 * 1024.0 * 1024.0 * 1024.0;
+    double restore_bytes_per_sec = 4.0 * 1024.0 * 1024.0 * 1024.0;
+    double fixed_spill_overhead_us = 250.0;
+    double fixed_recompute_overhead_us = 50.0;
+    std::size_t min_spill_tokens = 256;
+    std::uint64_t available_spill_bytes = 0;  // 0 = unbounded / caller cap
+    double spill_margin = 1.05;
+    std::uint32_t max_requeue_count = 8;
+    std::uint32_t anti_starvation_cap = 3;
+};
+
+struct PhysicalPreemptionChoice {
+    std::size_t victim_slot_index = 0;
+    PhysicalPreemptionPolicy policy = PhysicalPreemptionPolicy::kRecompute;
+    double recompute_cost_us = 0.0;
+    double spill_restore_cost_us = 0.0;
+    std::uint64_t estimated_spill_bytes = 0;
+    bool budget_exceeded = false;
+    bool hit_requeue_limit = false;
+    bool bypassed_protected_peer = false;
+};
+
+// Evaluates Recompute (default) vs SpillToCheckpoint from measured/estimated
+// spill+restore cost vs recompute cost and available spill byte budget.
+[[nodiscard]] inline PhysicalPreemptionChoice EvaluatePhysicalPreemptionCost(
+    std::size_t kv_tokens, bool allow_spill, std::uint32_t requeue_count,
+    const PhysicalPreemptionCostParams& params) noexcept {
+    PhysicalPreemptionChoice out;
+    out.policy = PhysicalPreemptionPolicy::kRecompute;
+    out.hit_requeue_limit = requeue_count >= params.max_requeue_count;
+
+    const std::uint64_t tokens = static_cast<std::uint64_t>(kv_tokens);
+    const std::uint64_t max_u64 = std::numeric_limits<std::uint64_t>::max();
+    if (params.bytes_per_token > 0 && tokens > max_u64 / params.bytes_per_token) {
+        out.estimated_spill_bytes = max_u64;
+    } else {
+        out.estimated_spill_bytes = tokens * params.bytes_per_token;
+    }
+
+    const bool valid_prefill = std::isfinite(params.prefill_tokens_per_sec) && params.prefill_tokens_per_sec > 0.0;
+    const bool valid_spill = std::isfinite(params.spill_bytes_per_sec) && params.spill_bytes_per_sec > 0.0;
+    const bool valid_restore = std::isfinite(params.restore_bytes_per_sec) && params.restore_bytes_per_sec > 0.0;
+    const double fixed_recompute =
+        (std::isfinite(params.fixed_recompute_overhead_us) && params.fixed_recompute_overhead_us >= 0.0)
+            ? params.fixed_recompute_overhead_us
+            : 0.0;
+    const double fixed_spill =
+        (std::isfinite(params.fixed_spill_overhead_us) && params.fixed_spill_overhead_us >= 0.0)
+            ? params.fixed_spill_overhead_us
+            : 0.0;
+
+    if (valid_prefill) {
+        out.recompute_cost_us =
+            fixed_recompute + (static_cast<double>(tokens) / params.prefill_tokens_per_sec) * 1'000'000.0;
+    }
+    if (valid_spill && valid_restore && out.estimated_spill_bytes > 0) {
+        const double b = static_cast<double>(out.estimated_spill_bytes);
+        out.spill_restore_cost_us = fixed_spill + ((b / params.spill_bytes_per_sec) + (b / params.restore_bytes_per_sec)) * 1'000'000.0;
+    } else {
+        out.spill_restore_cost_us = fixed_spill;
+    }
+
+    if (!allow_spill || kv_tokens < params.min_spill_tokens || !valid_prefill || !valid_spill || !valid_restore ||
+        out.estimated_spill_bytes == 0) {
+        return out;
+    }
+    if (params.available_spill_bytes > 0 && out.estimated_spill_bytes > params.available_spill_bytes) {
+        out.budget_exceeded = true;
+        return out;
+    }
+    const double margin = (std::isfinite(params.spill_margin) && params.spill_margin >= 1.0) ? params.spill_margin : 1.0;
+    if (out.spill_restore_cost_us * margin < out.recompute_cost_us) {
+        out.policy = PhysicalPreemptionPolicy::kSpillToCheckpoint;
+    }
+    return out;
+}
+
+// Picks one active slot to selectively preempt under physical KV pressure:
+//   - Prefers unprotected slots (requeue_count < anti_starvation_cap) over
+//     anti-starvation-protected slots when an unprotected peer exists.
+//   - Within the eligible set, picks the least urgent (highest priority_rank),
+//     breaking ties by newest admit_order, then largest kv_tokens.
+//   - Never evicts the sole live slot unless `allow_last_slot` is true.
+[[nodiscard]] inline std::optional<PhysicalPreemptionChoice> SelectSelectivePreemptionVictim(
+    std::span<const PreemptionVictimView> active_slots, const PhysicalPreemptionCostParams& params,
+    bool allow_last_slot = false) noexcept {
+    std::size_t live_count = 0;
+    for (const auto& s : active_slots) {
+        if (!s.cancelled && !s.suspended) ++live_count;
+    }
+    if (live_count == 0 || (!allow_last_slot && live_count <= 1u)) {
+        return std::nullopt;
+    }
+
+    auto pick_from = [&](bool skip_protected, bool& saw_protected) -> std::optional<std::size_t> {
+        std::optional<std::size_t> best;
+        for (std::size_t i = 0; i < active_slots.size(); ++i) {
+            const auto& s = active_slots[i];
+            if (s.cancelled || s.suspended) continue;
+            const bool is_protected = params.anti_starvation_cap > 0 && s.requeue_count >= params.anti_starvation_cap;
+            if (skip_protected && is_protected) {
+                saw_protected = true;
+                continue;
+            }
+            if (!best.has_value()) {
+                best = i;
+                continue;
+            }
+            const auto& cur = active_slots[*best];
+            if (s.priority_rank != cur.priority_rank) {
+                if (s.priority_rank > cur.priority_rank) best = i;
+            } else if (s.admit_order != cur.admit_order) {
+                if (s.admit_order > cur.admit_order) best = i;
+            } else if (s.kv_tokens > cur.kv_tokens) {
+                best = i;
+            }
+        }
+        return best;
+    };
+
+    bool saw_protected = false;
+    auto chosen_idx = pick_from(/*skip_protected=*/true, saw_protected);
+    bool bypassed = saw_protected && chosen_idx.has_value();
+    if (!chosen_idx.has_value()) {
+        chosen_idx = pick_from(/*skip_protected=*/false, saw_protected);
+        bypassed = false;
+    }
+    if (!chosen_idx.has_value()) {
+        return std::nullopt;
+    }
+    const auto& v = active_slots[*chosen_idx];
+    PhysicalPreemptionChoice choice =
+        EvaluatePhysicalPreemptionCost(v.kv_tokens, v.allow_spill, v.requeue_count, params);
+    choice.victim_slot_index = v.slot_index;
+    choice.bypassed_protected_peer = bypassed;
+    return choice;
+}
 
 struct PlannedBatchItem {
     std::size_t slot_index = 0;
@@ -442,7 +603,7 @@ struct CandidateOrder {
     // Pass 1: Pack 1 decode token per decoding slot (low inter-token latency).
     std::size_t decode_waiting = 0;
     for (const BatchSlotPlanView& s : active_slots) {
-        if (!s.cancelled && s.phase == BatchSlotPhase::kDecode) {
+        if (!s.cancelled && !s.suspended && s.phase == BatchSlotPhase::kDecode) {
             ++decode_waiting;
         }
     }
@@ -452,7 +613,7 @@ struct CandidateOrder {
             // All decoding slots fit: mark in canonical ascending order.
             for (std::size_t idx = 0; idx < n; ++idx) {
                 const BatchSlotPlanView& s = active_slots[idx];
-                if (!s.cancelled && s.phase == BatchSlotPhase::kDecode) {
+                if (!s.cancelled && !s.suspended && s.phase == BatchSlotPhase::kDecode) {
                     flags[idx] = 1u;
                 }
             }
@@ -463,7 +624,7 @@ struct CandidateOrder {
             for (std::size_t off = 0; off < n; ++off) {
                 const std::size_t idx = (start_idx + off) % n;
                 const BatchSlotPlanView& s = active_slots[idx];
-                if (s.cancelled || s.phase != BatchSlotPhase::kDecode) continue;
+                if (s.cancelled || s.suspended || s.phase != BatchSlotPhase::kDecode) continue;
                 const double wait_ms = SlotWaitSinceServiceMs(s, now_us);
                 CandidateOrder c;
                 c.idx = idx;
@@ -506,7 +667,7 @@ struct CandidateOrder {
         for (std::size_t off = 0; off < n; ++off) {
             const std::size_t idx = (start_idx + off) % n;
             const BatchSlotPlanView& s = active_slots[idx];
-            if (s.cancelled || s.phase != BatchSlotPhase::kPrefill || s.prefill_offset >= s.prompt_len) continue;
+            if (s.cancelled || s.suspended || s.phase != BatchSlotPhase::kPrefill || s.prefill_offset >= s.prompt_len) continue;
             const double wait_ms = SlotWaitSinceServiceMs(s, now_us);
             const std::optional<double> slack = ComputeTtftSlackMs(s.target_ttft_ms, s.enqueue_time_us, now_us);
             CandidateOrder c;
@@ -785,7 +946,7 @@ struct CandidateOrder {
         std::isfinite(config.default_foreground_itl_ms) && config.default_foreground_itl_ms > 0.0;
 
     for (const BatchSlotPlanView& s : active_slots) {
-        if (s.cancelled) continue;
+        if (s.cancelled || s.suspended) continue;
         if (s.phase == BatchSlotPhase::kDecode) {
             ++decode_waiting;
             const std::int64_t kv = detail::EffectiveKvContextTokens(s);
