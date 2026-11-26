@@ -480,6 +480,19 @@ TEST_CASE("llamacpp frontier: suffix, cache_ram_mib, moe_cache_mib, mmproj_path,
     lo.moe_cache_mib = kMaxMoeCacheMiB + 1;
     CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
     lo.moe_cache_mib = 2048;
+    lo.moe_cache_cpu_share = 0.0;
+    CHECK(ValidateContextOptions(lo).ok());
+    lo.moe_cache_cpu_share = 0.25;
+    CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
+    lo.moe_cache_cpu_share = std::numeric_limits<double>::quiet_NaN();
+    CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
+    lo.moe_cache_cpu_share = 0.0;
+
+    sonder::inference::LlamaCppBackendOptions backend_opts;
+    backend_opts.moe_cache_cpu_share = 0.5;
+    CHECK(sonder::inference::validate_llamacpp_options(backend_opts).code() ==
+          sonder::inference::ErrorCode::invalid_argument);
+
     std::string bad_mm = "mmproj.gguf";
     bad_mm[6] = '\0';
     lo.mmproj_path = bad_mm;

@@ -78,7 +78,7 @@ flash attention `auto`, micro-batch = llama.cpp's 512 capped at the batch size).
 | `--batch-size N` | `batch_size` | tokens per `llama_decode` during prefill | 512 |
 | `--ubatch-size N` | `ubatch_size` | physical micro-batch, `<= --batch-size` | llama.cpp's 512, capped at the batch size |
 | `--moe-cache-mib N` | `moe_cache_mib` | dynamic SLRU MoE expert VRAM cache in MiB (`0..262144`) | `0` (disabled) |
-| `--moe-cache-cpu-share F` | `moe_cache_cpu_share` | fraction (`0.0..1.0`) of SLRU cache misses executed directly on CPU | unset |
+| `--moe-cache-cpu-share F` | `moe_cache_cpu_share` (`llamaserver` profile/args; rejected on direct `llamacpp`) | fraction (`0.0..1.0`) of SLRU cache misses executed directly on CPU (`llama-server` only) | unset |
 | `--cache-ram-mib N` | `cache_ram_mib` | host RAM prompt-cache budget in MiB (`0..65536`) | unset |
 | `--mmproj PATH` | `mmproj_path` | multimodal projector GGUF path | unset |
 | `--spec-type TYPE` | `spec_type` | `none`, `ngram-simple`, `ngram-mod`, `ngram-cache`, `suffix`, `draft` | `none` |

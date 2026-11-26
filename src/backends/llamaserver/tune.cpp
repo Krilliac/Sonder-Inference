@@ -1,9 +1,13 @@
 #include "tune.hpp"
 #include "llamaserver_options.hpp"
+#include "common/sha256.hpp"
+#include "utf8_path.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <set>
@@ -72,7 +76,92 @@ bool is_valid_kv_flash_attn(const KvPair &kv, std::string_view flash_attn) {
 }
 bool is_supported_spec_type(std::string_view type) {
     return type == "draft-mtp" || type == "draft-mtp,ngram-mod" || type == "ngram-mod" ||
-           type == "dflash" || type == "draft-dflash" || type == "draft" || type == "draft-simple";
+           type == "dflash" || type == "draft-dflash" || type == "draft-eagle3" ||
+           type == "draft-dspark" || type == "draft" || type == "draft-simple";
+}
+bool has_control_or_newline(std::string_view s) noexcept {
+    return s.find('\0') != std::string_view::npos || s.find('\r') != std::string_view::npos ||
+           s.find('\n') != std::string_view::npos;
+}
+std::string to_lower_ascii(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (const char c : s) out.push_back(ascii_lower(c));
+    return out;
+}
+bool grid_uses_external_draft(const Grid &g) noexcept {
+    const bool has_nonzero_mtp = std::any_of(g.mtp.begin(), g.mtp.end(), [](std::uint32_t n) { return n > 0; });
+    if (!has_nonzero_mtp) return false;
+    return std::any_of(g.spec_type.begin(), g.spec_type.end(),
+                       [](const std::string &t) { return uses_draft_model(t); });
+}
+bool is_compatible_gguf_arch(std::string_view target_arch, std::string_view draft_arch) {
+    if (target_arch.empty() || draft_arch.empty()) return true;
+    const std::string ta = to_lower_ascii(target_arch);
+    const std::string da = to_lower_ascii(draft_arch);
+    if (ta == da) return true;
+    if (da.size() > ta.size() && da.compare(0, ta.size(), ta) == 0 && (da[ta.size()] == '_' || da[ta.size()] == '-')) {
+        return true;
+    }
+    return da == "dflash" || da == "eagle" || da == "eagle3" || da == "dspark";
+}
+json::Value artifact_identity_json(const ArtifactIdentity &a, bool include_limit) {
+    json::Object o{
+        {"path", a.path},
+        {"sha256", a.sha256.empty() ? json::Value{} : json::Value(a.sha256)},
+        {"architecture", a.architecture.empty() ? json::Value{} : json::Value(a.architecture)},
+        {"tokenizer_model", a.tokenizer_model.empty() ? json::Value{} : json::Value(a.tokenizer_model)},
+        {"vocab_size", a.vocab_size ? json::Value(*a.vocab_size) : json::Value{}},
+        {"file_bytes", a.file_bytes ? json::Value(*a.file_bytes) : json::Value{}},
+    };
+    if (include_limit) {
+        o.set("trained_block_limit",
+              a.trained_block_limit ? json::Value(static_cast<std::uint64_t>(*a.trained_block_limit)) : json::Value{});
+    }
+    return o;
+}
+json::Value executable_identity_json(const ExecutableIdentity &e) {
+    return json::Object{
+        {"path", e.path},
+        {"sha256", e.sha256.empty() ? json::Value{} : json::Value(e.sha256)},
+        {"supports_spec_type", e.supports_spec_type},
+        {"supports_mtp", e.supports_mtp},
+        {"supports_draft_model", e.supports_draft_model},
+    };
+}
+Result<ModelInfo> inspect_gguf_file(const std::string &path, const char *label, std::string &sha256_out,
+                                    const std::string &expected_sha256, const std::function<bool()> &cancelled) {
+    std::error_code ec;
+    const auto fs_path = utf8_path(path);
+    if (!std::filesystem::is_regular_file(fs_path, ec) || ec) {
+        return Status(ErrorCode::invalid_argument, std::string(label) + " is not a readable regular local file");
+    }
+    std::ifstream in(fs_path, std::ios::binary);
+    if (!in) {
+        return Status(ErrorCode::not_found, std::string("cannot open ") + label + " GGUF");
+    }
+    auto info = read_model_info(in, cancelled);
+    if (!info.ok()) {
+        if (cancelled && cancelled()) return Status(ErrorCode::cancelled, "GGUF inspection cancelled");
+        return Status(info.status().code(), std::string(label) + ": " + info.status().message());
+    }
+    in.close();
+    std::string hash_err;
+    if (!sonder::inference::detail::sha256_file_hex(fs_path, sha256_out, hash_err, cancelled)) {
+        if (cancelled && cancelled()) return Status(ErrorCode::cancelled, "artifact hashing cancelled");
+        return Status(ErrorCode::io_error, std::string(label) + " SHA-256 check failed: " + hash_err);
+    }
+    if (!expected_sha256.empty()) {
+        std::string expected_norm;
+        if (!sonder::inference::detail::normalize_sha256_hex(expected_sha256, expected_norm)) {
+            return Status(ErrorCode::invalid_argument, std::string(label) + " expected SHA-256 must be 64 hex chars");
+        }
+        if (sha256_out != expected_norm) {
+            return Status(ErrorCode::invalid_argument, std::string(label) + " SHA-256 mismatch (expected " +
+                                                           expected_norm + ", got " + sha256_out + ")");
+        }
+    }
+    return info;
 }
 bool spec_type_requires_mtp(std::string_view type) {
     return type == "draft-mtp" || type == "draft-mtp,ngram-mod";
@@ -320,6 +409,161 @@ std::optional<std::uint64_t> margin_context(std::uint64_t edge) {
     if (edge < 16384) return {};
     return edge - kMargin;
 }
+Status validate_options_for_grid(const Options &o, bool dry_run) {
+    for (const auto *path : {&o.executable, &o.model, &o.draft_model, &o.mmproj, &o.out}) {
+        if (has_control_or_newline(*path)) {
+            return invalid("artifact paths must not contain NUL or newline characters");
+        }
+    }
+    if (!o.target_model_sha256.empty()) {
+        std::string normalized;
+        if (!sonder::inference::detail::normalize_sha256_hex(o.target_model_sha256, normalized)) {
+            return invalid("target_model_sha256 must be a 64-character hexadecimal SHA-256 digest");
+        }
+    }
+    if (!o.draft_model_sha256.empty()) {
+        if (o.draft_model.empty()) {
+            return invalid("draft_model_sha256 requires draft_model");
+        }
+        std::string normalized;
+        if (!sonder::inference::detail::normalize_sha256_hex(o.draft_model_sha256, normalized)) {
+            return invalid("draft_model_sha256 must be a 64-character hexadecimal SHA-256 digest");
+        }
+    }
+    if (o.trained_block_limit) {
+        if (o.draft_model.empty()) {
+            return invalid("trained_block_limit requires draft_model");
+        }
+        if (*o.trained_block_limit == 0 || *o.trained_block_limit > 16) {
+            return invalid("trained_block_limit must be an integer from 1 to 16");
+        }
+    }
+    const bool uses_ext_draft = grid_uses_external_draft(o.grid);
+    if (uses_ext_draft) {
+        if (!dry_run && o.draft_model.empty()) {
+            return invalid("draft_model is required when grid includes external draft speculative modes");
+        }
+        if (o.trained_block_limit) {
+            for (const std::uint32_t n : o.grid.mtp) {
+                if (n > *o.trained_block_limit) {
+                    return Status(ErrorCode::invalid_argument,
+                                  "grid mtp value " + std::to_string(n) + " exceeds trained_block_limit (" +
+                                      std::to_string(*o.trained_block_limit) + ")");
+                }
+            }
+        }
+    }
+    return {};
+}
+Status validate_draft_pair_compatibility(const ModelInfo &target, const ModelInfo &draft) {
+    if (target.vocab_size && draft.vocab_size && *target.vocab_size != *draft.vocab_size) {
+        return Status(ErrorCode::invalid_argument, "draft model vocabulary size (" + std::to_string(*draft.vocab_size) +
+                                                       ") does not match target model (" +
+                                                       std::to_string(*target.vocab_size) + ")");
+    }
+    if (!target.tokenizer_model.empty() && !draft.tokenizer_model.empty() &&
+        target.tokenizer_model != draft.tokenizer_model) {
+        return Status(ErrorCode::invalid_argument, "draft model tokenizer ('" + draft.tokenizer_model +
+                                                       "') does not match target model ('" + target.tokenizer_model +
+                                                       "')");
+    }
+    if (!is_compatible_gguf_arch(target.gguf_architecture, draft.gguf_architecture)) {
+        return Status(ErrorCode::invalid_argument, "draft model architecture ('" + draft.gguf_architecture +
+                                                       "') is incompatible with target model ('" +
+                                                       target.gguf_architecture + "')");
+    }
+    return {};
+}
+Status prepare_model_and_draft_artifacts(Options &o, PreparedArtifacts &out, const std::function<bool()> &cancelled) {
+    if (auto st = validate_grid(o.grid); !st.ok()) return st;
+    if (auto st = validate_options_for_grid(o, false); !st.ok()) return st;
+    if (o.model.empty()) return invalid("target model path must not be empty");
+    std::string target_sha;
+    auto target_info = inspect_gguf_file(o.model, "target model", target_sha, o.target_model_sha256, cancelled);
+    if (!target_info.ok()) return target_info.status();
+    out.target_info = std::move(target_info.value());
+
+    ArtifactIdentity target_id;
+    target_id.path = o.model;
+    target_id.sha256 = std::move(target_sha);
+    target_id.architecture = out.target_info.gguf_architecture;
+    target_id.tokenizer_model = out.target_info.tokenizer_model;
+    target_id.vocab_size = out.target_info.vocab_size;
+    target_id.file_bytes = out.target_info.file_bytes;
+    o.target_identity = std::move(target_id);
+
+    o.draft_identity.reset();
+    out.draft_info.reset();
+    if (!o.draft_model.empty()) {
+        std::error_code ec;
+        if (std::filesystem::equivalent(utf8_path(o.model), utf8_path(o.draft_model), ec) && !ec) {
+            return invalid("draft model must be a distinct GGUF artifact from target model");
+        }
+        std::string draft_sha;
+        auto draft_info = inspect_gguf_file(o.draft_model, "draft model", draft_sha, o.draft_model_sha256, cancelled);
+        if (!draft_info.ok()) return draft_info.status();
+        if (auto compat = validate_draft_pair_compatibility(out.target_info, draft_info.value()); !compat.ok()) {
+            return compat;
+        }
+        out.draft_info = std::move(draft_info.value());
+        ArtifactIdentity draft_id;
+        draft_id.path = o.draft_model;
+        draft_id.sha256 = std::move(draft_sha);
+        draft_id.architecture = out.draft_info->gguf_architecture;
+        draft_id.tokenizer_model = out.draft_info->tokenizer_model;
+        draft_id.vocab_size = out.draft_info->vocab_size;
+        draft_id.file_bytes = out.draft_info->file_bytes;
+        draft_id.trained_block_limit = o.trained_block_limit;
+        o.draft_identity = std::move(draft_id);
+    }
+    return {};
+}
+Status apply_executable_capabilities(Options &o, PreparedArtifacts &artifacts, std::string_view executable_help_text,
+                                     const std::function<bool()> &cancelled) {
+    o.spec_type_supported = help_supports_spec_type(executable_help_text);
+    o.draft_model_supported = help_supports_draft_model(executable_help_text);
+    const bool mtp_supported = help_supports_mtp(executable_help_text);
+    artifacts.mtp_available = artifacts.target_info.has_nextn && mtp_supported;
+
+    if (grid_uses_external_draft(o.grid)) {
+        if (!o.spec_type_supported || !o.draft_model_supported) {
+            return invalid("executable --help does not advertise --spec-type, --spec-draft-n-max, and "
+                           "--spec-draft-model/--model-draft required for draft-model calibration");
+        }
+        for (const auto &type : o.grid.spec_type) {
+            if (uses_draft_model(type) && !help_supports_spec_type_value(executable_help_text, type)) {
+                return Status(ErrorCode::invalid_argument,
+                              "executable --help does not list support for external draft spec_type '" + type + "'");
+            }
+        }
+    }
+
+    ExecutableIdentity exec_id;
+    exec_id.path = o.executable;
+    exec_id.supports_spec_type = o.spec_type_supported;
+    exec_id.supports_mtp = mtp_supported;
+    exec_id.supports_draft_model = o.draft_model_supported;
+    if (!o.executable.empty()) {
+        std::error_code ec;
+        const auto exe_path = utf8_path(o.executable);
+        if (std::filesystem::is_regular_file(exe_path, ec) && !ec) {
+            std::string hash_err;
+            if (!sonder::inference::detail::sha256_file_hex(exe_path, exec_id.sha256, hash_err, cancelled)) {
+                if (cancelled && cancelled()) return Status(ErrorCode::cancelled, "executable hashing cancelled");
+                return Status(ErrorCode::io_error, "executable SHA-256 check failed: " + hash_err);
+            }
+        }
+    }
+    o.executable_identity = std::move(exec_id);
+    return {};
+}
+Result<PreparedArtifacts> prepare_live_artifacts(Options &o, std::string_view executable_help_text,
+                                                 const std::function<bool()> &cancelled) {
+    PreparedArtifacts artifacts;
+    if (auto st = prepare_model_and_draft_artifacts(o, artifacts, cancelled); !st.ok()) return st;
+    if (auto st = apply_executable_capabilities(o, artifacts, executable_help_text, cancelled); !st.ok()) return st;
+    return artifacts;
+}
 Status validate_grid(const Grid &g) {
     if (g.kv.empty() || g.kv.size() > 8 || g.ctx.empty() || g.ctx.size() > 128 ||
         g.ubatch.empty() || g.ubatch.size() > 8 || g.mtp.empty() || g.mtp.size() > 8 ||
@@ -499,6 +743,9 @@ std::vector<std::string> arguments(const Options &o, const Candidate &c) {
         if (c.spec_type == "ngram-mod") {
             args.insert(args.end(), {"--spec-type", c.spec_type, "--spec-ngram-mod-n-max", std::to_string(c.mtp)});
         } else {
+            if (!o.draft_model.empty() && uses_draft_model(c.spec_type)) {
+                args.insert(args.end(), {"--spec-draft-model", o.draft_model});
+            }
             args.insert(args.end(), {"--spec-type", c.spec_type, "--spec-draft-n-max", std::to_string(c.mtp),
                 "--spec-draft-p-min", std::to_string(c.p_min)});
         }
@@ -508,7 +755,14 @@ std::vector<std::string> arguments(const Options &o, const Candidate &c) {
 
 Report search(const Options &o, bool mtp_available, Deadline deadline, const Trial &trial, const Now &now) {
     Report report;
+    report.target_identity = o.target_identity;
+    report.draft_identity = o.draft_identity;
+    report.executable_identity = o.executable_identity;
     if (auto status = validate_grid(o.grid); !status.ok()) {
+        report.stopped_reason = status.message();
+        return report;
+    }
+    if (auto status = validate_options_for_grid(o, false); !status.ok()) {
         report.stopped_reason = status.message();
         return report;
     }
@@ -645,9 +899,41 @@ json::Value report_json(const Options &o, const Report &report) {
         return json::Object{{"result_index", static_cast<std::uint64_t>(*index)},
             {"config", spawn_config(o, report.results[*index].candidate)}};
     };
+    ArtifactIdentity target_id;
+    if (report.target_identity) target_id = *report.target_identity;
+    else if (o.target_identity) target_id = *o.target_identity;
+    else {
+        target_id.path = o.model;
+        if (!o.target_model_sha256.empty()) {
+            (void)sonder::inference::detail::normalize_sha256_hex(o.target_model_sha256, target_id.sha256);
+        }
+    }
+    json::Value draft_json;
+    if (report.draft_identity) draft_json = artifact_identity_json(*report.draft_identity, true);
+    else if (o.draft_identity) draft_json = artifact_identity_json(*o.draft_identity, true);
+    else if (!o.draft_model.empty()) {
+        ArtifactIdentity fallback;
+        fallback.path = o.draft_model;
+        if (!o.draft_model_sha256.empty()) {
+            (void)sonder::inference::detail::normalize_sha256_hex(o.draft_model_sha256, fallback.sha256);
+        }
+        fallback.trained_block_limit = o.trained_block_limit;
+        draft_json = artifact_identity_json(fallback, true);
+    }
+    ExecutableIdentity exec_id;
+    if (report.executable_identity) exec_id = *report.executable_identity;
+    else if (o.executable_identity) exec_id = *o.executable_identity;
+    else {
+        exec_id.path = o.executable;
+        exec_id.supports_spec_type = o.spec_type_supported;
+        exec_id.supports_draft_model = o.draft_model_supported;
+    }
     doc.set("results", json::Object{{"schema", "sonder.inference.tune/1"},
         {"margin_tokens", kMargin}, {"budget_exhausted", report.budget_exhausted},
         {"stopped_reason", report.stopped_reason}, {"thorough", o.thorough},
+        {"target_model", artifact_identity_json(target_id, false)},
+        {"draft_model", std::move(draft_json)},
+        {"executable", executable_identity_json(exec_id)},
         {"fast_default", recommendation(report.fast_default)}, {"long_context", recommendation(report.long_context)},
         {"candidates", std::move(rows)}});
     return doc;

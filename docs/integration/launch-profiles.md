@@ -147,22 +147,26 @@ to about 1 tok/s at 72k. For long context, keep Q3_K_XL at 100k.
 | `mmproj_offload` | `--mmproj-offload` / `--no-mmproj-offload` | rejected | bool; needs `mmproj` |
 | `image_max_tokens` | `--image-max-tokens` | rejected | 1-65536; needs `mmproj` |
 | `ctx_size` | `--ctx-size` | `context_length` (at most 4194304) | 0 (model default) to 16777216 |
+| `mmproj` | `--mmproj` | `mmproj_path` | path (`mmproj_offload`/`image_max_tokens` require `llamaserver`) |
+| `mmproj_offload` | `--mmproj-offload` / `--no-mmproj-offload` | rejected | bool |
+| `image_max_tokens` | `--image-max-tokens` | rejected | 1-65536 |
+| `ctx_size` | `--ctx-size` | `context_length` | 0 to 4194304 (`llamacpp`); 0 to 16777216 (`llamaserver`); `0` = model maximum |
 | `n_gpu_layers` | `--n-gpu-layers` (`-1` is `all`) | `gpu_layers`; sets `--device gpu:0` when none is given, refuses a cpu device | -1 to 100000 |
 | `batch_size` | `--batch-size` | `batch_size` * | 1 to 4194304 |
 | `ubatch_size` | `--ubatch-size` | `ubatch_size` * | at most `batch_size` (upstream default: 2048 for llama-server, 512 for llamacpp) |
-| `parallel` | `--parallel` | rejected | 1-256; unset = llama-server's automatic default (`-np -1`): 4 slots with a unified KV cache, which the fit check counts as 4 recurrent states |
-| `kv_unified` | `--kv-unified` / `--no-kv-unified` | rejected | bool; `false` needs `parallel` (the automatic slots always unify the cache) |
+| `parallel` | `--parallel` | `slots` (1-16) | 1-256 (`llamaserver`), 1-16 (`llamacpp`); unset on `llamaserver` = automatic default (`-np -1`, 4 slots with unified KV) |
+| `kv_unified` | `--kv-unified` / `--no-kv-unified` | `kv_unified` | bool; on `llamaserver`, `false` needs `parallel` (the automatic slots always unify the cache) |
 | `flash_attn` | `--flash-attn` | `flash_attention` * | `on`, `off`, `auto` (also `enabled`, `disabled`) |
 | `cache_type_k`, `cache_type_v` | `--cache-type-k`, `--cache-type-v` | `kv_cache_type_k`, `kv_cache_type_v` * | `f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1` |
 | `ctx_checkpoints` | `--ctx-checkpoints` | rejected | 0-1024 |
 | `checkpoint_min_step` | `--checkpoint-min-step` | rejected | 0 to 16777216 |
-| `cache_ram_mib` | `--cache-ram` | rejected | -1 (no limit), 0 (off), up to 16777216 |
+| `cache_ram_mib` | `--cache-ram` | `cache_ram_mib` (0-65536) | -1 (no limit), 0 (off), up to 16777216 (`llamaserver`); 0-65536 (`llamacpp`) |
 | `context_shift` | `--context-shift` / `--no-context-shift` | rejected | bool |
 | `fit` | `--fit on/off` | rejected | bool |
-| `speculative.types` | `--spec-type a,b` | rejected | `none draft-simple draft-eagle3 draft-mtp draft-dflash draft-dspark ngram-simple ngram-map-k ngram-map-k4v ngram-mod ngram-cache` |
-| `speculative.draft_n_max` | `--spec-draft-n-max` | rejected | 1-64 |
+| `speculative.types` | `--spec-type a,b` | `spec_type` (single entry) | `none draft-simple draft-eagle3 draft-mtp draft-dflash draft-dspark ngram-simple ngram-map-k ngram-map-k4v ngram-mod ngram-cache suffix` (`llamaserver`); single value from `none auto ngram ngram-mod suffix draft-mtp` (`llamacpp`) |
+| `speculative.draft_n_max` | `--spec-draft-n-max` | `spec_draft_max` (non-`none`) | 1-64 |
 | `speculative.draft_model` | `--spec-draft-model` | rejected | path |
-| `threads`, `threads_batch` | `--threads`, `--threads-batch` | rejected | -1 to 1024 |
+| `threads`, `threads_batch` | `--threads`, `--threads-batch` | `threads` (1-256); `threads_batch` rejected | -1 to 1024 (`llamaserver`); `threads` 1-256 (`llamacpp`) |
 | `jinja` | `--jinja` / `--no-jinja` | rejected | bool |
 | `reasoning_format` | `--reasoning-format` | rejected | `none deepseek deepseek-legacy auto` |
 | `sampling.*` | (per request) | (per request) | `temperature top_p top_k min_p presence_penalty repeat_penalty` |

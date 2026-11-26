@@ -198,7 +198,8 @@ struct LoadOptions {
     std::uint32_t cache_ram_mib = 0;
     // Dynamic GPU cache in MiB for host-resident MoE experts (0 = disabled, max kMaxMoeCacheMiB).
     std::uint32_t moe_cache_mib = 0;
-    // Fraction of MoE cache capacity reserved for CPU-shared tier (0.0..1.0).
+    // Unused/rejected by the direct llamacpp backend (no execution consumer):
+    // must remain 0.0; non-zero or non-finite values fail with invalid_argument.
     double moe_cache_cpu_share = 0.0;
     // Optional multimodal projector GGUF path (--mmproj); requires SONDER_WITH_MTMD=ON.
     std::string mmproj_path;
