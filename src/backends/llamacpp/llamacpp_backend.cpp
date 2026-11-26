@@ -864,6 +864,7 @@ struct LlamaCppBackend::Impl {
         slot_mtp_synced.clear();
         slot_checkpoints.clear();
         radix_cache.Clear();
+        radix_cache.restore_cost_gate().Reset();
         prefix_coalescer.Reset();
         SyncCoalescerStats();
         total_checkpoint_bytes = 0;
@@ -1058,8 +1059,9 @@ struct LlamaCppBackend::Impl {
             pending_bytes > radix_cache.max_bytes() - sz - dft_sz) {
             return;
         }
+        const std::string& session_key = slots[slot_idx].session_key;
         const std::size_t total_need = sz + dft_sz + pending_bytes;
-        if (!radix_cache.ReserveBeforeAlloc(total_need, stoks)) {
+        if (!radix_cache.ReserveBeforeAlloc(total_need, stoks, session_key, !session_key.empty())) {
             return;
         }
 
@@ -1089,7 +1091,9 @@ struct LlamaCppBackend::Impl {
             }
         }
 #endif
-        entry.session_key = slots[slot_idx].session_key;
+        entry.session_key = session_key;
+        entry.request_soft_lease = !session_key.empty();
+        entry.estimated_recompute_ms = radix_cache.restore_cost_gate().PredictRecomputeMs(stoks.size());
         (void)radix_cache.Insert(stoks, std::move(entry));
     }
 
@@ -1099,23 +1103,38 @@ struct LlamaCppBackend::Impl {
     // Sets `out_wiped = true` if VRAM KV for `slot_id` was cleared prior to a
     // failed restore so callers reset `lcp = 0` and slot metadata cleanly.
     bool TryRestoreSlotFromL2(std::size_t slot_idx, llama_seq_id slot_id, std::span<const Token> prompt,
-                              std::size_t min_beat_lcp, std::size_t& out_lcp, bool& out_mtp_synced,
-                              bool& out_wiped) {
+                              std::string_view session_key, std::size_t min_beat_lcp, std::size_t& out_lcp,
+                              bool& out_mtp_synced, bool& out_wiped) {
         out_lcp = 0;
         out_mtp_synced = false;
         out_wiped = false;
         if (!radix_cache.enabled() || ctx == nullptr || prompt.size() <= 1) return false;
         const std::size_t max_reuse = prompt.size() - 1;
         const bool allow_trim = (architecture == sonder::inference::ModelArchitecture::attention_only);
-        const PinnedRadixLookup hit = radix_cache.LookupAndPin(prompt, max_reuse, allow_trim);
+        const PinnedRadixLookup hit = radix_cache.LookupAndPin(prompt, max_reuse, allow_trim, session_key);
         const RadixCacheEntry* entry = hit.entry();
         if (!hit.found() || entry == nullptr || hit.matched_tokens() <= min_beat_lcp ||
             (hit.matched_tokens() - min_beat_lcp) < kMinL2RestoreGainTokens) {
             return false;
         }
 
+        // Measured restore-vs-recompute cost gate: skip host L2 restore BEFORE
+        // wiping VRAM whenever predicted restore transfer/deserialization cost
+        // meets or exceeds estimated prefill recomputation cost for the net gain.
+        const std::size_t gain_tokens = hit.matched_tokens() - min_beat_lcp;
+        std::size_t restore_payload_bytes = entry->state_blob.size();
+#if defined(SONDER_LLAMACPP_HAS_MTP)
+        if (ctx_dft != nullptr && !mtp_mem_shared) {
+            restore_payload_bytes += entry->dft_state_blob.size();
+        }
+#endif
+        if (!radix_cache.restore_cost_gate().should_restore(gain_tokens, restore_payload_bytes)) {
+            return false;
+        }
+
         llama_memory_t mem = llama_get_memory(ctx);
         if (mem == nullptr) return false;
+        const auto restore_start = Clock::now();
         out_wiped = true;
         llama_memory_seq_rm(mem, slot_id, -1, -1);
         ResetSwaSlot(slot_idx);
@@ -1185,6 +1204,8 @@ struct LlamaCppBackend::Impl {
             }
         }
 #endif
+        const double restore_ms = MsSince(restore_start);
+        radix_cache.ObserveRestore(hit, restore_payload_bytes, restore_ms);
         out_lcp = hit.matched_tokens();
         return true;
     }
@@ -2980,7 +3001,8 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         bool l2_wiped = false;
         if (radix_cache.enabled() && request.prompt.size() > 1 && request.prompt.size() - 1 > lcp &&
             (request.prompt.size() - 1 - lcp) >= kMinL2RestoreGainTokens) {
-            if (TryRestoreSlotFromL2(slot_idx, slot_id, request.prompt, lcp, l2_lcp, l2_mtp_synced, l2_wiped)) {
+            if (TryRestoreSlotFromL2(slot_idx, slot_id, request.prompt, request.session_key, lcp, l2_lcp,
+                                     l2_mtp_synced, l2_wiped)) {
                 lcp = l2_lcp;
                 restored_from_l2 = true;
                 slots[slot_idx].tokens.assign(request.prompt.begin(),
@@ -3333,6 +3355,9 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         }
     }
     result.prefill_ms = MsSince(prefill_start);
+    if (!has_media && result.prompt_tokens > 0 && result.prefill_ms > 0.0) {
+        radix_cache.ObservePrefill(static_cast<std::size_t>(result.prompt_tokens), result.prefill_ms);
+    }
     Emit(TelemetryKind::kPrefillDone, result.prompt_tokens, result.prefill_ms);
 
     // ---- Streaming decode (with optional in-process speculation) ----
@@ -4205,7 +4230,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         bool l2_wiped = false;
         if (!restored_from_l2 && options.prefix_cache && radix_cache.enabled() && req.prompt.size() > 1 &&
             req.prompt.size() - 1 > lcp && (req.prompt.size() - 1 - lcp) >= kMinL2RestoreGainTokens) {
-            if (TryRestoreSlotFromL2(s->slot_idx, s->slot_id, req.prompt, lcp, l2_lcp, l2_mtp_synced, l2_wiped)) {
+            if (TryRestoreSlotFromL2(s->slot_idx, s->slot_id, req.prompt, req.session_key, lcp, l2_lcp, l2_mtp_synced,
+                                     l2_wiped)) {
                 lcp = l2_lcp;
                 restored_from_l2 = true;
                 slots[s->slot_idx].tokens.assign(req.prompt.begin(),
@@ -4614,6 +4640,10 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 if (step_end == n_prompt) {
                     s.prefill_done = true;
                     s.result.prefill_ms = MsSince(s.prefill_start);
+                    if (s.result.prompt_tokens > 0 && s.result.prefill_ms > 0.0) {
+                        radix_cache.ObservePrefill(static_cast<std::size_t>(s.result.prompt_tokens),
+                                                   s.result.prefill_ms);
+                    }
                     Emit(TelemetryKind::kPrefillDone, s.result.prompt_tokens, s.result.prefill_ms);
                     s.decode_start = Clock::now();
                     if (req.max_new_tokens == 0) {
@@ -5319,6 +5349,10 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 if (s->prefill_offset >= req.prompt.size()) {
                     s->prefill_done = true;
                     s->result.prefill_ms = MsSince(s->prefill_start);
+                    if (s->result.prompt_tokens > 0 && s->result.prefill_ms > 0.0) {
+                        radix_cache.ObservePrefill(static_cast<std::size_t>(s->result.prompt_tokens),
+                                                   s->result.prefill_ms);
+                    }
                     Emit(TelemetryKind::kPrefillDone, s->result.prompt_tokens, s->result.prefill_ms);
                     s->decode_start = Clock::now();
                     if (req.max_new_tokens == 0) {
