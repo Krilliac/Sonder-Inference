@@ -442,14 +442,31 @@ struct SamplerDeleter {
 };
 using SamplerPtr = std::unique_ptr<llama_sampler, SamplerDeleter>;
 
-// Accepts `tok` into a grammar sampler without letting llama.cpp's exceptions escape. A lazy grammar
-// replays the text captured since its trigger fired into the grammar stack and throws
-// std::runtime_error when that text does not fit the grammar (an eager grammar only ever accepts
-// tokens it already approved). Returns false on failure; the grammar state is then undefined and the
-// request must be failed.
+// llama.cpp's grammar code reports failure by throwing: a lazy grammar replays the text captured
+// since its trigger fired into the grammar stack and throws std::runtime_error (via
+// llama_grammar_accept_str / llama_grammar_accept_token in llama-grammar.cpp) when that text does
+// not fit the grammar, and any allocation can throw std::bad_alloc. The exception unwinds through
+// llama_sampler_accept / llama_sampler_apply, which are declared extern "C". Under MSVC /EHsc the
+// compiler assumes extern "C" functions never throw and may drop the try/catch around the call, so
+// the exception then reaches a noexcept frame and calls std::terminate. This target is therefore
+// compiled with /EHs (see CMakeLists.txt), which keeps the catch below alive.
+//
+// Accepts `tok` into a grammar sampler without letting llama.cpp's exceptions escape. Returns
+// false on failure; the grammar state is then undefined and the request must be failed.
 bool TryAcceptGrammar(llama_sampler* grammar, llama_token tok) noexcept {
     try {
         llama_sampler_accept(grammar, tok);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Applies the grammar mask to `cur_p` without letting exceptions escape. Returns false on failure,
+// in which case `cur_p` must not be used. Same exception-handling rationale as TryAcceptGrammar.
+bool TryApplyGrammar(llama_sampler* grammar, llama_token_data_array* cur_p) noexcept {
+    try {
+        llama_sampler_apply(grammar, cur_p);
         return true;
     } catch (...) {
         return false;
@@ -1396,7 +1413,7 @@ struct LlamaCppBackend::Impl {
         // 2. Test ONLY the 1 candidate token against the GBNF grammar.
         llama_token_data single{tok, 1.0F, 0.0F};
         llama_token_data_array single_arr{&single, 1, -1, false};
-        llama_sampler_apply(grammar_sampler, &single_arr);
+        if (!TryApplyGrammar(grammar_sampler, &single_arr)) return LLAMA_TOKEN_NULL;
         if (std::isfinite(single.logit)) {
             if (!TryAcceptGrammar(grammar_sampler, tok)) return LLAMA_TOKEN_NULL;
             llama_sampler_accept(sampler, tok);
@@ -1414,7 +1431,7 @@ struct LlamaCppBackend::Impl {
             cand[static_cast<std::size_t>(v)] = llama_token_data{v, logits[v], 0.0F};
         }
         llama_token_data_array cur_p{cand.data(), cand.size(), -1, false};
-        llama_sampler_apply(grammar_sampler, &cur_p);
+        if (!TryApplyGrammar(grammar_sampler, &cur_p)) return LLAMA_TOKEN_NULL;
         llama_sampler_apply(sampler, &cur_p);
         if (cur_p.selected < 0 || static_cast<std::size_t>(cur_p.selected) >= cur_p.size ||
             !std::isfinite(cur_p.data[cur_p.selected].logit)) {
@@ -1450,8 +1467,8 @@ struct LlamaCppBackend::Impl {
             cand[static_cast<std::size_t>(v)] = llama_token_data{v, logits[v], 0.0F};
         }
         llama_token_data_array cur_p{cand.data(), cand.size(), -1, false};
-        if (grammar_sampler != nullptr) {
-            llama_sampler_apply(grammar_sampler, &cur_p);
+        if (grammar_sampler != nullptr && !TryApplyGrammar(grammar_sampler, &cur_p)) {
+            return false;
         }
         const int32_t n_stages = llama_sampler_chain_n(sampler);
         // Apply all processor stages (logit_bias, penalties, top_k, typical_p,
@@ -2684,7 +2701,10 @@ Status LlamaCppBackend::ProbeGrammarMask(const SamplingParams& params, std::span
     std::vector<llama_token_data> cand(static_cast<std::size_t>(n_vocab));
     for (int32_t i = 0; i < n_vocab; ++i) cand[static_cast<std::size_t>(i)] = llama_token_data{i, 0.0F, 0.0F};
     llama_token_data_array arr{cand.data(), cand.size(), -1, false};
-    llama_sampler_apply(grammar.get(), &arr);
+    if (!TryApplyGrammar(grammar.get(), &arr)) {
+        allowed.clear();
+        return Status::Error(ErrorCode::kDecodeFailed, "grammar sampler failed to apply");
+    }
     for (std::size_t i = 0; i < arr.size; ++i) {
         const auto id = static_cast<std::size_t>(arr.data[i].id);
         if (id < allowed.size()) allowed[id] = arr.data[i].logit == -std::numeric_limits<float>::infinity() ? 0 : 1;
