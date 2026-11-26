@@ -1,0 +1,5 @@
+// Generated from src/engine/build_commit.cpp.in by cmake/SonderBuildInfo.cmake.
+// Kept as its own translation unit so a new commit recompiles only this file.
+const char* sonder_build_commit_string();
+
+const char* sonder_build_commit_string() { return "@SONDER_GIT_COMMIT@"; }
