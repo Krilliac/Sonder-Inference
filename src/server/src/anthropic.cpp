@@ -210,6 +210,7 @@ std::variant<ChatJob, ApiError> parse_messages_request(std::string_view body_tex
                     if (!present(t) || !t->is_string())
                         return bad("invalid_messages", bp + ".text must be a string", bp + ".text");
                     user_msg.content += t->as_string();
+                    user_msg.parts.push_back(TextContentPart{t->as_string()});
                     has_user_content = true;
                 } else if (btype == "image") {
                     if (++total_images > kMaxImagesPerRequest)
@@ -219,7 +220,9 @@ std::variant<ChatJob, ApiError> parse_messages_request(std::string_view body_tex
                     auto media = parse_anthropic_image_block(b.as_object(), bp);
                     if (auto* err = std::get_if<ApiError>(&media))
                         return *err;
-                    user_msg.media.push_back(std::move(std::get<MediaContent>(media)));
+                    MediaContent parsed_media = std::move(std::get<MediaContent>(media));
+                    user_msg.parts.push_back(ImageContentPart{parsed_media});
+                    user_msg.media.push_back(std::move(parsed_media));
                     has_user_content = true;
                 } else if (btype == "tool_result") {
                     const auto* tuid = b.find("tool_use_id");
