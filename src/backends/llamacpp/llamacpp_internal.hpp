@@ -137,6 +137,11 @@ struct ThinkingSplitResult {
 // partial tag prefixes across arbitrary token chunk boundaries.
 class ThinkingStreamSplitter {
 public:
+    ThinkingStreamSplitter() = default;
+    // `start_in_thinking` begins inside an already-open <think> block (the rendered
+    // generation prompt ended with an unclosed <think>).
+    explicit ThinkingStreamSplitter(bool start_in_thinking) noexcept : in_thinking_(start_in_thinking) {}
+
     ThinkingSplitResult Push(std::string_view chunk) {
         ThinkingSplitResult out;
         pending_.append(chunk);
@@ -205,6 +210,25 @@ private:
     std::string pending_;
     bool in_thinking_ = false;
 };
+
+// True when the trailing trusted (parse_special) run of the prompt ends inside an
+// unclosed <think> block (Qwen3.5 / R1-Distill style generation prompts), so the
+// model's first output is reasoning and the splitter must start in thinking mode.
+inline bool PromptEndsInsideThink(const std::vector<ChatPromptSegment>& segments) {
+    std::string trailing;
+    std::size_t idx = segments.size();
+    while (idx > 0 && segments[idx - 1].parse_special) {
+        --idx;
+    }
+    for (std::size_t i = idx; i < segments.size(); ++i) {
+        trailing.append(segments[i].text);
+    }
+    static constexpr std::string_view kOpen = "<think>";
+    static constexpr std::string_view kClose = "</think>";
+    const std::size_t open = trailing.rfind(kOpen);
+    if (open == std::string::npos) return false;
+    return trailing.find(kClose, open) == std::string::npos;
+}
 
 // When thinking is explicitly disabled on Qwen3/ChatML-style templates ending
 // in `<|im_start|>assistant\n` (and not already containing `<think>`), appends

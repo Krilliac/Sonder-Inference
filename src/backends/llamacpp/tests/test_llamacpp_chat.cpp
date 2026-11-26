@@ -392,3 +392,58 @@ TEST_CASE("llamacpp chat: BuildDirectChatPromptPlan preserves interleaved multim
         CHECK(std::count(combined.begin(), combined.end(), eot_special.front()) == 1);
     }
 }
+
+TEST_CASE("llamacpp chat: splitter starts inside <think> when the generation prompt opened it") {
+    using llamacpp_detail::ChatPromptSegment;
+    using llamacpp_detail::PromptEndsInsideThink;
+    using llamacpp_detail::ThinkingStreamSplitter;
+
+    const std::vector<ChatPromptSegment> open_prompt{{"<|im_start|>user
+", true},
+                                                     {"Hi", false},
+                                                     {"<|im_end|>
+<|im_start|>assistant
+<think>
+", true}};
+    REQUIRE(PromptEndsInsideThink(open_prompt));
+
+    ThinkingStreamSplitter s(PromptEndsInsideThink(open_prompt));
+    auto r = s.Push("abc</think>answer");
+    auto f = s.Flush();
+    CHECK(r.reasoning + f.reasoning == "abc");
+    CHECK(r.text + f.text == "answer");
+
+    // Chunked across the closing tag.
+    ThinkingStreamSplitter c(true);
+    std::string reasoning;
+    std::string text;
+    for (const char* piece : {"ab", "c</th", "ink>ans", "wer"}) {
+        auto o = c.Push(piece);
+        reasoning += o.reasoning;
+        text += o.text;
+    }
+    auto cf = c.Flush();
+    reasoning += cf.reasoning;
+    text += cf.text;
+    CHECK(reasoning == "abc");
+    CHECK(text == "answer");
+
+    // Prompt that does not open <think>: default splitter behaviour unchanged.
+    const std::vector<ChatPromptSegment> plain{{"<|im_start|>assistant
+", true}};
+    CHECK_FALSE(PromptEndsInsideThink(plain));
+    ThinkingStreamSplitter d(PromptEndsInsideThink(plain));
+    auto dr = d.Push("abc</think>answer");
+    CHECK(dr.reasoning.empty());
+    CHECK(dr.text == "abc</think>answer");
+
+    // A closed think block in the prompt (no-think scaffolding) is not open.
+    const std::vector<ChatPromptSegment> closed{{"<|im_start|>assistant
+<think>
+
+</think>
+
+", true}};
+    CHECK_FALSE(PromptEndsInsideThink(closed));
+    CHECK_FALSE(PromptEndsInsideThink({}));
+}

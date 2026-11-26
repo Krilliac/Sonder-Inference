@@ -650,7 +650,12 @@ reasoning-only chunk has `reasoning_content` and no `content`, and deltas keep
 the order the backend produced them.
 
 `content` holds no reasoning only when the backend separates it. The in-process
-llamacpp backend leaves inline `<think>` text in `content`. llama-server with
+llamacpp backend separates `<think>...</think>` text into `reasoning_content`
+when the request sets separate_reasoning, including when the rendered
+generation prompt itself ended inside an open `<think>` (Qwen3.5 and
+R1-Distill style templates). Other reasoning formats (gpt-oss channels,
+`[THINK]`, `seed:think`) are not handled yet and stay in `content`. Without
+separate_reasoning, inline `<think>` text stays in `content`. llama-server with
 `--reasoning-format none` leaves the thoughts unparsed in `content`, and with
 `--reasoning-format deepseek-legacy` it keeps the `<think>` tags in `content`
 while also filling `reasoning_content`, so the client receives the reasoning
