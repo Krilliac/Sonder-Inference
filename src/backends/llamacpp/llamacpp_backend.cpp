@@ -14,6 +14,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -441,6 +442,20 @@ struct SamplerDeleter {
 };
 using SamplerPtr = std::unique_ptr<llama_sampler, SamplerDeleter>;
 
+// Accepts `tok` into a grammar sampler without letting llama.cpp's exceptions escape. A lazy grammar
+// replays the text captured since its trigger fired into the grammar stack and throws
+// std::runtime_error when that text does not fit the grammar (an eager grammar only ever accepts
+// tokens it already approved). Returns false on failure; the grammar state is then undefined and the
+// request must be failed.
+bool TryAcceptGrammar(llama_sampler* grammar, llama_token tok) noexcept {
+    try {
+        llama_sampler_accept(grammar, tok);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 // Order follows llama.cpp's common sampler: logit bias, penalties, then selector
 // (greedy or top-k/typical/top-p/min-p/temp/dist). An optional GBNF grammar is
 // returned separately so Generate() can apply fast grammar-based rejection
@@ -467,10 +482,44 @@ Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n
         llama_sampler_chain_add(chain.get(), llama_sampler_init_penalties(n_vocab, last_n, p.repeat_penalty,
                                                                           p.frequency_penalty, p.presence_penalty));
     }
+    if (p.grammar_lazy && (p.grammar.empty() || (p.trigger_patterns.empty() && p.trigger_tokens.empty()))) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "lazy grammar requires a grammar and at least one trigger pattern or token");
+    }
+    // Every preserved token must map to exactly one id. This is a deliberate divergence from
+    // llama-server, which silently skips preserved texts that do not tokenize to one id.
+    for (const std::string& text : p.preserved_tokens) {
+        llama_token id = 0;
+        const int32_t n = text.size() > static_cast<std::size_t>(INT32_MAX)
+                              ? 0
+                              : llama_tokenize(vocab, text.data(), static_cast<int32_t>(text.size()), &id, 1,
+                                               /*add_special=*/false, /*parse_special=*/true);
+        if (n != 1) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "preserved token does not map to exactly one token id: " + text);
+        }
+    }
     if (!p.grammar.empty()) {
-        llama_sampler* gram = llama_sampler_init_grammar(vocab, p.grammar.c_str(), "root");
+        llama_sampler* gram = nullptr;
+        if (p.grammar_lazy) {
+            std::vector<const char*> patterns;
+            patterns.reserve(p.trigger_patterns.size());
+            for (const std::string& pat : p.trigger_patterns) patterns.push_back(pat.c_str());
+            // llama.cpp compiles trigger regexes with std::regex, which throws on a bad pattern.
+            try {
+                gram = llama_sampler_init_grammar_lazy_patterns(
+                    vocab, p.grammar.c_str(), "root", patterns.data(), patterns.size(), p.trigger_tokens.data(),
+                    p.trigger_tokens.size());
+            } catch (const std::exception&) {
+                gram = nullptr;
+            }
+        } else {
+            gram = llama_sampler_init_grammar(vocab, p.grammar.c_str(), "root");
+        }
         if (gram == nullptr) {
-            return Status::Error(ErrorCode::kInvalidArgument, "invalid GBNF grammar");
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 p.grammar_lazy ? "invalid lazy GBNF grammar or trigger pattern"
+                                                : "invalid GBNF grammar");
         }
         grammar_out.reset(gram);
     }
@@ -1349,7 +1398,7 @@ struct LlamaCppBackend::Impl {
         llama_token_data_array single_arr{&single, 1, -1, false};
         llama_sampler_apply(grammar_sampler, &single_arr);
         if (std::isfinite(single.logit)) {
-            llama_sampler_accept(grammar_sampler, tok);
+            if (!TryAcceptGrammar(grammar_sampler, tok)) return LLAMA_TOKEN_NULL;
             llama_sampler_accept(sampler, tok);
             if (sp.compute_logprobs && out_logprob != nullptr) {
                 *out_logprob = ComputeTokenLogprobs(
@@ -1372,7 +1421,7 @@ struct LlamaCppBackend::Impl {
             return LLAMA_TOKEN_NULL;
         }
         tok = cur_p.data[cur_p.selected].id;
-        llama_sampler_accept(grammar_sampler, tok);
+        if (!TryAcceptGrammar(grammar_sampler, tok)) return LLAMA_TOKEN_NULL;
         llama_sampler_accept(sampler, tok);
         if (sp.compute_logprobs && out_logprob != nullptr) {
             *out_logprob = ComputeTokenLogprobs(
@@ -1490,6 +1539,7 @@ struct LlamaCppBackend::Impl {
 
         if (step_mode == SpeculativeVerificationMode::StochasticRejection) {
             spec_verifier.set_mode(SpeculativeVerificationMode::StochasticRejection);
+            bool grammar_accept_failed = false;
             const sonder::inference::SpeculativeSequenceResult seq = spec_verifier.verify_sequence_lazy(
                 draft_tokens, /*has_proposal_dists=*/true,
                 [&](std::size_t pos, std::vector<double>& out_p) -> bool {
@@ -1501,8 +1551,8 @@ struct LlamaCppBackend::Impl {
                     return !out_q.empty();
                 },
                 [&](std::size_t pos, std::int32_t committed_tok) {
-                    if (grammar_sampler != nullptr) {
-                        llama_sampler_accept(grammar_sampler, committed_tok);
+                    if (grammar_sampler != nullptr && !TryAcceptGrammar(grammar_sampler, committed_tok)) {
+                        grammar_accept_failed = true;
                     }
                     llama_sampler_accept(sampler, committed_tok);
                     TokenLogprobInfo lp;
@@ -1517,7 +1567,7 @@ struct LlamaCppBackend::Impl {
                     accepted_lps.push_back(std::move(lp));
                 },
                 verify_rng);
-            if (!seq.ok) {
+            if (!seq.ok || grammar_accept_failed) {
                 return false;
             }
             accepted_tokens = seq.emitted_tokens;
@@ -2611,6 +2661,43 @@ Status LlamaCppBackend::Tokenize(std::string_view text, bool add_special, std::v
         return Status::Error(ErrorCode::kTokenizeFailed, "llama_tokenize failed");
     }
     out.resize(static_cast<std::size_t>(n));
+    return Status::Ok();
+}
+
+Status LlamaCppBackend::ProbeGrammarMask(const SamplingParams& params, std::span<const Token> accepted,
+                                         std::vector<std::uint8_t>& allowed) const {
+    allowed.clear();
+    if (!IsLoaded()) return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
+    if (Status v = Validate(params); !v.ok()) return v;
+    const int32_t n_vocab = llama_vocab_n_tokens(impl_->vocab);
+    SamplerPtr chain;
+    SamplerPtr grammar;
+    if (Status s = BuildSampler(params, impl_->vocab, n_vocab, 0, chain, grammar); !s.ok()) return s;
+    allowed.assign(static_cast<std::size_t>(n_vocab), 1);
+    if (!grammar) return Status::Ok();
+    for (const Token t : accepted) {
+        if (!TryAcceptGrammar(grammar.get(), t)) {
+            allowed.clear();
+            return Status::Error(ErrorCode::kDecodeFailed, "accepted tokens violate the grammar");
+        }
+    }
+    std::vector<llama_token_data> cand(static_cast<std::size_t>(n_vocab));
+    for (int32_t i = 0; i < n_vocab; ++i) cand[static_cast<std::size_t>(i)] = llama_token_data{i, 0.0F, 0.0F};
+    llama_token_data_array arr{cand.data(), cand.size(), -1, false};
+    llama_sampler_apply(grammar.get(), &arr);
+    for (std::size_t i = 0; i < arr.size; ++i) {
+        const auto id = static_cast<std::size_t>(arr.data[i].id);
+        if (id < allowed.size()) allowed[id] = arr.data[i].logit == -std::numeric_limits<float>::infinity() ? 0 : 1;
+    }
+    // Candidates the grammar removed outright (not just set to -inf) are masked too.
+    if (arr.size < cand.size()) {
+        std::vector<std::uint8_t> kept(allowed.size(), 0);
+        for (std::size_t i = 0; i < arr.size; ++i) {
+            const auto id = static_cast<std::size_t>(arr.data[i].id);
+            if (id < kept.size()) kept[id] = allowed[id];
+        }
+        allowed.swap(kept);
+    }
     return Status::Ok();
 }
 

@@ -310,6 +310,17 @@ struct SamplingParams {
     std::vector<std::pair<Token, float>> logit_bias;  // token -> additive bias (-inf bans)
     std::uint32_t seed = 0xC0FFEEU;    // 0xFFFFFFFF = random
     std::string grammar;               // optional GBNF grammar constraining output (root rule)
+    // Lazy grammar: when grammar_lazy is set the grammar stays dormant until the output matches a
+    // trigger. trigger_patterns are regexes matched from the start of the generated text (the
+    // grammar is fed from the first capture group); trigger_tokens trigger on the token itself.
+    // A lazy grammar needs a non-empty grammar and at least one trigger.
+    bool grammar_lazy = false;
+    std::vector<std::string> trigger_patterns;
+    std::vector<Token> trigger_tokens;
+    // Texts that must each tokenize (special tokens parsed) to exactly one token id, else the
+    // request fails with kInvalidArgument. This deliberately diverges from llama-server, which
+    // silently skips such texts. Resolved once per request.
+    std::vector<std::string> preserved_tokens;
     bool compute_logprobs = false;     // compute exact log-softmax logprob for each emitted token
     std::int32_t top_logprobs = 0;     // number of top alternative logprobs (0..kMaxTopLogprobs)
 };
@@ -680,6 +691,12 @@ public:
     Status Tokenize(std::string_view text, bool add_special, std::vector<Token>& out,
                     bool parse_special = false) const;
     Status TokenToPiece(Token token, std::string& out) const;
+    // Diagnostic/test hook: builds the sampler for `params` against the loaded vocab, feeds
+    // `accepted` to its grammar sampler, then reports per vocab id whether the grammar leaves the
+    // token unmasked (1) or masked (0). Without a grammar every token is unmasked. Works on
+    // vocab-only loads. Returns the same errors Generate() would for invalid sampling params.
+    Status ProbeGrammarMask(const SamplingParams& params, std::span<const Token> accepted,
+                            std::vector<std::uint8_t>& allowed) const;
     Status Detokenize(std::span<const Token> tokens, std::string& out, bool remove_special = false,
                       bool unparse_special = false) const;
     [[nodiscard]] bool IsEndOfGeneration(Token token) const;
