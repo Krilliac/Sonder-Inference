@@ -569,10 +569,12 @@ public:
 
     // Proposes a confidence-scored dynamic draft sequence (`min_draft_len..max_draft`)
     // matching the longest suffix of `tail` (or `current_request_` + `id_last`
-    // via DraftForCurrent).
+    // via DraftForCurrent). When `external_ring` is non-null, queries that shared
+    // cross-request ring instead of this instance's internal `session_ring_`.
     [[nodiscard]] SuffixMatchResult Draft(std::span<const Token> tail, std::size_t max_draft,
                                           std::size_t min_match_len = kDefaultMinMatchLen,
-                                          std::size_t min_draft_len = 1) const {
+                                          std::size_t min_draft_len = 1,
+                                          const BoundedSuffixAutomaton* external_ring = nullptr) const {
         if (max_draft == 0 || tail.empty()) return {};
         const std::size_t capped_max = std::min<std::size_t>(max_draft, static_cast<std::size_t>(kMaxSpecDraftTokens));
         const std::size_t eff_min_draft = std::max<std::size_t>(1, min_draft_len);
@@ -583,7 +585,8 @@ public:
         const std::size_t eff_min = std::max(min_match_len, adaptive_min_match_);
         SuffixMatchResult local_match = active_.MatchLongestSuffix(
             tail, eff_min, capped_max, /*exclude_tail_tokens=*/0, draft_factor_, eff_min_draft);
-        SuffixMatchResult ring_match = session_ring_.MatchLongestSuffix(
+        const BoundedSuffixAutomaton& ring_src = (external_ring != nullptr) ? *external_ring : session_ring_;
+        SuffixMatchResult ring_match = ring_src.MatchLongestSuffix(
             tail, eff_min, capped_max, /*exclude_tail_tokens=*/0, draft_factor_, eff_min_draft);
         if (!ring_match.draft.empty()) {
             ring_match.from_session_ring = true;
@@ -603,7 +606,8 @@ public:
     // Convenience overload that queries using `current_request_` followed by
     // `id_last` (without mutating `current_request_` or `active_`).
     [[nodiscard]] SuffixMatchResult DraftForCurrent(Token id_last, std::size_t max_draft,
-                                                    std::size_t min_match_len = kDefaultMinMatchLen) {
+                                                    std::size_t min_match_len = kDefaultMinMatchLen,
+                                                    const BoundedSuffixAutomaton* external_ring = nullptr) {
         query_scratch_.clear();
         const std::size_t keep =
             std::min<std::size_t>(current_request_.size(), BoundedSuffixAutomaton::kMaxQueryLookback - 1);
@@ -611,7 +615,7 @@ public:
         query_scratch_.insert(query_scratch_.end(),
                               current_request_.begin() + static_cast<std::ptrdiff_t>(start), current_request_.end());
         query_scratch_.push_back(id_last);
-        return Draft(query_scratch_, max_draft, min_match_len);
+        return Draft(query_scratch_, max_draft, min_match_len, /*min_draft_len=*/1, external_ring);
     }
 
     // Hybrid `draft-mtp` + `suffix` escalation:
@@ -619,12 +623,14 @@ public:
     // least 6 continuation tokens available (capped at min(max_k, 16)), returns
     // the burst draft (6..16 tokens); otherwise returns an empty draft so the
     // caller falls back cleanly to standard `draft-mtp`.
-    [[nodiscard]] SuffixMatchResult TryHybridMtpBurst(std::span<const Token> tail, std::size_t max_k) const {
+    [[nodiscard]] SuffixMatchResult TryHybridMtpBurst(std::span<const Token> tail, std::size_t max_k,
+                                                      const BoundedSuffixAutomaton* external_ring = nullptr) const {
         if (max_k < kHybridMtpMinBurstDraft || tail.size() < kHybridMtpMinMatchLen) {
             return {};
         }
         const std::size_t burst_cap = std::min<std::size_t>(max_k, kHybridMtpMaxBurstDraft);
-        SuffixMatchResult match = Draft(tail, burst_cap, kHybridMtpMinMatchLen, kHybridMtpMinBurstDraft);
+        SuffixMatchResult match =
+            Draft(tail, burst_cap, kHybridMtpMinMatchLen, kHybridMtpMinBurstDraft, external_ring);
         if (match.match_len < kHybridMtpMinMatchLen || match.confidence < kHybridMtpMinConfidence ||
             match.draft.size() < kHybridMtpMinBurstDraft) {
             return {};
@@ -635,7 +641,8 @@ public:
         return match;
     }
 
-    [[nodiscard]] SuffixMatchResult TryHybridMtpBurstForCurrent(Token id_last, std::size_t max_k) {
+    [[nodiscard]] SuffixMatchResult TryHybridMtpBurstForCurrent(Token id_last, std::size_t max_k,
+                                                                const BoundedSuffixAutomaton* external_ring = nullptr) {
         if (max_k < kHybridMtpMinBurstDraft || current_request_.size() + 1 < kHybridMtpMinMatchLen) {
             return {};
         }
@@ -646,7 +653,7 @@ public:
         query_scratch_.insert(query_scratch_.end(),
                               current_request_.begin() + static_cast<std::ptrdiff_t>(start), current_request_.end());
         query_scratch_.push_back(id_last);
-        return TryHybridMtpBurst(query_scratch_, max_k);
+        return TryHybridMtpBurst(query_scratch_, max_k, external_ring);
     }
 
     void NoteSkippedStep() noexcept {
@@ -778,6 +785,8 @@ public:
     [[nodiscard]] std::size_t active_size() const noexcept { return active_.size(); }
     [[nodiscard]] std::size_t session_ring_size() const noexcept { return session_ring_.size(); }
     [[nodiscard]] std::size_t session_ring_capacity() const noexcept { return session_ring_.capacity(); }
+    [[nodiscard]] const BoundedSuffixAutomaton& session_ring() const noexcept { return session_ring_; }
+    [[nodiscard]] const std::vector<Token>& current_request() const noexcept { return current_request_; }
     [[nodiscard]] std::uint64_t session_ring_compactions() const noexcept { return session_ring_.compactions(); }
     [[nodiscard]] double acceptance_ema() const noexcept { return acceptance_ema_; }
     [[nodiscard]] double draft_factor() const noexcept { return draft_factor_; }

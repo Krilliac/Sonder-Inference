@@ -230,6 +230,15 @@ struct LoadOptions {
     // interactive/foreground decoding slots when a request does not specify an
     // explicit `target_itl_ms` (0 disables the implicit foreground ITL cap).
     double default_foreground_itl_ms = 50.0;
+    // Consecutive sustained single-request decode steps required after batch
+    // suspension before reactivating per-request speculation (0..1024).
+    std::uint32_t spec_reactivation_cooldown_steps = 4;
+    // Opt-in bounded small-batch concurrent linear speculation (default false).
+    bool spec_batch_enabled = false;
+    // Maximum active decode slots eligible for concurrent linear speculation (1..kMaxSlots).
+    std::uint32_t spec_batch_max_slots = 4;
+    // Maximum aggregate draft tokens verified across all concurrent slots per step (0 = default 16).
+    std::int32_t spec_batch_max_aggregate_draft_tokens = 16;
 };
 
 // Checks placement options (main_gpu >= 0, split_mode, tensor_split finite /
