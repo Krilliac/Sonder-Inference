@@ -27,6 +27,7 @@ sonder_add_module_tests(core
     test_recurrent_checkpoints.cpp
     test_speculative_verifier.cpp
     test_batch_scheduler.cpp
+    test_speculation_transition.cpp
 )
 
 if(TARGET sonder_core_tests)

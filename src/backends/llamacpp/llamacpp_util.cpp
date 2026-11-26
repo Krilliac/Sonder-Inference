@@ -402,6 +402,24 @@ Status ValidateContextOptions(const LoadOptions& options) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "unknown spec_verification_mode (expected target_match or stochastic_rejection)");
     }
+    if (options.spec_reactivation_cooldown_steps > 1024u) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "spec_reactivation_cooldown_steps (" +
+                                 std::to_string(options.spec_reactivation_cooldown_steps) + ") must be <= 1024");
+    }
+    if (options.spec_batch_max_slots < 1u || options.spec_batch_max_slots > kMaxSlots) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "spec_batch_max_slots (" + std::to_string(options.spec_batch_max_slots) +
+                                 ") must be in [1, " + std::to_string(kMaxSlots) + "]");
+    }
+    const std::int32_t max_agg_drafts = kMaxSpecDraftTokens * static_cast<std::int32_t>(kMaxSlots);
+    if (options.spec_batch_max_aggregate_draft_tokens < 0 ||
+        options.spec_batch_max_aggregate_draft_tokens > max_agg_drafts) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "spec_batch_max_aggregate_draft_tokens (" +
+                                 std::to_string(options.spec_batch_max_aggregate_draft_tokens) +
+                                 ") must be in [0, " + std::to_string(max_agg_drafts) + "]");
+    }
     if (options.cache_ram_mib > kMaxCacheRamMiB) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "cache_ram_mib (" + std::to_string(options.cache_ram_mib) + ") must be <= " +

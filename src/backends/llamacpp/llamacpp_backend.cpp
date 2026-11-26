@@ -30,6 +30,7 @@
 #include "batch_scheduler.hpp"
 #include "prefix_coalescer.hpp"
 #include "radix_cache.hpp"
+#include "speculation_transition.hpp"
 #include "suffix_matcher.hpp"
 
 #include "ggml-backend.h"
@@ -504,6 +505,8 @@ struct LlamaCppBackend::Impl {
     // Reusable decode batch allocated once at Load() time (zero per-step allocs).
     llama_batch batch{};
     int32_t batch_cap = 0;
+    int32_t ctx_outputs_max = 0;
+    int32_t ctx_outputs_max_per_seq = 0;
     bool batch_allocated = false;
     std::vector<llama_token_data> grammar_candidates;
 
@@ -531,6 +534,9 @@ struct LlamaCppBackend::Impl {
     std::uint64_t swa_window = 0;
     std::uint64_t swa_retained_slack = 0;
     bool swa_compact_active = false;
+    // Target KV position corresponding to the currently captured `mtp_pending_h[slot_idx]`
+    // (-1 when not captured or invalidated after drift/reset).
+    std::vector<int64_t> slot_mtp_pending_h_pos;
     std::vector<std::vector<PartialCheckpoint>> slot_checkpoints;
     std::size_t total_checkpoint_bytes = 0;
     std::uint64_t checkpoint_clock = 0;
@@ -614,6 +620,7 @@ struct LlamaCppBackend::Impl {
     std::condition_variable worker_cv;
     std::deque<PendingRequest*> pending_queue;
     std::atomic<std::size_t> pending_count{0};
+    std::atomic<std::size_t> pending_exclusive_count{0};
     std::atomic<bool> worker_stop{false};
     std::atomic<bool> batch_worker_running{false};
     std::thread batch_worker;
@@ -759,6 +766,7 @@ struct LlamaCppBackend::Impl {
             slots[i].last_used = 0;
             if (i < slot_mtp_synced.size()) slot_mtp_synced[i] = false;
             if (i < slot_swa_guards.size()) slot_swa_guards[i].Reset();
+            if (i < slot_mtp_pending_h_pos.size()) slot_mtp_pending_h_pos[i] = -1;
         }
         for (auto& ckpts : slot_checkpoints) {
             ckpts.clear();
@@ -790,6 +798,7 @@ struct LlamaCppBackend::Impl {
         batch_worker_running.store(false, std::memory_order_release);
         worker_stop.store(false, std::memory_order_relaxed);
         pending_count.store(0, std::memory_order_relaxed);
+        pending_exclusive_count.store(0, std::memory_order_relaxed);
     }
 
     void StartBatchWorker();
@@ -858,6 +867,8 @@ struct LlamaCppBackend::Impl {
             llama_batch_free(batch);
             batch = {};
             batch_cap = 0;
+            ctx_outputs_max = 0;
+            ctx_outputs_max_per_seq = 0;
             batch_allocated = false;
         }
         if (ctx != nullptr) {
@@ -872,6 +883,11 @@ struct LlamaCppBackend::Impl {
         slots.clear();
         slot_busy.clear();
         slot_mtp_synced.clear();
+        slot_swa_guards.clear();
+        swa_window = 0;
+        swa_retained_slack = 0;
+        swa_compact_active = false;
+        slot_mtp_pending_h_pos.clear();
         slot_checkpoints.clear();
         radix_cache.Clear();
         radix_cache.restore_cost_gate().Reset();
@@ -997,6 +1013,9 @@ struct LlamaCppBackend::Impl {
             best->pending_h.size() == mtp_pending_h[slot_idx].size()) {
             mtp_pending_h[slot_idx] = best->pending_h;
             restored_pending_h = true;
+            if (slot_idx < slot_mtp_pending_h_pos.size()) {
+                slot_mtp_pending_h_pos[slot_idx] = static_cast<int64_t>(restored_tokens);
+            }
         }
         if (slot_idx < mtp_deferred.size()) {
             mtp_deferred[slot_idx].Clear();
@@ -1182,10 +1201,14 @@ struct LlamaCppBackend::Impl {
         if (ctx_dft != nullptr && slot_idx < mtp_pending_h.size()) {
             mtp_deferred[slot_idx].Clear();
             std::fill(mtp_pending_h[slot_idx].begin(), mtp_pending_h[slot_idx].end(), 0.0F);
+            if (slot_idx < slot_mtp_pending_h_pos.size()) slot_mtp_pending_h_pos[slot_idx] = -1;
             if (mtp_mem_shared) {
                 if (hit.state_tokens() == hit.matched_tokens() &&
                     entry->mtp_pending_h.size() == mtp_pending_h[slot_idx].size()) {
                     mtp_pending_h[slot_idx] = entry->mtp_pending_h;
+                    if (slot_idx < slot_mtp_pending_h_pos.size()) {
+                        slot_mtp_pending_h_pos[slot_idx] = static_cast<int64_t>(hit.matched_tokens());
+                    }
                 }
                 out_mtp_synced = true;
             } else if (!entry->dft_state_blob.empty()) {
@@ -1201,6 +1224,9 @@ struct LlamaCppBackend::Impl {
                     if (hit.state_tokens() == hit.matched_tokens() &&
                         entry->mtp_pending_h.size() == mtp_pending_h[slot_idx].size()) {
                         mtp_pending_h[slot_idx] = entry->mtp_pending_h;
+                        if (slot_idx < slot_mtp_pending_h_pos.size()) {
+                            slot_mtp_pending_h_pos[slot_idx] = static_cast<int64_t>(hit.matched_tokens());
+                        }
                     }
                     out_mtp_synced = true;
                 } else {
@@ -1851,6 +1877,9 @@ struct LlamaCppBackend::Impl {
         const float* h_last = llama_get_embeddings_nextn_ith(ctx, n_tokens - 1);
         if (h_last == nullptr) return false;
         std::memcpy(mtp_pending_h[sidx].data(), h_last, row_bytes);
+        if (sidx < slot_mtp_pending_h_pos.size()) {
+            slot_mtp_pending_h_pos[sidx] = static_cast<int64_t>(batch_in.pos[n_tokens - 1]) + 1;
+        }
         return true;
     }
 
@@ -1896,6 +1925,9 @@ struct LlamaCppBackend::Impl {
             }
             d.pending = true;
             std::memcpy(mtp_pending_h[sidx].data(), h_new_pending, row_bytes);
+            if (sidx < slot_mtp_pending_h_pos.size()) {
+                slot_mtp_pending_h_pos[sidx] = static_cast<int64_t>(batch_in.pos[n_valid - 1]) + 1;
+            }
             return true;
         }
 
@@ -1936,6 +1968,9 @@ struct LlamaCppBackend::Impl {
         }
 
         std::memcpy(mtp_pending_h[sidx].data(), h_new_pending, row_bytes);
+        if (sidx < slot_mtp_pending_h_pos.size()) {
+            slot_mtp_pending_h_pos[sidx] = static_cast<int64_t>(batch_in.pos[n_valid - 1]) + 1;
+        }
         return true;
     }
 
@@ -2291,6 +2326,17 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
         const auto cap = static_cast<int32_t>(std::max<uint32_t>(1, llama_n_batch(impl_->ctx)));
         impl_->batch = llama_batch_init(cap, /*embd=*/0, /*n_seq_max=*/1);
         impl_->batch_cap = cap;
+#if defined(SONDER_LLAMACPP_HAS_N_OUTPUTS_MAX)
+        impl_->ctx_outputs_max =
+            cp.n_outputs_max > 0 ? std::min<int32_t>(cap, static_cast<int32_t>(cp.n_outputs_max)) : cap;
+        impl_->ctx_outputs_max_per_seq =
+            cp.n_outputs_max_per_seq > 0
+                ? std::min<int32_t>(impl_->ctx_outputs_max, static_cast<int32_t>(cp.n_outputs_max_per_seq))
+                : impl_->ctx_outputs_max;
+#else
+        impl_->ctx_outputs_max = cap;
+        impl_->ctx_outputs_max_per_seq = cap;
+#endif
         impl_->batch_allocated = true;
 
         // Initialize per-slot KV prefix cache metadata & L2 host-RAM Radix cache.
@@ -2306,6 +2352,7 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
         for (auto& guard : impl_->slot_swa_guards) {
             guard.Configure(options.swa_kv_mode, impl_->swa_window, impl_->swa_retained_slack, swa_qualified);
         }
+        impl_->slot_mtp_pending_h_pos.assign(n_slots, -1);
         impl_->slot_checkpoints.assign(n_slots, {});
         for (std::uint32_t i = 0; i < n_slots; ++i) {
             impl_->slots[i].id = static_cast<std::int32_t>(i);
@@ -2896,6 +2943,9 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
             }
             impl_->pending_queue.push_back(&task);
             impl_->pending_count.fetch_add(1, std::memory_order_release);
+            if (exclusive) {
+                impl_->pending_exclusive_count.fetch_add(1, std::memory_order_release);
+            }
         }
         impl_->worker_cv.notify_one();
 
@@ -3052,6 +3102,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                         llama_memory_seq_rm(llama_get_memory(ctx_dft), slot_id, -1, -1);
                     }
                     std::fill(mtp_pending_h[slot_idx].begin(), mtp_pending_h[slot_idx].end(), 0.0F);
+                    if (slot_idx < slot_mtp_pending_h_pos.size()) slot_mtp_pending_h_pos[slot_idx] = -1;
                     mtp_deferred[slot_idx].Clear();
                 }
 #endif
@@ -3086,6 +3137,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                             llama_memory_seq_rm(llama_get_memory(ctx_dft), slot_id, -1, -1);
                         }
                         std::fill(mtp_pending_h[slot_idx].begin(), mtp_pending_h[slot_idx].end(), 0.0F);
+                        if (slot_idx < slot_mtp_pending_h_pos.size()) slot_mtp_pending_h_pos[slot_idx] = -1;
                         mtp_deferred[slot_idx].Clear();
                         if (slot_idx < slot_mtp_synced.size()) slot_mtp_synced[slot_idx] = true;
                     } else {
@@ -3109,6 +3161,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                                 llama_memory_seq_rm(llama_get_memory(ctx_dft), slot_id, -1, -1);
                                 ClearSlotCheckpoints(slot_idx);
                                 std::fill(mtp_pending_h[slot_idx].begin(), mtp_pending_h[slot_idx].end(), 0.0F);
+                                if (slot_idx < slot_mtp_pending_h_pos.size()) slot_mtp_pending_h_pos[slot_idx] = -1;
                                 lcp = 0;
                             } else if (dft_len > static_cast<int64_t>(lcp)) {
                                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot_id,
@@ -3117,12 +3170,14 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                                     llama_memory_seq_rm(llama_get_memory(ctx_dft), slot_id, -1, -1);
                                     ClearSlotCheckpoints(slot_idx);
                                     std::fill(mtp_pending_h[slot_idx].begin(), mtp_pending_h[slot_idx].end(), 0.0F);
+                                    if (slot_idx < slot_mtp_pending_h_pos.size()) slot_mtp_pending_h_pos[slot_idx] = -1;
                                     lcp = 0;
                                 }
                             }
                         }
                         if (lcp > 0 && lcp != prev_slot_len && !restored_pending_h) {
                             std::fill(mtp_pending_h[slot_idx].begin(), mtp_pending_h[slot_idx].end(), 0.0F);
+                            if (slot_idx < slot_mtp_pending_h_pos.size()) slot_mtp_pending_h_pos[slot_idx] = -1;
                         }
                         if (slot_idx < slot_mtp_synced.size()) slot_mtp_synced[slot_idx] = true;
                     }
@@ -3249,6 +3304,9 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         }
         if (slot_idx < slot_mtp_synced.size()) {
             slot_mtp_synced[slot_idx] = false;
+        }
+        if (slot_idx < slot_mtp_pending_h_pos.size()) {
+            slot_mtp_pending_h_pos[slot_idx] = -1;
         }
         ClearSlotCheckpoints(slot_idx);
 #if defined(SONDER_LLAMACPP_HAS_MTP)
@@ -3885,6 +3943,20 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         std::mt19937_64 verify_rng{};
         std::size_t ngram_indexed = 0;
         int32_t batch_logit_idx = -1;
+        // Per-request isolated speculation transition state, exact committed
+        // token history, local drafters, and proposal/verification buffers.
+        SpeculationTransitionState spec_transition;
+        std::vector<Token> committed_tokens;
+        std::unique_ptr<SuffixMatcher> local_suffix_matcher;
+        std::unique_ptr<NgramMatcher> local_ngram_matcher;
+        bool local_matcher_synced = false;
+        std::vector<Token> draft_tokens;
+        std::vector<Token> accepted_tokens;
+        std::vector<TokenLogprobInfo> accepted_lps;
+        int32_t batch_start_idx = -1;
+        std::size_t step_n_accepted = 0;
+        bool step_sample_deadlock = false;
+        SlotSpecMode concurrent_step_mode = SlotSpecMode::kNone;
         GenerateResult result{};
 
         [[nodiscard]] bool IsCancelled() const {
@@ -3900,6 +3972,22 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
     const auto n_ubatch = static_cast<int32_t>(std::max<uint32_t>(1u, llama_n_ubatch(ctx)));
     const int32_t step_token_budget = std::min<int32_t>(n_batch, n_ubatch);
     const int32_t step_output_budget = std::max<int32_t>(1, static_cast<int32_t>(slots.size()));
+    const int32_t concurrent_output_budget =
+        std::min<int32_t>(step_token_budget, ctx_outputs_max > 0 ? ctx_outputs_max : step_token_budget);
+    const int32_t per_seq_output_budget =
+        std::min<int32_t>(concurrent_output_budget,
+                          ctx_outputs_max_per_seq > 0 ? ctx_outputs_max_per_seq : concurrent_output_budget);
+
+    SpeculationReactivationPolicy reactivation_policy;
+    reactivation_policy.cooldown_steps = options.spec_reactivation_cooldown_steps;
+
+    ConcurrentSpecPolicy concurrent_spec_policy;
+    concurrent_spec_policy.enabled = options.spec_batch_enabled;
+    concurrent_spec_policy.max_concurrent_slots = std::clamp<std::uint32_t>(options.spec_batch_max_slots, 1u, kMaxSlots);
+    concurrent_spec_policy.max_aggregate_draft_tokens =
+        options.spec_batch_max_aggregate_draft_tokens > 0 ? options.spec_batch_max_aggregate_draft_tokens : 16;
+    ConcurrentSpecCostGate concurrent_cost_gate;
+    std::size_t conc_rr_cursor = 0;
 
     uint32_t rs_cap = 0;
 #if defined(SONDER_LLAMACPP_HAS_N_RS_SEQ)
@@ -3970,12 +4058,18 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                             fprompt.begin(),
                             fprompt.begin() + static_cast<std::ptrdiff_t>(act.clone_prefix_len));
                         slots[follower->slot_idx].last_used = ++slot_clock;
+                        follower->committed_tokens.assign(
+                            fprompt.begin(),
+                            fprompt.begin() + static_cast<std::ptrdiff_t>(act.clone_prefix_len));
                         follower->prefill_offset = act.clone_prefix_len;
                         follower->pos = static_cast<int64_t>(act.clone_prefix_len);
                         follower->result.cached_tokens = static_cast<std::int32_t>(
                             std::min<std::size_t>(act.clone_prefix_len, static_cast<std::size_t>(INT32_MAX)));
                         if (follower->slot_idx < slot_mtp_synced.size()) {
                             slot_mtp_synced[follower->slot_idx] = false;
+                        }
+                        if (follower->slot_idx < slot_mtp_pending_h_pos.size()) {
+                            slot_mtp_pending_h_pos[follower->slot_idx] = -1;
                         }
 #if defined(SONDER_LLAMACPP_HAS_MTP)
                         if (ctx_dft != nullptr && follower->slot_idx < mtp_pending_h.size()) {
@@ -3992,11 +4086,15 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     } else {
                         llama_memory_seq_rm(mem, follower->slot_id, -1, -1);
                         slots[follower->slot_idx].tokens.clear();
+                        follower->committed_tokens.clear();
                         follower->prefill_offset = 0;
                         follower->pos = 0;
                         follower->result.cached_tokens = 0;
                         if (follower->slot_idx < slot_mtp_synced.size()) {
                             slot_mtp_synced[follower->slot_idx] = false;
+                        }
+                        if (follower->slot_idx < slot_mtp_pending_h_pos.size()) {
+                            slot_mtp_pending_h_pos[follower->slot_idx] = -1;
                         }
                     }
                 }
@@ -4006,6 +4104,104 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             }
         }
         SyncCoalescerStats();
+    };
+
+    auto sync_slot_flags_from_transition = [](ActiveBatchSlot& s) noexcept {
+        const SlotSpecMode m = s.spec_transition.active_mode();
+        s.mtp_enabled = (m == SlotSpecMode::kDraftMtp);
+        s.hybrid_suffix_enabled = (m == SlotSpecMode::kDraftMtp) && s.spec_transition.active_hybrid_suffix();
+        s.suffix_enabled = (m == SlotSpecMode::kSuffix);
+        s.ngram_mod_enabled = (m == SlotSpecMode::kNgramMod);
+        s.ngram_short_enabled = (m == SlotSpecMode::kNgramShort);
+        s.effective_draft_max = s.spec_transition.active_draft_max();
+    };
+
+    auto mark_slot_mtp_drifted = [&](ActiveBatchSlot& s) noexcept {
+        if (s.slot_idx < slot_mtp_synced.size()) {
+            slot_mtp_synced[s.slot_idx] = false;
+        }
+        if (s.slot_idx < slot_mtp_pending_h_pos.size()) {
+            slot_mtp_pending_h_pos[s.slot_idx] = -1;
+        }
+#if defined(SONDER_LLAMACPP_HAS_MTP)
+        if (s.slot_idx < mtp_deferred.size()) {
+            mtp_deferred[s.slot_idx].Clear();
+        }
+#endif
+    };
+
+    auto build_mtp_readiness = [&](const ActiveBatchSlot& s) -> MtpReadinessState {
+        MtpReadinessState st;
+        st.slot_valid = s.slot_valid;
+        st.target_pos = s.pos;
+        st.slot_mtp_synced = (s.slot_idx < slot_mtp_synced.size()) ? slot_mtp_synced[s.slot_idx] : false;
+        st.pending_features_pos =
+            (s.slot_idx < slot_mtp_pending_h_pos.size()) ? slot_mtp_pending_h_pos[s.slot_idx] : -1;
+        st.pending_features_valid = (st.pending_features_pos >= 0);
+#if defined(SONDER_LLAMACPP_HAS_MTP)
+        st.draft_ctx_available = (ctx_dft != nullptr);
+        st.mem_shared = mtp_mem_shared;
+        st.pending_features_size_ok =
+            (mtp_n_embd > 0) && (s.slot_idx < mtp_pending_h.size()) &&
+            (mtp_pending_h[s.slot_idx].size() == static_cast<std::size_t>(mtp_n_embd));
+        if (ctx_dft != nullptr && !mtp_mem_shared) {
+            st.draft_pos = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), s.slot_id) + 1;
+            if (s.slot_idx < mtp_deferred.size() && mtp_deferred[s.slot_idx].pending) {
+                const auto& d = mtp_deferred[s.slot_idx];
+                st.has_deferred = true;
+                st.deferred_count = d.tokens.size();
+                if (!d.pos.empty()) {
+                    st.deferred_first_pos = static_cast<std::int64_t>(d.pos.front());
+                    st.deferred_last_pos = static_cast<std::int64_t>(d.pos.back());
+                }
+            }
+        } else if (ctx_dft != nullptr && mtp_mem_shared) {
+            st.draft_pos = s.pos;
+        }
+#endif
+        return st;
+    };
+
+    auto rebuild_slot_history_drafter = [&](ActiveBatchSlot& s, SlotSpecMode mode, bool enable_hybrid_suffix) -> bool {
+        if (!s.slot_valid || s.pos <= 0 || s.committed_tokens.size() != static_cast<std::size_t>(s.pos)) {
+            return false;
+        }
+        if (mode == SlotSpecMode::kSuffix || enable_hybrid_suffix) {
+            if (!s.local_suffix_matcher) {
+                s.local_suffix_matcher = std::make_unique<SuffixMatcher>(
+                    BoundedSuffixAutomaton::kMinCapacity, BoundedSuffixAutomaton::kDefaultCapacity);
+            }
+            s.local_suffix_matcher->BeginRequest(s.committed_tokens);
+        }
+        if (mode == SlotSpecMode::kNgramMod) {
+            if (ngram_mod == nullptr) return false;
+            ngram_mod->BeginRequest(s.committed_tokens);
+            s.ngram_indexed = s.committed_tokens.size() > ngram_mod->n_match()
+                                  ? s.committed_tokens.size() - ngram_mod->n_match()
+                                  : 0;
+        } else if (mode == SlotSpecMode::kNgramShort) {
+            if (!s.local_ngram_matcher) {
+                s.local_ngram_matcher = std::make_unique<NgramMatcher>(/*exact_scan_fallback=*/true);
+            }
+            s.local_ngram_matcher->Reset();
+            s.local_ngram_matcher->IndexRange(s.committed_tokens, 0, s.committed_tokens.size());
+            s.ngram_indexed = s.committed_tokens.size();
+        }
+        s.spec_initialized = true;
+        s.local_matcher_synced = true;
+        s.spec_transition.MarkHistorySynced(true);
+        return true;
+    };
+
+    auto suspend_slot_for_batch = [&](ActiveBatchSlot& s, SpecSuspendReason reason) {
+        if (s.local_suffix_matcher != nullptr) {
+            s.local_suffix_matcher->ClearActive();
+        }
+        s.spec_transition.SuspendForBatch(reason);
+        sync_slot_flags_from_transition(s);
+        s.spec_initialized = false;
+        s.local_matcher_synced = false;
+        s.batch_logit_idx = -1;
     };
 
     auto complete_task = [](PendingRequest* task, GenerateResult&& res) {
@@ -4032,8 +4228,13 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 
     auto invalidate_slot = [&](ActiveBatchSlot& s) {
         s.slot_valid = false;
-        s.mtp_enabled = false;
-        s.hybrid_suffix_enabled = false;
+        s.spec_transition.MarkSlotInvalidated();
+        sync_slot_flags_from_transition(s);
+        s.committed_tokens.clear();
+        s.local_matcher_synced = false;
+        if (s.local_suffix_matcher != nullptr) {
+            s.local_suffix_matcher->ClearActive();
+        }
         if (prefix_coalescer.IsEnabled()) {
             (void)prefix_coalescer.OnSlotRemoved(s.slot_idx);
             SyncCoalescerStats();
@@ -4047,6 +4248,9 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         }
         if (s.slot_idx < slot_mtp_synced.size()) {
             slot_mtp_synced[s.slot_idx] = false;
+        }
+        if (s.slot_idx < slot_mtp_pending_h_pos.size()) {
+            slot_mtp_pending_h_pos[s.slot_idx] = -1;
         }
         ClearSlotCheckpoints(s.slot_idx);
 #if defined(SONDER_LLAMACPP_HAS_MTP)
@@ -4094,14 +4298,17 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             s.result.prefill_ms = MsSince(s.prefill_start);
         }
         if (reason != StopReason::kError) {
-            if (s.ngram_mod_enabled && s.spec_initialized && ngram_mod != nullptr) {
-                s.ngram_indexed = ngram_mod->IndexRange(ngram_history, s.ngram_indexed, ngram_history.size());
+            if ((s.ngram_mod_enabled || s.spec_transition.configured_mode() == SlotSpecMode::kNgramMod) &&
+                ngram_mod != nullptr && !s.committed_tokens.empty()) {
+                s.ngram_indexed =
+                    ngram_mod->IndexRange(s.committed_tokens, s.ngram_indexed, s.committed_tokens.size());
             }
-            if ((s.suffix_enabled || s.hybrid_suffix_enabled) && s.spec_initialized && suffix_matcher != nullptr) {
-                suffix_matcher->EndRequest();
-            } else if (suffix_matcher != nullptr && s.slot_valid && s.slot_idx < slots.size() &&
-                       !slots[s.slot_idx].tokens.empty()) {
-                suffix_matcher->IngestSessionSequence(slots[s.slot_idx].tokens);
+            if (suffix_matcher != nullptr) {
+                if (s.slot_valid && s.slot_idx < slots.size() && !slots[s.slot_idx].tokens.empty()) {
+                    suffix_matcher->IngestSessionSequence(slots[s.slot_idx].tokens);
+                } else if (!s.committed_tokens.empty()) {
+                    suffix_matcher->IngestSessionSequence(s.committed_tokens);
+                }
             }
         }
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
@@ -4221,6 +4428,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     if (ctx_dft != nullptr && s->slot_idx < mtp_pending_h.size()) {
                         mtp_deferred[s->slot_idx].Clear();
                         std::fill(mtp_pending_h[s->slot_idx].begin(), mtp_pending_h[s->slot_idx].end(), 0.0F);
+                        if (s->slot_idx < slot_mtp_pending_h_pos.size()) slot_mtp_pending_h_pos[s->slot_idx] = -1;
                         if (mtp_mem_shared) {
                             l2_mtp_synced = true;
                         } else {
@@ -4251,6 +4459,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     lcp = 0;
                     slots[s->slot_idx].tokens.clear();
                     if (s->slot_idx < slot_mtp_synced.size()) slot_mtp_synced[s->slot_idx] = false;
+                    if (s->slot_idx < slot_mtp_pending_h_pos.size()) slot_mtp_pending_h_pos[s->slot_idx] = -1;
                 }
             }
         }
@@ -4270,6 +4479,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 lcp = 0;
                 slots[s->slot_idx].tokens.clear();
                 if (s->slot_idx < slot_mtp_synced.size()) slot_mtp_synced[s->slot_idx] = false;
+                if (s->slot_idx < slot_mtp_pending_h_pos.size()) slot_mtp_pending_h_pos[s->slot_idx] = -1;
             }
         }
 
@@ -4279,6 +4489,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 ResetSwaSlot(s->slot_idx);
                 ClearSlotCheckpoints(s->slot_idx);
                 if (s->slot_idx < slot_mtp_synced.size()) slot_mtp_synced[s->slot_idx] = true;
+                if (s->slot_idx < slot_mtp_pending_h_pos.size()) slot_mtp_pending_h_pos[s->slot_idx] = -1;
 #if defined(SONDER_LLAMACPP_HAS_MTP)
                 if (ctx_dft != nullptr) {
                     if (!mtp_mem_shared) {
@@ -4319,6 +4530,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                             llama_memory_seq_rm(llama_get_memory(ctx_dft), s->slot_id, -1, -1);
                         }
                         std::fill(mtp_pending_h[s->slot_idx].begin(), mtp_pending_h[s->slot_idx].end(), 0.0F);
+                        if (s->slot_idx < slot_mtp_pending_h_pos.size()) slot_mtp_pending_h_pos[s->slot_idx] = -1;
                         mtp_deferred[s->slot_idx].Clear();
                         if (s->slot_idx < slot_mtp_synced.size()) slot_mtp_synced[s->slot_idx] = true;
                     } else {
@@ -4329,6 +4541,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                                 llama_memory_seq_rm(llama_get_memory(ctx_dft), s->slot_id, -1, -1);
                             }
                             std::fill(mtp_pending_h[s->slot_idx].begin(), mtp_pending_h[s->slot_idx].end(), 0.0F);
+                            if (s->slot_idx < slot_mtp_pending_h_pos.size()) slot_mtp_pending_h_pos[s->slot_idx] = -1;
                             mtp_deferred[s->slot_idx].Clear();
                         } else if (!mtp_mem_shared) {
                             auto& d = mtp_deferred[s->slot_idx];
@@ -4351,11 +4564,13 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                                                       static_cast<llama_pos>(lcp), -1))) {
                                 llama_memory_seq_rm(llama_get_memory(ctx_dft), s->slot_id, -1, -1);
                                 std::fill(mtp_pending_h[s->slot_idx].begin(), mtp_pending_h[s->slot_idx].end(), 0.0F);
+                                if (s->slot_idx < slot_mtp_pending_h_pos.size()) slot_mtp_pending_h_pos[s->slot_idx] = -1;
                                 if (s->slot_idx < slot_mtp_synced.size()) slot_mtp_synced[s->slot_idx] = false;
                             }
                         }
                         if (lcp > 0 && lcp != prev_slot_len && !restored_pending_h) {
                             std::fill(mtp_pending_h[s->slot_idx].begin(), mtp_pending_h[s->slot_idx].end(), 0.0F);
+                            if (s->slot_idx < slot_mtp_pending_h_pos.size()) slot_mtp_pending_h_pos[s->slot_idx] = -1;
                         }
                     }
                 }
@@ -4382,48 +4597,41 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         slots[s->slot_idx].tokens.resize(lcp);
         slots[s->slot_idx].session_key = req.session_key;
         slots[s->slot_idx].last_used = ++slot_clock;
+        s->committed_tokens.assign(slots[s->slot_idx].tokens.begin(), slots[s->slot_idx].tokens.end());
 
+        SlotSpecCapability cap;
+        cap.architecture = architecture;
+        cap.hybrid_rs_cap = static_cast<std::int32_t>(rs_cap);
+        cap.can_hybrid_spec_ckpt = can_hybrid_spec_ckpt;
+        cap.fallback_suffix_draft_max =
+            options.spec_draft_max > 0 ? options.spec_draft_max : kDefaultSuffixDraftMax;
 #if defined(SONDER_LLAMACPP_HAS_MTP)
         const bool mtp_ok = (active_spec == SpeculativeType::kDraftMtp) && (ctx_dft != nullptr) &&
                             (!restored_from_l2 || l2_mtp_synced) &&
                             (s->slot_idx < slot_mtp_synced.size() && slot_mtp_synced[s->slot_idx]);
-        s->mtp_enabled = mtp_ok;
+        if (mtp_ok && active_draft_max > 0) {
+            cap.configured_mode = SlotSpecMode::kDraftMtp;
+            cap.configured_draft_max = active_draft_max;
+            cap.hybrid_suffix_configured = (suffix_matcher != nullptr);
+            cap.suffix_fallback_available = (suffix_matcher != nullptr);
+        }
 #else
         (void)l2_mtp_synced;
-        s->mtp_enabled = false;
 #endif
-        s->hybrid_suffix_enabled = s->mtp_enabled && (suffix_matcher != nullptr);
-        s->suffix_enabled = !s->mtp_enabled && (active_spec == SpeculativeType::kSuffix) && (suffix_matcher != nullptr) &&
-                            active_draft_max > 0;
-        s->ngram_mod_enabled = !s->mtp_enabled && !s->suffix_enabled && (active_spec == SpeculativeType::kNgramMod) &&
-                               (ngram_mod != nullptr) && active_draft_max > 0;
-        s->ngram_short_enabled = !s->mtp_enabled && !s->suffix_enabled && (active_spec == SpeculativeType::kNgram) &&
-                                 active_draft_max > 0;
-        s->effective_draft_max = active_draft_max;
-        if (architecture == sonder::inference::ModelArchitecture::recurrent) {
-            s->mtp_enabled = false;
-            s->hybrid_suffix_enabled = false;
-            s->suffix_enabled = false;
-            s->ngram_mod_enabled = false;
-            s->ngram_short_enabled = false;
-            s->effective_draft_max = 0;
-        } else if (architecture == sonder::inference::ModelArchitecture::hybrid) {
-            if (s->mtp_enabled) {
-                if (rs_cap == 0) {
-                    s->mtp_enabled = false;
-                    s->hybrid_suffix_enabled = false;
-                    s->effective_draft_max = 0;
-                } else {
-                    s->effective_draft_max = std::min<int32_t>(s->effective_draft_max, static_cast<int32_t>(rs_cap));
-                }
-            } else if ((s->suffix_enabled || s->ngram_mod_enabled || s->ngram_short_enabled) && rs_cap == 0 &&
-                       !can_hybrid_spec_ckpt) {
-                s->suffix_enabled = false;
-                s->ngram_mod_enabled = false;
-                s->ngram_short_enabled = false;
-                s->effective_draft_max = 0;
+        if (cap.configured_mode == SlotSpecMode::kNone && active_draft_max > 0) {
+            if (active_spec == SpeculativeType::kSuffix && suffix_matcher != nullptr) {
+                cap.configured_mode = SlotSpecMode::kSuffix;
+                cap.configured_draft_max = active_draft_max;
+            } else if (active_spec == SpeculativeType::kNgramMod && ngram_mod != nullptr) {
+                cap.configured_mode = SlotSpecMode::kNgramMod;
+                cap.configured_draft_max = active_draft_max;
+            } else if (active_spec == SpeculativeType::kNgram) {
+                cap.configured_mode = SlotSpecMode::kNgramShort;
+                cap.configured_draft_max = active_draft_max;
             }
         }
+        s->spec_transition.Configure(cap);
+        sync_slot_flags_from_transition(*s);
         s->adaptive_ctrl.Reset(s->effective_draft_max);
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
         s->want_hybrid_prefix_ckpt = options.prefix_cache &&
@@ -4464,6 +4672,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         slots[victim].session_key.clear();
         slots[victim].last_used = 0;
         if (victim < slot_mtp_synced.size()) slot_mtp_synced[victim] = false;
+        if (victim < slot_mtp_pending_h_pos.size()) slot_mtp_pending_h_pos[victim] = -1;
         ClearSlotCheckpoints(victim);
 #if defined(SONDER_LLAMACPP_HAS_MTP)
         if (ctx_dft != nullptr) {
@@ -4545,6 +4754,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     if (picked->exclusive) {
                         pending_queue.erase(pending_queue.begin() + static_cast<std::ptrdiff_t>(*pick));
                         pending_count.fetch_sub(1, std::memory_order_release);
+                        pending_exclusive_count.fetch_sub(1, std::memory_order_release);
                         exclusive_task = picked;
                     } else {
                         const auto chosen = SelectAvailablePrefixSlot(slots, slot_busy, picked->req->prompt,
@@ -4668,11 +4878,16 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     active.clear();
                     continue;
                 }
+                if (!s.mtp_enabled) {
+                    mark_slot_mtp_drifted(s);
+                }
 #endif
                 if (s.slot_idx < slots.size()) {
                     auto& stoks = slots[s.slot_idx].tokens;
                     stoks.insert(stoks.end(), req.prompt.begin() + off, req.prompt.begin() + step_end);
                 }
+                s.committed_tokens.insert(s.committed_tokens.end(), req.prompt.begin() + off,
+                                          req.prompt.begin() + step_end);
                 s.result.prompt_tokens += n;
                 s.pos += n;
                 AdvanceSwaSlot(s.slot_idx, mem, s.slot_id, static_cast<std::uint64_t>(s.pos));
@@ -4746,23 +4961,44 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 continue;
             }
 
-            // Single-request fast-path decode step (with full speculation!).
-            if (!s.spec_initialized) {
-                s.spec_initialized = true;
-                if ((s.suffix_enabled || s.hybrid_suffix_enabled) && suffix_matcher != nullptr) {
-                    suffix_matcher->BeginRequest(req.prompt);
+            // Single-request fast-path decode step (with safe post-batch
+            // reactivation and full per-slot isolated speculation!).
+            if (s.spec_transition.suspended_for_batch()) {
+                SpeculationReactivationInput rin;
+                rin.active_count = active.size();
+                rin.pending_count = pending_count.load(std::memory_order_acquire);
+                rin.pending_exclusive = pending_exclusive_count.load(std::memory_order_acquire) > 0;
+                rin.cancelled = s.IsCancelled();
+                rin.in_decode_phase = (s.phase == BatchSlotPhase::kDecode);
+                rin.slot_valid = s.slot_valid;
+                rin.remaining_max_tokens =
+                    static_cast<std::int64_t>(req.max_new_tokens) - static_cast<std::int64_t>(s.result.generated_tokens);
+                rin.remaining_ctx_tokens = n_ctx - s.pos;
+                rin.target_pos = s.pos;
+                rin.committed_history_len = s.committed_tokens.size();
+                rin.history_matches_target_pos =
+                    s.slot_valid && s.pos > 0 && s.committed_tokens.size() == static_cast<std::size_t>(s.pos);
+                rin.mtp_readiness = build_mtp_readiness(s);
+
+                const SpeculationTransitionDecision dec =
+                    s.spec_transition.EvaluateSingleRequestStep(rin, reactivation_policy);
+                if (dec.should_reactivate) {
+                    bool ready_ok = true;
+                    if (dec.requires_history_rebuild) {
+                        ready_ok = rebuild_slot_history_drafter(s, dec.target_mode, dec.enable_hybrid_suffix);
+                    }
+                    if (ready_ok) {
+                        s.spec_transition.CommitReactivation(dec);
+                        sync_slot_flags_from_transition(s);
+                        s.adaptive_ctrl.Reset(s.effective_draft_max);
+                    }
                 }
-                if (s.ngram_mod_enabled && ngram_mod != nullptr) {
-                    ngram_history.assign(req.prompt.begin(), req.prompt.end());
-                    ngram_mod->BeginRequest(ngram_history);
-                    s.ngram_indexed = ngram_history.size() > ngram_mod->n_match()
-                                          ? ngram_history.size() - ngram_mod->n_match()
-                                          : 0;
-                } else if (s.ngram_short_enabled) {
-                    ngram_matcher.Reset();
-                    ngram_history.assign(req.prompt.begin(), req.prompt.end());
-                    ngram_matcher.IndexRange(ngram_history, 0, ngram_history.size());
-                    s.ngram_indexed = ngram_history.size();
+            } else if (!s.spec_initialized && s.spec_transition.active_mode() != SlotSpecMode::kNone) {
+                const SlotSpecMode cur_mode = s.spec_transition.active_mode();
+                if (IsHistoryBasedSpecMode(cur_mode) || s.hybrid_suffix_enabled) {
+                    (void)rebuild_slot_history_drafter(s, cur_mode, s.hybrid_suffix_enabled);
+                } else {
+                    s.spec_initialized = true;
                 }
             }
 
@@ -4772,26 +5008,29 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             const int64_t max_k = std::min<int64_t>(
                 {rem_gen - 1, n_ctx - s.pos - 1, static_cast<int64_t>(step_token_budget) - 1});
 
-            auto& draft_tokens = draft_scratch;
-            auto& accepted_tokens = accepted_scratch;
-            auto& accepted_lps = accepted_logprobs_scratch;
+            auto& draft_tokens = s.draft_tokens;
+            auto& accepted_tokens = s.accepted_tokens;
+            auto& accepted_lps = s.accepted_lps;
             draft_tokens.clear();
             bool step_used_suffix = false;
+            const BoundedSuffixAutomaton* shared_ring =
+                (suffix_matcher != nullptr) ? &suffix_matcher->session_ring() : nullptr;
 
             if (max_k > 0) {
 #if defined(SONDER_LLAMACPP_HAS_MTP)
                 if (s.mtp_enabled) {
-                    if (s.hybrid_suffix_enabled && suffix_matcher != nullptr &&
+                    if (s.hybrid_suffix_enabled && s.local_suffix_matcher != nullptr &&
                         (architecture != sonder::inference::ModelArchitecture::hybrid || can_hybrid_spec_ckpt ||
                          rs_cap >= SuffixMatcher::kHybridMtpMinBurstDraft)) {
-                        if (suffix_matcher->paused()) {
-                            suffix_matcher->NoteSkippedStep();
+                        if (s.local_suffix_matcher->paused()) {
+                            s.local_suffix_matcher->NoteSkippedStep();
                         } else {
                             const std::size_t hybrid_cap =
                                 (architecture == sonder::inference::ModelArchitecture::hybrid && !can_hybrid_spec_ckpt)
                                     ? std::min<std::size_t>(static_cast<std::size_t>(max_k), static_cast<std::size_t>(rs_cap))
                                     : static_cast<std::size_t>(max_k);
-                            SuffixMatchResult burst = suffix_matcher->TryHybridMtpBurstForCurrent(s.cur_tok, hybrid_cap);
+                            SuffixMatchResult burst = s.local_suffix_matcher->TryHybridMtpBurstForCurrent(
+                                s.cur_tok, hybrid_cap, shared_ring);
                             if (!burst.draft.empty()) {
                                 draft_tokens = std::move(burst.draft);
                                 for (std::size_t j = 0; j < draft_tokens.size(); ++j) {
@@ -4813,26 +5052,29 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                                 active.clear();
                                 continue;
                             }
-                            s.mtp_enabled = false;
-                            s.hybrid_suffix_enabled = false;
+                            s.spec_transition.MarkMtpRuntimeFailure();
+                            s.spec_transition.MarkSlotInvalidated();
+                            sync_slot_flags_from_transition(s);
                             s.slot_valid = false;
+                            s.committed_tokens.clear();
                             if (s.slot_idx < slots.size()) {
                                 slots[s.slot_idx].tokens.clear();
                                 slots[s.slot_idx].session_key.clear();
                             }
-                            if (s.slot_idx < slot_mtp_synced.size()) slot_mtp_synced[s.slot_idx] = false;
+                            mark_slot_mtp_drifted(s);
                             ClearSlotCheckpoints(s.slot_idx);
                             draft_tokens.clear();
                         }
                     }
                 } else
 #endif
-                if (s.suffix_enabled && suffix_matcher != nullptr) {
-                    if (suffix_matcher->paused()) {
-                        suffix_matcher->NoteSkippedStep();
+                if (s.suffix_enabled && s.local_suffix_matcher != nullptr) {
+                    if (s.local_suffix_matcher->paused()) {
+                        s.local_suffix_matcher->NoteSkippedStep();
                     } else {
                         const auto k_lim = static_cast<std::size_t>(std::min<int64_t>(max_k, s.effective_draft_max));
-                        SuffixMatchResult m = suffix_matcher->DraftForCurrent(s.cur_tok, k_lim);
+                        SuffixMatchResult m = s.local_suffix_matcher->DraftForCurrent(
+                            s.cur_tok, k_lim, SuffixMatcher::kDefaultMinMatchLen, shared_ring);
                         if (!m.draft.empty()) {
                             draft_tokens = std::move(m.draft);
                             for (std::size_t j = 0; j < draft_tokens.size(); ++j) {
@@ -4846,20 +5088,20 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     }
                 } else if (s.ngram_mod_enabled && ngram_mod != nullptr) {
                     const auto k_lim = static_cast<std::size_t>(std::min<int64_t>(max_k, s.effective_draft_max));
-                    ngram_mod->Draft(ngram_history, s.cur_tok, k_lim, draft_tokens);
+                    ngram_mod->Draft(s.committed_tokens, s.cur_tok, k_lim, draft_tokens);
                     for (std::size_t j = 0; j < draft_tokens.size(); ++j) {
                         if (llama_vocab_is_eog(vocab, draft_tokens[j])) {
                             draft_tokens.resize(j + 1);
                             break;
                         }
                     }
-                } else if (s.ngram_short_enabled) {
+                } else if (s.ngram_short_enabled && s.local_ngram_matcher != nullptr) {
                     const int32_t ctrl_len = s.adaptive_ctrl.NextDraftLength();
                     if (ctrl_len > 0) {
-                        ngram_history.push_back(s.cur_tok);
+                        s.committed_tokens.push_back(s.cur_tok);
                         const auto k_lim = static_cast<std::size_t>(std::min<int64_t>(max_k, ctrl_len));
-                        ngram_matcher.Draft(ngram_history, k_lim, draft_tokens);
-                        ngram_history.pop_back();
+                        s.local_ngram_matcher->Draft(s.committed_tokens, k_lim, draft_tokens);
+                        s.committed_tokens.pop_back();
                         for (std::size_t j = 0; j < draft_tokens.size(); ++j) {
                             if (llama_vocab_is_eog(vocab, draft_tokens[j])) {
                                 draft_tokens.resize(j + 1);
@@ -4953,20 +5195,24 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     active.clear();
                     continue;
                 }
+                if (!s.mtp_enabled) {
+                    mark_slot_mtp_drifted(s);
+                }
 #endif
                 if (s.slot_valid && s.slot_idx < slots.size()) slots[s.slot_idx].tokens.push_back(s.cur_tok);
-                if ((s.suffix_enabled || s.hybrid_suffix_enabled) && suffix_matcher != nullptr) {
-                    suffix_matcher->CommitToken(s.cur_tok);
+                s.committed_tokens.push_back(s.cur_tok);
+                if ((s.suffix_enabled || s.hybrid_suffix_enabled) && s.local_suffix_matcher != nullptr) {
+                    s.local_suffix_matcher->CommitToken(s.cur_tok);
+                    s.local_suffix_matcher->ObserveBaselineStep(decode_call_ms, 1u);
                 }
                 if (s.ngram_mod_enabled && ngram_mod != nullptr) {
-                    ngram_history.push_back(s.cur_tok);
-                    s.ngram_indexed = ngram_mod->IndexRange(ngram_history, s.ngram_indexed, ngram_history.size());
-                } else if (s.ngram_short_enabled) {
-                    ngram_history.push_back(s.cur_tok);
-                    ngram_matcher.IndexRange(ngram_history, s.ngram_indexed, ngram_history.size());
-                    s.ngram_indexed = ngram_history.size();
+                    s.ngram_indexed = ngram_mod->IndexRange(s.committed_tokens, s.ngram_indexed, s.committed_tokens.size());
+                } else if (s.ngram_short_enabled && s.local_ngram_matcher != nullptr) {
+                    s.local_ngram_matcher->IndexRange(s.committed_tokens, s.ngram_indexed, s.committed_tokens.size());
+                    s.ngram_indexed = s.committed_tokens.size();
                 }
                 ++s.pos;
+                AdvanceSwaSlot(s.slot_idx, mem, s.slot_id, static_cast<std::uint64_t>(s.pos));
 
                 TokenLogprobInfo step_lp;
                 const Token next_tok = SampleTokenAt(0, req.sampling, s.sampler.get(), s.grammar_sampler.get(),
@@ -4998,9 +5244,9 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 }
                 Emit(TelemetryKind::kTokenDecoded, 1, MsSince(step_start));
                 if (s.result.generated_tokens >= req.max_new_tokens) {
-                    if (s.ngram_mod_enabled) ngram_history.push_back(next_tok);
-                    if ((s.suffix_enabled || s.hybrid_suffix_enabled) && suffix_matcher != nullptr) {
-                        suffix_matcher->CommitToken(next_tok);
+                    if (s.ngram_mod_enabled) s.committed_tokens.push_back(next_tok);
+                    if ((s.suffix_enabled || s.hybrid_suffix_enabled) && s.local_suffix_matcher != nullptr) {
+                        s.local_suffix_matcher->CommitToken(next_tok);
                     }
                     finish_slot(s, StopReason::kMaxTokens);
                     active.clear();
@@ -5033,8 +5279,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 continue;
             }
             s.result.draft_accepted_tokens += static_cast<std::int32_t>(n_accepted);
-            if (step_used_suffix && suffix_matcher != nullptr) {
-                suffix_matcher->Observe(k, n_accepted);
+            if (step_used_suffix && s.local_suffix_matcher != nullptr) {
+                s.local_suffix_matcher->ObserveWithCost(k, n_accepted, decode_call_ms, accepted_tokens.size());
             } else if (s.ngram_mod_enabled && ngram_mod != nullptr) {
                 if (ngram_mod->Observe(k, n_accepted)) s.ngram_indexed = 0;
             } else if (s.ngram_short_enabled) {
@@ -5042,10 +5288,10 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             }
 
             if (s.slot_valid && s.slot_idx < slots.size()) slots[s.slot_idx].tokens.push_back(step_base_tok);
-            if ((s.suffix_enabled || s.hybrid_suffix_enabled) && suffix_matcher != nullptr) {
-                suffix_matcher->CommitToken(step_base_tok);
+            s.committed_tokens.push_back(step_base_tok);
+            if ((s.suffix_enabled || s.hybrid_suffix_enabled) && s.local_suffix_matcher != nullptr) {
+                s.local_suffix_matcher->CommitToken(step_base_tok);
             }
-            if (s.ngram_mod_enabled || s.ngram_short_enabled) ngram_history.push_back(step_base_tok);
 
             int64_t new_pos = s.pos + 1;
             std::size_t committed_drafts = 0;
@@ -5055,13 +5301,17 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     invalidate_slot(s);
                     return false;
                 }
+                if (!s.mtp_enabled) {
+                    mark_slot_mtp_drifted(s);
+                }
 #endif
-                const int64_t batch_end_pos = s.pos + 1 + static_cast<int64_t>(k);
-                AdvanceSwaSlot(s.slot_idx, mem, s.slot_id, static_cast<std::uint64_t>(batch_end_pos));
-                if (keep_pos < batch_end_pos) {
+                const SlotKvRollbackRange rb = ComputeSlotRollbackRange(s.slot_id, s.pos, k, keep_drafts);
+                AdvanceSwaSlot(s.slot_idx, mem, s.slot_id, static_cast<std::uint64_t>(rb.batch_end_pos));
+                if (rb.needs_rollback || keep_pos < rb.batch_end_pos) {
+                    const int64_t rm_pos = std::min(keep_pos, rb.rm_from_pos);
                     const bool swa_ok =
-                        CheckSwaRollback(s.slot_idx, mem, s.slot_id, static_cast<std::uint64_t>(keep_pos));
-                    if (!swa_ok || !llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(keep_pos), -1)) {
+                        CheckSwaRollback(s.slot_idx, mem, s.slot_id, static_cast<std::uint64_t>(rm_pos));
+                    if (!swa_ok || !llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(rm_pos), -1)) {
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
                         if (have_spec_ckpt && !swa_compact_active) {
                             const llama_state_seq_flags flags = PartialCheckpointFlags();
@@ -5118,10 +5368,10 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 }
                 if (!is_bonus) {
                     if (s.slot_valid && s.slot_idx < slots.size()) slots[s.slot_idx].tokens.push_back(tok);
-                    if ((s.suffix_enabled || s.hybrid_suffix_enabled) && suffix_matcher != nullptr) {
-                        suffix_matcher->CommitToken(tok);
+                    s.committed_tokens.push_back(tok);
+                    if ((s.suffix_enabled || s.hybrid_suffix_enabled) && s.local_suffix_matcher != nullptr) {
+                        s.local_suffix_matcher->CommitToken(tok);
                     }
-                    if (s.ngram_mod_enabled || s.ngram_short_enabled) ngram_history.push_back(tok);
                     ++new_pos;
                     ++committed_drafts;
                 }
@@ -5132,9 +5382,9 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     break;
                 }
                 if (s.result.generated_tokens >= req.max_new_tokens) {
-                    if (is_bonus && s.ngram_mod_enabled) ngram_history.push_back(tok);
-                    if (is_bonus && (s.suffix_enabled || s.hybrid_suffix_enabled) && suffix_matcher != nullptr) {
-                        suffix_matcher->CommitToken(tok);
+                    if (is_bonus && s.ngram_mod_enabled) s.committed_tokens.push_back(tok);
+                    if (is_bonus && (s.suffix_enabled || s.hybrid_suffix_enabled) && s.local_suffix_matcher != nullptr) {
+                        s.local_suffix_matcher->CommitToken(tok);
                     }
                     (void)rollback_rejected(new_pos, committed_drafts);
                     Emit(TelemetryKind::kTokenDecoded, static_cast<std::int32_t>(m + 1), MsSince(step_start));
@@ -5162,10 +5412,10 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 continue;
             }
             if (s.ngram_mod_enabled && ngram_mod != nullptr) {
-                s.ngram_indexed = ngram_mod->IndexRange(ngram_history, s.ngram_indexed, ngram_history.size());
-            } else if (s.ngram_short_enabled) {
-                ngram_matcher.IndexRange(ngram_history, s.ngram_indexed, ngram_history.size());
-                s.ngram_indexed = ngram_history.size();
+                s.ngram_indexed = ngram_mod->IndexRange(s.committed_tokens, s.ngram_indexed, s.committed_tokens.size());
+            } else if (s.ngram_short_enabled && s.local_ngram_matcher != nullptr) {
+                s.local_ngram_matcher->IndexRange(s.committed_tokens, s.ngram_indexed, s.committed_tokens.size());
+                s.ngram_indexed = s.committed_tokens.size();
             }
             Emit(TelemetryKind::kTokenDecoded, static_cast<std::int32_t>(accepted_tokens.size()), MsSince(step_start));
             s.pos = new_pos;
@@ -5176,27 +5426,451 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             continue;
         }
 
-        // 5. Case B: True Continuous Batching + Chunked Prefill across multiple
+        // 5. Case B: Multi-request continuous batching.
+        // First attempt opt-in, cost-gated bounded small-batch concurrent linear
+        // speculation when pure-decode slots are within threshold and rollback-safe;
+        // otherwise immediately fall back to ordinary 1-token continuous batching.
+        std::size_t decoding_count = 0;
+        std::size_t prefill_count = 0;
+        for (const auto& sp : active) {
+            if (sp->IsCancelled()) continue;
+            if (sp->phase == BatchSlotPhase::kDecode) {
+                ++decoding_count;
+            } else if (sp->phase == BatchSlotPhase::kPrefill) {
+                ++prefill_count;
+            }
+        }
+
+        bool ran_concurrent_spec = false;
+        if (concurrent_spec_policy.enabled && !concurrent_cost_gate.IsRegressed() && prefill_count == 0u &&
+            prefix_coalescer.HeldFollowerCount() == 0u &&
+            decoding_count >= 2u && decoding_count <= static_cast<std::size_t>(concurrent_spec_policy.max_concurrent_slots) &&
+            architecture != sonder::inference::ModelArchitecture::recurrent &&
+            !(architecture == sonder::inference::ModelArchitecture::hybrid && rs_cap == 0u) &&
+            active_spec != SpeculativeType::kNone) {
+            const BoundedSuffixAutomaton* shared_ring =
+                (suffix_matcher != nullptr) ? &suffix_matcher->session_ring() : nullptr;
+
+            std::vector<ConcurrentSpecSlotInput> conc_inputs;
+            conc_inputs.reserve(active.size());
+            for (auto& sp : active) {
+                ActiveBatchSlot& s = *sp;
+                s.draft_tokens.clear();
+                s.concurrent_step_mode = SlotSpecMode::kNone;
+
+                ConcurrentSpecSlotInput in;
+                in.slot_index = s.slot_idx;
+                in.seq_id = static_cast<std::int32_t>(s.slot_id);
+                in.base_pos = s.pos;
+                in.is_prefill = (s.phase == BatchSlotPhase::kPrefill);
+                in.cancelled = s.IsCancelled();
+
+                if (!in.cancelled && !in.is_prefill && s.slot_valid && s.pos > 0 &&
+                    s.committed_tokens.size() == static_cast<std::size_t>(s.pos)) {
+                    const GenerateRequest& req = *s.task->req;
+                    const SlotSpecCapability& cap = s.spec_transition.capability();
+                    SlotSpecMode cmode = cap.configured_mode;
+                    std::int32_t req_draft_cap = cap.configured_draft_max;
+                    if (cmode == SlotSpecMode::kDraftMtp) {
+                        if (cap.suffix_fallback_available && suffix_matcher != nullptr) {
+                            cmode = SlotSpecMode::kSuffix;
+                            req_draft_cap = cap.fallback_suffix_draft_max;
+                        } else {
+                            cmode = SlotSpecMode::kNone;
+                            req_draft_cap = 0;
+                        }
+                    }
+                    const ArchitectureSpecGuardResult guard = CheckArchitectureSpecGuard(
+                        architecture, cmode, req_draft_cap, static_cast<std::int32_t>(rs_cap),
+                        can_hybrid_spec_ckpt, /*allow_partial_checkpoint=*/false);
+
+                    const int64_t rem_gen =
+                        static_cast<int64_t>(req.max_new_tokens) - static_cast<int64_t>(s.result.generated_tokens);
+                    const int64_t rem_ctx = n_ctx - s.pos;
+                    const int64_t slot_lim = std::min<int64_t>({
+                        rem_gen - 1,
+                        rem_ctx - 1,
+                        static_cast<int64_t>(guard.effective_draft_max),
+                        static_cast<int64_t>(concurrent_spec_policy.max_per_slot_draft_tokens),
+                        static_cast<int64_t>(per_seq_output_budget) - 1,
+                    });
+
+                    if (guard.allowed && slot_lim > 0) {
+                        s.concurrent_step_mode = cmode;
+                        if (!s.local_matcher_synced) {
+                            (void)rebuild_slot_history_drafter(s, cmode, /*enable_hybrid_suffix=*/false);
+                        }
+                        if (cmode == SlotSpecMode::kSuffix && s.local_suffix_matcher != nullptr) {
+                            if (s.local_suffix_matcher->paused()) {
+                                s.local_suffix_matcher->NoteSkippedStep();
+                            } else {
+                                SuffixMatchResult m = s.local_suffix_matcher->DraftForCurrent(
+                                    s.cur_tok, static_cast<std::size_t>(slot_lim),
+                                    SuffixMatcher::kDefaultMinMatchLen, shared_ring);
+                                if (!m.draft.empty()) {
+                                    s.draft_tokens = std::move(m.draft);
+                                }
+                            }
+                        } else if (cmode == SlotSpecMode::kNgramMod && ngram_mod != nullptr) {
+                            ngram_mod->Draft(s.committed_tokens, s.cur_tok, static_cast<std::size_t>(slot_lim),
+                                             s.draft_tokens);
+                        } else if (cmode == SlotSpecMode::kNgramShort && s.local_ngram_matcher != nullptr) {
+                            const int32_t ctrl_len = s.adaptive_ctrl.NextDraftLength();
+                            if (ctrl_len > 0) {
+                                const auto k_lim = static_cast<std::size_t>(
+                                    std::min<int64_t>(slot_lim, static_cast<int64_t>(ctrl_len)));
+                                s.committed_tokens.push_back(s.cur_tok);
+                                s.local_ngram_matcher->Draft(s.committed_tokens, k_lim, s.draft_tokens);
+                                s.committed_tokens.pop_back();
+                            } else {
+                                s.adaptive_ctrl.NoteSkippedStep();
+                            }
+                        }
+                        for (std::size_t j = 0; j < s.draft_tokens.size(); ++j) {
+                            if (llama_vocab_is_eog(vocab, s.draft_tokens[j])) {
+                                s.draft_tokens.resize(j + 1);
+                                break;
+                            }
+                        }
+                        if (!s.draft_tokens.empty()) {
+                            in.eligible_for_spec = true;
+                            in.max_draft_for_slot = static_cast<std::int32_t>(slot_lim);
+                            in.proposed_draft_count = s.draft_tokens.size();
+                        }
+                    }
+                }
+                conc_inputs.push_back(in);
+            }
+
+            const ConcurrentSpecBatchPlan cplan = PlanConcurrentLinearSpeculation(
+                conc_inputs, concurrent_spec_policy, step_token_budget, concurrent_output_budget,
+                per_seq_output_budget, architecture, static_cast<std::int32_t>(rs_cap),
+                concurrent_cost_gate.IsRegressed(), conc_rr_cursor);
+
+            if (cplan.use_concurrent_spec && cplan.total_draft_tokens > 0) {
+                BatchClear(batch);
+                for (const ConcurrentSpecSlotPlan& item : cplan.slots) {
+                    ActiveBatchSlot* s = find_active_by_slot(item.slot_index);
+                    if (s == nullptr) continue;
+                    s->draft_tokens.resize(static_cast<std::size_t>(item.allocated_draft_tokens));
+                    s->batch_start_idx = batch.n_tokens;
+                    BatchAdd(batch, s->cur_tok, static_cast<llama_pos>(s->pos), s->slot_id, /*logits=*/true);
+                    for (std::int32_t j = 0; j < item.allocated_draft_tokens; ++j) {
+                        BatchAdd(batch, s->draft_tokens[static_cast<std::size_t>(j)],
+                                 static_cast<llama_pos>(s->pos + 1 + j), s->slot_id, /*logits=*/true);
+                    }
+                }
+
+                abort_requested.store(false, std::memory_order_relaxed);
+                active_cancel = nullptr;
+                batch_abort_fn = [&]() -> bool {
+                    if (worker_stop.load(std::memory_order_relaxed)) return true;
+                    for (const auto& sp : active) {
+                        if (!sp->IsCancelled()) return false;
+                    }
+                    return true;
+                };
+
+                const auto step_start = Clock::now();
+                auto decode_start = step_start;
+                int32_t rc = llama_decode(ctx, batch);
+                while (rc == 1 && evict_one_idle_slot()) {
+                    abort_requested.store(false, std::memory_order_relaxed);
+                    decode_start = Clock::now();
+                    rc = llama_decode(ctx, batch);
+                }
+                const double decode_call_ms = MsSince(decode_start);
+                batch_abort_fn = nullptr;
+
+                if (rc == 1) {
+                    // KV pressure during concurrent speculation: clean up per-slot
+                    // speculative tails and fall through immediately to ordinary
+                    // 1-token continuous batching.
+                    for (const ConcurrentSpecSlotPlan& item : cplan.slots) {
+                        ActiveBatchSlot* s = find_active_by_slot(item.slot_index);
+                        if (s == nullptr) continue;
+                        const bool swa_ok =
+                            CheckSwaRollback(s->slot_idx, mem, s->slot_id, static_cast<std::uint64_t>(s->pos));
+                        if (!swa_ok || !llama_memory_seq_rm(mem, s->slot_id, static_cast<llama_pos>(s->pos), -1)) {
+                            invalidate_slot(*s);
+                        }
+                        s->draft_tokens.clear();
+                    }
+                } else if (rc != 0) {
+                    ran_concurrent_spec = true;
+                    const bool stopping = worker_stop.load(std::memory_order_acquire);
+                    for (const ConcurrentSpecSlotPlan& item : cplan.slots) {
+                        ActiveBatchSlot* s = find_active_by_slot(item.slot_index);
+                        if (s == nullptr) continue;
+                        const bool swa_ok =
+                            CheckSwaRollback(s->slot_idx, mem, s->slot_id, static_cast<std::uint64_t>(s->pos));
+                        if (!swa_ok || !llama_memory_seq_rm(mem, s->slot_id, static_cast<llama_pos>(s->pos), -1)) {
+                            invalidate_slot(*s);
+                        }
+                        if (rc == 2 && (s->IsCancelled() || stopping)) {
+                            finish_slot(*s, StopReason::kCancelled);
+                        } else if (rc != 2) {
+                            s->result.status = Status::Error(
+                                ErrorCode::kDecodeFailed, "llama_decode failed (rc=" + std::to_string(rc) + ")");
+                            finish_slot(*s, StopReason::kError);
+                        }
+                    }
+                    active.erase(std::remove_if(active.begin(), active.end(),
+                                                [](const auto& sp) { return sp->task == nullptr; }),
+                                 active.end());
+                } else {
+                    ran_concurrent_spec = true;
+                    const double step_ms = MsSince(step_start);
+                    const std::int64_t serviced_us = NowUs();
+
+                    // Phase 1: Extract every slot's verified tokens from ONLY its
+                    // own disjoint `[batch_start_idx, batch_start_idx + k_i]` span
+                    // and its own isolated sampler BEFORE any callbacks or KV writes.
+                    for (const ConcurrentSpecSlotPlan& item : cplan.slots) {
+                        ActiveBatchSlot* s = find_active_by_slot(item.slot_index);
+                        if (s == nullptr || s->task == nullptr) continue;
+                        const GenerateRequest& req = *s->task->req;
+                        const std::size_t k_i = static_cast<std::size_t>(item.allocated_draft_tokens);
+                        const auto verify_start = Clock::now();
+                        s->accepted_tokens.clear();
+                        s->accepted_lps.clear();
+                        s->step_n_accepted = 0;
+                        s->step_sample_deadlock = false;
+
+                        for (std::size_t j = 0; j < k_i; ++j) {
+                            TokenLogprobInfo lp;
+                            const Token sampled = SampleTokenAt(
+                                s->batch_start_idx + static_cast<int32_t>(j), req.sampling, s->sampler.get(),
+                                s->grammar_sampler.get(), s->target_gpu_sampled, n_vocab,
+                                req.sampling.compute_logprobs ? &lp : nullptr);
+                            if (sampled == LLAMA_TOKEN_NULL) {
+                                s->step_sample_deadlock = true;
+                                break;
+                            }
+                            s->accepted_tokens.push_back(sampled);
+                            s->accepted_lps.push_back(std::move(lp));
+                            if (sampled == s->draft_tokens[j]) {
+                                ++s->step_n_accepted;
+                            } else {
+                                break;
+                            }
+                        }
+                        bool sampled_bonus = false;
+                        if (!s->step_sample_deadlock && s->step_n_accepted == k_i) {
+                            TokenLogprobInfo bonus_lp;
+                            const Token bonus = SampleTokenAt(
+                                s->batch_start_idx + static_cast<int32_t>(k_i), req.sampling, s->sampler.get(),
+                                s->grammar_sampler.get(), s->target_gpu_sampled, n_vocab,
+                                req.sampling.compute_logprobs ? &bonus_lp : nullptr);
+                            if (bonus == LLAMA_TOKEN_NULL) {
+                                s->step_sample_deadlock = true;
+                            } else {
+                                s->accepted_tokens.push_back(bonus);
+                                s->accepted_lps.push_back(std::move(bonus_lp));
+                                sampled_bonus = true;
+                            }
+                        }
+                        if (!s->step_sample_deadlock && k_i > 0u) {
+                            const double verify_us =
+                                std::chrono::duration<double, std::micro>(Clock::now() - verify_start).count();
+                            const double safe_us = (std::isfinite(verify_us) && verify_us > 0.0) ? verify_us : 0.0;
+                            s->result.spec_verifier_mode = SpeculativeVerificationMode::TargetMatch;
+                            s->result.spec_verify_overhead_us += safe_us;
+                            spec_verifier.record_external_step(SpeculativeVerificationMode::TargetMatch, k_i,
+                                                               s->step_n_accepted, s->step_n_accepted < k_i,
+                                                               sampled_bonus, safe_us);
+                        }
+                    }
+
+                    // Phase 2: Commit per slot with exact isolated per-sequence
+                    // `llama_memory_seq_rm` rollback so one slot's rejection never
+                    // affects any sibling slot's KV or sampler history.
+                    std::size_t total_committed_step = 0;
+                    std::size_t total_drafted_step = 0;
+                    std::size_t total_accepted_step = 0;
+
+                    for (const ConcurrentSpecSlotPlan& item : cplan.slots) {
+                        ActiveBatchSlot* s = find_active_by_slot(item.slot_index);
+                        if (s == nullptr || s->task == nullptr) continue;
+                        s->last_service_time_us = serviced_us;
+                        const GenerateRequest& req = *s->task->req;
+                        const std::size_t k_i = static_cast<std::size_t>(item.allocated_draft_tokens);
+                        const Token step_base_tok = s->cur_tok;
+                        const int64_t batch_end_pos = s->pos + 1 + static_cast<int64_t>(k_i);
+                        AdvanceSwaSlot(s->slot_idx, mem, s->slot_id, static_cast<std::uint64_t>(batch_end_pos));
+
+                        mark_slot_mtp_drifted(*s);
+                        if (s->spec_transition.configured_mode() == SlotSpecMode::kDraftMtp) {
+                            s->spec_transition.SuspendForBatch(SpecSuspendReason::kMultiRequestBatch);
+                            sync_slot_flags_from_transition(*s);
+                        }
+
+                        if (s->step_sample_deadlock) {
+                            const bool swa_ok =
+                                CheckSwaRollback(s->slot_idx, mem, s->slot_id, static_cast<std::uint64_t>(s->pos));
+                            if (!swa_ok || !llama_memory_seq_rm(mem, s->slot_id, static_cast<llama_pos>(s->pos), -1)) {
+                                invalidate_slot(*s);
+                            }
+                            s->result.status = Status::Error(
+                                ErrorCode::kDecodeFailed, "sampler produced no valid token (grammar deadlock)");
+                            finish_slot(*s, StopReason::kError);
+                            continue;
+                        }
+
+                        if (k_i > 0) {
+                            s->result.draft_tokens += static_cast<std::int32_t>(k_i);
+                            s->result.draft_accepted_tokens += static_cast<std::int32_t>(s->step_n_accepted);
+                            total_drafted_step += k_i;
+                            total_accepted_step += s->step_n_accepted;
+                            if (s->concurrent_step_mode == SlotSpecMode::kSuffix && s->local_suffix_matcher != nullptr) {
+                                s->local_suffix_matcher->ObserveWithCost(k_i, s->step_n_accepted, decode_call_ms,
+                                                                         s->accepted_tokens.size());
+                            } else if (s->concurrent_step_mode == SlotSpecMode::kNgramShort) {
+                                s->adaptive_ctrl.Observe(static_cast<std::int32_t>(k_i),
+                                                         static_cast<std::int32_t>(s->step_n_accepted));
+                            }
+                        }
+
+                        if (s->slot_valid && s->slot_idx < slots.size()) {
+                            slots[s->slot_idx].tokens.push_back(step_base_tok);
+                        }
+                        s->committed_tokens.push_back(step_base_tok);
+                        if (s->local_suffix_matcher != nullptr && s->local_matcher_synced) {
+                            s->local_suffix_matcher->CommitToken(step_base_tok);
+                        }
+
+                        int64_t new_pos = s->pos + 1;
+                        std::size_t committed_drafts = 0;
+                        auto rollback_slot_tail = [&](std::size_t keep_drafts) -> bool {
+                            const SlotKvRollbackRange rb =
+                                ComputeSlotRollbackRange(s->slot_id, s->pos, k_i, keep_drafts);
+                            if (rb.needs_rollback) {
+                                const bool swa_ok = CheckSwaRollback(s->slot_idx, mem, s->slot_id,
+                                                                     static_cast<std::uint64_t>(rb.rm_from_pos));
+                                if (!swa_ok ||
+                                    !llama_memory_seq_rm(mem, s->slot_id, static_cast<llama_pos>(rb.rm_from_pos), -1)) {
+                                    invalidate_slot(*s);
+                                    return false;
+                                }
+                            }
+                            return true;
+                        };
+
+                        bool slot_finished = false;
+                        for (std::size_t m = 0; m < s->accepted_tokens.size(); ++m) {
+                            const Token tok = s->accepted_tokens[m];
+                            const bool is_bonus = (m == s->step_n_accepted);
+                            if (llama_vocab_is_eog(vocab, tok)) {
+                                (void)rollback_slot_tail(committed_drafts);
+                                if (m > 0) {
+                                    Emit(TelemetryKind::kTokenDecoded, static_cast<std::int32_t>(m), step_ms);
+                                    total_committed_step += m;
+                                }
+                                finish_slot(*s, StopReason::kEndOfGeneration);
+                                slot_finished = true;
+                                break;
+                            }
+                            bool keep_going = true;
+                            if (Status st = emit_slot_token(*s, tok, s->accepted_lps[m], keep_going); !st.ok()) {
+                                (void)rollback_slot_tail(committed_drafts);
+                                s->result.status = std::move(st);
+                                finish_slot(*s, StopReason::kError);
+                                slot_finished = true;
+                                break;
+                            }
+                            if (!is_bonus) {
+                                if (s->slot_valid && s->slot_idx < slots.size()) {
+                                    slots[s->slot_idx].tokens.push_back(tok);
+                                }
+                                s->committed_tokens.push_back(tok);
+                                if (s->local_suffix_matcher != nullptr && s->local_matcher_synced) {
+                                    s->local_suffix_matcher->CommitToken(tok);
+                                }
+                                ++new_pos;
+                                ++committed_drafts;
+                            }
+                            if (!keep_going || s->IsCancelled()) {
+                                (void)rollback_slot_tail(committed_drafts);
+                                finish_slot(*s, StopReason::kCancelled);
+                                slot_finished = true;
+                                break;
+                            }
+                            if (s->result.generated_tokens >= req.max_new_tokens) {
+                                if (is_bonus && s->concurrent_step_mode == SlotSpecMode::kNgramMod) {
+                                    s->committed_tokens.push_back(tok);
+                                }
+                                if (is_bonus && s->local_suffix_matcher != nullptr && s->local_matcher_synced) {
+                                    s->local_suffix_matcher->CommitToken(tok);
+                                }
+                                (void)rollback_slot_tail(committed_drafts);
+                                Emit(TelemetryKind::kTokenDecoded, static_cast<std::int32_t>(m + 1), step_ms);
+                                total_committed_step += m + 1;
+                                finish_slot(*s, StopReason::kMaxTokens);
+                                slot_finished = true;
+                                break;
+                            }
+                            if (is_bonus) {
+                                s->cur_tok = tok;
+                            }
+                        }
+                        if (slot_finished) continue;
+
+                        if (!rollback_slot_tail(committed_drafts)) {
+                            s->result.status = Status::Error(
+                                ErrorCode::kDecodeFailed, "failed to trim rejected concurrent speculative KV tail");
+                            finish_slot(*s, StopReason::kError);
+                            continue;
+                        }
+                        if (s->concurrent_step_mode == SlotSpecMode::kNgramMod && ngram_mod != nullptr) {
+                            s->ngram_indexed =
+                                ngram_mod->IndexRange(s->committed_tokens, s->ngram_indexed, s->committed_tokens.size());
+                        } else if (s->concurrent_step_mode == SlotSpecMode::kNgramShort &&
+                                   s->local_ngram_matcher != nullptr) {
+                            s->local_ngram_matcher->IndexRange(s->committed_tokens, s->ngram_indexed,
+                                                               s->committed_tokens.size());
+                            s->ngram_indexed = s->committed_tokens.size();
+                        }
+                        Emit(TelemetryKind::kTokenDecoded, static_cast<std::int32_t>(s->accepted_tokens.size()), step_ms);
+                        total_committed_step += s->accepted_tokens.size();
+                        s->pos = new_pos;
+                        if (s->pos >= n_ctx) {
+                            finish_slot(*s, StopReason::kContextFull);
+                        }
+                    }
+
+                    (void)concurrent_cost_gate.ObserveSpecStep(step_ms, total_committed_step, total_drafted_step,
+                                                               total_accepted_step, concurrent_spec_policy);
+
+                    active.erase(std::remove_if(active.begin(), active.end(),
+                                                [](const auto& sp) { return sp->task == nullptr; }),
+                                 active.end());
+                }
+            }
+        }
+
+        if (ran_concurrent_spec) {
+            continue;
+        }
+
+        // Ordinary Case B: True Continuous Batching + Chunked Prefill across
         // concurrent slots in lockstep (1 decode token per decoding slot +
         // chunked prefill <= n_ubatch packed into ONE llama_decode call!).
-        // Keep per-seq_id GPU backend samplers attached (never detach mid-request).
+        // Suspend speculation cleanly WITHOUT permanently zeroing configured
+        // capability so trailing requests can safely reactivate after drain.
+        const SpecSuspendReason batch_suspend_reason = [&]() noexcept {
+            if (pending_exclusive_count.load(std::memory_order_acquire) > 0) {
+                return SpecSuspendReason::kExclusivePending;
+            }
+            if (active.size() == 1u && pending_count.load(std::memory_order_acquire) > 0) {
+                return SpecSuspendReason::kPendingRequest;
+            }
+            if (concurrent_spec_policy.enabled && concurrent_cost_gate.IsRegressed()) {
+                return SpecSuspendReason::kVerifyCostRegression;
+            }
+            return SpecSuspendReason::kMultiRequestBatch;
+        }();
         for (auto& sp : active) {
-            if (sp->spec_initialized && (sp->suffix_enabled || sp->hybrid_suffix_enabled) &&
-                suffix_matcher != nullptr) {
-                suffix_matcher->ClearActive();
-            }
-            if (sp->mtp_enabled) {
-                sp->mtp_enabled = false;
-                sp->hybrid_suffix_enabled = false;
-                if (sp->slot_idx < slot_mtp_synced.size()) slot_mtp_synced[sp->slot_idx] = false;
-#if defined(SONDER_LLAMACPP_HAS_MTP)
-                if (sp->slot_idx < mtp_deferred.size()) mtp_deferred[sp->slot_idx].Clear();
-#endif
-            }
-            sp->suffix_enabled = false;
-            sp->ngram_mod_enabled = false;
-            sp->ngram_short_enabled = false;
-            sp->batch_logit_idx = -1;
+            suspend_slot_for_batch(*sp, batch_suspend_reason);
         }
 
         if (prefix_coalescer.IsEnabled()) {
@@ -5269,7 +5943,6 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 }
             }
         }
-
         auto pack_plan = [&](const PlannedBatchStep& p) {
             BatchClear(batch);
             for (auto& sp : active) sp->batch_logit_idx = -1;
@@ -5397,12 +6070,16 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         // Advance each planned slot and stream tokens to callbacks.
         const double step_ms = MsSince(step_start);
         const std::int64_t serviced_us = NowUs();
+        std::size_t plain_decode_committed = 0;
         for (std::size_t idx = 0; idx < plan.items.size(); ++idx) {
             const PlannedBatchItem& item = plan.items[idx];
             ActiveBatchSlot* s = find_active_by_slot(item.slot_index);
             if (s == nullptr || s->task == nullptr) continue;
             s->last_service_time_us = serviced_us;
             const GenerateRequest& req = *s->task->req;
+
+            // Target KV advanced without MTP draft context sync -> mark drifted.
+            mark_slot_mtp_drifted(*s);
 
             if (item.is_prefill) {
                 if (s->slot_valid && s->slot_idx < slots.size()) {
@@ -5412,6 +6089,11 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                                  req.prompt.begin() +
                                      static_cast<std::ptrdiff_t>(item.token_offset + static_cast<std::size_t>(item.token_count)));
                 }
+                s->committed_tokens.insert(
+                    s->committed_tokens.end(),
+                    req.prompt.begin() + static_cast<std::ptrdiff_t>(item.token_offset),
+                    req.prompt.begin() +
+                        static_cast<std::ptrdiff_t>(item.token_offset + static_cast<std::size_t>(item.token_count)));
                 s->prefill_offset += static_cast<std::size_t>(item.token_count);
                 s->pos += item.token_count;
                 AdvanceSwaSlot(s->slot_idx, mem, s->slot_id, static_cast<std::uint64_t>(s->pos));
@@ -5475,6 +6157,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 if (s->slot_valid && s->slot_idx < slots.size()) {
                     slots[s->slot_idx].tokens.push_back(s->cur_tok);
                 }
+                s->committed_tokens.push_back(s->cur_tok);
                 s->pos += 1;
                 AdvanceSwaSlot(s->slot_idx, mem, s->slot_id, static_cast<std::uint64_t>(s->pos));
 
@@ -5500,6 +6183,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     continue;
                 }
                 Emit(TelemetryKind::kTokenDecoded, 1, step_ms);
+                ++plain_decode_committed;
                 if (s->result.generated_tokens >= req.max_new_tokens) {
                     finish_slot(*s, StopReason::kMaxTokens);
                     continue;
@@ -5509,6 +6193,13 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     continue;
                 }
                 s->cur_tok = next_tok;
+            }
+        }
+
+        if (plan.prefill_slots == 0u && plain_decode_committed >= 2u) {
+            concurrent_cost_gate.ObservePlainStep(step_ms, plain_decode_committed);
+            if (concurrent_cost_gate.IsRegressed()) {
+                concurrent_cost_gate.NotePlainStepInCooldown();
             }
         }
 
@@ -5583,6 +6274,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         worker_stop.store(true, std::memory_order_release);
         leftover.swap(pending_queue);
         pending_count.store(0, std::memory_order_relaxed);
+        pending_exclusive_count.store(0, std::memory_order_relaxed);
     }
     for (PendingRequest* task : leftover) {
         GenerateResult res;

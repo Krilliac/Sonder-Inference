@@ -21,6 +21,7 @@
 #include "radix_cache.hpp"
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include "sonder/inference/backends/llamacpp.hpp"
+#include "speculation_transition.hpp"
 #include "suffix_matcher.hpp"
 #include <doctest/doctest.h>
 
@@ -2624,4 +2625,343 @@ TEST_CASE("llamacpp frontier: latency-target-aware batch planner, StepCostEstima
         REQUIRE(step.items.size() == 1u);
         CHECK(step.items[0].token_count == 2048);
     }
+}
+
+TEST_CASE("llamacpp frontier: post-batch suffix and ngram reactivation rebuilds exact committed history without stale prefix") {
+    // Simulates: Single -> Multi-request batch (advancing committed tokens) ->
+    // Drain -> Sustained cooldown window -> Safe reactivation with rebuilt history!
+    const std::vector<Token> prompt{
+        10, 11, 12, 13, 99, 98, 97, 96, 1, 2, 3,
+    };
+
+    // 1. SuffixMatcher end-to-end transition: tokens committed during plain batching
+    // introduce a new pattern [40, 41, 42, 43] -> [70, 71, 72, 73] that did NOT exist
+    // in `prompt`. Rebuilding from `committed_tokens` (never stale `prompt`!) must
+    // ground proposals in the exact post-batch prefix.
+    {
+        SuffixMatcher shared_ring_holder(/*session_ring_capacity=*/512, /*active_capacity=*/512);
+        SuffixMatcher slot_matcher(/*session_ring_capacity=*/BoundedSuffixAutomaton::kMinCapacity,
+                                   /*active_capacity=*/512);
+        SpeculationTransitionState state;
+        SlotSpecCapability cap;
+        cap.configured_mode = SlotSpecMode::kSuffix;
+        cap.configured_draft_max = 12;
+        cap.architecture = sonder::inference::ModelArchitecture::attention_only;
+        state.Configure(cap);
+
+        std::vector<Token> committed = prompt;
+        slot_matcher.BeginRequest(committed);
+
+        // Single-request phase commits 2 tokens.
+        committed.push_back(40);
+        slot_matcher.CommitToken(40);
+        committed.push_back(41);
+        slot_matcher.CommitToken(41);
+
+        // Enter multi-request batch: suspend speculation and clear active GSAM.
+        state.SuspendForBatch(SpecSuspendReason::kMultiRequestBatch);
+        slot_matcher.ClearActive();
+        CHECK(state.suspended_for_batch());
+        CHECK(slot_matcher.active_size() == 0u);
+
+        // Plain batch advances committed history with new tokens not in `prompt`.
+        const std::vector<Token> batch_generated{42, 43, 70, 71, 72, 73, 74, 75, 40, 41, 42};
+        committed.insert(committed.end(), batch_generated.begin(), batch_generated.end());
+        const Token cur_tok = 43;  // next token to evaluate at pos == committed.size()
+
+        SpeculationReactivationPolicy pol;
+        pol.cooldown_steps = 3;
+        pol.min_remaining_tokens_history = 16;
+
+        SpeculationReactivationInput rin;
+        rin.active_count = 1;
+        rin.pending_count = 0;
+        rin.pending_exclusive = false;
+        rin.in_decode_phase = true;
+        rin.slot_valid = true;
+        rin.remaining_max_tokens = 120;
+        rin.remaining_ctx_tokens = 1024;
+        rin.target_pos = static_cast<std::int64_t>(committed.size());
+        rin.committed_history_len = committed.size();
+        rin.history_matches_target_pos = true;
+
+        // First 2 steps stay in cooldown (plain decode).
+        CHECK(state.EvaluateSingleRequestStep(rin, pol).block_reason == SpecSuspendReason::kCooldownActive);
+        CHECK(state.EvaluateSingleRequestStep(rin, pol).block_reason == SpecSuspendReason::kCooldownActive);
+
+        // Step 3 reaches sustained window -> reactivate & rebuild from exact `committed`.
+        const SpeculationTransitionDecision dec = state.EvaluateSingleRequestStep(rin, pol);
+        REQUIRE(dec.should_reactivate);
+        CHECK(dec.target_mode == SlotSpecMode::kSuffix);
+        CHECK(dec.requires_history_rebuild);
+        slot_matcher.BeginRequest(committed);
+        state.CommitReactivation(dec);
+
+        CHECK_FALSE(state.suspended_for_batch());
+        CHECK(slot_matcher.current_request() == committed);
+
+        // Draft using rebuilt exact prefix [..., 40, 41, 42] + cur_tok=43 -> proposes [70, 71, 72, 73, 74, 75]!
+        const SuffixMatchResult draft = slot_matcher.DraftForCurrent(
+            cur_tok, /*max_draft=*/6, SuffixMatcher::kDefaultMinMatchLen, &shared_ring_holder.session_ring());
+        CHECK(draft.match_len == 4u);
+        REQUIRE(draft.draft.size() == 6u);
+        CHECK(draft.draft == std::vector<Token>{70, 71, 72, 73, 74, 75});
+
+        // Contrast: querying a stale prompt-only matcher would NOT have [40..43] -> [70..75]!
+        SuffixMatcher stale_matcher(/*session_ring_capacity=*/64, /*active_capacity=*/512);
+        stale_matcher.BeginRequest(prompt);
+        CHECK(stale_matcher.DraftForCurrent(cur_tok, 6).draft.empty());
+    }
+
+    // 2. NgramMatcher (short) & NgramModTable transition rebuild from exact committed tokens.
+    {
+        NgramMatcher local_ngram(/*exact_scan_fallback=*/true);
+        SpeculationTransitionState state;
+        SlotSpecCapability cap;
+        cap.configured_mode = SlotSpecMode::kNgramShort;
+        cap.configured_draft_max = 8;
+        cap.architecture = sonder::inference::ModelArchitecture::attention_only;
+        state.Configure(cap);
+
+        std::vector<Token> committed = prompt;
+        state.SuspendForBatch();
+        const std::vector<Token> during_batch{50, 51, 52, 53, 81, 82, 83, 84, 50, 51, 52};
+        committed.insert(committed.end(), during_batch.begin(), during_batch.end());
+
+        SpeculationReactivationPolicy pol;
+        pol.cooldown_steps = 1;
+        SpeculationReactivationInput rin;
+        rin.active_count = 1;
+        rin.in_decode_phase = true;
+        rin.slot_valid = true;
+        rin.remaining_max_tokens = 64;
+        rin.remaining_ctx_tokens = 512;
+        rin.target_pos = static_cast<std::int64_t>(committed.size());
+        rin.committed_history_len = committed.size();
+        rin.history_matches_target_pos = true;
+
+        const SpeculationTransitionDecision dec = state.EvaluateSingleRequestStep(rin, pol);
+        REQUIRE(dec.should_reactivate);
+        local_ngram.Reset();
+        local_ngram.IndexRange(committed, 0, committed.size());
+        state.CommitReactivation(dec);
+
+        committed.push_back(53);
+        std::vector<Token> draft;
+        local_ngram.Draft(committed, 4, draft);
+        committed.pop_back();
+        CHECK(draft == std::vector<Token>{81, 82, 83, 84});
+    }
+}
+
+TEST_CASE("llamacpp frontier: reactivation cooldown reset, MTP readiness, budget guard, and hybrid guard") {
+    // 1. Pending normal or exclusive request arriving during cooldown resets timer to 0.
+    {
+        SpeculationTransitionState st;
+        SlotSpecCapability cap;
+        cap.configured_mode = SlotSpecMode::kSuffix;
+        cap.configured_draft_max = 16;
+        st.Configure(cap);
+        st.SuspendForBatch();
+
+        SpeculationReactivationPolicy pol;
+        pol.cooldown_steps = 4;
+        SpeculationReactivationInput rin;
+        rin.active_count = 1;
+        rin.in_decode_phase = true;
+        rin.slot_valid = true;
+        rin.remaining_max_tokens = 100;
+        rin.remaining_ctx_tokens = 1000;
+        rin.target_pos = 40;
+        rin.committed_history_len = 40;
+        rin.history_matches_target_pos = true;
+
+        CHECK_FALSE(st.EvaluateSingleRequestStep(rin, pol).should_reactivate);
+        CHECK_FALSE(st.EvaluateSingleRequestStep(rin, pol).should_reactivate);
+        CHECK(st.low_concurrency_steps() == 2u);
+
+        rin.pending_count = 1;
+        CHECK(st.EvaluateSingleRequestStep(rin, pol).block_reason == SpecSuspendReason::kPendingRequest);
+        CHECK(st.low_concurrency_steps() == 0u);
+
+        rin.pending_count = 0;
+        CHECK_FALSE(st.EvaluateSingleRequestStep(rin, pol).should_reactivate);
+        CHECK(st.low_concurrency_steps() == 1u);
+
+        rin.pending_exclusive = true;
+        CHECK(st.EvaluateSingleRequestStep(rin, pol).block_reason == SpecSuspendReason::kExclusivePending);
+        CHECK(st.low_concurrency_steps() == 0u);
+    }
+
+    // 2. MTP reactivation requires validated draft_pos + pending_features_pos; hybrid falls back cleanly.
+    {
+        SpeculationTransitionState mtp_only;
+        SlotSpecCapability cap;
+        cap.configured_mode = SlotSpecMode::kDraftMtp;
+        cap.configured_draft_max = 3;
+        cap.suffix_fallback_available = false;
+        mtp_only.Configure(cap);
+        mtp_only.SuspendForBatch();
+
+        SpeculationReactivationPolicy pol;
+        pol.cooldown_steps = 1;
+        SpeculationReactivationInput rin;
+        rin.active_count = 1;
+        rin.in_decode_phase = true;
+        rin.slot_valid = true;
+        rin.remaining_max_tokens = 64;
+        rin.remaining_ctx_tokens = 512;
+        rin.target_pos = 90;
+        rin.committed_history_len = 90;
+        rin.history_matches_target_pos = true;
+        rin.mtp_readiness.draft_ctx_available = true;
+        rin.mtp_readiness.slot_valid = true;
+        rin.mtp_readiness.slot_mtp_synced = true;
+        rin.mtp_readiness.target_pos = 90;
+        rin.mtp_readiness.draft_pos = 88;  // drifted
+        rin.mtp_readiness.pending_features_valid = true;
+        rin.mtp_readiness.pending_features_pos = 90;
+        rin.mtp_readiness.pending_features_size_ok = true;
+
+        CHECK(mtp_only.EvaluateSingleRequestStep(rin, pol).block_reason == SpecSuspendReason::kMtpStateDrifted);
+
+        rin.mtp_readiness.draft_pos = 90;
+        rin.mtp_readiness.pending_features_pos = 88;  // stale target features
+        CHECK(mtp_only.EvaluateSingleRequestStep(rin, pol).block_reason == SpecSuspendReason::kMtpStateDrifted);
+
+        rin.mtp_readiness.pending_features_pos = 90;  // fully synchronized
+        const SpeculationTransitionDecision ok = mtp_only.EvaluateSingleRequestStep(rin, pol);
+        CHECK(ok.should_reactivate);
+        CHECK(ok.target_mode == SlotSpecMode::kDraftMtp);
+
+        // Remaining-budget guard blocks when only 3 tokens remain.
+        rin.remaining_max_tokens = 3;
+        CHECK(mtp_only.EvaluateSingleRequestStep(rin, pol).block_reason == SpecSuspendReason::kBudgetTooSmall);
+
+        // Cancellation blocks and resets cooldown; hybrid model with rs_cap=0 blocks MTP.
+        rin.remaining_max_tokens = 64;
+        rin.cancelled = true;
+        CHECK(mtp_only.EvaluateSingleRequestStep(rin, pol).block_reason == SpecSuspendReason::kCancelled);
+
+        SpeculationTransitionState hyb;
+        SlotSpecCapability hyb_cap;
+        hyb_cap.configured_mode = SlotSpecMode::kDraftMtp;
+        hyb_cap.configured_draft_max = 3;
+        hyb_cap.architecture = sonder::inference::ModelArchitecture::hybrid;
+        hyb_cap.hybrid_rs_cap = 0;
+        hyb_cap.can_hybrid_spec_ckpt = false;
+        hyb.Configure(hyb_cap);
+        CHECK(hyb.permanently_disabled());
+        CHECK(hyb.active_mode() == SlotSpecMode::kNone);
+    }
+}
+
+TEST_CASE("llamacpp frontier: small-batch concurrent linear draft isolation and option validation") {
+    // 1. Two isolated per-slot SuffixMatchers sharing one read-only session ring:
+    // slot 0 rejects all drafts while slot 1 accepts all drafts -> zero cross-slot
+    // corruption of proposal buffers, matcher state, or KV rollback ranges.
+    SuffixMatcher shared_ring(/*session_ring_capacity=*/512, /*active_capacity=*/512);
+    shared_ring.IngestSessionSequence(std::vector<Token>{500, 501, 502, 503, 504, 505, 506, 507});
+
+    SuffixMatcher slot0_matcher(/*session_ring_capacity=*/BoundedSuffixAutomaton::kMinCapacity, /*active_capacity=*/512);
+    SuffixMatcher slot1_matcher(/*session_ring_capacity=*/BoundedSuffixAutomaton::kMinCapacity, /*active_capacity=*/512);
+
+    std::vector<Token> hist0{10, 11, 12, 13, 20, 21, 22, 23, 10, 11, 12};
+    std::vector<Token> hist1{30, 31, 32, 33, 40, 41, 42, 43, 30, 31, 32};
+    slot0_matcher.BeginRequest(hist0);
+    slot1_matcher.BeginRequest(hist1);
+
+    const SuffixMatchResult d0 =
+        slot0_matcher.DraftForCurrent(/*id_last=*/13, /*max_draft=*/4, SuffixMatcher::kDefaultMinMatchLen,
+                                      &shared_ring.session_ring());
+    const SuffixMatchResult d1 =
+        slot1_matcher.DraftForCurrent(/*id_last=*/33, /*max_draft=*/4, SuffixMatcher::kDefaultMinMatchLen,
+                                      &shared_ring.session_ring());
+    REQUIRE(d0.draft == std::vector<Token>{20, 21, 22, 23});
+    REQUIRE(d1.draft == std::vector<Token>{40, 41, 42, 43});
+
+    ConcurrentSpecPolicy cpol;
+    cpol.enabled = true;
+    cpol.max_concurrent_slots = 4;
+    cpol.max_aggregate_draft_tokens = 6;  // tighter than 4 + 4 = 8 -> splits 3 + 3 fairly
+    cpol.max_per_slot_draft_tokens = 4;
+    std::size_t rr = 0;
+
+    const std::vector<ConcurrentSpecSlotInput> inputs{
+        {0, 0, static_cast<std::int64_t>(hist0.size()), false, false, true, 4, d0.draft.size()},
+        {1, 1, static_cast<std::int64_t>(hist1.size()), false, false, true, 4, d1.draft.size()},
+    };
+    const ConcurrentSpecBatchPlan plan = PlanConcurrentLinearSpeculation(
+        inputs, cpol, /*step_token_budget=*/128, /*step_output_budget=*/32, /*per_seq_output_budget=*/8,
+        sonder::inference::ModelArchitecture::attention_only, 0, false, rr);
+    REQUIRE(plan.use_concurrent_spec);
+    REQUIRE(plan.slots.size() == 2u);
+    CHECK(plan.total_draft_tokens == 6);
+    CHECK(plan.slots[0].allocated_draft_tokens == 3);
+    CHECK(plan.slots[1].allocated_draft_tokens == 3);
+
+    // Slot 0 rejects draft[0] (target sampled 99 instead of 20).
+    // Slot 1 accepts all 3 drafts + bonus token 43.
+    const std::vector<Token> prop0(d0.draft.begin(), d0.draft.begin() + 3);
+    const std::vector<Token> prop1(d1.draft.begin(), d1.draft.begin() + 3);
+    const LinearDraftVerifyOutcome v0 =
+        VerifyLinearDraftSlot(0, static_cast<std::int64_t>(hist0.size()), prop0, std::vector<Token>{99, 21, 22, 23});
+    const LinearDraftVerifyOutcome v1 =
+        VerifyLinearDraftSlot(1, static_cast<std::int64_t>(hist1.size()), prop1, std::vector<Token>{40, 41, 42, 43});
+
+    CHECK(v0.accepted_drafts == 0u);
+    CHECK(v0.rollback.seq_id == 0);
+    CHECK(v0.rollback.needs_rollback);
+    CHECK(v0.rollback.rm_from_pos == static_cast<std::int64_t>(hist0.size()) + 1);
+    CHECK(v0.rollback.rejected_tokens == 3);
+
+    CHECK(v1.accepted_drafts == 3u);
+    CHECK(v1.rollback.seq_id == 1);
+    CHECK_FALSE(v1.rollback.needs_rollback);
+    CHECK(v1.rollback.keep_pos == static_cast<std::int64_t>(hist1.size()) + 4);
+
+    // Updating slot 0's matcher with low acceptance does NOT pause or mutate slot 1's matcher!
+    for (int i = 0; i < 6; ++i) slot0_matcher.Observe(3, 0);
+    slot1_matcher.Observe(3, 3);
+    CHECK(slot0_matcher.paused());
+    CHECK_FALSE(slot1_matcher.paused());
+
+    // 2. Option defaults, validation, and adapter plumbing for new controls.
+    LoadOptions lo;
+    CHECK(lo.spec_reactivation_cooldown_steps == 4u);
+    CHECK_FALSE(lo.spec_batch_enabled);
+    CHECK(lo.spec_batch_max_slots == 4u);
+    CHECK(lo.spec_batch_max_aggregate_draft_tokens == 16);
+    CHECK(ValidateContextOptions(lo).ok());
+
+    lo.spec_reactivation_cooldown_steps = 1025u;
+    CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
+    lo.spec_reactivation_cooldown_steps = 4u;
+
+    lo.spec_batch_max_slots = 0u;
+    CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
+    lo.spec_batch_max_slots = kMaxSlots + 1u;
+    CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
+    lo.spec_batch_max_slots = 4u;
+
+    lo.spec_batch_max_aggregate_draft_tokens = -1;
+    CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
+    lo.spec_batch_max_aggregate_draft_tokens = kMaxSpecDraftTokens * static_cast<std::int32_t>(kMaxSlots) + 1;
+    CHECK(ValidateContextOptions(lo).code == ErrorCode::kInvalidArgument);
+    lo.spec_batch_max_aggregate_draft_tokens = 32;
+    lo.spec_batch_enabled = true;
+    CHECK(ValidateContextOptions(lo).ok());
+
+    namespace si = sonder::inference;
+    si::LlamaCppBackendOptions bo;
+    bo.slots = 4;
+    bo.spec_type = "suffix";
+    bo.spec_reactivation_cooldown_steps = 6;
+    bo.spec_batch_enabled = true;
+    bo.spec_batch_max_slots = 4;
+    bo.spec_batch_max_aggregate_draft_tokens = 24;
+    CHECK(si::validate_llamacpp_options(bo).ok());
+
+    bo.spec_batch_max_slots = 0;
+    CHECK(si::validate_llamacpp_options(bo).code() == si::ErrorCode::invalid_argument);
 }
