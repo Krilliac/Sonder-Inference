@@ -138,6 +138,40 @@ void SamplerChain::reset() {
     cur_.sorted = false;
 }
 
+SamplerChain::StateSnapshot SamplerChain::snapshot_state() const {
+    StateSnapshot snap;
+    snap.rng_state = rng_.state();
+    for (const auto& stage : stages_) {
+        auto hist = stage->snapshot_history();
+        if (!hist.empty()) {
+            snap.penalty_history = std::move(hist);
+            break;
+        }
+    }
+    if (constraint_) {
+        snap.constraint_state = constraint_->snapshot_state();
+    }
+    return snap;
+}
+
+bool SamplerChain::restore_state(const StateSnapshot& state) {
+    if (constraint_) {
+        if (!constraint_->restore_state(state.constraint_state)) {
+            return false;
+        }
+    } else if (!state.constraint_state.empty()) {
+        return false;
+    }
+    rng_.set_state(state.rng_state);
+    for (auto& stage : stages_) {
+        stage->reset();
+        stage->restore_history(state.penalty_history);
+    }
+    cur_.data.clear();
+    cur_.sorted = false;
+    return true;
+}
+
 bool SamplerChain::is_stop_token(TokenId token) const { return stop_tokens_.count(token) != 0; }
 
 std::vector<std::string_view> SamplerChain::stage_names() const {

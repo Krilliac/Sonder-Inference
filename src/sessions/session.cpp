@@ -51,6 +51,14 @@ const char* to_string(RequestOutcome outcome) noexcept {
     return "unknown";
 }
 
+const char* to_string(CheckpointMode mode) noexcept {
+    switch (mode) {
+        case CheckpointMode::Branch: return "branch";
+        case CheckpointMode::ExactResume: return "exact_resume";
+    }
+    return "unknown";
+}
+
 namespace {
 // These are backend observations. Keep their names distinct from Sonder's
 // logical reused_prompt_tokens, which do not prove physical KV reuse.
@@ -115,7 +123,441 @@ std::uint64_t model_fingerprint(const Model& m) {
 double ms_between(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
 }
+
+std::uint64_t current_process_epoch() noexcept {
+    static const std::uint64_t kEpoch = []() noexcept {
+        std::uint64_t h = 1469598103934665603ull;
+        const std::uint64_t t = monotonic_ns();
+        const std::uint64_t addr = reinterpret_cast<std::uintptr_t>(&current_process_epoch);
+        auto mix64 = [&](std::uint64_t v) noexcept {
+            for (int i = 0; i < 8; ++i) {
+                h ^= static_cast<std::uint8_t>((v >> (i * 8)) & 0xFFu);
+                h *= 1099511628211ull;
+            }
+        };
+        mix64(t);
+        mix64(addr);
+        mix64(0x517CC1B727220A95ull);
+        return h == 0 ? 1ull : h;
+    }();
+    return kEpoch;
+}
+
+std::uint64_t compute_fingerprint_digest(const ModelCompatibilityFingerprint& fp) noexcept {
+    std::uint64_t h = 1469598103934665603ull;
+    auto mix_u64 = [&](std::uint64_t v) noexcept {
+        for (int i = 0; i < 8; ++i) {
+            h ^= static_cast<std::uint8_t>((v >> (i * 8)) & 0xFFu);
+            h *= 1099511628211ull;
+        }
+    };
+    auto mix_str = [&](std::string_view s) noexcept {
+        mix_u64(static_cast<std::uint64_t>(s.size()));
+        for (const char c : s) {
+            h ^= static_cast<unsigned char>(c);
+            h *= 1099511628211ull;
+        }
+        h ^= 0xFFu;
+        h *= 1099511628211ull;
+    };
+    mix_u64(fp.process_epoch);
+    mix_str(fp.backend_name);
+    mix_str(fp.build_commit);
+    mix_str(fp.model_name);
+    mix_str(fp.model_format);
+    mix_str(fp.model_family);
+    mix_str(fp.parameter_size);
+    mix_str(fp.quantization);
+    mix_u64(fp.model_size_bytes);
+    mix_u64(fp.context_length);
+    mix_u64(static_cast<std::uint64_t>(fp.architecture));
+    mix_u64(fp.tokenizer_hash);
+    return h;
+}
+
+std::vector<std::string> build_prompt_token_pieces(std::string_view prompt, std::span<const TokenId> tokens) {
+    // Matches accounting_tokenize(): leading BOS (empty piece) + 1 piece per word
+    // preserving exact original whitespace so prefix slices reconstruct verbatim.
+    std::vector<std::string> pieces;
+    if (tokens.empty()) {
+        return pieces;
+    }
+    pieces.emplace_back();  // BOS
+    std::size_t i = 0;
+    while (i < prompt.size()) {
+        const std::size_t seg_start = i;
+        while (i < prompt.size() && detail::is_space(prompt[i])) ++i;
+        const std::size_t word_start = i;
+        while (i < prompt.size() && !detail::is_space(prompt[i])) ++i;
+        if (i > word_start) {
+            pieces.emplace_back(prompt.substr(seg_start, i - seg_start));
+        } else if (i > seg_start && !pieces.empty()) {
+            pieces.back().append(prompt.substr(seg_start, i - seg_start));
+        }
+    }
+    if (pieces.size() != tokens.size()) {
+        pieces.clear();  // Non-word tokenizer (e.g. BPE/SPM); fall back to detokenize.
+    }
+    return pieces;
+}
+
+std::string reconstruct_prefix_text(BackendModel& backend_model, std::span<const TokenId> tokens,
+                                    const std::vector<std::string>& pieces, std::size_t offset,
+                                    std::string_view full_fallback) {
+    if (offset == 0) {
+        return {};
+    }
+    if (offset >= tokens.size() && pieces.size() != tokens.size()) {
+        return std::string(full_fallback);
+    }
+    if (pieces.size() == tokens.size()) {
+        std::string out;
+        for (std::size_t i = 0; i < offset; ++i) {
+            out += pieces[i];
+        }
+        return out;
+    }
+    if (auto dt = backend_model.detokenize(tokens.subspan(0, offset)); dt.ok()) {
+        return std::move(dt).value();
+    }
+    return std::string(full_fallback);
+}
+
 }  // namespace
+
+bool ModelCompatibilityFingerprint::compatible_with(const ModelCompatibilityFingerprint& other) const noexcept {
+    return process_epoch == other.process_epoch && backend_name == other.backend_name &&
+           build_commit == other.build_commit && model_name == other.model_name &&
+           model_format == other.model_format && model_family == other.model_family &&
+           parameter_size == other.parameter_size && quantization == other.quantization &&
+           model_size_bytes == other.model_size_bytes && context_length == other.context_length &&
+           architecture == other.architecture && tokenizer_hash == other.tokenizer_hash &&
+           digest == other.digest;
+}
+
+std::string ModelCompatibilityFingerprint::mismatch_reason(const ModelCompatibilityFingerprint& other) const {
+    if (process_epoch != other.process_epoch) {
+        return "process_epoch mismatch (execution checkpoints are strictly same-process only)";
+    }
+    if (build_commit != other.build_commit) {
+        return "build_commit mismatch ('" + build_commit + "' vs '" + other.build_commit + "')";
+    }
+    if (backend_name != other.backend_name) {
+        return "backend_name mismatch ('" + backend_name + "' vs '" + other.backend_name + "')";
+    }
+    if (model_name != other.model_name) {
+        return "model_name mismatch ('" + model_name + "' vs '" + other.model_name + "')";
+    }
+    if (model_format != other.model_format) {
+        return "model_format mismatch ('" + model_format + "' vs '" + other.model_format + "')";
+    }
+    if (model_family != other.model_family) {
+        return "model_family mismatch ('" + model_family + "' vs '" + other.model_family + "')";
+    }
+    if (parameter_size != other.parameter_size) {
+        return "parameter_size mismatch ('" + parameter_size + "' vs '" + other.parameter_size + "')";
+    }
+    if (quantization != other.quantization) {
+        return "quantization mismatch ('" + quantization + "' vs '" + other.quantization + "')";
+    }
+    if (model_size_bytes != other.model_size_bytes) {
+        return "model_size_bytes mismatch";
+    }
+    if (context_length != other.context_length) {
+        return "context_length mismatch";
+    }
+    if (architecture != other.architecture) {
+        return "model architecture mismatch";
+    }
+    if (tokenizer_hash != other.tokenizer_hash) {
+        return "tokenizer_hash mismatch";
+    }
+    if (digest != other.digest) {
+        return "fingerprint digest mismatch";
+    }
+    return {};
+}
+
+ModelCompatibilityFingerprint compute_model_compatibility_fingerprint(const Model& model) {
+    ModelCompatibilityFingerprint fp;
+    const auto& d = model.descriptor();
+    fp.process_epoch = current_process_epoch();
+    fp.backend_name = model.backend_name();
+    fp.build_commit = std::string(version_string()) + "@" + std::string(build_commit());
+    fp.model_name = d.name;
+    fp.model_format = d.format;
+    fp.model_family = d.family;
+    fp.parameter_size = d.parameter_size;
+    fp.quantization = d.quantization;
+    fp.model_size_bytes = d.size_bytes;
+    fp.context_length = d.context_length;
+    fp.architecture = d.architecture;
+
+    std::uint64_t tok_h = 1469598103934665603ull;
+    auto mix_tok = [&](std::uint32_t v) noexcept {
+        for (int b = 0; b < 4; ++b) {
+            tok_h ^= static_cast<std::uint8_t>((v >> (b * 8)) & 0xFFu);
+            tok_h *= 1099511628211ull;
+        }
+    };
+    static constexpr std::string_view kProbe = "sonder checkpoint compatibility probe 0123456789";
+    if (auto toks = model.backend_model().tokenize(kProbe); toks.ok()) {
+        mix_tok(1u);
+        mix_tok(static_cast<std::uint32_t>(toks.value().size()));
+        for (const TokenId t : toks.value()) {
+            mix_tok(static_cast<std::uint32_t>(t));
+        }
+    } else {
+        mix_tok(0u);
+        for (const char c : fp.backend_name) {
+            tok_h ^= static_cast<unsigned char>(c);
+            tok_h *= 1099511628211ull;
+        }
+        for (const char c : fp.model_name) {
+            tok_h ^= static_cast<unsigned char>(c);
+            tok_h *= 1099511628211ull;
+        }
+    }
+    fp.tokenizer_hash = tok_h;
+    fp.digest = compute_fingerprint_digest(fp);
+    return fp;
+}
+
+std::size_t ExecutionCheckpointRecord::accounted_bytes() const noexcept {
+    std::size_t total = sizeof(ExecutionCheckpointRecord);
+    total += handle.checkpoint_id.size();
+    total += handle.owner_session_id.size();
+    total += prompt.size();
+    total += prompt_tokens.size() * sizeof(TokenId);
+    for (const auto& p : context_token_pieces) {
+        total += sizeof(std::string) + p.size();
+    }
+    total += generated_tokens.size() * sizeof(TokenId);
+    total += delivered_text.size();
+    total += sampler_penalty_history.size() * sizeof(TokenId);
+    total += grammar.size();
+    total += grammar_matcher_state.size();
+    total += stop_filter_pending.size();
+    total += pending_draft_tokens.size() * sizeof(TokenId);
+    total += backend_state_blob.size();
+    return total;
+}
+
+CheckpointStore::CheckpointStore(ExecutionCheckpointStoreOptions options, ClockFn clock)
+    : options_(options), clock_(std::move(clock)) {}
+
+std::chrono::steady_clock::time_point CheckpointStore::now() const {
+    return clock_ ? clock_() : std::chrono::steady_clock::now();
+}
+
+void CheckpointStore::collect_expired_locked(std::chrono::steady_clock::time_point ts,
+                                             std::vector<ExecutionCheckpointRecord>& evicted) {
+    for (auto it = lru_.begin(); it != lru_.end();) {
+        if (it->record.handle.expired(ts)) {
+            total_bytes_ = total_bytes_ >= it->bytes ? (total_bytes_ - it->bytes) : 0;
+            index_.erase(it->id);
+            evicted.push_back(std::move(it->record));
+            it = lru_.erase(it);
+            ++evictions_expired_;
+        } else {
+            ++it;
+        }
+    }
+}
+
+void CheckpointStore::invoke_evicted(const std::vector<ExecutionCheckpointRecord>& evicted) {
+    if (evicted.empty()) {
+        return;
+    }
+    EvictCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cb = evict_callback_;
+    }
+    if (!cb) {
+        return;
+    }
+    for (const auto& rec : evicted) {
+        cb(rec);
+    }
+}
+
+Result<ExecutionCheckpointHandle> CheckpointStore::put(ExecutionCheckpointRecord record,
+                                                       std::optional<std::chrono::milliseconds> ttl) {
+    if (ttl && ttl->count() < 0) {
+        return Status(ErrorCode::invalid_argument, "checkpoint TTL must be non-negative");
+    }
+    if (options_.max_bytes == 0 || options_.max_entries == 0) {
+        return Status(ErrorCode::unavailable, "execution checkpoint store is disabled (zero capacity)");
+    }
+    if (record.handle.checkpoint_id.empty()) {
+        record.handle.checkpoint_id = make_id("ckpt");
+    }
+    record.handle.same_process_only = true;
+    const auto ts = now();
+    record.handle.created_at = ts;
+    const std::chrono::milliseconds effective_ttl = ttl.value_or(options_.default_ttl);
+    if (effective_ttl.count() > 0) {
+        record.handle.expires_at = ts + effective_ttl;
+    } else if (ttl.has_value()) {
+        record.handle.expires_at = ts;
+    } else {
+        record.handle.expires_at = {};
+    }
+
+    const std::size_t bytes = record.accounted_bytes();
+    record.handle.approx_bytes = bytes;
+    if (bytes > options_.max_bytes) {
+        return Status(ErrorCode::invalid_argument,
+                      "execution checkpoint (" + std::to_string(bytes) +
+                          " bytes) exceeds store max_bytes (" + std::to_string(options_.max_bytes) + ")");
+    }
+
+    std::vector<ExecutionCheckpointRecord> evicted;
+    ExecutionCheckpointHandle handle = record.handle;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        collect_expired_locked(ts, evicted);
+
+        if (auto existing = index_.find(handle.checkpoint_id); existing != index_.end()) {
+            const auto lru_it = existing->second;
+            total_bytes_ = total_bytes_ >= lru_it->bytes ? (total_bytes_ - lru_it->bytes) : 0;
+            evicted.push_back(std::move(lru_it->record));
+            lru_.erase(lru_it);
+            index_.erase(existing);
+        }
+
+        while (!lru_.empty() &&
+               (total_bytes_ > options_.max_bytes - bytes || index_.size() >= options_.max_entries)) {
+            Entry& victim = lru_.back();
+            total_bytes_ = total_bytes_ >= victim.bytes ? (total_bytes_ - victim.bytes) : 0;
+            index_.erase(victim.id);
+            evicted.push_back(std::move(victim.record));
+            lru_.pop_back();
+            ++evictions_capacity_;
+        }
+
+        lru_.push_front(Entry{handle.checkpoint_id, std::move(record), bytes});
+        index_.emplace(handle.checkpoint_id, lru_.begin());
+        total_bytes_ += bytes;
+    }
+    invoke_evicted(evicted);
+    return handle;
+}
+
+Result<ExecutionCheckpointRecord> CheckpointStore::get(const std::string& checkpoint_id) {
+    if (checkpoint_id.empty()) {
+        return Status(ErrorCode::invalid_argument, "checkpoint_id is empty");
+    }
+    std::vector<ExecutionCheckpointRecord> evicted;
+    std::optional<ExecutionCheckpointRecord> found;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        collect_expired_locked(now(), evicted);
+        auto it = index_.find(checkpoint_id);
+        if (it != index_.end()) {
+            lru_.splice(lru_.begin(), lru_, it->second);
+            found = it->second->record;
+        }
+    }
+    invoke_evicted(evicted);
+    if (!found) {
+        return Status(ErrorCode::not_found, "execution checkpoint not found or expired: " + checkpoint_id);
+    }
+    return std::move(*found);
+}
+
+bool CheckpointStore::release(const std::string& checkpoint_id) {
+    if (checkpoint_id.empty()) {
+        return false;
+    }
+    std::vector<ExecutionCheckpointRecord> evicted;
+    bool removed = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = index_.find(checkpoint_id);
+        if (it != index_.end()) {
+            const auto lru_it = it->second;
+            total_bytes_ = total_bytes_ >= lru_it->bytes ? (total_bytes_ - lru_it->bytes) : 0;
+            evicted.push_back(std::move(lru_it->record));
+            lru_.erase(lru_it);
+            index_.erase(it);
+            ++releases_;
+            removed = true;
+        }
+    }
+    invoke_evicted(evicted);
+    return removed;
+}
+
+std::size_t CheckpointStore::release_owned_by(std::string_view session_id) {
+    if (session_id.empty()) {
+        return 0;
+    }
+    std::vector<ExecutionCheckpointRecord> evicted;
+    std::size_t count = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto it = lru_.begin(); it != lru_.end();) {
+            if (it->record.handle.owner_session_id == session_id) {
+                total_bytes_ = total_bytes_ >= it->bytes ? (total_bytes_ - it->bytes) : 0;
+                index_.erase(it->id);
+                evicted.push_back(std::move(it->record));
+                it = lru_.erase(it);
+                ++releases_;
+                ++count;
+            } else {
+                ++it;
+            }
+        }
+    }
+    invoke_evicted(evicted);
+    return count;
+}
+
+std::size_t CheckpointStore::sweep_expired() {
+    std::vector<ExecutionCheckpointRecord> evicted;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        collect_expired_locked(now(), evicted);
+    }
+    const std::size_t n = evicted.size();
+    invoke_evicted(evicted);
+    return n;
+}
+
+void CheckpointStore::clear() {
+    std::vector<ExecutionCheckpointRecord> evicted;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        evicted.reserve(lru_.size());
+        for (auto& e : lru_) {
+            evicted.push_back(std::move(e.record));
+        }
+        lru_.clear();
+        index_.clear();
+        total_bytes_ = 0;
+    }
+    invoke_evicted(evicted);
+}
+
+void CheckpointStore::set_evict_callback(EvictCallback cb) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    evict_callback_ = std::move(cb);
+}
+
+ExecutionCheckpointStoreStats CheckpointStore::stats() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ExecutionCheckpointStoreStats s;
+    s.entries = index_.size();
+    s.total_bytes = total_bytes_;
+    s.max_bytes = options_.max_bytes;
+    s.max_entries = options_.max_entries;
+    s.evictions_capacity = evictions_capacity_;
+    s.evictions_expired = evictions_expired_;
+    s.releases = releases_;
+    return s;
+}
 
 Session::Session(Engine& engine, std::shared_ptr<Model> model, SessionOptions options)
     : engine_(engine), model_(std::move(model)), options_(std::move(options)) {
@@ -170,7 +612,12 @@ void Session::cancel() {
     }
 }
 
+void Session::request_suspend(SuspendAction action) {
+    suspend_requested_.store(static_cast<std::uint8_t>(action), std::memory_order_release);
+}
+
 void Session::close() {
+    std::uint64_t seq_to_release = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_ == SessionState::closed) {
@@ -182,36 +629,641 @@ void Session::close() {
             active_cancel_->cancel();
         }
         state_ = SessionState::closed;
+        seq_to_release = logical_kv_seq_id_;
+        logical_kv_seq_id_ = 0;
+        last_continuation_.reset();
     }
+    if (seq_to_release != 0) {
+        if (detail::RequestRuntime* rt = engine_.request_runtime()) {
+            rt->release_logical_sequence(seq_to_release);
+        }
+    }
+    (void)engine_.checkpoint_store().release_owned_by(options_.session_id);
     engine_.telemetry().emit("session.closed", telemetry_context(),
                              json::Object{{"requests", requests_started()}}, TelemetryLevel::metrics);
 }
 
+std::size_t Session::context_token_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return context_tokens_.size();
+}
+
+std::vector<TokenId> Session::context_tokens() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return context_tokens_;
+}
+
+std::string Session::context_prompt() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return context_prompt_;
+}
+
+std::uint64_t Session::logical_kv_sequence_id() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return logical_kv_seq_id_;
+}
+
+ModelCompatibilityFingerprint Session::compatibility_fingerprint() const {
+    return compute_model_compatibility_fingerprint(*model_);
+}
+
+Result<std::shared_ptr<Session>> Session::fork(const ForkOptions& options) {
+    std::string parent_prompt;
+    std::vector<TokenId> parent_tokens;
+    std::vector<std::string> parent_pieces;
+    bool parent_exact = false;
+    std::uint64_t parent_seq_id = 0;
+    std::vector<std::uint8_t> parent_recurrent_blob;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == SessionState::closed) {
+            return Status(ErrorCode::invalid_state, "cannot fork a closed session");
+        }
+        if (state_ == SessionState::running) {
+            return Status(ErrorCode::invalid_state, "cannot fork while a request is in flight");
+        }
+        parent_prompt = context_prompt_;
+        parent_tokens = context_tokens_;
+        parent_pieces = context_token_pieces_;
+        parent_exact = exact_context_tokens_;
+        parent_seq_id = logical_kv_seq_id_;
+        parent_recurrent_blob = last_recurrent_state_blob_;
+    }
+
+    const std::size_t target_len = options.prefix_token_offset.value_or(parent_tokens.size());
+    if (target_len > parent_tokens.size()) {
+        return Status(ErrorCode::invalid_argument,
+                      "fork prefix_token_offset (" + std::to_string(target_len) +
+                          ") exceeds session context length (" + std::to_string(parent_tokens.size()) + ")");
+    }
+
+    SessionOptions child_opts = options.session_options;
+    if (options.inherit_session_options) {
+        SessionOptions inherited = options_;
+        inherited.session_id = options.session_options.session_id;
+        if (options.session_options.run_id) inherited.run_id = options.session_options.run_id;
+        if (options.session_options.agent_id) inherited.agent_id = options.session_options.agent_id;
+        if (options.session_options.task_id) inherited.task_id = options.session_options.task_id;
+        child_opts = std::move(inherited);
+    }
+    if (child_opts.session_id.empty()) {
+        child_opts.session_id = make_id("sess");
+    }
+    if (Status st = validate(child_opts.sampling); !st.ok()) {
+        return st;
+    }
+
+    std::uint64_t child_seq_id = 0;
+    detail::RequestRuntime* runtime = engine_.request_runtime();
+    if (runtime != nullptr && !parent_tokens.empty()) {
+        const std::int32_t rank = static_cast<std::int32_t>(options_.workload) - options_.priority;
+        const std::int32_t cache_prio = std::clamp(6 - rank, 0, 255);
+        if (parent_seq_id == 0) {
+            auto ensured = runtime->ensure_logical_sequence(
+                0, parent_tokens, model_fingerprint(*model_), model_->descriptor().architecture, cache_prio,
+                parent_recurrent_blob);
+            if (!ensured.ok()) {
+                return ensured.status();
+            }
+            parent_seq_id = ensured.value().sequence_id;
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_ == SessionState::closed) {
+                runtime->release_logical_sequence(parent_seq_id);
+                return Status(ErrorCode::invalid_state, "parent session closed during fork");
+            }
+            if (logical_kv_seq_id_ == 0) {
+                logical_kv_seq_id_ = parent_seq_id;
+            } else {
+                runtime->release_logical_sequence(parent_seq_id);
+                parent_seq_id = logical_kv_seq_id_;
+            }
+        }
+        const std::int32_t child_rank = static_cast<std::int32_t>(child_opts.workload) - child_opts.priority;
+        const std::int32_t child_cache_prio = std::clamp(6 - child_rank, 0, 255);
+        std::optional<std::size_t> rewind_opt =
+            target_len < parent_tokens.size() ? std::optional<std::size_t>(target_len) : std::nullopt;
+        auto forked = runtime->fork_logical_sequence(parent_seq_id, rewind_opt, child_cache_prio);
+        if (!forked.ok()) {
+            return forked.status();
+        }
+        child_seq_id = forked.value().sequence_id;
+    }
+
+    std::vector<TokenId> child_tokens(parent_tokens.begin(),
+                                      parent_tokens.begin() + static_cast<std::ptrdiff_t>(target_len));
+    std::vector<std::string> child_pieces;
+    if (parent_pieces.size() == parent_tokens.size()) {
+        child_pieces.assign(parent_pieces.begin(),
+                            parent_pieces.begin() + static_cast<std::ptrdiff_t>(target_len));
+    }
+    const std::string child_prompt =
+        target_len == parent_tokens.size()
+            ? parent_prompt
+            : reconstruct_prefix_text(model_->backend_model(), parent_tokens, parent_pieces, target_len, parent_prompt);
+
+    auto child = std::make_shared<Session>(engine_, model_, std::move(child_opts));
+    {
+        std::lock_guard<std::mutex> lock(child->mutex_);
+        child->context_prompt_ = child_prompt;
+        child->context_tokens_ = std::move(child_tokens);
+        child->context_token_pieces_ = std::move(child_pieces);
+        child->exact_context_tokens_ = parent_exact;
+        child->branched_context_ = true;
+        child->logical_kv_seq_id_ = child_seq_id;
+        child->last_continuation_.reset();  // Branch starts with fresh sampler/stop/grammar state.
+    }
+
+    engine_.telemetry().emit("session.forked", telemetry_context(),
+                             json::Object{{"child_session_id", child->id()},
+                                          {"mode", to_string(CheckpointMode::Branch)},
+                                          {"token_offset", static_cast<std::uint64_t>(target_len)},
+                                          {"parent_tokens", static_cast<std::uint64_t>(parent_tokens.size())},
+                                          {"logical_kv_sequence_id", child_seq_id}},
+                             TelemetryLevel::metrics);
+    return child;
+}
+
+Status Session::rewind(std::size_t token_offset) {
+    std::string cur_prompt;
+    std::vector<TokenId> cur_tokens;
+    std::vector<std::string> cur_pieces;
+    std::uint64_t seq_id = 0;
+    std::vector<std::uint8_t> recurrent_blob;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == SessionState::closed) {
+            return Status(ErrorCode::invalid_state, "cannot rewind a closed session");
+        }
+        if (state_ == SessionState::running) {
+            return Status(ErrorCode::invalid_state, "cannot rewind while a request is in flight");
+        }
+        if (token_offset > context_tokens_.size()) {
+            return Status(ErrorCode::invalid_argument,
+                          "rewind token_offset (" + std::to_string(token_offset) +
+                              ") exceeds session context length (" + std::to_string(context_tokens_.size()) + ")");
+        }
+        cur_prompt = context_prompt_;
+        cur_tokens = context_tokens_;
+        cur_pieces = context_token_pieces_;
+        seq_id = logical_kv_seq_id_;
+        recurrent_blob = last_recurrent_state_blob_;
+    }
+
+    detail::RequestRuntime* runtime = engine_.request_runtime();
+    if (runtime != nullptr && !cur_tokens.empty()) {
+        const std::int32_t rank = static_cast<std::int32_t>(options_.workload) - options_.priority;
+        const std::int32_t cache_prio = std::clamp(6 - rank, 0, 255);
+        if (seq_id == 0) {
+            auto ensured = runtime->ensure_logical_sequence(
+                0, cur_tokens, model_fingerprint(*model_), model_->descriptor().architecture, cache_prio,
+                recurrent_blob);
+            if (!ensured.ok()) {
+                return ensured.status();
+            }
+            seq_id = ensured.value().sequence_id;
+        }
+        auto truncated = runtime->truncate_logical_sequence(seq_id, token_offset);
+        if (!truncated.ok()) {
+            if (logical_kv_sequence_id() == 0) {
+                runtime->release_logical_sequence(seq_id);
+            }
+            return truncated.status();
+        }
+    }
+
+    const std::string rewound_prompt =
+        reconstruct_prefix_text(model_->backend_model(), cur_tokens, cur_pieces, token_offset, cur_prompt);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == SessionState::closed) {
+            if (seq_id != 0 && runtime != nullptr) {
+                runtime->release_logical_sequence(seq_id);
+            }
+            return Status(ErrorCode::invalid_state, "session closed during rewind");
+        }
+        context_tokens_.resize(token_offset);
+        if (context_token_pieces_.size() >= token_offset) {
+            context_token_pieces_.resize(token_offset);
+        } else {
+            context_token_pieces_.clear();
+        }
+        context_prompt_ = rewound_prompt;
+        logical_kv_seq_id_ = seq_id;
+        branched_context_ = true;
+        last_continuation_.reset();
+    }
+
+    engine_.telemetry().emit("session.rewound", telemetry_context(),
+                             json::Object{{"token_offset", static_cast<std::uint64_t>(token_offset)},
+                                          {"previous_tokens", static_cast<std::uint64_t>(cur_tokens.size())},
+                                          {"logical_kv_sequence_id", seq_id}},
+                             TelemetryLevel::metrics);
+    return Status::success();
+}
+
+Result<ExecutionCheckpointHandle> Session::export_checkpoint(const CheckpointExportOptions& options) {
+    std::string cur_prompt;
+    std::vector<TokenId> cur_tokens;
+    std::vector<std::string> cur_pieces;
+    bool cur_exact = false;
+    std::uint64_t cur_seq_id = 0;
+    std::optional<ExecutionCheckpointRecord> cur_cont;
+    std::vector<std::uint8_t> cur_recurrent_blob;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == SessionState::closed) {
+            return Status(ErrorCode::invalid_state, "cannot export checkpoint from a closed session");
+        }
+        if (state_ == SessionState::running) {
+            return Status(ErrorCode::invalid_state, "cannot export checkpoint while a request is in flight");
+        }
+        cur_prompt = context_prompt_;
+        cur_tokens = context_tokens_;
+        cur_pieces = context_token_pieces_;
+        cur_exact = exact_context_tokens_;
+        cur_seq_id = logical_kv_seq_id_;
+        cur_cont = last_continuation_;
+        cur_recurrent_blob = last_recurrent_state_blob_;
+    }
+
+    detail::RequestRuntime* runtime = engine_.request_runtime();
+    const ModelCompatibilityFingerprint fp = compatibility_fingerprint();
+
+    ExecutionCheckpointRecord rec;
+    rec.handle.owner_session_id = options_.session_id;
+    rec.handle.mode = options.mode;
+    rec.handle.compatibility = fp;
+    rec.handle.same_process_only = true;
+
+    if (options.mode == CheckpointMode::Branch) {
+        const std::size_t target_len = options.token_offset.value_or(cur_tokens.size());
+        if (target_len > cur_tokens.size()) {
+            return Status(ErrorCode::invalid_argument,
+                          "export_checkpoint token_offset (" + std::to_string(target_len) +
+                              ") exceeds session context length (" + std::to_string(cur_tokens.size()) + ")");
+        }
+        std::uint64_t ckpt_seq_id = 0;
+        if (runtime != nullptr && !cur_tokens.empty()) {
+            const std::int32_t rank = static_cast<std::int32_t>(options_.workload) - options_.priority;
+            const std::int32_t cache_prio = std::clamp(6 - rank, 0, 255);
+            if (cur_seq_id == 0) {
+                auto ensured = runtime->ensure_logical_sequence(
+                    0, cur_tokens, model_fingerprint(*model_), model_->descriptor().architecture, cache_prio,
+                    cur_recurrent_blob);
+                if (!ensured.ok()) {
+                    return ensured.status();
+                }
+                cur_seq_id = ensured.value().sequence_id;
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (logical_kv_seq_id_ == 0 && state_ != SessionState::closed) {
+                    logical_kv_seq_id_ = cur_seq_id;
+                } else {
+                    runtime->release_logical_sequence(cur_seq_id);
+                    cur_seq_id = logical_kv_seq_id_;
+                }
+            }
+            std::optional<std::size_t> rewind_opt =
+                target_len < cur_tokens.size() ? std::optional<std::size_t>(target_len) : std::nullopt;
+            auto forked = runtime->fork_logical_sequence(cur_seq_id, rewind_opt, cache_prio);
+            if (!forked.ok()) {
+                return forked.status();
+            }
+            ckpt_seq_id = forked.value().sequence_id;
+        }
+        rec.logical_kv_sequence_id = ckpt_seq_id;
+        rec.prompt = target_len == cur_tokens.size()
+                         ? cur_prompt
+                         : reconstruct_prefix_text(model_->backend_model(), cur_tokens, cur_pieces, target_len,
+                                                   cur_prompt);
+        rec.prompt_tokens.assign(cur_tokens.begin(), cur_tokens.begin() + static_cast<std::ptrdiff_t>(target_len));
+        if (cur_pieces.size() == cur_tokens.size()) {
+            rec.context_token_pieces.assign(cur_pieces.begin(),
+                                            cur_pieces.begin() + static_cast<std::ptrdiff_t>(target_len));
+        }
+        rec.exact_tokens = cur_exact;
+        rec.handle.token_position = static_cast<std::uint64_t>(target_len);
+        // Branch explicitly resets continuation state (fresh sampling, stop, grammar, offset).
+        rec.delivered_offset_bytes = 0;
+        rec.delivered_chunks = 0;
+        rec.delivered_completion_tokens = 0;
+        rec.has_sampler_rng_state = false;
+    } else {
+        if (!cur_cont.has_value()) {
+            return Status(ErrorCode::invalid_state,
+                          "ExactResume export requires an active/interrupted generation state on this session");
+        }
+        if (options.token_offset.has_value() && *options.token_offset != cur_cont->handle.token_position) {
+            return Status(ErrorCode::invalid_argument,
+                          "ExactResume cannot rewind to an arbitrary token_offset; use CheckpointMode::Branch instead");
+        }
+        rec = *cur_cont;
+        rec.handle.checkpoint_id.clear();
+        rec.handle.owner_session_id = options_.session_id;
+        rec.handle.mode = CheckpointMode::ExactResume;
+        rec.handle.compatibility = fp;
+        rec.handle.same_process_only = true;
+        if (!options.pending_draft_tokens.empty()) {
+            rec.pending_draft_tokens = options.pending_draft_tokens;
+        }
+        if (!options.grammar_matcher_state.empty()) {
+            rec.grammar_matcher_state = options.grammar_matcher_state;
+        }
+        rec.logical_kv_sequence_id = 0;
+        if (runtime != nullptr && cur_seq_id != 0) {
+            auto forked = runtime->fork_logical_sequence(cur_seq_id);
+            if (forked.ok()) {
+                rec.logical_kv_sequence_id = forked.value().sequence_id;
+            }
+        }
+    }
+
+    const std::uint64_t ckpt_kv_seq = rec.logical_kv_sequence_id;
+    auto stored = engine_.checkpoint_store().put(std::move(rec), options.ttl);
+    if (!stored.ok()) {
+        if (ckpt_kv_seq != 0 && runtime != nullptr) {
+            runtime->release_logical_sequence(ckpt_kv_seq);
+        }
+        return stored.status();
+    }
+    engine_.telemetry().emit("session.checkpoint.exported", telemetry_context(),
+                             json::Object{{"checkpoint_id", stored.value().checkpoint_id},
+                                          {"mode", to_string(options.mode)},
+                                          {"token_position", stored.value().token_position},
+                                          {"approx_bytes", stored.value().approx_bytes},
+                                          {"same_process_only", true}},
+                             TelemetryLevel::metrics);
+    return stored;
+}
+
+Result<GenerationResult> Session::resume_from_checkpoint(const ExecutionCheckpointHandle& handle,
+                                                         const TokenCallback& on_chunk,
+                                                         const ResumeOptions& resume_options) {
+    if (!handle.valid()) {
+        return Status(ErrorCode::invalid_argument, "checkpoint handle is empty/invalid");
+    }
+    if (!handle.same_process_only) {
+        return Status(ErrorCode::invalid_argument,
+                      "cross-process/cross-host execution checkpoints are not supported");
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == SessionState::closed) {
+            return Status(ErrorCode::invalid_state, "session is closed");
+        }
+        if (state_ == SessionState::running) {
+            return Status(ErrorCode::invalid_state, "session already has a request in flight");
+        }
+    }
+    const ModelCompatibilityFingerprint live_fp = compatibility_fingerprint();
+    if (!handle.compatibility.compatible_with(live_fp)) {
+        return Status(ErrorCode::invalid_argument,
+                      "incompatible execution checkpoint handle: " + handle.compatibility.mismatch_reason(live_fp));
+    }
+
+    auto fetched = engine_.checkpoint_store().get(handle.checkpoint_id);
+    if (!fetched.ok()) {
+        return fetched.status();
+    }
+    ExecutionCheckpointRecord rec = std::move(fetched).value();
+    if (!rec.handle.compatibility.compatible_with(live_fp)) {
+        return Status(ErrorCode::invalid_argument,
+                      "incompatible stored execution checkpoint: " + rec.handle.compatibility.mismatch_reason(live_fp));
+    }
+    if (rec.handle.mode != handle.mode) {
+        return Status(ErrorCode::invalid_argument, "checkpoint handle mode does not match stored checkpoint");
+    }
+
+    if (rec.handle.mode == CheckpointMode::Branch) {
+        if (resume_options.request_options.grammar_hooks && resume_options.request_options.grammar_hooks->reset) {
+            resume_options.request_options.grammar_hooks->reset();
+        }
+        std::string prompt = rec.prompt;
+        if (!resume_options.branch_prompt_suffix.empty()) {
+            if (!prompt.empty() && !detail::is_space(prompt.back()) &&
+                !detail::is_space(resume_options.branch_prompt_suffix.front())) {
+                prompt.push_back(' ');
+            }
+            prompt += resume_options.branch_prompt_suffix;
+        }
+        std::uint64_t new_seq_id = 0;
+        if (rec.logical_kv_sequence_id != 0) {
+            if (detail::RequestRuntime* rt = engine_.request_runtime()) {
+                auto forked = rt->fork_logical_sequence(rec.logical_kv_sequence_id);
+                if (forked.ok()) {
+                    new_seq_id = forked.value().sequence_id;
+                }
+            }
+        }
+        std::uint64_t old_seq_id = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            old_seq_id = logical_kv_seq_id_;
+            logical_kv_seq_id_ = new_seq_id;
+            context_prompt_ = rec.prompt;
+            context_tokens_ = rec.prompt_tokens;
+            context_token_pieces_ = rec.context_token_pieces;
+            exact_context_tokens_ = rec.exact_tokens;
+            branched_context_ = false;  // `prompt` already includes the branched prefix.
+            last_continuation_.reset();
+        }
+        if (old_seq_id != 0) {
+            if (detail::RequestRuntime* rt = engine_.request_runtime()) {
+                rt->release_logical_sequence(old_seq_id);
+            }
+        }
+        if (resume_options.consume_checkpoint) {
+            (void)engine_.checkpoint_store().release(handle.checkpoint_id);
+        }
+        return run_request("generate", prompt, nullptr, on_chunk, resume_options.sampling_override,
+                           resume_options.request_options);
+    }
+
+    // ExactResume semantics: must continue from exact interrupted boundary.
+    if (!resume_options.branch_prompt_suffix.empty()) {
+        return Status(ErrorCode::invalid_argument,
+                      "ExactResume does not accept branch_prompt_suffix; use CheckpointMode::Branch to branch");
+    }
+    if (resume_options.sampling_override.has_value()) {
+        return Status(ErrorCode::invalid_argument,
+                      "ExactResume preserves checkpointed sampling/RNG/stop state; use CheckpointMode::Branch to "
+                      "override sampling or max_additional_tokens to extend token budget");
+    }
+    if (resume_options.max_additional_tokens.has_value() && *resume_options.max_additional_tokens < 0) {
+        return Status(ErrorCode::invalid_argument, "max_additional_tokens must be >= 0");
+    }
+    if (resume_options.consume_checkpoint) {
+        (void)engine_.checkpoint_store().release(handle.checkpoint_id);
+    }
+    RequestOptions effective_ro = resume_options.request_options;
+    if (effective_ro.grammar.empty() && !rec.grammar.empty()) {
+        effective_ro.grammar = rec.grammar;
+    }
+    return run_request("generate", rec.prompt, nullptr, on_chunk, rec.sampling, effective_ro, &rec,
+                       resume_options.max_additional_tokens);
+}
+
+bool Session::release_checkpoint(const ExecutionCheckpointHandle& handle) {
+    if (!handle.valid()) {
+        return false;
+    }
+    return engine_.checkpoint_store().release(handle.checkpoint_id);
+}
+
 #if defined(SONDER_HAS_SAMPLER_CHAIN)
 namespace {
+
+class HooksConstraint final : public sampling::Constraint {
+public:
+    explicit HooksConstraint(GrammarMatcherHooks hooks) : hooks_(std::move(hooks)) {}
+
+    std::string_view name() const noexcept override { return "grammar_hooks"; }
+
+    void apply(sampling::Candidates& candidates) override {
+        if (!hooks_.mask_logits || candidates.data.empty()) {
+            return;
+        }
+        std::size_t max_id = 0;
+        for (const auto& item : candidates.data) {
+            if (item.id >= 0 && static_cast<std::size_t>(item.id) + 1 > max_id) {
+                max_id = static_cast<std::size_t>(item.id) + 1;
+            }
+        }
+        if (max_id == 0) {
+            return;
+        }
+        buf_.assign(max_id, sampling::kNegInf);
+        for (const auto& item : candidates.data) {
+            if (item.id >= 0) {
+                buf_[static_cast<std::size_t>(item.id)] = item.logit;
+            }
+        }
+        hooks_.mask_logits(std::span<float>(buf_));
+        for (auto& item : candidates.data) {
+            if (item.id >= 0) {
+                item.logit = buf_[static_cast<std::size_t>(item.id)];
+            }
+        }
+        candidates.sorted = false;
+    }
+
+    void accept(sampling::TokenId token) override {
+        if (hooks_.accept_token) {
+            hooks_.accept_token(token);
+        }
+    }
+
+    void reset() override {
+        if (hooks_.reset) {
+            hooks_.reset();
+        }
+    }
+
+    std::vector<std::uint8_t> snapshot_state() const override {
+        return hooks_.snapshot_state ? hooks_.snapshot_state() : std::vector<std::uint8_t>{};
+    }
+
+    bool restore_state(std::span<const std::uint8_t> state) override {
+        if (hooks_.restore_state) {
+            return hooks_.restore_state(state);
+        }
+        return state.empty();
+    }
+
+private:
+    GrammarMatcherHooks hooks_;
+    std::vector<float> buf_;
+};
 
 // Token-level decode loop with Sonder's sampler chain (Capability::token_logits).
 // NoViableCandidates maps to invalid_argument: it only happens when the
 // request's own policy (bias/penalties/constraints) excludes every
 // token, so retrying the same request cannot succeed. EmptyLogits is a backend
 // fault (backend_error).
-template <class Gate, class Produced, class Deliver>
-Result<GenerateStats> run_sonder_sampling(TokenStream& stream, BackendModel& backend_model,
-                                          const SamplingConfig& config, const CancellationToken& cancel,
-                                          TelemetryBus& bus, const TelemetryContext& ctx, const Gate& gate,
-                                          const Produced& produced, const Deliver& deliver,
-                                          StageTimings* stage_timings = nullptr) {
+// Supports both fresh generation and ExactResume continuation (restoring RNG,
+// penalty history, grammar matcher state, stop-filter pending buffer, delivered
+// offset, and backend stream state) plus non-blocking safe-point suspension.
+template <class Gate, class Produced, class Deliver, class PollSafePoint>
+Result<GenerateStats> run_sonder_sampling(
+    TokenStream& stream, BackendModel& backend_model, const SamplingConfig& config, const CancellationToken& cancel,
+    TelemetryBus& bus, const TelemetryContext& ctx, const Gate& gate, const Produced& produced,
+    const Deliver& deliver, const PollSafePoint& poll_safe_point, const RequestOptions& request_options,
+    const ExecutionCheckpointRecord* exact_resume, std::optional<std::int32_t> max_additional_tokens,
+    ExecutionCheckpointRecord* out_continuation, SuspendedExecutionState* out_suspended,
+    std::vector<TokenId>& out_generated_tokens, std::vector<std::string>& out_generated_pieces,
+    StageTimings* stage_timings = nullptr) {
     namespace smp = sampling;
     GenerateStats stats;
     stats.prompt_tokens = stream.prompt_tokens().size();
     stats.token_counts_from_backend = true;
 
-    auto built = smp::make_chain(config, nullptr, stream.vocab_size());
+    std::shared_ptr<smp::Constraint> constraint;
+    if (request_options.grammar_hooks) {
+        constraint = std::make_shared<HooksConstraint>(*request_options.grammar_hooks);
+    }
+
+    auto built = smp::make_chain(config, constraint, stream.vocab_size());
     if (!built.ok()) {
         return built.status();
     }
     smp::SamplerChain& chain = built.value();
-    chain.accept_prompt(stream.prompt_tokens());
+    smp::StopSequenceMatcher stop(config.stop);
+
+    std::uint64_t prior_completion_tokens = 0;
+    std::int32_t step_limit = config.max_tokens;
+    if (exact_resume != nullptr) {
+        // Restore backend stream state (spill blob) or replay generated tokens (recompute).
+        bool restored_stream = false;
+        if (!exact_resume->backend_state_blob.empty()) {
+            Status rst = stream.restore_state(exact_resume->backend_state_blob,
+                                              exact_resume->backend_state_token_position);
+            if (rst.ok()) {
+                restored_stream = true;
+                stats.cached_tokens = exact_resume->backend_state_token_position;
+            } else if (rst.code() != ErrorCode::unsupported) {
+                return rst;
+            }
+        }
+        if (!restored_stream) {
+            for (const TokenId t : exact_resume->generated_tokens) {
+                std::string ignored;
+                if (Status st = stream.accept(t, ignored); !st.ok()) {
+                    return st;
+                }
+            }
+        }
+        smp::SamplerChain::StateSnapshot snap;
+        snap.rng_state = exact_resume->sampler_rng_state;
+        snap.penalty_history = exact_resume->sampler_penalty_history;
+        snap.constraint_state = exact_resume->grammar_matcher_state;
+        if (exact_resume->has_sampler_rng_state) {
+            if (!chain.restore_state(snap)) {
+                return Status(ErrorCode::invalid_argument,
+                              "failed to restore sampler/grammar continuation state on ExactResume");
+            }
+        } else {
+            chain.accept_prompt(stream.prompt_tokens());
+            for (const TokenId t : exact_resume->generated_tokens) {
+                chain.accept(t);
+            }
+        }
+        stop.restore_state(exact_resume->stop_filter_pending, exact_resume->stop_filter_stopped);
+        stats.chunks = exact_resume->delivered_chunks;
+        prior_completion_tokens = exact_resume->delivered_completion_tokens;
+        out_generated_tokens = exact_resume->generated_tokens;
+        if (max_additional_tokens.has_value()) {
+            step_limit = std::max<std::int32_t>(0, *max_additional_tokens);
+        } else {
+            const std::uint64_t cap = static_cast<std::uint64_t>(std::max<std::int32_t>(0, config.max_tokens));
+            step_limit = cap > prior_completion_tokens
+                             ? static_cast<std::int32_t>(std::min<std::uint64_t>(
+                                   cap - prior_completion_tokens,
+                                   static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())))
+                             : 0;
+        }
+    } else {
+        chain.accept_prompt(stream.prompt_tokens());
+    }
+
     {
         json::Array stages;
         for (const auto name : chain.stage_names()) {
@@ -222,19 +1274,80 @@ Result<GenerateStats> run_sonder_sampling(TokenStream& stream, BackendModel& bac
                               {"selector", config.temperature == 0.0f ? "greedy" : "distribution"},
                               {"stages", std::move(stages)},
                               {"seed", config.seed},
-                              {"vocab_size", stream.vocab_size()}},
+                              {"vocab_size", stream.vocab_size()},
+                              {"resumed", exact_resume != nullptr}},
                  TelemetryLevel::metrics);
     }
 
-    smp::StopSequenceMatcher stop(config.stop);
+    auto capture_continuation_state = [&](SuspendAction suspend_act, std::size_t max_spill_bytes,
+                                          bool do_suspend) {
+        std::vector<std::uint8_t> stream_blob;
+        if (!do_suspend || suspend_act == SuspendAction::yield_spill) {
+            if (auto cap = stream.capture_state(max_spill_bytes); cap.ok()) {
+                stream_blob = std::move(cap).value();
+            }
+        }
+        const bool reclaimed = do_suspend ? stream.reclaim_physical_state() : false;
+        const std::uint64_t total_gen = prior_completion_tokens + stats.completion_tokens;
+        const std::uint64_t total_pos = static_cast<std::uint64_t>(stream.prompt_tokens().size()) + total_gen;
+        if (do_suspend && out_suspended != nullptr) {
+            out_suspended->action = suspend_act;
+            out_suspended->token_position = total_pos;
+            out_suspended->generated_tokens = total_gen;
+            out_suspended->tokens = stream.prompt_tokens();
+            out_suspended->tokens.insert(out_suspended->tokens.end(), out_generated_tokens.begin(),
+                                         out_generated_tokens.end());
+            out_suspended->backend_state_blob = stream_blob;
+            out_suspended->physical_slot_reclaimed = reclaimed;
+        }
+        if (out_continuation != nullptr) {
+            const auto snap = chain.snapshot_state();
+            out_continuation->prompt_tokens = stream.prompt_tokens();
+            out_continuation->generated_tokens = out_generated_tokens;
+            out_continuation->delivered_chunks = stats.chunks;
+            out_continuation->delivered_completion_tokens = total_gen;
+            out_continuation->sampling = config;
+            out_continuation->sampler_rng_state = snap.rng_state;
+            out_continuation->has_sampler_rng_state = true;
+            out_continuation->sampler_penalty_history = snap.penalty_history;
+            out_continuation->grammar = request_options.grammar;
+            out_continuation->grammar_matcher_state = snap.constraint_state;
+            out_continuation->stop_filter_pending = stop.pending();
+            out_continuation->stop_filter_stopped = stop.stopped();
+            out_continuation->backend_state_blob = std::move(stream_blob);
+            out_continuation->backend_state_token_position = total_pos;
+            out_continuation->handle.token_position = total_pos;
+            out_continuation->handle.delivered_chunks = stats.chunks;
+            out_continuation->handle.delivered_completion_tokens = total_gen;
+        }
+    };
+
     const auto t0 = std::chrono::steady_clock::now();
-    for (std::int32_t i = 0; i < config.max_tokens; ++i) {
+    // Pre-decode safe point.
+    {
+        SafePointContext sp;
+        sp.prompt_tokens = stream.prompt_tokens().size();
+        sp.prefill_completed_tokens = stream.prompt_tokens().size();
+        sp.generated_tokens = prior_completion_tokens;
+        sp.kv_tokens = stream.prompt_tokens().size() + prior_completion_tokens;
+        sp.in_prefill = true;
+        const SuspendDecision dec = poll_safe_point(sp);
+        if (dec.action != SuspendAction::continue_running) {
+            capture_continuation_state(dec.action, dec.max_spill_bytes, /*do_suspend=*/true);
+            stats.stop_reason = StopReason::suspended;
+            stats.eval_ns = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+            return stats;
+        }
+    }
+
+    for (std::int32_t i = 0; i < step_limit; ++i) {
         if (cancel.cancelled()) {
             return Status(ErrorCode::cancelled, "cancelled by caller");
         }
         if (!gate()) {
             stats.stop_reason = StopReason::callback;
-            return stats;
+            break;
         }
         auto logits = stream.next_logits(cancel);
         if (!logits.ok()) {
@@ -265,8 +1378,11 @@ Result<GenerateStats> run_sonder_sampling(TokenStream& stream, BackendModel& bac
         if (Status st = stream.accept(sampled.token, piece); !st.ok()) {
             return st;
         }
+        out_generated_tokens.push_back(sampled.token);
+        out_generated_pieces.push_back(piece);
         ++stats.completion_tokens;
         const smp::StopCheck check = stop.feed(piece);
+        bool stopped_by_callback = false;
         if (!check.emit.empty()) {
             TokenChunk chunk{check.emit, stats.chunks++};
             if (config.logprobs) {
@@ -284,12 +1400,14 @@ Result<GenerateStats> run_sonder_sampling(TokenStream& stream, BackendModel& bac
                 const double lse = (std::isfinite(max_l) && sum_exp > 0.0) ? (max_l + std::log(sum_exp)) : 0.0;
                 if (sampled.token >= 0 && static_cast<std::size_t>(sampled.token) < raw.size() &&
                     std::isfinite(raw[static_cast<std::size_t>(sampled.token)])) {
-                    chunk.logprob = static_cast<float>(static_cast<double>(raw[static_cast<std::size_t>(sampled.token)]) - lse);
+                    chunk.logprob =
+                        static_cast<float>(static_cast<double>(raw[static_cast<std::size_t>(sampled.token)]) - lse);
                 } else {
                     chunk.logprob = sampled.probability > 0.0f ? std::log(sampled.probability) : -1e9f;
                 }
                 if (config.top_logprobs > 0 && !raw.empty()) {
-                    const std::size_t k = std::min<std::size_t>(static_cast<std::size_t>(config.top_logprobs), raw.size());
+                    const std::size_t k =
+                        std::min<std::size_t>(static_cast<std::size_t>(config.top_logprobs), raw.size());
                     std::vector<std::size_t> order(raw.size());
                     std::iota(order.begin(), order.end(), 0);
                     std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(k), order.end(),
@@ -314,14 +1432,29 @@ Result<GenerateStats> run_sonder_sampling(TokenStream& stream, BackendModel& bac
             }
             if (!deliver(chunk, sampled.token, sampled.probability)) {
                 stats.stop_reason = StopReason::callback;
-                break;
+                stopped_by_callback = true;
             }
+        }
+        if (stopped_by_callback) {
+            break;
         }
         if (check.stopped) {
             stats.stop_reason = StopReason::stop_sequence;
             if (check.stop_index < config.stop.size()) {
                 stats.matched_stop = config.stop[check.stop_index];
             }
+            break;
+        }
+        SafePointContext sp;
+        sp.prompt_tokens = stream.prompt_tokens().size();
+        sp.prefill_completed_tokens = stream.prompt_tokens().size();
+        sp.generated_tokens = prior_completion_tokens + stats.completion_tokens;
+        sp.kv_tokens = stream.prompt_tokens().size() + sp.generated_tokens;
+        sp.in_prefill = false;
+        const SuspendDecision dec = poll_safe_point(sp);
+        if (dec.action != SuspendAction::continue_running) {
+            capture_continuation_state(dec.action, dec.max_spill_bytes, /*do_suspend=*/true);
+            stats.stop_reason = StopReason::suspended;
             break;
         }
     }
@@ -334,6 +1467,9 @@ Result<GenerateStats> run_sonder_sampling(TokenStream& stream, BackendModel& bac
             const TokenChunk chunk{rest, stats.chunks++};
             (void)deliver(chunk, std::nullopt, 0.0f);
         }
+    }
+    if (stats.stop_reason != StopReason::suspended) {
+        capture_continuation_state(SuspendAction::continue_running, kMaxRecurrentCheckpointBytes, /*do_suspend=*/false);
     }
     stats.eval_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
@@ -987,7 +2123,9 @@ Result<ScoreResult> Session::score(const ScoreRequest& request, const RequestOpt
 Result<GenerationResult> Session::run_request(const char* kind, const std::string& prompt,
                                               const std::vector<ChatMessage>* messages, const TokenCallback& on_chunk,
                                               const std::optional<SamplingConfig>& sampling_override,
-                                              const RequestOptions& request_options) {
+                                              const RequestOptions& request_options,
+                                              const ExecutionCheckpointRecord* exact_resume,
+                                              std::optional<std::int32_t> max_additional_tokens) {
     SamplingConfig sampling = sampling_override.value_or(options_.sampling);
     if (auto st = validate(sampling); !st.ok()) {
         return st;
@@ -1013,17 +2151,53 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         }
         return RequestPriority::background;
     }();
+
+    // For forked/rewound sessions, prepend the active branched context prefix
+    // on ordinary generate() calls (unless caller already passed the full prefix).
+    std::string effective_prompt = prompt;
+    std::uint64_t existing_branch_seq_id = 0;
+    bool using_branch_prefix = false;
+    std::size_t branch_prefix_tokens = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == SessionState::closed) {
+            return Status(ErrorCode::invalid_state, "session is closed");
+        }
+        if (state_ == SessionState::running) {
+            return Status(ErrorCode::invalid_state, "session already has a request in flight");
+        }
+        existing_branch_seq_id = logical_kv_seq_id_;
+        if (exact_resume == nullptr && messages == nullptr && branched_context_ && !context_prompt_.empty()) {
+            using_branch_prefix = true;
+            branch_prefix_tokens = context_tokens_.size();
+            if (effective_prompt.empty()) {
+                effective_prompt = context_prompt_;
+            } else if (effective_prompt.rfind(context_prompt_, 0) != 0) {
+                std::string combined = context_prompt_;
+                if (!detail::is_space(combined.back()) && !detail::is_space(effective_prompt.front())) {
+                    combined.push_back(' ');
+                }
+                combined += effective_prompt;
+                effective_prompt = std::move(combined);
+            }
+        }
+    }
+
     GenerateRequest request;
     request.request_id = request_options.request_id && !request_options.request_id->empty()
                              ? *request_options.request_id
                              : make_id("req");
-    request.prompt = prompt;
+    request.prompt = effective_prompt;
     request.sampling = sampling;
     request.session_key = request_options.session_key;
     request.grammar = request_options.grammar;
     request.priority_class = effective_priority;
     request.target_ttft_ms = request_options.target_ttft_ms;
     request.target_itl_ms = request_options.target_itl_ms;
+    request.enable_stage_profiling = request_options.enable_stage_profiling;
+    request.priority_rank = static_cast<int>(options_.workload) - options_.priority;
+    request.allow_preempt_spill =
+        request_options.allow_preempt_spill || engine_.scheduling_options().enable_spill_preemption;
 
     // Prepare failure recovery before publishing running. No cleanup action
     // can replace an exception from a public C++ callback.
@@ -1088,6 +2262,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
             std::lock_guard<std::mutex> lock(mutex_);
             active_cancel_.reset();
             cancel_requested_ns_.store(0);
+            suspend_requested_.store(0, std::memory_order_release);
             last_outcome_ = RequestOutcome::failed;
             last_scheduler_rejected_ = false;
             if (state_ == SessionState::running) state_ = SessionState::idle;
@@ -1115,6 +2290,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         token = active_cancel_->token();
         state_ = SessionState::running;
         cancel_requested_ns_.store(0);
+        suspend_requested_.store(0, std::memory_order_release);
         ++requests_started_;
         failure_guard.armed = true;
     }
@@ -1159,7 +2335,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         json::Object queued{{"kind", kind},
                             {"priority", options_.priority},
                             {"workload", to_string(options_.workload)},
-                            {"prompt_bytes", prompt.size()}};
+                            {"prompt_bytes", effective_prompt.size()}};
         if (messages != nullptr) {
             queued.set("messages", messages->size());
         }
@@ -1183,7 +2359,8 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         backend && backend->capabilities().has(Capability::recurrent_checkpoint);
 #if defined(SONDER_HAS_SAMPLER_CHAIN)
     const bool use_token_logits =
-        !backend_chat_call && request.grammar.empty() && backend && backend->capabilities().has(Capability::token_logits);
+        !backend_chat_call && (request.grammar.empty() || request_options.grammar_hooks.has_value()) && backend &&
+        backend->capabilities().has(Capability::token_logits);
     const bool defer_stream_open =
         (engine_.scheduling_options().strict_priority_admission || checkpoint_candidate) && use_token_logits;
     if (!defer_stream_open && use_token_logits) {
@@ -1205,11 +2382,20 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     // Scheduling: the request enters the scheduler queue and holds KV blocks.
     // Per-chunk grants pace an in-process backend's decode; a remote process
     // batches on its own, so by default it is only admitted and accounted.
+    // Backends with shared continuous-batching workers or selective_preemption
+    // use non-blocking gate separation so pausing ONE request yields cleanly at
+    // a backend safe point without stalling peer slots on the shared thread.
     const SchedulerMode mode = engine_.scheduling_options().mode;
     const bool remote = backend && backend->capabilities().has(Capability::remote_process);
     const bool gated = mode == SchedulerMode::gate || (mode == SchedulerMode::automatic && !remote);
+    const bool nonblocking_gate =
+        request_options.nonblocking_gate ||
+        (backend && (backend->capabilities().has(Capability::selective_preemption) ||
+                     backend->capabilities().has(Capability::continuous_batch_decode)));
     bool use_checkpoints = false;
     std::uint64_t aligned_capture_pos = 0;
+    std::vector<TokenId> tracked_prompt_tokens;
+    bool tracked_exact_tokens = false;
     if (runtime != nullptr && !pre_failed) {
         detail::RuntimeRequestSpec spec;
         spec.context = ctx;
@@ -1225,15 +2411,17 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
             // Exact only for the prompt the backend actually receives: a native
             // chat template differs from the generic prompt, so native chat is
             // accounted approximately below.
-            if (auto tk = backend_model.tokenize(prompt); tk.ok() && !tk.value().empty()) {
+            if (auto tk = backend_model.tokenize(effective_prompt); tk.ok() && !tk.value().empty()) {
                 spec.prompt_tokens = std::move(tk).value();
                 spec.exact_tokens = true;
             }
         }
         if (spec.prompt_tokens.empty()) {
-            spec.prompt_tokens = detail::accounting_tokenize(prompt);
+            spec.prompt_tokens = detail::accounting_tokenize(effective_prompt);
             spec.exact_tokens = false;
         }
+        tracked_prompt_tokens = spec.prompt_tokens;
+        tracked_exact_tokens = spec.exact_tokens;
         spec.max_new_tokens = static_cast<std::uint32_t>(sampling.max_tokens);
         // A requested num_ctx narrows the model's context window (0 = model default).
         std::uint64_t ctx_limit = model_->descriptor().context_length;
@@ -1278,6 +2466,20 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
             pre_failed = true;
             scheduler_rejected = true;
         }
+    } else if (!pre_failed) {
+        if (stream) {
+            tracked_prompt_tokens = stream->prompt_tokens();
+            tracked_exact_tokens = true;
+        } else if (!native_chat) {
+            if (auto tk = backend_model.tokenize(effective_prompt); tk.ok() && !tk.value().empty()) {
+                tracked_prompt_tokens = std::move(tk).value();
+                tracked_exact_tokens = true;
+            }
+        }
+        if (tracked_prompt_tokens.empty()) {
+            tracked_prompt_tokens = detail::accounting_tokenize(effective_prompt);
+            tracked_exact_tokens = false;
+        }
     }
 
     {
@@ -1287,6 +2489,9 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                              {"sampler", (stream || defer_stream_open) ? "sonder" : "backend"}};
         if (sched_id) {
             started.set("scheduler_mode", gated ? "gate" : "account");
+            if (nonblocking_gate) {
+                started.set("nonblocking_gate", true);
+            }
         }
         if (messages != nullptr) {
             started.set("chat_template", native_chat ? "native" : "generic");
@@ -1298,7 +2503,8 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
 
     std::chrono::steady_clock::time_point t_first{};
     bool have_first = false;
-    std::size_t delivered_bytes = 0;
+    std::size_t delivered_bytes = exact_resume != nullptr ? static_cast<std::size_t>(exact_resume->delivered_offset_bytes) : 0;
+    const std::uint64_t resume_chunk_base = exact_resume != nullptr ? exact_resume->delivered_chunks : 0;
     std::optional<Status> output_limit_failure;
 
     // Telemetry + user callback for one visible chunk (not gated).
@@ -1373,13 +2579,12 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
 
     // Scheduler gate: every generated token waits for a grant (gated), or
     // the request waits once for admission (ungated, before the backend call).
+    // When nonblocking_gate is active, admission waits on the caller thread
+    // while in-flight per-token callbacks never block the shared worker thread.
     std::optional<Status> gate_failure;
     const auto prepare_backend = [&]() -> Status {
-        // Library callers retain the old per-chunk gate unless they explicitly
-        // enable strict admission. Account mode always waits once up front, and
-        // checkpoint-enabled hybrid/recurrent requests wait for logical prefill
-        // so any matched recurrent checkpoint can be restored before decode.
-        if (sched_id && (!gated || engine_.scheduling_options().strict_priority_admission || use_checkpoints)) {
+        if (sched_id &&
+            (!gated || nonblocking_gate || engine_.scheduling_options().strict_priority_admission || use_checkpoints)) {
             Status st = gated ? runtime->admit_backend(*sched_id, token, request_options.deadline)
                               : runtime->acquire_token(*sched_id, token, request_options.deadline);
             if (!st.ok()) return st;
@@ -1400,6 +2605,21 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         if (!sched_id || !gated) {
             return true;
         }
+        if (nonblocking_gate) {
+            const detail::GatePollResult gp = runtime->try_acquire_token_nonblocking(*sched_id, token);
+            if (gp.status == detail::GatePollStatus::granted) {
+                return true;
+            }
+            if (gp.status == detail::GatePollStatus::yield_recompute ||
+                gp.status == detail::GatePollStatus::yield_spill) {
+                // Never block on shared worker; safe-point callback handles selective suspension.
+                return true;
+            }
+            if (gp.status != detail::GatePollStatus::cancelled && !gp.error.ok()) {
+                gate_failure = gp.error;
+            }
+            return false;
+        }
         ScopedStageTimer gate_timer(stage_profiling ? &session_stages.callback_gate_wait_ms : nullptr);
         Status st = runtime->acquire_token(*sched_id, token);
         gate_timer.stop();
@@ -1419,6 +2639,37 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
             runtime->token_produced(*sched_id, t);
         }
     };
+
+    const char* suspend_reason_seen = nullptr;
+    const auto poll_safe_point = [&](const SafePointContext& sp) -> SuspendDecision {
+        const auto req_act = static_cast<SuspendAction>(suspend_requested_.load(std::memory_order_acquire));
+        if (req_act != SuspendAction::continue_running) {
+            suspend_reason_seen = "caller_suspend";
+            return SuspendDecision{req_act, "caller_suspend", kMaxRecurrentCheckpointBytes};
+        }
+        if (request_options.on_safe_point) {
+            const SuspendDecision user_dec = request_options.on_safe_point(sp);
+            if (user_dec.action != SuspendAction::continue_running) {
+                suspend_reason_seen = user_dec.reason ? user_dec.reason : "safe_point_callback";
+                return user_dec;
+            }
+        }
+        if (sched_id && gated && nonblocking_gate) {
+            const SuspendDecision sched_dec = runtime->poll_suspend_decision(*sched_id, token);
+            if (sched_dec.action != SuspendAction::continue_running) {
+                suspend_reason_seen = sched_dec.reason ? sched_dec.reason : "scheduler_preempt";
+                return sched_dec;
+            }
+        }
+        return SuspendDecision{};
+    };
+
+    ExecutionCheckpointRecord captured_continuation;
+    bool has_captured_continuation = false;
+    SuspendedExecutionState suspended_state;
+    std::vector<TokenId> generated_tokens_accum;
+    std::vector<std::string> generated_pieces_accum;
+    std::vector<std::uint8_t> captured_recurrent_blob;
 
     Result<GenerateStats> generated = GenerateStats{};
     Status prepared = pre_failed ? failure : prepare_backend();
@@ -1467,6 +2718,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                                               {"error_code", to_string(ErrorCode::invalid_argument)}},
                                  TelemetryLevel::deep);
                     } else {
+                        captured_recurrent_blob = bytes;
                         const Status reg = runtime->register_checkpoint(*sched_id, pos, std::move(bytes));
                         if (reg.ok()) {
                             bus.emit("kv.checkpoint.saved", ctx,
@@ -1522,14 +2774,58 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         } else if (stream) {
 #if defined(SONDER_HAS_SAMPLER_CHAIN)
             generated = run_sonder_sampling(*stream, backend_model, sampling, token, bus, ctx, gate, produced, deliver,
-                                            stage_profiling ? &session_stages : nullptr);
+                                            poll_safe_point, request_options, exact_resume, max_additional_tokens,
+                                            &captured_continuation, &suspended_state, generated_tokens_accum,
+                                            generated_pieces_accum, stage_profiling ? &session_stages : nullptr);
+            has_captured_continuation = generated.ok();
 #endif
         } else {
+            ExecutionResumeState exec_resume;
+            if (exact_resume != nullptr) {
+                exec_resume.token_position = exact_resume->handle.token_position;
+                exec_resume.generated_tokens = exact_resume->delivered_completion_tokens;
+                exec_resume.backend_step_index = exact_resume->backend_step_index;
+                exec_resume.generated_token_ids = exact_resume->generated_tokens;
+                exec_resume.pending_draft_tokens = exact_resume->pending_draft_tokens;
+                exec_resume.backend_state_blob = exact_resume->backend_state_blob;
+                exec_resume.stop_filter_pending = exact_resume->stop_filter_pending;
+                exec_resume.stop_filter_stopped = exact_resume->stop_filter_stopped;
+                request.execution_resume = &exec_resume;
+                if (max_additional_tokens.has_value()) {
+                    request.sampling.max_tokens = std::max<std::int32_t>(0, *max_additional_tokens);
+                } else {
+                    const std::uint64_t cap = static_cast<std::uint64_t>(std::max<std::int32_t>(0, sampling.max_tokens));
+                    request.sampling.max_tokens =
+                        cap > exact_resume->delivered_completion_tokens
+                            ? static_cast<std::int32_t>(cap - exact_resume->delivered_completion_tokens)
+                            : 0;
+                }
+            }
+            request.on_safe_point = poll_safe_point;
+            request.suspended_state = &suspended_state;
+
             const auto on_backend_chunk = [&](const TokenChunk& chunk) -> bool {
-                if (!gated || !sched_id) return deliver(chunk, std::nullopt, 0.0f);
+                TokenChunk adjusted = chunk;
+                adjusted.index = resume_chunk_base + chunk.index;
+                const TokenId tok = detail::accounting_chunk_token(chunk.text);
+                generated_tokens_accum.push_back(tok);
+                generated_pieces_accum.emplace_back(chunk.text);
+                if (!gated || !sched_id) return deliver(adjusted, std::nullopt, 0.0f);
+                if (nonblocking_gate) {
+                    const detail::GatePollResult gp = runtime->try_acquire_token_nonblocking(*sched_id, token);
+                    if (gp.status == detail::GatePollStatus::cancelled) {
+                        return false;
+                    }
+                    if (gp.status == detail::GatePollStatus::failed) {
+                        gate_failure = gp.error;
+                        return false;
+                    }
+                    produced(tok);
+                    return deliver(adjusted, std::nullopt, 0.0f);
+                }
                 if (!gate()) return false;
-                produced(detail::accounting_chunk_token(chunk.text));
-                return deliver(chunk, std::nullopt, 0.0f);
+                produced(tok);
+                return deliver(adjusted, std::nullopt, 0.0f);
             };
             if (backend_chat_call) {
                 ChatRequest chat_request;
@@ -1554,6 +2850,49 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                 generated = backend_model.chat(chat_request, token, on_backend_chunk);
             } else {
                 generated = backend_model.generate(request, token, on_backend_chunk);
+            }
+            request.execution_resume = nullptr;
+            request.suspended_state = nullptr;
+            if (generated.ok()) {
+                const std::uint64_t prior_gen = exact_resume != nullptr ? exact_resume->delivered_completion_tokens : 0;
+                const std::uint64_t total_gen = prior_gen + generated.value().completion_tokens;
+                captured_continuation.prompt_tokens = tracked_prompt_tokens;
+                if (generated.value().stop_reason == StopReason::suspended && !suspended_state.tokens.empty() &&
+                    suspended_state.tokens.size() >= tracked_prompt_tokens.size()) {
+                    captured_continuation.generated_tokens.assign(
+                        suspended_state.tokens.begin() + static_cast<std::ptrdiff_t>(tracked_prompt_tokens.size()),
+                        suspended_state.tokens.end());
+                } else {
+                    if (exact_resume != nullptr) {
+                        captured_continuation.generated_tokens = exact_resume->generated_tokens;
+                    }
+                    captured_continuation.generated_tokens.insert(captured_continuation.generated_tokens.end(),
+                                                                  generated_tokens_accum.begin(),
+                                                                  generated_tokens_accum.end());
+                }
+                captured_continuation.delivered_chunks = resume_chunk_base + delivered;
+                captured_continuation.delivered_completion_tokens = total_gen;
+                captured_continuation.sampling = sampling;
+                captured_continuation.grammar = request_options.grammar;
+                captured_continuation.pending_draft_tokens = suspended_state.pending_draft_tokens;
+                captured_continuation.backend_state_blob = suspended_state.backend_state_blob;
+                captured_continuation.backend_step_index =
+                    suspended_state.backend_step_index > 0 ? suspended_state.backend_step_index : total_gen;
+                const std::uint64_t tok_pos = suspended_state.token_position > 0
+                                                  ? suspended_state.token_position
+                                                  : (static_cast<std::uint64_t>(tracked_prompt_tokens.size()) + total_gen);
+                captured_continuation.backend_state_token_position = tok_pos;
+                captured_continuation.handle.token_position = tok_pos;
+                captured_continuation.handle.delivered_chunks = captured_continuation.delivered_chunks;
+                captured_continuation.handle.delivered_completion_tokens = total_gen;
+                if (!suspended_state.stop_filter_pending.empty() || suspended_state.stop_filter_stopped) {
+                    captured_continuation.stop_filter_pending = suspended_state.stop_filter_pending;
+                    captured_continuation.stop_filter_stopped = suspended_state.stop_filter_stopped;
+                } else if (!sampling.stop.empty()) {
+                    captured_continuation.stop_filter_pending =
+                        (exact_resume != nullptr ? exact_resume->stop_filter_pending : std::string()) + result.text;
+                }
+                has_captured_continuation = true;
             }
         }
         request.checkpoint = nullptr;
@@ -1593,6 +2932,8 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     }
     const auto t_end = std::chrono::steady_clock::now();
     result.total_ms = ms_between(t_start, t_end);
+    result.delivered_offset_bytes = static_cast<std::uint64_t>(delivered_bytes);
+    result.delivered_chunks = resume_chunk_base + delivered;
 
     const bool was_cancelled =
         token.cancelled() || (!generated.ok() && generated.status().code() == ErrorCode::cancelled);
@@ -1629,6 +2970,13 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         result.stats = generated.value();
     }
     result.outcome = outcome;
+
+    const bool was_suspended = (outcome == RequestOutcome::completed && result.stats.stop_reason == StopReason::suspended);
+    if (was_suspended) {
+        result.scheduling.suspended = true;
+        result.scheduling.physical_slot_reclaimed = suspended_state.physical_slot_reclaimed;
+        result.scheduling.suspend_action = suspended_state.action;
+    }
 
     if (sched_id) {
         finish_attempted = true;
@@ -1713,6 +3061,122 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         result.stage_timings = std::move(merged);
     }
 
+    // Update session context tracking, logical KV branch (if already forked),
+    // continuation state, and safe cleanup on cancellation.
+    if (outcome == RequestOutcome::cancelled) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_continuation_.reset();
+    } else if (outcome == RequestOutcome::completed) {
+        std::vector<TokenId> full_tokens = tracked_prompt_tokens;
+        std::vector<std::string> full_pieces = build_prompt_token_pieces(effective_prompt, tracked_prompt_tokens);
+        const bool pieces_aligned = (full_pieces.size() == tracked_prompt_tokens.size());
+        if (exact_resume != nullptr && !exact_resume->generated_tokens.empty()) {
+            // generated_tokens_accum already includes resumed tokens on token_logits,
+            // or only newly generated tokens on non-token_logits.
+            if (!result.scheduling.sonder_sampled) {
+                full_tokens.insert(full_tokens.end(), exact_resume->generated_tokens.begin(),
+                                   exact_resume->generated_tokens.end());
+            }
+        }
+        full_tokens.insert(full_tokens.end(), generated_tokens_accum.begin(), generated_tokens_accum.end());
+        if (pieces_aligned && generated_pieces_accum.size() == generated_tokens_accum.size() &&
+            full_tokens.size() == tracked_prompt_tokens.size() + generated_pieces_accum.size()) {
+            full_pieces.insert(full_pieces.end(), generated_pieces_accum.begin(), generated_pieces_accum.end());
+        } else {
+            full_pieces.clear();
+        }
+
+        const std::string total_delivered_text =
+            (exact_resume != nullptr ? exact_resume->delivered_text : std::string()) + result.text;
+        std::string full_prompt_text = effective_prompt;
+        if (!total_delivered_text.empty()) {
+            if (!full_prompt_text.empty() && !detail::is_space(full_prompt_text.back()) &&
+                !detail::is_space(total_delivered_text.front())) {
+                full_prompt_text.push_back(' ');
+            }
+            full_prompt_text += total_delivered_text;
+        }
+
+        // If this session already owns a forked logical KV sequence, append only
+        // the newly added suffix tokens onto it (exercising real COW isolation!).
+        std::uint64_t updated_branch_seq = existing_branch_seq_id;
+        if (existing_branch_seq_id != 0 && runtime != nullptr && !full_tokens.empty()) {
+            const std::size_t existing_len = using_branch_prefix ? branch_prefix_tokens : 0;
+            if (using_branch_prefix && full_tokens.size() >= existing_len) {
+                auto appended = runtime->append_logical_sequence(
+                    existing_branch_seq_id,
+                    std::span<const TokenId>(full_tokens.data() + existing_len, full_tokens.size() - existing_len));
+                if (!appended.ok()) {
+                    // Sequence length diverged; re-materialize cleanly.
+                    const std::int32_t rank = static_cast<std::int32_t>(options_.workload) - options_.priority;
+                    auto ensured = runtime->ensure_logical_sequence(
+                        existing_branch_seq_id, full_tokens, model_fingerprint(*model_), arch,
+                        std::clamp(6 - rank, 0, 255), captured_recurrent_blob);
+                    if (ensured.ok()) {
+                        updated_branch_seq = ensured.value().sequence_id;
+                    }
+                }
+            } else {
+                const std::int32_t rank = static_cast<std::int32_t>(options_.workload) - options_.priority;
+                auto ensured = runtime->ensure_logical_sequence(
+                    existing_branch_seq_id, full_tokens, model_fingerprint(*model_), arch,
+                    std::clamp(6 - rank, 0, 255), captured_recurrent_blob);
+                if (ensured.ok()) {
+                    updated_branch_seq = ensured.value().sequence_id;
+                }
+            }
+        }
+
+        if (has_captured_continuation) {
+            captured_continuation.handle.owner_session_id = options_.session_id;
+            captured_continuation.handle.mode = CheckpointMode::ExactResume;
+            captured_continuation.handle.compatibility = compatibility_fingerprint();
+            captured_continuation.handle.same_process_only = true;
+            captured_continuation.handle.delivered_offset_bytes = static_cast<std::uint64_t>(delivered_bytes);
+            captured_continuation.delivered_offset_bytes = static_cast<std::uint64_t>(delivered_bytes);
+            captured_continuation.prompt = effective_prompt;
+            captured_continuation.exact_tokens = tracked_exact_tokens;
+            captured_continuation.delivered_text =
+                (exact_resume != nullptr ? exact_resume->delivered_text : std::string()) + result.text;
+            if (!captured_recurrent_blob.empty() && captured_continuation.backend_state_blob.empty()) {
+                captured_continuation.backend_state_blob = captured_recurrent_blob;
+            }
+        }
+
+        if (was_suspended && has_captured_continuation && request_options.auto_checkpoint_on_suspend) {
+            ExecutionCheckpointRecord store_rec = captured_continuation;
+            store_rec.logical_kv_sequence_id = 0;
+            if (updated_branch_seq != 0 && runtime != nullptr) {
+                auto forked = runtime->fork_logical_sequence(updated_branch_seq);
+                if (forked.ok()) {
+                    store_rec.logical_kv_sequence_id = forked.value().sequence_id;
+                }
+            }
+            const std::uint64_t store_kv_seq = store_rec.logical_kv_sequence_id;
+            auto stored = engine_.checkpoint_store().put(std::move(store_rec), request_options.suspend_checkpoint_ttl);
+            if (stored.ok()) {
+                result.suspended_checkpoint = stored.value();
+            } else if (store_kv_seq != 0 && runtime != nullptr) {
+                runtime->release_logical_sequence(store_kv_seq);
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            context_prompt_ = std::move(full_prompt_text);
+            context_tokens_ = std::move(full_tokens);
+            context_token_pieces_ = std::move(full_pieces);
+            exact_context_tokens_ = tracked_exact_tokens;
+            logical_kv_seq_id_ = updated_branch_seq;
+            if (!captured_recurrent_blob.empty()) {
+                last_recurrent_state_blob_ = std::move(captured_recurrent_blob);
+            }
+            if (has_captured_continuation) {
+                last_continuation_ = std::move(captured_continuation);
+            }
+        }
+    }
+
     const std::uint64_t cancel_ns = cancel_requested_ns_.load();
     const std::uint64_t now_ns = monotonic_ns();
 
@@ -1737,6 +3201,17 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                                                           : std::string_view{},
                                TelemetryLevel::metrics);
     }
+    if (was_suspended) {
+        summary.set("suspended", true);
+        summary.set("suspend_action", to_string(result.scheduling.suspend_action));
+        summary.set("physical_slot_reclaimed", result.scheduling.physical_slot_reclaimed);
+        if (suspend_reason_seen != nullptr) {
+            summary.set("suspend_reason", suspend_reason_seen);
+        }
+        if (result.suspended_checkpoint) {
+            summary.set("checkpoint_id", result.suspended_checkpoint->checkpoint_id);
+        }
+    }
     if (request_options.reasoning_budget_tokens) summary.set("reasoning_budget", *request_options.reasoning_budget_tokens);
     if (result.stats.backend_timings) {
         const auto& t = *result.stats.backend_timings;
@@ -1759,6 +3234,16 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     }
 
     if (outcome == RequestOutcome::completed) {
+        if (was_suspended) {
+            bus.emit("request.suspended", ctx,
+                     json::Object{{"action", to_string(result.scheduling.suspend_action)},
+                                  {"reason", suspend_reason_seen ? suspend_reason_seen : "suspended"},
+                                  {"physical_slot_reclaimed", result.scheduling.physical_slot_reclaimed},
+                                  {"delivered_offset_bytes", result.delivered_offset_bytes},
+                                  {"delivered_chunks", result.delivered_chunks},
+                                  {"spilled_bytes", suspended_state.backend_state_blob.size()}},
+                     TelemetryLevel::metrics);
+        }
         json::Object pre{{"prompt_tokens", result.stats.prompt_tokens},
                          {"token_counts_from_backend", result.stats.token_counts_from_backend},
                          {"ttft_ms", result.ttft_ms}};
@@ -1808,6 +3293,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         std::lock_guard<std::mutex> lock(mutex_);
         active_cancel_.reset();
         cancel_requested_ns_.store(0);
+        suspend_requested_.store(0, std::memory_order_release);
         last_outcome_ = outcome;
         last_scheduler_rejected_ = outcome == RequestOutcome::failed && scheduler_rejected;
         if (state_ == SessionState::running) {

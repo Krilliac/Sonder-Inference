@@ -50,6 +50,8 @@ enum class Capability : std::uint32_t {
     multimodal = 1u << 19,     // supports multimodal media inputs (validated base64 images)
     logprobs = 1u << 20,       // supports per-token logprobs / top_logprobs
     reranking = 1u << 21,      // supports native cross-encoder reranking and pair scoring
+    execution_checkpoint = 1u << 22,  // supports same-process execution-state capture & restore
+    selective_preemption = 1u << 23,  // supports non-blocking per-request safe-point suspension & slot reclamation
 };
 
 // Maximum serialized byte size permitted for a single recurrent-state snapshot.
@@ -95,6 +97,75 @@ struct RecurrentCheckpointExchange {
 
 // Vocabulary index as produced by a backend tokenizer.
 using TokenId = std::int32_t;
+
+// Non-blocking action returned at backend-owned safe points (between prefill
+// chunks or after a decoded token) so a shared batch worker can park and
+// reclaim ONE request's physical slot/state without stalling peer requests.
+enum class SuspendAction : std::uint8_t {
+    continue_running = 0,  // keep executing normally
+    yield_recompute = 1,   // reclaim physical slot/KV; caller may requeue & recompute
+    yield_spill = 2,       // spill/capture physical state blob, then reclaim physical slot/KV
+};
+
+const char* to_string(SuspendAction action) noexcept;
+
+// Snapshot of execution progress passed by a backend at a safe point.
+struct SafePointContext {
+    std::uint64_t prompt_tokens = 0;
+    std::uint64_t prefill_completed_tokens = 0;
+    std::uint64_t generated_tokens = 0;
+    std::uint64_t kv_tokens = 0;
+    std::size_t active_peers = 0;
+    bool in_prefill = false;
+};
+
+// Non-blocking decision returned by a safe-point callback.
+struct SuspendDecision {
+    SuspendAction action = SuspendAction::continue_running;
+    const char* reason = nullptr;  // optional static/diagnostic label for telemetry
+    std::size_t max_spill_bytes = kMaxRecurrentCheckpointBytes;
+};
+
+// Must NEVER block or sleep; invoked inline on the backend execution thread.
+using SuspendSafePointCallback = std::function<SuspendDecision(const SafePointContext&)>;
+
+// Physical state returned when a backend parks one request at a safe point
+// (StopReason::suspended). Strictly same-process / same-build only.
+struct SuspendedExecutionState {
+    SuspendAction action = SuspendAction::yield_recompute;
+    std::uint64_t token_position = 0;
+    std::uint64_t generated_tokens = 0;
+    std::uint64_t backend_step_index = 0;
+    std::vector<TokenId> tokens;
+    std::vector<TokenId> pending_draft_tokens;
+    std::vector<std::uint8_t> backend_state_blob;
+    std::string stop_filter_pending;
+    bool stop_filter_stopped = false;
+    bool physical_slot_reclaimed = false;
+};
+
+// Process-local execution resume payload attached to GenerateRequest for
+// ExactResume continuation. Never portable across processes, builds, or models.
+struct ExecutionResumeState {
+    std::uint64_t token_position = 0;
+    std::uint64_t generated_tokens = 0;
+    std::uint64_t backend_step_index = 0;
+    std::vector<TokenId> generated_token_ids;
+    std::vector<TokenId> pending_draft_tokens;
+    std::span<const std::uint8_t> backend_state_blob{};
+    std::string stop_filter_pending;
+    bool stop_filter_stopped = false;
+};
+
+// Optional stateful grammar/constraint hooks for ExactResume snapshot/restore
+// and Branch reset (pure core types, independent of any grammar backend).
+struct GrammarMatcherHooks {
+    std::function<void(std::span<float> logits)> mask_logits;
+    std::function<void(TokenId token)> accept_token;
+    std::function<std::vector<std::uint8_t>()> snapshot_state;
+    std::function<bool(std::span<const std::uint8_t>)> restore_state;
+    std::function<void()> reset;
+};
 
 struct BackendCapabilities {
     std::uint32_t bits = 0;
@@ -144,6 +215,16 @@ struct GenerateRequest {
     std::optional<double> target_itl_ms = std::nullopt;
     // Opt-in per-request stage timing hooks (false by default: zero extra clocks).
     bool enable_stage_profiling = false;
+    // Optional non-blocking safe-point suspension hook (Item #9). Must not block.
+    SuspendSafePointCallback on_safe_point{};
+    // Optional non-owning output populated when StopReason::suspended occurs.
+    SuspendedExecutionState* suspended_state = nullptr;
+    // Optional non-owning ExactResume state payload (same-process/same-model only).
+    const ExecutionResumeState* execution_resume = nullptr;
+    // Scheduler priority rank (lower = more urgent) for physical victim choice.
+    int priority_rank = 0;
+    // Allow cost-aware spill-to-checkpoint when selectively preempted under pressure.
+    bool allow_preempt_spill = false;
 };
 
 // Bounded batch limits for embedding, reranking, and pair-scoring requests.
@@ -301,7 +382,7 @@ struct BackendTimings {
     std::optional<std::uint64_t> draft_n_accepted = std::nullopt;
 };
 
-enum class StopReason { none, max_tokens, stop_sequence, end_of_sequence, cancelled, callback, error, tool_calls };
+enum class StopReason { none, max_tokens, stop_sequence, end_of_sequence, cancelled, callback, error, tool_calls, suspended };
 const char* to_string(StopReason reason) noexcept;
 
 struct GenerateStats {
@@ -351,6 +432,23 @@ public:
     virtual Status accept(TokenId token, std::string& piece) = 0;
     // True for end-of-generation tokens (EOS/EOT).
     [[nodiscard]] virtual bool is_end_of_generation(TokenId token) const = 0;
+    // Optional: capture process-local physical execution state at the stream's
+    // current position (strictly same-process / same-model / same-build only).
+    virtual Result<std::vector<std::uint8_t>> capture_state(
+        std::size_t max_bytes = kMaxRecurrentCheckpointBytes) {
+        (void)max_bytes;
+        return Status(ErrorCode::unsupported, "token stream does not expose state capture");
+    }
+    // Optional: restore process-local physical execution state captured from
+    // the exact same model/build/tokenizer.
+    virtual Status restore_state(std::span<const std::uint8_t> bytes, std::uint64_t token_position) {
+        (void)bytes;
+        (void)token_position;
+        return Status(ErrorCode::unsupported, "token stream does not expose state restore");
+    }
+    // Optional: explicitly reclaim any physical slot/KV held by this stream
+    // when selectively suspended (returns true if physical state was reclaimed).
+    virtual bool reclaim_physical_state() { return false; }
 };
 
 // ---------------------------------------------------------------------------
@@ -569,6 +667,26 @@ public:
         (void)bytes;
         return Status(ErrorCode::unsupported, "backend does not expose recurrent-state checkpoints");
     }
+
+    // Optional (Capability::execution_checkpoint): capture/restore process-local
+    // physical sequence state (KV + recurrent state) for continuation or spill.
+    // Valid ONLY within the same process, build, model, and tokenizer.
+    virtual Result<std::vector<std::uint8_t>> capture_execution_state(
+        std::uint64_t token_position, std::size_t max_bytes = kMaxRecurrentCheckpointBytes) {
+        (void)token_position;
+        (void)max_bytes;
+        return Status(ErrorCode::unsupported, "backend does not expose execution-state checkpoints");
+    }
+
+    virtual Status restore_execution_state(std::span<const std::uint8_t> bytes, std::uint64_t token_position) {
+        (void)bytes;
+        (void)token_position;
+        return Status(ErrorCode::unsupported, "backend does not expose execution-state checkpoints");
+    }
+
+    // Diagnostic counters for physical slot occupancy and reclamation.
+    [[nodiscard]] virtual std::size_t active_physical_slots() const { return 0; }
+    [[nodiscard]] virtual std::uint64_t reclaimed_physical_slots() const { return 0; }
 };
 
 class Backend {

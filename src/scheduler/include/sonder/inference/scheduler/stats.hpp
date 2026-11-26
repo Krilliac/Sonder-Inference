@@ -75,7 +75,9 @@ struct SchedulerStats {
     std::uint64_t preemptions_recompute = 0;
     std::uint64_t preemptions_swap = 0;
     std::uint64_t recomputed_tokens = 0;    // KV discarded by recompute preemption
-    std::uint64_t swapped_tokens = 0;       // KV moved out by swap preemption
+    std::uint64_t swapped_tokens = 0;       // KV moved out by spill/swap preemption
+    std::uint64_t spill_budget_fallbacks = 0;       // fell back to recompute because spill tier lacked budget
+    std::uint64_t anti_starvation_protections = 0;  // priority-preemption skips due to anti-starvation cap
     std::uint64_t starvation_promotions = 0;
     std::uint64_t lookahead_admissions = 0; // admitted past a blocked head
     std::uint64_t admission_kv_blocked = 0; // steps where head was KV-blocked

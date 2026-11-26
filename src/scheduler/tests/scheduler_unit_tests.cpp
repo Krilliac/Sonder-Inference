@@ -869,3 +869,108 @@ TEST_CASE("sim_clock_saturates_and_backward_clock_never_produces_negative_latenc
     CHECK(st.per_class[0].end_to_end.min >= 0);
     CHECK(st.per_class[0].inter_token.min >= 0);
 }
+
+TEST_CASE("cost_aware_preemption_chooses_recompute_vs_spill_and_respects_budget") {
+    SchedulerConfig cfg;
+    cfg.enable_swap = true;
+    cfg.swap_min_tokens = 256;
+    cfg.admission_watermark_blocks = 0;
+    cfg.enable_priority_preemption = false;
+    cfg.preemption_cost.kv_bytes_per_token = 4096;
+    cfg.preemption_cost.prefill_tokens_per_sec = 2000.0;
+    cfg.preemption_cost.spill_bandwidth_bytes_per_sec = 4.0 * 1024.0 * 1024.0 * 1024.0;
+    cfg.preemption_cost.restore_bandwidth_bytes_per_sec = 4.0 * 1024.0 * 1024.0 * 1024.0;
+    cfg.preemption_cost.fixed_spill_overhead_us = 250.0;
+    cfg.preemption_cost.spill_cost_margin = 1.05;
+
+    SimClock clock;
+    FixedKvCapacity kv(4, 16);
+    Scheduler sched(cfg, clock, kv);
+
+    // Below min_tokens -> Recompute.
+    const auto below = sched.evaluate_preemption(128);
+    CHECK(below.mode == PreemptionMode::Recompute);
+    CHECK_FALSE(below.budget_exceeded);
+
+    // Above min_tokens with fast spill/restore -> SpillToCheckpoint wins over Recompute.
+    const auto fast_spill = sched.evaluate_preemption(1024);
+    CHECK(fast_spill.mode == PreemptionMode::SpillToCheckpoint);
+    CHECK(fast_spill.spill_restore_cost_us < fast_spill.recompute_cost_us);
+    CHECK_EQ(fast_spill.estimated_spill_bytes, 1024ULL * 4096ULL);
+
+    // Exceeding spill budget falls back to Recompute with budget_exceeded set.
+    const auto over_budget = sched.evaluate_preemption(1024, /*spill_budget_free_bytes=*/512ULL * 1024ULL);
+    CHECK(over_budget.mode == PreemptionMode::Recompute);
+    CHECK(over_budget.budget_exceeded);
+
+    // Slow spill bandwidth makes spill+restore slower than recompute -> chooses Recompute.
+    PreemptionCostModel slow_model = cfg.preemption_cost;
+    slow_model.spill_bandwidth_bytes_per_sec = 1.0 * 1024.0 * 1024.0;
+    slow_model.restore_bandwidth_bytes_per_sec = 1.0 * 1024.0 * 1024.0;
+    sched.update_preemption_cost_model(slow_model);
+    const auto slow_dec = sched.evaluate_preemption(1024);
+    CHECK(slow_dec.mode == PreemptionMode::Recompute);
+    CHECK(slow_dec.spill_restore_cost_us > slow_dec.recompute_cost_us);
+
+    // Live preemption under tight spill budget records spill_budget_fallbacks and falls back to Recompute.
+    SchedulerConfig live_cfg = cfg;
+    live_cfg.swap_min_tokens = 32;
+    live_cfg.preemption_cost.spill_budget_free_bytes = 1024;  // < 32 * 4096
+    FixedKvCapacity kv2(4, 16);
+    Scheduler sched2(live_cfg, clock, kv2);
+    CHECK(sched2.submit(spec(1, WorkloadClass::InteractiveUser, 32, 3)).accepted);
+    CHECK(sched2.submit(spec(2, WorkloadClass::BackgroundIndexing, 32, 3)).accepted);
+    step(sched2, clock);
+    auto plan = step(sched2, clock);
+    REQUIRE(was_preempted(plan, 2));
+    CHECK(plan.preempted[0].mode == PreemptionMode::Recompute);
+    CHECK_EQ(sched2.stats().spill_budget_fallbacks, 1u);
+    CHECK_EQ(sched2.requeue_count(2), 1u);
+}
+
+TEST_CASE("anti_starvation_preemption_cap_shields_requeued_victim_from_starvation") {
+    SchedulerConfig cfg;
+    cfg.admission_watermark_blocks = 0;
+    cfg.enable_priority_preemption = true;
+    cfg.anti_starvation_preemption_cap = 1;
+    cfg.max_requeue_count = 4;
+    SimClock clock;
+    FixedKvCapacity kv(4, 16);
+    Scheduler sched(cfg, clock, kv);
+
+    // Req 1 (Maintenance) occupies all 4 blocks.
+    CHECK(sched.submit(spec(1, WorkloadClass::Maintenance, 60, 4)).accepted);
+    step(sched, clock);
+    CHECK_EQ(kv.free_blocks(), 0u);
+
+    // Interactive req 2 arrives -> preempts req 1 once (requeue_count becomes 1).
+    CHECK(sched.submit(spec(2, WorkloadClass::InteractiveUser, 60, 2)).accepted);
+    auto p_preempt = step(sched, clock);
+    CHECK(was_preempted(p_preempt, 1));
+    CHECK_EQ(sched.requeue_count(1), 1u);
+
+    // Wait for req 2 to finish and req 1 to be re-admitted and running.
+    auto is_running = [&](RequestId id) {
+        const auto& r = sched.running();
+        return std::find(r.begin(), r.end(), id) != r.end();
+    };
+    int guard = 0;
+    while (!is_running(1) && guard++ < 50) {
+        step(sched, clock);
+    }
+    REQUIRE(is_running(1));
+
+    // Interactive req 3 arrives while req 1 is protected by anti_starvation_preemption_cap == 1.
+    CHECK(sched.submit(spec(3, WorkloadClass::InteractiveUser, 60, 2)).accepted);
+    auto p_shielded = step(sched, clock);
+    CHECK_FALSE(was_preempted(p_shielded, 1));
+    CHECK(sched.stats().anti_starvation_protections >= 1u);
+
+    // Both req 1 and req 3 complete cleanly without starvation.
+    while (!sched.idle() && guard++ < 200) {
+        step(sched, clock);
+    }
+    CHECK(sched.state(1) == RequestState::Completed);
+    CHECK(sched.state(2) == RequestState::Completed);
+    CHECK(sched.state(3) == RequestState::Completed);
+}

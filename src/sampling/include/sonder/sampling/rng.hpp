@@ -26,6 +26,10 @@ public:
     /// Seed from a non-deterministic source (std::random_device + clock).
     static std::uint64_t entropy_seed();
 
+    /// Process-local state snapshot/restore for ExactResume continuation.
+    [[nodiscard]] std::array<std::uint64_t, 4> state() const noexcept { return s_; }
+    void set_state(const std::array<std::uint64_t, 4>& s) noexcept { s_ = s; }
+
 private:
     std::array<std::uint64_t, 4> s_{};
 };

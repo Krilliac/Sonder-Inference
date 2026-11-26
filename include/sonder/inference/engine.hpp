@@ -57,7 +57,18 @@ struct SchedulingOptions {
     std::uint32_t admission_watermark_blocks = 4;
     // A request preempted more than this many times fails (ErrorCode::unavailable).
     std::uint32_t max_requeue_count = 8;
+    // Anti-starvation cap: shield repeatedly preempted requests from priority
+    // preemption once they reach this requeue count (0 disables).
+    std::uint32_t anti_starvation_preemption_cap = 3;
     bool enable_priority_preemption = true;
+    // Cost-aware preemption policy (Recompute default; SpillToCheckpoint when
+    // enabled and spill+restore cost < recompute cost within checkpoint budget).
+    bool enable_spill_preemption = false;
+    std::uint32_t spill_min_tokens = 1024;
+    std::uint64_t kv_bytes_per_token = 4096;
+    double prefill_tokens_per_sec = 2000.0;
+    double spill_bandwidth_bytes_per_sec = 4.0 * 1024.0 * 1024.0 * 1024.0;
+    double restore_bandwidth_bytes_per_sec = 4.0 * 1024.0 * 1024.0 * 1024.0;
     // Longest a scheduling step waits for a granted request to produce its
     // token (0 = 1 ms). A request that misses it is left out of the step
     // barrier until it produces the token, so one stalled request (a
@@ -108,6 +119,8 @@ struct EngineOptions {
     // Periodic device.memory.sample for every device (0 disables).
     std::chrono::milliseconds device_sample_interval{10000};
     SchedulingOptions scheduling;
+    // Bounded, TTL-expiring store for caller-visible execution checkpoints.
+    ExecutionCheckpointStoreOptions checkpoints;
     // Enumerate live GPUs at startup and emit GPU device.memory.sample events.
     bool sample_gpu_devices = true;
 };
@@ -152,6 +165,10 @@ public:
     // Internal: request runtime used by Session (null when inactive).
     [[nodiscard]] detail::RequestRuntime* request_runtime() noexcept { return runtime_.get(); }
 
+    // Bounded, owned, expirable store for caller-visible execution checkpoints.
+    [[nodiscard]] CheckpointStore& checkpoint_store() noexcept { return checkpoint_store_; }
+    [[nodiscard]] const CheckpointStore& checkpoint_store() const noexcept { return checkpoint_store_; }
+
 private:
     void sample_devices(const std::vector<DeviceInfo>& devices);
     void sample_gpu_devices(const std::vector<GpuDeviceInfo>& gpus);
@@ -173,6 +190,8 @@ private:
     std::map<std::string, std::shared_ptr<Model>> models_;
     // Declared last: stopped before the telemetry bus and registries go away.
     std::unique_ptr<detail::RequestRuntime> runtime_;
+    // Destroyed before runtime_ so eviction callbacks can safely release logical KV.
+    CheckpointStore checkpoint_store_;
     // Periodic device sampler.
     std::mutex sampler_mutex_;
     std::condition_variable sampler_cv_;

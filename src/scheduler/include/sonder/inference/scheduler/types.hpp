@@ -62,8 +62,38 @@ enum class Phase : std::uint8_t { Prefill, Decode };
 
 /// How a preempted sequence will be resumed.
 enum class PreemptionMode : std::uint8_t {
-    Recompute,  // drop KV, re-prefill prompt + generated tokens later
-    Swap,       // move KV to a lower tier, swap back in on resume (stub)
+    Recompute = 0,          // default: drop KV, re-prefill prompt + generated tokens later
+    Swap = 1,               // alias for SpillToCheckpoint (backward compatibility)
+    SpillToCheckpoint = 1,  // spill state to bounded checkpoint tier when cheaper than recompute
+};
+
+/// Measured/estimated cost model parameters for deciding Recompute vs SpillToCheckpoint.
+struct PreemptionCostModel {
+    /// Estimated KV + recurrent state bytes per token for the active model.
+    std::uint64_t kv_bytes_per_token = 4096;
+    /// Effective prefill throughput in tokens/sec (measured or configured).
+    double prefill_tokens_per_sec = 2000.0;
+    /// Effective checkpoint spill (serialize + write) bandwidth in bytes/sec.
+    double spill_bandwidth_bytes_per_sec = 4.0 * 1024.0 * 1024.0 * 1024.0;
+    /// Effective checkpoint restore (read + deserialize) bandwidth in bytes/sec.
+    double restore_bandwidth_bytes_per_sec = 4.0 * 1024.0 * 1024.0 * 1024.0;
+    /// Fixed per-spill serialization/coordination overhead in microseconds.
+    double fixed_spill_overhead_us = 250.0;
+    /// Fixed per-recompute scheduling/setup overhead in microseconds.
+    double fixed_recompute_overhead_us = 50.0;
+    /// Free byte budget available in the checkpoint spill tier (0 = unbounded/unknown).
+    std::uint64_t spill_budget_free_bytes = 0;
+    /// Hysteresis safety margin: spill only if spill_restore_cost_us * margin < recompute_cost_us.
+    double spill_cost_margin = 1.05;
+};
+
+/// Outcome of the cost-aware preemption policy evaluation.
+struct PreemptionDecision {
+    PreemptionMode mode = PreemptionMode::Recompute;
+    double recompute_cost_us = 0.0;
+    double spill_restore_cost_us = 0.0;
+    std::uint64_t estimated_spill_bytes = 0;
+    bool budget_exceeded = false;
 };
 
 enum class PreemptionReason : std::uint8_t {

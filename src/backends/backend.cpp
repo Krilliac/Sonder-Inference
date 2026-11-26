@@ -32,6 +32,8 @@ std::vector<std::string> BackendCapabilities::names() const {
         {Capability::multimodal, "multimodal"},
         {Capability::logprobs, "logprobs"},
         {Capability::reranking, "reranking"},
+        {Capability::execution_checkpoint, "execution_checkpoint"},
+        {Capability::selective_preemption, "selective_preemption"},
     };
     std::vector<std::string> out;
     for (const auto& [cap, name] : kNames) {
@@ -50,6 +52,15 @@ const char* to_string(EmbedPoolingType pooling) noexcept {
         case EmbedPoolingType::cls: return "cls";
         case EmbedPoolingType::last: return "last";
         case EmbedPoolingType::rank: return "rank";
+    }
+    return "unknown";
+}
+
+const char* to_string(SuspendAction action) noexcept {
+    switch (action) {
+        case SuspendAction::continue_running: return "continue";
+        case SuspendAction::yield_recompute: return "yield_recompute";
+        case SuspendAction::yield_spill: return "yield_spill";
     }
     return "unknown";
 }
@@ -113,7 +124,6 @@ void finalize_rerank_items(std::vector<RerankItem>& items, std::optional<std::si
         items.resize(*top_n);
     }
 }
-
 const char* to_string(StopReason reason) noexcept {
     switch (reason) {
         case StopReason::none: return "none";
@@ -124,6 +134,7 @@ const char* to_string(StopReason reason) noexcept {
         case StopReason::callback: return "callback";
         case StopReason::error: return "error";
         case StopReason::tool_calls: return "tool_calls";
+        case StopReason::suspended: return "suspended";
     }
     return "unknown";
 }

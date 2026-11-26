@@ -560,7 +560,9 @@ struct RuntimeState {
             if (!mtmd_build) s.note = "libmtmd_not_in_build";
             out.emplace_back("multimodal", std::move(s));
         }
-        for (const char* cap_name : {"structured_output", "embeddings", "reranking", "logprobs", "recurrent_checkpoint"}) {
+        for (const char* cap_name :
+             {"structured_output", "embeddings", "reranking", "logprobs", "recurrent_checkpoint",
+              "execution_checkpoint", "selective_preemption"}) {
             CapabilityStatus s;
             s.adapter_supports = CapabilityState::yes;
             s.build_supports = CapabilityState::yes;
@@ -1032,7 +1034,8 @@ public:
         return run_tokens(std::move(prompt_tokens), request.sampling, cancel, on_chunk, request.session_key,
                           request.grammar, /*separate_reasoning=*/false, request.checkpoint, {}, {}, {},
                           request.priority_class, request.target_ttft_ms, request.target_itl_ms,
-                          request.enable_stage_profiling);
+                          request.enable_stage_profiling, request.on_safe_point, request.suspended_state,
+                          request.execution_resume, request.priority_rank, request.allow_preempt_spill);
     }
 
     // Chat through the GGUF chat template (llama_chat_apply_template). Models
@@ -1121,6 +1124,34 @@ public:
         return ToStatus(runtime_.RestoreSequenceState(bytes, kMaxRecurrentCheckpointBytes));
     }
 
+    Result<std::vector<std::uint8_t>> capture_execution_state(std::uint64_t token_position,
+                                                              std::size_t max_bytes) override {
+        (void)token_position;
+        const std::size_t cap = std::min(max_bytes, kMaxRecurrentCheckpointBytes);
+        if (cap == 0) {
+            return Status(ErrorCode::invalid_argument, "execution state max_bytes must be > 0");
+        }
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        std::vector<std::uint8_t> bytes;
+        if (lc::Status s = runtime_.CaptureSequenceState(bytes, cap); !s.ok()) {
+            return ToStatus(s);
+        }
+        return bytes;
+    }
+
+    Status restore_execution_state(std::span<const std::uint8_t> bytes, std::uint64_t token_position) override {
+        (void)token_position;
+        if (bytes.empty()) {
+            return Status(ErrorCode::invalid_argument, "execution state snapshot is empty");
+        }
+        if (bytes.size() > kMaxRecurrentCheckpointBytes) {
+            return Status(ErrorCode::invalid_argument,
+                          "execution state snapshot exceeds kMaxRecurrentCheckpointBytes");
+        }
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        return ToStatus(runtime_.RestoreSequenceState(bytes, kMaxRecurrentCheckpointBytes));
+    }
+
 private:
     // Caller holds mutex_. Prompt tokens are already produced across the
     // trusted/untrusted tokenization boundary.
@@ -1135,7 +1166,11 @@ private:
                                      std::optional<RequestPriority> priority_class = std::nullopt,
                                      std::optional<double> target_ttft_ms = std::nullopt,
                                      std::optional<double> target_itl_ms = std::nullopt,
-                                     bool enable_stage_profiling = false) {
+                                     bool enable_stage_profiling = false,
+                                     const SuspendSafePointCallback& on_safe_point = {},
+                                     SuspendedExecutionState* suspended_state = nullptr,
+                                     const ExecutionResumeState* execution_resume = nullptr,
+                                     int priority_rank = 0, bool allow_preempt_spill = false) {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
 
         lc::GenerateRequest req;
@@ -1152,6 +1187,37 @@ private:
         req.target_ttft_ms = target_ttft_ms;
         req.target_itl_ms = target_itl_ms;
         req.enable_stage_profiling = enable_stage_profiling;
+        req.priority_rank = priority_rank;
+        req.allow_preempt_spill = allow_preempt_spill;
+        if (execution_resume != nullptr && !execution_resume->generated_token_ids.empty()) {
+            req.prompt.insert(req.prompt.end(), execution_resume->generated_token_ids.begin(),
+                              execution_resume->generated_token_ids.end());
+            if (!execution_resume->backend_state_blob.empty() && execution_resume->token_position > 0 &&
+                execution_resume->token_position < req.prompt.size()) {
+                req.restore_state = execution_resume->backend_state_blob;
+                req.restore_tokens = static_cast<std::size_t>(execution_resume->token_position);
+            }
+        }
+        if (on_safe_point) {
+            req.on_safe_point = [&on_safe_point](const lc::SafePointInfo& info) -> lc::SafePointDecision {
+                SafePointContext ctx;
+                ctx.prompt_tokens = info.prompt_tokens;
+                ctx.prefill_completed_tokens = info.prefill_completed_tokens;
+                ctx.generated_tokens = static_cast<std::uint64_t>(std::max<std::int32_t>(0, info.generated_tokens));
+                ctx.kv_tokens = info.kv_pos > 0 ? static_cast<std::uint64_t>(info.kv_pos) : 0;
+                ctx.active_peers = info.active_peers;
+                ctx.in_prefill = info.in_prefill;
+                const SuspendDecision d = on_safe_point(ctx);
+                lc::SafePointDecision out;
+                out.max_spill_bytes = std::min(d.max_spill_bytes, lc::kMaxSequenceStateBytes);
+                switch (d.action) {
+                    case SuspendAction::continue_running: out.action = lc::SuspendAction::kContinue; break;
+                    case SuspendAction::yield_recompute: out.action = lc::SuspendAction::kYieldRecompute; break;
+                    case SuspendAction::yield_spill: out.action = lc::SuspendAction::kYieldSpill; break;
+                }
+                return out;
+            };
+        }
         if (checkpoint != nullptr) {
             if (!checkpoint->restore_bytes.empty() && checkpoint->restore_token_position > 0 &&
                 checkpoint->restore_token_position < req.prompt.size()) {
@@ -1183,6 +1249,9 @@ private:
         stats.load_ns = load_ns_;
         stats.token_counts_from_backend = true;
         StopSequenceFilter stop(sampling.stop);
+        if (execution_resume != nullptr && !execution_resume->stop_filter_pending.empty()) {
+            stop.RestoreState(execution_resume->stop_filter_pending, execution_resume->stop_filter_stopped);
+        }
         ThinkingStreamSplitter thinking_splitter;
         bool callback_stopped = false;
 
@@ -1267,6 +1336,22 @@ private:
             case lc::StopReason::kEndOfGeneration: stats.stop_reason = StopReason::end_of_sequence; break;
             case lc::StopReason::kMaxTokens: stats.stop_reason = StopReason::max_tokens; break;
             case lc::StopReason::kContextFull: stats.stop_reason = StopReason::max_tokens; break;
+            case lc::StopReason::kSuspended:
+                stats.stop_reason = StopReason::suspended;
+                if (suspended_state != nullptr) {
+                    suspended_state->action = r.suspend_action == lc::SuspendAction::kYieldSpill
+                                                  ? SuspendAction::yield_spill
+                                                  : SuspendAction::yield_recompute;
+                    suspended_state->token_position = r.suspended_token_position;
+                    suspended_state->generated_tokens =
+                        static_cast<std::uint64_t>(std::max<std::int32_t>(0, r.generated_tokens));
+                    suspended_state->tokens = r.suspended_tokens;
+                    suspended_state->backend_state_blob = r.suspended_state_blob;
+                    suspended_state->stop_filter_pending = stop.held();
+                    suspended_state->stop_filter_stopped = stop.matched();
+                    suspended_state->physical_slot_reclaimed = r.physical_slot_reclaimed;
+                }
+                break;
             case lc::StopReason::kCancelled:
                 if (stop.matched()) {
                     stats.stop_reason = StopReason::stop_sequence;
@@ -1283,7 +1368,8 @@ private:
                 stats.matched_stop = std::string(*matched);
             }
         }
-        if (stats.stop_reason != StopReason::stop_sequence && stats.stop_reason != StopReason::callback) {
+        if (stats.stop_reason != StopReason::stop_sequence && stats.stop_reason != StopReason::callback &&
+            stats.stop_reason != StopReason::suspended) {
             deliver(stop.Flush());
             if (separate_reasoning && !callback_stopped) {
                 const ThinkingSplitResult tail = thinking_splitter.Flush();
@@ -1343,7 +1429,9 @@ public:
             .add(Capability::deterministic)
             .add(Capability::recurrent_checkpoint)
             .add(Capability::logprobs)
-            .add(Capability::reranking);
+            .add(Capability::reranking)
+            .add(Capability::execution_checkpoint)
+            .add(Capability::selective_preemption);
         if (options_.slots > 1u) {
             caps.add(Capability::continuous_batch_decode);
         }

@@ -39,6 +39,14 @@ struct MockBackendOptions {
     // Opt-in Matryoshka-style reduced embedding dimensions for mock tests;
     // false (default) fails closed on dimensions < native width.
     bool allow_embed_dimension_truncation = false;
+    // Opt-in process-local execution checkpoint & selective preemption
+    // capability advertisements (defaults false to preserve legacy mock caps).
+    bool enable_execution_checkpoints = false;
+    bool enable_selective_preemption = false;
+    // Simulated physical slot pool size for selective preemption tests (0 = unlimited).
+    std::size_t physical_slots = 4;
+    // Optional tokenizer salt so tests can construct distinct tokenizer fingerprints.
+    std::uint64_t tokenizer_salt = 0;
 };
 inline constexpr const char* kMockBackendName = "mock";
 std::shared_ptr<Backend> make_mock_backend(MockBackendOptions options = {});

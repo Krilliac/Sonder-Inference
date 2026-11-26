@@ -102,6 +102,31 @@ struct RuntimeRequestSummary {
     double queue_ms = 0.0;
 };
 
+// Non-blocking gate poll result for backends that run multiple requests on a
+// shared worker thread (prevents blocking peer slots on logical pauses).
+enum class GatePollStatus : std::uint8_t {
+    granted = 0,
+    yield_recompute = 1,
+    yield_spill = 2,
+    cancelled = 3,
+    failed = 4,
+};
+
+struct GatePollResult {
+    GatePollStatus status = GatePollStatus::granted;
+    Status error;
+    const char* reason = nullptr;
+};
+
+// Snapshot of a logical KV branch sequence owned by a Session or Checkpoint.
+struct LogicalBranchInfo {
+    std::uint64_t sequence_id = 0;
+    std::size_t num_tokens = 0;
+    std::size_t block_count = 0;
+    std::size_t shared_block_count = 0;
+    std::size_t copy_on_write_count = 0;
+};
+
 class RequestRuntime {
 public:
     virtual ~RequestRuntime() = default;
@@ -114,6 +139,22 @@ public:
     // failed by the scheduler (requeue limit, KV exhaustion) or on shutdown.
     virtual Status acquire_token(std::uint64_t id, const CancellationToken& cancel,
                                  std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt) = 0;
+    // Non-blocking token gate poll: consumes a credit if immediately available
+    // (or passthrough), or returns yield_recompute / yield_spill without
+    // sleeping/blocking so shared batch workers never stall peer requests.
+    virtual GatePollResult try_acquire_token_nonblocking(std::uint64_t id, const CancellationToken& cancel) {
+        (void)id;
+        if (cancel.cancelled()) {
+            return GatePollResult{GatePollStatus::cancelled, Status(ErrorCode::cancelled, "cancelled"), "cancelled"};
+        }
+        return GatePollResult{GatePollStatus::granted, Status::success(), nullptr};
+    }
+    // Non-blocking safe-point preemption check (does not consume a token credit).
+    virtual SuspendDecision poll_suspend_decision(std::uint64_t id, const CancellationToken& cancel) {
+        (void)id;
+        (void)cancel;
+        return SuspendDecision{};
+    }
     // Waits for admission without consuming a token grant, leaving
     // the first gate credit available for the backend's first token.
     virtual Status admit_backend(std::uint64_t id, const CancellationToken& cancel,
@@ -122,6 +163,44 @@ public:
     virtual void token_produced(std::uint64_t id, TokenId token) = 0;
     // Ends the request and frees its KV blocks. Safe to call once per id.
     virtual RuntimeRequestSummary finish(std::uint64_t id, RequestOutcome outcome) = 0;
+
+    // Session/checkpoint logical KV lifecycle via KvCacheManager::fork_sequence & truncate.
+    virtual Result<LogicalBranchInfo> ensure_logical_sequence(
+        std::uint64_t existing_seq_id, std::span<const TokenId> tokens, std::uint64_t fingerprint,
+        ModelArchitecture architecture, std::int32_t priority,
+        std::span<const std::uint8_t> recurrent_checkpoint_blob = {}) {
+        (void)existing_seq_id;
+        (void)tokens;
+        (void)fingerprint;
+        (void)architecture;
+        (void)priority;
+        (void)recurrent_checkpoint_blob;
+        return LogicalBranchInfo{};
+    }
+    virtual Result<LogicalBranchInfo> fork_logical_sequence(
+        std::uint64_t parent_seq_id, std::optional<std::size_t> rewind_to_tokens = std::nullopt,
+        std::optional<std::int32_t> child_priority = std::nullopt) {
+        (void)parent_seq_id;
+        (void)rewind_to_tokens;
+        (void)child_priority;
+        return LogicalBranchInfo{};
+    }
+    virtual Result<LogicalBranchInfo> truncate_logical_sequence(std::uint64_t seq_id, std::size_t new_length) {
+        (void)seq_id;
+        (void)new_length;
+        return LogicalBranchInfo{};
+    }
+    virtual Result<LogicalBranchInfo> append_logical_sequence(std::uint64_t seq_id,
+                                                              std::span<const TokenId> suffix_tokens) {
+        (void)seq_id;
+        (void)suffix_tokens;
+        return LogicalBranchInfo{};
+    }
+    virtual void release_logical_sequence(std::uint64_t seq_id) { (void)seq_id; }
+    [[nodiscard]] virtual std::optional<LogicalBranchInfo> inspect_logical_sequence(std::uint64_t seq_id) const {
+        (void)seq_id;
+        return std::nullopt;
+    }
 
     // Registers a backend-captured recurrent-state checkpoint for an active
     // request and records it in KvCacheManager::save_checkpoint(). No-op when

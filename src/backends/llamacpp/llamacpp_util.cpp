@@ -30,6 +30,7 @@ std::string_view ToString(StopReason reason) noexcept {
         case StopReason::kCancelled: return "cancelled";
         case StopReason::kContextFull: return "context_full";
         case StopReason::kError: return "error";
+        case StopReason::kSuspended: return "suspended";
     }
     return "unknown";
 }

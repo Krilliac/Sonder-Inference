@@ -81,6 +81,17 @@ void PenaltiesSampler::reset() {
     counts_.clear();
 }
 
+std::vector<TokenId> PenaltiesSampler::snapshot_history() const {
+    return std::vector<TokenId>(history_.begin(), history_.end());
+}
+
+void PenaltiesSampler::restore_history(std::span<const TokenId> tokens) {
+    reset();
+    for (const TokenId t : tokens) {
+        accept(t);
+    }
+}
+
 std::int32_t PenaltiesSampler::count(TokenId token) const {
     const auto it = counts_.find(token);
     return it == counts_.end() ? 0 : it->second;

@@ -49,11 +49,17 @@ struct SchedulerConfig {
     // ---- Preemption / no-progress guards ----
     /// A request preempted more than this many times fails (RequeueLimit).
     std::uint32_t max_requeue_count = 8;
-    /// Swap (instead of recompute) when enabled and the victim holds at least
-    /// this many tokens of KV. Swap is a decision stub: the engine performs
-    /// the actual movement.
+    /// Anti-starvation cap: once a request has been preempted this many times
+    /// (and is still below max_requeue_count), it is shielded from further
+    /// priority preemption and receives a waiting-rank boost. 0 disables.
+    std::uint32_t anti_starvation_preemption_cap = 3;
+    /// Allow SpillToCheckpoint (instead of default Recompute) when enabled,
+    /// the victim holds at least `swap_min_tokens`, spill budget permits, and
+    /// measured/estimated spill+restore cost beats recompute cost.
     bool enable_swap = false;
     TokenCount swap_min_tokens = 1024;
+    /// Cost model used to compare Recompute vs SpillToCheckpoint.
+    PreemptionCostModel preemption_cost{};
 
     // ---- Statistics ----
     /// Inter-token gaps retained per workload class for SchedulerStats (the
