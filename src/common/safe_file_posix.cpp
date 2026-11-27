@@ -3,6 +3,7 @@
 // model store.
 #include "common/safe_file.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <climits>
 #include <cstring>
@@ -52,11 +53,14 @@ std::int64_t ticks(const struct timespec& ts) {
     return static_cast<std::int64_t>(ts.tv_sec) * 1000000000LL + static_cast<std::int64_t>(ts.tv_nsec);
 }
 
+std::atomic<bool> g_weak_identity_for_testing{false};  // set_weak_identity_for_testing
+thread_local std::uint64_t t_dir_entries_visited = 0;    // dir_entries_visited_on_this_thread
+
 void fill_identity(const struct stat& st, FileIdentity& out) {
     out.volume = static_cast<std::uint64_t>(st.st_dev);
     out.file_id = static_cast<std::uint64_t>(st.st_ino);
     out.file_id_high = 0;
-    out.weak_id = false;
+    out.weak_id = g_weak_identity_for_testing.load(std::memory_order_relaxed);
     out.size = st.st_size < 0 ? 0u : static_cast<std::uint64_t>(st.st_size);
     out.link_count = static_cast<std::uint64_t>(st.st_nlink);
 #if defined(__APPLE__)
@@ -92,6 +96,10 @@ OpenOutcome open_dirs(int anchor, const std::vector<std::string>& segs, std::siz
 }
 
 }  // namespace
+
+void set_weak_identity_for_testing(bool on) noexcept { g_weak_identity_for_testing.store(on, std::memory_order_relaxed); }
+
+std::uint64_t dir_entries_visited_on_this_thread() noexcept { return t_dir_entries_visited; }
 
 OwnedFileHandle::OwnedFileHandle() noexcept : handle_(-1) {}
 
@@ -261,6 +269,7 @@ OpenOutcome visit_anchored_dir(const OwnedFileHandle& anchor, std::string_view r
             return OpenOutcome::ok;
         }
         ++visited;
+        ++t_dir_entries_visited;
         DirEntry e;
         e.name.assign(name);
         struct stat st {};

@@ -31,9 +31,11 @@
 // OllamaStore's shared state (the pinned root handle, used only as the start of
 // relative opens, and the verified-blob cache, internally locked) is shared by
 // copies of that store. ModelRegistry serializes its own state with a mutex;
-// records it returns are independent copies (they share the read-only root).
+// records its resolve() returns are independent copies (they share the read-only root);
+// list() hands out the registry's own records as shared read-only pointers.
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -57,7 +59,7 @@ namespace sonder::inference::models {
 inline constexpr const char* kOllamaDefaultHost = "registry.ollama.ai";
 inline constexpr const char* kOllamaDefaultNamespace = "library";
 inline constexpr const char* kOllamaDefaultTag = "latest";
-inline constexpr const char* kStoreJsonSchema = "sonder.inference.model_store/1";
+inline constexpr const char* kStoreJsonSchema = "sonder.inference.model_store/2";
 // "https://" + host (350) + "/" + namespace (80) + "/" + model (80) + ":" + tag (80).
 inline constexpr std::size_t kMaxOllamaNameBytes = 8 + 350 + 1 + 80 + 1 + 80 + 1 + 80;
 
@@ -107,6 +109,10 @@ enum class UnsupportedReason {
     digest_mismatch,          // a blob's content does not hash to its digest
     blob_busy,                // Windows: a weight blob is open for writing by another process, so it
                               // cannot be opened with writes denied to hash or serve it (transient)
+    hash_limit,               // a weight blob was not hashed to the end: it is larger than
+                              // StoreOptions::max_weight_file_bytes, or its hash ran past
+                              // StoreOptions::weight_hash_timeout or was cancelled (transient: the
+                              // record is never reused, the next resolve tries again)
 };
 const char* to_string(UnsupportedReason reason) noexcept;
 const char* to_string(EntryStatus status) noexcept;
@@ -128,7 +134,8 @@ struct FileStamp {
     std::int64_t write_time = 0;
     std::int64_t change_time = 0;
     // Windows: the file system does not report FileIdInfo, so `file_id` is the 64-bit index,
-    // which can collide; such a file is never matched against remembered digests.
+    // which can collide; such a file is hashed on every check, never looked up in nor added to
+    // the remembered digests (first_use). Copied from the handle's identity; part of ==.
     bool weak_id = false;
     friend bool operator==(const FileStamp&, const FileStamp&) = default;
 };
@@ -215,7 +222,8 @@ const char* to_string(ManifestLayout layout) noexcept;
 //              the identity is read again from the same open handle after the lookup; any
 //              difference (or a failed query) fails the record at once. Concurrent first uses
 //              of one file share a single hash (the others wait for it). scan() does not hash.
-//              Files with a weak (64-bit fallback) id are always hashed.
+//              Files with a weak (64-bit fallback) id (FileStamp::weak_id) are hashed on
+//              every resolve(): their digest is never looked up nor remembered.
 //   off        never; only the size and the GGUF header are checked. Not suitable for a
 //              library that untrusted local writers can modify.
 // Small layers are always hashed, whatever this says. Every weight hash, and every hash
@@ -239,28 +247,45 @@ const char* to_string(WeightCheck check) noexcept;
 
 inline constexpr std::size_t kMaxConcurrentWeightHashes = 2;
 
-// Bounds on directory enumeration: a store anyone can write to may hold any number of
-// entries. Applied while entries are read, before anything is kept; a scan that reaches one
-// says so in ScanResult::notes. A name lookup that misses (the case-insensitive fallback)
-// reads at most max_scan_entries entries and stops at the first match.
+// Bounds on directory enumeration and on what a scan keeps: a store anyone can write to may
+// hold any number of entries. Applied while entries are read, before anything is kept; a scan
+// that reaches one says so in ScanResult::notes. A name lookup that misses (the
+// case-insensitive fallback) reads at most max_scan_entries entries, all its nested
+// directories together, and stops at the first match.
 struct ScanLimits {
     std::size_t max_dir_entries = 4096;    // entries read from any one directory
     std::size_t max_scan_entries = 65536;  // entries read by one scan() or lookup, all directories
     std::size_t max_models = 1024;         // manifests one scan() reads
+    // Template, system and messages text one scan() keeps, all records together (each record
+    // is also capped at 16 MiB of small layers). Once the next such layer would pass it, the
+    // scan reads no more text layers: the records concerned have text_omitted set (their text
+    // layers were neither read nor checked) and a note says so. resolve() reads them in full.
+    // A ModelRegistry also bounds the text of the records it caches from resolve() by it.
+    std::uint64_t max_retained_text_bytes = 64ull << 20;
 };
 
 struct StoreOptions {
     WeightVerification verify_weights = WeightVerification::first_use;
-    // Called just before a weight blob is hashed (a multi-GB file takes minutes), e.g. for a
-    // progress line, on the thread that will hash it: when several threads need the same file
-    // only one hashes it, and the others wait for that hash while this runs. It runs before
-    // the thread takes one of the store's hash slots, so it holds none. It must not call back
-    // into a store or registry, directly or by waiting for another thread that does: on the
-    // callback's own thread every OllamaStore / ModelRegistry resolve(), resolve_for_load()
-    // and ModelRegistry::resolve fails at once with ErrorCode::invalid_state, revalidate()
-    // returns false, and scan() hashes nothing. It may run on several threads at once. May be
-    // empty. An exception it throws propagates out of the resolve that hashed.
+    // Called before a weight blob is hashed (a multi-GB file takes minutes), e.g. for a
+    // progress line, on the thread that wants to hash it. It runs while that thread holds
+    // nothing of the store: no hash slot and no single-flight claim, so no other thread ever
+    // waits for it. When several threads need the same unchanged file under first_use, each
+    // may call it, but only one of them then hashes the file; the others wait for that hash
+    // (never for a callback) and reuse its digest. It may wait for other threads that use
+    // any store or registry. On the callback's own thread, though, every OllamaStore /
+    // ModelRegistry resolve(), resolve_for_load() and ModelRegistry::resolve fails at once
+    // with ErrorCode::invalid_state, revalidate() returns false, and scan() hashes nothing
+    // (a direct call would hash, and so call back, again). It may run on several threads at
+    // once. May be empty. An exception it throws propagates out of the resolve that called it.
     std::function<void(const BlobRef&)> on_weight_hash;
+    // Bounds on one weight hash. A file larger than max_weight_file_bytes is not hashed; a hash
+    // that runs longer than weight_hash_timeout (zero: no time limit; measured from when it
+    // takes its hash slot) or sees weight_hash_cancel cancelled stops. Either way the record
+    // fails with UnsupportedReason::hash_limit, as a transient failure (never reused, never
+    // remembered as a digest), and any thread waiting for that hash is released to try again.
+    std::uint64_t max_weight_file_bytes = 1ull << 40;  // 1 TiB
+    std::chrono::milliseconds weight_hash_timeout{0};
+    CancellationToken weight_hash_cancel;
     ScanLimits limits;
 };
 
@@ -305,6 +330,11 @@ struct ModelRecord {
     std::optional<std::string> template_text;  // image.template (or legacy image.prompt)
     std::optional<std::string> system_prompt;  // image.system
     std::optional<std::string> messages_json;  // image.messages, validated JSON text
+    // A scan reached ScanLimits::max_retained_text_bytes before this record's template, system
+    // or messages layer: those not kept were neither read nor checked (their blobs are only
+    // opened and stamped). resolve() of the name reads them; ModelRegistry never serves such a
+    // cached record without resolving it again.
+    bool text_omitted = false;
     std::size_t license_count = 0;
 
     std::uint64_t weights_bytes = 0;     // declared size of model + shard + projector + adapter + draft layers
@@ -376,7 +406,10 @@ public:
     // The weakest check among the files (unchecked when empty).
     [[nodiscard]] WeightCheck check() const noexcept { return check_; }
     // True only when every file was hashed through its handle in the call that returned this
-    // object and matched its digest (check() == WeightCheck::hashed_now).
+    // object and matched its digest (check() == WeightCheck::hashed_now). It is a statement
+    // about that past hash ("hashed through this handle in this call"), not a guarantee that
+    // the bytes cannot change afterwards: POSIX cannot deny writers, and on Windows a writable
+    // mapping made before the open is not revoked (see the windows listed above).
     [[nodiscard]] bool verified() const noexcept { return check_ == WeightCheck::hashed_now; }
 
 private:
@@ -437,7 +470,7 @@ public:
     // (resolve again), when the record came from another OllamaStore (even one opened on the
     // same directory: records are tied to the root handle that read them), or when called
     // from on_weight_hash; on true `record` is current, though it may now be unsupported
-    // (digest_mismatch, blob_busy).
+    // (digest_mismatch, blob_busy, hash_limit).
     [[nodiscard]] bool revalidate(ModelRecord& record) const;
 
     // Diagnostics: weight hashes (and verify_blobs() hashes of this store's records) running
@@ -532,7 +565,9 @@ public:
     // another thread while it runs keeps the records its own scan produced.
     void refresh();
 
-    [[nodiscard]] std::vector<ModelRecord> list() const;
+    // The scanned records, shared with the registry (read-only, not copied; a refresh() or a
+    // resolve() that replaces an entry swaps the registry's pointer, never the record).
+    [[nodiscard]] std::vector<std::shared_ptr<const ModelRecord>> list() const;
 
     // A ready record for `name`. not_found when unknown; unsupported (with the reason in
     // the message) when the entry exists but cannot be served locally. A miss in the
@@ -554,11 +589,14 @@ public:
 private:
     [[nodiscard]] Result<ModelRecord> resolve_impl(std::string_view name, WeightVerification policy,
                                                    VerifiedWeights* keep) const;
+    // Template/system/messages bytes held by records_ and live_ (kept within
+    // options_.limits.max_retained_text_bytes). The caller holds mutex_.
+    [[nodiscard]] std::uint64_t retained_text_bytes() const;
     StoreOptions options_;
     mutable std::mutex mutex_;
     std::vector<OllamaStore> stores_;
-    mutable std::vector<ModelRecord> records_;
-    mutable std::map<std::string, ModelRecord> live_;
+    mutable std::vector<std::shared_ptr<const ModelRecord>> records_;
+    mutable std::map<std::string, std::shared_ptr<const ModelRecord>> live_;
 };
 
 // `sonder-infer models import-ollama` (docs/integration/model-store.md). Returns the

@@ -677,8 +677,13 @@ Changes outside the module, for the integrator:
    vector of every entry), `read_anchored_leaf_symlink` (POSIX: `readlinkat` + `lstat` only, the
    target is never resolved), `query_identity` (Windows: 128-bit `FILE_ID_INFO` id and 64-bit
    volume serial; the 64-bit fallback only for an unsupported class, marked
-   `FileIdentity::weak_id`), `read_some` and `OwnedFileHandle::release`. Round 3 also opens
-   directories without `FILE_DIRECTORY_FILE` (the attributes are checked on the handle). `open_anchored_regular(path, ...)` keeps its
+   `FileIdentity::weak_id`, which round 4 carries into the store's `FileStamp::weak_id` so such a
+   file is hashed on every `first_use` resolve and never looked up in or added to the remembered
+   digests), `read_some` and `OwnedFileHandle::release`. Round 3 also opens directories without
+   `FILE_DIRECTORY_FILE` (the attributes are checked on the handle). Round 4 adds two test aids:
+   `set_weak_identity_for_testing` (one atomic flag that marks every identity weak) and
+   `dir_entries_visited_on_this_thread` (a thread-local count of the entries `visit_anchored_dir`
+   handed to a callback). `open_anchored_regular(path, ...)` keeps its
    signature (it pins the path, then opens relative to it), so `src/artifacts` is unchanged apart
    from now using the relative opens; the `sonder.artifacts.*` tests cover it. `src/artifacts`
    keeps only `hash_open_handle`; `weight_manifest_io.hpp` re-exports the shared names with
@@ -695,10 +700,19 @@ model, shard, projector, adapter and draft layers by `find(digest)`; `draft_path
 model, rest = its shards), keep that object alive while the model is mapped, and never reopen
 `model_path` or any other record path. By default `resolve_for_load` hashes every weight through
 those handles (`weights.verified()`); the loader should refuse to load when `verified()` is false
-unless the operator chose `first_use` or `off`. Use `params`, `template_text` and `system_prompt`
-as request defaults. `resolve_for_load` takes no registry lock while it reads the disk, a miss
-streams only the directories on the name's path, and `StoreOptions::on_weight_hash` must not call
-back into the registry.
+unless the operator chose `first_use` or `off`. `verified()` means "hashed through this handle in
+this call", not that the bytes are immutable from then on: POSIX cannot deny writers, and Windows
+cannot revoke a writable mapping made before the open, so the loader security review must treat it
+as a past hash. Use `params`, `template_text` and `system_prompt` as request defaults (a record
+with `text_omitted` did not keep them; `resolve_for_load` never returns one). `resolve_for_load`
+takes no registry lock while it reads the disk, a miss streams only the directories on the name's
+path (at most `ScanLimits::max_scan_entries` entries in all), and `StoreOptions::on_weight_hash`
+runs while its thread holds no hash slot or single-flight claim: it may wait for other threads
+that use the registry, but on its own thread every store and registry entry point fails at once
+(`invalid_state`). A service should set `StoreOptions::weight_hash_timeout` and/or
+`weight_hash_cancel` (the default bounds a hash only by `max_weight_file_bytes`, 1 TiB). The JSON
+document is `sonder.inference.model_store/2` (round 4: `weight_check` and `text_omitted` added,
+`weights_verified` means hashed in this call).
 
 Open items:
 
@@ -710,6 +724,8 @@ Open items:
   load path in the loader lane before it can be wired. POSIX has no deny-write, so a writer can
   still change a blob after it was hashed there; on Windows a held blob blocks `ollama rm` and
   re-pulls of it (doc "Trust and verification", "Known limits").
-- The case-insensitive directory lookup (`locate_ci`) is only reachable on case-sensitive file
-  systems, so on Windows it is covered by CI on Linux, not by the local run.
+- The case-insensitive directory lookup (`locate_ci`) only finds anything on case-sensitive file
+  systems. Its entry bound is tested everywhere (a miss walks it on any file system); its
+  differently cased matches run only where the test directory is case-sensitive (Linux, or a
+  Windows directory with per-directory case sensitivity enabled).
 - The real-store totals in the doc were measured before the CLI counted shared blobs once.

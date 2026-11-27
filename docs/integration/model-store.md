@@ -77,6 +77,7 @@ was parsed and carries `reason` + `detail`. Precedence: the first reason found w
 | `unsafe_path` | a manifest, a directory on its path, `blobs/` or a blob is a symlink, junction or other reparse point, is not a regular disk file, or (manifests and small layers) has more than one hard link. |
 | `digest_mismatch` | a small layer, or a weight that was hashed (see the policy below), does not hash to its digest. |
 | `blob_busy` | (Windows) a weight blob is open for writing by another process, so it cannot be opened with writers denied to hash or serve it. Transient: the registry checks again on the next lookup. |
+| `hash_limit` | a weight blob was not hashed to the end: it is larger than `StoreOptions::max_weight_file_bytes` (default 1 TiB), or its hash ran past `weight_hash_timeout` or saw `weight_hash_cancel` cancelled. Transient: nothing is remembered and the next lookup tries again. |
 | `no_compatible_manifest` | manifest list without a `llamacpp`/`ggml` GGUF child. |
 | `manifest_invalid` | unreadable/oversized/not JSON/not an object, a repeated JSON key, a size that is not a non-negative integer (`24.9`, `-1`, `"24"`), a digest that is not exactly `sha256:<64 hex>` (the `sha256-` spelling is only a blob file name), more than 64 content layers or 64 list children, small layers over 4 MiB each or 16 MiB together, declared sizes that overflow 64 bits, a list child whose blob does not match its digest. |
 
@@ -149,20 +150,34 @@ the bytes were hashed in this call, through a handle that denies writers on Wind
     difference or a failed query fails the entry at once (transient), it is not hashed instead.
     Concurrent first uses of one identity share a single hash: one thread hashes (its record says
     `hashed_now`), the others wait for its result (`cached_identity`) and retry if it failed. A file
-    whose identity is weak (the 64-bit fallback below) is always hashed. `scan()`/`list()` do not
-    hash (`unchecked`).
+    whose identity is weak (`FileStamp::weak_id`, the 64-bit fallback below) is hashed on every
+    resolve: its digest is never looked up nor remembered (test "a weak file identity is hashed on
+    every first_use resolve and never remembered", through a test hook that marks every identity
+    weak). `scan()`/`list()` do not hash (`unchecked`).
   - `always`: every resolve and every scan hashes (`hashed_now`), nothing is remembered.
   - `off`: never (`unchecked`; the CLI listing uses this, `--verify` still hashes on request). Not
     suitable for a library that untrusted local writers can modify.
   At most `kMaxConcurrentWeightHashes` (2) hashes run at once per opened root: the weight checks and
   `verify_blobs()` of records read through it share the slots (copies of the store share them
   too). Only the hash read loop runs inside a slot; no hash runs while a cache or registry lock is
-  held. `on_weight_hash` runs before each weight hash, on the thread that will hash, holding no
-  slot (it does hold the single flight, so others needing the same file wait for it). It must not
-  call back into a store or registry, directly or by waiting for a thread that does: on its own
-  thread every `resolve()`, `resolve_for_load()` and registry `resolve()` fails at once with
-  `invalid_state`, `revalidate()` returns false and `scan()` hashes nothing (test "an
-  on_weight_hash callback that calls back into the store fails fast instead of deadlocking").
+  held. `on_weight_hash` runs before a weight hash, on the thread that wants to hash, while that
+  thread holds nothing of the store: no slot and no single-flight claim (under `first_use` the
+  claim is taken only after the callback returns, so nobody ever waits for a callback; several
+  threads needing one unchanged file may each call back, and one of them then hashes it). It may
+  therefore wait for other threads that use a store or registry (test "an on_weight_hash callback
+  may wait for another thread that resolves the same model"). On its own thread, though, every
+  `resolve()`, `resolve_for_load()` and registry `resolve()` fails at once with `invalid_state`,
+  `revalidate()` returns false and `scan()` hashes nothing, so a callback cannot recurse into
+  itself (test "an on_weight_hash callback that calls back into the store fails fast instead of
+  deadlocking").
+  Each hash is bounded (`StoreOptions`): a weight file larger than `max_weight_file_bytes`
+  (default 1 TiB) is not hashed, and a hash stops once it has run `weight_hash_timeout` (default
+  none; measured from when it takes its slot) or `weight_hash_cancel` is cancelled. The entry is
+  then `hash_limit`, a transient failure: nothing is remembered, a registry never reuses it, and
+  threads waiting for that hash are released to try for themselves (test "weight hashing is
+  bounded by file size, time and cancellation"). A sparse multi-terabyte blob with a valid header
+  and matching declared size is refused at 1 TiB by default, and holds a slot for at most the
+  timeout when one is set.
 - **What `hashed_now` and `VerifiedWeights` mean.** `hashed_now`: every weight blob, opened while
   the record was produced or revalidated, hashed to its digest through that handle in that call.
   It says nothing about the file once that handle is closed. A loader that must load exactly the
@@ -170,9 +185,13 @@ the bytes were hashed in this call, through a handle that denies writers on Wind
   return those same open handles in a move-only `VerifiedWeights` (one per distinct weight digest,
   `find(digest)`, each with its own `check`), and maps or reads those handles; it must not reopen
   `model_path` & co. `resolve_for_load` hashes every weight through the returned handles by
-  default (`always`, whatever the store's policy); `verified()` is true only when every file is
-  `hashed_now`. A caller that passes `first_use` explicitly accepts `cached_identity`. On Windows
-  the handles deny writers for as long as the `VerifiedWeights` lives.
+  default (`always`, whatever the store's policy, `off` included: test "resolve_for_load hashes by
+  default even on a store opened with verification off"); `verified()` is true only when every
+  file is `hashed_now`. A caller that passes `first_use` explicitly accepts `cached_identity`. On
+  Windows the handles deny writers for as long as the `VerifiedWeights` lives.
+  `verified()` means "hashed through this handle in this call": a statement about a past hash,
+  not a guarantee that the bytes cannot change afterwards. POSIX cannot deny writers, and Windows
+  cannot revoke a writable mapping that existed before the open (Known limits below).
 - **Cached records are revalidated.** `ModelRegistry::resolve` passes every cached ready record
   (from the scan or from an earlier live lookup) through `OllamaStore::revalidate`: each source
   file and blob must still have the identity it had when it was read; otherwise the name is
@@ -187,7 +206,8 @@ the bytes were hashed in this call, through a handle that denies writers on Wind
   a removed hard link or a released writer is served without `refresh()`, and an unchanged corrupt
   multi-GB blob is not re-hashed on every request. Successful live lookups are cached (at most
   1024; `refresh()` drops them). `refresh()` keeps the records of a store that `add_ollama_dir()`
-  registered while it ran.
+  registered while it ran. `list()` returns the registry's records as shared read-only pointers,
+  not copies.
 - **Bounds.** Manifests and list children 4 MiB, 64 content layers, 64 list children, small layers
   4 MiB each and 16 MiB per manifest, each digest validated once per manifest, `params.stop` at most
   64 entries of at most 1024 bytes (a later params layer replaces `stop`, as Ollama's map decode
@@ -197,7 +217,19 @@ the bytes were hashed in this call, through a handle that denies writers on Wind
   any one directory, 65536 per scan or lookup in total, and 1024 manifests per scan; the caps are
   applied while entries are read, before anything is kept, and a scan that reaches one says so in
   its notes. The case-insensitive lookup streams the directories on the name's path, keeps no
-  entries, and stops at the first match.
+  entries, and stops at the first match; its nested listings share the one `max_scan_entries`
+  count, checked before and after each nested listing, so a lookup reads at most that many
+  entries in all (test "a name lookup that misses reads at most max_scan_entries entries across
+  nested directories").
+  Retained text (`ScanLimits::max_retained_text_bytes`, default 64 MiB): the template, system and
+  messages text one scan keeps, all records together. Each layer's declared size is charged
+  before it is read; once the next one would not fit, the scan reads no more text layers, notes
+  it, and sets `ModelRecord::text_omitted` on the records concerned (those layers were opened and
+  stamped, not read or checked). `resolve()` reads them in full, and the registry never serves a
+  ready `text_omitted` record from its cache without resolving it again. The registry applies the
+  same budget to everything it caches (the scan records of all its stores plus live results): a
+  record whose text would not fit is cached without it (`text_omitted`). Test "a scan keeps
+  template, system and messages text only within max_retained_text_bytes".
 - **Names.** Besides Ollama's part rules, a part (the host included) may not end in `.` and may not
   be a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM0-9`, `LPT0-9`, with or without an
   extension or port), on every platform; Win32 would otherwise open `coder` for `coder.`. Directory
@@ -247,11 +279,14 @@ Known limits (the remaining post-check windows):
   read them); the registry only revalidates records against the store that produced them.
 - **Enumeration caps hide entries.** A directory over `max_dir_entries` is read only partly (which
   entries depends on the file system's order), and a store over the per-scan caps is listed only
-  partly; the notes say so, and `resolve()` of an exact name does not enumerate. The memory a scan
-  keeps is bounded by `max_models` records of at most 16 MiB of small-layer text each, which is
-  still large; a per-scan text budget is not implemented.
-- Hash cancellation and request-level admission (rate limiting) for an HTTP path are not here; the
-  store is not wired to the server.
+  partly; the notes say so, and `resolve()` of an exact name does not enumerate. Which records
+  keep their text under `max_retained_text_bytes` follows the scan's name order.
+- **One resolve can still read up to 16 MiB of text** (the per-manifest small-layer cap) while it
+  runs; the retained-text budget bounds what scans and the registry keep, not a single call.
+- **Hash limits are per file.** `weight_hash_timeout` bounds one file's hash; a model with several
+  weight files, or threads that retry after a timed-out hash, take up to that long each.
+  Request-level admission (rate limiting) for an HTTP path is not here; the store is not wired to
+  the server.
 
 ## Full digest report (opt-in)
 
@@ -274,8 +309,11 @@ sonder-infer models import-ollama [DIR] [--name NAME] [--verify [--weights-only]
 
 `DIR` defaults to `$OLLAMA_MODELS`, then `<home>/.ollama/models`. Output is a table (name, status,
 size, quantization, parameter size, `num_ctx`, which layers exist, the paths) or, with `--json`,
-the `sonder.inference.model_store/1` document (`source`, `models[]` with `files`, `config`,
-`params`, `template`, `system`, `gguf`, `warnings`, and `verification` when `--verify` ran).
+the `sonder.inference.model_store/2` document (`source`, `models[]` with `files`, `config`,
+`params`, `template`, `system`, `gguf`, `weights_verified`, `weight_check`, `text_omitted`,
+`warnings`, and `verification` when `--verify` ran). Schema `/2` (PR 135 round 4) replaced `/1`:
+`weights_verified` now means `weight_check == "hashed_now"` (hashed in this call), and
+`weight_check` and `text_omitted` were added.
 Exit status: 0 ok, 1 failure (directory unreadable, name not found, verification failed),
 2 usage error. Entries that cannot be served are listed, not errors.
 

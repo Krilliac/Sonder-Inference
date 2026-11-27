@@ -415,7 +415,7 @@ grep -q 'outcome=cancelled' \"$2\" || { echo 'no outcome=cancelled stats line'; 
         set(model_store_empty "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/model_store_empty")
         sonder_cli_test(models_import_ollama_lists RC 0 STDOUT_REGEX "0 entries: 0 ready"
             COMMAND ${infer} models import-ollama ${model_store_empty})
-        sonder_cli_test(models_import_ollama_json RC 0 STDOUT_JSON STDOUT_REGEX "sonder.inference.model_store/1"
+        sonder_cli_test(models_import_ollama_json RC 0 STDOUT_JSON STDOUT_REGEX "sonder.inference.model_store/2"
             COMMAND ${infer} models import-ollama ${model_store_empty} --json)
         sonder_cli_test(models_import_ollama_help RC 0 STDOUT_REGEX "usage: sonder-infer models import-ollama"
             COMMAND ${infer} models import-ollama --help)

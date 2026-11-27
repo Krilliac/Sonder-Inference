@@ -34,7 +34,7 @@ const char* kUsage =
     "  --verify         also re-hash the blobs of every ready model and compare with the manifest\n"
     "                   digest. Opt-in: reads every byte (minutes for multi-GB files); progress on stderr\n"
     "  --weights-only   with --verify, hash only model/projector/adapter/draft blobs\n"
-    "  --json           print the sonder.inference.model_store/1 document instead of the table\n"
+    "  --json           print the sonder.inference.model_store/2 document instead of the table\n"
     "\n"
     "Entries that cannot be served locally (Ollama Cloud stubs, safetensors/MLX, missing or truncated\n"
     "blobs, invalid GGUF) are listed with the reason. Exit status: 0 ok, 1 failure (directory\n"

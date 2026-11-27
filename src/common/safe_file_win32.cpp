@@ -12,6 +12,7 @@
 #include "common/safe_file.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <functional>
@@ -132,6 +133,9 @@ std::int64_t filetime_ticks(const FILETIME& ft) {
                                      static_cast<std::uint64_t>(ft.dwLowDateTime));
 }
 
+std::atomic<bool> g_weak_identity_for_testing{false};  // set_weak_identity_for_testing
+thread_local std::uint64_t t_dir_entries_visited = 0;    // dir_entries_visited_on_this_thread
+
 // GetFileInformationByHandleEx(FileIdInfo) errors that mean "this file system does not
 // implement the class", as opposed to a transient, permission or device failure.
 bool file_id_info_unsupported(DWORD err) {
@@ -172,6 +176,7 @@ bool fill_identity(HANDLE h, FileIdentity& out, DWORD& attrs, std::string& err_m
         out.file_id_high = 0;
         out.weak_id = true;
     }
+    if (g_weak_identity_for_testing.load(std::memory_order_relaxed)) out.weak_id = true;
     out.size = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | static_cast<std::uint64_t>(info.nFileSizeLow);
     out.link_count = info.nNumberOfLinks;
     out.write_time = filetime_ticks(info.ftLastWriteTime);
@@ -257,6 +262,10 @@ OpenOutcome open_dirs(HANDLE anchor, const std::vector<std::wstring>& segs, std:
 }
 
 }  // namespace
+
+void set_weak_identity_for_testing(bool on) noexcept { g_weak_identity_for_testing.store(on, std::memory_order_relaxed); }
+
+std::uint64_t dir_entries_visited_on_this_thread() noexcept { return t_dir_entries_visited; }
 
 OwnedFileHandle::OwnedFileHandle() noexcept : handle_(to_raw(INVALID_HANDLE_VALUE)) {}
 
@@ -442,6 +451,7 @@ OpenOutcome visit_anchored_dir(const OwnedFileHandle& anchor, std::string_view r
                     return OpenOutcome::ok;
                 }
                 ++visited;
+                ++t_dir_entries_visited;
                 DirEntry e;
                 e.name_ok = wide_to_utf8(wname, e.name);
                 if (!e.name_ok) e.name.clear();
