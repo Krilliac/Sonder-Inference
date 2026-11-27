@@ -8,6 +8,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -52,6 +53,37 @@ std::string ToLowerAscii(std::string_view s) {
     return out;
 }
 
+// Extracts trailing decimal GPU ordinal from vendor backend names ("cuda0", "vulkan1",
+// "rocm0", "hip2", "metal0", "sycl0", "musa0", "cann0", "opencl0", "webgpu0", "gpu:0")
+// so backends referencing the same GPU ordinal canonicalize to the same domain token.
+std::string CanonicalizeDeviceDomainToken(std::string_view raw_dev) {
+    std::string lower = ToLowerAscii(raw_dev);
+    if (lower.empty() || lower == "cpu") return "cpu";
+    if (lower.rfind("gpu:", 0) == 0 && lower.size() > 4u) {
+        const std::string_view tail(lower.data() + 4u, lower.size() - 4u);
+        const bool all_digits = std::all_of(tail.begin(), tail.end(),
+                                            [](unsigned char c) { return std::isdigit(c) != 0; });
+        if (all_digits) return std::string(tail);
+        return lower.substr(4u);
+    }
+    constexpr std::string_view kKnownPrefixes[] = {
+        "cuda", "vulkan", "rocm", "hip", "metal", "sycl", "musa", "cann", "opencl", "webgpu"};
+    for (std::string_view pfx : kKnownPrefixes) {
+        if (lower.rfind(pfx, 0) == 0 && lower.size() > pfx.size()) {
+            const std::string_view tail(lower.data() + pfx.size(), lower.size() - pfx.size());
+            const bool all_digits = std::all_of(tail.begin(), tail.end(),
+                                                [](unsigned char c) { return std::isdigit(c) != 0; });
+            if (all_digits) {
+                // Strip leading zeros except single "0".
+                std::size_t first_nz = 0;
+                while (first_nz + 1u < tail.size() && tail[first_nz] == '0') ++first_nz;
+                return std::string(tail.substr(first_nz));
+            }
+        }
+    }
+    return lower;
+}
+
 bool IsValidStreamPriorityValue(StreamPriority p) noexcept {
     switch (p) {
         case StreamPriority::kDefault:
@@ -88,6 +120,26 @@ std::int64_t SaturatingAddNs(std::int64_t a, std::int64_t b) noexcept {
 
 constexpr std::int64_t kMinCreditFloorNs = -60'000'000'000LL;  // -60s floor prevents underflow
 constexpr std::uint64_t kMaxSttTotalEncoderTokens = 1ull << 20;
+
+struct TransparentStringHash {
+    using is_transparent = void;
+    std::size_t operator()(std::string_view sv) const noexcept {
+        return std::hash<std::string_view>{}(sv);
+    }
+    std::size_t operator()(const std::string& s) const noexcept {
+        return std::hash<std::string_view>{}(s);
+    }
+};
+
+std::mutex& GetSyncObserverMutex() {
+    static std::mutex mu;
+    return mu;
+}
+
+AuxContextSyncObserver& GetSyncObserverSlot() {
+    static AuxContextSyncObserver obs;
+    return obs;
+}
 
 #if defined(_WIN32)
 template <typename Fn>
@@ -173,11 +225,12 @@ int ResolveCudaNumericStreamPriority(int least_priority, int greatest_priority,
     }
 }
 
-StreamPriority EffectiveMainStreamPriority(WorkloadRole role, StreamPriority configured) noexcept {
+StreamPriority EffectiveMainStreamPriority(WorkloadRole role, StreamPriority main_configured,
+                                           StreamPriority aux_configured) noexcept {
     if (role == WorkloadRole::kAuxiliary) {
-        return StreamPriority::kLow;
+        return aux_configured;
     }
-    return configured;
+    return main_configured;
 }
 
 GgmlCudaStreamPriorityStats GetGgmlCudaStreamPriorityStats() noexcept {
@@ -498,10 +551,10 @@ Status ValidateAuxGateConfig(const AuxGateConfig& config) {
                              "handoff_pickup_timeout_ms (" + std::to_string(config.handoff_pickup_timeout_ms) +
                                  ") must be in [1, " + std::to_string(kMaxAuxGateTimeoutMs) + "]");
     }
-    if (config.max_starvation_wait_ms > kMaxAuxGateTimeoutMs) {
+    if (config.max_starvation_wait_ms < 1u || config.max_starvation_wait_ms > kMaxAuxGateTimeoutMs) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "max_starvation_wait_ms (" + std::to_string(config.max_starvation_wait_ms) +
-                                 ") must be <= " + std::to_string(kMaxAuxGateTimeoutMs));
+                                 ") must be in [1, " + std::to_string(kMaxAuxGateTimeoutMs) + "]");
     }
     if (config.cancel_poll_interval_ms < 1u || config.cancel_poll_interval_ms > kMaxAuxGateTimeoutMs) {
         return Status::Error(ErrorCode::kInvalidArgument,
@@ -516,23 +569,29 @@ std::string ResolveAuxExecutionDomain(std::int32_t n_gpu_layers, std::int32_t ma
     if (n_gpu_layers == 0) {
         return "cpu";
     }
-    std::vector<std::string> norm_devs;
-    norm_devs.reserve(devices.size());
+    std::vector<std::string> tokens;
+    tokens.reserve(devices.size());
     for (const std::string& d : devices) {
-        if (!d.empty()) {
-            norm_devs.push_back(ToLowerAscii(d));
+        if (d.empty()) continue;
+        std::string tok = CanonicalizeDeviceDomainToken(d);
+        if (tok == "cpu") continue;
+        if (std::find(tokens.begin(), tokens.end(), tok) == tokens.end()) {
+            tokens.push_back(std::move(tok));
         }
     }
-    if (norm_devs.empty()) {
+    if (tokens.empty()) {
+        for (const std::string& d : devices) {
+            if (EqualsAsciiIgnoreCase(d, "cpu")) return "cpu";
+        }
         return "gpu:" + std::to_string(std::max<std::int32_t>(0, main_gpu));
     }
-    if (norm_devs.size() == 1u) {
-        return norm_devs[0];
+    if (tokens.size() == 1u) {
+        return "gpu:" + tokens[0];
     }
     std::string joined = "gpu:";
-    for (std::size_t i = 0; i < norm_devs.size(); ++i) {
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
         if (i > 0u) joined.push_back('+');
-        joined += norm_devs[i];
+        joined += tokens[i];
     }
     return joined;
 }
@@ -551,7 +610,7 @@ struct DecodeAwareAuxGate::Impl {
     AuxGateConfig cfg{};
     ClockFn clock_fn;
     std::vector<std::unique_ptr<DomainState>> domains;
-    std::unordered_map<std::string, std::size_t> domain_by_name;
+    std::unordered_map<std::string, std::size_t, TransparentStringHash, std::equal_to<>> domain_by_name;
 
     Impl(AuxGateConfig c, ClockFn clk)
         : cfg(ValidateAuxGateConfig(c).ok() ? c : AuxGateConfig{}),
@@ -568,23 +627,31 @@ struct DecodeAwareAuxGate::Impl {
         return cfg;
     }
 
+    [[nodiscard]] static std::string_view NormalizeDomainView(std::string_view raw) noexcept {
+        return raw.empty() ? std::string_view("default") : raw;
+    }
+
+    [[nodiscard]] static bool IsBypassedCpuDomain(const AuxGateConfig& c, std::string_view dom_view) noexcept {
+        return !c.gate_cpu_domain && dom_view == "cpu";
+    }
+
     std::size_t GetOrCreateDomainIndex(std::string_view raw_domain) {
-        const std::string key = raw_domain.empty() ? std::string("default") : std::string(raw_domain);
+        const std::string_view key_view = NormalizeDomainView(raw_domain);
         std::lock_guard<std::mutex> lock(table_mu);
-        const auto it = domain_by_name.find(key);
+        const auto it = domain_by_name.find(key_view);
         if (it != domain_by_name.end()) {
             return it->second;
         }
         const std::size_t idx = domains.size();
         domains.push_back(std::make_unique<DomainState>());
-        domain_by_name.emplace(key, idx);
+        domain_by_name.emplace(std::string(key_view), idx);
         return idx;
     }
 
-    [[nodiscard]] DomainState* FindDomain(std::string_view raw_domain) const noexcept {
-        const std::string key = raw_domain.empty() ? std::string("default") : std::string(raw_domain);
+    [[nodiscard]] DomainState* FindDomain(std::string_view raw_domain) const {
+        const std::string_view key_view = NormalizeDomainView(raw_domain);
         std::lock_guard<std::mutex> lock(table_mu);
-        const auto it = domain_by_name.find(key);
+        const auto it = domain_by_name.find(key_view);
         if (it == domain_by_name.end()) return nullptr;
         return domains[it->second].get();
     }
@@ -615,17 +682,18 @@ Status DecodeAwareAuxGate::Reconfigure(const AuxGateConfig& config) {
 
 AuxGateConfig DecodeAwareAuxGate::config() const { return impl_->SnapshotConfig(); }
 
-bool DecodeAwareAuxGate::IsDecodeActive(std::string_view domain) const noexcept {
+bool DecodeAwareAuxGate::IsDecodeActive(std::string_view domain) const {
     if (!impl_) return false;
+    const std::string_view key_view = Impl::NormalizeDomainView(domain);
     const AuxGateConfig c = impl_->SnapshotConfig();
-    if (!c.enabled) return false;
-    Impl::DomainState* dom = impl_->FindDomain(domain);
+    if (!c.enabled || Impl::IsBypassedCpuDomain(c, key_view)) return false;
+    Impl::DomainState* dom = impl_->FindDomain(key_view);
     if (dom == nullptr) return false;
     std::lock_guard<std::mutex> lock(dom->mu);
     return dom->stats.active_decode_sessions > 0u || dom->stats.in_flight_decode_steps > 0u;
 }
 
-bool DecodeAwareAuxGate::IsDecodeStepInFlight(std::string_view domain) const noexcept {
+bool DecodeAwareAuxGate::IsDecodeStepInFlight(std::string_view domain) const {
     if (!impl_) return false;
     Impl::DomainState* dom = impl_->FindDomain(domain);
     if (dom == nullptr) return false;
@@ -681,7 +749,8 @@ DecodeAwareAuxGate::DecodeStepScope::DecodeStepScope(DecodeAwareAuxGate* gate, s
 DecodeAwareAuxGate::DecodeStepScope::DecodeStepScope(DecodeStepScope&& other) noexcept
     : gate_(std::exchange(other.gate_, nullptr)),
       domain_idx_(other.domain_idx_),
-      start_ns_(other.start_ns_) {}
+      start_ns_(other.start_ns_),
+      synced_(std::exchange(other.synced_, false)) {}
 
 DecodeAwareAuxGate::DecodeStepScope& DecodeAwareAuxGate::DecodeStepScope::operator=(
     DecodeStepScope&& other) noexcept {
@@ -690,14 +759,22 @@ DecodeAwareAuxGate::DecodeStepScope& DecodeAwareAuxGate::DecodeStepScope::operat
         gate_ = std::exchange(other.gate_, nullptr);
         domain_idx_ = other.domain_idx_;
         start_ns_ = other.start_ns_;
+        synced_ = std::exchange(other.synced_, false);
     }
     return *this;
 }
 
 DecodeAwareAuxGate::DecodeStepScope::~DecodeStepScope() noexcept { Release(); }
 
+void DecodeAwareAuxGate::DecodeStepScope::MarkSynchronized() noexcept {
+    if (gate_ != nullptr) {
+        synced_ = true;
+    }
+}
+
 void DecodeAwareAuxGate::DecodeStepScope::Release() noexcept {
     DecodeAwareAuxGate* g = std::exchange(gate_, nullptr);
+    const bool was_synced = std::exchange(synced_, false);
     if (g == nullptr || !g->impl_) return;
     AuxGateConfig cfg{};
     Impl::DomainState* dom = nullptr;
@@ -715,6 +792,9 @@ void DecodeAwareAuxGate::DecodeStepScope::Release() noexcept {
 
     std::lock_guard<std::mutex> lock(dom->mu);
     dom->stats.decode_busy_ns += static_cast<std::uint64_t>(step_ns);
+    if (was_synced) {
+        ++dom->stats.decode_steps_synced_before_release;
+    }
     if (dom->stats.in_flight_decode_steps > 0u) {
         --dom->stats.in_flight_decode_steps;
     }
@@ -722,12 +802,8 @@ void DecodeAwareAuxGate::DecodeStepScope::Release() noexcept {
     if (cfg.enabled) {
         const double d = std::clamp(cfg.max_aux_duty_cycle, 1e-6, kMaxAllowedAuxDutyCycle);
         const double ratio = d / (1.0 - d);
-        const auto proportional_ns = static_cast<std::int64_t>(static_cast<double>(step_ns) * ratio);
-        // Sub-millisecond CPU micro-steps (e.g. tiny synthetic GGUF unit tests) earn a 100 us
-        // minimum credit per step; any real >= 2 ms GPU decode step exceeds 100 us at 5% duty,
-        // preserving exact step_ns * (d / (1 - d)) DRR accounting.
-        const std::int64_t min_floor_ns = (d >= 0.01) ? 100'000LL : 1'000LL;
-        const std::int64_t add_ns = std::max<std::int64_t>(1LL, std::max(proportional_ns, min_floor_ns));
+        const auto proportional_ns = static_cast<std::int64_t>(std::llround(static_cast<double>(step_ns) * ratio));
+        const std::int64_t add_ns = std::max<std::int64_t>(1LL, proportional_ns);
         // Cap positive credit at +1 ns so idle decode steps never pre-bank multi-slice bursts.
         dom->aux_credit_ns = std::min<std::int64_t>(1LL, SaturatingAddNs(dom->aux_credit_ns, add_ns));
 
@@ -751,7 +827,8 @@ DecodeAwareAuxGate::AuxSliceScope::AuxSliceScope(AuxSliceScope&& other) noexcept
       domain_idx_(other.domain_idx_),
       status_(other.status_),
       start_ns_(other.start_ns_),
-      wait_ns_(other.wait_ns_) {}
+      wait_ns_(other.wait_ns_),
+      synced_(std::exchange(other.synced_, false)) {}
 
 DecodeAwareAuxGate::AuxSliceScope& DecodeAwareAuxGate::AuxSliceScope::operator=(
     AuxSliceScope&& other) noexcept {
@@ -762,14 +839,22 @@ DecodeAwareAuxGate::AuxSliceScope& DecodeAwareAuxGate::AuxSliceScope::operator=(
         status_ = other.status_;
         start_ns_ = other.start_ns_;
         wait_ns_ = other.wait_ns_;
+        synced_ = std::exchange(other.synced_, false);
     }
     return *this;
 }
 
 DecodeAwareAuxGate::AuxSliceScope::~AuxSliceScope() noexcept { Release(); }
 
+void DecodeAwareAuxGate::AuxSliceScope::MarkSynchronized() noexcept {
+    if (gate_ != nullptr && status_ != AuxAcquireStatus::kCancelled) {
+        synced_ = true;
+    }
+}
+
 void DecodeAwareAuxGate::AuxSliceScope::Release() noexcept {
     DecodeAwareAuxGate* g = std::exchange(gate_, nullptr);
+    const bool was_synced = std::exchange(synced_, false);
     if (g == nullptr || !g->impl_ || status_ == AuxAcquireStatus::kCancelled) return;
     Impl::DomainState* dom = nullptr;
     {
@@ -785,6 +870,9 @@ void DecodeAwareAuxGate::AuxSliceScope::Release() noexcept {
 
     std::lock_guard<std::mutex> lock(dom->mu);
     dom->stats.aux_busy_ns += static_cast<std::uint64_t>(slice_ns);
+    if (was_synced) {
+        ++dom->stats.aux_slices_synced_before_release;
+    }
     if (dom->stats.in_flight_aux_slices > 0u) {
         --dom->stats.in_flight_aux_slices;
     }
@@ -797,11 +885,17 @@ void DecodeAwareAuxGate::AuxSliceScope::Release() noexcept {
 }
 
 DecodeAwareAuxGate::DecodeSessionScope DecodeAwareAuxGate::EnterDecodeSession(std::string_view domain) {
-    const std::size_t idx = impl_->GetOrCreateDomainIndex(domain);
+    const std::string_view key_view = Impl::NormalizeDomainView(domain);
+    const std::size_t idx = impl_->GetOrCreateDomainIndex(key_view);
+    AuxGateConfig cfg{};
     Impl::DomainState* dom = nullptr;
     {
         std::lock_guard<std::mutex> tlock(impl_->table_mu);
+        cfg = impl_->cfg;
         dom = impl_->domains[idx].get();
+    }
+    if (Impl::IsBypassedCpuDomain(cfg, key_view)) {
+        return DecodeSessionScope();
     }
     {
         std::lock_guard<std::mutex> lock(dom->mu);
@@ -816,13 +910,17 @@ DecodeAwareAuxGate::DecodeSessionScope DecodeAwareAuxGate::EnterDecodeSession(st
 }
 
 DecodeAwareAuxGate::DecodeStepScope DecodeAwareAuxGate::EnterDecodeStep(std::string_view domain) {
-    const std::size_t idx = impl_->GetOrCreateDomainIndex(domain);
+    const std::string_view key_view = Impl::NormalizeDomainView(domain);
+    const std::size_t idx = impl_->GetOrCreateDomainIndex(key_view);
     AuxGateConfig cfg{};
     Impl::DomainState* dom = nullptr;
     {
         std::lock_guard<std::mutex> tlock(impl_->table_mu);
         cfg = impl_->cfg;
         dom = impl_->domains[idx].get();
+    }
+    if (Impl::IsBypassedCpuDomain(cfg, key_view)) {
+        return DecodeStepScope();
     }
 
     std::unique_lock<std::mutex> lock(dom->mu);
@@ -844,8 +942,9 @@ DecodeAwareAuxGate::DecodeStepScope DecodeAwareAuxGate::EnterDecodeStep(std::str
             }
         }
 
-        // 2. Wait for any in-flight auxiliary slice (including one that just claimed
-        //    the handoff ticket above) to finish and synchronize its stream.
+        // 2. Wait for any in-flight AuxSliceScope (whose caller synchronizes device
+        //    execution via llama_synchronize or CudaPriorityStream::Synchronize before
+        //    releasing the scope) up to max_decode_hold_ms.
         if (dom->stats.in_flight_aux_slices > 0u) {
             waited = true;
             const auto hold_deadline =
@@ -875,7 +974,8 @@ DecodeAwareAuxGate::DecodeStepScope DecodeAwareAuxGate::EnterDecodeStep(std::str
 
 DecodeAwareAuxGate::AuxSliceScope DecodeAwareAuxGate::AcquireAuxSlice(
     std::string_view domain, const std::function<bool()>& should_cancel) {
-    const std::size_t idx = impl_->GetOrCreateDomainIndex(domain);
+    const std::string_view key_view = Impl::NormalizeDomainView(domain);
+    const std::size_t idx = impl_->GetOrCreateDomainIndex(key_view);
     AuxGateConfig cfg{};
     Impl::DomainState* dom = nullptr;
     {
@@ -898,6 +998,13 @@ DecodeAwareAuxGate::AuxSliceScope DecodeAwareAuxGate::AcquireAuxSlice(
             ++dom->stats.aux_slices_overlapped_decode;
         }
         return AuxSliceScope(this, idx, AuxAcquireStatus::kBypassedDisabled, impl_->NowNs(), 0);
+    }
+
+    if (Impl::IsBypassedCpuDomain(cfg, key_view)) {
+        ++dom->stats.in_flight_aux_slices;
+        ++dom->stats.aux_slices_total;
+        ++dom->stats.aux_slices_idle_fastpath;
+        return AuxSliceScope(this, idx, AuxAcquireStatus::kAcquiredIdle, impl_->NowNs(), 0);
     }
 
     // Zero-wait idle fast path when no foreground decode session or step is active.
@@ -935,16 +1042,22 @@ DecodeAwareAuxGate::AuxSliceScope DecodeAwareAuxGate::AcquireAuxSlice(
         }
 
         const AuxGateConfig cur_cfg = impl_->SnapshotConfig();
-        if (!cur_cfg.enabled) {
+        if (!cur_cfg.enabled || Impl::IsBypassedCpuDomain(cur_cfg, key_view)) {
             dom->handoff_armed = false;
             ++dom->stats.in_flight_aux_slices;
             ++dom->stats.aux_slices_total;
-            if (dom->stats.in_flight_decode_steps > 0u) {
+            if (Impl::IsBypassedCpuDomain(cur_cfg, key_view)) {
+                ++dom->stats.aux_slices_idle_fastpath;
+            } else if (dom->stats.in_flight_decode_steps > 0u) {
                 ++dom->stats.aux_slices_overlapped_decode;
             }
             const std::int64_t wait_ns = std::max<std::int64_t>(0, impl_->NowNs() - wait_begin_ns);
             dom->stats.aux_gate_wait_ns += static_cast<std::uint64_t>(wait_ns);
-            return AuxSliceScope(this, idx, AuxAcquireStatus::kBypassedDisabled, impl_->NowNs(), wait_ns);
+            return AuxSliceScope(
+                this, idx,
+                Impl::IsBypassedCpuDomain(cur_cfg, key_view) ? AuxAcquireStatus::kAcquiredIdle
+                                                             : AuxAcquireStatus::kBypassedDisabled,
+                impl_->NowNs(), wait_ns);
         }
 
         if (dom->stats.in_flight_decode_steps == 0u && dom->stats.in_flight_aux_slices == 0u) {
@@ -1003,10 +1116,12 @@ AuxGateStats DecodeAwareAuxGate::GetStats(std::string_view domain) const {
         std::lock_guard<std::mutex> lock(dom->mu);
         total.decode_sessions_total += dom->stats.decode_sessions_total;
         total.decode_steps_total += dom->stats.decode_steps_total;
+        total.decode_steps_synced_before_release += dom->stats.decode_steps_synced_before_release;
         total.decode_busy_ns += dom->stats.decode_busy_ns;
         total.decode_hold_wait_ns += dom->stats.decode_hold_wait_ns;
         total.decode_hold_timeouts += dom->stats.decode_hold_timeouts;
         total.aux_slices_total += dom->stats.aux_slices_total;
+        total.aux_slices_synced_before_release += dom->stats.aux_slices_synced_before_release;
         total.aux_slices_idle_fastpath += dom->stats.aux_slices_idle_fastpath;
         total.aux_slices_gated_between_steps += dom->stats.aux_slices_gated_between_steps;
         total.aux_slices_starvation_admitted += dom->stats.aux_slices_starvation_admitted;
@@ -1047,6 +1162,31 @@ void DecodeAwareAuxGate::ResetStats() {
 std::shared_ptr<DecodeAwareAuxGate> DefaultProcessAuxGate() {
     static const std::shared_ptr<DecodeAwareAuxGate> kGate = std::make_shared<DecodeAwareAuxGate>();
     return kGate;
+}
+
+void SetAuxContextSyncObserverForTest(AuxContextSyncObserver observer) {
+    std::lock_guard<std::mutex> lock(GetSyncObserverMutex());
+    GetSyncObserverSlot() = std::move(observer);
+}
+
+void NotifyAuxContextSynchronized(const DecodeAwareAuxGate* gate, std::string_view domain,
+                                  bool is_aux_slice) {
+    AuxContextSyncObserver copy;
+    {
+        std::lock_guard<std::mutex> lock(GetSyncObserverMutex());
+        copy = GetSyncObserverSlot();
+    }
+    if (!copy) return;
+
+    AuxContextSyncObservation obs;
+    obs.domain = std::string(domain);
+    obs.is_aux_slice = is_aux_slice;
+    if (gate != nullptr) {
+        const AuxGateStats st = gate->GetStats(domain);
+        obs.decode_step_in_flight_at_sync = (st.in_flight_decode_steps > 0u);
+        obs.aux_slice_in_flight_at_sync = (st.in_flight_aux_slices > 0u);
+    }
+    copy(obs);
 }
 
 std::vector<PlannedEmbedBatch> SubslicePlannedBatch(const PlannedEmbedBatch& batch,
@@ -1191,6 +1331,10 @@ Status RunGatedAuxSlices(
             slice_status = run_slice(i, decode_active);
             if (slice_status.ok() && cuda_stream != nullptr && cuda_stream->valid()) {
                 slice_status = cuda_stream->Synchronize();
+                if (slice_status.ok()) {
+                    scope.MarkSynchronized();
+                    NotifyAuxContextSynchronized(&gate, domain, /*is_aux_slice=*/true);
+                }
             }
         }
         scope.Release();

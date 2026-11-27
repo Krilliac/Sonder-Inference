@@ -556,12 +556,20 @@ TEST_CASE("NAT-12: AuxGateConfig validation and execution domain isolation") {
     CHECK(ValidateAuxGateConfig(bad).code == ErrorCode::kInvalidArgument);
 
     bad = cfg;
+    bad.max_starvation_wait_ms = 0u;
+    CHECK(ValidateAuxGateConfig(bad).code == ErrorCode::kInvalidArgument);
     bad.max_starvation_wait_ms = kMaxAuxGateTimeoutMs + 1u;
     CHECK(ValidateAuxGateConfig(bad).code == ErrorCode::kInvalidArgument);
 
     bad = cfg;
     bad.cancel_poll_interval_ms = 0;
     CHECK(ValidateAuxGateConfig(bad).code == ErrorCode::kInvalidArgument);
+
+    // EffectiveMainStreamPriority honors configured aux_stream_priority for auxiliary models.
+    CHECK(EffectiveMainStreamPriority(WorkloadRole::kAuxiliary, StreamPriority::kHigh, StreamPriority::kDefault) ==
+          StreamPriority::kDefault);
+    CHECK(EffectiveMainStreamPriority(WorkloadRole::kAuxiliary, StreamPriority::kHigh, StreamPriority::kLow) ==
+          StreamPriority::kLow);
 
     // Core LlamaCppBackendOptions validation maps and rejects hostile NAT-12 knobs.
     sonder::inference::LlamaCppBackendOptions bo;
@@ -580,16 +588,22 @@ TEST_CASE("NAT-12: AuxGateConfig validation and execution domain isolation") {
     bo.max_aux_duty_cycle = 0.99;
     CHECK(sonder::inference::validate_llamacpp_options(bo).code() == sonder::inference::ErrorCode::invalid_argument);
 
-    // Execution domain resolution isolates CPU offload and multi-GPU targets.
+    // Execution domain resolution canonicalizes vendor ordinals ("CUDA0", "Vulkan0" -> "gpu:0")
+    // so backends configured via main_gpu or explicit devices coordinate on the same GPU.
     CHECK(ResolveAuxExecutionDomain(0, 0, {"CUDA0"}) == "cpu");
     CHECK(ResolveAuxExecutionDomain(-1, 0, {}) == "gpu:0");
     CHECK(ResolveAuxExecutionDomain(32, 1, {}) == "gpu:1");
-    CHECK(ResolveAuxExecutionDomain(-1, 0, {"CUDA0"}) == "cuda0");
-    CHECK(ResolveAuxExecutionDomain(-1, 0, {"Vulkan1"}) == "vulkan1");
-    CHECK(ResolveAuxExecutionDomain(-1, 0, {"CUDA0", "CUDA1"}) == "gpu:cuda0+cuda1");
+    CHECK(ResolveAuxExecutionDomain(-1, 0, {"CUDA0"}) == "gpu:0");
+    CHECK(ResolveAuxExecutionDomain(-1, 0, {"Vulkan0"}) == "gpu:0");
+    CHECK(ResolveAuxExecutionDomain(-1, 0, {"Vulkan1"}) == "gpu:1");
+    CHECK(ResolveAuxExecutionDomain(-1, 0, {"CUDA0", "CUDA1"}) == "gpu:0+1");
 
-    // Active decode on gpu:0 never stalls CPU-offloaded auxiliary slices.
+    // Active decode on gpu:0 never stalls CPU-offloaded auxiliary slices, and CPU-only
+    // sessions bypass gating by default unless gate_cpu_domain is explicitly enabled.
     DecodeAwareAuxGate gate;
+    auto cpu_default_sess = gate.EnterDecodeSession("cpu");
+    CHECK_FALSE(cpu_default_sess.active());
+    CHECK_FALSE(gate.IsDecodeActive("cpu"));
     auto gpu_sess = gate.EnterDecodeSession("gpu:0");
     auto gpu_step = gate.EnterDecodeStep("gpu:0");
     CHECK(gate.IsDecodeActive("gpu:0"));
@@ -602,20 +616,23 @@ TEST_CASE("NAT-12: AuxGateConfig validation and execution domain isolation") {
     CHECK(gate.GetStats("cpu").aux_slices_idle_fastpath == 1u);
 }
 
-TEST_CASE("NAT-12: DecodeAwareAuxGate slices between decode steps with zero overlap and >=95 percent decode duty") {
+TEST_CASE("NAT-12: DecodeAwareAuxGate DRR accounting enforces zero overlap and configured 5 percent duty cap") {
     MockCudaState mock;
     g_mock_cuda = &mock;
     const CudaDriverApi api = MakeMockCudaApi();
     CudaPriorityStream aux_stream;
     REQUIRE(CudaPriorityStream::Create(0, StreamPriority::kLow, aux_stream, &api).ok());
 
+    // Deterministic atomic clock eliminates OS sleep-granularity flakiness on DRR duty accounting,
+    // while real threads still contend concurrently to verify strict mutual exclusion.
+    std::atomic<std::int64_t> fake_clock_ns{1'000'000'000LL};
     AuxGateConfig cfg;
     cfg.enabled = true;
-    cfg.max_aux_duty_cycle = 0.05;  // <= 5% aux budget => >= 95% decode duty
-    cfg.max_decode_hold_ms = 50;
-    cfg.handoff_pickup_timeout_ms = 10;
-    cfg.max_starvation_wait_ms = 2000;
-    DecodeAwareAuxGate gate(cfg);
+    cfg.max_aux_duty_cycle = 0.05;  // Configured 5% DRR duty target
+    cfg.max_decode_hold_ms = 200;
+    cfg.handoff_pickup_timeout_ms = 25;
+    cfg.max_starvation_wait_ms = 5000;
+    DecodeAwareAuxGate gate(cfg, [&] { return fake_clock_ns.load(std::memory_order_relaxed); });
 
     std::atomic<bool> in_decode_step{false};
     std::atomic<bool> in_aux_slice{false};
@@ -623,8 +640,6 @@ TEST_CASE("NAT-12: DecodeAwareAuxGate slices between decode steps with zero over
     std::atomic<bool> decode_started{false};
     std::atomic<bool> stop_aux{false};
 
-    // Auxiliary worker floods continuous 2 ms slices (with primary-context CUDA stream sync)
-    // throughout the entire 35-step foreground decode run.
     std::size_t total_aux_slices_while_decoding = 0;
     std::thread aux_thread([&] {
         while (!decode_started.load(std::memory_order_acquire)) {
@@ -639,7 +654,8 @@ TEST_CASE("NAT-12: DecodeAwareAuxGate slices between decode steps with zero over
                     if (in_decode_step.load(std::memory_order_seq_cst)) {
                         observed_overlaps.fetch_add(1, std::memory_order_relaxed);
                     }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    fake_clock_ns.fetch_add(2'000'000LL, std::memory_order_relaxed);  // 2.0 ms slice
+                    std::this_thread::yield();
                     if (in_decode_step.load(std::memory_order_seq_cst)) {
                         observed_overlaps.fetch_add(1, std::memory_order_relaxed);
                     }
@@ -655,10 +671,9 @@ TEST_CASE("NAT-12: DecodeAwareAuxGate slices between decode steps with zero over
         }
     });
 
-    const auto decode_wall_begin = std::chrono::steady_clock::now();
     {
         auto session = gate.EnterDecodeSession("gpu:0");
-        for (int step = 0; step < 35; ++step) {
+        for (int step = 0; step < 40; ++step) {
             {
                 auto step_scope = gate.EnterDecodeStep("gpu:0");
                 in_decode_step.store(true, std::memory_order_seq_cst);
@@ -666,38 +681,36 @@ TEST_CASE("NAT-12: DecodeAwareAuxGate slices between decode steps with zero over
                     observed_overlaps.fetch_add(1, std::memory_order_relaxed);
                 }
                 decode_started.store(true, std::memory_order_release);
-                // Simulate a 4 ms bandwidth-bound main LLM decode pass on high-priority stream.
-                std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                fake_clock_ns.fetch_add(4'000'000LL, std::memory_order_relaxed);  // 4.0 ms step
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 if (in_aux_slice.load(std::memory_order_seq_cst)) {
                     observed_overlaps.fetch_add(1, std::memory_order_relaxed);
                 }
                 in_decode_step.store(false, std::memory_order_seq_cst);
+                step_scope.MarkSynchronized();
             }
         }
         stop_aux.store(true, std::memory_order_release);
     }
-    const auto decode_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - decode_wall_begin)
-                                    .count();
     aux_thread.join();
 
     const AuxGateStats stats = gate.GetStats("gpu:0");
     CHECK(observed_overlaps.load() == 0u);
     CHECK(stats.aux_slices_overlapped_decode == 0u);
-    CHECK(stats.decode_steps_total == 35u);
+    CHECK(stats.decode_steps_total == 40u);
+    CHECK(stats.decode_steps_synced_before_release == 40u);
     CHECK(stats.aux_slices_gated_between_steps >= 2u);
+    CHECK(stats.aux_slices_synced_before_release == stats.aux_slices_total);
     CHECK(mock.sync_calls >= static_cast<int>(stats.aux_slices_total));
 
-    // Verify DRR keeps main decode >= 95% of GPU busy time (allowing small Windows sleep jitter: >= 93.5%).
     const double total_gpu_busy_ns =
         static_cast<double>(stats.decode_busy_ns) + static_cast<double>(stats.aux_busy_ns);
     REQUIRE(total_gpu_busy_ns > 0.0);
     const double decode_share = static_cast<double>(stats.decode_busy_ns) / total_gpu_busy_ns;
     CAPTURE(stats.decode_busy_ns);
     CAPTURE(stats.aux_busy_ns);
-    CAPTURE(decode_wall_ns);
     CAPTURE(decode_share);
-    CHECK(decode_share >= 0.935);
+    CHECK(decode_share >= 0.945);
 
     // Verify prompt cooperative cancellation while blocked on an active decode step.
     {
@@ -818,6 +831,7 @@ TEST_CASE("NAT-12: end-to-end synthetic GGUF co-resident main decode plus gated 
     auto shared_gate = std::make_shared<DecodeAwareAuxGate>();
     AuxGateConfig gate_cfg;
     gate_cfg.enabled = true;
+    gate_cfg.gate_cpu_domain = true;          // Explicitly enable gating on CPU domain for synthetic fixture
     gate_cfg.max_aux_duty_cycle = 0.05;
     gate_cfg.active_slice_max_tokens = 64u;   // Cap active slices to <= 64 tokens for small 512-ctx fixture
     gate_cfg.active_slice_max_sequences = 2u; // <= 2 sequences per slice during decode
@@ -880,25 +894,29 @@ TEST_CASE("NAT-12: end-to-end synthetic GGUF co-resident main decode plus gated 
     CHECK(idle_scores.batches_executed == 1u);
     CHECK(idle_scores.gated_slices == 0u);
 
-    // Now hold an active decode session on the shared gate while running Embed, ScorePairs,
-    // and auxiliary-role Generate (simulating in-process STT encoder-decoder) concurrently
-    // with real multi-slot main_be.Generate()!
+    // Run continuous multi-slot main_be.Generate() until all auxiliary workloads complete
+    // so gated slice assertions never depend on fixed wall-clock sleep durations.
     std::atomic<bool> main_running{false};
     std::atomic<bool> aux_done{false};
-    GenerateResult main_gen_res;
+    std::int64_t main_generated_total = 0;
+    Status main_last_status = Status::Ok();
 
     std::thread main_thread([&] {
+        auto keep_session_open = shared_gate->EnterDecodeSession("cpu");
         GenerateRequest greq;
         greq.prompt = {1, 2, 3, 4};
-        greq.max_new_tokens = 128;
+        greq.max_new_tokens = 32;
         greq.sampling.temperature = 0.0f;
-        main_gen_res = main_be.Generate(greq, [&](const TokenEvent&) {
-            main_running.store(true, std::memory_order_release);
-            if (!aux_done.load(std::memory_order_acquire)) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(3));
-            }
-            return true;
-        });
+        do {
+            const GenerateResult r = main_be.Generate(greq, [&](const TokenEvent&) {
+                main_running.store(true, std::memory_order_release);
+                std::this_thread::yield();
+                return true;
+            });
+            main_last_status = r.status;
+            main_generated_total += r.generated_tokens;
+            if (!r.status.ok()) break;
+        } while (!aux_done.load(std::memory_order_acquire) || main_generated_total < 24);
     });
 
     while (!main_running.load(std::memory_order_acquire)) {
@@ -930,8 +948,8 @@ TEST_CASE("NAT-12: end-to-end synthetic GGUF co-resident main decode plus gated 
         CHECK(std::fabs(gated_scores.scores[i] - idle_scores.scores[i]) < 1e-5);
     }
 
-    // Auxiliary-role Generate (in-process STT / aux seq2seq) runs on low-priority streams
-    // and slices prefill + decode through AuxSliceScope without registering as main decode.
+    // Auxiliary-role Generate runs on low-priority streams and slices prefill + decode
+    // through AuxSliceScope without registering as main decode.
     GenerateRequest stt_req;
     stt_req.prompt = std::vector<Token>(100, 1);  // 100 tokens > 64 active_slice_max_tokens => 2 prefill slices!
     stt_req.max_new_tokens = 3;
@@ -943,8 +961,8 @@ TEST_CASE("NAT-12: end-to-end synthetic GGUF co-resident main decode plus gated 
     aux_done.store(true, std::memory_order_release);
     main_thread.join();
 
-    REQUIRE(main_gen_res.status.ok());
-    CHECK(main_gen_res.generated_tokens == 128);
+    REQUIRE(main_last_status.ok());
+    CHECK(main_generated_total >= 24);
 
     const AuxGateStats gstats = shared_gate->GetStats("cpu");
     CHECK(gstats.aux_slices_overlapped_decode == 0u);
@@ -974,4 +992,113 @@ TEST_CASE("NAT-12: end-to-end synthetic GGUF co-resident main decode plus gated 
     auto er = m2.value()->embed(core_ereq, cancel);
     REQUIRE(er.ok());
     CHECK(er.value().embeddings.size() == 3u);
+}
+
+TEST_CASE("NAT-12: llama_synchronize executes inside DecodeStepScope and AuxSliceScope before gate release") {
+    TempGgufDir dir;
+    const std::string main_gguf = WriteTinyLlamaGguf(dir, "sync-main.gguf", /*n_ctx=*/512u);
+    const std::string rerank_gguf = WriteTinyQwen3RerankerGguf(dir, "sync-rerank.gguf", /*n_ctx=*/512u);
+
+    auto shared_gate = std::make_shared<DecodeAwareAuxGate>();
+    AuxGateConfig gate_cfg;
+    gate_cfg.enabled = true;
+    gate_cfg.gate_cpu_domain = true;
+    gate_cfg.max_aux_duty_cycle = 0.20;
+    gate_cfg.active_slice_max_tokens = 64u;
+    gate_cfg.active_slice_max_sequences = 2u;
+    REQUIRE(shared_gate->Reconfigure(gate_cfg).ok());
+
+    struct SyncRecorder {
+        std::mutex mu;
+        std::size_t decode_syncs = 0;
+        std::size_t decode_syncs_while_in_flight = 0;
+        std::size_t aux_syncs = 0;
+        std::size_t aux_syncs_while_in_flight = 0;
+    } rec;
+
+    struct ClearObserverGuard {
+        ~ClearObserverGuard() { SetAuxContextSyncObserverForTest({}); }
+    } clear_obs;
+
+    SetAuxContextSyncObserverForTest([&](const AuxContextSyncObservation& obs) {
+        if (obs.domain != "cpu") return;
+        std::lock_guard<std::mutex> lock(rec.mu);
+        if (obs.is_aux_slice) {
+            ++rec.aux_syncs;
+            if (obs.aux_slice_in_flight_at_sync) {
+                ++rec.aux_syncs_while_in_flight;
+            }
+        } else {
+            ++rec.decode_syncs;
+            if (obs.decode_step_in_flight_at_sync) {
+                ++rec.decode_syncs_while_in_flight;
+            }
+        }
+    });
+
+    // 1. Single-slot (n_slots=1 -> GenerateSingleLocked) AND multi-slot (n_slots=2 -> BatchWorkerLoop)
+    //    must synchronize `ctx` BEFORE releasing DecodeStepScope.
+    for (const std::uint32_t slots : {1u, 2u}) {
+        LlamaCppBackend main_be;
+        LoadOptions lo;
+        lo.model_path = main_gguf;
+        lo.n_ctx = 512u;
+        lo.n_batch = 64u;
+        lo.n_slots = slots;
+        lo.workload_role = WorkloadRole::kMainDecode;
+        lo.aux_gate = gate_cfg;
+        lo.shared_aux_gate = shared_gate;
+        REQUIRE(main_be.Load(lo).ok());
+
+        GenerateRequest req;
+        req.prompt = {1, 2, 3, 4, 5};
+        req.max_new_tokens = 4;
+        req.sampling.temperature = 0.0f;
+        const GenerateResult res = main_be.Generate(req, {});
+        REQUIRE(res.status.ok());
+        CHECK(res.generated_tokens == 4);
+    }
+
+    // 2. Embed, ScorePairs, and auxiliary-role Generate must synchronize `ectx`/`rctx`/`ctx`
+    //    BEFORE releasing AuxSliceScope.
+    LlamaCppBackend aux_embed_be;
+    LoadOptions lo_aux;
+    lo_aux.model_path = main_gguf;
+    lo_aux.n_ctx = 512u;
+    lo_aux.n_batch = 64u;
+    lo_aux.workload_role = WorkloadRole::kAuxiliary;
+    lo_aux.aux_gate = gate_cfg;
+    lo_aux.shared_aux_gate = shared_gate;
+    REQUIRE(aux_embed_be.Load(lo_aux).ok());
+
+    EmbedOutput emb_out;
+    REQUIRE(aux_embed_be.Embed({{1, 2, 3}, {4, 5, 6}}, /*normalize=*/true, emb_out).ok());
+
+    GenerateRequest aux_gen_req;
+    aux_gen_req.prompt = {1, 2, 3, 4};
+    aux_gen_req.max_new_tokens = 2;
+    aux_gen_req.sampling.temperature = 0.0f;
+    const GenerateResult aux_gen_res = aux_embed_be.Generate(aux_gen_req, {});
+    REQUIRE(aux_gen_res.status.ok());
+
+    LlamaCppBackend aux_rerank_be;
+    LoadOptions lo_rr = lo_aux;
+    lo_rr.model_path = rerank_gguf;
+    REQUIRE(aux_rerank_be.Load(lo_rr).ok());
+    ScoreOutput score_out;
+    REQUIRE(aux_rerank_be.ScorePairs({{1, 2, 3}, {2, 3, 4}}, score_out).ok());
+
+    const AuxGateStats st = shared_gate->GetStats("cpu");
+    REQUIRE(st.decode_steps_total >= 8u);
+    CHECK(st.decode_steps_synced_before_release == st.decode_steps_total);
+    REQUIRE(st.aux_slices_total >= 4u);
+    CHECK(st.aux_slices_synced_before_release == st.aux_slices_total);
+
+    {
+        std::lock_guard<std::mutex> lock(rec.mu);
+        CHECK(rec.decode_syncs == st.decode_steps_total);
+        CHECK(rec.decode_syncs_while_in_flight == rec.decode_syncs);
+        CHECK(rec.aux_syncs == st.aux_slices_total);
+        CHECK(rec.aux_syncs_while_in_flight == rec.aux_syncs);
+    }
 }

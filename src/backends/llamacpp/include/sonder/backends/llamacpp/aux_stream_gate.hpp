@@ -1,6 +1,7 @@
 // In-process CUDA stream priorities, primary-context external EP stream helper
-// (TensorRT-RTX `user_compute_stream`), and decode-aware auxiliary execution gate
-// for slicing embeddings, reranking, and STT workloads between main LLM decode steps.
+// (ONNX Runtime `NvTensorRTRTXExecutionProvider` `user_compute_stream` scaffolding),
+// and decode-aware auxiliary execution gate for slicing embeddings, reranking, and
+// auxiliary workloads between main LLM decode steps.
 //
 // Zero llama.cpp or CUDA SDK headers are included here so callers and unit tests
 // build cleanly across CPU-only, Vulkan, ROCm, and CUDA presets.
@@ -11,7 +12,6 @@
 #include <functional>
 #include <memory>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -38,7 +38,7 @@ enum class StreamPriority : std::uint8_t {
 // Execution role of a loaded model inside Sonder Inference.
 //   kMainDecode: foreground generative LLM; owns high-priority decode streams and
 //                registers active decode sessions/steps on DecodeAwareAuxGate.
-//   kAuxiliary:  co-resident auxiliary model (embeddings, reranker, STT, encoder);
+//   kAuxiliary:  co-resident auxiliary model (embeddings, reranker, encoder/seq2seq);
 //                runs on low-priority streams and slices work between decode steps.
 enum class WorkloadRole : std::uint8_t {
     kMainDecode = 0,
@@ -55,10 +55,11 @@ enum class WorkloadRole : std::uint8_t {
                                                    StreamPriority requested) noexcept;
 
 // Effective primary context stream priority for a model's main `llama_context`:
-// auxiliary-role models always resolve to `kLow` unless `configured` is explicitly `kLow`;
-// main-decode models use `configured` (`kHigh` by default).
-[[nodiscard]] StreamPriority EffectiveMainStreamPriority(WorkloadRole role,
-                                                         StreamPriority configured) noexcept;
+// auxiliary-role models use `aux_configured` (`kLow` by default); main-decode
+// models use `main_configured` (`kHigh` by default).
+[[nodiscard]] StreamPriority EffectiveMainStreamPriority(
+    WorkloadRole role, StreamPriority main_configured,
+    StreamPriority aux_configured = StreamPriority::kLow) noexcept;
 
 struct GgmlCudaStreamPriorityStats {
     std::uint64_t high_priority_scopes = 0;
@@ -121,7 +122,8 @@ struct CudaDriverApi {
 [[nodiscard]] const CudaDriverApi* GetSystemCudaDriverApi() noexcept;
 
 // Key-value provider options formatted for ONNX Runtime TensorRT-RTX Execution Provider
-// (`NvTensorRtRtx` / `TensorRTRTXExecutionProvider`) sharing the process primary CUDA context.
+// (`NvTensorRTRTXExecutionProvider` / `NvTensorRtRtx`) sharing the process primary CUDA
+// context. API scaffolding: Sonder Inference has no in-tree ONNX Runtime consumer yet.
 struct TrtRtxProviderOptions {
     std::vector<std::pair<std::string, std::string>> entries;
 
@@ -129,8 +131,8 @@ struct TrtRtxProviderOptions {
 };
 
 // Move-only RAII non-blocking CUDA stream bound to the device's primary CUDA context
-// (the same context `cudart` and `ggml-cuda` use in-process). Exposes `user_compute_stream()`
-// for TensorRT-RTX EP or custom auxiliary kernels.
+// (the same context `cudart` and `ggml-cuda` use in-process). Scaffolding helper exposing
+// `user_compute_stream()` for future external EP / custom auxiliary kernel integrations.
 class CudaPriorityStream {
 public:
     CudaPriorityStream() = default;
@@ -156,16 +158,16 @@ public:
     [[nodiscard]] int greatest_priority() const noexcept { return greatest_priority_; }
     [[nodiscard]] bool priority_range_supported() const noexcept { return least_priority_ != greatest_priority_; }
 
-    // Opaque `cudaStream_t` / `CUstream` handle for ORT TensorRT-RTX EP `user_compute_stream`.
+    // Opaque `cudaStream_t` / `CUstream` handle for ORT `NvTensorRTRTXExecutionProvider` `user_compute_stream`.
     [[nodiscard]] void* user_compute_stream() const noexcept { return stream_; }
 
     // Formats `user_compute_stream` as decimal uintptr string expected by ORT C API provider maps.
     [[nodiscard]] std::string FormatUserComputeStreamOption() const;
 
-    // Builds TensorRT-RTX EP options (`device_id`, `user_compute_stream`, `enable_cuda_graph`,
-    // and optional `nv_runtime_cache_path`). Defaults `enable_cuda_graph` to false on auxiliary
-    // streams because TRT-RTX enables CUDA graphs by default and graph capture/replay can
-    // interact with stream priority unless explicitly validated.
+    // Builds `NvTensorRTRTXExecutionProvider` options (`device_id`, `user_compute_stream`,
+    // `enable_cuda_graph`, and optional `nv_runtime_cache_path`). Defaults `enable_cuda_graph`
+    // to false on auxiliary streams because TRT-RTX enables CUDA graphs by default and graph
+    // capture/replay can interact with stream priority unless explicitly validated.
     [[nodiscard]] TrtRtxProviderOptions BuildTrtRtxProviderOptions(
         bool enable_cuda_graph = false, std::string_view runtime_cache_path = {}) const;
 
@@ -200,18 +202,24 @@ inline constexpr std::uint32_t kMaxAuxGateTimeoutMs = 60000;
 
 struct AuxGateConfig {
     bool enabled = true;
-    // Maximum fraction of active-decode wall clock granted to auxiliary slices.
-    // Default 0.05 (5%) keeps main LLM decode >= 95% of baseline under continuous aux load.
+    // When false (default), CPU-only execution (`domain == "cpu"`, `n_gpu_layers == 0`)
+    // bypasses decode-aware slicing and throttling so CPU deployments keep existing
+    // behavior unless explicitly opted in (e.g. deterministic CPU tests).
+    bool gate_cpu_domain = false;
+    // Configured DRR upper bound on the fraction of active-decode GPU busy time granted
+    // to auxiliary slices (default 0.05 targets >= 95% main decode retention; end-to-end
+    // throughput impact on full-scale models remains a target to measure on hardware).
     double max_aux_duty_cycle = kDefaultMaxAuxDutyCycle;
     // Maximum tokens packed per auxiliary slice while foreground decode is active (<= 512 default).
     std::uint32_t active_slice_max_tokens = kDefaultAuxActiveSliceTokens;
     // Maximum sequences packed per auxiliary slice while foreground decode is active.
     std::uint32_t active_slice_max_sequences = kDefaultAuxActiveMaxSequences;
-    // Upper bound on how long BeginDecodeStep() holds for one in-flight aux slice (ms).
+    // Upper bound on how long EnterDecodeStep() holds for one in-flight aux slice (ms).
     std::uint32_t max_decode_hold_ms = kDefaultMaxDecodeHoldMs;
     // Upper bound for a woken aux thread to claim an inter-step handoff ticket (ms).
     std::uint32_t handoff_pickup_timeout_ms = kDefaultHandoffPickupTimeoutMs;
-    // Emergency anti-starvation ceiling (ms; 0 disables starvation bypass).
+    // Anti-starvation ceiling in [1, kMaxAuxGateTimeoutMs] ms (must be >= 1 to prevent
+    // infinite wait if an aux request is issued while a decode session is paused).
     std::uint32_t max_starvation_wait_ms = kDefaultMaxStarvationWaitMs;
     // Cancellation polling period while an aux caller waits at the gate (ms).
     std::uint32_t cancel_poll_interval_ms = kDefaultCancelPollIntervalMs;
@@ -220,8 +228,9 @@ struct AuxGateConfig {
 [[nodiscard]] Status ValidateAuxGateConfig(const AuxGateConfig& config);
 
 // Maps placement settings onto a canonical device execution domain ("cpu", "gpu:0",
-// "cuda0", "vulkan1", ...) so models sharing one GPU coordinate through the gate
-// while models offloaded to CPU or a separate GPU run independently.
+// "gpu:1", "gpu:0+1", ...) canonicalizing vendor ordinal names such as "CUDA0" or
+// "Vulkan0" onto "gpu:0" so co-resident models on the same GPU coordinate even when
+// one uses `main_gpu` and another specifies an explicit `devices` allowlist.
 [[nodiscard]] std::string ResolveAuxExecutionDomain(std::int32_t n_gpu_layers, std::int32_t main_gpu,
                                                     const std::vector<std::string>& devices);
 
@@ -236,10 +245,12 @@ enum class AuxAcquireStatus : std::uint8_t {
 struct AuxGateStats {
     std::uint64_t decode_sessions_total = 0;
     std::uint64_t decode_steps_total = 0;
+    std::uint64_t decode_steps_synced_before_release = 0;
     std::uint64_t decode_busy_ns = 0;
     std::uint64_t decode_hold_wait_ns = 0;
     std::uint64_t decode_hold_timeouts = 0;
     std::uint64_t aux_slices_total = 0;
+    std::uint64_t aux_slices_synced_before_release = 0;
     std::uint64_t aux_slices_idle_fastpath = 0;
     std::uint64_t aux_slices_gated_between_steps = 0;
     std::uint64_t aux_slices_starvation_admitted = 0;
@@ -254,7 +265,10 @@ struct AuxGateStats {
 };
 
 // Thread-safe Deficit Round Robin (DRR) inter-step gate coordinating foreground
-// decode steps and auxiliary slices per execution domain.
+// decode steps and auxiliary slices per execution domain. Callers must synchronize
+// device work (`llama_synchronize` or `CudaPriorityStream::Synchronize`) and call
+// `MarkSynchronized()` before releasing `DecodeStepScope` / `AuxSliceScope` so the
+// gate orders actual GPU execution rather than asynchronous host submission.
 class DecodeAwareAuxGate {
 public:
     using ClockFn = std::function<std::int64_t()>;
@@ -268,8 +282,8 @@ public:
     Status Reconfigure(const AuxGateConfig& config);
     [[nodiscard]] AuxGateConfig config() const;
 
-    [[nodiscard]] bool IsDecodeActive(std::string_view domain = "default") const noexcept;
-    [[nodiscard]] bool IsDecodeStepInFlight(std::string_view domain = "default") const noexcept;
+    [[nodiscard]] bool IsDecodeActive(std::string_view domain = "default") const;
+    [[nodiscard]] bool IsDecodeStepInFlight(std::string_view domain = "default") const;
 
     class DecodeSessionScope {
     public:
@@ -300,8 +314,10 @@ public:
         DecodeStepScope& operator=(const DecodeStepScope&) = delete;
         ~DecodeStepScope() noexcept;
 
+        void MarkSynchronized() noexcept;
         void Release() noexcept;
         [[nodiscard]] bool active() const noexcept { return gate_ != nullptr; }
+        [[nodiscard]] bool synchronized() const noexcept { return synced_; }
 
     private:
         friend class DecodeAwareAuxGate;
@@ -310,6 +326,7 @@ public:
         DecodeAwareAuxGate* gate_ = nullptr;
         std::size_t domain_idx_ = 0;
         std::int64_t start_ns_ = 0;
+        bool synced_ = false;
     };
 
     class AuxSliceScope {
@@ -321,9 +338,11 @@ public:
         AuxSliceScope& operator=(const AuxSliceScope&) = delete;
         ~AuxSliceScope() noexcept;
 
+        void MarkSynchronized() noexcept;
         void Release() noexcept;
         [[nodiscard]] AuxAcquireStatus status() const noexcept { return status_; }
         [[nodiscard]] bool acquired() const noexcept { return status_ != AuxAcquireStatus::kCancelled; }
+        [[nodiscard]] bool synchronized() const noexcept { return synced_; }
         [[nodiscard]] bool gated() const noexcept {
             return status_ == AuxAcquireStatus::kAcquiredBetweenSteps ||
                    status_ == AuxAcquireStatus::kAcquiredStarvation;
@@ -340,6 +359,7 @@ public:
         AuxAcquireStatus status_ = AuxAcquireStatus::kCancelled;
         std::int64_t start_ns_ = 0;
         std::int64_t wait_ns_ = 0;
+        bool synced_ = false;
     };
 
     [[nodiscard]] DecodeSessionScope EnterDecodeSession(std::string_view domain = "default");
@@ -360,6 +380,21 @@ private:
 // do not supply an explicit isolated gate.
 [[nodiscard]] std::shared_ptr<DecodeAwareAuxGate> DefaultProcessAuxGate();
 
+// Test inspection hook invoked immediately after `llama_synchronize` inside a gated
+// decode step or auxiliary slice so unit tests can assert GPU synchronization runs
+// while the gate scope is still held (before `Release()`).
+struct AuxContextSyncObservation {
+    std::string domain;
+    bool is_aux_slice = false;
+    bool decode_step_in_flight_at_sync = false;
+    bool aux_slice_in_flight_at_sync = false;
+};
+
+using AuxContextSyncObserver = std::function<void(const AuxContextSyncObservation&)>;
+void SetAuxContextSyncObserverForTest(AuxContextSyncObserver observer);
+void NotifyAuxContextSynchronized(const DecodeAwareAuxGate* gate, std::string_view domain,
+                                  bool is_aux_slice);
+
 // Splits a `PlannedEmbedBatch` into bounded sub-batches of at most `max_slice_tokens`
 // and `max_slice_sequences` (used dynamically when foreground decode starts mid-request).
 // Single oversized items (`token_count > max_slice_tokens`) remain isolated 1-item slices.
@@ -367,7 +402,10 @@ private:
                                                                   std::size_t max_slice_tokens,
                                                                   std::size_t max_slice_sequences);
 
-// ---- STT / Streaming Audio Encoder Slice Planner & Runner ----
+// ---- STT / Streaming Audio Encoder Slice Planner & Runner (API Scaffolding) ----
+// Sonder Inference has no in-tree STT or ONNX Runtime consumer yet; these helpers
+// provide tested slice-planning and stream-synchronized gate execution primitives
+// for future in-process audio/encoder integrations.
 
 struct SttSlicePlanConfig {
     std::uint32_t sample_rate_hz = 16000;
@@ -404,11 +442,11 @@ struct AuxSliceRunSummary {
     double gate_wait_ms = 0.0;
 };
 
-// Executes `slice_count` auxiliary work slices (e.g., STT encoder chunks or ONNX
-// TensorRT-RTX encoder slices) through `gate` on `domain` under `stream_priority`.
-// When `cuda_stream` is non-null and valid, `cuda_stream->Synchronize()` runs inside
-// each `AuxSliceScope` before releasing the gate so async GPU kernels complete
-// within the measured slice budget and never bleed into the next decode step.
+// Executes `slice_count` auxiliary work slices through `gate` on `domain` under
+// `stream_priority`. When `cuda_stream` is non-null and valid, `cuda_stream->Synchronize()`
+// runs inside each `AuxSliceScope` before releasing the gate so async GPU kernels complete
+// within the measured slice budget. Cancellation returns `ErrorCode::kDecodeFailed`
+// (matching `LlamaCppBackend::Embed` / `ScorePairs`).
 [[nodiscard]] Status RunGatedAuxSlices(
     DecodeAwareAuxGate& gate, std::string_view domain, std::size_t slice_count,
     const std::function<Status(std::size_t slice_index, bool decode_active)>& run_slice,

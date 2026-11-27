@@ -1820,6 +1820,31 @@ struct LlamaCppBackend::Impl {
         return true;
     }
 
+    void SyncContextForAuxGate(llama_context* primary_ctx,
+                               DecodeAwareAuxGate::DecodeStepScope* step_scope,
+                               DecodeAwareAuxGate::AuxSliceScope* slice_scope,
+                               llama_context* secondary_ctx = nullptr) {
+        const bool step_active = (step_scope != nullptr && step_scope->active());
+        const bool slice_active = (slice_scope != nullptr && slice_scope->acquired());
+        if (!step_active && !slice_active) {
+            return;
+        }
+        if (primary_ctx != nullptr) {
+            llama_synchronize(primary_ctx);
+        }
+        if (secondary_ctx != nullptr && secondary_ctx != primary_ctx) {
+            llama_synchronize(secondary_ctx);
+        }
+        if (step_active) {
+            step_scope->MarkSynchronized();
+            NotifyAuxContextSynchronized(aux_gate.get(), aux_domain, /*is_aux_slice=*/false);
+        }
+        if (slice_active) {
+            slice_scope->MarkSynchronized();
+            NotifyAuxContextSynchronized(aux_gate.get(), aux_domain, /*is_aux_slice=*/true);
+        }
+    }
+
 #if defined(SONDER_LLAMACPP_HAS_MTMD)
     Status EvaluateMultimodalPrompt(const GenerateRequest& request, llama_seq_id slot_id, int32_t n_batch,
                                     int64_t n_ctx, int64_t& out_cur_pos, int32_t& out_prompt_tokens) {
@@ -2019,7 +2044,7 @@ struct LlamaCppBackend::Impl {
 #endif
         try {
             const StreamPriority dft_prio =
-                EffectiveMainStreamPriority(opts.workload_role, opts.main_stream_priority);
+                EffectiveMainStreamPriority(opts.workload_role, opts.main_stream_priority, opts.aux_stream_priority);
             ScopedGgmlCudaStreamPriority cuda_prio_guard(dft_prio);
             ctx_dft = llama_init_from_model(model, cp_dft);
         } catch (...) {
@@ -2620,9 +2645,6 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
         impl_->aux_gate = options.shared_aux_gate;
     } else {
         impl_->aux_gate = DefaultProcessAuxGate();
-        if (options.workload_role == WorkloadRole::kMainDecode) {
-            (void)impl_->aux_gate->Reconfigure(options.aux_gate);
-        }
     }
 
     if (!options.vocab_only) {
@@ -2640,8 +2662,8 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
         llama_context_params cp = MakeContextParams(options, swa_qualified);
         cp.abort_callback = &Impl::AbortCallback;
         cp.abort_callback_data = impl_.get();
-        const StreamPriority main_ctx_prio =
-            EffectiveMainStreamPriority(options.workload_role, options.main_stream_priority);
+        const StreamPriority main_ctx_prio = EffectiveMainStreamPriority(
+            options.workload_role, options.main_stream_priority, options.aux_stream_priority);
         if (Status s = RunGuarded(ErrorCode::kLoadFailed, "llama_init_from_model", [&] {
                 ScopedGgmlCudaStreamPriority cuda_prio_guard(main_ctx_prio);
                 impl_->ctx = llama_init_from_model(model, cp);
@@ -3501,6 +3523,13 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
                     return false;
                 }
 
+                for (const EmbedBatchItem& item : slice.items) {
+                    if (Status s = ValidateSeqId(static_cast<int32_t>(item.seq_id), impl_->embed_seq_max); !s.ok()) {
+                        batch_error = std::move(s);
+                        return false;
+                    }
+                }
+
                 DecodeAwareAuxGate::AuxSliceScope gate_scope;
                 if (aux_gate_enabled) {
                     gate_scope = impl_->aux_gate->AcquireAuxSlice(impl_->aux_domain, cancelled);
@@ -3521,11 +3550,6 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
                     }
                     BatchClear(impl_->embed_batch);
                     for (const EmbedBatchItem& item : slice.items) {
-                        if (Status s = ValidateSeqId(static_cast<int32_t>(item.seq_id), impl_->embed_seq_max);
-                            !s.ok()) {
-                            batch_error = std::move(s);
-                            return false;
-                        }
                         const auto& seq = inputs[item.original_index];
                         const std::size_t n_tok = seq.size();
                         for (std::size_t t = 0; t < n_tok; ++t) {
@@ -3537,6 +3561,7 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
                     }
                     rc = encoder_only ? TryEncode(ectx, impl_->embed_batch, &batch_error)
                                       : TryDecode(ectx, impl_->embed_batch, &batch_error);
+                    impl_->SyncContextForAuxGate(ectx, nullptr, &gate_scope);
                 }
                 gate_scope.Release();
 
@@ -3783,6 +3808,13 @@ Status LlamaCppBackend::ScorePairs(const std::vector<std::vector<Token>>& pairs,
                     return false;
                 }
 
+                for (const EmbedBatchItem& item : slice.items) {
+                    if (Status s = ValidateSeqId(static_cast<int32_t>(item.seq_id), impl_->rank_seq_max); !s.ok()) {
+                        batch_error = std::move(s);
+                        return false;
+                    }
+                }
+
                 DecodeAwareAuxGate::AuxSliceScope gate_scope;
                 if (aux_gate_enabled) {
                     gate_scope = impl_->aux_gate->AcquireAuxSlice(impl_->aux_domain, cancelled);
@@ -3803,11 +3835,6 @@ Status LlamaCppBackend::ScorePairs(const std::vector<std::vector<Token>>& pairs,
                     }
                     BatchClear(impl_->rank_batch);
                     for (const EmbedBatchItem& item : slice.items) {
-                        if (Status s = ValidateSeqId(static_cast<int32_t>(item.seq_id), impl_->rank_seq_max);
-                            !s.ok()) {
-                            batch_error = std::move(s);
-                            return false;
-                        }
                         const auto& seq = pairs[item.original_index];
                         for (std::size_t t = 0; t < seq.size(); ++t) {
                             BatchAdd(impl_->rank_batch, seq[t], static_cast<llama_pos>(t),
@@ -3817,6 +3844,7 @@ Status LlamaCppBackend::ScorePairs(const std::vector<std::vector<Token>>& pairs,
                     }
                     rc = encoder_only ? TryEncode(rctx, impl_->rank_batch, &batch_error)
                                       : TryDecode(rctx, impl_->rank_batch, &batch_error);
+                    impl_->SyncContextForAuxGate(rctx, nullptr, &gate_scope);
                 }
                 gate_scope.Release();
 
@@ -4393,8 +4421,8 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
     // ---- Prefill ----
     const bool is_aux_workload = (options.workload_role == WorkloadRole::kAuxiliary);
     const bool gate_active = (aux_gate != nullptr && options.aux_gate.enabled);
-    const StreamPriority exec_stream_prio =
-        EffectiveMainStreamPriority(options.workload_role, options.main_stream_priority);
+    const StreamPriority exec_stream_prio = EffectiveMainStreamPriority(
+        options.workload_role, options.main_stream_priority, options.aux_stream_priority);
     DecodeAwareAuxGate::DecodeSessionScope aux_session_guard;
     if (!is_aux_workload && gate_active) {
         aux_session_guard = aux_gate->EnterDecodeSession(aux_domain);
@@ -4441,6 +4469,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
             ScopedGgmlCudaStreamPriority cuda_prio_guard(exec_stream_prio);
             mm_status = EvaluateMultimodalPrompt(request, slot_id, static_cast<int32_t>(n_batch), n_ctx, cur_pos,
                                                  mm_prompt_tokens);
+            SyncContextForAuxGate(ctx, &mm_step_guard, &mm_slice_guard);
         }
         mm_step_guard.Release();
         mm_slice_guard.Release();
@@ -4515,6 +4544,9 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                 if (rc == 0 && use_mtp && !MtpProcessPrefill(batch, slot_id)) {
                     mtp_prefill_ok = false;
                 }
+                SyncContextForAuxGate(ctx, &prefill_step_guard, &prefill_slice_guard, use_mtp ? ctx_dft : nullptr);
+#else
+                SyncContextForAuxGate(ctx, &prefill_step_guard, &prefill_slice_guard);
 #endif
             }
             prefill_step_guard.Release();
@@ -4826,7 +4858,13 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                 if (!step_used_suffix) {
                     const auto k_lim = static_cast<int32_t>(std::min<int64_t>(max_k, effective_draft_max));
                     if (!MtpDraft(slot_id, cur_tok, pos, k_lim, draft_tokens)) {
-                        if (cancelled()) return finish(StopReason::kCancelled);
+                        if (cancelled()) {
+                            SyncContextForAuxGate(ctx, &step_gpu_guard, &step_aux_guard, ctx_dft);
+                            step_prio_guard.reset();
+                            step_gpu_guard.Release();
+                            step_aux_guard.Release();
+                            return finish(StopReason::kCancelled);
+                        }
                         use_mtp = false;
                         use_hybrid_suffix = false;
                         result.spec_transitioned_during_request = true;
@@ -4928,6 +4966,11 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
             (stage_prof && !draft_tokens.empty()) ? Clock::now() : Clock::time_point{};
         Status decode_err;
         const int32_t rc = TryDecode(ctx, batch, &decode_err);
+#if defined(SONDER_LLAMACPP_HAS_MTP)
+        SyncContextForAuxGate(ctx, &step_gpu_guard, &step_aux_guard, use_mtp ? ctx_dft : nullptr);
+#else
+        SyncContextForAuxGate(ctx, &step_gpu_guard, &step_aux_guard);
+#endif
         step_prio_guard.reset();
         step_gpu_guard.Release();
         step_aux_guard.Release();
@@ -5100,7 +5143,28 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                                      static_cast<llama_pos>(pos + 1 + static_cast<int64_t>(j)), slot_id,
                                      /*logits=*/false);
                         }
-                        if (TryDecode(ctx, batch) != 0) {
+                        DecodeAwareAuxGate::DecodeStepScope rb_step_guard;
+                        DecodeAwareAuxGate::AuxSliceScope rb_slice_guard;
+                        if (gate_active) {
+                            if (is_aux_workload) {
+                                rb_slice_guard = aux_gate->AcquireAuxSlice(aux_domain, cancelled);
+                                if (!rb_slice_guard.acquired()) {
+                                    invalidate_slot();
+                                    return finish_rb(false);
+                                }
+                            } else {
+                                rb_step_guard = aux_gate->EnterDecodeStep(aux_domain);
+                            }
+                        }
+                        int32_t rb_rc = 0;
+                        {
+                            ScopedGgmlCudaStreamPriority cuda_prio_guard(exec_stream_prio);
+                            rb_rc = TryDecode(ctx, batch);
+                            SyncContextForAuxGate(ctx, &rb_step_guard, &rb_slice_guard);
+                        }
+                        rb_step_guard.Release();
+                        rb_slice_guard.Release();
+                        if (rb_rc != 0) {
                             invalidate_slot();
                             return finish_rb(false);
                         }
@@ -6112,8 +6176,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 
     const bool is_aux_workload = (options.workload_role == WorkloadRole::kAuxiliary);
     const bool gate_active = (aux_gate != nullptr && options.aux_gate.enabled);
-    const StreamPriority exec_stream_prio =
-        EffectiveMainStreamPriority(options.workload_role, options.main_stream_priority);
+    const StreamPriority exec_stream_prio = EffectiveMainStreamPriority(
+        options.workload_role, options.main_stream_priority, options.aux_stream_priority);
     DecodeAwareAuxGate::DecodeSessionScope worker_decode_session;
 
     try {
@@ -6281,6 +6345,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 auto decode_start = Clock::now();
                 Status decode_err;
                 int32_t rc = 0;
+                bool mtp_prefill_ok = true;
                 {
                     ScopedGgmlCudaStreamPriority cuda_prio_guard(exec_stream_prio);
                     rc = TryDecode(ctx, batch, &decode_err);
@@ -6289,6 +6354,15 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                         decode_start = Clock::now();
                         rc = TryDecode(ctx, batch, &decode_err);
                     }
+#if defined(SONDER_LLAMACPP_HAS_MTP)
+                    if (rc == 0 && s.mtp_enabled && !MtpProcessPrefill(batch, s.slot_id)) {
+                        mtp_prefill_ok = false;
+                    }
+                    SyncContextForAuxGate(ctx, &fast_prefill_step_guard, &fast_prefill_slice_guard,
+                                          s.mtp_enabled ? ctx_dft : nullptr);
+#else
+                    SyncContextForAuxGate(ctx, &fast_prefill_step_guard, &fast_prefill_slice_guard);
+#endif
                 }
                 fast_prefill_step_guard.Release();
                 fast_prefill_slice_guard.Release();
@@ -6318,7 +6392,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     StepCostObservation{0, n, std::max<std::int64_t>(0, s.pos), prefill_decode_ms});
                 s.last_service_time_us = NowUs();
 #if defined(SONDER_LLAMACPP_HAS_MTP)
-                if (s.mtp_enabled && !MtpProcessPrefill(batch, s.slot_id)) {
+                if (!mtp_prefill_ok) {
                     invalidate_slot(s);
                     if (s.IsCancelled()) {
                         finish_slot(s, StopReason::kCancelled);
@@ -6543,6 +6617,11 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                         if (!MtpDraft(s.slot_id, s.cur_tok, s.pos, k_lim, draft_tokens)) {
                             active_cancel = nullptr;
                             if (s.IsCancelled()) {
+                                SyncContextForAuxGate(ctx, &fast_dec_step_guard, &fast_dec_slice_guard, ctx_dft);
+                                fast_dec_prio_guard.reset();
+                                fast_dec_step_guard.Release();
+                                fast_dec_slice_guard.Release();
+                                batch_abort_fn = nullptr;
                                 finish_slot(s, StopReason::kCancelled);
                                 active.clear();
                                 continue;
@@ -6653,6 +6732,12 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 decode_start = Clock::now();
                 rc = TryDecode(ctx, batch, &decode_err);
             }
+#if defined(SONDER_LLAMACPP_HAS_MTP)
+            SyncContextForAuxGate(ctx, &fast_dec_step_guard, &fast_dec_slice_guard,
+                                  s.mtp_enabled ? ctx_dft : nullptr);
+#else
+            SyncContextForAuxGate(ctx, &fast_dec_step_guard, &fast_dec_slice_guard);
+#endif
             fast_dec_prio_guard.reset();
             fast_dec_step_guard.Release();
             fast_dec_slice_guard.Release();
@@ -6854,7 +6939,30 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                                          static_cast<llama_pos>(s.pos + 1 + static_cast<int64_t>(j)), s.slot_id,
                                          /*logits=*/false);
                             }
-                            if (TryDecode(ctx, batch) != 0) {
+                            DecodeAwareAuxGate::DecodeStepScope rb_step_guard;
+                            DecodeAwareAuxGate::AuxSliceScope rb_slice_guard;
+                            if (gate_active) {
+                                if (is_aux_workload) {
+                                    rb_slice_guard = aux_gate->AcquireAuxSlice(aux_domain, [&]() {
+                                        return worker_stop.load(std::memory_order_relaxed) || s.IsCancelled();
+                                    });
+                                    if (!rb_slice_guard.acquired()) {
+                                        invalidate_slot(s);
+                                        return finish_rb(false);
+                                    }
+                                } else {
+                                    rb_step_guard = aux_gate->EnterDecodeStep(aux_domain);
+                                }
+                            }
+                            int32_t rb_rc = 0;
+                            {
+                                ScopedGgmlCudaStreamPriority cuda_prio_guard(exec_stream_prio);
+                                rb_rc = TryDecode(ctx, batch);
+                                SyncContextForAuxGate(ctx, &rb_step_guard, &rb_slice_guard);
+                            }
+                            rb_step_guard.Release();
+                            rb_slice_guard.Release();
+                            if (rb_rc != 0) {
                                 invalidate_slot(s);
                                 return finish_rb(false);
                             }
@@ -7118,6 +7226,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                         decode_start = Clock::now();
                         rc = TryDecode(ctx, batch, &decode_err);
                     }
+                    SyncContextForAuxGate(ctx, &conc_step_guard, &conc_slice_guard);
                 }
                 conc_step_guard.Release();
                 conc_slice_guard.Release();
@@ -7660,6 +7769,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             decode_start = Clock::now();
             rc = TryDecode(ctx, batch, &decode_err);
         }
+        SyncContextForAuxGate(ctx, &batch_step_guard, &batch_slice_guard);
         batch_prio_guard.reset();
         batch_step_guard.Release();
         batch_slice_guard.Release();
