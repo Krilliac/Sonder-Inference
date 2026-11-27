@@ -296,6 +296,10 @@ struct RequestOptions {
     // When false (e.g. SSE streaming where chunks are flushed immediately),
     // Session skips retaining the full text/reasoning in GenerationResult.
     bool retain_text = true;
+    // Per-request text-capture opt-out (X-Sonder-No-Capture). Forces the
+    // telemetry text-capture policy to `off` for this request only; it can
+    // never enable capture.
+    bool no_text_capture = false;
     // Optional GBNF grammar constraining output (empty = unconstrained).
     std::string grammar;
     // Optional OpenAI response_format hint ("text", "json_object", "json_schema")

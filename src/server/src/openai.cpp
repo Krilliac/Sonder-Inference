@@ -1130,7 +1130,7 @@ std::optional<WorkloadClass> parse_workload(std::string_view name) noexcept {
 }
 
 std::variant<Correlation, ApiError> parse_correlation(const RequestHead& head) {
-    for (const auto* name : {"x-sonder-priority", "x-sonder-deadline-ms"}) {
+    for (const auto* name : {"x-sonder-priority", "x-sonder-deadline-ms", "x-sonder-no-capture"}) {
         std::size_t count = 0;
         for (const auto& field : head.headers) if (field.first == name) ++count;
         if (count > 1) return bad("invalid_correlation_header", std::string(name) + " must occur once", name);
@@ -1198,6 +1198,14 @@ std::variant<Correlation, ApiError> parse_correlation(const RequestHead& head) {
             return bad("invalid_correlation_header", "X-Sonder-Deadline-Ms must be a positive integer within 32-bit milliseconds", "X-Sonder-Deadline-Ms");
         }
         c.deadline_ms = n;
+    }
+    if (const std::string* nc = head.header("x-sonder-no-capture")) {
+        const auto parsed = parse_no_capture_header(*nc);
+        if (!parsed) {
+            return bad("invalid_correlation_header", "X-Sonder-No-Capture must be 1, true, 0 or false",
+                       "X-Sonder-No-Capture");
+        }
+        c.no_text_capture = *parsed;
     }
     return c;
 }

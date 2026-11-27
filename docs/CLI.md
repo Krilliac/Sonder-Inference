@@ -236,7 +236,8 @@ stats only with `--stats text` or `--stats json`.
 `--telemetry PATH` writes Observatory envelope `sonder.observatory.event/1`
 JSONL to PATH (`-` for stderr); `--telemetry-level off|metrics|standard|deep`
 (default `standard`); `--capture-text` includes generated text in token
-events. With `--telemetry -`, telemetry lines and status lines never
+events (`sonder-infer serve` also has `--text-capture off|on|full`,
+see [TELEMETRY.md](TELEMETRY.md#text-capture-policy)). With `--telemetry -`, telemetry lines and status lines never
 interleave mid-line (stderr is written line by line under one lock).
 
 ## Correlation and scheduling options

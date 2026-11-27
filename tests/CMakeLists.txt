@@ -8,6 +8,7 @@ sonder_add_module_tests(core
     test_model_architecture.cpp
     test_session.cpp
     test_telemetry.cpp
+    test_text_capture.cpp
     test_diag_log.cpp
     test_c_api.cpp
     test_c_api_chat.cpp

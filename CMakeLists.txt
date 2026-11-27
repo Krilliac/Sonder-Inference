@@ -49,6 +49,7 @@ add_library(sonder_inference
     src/engine/sampling_config.cpp
     src/devices/device.cpp
     src/telemetry/telemetry.cpp
+    src/telemetry/text_capture.cpp
     src/sessions/session.cpp
     src/engine/engine.cpp
     src/engine/request_runtime.cpp
