@@ -23,6 +23,7 @@ sonder_add_module_tests(core
     test_cli_repl.cpp
     test_priority_runtime.cpp
     test_device_memory.cpp
+    test_coopmat_canary.cpp
     test_http_client.cpp
     test_recurrent_checkpoints.cpp
     test_speculative_verifier.cpp
@@ -196,7 +197,7 @@ if(SONDER_BUILD_CLI)
     sonder_cli_test(unknown_command RC 2 STDERR_REGEX "unknown command 'genrate' \\(did you mean 'generate'\\?\\)"
         COMMAND ${infer} genrate)
     sonder_cli_test(help_unknown_command RC 2 STDERR_REGEX "unknown command 'nope'" COMMAND ${infer} help nope)
-    set(help_commands version devices backends models generate chat bench help)
+    set(help_commands version devices coopmat-canary backends models generate chat bench help)
     if(sonder_cli_has_server)
         list(APPEND help_commands serve)
     endif()
@@ -270,6 +271,10 @@ if(SONDER_BUILD_CLI)
     sonder_cli_test(version_json_commit RC 0 STDOUT_REGEX "\"commit\":\"(unknown|[0-9a-f]+)\""
         COMMAND ${infer} version --json)
     sonder_cli_test(devices_json RC 0 STDOUT_JSON STDOUT_REGEX "\"platform\":\"[^\"]+\",\"devices\":" COMMAND ${infer} devices --json)
+    sonder_cli_test(coopmat_canary_missing_vendor RC 2 STDERR_REGEX "--vendor-id is required"
+        COMMAND ${infer} coopmat-canary --device-id 0x7590)
+    sonder_cli_test(coopmat_canary_bad_ubatch RC 2 STDERR_REGEX "out of range"
+        COMMAND ${infer} coopmat-canary --vendor-id 0x1002 --device-id 0x7590 --ubatch 4)
     # The mock backend is always available; an absent Ollama is reported, not fatal.
     sonder_cli_test(backends_json RC 0 STDOUT_JSON
         STDOUT_REGEX "\"name\":\"mock\",\"available\":true"

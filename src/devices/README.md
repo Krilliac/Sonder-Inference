@@ -19,6 +19,17 @@ and provides pure parsers for ggml device capability lines
 (`parse_ggml_device_line()`, handling both v1.0.0/b12171+ `rebar` and older
 lines where `rebar` is absent).
 
+`coopmat_canary.cpp` implements the AMD Windows Vulkan cooperative-matrix
+child-process canary (NAT-16): before `llama_backend_init()`, eligible AMD
+Windows GPUs (both discrete e.g. RX 9060 XT and integrated UMA e.g. Radeon
+780M) are probed in an isolated `sonder-infer coopmat-canary` child process
+using dynamic `vulkan-1.dll` loading (Phase 1 `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR`
+for `llama.cpp#22750/#23508`; Phase 2 16x16x16 FP16->FP32 compute dispatch at
+`ubatch >= 64` for `llama.cpp#32447`). Verdicts are cached atomically per
+`(vendor_id, device_id, driver_build, ubatch)`; any crash, hang, or mismatch
+activates `GGML_VK_DISABLE_COOPMAT=1` automatically and surfaces an
+`amd_vk_coopmat_disabled` runtime warning.
+
 `read_host_memory()` returns a tri-state `MemoryReading` (known value, known
 zero, unknown) for total/available physical memory and available commit.
 Windows uses `GlobalMemoryStatusEx` (`ullAvailPhys`, `ullAvailPageFile`); Linux

@@ -381,6 +381,25 @@ inline const CommandSpec& worker_command() {
     return spec;
 }
 
+inline const CommandSpec& coopmat_canary_command() {
+    using namespace commands_detail;
+    static const CommandSpec spec{
+        "coopmat-canary",
+        "run isolated AMD Windows Vulkan cooperative-matrix canary probe (NAT-16)",
+        {"coopmat-canary --vendor-id ID --device-id ID [--ubatch N] [--quiet] [--json]"},
+        {{"Canary",
+          {{"vendor-id", OptionKind::value, "ID", "PCI vendor ID (decimal or 0x hex, e.g. 0x1002)"},
+           {"device-id", OptionKind::value, "ID", "PCI device ID (decimal or 0x hex, e.g. 0x7590)"},
+           {"ubatch", OptionKind::value, "N", "micro-batch rows to test, 16 to 4096 (default 64)"},
+           {"quiet", OptionKind::flag, "", "suppress human status output"}}},
+         output_json()},
+        {"Exercises VK_KHR_cooperative_matrix property enumeration and a 16x16x16 FP16->FP32\n"
+         "compute dispatch in the current process so the caller can isolate driver crashes or hangs.",
+         kExitNote},
+        {"coopmat-canary --vendor-id 0x1002 --device-id 0x7590 --ubatch 64 --json"}};
+    return spec;
+}
+
 inline const CommandSpec& help_command() {
     static const CommandSpec spec{"help",
                                   "show help for a command",
@@ -397,7 +416,7 @@ inline const std::vector<const CommandSpec*>& all_commands() {
         &generate_command(), &chat_command(),     &serve_command(),   &bench_command(),
         &models_command(),   &backends_command(), &devices_command(), &node_command(),
         &plan_command(),     &version_command(),  &tune_command(),    &weights_command(),
-        &worker_command(),   &help_command()};
+        &worker_command(),   &coopmat_canary_command(), &help_command()};
     return list;
 }
 

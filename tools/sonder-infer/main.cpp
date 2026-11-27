@@ -19,6 +19,7 @@
 #include "../../src/worker/remote_backend.hpp"
 #endif
 #include "sonder/inference.hpp"
+#include "sonder/inference/coopmat_canary.hpp"
 #include "sonder_inference.h"
 // Header-only CLI helpers (option specs, checked values, environment, chat
 // files and the chat loop); shared with the unit tests (tests/test_cli_*.cpp).
@@ -1039,6 +1040,80 @@ int cmd_serve(const std::vector<std::string>& args) {
 #endif
 }
 
+int cmd_coopmat_canary(const Args& a) {
+    auto parse_u32_id = [](std::string_view raw, std::uint32_t& out) -> bool {
+        if (raw.empty()) return false;
+        int base = 10;
+        std::string_view digits = raw;
+        if (raw.size() > 2 && raw[0] == '0' && (raw[1] == 'x' || raw[1] == 'X')) {
+            base = 16;
+            digits = raw.substr(2);
+        }
+        if (digits.empty()) return false;
+        std::uint64_t val = 0;
+        for (const char c : digits) {
+            unsigned d = 0;
+            if (c >= '0' && c <= '9') {
+                d = static_cast<unsigned>(c - '0');
+            } else if (base == 16 && c >= 'a' && c <= 'f') {
+                d = static_cast<unsigned>(10 + (c - 'a'));
+            } else if (base == 16 && c >= 'A' && c <= 'F') {
+                d = static_cast<unsigned>(10 + (c - 'A'));
+            } else {
+                return false;
+            }
+            val = val * static_cast<std::uint64_t>(base) + d;
+            if (val > 0xFFFFFFFFull) return false;
+        }
+        out = static_cast<std::uint32_t>(val);
+        return true;
+    };
+
+    const auto vendor_raw = a.get("vendor-id");
+    const auto device_raw = a.get("device-id");
+    if (!vendor_raw || vendor_raw->empty()) {
+        return usage_error("coopmat-canary", "--vendor-id is required");
+    }
+    if (!device_raw || device_raw->empty()) {
+        return usage_error("coopmat-canary", "--device-id is required");
+    }
+    std::uint32_t vendor_id = 0;
+    std::uint32_t device_id = 0;
+    if (!parse_u32_id(*vendor_raw, vendor_id) || vendor_id == 0u) {
+        return usage_error("coopmat-canary", "invalid value '" + *vendor_raw + "' for --vendor-id");
+    }
+    if (!parse_u32_id(*device_raw, device_id) || device_id == 0u) {
+        return usage_error("coopmat-canary", "invalid value '" + *device_raw + "' for --device-id");
+    }
+
+    std::uint32_t ubatch = 64u;
+    if (const auto ub_raw = a.get("ubatch")) {
+        std::uint32_t parsed_ub = 0;
+        if (!parse_u32_id(*ub_raw, parsed_ub) || parsed_ub < 16u || parsed_ub > 4096u) {
+            return usage_error("coopmat-canary", "value '" + *ub_raw + "' for --ubatch is out of range (16 to 4096)");
+        }
+        ubatch = parsed_ub;
+    }
+
+    const auto result = si::run_vulkan_coopmat_canary_in_process(vendor_id, device_id, ubatch);
+    if (a.has("json")) {
+        const si::json::Object doc{{"vendor_id", vendor_id},
+                                   {"device_id", device_id},
+                                   {"ubatch_tested", result.ubatch_tested},
+                                   {"ok", result.ok},
+                                   {"coopmat_supported", result.coopmat_supported},
+                                   {"shapes_found", result.shapes_found},
+                                   {"reason", result.reason}};
+        std::cout << si::json::Value(doc).dump() << "\n";
+    } else if (!a.has("quiet")) {
+        std::cout << "coopmat-canary ok=" << (result.ok ? "true" : "false")
+                  << " coopmat_supported=" << (result.coopmat_supported ? "true" : "false")
+                  << " shapes=" << result.shapes_found << " ubatch=" << result.ubatch_tested
+                  << " reason=\"" << result.reason << "\"\n";
+    }
+    return result.ok ? cli::kExitOk : cli::kExitFailure;
+}
+
 int cmd_help(const std::vector<std::string>& args) {
     if (args.empty()) {
         std::cout << cli::overview();
@@ -1131,6 +1206,7 @@ int main(int argc, char** argv) {
 
     if (cmd == "version") return cmd_version(a);
     if (cmd == "devices") return cmd_devices(a);
+    if (cmd == "coopmat-canary") return cmd_coopmat_canary(a);
     if (cmd == "node") return cmd_node(a);
     if (cmd == "plan") return cmd_plan(a);
     if (cmd == "backends") return cmd_backends(a, env);

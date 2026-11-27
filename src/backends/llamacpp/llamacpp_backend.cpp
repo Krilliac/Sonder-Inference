@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "batch_scheduler.hpp"
+#include "sonder/inference/coopmat_canary.hpp"
 #include "grammar_retry.hpp"
 #include "embed_batch_planner.hpp"
 #include "gguf_compat.hpp"
@@ -227,6 +228,29 @@ void EnsureBackendInitialized() {
     static std::once_flag once;
     std::call_once(once, [] {
         llama_log_set(&LogCallback, nullptr);
+#if defined(_WIN32)
+        const char* skip_canary = std::getenv("SONDER_SKIP_COOPMAT_CANARY");
+        if (skip_canary == nullptr || skip_canary[0] == '\0' || skip_canary[0] == '0') {
+            const std::string helper_exe = sonder::inference::find_coopmat_canary_executable();
+            if (!helper_exe.empty()) {
+                sonder::inference::CoopmatCanaryOptions opts;
+                opts.is_windows = true;
+                opts.executable_path = helper_exe;
+                opts.apply_env_fallback = true;
+                opts.fail_closed_on_runner_error = true;
+                const auto decision =
+                    sonder::inference::evaluate_amd_coopmat_canary(sonder::inference::enumerate_gpu_devices(), opts);
+                sonder::inference::record_coopmat_canary_decision(decision);
+                if (decision.disable_coopmat &&
+                    decision.status != sonder::inference::CoopmatCanaryStatus::skipped_env_disabled) {
+                    const std::string msg =
+                        "sonder-inference: AMD Windows Vulkan coopmat canary triggered GGML_VK_DISABLE_COOPMAT=1 (" +
+                        decision.reason + ")\n";
+                    RouteLog(LogLevel::kWarn, msg.c_str());
+                }
+            }
+        }
+#endif
         llama_backend_init();
     });
 }

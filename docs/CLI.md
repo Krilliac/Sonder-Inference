@@ -22,6 +22,7 @@ The HTTP server started by `sonder-infer serve` has its own reference:
 | `models` | List the models a backend can serve; `models import-ollama [DIR]` lists what an existing Ollama models directory would serve through the native engine (read-only, in place; see [model store](integration/model-store.md)). |
 | `backends` | Probe the backends compiled into this build. |
 | `devices` | List host devices (CPU, memory and GPU inventory). |
+| `coopmat-canary` | Run the isolated AMD Windows Vulkan cooperative-matrix canary probe (`--vendor-id`, `--device-id`, `--ubatch`, `--json`). |
 | `node` | Print unified local hardware, GPU, backend and capability snapshot (`sonder.inference.node/1`). |
 | `plan` | Plan hardware placement and validated launch profile(s) for one or more GGUF models (repeatable `--model` for co-residency planning; header-only, no weights loaded). |
 | `version` | Print version, commit, C ABI and HTTP API versions. |

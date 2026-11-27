@@ -32,6 +32,7 @@
 #include "common/diag_log.hpp"
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include "sonder/inference/backends/llamacpp.hpp"
+#include "sonder/inference/coopmat_canary.hpp"
 #include "sonder/inference/json.hpp"
 #include "llamacpp_internal.hpp"
 #include "request_guards.hpp"
@@ -734,6 +735,37 @@ struct RuntimeState {
                     " above a " + FormatMiBText(status.gpu_memory.shared_baseline_bytes) +
                     " baseline): VRAM overflowed into system RAM; lower context_length or KV cache precision",
                 std::move(details), 1});
+        }
+        if (const auto canary = last_coopmat_canary_decision();
+            canary.has_value() && canary->disable_coopmat &&
+            canary->status != CoopmatCanaryStatus::skipped_env_disabled) {
+            std::vector<std::pair<std::string, std::string>> details{
+                {"status", to_string(canary->status)},
+                {"env_applied", canary->env_applied ? "true" : "false"},
+                {"reason", canary->reason}};
+            std::string driver_summary;
+            for (const auto& rec : canary->records) {
+                if (!rec.disable_coopmat) continue;
+                if (!rec.gpu_id.empty()) details.emplace_back("gpu_id", rec.gpu_id);
+                if (!rec.gpu_name.empty()) details.emplace_back("gpu_name", rec.gpu_name);
+                if (!rec.key.driver_build.empty()) {
+                    details.emplace_back("driver_build", rec.key.driver_build);
+                    driver_summary = rec.key.driver_build;
+                }
+                details.emplace_back("ubatch", std::to_string(rec.key.ubatch));
+                details.emplace_back("from_cache", rec.from_cache ? "true" : "false");
+                if (rec.exit_code != 0u) {
+                    details.emplace_back("exit_code", std::to_string(rec.exit_code));
+                }
+                break;
+            }
+            std::string msg = "AMD Windows Vulkan cooperative-matrix canary failed";
+            if (!driver_summary.empty()) {
+                msg += " on driver " + driver_summary;
+            }
+            msg += "; activated GGML_VK_DISABLE_COOPMAT=1 fallback (" + canary->reason + ")";
+            status.warnings.push_back(BackendWarning{
+                "amd_vk_coopmat_disabled", "warning", "coopmat_canary", std::move(msg), std::move(details), 1});
         }
         status.capability_statuses = BuildCapabilityStatusesLocked();
         status.effective_execution = BuildEffectiveExecutionLocked();

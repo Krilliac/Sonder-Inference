@@ -15,6 +15,7 @@
 #include "common/diag_log.hpp"
 #include "llamacpp_internal.hpp"
 #include "sonder/inference/backends/llamacpp.hpp"
+#include "sonder/inference/coopmat_canary.hpp"
 #include "sonder/inference/engine.hpp"
 #include "sonder/inference/json.hpp"
 
@@ -970,5 +971,90 @@ TEST_CASE("llamacpp adapter: 5-state capability_statuses and runtime_status effe
         CHECK(rt->effective_execution->configured_spec_method == "auto");
         CHECK(rt->effective_execution->effective_spec_method.empty());  // unknown until model loads
         CHECK(rt->effective_execution->speculation_observed_active == CapabilityState::unknown);
+    }
+}
+
+TEST_CASE("NAT-16: llamacpp runtime_status surfaces amd_vk_coopmat_disabled warning when fallback triggers") {
+    struct Guard {
+        ~Guard() { clear_coopmat_canary_decision(); }
+    } cleanup;
+
+    auto find_warning = [](const BackendRuntimeStatus& rt, std::string_view code) -> const BackendWarning* {
+        for (const auto& w : rt.warnings) {
+            if (w.code == code) return &w;
+        }
+        return nullptr;
+    };
+
+    clear_coopmat_canary_decision();
+    auto be = make_llamacpp_backend();
+    {
+        const auto rt = be->runtime_status();
+        REQUIRE(rt.has_value());
+        CHECK(find_warning(*rt, "amd_vk_coopmat_disabled") == nullptr);
+    }
+
+    // Passing canary emits no fallback warning.
+    CoopmatCanaryDecision passed;
+    passed.status = CoopmatCanaryStatus::passed;
+    passed.disable_coopmat = false;
+    passed.reason = "all eligible AMD GPUs passed";
+    record_coopmat_canary_decision(passed);
+    {
+        const auto rt = be->runtime_status();
+        REQUIRE(rt.has_value());
+        CHECK(find_warning(*rt, "amd_vk_coopmat_disabled") == nullptr);
+    }
+
+    // Operator-set GGML_VK_DISABLE_COOPMAT emits no failure fallback warning.
+    CoopmatCanaryDecision skipped;
+    skipped.status = CoopmatCanaryStatus::skipped_env_disabled;
+    skipped.disable_coopmat = true;
+    skipped.reason = "GGML_VK_DISABLE_COOPMAT already set";
+    record_coopmat_canary_decision(skipped);
+    {
+        const auto rt = be->runtime_status();
+        REQUIRE(rt.has_value());
+        CHECK(find_warning(*rt, "amd_vk_coopmat_disabled") == nullptr);
+    }
+
+    // Failed AMD Windows canary surfaces amd_vk_coopmat_disabled warning with structured details.
+    CoopmatCanaryRecord rec;
+    rec.key.vendor_id = 0x1002u;
+    rec.key.device_id = 0x7590u;
+    rec.key.driver_build = "26.11.2 (32.0.21045.29003)";
+    rec.key.ubatch = 64u;
+    rec.gpu_id = "gpu:0";
+    rec.gpu_name = "AMD Radeon RX 9060 XT";
+    rec.status = CoopmatCanaryStatus::failed;
+    rec.disable_coopmat = true;
+    rec.from_cache = false;
+    rec.exit_code = 0xC0000005u;
+    rec.reason = "canary child crashed with exit_code=0xc0000005";
+
+    CoopmatCanaryDecision failed;
+    failed.status = CoopmatCanaryStatus::failed;
+    failed.disable_coopmat = true;
+    failed.env_applied = true;
+    failed.reason = rec.reason;
+    failed.records.push_back(rec);
+    record_coopmat_canary_decision(failed);
+    {
+        const auto rt = be->runtime_status();
+        REQUIRE(rt.has_value());
+        const auto* warn = find_warning(*rt, "amd_vk_coopmat_disabled");
+        REQUIRE(warn != nullptr);
+        CHECK(warn->severity == "warning");
+        CHECK(warn->source == "coopmat_canary");
+        CHECK(warn->message.find("GGML_VK_DISABLE_COOPMAT=1") != std::string::npos);
+        CHECK(warn->message.find("26.11.2") != std::string::npos);
+        bool has_driver = false;
+        bool has_ubatch = false;
+        for (const auto& kv : warn->details) {
+            if (kv.first == "driver_build" && kv.second == "26.11.2 (32.0.21045.29003)") has_driver = true;
+            if (kv.first == "ubatch" && kv.second == "64") has_ubatch = true;
+        }
+        CHECK(has_driver);
+        CHECK(has_ubatch);
     }
 }
