@@ -34,6 +34,7 @@
 #include "embed_batch_planner.hpp"
 #include "embeddings.hpp"
 #include "gguf_compat.hpp"
+#include "kv_policy.hpp"
 #include "kv_telemetry.hpp"
 #include "llguidance_sampler.hpp"
 #include "lora_registry.hpp"
@@ -186,37 +187,27 @@ DeviceKind MapDeviceKind(enum ggml_backend_dev_type type) {
     }
 }
 
-ggml_type ToGgmlType(KvCacheType type) {
-    switch (type) {
-        case KvCacheType::kF16: return GGML_TYPE_F16;
-        case KvCacheType::kF32: return GGML_TYPE_F32;
-        case KvCacheType::kBF16: return GGML_TYPE_BF16;
-        case KvCacheType::kQ8_0: return GGML_TYPE_Q8_0;
-        case KvCacheType::kQ5_1: return GGML_TYPE_Q5_1;
-        case KvCacheType::kQ5_0: return GGML_TYPE_Q5_0;
-        case KvCacheType::kQ4_1: return GGML_TYPE_Q4_1;
-        case KvCacheType::kQ4_0: return GGML_TYPE_Q4_0;
-        case KvCacheType::kIQ4_NL: return GGML_TYPE_IQ4_NL;
-        case KvCacheType::kF8_E4M3:
-#if defined(SONDER_LLAMACPP_HAS_GGML_F8_E4M3)
-            return GGML_TYPE_F8_E4M3;
-#else
-            return GGML_TYPE_F16;  // unreachable after ValidateContextOptions
-#endif
-        case KvCacheType::kQ2_0:
-#if defined(SONDER_LLAMACPP_HAS_GGML_Q2_0)
-            return GGML_TYPE_Q2_0;
-#else
-            return GGML_TYPE_F16;  // unreachable after ValidateContextOptions
-#endif
-        case KvCacheType::kPQ2_0:
-#if defined(SONDER_LLAMACPP_HAS_GGML_PQ2_0)
-            return GGML_TYPE_PQ2_0;
-#else
-            return GGML_TYPE_F16;  // unreachable after ValidateContextOptions
-#endif
+Status ResolveGgmlKvType(KvCacheType type, ggml_type& out) {
+    int raw = -1;
+    if (Status s = KvCacheTypeToGgmlType(type, raw); !s.ok()) {
+        return s;
     }
-    return GGML_TYPE_F16;  // unreachable after ValidateContextOptions
+    out = static_cast<ggml_type>(raw);
+    return Status::Ok();
+}
+
+ggml_type ToGgmlTypeChecked(KvCacheType type) {
+    ggml_type out = GGML_TYPE_COUNT;
+    if (!ResolveGgmlKvType(type, out).ok()) {
+        return GGML_TYPE_COUNT;
+    }
+    return out;
+}
+
+std::string SafeGgmlTypeName(ggml_type t) {
+    if (t < 0 || t >= GGML_TYPE_COUNT) return "unknown";
+    const char* name = ggml_type_name(t);
+    return name != nullptr ? std::string(name) : std::string("unknown");
 }
 
 llama_flash_attn_type ToLlamaFlashAttn(FlashAttention mode) {
@@ -348,8 +339,8 @@ llama_context_params MakeContextParams(const LoadOptions& options, bool swa_comp
             }
         }
     }
-    cp.type_k = ToGgmlType(options.type_k);
-    cp.type_v = ToGgmlType(options.type_v);
+    cp.type_k = ToGgmlTypeChecked(options.type_k);
+    cp.type_v = ToGgmlTypeChecked(options.type_v);
     cp.flash_attn_type = ToLlamaFlashAttn(options.flash_attn);
     cp.offload_kqv = true;
     cp.no_perf = true;
@@ -442,8 +433,8 @@ ContextParamsSummary Summarize(const llama_context_params& cp) {
     s.n_batch = cp.n_batch;
     s.n_ubatch = cp.n_ubatch;
     s.n_seq_max = cp.n_seq_max;
-    s.type_k = ggml_type_name(cp.type_k);
-    s.type_v = ggml_type_name(cp.type_v);
+    s.type_k = SafeGgmlTypeName(cp.type_k);
+    s.type_v = SafeGgmlTypeName(cp.type_v);
     s.flash_attn = llama_flash_attn_type_name(cp.flash_attn_type);
     s.offload_kqv = cp.offload_kqv;
     s.no_perf = cp.no_perf;
@@ -3134,6 +3125,12 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
     if (Status s = ValidateContextOptions(options); !s.ok()) {
         return s;
     }
+    if (!options.vocab_only) {
+        ggml_type checked_k = GGML_TYPE_COUNT;
+        ggml_type checked_v = GGML_TYPE_COUNT;
+        if (Status s = ResolveGgmlKvType(options.type_k, checked_k); !s.ok()) return s;
+        if (Status s = ResolveGgmlKvType(options.type_v, checked_v); !s.ok()) return s;
+    }
     if (!effective_options.tensor_split.empty() && effective_options.tensor_split.size() > llama_max_devices()) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "tensor_split exceeds llama_max_devices (" + std::to_string(llama_max_devices()) + ")");
@@ -4095,8 +4092,8 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
         cp_emb.n_seq_max = want_seqs;
         cp_emb.embeddings = true;
         cp_emb.pooling_type = requested_pooling;
-        cp_emb.type_k = ToGgmlType(impl_->options.type_k);
-        cp_emb.type_v = ToGgmlType(impl_->options.type_v);
+        if (Status s = ResolveGgmlKvType(impl_->options.type_k, cp_emb.type_k); !s.ok()) return s;
+        if (Status s = ResolveGgmlKvType(impl_->options.type_v, cp_emb.type_v); !s.ok()) return s;
         cp_emb.flash_attn_type = ToLlamaFlashAttn(impl_->options.flash_attn);
         cp_emb.offload_kqv = true;
         cp_emb.no_perf = true;
@@ -4333,8 +4330,8 @@ Status LlamaCppBackend::ScorePairs(const std::vector<std::vector<Token>>& pairs,
         cp_rank.n_seq_max = want_seqs;
         cp_rank.embeddings = true;
         cp_rank.pooling_type = LLAMA_POOLING_TYPE_RANK;
-        cp_rank.type_k = ToGgmlType(impl_->options.type_k);
-        cp_rank.type_v = ToGgmlType(impl_->options.type_v);
+        if (Status s = ResolveGgmlKvType(impl_->options.type_k, cp_rank.type_k); !s.ok()) return s;
+        if (Status s = ResolveGgmlKvType(impl_->options.type_v, cp_rank.type_v); !s.ok()) return s;
         cp_rank.flash_attn_type = ToLlamaFlashAttn(impl_->options.flash_attn);
         cp_rank.offload_kqv = true;
         cp_rank.no_perf = true;

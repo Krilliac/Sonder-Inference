@@ -8,6 +8,7 @@
 
 sonder_add_module_tests(llamacpp
     test_gguf_compat.cpp
+    test_kv_policy.cpp
     test_llamacpp_util.cpp
     test_llamacpp_nomodel.cpp
     test_llamacpp_adapter.cpp

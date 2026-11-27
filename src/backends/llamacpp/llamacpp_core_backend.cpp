@@ -37,6 +37,7 @@
 #include "sonder/inference/backends/llamacpp.hpp"
 #include "sonder/inference/json.hpp"
 #include "json_schema_normalize.hpp"
+#include "kv_policy.hpp"
 #include "llguidance_sampler.hpp"
 #include "llamacpp_internal.hpp"
 #include "lora_registry.hpp"
@@ -866,19 +867,15 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
         return Status(ErrorCode::invalid_argument,
                       "unknown split mode '" + o.split_mode + "' (expected none, layer or row)");
     }
-    if (!lc::ParseKvCacheType(o.kv_cache_type_k, lo.type_k)) {
-        return Status(ErrorCode::invalid_argument,
-                      "unknown K cache type '" + o.kv_cache_type_k +
-                          "' (expected f16, f32, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl, f8_e4m3, q2_0 or pq2_0)");
-    }
-    if (!lc::ParseKvCacheType(o.kv_cache_type_v, lo.type_v)) {
-        return Status(ErrorCode::invalid_argument,
-                      "unknown V cache type '" + o.kv_cache_type_v +
-                          "' (expected f16, f32, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl, f8_e4m3, q2_0 or pq2_0)");
-    }
     if (!lc::ParseFlashAttention(o.flash_attention, lo.flash_attn)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown flash attention mode '" + o.flash_attention + "' (expected auto, on or off)");
+    }
+    if (Status kv_st = lc::ValidateKvPolicyOptions(
+            o.kv_cache_type_k, o.kv_cache_type_v, o.kv_k_q4_allowed,
+            lc::InferConfiguredKvDeviceKind(o.gpu_layers, o.devices), lo.type_k, lo.type_v, lo.flash_attn);
+        !kv_st.ok()) {
+        return kv_st;
     }
     if (lc::Status s = lc::ValidatePlacementOptions(lo); !s.ok()) {
         return ToStatus(s);
@@ -1788,6 +1785,11 @@ public:
             if (Status dh = health->CheckDevicesStatus(active_gpu_devices); !dh.ok()) {
                 return dh;
             }
+        }
+        if (Status s = lc::CheckKvPolicyAtLoad(lo, options_.kv_cache_type_k, options_.kv_cache_type_v,
+                                               options_.kv_k_q4_allowed, enumerated_devices, path);
+            !s.ok()) {
+            return s;
         }
 
         lc::LlamaCppBackend runtime;

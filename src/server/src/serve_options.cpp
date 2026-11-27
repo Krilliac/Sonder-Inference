@@ -84,10 +84,14 @@ Backend:
   --batch-size N          llama.cpp: max prompt tokens per decode call (default 512)
   --ubatch-size N         llama.cpp: physical micro-batch, <= --batch-size
                           (default: llama.cpp's 512, capped at --batch-size)
-  --cache-type-k T        llama.cpp: K cache type f16 (default), f32, bf16, q8_0,
-                          q5_1, q5_0, q4_1, q4_0, iq4_nl, f8_e4m3, q2_0, pq2_0/pq2_0m
-  --cache-type-v T        llama.cpp: V cache type, same values; a quantized V
-                          cache needs flash attention (on or auto)
+  --cache-type-k T        llama.cpp: K cache type auto (default: q8_0 when model
+                          head dims % 32 == 0 and flash-attn != off, else f16),
+                          f16, f32, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl,
+                          f8_e4m3, q2_0, pq2_0/pq2_0m
+  --cache-type-v T        llama.cpp: V cache type, same values and auto default;
+                          an explicit quantized V cache needs flash attention
+  --allow-q4-k-cache      llama.cpp: allow q4_0 for --cache-type-k on models with
+                          K-cache Hadamard rotation
   --flash-attn MODE       llama.cpp: auto (default), on or off
   --swa-kv-mode MODE      llama.cpp: sliding-window KV policy full (default) or
                           compact_if_qualified (guarded by min_retained_pos)
@@ -184,6 +188,7 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"moe-experts", Kind::value},            {"tensor-override", Kind::repeat},
         {"batch-size", Kind::value},             {"ubatch-size", Kind::value},
         {"cache-type-k", Kind::value},           {"cache-type-v", Kind::value},
+        {"allow-q4-k-cache", Kind::flag},
         {"flash-attn", Kind::value},             {"swa-kv-mode", Kind::value},
         {"threads", Kind::value},
         {"no-mmap", Kind::flag},                 {"no-kv-unified", Kind::flag},
@@ -605,7 +610,8 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
                                    " applies only to --backend llamacpp; for llamaserver set it in the JSON args");
             }
         }
-        for (const char* flag : {"no-mmap", "no-kv-unified", "no-prefix-cache", "startup-smoke-test"}) {
+        for (const char* flag :
+             {"no-mmap", "no-kv-unified", "no-prefix-cache", "startup-smoke-test", "allow-q4-k-cache"}) {
             if (a.flags.count(flag) != 0) {
                 return usage_error(std::string("option --") + flag +
                                    " applies only to --backend llamacpp; for llamaserver set it in the JSON args");
@@ -623,6 +629,7 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     // Values are checked by validate_options() (validate_llamacpp_options).
     if (auto v = a.get("cache-type-k")) o.backend.llamacpp_kv_cache_type_k = *v;
     if (auto v = a.get("cache-type-v")) o.backend.llamacpp_kv_cache_type_v = *v;
+    if (a.flags.count("allow-q4-k-cache") != 0) o.backend.llamacpp_kv_k_q4_allowed = true;
     if (auto v = a.get("flash-attn")) o.backend.llamacpp_flash_attention = *v;
     if (auto v = a.get("swa-kv-mode")) {
         SwaKvMode parsed_swa = SwaKvMode::Full;

@@ -66,14 +66,16 @@ from real runs.
 
 The KV cache competes with weights for VRAM, and its size grows linearly with
 context. The llama.cpp backend exposes llama.cpp's own context knobs so an
-operator can trade a little accuracy for a lot of KV memory. This is plumbing
-only: with no flags, `serve` passes exactly what it passed before (f16 K and V,
+operator can trade a little accuracy for a lot of KV memory. With no KV-type
+flags, `serve` resolves `auto` per model (`q8_0` K and V when the model's head
+dimensions are multiples of 32 and flash attention is not `off`, otherwise `f16`;
 flash attention `auto`, micro-batch = llama.cpp's 512 capped at the batch size).
 
 | `serve` flag | `LlamaCppBackendOptions` | Values | Default |
 |---|---|---|---|
-| `--cache-type-k T` | `kv_cache_type_k` | `f16`, `f32`, `bf16`, `q8_0`, `q5_1`, `q5_0`, `q4_1`, `q4_0`, `iq4_nl` | `f16` |
-| `--cache-type-v T` | `kv_cache_type_v` | same | `f16` |
+| `--cache-type-k T` | `kv_cache_type_k` | `auto`, `f16`, `f32`, `bf16`, `q8_0`, `q5_1`, `q5_0`, `q4_1`, `q4_0` (needs `--allow-q4-k-cache` + rotation), `iq4_nl`, `f8_e4m3` (CUDA-only) | `auto` (`q8_0` if head dims % 32 == 0 and `--flash-attn != off`, else `f16`) |
+| `--cache-type-v T` | `kv_cache_type_v` | `auto`, `f16`, `f32`, `bf16`, `q8_0`, `q5_1`, `q5_0`, `q4_1`, `q4_0`, `iq4_nl`, `f8_e4m3` (CUDA-only) | `auto` (`q8_0` if head dims % 32 == 0 and `--flash-attn != off`, else `f16`) |
+| `--allow-q4-k-cache` | `kv_k_q4_allowed` | opt-in flag enabling `q4_0` for K when model supports Hadamard K rotation | `false` |
 | `--flash-attn MODE` | `flash_attention` | `auto`, `on`, `off` | `auto` |
 | `--batch-size N` | `batch_size` | tokens per `llama_decode` during prefill | 512 |
 | `--ubatch-size N` | `ubatch_size` | physical micro-batch, `<= --batch-size` | llama.cpp's 512, capped at the batch size |

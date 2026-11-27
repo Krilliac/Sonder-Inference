@@ -561,6 +561,7 @@ endif()
 add_library(sonder_backend_llamacpp STATIC
     device_health.cpp
     gguf_compat.cpp
+    kv_policy.cpp
     llamacpp_backend.cpp
     llamacpp_util.cpp
     lora_registry.cpp
