@@ -863,6 +863,7 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     RequestOptions ro;
     ro.request_id = make_id("req");
     ro.parent_request_id = corr.parent_request_id;
+    ro.no_text_capture = corr.no_text_capture;
     const std::string response_id = "resp_" + *ro.request_id;
     if (!inherited_session_key.empty()) {
         ro.session_key = inherited_session_key;

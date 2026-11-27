@@ -35,6 +35,21 @@ if(NOT SONDER_WITH_LLAMA_CPP)
     return()
 endif()
 
+# The in-process backend never links llama.cpp's RPC client: a broken or
+# hostile rpc-server aborts the whole client process (GGML_ABORT in
+# ggml-rpc.cpp) and every tensor it returns would be parsed inside sonder.
+# Cross-host layer split runs only in the isolated llamaserver rpc_worker child
+# (docs/integration/rpc-worker.md). Checked before anything is fetched.
+if(GGML_RPC)
+    message(FATAL_ERROR
+        "GGML_RPC=ON is refused for the in-process llamacpp backend: the RPC client must run in an "
+        "isolated worker process. Use the llamaserver backend's rpc_worker (docs/integration/rpc-worker.md).")
+endif()
+# Pin it off in the cache as well, so a fork (FETCHCONTENT_SOURCE_DIR_LLAMACPP)
+# whose ggml declares GGML_RPC with a default of ON cannot turn it back on:
+# option() leaves an existing cache entry alone.
+set(GGML_RPC OFF CACHE BOOL "ggml: use RPC (refused for the in-process llamacpp backend)" FORCE)
+
 include(FetchContent)
 
 # --- pin resolution begin (extracted by scripts/test_llamacpp_pin.py) ---
@@ -216,6 +231,12 @@ FetchContent_Declare(llamacpp
     ${SONDER_LLAMACPP_FETCH_EXTRA}
 )
 FetchContent_MakeAvailable(llamacpp)
+# Backstop for a tree that adds the RPC backend some other way.
+if(TARGET ggml-rpc)
+    message(FATAL_ERROR
+        "the fetched llama.cpp defines the ggml-rpc target; the in-process llamacpp backend must not contain the "
+        "RPC client (docs/integration/rpc-worker.md)")
+endif()
 
 # llama.cpp itself is written against C++17. The root project sets
 # CMAKE_CXX_STANDARD 20, and under MSVC C++20 char8_t makes u8"" literals in
@@ -427,9 +448,11 @@ endif()
 # --- expected features end ---
 
 add_library(sonder_backend_llamacpp STATIC
+    gguf_compat.cpp
     llamacpp_backend.cpp
     llamacpp_util.cpp
     kv_telemetry.cpp
+    slot_store.cpp
     request_guards.cpp
 )
 add_library(sonder::backend_llamacpp ALIAS sonder_backend_llamacpp)

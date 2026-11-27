@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <string_view>
 
 #include "sonder/inference/backend.hpp"
 
@@ -49,6 +50,10 @@ struct MockBackendOptions {
     std::uint64_t tokenizer_salt = 0;
 };
 inline constexpr const char* kMockBackendName = "mock";
+// Both execution paths produce synthetic test data, including in mixed engines.
+inline bool is_mock_backend(std::string_view name) noexcept {
+    return name == kMockBackendName || name == "remote-mock";
+}
 std::shared_ptr<Backend> make_mock_backend(MockBackendOptions options = {});
 
 }  // namespace sonder::inference

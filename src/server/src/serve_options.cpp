@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <locale>
 #include <sstream>
@@ -24,7 +25,7 @@ namespace sonder::inference::server::detail {
 const char* const kServeUsage = R"(sonder-infer serve - local HTTP API and live telemetry (docs/SERVER.md)
 
 Usage:
-  sonder-infer serve --backend mock|ollama|llamacpp|llamaserver [--model ID]... [options]
+  sonder-infer serve --backend mock|remote-mock|ollama|llamacpp|llamaserver [--model ID]... [options]
 
 Server:
   --host HOST             listen address (default 127.0.0.1; non-loopback needs --token-file)
@@ -47,9 +48,10 @@ Server:
   --log-format text|json  access log and diagnostics on stderr (default text)
 
 Backend:
-  --backend NAME          mock (synthetic, tests only), ollama, llamacpp,
+  --backend NAME          mock / remote-mock (synthetic, tests only), ollama, llamacpp,
                           llamaserver (external llama-server or OpenAI upstream)
-                          (env SONDER_INFER_BACKEND)
+                          (env SONDER_INFER_BACKEND). remote-mock launches a private
+                          worker subprocess using this sonder-infer executable.
   --model ID              model to serve (repeatable; the first is the default and
                           answers to "default"; env SONDER_INFER_MODEL). The mock
                           backend serves "mock" when no model is given.
@@ -128,7 +130,13 @@ Telemetry (Observatory envelope v1; live at /v1/telemetry/sse and /v1/telemetry/
   --telemetry-level L     off|metrics|standard|deep (default standard)
   --telemetry-buffer N    retained events for resume (default 8192)
   --telemetry PATH        also write JSONL to PATH ('-' for stderr)
-  --capture-text          include generated text in token events (requires --token-file)
+  --capture-text          include generated text in token events (requires --token-file);
+                          same as --text-capture on
+  --text-capture P        telemetry text capture policy: off (default), on (generated
+                          text in token events) or full (on, plus prompt text in
+                          request.started); env SONDER_INFER_TEXT_CAPTURE; on/full
+                          require --token-file; declared in discovery as text_capture;
+                          a request opts out with the X-Sonder-No-Capture: 1 header
 
 Exit status: 0 after a clean shutdown (SIGINT/SIGTERM; a second signal exits
 at once), 1 on a runtime error (e.g. port in use), 2 on a usage error.
@@ -159,6 +167,7 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"cors-origin", Kind::repeat},           {"no-default-cors", Kind::flag},
         {"telemetry-level", Kind::value},        {"telemetry-buffer", Kind::value},
         {"telemetry", Kind::value},              {"capture-text", Kind::flag},
+        {"text-capture", Kind::value},
         {"max-connections", Kind::value},        {"max-body-bytes", Kind::value},
         {"shutdown-grace-ms", Kind::value},      {"stream-keepalive-ms", Kind::value},
         {"disable-response-store", Kind::flag},  {"response-history-ttl", Kind::value},
@@ -393,7 +402,7 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     }
     o.backend.backend = primary ? primary->backend : a.get("backend").value_or(env.backend.value_or(""));
     if (o.backend.backend.empty()) {
-        return usage_error("--backend is required (mock, ollama, llamacpp or llamaserver; or set SONDER_INFER_BACKEND)");
+        return usage_error("--backend is required (mock, remote-mock, ollama, llamacpp or llamaserver; or set SONDER_INFER_BACKEND)");
     }
     if (!active_profiles.empty()) {
         o.models.clear();
@@ -418,6 +427,15 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     if (auto v = a.get("llamaserver-executable")) o.backend.llamaserver_executable = *v;
     if (!a.all("llamaserver-arg").empty()) o.backend.llamaserver_args = a.all("llamaserver-arg");
     if (primary && primary->backend == kLaunchProfileBackendLlamaServer) {
+        // A profile's child is the one that serves its model, and in shared
+        // spawn mode several profiles share it; the RPC client never runs
+        // there (docs/integration/rpc-worker.md). Run the worker as its own
+        // serve instance without --profile.
+        if (o.backend.llamaserver_rpc_worker.enabled || !o.backend.llamaserver_rpc_worker.servers.empty()) {
+            return usage_error("launch profile '" + primary->name +
+                               "': llamaserver config 'rpc_worker' cannot be combined with --profile or "
+                               "--all-profiles; run the RPC worker as a separate `sonder-infer serve` instance");
+        }
         const auto check_profile_env = [&]() -> std::string {
             for (const auto& [env_key, env_val] : o.backend.llamaserver_environment) {
                 (void)env_val;
@@ -880,6 +898,29 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
         o.telemetry_buffer = static_cast<std::size_t>(n);
     }
     o.capture_text = a.flags.count("capture-text") != 0;
+    {
+        // Precedence: --text-capture, then SONDER_INFER_TEXT_CAPTURE, then off.
+        // A typo is an error: it must never silently enable or disable capture.
+        std::optional<std::string> raw = a.get("text-capture");
+        const char* from = "--text-capture";
+        if (!raw) {
+            if (const char* env_value = std::getenv("SONDER_INFER_TEXT_CAPTURE");
+                env_value != nullptr && *env_value != '\0') {
+                raw = std::string(env_value);
+                from = "SONDER_INFER_TEXT_CAPTURE";
+            }
+        }
+        if (raw) {
+            const auto parsed = parse_text_capture_policy(*raw);
+            if (!parsed) {
+                return usage_error(std::string(from) + " must be off, on or full");
+            }
+            o.text_capture = *parsed;
+        }
+        if (o.capture_text && a.get("text-capture") && o.text_capture == TextCapturePolicy::off) {
+            return usage_error("--capture-text conflicts with --text-capture off");
+        }
+    }
     if (auto v = a.get("max-connections")) {
         if (!parse_uint(*v, 100000, n) || n == 0) return usage_error("--max-connections must be from 1 to 100000");
         o.max_connections = static_cast<std::size_t>(n);
