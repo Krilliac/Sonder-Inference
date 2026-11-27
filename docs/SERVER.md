@@ -303,7 +303,7 @@ The preflight (`OPTIONS`) answers 204 with
 `Access-Control-Allow-Headers: Accept, Authorization, Cache-Control,
 Content-Type, Last-Event-ID, X-Sonder-Run-Id, X-Sonder-Parent-Request-Id,
 X-Sonder-Agent-Id, X-Sonder-Task-Id, X-Sonder-Workload, X-Sonder-Priority,
-X-Sonder-Deadline-Ms, X-Sonder-Reasoning-Budget`
+X-Sonder-Deadline-Ms, X-Sonder-Reasoning-Budget, X-Sonder-Local-Only`
 and `Access-Control-Max-Age: 600` (plus
 `Access-Control-Allow-Private-Network: true` when the browser asks for it).
 
@@ -921,6 +921,7 @@ Correlation request headers (all optional; values must match
 | `X-Sonder-Workload` | One of the 7 workload classes; default `interactive_user`. |
 | `X-Sonder-Priority` | Integer from -16 to 16 (existing scheduler priority and integer telemetry; admission class `interactive`), or `interactive`, `subagent`, or `background` (class selection). Header wins over body `priority`; no hint defaults to numeric `0` and class `interactive`. |
 | `X-Sonder-Deadline-Ms` | Positive integer up to `INT32_MAX`, measured from connection arrival; a queued request past it returns 504. |
+| `X-Sonder-Local-Only` | `1`/`true` or `0`/`false` (case-insensitive). When true the request must stay on this host: a remote provider (`ollama_cloud`) refuses it before any network I/O with 400 `invalid_request` ("... is local-only"). Local backends ignore it. Applies to chat, completions and responses. |
 
 The envelope `request_id` is always Inference's own id (`req-…`), also
 returned as `sonder.request_id`, in the completion id and in

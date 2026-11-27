@@ -173,12 +173,16 @@ struct Correlation {
     // Explicit numeric zero also keeps the workload's legacy scheduler rank.
     bool numeric_priority = false;
     std::optional<std::int64_t> reasoning_budget_tokens = std::nullopt;
+    // X-Sonder-Local-Only: the request must not leave this host (remote
+    // providers such as ollama_cloud refuse it).
+    bool local_only = false;
 };
 
 // X-Sonder-Run-Id, -Parent-Request-Id, -Agent-Id, -Task-Id, -Workload,
 // -Priority. X-Sonder-Priority accepts the legacy integer -16..16 (retained
 // in Correlation::priority and mapped to interactive admission) or the
-// additive class names interactive, subagent and background. Invalid values:
+// additive class names interactive, subagent and background.
+// X-Sonder-Local-Only accepts 1/true or 0/false (case-insensitive). Invalid values:
 // 400 invalid_correlation_header naming the header.
 std::variant<Correlation, ApiError> parse_correlation(const RequestHead& head);
 std::optional<WorkloadClass> parse_workload(std::string_view name) noexcept;

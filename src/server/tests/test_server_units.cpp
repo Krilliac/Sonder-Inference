@@ -311,6 +311,19 @@ TEST_CASE("openai: correlation headers") {
     const auto defaults = parse_correlation(none);
     REQUIRE(std::holds_alternative<Correlation>(defaults));
     CHECK(std::get<Correlation>(defaults).workload == WorkloadClass::interactive_user);
+    CHECK_FALSE(std::get<Correlation>(defaults).local_only);
+
+    for (const auto& [value, expected] : std::vector<std::pair<std::string, bool>>{
+             {"1", true}, {"true", true}, {"TRUE", true}, {"0", false}, {"false", false}}) {
+        RequestHead local;
+        local.headers = {{"x-sonder-local-only", value}};
+        const auto r = parse_correlation(local);
+        REQUIRE(std::holds_alternative<Correlation>(r));
+        CHECK(std::get<Correlation>(r).local_only == expected);
+    }
+    RequestHead twice;
+    twice.headers = {{"x-sonder-local-only", "1"}, {"x-sonder-local-only", "0"}};
+    CHECK(std::holds_alternative<ApiError>(parse_correlation(twice)));
 
     for (const auto& [name, value] : std::vector<std::pair<std::string, std::string>>{
              {"x-sonder-run-id", "has space"},
@@ -319,7 +332,9 @@ TEST_CASE("openai: correlation headers") {
              {"x-sonder-priority", "17"},
              {"x-sonder-priority", "backgroundx"},
              {"x-sonder-priority", "1.5"},
-             {"x-sonder-priority", ""}}) {
+             {"x-sonder-priority", ""},
+             {"x-sonder-local-only", "yes"},
+             {"x-sonder-local-only", ""}}) {
         RequestHead bad;
         bad.headers = {{name, value}};
         const auto r = parse_correlation(bad);

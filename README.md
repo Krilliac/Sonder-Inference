@@ -27,6 +27,11 @@ Version 0.1.0 (`CMakeLists.txt`). Design notes and plans are in
   - `mock`: deterministic synthetic output for tests; performs no inference.
   - `ollama`: adapter for an Ollama server over HTTP, with streaming and
     cancellation ([src/backends/ollama](src/backends/ollama/README.md)).
+  - `ollama_cloud`: Ollama's hosted cloud models straight over HTTPS
+    (`https://ollama.com`, bearer API key from an env var or token file), no
+    local daemon; opt-in per model, refuses `X-Sonder-Local-Only` requests;
+    needs a `SONDER_WITH_TLS=ON` build
+    ([docs/integration/ollama-cloud.md](docs/integration/ollama-cloud.md)).
   - `llamacpp`: direct llama.cpp/GGML backend, built only with
     `SONDER_WITH_LLAMA_CPP=ON` ([docs/integration/llamacpp.md](docs/integration/llamacpp.md)).
   - `llamaserver`: supervised external llama-server, or an existing compatible

@@ -2195,6 +2195,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     request.target_ttft_ms = request_options.target_ttft_ms;
     request.target_itl_ms = request_options.target_itl_ms;
     request.enable_stage_profiling = request_options.enable_stage_profiling;
+    request.local_only = request_options.local_only;
     request.priority_rank = static_cast<int>(options_.workload) - options_.priority;
     request.allow_preempt_spill =
         request_options.allow_preempt_spill || engine_.scheduling_options().enable_spill_preemption;
@@ -2847,6 +2848,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                 chat_request.target_ttft_ms = request_options.target_ttft_ms;
                 chat_request.target_itl_ms = request_options.target_itl_ms;
                 chat_request.enable_stage_profiling = stage_profiling;
+                chat_request.local_only = request.local_only;
                 generated = backend_model.chat(chat_request, token, on_backend_chunk);
             } else {
                 generated = backend_model.generate(request, token, on_backend_chunk);

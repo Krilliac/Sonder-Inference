@@ -378,6 +378,12 @@ IdentityResult backend_identity(const std::string& backend, const std::string& m
             "cannot be reported (API v1 returns null rather than a partial or guessed identity)";
         return out;
     }
+    if (backend == "ollama_cloud") {
+        out.reason =
+            "ollama_cloud: remote provider (Ollama Cloud); the API exposes no tokenizer or template digest, so a "
+            "complete backend identity cannot be reported";
+        return out;
+    }
     if (backend == "llamacpp") {
         if (descriptor == nullptr) {
             out.reason = "model '" + model_id +

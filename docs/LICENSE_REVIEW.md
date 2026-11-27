@@ -122,6 +122,17 @@ No license conclusions from the initial broad web sweep are considered authorita
 - security/maintenance notes: security updates come from the OS package. The Windows CI build (`tls-windows` in `.github/workflows/ci.yml`) downloads the tarball above, refuses it unless the SHA-256 matches, builds it with MSVC (`VC-WIN64A no-asm no-apps no-tests no-docs`) and caches the install under that hash; to move it, bump `OPENSSL_VERSION` and `OPENSSL_SHA256` together after checking the new release's hash and license. Certificate verification, pinning and the `insecure_skip_verify` warning are documented in `docs/integration/tls.md`
 - approved: yes, approved by Nate on 2026-09-26 (dynamic link to the system library, OFF by default; CI revisions pinned as above)
 
+### Ollama Cloud (hosted HTTPS API only)
+- repository: none used; the service at https://ollama.com
+- revision/tag: the hosted API as documented at https://docs.ollama.com/api/introduction.md (checked 2026-11-26)
+- evaluated: 2026-11-26
+- license: not applicable; no code is copied, linked or fetched. Use of the service is governed by Ollama's terms and privacy policy (https://ollama.com/privacy), which the operator accepts with their account
+- intended use: the `ollama_cloud` provider (`src/backends/ollama_cloud`) sends chat requests to Ollama's hosted models
+- linkage/process boundary: remote service over HTTPS through the existing internal HTTP client and the already-reviewed optional TLS layer (Schannel on Windows, the OpenSSL record above elsewhere). No new dependency
+- notices required: none
+- security/maintenance notes: opt-in per model; certificate verification always on; API key from an env var or token file, never logged or echoed (docs/integration/ollama-cloud.md "Secrets"). Prompts leave the machine, so `X-Sonder-Local-Only` requests are refused
+- approved: no approval needed for code (none is used); recorded because prompts now cross a network boundary when an operator opts in
+
 ### Ollama (process boundary only)
 - repository: https://github.com/ollama/ollama
 - revision/tag: whatever server the user runs locally

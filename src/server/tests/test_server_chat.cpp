@@ -4,15 +4,20 @@
 #include <doctest/doctest.h>
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 #include "server_test_support.hpp"
 #include "src/openai.hpp"
 #include "src/request_path.hpp"
+#if defined(SONDER_HAS_OLLAMA_CLOUD_BACKEND)
+#include "sonder/inference/backends/ollama_cloud.hpp"
+#endif
 
 using namespace server_test;
 namespace json = sonder::inference::json;
@@ -40,6 +45,7 @@ struct ScriptedBackend final : si::Backend {
         si::ModelDescriptor description;
         std::vector<std::pair<std::string, std::string>> chunks;
         std::atomic<bool> separate_reasoning{false};
+        std::atomic<int> local_only{-1};  // last ChatRequest::local_only seen (-1 = none yet)
         Model() {
             description.name = "scripted:test";
             description.backend = "scripted-test";
@@ -54,6 +60,7 @@ struct ScriptedBackend final : si::Backend {
         si::Result<si::GenerateStats> chat(const si::ChatRequest& request, const si::CancellationToken&,
                                           const si::TokenCallback& callback) override {
             separate_reasoning.store(request.separate_reasoning);
+            local_only.store(request.local_only ? 1 : 0);
             std::uint64_t index = 0;
             for (const auto& [text, reasoning] : chunks) {
                 if (callback && !callback(si::TokenChunk{text, index++, reasoning})) break;
@@ -497,6 +504,70 @@ TEST_CASE("chat: a client disconnect cancels the request (request.cancelled)") {
     // The server keeps serving.
     CHECK(post(f.port, "/v1/chat/completions", chat_body(R"(,"max_tokens":2)")).status == 200);
 }
+
+TEST_CASE("chat: X-Sonder-Local-Only reaches the backend request") {
+    auto backend = std::make_shared<ScriptedBackend>();
+    backend->model->chunks = {{"ok", ""}};
+    Fixture f(scripted_options(backend));
+    Reply r = post(f.port, "/v1/chat/completions", chat_body(), {{"X-Sonder-Local-Only", "1"}});
+    REQUIRE_MESSAGE(r.status == 200, r.body);
+    CHECK(backend->model->local_only.load() == 1);
+    r = post(f.port, "/v1/chat/completions", chat_body());
+    REQUIRE_MESSAGE(r.status == 200, r.body);
+    CHECK(backend->model->local_only.load() == 0);
+    r = post(f.port, "/v1/responses", R"({"model":"default","input":"hi"})", {{"X-Sonder-Local-Only", "true"}});
+    REQUIRE_MESSAGE(r.status == 200, r.body);
+    CHECK(backend->model->local_only.load() == 1);
+    r = post(f.port, "/v1/chat/completions", chat_body(), {{"X-Sonder-Local-Only", "maybe"}});
+    CHECK(r.status == 400);
+    CHECK(r.body.find("X-Sonder-Local-Only") != std::string::npos);
+}
+
+#if defined(SONDER_HAS_OLLAMA_CLOUD_BACKEND)
+TEST_CASE("chat: ollama_cloud refuses a local-only request over HTTP without calling the cloud") {
+    // Scripted stand-in for https://ollama.com; counts chat calls.
+    struct CloudStub final : si::OllamaCloudTransport {
+        std::atomic<int> chats{0};
+        si::Status send(const si::OllamaCloudHttpRequest& request, const std::function<void(int)>& on_status,
+                        const std::function<bool(std::string_view)>& on_body,
+                        const si::CancellationToken&) override {
+            on_status(200);
+            if (request.target == "/api/tags") {
+                on_body(R"({"models":[{"name":"gpt-oss:120b"}]})");
+            } else {
+                ++chats;
+                on_body(R"({"message":{"content":"from the cloud"},"done":false})"
+                        "\n"
+                        R"({"message":{"content":""},"done":true,"done_reason":"stop"})"
+                        "\n");
+            }
+            return si::Status::success();
+        }
+    };
+    auto stub = std::make_shared<CloudStub>();
+    si::OllamaCloudOptions co;
+    co.api_key_env = "SONDER_TEST_CLOUD_KEY";
+    co.env_lookup = [](const char*) -> std::optional<std::string> { return std::string("sk-FAKE-http-test"); };
+    co.models = {"gpt-oss:120b"};
+    co.transport = stub;
+    auto backend = si::make_ollama_cloud_backend(co);
+    REQUIRE(backend.ok());
+    auto options = Fixture::defaults();
+    options.models = {"gpt-oss:120b"};
+    options.backend.backend.clear();
+    options.backend_instance = backend.value();
+    Fixture f(options);
+    const Reply refused = post(f.port, "/v1/chat/completions", chat_body(), {{"X-Sonder-Local-Only", "1"}});
+    CHECK(refused.status == 400);
+    CHECK(refused.body.find("local-only") != std::string::npos);
+    CHECK(refused.body.find("sk-FAKE") == std::string::npos);
+    CHECK(stub->chats.load() == 0);
+    const Reply ok = post(f.port, "/v1/chat/completions", chat_body());
+    REQUIRE_MESSAGE(ok.status == 200, ok.body);
+    CHECK(ok.body.find("from the cloud") != std::string::npos);
+    CHECK(stub->chats.load() == 1);
+}
+#endif
 
 TEST_CASE("chat: non-streaming message carries reasoning_content only when reasoning was produced") {
     auto backend = std::make_shared<ScriptedBackend>();

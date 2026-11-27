@@ -19,6 +19,9 @@
 #if defined(SONDER_HAS_OLLAMA_BACKEND)
 #include "sonder/inference/backends/ollama.hpp"
 #endif
+#if defined(SONDER_HAS_OLLAMA_CLOUD_BACKEND)
+#include "sonder/inference/backends/ollama_cloud.hpp"
+#endif
 #if defined(SONDER_HAS_LLAMACPP_BACKEND)
 #include "sonder/inference/backends/llamacpp.hpp"
 #endif
@@ -429,10 +432,91 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
     return {};
 }
 
+Status load_ollama_cloud_config(const std::string& path, BackendSetup& destination) {
+    BackendSetup setup = destination;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return Status(ErrorCode::not_found, "cannot read ollama_cloud config " + path);
+    std::string text(256 * 1024 + 1, '\0');
+    in.read(text.data(), static_cast<std::streamsize>(text.size()));
+    if (in.bad()) return Status(ErrorCode::io_error, "cannot read ollama_cloud config");
+    if (in.gcount() > 256 * 1024) return Status(ErrorCode::invalid_argument, "ollama_cloud config exceeds 256 KiB");
+    text.resize(static_cast<std::size_t>(in.gcount()));
+    auto parsed = json::parse(text);
+    if (!parsed.ok()) {
+        // No parser detail: it could quote file content, and a misplaced key
+        // might be in there.
+        return Status(ErrorCode::invalid_argument, "ollama_cloud config is not valid JSON");
+    }
+    if (!parsed.value().is_object()) return Status(ErrorCode::invalid_argument, "ollama_cloud config must be a JSON object");
+    const auto& object = parsed.value().as_object();
+    static constexpr std::string_view known[] = {"base_url", "api_key_env", "api_key_file", "models",
+                                                 "connect_timeout_ms", "request_timeout_ms", "idle_timeout_ms",
+                                                 "ca_bundle_path"};
+    for (const auto& member : object) {
+        if (member.first == "api_key" || member.first == "key" || member.first == "token") {
+            return Status(ErrorCode::invalid_argument,
+                          "ollama_cloud config: an inline key is not accepted; set api_key_env (a variable name) "
+                          "or api_key_file (a path)");
+        }
+        if (std::find(std::begin(known), std::end(known), member.first) == std::end(known))
+            return Status(ErrorCode::invalid_argument, "ollama_cloud config: unknown field '" +
+                                                           detail::bounded_for_message(member.first) + "'");
+    }
+    const auto string_field = [&](const char* key, std::string& out) -> Status {
+        if (const auto* v = object.find(key)) {
+            if (!v->is_string() || v->as_string().empty() || v->as_string().find('\0') != std::string::npos)
+                return Status(ErrorCode::invalid_argument,
+                              std::string("ollama_cloud config: '") + key + "' must be a non-empty string");
+            out = v->as_string();
+        }
+        return {};
+    };
+    if (auto st = string_field("base_url", setup.ollama_cloud_base_url); !st.ok()) return st;
+    if (auto st = string_field("api_key_env", setup.ollama_cloud_api_key_env); !st.ok()) return st;
+    if (auto st = string_field("api_key_file", setup.ollama_cloud_api_key_file); !st.ok()) return st;
+    if (auto st = string_field("ca_bundle_path", setup.ollama_cloud_ca_bundle_path); !st.ok()) return st;
+    if (setup.ollama_cloud_api_key_env.empty() == setup.ollama_cloud_api_key_file.empty())
+        return Status(ErrorCode::invalid_argument,
+                      "ollama_cloud config: set exactly one of api_key_env or api_key_file");
+    const auto* models = object.find("models");
+    if (models == nullptr || !models->is_array() || models->as_array().empty())
+        return Status(ErrorCode::invalid_argument,
+                      "ollama_cloud config: 'models' must be a non-empty array of cloud model names");
+    setup.ollama_cloud_models.clear();
+    for (const auto& item : models->as_array()) {
+        if (!item.is_string() || item.as_string().empty())
+            return Status(ErrorCode::invalid_argument, "ollama_cloud config: 'models' entries must be non-empty strings");
+        setup.ollama_cloud_models.push_back(item.as_string());
+    }
+    struct Bound {
+        const char* key;
+        std::uint64_t* out;
+        std::uint64_t lo;
+        std::uint64_t hi;
+    };
+    const Bound bounds[] = {{"connect_timeout_ms", &setup.ollama_cloud_connect_timeout_ms, 1, 600000},
+                            {"request_timeout_ms", &setup.ollama_cloud_request_timeout_ms, 1, 86400000},
+                            {"idle_timeout_ms", &setup.ollama_cloud_idle_timeout_ms, 0, 86400000}};
+    for (const Bound& b : bounds) {
+        if (const auto* v = object.find(b.key)) {
+            if (!v->is_integer() || v->as_int(-1) < 0 || v->as_uint() < b.lo || v->as_uint() > b.hi)
+                return Status(ErrorCode::invalid_argument,
+                              std::string("ollama_cloud config: '") + b.key + "' is out of range");
+            *b.out = v->as_uint();
+        }
+    }
+    setup.ollama_cloud_config = path;
+    destination = std::move(setup);
+    return {};
+}
+
 std::vector<std::string> available_backend_names() {
     std::vector<std::string> names{kMockBackendName};
 #if defined(SONDER_HAS_OLLAMA_BACKEND)
     names.emplace_back(kOllamaBackendName);
+#endif
+#if defined(SONDER_HAS_OLLAMA_CLOUD_BACKEND)
+    names.emplace_back(kOllamaCloudBackendName);
 #endif
 #if defined(SONDER_HAS_LLAMACPP_BACKEND)
     names.emplace_back(kLlamaCppBackendName);
@@ -462,6 +546,27 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
         return make_ollama_backend(oo);
 #else
         return Status(ErrorCode::unsupported, "this build does not include the ollama backend (src/backends/ollama)");
+#endif
+    }
+    if (setup.backend == "ollama_cloud") {
+#if defined(SONDER_HAS_OLLAMA_CLOUD_BACKEND)
+        if (setup.ollama_cloud_models.empty()) {
+            return Status(ErrorCode::invalid_argument,
+                          "the ollama_cloud backend needs a config with a non-empty 'models' list (--ollama-cloud-config)");
+        }
+        OllamaCloudOptions co;
+        if (!setup.ollama_cloud_base_url.empty()) co.base_url = setup.ollama_cloud_base_url;
+        co.api_key_env = setup.ollama_cloud_api_key_env;
+        co.api_key_file = setup.ollama_cloud_api_key_file;
+        co.models = setup.ollama_cloud_models;
+        co.connect_timeout = std::chrono::milliseconds(setup.ollama_cloud_connect_timeout_ms);
+        co.request_timeout = std::chrono::milliseconds(setup.ollama_cloud_request_timeout_ms);
+        co.idle_timeout = std::chrono::milliseconds(setup.ollama_cloud_idle_timeout_ms);
+        co.ca_bundle_path = setup.ollama_cloud_ca_bundle_path;
+        return make_ollama_cloud_backend(std::move(co));
+#else
+        return Status(ErrorCode::unsupported,
+                      "this build does not include the ollama_cloud backend (src/backends/ollama_cloud)");
 #endif
     }
     if (setup.backend == "llamacpp") {
@@ -594,7 +699,7 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
 #endif
     }
     return Status(ErrorCode::invalid_argument,
-                  "unknown backend '" + detail::bounded_for_message(setup.backend) + "' (expected mock, ollama, llamacpp or llamaserver)");
+                  "unknown backend '" + detail::bounded_for_message(setup.backend) + "' (expected mock, ollama, ollama_cloud, llamacpp or llamaserver)");
 }
 
 Status validate_backend_setup(const BackendSetup& setup) {
