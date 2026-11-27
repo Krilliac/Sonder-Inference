@@ -569,6 +569,7 @@ add_library(sonder_backend_llamacpp STATIC
     kv_telemetry.cpp
     prefix_checkpoints.cpp
     slot_store.cpp
+    spec_controller.cpp
     request_guards.cpp
 )
 add_library(sonder::backend_llamacpp ALIAS sonder_backend_llamacpp)

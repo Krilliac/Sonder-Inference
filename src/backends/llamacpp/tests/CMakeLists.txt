@@ -23,6 +23,7 @@ sonder_add_module_tests(llamacpp
     test_slot_store.cpp
     test_tool_grammar_preflight.cpp
     test_device_health.cpp
+    test_spec_controller.cpp
     test_request_guards.cpp
 )
 if(TARGET sonder_llamacpp_tests)

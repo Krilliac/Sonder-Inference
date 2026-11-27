@@ -224,6 +224,13 @@ struct LoadOptions {
     std::string spec_type = "none";
     // Max draft tokens per speculative step (0 = automatic default for spec_type).
     std::int32_t spec_draft_max = 0;
+    // Hint from SpecControllerConfig::MayUseMtp() / MaxPlannedDraft() so Load()
+    // prepares MTP weights/context and output-row capacity for per-route rules
+    // even when base spec_type is "none" or another strategy.
+    bool spec_may_use_mtp = false;
+    bool spec_may_use_p_min = false;
+    std::int32_t spec_max_route_draft = 0;
+    std::int32_t spec_mtp_route_draft = 0;
     // Verification policy for speculative decoding (TargetMatch default vs
     // opt-in StochasticRejection when a stochastic proposer supplies real q).
     SpeculativeVerificationMode spec_verification_mode = SpeculativeVerificationMode::TargetMatch;
@@ -376,6 +383,9 @@ struct ContextParamsSummary {
     bool op_offload = false;
     bool swa_full = true;
     std::uint64_t moe_cache_size = 0;
+    std::uint32_t n_rs_seq = 0;
+    std::uint32_t n_outputs_max_per_seq = 0;
+    std::uint32_t n_outputs_max = 0;
 };
 
 struct SamplingParams {
@@ -513,6 +523,15 @@ struct GenerateRequest {
     bool allow_preempt_spill = false;
     // Prior requeue count (for anti-starvation protection on physical pressure).
     std::uint32_t requeue_count = 0;
+    // Optional per-request speculative decoding overrides chosen by SpecController.
+    std::optional<SpeculativeType> spec_override = std::nullopt;
+    std::optional<std::int32_t> spec_draft_max_override = std::nullopt;
+    double spec_p_min = 0.0;
+    std::string spec_fallback_reason_override;
+    // Policy configured before controller overrides (acceptance disable, determinism, etc.),
+    // used for EffectiveExecutionReport configured_spec_method / configured_draft_limit.
+    std::string spec_configured_method;
+    std::optional<std::int32_t> spec_configured_draft_limit = std::nullopt;
 };
 
 // One event per generated token. After the last token a final event with
@@ -608,6 +627,9 @@ struct SpeculativeLoadInfo {
     bool mtp_build_supported = false;
     bool mtp_model_supported = false;
     bool l2_cache_enabled = false;
+    std::int32_t hybrid_rs_cap = 0;
+    bool can_hybrid_spec_ckpt = false;
+    std::int32_t ctx_outputs_max_per_seq = 0;
 };
 
 enum class PoolingType {
