@@ -1,4 +1,6 @@
-// Pure helper tests: no model, no llama.cpp calls.
+// Pure helper tests (no model weights); the lazy-grammar cases at the end use a vocab-only GGUF fixture.
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <string>
 #include <vector>
@@ -501,3 +503,113 @@ TEST_CASE("llamacpp wrapper: NgramModTable chains across turns, enforces n_min, 
     table.Draft(turn2_prompt, /*id_last=*/103, /*max_draft=*/12, draft);
     CHECK(draft.empty());
 }
+
+#ifdef SONDER_LLAMACPP_VOCAB_DIR
+namespace {
+
+std::size_t CountAllowed(const std::vector<std::uint8_t>& allowed) {
+    std::size_t n = 0;
+    for (const std::uint8_t a : allowed) n += a != 0 ? 1U : 0U;
+    return n;
+}
+
+SamplingParams LazyToolCallParams() {
+    SamplingParams p;
+    p.grammar = "root ::= \"<tool_call>\" [a-z]+";
+    p.grammar_lazy = true;
+    p.trigger_patterns = {"[\\s\\S]*?(<tool_call>[\\s\\S]*)"};
+    return p;
+}
+
+}  // namespace
+
+TEST_CASE("llamacpp lazy grammar: masks logits only after the trigger (vocab-only)") {
+    LlamaCppBackend be;
+    LoadOptions opts;
+    opts.model_path = std::string(SONDER_LLAMACPP_VOCAB_DIR) + "/ggml-vocab-llama-bpe.gguf";
+    opts.vocab_only = true;
+    REQUIRE(be.Load(opts).ok());
+
+    const SamplingParams lazy = LazyToolCallParams();
+    std::vector<std::uint8_t> before;
+    REQUIRE(be.ProbeGrammarMask(lazy, {}, before).ok());
+    REQUIRE_FALSE(before.empty());
+    CHECK(CountAllowed(before) == before.size());  // dormant: nothing masked
+
+    std::vector<Token> chatter;
+    REQUIRE(be.Tokenize("hello there", false, chatter).ok());
+    std::vector<std::uint8_t> still;
+    REQUIRE(be.ProbeGrammarMask(lazy, chatter, still).ok());
+    CHECK(CountAllowed(still) == still.size());  // non-trigger text leaves it dormant
+
+    std::vector<Token> trigger;
+    REQUIRE(be.Tokenize("<tool_call>", false, trigger).ok());
+    std::vector<std::uint8_t> after;
+    REQUIRE(be.ProbeGrammarMask(lazy, trigger, after).ok());
+    CHECK(CountAllowed(after) > 0);
+    CHECK(CountAllowed(after) < after.size() / 2);  // grammar now active: only [a-z]+ continuations remain
+
+    // The same grammar without laziness masks from the first token.
+    SamplingParams eager = lazy;
+    eager.grammar_lazy = false;
+    std::vector<std::uint8_t> eager_mask;
+    REQUIRE(be.ProbeGrammarMask(eager, {}, eager_mask).ok());
+    CHECK(CountAllowed(eager_mask) < eager_mask.size());
+    be.Unload();
+}
+
+TEST_CASE("llamacpp lazy grammar: invalid inputs return kInvalidArgument (vocab-only)") {
+    LlamaCppBackend be;
+    LoadOptions opts;
+    opts.model_path = std::string(SONDER_LLAMACPP_VOCAB_DIR) + "/ggml-vocab-llama-bpe.gguf";
+    opts.vocab_only = true;
+    REQUIRE(be.Load(opts).ok());
+    std::vector<std::uint8_t> mask;
+
+    SamplingParams bad_grammar = LazyToolCallParams();
+    bad_grammar.grammar = "root ::= (";
+    CHECK(be.ProbeGrammarMask(bad_grammar, {}, mask).code == ErrorCode::kInvalidArgument);
+
+    SamplingParams no_trigger = LazyToolCallParams();
+    no_trigger.trigger_patterns.clear();
+    CHECK(be.ProbeGrammarMask(no_trigger, {}, mask).code == ErrorCode::kInvalidArgument);
+
+    SamplingParams bad_regex = LazyToolCallParams();
+    bad_regex.trigger_patterns = {"([unclosed"};
+    CHECK(be.ProbeGrammarMask(bad_regex, {}, mask).code == ErrorCode::kInvalidArgument);
+
+    // "<tool_call>" is plain text in this vocab, so it tokenizes to several ids.
+    SamplingParams multi = LazyToolCallParams();
+    multi.preserved_tokens = {"<tool_call>"};
+    CHECK(be.ProbeGrammarMask(multi, {}, mask).code == ErrorCode::kInvalidArgument);
+
+    SamplingParams single = LazyToolCallParams();
+    single.preserved_tokens = {"a"};
+    CHECK(be.ProbeGrammarMask(single, {}, mask).ok());
+    be.Unload();
+}
+TEST_CASE("llamacpp lazy grammar: captured text violating the grammar returns an error, not an exception (vocab-only)") {
+    LlamaCppBackend be;
+    LoadOptions opts;
+    opts.model_path = std::string(SONDER_LLAMACPP_VOCAB_DIR) + "/ggml-vocab-llama-bpe.gguf";
+    opts.vocab_only = true;
+    REQUIRE(be.Load(opts).ok());
+
+    // The trigger fires inside this text and the captured text ("<tool_call>1...") is replayed into
+    // the grammar, which only allows [a-z]+ after the tag: llama.cpp throws std::runtime_error.
+    std::vector<Token> violating;
+    REQUIRE(be.Tokenize("<tool_call>1", false, violating).ok());
+    std::vector<std::uint8_t> mask(3, 1);
+    Status st = Status::Ok();
+    CHECK_NOTHROW(st = be.ProbeGrammarMask(LazyToolCallParams(), violating, mask));
+    CHECK(st.code == ErrorCode::kDecodeFailed);
+    CHECK(mask.empty());
+
+    // A conforming continuation still succeeds.
+    std::vector<Token> fine;
+    REQUIRE(be.Tokenize("<tool_call>abc", false, fine).ok());
+    CHECK_NOTHROW(st = be.ProbeGrammarMask(LazyToolCallParams(), fine, mask));
+    CHECK(st.ok());
+    be.Unload();
+}
+#endif
