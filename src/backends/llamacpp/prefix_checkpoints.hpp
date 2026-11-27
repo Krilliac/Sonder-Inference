@@ -107,10 +107,14 @@ struct PrefixCheckpointConfig {
 // is true when the context retains full-context SWA KV (`cp.swa_full = true`,
 // e.g. `SwaKvMode::Full`), in which case `llama_memory_seq_rm` rolls SWA back
 // directly without checkpoints (matching llama.cpp v1.0.0
-// `tools/server/server-context.cpp:1439,4425-4428`).
+// `tools/server/server-context.cpp:1439,4425-4428`). `slot_restore_allowed` is
+// false when the slot-level `RestorePartialCheckpoint` path is disabled (e.g.
+// compact SWA); when false and `SplitHostCacheBudget` allocates 0 bytes to the
+// host tier, no restore consumer exists so `kOff` is returned.
 [[nodiscard]] CheckpointMode ClassifyCheckpointMode(const sonder::inference::ModelMetadata& metadata,
                                                     bool sliding_window, std::optional<bool> runtime_stateful,
-                                                    const PrefixCheckpointConfig& cfg, bool swa_full = false);
+                                                    const PrefixCheckpointConfig& cfg, bool swa_full = false,
+                                                    bool slot_restore_allowed = true);
 
 [[nodiscard]] std::uint32_t SpacingFor(CheckpointMode mode, const PrefixCheckpointConfig& cfg) noexcept;
 

@@ -114,15 +114,24 @@ sonder::inference::ModelArchitecture DetectCheckpointArchitecture(const sonder::
 
 CheckpointMode ClassifyCheckpointMode(const sonder::inference::ModelMetadata& metadata, bool sliding_window,
                                       std::optional<bool> runtime_stateful, const PrefixCheckpointConfig& cfg,
-                                      bool swa_full) {
+                                      bool swa_full, bool slot_restore_allowed) {
     if (!cfg.enabled) return CheckpointMode::kOff;
     const bool stateful =
         runtime_stateful.has_value()
             ? *runtime_stateful
             : DetectCheckpointArchitecture(metadata) != sonder::inference::ModelArchitecture::attention_only;
-    if (stateful) return CheckpointMode::kDense;
-    if ((sliding_window && !swa_full) || cfg.force_attention_only) return CheckpointMode::kSparse;
-    return CheckpointMode::kOff;
+    CheckpointMode mode = CheckpointMode::kOff;
+    if (stateful) {
+        mode = CheckpointMode::kDense;
+    } else if ((sliding_window && !swa_full) || cfg.force_attention_only) {
+        mode = CheckpointMode::kSparse;
+    } else {
+        return CheckpointMode::kOff;
+    }
+    const bool has_host_consumer =
+        SplitHostCacheBudget(SanitizeConfig(cfg).cache_ram_mb, mode).checkpoint_bytes > 0;
+    if (!slot_restore_allowed && !has_host_consumer) return CheckpointMode::kOff;
+    return mode;
 }
 
 std::uint32_t SpacingFor(CheckpointMode mode, const PrefixCheckpointConfig& cfg) noexcept {
@@ -373,9 +382,12 @@ void CheckpointHostTier::Configure(std::size_t max_bytes, std::size_t max_entrie
     if (!enabled()) {
         entries_.clear();
         bytes_ = 0;
-        return;
+    } else {
+        while (!entries_.empty() && (bytes_ > max_bytes_ || entries_.size() > max_entries_)) EvictBack();
     }
-    while (!entries_.empty() && (bytes_ > max_bytes_ || entries_.size() > max_entries_)) EvictBack();
+    puts_ = 0;
+    evictions_ = 0;
+    rejected_ = 0;
 }
 
 void CheckpointHostTier::ConfigureMiB(std::uint32_t cache_ram_mb, std::size_t max_entries) {
@@ -389,6 +401,9 @@ void CheckpointHostTier::ConfigureMiB(std::uint32_t cache_ram_mb, std::size_t ma
 void CheckpointHostTier::Clear() noexcept {
     entries_.clear();
     bytes_ = 0;
+    puts_ = 0;
+    evictions_ = 0;
+    rejected_ = 0;
 }
 
 bool CheckpointHostTier::Put(std::span<const Token> prefix, std::vector<std::uint8_t> state,

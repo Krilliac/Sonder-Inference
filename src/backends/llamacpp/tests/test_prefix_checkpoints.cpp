@@ -215,6 +215,68 @@ TEST_CASE("prefix checkpoints: SWA model with swa_full gives kOff and keeps full
           CheckpointMode::kSparse);
 }
 
+TEST_CASE("prefix checkpoints: compact SWA without restore consumer gives kOff") {
+    const ModelMetadata gemma_swa{{"general.architecture", "gemma3"}, {"gemma3.attention.sliding_window", "1024"}};
+
+    // Compact SWA (`swa_full=false`, `slot_restore_allowed=false`) with
+    // `cache_ram_mb=0` has neither slot nor host restore consumer -> kOff and
+    // zero planned positions.
+    auto cfg_no_ram = BaseConfig();
+    cfg_no_ram.cache_ram_mb = 0;
+    const CheckpointMode off_mode = ClassifyCheckpointMode(gemma_swa, /*sliding_window=*/true, std::nullopt, cfg_no_ram,
+                                                           /*swa_full=*/false, /*slot_restore_allowed=*/false);
+    CHECK(off_mode == CheckpointMode::kOff);
+    CHECK(PlanCheckpointPositions(0, 8192, off_mode, cfg_no_ram).empty());
+
+    // With `cache_ram_mb > 0`, the host tier is active so a restore consumer
+    // exists -> stays kSparse and plans checkpoint positions.
+    auto cfg_with_ram = BaseConfig();
+    cfg_with_ram.cache_ram_mb = 256;
+    const CheckpointMode sparse_mode =
+        ClassifyCheckpointMode(gemma_swa, /*sliding_window=*/true, std::nullopt, cfg_with_ram,
+                               /*swa_full=*/false, /*slot_restore_allowed=*/false);
+    CHECK(sparse_mode == CheckpointMode::kSparse);
+    CHECK_FALSE(PlanCheckpointPositions(0, 8192, sparse_mode, cfg_with_ram).empty());
+    CHECK(SplitHostCacheBudget(cfg_with_ram.cache_ram_mb, sparse_mode).checkpoint_bytes > 0u);
+}
+
+TEST_CASE("prefix checkpoints: Clear and Configure reset host tier counters") {
+    const std::size_t one = CheckpointHostTier::EntryBytes(8, 1000, 0);
+    CheckpointHostTier tier(one * 2, 10);
+    REQUIRE(tier.Put(Seq(8, 100), Blob(1000)));
+    REQUIRE(tier.Put(Seq(8, 200), Blob(1000)));
+    REQUIRE(tier.Put(Seq(8, 300), Blob(1000)));   // triggers eviction
+    CHECK_FALSE(tier.Put(Seq(8, 400), Blob(one * 3)));  // triggers rejection
+
+    PrefixCheckpointStats before;
+    tier.FillStats(before);
+    REQUIRE(before.host_puts == 3u);
+    REQUIRE(before.host_evictions == 1u);
+    REQUIRE(before.host_rejected == 1u);
+
+    tier.Clear();
+    PrefixCheckpointStats after_clear;
+    tier.FillStats(after_clear);
+    CHECK(after_clear.host_puts == 0u);
+    CHECK(after_clear.host_evictions == 0u);
+    CHECK(after_clear.host_rejected == 0u);
+    CHECK(after_clear.host_bytes == 0u);
+    CHECK(after_clear.host_entries == 0u);
+
+    // Populate again and verify Configure() also resets counters (e.g. Unload/Load).
+    REQUIRE(tier.Put(Seq(8, 500), Blob(1000)));
+    REQUIRE(tier.Put(Seq(8, 600), Blob(1000)));
+    REQUIRE(tier.Put(Seq(8, 700), Blob(1000)));
+    CHECK_FALSE(tier.Put(Seq(8, 800), Blob(one * 3)));
+
+    tier.Configure(one * 4, 10);
+    PrefixCheckpointStats after_cfg;
+    tier.FillStats(after_cfg);
+    CHECK(after_cfg.host_puts == 0u);
+    CHECK(after_cfg.host_evictions == 0u);
+    CHECK(after_cfg.host_rejected == 0u);
+}
+
 // ---------------------------------------------------------------------------
 // Placement
 // ---------------------------------------------------------------------------

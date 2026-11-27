@@ -404,6 +404,27 @@ Per-request KV events carry the request's `request_id` in the envelope.
 | `kv.pressure` | metrics | engine-scoped, on watermark level change: `level` str (`normal` / `high` / `critical`), `occupancy` num (0..1), `utilization` num (same value), `pinned_blocks` int, `total_blocks` int |
 | `kv.freed` | metrics | `scheduler_request_id` int, `blocks` int, `reason` str (`completed`, `cancelled`, `failed`, `preempted`) |
 
+### Native prefix checkpoints (llama.cpp backend)
+
+The native `llama.cpp` wrapper exposes prefix-checkpoint activity via
+`TelemetryKind::kPrefixCheckpoint` on `LlamaCppBackend::SetTelemetrySink` (only
+formatted and emitted when a sink is installed) and as a lock-free counter
+snapshot via `LlamaCppBackend::GetPrefixCheckpointStats()` (structured
+`prefix_checkpoint.*` field names from `StatsToFields`).
+
+| Field | Value |
+| --- | --- |
+| `kind` | `TelemetryKind::kPrefixCheckpoint` |
+| `tokens` | checkpoint token position captured or restored (`0` on `miss`) |
+| `elapsed_ms` | `0.0` on `captured`; restore duration in ms on `hit_slot`, `hit_host`, `hit_host_l2`, or `miss` |
+| `detail` | `<event> slot_hits=<u64> host_hits=<u64> misses=<u64> captured=<u64> restored_tokens=<u64> host_entries=<u64> host_bytes=<u64> host_evictions=<u64>` |
+
+`<event>` is one of: `captured` (partial checkpoint saved to slot), `hit_slot`
+(restored from the slot's checkpoint list), `hit_host` (restored from the
+bounded host-RAM LRU tier during slot rollback), `hit_host_l2` (restored from
+the host-RAM tier on top of an evicted L2 radix snapshot), or `miss` (no usable
+checkpoint found or restore failed).
+
 ## Typical order for one scheduled request
 
 `request.queued` → `scheduler.enqueued` → `request.started` →
