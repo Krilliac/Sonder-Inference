@@ -72,7 +72,11 @@ def test_parent_is_request_local_across_all_methods_and_default_reuse(tmp_path, 
     assert all(('text' in event['attributes']) == capture_text for event in tokens)
     if capture_text:
         assert ''.join(event['attributes']['text'] for event in tokens) == ''.join(outputs)
-    assert [event['sequence'] for event in events] == list(range(len(events)))
+    # Each sequence stream (producer.stream: absent = main, "samples") is contiguous from 0.
+    by_stream = {}
+    for event in events:
+        by_stream.setdefault(event['producer'].get('stream'), []).append(event['sequence'])
+    assert all(sequences == list(range(len(sequences))) for sequences in by_stream.values())
     assert len({event['event_id'] for event in events}) == len(events)
     assert len({event['producer']['instance_id'] for event in events}) == 1
 
