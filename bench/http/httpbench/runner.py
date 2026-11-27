@@ -961,6 +961,10 @@ class Runner:
                      f"{agg_tps or 0:.1f} tok/s aggregate")
 
         res["clamped_output_requests"] = sum(1 for r in reqs if r.get("output_tokens_clamped"))
+        res["output_tokens_shortfall_requests"] = sum(
+            1 for r in reqs
+            if r.get("ok") and isinstance(r.get("output_tokens_delta"), int) and r["output_tokens_delta"] < 0
+        )
         res["expected_requests"] = expected
         res["_group_extra"] = extra
 
@@ -1055,6 +1059,7 @@ def _build_agentx_summary(res: dict[str, Any]) -> dict[str, Any]:
         "scaled_traces": res.get("scaled_traces") or [],
         "skipped_traces": len(res.get("skipped_traces") or []),
         "clamped_output_requests": res.get("clamped_output_requests", 0),
+        "output_tokens_shortfall_requests": res.get("output_tokens_shortfall_requests", 0),
         "levels": levels_out,
     }
 

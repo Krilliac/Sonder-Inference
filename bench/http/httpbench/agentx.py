@@ -615,6 +615,16 @@ def replay_trace_session(
         }
         row = dict(send_fn(meta, prompt))
         row.update(meta)
+        raw_actual = row.get("committed_output_tokens")
+        if raw_actual is None:
+            raw_actual = row.get("completion_tokens")
+        if isinstance(raw_actual, int) and not isinstance(raw_actual, bool):
+            actual_out: int | None = raw_actual
+        else:
+            actual_out = None
+        row["actual_output_tokens"] = actual_out
+        row["output_tokens_delta"] = (actual_out - eff_out) if actual_out is not None else None
+        row["output_tokens_ratio"] = (actual_out / float(eff_out)) if (actual_out is not None and eff_out > 0) else None
         return row
 
     results: list[dict[str, Any]] = []

@@ -389,12 +389,27 @@ Replay properties preserved:
   because SI's `/v1/chat/completions` requires `max_tokens >= 1`
   (`src/server/src/openai.cpp`), those requests send `max_tokens: 1` and record
   `target_output_tokens: 0`, `effective_output_tokens: 1`, and
-  `output_tokens_clamped: true`.
+  `output_tokens_clamped: true`. Because computing ITL and decode rate requires
+  `completion_tokens > 1` (at least two token-bearing chunks), clamped `out: 0`
+  requests emit no ITL/decode sample and are excluded from
+  `p90_interactivity_tps` and `output_tps_per_user`. Every request also records
+  `actual_output_tokens`, `output_tokens_delta` (`actual - effective`), and
+  `output_tokens_ratio` (with scenario-level `output_tokens_shortfall_requests`)
+  so early EOS stops remain visible.
 - **Subagent branches:** consecutive `type: "subagent"` blocks spawn
   concurrently as child branches (carrying `"priority": "subagent"`) and join
-  before the parent agent's next main turn.
-- **Idle gaps:** inter-turn think/idle gaps are preserved and capped at **10 s**
-  (`--idle-gap-cap 10`).
+  before the parent agent's next main turn. Compared with NVIDIA AIPerf's
+  `inferencex-agentx-mvp` replayer, note three intentional simplifications:
+  (1) consecutive subagent blocks start at their recorded relative offset
+  capped at `--idle-gap-cap` (10 s), so subagents that originally ran back to
+  back across a longer gap can overlap; (2) trailing background subagents at
+  the end of a trace are always joined before the session finishes, whereas
+  AIPerf does not wait for them; and (3) subagent blocks with no preceding
+  parent turn are replayed rather than dropped.
+- **Idle gaps:** every inter-turn think/idle gap is preserved and capped at
+  **10 s** (`--idle-gap-cap 10`). Note that this differs from AIPerf's
+  `--system-idle-gap-cap-seconds 10`, which applies only when no request is
+  active across the system (while AIPerf's per-trace idle cap is 300 s).
 - **Context cap (`--max-context-length`, default `32768`) and `--trace-fit {scale,drop}` (default `scale`):**
   the median trace request in `cc-traces-weka-062126` is ~142K tokens (most
   real traces exceed 32K after turn 1).
@@ -457,17 +472,23 @@ dependency:
      shorten outputs and skew throughput versus `submission_valid: true`
      InferenceX runs until `ignore_eos` is plumbed into `SamplingConfig` and
      the native `llamacpp` backend.
-  2. **Explicit HF `--tokenizer` required:** AIPerf needs a Hugging Face
-     tokenizer to synthesize prompts from Weka `hash_ids` blocks. Because SI
-     serves local GGUF model IDs rather than HF repo IDs, operators must pass
-     `--tokenizer <matching-hf-repo-or-local-dir>` explicitly even with
-     `--use-server-token-count`.
+  2. **Explicit HF `--tokenizer` for local aliases:** AIPerf's documentation
+     notes that non-HF model aliases *can require* passing
+     `--tokenizer <matching-hf-repo-or-local-dir>` explicitly (even with
+     `--use-server-token-count`) so AIPerf can resolve the tokenizer used to
+     synthesize prompts from Weka `hash_ids` blocks when SI serves local GGUF
+     model IDs.
   3. **Context cap override:** Pass `--max-context-length 32768` on 16 GB GPUs
      (AIPerf examples default to `128000`).
 - **Recommendation:** Use `bench/http/bench_http.py` (`agentx_trace`) as the
-  zero-dependency harness for SI A/B runs now; if external AIPerf
-  `inferencex-agentx-mvp` cross-validation is desired later, first add
-  `ignore_eos` support to `SamplingConfig`, `openai.cpp`, and `llamacpp`.
+  zero-dependency harness for SI A/B runs today, keeping in mind that
+  `bench_http.py` does **not** send `ignore_eos` either — so trace `out`
+  lengths are not enforced as a floor against early EOS stops in either harness
+  until SI adds `ignore_eos` support to `SamplingConfig`, `openai.cpp`, and
+  `llamacpp`. Every request records `actual_output_tokens`,
+  `output_tokens_delta`, and `output_tokens_ratio` (plus scenario-level
+  `output_tokens_shortfall_requests`) so any early-EOS skew between A/B arms is
+  explicit in the saved JSON.
 
 ### Live-server A/B matrix (run when inference services are up)
 
@@ -482,7 +503,7 @@ correctness line beside every speed row.
 | --- | --- | --- | --- | --- |
 | Speculative decoding (`spec_type`) | `none` | `suffix` and `ngram` (also `ngram-mod`) | `--spec-type none` vs `--spec-type suffix` / `--spec-type ngram` | P90 interactivity tok/s (`1000 / itl_ms.p90`, `c1..c8`), ITL p50/p90, draft acceptance, committed vs proposed draft tokens |
 | KV-cache quant + Flash Attention (`kv_cache_type_k`/`_v`) | `f16` / `f16` (`flash_attn=on`) | `q8_0` / `q8_0` (`flash_attn=on`, required for quantized V) | `--cache-type-k f16 --cache-type-v f16 --flash-attn on` vs `--cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on` | P90 interactivity tok/s (`1000 / itl_ms.p90`), TTFT p50/p90, peak dedicated/shared VRAM (spill check), correctness parity |
-| Concurrent KV slots (`n_slots` / `--slots`) | `1` slot | `4` slots | `--slots 1` vs `--slots 4` | P90 interactivity tok/s (`1000 / itl_ms.p90`) at `c2`/`c4`/`c8`, aggregate output tok/s, makespan, TTFT p90 under concurrency |
+| Concurrent KV slots (`n_slots` / `--slots`) | `1` slot | `4` slots | `--slots 1` vs `--slots 4` (note: `kv_unified` defaults to `true` in `llamacpp.hpp:62`, so all 4 slots share one `--context-length` pool; 32K traces at `c4`/`c8` will fill a 32,768-token pool — raise `--context-length` for the 4-slot arm when VRAM allows, or cap `--max-context-length` to fit `n_ctx / slots`) | P90 interactivity tok/s (`1000 / itl_ms.p90`) at `c2`/`c4`/`c8`, aggregate output tok/s, makespan, TTFT p90 under concurrency |
 | L2 host-RAM `RadixPrefixCache` (`cache_ram_mib`) | off (`0`) | on (`8192` MiB, subject to host commit headroom) | `--cache-ram-mib 0` vs `--cache-ram-mib 8192` | Realized prefix-hit rate (`c2`/`c4`/`c8`), TTFT p50/p90 on warm turns/subagents, host private bytes |
 
 *Status:* Live A/B runs are blocked while inference services are intentionally

@@ -522,6 +522,16 @@ def test_out_zero_accepted_and_clamped_to_one_with_metadata(tmp_path):
     assert reqs[1]["effective_output_tokens"] == 1
     assert reqs[1]["output_tokens_clamped"] is True
     assert reqs[0]["output_tokens_clamped"] is False
+    # Actual vs target output token accounting (surfaces early EOS stops when ignore_eos is unsupported)
+    assert reqs[0]["actual_output_tokens"] == reqs[0]["completion_tokens"]
+    assert reqs[0]["output_tokens_delta"] == reqs[0]["actual_output_tokens"] - reqs[0]["effective_output_tokens"]
+    assert reqs[0]["output_tokens_ratio"] == pytest.approx(
+        reqs[0]["actual_output_tokens"] / reqs[0]["effective_output_tokens"]
+    )
+    assert reqs[1]["actual_output_tokens"] == 1
+    assert reqs[1]["output_tokens_delta"] == 0
+    assert reqs[1]["output_tokens_ratio"] == pytest.approx(1.0)
+    assert res["scenarios"][0]["agentx_summary"]["output_tokens_shortfall_requests"] >= 0
 
 
 def test_trace_fit_scale_preserves_topology_prefix_and_reports_transparency(tmp_path):
