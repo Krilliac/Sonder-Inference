@@ -146,6 +146,37 @@ def test_group_summary_reports_per_user_output_tps_p90_and_token_weighted_prefix
     assert gu["prefix_hit_prompt_tokens_total"] is None
 
 
+def test_p90_interactivity_tps_is_slow_tail_from_pooled_itl_p90():
+    # Fast request: 10ms ITL (100 tok/s); medium: 20ms ITL (50 tok/s); slow: 100ms ITL (10 tok/s).
+    # Pooled itl_ms = [10, 10, 10, 20, 20, 20, 100, 100, 100] -> itl_ms.p90 = 100ms, itl_ms.p50 = 20ms.
+    # Slow-tail headline p90_interactivity_tps = 1000 / 100 = 10.0 tok/s (<= p50_interactivity_tps = 50.0).
+    # Fast-tail secondary output_tps_per_user.p90 = percentile([10, 50, 100], 90) = 90.0 tok/s.
+    # Swapping fast-tail and slow-tail MUST fail this test (10.0 vs 90.0).
+    reqs = [
+        {"ok": True, "ttft_s": 0.05, "e2e_s": 0.08, "itl_s": [0.010, 0.010, 0.010],
+         "completion_tokens": 4, "decode_tps_client": 100.0, "output_tps_per_user": 100.0},
+        {"ok": True, "ttft_s": 0.05, "e2e_s": 0.11, "itl_s": [0.020, 0.020, 0.020],
+         "completion_tokens": 4, "decode_tps_client": 50.0, "output_tps_per_user": 50.0},
+        {"ok": True, "ttft_s": 0.05, "e2e_s": 0.35, "itl_s": [0.100, 0.100, 0.100],
+         "completion_tokens": 4, "decode_tps_client": 10.0, "output_tps_per_user": 10.0},
+    ]
+    g = group_summary(reqs)
+    assert g["client_observed_ms"]["itl_ms"]["p90"] == pytest.approx(100.0)
+    assert g["p90_interactivity_tps"] == pytest.approx(10.0)
+    assert g["p50_interactivity_tps"] == pytest.approx(50.0)
+    assert g["p90_interactivity_tps"] < g["p50_interactivity_tps"]
+    # Secondary per-request fast-tail stat stays distinct and much larger
+    assert g["output_tps_per_user"]["p90"] == pytest.approx(90.0)
+    assert g["p90_interactivity_tps"] != pytest.approx(g["output_tps_per_user"]["p90"])
+
+    # Empty ITL or zero ITL (e.g. out=0 clamped to 1 token) yields None, never inf/ZeroDivisionError
+    g_empty = group_summary([{"ok": True, "ttft_s": 0.05, "e2e_s": 0.05, "itl_s": [], "completion_tokens": 1}])
+    assert g_empty["p90_interactivity_tps"] is None
+    assert g_empty["p50_interactivity_tps"] is None
+    g_zero = group_summary([{"ok": True, "ttft_s": 0.05, "e2e_s": 0.05, "itl_s": [0.0, 0.0], "completion_tokens": 3}])
+    assert g_zero["p90_interactivity_tps"] is None
+
+
 # ---------------------------------------------------------------------- trace loader, filtering, prompt synthesis
 
 def test_load_fixture_and_filter_by_max_context_length():
@@ -390,19 +421,25 @@ def test_end_to_end_agentx_trace_concurrency_1_2_4_8_against_fake_server(tmp_pat
         assert g["output_tps_per_user_p90"] == pytest.approx(g["output_tps_per_user"]["p90"])
         assert g["ttft_s"]["p90"] is not None
         assert g["itl_s"]["p90"] is not None
+        itl_p90_ms = g["client_observed_ms"]["itl_ms"]["p90"]
+        assert g["p90_interactivity_tps"] == pytest.approx(1000.0 / itl_p90_ms)
+        assert g["p90_interactivity_tps"] <= g["p50_interactivity_tps"] + 1e-9
         assert g["realized_prefix_hit_rate"] is not None and g["realized_prefix_hit_rate"] > 0.0
 
     # AgentX headline summary and markdown output
     assert "agentx_summary" in sc
+    assert sc["agentx_summary"]["headline_metric"] == "p90_interactivity_tps"
     assert set(sc["agentx_summary"]["levels"]) == {"c1", "c2", "c4", "c8"}
     assert "AgentX" in md
-    assert "P90" in md or "p90" in md
+    assert "P90 interactivity tok/s" in md
     assert "realized prefix hit" in md.lower()
 
-    # Compare includes P90 and per-user output tok/s metrics
+    # Compare includes P90 interactivity (slow tail) and secondary decode metrics
     _diff_md, rows = compare(res, res)
     metrics_seen = {r["metric"] for r in rows}
-    assert "per-user output tok/s p90" in metrics_seen
+    assert "P90 interactivity tok/s" in metrics_seen
+    assert "P50 interactivity tok/s" in metrics_seen
+    assert "per-user decode tok/s p90 (fast tail)" in metrics_seen
     assert "TTFT p90 ms" in metrics_seen
     assert "realized prefix hit" in metrics_seen
 

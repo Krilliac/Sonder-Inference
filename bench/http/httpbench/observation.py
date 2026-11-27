@@ -52,7 +52,8 @@ DEFAULT_TIMING_DEFINITION: dict[str, str] = {
     "committed_output_tokens": "target-verified output tokens emitted to the client (usage.completion_tokens / timings.predicted_n)",
     "proposed_draft_tokens": "speculative draft tokens proposed before verification (timings.draft_n; null/unknown when unreported)",
     "cold_vs_warm_rule": "explicit cache_state/cold flag, else turn/repeat index (1=cold, >=2=warm), else reported cached tokens (>0=warm, 0=cold, null=unclassified)",
-    "output_tps_per_user": "client-observed per-request decode rate (committed_output_tokens - 1) / (e2e_s - ttft_s); headline AgentX metric is P90 across ok requests",
+    "p90_interactivity_tps": "AgentX headline metric (slow tail): 1000 / client_observed_ms.itl_ms.p90, pooled across token gaps of ok requests per group/concurrency level (null when ITL p90 is absent or <= 0)",
+    "output_tps_per_user": "secondary per-request decode rate distribution (committed_output_tokens - 1) / (e2e_s - ttft_s); its p90 is the fast tail, not the AgentX headline",
     "realized_prefix_hit_rate": "token-weighted sum(cached_tokens) / sum(prompt_tokens) over ok requests reporting usage.prompt_tokens_details.cached_tokens or usage.sonder.timings.cache_n (null when unreported)",
     "percentiles": "linear interpolation (numpy default linear method) over ok requests (p50/p90/p95/p99); ITL pooled across token gaps of ok requests",
 }

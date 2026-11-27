@@ -343,13 +343,21 @@ coding-agent sessions rather than single-turn prompts.
 
 ### Headline metric and reporting
 
-- **Headline metric:** **P90 per-user output tok/s**
-  (`output_tps_per_user.p90` in `bench/http/httpbench/metrics.py`), defined as
-  the 90th percentile of client-observed per-request decode rate
-  `(committed_output_tokens - 1) / (e2e_s - ttft_s)` across `ok` requests.
+- **Headline metric:** **P90 interactivity tok/s**
+  (`p90_interactivity_tps = 1000 / client_observed_ms.itl_ms.p90` in
+  `bench/http/httpbench/metrics.py`), pooled across token gaps of `ok` requests
+  per concurrency level — the **slow tail** per-client decode speed matching
+  SemiAnalysis InferenceX AgentX methodology
+  (`https://inferencex.semianalysis.com/blog/agentic-benchmark-agent-benchmark-guide`).
+  `p50_interactivity_tps` (`1000 / itl_ms.p50`) is reported alongside it.
+- **Secondary per-request decode distribution:** `output_tps_per_user`
+  summarizes per-request `(committed_output_tokens - 1) / (e2e_s - ttft_s)`
+  with `p50`/`p90`/`p95`/`p99` (plus `output_tps_by_session` when `session_id`
+  is present). Its `p90` (`output_tps_per_user_p90` / `req_decode_tps_p90_fast_tail`)
+  is the **fast tail** and is retained only as a secondary diagnostic, never as
+  the AgentX headline or primary A/B ranker.
 - **Percentiles:** `summarize()` reports `p50`, `p90`, `p95`, and `p99`
-  (linear interpolation) across TTFT, ITL, e2e, and `output_tps_per_user` (plus
-  `output_tps_by_session` when requests carry a `session_id`).
+  (linear interpolation) across TTFT, ITL, e2e, and `output_tps_per_user`.
 - **Realized prefix-hit rate:** token-weighted
   `sum(cached_tokens) / sum(prompt_tokens)` over `ok` requests reporting
   `usage.prompt_tokens_details.cached_tokens`, `usage.sonder.timings.cache_n`
@@ -472,9 +480,9 @@ correctness line beside every speed row.
 
 | Axis | Arm A (baseline) | Arm B (candidate) | `sonder-infer serve --backend llamacpp` flags | Primary metrics to compare |
 | --- | --- | --- | --- | --- |
-| Speculative decoding (`spec_type`) | `none` | `suffix` and `ngram` (also `ngram-mod`) | `--spec-type none` vs `--spec-type suffix` / `--spec-type ngram` | P90 per-user output tok/s (`c1..c8`), ITL p50/p90, draft acceptance, committed vs proposed draft tokens |
-| KV-cache quant + Flash Attention (`kv_cache_type_k`/`_v`) | `f16` / `f16` (`flash_attn=on`) | `q8_0` / `q8_0` (`flash_attn=on`, required for quantized V) | `--cache-type-k f16 --cache-type-v f16 --flash-attn on` vs `--cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on` | P90 per-user output tok/s, TTFT p50/p90, peak dedicated/shared VRAM (spill check), correctness parity |
-| Concurrent KV slots (`n_slots` / `--slots`) | `1` slot | `4` slots | `--slots 1` vs `--slots 4` | P90 per-user output tok/s at `c2`/`c4`/`c8`, aggregate output tok/s, makespan, TTFT p90 under concurrency |
+| Speculative decoding (`spec_type`) | `none` | `suffix` and `ngram` (also `ngram-mod`) | `--spec-type none` vs `--spec-type suffix` / `--spec-type ngram` | P90 interactivity tok/s (`1000 / itl_ms.p90`, `c1..c8`), ITL p50/p90, draft acceptance, committed vs proposed draft tokens |
+| KV-cache quant + Flash Attention (`kv_cache_type_k`/`_v`) | `f16` / `f16` (`flash_attn=on`) | `q8_0` / `q8_0` (`flash_attn=on`, required for quantized V) | `--cache-type-k f16 --cache-type-v f16 --flash-attn on` vs `--cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on` | P90 interactivity tok/s (`1000 / itl_ms.p90`), TTFT p50/p90, peak dedicated/shared VRAM (spill check), correctness parity |
+| Concurrent KV slots (`n_slots` / `--slots`) | `1` slot | `4` slots | `--slots 1` vs `--slots 4` | P90 interactivity tok/s (`1000 / itl_ms.p90`) at `c2`/`c4`/`c8`, aggregate output tok/s, makespan, TTFT p90 under concurrency |
 | L2 host-RAM `RadixPrefixCache` (`cache_ram_mib`) | off (`0`) | on (`8192` MiB, subject to host commit headroom) | `--cache-ram-mib 0` vs `--cache-ram-mib 8192` | Realized prefix-hit rate (`c2`/`c4`/`c8`), TTFT p50/p90 on warm turns/subagents, host private bytes |
 
 *Status:* Live A/B runs are blocked while inference services are intentionally

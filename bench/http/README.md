@@ -24,10 +24,12 @@ use pytest.
   the previous one, divided by the tokens in that chunk. When a chunk does not
   say how many tokens it holds, completion tokens / chunks is used. Reported
   as p50/p90/p95/p99.
-- **Per-user output tok/s** (`output_tps_per_user`) is client-observed decode
-  rate `(committed_output_tokens - 1) / (e2e_s - ttft_s)` summarized with
-  p50/p90/p95/p99; **P90 per-user output tok/s** (`output_tps_per_user_p90`)
-  is the AgentX headline metric.
+- **P90 interactivity tok/s** (`p90_interactivity_tps = 1000 / itl_ms.p90`,
+  pooled per concurrency level) is the AgentX **slow-tail** headline metric
+  (matching SemiAnalysis InferenceX AgentX); `p50_interactivity_tps`
+  (`1000 / itl_ms.p50`) is reported alongside it. Secondary per-request decode
+  rate (`output_tps_per_user`, `(committed_output_tokens - 1) / (e2e_s - ttft_s)`)
+  is still summarized with p50/p90/p95/p99, where its p90 is the fast tail.
 - **End-to-end** time.
 - **Prompt and completion tokens.**
 - **Prefill and decode tok/s**, both client-side and from `timings` when the
@@ -67,7 +69,7 @@ use pytest.
 | `staggered_arrivals` (`staggered-arrivals`) | Staggered concurrent arrivals separated by `stagger_ms` after the prior request's send event, capturing arrival ordering and overlap. |
 | `long_trailing` (`long-trailing`) | Short concurrent peers launched alongside one long trailing decode request, recording whether peers finished first and the trailing solo tail duration (`solo_tail_s`). |
 | `warm_tool_return` (`warm-tool-return`) | Cold initial prompt followed by warm tool-return turns on a stable system prompt + cache key, reporting cold vs warm metrics and `warm_tool_reuse`. |
-| `agentx_trace` (`agentx-trace`, `--preset agentx` or `--trace-file PATH`) | InferenceX AgentX-style streaming replay of local Weka JSON/JSONL traces (`semianalysisai/cc-traces-weka-062126` `traces.jsonl`, which already includes subagents). Replays `type: "s"` and `type: "n"` main turns, clamps `out: 0` rows to `max_tokens: 1` (recording `output_tokens_clamped`), preserves growing shared prefixes (`hash_ids`), concurrent subagent branches, and idle gaps capped at 10 s; fits traces to `--max-context-length` (default 32,768) via `--trace-fit {scale,drop}` (default `scale`, recording scale factors and original vs scaled peaks) and sweeps concurrency 1/2/4/8. Reports P90 per-user output tok/s and realized prefix-hit rate. See [docs/BENCHMARK_PLAN.md](../../docs/BENCHMARK_PLAN.md#agentx-coding-agent-trace-benchmark-agx-01) for the AIPerf compatibility note and live A/B matrix. |
+| `agentx_trace` (`agentx-trace`, `--preset agentx` or `--trace-file PATH`) | InferenceX AgentX-style streaming replay of local Weka JSON/JSONL traces (`semianalysisai/cc-traces-weka-062126` `traces.jsonl`, which already includes subagents). Replays `type: "s"` and `type: "n"` main turns, clamps `out: 0` rows to `max_tokens: 1` (recording `output_tokens_clamped`), preserves growing shared prefixes (`hash_ids`), concurrent subagent branches, and idle gaps capped at 10 s; fits traces to `--max-context-length` (default 32,768) via `--trace-fit {scale,drop}` (default `scale`, recording scale factors and original vs scaled peaks) and sweeps concurrency 1/2/4/8. Reports P90 interactivity tok/s (`1000 / itl_ms.p90`) and realized prefix-hit rate. See [docs/BENCHMARK_PLAN.md](../../docs/BENCHMARK_PLAN.md#agentx-coding-agent-trace-benchmark-agx-01) for the AIPerf compatibility note and live A/B matrix. |
 
 Every result file also records a strict `provenance` block (`source_commit`, `upstream_revision_or_digest`, `model_sha256`, `draft_sha256`, `resolved_settings`, `effective_settings`, `corpus_revision`, `sample_count`, `timing_definition`, and `validation_outcome`), reports `cold_vs_warm` independently, separates `committed_output_tokens` from `proposed_draft_tokens`, and separates `backend_compute_ms` from `client_observed_ms` (TTFT/ITL p50/p95). Use `--model-file`/`--model-sha256`, `--draft-file`/`--draft-sha256`, `--upstream-exe`/`--upstream-revision`, `--source-commit`, and `--require-provenance` for strict reproducible benchmark captures, and `bench_http.py scenarios --preset acceptance` to emit the acceptance-matrix preset.
 

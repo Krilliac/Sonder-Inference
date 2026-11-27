@@ -377,6 +377,13 @@ def group_summary(reqs: list[dict[str, Any]]) -> dict[str, Any]:
     output_tps_per_user = summarize(per_user_vals)
     session_means = [sum(vs) / len(vs) for vs in by_session.values() if vs]
     realized_prefix_hit_rate = min(cached_sum / prompt_sum, 1.0) if realized_n > 0 and prompt_sum > 0 else None
+    itl_ms_summary = summarize(x * 1000.0 for x in itl)
+    itl_ms_p90 = itl_ms_summary.get("p90")
+    itl_ms_p50 = itl_ms_summary.get("p50")
+    # AgentX headline interactivity is the SLOW tail derived from pooled ITL p90:
+    # 1000 / itl_ms.p90 (higher ITL -> lower interactivity tok/s).
+    p90_interactivity_tps = (1000.0 / itl_ms_p90) if (itl_ms_p90 is not None and itl_ms_p90 > 0.0) else None
+    p50_interactivity_tps = (1000.0 / itl_ms_p50) if (itl_ms_p50 is not None and itl_ms_p50 > 0.0) else None
 
     return {
         "requests": len(reqs),
@@ -387,7 +394,7 @@ def group_summary(reqs: list[dict[str, Any]]) -> dict[str, Any]:
         "e2e_s": summarize(r.get("e2e_s") for r in ok),
         "client_observed_ms": {
             "ttft_ms": summarize(r["ttft_s"] * 1000.0 for r in ok if r.get("ttft_s") is not None),
-            "itl_ms": summarize(x * 1000.0 for x in itl),
+            "itl_ms": itl_ms_summary,
             "e2e_ms": summarize(r["e2e_s"] * 1000.0 for r in ok if r.get("e2e_s") is not None),
         },
         "backend_compute_ms": {
@@ -408,6 +415,10 @@ def group_summary(reqs: list[dict[str, Any]]) -> dict[str, Any]:
         "prefill_tps_server": summarize(r.get("prefill_tps_server") for r in ok),
         "decode_tps_client": summarize(r.get("decode_tps_client") for r in ok),
         "decode_tps_server": summarize(r.get("decode_tps_server") for r in ok),
+        # Headline slow-tail interactivity derived from pooled ITL p90/p50.
+        "p90_interactivity_tps": p90_interactivity_tps,
+        "p50_interactivity_tps": p50_interactivity_tps,
+        # Secondary per-request decode rate distribution (its p90 is the fast tail).
         "output_tps_per_user": output_tps_per_user,
         "output_tps_per_user_p90": output_tps_per_user.get("p90"),
         "output_tps_by_session": summarize(session_means),

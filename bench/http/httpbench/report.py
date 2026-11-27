@@ -152,8 +152,9 @@ def render_markdown(res: dict) -> str:
     if agentx_scens:
         L.append("## AgentX Trace-Replay Summary")
         L.append("")
-        L.append("Headline metric: **P90 per-user output tok/s** (`output_tps_per_user.p90`). "
-                 "Realized prefix hit is token-weighted `sum(cached_tokens) / sum(prompt_tokens)`.")
+        L.append("Headline metric: **P90 interactivity tok/s** (`p90_interactivity_tps = 1000 / itl_ms.p90`, slow tail "
+                 "pooled per concurrency level). Secondary per-request decode p50/p90 (`output_tps_per_user`, fast tail "
+                 "at p90) is shown separately. Realized prefix hit is token-weighted `sum(cached_tokens) / sum(prompt_tokens)`.")
         L.append("")
         for s in agentx_scens:
             ax = s["agentx_summary"]
@@ -169,9 +170,10 @@ def render_markdown(res: dict) -> str:
                 L.append(f"  - scaled `{st['trace_id']}`: peak {st['original_peak_tokens']} -> "
                          f"{st['scaled_peak_tokens']} tokens (scale_factor={st['scale_factor']:.4f})")
         L.append("")
-        L.append("| scenario | level | ok/n | sessions | P90 per-user tok/s | P50 per-user tok/s | "
-                 "realized prefix hit | TTFT p50/p90 ms | ITL p50/p90 ms | agg output tok/s | makespan (s) |")
-        L.append("|---|---|---|---|---|---|---|---|---|---|---|")
+        L.append("| scenario | level | ok/n | sessions | P90 interactivity tok/s | P50 interactivity tok/s | "
+                 "req decode p50/p90 (fast tail) | realized prefix hit | TTFT p50/p90 ms | ITL p50/p90 ms | "
+                 "agg output tok/s | makespan (s) |")
+        L.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
         for s in agentx_scens:
             ax = s["agentx_summary"]
             for g, lv in (ax.get("levels") or {}).items():
@@ -181,8 +183,9 @@ def render_markdown(res: dict) -> str:
                     g,
                     f"{lv.get('ok')}/{lv.get('requests')}",
                     _f(lv.get("sessions"), digits=0),
-                    _f(lv.get("p90_output_tps_per_user")),
-                    _f(lv.get("p50_output_tps_per_user")),
+                    _f(lv.get("p90_interactivity_tps")),
+                    _f(lv.get("p50_interactivity_tps")),
+                    f"{_f(lv.get('req_decode_tps_p50'))} / {_f(lv.get('req_decode_tps_p90_fast_tail'))}",
                     rh,
                     f"{_f(lv.get('ttft_p50_ms'))} / {_f(lv.get('ttft_p90_ms'))}",
                     f"{_f(lv.get('itl_p50_ms'), digits=2)} / {_f(lv.get('itl_p90_ms'), digits=2)}",
@@ -201,8 +204,8 @@ def render_markdown(res: dict) -> str:
             extra = []
             if "aggregate_decode_tps" in gs:
                 extra.append(f"agg {_f(gs['aggregate_decode_tps'])} tok/s, makespan {_f(gs.get('makespan_s'), digits=2)} s")
-            if gs.get("output_tps_per_user_p90") is not None:
-                extra.append(f"user-p90 {_f(gs['output_tps_per_user_p90'])} tok/s")
+            if gs.get("p90_interactivity_tps") is not None:
+                extra.append(f"p90-interactivity {_f(gs['p90_interactivity_tps'])} tok/s")
             if gs.get("realized_prefix_hit_rate") is not None:
                 extra.append(f"realized hit {gs['realized_prefix_hit_rate']:.3f}")
             if gs.get("proposed_draft_tokens_total") is not None:
@@ -276,8 +279,10 @@ COMPARE_METRICS = [
     ("prefill tok/s (server)", ("prefill_tps_server", "mean"), 1, False),
     ("decode tok/s (client)", ("decode_tps_client", "mean"), 1, False),
     ("decode tok/s (server)", ("decode_tps_server", "mean"), 1, False),
-    ("per-user output tok/s p50", ("output_tps_per_user", "p50"), 1, False),
-    ("per-user output tok/s p90", ("output_tps_per_user", "p90"), 1, False),
+    ("P90 interactivity tok/s", ("p90_interactivity_tps",), 1, False),
+    ("P50 interactivity tok/s", ("p50_interactivity_tps",), 1, False),
+    ("per-user decode tok/s p50", ("output_tps_per_user", "p50"), 1, False),
+    ("per-user decode tok/s p90 (fast tail)", ("output_tps_per_user", "p90"), 1, False),
     ("prefix hit", ("prefix_hit", "mean"), 1, False),
     ("realized prefix hit", ("realized_prefix_hit_rate",), 1, False),
     ("recall", ("recall",), 1, False),

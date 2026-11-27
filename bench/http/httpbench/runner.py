@@ -1025,8 +1025,12 @@ def _build_agentx_summary(res: dict[str, Any]) -> dict[str, Any]:
             "ok": gs.get("ok"),
             "main_requests": gs.get("main_requests"),
             "subagent_requests": gs.get("subagent_requests"),
-            "p90_output_tps_per_user": gs.get("output_tps_per_user_p90"),
-            "p50_output_tps_per_user": (gs.get("output_tps_per_user") or {}).get("p50"),
+            # Headline AgentX interactivity (slow tail): 1000 / itl_ms.p90 pooled per concurrency level.
+            "p90_interactivity_tps": gs.get("p90_interactivity_tps"),
+            "p50_interactivity_tps": gs.get("p50_interactivity_tps"),
+            # Secondary per-request decode rate stats (p90 is the fast tail, not the headline).
+            "req_decode_tps_p50": (gs.get("output_tps_per_user") or {}).get("p50"),
+            "req_decode_tps_p90_fast_tail": gs.get("output_tps_per_user_p90"),
             "realized_prefix_hit_rate": gs.get("realized_prefix_hit_rate"),
             "ttft_p50_ms": ((gs.get("client_observed_ms") or {}).get("ttft_ms") or {}).get("p50"),
             "ttft_p90_ms": ((gs.get("client_observed_ms") or {}).get("ttft_ms") or {}).get("p90"),
@@ -1037,8 +1041,10 @@ def _build_agentx_summary(res: dict[str, Any]) -> dict[str, Any]:
         }
     overall = res.get("summary") or {}
     return {
-        "headline_metric": "p90_output_tps_per_user",
-        "overall_p90_output_tps_per_user": overall.get("output_tps_per_user_p90"),
+        "headline_metric": "p90_interactivity_tps",
+        "overall_p90_interactivity_tps": overall.get("p90_interactivity_tps"),
+        "overall_p50_interactivity_tps": overall.get("p50_interactivity_tps"),
+        "overall_req_decode_tps_p90_fast_tail": overall.get("output_tps_per_user_p90"),
         "overall_realized_prefix_hit_rate": overall.get("realized_prefix_hit_rate"),
         "max_context_length": res.get("max_context_length"),
         "effective_max_context_length": res.get("effective_max_context_length"),
@@ -1256,7 +1262,7 @@ def run_checks(results: dict, *, require_provenance: bool = False) -> list[dict]
             if warm:
                 warm_summary = group_summary(warm)
                 realized = warm_summary.get("realized_prefix_hit_rate")
-                p90_user = (s.get("summary") or {}).get("output_tps_per_user_p90")
+                p90_inter = (s.get("summary") or {}).get("p90_interactivity_tps")
                 if realized is None:
                     checks.append(_check(
                         "agentx_prefix_reuse",
@@ -1276,7 +1282,7 @@ def run_checks(results: dict, *, require_provenance: bool = False) -> list[dict]
                     checks.append(_check(
                         "agentx_prefix_reuse",
                         "pass",
-                        f"warm realized prefix-hit rate {realized:.3f}, P90 per-user output {_fmt(p90_user)} tok/s",
+                        f"warm realized prefix-hit rate {realized:.3f}, P90 interactivity {_fmt(p90_inter)} tok/s",
                         name,
                     ))
         sp = s.get("spill")
