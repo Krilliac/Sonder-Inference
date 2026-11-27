@@ -39,7 +39,9 @@
 #include "ggml-backend.h"
 #include "llama.h"
 
-#if defined(SONDER_LLAMACPP_HAS_MTP)
+// Older trees (b11195) declare the NextN/MTP calls only in the private src/llama-ext.h;
+// from v1.0.0 they are public in llama.h and llama-ext.h is not needed (CMake detects which).
+#if defined(SONDER_LLAMACPP_HAS_MTP) && defined(SONDER_LLAMACPP_MTP_VIA_EXT)
 #include "llama-ext.h"
 #endif
 

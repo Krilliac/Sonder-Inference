@@ -96,7 +96,11 @@ Emitted today:
 - Scheduler: `scheduler.enqueued/admitted/preempted/rejected`,
   `scheduler.prefill.chunk/completed`, `scheduler.batch.formed/completed`,
   and `scheduler.configured`.
-- Sampling: `sampling.configured` and `sampling.failed`.
+- Sampling: `sampling.configured`, `sampling.failed`, and
+  `inference.sampling.candidates` (llamaserver backend-sampled tokens).
+  `inference.token.generated` carries `unit: "token"` with `probability` for
+  Sonder-sampled tokens and for llamaserver tokens whose probability
+  llama-server reported.
 - Device: `device.memory.sample` (CPU/RAM at engine start and every
   `device_sample_interval`, default 10 s).
 - Other (ADR-012): `engine.started/stopped`, `backend.registered`,
