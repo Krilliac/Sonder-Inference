@@ -128,7 +128,7 @@ regressions, bounded concurrent controls, timing comparisons and remaining limit
 | --- | --- | --- |
 | `engine.started` | metrics | `version` str, `commit` str, `platform` str, `device_count` int, `text_capture` str (`on` / `off`); optional `server` obj `{host` str, `port` int, `api_version` int`}` when the engine is hosted by `sonder-infer serve` (`EngineOptions::server`) |
 | `engine.stopped` | metrics | none |
-| `scheduler.configured` | metrics | emitted once at engine start when scheduling is active: `mode` str (`automatic`, `gate`, `account`), `kv_block_size_tokens` int, `kv_num_blocks` int, `prefix_caching` bool, `max_running_sequences` int, `max_step_sequences` int, `max_step_tokens` int, `prefill_chunk_tokens` int, `admission_watermark_blocks` int, `max_requeue_count` int, `step_stall_timeout_ms` int |
+| `scheduler.configured` | metrics | emitted once at engine start when scheduling is active: `mode` str (`automatic`, `gate`, `account`), `kv_block_size_tokens` int, `kv_num_blocks` int, `kv_capacity_tokens` int (`kv_block_size_tokens` x `kv_num_blocks`: the LOGICAL admission pool, not the native backend's physical KV, which is `kv.pool.configured`), `prefix_caching` bool, `max_running_sequences` int, `max_step_sequences` int, `max_step_tokens` int, `prefill_chunk_tokens` int, `admission_watermark_blocks` int, `max_requeue_count` int, `step_stall_timeout_ms` int |
 | `device.memory.sample` | metrics | at start (`sample_devices_on_start`) and every `EngineOptions::device_sample_interval` (default 10 s, 0 disables): `kind` str, `name` str, `logical_cores` int, `total_bytes` int, `available_bytes` int; optional `used_bytes` int. Host memory only; per-process VRAM of a spawned llama-server is `backend.gpu_memory.sample` |
 | `backend.registered` | metrics | `backend` str, `description` str, `capabilities` arr of str |
 | `backend.gpu_memory.sample` | metrics | from the engine's periodic sampler, once per new sample of a backend that reports `Backend::runtime_status()` (a spawned `llamaserver` child): `backend`, `probe`, `status` str; `dedicated_bytes`, `shared_bytes`, `peak_shared_bytes`, `shared_baseline_bytes` (effective, including any per-1k-ctx growth), `spill_threshold_bytes`, `samples` int; `spilled` bool; `fitted_ctx` int or null; `fit_outcome` str ([vram-spill](integration/vram-spill.md)) |
@@ -335,6 +335,42 @@ Per-request KV events carry the request's `request_id` in the envelope.
 | `kv.evicted` | metrics | aggregated per append: `blocks` int, `trigger_scheduler_request_id` int, `total_evictions` int |
 | `kv.pressure` | metrics | engine-scoped, on watermark level change: `level` str (`normal` / `high` / `critical`), `occupancy` num (0..1), `utilization` num (same value), `pinned_blocks` int, `total_blocks` int |
 | `kv.freed` | metrics | `scheduler_request_id` int, `blocks` int, `reason` str (`completed`, `cancelled`, `failed`, `preempted`) |
+
+### Native KV cache events (physical)
+
+The in-process llama.cpp backend (`--backend llamacpp`) also reports its **physical** KV cache, the
+memory the Observatory's "KV cache pool" panel plots. Every event below carries `scope: "physical"`
+and `backend` (`llamacpp`); the logical events above carry neither. `kv.evicted` exists in both
+streams with different attributes, so tell them apart by `scope` (absent = logical).
+
+The backend queues these events and the engine sampler drains them, so they are delivered every
+`EngineOptions::device_sample_interval` (default 10 s; `0` disables the sampler and with it these
+events). Each event carries `observed_ms`, the backend's monotonic clock in milliseconds at the moment
+it was observed, because the delivery time says little about it. The events are **standard level**:
+they are dropped at `metrics`.
+
+| Event | Level | Attributes |
+| --- | --- | --- |
+| `kv.pool.configured` | standard | a context was created (model load): `n_ctx` int (total cells), `n_ctx_seq` int (cells one sequence may use), `n_seq` int, `kv_unified` bool, `type_k` / `type_v` str (ggml type names such as `f16`, `q8_0`), `bytes_per_token` int (K+V bytes per token over all layers; 0 when unknown), `bytes_per_token_source` str (`estimate`, `upper_bound_hybrid`, `unavailable`), `total_bytes` int (`n_ctx` x `bytes_per_token`), `device` str (`cpu`, `gpu`, or the first pinned device), `observed_ms` int |
+| `kv.usage` | standard | a gauge, rate limited: `cells_used` int, `cells_total` int, `bytes_used` int, `bytes_total` int, `occupancy` num (0..1), `observed_ms` int |
+| `kv.evicted` | standard | the backend dropped cached sequence tokens (`idle_lru` on unified-pool idle-slot eviction, `slot_reset` on full slot clear, `prefix_trim` on divergent suffix trim): `seq_id` int, `tokens` int, `bytes` int, `reason` str (`idle_lru`, `slot_reset`, `prefix_trim`), `observed_ms` int |
+| `kv.shifted` | standard | positions `[p0, p1)` of a sequence moved by `delta`: `seq_id`, `p0`, `p1`, `delta`, `tokens_discarded`, `bytes_discarded` int, `observed_ms` int. **Reserved: the native backend performs no context shift today, so it never emits this**; the shape is fixed and unit-tested |
+
+How to read them:
+
+- **`kv.usage` rate limit.** At most one event per 64 tokens **and** per 500 ms, whichever comes
+  later (both must have passed); the first observation always passes. It is a gauge, so only the
+  newest observation is kept between drains: a burst collapses to its last state, and the final state
+  of a request is delivered by the next drain even if the limiter suppressed it.
+- **`cells_used`** is the sum of the per-sequence lengths (`llama_memory_seq_pos_max + 1`). It is an
+  upper bound when sequences share cells (prefix cloning on a unified pool).
+- **`bytes_per_token` is an estimate**, computed from model metadata with uniform `n_head_kv` and
+  head sizes (`<arch>.attention.key_length` / `value_length`, else `n_embd / n_head`) and the exact
+  size of the K and V types. It ignores sliding-window layers, MLA latent caches and per-layer
+  variation. For hybrid models it counts every layer (`upper_bound_hybrid`); for recurrent models it
+  is 0 (`unavailable`). Byte fields follow it, so they are estimates too.
+- **Queue bound.** At most 64 discrete events wait between drains; the newest overflow is dropped
+  (the first `kv.pool.configured` survives). Usage is coalesced and never dropped.
 
 ## Typical order for one scheduled request
 

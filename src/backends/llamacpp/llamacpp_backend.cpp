@@ -30,6 +30,7 @@
 
 #include "batch_scheduler.hpp"
 #include "embed_batch_planner.hpp"
+#include "kv_telemetry.hpp"
 #include "prefix_coalescer.hpp"
 #include "radix_cache.hpp"
 #include "speculation_transition.hpp"
@@ -565,6 +566,8 @@ struct LlamaCppBackend::Impl {
     const llama_vocab* vocab = nullptr;
     LoadOptions options{};
     TelemetrySink telemetry;
+    // Physical KV telemetry queue shared with the owner (null = disabled).
+    std::shared_ptr<KvTelemetry> kv_tel;
     // Consulted by llama.cpp's abort callback during long llama_decode calls.
     const CancelPredicate* active_cancel = nullptr;
     std::function<bool()> batch_abort_fn;
@@ -1125,7 +1128,89 @@ struct LlamaCppBackend::Impl {
     }
 #endif
 
+    static std::uint64_t KvNowMs() {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count());
+    }
+
+    // Queues kv.pool.configured for the context just created. bytes_per_token is
+    // an ESTIMATE from model metadata (uniform n_head_kv and head sizes; it
+    // ignores SWA, MLA latents and per-layer variation), and an upper bound for
+    // hybrid models, whose recurrent layers keep no token-indexed cache.
+    void ConfigureKvTelemetry(const llama_context_params& cp) const {
+        if (!kv_tel || ctx == nullptr || model == nullptr) return;
+        KvPoolConfig cfg;
+        cfg.n_ctx = llama_n_ctx(ctx);
+#if defined(SONDER_LLAMACPP_HAS_N_CTX_SEQ)
+        cfg.n_ctx_seq = llama_n_ctx_seq(ctx);
+#else
+        cfg.n_ctx_seq = cfg.n_ctx;
+#endif
+        cfg.n_seq = cp.n_seq_max;
+#if defined(SONDER_LLAMACPP_HAS_KV_UNIFIED)
+        cfg.kv_unified = cp.kv_unified;
+#endif
+        cfg.type_k = ggml_type_name(cp.type_k);
+        cfg.type_v = ggml_type_name(cp.type_v);
+        cfg.device = options.n_gpu_layers == 0 ? "cpu" : (options.devices.empty() ? "gpu" : options.devices.front());
+
+        const auto read_u64 = [&](const std::string& key) -> std::uint64_t {
+            const std::string text = ReadModelMetadataValue(model, key.c_str());
+            if (text.empty()) return 0;
+            char* end = nullptr;
+            const unsigned long long v = std::strtoull(text.c_str(), &end, 10);
+            return (end != nullptr && *end == '\0') ? static_cast<std::uint64_t>(v) : 0;
+        };
+        const std::string arch = ReadModelMetadataValue(model, "general.architecture");
+        const std::int32_t n_head = llama_model_n_head(model);
+        const std::int32_t n_head_kv = llama_model_n_head_kv(model);
+        const std::int32_t n_embd = llama_model_n_embd(model);
+        std::int32_t n_layer = llama_model_n_layer(model);
+#if defined(SONDER_LLAMACPP_HAS_MTP)
+        n_layer -= std::max<std::int32_t>(0, llama_model_n_layer_nextn(model));
+#endif
+        std::uint64_t key_len = arch.empty() ? 0 : read_u64(arch + ".attention.key_length");
+        std::uint64_t val_len = arch.empty() ? 0 : read_u64(arch + ".attention.value_length");
+        if (n_head > 0 && n_embd > 0) {
+            if (key_len == 0) key_len = static_cast<std::uint64_t>(n_embd) / static_cast<std::uint64_t>(n_head);
+            if (val_len == 0) val_len = key_len;
+        }
+        if (n_layer > 0 && n_head_kv > 0 && key_len > 0 && val_len > 0 && !llama_model_is_recurrent(model)) {
+            KvShape shape;
+            shape.n_layer_kv = static_cast<std::uint32_t>(n_layer);
+            shape.n_embd_k_gqa = static_cast<std::uint64_t>(n_head_kv) * key_len;
+            shape.n_embd_v_gqa = static_cast<std::uint64_t>(n_head_kv) * val_len;
+            if (const auto bpt = KvBytesPerToken(shape, cfg.type_k, cfg.type_v)) {
+                cfg.bytes_per_token = *bpt;
+                cfg.bytes_per_token_source = llama_model_is_hybrid(model) ? "upper_bound_hybrid" : "estimate";
+            }
+        }
+        kv_tel->Configure(cfg, KvNowMs());
+    }
+
+    // Reads the cells held by every slot and hands them to the rate limiter.
+    // `force` skips the cheap limiter pre-check (prefill/generation boundaries),
+    // so the newest state is always available to the next drain. Cells are the
+    // sum of per-sequence lengths: an upper bound when sequences share cells.
+    void ObserveKvUsage(bool force) const {
+        if (!kv_tel || ctx == nullptr) return;
+        const std::uint64_t now = KvNowMs();
+        if (!force && !kv_tel->WantsUsageSample(now)) return;
+        llama_memory_t mem = llama_get_memory(ctx);
+        if (mem == nullptr) return;
+        std::uint64_t used = 0;
+        for (const auto& slot : slots) {
+            const int64_t pos_max = llama_memory_seq_pos_max(mem, static_cast<llama_seq_id>(slot.id));
+            if (pos_max >= 0) used += static_cast<std::uint64_t>(pos_max) + 1u;
+        }
+        kv_tel->ObserveUsage(KvUsageSample{used, llama_n_ctx(ctx)}, now);
+    }
+
     void Emit(TelemetryKind kind, std::int32_t tokens, double ms, std::string detail = {}) const {
+        if (kv_tel && kind != TelemetryKind::kModelLoaded && kind != TelemetryKind::kModelUnloaded) {
+            if (tokens > 0) kv_tel->OnTokens(static_cast<std::uint64_t>(tokens));
+            ObserveKvUsage(/*force=*/kind != TelemetryKind::kTokenDecoded);
+        }
         if (telemetry) telemetry(TelemetryEvent{kind, tokens, ms, std::move(detail)});
     }
 
@@ -2444,6 +2529,7 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
         impl_->ctx_outputs_max_per_seq = cap;
 #endif
         impl_->batch_allocated = true;
+        impl_->ConfigureKvTelemetry(cp);
 
         // Initialize per-slot KV prefix cache metadata & L2 host-RAM Radix cache.
         const std::uint32_t n_slots = std::clamp<uint32_t>(options.n_slots, 1, kMaxSlots);
@@ -2831,6 +2917,7 @@ Status LlamaCppBackend::FormatChat(std::string_view chat_template, const std::ve
 }
 
 void LlamaCppBackend::SetTelemetrySink(TelemetrySink sink) { impl_->telemetry = std::move(sink); }
+void LlamaCppBackend::SetKvTelemetry(std::shared_ptr<KvTelemetry> kv) { impl_->kv_tel = std::move(kv); }
 
 PrefixCoalescerStats LlamaCppBackend::GetPrefixCoalescerStats() const noexcept {
     PrefixCoalescerStats out;
@@ -3830,6 +3917,11 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                 (void)restored_pending_h;
 #endif
             }
+        }
+
+        if (!restored_from_l2 && kv_tel && kv_len > lcp) {
+            kv_tel->NoteEvicted(static_cast<std::int64_t>(slot_id), kv_len - lcp,
+                                lcp == 0 ? "slot_reset" : "prefix_trim", KvNowMs());
         }
 
         prefill_start_offset = static_cast<int64_t>(lcp);
@@ -5479,6 +5571,11 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             }
         }
 
+        if (!restored_from_l2 && kv_tel && kv_len > lcp) {
+            kv_tel->NoteEvicted(static_cast<std::int64_t>(s->slot_id), kv_len - lcp,
+                                lcp == 0 ? "slot_reset" : "prefix_trim", KvNowMs());
+        }
+
         const int64_t n_past = llama_memory_seq_pos_max(mem, s->slot_id) + 1;
         const auto n_prompt = static_cast<int64_t>(req.prompt.size());
         const int64_t rem_prompt = n_prompt - static_cast<int64_t>(lcp);
@@ -5609,6 +5706,14 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         const auto sid = static_cast<llama_seq_id>(slots[victim].id);
         if (options.prefix_cache && radix_cache.enabled() && slots[victim].tokens.size() >= kMinL2SnapshotTokens) {
             SnapshotSlotToL2(victim, sid);
+        }
+        if (kv_tel) {
+            const int64_t victim_kv_max = llama_memory_seq_pos_max(mem, sid);
+            const std::uint64_t evicted_tokens = std::max<std::uint64_t>(
+                slots[victim].tokens.size(), victim_kv_max >= 0 ? static_cast<std::uint64_t>(victim_kv_max) + 1u : 0u);
+            if (evicted_tokens > 0) {
+                kv_tel->NoteEvicted(static_cast<std::int64_t>(sid), evicted_tokens, "idle_lru", KvNowMs());
+            }
         }
         llama_memory_seq_rm(mem, sid, -1, -1);
         ResetSwaSlot(victim);

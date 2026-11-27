@@ -13,6 +13,7 @@ sonder_add_module_tests(llamacpp
     test_llamacpp_chat.cpp
     test_llamacpp_frontier.cpp
     test_llamacpp_speculative_verifier.cpp
+    test_kv_telemetry.cpp
 )
 if(TARGET sonder_llamacpp_tests)
     target_link_libraries(sonder_llamacpp_tests PRIVATE sonder_backend_llamacpp)
@@ -25,6 +26,7 @@ endif()
 add_executable(sonder_llamacpp_integration test_llamacpp_integration.cpp)
 target_link_libraries(sonder_llamacpp_integration PRIVATE
     sonder::inference sonder_backend_llamacpp sonder_doctest)
+target_include_directories(sonder_llamacpp_integration PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
 sonder_set_warnings(sonder_llamacpp_integration)
 add_test(NAME sonder.llamacpp.integration COMMAND sonder_llamacpp_integration)
 set_tests_properties(sonder.llamacpp.integration PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)

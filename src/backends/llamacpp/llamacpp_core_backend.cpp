@@ -30,6 +30,7 @@
 #endif
 
 #include "common/diag_log.hpp"
+#include "kv_telemetry.hpp"
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include "sonder/inference/backends/llamacpp.hpp"
 #include "sonder/inference/json.hpp"
@@ -285,6 +286,21 @@ using llamacpp_detail::ApplyNoThinkScaffolding;
 using llamacpp_detail::PathFromUtf8;
 using llamacpp_detail::PathToUtf8;
 using llamacpp_detail::StopSequenceFilter;
+
+// Drains the physical KV event queue into the (type, attributes) pairs the engine
+// sampler emits. The engine adds `backend`; `observed_ms` rides in the attributes.
+std::vector<std::pair<std::string, json::Object>> DrainKvEvents(lc::KvTelemetry& kv) {
+    std::vector<std::pair<std::string, json::Object>> out;
+    for (auto& ev : kv.Drain()) {
+        json::Object attrs;
+        for (auto& a : ev.attrs) {
+            std::visit([&](auto&& v) { attrs.set(std::move(a.key), json::Value(std::forward<decltype(v)>(v))); },
+                       std::move(a.value));
+        }
+        out.emplace_back(std::move(ev.type), std::move(attrs));
+    }
+    return out;
+}
 using llamacpp_detail::ThinkingSplitResult;
 using llamacpp_detail::ThinkingStreamSplitter;
 using llamacpp_detail::ToLlamaSampling;
@@ -386,6 +402,10 @@ struct ActiveModelEntry {
 
 struct RuntimeState {
     static constexpr std::uint64_t kDefaultSpillThresholdBytes = 256ull * 1024ull * 1024ull;
+
+    // Physical KV events of every model this backend loaded; drained by the
+    // engine sampler through BackendRuntimeStatus::take_events.
+    std::shared_ptr<lc::KvTelemetry> kv_telemetry = std::make_shared<lc::KvTelemetry>();
 
     mutable std::mutex mutex;
     llamacpp_detail::ProcessGpuMemoryProbe probe;
@@ -736,6 +756,7 @@ struct RuntimeState {
         }
         status.capability_statuses = BuildCapabilityStatusesLocked();
         status.effective_execution = BuildEffectiveExecutionLocked();
+        status.take_events = [kv = kv_telemetry] { return DrainKvEvents(*kv); };
         return status;
     }
 };
@@ -1515,6 +1536,7 @@ public:
 
         lc::LlamaCppBackend runtime;
         double load_ms = 0.0;
+        runtime.SetKvTelemetry(runtime_state_->kv_telemetry);
         runtime.SetTelemetrySink([&](const lc::TelemetryEvent& e) {
             if (e.kind == lc::TelemetryKind::kModelLoaded) load_ms = e.elapsed_ms;
         });
