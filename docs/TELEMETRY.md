@@ -339,9 +339,13 @@ Per-request KV events carry the request's `request_id` in the envelope.
 ### Native KV cache events (physical)
 
 The in-process llama.cpp backend (`--backend llamacpp`) also reports its **physical** KV cache, the
-memory the Observatory's "KV cache pool" panel plots. Every event below carries `scope: "physical"`
-and `backend` (`llamacpp`); the logical events above carry neither. `kv.evicted` exists in both
-streams with different attributes, so tell them apart by `scope` (absent = logical).
+memory the Observatory's "KV cache pool" panel plots. Every event below carries `scope: "physical"`,
+`backend` (`llamacpp`), `model_id` (int: unique per-loaded-model instance id within the backend),
+and, when known, `model` (str: loaded model filename); the logical events above carry none of those
+physical attribution fields. Each resident model keeps its own `bytes_per_token`, rate limiter, and
+usage gauge, so concurrently loaded models do not overwrite each other and stay separable by
+`model_id`. `kv.evicted` exists in both streams with different attributes, so tell them apart by
+`scope` (absent = logical).
 
 The backend queues these events and the engine sampler drains them, so they are delivered every
 `EngineOptions::device_sample_interval` (default 10 s; `0` disables the sampler and with it these

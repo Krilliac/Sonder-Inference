@@ -287,11 +287,12 @@ using llamacpp_detail::PathFromUtf8;
 using llamacpp_detail::PathToUtf8;
 using llamacpp_detail::StopSequenceFilter;
 
-// Drains the physical KV event queue into the (type, attributes) pairs the engine
-// sampler emits. The engine adds `backend`; `observed_ms` rides in the attributes.
-std::vector<std::pair<std::string, json::Object>> DrainKvEvents(lc::KvTelemetry& kv) {
+// Drains every resident model's physical KV event queue into the (type, attributes)
+// pairs the engine sampler emits. Each event carries per-model `model_id` (and
+// `model` when known); the engine adds `backend`; `observed_ms` rides in attrs.
+std::vector<std::pair<std::string, json::Object>> DrainKvEvents(lc::KvTelemetryRegistry& registry) {
     std::vector<std::pair<std::string, json::Object>> out;
-    for (auto& ev : kv.Drain()) {
+    for (auto& ev : registry.DrainAll()) {
         json::Object attrs;
         for (auto& a : ev.attrs) {
             std::visit([&](auto&& v) { attrs.set(std::move(a.key), json::Value(std::forward<decltype(v)>(v))); },
@@ -403,9 +404,9 @@ struct ActiveModelEntry {
 struct RuntimeState {
     static constexpr std::uint64_t kDefaultSpillThresholdBytes = 256ull * 1024ull * 1024ull;
 
-    // Physical KV events of every model this backend loaded; drained by the
-    // engine sampler through BackendRuntimeStatus::take_events.
-    std::shared_ptr<lc::KvTelemetry> kv_telemetry = std::make_shared<lc::KvTelemetry>();
+    // Per-loaded-model physical KV event queues; drained by the engine sampler
+    // through BackendRuntimeStatus::take_events so resident models stay isolated.
+    std::shared_ptr<lc::KvTelemetryRegistry> kv_registry = std::make_shared<lc::KvTelemetryRegistry>();
 
     mutable std::mutex mutex;
     llamacpp_detail::ProcessGpuMemoryProbe probe;
@@ -456,19 +457,28 @@ struct RuntimeState {
     }
 
     std::uint64_t RegisterModel(std::uint32_t n_ctx, bool gpu_offload, bool uma_target, std::string target_identity,
-                                lc::SpeculativeLoadInfo spec_info) {
-        std::lock_guard<std::mutex> lock(mutex);
-        const std::uint64_t id = next_model_id++;
-        active_models.push_back(
-            ActiveModelEntry{id, n_ctx, gpu_offload, uma_target, std::move(target_identity), std::move(spec_info)});
+                                lc::SpeculativeLoadInfo spec_info, std::shared_ptr<lc::KvTelemetry> kv) {
+        std::uint64_t id = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            id = next_model_id++;
+            active_models.push_back(
+                ActiveModelEntry{id, n_ctx, gpu_offload, uma_target, target_identity, std::move(spec_info)});
+        }
+        if (kv) {
+            kv_registry->Register(id, std::move(target_identity), std::move(kv));
+        }
         return id;
     }
 
     void UnregisterModel(std::uint64_t id) noexcept {
-        std::lock_guard<std::mutex> lock(mutex);
-        active_models.erase(std::remove_if(active_models.begin(), active_models.end(),
-                                           [id](const ActiveModelEntry& e) noexcept { return e.id == id; }),
-                            active_models.end());
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            active_models.erase(std::remove_if(active_models.begin(), active_models.end(),
+                                               [id](const ActiveModelEntry& e) noexcept { return e.id == id; }),
+                                active_models.end());
+        }
+        kv_registry->Unregister(id);
     }
 
     void RecordExecution(const EffectiveExecutionReport& report) {
@@ -756,7 +766,7 @@ struct RuntimeState {
         }
         status.capability_statuses = BuildCapabilityStatusesLocked();
         status.effective_execution = BuildEffectiveExecutionLocked();
-        status.take_events = [kv = kv_telemetry] { return DrainKvEvents(*kv); };
+        status.take_events = [reg = kv_registry] { return DrainKvEvents(*reg); };
         return status;
     }
 };
@@ -1536,7 +1546,8 @@ public:
 
         lc::LlamaCppBackend runtime;
         double load_ms = 0.0;
-        runtime.SetKvTelemetry(runtime_state_->kv_telemetry);
+        auto kv_telemetry = std::make_shared<lc::KvTelemetry>();
+        runtime.SetKvTelemetry(kv_telemetry);
         runtime.SetTelemetrySink([&](const lc::TelemetryEvent& e) {
             if (e.kind == lc::TelemetryKind::kModelLoaded) load_ms = e.elapsed_ms;
         });
@@ -1569,8 +1580,8 @@ public:
         }
         const std::uint32_t loaded_slots = std::max<std::uint32_t>(1u, runtime.SlotCount());
         const lc::SpeculativeLoadInfo spec_info = runtime.GetSpeculativeInfo();
-        const std::uint64_t model_id =
-            runtime_state_->RegisterModel(info.n_ctx, lo.n_gpu_layers != 0, uma_target, d.name, spec_info);
+        const std::uint64_t model_id = runtime_state_->RegisterModel(
+            info.n_ctx, lo.n_gpu_layers != 0, uma_target, d.name, spec_info, std::move(kv_telemetry));
         runtime_state_->RefreshGpuMemory(/*force=*/true);
         return std::shared_ptr<BackendModel>(std::make_shared<LlamaCppModel>(
             std::move(d), std::move(runtime), load_ms, loaded_slots, runtime_state_, model_id));

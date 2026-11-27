@@ -17,6 +17,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -186,6 +187,39 @@ private:
     std::optional<KvEvent> queued_usage_;   // newest usage already allowed by the limiter
     std::optional<KvEvent> pending_usage_;  // newest usage the limiter suppressed
     std::uint64_t dropped_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// KvTelemetryRegistry: owns one KvTelemetry per resident model instance so
+// multiple concurrently loaded models never share bytes_per_token, limiters,
+// or usage gauges, and every drained event carries model attribution.
+// ---------------------------------------------------------------------------
+
+class KvTelemetryRegistry {
+public:
+    // Registers `kv` under unique instance `model_id` and human-readable `model`
+    // name. Null `kv` is ignored; re-registering `model_id` replaces its entry.
+    void Register(std::uint64_t model_id, std::string model, std::shared_ptr<KvTelemetry> kv);
+
+    // Removes `model_id` when the model unloads. Unknown ids are a no-op.
+    void Unregister(std::uint64_t model_id) noexcept;
+
+    [[nodiscard]] std::size_t ActiveCount() const;
+
+    // Drains every registered model's KvTelemetry in ascending `model_id` order
+    // and appends `model_id` (int64) and, when non-empty, `model` (str) to each
+    // emitted event.
+    [[nodiscard]] std::vector<KvEvent> DrainAll();
+
+private:
+    struct Entry {
+        std::uint64_t model_id = 0;
+        std::string model;
+        std::shared_ptr<KvTelemetry> kv;
+    };
+
+    mutable std::mutex mutex_;
+    std::vector<Entry> entries_;
 };
 
 }  // namespace sonder::backends::llamacpp

@@ -543,3 +543,201 @@ TEST_CASE("kv telemetry: core backend exposes a drain that is empty before any m
     REQUIRE(static_cast<bool>(status->take_events));
     CHECK(status->take_events().empty());
 }
+
+// ---------------------------------------------------------------------------
+// Multi-model residency: per-model KvTelemetry registry isolation & tagging.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("kv telemetry registry: two models keep separate bytes_per_token, usage gauges, limiters and attribution") {
+    KvTelemetryRegistry reg;
+    KvTelemetryOptions opt;
+    opt.min_tokens = 100;
+    opt.min_interval_ms = 500;
+    auto kv_a = std::make_shared<KvTelemetry>(opt);
+    auto kv_b = std::make_shared<KvTelemetry>(opt);
+
+    reg.Register(1, "alpha-7b.gguf", kv_a);
+    reg.Register(2, "beta-32b.gguf", kv_b);
+    CHECK(reg.ActiveCount() == 2);
+
+    KvPoolConfig cfg_a = SamplePool();
+    cfg_a.n_ctx = 4096;
+    cfg_a.n_ctx_seq = 4096;
+    cfg_a.n_seq = 1;
+    cfg_a.bytes_per_token = 1000;
+    kv_a->Configure(cfg_a, 100);
+
+    // Loading/configuring model B must NOT overwrite model A's bytes_per_token or reset A's limiter.
+    kv_a->ObserveUsage(KvUsageSample{50, 4096}, 200);
+    CHECK_FALSE(kv_a->WantsUsageSample(250));  // A is now inside its limiter window
+
+    KvPoolConfig cfg_b = SamplePool();
+    cfg_b.n_ctx = 16384;
+    cfg_b.n_ctx_seq = 8192;
+    cfg_b.n_seq = 2;
+    cfg_b.bytes_per_token = 8192;
+    kv_b->Configure(cfg_b, 260);
+
+    CHECK(kv_a->BytesPerToken() == 1000);
+    CHECK(kv_b->BytesPerToken() == 8192);
+    CHECK_FALSE(kv_a->WantsUsageSample(270));  // B's Configure did not reset A's limiter
+
+    // Interleaved usage, eviction, and shift events across both models.
+    kv_b->ObserveUsage(KvUsageSample{10, 16384}, 280);
+    kv_a->NoteEvicted(0, 20, "idle_lru", 290);
+    kv_b->NoteEvicted(1, 5, "slot_reset", 300);
+    kv_a->NoteShifted(0, 4, 44, -4, 4, 310);
+    // B emits a second (limiter-suppressed) usage sample: updates B's gauge only, never overwrites A's.
+    kv_b->ObserveUsage(KvUsageSample{25, 16384}, 320);
+
+    const auto evs = reg.DrainAll();
+    std::vector<KvEvent> evs_a;
+    std::vector<KvEvent> evs_b;
+    for (const auto& ev : evs) {
+        const std::int64_t mid = GetInt(ev, "model_id");
+        if (mid == 1) {
+            CHECK(GetStr(ev, "model") == "alpha-7b.gguf");
+            evs_a.push_back(ev);
+        } else if (mid == 2) {
+            CHECK(GetStr(ev, "model") == "beta-32b.gguf");
+            evs_b.push_back(ev);
+        } else {
+            FAIL_CHECK("unexpected model_id " << mid);
+        }
+    }
+
+    // Model A: configured, evicted, shifted, usage (4 events) — all using 1000 bytes/token.
+    REQUIRE(evs_a.size() == 4);
+    CHECK(evs_a[0].type == "kv.pool.configured");
+    CHECK(GetInt(evs_a[0], "bytes_per_token") == 1000);
+    CHECK(GetInt(evs_a[0], "total_bytes") == 4096 * 1000);
+    CHECK(evs_a[1].type == "kv.evicted");
+    CHECK(GetInt(evs_a[1], "bytes") == 20 * 1000);
+    CHECK(evs_a[2].type == "kv.shifted");
+    CHECK(GetInt(evs_a[2], "bytes_discarded") == 4 * 1000);
+    CHECK(evs_a[3].type == "kv.usage");
+    CHECK(GetInt(evs_a[3], "cells_used") == 50);
+    CHECK(GetInt(evs_a[3], "bytes_used") == 50 * 1000);
+    CHECK(GetInt(evs_a[3], "bytes_total") == 4096 * 1000);
+
+    // Model B: configured, evicted, usage (3 events) — all using 8192 bytes/token.
+    REQUIRE(evs_b.size() == 3);
+    CHECK(evs_b[0].type == "kv.pool.configured");
+    CHECK(GetInt(evs_b[0], "bytes_per_token") == 8192);
+    CHECK(GetInt(evs_b[0], "total_bytes") == 16384 * 8192);
+    CHECK(evs_b[1].type == "kv.evicted");
+    CHECK(GetInt(evs_b[1], "bytes") == 5 * 8192);
+    CHECK(evs_b[2].type == "kv.usage");
+    CHECK(GetInt(evs_b[2], "cells_used") == 25);
+    CHECK(GetInt(evs_b[2], "bytes_used") == 25 * 8192);
+    CHECK(GetInt(evs_b[2], "bytes_total") == 16384 * 8192);
+
+    // Drained clean.
+    CHECK(reg.DrainAll().empty());
+}
+
+TEST_CASE("kv telemetry registry: duplicate filenames stay separable by model_id, Unregister removes entry") {
+    KvTelemetryRegistry reg;
+    auto kv1 = std::make_shared<KvTelemetry>();
+    auto kv2 = std::make_shared<KvTelemetry>();
+
+    reg.Register(10, "shared.gguf", kv1);
+    reg.Register(20, "shared.gguf", kv2);
+    reg.Register(30, "ignored", nullptr);  // null ignored
+    CHECK(reg.ActiveCount() == 2);
+
+    KvPoolConfig c1 = SamplePool();
+    c1.bytes_per_token = 512;
+    KvPoolConfig c2 = SamplePool();
+    c2.bytes_per_token = 2048;
+    kv1->Configure(c1, 1);
+    kv2->Configure(c2, 2);
+    kv1->ObserveUsage(KvUsageSample{10, 100}, 3);
+    kv2->ObserveUsage(KvUsageSample{10, 100}, 4);
+
+    const auto evs = reg.DrainAll();
+    int usage_10 = 0;
+    int usage_20 = 0;
+    for (const auto& ev : evs) {
+        if (ev.type != "kv.usage") continue;
+        CHECK(GetStr(ev, "model") == "shared.gguf");
+        const std::int64_t mid = GetInt(ev, "model_id");
+        if (mid == 10) {
+            CHECK(GetInt(ev, "bytes_used") == 10 * 512);
+            ++usage_10;
+        } else if (mid == 20) {
+            CHECK(GetInt(ev, "bytes_used") == 10 * 2048);
+            ++usage_20;
+        }
+    }
+    CHECK(usage_10 == 1);
+    CHECK(usage_20 == 1);
+
+    // Unregister model 10: further events on kv1 are not drained; model 20 continues.
+    reg.Unregister(10);
+    reg.Unregister(999);  // unknown id is a no-op
+    CHECK(reg.ActiveCount() == 1);
+    kv1->NoteEvicted(0, 10, "idle_lru", 5);
+    kv2->NoteEvicted(0, 10, "idle_lru", 6);
+    const auto after = reg.DrainAll();
+    REQUIRE(after.size() == 1);
+    CHECK(GetInt(after[0], "model_id") == 20);
+    CHECK(GetInt(after[0], "bytes") == 10 * 2048);
+
+    // Empty model name omits the `model` attribute while keeping `model_id`.
+    auto kv3 = std::make_shared<KvTelemetry>();
+    reg.Register(30, "", kv3);
+    kv3->NoteEvicted(0, 1, "idle_lru", 7);
+    const auto unnamed = reg.DrainAll();
+    REQUIRE(unnamed.size() == 1);
+    CHECK(GetInt(unnamed[0], "model_id") == 30);
+    CHECK(unnamed[0].Find("model") == nullptr);
+}
+
+TEST_CASE("kv telemetry registry: concurrent Register, Unregister, producers, and DrainAll") {
+    KvTelemetryRegistry reg;
+    auto sentinel = std::make_shared<KvTelemetry>();
+    reg.Register(1, "sentinel.gguf", sentinel);
+    KvPoolConfig sc = SamplePool();
+    sc.bytes_per_token = 64;
+    sentinel->Configure(sc, 0);
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> sentinel_seen{0};
+
+    std::thread drainer([&] {
+        while (!stop.load()) {
+            const auto evs = reg.DrainAll();
+            for (const auto& ev : evs) {
+                CHECK(ev.Find("model_id") != nullptr);
+                if (GetInt(ev, "model_id") == 1) sentinel_seen.fetch_add(1);
+            }
+        }
+    });
+
+    std::vector<std::thread> workers;
+    for (std::uint64_t t = 1; t <= 4; ++t) {
+        workers.emplace_back([&reg, t] {
+            for (std::uint64_t round = 0; round < 20; ++round) {
+                const std::uint64_t id = t * 100 + round;
+                auto kv = std::make_shared<KvTelemetry>();
+                reg.Register(id, "m" + std::to_string(t), kv);
+                KvPoolConfig c = SamplePool();
+                c.bytes_per_token = t * 128;
+                kv->Configure(c, round);
+                kv->ObserveUsage(KvUsageSample{round, 1024}, round + 1);
+                reg.Unregister(id);
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    stop.store(true);
+    drainer.join();
+    for (const auto& ev : reg.DrainAll()) {
+        if (GetInt(ev, "model_id") == 1) sentinel_seen.fetch_add(1);
+    }
+    CHECK(sentinel_seen.load() >= 1);
+    CHECK(reg.ActiveCount() == 1);
+    reg.Unregister(1);
+    CHECK(reg.ActiveCount() == 0);
+    CHECK(reg.DrainAll().empty());
+}

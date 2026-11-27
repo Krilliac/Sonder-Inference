@@ -253,4 +253,50 @@ std::uint64_t KvTelemetry::Dropped() const {
     return dropped_;
 }
 
+// --- KvTelemetryRegistry ---------------------------------------------------
+
+void KvTelemetryRegistry::Register(std::uint64_t model_id, std::string model, std::shared_ptr<KvTelemetry> kv) {
+    if (!kv) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = std::lower_bound(entries_.begin(), entries_.end(), model_id,
+                               [](const Entry& e, std::uint64_t id) noexcept { return e.model_id < id; });
+    if (it != entries_.end() && it->model_id == model_id) {
+        it->model = std::move(model);
+        it->kv = std::move(kv);
+    } else {
+        entries_.insert(it, Entry{model_id, std::move(model), std::move(kv)});
+    }
+}
+
+void KvTelemetryRegistry::Unregister(std::uint64_t model_id) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+                                  [model_id](const Entry& e) noexcept { return e.model_id == model_id; }),
+                   entries_.end());
+}
+
+std::size_t KvTelemetryRegistry::ActiveCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return entries_.size();
+}
+
+std::vector<KvEvent> KvTelemetryRegistry::DrainAll() {
+    std::vector<Entry> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot = entries_;
+    }
+    std::vector<KvEvent> out;
+    for (const auto& entry : snapshot) {
+        for (auto& ev : entry.kv->Drain()) {
+            ev.attrs.push_back(Attr("model_id", ToI64(entry.model_id)));
+            if (!entry.model.empty()) {
+                ev.attrs.push_back(Attr("model", entry.model));
+            }
+            out.push_back(std::move(ev));
+        }
+    }
+    return out;
+}
+
 }  // namespace sonder::backends::llamacpp
