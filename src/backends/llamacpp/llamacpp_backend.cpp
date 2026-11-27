@@ -69,6 +69,70 @@ namespace {
 
 std::atomic<LogSink> g_log_sink{nullptr};
 
+struct GgmlDeviceLineRegistry {
+    static constexpr std::size_t kMaxEntries = 64;
+    static constexpr std::size_t kMaxPendingBytes = 2048;
+
+    std::mutex mutex;
+    std::string pending;
+    std::vector<sonder::inference::GgmlDeviceTelemetry> entries;
+
+    void Feed(LogLevel level, const char* text) {
+        if (text == nullptr || text[0] == '\0') return;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (level != LogLevel::kCont) {
+            pending.clear();
+        }
+        const std::string_view chunk(text);
+        std::size_t pos = 0;
+        while (pos < chunk.size()) {
+            const std::size_t nl = chunk.find('\n', pos);
+            const std::string_view part =
+                nl == std::string_view::npos ? chunk.substr(pos) : chunk.substr(pos, nl - pos);
+            if (pending.size() < kMaxPendingBytes) {
+                const std::size_t take = std::min(part.size(), kMaxPendingBytes - pending.size());
+                pending.append(part.data(), take);
+            }
+            if (nl == std::string_view::npos) {
+                break;
+            }
+            if (auto parsed = sonder::inference::parse_ggml_device_line(pending)) {
+                sonder::inference::register_ggml_device_telemetry(*parsed);
+                bool updated = false;
+                for (auto& existing : entries) {
+                    if (existing.backend == parsed->backend && existing.index == parsed->index &&
+                        existing.device_name == parsed->device_name) {
+                        existing = std::move(*parsed);
+                        updated = true;
+                        break;
+                    }
+                }
+                if (!updated && entries.size() < kMaxEntries) {
+                    entries.push_back(std::move(*parsed));
+                }
+            }
+            pending.clear();
+            pos = nl + 1;
+        }
+    }
+
+    std::vector<sonder::inference::GgmlDeviceTelemetry> Snapshot() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return entries;
+    }
+
+    void Clear() noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        pending.clear();
+        entries.clear();
+    }
+};
+
+GgmlDeviceLineRegistry& DeviceLineRegistry() {
+    static GgmlDeviceLineRegistry registry;
+    return registry;
+}
+
 }  // namespace
 
 void SetLogSink(LogSink sink) noexcept { g_log_sink.store(sink, std::memory_order_release); }
@@ -76,6 +140,9 @@ void SetLogSink(LogSink sink) noexcept { g_log_sink.store(sink, std::memory_orde
 // llama.cpp logs verbosely to stderr by default. Keep warnings and errors;
 // set SONDER_LLAMACPP_VERBOSE=1 to see everything.
 void RouteLog(LogLevel level, const char* text) {
+    if (text != nullptr) {
+        DeviceLineRegistry().Feed(level, text);
+    }
     static const bool verbose = [] {
         const char* v = std::getenv("SONDER_LLAMACPP_VERBOSE");
         return v != nullptr && v[0] != '\0' && v[0] != '0';
@@ -2395,6 +2462,7 @@ std::string_view LlamaCppBackend::UpstreamVersion() noexcept { return SONDER_LLA
 
 std::vector<DeviceInfo> LlamaCppBackend::EnumerateDevices() {
     EnsureBackendInitialized();
+    const auto captured = DeviceLineRegistry().Snapshot();
     std::vector<DeviceInfo> out;
     const std::size_t count = ggml_backend_dev_count();
     out.reserve(count);
@@ -2409,9 +2477,31 @@ std::vector<DeviceInfo> LlamaCppBackend::EnumerateDevices() {
         ggml_backend_dev_memory(dev, &free_b, &total_b);
         info.memory_free_bytes = free_b;
         info.memory_total_bytes = total_b;
+        // Attach parsed ggml_vulkan device telemetry when available.
+        if (info.name.rfind("Vulkan", 0) == 0 && info.name.size() > 6) {
+            const std::string_view suffix(info.name.data() + 6, info.name.size() - 6);
+            if (const auto idx = sonder::inference::parse_strict_u64(suffix)) {
+                for (const auto& line : captured) {
+                    if (line.backend == "vulkan" && line.index.has_value() &&
+                        static_cast<std::uint64_t>(*line.index) == *idx) {
+                        info.telemetry = line;
+                        break;
+                    }
+                }
+            }
+        }
         out.push_back(std::move(info));
     }
     return out;
+}
+
+std::vector<sonder::inference::GgmlDeviceTelemetry> LlamaCppBackend::CapturedGgmlDevices() {
+    return DeviceLineRegistry().Snapshot();
+}
+
+void LlamaCppBackend::ClearCapturedGgmlDevices() noexcept {
+    DeviceLineRegistry().Clear();
+    sonder::inference::clear_registered_ggml_device_telemetry();
 }
 
 std::string LlamaCppBackend::SystemInfo() {

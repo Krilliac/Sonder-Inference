@@ -1,6 +1,7 @@
 #include "sonder/inference/device.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -393,6 +394,570 @@ std::optional<std::size_t> map_rocm_visible_ordinal(std::size_t ordinal, std::st
     return std::nullopt;
 }
 
+std::string normalize_pci_bus_id(std::string_view raw) {
+    const std::string_view sv = trim_view(raw);
+    if (sv.empty()) {
+        return {};
+    }
+    std::string lower;
+    lower.reserve(sv.size());
+    for (const char c : sv) {
+        lower.push_back(ascii_tolower(c));
+    }
+    const std::size_t first_colon = lower.find(':');
+    if (first_colon != std::string::npos && first_colon > 4u) {
+        // NVML formats the PCI domain with 8 hex digits ("00000000:01:00.0")
+        // whereas Vulkan and Linux sysfs use 4 ("0000:01:00.0"). Trim extra
+        // leading zeros on the domain down to 4 digits for canonical matching.
+        std::size_t trim_pos = 0;
+        while (first_colon - trim_pos > 4u && lower[trim_pos] == '0') {
+            ++trim_pos;
+        }
+        lower.erase(0, trim_pos);
+    }
+    return lower;
+}
+
+#if defined(_WIN32) || defined(__linux__)
+#  if defined(_WIN32)
+#    define SONDER_VKAPI_CALL __stdcall
+#  else
+#    define SONDER_VKAPI_CALL
+#  endif
+
+struct VkProbeAdapterLuid {
+    bool valid = false;
+    std::uint8_t bytes[8] = {};
+};
+
+struct VkPhysicalDeviceProbe {
+    std::uint32_t vendor_id = 0;
+    std::uint32_t device_id = 0;
+    std::string name;
+    bool is_integrated_uma = false;
+    VkProbeAdapterLuid luid;
+    std::string pci_bus_id;
+    std::string driver_name;
+    std::string driver_info;
+    std::optional<std::uint64_t> shared_memory_bytes;
+    std::optional<std::uint32_t> warp_size;
+    std::string matrix_cores;
+    std::vector<VulkanMemoryHeapInfo> heaps;
+    std::optional<bool> rebar;
+};
+
+std::string format_pci_bdf(std::uint32_t domain, std::uint32_t bus, std::uint32_t device, std::uint32_t func) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(16);
+    out.push_back(kHex[(domain >> 12) & 0xFu]);
+    out.push_back(kHex[(domain >> 8) & 0xFu]);
+    out.push_back(kHex[(domain >> 4) & 0xFu]);
+    out.push_back(kHex[domain & 0xFu]);
+    out.push_back(':');
+    out.push_back(kHex[(bus >> 4) & 0xFu]);
+    out.push_back(kHex[bus & 0xFu]);
+    out.push_back(':');
+    out.push_back(kHex[(device >> 4) & 0xFu]);
+    out.push_back(kHex[device & 0xFu]);
+    out.push_back('.');
+    out.push_back(kHex[func & 0xFu]);
+    return out;
+}
+
+// Optional, zero-SDK-dependency Vulkan 1.1/1.2 physical-device probe.
+// Safety invariant (NAT-16 / #22750): never calls vkCreateDevice and never
+// calls vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR in-process.
+std::vector<VkPhysicalDeviceProbe> probe_vulkan_physical_devices() {
+    std::vector<VkPhysicalDeviceProbe> out;
+#  if defined(_WIN32)
+    HMODULE lib = LoadLibraryExW(L"vulkan-1.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!lib) {
+        return out;
+    }
+    struct ScopedVkLib {
+        HMODULE h = nullptr;
+        ~ScopedVkLib() {
+            if (h) FreeLibrary(h);
+        }
+    } lib_guard{lib};
+    auto load_sym = [&](const char* name, auto& fn) noexcept -> bool {
+        const FARPROC raw = GetProcAddress(lib, name);
+        if (!raw) return false;
+        std::memcpy(&fn, &raw, sizeof(fn));
+        return true;
+    };
+#  else
+    void* lib = dlopen("libvulkan.so.1", RTLD_LAZY);
+    if (!lib) {
+        return out;
+    }
+    struct ScopedVkLib {
+        void* h = nullptr;
+        ~ScopedVkLib() {
+            if (h) dlclose(h);
+        }
+    } lib_guard{lib};
+    auto load_sym = [&](const char* name, auto& fn) noexcept -> bool {
+        void* raw = dlsym(lib, name);
+        if (!raw) return false;
+        std::memcpy(&fn, &raw, sizeof(fn));
+        return true;
+    };
+#  endif
+
+    using VkResult = std::int32_t;
+    using VkBool32 = std::uint32_t;
+    using VkFlags = std::uint32_t;
+    using VkDeviceSize = std::uint64_t;
+    using VkStructureType = std::int32_t;
+    struct VkInstance_T;
+    struct VkPhysicalDevice_T;
+    using VkInstance = VkInstance_T*;
+    using VkPhysicalDevice = VkPhysicalDevice_T*;
+    using PFN_vkVoidFunction = void(SONDER_VKAPI_CALL*)();
+
+    constexpr VkResult kVkSuccess = 0;
+    constexpr VkStructureType kStAppInfo = 0;
+    constexpr VkStructureType kStInstCreate = 1;
+    constexpr VkStructureType kStProps2 = 1000059001;
+    constexpr VkStructureType kStMemProps2 = 1000059006;
+    constexpr VkStructureType kStIdProps = 1000071004;
+    constexpr VkStructureType kStSubgroupProps = 1000094000;
+    constexpr VkStructureType kStDriverProps = 1000196000;
+    constexpr VkStructureType kStPciBusInfo = 1000212000;
+    constexpr VkStructureType kStMemBudget = 1000237000;
+    constexpr std::uint32_t kVkApi11 = (1u << 22) | (1u << 12);
+    constexpr std::uint32_t kVkApi12 = (1u << 22) | (2u << 12);
+    constexpr std::uint32_t kMaxHeaps = 16u;
+    constexpr std::uint32_t kMaxTypes = 32u;
+    constexpr VkFlags kMemPropDeviceLocal = 0x00000001u;
+    constexpr VkFlags kMemPropHostVisible = 0x00000002u;
+    constexpr VkFlags kMemPropHostCoherent = 0x00000004u;
+    constexpr VkFlags kMemHeapDeviceLocal = 0x00000001u;
+    constexpr VkFlags kMemHeapMultiInstance = 0x00000002u;
+
+    struct VkApplicationInfoRaw {
+        VkStructureType sType;
+        const void* pNext;
+        const char* pApplicationName;
+        std::uint32_t applicationVersion;
+        const char* pEngineName;
+        std::uint32_t engineVersion;
+        std::uint32_t apiVersion;
+    };
+    struct VkInstanceCreateInfoRaw {
+        VkStructureType sType;
+        const void* pNext;
+        VkFlags flags;
+        const VkApplicationInfoRaw* pApplicationInfo;
+        std::uint32_t enabledLayerCount;
+        const char* const* ppEnabledLayerNames;
+        std::uint32_t enabledExtensionCount;
+        const char* const* ppEnabledExtensionNames;
+    };
+    struct VkExtensionPropertiesRaw {
+        char extensionName[256];
+        std::uint32_t specVersion;
+    };
+    struct VkPhysicalDevicePropertiesRaw {
+        std::uint32_t apiVersion;
+        std::uint32_t driverVersion;
+        std::uint32_t vendorID;
+        std::uint32_t deviceID;
+        std::int32_t deviceType;
+        char deviceName[256];
+        std::uint8_t pipelineCacheUUID[16];
+        // Natural 8-byte alignment pad before VkPhysicalDeviceLimits (which
+        // contains VkDeviceSize / uint64_t).
+        std::uint32_t limits_align_pad;
+        // VkPhysicalDeviceLimits (504 bytes on 64-bit) +
+        // VkPhysicalDeviceSparseProperties (20 bytes) + 4 bytes tail padding = 528 bytes (66 qwords).
+        // maxComputeSharedMemorySize sits at byte offset 216 inside limits (512 in struct).
+        std::uint64_t limits_and_sparse[66];
+    };
+    struct VkPhysicalDeviceProperties2Raw {
+        VkStructureType sType;
+        void* pNext;
+        VkPhysicalDevicePropertiesRaw properties;
+    };
+    struct VkConformanceVersionRaw {
+        std::uint8_t major;
+        std::uint8_t minor;
+        std::uint8_t subminor;
+        std::uint8_t patch;
+    };
+    struct VkPhysicalDeviceDriverPropertiesRaw {
+        VkStructureType sType;
+        void* pNext;
+        std::int32_t driverID;
+        char driverName[256];
+        char driverInfo[256];
+        VkConformanceVersionRaw conformanceVersion;
+    };
+    struct VkPhysicalDeviceIDPropertiesRaw {
+        VkStructureType sType;
+        void* pNext;
+        std::uint8_t deviceUUID[16];
+        std::uint8_t driverUUID[16];
+        std::uint8_t deviceLUID[8];
+        std::uint32_t deviceNodeMask;
+        VkBool32 deviceLUIDValid;
+    };
+    struct VkPhysicalDeviceSubgroupPropertiesRaw {
+        VkStructureType sType;
+        void* pNext;
+        std::uint32_t subgroupSize;
+        VkFlags supportedStages;
+        VkFlags supportedOperations;
+        VkBool32 quadOperationsInAllStages;
+    };
+    struct VkPhysicalDevicePCIBusInfoPropertiesEXTRaw {
+        VkStructureType sType;
+        void* pNext;
+        std::uint32_t pciDomain;
+        std::uint32_t pciBus;
+        std::uint32_t pciDevice;
+        std::uint32_t pciFunction;
+    };
+    struct VkMemoryTypeRaw {
+        VkFlags propertyFlags;
+        std::uint32_t heapIndex;
+    };
+    struct VkMemoryHeapRaw {
+        VkDeviceSize size;
+        VkFlags flags;
+    };
+    struct VkPhysicalDeviceMemoryPropertiesRaw {
+        std::uint32_t memoryTypeCount;
+        VkMemoryTypeRaw memoryTypes[kMaxTypes];
+        std::uint32_t memoryHeapCount;
+        VkMemoryHeapRaw memoryHeaps[kMaxHeaps];
+    };
+    struct VkPhysicalDeviceMemoryProperties2Raw {
+        VkStructureType sType;
+        void* pNext;
+        VkPhysicalDeviceMemoryPropertiesRaw memoryProperties;
+    };
+    struct VkPhysicalDeviceMemoryBudgetPropertiesEXTRaw {
+        VkStructureType sType;
+        void* pNext;
+        VkDeviceSize heapBudget[kMaxHeaps];
+        VkDeviceSize heapUsage[kMaxHeaps];
+    };
+
+    static_assert(sizeof(VkPhysicalDevicePropertiesRaw) == 824u);
+    static_assert(offsetof(VkPhysicalDevicePropertiesRaw, limits_and_sparse) == 296u);
+
+    using GetInstProcFn = PFN_vkVoidFunction(SONDER_VKAPI_CALL*)(VkInstance, const char*);
+    using EnumInstVerFn = VkResult(SONDER_VKAPI_CALL*)(std::uint32_t*);
+    using CreateInstFn = VkResult(SONDER_VKAPI_CALL*)(const VkInstanceCreateInfoRaw*, const void*, VkInstance*);
+    using DestroyInstFn = void(SONDER_VKAPI_CALL*)(VkInstance, const void*);
+    using EnumDevsFn = VkResult(SONDER_VKAPI_CALL*)(VkInstance, std::uint32_t*, VkPhysicalDevice*);
+    using EnumExtsFn =
+        VkResult(SONDER_VKAPI_CALL*)(VkPhysicalDevice, const char*, std::uint32_t*, VkExtensionPropertiesRaw*);
+    using GetPropsFn = void(SONDER_VKAPI_CALL*)(VkPhysicalDevice, VkPhysicalDevicePropertiesRaw*);
+    using GetProps2Fn = void(SONDER_VKAPI_CALL*)(VkPhysicalDevice, VkPhysicalDeviceProperties2Raw*);
+    using GetMemProps2Fn = void(SONDER_VKAPI_CALL*)(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2Raw*);
+
+    GetInstProcFn get_proc = nullptr;
+    if (!load_sym("vkGetInstanceProcAddr", get_proc) || !get_proc) {
+        return out;
+    }
+    auto resolve_inst = [&](VkInstance inst, const char* name, auto& fn) noexcept -> bool {
+        const PFN_vkVoidFunction raw = get_proc(inst, name);
+        if (!raw) return false;
+        std::memcpy(&fn, &raw, sizeof(fn));
+        return true;
+    };
+
+    EnumInstVerFn enum_ver = nullptr;
+    CreateInstFn create_inst = nullptr;
+    if (!resolve_inst(nullptr, "vkCreateInstance", create_inst)) {
+        return out;
+    }
+    std::uint32_t inst_ver = kVkApi11;
+    if (resolve_inst(nullptr, "vkEnumerateInstanceVersion", enum_ver)) {
+        std::uint32_t avail = 0;
+        if (enum_ver(&avail) == kVkSuccess) {
+            if (avail < kVkApi11) {
+                return out;  // Vulkan 1.1+ required for Properties2 / MemoryProperties2
+            }
+            inst_ver = avail >= kVkApi12 ? kVkApi12 : kVkApi11;
+        }
+    }
+
+    VkApplicationInfoRaw app{};
+    app.sType = kStAppInfo;
+    app.pApplicationName = "sonder-inference";
+    app.apiVersion = inst_ver;
+
+    VkInstanceCreateInfoRaw ci{};
+    ci.sType = kStInstCreate;
+    ci.pApplicationInfo = &app;
+
+    VkInstance instance = nullptr;
+    if (create_inst(&ci, nullptr, &instance) != kVkSuccess || !instance) {
+        return out;
+    }
+
+    DestroyInstFn destroy_inst = nullptr;
+    (void)resolve_inst(instance, "vkDestroyInstance", destroy_inst);
+    struct ScopedVkInst {
+        VkInstance inst = nullptr;
+        DestroyInstFn destroy = nullptr;
+        ~ScopedVkInst() {
+            if (inst && destroy) destroy(inst, nullptr);
+        }
+    } inst_guard{instance, destroy_inst};
+
+    EnumDevsFn enum_devs = nullptr;
+    EnumExtsFn enum_exts = nullptr;
+    GetPropsFn get_props = nullptr;
+    GetProps2Fn get_props2 = nullptr;
+    GetMemProps2Fn get_mem_props2 = nullptr;
+    if (!resolve_inst(instance, "vkEnumeratePhysicalDevices", enum_devs) ||
+        !resolve_inst(instance, "vkEnumerateDeviceExtensionProperties", enum_exts) ||
+        !resolve_inst(instance, "vkGetPhysicalDeviceProperties2", get_props2) ||
+        !resolve_inst(instance, "vkGetPhysicalDeviceMemoryProperties2", get_mem_props2)) {
+        return out;
+    }
+    (void)resolve_inst(instance, "vkGetPhysicalDeviceProperties", get_props);
+
+    std::uint32_t dev_count = 0;
+    if (enum_devs(instance, &dev_count, nullptr) != kVkSuccess || dev_count == 0) {
+        return out;
+    }
+    dev_count = std::min<std::uint32_t>(dev_count, 32u);
+    std::vector<VkPhysicalDevice> phys_devs(dev_count, nullptr);
+    if (enum_devs(instance, &dev_count, phys_devs.data()) != kVkSuccess) {
+        return out;
+    }
+    phys_devs.resize(dev_count);
+
+    for (VkPhysicalDevice pd : phys_devs) {
+        if (!pd) continue;
+
+        bool has_mem_budget = false;
+        bool has_pci_bus_info = false;
+        bool has_driver_props_ext = false;
+        bool has_coopmat = false;
+        bool has_coopmat2 = false;
+
+        std::uint32_t ext_count = 0;
+        if (enum_exts(pd, nullptr, &ext_count, nullptr) == kVkSuccess && ext_count > 0) {
+            ext_count = std::min<std::uint32_t>(ext_count, 1024u);
+            std::vector<VkExtensionPropertiesRaw> exts(ext_count);
+            if (enum_exts(pd, nullptr, &ext_count, exts.data()) == kVkSuccess) {
+                exts.resize(ext_count);
+                for (const auto& e : exts) {
+                    const std::string_view ename(e.extensionName,
+                                                 strnlen(e.extensionName, sizeof(e.extensionName)));
+                    if (ename == "VK_EXT_memory_budget") has_mem_budget = true;
+                    else if (ename == "VK_EXT_pci_bus_info") has_pci_bus_info = true;
+                    else if (ename == "VK_KHR_driver_properties") has_driver_props_ext = true;
+                    else if (ename == "VK_KHR_cooperative_matrix") has_coopmat = true;
+                    else if (ename == "VK_NV_cooperative_matrix2") has_coopmat2 = true;
+                }
+            }
+        }
+
+        std::uint32_t dev_api_ver = 0;
+        if (get_props) {
+            VkPhysicalDevicePropertiesRaw base_props{};
+            get_props(pd, &base_props);
+            dev_api_ver = base_props.apiVersion;
+        }
+        const bool chain_driver_props = has_driver_props_ext || (inst_ver >= kVkApi12 && dev_api_ver >= kVkApi12);
+
+        VkPhysicalDeviceProperties2Raw props2{};
+        props2.sType = kStProps2;
+        VkPhysicalDeviceIDPropertiesRaw id_props{};
+        id_props.sType = kStIdProps;
+        VkPhysicalDeviceSubgroupPropertiesRaw subgroup_props{};
+        subgroup_props.sType = kStSubgroupProps;
+        VkPhysicalDeviceDriverPropertiesRaw drv_props{};
+        drv_props.sType = kStDriverProps;
+        VkPhysicalDevicePCIBusInfoPropertiesEXTRaw pci_props{};
+        pci_props.sType = kStPciBusInfo;
+
+        void* pnext = nullptr;
+        id_props.pNext = pnext;
+        pnext = &id_props;
+        subgroup_props.pNext = pnext;
+        pnext = &subgroup_props;
+        if (chain_driver_props) {
+            drv_props.pNext = pnext;
+            pnext = &drv_props;
+        }
+        if (has_pci_bus_info) {
+            pci_props.pNext = pnext;
+            pnext = &pci_props;
+        }
+        props2.pNext = pnext;
+        get_props2(pd, &props2);
+
+        // Skip CPU/virtual/software Vulkan adapters (e.g. llvmpipe).
+        if (props2.properties.deviceType == 4 /*VK_PHYSICAL_DEVICE_TYPE_CPU*/ ||
+            props2.properties.vendorID == 0x1414u) {
+            continue;
+        }
+
+        VkPhysicalDeviceProbe p;
+        p.vendor_id = props2.properties.vendorID;
+        p.device_id = props2.properties.deviceID;
+        p.is_integrated_uma = (props2.properties.deviceType == 1 /*INTEGRATED_GPU*/);
+        p.name = sanitize_driver_build_string(std::string_view(
+            props2.properties.deviceName, strnlen(props2.properties.deviceName, sizeof(props2.properties.deviceName))));
+        if (id_props.deviceLUIDValid != 0) {
+            p.luid.valid = true;
+            std::memcpy(p.luid.bytes, id_props.deviceLUID, sizeof(p.luid.bytes));
+        }
+        if (has_pci_bus_info) {
+            p.pci_bus_id = format_pci_bdf(pci_props.pciDomain, pci_props.pciBus, pci_props.pciDevice,
+                                          pci_props.pciFunction);
+        }
+        if (chain_driver_props) {
+            p.driver_name = sanitize_driver_build_string(
+                std::string_view(drv_props.driverName, strnlen(drv_props.driverName, sizeof(drv_props.driverName))));
+            p.driver_info = sanitize_driver_build_string(
+                std::string_view(drv_props.driverInfo, strnlen(drv_props.driverInfo, sizeof(drv_props.driverInfo))));
+        }
+        std::uint32_t shared_mem = 0;
+        std::memcpy(&shared_mem, reinterpret_cast<const std::uint8_t*>(props2.properties.limits_and_sparse) + 216u,
+                    sizeof(shared_mem));
+        if (shared_mem > 0) {
+            p.shared_memory_bytes = static_cast<std::uint64_t>(shared_mem);
+        }
+        if (subgroup_props.subgroupSize > 0) {
+            p.warp_size = subgroup_props.subgroupSize;
+        }
+        if (has_coopmat2) {
+            p.matrix_cores = "NV_coopmat2";
+        } else if (has_coopmat) {
+            p.matrix_cores = "KHR_coopmat";
+        } else {
+            p.matrix_cores = "none";
+        }
+
+        VkPhysicalDeviceMemoryProperties2Raw mem2{};
+        mem2.sType = kStMemProps2;
+        VkPhysicalDeviceMemoryBudgetPropertiesEXTRaw budget{};
+        budget.sType = kStMemBudget;
+        if (has_mem_budget) {
+            mem2.pNext = &budget;
+        }
+        get_mem_props2(pd, &mem2);
+
+        const std::uint32_t heap_count = std::min<std::uint32_t>(mem2.memoryProperties.memoryHeapCount, kMaxHeaps);
+        const std::uint32_t type_count = std::min<std::uint32_t>(mem2.memoryProperties.memoryTypeCount, kMaxTypes);
+        p.heaps.reserve(heap_count);
+        for (std::uint32_t hi = 0; hi < heap_count; ++hi) {
+            VulkanMemoryHeapInfo h;
+            h.heap_index = hi;
+            h.size_bytes = mem2.memoryProperties.memoryHeaps[hi].size;
+            h.device_local = (mem2.memoryProperties.memoryHeaps[hi].flags & kMemHeapDeviceLocal) != 0;
+            h.multi_instance = (mem2.memoryProperties.memoryHeaps[hi].flags & kMemHeapMultiInstance) != 0;
+            if (has_mem_budget) {
+                h.budget_bytes = MemoryReading::known(budget.heapBudget[hi]);
+                h.usage_bytes = MemoryReading::known(budget.heapUsage[hi]);
+            }
+            for (std::uint32_t ti = 0; ti < type_count; ++ti) {
+                const auto& mt = mem2.memoryProperties.memoryTypes[ti];
+                if (mt.heapIndex != hi) continue;
+                if ((mt.propertyFlags & kMemPropHostVisible) != 0) {
+                    h.host_visible = true;
+                }
+                constexpr VkFlags kHvv = kMemPropDeviceLocal | kMemPropHostVisible | kMemPropHostCoherent;
+                if ((mt.propertyFlags & kHvv) == kHvv) {
+                    h.host_coherent = true;
+                }
+            }
+            p.heaps.push_back(std::move(h));
+        }
+        p.rebar = classify_vulkan_rebar(p.heaps);
+        out.push_back(std::move(p));
+    }
+    return out;
+}
+
+void enrich_gpus_with_vulkan(std::vector<GpuDeviceInfo>& gpus, const std::vector<VkProbeAdapterLuid>& adapter_luids) {
+    if (gpus.empty()) {
+        return;
+    }
+    const auto vk_devs = probe_vulkan_physical_devices();
+    if (vk_devs.empty()) {
+        return;
+    }
+    std::vector<bool> used(vk_devs.size(), false);
+    auto apply_vk = [](GpuDeviceInfo& gpu, const VkPhysicalDeviceProbe& vk) {
+        if (gpu.pci_bus_id.empty() && !vk.pci_bus_id.empty()) {
+            gpu.pci_bus_id = vk.pci_bus_id;
+        }
+        if (gpu.driver_name.empty() && !vk.driver_name.empty()) {
+            gpu.driver_name = vk.driver_name;
+        }
+        if (gpu.driver_build.empty() && !vk.driver_info.empty()) {
+            gpu.driver_build = vk.driver_info;
+        }
+        if (!gpu.rebar.has_value() && vk.rebar.has_value()) {
+            gpu.rebar = vk.rebar;
+        }
+        if (!gpu.shared_memory_bytes.has_value() && vk.shared_memory_bytes.has_value()) {
+            gpu.shared_memory_bytes = vk.shared_memory_bytes;
+        }
+        if (!gpu.warp_size.has_value() && vk.warp_size.has_value()) {
+            gpu.warp_size = vk.warp_size;
+        }
+        if (gpu.matrix_cores.empty() && !vk.matrix_cores.empty()) {
+            gpu.matrix_cores = vk.matrix_cores;
+        }
+        if (gpu.vulkan_heaps.empty() && !vk.heaps.empty()) {
+            gpu.vulkan_heaps = vk.heaps;
+        }
+    };
+
+    for (std::size_t gi = 0; gi < gpus.size(); ++gi) {
+        auto& gpu = gpus[gi];
+        std::optional<std::size_t> match;
+        // 1. Exact Windows AdapterLuid match.
+        if (gi < adapter_luids.size() && adapter_luids[gi].valid) {
+            for (std::size_t vi = 0; vi < vk_devs.size(); ++vi) {
+                if (!used[vi] && vk_devs[vi].luid.valid &&
+                    std::memcmp(vk_devs[vi].luid.bytes, adapter_luids[gi].bytes, 8u) == 0) {
+                    match = vi;
+                    break;
+                }
+            }
+        }
+        // 2. Exact PCI BDF match (normalized across 4-digit and 8-digit domains).
+        if (!match && !gpu.pci_bus_id.empty()) {
+            const std::string norm_gpu_bdf = normalize_pci_bus_id(gpu.pci_bus_id);
+            for (std::size_t vi = 0; vi < vk_devs.size(); ++vi) {
+                if (!used[vi] && !vk_devs[vi].pci_bus_id.empty() &&
+                    normalize_pci_bus_id(vk_devs[vi].pci_bus_id) == norm_gpu_bdf) {
+                    match = vi;
+                    break;
+                }
+            }
+        }
+        // 3. PCI vendor_id + device_id match.
+        if (!match && gpu.vendor_id != 0 && gpu.device_id != 0) {
+            for (std::size_t vi = 0; vi < vk_devs.size(); ++vi) {
+                if (!used[vi] && vk_devs[vi].vendor_id == gpu.vendor_id && vk_devs[vi].device_id == gpu.device_id) {
+                    match = vi;
+                    break;
+                }
+            }
+        }
+        if (match) {
+            used[*match] = true;
+            apply_vk(gpu, vk_devs[*match]);
+        }
+    }
+}
+#endif
+
 #if defined(_WIN32)
 std::string cpu_name() {
     char buffer[256] = {};
@@ -574,6 +1139,11 @@ std::vector<GpuDeviceInfo> enumerate_win32_nvml_devices() {
     NvmlReturn (*nvml_get_memory)(NvmlDevice, NvmlMemory*) = nullptr;
     NvmlReturn (*nvml_get_pci)(NvmlDevice, NvmlPciInfo*) = nullptr;
     NvmlReturn (*nvml_get_driver_model)(NvmlDevice, int*, int*) = nullptr;
+    NvmlReturn (*nvml_sys_driver_ver)(char*, unsigned int) = nullptr;
+    NvmlReturn (*nvml_curr_pcie_gen)(NvmlDevice, unsigned int*) = nullptr;
+    NvmlReturn (*nvml_curr_pcie_width)(NvmlDevice, unsigned int*) = nullptr;
+    NvmlReturn (*nvml_max_pcie_gen)(NvmlDevice, unsigned int*) = nullptr;
+    NvmlReturn (*nvml_max_pcie_width)(NvmlDevice, unsigned int*) = nullptr;
 
     if (!load_win32_symbol(nvml.handle, "nvmlInit_v2", nvml_init) ||
         !load_win32_symbol(nvml.handle, "nvmlShutdown", nvml_shutdown) ||
@@ -589,6 +1159,11 @@ std::vector<GpuDeviceInfo> enumerate_win32_nvml_devices() {
     if (!load_win32_symbol(nvml.handle, "nvmlDeviceGetDriverModel_v2", nvml_get_driver_model)) {
         (void)load_win32_symbol(nvml.handle, "nvmlDeviceGetDriverModel", nvml_get_driver_model);
     }
+    (void)load_win32_symbol(nvml.handle, "nvmlSystemGetDriverVersion", nvml_sys_driver_ver);
+    (void)load_win32_symbol(nvml.handle, "nvmlDeviceGetCurrPcieLinkGeneration", nvml_curr_pcie_gen);
+    (void)load_win32_symbol(nvml.handle, "nvmlDeviceGetCurrPcieLinkWidth", nvml_curr_pcie_width);
+    (void)load_win32_symbol(nvml.handle, "nvmlDeviceGetMaxPcieLinkGeneration", nvml_max_pcie_gen);
+    (void)load_win32_symbol(nvml.handle, "nvmlDeviceGetMaxPcieLinkWidth", nvml_max_pcie_width);
     if (nvml_init() != kNvmlSuccess) {
         return out;
     }
@@ -603,6 +1178,15 @@ std::vector<GpuDeviceInfo> enumerate_win32_nvml_devices() {
         ScopedNvml(const ScopedNvml&) = delete;
         ScopedNvml& operator=(const ScopedNvml&) = delete;
     } nvml_guard(nvml_shutdown);
+
+    std::string nvml_driver_build;
+    if (nvml_sys_driver_ver) {
+        char drv_buf[96] = {};
+        if (nvml_sys_driver_ver(drv_buf, static_cast<unsigned int>(sizeof(drv_buf))) == kNvmlSuccess) {
+            drv_buf[sizeof(drv_buf) - 1] = '\0';
+            nvml_driver_build = sanitize_driver_build_string(drv_buf);
+        }
+    }
 
     unsigned int count = 0;
     if (nvml_get_count(&count) != kNvmlSuccess || count == 0) {
@@ -641,6 +1225,27 @@ std::vector<GpuDeviceInfo> enumerate_win32_nvml_devices() {
                 info.is_tcc_mode = (cur_model == kNvmlDriverTcc);
             }
         }
+        if (!nvml_driver_build.empty()) {
+            info.driver_name = "NVIDIA";
+            info.driver_build = nvml_driver_build;
+        }
+        unsigned int pcie_val = 0;
+        if (nvml_curr_pcie_gen && nvml_curr_pcie_gen(dev, &pcie_val) == kNvmlSuccess && pcie_val >= 1u &&
+            pcie_val <= 6u) {
+            info.pcie.current_gen = pcie_val;
+        }
+        if (nvml_curr_pcie_width && nvml_curr_pcie_width(dev, &pcie_val) == kNvmlSuccess && pcie_val >= 1u &&
+            pcie_val <= 32u) {
+            info.pcie.current_width = pcie_val;
+        }
+        if (nvml_max_pcie_gen && nvml_max_pcie_gen(dev, &pcie_val) == kNvmlSuccess && pcie_val >= 1u &&
+            pcie_val <= 6u) {
+            info.pcie.max_gen = pcie_val;
+        }
+        if (nvml_max_pcie_width && nvml_max_pcie_width(dev, &pcie_val) == kNvmlSuccess && pcie_val >= 1u &&
+            pcie_val <= 32u) {
+            info.pcie.max_width = pcie_val;
+        }
         NvmlMemory mem{};
         if (nvml_get_memory(dev, &mem) == kNvmlSuccess) {
             info.dedicated_total = MemoryReading::known(static_cast<std::uint64_t>(mem.total));
@@ -656,8 +1261,252 @@ std::vector<GpuDeviceInfo> enumerate_win32_nvml_devices() {
     return out;
 }
 
+std::string read_reg_sz_value(HKEY key, const char* value_name) {
+    char buf[512] = {};
+    DWORD size = sizeof(buf);
+    if (RegGetValueA(key, nullptr, value_name, RRF_RT_REG_SZ, nullptr, buf, &size) == ERROR_SUCCESS && size > 0) {
+        buf[sizeof(buf) - 1] = '\0';
+        return sanitize_driver_build_string(buf);
+    }
+    return {};
+}
+
+bool parse_ven_dev_from_pnp_id(std::string_view pnp_id, std::uint32_t& ven_out, std::uint32_t& dev_out) noexcept {
+    auto find_hex_tag = [&](std::string_view tag, std::uint32_t& out) noexcept -> bool {
+        for (std::size_t i = 0; i + tag.size() + 4 <= pnp_id.size(); ++i) {
+            if (iequals(pnp_id.substr(i, tag.size()), tag)) {
+                if (const auto v = parse_hex_u32(pnp_id.substr(i + tag.size(), 4))) {
+                    out = *v;
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    return find_hex_tag("VEN_", ven_out) && find_hex_tag("DEV_", dev_out);
+}
+
+void enrich_win32_registry_drivers(std::vector<GpuDeviceInfo>& gpus) {
+    if (gpus.empty()) return;
+    HKEY class_key = nullptr;
+    constexpr const char* kDisplayClass =
+        "SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}";
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, kDisplayClass, 0, KEY_READ, &class_key) != ERROR_SUCCESS || !class_key) {
+        return;
+    }
+    struct ScopedRegKey {
+        HKEY h = nullptr;
+        ~ScopedRegKey() {
+            if (h) RegCloseKey(h);
+        }
+    } class_guard{class_key};
+
+    struct RegDriverEntry {
+        std::uint32_t vendor_id = 0;
+        std::uint32_t device_id = 0;
+        std::string desc;
+        std::string driver_build;
+    };
+    std::vector<RegDriverEntry> entries;
+    for (DWORD idx = 0; idx < 64u; ++idx) {
+        char sub_name[64] = {};
+        DWORD sub_len = static_cast<DWORD>(sizeof(sub_name));
+        if (RegEnumKeyExA(class_key, idx, sub_name, &sub_len, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
+            break;
+        }
+        if (sub_len != 4 || sub_name[0] < '0' || sub_name[0] > '9') {
+            continue;
+        }
+        HKEY sub_key = nullptr;
+        if (RegOpenKeyExA(class_key, sub_name, 0, KEY_READ, &sub_key) != ERROR_SUCCESS || !sub_key) {
+            continue;
+        }
+        ScopedRegKey sub_guard{sub_key};
+        const std::string match_id = read_reg_sz_value(sub_key, "MatchingDeviceId");
+        std::uint32_t ven = 0;
+        std::uint32_t dev = 0;
+        if (!parse_ven_dev_from_pnp_id(match_id, ven, dev)) {
+            continue;
+        }
+        const std::string drv_ver = read_reg_sz_value(sub_key, "DriverVersion");
+        std::string rel_ver = read_reg_sz_value(sub_key, "RadeonSoftwareVersion");
+        if (rel_ver.empty()) {
+            rel_ver = read_reg_sz_value(sub_key, "ReleaseVersion");
+        }
+        const std::string build = format_driver_build_string(drv_ver, rel_ver);
+        if (build.empty()) {
+            continue;
+        }
+        RegDriverEntry e;
+        e.vendor_id = ven;
+        e.device_id = dev;
+        e.desc = read_reg_sz_value(sub_key, "DriverDesc");
+        e.driver_build = build;
+        entries.push_back(std::move(e));
+    }
+
+    for (auto& gpu : gpus) {
+        if (!gpu.driver_build.empty() || gpu.vendor_id == 0 || gpu.device_id == 0) continue;
+        for (const auto& e : entries) {
+            if (e.vendor_id == gpu.vendor_id && e.device_id == gpu.device_id) {
+                gpu.driver_build = e.driver_build;
+                break;
+            }
+        }
+    }
+}
+
+void enrich_win32_pcie_and_aspm(std::vector<GpuDeviceInfo>& gpus) {
+    if (gpus.empty()) return;
+
+    // 1. Windows PCIe link speed/width via cfgmgr32.dll (for non-NVIDIA or
+    //    any GPU missing PCIe readings).
+    ScopedLibrary cfgmgr(LoadLibraryExW(L"cfgmgr32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32));
+    if (cfgmgr.handle) {
+        struct DevPropKeyRaw {
+            GUID fmtid;
+            ULONG pid;
+        };
+        constexpr GUID kPciDevicePropGuid = {
+            0x3ab22e31u, 0x8264u, 0x4b4eu, {0x9au, 0xf5u, 0xa8u, 0xd2u, 0xd8u, 0xe3u, 0x3eu, 0x62u}};
+        constexpr DevPropKeyRaw kKeyCurrSpeed{kPciDevicePropGuid, 9u};
+        constexpr DevPropKeyRaw kKeyCurrWidth{kPciDevicePropGuid, 10u};
+        constexpr DevPropKeyRaw kKeyMaxSpeed{kPciDevicePropGuid, 11u};
+        constexpr DevPropKeyRaw kKeyMaxWidth{kPciDevicePropGuid, 12u};
+        constexpr ULONG kCmGetIdListFilterClass = 0x00000200u;
+        constexpr ULONG kCmGetIdListFilterPresent = 0x00000100u;
+        constexpr ULONG kDevPropTypeUint32 = 0x00000007u;
+
+        using GetListSizeFn = DWORD(WINAPI*)(ULONG*, const wchar_t*, ULONG);
+        using GetListFn = DWORD(WINAPI*)(const wchar_t*, wchar_t*, ULONG, ULONG);
+        using LocateFn = DWORD(WINAPI*)(DWORD*, wchar_t*, ULONG);
+        using GetPropFn = DWORD(WINAPI*)(DWORD, const DevPropKeyRaw*, ULONG*, BYTE*, ULONG*, ULONG);
+
+        GetListSizeFn get_list_size = nullptr;
+        GetListFn get_list = nullptr;
+        LocateFn locate = nullptr;
+        GetPropFn get_prop = nullptr;
+        if (load_win32_symbol(cfgmgr.handle, "CM_Get_Device_ID_List_SizeW", get_list_size) &&
+            load_win32_symbol(cfgmgr.handle, "CM_Get_Device_ID_ListW", get_list) &&
+            load_win32_symbol(cfgmgr.handle, "CM_Locate_DevNodeW", locate) &&
+            load_win32_symbol(cfgmgr.handle, "CM_Get_DevNode_PropertyW", get_prop)) {
+            const wchar_t* kDisplayGuid = L"{4d36e968-e325-11ce-bfc1-08002be10318}";
+            ULONG chars = 0;
+            if (get_list_size(&chars, kDisplayGuid, kCmGetIdListFilterClass | kCmGetIdListFilterPresent) == 0 &&
+                chars > 1u && chars < 65536u) {
+                std::vector<wchar_t> buf(chars, L'\0');
+                if (get_list(kDisplayGuid, buf.data(), chars, kCmGetIdListFilterClass | kCmGetIdListFilterPresent) ==
+                    0) {
+                    auto read_u32_prop = [&](DWORD dev_inst, const DevPropKeyRaw& key) -> std::optional<std::uint32_t> {
+                        ULONG prop_type = 0;
+                        std::uint32_t value = 0;
+                        ULONG sz = sizeof(value);
+                        if (get_prop(dev_inst, &key, &prop_type, reinterpret_cast<BYTE*>(&value), &sz, 0) == 0 &&
+                            prop_type == kDevPropTypeUint32 && sz == sizeof(value)) {
+                            return value;
+                        }
+                        return std::nullopt;
+                    };
+                    const wchar_t* cur = buf.data();
+                    const wchar_t* end = buf.data() + buf.size();
+                    while (cur < end && *cur != L'\0') {
+                        const std::size_t len = wcsnlen(cur, static_cast<std::size_t>(end - cur));
+                        std::wstring id_w(cur, len);
+                        cur += len + 1;
+                        const std::string id_u8 = utf8_from_wide(id_w.c_str(), id_w.size());
+                        std::uint32_t ven = 0;
+                        std::uint32_t dev = 0;
+                        if (!parse_ven_dev_from_pnp_id(id_u8, ven, dev)) {
+                            continue;
+                        }
+                        DWORD dev_inst = 0;
+                        if (locate(&dev_inst, id_w.data(), 0) != 0) {
+                            continue;
+                        }
+                        const auto cgen = read_u32_prop(dev_inst, kKeyCurrSpeed);
+                        const auto cwid = read_u32_prop(dev_inst, kKeyCurrWidth);
+                        const auto mgen = read_u32_prop(dev_inst, kKeyMaxSpeed);
+                        const auto mwid = read_u32_prop(dev_inst, kKeyMaxWidth);
+                        for (auto& gpu : gpus) {
+                            if (gpu.vendor_id != ven || gpu.device_id != dev) continue;
+                            if (gpu.pcie.current_gen && gpu.pcie.current_width && gpu.pcie.max_gen &&
+                                gpu.pcie.max_width) {
+                                continue;
+                            }
+                            if (!gpu.pcie.current_gen && cgen && *cgen >= 1u && *cgen <= 6u) {
+                                gpu.pcie.current_gen = *cgen;
+                            }
+                            if (!gpu.pcie.current_width && cwid && *cwid >= 1u && *cwid <= 32u) {
+                                gpu.pcie.current_width = *cwid;
+                            }
+                            if (!gpu.pcie.max_gen && mgen && *mgen >= 1u && *mgen <= 6u) {
+                                gpu.pcie.max_gen = *mgen;
+                            }
+                            if (!gpu.pcie.max_width && mwid && *mwid >= 1u && *mwid <= 32u) {
+                                gpu.pcie.max_width = *mwid;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Active Windows power-plan PCIe Link State Power Management (ASPM).
+    ScopedLibrary powrprof(LoadLibraryExW(L"powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32));
+    if (powrprof.handle) {
+        using GetActiveSchemeFn = DWORD(WINAPI*)(HKEY, GUID**);
+        using ReadValueIdxFn = DWORD(WINAPI*)(HKEY, const GUID*, const GUID*, const GUID*, DWORD*);
+        GetActiveSchemeFn get_scheme = nullptr;
+        ReadValueIdxFn read_ac = nullptr;
+        ReadValueIdxFn read_dc = nullptr;
+        if (load_win32_symbol(powrprof.handle, "PowerGetActiveScheme", get_scheme) &&
+            load_win32_symbol(powrprof.handle, "PowerReadACValueIndex", read_ac)) {
+            (void)load_win32_symbol(powrprof.handle, "PowerReadDCValueIndex", read_dc);
+            GUID* active_scheme = nullptr;
+            if (get_scheme(nullptr, &active_scheme) == ERROR_SUCCESS && active_scheme) {
+                struct ScopedLocalGuid {
+                    GUID* p = nullptr;
+                    ~ScopedLocalGuid() {
+                        if (p) LocalFree(p);
+                    }
+                } scheme_guard{active_scheme};
+
+                constexpr GUID kSubgroupPciExpress = {
+                    0x501a4d13u, 0x42afu, 0x4429u, {0x9fu, 0xd1u, 0xa8u, 0x21u, 0x8cu, 0x26u, 0x8eu, 0x20u}};
+                constexpr GUID kSettingAspmPolicy = {
+                    0xee12f906u, 0xd277u, 0x404bu, {0xb6u, 0xdau, 0xe5u, 0xfau, 0x1au, 0x57u, 0x6du, 0xf5u}};
+
+                bool on_dc = false;
+                SYSTEM_POWER_STATUS sps{};
+                if (GetSystemPowerStatus(&sps) && sps.ACLineStatus == 0) {
+                    on_dc = true;
+                }
+                DWORD policy_idx = 0xFFFFFFFFu;
+                const DWORD rc =
+                    (on_dc && read_dc)
+                        ? read_dc(nullptr, active_scheme, &kSubgroupPciExpress, &kSettingAspmPolicy, &policy_idx)
+                        : read_ac(nullptr, active_scheme, &kSubgroupPciExpress, &kSettingAspmPolicy, &policy_idx);
+                if (rc == ERROR_SUCCESS) {
+                    const std::string_view aspm = windows_aspm_policy_name(policy_idx);
+                    if (!aspm.empty()) {
+                        for (auto& gpu : gpus) {
+                            if (gpu.pcie.aspm_state.empty()) {
+                                gpu.pcie.aspm_state = std::string(aspm);
+                                gpu.pcie.aspm_source = "windows_power_plan";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 std::vector<GpuDeviceInfo> live_gpu_devices() {
     std::vector<GpuDeviceInfo> gpus;
+    std::vector<VkProbeAdapterLuid> adapter_luids;
     const bool hip_sdk_available = detect_windows_hip_sdk();
     const auto hip_vis = read_win32_env_utf8("HIP_VISIBLE_DEVICES");
     const auto rocr_vis = read_win32_env_utf8("ROCR_VISIBLE_DEVICES");
@@ -746,6 +1595,13 @@ std::vector<GpuDeviceInfo> live_gpu_devices() {
                             }
                         }
                     }
+                    VkProbeAdapterLuid luid;
+                    luid.valid = (desc.AdapterLuid.LowPart != 0 || desc.AdapterLuid.HighPart != 0);
+                    if (luid.valid) {
+                        static_assert(sizeof(desc.AdapterLuid) == 8u);
+                        std::memcpy(luid.bytes, &desc.AdapterLuid, 8u);
+                    }
+                    adapter_luids.push_back(luid);
                     gpus.push_back(std::move(info));
                 }
             }
@@ -756,6 +1612,10 @@ std::vector<GpuDeviceInfo> live_gpu_devices() {
     // GPUs that DXGI does not enumerate, even when a WDDM NVIDIA card is present.
     const auto nvml_gpus = enumerate_win32_nvml_devices();
     merge_win32_nvml_devices(gpus, nvml_gpus);
+    adapter_luids.resize(gpus.size());
+    enrich_win32_registry_drivers(gpus);
+    enrich_gpus_with_vulkan(gpus, adapter_luids);
+    enrich_win32_pcie_and_aspm(gpus);
     for (std::size_t i = 0; i < gpus.size(); ++i) {
         gpus[i].id = "gpu:" + std::to_string(i);
     }
@@ -942,6 +1802,11 @@ void append_nvml_gpu_devices(std::vector<GpuDeviceInfo>& gpus) {
     NvmlReturn (*nvml_get_name)(NvmlDevice, char*, unsigned int) = nullptr;
     NvmlReturn (*nvml_get_memory)(NvmlDevice, NvmlMemory*) = nullptr;
     NvmlReturn (*nvml_get_pci)(NvmlDevice, NvmlPciInfo*) = nullptr;
+    NvmlReturn (*nvml_sys_driver_ver)(char*, unsigned int) = nullptr;
+    NvmlReturn (*nvml_curr_pcie_gen)(NvmlDevice, unsigned int*) = nullptr;
+    NvmlReturn (*nvml_curr_pcie_width)(NvmlDevice, unsigned int*) = nullptr;
+    NvmlReturn (*nvml_max_pcie_gen)(NvmlDevice, unsigned int*) = nullptr;
+    NvmlReturn (*nvml_max_pcie_width)(NvmlDevice, unsigned int*) = nullptr;
 
     if (!load_dl_symbol(lib.handle, "nvmlInit_v2", nvml_init) ||
         !load_dl_symbol(lib.handle, "nvmlShutdown", nvml_shutdown) ||
@@ -954,6 +1819,11 @@ void append_nvml_gpu_devices(std::vector<GpuDeviceInfo>& gpus) {
     if (!load_dl_symbol(lib.handle, "nvmlDeviceGetPciInfo_v3", nvml_get_pci)) {
         (void)load_dl_symbol(lib.handle, "nvmlDeviceGetPciInfo", nvml_get_pci);
     }
+    (void)load_dl_symbol(lib.handle, "nvmlSystemGetDriverVersion", nvml_sys_driver_ver);
+    (void)load_dl_symbol(lib.handle, "nvmlDeviceGetCurrPcieLinkGeneration", nvml_curr_pcie_gen);
+    (void)load_dl_symbol(lib.handle, "nvmlDeviceGetCurrPcieLinkWidth", nvml_curr_pcie_width);
+    (void)load_dl_symbol(lib.handle, "nvmlDeviceGetMaxPcieLinkGeneration", nvml_max_pcie_gen);
+    (void)load_dl_symbol(lib.handle, "nvmlDeviceGetMaxPcieLinkWidth", nvml_max_pcie_width);
 
     if (nvml_init() != kNvmlSuccess) {
         return;
@@ -969,6 +1839,15 @@ void append_nvml_gpu_devices(std::vector<GpuDeviceInfo>& gpus) {
         ScopedNvml& operator=(const ScopedNvml&) = delete;
         explicit ScopedNvml(NvmlReturn (*fn)()) noexcept : shutdown(fn) {}
     } nvml_guard(nvml_shutdown);
+
+    std::string nvml_driver_build;
+    if (nvml_sys_driver_ver) {
+        char drv_buf[96] = {};
+        if (nvml_sys_driver_ver(drv_buf, static_cast<unsigned int>(sizeof(drv_buf))) == kNvmlSuccess) {
+            drv_buf[sizeof(drv_buf) - 1] = '\0';
+            nvml_driver_build = sanitize_driver_build_string(drv_buf);
+        }
+    }
 
     unsigned int count = 0;
     if (nvml_get_count(&count) != kNvmlSuccess || count == 0) {
@@ -996,7 +1875,30 @@ void append_nvml_gpu_devices(std::vector<GpuDeviceInfo>& gpus) {
             NvmlPciInfo pci{};
             if (nvml_get_pci(device, &pci) == kNvmlSuccess) {
                 info.device_id = static_cast<std::uint32_t>(pci.pci_device_id >> 16);
+                pci.bus_id[sizeof(pci.bus_id) - 1] = '\0';
+                info.pci_bus_id = trim(pci.bus_id);
             }
+        }
+        if (!nvml_driver_build.empty()) {
+            info.driver_name = "NVIDIA";
+            info.driver_build = nvml_driver_build;
+        }
+        unsigned int pcie_val = 0;
+        if (nvml_curr_pcie_gen && nvml_curr_pcie_gen(device, &pcie_val) == kNvmlSuccess && pcie_val >= 1u &&
+            pcie_val <= 6u) {
+            info.pcie.current_gen = pcie_val;
+        }
+        if (nvml_curr_pcie_width && nvml_curr_pcie_width(device, &pcie_val) == kNvmlSuccess && pcie_val >= 1u &&
+            pcie_val <= 32u) {
+            info.pcie.current_width = pcie_val;
+        }
+        if (nvml_max_pcie_gen && nvml_max_pcie_gen(device, &pcie_val) == kNvmlSuccess && pcie_val >= 1u &&
+            pcie_val <= 6u) {
+            info.pcie.max_gen = pcie_val;
+        }
+        if (nvml_max_pcie_width && nvml_max_pcie_width(device, &pcie_val) == kNvmlSuccess && pcie_val >= 1u &&
+            pcie_val <= 32u) {
+            info.pcie.max_width = pcie_val;
         }
         NvmlMemory mem{};
         if (nvml_get_memory(device, &mem) == kNvmlSuccess) {
@@ -1018,6 +1920,7 @@ std::vector<GpuDeviceInfo> live_gpu_devices() {
     std::vector<GpuDeviceInfo> gpus;
     append_amdgpu_sysfs_devices(gpus);
     append_nvml_gpu_devices(gpus);
+    enrich_gpus_with_vulkan(gpus, {});
     for (std::size_t i = 0; i < gpus.size(); ++i) {
         gpus[i].id = "gpu:" + std::to_string(i);
     }
@@ -1270,13 +2173,31 @@ void merge_win32_nvml_devices(std::vector<GpuDeviceInfo>& gpus, const std::vecto
                 continue;
             }
             const bool same_bus = !nv.pci_bus_id.empty() && !gpus[i].pci_bus_id.empty() &&
-                                  iequals(nv.pci_bus_id, gpus[i].pci_bus_id);
+                                  normalize_pci_bus_id(nv.pci_bus_id) == normalize_pci_bus_id(gpus[i].pci_bus_id);
             const bool same_dev = (nv.device_id != 0 && gpus[i].device_id == nv.device_id);
             const bool same_name = !nv.name.empty() && iequals(nv.name, gpus[i].name);
             if (same_bus || same_dev || same_name) {
                 dxgi_matched[i] = true;
                 if (gpus[i].pci_bus_id.empty() && !nv.pci_bus_id.empty()) {
                     gpus[i].pci_bus_id = nv.pci_bus_id;
+                }
+                if (gpus[i].driver_name.empty() && !nv.driver_name.empty()) {
+                    gpus[i].driver_name = nv.driver_name;
+                }
+                if (gpus[i].driver_build.empty() && !nv.driver_build.empty()) {
+                    gpus[i].driver_build = nv.driver_build;
+                }
+                if (!gpus[i].pcie.current_gen && nv.pcie.current_gen) {
+                    gpus[i].pcie.current_gen = nv.pcie.current_gen;
+                }
+                if (!gpus[i].pcie.current_width && nv.pcie.current_width) {
+                    gpus[i].pcie.current_width = nv.pcie.current_width;
+                }
+                if (!gpus[i].pcie.max_gen && nv.pcie.max_gen) {
+                    gpus[i].pcie.max_gen = nv.pcie.max_gen;
+                }
+                if (!gpus[i].pcie.max_width && nv.pcie.max_width) {
+                    gpus[i].pcie.max_width = nv.pcie.max_width;
                 }
                 matched = true;
                 break;
@@ -1349,6 +2270,7 @@ std::optional<GpuDeviceInfo> parse_amdgpu_sysfs_device(std::string_view card_id,
     }
 
     std::uint32_t uevent_device_id = 0;
+    std::string uevent_pci_slot;
     if (const auto uevent = read_file(dev_dir + "/uevent")) {
         std::size_t pos = 0;
         const std::string_view text(*uevent);
@@ -1369,6 +2291,8 @@ std::optional<GpuDeviceInfo> parse_amdgpu_sysfs_device(std::string_view card_id,
                         uevent_device_id = *parsed;
                     }
                 }
+            } else if (line.size() > 14 && line.substr(0, 14) == "PCI_SLOT_NAME=") {
+                uevent_pci_slot = sanitize_driver_build_string(line.substr(14));
             }
         }
     }
@@ -1442,6 +2366,51 @@ std::optional<GpuDeviceInfo> parse_amdgpu_sysfs_device(std::string_view card_id,
         info.dedicated_free = MemoryReading::known(saturating_add(vram_free, gtt_free));
     }
 
+    if (!uevent_pci_slot.empty()) {
+        info.pci_bus_id = std::move(uevent_pci_slot);
+    }
+    info.driver_name = "amdgpu";
+    if (const auto drv_ver = read_file("/sys/module/amdgpu/version")) {
+        info.driver_build = sanitize_driver_build_string(*drv_ver);
+    }
+    if (const auto speed = read_file(dev_dir + "/current_link_speed")) {
+        info.pcie.current_gen = parse_pcie_link_speed_gen(*speed);
+    }
+    if (const auto width = read_file(dev_dir + "/current_link_width")) {
+        if (const auto w = parse_sysfs_u64(*width); w && *w >= 1u && *w <= 32u) {
+            info.pcie.current_width = static_cast<std::uint32_t>(*w);
+        }
+    }
+    if (const auto speed = read_file(dev_dir + "/max_link_speed")) {
+        info.pcie.max_gen = parse_pcie_link_speed_gen(*speed);
+    }
+    if (const auto width = read_file(dev_dir + "/max_link_width")) {
+        if (const auto w = parse_sysfs_u64(*width); w && *w >= 1u && *w <= 32u) {
+            info.pcie.max_width = static_cast<std::uint32_t>(*w);
+        }
+    }
+    auto read_sysfs_bool = [&](const std::string& path) -> std::optional<bool> {
+        if (const auto text = read_file(path)) {
+            const std::string_view v = trim_view(*text);
+            if (v == "0") return false;
+            if (v == "1") return true;
+        }
+        return std::nullopt;
+    };
+    const std::string link_aspm = format_linux_link_aspm(
+        read_sysfs_bool(dev_dir + "/link/l0s_aspm"), read_sysfs_bool(dev_dir + "/link/l1_aspm"),
+        read_sysfs_bool(dev_dir + "/link/l1_1_aspm"), read_sysfs_bool(dev_dir + "/link/l1_2_aspm"));
+    if (!link_aspm.empty()) {
+        info.pcie.aspm_state = link_aspm;
+        info.pcie.aspm_source = "linux_sysfs_link";
+    } else if (const auto policy = read_file("/sys/module/pcie_aspm/parameters/policy")) {
+        const std::string pol = parse_linux_aspm_policy(*policy);
+        if (!pol.empty()) {
+            info.pcie.aspm_state = pol;
+            info.pcie.aspm_source = "linux_pcie_aspm_policy";
+        }
+    }
+
     info.backend_hint = rocm_available ? "rocm" : "vulkan";
     info.source = "amdgpu-sysfs";
     return info;
@@ -1450,7 +2419,12 @@ std::optional<GpuDeviceInfo> parse_amdgpu_sysfs_device(std::string_view card_id,
 std::vector<GpuDeviceInfo> enumerate_gpu_devices() {
     static std::mutex probe_mutex;
     std::lock_guard<std::mutex> lock(probe_mutex);
-    return live_gpu_devices();
+    std::vector<GpuDeviceInfo> gpus = live_gpu_devices();
+    const auto ggml_devices = registered_ggml_device_telemetry();
+    if (!ggml_devices.empty()) {
+        merge_ggml_device_telemetry(gpus, ggml_devices);
+    }
+    return gpus;
 }
 
 std::optional<std::uint64_t> gpu_effective_vram_mib(const GpuDeviceInfo& gpu, bool prefer_free) noexcept {
@@ -1784,6 +2758,408 @@ std::string host_name() {
     }
     return "unknown-host";
 #endif
+}
+
+namespace {
+
+std::optional<bool> parse_bit_bool(std::string_view sv) noexcept {
+    sv = trim_view(sv);
+    if (sv == "0") return false;
+    if (sv == "1") return true;
+    return std::nullopt;
+}
+
+}  // namespace
+
+std::string sanitize_driver_build_string(std::string_view raw) {
+    constexpr std::size_t kMaxLen = 256u;
+    std::string out;
+    out.reserve(std::min(raw.size(), kMaxLen));
+    for (const char c : raw) {
+        const auto u = static_cast<unsigned char>(c);
+        if (u < 0x20u || u == 0x7Fu) {
+            continue;
+        }
+        out.push_back(c);
+        if (out.size() >= kMaxLen) {
+            break;
+        }
+    }
+    return trim(std::move(out));
+}
+
+std::string format_driver_build_string(std::string_view driver_version, std::string_view release_version,
+                                       std::string_view vulkan_driver_info) {
+    const std::string drv = sanitize_driver_build_string(driver_version);
+    const std::string rel = sanitize_driver_build_string(release_version);
+    const std::string vk = sanitize_driver_build_string(vulkan_driver_info);
+    if (!rel.empty() && !drv.empty()) {
+        if (rel.find(drv) != std::string::npos) return rel;
+        if (drv.find(rel) != std::string::npos) return drv;
+        return sanitize_driver_build_string(rel + " (" + drv + ")");
+    }
+    if (!drv.empty()) return drv;
+    if (!rel.empty()) return rel;
+    return vk;
+}
+
+std::optional<GgmlDeviceTelemetry> parse_ggml_device_line(std::string_view line) {
+    if (line.empty() || line.size() > 4096u || line.find('\0') != std::string_view::npos) {
+        return std::nullopt;
+    }
+    const std::string_view trimmed = trim_view(line);
+    if (trimmed.empty()) {
+        return std::nullopt;
+    }
+    constexpr std::string_view kVkPrefix = "ggml_vulkan:";
+    const std::size_t prefix_pos = trimmed.find(kVkPrefix);
+    if (prefix_pos == std::string_view::npos) {
+        return std::nullopt;
+    }
+    const std::string_view body = trim_view(trimmed.substr(prefix_pos + kVkPrefix.size()));
+    if (body.empty()) {
+        return std::nullopt;
+    }
+
+    // Split on '|': segment 0 is `<index> = <device name> (<driver name>)`,
+    // followed by one or more `key: value` capability fields.
+    std::vector<std::string_view> parts;
+    std::size_t pos = 0;
+    while (pos <= body.size()) {
+        const std::size_t bar = body.find('|', pos);
+        const std::string_view seg =
+            trim_view(body.substr(pos, bar == std::string_view::npos ? std::string_view::npos : bar - pos));
+        if (!seg.empty()) {
+            parts.push_back(seg);
+        }
+        if (bar == std::string_view::npos) break;
+        pos = bar + 1;
+    }
+    if (parts.size() < 2u) {
+        return std::nullopt;
+    }
+
+    const std::string_view head = parts[0];
+    const std::size_t eq = head.find('=');
+    if (eq == std::string_view::npos) {
+        return std::nullopt;
+    }
+    const auto idx = parse_strict_u64(trim_view(head.substr(0, eq)));
+    if (!idx || *idx > std::numeric_limits<std::uint32_t>::max()) {
+        return std::nullopt;
+    }
+    std::string_view name_and_driver = trim_view(head.substr(eq + 1));
+    if (name_and_driver.empty()) {
+        return std::nullopt;
+    }
+
+    GgmlDeviceTelemetry out;
+    out.backend = "vulkan";
+    out.index = static_cast<std::uint32_t>(*idx);
+
+    // Split trailing ` (<driver>)` using the last ` (` so names with embedded
+    // parentheticals like `AMD Radeon(TM) 780M Graphics (AMD proprietary driver)`
+    // keep `(TM)` intact.
+    if (name_and_driver.back() == ')') {
+        const std::size_t open = name_and_driver.rfind(" (");
+        if (open != std::string_view::npos && open > 0) {
+            const std::string_view dev_part = trim_view(name_and_driver.substr(0, open));
+            const std::string_view drv_part =
+                trim_view(name_and_driver.substr(open + 2, name_and_driver.size() - open - 3));
+            if (!dev_part.empty()) {
+                out.device_name = sanitize_driver_build_string(dev_part);
+                out.driver_name = sanitize_driver_build_string(drv_part);
+            }
+        }
+    }
+    if (out.device_name.empty()) {
+        out.device_name = sanitize_driver_build_string(name_and_driver);
+    }
+    if (out.device_name.empty()) {
+        return std::nullopt;
+    }
+
+    bool any_recognized = false;
+    for (std::size_t i = 1; i < parts.size(); ++i) {
+        const std::size_t colon = parts[i].find(':');
+        if (colon == std::string_view::npos) {
+            return std::nullopt;
+        }
+        const std::string_view key = trim_view(parts[i].substr(0, colon));
+        const std::string_view val = trim_view(parts[i].substr(colon + 1));
+        if (key.empty() || val.empty()) {
+            return std::nullopt;
+        }
+        if (iequals(key, "uma")) {
+            const auto b = parse_bit_bool(val);
+            if (!b) return std::nullopt;
+            out.uma = *b;
+            any_recognized = true;
+        } else if (iequals(key, "rebar")) {
+            const auto b = parse_bit_bool(val);
+            if (!b) return std::nullopt;
+            out.rebar = *b;
+            any_recognized = true;
+        } else if (iequals(key, "fp16")) {
+            out.fp16 = sanitize_driver_build_string(val);
+            if (out.fp16.empty()) return std::nullopt;
+            any_recognized = true;
+        } else if (iequals(key, "bf16")) {
+            const auto b = parse_bit_bool(val);
+            if (!b) return std::nullopt;
+            out.bf16 = *b;
+            any_recognized = true;
+        } else if (iequals(key, "fp4")) {
+            const auto b = parse_bit_bool(val);
+            if (!b) return std::nullopt;
+            out.fp4 = *b;
+            any_recognized = true;
+        } else if (iequals(key, "warp size")) {
+            const auto w = parse_strict_u64(val);
+            if (!w || *w == 0 || *w > std::numeric_limits<std::uint32_t>::max()) return std::nullopt;
+            out.warp_size = static_cast<std::uint32_t>(*w);
+            any_recognized = true;
+        } else if (iequals(key, "shared memory")) {
+            const auto s = parse_strict_u64(val);
+            if (!s) return std::nullopt;
+            out.shared_memory_bytes = *s;
+            any_recognized = true;
+        } else if (iequals(key, "int dot")) {
+            const auto b = parse_bit_bool(val);
+            if (!b) return std::nullopt;
+            out.int_dot = *b;
+            any_recognized = true;
+        } else if (iequals(key, "matrix cores")) {
+            out.matrix_cores = sanitize_driver_build_string(val);
+            if (out.matrix_cores.empty()) return std::nullopt;
+            any_recognized = true;
+        }
+    }
+    if (!any_recognized) {
+        return std::nullopt;
+    }
+    out.raw_line = std::string(trimmed.substr(0, std::min<std::size_t>(trimmed.size(), 1024u)));
+    return out;
+}
+
+void apply_ggml_device_telemetry(GpuDeviceInfo& gpu, const GgmlDeviceTelemetry& ggml) {
+    gpu.ggml_device = ggml;
+    if (!ggml.driver_name.empty()) {
+        gpu.driver_name = ggml.driver_name;
+    }
+    if (ggml.rebar.has_value()) {
+        gpu.rebar = ggml.rebar;
+    }
+    if (ggml.shared_memory_bytes.has_value()) {
+        gpu.shared_memory_bytes = ggml.shared_memory_bytes;
+    }
+    if (ggml.warp_size.has_value()) {
+        gpu.warp_size = ggml.warp_size;
+    }
+    if (!ggml.matrix_cores.empty()) {
+        gpu.matrix_cores = ggml.matrix_cores;
+    }
+}
+
+namespace {
+
+struct CoreGgmlDeviceRegistry {
+    static constexpr std::size_t kMaxEntries = 64u;
+    std::mutex mu;
+    std::vector<GgmlDeviceTelemetry> entries;
+};
+
+CoreGgmlDeviceRegistry& core_ggml_registry() {
+    static CoreGgmlDeviceRegistry reg;
+    return reg;
+}
+
+}  // namespace
+
+void register_ggml_device_telemetry(const GgmlDeviceTelemetry& entry) {
+    if (entry.backend.empty() || entry.device_name.empty()) {
+        return;
+    }
+    auto& reg = core_ggml_registry();
+    std::lock_guard<std::mutex> lock(reg.mu);
+    for (auto& existing : reg.entries) {
+        if (existing.backend == entry.backend && existing.index == entry.index &&
+            existing.device_name == entry.device_name) {
+            existing = entry;
+            return;
+        }
+    }
+    if (reg.entries.size() < CoreGgmlDeviceRegistry::kMaxEntries) {
+        reg.entries.push_back(entry);
+    }
+}
+
+std::vector<GgmlDeviceTelemetry> registered_ggml_device_telemetry() {
+    auto& reg = core_ggml_registry();
+    std::lock_guard<std::mutex> lock(reg.mu);
+    return reg.entries;
+}
+
+void clear_registered_ggml_device_telemetry() noexcept {
+    auto& reg = core_ggml_registry();
+    std::lock_guard<std::mutex> lock(reg.mu);
+    reg.entries.clear();
+}
+
+void merge_ggml_device_telemetry(std::vector<GpuDeviceInfo>& gpus,
+                                 const std::vector<GgmlDeviceTelemetry>& ggml_devices) {
+    if (gpus.empty() || ggml_devices.empty()) {
+        return;
+    }
+    std::vector<bool> matched_gpu(gpus.size(), false);
+    for (const auto& ggml : ggml_devices) {
+        std::optional<std::size_t> target;
+        // 1. Exact case-insensitive device name match.
+        if (!ggml.device_name.empty()) {
+            for (std::size_t i = 0; i < gpus.size(); ++i) {
+                if (!matched_gpu[i] && iequals(gpus[i].name, ggml.device_name)) {
+                    target = i;
+                    break;
+                }
+            }
+        }
+        // 2. Substring device name match (e.g. "AMD Radeon RX 9060 XT" vs
+        //    "AMD Radeon RX 9060 XT (RADV ...)" or trimmed suffix).
+        if (!target && !ggml.device_name.empty()) {
+            std::string ggml_lower;
+            ggml_lower.reserve(ggml.device_name.size());
+            for (const char c : ggml.device_name) ggml_lower.push_back(ascii_tolower(c));
+            for (std::size_t i = 0; i < gpus.size(); ++i) {
+                if (matched_gpu[i] || gpus[i].name.empty()) continue;
+                std::string gpu_lower;
+                gpu_lower.reserve(gpus[i].name.size());
+                for (const char c : gpus[i].name) gpu_lower.push_back(ascii_tolower(c));
+                if (gpu_lower.find(ggml_lower) != std::string::npos ||
+                    ggml_lower.find(gpu_lower) != std::string::npos) {
+                    target = i;
+                    break;
+                }
+            }
+        }
+        // 3. Fallback to ggml device index when UMA flag agrees (or unset).
+        if (!target && ggml.index.has_value() && *ggml.index < gpus.size() && !matched_gpu[*ggml.index]) {
+            if (!ggml.uma.has_value() || *ggml.uma == gpus[*ggml.index].is_integrated_uma) {
+                target = *ggml.index;
+            }
+        }
+        if (target) {
+            matched_gpu[*target] = true;
+            apply_ggml_device_telemetry(gpus[*target], ggml);
+        }
+    }
+}
+
+std::optional<bool> classify_vulkan_rebar(const std::vector<VulkanMemoryHeapInfo>& heaps) noexcept {
+    for (const auto& h : heaps) {
+        if (h.device_local) {
+            return h.host_coherent;
+        }
+    }
+    return std::nullopt;
+}
+
+MemoryReading vulkan_device_local_budget_bytes(const std::vector<VulkanMemoryHeapInfo>& heaps) noexcept {
+    bool any = false;
+    std::uint64_t total = 0;
+    for (const auto& h : heaps) {
+        if (h.device_local && h.budget_bytes.is_known()) {
+            total = saturating_add(total, h.budget_bytes.bytes_or(0));
+            any = true;
+        }
+    }
+    return any ? MemoryReading::known(total) : MemoryReading::unknown();
+}
+
+MemoryReading vulkan_device_local_usage_bytes(const std::vector<VulkanMemoryHeapInfo>& heaps) noexcept {
+    bool any = false;
+    std::uint64_t total = 0;
+    for (const auto& h : heaps) {
+        if (h.device_local && h.usage_bytes.is_known()) {
+            total = saturating_add(total, h.usage_bytes.bytes_or(0));
+            any = true;
+        }
+    }
+    return any ? MemoryReading::known(total) : MemoryReading::unknown();
+}
+
+std::optional<std::uint32_t> parse_pcie_link_speed_gen(std::string_view speed_text) noexcept {
+    speed_text = trim_view(speed_text);
+    if (speed_text.empty() || speed_text.front() == '-') {
+        return std::nullopt;
+    }
+    std::size_t end = 0;
+    while (end < speed_text.size() && ((speed_text[end] >= '0' && speed_text[end] <= '9') || speed_text[end] == '.')) {
+        ++end;
+    }
+    if (end == 0) {
+        return std::nullopt;
+    }
+    const std::string_view num = speed_text.substr(0, end);
+    const std::string_view rest = trim_view(speed_text.substr(end));
+    if (!rest.empty() && !istarts_with(rest, "gt/s")) {
+        return std::nullopt;
+    }
+    if (num == "2.5") return 1u;
+    if (num == "5" || num == "5.0") return 2u;
+    if (num == "8" || num == "8.0") return 3u;
+    if (num == "16" || num == "16.0") return 4u;
+    if (num == "32" || num == "32.0") return 5u;
+    if (num == "64" || num == "64.0") return 6u;
+    return std::nullopt;
+}
+
+std::string parse_linux_aspm_policy(std::string_view policy_text) {
+    const std::size_t open = policy_text.find('[');
+    if (open == std::string_view::npos) {
+        return {};
+    }
+    const std::size_t close = policy_text.find(']', open + 1);
+    if (close == std::string_view::npos || policy_text.find('[', open + 1) != std::string_view::npos) {
+        return {};
+    }
+    const std::string_view token = trim_view(policy_text.substr(open + 1, close - open - 1));
+    if (token.empty() || token.size() > 32u) {
+        return {};
+    }
+    for (const char c : token) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+                        c == '-';
+        if (!ok) return {};
+    }
+    return std::string(token);
+}
+
+std::string format_linux_link_aspm(std::optional<bool> l0s, std::optional<bool> l1, std::optional<bool> l1_1,
+                                   std::optional<bool> l1_2) {
+    if (!l0s.has_value() && !l1.has_value() && !l1_1.has_value() && !l1_2.has_value()) {
+        return {};
+    }
+    std::string out;
+    auto add = [&](std::optional<bool> flag, const char* label) {
+        if (flag && *flag) {
+            if (!out.empty()) out.push_back('+');
+            out += label;
+        }
+    };
+    add(l0s, "l0s");
+    add(l1, "l1");
+    add(l1_1, "l1.1");
+    add(l1_2, "l1.2");
+    return out.empty() ? std::string("off") : out;
+}
+
+std::string_view windows_aspm_policy_name(std::uint32_t power_index) noexcept {
+    switch (power_index) {
+        case 0u: return "off";
+        case 1u: return "moderate";
+        case 2u: return "maximum";
+        default: return {};
+    }
 }
 
 }  // namespace sonder::inference

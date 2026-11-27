@@ -294,6 +294,13 @@ without the server module.
  "backend_hint":"cuda","source":"dxgi"}]}
 ```
 
+When available on the host, each GPU object in `devices --json` and `node --json`
+also carries additive device telemetry fields: `pci_bus_id`, `driver_name`,
+`driver_build`, `rebar`, `shared_memory_bytes`, `warp_size`, `matrix_cores`,
+`pcie` (`current_gen`, `current_width`, `max_gen`, `max_width`, `aspm_state`,
+`aspm_source`), `vulkan_heaps` (per-heap `VK_EXT_memory_budget` readings), and
+`ggml_device` (parsed ggml capability line). Unobserved fields are omitted.
+
 `node --json`:
 
 ```json

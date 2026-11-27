@@ -127,6 +127,51 @@ const char* to_string(GpuVendor vendor) noexcept;
 // 0x106B Apple). Compiled on all platforms for cross-platform testing.
 GpuVendor gpu_vendor_from_pci_id(std::uint32_t vendor_id) noexcept;
 
+// Per-heap Vulkan memory snapshot (VkPhysicalDeviceMemoryProperties2 +
+// VK_EXT_memory_budget when available).
+struct VulkanMemoryHeapInfo {
+    std::uint32_t heap_index = 0;
+    std::uint64_t size_bytes = 0;
+    MemoryReading budget_bytes;   // known when VK_EXT_memory_budget is supported
+    MemoryReading usage_bytes;    // known when VK_EXT_memory_budget is supported
+    bool device_local = false;    // VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
+    bool multi_instance = false;  // VK_MEMORY_HEAP_MULTI_INSTANCE_BIT
+    bool host_visible = false;    // any memory type on this heap has HOST_VISIBLE
+    bool host_coherent = false;   // any memory type on this heap has DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT
+};
+
+// Parsed ggml Vulkan (or accelerator) device capability line, e.g.:
+//   ggml_vulkan: 0 = AMD Radeon RX 9060 XT (AMD proprietary driver) | uma: 0 | rebar: 1 |
+//                fp16: 1 | bf16: 1 | fp4: 0 | warp size: 64 | shared memory: 32768 |
+//                int dot: 1 | matrix cores: KHR_coopmat
+// Pre-b12171 lines omit `rebar`, leaving `rebar` as std::nullopt.
+struct GgmlDeviceTelemetry {
+    std::string backend;                              // e.g. "vulkan"
+    std::optional<std::uint32_t> index;               // e.g. 0
+    std::string device_name;                          // e.g. "AMD Radeon RX 9060 XT"
+    std::string driver_name;                          // e.g. "AMD proprietary driver"
+    std::optional<bool> uma;                          // uma: 0|1
+    std::optional<bool> rebar;                        // rebar: 0|1 (absent before b12171)
+    std::string fp16;                                 // "0", "1", "dot2", or ""
+    std::optional<bool> bf16;                         // bf16: 0|1
+    std::optional<bool> fp4;                          // fp4: 0|1
+    std::optional<std::uint32_t> warp_size;           // subgroup / warp size
+    std::optional<std::uint64_t> shared_memory_bytes; // workgroup shared memory in bytes
+    std::optional<bool> int_dot;                      // int dot: 0|1
+    std::string matrix_cores;                         // "none", "KHR_coopmat", "NV_coopmat2", "NV_coopmat2v", or ""
+    std::string raw_line;                             // trimmed source line (bounded)
+};
+
+// PCIe link and ASPM telemetry for a GPU device. Unknown fields remain unset.
+struct PcieLinkTelemetry {
+    std::optional<std::uint32_t> current_gen;    // PCIe generation 1..6
+    std::optional<std::uint32_t> current_width;  // PCIe lane width (1..32)
+    std::optional<std::uint32_t> max_gen;        // max capable PCIe generation 1..6
+    std::optional<std::uint32_t> max_width;      // max capable lane width (1..32)
+    std::string aspm_state;                      // "off", "moderate", "maximum", "l0s", "l1", "l0s+l1", ...
+    std::string aspm_source;                     // "windows_power_plan", "linux_sysfs_link", "linux_pcie_aspm_policy"
+};
+
 struct GpuDeviceInfo {
     std::string id;                   // e.g. "gpu:0"
     std::string name;                 // human-readable adapter name
@@ -142,7 +187,42 @@ struct GpuDeviceInfo {
     std::string source;               // "dxgi", "amdgpu-sysfs", "nvml", etc.
     std::string pci_bus_id;           // optional PCI BDF (e.g. "0000:01:00.0")
     std::optional<std::size_t> rocm_runtime_ordinal;  // mapped ROCm/HIP ordinal after visibility masks
+    // Additive device telemetry (NAT-08; empty / nullopt when unavailable).
+    std::string driver_name;                          // e.g. "AMD proprietary driver", "NVIDIA", "radv"
+    std::string driver_build;                         // canonical driver build string (e.g. "25.10.2 (32.0.21025.1024)")
+    std::optional<bool> rebar;                        // true when VRAM heap is host-visible+coherent or ggml rebar:1
+    std::optional<std::uint64_t> shared_memory_bytes; // workgroup compute shared memory (bytes)
+    std::optional<std::uint32_t> warp_size;           // subgroup / warp size
+    std::string matrix_cores;                         // "KHR_coopmat", "NV_coopmat2", "NV_coopmat2v", "none", or ""
+    PcieLinkTelemetry pcie;                           // PCIe link gen/width and ASPM state
+    std::vector<VulkanMemoryHeapInfo> vulkan_heaps;   // per-heap Vulkan memory + VK_EXT_memory_budget
+    std::optional<GgmlDeviceTelemetry> ggml_device;   // parsed ggml device line when captured/merged
 };
+
+// Pure NAT-08 device-telemetry parsers and classifiers (compiled on all platforms).
+std::optional<GgmlDeviceTelemetry> parse_ggml_device_line(std::string_view line);
+void apply_ggml_device_telemetry(GpuDeviceInfo& gpu, const GgmlDeviceTelemetry& ggml);
+// Process-wide bounded registry of ggml device lines observed by in-process
+// backends (e.g. llama.cpp RouteLog). enumerate_gpu_devices() merges matching
+// entries onto GpuDeviceInfo so devices/node/health/device.memory.sample surface
+// ggml_device automatically without coupling core to optional backend modules.
+void register_ggml_device_telemetry(const GgmlDeviceTelemetry& entry);
+std::vector<GgmlDeviceTelemetry> registered_ggml_device_telemetry();
+void clear_registered_ggml_device_telemetry() noexcept;
+void merge_ggml_device_telemetry(std::vector<GpuDeviceInfo>& gpus,
+                                 const std::vector<GgmlDeviceTelemetry>& ggml_devices);
+std::optional<bool> classify_vulkan_rebar(const std::vector<VulkanMemoryHeapInfo>& heaps) noexcept;
+MemoryReading vulkan_device_local_budget_bytes(const std::vector<VulkanMemoryHeapInfo>& heaps) noexcept;
+MemoryReading vulkan_device_local_usage_bytes(const std::vector<VulkanMemoryHeapInfo>& heaps) noexcept;
+std::optional<std::uint32_t> parse_pcie_link_speed_gen(std::string_view speed_text) noexcept;
+std::string parse_linux_aspm_policy(std::string_view policy_text);
+std::string format_linux_link_aspm(std::optional<bool> l0s, std::optional<bool> l1,
+                                   std::optional<bool> l1_1 = std::nullopt,
+                                   std::optional<bool> l1_2 = std::nullopt);
+std::string_view windows_aspm_policy_name(std::uint32_t power_index) noexcept;
+std::string sanitize_driver_build_string(std::string_view raw);
+std::string format_driver_build_string(std::string_view driver_version, std::string_view release_version = {},
+                                       std::string_view vulkan_driver_info = {});
 
 // Pure Linux amdgpu sysfs parser (/sys/class/drm/<card_id>/device/*).
 // Compiled on all platforms so it is testable everywhere via an injected FileReader.

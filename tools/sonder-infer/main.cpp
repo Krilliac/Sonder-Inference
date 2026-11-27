@@ -114,7 +114,7 @@ std::string format_reading_mib(const si::MemoryReading& reading) {
 }
 
 si::json::Object gpu_to_json(const si::GpuDeviceInfo& g) {
-    return si::json::Object{
+    si::json::Object obj{
         {"id", g.id},
         {"name", g.name},
         {"vendor", si::to_string(g.vendor)},
@@ -128,6 +128,43 @@ si::json::Object gpu_to_json(const si::GpuDeviceInfo& g) {
         {"is_integrated_uma", g.is_integrated_uma},
         {"backend_hint", g.backend_hint},
         {"source", g.source}};
+    si::append_gpu_device_telemetry_json(obj, g);
+    return obj;
+}
+
+void print_gpu_line(const si::GpuDeviceInfo& g) {
+    std::cout << g.id << "  kind=gpu  vendor=" << si::to_string(g.vendor) << "  name=\"" << g.name << "\""
+              << "  dedicated_total_mib=" << format_reading_mib(g.dedicated_total)
+              << "  dedicated_free_mib=" << format_reading_mib(g.dedicated_free)
+              << "  shared_total_mib=" << format_reading_mib(g.shared_total)
+              << "  uma=" << (g.is_integrated_uma ? "true" : "false")
+              << "  backend_hint=" << (g.backend_hint.empty() ? "none" : g.backend_hint)
+              << "  source=" << (g.source.empty() ? "unknown" : g.source);
+    if (!g.driver_build.empty()) {
+        std::cout << "  driver_build=\"" << g.driver_build << "\"";
+    }
+    if (g.rebar.has_value()) {
+        std::cout << "  rebar=" << (*g.rebar ? "true" : "false");
+    }
+    if (!g.matrix_cores.empty()) {
+        std::cout << "  matrix_cores=" << g.matrix_cores;
+    }
+    if (g.pcie.current_gen.has_value() || g.pcie.current_width.has_value()) {
+        std::cout << "  pcie=";
+        if (g.pcie.current_gen.has_value()) {
+            std::cout << "gen" << *g.pcie.current_gen;
+        }
+        if (g.pcie.current_width.has_value()) {
+            std::cout << "x" << *g.pcie.current_width;
+        }
+    }
+    if (!g.pcie.aspm_state.empty()) {
+        std::cout << "  aspm=" << g.pcie.aspm_state;
+    }
+    if (!g.vulkan_heaps.empty()) {
+        std::cout << "  vk_heaps=" << g.vulkan_heaps.size();
+    }
+    std::cout << "\n";
 }
 
 int cmd_devices(const Args& a) {
@@ -161,13 +198,7 @@ int cmd_devices(const Args& a) {
                   << "  available_memory_mib=" << (d.available_memory_bytes >> 20) << "\n";
     }
     for (const auto& g : gpus) {
-        std::cout << g.id << "  kind=gpu  vendor=" << si::to_string(g.vendor) << "  name=\"" << g.name << "\""
-                  << "  dedicated_total_mib=" << format_reading_mib(g.dedicated_total)
-                  << "  dedicated_free_mib=" << format_reading_mib(g.dedicated_free)
-                  << "  shared_total_mib=" << format_reading_mib(g.shared_total)
-                  << "  uma=" << (g.is_integrated_uma ? "true" : "false")
-                  << "  backend_hint=" << (g.backend_hint.empty() ? "none" : g.backend_hint)
-                  << "  source=" << (g.source.empty() ? "unknown" : g.source) << "\n";
+        print_gpu_line(g);
     }
     std::cout << "platform=" << si::host_platform() << "\n";
     return cli::kExitOk;
@@ -252,13 +283,7 @@ int cmd_node(const Args& a) {
                   << "  available_memory_mib=" << (d.available_memory_bytes >> 20) << "\n";
     }
     for (const auto& g : gpus) {
-        std::cout << g.id << "  kind=gpu  vendor=" << si::to_string(g.vendor) << "  name=\"" << g.name << "\""
-                  << "  dedicated_total_mib=" << format_reading_mib(g.dedicated_total)
-                  << "  dedicated_free_mib=" << format_reading_mib(g.dedicated_free)
-                  << "  shared_total_mib=" << format_reading_mib(g.shared_total)
-                  << "  uma=" << (g.is_integrated_uma ? "true" : "false")
-                  << "  backend_hint=" << (g.backend_hint.empty() ? "none" : g.backend_hint)
-                  << "  source=" << (g.source.empty() ? "unknown" : g.source) << "\n";
+        print_gpu_line(g);
     }
     std::cout << "backends:";
     for (const auto& n : backend_names) std::cout << " " << n;

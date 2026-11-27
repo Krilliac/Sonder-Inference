@@ -38,6 +38,100 @@ const char* to_string(SchedulerMode mode) noexcept {
     return "unknown";
 }
 
+namespace {
+
+json::Value optional_reading_bytes_json(const MemoryReading& reading) {
+    if (!reading.is_known()) {
+        return json::Value(nullptr);
+    }
+    return json::Value(reading.bytes_or(0));
+}
+
+json::Value optional_u32_json(std::optional<std::uint32_t> v) {
+    return v ? json::Value(static_cast<std::uint64_t>(*v)) : json::Value(nullptr);
+}
+
+json::Value optional_u64_json_val(std::optional<std::uint64_t> v) {
+    return v ? json::Value(*v) : json::Value(nullptr);
+}
+
+json::Value optional_bool_json(std::optional<bool> v) {
+    return v ? json::Value(*v) : json::Value(nullptr);
+}
+
+json::Value optional_string_json(const std::string& s) {
+    return s.empty() ? json::Value(nullptr) : json::Value(s);
+}
+
+}  // namespace
+
+void append_gpu_device_telemetry_json(json::Object& out, const GpuDeviceInfo& gpu) {
+    if (!gpu.pci_bus_id.empty()) {
+        out.set("pci_bus_id", gpu.pci_bus_id);
+    }
+    if (!gpu.driver_name.empty()) {
+        out.set("driver_name", gpu.driver_name);
+    }
+    if (!gpu.driver_build.empty()) {
+        out.set("driver_build", gpu.driver_build);
+    }
+    if (gpu.rebar.has_value()) {
+        out.set("rebar", *gpu.rebar);
+    }
+    if (gpu.shared_memory_bytes.has_value()) {
+        out.set("shared_memory_bytes", *gpu.shared_memory_bytes);
+    }
+    if (gpu.warp_size.has_value()) {
+        out.set("warp_size", static_cast<std::uint64_t>(*gpu.warp_size));
+    }
+    if (!gpu.matrix_cores.empty()) {
+        out.set("matrix_cores", gpu.matrix_cores);
+    }
+    const bool has_pcie = gpu.pcie.current_gen.has_value() || gpu.pcie.current_width.has_value() ||
+                          gpu.pcie.max_gen.has_value() || gpu.pcie.max_width.has_value() ||
+                          !gpu.pcie.aspm_state.empty();
+    if (has_pcie) {
+        out.set("pcie", json::Object{{"current_gen", optional_u32_json(gpu.pcie.current_gen)},
+                                     {"current_width", optional_u32_json(gpu.pcie.current_width)},
+                                     {"max_gen", optional_u32_json(gpu.pcie.max_gen)},
+                                     {"max_width", optional_u32_json(gpu.pcie.max_width)},
+                                     {"aspm_state", optional_string_json(gpu.pcie.aspm_state)},
+                                     {"aspm_source", optional_string_json(gpu.pcie.aspm_source)}});
+    }
+    if (!gpu.vulkan_heaps.empty()) {
+        json::Array heaps;
+        heaps.reserve(gpu.vulkan_heaps.size());
+        for (const auto& h : gpu.vulkan_heaps) {
+            heaps.emplace_back(json::Object{{"heap_index", static_cast<std::uint64_t>(h.heap_index)},
+                                            {"size_bytes", h.size_bytes},
+                                            {"budget_bytes", optional_reading_bytes_json(h.budget_bytes)},
+                                            {"usage_bytes", optional_reading_bytes_json(h.usage_bytes)},
+                                            {"device_local", h.device_local},
+                                            {"multi_instance", h.multi_instance},
+                                            {"host_visible", h.host_visible},
+                                            {"host_coherent", h.host_coherent}});
+        }
+        out.set("vulkan_heaps", std::move(heaps));
+    }
+    if (gpu.ggml_device.has_value()) {
+        const auto& g = *gpu.ggml_device;
+        out.set("ggml_device",
+                json::Object{{"backend", g.backend},
+                             {"index", optional_u32_json(g.index)},
+                             {"device_name", g.device_name},
+                             {"driver_name", optional_string_json(g.driver_name)},
+                             {"uma", optional_bool_json(g.uma)},
+                             {"rebar", optional_bool_json(g.rebar)},
+                             {"fp16", optional_string_json(g.fp16)},
+                             {"bf16", optional_bool_json(g.bf16)},
+                             {"fp4", optional_bool_json(g.fp4)},
+                             {"warp_size", optional_u32_json(g.warp_size)},
+                             {"shared_memory_bytes", optional_u64_json_val(g.shared_memory_bytes)},
+                             {"int_dot", optional_bool_json(g.int_dot)},
+                             {"matrix_cores", optional_string_json(g.matrix_cores)}});
+    }
+}
+
 json::Object gpu_memory_sample_attributes(const GpuDeviceInfo& gpu) {
     json::Object attrs{{"kind", "gpu"},
                        {"name", gpu.name},
@@ -106,6 +200,7 @@ json::Object gpu_memory_sample_attributes(const GpuDeviceInfo& gpu) {
             attrs.set("effective_free_vram_mib", *effective_free_mib);
         }
     }
+    append_gpu_device_telemetry_json(attrs, gpu);
     return attrs;
 }
 

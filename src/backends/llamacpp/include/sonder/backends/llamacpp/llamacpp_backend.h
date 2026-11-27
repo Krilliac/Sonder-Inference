@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "sonder/inference/device.hpp"
 #include "sonder/inference/model_architecture.hpp"
 #include "sonder/inference/request_priority.hpp"
 #include "sonder/inference/speculative_verifier.hpp"
@@ -566,6 +567,7 @@ struct DeviceInfo {
     DeviceKind kind = DeviceKind::kOther;
     std::uint64_t memory_free_bytes = 0;
     std::uint64_t memory_total_bytes = 0;
+    std::optional<sonder::inference::GgmlDeviceTelemetry> telemetry;
 };
 
 [[nodiscard]] std::string_view ToString(DeviceKind kind) noexcept;
@@ -665,6 +667,10 @@ public:
     [[nodiscard]] static bool HasMtmdBuildSupport() noexcept;
     // Devices ggml can see in this build (CPU always; CUDA/Vulkan/Metal when compiled in).
     [[nodiscard]] static std::vector<DeviceInfo> EnumerateDevices();
+    // Parsed ggml device capability lines captured from llama.cpp/ggml log output
+    // (including DEBUG-level `ggml_vulkan:` lines when SONDER_LLAMACPP_VERBOSE is unset).
+    [[nodiscard]] static std::vector<sonder::inference::GgmlDeviceTelemetry> CapturedGgmlDevices();
+    static void ClearCapturedGgmlDevices() noexcept;
     // Checks each ggml device name (non-empty, registered in this build via
     // ggml_backend_dev_by_name, at most llama_max_devices()). On success,
     // `resolved` (if non-null) receives one opaque ggml_backend_dev_t per

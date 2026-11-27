@@ -776,3 +776,269 @@ TEST_CASE("shared match_single_gpu_hint and resolve_uma_selection unify GPU-hint
     CHECK(resolve_uma_mode("auto", hybrid, "Vulkan0,Vulkan1"));
     CHECK_FALSE(resolve_uma_mode("auto", hybrid, "Vulkan0"));
 }
+
+TEST_CASE("NAT-08: parse_ggml_device_line parses v1.0.0 with rebar, pre-b12171 without rebar, and rejects bad lines") {
+    // 1. v1.0.0 / b12171+ discrete RX 9060 XT line with rebar: 1 and KHR_coopmat.
+    const auto rx = parse_ggml_device_line(
+        "ggml_vulkan: 0 = AMD Radeon RX 9060 XT (AMD proprietary driver) | uma: 0 | rebar: 1 | "
+        "fp16: 1 | bf16: 1 | fp4: 0 | warp size: 64 | shared memory: 32768 | int dot: 1 | "
+        "matrix cores: KHR_coopmat\n");
+    REQUIRE(rx.has_value());
+    CHECK(rx->backend == "vulkan");
+    CHECK(rx->index == std::optional<std::uint32_t>(0u));
+    CHECK(rx->device_name == "AMD Radeon RX 9060 XT");
+    CHECK(rx->driver_name == "AMD proprietary driver");
+    CHECK(rx->uma == std::optional<bool>(false));
+    CHECK(rx->rebar == std::optional<bool>(true));
+    CHECK(rx->fp16 == "1");
+    CHECK(rx->bf16 == std::optional<bool>(true));
+    CHECK(rx->fp4 == std::optional<bool>(false));
+    CHECK(rx->warp_size == std::optional<std::uint32_t>(64u));
+    CHECK(rx->shared_memory_bytes == std::optional<std::uint64_t>(32768ull));
+    CHECK(rx->int_dot == std::optional<bool>(true));
+    CHECK(rx->matrix_cores == "KHR_coopmat");
+
+    // 2. Pre-b12171 line without `rebar:` leaves rebar unset (nullopt), never false.
+    const auto pre_b12171 = parse_ggml_device_line(
+        "ggml_vulkan: 1 = AMD Radeon(TM) 780M Graphics (AMD proprietary driver) | uma: 1 | "
+        "fp16: dot2 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 32768 | int dot: 1 | "
+        "matrix cores: none\r\n");
+    REQUIRE(pre_b12171.has_value());
+    CHECK(pre_b12171->index == std::optional<std::uint32_t>(1u));
+    CHECK(pre_b12171->device_name == "AMD Radeon(TM) 780M Graphics");
+    CHECK(pre_b12171->driver_name == "AMD proprietary driver");
+    CHECK(pre_b12171->uma == std::optional<bool>(true));
+    CHECK_FALSE(pre_b12171->rebar.has_value());
+    CHECK(pre_b12171->fp16 == "dot2");
+    CHECK(pre_b12171->bf16 == std::optional<bool>(false));
+    CHECK(pre_b12171->warp_size == std::optional<std::uint32_t>(32u));
+    CHECK(pre_b12171->shared_memory_bytes == std::optional<std::uint64_t>(32768ull));
+    CHECK(pre_b12171->matrix_cores == "none");
+
+    // 3. NVIDIA NV_coopmat2v with rebar: 0 and extra future fields is accepted.
+    const auto nv = parse_ggml_device_line(
+        "ggml_vulkan: 0 = NVIDIA GeForce RTX 5070 Ti (NVIDIA) | uma: 0 | rebar: 0 | "
+        "fp16: 1 | bf16: 1 | fp4: 1 | warp size: 32 | shared memory: 49152 | int dot: 1 | "
+        "matrix cores: NV_coopmat2v | future_flag: 42");
+    REQUIRE(nv.has_value());
+    CHECK(nv->rebar == std::optional<bool>(false));
+    CHECK(nv->fp4 == std::optional<bool>(true));
+    CHECK(nv->shared_memory_bytes == std::optional<std::uint64_t>(49152ull));
+    CHECK(nv->matrix_cores == "NV_coopmat2v");
+
+    // 4. apply_ggml_device_telemetry merges onto GpuDeviceInfo cleanly.
+    GpuDeviceInfo gpu;
+    gpu.id = "gpu:0";
+    gpu.name = "AMD Radeon RX 9060 XT";
+    apply_ggml_device_telemetry(gpu, *rx);
+    REQUIRE(gpu.ggml_device.has_value());
+    CHECK(gpu.driver_name == "AMD proprietary driver");
+    CHECK(gpu.rebar == std::optional<bool>(true));
+    CHECK(gpu.shared_memory_bytes == std::optional<std::uint64_t>(32768ull));
+    CHECK(gpu.warp_size == std::optional<std::uint32_t>(64u));
+    CHECK(gpu.matrix_cores == "KHR_coopmat");
+
+    // 5. Rejects unrelated, empty, malformed, negative, or non-device ggml_vulkan lines.
+    CHECK_FALSE(parse_ggml_device_line("").has_value());
+    CHECK_FALSE(parse_ggml_device_line("ggml_vulkan: Found 2 Vulkan devices:").has_value());
+    CHECK_FALSE(parse_ggml_device_line("ggml_vulkan: Warning: Device type is CPU.").has_value());
+    CHECK_FALSE(parse_ggml_device_line("ggml_vulkan: -1 = Bad | uma: 0 | shared memory: 32768").has_value());
+    CHECK_FALSE(parse_ggml_device_line("ggml_vulkan: 0 = | uma: 0").has_value());
+    CHECK_FALSE(parse_ggml_device_line("ggml_vulkan: 0 = Foo (Bar) | uma: 2").has_value());
+    CHECK_FALSE(parse_ggml_device_line("ggml_vulkan: 0 = Foo (Bar) | shared memory: -5").has_value());
+    CHECK_FALSE(parse_ggml_device_line("ggml_vulkan: 0 = Foo (Bar) | warp size: 99999999999999").has_value());
+    CHECK_FALSE(parse_ggml_device_line(std::string(5000u, 'a')).has_value());
+    CHECK_FALSE(parse_ggml_device_line(std::string_view("ggml_vulkan: 0 = Foo\0Bar | uma: 0", 31)).has_value());
+    CHECK_FALSE(parse_ggml_device_line("ggml_vulkan: 0 = Foo (Bar) | unknown_only: 1").has_value());
+}
+
+TEST_CASE("NAT-08: Vulkan heap ReBAR, memory budget, PCIe speed, ASPM, and driver build helpers") {
+    constexpr std::uint64_t kGiB = 1024ull * 1024ull * 1024ull;
+
+    // 1. Per-heap VK_EXT_memory_budget and ReBAR classification.
+    VulkanMemoryHeapInfo vram_rebar;
+    vram_rebar.heap_index = 0;
+    vram_rebar.size_bytes = 16ull * kGiB;
+    vram_rebar.budget_bytes = MemoryReading::known(15ull * kGiB);
+    vram_rebar.usage_bytes = MemoryReading::known(1ull * kGiB);
+    vram_rebar.device_local = true;
+    vram_rebar.host_visible = true;
+    vram_rebar.host_coherent = true;
+
+    VulkanMemoryHeapInfo host_heap;
+    host_heap.heap_index = 1;
+    host_heap.size_bytes = 24ull * kGiB;
+    host_heap.budget_bytes = MemoryReading::known(20ull * kGiB);
+    host_heap.usage_bytes = MemoryReading::known(2ull * kGiB);
+    host_heap.device_local = false;
+    host_heap.host_visible = true;
+    host_heap.host_coherent = false;
+
+    CHECK(classify_vulkan_rebar({vram_rebar, host_heap}) == std::optional<bool>(true));
+    CHECK(vulkan_device_local_budget_bytes({vram_rebar, host_heap}) == MemoryReading::known(15ull * kGiB));
+    CHECK(vulkan_device_local_usage_bytes({vram_rebar, host_heap}) == MemoryReading::known(1ull * kGiB));
+
+    VulkanMemoryHeapInfo vram_no_rebar = vram_rebar;
+    vram_no_rebar.host_visible = false;
+    vram_no_rebar.host_coherent = false;
+    vram_no_rebar.budget_bytes = MemoryReading::unknown();
+    vram_no_rebar.usage_bytes = MemoryReading::unknown();
+    CHECK(classify_vulkan_rebar({vram_no_rebar, host_heap}) == std::optional<bool>(false));
+    CHECK_FALSE(vulkan_device_local_budget_bytes({vram_no_rebar, host_heap}).is_known());
+    CHECK_FALSE(vulkan_device_local_usage_bytes({vram_no_rebar, host_heap}).is_known());
+    CHECK_FALSE(classify_vulkan_rebar({}).has_value());
+    CHECK_FALSE(classify_vulkan_rebar({host_heap}).has_value());
+
+    // 2. PCIe link speed string -> generation mapping.
+    CHECK(parse_pcie_link_speed_gen("2.5 GT/s PCIe\n") == std::optional<std::uint32_t>(1u));
+    CHECK(parse_pcie_link_speed_gen("5.0 GT/s PCIe") == std::optional<std::uint32_t>(2u));
+    CHECK(parse_pcie_link_speed_gen("8.0 GT/s PCIe") == std::optional<std::uint32_t>(3u));
+    CHECK(parse_pcie_link_speed_gen("16.0 GT/s PCIe") == std::optional<std::uint32_t>(4u));
+    CHECK(parse_pcie_link_speed_gen("32.0 GT/s PCIe") == std::optional<std::uint32_t>(5u));
+    CHECK(parse_pcie_link_speed_gen("64.0 GT/s PCIe") == std::optional<std::uint32_t>(6u));
+    CHECK_FALSE(parse_pcie_link_speed_gen("Unknown").has_value());
+    CHECK_FALSE(parse_pcie_link_speed_gen("").has_value());
+    CHECK_FALSE(parse_pcie_link_speed_gen("-16.0 GT/s").has_value());
+
+    // 3. Linux ASPM policy & per-link state + Windows ASPM policy mapping.
+    CHECK(parse_linux_aspm_policy("[default] performance powersave powersupersave\n") == "default");
+    CHECK(parse_linux_aspm_policy("default [performance] powersave powersupersave\n") == "performance");
+    CHECK(parse_linux_aspm_policy("default performance [powersave] powersupersave") == "powersave");
+    CHECK(parse_linux_aspm_policy("no brackets here").empty());
+    CHECK(parse_linux_aspm_policy("[]").empty());
+
+    CHECK(format_linux_link_aspm(false, false, false, false) == "off");
+    CHECK(format_linux_link_aspm(true, false) == "l0s");
+    CHECK(format_linux_link_aspm(false, true) == "l1");
+    CHECK(format_linux_link_aspm(true, true) == "l0s+l1");
+    CHECK(format_linux_link_aspm(true, true, true, true) == "l0s+l1+l1.1+l1.2");
+    CHECK(format_linux_link_aspm(std::nullopt, std::nullopt).empty());
+
+    CHECK(windows_aspm_policy_name(0u) == "off");
+    CHECK(windows_aspm_policy_name(1u) == "moderate");
+    CHECK(windows_aspm_policy_name(2u) == "maximum");
+    CHECK(windows_aspm_policy_name(3u).empty());
+
+    // 4. Driver build string sanitization and formatting.
+    CHECK(sanitize_driver_build_string("  32.0.21025.1024\r\n") == "32.0.21025.1024");
+    CHECK(sanitize_driver_build_string("25.10.2\x01\x02-ok") == "25.10.2-ok");
+    CHECK(format_driver_build_string("32.0.21025.1024", "25.10.2", "") == "25.10.2 (32.0.21025.1024)");
+    CHECK(format_driver_build_string("32.0.21025.1024", "", "") == "32.0.21025.1024");
+    CHECK(format_driver_build_string("", "", "Mesa 25.1.0") == "Mesa 25.1.0");
+    CHECK(format_driver_build_string("", "", "").empty());
+
+    // 5. Linux amdgpu sysfs parser extracts PCIe gen/width, ASPM, pci_bus_id, and driver_build.
+    const auto sysfs = fake_files({
+        {"/sys/class/drm/card0/device/vendor", "0x1002\n"},
+        {"/sys/class/drm/card0/device/device", "0x7590\n"},
+        {"/sys/class/drm/card0/device/product_name", "AMD Radeon RX 9060 XT\n"},
+        {"/sys/class/drm/card0/device/uevent",
+         "DRIVER=amdgpu\nPCI_ID=1002:7590\nPCI_SLOT_NAME=0000:03:00.0\n"},
+        {"/sys/class/drm/card0/device/mem_info_vram_total", std::to_string(16ull * kGiB) + "\n"},
+        {"/sys/class/drm/card0/device/mem_info_vram_used", std::to_string(1ull * kGiB) + "\n"},
+        {"/sys/class/drm/card0/device/current_link_speed", "32.0 GT/s PCIe\n"},
+        {"/sys/class/drm/card0/device/current_link_width", "16\n"},
+        {"/sys/class/drm/card0/device/max_link_speed", "32.0 GT/s PCIe\n"},
+        {"/sys/class/drm/card0/device/max_link_width", "16\n"},
+        {"/sys/class/drm/card0/device/link/l0s_aspm", "0\n"},
+        {"/sys/class/drm/card0/device/link/l1_aspm", "1\n"},
+        {"/sys/module/amdgpu/version", "6.12.12\n"},
+    });
+    const auto parsed = parse_amdgpu_sysfs_device("card0", sysfs);
+    REQUIRE(parsed.has_value());
+    CHECK(parsed->pci_bus_id == "0000:03:00.0");
+    CHECK(parsed->driver_name == "amdgpu");
+    CHECK(parsed->driver_build == "6.12.12");
+    CHECK(parsed->pcie.current_gen == std::optional<std::uint32_t>(5u));
+    CHECK(parsed->pcie.current_width == std::optional<std::uint32_t>(16u));
+    CHECK(parsed->pcie.max_gen == std::optional<std::uint32_t>(5u));
+    CHECK(parsed->pcie.max_width == std::optional<std::uint32_t>(16u));
+    CHECK(parsed->pcie.aspm_state == "l1");
+    CHECK(parsed->pcie.aspm_source == "linux_sysfs_link");
+
+    // Fallback to global /sys/module/pcie_aspm/parameters/policy when per-link files are absent.
+    const auto sysfs_global_aspm = fake_files({
+        {"/sys/class/drm/card0/device/vendor", "0x1002\n"},
+        {"/sys/class/drm/card0/device/mem_info_vram_total", std::to_string(16ull * kGiB) + "\n"},
+        {"/sys/module/pcie_aspm/parameters/policy", "default [performance] powersave powersupersave\n"},
+    });
+    const auto parsed_global = parse_amdgpu_sysfs_device("card0", sysfs_global_aspm);
+    REQUIRE(parsed_global.has_value());
+    CHECK(parsed_global->pcie.aspm_state == "performance");
+    CHECK(parsed_global->pcie.aspm_source == "linux_pcie_aspm_policy");
+
+    // 6. Core ggml device registry merges captured lines into GPU inventory end-to-end.
+    clear_registered_ggml_device_telemetry();
+    const auto g0 = parse_ggml_device_line(
+        "ggml_vulkan: 0 = AMD Radeon RX 9060 XT (AMD proprietary driver) | uma: 0 | rebar: 1 | "
+        "fp16: 1 | bf16: 1 | fp4: 0 | warp size: 64 | shared memory: 32768 | int dot: 1 | "
+        "matrix cores: KHR_coopmat");
+    const auto g1 = parse_ggml_device_line(
+        "ggml_vulkan: 1 = AMD Radeon 780M Graphics (AMD proprietary driver) | uma: 1 | "
+        "fp16: 1 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 32768 | int dot: 1 | "
+        "matrix cores: none");
+    REQUIRE(g0.has_value());
+    REQUIRE(g1.has_value());
+    register_ggml_device_telemetry(*g0);
+    register_ggml_device_telemetry(*g1);
+    CHECK(registered_ggml_device_telemetry().size() == 2u);
+
+    GpuDeviceInfo d_rx;
+    d_rx.id = "gpu:0";
+    d_rx.name = "AMD Radeon RX 9060 XT";
+    d_rx.is_integrated_uma = false;
+    GpuDeviceInfo d_igpu;
+    d_igpu.id = "gpu:1";
+    d_igpu.name = "AMD Radeon 780M Graphics";
+    d_igpu.is_integrated_uma = true;
+    std::vector<GpuDeviceInfo> inv{d_rx, d_igpu};
+    merge_ggml_device_telemetry(inv, registered_ggml_device_telemetry());
+    REQUIRE(inv[0].ggml_device.has_value());
+    CHECK(inv[0].ggml_device->matrix_cores == "KHR_coopmat");
+    CHECK(inv[0].rebar == std::optional<bool>(true));
+    REQUIRE(inv[1].ggml_device.has_value());
+    CHECK(inv[1].ggml_device->matrix_cores == "none");
+    CHECK_FALSE(inv[1].ggml_device->rebar.has_value());
+
+    // Live enumerate_gpu_devices() also merges any matching registered ggml line.
+    const auto live_before = enumerate_gpu_devices();
+    clear_registered_ggml_device_telemetry();
+    if (!live_before.empty()) {
+        GgmlDeviceTelemetry live_entry;
+        live_entry.backend = "vulkan";
+        live_entry.index = 0u;
+        live_entry.device_name = live_before[0].name;
+        live_entry.driver_name = "test-driver";
+        live_entry.uma = live_before[0].is_integrated_uma;
+        live_entry.rebar = true;
+        live_entry.shared_memory_bytes = 32768ull;
+        live_entry.matrix_cores = "KHR_coopmat";
+        register_ggml_device_telemetry(live_entry);
+        const auto live_after = enumerate_gpu_devices();
+        clear_registered_ggml_device_telemetry();
+        REQUIRE_FALSE(live_after.empty());
+        REQUIRE(live_after[0].ggml_device.has_value());
+        CHECK(live_after[0].ggml_device->driver_name == "test-driver");
+    }
+
+    // 7. PCI BDF normalization matches 8-digit NVML domains ("00000000:01:00.0") with 4-digit ("0000:01:00.0").
+    {
+        GpuDeviceInfo dxgi_nv;
+        dxgi_nv.vendor = GpuVendor::nvidia;
+        dxgi_nv.pci_bus_id = "0000:01:00.0";
+        dxgi_nv.source = "dxgi";
+        GpuDeviceInfo nvml_nv;
+        nvml_nv.vendor = GpuVendor::nvidia;
+        nvml_nv.pci_bus_id = "00000000:01:00.0";
+        nvml_nv.driver_build = "610.88";
+        nvml_nv.pcie.current_gen = 5u;
+        nvml_nv.pcie.current_width = 16u;
+        nvml_nv.source = "nvml";
+        std::vector<GpuDeviceInfo> merged{dxgi_nv};
+        merge_win32_nvml_devices(merged, {nvml_nv});
+        REQUIRE(merged.size() == 1u);
+        CHECK(merged[0].driver_build == "610.88");
+        CHECK(merged[0].pcie.current_gen == std::optional<std::uint32_t>(5u));
+        CHECK(merged[0].pcie.current_width == std::optional<std::uint32_t>(16u));
+    }
+}

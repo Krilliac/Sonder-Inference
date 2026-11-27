@@ -1353,3 +1353,50 @@ TEST_CASE("plan: plans a synthetic GGUF in model_dirs and via bound profile with
     CHECK(nomm_doc.find("profile")->find("mmproj") == nullptr);
     CHECK(nomm_r.body.find(bound_dir.path.filename().string()) == std::string::npos);
 }
+
+TEST_CASE("NAT-08: gpu_inventory_json includes additive device telemetry when populated") {
+    constexpr std::uint64_t kGiB = 1024ull * 1024ull * 1024ull;
+
+    si::GpuDeviceInfo gpu;
+    gpu.id = "gpu:0";
+    gpu.name = "AMD Radeon RX 9060 XT";
+    gpu.vendor = si::GpuVendor::amd;
+    gpu.vendor_id = 0x1002u;
+    gpu.device_id = 0x7590u;
+    gpu.dedicated_total = si::MemoryReading::known(16ull * kGiB);
+    gpu.dedicated_free = si::MemoryReading::known(15ull * kGiB);
+    gpu.driver_name = "AMD proprietary driver";
+    gpu.driver_build = "25.10.2 (32.0.21025.1024)";
+    gpu.rebar = true;
+    gpu.shared_memory_bytes = 32768ull;
+    gpu.warp_size = 64u;
+    gpu.matrix_cores = "KHR_coopmat";
+    gpu.pcie.current_gen = 5u;
+    gpu.pcie.current_width = 16u;
+    gpu.pcie.aspm_state = "off";
+    si::VulkanMemoryHeapInfo h0;
+    h0.heap_index = 0u;
+    h0.size_bytes = 16ull * kGiB;
+    h0.budget_bytes = si::MemoryReading::known(15ull * kGiB);
+    h0.usage_bytes = si::MemoryReading::known(0u);
+    h0.device_local = true;
+    h0.host_visible = true;
+    h0.host_coherent = true;
+    gpu.vulkan_heaps.push_back(h0);
+
+    const json::Array arr = det::gpu_inventory_json({gpu});
+    REQUIRE(arr.size() == 1u);
+    const json::Value& item = arr[0];
+    REQUIRE(item.find("driver_build") != nullptr);
+    CHECK(item.find("driver_build")->as_string() == "25.10.2 (32.0.21025.1024)");
+    REQUIRE(item.find("rebar") != nullptr);
+    CHECK(item.find("rebar")->as_bool());
+    REQUIRE(item.find("matrix_cores") != nullptr);
+    CHECK(item.find("matrix_cores")->as_string() == "KHR_coopmat");
+    REQUIRE(item.find("pcie") != nullptr);
+    CHECK(item.find("pcie")->find("current_gen")->as_uint() == 5ull);
+    CHECK(item.find("pcie")->find("aspm_state")->as_string() == "off");
+    REQUIRE(item.find("vulkan_heaps") != nullptr);
+    REQUIRE(item.find("vulkan_heaps")->as_array().size() == 1u);
+    CHECK(item.find("vulkan_heaps")->as_array()[0].find("budget_bytes")->as_uint() == 15ull * kGiB);
+}
