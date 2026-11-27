@@ -41,6 +41,14 @@ if(WIN32 AND TARGET sonder_core_tests)
     target_link_libraries(sonder_core_tests PRIVATE ws2_32)
 endif()
 
+# The commit string lives in one generated TU; its generator must be a no-op for an
+# unchanged commit and rewrite only that file for a new one.
+add_test(NAME sonder.build_commit_generator
+    COMMAND "${CMAKE_COMMAND}" -DSOURCE_DIR=${PROJECT_SOURCE_DIR}
+            -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/build_commit_check
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/build_commit_check.cmake")
+set_tests_properties(sonder.build_commit_generator PROPERTIES TIMEOUT 60)
+
 # Proves sonder_inference.h is valid C and the ABI is usable from C.
 add_executable(sonder_c_abi_smoke c_abi_smoke.c)
 target_link_libraries(sonder_c_abi_smoke PRIVATE sonder::inference)
@@ -254,6 +262,8 @@ if(SONDER_BUILD_CLI)
 
     # --- Machine-readable output -------------------------------------------
     sonder_cli_test(version_json RC 0 STDOUT_JSON STDOUT_REGEX "\"abi_version\":1" COMMAND ${infer} version --json)
+    sonder_cli_test(version_json_commit RC 0 STDOUT_REGEX "\"commit\":\"(unknown|[0-9a-f]+)\""
+        COMMAND ${infer} version --json)
     sonder_cli_test(devices_json RC 0 STDOUT_JSON STDOUT_REGEX "\"platform\":\"[^\"]+\",\"devices\":" COMMAND ${infer} devices --json)
     # The mock backend is always available; an absent Ollama is reported, not fatal.
     sonder_cli_test(backends_json RC 0 STDOUT_JSON
