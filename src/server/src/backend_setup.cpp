@@ -13,6 +13,10 @@
 #include "sonder/inference/json.hpp"
 #include "warmup_config.hpp"
 #include "residency_config.hpp"
+#if defined(SONDER_HAS_WORKER)
+#include "worker/remote_backend.hpp"
+#include "worker/process.hpp"
+#endif
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
 #include "sonder/inference/backends/llamaserver.hpp"
 #endif
@@ -431,6 +435,9 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
 
 std::vector<std::string> available_backend_names() {
     std::vector<std::string> names{kMockBackendName};
+#if defined(SONDER_HAS_WORKER)
+    names.emplace_back("remote-mock");
+#endif
 #if defined(SONDER_HAS_OLLAMA_BACKEND)
     names.emplace_back(kOllamaBackendName);
 #endif
@@ -443,9 +450,21 @@ std::vector<std::string> available_backend_names() {
     return names;
 }
 
-bool is_synthetic_backend(std::string_view name) noexcept { return name == kMockBackendName; }
+bool is_synthetic_backend(std::string_view name) noexcept { return is_mock_backend(name); }
 
 Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
+    if (setup.backend == "remote-mock") {
+#if defined(SONDER_HAS_WORKER)
+        auto executable = worker::current_executable();
+        if (!executable) return executable.status();
+        worker::RemoteBackendOptions options;
+        options.executable = std::move(executable).value();
+        options.token_delay = std::chrono::duration_cast<std::chrono::milliseconds>(setup.mock_token_delay);
+        return worker::make_remote_backend(std::move(options));
+#else
+        return Status(ErrorCode::unsupported, "this build does not include the worker module");
+#endif
+    }
     if (setup.backend == kMockBackendName) {
         MockBackendOptions mo;
         mo.token_delay = setup.mock_token_delay;

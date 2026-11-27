@@ -15,6 +15,9 @@
 #include <vector>
 
 #include "cli_runtime.hpp"
+#if defined(SONDER_HAS_WORKER)
+#include "../../src/worker/remote_backend.hpp"
+#endif
 #include "sonder/inference.hpp"
 #include "sonder_inference.h"
 // Header-only CLI helpers (option specs, checked values, environment, chat
@@ -542,6 +545,24 @@ int cmd_backends(const Args& a, const cli::EnvDefaults& env) {
         for (const auto& c : b->capabilities().names()) std::cout << " " << c;
         std::cout << "\n";
     }
+#if defined(SONDER_HAS_WORKER)
+    // Discovery must not instantiate/probe a remote worker unless selected.
+    // Still advertise its compiled identity honestly in the JSON listing.
+    if (!engine->find_backend("remote-mock")) {
+        si::json::Array caps;
+        for (const auto& cap : si::worker::RemoteBackend::advertised_capabilities().names())
+            caps.emplace_back(cap);
+        if (json) {
+            list.emplace_back(si::json::Object{
+                {"name", "remote-mock"}, {"available", false}, {"probed", false},
+                {"version", nullptr}, {"error", nullptr},
+                {"description", "Synthetic mock worker; select --backend remote-mock to probe"},
+                {"synthetic", is_mock_backend("remote-mock")}, {"capabilities", std::move(caps)}});
+        } else {
+            std::cout << "remote-mock  not probed (select --backend remote-mock); synthetic mock worker\n";
+        }
+    }
+#endif
     if (json) {
         std::cout << si::json::Value(si::json::Object{{"backends", std::move(list)}, {"available", available}}).dump()
                   << "\n";
@@ -1036,6 +1057,18 @@ int main(int argc, char** argv) {
         return cli::kExitUsage;
     }
     if (cmd == "serve") return cmd_serve(rest);
+    if (cmd == "worker") {
+        if (wants_help(rest)) {
+            std::cout << cli::render_help(cli::kProgram, *spec);
+            return cli::kExitOk;
+        }
+#if defined(SONDER_HAS_WORKER)
+        return si::worker::worker_main(rest);
+#else
+        err() << "error: this build does not include the worker module\n";
+        return cli::kExitUsage;
+#endif
+    }
     if (cmd == "weights") {
 #if defined(SONDER_HAS_WEIGHT_MANIFEST)
         return si::weights::weights_main(rest, std::cout, std::cerr);

@@ -45,7 +45,11 @@ def test_chat_stream_result_metadata_privacy_and_cursor(tmp_path, capture_text):
     else:
         assert all("text" not in event["attributes"] for event in tokens)
     assert len({event["event_id"] for event in events}) == len(events)
-    assert [event["sequence"] for event in events] == sorted({event["sequence"] for event in events})
+    # Each sequence stream (producer.stream: absent = main, "samples") is numbered on its own.
+    by_stream = {}
+    for event in events:
+        by_stream.setdefault(event["producer"].get("stream"), []).append(event["sequence"])
+    assert all(sequences == sorted(set(sequences)) for sequences in by_stream.values())
 
 
 @pytest.mark.parametrize("messages,error", [

@@ -123,6 +123,7 @@ set(SONDER_MODULE_DIRS
     src/backends/llamaserver
     src/artifacts
     src/models
+    src/worker
     src/server
     bench)
 foreach(module_dir IN LISTS SONDER_MODULE_DIRS)
