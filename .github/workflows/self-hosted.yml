@@ -1,0 +1,62 @@
+name: self-hosted
+
+# Build and test on the owner's self-hosted runners (labels sonder-win and
+# sonder-linux), which are much faster than the shared hosted queue. A green run
+# here is what the merge train requires before it merges with the admin bypass.
+# The hosted ci.yml checks keep running as before.
+#
+# Security: these runners are the owner's own machines and this repository is
+# public. Only same-repository pull requests (and manual dispatch) reach them,
+# never a fork: see the `if:` on every job. Fork-PR workflow runs also need
+# approval for all outside contributors (repository Actions setting).
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: self-hosted-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: self-hosted windows
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, sonder-win]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: x64
+
+      - name: Configure
+        run: cmake --preset ci-windows
+
+      - name: Build
+        run: cmake --build --preset ci-windows
+
+      - name: Test
+        run: ctest --preset ci-windows
+
+  linux:
+    name: self-hosted linux
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, sonder-linux]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Configure
+        run: cmake --preset ci-linux
+
+      - name: Build
+        run: cmake --build --preset ci-linux
+
+      - name: Test
+        run: ctest --preset ci-linux
