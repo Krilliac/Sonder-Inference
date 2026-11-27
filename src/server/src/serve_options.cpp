@@ -94,6 +94,7 @@ Backend:
   --no-mmap               llama.cpp: disable GGUF memory-mapping (direct read)
   --no-kv-unified         llama.cpp: disable unified KV buffer across slots
   --no-prefix-cache       llama.cpp: disable prompt KV prefix reuse across turns
+  --startup-smoke-test    llama.cpp: run a post-load greedy smoke test (default off)
   --slots N               llama.cpp: cached KV sequence slots (1..16, default 1)
   --spec-type TYPE        llama.cpp: in-process speculative decoding
                           (none|auto|ngram|ngram-mod|suffix|draft-mtp, default none)
@@ -178,7 +179,8 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"flash-attn", Kind::value},             {"swa-kv-mode", Kind::value},
         {"threads", Kind::value},
         {"no-mmap", Kind::flag},                 {"no-kv-unified", Kind::flag},
-        {"no-prefix-cache", Kind::flag},         {"slots", Kind::value},
+        {"no-prefix-cache", Kind::flag},         {"startup-smoke-test", Kind::flag},
+        {"slots", Kind::value},
         {"spec-type", Kind::value},              {"spec-draft-max", Kind::value},
         {"moe-cache-mib", Kind::value},          {"moe-cache-cpu-share", Kind::value},
         {"cache-ram-mib", Kind::value},          {"mmproj", Kind::value},
@@ -371,6 +373,9 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
         }
         if (a.flags.count("no-kv-unified") != 0) {
             return usage_error("--no-kv-unified conflicts with --profile (set the profile's typed fields)");
+        }
+        if (a.flags.count("startup-smoke-test") != 0) {
+            return usage_error("--startup-smoke-test conflicts with --profile (set the profile's typed fields)");
         }
         if (a.get("llamaserver-url") && (!multi_profile || primary->backend != kLaunchProfileBackendLlamaServer)) {
             return usage_error("--llamaserver-url conflicts with --profile (set the profile's typed fields)");
@@ -592,7 +597,7 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
                                    " applies only to --backend llamacpp; for llamaserver set it in the JSON args");
             }
         }
-        for (const char* flag : {"no-mmap", "no-kv-unified", "no-prefix-cache"}) {
+        for (const char* flag : {"no-mmap", "no-kv-unified", "no-prefix-cache", "startup-smoke-test"}) {
             if (a.flags.count(flag) != 0) {
                 return usage_error(std::string("option --") + flag +
                                    " applies only to --backend llamacpp; for llamaserver set it in the JSON args");
@@ -630,6 +635,9 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     }
     if (a.flags.count("no-prefix-cache") != 0) {
         o.backend.llamacpp_prefix_cache = false;
+    }
+    if (a.flags.count("startup-smoke-test") != 0) {
+        o.backend.llamacpp_startup_smoke_test = true;
     }
     if (auto v = a.get("slots")) {
         if (!parse_uint(*v, 16, n) || n == 0) return usage_error("--slots must be an integer from 1 to 16");
@@ -675,6 +683,7 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
         std::string owner_v = o.backend.llamacpp_kv_cache_type_v ? primary->name : std::string{};
         std::string owner_fa = o.backend.llamacpp_flash_attention ? primary->name : std::string{};
         std::string owner_swa = o.backend.llamacpp_swa_kv_mode ? primary->name : std::string{};
+        std::string owner_smoke = o.backend.llamacpp_startup_smoke_test ? primary->name : std::string{};
         std::string owner_slots = o.backend.llamacpp_slots ? primary->name : std::string{};
         std::string owner_kv_unified = o.backend.llamacpp_kv_unified ? primary->name : std::string{};
         std::string owner_cache_ram = o.backend.llamacpp_cache_ram_mib ? primary->name : std::string{};
@@ -762,6 +771,12 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
                 !err.empty()) {
                 return usage_error(err);
             }
+            if (const std::string err = merge_opt("startup_smoke_test", o.backend.llamacpp_startup_smoke_test,
+                                                  candidate_backend.llamacpp_startup_smoke_test, owner_smoke,
+                                                  bool_text);
+                !err.empty()) {
+                return usage_error(err);
+            }
             if (const std::string err = merge_opt("parallel", o.backend.llamacpp_slots,
                                                   candidate_backend.llamacpp_slots, owner_slots, int_text);
                 !err.empty()) {
@@ -836,6 +851,9 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
         if (o.backend.llamacpp_flash_attention) add_resolved("flash_attn", *o.backend.llamacpp_flash_attention);
         if (o.backend.llamacpp_slots) add_resolved("slots", std::to_string(*o.backend.llamacpp_slots));
         if (o.backend.llamacpp_kv_unified) add_resolved("kv_unified", *o.backend.llamacpp_kv_unified ? "true" : "false");
+        if (o.backend.llamacpp_startup_smoke_test) {
+            add_resolved("startup_smoke_test", *o.backend.llamacpp_startup_smoke_test ? "true" : "false");
+        }
         if (o.backend.llamacpp_cache_ram_mib) add_resolved("cache_ram_mib", std::to_string(*o.backend.llamacpp_cache_ram_mib));
         if (o.backend.llamacpp_threads) add_resolved("threads", std::to_string(*o.backend.llamacpp_threads));
         if (o.backend.llamacpp_spec_type) add_resolved("spec_type", *o.backend.llamacpp_spec_type);

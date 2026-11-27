@@ -114,6 +114,8 @@ struct LlamaCppBackendOptions {
     std::uint32_t embed_batch_tokens = 2048;
     // Maximum sequences packed per embedding/rerank forward pass (0 = auto, max 64).
     std::uint32_t embed_max_sequences = 16;
+    // Opt-in startup greedy smoke test after load (default off).
+    bool startup_smoke_test = false;
 };
 
 // Checks the llama.cpp context and placement options (KV cache types,

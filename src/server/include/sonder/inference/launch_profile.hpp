@@ -91,6 +91,8 @@ struct LaunchProfile {
     // Explicit `Full` forces full-context SWA caches; `CompactIfQualified`
     // opts in only for qualified SWA architectures with rollback guarding.
     std::optional<SwaKvMode> swa_kv_mode;
+    // Direct llamacpp backend only: run the post-load greedy smoke test (default off).
+    std::optional<bool> startup_smoke_test;
     // KV cache and flash attention: the llamacpp backend's option names and
     // values (LlamaCppBackendOptions::kv_cache_type_k/_v, flash_attention).
     // llamaserver profiles also accept f8_e4m3, q2_0 and pq2_0m.

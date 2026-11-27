@@ -2942,3 +2942,63 @@ TEST_CASE("SWA rollback guard: fails closed on cuts below min_retained_pos and s
     CHECK_FALSE(guard.CheckAndApplyRollback(1200));  // < 1324 -> rejected!
     CHECK(guard.rollback_rejections() == 2u);
 }
+
+TEST_CASE("launch profile: startup_smoke_test parses for llamacpp, rejects non-bool and llamaserver") {
+    const LaunchProfile enabled =
+        parse_single(R"({"name":"bonsai","backend":"llamacpp","model":"m.gguf","startup_smoke_test":true})");
+    CHECK(enabled.startup_smoke_test == std::optional<bool>(true));
+    {
+        si::BackendSetup setup;
+        std::string dev;
+        REQUIRE(si::apply_llamacpp_profile(enabled, setup, dev).ok());
+        CHECK(setup.llamacpp_startup_smoke_test == std::optional<bool>(true));
+    }
+    const json::Object meta_on = si::launch_profile_metadata(enabled, std::nullopt, std::nullopt);
+    REQUIRE(meta_on.find("startup_smoke_test") != nullptr);
+    CHECK(meta_on.find("startup_smoke_test")->as_bool() == true);
+
+    const LaunchProfile disabled =
+        parse_single(R"({"name":"bonsai-off","backend":"llamacpp","model":"m.gguf","startup_smoke_test":false})");
+    CHECK(disabled.startup_smoke_test == std::optional<bool>(false));
+    {
+        si::BackendSetup setup;
+        std::string dev;
+        REQUIRE(si::apply_llamacpp_profile(disabled, setup, dev).ok());
+        CHECK(setup.llamacpp_startup_smoke_test == std::optional<bool>(false));
+    }
+    const json::Object meta_off = si::launch_profile_metadata(disabled, std::nullopt, std::nullopt);
+    REQUIRE(meta_off.find("startup_smoke_test") != nullptr);
+    CHECK(meta_off.find("startup_smoke_test")->as_bool() == false);
+
+    const LaunchProfile unset =
+        parse_single(R"({"name":"bonsai-default","backend":"llamacpp","model":"m.gguf"})");
+    CHECK_FALSE(unset.startup_smoke_test.has_value());
+    {
+        si::BackendSetup setup;
+        std::string dev;
+        REQUIRE(si::apply_llamacpp_profile(unset, setup, dev).ok());
+        CHECK_FALSE(setup.llamacpp_startup_smoke_test.has_value());
+    }
+    const json::Object meta_unset = si::launch_profile_metadata(unset, std::nullopt, std::nullopt);
+    CHECK(meta_unset.find("startup_smoke_test") == nullptr);
+
+    // Transactional failure on an unsupported field must not mutate setup.
+    {
+        const LaunchProfile rejected = parse_single(
+            R"({"name":"bad","backend":"llamacpp","model":"m.gguf","startup_smoke_test":true,"fit":false})");
+        si::BackendSetup clean;
+        std::string dev;
+        CHECK_FALSE(si::apply_llamacpp_profile(rejected, clean, dev).ok());
+        CHECK_FALSE(clean.llamacpp_startup_smoke_test.has_value());
+    }
+
+    // Non-boolean values are rejected.
+    CHECK(contains(parse_error(R"({"name":"p","backend":"llamacpp","model":"m.gguf","startup_smoke_test":1})"),
+                   "'startup_smoke_test' must be true or false"));
+    CHECK(contains(parse_error(R"({"name":"p","backend":"llamacpp","model":"m.gguf","startup_smoke_test":"true"})"),
+                   "'startup_smoke_test' must be true or false"));
+
+    // llamaserver profiles reject startup_smoke_test rather than silently dropping it.
+    CHECK(contains(parse_error(R"({"name":"p","backend":"llamaserver","model":"m.gguf","startup_smoke_test":true})"),
+                   "'startup_smoke_test'"));
+}

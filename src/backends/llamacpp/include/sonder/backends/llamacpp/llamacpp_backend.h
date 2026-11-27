@@ -249,6 +249,14 @@ struct LoadOptions {
     std::uint32_t embed_batch_tokens = kDefaultEmbedBatchTokens;
     // Maximum sequences packed per embedding/rerank forward pass (0 = auto, max kMaxEmbedSequences).
     std::uint32_t embed_max_sequences = kDefaultEmbedMaxSequences;
+    // Opt-in startup greedy smoke test (default off): after a successful load
+    // Load() decodes a short fixed prompt greedily and fails the load with
+    // kLoadFailed when logits are non-finite/uniform, step 0 emits an immediate
+    // EOG token (0 non-EOG tokens), or the continuation is degenerate (see
+    // EvaluateSmokeLogits / EvaluateSmokeTokens). Ignored for vocab_only loads,
+    // encoder-only models, and pooled contexts (embedding MEAN/CLS/LAST or
+    // reranker RANK).
+    bool startup_smoke_test = false;
 };
 
 // Checks placement options (main_gpu >= 0, split_mode, tensor_split finite /
@@ -262,6 +270,64 @@ struct LoadOptions {
 // runs it before touching the model file. Always Ok for vocab_only loads,
 // which create no context.
 [[nodiscard]] Status ValidateContextOptions(const LoadOptions& options);
+
+// True when the linked llama.cpp carries prism.hadamard.* / FWHT runtime
+// support (decided at configure time from the resolved llama.cpp sources;
+// SONDER_LLAMACPP_HAS_PRISM_HADAMARD). Mainline >= b11556 / v1.0.0 and the
+// PrismML-Eng fork have it; older trees such as b11195 do not.
+[[nodiscard]] constexpr bool LinkedLlamaSupportsPrismHadamard() noexcept {
+#if defined(SONDER_LLAMACPP_HAS_PRISM_HADAMARD)
+    return true;
+#else
+    return false;
+#endif
+}
+
+// True when a GGUF metadata key marks a Hadamard-folded (Bonsai / Prism)
+// model: any key under the "prism.hadamard." namespace.
+[[nodiscard]] bool IsPrismHadamardKey(std::string_view key) noexcept;
+
+// Pure guard decision. `gguf_keys` are the model's metadata keys. Returns
+// kUnsupported with an explanatory message when the model is Hadamard-folded
+// and `runtime_supports_hadamard` is false; Ok otherwise.
+[[nodiscard]] Status EvaluateHadamardGuard(const std::vector<std::string>& gguf_keys,
+                                           bool runtime_supports_hadamard,
+                                           std::string_view model_path = {});
+
+// Reads only the metadata key names of a GGUF file (no tensor data). Returns
+// kLoadFailed if the file cannot be parsed.
+[[nodiscard]] Status ReadGgufKeys(const std::string& path, std::vector<std::string>& keys);
+
+// Pure logit sanity check for one greedy step of the startup smoke test.
+// Fails with kLoadFailed on empty logits, any non-finite logit (NaN/Inf), or
+// degenerate uniform logits (all values identical when vocab > 1). On Ok,
+// writes the first argmax token id to `argmax_out`.
+[[nodiscard]] Status EvaluateSmokeLogits(std::span<const float> logits, std::int32_t& argmax_out);
+
+// Pure sanity heuristic for the startup smoke test. `tokens` are the greedy
+// continuation, `logits_finite` whether every inspected logit was finite.
+// Fails on non-finite logits, an empty continuation, or a degenerate one
+// (all tokens identical when at least kSmokeMinTokens were produced).
+inline constexpr std::size_t kSmokeMinTokens = 4;
+[[nodiscard]] Status EvaluateSmokeTokens(const std::vector<std::int32_t>& tokens, bool logits_finite);
+
+namespace detail {
+
+// RAII test seam for exercising the Hadamard refusal path in Load() even when
+// linked against a llama.cpp build that supports prism.hadamard (such as v1.0.0).
+// Not exposed in LoadOptions or user configuration.
+class ScopedPrismHadamardSupportOverrideForTest {
+public:
+    explicit ScopedPrismHadamardSupportOverrideForTest(bool runtime_supported) noexcept;
+    ~ScopedPrismHadamardSupportOverrideForTest() noexcept;
+    ScopedPrismHadamardSupportOverrideForTest(const ScopedPrismHadamardSupportOverrideForTest&) = delete;
+    ScopedPrismHadamardSupportOverrideForTest& operator=(const ScopedPrismHadamardSupportOverrideForTest&) = delete;
+
+private:
+    int previous_ = -1;
+};
+
+}  // namespace detail
 
 // The llama_model_params values a Load() with given options passes to
 // llama.cpp, read back from the real parameter struct. For tests and

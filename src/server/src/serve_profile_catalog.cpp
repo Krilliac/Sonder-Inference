@@ -46,6 +46,9 @@ LaunchProfile effective_llamacpp_profile(const LaunchProfile& p, const BackendSe
     if (!eff.cache_type_v && backend.llamacpp_kv_cache_type_v) eff.cache_type_v = *backend.llamacpp_kv_cache_type_v;
     if (!eff.flash_attn && backend.llamacpp_flash_attention) eff.flash_attn = *backend.llamacpp_flash_attention;
     if (!eff.swa_kv_mode && backend.llamacpp_swa_kv_mode) eff.swa_kv_mode = *backend.llamacpp_swa_kv_mode;
+    if (!eff.startup_smoke_test && backend.llamacpp_startup_smoke_test) {
+        eff.startup_smoke_test = *backend.llamacpp_startup_smoke_test;
+    }
     if (!eff.parallel && backend.llamacpp_slots) eff.parallel = *backend.llamacpp_slots;
     if (!eff.kv_unified && backend.llamacpp_kv_unified) eff.kv_unified = *backend.llamacpp_kv_unified;
     if (!eff.cache_ram_mib && backend.llamacpp_cache_ram_mib) {

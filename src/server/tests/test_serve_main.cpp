@@ -1320,3 +1320,82 @@ TEST_CASE("serve_main: multi-profile llamacpp merges and conflicts on direct par
     fs::remove(g_path, ec);
     fs::remove(profiles, ec);
 }
+
+TEST_CASE("serve_main: --startup-smoke-test flag parses, enforces backend/profile rules, and merges across profiles") {
+    std::string out;
+    std::string err;
+    CHECK(run({"--help"}, out, err) == 0);
+    CHECK(out.find("--startup-smoke-test") != std::string::npos);
+
+    // Accepted on --backend llamacpp and populates BackendSetup::llamacpp_startup_smoke_test.
+    {
+        det::ServeCliConfig cli_cfg;
+        std::string cli_err;
+        CHECK(build_cli({"--backend", "llamacpp", "--model", "x", "--startup-smoke-test", "--max-connections", "0"},
+                        cli_cfg, cli_err) == 2);
+        CHECK(cli_err.find("applies only to --backend llamacpp") == std::string::npos);
+        CHECK(cli_err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+        CHECK(cli_cfg.options.backend.llamacpp_startup_smoke_test == std::optional<bool>(true));
+    }
+
+    // Takes no value.
+    CHECK(run({"--backend", "llamacpp", "--model", "x", "--startup-smoke-test=1"}, out, err) == 2);
+    CHECK(err.find("--startup-smoke-test takes no value") != std::string::npos);
+
+    // Refused on non-llamacpp backends.
+    for (const std::string backend : {"mock", "ollama", "llamaserver"}) {
+        CAPTURE(backend);
+        CHECK(run({"--backend", backend, "--model", "x", "--startup-smoke-test", "--max-connections", "0"}, out, err) ==
+              2);
+        CHECK(err.find("option --startup-smoke-test applies only to --backend llamacpp") != std::string::npos);
+    }
+
+    // Conflicts with --profile, and merges/conflicts across multi-profile llamacpp.
+    const auto g_path = temp_path("smoke-direct.gguf");
+    {
+        std::ofstream(g_path, std::ios::binary) << minimal_gguf_header();
+    }
+    const std::string g_str = g_path.generic_string();
+    const auto profiles = temp_path("smoke-profiles.json");
+    {
+        std::ofstream(profiles) << R"({"profiles":[
+            {"name":"smoke-on","backend":"llamacpp","model":")" << g_str
+                                << R"(","n_gpu_layers":0,"startup_smoke_test":true},
+            {"name":"smoke-unset","backend":"llamacpp","model":")" << g_str << R"(","n_gpu_layers":0},
+            {"name":"smoke-off","backend":"llamacpp","model":")" << g_str
+                                << R"(","n_gpu_layers":0,"startup_smoke_test":false}
+        ]})";
+    }
+    const std::string pf = profiles.string();
+
+    CHECK(run({"--profiles", pf, "--profile", "smoke-on", "--startup-smoke-test", "--max-connections", "0"}, out, err) ==
+          2);
+    CHECK(err.find("--startup-smoke-test conflicts with --profile") != std::string::npos);
+
+    CHECK(run({"--profiles", pf, "--profile", "smoke-on", "--profile", "smoke-off", "--max-connections", "0"}, out,
+              err) == 2);
+    CHECK(err.find("conflicts with 'smoke-on' on shared llamacpp option 'startup_smoke_test'") != std::string::npos);
+
+    det::ServeCliConfig cfg;
+    const int rc =
+        build_cli({"--profiles", pf, "--profile", "smoke-on", "--profile", "smoke-unset", "--max-connections", "0"},
+                  cfg, err);
+    CHECK(rc == 2);
+    CHECK(err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+    CHECK(cfg.options.backend.llamacpp_startup_smoke_test == std::optional<bool>(true));
+    REQUIRE(cfg.options.profile_bindings.size() == 2u);
+    REQUIRE(cfg.options.profile_bindings[1].metadata.find("startup_smoke_test") != nullptr);
+    CHECK(cfg.options.profile_bindings[1].metadata.find("startup_smoke_test")->as_bool() == true);
+    bool has_resolved = false;
+    for (const auto& note : cfg.profile_notes) {
+        if (note.find("llamacpp resolved settings:") != std::string::npos &&
+            note.find("startup_smoke_test=true") != std::string::npos) {
+            has_resolved = true;
+        }
+    }
+    CHECK(has_resolved);
+
+    std::error_code ec;
+    fs::remove(g_path, ec);
+    fs::remove(profiles, ec);
+}
