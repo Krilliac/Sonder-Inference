@@ -112,7 +112,7 @@ struct PlacementPlan {
     // Selective tensor repacking policy: "none", "cpu_only_selective", or "disabled_no_repack".
     // Global repacking (--repack) is never recommended while GPU layers remain active.
     std::string repack_policy;
-    // Strictly env vars permitted by backends/llamaserver/env_policy.hpp.
+    // Strictly env vars permitted by server/src/env_policy.hpp.
     std::vector<std::pair<std::string, std::string>> recommended_env;
     std::vector<std::string> reasons;   // concrete measured/arithmetic rationale for every decision
     std::vector<std::string> warnings;  // runtime, headroom, UMA bandwidth, or partial-offload cautions

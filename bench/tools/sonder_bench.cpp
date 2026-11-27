@@ -9,10 +9,14 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "sonder/inference.hpp"
 #include "sonder/inference/benchmark.hpp"
+#if defined(SONDER_HAS_LLAMACPP_BACKEND)
+#include "sonder/inference/backends/llamacpp.hpp"
+#endif
 #if defined(SONDER_HAS_OLLAMA_BACKEND)
 #include "sonder/inference/backends/ollama.hpp"
 #endif
@@ -86,6 +90,17 @@ int main(int argc, char** argv) {
         mo.token_delay = std::chrono::microseconds(500);
         mo.default_completion_tokens = 48;
         (void)engine.register_backend(si::make_mock_backend(mo));
+    } else if (backend_name == "llamacpp") {
+#if defined(SONDER_HAS_LLAMACPP_BACKEND)
+        si::LlamaCppBackendOptions native;
+        native.context_length = parsed.context_length;
+        native.threads = parsed.threads;
+        native.gpu_layers = parsed.gpu_layers;
+        (void)engine.register_backend(si::make_llamacpp_backend(std::move(native)));
+#else
+        return usage_error("this build does not include the llamacpp backend "
+                           "(configure with SONDER_WITH_LLAMA_CPP=ON)");
+#endif
     }
 #if defined(SONDER_HAS_OLLAMA_BACKEND)
     else if (backend_name == "ollama") {
@@ -119,7 +134,8 @@ int main(int argc, char** argv) {
         }
         (void)engine.register_backend(std::move(made.value()));
     } else {
-        return usage_error("unsupported backend '" + backend_name + "' (expected ollama, llamaserver or mock)");
+        return usage_error("unsupported backend '" + backend_name +
+                           "' (expected llamacpp, ollama, llamaserver or mock)");
     }
 
     auto backend = engine.find_backend(backend_name);

@@ -766,32 +766,37 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
                        std::string_view tokenizer_identity, bool backend_supports_structured_output) {
     const bool store_enabled =
         !ex.options.disable_response_store && ex.options.response_history_ttl.count() > 0 && history.ttl().count() > 0;
+    const std::string pre_req_id = ex.request_id.rfind("req-", 0) == 0 ? ex.request_id : make_id("req");
+    ex.request_id = pre_req_id;
+    const RequestPriority priority = corr.priority_class.value_or(
+        job.priority_class.value_or(RequestPriority::interactive));
+    const auto reject_pre_session = [&](const ApiError& err) {
+        emit_pre_execution_failure(ex.telemetry, session->telemetry_context(pre_req_id), "chat", err.code, corr,
+                                   priority, model, job.model);
+        ex.leave_inflight();
+        session->close();
+        ex.send_error(err);
+    };
     // 1. Assemble conversation history from optional previous_response_id.
     std::vector<ChatMessage> conversation;
     std::string inherited_session_key;
     if (job.previous_response_id) {
         if (!store_enabled) {
-            ex.leave_inflight();
-            session->close();
-            ex.send_error(make_error(400, "unsupported_parameter",
-                                     "response history store is disabled on this server", "previous_response_id"));
+            reject_pre_session(make_error(400, "unsupported_parameter",
+                                          "response history store is disabled on this server", "previous_response_id"));
             return;
         }
         auto prev = history.get(*job.previous_response_id, caller_scope);
         if (!prev) {
-            ex.leave_inflight();
-            session->close();
-            ex.send_error(make_error(404, "not_found",
-                                     "previous_response_id '" + *job.previous_response_id + "' was not found",
-                                     "previous_response_id"));
+            reject_pre_session(make_error(404, "not_found",
+                                          "previous_response_id '" + *job.previous_response_id + "' was not found",
+                                          "previous_response_id"));
             return;
         }
         if (!prev->model.empty() && prev->model != model) {
-            ex.leave_inflight();
-            session->close();
-            ex.send_error(bad("invalid_request",
-                              "previous_response_id belongs to a different model ('" + prev->model + "')",
-                              "previous_response_id"));
+            reject_pre_session(bad("invalid_request",
+                                   "previous_response_id belongs to a different model ('" + prev->model + "')",
+                                   "previous_response_id"));
             return;
         }
         conversation = std::move(prev->messages);
@@ -808,12 +813,10 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
         conversation.push_back(m);
     }
     if (conversation.size() > ResponseHistoryStore::kMaxMessagesPerEntry) {
-        ex.leave_inflight();
-        session->close();
-        ex.send_error(bad("invalid_messages",
-                          "conversation exceeds maximum of " +
-                              std::to_string(ResponseHistoryStore::kMaxMessagesPerEntry) + " messages",
-                          "input"));
+        reject_pre_session(bad("invalid_messages",
+                               "conversation exceeds maximum of " +
+                                   std::to_string(ResponseHistoryStore::kMaxMessagesPerEntry) + " messages",
+                               "input"));
         return;
     }
     std::size_t accumulated_images = 0;
@@ -821,22 +824,16 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
         accumulated_images += count_message_images(m);
     }
     if (accumulated_images > 8u) {
-        ex.leave_inflight();
-        session->close();
-        ex.send_error(bad("invalid_messages", "conversation exceeds maximum of 8 images", "input"));
+        reject_pre_session(bad("invalid_messages", "conversation exceeds maximum of 8 images", "input"));
         return;
     }
     if (accumulated_images > 0 && !backend_supports_multimodal) {
-        ex.leave_inflight();
-        session->close();
-        ex.send_error(make_error(400, "unsupported_parameter",
-                                 "backend '" + backend + "' does not support multimodal image inputs", "input"));
+        reject_pre_session(make_error(400, "unsupported_parameter",
+                                      "backend '" + backend + "' does not support multimodal image inputs", "input"));
         return;
     }
     if (Status st = validate_chat_messages(conversation); !st.ok()) {
-        ex.leave_inflight();
-        session->close();
-        ex.send_error(bad("invalid_messages", st.message(), "input"));
+        reject_pre_session(bad("invalid_messages", st.message(), "input"));
         return;
     }
 
@@ -853,16 +850,16 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
         }
     }
 
-    const RequestPriority priority = corr.priority_class.value_or(
-        job.priority_class.value_or(RequestPriority::interactive));
     const auto deadline_ms = corr.deadline_ms ? corr.deadline_ms : job.deadline_ms;
     const auto deadline = deadline_ms
         ? ex.started + std::chrono::milliseconds(static_cast<std::int64_t>(*deadline_ms))
         : std::chrono::steady_clock::time_point::max();
 
     RequestOptions ro;
-    ro.request_id = make_id("req");
+    ro.request_id = pre_req_id;
     ro.parent_request_id = corr.parent_request_id;
+    ro.no_text_capture = corr.no_text_capture;
+    ro.local_only = corr.local_only;
     const std::string response_id = "resp_" + *ro.request_id;
     if (!inherited_session_key.empty()) {
         ro.session_key = inherited_session_key;
@@ -876,6 +873,8 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     ro.thinking = job.thinking;
     ro.separate_reasoning = true;
     ro.retain_text = true;  // retain for response.completed + previous_response_id history
+    ro.served_model = model;
+    ro.requested_model = job.model;
     std::shared_ptr<const CompiledGrammar> compiled_grammar = job.compiled_grammar;
     std::string fallback_grammar = job.grammar;
     if (!compiled_grammar && grammar_cache != nullptr &&
@@ -887,15 +886,13 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
             job.pending_response_schema, job.response_format_schema, job.tools, job.tool_choice,
             backend_supports_structured_output, backend_native_tools, backend, fallback_tok, grammar_cache);
         if (!resolved.ok()) {
-            ex.leave_inflight();
-            session->close();
             const std::string code = resolved.status().code() == ErrorCode::unsupported
                                          ? "unsupported_parameter"
                                          : "invalid_request";
             const bool from_tools =
                 !job.response_format_type.has_value() && job.grammar.empty() && !job.tools.empty();
-            ex.send_error(make_error(400, code, resolved.status().message(),
-                                     from_tools ? "tools" : "text.format"));
+            reject_pre_session(make_error(400, code, resolved.status().message(),
+                                          from_tools ? "tools" : "text.format"));
             return;
         }
         compiled_grammar = std::move(resolved.value().compiled);
@@ -903,12 +900,10 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
     }
     auto matcher_res = bind_request_grammar_matcher(compiled_grammar, ro.grammar, fallback_grammar);
     if (!matcher_res.ok()) {
-        ex.leave_inflight();
-        session->close();
         const std::string code = matcher_res.status().code() == ErrorCode::unsupported
                                      ? "unsupported_parameter"
                                      : "invalid_request";
-        ex.send_error(make_error(400, code, matcher_res.status().message(), "text.format"));
+        reject_pre_session(make_error(400, code, matcher_res.status().message(), "text.format"));
         return;
     }
     std::unique_ptr<GrammarMatcher> grammar_matcher = std::move(matcher_res).value();
@@ -1005,6 +1000,8 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
             }
         });
     } catch (const std::system_error&) {
+        emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "chat", "overloaded",
+                                   corr, priority, model, job.model);
         end_request();
         session->close();
         ex.watcher_failure();
@@ -1021,19 +1018,13 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
             return disconnected.load() || session->state() == SessionState::closed || ex.hard_stop.load();
         }, deadline);
         if (ticket->outcome() != PriorityAdmission::Outcome::admitted) {
-            json::Object attrs{{"kind", "chat"},
-                               {"priority_class", to_string(priority)},
-                               {"admission", json::Object{{"priority", to_string(priority)},
-                                                          {"queue_ms", ticket->queue_ms()}}},
-                               {"error_code", ticket->outcome() == PriorityAdmission::Outcome::full
-                                                  ? "overloaded"
-                                                  : ticket->outcome() == PriorityAdmission::Outcome::expired
-                                                  ? "deadline_exceeded"
-                                                  : "cancelled"},
-                               {"backend_started", false}};
-            if (ro.parent_request_id) attrs.set("parent_request_id", *ro.parent_request_id);
-            ex.telemetry.emit(disconnected.load() ? "request.cancelled" : "request.failed",
-                              session->telemetry_context(ro.request_id), std::move(attrs), TelemetryLevel::metrics);
+            const char* err_code = ticket->outcome() == PriorityAdmission::Outcome::full
+                                       ? "overloaded"
+                                       : ticket->outcome() == PriorityAdmission::Outcome::expired
+                                       ? "deadline_exceeded"
+                                       : "cancelled";
+            emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "chat", err_code,
+                                       corr, priority, model, job.model, disconnected.load(), ticket->queue_ms());
             end_request();
             if (disconnected.load()) {
                 ex.status = 499;
@@ -1200,6 +1191,10 @@ void execute_responses(ChatExchange& ex, const ResponsesJob& job, const Correlat
         return;
     }
     if (!result.ok()) {
+        if (session->requests_started() == 0) {
+            emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "chat",
+                                       to_string(result.status().code()), corr, priority, model, job.model);
+        }
         session->close();
         const ApiError e = map_session_failure(result.status(), rejected);
         if (sse.headers_sent()) {
