@@ -18,6 +18,19 @@ namespace sonder::inference {
 
 inline constexpr const char* kLlamaCppBackendName = "llamacpp";
 
+// One LoRA adapter file + scale attached to a named LoRA alias.
+struct LlamaCppLoraAdapterOption {
+    std::string path;
+    float scale = 1.0f;
+};
+
+// Named LoRA alias mapping an alias string to a base model + one or more adapters.
+struct LlamaCppLoraAliasOption {
+    std::string alias;
+    std::string base_model;
+    std::vector<LlamaCppLoraAdapterOption> adapters;
+};
+
 struct LlamaCppBackendOptions {
     // Directories scanned (non-recursively) by list_models() for *.gguf files.
     // load_model() accepts either a GGUF path or a file name found here.
@@ -114,6 +127,10 @@ struct LlamaCppBackendOptions {
     std::uint32_t embed_batch_tokens = 2048;
     // Maximum sequences packed per embedding/rerank forward pass (0 = auto, max 64).
     std::uint32_t embed_max_sequences = 16;
+    // Optional root directories constraining allowed LoRA adapter files (defaults to model_dirs when empty).
+    std::vector<std::string> lora_roots;
+    // Named LoRA aliases mapping alias -> base model + one or more (adapter, scale) pairs.
+    std::vector<LlamaCppLoraAliasOption> lora_aliases;
 };
 
 // Checks the llama.cpp context and placement options (KV cache types,

@@ -34,6 +34,7 @@
 #include "sonder/inference/backends/llamacpp.hpp"
 #include "sonder/inference/json.hpp"
 #include "llamacpp_internal.hpp"
+#include "lora_registry.hpp"
 
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
 #  include "backends/llamaserver/gpu_memory.hpp"
@@ -401,6 +402,7 @@ struct RuntimeState {
     std::uint32_t configured_slots = 1;
     std::uint32_t configured_cache_ram_mib = 0;
     bool configured_mmproj = false;
+    bool configured_lora = false;
 
     bool has_sampled = false;
     bool probe_in_flight = false;
@@ -428,7 +430,8 @@ struct RuntimeState {
           configured_prefix_cache(opts.prefix_cache),
           configured_slots(opts.slots),
           configured_cache_ram_mib(opts.cache_ram_mib),
-          configured_mmproj(!opts.mmproj_path.empty()) {
+          configured_mmproj(!opts.mmproj_path.empty()),
+          configured_lora(!opts.lora_aliases.empty()) {
         gpu_memory.probe = "none";
         gpu_memory.status = "not_sampled";
         gpu_memory.spill_threshold_bytes = kDefaultSpillThresholdBytes;
@@ -559,6 +562,15 @@ struct RuntimeState {
             s.qualified_beneficial = CapabilityState::unknown;
             if (!mtmd_build) s.note = "libmtmd_not_in_build";
             out.emplace_back("multimodal", std::move(s));
+        }
+        {
+            CapabilityStatus s;
+            s.adapter_supports = CapabilityState::yes;
+            s.build_supports = CapabilityState::yes;
+            s.configured = capability_state_from_bool(configured_lora);
+            s.observed_active = configured_lora ? CapabilityState::unknown : CapabilityState::no;
+            s.qualified_beneficial = CapabilityState::unknown;
+            out.emplace_back("lora", std::move(s));
         }
         for (const char* cap_name :
              {"structured_output", "embeddings", "reranking", "logprobs", "recurrent_checkpoint",
@@ -794,6 +806,26 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     }
     if (lc::Status s = lc::ValidatePlacementOptions(lo); !s.ok()) {
         return ToStatus(s);
+    }
+    if (!o.lora_aliases.empty()) {
+        std::vector<std::string> seen_aliases;
+        seen_aliases.reserve(o.lora_aliases.size());
+        for (const auto& opt_alias : o.lora_aliases) {
+            lc::LoraAliasEntry entry;
+            entry.alias = opt_alias.alias;
+            entry.base_model = opt_alias.base_model;
+            entry.adapters.reserve(opt_alias.adapters.size());
+            for (const auto& a : opt_alias.adapters) {
+                entry.adapters.push_back(lc::LoraAdapterSpec{a.path, a.scale});
+            }
+            if (lc::Status s = lc::ValidateLoraAliasSyntax(entry); !s.ok()) {
+                return ToStatus(s);
+            }
+            if (std::find(seen_aliases.begin(), seen_aliases.end(), entry.alias) != seen_aliases.end()) {
+                return Status(ErrorCode::invalid_argument, "duplicate LoRA alias: " + entry.alias);
+            }
+            seen_aliases.push_back(entry.alias);
+        }
     }
     return ToStatus(lc::ValidateContextOptions(lo));
 }
@@ -1433,7 +1465,8 @@ public:
             .add(Capability::logprobs)
             .add(Capability::reranking)
             .add(Capability::execution_checkpoint)
-            .add(Capability::selective_preemption);
+            .add(Capability::selective_preemption)
+            .add(Capability::lora);
         if (options_.slots > 1u) {
             caps.add(Capability::continuous_batch_decode);
         }
@@ -1475,13 +1508,48 @@ public:
                 out.push_back(std::move(d));
             }
         }
+        for (const auto& alias_opt : options_.lora_aliases) {
+            if (alias_opt.alias.empty()) continue;
+            const bool exists = std::any_of(out.begin(), out.end(),
+                                            [&](const ModelDescriptor& m) { return m.name == alias_opt.alias; });
+            if (exists) continue;
+            ModelDescriptor d;
+            d.name = alias_opt.alias;
+            d.backend = kLlamaCppBackendName;
+            d.format = "gguf";
+            out.push_back(std::move(d));
+        }
         std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.name < b.name; });
         return out;
     }
 
     Result<std::shared_ptr<BackendModel>> load_model(const ModelLoadOptions& options) override {
         if (options.model.empty()) return Status(ErrorCode::invalid_argument, "model path is empty");
-        const std::string path = Resolve(options.model);
+        std::optional<lc::LoraAliasEntry> matched_alias;
+        std::vector<std::string> effective_lora_roots;
+        for (const auto& alias_opt : options_.lora_aliases) {
+            if (alias_opt.alias == options.model) {
+                effective_lora_roots = options_.lora_roots.empty() ? options_.model_dirs : options_.lora_roots;
+                lc::LoraRegistry temp_reg(effective_lora_roots);
+                lc::LoraAliasEntry candidate;
+                candidate.alias = alias_opt.alias;
+                candidate.base_model = alias_opt.base_model;
+                candidate.adapters.reserve(alias_opt.adapters.size());
+                for (const auto& a : alias_opt.adapters) {
+                    candidate.adapters.push_back(lc::LoraAdapterSpec{a.path, a.scale});
+                }
+                if (lc::Status reg_s = temp_reg.RegisterAlias(candidate); !reg_s.ok()) {
+                    return ToStatus(reg_s);
+                }
+                lc::LoraAliasEntry resolved_alias;
+                if (lc::Status res_s = temp_reg.ResolveAlias(alias_opt.alias, resolved_alias); !res_s.ok()) {
+                    return ToStatus(res_s);
+                }
+                matched_alias = std::move(resolved_alias);
+                break;
+            }
+        }
+        const std::string path = Resolve(matched_alias ? matched_alias->base_model : options.model);
 
         lc::LoadOptions lo;
         lo.model_path = path;
@@ -1520,10 +1588,16 @@ public:
         });
         if (lc::Status s = runtime.Load(lo); !s.ok()) return ToStatus(s);
         runtime.SetTelemetrySink({});
+        if (matched_alias.has_value()) {
+            if (lc::Status ls = lc::ApplyLoraAdapters(runtime, matched_alias->adapters, effective_lora_roots);
+                !ls.ok()) {
+                return ToStatus(ls);
+            }
+        }
 
         const lc::ModelInfo info = runtime.GetModelInfo();
         ModelDescriptor d;
-        d.name = PathToUtf8(PathFromUtf8(path).filename());
+        d.name = matched_alias ? matched_alias->alias : PathToUtf8(PathFromUtf8(path).filename());
         d.backend = kLlamaCppBackendName;
         d.format = "gguf";
         d.family = info.description;  // e.g. "llama 7B Q4_0"
