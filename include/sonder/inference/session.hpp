@@ -52,11 +52,11 @@ const char* to_string(RequestOutcome outcome) noexcept;
 const char* to_string(WorkloadClass workload) noexcept;
 
 struct SessionOptions {
-    std::string session_id;  // generated when empty
-    std::optional<std::string> run_id;
-    std::optional<std::string> agent_id;
-    std::optional<std::string> task_id;
-    SamplingConfig sampling;
+    std::string session_id{};  // generated when empty
+    std::optional<std::string> run_id{};
+    std::optional<std::string> agent_id{};
+    std::optional<std::string> task_id{};
+    SamplingConfig sampling{};
     // Scheduling metadata (used when the engine schedules requests).
     WorkloadClass workload = WorkloadClass::implementation_worker;
     // Adjusts the class rank: effective rank = class rank - priority, so a
@@ -329,9 +329,17 @@ struct RequestOptions {
     std::optional<std::chrono::milliseconds> suspend_checkpoint_ttl = std::nullopt;
     // Allow cost-aware spill-to-checkpoint when selectively preempted under pressure.
     bool allow_preempt_spill = false;
+    // The caller requires on-premises execution; forwarded as
+    // GenerateRequest/ChatRequest::local_only, so remote providers refuse it.
+    bool local_only = false;
     // Optional stateful grammar matcher hooks (for ExactResume state snapshot/restore
     // and Branch reset on token_logits backends).
     std::optional<GrammarMatcherHooks> grammar_hooks = std::nullopt;
+    // Optional served model identifier (e.g. launch-profile name on `serve`)
+    // and caller-requested model alias (e.g. "default") carried as `model` and
+    // `requested_model` on `request.*` lifecycle events at `metrics` level.
+    std::optional<std::string> served_model = std::nullopt;
+    std::optional<std::string> requested_model = std::nullopt;
 };
 
 struct ForkOptions {

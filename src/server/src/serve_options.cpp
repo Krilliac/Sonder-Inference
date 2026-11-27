@@ -13,7 +13,7 @@
 #  include <sys/stat.h>
 #endif
 
-#include "backends/llamaserver/env_policy.hpp"
+#include "server/src/env_policy.hpp"
 #include "cli/cli_spec.hpp"
 #include "request_path.hpp"
 #include "sonder/inference/backend_setup.hpp"
@@ -25,7 +25,7 @@ namespace sonder::inference::server::detail {
 const char* const kServeUsage = R"(sonder-infer serve - local HTTP API and live telemetry (docs/SERVER.md)
 
 Usage:
-  sonder-infer serve --backend mock|remote-mock|ollama|llamacpp|llamaserver [--model ID]... [options]
+  sonder-infer serve --backend mock|remote-mock|ollama|ollama_cloud|llamacpp|llamaserver [--model ID]... [options]
 
 Server:
   --host HOST             listen address (default 127.0.0.1; non-loopback needs --token-file)
@@ -48,7 +48,8 @@ Server:
   --log-format text|json  access log and diagnostics on stderr (default text)
 
 Backend:
-  --backend NAME          mock / remote-mock (synthetic, tests only), ollama, llamacpp,
+  --backend NAME          mock / remote-mock (synthetic, tests only), ollama,
+                          ollama_cloud (Ollama's hosted models over HTTPS), llamacpp,
                           llamaserver (external llama-server or OpenAI upstream)
                           (env SONDER_INFER_BACKEND). remote-mock launches a private
                           worker subprocess using this sonder-infer executable.
@@ -58,6 +59,11 @@ Backend:
   --ollama-url URL        Ollama base URL (env SONDER_OLLAMA_URL, then OLLAMA_HOST)
   --ollama-allow-remote   allow a non-loopback Ollama host (needs https, i.e. a
                           SONDER_WITH_TLS=ON build)
+  --ollama-cloud-config PATH
+                          ollama_cloud JSON (base_url, api_key_env or api_key_file,
+                          models allowlist, timeouts); required by --backend
+                          ollama_cloud, whose --model defaults to the allowlist.
+                          Needs a SONDER_WITH_TLS=ON build
   --model-dir DIR         llama.cpp: directory with *.gguf files (repeatable)
   --device ID             device to load models on (llama.cpp: gpu:0 offloads to
                           the GPU; default cpu)
@@ -84,10 +90,14 @@ Backend:
   --batch-size N          llama.cpp: max prompt tokens per decode call (default 512)
   --ubatch-size N         llama.cpp: physical micro-batch, <= --batch-size
                           (default: llama.cpp's 512, capped at --batch-size)
-  --cache-type-k T        llama.cpp: K cache type f16 (default), f32, bf16, q8_0,
-                          q5_1, q5_0, q4_1, q4_0, iq4_nl, f8_e4m3, q2_0, pq2_0/pq2_0m
-  --cache-type-v T        llama.cpp: V cache type, same values; a quantized V
-                          cache needs flash attention (on or auto)
+  --cache-type-k T        llama.cpp: K cache type auto (default: q8_0 when model
+                          head dims % 32 == 0 and flash-attn != off, else f16),
+                          f16, f32, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl,
+                          f8_e4m3, q2_0, pq2_0/pq2_0m
+  --cache-type-v T        llama.cpp: V cache type, same values and auto default;
+                          an explicit quantized V cache needs flash attention
+  --allow-q4-k-cache      llama.cpp: allow q4_0 for --cache-type-k on models with
+                          K-cache Hadamard rotation
   --flash-attn MODE       llama.cpp: auto (default), on or off
   --swa-kv-mode MODE      llama.cpp: sliding-window KV policy full (default) or
                           compact_if_qualified (guarded by min_retained_pos)
@@ -95,6 +105,7 @@ Backend:
   --no-mmap               llama.cpp: disable GGUF memory-mapping (direct read)
   --no-kv-unified         llama.cpp: disable unified KV buffer across slots
   --no-prefix-cache       llama.cpp: disable prompt KV prefix reuse across turns
+  --startup-smoke-test    llama.cpp: run a post-load greedy smoke test (default off)
   --slots N               llama.cpp: cached KV sequence slots (1..16, default 1)
   --spec-type TYPE        llama.cpp: in-process speculative decoding
                           (none|auto|ngram|ngram-mod|suffix|draft-mtp, default none)
@@ -163,6 +174,7 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"host", Kind::value},                   {"port", Kind::value},
         {"backend", Kind::value},                {"model", Kind::repeat},
         {"ollama-url", Kind::value},             {"ollama-allow-remote", Kind::flag},
+        {"ollama-cloud-config", Kind::value},
         {"model-dir", Kind::repeat},             {"token-file", Kind::value},
         {"cors-origin", Kind::repeat},           {"no-default-cors", Kind::flag},
         {"telemetry-level", Kind::value},        {"telemetry-buffer", Kind::value},
@@ -183,10 +195,12 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"moe-experts", Kind::value},            {"tensor-override", Kind::repeat},
         {"batch-size", Kind::value},             {"ubatch-size", Kind::value},
         {"cache-type-k", Kind::value},           {"cache-type-v", Kind::value},
+        {"allow-q4-k-cache", Kind::flag},
         {"flash-attn", Kind::value},             {"swa-kv-mode", Kind::value},
         {"threads", Kind::value},
         {"no-mmap", Kind::flag},                 {"no-kv-unified", Kind::flag},
-        {"no-prefix-cache", Kind::flag},         {"slots", Kind::value},
+        {"no-prefix-cache", Kind::flag},         {"startup-smoke-test", Kind::flag},
+        {"slots", Kind::value},
         {"spec-type", Kind::value},              {"spec-draft-max", Kind::value},
         {"moe-cache-mib", Kind::value},          {"moe-cache-cpu-share", Kind::value},
         {"cache-ram-mib", Kind::value},          {"mmproj", Kind::value},
@@ -380,6 +394,9 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
         if (a.flags.count("no-kv-unified") != 0) {
             return usage_error("--no-kv-unified conflicts with --profile (set the profile's typed fields)");
         }
+        if (a.flags.count("startup-smoke-test") != 0) {
+            return usage_error("--startup-smoke-test conflicts with --profile (set the profile's typed fields)");
+        }
         if (a.get("llamaserver-url") && (!multi_profile || primary->backend != kLaunchProfileBackendLlamaServer)) {
             return usage_error("--llamaserver-url conflicts with --profile (set the profile's typed fields)");
         }
@@ -402,7 +419,7 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     }
     o.backend.backend = primary ? primary->backend : a.get("backend").value_or(env.backend.value_or(""));
     if (o.backend.backend.empty()) {
-        return usage_error("--backend is required (mock, remote-mock, ollama, llamacpp or llamaserver; or set SONDER_INFER_BACKEND)");
+        return usage_error("--backend is required (mock, remote-mock, ollama, ollama_cloud, llamacpp or llamaserver; or set SONDER_INFER_BACKEND)");
     }
     if (!active_profiles.empty()) {
         o.models.clear();
@@ -421,6 +438,18 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     o.backend.ollama_allow_remote = a.flags.count("ollama-allow-remote") != 0;
     if (auto path = a.get("llamaserver-config")) {
         if (auto st = load_llamaserver_config(*path, o.backend); !st.ok()) return usage_error(st.message());
+    }
+    if (auto path = a.get("ollama-cloud-config")) {
+        if (o.backend.backend != "ollama_cloud") return usage_error("--ollama-cloud-config requires --backend ollama_cloud");
+        if (auto st = load_ollama_cloud_config(*path, o.backend); !st.ok()) return usage_error(st.message());
+        if (o.models.empty()) o.models = o.backend.ollama_cloud_models;
+        // Security-relevant, like --ollama-allow-remote in the other commands.
+        log->line("sonder-infer serve: warning: --backend ollama_cloud sends prompts to a remote provider (" +
+                  (o.backend.ollama_cloud_base_url.empty() ? std::string("https://ollama.com")
+                                                           : o.backend.ollama_cloud_base_url) +
+                  "); X-Sonder-Local-Only requests are refused");
+    } else if (o.backend.backend == "ollama_cloud") {
+        return usage_error("--backend ollama_cloud requires --ollama-cloud-config PATH");
     }
     if (auto v = a.get("llamaserver-mode")) o.backend.llamaserver_mode = *v;
     if (auto v = a.get("llamaserver-url")) o.backend.llamaserver_url = *v;
@@ -600,7 +629,8 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
                                    " applies only to --backend llamacpp; for llamaserver set it in the JSON args");
             }
         }
-        for (const char* flag : {"no-mmap", "no-kv-unified", "no-prefix-cache"}) {
+        for (const char* flag :
+             {"no-mmap", "no-kv-unified", "no-prefix-cache", "startup-smoke-test", "allow-q4-k-cache"}) {
             if (a.flags.count(flag) != 0) {
                 return usage_error(std::string("option --") + flag +
                                    " applies only to --backend llamacpp; for llamaserver set it in the JSON args");
@@ -618,6 +648,7 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     // Values are checked by validate_options() (validate_llamacpp_options).
     if (auto v = a.get("cache-type-k")) o.backend.llamacpp_kv_cache_type_k = *v;
     if (auto v = a.get("cache-type-v")) o.backend.llamacpp_kv_cache_type_v = *v;
+    if (a.flags.count("allow-q4-k-cache") != 0) o.backend.llamacpp_kv_k_q4_allowed = true;
     if (auto v = a.get("flash-attn")) o.backend.llamacpp_flash_attention = *v;
     if (auto v = a.get("swa-kv-mode")) {
         SwaKvMode parsed_swa = SwaKvMode::Full;
@@ -638,6 +669,9 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     }
     if (a.flags.count("no-prefix-cache") != 0) {
         o.backend.llamacpp_prefix_cache = false;
+    }
+    if (a.flags.count("startup-smoke-test") != 0) {
+        o.backend.llamacpp_startup_smoke_test = true;
     }
     if (auto v = a.get("slots")) {
         if (!parse_uint(*v, 16, n) || n == 0) return usage_error("--slots must be an integer from 1 to 16");
@@ -683,6 +717,7 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
         std::string owner_v = o.backend.llamacpp_kv_cache_type_v ? primary->name : std::string{};
         std::string owner_fa = o.backend.llamacpp_flash_attention ? primary->name : std::string{};
         std::string owner_swa = o.backend.llamacpp_swa_kv_mode ? primary->name : std::string{};
+        std::string owner_smoke = o.backend.llamacpp_startup_smoke_test ? primary->name : std::string{};
         std::string owner_slots = o.backend.llamacpp_slots ? primary->name : std::string{};
         std::string owner_kv_unified = o.backend.llamacpp_kv_unified ? primary->name : std::string{};
         std::string owner_cache_ram = o.backend.llamacpp_cache_ram_mib ? primary->name : std::string{};
@@ -770,6 +805,12 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
                 !err.empty()) {
                 return usage_error(err);
             }
+            if (const std::string err = merge_opt("startup_smoke_test", o.backend.llamacpp_startup_smoke_test,
+                                                  candidate_backend.llamacpp_startup_smoke_test, owner_smoke,
+                                                  bool_text);
+                !err.empty()) {
+                return usage_error(err);
+            }
             if (const std::string err = merge_opt("parallel", o.backend.llamacpp_slots,
                                                   candidate_backend.llamacpp_slots, owner_slots, int_text);
                 !err.empty()) {
@@ -827,6 +868,14 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
                 return usage_error(
                     "combined llamacpp launch profiles set speculative.draft_n_max alongside speculative type 'none'");
             }
+            if (o.backend.llamacpp_gpu_layers && *o.backend.llamacpp_gpu_layers == 0) {
+                for (const LaunchProfile* ap : active_profiles) {
+                    if (ap != nullptr && !ap->devices.empty()) {
+                        return usage_error("combined llamacpp launch profiles set 'devices' on '" + ap->name +
+                                           "' alongside 'n_gpu_layers' 0 (CPU only)");
+                    }
+                }
+            }
         }
         std::string resolved = "llamacpp resolved settings:";
         const auto add_resolved = [&](const char* k, const std::string& v) {
@@ -844,6 +893,9 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
         if (o.backend.llamacpp_flash_attention) add_resolved("flash_attn", *o.backend.llamacpp_flash_attention);
         if (o.backend.llamacpp_slots) add_resolved("slots", std::to_string(*o.backend.llamacpp_slots));
         if (o.backend.llamacpp_kv_unified) add_resolved("kv_unified", *o.backend.llamacpp_kv_unified ? "true" : "false");
+        if (o.backend.llamacpp_startup_smoke_test) {
+            add_resolved("startup_smoke_test", *o.backend.llamacpp_startup_smoke_test ? "true" : "false");
+        }
         if (o.backend.llamacpp_cache_ram_mib) add_resolved("cache_ram_mib", std::to_string(*o.backend.llamacpp_cache_ram_mib));
         if (o.backend.llamacpp_threads) add_resolved("threads", std::to_string(*o.backend.llamacpp_threads));
         if (o.backend.llamacpp_spec_type) add_resolved("spec_type", *o.backend.llamacpp_spec_type);

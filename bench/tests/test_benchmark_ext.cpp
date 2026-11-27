@@ -669,6 +669,66 @@ TEST_CASE("single-child fan-out records child index 0") {
     CHECK(batches[0].find("children")->as_int() == 1);
 }
 
+TEST_CASE("sonder-bench defaults to llamacpp and accepts native options without weights") {
+    bench::BenchCliArgs parsed;
+    CHECK(parsed.backend == "llamacpp");
+    std::string error;
+    REQUIRE_MESSAGE(bench::parse_bench_cli_args({"--model", "models/test model.gguf"}, parsed, error), error);
+    CHECK(parsed.backend == "llamacpp");
+    CHECK(parsed.model == "models/test model.gguf");
+    CHECK(parsed.context_length == 4096);
+    CHECK(parsed.threads == 0);
+    CHECK(parsed.gpu_layers == -1);
+
+    REQUIRE_MESSAGE(bench::parse_bench_cli_args(
+        {"--backend", "llamacpp", "--model", "model.gguf", "--ctx-size", "8192", "--threads", "4",
+         "--gpu-layers", "0", "--warmup", "0", "--runs", "1", "--no-gpu-snapshot"}, parsed, error), error);
+    CHECK(parsed.backend == "llamacpp");
+    CHECK(parsed.context_length == 8192);
+    CHECK(parsed.threads == 4);
+    CHECK(parsed.gpu_layers == 0);
+    CHECK(parsed.options.warmup_runs == 0);
+    CHECK(parsed.options.measured_runs == 1);
+    CHECK_FALSE(parsed.options.capture_gpu_snapshot);
+
+    REQUIRE_MESSAGE(bench::parse_bench_cli_args(
+        {"--model", "model.gguf", "--ctx-size", "0", "--threads", "0", "--gpu-layers", "-1"}, parsed, error), error);
+    CHECK(parsed.context_length == 0);
+    CHECK(parsed.threads == 0);
+    CHECK(parsed.gpu_layers == -1);
+    const auto help = bench::render_bench_cli_help();
+    CHECK(help.find("default: llamacpp") != std::string::npos);
+    CHECK(help.find("--ctx-size N") != std::string::npos);
+    CHECK(help.find("--threads N") != std::string::npos);
+    CHECK(help.find("--gpu-layers N") != std::string::npos);
+}
+
+TEST_CASE("sonder-bench rejects invalid native options and backend combinations") {
+    bench::BenchCliArgs parsed;
+    std::string error;
+    for (const char* option : {"--ctx-size", "--threads", "--gpu-layers"}) {
+        for (const char* bad : {"-2", "nope", "1.5", "2147483648", ""}) {
+            CAPTURE(option);
+            CAPTURE(bad);
+            CHECK_FALSE(bench::parse_bench_cli_args({"--model", "model.gguf", option, bad}, parsed, error));
+            CHECK(error.find(option) != std::string::npos);
+        }
+        for (const char* backend : {"mock", "ollama", "llamaserver"}) {
+            CAPTURE(option);
+            CAPTURE(backend);
+            CHECK_FALSE(bench::parse_bench_cli_args({"--backend", backend, option, "1"}, parsed, error));
+            CHECK(error.find("requires --backend llamacpp") != std::string::npos);
+        }
+    }
+    for (const char* option : {"--ctx-size", "--threads"}) {
+        CHECK_FALSE(bench::parse_bench_cli_args({option, "-1"}, parsed, error));
+    }
+    CHECK_FALSE(bench::parse_bench_cli_args({"--require-idle"}, parsed, error));
+    CHECK(error.find("--backend ollama") != std::string::npos);
+    CHECK_FALSE(bench::parse_bench_cli_args({"--ollama-url", "http://127.0.0.1:11434"}, parsed, error));
+    CHECK(error.find("--backend ollama") != std::string::npos);
+}
+
 TEST_CASE("sonder-bench CLI options for llamaserver backend") {
     bench::BenchCliArgs parsed;
     std::string error;

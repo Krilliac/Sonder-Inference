@@ -1,4 +1,5 @@
 #include "chat_handler.hpp"
+#include "embeddings_route.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -16,6 +17,10 @@
 #include "reasoning_budget.hpp"
 #include "test_hooks.hpp"
 #include "tool_call_parser.hpp"
+#ifdef SONDER_LLAMACPP_HAS_LLGUIDANCE
+#include "json_schema_normalize.hpp"
+#include "llguidance_sampler.hpp"
+#endif
 
 namespace sonder::inference::server::detail {
 
@@ -43,13 +48,119 @@ json::Object openai_tool_call_delta_json(std::uint32_t index, const std::string&
     return entry;
 }
 
+std::string bounded_model_label(std::string_view text) {
+    if (text.size() > kMaxEvidenceStringBytes) {
+        std::size_t n = kMaxEvidenceStringBytes;
+        while (n > 0 && (static_cast<unsigned char>(text[n]) & 0xC0u) == 0x80u) {
+            --n;
+        }
+        text = text.substr(0, n);
+    }
+    return sanitize_bounded_evidence_string(text, kMaxEvidenceStringBytes);
+}
+
+#ifdef SONDER_LLAMACPP_HAS_LLGUIDANCE
+bool backend_uses_llguidance_json_schema(const ChatJob& job, bool backend_supports_structured_output,
+                                         std::string_view backend_name) noexcept {
+    return backend_supports_structured_output && backend_name == "llamacpp" &&
+           sonder::backends::llamacpp::LlguidanceAvailable() &&
+           job.response_format_type.has_value() && *job.response_format_type == "json_schema";
+}
+
+std::optional<ApiError> prepare_llguidance_chat_schema(ChatJob& job, bool backend_native_tools,
+                                                       const StructuredGrammarEngine& engine) {
+    const bool tool_choice_none = job.tool_choice && job.tool_choice->mode == ToolChoiceMode::none;
+    if (!job.tools.empty() && !tool_choice_none && !backend_native_tools) {
+        if (Status st = validate_strict_tool_schemas(job.tools, job.tool_choice, engine); !st.ok()) {
+            return make_error(400, st.code() == ErrorCode::unsupported ? "unsupported_parameter" : "invalid_request",
+                              st.message(), "tools");
+        }
+    }
+    std::string normalized;
+    if (job.pending_response_schema) {
+        if (!job.pending_response_schema->is_object()) {
+            return make_error(400, "invalid_request",
+                              "invalid response_format: invalid response_format.json_schema.schema: schema must be a JSON object",
+                              "response_format.json_schema.schema");
+        }
+        auto norm = llamacpp_detail::NormalizeJsonSchema(*job.pending_response_schema);
+        if (!norm.ok()) {
+            return make_error(400, "invalid_request", "invalid response_format: " + norm.status().message(),
+                              "response_format.json_schema.schema");
+        }
+        normalized = norm.value().dump();
+        job.pending_response_schema = std::move(norm).value();
+    } else if (job.response_format_schema) {
+        auto norm = llamacpp_detail::NormalizeJsonSchemaText(*job.response_format_schema);
+        if (!norm.ok()) {
+            return make_error(400, "invalid_request", "invalid response_format: " + norm.status().message(),
+                              "response_format.json_schema.schema");
+        }
+        if (norm.value().empty() || norm.value().front() != '{') {
+            return make_error(400, "invalid_request",
+                              "invalid response_format: invalid response_format.json_schema.schema: schema must be a JSON object",
+                              "response_format.json_schema.schema");
+        }
+        normalized = std::move(norm).value();
+    } else {
+        return make_error(400, "invalid_request",
+                          "invalid response_format: invalid response_format.json_schema.schema: schema is missing",
+                          "response_format.json_schema.schema");
+    }
+    job.compiled_grammar.reset();
+    job.grammar.clear();
+    job.response_format_schema = std::move(normalized);
+    return std::nullopt;
+}
+#endif
 }  // namespace
+
+void emit_pre_execution_failure(TelemetryBus& bus, TelemetryContext ctx, std::string_view kind,
+                                std::string_view error_code, const Correlation& corr,
+                                std::optional<RequestPriority> job_priority,
+                                std::string_view resolved_model,
+                                std::string_view requested_model,
+                                bool cancelled,
+                                std::optional<double> admission_queue_ms) {
+    if (corr.run_id) ctx.run_id = corr.run_id;
+    if (corr.agent_id) ctx.agent_id = corr.agent_id;
+    if (corr.task_id) ctx.task_id = corr.task_id;
+    const auto prio = corr.priority_class ? corr.priority_class : job_priority;
+    json::Object attrs{{"kind", std::string(kind)},
+                       {"outcome", cancelled ? "cancelled" : "failed"}};
+    if (!resolved_model.empty()) {
+        attrs.set("model", bounded_model_label(resolved_model));
+    }
+    if (!requested_model.empty()) {
+        attrs.set("requested_model", bounded_model_label(requested_model));
+    }
+    if (prio) {
+        attrs.set("priority_class", to_string(*prio));
+        if (admission_queue_ms.has_value()) {
+            attrs.set("admission", json::Object{{"priority", to_string(*prio)},
+                                                {"queue_ms", *admission_queue_ms}});
+        }
+    }
+    attrs.set("error_code", std::string(error_code));
+    attrs.set("error", std::string(error_code));
+    attrs.set("backend_started", false);
+    if (corr.parent_request_id) {
+        attrs.set("parent_request_id", *corr.parent_request_id);
+    }
+    bus.emit(cancelled ? "request.cancelled" : "request.failed", std::move(ctx), std::move(attrs),
+             TelemetryLevel::metrics);
+}
 
 std::optional<ApiError> prepare_chat_grammar(
     ChatJob& job, std::string_view tokenizer_identity,
     bool backend_supports_structured_output, bool backend_native_tools,
     std::string_view backend_name, CompiledGrammarCache* cache,
     const StructuredGrammarEngine& engine) {
+#ifdef SONDER_LLAMACPP_HAS_LLGUIDANCE
+    if (backend_uses_llguidance_json_schema(job, backend_supports_structured_output, backend_name)) {
+        return prepare_llguidance_chat_schema(job, backend_native_tools, engine);
+    }
+#endif
     auto resolved = resolve_structured_grammar(
         "response_format.json_schema.schema", job.grammar, job.response_format_type,
         job.pending_response_schema, job.response_format_schema, job.tools, job.tool_choice,
@@ -91,6 +202,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     ro.request_id = make_id("req");
     ro.parent_request_id = corr.parent_request_id;
     ro.no_text_capture = corr.no_text_capture;
+    ro.local_only = corr.local_only;
     ro.session_key = chat_session_key(job, corr);
     ro.thinking = job.thinking;
     // Both protocols ask the backend to split reasoning from visible text.
@@ -98,9 +210,23 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     // (llama-server's convention); neither adds a field when it is empty.
     ro.separate_reasoning = true;
     ro.retain_text = !job.stream;
+    if (ex.request_id.rfind("req-", 0) == 0) ro.request_id = ex.request_id;
+    ex.request_id = *ro.request_id;
+    ro.served_model = model;
+    ro.requested_model = job.model;
     std::shared_ptr<const CompiledGrammar> compiled_grammar = job.compiled_grammar;
     std::string fallback_grammar = job.grammar;
-    if (!compiled_grammar && grammar_cache != nullptr &&
+#ifdef SONDER_LLAMACPP_HAS_LLGUIDANCE
+    const bool llg_candidate = backend_uses_llguidance_json_schema(job, backend_supports_structured_output, backend);
+    const bool session_has_native_chat =
+        session && session->model() && session->model()->backend_model().has_native_chat();
+    const bool native_llg = llg_candidate && session_has_native_chat;
+    const bool llg_needs_gbnf_fallback = llg_candidate && !session_has_native_chat && fallback_grammar.empty();
+#else
+    constexpr bool native_llg = false;
+    constexpr bool llg_needs_gbnf_fallback = false;
+#endif
+    if (!native_llg && !compiled_grammar && (grammar_cache != nullptr || llg_needs_gbnf_fallback) &&
         (job.response_format_type.has_value() || (!job.tools.empty() && job.tool_choice))) {
         const std::string fallback_tok =
             tokenizer_identity.empty() ? build_tokenizer_identity_key(backend, model) : std::string(tokenizer_identity);
@@ -109,11 +235,13 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
             job.pending_response_schema, job.response_format_schema, job.tools, job.tool_choice,
             backend_supports_structured_output, backend_native_tools, backend, fallback_tok, grammar_cache);
         if (!resolved.ok()) {
-            ex.leave_inflight();
-            session->close();
             const std::string code = resolved.status().code() == ErrorCode::unsupported
                                          ? "unsupported_parameter"
                                          : "invalid_request";
+            emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "chat", code, corr,
+                                       priority, model, job.model);
+            ex.leave_inflight();
+            session->close();
             const bool from_tools =
                 !job.response_format_type.has_value() && job.grammar.empty() && !job.tools.empty();
             ex.send_error(make_error(400, code, resolved.status().message(),
@@ -125,11 +253,13 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     }
     auto matcher_res = bind_request_grammar_matcher(compiled_grammar, ro.grammar, fallback_grammar);
     if (!matcher_res.ok()) {
-        ex.leave_inflight();
-        session->close();
         const std::string code = matcher_res.status().code() == ErrorCode::unsupported
                                      ? "unsupported_parameter"
                                      : "invalid_request";
+        emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "chat", code, corr,
+                                   priority, model, job.model);
+        ex.leave_inflight();
+        session->close();
         ex.send_error(make_error(400, code, matcher_res.status().message(), "response_format"));
         return;
     }
@@ -226,6 +356,8 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     } catch (const std::system_error&) {
         // The OS refused a thread (thread or memory limits). Nothing ran:
         // answer 503 for this request instead of taking the server down.
+        emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "chat", "overloaded",
+                                   corr, priority, model, job.model);
         end_request();
         session->close();
         ex.watcher_failure();
@@ -243,19 +375,12 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
             return disconnected.load() || session->state() == SessionState::closed || ex.hard_stop.load();
         }, deadline);
         if (ticket->outcome() != PriorityAdmission::Outcome::admitted) {
-            json::Object attrs{{"kind", "chat"},
-                               {"priority_class", to_string(priority)},
-                               {"admission", json::Object{{"priority", to_string(priority)},
-                                                           {"queue_ms", ticket->queue_ms()}}},
-                               {"error_code", ticket->outcome() == PriorityAdmission::Outcome::full
-                                                  ? "overloaded"
-                                                  : ticket->outcome() == PriorityAdmission::Outcome::expired
-                                                  ? "deadline_exceeded" : "cancelled"},
-                               {"backend_started", false}};
-            if (ro.parent_request_id) attrs.set("parent_request_id", *ro.parent_request_id);
-            ex.telemetry.emit(disconnected.load() ? "request.cancelled" : "request.failed",
-                              session->telemetry_context(ro.request_id), std::move(attrs),
-                              TelemetryLevel::metrics);
+            const char* err_code = ticket->outcome() == PriorityAdmission::Outcome::full
+                                       ? "overloaded"
+                                       : ticket->outcome() == PriorityAdmission::Outcome::expired
+                                       ? "deadline_exceeded" : "cancelled";
+            emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "chat", err_code,
+                                       corr, priority, model, job.model, disconnected.load(), ticket->queue_ms());
             end_request();
             if (disconnected.load()) {
                 ex.status = 499;
@@ -478,6 +603,10 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
         return;
     }
     if (!result.ok()) {
+        if (session->requests_started() == 0) {
+            emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "chat",
+                                       to_string(result.status().code()), corr, priority, model, job.model);
+        }
         session->close();
         const ApiError e = map_session_failure(result.status(), rejected);
         if (sse.headers_sent()) {
@@ -618,6 +747,7 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
     ro.request_id = make_id("req");
     ro.parent_request_id = corr.parent_request_id;
     ro.no_text_capture = corr.no_text_capture;
+    ro.local_only = corr.local_only;
     if (job.session_key) {
         ro.session_key = *job.session_key;
     } else {
@@ -629,6 +759,9 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
     ro.priority_class = priority;
     ro.preserve_numeric_priority = corr.numeric_priority;
     if (deadline_ms) ro.deadline = deadline;
+    if (ex.request_id.rfind("req-", 0) == 0) ro.request_id = ex.request_id;
+    ro.served_model = model;
+    ro.requested_model = job.model;
     std::atomic<bool> backend_started{false};
     const std::string completion_id = "cmpl-" + *ro.request_id;
     ex.request_id = *ro.request_id;
@@ -704,6 +837,8 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
             }
         });
     } catch (const std::system_error&) {
+        emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "generate", "overloaded",
+                                   corr, priority, model, job.model);
         end_request();
         session->close();
         ex.watcher_failure();
@@ -720,19 +855,13 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
             return disconnected.load() || session->state() == SessionState::closed || ex.hard_stop.load();
         }, deadline);
         if (ticket->outcome() != PriorityAdmission::Outcome::admitted) {
-            json::Object attrs{{"kind", "generate"},
-                               {"priority_class", to_string(priority)},
-                               {"admission", json::Object{{"priority", to_string(priority)},
-                                                          {"queue_ms", ticket->queue_ms()}}},
-                               {"error_code", ticket->outcome() == PriorityAdmission::Outcome::full
-                                                  ? "overloaded"
-                                                  : ticket->outcome() == PriorityAdmission::Outcome::expired
-                                                  ? "deadline_exceeded"
-                                                  : "cancelled"},
-                               {"backend_started", false}};
-            if (ro.parent_request_id) attrs.set("parent_request_id", *ro.parent_request_id);
-            ex.telemetry.emit(disconnected.load() ? "request.cancelled" : "request.failed",
-                              session->telemetry_context(ro.request_id), std::move(attrs), TelemetryLevel::metrics);
+            const char* err_code = ticket->outcome() == PriorityAdmission::Outcome::full
+                                       ? "overloaded"
+                                       : ticket->outcome() == PriorityAdmission::Outcome::expired
+                                       ? "deadline_exceeded"
+                                       : "cancelled";
+            emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "generate", err_code,
+                                       corr, priority, model, job.model, disconnected.load(), ticket->queue_ms());
             end_request();
             if (disconnected.load()) {
                 ex.status = 499;
@@ -810,6 +939,10 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
         return;
     }
     if (!result.ok()) {
+        if (session->requests_started() == 0) {
+            emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "generate",
+                                       to_string(result.status().code()), corr, priority, model, job.model);
+        }
         session->close();
         const ApiError e = map_session_failure(result.status(), rejected);
         if (sse.headers_sent()) {
@@ -876,6 +1009,9 @@ void execute_embeddings(ChatExchange& ex, const EmbedJob& job, const Correlation
     ro.priority_class = priority;
     ro.preserve_numeric_priority = corr.numeric_priority;
     if (deadline_ms) ro.deadline = deadline;
+    if (ex.request_id.rfind("req-", 0) == 0) ro.request_id = ex.request_id;
+    ro.served_model = model;
+    ro.requested_model = job.model;
     std::atomic<bool> backend_started{false};
     ex.request_id = *ro.request_id;
 
@@ -933,6 +1069,8 @@ void execute_embeddings(ChatExchange& ex, const EmbedJob& job, const Correlation
             }
         });
     } catch (const std::system_error&) {
+        emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "embed", "overloaded",
+                                   corr, priority, model, job.model);
         end_request();
         session->close();
         ex.watcher_failure();
@@ -949,19 +1087,13 @@ void execute_embeddings(ChatExchange& ex, const EmbedJob& job, const Correlation
             return disconnected.load() || session->state() == SessionState::closed || ex.hard_stop.load();
         }, deadline);
         if (ticket->outcome() != PriorityAdmission::Outcome::admitted) {
-            json::Object attrs{{"kind", "embed"},
-                               {"priority_class", to_string(priority)},
-                               {"admission", json::Object{{"priority", to_string(priority)},
-                                                          {"queue_ms", ticket->queue_ms()}}},
-                               {"error_code", ticket->outcome() == PriorityAdmission::Outcome::full
-                                                  ? "overloaded"
-                                                  : ticket->outcome() == PriorityAdmission::Outcome::expired
-                                                  ? "deadline_exceeded"
-                                                  : "cancelled"},
-                               {"backend_started", false}};
-            if (ro.parent_request_id) attrs.set("parent_request_id", *ro.parent_request_id);
-            ex.telemetry.emit(disconnected.load() ? "request.cancelled" : "request.failed",
-                              session->telemetry_context(ro.request_id), std::move(attrs), TelemetryLevel::metrics);
+            const char* err_code = ticket->outcome() == PriorityAdmission::Outcome::full
+                                       ? "overloaded"
+                                       : ticket->outcome() == PriorityAdmission::Outcome::expired
+                                       ? "deadline_exceeded"
+                                       : "cancelled";
+            emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "embed", err_code,
+                                       corr, priority, model, job.model, disconnected.load(), ticket->queue_ms());
             end_request();
             if (disconnected.load()) {
                 ex.status = 499;
@@ -983,10 +1115,14 @@ void execute_embeddings(ChatExchange& ex, const EmbedJob& job, const Correlation
     EmbedRequest embed_req;
     embed_req.request_id = *ro.request_id;
     embed_req.inputs = job.inputs;
+    embed_req.token_inputs = job.token_inputs;
     embed_req.normalize = job.normalize;
     embed_req.dimensions = job.dimensions;
     embed_req.pooling_type = job.pooling_type;
-    embed_req.encoding_format = job.encoding_format;
+    // Backends always return float vectors; build_embeddings_response() owns
+    // base64 wire encoding so upstream backends (e.g. llamaserver) never receive
+    // a wire format their response parser does not decode.
+    embed_req.encoding_format = "float";
     auto result = session->embed(embed_req, ro);
     end_request();
 
@@ -994,6 +1130,10 @@ void execute_embeddings(ChatExchange& ex, const EmbedJob& job, const Correlation
         ex.status = 499;
         session->close();
         return;
+    }
+    if (!result.ok() && session->requests_started() == 0) {
+        emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "embed",
+                                   to_string(result.status().code()), corr, priority, model, job.model);
     }
     if (deadline_ms && !backend_started.load() && std::chrono::steady_clock::now() >= deadline) {
         session->close();
@@ -1010,34 +1150,7 @@ void execute_embeddings(ChatExchange& ex, const EmbedJob& job, const Correlation
         return;
     }
 
-    const EmbedResult& r = result.value();
-    json::Array data;
-    data.reserve(r.embeddings.size());
-    for (std::size_t i = 0; i < r.embeddings.size(); ++i) {
-        json::Array vec;
-        vec.reserve(r.embeddings[i].size());
-        for (const float v : r.embeddings[i]) {
-            vec.emplace_back(static_cast<double>(v));
-        }
-        data.emplace_back(json::Object{{"object", "embedding"},
-                                       {"index", static_cast<std::int64_t>(i)},
-                                       {"embedding", std::move(vec)}});
-    }
-    const std::size_t effective_dims =
-        r.dimensions > 0 ? r.dimensions : (!r.embeddings.empty() ? r.embeddings.front().size() : 0u);
-    json::Object meta{{"api_version", kApiVersion},
-                      {"request_id", *ro.request_id},
-                      {"backend", backend},
-                      {"model", model},
-                      {"synthetic", ex.synthetic},
-                      {"dimensions", static_cast<std::uint64_t>(effective_dims)},
-                      {"pooling_type", to_string(r.pooling_type)},
-                      {"encoding_format", r.encoding_format.empty() ? job.encoding_format : r.encoding_format}};
-    json::Object doc{{"object", "list"},
-                     {"data", std::move(data)},
-                     {"model", model},
-                     {"usage", json::Object{{"prompt_tokens", r.prompt_tokens}, {"total_tokens", r.prompt_tokens}}},
-                     {"sonder", std::move(meta)}};
+    json::Object doc = build_embeddings_response(job, result.value(), model, backend, *ro.request_id, ex.synthetic);
     session->close();
     ex.send_json(200, doc);
 }
@@ -1057,6 +1170,9 @@ void execute_rerank(ChatExchange& ex, const RerankJob& job, const Correlation& c
     ro.priority_class = priority;
     ro.preserve_numeric_priority = corr.numeric_priority;
     if (deadline_ms) ro.deadline = deadline;
+    if (ex.request_id.rfind("req-", 0) == 0) ro.request_id = ex.request_id;
+    ro.served_model = model;
+    ro.requested_model = job.model;
     std::atomic<bool> backend_started{false};
     ex.request_id = *ro.request_id;
 
@@ -1114,6 +1230,8 @@ void execute_rerank(ChatExchange& ex, const RerankJob& job, const Correlation& c
             }
         });
     } catch (const std::system_error&) {
+        emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "rerank", "overloaded",
+                                   corr, priority, model, job.model);
         end_request();
         session->close();
         ex.watcher_failure();
@@ -1130,19 +1248,13 @@ void execute_rerank(ChatExchange& ex, const RerankJob& job, const Correlation& c
             return disconnected.load() || session->state() == SessionState::closed || ex.hard_stop.load();
         }, deadline);
         if (ticket->outcome() != PriorityAdmission::Outcome::admitted) {
-            json::Object attrs{{"kind", "rerank"},
-                               {"priority_class", to_string(priority)},
-                               {"admission", json::Object{{"priority", to_string(priority)},
-                                                          {"queue_ms", ticket->queue_ms()}}},
-                               {"error_code", ticket->outcome() == PriorityAdmission::Outcome::full
-                                                  ? "overloaded"
-                                                  : ticket->outcome() == PriorityAdmission::Outcome::expired
-                                                  ? "deadline_exceeded"
-                                                  : "cancelled"},
-                               {"backend_started", false}};
-            if (ro.parent_request_id) attrs.set("parent_request_id", *ro.parent_request_id);
-            ex.telemetry.emit(disconnected.load() ? "request.cancelled" : "request.failed",
-                              session->telemetry_context(ro.request_id), std::move(attrs), TelemetryLevel::metrics);
+            const char* err_code = ticket->outcome() == PriorityAdmission::Outcome::full
+                                       ? "overloaded"
+                                       : ticket->outcome() == PriorityAdmission::Outcome::expired
+                                       ? "deadline_exceeded"
+                                       : "cancelled";
+            emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "rerank", err_code,
+                                       corr, priority, model, job.model, disconnected.load(), ticket->queue_ms());
             end_request();
             if (disconnected.load()) {
                 ex.status = 499;
@@ -1174,6 +1286,10 @@ void execute_rerank(ChatExchange& ex, const RerankJob& job, const Correlation& c
         ex.status = 499;
         session->close();
         return;
+    }
+    if (!result.ok() && session->requests_started() == 0) {
+        emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "rerank",
+                                   to_string(result.status().code()), corr, priority, model, job.model);
     }
     if (deadline_ms && !backend_started.load() && std::chrono::steady_clock::now() >= deadline) {
         session->close();
@@ -1230,6 +1346,9 @@ void execute_score(ChatExchange& ex, const ScoreJob& job, const Correlation& cor
     ro.priority_class = priority;
     ro.preserve_numeric_priority = corr.numeric_priority;
     if (deadline_ms) ro.deadline = deadline;
+    if (ex.request_id.rfind("req-", 0) == 0) ro.request_id = ex.request_id;
+    ro.served_model = model;
+    ro.requested_model = job.model;
     std::atomic<bool> backend_started{false};
     ex.request_id = *ro.request_id;
 
@@ -1287,6 +1406,8 @@ void execute_score(ChatExchange& ex, const ScoreJob& job, const Correlation& cor
             }
         });
     } catch (const std::system_error&) {
+        emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "score", "overloaded",
+                                   corr, priority, model, job.model);
         end_request();
         session->close();
         ex.watcher_failure();
@@ -1303,19 +1424,13 @@ void execute_score(ChatExchange& ex, const ScoreJob& job, const Correlation& cor
             return disconnected.load() || session->state() == SessionState::closed || ex.hard_stop.load();
         }, deadline);
         if (ticket->outcome() != PriorityAdmission::Outcome::admitted) {
-            json::Object attrs{{"kind", "score"},
-                               {"priority_class", to_string(priority)},
-                               {"admission", json::Object{{"priority", to_string(priority)},
-                                                          {"queue_ms", ticket->queue_ms()}}},
-                               {"error_code", ticket->outcome() == PriorityAdmission::Outcome::full
-                                                  ? "overloaded"
-                                                  : ticket->outcome() == PriorityAdmission::Outcome::expired
-                                                  ? "deadline_exceeded"
-                                                  : "cancelled"},
-                               {"backend_started", false}};
-            if (ro.parent_request_id) attrs.set("parent_request_id", *ro.parent_request_id);
-            ex.telemetry.emit(disconnected.load() ? "request.cancelled" : "request.failed",
-                              session->telemetry_context(ro.request_id), std::move(attrs), TelemetryLevel::metrics);
+            const char* err_code = ticket->outcome() == PriorityAdmission::Outcome::full
+                                       ? "overloaded"
+                                       : ticket->outcome() == PriorityAdmission::Outcome::expired
+                                       ? "deadline_exceeded"
+                                       : "cancelled";
+            emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "score", err_code,
+                                       corr, priority, model, job.model, disconnected.load(), ticket->queue_ms());
             end_request();
             if (disconnected.load()) {
                 ex.status = 499;
@@ -1344,6 +1459,10 @@ void execute_score(ChatExchange& ex, const ScoreJob& job, const Correlation& cor
         ex.status = 499;
         session->close();
         return;
+    }
+    if (!result.ok() && session->requests_started() == 0) {
+        emit_pre_execution_failure(ex.telemetry, session->telemetry_context(ro.request_id), "score",
+                                   to_string(result.status().code()), corr, priority, model, job.model);
     }
     if (deadline_ms && !backend_started.load() && std::chrono::steady_clock::now() >= deadline) {
         session->close();

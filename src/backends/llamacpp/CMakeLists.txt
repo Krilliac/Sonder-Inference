@@ -31,7 +31,16 @@
 # Opt-in GPU presets live in CMakePresets.json: windows-cuda-rtx,
 # windows-vulkan-xt, linux-cuda-rtx, linux-rocm-xt, and linux-vulkan-xt.
 
+# Optional llguidance structured-output path (see the llguidance block below). OFF by default: the
+# default build, CI and every existing test are unchanged. Needs the Rust toolchain (cargo) and git
+# at build time, and network access to github.com the first time llguidance is fetched.
+option(SONDER_WITH_LLGUIDANCE
+       "Build llguidance (Rust) into the llama.cpp backend for response_format json_schema" OFF)
+
 if(NOT SONDER_WITH_LLAMA_CPP)
+    if(SONDER_WITH_LLGUIDANCE)
+        message(WARNING "SONDER_WITH_LLGUIDANCE=ON has no effect without SONDER_WITH_LLAMA_CPP=ON")
+    endif()
     return()
 endif()
 
@@ -412,6 +421,37 @@ elseif(SONDER_WITH_MTMD)
     message(WARNING "SONDER_WITH_MTMD=ON requested, but upstream llama.cpp tree does not expose standalone mtmd target")
 endif()
 
+# prism.hadamard.* (Hadamard-folded Bonsai) runtime support. Mainline (>= b11556 /
+# v1.0.0, PR #29600) registers the key in src/llama-arch.cpp; the PrismML-Eng fork
+# reads it as a string literal in src/llama-model.cpp (and mentions it in
+# src/llama-context.cpp). Absent on older builds such as b11195; the backend then
+# refuses to load such models instead of silently producing garbage.
+# Override: -DSONDER_LLAMACPP_FORCE_PRISM_HADAMARD=ON|OFF.
+set(SONDER_LLAMACPP_FORCE_PRISM_HADAMARD "" CACHE STRING
+    "Force prism.hadamard runtime detection: ON, OFF, or empty to probe the llama.cpp sources")
+set_property(CACHE SONDER_LLAMACPP_FORCE_PRISM_HADAMARD PROPERTY STRINGS "" ON OFF)
+set(_sonder_has_prism_hadamard FALSE)
+if(SONDER_LLAMACPP_FORCE_PRISM_HADAMARD STREQUAL "")
+    foreach(_sonder_prism_src IN ITEMS llama-arch.cpp llama-model.cpp llama-context.cpp)
+        set(_sonder_prism_path "${llamacpp_SOURCE_DIR}/src/${_sonder_prism_src}")
+        if(EXISTS "${_sonder_prism_path}")
+            file(READ "${_sonder_prism_path}" _sonder_prism_content)
+            string(FIND "${_sonder_prism_content}" "prism.hadamard.version" _idx_prism_hadamard)
+            if(NOT _idx_prism_hadamard EQUAL -1)
+                set(_sonder_has_prism_hadamard TRUE)
+                break()
+            endif()
+        endif()
+    endforeach()
+elseif(SONDER_LLAMACPP_FORCE_PRISM_HADAMARD STREQUAL "ON")
+    set(_sonder_has_prism_hadamard TRUE)
+elseif(NOT SONDER_LLAMACPP_FORCE_PRISM_HADAMARD STREQUAL "OFF")
+    message(FATAL_ERROR "SONDER_LLAMACPP_FORCE_PRISM_HADAMARD must be ON, OFF or empty, got '${SONDER_LLAMACPP_FORCE_PRISM_HADAMARD}'")
+endif()
+if(_sonder_has_prism_hadamard)
+    list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_PRISM_HADAMARD=1)
+endif()
+
 if(SONDER_LLAMACPP_FEATURE_DEFS)
     message(STATUS "Sonder llamacpp detected features: ${SONDER_LLAMACPP_FEATURE_DEFS}")
 endif()
@@ -447,12 +487,91 @@ if(SONDER_LLAMACPP_EXPECTED_FEATURES)
 endif()
 # --- expected features end ---
 
+# --- llguidance begin (optional: SONDER_WITH_LLGUIDANCE) ---
+# llama.cpp builds llguidance only inside its `common` library (LLAMA_LLGUIDANCE), which this project
+# does not build (LLAMA_BUILD_COMMON=OFF). So the Rust library is built here with the same recipe
+# upstream uses (cargo build --release --package llguidance at a pinned commit) and wrapped by
+# llguidance_sampler.cpp. SONDER_LLAMACPP_HAS_LLGUIDANCE=1 is defined only when this block runs.
+set(SONDER_LLGUIDANCE_GIT_REPOSITORY "https://github.com/guidance-ai/llguidance")
+# v1.0.1: the commit llama.cpp v1.0.0 pins in common/CMakeLists.txt.
+set(SONDER_LLGUIDANCE_GIT_TAG "d795912fedc7d393de740177ea9ea761e7905774")
+set(SONDER_LLGUIDANCE_LINK_LIBS "")
+if(SONDER_WITH_LLGUIDANCE)
+    find_program(SONDER_CARGO_EXECUTABLE cargo
+                 HINTS "$ENV{CARGO_HOME}/bin" "$ENV{USERPROFILE}/.cargo/bin" "$ENV{HOME}/.cargo/bin")
+    if(NOT SONDER_CARGO_EXECUTABLE)
+        message(FATAL_ERROR
+            "SONDER_WITH_LLGUIDANCE=ON requires the Rust toolchain, but `cargo` was not found on PATH "
+            "(or in $CARGO_HOME/bin, ~/.cargo/bin). Install it from https://rustup.rs and re-run "
+            "configure, set -DSONDER_CARGO_EXECUTABLE=/path/to/cargo, or configure with "
+            "-DSONDER_WITH_LLGUIDANCE=OFF (the default).")
+    endif()
+    find_package(Git QUIET)
+    if(NOT GIT_FOUND)
+        message(FATAL_ERROR
+            "SONDER_WITH_LLGUIDANCE=ON requires `git` to fetch llguidance "
+            "${SONDER_LLGUIDANCE_GIT_REPOSITORY} at ${SONDER_LLGUIDANCE_GIT_TAG}. Install git or "
+            "configure with -DSONDER_WITH_LLGUIDANCE=OFF.")
+    endif()
+    # Keep the pin in step with the llama.cpp tree this build uses: warn when upstream moved it.
+    set(_sonder_llg_upstream_cmake "${llamacpp_SOURCE_DIR}/common/CMakeLists.txt")
+    if(EXISTS "${_sonder_llg_upstream_cmake}")
+        file(READ "${_sonder_llg_upstream_cmake}" _sonder_llg_upstream_text)
+        if(_sonder_llg_upstream_text MATCHES "llguidance_ext[^)]*GIT_TAG[ \t]+([0-9a-f]+)")
+            if(NOT CMAKE_MATCH_1 STREQUAL SONDER_LLGUIDANCE_GIT_TAG)
+                message(WARNING "llama.cpp ${SONDER_LLAMACPP_RESOLVED_TAG} pins llguidance ${CMAKE_MATCH_1}, "
+                                "this build uses ${SONDER_LLGUIDANCE_GIT_TAG}; review the llguidance_sampler.cpp "
+                                "port and docs/LICENSE_REVIEW.md before moving the pin.")
+            endif()
+        endif()
+    endif()
+
+    include(ExternalProject)
+    set(_sonder_llg_src "${CMAKE_BINARY_DIR}/llguidance/source")
+    set(_sonder_llg_out "${_sonder_llg_src}/target/release")
+    set(_sonder_llg_lib "${_sonder_llg_out}/${CMAKE_STATIC_LIBRARY_PREFIX}llguidance${CMAKE_STATIC_LIBRARY_SUFFIX}")
+    ExternalProject_Add(sonder_llguidance_ext
+        GIT_REPOSITORY    "${SONDER_LLGUIDANCE_GIT_REPOSITORY}"
+        GIT_TAG           "${SONDER_LLGUIDANCE_GIT_TAG}"
+        PREFIX            "${CMAKE_BINARY_DIR}/llguidance"
+        SOURCE_DIR        "${_sonder_llg_src}"
+        BUILD_IN_SOURCE   TRUE
+        CONFIGURE_COMMAND ""
+        BUILD_COMMAND     "${SONDER_CARGO_EXECUTABLE}" build --release --package llguidance
+        INSTALL_COMMAND   ""
+        UPDATE_COMMAND    ""
+        BUILD_BYPRODUCTS  "${_sonder_llg_lib}" "${_sonder_llg_out}/llguidance.h"
+    )
+    add_library(sonder_llguidance STATIC IMPORTED)
+    set_target_properties(sonder_llguidance PROPERTIES IMPORTED_LOCATION "${_sonder_llg_lib}")
+    add_dependencies(sonder_llguidance sonder_llguidance_ext)
+    list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_LLGUIDANCE=1)
+    list(APPEND SONDER_LLAMACPP_PRIVATE_INCLUDES "${_sonder_llg_out}")
+    list(APPEND SONDER_LLGUIDANCE_LINK_LIBS sonder_llguidance)
+    if(WIN32)
+        list(APPEND SONDER_LLGUIDANCE_LINK_LIBS ws2_32 userenv ntdll bcrypt)
+    else()
+        find_package(Threads REQUIRED)
+        list(APPEND SONDER_LLGUIDANCE_LINK_LIBS Threads::Threads ${CMAKE_DL_LIBS} m)
+    endif()
+    message(STATUS "llguidance: ON (${SONDER_LLGUIDANCE_GIT_TAG}, cargo: ${SONDER_CARGO_EXECUTABLE})")
+endif()
+# --- llguidance end ---
+
 add_library(sonder_backend_llamacpp STATIC
+    device_health.cpp
     gguf_compat.cpp
+    kv_policy.cpp
     llamacpp_backend.cpp
     llamacpp_util.cpp
     lora_registry.cpp
+    llguidance_sampler.cpp
+    embeddings.cpp
+    kv_telemetry.cpp
+    prefix_checkpoints.cpp
+    graph_telemetry.cpp
     slot_store.cpp
+    spec_controller.cpp
     request_guards.cpp
 )
 add_library(sonder::backend_llamacpp ALIAS sonder_backend_llamacpp)
@@ -463,7 +582,10 @@ target_include_directories(sonder_backend_llamacpp
 )
 target_compile_features(sonder_backend_llamacpp PUBLIC cxx_std_20)
 # llama.h stays private: nothing outside this directory sees llama.cpp types.
-target_link_libraries(sonder_backend_llamacpp PRIVATE llama ggml ${SONDER_LLAMACPP_EXTRA_LIBS})
+target_link_libraries(sonder_backend_llamacpp PRIVATE llama ggml ${SONDER_LLAMACPP_EXTRA_LIBS} ${SONDER_LLGUIDANCE_LINK_LIBS})
+if(SONDER_WITH_LLGUIDANCE)
+    add_dependencies(sonder_backend_llamacpp sonder_llguidance_ext)
+endif()
 target_compile_definitions(sonder_backend_llamacpp
     PUBLIC  ${SONDER_LLAMACPP_FEATURE_DEFS}
     PRIVATE SONDER_LLAMACPP_TAG_STRING="${SONDER_LLAMACPP_RESOLVED_TAG}"
@@ -485,6 +607,8 @@ endif()
 # Core adapter: sonder::inference::Backend implementation compiled into the
 # core library, which links the wrapper.
 sonder_module_sources(${CMAKE_CURRENT_SOURCE_DIR}/llamacpp_core_backend.cpp)
+sonder_module_sources(${CMAKE_CURRENT_SOURCE_DIR}/tool_grammar_preflight.cpp)
+sonder_module_sources(${CMAKE_CURRENT_SOURCE_DIR}/json_schema_normalize.cpp)
 sonder_module_include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 sonder_module_define(SONDER_HAS_LLAMACPP_BACKEND)
 target_link_libraries(sonder_inference PRIVATE sonder_backend_llamacpp)

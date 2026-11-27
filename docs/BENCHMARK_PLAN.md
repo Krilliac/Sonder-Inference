@@ -150,7 +150,7 @@ and supports `--budget-seconds` (default 540), `--prompts`, `--require-idle`
 `--list-models` and `--dry-run`:
 
 ```bash
-sonder-bench --backend ollama --model <model> --corpus bench/corpus/baseline.json --require-idle
+sonder-bench --model <path.gguf> --ctx-size 4096 --corpus bench/corpus/baseline.json
 ```
 
 [`bench/corpus/baseline.json`](../bench/corpus/baseline.json) covers a short
@@ -160,13 +160,14 @@ concurrently, each in its own session; results add `per_prompt` distributions,
 `fanout_batches` (makespan and aggregate tok/s), p99, host hardware, the corpus
 hash, and cold first-request/load time.
 
-Limitations: concurrency is 1 except for fan-out prompts; no context-window
-control (`SamplingConfig` has no `num_ctx`, so the long-context case is sized
-for Ollama's default 4096 window); no GPU/VRAM sampling; mock-backend numbers
-are meaningless by design. Small reviewed snapshots go in
-[`bench/results/`](../bench/results/). The Ollama baseline is still pending
-(`bench/results/PENDING_ollama_baseline.md`): no live Ollama was reachable when
-the harness was built.
+The standalone runner defaults to native `llamacpp` (build with
+`SONDER_WITH_LLAMA_CPP=ON`); `--model` takes a GGUF path. Native-only
+`--ctx-size`, `--threads`, and `--gpu-layers` control context size, CPU
+threads, and GPU offload. Explicit `--backend ollama` remains supported.
+`--concurrency` controls worker sessions and GPU snapshots are captured by
+default; see [bench/README.md](../bench/README.md) for limits and options.
+Mock-backend numbers are meaningless by design. Small reviewed snapshots go
+in [`bench/results/`](../bench/results/); no native baseline is recorded yet.
 
 ## HTTP agent and contention harness
 

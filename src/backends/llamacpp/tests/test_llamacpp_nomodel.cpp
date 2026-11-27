@@ -264,7 +264,9 @@ TEST_CASE("llamacpp wrapper: placement options reach llama_model_params") {
     CHECK(s.split_mode == "layer");
     CHECK(s.load_mode == "auto");
     CHECK_FALSE(s.has_tensor_split);
-    CHECK_FALSE(s.has_devices);
+    // Default placement is an explicit device list chosen by SelectDevices()
+    // (never llama.cpp's own default, which can pick an integrated GPU).
+    CHECK(s.has_devices);
 
     // Split modes map to LLAMA_SPLIT_MODE_NONE / LAYER / ROW.
     d.split_mode = SplitMode::kNone;
@@ -352,6 +354,64 @@ TEST_CASE("llamacpp wrapper: Load rejects bad placement options before touching 
     REQUIRE(be.Load(opts).ok());
     CHECK(be.IsLoaded());
     be.Unload();
+}
+
+TEST_CASE("NAT-07 wrapper: default ModelParamsFor sets explicit devices and Load rejects tensor_split without dGPU") {
+    LoadOptions d;
+    const ModelParamsSummary s = LlamaCppBackend::ModelParamsFor(d);
+    CHECK(s.has_devices);
+
+    // ResolveModelDevices honours case-insensitive allowlist names and ProjectorDevice stays inside it.
+    std::vector<void*> resolved;
+    DeviceSelection sel;
+    CHECK(LlamaCppBackend::ResolveModelDevices({}, &resolved, &sel).ok());
+    CHECK(resolved.empty() == (LlamaCppBackend::ProjectorDevice(resolved) == nullptr));
+
+    REQUIRE(LlamaCppBackend::ResolveModelDevices({"cpu"}, &resolved, &sel).ok());
+    REQUIRE(resolved.size() == 1u);
+    CHECK(resolved.front() != nullptr);
+    CHECK(sel.names == std::vector<std::string>{"CPU"});
+    CHECK(LlamaCppBackend::ProjectorDevice(resolved) == nullptr);
+    CHECK(LlamaCppBackend::ProjectorDevice({}) == nullptr);
+
+    CHECK(LlamaCppBackend::ResolveModelDevices({"NoSuchDevice9"}, &resolved).code == ErrorCode::kInvalidArgument);
+    CHECK(resolved.empty());
+
+    // Per-model ModelLoadOptions::devices overrides backend-wide options.devices.
+    {
+        sonder::inference::LlamaCppBackendOptions base_opts;
+        base_opts.devices = {"NoSuchDevice9"};
+        auto core_be = sonder::inference::make_llamacpp_backend(base_opts);
+        sonder::inference::ModelLoadOptions per_model;
+        per_model.model = "this/file/does/not/exist.gguf";
+        per_model.device_id = "gpu:0";
+        per_model.devices = {"cpu"};
+        CHECK(core_be->load_model(per_model).status().code() == sonder::inference::ErrorCode::not_found);
+
+        sonder::inference::ModelLoadOptions bad_per_model;
+        bad_per_model.model = "this/file/does/not/exist.gguf";
+        bad_per_model.device_id = "gpu:0";
+        bad_per_model.devices = {"UnknownGpu99"};
+        CHECK(core_be->load_model(bad_per_model).status().code() == sonder::inference::ErrorCode::invalid_argument);
+    }
+
+    // If no discrete GPU is selected in this build, tensor_split without an explicit allowlist must fail.
+    const auto devs = LlamaCppBackend::EnumerateDevices();
+    const bool any_dgpu = std::any_of(devs.begin(), devs.end(), [](const DeviceInfo& info) {
+        return info.kind == DeviceKind::kGpu;
+    });
+    if (!any_dgpu) {
+        LlamaCppBackend be;
+        LoadOptions bad;
+        bad.model_path = "this/file/does/not/exist.gguf";
+        bad.tensor_split = {0.6F, 0.4F};
+        CHECK(be.Load(bad).code == ErrorCode::kInvalidArgument);
+
+        LoadOptions bad_mg;
+        bad_mg.model_path = "this/file/does/not/exist.gguf";
+        bad_mg.main_gpu = 1;
+        CHECK(be.Load(bad_mg).code == ErrorCode::kInvalidArgument);
+    }
 }
 
 TEST_CASE("llamacpp adapter: multi-GPU placement options validate and forward") {

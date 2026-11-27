@@ -369,17 +369,29 @@ inline GpuVendor InferGgmlDeviceVendor(const sonder::backends::llamacpp::DeviceI
     return GpuVendor::unknown;
 }
 
-// Pins `gpu:<index>` requests onto the matching llama.cpp GPU device when the
-// caller did not pass explicit ggml device names or multi-GPU tensor_split
-// (prevents silent fallback to GPU 0, unintended layer splitting across discrete
-// + integrated GPUs, or cross-vendor ordinal mismatch between OS and GGML lists).
+// Pins `gpu:<index>` requests onto the matching discrete llama.cpp GPU device
+// when the caller did not pass explicit ggml device names (prevents silent
+// fallback to GPU 0, unintended layer splitting across discrete + integrated
+// GPUs, duplicate CUDA0/Vulkan0 counting, or cross-vendor ordinal mismatch).
+// Integrated GPUs are never counted by `gpu:<index>`; use an explicit `devices`
+// allowlist to place a model onto an integrated GPU.
 inline Status ResolveGpuDevicePin(std::string_view device_id,
                                   const std::vector<sonder::backends::llamacpp::DeviceInfo>& available_devices,
                                   std::vector<std::string>& out_devices, std::int32_t& out_main_gpu,
                                   const std::vector<float>& tensor_split = {},
                                   const std::vector<GpuDeviceInfo>& os_gpus = {}) {
-    if (!out_devices.empty() || !tensor_split.empty()) return Status::success();
-    if (device_id.rfind("gpu:", 0) != 0) return Status::success();
+    namespace lc = sonder::backends::llamacpp;
+    if (!out_devices.empty()) return Status::success();
+    if (device_id.rfind("gpu:", 0) != 0) {
+        if (!tensor_split.empty() && device_id.rfind("gpu", 0) == 0) {
+            lc::DeviceSelection auto_sel;
+            if (!lc::SelectDevices(available_devices, {}, tensor_split, 0, &auto_sel).ok() || auto_sel.names.empty()) {
+                return Status(ErrorCode::invalid_argument,
+                              "tensor_split requires at least one discrete GPU when no device allowlist is set");
+            }
+        }
+        return Status::success();
+    }
     const std::string_view suffix = device_id.substr(4);
     if (suffix.empty()) {
         return Status(ErrorCode::invalid_argument, "invalid gpu device id: " + std::string(device_id));
@@ -394,32 +406,66 @@ inline Status ResolveGpuDevicePin(std::string_view device_id,
         }
         idx = idx * 10 + static_cast<std::size_t>(ch - '0');
     }
-    std::vector<const sonder::backends::llamacpp::DeviceInfo*> gpus;
-    for (const auto& d : available_devices) {
-        if (d.kind == sonder::backends::llamacpp::DeviceKind::kGpu ||
-            d.kind == sonder::backends::llamacpp::DeviceKind::kIntegratedGpu) {
-            gpus.push_back(&d);
-        }
+
+    // Auto-select de-duplicated discrete GPUs only (never integrated GPUs, and
+    // collapsing CUDA0 + Vulkan0 views of the same physical card).
+    lc::DeviceSelection auto_sel;
+    (void)lc::SelectDevices(available_devices, {}, &auto_sel);
+    std::vector<const lc::DeviceInfo*> gpus;
+    gpus.reserve(auto_sel.names.size());
+    for (const std::string& name : auto_sel.names) {
+        const auto it = std::find_if(available_devices.begin(), available_devices.end(),
+                                     [&](const lc::DeviceInfo& d) { return d.name == name; });
+        if (it != available_devices.end()) gpus.push_back(&*it);
     }
 
-    // When OS GPU inventory is supplied, resolve `gpu:<idx>` in OS inventory space
-    // and match it against the compiled GGML devices by hardware identity (vendor
-    // + adapter name / intra-vendor ordinal) instead of assuming OS and GGML
-    // ordinal spaces are identical.
-    if (!os_gpus.empty()) {
-        if (idx >= os_gpus.size()) {
-            return Status(ErrorCode::not_found, "requested device '" + std::string(device_id) +
-                                                    "' exceeds detected OS GPU count (" +
-                                                    std::to_string(os_gpus.size()) + ")");
+    if (!tensor_split.empty()) {
+        if (gpus.empty()) {
+            return Status(ErrorCode::invalid_argument,
+                          "tensor_split requires at least one discrete GPU when no device allowlist is set");
         }
-        const GpuDeviceInfo& target = os_gpus[idx];
+        return Status::success();
+    }
+
+    if (gpus.empty()) {
+        return Status(ErrorCode::not_found,
+                      "requested device '" + std::string(device_id) +
+                          "' has no available discrete llama.cpp GPU (integrated GPUs require an explicit devices "
+                          "allowlist)");
+    }
+
+    // When OS GPU inventory is supplied, filter to discrete OS GPUs (excluding
+    // integrated UMA adapters) and match `gpu:<idx>` against the de-duplicated
+    // discrete GGML devices by PCI bus id, adapter name, or intra-vendor ordinal.
+    if (!os_gpus.empty()) {
+        std::vector<const GpuDeviceInfo*> os_discrete;
+        os_discrete.reserve(os_gpus.size());
+        for (const auto& g : os_gpus) {
+            if (!g.is_integrated_uma) os_discrete.push_back(&g);
+        }
+        if (idx >= os_discrete.size()) {
+            return Status(ErrorCode::not_found, "requested device '" + std::string(device_id) +
+                                                    "' exceeds detected discrete OS GPU count (" +
+                                                    std::to_string(os_discrete.size()) + ")");
+        }
+        const GpuDeviceInfo& target = *os_discrete[idx];
+        const std::string target_bus = lc::NormalizePciBusId(target.pci_bus_id);
+        if (!target_bus.empty()) {
+            for (const auto* g : gpus) {
+                if (!g->device_id.empty() && lc::NormalizePciBusId(g->device_id) == target_bus) {
+                    out_devices = {g->name};
+                    out_main_gpu = 0;
+                    return Status::success();
+                }
+            }
+        }
         const std::string target_name = LowerAscii(target.name);
         std::size_t vendor_ordinal = 0;
         for (std::size_t i = 0; i < idx; ++i) {
-            if (os_gpus[i].vendor == target.vendor) ++vendor_ordinal;
+            if (os_discrete[i]->vendor == target.vendor) ++vendor_ordinal;
         }
-        std::vector<const sonder::backends::llamacpp::DeviceInfo*> same_vendor;
-        std::vector<const sonder::backends::llamacpp::DeviceInfo*> name_matches;
+        std::vector<const lc::DeviceInfo*> same_vendor;
+        std::vector<const lc::DeviceInfo*> name_matches;
         for (const auto* g : gpus) {
             const GpuVendor gv = InferGgmlDeviceVendor(*g);
             if (target.vendor != GpuVendor::unknown && gv == target.vendor) {
@@ -449,7 +495,7 @@ inline Status ResolveGpuDevicePin(std::string_view device_id,
 
     if (idx >= gpus.size()) {
         return Status(ErrorCode::not_found, "requested device '" + std::string(device_id) +
-                                                "' exceeds available llama.cpp GPU count (" +
+                                                "' exceeds available discrete llama.cpp GPU count (" +
                                                 std::to_string(gpus.size()) + ")");
     }
     out_devices = {gpus[idx]->name};

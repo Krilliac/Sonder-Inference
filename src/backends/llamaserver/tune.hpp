@@ -10,7 +10,7 @@
 #include <string_view>
 #include <vector>
 
-#include "gpu_memory.hpp"
+#include "spill_guard.hpp"
 #include "process.hpp"
 #include "tune_model.hpp"
 #include "sonder/inference/device.hpp"

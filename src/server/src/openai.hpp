@@ -78,12 +78,24 @@ struct ChatJob {
     std::optional<bool> parallel_tool_calls;
 };
 
+// Per-request bounds for POST /v1/embeddings, checked at ingress (before any
+// tokenization). The backend enforces the model-context bounds on top of these.
+struct EmbedRouteLimits {
+    std::size_t max_inputs = kMaxEmbedInputs;              // items in `input`
+    std::size_t max_input_bytes = 256u * 1024u;            // one text input
+    std::size_t max_total_bytes = 2u * 1024u * 1024u;      // all text inputs together
+    std::size_t max_input_tokens = 65536u;                 // one token-array input
+    std::size_t max_total_tokens = 262144u;                // all token-array inputs together
+};
+
 struct EmbedJob {
     std::string model = "default";
     std::vector<std::string> inputs;
+    // Set instead of `inputs` when `input` is a token array / array of token arrays.
+    std::vector<std::vector<TokenId>> token_inputs;
     std::optional<std::size_t> dimensions;
     EmbedPoolingType pooling_type = EmbedPoolingType::unspecified;
-    std::string encoding_format = "float";
+    std::string encoding_format = "float";  // "float" or "base64"
     bool normalize = true;
     std::optional<RequestPriority> priority_class;
     std::optional<std::uint64_t> deadline_ms;
@@ -145,6 +157,7 @@ struct DetokenizeJob {
 std::variant<ChatJob, ApiError> parse_chat_request(std::string_view body);
 std::variant<ChatJob, ApiError> parse_chat_request_with_mode(std::string_view body, StructuredParseMode schema_mode);
 std::variant<EmbedJob, ApiError> parse_embed_request(std::string_view body);
+std::variant<EmbedJob, ApiError> parse_embed_request(std::string_view body, const EmbedRouteLimits& limits);
 std::variant<RerankJob, ApiError> parse_rerank_request(std::string_view body);
 std::variant<ScoreJob, ApiError> parse_score_request(std::string_view body);
 std::variant<CompletionJob, ApiError> parse_completion_request(std::string_view body);
@@ -176,12 +189,17 @@ struct Correlation {
     // X-Sonder-No-Capture: forces the telemetry text-capture policy to off
     // for this request; it can never enable capture.
     bool no_text_capture = false;
+    // X-Sonder-Local-Only: with the ollama_cloud backend the server refuses
+    // the request before residency (no model load, no network I/O) and the
+    // backend refuses it again; other backends ignore it.
+    bool local_only = false;
 };
 
 // X-Sonder-Run-Id, -Parent-Request-Id, -Agent-Id, -Task-Id, -Workload,
 // -Priority. X-Sonder-Priority accepts the legacy integer -16..16 (retained
 // in Correlation::priority and mapped to interactive admission) or the
-// additive class names interactive, subagent and background. Invalid values:
+// additive class names interactive, subagent and background.
+// X-Sonder-Local-Only accepts 1/true or 0/false (case-insensitive). Invalid values:
 // 400 invalid_correlation_header naming the header.
 std::variant<Correlation, ApiError> parse_correlation(const RequestHead& head);
 std::optional<WorkloadClass> parse_workload(std::string_view name) noexcept;
