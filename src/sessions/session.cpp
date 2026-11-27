@@ -1507,10 +1507,14 @@ Result<EmbedResult> Session::embed(const std::vector<std::string>& inputs, const
 }
 
 Result<EmbedResult> Session::embed_request(const EmbedRequest& request, const RequestOptions& request_options) {
-    if (request.inputs.empty()) {
+    const std::size_t n_embed_inputs = request.inputs.size() + request.token_inputs.size();
+    if (n_embed_inputs == 0) {
         return Status(ErrorCode::invalid_argument, "embed inputs must be non-empty");
     }
-    if (request.inputs.size() > kMaxEmbedInputs) {
+    if (!request.inputs.empty() && !request.token_inputs.empty()) {
+        return Status(ErrorCode::invalid_argument, "embed request mixes text inputs and token inputs");
+    }
+    if (n_embed_inputs > kMaxEmbedInputs) {
         return Status(ErrorCode::invalid_argument,
                       "embed inputs exceeds maximum of " + std::to_string(kMaxEmbedInputs) + " items");
     }
@@ -1526,7 +1530,7 @@ Result<EmbedResult> Session::embed_request(const EmbedRequest& request, const Re
                                    : (!request.request_id.empty() ? request.request_id : make_id("req"));
     TelemetryBus& bus = engine_.telemetry();
     const auto ctx = telemetry_context(req_id);
-    const std::uint64_t input_count = static_cast<std::uint64_t>(request.inputs.size());
+    const std::uint64_t input_count = static_cast<std::uint64_t>(n_embed_inputs);
     bool terminal_attempted = false;
     auto t_start = std::chrono::steady_clock::now();
     const auto current_queue_ms = [&]() {

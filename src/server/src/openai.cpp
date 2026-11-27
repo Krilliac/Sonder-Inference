@@ -1,4 +1,5 @@
 #include "openai.hpp"
+#include "embeddings_route.hpp"
 #include "json_schema_gbnf.hpp"
 #include "reasoning_budget.hpp"
 #include "tool_call_parser.hpp"
@@ -643,7 +644,11 @@ std::variant<ChatJob, ApiError> parse_chat_request_with_mode(std::string_view bo
 }
 
 std::variant<EmbedJob, ApiError> parse_embed_request(std::string_view body_text) {
-    auto parsed = json::parse(body_text, json::ParseLimits{128, 65536});
+    return parse_embed_request(body_text, EmbedRouteLimits{});
+}
+
+std::variant<EmbedJob, ApiError> parse_embed_request(std::string_view body_text, const EmbedRouteLimits& limits) {
+    auto parsed = json::parse(body_text, embed_parse_limits(limits));
     if (!parsed.ok()) {
         return bad("invalid_json", "request body is not valid JSON: " + parsed.status().message());
     }
@@ -659,10 +664,9 @@ std::variant<EmbedJob, ApiError> parse_embed_request(std::string_view body_text)
         job.model = model->as_string();
     }
     if (const json::Value* fmt = body.find("encoding_format"); present(fmt)) {
-        if (!fmt->is_string() || fmt->as_string() != "float") {
-            return bad("unsupported_parameter", "only encoding_format 'float' is supported", "encoding_format");
-        }
-        job.encoding_format = fmt->as_string();
+        auto format = parse_embedding_encoding_format(*fmt);
+        if (auto* err = std::get_if<ApiError>(&format)) return *err;
+        job.encoding_format = std::get<std::string>(std::move(format));
     }
     if (const json::Value* dims = body.find("dimensions"); present(dims)) {
         if (!dims->is_integer()) {
@@ -706,31 +710,8 @@ std::variant<EmbedJob, ApiError> parse_embed_request(std::string_view body_text)
         }
         job.normalize = norm->as_bool();
     }
-    const json::Value* input = body.find("input");
-    if (!present(input)) {
-        return bad("invalid_request", "input is required (string or non-empty array of strings)", "input");
-    }
-    if (input->is_string()) {
-        job.inputs.push_back(input->as_string());
-    } else if (input->is_array()) {
-        const auto& arr = input->as_array();
-        if (arr.empty()) {
-            return bad("invalid_request", "input array must not be empty", "input");
-        }
-        if (arr.size() > kMaxEmbedInputs) {
-            return bad("invalid_request",
-                       "input array exceeds maximum of " + std::to_string(kMaxEmbedInputs) + " items", "input");
-        }
-        job.inputs.reserve(arr.size());
-        for (std::size_t i = 0; i < arr.size(); ++i) {
-            if (!arr[i].is_string()) {
-                return bad("invalid_request", "input[" + std::to_string(i) + "] must be a string", "input");
-            }
-            job.inputs.push_back(arr[i].as_string());
-        }
-    } else {
-        return bad("invalid_request", "input must be a string or a non-empty array of strings", "input");
-    }
+    // string, string array, token array or array of token arrays; bounded by `limits`.
+    if (auto e = parse_embedding_input(body.find("input"), limits, job)) return *e;
     if (auto e = read_request_hints(body, job.priority_class, job.deadline_ms)) {
         return *e;
     }

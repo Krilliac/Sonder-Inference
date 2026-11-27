@@ -392,10 +392,13 @@ TEST_CASE("embeddings: single input, batch array, validation and 501 on unsuppor
     }
     // Validation errors
     CHECK(post(f.port, "/v1/embeddings", R"({"input":[]})").status == 400);
-    CHECK(post(f.port, "/v1/embeddings", R"({"input":[1,2]})").status == 400);
+    // `[1,2]` is a valid token array since POST /v1/embeddings accepts pre-tokenized input
+    // (see test_embeddings_route.cpp); a mixed array stays a 400.
+    CHECK(post(f.port, "/v1/embeddings", R"({"input":[1,"a"]})").status == 400);
     CHECK(post(f.port, "/v1/embeddings", R"({"input":42})").status == 400);
     {
-        const Reply bad_fmt = post(f.port, "/v1/embeddings", R"({"input":"x","encoding_format":"base64"})");
+        // base64 is a supported encoding_format now; an unknown one is still refused.
+        const Reply bad_fmt = post(f.port, "/v1/embeddings", R"({"input":"x","encoding_format":"int8"})");
         CHECK(bad_fmt.status == 400);
         CHECK(bad_fmt.json().find("error")->find("code")->as_string() == "unsupported_parameter");
     }

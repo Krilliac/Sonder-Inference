@@ -138,6 +138,10 @@ struct LlamaCppBackendOptions {
     std::vector<LlamaCppLoraAliasOption> lora_aliases{};
     // Opt-in startup greedy smoke test after load (default off).
     bool startup_smoke_test = false;
+    // Per-request embedding limits on the tokenized inputs (0 = no limit). A single input is
+    // always bounded by the context window as well.
+    std::uint32_t embed_max_total_tokens = 262144;
+    std::uint32_t embed_max_input_tokens = 0;
 };
 
 // Checks the llama.cpp context and placement options (KV cache types,
