@@ -328,6 +328,11 @@ struct RequestOptions {
     // Optional stateful grammar matcher hooks (for ExactResume state snapshot/restore
     // and Branch reset on token_logits backends).
     std::optional<GrammarMatcherHooks> grammar_hooks = std::nullopt;
+    // Optional served model identifier (e.g. launch-profile name on `serve`)
+    // and caller-requested model alias (e.g. "default") carried as `model` and
+    // `requested_model` on `request.*` lifecycle events at `metrics` level.
+    std::optional<std::string> served_model = std::nullopt;
+    std::optional<std::string> requested_model = std::nullopt;
 };
 
 struct ForkOptions {

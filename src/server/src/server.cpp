@@ -278,15 +278,44 @@ struct Server::Impl {
         return backend && backend->capabilities().has(cap);
     }
 
+    static ApiError not_ready_error(State s) {
+        return make_error(503, "not_ready",
+                          std::string("sonder-inference is ") + state_name(s) +
+                              "; nothing was executed, the request is safe to send elsewhere");
+    }
+
     bool require_ready(Exchange& ex) {
         const State s = state.load();
         if (s == State::ready) {
             return true;
         }
-        write_error(ex, make_error(503, "not_ready",
-                                   std::string("sonder-inference is ") + state_name(s) +
-                                       "; nothing was executed, the request is safe to send elsewhere"));
+        write_error(ex, not_ready_error(s));
         return false;
+    }
+
+    void fail_inference_request(Exchange& ex, std::string_view kind, const ApiError& err,
+                                const Correlation& corr = {},
+                                std::optional<RequestPriority> job_prio = std::nullopt,
+                                std::string_view resolved_model = {},
+                                std::string_view requested_model = {},
+                                const std::shared_ptr<Model>& loaded_model = nullptr,
+                                const std::shared_ptr<Session>& session = nullptr) {
+        if (Engine* e = engine_ptr()) {
+            TelemetryContext ctx = session ? session->telemetry_context(ex.request_id) : e->engine_context();
+            ctx.request_id = ex.request_id;
+            if (!session) {
+                if (loaded_model) {
+                    ctx.model_instance_id = loaded_model->instance_id();
+                    ctx.device_id = loaded_model->device_id();
+                    ctx.synthetic_work = is_synthetic_backend(loaded_model->backend_name());
+                } else {
+                    ctx.synthetic_work = synthetic;
+                }
+            }
+            emit_pre_execution_failure(e->telemetry(), std::move(ctx), kind, err.code, corr, job_prio,
+                                       resolved_model, requested_model);
+        }
+        write_error(ex, err);
     }
 
     void handle_health(Exchange& ex) {
@@ -401,9 +430,10 @@ struct Server::Impl {
 
     void handle_chat(Exchange& ex, const RequestHead& head, const std::string& body,
                      ChatProtocol protocol = ChatProtocol::openai) {
+        ex.request_id = make_id("req");
         auto corr_v = parse_correlation(head);
         if (auto* e = std::get_if<ApiError>(&corr_v)) {
-            write_error(ex, *e);
+            fail_inference_request(ex, "chat", *e);
             return;
         }
         const Correlation corr = std::get<Correlation>(corr_v);
@@ -412,12 +442,13 @@ struct Server::Impl {
             const auto parse_timeout = std::min(opts.read_timeout, std::chrono::milliseconds(2000));
             auto parse_guard = parse_gate.acquire(body.size(), parse_timeout);
             if (!parse_guard) {
-                if (!require_ready(ex)) {
+                if (const State s = state.load(); s != State::ready) {
+                    fail_inference_request(ex, "chat", not_ready_error(s), corr);
                     return;
                 }
                 ApiError e = make_error(503, "overloaded", "request parser concurrency limit reached; retry later");
                 e.retry_after = 1;
-                write_error(ex, e);
+                fail_inference_request(ex, "chat", e, corr);
                 return;
             }
             job_v = protocol == ChatProtocol::anthropic
@@ -425,16 +456,19 @@ struct Server::Impl {
                         : parse_chat_request_with_mode(body, StructuredParseMode::defer_grammar_compile);
         }
         if (auto* e = std::get_if<ApiError>(&job_v)) {
-            write_error(ex, *e);
+            fail_inference_request(ex, "chat", *e, corr);
             return;
         }
         ChatJob job = std::move(std::get<ChatJob>(job_v));
-        if (!require_ready(ex)) {
+        if (const State s = state.load(); s != State::ready) {
+            fail_inference_request(ex, "chat", not_ready_error(s), corr, job.priority_class, job.model, job.model);
             return;
         }
         const auto served_id = residency->resolve(job.model);
         if (!served_id) {
-            write_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
+            fail_inference_request(
+                ex, "chat", make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"),
+                corr, job.priority_class, job.model, job.model);
             return;
         }
         // Pins the model for the whole request (never evicted meanwhile);
@@ -443,29 +477,36 @@ struct Server::Impl {
         // (declared later, destroyed earlier) is gone.
         auto pinned = residency->acquire(*served_id);
         if (!pinned.ok()) {
-            write_error(ex, load_failure_error(*served_id, pinned.status()));
+            fail_inference_request(ex, "chat", load_failure_error(*served_id, pinned.status()), corr,
+                                   job.priority_class, *served_id, job.model);
             return;
         }
         const ModelResidency::Pin pin = std::move(pinned).value();
         if ((job.response_format_type.has_value() || !job.grammar.empty()) &&
             !backend_has_capability(Capability::structured_output)) {
-            write_error(ex,
-                        make_error(400, "unsupported_parameter",
-                                   "backend '" + pin.backend() + "' does not support structured output / grammar constraints",
-                                   job.response_format_type ? "response_format" : "grammar"));
+            fail_inference_request(
+                ex, "chat",
+                make_error(400, "unsupported_parameter",
+                           "backend '" + pin.backend() + "' does not support structured output / grammar constraints",
+                           job.response_format_type ? "response_format" : "grammar"),
+                corr, job.priority_class, pin.id(), job.model, pin.model());
             return;
         }
         if (job.sampling.logprobs && !backend_has_capability(Capability::logprobs)) {
-            write_error(ex,
-                        make_error(400, "unsupported_parameter",
-                                   "backend '" + pin.backend() + "' does not support logprobs", "logprobs"));
+            fail_inference_request(
+                ex, "chat",
+                make_error(400, "unsupported_parameter",
+                           "backend '" + pin.backend() + "' does not support logprobs", "logprobs"),
+                corr, job.priority_class, pin.id(), job.model, pin.model());
             return;
         }
         const bool has_media = has_chat_media(job.messages);
         if (has_media && !backend_has_capability(Capability::multimodal)) {
-            write_error(ex, make_error(400, "unsupported_parameter",
-                                       "backend '" + pin.backend() + "' does not support multimodal image inputs",
-                                       "messages"));
+            fail_inference_request(
+                ex, "chat",
+                make_error(400, "unsupported_parameter",
+                           "backend '" + pin.backend() + "' does not support multimodal image inputs", "messages"),
+                corr, job.priority_class, pin.id(), job.model, pin.model());
             return;
         }
         const ModelDescriptor* desc_ptr = pin.model() ? &pin.model()->descriptor() : nullptr;
@@ -474,7 +515,7 @@ struct Server::Impl {
                                             backend_has_capability(Capability::structured_output),
                                             backend_has_capability(Capability::tool_calling),
                                             pin.backend(), &grammar_cache)) {
-            write_error(ex, *err);
+            fail_inference_request(ex, "chat", *err, corr, job.priority_class, pin.id(), job.model, pin.model());
             return;
         }
         // Launch profile defaults fill only the fields the request left unset
@@ -499,7 +540,15 @@ struct Server::Impl {
             }
             auto created = engine->create_session(pin.model(), so);
             if (!created.ok()) {
-                write_error(ex, map_session_failure(created.status(), false));
+                const ApiError err = map_session_failure(created.status(), false);
+                TelemetryContext ctx = engine->engine_context();
+                ctx.request_id = ex.request_id;
+                ctx.model_instance_id = pin.model()->instance_id();
+                ctx.device_id = pin.model()->device_id();
+                ctx.synthetic_work = is_synthetic_backend(pin.model()->backend_name());
+                emit_pre_execution_failure(engine->telemetry(), std::move(ctx), "chat", err.code, corr,
+                                           job.priority_class, pin.id(), job.model);
+                write_error(ex, err);
                 return;
             }
             session = created.value();
@@ -507,10 +556,12 @@ struct Server::Impl {
         {
             std::lock_guard<std::mutex> lock(inflight_mu);
             if (state.load() != State::ready) {
+                const ApiError err = make_error(
+                    503, "not_ready",
+                    "sonder-inference is draining; nothing was executed, the request is safe to send elsewhere");
+                fail_inference_request(ex, "chat", err, corr, job.priority_class, pin.id(), job.model, pin.model(),
+                                       session);
                 session->close();
-                write_error(ex, make_error(503, "not_ready",
-                                           "sonder-inference is draining; nothing was executed, the request is safe "
-                                           "to send elsewhere"));
                 return;
             }
             inflight.insert(session);
@@ -543,9 +594,10 @@ struct Server::Impl {
     }
 
     void handle_responses(Exchange& ex, const RequestHead& head, const std::string& body) {
+        ex.request_id = make_id("req");
         auto corr_v = parse_correlation(head);
         if (auto* e = std::get_if<ApiError>(&corr_v)) {
-            write_error(ex, *e);
+            fail_inference_request(ex, "chat", *e);
             return;
         }
         const Correlation corr = std::get<Correlation>(corr_v);
@@ -554,53 +606,65 @@ struct Server::Impl {
             const auto parse_timeout = std::min(opts.read_timeout, std::chrono::milliseconds(2000));
             auto parse_guard = parse_gate.acquire(body.size(), parse_timeout);
             if (!parse_guard) {
-                if (!require_ready(ex)) {
+                if (const State s = state.load(); s != State::ready) {
+                    fail_inference_request(ex, "chat", not_ready_error(s), corr);
                     return;
                 }
                 ApiError e = make_error(503, "overloaded", "request parser concurrency limit reached; retry later");
                 e.retry_after = 1;
-                write_error(ex, e);
+                fail_inference_request(ex, "chat", e, corr);
                 return;
             }
             job_v = parse_responses_request_with_mode(body, StructuredParseMode::defer_grammar_compile);
         }
         if (auto* e = std::get_if<ApiError>(&job_v)) {
-            write_error(ex, *e);
+            fail_inference_request(ex, "chat", *e, corr);
             return;
         }
         ResponsesJob job = std::move(std::get<ResponsesJob>(job_v));
-        if (!require_ready(ex)) {
+        if (const State s = state.load(); s != State::ready) {
+            fail_inference_request(ex, "chat", not_ready_error(s), corr, job.priority_class, job.model, job.model);
             return;
         }
         const auto served_id = residency->resolve(job.model);
         if (!served_id) {
-            write_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
+            fail_inference_request(
+                ex, "chat", make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"),
+                corr, job.priority_class, job.model, job.model);
             return;
         }
         auto pinned = residency->acquire(*served_id);
         if (!pinned.ok()) {
-            write_error(ex, load_failure_error(*served_id, pinned.status()));
+            fail_inference_request(ex, "chat", load_failure_error(*served_id, pinned.status()), corr,
+                                   job.priority_class, *served_id, job.model);
             return;
         }
         const ModelResidency::Pin pin = std::move(pinned).value();
         if ((job.response_format_type.has_value() || !job.grammar.empty()) &&
             !backend_has_capability(Capability::structured_output)) {
-            write_error(ex, make_error(400, "unsupported_parameter",
-                                       "backend '" + pin.backend() +
-                                           "' does not support structured output / grammar constraints",
-                                       "text.format"));
+            fail_inference_request(
+                ex, "chat",
+                make_error(400, "unsupported_parameter",
+                           "backend '" + pin.backend() + "' does not support structured output / grammar constraints",
+                           "text.format"),
+                corr, job.priority_class, pin.id(), job.model, pin.model());
             return;
         }
         if (job.sampling.logprobs && !backend_has_capability(Capability::logprobs)) {
-            write_error(ex, make_error(400, "unsupported_parameter",
-                                       "backend '" + pin.backend() + "' does not support logprobs", "logprobs"));
+            fail_inference_request(
+                ex, "chat",
+                make_error(400, "unsupported_parameter",
+                           "backend '" + pin.backend() + "' does not support logprobs", "logprobs"),
+                corr, job.priority_class, pin.id(), job.model, pin.model());
             return;
         }
         const bool has_media = has_chat_media(job.input_messages);
         if (has_media && !backend_has_capability(Capability::multimodal)) {
-            write_error(ex, make_error(400, "unsupported_parameter",
-                                       "backend '" + pin.backend() + "' does not support multimodal image inputs",
-                                       "input"));
+            fail_inference_request(
+                ex, "chat",
+                make_error(400, "unsupported_parameter",
+                           "backend '" + pin.backend() + "' does not support multimodal image inputs", "input"),
+                corr, job.priority_class, pin.id(), job.model, pin.model());
             return;
         }
         const ModelDescriptor* desc_ptr = pin.model() ? &pin.model()->descriptor() : nullptr;
@@ -609,7 +673,7 @@ struct Server::Impl {
                                                  backend_has_capability(Capability::structured_output),
                                                  backend_has_capability(Capability::tool_calling),
                                                  pin.backend(), &grammar_cache)) {
-            write_error(ex, *err);
+            fail_inference_request(ex, "chat", *err, corr, job.priority_class, pin.id(), job.model, pin.model());
             return;
         }
         if (const ModelProfileBinding* binding = find_profile_binding(opts, *served_id)) {
@@ -632,7 +696,15 @@ struct Server::Impl {
             }
             auto created = engine->create_session(pin.model(), so);
             if (!created.ok()) {
-                write_error(ex, map_session_failure(created.status(), false));
+                const ApiError err = map_session_failure(created.status(), false);
+                TelemetryContext ctx = engine->engine_context();
+                ctx.request_id = ex.request_id;
+                ctx.model_instance_id = pin.model()->instance_id();
+                ctx.device_id = pin.model()->device_id();
+                ctx.synthetic_work = is_synthetic_backend(pin.model()->backend_name());
+                emit_pre_execution_failure(engine->telemetry(), std::move(ctx), "chat", err.code, corr,
+                                           job.priority_class, pin.id(), job.model);
+                write_error(ex, err);
                 return;
             }
             session = created.value();
@@ -640,10 +712,12 @@ struct Server::Impl {
         {
             std::lock_guard<std::mutex> lock(inflight_mu);
             if (state.load() != State::ready) {
+                const ApiError err = make_error(
+                    503, "not_ready",
+                    "sonder-inference is draining; nothing was executed, the request is safe to send elsewhere");
+                fail_inference_request(ex, "chat", err, corr, job.priority_class, pin.id(), job.model, pin.model(),
+                                       session);
                 session->close();
-                write_error(ex, make_error(503, "not_ready",
-                                           "sonder-inference is draining; nothing was executed, the request is safe "
-                                           "to send elsewhere"));
                 return;
             }
             inflight.insert(session);
@@ -678,9 +752,10 @@ struct Server::Impl {
     }
 
     void handle_completions(Exchange& ex, const RequestHead& head, const std::string& body) {
+        ex.request_id = make_id("req");
         auto corr_v = parse_correlation(head);
         if (auto* e = std::get_if<ApiError>(&corr_v)) {
-            write_error(ex, *e);
+            fail_inference_request(ex, "generate", *e);
             return;
         }
         const Correlation corr = std::get<Correlation>(corr_v);
@@ -689,44 +764,54 @@ struct Server::Impl {
             const auto parse_timeout = std::min(opts.read_timeout, std::chrono::milliseconds(2000));
             auto parse_guard = parse_gate.acquire(body.size(), parse_timeout);
             if (!parse_guard) {
-                if (!require_ready(ex)) {
+                if (const State s = state.load(); s != State::ready) {
+                    fail_inference_request(ex, "generate", not_ready_error(s), corr);
                     return;
                 }
                 ApiError e = make_error(503, "overloaded", "request parser concurrency limit reached; retry later");
                 e.retry_after = 1;
-                write_error(ex, e);
+                fail_inference_request(ex, "generate", e, corr);
                 return;
             }
             job_v = parse_completion_request(body);
         }
         if (auto* e = std::get_if<ApiError>(&job_v)) {
-            write_error(ex, *e);
+            fail_inference_request(ex, "generate", *e, corr);
             return;
         }
         CompletionJob job = std::move(std::get<CompletionJob>(job_v));
-        if (!require_ready(ex)) {
+        if (const State s = state.load(); s != State::ready) {
+            fail_inference_request(ex, "generate", not_ready_error(s), corr, job.priority_class, job.model, job.model);
             return;
         }
         const auto served_id = residency->resolve(job.model);
         if (!served_id) {
-            write_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
+            fail_inference_request(
+                ex, "generate", make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"),
+                corr, job.priority_class, job.model, job.model);
             return;
         }
         auto pinned = residency->acquire(*served_id);
         if (!pinned.ok()) {
-            write_error(ex, load_failure_error(*served_id, pinned.status()));
+            fail_inference_request(ex, "generate", load_failure_error(*served_id, pinned.status()), corr,
+                                   job.priority_class, *served_id, job.model);
             return;
         }
         const ModelResidency::Pin pin = std::move(pinned).value();
         if (!job.grammar.empty() && !backend_has_capability(Capability::structured_output)) {
-            write_error(ex, make_error(400, "unsupported_parameter",
-                                       "backend '" + pin.backend() + "' does not support grammar constraints",
-                                       "grammar"));
+            fail_inference_request(
+                ex, "generate",
+                make_error(400, "unsupported_parameter",
+                           "backend '" + pin.backend() + "' does not support grammar constraints", "grammar"),
+                corr, job.priority_class, pin.id(), job.model, pin.model());
             return;
         }
         if (job.sampling.logprobs && !backend_has_capability(Capability::logprobs)) {
-            write_error(ex, make_error(400, "unsupported_parameter",
-                                       "backend '" + pin.backend() + "' does not support logprobs", "logprobs"));
+            fail_inference_request(
+                ex, "generate",
+                make_error(400, "unsupported_parameter",
+                           "backend '" + pin.backend() + "' does not support logprobs", "logprobs"),
+                corr, job.priority_class, pin.id(), job.model, pin.model());
             return;
         }
         if (const ModelProfileBinding* binding = find_profile_binding(opts, *served_id)) {
@@ -749,7 +834,15 @@ struct Server::Impl {
             }
             auto created = engine->create_session(pin.model(), so);
             if (!created.ok()) {
-                write_error(ex, map_session_failure(created.status(), false));
+                const ApiError err = map_session_failure(created.status(), false);
+                TelemetryContext ctx = engine->engine_context();
+                ctx.request_id = ex.request_id;
+                ctx.model_instance_id = pin.model()->instance_id();
+                ctx.device_id = pin.model()->device_id();
+                ctx.synthetic_work = is_synthetic_backend(pin.model()->backend_name());
+                emit_pre_execution_failure(engine->telemetry(), std::move(ctx), "generate", err.code, corr,
+                                           job.priority_class, pin.id(), job.model);
+                write_error(ex, err);
                 return;
             }
             session = created.value();
@@ -757,10 +850,12 @@ struct Server::Impl {
         {
             std::lock_guard<std::mutex> lock(inflight_mu);
             if (state.load() != State::ready) {
+                const ApiError err = make_error(
+                    503, "not_ready",
+                    "sonder-inference is draining; nothing was executed, the request is safe to send elsewhere");
+                fail_inference_request(ex, "generate", err, corr, job.priority_class, pin.id(), job.model, pin.model(),
+                                       session);
                 session->close();
-                write_error(ex, make_error(503, "not_ready",
-                                           "sonder-inference is draining; nothing was executed, the request is safe "
-                                           "to send elsewhere"));
                 return;
             }
             inflight.insert(session);
@@ -791,9 +886,10 @@ struct Server::Impl {
     }
 
     void handle_embeddings(Exchange& ex, const RequestHead& head, const std::string& body) {
+        ex.request_id = make_id("req");
         auto corr_v = parse_correlation(head);
         if (auto* e = std::get_if<ApiError>(&corr_v)) {
-            write_error(ex, *e);
+            fail_inference_request(ex, "embed", *e);
             return;
         }
         const Correlation corr = std::get<Correlation>(corr_v);
@@ -802,32 +898,37 @@ struct Server::Impl {
             const auto parse_timeout = std::min(opts.read_timeout, std::chrono::milliseconds(2000));
             auto parse_guard = parse_gate.acquire(body.size(), parse_timeout);
             if (!parse_guard) {
-                if (!require_ready(ex)) {
+                if (const State s = state.load(); s != State::ready) {
+                    fail_inference_request(ex, "embed", not_ready_error(s), corr);
                     return;
                 }
                 ApiError e = make_error(503, "overloaded", "request parser concurrency limit reached; retry later");
                 e.retry_after = 1;
-                write_error(ex, e);
+                fail_inference_request(ex, "embed", e, corr);
                 return;
             }
             job_v = parse_embed_request(body);
         }
         if (auto* e = std::get_if<ApiError>(&job_v)) {
-            write_error(ex, *e);
+            fail_inference_request(ex, "embed", *e, corr);
             return;
         }
         const EmbedJob job = std::move(std::get<EmbedJob>(job_v));
-        if (!require_ready(ex)) {
+        if (const State s = state.load(); s != State::ready) {
+            fail_inference_request(ex, "embed", not_ready_error(s), corr, job.priority_class, job.model, job.model);
             return;
         }
         const auto served_id = residency->resolve(job.model);
         if (!served_id) {
-            write_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
+            fail_inference_request(
+                ex, "embed", make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"),
+                corr, job.priority_class, job.model, job.model);
             return;
         }
         auto pinned = residency->acquire(*served_id);
         if (!pinned.ok()) {
-            write_error(ex, load_failure_error(*served_id, pinned.status()));
+            fail_inference_request(ex, "embed", load_failure_error(*served_id, pinned.status()), corr,
+                                   job.priority_class, *served_id, job.model);
             return;
         }
         const ModelResidency::Pin pin = std::move(pinned).value();
@@ -847,7 +948,15 @@ struct Server::Impl {
             }
             auto created = engine->create_session(pin.model(), so);
             if (!created.ok()) {
-                write_error(ex, map_session_failure(created.status(), false));
+                const ApiError err = map_session_failure(created.status(), false);
+                TelemetryContext ctx = engine->engine_context();
+                ctx.request_id = ex.request_id;
+                ctx.model_instance_id = pin.model()->instance_id();
+                ctx.device_id = pin.model()->device_id();
+                ctx.synthetic_work = is_synthetic_backend(pin.model()->backend_name());
+                emit_pre_execution_failure(engine->telemetry(), std::move(ctx), "embed", err.code, corr,
+                                           job.priority_class, pin.id(), job.model);
+                write_error(ex, err);
                 return;
             }
             session = created.value();
@@ -855,10 +964,12 @@ struct Server::Impl {
         {
             std::lock_guard<std::mutex> lock(inflight_mu);
             if (state.load() != State::ready) {
+                const ApiError err = make_error(
+                    503, "not_ready",
+                    "sonder-inference is draining; nothing was executed, the request is safe to send elsewhere");
+                fail_inference_request(ex, "embed", err, corr, job.priority_class, pin.id(), job.model, pin.model(),
+                                       session);
                 session->close();
-                write_error(ex, make_error(503, "not_ready",
-                                           "sonder-inference is draining; nothing was executed, the request is safe "
-                                           "to send elsewhere"));
                 return;
             }
             inflight.insert(session);
@@ -883,9 +994,10 @@ struct Server::Impl {
     }
 
     void handle_rerank(Exchange& ex, const RequestHead& head, const std::string& body) {
+        ex.request_id = make_id("req");
         auto corr_v = parse_correlation(head);
         if (auto* e = std::get_if<ApiError>(&corr_v)) {
-            write_error(ex, *e);
+            fail_inference_request(ex, "rerank", *e);
             return;
         }
         const Correlation corr = std::get<Correlation>(corr_v);
@@ -894,32 +1006,37 @@ struct Server::Impl {
             const auto parse_timeout = std::min(opts.read_timeout, std::chrono::milliseconds(2000));
             auto parse_guard = parse_gate.acquire(body.size(), parse_timeout);
             if (!parse_guard) {
-                if (!require_ready(ex)) {
+                if (const State s = state.load(); s != State::ready) {
+                    fail_inference_request(ex, "rerank", not_ready_error(s), corr);
                     return;
                 }
                 ApiError e = make_error(503, "overloaded", "request parser concurrency limit reached; retry later");
                 e.retry_after = 1;
-                write_error(ex, e);
+                fail_inference_request(ex, "rerank", e, corr);
                 return;
             }
             job_v = parse_rerank_request(body);
         }
         if (auto* e = std::get_if<ApiError>(&job_v)) {
-            write_error(ex, *e);
+            fail_inference_request(ex, "rerank", *e, corr);
             return;
         }
         const RerankJob job = std::move(std::get<RerankJob>(job_v));
-        if (!require_ready(ex)) {
+        if (const State s = state.load(); s != State::ready) {
+            fail_inference_request(ex, "rerank", not_ready_error(s), corr, job.priority_class, job.model, job.model);
             return;
         }
         const auto served_id = residency->resolve(job.model);
         if (!served_id) {
-            write_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
+            fail_inference_request(
+                ex, "rerank", make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"),
+                corr, job.priority_class, job.model, job.model);
             return;
         }
         auto pinned = residency->acquire(*served_id);
         if (!pinned.ok()) {
-            write_error(ex, load_failure_error(*served_id, pinned.status()));
+            fail_inference_request(ex, "rerank", load_failure_error(*served_id, pinned.status()), corr,
+                                   job.priority_class, *served_id, job.model);
             return;
         }
         const ModelResidency::Pin pin = std::move(pinned).value();
@@ -939,7 +1056,15 @@ struct Server::Impl {
             }
             auto created = engine->create_session(pin.model(), so);
             if (!created.ok()) {
-                write_error(ex, map_session_failure(created.status(), false));
+                const ApiError err = map_session_failure(created.status(), false);
+                TelemetryContext ctx = engine->engine_context();
+                ctx.request_id = ex.request_id;
+                ctx.model_instance_id = pin.model()->instance_id();
+                ctx.device_id = pin.model()->device_id();
+                ctx.synthetic_work = is_synthetic_backend(pin.model()->backend_name());
+                emit_pre_execution_failure(engine->telemetry(), std::move(ctx), "rerank", err.code, corr,
+                                           job.priority_class, pin.id(), job.model);
+                write_error(ex, err);
                 return;
             }
             session = created.value();
@@ -947,10 +1072,12 @@ struct Server::Impl {
         {
             std::lock_guard<std::mutex> lock(inflight_mu);
             if (state.load() != State::ready) {
+                const ApiError err = make_error(
+                    503, "not_ready",
+                    "sonder-inference is draining; nothing was executed, the request is safe to send elsewhere");
+                fail_inference_request(ex, "rerank", err, corr, job.priority_class, pin.id(), job.model, pin.model(),
+                                       session);
                 session->close();
-                write_error(ex, make_error(503, "not_ready",
-                                           "sonder-inference is draining; nothing was executed, the request is safe "
-                                           "to send elsewhere"));
                 return;
             }
             inflight.insert(session);
@@ -975,9 +1102,10 @@ struct Server::Impl {
     }
 
     void handle_score(Exchange& ex, const RequestHead& head, const std::string& body) {
+        ex.request_id = make_id("req");
         auto corr_v = parse_correlation(head);
         if (auto* e = std::get_if<ApiError>(&corr_v)) {
-            write_error(ex, *e);
+            fail_inference_request(ex, "score", *e);
             return;
         }
         const Correlation corr = std::get<Correlation>(corr_v);
@@ -986,32 +1114,37 @@ struct Server::Impl {
             const auto parse_timeout = std::min(opts.read_timeout, std::chrono::milliseconds(2000));
             auto parse_guard = parse_gate.acquire(body.size(), parse_timeout);
             if (!parse_guard) {
-                if (!require_ready(ex)) {
+                if (const State s = state.load(); s != State::ready) {
+                    fail_inference_request(ex, "score", not_ready_error(s), corr);
                     return;
                 }
                 ApiError e = make_error(503, "overloaded", "request parser concurrency limit reached; retry later");
                 e.retry_after = 1;
-                write_error(ex, e);
+                fail_inference_request(ex, "score", e, corr);
                 return;
             }
             job_v = parse_score_request(body);
         }
         if (auto* e = std::get_if<ApiError>(&job_v)) {
-            write_error(ex, *e);
+            fail_inference_request(ex, "score", *e, corr);
             return;
         }
         const ScoreJob job = std::move(std::get<ScoreJob>(job_v));
-        if (!require_ready(ex)) {
+        if (const State s = state.load(); s != State::ready) {
+            fail_inference_request(ex, "score", not_ready_error(s), corr, job.priority_class, job.model, job.model);
             return;
         }
         const auto served_id = residency->resolve(job.model);
         if (!served_id) {
-            write_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
+            fail_inference_request(
+                ex, "score", make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"),
+                corr, job.priority_class, job.model, job.model);
             return;
         }
         auto pinned = residency->acquire(*served_id);
         if (!pinned.ok()) {
-            write_error(ex, load_failure_error(*served_id, pinned.status()));
+            fail_inference_request(ex, "score", load_failure_error(*served_id, pinned.status()), corr,
+                                   job.priority_class, *served_id, job.model);
             return;
         }
         const ModelResidency::Pin pin = std::move(pinned).value();
@@ -1031,7 +1164,15 @@ struct Server::Impl {
             }
             auto created = engine->create_session(pin.model(), so);
             if (!created.ok()) {
-                write_error(ex, map_session_failure(created.status(), false));
+                const ApiError err = map_session_failure(created.status(), false);
+                TelemetryContext ctx = engine->engine_context();
+                ctx.request_id = ex.request_id;
+                ctx.model_instance_id = pin.model()->instance_id();
+                ctx.device_id = pin.model()->device_id();
+                ctx.synthetic_work = is_synthetic_backend(pin.model()->backend_name());
+                emit_pre_execution_failure(engine->telemetry(), std::move(ctx), "score", err.code, corr,
+                                           job.priority_class, pin.id(), job.model);
+                write_error(ex, err);
                 return;
             }
             session = created.value();
@@ -1039,10 +1180,12 @@ struct Server::Impl {
         {
             std::lock_guard<std::mutex> lock(inflight_mu);
             if (state.load() != State::ready) {
+                const ApiError err = make_error(
+                    503, "not_ready",
+                    "sonder-inference is draining; nothing was executed, the request is safe to send elsewhere");
+                fail_inference_request(ex, "score", err, corr, job.priority_class, pin.id(), job.model, pin.model(),
+                                       session);
                 session->close();
-                write_error(ex, make_error(503, "not_ready",
-                                           "sonder-inference is draining; nothing was executed, the request is safe "
-                                           "to send elsewhere"));
                 return;
             }
             inflight.insert(session);
