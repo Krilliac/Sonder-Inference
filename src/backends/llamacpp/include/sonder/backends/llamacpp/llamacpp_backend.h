@@ -249,6 +249,11 @@ struct LoadOptions {
     std::uint32_t embed_batch_tokens = kDefaultEmbedBatchTokens;
     // Maximum sequences packed per embedding/rerank forward pass (0 = auto, max kMaxEmbedSequences).
     std::uint32_t embed_max_sequences = kDefaultEmbedMaxSequences;
+    // Deep graph eval telemetry (strictly opt-in at TelemetryLevel::deep; below deep
+    // cb_eval is never installed on llama_context_params).
+    bool graph_telemetry_enabled = false;
+    std::uint32_t graph_telemetry_sample_every = 1;
+    bool graph_telemetry_timings = true;
 };
 
 // Checks placement options (main_gpu >= 0, split_mode, tensor_split finite /
@@ -295,6 +300,7 @@ struct ContextParamsSummary {
     bool op_offload = false;
     bool swa_full = true;
     std::uint64_t moe_cache_size = 0;
+    bool has_eval_callback = false;
 };
 
 struct SamplingParams {
@@ -587,6 +593,9 @@ struct TelemetryEvent {
 
 using TelemetrySink = std::function<void(const TelemetryEvent&)>;
 
+struct GraphEvalSummary;
+using GraphEvalSink = std::function<void(const GraphEvalSummary&)>;
+
 // Telemetry counters for cold shared-prefix prefill coalescing.
 struct PrefixCoalescerStats {
     std::uint64_t coalesced_groups = 0;
@@ -747,6 +756,7 @@ public:
                                 std::size_t max_bytes = kMaxSequenceStateBytes);
 
     void SetTelemetrySink(TelemetrySink sink);
+    void SetGraphEvalSink(GraphEvalSink sink);
     [[nodiscard]] PrefixCoalescerStats GetPrefixCoalescerStats() const noexcept;
 
 private:

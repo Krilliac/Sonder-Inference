@@ -13,6 +13,7 @@
 #include "sonder/inference/backend.hpp"
 #include "sonder/inference/speculative_verifier.hpp"
 #include "sonder/inference/swa_policy.hpp"
+#include "sonder/inference/telemetry.hpp"
 
 namespace sonder::inference {
 
@@ -114,6 +115,19 @@ struct LlamaCppBackendOptions {
     std::uint32_t embed_batch_tokens = 2048;
     // Maximum sequences packed per embedding/rerank forward pass (0 = auto, max 64).
     std::uint32_t embed_max_sequences = 16;
+    // Telemetry verbosity for backend-internal instrumentation. Layer and
+    // operator graph telemetry (and Capability::layer_telemetry) activate
+    // strictly at TelemetryLevel::deep; below deep no ggml callback is installed.
+    TelemetryLevel telemetry_level = TelemetryLevel::standard;
+    // Sample graph eval telemetry every N evals when telemetry_level == deep (>= 1).
+    std::uint32_t graph_telemetry_sample_every = 1;
+    // Collect per-layer / per-op wall timings on sampled evals at deep level.
+    bool graph_telemetry_timings = true;
+    // Optional non-owning TelemetryBus receiving backend.layer.timing and
+    // backend.operator.activity events at TelemetryLevel::deep.
+    TelemetryBus* telemetry_bus = nullptr;
+    // Optional correlation context for emitted graph telemetry events.
+    TelemetryContext telemetry_context{};
 };
 
 // Checks the llama.cpp context and placement options (KV cache types,

@@ -429,6 +429,7 @@ endif()
 add_library(sonder_backend_llamacpp STATIC
     llamacpp_backend.cpp
     llamacpp_util.cpp
+    graph_telemetry.cpp
 )
 add_library(sonder::backend_llamacpp ALIAS sonder_backend_llamacpp)
 target_include_directories(sonder_backend_llamacpp
