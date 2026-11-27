@@ -612,4 +612,102 @@ TEST_CASE("llamacpp lazy grammar: captured text violating the grammar returns an
     CHECK(st.ok());
     be.Unload();
 }
+namespace {
+
+LlamaCppBackend& LoadedBpeBackend(LlamaCppBackend& be) {
+    LoadOptions opts;
+    opts.model_path = std::string(SONDER_LLAMACPP_VOCAB_DIR) + "/ggml-vocab-llama-bpe.gguf";
+    opts.vocab_only = true;
+    REQUIRE(be.Load(opts).ok());
+    return be;
+}
+
+SamplingParams HelloParams() {
+    SamplingParams p;
+    p.grammar = "root ::= \"hello\" [a-z]+";
+    return p;
+}
+
+}  // namespace
+
+TEST_CASE("llamacpp grammar prefill: accepted prefill advances the grammar (vocab-only)") {
+    LlamaCppBackend be;
+    LoadedBpeBackend(be);
+    std::vector<Token> hello;
+    REQUIRE(be.Tokenize("hello", false, hello).ok());
+    REQUIRE_FALSE(hello.empty());
+
+    SamplingParams prefilled = HelloParams();
+    prefilled.grammar_prefill = hello;
+    std::vector<std::uint8_t> via_prefill;
+    REQUIRE(be.ProbeGrammarMask(prefilled, {}, via_prefill).ok());
+
+    std::vector<std::uint8_t> via_accept;
+    REQUIRE(be.ProbeGrammarMask(HelloParams(), hello, via_accept).ok());
+    CHECK(via_prefill == via_accept);  // identical to accepting the tokens by hand
+
+    std::vector<std::uint8_t> fresh;
+    REQUIRE(be.ProbeGrammarMask(HelloParams(), {}, fresh).ok());
+    CHECK(via_prefill != fresh);  // and not the rebuilt, un-prefilled grammar
+    be.Unload();
+}
+
+TEST_CASE("llamacpp grammar prefill: rejected, out-of-range and EOG tokens rebuild without prefill (vocab-only)") {
+    LlamaCppBackend be;
+    LoadedBpeBackend(be);
+    std::vector<std::uint8_t> fresh;
+    REQUIRE(be.ProbeGrammarMask(HelloParams(), {}, fresh).ok());
+
+    std::vector<Token> wrong;
+    REQUIRE(be.Tokenize("xyz", false, wrong).ok());
+    REQUIRE_FALSE(wrong.empty());
+    std::vector<Token> eog;
+    REQUIRE(be.Tokenize("<|eot_id|>", false, eog, /*parse_special=*/true).ok());
+    REQUIRE(eog.size() == 1u);
+    std::vector<Token> hello;
+    REQUIRE(be.Tokenize("hello", false, hello).ok());
+    std::vector<Token> hello_then_eog = hello;
+    hello_then_eog.push_back(eog[0]);  // grammar stack is non-empty here; accepting EOG would GGML_ABORT
+
+    const std::vector<std::vector<Token>> cases{wrong, eog, hello_then_eog, {-1}, {0x7fffffff}};
+    for (const std::vector<Token>& prefill : cases) {
+        SamplingParams p = HelloParams();
+        p.grammar_prefill = prefill;
+        std::vector<std::uint8_t> mask;
+        REQUIRE(be.ProbeGrammarMask(p, {}, mask).ok());
+        CHECK(mask == fresh);
+    }
+    be.Unload();
+}
+
+TEST_CASE("llamacpp grammar prefill: requires a non-lazy grammar (vocab-only)") {
+    LlamaCppBackend be;
+    LoadedBpeBackend(be);
+    std::vector<Token> hello;
+    REQUIRE(be.Tokenize("hello", false, hello).ok());
+    std::vector<std::uint8_t> mask;
+
+    SamplingParams no_grammar;
+    no_grammar.grammar_prefill = hello;
+    CHECK(be.ProbeGrammarMask(no_grammar, {}, mask).code == ErrorCode::kInvalidArgument);
+
+    SamplingParams lazy = LazyToolCallParams();
+    lazy.grammar_prefill = hello;
+    CHECK(be.ProbeGrammarMask(lazy, {}, mask).code == ErrorCode::kInvalidArgument);
+    be.Unload();
+}
+
+TEST_CASE("llamacpp lazy grammar: a replay failure is deterministic, so a restored retry cannot recover (vocab-only)") {
+    LlamaCppBackend be;
+    LoadedBpeBackend(be);
+    std::vector<Token> violating;
+    REQUIRE(be.Tokenize("<tool_call>1", false, violating).ok());
+    // Rebuilding the sampler and replaying the same tokens (what a snapshot restore amounts to)
+    // fails identically every time; this is why the speculative step does not retry.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        std::vector<std::uint8_t> mask;
+        CHECK(be.ProbeGrammarMask(LazyToolCallParams(), violating, mask).code == ErrorCode::kDecodeFailed);
+    }
+    be.Unload();
+}
 #endif

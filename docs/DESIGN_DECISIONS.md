@@ -145,7 +145,8 @@ overrode the initial MIT choice with Apache-2.0).
 **Decision:** Sonder Inference is licensed under the Apache License, Version
 2.0. The root `LICENSE` holds the full standard text. `NOTICE` reads
 "Sonder-Inference, Copyright 2026 Nate Witkowski" and credits the fetched MIT
-third-party code (llama.cpp b11195, cpp-httplib v0.58.0 test-only, doctest
+third-party code (llama.cpp, pinned at b11195 when this was decided and
+at v1.0.0 since 2026-11; cpp-httplib v0.58.0 test-only, doctest
 test-only).
 
 **Reason:** Nate's explicit choice. It adds an express patent grant and a

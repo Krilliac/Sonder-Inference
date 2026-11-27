@@ -1,5 +1,6 @@
 #include "llamaserver_stream.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <functional>
@@ -96,6 +97,73 @@ class EventDecoder {
     bool oversized_ = false;
 };
 
+// A llama-server token id: an integer in [0, INT32_MAX].
+std::optional<TokenId> parse_token_id(const json::Value *value) {
+    if (value == nullptr)
+        return std::nullopt;
+    const auto id = value->try_as_int();
+    if (!id || *id < 0 || *id > std::numeric_limits<TokenId>::max())
+        return std::nullopt;
+    return static_cast<TokenId>(*id);
+}
+
+// One probability from a llama-server entry: "prob" when post_sampling
+// (post_sampling_probs), else exp("logprob"). Nullopt when absent or not a
+// probability.
+std::optional<float> parse_probability(const json::Value &entry, bool post_sampling) {
+    const auto *value = entry.find(post_sampling ? "prob" : "logprob");
+    if (value == nullptr || !value->is_number())
+        return std::nullopt;
+    const double raw = value->as_double();
+    if (!std::isfinite(raw))
+        return std::nullopt;
+    const double p = post_sampling ? raw : std::exp(raw);
+    // Tolerate float rounding just above 1 (a logprob of +1e-7); refuse the rest.
+    if (!(p >= 0.0) || p > 1.0 + 1e-6)
+        return std::nullopt;
+    return static_cast<float>(std::min(p, 1.0));
+}
+
+// Parses one llama-server probability entry ({id, token, prob | logprob,
+// top_probs | top_logprobs}, tools/server/server-task.cpp
+// probs_vector_to_json) into `out`, keeping at most `top_k` alternatives,
+// most probable first. False when the sampled token has no usable id or
+// probability. `out.candidates` keeps its capacity across calls.
+bool parse_sampled_probability(const json::Value &entry, std::size_t top_k, SampledTokenProbability &out) {
+    if (!entry.is_object())
+        return false;
+    const auto token_id = parse_token_id(entry.find("id"));
+    if (!token_id)
+        return false;
+    const bool post_sampling = entry.find("prob") != nullptr;
+    const auto probability = parse_probability(entry, post_sampling);
+    if (!probability)
+        return false;
+    out.token_id = *token_id;
+    out.probability = *probability;
+    out.post_sampling = post_sampling;
+    out.candidates.clear();
+    const auto *tops = entry.find(post_sampling ? "top_probs" : "top_logprobs");
+    if (top_k == 0 || tops == nullptr || !tops->is_array())
+        return true;
+    for (const auto &top : tops->as_array()) {
+        if (!top.is_object())
+            continue;
+        const auto id = parse_token_id(top.find("id"));
+        const auto p = parse_probability(top, post_sampling);
+        if (!id || !p)
+            continue;
+        const auto *text = top.find("token");
+        out.candidates.push_back(
+            TokenCandidate{*id, text != nullptr && text->is_string() ? text->as_string() : std::string(), *p});
+    }
+    std::stable_sort(out.candidates.begin(), out.candidates.end(),
+                     [](const TokenCandidate &a, const TokenCandidate &b) { return a.probability > b.probability; });
+    if (out.candidates.size() > top_k)
+        out.candidates.resize(top_k);
+    return true;
+}
+
 }  // namespace
 
 Status protocol_error(std::string message) { return {ErrorCode::protocol_error, "llamaserver: " + message}; }
@@ -127,7 +195,7 @@ Status upstream_status(const Status &status) {
 Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat, bool native, bool separate_reasoning,
                                             const CancellationToken &cancel, const TokenCallback &callback,
                                             std::uint64_t &progress_events, bool tools_requested,
-                                            std::size_t max_tool_call_bytes) {
+                                            std::size_t max_tool_call_bytes, const StreamProbabilities &probabilities) {
     int http_status = 0;
     request.on_status = [&](int status) { http_status = status; };
     GenerateStats stats;
@@ -142,6 +210,12 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
     std::size_t accumulated_tool_call_bytes = 0;
     std::size_t accumulated_output_bytes = 0;
     const bool allow_tools = chat && tools_requested;
+    const bool expose_logprobs = probabilities.expose_logprobs;
+    const std::size_t telemetry_top_k = static_cast<std::size_t>(
+        std::clamp<std::int32_t>(probabilities.telemetry_top_k, 0, kMaxTelemetryTopK));
+    const bool want_sampled = probabilities.telemetry_top_k > 0;
+    // Reused for every frame so the candidate vector keeps its capacity.
+    SampledTokenProbability sampled_scratch;
 
     const auto recompute_prompt_tokens = [&]() -> bool {
         if (usage_prompt)
@@ -265,6 +339,7 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
         std::optional<float> chunk_logprob = std::nullopt;
         std::vector<TopLogprob> chunk_top_logprobs;
         std::vector<ToolCallDelta> chunk_tool_deltas;
+        bool have_sampled = false;
         if (native) {
             if (const auto *content = object.find("content")) {
                 if (!content->is_string()) {
@@ -276,7 +351,9 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
             if (const auto *probs = object.find("completion_probabilities");
                 probs && probs->is_array() && !probs->as_array().empty()) {
                 const auto &p0 = probs->as_array().front();
-                if (p0.is_object()) {
+                if (want_sampled)
+                    have_sampled = parse_sampled_probability(p0, telemetry_top_k, sampled_scratch);
+                if (expose_logprobs && p0.is_object()) {
                     if (const auto *lp = p0.find("logprob"); lp && lp->is_number() && std::isfinite(lp->as_double())) {
                         chunk_logprob = static_cast<float>(lp->as_double());
                     }
@@ -425,7 +502,9 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
                     if (const auto *lp_content = lp_obj->find("content");
                         lp_content && lp_content->is_array() && !lp_content->as_array().empty()) {
                         const auto &entry = lp_content->as_array().front();
-                        if (entry.is_object()) {
+                        if (want_sampled)
+                            have_sampled = parse_sampled_probability(entry, telemetry_top_k, sampled_scratch);
+                        if (expose_logprobs && entry.is_object()) {
                             if (const auto *lp = entry.find("logprob");
                                 lp && lp->is_number() && std::isfinite(lp->as_double())) {
                                 chunk_logprob = static_cast<float>(lp->as_double());
@@ -444,7 +523,7 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
                             }
                         }
                     } else if (const auto *tlps = lp_obj->find("token_logprobs");
-                               tlps && tlps->is_array() && !tlps->as_array().empty()) {
+                               expose_logprobs && tlps && tlps->is_array() && !tlps->as_array().empty()) {
                         const auto &v0 = tlps->as_array().front();
                         if (v0.is_number() && std::isfinite(v0.as_double())) {
                             chunk_logprob = static_cast<float>(v0.as_double());
@@ -510,6 +589,7 @@ Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat
                 chunk.logprob = chunk_logprob;
                 chunk.top_logprobs = std::move(chunk_top_logprobs);
                 chunk.tool_call_deltas = std::move(chunk_tool_deltas);
+                chunk.sampled_probability = have_sampled ? &sampled_scratch : nullptr;
                 const bool keep = callback(chunk);
                 ++stats.chunks;
                 if (!keep) {

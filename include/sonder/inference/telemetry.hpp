@@ -308,6 +308,18 @@ struct TelemetryOptions {
     // pipe) must not hang the process: on expiry the writer is detached and
     // shutdown() returns false. Zero or negative means do not wait at all.
     std::chrono::milliseconds shutdown_timeout{5000};
+    // Backend-sampled token probabilities (llamaserver against llama.cpp),
+    // used only when `standard` events are recorded. top_k is how many
+    // alternatives the backend asks its upstream for per sampled token,
+    // clamped to [0, kMaxTelemetryTopK = 10]; 0 turns the probe off (no
+    // probability on backend chunks, no inference.sampling.candidates).
+    int token_probability_top_k = 5;
+    // inference.sampling.candidates volume bounds, per request: emit for
+    // every `stride`-th probability-bearing token (0 is read as 1), and at
+    // most `max_events` events (0 = no cap). The upstream still computes the
+    // probabilities for every token of the request; these bound the stream.
+    std::uint32_t token_candidates_stride = 1;
+    std::uint32_t token_candidates_max_events = 256;
 };
 
 class TelemetryBus {
