@@ -45,7 +45,7 @@ Target coverage:
 
 ### Single pinned llama.cpp engine and SI patch series
 
-`src/backends/llamacpp/CMakeLists.txt` builds only the single archive pinned in `cmake/llamacpp-pin.json` (**`v1.0.0`**, commit `b1b770d`), verified by SHA-256 (recorded in [LICENSE_REVIEW.md](LICENSE_REVIEW.md)), and applies SI's hash-manifested patch series from `third_party/ggml-patches/` via `cmake/ApplyGgmlPatches.cmake`. Separate `llama.cpp` forks (including `PrismML-Eng/llama.cpp`), standalone `llama-server` / Prism router / `local-fast` binaries, multi-track pins, and unverified local checkout overrides (`FETCHCONTENT_SOURCE_DIR_LLAMACPP`, `SONDER_LLAMACPP_SOURCE_DIR`) are retired and refused at configure time.
+`src/backends/llamacpp/CMakeLists.txt` builds only the single archive pinned in `cmake/llamacpp-pin.json` (**`v1.0.0`**, commit `b1b770d`), verified by SHA-256 (recorded in [LICENSE_REVIEW.md](LICENSE_REVIEW.md)), and applies SI's hash-manifested patch series from `third_party/ggml-patches/` via `cmake/ApplyGgmlPatches.cmake`. Separate `llama.cpp` fork source trees (including `PrismML-Eng/llama.cpp`), multi-track pins (`SONDER_LLAMACPP_TRACK`), and local checkout overrides (`FETCHCONTENT_SOURCE_DIR_LLAMACPP`, `SONDER_LLAMACPP_SOURCE_DIR`, `-LlamaCppSourceDir`, `--llamacpp-src`) are refused at configure time. Removal of the deprecated external `llamaserver` and `ollama` backends is tracked under **RET-07** ([ROADMAP_SI_ONLY.md](ROADMAP_SI_ONLY.md)).
 
 For offline or air-gapped builds, pass a local path to the pinned tarball:
 

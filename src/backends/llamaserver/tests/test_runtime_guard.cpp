@@ -555,8 +555,11 @@ TEST_CASE("log parser detects ROCm, Vulkan, multi-vendor OOM and ternary incompa
         REQUIRE(d.warnings().size() == 1);
         CHECK(d.warnings()[0].code == "ternary_runtime_incompatible");
         CHECK(d.warnings()[0].count == 3);
-        CHECK(d.warnings()[0].message.find("PrismML") != std::string::npos);
-        CHECK(d.warnings()[0].message.find("b11556") != std::string::npos);
+        CHECK(d.warnings()[0].message.find("reblock-pq2") != std::string::npos);
+        CHECK(d.warnings()[0].message.find("Q2_0") != std::string::npos);
+        CHECK(d.warnings()[0].message.find("v1.0.0") != std::string::npos);
+        CHECK(d.warnings()[0].message.find("PrismML-capable binary") == std::string::npos);
+        CHECK(d.warnings()[0].message.find("b11556") == std::string::npos);
     }
 }
 

@@ -1,7 +1,7 @@
 {
   "schema": "sonder.inference.corpus/1",
   "name": "ternary_agent",
-  "version": "2026-11-24.1",
+  "version": "2026-11-27.1",
   "description": "Ternary/1-bit and multi-agent benchmark corpus targeting Bonsai-2 / Qwen3.8 models, speculative decoding (MTP and ngram-mod across high- and low-acceptance workloads), hybrid attention/DeltaNet long-context prefill (~4k tokens, sized under a 4096-token default context window), and 4-way agent fan-out with a shared prefix on NVIDIA RTX and AMD Radeon RX XT / APU GPUs. Bump 'version' whenever prompts change; results record the corpus hash.",
   "fillers": {
     "hybrid_engine_spec": "Architecture note. Sonder Inference manages model residency, logical KV blocks, recurrent-state checkpoints, hardware placement, and backend execution across discrete NVIDIA RTX GPUs (CUDA), discrete AMD Radeon RX XT GPUs (ROCm/HIP and Vulkan), and integrated AMD Ryzen APUs (UMA shared memory). Hybrid models such as Qwen3.8 and Bonsai-2 combine attention layers (which keep token-indexed K and V caches quantized to f16, f8_e4m3, q8_0, q4_0, q2_0, or pq2_0m) with recurrent DeltaNet or SSM layers whose fixed-size per-sequence state cannot be truncated to an arbitrary earlier token. Prefix reuse on hybrid or recurrent models therefore requires an exact saved recurrent-state checkpoint at or before the matching token prefix, while tokens after the checkpoint are re-prefilled. When speculative decoding uses multi-token prediction (draft-mtp), each sequence reserves 1 + draft_n_max recurrent rollback snapshots in VRAM, whereas standalone ngram-mod drafts directly from recent context without extra weight tensors. Compact ternary and 1-bit GGUF formats (TQ1_0, TQ2_0, Q1_0, Q2_0, PQ2_0, PTQ1_0) shrink weight footprints so KV cache sizing, FlashAttention kernel pairing, and concurrent slot count dominate VRAM budgets on 16 GiB cards.",
@@ -17,7 +17,7 @@
     {
       "id": "ternary_tool_json",
       "workload": "tool_json",
-      "prompt": "Convert this hardware observation into a single compact JSON object with exactly the keys `vendor`, `device_hint`, `uma_mode`, `cache_type_k`, `cache_type_v`, `flash_attn`, `speculative_type`, and `warnings` (array of strings). Return valid JSON only, with no markdown fences or commentary.\n\nObservation: Host has one AMD Radeon RX 9070 XT (16384 MiB dedicated, 15200 MiB free, discrete, Vulkan backend) and a Bonsai-2 9B PQ2_0 GGUF with prism.hadamard.block_size=128 and 1 nextn_predict_layers. Keep KV cache at q8_0/q8_0 with auto flash attention and draft-mtp speculation, and warn that PrismML Hadamard runtime support is required.",
+      "prompt": "Convert this hardware observation into a single compact JSON object with exactly the keys `vendor`, `device_hint`, `uma_mode`, `cache_type_k`, `cache_type_v`, `flash_attn`, `speculative_type`, and `warnings` (array of strings). Return valid JSON only, with no markdown fences or commentary.\n\nObservation: Host has one AMD Radeon RX 9070 XT (16384 MiB dedicated, 15200 MiB free, discrete, Vulkan backend) and a Bonsai-2 9B PQ2_0 GGUF with prism.hadamard.block_size=128 and 1 nextn_predict_layers. Keep KV cache at q8_0/q8_0 with auto flash attention and draft-mtp speculation, and warn to re-block private PQ2_0 tensors to stock Q2_0 with sonder-infer reblock-pq2.",
       "max_tokens": 192
     },
     {
