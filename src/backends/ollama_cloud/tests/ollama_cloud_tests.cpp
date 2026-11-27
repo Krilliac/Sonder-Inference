@@ -919,7 +919,8 @@ TEST_CASE("bounds: a non-2xx body is not read past its cap, and the raw response
     auto be = make_ollama_cloud_backend(o).value();
     auto model = load(be);
 
-    // A huge 500 body: reading stops at the 8 KiB error cap (or sooner).
+    // A huge 500 body: the error body is never kept and reading stops early
+    // (at most 9 chunks delivered).
     t->route("/api/chat", Route{500, std::vector<std::string>(100, std::string(1024, 'e')), {}, false});
     auto r = model->chat(user_chat("x"), {}, {});
     REQUIRE_FALSE(r.ok());

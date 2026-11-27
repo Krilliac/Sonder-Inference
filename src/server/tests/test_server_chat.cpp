@@ -812,6 +812,10 @@ TEST_CASE("chat: a local-only request against ollama_cloud makes no network call
         {"/v1/responses", R"({"model":"gpt-oss:120b","input":"hi"})"},
         {"/v1/messages", R"({"model":"gpt-oss:120b","max_tokens":8,"messages":[{"role":"user","content":"hi"}]})"},
         {"/v1/embeddings", R"({"model":"gpt-oss:120b","input":"hi"})"},
+        {"/v1/rerank", R"({"model":"gpt-oss:120b","query":"hi","documents":["a","b"]})"},
+        {"/v1/score", R"({"model":"gpt-oss:120b","text_1":"hi","text_2":"there"})"},
+        {"/v1/tokenize", R"({"model":"gpt-oss:120b","content":"hi"})"},
+        {"/v1/detokenize", R"({"model":"gpt-oss:120b","tokens":[1,2]})"},
     };
     for (const auto& p : probes) {
         CAPTURE(p.target);

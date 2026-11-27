@@ -120,7 +120,8 @@ needed for the result, so none of it is passed on (Secrets below).
   resident (`--lazy-models`, or after an idle eviction) is itself an
   authenticated `GET /api/tags`, so the refusal must come first. That covers
   `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/completions`,
-  `/v1/embeddings`, `/v1/rerank` and `/v1/score`: 400 `invalid_request`
+  `/v1/embeddings`, `/v1/rerank`, `/v1/score`, `/v1/tokenize` and
+  `/v1/detokenize`: 400 `invalid_request`
   (param `X-Sonder-Local-Only`), "backend 'ollama_cloud' is a remote provider
   and the request is local-only (X-Sonder-Local-Only); nothing was sent to the
   provider". No network call is made. The provider itself refuses
@@ -263,3 +264,13 @@ neither the client, the log nor telemetry`. The wire-byte cap is covered in
     (the `Backend` interface has none), so `GET /api/tags` is bounded by its
     timeouts (at most 60 s total, plus `idle_timeout_ms`) rather than
     cancellable.
+  - TLS end-of-stream without a close_notify alert is treated as a clean end
+    by both TLS backends. Chunked and Content-Length bodies and NDJSON `done`
+    lines still detect truncation; a general fix is deferred to its own change.
+  - The key environment variable may be inherited by child processes of the
+    server, and a key file larger than 4 KiB is truncated.
+  - A 2xx response whose first body byte arrives after `idle_timeout_ms`
+    (default 120 s, for example a long prefill) now fails, and a stalled
+    non-2xx response reports a first-content timeout.
+  - The cap of 65,536 JSON values per line could refuse a very large
+    tool-call argument.

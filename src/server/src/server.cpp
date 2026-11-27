@@ -1111,7 +1111,13 @@ struct Server::Impl {
         execute_score(exchange, job, corr, pin.id(), pin.backend(), session);
     }
 
-    void handle_tokenize(Exchange& ex, const std::string& body) {
+    void handle_tokenize(Exchange& ex, const RequestHead& head, const std::string& body) {
+        auto corr_v = parse_correlation(head);
+        if (auto* e = std::get_if<ApiError>(&corr_v)) {
+            write_error(ex, *e);
+            return;
+        }
+        const Correlation corr = std::get<Correlation>(corr_v);
         std::variant<TokenizeJob, ApiError> job_v = make_error(500, "internal_error", "uninitialized");
         {
             const auto parse_timeout = std::min(opts.read_timeout, std::chrono::milliseconds(2000));
@@ -1133,6 +1139,9 @@ struct Server::Impl {
         }
         const TokenizeJob job = std::move(std::get<TokenizeJob>(job_v));
         if (!require_ready(ex)) {
+            return;
+        }
+        if (refuse_local_only_remote(ex, corr)) {
             return;
         }
         const auto served_id = residency->resolve(job.model);
@@ -1171,7 +1180,13 @@ struct Server::Impl {
                                 {"sonder", std::move(meta)}});
     }
 
-    void handle_detokenize(Exchange& ex, const std::string& body) {
+    void handle_detokenize(Exchange& ex, const RequestHead& head, const std::string& body) {
+        auto corr_v = parse_correlation(head);
+        if (auto* e = std::get_if<ApiError>(&corr_v)) {
+            write_error(ex, *e);
+            return;
+        }
+        const Correlation corr = std::get<Correlation>(corr_v);
         std::variant<DetokenizeJob, ApiError> job_v = make_error(500, "internal_error", "uninitialized");
         {
             const auto parse_timeout = std::min(opts.read_timeout, std::chrono::milliseconds(2000));
@@ -1193,6 +1208,9 @@ struct Server::Impl {
         }
         const DetokenizeJob job = std::move(std::get<DetokenizeJob>(job_v));
         if (!require_ready(ex)) {
+            return;
+        }
+        if (refuse_local_only_remote(ex, corr)) {
             return;
         }
         const auto served_id = residency->resolve(job.model);
@@ -1357,8 +1375,8 @@ struct Server::Impl {
             case Route::embeddings: handle_embeddings(ex, head, checked.body); break;
             case Route::rerank: handle_rerank(ex, head, checked.body); break;
             case Route::score: handle_score(ex, head, checked.body); break;
-            case Route::tokenize: handle_tokenize(ex, checked.body); break;
-            case Route::detokenize: handle_detokenize(ex, checked.body); break;
+            case Route::tokenize: handle_tokenize(ex, head, checked.body); break;
+            case Route::detokenize: handle_detokenize(ex, head, checked.body); break;
             case Route::discovery:
                 write_json(ex, 200, build_discovery_document(opts, *hub, instance_id, node_id, synthetic));
                 break;

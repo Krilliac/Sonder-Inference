@@ -104,10 +104,15 @@ public:
                 r.first_progress_timeout = request.idle_timeout;
                 r.progress_counter = [&body_bytes] { return body_bytes; };
             }
+            struct HeaderWipe {
+                net::HttpRequest& r;
+                ~HeaderWipe() {
+                    for (auto& header : r.headers) {
+                        ollama_cloud::secure_wipe(header.second);
+                    }
+                }
+            } wipe{r};
             auto res = net::http_request(r, counted, cancel);
-            for (auto& header : r.headers) {
-                ollama_cloud::secure_wipe(header.second);
-            }
             if (!res.ok()) {
                 return res.status();
             }
