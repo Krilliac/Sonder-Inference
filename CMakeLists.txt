@@ -58,6 +58,13 @@ add_library(sonder_inference
     src/net/http_client.cpp
 )
 add_library(sonder::inference ALIAS sonder_inference)
+# Handle-anchored no-follow file opens (src/common/safe_file.hpp), shared by the weight
+# manifests (src/artifacts) and the Ollama model store (src/models).
+if(WIN32)
+    target_sources(sonder_inference PRIVATE src/common/safe_file_win32.cpp)
+else()
+    target_sources(sonder_inference PRIVATE src/common/safe_file_posix.cpp)
+endif()
 
 target_include_directories(sonder_inference
     PUBLIC  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"

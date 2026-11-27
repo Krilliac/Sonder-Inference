@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -547,8 +548,8 @@ TEST_CASE("model store: a drive-shaped host cannot make resolve read outside the
     CHECK(out.str().empty());
     CHECK(err.str().find("not in") != std::string::npos);
 
-    // A host that ends in dots after the port stays inside the store too.
-    CHECK(store.value().resolve(drive + ":5000../ns/m:t").status().code() == si::ErrorCode::not_found);
+    // A host that ends in dots after the port is not even a valid name (a part may not end in '.').
+    CHECK(store.value().resolve(drive + ":5000../ns/m:t").status().code() == si::ErrorCode::invalid_argument);
 
     // The v2 spelling of a port host still works.
     s.put_v2(drive + "%3A5000", "ns", "m", "t", s.manifest(cfg, {model}));
@@ -568,10 +569,10 @@ TEST_CASE("model store: shards, drafts, messages, legacy prompt and Go-style opt
     const auto prompt = s.blob("application/vnd.ollama.image.prompt", "legacy {{ .Prompt }}");
     const auto messages = s.blob("application/vnd.ollama.image.messages", R"([{"role":"user","content":"hi"}])");
     const auto params = s.blob(kParams, R"({"num_ctx":4096.9,"top_k":-3.7,"num_predict":"many"})");
-    // Larger than the 4 MiB text cap: the layer is not read and the field stays unset.
-    const auto big_system = s.blob(kSystem, std::string((4u << 20) + 1, 's'));
+    // (A system layer over the 4 MiB cap makes the entry unsupported: see "text and config blobs must
+    // match their declared size and digest".)
     s.put_v2("ollama.com", "library", "layers", "latest",
-             s.manifest(cfg, {part1, part2, draft1, draft2, prompt, messages, params, big_system}));
+             s.manifest(cfg, {part1, part2, draft1, draft2, prompt, messages, params}));
 
     auto store = m::OllamaStore::open(s.tmp.path);
     REQUIRE(store.ok());
@@ -592,10 +593,7 @@ TEST_CASE("model store: shards, drafts, messages, legacy prompt and Go-style opt
     CHECK(r.params.num_ctx == 4096);  // float64 -> int truncates, like Ollama
     CHECK(r.params.top_k == -3);
     CHECK_FALSE(r.params.num_predict.has_value());  // a string is still rejected
-    CHECK_FALSE(r.system_prompt.has_value());       // over the cap: unset, not an empty string
-    bool capped = false;
-    for (const auto& w : r.warnings) capped = capped || w.find("system layer unreadable") != std::string::npos;
-    CHECK(capped);
+    CHECK_FALSE(r.system_prompt.has_value());
 }
 
 TEST_CASE("model store: manifest list falls back past a reference whose blob is absent") {
@@ -841,4 +839,736 @@ TEST_CASE("model store: import-ollama CLI lists, filters, verifies and rejects b
     CHECK(run({"export"}, out, err) == 2);
     CHECK(run({"import-ollama", "--help"}, out, err) == 0);
     CHECK(out.find("usage: sonder-infer models import-ollama") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// Security review of PR 135 (RET-04): links, verification, amplification, schema, names, messages.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Creates a directory link at `link` pointing to `target`: a symlink first; on Windows, where that needs a
+// privilege, a junction (`mklink /J`), which any user can create (same helper as test_weight_manifest.cpp).
+bool make_dir_link(const fs::path& link, const fs::path& target) {
+    std::error_code ec;
+    fs::create_directories(link.parent_path(), ec);
+    fs::create_directory_symlink(target, link, ec);
+    if (!ec) return true;
+#if defined(_WIN32)
+    const std::string cmd = "mklink /J \"" + link.string() + "\" \"" + target.string() + "\" >nul 2>nul";
+    if (std::system(cmd.c_str()) == 0) {
+        std::error_code probe;
+        return fs::exists(link, probe);
+    }
+#endif
+    return false;
+}
+
+// Removes a directory link without touching its target.
+void remove_dir_link(const fs::path& link) {
+    std::error_code ec;
+    fs::remove(link, ec);
+}
+
+bool any_contains(const std::vector<std::string>& v, const std::string& needle) {
+    for (const auto& s : v) {
+        if (s.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+std::string scan_json(const fs::path& root) {
+    auto store = m::OllamaStore::open(root);
+    if (!store.ok()) return {};
+    return m::to_json(store.value().scan(), store.value().root()).dump();
+}
+
+}  // namespace
+
+TEST_CASE("model store: a text layer hardlinked to a file outside the store is never read") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(1, 1, 8));
+    TempDir outside;
+    const std::string secret = "TOP-SECRET-hardlink-payload";
+    write_file(outside.path / "secret.txt", secret);
+
+    // The digest names the secret's real hash and size, so only the link count gives it away.
+    const std::string hex = si::detail::sha256_hex(secret);
+    std::error_code ec;
+    fs::create_hard_link(outside.path / "secret.txt", s.tmp.path / "blobs" / ("sha256-" + hex), ec);
+    REQUIRE_MESSAGE(!ec, "hard link creation failed: " << ec.message());
+    s.put_v2("ollama.com", "library", "evil", "latest",
+             s.manifest(cfg, {model, Layer{kTemplate, "sha256:" + hex, secret.size(), ""}}));
+
+    // The reviewer's form: a different claimed digest and size 1.
+    const std::string fake_hex(64, 'a');
+    fs::create_hard_link(outside.path / "secret.txt", s.tmp.path / "blobs" / ("sha256-" + fake_hex), ec);
+    REQUIRE(!ec);
+    s.put_v2("ollama.com", "library", "evil2", "latest",
+             s.manifest(cfg, {model, Layer{kSystem, "sha256:" + fake_hex, 1, ""}}));
+
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    for (const char* name : {"evil", "evil2"}) {
+        CAPTURE(name);
+        auto r = store.value().resolve(name);
+        REQUIRE(r.ok());
+        CHECK_FALSE(r.value().ready());
+        CHECK(r.value().reason == m::UnsupportedReason::unsafe_path);
+        CHECK(r.value().detail.find("hard links") != std::string::npos);
+        CHECK_FALSE(r.value().template_text.has_value());
+        CHECK_FALSE(r.value().system_prompt.has_value());
+    }
+    CHECK(scan_json(s.tmp.path).find("TOP-SECRET") == std::string::npos);
+    m::ModelRegistry reg;
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    CHECK_FALSE(reg.resolve("evil").ok());
+    CHECK_FALSE(reg.resolve("evil2").ok());
+}
+
+TEST_CASE("model store: a blob that is a symlink to a file outside the store is never read") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(1, 1, 8));
+    TempDir outside;
+    const std::string secret = "TOP-SECRET-symlink-payload";
+    write_file(outside.path / "secret.txt", secret);
+    const std::string hex = si::detail::sha256_hex(secret);
+    std::error_code ec;
+    fs::create_symlink(outside.path / "secret.txt", s.tmp.path / "blobs" / ("sha256-" + hex), ec);
+    if (ec) {
+#if defined(_WIN32)
+        MESSAGE("file symlinks need a privilege here (" << ec.message() << "); covered by the junction cases");
+        return;
+#else
+        FAIL_CHECK("file symlink creation failed: " << ec.message());
+        return;
+#endif
+    }
+    s.put_v2("ollama.com", "library", "evil", "latest",
+             s.manifest(cfg, {model, Layer{kSystem, "sha256:" + hex, secret.size(), ""}}));
+    // A weight blob symlinked to a GGUF outside the store is not served either.
+    TempDir outside_gguf;
+    const std::string ext = fake_gguf(4, 4, 16, 'e');
+    write_file(outside_gguf.path / "ext.gguf", ext);
+    const std::string ext_hex = si::detail::sha256_hex(ext);
+    fs::create_symlink(outside_gguf.path / "ext.gguf", s.tmp.path / "blobs" / ("sha256-" + ext_hex), ec);
+    REQUIRE(!ec);
+    s.put_v2("ollama.com", "library", "extgguf", "latest",
+             s.manifest(cfg, {Layer{kModel, "sha256:" + ext_hex, ext.size(), ""}}));
+
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    auto r = store.value().resolve("evil");
+    REQUIRE(r.ok());
+    CHECK_FALSE(r.value().ready());
+    CHECK(r.value().reason == m::UnsupportedReason::unsafe_path);
+    CHECK_FALSE(r.value().system_prompt.has_value());
+    auto g = store.value().resolve("extgguf");
+    REQUIRE(g.ok());
+    CHECK_FALSE(g.value().ready());
+    CHECK(g.value().reason == m::UnsupportedReason::unsafe_path);
+    // read_gguf_header refuses the link too.
+    CHECK_FALSE(m::read_gguf_header(s.tmp.path / "blobs" / ("sha256-" + ext_hex)).ok());
+    CHECK(scan_json(s.tmp.path).find("TOP-SECRET") == std::string::npos);
+}
+
+TEST_CASE("model store: directory links (junction or symlink) under the store are refused") {
+    // Case 1: manifests-v2/ollama.com/library is a link to a directory outside the store.
+    {
+        Store s;
+        const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+        const auto model = s.blob(kModel, fake_gguf(1, 1, 8));
+        TempDir outside;
+        write_file(outside.path / "evil" / "latest", s.manifest(cfg, {model}));
+        fs::create_directories(s.tmp.path / "manifests-v2" / "ollama.com");
+        if (!make_dir_link(s.tmp.path / "manifests-v2" / "ollama.com" / "library", outside.path)) {
+            FAIL_CHECK("no directory link (symlink or junction) could be created here; link refusal NOT exercised");
+            return;
+        }
+        auto store = m::OllamaStore::open(s.tmp.path);
+        REQUIRE(store.ok());
+        auto scan = store.value().scan();
+        CHECK(find(scan, "evil:latest") == nullptr);
+        CHECK(any_contains(scan.notes, "manifests-v2/ollama.com/library: a link or reparse point"));
+        auto r = store.value().resolve("evil");
+        REQUIRE(r.ok());
+        CHECK_FALSE(r.value().ready());
+        CHECK(r.value().reason == m::UnsupportedReason::unsafe_path);
+        remove_dir_link(s.tmp.path / "manifests-v2" / "ollama.com" / "library");
+    }
+    // Case 2: blobs/ itself is a link to a directory outside the store.
+    {
+        Store s;
+        TempDir outside;
+        const std::string cfg_text = R"({"model_format":"gguf"})";
+        const std::string gguf = fake_gguf(1, 1, 8);
+        const Layer cfg{kConfigType, "sha256:" + si::detail::sha256_hex(cfg_text), cfg_text.size(), ""};
+        const Layer model{kModel, "sha256:" + si::detail::sha256_hex(gguf), gguf.size(), ""};
+        write_file(outside.path / ("sha256-" + cfg.digest.substr(7)), cfg_text);
+        write_file(outside.path / ("sha256-" + model.digest.substr(7)), gguf);
+        s.put_v2("ollama.com", "library", "linked", "latest", s.manifest(cfg, {model}));
+        if (!make_dir_link(s.tmp.path / "blobs", outside.path)) {
+            FAIL_CHECK("no directory link could be created here; link refusal NOT exercised");
+            return;
+        }
+        auto store = m::OllamaStore::open(s.tmp.path);
+        REQUIRE(store.ok());
+        auto r = store.value().resolve("linked");
+        REQUIRE(r.ok());
+        CHECK_FALSE(r.value().ready());
+        CHECK(r.value().reason == m::UnsupportedReason::unsafe_path);
+        remove_dir_link(s.tmp.path / "blobs");
+    }
+}
+
+#if defined(_WIN32)
+TEST_CASE("model store: NTFS junctions for a manifest directory or blobs are refused") {
+    // make_dir_link() prefers a symlink, which Developer Mode allows; this case always uses a junction.
+    auto junction = [](const fs::path& link, const fs::path& target) {
+        std::error_code ec;
+        fs::create_directories(link.parent_path(), ec);
+        const std::string cmd = "mklink /J \"" + link.string() + "\" \"" + target.string() + "\" >nul 2>nul";
+        return std::system(cmd.c_str()) == 0 && fs::exists(link, ec);
+    };
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(1, 1, 8));
+    TempDir outside;
+    write_file(outside.path / "lib" / "evil" / "latest", s.manifest(cfg, {model}));
+    s.put_v2("ollama.com", "library", "fine", "latest", s.manifest(cfg, {model}));
+    REQUIRE_MESSAGE(junction(s.tmp.path / "manifests-v2" / "ollama.com" / "team", outside.path / "lib"),
+                    "mklink /J failed; junction refusal NOT exercised");
+    {
+        std::error_code ec;
+        const auto st = fs::symlink_status(s.tmp.path / "manifests-v2" / "ollama.com" / "team", ec);
+        CHECK(st.type() != fs::file_type::symlink);  // really a junction, not a symlink
+    }
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    auto scan = store.value().scan();
+    CHECK(find(scan, "team/evil:latest") == nullptr);
+    CHECK(any_contains(scan.notes, "manifests-v2/ollama.com/team: a link or reparse point"));
+    auto r = store.value().resolve("team/evil");
+    REQUIRE(r.ok());
+    CHECK(r.value().reason == m::UnsupportedReason::unsafe_path);
+    CHECK(store.value().resolve("fine").value().ready());
+    remove_dir_link(s.tmp.path / "manifests-v2" / "ollama.com" / "team");
+
+    // blobs/ as a junction to a directory holding the same files.
+    TempDir other;
+    fs::create_directories(other.path / "b");
+    for (const auto& e : fs::directory_iterator(s.tmp.path / "blobs")) fs::copy_file(e.path(), other.path / "b" / e.path().filename());
+    fs::remove_all(s.tmp.path / "blobs");
+    REQUIRE(junction(s.tmp.path / "blobs", other.path / "b"));
+    auto linked = store.value().resolve("fine");
+    REQUIRE(linked.ok());
+    CHECK(linked.value().reason == m::UnsupportedReason::unsafe_path);
+    remove_dir_link(s.tmp.path / "blobs");
+}
+#endif
+
+TEST_CASE("model store: a manifest leaf symlink is followed only into a matching blob") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(1, 1, 8));
+    const std::string manifest = s.manifest(cfg, {model});
+    const auto mblob = s.blob(kManifestType, manifest);  // Ollama keeps the manifest as a blob too
+    const fs::path leaf_dir = s.tmp.path / "manifests-v2" / "ollama.com" / "library" / "linked";
+    fs::create_directories(leaf_dir);
+    std::error_code ec;
+    // Relative link the way Ollama writes it (manifest/manifest.go: os.Symlink(rel, ...)).
+    fs::create_symlink(fs::path("../../../../blobs") / ("sha256-" + mblob.digest.substr(7)), leaf_dir / "latest", ec);
+    if (ec) {
+#if defined(_WIN32)
+        MESSAGE("file symlinks need a privilege here (" << ec.message() << "); manifest-link case not exercised");
+        return;
+#else
+        FAIL_CHECK("file symlink creation failed: " << ec.message());
+        return;
+#endif
+    }
+    // A link whose target has a blob-shaped name but lies outside the store.
+    TempDir outside;
+    write_file(outside.path / ("sha256-" + mblob.digest.substr(7)), manifest);
+    const fs::path out_dir = s.tmp.path / "manifests-v2" / "ollama.com" / "library" / "outlink";
+    fs::create_directories(out_dir);
+    fs::create_symlink(outside.path / ("sha256-" + mblob.digest.substr(7)), out_dir / "latest", ec);
+    REQUIRE(!ec);
+    // A link into blobs/ whose content does not hash to the blob name.
+    const std::string other = s.manifest(cfg, {model}, ",\"runner\":\"llamacpp\"");
+    write_file(s.tmp.path / "blobs" / ("sha256-" + std::string(64, 'b')), other);
+    const fs::path bad_dir = s.tmp.path / "manifests-v2" / "ollama.com" / "library" / "badlink";
+    fs::create_directories(bad_dir);
+    fs::create_symlink(fs::path("../../../../blobs") / ("sha256-" + std::string(64, 'b')), bad_dir / "latest", ec);
+    REQUIRE(!ec);
+
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    auto out = store.value().resolve("outlink");
+    REQUIRE(out.ok());
+    CHECK_FALSE(out.value().ready());
+    CHECK(out.value().reason == m::UnsupportedReason::unsafe_path);
+    auto bad = store.value().resolve("badlink");
+    REQUIRE(bad.ok());
+    CHECK_FALSE(bad.value().ready());
+#if defined(_WIN32)
+    CHECK(bad.value().reason == m::UnsupportedReason::unsafe_path);
+    // Windows: Ollama writes copies there (manifest.go "Avoid symlinks on windows"); a link is refused.
+    auto win = store.value().resolve("linked");
+    REQUIRE(win.ok());
+    CHECK_FALSE(win.value().ready());
+    CHECK(win.value().reason == m::UnsupportedReason::unsafe_path);
+#else
+    CHECK(bad.value().reason == m::UnsupportedReason::manifest_invalid);
+    auto ok = store.value().resolve("linked");
+    REQUIRE(ok.ok());
+    CHECK(ok.value().ready());
+    // The link itself is a source, so retargeting it makes a cached record stale.
+    bool has_link_source = false;
+    for (const auto& src : ok.value().sources) has_link_source = has_link_source || src.link;
+    CHECK(has_link_source);
+    auto scan = store.value().scan();
+    REQUIRE(find(scan, "linked:latest") != nullptr);
+    CHECK(find(scan, "linked:latest")->ready());
+#endif
+}
+
+TEST_CASE("model store: text and config blobs must match their declared size and digest") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(1, 1, 8));
+    // Same size, different bytes (a swapped system prompt).
+    const auto swapped = s.corrupt_blob(kSystem, "You are Sonder.", "You are Evil!!!");
+    s.put_v2("ollama.com", "library", "swapped", "latest", s.manifest(cfg, {model, swapped}));
+    // Declared size differs from the file.
+    auto tmpl = s.blob(kTemplate, "{{ .Prompt }}");
+    tmpl.size = 3;
+    s.put_v2("ollama.com", "library", "tsize", "latest", s.manifest(cfg, {model, tmpl}));
+    // A config whose content does not match its digest.
+    const auto bad_cfg = s.corrupt_blob(kConfigType, R"({"model_format":"gguf","n":1})", R"({"model_format":"ggml","n":1})");
+    s.put_v2("ollama.com", "library", "badcfg", "latest", s.manifest(bad_cfg, {model}));
+    // A config with a malformed digest.
+    s.put_v2("ollama.com", "library", "cfgdigest", "latest",
+             s.manifest(Layer{kConfigType, "sha256:bad", 10, ""}, {model}));
+    // A params layer whose bytes are not what the digest names.
+    const auto bad_params = s.corrupt_blob(kParams, R"({"num_ctx":2048})", R"({"num_ctx":9999})");
+    s.put_v2("ollama.com", "library", "badparams", "latest", s.manifest(cfg, {model, bad_params}));
+    // A system layer above the 4 MiB cap is not silently dropped.
+    const auto big = s.blob(kSystem, std::string((4u << 20) + 1, 's'));
+    s.put_v2("ollama.com", "library", "bigsys", "latest", s.manifest(cfg, {model, big}));
+
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    const std::pair<const char*, m::UnsupportedReason> cases[] = {
+        {"swapped", m::UnsupportedReason::digest_mismatch},   {"tsize", m::UnsupportedReason::blob_size_mismatch},
+        {"badcfg", m::UnsupportedReason::digest_mismatch},    {"cfgdigest", m::UnsupportedReason::manifest_invalid},
+        {"badparams", m::UnsupportedReason::digest_mismatch}, {"bigsys", m::UnsupportedReason::manifest_invalid}};
+    for (const auto& [name, reason] : cases) {
+        CAPTURE(name);
+        auto r = store.value().resolve(name);
+        REQUIRE(r.ok());
+        CHECK_FALSE(r.value().ready());
+        CHECK(r.value().reason == reason);
+        CHECK_FALSE(r.value().detail.empty());
+    }
+    CHECK_FALSE(store.value().resolve("swapped").value().system_prompt.has_value());
+    CHECK_FALSE(store.value().resolve("badparams").value().params.num_ctx.has_value());
+}
+
+TEST_CASE("model store: resolve does not serve a weight blob whose content does not match its digest") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto claimed = fake_gguf(1, 1, 1000, 'A');
+    const auto bad = s.corrupt_blob(kModel, claimed, fake_gguf(1, 1, 1000, 'B'));
+    s.put_v2("ollama.com", "library", "bad", "latest", s.manifest(cfg, {bad}));
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    auto r = store.value().resolve("bad");
+    REQUIRE(r.ok());
+    CHECK_FALSE(r.value().ready());
+    CHECK(r.value().reason == m::UnsupportedReason::digest_mismatch);
+    m::ModelRegistry reg;
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    auto via = reg.resolve("bad");
+    CHECK_FALSE(via.ok());
+    CHECK(via.status().code() == si::ErrorCode::unsupported);
+    CHECK(via.status().message().find("digest_mismatch") != std::string::npos);
+}
+
+TEST_CASE("model store: a cached registry record is revalidated before it is returned") {
+    Store s;
+    make_full_model(s);
+    m::ModelRegistry reg;
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    auto first = reg.resolve("coder:7b");
+    REQUIRE(first.ok());
+    const fs::path model = first.value().model_path;
+
+    // Same size, valid header, different content after the scan. The write time is moved on
+    // explicitly: a rewrite inside the file system's timestamp granularity would otherwise keep
+    // it (the documented limit of the identity check).
+    write_file(model, fake_gguf(291, 26, 4096, 'Z'));
+    fs::last_write_time(model, fs::last_write_time(model) + std::chrono::seconds(5));
+    auto swapped = reg.resolve("coder:7b");
+    CHECK_FALSE(swapped.ok());
+    CHECK(swapped.status().message().find("digest_mismatch") != std::string::npos);
+
+    // Truncated after the scan.
+    write_file(model, fake_gguf(291, 26, 10));
+    auto truncated = reg.resolve("coder:7b");
+    CHECK_FALSE(truncated.ok());
+}
+
+TEST_CASE("model store: manifest layer count and text bytes are bounded") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(1, 1, 8));
+    // 65 content layers (one blob referenced again and again) exceed the 64-layer cap.
+    std::vector<Layer> many(65, model);
+    s.put_v2("ollama.com", "library", "bomb", "latest", s.manifest(cfg, many));
+    // 64 is still accepted.
+    std::vector<Layer> max(64, model);
+    s.put_v2("ollama.com", "library", "max", "latest", s.manifest(cfg, max));
+
+    // More than 16 MiB of text layers in one manifest.
+    const std::size_t big = (4u << 20) - 64;
+    const auto cfg_big = s.config_blob(std::string(R"({"model_format":"gguf","pad":")") + std::string(1u << 20, 'p') + "\"}");
+    const auto t = s.blob(kTemplate, std::string(big, 't'));
+    const auto sy = s.blob(kSystem, std::string(big, 'y'));
+    const auto msg = s.blob("application/vnd.ollama.image.messages", "[\"" + std::string(big, 'm') + "\"]");
+    const auto par = s.blob(kParams, "{\"x\":\"" + std::string(big, 'q') + "\"}");
+    s.put_v2("ollama.com", "library", "fat", "latest", s.manifest(cfg_big, {model, t, sy, msg, par}));
+
+    // Stop strings: at most 64 entries, each bounded.
+    std::string stops = "{\"stop\":[";
+    for (int i = 0; i < 70; ++i) stops += (i ? ",\"s" : "\"s") + std::to_string(i) + "\"";
+    stops += ",\"" + std::string(5000, 'L') + "\"]}";
+    const auto stop_params = s.blob(kParams, stops);
+    s.put_v2("ollama.com", "library", "stops", "latest", s.manifest(cfg, {model, stop_params}));
+
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    auto bomb = store.value().resolve("bomb");
+    REQUIRE(bomb.ok());
+    CHECK_FALSE(bomb.value().ready());
+    CHECK(bomb.value().reason == m::UnsupportedReason::manifest_invalid);
+    CHECK(bomb.value().shard_paths.size() < 64);
+    auto mx = store.value().resolve("max");
+    REQUIRE(mx.ok());
+    CHECK(mx.value().ready());
+    auto fat = store.value().resolve("fat");
+    REQUIRE(fat.ok());
+    CHECK_FALSE(fat.value().ready());
+    CHECK(fat.value().reason == m::UnsupportedReason::manifest_invalid);
+    CHECK(fat.value().detail.find("past") != std::string::npos);
+    auto st = store.value().resolve("stops");
+    REQUIRE(st.ok());
+    CHECK(st.value().params.stop.size() == 64);
+    for (const auto& x : st.value().params.stop) CHECK(x.size() <= 1024);
+    CHECK(any_contains(st.value().warnings, "more than 64 entries"));
+}
+
+TEST_CASE("model store: declared byte totals cannot wrap") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(1, 1, 8));
+    // License blobs are only counted, never read, so a huge declared size reaches the sum.
+    const Layer lic{kLicense, "sha256:" + std::string(64, 'c'), 18446744073709551600ull, ""};
+    s.put_v2("ollama.com", "library", "wrap", "latest", s.manifest(cfg, {model, lic}));
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    auto r = store.value().resolve("wrap");
+    REQUIRE(r.ok());
+    CHECK_FALSE(r.value().ready());
+    CHECK(r.value().reason == m::UnsupportedReason::manifest_invalid);
+    CHECK(r.value().referenced_bytes >= r.value().weights_bytes);
+}
+
+TEST_CASE("model store: manifest schema is strict about keys sizes and digests") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(1, 1, 8));
+    const std::string good = s.manifest(cfg, {model});
+    // Duplicate key: the second "layers" would silently win.
+    std::string dup = good;
+    dup.insert(dup.size() - 1, ",\"layers\":[]");
+    s.put_v2("ollama.com", "library", "dupkey", "latest", dup);
+    // Fractional, negative and string sizes.
+    auto frac = good;
+    const std::string sz = "\"size\":" + std::to_string(model.size);
+    frac.replace(frac.find(sz), sz.size(), "\"size\":" + std::to_string(model.size) + ".9");
+    s.put_v2("ollama.com", "library", "frac", "latest", frac);
+    auto neg = good;
+    neg.replace(neg.find(sz), sz.size(), "\"size\":-1");
+    s.put_v2("ollama.com", "library", "neg", "latest", neg);
+    auto str = good;
+    str.replace(str.find(sz), sz.size(), "\"size\":\"" + std::to_string(model.size) + "\"");
+    s.put_v2("ollama.com", "library", "strsize", "latest", str);
+    // The blob-file spelling of a digest is not a manifest digest.
+    auto dash = good;
+    const std::string dg = "\"digest\":\"" + model.digest + "\"";
+    dash.replace(dash.find(dg), dg.size(), "\"digest\":\"sha256-" + model.digest.substr(7) + "\"");
+    s.put_v2("ollama.com", "library", "dash", "latest", dash);
+
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    for (const char* name : {"dupkey", "frac", "neg", "strsize", "dash"}) {
+        CAPTURE(name);
+        auto r = store.value().resolve(name);
+        REQUIRE(r.ok());
+        CHECK_FALSE(r.value().ready());
+        CHECK(r.value().reason == m::UnsupportedReason::manifest_invalid);
+    }
+}
+
+TEST_CASE("model store: name parts with trailing dots or DOS device names are rejected") {
+    for (const char* bad : {"coder.:7b", "coder:7b.", "coder...:7b...", "CON:latest", "con", "x:nul", "lpt1.txt:1",
+                            "ns/aux:1", "registry.ollama.ai/nul/x:1", "com7", "Prn.foo", "host./ns/m:t"}) {
+        CAPTURE(bad);
+        auto r = m::parse_ollama_name(bad);
+        CHECK_FALSE(r.ok());
+        if (!r.ok()) CHECK(r.status().code() == si::ErrorCode::invalid_argument);
+    }
+    // Names that merely contain those words stay valid.
+    for (const char* ok : {"console:1", "nullx", "com10:1", "lpt:1", "auxiliary/con-model:1", "a.b:c.d"}) {
+        CAPTURE(ok);
+        CHECK(m::parse_ollama_name(ok).ok());
+    }
+    Store s;
+    make_full_model(s);
+    m::ModelRegistry reg;
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    CHECK(reg.resolve("coder...:7b...").status().code() == si::ErrorCode::invalid_argument);
+}
+
+#if defined(_WIN32)
+TEST_CASE("model store: names with unpaired UTF-16 surrogates are skipped without throwing") {
+    Store s;
+    make_full_model(s);
+    const std::wstring bad_name{L'b', L'a', L'd', static_cast<wchar_t>(0xD800)};
+    const fs::path lib = s.tmp.path / "manifests-v2" / "ollama.com" / "library";
+    fs::create_directories(lib / fs::path(bad_name));
+    write_file(lib / fs::path(bad_name) / "latest", "{}");
+    fs::create_directories(s.tmp.path / "manifests-v2" / fs::path(bad_name) / "library" / "m");
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    m::ScanResult scan;
+    CHECK_NOTHROW(scan = store.value().scan());
+    CHECK(find(scan, "coder:7b") != nullptr);
+    CHECK(any_contains(scan.notes, "not representable"));
+    CHECK_NOTHROW((void)store.value().resolve("unknown:latest"));
+    CHECK_NOTHROW((void)scan_json(s.tmp.path));
+}
+#endif
+
+TEST_CASE("model store: status messages and notes carry no root path or raw control bytes") {
+    Store s;
+    make_full_model(s);
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    s.put_legacy("registry.ollama.ai", "library", "bad name", "latest", s.manifest(cfg, {}));
+    const auto cloud_cfg =
+        s.config_blob(R"({"remote_host":"https://user:hunter2@internal.example:8443/x","remote_model":"kimi\u001b[31m"})");
+    s.put_v2("ollama.com", "library", "stub", "cloud", s.manifest(cloud_cfg, {}));
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    const std::string root_text = store.value().root().generic_string();
+    const std::string root_native = store.value().root().string();
+
+    auto miss = store.value().resolve("ghost:1");
+    REQUIRE_FALSE(miss.ok());
+    CHECK(miss.status().message().find(root_text) == std::string::npos);
+    CHECK(miss.status().message().find(root_native) == std::string::npos);
+
+    const std::string hostile = "bad\r\n forged-log\x1b[31m" + std::string(10000, 'A');
+    auto bad = m::parse_ollama_name(hostile);
+    REQUIRE_FALSE(bad.ok());
+    const std::string msg = bad.status().message();  // a copy: status() returns by value
+    CHECK(msg.size() < 400);
+    CHECK(msg.find('\r') == std::string::npos);
+    CHECK(msg.find('\n') == std::string::npos);
+    CHECK(msg.find('\x1b') == std::string::npos);
+
+    m::ModelRegistry reg;
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    auto stub = reg.resolve("stub:cloud");
+    REQUIRE_FALSE(stub.ok());
+    CHECK(stub.status().message().find("hunter2") == std::string::npos);
+    CHECK(stub.status().message().find("internal.example") == std::string::npos);
+    CHECK(stub.status().message().find('\x1b') == std::string::npos);
+
+    auto scan = store.value().scan();
+    REQUIRE_FALSE(scan.notes.empty());
+    for (const auto& n : scan.notes) {
+        CAPTURE(n);
+        CHECK(n.find(root_text) == std::string::npos);
+        CHECK(n.find(root_native) == std::string::npos);
+    }
+}
+
+TEST_CASE("model store: weight verification policy first_use caches by file identity") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto good = s.blob(kModel, fake_gguf(1, 1, 2000, 'g'));
+    // One blob referenced three times (shards) is opened and hashed once.
+    s.put_v2("ollama.com", "library", "good", "latest", s.manifest(cfg, {good, good, good}));
+    const auto bad = s.corrupt_blob(kModel, fake_gguf(1, 1, 500, 'A'), fake_gguf(1, 1, 500, 'B'));
+    s.put_v2("ollama.com", "library", "bad", "latest", s.manifest(cfg, {bad}));
+
+    int hashed = 0;
+    m::StoreOptions first;
+    first.on_weight_hash = [&](const m::BlobRef&) { ++hashed; };
+    REQUIRE(first.verify_weights == m::WeightVerification::first_use);  // the default
+    auto store = m::OllamaStore::open(s.tmp.path, first);
+    REQUIRE(store.ok());
+
+    auto scan = store.value().scan();  // first_use: the scan does not hash weights
+    CHECK(hashed == 0);
+    REQUIRE(find(scan, "good:latest") != nullptr);
+    CHECK(find(scan, "good:latest")->ready());
+    CHECK_FALSE(find(scan, "good:latest")->weights_verified);
+
+    auto r1 = store.value().resolve("good");
+    REQUIRE(r1.ok());
+    CHECK(r1.value().ready());
+    CHECK(r1.value().weights_verified);
+    CHECK(hashed == 1);
+    auto r2 = store.value().resolve("good");
+    REQUIRE(r2.ok());
+    CHECK(r2.value().weights_verified);
+    CHECK(hashed == 1);  // cached: same file id, size, write and change time
+    // A copy of the store shares the cache.
+    const m::OllamaStore copy = store.value();
+    CHECK(copy.resolve("good").value().weights_verified);
+    CHECK(hashed == 1);
+
+    // A mismatch is cached too, so a corrupt multi-GB file is not re-read on every request.
+    CHECK(store.value().resolve("bad").value().reason == m::UnsupportedReason::digest_mismatch);
+    CHECK(hashed == 2);
+    CHECK(store.value().resolve("bad").value().reason == m::UnsupportedReason::digest_mismatch);
+    CHECK(hashed == 2);
+
+    // A changed file is hashed again.
+    write_file(s.blob_file(good), fake_gguf(1, 1, 2000, 'h'));
+    fs::last_write_time(s.blob_file(good), fs::last_write_time(s.blob_file(good)) + std::chrono::seconds(5));
+    auto r3 = store.value().resolve("good");
+    REQUIRE(r3.ok());
+    CHECK(hashed == 3);
+    CHECK(r3.value().reason == m::UnsupportedReason::digest_mismatch);
+    CHECK_FALSE(r3.value().weights_verified);
+
+    // revalidate(): a record from before the change is stale.
+    CHECK_FALSE(store.value().revalidate(r1.value()));
+    auto fresh = store.value().resolve("bad");
+    REQUIRE(fresh.ok());
+    auto again = fresh.value();
+    CHECK(store.value().revalidate(again));
+    CHECK(again.reason == m::UnsupportedReason::digest_mismatch);
+}
+
+TEST_CASE("model store: weight verification policies always and off") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto good = s.blob(kModel, fake_gguf(1, 1, 300, 'g'));
+    s.put_v2("ollama.com", "library", "good", "latest", s.manifest(cfg, {good}));
+    const auto bad = s.corrupt_blob(kModel, fake_gguf(1, 1, 300, 'A'), fake_gguf(1, 1, 300, 'B'));
+    s.put_v2("ollama.com", "library", "bad", "latest", s.manifest(cfg, {bad}));
+
+    int hashed = 0;
+    m::StoreOptions always;
+    always.verify_weights = m::WeightVerification::always;
+    always.on_weight_hash = [&](const m::BlobRef&) { ++hashed; };
+    auto a = m::OllamaStore::open(s.tmp.path, always);
+    REQUIRE(a.ok());
+    CHECK(a.value().resolve("good").value().weights_verified);
+    CHECK(a.value().resolve("good").value().weights_verified);
+    CHECK(hashed == 2);  // nothing cached
+    auto scan = a.value().scan();
+    CHECK(hashed == 4);  // the scan hashes both entries
+    CHECK(find(scan, "good:latest")->weights_verified);
+    CHECK(find(scan, "bad:latest")->reason == m::UnsupportedReason::digest_mismatch);
+
+    m::StoreOptions off;
+    off.verify_weights = m::WeightVerification::off;
+    off.on_weight_hash = [&](const m::BlobRef&) { ++hashed; };
+    auto o = m::OllamaStore::open(s.tmp.path, off);
+    REQUIRE(o.ok());
+    auto unverified = o.value().resolve("bad");
+    REQUIRE(unverified.ok());
+    CHECK(unverified.value().ready());  // size and header only, by request
+    CHECK_FALSE(unverified.value().weights_verified);
+    CHECK(hashed == 4);
+
+    m::ModelRegistry reg(off);
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    CHECK(reg.resolve("bad").ok());
+    m::ModelRegistry strict;  // default first_use
+    REQUIRE(strict.add_ollama_dir(s.tmp.path).ok());
+    CHECK(strict.resolve("bad").status().code() == si::ErrorCode::unsupported);
+    CHECK(strict.resolve("good").ok());
+}
+
+TEST_CASE("model store: a hard-linked weight blob is served only after its digest matches") {
+    // Ollama hard-links split-model shards into blobs/.ollama-split-*/ while it runs one
+    // (llm/model_split.go), so a weight with two links is normal; its content must still match.
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(1, 1, 64));
+    s.put_v2("ollama.com", "library", "split", "latest", s.manifest(cfg, {model}));
+    std::error_code ec;
+    fs::create_directories(s.tmp.path / "blobs" / ".ollama-split-abc");
+    fs::create_hard_link(s.blob_file(model), s.tmp.path / "blobs" / ".ollama-split-abc" / "model-00001-of-00001.gguf", ec);
+    REQUIRE_MESSAGE(!ec, "hard link creation failed: " << ec.message());
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    auto r = store.value().resolve("split");
+    REQUIRE(r.ok());
+    CHECK(r.value().ready());
+    CHECK(r.value().weights_verified);
+    CHECK(any_contains(r.value().warnings, "hard links"));
+}
+
+TEST_CASE("model store: verify_blobs reads through no link and reports each digest once") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(1, 1, 64));
+    s.put_v2("ollama.com", "library", "twice", "latest", s.manifest(cfg, {model, model}));
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    auto r = store.value().resolve("twice");
+    REQUIRE(r.ok());
+    REQUIRE(r.value().ready());
+    auto report = m::verify_blobs(r.value());
+    CHECK(report.ok());
+    CHECK(report.blobs.size() == 2);  // config + one model, not two
+
+    // Replace the model blob with a link to an identical file outside the store.
+    TempDir outside;
+    write_file(outside.path / "copy.gguf", fake_gguf(1, 1, 64));
+    fs::remove(s.blob_file(model));
+    std::error_code ec;
+    fs::create_symlink(outside.path / "copy.gguf", s.blob_file(model), ec);
+    if (ec) {
+#if defined(_WIN32)
+        MESSAGE("file symlinks need a privilege here (" << ec.message() << "); verify link case not exercised");
+        return;
+#else
+        FAIL_CHECK("file symlink creation failed: " << ec.message());
+        return;
+#endif
+    }
+    auto linked = m::verify_blobs(r.value());
+    CHECK_FALSE(linked.ok());
+    bool saw_unsafe = false;
+    for (const auto& b : linked.blobs) saw_unsafe = saw_unsafe || b.verdict == m::BlobVerdict::unsafe;
+    CHECK(saw_unsafe);
+}
+
+TEST_CASE("model store: the JSON document redacts URL credentials in remote_host") {
+    Store s;
+    const auto cloud_cfg = s.config_blob(R"({"remote_host":"https://user:hunter2@internal.example:8443/x","remote_model":"m1"})");
+    s.put_v2("ollama.com", "library", "stub", "cloud", s.manifest(cloud_cfg, {}));
+    const std::string doc = scan_json(s.tmp.path);
+    CHECK(doc.find("hunter2") == std::string::npos);
+    CHECK(doc.find("https://internal.example:8443/x") != std::string::npos);
 }

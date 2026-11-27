@@ -20,7 +20,10 @@ retiring the daemon loses no models.
 - Reports entries SI cannot serve locally, each with a reason code and text:
   Ollama Cloud stubs, safetensors/MLX, missing blobs, truncated blobs, invalid GGUF,
   broken manifests (see "Unsupported entries").
-- Verifies blob digests **only on request** (`verify_blobs`, `--verify`).
+- Opens every file without following links and inside the store root only, checks small layers
+  (config, template, system, params, messages) against their size and SHA-256 on every read, and
+  hashes weights on first use by default (see "Trust and verification").
+- A full report of every blob digest is still a separate call (`verify_blobs`, `--verify`).
 - Does NOT copy, move, link, rename or delete anything in the store (a test snapshots the
   tree before and after a scan, a verify and a resolve and requires it unchanged).
 - Does NOT load a model, start a daemon, or touch the llamacpp backend (see "Backend hook").
@@ -70,22 +73,95 @@ was parsed and carries `reason` + `detail`. Precedence: the first reason found w
 | `missing_blob` | a model/projector/adapter/draft/text-layer blob is absent from `blobs/`. |
 | `blob_size_mismatch` | blob size differs from the manifest (partial or replaced file). |
 | `invalid_gguf` | first 24 bytes are not a GGUF header of version 2 or 3 (version 1 is refused the way llama.cpp refuses it). |
+| `unsafe_path` | a manifest, a directory on its path, `blobs/` or a blob is a symlink, junction or other reparse point, is not a regular disk file, or (manifests and small layers) has more than one hard link. |
+| `digest_mismatch` | a small layer, or a weight that was hashed (see the policy below), does not hash to its digest. |
 | `no_compatible_manifest` | manifest list without a `llamacpp`/`ggml` GGUF child. |
-| `manifest_invalid` | unreadable/oversized/not JSON/not an object, malformed layer digest, a list child whose blob does not match its digest. |
+| `manifest_invalid` | unreadable/oversized/not JSON/not an object, a repeated JSON key, a size that is not a non-negative integer (`24.9`, `-1`, `"24"`), a digest that is not exactly `sha256:<64 hex>` (the `sha256-` spelling is only a blob file name), more than 64 content layers or 64 list children, small layers over 4 MiB each or 16 MiB together, declared sizes that overflow 64 bits, a list child whose blob does not match its digest. |
 
-A ready record means: every weight blob is present, has the declared size and starts with a
-supported GGUF header. It does **not** mean the file loads (see "Open items / UNVERIFIED").
+A ready record means: every blob it needs is a regular file inside the store with the declared
+size, every small layer matched its SHA-256, and every weight starts with a supported GGUF header;
+`weights_verified` says whether the weights were hashed too. It does **not** mean the file loads
+(see "Open items / UNVERIFIED").
 
-## Digest verification (opt-in)
+## Trust and verification
 
-Scanning reads small files and 24 bytes of each GGUF-class blob. It never hashes a model.
-`verify_blobs(record, options)` streams every blob through SHA-256 (64 KiB buffer) and
-compares with the blob's digest; `weights_only` skips the small layers; a `CancellationToken`
-stops it and `on_blob_start` lets a caller show progress. Verdicts: `ok`, `mismatch`,
-`missing`, `io_error`, `cancelled`. Ollama checks a blob's digest when it pulls it but does not
-re-check it when it loads a model, so a blob that was corrupted after the pull goes unnoticed and
-this is the way to find it. Cost: a full read of
-every byte (the real store holds about 145 GiB of weights).
+The threat model is a library another local user or process may be able to write to. What the
+reader enforces (security review of PR 135, both reviews):
+
+- **No links, no escape.** Every manifest, list child, config, text layer and blob is opened once
+  through `src/common/safe_file.hpp` (shared with the weight manifests): one path segment at a time
+  from the store root, never following a symlink, junction or other reparse point
+  (`FILE_FLAG_OPEN_REPARSE_POINT` and a final-path check of every component against
+  `root\segment` on Windows; `openat` + `O_NOFOLLOW` on POSIX), and the leaf must be a regular disk
+  file. Size, hash and content all come from that one handle with a bounded read (cap + 1 bytes),
+  so a file swapped or grown between check and read is caught. Directory links under `manifests*/`
+  are skipped with a note; `blobs/` itself must be a real directory. The store root may be a link
+  (the operator chose it); its resolved path is the anchor.
+- **Manifest symlinks (POSIX only).** Ollama writes each v2 name as a relative symlink to
+  `blobs/sha256-<manifest hex>` except on Windows (`manifest/manifest.go` `WriteManifest`). Such a
+  leaf is accepted only when its target's name is `sha256-<64 hex>`, `blobs/sha256-<hex>` opened
+  from the root (never through the link) is the very file the link resolves to, and its bytes hash
+  to `<hex>` (Ollama's own rule in `openManifestFileLocked`). On Windows a manifest link is refused
+  (`unsafe_path`): Ollama writes copies there, and following a link could open a UNC target.
+- **Hard links.** Manifests and small layers must have one link: a hard link to a file outside the
+  store would otherwise turn a template or system layer into a read of that file (and its digest
+  check into a guessing oracle). Weights may have more than one: Ollama hard-links split-model
+  shards into `blobs/.ollama-split-*/` while it runs one (`llm/model_split.go`), so refusing them
+  would break real stores. Such a weight gets a warning and is vouched for only by its SHA-256
+  (under `off` it is served on size and header alone, as every weight is there).
+- **Small layers** (config, template/prompt, system, params, messages, list children) are checked
+  against the declared size and SHA-256 on every read; a mismatch makes the entry unsupported,
+  never a silently dropped prompt.
+- **Weights.** Size (from the handle) and the GGUF header are checked on every read. The full
+  SHA-256 follows `StoreOptions::verify_weights`:
+  - `first_use` (default): `OllamaStore::resolve` and `ModelRegistry::resolve` hash each weight
+    once; the result (match or mismatch) is cached per store by the file's identity (volume + file
+    id, size, last-write and change time), so an unchanged file is not re-read and a changed one
+    is. `scan()`/`list()` do not hash (`weights_verified` is false there).
+  - `always`: every resolve and every scan hashes, nothing is cached.
+  - `off`: never (the CLI listing uses this; `--verify` still hashes on request).
+  `on_weight_hash` is called before each hash (a multi-GB file takes minutes).
+- **Cached records are revalidated.** `ModelRegistry::resolve` passes every cached record
+  (from the scan or from an earlier live lookup) through `OllamaStore::revalidate`: each source
+  file and blob must still have the identity it had when it was read; otherwise the name is
+  resolved again. Successful live lookups are cached (at most 1024; `refresh()` drops them).
+- **Bounds.** Manifests and list children 4 MiB, 64 content layers, 64 list children, small layers
+  4 MiB each and 16 MiB per manifest, each digest validated once per manifest, `params.stop` at most
+  64 entries of at most 1024 bytes (a later params layer replaces `stop`, as Ollama's map decode
+  does), byte totals added with overflow checks, at most 64 warnings and 256 scan notes.
+- **Names.** Besides Ollama's part rules, a part may not end in `.` and may not be a Windows device
+  name (`CON`, `PRN`, `AUX`, `NUL`, `COM0-9`, `LPT0-9`, with or without an extension), on every
+  platform; Win32 would otherwise open `coder` for `coder.`. Directory entries whose names are not
+  representable as UTF-8 (unpaired UTF-16 surrogates) are skipped with a note instead of throwing.
+- **Messages.** `Status` messages, `detail`, `warnings` and scan notes quote untrusted text at most
+  128 bytes with control bytes escaped, never name the store's absolute path (notes are
+  store-relative; `not_found` says "is not in the store"), and never include a cloud stub's
+  `remote_host` (the JSON document strips URL credentials from it). The CLI adds the directory for
+  the operator; nothing it prints is meant to become an HTTP response.
+
+Known limits (not fixed here):
+
+- **The loader opens weights by path.** llama.cpp mmaps `model_path` itself, so a writer who can
+  replace a blob after `resolve` verified it (and before or while it is mapped) is not caught
+  until the next `resolve`. Passing handles into llama.cpp is out of scope; where writers of the
+  store are untrusted, make the library read-only to them (ownership/ACLs).
+- **The identity cache trusts metadata.** A writer who rewrites a blob in place with the same size
+  and restores both timestamps (Windows lets a file's owner set even `ChangeTime`) defeats
+  `first_use`; a rewrite within the file system's timestamp granularity looks unchanged too. Use
+  `always` where that matters. On ReFS the 64-bit file index used for identity is not unique.
+- Directory listing still uses path-based iteration; a directory swapped for a link during a scan
+  can only change which names are listed, since every file is then opened anchored and refused.
+
+## Full digest report (opt-in)
+
+`verify_blobs(record, options)` streams each distinct blob (by digest) through SHA-256 from an
+anchored no-follow handle (one 1 MiB buffer per call), checks the file did not change while it
+was hashed, and compares with the digest; `weights_only` skips the small layers; a
+`CancellationToken` stops it and `on_blob_start` lets a caller show progress. Verdicts: `ok`,
+`mismatch`, `missing`, `unsafe` (a link or not a regular file; not read), `io_error`, `cancelled`.
+Ollama checks a blob's digest when it pulls it but does not re-check it when it loads a model, so a
+blob that was corrupted after the pull goes unnoticed and this (or the `first_use` policy) is the
+way to find it. Cost: a full read of every byte (the real store holds about 145 GiB of weights).
 
 ## CLI
 
@@ -116,7 +192,9 @@ auto rec = registry.resolve("qwen3.5:4b");       // ready records only
 
 `resolve` returns `not_found`, `invalid_argument` (bad name) or `unsupported` (entry exists but
 cannot be served; the message names the reason). A miss in the cached scan falls back to a live
-lookup, so a model pulled after the last `refresh()` is still found. Nothing in `src/backends`
+lookup, so a model pulled after the last `refresh()` is still found. Every cached record is
+revalidated against the disk before it is returned, and weights are hashed on first use
+(`ModelRegistry(StoreOptions)` chooses the policy; see "Trust and verification"). Nothing in `src/backends`
 includes this header yet; the integration is the loader lane's change: resolve the `--model`
 name through the registry when it is not an existing file path.
 
@@ -135,12 +213,13 @@ backend can choose; it does not reimplement Ollama's Go-template or renderers.
 - No configuration persistence: `OLLAMA_MODELS` or an explicit `DIR` selects the store. A durable
   "registered stores" setting (and where the server reads it) is a design choice for the integrator.
 - Digest references (`ollama run sha256-<hex>`) and Ollama's `@digest` name suffix are not resolved.
-- Manifest files are not themselves verified against their digest (v2 manifests on POSIX are
-  symlinks to blobs named by the manifest's SHA-256); list-child blobs are.
+- A regular-file manifest has no digest to check it against (Ollama treats it the same way); a
+  symlinked v2 manifest (POSIX) and list-child blobs are hash-checked.
 - Windows host:port registries in the legacy tree are skipped by Ollama itself; this reader accepts
   them only through the v2 tree (`%3A`). A name whose host contains `:` therefore never builds a
-  legacy path (on Windows `c:5000` would read as a drive-relative path outside the store), and every
-  candidate path is also checked to stay lexically under the store root before it is opened.
+  legacy path (on Windows `c:5000` would read as a drive-relative path outside the store), every
+  candidate path is also checked to stay lexically under the store root, and the anchored open
+  refuses a segment containing `:` on Windows.
 - Draft layers: Ollama keeps the first `image.draft` layer as the draft model and the later ones as
   its shards; `draft_paths` lists all of them in manifest order, first = draft model.
 - Weights that several entries reference (a manifest-list child and the legacy manifest that points

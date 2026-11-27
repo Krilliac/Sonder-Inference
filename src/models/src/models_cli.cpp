@@ -2,6 +2,7 @@
 //
 // Read-only: lists what an existing Ollama models directory would serve through SI's
 // native engine, without starting any daemon, copying any file or writing to the store.
+#include <cstdint>
 #include <cstdio>
 #include <iostream>
 #include <map>
@@ -65,9 +66,15 @@ std::string pad(std::string s, std::size_t width) {
     return s;
 }
 
+// For the operator's terminal only (never an HTTP response). Does not throw on a Windows
+// name with an unpaired UTF-16 surrogate.
 std::string path_text(const fs::path& p) {
-    const auto u = p.generic_u8string();
-    return std::string(reinterpret_cast<const char*>(u.data()), u.size());
+    try {
+        const auto u = p.generic_u8string();
+        return std::string(reinterpret_cast<const char*>(u.data()), u.size());
+    } catch (const std::exception&) {
+        return "<path not representable as UTF-8>";
+    }
 }
 
 struct Options {
@@ -135,9 +142,13 @@ int models_main(const std::vector<std::string>& args, std::ostream& out, std::os
     if (dir.empty()) {
         return usage_error(err, "no DIR given and neither OLLAMA_MODELS nor a home directory is set");
     }
-    auto store = OllamaStore::open(dir);
+    // A listing tool: weights are not hashed unless --verify asks for it (verify_blobs below),
+    // so resolving one --name does not read a multi-GB file by surprise.
+    StoreOptions store_options;
+    store_options.verify_weights = WeightVerification::off;
+    auto store = OllamaStore::open(dir, store_options);
     if (!store.ok()) {
-        err << "error: models: " << store.status().message() << "\n";
+        err << "error: models: '" << path_text(dir) << "': " << store.status().message() << "\n";
         return kExitFailure;
     }
 
@@ -145,7 +156,7 @@ int models_main(const std::vector<std::string>& args, std::ostream& out, std::os
     if (o.name) {
         auto one = store.value().resolve(*o.name);
         if (!one.ok()) {
-            err << "error: models: " << one.status().message() << "\n";
+            err << "error: models: " << one.status().message() << " (" << path_text(store.value().root()) << ")\n";
             return one.status().code() == ErrorCode::invalid_argument ? kExitUsage : kExitFailure;
         }
         scan.records.push_back(std::move(one).value());
@@ -210,7 +221,7 @@ int models_main(const std::vector<std::string>& args, std::ostream& out, std::os
                 }
                 const auto [it, inserted] = weight_owner.emplace(b.digest, r.name.display());
                 if (inserted) {
-                    ready_bytes += b.declared_size;
+                    ready_bytes = b.declared_size > UINT64_MAX - ready_bytes ? UINT64_MAX : ready_bytes + b.declared_size;
                 } else if (b.role == BlobRole::model && shares_with.empty()) {
                     shares_with = it->second;
                 }

@@ -651,7 +651,20 @@ verification), the `ModelRegistry` lookup and `sonder-infer models import-ollama
 Changes outside the module, for the integrator:
 
 1. Root `CMakeLists.txt`: `src/models` added to `SONDER_MODULE_DIRS` (one line). The module needs
-   only core code (`json`, `common/sha256`) and defines `SONDER_HAS_MODEL_STORE`.
+   only core code (`json`, `common/sha256`, `common/safe_file`) and defines `SONDER_HAS_MODEL_STORE`.
+   Security review follow-up (PR 135): the root file also adds `src/common/safe_file_win32.cpp` /
+   `safe_file_posix.cpp` to the core library (one `if(WIN32)` block).
+5. `src/common/safe_file.hpp` + `safe_file_{win32,posix}.cpp` (new, core): the handle-anchored
+   no-follow opens (`OwnedFileHandle`, `open_anchored_regular`, `open_single_regular`,
+   `is_link_like`) moved verbatim out of `src/artifacts/src/weight_manifest_io_{win32,posix}.cpp`,
+   plus `open_anchored_file` (identity: volume, file id, size, link count, write/change time),
+   `query_identity`, `read_some`, `read_anchored_leaf_symlink` (POSIX) and a check that rejects
+   empty/`.`/`..`/NUL (and on Windows `:`/`\`) segments before opening. `src/artifacts` keeps only
+   `hash_open_handle`; `weight_manifest_io.hpp` re-exports the moved names with using-declarations,
+   so `weight_manifest.cpp` is unchanged and the `sonder.artifacts.*` tests cover the move.
+6. `include/sonder/inference/json.hpp` / `src/common/json.cpp`: `ParseLimits::reject_duplicate_keys`
+   (default `false`, so every existing caller behaves as before); the model store parses manifests
+   with it. Test: `tests/test_json.cpp` "ParseLimits reject_duplicate_keys ...".
 2. `src/cli/sonder_infer_commands.hpp`: the `models` spec gains the `models import-ollama` usage
    line, a note and an example. `tools/sonder-infer/main.cpp`: `models import-ollama` dispatches
    to `models::models_main` behind `SONDER_HAS_MODEL_STORE` (before the generic `models` command,
@@ -674,7 +687,9 @@ Open items:
 - No model was loaded and no inference service was started; loadability of `runner: ggml` entries
   by llama.cpp is unverified.
 - No persistence for registered stores; digest references and the `@digest` name suffix are not
-  resolved; manifest files themselves are not hash-checked (see the doc's open-items list).
+  resolved (see the doc's open-items list).
+- The loader opens weights by path (llama.cpp), so a blob swapped after `resolve` verified it is
+  not caught until the next `resolve`/`revalidate` (doc "Trust and verification").
 - The case-insensitive directory lookup (`locate_ci`) is only reachable on case-sensitive file
   systems, so on Windows it is covered by CI on Linux, not by the local run.
 - The real-store totals in the doc were measured before the CLI counted shared blobs once.
