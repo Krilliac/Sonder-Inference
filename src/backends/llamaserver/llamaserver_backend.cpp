@@ -671,7 +671,8 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
     }
     Result<GenerateStats> stream(std::string_view path, std::string body, const CancellationToken &cancel,
                                  const TokenCallback &callback, bool chat, bool separate_reasoning = false,
-                                 bool tools_requested = false) {
+                                 bool tools_requested = false,
+                                 const llamaserver::StreamProbabilities &probabilities = {}) {
         auto activity = acquire_request(cancel);
         if (!activity.ok())
             return activity.status();
@@ -697,7 +698,8 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
         }
         const bool native = !chat && options_.native_completion;
         return llamaserver::run_completion_stream(request, chat, native, separate_reasoning, cancel, callback,
-                                                  progress_events, tools_requested);
+                                                  progress_events, tools_requested,
+                                                  llamaserver::kMaxToolCallDeltaBytes, probabilities);
     }
 
     // Generic-mode progress watchdog (warn policy), called from the request
@@ -927,6 +929,25 @@ void populate_llamaserver_effective_execution(LlamaServerBackendImpl &backend,
     }
 }
 
+// Telemetry probability probe for one request. Against llama.cpp (native
+// mode) and when the caller did not ask for logprobs, asks the upstream for
+// post-sampling probabilities (n_probs + post_sampling_probs) and keeps them
+// out of the caller's logprobs. A caller's own logprobs are reused as they
+// are, with no request change. Skipped for chat with tools: llama-server
+// refuses logprobs with tools + stream (server-common.cpp), so the probe is
+// not smuggled past that check. Generic OpenAI upstreams get no probe.
+llamaserver::StreamProbabilities telemetry_probabilities(std::int32_t telemetry_top_k, bool caller_logprobs,
+                                                         bool has_tools, bool native,
+                                                         llamaserver::RequestExtras &extras) {
+    llamaserver::StreamProbabilities p;
+    p.telemetry_top_k = std::clamp<std::int32_t>(telemetry_top_k, 0, kMaxTelemetryTopK);
+    if (p.telemetry_top_k > 0 && !caller_logprobs && native && !has_tools) {
+        extras.telemetry_n_probs = static_cast<std::uint32_t>(p.telemetry_top_k);
+        p.expose_logprobs = false;
+    }
+    return p;
+}
+
 class LlamaServerModel final : public BackendModel {
   public:
     LlamaServerModel(std::shared_ptr<LlamaServerBackendImpl> backend, ModelDescriptor descriptor)
@@ -963,6 +984,8 @@ class LlamaServerModel final : public BackendModel {
         auto req_extras = backend_->extras(props, {}, lease);
         if (has_spec_decision)
             req_extras.spec_draft_n_max = spec_decision.draft_n_max;
+        const auto probabilities =
+            telemetry_probabilities(request.telemetry_top_k, request.sampling.logprobs, false, native, req_extras);
         auto body = llamaserver::build_completion_body(descriptor_.name, request, native, backend_->options().grammar,
                                                        req_extras);
         bool saw_first_token = false;
@@ -978,7 +1001,8 @@ class LlamaServerModel final : public BackendModel {
             };
         }
         auto result = backend_->stream(native ? "/completion" : "/v1/completions", body.dump(), cancel,
-                                       timed_callback ? timed_callback : callback, false);
+                                       timed_callback ? timed_callback : callback, false, false, false,
+                                       probabilities);
         const auto stream_end = std::chrono::steady_clock::now();
         if (result.ok()) {
             if (has_spec_decision) {
@@ -1027,6 +1051,9 @@ class LlamaServerModel final : public BackendModel {
         if (has_spec_decision)
             req_extras.spec_draft_n_max = spec_decision.draft_n_max;
         const bool tools_requested = llamaserver::chat_tools_requested(request);
+        const auto probabilities =
+            telemetry_probabilities(request.telemetry_top_k, request.sampling.logprobs, !request.tools.empty(),
+                                    backend_->options().native_completion, req_extras);
         auto body = llamaserver::build_chat_body(descriptor_.name, request, backend_->options().grammar, req_extras);
         bool saw_first_token = false;
         std::chrono::steady_clock::time_point first_token_at{};
@@ -1042,7 +1069,7 @@ class LlamaServerModel final : public BackendModel {
         }
         auto result = backend_->stream("/v1/chat/completions", body.dump(), cancel,
                                        timed_callback ? timed_callback : callback, true,
-                                       request.separate_reasoning, tools_requested);
+                                       request.separate_reasoning, tools_requested, probabilities);
         const auto stream_end = std::chrono::steady_clock::now();
         if (result.ok()) {
             if (has_spec_decision) {
