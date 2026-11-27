@@ -10,6 +10,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bindings/python/src'))
 import sonder_inference as si  # noqa: E402
+from telemetry_streams import check_event_streams  # noqa: E402
 
 
 def main() -> int:
@@ -70,10 +71,7 @@ def main() -> int:
         assert all(('text' in event['attributes']) == capture for event in tokens)
         if capture:
             assert ''.join(event['attributes']['text'] for event in tokens) == ''.join(results)
-        assert [event['sequence'] for event in events] == list(range(len(events)))
-        producer = events[0]['producer']['instance_id']
-        assert all(event['producer']['instance_id'] == producer for event in events)
-        assert all(event['event_id'] == f"{producer}-{event['sequence']}" for event in events)
+        producer = check_event_streams(events)
         receipts.append({'path': str(path.resolve()), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
                          'events': len(events), 'requests': len(queued), 'token_events': len(tokens),
                          'capture_text': capture, 'session_metadata': identity.__dict__, 'request_parents': parents,
