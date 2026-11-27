@@ -1,7 +1,7 @@
 // Sonder Inference: AMD Windows Vulkan cooperative-matrix child-process canary (NAT-16).
 //
 // Runs VK_KHR_cooperative_matrix property enumeration (#22750/#23508) and a
-// ubatch >= 64 FP16->FP32 cooperative-matrix compute dispatch (#32447) in an
+// generic 16x16x16 FP16->FP32 cooperative-matrix compute smoke test in an
 // isolated child process so driver crashes or hangs never take down the server.
 // Results are cached per (vendor_id, device_id, driver_build, ubatch); any
 // failure activates the automatic GGML_VK_DISABLE_COOPMAT=1 fallback.
@@ -94,7 +94,7 @@ struct CoopmatCanaryOptions {
     // Explicit path to the `sonder-infer` binary used to run `coopmat-canary`.
     // Empty auto-discovers the current or sibling `sonder-infer` executable.
     std::string executable_path;
-    // Micro-batch row count exercised by the coopmat compute shader (>= 64 for #32447).
+    // Tile-grid row count exercised by the generic coopmat compute smoke test (ceil(ubatch/16) tiles).
     std::uint32_t ubatch = 64u;
     std::chrono::milliseconds timeout{15000};
     // When true and disable_coopmat is triggered, sets GGML_VK_DISABLE_COOPMAT=1
@@ -128,8 +128,9 @@ struct CoopmatCanaryOptions {
 
 // Executes the Vulkan cooperative-matrix canary directly in the CURRENT process:
 //   Phase 1 (#22750/#23508): vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR
-//   Phase 2 (#32447): 16x16x16 FP16->FP32 OpCooperativeMatrixMulAddKHR compute dispatch
-//                     over ceil(ubatch/16) workgroups with exact result verification.
+//   Phase 2: generic 16x16x16 FP16->FP32 OpCooperativeMatrixMulAddKHR compute
+//            smoke test over ceil(ubatch/16) workgroups with exact result verification.
+//            (Does not reproduce upstream flash-attention coopmat1 flip-direct bugs.)
 // Call ONLY from an isolated child process (`sonder-infer coopmat-canary`).
 [[nodiscard]] CoopmatCanaryProbeResult run_vulkan_coopmat_canary_in_process(std::uint32_t vendor_id,
                                                                             std::uint32_t device_id,

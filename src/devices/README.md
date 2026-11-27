@@ -24,11 +24,16 @@ child-process canary (NAT-16): before `llama_backend_init()`, eligible AMD
 Windows GPUs (both discrete e.g. RX 9060 XT and integrated UMA e.g. Radeon
 780M) are probed in an isolated `sonder-infer coopmat-canary` child process
 using dynamic `vulkan-1.dll` loading (Phase 1 `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR`
-for `llama.cpp#22750/#23508`; Phase 2 16x16x16 FP16->FP32 compute dispatch at
-`ubatch >= 64` for `llama.cpp#32447`). Verdicts are cached atomically per
+for `llama.cpp#22750/#23508`; Phase 2 generic 16x16x16 FP16->FP32 compute smoke
+test over `ceil(ubatch/16)` tiles — note that Phase 2 is a generic KHR coopmat
+compute smoke test and does not reproduce upstream flash-attention coopmat1
+flip-direct shader bugs, which are absent from pinned `v1.0.0` and gated
+upstream by `llama.cpp#32415`). Verdicts are cached atomically per
 `(vendor_id, device_id, driver_build, ubatch)`; any crash, hang, or mismatch
 activates `GGML_VK_DISABLE_COOPMAT=1` automatically and surfaces an
-`amd_vk_coopmat_disabled` runtime warning.
+`amd_vk_coopmat_disabled` runtime warning. Automatic probing requires the
+`sonder-infer` executable (self, sibling, or `SONDER_INFER_EXE`); callers
+without it alongside skip automatic probing unless `SONDER_INFER_EXE` is set.
 
 `read_host_memory()` returns a tri-state `MemoryReading` (known value, known
 zero, unknown) for total/available physical memory and available commit.

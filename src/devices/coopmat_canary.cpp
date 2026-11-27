@@ -1,11 +1,13 @@
 // Sonder Inference: AMD Windows Vulkan cooperative-matrix child-process canary (NAT-16).
 //
 // Design:
-//   - Guards against AMD Windows Vulkan cooperative-matrix regressions:
-//       * llama.cpp#22750 / #23508: iGPU (e.g. Radeon 780M) crash during
+//   - Guards against AMD Windows Vulkan cooperative-matrix init regressions:
+//       * Phase 1 (llama.cpp#22750 / #23508): iGPU (e.g. Radeon 780M) crash during
 //         vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR at backend init.
-//       * llama.cpp#32447: RDNA 4 (e.g. RX 9060 XT / gfx1201) crash or hang on
-//         OpCooperativeMatrixMulAddKHR compute dispatches at ubatch >= 64.
+//       * Phase 2: generic 16x16x16 FP16->FP32 OpCooperativeMatrixMulAddKHR
+//         compute smoke test over ceil(ubatch/16) tiles (does not reproduce
+//         upstream flash-attention coopmat1 flip-direct shader bugs, which are
+//         absent from pinned v1.0.0 and gated upstream by llama.cpp#32415).
 //   - Runs the Vulkan probe strictly inside an isolated child process
 //     (`sonder-infer coopmat-canary`), bounded by a Windows Job Object and wall
 //     timeout, with crash dialogs suppressed via SetErrorMode.
@@ -1407,7 +1409,7 @@ CoopmatCanaryProbeResult run_vulkan_coopmat_canary_in_process(std::uint32_t vend
         return res;
     }
 
-    // Phase 2 (#32447): create logical device and run ubatch >= 64 coopMatMulAdd compute dispatch.
+    // Phase 2: create logical device and run generic 16x16x16 FP16->FP32 coopMatMulAdd smoke dispatch.
     VkPhysicalDeviceCoopMatFeaturesKHRRaw cm_feat{};
     cm_feat.sType = kVkStypePhysicalDeviceCoopMatFeaturesKHR;
     VkPhysicalDevice16BitStorageFeaturesRaw s16_feat{};

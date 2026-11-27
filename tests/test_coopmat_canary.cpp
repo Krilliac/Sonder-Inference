@@ -213,7 +213,7 @@ TEST_CASE("NAT-16: evaluate_amd_coopmat_canary caches by driver build and trigge
     CHECK(calls == 4);
     CHECK(d4.records[1].from_cache);
 
-    // 5. Timeout (#32447 hang) triggers fallback and is cached as failed.
+    // 5. Child timeout triggers fallback and is cached as failed.
     auto rx9060_v3 = rx9060;
     rx9060_v3.driver_build = "26.12.1";
     opts.child_runner = [&](const CoopmatCanaryKey&, std::chrono::milliseconds) {
