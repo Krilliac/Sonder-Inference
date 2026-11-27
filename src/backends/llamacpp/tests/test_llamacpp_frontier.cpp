@@ -454,6 +454,84 @@ TEST_CASE("llamacpp frontier: ComputeTokenLogprobs exact log-softmax, numerical 
     CHECK_FALSE(ComputeTokenLogprobs(logits, 4, 5).valid);
 }
 
+TEST_CASE("llamacpp frontier: BuildPreSamplingProbInfo and ComputePostSamplingProbInfo") {
+    // 1. Pre-sampling conversion from ComputeTokenLogprobs.
+    const std::vector<float> logits{1.0F, 2.0F, 3.0F, 0.0F};
+    const TokenLogprobInfo lp = ComputeTokenLogprobs(logits, /*chosen_token=*/2, /*top_k=*/4);
+    REQUIRE(lp.valid);
+    const SampledProbInfo pre = BuildPreSamplingProbInfo(lp, /*chosen_token=*/2, /*top_k=*/2);
+    REQUIRE(pre.valid);
+    CHECK_FALSE(pre.post_sampling);
+    CHECK(pre.probability == doctest::Approx(std::exp(static_cast<double>(lp.logprob))).epsilon(1e-5));
+    REQUIRE(pre.candidates.size() == 2u);
+    CHECK(pre.candidates[0].first == 2);
+    CHECK(pre.candidates[1].first == 1);
+    CHECK(pre.candidates[0].second > pre.candidates[1].second);
+
+    // Invalid pre-sampling inputs return valid == false.
+    CHECK_FALSE(BuildPreSamplingProbInfo(lp, -1, 2).valid);
+    CHECK_FALSE(BuildPreSamplingProbInfo(lp, 2, 0).valid);
+    CHECK_FALSE(BuildPreSamplingProbInfo(TokenLogprobInfo{}, 2, 2).valid);
+
+    // 2. Post-sampling with pre-computed probs (dist path): sorts desc, tie-breaks id asc, drops p <= 0 / NaN / bad id.
+    const std::vector<CandidateLogitProb> dist_cands{
+        {5, 0.0F, 0.25F},
+        {2, 0.0F, 0.50F},
+        {3, 0.0F, 0.25F},
+        {7, 0.0F, 0.0F},
+        {8, 0.0F, std::numeric_limits<float>::quiet_NaN()},
+        {-1, 0.0F, 0.9F},
+    };
+    const SampledProbInfo post_dist = ComputePostSamplingProbInfo(dist_cands, /*has_probs=*/true, /*chosen_token=*/3, 2);
+    REQUIRE(post_dist.valid);
+    CHECK(post_dist.post_sampling);
+    CHECK(post_dist.probability == doctest::Approx(0.25F));
+    REQUIRE(post_dist.candidates.size() == 2u);
+    CHECK(post_dist.candidates[0].first == 2);
+    CHECK(post_dist.candidates[1].first == 3);  // tie with 5 broken by smaller id 3
+
+    // Missing chosen_token fails closed.
+    CHECK_FALSE(ComputePostSamplingProbInfo(dist_cands, true, 99, 2).valid);
+
+    // 3. Post-sampling from logits (greedy path): numerically stable softmax, excludes -inf/NaN, handles +inf ties.
+    const std::vector<CandidateLogitProb> greedy_cands{
+        {0, -std::numeric_limits<float>::infinity(), 0.0F},
+        {1, 1002.0F, 0.0F},
+        {2, 1001.0F, 0.0F},
+        {3, std::numeric_limits<float>::quiet_NaN(), 0.0F},
+    };
+    const SampledProbInfo post_greedy =
+        ComputePostSamplingProbInfo(greedy_cands, /*has_probs=*/false, /*chosen_token=*/1, 5);
+    REQUIRE(post_greedy.valid);
+    CHECK(post_greedy.post_sampling);
+    REQUIRE(post_greedy.candidates.size() == 2u);
+    const double z = std::exp(1.0) + 1.0;
+    CHECK(post_greedy.probability == doctest::Approx(std::exp(1.0) / z).epsilon(1e-5));
+    CHECK(post_greedy.candidates[0].first == 1);
+    CHECK(post_greedy.candidates[1].first == 2);
+
+    const std::vector<CandidateLogitProb> inf_cands{
+        {4, std::numeric_limits<float>::infinity(), 0.0F},
+        {1, std::numeric_limits<float>::infinity(), 0.0F},
+        {2, 5.0F, 0.0F},
+    };
+    const SampledProbInfo post_inf = ComputePostSamplingProbInfo(inf_cands, false, 1, 5);
+    REQUIRE(post_inf.valid);
+    REQUIRE(post_inf.candidates.size() == 2u);
+    CHECK(post_inf.candidates[0].first == 1);
+    CHECK(post_inf.candidates[1].first == 4);
+    CHECK(post_inf.probability == doctest::Approx(0.5F));
+
+    // Validate rejects out-of-range telemetry_top_k.
+    SamplingParams sp;
+    sp.telemetry_top_k = -1;
+    CHECK_FALSE(Validate(sp).ok());
+    sp.telemetry_top_k = kMaxTopLogprobs + 1;
+    CHECK_FALSE(Validate(sp).ok());
+    sp.telemetry_top_k = 5;
+    CHECK(Validate(sp).ok());
+}
+
 TEST_CASE("llamacpp frontier: suffix, cache_ram_mib, moe_cache_mib, mmproj_path, media_blobs, and logprobs options") {
     // SpeculativeType::kSuffix round-trips case-insensitively.
     SpeculativeType sp = SpeculativeType::kNone;

@@ -275,3 +275,65 @@ TEST_CASE("unseeded config still samples valid tokens") {
         CHECK((r.token >= 0 && r.token < static_cast<TokenId>(kLogits.size())));
     }
 }
+
+TEST_CASE("top_candidates returns bounded post-sampling distribution in canonical order") {
+    // Before any sample, empty.
+    SamplerConfig c = plain(42);
+    c.greedy = true;
+    auto chain = build_chain(c);
+    CHECK(chain.top_candidates(5).empty());
+
+    // Greedy still exposes post-bias/penalty softmax candidates; banned (-inf) and NaN are excluded.
+    c.logit_bias = {{0, -kInf}};
+    chain = build_chain(c);
+    const std::vector<float> logits = {10.0f, 2.0f, 2.0f, kNaN, 1.0f};
+    const auto r = chain.sample(logits);
+    CHECK(r.ok());
+    CHECK_EQ(r.token, 1);  // tie between 1 and 2 broken by lowest id
+    const auto top2 = chain.top_candidates(2);
+    CHECK_EQ(top2.size(), std::size_t{2});
+    CHECK_EQ(top2[0].id, 1);
+    CHECK_EQ(top2[1].id, 2);
+    CHECK_NEAR(top2[0].p, top2[1].p, 1e-6);
+
+    // Asking for more than viable count returns only viable entries (1, 2, 4).
+    const auto all = chain.top_candidates(100);
+    CHECK_EQ(all.size(), std::size_t{3});
+    CHECK_EQ(all[2].id, 4);
+    CHECK_NEAR(all[0].p + all[1].p + all[2].p, 1.0, 1e-5);
+    CHECK(chain.top_candidates(0).empty());
+
+    // +inf splits probability mass uniformly and excludes finite tokens (p = 0).
+    const auto inf_res = chain.sample(std::vector<float>{1.0f, kInf, kInf, 2.0f});
+    CHECK(inf_res.ok());
+    const auto inf_top = chain.top_candidates(5);
+    CHECK_EQ(inf_top.size(), std::size_t{2});
+    CHECK_EQ(inf_top[0].id, 1);
+    CHECK_EQ(inf_top[1].id, 2);
+    CHECK_NEAR(inf_top[0].p, 0.5, 1e-6);
+    CHECK_NEAR(inf_top[1].p, 0.5, 1e-6);
+
+    // Failed sample (EmptyLogits / NoViableCandidates) and reset() clear the last distribution.
+    CHECK(!chain.sample(std::vector<float>{-kInf, -kInf}).ok());
+    CHECK(chain.top_candidates(5).empty());
+    CHECK(chain.sample(kLogits).ok());
+    CHECK(!chain.top_candidates(3).empty());
+    chain.reset();
+    CHECK(chain.top_candidates(5).empty());
+
+    // Distribution mode with top_k truncation caps survivors to k.
+    SamplerConfig dist = plain(99);
+    dist.top_k = 2;
+    auto dchain = build_chain(dist);
+    CHECK(dchain.sample(kLogits).ok());
+    const auto dtop = dchain.top_candidates(10);
+    CHECK_EQ(dtop.size(), std::size_t{2});
+    CHECK_EQ(dtop[0].id, 6);
+    CHECK_EQ(dtop[1].id, 1);
+    CHECK_NEAR(dtop[0].p + dtop[1].p, 1.0, 1e-5);
+
+    // Copy preserves top_candidates.
+    SamplerChain copy = dchain;
+    CHECK_EQ(copy.top_candidates(2).size(), std::size_t{2});
+    CHECK_EQ(copy.top_candidates(2)[0].id, 6);
+}

@@ -85,6 +85,11 @@ public:
 
     [[nodiscard]] bool is_stop_token(TokenId token) const;
     [[nodiscard]] const Candidates& last_candidates() const noexcept { return cur_; }
+    /// Up to `max_k` most probable viable candidates from the last successful
+    /// sample() call (post-sampling distribution, canonical order: probability
+    /// descending, ties by ascending token id). Empty if the last call failed,
+    /// before any sample, after reset()/restore_state(), or when max_k == 0.
+    [[nodiscard]] std::vector<TokenData> top_candidates(std::size_t max_k) const;
     [[nodiscard]] std::vector<std::string_view> stage_names() const;
     [[nodiscard]] std::size_t stage_count() const noexcept { return stages_.size(); }
 
@@ -95,6 +100,7 @@ private:
     Selector selector_;
     Rng rng_;
     Candidates cur_;
+    bool has_last_distribution_ = false;
 };
 
 /// Build a chain from a config. Throws std::invalid_argument (message from

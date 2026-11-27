@@ -333,6 +333,10 @@ struct SamplingParams {
     std::vector<Token> grammar_prefill;
     bool compute_logprobs = false;     // compute exact log-softmax logprob for each emitted token
     std::int32_t top_logprobs = 0;     // number of top alternative logprobs (0..kMaxTopLogprobs)
+    // Telemetry-only probability probe (0..kMaxTopLogprobs; 0 = off). Computes
+    // sampled token probability + top-K alternatives for TokenEvent without
+    // populating caller logprobs unless compute_logprobs is true.
+    std::int32_t telemetry_top_k = 0;
 };
 
 [[nodiscard]] Status Validate(const SamplingParams& params);
@@ -439,6 +443,12 @@ struct TokenEvent {
     bool has_logprob = false;
     float logprob = 0.0F;
     std::vector<std::pair<Token, float>> top_logprobs{};
+    // Telemetry-only sampled token probability and top-K alternatives
+    // (populated when SamplingParams::telemetry_top_k > 0).
+    bool has_sampled_probability = false;
+    float sampled_probability = 0.0F;
+    bool sampled_probability_post_sampling = false;
+    std::vector<std::pair<Token, float>> sampled_candidates{};
 };
 
 // Return false to stop generation (treated as cancellation).
@@ -788,11 +798,27 @@ private:
 // Length of the longest common prefix between two token spans.
 [[nodiscard]] std::size_t LongestCommonPrefix(std::span<const Token> a, std::span<const Token> b) noexcept;
 
+// Telemetry-only sampled token probability and top-K alternatives (prob in [0, 1]).
+struct SampledProbInfo {
+    bool valid = false;
+    float probability = 0.0F;
+    bool post_sampling = false;
+    std::vector<std::pair<Token, float>> candidates;
+};
+
+// Pure mirror of llama_token_data for header-free probability helpers.
+struct CandidateLogitProb {
+    Token id = -1;
+    float logit = 0.0F;
+    float p = 0.0F;
+};
+
 // Per-token exact log-softmax probability and top-K alternatives.
 struct TokenLogprobInfo {
     bool valid = false;
     float logprob = 0.0F;
     std::vector<std::pair<Token, float>> top_logprobs;
+    SampledProbInfo sampled_prob{};
 };
 
 // Computes exact log-softmax logprob for `chosen_token` and up to `top_k`
@@ -800,6 +826,18 @@ struct TokenLogprobInfo {
 // by smaller token id) using numerically stable max-subtraction.
 [[nodiscard]] TokenLogprobInfo ComputeTokenLogprobs(std::span<const float> logits, Token chosen_token,
                                                     std::int32_t top_k);
+
+// Converts exact pre-sampling log-softmax info into telemetry SampledProbInfo
+// (post_sampling = false), keeping at most `top_k` entries sorted by
+// probability descending then token id ascending.
+[[nodiscard]] SampledProbInfo BuildPreSamplingProbInfo(const TokenLogprobInfo& lp, Token chosen_token,
+                                                       std::int32_t top_k);
+
+// Extracts post-sampling telemetry probability and top-K alternatives from
+// surviving sampler candidates (post_sampling = true). When `has_probs` is
+// true, reads `c.p`; otherwise runs numerically stable softmax over `c.logit`.
+[[nodiscard]] SampledProbInfo ComputePostSamplingProbInfo(std::span<const CandidateLogitProb> candidates,
+                                                          bool has_probs, Token chosen_token, std::int32_t top_k);
 
 // Validates multimodal media payloads against kMaxMediaImages (8) and
 // kMaxMediaBlobBytes (16 MiB per image), rejecting empty blobs.

@@ -1036,7 +1036,8 @@ public:
                           request.grammar, /*separate_reasoning=*/false, request.checkpoint, {}, {}, {},
                           request.priority_class, request.target_ttft_ms, request.target_itl_ms,
                           request.enable_stage_profiling, request.on_safe_point, request.suspended_state,
-                          request.execution_resume, request.priority_rank, request.allow_preempt_spill);
+                          request.execution_resume, request.priority_rank, request.allow_preempt_spill,
+                          /*start_in_thinking=*/false, request.telemetry_top_k);
     }
 
     // Chat through the GGUF chat template (llama_chat_apply_template). Models
@@ -1096,7 +1097,8 @@ public:
                           std::move(plan.media_blobs), {}, std::move(plan.media_prompt_parts),
                           request.priority_class, request.target_ttft_ms, request.target_itl_ms,
                           request.enable_stage_profiling, {}, nullptr, nullptr, 0, false,
-                          request.separate_reasoning && llamacpp_detail::PromptEndsInsideThink(plan.segments));
+                          request.separate_reasoning && llamacpp_detail::PromptEndsInsideThink(plan.segments),
+                          request.telemetry_top_k);
     }
 
     [[nodiscard]] bool has_native_chat() const override { return native_chat_; }
@@ -1173,7 +1175,7 @@ private:
                                      SuspendedExecutionState* suspended_state = nullptr,
                                      const ExecutionResumeState* execution_resume = nullptr,
                                      int priority_rank = 0, bool allow_preempt_spill = false,
-                                     bool start_in_thinking = false) {
+                                     bool start_in_thinking = false, std::int32_t telemetry_top_k = 0) {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
 
         lc::GenerateRequest req;
@@ -1182,6 +1184,7 @@ private:
         if (lc::Status s = lc::ValidateStopSequences(sampling.stop); !s.ok()) return ToStatus(s);
         req.max_new_tokens = sampling.max_tokens;
         req.sampling = ToLlamaSampling(sampling);
+        req.sampling.telemetry_top_k = std::clamp<std::int32_t>(telemetry_top_k, 0, kMaxTelemetryTopK);
         req.sampling.grammar = std::string(grammar);
         req.session_key = std::string(session_key);
         req.media_blobs = std::move(media_blobs);
@@ -1261,7 +1264,8 @@ private:
 
         auto deliver_split = [&](std::string_view text_part, std::string_view reasoning_part,
                                  std::optional<float> logprob = std::nullopt,
-                                 std::vector<TopLogprob> top_logprobs = {}) {
+                                 std::vector<TopLogprob> top_logprobs = {},
+                                 const SampledTokenProbability* sampled_probability = nullptr) {
             if (!reasoning_part.empty() && !callback_stopped) {
                 if (on_chunk && !on_chunk(TokenChunk{std::string_view{}, stats.chunks, reasoning_part})) {
                     callback_stopped = true;
@@ -1272,6 +1276,7 @@ private:
                 TokenChunk chunk{text_part, stats.chunks, std::string_view{}};
                 chunk.logprob = logprob;
                 chunk.top_logprobs = std::move(top_logprobs);
+                chunk.sampled_probability = sampled_probability;
                 if (on_chunk && !on_chunk(chunk)) {
                     callback_stopped = true;
                 }
@@ -1280,18 +1285,20 @@ private:
         };
 
         auto deliver = [&](std::string_view text, std::optional<float> logprob = std::nullopt,
-                           std::vector<TopLogprob> top_logprobs = {}) {
+                           std::vector<TopLogprob> top_logprobs = {},
+                           const SampledTokenProbability* sampled_probability = nullptr) {
             if (text.empty() || callback_stopped) return;
             if (!separate_reasoning) {
                 TokenChunk chunk{text, stats.chunks};
                 chunk.logprob = logprob;
                 chunk.top_logprobs = std::move(top_logprobs);
+                chunk.sampled_probability = sampled_probability;
                 if (on_chunk && !on_chunk(chunk)) callback_stopped = true;
                 ++stats.chunks;
                 return;
             }
             const ThinkingSplitResult split = thinking_splitter.Push(text);
-            deliver_split(split.text, split.reasoning, logprob, std::move(top_logprobs));
+            deliver_split(split.text, split.reasoning, logprob, std::move(top_logprobs), sampled_probability);
         };
 
         const lc::GenerateResult r = runtime_.Generate(
@@ -1310,7 +1317,23 @@ private:
                         top_lps.push_back(TopLogprob{std::move(piece), tok_lp});
                     }
                 }
-                deliver(stop.Push(ev.text), lp, std::move(top_lps));
+                SampledTokenProbability sampled_prob;
+                const SampledTokenProbability* sampled_prob_ptr = nullptr;
+                if (ev.has_sampled_probability && ev.token >= 0) {
+                    sampled_prob.token_id = ev.token;
+                    sampled_prob.probability = ev.sampled_probability;
+                    sampled_prob.post_sampling = ev.sampled_probability_post_sampling;
+                    sampled_prob.candidates.reserve(ev.sampled_candidates.size());
+                    for (const auto& [cand_tok, cand_prob] : ev.sampled_candidates) {
+                        std::string piece;
+                        if (!runtime_.TokenToPiece(cand_tok, piece).ok()) {
+                            piece.clear();
+                        }
+                        sampled_prob.candidates.push_back(TokenCandidate{cand_tok, std::move(piece), cand_prob});
+                    }
+                    sampled_prob_ptr = &sampled_prob;
+                }
+                deliver(stop.Push(ev.text), lp, std::move(top_lps), sampled_prob_ptr);
                 return !callback_stopped && !stop.matched();
             },
             [&] { return cancel.cancelled(); });
