@@ -46,6 +46,9 @@ inference onto the native in-process `llama.cpp` backend is in
     `llama-server`, or an existing compatible HTTP upstream; no llama.cpp
     linkage ([docs/integration/llama-server.md](docs/integration/llama-server.md)).
   - `mock`: deterministic synthetic output for tests; performs no inference.
+  - `remote-mock`: the same synthetic engine in a supervised `sonder-infer worker`
+    process over private local IPC ([ARCH-01](docs/design/ARCH-01-multiprocess.md));
+    the first slice of native engine process isolation, without GPU requirements.
 
   `ollama` and `llamaserver` are deprecated because Sonder Inference must own
   scheduling, memory, and telemetry end to end; piggy-backed external servers

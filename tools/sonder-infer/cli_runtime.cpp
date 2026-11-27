@@ -15,6 +15,9 @@
 #endif
 
 #include "../../src/cli/cli_spec.hpp"
+#if defined(SONDER_HAS_WORKER)
+#include "../../src/worker/remote_backend.hpp"
+#endif
 #if defined(SONDER_HAS_SERVER)
 #include "sonder/inference/backend_setup.hpp"
 #else
@@ -84,7 +87,7 @@ static_assert(std::atomic<int>::is_always_lock_free, "the Ctrl-C flag must be lo
 
 extern "C" void on_sigint(int) { g_interrupted.store(1); }
 
-constexpr std::string_view kKnownBackends[] = {"mock", "ollama", "llamacpp", "llamaserver"};
+constexpr std::string_view kKnownBackends[] = {"mock", "remote-mock", "ollama", "llamacpp", "llamaserver"};
 
 }  // namespace
 
@@ -138,7 +141,7 @@ bool stdout_supports_ansi() {
 #endif
 }
 
-bool is_mock_backend(std::string_view name) { return name == si::kMockBackendName; }
+bool is_mock_backend(std::string_view name) { return si::is_mock_backend(name); }
 
 InterruptWatcher::InterruptWatcher(std::function<void()> on_interrupt) : on_interrupt_(std::move(on_interrupt)) {
     g_interrupted.store(0);
@@ -175,6 +178,9 @@ std::vector<std::string> compiled_backends() {
     return si::available_backend_names();
 #else
     std::vector<std::string> names{si::kMockBackendName};
+#if defined(SONDER_HAS_WORKER)
+    names.emplace_back("remote-mock");
+#endif
 #if defined(SONDER_HAS_OLLAMA_BACKEND)
     names.emplace_back("ollama");
 #endif
@@ -197,7 +203,8 @@ bool check_backend_name(std::string_view command, const std::string& name, int& 
         if (known == name) {
             rc = usage_error(command, "this build does not include the " + name + " backend" +
                                           (name == "llamacpp" ? " (configure with SONDER_WITH_LLAMA_CPP=ON)"
-                                                              : " (module src/backends/" + name + ")"));
+                                                              : (name == "remote-mock" ? " (module src/worker)"
+                                                                  : " (module src/backends/" + name + ")")));
             return false;
         }
     }
@@ -240,7 +247,7 @@ bool resolve_backend(std::string_view command, const cli::Args& a, const cli::En
     if (need_backend) {
         if (out.backend.empty()) {
             rc = usage_error(command,
-                             "--backend is required (mock, ollama, llamacpp or llamaserver; or set SONDER_INFER_BACKEND)");
+                             "--backend is required (mock, remote-mock, ollama, llamacpp or llamaserver; or set SONDER_INFER_BACKEND)");
             return false;
         }
         if (!check_backend_name(command, out.backend, rc)) return false;
@@ -275,6 +282,7 @@ void register_backends(si::Engine& engine, const BackendChoice& choice) {
     for (const auto& name : si::available_backend_names()) {
         // Opt-in remote provider: configured only by `serve --ollama-cloud-config`.
         if (name == "ollama_cloud") continue;
+        if (name == "remote-mock" && choice.backend != name) continue;
         si::BackendSetup setup;
         setup.backend = name;
         setup.ollama_url = choice.ollama_url;
@@ -307,6 +315,13 @@ void register_backends(si::Engine& engine, const BackendChoice& choice) {
     si::MockBackendOptions mo;
     mo.token_delay = choice.mock_delay;
     (void)engine.register_backend(si::make_mock_backend(mo));
+#if defined(SONDER_HAS_WORKER)
+    if (choice.backend == "remote-mock") {
+        si::worker::RemoteBackendOptions options;
+        options.token_delay = std::chrono::duration_cast<std::chrono::milliseconds>(choice.mock_delay);
+        (void)engine.register_backend(si::worker::make_remote_backend(std::move(options)));
+    }
+#endif
 #if defined(SONDER_HAS_OLLAMA_BACKEND)
     si::OllamaBackendOptions oo;
     if (!choice.ollama_url.empty()) oo.base_url = choice.ollama_url;

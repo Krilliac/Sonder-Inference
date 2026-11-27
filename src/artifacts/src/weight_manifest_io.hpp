@@ -1,4 +1,4 @@
-// Internal: platform-specific handle-anchored OS file helpers for weight
+// Internal: platform-specific streaming SHA-256 over an anchored handle for weight
 // manifests. Windows implements this in weight_manifest_io_win32.cpp; POSIX
 // implements it in weight_manifest_io_posix.cpp.
 #pragma once
@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 
+#include "common/safe_file.hpp"
 #include "sonder/inference/weight_manifest.hpp"
 
 namespace sonder::inference::weights::detail {
@@ -17,7 +18,13 @@ namespace sonder::inference::weights::detail {
 inline constexpr std::size_t kMinBuffer = 4096;
 inline constexpr std::size_t kMaxBuffer = 64u << 20;
 
-enum class OpenOutcome { ok, missing, unsafe, io_error };
+// The handle type and the anchored opens live in src/common/safe_file.hpp (shared with the
+// Ollama model store); these names keep the artifact code unchanged.
+using sonder::inference::detail::is_link_like;
+using sonder::inference::detail::open_anchored_regular;
+using sonder::inference::detail::open_single_regular;
+using sonder::inference::detail::OpenOutcome;
+using sonder::inference::detail::OwnedFileHandle;
 
 inline std::string to_hex(const std::array<std::uint8_t, 32>& d) {
     static constexpr char kDigits[] = "0123456789abcdef";
@@ -29,41 +36,6 @@ inline std::string to_hex(const std::array<std::uint8_t, 32>& d) {
     }
     return out;
 }
-
-// Move-only RAII wrapper around an OS file handle (HANDLE on Win32, fd on
-// POSIX). Implemented in the active platform's TU so cross-platform code never
-// includes OS headers.
-class OwnedFileHandle {
-public:
-    OwnedFileHandle() noexcept;
-    ~OwnedFileHandle();
-    OwnedFileHandle(const OwnedFileHandle&) = delete;
-    OwnedFileHandle& operator=(const OwnedFileHandle&) = delete;
-    OwnedFileHandle(OwnedFileHandle&& other) noexcept;
-    OwnedFileHandle& operator=(OwnedFileHandle&& other) noexcept;
-
-    void reset() noexcept;
-    [[nodiscard]] bool valid() const noexcept;
-
-    [[nodiscard]] std::intptr_t native_value() const noexcept { return handle_; }
-    void assign_native(std::intptr_t raw) noexcept;
-
-private:
-    std::intptr_t handle_;
-};
-
-// Returns true for symlinks and (on Windows) junctions / reparse points.
-bool is_link_like(const std::filesystem::path& p, const std::filesystem::file_status& st);
-
-// Opens `rel` under `root` one segment at a time without following symlinks or
-// reparse points, verifying containment and regular-file identity on the open
-// handle itself.
-OpenOutcome open_anchored_regular(const std::filesystem::path& root, std::string_view rel,
-                                  OwnedFileHandle& out_handle, std::uint64_t& out_size, std::string& err_msg);
-
-// Opens a single regular file without following symlinks or reparse points.
-OpenOutcome open_single_regular(const std::filesystem::path& file, OwnedFileHandle& out_handle,
-                                std::uint64_t& out_size, std::string& err_msg);
 
 // Streams the already-open handle through SHA-256 and verifies size/type did
 // not change on the handle while hashing.

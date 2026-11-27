@@ -347,7 +347,7 @@ IdentityResult backend_identity(const Model& model, const std::optional<std::str
 IdentityResult backend_identity(const std::string& backend, const std::string& model_id,
                                 const ModelDescriptor* descriptor, const std::optional<std::string>& backend_version) {
     IdentityResult out;
-    if (backend == kMockBackendName) {
+    if (is_mock_backend(backend)) {
         if (descriptor == nullptr) {
             out.reason = "model '" + model_id +
                          "' is not loaded yet (lazy model residency): its identity is measured once a request "

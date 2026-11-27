@@ -674,26 +674,31 @@ TEST_CASE("containment: by-design operator spawn args are filtered only for host
     // profile is an operator flag and is not filtered this way", and with
     // --profile serve refuses the config file's `args`. So a credential or
     // download flag in operator args (--llamaserver-arg, config `args`) is
-    // accepted on purpose; this pins that split.
-    std::size_t both = 0, profile_only = 0;
+    // accepted on purpose; this pins that split. The one exception is
+    // --models-preset: a preset INI can set any option, rpc included, so the
+    // spawn backend refuses it too (rpc_worker.cpp, docs/integration/
+    // rpc-worker.md); list 1 itself still accepts it.
+    std::size_t both = 0, preset = 0, profile_only = 0;
     for (const auto &group : forbidden_groups()) {
         for (const auto &alias : group.aliases) {
             CAPTURE(alias);
             CHECK(profile_status({alias, "value"}).code() == ErrorCode::invalid_argument);
             const bool listen = alias == "--host" || alias == "--port";
-            const Decision expected = listen ? Decision::refused : Decision::accepted;
+            const bool models_preset = alias == "--models-preset";
+            const Decision expected = listen || models_preset ? Decision::refused : Decision::accepted;
             CHECK((ls::validate_process_arguments({alias, "value"}).ok() ? Decision::accepted : Decision::refused) ==
-                  expected);
+                  (listen ? Decision::refused : Decision::accepted));
             CHECK(decision_of(spawn_status({alias, "value"})) == expected);
             CHECK(decision_of(config_status(
                       R"({"mode":"spawn","executable":"containment-never-started-llama-server.exe","args":[)" +
                       json_string(alias) +
                       R"(,"value"],"native_completion":false,"spill_guard":{"enabled":false}})")) == expected);
-            (listen ? both : profile_only) += 1;
+            (listen ? both : models_preset ? preset : profile_only) += 1;
         }
     }
     CHECK(both == 2u);
-    CHECK(profile_only == 31u);
+    CHECK(preset == 1u);
+    CHECK(profile_only == 30u);
     // "--" is refused by lists 1 and 3.
     CHECK(profile_status({"--"}).code() == ErrorCode::invalid_argument);
     CHECK_FALSE(ls::validate_process_arguments({"--"}).ok());
@@ -832,6 +837,8 @@ TEST_CASE("containment: inherited LLAMA_ARG, credential and proxy variables are 
     ScopedParentEnv mcp("MCP_SERVERS", std::string("{}"));
     ScopedParentEnv sonder_tok("SONDER_API_TOKEN", std::string("sonder-secret"));
     ScopedParentEnv xdg_cfg("XDG_CONFIG_HOME", std::string("containment-xdg-config"));
+    ScopedParentEnv appdata("APPDATA", std::string("containment-appdata"));
+    ScopedParentEnv programdata("PROGRAMDATA", std::string("containment-programdata"));
     ScopedParentEnv gpu("CUDA_VISIBLE_DEVICES", std::string("0"));
 
     {
@@ -848,7 +855,14 @@ TEST_CASE("containment: inherited LLAMA_ARG, credential and proxy variables are 
         CHECK(values_named(entries, "HTTP_PROXY").empty());
         CHECK(values_named(entries, "MCP_SERVERS").empty());
         CHECK(values_named(entries, "SONDER_API_TOKEN").empty());
+        // llama.cpp's config.ini homes (env_policy.hpp): never the parent's.
+        CHECK(values_named(entries, "APPDATA").empty());
+        CHECK(values_named(entries, "PROGRAMDATA").empty());
+#if defined(_WIN32)
         CHECK(values_named(entries, "XDG_CONFIG_HOME").empty());
+#else
+        CHECK(values_named(entries, "XDG_CONFIG_HOME") == std::vector<std::string>{"/dev/null"});
+#endif
         // Allowlisted GPU/runtime variables still pass through.
         CHECK(values_named(entries, "CUDA_VISIBLE_DEVICES") == std::vector<std::string>{"0"});
     }
@@ -876,6 +890,55 @@ TEST_CASE("containment: inherited LLAMA_ARG, credential and proxy variables are 
             CHECK(refused.prepare(spec).code() == ErrorCode::invalid_argument);
         }
     }
+}
+
+TEST_CASE("containment: no spawned child can find a planted llama.cpp user config.ini") {
+    // llama-server applies <config dir>/llama.cpp/config.ini before env and
+    // argv, and a key such as "rpc = host:port" reaches the --rpc handler
+    // (common_params_apply_system_config, fs_get_config_directory at b11195).
+    // Plant one where the parent's environment points, then resolve the
+    // config dir from the child block exactly as llama.cpp does.
+    namespace fs = std::filesystem;
+    const fs::path home = fs::temp_directory_path() / "sonder-containment-config-home";
+    std::error_code ec;
+    fs::remove_all(home, ec);
+    REQUIRE(fs::create_directories(home / "llama.cpp"));
+    REQUIRE(fs::create_directories(home / ".config" / "llama.cpp"));
+    for (const fs::path &file : {home / "llama.cpp" / "config.ini", home / ".config" / "llama.cpp" / "config.ini"}) {
+        std::ofstream(file) << "rpc = 10.0.0.2:50052\n";
+        REQUIRE(fs::exists(file));
+    }
+    ScopedParentEnv appdata("APPDATA", home.string());
+    ScopedParentEnv xdg("XDG_CONFIG_HOME", home.string());
+#if !defined(_WIN32)
+    ScopedParentEnv posix_home("HOME", home.string());
+#endif
+
+    ls::ProcessSpec spec;
+    spec.environment = {{"CUDA_VISIBLE_DEVICES", "0"}};
+    ls::ProcessOptions prepared;
+    REQUIRE(prepared.prepare(spec).ok());
+    const auto entries = prepared_entries(prepared);
+    const auto only = [&](std::string_view name) -> std::string {
+        const auto values = values_named(entries, name);
+        REQUIRE(values.size() <= 1u);
+        return values.empty() ? std::string() : values.front();
+    };
+#if defined(_WIN32)
+    // Windows: %APPDATA%; unset makes fs_get_config_directory throw and the
+    // user file is skipped.
+    CHECK(only("APPDATA").empty());
+#else
+    // POSIX: $XDG_CONFIG_HOME, else $HOME/.config.
+    const std::string xdg_value = only("XDG_CONFIG_HOME");
+    REQUIRE_FALSE(xdg_value.empty());
+    CHECK(xdg_value == "/dev/null");
+    const fs::path resolved = fs::path(xdg_value) / "llama.cpp" / "config.ini";
+    CHECK_FALSE(fs::exists(resolved, ec));
+    // HOME still reaches the child, but XDG_CONFIG_HOME takes precedence.
+    CHECK(only("HOME") == home.string());
+#endif
+    fs::remove_all(home, ec);
 }
 
 TEST_CASE("containment: ProcessLauncher rejects relative executable paths") {

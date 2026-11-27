@@ -1,5 +1,6 @@
 #include "sonder/inference/json.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
@@ -461,6 +462,17 @@ private:
             if (text_[pos_] == '}') { ++pos_; break; }
             error_ = "expected ',' or '}'";
             return false;
+        }
+        if (limits_.reject_duplicate_keys && members.size() > 1) {
+            // `members` no longer grows, so views into its keys stay valid.
+            std::vector<std::string_view> keys;
+            keys.reserve(members.size());
+            for (const auto& m : members) keys.emplace_back(m.first);
+            std::sort(keys.begin(), keys.end());
+            if (std::adjacent_find(keys.begin(), keys.end()) != keys.end()) {
+                error_ = "duplicate object key";
+                return false;
+            }
         }
         out = Value(Object::from_members(std::move(members)));
         return true;
