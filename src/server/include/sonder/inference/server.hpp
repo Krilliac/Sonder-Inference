@@ -80,6 +80,9 @@ struct ModelResourceFootprint {
 struct ModelProfileBinding {
     std::string model;      // served id; must also be listed in ServerOptions::models
     std::string load_name;  // passed to Backend::load_model (empty = `model`)
+    // llamacpp: exact device allowlist for this model, forwarded as
+    // ModelLoadOptions::devices (empty = the backend-wide setting).
+    std::vector<std::string> devices;
     // Applied to requests that leave these fields unset (apply_sampling_defaults).
     SamplingDefaults sampling_defaults;
     // Added to the model's /v1/models entry as `sonder.profile`.

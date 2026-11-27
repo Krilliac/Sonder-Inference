@@ -819,6 +819,14 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
                 return usage_error(
                     "combined llamacpp launch profiles set speculative.draft_n_max alongside speculative type 'none'");
             }
+            if (o.backend.llamacpp_gpu_layers && *o.backend.llamacpp_gpu_layers == 0) {
+                for (const LaunchProfile* ap : active_profiles) {
+                    if (ap != nullptr && !ap->devices.empty()) {
+                        return usage_error("combined llamacpp launch profiles set 'devices' on '" + ap->name +
+                                           "' alongside 'n_gpu_layers' 0 (CPU only)");
+                    }
+                }
+            }
         }
         std::string resolved = "llamacpp resolved settings:";
         const auto add_resolved = [&](const char* k, const std::string& v) {

@@ -331,6 +331,21 @@ const ModelProfileBinding* find_profile_binding(const ServerOptions& opts, const
     return nullptr;
 }
 
+ModelLoadOptions make_model_load_options(const ServerOptions& opts, const std::string& id) {
+    ModelLoadOptions lo;
+    // A launch profile may load the model under another name (a llamacpp
+    // profile's GGUF path) while it is served under the profile's name.
+    const ModelProfileBinding* binding = find_profile_binding(opts, id);
+    lo.model = binding != nullptr && !binding->load_name.empty() ? binding->load_name : id;
+    // Keep ModelLoadOptions' default device unless --device was given.
+    if (!opts.device.empty()) lo.device_id = opts.device;
+    if (binding != nullptr && !binding->devices.empty()) {
+        lo.devices = binding->devices;
+        if (lo.device_id.rfind("gpu:", 0) != 0) lo.device_id = "gpu:0";
+    }
+    return lo;
+}
+
 json::Object profile_with_runtime_context(json::Object profile, const std::optional<BackendRuntimeStatus>& runtime) {
     if (!runtime || !runtime->context.fitted_ctx) {
         return profile;

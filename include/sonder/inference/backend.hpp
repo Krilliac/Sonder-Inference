@@ -199,6 +199,14 @@ struct ModelDescriptor {
 struct ModelLoadOptions {
     std::string model;
     std::string device_id = "cpu:0";
+    // Optional exact device allowlist for this model (backend-specific names;
+    // llamacpp: ggml names such as "CUDA0" or "Vulkan0", case-insensitive).
+    // Non-empty overrides the backend-wide list and takes precedence over a
+    // "gpu:N" device_id pin. Empty = backend default.
+    // The model only runs on these devices when device_id is gpu:* or empty
+    // (a cpu:* id offloads no layers, so the default "cpu:0" ignores the list);
+    // the server sets gpu:0 for it. Ignored by backends without named devices.
+    std::vector<std::string> devices;
 };
 
 struct GenerateRequest {

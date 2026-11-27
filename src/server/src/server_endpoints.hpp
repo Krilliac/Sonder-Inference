@@ -34,6 +34,11 @@ json::Object sonder_meta();
 // guarantees at most one per model).
 const ModelProfileBinding* find_profile_binding(const ServerOptions& opts, const std::string& id);
 
+// Load options for served model `id`: the profile's GGUF path and device
+// allowlist (a non-empty allowlist forces a gpu:* device_id, since cpu:* ids
+// offload no layers), and --device otherwise.
+ModelLoadOptions make_model_load_options(const ServerOptions& opts, const std::string& id);
+
 // When the backend reports a fitted --ctx-size, the served profile reports
 // that running value as `context_length` and keeps the configured one as
 // `configured_context_length`. Unchanged otherwise.

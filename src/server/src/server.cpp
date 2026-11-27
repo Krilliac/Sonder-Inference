@@ -186,15 +186,8 @@ struct Server::Impl {
         if (stopping.load()) {
             return Status(ErrorCode::unavailable, "sonder-inference is draining");
         }
-        ModelLoadOptions lo;
-        // A launch profile may load the model under another name (a llamacpp
-        // profile's GGUF path) while it is served under the profile's name.
         // Every load goes through here: eager, lazy and after an eviction.
-        const ModelProfileBinding* binding = find_profile_binding(opts, id);
-        lo.model = binding != nullptr && !binding->load_name.empty() ? binding->load_name : id;
-        // Keep ModelLoadOptions' default device unless --device was given.
-        if (!opts.device.empty()) lo.device_id = opts.device;
-        return e->load_model(backend_name, lo);
+        return e->load_model(backend_name, make_model_load_options(opts, id));
     }
 
     // Reconciles a freshly loaded model's pre-load byte reservation against

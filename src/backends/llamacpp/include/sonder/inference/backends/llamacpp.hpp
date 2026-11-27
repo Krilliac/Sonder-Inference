@@ -43,7 +43,11 @@ struct LlamaCppBackendOptions {
     // quantized V cache needs it: "off" with a quantized V type is rejected.
     std::string flash_attention = "auto";
     // Explicit ggml device names (e.g. "CUDA0", "ROCm0", "Vulkan0", "CUDA1")
-    // for vendor-targeted or multi-GPU offloading. Empty = llama.cpp default.
+    // for vendor-targeted or multi-GPU offloading. Non-empty is an exact
+    // allowlist (case-insensitive names; an iGPU is used only when named; two
+    // backend views of one card collapse to the first named). Empty = automatic:
+    // discrete GPUs only, never an iGPU, CPU-only when there is none. A load
+    // request's ModelLoadOptions::devices overrides this per model.
     std::vector<std::string> devices;
     // Primary GPU index for single-GPU mode (split_mode == "none") and
     // non-split / scratch tensors. Must be >= 0.

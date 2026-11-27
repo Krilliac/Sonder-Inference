@@ -1320,3 +1320,42 @@ TEST_CASE("serve_main: multi-profile llamacpp merges and conflicts on direct par
     fs::remove(g_path, ec);
     fs::remove(profiles, ec);
 }
+
+TEST_CASE("NAT-07 serve_main: multi-profile llamacpp binds distinct per-model devices and rejects n_gpu_layers 0 conflict") {
+    namespace det = sonder::inference::server::detail;
+    const auto g_path = temp_path("nat07-tiny.gguf");
+    {
+        std::ofstream(g_path, std::ios::binary) << minimal_gguf_header();
+    }
+    const std::string g_str = g_path.generic_string();
+    const auto profiles = temp_path("nat07-profiles.json");
+    {
+        std::ofstream(profiles) << R"({"profiles":[
+            {"name":"main-dgpu","backend":"llamacpp","model":")" << g_str << R"(","devices":["CUDA0"]},
+            {"name":"aux-igpu","backend":"llamacpp","model":")" << g_str << R"(","devices":["Vulkan1"]},
+            {"name":"cpu-zero","backend":"llamacpp","model":")" << g_str << R"(","n_gpu_layers":0}
+        ]})";
+    }
+    const std::string pf = profiles.string();
+
+    std::string err;
+    det::ServeCliConfig cfg;
+    const int rc = build_cli({"--profiles", pf, "--profile", "main-dgpu", "--profile", "aux-igpu",
+                              "--vram-budget-mib", "16384", "--max-connections", "0"},
+                             cfg, err);
+    CHECK(rc == 2);
+    CHECK(err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+    CHECK(cfg.options.device == "gpu:0");
+    REQUIRE(cfg.options.profile_bindings.size() == 2u);
+    CHECK(cfg.options.profile_bindings[0].devices == std::vector<std::string>{"CUDA0"});
+    CHECK(cfg.options.profile_bindings[1].devices == std::vector<std::string>{"Vulkan1"});
+
+    std::string out;
+    err.clear();
+    CHECK(run({"--profiles", pf, "--profile", "cpu-zero", "--profile", "main-dgpu"}, out, err) == 2);
+    CHECK(err.find("alongside 'n_gpu_layers' 0") != std::string::npos);
+
+    std::error_code ec;
+    fs::remove(g_path, ec);
+    fs::remove(profiles, ec);
+}

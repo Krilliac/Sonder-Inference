@@ -287,6 +287,7 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles,
         binding.model = p.name;
         if (p.backend == kLaunchProfileBackendLlamaCpp) {
             binding.load_name = p.model;
+            binding.devices = p.devices;
         } else if (llamaserver_shared_spawn && primary != nullptr) {
             binding.load_name = primary->name;
         } else {

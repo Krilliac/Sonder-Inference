@@ -46,6 +46,392 @@ std::string_view ToString(DeviceKind kind) noexcept {
     return "unknown";
 }
 
+namespace {
+
+bool EqualsIgnoreCase(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const auto ca = static_cast<unsigned char>(a[i]);
+        const auto cb = static_cast<unsigned char>(b[i]);
+        const auto la = static_cast<unsigned char>(ca >= 'A' && ca <= 'Z' ? ca + ('a' - 'A') : ca);
+        const auto lb = static_cast<unsigned char>(cb >= 'A' && cb <= 'Z' ? cb + ('a' - 'A') : cb);
+        if (la != lb) return false;
+    }
+    return true;
+}
+
+std::string_view TrimAscii(std::string_view s) noexcept {
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n')) {
+        s.remove_prefix(1);
+    }
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n')) {
+        s.remove_suffix(1);
+    }
+    return s;
+}
+
+bool ParseHexU32(std::string_view s, std::uint32_t& out) noexcept {
+    if (s.empty() || s.size() > 8) return false;
+    std::uint64_t val = 0;
+    for (char ch : s) {
+        std::uint32_t digit = 0;
+        if (ch >= '0' && ch <= '9') {
+            digit = static_cast<std::uint32_t>(ch - '0');
+        } else if (ch >= 'a' && ch <= 'f') {
+            digit = static_cast<std::uint32_t>(ch - 'a' + 10);
+        } else if (ch >= 'A' && ch <= 'F') {
+            digit = static_cast<std::uint32_t>(ch - 'A' + 10);
+        } else {
+            return false;
+        }
+        val = (val << 4) | digit;
+    }
+    if (val > 0xFFFFFFFFULL) return false;
+    out = static_cast<std::uint32_t>(val);
+    return true;
+}
+
+void AppendHexPadded(std::string& dst, std::uint32_t v, std::size_t min_digits) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    char buf[8];
+    std::size_t n = 0;
+    do {
+        buf[n++] = kHex[v & 0xFU];
+        v >>= 4;
+    } while (v != 0 && n < sizeof(buf));
+    while (n < min_digits) dst.push_back('0'), --min_digits;
+    while (n > 0) dst.push_back(buf[--n]);
+}
+
+// "CUDA0" -> "CUDA", "Vulkan12" -> "Vulkan".
+std::string_view BackendPrefix(std::string_view name) noexcept {
+    while (!name.empty() && name.back() >= '0' && name.back() <= '9') name.remove_suffix(1);
+    return name;
+}
+
+// Lower number = higher preference when one physical GPU appears under multiple
+// ggml backends in automatic mode (native vendor backends beat Vulkan/OpenCL/WebGPU).
+int BackendPriority(std::string_view name) noexcept {
+    const std::string_view p = BackendPrefix(name);
+    if (EqualsIgnoreCase(p, "CUDA") || EqualsIgnoreCase(p, "ROCm") || EqualsIgnoreCase(p, "HIP") ||
+        EqualsIgnoreCase(p, "Metal") || EqualsIgnoreCase(p, "SYCL") || EqualsIgnoreCase(p, "MUSA") ||
+        EqualsIgnoreCase(p, "CANN")) {
+        return 0;
+    }
+    if (EqualsIgnoreCase(p, "Vulkan") || EqualsIgnoreCase(p, "OpenCL") || EqualsIgnoreCase(p, "WebGPU")) {
+        return 2;
+    }
+    return 1;
+}
+
+bool SamePhysicalDevice(const DeviceInfo& a, const DeviceInfo& b) noexcept {
+    if (a.kind == DeviceKind::kCpu || b.kind == DeviceKind::kCpu) return false;
+    const std::string id_a = NormalizePciBusId(a.device_id);
+    const std::string id_b = NormalizePciBusId(b.device_id);
+    if (!id_a.empty() && !id_b.empty()) return id_a == id_b;
+    // Without ids on both sides, identical cards on the same backend stay distinct.
+    if (EqualsIgnoreCase(BackendPrefix(a.name), BackendPrefix(b.name))) return false;
+    const std::string_view desc_a = TrimAscii(a.description);
+    const std::string_view desc_b = TrimAscii(b.description);
+    return !desc_a.empty() && EqualsIgnoreCase(desc_a, desc_b) && a.memory_total_bytes != 0 &&
+           a.memory_total_bytes == b.memory_total_bytes;
+}
+
+Status ValidateTensorSplitShape(const std::vector<float>& tensor_split) {
+    if (tensor_split.empty()) return Status::Ok();
+    if (tensor_split.size() > kMaxTensorSplitDevices) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "tensor_split has " + std::to_string(tensor_split.size()) +
+                                 " entries (maximum is " + std::to_string(kMaxTensorSplitDevices) + ")");
+    }
+    bool any_positive = false;
+    for (const float weight : tensor_split) {
+        if (!std::isfinite(weight) || weight < 0.0F) {
+            return Status::Error(ErrorCode::kInvalidArgument, "tensor_split values must be finite and >= 0");
+        }
+        if (weight > 0.0F) any_positive = true;
+    }
+    if (!any_positive) {
+        return Status::Error(ErrorCode::kInvalidArgument, "tensor_split must contain at least one positive value");
+    }
+    return Status::Ok();
+}
+
+}  // namespace
+
+std::string NormalizePciBusId(std::string_view raw) {
+    raw = TrimAscii(raw);
+    if (raw.empty()) return {};
+
+    // Split optional virtual-device suffix such as "-v0" (ggml-cuda virtual devices).
+    std::string_view bdf = raw;
+    std::string_view suffix;
+    if (const std::size_t dash = raw.find('-'); dash != std::string_view::npos) {
+        bdf = raw.substr(0, dash);
+        suffix = raw.substr(dash);
+    }
+
+    const std::size_t c1 = bdf.find(':');
+    const std::size_t c2 = c1 == std::string_view::npos ? std::string_view::npos : bdf.find(':', c1 + 1);
+    const std::size_t dot = c2 == std::string_view::npos ? std::string_view::npos : bdf.find('.', c2 + 1);
+    if (c1 != std::string_view::npos && c2 != std::string_view::npos && dot != std::string_view::npos &&
+        bdf.find(':', c2 + 1) == std::string_view::npos && bdf.find('.', dot + 1) == std::string_view::npos) {
+        std::uint32_t domain = 0;
+        std::uint32_t bus = 0;
+        std::uint32_t dev = 0;
+        std::uint32_t fn = 0;
+        if (ParseHexU32(bdf.substr(0, c1), domain) && ParseHexU32(bdf.substr(c1 + 1, c2 - c1 - 1), bus) &&
+            ParseHexU32(bdf.substr(c2 + 1, dot - c2 - 1), dev) && ParseHexU32(bdf.substr(dot + 1), fn) &&
+            bus <= 0xFFU && dev <= 0xFFU && fn <= 0xFU) {
+            std::string norm;
+            norm.reserve(12 + suffix.size());
+            AppendHexPadded(norm, domain, 4);
+            norm.push_back(':');
+            AppendHexPadded(norm, bus, 2);
+            norm.push_back(':');
+            AppendHexPadded(norm, dev, 2);
+            norm.push_back('.');
+            AppendHexPadded(norm, fn, 1);
+            for (char ch : suffix) {
+                const auto u = static_cast<unsigned char>(ch);
+                norm.push_back(static_cast<char>(u >= 'A' && u <= 'Z' ? u + ('a' - 'A') : u));
+            }
+            return norm;
+        }
+    }
+
+    std::string lower;
+    lower.reserve(raw.size());
+    for (char ch : raw) {
+        const auto u = static_cast<unsigned char>(ch);
+        lower.push_back(static_cast<char>(u >= 'A' && u <= 'Z' ? u + ('a' - 'A') : u));
+    }
+    return lower;
+}
+
+Status SelectDevices(const std::vector<DeviceInfo>& available, const std::vector<std::string>& allowlist,
+                     DeviceSelection* out) {
+    return SelectDevices(available, allowlist, {}, 0, out);
+}
+
+Status SelectDevices(const std::vector<DeviceInfo>& available, const std::vector<std::string>& allowlist,
+                     const std::vector<float>& tensor_split, std::int32_t main_gpu, DeviceSelection* out) {
+    if (main_gpu < 0) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "main_gpu (" + std::to_string(main_gpu) + ") must be >= 0");
+    }
+    if (allowlist.size() > kMaxTensorSplitDevices) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "too many devices (" + std::to_string(allowlist.size()) + ", maximum is " +
+                                 std::to_string(kMaxTensorSplitDevices) + ")");
+    }
+    for (const std::string& name : allowlist) {
+        if (name.empty()) {
+            return Status::Error(ErrorCode::kInvalidArgument, "device name in devices list is empty");
+        }
+        if (name.find('\0') != std::string::npos) {
+            return Status::Error(ErrorCode::kInvalidArgument, "device name in devices list contains NUL");
+        }
+    }
+    if (Status s = ValidateTensorSplitShape(tensor_split); !s.ok()) return s;
+
+    DeviceSelection sel;
+    if (!allowlist.empty()) {
+        std::vector<const DeviceInfo*> chosen;
+        std::vector<std::size_t> allowlist_to_selected(allowlist.size(), 0);
+        std::vector<std::size_t> selected_first_idx;
+        for (std::size_t j = 0; j < allowlist.size(); ++j) {
+            const std::string& name = allowlist[j];
+            const auto it = std::find_if(available.begin(), available.end(),
+                                         [&](const DeviceInfo& d) { return EqualsIgnoreCase(d.name, name); });
+            if (it == available.end()) {
+                return Status::Error(ErrorCode::kInvalidArgument,
+                                     "device '" + name + "' is not available in this build");
+            }
+            const auto dup = std::find_if(chosen.begin(), chosen.end(), [&](const DeviceInfo* c) {
+                return EqualsIgnoreCase(c->name, it->name) || SamePhysicalDevice(*c, *it);
+            });
+            if (dup != chosen.end()) {
+                sel.notes.push_back("skipping " + it->name + ": same physical device as " + (*dup)->name);
+                allowlist_to_selected[j] = static_cast<std::size_t>(dup - chosen.begin());
+                continue;
+            }
+            allowlist_to_selected[j] = chosen.size();
+            selected_first_idx.push_back(j);
+            chosen.push_back(&*it);
+            sel.names.push_back(it->name);
+        }
+
+        const std::size_t L = allowlist.size();
+        const std::size_t S = sel.names.size();
+        if (!tensor_split.empty()) {
+            if (S == L) {
+                sel.tensor_split = tensor_split;
+            } else {
+                if (tensor_split.size() > L) {
+                    sel.tensor_split = tensor_split;
+                    sel.main_gpu = main_gpu;
+                    if (out != nullptr) *out = std::move(sel);
+                    return Status::Error(ErrorCode::kInvalidArgument,
+                                         "tensor_split has " + std::to_string(tensor_split.size()) +
+                                             " entries, exceeding allowlist size (" + std::to_string(L) + ")");
+                }
+                sel.tensor_split.assign(S, 0.0F);
+                for (std::size_t k = 0; k < S; ++k) {
+                    const std::size_t orig = selected_first_idx[k];
+                    if (orig < tensor_split.size()) {
+                        sel.tensor_split[k] = tensor_split[orig];
+                    }
+                    if (sel.tensor_split[k] == 0.0F) {
+                        for (std::size_t j = 0; j < std::min(L, tensor_split.size()); ++j) {
+                            if (allowlist_to_selected[j] == k && tensor_split[j] > 0.0F) {
+                                sel.tensor_split[k] = tensor_split[j];
+                                break;
+                            }
+                        }
+                    }
+                }
+                const bool any_pos =
+                    std::any_of(sel.tensor_split.begin(), sel.tensor_split.end(), [](float w) { return w > 0.0F; });
+                if (!any_pos) {
+                    sel.main_gpu = main_gpu;
+                    if (out != nullptr) *out = std::move(sel);
+                    return Status::Error(ErrorCode::kInvalidArgument,
+                                         "tensor_split assigns zero weight to every selected device");
+                }
+            }
+        }
+
+        if (static_cast<std::size_t>(main_gpu) < L) {
+            sel.main_gpu = static_cast<std::int32_t>(allowlist_to_selected[static_cast<std::size_t>(main_gpu)]);
+        } else {
+            sel.main_gpu = main_gpu;
+            if (out != nullptr) *out = std::move(sel);
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "main_gpu (" + std::to_string(main_gpu) + ") exceeds selected device count (" +
+                                     std::to_string(S) + ")");
+        }
+        if (out != nullptr) *out = std::move(sel);
+        return Status::Ok();
+    }
+
+    // Automatic selection: discrete GPUs only (never integrated GPUs), de-duplicated across backends.
+    std::vector<const DeviceInfo*> raw_gpus;
+    for (const DeviceInfo& d : available) {
+        if (d.kind == DeviceKind::kGpu || d.kind == DeviceKind::kIntegratedGpu) {
+            raw_gpus.push_back(&d);
+        }
+    }
+    const std::size_t R = raw_gpus.size();
+    std::vector<int> raw_to_selected(R, -1);
+    std::vector<std::size_t> selected_raw_idx;
+    std::vector<const DeviceInfo*> chosen;
+
+    for (std::size_t r = 0; r < R; ++r) {
+        const DeviceInfo& d = *raw_gpus[r];
+        if (d.kind == DeviceKind::kIntegratedGpu) {
+            sel.notes.push_back("skipping " + d.name + ": integrated GPU not in the device allowlist");
+            continue;
+        }
+        const auto dup =
+            std::find_if(chosen.begin(), chosen.end(), [&](const DeviceInfo* c) { return SamePhysicalDevice(*c, d); });
+        if (dup == chosen.end()) {
+            raw_to_selected[r] = static_cast<int>(chosen.size());
+            selected_raw_idx.push_back(r);
+            chosen.push_back(&d);
+        } else {
+            const auto k = static_cast<std::size_t>(dup - chosen.begin());
+            raw_to_selected[r] = static_cast<int>(k);
+            if (BackendPriority(d.name) < BackendPriority((*dup)->name)) {
+                sel.notes.push_back("skipping " + (*dup)->name + ": same physical device as " + d.name);
+                *dup = &d;
+                selected_raw_idx[k] = r;
+            } else {
+                sel.notes.push_back("skipping " + d.name + ": same physical device as " + (*dup)->name);
+            }
+        }
+    }
+    for (const DeviceInfo* c : chosen) sel.names.push_back(c->name);
+
+    const std::size_t S = sel.names.size();
+    if (S == 0) {
+        sel.main_gpu = main_gpu;
+        sel.tensor_split = tensor_split;
+        if (out != nullptr) *out = std::move(sel);
+        if (!tensor_split.empty()) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "tensor_split requires at least one discrete GPU when no device allowlist is set");
+        }
+        if (main_gpu > 0) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "main_gpu (" + std::to_string(main_gpu) + ") exceeds selected discrete GPU count (0)");
+        }
+        return Status::Ok();
+    }
+
+    const bool raw_indexed_split = (R > S) && (tensor_split.size() == R);
+    if (!tensor_split.empty()) {
+        if (raw_indexed_split) {
+            sel.tensor_split.assign(S, 0.0F);
+            for (std::size_t k = 0; k < S; ++k) {
+                sel.tensor_split[k] = tensor_split[selected_raw_idx[k]];
+                if (sel.tensor_split[k] == 0.0F) {
+                    for (std::size_t r = 0; r < R; ++r) {
+                        if (raw_to_selected[r] == static_cast<int>(k) && tensor_split[r] > 0.0F) {
+                            sel.tensor_split[k] = tensor_split[r];
+                            break;
+                        }
+                    }
+                }
+            }
+            const bool any_pos =
+                std::any_of(sel.tensor_split.begin(), sel.tensor_split.end(), [](float w) { return w > 0.0F; });
+            if (!any_pos) {
+                sel.main_gpu = main_gpu;
+                if (out != nullptr) *out = std::move(sel);
+                return Status::Error(ErrorCode::kInvalidArgument,
+                                     "tensor_split assigns zero weight to every selected discrete GPU");
+            }
+        } else if (tensor_split.size() <= S) {
+            sel.tensor_split = tensor_split;
+        } else {
+            sel.tensor_split = tensor_split;
+            sel.main_gpu = main_gpu;
+            if (out != nullptr) *out = std::move(sel);
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "tensor_split has " + std::to_string(tensor_split.size()) +
+                                     " entries, exceeding selected discrete GPU count (" + std::to_string(S) + ")");
+        }
+    }
+
+    if (main_gpu == 0) {
+        sel.main_gpu = (raw_indexed_split && raw_to_selected[0] >= 0) ? raw_to_selected[0] : 0;
+    } else {
+        const auto mg = static_cast<std::size_t>(main_gpu);
+        if (!raw_indexed_split && mg < S) {
+            sel.main_gpu = main_gpu;
+        } else if (R > S && mg < R) {
+            if (raw_to_selected[mg] < 0) {
+                sel.main_gpu = main_gpu;
+                if (out != nullptr) *out = std::move(sel);
+                return Status::Error(ErrorCode::kInvalidArgument,
+                                     "main_gpu (" + std::to_string(main_gpu) + ") targets integrated GPU '" +
+                                         raw_gpus[mg]->name + "' which is not in the device allowlist");
+            }
+            sel.main_gpu = raw_to_selected[mg];
+        } else {
+            sel.main_gpu = main_gpu;
+            if (out != nullptr) *out = std::move(sel);
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "main_gpu (" + std::to_string(main_gpu) + ") exceeds selected discrete GPU count (" +
+                                     std::to_string(S) + ")");
+        }
+    }
+
+    if (out != nullptr) *out = std::move(sel);
+    return Status::Ok();
+}
+
 Status Validate(const SamplingParams& params) {
     if (!std::isfinite(params.temperature)) {
         return Status::Error(ErrorCode::kInvalidArgument, "temperature must be finite");
@@ -91,18 +477,6 @@ constexpr KvCacheType kAllKvCacheTypes[] = {
     KvCacheType::kQ5_1,   KvCacheType::kQ5_0, KvCacheType::kQ4_1, KvCacheType::kQ4_0,
     KvCacheType::kIQ4_NL, KvCacheType::kF8_E4M3, KvCacheType::kQ2_0, KvCacheType::kPQ2_0,
 };
-
-bool EqualsIgnoreCase(std::string_view a, std::string_view b) noexcept {
-    if (a.size() != b.size()) return false;
-    for (std::size_t i = 0; i < a.size(); ++i) {
-        const auto ca = static_cast<unsigned char>(a[i]);
-        const auto cb = static_cast<unsigned char>(b[i]);
-        const auto la = static_cast<unsigned char>(ca >= 'A' && ca <= 'Z' ? ca + ('a' - 'A') : ca);
-        const auto lb = static_cast<unsigned char>(cb >= 'A' && cb <= 'Z' ? cb + ('a' - 'A') : cb);
-        if (la != lb) return false;
-    }
-    return true;
-}
 
 std::uint64_t Mix64(std::uint64_t x) noexcept {
     x += 0x9E3779B97F4A7C15ULL;

@@ -435,6 +435,42 @@ TEST_CASE("launch profile llamacpp: context and GPU layers map onto the backend 
     CHECK(cpu_device == "cpu:0");
 }
 
+TEST_CASE("NAT-07 launch profile llamacpp: devices allowlist parses, forces a gpu device and is validated") {
+    const LaunchProfile p = parse_single(
+        R"({"name":"pinned","backend":"llamacpp","model":"D:/m.gguf","devices":["CUDA0","Vulkan1"]})");
+    REQUIRE(p.devices.size() == 2u);
+    CHECK(p.devices[0] == "CUDA0");
+    CHECK(p.devices[1] == "Vulkan1");
+    si::BackendSetup setup;
+    setup.backend = "llamacpp";
+    std::string device;
+    REQUIRE(si::apply_llamacpp_profile(p, setup, device).ok());
+    CHECK(device == "gpu:0");  // cpu:* ids offload no layers, so the list would be ignored
+
+    const auto meta = si::launch_profile_metadata(p, std::nullopt, std::nullopt);
+    REQUIRE(meta.find("devices") != nullptr);
+    REQUIRE(meta.find("devices")->as_array().size() == 2u);
+    CHECK(meta.find("devices")->as_array()[0].as_string() == "CUDA0");
+    CHECK(meta.find("devices")->as_array()[1].as_string() == "Vulkan1");
+
+    std::string cpu = "cpu:0";
+    si::BackendSetup untouched;
+    const si::Status refused = si::apply_llamacpp_profile(p, untouched, cpu);
+    CHECK_FALSE(refused.ok());
+    CHECK(contains(refused.message(), "'devices' needs a gpu:* --device"));
+
+    const LaunchProfile cpu_layers = parse_single(
+        R"({"name":"x","backend":"llamacpp","model":"D:/m.gguf","devices":["CUDA0"],"n_gpu_layers":0})");
+    std::string d2;
+    si::BackendSetup s2;
+    CHECK_FALSE(si::apply_llamacpp_profile(cpu_layers, s2, d2).ok());
+
+    CHECK(contains(parse_error(R"({"name":"x","backend":"llamacpp","model":"D:/m.gguf","devices":["CUDA0,CUDA1"]})"),
+                   "single device names"));
+    CHECK(contains(parse_error(R"({"name":"x","backend":"llamaserver","model":"D:/m.gguf","devices":["CUDA0"]})"),
+                   "only for the llamacpp backend"));
+}
+
 TEST_CASE("launch profile llamacpp: fields the direct backend cannot honour are rejected and never dropped") {
     const std::vector<std::pair<std::string, std::string>> cases{
         {R"("mmproj":"p.gguf","image_max_tokens":100)", "image_max_tokens"},
