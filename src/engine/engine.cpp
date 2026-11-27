@@ -148,6 +148,8 @@ Engine::Engine(EngineOptions options)
                          json::Object{{"mode", to_string(so.mode)},
                                       {"kv_block_size_tokens", so.kv_block_size_tokens},
                                       {"kv_num_blocks", so.kv_num_blocks},
+                                      {"kv_capacity_tokens",
+                                       static_cast<std::uint64_t>(so.kv_block_size_tokens) * so.kv_num_blocks},
                                       {"prefix_caching", so.prefix_caching},
                                       {"max_running_sequences", so.max_running_sequences},
                                       {"max_step_sequences", so.max_step_sequences},
@@ -223,7 +225,10 @@ void Engine::sample_backend_runtime() {
         if (status->take_events) {
             for (auto& [type, attrs] : status->take_events()) {
                 attrs.set("backend", name);
-                telemetry_->emit(std::move(type), engine_context(), std::move(attrs), TelemetryLevel::metrics);
+                // Native physical KV events (`kv.*`) are standard-level; the other
+                // backend observations stay at metrics.
+                const TelemetryLevel level = type.rfind("kv.", 0) == 0 ? TelemetryLevel::standard : TelemetryLevel::metrics;
+                telemetry_->emit(std::move(type), engine_context(), std::move(attrs), level);
             }
         }
         if (status->warmup) {

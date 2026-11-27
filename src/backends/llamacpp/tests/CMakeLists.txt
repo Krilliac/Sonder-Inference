@@ -18,6 +18,7 @@ sonder_add_module_tests(llamacpp
     test_json_schema_normalize.cpp
     test_llguidance_sampler.cpp
     test_embeddings.cpp
+    test_kv_telemetry.cpp
     test_slot_store.cpp
     test_tool_grammar_preflight.cpp
     test_device_health.cpp
@@ -35,6 +36,7 @@ endif()
 add_executable(sonder_llamacpp_integration test_llamacpp_integration.cpp)
 target_link_libraries(sonder_llamacpp_integration PRIVATE
     sonder::inference sonder_backend_llamacpp sonder_doctest)
+target_include_directories(sonder_llamacpp_integration PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
 sonder_set_warnings(sonder_llamacpp_integration)
 add_test(NAME sonder.llamacpp.integration COMMAND sonder_llamacpp_integration)
 set_tests_properties(sonder.llamacpp.integration PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)

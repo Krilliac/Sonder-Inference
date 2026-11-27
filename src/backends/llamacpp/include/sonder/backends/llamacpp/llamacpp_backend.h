@@ -769,6 +769,8 @@ void SetLogSink(LogSink sink) noexcept;
 // hands the text to the sink. Public so tests can drive it without a model.
 void RouteLog(LogLevel level, const char* text);
 
+class KvTelemetry;  // kv_telemetry.hpp
+
 class LlamaCppBackend {
 public:
     LlamaCppBackend();
@@ -891,6 +893,10 @@ public:
                                 std::size_t max_bytes = kMaxSequenceStateBytes);
 
     void SetTelemetrySink(TelemetrySink sink);
+    // Physical KV telemetry (kv_telemetry.hpp). Set before Load(): the backend
+    // queues kv.pool.configured when the context is created, kv.usage as slots
+    // change and kv.evicted on idle-slot eviction; the owner drains the queue.
+    void SetKvTelemetry(std::shared_ptr<KvTelemetry> kv);
     [[nodiscard]] PrefixCoalescerStats GetPrefixCoalescerStats() const noexcept;
 
 private:
