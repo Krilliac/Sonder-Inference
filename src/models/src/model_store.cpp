@@ -17,13 +17,15 @@
 //   types/model/config.go  ConfigV2 (model_format, remote_host, ...)
 //   api/types.go           Options / Runner JSON keys for the params layer
 //
-// Every file is opened through common/safe_file.hpp: one segment at a time from the store
-// root, never following a link or reparse point, and read from that one handle.
+// Every file is opened through common/safe_file.hpp relative to the root directory handle
+// OllamaStore::open() pinned: one segment at a time, never following a link or reparse
+// point, and read from that one handle. Directories are listed from their own handles.
 #include "sonder/inference/model_store.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -35,11 +37,105 @@
 
 #include "common/safe_file.hpp"
 #include "common/sha256.hpp"
+#include "store_text.hpp"
 
 namespace sonder::inference::models {
 
 namespace fs = std::filesystem;
 namespace sf = ::sonder::inference::detail;
+
+// The store root, opened once by OllamaStore::open() and shared (read-only) by copies of the
+// store and by every record read through it. `dir` is only ever the starting directory of a
+// relative open, so concurrent use from any number of threads is safe.
+struct StoreAnchor {
+    sf::OwnedFileHandle dir;
+    sf::FileIdentity id;
+    fs::path path;  // absolute form of the path given to open(); display and record paths only
+};
+
+namespace store_text {
+
+namespace {
+
+// Zero-width, bidi, separator and other invisible format code points that can disguise text.
+bool invisible_or_control(char32_t cp) {
+    return (cp >= 0x80 && cp <= 0x9F) || cp == 0x061C || (cp >= 0x200B && cp <= 0x200F) || cp == 0x2028 ||
+           cp == 0x2029 || (cp >= 0x202A && cp <= 0x202E) || (cp >= 0x2060 && cp <= 0x2069) || cp == 0xFEFF ||
+           (cp >= 0xFFF9 && cp <= 0xFFFB);
+}
+
+}  // namespace
+
+std::string printable(std::string_view s, std::size_t max) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    const std::size_t n = std::min(s.size(), max);
+    std::string out;
+    out.reserve(n + 8);
+    auto hex_byte = [&](unsigned char c) {
+        out += "\\x";
+        out.push_back(kHex[c >> 4]);
+        out.push_back(kHex[c & 15]);
+    };
+    std::size_t i = 0;
+    while (i < n) {
+        const auto c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80) {
+            if (c < 0x20 || c == 0x7f) {
+                hex_byte(c);
+            } else if (c == '\\') {
+                out += "\\\\";
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+            ++i;
+            continue;
+        }
+        // One UTF-8 sequence inside [i, n) (RFC 3629: no overlongs, surrogates or > U+10FFFF).
+        std::size_t len = 0;
+        char32_t cp = 0;
+        if (c >= 0xC2 && c <= 0xDF) {
+            len = 2;
+            cp = c & 0x1Fu;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            len = 3;
+            cp = c & 0x0Fu;
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            len = 4;
+            cp = c & 0x07u;
+        }
+        bool ok = len != 0 && i + len <= n;
+        for (std::size_t k = 1; ok && k < len; ++k) {
+            const auto b = static_cast<unsigned char>(s[i + k]);
+            if ((b & 0xC0u) != 0x80u) {
+                ok = false;
+            } else {
+                cp = (cp << 6) | (b & 0x3Fu);
+            }
+        }
+        if (ok && ((len == 3 && cp < 0x800) || (len == 4 && cp < 0x10000) || (cp >= 0xD800 && cp <= 0xDFFF) ||
+                   cp > 0x10FFFF)) {
+            ok = false;
+        }
+        if (!ok) {
+            hex_byte(c);  // its continuation bytes, if any, are escaped one by one after it
+            ++i;
+            continue;
+        }
+        for (std::size_t k = 0; k < len; ++k) {
+            const auto b = static_cast<unsigned char>(s[i + k]);
+            if (invisible_or_control(cp)) {
+                hex_byte(b);
+            } else {
+                out.push_back(static_cast<char>(b));
+            }
+        }
+        i += len;
+    }
+    if (s.size() > max) out += "...";
+    return out;
+}
+
+}  // namespace store_text
 
 namespace {
 
@@ -58,6 +154,7 @@ constexpr std::size_t kMaxVerifiedEntries = 4096;
 constexpr std::size_t kMaxLiveRecords = 1024;
 constexpr std::size_t kMaxHostLen = 350;
 constexpr std::size_t kMaxPartLen = 80;
+static_assert(kMaxOllamaNameBytes == 8 + kMaxHostLen + 1 + kMaxPartLen + 1 + kMaxPartLen + 1 + kMaxPartLen);
 
 constexpr std::string_view kMediaManifestList = "application/vnd.ollama.manifest.list.v2+json";
 constexpr std::string_view kMediaManifest = "application/vnd.docker.distribution.manifest.v2+json";
@@ -73,35 +170,8 @@ std::string lower(std::string_view s) {
     return out;
 }
 
-// Bounded, single-line form of an untrusted string for messages and notes: C0/C1 controls,
-// DEL and backslash are escaped (\xNN, \\), at most `max` input bytes, "..." when cut.
-std::string printable(std::string_view s, std::size_t max = kMaxQuoted) {
-    static constexpr char kHex[] = "0123456789abcdef";
-    const std::size_t n = std::min(s.size(), max);
-    std::string out;
-    out.reserve(n + 8);
-    auto hex_byte = [&](unsigned char c) {
-        out += "\\x";
-        out.push_back(kHex[c >> 4]);
-        out.push_back(kHex[c & 15]);
-    };
-    for (std::size_t i = 0; i < n; ++i) {
-        const auto c = static_cast<unsigned char>(s[i]);
-        if (c < 0x20 || c == 0x7f) {
-            hex_byte(c);
-        } else if (c == '\\') {
-            out += "\\\\";
-        } else if (c == 0xC2 && i + 1 < n && static_cast<unsigned char>(s[i + 1]) >= 0x80 &&
-                   static_cast<unsigned char>(s[i + 1]) <= 0x9F) {
-            hex_byte(c);  // a C1 control (U+0080-U+009F)
-            hex_byte(static_cast<unsigned char>(s[++i]));
-        } else {
-            out.push_back(static_cast<char>(c));
-        }
-    }
-    if (s.size() > max) out += "...";
-    return out;
-}
+// Bounded, single-line form of an untrusted string for messages and notes (store_text.hpp).
+std::string printable(std::string_view s, std::size_t max = kMaxQuoted) { return store_text::printable(s, max); }
 
 // Converts without throwing: a Windows name with an unpaired UTF-16 surrogate makes
 // generic_u8string throw (same approach as src/artifacts/src/weight_manifest.cpp).
@@ -137,7 +207,8 @@ bool is_dos_device_name(std::string_view s) {
 enum class Part { host, ns, model, tag };
 
 // types/model/name.go isValidPart / isValidLen, plus no trailing '.' (Win32 strips it, so
-// "coder." would open "coder") and no DOS device base name.
+// "coder." would open "coder") and no DOS device base name, for every part including the
+// host ("nul", "aux:5000", "com1.example" are refused; the host is a directory name too).
 bool valid_part(Part kind, std::string_view s) {
     const std::size_t max_len = kind == Part::host ? kMaxHostLen : kMaxPartLen;
     if (s.empty() || s.size() > max_len) return false;
@@ -172,14 +243,6 @@ bool is_hex64(std::string_view s) {
 std::optional<std::string> manifest_digest_hex(std::string_view d) {
     if (d.size() != 7 + 64 || d.substr(0, 7) != "sha256:") return std::nullopt;
     const std::string_view hex = d.substr(7);
-    if (!is_hex64(hex)) return std::nullopt;
-    return lower(hex);
-}
-
-// A blob file name: "sha256-<64 hex>" (manifest.go blobFilenamePattern) -> lowercase hex.
-std::optional<std::string> blob_name_hex(std::string_view name) {
-    if (name.size() != 7 + 64 || name.substr(0, 7) != "sha256-") return std::nullopt;
-    const std::string_view hex = name.substr(7);
     if (!is_hex64(hex)) return std::nullopt;
     return lower(hex);
 }
@@ -248,6 +311,7 @@ FileStamp to_stamp(const sf::FileIdentity& id) {
     FileStamp s;
     s.volume = id.volume;
     s.file_id = id.file_id;
+    s.file_id_high = id.file_id_high;
     s.size = id.size;
     s.link_count = id.link_count;
     s.write_time = id.write_time;
@@ -670,35 +734,81 @@ struct ManifestText {
     std::vector<SourceStamp> sources;
 };
 
-// Opens `rel` under `root` without following links. On POSIX a v2 name may be a symlink
-// (Ollama writes them as ../../../../blobs/sha256-<hex>): then the link is never read
-// through; blobs/sha256-<hex> is opened from the root instead, must be the very file the
-// link resolves to, and must hash to <hex> (manifest.go openManifestFileLocked).
-ManifestText read_manifest(const fs::path& root, const std::string& rel) {
+// The blob a v2 manifest symlink may stand for: its text must be a relative path that,
+// resolved lexically from the link's own directory (every directory on the way was opened as
+// a real directory, so ".." there means its parent), is exactly blobs/sha256-<64 lowercase
+// hex> under the store root. Anything else (absolute, "." or empty segments, climbing above
+// the root, another directory, another name) is refused without looking at the target.
+std::optional<std::string> manifest_link_blob_hex(std::string_view link_rel, std::string_view text) {
+    const auto dir_end = link_rel.rfind('/');
+    if (dir_end == std::string_view::npos || text.empty() || text.front() == '/') return std::nullopt;
+    std::vector<std::string_view> parts;
+    auto split_into = [&](std::string_view path, bool allow_dotdot) {
+        std::size_t pos = 0;
+        while (pos <= path.size()) {
+            std::size_t next = path.find('/', pos);
+            if (next == std::string_view::npos) next = path.size();
+            const std::string_view seg = path.substr(pos, next - pos);
+            if (seg.empty() || seg == ".") return false;
+            if (seg == "..") {
+                if (!allow_dotdot || parts.empty()) return false;
+                parts.pop_back();
+            } else {
+                parts.push_back(seg);
+            }
+            pos = next + 1;
+        }
+        return true;
+    };
+    if (!split_into(link_rel.substr(0, dir_end), false) || !split_into(text, true)) return std::nullopt;
+    if (parts.size() != 2 || parts[0] != "blobs") return std::nullopt;
+    const std::string_view name = parts[1];
+    if (name.size() != 7 + 64 || name.substr(0, 7) != "sha256-") return std::nullopt;
+    const std::string_view hex = name.substr(7);
+    const bool lower_hex = std::all_of(hex.begin(), hex.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+    if (!lower_hex) return std::nullopt;
+    return std::string(hex);
+}
+
+// Opens `rel` relative to the pinned root without following links. On POSIX a manifests-v2
+// name may be a symlink (Ollama writes them as ../../../../blobs/sha256-<hex>,
+// manifest.go WriteManifest). Then the link is never followed or stat'ed through: its text
+// (readlinkat) must be exactly the relative path of blobs/sha256-<hex>, that blob is opened
+// from the root, the link is lstat'ed again (same identity, same text) so a retarget during
+// the read is caught, and the blob must hash to <hex> (manifest.go openManifestFileLocked).
+// A link under the legacy manifests/ tree is refused.
+ManifestText read_manifest(const StoreAnchor& a, const std::string& rel, ManifestLayout layout) {
     ManifestText m;
     sf::OwnedFileHandle h;
     sf::FileIdentity id;
     std::string err;
     std::string expect_hex;
     std::string read_rel = rel;
-    m.outcome = sf::open_anchored_file(root, rel, h, id, err);
-    if (m.outcome == sf::OpenOutcome::unsafe) {
+    m.outcome = sf::open_anchored_file(a.dir, rel, sf::ShareMode::allow_writers, h, id, err);
+    if (m.outcome == sf::OpenOutcome::unsafe && layout == ManifestLayout::v2) {
         std::string target, link_err;
-        sf::FileIdentity link_id, target_id;
-        if (sf::read_anchored_leaf_symlink(root, rel, target, link_id, target_id, link_err)) {
-            const auto slash = target.find_last_of('/');
-            const auto hex = blob_name_hex(slash == std::string::npos ? target : target.substr(slash + 1));
+        sf::FileIdentity link_id;
+        if (sf::read_anchored_leaf_symlink(a.dir, rel, target, link_id, link_err)) {
+            const auto hex = manifest_link_blob_hex(rel, target);
             if (!hex) {
                 m.reason = UnsupportedReason::unsafe_path;
-                m.error = "manifest is a symbolic link that does not name a blob";
+                m.error = "manifest is a symbolic link whose text is not the relative path of a blob in blobs/";
                 return m;
             }
             read_rel = blob_rel(*hex);
             sf::OwnedFileHandle bh;
             sf::FileIdentity bid;
-            if (sf::open_anchored_file(root, read_rel, bh, bid, err) != sf::OpenOutcome::ok || !bid.same_file(target_id)) {
+            if (sf::open_anchored_file(a.dir, read_rel, sf::ShareMode::allow_writers, bh, bid, err) != sf::OpenOutcome::ok) {
                 m.reason = UnsupportedReason::unsafe_path;
-                m.error = "manifest symbolic link does not resolve to " + short_digest(*hex) + " in blobs/";
+                m.error = "manifest symbolic link names " + short_digest(*hex) + ", which is not a regular file in blobs/";
+                return m;
+            }
+            std::string target_again;
+            sf::FileIdentity link_again;
+            if (!sf::read_anchored_leaf_symlink(a.dir, rel, target_again, link_again, link_err) || target_again != target ||
+                link_again != link_id) {
+                m.reason = UnsupportedReason::unsafe_path;
+                m.error = "manifest symbolic link changed while it was read";
                 return m;
             }
             m.sources.push_back(SourceStamp{rel, to_stamp(link_id), true});
@@ -751,7 +861,7 @@ ManifestText read_manifest(const fs::path& root, const std::string& rel) {
 // digest, and enforces the per-manifest text budget.
 class RecordReader {
 public:
-    RecordReader(const fs::path& root, ModelRecord& r) : root_(root), r_(r) {}
+    RecordReader(const StoreAnchor& a, ModelRecord& r) : a_(a), r_(r) {}
 
     // A validated small blob (config, template, system, params, messages, list child): a
     // regular file with one link, `declared` bytes (when known), at most `cap`, and hashing
@@ -813,7 +923,8 @@ public:
         sf::OwnedFileHandle h;
         sf::FileIdentity id;
         std::string err;
-        if (sf::open_anchored_file(root_, blob_rel(hex), h, id, err) == sf::OpenOutcome::ok) {
+        if (sf::open_anchored_file(a_.dir, blob_rel(hex), sf::ShareMode::allow_writers, h, id, err) ==
+            sf::OpenOutcome::ok) {
             b.disk_size = id.size;
             b.stamp = to_stamp(id);
         }
@@ -850,7 +961,7 @@ private:
         sf::OwnedFileHandle h;
         sf::FileIdentity id;
         std::string err;
-        const sf::OpenOutcome o = sf::open_anchored_file(root_, blob_rel(hex), h, id, err);
+        const sf::OpenOutcome o = sf::open_anchored_file(a_.dir, blob_rel(hex), sf::ShareMode::allow_writers, h, id, err);
         if (o == sf::OpenOutcome::missing) return fail(UnsupportedReason::missing_blob, "is not in blobs/");
         if (o == sf::OpenOutcome::unsafe) return fail(UnsupportedReason::unsafe_path, open_failure_text(o));
         if (o == sf::OpenOutcome::io_error) return fail(UnsupportedReason::missing_blob, "cannot be opened: " + printable(err));
@@ -893,7 +1004,7 @@ private:
         sf::OwnedFileHandle h;
         sf::FileIdentity id;
         std::string err;
-        const sf::OpenOutcome o = sf::open_anchored_file(root_, blob_rel(hex), h, id, err);
+        const sf::OpenOutcome o = sf::open_anchored_file(a_.dir, blob_rel(hex), sf::ShareMode::allow_writers, h, id, err);
         if (o != sf::OpenOutcome::ok) {
             w.reason = o == sf::OpenOutcome::unsafe ? UnsupportedReason::unsafe_path : UnsupportedReason::missing_blob;
             w.detail = o == sf::OpenOutcome::missing ? "is not in blobs/" : open_failure_text(o);
@@ -912,7 +1023,7 @@ private:
         return w;
     }
 
-    const fs::path& root_;
+    const StoreAnchor& a_;
     ModelRecord& r_;
     std::uint64_t text_bytes_ = 0;
     std::map<std::string, SmallResult> small_;
@@ -922,7 +1033,7 @@ private:
 // Selects the manifest-list child this engine can use: llamacpp first, then ggml (the same
 // order as manifest/manifest.go runnerPreferences on non-Apple platforms, minus mlx).
 // Returns false and sets reason/detail when none fits.
-bool select_child(const json::Value& list, const fs::path& root, ModelRecord& r, json::Value& child_doc,
+bool select_child(const json::Value& list, const StoreAnchor& a, ModelRecord& r, json::Value& child_doc,
                   UnsupportedReason& reason, std::string& detail_text) {
     const auto* children = list.find("manifests");
     if (children == nullptr || !children->is_array()) {
@@ -970,7 +1081,8 @@ bool select_child(const json::Value& list, const fs::path& root, ModelRecord& r,
                 sf::OwnedFileHandle probe;
                 sf::FileIdentity pid;
                 std::string perr;
-                if (sf::open_anchored_file(root, blob_rel(*hex), probe, pid, perr) == sf::OpenOutcome::missing) {
+                if (sf::open_anchored_file(a.dir, blob_rel(*hex), sf::ShareMode::allow_writers, probe, pid, perr) ==
+                    sf::OpenOutcome::missing) {
                     if (skipped_reason == UnsupportedReason::none) {
                         skipped_reason = UnsupportedReason::missing_blob;
                         skipped_detail = "manifest list child " + short_digest(*hex) + " is not in blobs/";
@@ -979,7 +1091,7 @@ bool select_child(const json::Value& list, const fs::path& root, ModelRecord& r,
                 }
             }
             ModelRecord probe_record;
-            RecordReader child_reader(root, probe_record);
+            RecordReader child_reader(a, probe_record);
             BlobRef ref;
             auto text = child_reader.small(*hex, std::nullopt, kMaxManifestBytes, "manifest list child", &ref);
             if (!text) {
@@ -1023,11 +1135,14 @@ bool select_child(const json::Value& list, const fs::path& root, ModelRecord& r,
     return false;
 }
 
-ModelRecord build_record(const fs::path& root, const OllamaName& name, const std::string& rel, ManifestLayout layout,
-                         ManifestText&& mt) {
+ModelRecord build_record(const std::shared_ptr<const StoreAnchor>& anchor, const OllamaName& name, const std::string& rel,
+                         ManifestLayout layout, ManifestText&& mt) {
+    const StoreAnchor& a = *anchor;
+    const fs::path& root = a.path;
     ModelRecord r;
     r.name = name;
     r.store_root = root;
+    r.anchor = anchor;
     r.manifest_path = root / from_utf8(rel);
     r.layout = layout;
     r.sources = std::move(mt.sources);
@@ -1036,7 +1151,7 @@ ModelRecord build_record(const fs::path& root, const OllamaName& name, const std
              mt.error.empty() ? std::string("manifest ") + open_failure_text(mt.outcome) : mt.error);
         return r;
     }
-    RecordReader reader(root, r);
+    RecordReader reader(a, r);
 
     auto doc = json::parse(mt.text, kManifestLimits);
     if (!doc.ok()) {
@@ -1052,7 +1167,7 @@ ModelRecord build_record(const fs::path& root, const OllamaName& name, const std
         json::Value child;
         UnsupportedReason reason = UnsupportedReason::none;
         std::string why;
-        if (!select_child(manifest_doc, root, r, child, reason, why)) {
+        if (!select_child(manifest_doc, a, r, child, reason, why)) {
             mark(r, reason, why);
             return r;
         }
@@ -1216,60 +1331,48 @@ ModelRecord build_record(const fs::path& root, const OllamaName& name, const std
     return r;
 }
 
-std::vector<fs::directory_entry> list_dir(const fs::path& dir) {
-    std::vector<fs::directory_entry> out;
-    std::error_code ec;
-    fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec);
-    if (ec) return out;
-    for (const fs::directory_iterator end{}; it != end; it.increment(ec)) {
-        if (ec) break;
-        out.push_back(*it);
-    }
-    return out;
-}
+using EntryKind = sf::DirEntryKind;
 
-enum class EntryKind { directory, file, link, other };
-
-EntryKind kind_of(const fs::directory_entry& e) {
-    std::error_code ec;
-    const fs::file_status st = e.symlink_status(ec);
-    if (ec) return EntryKind::other;
-    if (sf::is_link_like(e.path(), st)) return EntryKind::link;
-    if (fs::is_directory(st)) return EntryKind::directory;
-    if (fs::is_regular_file(st)) return EntryKind::file;
-    return EntryKind::other;
-}
-
-// Lists `dir_rel` under `root`: each entry's UTF-8 name and kind. Entries whose names are not
-// representable as UTF-8 are noted and skipped.
+// Lists `dir_rel` from its own handle, opened relative to the pinned root: each entry's UTF-8
+// name and kind (never following an entry). Entries whose names are not representable as
+// UTF-8 are noted and skipped. `outcome` (optional) receives the open result.
 struct Listed {
     std::string name;
     EntryKind kind;
 };
 
-std::vector<Listed> list_rel(const fs::path& root, const std::string& dir_rel, std::vector<std::string>* notes) {
+std::vector<Listed> list_rel(const StoreAnchor& a, const std::string& dir_rel, std::vector<std::string>* notes,
+                             sf::OpenOutcome* outcome = nullptr) {
     std::vector<Listed> out;
-    for (const auto& e : list_dir(root / from_utf8(dir_rel))) {
-        std::string name;
-        if (!try_path_utf8(e.path().filename(), name)) {
+    std::vector<sf::DirEntry> entries;
+    std::string err;
+    const sf::OpenOutcome o = sf::list_anchored_dir(a.dir, dir_rel, entries, err);
+    if (outcome != nullptr) *outcome = o;
+    if (o != sf::OpenOutcome::ok) return out;
+    out.reserve(entries.size());
+    for (auto& e : entries) {
+        if (!e.name_ok) {
             if (notes) note(*notes, "skipped an entry in " + printable(dir_rel) + ": its name is not representable as UTF-8");
             continue;
         }
-        out.push_back(Listed{std::move(name), kind_of(e)});
+        out.push_back(Listed{std::move(e.name), e.kind});
     }
     return out;
 }
 
-bool tree_is_safe(const fs::path& root, const char* tree, std::vector<std::string>* notes) {
-    std::error_code ec;
-    const fs::path p = root / tree;
-    const fs::file_status st = fs::symlink_status(p, ec);
-    if (ec || !fs::exists(st)) return false;
-    if (sf::is_link_like(p, st)) {
-        if (notes) note(*notes, std::string("skipped ") + tree + ": a link or reparse point");
-        return false;
+// True when the manifest tree `tree` is a real directory under the root (opened without
+// following a link); a link, junction or non-directory there is noted and skipped.
+bool tree_is_safe(const StoreAnchor& a, const char* tree, std::vector<std::string>* notes) {
+    std::string err;
+    switch (sf::probe_anchored_dir(a.dir, tree, err)) {
+        case sf::OpenOutcome::ok: return true;
+        case sf::OpenOutcome::unsafe:
+            if (notes) note(*notes, std::string("skipped ") + tree + ": a link, reparse point or not a directory");
+            return false;
+        case sf::OpenOutcome::missing:
+        case sf::OpenOutcome::io_error: return false;
     }
-    return fs::is_directory(st);
+    return false;
 }
 
 bool valid_name(const OllamaName& n) {
@@ -1283,12 +1386,12 @@ struct Found {
     ManifestLayout layout;
 };
 
-void walk_tree(const fs::path& root, ManifestLayout layout, std::map<std::string, Found>& out,
+void walk_tree(const StoreAnchor& a, ManifestLayout layout, std::map<std::string, Found>& out,
                std::vector<std::string>& notes) {
     const char* tree = layout == ManifestLayout::v2 ? "manifests-v2" : "manifests";
-    if (!tree_is_safe(root, tree, &notes)) return;
+    if (!tree_is_safe(a, tree, &notes)) return;
     auto skip_link = [&](const std::string& rel) { note(notes, "skipped " + printable(rel) + ": a link or reparse point"); };
-    for (const auto& host_e : list_rel(root, tree, &notes)) {
+    for (const auto& host_e : list_rel(a, tree, &notes)) {
         const std::string host_rel = std::string(tree) + "/" + host_e.name;
         if (host_e.kind == EntryKind::link) {
             skip_link(host_rel);
@@ -1296,21 +1399,21 @@ void walk_tree(const fs::path& root, ManifestLayout layout, std::map<std::string
         }
         if (host_e.kind != EntryKind::directory) continue;
         const std::string host = layout == ManifestLayout::v2 ? decode_v2_host(host_e.name) : host_e.name;
-        for (const auto& ns_e : list_rel(root, host_rel, &notes)) {
+        for (const auto& ns_e : list_rel(a, host_rel, &notes)) {
             const std::string ns_rel = host_rel + "/" + ns_e.name;
             if (ns_e.kind == EntryKind::link) {
                 skip_link(ns_rel);
                 continue;
             }
             if (ns_e.kind != EntryKind::directory) continue;
-            for (const auto& model_e : list_rel(root, ns_rel, &notes)) {
+            for (const auto& model_e : list_rel(a, ns_rel, &notes)) {
                 const std::string model_rel = ns_rel + "/" + model_e.name;
                 if (model_e.kind == EntryKind::link) {
                     skip_link(model_rel);
                     continue;
                 }
                 if (model_e.kind != EntryKind::directory) continue;
-                for (const auto& tag_e : list_rel(root, model_rel, &notes)) {
+                for (const auto& tag_e : list_rel(a, model_rel, &notes)) {
                     const std::string tag_rel = model_rel + "/" + tag_e.name;
                     if (tag_e.kind == EntryKind::directory) continue;
                     if (tag_e.kind == EntryKind::other) {
@@ -1347,24 +1450,24 @@ bool under_root(const fs::path& root, const fs::path& candidate) {
 // then the matching namespace/model/tag). It reads nothing besides directory entries, so a
 // miss costs a handful of listings instead of a full scan. Layout order and the first-match
 // rule are the same as scan(), so both pick the same entry. Links are skipped as in scan().
-std::optional<Found> locate_ci(const fs::path& root, const OllamaName& want) {
+std::optional<Found> locate_ci(const StoreAnchor& a, const OllamaName& want) {
     const std::string want_host = canonical_host(want.host);
     const std::string want_ns = lower(want.ns), want_model = lower(want.model), want_tag = lower(want.tag);
     for (const ManifestLayout layout : {ManifestLayout::v2, ManifestLayout::legacy}) {
         const char* tree = layout == ManifestLayout::v2 ? "manifests-v2" : "manifests";
-        if (!tree_is_safe(root, tree, nullptr)) continue;
-        for (const auto& host_e : list_rel(root, tree, nullptr)) {
+        if (!tree_is_safe(a, tree, nullptr)) continue;
+        for (const auto& host_e : list_rel(a, tree, nullptr)) {
             if (host_e.kind != EntryKind::directory) continue;
             const std::string host = layout == ManifestLayout::v2 ? decode_v2_host(host_e.name) : host_e.name;
             if (canonical_host(host) != want_host) continue;
             const std::string host_rel = std::string(tree) + "/" + host_e.name;
-            for (const auto& ns_e : list_rel(root, host_rel, nullptr)) {
+            for (const auto& ns_e : list_rel(a, host_rel, nullptr)) {
                 if (ns_e.kind != EntryKind::directory || lower(ns_e.name) != want_ns) continue;
                 const std::string ns_rel = host_rel + "/" + ns_e.name;
-                for (const auto& model_e : list_rel(root, ns_rel, nullptr)) {
+                for (const auto& model_e : list_rel(a, ns_rel, nullptr)) {
                     if (model_e.kind != EntryKind::directory || lower(model_e.name) != want_model) continue;
                     const std::string model_rel = ns_rel + "/" + model_e.name;
-                    for (const auto& tag_e : list_rel(root, model_rel, nullptr)) {
+                    for (const auto& tag_e : list_rel(a, model_rel, nullptr)) {
                         if ((tag_e.kind != EntryKind::file && tag_e.kind != EntryKind::link) ||
                             lower(tag_e.name) != want_tag) {
                             continue;
@@ -1384,39 +1487,171 @@ std::optional<Found> locate_ci(const fs::path& root, const OllamaName& want) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Verified-blob cache (first_use)
+// Verified-blob cache (first_use), single-flight hashing and the hash-slot limit
 // ---------------------------------------------------------------------------
+// Shared by copies of one OllamaStore. Every member is guarded by `mutex`; no hash and no
+// file I/O ever runs while it is held (lookup() only waits on `cv`, which releases it).
 struct OllamaStore::VerifiedCache {
-    using Key = std::tuple<std::uint64_t, std::uint64_t, std::uint64_t, std::int64_t, std::int64_t>;
+    using Key = std::tuple<std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::int64_t,
+                           std::int64_t>;
 
-    static Key key_of(const FileStamp& s) { return Key{s.volume, s.file_id, s.size, s.write_time, s.change_time}; }
-
-    // The SHA-256 a file with this identity hashed to, if known.
-    std::optional<std::string> find(const FileStamp& s) {
-        std::lock_guard<std::mutex> lock(mutex);
-        const auto it = entries.find(key_of(s));
-        if (it == entries.end()) return std::nullopt;
-        return it->second;
+    static Key key_of(const FileStamp& s) {
+        return Key{s.volume, s.file_id, s.file_id_high, s.size, s.link_count, s.write_time, s.change_time};
     }
 
-    void store(const FileStamp& s, std::string hex) {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (entries.size() >= kMaxVerifiedEntries) entries.clear();
-        entries[key_of(s)] = std::move(hex);
+    // One in-progress hash of one identity. `hex` is nullopt when the hasher failed.
+    struct Flight {
+        bool done = false;
+        std::optional<std::string> hex;
+    };
+
+    // Either a known digest for this identity, or `flight` set: the caller is now the one
+    // thread hashing this identity and must end the flight with finish().
+    struct Lookup {
+        std::optional<std::string> hex;
+        std::shared_ptr<Flight> flight;
+    };
+
+    // Concurrent callers for one identity: the first becomes the hasher, the others wait for
+    // its result (and retry, one of them becoming the hasher, if it failed).
+    Lookup lookup(const FileStamp& s) {
+        const Key k = key_of(s);
+        std::unique_lock<std::mutex> lock(mutex);
+        while (true) {
+            if (const auto it = entries.find(k); it != entries.end()) return Lookup{it->second, nullptr};
+            const auto f = inflight.find(k);
+            if (f == inflight.end()) {
+                auto flight = std::make_shared<Flight>();
+                inflight.emplace(k, flight);
+                return Lookup{std::nullopt, std::move(flight)};
+            }
+            const std::shared_ptr<Flight> other = f->second;
+            cv.wait(lock, [&] { return other->done; });
+            if (other->hex) return Lookup{other->hex, nullptr};
+        }
+    }
+
+    // Ends a flight from lookup(): a digest is cached and handed to the waiters; nullopt
+    // (failure) only wakes them.
+    void finish(const FileStamp& s, const std::shared_ptr<Flight>& flight, std::optional<std::string> hex) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            const Key k = key_of(s);
+            if (hex) {
+                if (entries.size() >= kMaxVerifiedEntries) entries.clear();
+                entries[k] = *hex;
+            }
+            if (const auto it = inflight.find(k); it != inflight.end() && it->second == flight) inflight.erase(it);
+            flight->hex = std::move(hex);
+            flight->done = true;
+        }
+        cv.notify_all();
+    }
+
+    // At most kMaxConcurrentWeightHashes weight hashes run at once per store.
+    void acquire_hash_slot() {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [&] { return hashing < kMaxConcurrentWeightHashes; });
+        ++hashing;
+    }
+
+    void release_hash_slot() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            --hashing;
+        }
+        cv.notify_all();
     }
 
     std::mutex mutex;
+    std::condition_variable cv;
     std::map<Key, std::string> entries;
+    std::map<Key, std::shared_ptr<Flight>> inflight;
+    std::size_t hashing = 0;
+};
+
+// Owns the open weight handles of a VerifiedWeights (model_store.hpp).
+struct VerifiedWeights::Handles {
+    std::vector<sf::OwnedFileHandle> owned;
+};
+
+// The store's write access to VerifiedWeights' private members.
+struct VerifiedWeightsAccess {
+    static void clear(VerifiedWeights& w) {
+        w.files_.clear();
+        if (w.handles_) w.handles_->owned.clear();
+        w.verified_ = false;
+    }
+    static void add(VerifiedWeights& w, const BlobRef& blob, sf::OwnedFileHandle handle) {
+        if (!w.handles_) w.handles_ = std::make_unique<VerifiedWeights::Handles>();
+        VerifiedWeights::File f;
+        f.blob = blob;
+        f.native_handle = handle.native_value();
+        w.handles_->owned.push_back(std::move(handle));
+        w.files_.push_back(std::move(f));
+    }
+    static void set_verified(VerifiedWeights& w, bool v) { w.verified_ = v; }
 };
 
 namespace {
 
-// Verifies every weight blob of a ready record per the policy, from a fresh anchored handle
-// whose identity must equal the stamp taken while the record was read.
-void verify_weights_for_use(const fs::path& root, ModelRecord& r, const StoreOptions& options,
-                            OllamaStore::VerifiedCache* cache, bool use_cache) {
+// Holds one of the store's hash slots for its lifetime.
+class HashSlot {
+public:
+    explicit HashSlot(OllamaStore::VerifiedCache* cache) : cache_(cache) {
+        if (cache_ != nullptr) cache_->acquire_hash_slot();
+    }
+    ~HashSlot() {
+        if (cache_ != nullptr) cache_->release_hash_slot();
+    }
+    HashSlot(const HashSlot&) = delete;
+    HashSlot& operator=(const HashSlot&) = delete;
+
+private:
+    OllamaStore::VerifiedCache* cache_;
+};
+
+// Ends a single-flight hash exactly once: complete() publishes the digest; leaving the scope
+// without it (an error, an exception from on_weight_hash) wakes the waiters with a failure.
+class FlightGuard {
+public:
+    FlightGuard(OllamaStore::VerifiedCache* cache, const FileStamp& stamp,
+                std::shared_ptr<OllamaStore::VerifiedCache::Flight> flight)
+        : cache_(cache), stamp_(stamp), flight_(std::move(flight)) {}
+    ~FlightGuard() {
+        if (flight_ && cache_ != nullptr) cache_->finish(stamp_, flight_, std::nullopt);
+    }
+    FlightGuard(const FlightGuard&) = delete;
+    FlightGuard& operator=(const FlightGuard&) = delete;
+    void complete(const std::string& hex) {
+        if (flight_ && cache_ != nullptr) cache_->finish(stamp_, flight_, hex);
+        flight_.reset();
+    }
+
+private:
+    OllamaStore::VerifiedCache* cache_;
+    FileStamp stamp_;
+    std::shared_ptr<OllamaStore::VerifiedCache::Flight> flight_;
+};
+
+// Verifies every weight blob of a ready record per the policy. Each blob is opened afresh
+// relative to the pinned root, with writers denied (Windows) for as long as the handle is
+// open, and its identity must equal the stamp taken while the record was read. Under
+// first_use a cache hit is accepted only if the identity read from this same handle after
+// the lookup still equals that stamp; concurrent first uses share one hash. With `keep`,
+// the handles are moved into it (also under `off`, unhashed) for a loader; on any failure it
+// is left empty.
+void verify_weights_for_use(const StoreAnchor& a, ModelRecord& r, const StoreOptions& options,
+                            OllamaStore::VerifiedCache* cache, bool use_cache, VerifiedWeights* keep) {
     r.weights_verified = false;
-    if (!r.ready() || options.verify_weights == WeightVerification::off) return;
+    if (keep != nullptr) VerifiedWeightsAccess::clear(*keep);
+    if (!r.ready()) return;
+    const bool hash = options.verify_weights != WeightVerification::off;
+    if (!hash && keep == nullptr) return;
+    auto fail = [&](UnsupportedReason reason, std::string text) {
+        mark(r, reason, std::move(text));
+        if (keep != nullptr) VerifiedWeightsAccess::clear(*keep);
+    };
     std::vector<char> buf;
     std::set<std::string> done;
     for (const auto& b : r.blobs) {
@@ -1426,78 +1661,113 @@ void verify_weights_for_use(const fs::path& root, ModelRecord& r, const StoreOpt
         sf::OwnedFileHandle h;
         sf::FileIdentity id;
         std::string err;
-        const sf::OpenOutcome o = sf::open_anchored_file(root, blob_rel(hex), h, id, err);
+        bool busy = false;
+        const sf::OpenOutcome o =
+            sf::open_anchored_file(a.dir, blob_rel(hex), sf::ShareMode::deny_writers, h, id, err, &busy);
         if (o != sf::OpenOutcome::ok) {
-            mark(r, o == sf::OpenOutcome::unsafe ? UnsupportedReason::unsafe_path : UnsupportedReason::missing_blob,
-                 label + " " + (o == sf::OpenOutcome::missing ? std::string("is not in blobs/") : open_failure_text(o)));
+            if (busy) {
+                fail(UnsupportedReason::blob_busy,
+                     label + " is open for writing by another process; it is not hashed or served until that ends");
+            } else {
+                fail(o == sf::OpenOutcome::unsafe ? UnsupportedReason::unsafe_path : UnsupportedReason::missing_blob,
+                     label + " " +
+                         (o == sf::OpenOutcome::missing ? std::string("is not in blobs/") : open_failure_text(o)));
+            }
             return;
         }
         const FileStamp stamp = to_stamp(id);
         if (!b.stamp || *b.stamp != stamp) {
-            mark(r, UnsupportedReason::blob_size_mismatch, label + " changed while the model was being resolved");
+            fail(UnsupportedReason::blob_size_mismatch, label + " changed while the model was being resolved");
             return;
         }
-        std::optional<std::string> actual;
-        if (use_cache && cache != nullptr) actual = cache->find(stamp);
-        if (!actual) {
-            if (options.on_weight_hash) options.on_weight_hash(b);
-            if (buf.empty()) buf.resize(kHashBufferBytes);
-            std::string got;
-            std::uint64_t bytes = 0;
-            if (!hash_handle(h, buf, got, bytes, err, {})) {
-                mark(r, UnsupportedReason::missing_blob, label + " cannot be read: " + printable(err));
+        if (hash) {
+            std::optional<std::string> actual;
+            std::shared_ptr<OllamaStore::VerifiedCache::Flight> flight;
+            if (use_cache && cache != nullptr) {
+                OllamaStore::VerifiedCache::Lookup found = cache->lookup(stamp);
+                if (found.hex) {
+                    // The cached digest is for `stamp`; it applies to this handle only if the
+                    // identity read from it now, after the lookup, is still exactly that.
+                    sf::FileIdentity now;
+                    if (sf::query_identity(h, now, err) && to_stamp(now) == stamp) actual = std::move(found.hex);
+                } else {
+                    flight = std::move(found.flight);
+                }
+            }
+            if (!actual) {
+                FlightGuard guard(cache, stamp, std::move(flight));
+                std::string got;
+                std::uint64_t bytes = 0;
+                bool read_ok = false;
+                {
+                    HashSlot slot(cache);
+                    if (options.on_weight_hash) options.on_weight_hash(b);
+                    if (buf.empty()) buf.resize(kHashBufferBytes);
+                    read_ok = hash_handle(h, buf, got, bytes, err, {});
+                }
+                if (!read_ok) {
+                    fail(UnsupportedReason::missing_blob, label + " cannot be read: " + printable(err));
+                    return;
+                }
+                sf::FileIdentity after;
+                if (bytes != id.size || !sf::query_identity(h, after, err) || to_stamp(after) != stamp) {
+                    fail(UnsupportedReason::blob_size_mismatch, label + " changed while it was hashed");
+                    return;
+                }
+                guard.complete(got);
+                actual = std::move(got);
+            }
+            if (*actual != hex) {
+                fail(UnsupportedReason::digest_mismatch, label + " does not hash to its digest");
                 return;
             }
-            sf::FileIdentity after;
-            if (bytes != id.size || !sf::query_identity(h, after, err) || to_stamp(after) != stamp) {
-                mark(r, UnsupportedReason::blob_size_mismatch, label + " changed while it was hashed");
-                return;
-            }
-            if (cache != nullptr) cache->store(stamp, got);
-            actual = std::move(got);
         }
-        if (*actual != hex) {
-            mark(r, UnsupportedReason::digest_mismatch, label + " does not hash to its digest");
-            return;
-        }
+        if (keep != nullptr) VerifiedWeightsAccess::add(*keep, b, std::move(h));
     }
-    r.weights_verified = r.ready();
+    r.weights_verified = hash && r.ready();
+    if (keep != nullptr) VerifiedWeightsAccess::set_verified(*keep, r.weights_verified);
 }
 
-// True when every file the record was built from still has the identity it had then.
-bool sources_unchanged(const ModelRecord& r) {
+bool is_needed_role(BlobRole role) {
+    return is_weight_role(role) || role == BlobRole::config || role == BlobRole::tmpl || role == BlobRole::system ||
+           role == BlobRole::params || role == BlobRole::messages;
+}
+
+// True when every file the record was built from still has the identity it had then. A blob
+// the record never opened makes a ready record stale when it is one the record needs; for an
+// unsupported record (`unopened_must_be_absent`) every such blob must still be absent, since
+// one that appeared (a finished download, a repair) can change the outcome.
+bool sources_unchanged(const StoreAnchor& a, const ModelRecord& r, bool unopened_must_be_absent) {
     for (const auto& s : r.sources) {
         std::string err;
         if (s.link) {
             std::string target;
-            sf::FileIdentity link_id, target_id;
-            if (!sf::read_anchored_leaf_symlink(r.store_root, s.rel, target, link_id, target_id, err) ||
-                to_stamp(link_id) != s.stamp) {
+            sf::FileIdentity link_id;
+            if (!sf::read_anchored_leaf_symlink(a.dir, s.rel, target, link_id, err) || to_stamp(link_id) != s.stamp) {
                 return false;
             }
             continue;
         }
         sf::OwnedFileHandle h;
         sf::FileIdentity id;
-        if (sf::open_anchored_file(r.store_root, s.rel, h, id, err) != sf::OpenOutcome::ok || to_stamp(id) != s.stamp) {
+        if (sf::open_anchored_file(a.dir, s.rel, sf::ShareMode::allow_writers, h, id, err) != sf::OpenOutcome::ok ||
+            to_stamp(id) != s.stamp) {
             return false;
         }
     }
     for (const auto& b : r.blobs) {
-        if (!b.stamp) {
-            if (is_weight_role(b.role) || b.role == BlobRole::config || b.role == BlobRole::tmpl ||
-                b.role == BlobRole::system || b.role == BlobRole::params || b.role == BlobRole::messages) {
-                return false;  // a blob a ready record needs was never opened
-            }
-            continue;
-        }
+        if (!b.stamp && !unopened_must_be_absent && !is_needed_role(b.role)) continue;
+        if (!b.stamp && !unopened_must_be_absent) return false;  // a blob a ready record needs was never opened
         sf::OwnedFileHandle h;
         sf::FileIdentity id;
         std::string err;
-        if (sf::open_anchored_file(r.store_root, blob_rel(b.digest.substr(7)), h, id, err) != sf::OpenOutcome::ok ||
-            to_stamp(id) != *b.stamp) {
-            return false;
+        const sf::OpenOutcome o =
+            sf::open_anchored_file(a.dir, blob_rel(b.digest.substr(7)), sf::ShareMode::allow_writers, h, id, err);
+        if (!b.stamp) {
+            if (o != sf::OpenOutcome::missing) return false;  // it appeared (or is now refused)
+            continue;
         }
+        if (o != sf::OpenOutcome::ok || to_stamp(id) != *b.stamp) return false;
     }
     return true;
 }
@@ -1528,6 +1798,10 @@ Result<OllamaName> parse_ollama_name(std::string_view text) {
         return Status(ErrorCode::invalid_argument, "invalid model name '" + printable(text) + "': " + why);
     };
     if (text.empty()) return bad("empty");
+    // No part is copied out of a name that cannot be valid (kMaxOllamaNameBytes).
+    if (text.size() > kMaxOllamaNameBytes) {
+        return bad("longer than " + std::to_string(kMaxOllamaNameBytes) + " bytes");
+    }
     std::string_view s = text;
     OllamaName n;
     // A separator promises a part: "x:" and "/x" are errors, not defaults (name.go cutPromised).
@@ -1581,6 +1855,7 @@ const char* to_string(UnsupportedReason reason) noexcept {
         case UnsupportedReason::invalid_gguf: return "invalid_gguf";
         case UnsupportedReason::unsafe_path: return "unsafe_path";
         case UnsupportedReason::digest_mismatch: return "digest_mismatch";
+        case UnsupportedReason::blob_busy: return "blob_busy";
     }
     return "none";
 }
@@ -1652,40 +1927,67 @@ Result<GgufHeader> read_gguf_header(const fs::path& file) {
 // ---------------------------------------------------------------------------
 // OllamaStore
 // ---------------------------------------------------------------------------
-OllamaStore::OllamaStore(fs::path root, StoreOptions options)
-    : root_(std::move(root)), options_(std::move(options)), cache_(std::make_shared<VerifiedCache>()) {}
+OllamaStore::OllamaStore(fs::path root, std::shared_ptr<const StoreAnchor> anchor, StoreOptions options)
+    : root_(std::move(root)),
+      anchor_(std::move(anchor)),
+      options_(std::move(options)),
+      cache_(std::make_shared<VerifiedCache>()) {}
 
 Result<OllamaStore> OllamaStore::open(fs::path models_dir, StoreOptions options) {
-    std::error_code ec;
-    if (models_dir.empty() || !fs::is_directory(models_dir, ec) || ec) {
+    if (models_dir.empty()) return Status(ErrorCode::not_found, "the models directory is not a directory");
+    auto anchor = std::make_shared<StoreAnchor>();
+    std::string err;
+    // The one path-based open: a link at the root itself is followed here, once.
+    if (sf::open_anchor_dir(models_dir, anchor->dir, anchor->id, err) != sf::OpenOutcome::ok) {
         return Status(ErrorCode::not_found, "the models directory is not a directory");
     }
-    const bool v2 = fs::is_directory(models_dir / "manifests-v2", ec);
-    const bool legacy = fs::is_directory(models_dir / "manifests", ec);
+    // A tree that is a link counts as present: the scan then notes and skips it.
+    auto present = [&](const char* tree) {
+        const sf::OpenOutcome o = sf::probe_anchored_dir(anchor->dir, tree, err);
+        return o == sf::OpenOutcome::ok || o == sf::OpenOutcome::unsafe;
+    };
+    const bool v2 = present("manifests-v2");
+    const bool legacy = present("manifests");
     if (!v2 && !legacy) {
         return Status(ErrorCode::invalid_argument,
                       "the directory has neither manifests-v2/ nor manifests/ (not an Ollama models directory)");
     }
-    return OllamaStore(fs::absolute(models_dir, ec), std::move(options));
+    std::error_code ec;
+    fs::path root = fs::absolute(models_dir, ec);
+    if (ec) root = models_dir;
+    anchor->path = root;
+    return OllamaStore(std::move(root), std::move(anchor), std::move(options));
 }
 
 ScanResult OllamaStore::scan() const {
     std::map<std::string, Found> found;
     ScanResult result;
-    walk_tree(root_, ManifestLayout::v2, found, result.notes);
-    walk_tree(root_, ManifestLayout::legacy, found, result.notes);
+    walk_tree(*anchor_, ManifestLayout::v2, found, result.notes);
+    walk_tree(*anchor_, ManifestLayout::legacy, found, result.notes);
     result.records.reserve(found.size());
     for (auto& [key, f] : found) {
-        ModelRecord rec = build_record(root_, f.name, f.rel, f.layout, read_manifest(root_, f.rel));
+        ModelRecord rec = build_record(anchor_, f.name, f.rel, f.layout, read_manifest(*anchor_, f.rel, f.layout));
         if (options_.verify_weights == WeightVerification::always) {
-            verify_weights_for_use(root_, rec, options_, cache_.get(), false);
+            verify_weights_for_use(*anchor_, rec, options_, cache_.get(), false, nullptr);
         }
         result.records.push_back(std::move(rec));
     }
     return result;
 }
 
-Result<ModelRecord> OllamaStore::resolve(std::string_view name) const {
+Result<ModelRecord> OllamaStore::resolve(std::string_view name) const { return resolve_impl(name, nullptr); }
+
+Result<LoadableModel> OllamaStore::resolve_for_load(std::string_view name) const {
+    VerifiedWeights weights;
+    auto rec = resolve_impl(name, &weights);
+    if (!rec.ok()) return rec.status();
+    LoadableModel out;
+    out.record = std::move(rec).value();
+    if (out.record.ready()) out.weights = std::move(weights);
+    return out;
+}
+
+Result<ModelRecord> OllamaStore::resolve_impl(std::string_view name, VerifiedWeights* keep) const {
     auto parsed = parse_ollama_name(name);
     if (!parsed.ok()) return parsed.status();
     const OllamaName n = parsed.value();
@@ -1709,20 +2011,20 @@ Result<ModelRecord> OllamaStore::resolve(std::string_view name) const {
     }
     const bool use_cache = options_.verify_weights == WeightVerification::first_use;
     auto finish = [&](const OllamaName& rec_name, const std::string& rel, ManifestLayout layout, ManifestText&& mt) {
-        ModelRecord rec = build_record(root_, rec_name, rel, layout, std::move(mt));
-        verify_weights_for_use(root_, rec, options_, cache_.get(), use_cache);
+        ModelRecord rec = build_record(anchor_, rec_name, rel, layout, std::move(mt));
+        verify_weights_for_use(*anchor_, rec, options_, cache_.get(), use_cache, keep);
         return rec;
     };
     for (const auto& [rel, layout] : candidates) {
         if (!under_root(root_, root_ / from_utf8(rel))) continue;
-        ManifestText mt = read_manifest(root_, rel);
+        ManifestText mt = read_manifest(*anchor_, rel, layout);
         if (mt.outcome == sf::OpenOutcome::missing && mt.reason == UnsupportedReason::none) continue;
         return finish(n, rel, layout, std::move(mt));
     }
     // Case-insensitive fallback on case-sensitive file systems: list the matching directories
     // only (no manifest, config or GGUF reads except for the one entry that matches).
-    if (auto found = locate_ci(root_, n)) {
-        ManifestText mt = read_manifest(root_, found->rel);
+    if (auto found = locate_ci(*anchor_, n)) {
+        ManifestText mt = read_manifest(*anchor_, found->rel, found->layout);
         if (!(mt.outcome == sf::OpenOutcome::missing && mt.reason == UnsupportedReason::none)) {
             return finish(found->name, found->rel, found->layout, std::move(mt));
         }
@@ -1730,11 +2032,51 @@ Result<ModelRecord> OllamaStore::resolve(std::string_view name) const {
     return Status(ErrorCode::not_found, "model '" + n.display() + "' is not in the store");
 }
 
-bool OllamaStore::revalidate(ModelRecord& record) const {
-    if (record.store_root != root_ || !sources_unchanged(record)) return false;
-    verify_weights_for_use(root_, record, options_, cache_.get(),
-                           options_.verify_weights == WeightVerification::first_use);
+bool OllamaStore::revalidate(ModelRecord& record) const { return revalidate_impl(record, nullptr); }
+
+bool OllamaStore::revalidate_impl(ModelRecord& record, VerifiedWeights* keep) const {
+    // Only a record read through this very root handle (copies of this store share it).
+    if (record.anchor.get() != anchor_.get() || !sources_unchanged(*anchor_, record, false)) return false;
+    verify_weights_for_use(*anchor_, record, options_, cache_.get(),
+                           options_.verify_weights == WeightVerification::first_use, keep);
     return true;
+}
+
+bool OllamaStore::unsupported_still_current(const ModelRecord& record) const {
+    if (record.ready() || record.anchor.get() != anchor_.get()) return false;
+    if (record.reason == UnsupportedReason::blob_busy) return false;  // ends when the writer closes the file
+    return sources_unchanged(*anchor_, record, true);
+}
+
+// ---------------------------------------------------------------------------
+// VerifiedWeights
+// ---------------------------------------------------------------------------
+VerifiedWeights::VerifiedWeights() noexcept = default;
+
+VerifiedWeights::~VerifiedWeights() = default;
+
+VerifiedWeights::VerifiedWeights(VerifiedWeights&& other) noexcept
+    : files_(std::move(other.files_)), handles_(std::move(other.handles_)), verified_(other.verified_) {
+    other.files_.clear();
+    other.verified_ = false;
+}
+
+VerifiedWeights& VerifiedWeights::operator=(VerifiedWeights&& other) noexcept {
+    if (this != &other) {
+        files_ = std::move(other.files_);
+        handles_ = std::move(other.handles_);
+        verified_ = other.verified_;
+        other.files_.clear();
+        other.verified_ = false;
+    }
+    return *this;
+}
+
+const VerifiedWeights::File* VerifiedWeights::find(std::string_view digest) const noexcept {
+    for (const auto& f : files_) {
+        if (f.blob.digest == digest) return &f;
+    }
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -1746,6 +2088,16 @@ bool VerifyReport::ok() const {
 
 VerifyReport verify_blobs(const ModelRecord& record, const VerifyOptions& options) {
     VerifyReport report;
+    // The record's pinned root; a hand-built record without one opens store_root once here.
+    std::shared_ptr<const StoreAnchor> root = record.anchor;
+    if (!root) {
+        auto own = std::make_shared<StoreAnchor>();
+        std::string err;
+        if (sf::open_anchor_dir(record.store_root, own->dir, own->id, err) == sf::OpenOutcome::ok) {
+            own->path = record.store_root;
+            root = std::move(own);
+        }
+    }
     std::vector<char> buf;
     std::set<std::string> seen;
     for (const auto& blob : record.blobs) {
@@ -1766,10 +2118,17 @@ VerifyReport verify_blobs(const ModelRecord& record, const VerifyOptions& option
             report.blobs.push_back(std::move(v));
             continue;
         }
+        if (!root) {
+            v.verdict = BlobVerdict::io_error;
+            v.detail = "the store directory cannot be opened";
+            report.blobs.push_back(std::move(v));
+            continue;
+        }
         sf::OwnedFileHandle h;
         sf::FileIdentity id;
         std::string error;
-        const sf::OpenOutcome o = sf::open_anchored_file(record.store_root, blob_rel(*hex), h, id, error);
+        const sf::OpenOutcome o =
+            sf::open_anchored_file(root->dir, blob_rel(*hex), sf::ShareMode::allow_writers, h, id, error);
         if (o != sf::OpenOutcome::ok) {
             v.verdict = o == sf::OpenOutcome::missing ? BlobVerdict::missing
                         : o == sf::OpenOutcome::unsafe ? BlobVerdict::unsafe
@@ -1939,10 +2298,10 @@ fs::path default_ollama_models_dir() {
 Status ModelRegistry::add_ollama_dir(fs::path models_dir) {
     auto store = OllamaStore::open(std::move(models_dir), options_);
     if (!store.ok()) return store.status();
+    // The same directory: compared by the identity of the pinned root handles, not by path.
     auto registered = [&] {
         for (const auto& s : stores_) {
-            std::error_code ec;
-            if (fs::equivalent(s.root(), store.value().root(), ec) && !ec) return true;
+            if (s.anchor_->id.same_file(store.value().anchor_->id)) return true;
         }
         return false;
     };
@@ -1989,7 +2348,19 @@ std::vector<ModelRecord> ModelRegistry::list() const {
     return records_;
 }
 
-Result<ModelRecord> ModelRegistry::resolve(std::string_view name) const {
+Result<ModelRecord> ModelRegistry::resolve(std::string_view name) const { return resolve_impl(name, nullptr); }
+
+Result<LoadableModel> ModelRegistry::resolve_for_load(std::string_view name) const {
+    VerifiedWeights weights;
+    auto rec = resolve_impl(name, &weights);
+    if (!rec.ok()) return rec.status();
+    LoadableModel out;
+    out.record = std::move(rec).value();
+    out.weights = std::move(weights);
+    return out;
+}
+
+Result<ModelRecord> ModelRegistry::resolve_impl(std::string_view name, VerifiedWeights* keep) const {
     auto parsed = parse_ollama_name(name);
     if (!parsed.ok()) return parsed.status();
     const std::string key = parsed.value().key();
@@ -2016,8 +2387,8 @@ Result<ModelRecord> ModelRegistry::resolve(std::string_view name) const {
         }
         stores = stores_;
     }
-    // Store this result in the caches: a scan entry is replaced (so a broken model is not
-    // re-resolved on every request), a live entry only kept while it is ready.
+    // Store this result in the caches: a scan entry is replaced (an unsupported one is then
+    // re-checked on every lookup, see below), a live entry only kept while it is ready.
     auto remember = [&](const ModelRecord& rec, bool replace_scan) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (replace_scan) {
@@ -2034,12 +2405,17 @@ Result<ModelRecord> ModelRegistry::resolve(std::string_view name) const {
         live_.emplace(key, rec);
     };
     if (cached) {
-        if (!cached->ready()) return check(*cached);
         for (const auto& store : stores) {
-            if (store.root() != cached->store_root) continue;
+            if (store.anchor_.get() != cached->anchor.get()) continue;
+            // Disk reads (and possibly a weight hash) below run without the registry lock.
+            if (!cached->ready()) {
+                // An unsupported reason is served again only while it still holds: the files it
+                // was read from are unchanged and the blobs it could not open are still absent.
+                if (store.unsupported_still_current(*cached)) return check(*cached);
+                break;  // something changed (a repair, a finished pull): resolve it again below
+            }
             ModelRecord rec = *cached;
-            // Revalidation reads the disk (and may hash weights): no lock held.
-            if (store.revalidate(rec)) {
+            if (store.revalidate_impl(rec, keep)) {
                 if (!rec.ready()) remember(rec, from_scan);
                 return check(rec);
             }
@@ -2048,7 +2424,7 @@ Result<ModelRecord> ModelRegistry::resolve(std::string_view name) const {
     }
     // Live lookup without the lock: it reads the disk (manifest and blob headers).
     for (const auto& store : stores) {
-        auto live = store.resolve(name);
+        auto live = store.resolve_impl(name, keep);
         if (!live.ok()) continue;
         remember(live.value(), from_scan);
         return check(live.value());

@@ -1,11 +1,12 @@
-// POSIX handle-anchored (openat + O_NOFOLLOW) regular-file open and symlink checks
-// (src/common/safe_file.hpp). Moved here from src/artifacts/src/weight_manifest_io_posix.cpp
-// so the weight manifests and the Ollama model store share one implementation.
+// POSIX handle-anchored (openat + O_NOFOLLOW) regular-file opens, directory listing and
+// symlink checks (src/common/safe_file.hpp). Shared by the weight manifests and the Ollama
+// model store.
 #include "common/safe_file.hpp"
 
 #include <cerrno>
 #include <climits>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <string>
 #include <sys/stat.h>
@@ -31,6 +32,21 @@ bool unsafe_segment(std::string_view seg) {
     return seg.find('\0') != std::string_view::npos;
 }
 
+// Splits `rel` into segments; false when any segment is unsafe.
+bool split_rel(std::string_view rel, std::vector<std::string>& out) {
+    out.clear();
+    std::size_t pos = 0;
+    while (pos <= rel.size()) {
+        std::size_t next = rel.find('/', pos);
+        if (next == std::string_view::npos) next = rel.size();
+        const std::string_view seg = rel.substr(pos, next - pos);
+        if (unsafe_segment(seg)) return false;
+        out.emplace_back(seg);
+        pos = next + 1;
+    }
+    return true;
+}
+
 std::int64_t ticks(const struct timespec& ts) {
     return static_cast<std::int64_t>(ts.tv_sec) * 1000000000LL + static_cast<std::int64_t>(ts.tv_nsec);
 }
@@ -38,6 +54,7 @@ std::int64_t ticks(const struct timespec& ts) {
 void fill_identity(const struct stat& st, FileIdentity& out) {
     out.volume = static_cast<std::uint64_t>(st.st_dev);
     out.file_id = static_cast<std::uint64_t>(st.st_ino);
+    out.file_id_high = 0;
     out.size = st.st_size < 0 ? 0u : static_cast<std::uint64_t>(st.st_size);
     out.link_count = static_cast<std::uint64_t>(st.st_nlink);
 #if defined(__APPLE__)
@@ -49,29 +66,16 @@ void fill_identity(const struct stat& st, FileIdentity& out) {
 #endif
 }
 
-// Opens every directory of `rel` but the last segment under `root` without following links.
-// On success `dir` is the leaf's parent and `leaf` its name.
-OpenOutcome open_parent_dirs(const fs::path& root, std::string_view rel, OwnedFileHandle& dir, std::string& leaf,
-                             std::string& err_msg) {
-    OwnedFileHandle cur = make_owned(::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-    if (!cur.valid()) {
-        err_msg = std::strerror(errno);
-        return OpenOutcome::io_error;
-    }
-    std::size_t pos = 0;
-    while (pos <= rel.size()) {
-        std::size_t next = rel.find('/', pos);
-        if (next == std::string_view::npos) next = rel.size();
-        const std::string_view seg_text = rel.substr(pos, next - pos);
-        if (unsafe_segment(seg_text)) return OpenOutcome::unsafe;
-        const std::string seg(seg_text);
-        if (next >= rel.size()) {
-            leaf = seg;
-            dir = std::move(cur);
-            return OpenOutcome::ok;
-        }
+// Opens segs[0, count) as directories relative to `anchor` without following links. On ok
+// `owned` holds the last directory opened (invalid when count == 0) and `dirfd` is the fd to
+// continue from (the anchor when count == 0; never closed here).
+OpenOutcome open_dirs(int anchor, const std::vector<std::string>& segs, std::size_t count, OwnedFileHandle& owned,
+                      int& dirfd, std::string& err_msg) {
+    owned.reset();
+    dirfd = anchor;
+    for (std::size_t i = 0; i < count; ++i) {
         OwnedFileHandle child =
-            make_owned(::openat(to_fd(cur.native_value()), seg.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+            make_owned(::openat(dirfd, segs[i].c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
         if (!child.valid()) {
             const int err = errno;
             if (err == ENOENT) return OpenOutcome::missing;
@@ -79,10 +83,10 @@ OpenOutcome open_parent_dirs(const fs::path& root, std::string_view rel, OwnedFi
             err_msg = std::strerror(err);
             return OpenOutcome::io_error;
         }
-        cur = std::move(child);
-        pos = next + 1;
+        owned = std::move(child);
+        dirfd = to_fd(owned.native_value());
     }
-    return OpenOutcome::missing;
+    return OpenOutcome::ok;
 }
 
 }  // namespace
@@ -117,19 +121,54 @@ void OwnedFileHandle::assign_native(std::intptr_t raw) noexcept {
     handle_ = raw;
 }
 
+std::intptr_t OwnedFileHandle::release() noexcept {
+    const std::intptr_t raw = handle_;
+    handle_ = -1;
+    return raw;
+}
+
 bool is_link_like(const fs::path& p, const fs::file_status& st) {
     (void)p;
     return st.type() == fs::file_type::symlink;
 }
 
-OpenOutcome open_anchored_file(const fs::path& root, std::string_view rel, OwnedFileHandle& out_handle,
-                               FileIdentity& out_id, std::string& err_msg) {
+OpenOutcome open_anchor_dir(const fs::path& dir, OwnedFileHandle& out_dir, FileIdentity& out_id, std::string& err_msg) {
+    // Follows a link at `dir` (the operator chose it); the descriptor then pins what it reached.
+    OwnedFileHandle h = make_owned(::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (!h.valid()) {
+        const int err = errno;
+        if (err == ENOENT) return OpenOutcome::missing;
+        if (err == ENOTDIR) return OpenOutcome::unsafe;
+        err_msg = std::strerror(err);
+        return OpenOutcome::io_error;
+    }
+    struct stat st {};
+    if (::fstat(to_fd(h.native_value()), &st) != 0) {
+        err_msg = std::strerror(errno);
+        return OpenOutcome::io_error;
+    }
+    if (!S_ISDIR(st.st_mode)) return OpenOutcome::unsafe;
+    fill_identity(st, out_id);
+    out_dir = std::move(h);
+    return OpenOutcome::ok;
+}
+
+OpenOutcome open_anchored_file(const OwnedFileHandle& anchor, std::string_view rel, ShareMode mode,
+                               OwnedFileHandle& out_handle, FileIdentity& out_id, std::string& err_msg, bool* busy) {
+    (void)mode;  // POSIX has no mandatory deny-write share mode (safe_file.hpp ShareMode)
+    if (busy != nullptr) *busy = false;
+    if (!anchor.valid()) {
+        err_msg = "store root is not open";
+        return OpenOutcome::io_error;
+    }
+    std::vector<std::string> segs;
+    if (!split_rel(rel, segs)) return OpenOutcome::unsafe;
     OwnedFileHandle dir;
-    std::string seg;
-    const OpenOutcome parents = open_parent_dirs(root, rel, dir, seg, err_msg);
-    if (parents != OpenOutcome::ok) return parents;
+    int dfd = -1;
+    const OpenOutcome dirs = open_dirs(to_fd(anchor.native_value()), segs, segs.size() - 1, dir, dfd, err_msg);
+    if (dirs != OpenOutcome::ok) return dirs;
     OwnedFileHandle leaf =
-        make_owned(::openat(to_fd(dir.native_value()), seg.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK));
+        make_owned(::openat(dfd, segs.back().c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK));
     if (!leaf.valid()) {
         const int err = errno;
         if (err == ENOENT) return OpenOutcome::missing;
@@ -152,10 +191,84 @@ OpenOutcome open_anchored_file(const fs::path& root, std::string_view rel, Owned
 
 OpenOutcome open_anchored_regular(const fs::path& root, std::string_view rel, OwnedFileHandle& out_handle,
                                   std::uint64_t& out_size, std::string& err_msg) {
+    OwnedFileHandle anchor;
+    FileIdentity root_id;
+    if (open_anchor_dir(root, anchor, root_id, err_msg) != OpenOutcome::ok) {
+        if (err_msg.empty()) err_msg = "cannot open the directory";
+        return OpenOutcome::io_error;
+    }
     FileIdentity id;
-    const OpenOutcome outcome = open_anchored_file(root, rel, out_handle, id, err_msg);
+    const OpenOutcome outcome = open_anchored_file(anchor, rel, ShareMode::allow_writers, out_handle, id, err_msg);
     if (outcome == OpenOutcome::ok) out_size = id.size;
     return outcome;
+}
+
+OpenOutcome probe_anchored_dir(const OwnedFileHandle& anchor, std::string_view rel, std::string& err_msg) {
+    if (!anchor.valid()) {
+        err_msg = "store root is not open";
+        return OpenOutcome::io_error;
+    }
+    std::vector<std::string> segs;
+    if (!split_rel(rel, segs)) return OpenOutcome::unsafe;
+    OwnedFileHandle dir;
+    int dfd = -1;
+    return open_dirs(to_fd(anchor.native_value()), segs, segs.size(), dir, dfd, err_msg);
+}
+
+OpenOutcome list_anchored_dir(const OwnedFileHandle& anchor, std::string_view rel, std::vector<DirEntry>& out,
+                              std::string& err_msg) {
+    out.clear();
+    if (!anchor.valid()) {
+        err_msg = "store root is not open";
+        return OpenOutcome::io_error;
+    }
+    std::vector<std::string> segs;
+    if (!split_rel(rel, segs)) return OpenOutcome::unsafe;
+    OwnedFileHandle dir;
+    int dfd = -1;
+    const OpenOutcome opened = open_dirs(to_fd(anchor.native_value()), segs, segs.size(), dir, dfd, err_msg);
+    if (opened != OpenOutcome::ok) return opened;
+    // `dir` is a private open file description (opened above, never the anchor), so the
+    // stream's position is not shared with any other thread. fdopendir owns it from here.
+    DIR* d = ::fdopendir(to_fd(dir.native_value()));
+    if (d == nullptr) {
+        err_msg = std::strerror(errno);
+        return OpenOutcome::io_error;
+    }
+    (void)dir.release();
+    const int list_fd = dirfd(d);  // unqualified: a macro on some BSD libcs
+    OpenOutcome result = OpenOutcome::ok;
+    while (true) {
+        errno = 0;
+        const struct dirent* ent = ::readdir(d);
+        if (ent == nullptr) {
+            if (errno != 0) {
+                err_msg = std::strerror(errno);
+                result = OpenOutcome::io_error;
+                out.clear();
+            }
+            break;
+        }
+        const std::string_view name(ent->d_name);
+        if (name == "." || name == "..") continue;
+        DirEntry e;
+        e.name.assign(name);
+        struct stat st {};
+        if (::fstatat(list_fd, ent->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            e.kind = DirEntryKind::other;  // vanished or unreadable: never followed
+        } else if (S_ISLNK(st.st_mode)) {
+            e.kind = DirEntryKind::link;
+        } else if (S_ISDIR(st.st_mode)) {
+            e.kind = DirEntryKind::directory;
+        } else if (S_ISREG(st.st_mode)) {
+            e.kind = DirEntryKind::file;
+        } else {
+            e.kind = DirEntryKind::other;
+        }
+        out.push_back(std::move(e));
+    }
+    ::closedir(d);
+    return result;
 }
 
 OpenOutcome open_single_regular(const fs::path& file, OwnedFileHandle& out_handle, std::uint64_t& out_size,
@@ -207,14 +320,25 @@ std::int64_t read_some(const OwnedFileHandle& handle, char* buf, std::size_t n, 
     }
 }
 
-bool read_anchored_leaf_symlink(const fs::path& root, std::string_view rel, std::string& target,
-                                FileIdentity& link_id, FileIdentity& target_id, std::string& err_msg) {
+bool read_anchored_leaf_symlink(const OwnedFileHandle& anchor, std::string_view rel, std::string& target,
+                                FileIdentity& link_id, std::string& err_msg) {
+    if (!anchor.valid()) {
+        err_msg = "store root is not open";
+        return false;
+    }
+    std::vector<std::string> segs;
+    if (!split_rel(rel, segs)) {
+        err_msg = "unsafe path segment";
+        return false;
+    }
     OwnedFileHandle dir;
-    std::string seg;
-    if (open_parent_dirs(root, rel, dir, seg, err_msg) != OpenOutcome::ok) return false;
-    const int dfd = to_fd(dir.native_value());
+    int dfd = -1;
+    if (open_dirs(to_fd(anchor.native_value()), segs, segs.size() - 1, dir, dfd, err_msg) != OpenOutcome::ok) {
+        return false;
+    }
+    const char* leaf = segs.back().c_str();
     struct stat lst {};
-    if (::fstatat(dfd, seg.c_str(), &lst, AT_SYMLINK_NOFOLLOW) != 0) {
+    if (::fstatat(dfd, leaf, &lst, AT_SYMLINK_NOFOLLOW) != 0) {
         err_msg = std::strerror(errno);
         return false;
     }
@@ -222,20 +346,15 @@ bool read_anchored_leaf_symlink(const fs::path& root, std::string_view rel, std:
         err_msg = "not a symbolic link";
         return false;
     }
+    // readlinkat reads the link's own text; nothing it names is resolved, stat'ed or opened.
     char buf[PATH_MAX];
-    const ssize_t n = ::readlinkat(dfd, seg.c_str(), buf, sizeof(buf));
+    const ssize_t n = ::readlinkat(dfd, leaf, buf, sizeof(buf));
     if (n < 0 || static_cast<std::size_t>(n) >= sizeof(buf)) {
         err_msg = n < 0 ? std::strerror(errno) : "link target too long";
         return false;
     }
-    struct stat tst {};
-    if (::fstatat(dfd, seg.c_str(), &tst, 0) != 0) {
-        err_msg = std::strerror(errno);
-        return false;
-    }
     target.assign(buf, static_cast<std::size_t>(n));
     fill_identity(lst, link_id);
-    fill_identity(tst, target_id);
     return true;
 }
 

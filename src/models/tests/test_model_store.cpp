@@ -10,9 +10,23 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "common/sha256.hpp"
 #include "sonder/inference/model_store.hpp"
@@ -1572,3 +1586,508 @@ TEST_CASE("model store: the JSON document redacts URL credentials in remote_host
     CHECK(doc.find("hunter2") == std::string::npos);
     CHECK(doc.find("https://internal.example:8443/x") != std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// Security review of PR 135, round 2: bytes bound to handles, pinned root, POSIX manifest links,
+// single-flight hashing, stale unsupported records, escaping.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Reads up to `n` bytes from offset 0 of a native handle owned by a VerifiedWeights.
+std::string read_native(std::intptr_t handle, std::size_t n) {
+    std::string out(n, '\0');
+#if defined(_WIN32)
+    const HANDLE h = reinterpret_cast<HANDLE>(handle);
+    LARGE_INTEGER zero{};
+    if (!::SetFilePointerEx(h, zero, nullptr, FILE_BEGIN)) return {};
+    DWORD got = 0;
+    if (!::ReadFile(h, out.data(), static_cast<DWORD>(n), &got, nullptr)) return {};
+    out.resize(got);
+#else
+    const ssize_t got = ::pread(static_cast<int>(handle), out.data(), n, 0);
+    if (got < 0) return {};
+    out.resize(static_cast<std::size_t>(got));
+#endif
+    return out;
+}
+
+void bump_mtime(const fs::path& p, int seconds) {
+    fs::last_write_time(p, fs::last_write_time(p) + std::chrono::seconds(seconds));
+}
+
+// Sets OLLAMA_MODELS for one scope and restores the previous value.
+struct OllamaModelsEnv {
+#if defined(_WIN32)
+    std::optional<std::wstring> old;
+    explicit OllamaModelsEnv(const fs::path& value) {
+        if (const wchar_t* v = _wgetenv(L"OLLAMA_MODELS")) old = v;
+        _wputenv_s(L"OLLAMA_MODELS", value.c_str());
+    }
+    ~OllamaModelsEnv() { _wputenv_s(L"OLLAMA_MODELS", old ? old->c_str() : L""); }
+#else
+    std::optional<std::string> old;
+    explicit OllamaModelsEnv(const fs::path& value) {
+        if (const char* v = std::getenv("OLLAMA_MODELS")) old = v;
+        ::setenv("OLLAMA_MODELS", value.c_str(), 1);
+    }
+    ~OllamaModelsEnv() {
+        if (old) {
+            ::setenv("OLLAMA_MODELS", old->c_str(), 1);
+        } else {
+            ::unsetenv("OLLAMA_MODELS");
+        }
+    }
+#endif
+    OllamaModelsEnv(const OllamaModelsEnv&) = delete;
+    OllamaModelsEnv& operator=(const OllamaModelsEnv&) = delete;
+};
+
+}  // namespace
+
+TEST_CASE("model store: retargeting the root link after open() does not move the store") {
+    Store real;  // the directory the operator approved
+    const auto cfg = real.config_blob(R"({"model_format":"gguf"})");
+    real.put_v2("ollama.com", "library", "m", "latest", real.manifest(cfg, {real.blob(kModel, fake_gguf(11, 1, 64))}));
+    Store other;  // an Ollama-shaped tree somewhere else
+    const auto cfg2 = other.config_blob(R"({"model_format":"gguf","x":1})");
+    other.put_v2("ollama.com", "library", "m", "latest", other.manifest(cfg2, {other.blob(kModel, fake_gguf(22, 1, 64))}));
+    other.put_v2("ollama.com", "library", "evil", "latest", other.manifest(cfg2, {other.blob(kModel, fake_gguf(33, 1, 64))}));
+    TempDir links;
+    const fs::path root = links.path / "models";
+    REQUIRE_MESSAGE(make_dir_link(root, real.tmp.path), "no directory link could be created; root pinning NOT exercised");
+    {
+        auto store = m::OllamaStore::open(root);
+        REQUIRE(store.ok());
+        m::ModelRegistry reg;
+        REQUIRE(reg.add_ollama_dir(root).ok());
+        auto before = store.value().resolve("m");
+        REQUIRE(before.ok());
+        REQUIRE(before.value().gguf.has_value());
+        CHECK(before.value().gguf->tensor_count == 11);
+
+        remove_dir_link(root);
+        REQUIRE(make_dir_link(root, other.tmp.path));
+        // The path really leads to the other tree now, so the checks below are not vacuous.
+        REQUIRE(fs::exists(root / "manifests-v2" / "ollama.com" / "library" / "evil" / "latest"));
+
+        auto after = store.value().resolve("m");
+        REQUIRE(after.ok());
+        CHECK(after.value().ready());
+        REQUIRE(after.value().gguf.has_value());
+        CHECK(after.value().gguf->tensor_count == 11);
+        CHECK(store.value().resolve("evil").status().code() == si::ErrorCode::not_found);
+        auto scan = store.value().scan();
+        CHECK(find(scan, "evil:latest") == nullptr);
+        REQUIRE(find(scan, "m:latest") != nullptr);
+        REQUIRE(find(scan, "m:latest")->gguf.has_value());
+        CHECK(find(scan, "m:latest")->gguf->tensor_count == 11);
+        CHECK(m::verify_blobs(before.value()).ok());  // through the pinned root, not the retargeted path
+        CHECK(reg.resolve("evil").status().code() == si::ErrorCode::not_found);
+        auto via = reg.resolve("m");
+        REQUIRE(via.ok());
+        CHECK(via.value().gguf->tensor_count == 11);
+    }
+    remove_dir_link(root);
+}
+
+TEST_CASE("model store: concurrent first uses of one weight file share one hash") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto big = s.blob(kModel, fake_gguf(1, 1, 1u << 20, 'q'));
+    s.put_v2("ollama.com", "library", "big", "latest", s.manifest(cfg, {big}));
+    std::atomic<int> hashed{0};
+    m::StoreOptions opt;
+    // Holding the hash open for a while makes every other thread arrive while it runs.
+    opt.on_weight_hash = [&](const m::BlobRef&) {
+        ++hashed;
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    };
+    auto store = m::OllamaStore::open(s.tmp.path, opt);
+    REQUIRE(store.ok());
+    constexpr int kThreads = 8;
+    std::atomic<int> waiting{0};
+    std::atomic<bool> go{false};
+    std::vector<int> verified(kThreads, 0);
+    std::vector<std::thread> threads;
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&, i] {
+            ++waiting;
+            while (!go.load()) std::this_thread::yield();
+            auto r = store.value().resolve("big");
+            verified[static_cast<std::size_t>(i)] = r.ok() && r.value().ready() && r.value().weights_verified ? 1 : 0;
+        });
+    }
+    while (waiting.load() < kThreads) std::this_thread::yield();
+    go = true;
+    for (auto& t : threads) t.join();
+    CHECK(hashed.load() == 1);
+    for (int v : verified) CHECK(v == 1);
+}
+
+TEST_CASE("model store: weight hashes run at most kMaxConcurrentWeightHashes at a time per store") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    constexpr int kModels = 6;
+    for (int i = 0; i < kModels; ++i) {
+        s.put_v2("ollama.com", "library", "m" + std::to_string(i), "latest",
+                 s.manifest(cfg, {s.blob(kModel, fake_gguf(1, 1, 64, static_cast<char>('a' + i)))}));
+    }
+    std::atomic<int> hashed{0}, current{0}, peak{0};
+    m::StoreOptions opt;
+    opt.on_weight_hash = [&](const m::BlobRef&) {
+        ++hashed;
+        const int now = ++current;
+        int seen = peak.load();
+        while (now > seen && !peak.compare_exchange_weak(seen, now)) {
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        --current;
+    };
+    auto store = m::OllamaStore::open(s.tmp.path, opt);
+    REQUIRE(store.ok());
+    std::atomic<bool> go{false};
+    std::vector<int> ok(kModels, 0);
+    std::vector<std::thread> threads;
+    for (int i = 0; i < kModels; ++i) {
+        threads.emplace_back([&, i] {
+            while (!go.load()) std::this_thread::yield();
+            auto r = store.value().resolve("m" + std::to_string(i));
+            ok[static_cast<std::size_t>(i)] = r.ok() && r.value().weights_verified ? 1 : 0;
+        });
+    }
+    go = true;
+    for (auto& t : threads) t.join();
+    CHECK(hashed.load() == kModels);
+    CHECK(peak.load() >= 1);
+    CHECK(peak.load() <= static_cast<int>(m::kMaxConcurrentWeightHashes));
+    for (int v : ok) CHECK(v == 1);
+}
+
+TEST_CASE("model store: a registry entry that was briefly corrupt is served again once repaired") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const std::string good = fake_gguf(1, 1, 2000, 'g');
+    const auto model = s.blob(kModel, good);
+    s.put_v2("ollama.com", "library", "flaky", "latest", s.manifest(cfg, {model}));
+    int hashed = 0;
+    m::StoreOptions opt;
+    opt.on_weight_hash = [&](const m::BlobRef&) { ++hashed; };
+    m::ModelRegistry reg(opt);
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    REQUIRE(reg.resolve("flaky").ok());
+    CHECK(hashed == 1);
+
+    write_file(s.blob_file(model), fake_gguf(1, 1, 2000, 'X'));  // same size and header
+    bump_mtime(s.blob_file(model), 5);
+    auto broken = reg.resolve("flaky");
+    CHECK_FALSE(broken.ok());
+    CHECK(broken.status().message().find("digest_mismatch") != std::string::npos);
+    CHECK(hashed == 2);
+    // While nothing changes, the broken result is served from the cache (no re-hash).
+    auto still = reg.resolve("flaky");
+    CHECK_FALSE(still.ok());
+    CHECK(still.status().message().find("digest_mismatch") != std::string::npos);
+    CHECK(hashed == 2);
+
+    write_file(s.blob_file(model), good);  // repaired
+    bump_mtime(s.blob_file(model), 10);
+    auto repaired = reg.resolve("flaky");
+    REQUIRE(repaired.ok());
+    CHECK(repaired.value().weights_verified);
+}
+
+TEST_CASE("model store: a registry entry with a missing blob is served once the blob arrives") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const std::string gguf = fake_gguf(4, 4, 128, 'p');
+    const auto later = Store::absent(kModel, gguf);
+    s.put_v2("ollama.com", "library", "pulling", "latest", s.manifest(cfg, {later}));
+    m::ModelRegistry reg;
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    for (int i = 0; i < 2; ++i) {
+        auto miss = reg.resolve("pulling");
+        CHECK_FALSE(miss.ok());
+        CHECK(miss.status().message().find("missing_blob") != std::string::npos);
+    }
+    write_file(s.blob_file(later), gguf);  // the pull finished
+    auto now = reg.resolve("pulling");
+    REQUIRE(now.ok());
+    CHECK(now.value().gguf->tensor_count == 4);
+}
+
+TEST_CASE("model store: messages escape raw C1 bytes, invalid UTF-8 and invisible controls") {
+    const std::string raw = std::string("a\x9b") + "31m" + "\xC3" + "x" + "\xE2\x80\xAE" + "rtl" + "\xC2\x9B" +
+                            "\xE2\x80\xA8" + "\xED\xA0\x80" + "\xF0\x9F\x98\x80";
+    auto bad = m::parse_ollama_name(raw);
+    REQUIRE_FALSE(bad.ok());
+    const std::string msg = bad.status().message();
+    CAPTURE(msg);
+    CHECK(msg.find('\x9b') == std::string::npos);  // no raw C1 byte anywhere
+    CHECK(msg.find("a\\x9b31m") != std::string::npos);
+    CHECK(msg.find("\\xc3x") != std::string::npos);  // a lead byte without its continuation
+    CHECK(msg.find("\xE2\x80\xAE") == std::string::npos);
+    CHECK(msg.find("\\xe2\\x80\\xae") != std::string::npos);  // U+202E RIGHT-TO-LEFT OVERRIDE
+    CHECK(msg.find("\\xc2\\x9b") != std::string::npos);       // U+009B as UTF-8
+    CHECK(msg.find("\\xe2\\x80\\xa8") != std::string::npos);  // U+2028 LINE SEPARATOR
+    CHECK(msg.find("\\xed\\xa0\\x80") != std::string::npos);  // an encoded surrogate is not UTF-8
+    CHECK(msg.find("\xF0\x9F\x98\x80") != std::string::npos); // printable UTF-8 is kept
+
+    // A name longer than any valid one is refused before it is split into parts.
+    auto huge = m::parse_ollama_name(std::string(100000, 'a'));
+    REQUIRE_FALSE(huge.ok());
+    CHECK(huge.status().code() == si::ErrorCode::invalid_argument);
+    CHECK(huge.status().message().find("longer than") != std::string::npos);
+    CHECK(huge.status().message().size() < 400);
+    CHECK(m::parse_ollama_name(std::string(m::kMaxOllamaNameBytes + 1, 'a')).status().message().find("longer than") !=
+          std::string::npos);
+
+    // Device names are refused in the host part too.
+    for (const char* host : {"nul/ns/m:t", "aux:5000/ns/m:t", "COM1.example.com/ns/m:t", "lpt9/x/y:z"}) {
+        CAPTURE(host);
+        CHECK(m::parse_ollama_name(host).status().code() == si::ErrorCode::invalid_argument);
+    }
+}
+
+TEST_CASE("model store: the import-ollama table escapes store paths") {
+    TempDir t;
+#if defined(_WIN32)
+    // Windows names cannot hold C0 controls; a bidi override and a line separator can.
+    const std::string name_utf8 = std::string("lib") + "\xE2\x80\xAE" + "evil" + "\xE2\x80\xA8" + "x";  // U+202E, U+2028
+    const fs::path root = t.path / fs::path(std::u8string(name_utf8.begin(), name_utf8.end()));
+    const std::string raw_marker = "\xE2\x80\xAE";
+    const std::string escaped_marker = "\\xe2\\x80\\xae";
+#else
+    const fs::path root = t.path / "lib\n\x1b[31mevil";
+    const std::string raw_marker = "\x1b[31m";
+    const std::string escaped_marker = "\\x0a\\x1b[31m";
+#endif
+    const std::string cfg_text = R"({"model_format":"gguf","file_type":"Q4\u001b[2J"})";
+    const std::string gguf = fake_gguf(1, 1, 16);
+    const std::string cfg_hex = si::detail::sha256_hex(cfg_text), model_hex = si::detail::sha256_hex(gguf);
+    write_file(root / "blobs" / ("sha256-" + cfg_hex), cfg_text);
+    write_file(root / "blobs" / ("sha256-" + model_hex), gguf);
+    const std::string manifest = std::string("{\"schemaVersion\":2,\"mediaType\":\"") + kManifestType +
+                                 "\",\"config\":" + layer_json(Layer{kConfigType, "sha256:" + cfg_hex, cfg_text.size(), ""}) +
+                                 ",\"layers\":[" + layer_json(Layer{kModel, "sha256:" + model_hex, gguf.size(), ""}) + "]}";
+    write_file(root / "manifests-v2" / "ollama.com" / "library" / "m" / "latest", manifest);
+
+    OllamaModelsEnv env(root);  // the CLI reads the directory from OLLAMA_MODELS as a wide string
+    std::ostringstream out, err;
+    REQUIRE(m::models_main({"import-ollama"}, out, err) == 0);
+    const std::string text = out.str();
+    CAPTURE(text);
+    CHECK(text.find("m:latest") != std::string::npos);
+    CHECK(text.find(raw_marker) == std::string::npos);
+    CHECK(text.find(escaped_marker) != std::string::npos);
+    CHECK(text.find('\x1b') == std::string::npos);  // the config's file_type escape too
+    CHECK(text.find("Q4\\x1b[2J") != std::string::npos);
+}
+
+#if defined(_WIN32)
+TEST_CASE("model store: a weight blob held open for writing is not hashed or served until released") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(1, 1, 256));
+    s.put_v2("ollama.com", "library", "held", "latest", s.manifest(cfg, {model}));
+    int hashed = 0;
+    m::StoreOptions opt;
+    opt.on_weight_hash = [&](const m::BlobRef&) { ++hashed; };
+    m::ModelRegistry reg(opt);
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    {
+        std::ofstream writer(s.blob_file(model), std::ios::binary | std::ios::app);  // a writer has it open
+        REQUIRE(writer.is_open());
+        auto store = m::OllamaStore::open(s.tmp.path, opt);
+        REQUIRE(store.ok());
+        auto r = store.value().resolve("held");
+        REQUIRE(r.ok());
+        CHECK_FALSE(r.value().ready());
+        CHECK(r.value().reason == m::UnsupportedReason::blob_busy);
+        CHECK_FALSE(r.value().weights_verified);
+        auto via = reg.resolve("held");
+        CHECK_FALSE(via.ok());
+        CHECK(via.status().message().find("blob_busy") != std::string::npos);
+        CHECK(hashed == 0);
+    }
+    auto released = reg.resolve("held");  // a transient reason is re-checked, not cached
+    REQUIRE(released.ok());
+    CHECK(released.value().weights_verified);
+    CHECK(hashed == 1);
+}
+#endif
+
+TEST_CASE("model store: resolve_for_load hands the loader the verified, open weight handles") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const std::string gguf = fake_gguf(5, 2, 512, 'w');
+    const auto model = s.blob(kModel, gguf);
+    const auto proj = s.blob(kProjector, fake_gguf(1, 1, 32, 'p'));
+    s.put_v2("ollama.com", "library", "load", "latest", s.manifest(cfg, {model, model, proj}));
+    const auto bad = s.corrupt_blob(kModel, fake_gguf(1, 1, 64, 'A'), fake_gguf(1, 1, 64, 'B'));
+    s.put_v2("ollama.com", "library", "bad", "latest", s.manifest(cfg, {bad}));
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    {
+        auto lm = store.value().resolve_for_load("load");
+        REQUIRE(lm.ok());
+        REQUIRE(lm.value().record.ready());
+        CHECK(lm.value().record.weights_verified);
+        const m::VerifiedWeights& w = lm.value().weights;
+        CHECK(w.verified());
+        REQUIRE(w.files().size() == 2);  // one handle per distinct digest
+        const auto* f = w.find(model.digest);
+        REQUIRE(f != nullptr);
+        CHECK(f->blob.role == m::BlobRole::model);
+        CHECK(read_native(f->native_handle, gguf.size() + 1) == gguf);  // the verified bytes, by handle
+        REQUIRE(w.find(proj.digest) != nullptr);
+        CHECK(w.find("sha256:" + std::string(64, '0')) == nullptr);
+#if defined(_WIN32)
+        // While the handles live nobody can open the blob for writing, rename or delete it.
+        {
+            std::ofstream writer(s.blob_file(model), std::ios::binary | std::ios::app);
+            CHECK_FALSE(writer.is_open());
+        }
+        std::error_code ec;
+        fs::rename(s.blob_file(model), fs::path(s.blob_file(model).native() + L".moved"), ec);
+        CHECK(ec);
+        CHECK(fs::exists(s.blob_file(model)));
+#endif
+        m::VerifiedWeights moved = std::move(lm.value().weights);  // move-only ownership
+        CHECK(moved.files().size() == 2);
+        CHECK(moved.verified());
+        CHECK(lm.value().weights.empty());
+        CHECK_FALSE(lm.value().weights.verified());
+    }
+    {
+        std::ofstream writer(s.blob_file(model), std::ios::binary | std::ios::app);  // released again
+        CHECK(writer.is_open());
+    }
+    auto broken = store.value().resolve_for_load("bad");
+    REQUIRE(broken.ok());
+    CHECK(broken.value().record.reason == m::UnsupportedReason::digest_mismatch);
+    CHECK(broken.value().weights.empty());
+
+    m::StoreOptions off;
+    off.verify_weights = m::WeightVerification::off;
+    auto o = m::OllamaStore::open(s.tmp.path, off);
+    REQUIRE(o.ok());
+    auto unhashed = o.value().resolve_for_load("load");
+    REQUIRE(unhashed.ok());
+    CHECK(unhashed.value().weights.files().size() == 2);
+    CHECK_FALSE(unhashed.value().weights.verified());
+
+    m::ModelRegistry reg;
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    auto rl = reg.resolve_for_load("load");
+    REQUIRE(rl.ok());
+    CHECK(rl.value().weights.verified());
+    CHECK(rl.value().weights.files().size() == 2);
+    CHECK_FALSE(reg.resolve_for_load("bad").ok());
+}
+
+TEST_CASE("model store: first_use hashes again when a weight's hard-link count changes") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(1, 1, 128));
+    s.put_v2("ollama.com", "library", "linked", "latest", s.manifest(cfg, {model}));
+    int hashed = 0;
+    m::StoreOptions opt;
+    opt.on_weight_hash = [&](const m::BlobRef&) { ++hashed; };
+    auto store = m::OllamaStore::open(s.tmp.path, opt);
+    REQUIRE(store.ok());
+    REQUIRE(store.value().resolve("linked").value().weights_verified);
+    REQUIRE(store.value().resolve("linked").value().weights_verified);
+    CHECK(hashed == 1);
+#if defined(_WIN32)
+    // Reads or sets FILE_BASIC_INFO (all four times) the way any holder of FILE_WRITE_ATTRIBUTES can.
+    auto basic_info = [](const fs::path& p, FILE_BASIC_INFO& info, bool set) {
+        const HANDLE h = ::CreateFileW(p.c_str(), FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0,
+                                       nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        const BOOL ok = set ? ::SetFileInformationByHandle(h, FileBasicInfo, &info, sizeof(info))
+                            : ::GetFileInformationByHandleEx(h, FileBasicInfo, &info, sizeof(info));
+        ::CloseHandle(h);
+        return ok != FALSE;
+    };
+    FILE_BASIC_INFO saved{};
+    REQUIRE(basic_info(s.blob_file(model), saved, false));
+#endif
+    std::error_code ec;
+    fs::create_directories(s.tmp.path / "blobs" / ".ollama-split-x");
+    fs::create_hard_link(s.blob_file(model), s.tmp.path / "blobs" / ".ollama-split-x" / "part.gguf", ec);
+    REQUIRE_MESSAGE(!ec, "hard link creation failed: " << ec.message());
+#if defined(_WIN32)
+    // Put LastWriteTime and ChangeTime back: then only the link count tells the identities apart.
+    REQUIRE(basic_info(s.blob_file(model), saved, true));
+    FILE_BASIC_INFO now{};
+    REQUIRE(basic_info(s.blob_file(model), now, false));
+    REQUIRE(now.ChangeTime.QuadPart == saved.ChangeTime.QuadPart);
+    REQUIRE(now.LastWriteTime.QuadPart == saved.LastWriteTime.QuadPart);
+#endif
+    auto again = store.value().resolve("linked");
+    REQUIRE(again.ok());
+    CHECK(again.value().weights_verified);
+    CHECK(hashed == 2);
+}
+
+#if !defined(_WIN32)
+TEST_CASE("model store: POSIX manifest links are accepted only as the exact relative blob path under manifests-v2") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(1, 1, 8));
+    const std::string manifest = s.manifest(cfg, {model});
+    const auto mblob = s.blob(kManifestType, manifest);
+    const std::string hex = mblob.digest.substr(7);
+    const fs::path lib = s.tmp.path / "manifests-v2" / "ollama.com" / "library";
+    auto link = [&](const fs::path& at, const fs::path& target) {
+        fs::create_directories(at.parent_path());
+        std::error_code ec;
+        fs::create_symlink(target, at, ec);
+        REQUIRE_MESSAGE(!ec, "symlink creation failed: " << ec.message());
+    };
+    // The very in-store blob, but by absolute path: only Ollama's relative form is accepted.
+    link(lib / "abs" / "latest", s.tmp.path / "blobs" / ("sha256-" + hex));
+    // An external path with a blob-shaped name, in a directory that does not even exist: a reader
+    // that looked the target up first would fail differently from one that judged the text.
+    link(lib / "ext" / "latest", fs::path("/nonexistent-sonder-store-dir") / ("sha256-" + hex));
+    // A relative path that climbs above the store root.
+    link(lib / "climb" / "latest", fs::path("../../../../../outside/blobs") / ("sha256-" + hex));
+    // A non-blob name inside blobs/.
+    write_file(s.tmp.path / "blobs" / "notablob", manifest);
+    link(lib / "nonblob" / "latest", fs::path("../../../../blobs/notablob"));
+    // Uppercase hex is not the name Ollama writes.
+    std::string upper = hex;
+    for (char& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    link(lib / "upper" / "latest", fs::path("../../../../blobs") / ("sha256-" + upper));
+    // The legacy tree never had manifest links.
+    link(s.tmp.path / "manifests" / "registry.ollama.ai" / "library" / "legacy" / "latest",
+         fs::path("../../../../blobs") / ("sha256-" + hex));
+    // Ollama's own form still works.
+    link(lib / "good" / "latest", fs::path("../../../../blobs") / ("sha256-" + hex));
+
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    for (const char* name : {"abs", "ext", "climb", "nonblob", "upper"}) {
+        CAPTURE(name);
+        auto r = store.value().resolve(name);
+        REQUIRE(r.ok());
+        CHECK_FALSE(r.value().ready());
+        CHECK(r.value().reason == m::UnsupportedReason::unsafe_path);
+        CHECK(r.value().detail.find("not the relative path of a blob") != std::string::npos);
+    }
+    auto legacy = store.value().resolve("legacy");
+    REQUIRE(legacy.ok());
+    CHECK_FALSE(legacy.value().ready());
+    CHECK(legacy.value().reason == m::UnsupportedReason::unsafe_path);
+    CHECK(legacy.value().layout == m::ManifestLayout::legacy);
+    auto good = store.value().resolve("good");
+    REQUIRE(good.ok());
+    CHECK(good.value().ready());
+    auto scan = store.value().scan();
+    REQUIRE(find(scan, "good:latest") != nullptr);
+    CHECK(find(scan, "good:latest")->ready());
+    REQUIRE(find(scan, "ext:latest") != nullptr);
+    CHECK(find(scan, "ext:latest")->reason == m::UnsupportedReason::unsafe_path);
+}
+#endif

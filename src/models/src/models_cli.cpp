@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "sonder/inference/model_store.hpp"
+#include "store_text.hpp"
 
 namespace sonder::inference::models {
 
@@ -66,16 +67,23 @@ std::string pad(std::string s, std::size_t width) {
     return s;
 }
 
-// For the operator's terminal only (never an HTTP response). Does not throw on a Windows
-// name with an unpaired UTF-16 surrogate.
+constexpr std::size_t kMaxPathText = 8192;
+constexpr std::size_t kMaxFieldText = 128;
+
+// For the operator's terminal only (never an HTTP response), escaped with the store's
+// sanitizer (store_text.hpp): a POSIX path may hold newlines, ESC or invalid UTF-8, and any
+// path may hold bidi controls. Does not throw on a Windows name with an unpaired surrogate.
 std::string path_text(const fs::path& p) {
     try {
         const auto u = p.generic_u8string();
-        return std::string(reinterpret_cast<const char*>(u.data()), u.size());
+        return store_text::printable(std::string_view(reinterpret_cast<const char*>(u.data()), u.size()), kMaxPathText);
     } catch (const std::exception&) {
         return "<path not representable as UTF-8>";
     }
 }
+
+// An untrusted config field (quantization, parameter size) for the table.
+std::string field_text(const std::string& s) { return s.empty() ? std::string("-") : store_text::printable(s, kMaxFieldText); }
 
 struct Options {
     std::optional<std::string> dir;
@@ -228,8 +236,7 @@ int models_main(const std::vector<std::string>& args, std::ostream& out, std::os
             }
             if (!shares_with.empty()) ++shared_entries;
             out << "ready        " << pad(human_bytes(r.weights_bytes), 10) << " "
-                << pad(r.config.quantization.empty() ? "-" : r.config.quantization, 8) << " "
-                << pad(r.config.parameter_size.empty() ? "-" : r.config.parameter_size, 7);
+                << pad(field_text(r.config.quantization), 8) << " " << pad(field_text(r.config.parameter_size), 7);
             if (r.params.num_ctx) out << " num_ctx=" << *r.params.num_ctx;
             if (!r.projector_paths.empty()) out << " +projector";
             if (!r.adapter_paths.empty()) out << " +adapter";

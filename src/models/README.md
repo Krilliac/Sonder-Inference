@@ -10,9 +10,10 @@ Implemented here (`SONDER_HAS_MODEL_STORE`): the model store. It reads an existi
 Ollama models directory read-only and in place (manifests-v2 and legacy trees, blobs,
 manifest lists), resolves `name[:tag]` to GGUF/projector/adapter paths plus params,
 template and system records, reports unsupported entries (cloud stubs, safetensors,
-missing or truncated blobs), opens every file without following links, hashes small
-layers on every read and weights on first use, and exposes `ModelRegistry` for the
-native backend plus `sonder-infer models import-ollama`.
+missing or truncated blobs), pins the store root and opens every file relative to it
+without following links, hashes small layers on every read and weights on first use, hands
+a loader the verified open weight handles (`resolve_for_load`), and exposes `ModelRegistry`
+for the native backend plus `sonder-infer models import-ollama`.
 Reference: [model store](../../docs/integration/model-store.md). The native backend does
 not use it yet.
 

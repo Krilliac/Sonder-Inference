@@ -653,18 +653,8 @@ Changes outside the module, for the integrator:
 1. Root `CMakeLists.txt`: `src/models` added to `SONDER_MODULE_DIRS` (one line). The module needs
    only core code (`json`, `common/sha256`, `common/safe_file`) and defines `SONDER_HAS_MODEL_STORE`.
    Security review follow-up (PR 135): the root file also adds `src/common/safe_file_win32.cpp` /
-   `safe_file_posix.cpp` to the core library (one `if(WIN32)` block).
-5. `src/common/safe_file.hpp` + `safe_file_{win32,posix}.cpp` (new, core): the handle-anchored
-   no-follow opens (`OwnedFileHandle`, `open_anchored_regular`, `open_single_regular`,
-   `is_link_like`) moved verbatim out of `src/artifacts/src/weight_manifest_io_{win32,posix}.cpp`,
-   plus `open_anchored_file` (identity: volume, file id, size, link count, write/change time),
-   `query_identity`, `read_some`, `read_anchored_leaf_symlink` (POSIX) and a check that rejects
-   empty/`.`/`..`/NUL (and on Windows `:`/`\`) segments before opening. `src/artifacts` keeps only
-   `hash_open_handle`; `weight_manifest_io.hpp` re-exports the moved names with using-declarations,
-   so `weight_manifest.cpp` is unchanged and the `sonder.artifacts.*` tests cover the move.
-6. `include/sonder/inference/json.hpp` / `src/common/json.cpp`: `ParseLimits::reject_duplicate_keys`
-   (default `false`, so every existing caller behaves as before); the model store parses manifests
-   with it. Test: `tests/test_json.cpp` "ParseLimits reject_duplicate_keys ...".
+   `safe_file_posix.cpp` to the core library (one `if(WIN32)` block), and (round 2) links `ntdll`
+   on Windows for `NtCreateFile` (handle-relative opens).
 2. `src/cli/sonder_infer_commands.hpp`: the `models` spec gains the `models import-ollama` usage
    line, a note and an example. `tools/sonder-infer/main.cpp`: `models import-ollama` dispatches
    to `models::models_main` behind `SONDER_HAS_MODEL_STORE` (before the generic `models` command,
@@ -674,6 +664,25 @@ Changes outside the module, for the integrator:
    the executable dispatch, `--json`, `--help`, the exit codes and a drive-shaped host name
    (`c:5000/ns/model:tag`) are covered end to end; gated on `SONDER_HAS_MODEL_STORE`.
 4. `docs/MODULES.md` (module row) and `docs/CLI.md` (`models` row).
+5. `src/common/safe_file.hpp` + `safe_file_{win32,posix}.cpp` (new, core): the handle-anchored
+   no-follow opens (`OwnedFileHandle`, `open_anchored_regular`, `open_single_regular`,
+   `is_link_like`) moved out of `src/artifacts/src/weight_manifest_io_{win32,posix}.cpp`, plus a
+   check that rejects empty/`.`/`..`/NUL (and on Windows `:`/`\`) segments before opening.
+   Round 2 of the review made every traversal start from an open directory handle:
+   `open_anchor_dir` (follows a link at the root once), `open_anchored_file(anchor, rel, ShareMode,
+   ...)` (Windows: `NtCreateFile` relative to the previous handle with `FILE_OPEN_REPARSE_POINT`;
+   POSIX: `openat` + `O_NOFOLLOW`; `ShareMode::deny_writers` opens without `FILE_SHARE_WRITE`/
+   `FILE_SHARE_DELETE` on Windows), `probe_anchored_dir`, `list_anchored_dir` (handle-based
+   enumeration), `read_anchored_leaf_symlink` (POSIX: `readlinkat` + `lstat` only, the target is
+   never resolved), `query_identity` (Windows: 128-bit `FILE_ID_INFO` id and 64-bit volume serial),
+   `read_some` and `OwnedFileHandle::release`. `open_anchored_regular(path, ...)` keeps its
+   signature (it pins the path, then opens relative to it), so `src/artifacts` is unchanged apart
+   from now using the relative opens; the `sonder.artifacts.*` tests cover it. `src/artifacts`
+   keeps only `hash_open_handle`; `weight_manifest_io.hpp` re-exports the shared names with
+   using-declarations.
+6. `include/sonder/inference/json.hpp` / `src/common/json.cpp`: `ParseLimits::reject_duplicate_keys`
+   (default `false`, so every existing caller behaves as before); the model store parses manifests
+   with it. Test: `tests/test_json.cpp` "ParseLimits reject_duplicate_keys ...".
 
 Integration hook (not wired in this lane): the native llamacpp backend should call
 `ModelRegistry::add_ollama_dir(default_ollama_models_dir())` once and `resolve(name)` when a model
@@ -688,8 +697,10 @@ Open items:
   by llama.cpp is unverified.
 - No persistence for registered stores; digest references and the `@digest` name suffix are not
   resolved (see the doc's open-items list).
-- The loader opens weights by path (llama.cpp), so a blob swapped after `resolve` verified it is
-  not caught until the next `resolve`/`revalidate` (doc "Trust and verification").
+- The loader lane must load from `resolve_for_load`'s `VerifiedWeights` handles, not from the
+  record paths (llama.cpp opens paths itself, so that needs a handle- or memory-based load path).
+  POSIX has no deny-write, so a writer can still change a blob after it was hashed there (doc
+  "Trust and verification", "Known limits").
 - The case-insensitive directory lookup (`locate_ci`) is only reachable on case-sensitive file
   systems, so on Windows it is covered by CI on Linux, not by the local run.
 - The real-store totals in the doc were measured before the CLI counted shared blobs once.
