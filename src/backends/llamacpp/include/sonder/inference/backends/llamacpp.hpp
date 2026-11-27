@@ -114,6 +114,10 @@ struct LlamaCppBackendOptions {
     std::uint32_t embed_batch_tokens = 2048;
     // Maximum sequences packed per embedding/rerank forward pass (0 = auto, max 64).
     std::uint32_t embed_max_sequences = 16;
+    // Per-request embedding limits on the tokenized inputs (0 = no limit). A single input is
+    // always bounded by the context window as well.
+    std::uint32_t embed_max_total_tokens = 262144;
+    std::uint32_t embed_max_input_tokens = 0;
 };
 
 // Checks the llama.cpp context and placement options (KV cache types,

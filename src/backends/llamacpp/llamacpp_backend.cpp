@@ -30,6 +30,7 @@
 
 #include "batch_scheduler.hpp"
 #include "embed_batch_planner.hpp"
+#include "embeddings.hpp"
 #include "prefix_coalescer.hpp"
 #include "radix_cache.hpp"
 #include "speculation_transition.hpp"
@@ -2935,6 +2936,17 @@ std::int32_t QueryModelEmbeddingDim(const llama_model* model) noexcept {
 #endif
 }
 
+// The pooling the model's GGUF metadata declares ("<arch>.pooling_type"), if any.
+std::optional<PoolingType> QueryModelDefaultPooling(const llama_model* model) {
+    if (model == nullptr) return std::nullopt;
+    char arch[96] = {0};
+    if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof arch) <= 0) return std::nullopt;
+    const std::string key = PoolingMetadataKey(arch);
+    char value[16] = {0};
+    if (key.empty() || llama_model_meta_val_str(model, key.c_str(), value, sizeof value) <= 0) return std::nullopt;
+    return ParsePoolingMetadata(value);
+}
+
 }  // namespace
 
 bool LlamaCppBackend::SupportsReranking() const noexcept {
@@ -3082,6 +3094,14 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
         }
         lengths.push_back(seq.size());
     }
+    {
+        EmbedLimits limits;
+        limits.max_input_tokens = impl_->options.embed_max_input_tokens;
+        limits.max_total_tokens = impl_->options.embed_max_total_tokens;
+        if (const EmbedLimitCheck limit_check = CheckEmbedLimits(lengths, limits); !limit_check.ok) {
+            return Status::Error(ErrorCode::kInvalidArgument, limit_check.message);
+        }
+    }
 
     const uint32_t configured_budget =
         options.max_batch_tokens > 0
@@ -3114,10 +3134,15 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
     // Lazily allocate an isolated multi-sequence embedding context sized to
     // the planned batch budget so Embed() never disturbs live KV prefix caches
     // or MTP/backend-sampler graphs.
-    const enum llama_pooling_type requested_pooling =
-        options.pooling == PoolingType::kUnspecified
-            ? (llama_model_has_encoder(impl_->model) ? LLAMA_POOLING_TYPE_UNSPECIFIED : LLAMA_POOLING_TYPE_MEAN)
-            : ToLlamaPooling(options.pooling);
+    // Pooling: the caller's explicit choice, else the model's own (GGUF "<arch>.pooling_type"),
+    // else mean for decoder-only models / llama.cpp's default for encoders.
+    const PoolingType resolved_pooling = ResolveEmbedPooling(
+        options.pooling, QueryModelDefaultPooling(impl_->model), llama_model_has_encoder(impl_->model));
+    if (resolved_pooling == PoolingType::kRank) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "reranking/classification pooling is not supported for dense embeddings");
+    }
+    const enum llama_pooling_type requested_pooling = ToLlamaPooling(resolved_pooling);
     const uint32_t aligned_need =
         static_cast<uint32_t>(((plan.max_batch_tokens_used + 255u) / 256u) * 256u);
     const uint32_t want_ctx = std::max<uint32_t>(256u, aligned_need);
@@ -3259,13 +3284,7 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
                 }
                 std::vector<float> vec(raw, raw + static_cast<std::size_t>(n_embd));
                 if (options.normalize) {
-                    double sq_sum = 0.0;
-                    for (float v : vec) sq_sum += static_cast<double>(v) * static_cast<double>(v);
-                    const double norm = std::sqrt(sq_sum);
-                    if (norm > 0.0) {
-                        const auto inv = static_cast<float>(1.0 / norm);
-                        for (float& v : vec) v *= inv;
-                    }
+                    L2Normalize(vec);
                 }
                 batch_out.push_back(std::move(vec));
                 total_prompt_tokens += static_cast<std::int64_t>(item.token_count);

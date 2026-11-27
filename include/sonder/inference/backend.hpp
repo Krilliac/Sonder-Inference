@@ -237,7 +237,12 @@ const char* to_string(EmbedPoolingType pooling) noexcept;
 
 struct EmbedRequest {
     std::string request_id;
+    // Text inputs. Exactly one of `inputs` / `token_inputs` is non-empty.
     std::vector<std::string> inputs;
+    // Pre-tokenized inputs (OpenAI `input` as token arrays). The ids are in the
+    // loaded model's own vocabulary, so only backends that tokenize natively
+    // can serve them; others fail the request.
+    std::vector<std::vector<TokenId>> token_inputs;
     bool normalize = true;
     // Optional requested output dimension. Backends must fail closed if
     // unsupported or > native dimension; never silently truncate arbitrary models.

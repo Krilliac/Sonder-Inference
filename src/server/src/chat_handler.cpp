@@ -1,4 +1,5 @@
 #include "chat_handler.hpp"
+#include "embeddings_route.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -980,6 +981,7 @@ void execute_embeddings(ChatExchange& ex, const EmbedJob& job, const Correlation
     EmbedRequest embed_req;
     embed_req.request_id = *ro.request_id;
     embed_req.inputs = job.inputs;
+    embed_req.token_inputs = job.token_inputs;
     embed_req.normalize = job.normalize;
     embed_req.dimensions = job.dimensions;
     embed_req.pooling_type = job.pooling_type;
@@ -1007,34 +1009,7 @@ void execute_embeddings(ChatExchange& ex, const EmbedJob& job, const Correlation
         return;
     }
 
-    const EmbedResult& r = result.value();
-    json::Array data;
-    data.reserve(r.embeddings.size());
-    for (std::size_t i = 0; i < r.embeddings.size(); ++i) {
-        json::Array vec;
-        vec.reserve(r.embeddings[i].size());
-        for (const float v : r.embeddings[i]) {
-            vec.emplace_back(static_cast<double>(v));
-        }
-        data.emplace_back(json::Object{{"object", "embedding"},
-                                       {"index", static_cast<std::int64_t>(i)},
-                                       {"embedding", std::move(vec)}});
-    }
-    const std::size_t effective_dims =
-        r.dimensions > 0 ? r.dimensions : (!r.embeddings.empty() ? r.embeddings.front().size() : 0u);
-    json::Object meta{{"api_version", kApiVersion},
-                      {"request_id", *ro.request_id},
-                      {"backend", backend},
-                      {"model", model},
-                      {"synthetic", ex.synthetic},
-                      {"dimensions", static_cast<std::uint64_t>(effective_dims)},
-                      {"pooling_type", to_string(r.pooling_type)},
-                      {"encoding_format", r.encoding_format.empty() ? job.encoding_format : r.encoding_format}};
-    json::Object doc{{"object", "list"},
-                     {"data", std::move(data)},
-                     {"model", model},
-                     {"usage", json::Object{{"prompt_tokens", r.prompt_tokens}, {"total_tokens", r.prompt_tokens}}},
-                     {"sonder", std::move(meta)}};
+    json::Object doc = build_embeddings_response(job, result.value(), model, backend, *ro.request_id, ex.synthetic);
     session->close();
     ex.send_json(200, doc);
 }

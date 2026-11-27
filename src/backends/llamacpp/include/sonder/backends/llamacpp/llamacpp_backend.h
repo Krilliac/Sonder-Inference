@@ -109,6 +109,7 @@ inline constexpr std::uint32_t kMaxSlots = 16;
 inline constexpr std::uint32_t kMaxEmbedSequences = 64;
 inline constexpr std::uint32_t kDefaultEmbedBatchTokens = 2048;
 inline constexpr std::uint32_t kDefaultEmbedMaxSequences = 16;
+inline constexpr std::uint32_t kDefaultEmbedMaxTotalTokens = 262144;
 
 // Maximum draft tokens per speculative step and per-strategy defaults.
 inline constexpr std::int32_t kMaxSpecDraftTokens = 64;
@@ -249,6 +250,10 @@ struct LoadOptions {
     std::uint32_t embed_batch_tokens = kDefaultEmbedBatchTokens;
     // Maximum sequences packed per embedding/rerank forward pass (0 = auto, max kMaxEmbedSequences).
     std::uint32_t embed_max_sequences = kDefaultEmbedMaxSequences;
+    // Per-request embedding limits on the tokenized inputs (0 = no limit). A single input is
+    // always bounded by the context window as well.
+    std::uint32_t embed_max_total_tokens = kDefaultEmbedMaxTotalTokens;
+    std::uint32_t embed_max_input_tokens = 0;
 };
 
 // Checks placement options (main_gpu >= 0, split_mode, tensor_split finite /

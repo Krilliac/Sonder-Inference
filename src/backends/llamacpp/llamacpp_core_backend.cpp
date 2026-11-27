@@ -774,6 +774,8 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     lo.spec_batch_max_aggregate_draft_tokens = o.spec_batch_max_aggregate_draft_tokens;
     lo.embed_batch_tokens = o.embed_batch_tokens;
     lo.embed_max_sequences = o.embed_max_sequences;
+    lo.embed_max_total_tokens = o.embed_max_total_tokens;
+    lo.embed_max_input_tokens = o.embed_max_input_tokens;
     if (!lc::ParseSplitMode(o.split_mode, lo.split_mode)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown split mode '" + o.split_mode + "' (expected none, layer or row)");
@@ -873,8 +875,11 @@ public:
 
     Result<EmbedResult> embed(const EmbedRequest& request, const CancellationToken& cancel) override {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
-        if (request.inputs.empty()) {
+        if (request.inputs.empty() && request.token_inputs.empty()) {
             return Status(ErrorCode::invalid_argument, "embed request inputs are empty");
+        }
+        if (!request.inputs.empty() && !request.token_inputs.empty()) {
+            return Status(ErrorCode::invalid_argument, "embed request mixes text inputs and token inputs");
         }
         if (request.pooling_type == EmbedPoolingType::rank) {
             return Status(ErrorCode::invalid_argument,
@@ -882,7 +887,12 @@ public:
         }
         std::unique_lock<std::shared_mutex> lock(mutex_);
         std::vector<std::vector<lc::Token>> tokenized;
-        tokenized.reserve(request.inputs.size());
+        tokenized.reserve(request.inputs.size() + request.token_inputs.size());
+        // Pre-tokenized inputs are evaluated exactly as given (no special tokens are added).
+        for (const std::vector<TokenId>& ids : request.token_inputs) {
+            if (ids.empty()) return Status(ErrorCode::invalid_argument, "embed token input is empty");
+            tokenized.emplace_back(ids.begin(), ids.end());
+        }
         for (const std::string& input : request.inputs) {
             if (cancel.cancelled()) return Status(ErrorCode::cancelled, "embedding cancelled");
             std::vector<lc::Token> toks;
