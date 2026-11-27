@@ -427,6 +427,7 @@ endif()
 # --- expected features end ---
 
 add_library(sonder_backend_llamacpp STATIC
+    gguf_compat.cpp
     llamacpp_backend.cpp
     llamacpp_util.cpp
 )

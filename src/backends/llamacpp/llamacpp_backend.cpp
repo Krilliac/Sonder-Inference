@@ -30,6 +30,7 @@
 
 #include "batch_scheduler.hpp"
 #include "embed_batch_planner.hpp"
+#include "gguf_compat.hpp"
 #include "prefix_coalescer.hpp"
 #include "radix_cache.hpp"
 #include "speculation_transition.hpp"
@@ -560,6 +561,7 @@ Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n
 }  // namespace
 
 struct LlamaCppBackend::Impl {
+    GgufCompatOverlay compat_overlay;
     llama_model* model = nullptr;
     llama_context* ctx = nullptr;
     const llama_vocab* vocab = nullptr;
@@ -974,6 +976,7 @@ struct LlamaCppBackend::Impl {
             llama_model_free(model);
             model = nullptr;
         }
+        compat_overlay.Reset();
         vocab = nullptr;
         slots.clear();
         slot_busy.clear();
@@ -2398,9 +2401,17 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
         mp.tensor_buft_overrides = overrides.data();
     }
 
-    llama_model* model = llama_model_load_from_file(options.model_path.c_str(), mp);
+    std::string compat_err;
+    llama_model* model = LoadModelWithGgufCompat(options.model_path, mp, impl_->compat_overlay, &compat_err);
     if (model == nullptr) {
-        return Status::Error(ErrorCode::kLoadFailed, "llama.cpp failed to load: " + options.model_path);
+        return Status::Error(
+            ErrorCode::kLoadFailed,
+            compat_err.empty() ? ("llama.cpp failed to load: " + options.model_path)
+                               : ("llama.cpp failed to load: " + options.model_path + " (" + compat_err + ")"));
+    }
+    if (impl_->compat_overlay.active() && !impl_->compat_overlay.inspection().detail.empty()) {
+        const std::string line = "gguf_compat: " + impl_->compat_overlay.inspection().detail + "\n";
+        RouteLog(LogLevel::kInfo, line.c_str());
     }
     impl_->model = model;
     impl_->vocab = llama_model_get_vocab(model);
