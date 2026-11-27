@@ -140,9 +140,9 @@ struct ServerOptions {
     // Telemetry. The live hub is always attached; `extra_sinks` (e.g. the
     // --telemetry JSONL file) receive the same events.
     TelemetryLevel telemetry_level = TelemetryLevel::standard;
-    std::size_t telemetry_buffer = 8192;      // retained ring, events
+    std::size_t telemetry_buffer = 8192;      // retained events per sequence stream (main, samples)
     std::size_t max_subscribers = 8;          // concurrent telemetry streams
-    std::size_t subscriber_queue = 0;         // per-subscriber queue; 0 = telemetry_buffer
+    std::size_t subscriber_queue = 0;         // per-subscriber queue; 0 = 2 x telemetry_buffer
     bool capture_text = false;                // requires `token`
     // Declared telemetry text-capture policy (--text-capture / env
     // SONDER_INFER_TEXT_CAPTURE); `capture_text` is the legacy spelling of

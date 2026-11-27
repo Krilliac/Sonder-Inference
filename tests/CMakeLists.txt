@@ -30,6 +30,7 @@ sonder_add_module_tests(core
     test_batch_scheduler.cpp
     test_speculation_transition.cpp
     test_execution_state_lifecycle.cpp
+    test_grammar_retry.cpp
 )
 
 if(TARGET sonder_core_tests)
