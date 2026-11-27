@@ -11,8 +11,8 @@ that include their code must keep the notices below.
 ------------------------------------------------------------------------------
 llama.cpp / GGML  (optional backend, SONDER_WITH_LLAMA_CPP=ON; statically
 linked into sonder_inference when enabled)
-  https://github.com/ggml-org/llama.cpp  tag b11195
-  (commit d834d44e643681f7b046a22d357335f6f4ff6107)
+  https://github.com/ggml-org/llama.cpp  tag v1.0.0
+  (commit b1b770d90d94cad9e9ea5b993bdbc383a522fb28)
   License: MIT
   Copyright (c) 2023-2026 The ggml authors
 

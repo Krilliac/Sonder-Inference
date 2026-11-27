@@ -39,7 +39,7 @@ reference's meaning; no identity registry or authorization is introduced.
 Identifiers are explicit telemetry metadata, visible independently of text
 capture. Do not put prompts, secrets or personal data in IDs. Validation is a
 structural bound, not a semantic privacy filter. Metadata never enables text
-capture. Producer identity/global sequence cursors, known mock provenance,
+capture. Producer identity/per-stream sequence cursors, known mock provenance,
 the 64-chunk queue, 25 ms cancellation polling, independent completion,
 drain-before-error and native input lifetime remain unchanged. Result text
 and exception tracebacks can retain data; this is not a total byte-memory cap.
@@ -65,7 +65,7 @@ The real older-library control supplements the collected missing-symbol
 proxy. An original-header compiled C caller must still run against the new
 library. The bounded stress driver uses 1/2/4 workers and independent sessions
 with mixed generate/chat and iterator requests, alternating/unset parents,
-per-session correlation, unique engine IDs, contiguous producer cursors and
+per-session correlation, unique engine IDs, contiguous per-stream producer cursors and
 capture-off private prompt exclusion. Timings describe synthetic SDK/engine
 overhead on that host, not provider/model speed or quality. Generated logs,
 recordings and receipts stay outside Git.

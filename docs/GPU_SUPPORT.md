@@ -43,7 +43,7 @@ Sonder's header-only GGUF reader (`src/server/src/gguf_header.cpp`) recognizes t
 Rules enforced at startup before any model file is loaded:
 
 - Any quantized V cache (`is_quantized_kv_cache_type()` — everything except `f32`, `f16`, `bf16`) requires `flash_attn` `on` or `auto`. Pairing a quantized V cache with `flash_attn: "off"` fails fast with `invalid_argument`.
-- Direct `llamacpp` profiles and `serve` CLI flags reject `f8_e4m3`, `q2_0`, and `pq2_0m` because the default pinned `b11195` library does not expose them; use `llamaserver` with a matching `llama-server` binary.
+- Direct `llamacpp` profiles and `serve` CLI flags reject `f8_e4m3`, `q2_0`, and `pq2_0m` as KV cache types (`is_llamacpp_kv_cache_type()` in `launch_profile.cpp`); use `llamaserver` with a matching `llama-server` binary. The default `v1.0.0` pin does define `GGML_TYPE_F8_E4M3`, and direct `LoadOptions` accept `f8_e4m3` there, but the profile and CLI paths still reject it.
 - Compact ternary/1-bit weights reduce weight VRAM sharply, making KV cache dtype, context length, FlashAttention kernel pairing, and concurrent slot count the primary VRAM levers on 16 GiB cards.
 
 ### PrismML Hadamard Metadata (`prism.hadamard.*`) and Runtime Overrides
@@ -55,7 +55,7 @@ When a GGUF header contains any `prism.hadamard.*` metadata key (such as `prism.
 - `plan_model_placement()` adds an explicit warning that stock `llama-server` cannot load the file and requires PrismML's Hadamard-capable runtime.
 - If a spawned `llama-server` fails to load unknown tensor types or reports a `prism.hadamard` error in its log file, `LogDiagnostics` emits warning code `ternary_runtime_incompatible`.
 
-To build the direct `llamacpp` backend against a newer mainline or PrismML `llama.cpp` tree without editing the default `b11195` pin (see also [BACKENDS.md](BACKENDS.md#upstream-llamacpp-pin-and-ternary--prismml-overrides)):
+To build the direct `llamacpp` backend against a newer mainline or PrismML `llama.cpp` tree without editing the default pin in `cmake/llamacpp-pin.json` (see also [BACKENDS.md](BACKENDS.md#upstream-llamacpp-pin-and-ternary--prismml-overrides)):
 
 ```powershell
 # Windows one-liner (normalizes path, enters VS x64 DevShell, builds & tests):
