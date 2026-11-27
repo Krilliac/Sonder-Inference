@@ -108,6 +108,7 @@ set(SONDER_MODULE_DIRS
     src/backends/ollama
     src/backends/llamaserver
     src/artifacts
+    src/worker
     src/server
     bench)
 foreach(module_dir IN LISTS SONDER_MODULE_DIRS)

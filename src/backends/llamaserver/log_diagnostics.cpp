@@ -357,6 +357,7 @@ void LogDiagnostics::reset() {
     keys_.clear();
     mtp_bytes_ = 0;
     offload_.reset();
+    fault_.reset();
     if (ready_ && diagnostics_blind_) {
         add(BackendWarning{"diagnostics_blind", "warning", "config",
                            "llama-server log verbosity is below 4; offload diagnostics cannot be observed", {}, 1},
@@ -443,8 +444,134 @@ BackendWarning *LogDiagnostics::add(BackendWarning warning, std::string key) {
     return &warnings_.back();
 }
 
+namespace {
+
+std::string bounded(std::string_view text, std::size_t cap) {
+    while (!text.empty() && (text.front() == ' ' || text.front() == '\t'))
+        text.remove_prefix(1);
+    while (!text.empty() && (text.back() == ' ' || text.back() == '\t' || text.back() == '\r'))
+        text.remove_suffix(1);
+    return std::string(text.substr(0, cap));
+}
+
+bool has(std::string_view text, std::string_view needle) { return text.find(needle) != std::string_view::npos; }
+
+// Strips an optional common_log prefix (`0.01.234.567 E `, or a bare level
+// letter) so fault matchers can anchor to the start of the ggml-emitted text.
+// A request body, response body or prompt-token debug line from llama-server
+// starts with its own tag, so text an API caller controls never reaches the
+// anchored matchers.
+std::string_view strip_log_prefix(std::string_view text) {
+    std::size_t i = 0;
+    while (i < text.size() && ((text[i] >= '0' && text[i] <= '9') || text[i] == '.'))
+        ++i;
+    if (i > 0) {
+        if (i >= text.size() || text[i] != ' ')
+            return text;
+        while (i < text.size() && text[i] == ' ')
+            ++i;
+        text.remove_prefix(i);
+    }
+    if (text.size() >= 2 && text[1] == ' ' && (text[0] == 'D' || text[0] == 'I' || text[0] == 'W' || text[0] == 'E'))
+        text.remove_prefix(2);
+    return text;
+}
+
+bool starts_with(std::string_view text, std::string_view prefix) { return text.substr(0, prefix.size()) == prefix; }
+
+constexpr std::string_view kVkLost = "ggml_vulkan: device lost on ";
+
+} // namespace
+
+// Fatal accelerator faults. Runs before the warning matchers and never
+// consumes the line, so the existing warnings keep their shape.
+void LogDiagnostics::note_fault(std::string_view text) {
+    // Continuation lines of ggml_vk_print_device_fault_info.
+    // When the driver gives no description upstream prints these without a
+    // "device fault on" line, so they are held until a fault is recorded.
+    {
+        auto &sink = fault_ ? fault_->details : pending_details_;
+        if (sink.size() < kMaxFaultDetails) {
+            const auto trimmed = bounded(text, kMaxFaultText);
+            if (trimmed.rfind("address fault ", 0) == 0 || trimmed.rfind("vendor fault ", 0) == 0)
+                sink.push_back(trimmed);
+        }
+    }
+
+    std::string backend, reason, device, description;
+    static constexpr std::string_view kVkFault = "ggml_vulkan: device fault on ";
+    static constexpr std::string_view kVkHpp = "ggml_vulkan: ";
+    const auto anchored = strip_log_prefix(text);
+    if (starts_with(anchored, kVkFault)) {
+        backend = "vulkan";
+        reason = "device_fault";
+        const auto rest = anchored.substr(kVkFault.size());
+        const auto colon = rest.find(": ");
+        device = bounded(rest.substr(0, colon), kMaxFaultText);
+        if (colon != std::string_view::npos)
+            description = bounded(rest.substr(colon + 2), kMaxFaultText);
+    } else if (starts_with(anchored, kVkLost)) {
+        // ggml_vk_print_device_lost_info: "device lost on <name>" or
+        // "device lost on <name>, likely caused by ...".
+        backend = "vulkan";
+        reason = "device_lost";
+        const auto rest = anchored.substr(kVkLost.size());
+        // The serialized-submission form has no comma:
+        // "device lost on <name> waiting for submission (nodes a to b):".
+        auto end = rest.find(',');
+        if (const auto waiting = rest.find(" waiting for submission"); waiting < end)
+            end = waiting;
+        device = bounded(rest.substr(0, end), kMaxFaultText);
+    } else if (starts_with(anchored, kVkHpp) && has(anchored, "ErrorDeviceLost")) {
+        // vulkan-hpp what() text when a catch site forwards it.
+        backend = "vulkan";
+        reason = "device_lost";
+    } else if (starts_with(anchored, "CUDA error: ") || starts_with(anchored, "HIP error: ") ||
+               starts_with(anchored, "ROCm error: ")) {
+        // cudaErrorInvalidKernelImage ("device kernel image is invalid") is a
+        // wrong-arch build, not a device fault, so it is not listed.
+        static constexpr std::string_view kFatal[] = {
+            "unspecified launch failure", "illegal memory access", "device-side assert",
+            "launch timed out",           "illegal instruction",    "uncorrectable ECC",
+            "misaligned address",         "hardware stack error"};
+        for (const auto phrase : kFatal) {
+            if (has(anchored, phrase)) {
+                backend = starts_with(anchored, "CUDA error: ") ? "cuda" : "rocm";
+                reason = "fatal_error";
+                description = bounded(anchored, kMaxFaultText);
+                break;
+            }
+        }
+    }
+    if (backend.empty())
+        return;
+    if (!fault_) {
+        fault_ = DeviceFault{backend, reason, device, description, std::move(pending_details_)};
+        pending_details_.clear();
+    } else if (fault_->backend == backend) {
+        if (fault_->device.empty())
+            fault_->device = device;
+        if (fault_->description.empty())
+            fault_->description = description;
+    }
+    // Device loss keeps its existing vulkan_runtime_error warning.
+    if (reason == "device_lost")
+        return;
+    if (auto *existing = find("device_fault", backend)) {
+        ++existing->count;
+        return;
+    }
+    add(BackendWarning{"device_fault", "warning", "log",
+                       "accelerator fault (" + (device.empty() ? backend : device) + "): " +
+                           (description.empty() ? reason : description) +
+                           "; the device is marked unhealthy and is not scheduled again until the host recovers it",
+                       {{"backend", backend}, {"reason", reason}}, 1},
+        backend);
+}
+
 void LogDiagnostics::line(std::string_view text) {
     ++lines_;
+    note_fault(text);
     const auto bump = [&](std::string_view code, const std::string &key, auto make) {
         if (auto *existing = find(code, key)) {
             ++existing->count;
@@ -622,11 +749,11 @@ void LogDiagnostics::line(std::string_view text) {
         return;
     }
 
-    if (text.find("VK_ERROR_DEVICE_LOST") != std::string_view::npos) {
+    if (text.find("VK_ERROR_DEVICE_LOST") != std::string_view::npos || starts_with(strip_log_prefix(text), kVkLost)) {
         bump("vulkan_runtime_error", "device_lost", [&] {
             return BackendWarning{
                 "vulkan_runtime_error", "warning", "log",
-                "Vulkan device lost (VK_ERROR_DEVICE_LOST); GPU driver reset or compute timeout occurred",
+                "Vulkan device lost; GPU driver reset or compute timeout occurred",
                 {{"backend", "vulkan"}, {"reason", "device_lost"}}, 1};
         });
         return;
