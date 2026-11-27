@@ -13,8 +13,14 @@ the host). A fault is any of:
 
 - `ggml_vulkan: device lost on <device>` (Vulkan, printed at every vk::DeviceLostError catch site in the b11195 pin);
 - `ggml_vulkan: device fault on <device>: <text>` (VK_EXT_device_fault output,
-  llama.cpp #32008; present in the b11195 pin), including the following
-  `address fault` / `vendor fault` lines;
+  llama.cpp `ggml_vk_print_device_fault_info`), including the following
+  `address fault` / `vendor fault` lines. The printing code is in the b11195
+  pin, but the fix llama.cpp #32008 (allocate the vendor binary buffer) is
+  not: it first appears in v1.0.0. On drivers that report
+  `vendorBinarySize > 0` (AMD) the `device fault on` line and its details may
+  therefore not appear at b11195. This is not handled here; bump the pin or
+  cherry-pick #32008 to get them. Upstream prints the fault info before the
+  `device lost on` line;
 - a CUDA/HIP error such as `unspecified launch failure`,
   `illegal memory access`, `device-side assert` or `launch timed out`.
 

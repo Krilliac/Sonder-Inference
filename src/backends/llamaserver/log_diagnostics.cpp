@@ -487,10 +487,15 @@ constexpr std::string_view kVkLost = "ggml_vulkan: device lost on ";
 // consumes the line, so the existing warnings keep their shape.
 void LogDiagnostics::note_fault(std::string_view text) {
     // Continuation lines of ggml_vk_print_device_fault_info.
-    if (fault_ && fault_->details.size() < kMaxFaultDetails) {
-        const auto trimmed = bounded(text, kMaxFaultText);
-        if (trimmed.rfind("address fault ", 0) == 0 || trimmed.rfind("vendor fault ", 0) == 0)
-            fault_->details.push_back(trimmed);
+    // When the driver gives no description upstream prints these without a
+    // "device fault on" line, so they are held until a fault is recorded.
+    {
+        auto &sink = fault_ ? fault_->details : pending_details_;
+        if (sink.size() < kMaxFaultDetails) {
+            const auto trimmed = bounded(text, kMaxFaultText);
+            if (trimmed.rfind("address fault ", 0) == 0 || trimmed.rfind("vendor fault ", 0) == 0)
+                sink.push_back(trimmed);
+        }
     }
 
     std::string backend, reason, device, description;
@@ -511,7 +516,12 @@ void LogDiagnostics::note_fault(std::string_view text) {
         backend = "vulkan";
         reason = "device_lost";
         const auto rest = anchored.substr(kVkLost.size());
-        device = bounded(rest.substr(0, rest.find(',')), kMaxFaultText);
+        // The serialized-submission form has no comma:
+        // "device lost on <name> waiting for submission (nodes a to b):".
+        auto end = rest.find(',');
+        if (const auto waiting = rest.find(" waiting for submission"); waiting < end)
+            end = waiting;
+        device = bounded(rest.substr(0, end), kMaxFaultText);
     } else if (starts_with(anchored, kVkHpp) && has(anchored, "ErrorDeviceLost")) {
         // vulkan-hpp what() text when a catch site forwards it.
         backend = "vulkan";
@@ -536,7 +546,8 @@ void LogDiagnostics::note_fault(std::string_view text) {
     if (backend.empty())
         return;
     if (!fault_) {
-        fault_ = DeviceFault{backend, reason, device, description, {}};
+        fault_ = DeviceFault{backend, reason, device, description, std::move(pending_details_)};
+        pending_details_.clear();
     } else if (fault_->backend == backend) {
         if (fault_->device.empty())
             fault_->device = device;

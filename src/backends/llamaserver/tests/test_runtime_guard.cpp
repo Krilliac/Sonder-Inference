@@ -916,6 +916,37 @@ TEST_CASE("supervisor appends --log-file and surfaces log warnings after readine
     CHECK(std::find(argv2.begin(), argv2.end(), "ignored.log") == argv2.end());
 }
 
+TEST_CASE("log parser handles the real upstream order: fault info first, then the lost line") {
+    {
+        LogDiagnostics d;
+        d.feed("ggml_vulkan: device fault on AMD Radeon RX 9060 XT: page fault at 0x1000\n");
+        d.feed("address fault 0: type=2 address=0x1000 precision=0x1000\n");
+        d.feed("vendor fault 0: GCVM_L2_PROTECTION_FAULT (code=0x1 data=0x2)\n");
+        d.feed("ggml_vulkan: device lost on AMD Radeon RX 9060 XT, likely caused by previous submission (nodes 1 to 2):\n");
+        REQUIRE(d.device_fault().has_value());
+        CHECK(d.device_fault()->reason == "device_fault");
+        CHECK(d.device_fault()->device == "AMD Radeon RX 9060 XT");
+        CHECK(d.device_fault()->description == "page fault at 0x1000");
+        CHECK(d.device_fault()->details.size() == 2);
+    }
+    {
+        // No driver description: upstream prints the detail lines with no fault line.
+        LogDiagnostics d;
+        d.feed("address fault 0: type=2 address=0x1000 precision=0x1000\n");
+        d.feed("vendor fault 0: GCVM_L2_PROTECTION_FAULT (code=0x1 data=0x2)\n");
+        CHECK_FALSE(d.device_fault().has_value());
+        d.feed("ggml_vulkan: device lost on AMD Radeon RX 9060 XT\n");
+        REQUIRE(d.device_fault().has_value());
+        CHECK(d.device_fault()->details.size() == 2);
+    }
+    {
+        LogDiagnostics d;
+        d.feed("ggml_vulkan: device lost on AMD Radeon RX 9060 XT waiting for submission (nodes 1 to 2):\n");
+        REQUIRE(d.device_fault().has_value());
+        CHECK(d.device_fault()->device == "AMD Radeon RX 9060 XT");
+    }
+}
+
 TEST_CASE("log parser records device faults: Vulkan device lost, VK_EXT_device_fault and fatal CUDA errors") {
     {
         LogDiagnostics d;

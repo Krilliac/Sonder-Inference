@@ -65,8 +65,9 @@ std::vector<BackendWarning> check_kv_cache_pairing(const std::vector<std::string
 //   gpu_init_failed              "failed to initialize CUDA", "failed to initialize HIP", "failed to initialize ROCm"
 //   rocm_runtime_error           "HSA_STATUS_ERROR", "hipError"
 //   vulkan_runtime_error         "failed to initialize Vulkan", "VK_ERROR_DEVICE_LOST" (warning only), "ggml_vulkan: device lost on"
-//   device_fault                 "ggml_vulkan: device fault on <name>: <description>" (VK_EXT_device_fault, llama.cpp
-//                                #32008) and fatal CUDA/HIP errors ("CUDA error: unspecified launch failure",
+//   device_fault                 "ggml_vulkan: device fault on <name>: <description>" (VK_EXT_device_fault; the
+//                                printing code is in the b11195 pin, the vendor-binary fix llama.cpp #32008 is
+//                                not and first appears in v1.0.0) and fatal CUDA/HIP errors ("CUDA error: unspecified launch failure",
 //                                "an illegal memory access was encountered", "device-side assert triggered", ...)
 //   gpu_oom                      CUDA/HIP/Vulkan out-of-memory / "OutOfDeviceMemoryError"
 //   ternary_runtime_incompatible "unknown tensor type", "unsupported ggml type", "prism.hadamard" errors
@@ -77,7 +78,9 @@ std::vector<BackendWarning> check_kv_cache_pairing(const std::vector<std::string
 // trusted again until the host recovers it (for a hung OCuLink GPU that means a
 // hard power cycle of the dock). The first fault wins for backend/reason; the
 // device name and description are filled in by a later VK_EXT_device_fault
-// line when the "device lost" line came first.
+// line when the "device lost" line came first. Upstream prints the fault info
+// first (print_device_lost_info calls print_device_fault_info before the lost
+// line), so the real order is: fault line, address/vendor lines, lost line.
 struct DeviceFault {
     std::string backend;      // "vulkan", "cuda" or "rocm"
     std::string reason;       // "device_lost", "device_fault" or "fatal_error"
@@ -124,6 +127,7 @@ class LogDiagnostics {
     bool diagnostics_blind_ = false;
     std::optional<std::pair<std::uint64_t, std::uint64_t>> offload_;
     std::optional<DeviceFault> fault_;
+    std::vector<std::string> pending_details_; // address/vendor lines seen before any fault line
 };
 
 // Incrementally reads a log file that a child appends to. Bounded per call;
