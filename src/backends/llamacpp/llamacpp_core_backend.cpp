@@ -36,6 +36,7 @@
 #include "sonder/inference/json.hpp"
 #include "llamacpp_internal.hpp"
 #include "tool_grammar_preflight.hpp"
+#include "request_guards.hpp"
 
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
 #  include "backends/llamaserver/gpu_memory.hpp"
@@ -1189,6 +1190,7 @@ private:
         lc::GenerateRequest req;
         req.prompt = std::move(prompt_tokens);
         if (req.prompt.empty()) return Status(ErrorCode::invalid_argument, "prompt produced no tokens");
+        if (lc::Status s = lc::ValidateStopSequences(sampling.stop); !s.ok()) return ToStatus(s);
         req.max_new_tokens = sampling.max_tokens;
         req.sampling = ToLlamaSampling(sampling);
         req.sampling.grammar = std::string(grammar);
