@@ -81,6 +81,7 @@ public:
         std::size_t cut = std::string::npos;
         const std::string* matched = nullptr;
         for (const auto& s : stops_) {
+            if (s.empty()) continue;
             const std::size_t at = held_.find(s);
             if (at != std::string::npos &&
                 (at < cut || (at == cut && matched && s.size() > matched->size()))) {
@@ -98,6 +99,7 @@ public:
         // Keep the longest suffix that is a proper prefix of some stop string.
         std::size_t keep = 0;
         for (const auto& s : stops_) {
+            if (s.empty()) continue;
             const std::size_t limit = std::min(held_.size(), s.size() - 1);
             for (std::size_t k = limit; k > keep; --k) {
                 if (std::string_view(held_).substr(held_.size() - k) == std::string_view(s).substr(0, k)) {

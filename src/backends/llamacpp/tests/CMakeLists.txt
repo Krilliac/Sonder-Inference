@@ -14,6 +14,7 @@ sonder_add_module_tests(llamacpp
     test_llamacpp_frontier.cpp
     test_llamacpp_speculative_verifier.cpp
     test_embeddings.cpp
+    test_request_guards.cpp
 )
 if(TARGET sonder_llamacpp_tests)
     target_link_libraries(sonder_llamacpp_tests PRIVATE sonder_backend_llamacpp)
