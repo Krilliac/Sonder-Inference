@@ -223,4 +223,26 @@ TEST_CASE("ParseLimits caps total JSON value count (M-17)") {
     CHECK(capped.status().code() == sonder::inference::ErrorCode::protocol_error);
     CHECK(capped.status().message().find("too many JSON values") != std::string::npos);
 }
+
+TEST_CASE("ParseLimits reject_duplicate_keys turns a repeated key into a parse error") {
+    const std::string dup = R"({"layers":[1],"x":{"a":1,"b":2},"layers":[]})";
+    // Default: the last value wins (unchanged behaviour).
+    auto lenient = json::parse(dup);
+    REQUIRE(lenient.ok());
+    CHECK(lenient.value().find("layers")->as_array().empty());
+
+    json::ParseLimits strict;
+    strict.reject_duplicate_keys = true;
+    auto rejected = json::parse(dup, strict);
+    CHECK_FALSE(rejected.ok());
+    CHECK(rejected.status().message().find("duplicate object key") != std::string::npos);
+    // Nested objects are checked too, and distinct keys still parse.
+    CHECK_FALSE(json::parse(R"({"a":{"k":1,"k":2}})", strict).ok());
+    CHECK(json::parse(R"({"a":{"k":1,"l":2},"b":[{"k":1},{"k":2}]})", strict).ok());
+    // Above the 16-member linear threshold of Object::from_members.
+    std::string wide = "{";
+    for (int i = 0; i < 40; ++i) wide += (i ? ",\"k" : "\"k") + std::to_string(i) + "\":0";
+    CHECK(json::parse(wide + "}", strict).ok());
+    CHECK_FALSE(json::parse(wide + ",\"k7\":1}", strict).ok());
+}
 }

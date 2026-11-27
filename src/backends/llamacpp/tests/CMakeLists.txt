@@ -7,15 +7,19 @@
 #                             reported as Skipped (exit 77) when unset.
 
 sonder_add_module_tests(llamacpp
+    test_gguf_compat.cpp
     test_llamacpp_util.cpp
     test_llamacpp_nomodel.cpp
     test_llamacpp_adapter.cpp
     test_llamacpp_chat.cpp
     test_llamacpp_frontier.cpp
     test_llamacpp_speculative_verifier.cpp
+    test_slot_store.cpp
+    test_request_guards.cpp
 )
 if(TARGET sonder_llamacpp_tests)
     target_link_libraries(sonder_llamacpp_tests PRIVATE sonder_backend_llamacpp)
+    target_link_libraries(sonder_llamacpp_tests PRIVATE llama ggml)
     target_include_directories(sonder_llamacpp_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
     target_compile_definitions(sonder_llamacpp_tests PRIVATE
         SONDER_LLAMACPP_VOCAB_DIR="${SONDER_LLAMACPP_VOCAB_DIR}"

@@ -338,7 +338,7 @@ Status Engine::register_backend(std::shared_ptr<Backend> backend) {
         backends_[name] = backend;
     }
     auto ctx = engine_context();
-    ctx.synthetic_work = name == kMockBackendName;
+    ctx.synthetic_work = is_mock_backend(name);
     telemetry_->emit("backend.registered", ctx,
                      json::Object{{"backend", name}, {"description", backend->description()},
                                   {"capabilities", [&] {
@@ -377,7 +377,7 @@ Result<std::shared_ptr<Model>> Engine::load_model(const std::string& backend_nam
     auto ctx = engine_context();
     ctx.model_instance_id = instance_id;
     ctx.device_id = options.device_id;
-    ctx.synthetic_work = backend_name == kMockBackendName;
+    ctx.synthetic_work = is_mock_backend(backend_name);
     telemetry_->emit("model.load.started", ctx, json::Object{{"backend", backend_name}, {"model", options.model}},
                      TelemetryLevel::metrics);
     const auto t0 = std::chrono::steady_clock::now();
@@ -426,7 +426,7 @@ Status Engine::unload_model(const std::string& model_instance_id) {
     auto ctx = engine_context();
     ctx.model_instance_id = model_instance_id;
     ctx.device_id = model->device_id();
-    ctx.synthetic_work = model->backend_name() == kMockBackendName;
+    ctx.synthetic_work = is_mock_backend(model->backend_name());
     // Sessions may still hold the handle; the backend model is released when
     // the last reference drops.
     telemetry_->emit("model.unload", ctx,

@@ -31,8 +31,10 @@
 #include "batch_scheduler.hpp"
 #include "grammar_retry.hpp"
 #include "embed_batch_planner.hpp"
+#include "gguf_compat.hpp"
 #include "prefix_coalescer.hpp"
 #include "radix_cache.hpp"
+#include "request_guards.hpp"
 #include "speculation_transition.hpp"
 #include "suffix_matcher.hpp"
 
@@ -490,15 +492,119 @@ bool TryAcceptPrefillToken(llama_sampler* grammar, llama_token tok, int32_t n_vo
     return TryAcceptGrammar(grammar, tok);
 }
 
+bool TryAcceptSampler(llama_sampler* sampler, llama_token tok) noexcept {
+    try {
+        llama_sampler_accept(sampler, tok);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool TryApplySampler(llama_sampler* sampler, llama_token_data_array* cur_p) noexcept {
+    try {
+        llama_sampler_apply(sampler, cur_p);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+llama_token TrySampleToken(llama_sampler* sampler, llama_context* ctx, int32_t idx) noexcept {
+    try {
+        return llama_sampler_sample(sampler, ctx, idx);
+    } catch (...) {
+        return LLAMA_TOKEN_NULL;
+    }
+}
+
+#if defined(SONDER_LLAMACPP_HAS_SET_SAMPLER)
+bool TrySetSampler(llama_context* ctx, llama_seq_id seq_id, llama_sampler* sampler) noexcept {
+    try {
+        return llama_set_sampler(ctx, seq_id, sampler);
+    } catch (...) {
+        return false;
+    }
+}
+#endif
+
+int32_t TryDecode(llama_context* ctx, llama_batch batch, Status* err_out = nullptr) noexcept {
+    try {
+        return llama_decode(ctx, batch);
+    } catch (const std::exception& ex) {
+        if (err_out != nullptr) *err_out = ExceptionToStatus(ErrorCode::kDecodeFailed, "llama_decode", &ex);
+        return -99;
+    } catch (...) {
+        if (err_out != nullptr) *err_out = ExceptionToStatus(ErrorCode::kDecodeFailed, "llama_decode", nullptr);
+        return -99;
+    }
+}
+
+int32_t TryEncode(llama_context* ctx, llama_batch batch, Status* err_out = nullptr) noexcept {
+    try {
+        return llama_encode(ctx, batch);
+    } catch (const std::exception& ex) {
+        if (err_out != nullptr) *err_out = ExceptionToStatus(ErrorCode::kDecodeFailed, "llama_encode", &ex);
+        return -99;
+    } catch (...) {
+        if (err_out != nullptr) *err_out = ExceptionToStatus(ErrorCode::kDecodeFailed, "llama_encode", nullptr);
+        return -99;
+    }
+}
+
+std::size_t TryStateSeqGetData(llama_context* ctx, std::uint8_t* dst, std::size_t size,
+                               llama_seq_id seq_id) noexcept {
+    try {
+        return llama_state_seq_get_data(ctx, dst, size, seq_id);
+    } catch (...) {
+        return 0;
+    }
+}
+
+std::size_t TryStateSeqSetData(llama_context* ctx, const std::uint8_t* src, std::size_t size,
+                               llama_seq_id seq_id) noexcept {
+    try {
+        return llama_state_seq_set_data(ctx, src, size, seq_id);
+    } catch (...) {
+        return 0;
+    }
+}
+
+#if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
+std::size_t TryStateSeqGetDataExt(llama_context* ctx, std::uint8_t* dst, std::size_t size, llama_seq_id seq_id,
+                                  llama_state_seq_flags flags) noexcept {
+    try {
+        return llama_state_seq_get_data_ext(ctx, dst, size, seq_id, flags);
+    } catch (...) {
+        return 0;
+    }
+}
+
+std::size_t TryStateSeqSetDataExt(llama_context* ctx, const std::uint8_t* src, std::size_t size, llama_seq_id seq_id,
+                                  llama_state_seq_flags flags) noexcept {
+    try {
+        return llama_state_seq_set_data_ext(ctx, src, size, seq_id, flags);
+    } catch (...) {
+        return 0;
+    }
+}
+#endif
+
 // Order follows llama.cpp's common sampler: logit bias, penalties, then selector
 // (greedy or top-k/typical/top-p/min-p/temp/dist). An optional GBNF grammar is
 // returned separately so Generate() can apply fast grammar-based rejection
 // sampling (checking only the 1 sampled token first and only masking the full
 // vocabulary on the rare rejection case).
 Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n_vocab, int32_t n_ctx,
-                    SamplerPtr& out, SamplerPtr& grammar_out) {
+                    SamplerPtr& out, SamplerPtr& grammar_out, bool already_validated = false) {
     out.reset();
     grammar_out.reset();
+    if (!already_validated) {
+        if (Status s = ValidateSamplingRequestGuards(p, n_vocab); !s.ok()) return s;
+    }
+    Status status = RunGuarded(
+        ErrorCode::kDecodeFailed, "sampler_init",
+        [&]() -> Status {
     SamplerPtr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
     if (!chain) {
         return Status::Error(ErrorCode::kDecodeFailed, "failed to initialize llama sampler chain");
@@ -533,7 +639,7 @@ Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n
                                                /*add_special=*/false, /*parse_special=*/true);
         if (n != 1) {
             return Status::Error(ErrorCode::kInvalidArgument,
-                                 "preserved token does not map to exactly one token id: " + text);
+                                 "preserved token does not map to exactly one token id");
         }
     }
     if (!p.grammar.empty()) {
@@ -547,11 +653,19 @@ Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n
                 gram = llama_sampler_init_grammar_lazy_patterns(
                     vocab, p.grammar.c_str(), "root", patterns.data(), patterns.size(), p.trigger_tokens.data(),
                     p.trigger_tokens.size());
-            } catch (const std::exception&) {
+            } catch (const std::bad_alloc&) {
+                throw;
+            } catch (...) {
                 gram = nullptr;
             }
         } else {
-            gram = llama_sampler_init_grammar(vocab, p.grammar.c_str(), "root");
+            try {
+                gram = llama_sampler_init_grammar(vocab, p.grammar.c_str(), "root");
+            } catch (const std::bad_alloc&) {
+                throw;
+            } catch (...) {
+                gram = nullptr;
+            }
         }
         if (gram == nullptr) {
             return Status::Error(ErrorCode::kInvalidArgument,
@@ -566,7 +680,14 @@ Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n
                 std::span<const std::int32_t>(p.grammar_prefill.data(), p.grammar_prefill.size()),
                 [&](std::int32_t t) { return TryAcceptPrefillToken(grammar_out.get(), t, n_vocab); },
                 [&]() {
-                    grammar_out.reset(llama_sampler_init_grammar(vocab, p.grammar.c_str(), "root"));
+                    try {
+                        grammar_out.reset(llama_sampler_init_grammar(vocab, p.grammar.c_str(), "root"));
+                    } catch (const std::bad_alloc&) {
+                        grammar_out.reset();
+                        throw;
+                    } catch (...) {
+                        grammar_out.reset();
+                    }
                     return grammar_out != nullptr;
                 },
                 [](std::string_view m) {
@@ -585,7 +706,7 @@ Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n
         out = std::move(chain);
         return Status::Ok();
     }
-    if (p.top_k > 0) llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(p.top_k));
+    if (p.top_k > 0) llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(ClampTopK(p.top_k, n_vocab)));
     if (p.typical_p < 1.0F) llama_sampler_chain_add(chain.get(), llama_sampler_init_typical(p.typical_p, 1));
     if (p.top_p < 1.0F) llama_sampler_chain_add(chain.get(), llama_sampler_init_top_p(p.top_p, 1));
     if (p.min_p > 0.0F) llama_sampler_chain_add(chain.get(), llama_sampler_init_min_p(p.min_p, 1));
@@ -593,11 +714,19 @@ Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n
     llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(p.seed));
     out = std::move(chain);
     return Status::Ok();
+        },
+        ErrorCode::kLoadFailed);
+    if (!status.ok()) {
+        out.reset();
+        grammar_out.reset();
+    }
+    return status;
 }
 
 }  // namespace
 
 struct LlamaCppBackend::Impl {
+    GgufCompatOverlay compat_overlay;
     llama_model* model = nullptr;
     llama_context* ctx = nullptr;
     const llama_vocab* vocab = nullptr;
@@ -932,7 +1061,7 @@ struct LlamaCppBackend::Impl {
             if (mtp_backend_chains[i] == nullptr) continue;
 #if defined(SONDER_LLAMACPP_HAS_SET_SAMPLER)
             if (ctx_dft != nullptr) {
-                llama_set_sampler(ctx_dft, static_cast<llama_seq_id>(i), nullptr);
+                (void)TrySetSampler(ctx_dft, static_cast<llama_seq_id>(i), nullptr);
             }
 #endif
             llama_sampler_free(mtp_backend_chains[i]);
@@ -1012,6 +1141,7 @@ struct LlamaCppBackend::Impl {
             llama_model_free(model);
             model = nullptr;
         }
+        compat_overlay.Reset();
         vocab = nullptr;
         slots.clear();
         slot_busy.clear();
@@ -1101,7 +1231,7 @@ struct LlamaCppBackend::Impl {
         ckpt.n_tokens = n_tokens;
         ckpt.last_used = ++checkpoint_clock;
         ckpt.tgt_state.resize(sz);
-        const std::size_t written = llama_state_seq_get_data_ext(ctx, ckpt.tgt_state.data(), sz, slot_id, flags);
+        const std::size_t written = TryStateSeqGetDataExt(ctx, ckpt.tgt_state.data(), sz, slot_id, flags);
         if (written == 0 || written > sz) return;
         ckpt.tgt_state.resize(written);
         ckpt.tgt_state.shrink_to_fit();
@@ -1137,7 +1267,7 @@ struct LlamaCppBackend::Impl {
         }
         if (best == nullptr) return false;
         const std::size_t read =
-            llama_state_seq_set_data_ext(ctx, best->tgt_state.data(), best->tgt_state.size(), slot_id, flags);
+            TryStateSeqSetDataExt(ctx, best->tgt_state.data(), best->tgt_state.size(), slot_id, flags);
         if (read == 0) return false;
         llama_memory_t mem = llama_get_memory(ctx);
         if (!llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(best->n_tokens), -1)) {
@@ -1235,7 +1365,7 @@ struct LlamaCppBackend::Impl {
 
         RadixCacheEntry entry;
         entry.state_blob.resize(sz);
-        const std::size_t written = llama_state_seq_get_data(ctx, entry.state_blob.data(), sz, slot_id);
+        const std::size_t written = TryStateSeqGetData(ctx, entry.state_blob.data(), sz, slot_id);
         if (written == 0 || written > sz) return;
         entry.state_blob.resize(written);
         entry.state_blob.shrink_to_fit();
@@ -1245,7 +1375,7 @@ struct LlamaCppBackend::Impl {
             if (dft_sz > 0 && ctx_dft != nullptr) {
                 entry.dft_state_blob.resize(dft_sz);
                 const std::size_t dw =
-                    llama_state_seq_get_data(ctx_dft, entry.dft_state_blob.data(), dft_sz, slot_id);
+                    TryStateSeqGetData(ctx_dft, entry.dft_state_blob.data(), dft_sz, slot_id);
                 if (dw > 0 && dw <= dft_sz) {
                     entry.dft_state_blob.resize(dw);
                     entry.dft_state_blob.shrink_to_fit();
@@ -1308,8 +1438,8 @@ struct LlamaCppBackend::Impl {
         ResetSwaSlot(slot_idx);
         ClearSlotCheckpoints(slot_idx);
 
-        const std::size_t read = llama_state_seq_set_data(ctx, entry->state_blob.data(),
-                                                          entry->state_blob.size(), slot_id);
+        const std::size_t read = TryStateSeqSetData(ctx, entry->state_blob.data(),
+                                                    entry->state_blob.size(), slot_id);
         if (read == 0) {
             llama_memory_seq_rm(mem, slot_id, -1, -1);
             ResetSwaSlot(slot_idx);
@@ -1351,8 +1481,8 @@ struct LlamaCppBackend::Impl {
             } else if (!entry->dft_state_blob.empty()) {
                 llama_memory_t mem_dft = llama_get_memory(ctx_dft);
                 llama_memory_seq_rm(mem_dft, slot_id, -1, -1);
-                const std::size_t dr = llama_state_seq_set_data(ctx_dft, entry->dft_state_blob.data(),
-                                                                entry->dft_state_blob.size(), slot_id);
+                const std::size_t dr = TryStateSeqSetData(ctx_dft, entry->dft_state_blob.data(),
+                                                          entry->dft_state_blob.size(), slot_id);
                 bool dft_ok = (dr > 0);
                 if (dft_ok && hit.state_tokens() > hit.matched_tokens()) {
                     dft_ok = llama_memory_seq_rm(mem_dft, slot_id, static_cast<llama_pos>(hit.matched_tokens()), -1);
@@ -1397,7 +1527,7 @@ struct LlamaCppBackend::Impl {
         if (gpu_sampled && !sp.compute_logprobs && grammar_sampler == nullptr) {
             tok = llama_get_sampled_token_ith(ctx, batch_idx);
             if (tok != LLAMA_TOKEN_NULL) {
-                llama_sampler_accept(sampler, tok);
+                if (!TryAcceptSampler(sampler, tok)) return LLAMA_TOKEN_NULL;
                 return tok;
             }
         }
@@ -1405,7 +1535,7 @@ struct LlamaCppBackend::Impl {
         (void)gpu_sampled;
 #endif
         if (grammar_sampler == nullptr) {
-            tok = llama_sampler_sample(sampler, ctx, batch_idx);
+            tok = TrySampleToken(sampler, ctx, batch_idx);
             if (tok != LLAMA_TOKEN_NULL && sp.compute_logprobs && out_logprob != nullptr) {
                 if (const float* logits = llama_get_logits_ith(ctx, batch_idx); logits != nullptr) {
                     *out_logprob = ComputeTokenLogprobs(
@@ -1443,7 +1573,7 @@ struct LlamaCppBackend::Impl {
                 cand[static_cast<std::size_t>(v)] = llama_token_data{v, logits[v], 0.0F};
             }
             llama_token_data_array cur_p{cand.data(), cand.size(), -1, false};
-            llama_sampler_apply(sampler, &cur_p);
+            if (!TryApplySampler(sampler, &cur_p)) return LLAMA_TOKEN_NULL;
             if (cur_p.selected < 0 || static_cast<std::size_t>(cur_p.selected) >= cur_p.size) {
                 return LLAMA_TOKEN_NULL;
             }
@@ -1456,7 +1586,7 @@ struct LlamaCppBackend::Impl {
         if (!TryApplyGrammar(grammar_sampler, &single_arr)) return LLAMA_TOKEN_NULL;
         if (std::isfinite(single.logit)) {
             if (!TryAcceptGrammar(grammar_sampler, tok)) return LLAMA_TOKEN_NULL;
-            llama_sampler_accept(sampler, tok);
+            if (!TryAcceptSampler(sampler, tok)) return LLAMA_TOKEN_NULL;
             if (sp.compute_logprobs && out_logprob != nullptr) {
                 *out_logprob = ComputeTokenLogprobs(
                     std::span<const float>(logits, static_cast<std::size_t>(n_vocab)), tok, sp.top_logprobs);
@@ -1472,14 +1602,14 @@ struct LlamaCppBackend::Impl {
         }
         llama_token_data_array cur_p{cand.data(), cand.size(), -1, false};
         if (!TryApplyGrammar(grammar_sampler, &cur_p)) return LLAMA_TOKEN_NULL;
-        llama_sampler_apply(sampler, &cur_p);
+        if (!TryApplySampler(sampler, &cur_p)) return LLAMA_TOKEN_NULL;
         if (cur_p.selected < 0 || static_cast<std::size_t>(cur_p.selected) >= cur_p.size ||
             !std::isfinite(cur_p.data[cur_p.selected].logit)) {
             return LLAMA_TOKEN_NULL;
         }
         tok = cur_p.data[cur_p.selected].id;
         if (!TryAcceptGrammar(grammar_sampler, tok)) return LLAMA_TOKEN_NULL;
-        llama_sampler_accept(sampler, tok);
+        if (!TryAcceptSampler(sampler, tok)) return LLAMA_TOKEN_NULL;
         if (sp.compute_logprobs && out_logprob != nullptr) {
             *out_logprob = ComputeTokenLogprobs(
                 std::span<const float>(logits, static_cast<std::size_t>(n_vocab)), tok, sp.top_logprobs);
@@ -1516,7 +1646,7 @@ struct LlamaCppBackend::Impl {
         const int32_t n_processors = n_stages > 0 ? (n_stages - 1) : 0;
         for (int32_t s_idx = 0; s_idx < n_processors; ++s_idx) {
             if (llama_sampler* stage = llama_sampler_chain_get(sampler, s_idx); stage != nullptr) {
-                llama_sampler_apply(stage, &cur_p);
+                if (!TryApplySampler(stage, &cur_p)) return false;
             }
         }
         if (cur_p.size == 0) {
@@ -1617,7 +1747,9 @@ struct LlamaCppBackend::Impl {
                     if (grammar_sampler != nullptr && !TryAcceptGrammar(grammar_sampler, committed_tok)) {
                         grammar_accept_failed = true;
                     }
-                    llama_sampler_accept(sampler, committed_tok);
+                    if (!TryAcceptSampler(sampler, committed_tok)) {
+                        grammar_accept_failed = true;
+                    }
                     TokenLogprobInfo lp;
                     if (sp.compute_logprobs) {
                         if (const float* logits = llama_get_logits_ith(ctx, static_cast<int32_t>(pos));
@@ -1687,10 +1819,14 @@ struct LlamaCppBackend::Impl {
                                     int64_t n_ctx, int64_t& out_cur_pos, int32_t& out_prompt_tokens) {
         out_cur_pos = 0;
         out_prompt_tokens = 0;
-        if (mtmd_ctx == nullptr) {
-            return Status::Error(ErrorCode::kInvalidArgument,
-                                 "media_blobs provided but no mmproj multimodal projector is loaded (unsupported)");
+        if (Status s = ValidateMultimodalRequest(request, mtmd_ctx != nullptr, true); !s.ok()) {
+            return s;
         }
+        if (Status s = ValidateSeqId(slot_id, std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(slots.size())));
+            !s.ok()) {
+            return s;
+        }
+        return RunGuarded(ErrorCode::kDecodeFailed, "mtmd_eval", [&]() -> Status {
         std::vector<mtmd_bitmap*> bitmaps;
         bitmaps.reserve(request.media_blobs.size());
         struct BitmapGuard {
@@ -1828,10 +1964,12 @@ struct LlamaCppBackend::Impl {
                                  "mtmd_tokenize failed (rc=" + std::to_string(tok_rc) + ")");
         }
 
+        const std::size_t total_tokens = mtmd_helper_get_n_tokens(chunks);
         const llama_pos total_pos = mtmd_helper_get_n_pos(chunks);
-        if (static_cast<int64_t>(total_pos) > n_ctx) {
-            return Status::Error(ErrorCode::kContextOverflow,
-                                 "multimodal prompt exceeds context window");
+        if (Status s = ValidateMultimodalEvalBounds(static_cast<int64_t>(total_tokens),
+                                                    static_cast<int64_t>(total_pos), n_ctx, n_batch);
+            !s.ok()) {
+            return s;
         }
 
         llama_memory_t mem = llama_get_memory(ctx);
@@ -1850,8 +1988,9 @@ struct LlamaCppBackend::Impl {
         }
         out_cur_pos = static_cast<int64_t>(new_n_past);
         out_prompt_tokens = static_cast<int32_t>(
-            std::min<std::size_t>(mtmd_helper_get_n_tokens(chunks), static_cast<std::size_t>(INT32_MAX)));
+            std::min<std::size_t>(total_tokens, static_cast<std::size_t>(INT32_MAX)));
         return Status::Ok();
+        });
     }
 #endif
 
@@ -1872,7 +2011,11 @@ struct LlamaCppBackend::Impl {
 #if defined(SONDER_LLAMACPP_HAS_CTX_OTHER)
         cp_dft.ctx_other = ctx;
 #endif
-        ctx_dft = llama_init_from_model(model, cp_dft);
+        try {
+            ctx_dft = llama_init_from_model(model, cp_dft);
+        } catch (...) {
+            ctx_dft = nullptr;
+        }
         if (ctx_dft == nullptr) return false;
 
         mtp_n_embd = llama_model_n_embd_out(model);
@@ -1909,18 +2052,21 @@ struct LlamaCppBackend::Impl {
         mtp_samplers.resize(n_slots);
         mtp_backend_chains.assign(n_slots, nullptr);
         for (std::size_t i = 0; i < n_slots; ++i) {
-            SamplerPtr s(llama_sampler_chain_init(llama_sampler_chain_default_params()));
-            llama_sampler_chain_add(s.get(), llama_sampler_init_greedy());
-            mtp_samplers[i] = std::move(s);
+            try {
+                SamplerPtr s(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                llama_sampler_chain_add(s.get(), llama_sampler_init_greedy());
+                mtp_samplers[i] = std::move(s);
 #if defined(SONDER_LLAMACPP_HAS_SET_SAMPLER)
-            llama_sampler* bchain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-            llama_sampler_chain_add(bchain, llama_sampler_init_greedy());
-            if (!llama_set_sampler(ctx_dft, static_cast<llama_seq_id>(i), bchain)) {
-                llama_sampler_free(bchain);
-                bchain = nullptr;
-            }
-            mtp_backend_chains[i] = bchain;
+                SamplerPtr bchain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                llama_sampler_chain_add(bchain.get(), llama_sampler_init_greedy());
+                if (TrySetSampler(ctx_dft, static_cast<llama_seq_id>(i), bchain.get())) {
+                    mtp_backend_chains[i] = bchain.release();
+                }
 #endif
+            } catch (...) {
+                ReleaseMtp();
+                return false;
+            }
         }
 
         mtp_pending_h.assign(n_slots, std::vector<float>(static_cast<std::size_t>(mtp_n_embd), 0.0F));
@@ -1952,7 +2098,7 @@ struct LlamaCppBackend::Impl {
             std::memcpy(dft_batch.embd,
                         d.h.data() + static_cast<std::size_t>(off) * static_cast<std::size_t>(mtp_n_embd),
                         row_bytes * static_cast<std::size_t>(step_n));
-            if (llama_decode(ctx_dft, dft_batch) != 0) {
+            if (TryDecode(ctx_dft, dft_batch) != 0) {
                 d.Clear();
                 return false;
             }
@@ -2005,7 +2151,7 @@ struct LlamaCppBackend::Impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
 #endif
                 }
-                if (llama_decode(ctx_dft, dft_batch) != 0) {
+                if (TryDecode(ctx_dft, dft_batch) != 0) {
                     ok = false;
                     break;
                 }
@@ -2098,7 +2244,7 @@ struct LlamaCppBackend::Impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
 #endif
                 }
-                if (llama_decode(ctx_dft, dft_batch) != 0) {
+                if (TryDecode(ctx_dft, dft_batch) != 0) {
                     ok = false;
                     break;
                 }
@@ -2176,7 +2322,7 @@ struct LlamaCppBackend::Impl {
                 llama_set_nextn_layer_offset(ctx_dft, step);
 #endif
             }
-            if (llama_decode(ctx_dft, dft_batch) != 0) {
+            if (TryDecode(ctx_dft, dft_batch) != 0) {
                 if (step == 0 && fused_catchup && !d.pos.empty()) {
                     trim_from = d.pos.front();
                 }
@@ -2193,7 +2339,8 @@ struct LlamaCppBackend::Impl {
             }
 #endif
             if (id == LLAMA_TOKEN_NULL) {
-                id = llama_sampler_sample(mtp_samplers[sidx].get(), ctx_dft, i_last);
+                id = TrySampleToken(mtp_samplers[sidx].get(), ctx_dft, i_last);
+                if (id == LLAMA_TOKEN_NULL) break;
             }
             draft_out.push_back(id);
             if (llama_vocab_is_eog(vocab, id)) break;
@@ -2436,9 +2583,24 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
         mp.tensor_buft_overrides = overrides.data();
     }
 
-    llama_model* model = llama_model_load_from_file(options.model_path.c_str(), mp);
+    std::string compat_err;
+    llama_model* model = nullptr;
+    if (Status s = RunGuarded(ErrorCode::kLoadFailed, "llama_model_load_from_file", [&] {
+            model = LoadModelWithGgufCompat(options.model_path, mp, impl_->compat_overlay, &compat_err);
+            return Status::Ok();
+        });
+        !s.ok()) {
+        return s;
+    }
     if (model == nullptr) {
-        return Status::Error(ErrorCode::kLoadFailed, "llama.cpp failed to load: " + options.model_path);
+        return Status::Error(
+            ErrorCode::kLoadFailed,
+            compat_err.empty() ? ("llama.cpp failed to load: " + options.model_path)
+                               : ("llama.cpp failed to load: " + options.model_path + " (" + compat_err + ")"));
+    }
+    if (impl_->compat_overlay.active() && !impl_->compat_overlay.inspection().detail.empty()) {
+        const std::string line = "gguf_compat: " + impl_->compat_overlay.inspection().detail + "\n";
+        RouteLog(LogLevel::kInfo, line.c_str());
     }
     impl_->model = model;
     impl_->vocab = llama_model_get_vocab(model);
@@ -2460,7 +2622,14 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
         llama_context_params cp = MakeContextParams(options, swa_qualified);
         cp.abort_callback = &Impl::AbortCallback;
         cp.abort_callback_data = impl_.get();
-        impl_->ctx = llama_init_from_model(model, cp);
+        if (Status s = RunGuarded(ErrorCode::kLoadFailed, "llama_init_from_model", [&] {
+                impl_->ctx = llama_init_from_model(model, cp);
+                return Status::Ok();
+            });
+            !s.ok()) {
+            impl_->Release();
+            return s;
+        }
         if (impl_->ctx == nullptr) {
             impl_->Release();
             return Status::Error(ErrorCode::kLoadFailed, "llama.cpp failed to create context");
@@ -2527,7 +2696,14 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
                 mp_mtmd.n_threads = options.n_threads;
             }
             mp_mtmd.flash_attn_type = ToLlamaFlashAttn(options.flash_attn);
-            impl_->mtmd_ctx = mtmd_init_from_file(options.mmproj_path.c_str(), model, mp_mtmd);
+            if (Status s = RunGuarded(ErrorCode::kLoadFailed, "mtmd_init_from_file", [&] {
+                    impl_->mtmd_ctx = mtmd_init_from_file(options.mmproj_path.c_str(), model, mp_mtmd);
+                    return Status::Ok();
+                });
+                !s.ok()) {
+                impl_->Release();
+                return s;
+            }
             if (impl_->mtmd_ctx == nullptr) {
                 impl_->Release();
                 return Status::Error(ErrorCode::kLoadFailed,
@@ -2710,36 +2886,38 @@ Status LlamaCppBackend::Tokenize(std::string_view text, bool add_special, std::v
         return Status::Error(ErrorCode::kInvalidArgument, "text too long");
     }
     const auto len = static_cast<int32_t>(text.size());
-    // Upper bound: one token per byte plus BOS/EOS.
-    out.resize(static_cast<std::size_t>(len) + 2);
-    int32_t n = llama_tokenize(impl_->vocab, text.data(), len, out.data(),
+    return RunGuarded(ErrorCode::kTokenizeFailed, "llama_tokenize", [&]() -> Status {
+        // Upper bound: one token per byte plus BOS/EOS.
+        out.resize(static_cast<std::size_t>(len) + 2);
+        int32_t n = llama_tokenize(impl_->vocab, text.data(), len, out.data(),
+                                   static_cast<int32_t>(out.size()), add_special, parse_special);
+        if (n < 0 && n != INT32_MIN) {
+            out.resize(static_cast<std::size_t>(-n));
+            n = llama_tokenize(impl_->vocab, text.data(), len, out.data(),
                                static_cast<int32_t>(out.size()), add_special, parse_special);
-    if (n < 0 && n != INT32_MIN) {
-        out.resize(static_cast<std::size_t>(-n));
-        n = llama_tokenize(impl_->vocab, text.data(), len, out.data(),
-                           static_cast<int32_t>(out.size()), add_special, parse_special);
-    }
-    if (n < 0) {
-        out.clear();
-        return Status::Error(ErrorCode::kTokenizeFailed, "llama_tokenize failed");
-    }
-    out.resize(static_cast<std::size_t>(n));
-    return Status::Ok();
+        }
+        if (n < 0) {
+            out.clear();
+            return Status::Error(ErrorCode::kTokenizeFailed, "llama_tokenize failed");
+        }
+        out.resize(static_cast<std::size_t>(n));
+        return Status::Ok();
+    });
 }
 
 Status LlamaCppBackend::ProbeGrammarMask(const SamplingParams& params, std::span<const Token> accepted,
                                          std::vector<std::uint8_t>& allowed) const {
     allowed.clear();
     if (!IsLoaded()) return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
-    if (Status v = Validate(params); !v.ok()) return v;
     const int32_t n_vocab = llama_vocab_n_tokens(impl_->vocab);
+    if (Status v = ValidateTokenIds(accepted, n_vocab, "accepted"); !v.ok()) return v;
     SamplerPtr chain;
     SamplerPtr grammar;
     if (Status s = BuildSampler(params, impl_->vocab, n_vocab, 0, chain, grammar); !s.ok()) return s;
     allowed.assign(static_cast<std::size_t>(n_vocab), 1);
     if (!grammar) return Status::Ok();
     for (const Token t : accepted) {
-        if (!TryAcceptGrammar(grammar.get(), t)) {
+        if (!TryAcceptPrefillToken(grammar.get(), t, n_vocab)) {
             allowed.clear();
             return Status::Error(ErrorCode::kDecodeFailed, "accepted tokens violate the grammar");
         }
@@ -2770,23 +2948,24 @@ Status LlamaCppBackend::ProbeGrammarMask(const SamplingParams& params, std::span
 Status LlamaCppBackend::TokenToPiece(Token token, std::string& out) const {
     out.clear();
     if (!IsLoaded()) return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
-    if (token < 0 || token >= llama_vocab_n_tokens(impl_->vocab)) {
-        return Status::Error(ErrorCode::kInvalidArgument, "token id out of range");
-    }
-    char stack_buf[64];
-    int32_t n = llama_token_to_piece(impl_->vocab, token, stack_buf, sizeof(stack_buf), 0, /*special=*/false);
-    if (n >= 0) {
-        out.assign(stack_buf, static_cast<std::size_t>(n));
+    const Token one[1] = {token};
+    if (Status s = ValidateTokenIds(one, llama_vocab_n_tokens(impl_->vocab)); !s.ok()) return s;
+    return RunGuarded(ErrorCode::kTokenizeFailed, "llama_token_to_piece", [&]() -> Status {
+        char stack_buf[64];
+        int32_t n = llama_token_to_piece(impl_->vocab, token, stack_buf, sizeof(stack_buf), 0, /*special=*/false);
+        if (n >= 0) {
+            out.assign(stack_buf, static_cast<std::size_t>(n));
+            return Status::Ok();
+        }
+        out.resize(static_cast<std::size_t>(-n));
+        n = llama_token_to_piece(impl_->vocab, token, out.data(), static_cast<int32_t>(out.size()), 0, false);
+        if (n < 0) {
+            out.clear();
+            return Status::Error(ErrorCode::kTokenizeFailed, "llama_token_to_piece failed");
+        }
+        out.resize(static_cast<std::size_t>(n));
         return Status::Ok();
-    }
-    out.resize(static_cast<std::size_t>(-n));
-    n = llama_token_to_piece(impl_->vocab, token, out.data(), static_cast<int32_t>(out.size()), 0, false);
-    if (n < 0) {
-        out.clear();
-        return Status::Error(ErrorCode::kTokenizeFailed, "llama_token_to_piece failed");
-    }
-    out.resize(static_cast<std::size_t>(n));
-    return Status::Ok();
+    });
 }
 
 Status LlamaCppBackend::Detokenize(std::span<const Token> tokens, std::string& out, bool remove_special,
@@ -2797,27 +2976,24 @@ Status LlamaCppBackend::Detokenize(std::span<const Token> tokens, std::string& o
     if (tokens.size() > static_cast<std::size_t>(INT32_MAX)) {
         return Status::Error(ErrorCode::kInvalidArgument, "token span too long");
     }
-    const int32_t n_vocab = llama_vocab_n_tokens(impl_->vocab);
-    for (Token t : tokens) {
-        if (t < 0 || t >= n_vocab) {
-            return Status::Error(ErrorCode::kInvalidArgument, "token id out of range");
-        }
-    }
+    if (Status s = ValidateTokenIds(tokens, llama_vocab_n_tokens(impl_->vocab)); !s.ok()) return s;
     const auto n_tok = static_cast<int32_t>(tokens.size());
-    out.resize(std::max<std::size_t>(64, tokens.size() * 8));
-    int32_t n = llama_detokenize(impl_->vocab, tokens.data(), n_tok, out.data(),
+    return RunGuarded(ErrorCode::kTokenizeFailed, "llama_detokenize", [&]() -> Status {
+        out.resize(std::max<std::size_t>(64, tokens.size() * 8));
+        int32_t n = llama_detokenize(impl_->vocab, tokens.data(), n_tok, out.data(),
+                                     static_cast<int32_t>(out.size()), remove_special, unparse_special);
+        if (n < 0 && n != INT32_MIN) {
+            out.resize(static_cast<std::size_t>(-n));
+            n = llama_detokenize(impl_->vocab, tokens.data(), n_tok, out.data(),
                                  static_cast<int32_t>(out.size()), remove_special, unparse_special);
-    if (n < 0 && n != INT32_MIN) {
-        out.resize(static_cast<std::size_t>(-n));
-        n = llama_detokenize(impl_->vocab, tokens.data(), n_tok, out.data(),
-                             static_cast<int32_t>(out.size()), remove_special, unparse_special);
-    }
-    if (n < 0) {
-        out.clear();
-        return Status::Error(ErrorCode::kTokenizeFailed, "llama_detokenize failed");
-    }
-    out.resize(static_cast<std::size_t>(n));
-    return Status::Ok();
+        }
+        if (n < 0) {
+            out.clear();
+            return Status::Error(ErrorCode::kTokenizeFailed, "llama_detokenize failed");
+        }
+        out.resize(static_cast<std::size_t>(n));
+        return Status::Ok();
+    });
 }
 
 bool LlamaCppBackend::IsEndOfGeneration(Token token) const {
@@ -2855,17 +3031,22 @@ Status LlamaCppBackend::FormatChat(std::string_view chat_template, const std::ve
     if (total > static_cast<std::size_t>(INT32_MAX / 4)) {
         return Status::Error(ErrorCode::kInvalidArgument, "chat too long");
     }
-    std::vector<char> buf(total * 2 + 256);
-    int32_t n = llama_chat_apply_template(tmpl.c_str(), chat.data(), chat.size(), add_assistant, buf.data(),
-                                          static_cast<int32_t>(buf.size()));
-    if (n > static_cast<int32_t>(buf.size())) {
-        buf.resize(static_cast<std::size_t>(n));
-        n = llama_chat_apply_template(tmpl.c_str(), chat.data(), chat.size(), add_assistant, buf.data(),
-                                      static_cast<int32_t>(buf.size()));
-    }
-    if (n < 0) return Status::Error(ErrorCode::kInvalidArgument, "chat template not supported by llama.cpp");
-    out.assign(buf.data(), static_cast<std::size_t>(n));
-    return Status::Ok();
+    return RunGuarded(
+        ErrorCode::kInvalidArgument, "llama_chat_apply_template",
+        [&]() -> Status {
+            std::vector<char> buf(total * 2 + 256);
+            int32_t n = llama_chat_apply_template(tmpl.c_str(), chat.data(), chat.size(), add_assistant, buf.data(),
+                                                  static_cast<int32_t>(buf.size()));
+            if (n > static_cast<int32_t>(buf.size())) {
+                buf.resize(static_cast<std::size_t>(n));
+                n = llama_chat_apply_template(tmpl.c_str(), chat.data(), chat.size(), add_assistant, buf.data(),
+                                              static_cast<int32_t>(buf.size()));
+            }
+            if (n < 0) return Status::Error(ErrorCode::kInvalidArgument, "chat template not supported by llama.cpp");
+            out.assign(buf.data(), static_cast<std::size_t>(n));
+            return Status::Ok();
+        },
+        ErrorCode::kTokenizeFailed);
 }
 
 void LlamaCppBackend::SetTelemetrySink(TelemetrySink sink) { impl_->telemetry = std::move(sink); }
@@ -2888,25 +3069,27 @@ Status LlamaCppBackend::CaptureSequenceState(std::vector<std::uint8_t>& out_byte
     if (!IsLoaded()) return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
     if (impl_->ctx == nullptr) return Status::Error(ErrorCode::kNotLoaded, "model loaded vocab-only; no context");
 
-    const std::size_t state_size = llama_state_seq_get_size(impl_->ctx, 0);
-    if (state_size == 0) {
-        return Status::Error(ErrorCode::kDecodeFailed, "llama_state_seq_get_size returned 0");
-    }
-    if (state_size > max_bytes) {
-        return Status::Error(ErrorCode::kInvalidArgument,
-                             "sequence state size (" + std::to_string(state_size) + " bytes) exceeds max_bytes (" +
-                                 std::to_string(max_bytes) + ")");
-    }
-    out_bytes.resize(state_size);
-    const std::size_t written = llama_state_seq_get_data(impl_->ctx, out_bytes.data(), out_bytes.size(), 0);
-    if (written == 0 || written > state_size) {
-        out_bytes.clear();
-        return Status::Error(ErrorCode::kDecodeFailed,
-                             "llama_state_seq_get_data failed (wrote " + std::to_string(written) + " of " +
-                                 std::to_string(state_size) + " bytes)");
-    }
-    out_bytes.resize(written);
-    return Status::Ok();
+    return RunGuarded(ErrorCode::kDecodeFailed, "llama_state_seq_get_data", [&]() -> Status {
+        const std::size_t state_size = llama_state_seq_get_size(impl_->ctx, 0);
+        if (state_size == 0) {
+            return Status::Error(ErrorCode::kDecodeFailed, "llama_state_seq_get_size returned 0");
+        }
+        if (state_size > max_bytes) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "sequence state size (" + std::to_string(state_size) + " bytes) exceeds max_bytes (" +
+                                     std::to_string(max_bytes) + ")");
+        }
+        out_bytes.resize(state_size);
+        const std::size_t written = llama_state_seq_get_data(impl_->ctx, out_bytes.data(), out_bytes.size(), 0);
+        if (written == 0 || written > state_size) {
+            out_bytes.clear();
+            return Status::Error(ErrorCode::kDecodeFailed,
+                                 "llama_state_seq_get_data failed (wrote " + std::to_string(written) + " of " +
+                                     std::to_string(state_size) + " bytes)");
+        }
+        out_bytes.resize(written);
+        return Status::Ok();
+    });
 }
 
 Status LlamaCppBackend::RestoreSequenceState(std::span<const std::uint8_t> bytes, std::size_t max_bytes) {
@@ -2920,18 +3103,20 @@ Status LlamaCppBackend::RestoreSequenceState(std::span<const std::uint8_t> bytes
     }
     if (!IsLoaded()) return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
     if (impl_->ctx == nullptr) return Status::Error(ErrorCode::kNotLoaded, "model loaded vocab-only; no context");
-    const std::size_t read = llama_state_seq_set_data(impl_->ctx, bytes.data(), bytes.size(), 0);
-    if (read == 0 || read != bytes.size()) {
-        return Status::Error(ErrorCode::kDecodeFailed,
-                             "llama_state_seq_set_data failed (read " + std::to_string(read) + " of " +
-                                 std::to_string(bytes.size()) + " bytes)");
-    }
-    if (!impl_->slots.empty()) {
-        impl_->slots[0].tokens.clear();
-        impl_->slots[0].session_key.clear();
-        impl_->slots[0].last_used = 0;
-    }
-    return Status::Ok();
+    return RunGuarded(ErrorCode::kDecodeFailed, "llama_state_seq_set_data", [&]() -> Status {
+        const std::size_t read = llama_state_seq_set_data(impl_->ctx, bytes.data(), bytes.size(), 0);
+        if (read == 0 || read != bytes.size()) {
+            return Status::Error(ErrorCode::kDecodeFailed,
+                                 "llama_state_seq_set_data failed (read " + std::to_string(read) + " of " +
+                                     std::to_string(bytes.size()) + " bytes)");
+        }
+        if (!impl_->slots.empty()) {
+            impl_->slots[0].tokens.clear();
+            impl_->slots[0].session_key.clear();
+            impl_->slots[0].last_used = 0;
+        }
+        return Status::Ok();
+    });
 }
 
 namespace {
@@ -3207,7 +3392,13 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
 #endif
         cp_emb.abort_callback = &Impl::AbortCallback;
         cp_emb.abort_callback_data = impl_.get();
-        impl_->embed_ctx = llama_init_from_model(impl_->model, cp_emb);
+        if (Status s = RunGuarded(ErrorCode::kDecodeFailed, "llama_init_from_model", [&] {
+                impl_->embed_ctx = llama_init_from_model(impl_->model, cp_emb);
+                return Status::Ok();
+            });
+            !s.ok()) {
+            return s;
+        }
         if (impl_->embed_ctx == nullptr) {
             return Status::Error(ErrorCode::kDecodeFailed, "failed to create embedding context");
         }
@@ -3239,6 +3430,7 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
     }
     const bool encoder_only = llama_model_has_encoder(impl_->model) && !llama_model_has_decoder(impl_->model);
     const auto n_batch = static_cast<std::size_t>(std::max<int32_t>(1, impl_->embed_batch_cap));
+    const auto n_ubatch = static_cast<int32_t>(std::max<uint32_t>(1, llama_n_ubatch(ectx)));
     const auto start = Clock::now();
     std::int64_t total_prompt_tokens = 0;
     Status batch_error = Status::Ok();
@@ -3247,9 +3439,14 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
     const EmbedBatchExecStatus exec_status = ExecuteEmbedBatchPlan<std::vector<float>>(
         plan, cancelled,
         [&](const PlannedEmbedBatch& planned_batch, std::vector<std::vector<float>>& batch_out) -> bool {
-            if (planned_batch.total_tokens > n_batch) {
-                batch_error =
-                    Status::Error(ErrorCode::kContextOverflow, "embedding batch exceeds embedding batch capacity");
+            if (planned_batch.total_tokens > static_cast<std::size_t>(INT32_MAX)) {
+                batch_error = Status::Error(ErrorCode::kContextOverflow, "embedding batch exceeds INT32_MAX");
+                return false;
+            }
+            if (Status s = ValidateBatchBounds(static_cast<int32_t>(planned_batch.total_tokens),
+                                               static_cast<int32_t>(n_batch), n_ubatch, /*require_ubatch_fit=*/true);
+                !s.ok()) {
+                batch_error = std::move(s);
                 return false;
             }
             if (llama_memory_t emem = llama_get_memory(ectx); emem != nullptr) {
@@ -3259,6 +3456,10 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
             std::vector<int32_t> last_tok_idx;
             last_tok_idx.reserve(planned_batch.items.size());
             for (const EmbedBatchItem& item : planned_batch.items) {
+                if (Status s = ValidateSeqId(static_cast<int32_t>(item.seq_id), impl_->embed_seq_max); !s.ok()) {
+                    batch_error = std::move(s);
+                    return false;
+                }
                 const auto& seq = inputs[item.original_index];
                 const std::size_t n_tok = seq.size();
                 for (std::size_t t = 0; t < n_tok; ++t) {
@@ -3268,10 +3469,10 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
                 }
                 last_tok_idx.push_back(impl_->embed_batch.n_tokens - 1);
             }
-            const int32_t rc = encoder_only ? llama_encode(ectx, impl_->embed_batch)
-                                            : llama_decode(ectx, impl_->embed_batch);
+            const int32_t rc = encoder_only ? TryEncode(ectx, impl_->embed_batch, &batch_error)
+                                            : TryDecode(ectx, impl_->embed_batch, &batch_error);
             if (rc != 0) {
-                if (!cancelled()) {
+                if (!cancelled() && batch_error.ok()) {
                     batch_error = Status::Error(ErrorCode::kDecodeFailed,
                                                 "llama embedding pass failed (rc=" + std::to_string(rc) + ")");
                 }
@@ -3432,7 +3633,13 @@ Status LlamaCppBackend::ScorePairs(const std::vector<std::vector<Token>>& pairs,
 #endif
         cp_rank.abort_callback = &Impl::AbortCallback;
         cp_rank.abort_callback_data = impl_.get();
-        impl_->rank_ctx = llama_init_from_model(impl_->model, cp_rank);
+        if (Status s = RunGuarded(ErrorCode::kDecodeFailed, "llama_init_from_model", [&] {
+                impl_->rank_ctx = llama_init_from_model(impl_->model, cp_rank);
+                return Status::Ok();
+            });
+            !s.ok()) {
+            return s;
+        }
         if (impl_->rank_ctx == nullptr) {
             return Status::Error(ErrorCode::kDecodeFailed, "failed to create reranking context");
         }
@@ -3462,6 +3669,7 @@ Status LlamaCppBackend::ScorePairs(const std::vector<std::vector<Token>>& pairs,
 
     const bool encoder_only = llama_model_has_encoder(impl_->model) && !llama_model_has_decoder(impl_->model);
     const auto n_batch = static_cast<std::size_t>(std::max<int32_t>(1, impl_->rank_batch_cap));
+    const auto n_ubatch = static_cast<int32_t>(std::max<uint32_t>(1, llama_n_ubatch(rctx)));
     const auto start = Clock::now();
     std::int64_t total_prompt_tokens = 0;
     Status batch_error = Status::Ok();
@@ -3470,9 +3678,14 @@ Status LlamaCppBackend::ScorePairs(const std::vector<std::vector<Token>>& pairs,
     const EmbedBatchExecStatus exec_status = ExecuteEmbedBatchPlan<double>(
         plan, cancelled,
         [&](const PlannedEmbedBatch& planned_batch, std::vector<double>& batch_out) -> bool {
-            if (planned_batch.total_tokens > n_batch) {
-                batch_error =
-                    Status::Error(ErrorCode::kContextOverflow, "rerank batch exceeds rerank batch capacity");
+            if (planned_batch.total_tokens > static_cast<std::size_t>(INT32_MAX)) {
+                batch_error = Status::Error(ErrorCode::kContextOverflow, "rerank batch exceeds INT32_MAX");
+                return false;
+            }
+            if (Status s = ValidateBatchBounds(static_cast<int32_t>(planned_batch.total_tokens),
+                                               static_cast<int32_t>(n_batch), n_ubatch, /*require_ubatch_fit=*/true);
+                !s.ok()) {
+                batch_error = std::move(s);
                 return false;
             }
             if (llama_memory_t rmem = llama_get_memory(rctx); rmem != nullptr) {
@@ -3482,6 +3695,10 @@ Status LlamaCppBackend::ScorePairs(const std::vector<std::vector<Token>>& pairs,
             std::vector<int32_t> last_tok_idx;
             last_tok_idx.reserve(planned_batch.items.size());
             for (const EmbedBatchItem& item : planned_batch.items) {
+                if (Status s = ValidateSeqId(static_cast<int32_t>(item.seq_id), impl_->rank_seq_max); !s.ok()) {
+                    batch_error = std::move(s);
+                    return false;
+                }
                 const auto& seq = pairs[item.original_index];
                 for (std::size_t t = 0; t < seq.size(); ++t) {
                     BatchAdd(impl_->rank_batch, seq[t], static_cast<llama_pos>(t),
@@ -3489,10 +3706,10 @@ Status LlamaCppBackend::ScorePairs(const std::vector<std::vector<Token>>& pairs,
                 }
                 last_tok_idx.push_back(impl_->rank_batch.n_tokens - 1);
             }
-            const int32_t rc = encoder_only ? llama_encode(rctx, impl_->rank_batch)
-                                            : llama_decode(rctx, impl_->rank_batch);
+            const int32_t rc = encoder_only ? TryEncode(rctx, impl_->rank_batch, &batch_error)
+                                            : TryDecode(rctx, impl_->rank_batch, &batch_error);
             if (rc != 0) {
-                if (!cancelled()) {
+                if (!cancelled() && batch_error.ok()) {
                     batch_error = Status::Error(ErrorCode::kDecodeFailed,
                                                 "llama reranking pass failed (rc=" + std::to_string(rc) + ")");
                 }
@@ -3557,9 +3774,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
 
     if (!IsLoaded()) return fail(ErrorCode::kNotLoaded, "no model loaded");
     if (impl_->ctx == nullptr) return fail(ErrorCode::kNotLoaded, "model loaded vocab-only; no context");
-    if (request.prompt.empty()) return fail(ErrorCode::kInvalidArgument, "prompt is empty");
     if (request.max_new_tokens < 0) return fail(ErrorCode::kInvalidArgument, "max_new_tokens < 0");
-    if (Status s = Validate(request.sampling); !s.ok()) return fail(s.code, s.message);
     if (request.target_ttft_ms.has_value() &&
         (!std::isfinite(*request.target_ttft_ms) || *request.target_ttft_ms <= 0.0)) {
         return fail(ErrorCode::kInvalidArgument, "target_ttft_ms must be finite and > 0");
@@ -3568,20 +3783,14 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
         (!std::isfinite(*request.target_itl_ms) || *request.target_itl_ms <= 0.0)) {
         return fail(ErrorCode::kInvalidArgument, "target_itl_ms must be finite and > 0");
     }
-    if (Status s = ValidateMediaBlobs(request.media_blobs); !s.ok()) return fail(s.code, s.message);
-    if (!request.media_blobs.empty() && !HasMmproj()) {
-        return fail(ErrorCode::kInvalidArgument,
-                    "media_blobs provided but no mmproj multimodal projector is loaded (unsupported)");
+    if (Status s = ValidateMultimodalRequest(request, HasMmproj(), HasMtmdBuildSupport()); !s.ok()) {
+        return fail(s.code, s.message);
     }
 
     const int32_t n_vocab = llama_vocab_n_tokens(impl_->vocab);
-    for (Token t : request.prompt) {
-        if (t < 0 || t >= n_vocab) return fail(ErrorCode::kInvalidArgument, "prompt token out of range");
-    }
-    for (const auto& entry : request.sampling.logit_bias) {
-        if (entry.first < 0 || entry.first >= n_vocab) {
-            return fail(ErrorCode::kInvalidArgument, "logit_bias token out of range");
-        }
+    if (Status s = ValidatePromptTokens(request.prompt, n_vocab); !s.ok()) return fail(s.code, s.message);
+    if (Status s = ValidateSamplingRequestGuards(request.sampling, n_vocab); !s.ok()) {
+        return fail(s.code, s.message);
     }
 
     // When n_slots > 1, dispatch through the single-owner continuous-batching
@@ -3648,7 +3857,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
     SamplerPtr sampler;
     SamplerPtr grammar_sampler;
     if (Status s = BuildSampler(request.sampling, vocab, n_vocab, static_cast<int32_t>(n_ctx), sampler,
-                                grammar_sampler);
+                                grammar_sampler, /*already_validated=*/true);
         !s.ok()) {
         return fail(s.code, s.message);
     }
@@ -3890,10 +4099,16 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         }
     }
 
+    if (Status s = ValidateSeqId(slot_id, std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(slots.size())));
+        !s.ok()) {
+        return fail(s.code, s.message);
+    }
     const int64_t n_past = llama_memory_seq_pos_max(mem, slot_id) + 1;
     const int64_t remaining_prompt = n_prompt - prefill_start_offset;
-    if (!has_media && n_past + remaining_prompt > n_ctx) {
-        return fail(ErrorCode::kContextOverflow, "prompt does not fit in the context window");
+    if (!has_media) {
+        if (Status s = ValidateContextPosition(n_past, remaining_prompt, n_ctx); !s.ok()) {
+            return fail(s.code, s.message);
+        }
     }
 
 #if defined(SONDER_LLAMACPP_HAS_MTP)
@@ -4003,7 +4218,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
 #if defined(SONDER_LLAMACPP_HAS_SET_SAMPLER)
     if (!grammar_sampler && !request.sampling.compute_logprobs &&
         effective_spec_verification_mode != SpeculativeVerificationMode::StochasticRejection) {
-        target_gpu_sampled = llama_set_sampler(ctx, slot_id, sampler.get());
+        target_gpu_sampled = TrySetSampler(ctx, slot_id, sampler.get());
     }
     struct ClearTargetSampler {
         llama_context* c = nullptr;
@@ -4011,7 +4226,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         bool active = false;
         ~ClearTargetSampler() {
             if (active && c != nullptr) {
-                llama_set_sampler(c, sid, nullptr);
+                (void)TrySetSampler(c, sid, nullptr);
             }
         }
     } clear_target_sampler{ctx, slot_id, target_gpu_sampled};
@@ -4114,13 +4329,19 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                 step_end = hybrid_ckpt_offset;
             }
             const auto n = static_cast<int32_t>(step_end - off);
+            if (Status s = ValidateBatchBounds(n, batch_cap, static_cast<int32_t>(n_ubatch),
+                                               /*require_ubatch_fit=*/false);
+                !s.ok()) {
+                return fail(s.code, s.message);
+            }
             BatchClear(batch);
             for (int32_t j = 0; j < n; ++j) {
                 const bool is_last_prompt_tok = (off + j + 1 == n_prompt);
                 BatchAdd(batch, request.prompt[static_cast<std::size_t>(off + j)],
                          static_cast<llama_pos>(cur_pos + j), slot_id, is_last_prompt_tok);
             }
-            const int32_t rc = llama_decode(ctx, batch);
+            Status decode_err;
+            const int32_t rc = TryDecode(ctx, batch, &decode_err);
             if (rc == 2) {
                 if (!llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(cur_pos), -1)) {
                     invalidate_slot();
@@ -4133,6 +4354,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                 if (!llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(cur_pos), -1)) {
                     invalidate_slot();
                 }
+                if (!decode_err.ok()) return fail(decode_err.code, decode_err.message);
                 return fail(ErrorCode::kDecodeFailed,
                             "llama_decode failed during prefill (rc=" + std::to_string(rc) + ")");
             }
@@ -4193,7 +4415,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                         const std::size_t cap = std::min(dec.max_spill_bytes, kMaxSequenceStateBytes);
                         if (state_sz > 0 && state_sz <= cap) {
                             result.suspended_state_blob.resize(state_sz);
-                            const std::size_t wrote = llama_state_seq_get_data(
+                            const std::size_t wrote = TryStateSeqGetData(
                                 ctx, result.suspended_state_blob.data(), result.suspended_state_blob.size(), slot_id);
                             if (wrote > 0 && wrote <= state_sz) {
                                 result.suspended_state_blob.resize(wrote);
@@ -4330,7 +4552,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
             const std::size_t cap = std::min(dec.max_spill_bytes, kMaxSequenceStateBytes);
             if (state_sz > 0 && state_sz <= cap) {
                 result.suspended_state_blob.resize(state_sz);
-                const std::size_t wrote = llama_state_seq_get_data(
+                const std::size_t wrote = TryStateSeqGetData(
                     ctx, result.suspended_state_blob.data(), result.suspended_state_blob.size(), slot_id);
                 if (wrote > 0 && wrote <= state_sz) {
                     result.suspended_state_blob.resize(wrote);
@@ -4493,7 +4715,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                     spec_ckpt_buf.resize(sz);
                 }
                 const std::size_t written =
-                    llama_state_seq_get_data_ext(ctx, spec_ckpt_buf.data(), sz, slot_id, flags);
+                    TryStateSeqGetDataExt(ctx, spec_ckpt_buf.data(), sz, slot_id, flags);
                 if (written > 0 && written <= sz) {
                     spec_ckpt_size = written;
                     have_spec_ckpt = true;
@@ -4515,7 +4737,8 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
 
         const Clock::time_point verify_start =
             (stage_prof && !draft_tokens.empty()) ? Clock::now() : Clock::time_point{};
-        const int32_t rc = llama_decode(ctx, batch);
+        Status decode_err;
+        const int32_t rc = TryDecode(ctx, batch, &decode_err);
         if (stage_prof && !draft_tokens.empty()) {
             add_stage_ms(result.stage_timings.verify_ms, MsSince(verify_start));
         }
@@ -4527,7 +4750,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                 if (have_spec_ckpt && !swa_compact_active) {
                     const llama_state_seq_flags flags = PartialCheckpointFlags();
                     const std::size_t read =
-                        llama_state_seq_set_data_ext(ctx, spec_ckpt_buf.data(), spec_ckpt_size, slot_id, flags);
+                        TryStateSeqSetDataExt(ctx, spec_ckpt_buf.data(), spec_ckpt_size, slot_id, flags);
                     rolled_back = (read > 0) && llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
                 }
 #endif
@@ -4537,8 +4760,10 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
             }
             if (rc == 2) return finish(StopReason::kCancelled);
             if (rc == 1) return finish(StopReason::kContextFull);
-            result.status =
-                Status::Error(ErrorCode::kDecodeFailed, "llama_decode failed (rc=" + std::to_string(rc) + ")");
+            result.status = !decode_err.ok()
+                                ? std::move(decode_err)
+                                : Status::Error(ErrorCode::kDecodeFailed,
+                                                "llama_decode failed (rc=" + std::to_string(rc) + ")");
             return finish(StopReason::kError);
         }
 
@@ -4670,8 +4895,8 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
                     if (have_spec_ckpt && !swa_compact_active) {
                         const llama_state_seq_flags flags = PartialCheckpointFlags();
-                        const std::size_t read = llama_state_seq_set_data_ext(ctx, spec_ckpt_buf.data(), spec_ckpt_size,
-                                                                              slot_id, flags);
+                        const std::size_t read = TryStateSeqSetDataExt(ctx, spec_ckpt_buf.data(), spec_ckpt_size,
+                                                                       slot_id, flags);
                         if (read == 0 || !llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1)) {
                             invalidate_slot();
                             return finish_rb(false);
@@ -4683,7 +4908,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                                      static_cast<llama_pos>(pos + 1 + static_cast<int64_t>(j)), slot_id,
                                      /*logits=*/false);
                         }
-                        if (llama_decode(ctx, batch) != 0) {
+                        if (TryDecode(ctx, batch) != 0) {
                             invalidate_slot();
                             return finish_rb(false);
                         }
@@ -5084,7 +5309,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
     auto detach_gpu_sampler = [&](ActiveBatchSlot& s) {
 #if defined(SONDER_LLAMACPP_HAS_SET_SAMPLER)
         if (s.target_gpu_sampled) {
-            llama_set_sampler(ctx, s.slot_id, nullptr);
+            (void)TrySetSampler(ctx, s.slot_id, nullptr);
             s.target_gpu_sampled = false;
         }
 #else
@@ -5230,7 +5455,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             const std::size_t cap = std::min(max_spill_bytes, kMaxSequenceStateBytes);
             if (state_sz > 0 && state_sz <= cap) {
                 s.result.suspended_state_blob.resize(state_sz);
-                const std::size_t wrote = llama_state_seq_get_data(
+                const std::size_t wrote = TryStateSeqGetData(
                     ctx, s.result.suspended_state_blob.data(), s.result.suspended_state_blob.size(), s.slot_id);
                 if (wrote > 0 && wrote <= state_sz) {
                     s.result.suspended_state_blob.resize(wrote);
@@ -5285,7 +5510,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             req.sampling.seed == 0xFFFFFFFFU ? std::random_device{}() : static_cast<std::uint64_t>(req.sampling.seed);
         s->verify_rng.seed(verify_seed ^ 0x517CC1B727220A95ULL);
         if (Status st = BuildSampler(req.sampling, vocab, n_vocab, static_cast<int32_t>(n_ctx), s->sampler,
-                                     s->grammar_sampler);
+                                     s->grammar_sampler, /*already_validated=*/true);
             !st.ok()) {
             s->result.status = std::move(st);
             finish_slot(*s, StopReason::kError);
@@ -5299,7 +5524,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         // later would skip stages and trip GGML_ASSERT(cur_p.selected >= 0).
         if (!s->grammar_sampler && !req.sampling.compute_logprobs &&
             effective_spec_verification_mode != SpeculativeVerificationMode::StochasticRejection) {
-            s->target_gpu_sampled = llama_set_sampler(ctx, s->slot_id, s->sampler.get());
+            s->target_gpu_sampled = TrySetSampler(ctx, s->slot_id, s->sampler.get());
         }
 #endif
 
@@ -5527,9 +5752,9 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         const int64_t n_past = llama_memory_seq_pos_max(mem, s->slot_id) + 1;
         const auto n_prompt = static_cast<int64_t>(req.prompt.size());
         const int64_t rem_prompt = n_prompt - static_cast<int64_t>(lcp);
-        if (n_past + rem_prompt > n_ctx) {
+        if (Status st = ValidateContextPosition(n_past, rem_prompt, n_ctx); !st.ok()) {
             invalidate_slot(*s);
-            s->result.status = Status::Error(ErrorCode::kContextOverflow, "prompt does not fit in the context window");
+            s->result.status = std::move(st);
             finish_slot(*s, StopReason::kError);
             return nullptr;
         }
@@ -5829,11 +6054,12 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                              static_cast<llama_pos>(s.pos + j), s.slot_id, is_last);
                 }
                 auto decode_start = Clock::now();
-                int32_t rc = llama_decode(ctx, batch);
+                Status decode_err;
+                int32_t rc = TryDecode(ctx, batch, &decode_err);
                 while (rc == 1 && evict_one_idle_slot()) {
                     abort_requested.store(false, std::memory_order_relaxed);
                     decode_start = Clock::now();
-                    rc = llama_decode(ctx, batch);
+                    rc = TryDecode(ctx, batch, &decode_err);
                 }
                 const double prefill_decode_ms = MsSince(decode_start);
                 batch_abort_fn = nullptr;
@@ -5847,8 +6073,11 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     } else if (rc == 1) {
                         finish_slot(s, StopReason::kContextFull);
                     } else {
-                        s.result.status = Status::Error(
-                            ErrorCode::kDecodeFailed, "llama_decode failed during prefill (rc=" + std::to_string(rc) + ")");
+                        s.result.status = !decode_err.ok()
+                                              ? std::move(decode_err)
+                                              : Status::Error(ErrorCode::kDecodeFailed,
+                                                              "llama_decode failed during prefill (rc=" +
+                                                                  std::to_string(rc) + ")");
                         finish_slot(s, StopReason::kError);
                     }
                     active.clear();
@@ -6148,7 +6377,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 if (sz > 0 && sz <= kMaxPartialCheckpointBytes) {
                     if (spec_ckpt_buf.size() < sz) spec_ckpt_buf.resize(sz);
                     const std::size_t written =
-                        llama_state_seq_get_data_ext(ctx, spec_ckpt_buf.data(), sz, s.slot_id, flags);
+                        TryStateSeqGetDataExt(ctx, spec_ckpt_buf.data(), sz, s.slot_id, flags);
                     if (written > 0 && written <= sz) {
                         spec_ckpt_size = written;
                         have_spec_ckpt = true;
@@ -6169,11 +6398,12 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             }
 
             auto decode_start = Clock::now();
-            int32_t rc = llama_decode(ctx, batch);
+            Status decode_err;
+            int32_t rc = TryDecode(ctx, batch, &decode_err);
             while (rc == 1 && evict_one_idle_slot()) {
                 abort_requested.store(false, std::memory_order_relaxed);
                 decode_start = Clock::now();
-                rc = llama_decode(ctx, batch);
+                rc = TryDecode(ctx, batch, &decode_err);
             }
             const double decode_call_ms = MsSince(decode_start);
             if (slot_stage_prof && !draft_tokens.empty()) {
@@ -6189,8 +6419,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
                     if (have_spec_ckpt && !swa_compact_active) {
                         const llama_state_seq_flags flags = PartialCheckpointFlags();
-                        const std::size_t read = llama_state_seq_set_data_ext(ctx, spec_ckpt_buf.data(), spec_ckpt_size,
-                                                                              s.slot_id, flags);
+                        const std::size_t read = TryStateSeqSetDataExt(ctx, spec_ckpt_buf.data(), spec_ckpt_size,
+                                                                       s.slot_id, flags);
                         rolled_back = (read > 0) && llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1);
                     }
 #endif
@@ -6201,8 +6431,10 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 } else if (rc == 1) {
                     finish_slot(s, StopReason::kContextFull);
                 } else {
-                    s.result.status =
-                        Status::Error(ErrorCode::kDecodeFailed, "llama_decode failed (rc=" + std::to_string(rc) + ")");
+                    s.result.status = !decode_err.ok()
+                                          ? std::move(decode_err)
+                                          : Status::Error(ErrorCode::kDecodeFailed,
+                                                          "llama_decode failed (rc=" + std::to_string(rc) + ")");
                     finish_slot(s, StopReason::kError);
                 }
                 active.clear();
@@ -6358,8 +6590,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
                         if (have_spec_ckpt && !swa_compact_active) {
                             const llama_state_seq_flags flags = PartialCheckpointFlags();
-                            const std::size_t read = llama_state_seq_set_data_ext(ctx, spec_ckpt_buf.data(),
-                                                                                  spec_ckpt_size, s.slot_id, flags);
+                            const std::size_t read = TryStateSeqSetDataExt(ctx, spec_ckpt_buf.data(),
+                                                                           spec_ckpt_size, s.slot_id, flags);
                             if (read == 0 || !llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1)) {
                                 invalidate_slot(s);
                                 return finish_rb(false);
@@ -6371,7 +6603,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                                          static_cast<llama_pos>(s.pos + 1 + static_cast<int64_t>(j)), s.slot_id,
                                          /*logits=*/false);
                             }
-                            if (llama_decode(ctx, batch) != 0) {
+                            if (TryDecode(ctx, batch) != 0) {
                                 invalidate_slot(s);
                                 return finish_rb(false);
                             }
@@ -6616,11 +6848,12 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 
                 const auto step_start = Clock::now();
                 auto decode_start = step_start;
-                int32_t rc = llama_decode(ctx, batch);
+                Status decode_err;
+                int32_t rc = TryDecode(ctx, batch, &decode_err);
                 while (rc == 1 && evict_one_idle_slot()) {
                     abort_requested.store(false, std::memory_order_relaxed);
                     decode_start = Clock::now();
-                    rc = llama_decode(ctx, batch);
+                    rc = TryDecode(ctx, batch, &decode_err);
                 }
                 const double decode_call_ms = MsSince(decode_start);
                 batch_abort_fn = nullptr;
@@ -6653,8 +6886,11 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                         if (rc == 2 && (s->IsCancelled() || stopping)) {
                             finish_slot(*s, StopReason::kCancelled);
                         } else if (rc != 2) {
-                            s->result.status = Status::Error(
-                                ErrorCode::kDecodeFailed, "llama_decode failed (rc=" + std::to_string(rc) + ")");
+                            s->result.status = !decode_err.ok()
+                                                   ? decode_err
+                                                   : Status::Error(ErrorCode::kDecodeFailed,
+                                                                   "llama_decode failed (rc=" + std::to_string(rc) +
+                                                                       ")");
                             finish_slot(*s, StopReason::kError);
                         }
                     }
@@ -7052,14 +7288,15 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 
         const auto step_start = Clock::now();
         auto decode_start = step_start;
-        int32_t rc = llama_decode(ctx, batch);
+        Status decode_err;
+        int32_t rc = TryDecode(ctx, batch, &decode_err);
 
         // Under unified KV (`kv_unified=true`), idle prefix-cached slots share
         // the same n_ctx pool; evict LRU idle slots before retrying on rc==1.
         while (rc == 1 && evict_one_idle_slot()) {
             abort_requested.store(false, std::memory_order_relaxed);
             decode_start = Clock::now();
-            rc = llama_decode(ctx, batch);
+            rc = TryDecode(ctx, batch, &decode_err);
         }
 
         // If KV is still full after idle eviction and multiple active slots
@@ -7124,7 +7361,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             pack_plan(plan);
             abort_requested.store(false, std::memory_order_relaxed);
             decode_start = Clock::now();
-            rc = llama_decode(ctx, batch);
+            rc = TryDecode(ctx, batch, &decode_err);
         }
 
         // If a mixed prefill+decode batch still returned rc==1 (no KV slot for
@@ -7143,7 +7380,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             pack_plan(plan);
             abort_requested.store(false, std::memory_order_relaxed);
             decode_start = Clock::now();
-            rc = llama_decode(ctx, batch);
+            rc = TryDecode(ctx, batch, &decode_err);
         }
         const double decode_call_ms = MsSince(decode_start);
         batch_abort_fn = nullptr;
@@ -7162,8 +7399,10 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 } else if (rc == 1) {
                     finish_slot(*s, StopReason::kContextFull);
                 } else if (rc != 2) {
-                    s->result.status =
-                        Status::Error(ErrorCode::kDecodeFailed, "llama_decode failed (rc=" + std::to_string(rc) + ")");
+                    s->result.status = !decode_err.ok()
+                                           ? decode_err
+                                           : Status::Error(ErrorCode::kDecodeFailed,
+                                                           "llama_decode failed (rc=" + std::to_string(rc) + ")");
                     finish_slot(*s, StopReason::kError);
                 }
             }
@@ -7353,7 +7592,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
     } catch (const std::exception& ex) {
         batch_abort_fn = nullptr;
         active_cancel = nullptr;
-        const std::string err_msg = std::string("batch worker error: ") + ex.what();
+        const std::string err_msg = FormatBoundedExceptionMessage("batch_worker", &ex);
         if (inflight_exclusive != nullptr) {
             GenerateResult res;
             res.status = Status::Error(ErrorCode::kDecodeFailed, err_msg);
