@@ -5,6 +5,7 @@
 
 #include <doctest/doctest.h>
 
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
@@ -300,6 +301,106 @@ struct Fixture {
         return out;
     }
 };
+
+// Mirrors Observatory tests/conformance/checks.ts sseSample + checkSequence
+// for this repo's framing: per stream, an event whose sequence is not the
+// previous one plus 1 needs a `resume-gap` notice of its own stream form (or a
+// `dropped` notice) pending; the id line must equal the envelope event_id and
+// the per-stream form. One rule is stricter than checks.ts and is what
+// format_sse_batch guarantees: a `resume-gap` notice must be followed directly
+// by the first event of the same stream, with sequence == to + 1.
+// `last` holds the last sequence the client already had per stream (none for a
+// fresh connection).
+inline std::vector<std::string> sse_sequence_failures(const std::string& text, const std::string& instance,
+                                               std::array<std::optional<std::uint64_t>, 2> last) {
+    std::vector<std::string> failures;
+    std::array<bool, 2> pending{false, false};
+    std::optional<std::pair<std::size_t, std::uint64_t>> awaiting;  // (stream index, expected sequence)
+    std::size_t at = 0;
+    while (at < text.size()) {
+        const std::size_t end = text.find("\n\n", at);
+        if (end == std::string::npos) {
+            failures.push_back("unterminated block");
+            break;
+        }
+        const std::string block = text.substr(at, end - at);
+        at = end + 2;
+        const bool is_event = block.rfind("id: ", 0) == 0;
+        if (awaiting && !is_event) {
+            failures.push_back("resume-gap notice not followed directly by an event");
+            awaiting.reset();
+        }
+        if (block.rfind(": resume-gap ", 0) == 0) {
+            const std::string rest = block.substr(13);
+            std::size_t i = 0;
+            const bool samples = !rest.empty() && rest[0] == 's';
+            const auto number = [&](std::uint64_t& out) {
+                if (samples) {  // both numbers carry the prefix
+                    if (i >= rest.size() || rest[i] != 's') return false;
+                    ++i;
+                }
+                const std::size_t begin = i;
+                out = 0;
+                while (i < rest.size() && rest[i] >= '0' && rest[i] <= '9') out = out * 10 + static_cast<std::uint64_t>(rest[i++] - '0');
+                return i > begin;
+            };
+            std::uint64_t from = 0;
+            std::uint64_t to = 0;
+            if (!number(from) || i >= rest.size() || rest[i++] != '-' || !number(to) || i != rest.size()) {
+                failures.push_back("malformed resume-gap: " + block);
+                continue;
+            }
+            const std::size_t k = samples ? 1 : 0;
+            pending[k] = true;
+            awaiting = std::make_pair(k, to + 1);
+            continue;
+        }
+        if (block.rfind(": dropped ", 0) == 0) {
+            pending = {true, true};
+            continue;
+        }
+        if (!is_event) {
+            continue;  // retry:, keepalive
+        }
+        const std::size_t data_at = block.find("\ndata: ");
+        if (data_at == std::string::npos) {
+            failures.push_back("event without data: " + block);
+            continue;
+        }
+        const std::string id = block.substr(4, data_at - 4);
+        auto parsed = si::json::parse(block.substr(data_at + 7));
+        if (!parsed.ok()) {
+            failures.push_back("unparseable data: " + block);
+            continue;
+        }
+        const si::json::Value* producer = parsed.value().find("producer");
+        const si::json::Value* named = producer != nullptr ? producer->find("stream") : nullptr;
+        const bool samples = named != nullptr && !named->is_null() && named->is_string() && named->as_string() == "samples";
+        if (named != nullptr && !named->is_null() && !samples) {
+            failures.push_back("unknown stream name");
+        }
+        const std::uint64_t seq = static_cast<std::uint64_t>(parsed.value().find("sequence")->as_int());
+        const std::string want = instance + (samples ? "-s" : "-") + std::to_string(seq);
+        if (id != want || parsed.value().find("event_id")->as_string() != want) {
+            failures.push_back("id mismatch: " + id + " vs " + want);
+        }
+        const std::size_t k = samples ? 1 : 0;
+        if (awaiting && (awaiting->first != k || awaiting->second != seq)) {
+            failures.push_back("resume-gap notice followed by the wrong event: " + id);
+        }
+        awaiting.reset();
+        if (last[k] && seq != *last[k] + 1 && !pending[k]) {
+            failures.push_back("sequence " + std::to_string(seq) + " follows " + std::to_string(*last[k]) +
+                               " without a notice (" + (samples ? "samples" : "main") + ")");
+        }
+        pending[k] = false;
+        last[k] = seq;
+    }
+    if (awaiting) {
+        failures.push_back("resume-gap notice at the end");
+    }
+    return failures;
+}
 
 inline std::string chat_body(const std::string& extra = "", const std::string& content = "hello sonder") {
     return R"({"model":"default","messages":[{"role":"user","content":")" + content + R"("}])" + extra + "}";

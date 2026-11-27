@@ -138,15 +138,18 @@ TEST_CASE("sse: retry line, id == event_id, one envelope per data line, no event
     c.read_until(acc, "\n\n", std::chrono::milliseconds(200));
     const auto events = parse_sse(body_of(acc));
     REQUIRE(events.size() > 3);
-    std::uint64_t expected_seq = 0;
+    // Each sequence stream (main, samples) is contiguous from 0 on its own.
+    std::int64_t expected_seq[2] = {0, 0};
     bool saw_chat = false;
     for (const auto& ev : events) {
         CHECK_FALSE(ev.has_event_field);
         auto env = json::parse(ev.data);
         REQUIRE(env.ok());
         CHECK(env.value().find("event_id")->as_string() == ev.id);
-        CHECK(env.value().find("sequence")->as_int() == static_cast<std::int64_t>(expected_seq));
-        ++expected_seq;
+        const json::Value* named = env.value().find("producer")->find("stream");
+        const int k = (named != nullptr && named->is_string() && named->as_string() == "samples") ? 1 : 0;
+        CHECK(env.value().find("sequence")->as_int() == expected_seq[k]);
+        ++expected_seq[k];
         const json::Value* rid = env.value().find("request_id");
         if (rid != nullptr && rid->is_string() && rid->as_string() == request_id) saw_chat = true;
     }
@@ -196,6 +199,59 @@ TEST_CASE("ndjson: one envelope per line, format selection by path, query and Ac
     CHECK(get(f.port, "/v1/telemetry?format=xml").status == 400);
 }
 
+TEST_CASE("sample stream: both transports are contiguous per stream, with start-up samples and no notices") {
+    Fixture f;
+    REQUIRE(post(f.port, "/v1/chat/completions", chat_body(R"(,"max_tokens":3)")).status == 200);
+    f.envelopes();  // everything so far has reached the hub
+    const std::string instance = f.server->instance_id();
+    const json::Value disc = get(f.port, "/.well-known/sonder-telemetry").json();
+    const json::Value* samples = disc.find("resume")->find("streams")->find("samples");
+    REQUIRE(samples != nullptr);
+    const std::int64_t sample_next = samples->find("next_sequence")->as_int();
+    REQUIRE(sample_next > 0);  // the start-up device samples
+    CHECK(samples->find("retained_events")->as_int() == sample_next);
+    CHECK(samples->find("oldest_sequence")->as_int() == 0);
+    const std::int64_t main_next = disc.find("resume")->find("next_sequence")->as_int();
+    CHECK(disc.find("resume")->find("retained_events")->as_int() == main_next);
+    CHECK(disc.find("resume")->find("retained_sample_events") == nullptr);
+
+    Conn sse(f.port);
+    sse.send(build_request("GET", "/v1/telemetry/sse", f.port));
+    std::string acc;
+    REQUIRE(sse.read_until(acc, "id: " + instance + "-" + std::to_string(main_next - 1) + "\n"));
+    REQUIRE(sse.read_until(acc, "id: " + instance + "-s" + std::to_string(sample_next - 1) + "\n"));
+    sse.read_until(acc, "\n\n", std::chrono::milliseconds(200));
+    const std::string text = body_of(acc);
+    CHECK(text.find("resume-gap") == std::string::npos);
+    CHECK(text.find("id: " + instance + "-0\n") != std::string::npos);
+    CHECK(text.find("id: " + instance + "-s0\n") != std::string::npos);
+    const auto failures = sse_sequence_failures(text.substr(0, text.rfind("\n\n") + 2), instance, {});
+    CHECK_MESSAGE(failures.empty(), (failures.empty() ? std::string() : failures.front()));
+
+    Conn nd(f.port);
+    nd.send(build_request("GET", "/v1/telemetry/ndjson", f.port));
+    std::string nacc;
+    REQUIRE(nd.read_until(nacc, "\"event_id\":\"" + instance + "-s" + std::to_string(sample_next - 1) + "\""));
+    REQUIRE(nd.read_until(nacc, "\"event_id\":\"" + instance + "-" + std::to_string(main_next - 1) + "\""));
+    nd.read_until(nacc, "\n", std::chrono::milliseconds(200));
+    std::string body = body_of(nacc);
+    body = body.substr(0, body.rfind('\n') + 1);
+    std::int64_t next[2] = {0, 0};
+    std::size_t pos = 0;
+    while (pos < body.size()) {
+        const auto nl = body.find('\n', pos);
+        const std::string line = body.substr(pos, nl - pos);
+        pos = nl + 1;
+        auto env = json::parse(line);
+        REQUIRE_MESSAGE(env.ok(), line);
+        const json::Value* named = env.value().find("producer")->find("stream");
+        const int k = (named != nullptr && named->is_string() && named->as_string() == "samples") ? 1 : 0;
+        CHECK(env.value().find("sequence")->as_int() == next[k]++);
+    }
+    CHECK(next[0] >= main_next);
+    CHECK(next[1] >= sample_next);
+}
+
 TEST_CASE("heartbeats: SSE comment and NDJSON blank line while idle") {
     auto o = Fixture::defaults();
     o.heartbeat_interval = std::chrono::milliseconds(100);
@@ -233,8 +289,10 @@ TEST_CASE("resume: Last-Event-ID from the same instance, unknown instance, too o
     CHECK(disc.find("resume")->find("retained_events")->as_int() == 16);
     CHECK(next - oldest == 16);
 
+    // The ids of the main stream in a replay (samples-stream ids carry an `s`
+    // before the number), in order. `raw_out` receives the framed text.
     const auto first_ids = [&](const std::vector<std::pair<std::string, std::string>>& headers,
-                               const std::string& target, std::string* comments_out) {
+                               const std::string& target, std::string* comments_out, std::string* raw_out = nullptr) {
         Conn c(f.port);
         c.send(build_request("GET", target, f.port, headers));
         std::string acc;
@@ -245,8 +303,11 @@ TEST_CASE("resume: Last-Event-ID from the same instance, unknown instance, too o
         if (comments_out) {
             for (const auto& cm : comments) *comments_out += cm + "\n";
         }
+        if (raw_out) *raw_out = body_of(acc);
         std::vector<std::string> ids;
-        for (const auto& e : events) ids.push_back(e.id);
+        for (const auto& e : events) {
+            if (e.id.compare(0, instance.size() + 2, instance + "-s") != 0) ids.push_back(e.id);
+        }
         return ids;
     };
     // Same instance inside the window: resumes right after the id (header).
@@ -268,10 +329,17 @@ TEST_CASE("resume: Last-Event-ID from the same instance, unknown instance, too o
     CHECK(ids.front() == instance + "-" + std::to_string(oldest));
     // Older than the window: resume-gap comment, then the whole window.
     std::string comments;
-    ids = first_ids({{"Last-Event-ID", instance + "-0"}}, "/v1/telemetry/sse", &comments);
+    std::string raw;
+    ids = first_ids({{"Last-Event-ID", instance + "-0"}}, "/v1/telemetry/sse", &comments, &raw);
     REQUIRE_FALSE(ids.empty());
     CHECK(ids.front() == instance + "-" + std::to_string(oldest));
-    CHECK(comments.find(": resume-gap 1-" + std::to_string(oldest - 1)) != std::string::npos);
+    const std::string notice = ": resume-gap 1-" + std::to_string(oldest - 1);
+    CHECK(comments.find(notice) != std::string::npos);
+    // One notice, directly before the first replayed main event. Samples
+    // replayed alongside (no samples cursor) come without a notice.
+    CHECK(raw.find(notice + "\n\nid: " + instance + "-" + std::to_string(oldest) + "\n") != std::string::npos);
+    CHECK(raw.find(notice) == raw.rfind(notice));
+    CHECK(raw.find("resume-gap s") == std::string::npos);
     // since=now: nothing replayed, only live events.
     Conn live(f.port);
     live.send(build_request("GET", "/v1/telemetry/sse?since=now", f.port));

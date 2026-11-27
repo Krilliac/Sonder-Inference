@@ -1,6 +1,7 @@
 #include "sonder/inference/telemetry.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -13,6 +14,14 @@
 #include "sonder/inference/engine.hpp"
 
 namespace sonder::inference {
+
+TelemetryStream telemetry_stream_of(std::string_view event_type) noexcept {
+    constexpr std::string_view suffix = ".sample";
+    if (event_type.size() > suffix.size() && event_type.substr(event_type.size() - suffix.size()) == suffix) {
+        return TelemetryStream::samples;
+    }
+    return TelemetryStream::main;
+}
 
 const char* to_string(TelemetryLevel level) noexcept {
     switch (level) {
@@ -357,6 +366,12 @@ std::vector<std::string> MemoryTelemetrySink::lines() const {
 // detached thread only touches this object and its own sink references, never
 // the TelemetryBus.
 struct TelemetryBus::Shared {
+    struct Queued {
+        TelemetryStream stream;
+        std::uint64_t sequence;
+        std::string line;
+    };
+
     Shared(TelemetryOptions opts, std::string id) : options(std::move(opts)), instance_id(std::move(id)) {}
 
     // Immutable after construction.
@@ -368,9 +383,10 @@ struct TelemetryBus::Shared {
     std::condition_variable drained_cv;
     std::condition_variable exit_cv;  // shutdown(): the writer has left its loop
     std::vector<std::shared_ptr<TelemetrySink>> sinks;
-    // (sequence, serialized envelope) in emission order.
-    std::deque<std::pair<std::uint64_t, std::string>> queue;
-    std::uint64_t next_sequence = 0;
+    // (stream, sequence within the stream, serialized envelope) in emission order.
+    std::deque<Queued> queue;
+    // One counter per TelemetryStream.
+    std::array<std::uint64_t, kTelemetryStreamCount> next_sequence{};
     std::uint64_t written_sequence = 0;  // count of lines handed to sinks
     std::uint64_t enqueued_count = 0;
     bool stopping = false;
@@ -399,7 +415,9 @@ json::Object build_envelope(const TelemetryOptions& options, const std::string& 
                             std::uint64_t sequence, TelemetryLevel level) {
     json::Object env;
     env.set("schema", std::string(kObservatorySchema));
-    env.set("event_id", instance_id + "-" + std::to_string(sequence));
+    const TelemetryStream stream = telemetry_stream_of(event_type);
+    env.set("event_id",
+            instance_id + (stream == TelemetryStream::samples ? "-s" : "-") + std::to_string(sequence));
     env.set("sequence", sequence);
     env.set("event_type", std::string(event_type));
     env.set("wall_time", utc_timestamp_now());
@@ -415,6 +433,9 @@ json::Object build_envelope(const TelemetryOptions& options, const std::string& 
                           {"version", version_string()},
                           {"node_id", options.node_id},
                           {"instance_id", instance_id}};
+    if (stream == TelemetryStream::samples) {
+        producer.set("stream", "samples");
+    }
     if (!options.role.empty()) {
         producer.set("role", options.role);
     }
@@ -486,9 +507,10 @@ bool TelemetryBus::emit(std::string_view event_type, const TelemetryContext& con
         s.dropped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    const std::uint64_t seq = s.next_sequence++;
-    s.queue.emplace_back(
-        seq, json::Value(make_envelope(event_type, context, std::move(attributes), seq, level)).dump());
+    const TelemetryStream stream = telemetry_stream_of(event_type);
+    const std::uint64_t seq = s.next_sequence[static_cast<std::size_t>(stream)]++;
+    s.queue.push_back(Shared::Queued{
+        stream, seq, json::Value(make_envelope(event_type, context, std::move(attributes), seq, level)).dump()});
     ++s.enqueued_count;
     s.emitted.fetch_add(1, std::memory_order_relaxed);
     lock.unlock();
@@ -530,7 +552,7 @@ void TelemetryBus::Shared::writer_loop(const std::shared_ptr<Shared>& shared) {
         if (s.abandoned.load() || (s.queue.empty() && s.stopping)) {
             break;
         }
-        std::deque<std::pair<std::uint64_t, std::string>> batch;
+        std::deque<Shared::Queued> batch;
         batch.swap(s.queue);
         auto sinks = s.sinks;
         lock.unlock();
@@ -546,13 +568,13 @@ void TelemetryBus::Shared::writer_loop(const std::shared_ptr<Shared>& shared) {
                 if (alias == failed) alias.reset();
             }
         };
-        for (const auto& [sequence, line] : batch) {
+        for (const auto& [stream, sequence, line] : batch) {
             for (const auto& sink : sinks) {
                 if (!sink) continue;
                 // shutdown() gave up on this writer: start no further sink call.
                 if (s.abandoned.load()) break;
                 try {
-                    sink->write_event(sequence, line);
+                    sink->write_stream_event(stream, sequence, line);
                 } catch (...) {
                     retire_sink(sink);
                 }
@@ -591,14 +613,16 @@ void TelemetryBus::Shared::enqueue_drop_report_locked(bool final_report) {
     const std::uint64_t dropped_now = dropped.load();
     TelemetryContext ctx;
     ctx.session_id = instance_id;
-    const std::uint64_t seq = next_sequence++;
-    queue.emplace_back(seq, json::Value(build_envelope(options, instance_id, "telemetry.dropped", ctx,
-                                               json::Object{{"dropped_events", dropped_now},
-                                                            {"emitted_events", emitted.load()},
-                                                            {"queue_capacity", options.queue_capacity},
-                                                            {"final", final_report}},
-                                               seq, TelemetryLevel::metrics))
-                         .dump());
+    // telemetry.dropped is a main-stream event.
+    const std::uint64_t seq = next_sequence[static_cast<std::size_t>(TelemetryStream::main)]++;
+    queue.push_back(Queued{TelemetryStream::main, seq,
+                           json::Value(build_envelope(options, instance_id, "telemetry.dropped", ctx,
+                                                      json::Object{{"dropped_events", dropped_now},
+                                                                   {"emitted_events", emitted.load()},
+                                                                   {"queue_capacity", options.queue_capacity},
+                                                                   {"final", final_report}},
+                                                      seq, TelemetryLevel::metrics))
+                               .dump()});
     ++enqueued_count;
     reported_dropped = dropped_now;
     last_drop_report = std::chrono::steady_clock::now();
@@ -639,7 +663,7 @@ bool TelemetryBus::shutdown() {
         // starts no further sink call once `abandoned` is set.
         s.abandoned.store(true);
         s.clean = false;
-        std::deque<std::pair<std::uint64_t, std::string>> discarded;
+        std::deque<Shared::Queued> discarded;
         discarded.swap(s.queue);
         s.cv.notify_all();
         lock.unlock();
