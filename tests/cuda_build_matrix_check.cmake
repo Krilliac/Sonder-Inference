@@ -119,6 +119,33 @@ foreach(i RANGE ${cfg_last})
     endif()
 endforeach()
 
+# Ensure Markdown docs agree with the 120a/120f preset matrix (no stale
+# CMAKE_CUDA_ARCHITECTURES=86;89;120 or =120 without a/f suffix, and PLACEMENT.md
+# documents 86;89;120a, sm_120a, -120f presets, and CUDA >= 13.4).
+file(GLOB_RECURSE md_files LIST_DIRECTORIES false
+    "${SOURCE_DIR}/README.md"
+    "${SOURCE_DIR}/docs/*.md"
+    "${SOURCE_DIR}/src/*.md")
+foreach(md_file IN LISTS md_files)
+    file(READ "${md_file}" md_text)
+    if(md_text MATCHES "CMAKE_CUDA_ARCHITECTURES[ \t]*=[ \t]*\"?(86;89;120|120)([^0-9af]|$)")
+        message(FATAL_ERROR "stale bare-120 CMAKE_CUDA_ARCHITECTURES claim in ${md_file}")
+    endif()
+endforeach()
+
+set(placement_doc "${SOURCE_DIR}/docs/PLACEMENT.md")
+file(READ "${placement_doc}" placement_text)
+foreach(req_substr IN ITEMS
+        "CMAKE_CUDA_ARCHITECTURES=86;89;120a"
+        "sm_120a"
+        "windows-cuda-blackwell-120f"
+        "CUDA >= 13.4")
+    string(FIND "${placement_text}" "${req_substr}" p_idx)
+    if(p_idx EQUAL -1)
+        message(FATAL_ERROR "docs/PLACEMENT.md is missing '${req_substr}'")
+    endif()
+endforeach()
+
 # ---------------------------------------------------------------------------
 # 2. Mock CUDA toolkit helper + configure runner
 # ---------------------------------------------------------------------------

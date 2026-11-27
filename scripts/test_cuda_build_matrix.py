@@ -107,6 +107,18 @@ class CMakePresetsMatrixTests(unittest.TestCase):
         expected = "windows-cuda-blackwell-120f" if os.name == "nt" else "linux-cuda-blackwell-120f"
         self.assertIn(expected, r.stdout)
 
+    def test_docs_agree_with_cuda_preset_matrix(self) -> None:
+        stale_re = re.compile(r"CMAKE_CUDA_ARCHITECTURES\s*=\s*\"?(?:86;89;120|120)(?![0-9af])")
+        md_paths = [REPO_ROOT / "README.md", *sorted((REPO_ROOT / "docs").rglob("*.md")), *sorted((REPO_ROOT / "src").rglob("*.md"))]
+        for md in md_paths:
+            text = md.read_text(encoding="utf-8")
+            m = stale_re.search(text)
+            self.assertIsNone(m, f"stale bare-120 CMAKE_CUDA_ARCHITECTURES doc in {md.relative_to(REPO_ROOT)}: {m.group(0) if m else ''}")
+
+        placement = (REPO_ROOT / "docs" / "PLACEMENT.md").read_text(encoding="utf-8")
+        for token in ("CMAKE_CUDA_ARCHITECTURES=86;89;120a", "sm_120a", "windows-cuda-blackwell-120f", "CUDA >= 13.4"):
+            self.assertIn(token, placement)
+
 
 class CMakeCudaCheckConfigureTests(unittest.TestCase):
     @classmethod
