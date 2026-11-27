@@ -520,6 +520,24 @@ TEST_CASE("hub: a sample flood never evicts lifecycle events") {
     r.last_event_id = "tel-abc-1";
     replayed(r, &gap);
     CHECK_FALSE(gap.empty());
+
+    // Gap resume from an id after all retained samples but below the lifecycle
+    // floor: only events newer than the id are replayed, never older samples.
+    r.last_event_id = "tel-abc-" + std::to_string(last);
+    const auto newer = replayed(r, &gap);
+    CHECK_FALSE(gap.empty());
+    REQUIRE_FALSE(newer.empty());
+    for (const auto s : newer) CHECK(s > last);
+    for (std::size_t i = 1; i < newer.size(); ++i) CHECK(newer[i - 1] < newer[i]);
+
+    // Full replay: every hole between lifecycle events is an evicted sample
+    // (lifecycle events are contiguous from the first retained one).
+    const auto full = replayed(ResumeRequest{}, nullptr);
+    std::vector<std::uint64_t> tail;
+    for (const auto s : full) {
+        if (s > last) tail.push_back(s);
+    }
+    for (std::size_t i = 1; i < tail.size(); ++i) CHECK(tail[i] == tail[i - 1] + 1);
 }
 
 TEST_CASE("backend setup: env defaults and factory") {

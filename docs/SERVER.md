@@ -113,7 +113,7 @@ itself.
 | `--cors-origin ORIGIN` (repeatable) | none | Exact-match browser origin, allowed on every route. Must be a serialized origin as browsers send it: lowercase `scheme://host[:port]`, no path, trailing slash, query or wildcard (exit 2 otherwise). |
 | `--no-default-cors` | off | Drops the default origin list. |
 | `--telemetry-level off\|metrics\|standard\|deep` | `standard` | |
-| `--telemetry-buffer N` | `8192` | Retained events for resume (1 to 1048576). |
+| `--telemetry-buffer N` | `8192` | Retained lifecycle events for resume (1 to 1048576). Periodic `*.sample` events are kept apart: the latest per (type, device, backend) plus a history of `N/16` samples (no flag; minutes of history at default rates). Holes in a replayed sequence are evicted samples only. |
 | `--telemetry PATH` | none | Also write JSONL to `PATH` (`-` for stderr). |
 | `--capture-text` | off | Include generated text in token events. Requires `--token-file`. |
 | `--max-connections N` | `64` | A warning is printed when it plus 32 exceeds the open-file limit (`ulimit -n`). |
@@ -1053,7 +1053,7 @@ advertising `embeddings` (such as `llamacpp` and `llamaserver`), or 501
              "role":"inference","synthetic":true},
  "event_schema":"sonder.observatory.event/1",
  "streams":[{"transport":"sse","url":"/v1/telemetry/sse"},{"transport":"ndjson","url":"/v1/telemetry/ndjson"}],
- "resume":{"header":"Last-Event-ID","query":"last_event_id","retained_events":42,"oldest_sequence":0,"next_sequence":42},
+ "resume":{"header":"Last-Event-ID","query":"last_event_id","retained_events":42,"retained_sample_events":0,"oldest_sequence":0,"next_sequence":42},
  "auth":{"required":false,"schemes":["bearer"]},"clock":{"mono_ns":"host-monotonic"},
  "sampling_level":"standard","text_capture":"off",
  "links":{"health":"/v1/sonder/health","identity":"/v1/sonder/identity","models":"/v1/models",
@@ -1077,7 +1077,7 @@ equals the envelopes' `producer.instance_id` and the `event_id` prefix.
   15 s when idle.
 - Resume: `Last-Event-ID` wins over `?last_event_id=`. Same instance and
   retained: replay after it. Same instance but older than the window:
-  `: resume-gap <from>-<to>` (SSE), then the whole window. Unknown instance
+  `: resume-gap <from>-<to>` (SSE; lifecycle loss only), then every retained event newer than the id. Unknown instance
   (producer restarted), malformed or no id: the whole window. `?since=now`:
   live only.
 - At most 8 concurrent streams; the ninth gets 429 `overloaded` with

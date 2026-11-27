@@ -117,7 +117,9 @@ std::vector<HubEventPtr> LiveTelemetryHub::collect_locked() const {
     std::sort(all.begin(), all.end(),
               [](const HubEventPtr& a, const HubEventPtr& b) { return a->sequence < b->sequence; });
     all.erase(std::unique(all.begin(), all.end(),
-                          [](const HubEventPtr& a, const HubEventPtr& b) { return a->sequence == b->sequence; }),
+                          [](const HubEventPtr& a, const HubEventPtr& b) {
+                              return a == b || (a->sequence == b->sequence && a->line == b->line);
+                          }),
               all.end());
     return all;
 }
@@ -237,17 +239,16 @@ LiveTelemetryHub::Subscribed LiveTelemetryHub::subscribe(const ResumeRequest& re
         std::uint64_t seq = 0;
         if (parse_event_id(*resume.last_event_id, instance, seq) && instance == instance_id_ && !replay.empty()) {
             if (seq + 1 < lifecycle_floor_) {
-                // Lifecycle events after the id were evicted: announce the gap,
-                // then replay everything retained.
+                // Lifecycle events after the id were evicted: announce the gap
+                // (lifecycle loss only; retained samples are a declared sparse class).
                 out.gap_comment =
                     ": resume-gap " + std::to_string(seq + 1) + "-" + std::to_string(lifecycle_floor_ - 1);
-            } else {
-                // Resume right after the last seen event (nothing when caught up).
-                start = static_cast<std::size_t>(
-                    std::partition_point(replay.begin(), replay.end(),
-                                         [seq](const HubEventPtr& e) { return e->sequence <= seq; }) -
-                    replay.begin());
             }
+            // Either way replay only what is newer than the id; never go backwards.
+            start = static_cast<std::size_t>(
+                std::partition_point(replay.begin(), replay.end(),
+                                     [seq](const HubEventPtr& e) { return e->sequence <= seq; }) -
+                replay.begin());
         }
         // Unknown or different instance (producer restarted), malformed id,
         // or nothing retained: replay the whole retained window.
