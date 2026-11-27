@@ -182,8 +182,14 @@ struct LoadOptions {
     KvCacheType type_v = KvCacheType::kF16;
     FlashAttention flash_attn = FlashAttention::kAuto;
     // Explicit ggml device names (e.g. "CUDA0", "ROCm0", "Vulkan0", "CUDA1")
-    // passed as a null-terminated llama_model_params::devices list. Empty uses
-    // llama.cpp's default device selection. Validated upfront before loading.
+    // passed as a null-terminated llama_model_params::devices list. Non-empty
+    // is an exact allowlist: only these devices are used (an integrated GPU is
+    // used only when named), and names that are the same physical GPU seen
+    // through two backends are reduced to the first one named. Empty selects
+    // automatically via SelectDevices(): discrete GPUs only (one backend per
+    // physical card), never an integrated GPU; CPU-only when no discrete GPU
+    // exists. Names match case-insensitively (as ggml does). A CPU entry is
+    // accepted and is the CPU offload device. Validated upfront before loading.
     std::vector<std::string> devices;
     // Primary GPU index used for the full model when split_mode == kNone and
     // for scratch / non-split tensors. Must be >= 0.
@@ -566,9 +572,48 @@ struct DeviceInfo {
     DeviceKind kind = DeviceKind::kOther;
     std::uint64_t memory_free_bytes = 0;
     std::uint64_t memory_total_bytes = 0;
+    // Lower-case PCI bus id ("0000:c1:00.0") when the ggml backend reports one;
+    // empty when unknown. Equal non-empty ids are the same physical device.
+    std::string device_id;
 };
 
 [[nodiscard]] std::string_view ToString(DeviceKind kind) noexcept;
+
+// Canonicalizes a PCI bus id (e.g. CUDA's "00000000:01:00.0" or mixed-case
+// "0000:C1:00.0") to lower-case "0000:01:00.0", preserving any virtual-device
+// suffix such as "-v0". Non-BDF identifiers are trimmed and lower-cased.
+[[nodiscard]] std::string NormalizePciBusId(std::string_view raw);
+
+// Result of SelectDevices(): `names` are the ggml device names to hand to
+// llama.cpp (possibly empty = CPU only); `tensor_split` and `main_gpu` are
+// re-indexed onto `names` when duplicate views or unlisted iGPUs are removed;
+// `notes` explain every device that was left out, for logging.
+struct DeviceSelection {
+    std::vector<std::string> names;
+    std::vector<float> tensor_split;
+    std::int32_t main_gpu = 0;
+    std::vector<std::string> notes;
+};
+
+// Pure device-selection policy (no ggml calls; unit-testable with mock lists).
+//  - `allowlist` non-empty: every name must exist in `available` (case-insensitive
+//    match, else kInvalidArgument) and is used even if it is an integrated GPU
+//    or the CPU. Later names that are the same physical GPU as an earlier one
+//    are dropped, and `tensor_split` / `main_gpu` are re-indexed onto `names`.
+//  - `allowlist` empty: all kGpu devices, never kIntegratedGpu. When one
+//    physical GPU appears under several backends the non-Vulkan backend wins.
+//    If no discrete GPU exists, a non-empty `tensor_split` or `main_gpu > 0`
+//    fails with kInvalidArgument. When iGPUs or duplicate views are skipped,
+//    `tensor_split` and `main_gpu` are re-indexed onto the surviving discrete GPUs.
+// Two non-CPU devices are the same physical GPU when their normalized non-empty
+// device_id match, or (when at least one id is unknown) when they come from
+// different backends and have matching description and non-zero total memory.
+[[nodiscard]] Status SelectDevices(const std::vector<DeviceInfo>& available,
+                                   const std::vector<std::string>& allowlist, DeviceSelection* out);
+[[nodiscard]] Status SelectDevices(const std::vector<DeviceInfo>& available,
+                                   const std::vector<std::string>& allowlist,
+                                   const std::vector<float>& tensor_split, std::int32_t main_gpu,
+                                   DeviceSelection* out);
 
 struct ModelInfo {
     std::string description;
@@ -665,6 +710,20 @@ public:
     [[nodiscard]] static bool HasMtmdBuildSupport() noexcept;
     // Devices ggml can see in this build (CPU always; CUDA/Vulkan/Metal when compiled in).
     [[nodiscard]] static std::vector<DeviceInfo> EnumerateDevices();
+    // Applies SelectDevices() to EnumerateDevices() and resolves the result.
+    // `resolved` may come back empty on success (CPU only).
+    [[nodiscard]] static Status ResolveModelDevices(const std::vector<std::string>& allowlist,
+                                                    std::vector<void*>* resolved,
+                                                    DeviceSelection* selection = nullptr);
+    // Device the multimodal projector (mtmd/clip) must use for a resolved
+    // device list: the selected main_gpu accelerator in SplitMode::kNone, else
+    // the first non-CPU device, so the projector stays inside the allowlist.
+    // nullptr when the list holds no accelerator (projector on CPU; the caller
+    // must then also disable mtmd's GPU use, since a null device makes clip
+    // pick any GPU, including an integrated one).
+    [[nodiscard]] static void* ProjectorDevice(const std::vector<void*>& resolved,
+                                               SplitMode split_mode = SplitMode::kLayer,
+                                               std::int32_t main_gpu = 0);
     // Checks each ggml device name (non-empty, registered in this build via
     // ggml_backend_dev_by_name, at most llama_max_devices()). On success,
     // `resolved` (if non-null) receives one opaque ggml_backend_dev_t per

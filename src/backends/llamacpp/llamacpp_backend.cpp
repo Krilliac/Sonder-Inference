@@ -275,7 +275,9 @@ llama_model_params MakeModelParams(const LoadOptions& options,
     }
 #endif
     device_buf.clear();
-    if (!resolved_devices.empty()) {
+    {
+        // Always an explicit null-terminated list (possibly empty = CPU only):
+        // device selection is ours (SelectDevices), never llama.cpp's default.
         device_buf.reserve(resolved_devices.size() + 1);
         for (void* dev : resolved_devices) {
             device_buf.push_back(static_cast<ggml_backend_dev_t>(dev));
@@ -2440,11 +2442,14 @@ std::vector<DeviceInfo> LlamaCppBackend::EnumerateDevices() {
         if (const char* n = ggml_backend_dev_name(dev)) info.name = n;
         if (const char* d = ggml_backend_dev_description(dev)) info.description = d;
         info.kind = MapDeviceKind(ggml_backend_dev_type(dev));
+        ggml_backend_dev_props props{};
+        ggml_backend_dev_get_props(dev, &props);
         std::size_t free_b = 0;
         std::size_t total_b = 0;
         ggml_backend_dev_memory(dev, &free_b, &total_b);
         info.memory_free_bytes = free_b;
         info.memory_total_bytes = total_b;
+        info.device_id = props.device_id != nullptr ? NormalizePciBusId(props.device_id) : std::string();
         out.push_back(std::move(info));
     }
     return out;
@@ -2457,11 +2462,19 @@ std::string LlamaCppBackend::SystemInfo() {
 }
 
 ModelParamsSummary LlamaCppBackend::ModelParamsFor(const LoadOptions& options) {
+    LoadOptions effective = options;
     std::vector<void*> resolved_devices;
-    (void)ResolveDevices(options.devices, &resolved_devices);
+    if (options.n_gpu_layers != 0 || !options.devices.empty() || !options.tensor_split.empty() ||
+        options.main_gpu != 0) {
+        DeviceSelection sel;
+        (void)SelectDevices(EnumerateDevices(), options.devices, options.tensor_split, options.main_gpu, &sel);
+        effective.tensor_split = sel.tensor_split;
+        effective.main_gpu = sel.main_gpu;
+        (void)ResolveDevices(sel.names, &resolved_devices);
+    }
     std::vector<ggml_backend_dev_t> device_buf;
     std::vector<float> tensor_split_buf;
-    return SummarizeModelParams(MakeModelParams(options, resolved_devices, device_buf, tensor_split_buf));
+    return SummarizeModelParams(MakeModelParams(effective, resolved_devices, device_buf, tensor_split_buf));
 }
 
 ModelParamsSummary LlamaCppBackend::UpstreamModelDefaults() {
@@ -2503,6 +2516,39 @@ LlamaCppBackend& LlamaCppBackend::operator=(LlamaCppBackend&& other) noexcept {
         }
     }
     return *this;
+}
+
+Status LlamaCppBackend::ResolveModelDevices(const std::vector<std::string>& allowlist, std::vector<void*>* resolved,
+                                            DeviceSelection* selection) {
+    if (resolved != nullptr) resolved->clear();
+    // Validate shape (empty / NUL / count) with the same rules as ResolveDevices.
+    if (Status s = ResolveDevices(allowlist, nullptr); !s.ok()) return s;
+    DeviceSelection sel;
+    if (Status s = SelectDevices(EnumerateDevices(), allowlist, &sel); !s.ok()) return s;
+    for (const std::string& note : sel.notes) {
+        RouteLog(LogLevel::kInfo, ("device selection: " + note + "\n").c_str());
+    }
+    Status rs = ResolveDevices(sel.names, resolved);
+    if (rs.ok() && selection != nullptr) *selection = std::move(sel);
+    return rs;
+}
+
+void* LlamaCppBackend::ProjectorDevice(const std::vector<void*>& resolved, SplitMode split_mode,
+                                       std::int32_t main_gpu) {
+    if (split_mode == SplitMode::kNone && main_gpu >= 0 && static_cast<std::size_t>(main_gpu) < resolved.size()) {
+        void* const primary = resolved[static_cast<std::size_t>(main_gpu)];
+        if (primary != nullptr &&
+            ggml_backend_dev_type(static_cast<ggml_backend_dev_t>(primary)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return primary;
+        }
+    }
+    for (void* dev : resolved) {
+        if (dev != nullptr &&
+            ggml_backend_dev_type(static_cast<ggml_backend_dev_t>(dev)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return dev;
+        }
+    }
+    return nullptr;
 }
 
 Status LlamaCppBackend::ResolveDevices(const std::vector<std::string>& device_names, std::vector<void*>* resolved) {
@@ -2579,9 +2625,27 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
     if (Status s = ValidatePlacementOptions(options); !s.ok()) {
         return s;
     }
+    LoadOptions effective_options = options;
     std::vector<void*> resolved_devices;
-    if (Status s = ResolveDevices(options.devices, &resolved_devices); !s.ok()) {
-        return s;
+    if (options.n_gpu_layers != 0 || !options.devices.empty() || !options.tensor_split.empty() ||
+        options.main_gpu != 0) {
+        if (Status s = ResolveDevices(options.devices, nullptr); !s.ok()) {
+            return s;
+        }
+        DeviceSelection sel;
+        if (Status s = SelectDevices(EnumerateDevices(), options.devices, options.tensor_split, options.main_gpu, &sel);
+            !s.ok()) {
+            return s;
+        }
+        for (const std::string& note : sel.notes) {
+            RouteLog(LogLevel::kInfo, ("device selection: " + note + "\n").c_str());
+        }
+        if (Status s = ResolveDevices(sel.names, &resolved_devices); !s.ok()) {
+            return s;
+        }
+        effective_options.devices = std::move(sel.names);
+        effective_options.tensor_split = std::move(sel.tensor_split);
+        effective_options.main_gpu = sel.main_gpu;
     }
     std::vector<void*> override_buffers;
     if (Status s = ResolveTensorOverrides(options.tensor_overrides, &override_buffers); !s.ok()) {
@@ -2590,7 +2654,7 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
     if (Status s = ValidateContextOptions(options); !s.ok()) {
         return s;
     }
-    if (!options.tensor_split.empty() && options.tensor_split.size() > llama_max_devices()) {
+    if (!effective_options.tensor_split.empty() && effective_options.tensor_split.size() > llama_max_devices()) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "tensor_split exceeds llama_max_devices (" + std::to_string(llama_max_devices()) + ")");
     }
@@ -2620,7 +2684,7 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
     const auto start = Clock::now();
     std::vector<ggml_backend_dev_t> device_buf;
     std::vector<float> tensor_split_buf;
-    llama_model_params mp = MakeModelParams(options, resolved_devices, device_buf, tensor_split_buf);
+    llama_model_params mp = MakeModelParams(effective_options, resolved_devices, device_buf, tensor_split_buf);
     // Null-terminated list; patterns point into `options`, which outlives the load.
     std::vector<llama_model_tensor_buft_override> overrides;
     if (!options.tensor_overrides.empty()) {
@@ -2654,7 +2718,7 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
     }
     impl_->model = model;
     impl_->vocab = llama_model_get_vocab(model);
-    impl_->options = options;
+    impl_->options = effective_options;
     impl_->architecture = ReadModelArchitecture(model);
 
     if (!options.vocab_only) {
@@ -2740,7 +2804,16 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
 #if defined(SONDER_LLAMACPP_HAS_MTMD)
         if (!options.mmproj_path.empty()) {
             mtmd_context_params mp_mtmd = mtmd_context_params_default();
-            mp_mtmd.use_gpu = (options.n_gpu_layers != 0);
+            // Pin the projector to the allowed accelerator (or main_gpu in
+            // SplitMode::kNone); with no allowed accelerator it stays on CPU
+            // (a null device with use_gpu=true would let clip pick any GPU,
+            // including an unlisted iGPU or a duplicate backend view).
+            void* const projector_dev =
+                (options.n_gpu_layers != 0)
+                    ? ProjectorDevice(resolved_devices, effective_options.split_mode, effective_options.main_gpu)
+                    : nullptr;
+            mp_mtmd.use_gpu = (options.n_gpu_layers != 0) && (projector_dev != nullptr);
+            mp_mtmd.device = static_cast<ggml_backend_dev_t>(projector_dev);
             mp_mtmd.print_timings = false;
             if (options.n_threads > 0) {
                 mp_mtmd.n_threads = options.n_threads;

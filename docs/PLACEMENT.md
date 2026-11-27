@@ -148,18 +148,21 @@ sonder-infer serve --backend llamacpp ... --cache-type-k q8_0 --cache-type-v q8_
 
 The direct `llamacpp` backend exposes multi-GPU and vendor device placement on `LlamaCppBackendOptions` (`sonder/inference/backends/llamacpp.hpp`) and `LoadOptions` (`sonder/backends/llamacpp/llamacpp_backend.h`). All fields are additive and default to `llama.cpp`'s existing behavior. (`llamaserver` launch profiles pass the corresponding `--device`, `--main-gpu`, `--split-mode`, `--tensor-split`, and `--load-mode` flags to `llama-server`.)
 
-| `LlamaCppBackendOptions` | `LoadOptions` | Values / constraints | Default | `llama_model_params` (`b11195`) |
+| `LlamaCppBackendOptions` | `LoadOptions` | Values / constraints | Default | `llama_model_params` (`v1.0.0`) |
 | --- | --- | --- | --- | --- |
-| `devices` | `devices` | ggml device names (`CUDA0`, `CUDA1`, `ROCm0`, `Vulkan0`), max 16; resolved via `ggml_backend_dev_by_name` | empty (llama.cpp default) | null-terminated `mp.devices` |
-| `main_gpu` | `main_gpu` | integer `>= 0`; primary GPU for `split_mode = none` and non-split/scratch tensors | `0` | `mp.main_gpu` |
+| `devices` | `devices` | exact ggml device allowlist (`CUDA0`, `CUDA1`, `ROCm0`, `Vulkan0`, `CPU`), case-insensitive, max 16; per-model override via `ModelLoadOptions::devices` and launch profile `devices` | empty (`SelectDevices` auto: discrete GPUs only, never iGPUs, native backend preferred over Vulkan) | null-terminated `mp.devices` |
+| `main_gpu` | `main_gpu` | integer `>= 0`; primary GPU for `split_mode = none` and non-split/scratch tensors (re-indexed when duplicates/iGPUs are filtered) | `0` | `mp.main_gpu` |
 | `split_mode` | `split_mode` | `layer`, `none`, `row` (case-insensitive) | `layer` | `mp.split_mode` (`LLAMA_SPLIT_MODE_*`) |
-| `tensor_split` | `tensor_split` | up to 16 finite floats `>= 0`, at least one `> 0` when non-empty | empty (equal / default) | `mp.tensor_split` (zero-padded to `llama_max_devices()`) |
+| `tensor_split` | `tensor_split` | up to 16 finite floats `>= 0`, at least one `> 0` when non-empty (re-indexed when duplicates/iGPUs are filtered; rejected when no discrete GPU is selected) | empty (equal / default) | `mp.tensor_split` (zero-padded to `llama_max_devices()`) |
 | `use_mlock` | `use_mlock` | boolean; locks weights in RAM | `false` | `mp.load_mode` (`LLAMA_LOAD_MODE_MMAP_MLOCK` with `use_mmap`, `LLAMA_LOAD_MODE_MLOCK` without) |
 
 Rules, checked before any model file is read (`invalid_argument`):
 
 - **Pure validation (`validate_llamacpp_options` / `ValidatePlacementOptions`)** rejects `main_gpu < 0`, unknown `split_mode`, empty or NUL-containing device names, more than 16 devices or split entries, and `tensor_split` entries that are NaN, infinite, negative, or all zero.
-- **Runtime device validation (`LlamaCppBackend::ResolveDevices`)** resolves every name in `devices` against ggml's registered backend devices in `Load()` before touching the model file. Passing an unavailable device (for example `CUDA0` on a CPU-only or Vulkan-only build) fails fast with `invalid_argument`.
+- **Explicit allowlist, automatic iGPU exclusion, and cross-backend deduplication (`SelectDevices` / `ResolveModelDevices` / `ResolveGpuDevicePin`)**:
+  - When `devices` is empty, `SelectDevices` chooses discrete GPUs (`kGpu`) only — never an integrated UMA GPU (`kIntegratedGpu`, e.g. Radeon 780M) — and collapses duplicate views of the same physical card across backends (e.g. `CUDA0` + `Vulkan0`, or `ROCm0` + `Vulkan0`, matched via normalized PCI bus ID or cross-backend description + memory) in favor of the native vendor backend. `gpu:N` ordinals index only this de-duplicated discrete GPU set (and non-UMA OS GPUs).
+  - When `devices` is non-empty (via `LlamaCppBackendOptions::devices`, per-model `ModelLoadOptions::devices`, or launch profile `devices`), names match case-insensitively, explicitly named integrated GPUs are honored, and duplicate views of the same card collapse to the first named entry.
+  - `tensor_split` and `main_gpu` are re-indexed onto the surviving selected device list whenever duplicate views or unlisted iGPUs are filtered out, and `tensor_split` or `main_gpu > 0` without a discrete GPU (and without an explicit allowlist) fails fast with `invalid_argument`. Multimodal projectors (`--mmproj`) are pinned inside the resolved accelerator allowlist via `ProjectorDevice`.
 - **Load mode mapping in `b11195`**: `llama.cpp` `b11195` folds mmap and mlock into `llama_model_params::load_mode`. Leaving `use_mmap = true` and `use_mlock = false` preserves `LLAMA_LOAD_MODE_AUTO` (so backends without `mmap_support` still fall back automatically); `use_mmap = false, use_mlock = false` sets `LLAMA_LOAD_MODE_NONE`; `use_mlock = true` selects `LLAMA_LOAD_MODE_MMAP_MLOCK` (with `use_mmap = true`) or `LLAMA_LOAD_MODE_MLOCK` (with `use_mmap = false`).
 
 ## Vendor and low-bit placement notes

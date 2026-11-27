@@ -2689,3 +2689,45 @@ TEST_CASE("tool_calling: strict schema validation, non-strict fallback, and para
         CHECK(ext_arr_single.visible_text.empty());
     }
 }
+
+TEST_CASE("NAT-07 make_model_load_options: a profile devices list reaches ModelLoadOptions") {
+    server::ServerOptions opts;
+    opts.backend.backend = "llamacpp";
+    opts.models = {"pinned", "plain"};
+    opts.device = "";  // CPU default when a profile does not pin devices
+
+    server::ModelProfileBinding pinned;
+    pinned.model = "pinned";
+    pinned.load_name = "/weights/pinned.gguf";
+    pinned.devices = {"CUDA0", "Vulkan1"};
+    server::ModelProfileBinding plain;
+    plain.model = "plain";
+    plain.load_name = "/weights/plain.gguf";
+    opts.profile_bindings = {pinned, plain};
+
+    const ModelLoadOptions pinned_lo = make_model_load_options(opts, "pinned");
+    CHECK(pinned_lo.model == "/weights/pinned.gguf");
+    CHECK(pinned_lo.devices == std::vector<std::string>{"CUDA0", "Vulkan1"});
+    // A non-empty profile devices list forces GPU offload even when --device is unset or cpu:*.
+    CHECK(pinned_lo.device_id == "gpu:0");
+
+    opts.device = "cpu:0";
+    const ModelLoadOptions pinned_from_cpu = make_model_load_options(opts, "pinned");
+    CHECK(pinned_from_cpu.device_id == "gpu:0");
+    CHECK(pinned_from_cpu.devices == std::vector<std::string>{"CUDA0", "Vulkan1"});
+
+    opts.device = "gpu:2";
+    const ModelLoadOptions pinned_from_gpu = make_model_load_options(opts, "pinned");
+    CHECK(pinned_from_gpu.device_id == "gpu:2");
+
+    opts.device = "cpu:0";
+    const ModelLoadOptions plain_lo = make_model_load_options(opts, "plain");
+    CHECK(plain_lo.model == "/weights/plain.gguf");
+    CHECK(plain_lo.devices.empty());
+    CHECK(plain_lo.device_id == "cpu:0");
+
+    const ModelLoadOptions unmapped_lo = make_model_load_options(opts, "other");
+    CHECK(unmapped_lo.model == "other");
+    CHECK(unmapped_lo.devices.empty());
+    CHECK(unmapped_lo.device_id == "cpu:0");
+}

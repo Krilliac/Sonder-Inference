@@ -711,3 +711,188 @@ TEST_CASE("llamacpp lazy grammar: a replay failure is deterministic, so a restor
     be.Unload();
 }
 #endif
+
+namespace {
+
+DeviceInfo MockDev(const char* name, const char* desc, DeviceKind kind, std::uint64_t total, const char* id = "") {
+    DeviceInfo d;
+    d.name = name;
+    d.description = desc;
+    d.kind = kind;
+    d.memory_total_bytes = total;
+    d.device_id = id;
+    return d;
+}
+
+constexpr std::uint64_t kGiB = 1024ULL * 1024ULL * 1024ULL;
+
+std::vector<DeviceInfo> MockMainPc() {
+    return {
+        MockDev("CUDA0", "RTX 5070 Ti", DeviceKind::kGpu, 16 * kGiB, "00000000:01:00.0"),
+        MockDev("Vulkan0", "RTX 5070 Ti", DeviceKind::kGpu, 16 * kGiB, "0000:01:00.0"),
+        MockDev("Vulkan1", "Radeon 780M", DeviceKind::kIntegratedGpu, 8 * kGiB, "0000:c5:00.0"),
+        MockDev("CPU", "Ryzen", DeviceKind::kCpu, 31 * kGiB),
+    };
+}
+
+}  // namespace
+
+TEST_CASE("NAT-07 NormalizePciBusId canonicalizes 8-digit CUDA and 4-digit Vulkan PCI BDF strings") {
+    CHECK(NormalizePciBusId("") == "");
+    CHECK(NormalizePciBusId("   ") == "");
+    CHECK(NormalizePciBusId("00000000:01:00.0") == "0000:01:00.0");
+    CHECK(NormalizePciBusId("0000:01:00.0") == "0000:01:00.0");
+    CHECK(NormalizePciBusId("0000:C5:00.0") == "0000:c5:00.0");
+    CHECK(NormalizePciBusId("00010000:0A:1F.3") == "10000:0a:1f.3");
+    CHECK(NormalizePciBusId("00000000:01:00.0-v0") == "0000:01:00.0-v0");
+    CHECK(NormalizePciBusId("00000000:01:00.0-V1") == "0000:01:00.0-v1");
+    CHECK(NormalizePciBusId("Apple-M4-Max") == "apple-m4-max");
+}
+
+TEST_CASE("NAT-07 SelectDevices: auto mode skips iGPU and deduplicates CUDA0 and Vulkan0") {
+    DeviceSelection sel;
+    REQUIRE(SelectDevices(MockMainPc(), {}, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0"});
+    CHECK(sel.main_gpu == 0);
+    CHECK(sel.tensor_split.empty());
+    CHECK(sel.notes.size() == 2u);  // Vulkan0 duplicate, Vulkan1 iGPU
+
+    // Non-Vulkan native backend wins regardless of enumeration order.
+    std::vector<DeviceInfo> rev = MockMainPc();
+    std::swap(rev[0], rev[1]);
+    REQUIRE(SelectDevices(rev, {}, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0"});
+
+    // ROCm also beats Vulkan on AMD discrete GPUs.
+    const std::vector<DeviceInfo> node1{
+        MockDev("Vulkan0", "AMD Radeon RX 9060 XT", DeviceKind::kGpu, 16 * kGiB, "0000:03:00.0"),
+        MockDev("ROCm0", "AMD Radeon RX 9060 XT", DeviceKind::kGpu, 16 * kGiB, "00000000:03:00.0"),
+        MockDev("Vulkan1", "AMD Radeon 780M", DeviceKind::kIntegratedGpu, 8 * kGiB, "0000:c5:00.0"),
+    };
+    REQUIRE(SelectDevices(node1, {}, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"ROCm0"});
+}
+
+TEST_CASE("NAT-07 SelectDevices: auto mode without discrete GPU is CPU-only and rejects tensor_split or main_gpu") {
+    const std::vector<DeviceInfo> igpu_only{
+        MockDev("Vulkan0", "Radeon 780M", DeviceKind::kIntegratedGpu, 8 * kGiB, "0000:c5:00.0"),
+        MockDev("CPU", "Ryzen", DeviceKind::kCpu, 31 * kGiB),
+    };
+    DeviceSelection sel;
+    REQUIRE(SelectDevices(igpu_only, {}, &sel).ok());
+    CHECK(sel.names.empty());
+
+    // Without a discrete GPU, tensor_split and non-zero main_gpu fail closed.
+    CHECK(SelectDevices(igpu_only, {}, {0.6F, 0.4F}, 0, &sel).code == ErrorCode::kInvalidArgument);
+    CHECK(SelectDevices(igpu_only, {}, {1.0F}, 0, &sel).code == ErrorCode::kInvalidArgument);
+    CHECK(SelectDevices(igpu_only, {}, {}, 1, &sel).code == ErrorCode::kInvalidArgument);
+    CHECK(SelectDevices({MockDev("CPU", "Ryzen", DeviceKind::kCpu, 31 * kGiB)}, {}, {1.0F}, 0, &sel).code ==
+          ErrorCode::kInvalidArgument);
+}
+
+TEST_CASE("NAT-07 SelectDevices: distinct cards on one backend stay and fallback dedup matches description and memory") {
+    DeviceSelection sel;
+    // Identical description and memory on the same backend are two physical cards.
+    REQUIRE(SelectDevices({MockDev("CUDA0", "RTX 3090", DeviceKind::kGpu, 24 * kGiB),
+                           MockDev("CUDA1", "RTX 3090", DeviceKind::kGpu, 24 * kGiB)},
+                          {}, &sel)
+                .ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0", "CUDA1"});
+
+    // Differing PCI bus IDs are always distinct even across backends.
+    REQUIRE(SelectDevices({MockDev("CUDA0", "RTX 3090", DeviceKind::kGpu, 24 * kGiB, "0000:01:00.0"),
+                           MockDev("Vulkan1", "RTX 3090", DeviceKind::kGpu, 24 * kGiB, "0000:02:00.0")},
+                          {}, &sel)
+                .ok());
+    CHECK(sel.names.size() == 2u);
+
+    // Missing device_id on one or both sides falls back to cross-backend description + memory.
+    REQUIRE(SelectDevices({MockDev("Vulkan0", "RTX 5070 Ti", DeviceKind::kGpu, 16 * kGiB),
+                           MockDev("CUDA0", "RTX 5070 Ti", DeviceKind::kGpu, 16 * kGiB, "0000:01:00.0")},
+                          {}, &sel)
+                .ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0"});
+
+    // Different total memory stays distinct when one id is missing.
+    REQUIRE(SelectDevices({MockDev("CUDA0", "RTX 5070 Ti", DeviceKind::kGpu, 16 * kGiB, "0000:01:00.0"),
+                           MockDev("Vulkan0", "RTX 5070 Ti", DeviceKind::kGpu, 12 * kGiB)},
+                          {"CUDA0", "Vulkan0"}, &sel)
+                .ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0", "Vulkan0"});
+}
+
+TEST_CASE("NAT-07 SelectDevices: allowlist is case-insensitive, honours named iGPU, and collapses duplicates") {
+    DeviceSelection sel;
+    REQUIRE(SelectDevices(MockMainPc(), {"Vulkan1"}, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"Vulkan1"});
+
+    REQUIRE(SelectDevices(MockMainPc(), {"cuda0", "VULKAN1"}, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0", "Vulkan1"});
+
+    // Order of the allowlist is preserved.
+    REQUIRE(SelectDevices(MockMainPc(), {"Vulkan1", "CUDA0"}, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"Vulkan1", "CUDA0"});
+
+    // Naming both views of one card keeps the first named.
+    REQUIRE(SelectDevices(MockMainPc(), {"Vulkan0", "CUDA0"}, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"Vulkan0"});
+    CHECK(sel.notes.size() == 1u);
+
+    // Repeating a name with different case is also collapsed.
+    REQUIRE(SelectDevices(MockMainPc(), {"CUDA0", "cuda0"}, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0"});
+
+    // Unknown or invalid names fail closed.
+    CHECK(SelectDevices(MockMainPc(), {"CUDA0", "CUDA7"}, &sel).code == ErrorCode::kInvalidArgument);
+    CHECK(SelectDevices(MockMainPc(), {"vulkan9"}, &sel).code == ErrorCode::kInvalidArgument);
+    CHECK(SelectDevices({}, {"CUDA0"}, &sel).code == ErrorCode::kInvalidArgument);
+    CHECK(SelectDevices(MockMainPc(), {""}, &sel).code == ErrorCode::kInvalidArgument);
+}
+
+TEST_CASE("NAT-07 SelectDevices: re-indexes tensor_split and main_gpu when duplicates or iGPUs are removed") {
+    const std::vector<DeviceInfo> multi{
+        MockDev("Vulkan0", "Radeon 780M", DeviceKind::kIntegratedGpu, 8 * kGiB, "0000:c5:00.0"),
+        MockDev("CUDA0", "RTX 5070 Ti", DeviceKind::kGpu, 16 * kGiB, "00000000:01:00.0"),
+        MockDev("Vulkan1", "RTX 5070 Ti", DeviceKind::kGpu, 16 * kGiB, "0000:01:00.0"),
+        MockDev("CUDA1", "RTX 3090", DeviceKind::kGpu, 24 * kGiB, "00000000:02:00.0"),
+        MockDev("CPU", "Ryzen", DeviceKind::kCpu, 64 * kGiB),
+    };
+
+    // 1. Allowlist with collapsed duplicate view re-indexes both tensor_split and main_gpu.
+    DeviceSelection sel;
+    REQUIRE(SelectDevices(multi, {"CUDA0", "Vulkan1", "CUDA1"}, {16.0F, 16.0F, 24.0F}, 2, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0", "CUDA1"});
+    CHECK(sel.tensor_split == std::vector<float>{16.0F, 24.0F});  // re-indexed, not doubled
+    CHECK(sel.main_gpu == 1);                                     // CUDA1 moved from index 2 to 1
+
+    // main_gpu pointing at the collapsed duplicate view maps to its surviving card.
+    REQUIRE(SelectDevices(multi, {"CUDA0", "Vulkan1", "CUDA1"}, {0.0F, 0.7F, 0.3F}, 1, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0", "CUDA1"});
+    CHECK(sel.tensor_split == std::vector<float>{0.7F, 0.3F});
+    CHECK(sel.main_gpu == 0);
+
+    // Out-of-range main_gpu in allowlist mode is rejected.
+    CHECK(SelectDevices(multi, {"CUDA0", "CUDA1"}, {0.5F, 0.5F}, 2, &sel).code == ErrorCode::kInvalidArgument);
+
+    // 2. Auto mode: caller already sized tensor_split and main_gpu for the 2 selected discrete GPUs.
+    REQUIRE(SelectDevices(multi, {}, {0.4F, 0.6F}, 1, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0", "CUDA1"});
+    CHECK(sel.tensor_split == std::vector<float>{0.4F, 0.6F});
+    CHECK(sel.main_gpu == 1);
+
+    // 3. Auto mode: caller supplied raw-GPU-indexed tensor_split (4 entries) and main_gpu (3 -> CUDA1).
+    REQUIRE(SelectDevices(multi, {}, {0.2F, 0.5F, 0.0F, 0.3F}, 3, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0", "CUDA1"});
+    CHECK(sel.tensor_split == std::vector<float>{0.5F, 0.3F});
+    CHECK(sel.main_gpu == 1);
+
+    // 4. Auto mode: raw tensor_split that placed 100% weight on the skipped iGPU fails closed.
+    CHECK(SelectDevices(multi, {}, {1.0F, 0.0F, 0.0F, 0.0F}, 0, &sel).code == ErrorCode::kInvalidArgument);
+
+    // 5. Auto mode: main_gpu targeting the skipped iGPU (raw index 0 when raw split given, or raw iGPU index >= S) fails.
+    const std::vector<DeviceInfo> main_pc = MockMainPc();  // [0: CUDA0, 1: Vulkan0(dup), 2: Vulkan1(iGPU)]
+    REQUIRE(SelectDevices(main_pc, {}, {}, 1, &sel).ok());
+    CHECK(sel.main_gpu == 0);  // Vulkan0 dup maps to CUDA0 at 0
+    CHECK(SelectDevices(main_pc, {}, {}, 2, &sel).code == ErrorCode::kInvalidArgument);  // Vulkan1 iGPU refused
+    CHECK(SelectDevices(main_pc, {}, {0.5F, 0.5F}, 0, &sel).code == ErrorCode::kInvalidArgument);  // 2 > 1 selected dGPU
+}

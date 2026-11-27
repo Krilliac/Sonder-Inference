@@ -88,7 +88,7 @@ Result<std::int32_t> ResolveGpuLayers(const LlamaCppBackendOptions& options, std
         return options.devices.empty() ? std::int32_t{0} : options.gpu_layers;
     }
     if (device_id.rfind("gpu", 0) == 0) {
-        if (!has_gpu_backend) {
+        if (!has_gpu_backend && options.devices.empty()) {
             return Status(ErrorCode::unsupported, "this llama.cpp build has no GPU backend");
         }
         return options.gpu_layers;
@@ -373,7 +373,19 @@ llamacpp_detail::ProcessGpuMemoryProbe MakeDefaultGpuMemoryProbe(std::vector<std
             }
         }
 #endif
-        return llamacpp_detail::SummarizeGgmlDeviceMemory(lc::LlamaCppBackend::EnumerateDevices(), configured_devices);
+        const auto enumerated = lc::LlamaCppBackend::EnumerateDevices();
+        lc::DeviceSelection used;
+        if (lc::SelectDevices(enumerated, configured_devices, &used).ok()) {
+            if (used.names.empty()) {
+                llamacpp_detail::ProcessGpuMemoryReading none;
+                none.probe = "none";
+                none.status = "unsupported";
+                none.error = "no GPU device selected";
+                return none;
+            }
+            return llamacpp_detail::SummarizeGgmlDeviceMemory(enumerated, used.names);
+        }
+        return llamacpp_detail::SummarizeGgmlDeviceMemory(enumerated, configured_devices);
     };
 }
 
@@ -1521,7 +1533,10 @@ public:
 
         lc::LoadOptions lo;
         lo.model_path = path;
-        if (Status s = ApplyBackendOptions(options_, lo); !s.ok()) return s;
+        // A per-model device allowlist overrides the backend-wide one.
+        LlamaCppBackendOptions effective = options_;
+        if (!options.devices.empty()) effective.devices = options.devices;
+        if (Status s = ApplyBackendOptions(effective, lo); !s.ok()) return s;
         for (const auto& [pattern, device] : options_.tensor_overrides) {
             lo.tensor_overrides.push_back({pattern, device});
         }
@@ -1534,7 +1549,7 @@ public:
                 has_gpu = has_gpu || d.kind == lc::DeviceKind::kGpu || d.kind == lc::DeviceKind::kIntegratedGpu;
             }
         }
-        const auto gpu_layers = llamacpp_detail::ResolveGpuLayers(options_, dev, has_gpu);
+        const auto gpu_layers = llamacpp_detail::ResolveGpuLayers(effective, dev, has_gpu);
         if (!gpu_layers.ok()) return gpu_layers.status();
         lo.n_gpu_layers = gpu_layers.value();
         if (lo.n_gpu_layers != 0) {
@@ -1546,6 +1561,15 @@ public:
                                                                 lo.tensor_split, os_gpus);
                 !s.ok()) {
                 return s;
+            }
+            if (dev.rfind("gpu", 0) == 0 && dev.rfind("gpu:", 0) != 0 && lo.devices.empty()) {
+                lc::DeviceSelection auto_sel;
+                if (!lc::SelectDevices(enumerated_devices, {}, &auto_sel).ok() || auto_sel.names.empty()) {
+                    return Status(ErrorCode::not_found,
+                                  "requested device '" + std::string(dev) +
+                                      "' has no available discrete llama.cpp GPU (integrated GPUs require an explicit "
+                                      "devices allowlist)");
+                }
             }
         }
 
@@ -1585,7 +1609,15 @@ public:
             if (enumerated_devices.empty()) {
                 enumerated_devices = lc::LlamaCppBackend::EnumerateDevices();
             }
-            uma_target = llamacpp_detail::HasIntegratedUmaTarget(enumerated_devices, lo.devices);
+            // Mirror the load's device selection: an iGPU that auto selection
+            // skipped is not a UMA target.
+            lc::DeviceSelection used;
+            if (lc::SelectDevices(enumerated_devices, lo.devices, &used).ok()) {
+                uma_target =
+                    !used.names.empty() && llamacpp_detail::HasIntegratedUmaTarget(enumerated_devices, used.names);
+            } else {
+                uma_target = llamacpp_detail::HasIntegratedUmaTarget(enumerated_devices, lo.devices);
+            }
         }
         const std::uint32_t loaded_slots = std::max<std::uint32_t>(1u, runtime.SlotCount());
         const lc::SpeculativeLoadInfo spec_info = runtime.GetSpeculativeInfo();

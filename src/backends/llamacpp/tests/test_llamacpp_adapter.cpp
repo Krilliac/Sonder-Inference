@@ -342,22 +342,23 @@ TEST_CASE("llamacpp adapter: ResolveGpuDevicePin routes gpu:N to the matching gg
     namespace lc = sonder::backends::llamacpp;
     const std::vector<lc::DeviceInfo> devs{
         {"CPU", "Ryzen", lc::DeviceKind::kCpu, 0, 0},
-        {"Vulkan0", "NVIDIA RTX 5070 Ti", lc::DeviceKind::kGpu, 16000, 15000},
+        {"CUDA0", "NVIDIA RTX 5070 Ti", lc::DeviceKind::kGpu, 15000, 16000},
+        {"CUDA1", "NVIDIA RTX 3090", lc::DeviceKind::kGpu, 22000, 24000},
         {"Vulkan1", "AMD Radeon Graphics", lc::DeviceKind::kIntegratedGpu, 512, 512},
     };
     std::vector<std::string> pinned;
     std::int32_t main_gpu = 1;
     CHECK(llamacpp_detail::ResolveGpuDevicePin("gpu:1", devs, pinned, main_gpu).ok());
     REQUIRE(pinned.size() == 1u);
-    CHECK(pinned[0] == "Vulkan1");
+    CHECK(pinned[0] == "CUDA1");
     CHECK(main_gpu == 0);
 
     pinned.clear();
     CHECK(llamacpp_detail::ResolveGpuDevicePin("gpu:0", devs, pinned, main_gpu).ok());
     REQUIRE(pinned.size() == 1u);
-    CHECK(pinned[0] == "Vulkan0");
+    CHECK(pinned[0] == "CUDA0");
 
-    // Out-of-range GPU index fails explicitly instead of silently falling back to GPU 0.
+    // Out-of-range GPU index (including unlisted iGPUs) fails explicitly instead of falling back to GPU 0.
     pinned.clear();
     CHECK(llamacpp_detail::ResolveGpuDevicePin("gpu:2", devs, pinned, main_gpu).code() == ErrorCode::not_found);
     CHECK(llamacpp_detail::ResolveGpuDevicePin("gpu:abc", devs, pinned, main_gpu).code() ==
@@ -403,6 +404,62 @@ TEST_CASE("llamacpp adapter: ResolveGpuDevicePin routes gpu:N to the matching gg
     pinned.clear();
     CHECK(llamacpp_detail::ResolveGpuDevicePin("gpu:0", cuda_only, pinned, main_gpu, {}, os_gpus).code() ==
           ErrorCode::not_found);
+}
+
+TEST_CASE("NAT-07 adapter: ResolveGpuDevicePin excludes iGPUs, deduplicates CUDA0/Vulkan0, and rejects tensor_split without dGPU") {
+    namespace lc = sonder::backends::llamacpp;
+    constexpr std::uint64_t kGiB = 1024ull * 1024ull * 1024ull;
+
+    // Vulkan0 and CUDA0 are two views of the same RTX 5070 Ti, and Vulkan1 is a 780M iGPU.
+    const std::vector<lc::DeviceInfo> mixed{
+        {"CPU", "Ryzen", lc::DeviceKind::kCpu, 0, 31 * kGiB},
+        {"Vulkan0", "NVIDIA GeForce RTX 5070 Ti", lc::DeviceKind::kGpu, 15 * kGiB, 16 * kGiB},
+        {"CUDA0", "NVIDIA GeForce RTX 5070 Ti", lc::DeviceKind::kGpu, 15 * kGiB, 16 * kGiB},
+        {"Vulkan1", "AMD Radeon 780M Graphics", lc::DeviceKind::kIntegratedGpu, 8 * kGiB, 8 * kGiB},
+    };
+
+    std::vector<std::string> pinned;
+    std::int32_t main_gpu = 2;
+    REQUIRE(llamacpp_detail::ResolveGpuDevicePin("gpu:0", mixed, pinned, main_gpu).ok());
+    REQUIRE(pinned.size() == 1u);
+    CHECK(pinned[0] == "CUDA0");
+    CHECK(main_gpu == 0);
+
+    // Neither the duplicate Vulkan0 view nor the 780M iGPU is counted as gpu:1.
+    pinned.clear();
+    CHECK(llamacpp_detail::ResolveGpuDevicePin("gpu:1", mixed, pinned, main_gpu).code() == ErrorCode::not_found);
+
+    // When OS inventory lists an integrated UMA iGPU at index 0 and discrete GPU at index 1,
+    // gpu:0 selects the discrete GPU and gpu:1 is not_found.
+    GpuDeviceInfo os_igpu;
+    os_igpu.id = "gpu:0";
+    os_igpu.name = "AMD Radeon 780M Graphics";
+    os_igpu.vendor = GpuVendor::amd;
+    os_igpu.is_integrated_uma = true;
+    GpuDeviceInfo os_dgpu;
+    os_dgpu.id = "gpu:1";
+    os_dgpu.name = "NVIDIA GeForce RTX 5070 Ti";
+    os_dgpu.vendor = GpuVendor::nvidia;
+    os_dgpu.is_integrated_uma = false;
+    const std::vector<GpuDeviceInfo> hybrid_os{os_igpu, os_dgpu};
+
+    pinned.clear();
+    REQUIRE(llamacpp_detail::ResolveGpuDevicePin("gpu:0", mixed, pinned, main_gpu, {}, hybrid_os).ok());
+    REQUIRE(pinned.size() == 1u);
+    CHECK(pinned[0] == "CUDA0");
+    pinned.clear();
+    CHECK(llamacpp_detail::ResolveGpuDevicePin("gpu:1", mixed, pinned, main_gpu, {}, hybrid_os).code() ==
+          ErrorCode::not_found);
+
+    // Without a discrete GPU (only CPU + iGPU), tensor_split fails with invalid_argument.
+    const std::vector<lc::DeviceInfo> igpu_only{
+        {"CPU", "Ryzen", lc::DeviceKind::kCpu, 0, 31 * kGiB},
+        {"Vulkan0", "AMD Radeon 780M Graphics", lc::DeviceKind::kIntegratedGpu, 8 * kGiB, 8 * kGiB},
+    };
+    pinned.clear();
+    const std::vector<float> split{0.5f, 0.5f};
+    CHECK(llamacpp_detail::ResolveGpuDevicePin("gpu:0", igpu_only, pinned, main_gpu, split).code() ==
+          ErrorCode::invalid_argument);
 }
 
 TEST_CASE("llamacpp adapter: PopulateGenerateStats separates total, cached, and uncached prompt tokens") {

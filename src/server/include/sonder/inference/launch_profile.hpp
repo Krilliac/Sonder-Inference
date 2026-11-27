@@ -73,6 +73,10 @@ struct LaunchProfile {
     std::optional<std::int32_t> n_gpu_layers;    // -1 = all
     // Multi-GPU and model loading controls (llama-server only).
     std::optional<std::string> device;           // -dev/--device (e.g. CUDA0, ROCm0, Vulkan0, CUDA0,CUDA1)
+    // llamacpp only: exact ggml device allowlist for this model (e.g. ["CUDA0"]); names are matched
+    // case-insensitively by the backend. Needs n_gpu_layers != 0 (the model then runs on gpu:0).
+    // llamaserver profiles use 'device' instead.
+    std::vector<std::string> devices;
     std::optional<std::int32_t> main_gpu;        // -mg/--main-gpu (>= 0)
     std::optional<std::string> split_mode;       // -sm/--split-mode: none, layer or row
     std::vector<double> tensor_split;            // -ts/--tensor-split: positive finite weights (<= 16 GPUs)
