@@ -173,7 +173,7 @@ DeviceKind MapDeviceKind(enum ggml_backend_dev_type type) {
     }
 }
 
-Status ResolveGgmlKvType(KvCacheType type, ggml_type& out) noexcept {
+Status ResolveGgmlKvType(KvCacheType type, ggml_type& out) {
     int raw = -1;
     if (Status s = KvCacheTypeToGgmlType(type, raw); !s.ok()) {
         return s;
@@ -182,7 +182,7 @@ Status ResolveGgmlKvType(KvCacheType type, ggml_type& out) noexcept {
     return Status::Ok();
 }
 
-ggml_type ToGgmlTypeChecked(KvCacheType type) noexcept {
+ggml_type ToGgmlTypeChecked(KvCacheType type) {
     ggml_type out = GGML_TYPE_COUNT;
     if (!ResolveGgmlKvType(type, out).ok()) {
         return GGML_TYPE_COUNT;

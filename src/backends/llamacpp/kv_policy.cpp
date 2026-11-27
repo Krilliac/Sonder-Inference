@@ -336,7 +336,7 @@ std::string_view ToString(KvRotationSupport support) noexcept {
     return out;
 }
 
-Status KvCacheTypeToGgmlType(KvCacheType type, int& out_ggml_type) noexcept {
+Status KvCacheTypeToGgmlType(KvCacheType type, int& out_ggml_type) {
     int mapped = -1;
     const char* unsupported_name = nullptr;
     switch (type) {
@@ -421,8 +421,16 @@ std::optional<KvDeviceKind> InferConfiguredKvDeviceKind(
 KvDeviceKind ResolveLoadKvDeviceKind(
     std::int32_t n_gpu_layers,
     const std::vector<std::string>& resolved_devices,
-    const std::vector<DeviceInfo>& enumerated_devices) noexcept {
+    const std::vector<DeviceInfo>& enumerated_devices,
+    std::optional<std::uint32_t> model_block_count) noexcept {
     if (n_gpu_layers == 0) {
+        return KvDeviceKind::kCpu;
+    }
+    // In llama.cpp v1.0.0 (src/llama-model.cpp:1778, src/llama-kv-cache.cpp:217-218),
+    // i_gpu_start = max(n_layer_all + 1 - n_gpu_layers, 0). When 0 < n_gpu_layers <= n_layer_all,
+    // layers 0 .. i_gpu_start - 1 (and their KV cache buffers) remain on CPU.
+    if (n_gpu_layers > 0 && model_block_count.has_value() &&
+        static_cast<std::uint64_t>(n_gpu_layers) <= static_cast<std::uint64_t>(*model_block_count)) {
         return KvDeviceKind::kCpu;
     }
     std::vector<KvDeviceKind> kinds;
@@ -538,6 +546,9 @@ bool ReadGgufHeadFacts(const std::string& model_path, KvModelRotationFacts& out_
     facts.key_length_swa = ReadGgufScalarU32(guard.ctx, facts.architecture + ".attention.key_length_swa", invalid);
     facts.value_length_swa = ReadGgufScalarU32(guard.ctx, facts.architecture + ".attention.value_length_swa", invalid);
     facts.embedding_length = ReadGgufScalarU32(guard.ctx, facts.architecture + ".embedding_length", invalid);
+    bool ignored_block_count_invalid = false;
+    facts.block_count =
+        ReadGgufScalarU32(guard.ctx, facts.architecture + ".block_count", ignored_block_count_invalid);
     facts.kv_lora_rank = ReadGgufScalarU32(guard.ctx, facts.architecture + ".attention.kv_lora_rank", invalid);
     ReadGgufHeadCount(guard.ctx, facts.architecture + ".attention.head_count", facts, invalid);
     if (invalid) {
@@ -607,7 +618,10 @@ bool DoesModelQualifyForDefaultQ8Kv(const KvModelRotationFacts& facts) noexcept 
         return false;
     }
     const std::string arch = LowerAsciiCopy(facts.architecture);
-    if (IsNonAttentionKvArchitecture(arch)) {
+    // In llama.cpp v1.0.0, llama_init_from_model forces flash attention off for every
+    // Grok model (src/llama-context.cpp:4478-4481) and then rejects any quantized V
+    // cache (src/llama-context.cpp:4546-4548), so "auto" must fall back to f16 on Grok.
+    if (IsNonAttentionKvArchitecture(arch) || arch == "grok") {
         return false;
     }
 
@@ -678,11 +692,23 @@ sonder::inference::Status CheckKvPolicyAtLoad(
     bool kv_k_q4_allowed,
     const std::vector<DeviceInfo>& pre_enumerated_devices,
     const std::string& model_path) {
+    KvModelRotationFacts cached_facts;
+    bool attempted_facts = false;
+    bool have_facts = false;
+    auto ensure_facts = [&]() -> bool {
+        if (!attempted_facts) {
+            attempted_facts = true;
+            have_facts = ReadGgufHeadFacts(model_path, cached_facts);
+        }
+        return have_facts;
+    };
+
     const bool auto_k = EqualsIgnoreCaseAscii(configured_type_k, "auto");
     const bool auto_v = EqualsIgnoreCaseAscii(configured_type_v, "auto");
     if (auto_k || auto_v) {
         const KvCacheType resolved =
-            (lo.flash_attn != FlashAttention::kDisabled && DoesGgufQualifyForDefaultQ8Kv(model_path))
+            (lo.flash_attn != FlashAttention::kDisabled && ensure_facts() &&
+             DoesModelQualifyForDefaultQ8Kv(cached_facts))
                 ? KvCacheType::kQ8_0
                 : KvCacheType::kF16;
         if (auto_k) lo.type_k = resolved;
@@ -697,8 +723,10 @@ sonder::inference::Status CheckKvPolicyAtLoad(
         lazy_devices = LlamaCppBackend::EnumerateDevices();
         devices_for_policy = &lazy_devices;
     }
+    const std::optional<std::uint32_t> model_block_count =
+        (uses_fp8 && lo.n_gpu_layers > 0 && ensure_facts()) ? cached_facts.block_count : std::nullopt;
     const KvDeviceKind kv_dev_kind =
-        ResolveLoadKvDeviceKind(lo.n_gpu_layers, lo.devices, *devices_for_policy);
+        ResolveLoadKvDeviceKind(lo.n_gpu_layers, lo.devices, *devices_for_policy, model_block_count);
 
     if (lo.type_k != KvCacheType::kQ4_0) {
         return EvaluateKvCachePolicy(
@@ -708,7 +736,13 @@ sonder::inference::Status CheckKvPolicyAtLoad(
         return EvaluateKvCachePolicy(
             {lo.type_k, lo.type_v, kv_dev_kind, KvRotationSupport::kSupported, kv_k_q4_allowed});
     }
-    const KvRotationSupport rot = ProbeGgufKvRotationSupport(model_path);
+    KvRotationSupport rot = KvRotationSupport::kUnknown;
+    if (ensure_facts()) {
+        const char* env_rot = std::getenv("LLAMA_ATTN_ROT_DISABLE");
+        cached_facts.env_attn_rot_disable = (env_rot != nullptr && std::atoi(env_rot) != 0);
+        cached_facts.model_attn_rot = true;
+        rot = DetectKvRotationSupport(cached_facts);
+    }
     return EvaluateKvCachePolicy({lo.type_k, lo.type_v, kv_dev_kind, rot, kv_k_q4_allowed});
 }
 

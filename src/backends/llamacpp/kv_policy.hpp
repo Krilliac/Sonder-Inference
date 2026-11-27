@@ -56,6 +56,7 @@ struct KvModelRotationFacts {
     std::optional<std::uint32_t> key_length_swa;
     std::optional<std::uint32_t> value_length_swa;
     std::optional<std::uint32_t> embedding_length;
+    std::optional<std::uint32_t> block_count;
     std::optional<std::uint32_t> head_count;
     bool head_count_layer0_zero = false;
     bool head_count_heterogeneous = false;
@@ -78,7 +79,7 @@ struct KvPolicyRequest {
 // Maps KvCacheType onto ggml_type (returned as int so ggml.h stays private to
 // sonder_backend_llamacpp). Fails with kInvalidArgument on unknown enum values
 // or types not compiled into this ggml build; never silently falls back.
-[[nodiscard]] Status KvCacheTypeToGgmlType(KvCacheType type, int& out_ggml_type) noexcept;
+[[nodiscard]] Status KvCacheTypeToGgmlType(KvCacheType type, int& out_ggml_type);
 
 // Classifies a single ggml device name (e.g. "CPU", "CUDA0", "Vulkan0").
 [[nodiscard]] KvDeviceKind ClassifyKvDeviceName(std::string_view device_name) noexcept;
@@ -89,11 +90,13 @@ struct KvPolicyRequest {
     std::int32_t gpu_layers, const std::vector<std::string>& devices) noexcept;
 
 // Resolves target device kind at load time from effective n_gpu_layers,
-// explicit/pinned devices, and enumerated runtime devices.
+// explicit/pinned devices, enumerated runtime devices, and optional GGUF
+// block_count (partial offload 0 < n_gpu_layers <= block_count leaves layers on CPU).
 [[nodiscard]] KvDeviceKind ResolveLoadKvDeviceKind(
     std::int32_t n_gpu_layers,
     const std::vector<std::string>& resolved_devices,
-    const std::vector<DeviceInfo>& enumerated_devices) noexcept;
+    const std::vector<DeviceInfo>& enumerated_devices,
+    std::optional<std::uint32_t> model_block_count = std::nullopt) noexcept;
 
 // Pure detector implementing llama.cpp v1.0.0's attn_rot_k eligibility rules.
 [[nodiscard]] KvRotationSupport DetectKvRotationSupport(const KvModelRotationFacts& facts) noexcept;

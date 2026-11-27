@@ -2,6 +2,7 @@
 #include "kv_policy.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -13,6 +14,12 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include "sonder/inference/backends/llamacpp.hpp"
 #include <doctest/doctest.h>
@@ -22,15 +29,24 @@ namespace {
 namespace lc = sonder::backends::llamacpp;
 namespace si = sonder::inference;
 
+std::uint64_t CurrentTestProcessId() noexcept {
+#if defined(_WIN32)
+    return static_cast<std::uint64_t>(_getpid());
+#else
+    return static_cast<std::uint64_t>(getpid());
+#endif
+}
+
 // Minimal GGUF v3 metadata-only writer (zero tensors) for testing load-time
 // rotation detection through real gguf_init_from_file without model weights.
 class ScopedTempGguf {
 public:
     explicit ScopedTempGguf(std::string_view stem) {
-        static std::uint64_t counter = 0;
-        ++counter;
+        static std::atomic<std::uint64_t> counter{0};
+        const std::uint64_t seq = counter.fetch_add(1, std::memory_order_relaxed) + 1;
         path_ = std::filesystem::temp_directory_path() /
-                ("sonder_kv_policy_" + std::string(stem) + "_" + std::to_string(counter) + ".gguf");
+                ("sonder_kv_policy_" + std::string(stem) + "_" +
+                 std::to_string(CurrentTestProcessId()) + "_" + std::to_string(seq) + ".gguf");
     }
 
     ~ScopedTempGguf() {
@@ -245,6 +261,37 @@ TEST_CASE("kv_policy: defaults resolve per model to q8_0 when head dims % 32 == 
         bad_mla.value_length = 128u;
         bad_mla.kv_lora_rank = 528u;  // 528 % 32 == 16 != 0 -> overwritten n_embd_head_v_full fails % 32
         CHECK_FALSE(lc::DoesModelQualifyForDefaultQ8Kv(bad_mla));
+    }
+
+    // Fallback case 3: llama.cpp v1.0.0 forces flash attention off for every Grok model
+    // (src/llama-context.cpp:4478-4481) and then rejects quantized V (src/llama-context.cpp:4546-4548),
+    // so "auto" resolves to f16/f16 even though Grok head_dim = 128 is a multiple of 32.
+    {
+        lc::KvModelRotationFacts grok_facts;
+        grok_facts.architecture = "grok";
+        grok_facts.embedding_length = 6144u;
+        grok_facts.head_count = 48u;  // 6144 / 48 = 128 (% 32 == 0)
+        CHECK_FALSE(lc::DoesModelQualifyForDefaultQ8Kv(grok_facts));
+
+        ScopedTempGguf grok_gguf("auto_grok128");
+        REQUIRE(grok_gguf.Write({
+            {"general.architecture", Entry::Kind::kStr, "grok", 0, {}, {}, {}},
+            {"grok.embedding_length", Entry::Kind::kU32, {}, 4096u, {}, {}, {}},
+            {"grok.attention.head_count", Entry::Kind::kU32, {}, 32u, {}, {}, {}},
+        }));
+        CHECK_FALSE(lc::DoesGgufQualifyForDefaultQ8Kv(grok_gguf.PathString()));
+
+        lc::LoadOptions lo;
+        lo.flash_attn = lc::FlashAttention::kAuto;
+        REQUIRE(lc::CheckKvPolicyAtLoad(lo, "auto", "auto", false, {}, grok_gguf.PathString()).ok());
+        CHECK(lo.type_k == lc::KvCacheType::kF16);
+        CHECK(lo.type_v == lc::KvCacheType::kF16);
+
+        lc::LoadOptions lo_fa_on;
+        lo_fa_on.flash_attn = lc::FlashAttention::kEnabled;
+        REQUIRE(lc::CheckKvPolicyAtLoad(lo_fa_on, "auto", "auto", false, {}, grok_gguf.PathString()).ok());
+        CHECK(lo_fa_on.type_k == lc::KvCacheType::kF16);
+        CHECK(lo_fa_on.type_v == lc::KvCacheType::kF16);
     }
 }
 
@@ -767,6 +814,42 @@ TEST_CASE("kv_policy: load_model enforces rotation on GGUF metadata and f8_e4m3 
         CHECK(r_cpu.status().code() == si::ErrorCode::invalid_argument);
         CHECK(ContainsCaseInsensitive(r_cpu.status().message(), "cuda"));
         CHECK(ContainsCaseInsensitive(r_cpu.status().message(), "cpu"));
+
+        // Partial offload on CUDA (0 < n_gpu_layers <= block_count; src/llama-model.cpp:1778)
+        // leaves KV cache layers on CPU and must refuse f8_e4m3; full offload (-1 or >= block_count + 1) passes.
+        ScopedTempGguf blk32_gguf("fp8_blk32");
+        REQUIRE(blk32_gguf.Write({
+            {"general.architecture", Entry::Kind::kStr, "llama", 0, {}, {}, {}},
+            {"llama.block_count", Entry::Kind::kU32, {}, 32u, {}, {}, {}},
+            {"llama.embedding_length", Entry::Kind::kU32, {}, 4096u, {}, {}, {}},
+            {"llama.attention.head_count", Entry::Kind::kU32, {}, 32u, {}, {}, {}},
+        }));
+        CHECK(lc::ResolveLoadKvDeviceKind(16, {"CUDA0"}, {}, 32u) == lc::KvDeviceKind::kCpu);
+        CHECK(lc::ResolveLoadKvDeviceKind(32, {"CUDA0"}, {}, 32u) == lc::KvDeviceKind::kCpu);
+        CHECK(lc::ResolveLoadKvDeviceKind(33, {"CUDA0"}, {}, 32u) == lc::KvDeviceKind::kCuda);
+        CHECK(lc::ResolveLoadKvDeviceKind(-1, {"CUDA0"}, {}, 32u) == lc::KvDeviceKind::kCuda);
+
+        for (const std::int32_t partial_ngl : {1, 16, 32}) {
+            CAPTURE(partial_ngl);
+            lc::LoadOptions lo_partial;
+            lo_partial.type_k = lc::KvCacheType::kF8_E4M3;
+            lo_partial.type_v = lc::KvCacheType::kF8_E4M3;
+            lo_partial.n_gpu_layers = partial_ngl;
+            lo_partial.devices = {"CUDA0"};
+            const si::Status st_partial =
+                lc::CheckKvPolicyAtLoad(lo_partial, "f8_e4m3", "f8_e4m3", false, {}, blk32_gguf.PathString());
+            CHECK(st_partial.code() == si::ErrorCode::invalid_argument);
+            CHECK(ContainsCaseInsensitive(st_partial.message(), "cpu"));
+        }
+        for (const std::int32_t full_ngl : {-1, 33, 64}) {
+            CAPTURE(full_ngl);
+            lc::LoadOptions lo_full;
+            lo_full.type_k = lc::KvCacheType::kF8_E4M3;
+            lo_full.type_v = lc::KvCacheType::kF8_E4M3;
+            lo_full.n_gpu_layers = full_ngl;
+            lo_full.devices = {"CUDA0"};
+            CHECK(lc::CheckKvPolicyAtLoad(lo_full, "f8_e4m3", "f8_e4m3", false, {}, blk32_gguf.PathString()).ok());
+        }
     }
 
     // LLAMA_ATTN_ROT_DISABLE=1 disables rotation in ProbeGgufKvRotationSupport and load_model().
