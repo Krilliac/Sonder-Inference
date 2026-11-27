@@ -1550,6 +1550,7 @@ struct Server::Impl {
         EngineOptions eo;
         eo.telemetry.level = opts.telemetry_level;
         eo.telemetry.capture_text = opts.capture_text;
+        eo.telemetry.text_capture = opts.text_capture;
         eo.telemetry.role = "inference";
         eo.telemetry.synthetic = synthetic;
         eo.telemetry.queue_capacity = std::max<std::size_t>(4096, opts.telemetry_buffer);

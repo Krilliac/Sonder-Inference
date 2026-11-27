@@ -10,6 +10,7 @@
 #include <optional>
 
 #include "net/http_client.hpp"
+#include "rpc_worker.hpp"
 
 namespace sonder::inference::llamaserver {
 
@@ -235,7 +236,13 @@ Status validate_backend_options(const LlamaServerBackendOptions &options) {
         if (auto key = read_api_key(options.api_key_env); !key.ok())
             return key.status();
     }
+    if (auto st = validate_rpc_worker(options.rpc_worker, options.mode); !st.ok())
+        return st;
     if (options.mode == LlamaServerMode::spawn) {
+        // The RPC client only ever runs in the isolated rpc_worker child; an
+        // operator --rpc would put it in whatever child serves this model.
+        if (auto st = refuse_operator_rpc_arguments(options.args); !st.ok())
+            return st;
         if (options.executable.empty() || options.executable.find('\0') != std::string::npos) {
             return {ErrorCode::invalid_argument, "llamaserver: spawn needs an executable path"};
         }
