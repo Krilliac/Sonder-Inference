@@ -160,7 +160,7 @@ On RDNA 4 discrete cards (RX 9060 `gfx1200`, RX 9070 / 9070 XT `gfx1201`), Vulka
 
 ### ROCm/HIP and Vulkan Log Diagnostics
 
-When `log_file` (or `--log-file` in `args`) is enabled on a spawned `llamaserver` child, `LogDiagnostics` (`src/backends/llamaserver/log_diagnostics.cpp`) classifies vendor errors and KV fallback lines into `backends[].runtime.warnings` and `backend.warning` telemetry:
+When `log_file` (or `--log-file` in `args`) is enabled on a spawned `llamaserver` child, `LogDiagnostics` (`src/devices/log_diagnostics.cpp`, fed from the child log file by `LogTail` in `src/backends/llamaserver/log_diagnostics.cpp`) classifies vendor errors and KV fallback lines into `backends[].runtime.warnings` and `backend.warning` telemetry:
 
 | Warning code | Triggered by | Details / notes |
 | --- | --- | --- |

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+// Relative path on purpose: sonder-infer has no src/ include directory.
 #include "../../devices/gpu_memory.hpp"
 #include "sonder/inference/backends/llamaserver_residency.hpp"
 

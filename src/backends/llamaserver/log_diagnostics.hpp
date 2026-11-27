@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+// Relative path on purpose: sonder-infer has no src/ include directory.
 #include "../../devices/log_diagnostics.hpp"
 #include "sonder/inference/error.hpp"
 

@@ -31,9 +31,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(SONDER_BUILD_TESTS "Build the Sonder Inference test suite" ${PROJECT_IS_TOP_LEVEL})
 option(SONDER_BUILD_CLI "Build the sonder-infer CLI" ${PROJECT_IS_TOP_LEVEL})
 option(SONDER_WARNINGS_AS_ERRORS "Treat compiler warnings as errors for Sonder targets" OFF)
+option(SONDER_BUILD_LLAMASERVER "Build the external llama-server backend" ON)
 # Direct llama.cpp/GGML backend (src/backends/llamacpp). OFF by default: when ON,
 # llama.cpp is fetched at a pinned tag and compiled (CPU; accelerators via GGML_*).
-option(SONDER_BUILD_LLAMASERVER "Build the external llama-server backend" ON)
 option(SONDER_WITH_LLAMA_CPP "Build the direct llama.cpp backend" OFF)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
