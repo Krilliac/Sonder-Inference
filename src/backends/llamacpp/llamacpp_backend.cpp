@@ -2299,7 +2299,10 @@ struct LlamaCppBackend::Impl {
         if (check_p_min && sidx < mtp_backend_chain_attached.size() && mtp_backend_chain_attached[sidx] != 0u) {
             // One-way detach + free: llama_sampler_chain_backend_init() asserts is_init == false
             // (v1.0.0 src/llama-sampler.cpp:740), so an initialized chain must never be reattached.
-            (void)llama_set_sampler(ctx_dft, slot_id, nullptr);
+            // Detach through the NAT-02 barrier. If it fails, the context may still hold the
+            // chain: keep it owned and attached (ReleaseMtp detaches and frees it later), and
+            // stop MTP drafting on this slot rather than draft without the p_min gate.
+            if (!TrySetSampler(ctx_dft, slot_id, nullptr)) return false;
             if (mtp_backend_chains[sidx] != nullptr) {
                 llama_sampler_free(mtp_backend_chains[sidx]);
                 mtp_backend_chains[sidx] = nullptr;
