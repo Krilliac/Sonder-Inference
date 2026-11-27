@@ -27,13 +27,14 @@ Runtime per ADR-021
 
 ## Worklist status
 
-Statuses below are checked against `git log origin/main` (at `c3df44d`,
+Statuses below are checked against `git log origin/main` (at `df2fb11`,
 2026-11-26). An item is marked `merged` only when the full item has landed on
 `origin/main`.
 
 | Item | What | Status | Current state and references |
 | --- | --- | --- | --- |
-| **RET-01** | Native backend as sole local engine on CUDA (RTX 5070 Ti) and Vulkan (RX 9060 XT) | in progress | Direct `llamacpp` backend, CUDA/Vulkan presets, continuous batching, L2 radix cache, speculation, tool chat (`#124`), lazy grammar (`#128`, `#130`), and `<think>` splitter (`#129`) are on `origin/main`. Upstream pin rebase past `b11195` and live CUDA/Vulkan parity qualification remain. See [GPU_SUPPORT.md](GPU_SUPPORT.md) and [integration/llamacpp.md](integration/llamacpp.md). |
+| **RET-01** | Native backend as sole local engine on CUDA (`cuda-blackwell`) and Vulkan (`vulkan-xt`) | in progress | Direct `llamacpp` backend, CUDA/Vulkan presets, continuous batching, L2 radix cache, speculation, tool chat (`#124`), lazy grammar (`#128`, `#130`), `<think>` splitter (`#129`), and the `v1.0.0` upstream pin move (`#134`, see RET-01a below) are on `origin/main`. Live `cuda-blackwell` and `vulkan-xt` parity qualification remain. See [GPU_SUPPORT.md](GPU_SUPPORT.md) and [integration/llamacpp.md](integration/llamacpp.md). |
+| **RET-01a (NAT-01)** | Move `llama.cpp` upstream pin past `b11195` to `v1.0.0` | merged | Merged on `origin/main` (`df2fb11`, `#134`). Pin moved to `v1.0.0` (commit `b1b770d`) via `cmake/llamacpp-pin.json` with configure-time `expected_features` enforcement; `b11195` survives only as a legacy tag in `src/backends/llamacpp/CMakeLists.txt`. |
 | **RET-02** | Ollama Cloud provider over HTTPS | in progress | Not merged on `origin/main`. Opt-in direct HTTPS client to Ollama Cloud with no local daemon, building on optional `src/net` TLS ([integration/tls.md](integration/tls.md)). |
 | **RET-03** | Native embeddings endpoint | in progress | `POST /v1/embeddings` and batched direct `llamacpp` embeddings (`src/backends/llamacpp/embed_batch_planner.hpp`, plus `/v1/rerank` and `/v1/score`) are on `origin/main` (`46c8a3e`, `#121`; [SERVER.md](SERVER.md#post-v1embeddings)). Low-priority stream gating and cutover of Runtime's embedding model to native GGUF remain. |
 | **RET-04** | Model store importing an existing Ollama library in place | planned | Not on `origin/main`. Resolves existing Ollama manifests and blobs into an SI registry in place (no weight copies). |
@@ -41,14 +42,14 @@ Statuses below are checked against `git log origin/main` (at `c3df44d`,
 | **RET-06** | LoRA adapters in the native backend | planned | Not on `origin/main` (`Capability::lora` is declared in `include/sonder/inference/backend.hpp`, not yet implemented in `src/backends/llamacpp`). Required by Runtime's training path in RET-05. |
 | **RET-07** | Removal of the `ollama` and `llamaserver` backends | planned | Both backends are marked deprecated in [README.md](../README.md) and [src/backends/README.md](../src/backends/README.md). Code removal follows RET-01 through RET-06, keeping only the RET-02 cloud provider. |
 | **RET-08** | Cutover and bring-up | planned | Final operational cutover to native SI across main and secondary hosts, disabling local Ollama and verifying all Observatory inference panels ([OBSERVATORY_CONTRACT.md](OBSERVATORY_CONTRACT.md), [TELEMETRY.md](TELEMETRY.md)). |
-| **RET-09** | One vendored, pinned `ggml`/`llama.cpp` tree with SI's own patch series; no separate forks or binaries; stock `Q2_0` preferred for Bonsai if it reaches parity, otherwise `PQ2_0` kernels carried as SI patches | planned | Not on `origin/main` (`src/backends/llamacpp/CMakeLists.txt` still FetchContents tag `b11195`). Replaces standalone fork/server binaries with one SI-owned build and patch series. Licensing terms are tracked in [LICENSE_REVIEW.md](LICENSE_REVIEW.md). |
+| **RET-09** | One vendored, pinned `ggml`/`llama.cpp` tree with SI's own patch series; no separate forks or binaries; stock `Q2_0` preferred for Bonsai if it reaches parity, otherwise `PQ2_0` kernels carried as SI patches | planned | Current state on `origin/main`: FetchContent of `v1.0.0` (commit `b1b770d`, `#134`) via the pin manifest (`cmake/llamacpp-pin.json`), with `b11195` surviving only as a legacy tag in `src/backends/llamacpp/CMakeLists.txt`. Replaces standalone fork/server binaries with one SI-owned vendored tree and patch series; licensing review and owner approval are tracked as pending in [LICENSE_REVIEW.md](LICENSE_REVIEW.md). |
 
 ## Sequencing
 
-1. **Core engine consolidation (RET-01, RET-09):** upgrade and vendor the
-   pinned `ggml`/`llama.cpp` tree with SI's patch series, validate stock `Q2_0`
-   versus carried `PQ2_0` patches for Bonsai, and qualify native CUDA and
-   Vulkan parity.
+1. **Core engine consolidation (RET-01, RET-09):** build on the merged `v1.0.0`
+   pin move (`#134`) to vendor the pinned `ggml`/`llama.cpp` tree with SI's
+   patch series, validate stock `Q2_0` versus carried `PQ2_0` patches for
+   Bonsai, and qualify native `cuda-blackwell` and `vulkan-xt` parity.
 2. **Feature closure (RET-02, RET-03, RET-04, RET-06):** land the Ollama Cloud
    HTTPS provider, finish native embeddings cutover, import existing Ollama
    model libraries in place, and add native LoRA adapter lifecycle.
@@ -63,8 +64,8 @@ Statuses below are checked against `git log origin/main` (at `c3df44d`,
 - [GPU, ternary/1-bit, and APU hardware support](GPU_SUPPORT.md) — build
   presets, GGUF tensor formats, and CUDA/ROCm/Vulkan/UMA details
 - [Upstream license and dependency review](LICENSE_REVIEW.md) — Apache-2.0
-  project license, MIT terms for `ggml`/`llama.cpp` and SI patches, and
-  third-party review rules
+  project license, MIT terms for upstream `ggml`/`llama.cpp`, pending
+  vendoring/patch-series review, and third-party review rules
 - [General roadmap](ROADMAP.md) and [backend strategy](BACKENDS.md) — broader
   engine milestones and capability model
 - [HTTP server reference](SERVER.md) — current `/v1/*` routes and serve flags

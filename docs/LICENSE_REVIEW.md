@@ -107,16 +107,14 @@ No license conclusions from the initial broad web sweep are considered authorita
 - approved: yes, approved by Nate on 2026-09-26 (MIT, compatible with the project's Apache-2.0
   license; notice kept in `NOTICE`)
 - vendored tree and SI patches (planned, RET-09 in [ROADMAP_SI_ONLY.md](ROADMAP_SI_ONLY.md)):
-  when Sonder Inference transitions from FetchContent tarballs to a single
-  vendored, pinned `ggml`/`llama.cpp` source tree with SI's own patch series on
-  top, that vendored tree plus SI's patches to it remain under the **MIT**
-  license (preserving the upstream MIT copyright and permission notice in
-  `NOTICE` and binary distributions), which stays compatible with Sonder
-  Inference's Apache-2.0 project license. This file does not currently carry a
-  verified license record for the PrismML fork (`PrismML-Eng/llama.cpp`); if
-  stock `Q2_0` does not reach parity and any `PQ2_0` kernel code is ported from
-  PrismML rather than written independently, its exact repository, revision,
-  and license must be verified and recorded here before adoption.
+  vendoring the `ggml`/`llama.cpp` tree and choosing the license of SI's patch
+  series need a new review and an owner approval recorded here before RET-09
+  lands. Upstream code stays MIT, with its copyright and permission notice kept
+  in `NOTICE` and binary distributions. This file does not currently carry a
+  verified license record for the PrismML fork; if stock `Q2_0` does not reach
+  parity and any `PQ2_0` kernel code is ported from the PrismML fork rather
+  than written independently, its exact repository, revision, and license must
+  be verified and recorded here before adoption.
 
 ### cpp-httplib
 - repository: https://github.com/yhirose/cpp-httplib

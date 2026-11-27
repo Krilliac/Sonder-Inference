@@ -19,10 +19,10 @@ inference onto the native in-process `llama.cpp` backend is in
 
 ## Capabilities
 
-- **Core API**: `Engine`, `Device` and GPU inventory (CPU plus
-  DXGI/NVML/ROCm/sysfs GPU discovery with UMA detection), `Model`, `Session`,
-  `Backend` with capability advertisement, `SamplingConfig` validation and
-  cooperative cancellation. Public C++ headers are in
+- **Core API**: `Engine`, `Device` and GPU inventory (CPU plus DXGI, NVML and
+  sysfs GPU discovery, with ROCm ordinal mapping and UMA detection), `Model`,
+  `Session`, `Backend` with capability advertisement, `SamplingConfig`
+  validation and cooperative cancellation. Public C++ headers are in
   [`include/sonder/inference/`](include/sonder/inference/).
 - **C ABI**: [`include/sonder_inference.h`](include/sonder_inference.h),
   `SONDER_ABI_VERSION` 1.
@@ -185,8 +185,8 @@ $B/sonder-infer chat --backend mock --model mock:tiny \
     --messages tests/fixtures/chat_messages.json
 
 # Native in-process llama.cpp (target local engine; requires SONDER_WITH_LLAMA_CPP=ON)
-$B/sonder-infer generate --backend llamacpp --model-dir <gguf-dir> \
-    --model <file.gguf> --prompt "Say hi"
+$B/sonder-infer generate --backend llamacpp --model <path/to/file.gguf> \
+    --prompt "Say hi"
 
 # Local Ollama (deprecated, scheduled for removal; default http://127.0.0.1:11434,
 # or SONDER_OLLAMA_URL / OLLAMA_HOST)
@@ -208,6 +208,9 @@ session. Exit codes: 0 success, 1 runtime or backend failure, 2 usage error,
 ```bash
 $B/sonder-infer serve --backend mock --port 11437
 curl -fsS http://127.0.0.1:11437/v1/sonder/health
+
+# Native in-process llama.cpp (requires SONDER_WITH_LLAMA_CPP=ON)
+$B/sonder-infer serve --backend llamacpp --model-dir <gguf-dir> --model <file.gguf> --port 11437
 ```
 
 For local GGUF serving, the target path is `--backend llamacpp` (in-process,
