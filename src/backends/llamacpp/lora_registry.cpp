@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "llama.h"
+#include "request_guards.hpp"
 
 namespace sonder::backends::llamacpp {
 
@@ -931,12 +932,14 @@ public:
             return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
         }
         out = {};
-        out.model_id = hooks_->get_model_path(impl_);
-        out.architecture = ReadModelMetaStr(model, "general.architecture");
-        out.name = ReadModelMetaStr(model, "general.name");
-        out.basename = ReadModelMetaStr(model, "general.basename");
-        out.base_model_name = ReadModelMetaStr(model, "general.base_model.0.name");
-        return Status::Ok();
+        return RunGuarded(ErrorCode::kLoadFailed, "llama_model_meta_val_str", [&]() -> Status {
+            out.model_id = hooks_->get_model_path(impl_);
+            out.architecture = ReadModelMetaStr(model, "general.architecture");
+            out.name = ReadModelMetaStr(model, "general.name");
+            out.basename = ReadModelMetaStr(model, "general.basename");
+            out.base_model_name = ReadModelMetaStr(model, "general.base_model.0.name");
+            return Status::Ok();
+        });
     }
 
     Status ReadAdapterMetadata(const std::string& canonical_path, LoraAdapterMetadata& out) const override {
@@ -988,7 +991,15 @@ public:
             return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
         }
         // llama.cpp v1.0.0 include/llama.h:685
-        llama_adapter_lora* adapter = llama_adapter_lora_init(model, canonical_path.c_str());
+        llama_adapter_lora* adapter = nullptr;
+        if (Status gs = RunGuarded(ErrorCode::kLoadFailed, "llama_adapter_lora_init",
+                                   [&]() -> Status {
+                                       adapter = llama_adapter_lora_init(model, canonical_path.c_str());
+                                       return Status::Ok();
+                                   });
+            !gs.ok()) {
+            return gs;
+        }
         if (adapter == nullptr) {
             return Status::Error(ErrorCode::kLoadFailed, "llama_adapter_lora_init failed for: " + canonical_path);
         }
@@ -1002,11 +1013,18 @@ public:
         if (adapter == nullptr) {
             return Status::Error(ErrorCode::kInvalidArgument, "null LoRA adapter handle");
         }
-        out.general_type = ReadAdapterMetaStr(adapter, "general.type");
-        out.adapter_type = ReadAdapterMetaStr(adapter, "adapter.type");
-        out.architecture = ReadAdapterMetaStr(adapter, "general.architecture");
-        out.base_model_name = ReadAdapterMetaStr(adapter, "general.base_model.0.name");
-        const std::string alpha_str = ReadAdapterMetaStr(adapter, "adapter.lora.alpha");
+        std::string alpha_str;
+        if (Status gs = RunGuarded(ErrorCode::kLoadFailed, "llama_adapter_meta_val_str", [&]() -> Status {
+                out.general_type = ReadAdapterMetaStr(adapter, "general.type");
+                out.adapter_type = ReadAdapterMetaStr(adapter, "adapter.type");
+                out.architecture = ReadAdapterMetaStr(adapter, "general.architecture");
+                out.base_model_name = ReadAdapterMetaStr(adapter, "general.base_model.0.name");
+                alpha_str = ReadAdapterMetaStr(adapter, "adapter.lora.alpha");
+                return Status::Ok();
+            });
+            !gs.ok()) {
+            return gs;
+        }
         if (!alpha_str.empty()) {
             try {
                 std::size_t consumed = 0;
@@ -1026,7 +1044,10 @@ public:
     void FreeAdapter(LoraAdapterHandle handle) noexcept override {
         if (handle == nullptr) return;
         // llama.cpp v1.0.0 include/llama.h:714
-        llama_adapter_lora_free(static_cast<llama_adapter_lora*>(handle));
+        (void)RunGuarded(ErrorCode::kLoadFailed, "llama_adapter_lora_free", [&]() -> Status {
+            llama_adapter_lora_free(static_cast<llama_adapter_lora*>(handle));
+            return Status::Ok();
+        });
     }
 
     Status SetContextAdapters(std::span<const ActiveLoraBinding> bindings) override {
@@ -1041,18 +1062,26 @@ public:
 
         // llama.cpp v1.0.0 include/llama.h:723 (llama_set_adapters_lora)
         int32_t rc = 0;
-        if (bindings.empty()) {
-            rc = llama_set_adapters_lora(ctx, nullptr, 0, nullptr);
-        } else {
-            std::vector<llama_adapter_lora*> ptrs;
-            std::vector<float> scales;
-            ptrs.reserve(bindings.size());
-            scales.reserve(bindings.size());
-            for (const ActiveLoraBinding& b : bindings) {
-                ptrs.push_back(static_cast<llama_adapter_lora*>(b.handle));
-                scales.push_back(b.scale);
-            }
-            rc = llama_set_adapters_lora(ctx, ptrs.data(), ptrs.size(), scales.data());
+        if (Status gs = RunGuarded(ErrorCode::kDecodeFailed, "llama_set_adapters_lora",
+                                   [&]() -> Status {
+                                       if (bindings.empty()) {
+                                           rc = llama_set_adapters_lora(ctx, nullptr, 0, nullptr);
+                                       } else {
+                                           std::vector<llama_adapter_lora*> ptrs;
+                                           std::vector<float> scales;
+                                           ptrs.reserve(bindings.size());
+                                           scales.reserve(bindings.size());
+                                           for (const ActiveLoraBinding& b : bindings) {
+                                               ptrs.push_back(static_cast<llama_adapter_lora*>(b.handle));
+                                               scales.push_back(b.scale);
+                                           }
+                                           rc = llama_set_adapters_lora(ctx, ptrs.data(), ptrs.size(),
+                                                                        scales.data());
+                                       }
+                                       return Status::Ok();
+                                   });
+            !gs.ok()) {
+            return gs;
         }
         if (rc != 0) {
             return Status::Error(ErrorCode::kDecodeFailed,
