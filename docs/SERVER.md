@@ -113,7 +113,7 @@ itself.
 | `--cors-origin ORIGIN` (repeatable) | none | Exact-match browser origin, allowed on every route. Must be a serialized origin as browsers send it: lowercase `scheme://host[:port]`, no path, trailing slash, query or wildcard (exit 2 otherwise). |
 | `--no-default-cors` | off | Drops the default origin list. |
 | `--telemetry-level off\|metrics\|standard\|deep` | `standard` | |
-| `--telemetry-buffer N` | `8192` | Retained lifecycle events for resume (1 to 1048576). Periodic `*.sample` events are kept apart: the latest per (type, device, backend) plus a history of `N/16` samples (no flag; minutes of history at default rates). Holes in a replayed sequence are evicted samples only. |
+| `--telemetry-buffer N` | `8192` | Retained lifecycle events for resume (1 to 1048576). Periodic `*.sample` events are kept apart: the latest per (type, device, backend) plus a history of `N/16` samples (no flag; minutes of history at default rates). A replay can contain sequence holes (evicted samples, or lifecycle events past the ring); on SSE each hole is announced as `: resume-gap <from>-<to>`; NDJSON has no comment channel, so holes there are silent (contract change pending with Observatory). At most 64 latest-per-key sample keys are kept; the oldest key is evicted past that. The default per-subscriber queue holds a whole replay (ring + sample history + 64), so a fresh subscriber never loses retained events. |
 | `--telemetry PATH` | none | Also write JSONL to `PATH` (`-` for stderr). |
 | `--capture-text` | off | Include generated text in token events. Requires `--token-file`. |
 | `--max-connections N` | `64` | A warning is printed when it plus 32 exceeds the open-file limit (`ulimit -n`). |
@@ -1077,7 +1077,7 @@ equals the envelopes' `producer.instance_id` and the `event_id` prefix.
   15 s when idle.
 - Resume: `Last-Event-ID` wins over `?last_event_id=`. Same instance and
   retained: replay after it. Same instance but older than the window:
-  `: resume-gap <from>-<to>` (SSE; lifecycle loss only), then every retained event newer than the id. Unknown instance
+  `: resume-gap <from>-<to>` (SSE; one comment per hole, including evicted samples), then every retained event newer than the id. Unknown instance
   (producer restarted), malformed or no id: the whole window. `?since=now`:
   live only.
 - At most 8 concurrent streams; the ninth gets 429 `overloaded` with

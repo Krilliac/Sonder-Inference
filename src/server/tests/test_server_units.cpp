@@ -488,9 +488,41 @@ TEST_CASE("hub: a sample flood never evicts lifecycle events") {
         return out;
     };
 
+    // Every hole between consecutive replayed sequences (and before the first
+    // one after `from`) must be covered by a ": resume-gap a-b" notice.
+    const auto holes_announced = [](const std::vector<std::uint64_t>& seqs, std::uint64_t from,
+                                    const std::string& gap) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        std::size_t at = 0;
+        while ((at = gap.find(": resume-gap ", at)) != std::string::npos) {
+            at += 13;
+            const std::size_t dash = gap.find('-', at);
+            const std::size_t end = gap.find('\n', dash);
+            ranges.emplace_back(std::stoull(gap.substr(at, dash - at)),
+                                std::stoull(gap.substr(dash + 1, end == std::string::npos ? end : end - dash - 1)));
+        }
+        const auto covered = [&](std::uint64_t n) {
+            for (const auto& r : ranges) {
+                if (n >= r.first && n <= r.second) return true;
+            }
+            return false;
+        };
+        std::uint64_t expected = from;
+        for (const auto s : seqs) {
+            for (std::uint64_t n = expected; n < s; ++n) {
+                if (!covered(n)) return false;
+            }
+            expected = s + 1;
+        }
+        return true;
+    };
+
     // Full replay: lifecycle events and the latest sample per key (gpu1 is
     // long past the history but still the latest for its key), strictly ascending.
-    const auto all = replayed(ResumeRequest{}, nullptr);
+    std::string full_gap;
+    const auto all = replayed(ResumeRequest{}, &full_gap);
+    CHECK(holes_announced(all, all.empty() ? 0 : all.front(), full_gap));
+    CHECK(full_gap.find("resume-gap") != std::string::npos);  // evicted samples are announced
     REQUIRE(all.size() >= 5);
     CHECK(all[0] == 0);
     CHECK(all[1] == 1);
@@ -498,12 +530,13 @@ TEST_CASE("hub: a sample flood never evicts lifecycle events") {
     CHECK(all.back() == last);
     for (std::size_t i = 1; i < all.size(); ++i) CHECK(all[i - 1] < all[i]);
 
-    // Resuming after the lifecycle events: no gap, only retained samples after the id.
+    // Resuming after the lifecycle events: only retained samples after the
+    // id, with the evicted ones announced.
     ResumeRequest r;
     r.last_event_id = "tel-abc-1";
     std::string gap;
     const auto after = replayed(r, &gap);
-    CHECK(gap.empty());
+    CHECK(holes_announced(after, 2, gap));
     CHECK(after.front() == 3);
     CHECK(after.back() == last);
 
@@ -530,14 +563,41 @@ TEST_CASE("hub: a sample flood never evicts lifecycle events") {
     for (const auto s : newer) CHECK(s > last);
     for (std::size_t i = 1; i < newer.size(); ++i) CHECK(newer[i - 1] < newer[i]);
 
-    // Full replay: every hole between lifecycle events is an evicted sample
-    // (lifecycle events are contiguous from the first retained one).
-    const auto full = replayed(ResumeRequest{}, nullptr);
-    std::vector<std::uint64_t> tail;
-    for (const auto s : full) {
-        if (s > last) tail.push_back(s);
+    // Full replay: every hole (evicted samples or lifecycle events) is announced.
+    std::string full_gap2;
+    const auto full = replayed(ResumeRequest{}, &full_gap2);
+    CHECK(holes_announced(full, full.empty() ? 0 : full.front(), full_gap2));
+}
+
+TEST_CASE("hub: the default subscriber queue holds a full replay") {
+    const auto ev = [](std::uint64_t seq, const char* type, const char* device) {
+        return "{\"sequence\":" + std::to_string(seq) + ",\"event_type\":\"" + type + "\",\"device_id\":\"" + device +
+               "\"}";
+    };
+    constexpr std::size_t cap = 64;
+    LiveTelemetryHub hub(cap, 4, 0);  // production defaults: queue 0, sample history cap/16
+    std::uint64_t seq = 0;
+    hub.write_event(seq, ev(seq, "backend.registered", "")), ++seq;
+    // Overflow the lifecycle ring and the sample history, spread over many keys.
+    for (int i = 0; i < 400; ++i) {
+        hub.write_event(seq, ev(seq, "request.started", "")), ++seq;
+        const std::string dev = "d" + std::to_string(i % 100);  // 100 keys > kMaxSampleKeys
+        hub.write_event(seq, ev(seq, "device.memory.sample", dev.c_str())), ++seq;
     }
-    for (std::size_t i = 1; i < tail.size(); ++i) CHECK(tail[i] == tail[i - 1] + 1);
+    const HubStats st = hub.stats();
+    CHECK(st.retained == cap);
+    auto s = hub.subscribe(ResumeRequest{});
+    REQUIRE(s.subscription);
+    const auto batch = s.subscription->next(std::chrono::milliseconds(0), nullptr);
+    CHECK(batch.dropped == 0);
+    std::size_t lifecycle = 0;
+    for (const auto& e : batch.events) {
+        if (e->line.find("request.started") != std::string::npos) ++lifecycle;
+    }
+    CHECK(lifecycle == cap);  // every retained lifecycle event arrives
+    CHECK(batch.events.size() <= cap + st.sample_capacity + 64);
+    CHECK(hub.stats().subscriber_dropped_events == 0);
+    hub.unsubscribe(s.subscription);
 }
 
 TEST_CASE("backend setup: env defaults and factory") {

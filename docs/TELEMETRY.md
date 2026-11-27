@@ -411,9 +411,20 @@ itself is Observatory's (`protocol/producer-discovery.schema.json`,
   `model.*`, `request.*`, `kv.*` or `scheduler.*`. Samples keep the latest
   event per (event type, device or backend) plus a short history of
   `telemetry-buffer / 16` events. A replay merges both classes in sequence
-  order; `resume-gap` reports only evicted lifecycle events (older samples are
-  intentionally dropped), and `retained_events` / `oldest_sequence` describe
-  the lifecycle ring (`retained_sample_events` counts the samples kept).
+  order. Evicted samples leave sequence holes between retained events, so
+  "sequence is contiguous" no longer holds for a replay: on SSE every hole
+  (evicted sample or lifecycle event) is announced with its own
+  `: resume-gap <from>-<to>` comment before the event that follows it; NDJSON
+  cannot carry the notice, so there the holes are silent. That, the
+  `retained_sample_events` discovery field and the fact that `oldest_sequence`
+  describes only the lifecycle ring (a replay can start with an older
+  latest-per-key sample) need an agreed Observatory contract change. At most
+  64 sample keys are tracked (the oldest key is evicted beyond that). Lines
+  written through `write()` by producers other than the telemetry bus that
+  serialize with whitespace (`"event_type": "`) are not recognised as samples
+  and stay in the lifecycle class. The default subscriber queue holds a full
+  replay (lifecycle ring + sample history + 64), so a new subscriber loses
+  nothing it is entitled to.
 - Backpressure: the server keeps a ring of the last `--telemetry-buffer`
   lifecycle events (default 8192) and a bounded queue per subscriber (at most 8
   subscribers; the ninth gets 429). A subscriber that falls behind loses its

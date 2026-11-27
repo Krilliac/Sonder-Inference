@@ -2,6 +2,7 @@
 // resume (same instance, unknown instance, older than the window), since=now,
 // the subscriber cap, and a stalled subscriber that loses events while chat
 // requests keep completing.
+#include <algorithm>
 #include <doctest/doctest.h>
 
 #include <optional>
@@ -265,12 +266,16 @@ TEST_CASE("resume: Last-Event-ID from the same instance, unknown instance, too o
     // Unknown instance (producer restarted): the whole retained window.
     ids = first_ids({{"Last-Event-ID", "tel-0000000000000000-3"}}, "/v1/telemetry/sse", nullptr);
     REQUIRE_FALSE(ids.empty());
-    CHECK(ids.front() == instance + "-" + std::to_string(oldest));
+    // A full replay may start with an older retained latest-per-key sample;
+    // the lifecycle window (oldest_sequence) is always inside it.
+    CHECK(std::find(ids.begin(), ids.end(), instance + "-" + std::to_string(oldest)) != ids.end());
     // Older than the window: resume-gap comment, then the whole window.
     std::string comments;
     ids = first_ids({{"Last-Event-ID", instance + "-0"}}, "/v1/telemetry/sse", &comments);
     REQUIRE_FALSE(ids.empty());
-    CHECK(ids.front() == instance + "-" + std::to_string(oldest));
+    // A full replay may start with an older retained latest-per-key sample;
+    // the lifecycle window (oldest_sequence) is always inside it.
+    CHECK(std::find(ids.begin(), ids.end(), instance + "-" + std::to_string(oldest)) != ids.end());
     CHECK(comments.find(": resume-gap 1-" + std::to_string(oldest - 1)) != std::string::npos);
     // since=now: nothing replayed, only live events.
     Conn live(f.port);
