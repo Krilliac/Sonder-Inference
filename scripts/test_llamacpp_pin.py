@@ -456,31 +456,112 @@ class CMakeApplyPatchesTests(unittest.TestCase):
         pin_manifest(self.manifest, "v1.0.0", SHA_A, patches=[
             {"file": "0001-badsha.patch", "sha256": "0" * 64, "summary": "s", "upstream": "u"},
         ])
-        self.assertNotEqual(self.run_apply().returncode, 0)
+        r = self.run_apply()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("SHA-256 mismatch", r.stderr)
         (self.patch_dir / "0001-badsha.patch").unlink()
 
         # Unlisted .patch file on disk
         (self.patch_dir / "0001-unlisted.patch").write_bytes(valid_patch)
         pin_manifest(self.manifest, "v1.0.0", SHA_A, patches=[])
-        self.assertNotEqual(self.run_apply().returncode, 0)
+        r = self.run_apply()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("unlisted patch file", r.stderr)
         (self.patch_dir / "0001-unlisted.patch").unlink()
 
-        # Path traversal & .git hook & symlink mode 120000
-        hostile_payloads = [
-            b"diff --git a/../escape.c b/../escape.c\n--- a/../escape.c\n+++ b/../escape.c\n@@ -0,0 +1 @@\n+x\n",
-            b"diff --git a/.git/hooks/post-checkout b/.git/hooks/post-checkout\n--- /dev/null\n+++ b/.git/hooks/post-checkout\n@@ -0,0 +1 @@\n+evil\n",
-            b"diff --git a/link b/link\nnew file mode 120000\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+/etc/passwd\n",
+        # Path traversal, .git hook, symlink mode 120000, binary patch, 0-file/hunkless patch,
+        # and an unbalanced '[' preceding a hostile +++ header (CMake list-splitting regression).
+        hostile_cases = [
+            (
+                b"diff --git a/../escape.c b/../escape.c\n--- a/../escape.c\n+++ b/../escape.c\n@@ -0,0 +1 @@\n+x\n",
+                "unsafe target path",
+            ),
+            (
+                b"diff --git a/.git/hooks/post-checkout b/.git/hooks/post-checkout\n--- /dev/null\n+++ b/.git/hooks/post-checkout\n@@ -0,0 +1 @@\n+evil\n",
+                "unsafe target path",
+            ),
+            (
+                b"diff --git a/link b/link\nnew file mode 120000\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+/etc/passwd\n",
+                "symlink mode 120000",
+            ),
+            (
+                b"diff --git a/src/a.bin b/src/a.bin\nGIT binary patch\nliteral 0\nHcmV?d00001\n",
+                "binary patches are forbidden",
+            ),
+            (
+                b"diff --git a/src/a.c b/src/a.c\n--- /dev/null\n+++ /dev/null\n",
+                "no target files",
+            ),
+            (
+                b"diff --git a/src/a.c b/src/a.c\n--- a/src/a.c\n+++ b/src/a.c\n@@ -1 +1 @@\n-int a(void) { return 1; }\n+int arr[4;\n"
+                b"diff --git a/../escape.c b/../escape.c\n--- /dev/null\n+++ b/../escape.c\n@@ -0,0 +1 @@\n+int x;\n",
+                "unsafe target path",
+            ),
         ]
-        for idx, payload in enumerate(hostile_payloads, 1):
-            fname = f"000{idx}-hostile.patch"
-            p = self.patch_dir / fname
-            p.write_bytes(payload)
-            pin_manifest(self.manifest, "v1.0.0", SHA_A, patches=[
-                {"file": fname, "sha256": hashlib.sha256(payload).hexdigest(),
-                 "summary": "hostile", "upstream": "sonder-owned"},
-            ])
-            self.assertNotEqual(self.run_apply().returncode, 0)
-            p.unlink()
+        for idx, (payload, expected_err) in enumerate(hostile_cases, 1):
+            with self.subTest(idx=idx, expected_err=expected_err):
+                fname = f"000{idx}-hostile.patch"
+                p = self.patch_dir / fname
+                try:
+                    p.write_bytes(payload)
+                    pin_manifest(self.manifest, "v1.0.0", SHA_A, patches=[
+                        {"file": fname, "sha256": hashlib.sha256(payload).hexdigest(),
+                         "summary": "hostile", "upstream": "sonder-owned"},
+                    ])
+                    r = self.run_apply()
+                    self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+                    self.assertIn(expected_err, r.stderr)
+                finally:
+                    p.unlink(missing_ok=True)
+
+    def test_nested_inside_git_worktree_applies_patch_and_mutates_file(self) -> None:
+        """Regression for intake BLOCKING 1: build/<preset>/_deps/llamacpp-src sits inside
+        the SI git worktree, where bare `git apply` previously treated paths as relative to
+        the outer repo root, skipped every file, and still exited 0."""
+        repo = self.tmp / "outer-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True, timeout=30)
+        (repo / ".gitignore").write_text("build/\n", encoding="utf-8")
+        nested_src = repo / "build" / "msvc-debug" / "_deps" / "llamacpp-src"
+        (nested_src / "src").mkdir(parents=True)
+        (nested_src / "src" / "a.c").write_bytes(b"int a(void) { return 1; }\n")
+        patch_dir = repo / "third_party" / "ggml-patches"
+        patch_dir.mkdir(parents=True)
+        p1 = (
+            b"diff --git a/src/a.c b/src/a.c\n"
+            b"--- a/src/a.c\n"
+            b"+++ b/src/a.c\n"
+            b"@@ -1 +1 @@\n"
+            b"-int a(void) { return 1; }\n"
+            b"+int a(void) { return 42; }\n"
+        )
+        (patch_dir / "0001-nested.patch").write_bytes(p1)
+        manifest = repo / "pin.json"
+        pin_manifest(manifest, "v1.0.0", SHA_A, patches=[
+            {"file": "0001-nested.patch", "sha256": hashlib.sha256(p1).hexdigest(),
+             "summary": "nested repo apply", "upstream": "sonder-owned"},
+        ])
+        r = subprocess.run(
+            ["cmake",
+             f"-DSONDER_LLAMACPP_PIN_FILE={manifest.as_posix()}",
+             f"-DSONDER_LLAMACPP_REPO_ROOT={repo.as_posix()}",
+             f"-DSONDER_LLAMACPP_SOURCE_DIR_TO_PATCH={nested_src.as_posix()}",
+             "-P", str(APPLY_SCRIPT)],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((nested_src / "src" / "a.c").read_bytes(), b"int a(void) { return 42; }\n")
+        # Also verify the Python verifier inside the same git worktree parent.
+        pin.verify_patches_apply(
+            {"src/a.c": b"int a(void) { return 1; }\n"},
+            [patch_dir / "0001-nested.patch"],
+            work_parent=repo / "build",
+        )
+        # And 0-file / hunkless patches are rejected by inspect_patch_bytes too.
+        with self.assertRaisesRegex(pin.PinError, "no target files"):
+            pin.inspect_patch_bytes(
+                b"diff --git a/src/a.c b/src/a.c\n--- /dev/null\n+++ /dev/null\n",
+                "0001-zero.patch",
+            )
 
 
 FEATURES_BEGIN = "# --- expected features begin"

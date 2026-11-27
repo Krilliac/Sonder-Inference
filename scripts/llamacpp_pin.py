@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -103,9 +104,11 @@ def _check_rel_path(raw: str, context: str) -> None:
         raise PinError(f"forbidden .git path in {context}: {raw!r}")
 
 
-def inspect_patch_bytes(data: bytes, patch_name: str) -> None:
+def inspect_patch_bytes(data: bytes, patch_name: str) -> list[str]:
     if not data:
         raise PinError(f"patch {patch_name} is empty")
+    if b"\x00" in data:
+        raise PinError(f"binary patches are forbidden ({patch_name})")
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -117,6 +120,15 @@ def inspect_patch_bytes(data: bytes, patch_name: str) -> None:
 
     saw_minus = False
     saw_plus = False
+    saw_hunk = False
+    targets: list[str] = []
+    seen_targets: set[str] = set()
+
+    def _record(path_val: str) -> None:
+        if path_val not in seen_targets:
+            seen_targets.add(path_val)
+            targets.append(path_val)
+
     for line in text.splitlines():
         if line.startswith("diff --git "):
             tokens = line.split()
@@ -131,17 +143,25 @@ def inspect_patch_bytes(data: bytes, patch_name: str) -> None:
             if target != "/dev/null":
                 clean = target[2:] if target.startswith("a/") else target
                 _check_rel_path(clean, patch_name)
+                _record(clean)
         elif line.startswith("+++ "):
             saw_plus = True
             target = line[4:].split("\t", 1)[0].strip()
             if target != "/dev/null":
                 clean = target[2:] if target.startswith("b/") else target
                 _check_rel_path(clean, patch_name)
+                _record(clean)
+        elif line.startswith("@@ "):
+            saw_hunk = True
         elif line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
             target = line.split(" ", 2)[2].strip()
             _check_rel_path(target, patch_name)
+            _record(target)
     if not (saw_minus and saw_plus):
         raise PinError(f"patch {patch_name} contains no unified diff headers")
+    if not targets or not saw_hunk:
+        raise PinError(f"patch {patch_name} touches no target files or contains no hunks")
+    return targets
 
 
 def validate_patch_series(entry: dict, root: Path) -> list[Path]:
@@ -240,7 +260,12 @@ def split_member(name: str) -> tuple[str, str]:
 
 
 def tarball_blobs(tarball: Path, capture_regular: dict[str, bytes] | None = None) -> dict[str, str]:
-    """relative path -> git blob sha1, read in memory (no extraction to disk)."""
+    """relative path -> git blob sha1, read in memory (no extraction to disk).
+
+    The archive must have exactly one top-level directory shared by every
+    member: CMake's extract step uses the extraction root as the source dir when
+    there is more than one top-level entry, so anything else is rejected.
+    """
     blobs: dict[str, str] = {}
     tops: set[str] = set()
     try:
@@ -276,18 +301,35 @@ def tarball_blobs(tarball: Path, capture_regular: dict[str, bytes] | None = None
     return blobs
 
 
-def verify_patches_apply(regular_files: dict[str, bytes], patch_paths: list[Path]) -> None:
+def _file_state(path: Path) -> str:
+    if path.is_file() and not path.is_symlink():
+        return f"FILE:{sha256_file(path)}"
+    return "MISSING"
+
+
+def verify_patches_apply(
+    regular_files: dict[str, bytes],
+    patch_paths: list[Path],
+    work_parent: Path | None = None,
+) -> None:
     if not patch_paths:
         return
-    with tempfile.TemporaryDirectory(prefix="llamacpp-patch-verify-") as tmp_str:
-        tmp_dir = Path(tmp_str)
+    with tempfile.TemporaryDirectory(
+        prefix="llamacpp-patch-verify-",
+        dir=str(work_parent) if work_parent is not None else None,
+    ) as tmp_str:
+        tmp_dir = Path(tmp_str).resolve()
         for rel, content in regular_files.items():
             _check_rel_path(rel, "verified tarball")
             dst = tmp_dir / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(content)
+        env = os.environ.copy()
+        env["GIT_CEILING_DIRECTORIES"] = str(tmp_dir.parent)
         for pfile in patch_paths:
-            for extra in (["--check"], []):
+            targets = inspect_patch_bytes(pfile.read_bytes(), pfile.name)
+            before = {rel: _file_state(tmp_dir / rel) for rel in targets}
+            for extra, expect_banner in ((["--check"], "Checking patch "), ([], "Applied patch ")):
                 proc = subprocess.run(
                     [
                         "git",
@@ -297,14 +339,25 @@ def verify_patches_apply(regular_files: dict[str, bytes], patch_paths: list[Path
                         "core.safecrlf=false",
                         "apply",
                         *extra,
+                        "-v",
                         "-p1",
                         "--whitespace=nowarn",
                         str(pfile),
                     ],
-                    cwd=tmp_dir, capture_output=True, text=True, timeout=60,
+                    cwd=tmp_dir,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
                 )
+                combined = f"{proc.stdout}\n{proc.stderr}"
                 if proc.returncode != 0:
                     raise PinError(f"patch {pfile.name} failed to apply: {proc.stderr.strip()}")
+                if "Skipped patch" in combined or expect_banner not in combined:
+                    raise PinError(f"patch {pfile.name} skipped or matched 0 files: {combined.strip()}")
+            for rel in targets:
+                if _file_state(tmp_dir / rel) == before[rel]:
+                    raise PinError(f"patch {pfile.name} left target {rel!r} unchanged")
 
 
 def cmd_hash(args: argparse.Namespace) -> int:
@@ -371,6 +424,10 @@ def cmd_check(args: argparse.Namespace) -> int:
             text = path.read_text(encoding="utf-8")
         except OSError as exc:
             raise UsageError(f"cannot read {path}: {exc}") from exc
+        # LICENSE_REVIEW.md covers many dependencies: vX.Y.Z tag, commit and
+        # SHA-256 literals only count inside the llama.cpp section (heading naming
+        # llama.cpp up to the next heading). The integration doc is llama.cpp-only.
+        # bNNNNN build tags are llama.cpp-specific and count everywhere.
         scoped = rel == "docs/LICENSE_REVIEW.md"
         in_section = not scoped
         for lineno, line in enumerate(text.splitlines(), 1):

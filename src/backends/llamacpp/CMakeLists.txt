@@ -68,6 +68,9 @@ if(SONDER_LLAMACPP_SOURCE_DIR OR FETCHCONTENT_SOURCE_DIR_LLAMACPP)
                         "For offline builds pass -DSONDER_LLAMACPP_URL=/path/to/pinned-archive.tar.gz.")
 endif()
 
+# Configure-hygiene seam (not an untrusted-input security boundary): unit tests
+# point SONDER_LLAMACPP_PIN_FILE at temporary manifests; production builds use
+# cmake/llamacpp-pin.json enforced by CI (`scripts/llamacpp_pin.py check`).
 set(SONDER_LLAMACPP_PIN_FILE "${SONDER_LLAMACPP_REPO_ROOT}/cmake/llamacpp-pin.json" CACHE FILEPATH
     "Pin manifest to read (override for tests only)")
 set(SONDER_LLAMACPP_URL "" CACHE STRING
@@ -237,19 +240,24 @@ endif()
 set(_sonder_apply_patches_script "${SONDER_LLAMACPP_REPO_ROOT}/cmake/ApplyGgmlPatches.cmake")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_sonder_apply_patches_script}")
 
-# If _deps/llamacpp-src already exists from an earlier configure, verify and apply
-# any newly added patches before FetchContent evaluates llama.cpp's CMakeLists.txt.
-if(EXISTS "${CMAKE_BINARY_DIR}/_deps/llamacpp-src/CMakeLists.txt")
+# If <FETCHCONTENT_BASE_DIR>/llamacpp-src already exists from an earlier configure,
+# verify and apply any newly added patches before FetchContent evaluates llama.cpp.
+if(FETCHCONTENT_BASE_DIR)
+    get_filename_component(_sonder_fc_base_dir "${FETCHCONTENT_BASE_DIR}" ABSOLUTE BASE_DIR "${CMAKE_BINARY_DIR}")
+else()
+    set(_sonder_fc_base_dir "${CMAKE_BINARY_DIR}/_deps")
+endif()
+if(EXISTS "${_sonder_fc_base_dir}/llamacpp-src/CMakeLists.txt")
     execute_process(
         COMMAND "${CMAKE_COMMAND}"
                 "-DSONDER_LLAMACPP_PIN_FILE=${SONDER_LLAMACPP_PIN_FILE}"
                 "-DSONDER_LLAMACPP_REPO_ROOT=${SONDER_LLAMACPP_REPO_ROOT}"
-                "-DSONDER_LLAMACPP_SOURCE_DIR_TO_PATCH=${CMAKE_BINARY_DIR}/_deps/llamacpp-src"
+                "-DSONDER_LLAMACPP_SOURCE_DIR_TO_PATCH=${_sonder_fc_base_dir}/llamacpp-src"
                 -P "${_sonder_apply_patches_script}"
         RESULT_VARIABLE _sonder_pre_patch_rc
     )
     if(NOT _sonder_pre_patch_rc EQUAL 0)
-        message(FATAL_ERROR "Failed to verify/apply ggml-patches on existing _deps/llamacpp-src")
+        message(FATAL_ERROR "Failed to verify/apply ggml-patches on existing ${_sonder_fc_base_dir}/llamacpp-src")
     endif()
 endif()
 
@@ -409,6 +417,8 @@ if(EXISTS "${_sonder_ggml_h}")
         list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_GGML_Q2_0=1)
     endif()
 
+    # Absent on unpatched v1.0.0; reachable only if a reviewed SI patch in
+    # third_party/ggml-patches/ adds GGML_TYPE_PQ2_0 to ggml.h.
     string(FIND "${_sonder_ggml_h_content}" "GGML_TYPE_PQ2_0" _idx_pq2_0)
     if(NOT _idx_pq2_0 EQUAL -1)
         list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_GGML_PQ2_0=1)

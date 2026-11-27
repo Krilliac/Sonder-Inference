@@ -65,8 +65,9 @@ if(NOT _p_err)
     string(JSON _patches_len LENGTH "${_entry}" patches)
 endif()
 
-function(_sonder_check_rel_patch_target path_str patch_name)
+function(_sonder_check_rel_patch_target path_str patch_name out_clean_var)
     if("${path_str}" STREQUAL "/dev/null")
+        set(${out_clean_var} "" PARENT_SCOPE)
         return()
     endif()
     set(_clean "${path_str}")
@@ -82,9 +83,10 @@ function(_sonder_check_rel_patch_target path_str patch_name)
        OR "${_clean}" MATCHES "^\\.git(/|$)")
         message(FATAL_ERROR "ApplyGgmlPatches: unsafe target path '${path_str}' in patch ${patch_name}")
     endif()
+    set(${out_clean_var} "${_clean}" PARENT_SCOPE)
 endfunction()
 
-function(_sonder_inspect_patch_file patch_path patch_name)
+function(_sonder_inspect_patch_file patch_path patch_name out_targets_var)
     file(READ "${patch_path}" _raw)
     if("${_raw}" STREQUAL "")
         message(FATAL_ERROR "ApplyGgmlPatches: patch ${patch_name} is empty")
@@ -96,29 +98,55 @@ function(_sonder_inspect_patch_file patch_path patch_name)
         message(FATAL_ERROR "ApplyGgmlPatches: symlink mode 120000 is forbidden (${patch_name})")
     endif()
     string(REPLACE "\r\n" "\n" _norm "${_raw}")
-    # Escape semicolons before splitting lines into a CMake list.
+    # Escape semicolons AND square brackets before splitting lines into a CMake
+    # list: in CMake lists, an unbalanced '[' suppresses ';' splitting across
+    # subsequent lines until a matching ']'.
     string(REPLACE ";" "__SONDER_SEMI__" _escaped "${_norm}")
+    string(REPLACE "[" "__SONDER_LBRACK__" _escaped "${_escaped}")
+    string(REPLACE "]" "__SONDER_RBRACK__" _escaped "${_escaped}")
     string(REPLACE "\n" ";" _lines "${_escaped}")
     set(_saw_minus OFF)
     set(_saw_plus OFF)
+    set(_saw_hunk OFF)
+    set(_targets "")
     foreach(_line IN LISTS _lines)
+        string(REPLACE "__SONDER_RBRACK__" "]" _line "${_line}")
+        string(REPLACE "__SONDER_LBRACK__" "[" _line "${_line}")
         string(REPLACE "__SONDER_SEMI__" ";" _line "${_line}")
         if(_line MATCHES "^diff --git ([^ \t]+) ([^ \t]+)$")
-            _sonder_check_rel_patch_target("${CMAKE_MATCH_1}" "${patch_name}")
-            _sonder_check_rel_patch_target("${CMAKE_MATCH_2}" "${patch_name}")
+            _sonder_check_rel_patch_target("${CMAKE_MATCH_1}" "${patch_name}" _d1)
+            _sonder_check_rel_patch_target("${CMAKE_MATCH_2}" "${patch_name}" _d2)
         elseif(_line MATCHES "^--- ([^ \t]+)")
             set(_saw_minus ON)
-            _sonder_check_rel_patch_target("${CMAKE_MATCH_1}" "${patch_name}")
+            _sonder_check_rel_patch_target("${CMAKE_MATCH_1}" "${patch_name}" _m_clean)
+            if(NOT "${_m_clean}" STREQUAL "")
+                list(APPEND _targets "${_m_clean}")
+            endif()
         elseif(_line MATCHES "^\\+\\+\\+ ([^ \t]+)")
             set(_saw_plus ON)
-            _sonder_check_rel_patch_target("${CMAKE_MATCH_1}" "${patch_name}")
+            _sonder_check_rel_patch_target("${CMAKE_MATCH_1}" "${patch_name}" _p_clean)
+            if(NOT "${_p_clean}" STREQUAL "")
+                list(APPEND _targets "${_p_clean}")
+            endif()
+        elseif(_line MATCHES "^@@ ")
+            set(_saw_hunk ON)
         elseif(_line MATCHES "^(rename|copy) (from|to) (.+)$")
-            _sonder_check_rel_patch_target("${CMAKE_MATCH_3}" "${patch_name}")
+            _sonder_check_rel_patch_target("${CMAKE_MATCH_3}" "${patch_name}" _rc_clean)
+            if(NOT "${_rc_clean}" STREQUAL "")
+                list(APPEND _targets "${_rc_clean}")
+            endif()
         endif()
     endforeach()
     if(NOT _saw_minus OR NOT _saw_plus)
         message(FATAL_ERROR "ApplyGgmlPatches: patch ${patch_name} contains no unified diff headers")
     endif()
+    if(_targets)
+        list(REMOVE_DUPLICATES _targets)
+    endif()
+    if(NOT _targets OR NOT _saw_hunk)
+        message(FATAL_ERROR "ApplyGgmlPatches: patch ${patch_name} touches no target files or contains no hunks")
+    endif()
+    set(${out_targets_var} "${_targets}" PARENT_SCOPE)
 endfunction()
 
 set(_listed_files "")
@@ -160,10 +188,11 @@ if(_patches_len GREATER 0)
         if(NOT _actual_sha STREQUAL _p_sha)
             message(FATAL_ERROR "ApplyGgmlPatches: SHA-256 mismatch for ${_p_file}: got ${_actual_sha}, expected ${_p_sha}")
         endif()
-        _sonder_inspect_patch_file("${_p_abs}" "${_p_file}")
+        _sonder_inspect_patch_file("${_p_abs}" "${_p_file}" _p_targets)
 
         list(APPEND _listed_files "${_p_file}")
         list(APPEND _patch_abs_list "${_p_abs}")
+        set("_patch_targets_${_i}" "${_p_targets}")
         string(APPEND _expected_stamp "${_p_file}:${_p_sha}\n")
     endforeach()
 endif()
@@ -198,29 +227,84 @@ if(EXISTS "${_stamp_file}")
                         "${SONDER_LLAMACPP_PIN_FILE}; clean _deps/llamacpp-src to re-apply from the pristine archive.")
 endif()
 
-foreach(_p_abs IN LISTS _patch_abs_list)
+# Isolate git apply from any enclosing git repository (e.g. when _deps/llamacpp-src
+# lives inside ${sourceDir}/build/<preset>/_deps/llamacpp-src). Without a ceiling,
+# git discovers the parent .git, interprets patch paths relative to the outer repo
+# root, silently skips every file outside cwd, and exits 0.
+get_filename_component(_target_abs "${SONDER_LLAMACPP_SOURCE_DIR_TO_PATCH}" ABSOLUTE)
+get_filename_component(_ceiling_abs "${_target_abs}" DIRECTORY)
+file(TO_NATIVE_PATH "${_ceiling_abs}" _ceiling_native)
+
+function(_sonder_target_file_state full_path out_var)
+    if(EXISTS "${full_path}" AND NOT IS_DIRECTORY "${full_path}")
+        file(SHA256 "${full_path}" _digest)
+        set(${out_var} "FILE:${_digest}" PARENT_SCOPE)
+    else()
+        set(${out_var} "MISSING" PARENT_SCOPE)
+    endif()
+endfunction()
+
+math(EXPR _apply_last "${_patches_len} - 1")
+foreach(_idx RANGE ${_apply_last})
+    list(GET _patch_abs_list ${_idx} _p_abs)
     get_filename_component(_p_name "${_p_abs}" NAME)
+    set(_cur_targets "${_patch_targets_${_idx}}")
+    if(NOT _cur_targets)
+        message(FATAL_ERROR "ApplyGgmlPatches: internal error: patch ${_p_name} has 0 target files")
+    endif()
+
+    set(_before_states "")
+    foreach(_rel IN LISTS _cur_targets)
+        _sonder_target_file_state("${_target_abs}/${_rel}" _st_before)
+        list(APPEND _before_states "${_st_before}")
+    endforeach()
+
     execute_process(
-        COMMAND "${_git_exe}" -c core.autocrlf=false -c core.safecrlf=false apply --check -p1 --whitespace=nowarn "${_p_abs}"
-        WORKING_DIRECTORY "${SONDER_LLAMACPP_SOURCE_DIR_TO_PATCH}"
+        COMMAND "${CMAKE_COMMAND}" -E env "GIT_CEILING_DIRECTORIES=${_ceiling_native}"
+                "${_git_exe}" -c core.autocrlf=false -c core.safecrlf=false
+                apply --check -v -p1 --whitespace=nowarn "${_p_abs}"
+        WORKING_DIRECTORY "${_target_abs}"
         RESULT_VARIABLE _chk_rc
         OUTPUT_VARIABLE _chk_out
         ERROR_VARIABLE _chk_err
     )
+    set(_chk_log "${_chk_out}\n${_chk_err}")
     if(NOT _chk_rc EQUAL 0)
         message(FATAL_ERROR "ApplyGgmlPatches: git apply --check failed for ${_p_name}: ${_chk_err}")
     endif()
+    if(_chk_log MATCHES "Skipped patch" OR NOT _chk_log MATCHES "Checking patch ")
+        message(FATAL_ERROR "ApplyGgmlPatches: git apply --check skipped or matched 0 files for ${_p_name}: ${_chk_log}")
+    endif()
+
     execute_process(
-        COMMAND "${_git_exe}" -c core.autocrlf=false -c core.safecrlf=false apply -p1 --whitespace=nowarn "${_p_abs}"
-        WORKING_DIRECTORY "${SONDER_LLAMACPP_SOURCE_DIR_TO_PATCH}"
+        COMMAND "${CMAKE_COMMAND}" -E env "GIT_CEILING_DIRECTORIES=${_ceiling_native}"
+                "${_git_exe}" -c core.autocrlf=false -c core.safecrlf=false
+                apply -v -p1 --whitespace=nowarn "${_p_abs}"
+        WORKING_DIRECTORY "${_target_abs}"
         RESULT_VARIABLE _app_rc
         OUTPUT_VARIABLE _app_out
         ERROR_VARIABLE _app_err
     )
+    set(_app_log "${_app_out}\n${_app_err}")
     if(NOT _app_rc EQUAL 0)
         message(FATAL_ERROR "ApplyGgmlPatches: git apply failed for ${_p_name}: ${_app_err}")
     endif()
-    message(STATUS "llama.cpp patches: applied ${_p_name}")
+    if(_app_log MATCHES "Skipped patch" OR NOT _app_log MATCHES "Applied patch ")
+        message(FATAL_ERROR "ApplyGgmlPatches: git apply skipped or applied 0 files for ${_p_name}: ${_app_log}")
+    endif()
+
+    list(LENGTH _cur_targets _t_len)
+    math(EXPR _t_last "${_t_len} - 1")
+    foreach(_ti RANGE ${_t_last})
+        list(GET _cur_targets ${_ti} _rel)
+        list(GET _before_states ${_ti} _st_before)
+        _sonder_target_file_state("${_target_abs}/${_rel}" _st_after)
+        if("${_st_before}" STREQUAL "${_st_after}")
+            message(FATAL_ERROR "ApplyGgmlPatches: patch ${_p_name} did not modify expected target '${_rel}' (fail-closed)")
+        endif()
+    endforeach()
+
+    message(STATUS "llama.cpp patches: applied ${_p_name} (${_t_len} file(s))")
 endforeach()
 
 file(WRITE "${_stamp_file}" "${_expected_stamp}")
