@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-#include "gpu_memory.hpp"
+#include "spill_guard.hpp"
 #include "child_metrics.hpp"
 #include "gpu_residency.hpp"
 #include "host_memory.hpp"

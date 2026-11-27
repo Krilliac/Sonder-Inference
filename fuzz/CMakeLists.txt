@@ -112,6 +112,11 @@ set(_sonder_fuzz_targets
     llamaserver_text
     backend_config)
 
+if(NOT SONDER_BUILD_LLAMASERVER)
+    # These targets exercise child-process policy and wire-protocol helpers.
+    list(REMOVE_ITEM _sonder_fuzz_targets llamaserver_text backend_config)
+endif()
+
 foreach(name IN LISTS _sonder_fuzz_targets)
     set(target sonder_fuzz_${name})
     set(corpus_dir "${CMAKE_CURRENT_SOURCE_DIR}/corpus/${name}")

@@ -33,6 +33,7 @@ option(SONDER_BUILD_CLI "Build the sonder-infer CLI" ${PROJECT_IS_TOP_LEVEL})
 option(SONDER_WARNINGS_AS_ERRORS "Treat compiler warnings as errors for Sonder targets" OFF)
 # Direct llama.cpp/GGML backend (src/backends/llamacpp). OFF by default: when ON,
 # llama.cpp is fetched at a pinned tag and compiled (CPU; accelerators via GGML_*).
+option(SONDER_BUILD_LLAMASERVER "Build the external llama-server backend" ON)
 option(SONDER_WITH_LLAMA_CPP "Build the direct llama.cpp backend" OFF)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -48,6 +49,8 @@ add_library(sonder_inference
     src/common/sha256.cpp
     src/engine/sampling_config.cpp
     src/devices/device.cpp
+    src/devices/gpu_memory.cpp
+    src/devices/log_diagnostics.cpp
     src/telemetry/telemetry.cpp
     src/sessions/session.cpp
     src/engine/engine.cpp
@@ -76,7 +79,8 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(sonder_inference PUBLIC Threads::Threads)
 if(WIN32)
-    target_link_libraries(sonder_inference PRIVATE ws2_32 advapi32)
+    # PDH owns the shared per-process GPU counters in src/devices/gpu_memory.cpp.
+    target_link_libraries(sonder_inference PRIVATE ws2_32 advapi32 pdh)
     target_compile_definitions(sonder_inference PRIVATE _WIN32_WINNT=0x0A00)
 elseif(UNIX AND NOT APPLE)
     target_link_libraries(sonder_inference PRIVATE ${CMAKE_DL_LIBS})

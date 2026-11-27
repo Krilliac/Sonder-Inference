@@ -1,7 +1,7 @@
 // VRAM-spill guard, KV cache pairing check and llama-server log diagnostics
 // (docs/integration/vram-spill.md). GPU counters come from a fake source and
 // children from the fake launcher; nothing here needs a GPU or llama-server.
-#include "../gpu_memory.hpp"
+#include "../spill_guard.hpp"
 #include "../llamaserver_options.hpp"
 #include "../log_diagnostics.hpp"
 #include "../supervisor.hpp"

@@ -12,7 +12,7 @@
 #  include <sys/stat.h>
 #endif
 
-#include "backends/llamaserver/env_policy.hpp"
+#include "server/src/env_policy.hpp"
 #include "cli/cli_spec.hpp"
 #include "request_path.hpp"
 #include "sonder/inference/backend_setup.hpp"

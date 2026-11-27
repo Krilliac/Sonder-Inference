@@ -15,18 +15,16 @@
 #include <utility>
 #include <vector>
 
-#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
-#  if defined(_WIN32)
-#    ifndef WIN32_LEAN_AND_MEAN
-#      define WIN32_LEAN_AND_MEAN
-#    endif
-#    ifndef NOMINMAX
-#      define NOMINMAX
-#    endif
-#    include <windows.h>
-#  else
-#    include <unistd.h>
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
 #  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#else
+#  include <unistd.h>
 #endif
 
 #include "common/diag_log.hpp"
@@ -35,9 +33,7 @@
 #include "sonder/inference/json.hpp"
 #include "llamacpp_internal.hpp"
 
-#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
-#  include "backends/llamaserver/gpu_memory.hpp"
-#endif
+#include "devices/gpu_memory.hpp"
 
 namespace sonder::inference {
 
@@ -323,7 +319,6 @@ std::uint64_t SaturatingAddBytes(std::uint64_t a, std::uint64_t b) noexcept {
                : a + b;
 }
 
-#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
 std::uint32_t CurrentProcessId() noexcept {
 #  if defined(_WIN32)
     return static_cast<std::uint32_t>(GetCurrentProcessId());
@@ -332,7 +327,6 @@ std::uint32_t CurrentProcessId() noexcept {
     return pid > 0 ? static_cast<std::uint32_t>(pid) : 0u;
 #  endif
 }
-#endif
 
 std::string FormatMiBText(std::uint64_t bytes) {
     constexpr std::uint64_t kMiB = 1024ull * 1024ull;
@@ -340,16 +334,9 @@ std::string FormatMiBText(std::uint64_t bytes) {
 }
 
 llamacpp_detail::ProcessGpuMemoryProbe MakeDefaultGpuMemoryProbe(std::vector<std::string> configured_devices) {
-#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
     auto os_source = llamaserver::make_gpu_counter_source();
-#endif
-    return [configured_devices = std::move(configured_devices)
-#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
-            ,
-            os_source = std::move(os_source)
-#endif
-    ]() -> llamacpp_detail::ProcessGpuMemoryReading {
-#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+    return [configured_devices = std::move(configured_devices),
+            os_source = std::move(os_source)]() -> llamacpp_detail::ProcessGpuMemoryReading {
         if (os_source && os_source->supported()) {
             const std::uint32_t pid = CurrentProcessId();
             const auto counters = os_source->read(pid);
@@ -370,7 +357,6 @@ llamacpp_detail::ProcessGpuMemoryProbe MakeDefaultGpuMemoryProbe(std::vector<std
                 return reading;
             }
         }
-#endif
         return llamacpp_detail::SummarizeGgmlDeviceMemory(lc::LlamaCppBackend::EnumerateDevices(), configured_devices);
     };
 }
