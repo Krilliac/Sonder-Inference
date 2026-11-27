@@ -178,7 +178,7 @@ jobs:
         shell: pwsh
         run: |
           $tar = (Join-Path $env:RUNNER_TEMP 'llamacpp.tar.gz') -replace '\\','/'
-          cmake --preset ci-windows -DSONDER_WITH_LLAMA_CPP=ON -DGGML_NATIVE=OFF "-DSONDER_LLAMACPP_URL=file:///$tar"
+          cmake --preset ci-windows -DSONDER_WITH_LLAMA_CPP=ON -DGGML_NATIVE=OFF "-DSONDER_LLAMACPP_URL=$tar"
 
       - name: Build
         run: cmake --build --preset ci-windows

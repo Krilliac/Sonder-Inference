@@ -220,8 +220,20 @@ struct TelemetryContext {
     bool synthetic_work = false;
 };
 
+// Sequence stream an event belongs to. Every producer instance numbers each
+// stream contiguously from 0 with its own counter (docs/TELEMETRY.md "Stream
+// identity contract"). Periodic samples get their own stream so that
+// retaining recent samples never leaves a hole between retained lifecycle
+// events.
+enum class TelemetryStream : std::uint8_t { main = 0, samples = 1 };
+inline constexpr std::size_t kTelemetryStreamCount = 2;
+
+// Event types ending in ".sample" belong to the samples stream; every other
+// event is on the main (default) stream.
+[[nodiscard]] TelemetryStream telemetry_stream_of(std::string_view event_type) noexcept;
+
 // Receives fully serialized single-line JSON envelopes (no trailing newline).
-// Called only from the telemetry writer thread. An exception from write_event()
+// Called only from the telemetry writer thread. An exception from write_stream_event()
 // or flush() retires this sink without retrying it or logging exception contents;
 // healthy sinks continue. Implementations must not block indefinitely.
 class TelemetrySink {
@@ -235,6 +247,18 @@ public:
     virtual void write_event(std::uint64_t sequence, std::string_view json_line) {
         (void)sequence;
         write(json_line);
+    }
+    // What the bus calls for every event. `sequence` is the number within
+    // `stream` (two streams share numbers, so it is not unique across them).
+    // Main-stream events reach write_event(); events of any other stream reach
+    // write(), so a sink that indexes by sequence never sees two number spaces
+    // mixed. Override to receive the stream. Called on the writer thread.
+    virtual void write_stream_event(TelemetryStream stream, std::uint64_t sequence, std::string_view json_line) {
+        if (stream == TelemetryStream::main) {
+            write_event(sequence, json_line);
+        } else {
+            write(json_line);
+        }
     }
     virtual void flush() {}
 };
@@ -284,6 +308,18 @@ struct TelemetryOptions {
     // pipe) must not hang the process: on expiry the writer is detached and
     // shutdown() returns false. Zero or negative means do not wait at all.
     std::chrono::milliseconds shutdown_timeout{5000};
+    // Backend-sampled token probabilities (llamaserver against llama.cpp),
+    // used only when `standard` events are recorded. top_k is how many
+    // alternatives the backend asks its upstream for per sampled token,
+    // clamped to [0, kMaxTelemetryTopK = 10]; 0 turns the probe off (no
+    // probability on backend chunks, no inference.sampling.candidates).
+    int token_probability_top_k = 5;
+    // inference.sampling.candidates volume bounds, per request: emit for
+    // every `stride`-th probability-bearing token (0 is read as 1), and at
+    // most `max_events` events (0 = no cap). The upstream still computes the
+    // probabilities for every token of the request; these bound the stream.
+    std::uint32_t token_candidates_stride = 1;
+    std::uint32_t token_candidates_max_events = 256;
 };
 
 class TelemetryBus {
@@ -330,12 +366,16 @@ public:
     // even if registered more than once. Separate from queue-pressure drops.
     [[nodiscard]] std::uint64_t failed_sinks() const noexcept;
 
-    // Stream identity: event_id is "<instance_id>-<sequence>" and
-    // producer.instance_id carries the same value (docs/TELEMETRY.md).
+    // Stream identity: producer.instance_id names the producer instance; each
+    // stream (main, samples) is numbered contiguously from 0. event_id is
+    // "<instance_id>-<sequence>" on the main stream and
+    // "<instance_id>-s<sequence>" on the samples stream, whose events also
+    // carry producer.stream = "samples" (docs/TELEMETRY.md).
     [[nodiscard]] const std::string& instance_id() const noexcept { return instance_id_; }
 
     // Builds an envelope without queueing it (exposed for tests/tools).
-    // sampling.level is the level the event was emitted at.
+    // `sequence` is the number within the event's stream (see
+    // telemetry_stream_of). sampling.level is the level the event was emitted at.
     json::Object make_envelope(std::string_view event_type, const TelemetryContext& context,
                                json::Object attributes, std::uint64_t sequence,
                                TelemetryLevel level = TelemetryLevel::metrics) const;
