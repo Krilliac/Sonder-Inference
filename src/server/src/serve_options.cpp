@@ -24,7 +24,7 @@ namespace sonder::inference::server::detail {
 const char* const kServeUsage = R"(sonder-infer serve - local HTTP API and live telemetry (docs/SERVER.md)
 
 Usage:
-  sonder-infer serve --backend mock|ollama|llamacpp|llamaserver [--model ID]... [options]
+  sonder-infer serve --backend mock|remote-mock|ollama|llamacpp|llamaserver [--model ID]... [options]
 
 Server:
   --host HOST             listen address (default 127.0.0.1; non-loopback needs --token-file)
@@ -47,9 +47,10 @@ Server:
   --log-format text|json  access log and diagnostics on stderr (default text)
 
 Backend:
-  --backend NAME          mock (synthetic, tests only), ollama, llamacpp,
+  --backend NAME          mock / remote-mock (synthetic, tests only), ollama, llamacpp,
                           llamaserver (external llama-server or OpenAI upstream)
-                          (env SONDER_INFER_BACKEND)
+                          (env SONDER_INFER_BACKEND). remote-mock launches a private
+                          worker subprocess using this sonder-infer executable.
   --model ID              model to serve (repeatable; the first is the default and
                           answers to "default"; env SONDER_INFER_MODEL). The mock
                           backend serves "mock" when no model is given.
@@ -393,7 +394,7 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     }
     o.backend.backend = primary ? primary->backend : a.get("backend").value_or(env.backend.value_or(""));
     if (o.backend.backend.empty()) {
-        return usage_error("--backend is required (mock, ollama, llamacpp or llamaserver; or set SONDER_INFER_BACKEND)");
+        return usage_error("--backend is required (mock, remote-mock, ollama, llamacpp or llamaserver; or set SONDER_INFER_BACKEND)");
     }
     if (!active_profiles.empty()) {
         o.models.clear();
@@ -418,6 +419,15 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     if (auto v = a.get("llamaserver-executable")) o.backend.llamaserver_executable = *v;
     if (!a.all("llamaserver-arg").empty()) o.backend.llamaserver_args = a.all("llamaserver-arg");
     if (primary && primary->backend == kLaunchProfileBackendLlamaServer) {
+        // A profile's child is the one that serves its model, and in shared
+        // spawn mode several profiles share it; the RPC client never runs
+        // there (docs/integration/rpc-worker.md). Run the worker as its own
+        // serve instance without --profile.
+        if (o.backend.llamaserver_rpc_worker.enabled || !o.backend.llamaserver_rpc_worker.servers.empty()) {
+            return usage_error("launch profile '" + primary->name +
+                               "': llamaserver config 'rpc_worker' cannot be combined with --profile or "
+                               "--all-profiles; run the RPC worker as a separate `sonder-infer serve` instance");
+        }
         const auto check_profile_env = [&]() -> std::string {
             for (const auto& [env_key, env_val] : o.backend.llamaserver_environment) {
                 (void)env_val;

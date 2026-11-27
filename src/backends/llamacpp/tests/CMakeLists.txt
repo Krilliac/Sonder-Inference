@@ -14,6 +14,7 @@ sonder_add_module_tests(llamacpp
     test_llamacpp_chat.cpp
     test_llamacpp_frontier.cpp
     test_llamacpp_speculative_verifier.cpp
+    test_slot_store.cpp
     test_request_guards.cpp
 )
 if(TARGET sonder_llamacpp_tests)
