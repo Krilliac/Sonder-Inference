@@ -4,10 +4,10 @@
   "tracks": {
     "mainline": {
       "repository": "https://github.com/ggml-org/llama.cpp",
-      "tag": "b11195",
-      "commit": "d834d44e643681f7b046a22d357335f6f4ff6107",
-      "url": "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b11195.tar.gz",
-      "sha256": "d9818b7786c8a3b063bac7eb7dc8710e275638f1e288e206720c9e22e7ca216a",
+      "tag": "v1.0.0",
+      "commit": "b1b770d90d94cad9e9ea5b993bdbc383a522fb28",
+      "url": "https://github.com/ggml-org/llama.cpp/archive/refs/tags/v1.0.0.tar.gz",
+      "sha256": "3f5f750e36326aea4d65c7623e7d597a33e395d65f4d76e5e0532171f252532b",
       "expected_features": []
     }
   }

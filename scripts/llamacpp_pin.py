@@ -34,6 +34,9 @@ DOC_FILES = ("docs/LICENSE_REVIEW.md", "docs/integration/llamacpp.md")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 TAG_RE = re.compile(r"(?<![0-9A-Za-z.])b\d{4,6}(?![0-9A-Za-z])")
+# Release tags (v1.0.0 onwards). Other dependencies also use vX.Y.Z tags, so these
+# only count inside the llama.cpp scope (see cmd_check), unlike the bNNNNN build tags.
+SEMVER_TAG_RE = re.compile(r"(?<![0-9A-Za-z.])v\d+\.\d+\.\d+(?![0-9A-Za-z]|\.\d)")
 
 
 class PinError(Exception):
@@ -207,9 +210,10 @@ def cmd_check(args: argparse.Namespace) -> int:
             text = path.read_text(encoding="utf-8")
         except OSError as exc:
             raise UsageError(f"cannot read {path}: {exc}") from exc
-        # LICENSE_REVIEW.md covers many dependencies: commit and SHA-256 literals
-        # only count inside the llama.cpp section (heading naming llama.cpp up
-        # to the next heading). The integration doc is llama.cpp-only.
+        # LICENSE_REVIEW.md covers many dependencies: vX.Y.Z tag, commit and
+        # SHA-256 literals only count inside the llama.cpp section (heading naming
+        # llama.cpp up to the next heading). The integration doc is llama.cpp-only.
+        # bNNNNN build tags are llama.cpp-specific and count everywhere.
         scoped = rel == "docs/LICENSE_REVIEW.md"
         in_section = not scoped
         for lineno, line in enumerate(text.splitlines(), 1):
@@ -220,6 +224,9 @@ def cmd_check(args: argparse.Namespace) -> int:
                     problems.append(f"{rel}:{lineno}: tag {m.group(0)} != manifest {entry['tag']}")
             if not in_section:
                 continue
+            for m in SEMVER_TAG_RE.finditer(line):
+                if m.group(0) != entry["tag"]:
+                    problems.append(f"{rel}:{lineno}: tag {m.group(0)} != manifest {entry['tag']}")
             for m in re.finditer(r"\b[0-9a-f]{40}\b", line):
                 if m.group(0) != entry["commit"]:
                     problems.append(f"{rel}:{lineno}: commit {m.group(0)} != manifest {entry['commit']}")

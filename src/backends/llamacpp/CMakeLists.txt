@@ -205,8 +205,8 @@ foreach(sonder_llamacpp_upstream_target IN ITEMS llama)
     endif()
 endforeach()
 
-# Feature auto-detection against the resolved llama.cpp / ggml headers so both
-# pinned mainline b11195 and newer/forked trees (e.g. PrismML-Eng/llama.cpp)
+# Feature auto-detection against the resolved llama.cpp / ggml headers so the
+# pinned mainline tag, older trees (b11195) and newer/forked trees (e.g. PrismML-Eng/llama.cpp)
 # build cleanly without breaking older APIs.
 set(SONDER_LLAMACPP_FEATURE_DEFS "")
 set(SONDER_LLAMACPP_PRIVATE_INCLUDES "")
@@ -272,20 +272,36 @@ if(EXISTS "${_sonder_llama_h}")
     string(FIND "${_sonder_llama_h_content}" "load_mtp" _idx_load_mtp)
     if(NOT _idx_ctx_mtp EQUAL -1
        AND NOT _idx_layer_nextn EQUAL -1
-       AND NOT _idx_load_mtp EQUAL -1
-       AND EXISTS "${_sonder_llama_ext_h}")
-        file(READ "${_sonder_llama_ext_h}" _sonder_llama_ext_h_content)
-        string(FIND "${_sonder_llama_ext_h_content}" "llama_set_embeddings_nextn" _idx_embd_nextn)
+       AND NOT _idx_load_mtp EQUAL -1)
+        # The NextN calls (llama_set_embeddings_nextn, llama_set_nextn_layer_offset,
+        # llama_get_ctx_other, ...) are public in llama.h from v1.0.0; older trees
+        # (b11195) declare them only in the private src/llama-ext.h, which then has
+        # to be included (SONDER_LLAMACPP_MTP_VIA_EXT).
+        set(_sonder_llama_has_nextn OFF)
+        set(_sonder_llama_nextn_api "")
+        string(FIND "${_sonder_llama_h_content}" "llama_set_embeddings_nextn" _idx_embd_nextn)
         if(NOT _idx_embd_nextn EQUAL -1)
+            set(_sonder_llama_has_nextn ON)
+            set(_sonder_llama_nextn_api "${_sonder_llama_h_content}")
+        elseif(EXISTS "${_sonder_llama_ext_h}")
+            file(READ "${_sonder_llama_ext_h}" _sonder_llama_ext_h_content)
+            string(FIND "${_sonder_llama_ext_h_content}" "llama_set_embeddings_nextn" _idx_embd_nextn)
+            if(NOT _idx_embd_nextn EQUAL -1)
+                set(_sonder_llama_has_nextn ON)
+                set(_sonder_llama_nextn_api "${_sonder_llama_ext_h_content}")
+                list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_MTP_VIA_EXT=1)
+                list(APPEND SONDER_LLAMACPP_PRIVATE_INCLUDES "${llamacpp_SOURCE_DIR}/src")
+            endif()
+        endif()
+        if(_sonder_llama_has_nextn)
             list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_MTP=1)
-            list(APPEND SONDER_LLAMACPP_PRIVATE_INCLUDES "${llamacpp_SOURCE_DIR}/src")
 
-            string(FIND "${_sonder_llama_ext_h_content}" "llama_set_nextn_layer_offset" _idx_nextn_offset)
+            string(FIND "${_sonder_llama_nextn_api}" "llama_set_nextn_layer_offset" _idx_nextn_offset)
             if(NOT _idx_nextn_offset EQUAL -1)
                 list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_NEXTN_LAYER_OFFSET=1)
             endif()
 
-            string(FIND "${_sonder_llama_ext_h_content}" "llama_get_ctx_other" _idx_get_ctx_other)
+            string(FIND "${_sonder_llama_nextn_api}" "llama_get_ctx_other" _idx_get_ctx_other)
             string(FIND "${_sonder_llama_h_content}" "ctx_other" _idx_ctx_other)
             if(NOT _idx_get_ctx_other EQUAL -1 AND NOT _idx_ctx_other EQUAL -1)
                 list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_CTX_OTHER=1)

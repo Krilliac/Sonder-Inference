@@ -45,7 +45,7 @@ Target coverage:
 
 ### Upstream llama.cpp pin and Ternary / PrismML overrides
 
-`src/backends/llamacpp/CMakeLists.txt` defaults to pinned tag **`b11195`** with a verified SHA-256 (recorded in [LICENSE_REVIEW.md](LICENSE_REVIEW.md)) so default and CI builds stay deterministic. To run newer low-bit or Hadamard-ternary GGUF formats with direct `llamacpp`, override the source tree at configure time without editing the default pin:
+`src/backends/llamacpp/CMakeLists.txt` defaults to the tag pinned in `cmake/llamacpp-pin.json`, currently **`v1.0.0`** (commit `b1b770d`), with a verified SHA-256 (recorded in [LICENSE_REVIEW.md](LICENSE_REVIEW.md)) so default and CI builds stay deterministic. The previous pin was `b11195`; `v1.0.0` contains mainline `b11556`. To run newer low-bit or Hadamard-ternary GGUF formats with direct `llamacpp`, override the source tree at configure time without editing the default pin:
 
 ```sh
 # Local checkout (offline builds, newer mainline, or PrismML fork):
@@ -58,9 +58,11 @@ cmake --preset linux-cuda-rtx \
 ```
 
 Format-to-runtime matrix:
-- **Pinned `b11195` (default)**: standard GGUF K-quants, I-quants, `MXFP4` (type 39), and existing ternary `TQ1_0`/`TQ2_0` (types 34–35).
+- **Pinned `v1.0.0` (default)**: standard GGUF K-quants, I-quants, `MXFP4` (type 39), ternary `TQ1_0`/`TQ2_0` (types 34–35), and the mainline `>= b11556` types below (`ggml.h` at the pin defines types 40–43; the previous `b11195` pin defined 40–42 but not `F8_E4M3`).
 - **Mainline `ggml-org/llama.cpp >= b11556`**: adds stock `NVFP4` (Blackwell FP4, type 40), `Q1_0` (1-bit Bonsai-1, type 41), `Q2_0` (2-bit ternary, type 42), and `F8_E4M3` (FP8, type 43).
 - **`PrismML-Eng/llama.cpp` (`prism` branch)**: adds Hadamard-transformed Bonsai-2 ternary formats (`PQ2_0` type 142, `PTQ1_0` type 143, `PQ2_0M` KV-only type 145) and `prism.hadamard.*` GGUF metadata handling.
+
+**RPC server at this pin.** Sonder does not build or start the ggml RPC server (`GGML_RPC` stays off). `v1.0.0` predates upstream `b12658` ("rpc : typed request helpers and a single validation step on the server", #32651), which first ships in `v1.1.0` (the CVE-2026-137567 fix is also only in `v1.1.0` and later). Any `rpc-server` built from this tree (for example for `llama-server --rpc`) must stay on a private link until the pin moves to `v1.1.0` or later.
 
 The `llamaserver` backend can also spawn or attach to an external mainline `>= b11556` or PrismML `llama-server` binary while keeping the core build independent of llama.cpp. Sonder's GGUF header inspection recognizes all of these block layouts for fit estimation, but model execution requires a runtime build whose GGML implementation supports the file's tensor types.
 
@@ -151,7 +153,7 @@ Native code is justified when:
 | --- | --- | --- |
 | `mock` | implemented; **tests only**, performs no inference | tokenization, streaming, deterministic; token_logits when `MockBackendOptions::token_logits` |
 | `ollama` | implemented; loopback HTTP, streaming, cancellable | streaming, remote_process |
-| `llamacpp` | implemented, optional (`SONDER_WITH_LLAMA_CPP=ON`, pinned `b11195` default, overridable via `FETCHCONTENT_SOURCE_DIR_LLAMACPP`); CPU by default, GPU presets for CUDA RTX / ROCm XT / Vulkan XT; supports tensor overrides, KV quantization, and multi-GPU placement (`devices`, `main_gpu`, `split_mode`, `tensor_split`, `use_mlock`) | tokenization, streaming, batched_prefill, deterministic |
+| `llamacpp` | implemented, optional (`SONDER_WITH_LLAMA_CPP=ON`, pinned `v1.0.0` default (`cmake/llamacpp-pin.json`), overridable via `FETCHCONTENT_SOURCE_DIR_LLAMACPP`); CPU by default, GPU presets for CUDA RTX / ROCm XT / Vulkan XT; supports tensor overrides, KV quantization, and multi-GPU placement (`devices`, `main_gpu`, `split_mode`, `tensor_split`, `use_mlock`) | tokenization, streaming, batched_prefill, deterministic |
 | `llamaserver` | implemented, always built (`src/backends/llamaserver`); no llama.cpp linked. Attach to a running llama-server or any OpenAI-compatible upstream (default `http://127.0.0.1:8080`), or spawn and supervise a llama-server child. `"native_completion": false` selects generic OpenAI mode. Status 2026-11-20. See [integration/llama-server.md](integration/llama-server.md) | streaming, remote_process; plus speculative_decode and prefix_reuse in native mode (not generic OpenAI mode); structured_output when a grammar is configured |
 
 The interface lives in `include/sonder/inference/backend.hpp`. Capabilities

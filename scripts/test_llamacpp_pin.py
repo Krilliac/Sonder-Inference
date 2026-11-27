@@ -307,7 +307,7 @@ class CheckTests(unittest.TestCase):
     def test_manifest_has_mainline_track(self) -> None:
         track, entry = pin.load_entry(pin.DEFAULT_MANIFEST, None)
         self.assertEqual(track, "mainline")
-        self.assertRegex(entry["tag"], r"^b\d+$")
+        self.assertRegex(entry["tag"], r"^(b\d+|v\d+\.\d+\.\d+)$")
 
     def test_changed_manifest_tag_is_detected(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -315,6 +315,52 @@ class CheckTests(unittest.TestCase):
             _, entry = pin.load_entry(pin.DEFAULT_MANIFEST, None)
             write_manifest(m, entry["commit"], entry["sha256"], tag="b99999")
             self.assertEqual(self.run_check("--manifest", str(m)), 1)
+
+    def test_changed_manifest_release_tag_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            m = Path(d) / "pin.json"
+            _, entry = pin.load_entry(pin.DEFAULT_MANIFEST, None)
+            write_manifest(m, entry["commit"], entry["sha256"], tag="v9.9.9")
+            self.assertEqual(self.run_check("--manifest", str(m)), 1)
+
+    @staticmethod
+    def _docs_root(d: Path, license_review: str, integration: str) -> Path:
+        (d / "docs" / "integration").mkdir(parents=True)
+        (d / "docs" / "LICENSE_REVIEW.md").write_text(license_review, encoding="utf-8")
+        (d / "docs" / "integration" / "llamacpp.md").write_text(integration, encoding="utf-8")
+        return d
+
+    def test_release_tags_count_only_in_llamacpp_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            m = Path(d) / "pin.json"
+            write_manifest(m, "a" * 40, "b" * 64, tag="v1.0.0")
+            root = self._docs_root(
+                Path(d) / "ok",
+                "## Other\n- cpp-httplib v0.58.0\n"
+                "### llama.cpp / GGML\n- revision/tag: `v1.0.0`\n"
+                "### doctest\n- revision/tag: v2.5.3\n",
+                "llama.cpp is pinned at `v1.0.0`.\n")
+            self.assertEqual(self.run_check("--manifest", str(m), "--root", str(root)), 0)
+
+    def test_stale_release_tag_in_llamacpp_section_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            m = Path(d) / "pin.json"
+            write_manifest(m, "a" * 40, "b" * 64, tag="v1.0.0")
+            root = self._docs_root(
+                Path(d) / "rel",
+                "### llama.cpp / GGML\n- revision/tag: `v0.9.0`\n",
+                "llama.cpp is pinned at `v1.0.0`.\n")
+            self.assertEqual(self.run_check("--manifest", str(m), "--root", str(root)), 1)
+
+    def test_stale_build_tag_under_release_manifest_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            m = Path(d) / "pin.json"
+            write_manifest(m, "a" * 40, "b" * 64, tag="v1.0.0")
+            root = self._docs_root(
+                Path(d) / "build",
+                "### llama.cpp / GGML\n- revision/tag: `v1.0.0`\n",
+                "Offline builds: /path/to/llama.cpp-b11195\n")
+            self.assertEqual(self.run_check("--manifest", str(m), "--root", str(root)), 1)
 
     def test_changed_manifest_sha_is_detected(self) -> None:
         with tempfile.TemporaryDirectory() as d:
