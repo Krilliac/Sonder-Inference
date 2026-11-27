@@ -510,6 +510,7 @@ add_library(sonder_backend_llamacpp STATIC
     llamacpp_backend.cpp
     llamacpp_util.cpp
     llguidance_sampler.cpp
+    request_guards.cpp
 )
 add_library(sonder::backend_llamacpp ALIAS sonder_backend_llamacpp)
 target_include_directories(sonder_backend_llamacpp
