@@ -77,7 +77,7 @@ was parsed and carries `reason` + `detail`. Precedence: the first reason found w
 | `unsafe_path` | a manifest, a directory on its path, `blobs/` or a blob is a symlink, junction or other reparse point, is not a regular disk file, or (manifests and small layers) has more than one hard link. |
 | `digest_mismatch` | a small layer, or a weight that was hashed (see the policy below), does not hash to its digest. |
 | `blob_busy` | (Windows) a weight blob is open for writing by another process, so it cannot be opened with writers denied to hash or serve it. Transient: the registry checks again on the next lookup. |
-| `hash_limit` | a weight blob was not hashed to the end: it is larger than `StoreOptions::max_weight_file_bytes` (default 1 TiB), or its hash ran past `weight_hash_timeout` or saw `weight_hash_cancel` cancelled. Transient: nothing is remembered and the next lookup tries again. |
+| `hash_limit` | the weights were not hashed to the end: a blob is larger than `StoreOptions::max_weight_file_bytes` (default 1 TiB), the distinct weight blobs of the resolve add up to more than `max_resolve_weight_bytes` (default 2 TiB; refused before anything is opened or hashed), or hashing ran past `weight_hash_timeout` (default 3 hours per resolve) or was cancelled (`weight_hash_cancel`, or `ResolveOptions::cancel` of that call). Transient: nothing is remembered and the next lookup tries again. |
 | `no_compatible_manifest` | manifest list without a `llamacpp`/`ggml` GGUF child. |
 | `manifest_invalid` | unreadable/oversized/not JSON/not an object, a repeated JSON key, a size that is not a non-negative integer (`24.9`, `-1`, `"24"`), a digest that is not exactly `sha256:<64 hex>` (the `sha256-` spelling is only a blob file name), more than 64 content layers or 64 list children, small layers over 4 MiB each or 16 MiB together, declared sizes that overflow 64 bits, a list child whose blob does not match its digest. |
 
@@ -170,14 +170,25 @@ the bytes were hashed in this call, through a handle that denies writers on Wind
   `revalidate()` returns false and `scan()` hashes nothing, so a callback cannot recurse into
   itself (test "an on_weight_hash callback that calls back into the store fails fast instead of
   deadlocking").
-  Each hash is bounded (`StoreOptions`): a weight file larger than `max_weight_file_bytes`
-  (default 1 TiB) is not hashed, and a hash stops once it has run `weight_hash_timeout` (default
-  none; measured from when it takes its slot) or `weight_hash_cancel` is cancelled. The entry is
-  then `hash_limit`, a transient failure: nothing is remembered, a registry never reuses it, and
-  threads waiting for that hash are released to try for themselves (test "weight hashing is
-  bounded by file size, time and cancellation"). A sparse multi-terabyte blob with a valid header
-  and matching declared size is refused at 1 TiB by default, and holds a slot for at most the
-  timeout when one is set.
+  Hashing is bounded three ways (`StoreOptions`), so one hostile manifest cannot hold a resolve
+  and the two hash slots for days. (1) The declared sizes of the distinct weight blobs of one
+  resolve may add up to `max_resolve_weight_bytes` (default 2 TiB); more fails before any file is
+  opened, hashed or announced (test "weights that add up past max_resolve_weight_bytes fail
+  before anything is hashed"; a layer repeated under one digest counts once). (2) A file larger
+  than `max_weight_file_bytes` (default 1 TiB) is not hashed. (3) All the hashing of one resolve
+  (and of one `verify_blobs()` call) has one deadline, `weight_hash_timeout`, default 3 hours
+  (`kDefaultWeightHashTimeout`: 2 TiB at the portable SHA-256's slow end, about 90 minutes per TiB),
+  counted from when it starts to hash and including the wait for a hash slot or for another
+  thread's hash; zero removes it (a service should keep a finite value). A hash also stops when
+  the store-wide `weight_hash_cancel` is cancelled (a shutdown switch: never resettable, the
+  options are copied at `open()`) or when the `ResolveOptions::cancel` given to that one
+  `resolve()` / `resolve_for_load()` is, which also ends the wait for a slot or for another
+  thread's hash and affects nothing else (test "a per-call cancel stops one resolve and leaves
+  the store usable"). Whichever limit is hit, the entry is `hash_limit`, a transient failure:
+  nothing is remembered, a registry never reuses it, and threads waiting for that hash are
+  released to try for themselves (test "weight hashing is bounded by file size, time and
+  cancellation"). `verify_blobs()` applies `max_weight_file_bytes`, the deadline and
+  `weight_hash_cancel` of the store the record came from (test "verify_blobs applies ...").
 - **What `hashed_now` and `VerifiedWeights` mean.** `hashed_now`: every weight blob, opened while
   the record was produced or revalidated, hashed to its digest through that handle in that call.
   It says nothing about the file once that handle is closed. A loader that must load exactly the
@@ -221,15 +232,32 @@ the bytes were hashed in this call, through a handle that denies writers on Wind
   count, checked before and after each nested listing, so a lookup reads at most that many
   entries in all (test "a name lookup that misses reads at most max_scan_entries entries across
   nested directories").
-  Retained text (`ScanLimits::max_retained_text_bytes`, default 64 MiB): the template, system and
-  messages text one scan keeps, all records together. Each layer's declared size is charged
-  before it is read; once the next one would not fit, the scan reads no more text layers, notes
-  it, and sets `ModelRecord::text_omitted` on the records concerned (those layers were opened and
-  stamped, not read or checked). `resolve()` reads them in full, and the registry never serves a
-  ready `text_omitted` record from its cache without resolving it again. The registry applies the
-  same budget to everything it caches (the scan records of all its stores plus live results): a
-  record whose text would not fit is cached without it (`text_omitted`). Test "a scan keeps
-  template, system and messages text only within max_retained_text_bytes".
+  Retained content (`ScanLimits::max_retained_text_bytes`, default 64 MiB): the small layers
+  (config, params, template, system, messages) one scan keeps, all records together. Each
+  layer's declared size is charged before it is read; once the next one would not fit, the scan
+  reads no more of them, notes it, and sets `ModelRecord::text_omitted` on the records concerned.
+  Those layers are opened, stamped and checked for size and link count (one that cannot be opened,
+  or has the wrong size, makes the record unsupported, as reading it would) but not read or
+  hashed, so the config, params and text fields of such a record, and what is classified from
+  them, are empty or provisional. `resolve()` reads everything, `OllamaStore::revalidate()`
+  returns false for a `text_omitted` record, and the registry never serves a cached
+  `text_omitted` record without resolving it again. What a record keeps of a layer is also
+  capped per field: a config string 1 KiB (cut), a config array 32 entries of 256 bytes, params
+  unmodelled options ("extras") 64 entries and 64 KiB in all, `runner` / `format` / a layer's
+  `from` 256 bytes; anything over is cut or skipped with a warning (test "config strings and
+  arrays and params extras are capped per field"). The registry counts all of it (template,
+  system, messages, config strings and arrays, `params.stop`, `params.extra`, runner, format,
+  parent) in one running total over the scan records of all its stores plus its live results,
+  and strips what would not fit (`text_omitted`). `add_ollama_dir()` and `refresh()` hand each
+  store's scan what is left of that one allowance and retain each store's records before the
+  next store is read, so N stores never hold N budgets (test "refresh and add_ollama_dir share
+  one retained-content allowance across stores"). Not counted, because each is bounded per record
+  by a constant (about 100 KiB together): names, paths, the blob list, source stamps, `detail`
+  and warnings; so a library of `max_models` records holds at most about that much more.
+  A scan that runs out of memory for one entry reports that entry as unsupported
+  (`manifest_invalid`, never reused) and goes on. Tests "config and params layers are charged to
+  max_retained_text_bytes before they are read" and "a scan keeps template, system and messages
+  text only within max_retained_text_bytes".
 - **Names.** Besides Ollama's part rules, a part (the host included) may not end in `.` and may not
   be a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM0-9`, `LPT0-9`, with or without an
   extension or port), on every platform; Win32 would otherwise open `coder` for `coder.`. Directory
@@ -283,10 +311,11 @@ Known limits (the remaining post-check windows):
   keep their text under `max_retained_text_bytes` follows the scan's name order.
 - **One resolve can still read up to 16 MiB of text** (the per-manifest small-layer cap) while it
   runs; the retained-text budget bounds what scans and the registry keep, not a single call.
-- **Hash limits are per file.** `weight_hash_timeout` bounds one file's hash; a model with several
-  weight files, or threads that retry after a timed-out hash, take up to that long each.
-  Request-level admission (rate limiting) for an HTTP path is not here; the store is not wired to
-  the server.
+- **Hash limits are per resolve, not per caller.** `weight_hash_timeout` is one deadline for all
+  the hashing of one resolve, and `max_resolve_weight_bytes` caps its declared weights, but
+  threads that retry after a `hash_limit` start a new resolve with a new deadline; a service
+  should rate-limit them. Request-level admission for an HTTP path is not here; the store is not
+  wired to the server.
 
 ## Full digest report (opt-in)
 

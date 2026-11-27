@@ -133,8 +133,10 @@ std::int64_t filetime_ticks(const FILETIME& ft) {
                                      static_cast<std::uint64_t>(ft.dwLowDateTime));
 }
 
+#if defined(SONDER_INFERENCE_TEST_HOOKS)
 std::atomic<bool> g_weak_identity_for_testing{false};  // set_weak_identity_for_testing
 thread_local std::uint64_t t_dir_entries_visited = 0;    // dir_entries_visited_on_this_thread
+#endif
 
 // GetFileInformationByHandleEx(FileIdInfo) errors that mean "this file system does not
 // implement the class", as opposed to a transient, permission or device failure.
@@ -176,7 +178,9 @@ bool fill_identity(HANDLE h, FileIdentity& out, DWORD& attrs, std::string& err_m
         out.file_id_high = 0;
         out.weak_id = true;
     }
+#if defined(SONDER_INFERENCE_TEST_HOOKS)
     if (g_weak_identity_for_testing.load(std::memory_order_relaxed)) out.weak_id = true;
+#endif
     out.size = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | static_cast<std::uint64_t>(info.nFileSizeLow);
     out.link_count = info.nNumberOfLinks;
     out.write_time = filetime_ticks(info.ftLastWriteTime);
@@ -263,9 +267,11 @@ OpenOutcome open_dirs(HANDLE anchor, const std::vector<std::wstring>& segs, std:
 
 }  // namespace
 
+#if defined(SONDER_INFERENCE_TEST_HOOKS)
 void set_weak_identity_for_testing(bool on) noexcept { g_weak_identity_for_testing.store(on, std::memory_order_relaxed); }
 
 std::uint64_t dir_entries_visited_on_this_thread() noexcept { return t_dir_entries_visited; }
+#endif
 
 OwnedFileHandle::OwnedFileHandle() noexcept : handle_(to_raw(INVALID_HANDLE_VALUE)) {}
 
@@ -451,7 +457,9 @@ OpenOutcome visit_anchored_dir(const OwnedFileHandle& anchor, std::string_view r
                     return OpenOutcome::ok;
                 }
                 ++visited;
+#if defined(SONDER_INFERENCE_TEST_HOOKS)
                 ++t_dir_entries_visited;
+#endif
                 DirEntry e;
                 e.name_ok = wide_to_utf8(wname, e.name);
                 if (!e.name_ok) e.name.clear();

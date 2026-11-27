@@ -47,18 +47,26 @@ namespace fs = std::filesystem;
 namespace sf = ::sonder::inference::detail;
 
 // A counting semaphore: at most kMaxConcurrentWeightHashes hashes at once. Only the hash read
-// loop runs while a slot is held (no user callback, no other lock), so every holder releases
-// its slot in finite time. Thread-safe; not copyable.
+// loop runs while a slot is held (no user callback, no other lock), and that loop is bounded
+// by the hash limits, so every holder releases its slot in finite time. Thread-safe; not
+// copyable.
 class HashGate {
 public:
     HashGate() = default;
     HashGate(const HashGate&) = delete;
     HashGate& operator=(const HashGate&) = delete;
 
-    void acquire() {
+    // Takes a slot, waiting for one. `give_up` (may be empty) is polled about every 20 ms while
+    // waiting; once it returns true no slot is taken and false is returned. It runs under the
+    // gate's mutex: it may read atomics and the clock, nothing else.
+    bool acquire(const std::function<bool()>& give_up) {
         std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [&] { return running_.load() < kMaxConcurrentWeightHashes; });
+        while (running_.load() >= kMaxConcurrentWeightHashes) {
+            if (give_up && give_up()) return false;
+            cv_.wait_for(lock, std::chrono::milliseconds(20));
+        }
         running_.fetch_add(1);
+        return true;
     }
     void release() {
         {
@@ -81,11 +89,26 @@ private:
 // relative open, so concurrent use from any number of threads is safe. `gate` bounds the
 // hashes made through this root (weights and verify_blobs()); it is internally locked, hence
 // mutable in an otherwise immutable object.
+//
+// `max_weight_file_bytes`, `weight_hash_timeout` and `cancel` are the StoreOptions the store was
+// opened with, so verify_blobs() (which sees only a record) applies the same hash limits. They
+// are set once by open() before the anchor is shared, and never written again.
 struct StoreAnchor {
     sf::OwnedFileHandle dir;
     sf::FileIdentity id;
     fs::path path;  // absolute form of the path given to open(); display and record paths only
     mutable HashGate gate;
+    std::uint64_t max_weight_file_bytes = kDefaultMaxWeightFileBytes;
+    std::chrono::milliseconds weight_hash_timeout = kDefaultWeightHashTimeout;
+    CancellationToken cancel;
+};
+
+// What a scan may still keep of the small layers (ScanLimits::max_retained_text_bytes): each
+// layer's declared size is charged before the layer is read. Once one did not fit, `reached` is
+// set and no later layer is read. One budget may be carried through several scans.
+struct RetainBudget {
+    std::uint64_t left = 0;
+    bool reached = false;
 };
 
 namespace store_text {
@@ -186,6 +209,16 @@ constexpr std::size_t kMaxNotes = 256;
 constexpr std::size_t kMaxQuoted = 128;
 constexpr std::size_t kHashBufferBytes = 1u << 20;
 constexpr std::size_t kMaxCachedDigests = 4096;
+// What one record keeps of attacker-controlled small-layer content, per field (see
+// ScanLimits::max_retained_text_bytes). Over a cap the content is truncated or skipped, with a
+// warning.
+constexpr std::size_t kMaxConfigStringBytes = 1024;
+constexpr std::size_t kMaxConfigArrayEntries = 32;
+constexpr std::size_t kMaxConfigArrayEntryBytes = 256;
+constexpr std::size_t kMaxExtraEntries = 64;
+constexpr std::size_t kMaxExtraKeyBytes = 256;
+constexpr std::uint64_t kMaxExtraBytes = 64ull << 10;
+constexpr std::size_t kMaxManifestFieldBytes = 256;  // runner, format, a layer's "from"
 constexpr std::size_t kMaxLiveRecords = 1024;
 constexpr std::size_t kMaxHostLen = 350;
 constexpr std::size_t kMaxPartLen = 80;
@@ -203,6 +236,30 @@ std::string lower(std::string_view s) {
     std::string out(s);
     for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return out;
+}
+
+// `s` cut to at most `max` bytes, backed up to a UTF-8 boundary (parsed JSON strings are valid
+// UTF-8, so the cut never leaves half a sequence).
+std::string clip_utf8(std::string s, std::size_t max) {
+    if (s.size() <= max) return s;
+    std::size_t n = max;
+    while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0u) == 0x80u) --n;
+    s.resize(n);
+    return s;
+}
+
+// What a parsed JSON value costs to keep: its node, its text and its children. Recursion is
+// bounded by the parse depth limit.
+std::uint64_t json_cost(const json::Value& v) {
+    std::uint64_t n = sizeof(json::Value);
+    if (v.is_string()) {
+        n += v.as_string().size();
+    } else if (v.is_array()) {
+        for (const auto& e : v.as_array()) n += json_cost(e);
+    } else if (v.is_object()) {
+        for (const auto& [k, e] : v.as_object()) n += k.size() + sizeof(json::Member) + json_cost(e);
+    }
+    return n;
 }
 
 // Bounded, single-line form of an untrusted string for messages and notes (store_text.hpp).
@@ -574,7 +631,7 @@ bool parse_layer(const json::Value& v, LayerInfo& l, std::string& error) {
         }
         l.has_size = true;
     }
-    if (const auto* f = v.find("from"); f && f->is_string()) l.from = f->as_string();
+    if (const auto* f = v.find("from"); f && f->is_string()) l.from = clip_utf8(f->as_string(), kMaxManifestFieldBytes);
     if (const auto* n = v.find("name"); n && n->is_string()) l.name = n->as_string();
     return true;
 }
@@ -590,8 +647,8 @@ bool parse_manifest_object(const json::Value& v, ParsedManifest& out, std::strin
         return false;
     }
     out.media_type = str_field(v, "mediaType");
-    out.runner = lower(str_field(v, "runner"));
-    out.format = lower(str_field(v, "format"));
+    out.runner = clip_utf8(lower(str_field(v, "runner")), kMaxManifestFieldBytes);
+    out.format = clip_utf8(lower(str_field(v, "format")), kMaxManifestFieldBytes);
     if (const auto* cfg = v.find("config"); cfg && !cfg->is_null()) {
         if (!parse_layer(*cfg, out.config, error)) {
             error = "manifest config: " + error;
@@ -681,6 +738,9 @@ void parse_params(const json::Value& doc, ModelParams& p, ModelRecord& r) {
                                    {"repeat_penalty", &ModelParams::repeat_penalty},
                                    {"presence_penalty", &ModelParams::presence_penalty},
                                    {"frequency_penalty", &ModelParams::frequency_penalty}};
+    // What the extras already hold (earlier params layers), counted as json_cost + key bytes.
+    std::uint64_t extra_used = 0;
+    for (const auto& [k, v] : p.extra) extra_used += k.size() + json_cost(v);
     for (const auto& [key, value] : doc.as_object()) {
         bool handled = false;
         for (const auto& k : kInts) {
@@ -739,26 +799,63 @@ void parse_params(const json::Value& doc, ModelParams& p, ModelRecord& r) {
             }
             continue;
         }
+        // An unmodelled option is kept whole, within strict caps: a key, the entry count and
+        // the bytes of all extras together.
+        const std::uint64_t cost = key.size() + json_cost(value);
+        const json::Value* old = p.extra.find(key);
+        const std::uint64_t old_cost = old != nullptr ? key.size() + json_cost(*old) : 0;
+        if (key.size() > kMaxExtraKeyBytes || (old == nullptr && p.extra.size() >= kMaxExtraEntries) ||
+            extra_used - old_cost + cost > kMaxExtraBytes) {
+            warn(r, "params option '" + printable(key) + "' is not kept: unmodelled options are limited to " +
+                        std::to_string(kMaxExtraEntries) + " entries and " + std::to_string(kMaxExtraBytes) + " bytes");
+            continue;
+        }
+        extra_used = extra_used - old_cost + cost;
         p.extra.set(key, value);
     }
 }
 
-void parse_config(const json::Value& doc, ModelConfig& c) {
+void parse_config(const json::Value& doc, ModelRecord& r) {
     if (!doc.is_object()) return;
-    c.model_format = lower(str_field(doc, "model_format"));
-    c.model_family = str_field(doc, "model_family");
-    c.parameter_size = str_field(doc, "model_type");
-    c.quantization = str_field(doc, "file_type");
-    c.renderer = str_field(doc, "renderer");
-    c.parser = str_field(doc, "parser");
-    c.requires_version = str_field(doc, "requires");
-    c.remote_host = str_field(doc, "remote_host");
-    c.remote_model = str_field(doc, "remote_model");
-    auto strings = [&](std::string_view key, std::vector<std::string>& dst) {
-        if (const auto* a = doc.find(key); a && a->is_array()) {
-            for (const auto& s : a->as_array()) {
-                if (s.is_string()) dst.push_back(s.as_string());
+    ModelConfig& c = r.config;
+    // A string field is cut to kMaxConfigStringBytes (the config blob can be 4 MiB).
+    auto text = [&](const char* key) {
+        std::string v = str_field(doc, key);
+        if (v.size() > kMaxConfigStringBytes) {
+            warn(r, std::string("config '") + key + "' is longer than " + std::to_string(kMaxConfigStringBytes) +
+                        " bytes; truncated");
+            v = clip_utf8(std::move(v), kMaxConfigStringBytes);
+        }
+        return v;
+    };
+    c.model_format = lower(text("model_format"));
+    c.model_family = text("model_family");
+    c.parameter_size = text("model_type");
+    c.quantization = text("file_type");
+    c.renderer = text("renderer");
+    c.parser = text("parser");
+    c.requires_version = text("requires");
+    c.remote_host = text("remote_host");
+    c.remote_model = text("remote_model");
+    // An array keeps at most kMaxConfigArrayEntries entries of kMaxConfigArrayEntryBytes each.
+    auto strings = [&](const char* key, std::vector<std::string>& dst) {
+        const auto* a = doc.find(key);
+        if (a == nullptr || !a->is_array()) return;
+        bool warned = false;
+        for (const auto& s : a->as_array()) {
+            if (!s.is_string()) continue;
+            if (dst.size() >= kMaxConfigArrayEntries) {
+                warn(r, std::string("config '") + key + "' has more than " + std::to_string(kMaxConfigArrayEntries) +
+                            " entries; the rest are ignored");
+                return;
             }
+            if (s.as_string().size() > kMaxConfigArrayEntryBytes) {
+                if (!warned) warn(r, std::string("config '") + key + "' has an entry longer than " +
+                                         std::to_string(kMaxConfigArrayEntryBytes) + " bytes; ignored");
+                warned = true;
+                continue;
+            }
+            dst.push_back(s.as_string());
         }
     };
     strings("model_families", c.model_families);
@@ -984,6 +1081,41 @@ public:
                          " hard links (Ollama links split-model shards while it runs one); only a SHA-256 match vouches for it");
         }
         if (b.role == BlobRole::model && b.path == r_.model_path) r_.gguf = *w.header;
+    }
+
+    // A small layer that was not read because the retained-bytes budget was spent: it is opened
+    // and stamped, and checked against its declared size and link count, but not read or hashed.
+    // One that cannot be opened (or has the wrong size or too many links) marks the record
+    // unsupported, as reading it would have; the scan never reports `ready` for a model that
+    // resolve() would refuse for these reasons.
+    void stat_omitted(BlobRef& b, const std::string& hex, std::uint64_t declared, const std::string& what) {
+        const std::string label = what + " blob " + short_digest(hex);
+        sf::OwnedFileHandle h;
+        sf::FileIdentity id;
+        std::string err;
+        const sf::OpenOutcome o = sf::open_anchored_file(a_.dir, blob_rel(hex), sf::ShareMode::allow_writers, h, id, err);
+        if (o == sf::OpenOutcome::missing) {
+            mark(r_, UnsupportedReason::missing_blob, label + " is not in blobs/");
+            return;
+        }
+        if (o == sf::OpenOutcome::unsafe) {
+            mark(r_, UnsupportedReason::unsafe_path, label + " " + open_failure_text(o));
+            return;
+        }
+        if (o == sf::OpenOutcome::io_error) {
+            note_failed(r_, blob_rel(hex));
+            mark(r_, UnsupportedReason::missing_blob, label + " cannot be opened: " + printable(err));
+            return;
+        }
+        b.disk_size = id.size;
+        b.stamp = to_stamp(id);
+        if (id.link_count > 1) {
+            mark(r_, UnsupportedReason::unsafe_path,
+                 label + " has " + std::to_string(id.link_count) + " hard links; small layers must have one");
+        } else if (id.size != declared) {
+            mark(r_, UnsupportedReason::blob_size_mismatch,
+                 label + " is " + std::to_string(id.size) + " bytes on disk, manifest says " + std::to_string(declared));
+        }
     }
 
     // Presence and identity only (license layers are counted, never read).
@@ -1226,17 +1358,12 @@ bool select_child(const json::Value& list, const StoreAnchor& a, ModelRecord& r,
     return false;
 }
 
-// The template, system and messages text one scan may still keep (ScanLimits::
-// max_retained_text_bytes). Once one layer did not fit, no later one is read either.
-struct TextBudget {
-    std::uint64_t left = 0;
-    bool reached = false;
-};
-
-// `text_budget` (a scan's; nullptr for resolve()) is charged a text layer's declared size before
-// that layer is read; a layer that does not fit is only stamped and r.text_omitted is set.
+// `text_budget` (a scan's; nullptr for resolve()) is charged the declared size of every small
+// layer the record keeps (config, params, template, system, messages) before that layer is
+// read; a layer that does not fit is only opened and stamped (RecordReader::stat_omitted) and
+// r.text_omitted is set.
 ModelRecord build_record(const std::shared_ptr<const StoreAnchor>& anchor, const OllamaName& name, const std::string& rel,
-                         ManifestLayout layout, ManifestText&& mt, TextBudget* text_budget) {
+                         ManifestLayout layout, ManifestText&& mt, RetainBudget* text_budget) {
     const StoreAnchor& a = *anchor;
     const fs::path& root = a.path;
     ModelRecord r;
@@ -1283,9 +1410,9 @@ ModelRecord build_record(const std::shared_ptr<const StoreAnchor>& anchor, const
     r.runner = pm.runner;
     r.format = pm.format;
 
-    // True when the text layer `blob` may be read and kept under the scan's budget. A layer over
+    // True when the small layer `blob` may be read and kept under the scan's budget. A layer over
     // the per-layer cap is let through: reader.small() rejects it without reading it.
-    auto admit_text = [&](BlobRef& blob, const std::string& hex, std::uint64_t size) {
+    auto admit_text = [&](BlobRef& blob, const std::string& hex, std::uint64_t size, const char* what) {
         if (text_budget == nullptr || size > kMaxTextLayerBytes) return true;
         if (!text_budget->reached && size <= text_budget->left) {
             text_budget->left -= size;
@@ -1293,7 +1420,7 @@ ModelRecord build_record(const std::shared_ptr<const StoreAnchor>& anchor, const
         }
         text_budget->reached = true;
         r.text_omitted = true;
-        reader.stat_only(blob, hex);
+        reader.stat_omitted(blob, hex, size, what);
         return false;
     };
 
@@ -1312,12 +1439,14 @@ ModelRecord build_record(const std::shared_ptr<const StoreAnchor>& anchor, const
         cfg.digest = "sha256:" + pm.config.hex;
         cfg.path = blob_path(root, pm.config.hex);
         cfg.declared_size = pm.config.size;
-        if (auto text = reader.small(pm.config.hex, pm.config.size, kMaxTextLayerBytes, "config", &cfg)) {
-            auto cj = json::parse(*text, kLayerLimits);
-            if (cj.ok()) {
-                parse_config(cj.value(), r.config);
-            } else {
-                warn(r, "config blob is not valid JSON");
+        if (admit_text(cfg, pm.config.hex, pm.config.size, "config")) {
+            if (auto text = reader.small(pm.config.hex, pm.config.size, kMaxTextLayerBytes, "config", &cfg)) {
+                auto cj = json::parse(*text, kLayerLimits);
+                if (cj.ok()) {
+                    parse_config(cj.value(), r);
+                } else {
+                    warn(r, "config blob is not valid JSON");
+                }
             }
         }
         overflow = !add_checked(r.referenced_bytes, cfg.declared_size) || overflow;
@@ -1380,18 +1509,19 @@ ModelRecord build_record(const std::shared_ptr<const StoreAnchor>& anchor, const
                 r.draft_paths.push_back(blob.path);
                 break;
             case BlobRole::tmpl:
-                if (!admit_text(blob, l.hex, l.size)) break;
+                if (!admit_text(blob, l.hex, l.size, "template")) break;
                 if (auto body = reader.small(l.hex, l.size, kMaxTextLayerBytes, "template", &blob)) {
                     r.template_text = std::move(*body);
                 }
                 break;
             case BlobRole::system:
-                if (!admit_text(blob, l.hex, l.size)) break;
+                if (!admit_text(blob, l.hex, l.size, "system")) break;
                 if (auto body = reader.small(l.hex, l.size, kMaxTextLayerBytes, "system", &blob)) {
                     r.system_prompt = std::move(*body);
                 }
                 break;
             case BlobRole::params:
+                if (!admit_text(blob, l.hex, l.size, "params")) break;
                 if (auto body = reader.small(l.hex, l.size, kMaxTextLayerBytes, "params", &blob); body && !body->empty()) {
                     auto pj = json::parse(*body, kLayerLimits);
                     if (pj.ok()) {
@@ -1402,7 +1532,7 @@ ModelRecord build_record(const std::shared_ptr<const StoreAnchor>& anchor, const
                 }
                 break;
             case BlobRole::messages:
-                if (!admit_text(blob, l.hex, l.size)) break;
+                if (!admit_text(blob, l.hex, l.size, "messages")) break;
                 if (auto body = reader.small(l.hex, l.size, kMaxTextLayerBytes, "messages", &blob); body && !body->empty()) {
                     if (json::parse(*body, kLayerLimits).ok()) {
                         r.messages_json = std::move(*body);
@@ -1728,28 +1858,34 @@ struct OllamaStore::DigestCache {
     struct Lookup {
         std::optional<std::string> hex;
         std::shared_ptr<Flight> flight;
+        bool gave_up = false;  // `give_up` returned true while waiting for another thread's hash
     };
 
     // Concurrent callers for one identity: a claiming caller that finds it free becomes the
     // hasher, the others wait for its result (and retry, one of them becoming the hasher, if
     // it failed). A flight is only ever held while its owner hashes (no user code runs then),
-    // so a waiter waits for a bounded read, never for a callback. Never called with a weak
-    // (64-bit fallback) id, nor on an on_weight_hash thread.
-    Lookup lookup(const FileStamp& s, bool claim) {
+    // so a waiter waits for a bounded read (the hasher's own limits), never for a callback.
+    // `give_up` (may be empty) is polled about every 20 ms while waiting; once it returns true the
+    // wait ends with Lookup::gave_up. It runs under `mutex`: atomics and the clock only. Never
+    // called with a weak (64-bit fallback) id, nor on an on_weight_hash thread.
+    Lookup lookup(const FileStamp& s, bool claim, const std::function<bool()>& give_up) {
         const Key k = key_of(s);
         std::unique_lock<std::mutex> lock(mutex);
         while (true) {
-            if (const auto it = entries.find(k); it != entries.end()) return Lookup{it->second, nullptr};
+            if (const auto it = entries.find(k); it != entries.end()) return Lookup{it->second, nullptr, false};
             const auto f = inflight.find(k);
             if (f == inflight.end()) {
                 if (!claim) return Lookup{};
                 auto flight = std::make_shared<Flight>();
                 inflight.emplace(k, flight);
-                return Lookup{std::nullopt, std::move(flight)};
+                return Lookup{std::nullopt, std::move(flight), false};
             }
             const std::shared_ptr<Flight> other = f->second;
-            cv.wait(lock, [&] { return other->done; });
-            if (other->hex) return Lookup{other->hex, nullptr};
+            while (!other->done) {
+                if (give_up && give_up()) return Lookup{std::nullopt, nullptr, true};
+                cv.wait_for(lock, std::chrono::milliseconds(20));
+            }
+            if (other->hex) return Lookup{other->hex, nullptr, false};
         }
     }
 
@@ -1803,15 +1939,36 @@ struct VerifiedWeightsAccess {
 namespace {
 
 // Holds one of the root's hash slots for its lifetime (only the hash read loop runs inside).
+// held() is false when `give_up` ended the wait: then no slot is held and none is released.
 class HashSlot {
 public:
-    explicit HashSlot(HashGate& gate) : gate_(gate) { gate_.acquire(); }
-    ~HashSlot() { gate_.release(); }
+    HashSlot(HashGate& gate, const std::function<bool()>& give_up) : gate_(gate), held_(gate.acquire(give_up)) {}
+    ~HashSlot() {
+        if (held_) gate_.release();
+    }
     HashSlot(const HashSlot&) = delete;
     HashSlot& operator=(const HashSlot&) = delete;
+    [[nodiscard]] bool held() const noexcept { return held_; }
 
 private:
     HashGate& gate_;
+    bool held_;
+};
+
+// Why a hash stopped before the end of the file.
+enum class HashStop { none, size, time, cancel };
+
+// The time limit of one resolve (or one verify_blobs call): started when it begins to hash.
+struct HashClock {
+    HashClock(std::chrono::milliseconds limit) : limit_(limit), start_(std::chrono::steady_clock::now()) {}
+    [[nodiscard]] bool expired() const {
+        return limit_.count() > 0 && std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - start_) >= limit_;
+    }
+
+private:
+    std::chrono::milliseconds limit_;
+    std::chrono::steady_clock::time_point start_;
 };
 
 // Ends a single-flight hash exactly once: complete() publishes the digest; leaving the scope
@@ -1846,9 +2003,12 @@ WeightCheck weaker(WeightCheck a, WeightCheck b) { return static_cast<int>(a) < 
 //     on_weight_hash callback runs first, while this thread holds no hash slot and no
 //     single-flight claim (under first_use it runs before the claim is taken, so a thread that
 //     then finds the digest of another thread's hash uses it instead); only then is the flight
-//     claimed and a slot taken, for the hash alone. A file larger than
-//     opt.max_weight_file_bytes is not hashed, and a hash stops at opt.weight_hash_timeout or
-//     opt.weight_hash_cancel: UnsupportedReason::hash_limit, transient, nothing remembered.
+//     claimed and a slot taken, for the hash alone. Before anything is opened, the declared sizes
+//     of the distinct weight blobs must add up to at most opt.max_resolve_weight_bytes; a file
+//     larger than opt.max_weight_file_bytes is not hashed; the whole call (the wait for a slot
+//     or for another thread's hash included) stops at opt.weight_hash_timeout, at the
+//     store-wide opt.weight_hash_cancel and at `call_cancel`: UnsupportedReason::hash_limit,
+//     transient, nothing remembered.
 //   first_use hit: the remembered digest is used only if the identity read again from this
 //     same handle after the lookup is still exactly the stamp (WeightCheck::cached_identity);
 //     otherwise the record fails at once (transient). Weak ids never use remembered digests.
@@ -1856,13 +2016,43 @@ WeightCheck weaker(WeightCheck a, WeightCheck b) { return static_cast<int>(a) < 
 // Any open or read failure that may pass is recorded as a failed source (never reused). With
 // `keep`, the handles are moved into it for a loader; on any failure it is left empty.
 void verify_weights_for_use(const StoreAnchor& a, ModelRecord& r, WeightVerification policy, const StoreOptions& opt,
-                            OllamaStore::DigestCache* cache, VerifiedWeights* keep) {
+                            const CancellationToken& call_cancel, OllamaStore::DigestCache* cache,
+                            VerifiedWeights* keep) {
     r.weight_check = WeightCheck::unchecked;
     if (keep != nullptr) VerifiedWeightsAccess::clear(*keep);
     if (!r.ready()) return;
     const bool hash = policy != WeightVerification::off && !in_weight_callback();
     if (!hash && keep == nullptr) return;
+    if (hash) {
+        // The aggregate cap, on declared sizes (every blob's disk size equals its declared one
+        // here: the scan checked that), before any file is opened or hashed.
+        std::set<std::string> distinct;
+        std::uint64_t total = 0;
+        bool wrapped = false;
+        std::string first_rel;
+        for (const auto& b : r.blobs) {
+            if (!is_weight_role(b.role) || !distinct.insert(b.digest).second) continue;
+            if (first_rel.empty()) first_rel = blob_rel(b.digest.substr(7));
+            wrapped = !add_checked(total, b.declared_size) || wrapped;
+        }
+        if (wrapped || total > opt.max_resolve_weight_bytes) {
+            mark(r, UnsupportedReason::hash_limit,
+                 "weight blobs total " + (wrapped ? std::string("more than 2^64") : std::to_string(total)) +
+                     " bytes, more than StoreOptions::max_resolve_weight_bytes (" +
+                     std::to_string(opt.max_resolve_weight_bytes) + "); none is hashed or served");
+            if (!first_rel.empty()) note_failed(r, first_rel);
+            return;
+        }
+    }
     const bool use_cache = policy == WeightVerification::first_use && cache != nullptr;
+    // One time limit for the whole call, from here: hashing several files, waiting for a slot
+    // and waiting for another thread's hash all draw on it.
+    const HashClock clock(hash ? opt.weight_hash_timeout : std::chrono::milliseconds(0));
+    auto cancel_or_time = [&]() {
+        if (call_cancel.cancelled() || opt.weight_hash_cancel.cancelled()) return HashStop::cancel;
+        if (clock.expired()) return HashStop::time;
+        return HashStop::none;
+    };
     std::vector<char> buf;
     std::set<std::string> done;
     WeightCheck overall = WeightCheck::hashed_now;
@@ -1911,6 +2101,33 @@ void verify_weights_for_use(const StoreAnchor& a, ModelRecord& r, WeightVerifica
         if (hash) {
             std::optional<std::string> actual;
             std::shared_ptr<OllamaStore::DigestCache::Flight> flight;
+            HashStop stop = HashStop::none;
+            auto stopped = [&]() {  // also the give-up test of every wait
+                stop = cancel_or_time();
+                return stop != HashStop::none;
+            };
+            auto report_stop = [&]() {
+                switch (stop) {
+                    case HashStop::none: break;
+                    case HashStop::size:
+                        fail(UnsupportedReason::hash_limit,
+                             "grew past StoreOptions::max_weight_file_bytes while it was hashed", true);
+                        break;
+                    case HashStop::time:
+                        fail(UnsupportedReason::hash_limit,
+                             "was not hashed within StoreOptions::weight_hash_timeout (" +
+                                 std::to_string(opt.weight_hash_timeout.count()) +
+                                 " ms for this resolve); it is not served until a hash completes",
+                             true);
+                        break;
+                    case HashStop::cancel:
+                        fail(UnsupportedReason::hash_limit,
+                             "was not hashed: hashing was cancelled (StoreOptions::weight_hash_cancel or the "
+                             "ResolveOptions::cancel of this call)",
+                             true);
+                        break;
+                }
+            };
             bool announced = !opt.on_weight_hash;
             auto announce = [&] {
                 if (announced) return;
@@ -1921,7 +2138,11 @@ void verify_weights_for_use(const StoreAnchor& a, ModelRecord& r, WeightVerifica
             if (use_cache && !stamp.weak_id) {
                 while (true) {
                     // The flight is claimed only once the callback has returned.
-                    OllamaStore::DigestCache::Lookup found = cache->lookup(stamp, announced);
+                    OllamaStore::DigestCache::Lookup found = cache->lookup(stamp, announced, stopped);
+                    if (found.gave_up) {
+                        report_stop();
+                        return;
+                    }
                     if (found.hex) {
                         // The remembered digest is for `stamp`; it applies to this handle only if the
                         // identity read from it now, after the lookup, is still exactly that.
@@ -1945,48 +2166,29 @@ void verify_weights_for_use(const StoreAnchor& a, ModelRecord& r, WeightVerifica
             }
             if (!actual) {
                 FlightGuard guard(use_cache ? cache : nullptr, stamp, std::move(flight));
-                enum class Stop { none, size, time, cancel };
-                Stop stop = Stop::none;
                 std::string got;
                 std::uint64_t bytes = 0;
                 bool read_ok = false;
                 {
-                    const HashSlot slot(a.gate);
+                    const HashSlot slot(a.gate, stopped);
+                    if (!slot.held()) {
+                        report_stop();
+                        return;
+                    }
                     if (buf.empty()) buf.resize(kHashBufferBytes);
-                    const bool timed = opt.weight_hash_timeout.count() > 0;
-                    const auto start = std::chrono::steady_clock::now();
                     read_ok = hash_handle(h, buf, got, bytes, err, [&] {
                         if (bytes > opt.max_weight_file_bytes) {
-                            stop = Stop::size;
-                        } else if (opt.weight_hash_cancel.cancelled()) {
-                            stop = Stop::cancel;
-                        } else if (timed && std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                std::chrono::steady_clock::now() - start) >= opt.weight_hash_timeout) {
-                            stop = Stop::time;
+                            stop = HashStop::size;
+                            return true;
                         }
-                        return stop != Stop::none;
+                        return stopped();
                     });
                 }
                 if (!read_ok) {
-                    switch (stop) {
-                        case Stop::none:
-                            fail(UnsupportedReason::missing_blob, "cannot be read: " + printable(err), true);
-                            break;
-                        case Stop::size:
-                            fail(UnsupportedReason::hash_limit,
-                                 "grew past StoreOptions::max_weight_file_bytes while it was hashed", true);
-                            break;
-                        case Stop::time:
-                            fail(UnsupportedReason::hash_limit,
-                                 "was not hashed within StoreOptions::weight_hash_timeout (" +
-                                     std::to_string(opt.weight_hash_timeout.count()) +
-                                     " ms); it is not served until a hash completes",
-                                 true);
-                            break;
-                        case Stop::cancel:
-                            fail(UnsupportedReason::hash_limit,
-                                 "was not hashed: StoreOptions::weight_hash_cancel was cancelled", true);
-                            break;
+                    if (stop == HashStop::none) {
+                        fail(UnsupportedReason::missing_blob, "cannot be read: " + printable(err), true);
+                    } else {
+                        report_stop();
                     }
                     return;
                 }
@@ -2271,42 +2473,96 @@ Result<OllamaStore> OllamaStore::open(fs::path models_dir, StoreOptions options)
     fs::path root = fs::absolute(models_dir, ec);
     if (ec) root = models_dir;
     anchor->path = root;
+    anchor->max_weight_file_bytes = options.max_weight_file_bytes;
+    anchor->weight_hash_timeout = options.weight_hash_timeout;
+    anchor->cancel = options.weight_hash_cancel;
     return OllamaStore(std::move(root), std::move(anchor), std::move(options));
 }
 
+namespace {
+
+// A manifest that could not be read for lack of memory (or any other exception of the reader
+// itself): an unreadable one, never reused.
+ManifestText unreadable_manifest(const std::string& rel, const char* what) {
+    ManifestText m;
+    m.outcome = sf::OpenOutcome::io_error;
+    m.reason = UnsupportedReason::manifest_invalid;
+    m.error = std::string("manifest cannot be read: ") + printable(what);
+    m.sources.push_back(SourceStamp{rel, FileStamp{}, SourceKind::failed});
+    return m;
+}
+
+// read_manifest() that reports an exception (std::bad_alloc included) as an unreadable manifest
+// instead of letting it end the scan or the process.
+ManifestText read_manifest_guarded(const StoreAnchor& a, const std::string& rel, ManifestLayout layout) {
+    try {
+        return read_manifest(a, rel, layout);
+    } catch (const std::exception& e) {
+        return unreadable_manifest(rel, e.what());
+    }
+}
+
+// build_record() that reports an exception (std::bad_alloc included) as an unsupported record
+// that is never reused, instead of letting it end the scan or the process.
+ModelRecord build_record_guarded(const std::shared_ptr<const StoreAnchor>& anchor, const OllamaName& name,
+                                 const std::string& rel, ManifestLayout layout, ManifestText&& mt,
+                                 RetainBudget* budget) {
+    try {
+        return build_record(anchor, name, rel, layout, std::move(mt), budget);
+    } catch (const std::exception& e) {
+        ModelRecord r;
+        r.name = name;
+        r.store_root = anchor->path;
+        r.anchor = anchor;
+        r.manifest_path = anchor->path / from_utf8(rel);
+        r.layout = layout;
+        mark(r, UnsupportedReason::manifest_invalid, std::string("entry could not be read: ") + printable(e.what()));
+        note_failed(r, rel);
+        return r;
+    }
+}
+
+}  // namespace
+
 ScanResult OllamaStore::scan() const {
+    RetainBudget budget{options_.limits.max_retained_text_bytes, false};
+    return scan_impl(budget);
+}
+
+ScanResult OllamaStore::scan_impl(RetainBudget& text_budget) const {
     std::map<std::string, Found> found;
     ScanResult result;
     WalkBudget budget(options_.limits);
     walk_tree(*anchor_, ManifestLayout::v2, found, result.notes, budget);
     walk_tree(*anchor_, ManifestLayout::legacy, found, result.notes, budget);
-    TextBudget text_budget{options_.limits.max_retained_text_bytes, false};
     result.records.reserve(found.size());
     for (auto& [key, f] : found) {
-        ModelRecord rec =
-            build_record(anchor_, f.name, f.rel, f.layout, read_manifest(*anchor_, f.rel, f.layout), &text_budget);
+        ModelRecord rec = build_record_guarded(anchor_, f.name, f.rel, f.layout,
+                                               read_manifest_guarded(*anchor_, f.rel, f.layout), &text_budget);
         if (options_.verify_weights == WeightVerification::always) {
             // On an on_weight_hash thread this hashes nothing (the record stays unchecked).
-            verify_weights_for_use(*anchor_, rec, WeightVerification::always, options_, cache_.get(), nullptr);
+            verify_weights_for_use(*anchor_, rec, WeightVerification::always, options_, CancellationToken(), cache_.get(),
+                                   nullptr);
         }
         result.records.push_back(std::move(rec));
     }
     if (text_budget.reached) {
-        note(result.notes, "kept no more template, system or messages text after " +
+        note(result.notes, "kept no more config, params, template, system or messages content after " +
                                std::to_string(options_.limits.max_retained_text_bytes) +
                                " bytes (ScanLimits::max_retained_text_bytes); records marked text_omitted were not "
-                               "given theirs, resolve() reads it");
+                               "given the rest, resolve() reads it");
     }
     return result;
 }
 
-Result<ModelRecord> OllamaStore::resolve(std::string_view name) const {
-    return resolve_impl(name, options_.verify_weights, nullptr);
+Result<ModelRecord> OllamaStore::resolve(std::string_view name, const ResolveOptions& call) const {
+    return resolve_impl(name, options_.verify_weights, nullptr, call.cancel);
 }
 
-Result<LoadableModel> OllamaStore::resolve_for_load(std::string_view name, WeightVerification policy) const {
+Result<LoadableModel> OllamaStore::resolve_for_load(std::string_view name, WeightVerification policy,
+                                                    const ResolveOptions& call) const {
     VerifiedWeights weights;
-    auto rec = resolve_impl(name, policy, &weights);
+    auto rec = resolve_impl(name, policy, &weights, call.cancel);
     if (!rec.ok()) return rec.status();
     LoadableModel out;
     out.record = std::move(rec).value();
@@ -2317,7 +2573,7 @@ Result<LoadableModel> OllamaStore::resolve_for_load(std::string_view name, Weigh
 std::size_t OllamaStore::weight_hashes_running() const noexcept { return anchor_ ? anchor_->gate.running() : 0; }
 
 Result<ModelRecord> OllamaStore::resolve_impl(std::string_view name, WeightVerification policy,
-                                              VerifiedWeights* keep) const {
+                                              VerifiedWeights* keep, const CancellationToken& cancel) const {
     if (in_weight_callback()) return reentrant_call("OllamaStore::resolve");
     auto parsed = parse_ollama_name(name);
     if (!parsed.ok()) return parsed.status();
@@ -2341,20 +2597,20 @@ Result<ModelRecord> OllamaStore::resolve_impl(std::string_view name, WeightVerif
         }
     }
     auto finish = [&](const OllamaName& rec_name, const std::string& rel, ManifestLayout layout, ManifestText&& mt) {
-        ModelRecord rec = build_record(anchor_, rec_name, rel, layout, std::move(mt), nullptr);
-        verify_weights_for_use(*anchor_, rec, policy, options_, cache_.get(), keep);
+        ModelRecord rec = build_record_guarded(anchor_, rec_name, rel, layout, std::move(mt), nullptr);
+        verify_weights_for_use(*anchor_, rec, policy, options_, cancel, cache_.get(), keep);
         return rec;
     };
     for (const auto& [rel, layout] : candidates) {
         if (!under_root(root_, root_ / from_utf8(rel))) continue;
-        ManifestText mt = read_manifest(*anchor_, rel, layout);
+        ManifestText mt = read_manifest_guarded(*anchor_, rel, layout);
         if (mt.outcome == sf::OpenOutcome::missing && mt.reason == UnsupportedReason::none) continue;
         return finish(n, rel, layout, std::move(mt));
     }
     // Case-insensitive fallback on case-sensitive file systems: list the matching directories
     // only (no manifest, config or GGUF reads except for the one entry that matches).
     if (auto found = locate_ci(*anchor_, n, options_.limits)) {
-        ManifestText mt = read_manifest(*anchor_, found->rel, found->layout);
+        ManifestText mt = read_manifest_guarded(*anchor_, found->rel, found->layout);
         if (!(mt.outcome == sf::OpenOutcome::missing && mt.reason == UnsupportedReason::none)) {
             return finish(found->name, found->rel, found->layout, std::move(mt));
         }
@@ -2363,14 +2619,17 @@ Result<ModelRecord> OllamaStore::resolve_impl(std::string_view name, WeightVerif
 }
 
 bool OllamaStore::revalidate(ModelRecord& record) const {
-    return revalidate_impl(record, options_.verify_weights, nullptr);
+    return revalidate_impl(record, options_.verify_weights, nullptr, CancellationToken());
 }
 
-bool OllamaStore::revalidate_impl(ModelRecord& record, WeightVerification policy, VerifiedWeights* keep) const {
+bool OllamaStore::revalidate_impl(ModelRecord& record, WeightVerification policy, VerifiedWeights* keep,
+                                  const CancellationToken& cancel) const {
     if (in_weight_callback()) return false;  // see StoreOptions::on_weight_hash
+    // A record with layers that were never read cannot be current: it must be resolved again.
+    if (record.text_omitted) return false;
     // Only a record read through this very root handle (copies of this store share it).
     if (record.anchor.get() != anchor_.get() || !sources_unchanged(*anchor_, record, false)) return false;
-    verify_weights_for_use(*anchor_, record, policy, options_, cache_.get(), keep);
+    verify_weights_for_use(*anchor_, record, policy, options_, cancel, cache_.get(), keep);
     return true;
 }
 
@@ -2435,16 +2694,32 @@ VerifyReport verify_blobs(const ModelRecord& record, const VerifyOptions& option
     }
     std::vector<char> buf;
     std::set<std::string> seen;
+    // The hash limits of the store the record came from (defaults for a hand-built record): one
+    // time limit for the whole call, the per-file size cap, and the store-wide cancel.
+    const std::uint64_t max_file = root ? root->max_weight_file_bytes : kDefaultMaxWeightFileBytes;
+    const HashClock clock(root ? root->weight_hash_timeout : kDefaultWeightHashTimeout);
+    auto cancelled_now = [&] { return options.cancel.cancelled() || (root && root->cancel.cancelled()); };
+    auto timeout_text = [&] {
+        return "was not hashed within StoreOptions::weight_hash_timeout (" +
+               std::to_string((root ? root->weight_hash_timeout : kDefaultWeightHashTimeout).count()) +
+               " ms for this call)";
+    };
     for (const auto& blob : record.blobs) {
         if (options.weights_only && !is_weight_role(blob.role)) continue;
         if (!seen.insert(blob.digest).second) continue;
         BlobVerification v;
         v.blob = blob;
-        if (options.cancel.cancelled()) {
+        if (cancelled_now()) {
             v.verdict = BlobVerdict::cancelled;
             v.detail = "cancelled before hashing";
             report.blobs.push_back(std::move(v));
             break;
+        }
+        if (clock.expired()) {
+            v.verdict = BlobVerdict::io_error;
+            v.detail = "blob " + timeout_text();
+            report.blobs.push_back(std::move(v));
+            continue;
         }
         const auto hex = manifest_digest_hex(blob.digest);
         if (!hex) {
@@ -2476,21 +2751,42 @@ VerifyReport verify_blobs(const ModelRecord& record, const VerifyOptions& option
             report.blobs.push_back(std::move(v));
             continue;
         }
+        if (id.size > max_file) {
+            v.verdict = BlobVerdict::io_error;
+            v.detail = "blob is " + std::to_string(id.size) + " bytes, more than StoreOptions::max_weight_file_bytes (" +
+                       std::to_string(max_file) + "); it is not hashed";
+            report.blobs.push_back(std::move(v));
+            continue;
+        }
         if (options.on_blob_start) options.on_blob_start(blob);  // user code: no hash slot held
         if (buf.empty()) buf.resize(kHashBufferBytes);
         std::string got;
         std::uint64_t bytes = 0;
         bool done = false;
+        bool timed_out = false;
+        auto give_up = [&] {
+            if (cancelled_now()) return true;
+            timed_out = clock.expired();
+            return timed_out;
+        };
         {
-            const HashSlot slot(root->gate);
-            done = hash_handle(h, buf, got, bytes, error, [&options] { return options.cancel.cancelled(); });
+            const HashSlot slot(root->gate, give_up);
+            if (slot.held()) {
+                done = hash_handle(h, buf, got, bytes, error, [&] {
+                    if (bytes > max_file) {
+                        error = "blob grew past StoreOptions::max_weight_file_bytes while it was hashed";
+                        return true;
+                    }
+                    return give_up();
+                });
+            }
         }
         if (!done) {
-            v.verdict = options.cancel.cancelled() ? BlobVerdict::cancelled : BlobVerdict::io_error;
-            v.detail = printable(error);
-            const bool stop = v.verdict == BlobVerdict::cancelled;
+            const bool cancelled = cancelled_now();
+            v.verdict = cancelled ? BlobVerdict::cancelled : BlobVerdict::io_error;
+            v.detail = cancelled ? std::string("hashing cancelled") : timed_out ? "blob " + timeout_text() : printable(error);
             report.blobs.push_back(std::move(v));
-            if (stop) break;
+            if (cancelled) break;
             continue;
         }
         sf::FileIdentity after;
@@ -2643,38 +2939,73 @@ namespace {
 
 using SharedRecord = std::shared_ptr<const ModelRecord>;
 
-std::uint64_t text_bytes(const ModelRecord& r) {
+// Everything a record keeps of attacker-controlled small-layer content, counted against
+// ScanLimits::max_retained_text_bytes: template, system, messages, config strings and arrays,
+// params stop entries and unmodelled options, runner, format and parent. What it leaves out is
+// bounded per record by a constant (names, paths, blob list, sources, detail, warnings).
+std::uint64_t retained_bytes(const ModelRecord& r) {
     std::uint64_t n = 0;
-    if (r.template_text) n += r.template_text->size();
-    if (r.system_prompt) n += r.system_prompt->size();
-    if (r.messages_json) n += r.messages_json->size();
+    auto add = [&](const std::string& s) { n += s.size(); };
+    auto add_all = [&](const std::vector<std::string>& v) {
+        for (const auto& s : v) n += s.size() + sizeof(std::string);
+    };
+    if (r.template_text) add(*r.template_text);
+    if (r.system_prompt) add(*r.system_prompt);
+    if (r.messages_json) add(*r.messages_json);
+    add(r.runner);
+    add(r.format);
+    add(r.parent);
+    const ModelConfig& c = r.config;
+    add(c.model_format);
+    add(c.model_family);
+    add(c.parameter_size);
+    add(c.quantization);
+    add(c.renderer);
+    add(c.parser);
+    add(c.requires_version);
+    add(c.remote_host);
+    add(c.remote_model);
+    add_all(c.model_families);
+    add_all(c.capabilities);
+    add_all(r.params.stop);
+    for (const auto& [k, v] : r.params.extra) n += k.size() + json_cost(v);
     return n;
 }
 
-// `rec` as the registry keeps it: whole while its text fits in what is left of `budget` after
-// `used` (which it is then added to), otherwise without its text (text_omitted, so a resolve()
-// of the name reads the store again instead of serving it).
+// Drops everything retained_bytes() counts (the numbers and the status stay) and flags the
+// record text_omitted: what was dropped was neither kept nor will be served from a cache.
+void strip_retained(ModelRecord& r) {
+    r.template_text.reset();
+    r.system_prompt.reset();
+    r.messages_json.reset();
+    r.runner.clear();
+    r.format.clear();
+    r.parent.clear();
+    ModelConfig empty;
+    empty.context_length = r.config.context_length;
+    empty.embedding_length = r.config.embedding_length;
+    r.config = std::move(empty);
+    r.params.stop.clear();
+    r.params.extra = json::Object();
+    r.text_omitted = true;
+}
+
+// `rec` as the registry keeps it: whole while what it retains fits in what is left of `budget`
+// after `used` (which it is then added to), otherwise stripped (strip_retained: text_omitted,
+// so a resolve() of the name reads the store again instead of serving it).
 SharedRecord retain(ModelRecord rec, std::uint64_t& used, std::uint64_t budget) {
-    const std::uint64_t t = text_bytes(rec);
+    const std::uint64_t t = retained_bytes(rec);
     if (t > 0 && (used > budget || t > budget - used)) {
-        rec.template_text.reset();
-        rec.system_prompt.reset();
-        rec.messages_json.reset();
-        rec.text_omitted = true;
+        strip_retained(rec);
     } else {
         used += t;
     }
     return std::make_shared<const ModelRecord>(std::move(rec));
 }
 
-}  // namespace
+std::uint64_t sub_sat(std::uint64_t a, std::uint64_t b) { return a > b ? a - b : 0; }
 
-std::uint64_t ModelRegistry::retained_text_bytes() const {
-    std::uint64_t n = 0;
-    for (const auto& r : records_) n += text_bytes(*r);
-    for (const auto& e : live_) n += text_bytes(*e.second);
-    return n;
-}
+}  // namespace
 
 Status ModelRegistry::add_ollama_dir(fs::path models_dir) {
     auto store = OllamaStore::open(std::move(models_dir), options_);
@@ -2686,38 +3017,49 @@ Status ModelRegistry::add_ollama_dir(fs::path models_dir) {
         }
         return false;
     };
+    const std::uint64_t budget = options_.limits.max_retained_text_bytes;
+    RetainBudget allowance;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (registered()) return Status::success();
+        allowance.left = sub_sat(budget, retained_bytes_);
     }
     // The scan (directory walk, config/params reads, GGUF headers) runs without the lock so
-    // concurrent resolve()/list() calls are not stalled behind it.
-    auto scanned = store.value().scan();
+    // concurrent resolve()/list() calls are not stalled behind it. It keeps what is left of the
+    // registry's allowance, no more.
+    auto scanned = store.value().scan_impl(allowance);
     std::lock_guard<std::mutex> lock(mutex_);
     if (registered()) return Status::success();  // another thread added the same directory meanwhile
     stores_.push_back(store.value());
-    std::uint64_t used = retained_text_bytes();
+    std::uint64_t used = retained_bytes_;
     for (auto& rec : scanned.records) {
         const std::string key = rec.name.key();
         const bool dup = std::any_of(records_.begin(), records_.end(),
                                      [&](const SharedRecord& e) { return e->name.key() == key; });
-        if (!dup) records_.push_back(retain(std::move(rec), used, options_.limits.max_retained_text_bytes));
+        if (!dup) records_.push_back(retain(std::move(rec), used, budget));
     }
+    retained_bytes_ = used;
     return Status::success();
 }
 
 void ModelRegistry::refresh() {
+    const std::uint64_t budget = options_.limits.max_retained_text_bytes;
     std::vector<OllamaStore> stores;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        stores = stores_;
+        stores = stores_;  // every record held now belongs to one of these: all are rescanned
     }
-    std::vector<ModelRecord> fresh;
+    // One allowance for the whole refresh: each store's scan keeps only what is left of it, and
+    // its records are retained (stripped when they do not fit) before the next store is read, so
+    // what is held never grows past the budget however many stores there are.
+    RetainBudget allowance{budget, false};
+    std::uint64_t used = 0;
+    std::vector<SharedRecord> fresh;
     std::set<std::string> seen;
     for (const auto& store : stores) {
-        ScanResult scanned = store.scan();  // no lock held: this reads the disk
+        ScanResult scanned = store.scan_impl(allowance);  // no lock held: this reads the disk
         for (auto& rec : scanned.records) {
-            if (seen.insert(rec.name.key()).second) fresh.push_back(std::move(rec));
+            if (seen.insert(rec.name.key()).second) fresh.push_back(retain(std::move(rec), used, budget));
         }
     }
     std::lock_guard<std::mutex> lock(mutex_);
@@ -2726,21 +3068,31 @@ void ModelRegistry::refresh() {
     // They are kept as they are and counted first; the rescanned records share what is left
     // of the text budget.
     std::vector<SharedRecord> kept;
-    std::uint64_t used = 0;
+    std::uint64_t kept_used = 0;
     for (auto& rec : records_) {
         const bool rescanned = std::any_of(stores.begin(), stores.end(),
                                            [&](const OllamaStore& st) { return st.anchor_.get() == rec->anchor.get(); });
         if (!rescanned && seen.insert(rec->name.key()).second) {
-            used += text_bytes(*rec);
+            kept_used += retained_bytes(*rec);
             kept.push_back(std::move(rec));
         }
     }
+    // The records kept above were not counted while the stores were scanned; fit the rescanned
+    // ones around them (only a store added during the scan can make this change anything).
+    std::uint64_t fresh_used = 0;
+    for (const auto& rec : fresh) fresh_used += retained_bytes(*rec);
+    if (kept_used > 0 && kept_used + fresh_used > budget) {
+        std::uint64_t fit = kept_used;
+        for (auto& rec : fresh) rec = retain(ModelRecord(*rec), fit, budget);
+        fresh_used = fit - kept_used;
+    }
     std::vector<SharedRecord> next;
     next.reserve(fresh.size() + kept.size());
-    for (auto& rec : fresh) next.push_back(retain(std::move(rec), used, options_.limits.max_retained_text_bytes));
+    for (auto& rec : fresh) next.push_back(std::move(rec));
     for (auto& rec : kept) next.push_back(std::move(rec));
     records_ = std::move(next);
     live_.clear();
+    retained_bytes_ = kept_used + fresh_used;
 }
 
 std::vector<std::shared_ptr<const ModelRecord>> ModelRegistry::list() const {
@@ -2748,13 +3100,14 @@ std::vector<std::shared_ptr<const ModelRecord>> ModelRegistry::list() const {
     return records_;
 }
 
-Result<ModelRecord> ModelRegistry::resolve(std::string_view name) const {
-    return resolve_impl(name, options_.verify_weights, nullptr);
+Result<ModelRecord> ModelRegistry::resolve(std::string_view name, const ResolveOptions& call) const {
+    return resolve_impl(name, options_.verify_weights, nullptr, call.cancel);
 }
 
-Result<LoadableModel> ModelRegistry::resolve_for_load(std::string_view name, WeightVerification policy) const {
+Result<LoadableModel> ModelRegistry::resolve_for_load(std::string_view name, WeightVerification policy,
+                                                      const ResolveOptions& call) const {
     VerifiedWeights weights;
-    auto rec = resolve_impl(name, policy, &weights);
+    auto rec = resolve_impl(name, policy, &weights, call.cancel);
     if (!rec.ok()) return rec.status();
     LoadableModel out;
     out.record = std::move(rec).value();
@@ -2763,7 +3116,7 @@ Result<LoadableModel> ModelRegistry::resolve_for_load(std::string_view name, Wei
 }
 
 Result<ModelRecord> ModelRegistry::resolve_impl(std::string_view name, WeightVerification policy,
-                                                VerifiedWeights* keep) const {
+                                                VerifiedWeights* keep, const CancellationToken& cancel) const {
     if (in_weight_callback()) return reentrant_call("ModelRegistry::resolve");
     auto parsed = parse_ollama_name(name);
     if (!parsed.ok()) return parsed.status();
@@ -2793,30 +3146,42 @@ Result<ModelRecord> ModelRegistry::resolve_impl(std::string_view name, WeightVer
     }
     // Store this result in the caches: a scan entry is replaced (an unsupported one is then
     // re-checked on every lookup, see below), a live entry only kept while it is ready. Either
-    // keeps its text only within limits.max_retained_text_bytes over every cached record.
+    // keeps its retained content only within limits.max_retained_text_bytes over every cached
+    // record; retained_bytes_ is kept in step (the caller of each change holds mutex_).
+    auto drop_live = [&](const std::string& k) {
+        const auto it = live_.find(k);
+        if (it == live_.end()) return;
+        retained_bytes_ = sub_sat(retained_bytes_, retained_bytes(*it->second));
+        live_.erase(it);
+    };
     auto remember = [&](const ModelRecord& rec, bool replace_scan) {
         std::lock_guard<std::mutex> lock(mutex_);
         const std::uint64_t budget = options_.limits.max_retained_text_bytes;
         if (replace_scan) {
             for (auto& e : records_) {
                 if (e->name.key() == key) {
-                    std::uint64_t used = retained_text_bytes() - text_bytes(*e);
+                    std::uint64_t used = sub_sat(retained_bytes_, retained_bytes(*e));
                     e = retain(rec, used, budget);
+                    retained_bytes_ = used;
                     return;
                 }
             }
         }
-        live_.erase(key);
+        drop_live(key);
         if (!rec.ready()) return;
-        if (live_.size() >= kMaxLiveRecords) live_.clear();
-        std::uint64_t used = retained_text_bytes();
+        if (live_.size() >= kMaxLiveRecords) {
+            for (const auto& e : live_) retained_bytes_ = sub_sat(retained_bytes_, retained_bytes(*e.second));
+            live_.clear();
+        }
+        std::uint64_t used = retained_bytes_;
         live_.emplace(key, retain(rec, used, budget));
+        retained_bytes_ = used;
     };
     if (cached) {
         for (const auto& store : stores) {
             if (store.anchor_.get() != cached->anchor.get()) continue;
             // Disk reads (and possibly a weight hash) below run without the registry lock.
-            if (cached->ready() && cached->text_omitted) break;  // its text was not kept: read it again below
+            if (cached->text_omitted) break;  // some of its layers were not kept: read it again below
             if (!cached->ready()) {
                 // An unsupported reason is served again only while it still holds: the files it
                 // was read from are unchanged and the blobs it could not open are still absent.
@@ -2824,7 +3189,7 @@ Result<ModelRecord> ModelRegistry::resolve_impl(std::string_view name, WeightVer
                 break;  // something changed (a repair, a finished pull): resolve it again below
             }
             ModelRecord rec = *cached;
-            if (store.revalidate_impl(rec, policy, keep)) {
+            if (store.revalidate_impl(rec, policy, keep, cancel)) {
                 if (!rec.ready()) remember(rec, from_scan);
                 return check(rec);
             }
@@ -2833,17 +3198,22 @@ Result<ModelRecord> ModelRegistry::resolve_impl(std::string_view name, WeightVer
     }
     // Live lookup without the lock: it reads the disk (manifest and blob headers).
     for (const auto& store : stores) {
-        auto live = store.resolve_impl(name, policy, keep);
+        auto live = store.resolve_impl(name, policy, keep, cancel);
         if (!live.ok()) continue;
         remember(live.value(), from_scan);
         return check(live.value());
     }
     if (cached) {  // the cached entry is gone from every store
         std::lock_guard<std::mutex> lock(mutex_);
-        live_.erase(key);
-        records_.erase(std::remove_if(records_.begin(), records_.end(),
-                                      [&](const SharedRecord& e) { return e->name.key() == key; }),
-                       records_.end());
+        drop_live(key);
+        for (auto it = records_.begin(); it != records_.end();) {
+            if ((*it)->name.key() == key) {
+                retained_bytes_ = sub_sat(retained_bytes_, retained_bytes(**it));
+                it = records_.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
     return Status(ErrorCode::not_found, "model '" + parsed.value().display() + "' is not in any registered store");
 }

@@ -9,9 +9,11 @@
 // was opened therefore cannot move later opens to another directory.
 //
 // Ownership: OwnedFileHandle owns one OS handle (HANDLE / fd) and is move-only. Every
-// function here is reentrant and holds no global state besides the test hook
-// set_weak_identity_for_testing (one atomic flag, off in production) and the per-thread
-// counter behind dir_entries_visited_on_this_thread. An anchor handle may be shared by
+// function here is reentrant and holds no global state. The two test aids
+// (set_weak_identity_for_testing, a process-wide flag, and dir_entries_visited_on_this_thread,
+// a per-thread counter) exist only in a build that defines SONDER_INFERENCE_TEST_HOOKS (CMake
+// sets it for SONDER_BUILD_TESTS builds, never otherwise), so a production library has
+// neither the flag nor a way to set it. An anchor handle may be shared by
 // any number of threads at once (it is only ever used as the starting directory of a
 // relative open, never read through); a file handle is used by one thread at a time
 // (reads advance its file position).
@@ -142,20 +144,23 @@ struct DirEntry {
 OpenOutcome visit_anchored_dir(const OwnedFileHandle& anchor, std::string_view rel, std::size_t max_entries,
                                const std::function<bool(DirEntry&)>& visit, bool& truncated, std::string& err_msg);
 
-// Diagnostics: how many entries visit_anchored_dir has passed to a `visit` callback on the
+#if defined(SONDER_INFERENCE_TEST_HOOKS)
+// Test aid: how many entries visit_anchored_dir has passed to a `visit` callback on the
 // calling thread since it started (a thread_local count, so tests can bound the directory
 // entries one call reads).
 std::uint64_t dir_entries_visited_on_this_thread() noexcept;
+#endif
 
 // Opens a single regular file without following symlinks or reparse points.
 OpenOutcome open_single_regular(const std::filesystem::path& file, OwnedFileHandle& out_handle,
                                 std::uint64_t& out_size, std::string& err_msg);
 
+#if defined(SONDER_INFERENCE_TEST_HOOKS)
 // Test hook: while on, every FileIdentity filled by this module has weak_id set, as if the
 // file system did not report FileIdInfo, so a caller's handling of weak identities can be
-// tested on any volume. Process-wide (a relaxed atomic, safe from any thread); never turned
-// on outside tests.
+// tested on any volume. Process-wide (a relaxed atomic, safe from any thread).
 void set_weak_identity_for_testing(bool on) noexcept;
+#endif
 
 // Fills `out` from the open handle. False (with err_msg) on failure.
 bool query_identity(const OwnedFileHandle& handle, FileIdentity& out, std::string& err_msg);

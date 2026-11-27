@@ -102,6 +102,10 @@ endif()
 if(SONDER_BUILD_TESTS)
     enable_testing()
     include(SonderDoctest)
+    # Test-only seams in src/common/safe_file.* (a weak-identity switch and a directory-entry
+    # counter). Compiled in only when the test suite is built; a library built with
+    # -DSONDER_BUILD_TESTS=OFF contains neither.
+    target_compile_definitions(sonder_inference PUBLIC SONDER_INFERENCE_TEST_HOOKS=1)
 endif()
 
 # Optional modules, each owned by its own work stream (docs/MODULES.md).

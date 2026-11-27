@@ -683,7 +683,10 @@ Changes outside the module, for the integrator:
    `FILE_DIRECTORY_FILE` (the attributes are checked on the handle). Round 4 adds two test aids:
    `set_weak_identity_for_testing` (one atomic flag that marks every identity weak) and
    `dir_entries_visited_on_this_thread` (a thread-local count of the entries `visit_anchored_dir`
-   handed to a callback). `open_anchored_regular(path, ...)` keeps its
+   handed to a callback). Round 5 compiles both only when `SONDER_INFERENCE_TEST_HOOKS` is defined
+   (the root `CMakeLists.txt` defines it, publicly, exactly when `SONDER_BUILD_TESTS` is on), so a
+   library built with `-DSONDER_BUILD_TESTS=OFF` has neither the flag nor a way to set it; the two
+   tests that use them are guarded the same way. `open_anchored_regular(path, ...)` keeps its
    signature (it pins the path, then opens relative to it), so `src/artifacts` is unchanged apart
    from now using the relative opens; the `sonder.artifacts.*` tests cover it. `src/artifacts`
    keeps only `hash_open_handle`; `weight_manifest_io.hpp` re-exports the shared names with
@@ -709,10 +712,18 @@ takes no registry lock while it reads the disk, a miss streams only the director
 path (at most `ScanLimits::max_scan_entries` entries in all), and `StoreOptions::on_weight_hash`
 runs while its thread holds no hash slot or single-flight claim: it may wait for other threads
 that use the registry, but on its own thread every store and registry entry point fails at once
-(`invalid_state`). A service should set `StoreOptions::weight_hash_timeout` and/or
-`weight_hash_cancel` (the default bounds a hash only by `max_weight_file_bytes`, 1 TiB). The JSON
-document is `sonder.inference.model_store/2` (round 4: `weight_check` and `text_omitted` added,
-`weights_verified` means hashed in this call).
+(`invalid_state`). Hashing is bounded by default (round 5): `max_weight_file_bytes` 1 TiB per file,
+`max_resolve_weight_bytes` 2 TiB of declared weights per resolve (refused before any hashing),
+and `weight_hash_timeout` 3 hours for all the hashing of one resolve or one `verify_blobs()` call
+(`kDefaultWeightHashTimeout`; zero disables it). `StoreOptions::weight_hash_cancel` is store-wide
+and never resettable (a shutdown switch); `ResolveOptions::cancel`, an optional last argument of
+`resolve()` / `resolve_for_load()` on the store and the registry, cancels one call, including its
+wait for a hash slot. A service should still choose its own timeout and rate-limit callers that
+retry after `hash_limit`. `text_omitted` now also covers config and params (round 5: every small
+layer a scan keeps is charged to `ScanLimits::max_retained_text_bytes`, one allowance shared by
+all the stores of a registry, with per-field caps on what a record keeps); `revalidate()` returns
+false for such a record. The JSON document is `sonder.inference.model_store/2` (round 4:
+`weight_check` and `text_omitted` added, `weights_verified` means hashed in this call).
 
 Open items:
 

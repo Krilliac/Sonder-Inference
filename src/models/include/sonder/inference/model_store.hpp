@@ -109,10 +109,12 @@ enum class UnsupportedReason {
     digest_mismatch,          // a blob's content does not hash to its digest
     blob_busy,                // Windows: a weight blob is open for writing by another process, so it
                               // cannot be opened with writes denied to hash or serve it (transient)
-    hash_limit,               // a weight blob was not hashed to the end: it is larger than
-                              // StoreOptions::max_weight_file_bytes, or its hash ran past
-                              // StoreOptions::weight_hash_timeout or was cancelled (transient: the
-                              // record is never reused, the next resolve tries again)
+    hash_limit,               // the weights were not hashed to the end: a blob is larger than
+                              // StoreOptions::max_weight_file_bytes, the weights of the resolve add up
+                              // to more than max_resolve_weight_bytes, or hashing ran past
+                              // weight_hash_timeout or was cancelled (StoreOptions::weight_hash_cancel
+                              // or ResolveOptions::cancel) (transient: the record is never reused, the
+                              // next resolve tries again)
 };
 const char* to_string(UnsupportedReason reason) noexcept;
 const char* to_string(EntryStatus status) noexcept;
@@ -256,13 +258,26 @@ struct ScanLimits {
     std::size_t max_dir_entries = 4096;    // entries read from any one directory
     std::size_t max_scan_entries = 65536;  // entries read by one scan() or lookup, all directories
     std::size_t max_models = 1024;         // manifests one scan() reads
-    // Template, system and messages text one scan() keeps, all records together (each record
-    // is also capped at 16 MiB of small layers). Once the next such layer would pass it, the
-    // scan reads no more text layers: the records concerned have text_omitted set (their text
-    // layers were neither read nor checked) and a note says so. resolve() reads them in full.
-    // A ModelRegistry also bounds the text of the records it caches from resolve() by it.
+    // The small layers (config, params, template, system, messages) one scan() keeps, all
+    // records together, counted by declared size and charged before a layer is read (each record
+    // is also capped at 16 MiB of small layers). Once the next such layer would pass it, the scan
+    // reads no more of them: the records concerned have text_omitted set (the omitted layers were
+    // neither read nor checked: only opened, stamped and size-checked) and a note says so.
+    // resolve() reads them in full. What is kept from a layer is also capped per field (a config
+    // string 1 KiB, a config array 32 entries of 256 bytes, params extras 64 entries and 64 KiB,
+    // runner/format/parent 256 bytes), and the registry counts all of it (retained_bytes) against
+    // this limit. A ModelRegistry shares one allowance of this size across every store it scans
+    // (refresh() carries what is left from store to store) and across the records it caches from
+    // resolve(). Not counted, because each is bounded per record by a constant (about 100 KiB
+    // together): names, paths, the blob list, source stamps, detail and warnings.
     std::uint64_t max_retained_text_bytes = 64ull << 20;
 };
+
+// Defaults for StoreOptions (see there).
+inline constexpr std::uint64_t kDefaultMaxWeightFileBytes = 1ull << 40;     // 1 TiB per file
+inline constexpr std::uint64_t kDefaultMaxResolveWeightBytes = 2ull << 40;  // 2 TiB per resolve
+// 2 TiB at the portable SHA-256's slow end (about 90 minutes per TiB) is 3 hours.
+inline constexpr std::chrono::milliseconds kDefaultWeightHashTimeout = std::chrono::hours(3);
 
 struct StoreOptions {
     WeightVerification verify_weights = WeightVerification::first_use;
@@ -278,18 +293,43 @@ struct StoreOptions {
     // (a direct call would hash, and so call back, again). It may run on several threads at
     // once. May be empty. An exception it throws propagates out of the resolve that called it.
     std::function<void(const BlobRef&)> on_weight_hash;
-    // Bounds on one weight hash. A file larger than max_weight_file_bytes is not hashed; a hash
-    // that runs longer than weight_hash_timeout (zero: no time limit; measured from when it
-    // takes its hash slot) or sees weight_hash_cancel cancelled stops. Either way the record
-    // fails with UnsupportedReason::hash_limit, as a transient failure (never reused, never
-    // remembered as a digest), and any thread waiting for that hash is released to try again.
-    std::uint64_t max_weight_file_bytes = 1ull << 40;  // 1 TiB
-    std::chrono::milliseconds weight_hash_timeout{0};
+    // Bounds on weight hashing, so one hostile or huge manifest cannot hold a resolve and the
+    // store's hash slots for days (kMaxConcurrentWeightHashes of them are shared by every
+    // resolve of the store). Whichever is hit, the record fails with UnsupportedReason::hash_limit,
+    // as a transient failure (never reused, never remembered as a digest), and any thread waiting
+    // for that hash is released to try again.
+    //   max_weight_file_bytes     a file larger than this is not hashed (default 1 TiB).
+    //   max_resolve_weight_bytes  the declared sizes of the distinct weight blobs of one resolve
+    //                             (model, shard, projector, adapter, draft layers) may add up to
+    //                             this much (default 2 TiB); more fails before anything is
+    //                             opened, hashed or called back (a resolve that would hash).
+    //   weight_hash_timeout       the time all hashing of ONE resolve (and one verify_blobs()
+    //                             call) may take, counted from when it starts to hash and
+    //                             including the wait for a hash slot or for another thread's
+    //                             hash (default 3 hours, kDefaultWeightHashTimeout; zero: no time
+    //                             limit, not recommended for a service).
+    //   weight_hash_cancel        STORE-WIDE and never resettable (the options are copied at
+    //                             open()): once cancelled, every later hash on this store fails.
+    //                             It is the shutdown switch. To cancel one resolve, pass
+    //                             ResolveOptions::cancel to that call.
+    std::uint64_t max_weight_file_bytes = kDefaultMaxWeightFileBytes;
+    std::uint64_t max_resolve_weight_bytes = kDefaultMaxResolveWeightBytes;
+    std::chrono::milliseconds weight_hash_timeout = kDefaultWeightHashTimeout;
     CancellationToken weight_hash_cancel;
     ScanLimits limits;
 };
 
-struct StoreAnchor;  // the store root opened by OllamaStore::open() (model_store.cpp)
+// Per-call options for resolve() and resolve_for_load().
+struct ResolveOptions {
+    // Cancels this call only: its hashing stops (also while it waits for a hash slot or for
+    // another thread's hash of the same file) and the record fails with
+    // UnsupportedReason::hash_limit (transient). Nothing else on the store is affected; a later
+    // call without a cancelled token hashes normally. Default: never cancelled.
+    CancellationToken cancel;
+};
+
+struct StoreAnchor;    // the store root opened by OllamaStore::open() (model_store.cpp)
+struct RetainBudget;   // what a scan may still keep of the small layers (model_store.cpp)
 
 // Everything known about one store entry. A `ready` record has every blob
 // present as a regular file inside the store, sized as declared; every small
@@ -330,10 +370,14 @@ struct ModelRecord {
     std::optional<std::string> template_text;  // image.template (or legacy image.prompt)
     std::optional<std::string> system_prompt;  // image.system
     std::optional<std::string> messages_json;  // image.messages, validated JSON text
-    // A scan reached ScanLimits::max_retained_text_bytes before this record's template, system
-    // or messages layer: those not kept were neither read nor checked (their blobs are only
-    // opened and stamped). resolve() of the name reads them; ModelRegistry never serves such a
-    // cached record without resolving it again.
+    // A scan reached ScanLimits::max_retained_text_bytes before one of this record's small
+    // layers (config, params, template, system, messages), or a registry stripped what it was
+    // keeping of the record to stay within it: the omitted layers were neither read nor checked
+    // (their blobs are only opened, stamped and size-checked; one that cannot be opened makes
+    // the record unsupported), so config, params and text fields, and anything classified from
+    // them (cloud stub, safetensors config), are provisional or empty. resolve() of the name
+    // reads everything; ModelRegistry never serves such a cached record without resolving it
+    // again, and OllamaStore::revalidate() returns false for it.
     bool text_omitted = false;
     std::size_t license_count = 0;
 
@@ -452,8 +496,9 @@ public:
     // then the legacy tree (also under the alternate public host). Returns not_found when
     // no manifest exists; an unsupported entry is returned as a record, not an error.
     // Weights are checked per options().verify_weights (record.weight_check says how); their
-    // handles are then closed.
-    [[nodiscard]] Result<ModelRecord> resolve(std::string_view name) const;
+    // handles are then closed. The hash limits of StoreOptions apply; `call` can cancel just
+    // this resolve.
+    [[nodiscard]] Result<ModelRecord> resolve(std::string_view name, const ResolveOptions& call = {}) const;
 
     // resolve(), keeping the weight handles (opened with writers denied on Windows) for a
     // loader. `policy` defaults to `always`: every weight is hashed through the very handle
@@ -462,15 +507,17 @@ public:
     // the hash, or off to skip hashing (unchecked). The loader hook: map `weights`, never the
     // record's paths.
     [[nodiscard]] Result<LoadableModel> resolve_for_load(std::string_view name,
-                                                         WeightVerification policy = WeightVerification::always) const;
+                                                         WeightVerification policy = WeightVerification::always,
+                                                         const ResolveOptions& call = {}) const;
 
     // Re-checks a record this store produced before it is used again: every file it was
     // read from (sources and blob stamps) must be unchanged, then the weights are checked
     // per options().verify_weights. Returns false when something changed or disappeared
     // (resolve again), when the record came from another OllamaStore (even one opened on the
-    // same directory: records are tied to the root handle that read them), or when called
-    // from on_weight_hash; on true `record` is current, though it may now be unsupported
-    // (digest_mismatch, blob_busy, hash_limit).
+    // same directory: records are tied to the root handle that read them), when the record
+    // is text_omitted (some of its layers were never read, so it cannot be current), or when
+    // called from on_weight_hash; on true `record` is current, though it may now be
+    // unsupported (digest_mismatch, blob_busy, hash_limit).
     [[nodiscard]] bool revalidate(ModelRecord& record) const;
 
     // Diagnostics: weight hashes (and verify_blobs() hashes of this store's records) running
@@ -482,9 +529,13 @@ public:
 private:
     friend class ModelRegistry;
     OllamaStore(std::filesystem::path root, std::shared_ptr<const StoreAnchor> anchor, StoreOptions options);
+    // scan() with an allowance shared with other scans (ModelRegistry): the small layers it keeps
+    // are charged to `budget`, which it leaves with what is still unspent.
+    [[nodiscard]] ScanResult scan_impl(RetainBudget& budget) const;
     [[nodiscard]] Result<ModelRecord> resolve_impl(std::string_view name, WeightVerification policy,
-                                                   VerifiedWeights* keep) const;
-    [[nodiscard]] bool revalidate_impl(ModelRecord& record, WeightVerification policy, VerifiedWeights* keep) const;
+                                                   VerifiedWeights* keep, const CancellationToken& cancel) const;
+    [[nodiscard]] bool revalidate_impl(ModelRecord& record, WeightVerification policy, VerifiedWeights* keep,
+                                       const CancellationToken& cancel) const;
     // For a cached unsupported record: true while every file it was read from is unchanged,
     // every blob it could not open is still absent and nothing failed transiently (so its
     // reason still holds).
@@ -527,7 +578,12 @@ struct VerifyReport {
 // 1 MiB buffer per call. Each handle denies writers on Windows (a blob another process
 // has open for writing is reported io_error, "open for writing"), and each hash takes one
 // of the root's kMaxConcurrentWeightHashes slots (after on_blob_start returns). Stops after
-// the first cancelled blob. Does not modify the record or the store.
+// the first cancelled blob. Does not modify the record or the store. The limits of the
+// StoreOptions the record's store was opened with apply: a blob larger than
+// max_weight_file_bytes is not hashed (io_error), the whole call may hash for at most
+// weight_hash_timeout (io_error for the blob it stops in and for every later one; the wait
+// for a hash slot counts), and weight_hash_cancel cancels like VerifyOptions::cancel. A record
+// without an anchor uses the defaults.
 VerifyReport verify_blobs(const ModelRecord& record, const VerifyOptions& options = {});
 
 // Stable JSON for a record / a scan (schema kStoreJsonSchema).
@@ -579,21 +635,24 @@ public:
     // only while every file it was read from has the same stamp and every blob it could not
     // open is still absent; otherwise the name is resolved again, so a blob that was
     // repaired, finished downloading or stopped being written is served without refresh().
-    [[nodiscard]] Result<ModelRecord> resolve(std::string_view name) const;
+    [[nodiscard]] Result<ModelRecord> resolve(std::string_view name, const ResolveOptions& call = {}) const;
 
     // resolve(), plus the open weight handles (OllamaStore::resolve_for_load; `policy`
     // defaults to `always`, whatever the registry's StoreOptions say). Ready only.
     [[nodiscard]] Result<LoadableModel> resolve_for_load(std::string_view name,
-                                                         WeightVerification policy = WeightVerification::always) const;
+                                                         WeightVerification policy = WeightVerification::always,
+                                                         const ResolveOptions& call = {}) const;
 
 private:
     [[nodiscard]] Result<ModelRecord> resolve_impl(std::string_view name, WeightVerification policy,
-                                                   VerifiedWeights* keep) const;
-    // Template/system/messages bytes held by records_ and live_ (kept within
-    // options_.limits.max_retained_text_bytes). The caller holds mutex_.
-    [[nodiscard]] std::uint64_t retained_text_bytes() const;
+                                                   VerifiedWeights* keep, const CancellationToken& cancel) const;
     StoreOptions options_;
     mutable std::mutex mutex_;
+    // Bytes of retained small-layer content (config strings and arrays, params, template, system,
+    // messages, runner/format/parent) held by records_ and live_, kept within
+    // options_.limits.max_retained_text_bytes. A running total, updated wherever a record enters,
+    // leaves or is replaced in records_ or live_. Guarded by mutex_.
+    mutable std::uint64_t retained_bytes_ = 0;
     std::vector<OllamaStore> stores_;
     mutable std::vector<std::shared_ptr<const ModelRecord>> records_;
     mutable std::map<std::string, std::shared_ptr<const ModelRecord>> live_;
