@@ -84,7 +84,7 @@ engine.register_backend(sonder::inference::make_llamacpp_backend());
   the core Backend adapter (stop sequences, cancellation) and Engine + Session
   with Observatory telemetry.
 
-Verified on Linux against main `0c0b054` (preset `ci-linux`, GCC, Ninja,
+Historical record from the previous pin (not re-run at the current pin). Verified on Linux against main `0c0b054` (preset `ci-linux`, GCC, Ninja,
 `SONDER_WARNINGS_AS_ERRORS=ON`, `GGML_NATIVE=OFF`, root guard removed
 locally): full suite 108 tests, 107 passed + `sonder.llamacpp.integration`
 skipped (16 llamacpp unit cases among them). Sources also compile warning-free
@@ -164,5 +164,6 @@ manifest value with a STATUS line. `python -I scripts/llamacpp_pin.py verify --t
   (approved 2026-09-26).
 - CI: optional job `llamacpp-windows` (windows-latest, MSVC,
   `SONDER_WITH_LLAMA_CPP=ON`, `GGML_NATIVE=OFF`, `continue-on-error`), with the
-  pinned source tarball cached and passed via `FETCHCONTENT_SOURCE_DIR_LLAMACPP`.
+  pinned source tarball cached and passed as a `file:///` URL through
+  `SONDER_LLAMACPP_URL`, so FetchContent re-checks the manifest SHA-256.
   The default ubuntu/windows jobs keep the option OFF.

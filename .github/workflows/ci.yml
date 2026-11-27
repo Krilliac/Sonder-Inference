@@ -168,9 +168,11 @@ jobs:
       - name: Download llama.cpp tarball
         if: steps.llamacpp-cache.outputs.cache-hit != 'true'
         shell: pwsh
+        env:
+          LLAMACPP_URL: ${{ steps.pin.outputs.url }}
         run: |
           $ErrorActionPreference = 'Stop'
-          Invoke-WebRequest -Uri '${{ steps.pin.outputs.url }}' -OutFile (Join-Path $env:RUNNER_TEMP 'llamacpp.tar.gz')
+          Invoke-WebRequest -Uri $env:LLAMACPP_URL -OutFile (Join-Path $env:RUNNER_TEMP 'llamacpp.tar.gz')
 
       - name: Configure
         shell: pwsh

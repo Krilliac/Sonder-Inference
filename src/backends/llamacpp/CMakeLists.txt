@@ -42,8 +42,8 @@ include(FetchContent)
 # commit, URL, SHA-256). It is the single source of truth; CI, the docs check
 # (scripts/llamacpp_pin.py check) and the test expectations all read it.
 set(SONDER_LLAMACPP_TRACK "mainline" CACHE STRING
-    "llama.cpp pin track from cmake/llamacpp-pin.json (mainline|prism)")
-set_property(CACHE SONDER_LLAMACPP_TRACK PROPERTY STRINGS mainline prism)
+    "llama.cpp pin track from cmake/llamacpp-pin.json (the manifest has only mainline)")
+set_property(CACHE SONDER_LLAMACPP_TRACK PROPERTY STRINGS mainline)
 set(SONDER_LLAMACPP_PIN_FILE "${CMAKE_CURRENT_LIST_DIR}/../../../cmake/llamacpp-pin.json" CACHE FILEPATH
     "Pin manifest to read (override for experiments only)")
 
@@ -84,6 +84,30 @@ endif()
 string(JSON _sonder_llamacpp_m_tag    GET "${_sonder_llamacpp_entry}" tag)
 string(JSON _sonder_llamacpp_m_url    GET "${_sonder_llamacpp_entry}" url)
 string(JSON _sonder_llamacpp_m_sha256 GET "${_sonder_llamacpp_entry}" sha256)
+# expected_features: SONDER_LLAMACPP_* defines that header detection must produce
+# for this track's tarball (checked after detection, see "expected features").
+set(SONDER_LLAMACPP_EXPECTED_FEATURES "")
+string(JSON _sonder_llamacpp_ef_type ERROR_VARIABLE _sonder_llamacpp_err
+       TYPE "${_sonder_llamacpp_entry}" expected_features)
+if(NOT _sonder_llamacpp_err)
+    if(NOT _sonder_llamacpp_ef_type STREQUAL "ARRAY")
+        message(FATAL_ERROR "${SONDER_LLAMACPP_PIN_FILE}: tracks.${SONDER_LLAMACPP_TRACK}."
+                            "expected_features must be an array (got ${_sonder_llamacpp_ef_type})")
+    endif()
+    string(JSON _sonder_llamacpp_ef_len LENGTH "${_sonder_llamacpp_entry}" expected_features)
+    if(_sonder_llamacpp_ef_len GREATER 0)
+        math(EXPR _sonder_llamacpp_ef_last "${_sonder_llamacpp_ef_len} - 1")
+        foreach(_sonder_llamacpp_ef_i RANGE ${_sonder_llamacpp_ef_last})
+            string(JSON _sonder_llamacpp_ef_name GET "${_sonder_llamacpp_entry}"
+                   expected_features ${_sonder_llamacpp_ef_i})
+            if(NOT _sonder_llamacpp_ef_name MATCHES "^SONDER_LLAMACPP_[A-Z0-9_]+$")
+                message(FATAL_ERROR "${SONDER_LLAMACPP_PIN_FILE}: expected_features entry "
+                                    "'${_sonder_llamacpp_ef_name}' is not a SONDER_LLAMACPP_* define name")
+            endif()
+            list(APPEND SONDER_LLAMACPP_EXPECTED_FEATURES "${_sonder_llamacpp_ef_name}")
+        endforeach()
+    endif()
+endif()
 
 # Stale-cache handling. A cached value equal to what an earlier configure applied
 # from the manifest (or to a legacy default) was a default, not an override, and
@@ -370,6 +394,37 @@ endif()
 if(SONDER_LLAMACPP_FEATURE_DEFS)
     message(STATUS "Sonder llamacpp detected features: ${SONDER_LLAMACPP_FEATURE_DEFS}")
 endif()
+
+# --- expected features begin (extracted by scripts/test_llamacpp_pin.py) ---
+# A header-detection regression (an upstream rename, or a detection bug like the
+# NextN move from llama-ext.h to llama.h) would otherwise turn a feature off
+# silently, and the tests that follow the macros would still pass. When the
+# source is the manifest tarball itself (manifest SHA-256, no local source dir),
+# every define the track lists in expected_features must have been detected.
+if(SONDER_LLAMACPP_EXPECTED_FEATURES)
+    if(FETCHCONTENT_SOURCE_DIR_LLAMACPP)
+        message(STATUS "llama.cpp expected_features not enforced: local source dir "
+                       "${FETCHCONTENT_SOURCE_DIR_LLAMACPP}")
+    elseif(NOT SONDER_LLAMACPP_RESOLVED_SHA256 STREQUAL _sonder_llamacpp_m_sha256)
+        message(STATUS "llama.cpp expected_features not enforced: SHA-256 override "
+                       "${SONDER_LLAMACPP_RESOLVED_SHA256}")
+    else()
+        set(_sonder_llamacpp_missing_features "")
+        foreach(_sonder_llamacpp_ef_name IN LISTS SONDER_LLAMACPP_EXPECTED_FEATURES)
+            if(NOT "${_sonder_llamacpp_ef_name}=1" IN_LIST SONDER_LLAMACPP_FEATURE_DEFS)
+                list(APPEND _sonder_llamacpp_missing_features "${_sonder_llamacpp_ef_name}")
+            endif()
+        endforeach()
+        if(_sonder_llamacpp_missing_features)
+            message(FATAL_ERROR "llama.cpp ${SONDER_LLAMACPP_RESOLVED_TAG} (track "
+                                "${SONDER_LLAMACPP_TRACK}): header detection did not produce "
+                                "${_sonder_llamacpp_missing_features}, which "
+                                "${SONDER_LLAMACPP_PIN_FILE} lists in expected_features.")
+        endif()
+        message(STATUS "llama.cpp expected_features present: ${SONDER_LLAMACPP_EXPECTED_FEATURES}")
+    endif()
+endif()
+# --- expected features end ---
 
 add_library(sonder_backend_llamacpp STATIC
     llamacpp_backend.cpp

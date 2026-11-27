@@ -62,7 +62,7 @@ Format-to-runtime matrix:
 - **Mainline `ggml-org/llama.cpp >= b11556`**: adds stock `NVFP4` (Blackwell FP4, type 40), `Q1_0` (1-bit Bonsai-1, type 41), `Q2_0` (2-bit ternary, type 42), and `F8_E4M3` (FP8, type 43).
 - **`PrismML-Eng/llama.cpp` (`prism` branch)**: adds Hadamard-transformed Bonsai-2 ternary formats (`PQ2_0` type 142, `PTQ1_0` type 143, `PQ2_0M` KV-only type 145) and `prism.hadamard.*` GGUF metadata handling.
 
-**RPC server at this pin.** Sonder does not build or start the ggml RPC server (`GGML_RPC` stays off). `v1.0.0` predates upstream `b12658` ("rpc : typed request helpers and a single validation step on the server", #32651), which first ships in `v1.1.0` (the CVE-2026-137567 fix is also only in `v1.1.0` and later). Any `rpc-server` built from this tree (for example for `llama-server --rpc`) must stay on a private link until the pin moves to `v1.1.0` or later.
+**RPC server at this pin.** Sonder does not build or start the ggml RPC server (`GGML_RPC` stays off). `v1.0.0` predates upstream `b12658` ("rpc : typed request helpers and a single validation step on the server", #32651), which first ships in `v1.1.0`. Any `rpc-server` built from this tree (for example for `llama-server --rpc`) must stay on a private link until the pin moves to `v1.1.0` or later.
 
 The `llamaserver` backend can also spawn or attach to an external mainline `>= b11556` or PrismML `llama-server` binary while keeping the core build independent of llama.cpp. Sonder's GGUF header inspection recognizes all of these block layouts for fit estimation, but model execution requires a runtime build whose GGML implementation supports the file's tensor types.
 

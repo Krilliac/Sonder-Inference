@@ -264,6 +264,119 @@ class CMakePinResolutionTests(unittest.TestCase):
         self.assertEqual(self.configure(), ("bB", MIRROR, SHA_B))
 
 
+FEATURES_BEGIN = "# --- expected features begin"
+FEATURES_END = "# --- expected features end ---"
+MTP = "SONDER_LLAMACPP_HAS_MTP"
+F8 = "SONDER_LLAMACPP_HAS_GGML_F8_E4M3"
+# Defines the real pin must keep detecting (MTP was silently lost once when the
+# NextN API moved from src/llama-ext.h to llama.h).
+REQUIRED_DEFAULT_FEATURES = (
+    MTP,
+    "SONDER_LLAMACPP_HAS_NEXTN_LAYER_OFFSET",
+    "SONDER_LLAMACPP_HAS_CTX_OTHER",
+    "SONDER_LLAMACPP_HAS_MOE_CACHE_SIZE",
+    F8,
+)
+
+
+def features_manifest(path: Path, features: object, sha: str = SHA_A) -> None:
+    path.write_text(json.dumps({
+        "schema": 1, "default_track": "mainline",
+        "tracks": {"mainline": {
+            "tag": "bA", "commit": "c" * 40, "sha256": sha,
+            "url": "https://example.invalid/archive/bA.tar.gz",
+            "expected_features": features}},
+    }), encoding="utf-8")
+
+
+class CMakeExpectedFeaturesTests(unittest.TestCase):
+    """Configure a mini project made from the pin-resolution and expected-features
+    blocks of the real CMakeLists; TEST_FEATURE_DEFS stands in for what header
+    detection produced."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if shutil.which("cmake") is None:
+            raise unittest.SkipTest("cmake not available")
+        text = CMAKE_FILE.read_text(encoding="utf-8").replace("\r\n", "\n")
+        a, b = text.index(PIN_BEGIN), text.index(PIN_END)
+        c, d = text.index(FEATURES_BEGIN), text.index(FEATURES_END)
+        assert a < b < c < d, "pin / expected-features markers missing or out of order"
+        cls.pin_block, cls.features_block = text[a:b], text[c:d]
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        (self.tmp / "src").mkdir()
+        (self.tmp / "src" / "CMakeLists.txt").write_text(
+            "cmake_minimum_required(VERSION 3.20)\nproject(features_mini LANGUAGES NONE)\n"
+            "set(SONDER_WITH_LLAMA_CPP ON)\n" + self.pin_block
+            + 'set(SONDER_LLAMACPP_FEATURE_DEFS "${TEST_FEATURE_DEFS}")\n'
+            + self.features_block, encoding="utf-8")
+        self.manifest = self.tmp / "pin.json"
+        self.build = self.tmp / "build"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def configure(self, defs: list[str], *extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["cmake", "-S", str(self.tmp / "src"), "-B", str(self.build),
+             f"-DSONDER_LLAMACPP_PIN_FILE={self.manifest.as_posix()}",
+             "-DTEST_FEATURE_DEFS=" + ";".join(f"{x}=1" for x in defs), *extra],
+            capture_output=True, text=True, timeout=120)
+
+    def test_all_expected_detected_passes(self) -> None:
+        features_manifest(self.manifest, [MTP, F8])
+        r = self.configure([MTP, F8, "SONDER_LLAMACPP_HAS_KV_UNIFIED"])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("expected_features present", r.stdout)
+
+    def test_missing_expected_feature_fails_configure(self) -> None:
+        features_manifest(self.manifest, [MTP, F8])
+        r = self.configure([F8])
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(MTP, r.stderr)
+        self.assertNotIn(f"produce {F8}", r.stderr)
+
+    def test_prefix_of_a_define_does_not_count(self) -> None:
+        features_manifest(self.manifest, ["SONDER_LLAMACPP_HAS_MT"])
+        r = self.configure([MTP])
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_empty_or_absent_list_is_not_enforced(self) -> None:
+        features_manifest(self.manifest, [])
+        self.assertEqual(self.configure([]).returncode, 0)
+        pin_manifest(self.manifest, "bA", SHA_A)
+        r = self.configure([])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_sha_override_is_not_enforced(self) -> None:
+        features_manifest(self.manifest, [MTP])
+        r = self.configure([], "-DSONDER_LLAMACPP_TAG=bB", f"-DSONDER_LLAMACPP_SHA256={SHA_B}")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("not enforced: SHA-256 override", r.stdout)
+
+    def test_local_source_dir_is_not_enforced(self) -> None:
+        features_manifest(self.manifest, [MTP])
+        r = self.configure([], f"-DFETCHCONTENT_SOURCE_DIR_LLAMACPP={self.tmp.as_posix()}")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("not enforced: local source dir", r.stdout)
+
+    def test_malformed_entries_fail_configure(self) -> None:
+        for bad in (["HAS_MTP"], ["SONDER_LLAMACPP_HAS_MTP=1"], "SONDER_LLAMACPP_HAS_MTP"):
+            with self.subTest(bad=bad):
+                shutil.rmtree(self.build, ignore_errors=True)
+                features_manifest(self.manifest, bad)
+                r = self.configure([MTP])
+                self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_default_manifest_requires_mtp_and_friends(self) -> None:
+        _, entry = pin.load_entry(pin.DEFAULT_MANIFEST, None)
+        for name in REQUIRED_DEFAULT_FEATURES:
+            self.assertIn(name, entry.get("expected_features", []))
+
+
 class HashTests(unittest.TestCase):
     def test_hash_file(self) -> None:
         with tempfile.TemporaryDirectory() as d:
