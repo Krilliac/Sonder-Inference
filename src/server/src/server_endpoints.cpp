@@ -906,6 +906,7 @@ json::Object build_discovery_document(const ServerOptions& opts, const LiveTelem
         {"resume", json::Object{{"header", "Last-Event-ID"},
                                 {"query", "last_event_id"},
                                 {"retained_events", hs.retained},
+                                {"retained_sample_events", hs.sample_retained},
                                 {"oldest_sequence", hs.oldest_sequence},
                                 {"next_sequence", hs.next_sequence}}},
         {"auth", json::Object{{"required", !opts.token.empty()}, {"schemes", json::Array{"bearer"}}}},

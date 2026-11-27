@@ -404,8 +404,18 @@ itself is Observatory's (`protocol/producer-discovery.schema.json`,
     the open question recorded here earlier), a malformed id, or no id:
     replay the whole retained window, then live.
   - `?since=now`: live only.
+- Retention classes: periodic `*.sample` events (`device.memory.sample`,
+  `backend.metrics.sample`, `backend.gpu_memory.sample`) are kept apart from
+  lifecycle events. The lifecycle ring holds the last `--telemetry-buffer`
+  non-sample events, so samples never evict `backend.registered`, `session.*`,
+  `model.*`, `request.*`, `kv.*` or `scheduler.*`. Samples keep the latest
+  event per (event type, device or backend) plus a short history of
+  `telemetry-buffer / 16` events. A replay merges both classes in sequence
+  order; `resume-gap` reports only evicted lifecycle events (older samples are
+  intentionally dropped), and `retained_events` / `oldest_sequence` describe
+  the lifecycle ring (`retained_sample_events` counts the samples kept).
 - Backpressure: the server keeps a ring of the last `--telemetry-buffer`
-  events (default 8192) and a bounded queue per subscriber (at most 8
+  lifecycle events (default 8192) and a bounded queue per subscriber (at most 8
   subscribers; the ninth gets 429). A subscriber that falls behind loses its
   oldest undelivered events. That loss is visible as a sequence gap, is
   announced to that subscriber only (SSE comment `: dropped <n>`), and is

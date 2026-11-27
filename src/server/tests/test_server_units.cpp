@@ -450,6 +450,78 @@ TEST_CASE("hub: recovers the sequence when fed through write()") {
     CHECK(hub.stats().next_sequence == 42);
 }
 
+TEST_CASE("hub: a sample flood never evicts lifecycle events") {
+    const auto ev = [](std::uint64_t seq, const char* type, const char* device) {
+        return "{\"sequence\":" + std::to_string(seq) + ",\"event_type\":\"" + type + "\",\"device_id\":\"" + device +
+               "\"}";
+    };
+    LiveTelemetryHub hub(8, 2, 64, 4);
+    hub.set_instance_id("tel-abc");
+    std::uint64_t seq = 0;
+    hub.write_event(seq, ev(seq, "backend.registered", "")), ++seq;
+    hub.write_event(seq, ev(seq, "request.started", "")), ++seq;
+    hub.write_event(seq, ev(seq, "device.memory.sample", "cpu0")), ++seq;
+    hub.write_event(seq, ev(seq, "device.memory.sample", "gpu1")), ++seq;
+    for (int i = 0; i < 500; ++i) {
+        hub.write_event(seq, ev(seq, "device.memory.sample", "cpu0")), ++seq;
+        hub.write_event(seq, ev(seq, "backend.metrics.sample", "")), ++seq;
+    }
+    const std::uint64_t last = seq - 1;
+
+    const HubStats st = hub.stats();
+    CHECK(st.retained == 2);  // both lifecycle events survive
+    CHECK(st.oldest_sequence == std::optional<std::uint64_t>(0));
+    CHECK(st.sample_retained <= 4 + 3);  // history plus at most one latest per key
+    CHECK(st.next_sequence == seq);
+
+    const auto sequences = [](const Subscription::Batch& b) {
+        std::vector<std::uint64_t> out;
+        for (const auto& e : b.events) out.push_back(e->sequence);
+        return out;
+    };
+    const auto replayed = [&](const ResumeRequest& r, std::string* gap) {
+        auto s = hub.subscribe(r);
+        REQUIRE(s.subscription);
+        if (gap != nullptr) *gap = s.gap_comment;
+        auto out = sequences(s.subscription->next(std::chrono::milliseconds(0), nullptr));
+        hub.unsubscribe(s.subscription);
+        return out;
+    };
+
+    // Full replay: lifecycle events and the latest sample per key (gpu1 is
+    // long past the history but still the latest for its key), strictly ascending.
+    const auto all = replayed(ResumeRequest{}, nullptr);
+    REQUIRE(all.size() >= 5);
+    CHECK(all[0] == 0);
+    CHECK(all[1] == 1);
+    CHECK(all[2] == 3);  // latest gpu1 memory sample
+    CHECK(all.back() == last);
+    for (std::size_t i = 1; i < all.size(); ++i) CHECK(all[i - 1] < all[i]);
+
+    // Resuming after the lifecycle events: no gap, only retained samples after the id.
+    ResumeRequest r;
+    r.last_event_id = "tel-abc-1";
+    std::string gap;
+    const auto after = replayed(r, &gap);
+    CHECK(gap.empty());
+    CHECK(after.front() == 3);
+    CHECK(after.back() == last);
+
+    // Caught up: nothing.
+    r.last_event_id = "tel-abc-" + std::to_string(last);
+    CHECK(replayed(r, &gap).empty());
+    CHECK(gap.empty());
+
+    // Lifecycle overflow still reports a gap and keeps the newest lifecycle window.
+    for (int i = 0; i < 10; ++i) {
+        hub.write_event(seq, ev(seq, "request.completed", "")), ++seq;
+    }
+    CHECK(hub.stats().retained == 8);
+    r.last_event_id = "tel-abc-1";
+    replayed(r, &gap);
+    CHECK_FALSE(gap.empty());
+}
+
 TEST_CASE("backend setup: env defaults and factory") {
     const auto env = backend_env_defaults([](const char* name) -> std::optional<std::string> {
         const std::string n = name;

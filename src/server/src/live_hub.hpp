@@ -19,6 +19,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "sonder/inference/telemetry.hpp"
@@ -69,16 +70,24 @@ struct ResumeRequest {
 
 struct HubStats {
     std::size_t subscribers = 0;
-    std::size_t retained = 0;
-    std::size_t capacity = 0;
-    std::optional<std::uint64_t> oldest_sequence;
+    std::size_t retained = 0;         // lifecycle ring size (the resume window)
+    std::size_t capacity = 0;         // lifecycle ring budget
+    std::size_t sample_retained = 0;  // distinct sample events kept (history plus latest-per-key)
+    std::size_t sample_capacity = 0;  // sample history budget
+    std::optional<std::uint64_t> oldest_sequence;  // oldest lifecycle event in the ring
     std::uint64_t next_sequence = 0;
     std::uint64_t subscriber_dropped_events = 0;
 };
 
 class LiveTelemetryHub final : public TelemetrySink {
 public:
-    LiveTelemetryHub(std::size_t capacity, std::size_t max_subscribers, std::size_t subscriber_queue);
+    // `capacity` is the lifecycle budget (everything except `*.sample`
+    // events). Periodic `*.sample` events are retained separately: the latest
+    // per (event type, device/backend) plus a short history of
+    // `sample_history` events (0 = max(1, capacity / 16)), so a sample flood
+    // can never evict lifecycle events.
+    LiveTelemetryHub(std::size_t capacity, std::size_t max_subscribers, std::size_t subscriber_queue,
+                     std::size_t sample_history = 0);
 
     // The bus instance id (event_id prefix); set once the engine exists.
     void set_instance_id(std::string instance_id);
@@ -113,9 +122,18 @@ private:
     const std::size_t max_subscribers_;
     const std::size_t subscriber_queue_;
 
+    // Every retained event in sequence order (mutex_ held).
+    [[nodiscard]] std::vector<HubEventPtr> collect_locked() const;
+    [[nodiscard]] std::size_t sample_retained_locked() const;
+
+    const std::size_t sample_capacity_;
+
     mutable std::mutex mutex_;
     std::string instance_id_;
-    std::deque<HubEventPtr> ring_;
+    std::deque<HubEventPtr> ring_;  // lifecycle events
+    std::deque<HubEventPtr> sample_history_;
+    std::unordered_map<std::string, HubEventPtr> sample_latest_;
+    std::uint64_t lifecycle_floor_ = 0;  // sequence after the newest evicted lifecycle event
     std::uint64_t next_sequence_ = 0;
     std::vector<std::shared_ptr<Subscription>> subscribers_;
     std::uint64_t departed_dropped_ = 0;  // drops of subscribers already gone

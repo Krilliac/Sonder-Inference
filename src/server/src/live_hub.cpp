@@ -62,10 +62,75 @@ std::uint64_t Subscription::dropped_total() const {
 
 // -------------------------------------------------------- LiveTelemetryHub
 
-LiveTelemetryHub::LiveTelemetryHub(std::size_t capacity, std::size_t max_subscribers, std::size_t subscriber_queue)
+namespace {
+constexpr std::size_t kMaxSampleKeys = 64;
+
+// Raw (still escaped) string value of the first `"<key>":"` in a serialized
+// envelope; empty when absent. A raw quote cannot occur inside a JSON string,
+// so the first match is a key.
+std::string_view raw_string_field(std::string_view line, std::string_view key) {
+    const std::string needle = "\"" + std::string(key) + "\":\"";
+    const std::size_t at = line.find(needle);
+    if (at == std::string_view::npos) {
+        return {};
+    }
+    const std::size_t begin = at + needle.size();
+    std::size_t end = begin;
+    while (end < line.size() && line[end] != '"') {
+        end += (line[end] == '\\' && end + 1 < line.size()) ? 2 : 1;
+    }
+    return line.substr(begin, std::min(end, line.size()) - begin);
+}
+
+// Retention key for a periodic sample event, or nullopt for lifecycle events.
+std::optional<std::string> sample_key(std::string_view line) {
+    const std::string_view type = raw_string_field(line, "event_type");
+    constexpr std::string_view suffix = ".sample";
+    if (type.size() <= suffix.size() || type.substr(type.size() - suffix.size()) != suffix) {
+        return std::nullopt;
+    }
+    std::string key(type);
+    key += '|';
+    key += raw_string_field(line, "device_id");
+    key += '|';
+    key += raw_string_field(line, "backend");
+    return key;
+}
+}  // namespace
+
+LiveTelemetryHub::LiveTelemetryHub(std::size_t capacity, std::size_t max_subscribers, std::size_t subscriber_queue,
+                                   std::size_t sample_history)
     : capacity_(capacity == 0 ? 1 : capacity),
       max_subscribers_(max_subscribers),
-      subscriber_queue_(subscriber_queue == 0 ? (capacity == 0 ? 1 : capacity) : subscriber_queue) {}
+      subscriber_queue_(subscriber_queue == 0 ? (capacity == 0 ? 1 : capacity) : subscriber_queue),
+      sample_capacity_(sample_history != 0 ? sample_history
+                                           : std::max<std::size_t>(1, (capacity == 0 ? 1 : capacity) / 16)) {}
+
+std::vector<HubEventPtr> LiveTelemetryHub::collect_locked() const {
+    std::vector<HubEventPtr> all;
+    all.reserve(ring_.size() + sample_history_.size() + sample_latest_.size());
+    all.insert(all.end(), ring_.begin(), ring_.end());
+    all.insert(all.end(), sample_history_.begin(), sample_history_.end());
+    for (const auto& kv : sample_latest_) {
+        all.push_back(kv.second);
+    }
+    std::sort(all.begin(), all.end(),
+              [](const HubEventPtr& a, const HubEventPtr& b) { return a->sequence < b->sequence; });
+    all.erase(std::unique(all.begin(), all.end(),
+                          [](const HubEventPtr& a, const HubEventPtr& b) { return a->sequence == b->sequence; }),
+              all.end());
+    return all;
+}
+
+std::size_t LiveTelemetryHub::sample_retained_locked() const {
+    std::size_t n = sample_history_.size();
+    for (const auto& kv : sample_latest_) {
+        if (sample_history_.empty() || kv.second->sequence < sample_history_.front()->sequence) {
+            ++n;
+        }
+    }
+    return n;
+}
 
 void LiveTelemetryHub::set_instance_id(std::string instance_id) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -96,9 +161,32 @@ void LiveTelemetryHub::write_event(std::uint64_t sequence, std::string_view json
     if (closed_) {
         return;
     }
-    ring_.push_back(event);
-    while (ring_.size() > capacity_) {
-        ring_.pop_front();
+    if (auto key = sample_key(event->line)) {
+        sample_history_.push_back(event);
+        while (sample_history_.size() > sample_capacity_) {
+            sample_history_.pop_front();
+        }
+        const auto it = sample_latest_.find(*key);
+        if (it != sample_latest_.end()) {
+            it->second = event;
+        } else {
+            if (sample_latest_.size() >= kMaxSampleKeys) {
+                auto oldest = sample_latest_.begin();
+                for (auto cur = sample_latest_.begin(); cur != sample_latest_.end(); ++cur) {
+                    if (cur->second->sequence < oldest->second->sequence) {
+                        oldest = cur;
+                    }
+                }
+                sample_latest_.erase(oldest);
+            }
+            sample_latest_.emplace(std::move(*key), event);
+        }
+    } else {
+        ring_.push_back(event);
+        while (ring_.size() > capacity_) {
+            lifecycle_floor_ = std::max(lifecycle_floor_, ring_.front()->sequence + 1);
+            ring_.pop_front();
+        }
     }
     next_sequence_ = std::max(next_sequence_, sequence + 1);
     for (const auto& sub : subscribers_) {
@@ -139,28 +227,33 @@ LiveTelemetryHub::Subscribed LiveTelemetryHub::subscribe(const ResumeRequest& re
     }
     auto sub = std::make_shared<Subscription>(subscriber_queue_);
 
-    // Choose where the replay starts (index into ring_).
+    // Replay = lifecycle ring plus retained samples, in sequence order.
+    const std::vector<HubEventPtr> replay = collect_locked();
     std::size_t start = 0;
     if (resume.since_now) {
-        start = ring_.size();
+        start = replay.size();
     } else if (resume.last_event_id) {
         std::string instance;
         std::uint64_t seq = 0;
-        if (parse_event_id(*resume.last_event_id, instance, seq) && instance == instance_id_ && !ring_.empty()) {
-            const std::uint64_t oldest = ring_.front()->sequence;
-            if (seq + 1 >= oldest) {
-                // Resume right after the last seen event (nothing when caught up).
-                start = static_cast<std::size_t>(std::min<std::uint64_t>(seq + 1 - oldest, ring_.size()));
+        if (parse_event_id(*resume.last_event_id, instance, seq) && instance == instance_id_ && !replay.empty()) {
+            if (seq + 1 < lifecycle_floor_) {
+                // Lifecycle events after the id were evicted: announce the gap,
+                // then replay everything retained.
+                out.gap_comment =
+                    ": resume-gap " + std::to_string(seq + 1) + "-" + std::to_string(lifecycle_floor_ - 1);
             } else {
-                // Older than the window: announce the gap, then the whole window.
-                out.gap_comment = ": resume-gap " + std::to_string(seq + 1) + "-" + std::to_string(oldest - 1);
+                // Resume right after the last seen event (nothing when caught up).
+                start = static_cast<std::size_t>(
+                    std::partition_point(replay.begin(), replay.end(),
+                                         [seq](const HubEventPtr& e) { return e->sequence <= seq; }) -
+                    replay.begin());
             }
         }
         // Unknown or different instance (producer restarted), malformed id,
-        // or an empty ring: replay the whole retained window.
+        // or nothing retained: replay the whole retained window.
     }
-    for (std::size_t i = start; i < ring_.size(); ++i) {
-        sub->push(ring_[i]);
+    for (std::size_t i = start; i < replay.size(); ++i) {
+        sub->push(replay[i]);
     }
     subscribers_.push_back(sub);
     out.subscription = std::move(sub);
@@ -190,6 +283,8 @@ HubStats LiveTelemetryHub::stats() const {
     s.subscribers = subscribers_.size();
     s.retained = ring_.size();
     s.capacity = capacity_;
+    s.sample_capacity = sample_capacity_;
+    s.sample_retained = sample_retained_locked();
     if (!ring_.empty()) {
         s.oldest_sequence = ring_.front()->sequence;
     }
