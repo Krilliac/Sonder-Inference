@@ -829,7 +829,9 @@ TEST_CASE("endpoint: only the Ollama Cloud origin gets the key unless allow_cust
     }
     // The opt-in is visible in the redacted config.
     auto o = options_with(fake_with_tags());
-    const json::Value* flag = redacted_config(o).find("allow_custom_endpoint");
+    // Keep the config alive: find() returns a pointer into it.
+    const json::Object config = redacted_config(o);
+    const json::Value* flag = config.find("allow_custom_endpoint");
     REQUIRE(flag != nullptr);
     CHECK_FALSE(flag->as_bool());
 }
