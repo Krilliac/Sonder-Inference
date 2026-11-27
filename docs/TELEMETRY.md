@@ -340,7 +340,7 @@ recorded (a sink is attached and the level is `standard` or `deep`) and
 
 | Event | Level | Attributes |
 | --- | --- | --- |
-| `inference.sampling.candidates` | standard | per backend-sampled token with a reported probability and at least one alternative, bounded per request (below): `index` int (the `inference.token.generated` `index` of the same token), `sampled_token_id` int, `probability_basis` str (`post_sampling` / `pre_sampling`), `candidates` arr of `{token_id` int, `probability` num, optional `text` str (only with `capture_text`)`}`, most probable first, at most `token_probability_top_k` entries. Alternatives without a token id are left out |
+| `inference.sampling.candidates` | standard | per backend-sampled token with a reported probability and at least one alternative, bounded per request (below): `index` int (the `inference.token.generated` `index` of the same token), `sampled_token_id` int, `probability_basis` str (`post_sampling` / `pre_sampling`), `candidates` arr of `{token_id` int, `probability` num, optional `text` str (only when the [text capture policy](#text-capture-policy) is `on` or `full` for the request)`}`, most probable first, at most `token_probability_top_k` entries. Alternatives without a token id are left out |
 
 Volume bounds (`TelemetryOptions`): `token_candidates_stride` (default 1;
 emit for every n-th probability-bearing token of the request, counting from
@@ -464,10 +464,12 @@ The declared policy has three values:
 - **Bounds**: `prompt` holds at most 64 KiB (cut on a UTF-8 boundary);
   `prompt_truncated` says whether it was cut. For chat requests the prompt is
   the flattened conversation text.
-- **Not in this tree yet**: `inference.sampling.candidates` is not emitted in
-  this codebase today, and `src/sessions` has no local-only or sensitive
-  request flag today. Both are left out here; if either is added later, it must
-  honor `TextCapturePolicy` and force `off` for sensitive requests.
+- **Candidates**: the optional `text` of each `inference.sampling.candidates`
+  entry follows the same policy as `inference.token.generated` (`on` or `full`,
+  and never for a request that sent `X-Sonder-No-Capture`).
+- **Not in this tree yet**: `src/sessions` has no local-only or sensitive
+  request flag today. If one is added later, it must force `off` for that
+  request.
 
 ## Observatory change requests (Observatory `docs/telemetry-schema.md` @ f5e3ff5)
 

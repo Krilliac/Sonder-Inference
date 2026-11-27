@@ -4,8 +4,8 @@
 // declared values:
 //
 //   off   (default) no prompt or generated text in any event;
-//   on    generated output text in `inference.token.generated` (and in any
-//         future `inference.sampling.candidates` event) `text` fields;
+//   on    generated output text in the `text` fields of
+//         `inference.token.generated` and `inference.sampling.candidates`;
 //   full  `on`, plus the prompt text in `request.started`.
 //
 // The configured policy is declared in `engine.started`, `session.created`
