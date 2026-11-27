@@ -364,6 +364,10 @@ void Supervisor::monitor() {
                             if (Clock::now() >= next_sample && !shutdown_.cancelled() && child->running()) {
                                 observe(*child);
                                 next_sample = Clock::now() + options_.spill_guard.sample_interval;
+                                // A device fault is fatal for this child even if it
+                                // is still answering; stop and mark the device.
+                                if (log_diagnostics_.device_fault())
+                                    break;
                             }
                             if (options_.native_completion && metrics_now() >= next_metrics &&
                                 !shutdown_.cancelled() && child->running()) {
@@ -426,6 +430,13 @@ void Supervisor::monitor() {
                         state_ = State::backoff;
                     }
                     child->stop(options_.shutdown_timeout);
+                    // The child is gone; its last log lines may name a device
+                    // fault. Relaunching into a lost device only crash-loops
+                    // (and a hung dock GPU can wedge the host), so stop here.
+                    if (!shutdown_.cancelled() && drain_device_fault()) {
+                        fail_device_unhealthy();
+                        return;
+                    }
                 }
             }
             if (shutdown_.cancelled())
@@ -721,6 +732,33 @@ json::Object Supervisor::child_runtime_status() const {
     return result;
 }
 
+bool Supervisor::drain_device_fault() {
+    if (log_tail_) {
+        // Bounded per poll; a few polls cover a child that logged a burst while dying.
+        for (int i = 0; i < 8; ++i) {
+            const auto before = log_diagnostics_.lines();
+            if (!log_tail_->poll(log_diagnostics_).ok() || log_diagnostics_.lines() == before)
+                break;
+        }
+        log_diagnostics_.finish();
+    }
+    publish_diagnostics();
+    return log_diagnostics_.device_fault().has_value();
+}
+
+void Supervisor::fail_device_unhealthy() {
+    const auto &fault = *log_diagnostics_.device_fault();
+    json::Object attrs{{"backend", fault.backend}, {"reason", fault.reason}, {"device", fault.device},
+                       {"description", fault.description}};
+    runtime_events_->push("backend.device_unhealthy", std::move(attrs));
+    if (options_.warmup)
+        options_.warmup->stop();
+    fail(Status(ErrorCode::unavailable,
+                "llamaserver: device_unhealthy: " + fault.backend + " " + fault.reason +
+                    (fault.device.empty() ? std::string() : " on " + fault.device) +
+                    "; the device is not scheduled again until it is recovered and the runtime restarted"));
+}
+
 void Supervisor::publish_diagnostics() {
     const auto &warnings = log_diagnostics_.warnings();
     if (!diagnostics_warning_sent_) {
@@ -737,6 +775,17 @@ void Supervisor::publish_diagnostics() {
     std::lock_guard lock(mutex_);
     log_warnings_ = warnings;
     diagnostics_status_ = json::Object{{"offload", log_diagnostics_.offload_status()}};
+    if (const auto &fault = log_diagnostics_.device_fault()) {
+        json::Array details;
+        for (const auto &line : fault->details)
+            details.emplace_back(line);
+        diagnostics_status_->set("device", json::Object{{"status", "unhealthy"},
+                                                        {"backend", fault->backend},
+                                                        {"reason", fault->reason},
+                                                        {"device", fault->device},
+                                                        {"description", fault->description},
+                                                        {"details", std::move(details)}});
+    }
 }
 
 bool Supervisor::sample_child(net::HttpRequest endpoint) {

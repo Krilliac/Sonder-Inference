@@ -357,6 +357,7 @@ void LogDiagnostics::reset() {
     keys_.clear();
     mtp_bytes_ = 0;
     offload_.reset();
+    fault_.reset();
     if (ready_ && diagnostics_blind_) {
         add(BackendWarning{"diagnostics_blind", "warning", "config",
                            "llama-server log verbosity is below 4; offload diagnostics cannot be observed", {}, 1},
@@ -443,8 +444,85 @@ BackendWarning *LogDiagnostics::add(BackendWarning warning, std::string key) {
     return &warnings_.back();
 }
 
+namespace {
+
+std::string bounded(std::string_view text, std::size_t cap) {
+    while (!text.empty() && (text.front() == ' ' || text.front() == '\t'))
+        text.remove_prefix(1);
+    while (!text.empty() && (text.back() == ' ' || text.back() == '\t' || text.back() == '\r'))
+        text.remove_suffix(1);
+    return std::string(text.substr(0, cap));
+}
+
+bool has(std::string_view text, std::string_view needle) { return text.find(needle) != std::string_view::npos; }
+
+} // namespace
+
+// Fatal accelerator faults. Runs before the warning matchers and never
+// consumes the line, so the existing warnings keep their shape.
+void LogDiagnostics::note_fault(std::string_view text) {
+    // Continuation lines of ggml_vk_print_device_fault_info.
+    if (fault_ && fault_->details.size() < kMaxFaultDetails) {
+        const auto trimmed = bounded(text, kMaxFaultText);
+        if (trimmed.rfind("address fault ", 0) == 0 || trimmed.rfind("vendor fault ", 0) == 0)
+            fault_->details.push_back(trimmed);
+    }
+
+    std::string backend, reason, device, description;
+    static constexpr std::string_view kVkFault = "ggml_vulkan: device fault on ";
+    if (const auto at = text.find(kVkFault); at != std::string_view::npos) {
+        backend = "vulkan";
+        reason = "device_fault";
+        const auto rest = text.substr(at + kVkFault.size());
+        const auto colon = rest.find(": ");
+        device = bounded(rest.substr(0, colon), kMaxFaultText);
+        if (colon != std::string_view::npos)
+            description = bounded(rest.substr(colon + 2), kMaxFaultText);
+    } else if (has(text, "VK_ERROR_DEVICE_LOST")) {
+        backend = "vulkan";
+        reason = "device_lost";
+    } else if (has(text, "CUDA error") || has(text, "HIP error") || has(text, "ROCm error")) {
+        static constexpr std::string_view kFatal[] = {
+            "unspecified launch failure", "illegal memory access", "device-side assert",
+            "launch timed out",           "illegal instruction",    "uncorrectable ECC",
+            "misaligned address",         "hardware stack error",   "device kernel image is invalid"};
+        for (const auto phrase : kFatal) {
+            if (has(text, phrase)) {
+                backend = has(text, "HIP error") || has(text, "ROCm error") ? "rocm" : "cuda";
+                reason = "fatal_error";
+                description = bounded(text, kMaxFaultText);
+                break;
+            }
+        }
+    }
+    if (backend.empty())
+        return;
+    if (!fault_) {
+        fault_ = DeviceFault{backend, reason, device, description, {}};
+    } else if (fault_->backend == backend) {
+        if (fault_->device.empty())
+            fault_->device = device;
+        if (fault_->description.empty())
+            fault_->description = description;
+    }
+    // VK_ERROR_DEVICE_LOST keeps its existing vulkan_runtime_error warning.
+    if (reason == "device_lost")
+        return;
+    if (auto *existing = find("device_fault", backend)) {
+        ++existing->count;
+        return;
+    }
+    add(BackendWarning{"device_fault", "warning", "log",
+                       "accelerator fault (" + (device.empty() ? backend : device) + "): " +
+                           (description.empty() ? reason : description) +
+                           "; the device is marked unhealthy and is not scheduled again until the host recovers it",
+                       {{"backend", backend}, {"reason", reason}}, 1},
+        backend);
+}
+
 void LogDiagnostics::line(std::string_view text) {
     ++lines_;
+    note_fault(text);
     const auto bump = [&](std::string_view code, const std::string &key, auto make) {
         if (auto *existing = find(code, key)) {
             ++existing->count;

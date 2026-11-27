@@ -168,6 +168,7 @@ When `log_file` (or `--log-file` in `args`) is enabled on a spawned `llamaserver
 | `gpu_oom` | `cuda error: out of memory`, `OutOfDeviceMemoryError`, `VK_ERROR_OUT_OF_DEVICE_MEMORY`, `hipErrorOutOfMemory`, `hipErrorMemoryAllocation`, or vendor-qualified `out of memory` | `backend`: `"cuda"`, `"rocm"`, or `"vulkan"` |
 | `rocm_runtime_error` | `HSA_STATUS_ERROR`, `hipError` (non-OOM) | `backend: "rocm"` |
 | `vulkan_runtime_error` | `failed to initialize Vulkan` (`reason: "init_failed"`), `VK_ERROR_DEVICE_LOST` (`reason: "device_lost"`) | `backend: "vulkan"` |
+| `device_fault` | `ggml_vulkan: device fault on <device>: <text>` (VK_EXT_device_fault, `reason: "device_fault"`), fatal CUDA/HIP errors such as `unspecified launch failure` or `illegal memory access` (`reason: "fatal_error"`) | `backend`: `"vulkan"`, `"cuda"`, or `"rocm"`. Together with `VK_ERROR_DEVICE_LOST` this marks the device unhealthy: the supervisor stops, does not relaunch, and reports `diagnostics.device`. See `docs/runbooks/node1-oculink-gpu-hang.md` |
 | `ternary_runtime_incompatible` | `unknown tensor type`, `unsupported ggml type`, `unsupported tensor type`, or error-qualified `prism.hadamard` | Recommends PrismML binary or `llama.cpp >= b11556` |
 | `kv_type_mismatch`, `kv_type_no_vector_kernel`, `kv_type_kernel_unknown` | Up-front KV cache pairing check (`check_kv_cache_pairing`) | Backend-aware messaging for `cuda`, `rocm`, and `vulkan` |
 
