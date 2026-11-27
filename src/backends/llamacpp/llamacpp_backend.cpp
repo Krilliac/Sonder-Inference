@@ -474,6 +474,20 @@ bool TryApplyGrammar(llama_sampler* grammar, llama_token_data_array* cur_p) noex
     }
 }
 
+// Accepts one grammar_prefill token. llama_grammar_accept_impl aborts the process (GGML_ABORT, not
+// catchable) when handed an end-of-generation token while the grammar stack is non-empty, so the
+// token is first applied to a single-candidate array exactly as SampleTokenAt does and accepted
+// only if the grammar leaves its logit finite. Out-of-range ids and EOG tokens the grammar masks
+// are rejected, which makes the caller rebuild the grammar without prefill.
+bool TryAcceptPrefillToken(llama_sampler* grammar, llama_token tok, int32_t n_vocab) noexcept {
+    if (tok < 0 || tok >= n_vocab) return false;
+    llama_token_data single{tok, 1.0F, 0.0F};
+    llama_token_data_array single_arr{&single, 1, -1, false};
+    if (!TryApplyGrammar(grammar, &single_arr)) return false;
+    if (!std::isfinite(single.logit)) return false;
+    return TryAcceptGrammar(grammar, tok);
+}
+
 // Order follows llama.cpp's common sampler: logit bias, penalties, then selector
 // (greedy or top-k/typical/top-p/min-p/temp/dist). An optional GBNF grammar is
 // returned separately so Generate() can apply fast grammar-based rejection
@@ -548,7 +562,7 @@ Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n
             // prefill (a failed accept leaves the grammar with no stacks, so it cannot be reused).
             const auto outcome = sonder::backends::llamacpp::PrefillGrammarWithRetry(
                 std::span<const std::int32_t>(p.grammar_prefill.data(), p.grammar_prefill.size()),
-                [&](std::int32_t t) { return t >= 0 && t < n_vocab && TryAcceptGrammar(grammar_out.get(), t); },
+                [&](std::int32_t t) { return TryAcceptPrefillToken(grammar_out.get(), t, n_vocab); },
                 [&]() {
                     grammar_out.reset(llama_sampler_init_grammar(vocab, p.grammar.c_str(), "root"));
                     return grammar_out != nullptr;
@@ -559,7 +573,8 @@ Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n
                 });
             if (outcome == sonder::backends::llamacpp::GrammarRetryOutcome::kFailed) {
                 grammar_out.reset();
-                return Status::Error(ErrorCode::kInvalidArgument, "grammar prefill failed and the grammar could not be rebuilt");
+                return Status::Error(ErrorCode::kInvalidArgument,
+                                     "grammar prefill failed and the grammar could not be rebuilt");
             }
         }
     }
@@ -4589,44 +4604,16 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         std::size_t n_accepted = 0;
         const std::span<const std::vector<double>> no_proposal_dists{};
         const Clock::time_point spec_samp_start = stage_prof ? Clock::now() : Clock::time_point{};
-        // With a grammar active, snapshot the grammar, sampler chain and verify RNG so a grammar
-        // accept failure can be retried as a plain single-token step (the failed grammar has no
-        // stacks and the sampler history already saw the failed step's tokens).
-        SamplerPtr snap_grammar;
-        SamplerPtr snap_sampler;
-        std::mt19937_64 snap_rng;
-        const bool grammar_active = grammar_sampler != nullptr;
-        if (grammar_active && k > 0) {
-            snap_grammar.reset(llama_sampler_clone(grammar_sampler.get()));
-            snap_sampler.reset(llama_sampler_clone(sampler.get()));
-            snap_rng = verify_rng;
-        }
-        const auto spec_outcome = sonder::backends::llamacpp::VerifyWithNonSpeculativeRetry(
-            grammar_active && snap_grammar != nullptr && snap_sampler != nullptr, k,
-            [&](bool speculative) {
-                if (speculative) {
-                    return VerifySpeculativeBatch(draft_tokens, no_proposal_dists, request.sampling, sampler.get(),
-                                                  grammar_sampler.get(), target_gpu_sampled, n_vocab, verify_rng,
-                                                  accepted_tokens, accepted_lps, n_accepted, result);
-                }
-                // The batch holds logits for cur_tok at index 0, so an empty draft samples the
-                // next token exactly as the non-speculative path would; the rejected-tail
-                // rollback below trims the draft KV (keep_drafts stays 0).
-                return VerifySpeculativeBatch(std::span<const Token>{}, no_proposal_dists, request.sampling,
-                                              sampler.get(), grammar_sampler.get(), target_gpu_sampled, n_vocab,
-                                              verify_rng, accepted_tokens, accepted_lps, n_accepted, result);
-            },
-            [&]() {
-                grammar_sampler = std::move(snap_grammar);
-                sampler = std::move(snap_sampler);
-                verify_rng = snap_rng;
-                return grammar_sampler != nullptr && sampler != nullptr;
-            },
-            [](std::string_view m) {
-                const std::string line = "sonder-llamacpp: " + std::string(m) + "\n";
-                RouteLog(LogLevel::kWarn, line.c_str());
-            });
-        const bool sample_deadlock = spec_outcome == sonder::backends::llamacpp::GrammarRetryOutcome::kFailed;
+        // No grammar retry here: with the built-in proposers (TargetMatch) a speculative step
+        // samples position j from the same logits and sampler state a plain step would use, and a
+        // grammar failure (lazy-trigger replay that throws in llama_grammar_accept_impl) is a
+        // deterministic function of the token sequence. Restoring a snapshot and re-sampling
+        // reproduces the same token and the same failure, so the step fails the request. The real
+        // fix is upstream ggml-org/llama.cpp#32934 (transactional trigger activation, unmerged,
+        // not in the b11195 pin). The batch worker's per-slot verification behaves the same way.
+        const bool sample_deadlock = !VerifySpeculativeBatch(
+            draft_tokens, no_proposal_dists, request.sampling, sampler.get(), grammar_sampler.get(),
+            target_gpu_sampled, n_vocab, verify_rng, accepted_tokens, accepted_lps, n_accepted, result);
         if (stage_prof) {
             add_stage_ms(result.stage_timings.sampling_ms, MsSince(spec_samp_start));
         }
