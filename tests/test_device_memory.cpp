@@ -1042,3 +1042,24 @@ TEST_CASE("NAT-08: Vulkan heap ReBAR, memory budget, PCIe speed, ASPM, and drive
         CHECK(merged[0].pcie.current_width == std::optional<std::uint32_t>(16u));
     }
 }
+
+TEST_CASE("NAT-08: classify_vulkan_rebar mirrors ggml_vk_has_rebar first DEVICE_LOCAL memory type") {
+    VulkanMemoryHeapInfo h0;
+    h0.heap_index = 0u;
+    h0.device_local = true;
+    h0.host_coherent = false;
+
+    VulkanMemoryHeapInfo h1;
+    h1.heap_index = 1u;
+    h1.device_local = true;
+    h1.host_coherent = true;
+
+    const std::vector<VulkanMemoryHeapInfo> heaps{h0, h1};
+    // Without memory-type hint, falls back to first DEVICE_LOCAL heap (heap 0 -> false).
+    CHECK(classify_vulkan_rebar(heaps) == std::optional<bool>(false));
+    CHECK(classify_vulkan_rebar(heaps, std::nullopt) == std::optional<bool>(false));
+    // With ggml_vk_has_rebar hint pointing at heap 1, classifies heap 1 -> true.
+    CHECK(classify_vulkan_rebar(heaps, std::optional<std::uint32_t>(1u)) == std::optional<bool>(true));
+    // Out-of-range hint falls back cleanly to first DEVICE_LOCAL heap.
+    CHECK(classify_vulkan_rebar(heaps, std::optional<std::uint32_t>(99u)) == std::optional<bool>(false));
+}

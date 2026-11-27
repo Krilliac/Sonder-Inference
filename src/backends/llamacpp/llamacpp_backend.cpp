@@ -75,14 +75,24 @@ struct GgmlDeviceLineRegistry {
     static constexpr std::size_t kMaxPendingBytes = 2048;
 
     std::mutex mutex;
+    std::atomic<bool> has_pending{false};
     std::string pending;
     std::vector<sonder::inference::GgmlDeviceTelemetry> entries;
 
     void Feed(LogLevel level, const char* text) {
         if (text == nullptr || text[0] == '\0') return;
+        // Lock-free fast path: skip mutex on ordinary log traffic when no
+        // partial ggml_ device line is pending.
+        if (!has_pending.load(std::memory_order_acquire) && std::strstr(text, "ggml_") == nullptr) {
+            return;
+        }
         std::lock_guard<std::mutex> lock(mutex);
         if (level != LogLevel::kCont) {
             pending.clear();
+            has_pending.store(false, std::memory_order_release);
+            if (std::strstr(text, "ggml_") == nullptr) {
+                return;
+            }
         }
         const std::string_view chunk(text);
         std::size_t pos = 0;
@@ -95,6 +105,7 @@ struct GgmlDeviceLineRegistry {
                 pending.append(part.data(), take);
             }
             if (nl == std::string_view::npos) {
+                has_pending.store(!pending.empty(), std::memory_order_release);
                 break;
             }
             if (auto parsed = sonder::inference::parse_ggml_device_line(pending)) {
@@ -113,6 +124,7 @@ struct GgmlDeviceLineRegistry {
                 }
             }
             pending.clear();
+            has_pending.store(false, std::memory_order_release);
             pos = nl + 1;
         }
     }
@@ -125,6 +137,7 @@ struct GgmlDeviceLineRegistry {
     void Clear() noexcept {
         std::lock_guard<std::mutex> lock(mutex);
         pending.clear();
+        has_pending.store(false, std::memory_order_release);
         entries.clear();
     }
 };
@@ -232,14 +245,14 @@ void EnsureBackendInitialized() {
         const char* skip_canary = std::getenv("SONDER_SKIP_COOPMAT_CANARY");
         if (skip_canary == nullptr || skip_canary[0] == '\0' || skip_canary[0] == '0') {
             const std::string helper_exe = sonder::inference::find_coopmat_canary_executable();
+            const auto gpus = sonder::inference::enumerate_gpu_devices();
             if (!helper_exe.empty()) {
                 sonder::inference::CoopmatCanaryOptions opts;
                 opts.is_windows = true;
                 opts.executable_path = helper_exe;
                 opts.apply_env_fallback = true;
                 opts.fail_closed_on_runner_error = true;
-                const auto decision =
-                    sonder::inference::evaluate_amd_coopmat_canary(sonder::inference::enumerate_gpu_devices(), opts);
+                const auto decision = sonder::inference::evaluate_amd_coopmat_canary(gpus, opts);
                 sonder::inference::record_coopmat_canary_decision(decision);
                 if (decision.disable_coopmat &&
                     decision.status != sonder::inference::CoopmatCanaryStatus::skipped_env_disabled) {
@@ -247,6 +260,15 @@ void EnsureBackendInitialized() {
                         "sonder-inference: AMD Windows Vulkan coopmat canary triggered GGML_VK_DISABLE_COOPMAT=1 (" +
                         decision.reason + ")\n";
                     RouteLog(LogLevel::kWarn, msg.c_str());
+                }
+            } else {
+                for (const auto& gpu : gpus) {
+                    if (sonder::inference::needs_amd_windows_coopmat_canary(gpu, true)) {
+                        RouteLog(LogLevel::kInfo,
+                                 "sonder-inference: AMD Windows Vulkan coopmat canary skipped (sonder-infer "
+                                 "executable not found alongside binary; set SONDER_INFER_EXE to enable)\n");
+                        break;
+                    }
                 }
             }
         }

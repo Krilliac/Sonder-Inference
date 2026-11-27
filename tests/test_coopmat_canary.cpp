@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -293,4 +294,61 @@ TEST_CASE("NAT-16: evaluate_amd_coopmat_canary caches by driver build and trigge
     CHECK(last_coopmat_canary_decision()->disable_coopmat);
     clear_coopmat_canary_decision();
     CHECK_FALSE(last_coopmat_canary_decision().has_value());
+}
+
+TEST_CASE("NAT-16: default_coopmat_canary_cache_path honors SONDER_COOPMAT_CANARY_CACHE and rejects traversal") {
+    auto set_env = [](const char* k, const char* v) {
+#if defined(_WIN32)
+        (void)_putenv_s(k, v != nullptr ? v : "");
+#else
+        if (v != nullptr && v[0] != '\0') {
+            (void)::setenv(k, v, 1);
+        } else {
+            (void)::unsetenv(k);
+        }
+#endif
+    };
+    struct EnvRestore {
+        std::string prev;
+        bool had_prev = false;
+        EnvRestore() {
+#if defined(_WIN32)
+            char* buf = nullptr;
+            std::size_t len = 0;
+            if (_dupenv_s(&buf, &len, "SONDER_COOPMAT_CANARY_CACHE") == 0 && buf != nullptr) {
+                prev = buf;
+                had_prev = true;
+                std::free(buf);
+            }
+#else
+            if (const char* v = std::getenv("SONDER_COOPMAT_CANARY_CACHE")) {
+                prev = v;
+                had_prev = true;
+            }
+#endif
+        }
+        ~EnvRestore() {
+#if defined(_WIN32)
+            (void)_putenv_s("SONDER_COOPMAT_CANARY_CACHE", had_prev ? prev.c_str() : "");
+#else
+            if (had_prev) {
+                (void)::setenv("SONDER_COOPMAT_CANARY_CACHE", prev.c_str(), 1);
+            } else {
+                (void)::unsetenv("SONDER_COOPMAT_CANARY_CACHE");
+            }
+#endif
+        }
+    } restore;
+
+    TempDir tmp("sonder-coopmat-envcache");
+    const std::string custom = (tmp.path / "custom-canary.json").string();
+    set_env("SONDER_COOPMAT_CANARY_CACHE", custom.c_str());
+    CHECK(default_coopmat_canary_cache_path() == custom);
+
+    // Traversal path is rejected and falls back cleanly.
+    const std::string bad = (tmp.path / ".." / "escape.json").string();
+    set_env("SONDER_COOPMAT_CANARY_CACHE", bad.c_str());
+    const std::string resolved = default_coopmat_canary_cache_path();
+    CHECK(resolved != bad);
+    CHECK(resolved.find("..") == std::string::npos);
 }

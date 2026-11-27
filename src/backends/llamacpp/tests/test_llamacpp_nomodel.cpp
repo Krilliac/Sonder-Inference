@@ -622,8 +622,14 @@ TEST_CASE("NAT-08: RouteLog captures ggml_vulkan device lines at DEBUG level inc
     RouteLog(LogLevel::kCont,
              "fp16: 1 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 32768 | int dot: 1 | "
              "matrix cores: none\n");
-    // Non-device lines must not pollute the captured list.
+    // Non-device lines must not pollute the captured list, and an unterminated
+    // ggml_ prefix interrupted by an unrelated non-kCont line must clear cleanly.
     RouteLog(LogLevel::kDebug, "ggml_vulkan: Found 2 Vulkan devices:\n");
+    RouteLog(LogLevel::kDebug, "ordinary debug log line without backend prefix\n");
+    RouteLog(LogLevel::kCont, "continuation of ordinary log line\n");
+    RouteLog(LogLevel::kDebug, "ggml_vulkan: 9 = Unterminated Partial ");
+    RouteLog(LogLevel::kInfo, "unrelated info line interrupts partial\n");
+    RouteLog(LogLevel::kCont, "| uma: 1 | warp size: 64 | shared memory: 32768 | matrix cores: none\n");
 
     const auto captured = LlamaCppBackend::CapturedGgmlDevices();
     REQUIRE(captured.size() == 2u);

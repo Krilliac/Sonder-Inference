@@ -349,6 +349,19 @@ CoopmatCanaryChildOutcome spawn_canary_child(const std::string& exe_path, const 
     out.reason = "WaitForSingleObject failed (rc=" + std::to_string(wait_rc) + ")";
     return out;
 #else
+    // Prepare argv strictly before fork() so the child performs only
+    // async-signal-safe execv() / _exit().
+    std::string exe_s = safe_exe.string();
+    std::string cmd_s = "coopmat-canary";
+    std::string f_vid = "--vendor-id";
+    std::string f_did = "--device-id";
+    std::string f_ub = "--ubatch";
+    std::string f_q = "--quiet";
+    std::string v_s = vendor_arg;
+    std::string d_s = device_arg;
+    std::string u_s = ubatch_arg;
+    char* const argv[] = {exe_s.data(), cmd_s.data(), f_vid.data(), v_s.data(), f_did.data(),
+                          d_s.data(),   f_ub.data(),  u_s.data(),   f_q.data(), nullptr};
     const pid_t pid = ::fork();
     if (pid < 0) {
         out.spawn_error = true;
@@ -357,17 +370,6 @@ CoopmatCanaryChildOutcome spawn_canary_child(const std::string& exe_path, const 
         return out;
     }
     if (pid == 0) {
-        std::string exe_s = safe_exe.string();
-        std::string cmd_s = "coopmat-canary";
-        std::string f_vid = "--vendor-id";
-        std::string f_did = "--device-id";
-        std::string f_ub = "--ubatch";
-        std::string f_q = "--quiet";
-        std::string v_s = vendor_arg;
-        std::string d_s = device_arg;
-        std::string u_s = ubatch_arg;
-        char* const argv[] = {exe_s.data(), cmd_s.data(), f_vid.data(), v_s.data(), f_did.data(),
-                              d_s.data(),   f_ub.data(),  u_s.data(),   f_q.data(), nullptr};
         ::execv(exe_s.c_str(), argv);
         ::_exit(127);
     }
@@ -950,6 +952,13 @@ std::string canonical_coopmat_cache_key(const CoopmatCanaryKey& key) {
 }
 
 std::string default_coopmat_canary_cache_path() {
+    const std::string env_cache = read_env_var("SONDER_COOPMAT_CANARY_CACHE");
+    if (!env_cache.empty()) {
+        fs::path custom_path;
+        if (is_safe_file_path(env_cache, custom_path)) {
+            return custom_path.string();
+        }
+    }
 #if defined(_WIN32)
     std::string base = read_env_var("LOCALAPPDATA");
     if (base.empty()) base = read_env_var("TEMP");

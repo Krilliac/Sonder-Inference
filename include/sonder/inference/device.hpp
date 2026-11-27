@@ -212,6 +212,8 @@ void clear_registered_ggml_device_telemetry() noexcept;
 void merge_ggml_device_telemetry(std::vector<GpuDeviceInfo>& gpus,
                                  const std::vector<GgmlDeviceTelemetry>& ggml_devices);
 std::optional<bool> classify_vulkan_rebar(const std::vector<VulkanMemoryHeapInfo>& heaps) noexcept;
+std::optional<bool> classify_vulkan_rebar(const std::vector<VulkanMemoryHeapInfo>& heaps,
+                                          std::optional<std::uint32_t> first_device_local_heap_index) noexcept;
 MemoryReading vulkan_device_local_budget_bytes(const std::vector<VulkanMemoryHeapInfo>& heaps) noexcept;
 MemoryReading vulkan_device_local_usage_bytes(const std::vector<VulkanMemoryHeapInfo>& heaps) noexcept;
 std::optional<std::uint32_t> parse_pcie_link_speed_gen(std::string_view speed_text) noexcept;

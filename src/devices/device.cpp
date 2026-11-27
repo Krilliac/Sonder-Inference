@@ -875,7 +875,15 @@ std::vector<VkPhysicalDeviceProbe> probe_vulkan_physical_devices() {
             }
             p.heaps.push_back(std::move(h));
         }
-        p.rebar = classify_vulkan_rebar(p.heaps);
+        std::optional<std::uint32_t> first_device_local_heap;
+        for (std::uint32_t ti = 0; ti < type_count; ++ti) {
+            const auto& mt = mem2.memoryProperties.memoryTypes[ti];
+            if ((mt.propertyFlags & kMemPropDeviceLocal) != 0 && mt.heapIndex < heap_count) {
+                first_device_local_heap = mt.heapIndex;
+                break;
+            }
+        }
+        p.rebar = classify_vulkan_rebar(p.heaps, first_device_local_heap);
         out.push_back(std::move(p));
     }
     return out;
@@ -3061,6 +3069,18 @@ std::optional<bool> classify_vulkan_rebar(const std::vector<VulkanMemoryHeapInfo
         }
     }
     return std::nullopt;
+}
+
+std::optional<bool> classify_vulkan_rebar(const std::vector<VulkanMemoryHeapInfo>& heaps,
+                                          std::optional<std::uint32_t> first_device_local_heap_index) noexcept {
+    if (first_device_local_heap_index.has_value()) {
+        for (const auto& h : heaps) {
+            if (h.heap_index == *first_device_local_heap_index) {
+                return h.host_coherent;
+            }
+        }
+    }
+    return classify_vulkan_rebar(heaps);
 }
 
 MemoryReading vulkan_device_local_budget_bytes(const std::vector<VulkanMemoryHeapInfo>& heaps) noexcept {
