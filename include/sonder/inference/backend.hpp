@@ -98,6 +98,10 @@ struct RecurrentCheckpointExchange {
 // Vocabulary index as produced by a backend tokenizer.
 using TokenId = std::int32_t;
 
+// Largest number of alternatives a telemetry probability probe asks for per
+// sampled token (GenerateRequest/ChatRequest::telemetry_top_k).
+inline constexpr std::int32_t kMaxTelemetryTopK = 10;
+
 // Non-blocking action returned at backend-owned safe points (between prefill
 // chunks or after a decoded token) so a shared batch worker can park and
 // reclaim ONE request's physical slot/state without stalling peer requests.
@@ -225,6 +229,14 @@ struct GenerateRequest {
     int priority_rank = 0;
     // Allow cost-aware spill-to-checkpoint when selectively preempted under pressure.
     bool allow_preempt_spill = false;
+    // Telemetry-only probability probe, [0, kMaxTelemetryTopK]; 0 = off. Set
+    // by the session when token telemetry is recorded. A backend that samples
+    // upstream and can report probabilities (llamaserver against llama.cpp)
+    // asks for the sampled token's probability and this many alternatives and
+    // reports them in TokenChunk::sampled_probability. The caller-visible
+    // TokenChunk::logprob / top_logprobs stay exactly as sampling.logprobs
+    // asked. Other backends ignore it.
+    std::int32_t telemetry_top_k = 0;
 };
 
 // Bounded batch limits for embedding, reranking, and pair-scoring requests.
@@ -360,6 +372,26 @@ struct MediaContent {
     std::vector<std::uint8_t> bytes;
 };
 
+// One alternative considered for a backend-sampled token (telemetry only).
+struct TokenCandidate {
+    TokenId token_id = 0;
+    std::string token;         // the token's text as the backend reported it
+    float probability = 0.0f;  // [0, 1]
+};
+
+// Probability of the token a backend sampled itself, for telemetry
+// (inference.token.generated / inference.sampling.candidates). Not part of
+// the caller's logprobs.
+struct SampledTokenProbability {
+    TokenId token_id = 0;
+    float probability = 0.0f;  // [0, 1]
+    // True: after the backend's sampler chain (llama-server
+    // post_sampling_probs). False: softmax of the raw logits (logprobs).
+    bool post_sampling = false;
+    // Most probable first, at most the requested telemetry_top_k entries.
+    std::vector<TokenCandidate> candidates{};
+};
+
 struct TokenChunk {
     std::string_view text;
     std::uint64_t index = 0;  // 0-based chunk index within the request
@@ -372,6 +404,11 @@ struct TokenChunk {
     std::vector<TopLogprob> top_logprobs{};
     // Optional native upstream tool call deltas (e.g. from llama-server).
     std::vector<ToolCallDelta> tool_call_deltas{};
+    // Optional, non-owning: the probability of the backend-sampled token that
+    // produced this chunk, when the request set telemetry_top_k (or asked for
+    // logprobs) and the backend reported token ids. Valid only during the
+    // callback; copies of the chunk must not keep it past that.
+    const SampledTokenProbability* sampled_probability = nullptr;
 };
 
 // Per-request timing observations reported by llama-server. Each member is
@@ -539,6 +576,9 @@ struct ChatRequest {
     std::optional<double> target_itl_ms = std::nullopt;
     // Opt-in per-request stage timing hooks (false by default: zero extra clocks).
     bool enable_stage_profiling = false;
+    // Telemetry-only probability probe; same contract as
+    // GenerateRequest::telemetry_top_k.
+    std::int32_t telemetry_top_k = 0;
 };
 
 // True for "system", "user", "assistant" and "tool".

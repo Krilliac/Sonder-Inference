@@ -217,6 +217,8 @@ must key on the bus instance, and consumers need to know what a lower level
 would drop. All additions are compatible with envelope v1. Full status in
 [TELEMETRY.md](TELEMETRY.md).
 
+**Amendment (2026-11-26):** the periodic `*.sample` events are numbered on their own sequence stream so a flood of samples cannot hide lifecycle gaps. Those events carry `producer.stream = "samples"` and `event_id` `<instance_id>-s<sequence>`; every other event keeps `<instance_id>-<sequence>`. So "one counter numbers all of an engine's events" now holds per stream, not per engine, and gap detection keys on (instance, stream). The `--telemetry-buffer N` retention and the default `2 x N` subscriber queue are per stream, so at the maximum (1048576) worst-case retained lines and per-subscriber queue memory are about double the single-stream figure.
+
 ## ADR-020 — Local HTTP boundary with Sonder Runtime (`sonder-infer serve`)
 
 **Date:** 2026-09-26. **Status:** proposed, awaiting owner sign-off
