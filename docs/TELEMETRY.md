@@ -266,12 +266,23 @@ Hosted request admission fields are additive: the historical numeric
 terminal events include the full queue wait, including logical KV admission,
 without double-counting scheduler time. It remains available with scheduling
 off or an oversized account-mode prompt that bypasses the logical pool.
-A queue refusal before a session request begins emits `request.failed` with
-`backend_started: false`, `error_code`, class, queue time and correlation.
-Health exposes `queued_by_class` as instantaneous counts from these tickets.
+A queue or pre-session refusal on `sonder-infer serve` before a session request
+begins (priority queue full/expired, unserved model, lazy residency load or
+budget failure, capability/parameter validation, or server starting/draining)
+emits `request.failed` (or `request.cancelled` on client disconnect) at
+`metrics` level with `backend_started: false`, `outcome`, `kind`, safe
+`error_code`, correlation fields, and (when parsed) `model` and
+`requested_model`, without emitting `request.started` or `request.queued`.
+Health exposes `queued_by_class` as instantaneous counts from admission tickets.
 There is no separate Prometheus metrics endpoint.
 
-All five request lifecycle events carry the optional `parent_request_id` str
+All five request lifecycle events carry `kind` (`generate`, `chat`, `embed`,
+`rerank`, `score`), `model` (served model id when set via
+`RequestOptions::served_model`, else `ModelDescriptor::name`), and
+`requested_model` (`RequestOptions::requested_model` when set, else `model`), so
+Observatory's Stage Pipeline resolves the model lane at `metrics` level even
+without a retained `session.created` or `model.load.completed` event. They also
+carry the optional `parent_request_id` str
 when the caller set `RequestOptions::parent_request_id` (for `sonder-infer
 serve`: the `X-Sonder-Parent-Request-Id` header, i.e. the Sonder Runtime turn
 id). The C ABI/Python SDK can also set this parent with the additive

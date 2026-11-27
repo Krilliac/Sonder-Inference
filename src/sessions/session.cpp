@@ -1533,8 +1533,28 @@ Result<EmbedResult> Session::embed_request(const EmbedRequest& request, const Re
         return request_options.admission ? request_options.admission->queue_ms()
                                          : request_options.admission_queue_ms;
     };
+    const auto sanitize_model = [](std::string_view text) {
+        if (text.size() > kMaxEvidenceStringBytes) {
+            std::size_t n = kMaxEvidenceStringBytes;
+            while (n > 0 && (static_cast<unsigned char>(text[n]) & 0xC0u) == 0x80u) {
+                --n;
+            }
+            text = text.substr(0, n);
+        }
+        return sanitize_bounded_evidence_string(text, kMaxEvidenceStringBytes);
+    };
+    const std::string resolved_model = sanitize_model(
+        (request_options.served_model && !request_options.served_model->empty())
+            ? std::string_view(*request_options.served_model)
+            : std::string_view(model_->descriptor().name));
+    const std::string req_model =
+        (request_options.requested_model && !request_options.requested_model->empty())
+            ? sanitize_model(*request_options.requested_model)
+            : resolved_model;
     const auto& parent = request_options.parent_request_id;
-    const auto with_parent = [&parent](json::Object attrs) {
+    const auto with_parent = [&parent, &resolved_model, &req_model](json::Object attrs) {
+        attrs.set("model", resolved_model);
+        attrs.set("requested_model", req_model);
         if (parent) {
             attrs.set("parent_request_id", *parent);
         }
@@ -1739,8 +1759,28 @@ Result<RerankResult> Session::rerank(const RerankRequest& request, const Request
         return request_options.admission ? request_options.admission->queue_ms()
                                          : request_options.admission_queue_ms;
     };
+    const auto sanitize_model = [](std::string_view text) {
+        if (text.size() > kMaxEvidenceStringBytes) {
+            std::size_t n = kMaxEvidenceStringBytes;
+            while (n > 0 && (static_cast<unsigned char>(text[n]) & 0xC0u) == 0x80u) {
+                --n;
+            }
+            text = text.substr(0, n);
+        }
+        return sanitize_bounded_evidence_string(text, kMaxEvidenceStringBytes);
+    };
+    const std::string resolved_model = sanitize_model(
+        (request_options.served_model && !request_options.served_model->empty())
+            ? std::string_view(*request_options.served_model)
+            : std::string_view(model_->descriptor().name));
+    const std::string req_model =
+        (request_options.requested_model && !request_options.requested_model->empty())
+            ? sanitize_model(*request_options.requested_model)
+            : resolved_model;
     const auto& parent = request_options.parent_request_id;
-    const auto with_parent = [&parent](json::Object attrs) {
+    const auto with_parent = [&parent, &resolved_model, &req_model](json::Object attrs) {
+        attrs.set("model", resolved_model);
+        attrs.set("requested_model", req_model);
         if (parent) {
             attrs.set("parent_request_id", *parent);
         }
@@ -1938,8 +1978,28 @@ Result<ScoreResult> Session::score(const ScoreRequest& request, const RequestOpt
         return request_options.admission ? request_options.admission->queue_ms()
                                          : request_options.admission_queue_ms;
     };
+    const auto sanitize_model = [](std::string_view text) {
+        if (text.size() > kMaxEvidenceStringBytes) {
+            std::size_t n = kMaxEvidenceStringBytes;
+            while (n > 0 && (static_cast<unsigned char>(text[n]) & 0xC0u) == 0x80u) {
+                --n;
+            }
+            text = text.substr(0, n);
+        }
+        return sanitize_bounded_evidence_string(text, kMaxEvidenceStringBytes);
+    };
+    const std::string resolved_model = sanitize_model(
+        (request_options.served_model && !request_options.served_model->empty())
+            ? std::string_view(*request_options.served_model)
+            : std::string_view(model_->descriptor().name));
+    const std::string req_model =
+        (request_options.requested_model && !request_options.requested_model->empty())
+            ? sanitize_model(*request_options.requested_model)
+            : resolved_model;
     const auto& parent = request_options.parent_request_id;
-    const auto with_parent = [&parent](json::Object attrs) {
+    const auto with_parent = [&parent, &resolved_model, &req_model](json::Object attrs) {
+        attrs.set("model", resolved_model);
+        attrs.set("requested_model", req_model);
         if (parent) {
             attrs.set("parent_request_id", *parent);
         }
@@ -2203,6 +2263,24 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     // can replace an exception from a public C++ callback.
     TelemetryBus& bus = engine_.telemetry();
     const auto ctx = telemetry_context(request.request_id);
+    const auto sanitize_model = [](std::string_view text) {
+        if (text.size() > kMaxEvidenceStringBytes) {
+            std::size_t n = kMaxEvidenceStringBytes;
+            while (n > 0 && (static_cast<unsigned char>(text[n]) & 0xC0u) == 0x80u) {
+                --n;
+            }
+            text = text.substr(0, n);
+        }
+        return sanitize_bounded_evidence_string(text, kMaxEvidenceStringBytes);
+    };
+    const std::string resolved_model = sanitize_model(
+        (request_options.served_model && !request_options.served_model->empty())
+            ? std::string_view(*request_options.served_model)
+            : std::string_view(model_->descriptor().name));
+    const std::string req_model =
+        (request_options.requested_model && !request_options.requested_model->empty())
+            ? sanitize_model(*request_options.requested_model)
+            : resolved_model;
     detail::RequestRuntime* runtime = engine_.request_runtime();
     std::optional<std::uint64_t> sched_id;
     bool finish_attempted = false;
@@ -2227,7 +2305,10 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
             if (!terminal_attempted) {
                 terminal_attempted = true;
                 if (request_options.admission) result.scheduling.queue_ms = request_options.admission->queue_ms();
-                json::Object failed{{"outcome", "failed"},
+                json::Object failed{{"kind", kind},
+                                    {"outcome", "failed"},
+                                    {"model", resolved_model},
+                                    {"requested_model", req_model},
                                     {"stop_reason", to_string(result.stats.stop_reason)},
                                     {"prompt_tokens", result.stats.prompt_tokens},
                                     {"completion_tokens", result.stats.completion_tokens},
@@ -2329,7 +2410,9 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
          (backend && ((!request_options.tools.empty() && backend->capabilities().has(Capability::tool_calling)) ||
                       (has_media && backend->capabilities().has(Capability::multimodal)))));
     const auto& parent = request_options.parent_request_id;
-    const auto with_parent = [&parent](json::Object attrs) {
+    const auto with_parent = [&parent, &resolved_model, &req_model](json::Object attrs) {
+        attrs.set("model", resolved_model);
+        attrs.set("requested_model", req_model);
         if (parent) {
             attrs.set("parent_request_id", *parent);
         }
@@ -3256,7 +3339,8 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     const std::uint64_t cancel_ns = cancel_requested_ns_.load();
     const std::uint64_t now_ns = monotonic_ns();
 
-    json::Object summary{{"outcome", to_string(outcome)},
+    json::Object summary{{"kind", kind},
+                         {"outcome", to_string(outcome)},
                          {"stop_reason", to_string(result.stats.stop_reason)},
                          {"prompt_tokens", result.stats.prompt_tokens},
                          {"completion_tokens", result.stats.completion_tokens},
