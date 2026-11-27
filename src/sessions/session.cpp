@@ -2298,6 +2298,16 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
 
     const bool emit_tokens = bus.enabled(TelemetryLevel::standard);
     const bool capture_text = bus.options().capture_text;
+    // Telemetry probability probe for backend-sampled tokens (llamaserver),
+    // only while token events are recorded. The candidates bounds count the
+    // probability-bearing tokens of this request.
+    const std::int32_t telemetry_top_k =
+        emit_tokens ? std::clamp<int>(bus.options().token_probability_top_k, 0, kMaxTelemetryTopK) : 0;
+    request.telemetry_top_k = telemetry_top_k;
+    const std::uint64_t candidates_stride = std::max<std::uint32_t>(1u, bus.options().token_candidates_stride);
+    const std::uint32_t candidates_cap = bus.options().token_candidates_max_events;
+    std::uint64_t probability_tokens = 0;
+    std::uint32_t candidates_emitted = 0;
     const bool stage_profiling = request_options.enable_stage_profiling || bus.stage_profiling_enabled();
     request.enable_stage_profiling = stage_profiling;
     StageTimings session_stages;
@@ -2557,12 +2567,24 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
             json::Object attrs{{"index", chunk.index},
                                {"bytes", chunk.text.size()},
                                {"elapsed_ms", ms_between(t_start, now)}};
+            // A backend-sampled token whose probability the backend reported
+            // (llamaserver telemetry probe): one token per event, like Sonder's.
+            const SampledTokenProbability* backend_token =
+                token_id || telemetry_top_k <= 0 ? nullptr : chunk.sampled_probability;
+            const char* basis = backend_token != nullptr && backend_token->post_sampling ? "post_sampling"
+                                                                                          : "pre_sampling";
             if (token_id) {
                 // Sonder-sampled: exactly one token per event.
                 attrs.set("unit", "token");
                 attrs.set("count", 1);
                 attrs.set("token_id", *token_id);
                 attrs.set("probability", probability);
+            } else if (backend_token != nullptr) {
+                attrs.set("unit", "token");
+                attrs.set("count", 1);
+                attrs.set("token_id", backend_token->token_id);
+                attrs.set("probability", backend_token->probability);
+                attrs.set("probability_basis", basis);
             } else {
                 // Backend-streamed chunk: token count per chunk is unknown.
                 attrs.set("unit", "chunk");
@@ -2571,6 +2593,28 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                 attrs.set("text", std::string(chunk.text));
             }
             bus.emit("inference.token.generated", ctx, std::move(attrs), TelemetryLevel::standard);
+            if (backend_token != nullptr) {
+                const std::uint64_t ordinal = probability_tokens++;
+                if (!backend_token->candidates.empty() && ordinal % candidates_stride == 0 &&
+                    (candidates_cap == 0 || candidates_emitted < candidates_cap)) {
+                    ++candidates_emitted;
+                    json::Array candidates;
+                    candidates.reserve(backend_token->candidates.size());
+                    for (const auto& c : backend_token->candidates) {
+                        json::Object entry{{"token_id", c.token_id}, {"probability", c.probability}};
+                        if (capture_text) {
+                            entry.set("text", c.token);
+                        }
+                        candidates.emplace_back(std::move(entry));
+                    }
+                    bus.emit("inference.sampling.candidates", ctx,
+                             json::Object{{"index", chunk.index},
+                                          {"sampled_token_id", backend_token->token_id},
+                                          {"probability_basis", basis},
+                                          {"candidates", std::move(candidates)}},
+                             TelemetryLevel::standard);
+                }
+            }
         }
         if (on_chunk) {
             return on_chunk(chunk);
@@ -2849,6 +2893,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                 chat_request.target_itl_ms = request_options.target_itl_ms;
                 chat_request.enable_stage_profiling = stage_profiling;
                 chat_request.local_only = request.local_only;
+                chat_request.telemetry_top_k = telemetry_top_k;
                 generated = backend_model.chat(chat_request, token, on_backend_chunk);
             } else {
                 generated = backend_model.generate(request, token, on_backend_chunk);
