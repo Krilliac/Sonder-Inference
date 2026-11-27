@@ -28,6 +28,19 @@ Status status_for_http(int code);
 // status (including the total timeout) passes through unchanged.
 Status upstream_status(const Status &status);
 
+// Which per-token probability data a stream reports to its callback.
+struct StreamProbabilities {
+    // Copy upstream logprobs into TokenChunk::logprob / top_logprobs. False
+    // only when the probabilities were requested for telemetry alone.
+    bool expose_logprobs = true;
+    // > 0: also report the sampled token's probability and at most this many
+    // alternatives (clamped to kMaxTelemetryTopK) in
+    // TokenChunk::sampled_probability, from llama-server's
+    // completion_probabilities (native) or choices[0].logprobs.content
+    // (OpenAI shape). Entries without a token "id" are not reported.
+    std::int32_t telemetry_top_k = 0;
+};
+
 // Executes a prepared POST completion/chat request and decodes its bounded
 // SSE or NDJSON stream into `GenerateStats` and `callback` invocations,
 // incrementing `progress_events` on frames that carry content, reasoning, or
@@ -35,6 +48,7 @@ Status upstream_status(const Status &status);
 Result<GenerateStats> run_completion_stream(net::HttpRequest &request, bool chat, bool native, bool separate_reasoning,
                                             const CancellationToken &cancel, const TokenCallback &callback,
                                             std::uint64_t &progress_events, bool tools_requested = false,
-                                            std::size_t max_tool_call_bytes = kMaxToolCallDeltaBytes);
+                                            std::size_t max_tool_call_bytes = kMaxToolCallDeltaBytes,
+                                            const StreamProbabilities &probabilities = {});
 
 }  // namespace sonder::inference::llamaserver

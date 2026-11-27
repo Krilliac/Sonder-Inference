@@ -104,8 +104,11 @@ def test_chat_telemetry_consent_kind_and_cursor(tmp_path, capture_text):
     else:
         assert all("text" not in event["attributes"] for event in tokens)
     assert len({event["event_id"] for event in events}) == len(events)
-    sequences = [event["sequence"] for event in events]
-    assert sequences == sorted(set(sequences))
+    # Each sequence stream (producer.stream: absent = main, "samples") is numbered on its own.
+    by_stream = {}
+    for event in events:
+        by_stream.setdefault(event["producer"].get("stream"), []).append(event["sequence"])
+    assert all(sequences == sorted(set(sequences)) for sequences in by_stream.values())
 
 
 def test_legacy_abi_library_without_chat_still_generates(lib):

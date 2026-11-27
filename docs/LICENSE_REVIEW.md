@@ -106,6 +106,15 @@ No license conclusions from the initial broad web sweep are considered authorita
   closed (update hash after verifying the tag commit)
 - approved: yes, approved by Nate on 2026-09-26 (MIT, compatible with the project's Apache-2.0
   license; notice kept in `NOTICE`)
+- vendored tree and SI patches (planned, RET-09 in [ROADMAP_SI_ONLY.md](ROADMAP_SI_ONLY.md)):
+  vendoring the `ggml`/`llama.cpp` tree and choosing the license of SI's patch
+  series need a new review and an owner approval recorded here before RET-09
+  lands. Upstream code stays MIT, with its copyright and permission notice kept
+  in `NOTICE` and binary distributions. This file does not currently carry a
+  verified license record for the PrismML fork; if stock `Q2_0` does not reach
+  parity and any `PQ2_0` kernel code is ported from the PrismML fork rather
+  than written independently, its exact repository, revision, and license must
+  be verified and recorded here before adoption.
 
 ### llguidance (optional, `SONDER_WITH_LLGUIDANCE=ON`)
 - repository: https://github.com/guidance-ai/llguidance
@@ -171,7 +180,10 @@ No license conclusions from the initial broad web sweep are considered authorita
 - revision/tag: whatever server the user runs locally
 - evaluated: 2026-09-26
 - license: MIT (upstream); not relevant to linking because no code is used
-- intended use: compatibility backend over its HTTP API
+- intended use: compatibility backend over its HTTP API (local Ollama backend
+  is deprecated and scheduled for removal in RET-07; the planned opt-in Ollama
+  Cloud provider in RET-02 remains strictly a network/HTTP boundary with no
+  Ollama code copied or linked)
 - linkage/process boundary: separate process over loopback HTTP; no Ollama code is copied or linked
 - notices required: none
 - security/maintenance notes: loopback-only by default; API behaviour is taken from the public REST API docs

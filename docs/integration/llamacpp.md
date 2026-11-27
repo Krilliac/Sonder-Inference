@@ -164,6 +164,8 @@ manifest value with a STATUS line. `python -I scripts/llamacpp_pin.py verify --t
   (approved 2026-09-26).
 - CI: optional job `llamacpp-windows` (windows-latest, MSVC,
   `SONDER_WITH_LLAMA_CPP=ON`, `GGML_NATIVE=OFF`, `continue-on-error`), with the
-  pinned source tarball cached and passed as a `file:///` URL through
-  `SONDER_LLAMACPP_URL`, so FetchContent re-checks the manifest SHA-256.
+  pinned source tarball cached and passed as a plain local path through
+  `SONDER_LLAMACPP_URL`, so FetchContent re-checks the manifest SHA-256. (A
+  `file:///D:/...` URL fails on Windows: CMake's verify step looks for
+  `/D:/...`.)
   The default ubuntu/windows jobs keep the option OFF.
