@@ -3703,7 +3703,8 @@ TEST_CASE("model store: a digest another thread published during on_weight_hash 
     std::atomic<bool> other_done{false};
     m::StoreOptions opt;
     opt.verify_weights = m::WeightVerification::first_use;
-    opt.weight_hash_timeout = std::chrono::milliseconds(100);
+    // Long enough for the second thread's whole resolve under sanitizers or a loaded runner.
+    opt.weight_hash_timeout = std::chrono::milliseconds(2000);
     opt.on_weight_hash = [&](const m::BlobRef&) {
         if (calls.fetch_add(1) != 0) return;  // the second thread returns at once
         // The first thread's callback outlasts the other thread's whole resolve and then the deadline.
@@ -3711,7 +3712,7 @@ TEST_CASE("model store: a digest another thread published during on_weight_hash 
         while (!other_done.load() && std::chrono::steady_clock::now() < give_up) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));  // past the 2 s deadline
     };
     auto store = m::OllamaStore::open(s.tmp.path, opt);
     REQUIRE(store.ok());
