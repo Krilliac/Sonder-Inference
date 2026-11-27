@@ -799,6 +799,7 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     lo.spec_batch_max_aggregate_draft_tokens = o.spec_batch_max_aggregate_draft_tokens;
     lo.embed_batch_tokens = o.embed_batch_tokens;
     lo.embed_max_sequences = o.embed_max_sequences;
+    lo.startup_smoke_test = o.startup_smoke_test;
     if (!lc::ParseSplitMode(o.split_mode, lo.split_mode)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown split mode '" + o.split_mode + "' (expected none, layer or row)");

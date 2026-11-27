@@ -412,6 +412,37 @@ elseif(SONDER_WITH_MTMD)
     message(WARNING "SONDER_WITH_MTMD=ON requested, but upstream llama.cpp tree does not expose standalone mtmd target")
 endif()
 
+# prism.hadamard.* (Hadamard-folded Bonsai) runtime support. Mainline (>= b11556 /
+# v1.0.0, PR #29600) registers the key in src/llama-arch.cpp; the PrismML-Eng fork
+# reads it as a string literal in src/llama-model.cpp (and mentions it in
+# src/llama-context.cpp). Absent on older builds such as b11195; the backend then
+# refuses to load such models instead of silently producing garbage.
+# Override: -DSONDER_LLAMACPP_FORCE_PRISM_HADAMARD=ON|OFF.
+set(SONDER_LLAMACPP_FORCE_PRISM_HADAMARD "" CACHE STRING
+    "Force prism.hadamard runtime detection: ON, OFF, or empty to probe the llama.cpp sources")
+set_property(CACHE SONDER_LLAMACPP_FORCE_PRISM_HADAMARD PROPERTY STRINGS "" ON OFF)
+set(_sonder_has_prism_hadamard FALSE)
+if(SONDER_LLAMACPP_FORCE_PRISM_HADAMARD STREQUAL "")
+    foreach(_sonder_prism_src IN ITEMS llama-arch.cpp llama-model.cpp llama-context.cpp)
+        set(_sonder_prism_path "${llamacpp_SOURCE_DIR}/src/${_sonder_prism_src}")
+        if(EXISTS "${_sonder_prism_path}")
+            file(READ "${_sonder_prism_path}" _sonder_prism_content)
+            string(FIND "${_sonder_prism_content}" "prism.hadamard.version" _idx_prism_hadamard)
+            if(NOT _idx_prism_hadamard EQUAL -1)
+                set(_sonder_has_prism_hadamard TRUE)
+                break()
+            endif()
+        endif()
+    endforeach()
+elseif(SONDER_LLAMACPP_FORCE_PRISM_HADAMARD STREQUAL "ON")
+    set(_sonder_has_prism_hadamard TRUE)
+elseif(NOT SONDER_LLAMACPP_FORCE_PRISM_HADAMARD STREQUAL "OFF")
+    message(FATAL_ERROR "SONDER_LLAMACPP_FORCE_PRISM_HADAMARD must be ON, OFF or empty, got '${SONDER_LLAMACPP_FORCE_PRISM_HADAMARD}'")
+endif()
+if(_sonder_has_prism_hadamard)
+    list(APPEND SONDER_LLAMACPP_FEATURE_DEFS SONDER_LLAMACPP_HAS_PRISM_HADAMARD=1)
+endif()
+
 if(SONDER_LLAMACPP_FEATURE_DEFS)
     message(STATUS "Sonder llamacpp detected features: ${SONDER_LLAMACPP_FEATURE_DEFS}")
 endif()

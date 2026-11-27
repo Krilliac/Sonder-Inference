@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace sonder::backends::llamacpp {
 
@@ -715,6 +718,75 @@ Status ValidatePlacementOptions(const LoadOptions& options) {
             return Status::Error(ErrorCode::kInvalidArgument,
                                  "tensor_split must contain at least one positive value");
         }
+    }
+    return Status::Ok();
+}
+
+bool IsPrismHadamardKey(std::string_view key) noexcept {
+    constexpr std::string_view kPrefix = "prism.hadamard.";
+    return key.size() >= kPrefix.size() && key.substr(0, kPrefix.size()) == kPrefix;
+}
+
+Status EvaluateHadamardGuard(const std::vector<std::string>& gguf_keys, bool runtime_supports_hadamard,
+                             std::string_view model_path) {
+    if (runtime_supports_hadamard) return Status::Ok();
+    for (const std::string& key : gguf_keys) {
+        if (!IsPrismHadamardKey(key)) continue;
+        std::string msg = "model is Hadamard-folded (GGUF key '" + key +
+                          "', Bonsai/Prism ternary Q2_0) but the linked llama.cpp has no FWHT / "
+                          "prism.hadamard runtime support; loading it would produce garbage output. "
+                          "Rebuild against a llama.cpp with prism.hadamard support (mainline >= b11556 / v1.0.0, "
+                          "PR #29600, or the PrismML-Eng fork; see -DSONDER_LLAMACPP_FORCE_PRISM_HADAMARD) "
+                          "or use a non-folded GGUF";
+        if (!model_path.empty()) {
+            msg += ": ";
+            msg += model_path;
+        }
+        return Status::Error(ErrorCode::kUnsupported, std::move(msg));
+    }
+    return Status::Ok();
+}
+
+Status EvaluateSmokeLogits(std::span<const float> logits, std::int32_t& argmax_out) {
+    if (logits.empty()) {
+        return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: empty logits");
+    }
+    if (!std::isfinite(logits[0])) {
+        return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: non-finite logits");
+    }
+    float min_v = logits[0];
+    float max_v = logits[0];
+    std::int32_t best = 0;
+    for (std::size_t i = 1; i < logits.size(); ++i) {
+        const float v = logits[i];
+        if (!std::isfinite(v)) {
+            return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: non-finite logits");
+        }
+        if (v < min_v) min_v = v;
+        if (v > max_v) {
+            max_v = v;
+            best = static_cast<std::int32_t>(i);
+        }
+    }
+    if (logits.size() > 1u && max_v == min_v) {
+        return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: degenerate uniform logits");
+    }
+    argmax_out = best;
+    return Status::Ok();
+}
+
+Status EvaluateSmokeTokens(const std::vector<std::int32_t>& tokens, bool logits_finite) {
+    if (!logits_finite) {
+        return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: non-finite logits");
+    }
+    if (tokens.empty()) {
+        return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: no tokens produced");
+    }
+    if (tokens.size() >= kSmokeMinTokens &&
+        std::all_of(tokens.begin(), tokens.end(), [&](std::int32_t t) { return t == tokens.front(); })) {
+        return Status::Error(ErrorCode::kLoadFailed,
+                             "startup smoke test: degenerate output (one token repeated " +
+                                 std::to_string(tokens.size()) + " times)");
     }
     return Status::Ok();
 }

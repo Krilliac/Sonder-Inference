@@ -40,6 +40,7 @@
 #include "suffix_matcher.hpp"
 
 #include "ggml-backend.h"
+#include "gguf.h"
 #include "llama.h"
 
 // Older trees (b11195) declare the NextN/MTP calls only in the private src/llama-ext.h;
@@ -2616,6 +2617,128 @@ Status LlamaCppBackend::ResolveTensorOverrides(const std::vector<TensorOverride>
     return Status::Ok();
 }
 
+namespace {
+
+// -1 = use compile-time LinkedLlamaSupportsPrismHadamard(); 0 = force false; 1 = force true.
+std::atomic<int> g_prism_hadamard_override_for_test{-1};
+
+bool EffectivePrismHadamardSupport() noexcept {
+    const int ov = g_prism_hadamard_override_for_test.load(std::memory_order_acquire);
+    if (ov == 0) return false;
+    if (ov == 1) return true;
+    return LinkedLlamaSupportsPrismHadamard();
+}
+
+// Greedy decode of a short fixed prompt on a freshly created context; each
+// step's logits go through EvaluateSmokeLogits and the continuation goes
+// through EvaluateSmokeTokens. Always leaves the KV cache empty.
+Status RunStartupSmokeTest(llama_context* ctx, const llama_vocab* vocab, std::uint32_t n_batch) {
+    if (ctx == nullptr || vocab == nullptr) {
+        return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: context or vocab is null");
+    }
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    if (n_vocab <= 0) {
+        return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: empty vocabulary");
+    }
+    constexpr std::string_view kPrompt = "The capital of France is";
+    constexpr int kSteps = 8;
+    std::vector<llama_token> prompt(kPrompt.size() + 2);
+    int32_t n = llama_tokenize(vocab, kPrompt.data(), static_cast<int32_t>(kPrompt.size()), prompt.data(),
+                               static_cast<int32_t>(prompt.size()), /*add_special=*/true, /*parse_special=*/false);
+    if (n < 0 && n != INT32_MIN) {
+        prompt.resize(static_cast<std::size_t>(-n));
+        n = llama_tokenize(vocab, kPrompt.data(), static_cast<int32_t>(kPrompt.size()), prompt.data(),
+                           static_cast<int32_t>(prompt.size()), /*add_special=*/true, /*parse_special=*/false);
+    }
+    if (n <= 0) {
+        return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: tokenization failed");
+    }
+    prompt.resize(static_cast<std::size_t>(n));
+#if defined(SONDER_LLAMACPP_HAS_N_CTX_SEQ)
+    const std::uint32_t ctx_limit = llama_n_ctx_seq(ctx);
+#else
+    const std::uint32_t ctx_limit = llama_n_ctx(ctx);
+#endif
+    if (static_cast<std::uint64_t>(n) + static_cast<std::uint64_t>(kSteps) > ctx_limit) {
+        return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: n_ctx too small");
+    }
+    const auto clear_mem = [&] {
+        if (llama_memory_t mem = llama_get_memory(ctx); mem != nullptr) {
+            llama_memory_clear(mem, true);
+        }
+    };
+    const std::uint32_t ctx_batch = std::max<std::uint32_t>(1u, llama_n_batch(ctx));
+    const std::size_t chunk = std::max<std::size_t>(1u, std::min<std::uint32_t>(n_batch, ctx_batch));
+    std::vector<std::int32_t> out;
+    out.reserve(kSteps);
+    std::vector<llama_token> pending = prompt;
+    for (int step = 0; step < kSteps; ++step) {
+        std::size_t off = 0;
+        while (off < pending.size()) {
+            const std::size_t len = std::min(chunk, pending.size() - off);
+            llama_batch b = llama_batch_get_one(pending.data() + off, static_cast<int32_t>(len));
+            if (llama_decode(ctx, b) != 0) {
+                clear_mem();
+                return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: llama_decode failed");
+            }
+            off += len;
+        }
+        const float* logits = llama_get_logits_ith(ctx, -1);
+        if (logits == nullptr) {
+            clear_mem();
+            return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: no logits");
+        }
+        std::int32_t best = 0;
+        if (Status ls = EvaluateSmokeLogits(std::span<const float>(logits, static_cast<std::size_t>(n_vocab)), best);
+            !ls.ok()) {
+            clear_mem();
+            return ls;
+        }
+        if (llama_vocab_is_eog(vocab, best)) break;
+        out.push_back(best);
+        pending.assign(1, best);
+    }
+    clear_mem();
+    return EvaluateSmokeTokens(out, /*logits_finite=*/true);
+}
+
+}  // namespace
+
+namespace detail {
+
+ScopedPrismHadamardSupportOverrideForTest::ScopedPrismHadamardSupportOverrideForTest(bool runtime_supported) noexcept
+    : previous_(g_prism_hadamard_override_for_test.exchange(runtime_supported ? 1 : 0, std::memory_order_acq_rel)) {}
+
+ScopedPrismHadamardSupportOverrideForTest::~ScopedPrismHadamardSupportOverrideForTest() noexcept {
+    g_prism_hadamard_override_for_test.store(previous_, std::memory_order_release);
+}
+
+}  // namespace detail
+
+Status ReadGgufKeys(const std::string& path, std::vector<std::string>& keys) {
+    keys.clear();
+    if (path.empty()) {
+        return Status::Error(ErrorCode::kLoadFailed, "failed to read GGUF metadata: path is empty");
+    }
+    gguf_init_params gp{};
+    gp.no_alloc = true;
+    gp.ctx = nullptr;
+    std::unique_ptr<gguf_context, decltype(&gguf_free)> g(gguf_init_from_file(path.c_str(), gp), &gguf_free);
+    if (!g) {
+        return Status::Error(ErrorCode::kLoadFailed, "failed to read GGUF metadata: " + path);
+    }
+    const int64_t n = gguf_get_n_kv(g.get());
+    if (n > 0) {
+        keys.reserve(static_cast<std::size_t>(n));
+        for (int64_t i = 0; i < n; ++i) {
+            if (const char* k = gguf_get_key(g.get(), i); k != nullptr) {
+                keys.emplace_back(k);
+            }
+        }
+    }
+    return Status::Ok();
+}
+
 Status LlamaCppBackend::Load(const LoadOptions& options) {
     if (options.model_path.empty()) {
         return Status::Error(ErrorCode::kInvalidArgument, "model_path is empty");
@@ -2676,6 +2799,20 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
     }
     if (!options.vocab_only && options.n_batch == 0) {
         return Status::Error(ErrorCode::kInvalidArgument, "n_batch must be > 0");
+    }
+
+    // Pure metadata check, run before Unload() so a refused load keeps the
+    // model that is already loaded.
+    if (!options.vocab_only) {
+        std::vector<std::string> gguf_keys;
+        // A metadata read failure is not fatal here: llama.cpp reports its own
+        // load error below. Only a positive Hadamard marker blocks the load.
+        if (ReadGgufKeys(options.model_path, gguf_keys).ok()) {
+            if (Status s = EvaluateHadamardGuard(gguf_keys, EffectivePrismHadamardSupport(), options.model_path);
+                !s.ok()) {
+                return s;
+            }
+        }
     }
 
     EnsureBackendInitialized();
@@ -2747,6 +2884,22 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
         if (impl_->ctx == nullptr) {
             impl_->Release();
             return Status::Error(ErrorCode::kLoadFailed, "llama.cpp failed to create context");
+        }
+
+        // Encoder-only models and pooled contexts (embedding MEAN/CLS/LAST or
+        // reranker RANK) do not produce generative next-token logits, so the
+        // greedy-decode smoke test does not apply to them.
+        const bool smoke_applicable =
+            !(llama_model_has_encoder(model) && !llama_model_has_decoder(model)) &&
+            llama_pooling_type(impl_->ctx) == LLAMA_POOLING_TYPE_NONE;
+        if (options.startup_smoke_test && smoke_applicable) {
+            if (Status s = RunGuarded(ErrorCode::kLoadFailed, "RunStartupSmokeTest", [&] {
+                    return RunStartupSmokeTest(impl_->ctx, impl_->vocab, options.n_batch);
+                });
+                !s.ok()) {
+                impl_->Release();
+                return s;
+            }
         }
 
         // Pre-allocate reusable decode batch sized to the context's n_batch.

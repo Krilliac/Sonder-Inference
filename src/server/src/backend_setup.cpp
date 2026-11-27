@@ -62,6 +62,7 @@ Result<LlamaCppBackendOptions> llamacpp_options(const BackendSetup& setup) {
     if (setup.llamacpp_kv_unified) lo.kv_unified = *setup.llamacpp_kv_unified;
     if (setup.llamacpp_prefix_cache) lo.prefix_cache = *setup.llamacpp_prefix_cache;
     if (setup.llamacpp_slots) lo.slots = *setup.llamacpp_slots;
+    if (setup.llamacpp_startup_smoke_test) lo.startup_smoke_test = *setup.llamacpp_startup_smoke_test;
     if (setup.llamacpp_spec_type) lo.spec_type = *setup.llamacpp_spec_type;
     if (setup.llamacpp_spec_draft_max) lo.spec_draft_max = *setup.llamacpp_spec_draft_max;
     if (setup.llamacpp_moe_cache_cpu_share.has_value()) {

@@ -132,9 +132,11 @@ struct LlamaCppBackendOptions {
     // Maximum sequences packed per embedding/rerank forward pass (0 = auto, max 64).
     std::uint32_t embed_max_sequences = 16;
     // Optional root directories constraining allowed LoRA adapter files (defaults to model_dirs when empty).
-    std::vector<std::string> lora_roots;
+    std::vector<std::string> lora_roots{};
     // Named LoRA aliases mapping alias -> base model + one or more (adapter, scale) pairs.
-    std::vector<LlamaCppLoraAliasOption> lora_aliases;
+    std::vector<LlamaCppLoraAliasOption> lora_aliases{};
+    // Opt-in startup greedy smoke test after load (default off).
+    bool startup_smoke_test = false;
 };
 
 // Checks the llama.cpp context and placement options (KV cache types,
