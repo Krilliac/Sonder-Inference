@@ -763,6 +763,9 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     lo.spec_draft_max = o.spec_draft_max;
     lo.spec_verification_mode = o.spec_verification_mode;
     lo.cache_ram_mib = o.cache_ram_mib;
+    lo.checkpoint_spacing_tokens = o.checkpoint_spacing_tokens;
+    lo.checkpoint_dense_spacing_tokens = o.checkpoint_dense_spacing_tokens;
+    lo.checkpoint_max_per_slot = o.checkpoint_max_per_slot;
     lo.moe_cache_mib = o.moe_cache_mib;
     lo.moe_cache_cpu_share = o.moe_cache_cpu_share;
     lo.mmproj_path = o.mmproj_path;

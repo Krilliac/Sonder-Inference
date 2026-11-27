@@ -222,6 +222,10 @@ struct LoadOptions {
     SpeculativeVerificationMode spec_verification_mode = SpeculativeVerificationMode::TargetMatch;
     // Bounded L2 host-RAM prefix state cache budget in MiB (0 = disabled, max kMaxCacheRamMiB).
     std::uint32_t cache_ram_mib = 0;
+    // Context checkpoint spacing in tokens (normal / dense for hybrid & recurrent models) and per-slot cap.
+    std::uint32_t checkpoint_spacing_tokens = 2048;
+    std::uint32_t checkpoint_dense_spacing_tokens = 1024;
+    std::uint32_t checkpoint_max_per_slot = 8;
     // Dynamic GPU cache in MiB for host-resident MoE experts (0 = disabled, max kMaxMoeCacheMiB).
     std::uint32_t moe_cache_mib = 0;
     // Unused/rejected by the direct llamacpp backend (no execution consumer):
@@ -576,6 +580,7 @@ enum class TelemetryKind {
     kPrefillDone,
     kTokenDecoded,
     kGenerationDone,
+    kPrefixCheckpoint,
 };
 
 struct TelemetryEvent {
@@ -594,6 +599,22 @@ struct PrefixCoalescerStats {
     std::uint64_t coalesced_tokens_saved = 0;
     std::uint64_t coalesce_fallbacks_timeout = 0;
     std::uint64_t coalesce_fallbacks_producer_failed = 0;
+};
+
+// Telemetry counters for prefix-cache context checkpoints and host-RAM LRU tier.
+struct PrefixCheckpointCounters {
+    std::uint64_t checkpoints_planned = 0;
+    std::uint64_t checkpoints_captured = 0;
+    std::uint64_t captured_bytes = 0;
+    std::uint64_t slot_hits = 0;
+    std::uint64_t host_hits = 0;
+    std::uint64_t misses = 0;
+    std::uint64_t restored_tokens = 0;
+    std::uint64_t host_puts = 0;
+    std::uint64_t host_evictions = 0;
+    std::uint64_t host_rejected = 0;
+    std::uint64_t host_bytes = 0;
+    std::uint64_t host_entries = 0;
 };
 
 // One chat message for chat-template formatting (role: system, user,
@@ -748,6 +769,7 @@ public:
 
     void SetTelemetrySink(TelemetrySink sink);
     [[nodiscard]] PrefixCoalescerStats GetPrefixCoalescerStats() const noexcept;
+    [[nodiscard]] PrefixCheckpointCounters GetPrefixCheckpointStats() const noexcept;
 
 private:
     struct Impl;
