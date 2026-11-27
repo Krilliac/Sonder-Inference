@@ -119,9 +119,13 @@ private:
 
 // Bounds applied by json::parse(text, limits). max_values == 0 disables the
 // value-node cap (used by unbounded internal/trusted callers).
+// reject_duplicate_keys: an object that names one key twice is a parse error
+// instead of keeping the last value (opt-in strict mode for formats where a
+// second key could silently override the first, e.g. Ollama manifests).
 struct ParseLimits {
     int max_depth = 128;
     std::size_t max_values = 0;
+    bool reject_duplicate_keys = false;
 };
 
 // Parses exactly one JSON document (surrounding whitespace allowed).

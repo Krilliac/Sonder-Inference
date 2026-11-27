@@ -92,3 +92,7 @@ proxy 502 is not evidence that nothing executed.
 
 SI-to-SI remote workers and `DeviceKind::remote` capacity (reserved for the
 RPC capacity tier, POOL-21) are deferred.
+
+A cross-host layer split through llama.cpp RPC is not a remote worker: it is
+an ordinary SI endpoint whose supervised llama-server child is the only
+process that runs the RPC client ([rpc-worker.md](rpc-worker.md)).

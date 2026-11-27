@@ -599,7 +599,7 @@ TelemetryContext Session::telemetry_context(const std::optional<std::string>& re
     ctx.task_id = options_.task_id;
     ctx.model_instance_id = model_->instance_id();
     ctx.device_id = model_->device_id();
-    ctx.synthetic_work = model_->backend_name() == kMockBackendName;
+    ctx.synthetic_work = is_mock_backend(model_->backend_name());
     return ctx;
 }
 
@@ -2845,10 +2845,22 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                             : 0;
                 }
             }
-            request.on_safe_point = poll_safe_point;
-            request.suspended_state = &suspended_state;
+            // Preserve local backends' existing safe points. An incapable remote
+            // backend cannot transport these process-local pointers; preserve an
+            // explicit caller hook so it can reject unsupported suspension.
+            if (!backend || !backend->capabilities().has(Capability::remote_process) ||
+                request_options.on_safe_point || nonblocking_gate ||
+                (backend && (backend->capabilities().has(Capability::execution_checkpoint) ||
+                             backend->capabilities().has(Capability::selective_preemption)))) {
+                request.on_safe_point = poll_safe_point;
+                request.suspended_state = &suspended_state;
+            }
 
             const auto on_backend_chunk = [&](const TokenChunk& chunk) -> bool {
+                if (chunk.index > std::numeric_limits<std::uint64_t>::max() - resume_chunk_base) {
+                    gate_failure = Status(ErrorCode::protocol_error, "backend chunk index overflow");
+                    return false;
+                }
                 TokenChunk adjusted = chunk;
                 adjusted.index = resume_chunk_base + chunk.index;
                 const TokenId tok = detail::accounting_chunk_token(chunk.text);
@@ -2898,6 +2910,15 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
             }
             request.execution_resume = nullptr;
             request.suspended_state = nullptr;
+            if (generated.ok()) {
+                const auto prior = exact_resume != nullptr ? exact_resume->delivered_completion_tokens : 0;
+                const auto count = generated.value().completion_tokens;
+                const auto maximum = std::numeric_limits<std::uint64_t>::max();
+                if (count > maximum - prior || delivered > maximum - resume_chunk_base ||
+                    prior + count > maximum - static_cast<std::uint64_t>(tracked_prompt_tokens.size())) {
+                    generated = Status(ErrorCode::protocol_error, "backend completion counter overflow");
+                }
+            }
             if (generated.ok()) {
                 const std::uint64_t prior_gen = exact_resume != nullptr ? exact_resume->delivered_completion_tokens : 0;
                 const std::uint64_t total_gen = prior_gen + generated.value().completion_tokens;

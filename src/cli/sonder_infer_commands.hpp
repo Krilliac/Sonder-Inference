@@ -53,7 +53,7 @@ inline OptionGroup llamaserver_options() {
 
 inline OptionGroup backend_options() {
     return {"Backend",
-            {{"backend", OptionKind::value, "NAME", "mock | ollama | llamacpp | llamaserver (env SONDER_INFER_BACKEND)"},
+            {{"backend", OptionKind::value, "NAME", "mock | remote-mock | ollama | llamacpp | llamaserver (env SONDER_INFER_BACKEND)"},
              {"model", OptionKind::value, "MODEL",
               "model id (env SONDER_INFER_MODEL; the mock backend defaults to 'mock')"},
              {"ollama-url", OptionKind::value, "URL", "Ollama base URL (env SONDER_OLLAMA_URL, then OLLAMA_HOST)"},
@@ -189,8 +189,9 @@ inline const CommandSpec& backends_command() {
     static const CommandSpec spec{
         "backends",
         "probe the backends in this build",
-        {"backends [--json] [--ollama-url URL]"},
-        {output_json(), ollama_options(), llamaserver_options()},
+        {"backends [--json] [--backend remote-mock] [--ollama-url URL]"},
+        {output_json(), ollama_options(), llamaserver_options(),
+         {"Selection", {{"backend", OptionKind::value, "NAME", "select remote-mock to explicitly probe its worker"}}}},
         {kBackendNote, kEnvNote,
          "Exits 1 when no backend is available (an unreachable Ollama alone does not fail\n"
          "the command while the mock backend is available).",
@@ -204,13 +205,18 @@ inline const CommandSpec& models_command() {
     static const CommandSpec spec{
         "models",
         "list the models a backend can serve",
-        {"models --backend NAME [--json] [--ollama-url URL]"},
+        {"models --backend NAME [--json] [--ollama-url URL]",
+         "models import-ollama [DIR] [--name NAME] [--verify [--weights-only]] [--json]"},
         {{"Backend",
-          {{"backend", OptionKind::value, "NAME", "mock | ollama | llamacpp | llamaserver (env SONDER_INFER_BACKEND)"}}},
+          {{"backend", OptionKind::value, "NAME", "mock | remote-mock | ollama | llamacpp | llamaserver (env SONDER_INFER_BACKEND)"}}},
          output_json(),
          ollama_options(), llamaserver_options()},
-        {kBackendNote, kEnvNote, kExitNote},
-        {"models --backend mock --json", "models --backend ollama"}};
+        {kBackendNote, kEnvNote, kExitNote,
+         "'models import-ollama' (src/models, docs/integration/model-store.md) is parsed by the model store;\n"
+         "'models import-ollama --help' prints its options. It lists what an existing Ollama models\n"
+         "directory (default $OLLAMA_MODELS, then ~/.ollama/models) would serve through SI's native engine,\n"
+         "read-only and without copying, starting a daemon or hashing (hashing is opt-in with --verify)."},
+        {"models --backend mock --json", "models --backend ollama", "models import-ollama D:/ollama/models --json"}};
     return spec;
 }
 
@@ -312,7 +318,7 @@ inline const CommandSpec& bench_command() {
 inline const CommandSpec& serve_command() {
     static const CommandSpec spec{"serve",
                                   "local HTTP API (OpenAI-compatible subset) and live telemetry (docs/SERVER.md)",
-                                  {"serve --backend mock|ollama|llamacpp|llamaserver [--model ID]... [options]"},
+                                  {"serve --backend mock|remote-mock|ollama|llamacpp|llamaserver [--model ID]... [options]"},
                                   {},
                                   {},
                                   {"serve --backend mock --port 11437"}};
@@ -362,6 +368,19 @@ inline const CommandSpec& weights_command() {
     return spec;
 }
 
+inline const CommandSpec& worker_command() {
+    static const CommandSpec spec{
+        "worker", "private engine subprocess managed by serve (no network listener)",
+        {"worker --endpoint NAME --engine mock"},
+        {{"Worker", {{"endpoint", OptionKind::value, "NAME", "private IPC endpoint created by serve"},
+                     {"engine", OptionKind::value, "NAME", "worker engine (first slice: mock)"},
+                     {"token-delay-ms", OptionKind::value, "N", "mock per-token delay (0..60000 ms)"}}}},
+        {"Normally launched automatically by 'serve --backend remote-mock'.\n"
+         "The mock engine produces synthetic test output only. See docs/design/ARCH-01-multiprocess.md."},
+        {"serve --backend remote-mock --model mock:tiny"}};
+    return spec;
+}
+
 inline const CommandSpec& help_command() {
     static const CommandSpec spec{"help",
                                   "show help for a command",
@@ -378,7 +397,7 @@ inline const std::vector<const CommandSpec*>& all_commands() {
         &generate_command(), &chat_command(),     &serve_command(),   &bench_command(),
         &models_command(),   &backends_command(), &devices_command(), &node_command(),
         &plan_command(),     &version_command(),  &tune_command(),    &weights_command(),
-        &help_command()};
+        &worker_command(),   &help_command()};
     return list;
 }
 
