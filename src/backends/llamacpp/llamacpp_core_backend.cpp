@@ -31,6 +31,7 @@
 
 #include "common/diag_log.hpp"
 #include "common/sha256.hpp"
+#include "device_health.hpp"
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include "sonder/inference/backends/llamacpp.hpp"
 #include "sonder/inference/json.hpp"
@@ -432,6 +433,7 @@ struct RuntimeState {
     bool observed_host_l2_restore = false;
     bool observed_concurrent_batch = false;
     std::optional<EffectiveExecutionReport> last_execution_report;
+    std::shared_ptr<lc::DeviceHealthTracker> device_health;
 
     RuntimeState(llamacpp_detail::ProcessGpuMemoryProbe probe_fn, std::chrono::milliseconds interval,
                  const LlamaCppBackendOptions& opts, bool uma_override, std::optional<bool> gpu_offload_override)
@@ -446,11 +448,22 @@ struct RuntimeState {
           configured_slots(opts.slots),
           configured_cache_ram_mib(opts.cache_ram_mib),
           configured_mmproj(!opts.mmproj_path.empty()),
-          configured_lora(!opts.lora_aliases.empty()) {
+          configured_lora(!opts.lora_aliases.empty()),
+          device_health(std::make_shared<lc::DeviceHealthTracker>(kLlamaCppBackendName)) {
         gpu_memory.probe = "none";
         gpu_memory.status = "not_sampled";
         gpu_memory.spill_threshold_bytes = kDefaultSpillThresholdBytes;
         gpu_memory.shared_baseline_bytes = 0;
+    }
+
+    std::shared_ptr<lc::DeviceHealthTracker> DeviceHealth() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return device_health;
+    }
+
+    void SetDeviceHealth(std::shared_ptr<lc::DeviceHealthTracker> dh) {
+        std::lock_guard<std::mutex> lock(mutex);
+        device_health = std::move(dh);
     }
 
     std::uint64_t RegisterModel(std::uint32_t n_ctx, bool gpu_offload, bool uma_target, std::string target_identity,
@@ -763,6 +776,9 @@ struct RuntimeState {
         }
         status.capability_statuses = BuildCapabilityStatusesLocked();
         status.effective_execution = BuildEffectiveExecutionLocked();
+        if (device_health) {
+            status.take_events = [dh = device_health] { return dh->DrainTelemetryEvents(); };
+        }
         return status;
     }
 };
@@ -839,7 +855,8 @@ bool IsGguf(const fs::path& p) {
 class LlamaCppModel final : public BackendModel {
 public:
     LlamaCppModel(ModelDescriptor desc, lc::LlamaCppBackend runtime, double load_ms, std::uint32_t slots,
-                  std::shared_ptr<RuntimeState> runtime_state = nullptr, std::uint64_t runtime_model_id = 0)
+                  std::shared_ptr<RuntimeState> runtime_state = nullptr, std::uint64_t runtime_model_id = 0,
+                  std::vector<std::string> gpu_devices = {})
         : desc_(std::move(desc)),
           runtime_(std::move(runtime)),
           load_ns_(MsToNs(load_ms)),
@@ -847,7 +864,13 @@ public:
           runtime_state_(std::move(runtime_state)),
           runtime_model_id_(runtime_model_id),
           chat_template_id_(detail::sha256_hex(runtime_.ChatTemplate())),
-          tool_grammar_preflight_(llamacpp_detail::MakeLlamaCppToolGrammarCompiler(runtime_)) {
+          tool_grammar_preflight_(llamacpp_detail::MakeLlamaCppToolGrammarCompiler(runtime_)),
+          gpu_devices_(std::move(gpu_devices)) {
+        if (runtime_state_ && !gpu_devices_.empty()) {
+            if (auto dh = runtime_state_->DeviceHealth()) {
+                lc::BindBackendDeviceHealth(&runtime_, std::move(dh), gpu_devices_);
+            }
+        }
         // The chat template is fixed once the model is loaded, so decide here
         // rather than under mutex_, which is held for a whole generation.
         std::string ignored;
@@ -855,6 +878,7 @@ public:
     }
 
     ~LlamaCppModel() override {
+        lc::UnbindBackendDeviceHealth(&runtime_);
         if (runtime_state_ && runtime_model_id_ != 0) {
             runtime_state_->UnregisterModel(runtime_model_id_);
         }
@@ -906,6 +930,7 @@ public:
 
     Result<EmbedResult> embed(const EmbedRequest& request, const CancellationToken& cancel) override {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
+        if (Status dh = check_device_health(); !dh.ok()) return dh;
         if (request.inputs.empty()) {
             return Status(ErrorCode::invalid_argument, "embed request inputs are empty");
         }
@@ -936,6 +961,7 @@ public:
             runtime_.Embed(tokenized, emb_opts, emb_out, [&] { return cancel.cancelled(); });
         if (!st.ok()) {
             if (cancel.cancelled()) return Status(ErrorCode::cancelled, "embedding cancelled");
+            if (Status dh = check_device_health(); !dh.ok()) return dh;
             return ToStatus(st);
         }
         EmbedResult result;
@@ -951,6 +977,7 @@ public:
 
     Result<RerankResult> rerank(const RerankRequest& request, const CancellationToken& cancel) override {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
+        if (Status dh = check_device_health(); !dh.ok()) return dh;
         if (Status st = validate_rerank_request(request); !st.ok()) return st;
         std::unique_lock<std::shared_mutex> lock(mutex_);
         if (!runtime_.SupportsReranking()) {
@@ -972,6 +999,7 @@ public:
             runtime_.ScorePairs(tokenized_pairs, score_out, [&] { return cancel.cancelled(); });
         if (!st.ok()) {
             if (cancel.cancelled()) return Status(ErrorCode::cancelled, "reranking cancelled");
+            if (Status dh = check_device_health(); !dh.ok()) return dh;
             return ToStatus(st);
         }
         if (score_out.scores.size() != request.documents.size()) {
@@ -997,6 +1025,7 @@ public:
 
     Result<ScoreResult> score(const ScoreRequest& request, const CancellationToken& cancel) override {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
+        if (Status dh = check_device_health(); !dh.ok()) return dh;
         if (Status st = validate_score_request(request); !st.ok()) return st;
         std::unique_lock<std::shared_mutex> lock(mutex_);
         if (!runtime_.SupportsReranking()) {
@@ -1018,6 +1047,7 @@ public:
             runtime_.ScorePairs(tokenized_pairs, score_out, [&] { return cancel.cancelled(); });
         if (!st.ok()) {
             if (cancel.cancelled()) return Status(ErrorCode::cancelled, "pair scoring cancelled");
+            if (Status dh = check_device_health(); !dh.ok()) return dh;
             return ToStatus(st);
         }
         if (score_out.scores.size() != request.pairs.size()) {
@@ -1036,6 +1066,7 @@ public:
 
     Result<GenerateStats> generate(const GenerateRequest& request, const CancellationToken& cancel,
                                    const TokenCallback& on_chunk) override {
+        if (Status dh = check_device_health(); !dh.ok()) return dh;
         if (Status v = validate(request.sampling); !v.ok()) return v;
         // The llama.cpp context size is fixed at load (ModelLoadOptions::context_length).
         // A smaller num_ctx is honoured by the engine's scheduling limit; a larger one
@@ -1078,6 +1109,7 @@ public:
     // strictly tokenized with parse_special=false (G0028).
     Result<GenerateStats> chat(const ChatRequest& request, const CancellationToken& cancel,
                                const TokenCallback& on_chunk) override {
+        if (Status dh = check_device_health(); !dh.ok()) return dh;
         if (Status v = validate_chat_messages(request.messages); !v.ok()) return v;
         if (Status v = validate(request.sampling); !v.ok()) return v;
         if (request.sampling.num_ctx > 0 && desc_.context_length > 0 &&
@@ -1141,6 +1173,7 @@ public:
     [[nodiscard]] bool has_native_chat() const override { return native_chat_; }
 
     Result<RecurrentStateSnapshot> capture_recurrent_state(std::uint64_t token_position) override {
+        if (Status dh = check_device_health(); !dh.ok()) return dh;
         if (token_position == 0) {
             return Status(ErrorCode::invalid_argument, "recurrent checkpoint token_position must be > 0");
         }
@@ -1154,6 +1187,7 @@ public:
     }
 
     Status restore_recurrent_state(std::span<const std::uint8_t> bytes) override {
+        if (Status dh = check_device_health(); !dh.ok()) return dh;
         if (bytes.empty()) {
             return Status(ErrorCode::invalid_argument, "recurrent checkpoint snapshot is empty");
         }
@@ -1168,6 +1202,7 @@ public:
     Result<std::vector<std::uint8_t>> capture_execution_state(std::uint64_t token_position,
                                                               std::size_t max_bytes) override {
         (void)token_position;
+        if (Status dh = check_device_health(); !dh.ok()) return dh;
         const std::size_t cap = std::min(max_bytes, kMaxRecurrentCheckpointBytes);
         if (cap == 0) {
             return Status(ErrorCode::invalid_argument, "execution state max_bytes must be > 0");
@@ -1182,6 +1217,7 @@ public:
 
     Status restore_execution_state(std::span<const std::uint8_t> bytes, std::uint64_t token_position) override {
         (void)token_position;
+        if (Status dh = check_device_health(); !dh.ok()) return dh;
         if (bytes.empty()) {
             return Status(ErrorCode::invalid_argument, "execution state snapshot is empty");
         }
@@ -1373,7 +1409,10 @@ private:
             }
         }
 
-        if (!r.status.ok()) return ToStatus(r.status);
+        if (!r.status.ok()) {
+            if (Status dh = check_device_health(); !dh.ok()) return dh;
+            return ToStatus(r.status);
+        }
 
         switch (r.stop_reason) {
             case lc::StopReason::kEndOfGeneration: stats.stop_reason = StopReason::end_of_sequence; break;
@@ -1425,6 +1464,14 @@ private:
         return stats;
     }
 
+    [[nodiscard]] Status check_device_health() const {
+        if (!runtime_state_ || gpu_devices_.empty()) {
+            return Status::success();
+        }
+        const auto dh = runtime_state_->DeviceHealth();
+        return dh ? dh->CheckDevicesStatus(gpu_devices_) : Status::success();
+    }
+
     ModelDescriptor desc_;
     lc::LlamaCppBackend runtime_;
     std::uint64_t load_ns_ = 0;
@@ -1433,6 +1480,7 @@ private:
     std::uint64_t runtime_model_id_ = 0;
     std::string chat_template_id_;
     llamacpp_detail::ToolGrammarPreflight tool_grammar_preflight_;
+    std::vector<std::string> gpu_devices_;
     bool native_chat_ = false;  // set in the constructor, read-only afterwards
     mutable std::shared_mutex mutex_;
 };
@@ -1448,10 +1496,17 @@ public:
           runtime_state_(std::make_shared<RuntimeState>(
               probe ? std::move(probe) : MakeDefaultGpuMemoryProbe(options_.devices), sample_interval, options_,
               force_uma_mode, force_gpu_offload)) {
+        lc::BindCoreBackendDeviceHealth(
+            this, runtime_state_->DeviceHealth(),
+            [rs = runtime_state_](std::shared_ptr<lc::DeviceHealthTracker> dh) {
+                if (dh) rs->SetDeviceHealth(std::move(dh));
+            });
         // llama.cpp's log callback runs on inference threads: send its lines
         // through the non-blocking diagnostic queue, never to stderr directly.
         lc::SetLogSink(&ForwardLogToDiagnosticQueue);
     }
+
+    ~LlamaCppCoreBackend() override { lc::UnbindCoreBackendDeviceHealth(this); }
 
     [[nodiscard]] std::string name() const override { return kLlamaCppBackendName; }
     [[nodiscard]] std::string description() const override {
@@ -1555,6 +1610,12 @@ public:
             lo.tensor_overrides.push_back({pattern, device});
         }
         const std::string_view dev = options.device_id;
+        const auto health = runtime_state_ ? runtime_state_->DeviceHealth() : nullptr;
+        if (health) {
+            if (Status dh = health->CheckDevicesStatus(lc::CollectInitialGpuDevices(lo, dev)); !dh.ok()) {
+                return dh;
+            }
+        }
         bool has_gpu = false;
         std::vector<lc::DeviceInfo> enumerated_devices;
         if (dev.rfind("gpu", 0) == 0) {
@@ -1567,6 +1628,9 @@ public:
         if (!gpu_layers.ok()) return gpu_layers.status();
         lo.n_gpu_layers = gpu_layers.value();
         if (lo.n_gpu_layers != 0) {
+            if (enumerated_devices.empty() && lo.devices.empty()) {
+                enumerated_devices = lc::LlamaCppBackend::EnumerateDevices();
+            }
             const std::vector<GpuDeviceInfo> os_gpus =
                 (dev.rfind("gpu:", 0) == 0 && lo.devices.empty() && lo.tensor_split.empty())
                     ? enumerate_gpu_devices()
@@ -1586,13 +1650,32 @@ public:
                 }
             }
         }
+        std::vector<std::string> active_gpu_devices = lc::CollectActiveGpuDevices(lo, enumerated_devices, dev);
+        if (health && !active_gpu_devices.empty()) {
+            if (dev.rfind("gpu:", 0) == 0 && active_gpu_devices.size() == 1u) {
+                (void)health->RegisterAlias(dev, active_gpu_devices[0]);
+            }
+            if (Status dh = health->CheckDevicesStatus(active_gpu_devices); !dh.ok()) {
+                return dh;
+            }
+        }
 
         lc::LlamaCppBackend runtime;
+        if (health && !active_gpu_devices.empty()) {
+            lc::BindBackendDeviceHealth(&runtime, health, active_gpu_devices);
+        }
         double load_ms = 0.0;
         runtime.SetTelemetrySink([&](const lc::TelemetryEvent& e) {
             if (e.kind == lc::TelemetryKind::kModelLoaded) load_ms = e.elapsed_ms;
         });
-        if (lc::Status s = runtime.Load(lo); !s.ok()) return ToStatus(s);
+        if (lc::Status s = runtime.Load(lo); !s.ok()) {
+            if (health && !active_gpu_devices.empty()) {
+                if (Status dh = health->CheckDevicesStatus(active_gpu_devices); !dh.ok()) {
+                    return dh;
+                }
+            }
+            return ToStatus(s);
+        }
         runtime.SetTelemetrySink({});
         if (matched_alias.has_value()) {
             if (lc::Status ls = lc::ApplyLoraAdapters(runtime, matched_alias->adapters, effective_lora_roots);
@@ -1639,7 +1722,16 @@ public:
             runtime_state_->RegisterModel(info.n_ctx, lo.n_gpu_layers != 0, uma_target, d.name, spec_info);
         runtime_state_->RefreshGpuMemory(/*force=*/true);
         return std::shared_ptr<BackendModel>(std::make_shared<LlamaCppModel>(
-            std::move(d), std::move(runtime), load_ms, loaded_slots, runtime_state_, model_id));
+            std::move(d), std::move(runtime), load_ms, loaded_slots, runtime_state_, model_id,
+            std::move(active_gpu_devices)));
+    }
+
+    Status RecoverDevice(std::string_view device) {
+        const auto dh = runtime_state_ ? runtime_state_->DeviceHealth() : nullptr;
+        if (!dh) {
+            return Status(ErrorCode::internal, "device health tracker is not initialized");
+        }
+        return dh->RecoverDevice(device);
     }
 
 private:
@@ -1669,6 +1761,18 @@ std::shared_ptr<Backend> MakeLlamaCppBackendForTest(LlamaCppBackendOptions optio
 }
 
 }  // namespace llamacpp_detail
+
+bool is_llamacpp_device_unhealthy_error(const Status& status) noexcept {
+    return lc::IsDeviceUnhealthyInferenceStatus(status);
+}
+
+Status recover_llamacpp_device(Backend& backend, std::string_view device) {
+    auto* core = dynamic_cast<LlamaCppCoreBackend*>(&backend);
+    if (core == nullptr) {
+        return lc::RecoverCoreBackendDevice(backend, device);
+    }
+    return core->RecoverDevice(device);
+}
 
 Status validate_llamacpp_options(const LlamaCppBackendOptions& options) {
     lc::LoadOptions lo;

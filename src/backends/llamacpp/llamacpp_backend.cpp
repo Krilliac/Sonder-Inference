@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "batch_scheduler.hpp"
+#include "device_health.hpp"
 #include "grammar_retry.hpp"
 #include "embed_batch_planner.hpp"
 #include "gguf_compat.hpp"
@@ -66,6 +67,10 @@ static_assert(static_cast<int>(LogLevel::kInfo) == GGML_LOG_LEVEL_INFO);
 static_assert(static_cast<int>(LogLevel::kWarn) == GGML_LOG_LEVEL_WARN);
 static_assert(static_cast<int>(LogLevel::kError) == GGML_LOG_LEVEL_ERROR);
 static_assert(static_cast<int>(LogLevel::kCont) == GGML_LOG_LEVEL_CONT);
+static_assert(static_cast<int>(GgmlComputeStatus::kAllocFailed) == GGML_STATUS_ALLOC_FAILED);
+static_assert(static_cast<int>(GgmlComputeStatus::kFailed) == GGML_STATUS_FAILED);
+static_assert(static_cast<int>(GgmlComputeStatus::kSuccess) == GGML_STATUS_SUCCESS);
+static_assert(static_cast<int>(GgmlComputeStatus::kAborted) == GGML_STATUS_ABORTED);
 
 namespace {
 
@@ -1350,6 +1355,19 @@ struct LlamaCppBackend::Impl {
         return false;
     }
 
+    int32_t RunDecode(llama_context* c, llama_batch b, Status* err_out = nullptr) const {
+        return RunBoundBackendDecode(owner.load(std::memory_order_acquire),
+                                     [&] { return TryDecode(c, b, err_out); });
+    }
+    int32_t RunEncode(llama_context* c, llama_batch b, Status* err_out = nullptr) const {
+        return RunBoundBackendDecode(owner.load(std::memory_order_acquire),
+                                     [&] { return TryEncode(c, b, err_out); });
+    }
+    [[nodiscard]] bool HasBoundDeviceFault() const {
+        const LlamaCppBackend* self = owner.load(std::memory_order_acquire);
+        return HasBoundBackendDeviceTracker(self) && !CheckBoundBackendDeviceHealth(self).ok();
+    }
+
     // Snapshots an evicted VRAM slot's sequence state into the bounded L2
     // host-RAM Radix prefix cache (strictly enforcing LRU eviction BEFORE
     // allocating the state buffer).
@@ -2137,7 +2155,7 @@ struct LlamaCppBackend::Impl {
             std::memcpy(dft_batch.embd,
                         d.h.data() + static_cast<std::size_t>(off) * static_cast<std::size_t>(mtp_n_embd),
                         row_bytes * static_cast<std::size_t>(step_n));
-            if (TryDecode(ctx_dft, dft_batch) != 0) {
+            if (RunDecode(ctx_dft, dft_batch) != 0) {
                 d.Clear();
                 return false;
             }
@@ -2190,7 +2208,7 @@ struct LlamaCppBackend::Impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
 #endif
                 }
-                if (TryDecode(ctx_dft, dft_batch) != 0) {
+                if (RunDecode(ctx_dft, dft_batch) != 0) {
                     ok = false;
                     break;
                 }
@@ -2283,7 +2301,7 @@ struct LlamaCppBackend::Impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
 #endif
                 }
-                if (TryDecode(ctx_dft, dft_batch) != 0) {
+                if (RunDecode(ctx_dft, dft_batch) != 0) {
                     ok = false;
                     break;
                 }
@@ -2361,7 +2379,7 @@ struct LlamaCppBackend::Impl {
                 llama_set_nextn_layer_offset(ctx_dft, step);
 #endif
             }
-            if (TryDecode(ctx_dft, dft_batch) != 0) {
+            if (RunDecode(ctx_dft, dft_batch) != 0) {
                 if (step == 0 && fused_catchup && !d.pos.empty()) {
                     trim_from = d.pos.front();
                 }
@@ -2495,9 +2513,11 @@ LlamaCppBackend::LlamaCppBackend() : impl_(std::make_unique<Impl>()) {
     RegisterLlamaCppBackendForLora(this, impl_.get(), Impl::LoraHooks());
 }
 LlamaCppBackend::~LlamaCppBackend() {
+    UnbindBackendDeviceHealth(this);
     UnregisterLlamaCppBackendForLora(this);
 }
 LlamaCppBackend::LlamaCppBackend(LlamaCppBackend&& other) noexcept : impl_(std::move(other.impl_)) {
+    MoveBackendDeviceHealth(&other, this);
     if (impl_) {
         impl_->owner.store(this, std::memory_order_release);
         TransferLlamaCppBackendForLora(&other, this);
@@ -2507,6 +2527,8 @@ LlamaCppBackend::LlamaCppBackend(LlamaCppBackend&& other) noexcept : impl_(std::
 }
 LlamaCppBackend& LlamaCppBackend::operator=(LlamaCppBackend&& other) noexcept {
     if (this != &other) {
+        UnbindBackendDeviceHealth(this);
+        MoveBackendDeviceHealth(&other, this);
         UnregisterLlamaCppBackendForLora(this);
         impl_ = std::move(other.impl_);
         if (impl_) {
@@ -3545,6 +3567,9 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
                              "reranking/classification pooling is not supported for dense embeddings");
     }
 
+    if (const DeviceHealthError dh = CheckBoundBackendDeviceHealth(this); !dh.ok()) {
+        return Status::Error(ErrorCode::kDecodeFailed, dh.FormatMessage());
+    }
     const int32_t n_vocab = llama_vocab_n_tokens(impl_->vocab);
     const int32_t n_embd = QueryModelEmbeddingDim(impl_->model);
     if (n_embd <= 0) {
@@ -3745,8 +3770,8 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
                 }
                 last_tok_idx.push_back(impl_->embed_batch.n_tokens - 1);
             }
-            const int32_t rc = encoder_only ? TryEncode(ectx, impl_->embed_batch, &batch_error)
-                                            : TryDecode(ectx, impl_->embed_batch, &batch_error);
+            const int32_t rc = encoder_only ? impl_->RunEncode(ectx, impl_->embed_batch, &batch_error)
+                                            : impl_->RunDecode(ectx, impl_->embed_batch, &batch_error);
             if (rc != 0) {
                 if (!cancelled() && batch_error.ok()) {
                     batch_error = Status::Error(ErrorCode::kDecodeFailed,
@@ -3820,6 +3845,9 @@ Status LlamaCppBackend::ScorePairs(const std::vector<std::vector<Token>>& pairs,
                              "loaded model does not support reranking (RANK pooling is required)");
     }
 
+    if (const DeviceHealthError dh = CheckBoundBackendDeviceHealth(this); !dh.ok()) {
+        return Status::Error(ErrorCode::kDecodeFailed, dh.FormatMessage());
+    }
     const int32_t n_vocab = llama_vocab_n_tokens(impl_->vocab);
     const uint32_t base_ctx = std::max<uint32_t>(256u, Impl::EffectiveCtxSeq(impl_->ctx));
     std::vector<std::size_t> lengths;
@@ -3982,8 +4010,8 @@ Status LlamaCppBackend::ScorePairs(const std::vector<std::vector<Token>>& pairs,
                 }
                 last_tok_idx.push_back(impl_->rank_batch.n_tokens - 1);
             }
-            const int32_t rc = encoder_only ? TryEncode(rctx, impl_->rank_batch, &batch_error)
-                                            : TryDecode(rctx, impl_->rank_batch, &batch_error);
+            const int32_t rc = encoder_only ? impl_->RunEncode(rctx, impl_->rank_batch, &batch_error)
+                                            : impl_->RunDecode(rctx, impl_->rank_batch, &batch_error);
             if (rc != 0) {
                 if (!cancelled() && batch_error.ok()) {
                     batch_error = Status::Error(ErrorCode::kDecodeFailed,
@@ -4067,6 +4095,10 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
     if (Status s = ValidatePromptTokens(request.prompt, n_vocab); !s.ok()) return fail(s.code, s.message);
     if (Status s = ValidateSamplingRequestGuards(request.sampling, n_vocab); !s.ok()) {
         return fail(s.code, s.message);
+    }
+
+    if (const DeviceHealthError dh = CheckBoundBackendDeviceHealth(this); !dh.ok()) {
+        return fail(ErrorCode::kDecodeFailed, dh.FormatMessage());
     }
 
     // When n_slots > 1, dispatch through the single-owner continuous-batching
@@ -4617,7 +4649,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                          static_cast<llama_pos>(cur_pos + j), slot_id, is_last_prompt_tok);
             }
             Status decode_err;
-            const int32_t rc = TryDecode(ctx, batch, &decode_err);
+            const int32_t rc = RunDecode(ctx, batch, &decode_err);
             if (rc == 2) {
                 if (!llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(cur_pos), -1)) {
                     invalidate_slot();
@@ -4627,7 +4659,10 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                 return result;
             }
             if (rc != 0) {
-                if (!llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(cur_pos), -1)) {
+                if (!RecoverOrInvalidateAfterDecodeFailure(
+                        owner.load(std::memory_order_acquire), rc,
+                        [&] { return llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(cur_pos), -1); },
+                        [&] { radix_cache.Clear(); })) {
                     invalidate_slot();
                 }
                 if (!decode_err.ok()) return fail(decode_err.code, decode_err.message);
@@ -4914,6 +4949,11 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                     const auto k_lim = static_cast<int32_t>(std::min<int64_t>(max_k, effective_draft_max));
                     if (!MtpDraft(slot_id, cur_tok, pos, k_lim, draft_tokens)) {
                         if (cancelled()) return finish(StopReason::kCancelled);
+                        if (HasBoundDeviceFault()) {
+                            invalidate_slot();
+                            result.status = Status::Error(ErrorCode::kDecodeFailed, "MTP draft decode device fault");
+                            return finish(StopReason::kError);
+                        }
                         use_mtp = false;
                         use_hybrid_suffix = false;
                         result.spec_transitioned_during_request = true;
@@ -5014,23 +5054,27 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         const Clock::time_point verify_start =
             (stage_prof && !draft_tokens.empty()) ? Clock::now() : Clock::time_point{};
         Status decode_err;
-        const int32_t rc = TryDecode(ctx, batch, &decode_err);
+        const int32_t rc = RunDecode(ctx, batch, &decode_err);
         if (stage_prof && !draft_tokens.empty()) {
             add_stage_ms(result.stage_timings.verify_ms, MsSince(verify_start));
         }
         if (rc != 0) {
-            bool rolled_back = CheckSwaRollback(slot_idx, mem, slot_id, static_cast<std::uint64_t>(pos)) &&
-                               llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
-            if (!rolled_back) {
+            const bool rolled_back = RecoverOrInvalidateAfterDecodeFailure(
+                owner.load(std::memory_order_acquire), rc,
+                [&] {
+                    bool ok = CheckSwaRollback(slot_idx, mem, slot_id, static_cast<std::uint64_t>(pos)) &&
+                              llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
-                if (have_spec_ckpt && !swa_compact_active) {
-                    const llama_state_seq_flags flags = PartialCheckpointFlags();
-                    const std::size_t read =
-                        TryStateSeqSetDataExt(ctx, spec_ckpt_buf.data(), spec_ckpt_size, slot_id, flags);
-                    rolled_back = (read > 0) && llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
-                }
+                    if (!ok && have_spec_ckpt && !swa_compact_active) {
+                        const llama_state_seq_flags flags = PartialCheckpointFlags();
+                        const std::size_t read =
+                            TryStateSeqSetDataExt(ctx, spec_ckpt_buf.data(), spec_ckpt_size, slot_id, flags);
+                        ok = (read > 0) && llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
+                    }
 #endif
-            }
+                    return ok;
+                },
+                [&] { radix_cache.Clear(); });
             if (!rolled_back) {
                 invalidate_slot();
             }
@@ -5184,7 +5228,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                                      static_cast<llama_pos>(pos + 1 + static_cast<int64_t>(j)), slot_id,
                                      /*logits=*/false);
                         }
-                        if (TryDecode(ctx, batch) != 0) {
+                        if (RunDecode(ctx, batch) != 0) {
                             invalidate_slot();
                             return finish_rb(false);
                         }
@@ -6331,17 +6375,20 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 }
                 auto decode_start = Clock::now();
                 Status decode_err;
-                int32_t rc = TryDecode(ctx, batch, &decode_err);
+                int32_t rc = RunDecode(ctx, batch, &decode_err);
                 while (rc == 1 && evict_one_idle_slot()) {
                     abort_requested.store(false, std::memory_order_relaxed);
                     decode_start = Clock::now();
-                    rc = TryDecode(ctx, batch, &decode_err);
+                    rc = RunDecode(ctx, batch, &decode_err);
                 }
                 const double prefill_decode_ms = MsSince(decode_start);
                 batch_abort_fn = nullptr;
                 active_cancel = nullptr;
                 if (rc != 0) {
-                    if (!llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1)) {
+                    if (!RecoverOrInvalidateAfterDecodeFailure(
+                            owner.load(std::memory_order_acquire), rc,
+                            [&] { return llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1); },
+                            [&] { radix_cache.Clear(); })) {
                         invalidate_slot(s);
                     }
                     if (rc == 2) {
@@ -6575,6 +6622,13 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                                 active.clear();
                                 continue;
                             }
+                            if (HasBoundDeviceFault()) {
+                                invalidate_slot(s);
+                                s.result.status = Status::Error(ErrorCode::kDecodeFailed, "MTP draft decode device fault");
+                                finish_slot(s, StopReason::kError);
+                                active.clear();
+                                continue;
+                            }
                             s.spec_transition.MarkMtpRuntimeFailure();
                             s.spec_transition.MarkSlotInvalidated();
                             sync_slot_flags_from_transition(s);
@@ -6675,11 +6729,11 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 
             auto decode_start = Clock::now();
             Status decode_err;
-            int32_t rc = TryDecode(ctx, batch, &decode_err);
+            int32_t rc = RunDecode(ctx, batch, &decode_err);
             while (rc == 1 && evict_one_idle_slot()) {
                 abort_requested.store(false, std::memory_order_relaxed);
                 decode_start = Clock::now();
-                rc = TryDecode(ctx, batch, &decode_err);
+                rc = RunDecode(ctx, batch, &decode_err);
             }
             const double decode_call_ms = MsSince(decode_start);
             if (slot_stage_prof && !draft_tokens.empty()) {
@@ -6688,19 +6742,22 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             batch_abort_fn = nullptr;
             active_cancel = nullptr;
             if (rc != 0) {
-                bool rolled_back =
-                    CheckSwaRollback(s.slot_idx, mem, s.slot_id, static_cast<std::uint64_t>(s.pos)) &&
-                    llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1);
-                if (!rolled_back) {
+                const bool rolled_back = RecoverOrInvalidateAfterDecodeFailure(
+                    owner.load(std::memory_order_acquire), rc,
+                    [&] {
+                        bool ok = CheckSwaRollback(s.slot_idx, mem, s.slot_id, static_cast<std::uint64_t>(s.pos)) &&
+                                  llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1);
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
-                    if (have_spec_ckpt && !swa_compact_active) {
-                        const llama_state_seq_flags flags = PartialCheckpointFlags();
-                        const std::size_t read = TryStateSeqSetDataExt(ctx, spec_ckpt_buf.data(), spec_ckpt_size,
-                                                                       s.slot_id, flags);
-                        rolled_back = (read > 0) && llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1);
-                    }
+                        if (!ok && have_spec_ckpt && !swa_compact_active) {
+                            const llama_state_seq_flags flags = PartialCheckpointFlags();
+                            const std::size_t read = TryStateSeqSetDataExt(ctx, spec_ckpt_buf.data(),
+                                                                                  spec_ckpt_size, s.slot_id, flags);
+                            ok = (read > 0) && llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1);
+                        }
 #endif
-                }
+                        return ok;
+                    },
+                    [&] { radix_cache.Clear(); });
                 if (!rolled_back) invalidate_slot(s);
                 if (rc == 2) {
                     finish_slot(s, StopReason::kCancelled);
@@ -6879,7 +6936,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                                          static_cast<llama_pos>(s.pos + 1 + static_cast<int64_t>(j)), s.slot_id,
                                          /*logits=*/false);
                             }
-                            if (TryDecode(ctx, batch) != 0) {
+                            if (RunDecode(ctx, batch) != 0) {
                                 invalidate_slot(s);
                                 return finish_rb(false);
                             }
@@ -7125,11 +7182,11 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 const auto step_start = Clock::now();
                 auto decode_start = step_start;
                 Status decode_err;
-                int32_t rc = TryDecode(ctx, batch, &decode_err);
+                int32_t rc = RunDecode(ctx, batch, &decode_err);
                 while (rc == 1 && evict_one_idle_slot()) {
                     abort_requested.store(false, std::memory_order_relaxed);
                     decode_start = Clock::now();
-                    rc = TryDecode(ctx, batch, &decode_err);
+                    rc = RunDecode(ctx, batch, &decode_err);
                 }
                 const double decode_call_ms = MsSince(decode_start);
                 batch_abort_fn = nullptr;
@@ -7151,12 +7208,20 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 } else if (rc != 0) {
                     ran_concurrent_spec = true;
                     const bool stopping = worker_stop.load(std::memory_order_acquire);
+                    const bool fatal_device_fault =
+                        HasBoundDeviceFault() && (ClassifyDecodeStatus(rc) != DeviceFaultReason::kNone);
+                    if (fatal_device_fault) radix_cache.Clear();
                     for (const ConcurrentSpecSlotPlan& item : cplan.slots) {
                         ActiveBatchSlot* s = find_active_by_slot(item.slot_index);
                         if (s == nullptr) continue;
-                        const bool swa_ok =
-                            CheckSwaRollback(s->slot_idx, mem, s->slot_id, static_cast<std::uint64_t>(s->pos));
-                        if (!swa_ok || !llama_memory_seq_rm(mem, s->slot_id, static_cast<llama_pos>(s->pos), -1)) {
+                        if (!RecoverOrInvalidateAfterDecodeFailure(
+                                owner.load(std::memory_order_acquire), rc,
+                                [&] {
+                                    return CheckSwaRollback(s->slot_idx, mem, s->slot_id,
+                                                            static_cast<std::uint64_t>(s->pos)) &&
+                                           llama_memory_seq_rm(mem, s->slot_id, static_cast<llama_pos>(s->pos), -1);
+                                },
+                                {})) {
                             invalidate_slot(*s);
                         }
                         if (rc == 2 && (s->IsCancelled() || stopping)) {
@@ -7565,14 +7630,14 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         const auto step_start = Clock::now();
         auto decode_start = step_start;
         Status decode_err;
-        int32_t rc = TryDecode(ctx, batch, &decode_err);
+        int32_t rc = RunDecode(ctx, batch, &decode_err);
 
         // Under unified KV (`kv_unified=true`), idle prefix-cached slots share
         // the same n_ctx pool; evict LRU idle slots before retrying on rc==1.
         while (rc == 1 && evict_one_idle_slot()) {
             abort_requested.store(false, std::memory_order_relaxed);
             decode_start = Clock::now();
-            rc = TryDecode(ctx, batch, &decode_err);
+            rc = RunDecode(ctx, batch, &decode_err);
         }
 
         // If KV is still full after idle eviction and multiple active slots
@@ -7637,7 +7702,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             pack_plan(plan);
             abort_requested.store(false, std::memory_order_relaxed);
             decode_start = Clock::now();
-            rc = TryDecode(ctx, batch, &decode_err);
+            rc = RunDecode(ctx, batch, &decode_err);
         }
 
         // If a mixed prefill+decode batch still returned rc==1 (no KV slot for
@@ -7656,18 +7721,26 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             pack_plan(plan);
             abort_requested.store(false, std::memory_order_relaxed);
             decode_start = Clock::now();
-            rc = TryDecode(ctx, batch, &decode_err);
+            rc = RunDecode(ctx, batch, &decode_err);
         }
         const double decode_call_ms = MsSince(decode_start);
         batch_abort_fn = nullptr;
 
         if (rc != 0) {
             const bool stopping = worker_stop.load(std::memory_order_acquire);
+            const bool fatal_device_fault =
+                HasBoundDeviceFault() && (ClassifyDecodeStatus(rc) != DeviceFaultReason::kNone);
+            if (fatal_device_fault) radix_cache.Clear();
             for (const PlannedBatchItem& item : plan.items) {
                 ActiveBatchSlot* s = find_active_by_slot(item.slot_index);
                 if (s == nullptr) continue;
-                const bool swa_ok = CheckSwaRollback(s->slot_idx, mem, s->slot_id, static_cast<std::uint64_t>(s->pos));
-                if (!swa_ok || !llama_memory_seq_rm(mem, s->slot_id, static_cast<llama_pos>(s->pos), -1)) {
+                if (!RecoverOrInvalidateAfterDecodeFailure(
+                        owner.load(std::memory_order_acquire), rc,
+                        [&] {
+                            return CheckSwaRollback(s->slot_idx, mem, s->slot_id, static_cast<std::uint64_t>(s->pos)) &&
+                                   llama_memory_seq_rm(mem, s->slot_id, static_cast<llama_pos>(s->pos), -1);
+                        },
+                        {})) {
                     invalidate_slot(*s);
                 }
                 if (rc == 2 && (s->IsCancelled() || stopping)) {

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -147,5 +148,10 @@ struct LlamaCppBackendOptions {
 Status validate_llamacpp_options(const LlamaCppBackendOptions& options);
 
 std::shared_ptr<Backend> make_llamacpp_backend(LlamaCppBackendOptions options = {});
+
+#define SONDER_HAS_LLAMACPP_DEVICE_HEALTH_API 1
+inline constexpr std::string_view kLlamaCppDeviceUnhealthyError = "device_unhealthy";
+[[nodiscard]] bool is_llamacpp_device_unhealthy_error(const Status& status) noexcept;
+Status recover_llamacpp_device(Backend& backend, std::string_view device);
 
 }  // namespace sonder::inference

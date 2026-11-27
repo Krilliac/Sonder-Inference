@@ -479,6 +479,7 @@ endif()
 # --- expected features end ---
 
 add_library(sonder_backend_llamacpp STATIC
+    device_health.cpp
     gguf_compat.cpp
     llamacpp_backend.cpp
     llamacpp_util.cpp
