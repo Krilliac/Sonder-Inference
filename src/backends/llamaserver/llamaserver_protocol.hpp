@@ -43,6 +43,11 @@ struct RequestExtras {
     // Per-request speculative draft length ("speculative.n_max" in llama-server
     // tools/server/server-task.cpp). Omitted when unset or in generic mode.
     std::optional<std::uint32_t> spec_draft_n_max = std::nullopt;
+    // Telemetry-only probability probe: "n_probs" plus "post_sampling_probs":
+    // true (tools/server/server-schema.cpp; the OpenAI chat endpoint copies
+    // both through). 0 = omitted. Set only when the caller did not ask for
+    // logprobs, so it never collides with the caller's own n_probs.
+    std::uint32_t telemetry_n_probs = 0;
 };
 
 // GET /props: the per-slot context (default_generation_settings.n_ctx, or a
