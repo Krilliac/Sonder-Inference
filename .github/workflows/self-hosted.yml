@@ -24,6 +24,10 @@ permissions:
 # These runners share the owner's workstation (31 GB RAM, with WSL capped at about
 # 15 GB) with its interactive work and local builds. An uncapped Ninja build
 # (nproc + 2 = 26 jobs) thrashed the WSL VM on 2026-11-27, so parallelism is capped.
+# Timing-sensitive tests (loopback mocks, tuner timeouts) can miss a deadline when
+# both repositories' jobs share the box, so a failed test is retried up to twice
+# here. The hosted ci.yml runs every test once with no retry, and the merge train
+# still parks a PR on any failed hosted check, so a real flake stays visible.
 env:
   CMAKE_BUILD_PARALLEL_LEVEL: "4"
   CTEST_PARALLEL_LEVEL: "4"
@@ -49,7 +53,7 @@ jobs:
         run: cmake --build --preset ci-windows
 
       - name: Test
-        run: ctest --preset ci-windows
+        run: ctest --preset ci-windows --repeat until-pass:3
 
   linux:
     name: self-hosted linux
@@ -66,4 +70,4 @@ jobs:
         run: cmake --build --preset ci-linux
 
       - name: Test
-        run: ctest --preset ci-linux
+        run: ctest --preset ci-linux --repeat until-pass:3
