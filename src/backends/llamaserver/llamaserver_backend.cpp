@@ -20,6 +20,7 @@
 #include "llamaserver_stream.hpp"
 #include "net/http_client.hpp"
 #include "prefix_warmup.hpp"
+#include "rpc_worker.hpp"
 #include "slot_affinity.hpp"
 #include "supervisor.hpp"
 
@@ -282,7 +283,8 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             llamaserver::SupervisorOptions s;
             s.environment = options_.environment;
             s.executable = options_.executable;
-            s.arguments = options_.args;
+            // rpc_worker (validated above) prepends --rpc; operator args never carry it.
+            s.arguments = llamaserver::rpc_worker_arguments(options_.rpc_worker, options_.args);
             s.readiness_timeout = options_.startup_timeout;
             s.health_poll_interval = options_.poll_interval;
             s.restart_initial_backoff = options_.restart_backoff;
@@ -547,6 +549,16 @@ class LlamaServerBackendImpl final : public LlamaServerBackend,
             if (!status.diagnostics)
                 status.diagnostics.emplace();
             status.diagnostics->set("adaptive_speculation", adaptive_spec_->status_json());
+        }
+        if (options_.rpc_worker.enabled && supervisor_) {
+            // Validated, operator-pinned IPv4:PORT literals; no secrets.
+            json::Array servers;
+            for (const auto &server : options_.rpc_worker.servers)
+                servers.emplace_back(server);
+            if (!status.diagnostics)
+                status.diagnostics.emplace();
+            status.diagnostics->set("rpc_worker", json::Object{{"isolated_child", true},
+                                                               {"servers", std::move(servers)}});
         }
         if (options_.stall_guard.generic_progress) {
             std::lock_guard<std::mutex> lock(stall_mutex_);

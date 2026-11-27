@@ -19,7 +19,7 @@ The HTTP server started by `sonder-infer serve` has its own reference:
 | `bench` | Run the benchmark harness over a corpus and write JSON results (plus markdown with `--markdown`). |
 | `tune` | Calibrate a llama-server spawn profile within a time budget; see [calibration](integration/tune.md). |
 | `weights` | Weight-content digest manifests: `weights manifest DIR -o FILE`, `weights verify DIR MANIFEST`; see [weight manifests](integration/weight-manifest.md). Exit status 0 ok, 1 I/O, 2 mismatch, 3 missing/extra, 4 usage. |
-| `models` | List the models a backend can serve. |
+| `models` | List the models a backend can serve; `models import-ollama [DIR]` lists what an existing Ollama models directory would serve through the native engine (read-only, in place; see [model store](integration/model-store.md)). |
 | `backends` | Probe the backends compiled into this build. |
 | `devices` | List host devices (CPU, memory and GPU inventory). |
 | `node` | Print unified local hardware, GPU, backend and capability snapshot (`sonder.inference.node/1`). |
@@ -236,7 +236,8 @@ stats only with `--stats text` or `--stats json`.
 `--telemetry PATH` writes Observatory envelope `sonder.observatory.event/1`
 JSONL to PATH (`-` for stderr); `--telemetry-level off|metrics|standard|deep`
 (default `standard`); `--capture-text` includes generated text in token
-events. With `--telemetry -`, telemetry lines and status lines never
+events (`sonder-infer serve` also has `--text-capture off|on|full`,
+see [TELEMETRY.md](TELEMETRY.md#text-capture-policy)). With `--telemetry -`, telemetry lines and status lines never
 interleave mid-line (stderr is written line by line under one lock).
 
 ## Correlation and scheduling options
