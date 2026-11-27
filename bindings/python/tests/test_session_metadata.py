@@ -30,8 +30,11 @@ def test_session_metadata_correlates_generate_chat_and_stream(lib, tmp_path):
         assert event['run_id'] == metadata.run_id
         assert event['agent_id'] == metadata.agent_id
         assert event['task_id'] == metadata.task_id
-    sequences = [event['sequence'] for event in events]
-    assert sequences == sorted(set(sequences))
+    # Each sequence stream (producer.stream: absent = main, "samples") is numbered on its own.
+    by_stream = {}
+    for event in events:
+        by_stream.setdefault(event['producer'].get('stream'), []).append(event['sequence'])
+    assert all(sequences == sorted(set(sequences)) for sequences in by_stream.values())
     assert len({event['event_id'] for event in events}) == len(events)
     assert all('text' not in event['attributes'] for event in events
                if event['event_type'] == 'inference.token.generated')

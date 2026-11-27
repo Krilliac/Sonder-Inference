@@ -39,8 +39,11 @@ def test_sdk_mock_provenance_survives_generate_chat_and_stream(lib, tmp_path, le
     for event in events:
         if event['event_type'] in ('engine.started', 'engine.stopped', 'device.memory.sample'):
             assert 'synthetic' not in event['producer']
-    sequences = [event['sequence'] for event in events]
-    assert sequences == sorted(set(sequences))
+    # Each sequence stream (producer.stream: absent = main, "samples") is numbered on its own.
+    by_stream = {}
+    for event in events:
+        by_stream.setdefault(event['producer'].get('stream'), []).append(event['sequence'])
+    assert all(sequences == sorted(set(sequences)) for sequences in by_stream.values())
     assert len({event['event_id'] for event in events}) == len(events)
     assert all('text' not in event['attributes'] for event in events
                if event['event_type'] == 'inference.token.generated')
