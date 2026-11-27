@@ -74,7 +74,7 @@ Replay is observational; it is not required to reproduce the exact model generat
 ## Implementation status (v0.1)
 
 As of 2026-09-26 the library emits JSONL envelopes
-(`schema: sonder.observatory.event/1`) with `event_id`, contiguous `sequence`,
+(`schema: sonder.observatory.event/1`) with `event_id`, `sequence` (contiguous per sequence stream: the default stream, plus a `samples` stream named by `producer.stream`),
 RFC 3339 UTC `wall_time`, steady-clock `mono_ns`, `producer`
 (`sonder-inference`, version, node id), `sampling.level`, and the correlation
 ids `session_id`, `run_id`, `request_id`, `agent_id`, `task_id`,

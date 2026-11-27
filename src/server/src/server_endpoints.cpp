@@ -906,9 +906,12 @@ json::Object build_discovery_document(const ServerOptions& opts, const LiveTelem
         {"resume", json::Object{{"header", "Last-Event-ID"},
                                 {"query", "last_event_id"},
                                 {"retained_events", hs.retained},
-                                {"retained_sample_events", hs.sample_retained},
                                 {"oldest_sequence", hs.oldest_sequence},
-                                {"next_sequence", hs.next_sequence}}},
+                                {"next_sequence", hs.next_sequence},
+                                {"streams",
+                                 json::Object{{"samples", json::Object{{"retained_events", hs.sample_retained},
+                                                                       {"oldest_sequence", hs.sample_oldest_sequence},
+                                                                       {"next_sequence", hs.sample_next_sequence}}}}}}},
         {"auth", json::Object{{"required", !opts.token.empty()}, {"schemes", json::Array{"bearer"}}}},
         {"clock", json::Object{{"mono_ns", "host-monotonic"}}},
         {"sampling_level", to_string(opts.telemetry_level)},
@@ -977,9 +980,6 @@ void handle_telemetry_stream(Exchange& ex, const RequestHead& head, Route route,
     std::string preamble = format_head(200, h);
     if (sse) {
         preamble += "retry: 2000\n\n";
-        if (!subscribed.gap_comment.empty()) {
-            preamble += subscribed.gap_comment + "\n\n";
-        }
     }
     bool ok = send_raw(ex, preamble, opts.write_stall_timeout, hard_stop);
     auto last_write = std::chrono::steady_clock::now();
@@ -990,20 +990,7 @@ void handle_telemetry_stream(Exchange& ex, const RequestHead& head, Route route,
             std::min<std::chrono::steady_clock::duration>(opts.heartbeat_interval - since_write,
                                                           std::chrono::milliseconds(250)));
         auto batch = sub->next(std::chrono::duration_cast<std::chrono::milliseconds>(wait), &hard_stop);
-        std::string frame;
-        if (batch.dropped > 0 && sse) {
-            frame += ": dropped " + std::to_string(batch.dropped) + "\n\n";
-        }
-        for (const auto& ev : batch.events) {
-            if (sse) {
-                frame += "id: " + instance_id + "-" + std::to_string(ev->sequence) + "\ndata: ";
-                frame += ev->line;
-                frame += "\n\n";
-            } else {
-                frame += ev->line;
-                frame += "\n";
-            }
-        }
+        const std::string frame = sse ? format_sse_batch(instance_id, batch) : format_ndjson_batch(batch);
         if (!frame.empty()) {
             ok = send_raw(ex, frame, opts.write_stall_timeout, hard_stop);
             last_write = std::chrono::steady_clock::now();

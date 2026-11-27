@@ -26,23 +26,41 @@ Each line of the JSONL stream is one object:
 | Field | Type | Notes |
 | --- | --- | --- |
 | `schema` | string | `sonder.observatory.event/1` |
-| `event_id` | string | `<producer.instance_id>-<sequence>` (contract, see below) |
-| `sequence` | int | contiguous per producer instance, starting at 0. Dropped events take no number |
+| `event_id` | string | `<producer.instance_id>-<sequence>` on the main stream, `<producer.instance_id>-s<sequence>` on the samples stream (contract, see below) |
+| `sequence` | int | contiguous per (producer instance, sequence stream), starting at 0 in each stream. Dropped events take no number |
 | `event_type` | string | one of the names below |
 | `wall_time` | string | RFC 3339 UTC, millisecond precision |
 | `mono_ns` | int | steady clock in ns; see the precision note below |
 | `session_id` | string | engine id (`engine-…`) for engine-scoped events, session id (`sess-…`) for session and request events, bus instance id (`tel-…`) for `telemetry.dropped` |
 | `run_id` | string or null | the host's `SessionOptions::run_id`; **defaults to the engine id** on engine, session, request, scheduler and KV events, so one engine's events group as one run. Null only on `telemetry.dropped` |
 | `request_id`, `agent_id`, `task_id`, `model_instance_id`, `device_id` | string or null | correlation ids; null when unknown |
-| `producer` | object | `name` (`sonder-inference`), `version`, `node_id` (host name), `instance_id` (`tel-…`, one per telemetry bus), `role` (`inference`; additive, from `TelemetryOptions::role`), `synthetic` bool (additive, optional; `TelemetryOptions::synthetic`: true when the events describe synthetic work, i.e. `sonder-infer serve` with the MOCK backend, false when the host knows they do not; absent means unknown, so hosts that do not decide it, such as the CLI, the C ABI and bench, never claim that mock output is real) |
+| `producer` | object | `name` (`sonder-inference`), `version`, `node_id` (host name), `instance_id` (`tel-…`, one per telemetry bus), `stream` (additive, optional: `"samples"` on periodic sample events, absent on every other event; see the stream identity contract), `role` (`inference`; additive, from `TelemetryOptions::role`), `synthetic` bool (additive, optional; `TelemetryOptions::synthetic`: true when the events describe synthetic work, i.e. `sonder-infer serve` with the MOCK backend, false when the host knows they do not; absent means unknown, so hosts that do not decide it, such as the CLI, the C ABI and bench, never claim that mock output is real) |
 | `sampling` | object | `level`: the level **this event was emitted at** (`metrics` / `standard` / `deep`), so a consumer knows what a lower setting would drop; `sampled`: always true |
 | `attributes` | object | per event, listed below |
 
-**Stream identity contract.** One `TelemetryBus` (one engine) numbers all of
-its events, engine, session and request alike, from a single counter.
-`producer.instance_id` names that stream, and `event_id` is always
-`<instance_id>-<sequence>`. Consumers key gap detection on
-`producer.instance_id`, not on `session_id`.
+**Stream identity contract.** One `TelemetryBus` (one engine) has two
+sequence streams, each numbered from 0 by its own counter:
+
+- the **main stream** (the default; events carry no `producer.stream`): every
+  event except periodic samples, engine, session and request alike.
+  `event_id` is `<instance_id>-<sequence>`.
+- the **samples stream** (`producer.stream` is `"samples"`): events whose type
+  ends in `.sample` (`device.memory.sample`, `backend.metrics.sample`,
+  `backend.gpu_memory.sample`). `event_id` is `<instance_id>-s<sequence>`.
+
+`producer.instance_id` names the producer instance; `sequence` is contiguous
+per (instance, stream), so it is unique per (instance, stream) but not per
+instance alone. Stream membership is decided by the producer and read from
+`producer.stream` only; consumers never infer it from `event_type`. Consumers
+key gap detection on `producer.instance_id` plus `producer.stream`, not on
+`session_id`. Other producers (Sonder Runtime, the fake producer) have one
+stream and send no `producer.stream`.
+
+Why two streams: lifecycle events and periodic samples need different
+retention. A retained set that keeps old lifecycle events but drops old
+samples would be non-contiguous in one shared number space, which consumers
+read as loss. With one stream each, every retained window is a contiguous
+suffix of its own stream and no notices are needed.
 
 **`mono_ns` clock.** `mono_ns` is `std::chrono::steady_clock` since its
 platform epoch (boot on Linux and Windows). On Linux that is
@@ -392,42 +410,46 @@ itself is Observatory's (`protocol/producer-discovery.schema.json`,
 - SSE framing: the first write is `retry: 2000`; each event is
   `id: <event_id>` then `data: <envelope>` then a blank line, with no
   `event:` field. Idle streams get a `: keepalive` comment (NDJSON: a blank
-  line) every 15 s.
-- Resume: the `Last-Event-ID` header wins over `?last_event_id=`. The id is
-  split at its last `-` into instance and sequence.
-  - Same instance and still retained: replay from the next sequence, then
+  line) every 15 s. NDJSON carries one envelope per line and nothing else.
+- Resume: the `Last-Event-ID` header wins over `?last_event_id=`. The cursor is
+  one event id, or several separated by `,` (at most one per stream, any
+  order, optional spaces), for example `tel-ab12-41,tel-ab12-s97`. Each member
+  is split at its last `-`: the tail is `<sequence>` (main stream) or
+  `s<sequence>` (samples stream). The rules apply to each stream
+  independently:
+  - Same instance and still retained: replay from the next sequence of that
+    stream, then live.
+  - Same instance but older than the retained window of that stream: an SSE
+    comment `: resume-gap <from>-<to>` (main) or `: resume-gap s<from>-s<to>`
+    (samples) names the missing range, then the whole window of that stream
+    is replayed. The comment is its own block directly before the first
+    replayed event of that stream; there is at most one per stream per
+    connection and a fresh connection never gets one. NDJSON has no comment
+    channel and carries none.
+  - No member for a stream, a member of another instance (**the producer
+    restarted**; this settles the open question recorded here earlier), or a
+    malformed member: replay the whole retained window of that stream, then
     live.
-  - Same instance but older than the retained window: an SSE comment
-    `: resume-gap <from>-<to>` names the missing range, then the whole window
-    is replayed.
-  - Unknown or different instance (**the producer restarted**; this settles
-    the open question recorded here earlier), a malformed id, or no id:
-    replay the whole retained window, then live.
-  - `?since=now`: live only.
-- Retention classes: periodic `*.sample` events (`device.memory.sample`,
-  `backend.metrics.sample`, `backend.gpu_memory.sample`) are kept apart from
-  lifecycle events. The lifecycle ring holds the last `--telemetry-buffer`
-  non-sample events, so samples never evict `backend.registered`, `session.*`,
-  `model.*`, `request.*`, `kv.*` or `scheduler.*`. Samples keep the latest
-  event per (event type, device or backend) plus a short history of
-  `telemetry-buffer / 16` events. A replay merges both classes in sequence
-  order. Evicted samples leave sequence holes between retained events, so
-  "sequence is contiguous" no longer holds for a replay: on SSE every hole
-  (evicted sample or lifecycle event) is announced with its own
-  `: resume-gap <from>-<to>` comment before the event that follows it; NDJSON
-  cannot carry the notice, so there the holes are silent. That, the
-  `retained_sample_events` discovery field and the fact that `oldest_sequence`
-  describes only the lifecycle ring (a replay can start with an older
-  latest-per-key sample) need an agreed Observatory contract change. At most
-  64 sample keys are tracked (the oldest key is evicted beyond that). Lines
-  written through `write()` by producers other than the telemetry bus that
-  serialize with whitespace (`"event_type": "`) are not recognised as samples
-  and stay in the lifecycle class. The default subscriber queue holds a full
-  replay (lifecycle ring + sample history + 64), so a new subscriber loses
-  nothing it is entitled to.
-- Backpressure: the server keeps a ring of the last `--telemetry-buffer`
-  lifecycle events (default 8192) and a bounded queue per subscriber (at most 8
-  subscribers; the ninth gets 429). A subscriber that falls behind loses its
+  - `?since=now`: nothing replayed from either stream, live only.
+  - The replay interleaves the two streams in original emission order. A
+    client that sends only the last id it saw (a plain EventSource) still
+    works: the other stream replays its whole window and the client drops
+    duplicates by `event_id`.
+- Retention: two rings of `--telemetry-buffer` events each, one per stream.
+  Each holds a contiguous suffix of its stream, so a replay is contiguous per
+  stream, samples never evict main events and main events never evict
+  samples. The samples stream is a sliding window with no latest-per-key
+  guarantee: a sample type has to be re-emitted periodically to stay visible
+  to a late subscriber. Discovery reports the main stream in
+  `resume.retained_events`, `resume.oldest_sequence` and
+  `resume.next_sequence`, and the samples stream in
+  `resume.streams.samples` with the same three fields. Lines written to the
+  hub by producers other than the telemetry bus name their stream in
+  `producer.stream`; any value other than `"samples"` is the main stream.
+- Backpressure: the server keeps the two rings above and a bounded queue per
+  subscriber (at most 8 subscribers; the ninth gets 429). The default queue
+  holds a full replay (`2 x --telemetry-buffer`), so a fresh subscriber never
+  loses retained events. A subscriber that falls behind loses its
   oldest undelivered events. That loss is visible as a sequence gap, is
   announced to that subscriber only (SSE comment `: dropped <n>`), and is
   counted as `subscriber_dropped_events` in health and discovery. It is
