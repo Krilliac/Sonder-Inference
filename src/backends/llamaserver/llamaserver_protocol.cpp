@@ -114,6 +114,10 @@ void put_extras(json::Object &o, const RequestExtras &extras, bool emit_speculat
         o.set("id_slot", static_cast<std::int64_t>(*extras.id_slot));
     if (emit_speculative && extras.spec_draft_n_max)
         o.set("speculative.n_max", static_cast<std::int64_t>(*extras.spec_draft_n_max));
+    if (extras.telemetry_n_probs > 0) {
+        o.set("n_probs", static_cast<std::int64_t>(extras.telemetry_n_probs));
+        o.set("post_sampling_probs", true);
+    }
 }
 } // namespace
 
