@@ -427,6 +427,7 @@ endif()
 # --- expected features end ---
 
 add_library(sonder_backend_llamacpp STATIC
+    kv_policy.cpp
     llamacpp_backend.cpp
     llamacpp_util.cpp
 )

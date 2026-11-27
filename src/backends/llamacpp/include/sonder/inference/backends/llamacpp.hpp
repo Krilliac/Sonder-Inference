@@ -34,11 +34,12 @@ struct LlamaCppBackendOptions {
     // Physical micro-batch (llama.cpp n_ubatch). 0 = llama.cpp's default (512)
     // capped at batch_size; otherwise must be <= batch_size.
     std::uint32_t ubatch_size = 0;
-    // KV cache element types: f16 (default), f32, bf16, q8_0, q5_1, q5_0,
-    // q4_1, q4_0, iq4_nl. q8_0 roughly halves KV memory, q4_0 roughly quarters
-    // it (docs/PLACEMENT.md, "KV cache types").
-    std::string kv_cache_type_k = "f16";
-    std::string kv_cache_type_v = "f16";
+    // KV cache element types: q8_0 (default), f16, f32, bf16, q5_1, q5_0,
+    // q4_1, q4_0 (K requires kv_k_q4_allowed + model rotation), iq4_nl, f8_e4m3 (CUDA-only).
+    std::string kv_cache_type_k = "q8_0";
+    std::string kv_cache_type_v = "q8_0";
+    // Explicit opt-in permitting q4_0 for K when the model supports Hadamard K rotation.
+    bool kv_k_q4_allowed = false;
     // Flash Attention: auto (default, llama.cpp decides), on or off. A
     // quantized V cache needs it: "off" with a quantized V type is rejected.
     std::string flash_attention = "auto";

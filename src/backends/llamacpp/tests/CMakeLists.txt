@@ -7,6 +7,7 @@
 #                             reported as Skipped (exit 77) when unset.
 
 sonder_add_module_tests(llamacpp
+    test_kv_policy.cpp
     test_llamacpp_util.cpp
     test_llamacpp_nomodel.cpp
     test_llamacpp_adapter.cpp

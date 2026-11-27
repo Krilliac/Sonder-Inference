@@ -1,0 +1,124 @@
+// Sonder Inference: KV-cache dtype policy for the native llama.cpp backend.
+//
+// Enforces K/V element-type defaults and safety constraints when options are
+// parsed and at model load:
+//   - Default is q8_0 for both K and V.
+//   - q4_0 for K requires explicit opt-in (`kv_k_q4_allowed`) AND model
+//     Hadamard rotation (`attn_rot_k` in llama.cpp v1.0.0); undetectable
+//     rotation support is refused cleanly.
+//   - f8_e4m3 is opt-in and CUDA-only (refused on CPU, Vulkan, and other
+//     non-CUDA backends).
+//   - Unknown or build-unsupported types fail explicitly with no silent
+//     fallback.
+#pragma once
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "sonder/backends/llamacpp/llamacpp_backend.h"
+#include "sonder/inference/backends/llamacpp.hpp"
+#include "sonder/inference/error.hpp"
+
+namespace sonder::backends::llamacpp {
+
+inline constexpr KvCacheType kDefaultKvPolicyType = KvCacheType::kQ8_0;
+inline constexpr std::string_view kDefaultKvPolicyTypeName = "q8_0";
+
+enum class KvDeviceKind : std::uint8_t {
+    kCpu = 0,
+    kCuda = 1,
+    kVulkan = 2,
+    kOther = 3,
+};
+
+[[nodiscard]] std::string_view ToString(KvDeviceKind kind) noexcept;
+
+enum class KvRotationSupport : std::uint8_t {
+    kUnsupported = 0,
+    kSupported = 1,
+    kUnknown = 2,
+};
+
+[[nodiscard]] std::string_view ToString(KvRotationSupport support) noexcept;
+
+// Metadata facts extracted from a GGUF header to evaluate llama.cpp v1.0.0
+// K-cache Hadamard rotation eligibility (src/llama-kv-cache.cpp:300-336,
+// src/llama-model.cpp:1617-1648).
+struct KvModelRotationFacts {
+    std::string architecture;
+    std::optional<std::uint32_t> key_length;
+    std::optional<std::uint32_t> key_length_swa;
+    std::optional<std::uint32_t> embedding_length;
+    std::optional<std::uint32_t> head_count;
+    bool head_count_layer0_zero = false;
+    bool head_count_heterogeneous = false;
+    std::optional<std::uint32_t> indexer_head_size;
+    std::optional<bool> model_attn_rot = true;
+    bool env_attn_rot_disable = false;
+};
+
+struct KvPolicyRequest {
+    KvCacheType type_k = kDefaultKvPolicyType;
+    KvCacheType type_v = kDefaultKvPolicyType;
+    KvDeviceKind device_kind = KvDeviceKind::kCpu;
+    KvRotationSupport rotation = KvRotationSupport::kUnsupported;
+    bool kv_k_q4_allowed = false;
+};
+
+// Maps KvCacheType onto ggml_type (returned as int so ggml.h stays private to
+// sonder_backend_llamacpp). Fails with kInvalidArgument on unknown enum values
+// or types not compiled into this ggml build; never silently falls back.
+[[nodiscard]] Status KvCacheTypeToGgmlType(KvCacheType type, int& out_ggml_type) noexcept;
+
+// Classifies a single ggml device name (e.g. "CPU", "CUDA0", "Vulkan0").
+[[nodiscard]] KvDeviceKind ClassifyKvDeviceName(std::string_view device_name) noexcept;
+
+// Infers target device kind from static options when unambiguous
+// (gpu_layers == 0 -> kCpu; non-empty devices -> classified target; else nullopt).
+[[nodiscard]] std::optional<KvDeviceKind> InferConfiguredKvDeviceKind(
+    std::int32_t gpu_layers, const std::vector<std::string>& devices) noexcept;
+
+// Resolves target device kind at load time from effective n_gpu_layers,
+// explicit/pinned devices, and enumerated runtime devices.
+[[nodiscard]] KvDeviceKind ResolveLoadKvDeviceKind(
+    std::int32_t n_gpu_layers,
+    const std::vector<std::string>& resolved_devices,
+    const std::vector<DeviceInfo>& enumerated_devices) noexcept;
+
+// Pure detector implementing llama.cpp v1.0.0's attn_rot_k eligibility rules.
+[[nodiscard]] KvRotationSupport DetectKvRotationSupport(const KvModelRotationFacts& facts) noexcept;
+
+// Reads GGUF metadata only (gguf_init_from_file with no_alloc=true) plus
+// LLAMA_ATTN_ROT_DISABLE to determine K-cache rotation support for `model_path`.
+[[nodiscard]] KvRotationSupport ProbeGgufKvRotationSupport(const std::string& model_path);
+
+// Parses K/V type strings (rejecting unknown or empty names with
+// invalid_argument) and validates option-parse-time KV policy rules.
+[[nodiscard]] sonder::inference::Status ValidateKvPolicyOptions(
+    std::string_view type_k_name,
+    std::string_view type_v_name,
+    bool kv_k_q4_allowed,
+    std::optional<KvDeviceKind> configured_device,
+    KvCacheType& out_type_k,
+    KvCacheType& out_type_v);
+
+// Full KV-cache dtype policy check (used at load time and directly in tests).
+[[nodiscard]] sonder::inference::Status EvaluateKvCachePolicy(const KvPolicyRequest& req);
+
+// Convenience overload mapping bool has_rotation -> kSupported / kUnsupported.
+[[nodiscard]] inline sonder::inference::Status EvaluateKvCachePolicy(
+    KvCacheType type_k, KvCacheType type_v, KvDeviceKind device_kind,
+    bool has_rotation, bool kv_k_q4_allowed) {
+    return EvaluateKvCachePolicy(KvPolicyRequest{
+        type_k,
+        type_v,
+        device_kind,
+        has_rotation ? KvRotationSupport::kSupported : KvRotationSupport::kUnsupported,
+        kv_k_q4_allowed,
+    });
+}
+
+}  // namespace sonder::backends::llamacpp
