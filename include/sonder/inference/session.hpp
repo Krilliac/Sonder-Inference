@@ -52,11 +52,11 @@ const char* to_string(RequestOutcome outcome) noexcept;
 const char* to_string(WorkloadClass workload) noexcept;
 
 struct SessionOptions {
-    std::string session_id;  // generated when empty
-    std::optional<std::string> run_id;
-    std::optional<std::string> agent_id;
-    std::optional<std::string> task_id;
-    SamplingConfig sampling;
+    std::string session_id{};  // generated when empty
+    std::optional<std::string> run_id{};
+    std::optional<std::string> agent_id{};
+    std::optional<std::string> task_id{};
+    SamplingConfig sampling{};
     // Scheduling metadata (used when the engine schedules requests).
     WorkloadClass workload = WorkloadClass::implementation_worker;
     // Adjusts the class rank: effective rank = class rank - priority, so a
