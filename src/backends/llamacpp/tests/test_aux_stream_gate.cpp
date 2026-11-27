@@ -1102,3 +1102,104 @@ TEST_CASE("NAT-12: llama_synchronize executes inside DecodeStepScope and AuxSlic
         CHECK(rec.aux_syncs_while_in_flight == rec.aux_syncs);
     }
 }
+
+TEST_CASE("NAT-12: live CUDA backend compiles pre-include hook and creates HIGH and LOW priority streams") {
+#if !defined(SONDER_LLAMACPP_CUDA_PRIO_HOOK)
+    MESSAGE("SONDER_LLAMACPP_CUDA_PRIO_HOOK not enabled in this preset - skipping live CUDA verification");
+    return;
+#else
+    const auto devices = LlamaCppBackend::EnumerateDevices();
+    std::string cuda_dev_name;
+    for (const auto& d : devices) {
+        if (d.name.rfind("CUDA", 0) == 0) {
+            cuda_dev_name = d.name;
+            break;
+        }
+    }
+    if (cuda_dev_name.empty()) {
+        MESSAGE("No CUDA device enumerated at runtime - skipping live CUDA verification");
+        return;
+    }
+
+    // Verify system CUDA Driver API primary-context stream priority range on device 0.
+    CudaPriorityStream drv_low_stream;
+    const Status drv_st = CudaPriorityStream::Create(/*device_ordinal=*/0, StreamPriority::kLow, drv_low_stream);
+    REQUIRE(drv_st.ok());
+    REQUIRE(drv_low_stream.valid());
+    CHECK(drv_low_stream.Synchronize().ok());
+    const int least_prio = drv_low_stream.least_priority();
+    const int greatest_prio = drv_low_stream.greatest_priority();
+    const int expected_high = ResolveCudaNumericStreamPriority(least_prio, greatest_prio, StreamPriority::kHigh);
+    const int expected_low = ResolveCudaNumericStreamPriority(least_prio, greatest_prio, StreamPriority::kLow);
+    CHECK(drv_low_stream.numeric_priority() == expected_low);
+    if (least_prio != greatest_prio) {
+        CHECK(expected_high < expected_low);
+    }
+
+    TempGgufDir dir;
+    const std::string main_gguf = WriteTinyLlamaGguf(dir, "cuda-main.gguf", /*n_ctx=*/512u);
+    const std::string aux_gguf = WriteTinyLlamaGguf(dir, "cuda-aux.gguf", /*n_ctx=*/512u);
+
+    auto shared_gate = std::make_shared<DecodeAwareAuxGate>();
+    ResetGgmlCudaStreamPriorityStatsForTest();
+
+    // 1. Main decode workload on CUDA0 -> HIGH numeric stream priority.
+    LlamaCppBackend main_be;
+    LoadOptions lo_main;
+    lo_main.model_path = main_gguf;
+    lo_main.n_ctx = 512u;
+    lo_main.n_batch = 64u;
+    lo_main.n_slots = 1u;
+    lo_main.n_gpu_layers = -1;
+    lo_main.devices = {cuda_dev_name};
+    lo_main.workload_role = WorkloadRole::kMainDecode;
+    lo_main.main_stream_priority = StreamPriority::kHigh;
+    lo_main.shared_aux_gate = shared_gate;
+    REQUIRE(main_be.Load(lo_main).ok());
+    CHECK(main_be.GetAuxExecutionDomain() == "gpu:0");
+
+    GenerateRequest req;
+    req.prompt = {1, 2, 3, 4};
+    req.max_new_tokens = 3;
+    req.sampling.temperature = 0.0f;
+    const GenerateResult main_res = main_be.Generate(req, {});
+    REQUIRE(main_res.status.ok());
+    CHECK(main_res.generated_tokens == 3);
+
+    const GgmlCudaStreamPriorityStats st_high = GetGgmlCudaStreamPriorityStats();
+    CHECK(st_high.preinclude_hook_compiled);
+    REQUIRE(st_high.priority_streams_created >= 1u);
+    CHECK(st_high.last_numeric_priority == expected_high);
+
+    // 2. Auxiliary embedding workload on CUDA0 -> LOW numeric stream priority.
+    LlamaCppBackend aux_be;
+    LoadOptions lo_aux;
+    lo_aux.model_path = aux_gguf;
+    lo_aux.n_ctx = 512u;
+    lo_aux.n_batch = 64u;
+    lo_aux.n_slots = 1u;
+    lo_aux.n_gpu_layers = -1;
+    lo_aux.devices = {cuda_dev_name};
+    lo_aux.workload_role = WorkloadRole::kAuxiliary;
+    lo_aux.aux_stream_priority = StreamPriority::kLow;
+    lo_aux.shared_aux_gate = shared_gate;
+    REQUIRE(aux_be.Load(lo_aux).ok());
+    CHECK(aux_be.GetAuxExecutionDomain() == "gpu:0");
+
+    EmbedOutput emb_out;
+    REQUIRE(aux_be.Embed({{1, 2, 3}, {4, 5, 6}}, /*normalize=*/true, emb_out).ok());
+    CHECK(emb_out.embeddings.size() == 2u);
+
+    const GgmlCudaStreamPriorityStats st_low = GetGgmlCudaStreamPriorityStats();
+    CHECK(st_low.preinclude_hook_compiled);
+    CHECK(st_low.priority_streams_created > st_high.priority_streams_created);
+    CHECK(st_low.last_numeric_priority == expected_low);
+
+    // 3. GPU gate scopes on "gpu:0" synchronized before release.
+    const AuxGateStats gpu_gate_st = shared_gate->GetStats("gpu:0");
+    REQUIRE(gpu_gate_st.decode_steps_total >= 3u);
+    CHECK(gpu_gate_st.decode_steps_synced_before_release == gpu_gate_st.decode_steps_total);
+    REQUIRE(gpu_gate_st.aux_slices_total >= 1u);
+    CHECK(gpu_gate_st.aux_slices_synced_before_release == gpu_gate_st.aux_slices_total);
+#endif
+}

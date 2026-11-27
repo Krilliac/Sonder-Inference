@@ -159,7 +159,10 @@ Fn ResolvePosixSym(void* handle, const char* primary, const char* fallback = nul
     if (p == nullptr && fallback != nullptr) {
         p = ::dlsym(handle, fallback);
     }
-    return reinterpret_cast<Fn>(p);
+    Fn fn = nullptr;
+    static_assert(sizeof(fn) == sizeof(p), "POSIX function pointer must match void* size");
+    std::memcpy(&fn, &p, sizeof(fn));
+    return fn;
 }
 #endif
 

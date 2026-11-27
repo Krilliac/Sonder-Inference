@@ -206,6 +206,13 @@ endif()
 # the static archives be linked into a shared sonder_inference.
 set(BUILD_SHARED_LIBS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+if(GGML_BACKEND_DL)
+    message(WARNING
+        "GGML_BACKEND_DL=ON requested, but the in-process llamacpp backend links static archives and shares "
+        "thread-local CUDA stream priority state across sonder_backend_llamacpp and ggml-cuda; forcing GGML_BACKEND_DL=OFF.")
+endif()
+set(GGML_BACKEND_DL OFF CACHE BOOL
+    "ggml: build backends as dynamic libraries (forced OFF for static in-process llamacpp linkage)" FORCE)
 
 if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
     cmake_policy(SET CMP0135 NEW)
@@ -258,10 +265,12 @@ set_target_properties(sonder_cuda_prio_state PROPERTIES POSITION_INDEPENDENT_COD
 if(COMMAND sonder_set_warnings)
     sonder_set_warnings(sonder_cuda_prio_state)
 endif()
-if(TARGET ggml-cuda AND NOT GGML_HIP AND NOT GGML_MUSA)
+set(_sonder_llamacpp_cuda_prio_hook OFF)
+if(TARGET ggml-cuda AND NOT GGML_HIP AND NOT GGML_MUSA AND NOT GGML_BACKEND_DL)
     target_compile_options(ggml-cuda PRIVATE
         "$<$<COMPILE_LANGUAGE:CUDA>:--pre-include=${CMAKE_CURRENT_SOURCE_DIR}/sonder_ggml_cuda_stream_priority.cuh>")
     target_link_libraries(ggml-cuda PRIVATE sonder_cuda_prio_state)
+    set(_sonder_llamacpp_cuda_prio_hook ON)
 endif()
 
 # Feature auto-detection against the resolved llama.cpp / ggml headers so the
@@ -482,6 +491,9 @@ target_compile_definitions(sonder_backend_llamacpp
     PUBLIC  ${SONDER_LLAMACPP_FEATURE_DEFS}
     PRIVATE SONDER_LLAMACPP_TAG_STRING="${SONDER_LLAMACPP_RESOLVED_TAG}"
 )
+if(_sonder_llamacpp_cuda_prio_hook)
+    target_compile_definitions(sonder_backend_llamacpp PUBLIC SONDER_LLAMACPP_CUDA_PRIO_HOOK=1)
+endif()
 if(COMMAND sonder_set_warnings)
     sonder_set_warnings(sonder_backend_llamacpp)
 endif()
