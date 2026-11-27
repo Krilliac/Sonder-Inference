@@ -130,6 +130,9 @@ Status ProcessOptions::prepare(const ProcessSpec &spec) {
             }
         }
         for (const auto &[key, value] : spec.environment) entries[key] = value;
+        // Set after the overrides (which cannot name it): llama.cpp never
+        // reads a user config.ini in an SI-spawned child (env_policy.hpp).
+        entries[std::string(detail::kChildConfigHomeName)] = std::string(detail::kChildConfigHomeValue);
         environment.clear();
         envp.clear();
         for (const auto &[key, value] : entries) environment.push_back(key + '=' + value);

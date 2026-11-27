@@ -13,8 +13,21 @@
 #include "sonder/inference/json.hpp"
 #include "warmup_config.hpp"
 #include "residency_config.hpp"
+#if defined(SONDER_HAS_WORKER)
+#include "worker/remote_backend.hpp"
+#include "worker/process.hpp"
+#endif
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
 #include "sonder/inference/backends/llamaserver.hpp"
+#endif
+
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+// The setup loader mirrors the backend's rpc_worker bounds so it builds
+// without the backend header; these keep the two from drifting apart.
+static_assert(sonder::inference::BackendSetup::LlamaServerRpcWorkerConfig::kMaxServers ==
+              sonder::inference::LlamaServerRpcWorkerOptions::kMaxServers);
+static_assert(sonder::inference::BackendSetup::LlamaServerRpcWorkerConfig::kMaxServerChars ==
+              sonder::inference::LlamaServerRpcWorkerOptions::kMaxServerChars);
 #endif
 #if defined(SONDER_HAS_OLLAMA_BACKEND)
 #include "sonder/inference/backends/ollama.hpp"
@@ -214,6 +227,43 @@ Status parse_host_memory_config(const json::Value& value, BackendSetup::LlamaSer
     return {};
 }
 
+// Shape and bounds only; the llamaserver backend owns the address policy
+// (rpc_worker.cpp) and refuses a bad literal before any child is spawned.
+Status parse_rpc_worker_config(const json::Value& value, BackendSetup::LlamaServerRpcWorkerConfig& out) {
+    const auto bad = [](const char* key, const char* what) {
+        return Status(ErrorCode::invalid_argument, std::string("llamaserver config: rpc_worker.") + key + " must be " + what);
+    };
+    if (!value.is_object()) return Status(ErrorCode::invalid_argument, "llamaserver config: 'rpc_worker' must be an object");
+    static constexpr std::string_view keys[] = {"enabled", "servers", "allow_public_addresses"};
+    for (const auto& member : value.as_object()) {
+        if (std::find(std::begin(keys), std::end(keys), member.first) == std::end(keys))
+            return Status(ErrorCode::invalid_argument, "llamaserver config: unknown rpc_worker field '" +
+                                                           detail::bounded_for_message(member.first) + "'");
+    }
+    BackendSetup::LlamaServerRpcWorkerConfig parsed;
+    if (const auto* v = value.find("enabled")) {
+        if (!v->is_bool()) return bad("enabled", "boolean");
+        parsed.enabled = v->as_bool();
+    }
+    if (const auto* v = value.find("allow_public_addresses")) {
+        if (!v->is_bool()) return bad("allow_public_addresses", "boolean");
+        parsed.allow_public_addresses = v->as_bool();
+    }
+    if (const auto* v = value.find("servers")) {
+        using Config = BackendSetup::LlamaServerRpcWorkerConfig;
+        if (!v->is_array() || v->as_array().size() > Config::kMaxServers)
+            return bad("servers", ("an array of at most " + std::to_string(Config::kMaxServers) + " strings").c_str());
+        for (const auto& item : v->as_array()) {
+            if (!item.is_string() || item.as_string().empty() || item.as_string().size() > Config::kMaxServerChars ||
+                item.as_string().find('\0') != std::string::npos)
+                return bad("servers", "an array of IPV4:PORT strings");
+            parsed.servers.push_back(item.as_string());
+        }
+    }
+    out = std::move(parsed);
+    return {};
+}
+
 }  // namespace
 
 Status load_llamaserver_config(const std::string& path, BackendSetup& destination) {
@@ -237,7 +287,7 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
             "max_restarts", "tls", "spill_guard", "log_file", "kv_pairing_check", "context_length",
             "slot_affinity", "env", "results", "warmup", "stall_guard", "host_memory",
             "api_key_env", "idle_timeout_ms", "first_content_timeout_ms", "keepalive_gap_ms",
-            "unlimited_request_timeout", "upstream_grammar", "adaptive_speculation"};
+            "unlimited_request_timeout", "upstream_grammar", "adaptive_speculation", "rpc_worker"};
         for (auto k : known) if (k == key) return false;
         return true;
     };
@@ -424,6 +474,9 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
         if (auto st = detail::parse_adaptive_speculation_config(*spec, setup.llamaserver_adaptive_speculation); !st.ok())
             return st;
     }
+    if (const auto* rpc = object.find("rpc_worker")) {
+        if (auto st = parse_rpc_worker_config(*rpc, setup.llamaserver_rpc_worker); !st.ok()) return st;
+    }
     setup.llamaserver_config = path;
     destination = std::move(setup);
     return {};
@@ -431,6 +484,9 @@ Status load_llamaserver_config(const std::string& path, BackendSetup& destinatio
 
 std::vector<std::string> available_backend_names() {
     std::vector<std::string> names{kMockBackendName};
+#if defined(SONDER_HAS_WORKER)
+    names.emplace_back("remote-mock");
+#endif
 #if defined(SONDER_HAS_OLLAMA_BACKEND)
     names.emplace_back(kOllamaBackendName);
 #endif
@@ -443,9 +499,21 @@ std::vector<std::string> available_backend_names() {
     return names;
 }
 
-bool is_synthetic_backend(std::string_view name) noexcept { return name == kMockBackendName; }
+bool is_synthetic_backend(std::string_view name) noexcept { return is_mock_backend(name); }
 
 Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
+    if (setup.backend == "remote-mock") {
+#if defined(SONDER_HAS_WORKER)
+        auto executable = worker::current_executable();
+        if (!executable) return executable.status();
+        worker::RemoteBackendOptions options;
+        options.executable = std::move(executable).value();
+        options.token_delay = std::chrono::duration_cast<std::chrono::milliseconds>(setup.mock_token_delay);
+        return worker::make_remote_backend(std::move(options));
+#else
+        return Status(ErrorCode::unsupported, "this build does not include the worker module");
+#endif
+    }
     if (setup.backend == kMockBackendName) {
         MockBackendOptions mo;
         mo.token_delay = setup.mock_token_delay;
@@ -572,6 +640,9 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
         lo.warmup.slots = setup.llamaserver_warmup_slots;
         lo.warmup.on_restart = setup.llamaserver_warmup_on_restart;
         lo.warmup.max_prefix_chars = setup.llamaserver_warmup_max_prefix_chars;
+        lo.rpc_worker.enabled = setup.llamaserver_rpc_worker.enabled;
+        lo.rpc_worker.servers = setup.llamaserver_rpc_worker.servers;
+        lo.rpc_worker.allow_public_addresses = setup.llamaserver_rpc_worker.allow_public_addresses;
         {
             const auto& s = setup.llamaserver_adaptive_speculation;
             lo.adaptive_speculation.enabled = s.enabled;

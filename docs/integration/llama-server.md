@@ -321,7 +321,7 @@ in [1, 3600000] (one hour); 0 is rejected.
 | `mode` | string, `attach` | `attach` or `spawn`. |
 | `base_url` | string, `http://127.0.0.1:8080` | Attach mode: the server root (optionally with a proxy prefix; no `/v1`). |
 | `executable` | string, empty | Required in spawn mode; the llama-server binary. |
-| `args` | string array, `[]` | Spawn mode: one child argument per entry, no shell. `--host`, `--port` and `--` are refused. |
+| `args` | string array, `[]` | Spawn mode: one child argument per entry, no shell. `--host`, `--port`, `--`, `--rpc` and `--models-preset` are refused (cross-host split uses `rpc_worker`; a preset INI could set `rpc`). |
 | `allow_remote` | bool, `false` | Attach to a non-loopback host; requires HTTPS (see "Security and configuration limits" above). |
 | `native_completion` | bool, `true` | `false` selects generic OpenAI mode (`/v1/completions`). |
 | `grammar` | string, empty | Upstream GBNF; see [Sampling and observations](#sampling-and-observations). |
@@ -345,6 +345,7 @@ in [1, 3600000] (one hour); 0 is rejected.
 | `kv_pairing_check` | bool, `true` | Warn when FlashAttention may run with mismatched K/V cache types. See [vram-spill.md](vram-spill.md). |
 | `env` | object of strings, absent | Child-only environment overrides; at most 128 entries and about 32 KiB. `AIP_*` is refused. |
 | `results` | object, absent | Inert tune provenance (schema `sonder.inference.tune/1`); accepted only with an explicit spawn configuration that has `executable` and `args`. |
+| `rpc_worker` | object, absent | Spawn mode only: `enabled` (bool, `false`), `servers` (at most 16 `IPV4:PORT` strings) and `allow_public_addresses` (bool, `false`). Makes this child an isolated llama.cpp RPC worker; see [rpc-worker.md](rpc-worker.md). |
 
 ### `tls` object
 
@@ -424,6 +425,9 @@ Behaviour: "Host-memory admission (MoE offload)" below.
   spawn mode fails at backend construction.
 - `stall_guard.policy` of `cancel` without `generic_progress`, and
   `generic_progress` with `restart`, are refused.
+- `rpc_worker` needs spawn mode, and `rpc_worker.servers` without
+  `"enabled": true` is refused rather than ignored. `serve` refuses
+  `rpc_worker` together with `--profile` or `--all-profiles`.
 - A spawned child's own llama-server flags, including model placement and
   context, go in `args` (or come from a [launch profile](launch-profiles.md)).
 

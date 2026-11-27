@@ -151,6 +151,10 @@ int serve_main(const std::vector<std::string>& args, std::ostream& out, std::ost
         diag("warning", "listening on a non-loopback address without TLS: the bearer token and all traffic travel "
                         "in cleartext; put a TLS-terminating proxy in front");
     }
+    if (const std::string notice = text_capture_startup_notice(combine_text_capture(o.text_capture, o.capture_text));
+        !notice.empty()) {
+        diag("warning", notice);
+    }
 
     const std::string& ready_path = cfg.ready_path;
     std::string models;

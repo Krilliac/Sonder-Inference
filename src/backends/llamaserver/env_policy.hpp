@@ -164,7 +164,8 @@ inline bool is_allowed_inherited_upper(std::string_view upper) noexcept {
         "TMPDIR",
         "HOME",
         "USERPROFILE",
-        "APPDATA",
+        // Not APPDATA: it names llama.cpp's user config.ini on Windows (see
+        // the config.ini note above kChildConfigHomeName).
         "LOCALAPPDATA",
         "TZ",
         "LANG",
@@ -194,6 +195,24 @@ inline bool is_allowed_inherited_upper(std::string_view upper) noexcept {
     }
     return false;
 }
+
+// llama.cpp's common_params_parse_ex applies <config dir>/llama.cpp/config.ini
+// before the environment and argv (common_params_apply_system_config, common/
+// arg.cpp:716-766 at b11195), and every key there reaches the matching option
+// handler: an "rpc" key would put the RPC client into any spawned child, and
+// "host"/"port" or download keys would get past the argument checks. The
+// config dir is %APPDATA% on Windows (unset: the file is skipped) and
+// $XDG_CONFIG_HOME, else $HOME/.config, on POSIX. So APPDATA is not inherited
+// on Windows, and on POSIX every child gets XDG_CONFIG_HOME pinned to a path
+// under a character device, which can never hold a llama.cpp/config.ini.
+// APPDATA and XDG_CONFIG_HOME are refused as overrides (kForbiddenExact).
+// PROGRAMDATA (the Windows system-wide file) is never inherited either. The
+// POSIX system-wide /etc/llama.cpp/config.ini is read regardless of the
+// environment; it is root-owned and outside this policy.
+#if !defined(_WIN32)
+inline constexpr std::string_view kChildConfigHomeName = "XDG_CONFIG_HOME";
+inline constexpr std::string_view kChildConfigHomeValue = "/dev/null";
+#endif
 
 inline std::string bounded_key_for_message(std::string_view key) {
     constexpr std::size_t kMaxKeyChars = 64;
