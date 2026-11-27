@@ -307,55 +307,6 @@ ErrorCode MapError(lc::ErrorCode code) {
 
 Status ToStatus(const lc::Status& s) { return s.ok() ? Status::success() : Status(MapError(s.code), s.message); }
 
-bool IsValidUtf8Path(std::string_view s) noexcept {
-    std::size_t i = 0;
-    while (i < s.size()) {
-        const auto b0 = static_cast<unsigned char>(s[i]);
-        if (b0 == 0u) return false;
-        if (b0 < 0x80u) {
-            ++i;
-            continue;
-        }
-        std::size_t len = 0;
-        std::uint32_t cp = 0;
-        std::uint32_t min_cp = 0;
-        if ((b0 & 0xE0u) == 0xC0u) {
-            len = 2;
-            cp = static_cast<std::uint32_t>(b0 & 0x1Fu);
-            min_cp = 0x80u;
-        } else if ((b0 & 0xF0u) == 0xE0u) {
-            len = 3;
-            cp = static_cast<std::uint32_t>(b0 & 0x0Fu);
-            min_cp = 0x800u;
-        } else if ((b0 & 0xF8u) == 0xF0u) {
-            len = 4;
-            cp = static_cast<std::uint32_t>(b0 & 0x07u);
-            min_cp = 0x10000u;
-        } else {
-            return false;
-        }
-        if (i + len > s.size()) return false;
-        for (std::size_t j = 1; j < len; ++j) {
-            const auto bx = static_cast<unsigned char>(s[i + j]);
-            if ((bx & 0xC0u) != 0x80u) return false;
-            cp = (cp << 6u) | static_cast<std::uint32_t>(bx & 0x3Fu);
-        }
-        if (cp < min_cp || cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu)) return false;
-        i += len;
-    }
-    return true;
-}
-
-bool TryPathFromUtf8(const std::string& s, fs::path& out) noexcept {
-    if (!IsValidUtf8Path(s)) return false;
-    try {
-        out = PathFromUtf8(s);
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
-
 void ForwardLogToDiagnosticQueue(const char* text) {
     if (text != nullptr) (void)diag::log(std::string(text));
 }
@@ -828,15 +779,15 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
         return Status(ErrorCode::invalid_argument,
                       "unknown split mode '" + o.split_mode + "' (expected none, layer or row)");
     }
-    if (Status kv_st = lc::ValidateKvPolicyOptions(
-            o.kv_cache_type_k, o.kv_cache_type_v, o.kv_k_q4_allowed,
-            lc::InferConfiguredKvDeviceKind(o.gpu_layers, o.devices), lo.type_k, lo.type_v);
-        !kv_st.ok()) {
-        return kv_st;
-    }
     if (!lc::ParseFlashAttention(o.flash_attention, lo.flash_attn)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown flash attention mode '" + o.flash_attention + "' (expected auto, on or off)");
+    }
+    if (Status kv_st = lc::ValidateKvPolicyOptions(
+            o.kv_cache_type_k, o.kv_cache_type_v, o.kv_k_q4_allowed,
+            lc::InferConfiguredKvDeviceKind(o.gpu_layers, o.devices), lo.type_k, lo.type_v, lo.flash_attn);
+        !kv_st.ok()) {
+        return kv_st;
     }
     if (lc::Status s = lc::ValidatePlacementOptions(lo); !s.ok()) {
         return ToStatus(s);
@@ -1557,39 +1508,11 @@ public:
                 !s.ok()) {
                 return s;
             }
-            if (lo.devices.empty() && enumerated_devices.empty()) {
-                enumerated_devices = lc::LlamaCppBackend::EnumerateDevices();
-            }
         }
-        const lc::KvDeviceKind kv_dev_kind =
-            lc::ResolveLoadKvDeviceKind(lo.n_gpu_layers, lo.devices, enumerated_devices);
-        fs::path resolved_fs_path;
-        if (lo.type_k != lc::KvCacheType::kQ4_0) {
-            if (Status s = lc::EvaluateKvCachePolicy(
-                    {lo.type_k, lo.type_v, kv_dev_kind, lc::KvRotationSupport::kUnsupported, options_.kv_k_q4_allowed});
-                !s.ok()) {
-                return s;
-            }
-            if (!TryPathFromUtf8(path, resolved_fs_path)) {
-                return Status(ErrorCode::invalid_argument, "model path contains invalid UTF-8 or NUL byte");
-            }
-        } else {
-            if (lo.type_v == lc::KvCacheType::kF8_E4M3 && kv_dev_kind != lc::KvDeviceKind::kCuda) {
-                return lc::EvaluateKvCachePolicy(
-                    {lo.type_k, lo.type_v, kv_dev_kind, lc::KvRotationSupport::kSupported, options_.kv_k_q4_allowed});
-            }
-            if (!TryPathFromUtf8(path, resolved_fs_path)) {
-                return Status(ErrorCode::invalid_argument, "model path contains invalid UTF-8 or NUL byte");
-            }
-            std::error_code kv_ec;
-            if (fs::is_regular_file(resolved_fs_path, kv_ec)) {
-                const lc::KvRotationSupport rot = lc::ProbeGgufKvRotationSupport(path);
-                if (Status s = lc::EvaluateKvCachePolicy(
-                        {lo.type_k, lo.type_v, kv_dev_kind, rot, options_.kv_k_q4_allowed});
-                    !s.ok()) {
-                    return s;
-                }
-            }
+        if (Status s = lc::CheckKvPolicyAtLoad(lo, options_.kv_cache_type_k, options_.kv_cache_type_v,
+                                               options_.kv_k_q4_allowed, enumerated_devices, path);
+            !s.ok()) {
+            return s;
         }
 
         lc::LlamaCppBackend runtime;
@@ -1602,7 +1525,7 @@ public:
 
         const lc::ModelInfo info = runtime.GetModelInfo();
         ModelDescriptor d;
-        d.name = PathToUtf8(resolved_fs_path.filename());
+        d.name = PathToUtf8(PathFromUtf8(path).filename());
         d.backend = kLlamaCppBackendName;
         d.format = "gguf";
         d.family = info.description;  // e.g. "llama 7B Q4_0"
@@ -1635,14 +1558,10 @@ public:
 
 private:
     std::string Resolve(const std::string& model) const {
-        fs::path model_path;
-        if (!TryPathFromUtf8(model, model_path)) return model;
         std::error_code ec;
-        if (fs::is_regular_file(model_path, ec)) return model;
+        if (fs::is_regular_file(PathFromUtf8(model), ec)) return model;
         for (const auto& dir : options_.model_dirs) {
-            fs::path dir_path;
-            if (!TryPathFromUtf8(dir, dir_path)) continue;
-            const fs::path candidate = dir_path / model_path;
+            const fs::path candidate = PathFromUtf8(dir) / PathFromUtf8(model);
             if (fs::is_regular_file(candidate, ec)) return PathToUtf8(candidate);
         }
         return model;  // Load() reports not_found with the original name

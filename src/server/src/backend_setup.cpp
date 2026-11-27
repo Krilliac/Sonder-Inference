@@ -43,6 +43,7 @@ Result<LlamaCppBackendOptions> llamacpp_options(const BackendSetup& setup) {
     if (setup.llamacpp_ubatch_size) lo.ubatch_size = *setup.llamacpp_ubatch_size;
     if (setup.llamacpp_kv_cache_type_k) lo.kv_cache_type_k = *setup.llamacpp_kv_cache_type_k;
     if (setup.llamacpp_kv_cache_type_v) lo.kv_cache_type_v = *setup.llamacpp_kv_cache_type_v;
+    if (setup.llamacpp_kv_k_q4_allowed) lo.kv_k_q4_allowed = *setup.llamacpp_kv_k_q4_allowed;
     if (setup.llamacpp_flash_attention) lo.flash_attention = *setup.llamacpp_flash_attention;
     if (setup.llamacpp_threads) lo.threads = *setup.llamacpp_threads;
     if (setup.llamacpp_use_mmap) lo.use_mmap = *setup.llamacpp_use_mmap;

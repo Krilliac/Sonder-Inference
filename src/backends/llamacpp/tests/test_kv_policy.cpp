@@ -146,7 +146,7 @@ bool ContainsCaseInsensitive(std::string_view haystack, std::string_view needle)
 
 }  // namespace
 
-TEST_CASE("kv_policy: defaults are q8_0 for both K and V") {
+TEST_CASE("kv_policy: defaults resolve per model to q8_0 when head dims % 32 == 0 and flash_attn != off, else f16") {
     const lc::KvPolicyRequest req;
     CHECK(req.type_k == lc::KvCacheType::kQ8_0);
     CHECK(req.type_v == lc::KvCacheType::kQ8_0);
@@ -154,10 +154,98 @@ TEST_CASE("kv_policy: defaults are q8_0 for both K and V") {
     CHECK(lc::ToString(lc::kDefaultKvPolicyType) == "q8_0");
 
     const si::LlamaCppBackendOptions opts;
-    CHECK(opts.kv_cache_type_k == "q8_0");
-    CHECK(opts.kv_cache_type_v == "q8_0");
+    CHECK(opts.kv_cache_type_k == "auto");
+    CHECK(opts.kv_cache_type_v == "auto");
     CHECK_FALSE(opts.kv_k_q4_allowed);
     CHECK(si::validate_llamacpp_options(opts).ok());
+
+    // Default options with flash_attention = "off" resolve to f16 and validate cleanly,
+    // whereas an explicit quantized V cache ("q8_0") with flash_attention = "off" is still refused.
+    si::LlamaCppBackendOptions fa_off_default;
+    fa_off_default.flash_attention = "off";
+    CHECK(si::validate_llamacpp_options(fa_off_default).ok());
+
+    si::LlamaCppBackendOptions fa_off_explicit_q8;
+    fa_off_explicit_q8.kv_cache_type_k = "q8_0";
+    fa_off_explicit_q8.kv_cache_type_v = "q8_0";
+    fa_off_explicit_q8.flash_attention = "off";
+    CHECK(si::validate_llamacpp_options(fa_off_explicit_q8).code() == si::ErrorCode::invalid_argument);
+
+    using Entry = ScopedTempGguf::KvEntry;
+    // Llama-style head_dim = 128 (divisible by 32) -> auto resolves to q8_0 when flash_attn != off, f16 when off.
+    ScopedTempGguf llama128_gguf("auto_llama128");
+    REQUIRE(llama128_gguf.Write({
+        {"general.architecture", Entry::Kind::kStr, "llama", 0, {}, {}, {}},
+        {"llama.embedding_length", Entry::Kind::kU32, {}, 4096u, {}, {}, {}},
+        {"llama.attention.head_count", Entry::Kind::kU32, {}, 32u, {}, {}, {}},
+    }));
+    CHECK(lc::DoesGgufQualifyForDefaultQ8Kv(llama128_gguf.PathString()));
+    {
+        lc::LoadOptions lo;
+        lo.flash_attn = lc::FlashAttention::kAuto;
+        REQUIRE(lc::CheckKvPolicyAtLoad(lo, "auto", "auto", false, {}, llama128_gguf.PathString()).ok());
+        CHECK(lo.type_k == lc::KvCacheType::kQ8_0);
+        CHECK(lo.type_v == lc::KvCacheType::kQ8_0);
+
+        lc::LoadOptions lo_fa_off;
+        lo_fa_off.flash_attn = lc::FlashAttention::kDisabled;
+        REQUIRE(lc::CheckKvPolicyAtLoad(lo_fa_off, "auto", "auto", false, {}, llama128_gguf.PathString()).ok());
+        CHECK(lo_fa_off.type_k == lc::KvCacheType::kF16);
+        CHECK(lo_fa_off.type_v == lc::KvCacheType::kF16);
+    }
+
+    // Fallback case 1: Phi-2 head_dim = 80 (2560 / 32 = 80, not a multiple of 32) -> auto resolves to f16,
+    // while explicit user-set "q8_0" keeps strict q8_0.
+    ScopedTempGguf phi2_head80_gguf("auto_phi2_head80");
+    REQUIRE(phi2_head80_gguf.Write({
+        {"general.architecture", Entry::Kind::kStr, "phi2", 0, {}, {}, {}},
+        {"phi2.embedding_length", Entry::Kind::kU32, {}, 2560u, {}, {}, {}},
+        {"phi2.attention.head_count", Entry::Kind::kU32, {}, 32u, {}, {}, {}},
+    }));
+    CHECK_FALSE(lc::DoesGgufQualifyForDefaultQ8Kv(phi2_head80_gguf.PathString()));
+    {
+        lc::LoadOptions lo;
+        lo.flash_attn = lc::FlashAttention::kAuto;
+        REQUIRE(lc::CheckKvPolicyAtLoad(lo, "auto", "auto", false, {}, phi2_head80_gguf.PathString()).ok());
+        CHECK(lo.type_k == lc::KvCacheType::kF16);
+        CHECK(lo.type_v == lc::KvCacheType::kF16);
+
+        lc::LoadOptions lo_explicit;
+        lo_explicit.type_k = lc::KvCacheType::kQ8_0;
+        lo_explicit.type_v = lc::KvCacheType::kQ8_0;
+        lo_explicit.flash_attn = lc::FlashAttention::kAuto;
+        REQUIRE(lc::CheckKvPolicyAtLoad(lo_explicit, "q8_0", "q8_0", false, {}, phi2_head80_gguf.PathString()).ok());
+        CHECK(lo_explicit.type_k == lc::KvCacheType::kQ8_0);
+        CHECK(lo_explicit.type_v == lc::KvCacheType::kQ8_0);
+    }
+
+    // Fallback case 2: end-to-end load_model() with default KV types and flash_attention = "off"
+    // gets past option/policy checks into llama.cpp tensor loading (backend_error, not invalid_argument).
+    {
+        auto be = si::make_llamacpp_backend(fa_off_default);
+        si::ModelLoadOptions ml;
+        ml.model = llama128_gguf.PathString();
+        ml.device_id = "cpu:0";
+        CHECK(be->load_model(ml).status().code() == si::ErrorCode::backend_error);
+    }
+
+    // Hyphenated MLA architectures (kimi-k3, kimi-k31, glm5-next; src/llama-arch.cpp:170-172)
+    // derive n_embd_head_v_full from kv_lora_rank even when value_length is omitted or differs.
+    for (const std::string_view arch : {"kimi-k3", "kimi-k31", "glm5-next"}) {
+        CAPTURE(arch);
+        lc::KvModelRotationFacts ok_mla;
+        ok_mla.architecture = std::string(arch);
+        ok_mla.embedding_length = 7168u;
+        ok_mla.head_count = 64u;  // 7168 / 64 = 112 (not % 32 == 0)
+        ok_mla.key_length = 576u;
+        ok_mla.kv_lora_rank = 512u;
+        CHECK(lc::DoesModelQualifyForDefaultQ8Kv(ok_mla));
+
+        lc::KvModelRotationFacts bad_mla = ok_mla;
+        bad_mla.value_length = 128u;
+        bad_mla.kv_lora_rank = 528u;  // 528 % 32 == 16 != 0 -> overwritten n_embd_head_v_full fails % 32
+        CHECK_FALSE(lc::DoesModelQualifyForDefaultQ8Kv(bad_mla));
+    }
 }
 
 TEST_CASE("kv_policy: table test over all K types x V types x devices x rotation x opt-in") {
@@ -331,7 +419,7 @@ TEST_CASE("kv_policy: option parsing rejects unknown strings, unopted q4_0 K, an
         CHECK(sv.message().find("V cache type") != std::string::npos);
     }
 
-    // q4_0 for K is refused at option validation unless kv_k_q4_allowed is true.
+    // q4_0 for K is refused at option validation unless kv_k_q4_allowed is true, naming --allow-q4-k-cache.
     {
         si::LlamaCppBackendOptions kq4;
         kq4.kv_cache_type_k = "q4_0";
@@ -339,6 +427,7 @@ TEST_CASE("kv_policy: option parsing rejects unknown strings, unopted q4_0 K, an
         const si::Status refused = si::validate_llamacpp_options(kq4);
         CHECK(refused.code() == si::ErrorCode::invalid_argument);
         CHECK(ContainsCaseInsensitive(refused.message(), "kv_k_q4_allowed"));
+        CHECK(ContainsCaseInsensitive(refused.message(), "--allow-q4-k-cache"));
 
         kq4.kv_k_q4_allowed = true;
         CHECK(si::validate_llamacpp_options(kq4).ok());
@@ -580,10 +669,21 @@ TEST_CASE("kv_policy: load_model enforces rotation on GGUF metadata and f8_e4m3 
     }));
     CHECK(lc::ProbeGgufKvRotationSupport(f32_arr_hc_gguf.PathString()) == lc::KvRotationSupport::kUnknown);
 
+    // 7. Unused indexer_head_size metadata with non-integer type does not spuriously refuse q4_0 K.
+    ScopedTempGguf bad_indexer_gguf("bad_indexer");
+    REQUIRE(bad_indexer_gguf.Write({
+        {"general.architecture", Entry::Kind::kStr, "llama", 0, {}, {}, {}},
+        {"llama.embedding_length", Entry::Kind::kU32, {}, 4096u, {}, {}, {}},
+        {"llama.attention.head_count", Entry::Kind::kU32, {}, 32u, {}, {}, {}},
+        {"llama.attention.indexer_head_size", Entry::Kind::kStr, "not_an_int", 0u, {}, {}, {}},
+    }));
+    CHECK(lc::ProbeGgufKvRotationSupport(bad_indexer_gguf.PathString()) == lc::KvRotationSupport::kSupported);
+
     // End-to-end load_model() with kv_cache_type_k = "q4_0" + kv_k_q4_allowed = true:
     //   - no_rot_gguf & layer0_zero_gguf fail with invalid_argument naming rotation;
-    //   - unknown_rot_gguf, missing_hc_gguf, str_arr_hc_gguf fail with invalid_argument naming detection;
-    //   - malformed UTF-8 / embedded NUL model paths fail cleanly without throwing std::system_error;
+    //   - unknown_rot_gguf, missing_hc_gguf, str_arr_hc_gguf, and non-regular paths
+    //     (missing file or directory) fail with invalid_argument naming detection;
+    //   - CheckKvPolicyAtLoad + IsValidUtf8NoNul reject invalid UTF-8 / embedded NUL cleanly;
     //   - rot_ok_gguf passes policy and fails later in llama.cpp tensor load (backend_error).
     {
         si::LlamaCppBackendOptions opts;
@@ -620,17 +720,31 @@ TEST_CASE("kv_policy: load_model enforces rotation on GGUF metadata and f8_e4m3 
         CHECK(r_str_arr.status().code() == si::ErrorCode::invalid_argument);
         CHECK(ContainsCaseInsensitive(r_str_arr.status().message(), "detect"));
 
+        const std::u8string tmp_dir_u8 = std::filesystem::temp_directory_path().u8string();
+        const std::string tmp_dir_utf8(tmp_dir_u8.begin(), tmp_dir_u8.end());
+        for (const std::string& non_regular : {
+                 std::string("nonexistent_q4_rotation_probe.gguf"),
+                 tmp_dir_utf8,
+             }) {
+            CAPTURE(non_regular);
+            CHECK(lc::ProbeGgufKvRotationSupport(non_regular) == lc::KvRotationSupport::kUnknown);
+            ml.model = non_regular;
+            const auto r_non_reg = be->load_model(ml);
+            CHECK(r_non_reg.status().code() == si::ErrorCode::invalid_argument);
+            CHECK(ContainsCaseInsensitive(r_non_reg.status().message(), "detect"));
+        }
+
         for (const std::string& bad_utf8 : {
                  std::string("\xFF\xFEinvalid_utf8.gguf"),
                  std::string("embedded\0nul.gguf", 17),
              }) {
+            CHECK_FALSE(lc::IsValidUtf8NoNul(bad_utf8));
             CHECK(lc::ProbeGgufKvRotationSupport(bad_utf8) == lc::KvRotationSupport::kUnknown);
-            ml.model = bad_utf8;
-            si::Result<std::shared_ptr<si::BackendModel>> r_bad_path =
-                si::Status(si::ErrorCode::internal, "uninitialized");
-            CHECK_NOTHROW(r_bad_path = be->load_model(ml));
-            CHECK_FALSE(r_bad_path.ok());
-            CHECK(r_bad_path.status().code() == si::ErrorCode::invalid_argument);
+            lc::LoadOptions lo_q4;
+            lo_q4.type_k = lc::KvCacheType::kQ4_0;
+            lo_q4.type_v = lc::KvCacheType::kQ8_0;
+            const si::Status st_q4 = lc::CheckKvPolicyAtLoad(lo_q4, "q4_0", "q8_0", true, {}, bad_utf8);
+            CHECK(st_q4.code() == si::ErrorCode::invalid_argument);
         }
 
         ml.model = rot_ok_gguf.PathString();

@@ -45,6 +45,7 @@ struct BackendSetup {
     std::optional<std::uint32_t> llamacpp_ubatch_size;
     std::optional<std::string> llamacpp_kv_cache_type_k;
     std::optional<std::string> llamacpp_kv_cache_type_v;
+    std::optional<bool> llamacpp_kv_k_q4_allowed;
     std::optional<std::string> llamacpp_flash_attention;
     std::optional<std::int32_t> llamacpp_threads;
     std::optional<bool> llamacpp_use_mmap;

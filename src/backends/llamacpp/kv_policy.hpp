@@ -2,10 +2,11 @@
 //
 // Enforces K/V element-type defaults and safety constraints when options are
 // parsed and at model load:
-//   - Default is q8_0 for both K and V.
-//   - q4_0 for K requires explicit opt-in (`kv_k_q4_allowed`) AND model
-//     Hadamard rotation (`attn_rot_k` in llama.cpp v1.0.0); undetectable
-//     rotation support is refused cleanly.
+//   - Default is "auto" for both K and V, resolving per model to q8_0 when
+//     head dimensions are multiples of 32 and flash_attention != "off", else f16.
+//   - q4_0 for K requires explicit opt-in (--allow-q4-k-cache / `kv_k_q4_allowed`)
+//     AND model Hadamard rotation (`attn_rot_k` in llama.cpp v1.0.0);
+//     undetectable rotation support is refused cleanly.
 //   - f8_e4m3 is opt-in and CUDA-only (refused on CPU, Vulkan, and other
 //     non-CUDA backends).
 //   - Unknown or build-unsupported types fail explicitly with no silent
@@ -46,16 +47,19 @@ enum class KvRotationSupport : std::uint8_t {
 
 // Metadata facts extracted from a GGUF header to evaluate llama.cpp v1.0.0
 // K-cache Hadamard rotation eligibility (src/llama-kv-cache.cpp:300-336,
-// src/llama-model.cpp:1617-1648).
+// src/llama-model.cpp:1617-1648) and q8_0 default head-dim compatibility
+// (src/llama-context.cpp:4552-4572).
 struct KvModelRotationFacts {
     std::string architecture;
     std::optional<std::uint32_t> key_length;
+    std::optional<std::uint32_t> value_length;
     std::optional<std::uint32_t> key_length_swa;
+    std::optional<std::uint32_t> value_length_swa;
     std::optional<std::uint32_t> embedding_length;
     std::optional<std::uint32_t> head_count;
     bool head_count_layer0_zero = false;
     bool head_count_heterogeneous = false;
-    std::optional<std::uint32_t> indexer_head_size;
+    std::optional<std::uint32_t> kv_lora_rank;
     std::optional<bool> model_attn_rot = true;
     bool env_attn_rot_disable = false;
 };
@@ -67,6 +71,9 @@ struct KvPolicyRequest {
     KvRotationSupport rotation = KvRotationSupport::kUnsupported;
     bool kv_k_q4_allowed = false;
 };
+
+// Validates RFC 3629 UTF-8 with no embedded NUL bytes.
+[[nodiscard]] bool IsValidUtf8NoNul(std::string_view s) noexcept;
 
 // Maps KvCacheType onto ggml_type (returned as int so ggml.h stays private to
 // sonder_backend_llamacpp). Fails with kInvalidArgument on unknown enum values
@@ -95,15 +102,34 @@ struct KvPolicyRequest {
 // LLAMA_ATTN_ROT_DISABLE to determine K-cache rotation support for `model_path`.
 [[nodiscard]] KvRotationSupport ProbeGgufKvRotationSupport(const std::string& model_path);
 
-// Parses K/V type strings (rejecting unknown or empty names with
-// invalid_argument) and validates option-parse-time KV policy rules.
+// Returns true when model head dims (K, V, and optional SWA) are non-zero
+// multiples of 32 so default "auto" KV cache types can safely resolve to q8_0.
+[[nodiscard]] bool DoesModelQualifyForDefaultQ8Kv(const KvModelRotationFacts& facts) noexcept;
+[[nodiscard]] bool DoesGgufQualifyForDefaultQ8Kv(const std::string& model_path);
+
+// Parses K/V type strings ("auto" resolves to f16 when flash_attn == kDisabled,
+// else q8_0; unknown or empty names fail with invalid_argument) and validates
+// option-parse-time KV policy rules.
 [[nodiscard]] sonder::inference::Status ValidateKvPolicyOptions(
     std::string_view type_k_name,
     std::string_view type_v_name,
     bool kv_k_q4_allowed,
     std::optional<KvDeviceKind> configured_device,
     KvCacheType& out_type_k,
-    KvCacheType& out_type_v);
+    KvCacheType& out_type_v,
+    FlashAttention flash_attn = FlashAttention::kAuto);
+
+// Load-time KV policy hook: resolves per-model "auto" K/V types (q8_0 when
+// head dims % 32 == 0 and flash_attn != kDisabled, else f16), lazily enumerates
+// devices only when f8_e4m3 is active, and enforces q4_0 rotation (refusing
+// non-regular or unreadable GGUFs with kUnknown) and f8_e4m3 CUDA rules.
+[[nodiscard]] sonder::inference::Status CheckKvPolicyAtLoad(
+    LoadOptions& lo,
+    std::string_view configured_type_k,
+    std::string_view configured_type_v,
+    bool kv_k_q4_allowed,
+    const std::vector<DeviceInfo>& pre_enumerated_devices,
+    const std::string& model_path);
 
 // Full KV-cache dtype policy check (used at load time and directly in tests).
 [[nodiscard]] sonder::inference::Status EvaluateKvCachePolicy(const KvPolicyRequest& req);

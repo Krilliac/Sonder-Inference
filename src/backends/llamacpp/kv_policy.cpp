@@ -4,9 +4,11 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 #include "ggml.h"
 #include "gguf.h"
@@ -76,47 +78,6 @@ bool IsNonAttentionKvArchitecture(std::string_view arch_lower) noexcept {
         if (arch_lower == candidate) return true;
     }
     return false;
-}
-
-bool IsValidUtf8NoNul(std::string_view s) noexcept {
-    std::size_t i = 0;
-    while (i < s.size()) {
-        const auto b0 = static_cast<unsigned char>(s[i]);
-        if (b0 == 0u) return false;
-        if (b0 < 0x80u) {
-            ++i;
-            continue;
-        }
-        std::size_t len = 0;
-        std::uint32_t cp = 0;
-        std::uint32_t min_cp = 0;
-        if ((b0 & 0xE0u) == 0xC0u) {
-            len = 2;
-            cp = static_cast<std::uint32_t>(b0 & 0x1Fu);
-            min_cp = 0x80u;
-        } else if ((b0 & 0xF0u) == 0xE0u) {
-            len = 3;
-            cp = static_cast<std::uint32_t>(b0 & 0x0Fu);
-            min_cp = 0x800u;
-        } else if ((b0 & 0xF8u) == 0xF0u) {
-            len = 4;
-            cp = static_cast<std::uint32_t>(b0 & 0x07u);
-            min_cp = 0x10000u;
-        } else {
-            return false;
-        }
-        if (i + len > s.size()) return false;
-        for (std::size_t j = 1; j < len; ++j) {
-            const auto bx = static_cast<unsigned char>(s[i + j]);
-            if ((bx & 0xC0u) != 0x80u) return false;
-            cp = (cp << 6u) | static_cast<std::uint32_t>(bx & 0x3Fu);
-        }
-        if (cp < min_cp || cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu)) {
-            return false;
-        }
-        i += len;
-    }
-    return true;
 }
 
 bool IsIntegerGgufType(gguf_type t) noexcept {
@@ -540,45 +501,215 @@ KvRotationSupport DetectKvRotationSupport(const KvModelRotationFacts& facts) noe
     return KvRotationSupport::kSupported;
 }
 
-KvRotationSupport ProbeGgufKvRotationSupport(const std::string& model_path) {
+bool ReadGgufHeadFacts(const std::string& model_path, KvModelRotationFacts& out_facts) {
     if (model_path.empty() || !IsValidUtf8NoNul(model_path)) {
-        return KvRotationSupport::kUnknown;
+        return false;
+    }
+    try {
+        const std::filesystem::path fs_path(std::u8string(model_path.begin(), model_path.end()));
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(fs_path, ec) || ec) {
+            return false;
+        }
+    } catch (...) {
+        return false;
     }
 
     const gguf_init_params params{/*no_alloc=*/true, /*ctx=*/nullptr};
     GgufContextGuard guard{gguf_init_from_file(model_path.c_str(), params)};
     if (guard.ctx == nullptr) {
-        return KvRotationSupport::kUnknown;
+        return false;
     }
 
     const int64_t arch_id = gguf_find_key(guard.ctx, "general.architecture");
     if (arch_id < 0 || gguf_get_kv_type(guard.ctx, arch_id) != GGUF_TYPE_STRING) {
-        return KvRotationSupport::kUnknown;
+        return false;
     }
     const char* arch_str = gguf_get_val_str(guard.ctx, arch_id);
     if (arch_str == nullptr || arch_str[0] == '\0') {
-        return KvRotationSupport::kUnknown;
+        return false;
     }
 
     KvModelRotationFacts facts;
     facts.architecture = arch_str;
+    bool invalid = false;
+    facts.key_length = ReadGgufScalarU32(guard.ctx, facts.architecture + ".attention.key_length", invalid);
+    facts.value_length = ReadGgufScalarU32(guard.ctx, facts.architecture + ".attention.value_length", invalid);
+    facts.key_length_swa = ReadGgufScalarU32(guard.ctx, facts.architecture + ".attention.key_length_swa", invalid);
+    facts.value_length_swa = ReadGgufScalarU32(guard.ctx, facts.architecture + ".attention.value_length_swa", invalid);
+    facts.embedding_length = ReadGgufScalarU32(guard.ctx, facts.architecture + ".embedding_length", invalid);
+    facts.kv_lora_rank = ReadGgufScalarU32(guard.ctx, facts.architecture + ".attention.kv_lora_rank", invalid);
+    ReadGgufHeadCount(guard.ctx, facts.architecture + ".attention.head_count", facts, invalid);
+    if (invalid) {
+        return false;
+    }
+
+    out_facts = std::move(facts);
+    return true;
+}
+
+KvRotationSupport ProbeGgufKvRotationSupport(const std::string& model_path) {
+    KvModelRotationFacts facts;
+    if (!ReadGgufHeadFacts(model_path, facts)) {
+        return KvRotationSupport::kUnknown;
+    }
     const char* env_rot = std::getenv("LLAMA_ATTN_ROT_DISABLE");
     facts.env_attn_rot_disable = (env_rot != nullptr && std::atoi(env_rot) != 0);
     // llama.cpp v1.0.0 initializes llama_model::attn_rot = true (src/llama-model.h:783);
     // llama_model_set_attn_rot exists only in internal src/llama-ext.h:124 and is never called.
     facts.model_attn_rot = true;
+    return DetectKvRotationSupport(facts);
+}
 
-    bool invalid = false;
-    facts.key_length = ReadGgufScalarU32(guard.ctx, facts.architecture + ".attention.key_length", invalid);
-    facts.key_length_swa = ReadGgufScalarU32(guard.ctx, facts.architecture + ".attention.key_length_swa", invalid);
-    facts.embedding_length = ReadGgufScalarU32(guard.ctx, facts.architecture + ".embedding_length", invalid);
-    facts.indexer_head_size = ReadGgufScalarU32(guard.ctx, facts.architecture + ".attention.indexer_head_size", invalid);
-    ReadGgufHeadCount(guard.ctx, facts.architecture + ".attention.head_count", facts, invalid);
-    if (invalid) {
-        return KvRotationSupport::kUnknown;
+bool IsValidUtf8NoNul(std::string_view s) noexcept {
+    std::size_t i = 0;
+    while (i < s.size()) {
+        const auto b0 = static_cast<unsigned char>(s[i]);
+        if (b0 == 0u) return false;
+        if (b0 < 0x80u) {
+            ++i;
+            continue;
+        }
+        std::size_t len = 0;
+        std::uint32_t cp = 0;
+        std::uint32_t min_cp = 0;
+        if ((b0 & 0xE0u) == 0xC0u) {
+            len = 2;
+            cp = static_cast<std::uint32_t>(b0 & 0x1Fu);
+            min_cp = 0x80u;
+        } else if ((b0 & 0xF0u) == 0xE0u) {
+            len = 3;
+            cp = static_cast<std::uint32_t>(b0 & 0x0Fu);
+            min_cp = 0x800u;
+        } else if ((b0 & 0xF8u) == 0xF0u) {
+            len = 4;
+            cp = static_cast<std::uint32_t>(b0 & 0x07u);
+            min_cp = 0x10000u;
+        } else {
+            return false;
+        }
+        if (i + len > s.size()) return false;
+        for (std::size_t j = 1; j < len; ++j) {
+            const auto bx = static_cast<unsigned char>(s[i + j]);
+            if ((bx & 0xC0u) != 0x80u) return false;
+            cp = (cp << 6u) | static_cast<std::uint32_t>(bx & 0x3Fu);
+        }
+        if (cp < min_cp || cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu)) {
+            return false;
+        }
+        i += len;
+    }
+    return true;
+}
+
+bool DoesModelQualifyForDefaultQ8Kv(const KvModelRotationFacts& facts) noexcept {
+    if (facts.architecture.empty()) {
+        return false;
+    }
+    const std::string arch = LowerAsciiCopy(facts.architecture);
+    if (IsNonAttentionKvArchitecture(arch)) {
+        return false;
     }
 
-    return DetectKvRotationSupport(facts);
+    const bool is_plamo2 = (arch == "plamo2");
+    if (!is_plamo2) {
+        if (facts.head_count_layer0_zero ||
+            (facts.head_count.has_value() && *facts.head_count == 0u)) {
+            return false;
+        }
+        if (!facts.head_count.has_value() && !facts.head_count_heterogeneous) {
+            return false;
+        }
+    }
+
+    const auto uniform_div_dim = [&]() -> std::optional<std::uint32_t> {
+        if (facts.head_count_layer0_zero || facts.head_count_heterogeneous) {
+            return std::nullopt;
+        }
+        if (!facts.embedding_length.has_value() || !facts.head_count.has_value() || *facts.head_count == 0u) {
+            return std::nullopt;
+        }
+        if (*facts.embedding_length == 0u || (*facts.embedding_length % *facts.head_count) != 0u) {
+            return std::nullopt;
+        }
+        return *facts.embedding_length / *facts.head_count;
+    };
+
+    const std::optional<std::uint32_t> head_k_full =
+        facts.key_length.has_value() ? facts.key_length : uniform_div_dim();
+    std::optional<std::uint32_t> head_v_full;
+    if (arch == "glm5-next" || arch == "kimi-k3" || arch == "kimi-k31") {
+        head_v_full = facts.kv_lora_rank;
+    } else if (facts.value_length.has_value()) {
+        head_v_full = facts.value_length;
+    } else {
+        head_v_full = uniform_div_dim();
+    }
+
+    if (!head_k_full.has_value() || *head_k_full == 0u || (*head_k_full % 32u) != 0u) {
+        return false;
+    }
+    if (!head_v_full.has_value() || *head_v_full == 0u || (*head_v_full % 32u) != 0u) {
+        return false;
+    }
+    if (facts.key_length_swa.has_value() &&
+        (*facts.key_length_swa == 0u || (*facts.key_length_swa % 32u) != 0u)) {
+        return false;
+    }
+    if (facts.value_length_swa.has_value() &&
+        (*facts.value_length_swa == 0u || (*facts.value_length_swa % 32u) != 0u)) {
+        return false;
+    }
+    return true;
+}
+
+bool DoesGgufQualifyForDefaultQ8Kv(const std::string& model_path) {
+    KvModelRotationFacts facts;
+    if (!ReadGgufHeadFacts(model_path, facts)) {
+        return false;
+    }
+    return DoesModelQualifyForDefaultQ8Kv(facts);
+}
+
+sonder::inference::Status CheckKvPolicyAtLoad(
+    LoadOptions& lo,
+    std::string_view configured_type_k,
+    std::string_view configured_type_v,
+    bool kv_k_q4_allowed,
+    const std::vector<DeviceInfo>& pre_enumerated_devices,
+    const std::string& model_path) {
+    const bool auto_k = EqualsIgnoreCaseAscii(configured_type_k, "auto");
+    const bool auto_v = EqualsIgnoreCaseAscii(configured_type_v, "auto");
+    if (auto_k || auto_v) {
+        const KvCacheType resolved =
+            (lo.flash_attn != FlashAttention::kDisabled && DoesGgufQualifyForDefaultQ8Kv(model_path))
+                ? KvCacheType::kQ8_0
+                : KvCacheType::kF16;
+        if (auto_k) lo.type_k = resolved;
+        if (auto_v) lo.type_v = resolved;
+    }
+
+    const bool uses_fp8 =
+        (lo.type_k == KvCacheType::kF8_E4M3) || (lo.type_v == KvCacheType::kF8_E4M3);
+    std::vector<DeviceInfo> lazy_devices;
+    const std::vector<DeviceInfo>* devices_for_policy = &pre_enumerated_devices;
+    if (uses_fp8 && lo.n_gpu_layers != 0 && lo.devices.empty() && pre_enumerated_devices.empty()) {
+        lazy_devices = LlamaCppBackend::EnumerateDevices();
+        devices_for_policy = &lazy_devices;
+    }
+    const KvDeviceKind kv_dev_kind =
+        ResolveLoadKvDeviceKind(lo.n_gpu_layers, lo.devices, *devices_for_policy);
+
+    if (lo.type_k != KvCacheType::kQ4_0) {
+        return EvaluateKvCachePolicy(
+            {lo.type_k, lo.type_v, kv_dev_kind, KvRotationSupport::kUnsupported, kv_k_q4_allowed});
+    }
+    if (!kv_k_q4_allowed || (lo.type_v == KvCacheType::kF8_E4M3 && kv_dev_kind != KvDeviceKind::kCuda)) {
+        return EvaluateKvCachePolicy(
+            {lo.type_k, lo.type_v, kv_dev_kind, KvRotationSupport::kSupported, kv_k_q4_allowed});
+    }
+    const KvRotationSupport rot = ProbeGgufKvRotationSupport(model_path);
+    return EvaluateKvCachePolicy({lo.type_k, lo.type_v, kv_dev_kind, rot, kv_k_q4_allowed});
 }
 
 sonder::inference::Status ValidateKvPolicyOptions(
@@ -587,21 +718,25 @@ sonder::inference::Status ValidateKvPolicyOptions(
     bool kv_k_q4_allowed,
     std::optional<KvDeviceKind> configured_device,
     KvCacheType& out_type_k,
-    KvCacheType& out_type_v) {
+    KvCacheType& out_type_v,
+    FlashAttention flash_attn) {
     using sonder::inference::ErrorCode;
     using sonder::inference::Status;
 
-    KvCacheType parsed_k = kDefaultKvPolicyType;
-    if (!ParseKvCacheType(type_k_name, parsed_k)) {
+    const KvCacheType auto_default =
+        (flash_attn == FlashAttention::kDisabled) ? KvCacheType::kF16 : kDefaultKvPolicyType;
+
+    KvCacheType parsed_k = auto_default;
+    if (!EqualsIgnoreCaseAscii(type_k_name, "auto") && !ParseKvCacheType(type_k_name, parsed_k)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown K cache type '" + std::string(type_k_name) +
-                          "' (expected f16, f32, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl, f8_e4m3, q2_0 or pq2_0)");
+                          "' (expected auto, f16, f32, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl, f8_e4m3, q2_0 or pq2_0)");
     }
-    KvCacheType parsed_v = kDefaultKvPolicyType;
-    if (!ParseKvCacheType(type_v_name, parsed_v)) {
+    KvCacheType parsed_v = auto_default;
+    if (!EqualsIgnoreCaseAscii(type_v_name, "auto") && !ParseKvCacheType(type_v_name, parsed_v)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown V cache type '" + std::string(type_v_name) +
-                          "' (expected f16, f32, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl, f8_e4m3, q2_0 or pq2_0)");
+                          "' (expected auto, f16, f32, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl, f8_e4m3, q2_0 or pq2_0)");
     }
 
     int ggml_k = -1;
@@ -624,8 +759,9 @@ sonder::inference::Status ValidateKvPolicyOptions(
     }
 
     if (parsed_k == KvCacheType::kQ4_0 && !kv_k_q4_allowed) {
-        return Status(ErrorCode::invalid_argument,
-                      "K cache type 'q4_0' requires explicit opt-in (kv_k_q4_allowed = true) and model K rotation");
+        return Status(
+            ErrorCode::invalid_argument,
+            "K cache type 'q4_0' requires explicit opt-in (--allow-q4-k-cache / kv_k_q4_allowed = true) and model K rotation");
     }
 
     out_type_k = parsed_k;
@@ -654,7 +790,7 @@ sonder::inference::Status EvaluateKvCachePolicy(const KvPolicyRequest& req) {
         if (!req.kv_k_q4_allowed) {
             return Status(
                 ErrorCode::invalid_argument,
-                "K cache type 'q4_0' requires explicit opt-in (kv_k_q4_allowed = true) and model K rotation");
+                "K cache type 'q4_0' requires explicit opt-in (--allow-q4-k-cache / kv_k_q4_allowed = true) and model K rotation");
         }
         if (req.rotation == KvRotationSupport::kUnknown) {
             return Status(

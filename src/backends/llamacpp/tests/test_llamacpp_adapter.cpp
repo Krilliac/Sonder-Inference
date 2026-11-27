@@ -167,8 +167,8 @@ TEST_CASE("llamacpp adapter: context options default to today's behaviour and va
     const LlamaCppBackendOptions d;
     CHECK(d.batch_size == 512u);
     CHECK(d.ubatch_size == 0u);
-    CHECK(d.kv_cache_type_k == "q8_0");
-    CHECK(d.kv_cache_type_v == "q8_0");
+    CHECK(d.kv_cache_type_k == "auto");
+    CHECK(d.kv_cache_type_v == "auto");
     CHECK(d.flash_attention == "auto");
     CHECK(validate_llamacpp_options(d).ok());
 

@@ -379,7 +379,8 @@ TEST_CASE("serve_main: llama.cpp KV cache, flash attention and batch flags") {
     std::string out;
     std::string err;
     CHECK(run({"--help"}, out, err) == 0);
-    for (const char* flag : {"--batch-size", "--ubatch-size", "--cache-type-k", "--cache-type-v", "--flash-attn"}) {
+    for (const char* flag : {"--batch-size", "--ubatch-size", "--cache-type-k", "--cache-type-v",
+                             "--allow-q4-k-cache", "--flash-attn"}) {
         CAPTURE(flag);
         CHECK(out.find(flag) != std::string::npos);
     }
@@ -412,6 +413,18 @@ TEST_CASE("serve_main: llama.cpp KV cache, flash attention and batch flags") {
     CHECK(err.find("requires flash attention") != std::string::npos);
     CHECK(run({"--backend", "llamacpp", "--model", "x", "--port", "0", "--cache-type-k", "q4_k"}, out, err) == 2);
     CHECK(err.find("unknown K cache type 'q4_k'") != std::string::npos);
+    CHECK(run({"--backend", "llamacpp", "--model", "x", "--port", "0", "--cache-type-k", "q4_0"}, out, err) == 2);
+    CHECK(err.find("--allow-q4-k-cache") != std::string::npos);
+    CHECK(run({"--backend", "llamacpp", "--model", "x", "--port", "0", "--cache-type-k", "q4_0", "--allow-q4-k-cache",
+               "--max-connections", "0"},
+              out, err) == 2);
+    CHECK(err.find("--max-connections") != std::string::npos);
+    CHECK(run({"--backend", "llamacpp", "--model", "x", "--port", "0", "--flash-attn", "off", "--max-connections",
+               "0"},
+              out, err) == 2);
+    CHECK(err.find("--max-connections") != std::string::npos);
+    CHECK(run({"--backend", "mock", "--model", "x", "--allow-q4-k-cache", "--max-connections", "0"}, out, err) == 2);
+    CHECK(err.find("option --allow-q4-k-cache applies only to --backend llamacpp") != std::string::npos);
     CHECK(run({"--backend", "llamacpp", "--model", "x", "--port", "0", "--batch-size", "256", "--ubatch-size", "512"},
               out, err) == 2);
     CHECK(err.find("n_ubatch (512) must be <= n_batch (256)") != std::string::npos);
