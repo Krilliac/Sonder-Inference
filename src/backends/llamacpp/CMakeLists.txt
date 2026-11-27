@@ -451,6 +451,7 @@ add_library(sonder_backend_llamacpp STATIC
     gguf_compat.cpp
     llamacpp_backend.cpp
     llamacpp_util.cpp
+    lora_registry.cpp
     slot_store.cpp
     request_guards.cpp
 )

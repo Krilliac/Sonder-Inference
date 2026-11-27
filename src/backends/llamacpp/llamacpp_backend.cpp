@@ -32,6 +32,7 @@
 #include "grammar_retry.hpp"
 #include "embed_batch_planner.hpp"
 #include "gguf_compat.hpp"
+#include "lora_registry.hpp"
 #include "prefix_coalescer.hpp"
 #include "radix_cache.hpp"
 #include "request_guards.hpp"
@@ -823,6 +824,36 @@ struct LlamaCppBackend::Impl {
     mtmd_context* mtmd_ctx = nullptr;
 #endif
 
+    // Per-model LoRA adapter runtime and lifecycle manager (cleaned up before ctx/model free).
+    std::unique_ptr<LoraRuntimeOps> lora_ops;
+    std::unique_ptr<LoraAdapterManager> lora_manager;
+
+    static const LlamaCppBackendLoraHooks* LoraHooks() noexcept {
+        static const LlamaCppBackendLoraHooks kHooks{
+            [](void* p) noexcept -> void* { return static_cast<Impl*>(p)->model; },
+            [](void* p) noexcept -> void* { return static_cast<Impl*>(p)->ctx; },
+            [](void* p) -> std::string { return static_cast<Impl*>(p)->options.model_path; },
+            [](void* p) noexcept {
+                auto* self = static_cast<Impl*>(p);
+                if (self->ctx != nullptr) {
+                    (void)RunGuarded(ErrorCode::kDecodeFailed, "llama_memory_clear", [&]() -> Status {
+                        if (llama_memory_t mem = llama_get_memory(self->ctx); mem != nullptr) {
+                            llama_memory_clear(mem, true);
+                        }
+                        return Status::Ok();
+                    });
+                }
+                self->ResetAllSlots();
+                self->radix_cache.Clear();
+            },
+            [](void* p) noexcept -> std::unique_ptr<LoraRuntimeOps>& { return static_cast<Impl*>(p)->lora_ops; },
+            [](void* p) noexcept -> std::unique_ptr<LoraAdapterManager>& {
+                return static_cast<Impl*>(p)->lora_manager;
+            },
+        };
+        return &kHooks;
+    }
+
     // Resolved in-process speculative decoding state.
     SpeculativeType requested_spec = SpeculativeType::kNone;
     SpeculativeType active_spec = SpeculativeType::kNone;
@@ -1095,6 +1126,11 @@ struct LlamaCppBackend::Impl {
 
     void Release() noexcept {
         StopBatchWorker();
+        if (lora_manager) {
+            lora_manager->UnloadAll();
+            lora_manager.reset();
+        }
+        lora_ops.reset();
         ReleaseMtp();
 #if defined(SONDER_LLAMACPP_HAS_MTMD)
         if (mtmd_ctx != nullptr) {
@@ -2442,15 +2478,29 @@ ContextParamsSummary LlamaCppBackend::UpstreamContextDefaults() {
 
 LlamaCppBackend::LlamaCppBackend() : impl_(std::make_unique<Impl>()) {
     impl_->owner.store(this, std::memory_order_release);
+    RegisterLlamaCppBackendForLora(this, impl_.get(), Impl::LoraHooks());
 }
-LlamaCppBackend::~LlamaCppBackend() = default;
+LlamaCppBackend::~LlamaCppBackend() {
+    UnregisterLlamaCppBackendForLora(this);
+}
 LlamaCppBackend::LlamaCppBackend(LlamaCppBackend&& other) noexcept : impl_(std::move(other.impl_)) {
-    if (impl_) impl_->owner.store(this, std::memory_order_release);
+    if (impl_) {
+        impl_->owner.store(this, std::memory_order_release);
+        TransferLlamaCppBackendForLora(&other, this);
+    } else {
+        UnregisterLlamaCppBackendForLora(&other);
+    }
 }
 LlamaCppBackend& LlamaCppBackend::operator=(LlamaCppBackend&& other) noexcept {
     if (this != &other) {
+        UnregisterLlamaCppBackendForLora(this);
         impl_ = std::move(other.impl_);
-        if (impl_) impl_->owner.store(this, std::memory_order_release);
+        if (impl_) {
+            impl_->owner.store(this, std::memory_order_release);
+            TransferLlamaCppBackendForLora(&other, this);
+        } else {
+            UnregisterLlamaCppBackendForLora(&other);
+        }
     }
     return *this;
 }
