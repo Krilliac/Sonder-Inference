@@ -34,6 +34,7 @@
 #include "embed_batch_planner.hpp"
 #include "embeddings.hpp"
 #include "gguf_compat.hpp"
+#include "graph_telemetry.hpp"
 #include "kv_policy.hpp"
 #include "kv_telemetry.hpp"
 #include "llguidance_sampler.hpp"
@@ -317,6 +318,31 @@ ModelParamsSummary SummarizeModelParams(const llama_model_params& mp) {
     return s;
 }
 
+// ggml graph eval callback installed ONLY when deep graph telemetry is enabled.
+// Zero heap allocations and zero string formatting on the hot path.
+bool GraphEvalCallback(struct ggml_tensor* t, bool ask, void* user_data) noexcept {
+    if (t == nullptr || user_data == nullptr) return !ask;
+    auto* agg = static_cast<GraphTelemetryAggregator*>(user_data);
+    if (!agg->ActiveForCurrentEval()) {
+        return !ask;
+    }
+    if (ask) {
+        const char* device_name = nullptr;
+        if (t->buffer != nullptr) {
+            if (ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer)) {
+                if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
+                    device_name = ggml_backend_dev_name(dev);
+                }
+                if (device_name == nullptr) {
+                    device_name = ggml_backend_buft_name(buft);
+                }
+            }
+        }
+        return agg->OnNodeAsk(t->name, static_cast<int>(t->op), ggml_op_name(t->op), device_name);
+    }
+    return agg->OnNodeAfter(t->name, static_cast<int>(t->op));
+}
+
 // The single place that turns LoadOptions into llama_context_params; Load()
 // and ContextParamsFor() both use it. The abort callback is set by Load().
 llama_context_params MakeContextParams(const LoadOptions& options, bool swa_compact_qualified = true) {
@@ -344,6 +370,8 @@ llama_context_params MakeContextParams(const LoadOptions& options, bool swa_comp
     cp.flash_attn_type = ToLlamaFlashAttn(options.flash_attn);
     cp.offload_kqv = true;
     cp.no_perf = true;
+    cp.cb_eval = options.graph_telemetry_enabled ? &GraphEvalCallback : nullptr;
+    cp.cb_eval_user_data = nullptr;
 #if defined(SONDER_LLAMACPP_HAS_KV_UNIFIED)
     cp.kv_unified = options.kv_unified;
 #endif
@@ -459,6 +487,7 @@ ContextParamsSummary Summarize(const llama_context_params& cp) {
     s.n_outputs_max_per_seq = cp.n_outputs_max_per_seq;
     s.n_outputs_max = cp.n_outputs_max;
 #endif
+    s.has_eval_callback = (cp.cb_eval != nullptr);
     return s;
 }
 
@@ -765,6 +794,27 @@ struct LlamaCppBackend::Impl {
     TelemetrySink telemetry;
     // Physical KV telemetry queue shared with the owner (null = disabled).
     std::shared_ptr<KvTelemetry> kv_tel;
+    GraphTelemetryAggregator graph_telemetry;
+    GraphEvalSink graph_eval_sink;
+
+    int32_t DecodeMainContext(llama_batch& b, GraphEvalKind kind, Status* err_out = nullptr) {
+        if (!graph_telemetry.Enabled()) {
+            return RunDecode(ctx, b, err_out);
+        }
+        const bool sampled = graph_telemetry.BeginEval(kind, b.n_tokens);
+        const int32_t rc = RunDecode(ctx, b, err_out);
+        if (sampled) {
+            if (rc == 0) {
+                GraphEvalSummary summary;
+                if (graph_telemetry.EndEval(summary) && graph_eval_sink) {
+                    graph_eval_sink(summary);
+                }
+            } else {
+                graph_telemetry.CancelEval();
+            }
+        }
+        return rc;
+    }
     // Consulted by llama.cpp's abort callback during long llama_decode calls.
     const CancelPredicate* active_cancel = nullptr;
     std::function<bool()> batch_abort_fn;
@@ -1205,6 +1255,7 @@ struct LlamaCppBackend::Impl {
             lora_manager.reset();
         }
         lora_ops.reset();
+        graph_telemetry.Disable();
         ReleaseMtp();
 #if defined(SONDER_LLAMACPP_HAS_MTMD)
         if (mtmd_ctx != nullptr) {
@@ -3227,6 +3278,19 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
         llama_context_params cp = MakeContextParams(options, swa_qualified);
         cp.abort_callback = &Impl::AbortCallback;
         cp.abort_callback_data = impl_.get();
+        if (options.graph_telemetry_enabled) {
+            GraphTelemetryConfig gcfg;
+            gcfg.level = sonder::inference::TelemetryLevel::deep;
+            gcfg.sample_every_n = options.graph_telemetry_sample_every;
+            gcfg.collect_timings = options.graph_telemetry_timings;
+            impl_->graph_telemetry.Configure(gcfg);
+            cp.cb_eval = &GraphEvalCallback;
+            cp.cb_eval_user_data = &impl_->graph_telemetry;
+        } else {
+            impl_->graph_telemetry.Disable();
+            cp.cb_eval = nullptr;
+            cp.cb_eval_user_data = nullptr;
+        }
         if (Status s = RunGuarded(ErrorCode::kLoadFailed, "llama_init_from_model", [&] {
                 impl_->ctx = llama_init_from_model(model, cp);
                 return Status::Ok();
@@ -3726,6 +3790,8 @@ Status LlamaCppBackend::FormatChat(std::string_view chat_template, const std::ve
 
 void LlamaCppBackend::SetTelemetrySink(TelemetrySink sink) { impl_->telemetry = std::move(sink); }
 void LlamaCppBackend::SetKvTelemetry(std::shared_ptr<KvTelemetry> kv) { impl_->kv_tel = std::move(kv); }
+
+void LlamaCppBackend::SetGraphEvalSink(GraphEvalSink sink) { impl_->graph_eval_sink = std::move(sink); }
 
 PrefixCoalescerStats LlamaCppBackend::GetPrefixCoalescerStats() const noexcept {
     PrefixCoalescerStats out;
@@ -5107,7 +5173,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                          static_cast<llama_pos>(cur_pos + j), slot_id, is_last_prompt_tok);
             }
             Status decode_err;
-            const int32_t rc = RunDecode(ctx, batch, &decode_err);
+            const int32_t rc = DecodeMainContext(batch, GraphEvalKind::kPrefill, &decode_err);
             if (rc == 2) {
                 if (!llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(cur_pos), -1)) {
                     invalidate_slot();
@@ -5512,7 +5578,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         const Clock::time_point verify_start =
             (stage_prof && !draft_tokens.empty()) ? Clock::now() : Clock::time_point{};
         Status decode_err;
-        const int32_t rc = RunDecode(ctx, batch, &decode_err);
+        const int32_t rc = DecodeMainContext(batch, GraphEvalKind::kDecode, &decode_err);
         if (stage_prof && !draft_tokens.empty()) {
             add_stage_ms(result.stage_timings.verify_ms, MsSince(verify_start));
         }
@@ -5686,7 +5752,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                                      static_cast<llama_pos>(pos + 1 + static_cast<int64_t>(j)), slot_id,
                                      /*logits=*/false);
                         }
-                        if (RunDecode(ctx, batch) != 0) {
+                        if (DecodeMainContext(batch, GraphEvalKind::kDecode) != 0) {
                             invalidate_slot();
                             return finish_rb(false);
                         }
@@ -6894,11 +6960,11 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 }
                 auto decode_start = Clock::now();
                 Status decode_err;
-                int32_t rc = RunDecode(ctx, batch, &decode_err);
+                int32_t rc = DecodeMainContext(batch, GraphEvalKind::kPrefill, &decode_err);
                 while (rc == 1 && evict_one_idle_slot()) {
                     abort_requested.store(false, std::memory_order_relaxed);
                     decode_start = Clock::now();
-                    rc = RunDecode(ctx, batch, &decode_err);
+                    rc = DecodeMainContext(batch, GraphEvalKind::kPrefill, &decode_err);
                 }
                 const double prefill_decode_ms = MsSince(decode_start);
                 batch_abort_fn = nullptr;
@@ -7248,11 +7314,11 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 
             auto decode_start = Clock::now();
             Status decode_err;
-            int32_t rc = RunDecode(ctx, batch, &decode_err);
+            int32_t rc = DecodeMainContext(batch, GraphEvalKind::kDecode, &decode_err);
             while (rc == 1 && evict_one_idle_slot()) {
                 abort_requested.store(false, std::memory_order_relaxed);
                 decode_start = Clock::now();
-                rc = RunDecode(ctx, batch, &decode_err);
+                rc = DecodeMainContext(batch, GraphEvalKind::kDecode, &decode_err);
             }
             const double decode_call_ms = MsSince(decode_start);
             if (slot_stage_prof && !draft_tokens.empty()) {
@@ -7455,7 +7521,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                                          static_cast<llama_pos>(s.pos + 1 + static_cast<int64_t>(j)), s.slot_id,
                                          /*logits=*/false);
                             }
-                            if (RunDecode(ctx, batch) != 0) {
+                            if (DecodeMainContext(batch, GraphEvalKind::kDecode) != 0) {
                                 invalidate_slot(s);
                                 return finish_rb(false);
                             }
@@ -7706,11 +7772,11 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 const auto step_start = Clock::now();
                 auto decode_start = step_start;
                 Status decode_err;
-                int32_t rc = RunDecode(ctx, batch, &decode_err);
+                int32_t rc = DecodeMainContext(batch, GraphEvalKind::kBatch, &decode_err);
                 while (rc == 1 && evict_one_idle_slot()) {
                     abort_requested.store(false, std::memory_order_relaxed);
                     decode_start = Clock::now();
-                    rc = RunDecode(ctx, batch, &decode_err);
+                    rc = DecodeMainContext(batch, GraphEvalKind::kBatch, &decode_err);
                 }
                 const double decode_call_ms = MsSince(decode_start);
                 batch_abort_fn = nullptr;
@@ -8173,14 +8239,14 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         const auto step_start = Clock::now();
         auto decode_start = step_start;
         Status decode_err;
-        int32_t rc = RunDecode(ctx, batch, &decode_err);
+        int32_t rc = DecodeMainContext(batch, GraphEvalKind::kBatch, &decode_err);
 
         // Under unified KV (`kv_unified=true`), idle prefix-cached slots share
         // the same n_ctx pool; evict LRU idle slots before retrying on rc==1.
         while (rc == 1 && evict_one_idle_slot()) {
             abort_requested.store(false, std::memory_order_relaxed);
             decode_start = Clock::now();
-            rc = RunDecode(ctx, batch, &decode_err);
+            rc = DecodeMainContext(batch, GraphEvalKind::kBatch, &decode_err);
         }
 
         // If KV is still full after idle eviction and multiple active slots
@@ -8251,7 +8317,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             pack_plan(plan);
             abort_requested.store(false, std::memory_order_relaxed);
             decode_start = Clock::now();
-            rc = RunDecode(ctx, batch, &decode_err);
+            rc = DecodeMainContext(batch, GraphEvalKind::kBatch, &decode_err);
         }
 
         // If a mixed prefill+decode batch still returned rc==1 (no KV slot for
@@ -8270,7 +8336,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             pack_plan(plan);
             abort_requested.store(false, std::memory_order_relaxed);
             decode_start = Clock::now();
-            rc = RunDecode(ctx, batch, &decode_err);
+            rc = DecodeMainContext(batch, GraphEvalKind::kBatch, &decode_err);
         }
         const double decode_call_ms = MsSince(decode_start);
         batch_abort_fn = nullptr;

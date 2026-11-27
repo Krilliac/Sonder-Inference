@@ -32,6 +32,7 @@
 #include "common/diag_log.hpp"
 #include "common/sha256.hpp"
 #include "device_health.hpp"
+#include "graph_telemetry.hpp"
 #include "kv_telemetry.hpp"
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include "sonder/inference/backends/llamacpp.hpp"
@@ -444,6 +445,7 @@ struct RuntimeState {
     std::uint32_t configured_cache_ram_mib = 0;
     bool configured_mmproj = false;
     bool configured_lora = false;
+    bool configured_layer_telemetry = false;
 
     bool has_sampled = false;
     bool probe_in_flight = false;
@@ -457,6 +459,7 @@ struct RuntimeState {
     bool observed_device_prefix_reuse = false;
     bool observed_host_l2_restore = false;
     bool observed_concurrent_batch = false;
+    bool observed_layer_telemetry = false;
     std::optional<EffectiveExecutionReport> last_execution_report;
     std::shared_ptr<lc::DeviceHealthTracker> device_health;
 
@@ -474,6 +477,7 @@ struct RuntimeState {
           configured_cache_ram_mib(opts.cache_ram_mib),
           configured_mmproj(!opts.mmproj_path.empty()),
           configured_lora(!opts.lora_aliases.empty()),
+          configured_layer_telemetry(lc::ShouldInstallGraphCallback(opts.telemetry_level)),
           device_health(std::make_shared<lc::DeviceHealthTracker>(kLlamaCppBackendName)) {
         gpu_memory.probe = "none";
         gpu_memory.status = "not_sampled";
@@ -531,6 +535,11 @@ struct RuntimeState {
             observed_concurrent_batch = true;
         }
         last_execution_report = bound_effective_execution_report(report);
+    }
+
+    void RecordGraphTelemetryObserved() {
+        std::lock_guard<std::mutex> lock(mutex);
+        observed_layer_telemetry = true;
     }
 
     std::vector<CapabilityStatusEntry> BuildCapabilityStatusesLocked() const {
@@ -633,6 +642,21 @@ struct RuntimeState {
             s.observed_active = configured_lora ? CapabilityState::unknown : CapabilityState::no;
             s.qualified_beneficial = CapabilityState::unknown;
             out.emplace_back("lora", std::move(s));
+        }
+        {
+            CapabilityStatus s;
+            s.adapter_supports = CapabilityState::yes;
+            s.build_supports = CapabilityState::yes;
+            s.configured = capability_state_from_bool(configured_layer_telemetry);
+            if (observed_layer_telemetry) {
+                s.observed_active = CapabilityState::yes;
+            } else if (!configured_layer_telemetry) {
+                s.observed_active = CapabilityState::no;
+            } else {
+                s.observed_active = CapabilityState::unknown;
+            }
+            s.qualified_beneficial = CapabilityState::unknown;
+            out.emplace_back("layer_telemetry", std::move(s));
         }
         for (const char* cap_name :
              {"structured_output", "embeddings", "reranking", "logprobs", "recurrent_checkpoint",
@@ -863,6 +887,12 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     lo.startup_smoke_test = o.startup_smoke_test;
     lo.embed_max_total_tokens = o.embed_max_total_tokens;
     lo.embed_max_input_tokens = o.embed_max_input_tokens;
+    if (o.graph_telemetry_sample_every == 0) {
+        return Status(ErrorCode::invalid_argument, "graph_telemetry_sample_every must be >= 1");
+    }
+    lo.graph_telemetry_enabled = lc::ShouldInstallGraphCallback(o.telemetry_level);
+    lo.graph_telemetry_sample_every = o.graph_telemetry_sample_every;
+    lo.graph_telemetry_timings = o.graph_telemetry_timings;
     if (!lc::ParseSplitMode(o.split_mode, lo.split_mode)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown split mode '" + o.split_mode + "' (expected none, layer or row)");
@@ -1666,6 +1696,9 @@ public:
         if (!options_.mmproj_path.empty()) {
             caps.add(Capability::multimodal);
         }
+        if (lc::ShouldInstallGraphCallback(options_.telemetry_level)) {
+            caps.add(Capability::layer_telemetry);
+        }
         return caps;
     }
     [[nodiscard]] std::optional<BackendRuntimeStatus> runtime_status() const override {
@@ -1816,6 +1849,24 @@ public:
                 !ls.ok()) {
                 return ToStatus(ls);
             }
+        }
+        if (lc::ShouldInstallGraphCallback(options_.telemetry_level)) {
+            TelemetryContext gctx = options_.telemetry_context;
+            if (gctx.session_id.empty()) {
+                gctx.session_id = kLlamaCppBackendName;
+            }
+            if (!gctx.device_id.has_value() && !options.device_id.empty()) {
+                gctx.device_id = options.device_id;
+            }
+            TelemetryBus* bus = options_.telemetry_bus;
+            const TelemetryLevel level = options_.telemetry_level;
+            runtime.SetGraphEvalSink([state = runtime_state_, bus, gctx = std::move(gctx),
+                                      level](const lc::GraphEvalSummary& summary) {
+                if (state) state->RecordGraphTelemetryObserved();
+                if (bus != nullptr) {
+                    (void)lc::EmitGraphTelemetry(*bus, gctx, summary, level, kLlamaCppBackendName);
+                }
+            });
         }
 
         const lc::ModelInfo info = runtime.GetModelInfo();

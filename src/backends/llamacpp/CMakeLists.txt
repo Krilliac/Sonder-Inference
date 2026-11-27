@@ -569,6 +569,7 @@ add_library(sonder_backend_llamacpp STATIC
     embeddings.cpp
     kv_telemetry.cpp
     prefix_checkpoints.cpp
+    graph_telemetry.cpp
     slot_store.cpp
     spec_controller.cpp
     request_guards.cpp

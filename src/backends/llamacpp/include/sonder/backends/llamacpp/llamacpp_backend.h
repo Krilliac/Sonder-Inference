@@ -279,6 +279,11 @@ struct LoadOptions {
     // always bounded by the context window as well.
     std::uint32_t embed_max_total_tokens = kDefaultEmbedMaxTotalTokens;
     std::uint32_t embed_max_input_tokens = 0;
+    // Deep graph eval telemetry (strictly opt-in at TelemetryLevel::deep; below deep
+    // cb_eval is never installed on llama_context_params).
+    bool graph_telemetry_enabled = false;
+    std::uint32_t graph_telemetry_sample_every = 1;
+    bool graph_telemetry_timings = true;
 };
 
 // Checks placement options (main_gpu >= 0, split_mode, tensor_split finite /
@@ -386,6 +391,7 @@ struct ContextParamsSummary {
     std::uint32_t n_rs_seq = 0;
     std::uint32_t n_outputs_max_per_seq = 0;
     std::uint32_t n_outputs_max = 0;
+    bool has_eval_callback = false;
 };
 
 struct SamplingParams {
@@ -744,6 +750,9 @@ struct TelemetryEvent {
 
 using TelemetrySink = std::function<void(const TelemetryEvent&)>;
 
+struct GraphEvalSummary;
+using GraphEvalSink = std::function<void(const GraphEvalSummary&)>;
+
 // Telemetry counters for cold shared-prefix prefill coalescing.
 struct PrefixCoalescerStats {
     std::uint64_t coalesced_groups = 0;
@@ -940,6 +949,7 @@ public:
     // queues kv.pool.configured when the context is created, kv.usage as slots
     // change and kv.evicted on idle-slot eviction; the owner drains the queue.
     void SetKvTelemetry(std::shared_ptr<KvTelemetry> kv);
+    void SetGraphEvalSink(GraphEvalSink sink);
     [[nodiscard]] PrefixCoalescerStats GetPrefixCoalescerStats() const noexcept;
     [[nodiscard]] PrefixCheckpointCounters GetPrefixCheckpointStats() const noexcept;
 

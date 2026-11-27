@@ -375,6 +375,24 @@ tokens served from Ollama's prompt cache; 0 before Ollama 0.33.3),
 `model`, `eval_count` int, `eval_duration_ns` int, `decode_tokens_per_sec`
 num, optional `ttft_ms` num). The engine does not call it yet.
 
+### Layer and operator telemetry (deep)
+
+Emitted strictly when `TelemetryLevel::deep` is active. At any level below
+`deep` (`off`, `metrics`, `standard`), the direct `llamacpp` backend does not
+install ggml's `cb_eval` (`ggml_backend_sched_eval_callback`) on the context at
+all and does not advertise the `layer_telemetry` capability. At `deep`, the
+callback aggregates into fixed-size arrays with zero per-node heap allocation
+or string formatting and emits bounded summaries after each sampled graph
+evaluation (stride `graph_telemetry_sample_every`, default `1`; layers capped
+at `256`, operators at `64` per eval out of `128` tracked op slots, devices at
+`16`). Layer indices are parsed from llama.cpp v1.0.0 tensor names (`<name>-<layer>`,
+stripping trailing ` (view)` / ` (reshaped)` / ` (cont)` tags).
+
+| Event | Level | Attributes |
+| --- | --- | --- |
+| `backend.layer.timing` | deep | one per observed layer per sampled eval (ascending `layer_index`, bounded): `backend` str, `eval_index` int (1-based), `sample_every_n` int, `layer_index` int (0-based), `node_count` int, `backend_device` str (primary ggml device for the layer), `devices` arr of str, `op_count` int (distinct ops in layer), `eval_kind` str (`eval`, `prefill`, `decode`, `batch`, `embed`); optional `batch_tokens` int (when > 0); optional `duration_ms` num and `timed_nodes` int (present only when per-node timings were collected, omitted in counting-only mode) |
+| `backend.operator.activity` | deep | one per observed ggml op type per sampled eval (sorted hottest first, bounded): `backend` str, `eval_index` int (1-based), `sample_every_n` int, `op_type` str (`ggml_op_name`), `op_id` int, `node_count` int, `total_eval_nodes` int, `backend_device` str (primary ggml device for this op), `devices` arr of obj `{device` str, `node_count` int`}`, `eval_kind` str; optional `batch_tokens` int (when > 0); optional `duration_ms` num and `timed_nodes` int (present only when per-node timings were collected) |
+
 ## Sampling
 
 | Event | Level | Attributes |
