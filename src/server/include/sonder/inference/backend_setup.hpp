@@ -162,6 +162,10 @@ struct BackendSetup {
     // docs/integration/rpc-worker.md). Mirrors LlamaServerRpcWorkerOptions;
     // the backend validates the server literals before any child starts.
     struct LlamaServerRpcWorkerConfig {
+        // Same bounds as LlamaServerRpcWorkerOptions (static_assert in
+        // backend_setup.cpp when the llamaserver backend is built).
+        static constexpr std::size_t kMaxServers = 16;
+        static constexpr std::size_t kMaxServerChars = 21;
         bool enabled = false;
         std::vector<std::string> servers;
         bool allow_public_addresses = false;

@@ -21,12 +21,21 @@
 
 namespace sonder::inference::llamaserver {
 
-// True when llama-server would read `arg` as its `--rpc` flag: "--rpc",
-// "--rpc=VALUE" and any spelling whose '_' llama-server turns into '-'.
+// True when llama-server would read `arg` as the "--" flag `flag` (given in
+// its '-' spelling): the flag itself, "FLAG=VALUE", and any spelling whose '_'
+// llama-server turns into '-'.
+[[nodiscard]] bool matches_llama_server_flag(std::string_view arg, std::string_view flag) noexcept;
+
+// True when llama-server would read `arg` as its `--rpc` flag.
 [[nodiscard]] bool is_rpc_flag(std::string_view arg) noexcept;
 
-// Refuses every `--rpc` spelling in operator spawn arguments. The message
-// points at rpc_worker; it never echoes the argument value.
+// True when llama-server would read `arg` as `--models-preset`. A preset INI
+// sets llama-server options by key (an "rpc" key reaches the --rpc handler),
+// so it is a second way to put the RPC client into a spawned child.
+[[nodiscard]] bool is_models_preset_flag(std::string_view arg) noexcept;
+
+// Refuses every `--rpc` and `--models-preset` spelling in operator spawn
+// arguments. The message points at rpc_worker; it never echoes the value.
 [[nodiscard]] Status refuse_operator_rpc_arguments(const std::vector<std::string> &arguments);
 
 // One "A.B.C.D:PORT" entry: dotted-decimal IPv4 with no leading zeros, port

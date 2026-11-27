@@ -87,6 +87,37 @@ TEST_CASE("rpc worker: every llama-server spelling of --rpc is recognised, neigh
     CHECK(refused.message().find("10.0.0.2") == std::string::npos);
 }
 
+TEST_CASE("rpc worker: every llama-server spelling of --models-preset is recognised and refused") {
+    // A preset INI sets options by key; "rpc = host:port" reaches the --rpc
+    // handler (common/preset.cpp at b11195), so it is refused like --rpc.
+    for (const std::string_view arg : {"--models-preset", "--models_preset", "--models-preset=p.ini",
+                                       "--models_preset=p.ini"}) {
+        CAPTURE(arg);
+        CHECK(ls::is_models_preset_flag(arg));
+        CHECK_FALSE(ls::is_rpc_flag(arg));
+        const Status st = ls::refuse_operator_rpc_arguments({"-m", "x.gguf", std::string(arg), "p.ini"});
+        CHECK(st.code() == ErrorCode::invalid_argument);
+        CHECK(st.message().find("--models-preset") != std::string::npos);
+        CHECK(st.message().find("p.ini") == std::string::npos);
+    }
+    for (const std::string_view arg : {"--models-presets", "--models", "--models-dir", "-models-preset",
+                                       "--MODELS-PRESET", "models-preset", "--models-preset-x"}) {
+        CAPTURE(arg);
+        CHECK_FALSE(ls::is_models_preset_flag(arg));
+    }
+    CHECK(ls::matches_llama_server_flag("--spec_draft_hf", "--spec-draft-hf"));
+    CHECK_FALSE(ls::matches_llama_server_flag("_-rpc", "--rpc"));  // the leading "--" is never rewritten
+
+    // Through the backend, with and without rpc_worker.
+    auto plain = quiet_spawn();
+    plain.args.insert(plain.args.end(), {"--models-preset", "p.ini"});
+    CHECK(backend_status(plain).code() == ErrorCode::invalid_argument);
+    auto both = quiet_spawn();
+    both.rpc_worker = worker({"10.0.0.2:50052"});
+    both.args.insert(both.args.end(), {"--models_preset", "p.ini"});
+    CHECK(backend_status(both).code() == ErrorCode::invalid_argument);
+}
+
 TEST_CASE("rpc worker: server literals accept only pinned local IPv4:PORT unless public is allowed") {
     for (const std::string_view local :
          {"127.0.0.1:50052", "10.0.0.2:1", "10.255.255.255:65535", "172.16.0.1:50052", "172.31.255.255:50052",
@@ -390,6 +421,14 @@ TEST_CASE("rpc worker: the llamaserver config file switch is strict and reaches 
         R"("spill_guard":{"enabled":false},"stall_guard":{"enabled":false}})");
     CHECK(args_rpc.code() == ErrorCode::invalid_argument);
     CHECK(args_rpc.message().find("rpc_worker") != std::string::npos);
+
+    // So is a preset INI that could carry "rpc".
+    const Status args_preset = config_status(
+        R"({"mode":"spawn","executable":"rpc-worker-never-started-llama-server.exe",)"
+        R"("args":["--models-preset","p.ini"],"native_completion":false,)"
+        R"("spill_guard":{"enabled":false},"stall_guard":{"enabled":false}})");
+    CHECK(args_preset.code() == ErrorCode::invalid_argument);
+    CHECK(args_preset.message().find("--models-preset") != std::string::npos);
 
     // An attach backend cannot host the worker.
     CHECK(config_status(R"({"mode":"attach","base_url":"http://127.0.0.1:8080","native_completion":false,)"

@@ -77,19 +77,26 @@ AddressClass classify(const std::array<std::uint32_t, 4> &a) {
 
 } // namespace
 
-bool is_rpc_flag(std::string_view arg) noexcept {
-    // llama-server turns every '_' of a "--" argument into '-' before the
-    // exact lookup; a future parser may also accept "--flag=value".
+// True when llama-server would read `arg` as the "--" flag `flag`: exact
+// match after every '_' past the leading "--" becomes '-' (llama-server's
+// lookup), with or without a "=VALUE" suffix (no such form at b11195; a later
+// parser may add one, so the superset fails closed).
+bool matches_llama_server_flag(std::string_view arg, std::string_view flag) noexcept {
     const std::string_view name = arg.substr(0, arg.find('='));
-    constexpr std::string_view kRpc = "--rpc";
-    if (name.size() != kRpc.size())
+    if (name.size() != flag.size())
         return false;
-    for (std::size_t i = 0; i < kRpc.size(); ++i) {
+    for (std::size_t i = 0; i < flag.size(); ++i) {
         const char c = name[i] == '_' && i >= 2 ? '-' : name[i];
-        if (c != kRpc[i])
+        if (c != flag[i])
             return false;
     }
     return true;
+}
+
+bool is_rpc_flag(std::string_view arg) noexcept { return matches_llama_server_flag(arg, "--rpc"); }
+
+bool is_models_preset_flag(std::string_view arg) noexcept {
+    return matches_llama_server_flag(arg, "--models-preset");
 }
 
 Status refuse_operator_rpc_arguments(const std::vector<std::string> &arguments) {
@@ -97,13 +104,16 @@ Status refuse_operator_rpc_arguments(const std::vector<std::string> &arguments) 
         if (is_rpc_flag(arg))
             return bad("args must not contain --rpc: the llama.cpp RPC client runs only in an isolated worker child; "
                        "configure rpc_worker.servers instead (docs/integration/rpc-worker.md)");
+        if (is_models_preset_flag(arg))
+            return bad("args must not contain --models-preset: a preset INI can set any llama-server option, rpc "
+                       "included, outside these argument checks (docs/integration/rpc-worker.md)");
     }
     return Status::success();
 }
 
 Status validate_rpc_server(std::string_view server, bool allow_public) {
     const std::size_t colon = server.rfind(':');
-    if (server.empty() || server.size() > 21 || colon == std::string_view::npos || colon == 0)
+    if (server.empty() || server.size() > LlamaServerRpcWorkerOptions::kMaxServerChars || colon == std::string_view::npos || colon == 0)
         return bad("rpc_worker.servers entry '" + printable(server) + "' must be IPV4:PORT");
     const auto octets = parse_ipv4(server.substr(0, colon));
     if (!octets)

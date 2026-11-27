@@ -44,6 +44,10 @@ if(GGML_RPC)
         "GGML_RPC=ON is refused for the in-process llamacpp backend: the RPC client must run in an "
         "isolated worker process. Use the llamaserver backend's rpc_worker (docs/integration/rpc-worker.md).")
 endif()
+# Pin it off in the cache as well, so a fork (FETCHCONTENT_SOURCE_DIR_LLAMACPP)
+# whose ggml declares GGML_RPC with a default of ON cannot turn it back on:
+# option() leaves an existing cache entry alone.
+set(GGML_RPC OFF CACHE BOOL "ggml: use RPC (refused for the in-process llamacpp backend)" FORCE)
 
 include(FetchContent)
 
@@ -109,6 +113,12 @@ FetchContent_Declare(llamacpp
     ${SONDER_LLAMACPP_FETCH_EXTRA}
 )
 FetchContent_MakeAvailable(llamacpp)
+# Backstop for a tree that adds the RPC backend some other way.
+if(TARGET ggml-rpc)
+    message(FATAL_ERROR
+        "the fetched llama.cpp defines the ggml-rpc target; the in-process llamacpp backend must not contain the "
+        "RPC client (docs/integration/rpc-worker.md)")
+endif()
 
 # llama.cpp itself is written against C++17. The root project sets
 # CMAKE_CXX_STANDARD 20, and under MSVC C++20 char8_t makes u8"" literals in

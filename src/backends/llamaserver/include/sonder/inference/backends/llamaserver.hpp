@@ -180,6 +180,8 @@ struct LlamaServerRpcWorkerOptions {
     // RFC 6598 shared (100.64/10) addresses are accepted unless this is set.
     bool allow_public_addresses = false;
     static constexpr std::size_t kMaxServers = 16;
+    // Longest "A.B.C.D:PORT" literal ("255.255.255.255:65535").
+    static constexpr std::size_t kMaxServerChars = 21;
 };
 
 struct LlamaServerBackendOptions {

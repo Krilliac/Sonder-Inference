@@ -418,6 +418,15 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     if (auto v = a.get("llamaserver-executable")) o.backend.llamaserver_executable = *v;
     if (!a.all("llamaserver-arg").empty()) o.backend.llamaserver_args = a.all("llamaserver-arg");
     if (primary && primary->backend == kLaunchProfileBackendLlamaServer) {
+        // A profile's child is the one that serves its model, and in shared
+        // spawn mode several profiles share it; the RPC client never runs
+        // there (docs/integration/rpc-worker.md). Run the worker as its own
+        // serve instance without --profile.
+        if (o.backend.llamaserver_rpc_worker.enabled || !o.backend.llamaserver_rpc_worker.servers.empty()) {
+            return usage_error("launch profile '" + primary->name +
+                               "': llamaserver config 'rpc_worker' cannot be combined with --profile or "
+                               "--all-profiles; run the RPC worker as a separate `sonder-infer serve` instance");
+        }
         const auto check_profile_env = [&]() -> std::string {
             for (const auto& [env_key, env_val] : o.backend.llamaserver_environment) {
                 (void)env_val;

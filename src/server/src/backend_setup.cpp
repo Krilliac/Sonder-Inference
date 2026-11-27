@@ -16,6 +16,15 @@
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
 #include "sonder/inference/backends/llamaserver.hpp"
 #endif
+
+#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+// The setup loader mirrors the backend's rpc_worker bounds so it builds
+// without the backend header; these keep the two from drifting apart.
+static_assert(sonder::inference::BackendSetup::LlamaServerRpcWorkerConfig::kMaxServers ==
+              sonder::inference::LlamaServerRpcWorkerOptions::kMaxServers);
+static_assert(sonder::inference::BackendSetup::LlamaServerRpcWorkerConfig::kMaxServerChars ==
+              sonder::inference::LlamaServerRpcWorkerOptions::kMaxServerChars);
+#endif
 #if defined(SONDER_HAS_OLLAMA_BACKEND)
 #include "sonder/inference/backends/ollama.hpp"
 #endif
@@ -237,11 +246,11 @@ Status parse_rpc_worker_config(const json::Value& value, BackendSetup::LlamaServ
         parsed.allow_public_addresses = v->as_bool();
     }
     if (const auto* v = value.find("servers")) {
-        // 16 matches LlamaServerRpcWorkerOptions::kMaxServers; 21 bytes is the
-        // longest "A.B.C.D:PORT" literal.
-        if (!v->is_array() || v->as_array().size() > 16) return bad("servers", "an array of at most 16 strings");
+        using Config = BackendSetup::LlamaServerRpcWorkerConfig;
+        if (!v->is_array() || v->as_array().size() > Config::kMaxServers)
+            return bad("servers", ("an array of at most " + std::to_string(Config::kMaxServers) + " strings").c_str());
         for (const auto& item : v->as_array()) {
-            if (!item.is_string() || item.as_string().empty() || item.as_string().size() > 21 ||
+            if (!item.is_string() || item.as_string().empty() || item.as_string().size() > Config::kMaxServerChars ||
                 item.as_string().find('\0') != std::string::npos)
                 return bad("servers", "an array of IPV4:PORT strings");
             parsed.servers.push_back(item.as_string());

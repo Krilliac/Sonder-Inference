@@ -375,6 +375,41 @@ TEST_CASE("serve_main: --profile enforces GPU/runtime env allowlist on --llamase
     fs::remove(arbitrary_cfg, ec);
 }
 
+TEST_CASE("serve_main: rpc_worker in --llamaserver-config is refused with launch profiles") {
+    // A profile's child serves its model, and in shared spawn mode several
+    // profiles share it; the RPC client never runs there
+    // (docs/integration/rpc-worker.md).
+    const auto profiles = temp_path("profiles-rpc.json");
+    const auto worker_cfg = temp_path("cfg-rpc-worker.json");
+    const auto half_cfg = temp_path("cfg-rpc-servers-only.json");
+    {
+        std::ofstream(profiles) << R"({"profiles":[{"name":"p1","backend":"llamaserver","model":"m.gguf"},)"
+                                   R"({"name":"p2","backend":"llamaserver","model":"m.gguf"}]})";
+        std::ofstream(worker_cfg) << R"({"mode":"spawn","executable":"C:/llama-server.exe",)"
+                                     R"("rpc_worker":{"enabled":true,"servers":["10.0.0.2:50052"]}})";
+        std::ofstream(half_cfg) << R"({"mode":"spawn","executable":"C:/llama-server.exe",)"
+                                   R"("rpc_worker":{"servers":["10.0.0.2:50052"]}})";
+    }
+    for (const std::vector<std::string>& selection :
+         {std::vector<std::string>{"--profile", "p1"}, std::vector<std::string>{"--profile", "p1", "--profile", "p2"},
+          std::vector<std::string>{"--all-profiles"}}) {
+        for (const auto& cfg : {worker_cfg, half_cfg}) {
+            CAPTURE(selection.size());
+            CAPTURE(cfg.string());
+            std::vector<std::string> args{"--profiles", profiles.string()};
+            args.insert(args.end(), selection.begin(), selection.end());
+            args.insert(args.end(), {"--llamaserver-config", cfg.string()});
+            std::string out, err;
+            CHECK(run(args, out, err) == 2);
+            CHECK(err.find("'rpc_worker' cannot be combined with --profile") != std::string::npos);
+        }
+    }
+    std::error_code ec;
+    fs::remove(profiles, ec);
+    fs::remove(worker_cfg, ec);
+    fs::remove(half_cfg, ec);
+}
+
 TEST_CASE("serve_main: llama.cpp KV cache, flash attention and batch flags") {
     std::string out;
     std::string err;

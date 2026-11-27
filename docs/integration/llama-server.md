@@ -312,7 +312,7 @@ in [1, 3600000] (one hour); 0 is rejected.
 | `mode` | string, `attach` | `attach` or `spawn`. |
 | `base_url` | string, `http://127.0.0.1:8080` | Attach mode: the server root (optionally with a proxy prefix; no `/v1`). |
 | `executable` | string, empty | Required in spawn mode; the llama-server binary. |
-| `args` | string array, `[]` | Spawn mode: one child argument per entry, no shell. `--host`, `--port`, `--` and `--rpc` are refused (cross-host split uses `rpc_worker`). |
+| `args` | string array, `[]` | Spawn mode: one child argument per entry, no shell. `--host`, `--port`, `--`, `--rpc` and `--models-preset` are refused (cross-host split uses `rpc_worker`; a preset INI could set `rpc`). |
 | `allow_remote` | bool, `false` | Attach to a non-loopback host; requires HTTPS (see "Security and configuration limits" above). |
 | `native_completion` | bool, `true` | `false` selects generic OpenAI mode (`/v1/completions`). |
 | `grammar` | string, empty | Upstream GBNF; see [Sampling and observations](#sampling-and-observations). |
@@ -417,7 +417,8 @@ Behaviour: "Host-memory admission (MoE offload)" below.
 - `stall_guard.policy` of `cancel` without `generic_progress`, and
   `generic_progress` with `restart`, are refused.
 - `rpc_worker` needs spawn mode, and `rpc_worker.servers` without
-  `"enabled": true` is refused rather than ignored.
+  `"enabled": true` is refused rather than ignored. `serve` refuses
+  `rpc_worker` together with `--profile` or `--all-profiles`.
 - A spawned child's own llama-server flags, including model placement and
   context, go in `args` (or come from a [launch profile](launch-profiles.md)).
 

@@ -3,7 +3,9 @@
 Status: first slice (2026-11-26). Cross-host layer split through llama.cpp's
 RPC client runs only in a supervised llama-server child that Sonder-Inference
 (SI) owns, never inside the SI process and never in the child that serves the
-primary model. This page is the contract for that worker. It follows ADR-021
+primary model, except through the paths listed as not closed under
+"Refusals". The child is a fault boundary, not a privilege boundary (see
+"Why a separate process"). This page is the contract for that worker. It follows ADR-021
 and the [federation worker contract](federation-worker-contract.md): the
 worker is one more SI endpoint that the Runtime places whole requests on.
 
@@ -14,11 +16,25 @@ llama.cpp's RPC client trusts its peers. At the pinned revision (b11195,
 hello handshake or reports a different protocol version ends the client
 process with `GGML_ABORT`, and every tensor, size and graph result the peer
 sends back is parsed inside that process. The protocol has no authentication
-or encryption, and the activations of every prompt cross it. A broken or
-hostile `rpc-server` must therefore only be able to take down a process whose
-loss is already handled: a supervised child. It must not be able to kill or
-corrupt the SI server or the process that hosts the main model.
+or encryption, and the activations of every prompt cross it.
 
+What the separate process delivers in this slice, and what it does not:
+
+- **Delivered: fault isolation.** A peer that makes the client abort or
+  crash takes down only the supervised worker child, whose loss is already
+  handled (restart with backoff, a bounded budget, `503` for the request in
+  flight). The SI server and the process that hosts the primary model keep
+  running.
+- **Not delivered: a privilege boundary.** The worker child runs under the
+  same user token as SI, with no restricted token, lowered integrity level,
+  AppContainer or (on POSIX) separate user or sandbox. On Windows the only
+  Job Object limit is `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+  (`src/backends/llamaserver/process.cpp`). A peer that gets code execution
+  in the worker through the client's response parsing therefore runs as that
+  user and can kill or tamper with the SI server, the Bonsai llama-server and
+  anything else that user owns. Treat every `rpc-server` peer as trusted at
+  the level of the account SI runs under until a sandboxed worker lands (see
+  "Not in this slice").
 ## Layout
 
 ```
@@ -87,15 +103,35 @@ argv (llama.cpp registers RPC devices while parsing, so a later `--device`
 naming one has to follow it), then the operator `args` unchanged, then its own
 `--host 127.0.0.1 --port N`.
 
-## Refusals: RPC never runs anywhere else
+## Refusals: where RPC is kept out
 
 | Path | Result |
 |---|---|
 | `--rpc` or `--rpc=...` (any `_` spelling) in spawn `args` or `--llamaserver-arg`, with or without `rpc_worker` | refused at backend construction; use `rpc_worker` |
-| `--rpc` in a launch profile's `extra_args` | refused (unchanged, [launch-profiles.md](launch-profiles.md)) |
-| `LLAMA_ARG_RPC` as an `env` override | refused (all `LLAMA_*` overrides are); an inherited one is not passed to the child |
+| `--models-preset` (any `_` spelling) in spawn `args` or `--llamaserver-arg` | refused at backend construction: a preset INI sets options by key, and an `rpc` key reaches llama-server's `--rpc` handler (`common/preset.cpp` at b11195) |
+| `--rpc` or `--models-preset` in a launch profile's `extra_args` | refused (unchanged, [launch-profiles.md](launch-profiles.md)) |
+| `rpc_worker` in `--llamaserver-config` together with `--profile` or `--all-profiles` | refused by `serve`: a profile's child serves its model, and in shared spawn mode several profiles share one child |
+| llama.cpp user `config.ini` (`%APPDATA%\llama.cpp\config.ini`; `$XDG_CONFIG_HOME` or `~/.config/llama.cpp/config.ini` on POSIX), which llama-server applies before env and argv | closed for every SI-spawned child: `APPDATA` is not inherited on Windows (unset, llama.cpp skips the file) and on POSIX the child gets `XDG_CONFIG_HOME=/dev/null`, under which no file can exist (`env_policy.hpp`, `process_options.cpp`) |
+| llama.cpp system `config.ini` on Windows (`%PROGRAMDATA%\llama.cpp\config.ini`) | closed: `PROGRAMDATA` is never inherited and cannot be set as an override |
+| `LLAMA_ARG_RPC` / `LLAMA_ARG_MODELS_PRESET` as an `env` override | refused (all `LLAMA_*` overrides are); an inherited one is not passed to the child |
 | `rpc_worker` on an attach backend | refused: SI must own the process the RPC client runs in |
-| `SONDER_WITH_LLAMA_CPP=ON` together with `GGML_RPC=ON` | CMake configure fails before anything is fetched: the in-process backend never contains the RPC client |
+| `SONDER_WITH_LLAMA_CPP=ON` together with `GGML_RPC=ON` | CMake configure fails before anything is fetched; `GGML_RPC` is then forced `OFF` in the cache (a fork whose ggml defaults it `ON` cannot turn it back on), and configure also fails if the fetched tree still defines a `ggml-rpc` target |
+
+Paths that are **not** closed in this slice (each can still put the RPC client
+into an SI-spawned child, the primary model's included):
+
+- `-hf` / `--hf-repo` naming a Hugging Face repo that has a `preset.ini` at
+  its root: llama-server downloads that file and starts in router mode with
+  it (`tools/server/server.cpp`, `common/download.cpp` at b11195), and its
+  `rpc` key is applied like a local preset's. Operator spawn args accept
+  downloads on purpose (launch profiles refuse `-hf`), so refusing it is a
+  separate decision.
+- POSIX `/etc/llama.cpp/config.ini`: llama.cpp reads it regardless of the
+  environment. It is root-owned; whoever can write it controls every
+  llama.cpp program on the host.
+- `sonder-infer tune` children are not filtered for `--rpc` or
+  `--models-preset` (they get the same environment policy, so the
+  `config.ini` row above holds for them).
 
 An attach backend's `args` only describe an upstream that SI does not run, so
 they are not filtered for `--rpc`; an upstream that uses RPC is the operator's
@@ -129,8 +165,8 @@ and responses are parsed by the llamaserver protocol code, which refuses
 malformed JSON instead of trusting it. Nothing from the peer reaches SI
 except through that child. Inputs that cross into the child are the
 validated server literals, the operator's `args` (still filtered for
-`--host`, `--port`, `--` and `--rpc`) and the environment allowlist in
-`env_policy.hpp`.
+`--host`, `--port`, `--`, `--rpc` and `--models-preset`) and the
+environment allowlist in `env_policy.hpp`.
 
 For the router: a worker that dies while a request runs yields
 `503 backend_unavailable` (executed; not replayable). While the worker is
@@ -154,6 +190,11 @@ worker backend, so an operator or router can tell a worker endpoint apart.
 - `sonder-infer tune` does not filter `--rpc` in its own spawned children
   (they are short-lived and already separate processes).
 - `DeviceKind::remote` capacity and placement (POOL-21) are unchanged.
+- No privilege separation for the worker (see "Why a separate process"): a
+  restricted token or AppContainer on Windows, or a separate user or sandbox
+  on POSIX, is still to do.
+- The `-hf` preset-repo path and POSIX `/etc/llama.cpp/config.ini` listed
+  under "Refusals" stay open.
 
 ## Tests
 
@@ -164,3 +205,7 @@ bounded messages, the block rules, argv order, every refusal path through the
 backend and the config file, runtime status, and a fake-launcher run in which
 the worker dies three times and is relaunched with backoff and the identical
 pinned argv until the budget is spent.
+`test_containment.cpp` plants a llama.cpp `config.ini` where the parent's
+`APPDATA` / `XDG_CONFIG_HOME` / `HOME` point and checks that the child block
+resolves to no file; `test_serve_main.cpp` covers the `--profile` refusal.
+The CMake `GGML_RPC` refusal has no automated test.
