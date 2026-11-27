@@ -162,6 +162,26 @@ struct LlamaServerAdaptiveSpeculationOptions {
     std::uint32_t baseline_probe_interval = 0;
 };
 
+// Cross-host layer split through llama.cpp's RPC client (docs/integration/
+// rpc-worker.md). The RPC client runs only inside the spawned llama-server
+// child this backend supervises, never in the Sonder process and never through
+// operator `args`: a `--rpc` flag in `args` is refused in spawn mode, and the
+// supervisor itself puts `--rpc <servers>` first on the child's argv. The child
+// is a dedicated worker: it must not be the process that serves the primary
+// model. Spawn mode only. Off by default.
+struct LlamaServerRpcWorkerOptions {
+    bool enabled = false;
+    // "IPV4:PORT" each, at most kMaxServers, no duplicates. Host names and IPv6
+    // are refused: llama.cpp splits the endpoint at the first ':' and the RPC
+    // protocol has no authentication, so the peer list is pinned to literals.
+    std::vector<std::string> servers;
+    // RPC carries the activations of every prompt in clear text with no
+    // authentication. Only loopback, RFC 1918 private, link-local and
+    // RFC 6598 shared (100.64/10) addresses are accepted unless this is set.
+    bool allow_public_addresses = false;
+    static constexpr std::size_t kMaxServers = 16;
+};
+
 struct LlamaServerBackendOptions {
     LlamaServerMode mode = LlamaServerMode::attach;
     std::string base_url = "http://127.0.0.1:8080";
@@ -234,6 +254,8 @@ struct LlamaServerBackendOptions {
     bool upstream_grammar = true;
     // Opt-in workload-aware adaptive speculation policy (native mode only).
     LlamaServerAdaptiveSpeculationOptions adaptive_speculation;
+    // Spawn mode only: makes the supervised child an isolated RPC worker.
+    LlamaServerRpcWorkerOptions rpc_worker;
 };
 
 // Slot snapshots are upstream-owned files, not portable Sonder KV blocks.

@@ -34,6 +34,17 @@ if(NOT SONDER_WITH_LLAMA_CPP)
     return()
 endif()
 
+# The in-process backend never links llama.cpp's RPC client: a broken or
+# hostile rpc-server aborts the whole client process (GGML_ABORT in
+# ggml-rpc.cpp) and every tensor it returns would be parsed inside sonder.
+# Cross-host layer split runs only in the isolated llamaserver rpc_worker child
+# (docs/integration/rpc-worker.md). Checked before anything is fetched.
+if(GGML_RPC)
+    message(FATAL_ERROR
+        "GGML_RPC=ON is refused for the in-process llamacpp backend: the RPC client must run in an "
+        "isolated worker process. Use the llamaserver backend's rpc_worker (docs/integration/rpc-worker.md).")
+endif()
+
 include(FetchContent)
 
 # Tag and hash move together; bump both (and docs/LICENSE_REVIEW.md) on upgrade.
