@@ -32,6 +32,7 @@
 #include "embed_batch_planner.hpp"
 #include "prefix_coalescer.hpp"
 #include "radix_cache.hpp"
+#include "spec_controller.hpp"
 #include "speculation_transition.hpp"
 #include "suffix_matcher.hpp"
 
@@ -265,8 +266,9 @@ llama_model_params MakeModelParams(const LoadOptions& options,
     }
 #if defined(SONDER_LLAMACPP_HAS_MTP)
     SpeculativeType spec = SpeculativeType::kNone;
-    if (ParseSpeculativeType(options.spec_type, spec) &&
-        (spec == SpeculativeType::kDraftMtp || spec == SpeculativeType::kAuto)) {
+    if ((ParseSpeculativeType(options.spec_type, spec) &&
+         (spec == SpeculativeType::kDraftMtp || spec == SpeculativeType::kAuto)) ||
+        options.spec_may_use_mtp) {
         mp.load_mtp = true;
     }
 #endif
@@ -370,28 +372,29 @@ llama_context_params MakeContextParams(const LoadOptions& options, bool swa_comp
             } else {
                 planned_draft_max = static_cast<uint32_t>(kDefaultNgramDraftMax);
             }
-#if defined(SONDER_LLAMACPP_HAS_N_RS_SEQ)
-            // Only allocate per-step GPU recurrent rollback slots (n_rs_seq) for
-            // short-horizon draft-model speculation (draft-mtp / auto). Long-horizon
-            // n-gram / suffix speculation uses zero GPU rollback slots (saving
-            // ~1.6 GiB VRAM on 27B hybrid models) and relies on on-demand
-            // PARTIAL_ONLY checkpoints.
-            uint32_t rs_need = 0;
-            if (spec == SpeculativeType::kDraftMtp) {
-                rs_need = planned_draft_max;
-            } else if (spec == SpeculativeType::kAuto) {
-                rs_need = options.spec_draft_max > 0
-                              ? std::min<uint32_t>(static_cast<uint32_t>(options.spec_draft_max), 8u)
-                              : static_cast<uint32_t>(kDefaultMtpDraftMax);
-            }
-            const uint32_t n_batch_eff =
-                options.n_ctx > 0 ? std::min(options.n_batch, options.n_ctx) : options.n_batch;
-            const uint32_t n_ubatch_eff = cp.n_ubatch == 0 ? n_batch_eff : std::min(n_batch_eff, cp.n_ubatch);
-            if (rs_need > 0 && n_ubatch_eff > rs_need + 1u) {
-                cp.n_rs_seq = rs_need;
-            }
-#endif
         }
+        if (options.spec_max_route_draft > 0) {
+            planned_draft_max = std::max(planned_draft_max, static_cast<uint32_t>(options.spec_max_route_draft));
+        }
+#if defined(SONDER_LLAMACPP_HAS_N_RS_SEQ)
+        // Only allocate per-step GPU recurrent rollback slots (n_rs_seq) for
+        // short-horizon draft-model speculation (draft-mtp / auto / route MTP).
+        // Long-horizon n-gram / suffix speculation uses zero GPU rollback slots.
+        uint32_t rs_need = 0;
+        if (planned_spec == SpeculativeType::kDraftMtp) {
+            rs_need = planned_draft_max;
+        } else if (planned_spec == SpeculativeType::kAuto || options.spec_may_use_mtp) {
+            const uint32_t cap_ref =
+                options.spec_draft_max > 0 ? static_cast<uint32_t>(options.spec_draft_max) : planned_draft_max;
+            rs_need = cap_ref > 0 ? std::min<uint32_t>(cap_ref, 8u) : static_cast<uint32_t>(kDefaultMtpDraftMax);
+        }
+        const uint32_t n_batch_eff =
+            options.n_ctx > 0 ? std::min(options.n_batch, options.n_ctx) : options.n_batch;
+        const uint32_t n_ubatch_eff = cp.n_ubatch == 0 ? n_batch_eff : std::min(n_batch_eff, cp.n_ubatch);
+        if (rs_need > 0 && n_ubatch_eff > rs_need + 1u) {
+            cp.n_rs_seq = rs_need;
+        }
+#endif
     }
     (void)planned_spec;
 #endif
@@ -400,10 +403,14 @@ llama_context_params MakeContextParams(const LoadOptions& options, bool swa_comp
         // Hybrid draft-mtp + suffix escalation can burst up to 16 draft tokens
         // in one verification pass even when MTP's own k=3.
         uint32_t max_burst = planned_draft_max;
-        if (planned_spec == SpeculativeType::kDraftMtp || planned_spec == SpeculativeType::kAuto) {
+        if (planned_spec == SpeculativeType::kDraftMtp || planned_spec == SpeculativeType::kAuto ||
+            options.spec_may_use_mtp) {
             max_burst = std::max<uint32_t>(max_burst, static_cast<uint32_t>(SuffixMatcher::kHybridMtpMaxBurstDraft));
         }
-        const uint32_t per_seq = std::min<uint32_t>(cp.n_batch, std::max<uint32_t>(1u, max_burst + 1u));
+        const SpecSlotAdvice slot_advice =
+            AdviseSpecSlots(cp.n_seq_max, static_cast<std::int32_t>(max_burst), cp.n_batch, /*max_spec_slots=*/0);
+        const uint32_t per_seq =
+            std::min<uint32_t>(cp.n_batch, std::max<uint32_t>(1u, static_cast<uint32_t>(slot_advice.n_max) + 1u));
         cp.n_outputs_max_per_seq = per_seq;
         cp.n_outputs_max = std::min<uint32_t>(cp.n_batch, cp.n_seq_max * per_seq);
     }
@@ -666,7 +673,7 @@ struct LlamaCppBackend::Impl {
     std::string load_spec_fallback_reason;
     std::string load_draft_identity;
     bool mtp_model_supported = false;
-    NgramMatcher ngram_matcher{false};
+    NgramMatcher ngram_matcher{true};
     std::unique_ptr<NgramModTable> ngram_mod;
     std::unique_ptr<SuffixMatcher> suffix_matcher;
     std::vector<Token> draft_scratch;
@@ -2507,13 +2514,21 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
         impl_->load_draft_identity.clear();
         impl_->mtp_model_supported = false;
 
-        if (requested_spec == SpeculativeType::kDraftMtp || requested_spec == SpeculativeType::kAuto) {
+        const bool want_mtp_probe =
+            (requested_spec == SpeculativeType::kDraftMtp || requested_spec == SpeculativeType::kAuto ||
+             options.spec_may_use_mtp);
+        if (want_mtp_probe) {
 #if defined(SONDER_LLAMACPP_HAS_MTP)
             const int32_t n_nextn = llama_model_n_layer_nextn(model);
             if (n_nextn > 0) {
                 impl_->mtp_model_supported = true;
                 if (impl_->InitMtp(options, n_nextn)) {
-                    impl_->active_spec = SpeculativeType::kDraftMtp;
+                    if (requested_spec == SpeculativeType::kDraftMtp || requested_spec == SpeculativeType::kAuto) {
+                        impl_->active_spec = SpeculativeType::kDraftMtp;
+                    }
+                    if (impl_->suffix_matcher == nullptr) {
+                        impl_->suffix_matcher = std::make_unique<SuffixMatcher>();
+                    }
                 } else if (requested_spec == SpeculativeType::kDraftMtp) {
                     impl_->Release();
                     return Status::Error(ErrorCode::kLoadFailed, "llama.cpp failed to create MTP draft context");
@@ -2525,6 +2540,8 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
                 impl_->load_spec_fallback_reason = "auto_fallback_ngram_mod";
             } else if (impl_->active_spec == SpeculativeType::kNone && requested_spec == SpeculativeType::kDraftMtp) {
                 impl_->load_spec_fallback_reason = "not_supported";
+            } else if (requested_spec != SpeculativeType::kDraftMtp && requested_spec != SpeculativeType::kAuto) {
+                impl_->active_spec = requested_spec;
             }
         } else {
             impl_->active_spec = requested_spec;
@@ -2661,6 +2678,15 @@ SpeculativeLoadInfo LlamaCppBackend::GetSpeculativeInfo() const {
     info.draft_identity = impl_->load_draft_identity;
     info.mtp_model_supported = impl_->mtp_model_supported;
     info.l2_cache_enabled = impl_->radix_cache.enabled();
+#if defined(SONDER_LLAMACPP_HAS_N_RS_SEQ)
+    if (impl_->ctx != nullptr && impl_->architecture == sonder::inference::ModelArchitecture::hybrid) {
+        info.hybrid_rs_cap = static_cast<std::int32_t>(llama_n_rs_seq(impl_->ctx));
+    }
+#endif
+#if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
+    info.can_hybrid_spec_ckpt =
+        (impl_->architecture == sonder::inference::ModelArchitecture::hybrid) && (Impl::PartialCheckpointFlags() != 0);
+#endif
     return info;
 }
 
@@ -3858,20 +3884,38 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         return fail(ErrorCode::kContextOverflow, "prompt does not fit in the context window");
     }
 
+    const SpeculativeType req_spec = request.spec_override.value_or(active_spec);
+    const int32_t req_draft_max = request.spec_draft_max_override.has_value()
+                                      ? std::max<int32_t>(0, *request.spec_draft_max_override)
+                                      : active_draft_max;
+    if (req_spec == SpeculativeType::kSuffix && suffix_matcher == nullptr) {
+        suffix_matcher = std::make_unique<SuffixMatcher>();
+    } else if (req_spec == SpeculativeType::kNgramMod && req_draft_max > 0) {
+        const std::size_t min_draft =
+            std::min<std::size_t>(NgramModTable::kDefaultMinDraft, static_cast<std::size_t>(req_draft_max));
+        if (ngram_mod == nullptr) {
+            ngram_mod = std::make_unique<NgramModTable>(NgramModTable::kDefaultMatchLen,
+                                                        NgramModTable::kDefaultTableSize, min_draft,
+                                                        static_cast<std::size_t>(req_draft_max));
+        } else if (ngram_mod->n_min() != min_draft || ngram_mod->n_max() != static_cast<std::size_t>(req_draft_max)) {
+            ngram_mod->Configure(min_draft, static_cast<std::size_t>(req_draft_max));
+        }
+    }
+
 #if defined(SONDER_LLAMACPP_HAS_MTP)
-    bool use_mtp = (active_spec == SpeculativeType::kDraftMtp) && (ctx_dft != nullptr) && !result.state_restored &&
+    bool use_mtp = (req_spec == SpeculativeType::kDraftMtp) && (ctx_dft != nullptr) && !result.state_restored &&
                    !has_media && (!restored_from_l2 || l2_mtp_synced);
 #else
     bool use_mtp = false;
     (void)l2_mtp_synced;
 #endif
     bool use_hybrid_suffix = use_mtp && (suffix_matcher != nullptr);
-    bool use_suffix = !use_mtp && (active_spec == SpeculativeType::kSuffix) && (suffix_matcher != nullptr) &&
-                      active_draft_max > 0 && !has_media;
-    bool use_ngram_mod = !use_mtp && !use_suffix && (active_spec == SpeculativeType::kNgramMod) &&
-                         (ngram_mod != nullptr) && active_draft_max > 0 && !has_media;
+    bool use_suffix = !use_mtp && (req_spec == SpeculativeType::kSuffix) && (suffix_matcher != nullptr) &&
+                      req_draft_max > 0 && !has_media;
+    bool use_ngram_mod = !use_mtp && !use_suffix && (req_spec == SpeculativeType::kNgramMod) &&
+                         (ngram_mod != nullptr) && req_draft_max > 0 && !has_media;
     bool use_ngram_short =
-        !use_mtp && !use_suffix && (active_spec == SpeculativeType::kNgram) && active_draft_max > 0 && !has_media;
+        !use_mtp && !use_suffix && (req_spec == SpeculativeType::kNgram) && req_draft_max > 0 && !has_media;
     bool use_ngram = use_ngram_mod || use_ngram_short;
     if (architecture == sonder::inference::ModelArchitecture::recurrent) {
         use_mtp = false;
@@ -3893,7 +3937,12 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
 #else
     const bool can_hybrid_spec_ckpt = false;
 #endif
-    int32_t effective_draft_max = active_draft_max;
+    int32_t effective_draft_max = req_draft_max;
+#if defined(SONDER_LLAMACPP_HAS_MTP)
+    if (use_mtp && mtp_chain_heads && mtp_n_layers > 0) {
+        effective_draft_max = std::min(effective_draft_max, mtp_n_layers);
+    }
+#endif
     if (architecture == sonder::inference::ModelArchitecture::hybrid) {
         if (use_mtp) {
             if (rs_cap == 0) {
@@ -3915,8 +3964,10 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
     }
 
     // Record configured vs effective speculation strategy and disable/fallback reason.
-    result.configured_spec_method = std::string(ToString(requested_spec));
-    result.configured_draft_limit = options.spec_draft_max > 0 ? options.spec_draft_max : active_draft_max;
+    result.configured_spec_method = std::string(ToString(request.spec_override.value_or(requested_spec)));
+    result.configured_draft_limit = request.spec_draft_max_override.has_value()
+                                        ? req_draft_max
+                                        : (options.spec_draft_max > 0 ? options.spec_draft_max : active_draft_max);
     if (use_mtp) {
         result.effective_spec_method = use_hybrid_suffix ? "draft-mtp+suffix" : "draft-mtp";
         result.effective_draft_limit = effective_draft_max;
@@ -3940,7 +3991,9 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
     } else {
         result.effective_spec_method = "none";
         result.effective_draft_limit = 0;
-        if (active_spec != SpeculativeType::kNone) {
+        if (!request.spec_fallback_reason_override.empty()) {
+            result.spec_fallback_reason = request.spec_fallback_reason_override;
+        } else if (req_spec != SpeculativeType::kNone) {
             if (has_media) {
                 result.spec_fallback_reason = "media_exclusive";
             } else if (architecture == sonder::inference::ModelArchitecture::recurrent) {
@@ -5505,42 +5558,66 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         slots[s->slot_idx].last_used = ++slot_clock;
         s->committed_tokens.assign(slots[s->slot_idx].tokens.begin(), slots[s->slot_idx].tokens.end());
 
-        SlotSpecCapability cap;
-        cap.architecture = architecture;
-        cap.hybrid_rs_cap = static_cast<std::int32_t>(rs_cap);
-        cap.can_hybrid_spec_ckpt = can_hybrid_spec_ckpt;
-        cap.fallback_suffix_draft_max =
-            options.spec_draft_max > 0 ? options.spec_draft_max : kDefaultSuffixDraftMax;
+        const SpeculativeType req_spec = req.spec_override.value_or(active_spec);
+        const int32_t req_draft_max = req.spec_draft_max_override.has_value()
+                                          ? std::max<int32_t>(0, *req.spec_draft_max_override)
+                                          : active_draft_max;
+        if (req_spec == SpeculativeType::kSuffix && suffix_matcher == nullptr) {
+            suffix_matcher = std::make_unique<SuffixMatcher>();
+        } else if (req_spec == SpeculativeType::kNgramMod && req_draft_max > 0) {
+            const std::size_t min_draft =
+                std::min<std::size_t>(NgramModTable::kDefaultMinDraft, static_cast<std::size_t>(req_draft_max));
+            if (ngram_mod == nullptr) {
+                ngram_mod = std::make_unique<NgramModTable>(NgramModTable::kDefaultMatchLen,
+                                                            NgramModTable::kDefaultTableSize, min_draft,
+                                                            static_cast<std::size_t>(req_draft_max));
+            } else if (ngram_mod->n_min() != min_draft ||
+                       ngram_mod->n_max() != static_cast<std::size_t>(req_draft_max)) {
+                ngram_mod->Configure(min_draft, static_cast<std::size_t>(req_draft_max));
+            }
+        }
+
+        SpecModelCaps slot_caps;
+        slot_caps.architecture = architecture;
+        slot_caps.hybrid_rs_cap = static_cast<std::int32_t>(rs_cap);
+        slot_caps.can_hybrid_spec_ckpt = can_hybrid_spec_ckpt;
+        SpecDecision slot_dec;
+        slot_dec.n_max = req_draft_max;
 #if defined(SONDER_LLAMACPP_HAS_MTP)
-        const bool mtp_ok = (active_spec == SpeculativeType::kDraftMtp) && (ctx_dft != nullptr) &&
+        const bool mtp_ok = (req_spec == SpeculativeType::kDraftMtp) && (ctx_dft != nullptr) &&
                             (!restored_from_l2 || l2_mtp_synced) &&
                             (s->slot_idx < slot_mtp_synced.size() && slot_mtp_synced[s->slot_idx]);
-        if (mtp_ok && active_draft_max > 0) {
-            cap.configured_mode = SlotSpecMode::kDraftMtp;
-            cap.configured_draft_max = active_draft_max;
-            cap.hybrid_suffix_configured = (suffix_matcher != nullptr);
-            cap.suffix_fallback_available = (suffix_matcher != nullptr);
+        slot_caps.mtp_available = mtp_ok;
+        if (mtp_ok && req_draft_max > 0) {
+            slot_dec.mode = SpecStrategy::kDraftMtp;
+            if (mtp_chain_heads && mtp_n_layers > 0) {
+                slot_dec.n_max = std::min(slot_dec.n_max, mtp_n_layers);
+            }
         }
 #else
         (void)l2_mtp_synced;
 #endif
-        if (cap.configured_mode == SlotSpecMode::kNone && active_draft_max > 0) {
-            if (active_spec == SpeculativeType::kSuffix && suffix_matcher != nullptr) {
-                cap.configured_mode = SlotSpecMode::kSuffix;
-                cap.configured_draft_max = active_draft_max;
-            } else if (active_spec == SpeculativeType::kNgramMod && ngram_mod != nullptr) {
-                cap.configured_mode = SlotSpecMode::kNgramMod;
-                cap.configured_draft_max = active_draft_max;
-            } else if (active_spec == SpeculativeType::kNgram) {
-                cap.configured_mode = SlotSpecMode::kNgramShort;
-                cap.configured_draft_max = active_draft_max;
+        if (slot_dec.mode == SpecStrategy::kNone && req_draft_max > 0) {
+            if (req_spec == SpeculativeType::kSuffix && suffix_matcher != nullptr) {
+                slot_dec.mode = SpecStrategy::kSuffix;
+            } else if (req_spec == SpeculativeType::kNgramMod && ngram_mod != nullptr) {
+                slot_dec.mode = SpecStrategy::kNgramMod;
+            } else if (req_spec == SpeculativeType::kNgram) {
+                slot_dec.mode = SpecStrategy::kNgram;
             }
+        }
+        SlotSpecCapability cap =
+            BuildSlotSpecCapability(slot_dec, slot_caps, suffix_matcher != nullptr, suffix_matcher.get());
+        if (options.spec_draft_max > 0) {
+            cap.fallback_suffix_draft_max = options.spec_draft_max;
         }
         s->spec_transition.Configure(cap);
         sync_slot_flags_from_transition(*s);
         s->adaptive_ctrl.Reset(s->effective_draft_max);
-        s->result.configured_spec_method = std::string(ToString(requested_spec));
-        s->result.configured_draft_limit = options.spec_draft_max > 0 ? options.spec_draft_max : active_draft_max;
+        s->result.configured_spec_method = std::string(ToString(req.spec_override.value_or(requested_spec)));
+        s->result.configured_draft_limit = req.spec_draft_max_override.has_value()
+                                               ? req_draft_max
+                                               : (options.spec_draft_max > 0 ? options.spec_draft_max : active_draft_max);
         if (s->mtp_enabled) {
             s->result.effective_spec_method = s->hybrid_suffix_enabled ? "draft-mtp+suffix" : "draft-mtp";
             s->result.effective_draft_limit = s->effective_draft_max;
@@ -5564,7 +5641,9 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         } else {
             s->result.effective_spec_method = "none";
             s->result.effective_draft_limit = 0;
-            if (active_spec != SpeculativeType::kNone) {
+            if (!req.spec_fallback_reason_override.empty()) {
+                s->result.spec_fallback_reason = req.spec_fallback_reason_override;
+            } else if (req_spec != SpeculativeType::kNone) {
                 if (architecture == sonder::inference::ModelArchitecture::recurrent) {
                     s->result.spec_fallback_reason = "recurrent_unsupported";
                 } else if (architecture == sonder::inference::ModelArchitecture::hybrid) {
@@ -6440,12 +6519,17 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         }
 
         bool ran_concurrent_spec = false;
+        const bool any_decode_spec =
+            active_spec != SpeculativeType::kNone ||
+            std::any_of(active.begin(), active.end(), [](const auto& sp) {
+                return !sp->IsCancelled() && sp->phase == BatchSlotPhase::kDecode &&
+                       sp->spec_transition.capability().configured_mode != SlotSpecMode::kNone;
+            });
         if (concurrent_spec_policy.enabled && !concurrent_cost_gate.IsRegressed() && prefill_count == 0u &&
             prefix_coalescer.HeldFollowerCount() == 0u &&
             decoding_count >= 2u && decoding_count <= static_cast<std::size_t>(concurrent_spec_policy.max_concurrent_slots) &&
             architecture != sonder::inference::ModelArchitecture::recurrent &&
-            !(architecture == sonder::inference::ModelArchitecture::hybrid && rs_cap == 0u) &&
-            active_spec != SpeculativeType::kNone) {
+            !(architecture == sonder::inference::ModelArchitecture::hybrid && rs_cap == 0u) && any_decode_spec) {
             const BoundedSuffixAutomaton* shared_ring =
                 (suffix_matcher != nullptr) ? &suffix_matcher->session_ring() : nullptr;
 

@@ -34,6 +34,7 @@
 #include "sonder/inference/backends/llamacpp.hpp"
 #include "sonder/inference/json.hpp"
 #include "llamacpp_internal.hpp"
+#include "spec_controller.hpp"
 
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
 #  include "backends/llamaserver/gpu_memory.hpp"
@@ -795,7 +796,17 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     if (lc::Status s = lc::ValidatePlacementOptions(lo); !s.ok()) {
         return ToStatus(s);
     }
-    return ToStatus(lc::ValidateContextOptions(lo));
+    if (lc::Status s = lc::ValidateContextOptions(lo); !s.ok()) {
+        return ToStatus(s);
+    }
+    lc::SpecControllerConfig spec_cfg;
+    std::string spec_err;
+    if (!lc::BuildSpecControllerConfig(o, spec_cfg, spec_err)) {
+        return Status(ErrorCode::invalid_argument, std::move(spec_err));
+    }
+    lo.spec_may_use_mtp = spec_cfg.MayUseMtp();
+    lo.spec_max_route_draft = spec_cfg.MaxPlannedDraft();
+    return Status::success();
 }
 
 bool IsGguf(const fs::path& p) {
@@ -808,13 +819,25 @@ bool IsGguf(const fs::path& p) {
 class LlamaCppModel final : public BackendModel {
 public:
     LlamaCppModel(ModelDescriptor desc, lc::LlamaCppBackend runtime, double load_ms, std::uint32_t slots,
-                  std::shared_ptr<RuntimeState> runtime_state = nullptr, std::uint64_t runtime_model_id = 0)
+                  std::shared_ptr<RuntimeState> runtime_state = nullptr, std::uint64_t runtime_model_id = 0,
+                  std::shared_ptr<lc::SpecController> spec_controller = nullptr,
+                  lc::SpecModelCaps spec_caps = {}, std::uint32_t batch_size = 0)
         : desc_(std::move(desc)),
           runtime_(std::move(runtime)),
           load_ns_(MsToNs(load_ms)),
           slots_(std::max<std::uint32_t>(1u, slots)),
+          batch_size_(batch_size),
           runtime_state_(std::move(runtime_state)),
-          runtime_model_id_(runtime_model_id) {
+          runtime_model_id_(runtime_model_id),
+          spec_controller_(std::move(spec_controller)),
+          spec_caps_(spec_caps) {
+        if (spec_controller_) {
+            const auto& sc = spec_controller_->config();
+            const bool has_class_rule =
+                std::any_of(sc.class_rules.begin(), sc.class_rules.end(), [](const auto& r) { return r.has_value(); });
+            spec_controller_active_ = sc.auto_base || sc.base.mode != lc::SpecStrategy::kNone || sc.deterministic ||
+                                      has_class_rule || !sc.routes.empty();
+        }
         // The chat template is fixed once the model is loaded, so decide here
         // rather than under mutex_, which is held for a whole generation.
         std::string ignored;
@@ -1035,7 +1058,8 @@ public:
                           request.grammar, /*separate_reasoning=*/false, request.checkpoint, {}, {}, {},
                           request.priority_class, request.target_ttft_ms, request.target_itl_ms,
                           request.enable_stage_profiling, request.on_safe_point, request.suspended_state,
-                          request.execution_resume, request.priority_rank, request.allow_preempt_spill);
+                          request.execution_resume, request.priority_rank, request.allow_preempt_spill,
+                          /*start_in_thinking=*/false, lc::ClassifyGenerateRequest(request));
     }
 
     // Chat through the GGUF chat template (llama_chat_apply_template). Models
@@ -1095,7 +1119,8 @@ public:
                           std::move(plan.media_blobs), {}, std::move(plan.media_prompt_parts),
                           request.priority_class, request.target_ttft_ms, request.target_itl_ms,
                           request.enable_stage_profiling, {}, nullptr, nullptr, 0, false,
-                          request.separate_reasoning && llamacpp_detail::PromptEndsInsideThink(plan.segments));
+                          request.separate_reasoning && llamacpp_detail::PromptEndsInsideThink(plan.segments),
+                          lc::ClassifyChatRequest(request));
     }
 
     [[nodiscard]] bool has_native_chat() const override { return native_chat_; }
@@ -1172,12 +1197,36 @@ private:
                                      SuspendedExecutionState* suspended_state = nullptr,
                                      const ExecutionResumeState* execution_resume = nullptr,
                                      int priority_rank = 0, bool allow_preempt_spill = false,
-                                     bool start_in_thinking = false) {
+                                     bool start_in_thinking = false,
+                                     lc::SpecTaskClass spec_task = lc::SpecTaskClass::kChat) {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
 
         lc::GenerateRequest req;
         req.prompt = std::move(prompt_tokens);
         if (req.prompt.empty()) return Status(ErrorCode::invalid_argument, "prompt produced no tokens");
+        lc::SpecDecision spec_decision;
+        if (spec_controller_ && spec_controller_active_) {
+            lc::SpecRequestContext sctx;
+            sctx.route = desc_.name;
+            sctx.task = spec_task;
+            sctx.caps = spec_caps_;
+            sctx.n_slots = slots_;
+            sctx.n_batch = batch_size_;
+            spec_decision = spec_controller_->Decide(sctx);
+            if (const auto st = lc::ToSpeculativeType(spec_decision.mode); st.has_value()) {
+                req.spec_override = *st;
+                req.spec_draft_max_override = spec_decision.n_max;
+                req.spec_p_min = spec_decision.p_min;
+                if (spec_decision.mode == lc::SpecStrategy::kNone &&
+                    spec_decision.reason != lc::SpecDecisionReason::kConfiguredNone) {
+                    req.spec_fallback_reason_override = std::string(lc::ToString(spec_decision.reason));
+                }
+            } else {
+                req.spec_override = lc::SpeculativeType::kNone;
+                req.spec_draft_max_override = 0;
+                req.spec_fallback_reason_override = "draft_model_unsupported";
+            }
+        }
         req.max_new_tokens = sampling.max_tokens;
         req.sampling = ToLlamaSampling(sampling);
         req.sampling.grammar = std::string(grammar);
@@ -1324,6 +1373,16 @@ private:
             }
         }
 
+        if (spec_controller_ && spec_controller_active_ && spec_decision.mode != lc::SpecStrategy::kNone) {
+            if (r.draft_tokens > 0) {
+                spec_controller_->Observe(desc_.name, spec_task, spec_decision.mode,
+                                          static_cast<std::uint32_t>(r.draft_tokens),
+                                          static_cast<std::uint32_t>(std::max<std::int32_t>(0, r.draft_accepted_tokens)));
+            } else if (spec_decision.is_probe && (!r.status.ok() || r.stop_reason == lc::StopReason::kCancelled)) {
+                spec_controller_->CancelProbe(desc_.name, spec_task, spec_decision.mode, spec_decision.probe_id);
+            }
+        }
+
         llamacpp_detail::PopulateGenerateStats(r, req.restore_tokens, load_ns_, stats);
         if (stats.effective_execution) {
             stats.effective_execution->target_identity = desc_.name;
@@ -1388,8 +1447,12 @@ private:
     lc::LlamaCppBackend runtime_;
     std::uint64_t load_ns_ = 0;
     std::uint32_t slots_ = 1;
+    std::uint32_t batch_size_ = 0;
     std::shared_ptr<RuntimeState> runtime_state_;
     std::uint64_t runtime_model_id_ = 0;
+    std::shared_ptr<lc::SpecController> spec_controller_;
+    lc::SpecModelCaps spec_caps_;
+    bool spec_controller_active_ = false;
     bool native_chat_ = false;  // set in the constructor, read-only afterwards
     mutable std::shared_mutex mutex_;
 };
@@ -1405,6 +1468,10 @@ public:
           runtime_state_(std::make_shared<RuntimeState>(
               probe ? std::move(probe) : MakeDefaultGpuMemoryProbe(options_.devices), sample_interval, options_,
               force_uma_mode, force_gpu_offload)) {
+        lc::SpecControllerConfig spec_cfg;
+        std::string spec_err;
+        (void)lc::BuildSpecControllerConfig(options_, spec_cfg, spec_err);
+        spec_controller_ = std::make_shared<lc::SpecController>(std::move(spec_cfg));
         // llama.cpp's log callback runs on inference threads: send its lines
         // through the non-blocking diagnostic queue, never to stderr directly.
         lc::SetLogSink(&ForwardLogToDiagnosticQueue);
@@ -1550,8 +1617,14 @@ public:
         const std::uint64_t model_id =
             runtime_state_->RegisterModel(info.n_ctx, lo.n_gpu_layers != 0, uma_target, d.name, spec_info);
         runtime_state_->RefreshGpuMemory(/*force=*/true);
+        lc::SpecModelCaps spec_caps;
+        spec_caps.mtp_available = spec_info.mtp_build_supported && spec_info.mtp_model_supported;
+        spec_caps.architecture = d.architecture;
+        spec_caps.hybrid_rs_cap = spec_info.hybrid_rs_cap;
+        spec_caps.can_hybrid_spec_ckpt = spec_info.can_hybrid_spec_ckpt;
         return std::shared_ptr<BackendModel>(std::make_shared<LlamaCppModel>(
-            std::move(d), std::move(runtime), load_ms, loaded_slots, runtime_state_, model_id));
+            std::move(d), std::move(runtime), load_ms, loaded_slots, runtime_state_, model_id, spec_controller_,
+            spec_caps, lo.n_batch));
     }
 
 private:
@@ -1567,6 +1640,7 @@ private:
 
     LlamaCppBackendOptions options_;
     std::shared_ptr<RuntimeState> runtime_state_;
+    std::shared_ptr<lc::SpecController> spec_controller_;
 };
 
 }  // namespace

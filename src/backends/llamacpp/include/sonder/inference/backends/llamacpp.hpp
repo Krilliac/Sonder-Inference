@@ -78,6 +78,12 @@ struct LlamaCppBackendOptions {
     std::string spec_type = "none";
     // Max draft tokens per speculative step (0 = automatic default for spec_type).
     std::int32_t spec_draft_max = 0;
+    // Minimum draft-token probability for model-based speculation ([0, 1], default 0.0).
+    double spec_p_min = 0.0;
+    // Per-route / per-task-class speculation rules (<selector>=<policy>), parsed by ParseSpecRule().
+    std::vector<std::string> spec_route_rules;
+    // Determinism mode: disables model-based drafting (draft-model / draft-mtp).
+    bool deterministic = false;
     // Speculative decoding verification policy: TargetMatch (default reference
     // path) vs opt-in StochasticRejection (Leviathan et al. sum min(p, q) +
     // residual (p - q)_+ resampling). StochasticRejection activates only when
