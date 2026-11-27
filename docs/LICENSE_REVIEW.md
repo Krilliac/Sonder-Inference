@@ -98,6 +98,17 @@ No license conclusions from the initial broad web sweep are considered authorita
   closed (update hash after verifying the tag commit)
 - approved: yes, approved by Nate on 2026-09-26 (MIT, compatible with the project's Apache-2.0
   license; notice kept in `NOTICE`)
+- vendored tree and SI patches (planned, RET-09 in [ROADMAP_SI_ONLY.md](ROADMAP_SI_ONLY.md)):
+  when Sonder Inference transitions from FetchContent tarballs to a single
+  vendored, pinned `ggml`/`llama.cpp` source tree with SI's own patch series on
+  top, that vendored tree plus SI's patches to it remain under the **MIT**
+  license (preserving the upstream MIT copyright and permission notice in
+  `NOTICE` and binary distributions), which stays compatible with Sonder
+  Inference's Apache-2.0 project license. This file does not currently carry a
+  verified license record for the PrismML fork (`PrismML-Eng/llama.cpp`); if
+  stock `Q2_0` does not reach parity and any `PQ2_0` kernel code is ported from
+  PrismML rather than written independently, its exact repository, revision,
+  and license must be verified and recorded here before adoption.
 
 ### cpp-httplib
 - repository: https://github.com/yhirose/cpp-httplib
@@ -127,7 +138,10 @@ No license conclusions from the initial broad web sweep are considered authorita
 - revision/tag: whatever server the user runs locally
 - evaluated: 2026-09-26
 - license: MIT (upstream); not relevant to linking because no code is used
-- intended use: compatibility backend over its HTTP API
+- intended use: compatibility backend over its HTTP API (local Ollama backend
+  is deprecated and scheduled for removal in RET-07; the planned opt-in Ollama
+  Cloud provider in RET-02 remains strictly a network/HTTP boundary with no
+  Ollama code copied or linked)
 - linkage/process boundary: separate process over loopback HTTP; no Ollama code is copied or linked
 - notices required: none
 - security/maintenance notes: loopback-only by default; API behaviour is taken from the public REST API docs
