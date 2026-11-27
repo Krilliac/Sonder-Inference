@@ -34,6 +34,7 @@
 #include "sonder/inference/backends/llamacpp.hpp"
 #include "sonder/inference/json.hpp"
 #include "llamacpp_internal.hpp"
+#include "request_guards.hpp"
 #include "spec_controller.hpp"
 
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
@@ -1205,6 +1206,7 @@ private:
         lc::GenerateRequest req;
         req.prompt = std::move(prompt_tokens);
         if (req.prompt.empty()) return Status(ErrorCode::invalid_argument, "prompt produced no tokens");
+        if (lc::Status s = lc::ValidateStopSequences(sampling.stop); !s.ok()) return ToStatus(s);
         lc::SpecDecision spec_decision;
         if (spec_controller_ && spec_controller_active_) {
             lc::SpecRequestContext sctx;
