@@ -138,6 +138,11 @@ class Supervisor {
     void observe(Process &child);
     void begin_child();
     Status wait_ready(Process &child, std::uint16_t port);
+    bool health_ok(std::uint16_t port, std::chrono::milliseconds budget);
+    // Monitor thread. True when a device fault was logged and a second signal
+    // (child gone, or /health failing) agrees.
+    bool device_fault_confirmed(Process &child, std::uint16_t port);
+    void note_unconfirmed_fault();
     Result<std::uint16_t> settle_after_deadline(std::unique_lock<std::mutex> &lock,
                                                 const CancellationToken &cancel,
                                                 std::chrono::steady_clock::time_point deadline);

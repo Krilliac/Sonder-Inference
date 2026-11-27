@@ -456,6 +456,31 @@ std::string bounded(std::string_view text, std::size_t cap) {
 
 bool has(std::string_view text, std::string_view needle) { return text.find(needle) != std::string_view::npos; }
 
+// Strips an optional common_log prefix (`0.01.234.567 E `, or a bare level
+// letter) so fault matchers can anchor to the start of the ggml-emitted text.
+// A request body, response body or prompt-token debug line from llama-server
+// starts with its own tag, so text an API caller controls never reaches the
+// anchored matchers.
+std::string_view strip_log_prefix(std::string_view text) {
+    std::size_t i = 0;
+    while (i < text.size() && ((text[i] >= '0' && text[i] <= '9') || text[i] == '.'))
+        ++i;
+    if (i > 0) {
+        if (i >= text.size() || text[i] != ' ')
+            return text;
+        while (i < text.size() && text[i] == ' ')
+            ++i;
+        text.remove_prefix(i);
+    }
+    if (text.size() >= 2 && text[1] == ' ' && (text[0] == 'D' || text[0] == 'I' || text[0] == 'W' || text[0] == 'E'))
+        text.remove_prefix(2);
+    return text;
+}
+
+bool starts_with(std::string_view text, std::string_view prefix) { return text.substr(0, prefix.size()) == prefix; }
+
+constexpr std::string_view kVkLost = "ggml_vulkan: device lost on ";
+
 } // namespace
 
 // Fatal accelerator faults. Runs before the warning matchers and never
@@ -470,27 +495,40 @@ void LogDiagnostics::note_fault(std::string_view text) {
 
     std::string backend, reason, device, description;
     static constexpr std::string_view kVkFault = "ggml_vulkan: device fault on ";
-    if (const auto at = text.find(kVkFault); at != std::string_view::npos) {
+    static constexpr std::string_view kVkHpp = "ggml_vulkan: ";
+    const auto anchored = strip_log_prefix(text);
+    if (starts_with(anchored, kVkFault)) {
         backend = "vulkan";
         reason = "device_fault";
-        const auto rest = text.substr(at + kVkFault.size());
+        const auto rest = anchored.substr(kVkFault.size());
         const auto colon = rest.find(": ");
         device = bounded(rest.substr(0, colon), kMaxFaultText);
         if (colon != std::string_view::npos)
             description = bounded(rest.substr(colon + 2), kMaxFaultText);
-    } else if (has(text, "VK_ERROR_DEVICE_LOST")) {
+    } else if (starts_with(anchored, kVkLost)) {
+        // ggml_vk_print_device_lost_info: "device lost on <name>" or
+        // "device lost on <name>, likely caused by ...".
         backend = "vulkan";
         reason = "device_lost";
-    } else if (has(text, "CUDA error") || has(text, "HIP error") || has(text, "ROCm error")) {
+        const auto rest = anchored.substr(kVkLost.size());
+        device = bounded(rest.substr(0, rest.find(',')), kMaxFaultText);
+    } else if (starts_with(anchored, kVkHpp) && has(anchored, "ErrorDeviceLost")) {
+        // vulkan-hpp what() text when a catch site forwards it.
+        backend = "vulkan";
+        reason = "device_lost";
+    } else if (starts_with(anchored, "CUDA error: ") || starts_with(anchored, "HIP error: ") ||
+               starts_with(anchored, "ROCm error: ")) {
+        // cudaErrorInvalidKernelImage ("device kernel image is invalid") is a
+        // wrong-arch build, not a device fault, so it is not listed.
         static constexpr std::string_view kFatal[] = {
             "unspecified launch failure", "illegal memory access", "device-side assert",
             "launch timed out",           "illegal instruction",    "uncorrectable ECC",
-            "misaligned address",         "hardware stack error",   "device kernel image is invalid"};
+            "misaligned address",         "hardware stack error"};
         for (const auto phrase : kFatal) {
-            if (has(text, phrase)) {
-                backend = has(text, "HIP error") || has(text, "ROCm error") ? "rocm" : "cuda";
+            if (has(anchored, phrase)) {
+                backend = starts_with(anchored, "CUDA error: ") ? "cuda" : "rocm";
                 reason = "fatal_error";
-                description = bounded(text, kMaxFaultText);
+                description = bounded(anchored, kMaxFaultText);
                 break;
             }
         }
@@ -505,7 +543,7 @@ void LogDiagnostics::note_fault(std::string_view text) {
         if (fault_->description.empty())
             fault_->description = description;
     }
-    // VK_ERROR_DEVICE_LOST keeps its existing vulkan_runtime_error warning.
+    // Device loss keeps its existing vulkan_runtime_error warning.
     if (reason == "device_lost")
         return;
     if (auto *existing = find("device_fault", backend)) {
@@ -700,11 +738,11 @@ void LogDiagnostics::line(std::string_view text) {
         return;
     }
 
-    if (text.find("VK_ERROR_DEVICE_LOST") != std::string_view::npos) {
+    if (text.find("VK_ERROR_DEVICE_LOST") != std::string_view::npos || starts_with(strip_log_prefix(text), kVkLost)) {
         bump("vulkan_runtime_error", "device_lost", [&] {
             return BackendWarning{
                 "vulkan_runtime_error", "warning", "log",
-                "Vulkan device lost (VK_ERROR_DEVICE_LOST); GPU driver reset or compute timeout occurred",
+                "Vulkan device lost; GPU driver reset or compute timeout occurred",
                 {{"backend", "vulkan"}, {"reason", "device_lost"}}, 1};
         });
         return;

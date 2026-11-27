@@ -64,7 +64,7 @@ std::vector<BackendWarning> check_kv_cache_pairing(const std::vector<std::string
 //   no_gpu_device                "no usable GPU found"
 //   gpu_init_failed              "failed to initialize CUDA", "failed to initialize HIP", "failed to initialize ROCm"
 //   rocm_runtime_error           "HSA_STATUS_ERROR", "hipError"
-//   vulkan_runtime_error         "failed to initialize Vulkan", "VK_ERROR_DEVICE_LOST"
+//   vulkan_runtime_error         "failed to initialize Vulkan", "VK_ERROR_DEVICE_LOST" (warning only), "ggml_vulkan: device lost on"
 //   device_fault                 "ggml_vulkan: device fault on <name>: <description>" (VK_EXT_device_fault, llama.cpp
 //                                #32008) and fatal CUDA/HIP errors ("CUDA error: unspecified launch failure",
 //                                "an illegal memory access was encountered", "device-side assert triggered", ...)

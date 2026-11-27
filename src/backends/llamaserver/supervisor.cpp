@@ -222,6 +222,39 @@ bool Supervisor::pause(Milliseconds duration) {
     return wake_.wait_for(lock, duration, [&] { return shutdown_.cancelled(); });
 }
 
+bool Supervisor::health_ok(std::uint16_t port, Milliseconds budget) {
+    if (options_.health_check)
+        return options_.health_check(port, budget);
+    net::HttpRequest request;
+    request.host = "127.0.0.1";
+    request.port = port;
+    request.target = "/health";
+    request.connect_timeout = budget;
+    request.total_timeout = budget;
+    std::string body;
+    const auto response = net::http_request_buffered(request, body, shutdown_.token(), 4096);
+    return response.ok() && response->status == 200;
+}
+
+// A fault line alone is not terminal: log text can echo caller-controlled
+// strings. Require a second signal, the child gone or its /health failing.
+bool Supervisor::device_fault_confirmed(Process &child, std::uint16_t port) {
+    if (!log_diagnostics_.device_fault())
+        return false;
+    if (!child.running())
+        return true;
+    return !health_ok(port, Milliseconds(250));
+}
+
+// Keeps a fault that is not confirmed visible before the log is reset for the
+// next child.
+void Supervisor::note_unconfirmed_fault() {
+    if (const auto &fault = log_diagnostics_.device_fault())
+        runtime_events_->push("backend.device_fault_unconfirmed",
+                              {{"backend", fault->backend}, {"reason", fault->reason}, {"device", fault->device},
+                               {"description", fault->description}});
+}
+
 Status Supervisor::wait_ready(Process &child, std::uint16_t port) {
     const auto deadline = Clock::now() + options_.readiness_timeout;
     while (!shutdown_.cancelled()) {
@@ -231,20 +264,7 @@ Status Supervisor::wait_ready(Process &child, std::uint16_t port) {
         if (remaining.count() <= 0)
             return Status(ErrorCode::timeout, "llamaserver: /health readiness timed out");
         const auto budget = std::min(remaining, Milliseconds(250));
-        bool healthy = false;
-        if (options_.health_check) {
-            healthy = options_.health_check(port, budget);
-        } else {
-            net::HttpRequest request;
-            request.host = "127.0.0.1";
-            request.port = port;
-            request.target = "/health";
-            request.connect_timeout = budget;
-            request.total_timeout = budget;
-            std::string body;
-            const auto response = net::http_request_buffered(request, body, shutdown_.token(), 4096);
-            healthy = response.ok() && response->status == 200;
-        }
+        const bool healthy = health_ok(port, budget);
         if (healthy && child.running())
             return Status::success();
         const auto left = std::chrono::duration_cast<Milliseconds>(deadline - Clock::now());
@@ -321,6 +341,14 @@ void Supervisor::monitor() {
                             // refits are bounded by spill_guard.max_attempts.
                             if (options_.warmup)
                                 options_.warmup->stop();
+                            if (drain_device_fault()) {
+                                if (device_fault_confirmed(*child, spec.port)) {
+                                    child->stop(options_.shutdown_timeout);
+                                    fail_device_unhealthy();
+                                    return;
+                                }
+                                note_unconfirmed_fault();
+                            }
                             child->stop(options_.shutdown_timeout);
                             std::lock_guard lock(mutex_);
                             arguments_ = with_context_size(arguments_, verdict.next_ctx);
@@ -359,6 +387,7 @@ void Supervisor::monitor() {
                         auto next_metrics = metrics_now();
                         auto maintenance = ResidencyAction::none;
                         bool host_restart = false;
+                        bool fault_noted = false;
                         while (!shutdown_.cancelled() && child->running()) {
                             pause(options_.health_poll_interval);
                             if (Clock::now() >= next_sample && !shutdown_.cancelled() && child->running()) {
@@ -366,8 +395,14 @@ void Supervisor::monitor() {
                                 next_sample = Clock::now() + options_.spill_guard.sample_interval;
                                 // A device fault is fatal for this child even if it
                                 // is still answering; stop and mark the device.
-                                if (log_diagnostics_.device_fault())
-                                    break;
+                                if (log_diagnostics_.device_fault()) {
+                                    if (device_fault_confirmed(*child, spec.port))
+                                        break;
+                                    if (!fault_noted) {
+                                        note_unconfirmed_fault();
+                                        fault_noted = true;
+                                    }
+                                }
                             }
                             if (options_.native_completion && metrics_now() >= next_metrics &&
                                 !shutdown_.cancelled() && child->running()) {
@@ -392,6 +427,18 @@ void Supervisor::monitor() {
                                 host_restart = true;
                                 break;
                             }
+                        }
+                        const bool relaunching = host_restart || maintenance != ResidencyAction::none;
+                        if (relaunching && !shutdown_.cancelled() && drain_device_fault()) {
+                            if (device_fault_confirmed(*child, spec.port)) {
+                                if (options_.warmup)
+                                    options_.warmup->stop();
+                                child->stop(options_.shutdown_timeout);
+                                fail_device_unhealthy();
+                                return;
+                            }
+                            if (!fault_noted)
+                                note_unconfirmed_fault();
                         }
                         if (host_restart) {
                             if (options_.warmup)

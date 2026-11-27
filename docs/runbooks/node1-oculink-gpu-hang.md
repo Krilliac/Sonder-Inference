@@ -11,7 +11,7 @@ supervisor treats the device as unhealthy and stops. It does not relaunch
 into the same device (a relaunch loop against a hung dock GPU can also wedge
 the host). A fault is any of:
 
-- `VK_ERROR_DEVICE_LOST` (Vulkan);
+- `ggml_vulkan: device lost on <device>` (Vulkan, printed at every vk::DeviceLostError catch site in the b11195 pin);
 - `ggml_vulkan: device fault on <device>: <text>` (VK_EXT_device_fault output,
   llama.cpp #32008; present in the b11195 pin), including the following
   `address fault` / `vendor fault` lines;
@@ -26,6 +26,19 @@ What you see:
 | Runtime warnings and `backend.warning` | `vulkan_runtime_error` (`reason: device_lost`) and/or `device_fault` |
 | Telemetry event `backend.device_unhealthy` | `backend`, `reason`, `device`, `description` |
 | Backend failure status | `llamaserver: device_unhealthy: ...`; requests fail fast with `unavailable` |
+
+Matching is anchored to the start of the line (after an optional llama.cpp
+timestamp and level prefix), so request, response and prompt-token lines that
+llama-server logs at high verbosity cannot trigger it. While the child is
+alive the log is checked once per `spill_guard.sample_interval` (default
+5000 ms), so the child can keep taking requests for up to that long after the
+fault; a child that exits is checked immediately. `CUDA error: device kernel
+image is invalid` (wrong-arch build) is not treated as a device fault.
+
+A fault line is not terminal alone: the supervisor also needs the child to
+have exited or its `/health` probe to fail. A fault seen while the child still
+answers `/health` is only reported as a `backend.device_fault_unconfirmed`
+event.
 
 Detection needs the child log (`log_file`, or `--log-file` in `args`). Without
 one the supervisor cannot see the fault and falls back to its ordinary

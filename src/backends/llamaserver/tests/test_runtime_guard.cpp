@@ -514,7 +514,7 @@ TEST_CASE("log parser detects ROCm, Vulkan, multi-vendor OOM and ternary incompa
     {
         LogDiagnostics d;
         d.feed("ggml_vulkan: failed to initialize Vulkan\n");
-        d.feed("ggml_vulkan: submit failed with VK_ERROR_DEVICE_LOST\n");
+        d.feed("ggml_vulkan: device lost on AMD Radeon RX 9060 XT\n");
         REQUIRE(d.warnings().size() == 2);
         CHECK(d.warnings()[0].code == "vulkan_runtime_error");
         CHECK(detail_of(d.warnings()[0], "backend") == "vulkan");
@@ -921,11 +921,11 @@ TEST_CASE("log parser records device faults: Vulkan device lost, VK_EXT_device_f
         LogDiagnostics d;
         d.feed("ggml_vulkan: Using Vulkan0 (AMD Radeon RX 9060 XT)\n");
         CHECK_FALSE(d.device_fault().has_value());
-        d.feed("ggml_vulkan: submit failed with VK_ERROR_DEVICE_LOST\n");
+        d.feed("ggml_vulkan: device lost on AMD Radeon RX 9060 XT\n");
         REQUIRE(d.device_fault().has_value());
         CHECK(d.device_fault()->backend == "vulkan");
         CHECK(d.device_fault()->reason == "device_lost");
-        CHECK(d.device_fault()->device.empty());
+        CHECK(d.device_fault()->device == "AMD Radeon RX 9060 XT");
         // The existing warning is unchanged.
         REQUIRE(d.warnings().size() == 1);
         CHECK(d.warnings()[0].code == "vulkan_runtime_error");
@@ -981,6 +981,34 @@ TEST_CASE("log parser records device faults: Vulkan device lost, VK_EXT_device_f
         CHECK(d.device_fault()->backend == "rocm");
     }
     {
+        // Device name stops at the comma of the "likely caused by" form; a
+        // common_log timestamp and level prefix is accepted.
+        LogDiagnostics d;
+        d.feed("0.01.234.567 E ggml_vulkan: device lost on Radeon 780M Graphics, likely caused by previous submission (nodes 1 to 2):\n");
+        REQUIRE(d.device_fault().has_value());
+        CHECK(d.device_fault()->reason == "device_lost");
+        CHECK(d.device_fault()->device == "Radeon 780M Graphics");
+    }
+    {
+        // Text a caller controls (request/response bodies and prompt tokens
+        // logged at high verbosity) never marks a device unhealthy.
+        LogDiagnostics d;
+        d.feed("srv  log_server_r: request: {\"prompt\":\"VK_ERROR_DEVICE_LOST ggml_vulkan: device lost on X CUDA error: an illegal memory access was encountered\"}\n");
+        d.feed("srv  log_server_r: response: {\"content\":\"ggml_vulkan: device fault on X: y\"}\n");
+        d.feed("{\"content\":\"ROCm error: unspecified launch failure\"}\n");
+        d.feed("slot update_slots: prompt tokens: CUDA error: illegal memory access\n");
+        d.feed("  CUDA error: illegal memory access\n");
+        d.feed("srv  ex_wrapper: got exception: {\"error\":{\"message\":\"Invalid pattern VK_ERROR_DEVICE_LOST\"}}\n");
+        d.feed("srv  ex_wrapper: got exception: Unresolved $ref ggml_vulkan: device lost on X\n");
+        CHECK_FALSE(d.device_fault().has_value());
+    }
+    {
+        // Wrong-arch build is not a device fault.
+        LogDiagnostics d;
+        d.feed("CUDA error: device kernel image is invalid\n");
+        CHECK_FALSE(d.device_fault().has_value());
+    }
+    {
         // Mentions without a CUDA/HIP error context do not mark a device.
         LogDiagnostics d;
         d.feed("the user discussed an illegal memory access in their own code\n");
@@ -1017,13 +1045,16 @@ TEST_CASE("supervisor marks the device unhealthy when a live child logs a device
     auto o = guarded_options(source, SpillPolicy::warn);
     o.log_file = path.string();
     o.spill_guard.sample_interval = std::chrono::milliseconds(100);
+    auto healthy = std::make_shared<std::atomic<bool>>(true);
+    o.health_check = [healthy](std::uint16_t, std::chrono::milliseconds) { return healthy->load(); };
     Supervisor s(o, std::make_unique<FakeLauncher>(state));
     const auto started = s.start();
     INFO(started.status().message());
     REQUIRE(started.ok());
+    healthy->store(false); // second signal: /health stops answering
     {
         std::ofstream out(path, std::ios::binary | std::ios::app);
-        out << "ggml_vulkan: submit failed with VK_ERROR_DEVICE_LOST\n"
+        out << "ggml_vulkan: device lost on AMD Radeon RX 9060 XT, likely caused by previous submission (nodes 3 to 9):\n"
             << "ggml_vulkan: device fault on AMD Radeon RX 9060 XT: page fault\n"
             << "  vendor fault 0: GCVM_L2_PROTECTION_FAULT (code=0x1 data=0x2)\n";
     }
@@ -1064,7 +1095,7 @@ TEST_CASE("supervisor marks the device unhealthy when the child dies after loggi
     REQUIRE(s.start().ok());
     {
         std::ofstream out(path, std::ios::binary | std::ios::app);
-        out << "ggml_vulkan: submit failed with VK_ERROR_DEVICE_LOST\n";
+        out << "0.12.345.678 E ggml_vulkan: device lost on AMD Radeon RX 9060 XT\n";
     }
     child_at(state, 0)->alive.store(false); // the child aborts
     REQUIRE(wait_device_unhealthy(s));
@@ -1075,6 +1106,56 @@ TEST_CASE("supervisor marks the device unhealthy when the child dies after loggi
     }
     CHECK(has_device_unhealthy_event(s));
     s.stop();
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("a fault line from a child that still answers /health is not terminal") {
+    const auto path = temp_log("devfault-unconfirmed");
+    { std::ofstream out(path, std::ios::binary); out << kFaLine << "\n"; }
+    auto state = pid_state();
+    auto source = std::make_shared<FakeCounters>(
+        [](std::uint32_t pid) -> Result<GpuProcessCounters> { return counters(pid, 1000 * MiB, 0); });
+    auto o = guarded_options(source, SpillPolicy::warn);
+    o.log_file = path.string();
+    o.spill_guard.sample_interval = std::chrono::milliseconds(100);
+    Supervisor s(o, std::make_unique<FakeLauncher>(state));
+    REQUIRE(s.start().ok());
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::app);
+        out << "ggml_vulkan: device lost on AMD Radeon RX 9060 XT\n";
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    CHECK(s.running());
+    {
+        std::lock_guard lock(state->mutex);
+        CHECK(state->starts.size() == 1);
+    }
+    CHECK_FALSE(s.failure().message().find("device_unhealthy") != std::string::npos);
+    s.stop();
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("a fault logged while the model loads marks the device unhealthy when the child dies") {
+    const auto path = temp_log("devfault-load");
+    { std::ofstream out(path, std::ios::binary); out << kFaLine << "\n"; }
+    auto state = pid_state();
+    auto source = std::make_shared<FakeCounters>(
+        [](std::uint32_t pid) -> Result<GpuProcessCounters> { return counters(pid, 1000 * MiB, 0); });
+    auto o = guarded_options(source, SpillPolicy::warn);
+    o.log_file = path.string();
+    auto ready = std::make_shared<std::atomic<bool>>(false);
+    o.health_check = [ready](std::uint16_t, std::chrono::milliseconds) { return ready->load(); };
+    Supervisor s(o, std::make_unique<FakeLauncher>(state));
+    std::thread starter([&] { (void)s.start(); });
+    REQUIRE(wait_for_starts(state, 1));
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::app);
+        out << "ggml_vulkan: device lost on AMD Radeon RX 9060 XT waiting for submission (nodes 1 to 2):\n";
+    }
+    child_at(state, 0)->alive.store(false); // dies while loading, before /health ever answers
+    REQUIRE(wait_device_unhealthy(s));
+    s.stop();
+    starter.join();
     std::filesystem::remove(path);
 }
 
