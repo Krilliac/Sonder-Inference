@@ -408,7 +408,7 @@ grep -q 'outcome=cancelled' \"$2\" || { echo 'no outcome=cancelled stats line'; 
     # --- sonder-bench -------------------------------------------------------
     if(TARGET sonder-bench)
         set(bench_tool $<TARGET_FILE:sonder-bench>)
-        sonder_cli_test(bench_tool_no_args RC 2 STDERR_REGEX "Usage:\\n  sonder-bench --model NAME"
+        sonder_cli_test(bench_tool_no_args RC 2 STDERR_REGEX "Usage:\\n  sonder-bench --model PATH\\.gguf"
             COMMAND ${bench_tool})
         sonder_cli_test(bench_tool_help RC 0 STDOUT_REGEX "MOCK BACKEND banner.*Exit status: 0 ok"
             COMMAND ${bench_tool} --help)
