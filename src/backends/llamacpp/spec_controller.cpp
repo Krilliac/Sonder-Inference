@@ -442,6 +442,24 @@ std::string SpecControllerConfig::Validate() const {
             }
         }
     }
+    const auto check_resolved_pmin = [&](std::string_view route, SpecTaskClass task) -> std::string {
+        bool mode_from_rule = false;
+        const SpecPolicy p = Resolve(route, task, mode_from_rule);
+        if (!(auto_base && !mode_from_rule) && !IsModelBasedSpecStrategy(p.mode) && p.p_min > 0.0) {
+            return std::string("resolved policy for ") + std::string(ToString(task)) +
+                   (route.empty() ? "" : "@" + std::string(route)) +
+                   ": p_min > 0 is only supported for model-based strategies (draft-model, draft-mtp)";
+        }
+        return {};
+    };
+    for (std::size_t i = 0; i < kSpecTaskClassCount; ++i) {
+        const auto tc = static_cast<SpecTaskClass>(i);
+        if (auto e = check_resolved_pmin({}, tc); !e.empty()) return e;
+        for (const auto& [route, rules] : routes) {
+            (void)rules;
+            if (auto e = check_resolved_pmin(route, tc); !e.empty()) return e;
+        }
+    }
     const SpecAcceptanceConfig& a = acceptance;
     if (a.window_steps < 1 || a.window_steps > 4096) return "acceptance.window_steps must be in [1, 4096]";
     if (a.min_drafted_tokens < 1) return "acceptance.min_drafted_tokens must be >= 1";
@@ -475,6 +493,7 @@ SpecPolicy SpecControllerConfig::Resolve(std::string_view route, SpecTaskClass t
     if (p.mode == SpecStrategy::kNone) {
         if (!auto_base || mode_from_rule) {
             p.n_max = 0;
+            p.p_min = 0.0;
         }
     } else if (p.n_max <= 0) {
         p.n_max = DefaultSpecDraftMax(p.mode);
@@ -550,6 +569,26 @@ std::int32_t SpecControllerConfig::MaxMtpRouteDraft() const noexcept {
         }
     }
     return best;
+}
+
+bool SpecControllerConfig::MayUsePMin() const noexcept {
+    if (deterministic) return false;
+    const auto uses_pmin = [&](std::string_view route, SpecTaskClass task) noexcept {
+        bool mode_from_rule = false;
+        const SpecPolicy p = Resolve(route, task, mode_from_rule);
+        if (!(p.p_min > 0.0)) return false;
+        if (auto_base && !mode_from_rule) return true;
+        return p.mode == SpecStrategy::kDraftMtp;
+    };
+    for (std::size_t i = 0; i < kSpecTaskClassCount; ++i) {
+        const auto tc = static_cast<SpecTaskClass>(i);
+        if (uses_pmin({}, tc)) return true;
+        for (const auto& [route, rules] : routes) {
+            (void)rules;
+            if (uses_pmin(route, tc)) return true;
+        }
+    }
+    return false;
 }
 
 // --- bridge to speculation_transition.hpp & suffix_matcher.hpp -------------
@@ -653,6 +692,7 @@ SpecDecision SpecController::Decide(const SpecRequestContext& ctx) {
 
     SpecDecision d;
     d.configured_mode = policy.mode;
+    d.configured_n_max = policy.n_max;
     d.p_min = IsModelBasedSpecStrategy(policy.mode) ? policy.p_min : 0.0;
     if (policy.mode == SpecStrategy::kNone) {
         d.reason = SpecDecisionReason::kConfiguredNone;
@@ -662,6 +702,7 @@ SpecDecision SpecController::Decide(const SpecRequestContext& ctx) {
     const auto off = [&](SpecDecisionReason why) {
         SpecDecision o;
         o.configured_mode = policy.mode;
+        o.configured_n_max = policy.n_max;
         o.reason = why;
         return o;
     };
@@ -750,7 +791,7 @@ SpecDecision SpecController::Decide(const SpecRequestContext& ctx) {
 }
 
 void SpecController::Observe(std::string_view route, SpecTaskClass task, SpecStrategy mode, std::uint32_t drafted,
-                             std::uint32_t accepted) {
+                             std::uint32_t accepted, std::uint64_t probe_id) {
     if (mode == SpecStrategy::kNone || drafted == 0) return;
     accepted = std::min(accepted, drafted);
     const SpecAcceptanceConfig& a = config_.acceptance;
@@ -782,6 +823,10 @@ void SpecController::Observe(std::string_view route, SpecTaskClass task, SpecStr
             return;
         }
         case SpecAcceptanceState::kProbing: {
+            if (!e.probe_in_flight || probe_id == 0 || probe_id != e.active_probe_id) {
+                ++e.ignored;
+                return;
+            }
             e.total_drafted += drafted;
             e.total_accepted += accepted;
             e.probe_drafted += drafted;
@@ -844,13 +889,33 @@ void SpecController::ReleaseProbe(std::string_view route, SpecTaskClass task, Sp
     e.probe_started_ms = 0;
 }
 
+void ApplySpecDecisionToRequest(const SpecDecision& decision, GenerateRequest& req) {
+    req.spec_configured_method = std::string(ToString(decision.configured_mode));
+    req.spec_configured_draft_limit = decision.configured_n_max;
+    req.spec_fallback_reason_override.clear();
+    if (const auto st = ToSpeculativeType(decision.mode); st.has_value()) {
+        req.spec_override = *st;
+        req.spec_draft_max_override = decision.n_max;
+        req.spec_p_min = decision.p_min;
+        if (decision.mode == SpecStrategy::kNone && decision.reason != SpecDecisionReason::kConfiguredNone) {
+            req.spec_fallback_reason_override = std::string(ToString(decision.reason));
+        }
+    } else {
+        req.spec_override = SpeculativeType::kNone;
+        req.spec_draft_max_override = 0;
+        req.spec_p_min = 0.0;
+        req.spec_fallback_reason_override = "draft_model_unsupported";
+    }
+}
+
 void FinishSpecRequest(SpecController& controller, const SpecDecision& decision, std::string_view route,
                        SpecTaskClass task, std::int32_t draft_tokens, std::int32_t draft_accepted_tokens,
                        bool failed_or_cancelled) {
     if (decision.mode == SpecStrategy::kNone) return;
     if (draft_tokens > 0) {
         controller.Observe(route, task, decision.mode, static_cast<std::uint32_t>(draft_tokens),
-                           static_cast<std::uint32_t>(std::max<std::int32_t>(0, draft_accepted_tokens)));
+                           static_cast<std::uint32_t>(std::max<std::int32_t>(0, draft_accepted_tokens)),
+                           decision.is_probe ? decision.probe_id : 0);
     } else if (decision.is_probe) {
         if (failed_or_cancelled) {
             controller.CancelProbe(route, task, decision.mode, decision.probe_id);
@@ -939,8 +1004,8 @@ SpecSlotAdvice AdviseSpecSlots(std::uint32_t requested_slots, std::int32_t n_max
     }
     out.n_max = n_max;
     if (n_batch > 0) {
-        // llama.cpp v1.0.0 common_speculative_get_output_limits:
-        // n_parallel * (1 + n_draft) <= n_batch  =>  n_draft <= n_batch / n_parallel - 1
+        // SI opt-in concurrent small-batch policy: when all n_parallel slots share one
+        // n_batch verify pass, each slot gets at most floor(n_batch / n_parallel) - 1 drafts.
         const std::int64_t rows_per_slot = static_cast<std::int64_t>(n_batch / out.n_parallel);
         const std::int64_t allowed = std::max<std::int64_t>(0, rows_per_slot - 1);
         if (allowed < n_max) {

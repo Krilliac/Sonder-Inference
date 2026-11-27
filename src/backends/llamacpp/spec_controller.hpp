@@ -193,11 +193,11 @@ inline constexpr std::size_t kMaxSpecRouteKeyLength = 128;
 struct SpecPolicy {
     SpecStrategy mode = SpecStrategy::kNone;
     std::int32_t n_max = 0;  // 0 = DefaultSpecDraftMax(mode) after Resolve()
-    // Minimum draft-token probability threshold (llama.cpp v1.0.0
-    // common_params_speculative_draft::p_min, common/common.h:347, enforced in
-    // common/speculative.cpp:421, 871 and in LlamaCppBackend::Impl::MtpDraft).
-    // Valid only for model-based strategies (draft-model, draft-mtp, or auto_base
-    // when resolving to MTP); p_min > 0 is rejected for history-based strategies.
+    // Minimum draft-token probability threshold (enforced in LlamaCppBackend::Impl::MtpDraft
+    // using full-vocab softmax probability p(top); note llama.cpp v1.0.0 checks cur_p->data[0].p
+    // after top_k=10 filtering in common/speculative.cpp:63-67,421,871, so SI's full-vocab p_min
+    // is stricter at the same numeric value). Valid only for model-based strategies (draft-model,
+    // draft-mtp, or auto_base resolving to MTP); p_min > 0 is rejected for history-based strategies.
     double p_min = 0.0;
 };
 
@@ -263,7 +263,7 @@ struct SpecControllerConfig {
     [[nodiscard]] std::string Validate() const;
 
     // Layers base < class rule < route-wide rule < route+class rule, field by field,
-    // then fills n_max (0 -> strategy default; mode none -> 0).
+    // then fills n_max (0 -> strategy default; mode none -> n_max = 0, p_min = 0.0).
     [[nodiscard]] SpecPolicy Resolve(std::string_view route, SpecTaskClass task) const;
 
     // Same as Resolve(), plus tells the caller whether `mode` was explicitly set by a
@@ -282,6 +282,11 @@ struct SpecControllerConfig {
     // Largest draft length (n_max) requested specifically by class/route rules targeting kDraftMtp
     // (0 when deterministic or when no class/route rule selects kDraftMtp).
     [[nodiscard]] std::int32_t MaxMtpRouteDraft() const noexcept;
+
+    // True when !deterministic and any policy that can run MTP (base, auto_base, or a
+    // class/route rule) configures p_min > 0. InitMtp uses this to skip attaching GPU
+    // backend sampler chains so CPU logits stay available without llama_set_sampler toggling.
+    [[nodiscard]] bool MayUsePMin() const noexcept;
 };
 
 // One config rule as `<selector>=<policy>`:
@@ -309,7 +314,10 @@ using SpecClock = std::function<std::int64_t()>;
 // What the host knows about the loaded model and build.
 struct SpecModelCaps {
     bool mtp_available = false;          // build has SONDER_LLAMACPP_HAS_MTP and model has MTP layers
-    bool draft_model_available = false;  // standalone draft model loaded and vocab-compatible
+    // Standalone external draft model loaded and vocab-compatible. LlamaCppBackend does not
+    // yet implement external draft-model loading, so LlamaCppCoreBackend leaves this false
+    // and draft-model rules cleanly resolve to kDraftModelUnavailable.
+    bool draft_model_available = false;
     sonder::inference::ModelArchitecture architecture = sonder::inference::ModelArchitecture::attention_only;
     std::int32_t hybrid_rs_cap = 0;      // llama_n_rs_seq(ctx) on hybrid models; see CheckArchitectureSpecGuard
     bool can_hybrid_spec_ckpt = false;   // partial recurrent checkpoints available for hybrid rollback
@@ -321,9 +329,8 @@ struct SpecModelCaps {
 struct SpecRequestContext {
     std::string route;
     SpecTaskClass task = SpecTaskClass::kChat;
-    // Per-request determinism flag (identical inputs + seed => identical output;
-    // Capability::deterministic in include/sonder/inference/backend.hpp:45).
-    // OR-ed with config.deterministic.
+    // Per-request determinism override seam (OR-ed with SpecControllerConfig::deterministic,
+    // which LlamaCppCoreBackend populates from LlamaCppBackendOptions::deterministic).
     bool deterministic = false;
     SpecModelCaps caps;
 };
@@ -363,6 +370,7 @@ struct SpecDecision {
     bool is_probe = false;                               // a re-probe after an acceptance disable
     std::uint64_t probe_id = 0;                          // non-zero monotonic owner token when is_probe == true
     SpecStrategy configured_mode = SpecStrategy::kNone;  // what config asked for before any override
+    std::int32_t configured_n_max = 0;                   // resolved n_max before any override
 };
 
 // Bridges SpecDecision into SlotSpecCapability for SpeculationTransitionState::Configure(),
@@ -413,9 +421,11 @@ public:
 
     // Feeds one verification step (or one request's totals) back. `mode` is the strategy
     // that actually ran. drafted == 0 and mode none carry no information and are ignored.
-    // accepted is clamped to drafted.
+    // accepted is clamped to drafted. When the entry is in kProbing, only observations
+    // carrying the active `probe_id` are accepted; stale non-probe (probe_id == 0) or
+    // mismatched observations are ignored so they cannot clear probe ownership.
     void Observe(std::string_view route, SpecTaskClass task, SpecStrategy mode, std::uint32_t drafted,
-                 std::uint32_t accepted);
+                 std::uint32_t accepted, std::uint64_t probe_id = 0);
 
     // Aborts an in-flight probe (e.g. request cancelled or errored before drafting) and
     // returns the entry to disabled with its current backoff without counting a failed probe.
@@ -468,6 +478,10 @@ private:
     std::uint64_t next_probe_id_ = 0;
 };
 
+// Populates a LlamaCppBackend GenerateRequest with both the configured policy
+// (for EffectiveExecutionReport) and the controller's effective override / fallback reason.
+void ApplySpecDecisionToRequest(const SpecDecision& decision, GenerateRequest& req);
+
 // Completes one request against SpecController: observes draft counts when
 // draft_tokens > 0, cancels a failed/cancelled probe, or releases probe ownership
 // on zero-draft normal completion so probe_in_flight never leaks.
@@ -478,9 +492,9 @@ void FinishSpecRequest(SpecController& controller, const SpecDecision& decision,
 // Computes the numerically-stable softmax probability of `token` in `logits` (0.0 on invalid input).
 [[nodiscard]] double ComputeTopTokenProbability(std::span<const float> logits, Token token) noexcept;
 
-// Returns true when `p_min <= 0` or the softmax probability of `token` in `logits` is >= `p_min`.
+// Returns true when `p_min <= 0` or the full-vocab softmax probability of `token` in `logits` is >= `p_min`.
 // Used by the MTP draft loop to stop drafting early when draft confidence falls below `p_min`
-// (matching llama.cpp v1.0.0 common/speculative.cpp:421, 871).
+// (stricter than llama.cpp v1.0.0's top_k=10 filtered p_min in common/speculative.cpp:63-67, 421, 871).
 [[nodiscard]] bool DraftTokenPassesPMin(std::span<const float> logits, Token token, double p_min) noexcept;
 
 // ---------------------------------------------------------------------------

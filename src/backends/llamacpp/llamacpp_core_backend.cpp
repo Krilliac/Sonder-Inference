@@ -805,6 +805,7 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
         return Status(ErrorCode::invalid_argument, std::move(spec_err));
     }
     lo.spec_may_use_mtp = spec_cfg.MayUseMtp();
+    lo.spec_may_use_p_min = spec_cfg.MayUsePMin();
     lo.spec_max_route_draft = spec_cfg.MaxPlannedDraft();
     lo.spec_mtp_route_draft = spec_cfg.MaxMtpRouteDraft();
     return Status::success();
@@ -1211,19 +1212,7 @@ private:
             sctx.task = spec_task;
             sctx.caps = spec_caps_;
             spec_decision = spec_controller_->Decide(sctx);
-            if (const auto st = lc::ToSpeculativeType(spec_decision.mode); st.has_value()) {
-                req.spec_override = *st;
-                req.spec_draft_max_override = spec_decision.n_max;
-                req.spec_p_min = spec_decision.p_min;
-                if (spec_decision.mode == lc::SpecStrategy::kNone &&
-                    spec_decision.reason != lc::SpecDecisionReason::kConfiguredNone) {
-                    req.spec_fallback_reason_override = std::string(lc::ToString(spec_decision.reason));
-                }
-            } else {
-                req.spec_override = lc::SpeculativeType::kNone;
-                req.spec_draft_max_override = 0;
-                req.spec_fallback_reason_override = "draft_model_unsupported";
-            }
+            lc::ApplySpecDecisionToRequest(spec_decision, req);
         }
         req.max_new_tokens = sampling.max_tokens;
         req.sampling = ToLlamaSampling(sampling);

@@ -1932,14 +1932,16 @@ struct LlamaCppBackend::Impl {
             llama_sampler_chain_add(s.get(), llama_sampler_init_greedy());
             mtp_samplers[i] = std::move(s);
 #if defined(SONDER_LLAMACPP_HAS_SET_SAMPLER)
-            llama_sampler* bchain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-            llama_sampler_chain_add(bchain, llama_sampler_init_greedy());
-            if (!llama_set_sampler(ctx_dft, static_cast<llama_seq_id>(i), bchain)) {
-                llama_sampler_free(bchain);
-                bchain = nullptr;
+            if (!opts.spec_may_use_p_min) {
+                llama_sampler* bchain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                llama_sampler_chain_add(bchain, llama_sampler_init_greedy());
+                if (!llama_set_sampler(ctx_dft, static_cast<llama_seq_id>(i), bchain)) {
+                    llama_sampler_free(bchain);
+                    bchain = nullptr;
+                }
+                mtp_backend_chains[i] = bchain;
+                mtp_backend_chain_attached[i] = (bchain != nullptr) ? 1u : 0u;
             }
-            mtp_backend_chains[i] = bchain;
-            mtp_backend_chain_attached[i] = (bchain != nullptr) ? 1u : 0u;
 #endif
         }
 
@@ -2151,17 +2153,15 @@ struct LlamaCppBackend::Impl {
         if (sidx >= slots.size()) return false;
         const bool check_p_min = std::isfinite(p_min) && p_min > 0.0;
 #if defined(SONDER_LLAMACPP_HAS_SET_SAMPLER)
-        if (sidx < mtp_backend_chain_attached.size()) {
-            if (check_p_min && mtp_backend_chain_attached[sidx] != 0u) {
-                // Detach GPU backend sampler while p_min > 0 so CPU logits are populated for softmax gating.
-                (void)llama_set_sampler(ctx_dft, slot_id, nullptr);
-                mtp_backend_chain_attached[sidx] = 0u;
-            } else if (!check_p_min && mtp_backend_chain_attached[sidx] == 0u &&
-                       mtp_backend_chains[sidx] != nullptr) {
-                if (llama_set_sampler(ctx_dft, slot_id, mtp_backend_chains[sidx])) {
-                    mtp_backend_chain_attached[sidx] = 1u;
-                }
+        if (check_p_min && sidx < mtp_backend_chain_attached.size() && mtp_backend_chain_attached[sidx] != 0u) {
+            // One-way detach + free: llama_sampler_chain_backend_init() asserts is_init == false
+            // (v1.0.0 src/llama-sampler.cpp:740), so an initialized chain must never be reattached.
+            (void)llama_set_sampler(ctx_dft, slot_id, nullptr);
+            if (mtp_backend_chains[sidx] != nullptr) {
+                llama_sampler_free(mtp_backend_chains[sidx]);
+                mtp_backend_chains[sidx] = nullptr;
             }
+            mtp_backend_chain_attached[sidx] = 0u;
         }
 #endif
 
@@ -4040,9 +4040,11 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
     }
 
     // Record configured vs effective speculation strategy and disable/fallback reason.
-    result.configured_spec_method = std::string(ToString(request.spec_override.value_or(requested_spec)));
-    result.configured_draft_limit = request.spec_draft_max_override.has_value()
-                                        ? req_draft_max
+    result.configured_spec_method = !request.spec_configured_method.empty()
+                                        ? request.spec_configured_method
+                                        : std::string(ToString(requested_spec));
+    result.configured_draft_limit = request.spec_configured_draft_limit.has_value()
+                                        ? *request.spec_configured_draft_limit
                                         : (options.spec_draft_max > 0 ? options.spec_draft_max : active_draft_max);
     if (use_mtp) {
         result.effective_spec_method = use_hybrid_suffix ? "draft-mtp+suffix" : "draft-mtp";
@@ -4936,6 +4938,16 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
     ConcurrentSpecPolicy concurrent_spec_policy;
     concurrent_spec_policy.enabled = options.spec_batch_enabled;
     concurrent_spec_policy.max_concurrent_slots = std::clamp<std::uint32_t>(options.spec_batch_max_slots, 1u, kMaxSlots);
+    if (options.spec_batch_enabled) {
+        const SpecSlotAdvice conc_advice = AdviseSpecSlots(
+            static_cast<std::uint32_t>(slots.size()), concurrent_spec_policy.max_per_slot_draft_tokens,
+            static_cast<std::uint32_t>(std::max<int32_t>(0, ctx_outputs_max)),
+            concurrent_spec_policy.max_concurrent_slots);
+        concurrent_spec_policy.max_concurrent_slots = conc_advice.n_parallel;
+        if (conc_advice.n_max > 0) {
+            concurrent_spec_policy.max_per_slot_draft_tokens = conc_advice.n_max;
+        }
+    }
     concurrent_spec_policy.max_aggregate_draft_tokens =
         options.spec_batch_max_aggregate_draft_tokens > 0 ? options.spec_batch_max_aggregate_draft_tokens : 16;
     ConcurrentSpecCostGate concurrent_cost_gate;
@@ -5697,9 +5709,11 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         s->spec_transition.Configure(cap);
         sync_slot_flags_from_transition(*s);
         s->adaptive_ctrl.Reset(s->effective_draft_max);
-        s->result.configured_spec_method = std::string(ToString(req.spec_override.value_or(requested_spec)));
-        s->result.configured_draft_limit = req.spec_draft_max_override.has_value()
-                                               ? req_draft_max
+        s->result.configured_spec_method = !req.spec_configured_method.empty()
+                                               ? req.spec_configured_method
+                                               : std::string(ToString(requested_spec));
+        s->result.configured_draft_limit = req.spec_configured_draft_limit.has_value()
+                                               ? *req.spec_configured_draft_limit
                                                : (options.spec_draft_max > 0 ? options.spec_draft_max : active_draft_max);
         if (s->mtp_enabled) {
             s->result.effective_spec_method = s->hybrid_suffix_enabled ? "draft-mtp+suffix" : "draft-mtp";

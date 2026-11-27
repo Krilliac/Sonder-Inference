@@ -213,7 +213,7 @@ TEST_CASE("spec controller: rule parsing and LlamaCppBackendOptions integration"
     si::LlamaCppBackendOptions bo;
     bo.spec_type = "auto";
     bo.spec_p_min = 0.25;
-    bo.spec_route_rules = {"code=suffix,n_max=16", "reasoning@model.gguf=draft-mtp,n_max=3,p_min=0.6"};
+    bo.spec_route_rules = {"code=suffix,n_max=16,p_min=0", "reasoning@model.gguf=draft-mtp,n_max=3,p_min=0.6"};
     bo.deterministic = true;
     CHECK(si::validate_llamacpp_options(bo).ok());
 
@@ -489,7 +489,7 @@ TEST_CASE("spec controller: re-probe timing with exponential backoff, cancel and
     CHECK(ctl.Stats("r", T, M).probe_count == 2);
 
     // Partial probe evidence (8 < 16 drafted) releases probe ownership so the next request continues it.
-    ctl.Observe("r", T, M, 8, 0);
+    ctl.Observe("r", T, M, 8, 0, d2.probe_id);
     CHECK(ctl.Stats("r", T, M).state == SpecAcceptanceState::kProbing);
     const SpecDecision cont = ctl.Decide(ctx);
     CHECK(cont.is_probe);
@@ -497,7 +497,7 @@ TEST_CASE("spec controller: re-probe timing with exponential backoff, cancel and
     CHECK(ctl.Stats("r", T, M).probe_count == 2);  // continuation of the same probe, not a new one
     // The probe fails once it has 16 drafted tokens at 0%: backoff doubles to 2000 ms.
     const std::int64_t t1 = clk.now_ms;
-    ctl.Observe("r", T, M, 8, 0);
+    ctl.Observe("r", T, M, 8, 0, cont.probe_id);
     SpecRouteStats s = ctl.Stats("r", T, M);
     CHECK(s.state == SpecAcceptanceState::kDisabled);
     CHECK(s.disable_count == 1);  // a failed probe is not a new disable
@@ -507,20 +507,22 @@ TEST_CASE("spec controller: re-probe timing with exponential backoff, cancel and
     clk.now_ms = t1 + 1999;
     CHECK(ctl.Decide(ctx).mode == SpecStrategy::kNone);
     clk.now_ms = t1 + 2000;
-    CHECK(ctl.Decide(ctx).is_probe);
+    SpecDecision dp = ctl.Decide(ctx);
+    CHECK(dp.is_probe);
     // Fail again: 4000, then 8000, then capped at 8000.
     std::int64_t expected[] = {4000, 8000, 8000, 8000};
     for (std::int64_t want : expected) {
-        ctl.Observe("r", T, M, 16, 0);
+        ctl.Observe("r", T, M, 16, 0, dp.probe_id);
         s = ctl.Stats("r", T, M);
         CHECK(s.state == SpecAcceptanceState::kDisabled);
         CHECK(s.backoff_ms == want);
         clk.now_ms += want;
-        CHECK(ctl.Decide(ctx).is_probe);
+        dp = ctl.Decide(ctx);
+        CHECK(dp.is_probe);
     }
 
     // A probe at or above reenable_at_least (0.40) turns speculation back on and resets the backoff.
-    ctl.Observe("r", T, M, 16, 7);  // 0.4375
+    ctl.Observe("r", T, M, 16, 7, dp.probe_id);  // 0.4375
     s = ctl.Stats("r", T, M);
     CHECK(s.state == SpecAcceptanceState::kEnabled);
     CHECK(s.backoff_ms == 0);
@@ -543,8 +545,9 @@ TEST_CASE("spec controller: a probe between disable and re-enable thresholds fai
     const auto T = SpecTaskClass::kChat;
     ctl.Observe("r", T, M, 16, 0);
     clk.now_ms += 1000;
-    REQUIRE(ctl.Decide(ctx).is_probe);
-    ctl.Observe("r", T, M, 16, 5);  // 0.3125: above disable line, below re-enable line
+    const SpecDecision hp = ctl.Decide(ctx);
+    REQUIRE(hp.is_probe);
+    ctl.Observe("r", T, M, 16, 5, hp.probe_id);  // 0.3125: above disable line, below re-enable line
     CHECK(ctl.Stats("r", T, M).state == SpecAcceptanceState::kDisabled);
     CHECK(ctl.Stats("r", T, M).backoff_ms == 2000);
 }
@@ -840,7 +843,7 @@ TEST_CASE("spec controller: concurrent probe cancel does not race and Stats retr
     clk.now_ms += 1000;
     const SpecDecision r3 = ctl.Decide(ctx);
     REQUIRE(r3.is_probe);
-    ctl.Observe("r", T, M, 16, 16);
+    ctl.Observe("r", T, M, 16, 16, r3.probe_id);
     CHECK(ctl.Stats("r", T, M).state == SpecAcceptanceState::kEnabled);
 
     // Signed overflow protection in Stats().retry_in_ms when retry_at_ms == INT64_MAX and clock < 0.
@@ -1047,4 +1050,173 @@ TEST_CASE("spec controller: intake #4 p_min rejected for non-model strategies an
     CHECK_FALSE(DraftTokenPassesPMin(flat_logits, -1, 0.1));
     CHECK_FALSE(DraftTokenPassesPMin(flat_logits, 4, 0.1));
     CHECK_FALSE(DraftTokenPassesPMin({}, 0, 0.1));
+}
+
+TEST_CASE("spec controller: intake2 #1 MayUsePMin flags configs that can run MTP with p_min > 0") {
+    SpecControllerConfig cfg;
+    std::string err;
+
+    // Default (p_min == 0) does not disable backend MTP sampler chains.
+    si::LlamaCppBackendOptions bo;
+    bo.spec_type = "draft-mtp";
+    bo.spec_p_min = 0.0;
+    REQUIRE(BuildSpecControllerConfig(bo, cfg, err));
+    CHECK_FALSE(cfg.MayUsePMin());
+
+    // Base p_min > 0 on draft-mtp -> MayUsePMin() is true.
+    bo.spec_p_min = 0.5;
+    REQUIRE(BuildSpecControllerConfig(bo, cfg, err));
+    CHECK(cfg.MayUsePMin());
+
+    // Determinism mode disables model-based drafting -> MayUsePMin() is false.
+    bo.deterministic = true;
+    REQUIRE(BuildSpecControllerConfig(bo, cfg, err));
+    CHECK_FALSE(cfg.MayUsePMin());
+
+    // Route-only MTP rule with p_min > 0 on base spec_type=none -> MayUsePMin() is true.
+    si::LlamaCppBackendOptions bo2;
+    bo2.spec_type = "none";
+    bo2.spec_route_rules = {"code=draft-mtp,n_max=3,p_min=0.6", "chat=draft-mtp,n_max=3,p_min=0.0"};
+    REQUIRE(BuildSpecControllerConfig(bo2, cfg, err));
+    CHECK(cfg.MayUsePMin());
+}
+
+TEST_CASE("spec controller: intake2 #2 off-decisions preserve configured_spec_method and configured_draft_limit") {
+    FakeClock clk;
+    SpecController ctl(BaseConfig(SpecStrategy::kSuffix, 16), clk.fn());
+    const auto ctx = Ctx("m.gguf", SpecTaskClass::kCode);
+
+    // 1. Acceptance-disabled decision still reports configured "suffix" / 16, effective "none" / 0.
+    ctl.Observe("m.gguf", SpecTaskClass::kCode, SpecStrategy::kSuffix, 16, 0);
+    const SpecDecision off = ctl.Decide(ctx);
+    CHECK(off.mode == SpecStrategy::kNone);
+    CHECK(off.reason == SpecDecisionReason::kAcceptanceDisabled);
+    CHECK(off.configured_mode == SpecStrategy::kSuffix);
+    CHECK(off.configured_n_max == 16);
+
+    GenerateRequest req;
+    ApplySpecDecisionToRequest(off, req);
+    CHECK(req.spec_configured_method == "suffix");
+    CHECK(req.spec_configured_draft_limit == std::optional<std::int32_t>(16));
+    CHECK(req.spec_override == std::optional<SpeculativeType>(SpeculativeType::kNone));
+    CHECK(req.spec_draft_max_override == std::optional<std::int32_t>(0));
+    CHECK(req.spec_fallback_reason_override == "acceptance_disabled");
+
+    // 2. MTP configured on a model without MTP preserves configured "draft-mtp" / 3.
+    SpecController mtp_ctl(BaseConfig(SpecStrategy::kDraftMtp, 0), clk.fn());
+    SpecRequestContext mtp_ctx = Ctx("m.gguf", SpecTaskClass::kChat);
+    mtp_ctx.caps.mtp_available = false;
+    const SpecDecision mtp_off = mtp_ctl.Decide(mtp_ctx);
+    CHECK(mtp_off.configured_mode == SpecStrategy::kDraftMtp);
+    CHECK(mtp_off.configured_n_max == kDefaultMtpDraftMax);
+    GenerateRequest mtp_req;
+    ApplySpecDecisionToRequest(mtp_off, mtp_req);
+    CHECK(mtp_req.spec_configured_method == "draft-mtp");
+    CHECK(mtp_req.spec_configured_draft_limit == std::optional<std::int32_t>(kDefaultMtpDraftMax));
+    CHECK(mtp_req.spec_fallback_reason_override == "mtp_unavailable");
+
+    // 3. Reusing GenerateRequest clears stale fallback_reason_override and spec_p_min.
+    SpecDecision active_dec;
+    active_dec.mode = SpecStrategy::kSuffix;
+    active_dec.n_max = 8;
+    active_dec.p_min = 0.0;
+    active_dec.reason = SpecDecisionReason::kConfigured;
+    active_dec.configured_mode = SpecStrategy::kSuffix;
+    active_dec.configured_n_max = 8;
+    mtp_req.spec_p_min = 0.7;
+    ApplySpecDecisionToRequest(active_dec, mtp_req);
+    CHECK(mtp_req.spec_fallback_reason_override.empty());
+    CHECK(mtp_req.spec_p_min == doctest::Approx(0.0));
+
+    SpecDecision dm_dec;
+    dm_dec.mode = SpecStrategy::kDraftModel;
+    dm_dec.n_max = 4;
+    dm_dec.p_min = 0.7;
+    dm_dec.reason = SpecDecisionReason::kConfigured;
+    dm_dec.configured_mode = SpecStrategy::kDraftModel;
+    dm_dec.configured_n_max = 4;
+    mtp_req.spec_p_min = 0.7;
+    ApplySpecDecisionToRequest(dm_dec, mtp_req);
+    CHECK(mtp_req.spec_p_min == doctest::Approx(0.0));
+    CHECK(mtp_req.spec_fallback_reason_override == "draft_model_unsupported");
+}
+
+TEST_CASE("spec controller: intake2 #3 stale non-probe or wrong-id Observe during kProbing is ignored") {
+    FakeClock clk;
+    SpecController ctl(BaseConfig(SpecStrategy::kSuffix, 8), clk.fn());
+    const auto ctx = Ctx("r", SpecTaskClass::kChat);
+    const auto T = SpecTaskClass::kChat;
+    const auto M = SpecStrategy::kSuffix;
+
+    // Request A decided before disable (not a probe: probe_id == 0).
+    const SpecDecision dec_a = ctl.Decide(ctx);
+    REQUIRE_FALSE(dec_a.is_probe);
+    REQUIRE(dec_a.probe_id == 0);
+
+    // Route gets disabled, backoff expires, Request B starts a probe.
+    ctl.Observe("r", T, M, 16, 0);
+    clk.now_ms += 1000;
+    const SpecDecision dec_b = ctl.Decide(ctx);
+    REQUIRE(dec_b.is_probe);
+    REQUIRE(dec_b.probe_id > 0);
+
+    // Stale Request A finishes while Request B's probe is in flight: must be ignored,
+    // must NOT add tokens to probe evidence, and must NOT release Request B's ownership.
+    FinishSpecRequest(ctl, dec_a, "r", T, /*draft_tokens=*/16, /*draft_accepted_tokens=*/16, false);
+    CHECK(ctl.Stats("r", T, M).state == SpecAcceptanceState::kProbing);
+    CHECK(ctl.Stats("r", T, M).ignored_observations == 1);
+    CHECK(ctl.Stats("r", T, M).total_drafted == 16);  // unchanged by stale A
+    // Concurrent Request C is still blocked because Request B still owns the probe.
+    CHECK(ctl.Decide(ctx).reason == SpecDecisionReason::kAcceptanceDisabled);
+
+    // A mismatched non-zero probe_id is also ignored.
+    ctl.Observe("r", T, M, 16, 16, dec_b.probe_id + 99);
+    CHECK(ctl.Stats("r", T, M).state == SpecAcceptanceState::kProbing);
+    CHECK(ctl.Stats("r", T, M).ignored_observations == 2);
+
+    // Request B completes with its matching probe_id and re-enables speculation.
+    FinishSpecRequest(ctl, dec_b, "r", T, /*draft_tokens=*/16, /*draft_accepted_tokens=*/16, false);
+    CHECK(ctl.Stats("r", T, M).state == SpecAcceptanceState::kEnabled);
+}
+
+TEST_CASE("spec controller: intake2 #4 Validate rejects layered p_min inherited by non-model class") {
+    // Base sets draft-mtp with p_min=0.5, class rule overrides mode to suffix without resetting p_min:
+    // resolved policy for code would be suffix with p_min=0.5 -> Validate() must reject it.
+    SpecControllerConfig cfg = BaseConfig(SpecStrategy::kDraftMtp, 3);
+    cfg.base.p_min = 0.5;
+    std::string err;
+    REQUIRE(ParseSpecRule("code=suffix,n_max=16", cfg, err));
+    CHECK_FALSE(cfg.Validate().empty());
+
+    // Explicitly setting p_min=0 on the suffix rule makes the layered config valid.
+    REQUIRE(ParseSpecRule("code=suffix,n_max=16,p_min=0", cfg, err));
+    CHECK(cfg.Validate().empty());
+
+    // Disabling a class or route with '=none' under a model+p_min base must stay valid and zero p_min.
+    {
+        SpecControllerConfig disable_cfg = BaseConfig(SpecStrategy::kDraftMtp, 3);
+        disable_cfg.base.p_min = 0.5;
+        REQUIRE(ParseSpecRule("tool-call=none", disable_cfg, err));
+        REQUIRE(ParseSpecRule("@reranker=none", disable_cfg, err));
+        CHECK(disable_cfg.Validate().empty());
+        const SpecPolicy tc = disable_cfg.Resolve("any", SpecTaskClass::kToolCall);
+        CHECK(tc.mode == SpecStrategy::kNone);
+        CHECK(tc.n_max == 0);
+        CHECK(tc.p_min == doctest::Approx(0.0));
+        const SpecPolicy rr = disable_cfg.Resolve("reranker", SpecTaskClass::kChat);
+        CHECK(rr.mode == SpecStrategy::kNone);
+        CHECK(rr.n_max == 0);
+        CHECK(rr.p_min == doctest::Approx(0.0));
+    }
+    // Explicit p_min > 0 on a kNone base or overlay is still rejected by Validate().
+    {
+        SpecControllerConfig bad_none = BaseConfig(SpecStrategy::kNone, 0);
+        bad_none.base.p_min = 0.5;
+        CHECK_FALSE(bad_none.Validate().empty());
+
+        SpecControllerConfig bad_overlay = BaseConfig(SpecStrategy::kDraftMtp, 3);
+        REQUIRE(ParseSpecRule("code=none", bad_overlay, err));
+        REQUIRE(ParseSpecRule("code@m=p_min=0.5", bad_overlay, err));
+        CHECK_FALSE(bad_overlay.Validate().empty());
+    }
 }

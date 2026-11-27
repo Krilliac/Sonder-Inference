@@ -221,6 +221,7 @@ struct LoadOptions {
     // prepares MTP weights/context and output-row capacity for per-route rules
     // even when base spec_type is "none" or another strategy.
     bool spec_may_use_mtp = false;
+    bool spec_may_use_p_min = false;
     std::int32_t spec_max_route_draft = 0;
     std::int32_t spec_mtp_route_draft = 0;
     // Verification policy for speculative decoding (TargetMatch default vs
@@ -442,6 +443,10 @@ struct GenerateRequest {
     std::optional<std::int32_t> spec_draft_max_override = std::nullopt;
     double spec_p_min = 0.0;
     std::string spec_fallback_reason_override;
+    // Policy configured before controller overrides (acceptance disable, determinism, etc.),
+    // used for EffectiveExecutionReport configured_spec_method / configured_draft_limit.
+    std::string spec_configured_method;
+    std::optional<std::int32_t> spec_configured_draft_limit = std::nullopt;
 };
 
 // One event per generated token. After the last token a final event with
