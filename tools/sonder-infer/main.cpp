@@ -38,6 +38,9 @@
 #if defined(SONDER_HAS_WEIGHT_MANIFEST)
 #include "sonder/inference/weight_manifest.hpp"
 #endif
+#if defined(SONDER_HAS_MODEL_STORE)
+#include "sonder/inference/model_store.hpp"
+#endif
 
 namespace si = sonder::inference;
 namespace cli = sonder::cli;
@@ -1039,6 +1042,14 @@ int main(int argc, char** argv) {
 #else
         err() << "error: weights: this build does not include the artifacts module (src/artifacts)\n";
         return 4;  // `weights` usage code (cli::kExitUsage is 2, which `weights` uses for "mismatch")
+#endif
+    }
+    if (cmd == "models" && !rest.empty() && rest.front() == "import-ollama") {
+#if defined(SONDER_HAS_MODEL_STORE)
+        return si::models::models_main(rest, std::cout, std::cerr);
+#else
+        err() << "error: models: this build does not include the model store module (src/models)\n";
+        return cli::kExitUsage;
 #endif
     }
     if (cmd == "tune") {

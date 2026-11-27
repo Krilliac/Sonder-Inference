@@ -204,13 +204,18 @@ inline const CommandSpec& models_command() {
     static const CommandSpec spec{
         "models",
         "list the models a backend can serve",
-        {"models --backend NAME [--json] [--ollama-url URL]"},
+        {"models --backend NAME [--json] [--ollama-url URL]",
+         "models import-ollama [DIR] [--name NAME] [--verify [--weights-only]] [--json]"},
         {{"Backend",
           {{"backend", OptionKind::value, "NAME", "mock | ollama | llamacpp | llamaserver (env SONDER_INFER_BACKEND)"}}},
          output_json(),
          ollama_options(), llamaserver_options()},
-        {kBackendNote, kEnvNote, kExitNote},
-        {"models --backend mock --json", "models --backend ollama"}};
+        {kBackendNote, kEnvNote, kExitNote,
+         "'models import-ollama' (src/models, docs/integration/model-store.md) is parsed by the model store;\n"
+         "'models import-ollama --help' prints its options. It lists what an existing Ollama models\n"
+         "directory (default $OLLAMA_MODELS, then ~/.ollama/models) would serve through SI's native engine,\n"
+         "read-only and without copying, starting a daemon or hashing (hashing is opt-in with --verify)."},
+        {"models --backend mock --json", "models --backend ollama", "models import-ollama D:/ollama/models --json"}};
     return spec;
 }
 
