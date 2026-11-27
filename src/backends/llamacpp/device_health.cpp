@@ -2,7 +2,11 @@
 #include "device_health.hpp"
 
 #include <algorithm>
+#include <future>
+#include <ios>
 #include <limits>
+
+#include "sonder/backends/llamacpp/llamacpp_backend.h"
 
 namespace sonder::backends::llamacpp {
 
@@ -113,12 +117,51 @@ DeviceFaultReason ClassifyGgmlStatus(int ggml_status_code) noexcept {
     return DeviceFaultReason::kGgmlComputeFailed;
 }
 
+class VulkanResultErrorCategoryImpl final : public std::error_category {
+public:
+    const char* name() const noexcept override { return "vk::Result"; }
+    std::string message(int ev) const override {
+        return "vk::Result(" + std::to_string(ev) + ")";
+    }
+};
+
+bool IsVulkanErrorCategory(const std::error_category& category) noexcept {
+    if (&category == &std::generic_category() ||
+        &category == &std::system_category() ||
+        &category == &std::iostream_category() ||
+        &category == &std::future_category()) {
+        return false;
+    }
+    const char* name = category.name();
+    if (name == nullptr) {
+        return false;
+    }
+    const std::string_view sv(name);
+    if (sv == "vk::Result" || sv == "vulkan") {
+        return true;
+    }
+    constexpr std::string_view kSuffix = "::Result";
+    return sv.size() > kSuffix.size() && sv.substr(sv.size() - kSuffix.size()) == kSuffix;
+}
+
+const std::error_category& VulkanResultErrorCategory() noexcept {
+    static const VulkanResultErrorCategoryImpl kCategory;
+    return kCategory;
+}
+
 DeviceFaultReason ClassifyBackendSystemError(int error_value) noexcept {
     if (error_value == kVkErrorDeviceLost) {
         return DeviceFaultReason::kDeviceLost;
     }
     if (error_value == kVkErrorOutOfDeviceMemory) {
         return DeviceFaultReason::kDeviceOutOfMemory;
+    }
+    return DeviceFaultReason::kBackendDeviceError;
+}
+
+DeviceFaultReason ClassifyBackendSystemError(const std::error_code& ec) noexcept {
+    if (IsVulkanErrorCategory(ec.category())) {
+        return ClassifyBackendSystemError(ec.value());
     }
     return DeviceFaultReason::kBackendDeviceError;
 }
@@ -370,6 +413,14 @@ bool DeviceHealthTracker::ObserveSystemError(std::string_view device, int error_
     return RecordFaultLocked(device, reason, static_cast<std::int32_t>(error_value));
 }
 
+bool DeviceHealthTracker::ObserveSystemError(std::string_view device, const std::error_code& ec) {
+    if (IsVulkanErrorCategory(ec.category())) {
+        return ObserveSystemError(device, ec.value());
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    return RecordFaultLocked(device, DeviceFaultReason::kBackendDeviceError, -1);
+}
+
 bool DeviceHealthTracker::ObserveSystemErrorForDevices(std::span<const std::string> devices, int error_value) {
     if (devices.empty()) {
         return false;
@@ -379,6 +430,22 @@ bool DeviceHealthTracker::ObserveSystemErrorForDevices(std::span<const std::stri
     bool any = false;
     for (const std::string& dev : devices) {
         any = RecordFaultLocked(dev, reason, static_cast<std::int32_t>(error_value)) || any;
+    }
+    return any;
+}
+
+bool DeviceHealthTracker::ObserveSystemErrorForDevices(std::span<const std::string> devices,
+                                                       const std::error_code& ec) {
+    if (devices.empty()) {
+        return false;
+    }
+    if (IsVulkanErrorCategory(ec.category())) {
+        return ObserveSystemErrorForDevices(devices, ec.value());
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    bool any = false;
+    for (const std::string& dev : devices) {
+        any = RecordFaultLocked(dev, DeviceFaultReason::kBackendDeviceError, -1) || any;
     }
     return any;
 }
@@ -474,6 +541,18 @@ void UnbindBackendDeviceHealth(const LlamaCppBackend* backend) noexcept {
                       reg.entries.end());
 }
 
+bool HasBoundBackendDeviceTracker(const LlamaCppBackend* backend) noexcept {
+    if (backend == nullptr) return false;
+    auto& reg = GetBindingRegistry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    for (const auto& entry : reg.entries) {
+        if (entry.backend == backend) {
+            return entry.tracker != nullptr && !entry.gpu_devices.empty();
+        }
+    }
+    return false;
+}
+
 DeviceHealthError CheckBoundBackendDeviceHealth(const LlamaCppBackend* backend) {
     if (backend == nullptr) return {};
     std::shared_ptr<DeviceHealthTracker> tracker;
@@ -515,11 +594,81 @@ std::int32_t RunBoundBackendDecode(const LlamaCppBackend* backend, const std::fu
         (void)tracker->ExecuteDecodeGuarded(devices, fn, &rc);
         return rc;
     }
-    try {
-        return fn();
-    } catch (...) {
-        return kDeviceUnhealthyDecodeSentinel;
+    return fn();
+}
+
+bool RecoverOrInvalidateAfterDecodeFailure(
+    const LlamaCppBackend* backend,
+    std::int32_t rc,
+    const std::function<bool()>& try_rollback,
+    const std::function<void()>& clear_cache) {
+    if ((ClassifyDecodeStatus(rc) != DeviceFaultReason::kNone) &&
+        HasBoundBackendDeviceTracker(backend) &&
+        !CheckBoundBackendDeviceHealth(backend).ok()) {
+        if (clear_cache) clear_cache();
+        return false;
     }
+    return try_rollback ? try_rollback() : false;
+}
+
+void AppendUniqueNonCpuDevice(std::vector<std::string>& out, std::string_view candidate) {
+    if (candidate.empty() || AsciiLower(candidate) == "cpu") return;
+    const std::string low = AsciiLower(candidate);
+    for (const auto& existing : out) {
+        if (AsciiLower(existing) == low) return;
+    }
+    out.emplace_back(candidate);
+}
+
+std::vector<std::string> CollectInitialGpuDevices(const LoadOptions& lo, std::string_view device_id) {
+    std::vector<std::string> out;
+    if (device_id.rfind("cpu", 0) != 0) {
+        for (const auto& name : lo.devices) {
+            AppendUniqueNonCpuDevice(out, name);
+        }
+        if (device_id.rfind("gpu", 0) == 0) {
+            AppendUniqueNonCpuDevice(out, device_id);
+        }
+    }
+    for (const auto& ov : lo.tensor_overrides) {
+        AppendUniqueNonCpuDevice(out, ov.device);
+    }
+    return out;
+}
+
+std::vector<std::string> CollectActiveGpuDevices(const LoadOptions& lo,
+                                                 std::span<const DeviceInfo> enumerated_devices,
+                                                 std::string_view device_id) {
+    std::vector<std::string> out;
+    if (lo.n_gpu_layers != 0) {
+        for (const auto& name : lo.devices) {
+            AppendUniqueNonCpuDevice(out, name);
+        }
+        if (out.empty()) {
+            std::vector<const DeviceInfo*> gpus;
+            for (const auto& d : enumerated_devices) {
+                if (d.kind == DeviceKind::kGpu || d.kind == DeviceKind::kIntegratedGpu ||
+                    d.kind == DeviceKind::kAccelerator) {
+                    gpus.push_back(&d);
+                }
+            }
+            if (lo.split_mode == SplitMode::kNone && lo.main_gpu >= 0 &&
+                static_cast<std::size_t>(lo.main_gpu) < gpus.size()) {
+                AppendUniqueNonCpuDevice(out, gpus[static_cast<std::size_t>(lo.main_gpu)]->name);
+            } else {
+                for (const auto* g : gpus) {
+                    AppendUniqueNonCpuDevice(out, g->name);
+                }
+            }
+        }
+        if (out.empty() && device_id.rfind("gpu", 0) == 0) {
+            AppendUniqueNonCpuDevice(out, device_id);
+        }
+    }
+    for (const auto& ov : lo.tensor_overrides) {
+        AppendUniqueNonCpuDevice(out, ov.device);
+    }
+    return out;
 }
 
 void BindCoreBackendDeviceHealth(

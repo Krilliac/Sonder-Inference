@@ -42,6 +42,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <span>
 #include <string>
 #include <string_view>
@@ -59,6 +60,8 @@ class Backend;
 namespace sonder::backends::llamacpp {
 
 class LlamaCppBackend;
+struct LoadOptions;
+struct DeviceInfo;
 
 inline constexpr std::string_view kDeviceUnhealthyErrorCode = "device_unhealthy";
 inline constexpr std::string_view kDeviceUnhealthyEventType = "backend.device_unhealthy";
@@ -114,7 +117,10 @@ enum class DeviceHealthErrorKind : std::uint8_t {
 [[nodiscard]] inline DeviceFaultReason ClassifyGgmlStatus(GgmlComputeStatus status) noexcept {
     return ClassifyGgmlStatus(static_cast<int>(status));
 }
+[[nodiscard]] bool IsVulkanErrorCategory(const std::error_category& category) noexcept;
+[[nodiscard]] const std::error_category& VulkanResultErrorCategory() noexcept;
 [[nodiscard]] DeviceFaultReason ClassifyBackendSystemError(int error_value) noexcept;
+[[nodiscard]] DeviceFaultReason ClassifyBackendSystemError(const std::error_code& ec) noexcept;
 
 struct DeviceHealthEntry {
     std::string device;
@@ -163,7 +169,9 @@ public:
     bool ObserveGgmlStatus(std::string_view device, int ggml_status_code);
     bool ObserveGgmlStatusForDevices(std::span<const std::string> devices, int ggml_status_code);
     bool ObserveSystemError(std::string_view device, int error_value);
+    bool ObserveSystemError(std::string_view device, const std::error_code& ec);
     bool ObserveSystemErrorForDevices(std::span<const std::string> devices, int error_value);
+    bool ObserveSystemErrorForDevices(std::span<const std::string> devices, const std::error_code& ec);
     bool MarkDeviceUnhealthy(std::string_view device, DeviceFaultReason reason, std::int32_t raw_status = -1);
 
     // Runs `fn()` (returning llama_decode / llama_process int32_t rc) only if every device in `devices`
@@ -178,8 +186,10 @@ public:
         std::int32_t rc = 0;
         try {
             rc = fn();
+        } catch (const std::bad_alloc&) {
+            throw;
         } catch (const std::system_error& sys_err) {
-            (void)ObserveSystemErrorForDevices(devices, sys_err.code().value());
+            (void)ObserveSystemErrorForDevices(devices, sys_err.code());
             if (out_rc != nullptr) *out_rc = kDeviceUnhealthyDecodeSentinel;
             return CheckDevices(devices);
         } catch (...) {
@@ -237,9 +247,22 @@ void BindBackendDeviceHealth(const LlamaCppBackend* backend,
                              std::vector<std::string> gpu_devices);
 void MoveBackendDeviceHealth(const LlamaCppBackend* from, const LlamaCppBackend* to) noexcept;
 void UnbindBackendDeviceHealth(const LlamaCppBackend* backend) noexcept;
+[[nodiscard]] bool HasBoundBackendDeviceTracker(const LlamaCppBackend* backend) noexcept;
 [[nodiscard]] DeviceHealthError CheckBoundBackendDeviceHealth(const LlamaCppBackend* backend);
 [[nodiscard]] std::int32_t RunBoundBackendDecode(
     const LlamaCppBackend* backend, const std::function<std::int32_t()>& fn);
+[[nodiscard]] bool RecoverOrInvalidateAfterDecodeFailure(
+    const LlamaCppBackend* backend,
+    std::int32_t rc,
+    const std::function<bool()>& try_rollback,
+    const std::function<void()>& clear_cache);
+
+// Helper routines resolving active GPU targets from LoadOptions without bloating llamacpp_core_backend.cpp.
+void AppendUniqueNonCpuDevice(std::vector<std::string>& out, std::string_view candidate);
+[[nodiscard]] std::vector<std::string> CollectInitialGpuDevices(
+    const LoadOptions& lo, std::string_view device_id);
+[[nodiscard]] std::vector<std::string> CollectActiveGpuDevices(
+    const LoadOptions& lo, std::span<const DeviceInfo> enumerated_devices, std::string_view device_id);
 
 // Core Backend instance registry so unit/verifier tests and recover_llamacpp_device() work
 // without widening Backend virtual methods or changing existing test factory signatures.

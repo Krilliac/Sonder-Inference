@@ -821,50 +821,6 @@ bool IsGguf(const fs::path& p) {
     return ext == ".gguf";
 }
 
-void AppendUniqueNonCpuDevice(std::vector<std::string>& out, std::string_view candidate) {
-    if (candidate.empty() || llamacpp_detail::LowerAscii(candidate) == "cpu") return;
-    const std::string low = llamacpp_detail::LowerAscii(candidate);
-    for (const auto& existing : out) {
-        if (llamacpp_detail::LowerAscii(existing) == low) return;
-    }
-    out.emplace_back(candidate);
-}
-
-std::vector<std::string> CollectActiveGpuDevices(const lc::LoadOptions& lo,
-                                                 const std::vector<lc::DeviceInfo>& enumerated_devices,
-                                                 std::string_view device_id) {
-    std::vector<std::string> out;
-    if (lo.n_gpu_layers != 0) {
-        for (const auto& name : lo.devices) {
-            AppendUniqueNonCpuDevice(out, name);
-        }
-        if (out.empty()) {
-            std::vector<const lc::DeviceInfo*> gpus;
-            for (const auto& d : enumerated_devices) {
-                if (d.kind == lc::DeviceKind::kGpu || d.kind == lc::DeviceKind::kIntegratedGpu ||
-                    d.kind == lc::DeviceKind::kAccelerator) {
-                    gpus.push_back(&d);
-                }
-            }
-            if (lo.split_mode == lc::SplitMode::kNone && lo.main_gpu >= 0 &&
-                static_cast<std::size_t>(lo.main_gpu) < gpus.size()) {
-                AppendUniqueNonCpuDevice(out, gpus[static_cast<std::size_t>(lo.main_gpu)]->name);
-            } else {
-                for (const auto* g : gpus) {
-                    AppendUniqueNonCpuDevice(out, g->name);
-                }
-            }
-        }
-        if (out.empty() && device_id.rfind("gpu", 0) == 0) {
-            AppendUniqueNonCpuDevice(out, device_id);
-        }
-    }
-    for (const auto& ov : lo.tensor_overrides) {
-        AppendUniqueNonCpuDevice(out, ov.device);
-    }
-    return out;
-}
-
 class LlamaCppModel final : public BackendModel {
 public:
     LlamaCppModel(ModelDescriptor desc, lc::LlamaCppBackend runtime, double load_ms, std::uint32_t slots,
@@ -1591,13 +1547,7 @@ public:
         const std::string_view dev = options.device_id;
         const auto health = runtime_state_ ? runtime_state_->DeviceHealth() : nullptr;
         if (health) {
-            std::vector<std::string> initial_targets;
-            if (dev.rfind("cpu", 0) != 0) {
-                for (const auto& name : lo.devices) AppendUniqueNonCpuDevice(initial_targets, name);
-                if (dev.rfind("gpu", 0) == 0) AppendUniqueNonCpuDevice(initial_targets, dev);
-            }
-            for (const auto& ov : lo.tensor_overrides) AppendUniqueNonCpuDevice(initial_targets, ov.device);
-            if (Status dh = health->CheckDevicesStatus(initial_targets); !dh.ok()) {
+            if (Status dh = health->CheckDevicesStatus(lc::CollectInitialGpuDevices(lo, dev)); !dh.ok()) {
                 return dh;
             }
         }
@@ -1626,7 +1576,7 @@ public:
                 return s;
             }
         }
-        std::vector<std::string> active_gpu_devices = CollectActiveGpuDevices(lo, enumerated_devices, dev);
+        std::vector<std::string> active_gpu_devices = lc::CollectActiveGpuDevices(lo, enumerated_devices, dev);
         if (health && !active_gpu_devices.empty()) {
             if (dev.rfind("gpu:", 0) == 0 && active_gpu_devices.size() == 1u) {
                 (void)health->RegisterAlias(dev, active_gpu_devices[0]);

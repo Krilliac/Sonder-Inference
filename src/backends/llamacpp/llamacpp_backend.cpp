@@ -1134,19 +1134,14 @@ struct LlamaCppBackend::Impl {
         if (telemetry) telemetry(TelemetryEvent{kind, tokens, ms, std::move(detail)});
     }
 
-    static bool AbortCallback(void* data) noexcept {
+    static bool AbortCallback(void* data) {
         auto* self = static_cast<Impl*>(data);
         if (self->abort_requested.load(std::memory_order_relaxed)) return true;
-        try {
-            if (self->active_cancel != nullptr && *self->active_cancel && (*self->active_cancel)()) {
-                self->abort_requested.store(true, std::memory_order_relaxed);
-                return true;
-            }
-            if (self->batch_abort_fn && self->batch_abort_fn()) {
-                self->abort_requested.store(true, std::memory_order_relaxed);
-                return true;
-            }
-        } catch (...) {
+        if (self->active_cancel != nullptr && *self->active_cancel && (*self->active_cancel)()) {
+            self->abort_requested.store(true, std::memory_order_relaxed);
+            return true;
+        }
+        if (self->batch_abort_fn && self->batch_abort_fn()) {
             self->abort_requested.store(true, std::memory_order_relaxed);
             return true;
         }
@@ -1160,7 +1155,8 @@ struct LlamaCppBackend::Impl {
         return RunBoundBackendDecode(owner.load(std::memory_order_acquire), [&] { return llama_encode(c, b); });
     }
     [[nodiscard]] bool HasBoundDeviceFault() const {
-        return !CheckBoundBackendDeviceHealth(owner.load(std::memory_order_acquire)).ok();
+        const LlamaCppBackend* self = owner.load(std::memory_order_acquire);
+        return HasBoundBackendDeviceTracker(self) && !CheckBoundBackendDeviceHealth(self).ok();
     }
 
     // Snapshots an evicted VRAM slot's sequence state into the bounded L2
@@ -4125,12 +4121,11 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                 return result;
             }
             if (rc != 0) {
-                const bool fatal_device_fault = (ClassifyDecodeStatus(rc) != DeviceFaultReason::kNone);
-                if (fatal_device_fault || !llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(cur_pos), -1)) {
+                if (!RecoverOrInvalidateAfterDecodeFailure(
+                        owner.load(std::memory_order_acquire), rc,
+                        [&] { return llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(cur_pos), -1); },
+                        [&] { radix_cache.Clear(); })) {
                     invalidate_slot();
-                }
-                if (fatal_device_fault) {
-                    radix_cache.Clear();
                 }
                 return fail(ErrorCode::kDecodeFailed,
                             "llama_decode failed during prefill (rc=" + std::to_string(rc) + ")");
@@ -4524,25 +4519,24 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
             add_stage_ms(result.stage_timings.verify_ms, MsSince(verify_start));
         }
         if (rc != 0) {
-            const bool fatal_device_fault = (ClassifyDecodeStatus(rc) != DeviceFaultReason::kNone);
-            bool rolled_back = !fatal_device_fault &&
-                               CheckSwaRollback(slot_idx, mem, slot_id, static_cast<std::uint64_t>(pos)) &&
-                               llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
-            if (!rolled_back && !fatal_device_fault) {
+            const bool rolled_back = RecoverOrInvalidateAfterDecodeFailure(
+                owner.load(std::memory_order_acquire), rc,
+                [&] {
+                    bool ok = CheckSwaRollback(slot_idx, mem, slot_id, static_cast<std::uint64_t>(pos)) &&
+                              llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
-                if (have_spec_ckpt && !swa_compact_active) {
-                    const llama_state_seq_flags flags = PartialCheckpointFlags();
-                    const std::size_t read =
-                        llama_state_seq_set_data_ext(ctx, spec_ckpt_buf.data(), spec_ckpt_size, slot_id, flags);
-                    rolled_back = (read > 0) && llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
-                }
+                    if (!ok && have_spec_ckpt && !swa_compact_active) {
+                        const llama_state_seq_flags flags = PartialCheckpointFlags();
+                        const std::size_t read =
+                            llama_state_seq_set_data_ext(ctx, spec_ckpt_buf.data(), spec_ckpt_size, slot_id, flags);
+                        ok = (read > 0) && llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(pos), -1);
+                    }
 #endif
-            }
+                    return ok;
+                },
+                [&] { radix_cache.Clear(); });
             if (!rolled_back) {
                 invalidate_slot();
-            }
-            if (fatal_device_fault) {
-                radix_cache.Clear();
             }
             if (rc == 2) return finish(StopReason::kCancelled);
             if (rc == 1) return finish(StopReason::kContextFull);
@@ -5841,12 +5835,11 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 batch_abort_fn = nullptr;
                 active_cancel = nullptr;
                 if (rc != 0) {
-                    const bool fatal_device_fault = (ClassifyDecodeStatus(rc) != DeviceFaultReason::kNone);
-                    if (fatal_device_fault || !llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1)) {
+                    if (!RecoverOrInvalidateAfterDecodeFailure(
+                            owner.load(std::memory_order_acquire), rc,
+                            [&] { return llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1); },
+                            [&] { radix_cache.Clear(); })) {
                         invalidate_slot(s);
-                    }
-                    if (fatal_device_fault) {
-                        radix_cache.Clear();
                     }
                     if (rc == 2) {
                         finish_slot(s, StopReason::kCancelled);
@@ -6195,23 +6188,23 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             batch_abort_fn = nullptr;
             active_cancel = nullptr;
             if (rc != 0) {
-                const bool fatal_device_fault = (ClassifyDecodeStatus(rc) != DeviceFaultReason::kNone);
-                bool rolled_back =
-                    !fatal_device_fault &&
-                    CheckSwaRollback(s.slot_idx, mem, s.slot_id, static_cast<std::uint64_t>(s.pos)) &&
-                    llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1);
-                if (!rolled_back && !fatal_device_fault) {
+                const bool rolled_back = RecoverOrInvalidateAfterDecodeFailure(
+                    owner.load(std::memory_order_acquire), rc,
+                    [&] {
+                        bool ok = CheckSwaRollback(s.slot_idx, mem, s.slot_id, static_cast<std::uint64_t>(s.pos)) &&
+                                  llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1);
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
-                    if (have_spec_ckpt && !swa_compact_active) {
-                        const llama_state_seq_flags flags = PartialCheckpointFlags();
-                        const std::size_t read = llama_state_seq_set_data_ext(ctx, spec_ckpt_buf.data(), spec_ckpt_size,
-                                                                              s.slot_id, flags);
-                        rolled_back = (read > 0) && llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1);
-                    }
+                        if (!ok && have_spec_ckpt && !swa_compact_active) {
+                            const llama_state_seq_flags flags = PartialCheckpointFlags();
+                            const std::size_t read = llama_state_seq_set_data_ext(ctx, spec_ckpt_buf.data(),
+                                                                                  spec_ckpt_size, s.slot_id, flags);
+                            ok = (read > 0) && llama_memory_seq_rm(mem, s.slot_id, static_cast<llama_pos>(s.pos), -1);
+                        }
 #endif
-                }
+                        return ok;
+                    },
+                    [&] { radix_cache.Clear(); });
                 if (!rolled_back) invalidate_slot(s);
-                if (fatal_device_fault) radix_cache.Clear();
                 if (rc == 2) {
                     finish_slot(s, StopReason::kCancelled);
                 } else if (rc == 1) {
@@ -6658,15 +6651,20 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 } else if (rc != 0) {
                     ran_concurrent_spec = true;
                     const bool stopping = worker_stop.load(std::memory_order_acquire);
-                    const bool fatal_device_fault = (ClassifyDecodeStatus(rc) != DeviceFaultReason::kNone);
+                    const bool fatal_device_fault =
+                        HasBoundDeviceFault() && (ClassifyDecodeStatus(rc) != DeviceFaultReason::kNone);
                     if (fatal_device_fault) radix_cache.Clear();
                     for (const ConcurrentSpecSlotPlan& item : cplan.slots) {
                         ActiveBatchSlot* s = find_active_by_slot(item.slot_index);
                         if (s == nullptr) continue;
-                        const bool swa_ok =
-                            !fatal_device_fault &&
-                            CheckSwaRollback(s->slot_idx, mem, s->slot_id, static_cast<std::uint64_t>(s->pos));
-                        if (!swa_ok || !llama_memory_seq_rm(mem, s->slot_id, static_cast<llama_pos>(s->pos), -1)) {
+                        if (!RecoverOrInvalidateAfterDecodeFailure(
+                                owner.load(std::memory_order_acquire), rc,
+                                [&] {
+                                    return CheckSwaRollback(s->slot_idx, mem, s->slot_id,
+                                                            static_cast<std::uint64_t>(s->pos)) &&
+                                           llama_memory_seq_rm(mem, s->slot_id, static_cast<llama_pos>(s->pos), -1);
+                                },
+                                {})) {
                             invalidate_slot(*s);
                         }
                         if (rc == 2 && (s->IsCancelled() || stopping)) {
@@ -7169,14 +7167,19 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 
         if (rc != 0) {
             const bool stopping = worker_stop.load(std::memory_order_acquire);
-            const bool fatal_device_fault = (ClassifyDecodeStatus(rc) != DeviceFaultReason::kNone);
+            const bool fatal_device_fault =
+                HasBoundDeviceFault() && (ClassifyDecodeStatus(rc) != DeviceFaultReason::kNone);
             if (fatal_device_fault) radix_cache.Clear();
             for (const PlannedBatchItem& item : plan.items) {
                 ActiveBatchSlot* s = find_active_by_slot(item.slot_index);
                 if (s == nullptr) continue;
-                const bool swa_ok = !fatal_device_fault &&
-                                    CheckSwaRollback(s->slot_idx, mem, s->slot_id, static_cast<std::uint64_t>(s->pos));
-                if (!swa_ok || !llama_memory_seq_rm(mem, s->slot_id, static_cast<llama_pos>(s->pos), -1)) {
+                if (!RecoverOrInvalidateAfterDecodeFailure(
+                        owner.load(std::memory_order_acquire), rc,
+                        [&] {
+                            return CheckSwaRollback(s->slot_idx, mem, s->slot_id, static_cast<std::uint64_t>(s->pos)) &&
+                                   llama_memory_seq_rm(mem, s->slot_id, static_cast<llama_pos>(s->pos), -1);
+                        },
+                        {})) {
                     invalidate_slot(*s);
                 }
                 if (rc == 2 && (s->IsCancelled() || stopping)) {

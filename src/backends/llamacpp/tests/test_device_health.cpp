@@ -6,6 +6,8 @@
 #include <climits>
 #include <cstdint>
 #include <memory>
+#include <new>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -14,6 +16,7 @@
 #include "common/diag_log.hpp"
 #include "device_health.hpp"
 #include "llamacpp_internal.hpp"
+#include "radix_cache.hpp"
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include "sonder/inference/backends/llamacpp.hpp"
 #include "sonder/inference/engine.hpp"
@@ -217,17 +220,59 @@ TEST_CASE("device_health: ExecuteDecodeGuarded catches thrown std::system_error 
     int calls = 0;
     std::int32_t out_rc = 0;
 
-    // Simulate ggml_backend_vk_graph_compute throwing vk::DeviceLostError (std::system_error with code -4).
+    // 1. Host std::bad_alloc must NOT mark GPU devices unhealthy and must propagate.
+    CHECK_THROWS_AS(
+        tracker.ExecuteDecodeGuarded(
+            devs,
+            [&]() -> std::int32_t {
+                ++calls;
+                throw std::bad_alloc{};
+            },
+            &out_rc),
+        std::bad_alloc);
+    CHECK(calls == 1);
+    CHECK(tracker.CheckDevice("Vulkan0").ok());
+    CHECK(tracker.PendingTelemetryEventCount() == 0u);
+
+    // 2. Non-Vulkan error_category (generic_category / system_category) must NOT have its numeric
+    //    value read as a Vulkan VkResult (-4 = kDeviceLost, -2 = kDeviceOutOfMemory).
+    CHECK_FALSE(lc::IsVulkanErrorCategory(std::generic_category()));
+    CHECK_FALSE(lc::IsVulkanErrorCategory(std::system_category()));
+    CHECK(lc::IsVulkanErrorCategory(lc::VulkanResultErrorCategory()));
+    CHECK(lc::ClassifyBackendSystemError(std::error_code(lc::kVkErrorDeviceLost, std::generic_category())) ==
+          lc::DeviceFaultReason::kBackendDeviceError);
+    CHECK(lc::ClassifyBackendSystemError(std::error_code(lc::kVkErrorOutOfDeviceMemory, std::system_category())) ==
+          lc::DeviceFaultReason::kBackendDeviceError);
+    CHECK(lc::ClassifyBackendSystemError(std::error_code(lc::kVkErrorDeviceLost, lc::VulkanResultErrorCategory())) ==
+          lc::DeviceFaultReason::kDeviceLost);
+    CHECK(lc::ClassifyBackendSystemError(
+              std::error_code(lc::kVkErrorOutOfDeviceMemory, lc::VulkanResultErrorCategory())) ==
+          lc::DeviceFaultReason::kDeviceOutOfMemory);
+
+    {
+        lc::DeviceHealthTracker generic_tracker("llamacpp");
+        const lc::DeviceHealthError gen_err = generic_tracker.ExecuteDecodeGuarded(
+            devs,
+            [&]() -> std::int32_t {
+                throw std::system_error(std::error_code(lc::kVkErrorDeviceLost, std::generic_category()),
+                                        "generic POSIX error with numeric -4");
+            },
+            &out_rc);
+        CHECK(gen_err.is_device_unhealthy());
+        CHECK(gen_err.reason == lc::DeviceFaultReason::kBackendDeviceError);
+    }
+
+    // 3. Simulate ggml_backend_vk_graph_compute throwing vk::DeviceLostError (VulkanResultErrorCategory, code -4).
     const lc::DeviceHealthError err = tracker.ExecuteDecodeGuarded(
         devs,
         [&]() -> std::int32_t {
             ++calls;
-            throw std::system_error(std::error_code(lc::kVkErrorDeviceLost, std::generic_category()),
+            throw std::system_error(std::error_code(lc::kVkErrorDeviceLost, lc::VulkanResultErrorCategory()),
                                     "simulated vulkan device lost");
         },
         &out_rc);
 
-    CHECK(calls == 1);
+    CHECK(calls == 2);
     CHECK(err.is_device_unhealthy());
     CHECK(err.reason == lc::DeviceFaultReason::kDeviceLost);
     CHECK(out_rc == lc::kDeviceUnhealthyDecodeSentinel);
@@ -240,8 +285,84 @@ TEST_CASE("device_health: ExecuteDecodeGuarded catches thrown std::system_error 
             return 0;
         },
         &out_rc);
-    CHECK(calls == 1);
+    CHECK(calls == 2);
     CHECK(err2.is_device_unhealthy());
+}
+
+TEST_CASE("device_health: unbound CPU backend preserves decode exceptions rollback and prefix cache on -2") {
+    lc::LlamaCppBackend unbound_be;
+    CHECK_FALSE(lc::HasBoundBackendDeviceTracker(&unbound_be));
+
+    // Unbound RunBoundBackendDecode must not swallow exceptions into -1000.
+    CHECK_THROWS_AS(
+        (void)lc::RunBoundBackendDecode(&unbound_be,
+                                        []() -> std::int32_t { throw std::runtime_error("cpu callback threw"); }),
+        std::runtime_error);
+    CHECK(lc::RunBoundBackendDecode(&unbound_be, []() -> std::int32_t { return -2; }) == -2);
+
+    // CollectInitialGpuDevices / CollectActiveGpuDevices exclude CPU and deduplicate case-insensitively.
+    lc::LoadOptions cpu_lo;
+    cpu_lo.n_gpu_layers = 0;
+    cpu_lo.devices = {"CPU"};
+    CHECK(lc::CollectInitialGpuDevices(cpu_lo, "cpu:0").empty());
+    CHECK(lc::CollectActiveGpuDevices(cpu_lo, {}, "cpu:0").empty());
+    lc::LoadOptions gpu_lo;
+    gpu_lo.n_gpu_layers = -1;
+    gpu_lo.devices = {"CPU", "Vulkan0", "vulkan0"};
+    const auto active_gpus = lc::CollectActiveGpuDevices(gpu_lo, {}, "gpu:0");
+    REQUIRE(active_gpus.size() == 1u);
+    CHECK(active_gpus[0] == "Vulkan0");
+
+    // Seed a real RadixPrefixCache entry representing an existing session's cached prefix.
+    lc::RadixPrefixCache cache(/*max_bytes=*/4096);
+    const std::vector<lc::Token> cached_prefix{10, 20, 30, 40};
+    lc::RadixCacheEntry entry;
+    entry.state_blob.assign(128, 0xAB);
+    REQUIRE(cache.Insert(cached_prefix, std::move(entry)));
+    REQUIRE(cache.entry_count() == 1u);
+
+    // Unbound backend hitting rc == -2 must still invoke rollback and keep the prefix cache intact.
+    int rollback_calls = 0;
+    const bool unbound_rolled_back = lc::RecoverOrInvalidateAfterDecodeFailure(
+        &unbound_be, -2,
+        [&]() -> bool {
+            ++rollback_calls;
+            return true;
+        },
+        [&]() { cache.Clear(); });
+    CHECK(unbound_rolled_back);
+    CHECK(rollback_calls == 1);
+    CHECK(cache.entry_count() == 1u);
+    CHECK(cache.LookupLongestPrefix(cached_prefix, cached_prefix.size(), false).found());
+
+    // Bound backend with empty GPU list (CPU-only load) must also behave identically to unbound.
+    auto tracker = std::make_shared<lc::DeviceHealthTracker>("llamacpp");
+    lc::BindBackendDeviceHealth(&unbound_be, tracker, {});
+    CHECK_FALSE(lc::HasBoundBackendDeviceTracker(&unbound_be));
+    CHECK(lc::RecoverOrInvalidateAfterDecodeFailure(
+        &unbound_be, -2,
+        [&]() -> bool {
+            ++rollback_calls;
+            return true;
+        },
+        [&]() { cache.Clear(); }));
+    CHECK(rollback_calls == 2);
+    CHECK(cache.entry_count() == 1u);
+
+    // Contrast: GPU-bound backend hitting rc == -2 marks GPU unhealthy, skips rollback, and clears cache.
+    lc::BindBackendDeviceHealth(&unbound_be, tracker, {"CUDA0"});
+    CHECK(lc::HasBoundBackendDeviceTracker(&unbound_be));
+    CHECK(lc::RunBoundBackendDecode(&unbound_be, []() -> std::int32_t { return -2; }) == -2);
+    CHECK_FALSE(lc::RecoverOrInvalidateAfterDecodeFailure(
+        &unbound_be, -2,
+        [&]() -> bool {
+            ++rollback_calls;
+            return true;
+        },
+        [&]() { cache.Clear(); }));
+    CHECK(rollback_calls == 2);
+    CHECK(cache.entry_count() == 0u);
+    lc::UnbindBackendDeviceHealth(&unbound_be);
 }
 
 TEST_CASE("device_health: bound LlamaCppBackend decode hook marks device unhealthy preserves move binding and fails fast") {
@@ -409,7 +530,7 @@ TEST_CASE("device_health: hostile device names capacity bounds and concurrent ac
     lc::DeviceHealthTracker tracker("llamacpp");
 
     // Empty, NUL, control chars, malformed UTF-8, and oversized device names are rejected without throwing.
-    const std::string bad_utf8("\xFF\xFE\xFD\x80.gpu", 12);
+    const std::string bad_utf8("\xFF\xFE\xFD\x80.gpu", 8);
     CHECK_FALSE(lc::DeviceHealthTracker::IsValidDeviceName(""));
     CHECK_FALSE(lc::DeviceHealthTracker::IsValidDeviceName("   "));
     CHECK_FALSE(lc::DeviceHealthTracker::IsValidDeviceName(std::string("CUDA0\0bad", 9)));
