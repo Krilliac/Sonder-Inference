@@ -536,4 +536,3 @@ TEST_CASE("graph_telemetry: empty evals, CancelEval, Disable, and null/empty nam
     CHECK_FALSE(agg.OnNodeAsk("Qcur-0", 28, "MUL_MAT", "CPU"));
     CHECK(agg.OnNodeAfter("Qcur-0", 28));
 }
-

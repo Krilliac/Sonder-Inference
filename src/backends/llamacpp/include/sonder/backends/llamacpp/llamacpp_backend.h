@@ -421,7 +421,7 @@ struct SamplingParams {
     // JSON Schema text (normalised by the caller) enforced through llguidance instead of `grammar`.
     // Needs a build with SONDER_WITH_LLGUIDANCE=ON: otherwise the request fails with
     // kInvalidArgument rather than running unconstrained. Cannot be combined with grammar_lazy.
-    std::string llguidance_json_schema;
+    std::string llguidance_json_schema{};
     // Tokens pre-accepted into a non-lazy grammar before generation (for example the generation
     // prompt already present in the prompt). Requires a non-lazy grammar. If the grammar rejects
     // one (out of range, or masked by the grammar, which includes end-of-generation tokens), it is
@@ -533,10 +533,10 @@ struct GenerateRequest {
     std::optional<SpeculativeType> spec_override = std::nullopt;
     std::optional<std::int32_t> spec_draft_max_override = std::nullopt;
     double spec_p_min = 0.0;
-    std::string spec_fallback_reason_override;
+    std::string spec_fallback_reason_override{};
     // Policy configured before controller overrides (acceptance disable, determinism, etc.),
     // used for EffectiveExecutionReport configured_spec_method / configured_draft_limit.
-    std::string spec_configured_method;
+    std::string spec_configured_method{};
     std::optional<std::int32_t> spec_configured_draft_limit = std::nullopt;
 };
 

@@ -103,7 +103,7 @@ struct LlamaCppBackendOptions {
     // Minimum draft-token probability for model-based speculation ([0, 1], default 0.0).
     double spec_p_min = 0.0;
     // Per-route / per-task-class speculation rules (<selector>=<policy>), parsed by ParseSpecRule().
-    std::vector<std::string> spec_route_rules;
+    std::vector<std::string> spec_route_rules{};
     // Determinism mode: disables model-based drafting (draft-model / draft-mtp).
     bool deterministic = false;
     // Speculative decoding verification policy: TargetMatch (default reference

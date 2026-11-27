@@ -45,7 +45,7 @@ struct BackendSetup {
     std::optional<std::uint32_t> llamacpp_ubatch_size;
     std::optional<std::string> llamacpp_kv_cache_type_k;
     std::optional<std::string> llamacpp_kv_cache_type_v;
-    std::optional<bool> llamacpp_kv_k_q4_allowed;
+    std::optional<bool> llamacpp_kv_k_q4_allowed{};
     std::optional<std::string> llamacpp_flash_attention;
     std::optional<std::int32_t> llamacpp_threads;
     std::optional<bool> llamacpp_use_mmap;
@@ -60,7 +60,7 @@ struct BackendSetup {
     std::optional<std::string> llamacpp_mmproj_path;
     std::optional<SwaKvMode> llamacpp_swa_kv_mode;
     // llama.cpp: run the post-load greedy smoke test (default off).
-    std::optional<bool> llamacpp_startup_smoke_test;
+    std::optional<bool> llamacpp_startup_smoke_test{};
     // MOCK backend: artificial per-token latency.
     std::chrono::microseconds mock_token_delay{0};
     // MOCK backend: >= 0 injects a backend error after that many tokens
@@ -204,15 +204,15 @@ struct BackendSetup {
     // load_ollama_cloud_config() (docs/integration/ollama-cloud.md). Mirrors
     // are kept here so config loading does not need the optional backend
     // header. The API key itself is never stored here, only where it lives.
-    std::string ollama_cloud_config;     // path of the loaded file
-    std::string ollama_cloud_base_url;   // empty = https://ollama.com
-    std::string ollama_cloud_api_key_env;   // variable NAME, e.g. OLLAMA_API_KEY
-    std::string ollama_cloud_api_key_file;  // path of a file holding only the key
-    std::vector<std::string> ollama_cloud_models;  // the cloud allowlist
+    std::string ollama_cloud_config{};     // path of the loaded file
+    std::string ollama_cloud_base_url{};   // empty = https://ollama.com
+    std::string ollama_cloud_api_key_env{};   // variable NAME, e.g. OLLAMA_API_KEY
+    std::string ollama_cloud_api_key_file{};  // path of a file holding only the key
+    std::vector<std::string> ollama_cloud_models{};  // the cloud allowlist
     std::uint64_t ollama_cloud_connect_timeout_ms = 10000;
     std::uint64_t ollama_cloud_request_timeout_ms = 900000;
     std::uint64_t ollama_cloud_idle_timeout_ms = 120000;
-    std::string ollama_cloud_ca_bundle_path;
+    std::string ollama_cloud_ca_bundle_path{};
     // "allow_custom_endpoint": a base_url other than https://ollama.com (port
     // 443) is refused unless this is true; the key is sent to that host.
     bool ollama_cloud_allow_custom_endpoint = false;

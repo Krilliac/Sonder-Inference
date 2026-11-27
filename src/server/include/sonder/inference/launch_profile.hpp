@@ -76,7 +76,7 @@ struct LaunchProfile {
     // llamacpp only: exact ggml device allowlist for this model (e.g. ["CUDA0"]); names are matched
     // case-insensitively by the backend. Needs n_gpu_layers != 0 (the model then runs on gpu:0).
     // llamaserver profiles use 'device' instead.
-    std::vector<std::string> devices;
+    std::vector<std::string> devices{};
     std::optional<std::int32_t> main_gpu;        // -mg/--main-gpu (>= 0)
     std::optional<std::string> split_mode;       // -sm/--split-mode: none, layer or row
     std::vector<double> tensor_split;            // -ts/--tensor-split: positive finite weights (<= 16 GPUs)
@@ -96,7 +96,7 @@ struct LaunchProfile {
     // opts in only for qualified SWA architectures with rollback guarding.
     std::optional<SwaKvMode> swa_kv_mode;
     // Direct llamacpp backend only: run the post-load greedy smoke test (default off).
-    std::optional<bool> startup_smoke_test;
+    std::optional<bool> startup_smoke_test{};
     // KV cache and flash attention: the llamacpp backend's option names and
     // values (LlamaCppBackendOptions::kv_cache_type_k/_v, flash_attention).
     // llamaserver profiles also accept f8_e4m3, q2_0 and pq2_0m.
