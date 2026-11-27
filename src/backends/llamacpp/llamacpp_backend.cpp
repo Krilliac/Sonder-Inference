@@ -382,11 +382,16 @@ llama_context_params MakeContextParams(const LoadOptions& options, bool swa_comp
         // Long-horizon n-gram / suffix speculation uses zero GPU rollback slots.
         uint32_t rs_need = 0;
         if (planned_spec == SpeculativeType::kDraftMtp) {
-            rs_need = planned_draft_max;
-        } else if (planned_spec == SpeculativeType::kAuto || options.spec_may_use_mtp) {
-            const uint32_t cap_ref =
-                options.spec_draft_max > 0 ? static_cast<uint32_t>(options.spec_draft_max) : planned_draft_max;
-            rs_need = cap_ref > 0 ? std::min<uint32_t>(cap_ref, 8u) : static_cast<uint32_t>(kDefaultMtpDraftMax);
+            rs_need = options.spec_draft_max > 0 ? static_cast<uint32_t>(options.spec_draft_max)
+                                                 : static_cast<uint32_t>(kDefaultMtpDraftMax);
+        } else if (planned_spec == SpeculativeType::kAuto) {
+            rs_need = options.spec_draft_max > 0
+                          ? std::min<uint32_t>(static_cast<uint32_t>(options.spec_draft_max), 8u)
+                          : static_cast<uint32_t>(kDefaultMtpDraftMax);
+        }
+        if (options.spec_may_use_mtp && options.spec_mtp_route_draft > 0) {
+            rs_need = std::max<uint32_t>(
+                rs_need, std::min<uint32_t>(static_cast<uint32_t>(options.spec_mtp_route_draft), 8u));
         }
         const uint32_t n_batch_eff =
             options.n_ctx > 0 ? std::min(options.n_batch, options.n_ctx) : options.n_batch;
@@ -407,10 +412,7 @@ llama_context_params MakeContextParams(const LoadOptions& options, bool swa_comp
             options.spec_may_use_mtp) {
             max_burst = std::max<uint32_t>(max_burst, static_cast<uint32_t>(SuffixMatcher::kHybridMtpMaxBurstDraft));
         }
-        const SpecSlotAdvice slot_advice =
-            AdviseSpecSlots(cp.n_seq_max, static_cast<std::int32_t>(max_burst), cp.n_batch, /*max_spec_slots=*/0);
-        const uint32_t per_seq =
-            std::min<uint32_t>(cp.n_batch, std::max<uint32_t>(1u, static_cast<uint32_t>(slot_advice.n_max) + 1u));
+        const uint32_t per_seq = std::min<uint32_t>(cp.n_batch, std::max<uint32_t>(1u, max_burst + 1u));
         cp.n_outputs_max_per_seq = per_seq;
         cp.n_outputs_max = std::min<uint32_t>(cp.n_batch, cp.n_seq_max * per_seq);
     }
@@ -442,6 +444,13 @@ ContextParamsSummary Summarize(const llama_context_params& cp) {
 #endif
 #if defined(SONDER_LLAMACPP_HAS_MOE_CACHE_SIZE)
     s.moe_cache_size = static_cast<std::uint64_t>(cp.moe_cache_size);
+#endif
+#if defined(SONDER_LLAMACPP_HAS_N_RS_SEQ)
+    s.n_rs_seq = cp.n_rs_seq;
+#endif
+#if defined(SONDER_LLAMACPP_HAS_N_OUTPUTS_MAX)
+    s.n_outputs_max_per_seq = cp.n_outputs_max_per_seq;
+    s.n_outputs_max = cp.n_outputs_max;
 #endif
     return s;
 }
@@ -726,6 +735,7 @@ struct LlamaCppBackend::Impl {
     bool mtp_chain_heads = false;
     std::vector<SamplerPtr> mtp_samplers;
     std::vector<llama_sampler*> mtp_backend_chains;
+    std::vector<std::uint8_t> mtp_backend_chain_attached;
     std::vector<std::vector<float>> mtp_pending_h;
     std::vector<float> mtp_chain_h;
     struct MtpDeferred {
@@ -908,6 +918,7 @@ struct LlamaCppBackend::Impl {
             mtp_backend_chains[i] = nullptr;
         }
         mtp_backend_chains.clear();
+        mtp_backend_chain_attached.clear();
         mtp_samplers.clear();
         if (dft_batch_allocated) {
             if (dft_batch.token != nullptr) {
@@ -1877,6 +1888,7 @@ struct LlamaCppBackend::Impl {
         const std::size_t n_slots = slots.size();
         mtp_samplers.resize(n_slots);
         mtp_backend_chains.assign(n_slots, nullptr);
+        mtp_backend_chain_attached.assign(n_slots, 0u);
         for (std::size_t i = 0; i < n_slots; ++i) {
             SamplerPtr s(llama_sampler_chain_init(llama_sampler_chain_default_params()));
             llama_sampler_chain_add(s.get(), llama_sampler_init_greedy());
@@ -1889,6 +1901,7 @@ struct LlamaCppBackend::Impl {
                 bchain = nullptr;
             }
             mtp_backend_chains[i] = bchain;
+            mtp_backend_chain_attached[i] = (bchain != nullptr) ? 1u : 0u;
 #endif
         }
 
@@ -2093,11 +2106,26 @@ struct LlamaCppBackend::Impl {
     // Returns false if draft KV synchronization was lost (caller must disable MTP
     // on this slot until the slot is reset).
     bool MtpDraft(llama_seq_id slot_id, Token id_last, int64_t n_past, int32_t max_draft,
-                  std::vector<Token>& draft_out) {
+                  std::vector<Token>& draft_out, double p_min = 0.0) {
         draft_out.clear();
         if (ctx_dft == nullptr || max_draft <= 0) return true;
         const auto sidx = static_cast<std::size_t>(slot_id);
         if (sidx >= slots.size()) return false;
+        const bool check_p_min = std::isfinite(p_min) && p_min > 0.0;
+#if defined(SONDER_LLAMACPP_HAS_SET_SAMPLER)
+        if (sidx < mtp_backend_chain_attached.size()) {
+            if (check_p_min && mtp_backend_chain_attached[sidx] != 0u) {
+                // Detach GPU backend sampler while p_min > 0 so CPU logits are populated for softmax gating.
+                (void)llama_set_sampler(ctx_dft, slot_id, nullptr);
+                mtp_backend_chain_attached[sidx] = 0u;
+            } else if (!check_p_min && mtp_backend_chain_attached[sidx] == 0u &&
+                       mtp_backend_chains[sidx] != nullptr) {
+                if (llama_set_sampler(ctx_dft, slot_id, mtp_backend_chains[sidx])) {
+                    mtp_backend_chain_attached[sidx] = 1u;
+                }
+            }
+        }
+#endif
 
         const int32_t limit = mtp_chain_heads ? std::min(max_draft, mtp_n_layers) : max_draft;
         const std::size_t row_bytes = static_cast<std::size_t>(mtp_n_embd) * sizeof(float);
@@ -2157,12 +2185,21 @@ struct LlamaCppBackend::Impl {
 
             Token id = LLAMA_TOKEN_NULL;
 #if defined(SONDER_LLAMACPP_HAS_SET_SAMPLER)
-            if (mtp_backend_chains[sidx] != nullptr) {
+            if (!check_p_min && sidx < mtp_backend_chain_attached.size() && mtp_backend_chain_attached[sidx] != 0u) {
                 id = llama_get_sampled_token_ith(ctx_dft, i_last);
             }
 #endif
             if (id == LLAMA_TOKEN_NULL) {
                 id = llama_sampler_sample(mtp_samplers[sidx].get(), ctx_dft, i_last);
+            }
+            if (check_p_min) {
+                const float* logits = llama_get_logits_ith(ctx_dft, i_last);
+                const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+                if (logits == nullptr || n_vocab <= 0 ||
+                    !DraftTokenPassesPMin(std::span<const float>(logits, static_cast<std::size_t>(n_vocab)), id,
+                                          p_min)) {
+                    break;
+                }
             }
             draft_out.push_back(id);
             if (llama_vocab_is_eog(vocab, id)) break;
@@ -2678,6 +2715,7 @@ SpeculativeLoadInfo LlamaCppBackend::GetSpeculativeInfo() const {
     info.draft_identity = impl_->load_draft_identity;
     info.mtp_model_supported = impl_->mtp_model_supported;
     info.l2_cache_enabled = impl_->radix_cache.enabled();
+    info.ctx_outputs_max_per_seq = impl_->ctx_outputs_max_per_seq;
 #if defined(SONDER_LLAMACPP_HAS_N_RS_SEQ)
     if (impl_->ctx != nullptr && impl_->architecture == sonder::inference::ModelArchitecture::hybrid) {
         info.hybrid_rs_cap = static_cast<std::int32_t>(llama_n_rs_seq(impl_->ctx));
@@ -4429,7 +4467,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                 }
                 if (!step_used_suffix) {
                     const auto k_lim = static_cast<int32_t>(std::min<int64_t>(max_k, effective_draft_max));
-                    if (!MtpDraft(slot_id, cur_tok, pos, k_lim, draft_tokens)) {
+                    if (!MtpDraft(slot_id, cur_tok, pos, k_lim, draft_tokens, request.spec_p_min)) {
                         if (cancelled()) return finish(StopReason::kCancelled);
                         use_mtp = false;
                         use_hybrid_suffix = false;
@@ -6097,7 +6135,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     }
                     if (!step_used_suffix) {
                         const auto k_lim = static_cast<int32_t>(std::min<int64_t>(max_k, s.effective_draft_max));
-                        if (!MtpDraft(s.slot_id, s.cur_tok, s.pos, k_lim, draft_tokens)) {
+                        if (!MtpDraft(s.slot_id, s.cur_tok, s.pos, k_lim, draft_tokens, s.task->req->spec_p_min)) {
                             active_cancel = nullptr;
                             if (s.IsCancelled()) {
                                 finish_slot(s, StopReason::kCancelled);

@@ -24,6 +24,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -194,7 +195,9 @@ struct SpecPolicy {
     std::int32_t n_max = 0;  // 0 = DefaultSpecDraftMax(mode) after Resolve()
     // Minimum draft-token probability threshold (llama.cpp v1.0.0
     // common_params_speculative_draft::p_min, common/common.h:347, enforced in
-    // common/speculative.cpp:421, 871, 1411, 1505, 1941 for model drafters).
+    // common/speculative.cpp:421, 871 and in LlamaCppBackend::Impl::MtpDraft).
+    // Valid only for model-based strategies (draft-model, draft-mtp, or auto_base
+    // when resolving to MTP); p_min > 0 is rejected for history-based strategies.
     double p_min = 0.0;
 };
 
@@ -230,6 +233,10 @@ struct SpecAcceptanceConfig {
     std::int64_t reprobe_initial_ms = 30'000;
     std::int64_t reprobe_max_ms = 15 * 60 * 1000;
     double backoff_factor = 2.0;
+    // Safety-net timeout on an in-flight probe: if a probe owner never reports
+    // completion within this window, Decide() reclaims ownership so speculation
+    // cannot stay permanently locked out.
+    std::int64_t probe_timeout_ms = 60'000;
 };
 
 struct SpecControllerConfig {
@@ -271,6 +278,10 @@ struct SpecControllerConfig {
 
     // Largest draft length (n_max) that any configured base, class, or route rule can request (0 if all none).
     [[nodiscard]] std::int32_t MaxPlannedDraft() const noexcept;
+
+    // Largest draft length (n_max) requested specifically by class/route rules targeting kDraftMtp
+    // (0 when deterministic or when no class/route rule selects kDraftMtp).
+    [[nodiscard]] std::int32_t MaxMtpRouteDraft() const noexcept;
 };
 
 // One config rule as `<selector>=<policy>`:
@@ -302,6 +313,9 @@ struct SpecModelCaps {
     sonder::inference::ModelArchitecture architecture = sonder::inference::ModelArchitecture::attention_only;
     std::int32_t hybrid_rs_cap = 0;      // llama_n_rs_seq(ctx) on hybrid models; see CheckArchitectureSpecGuard
     bool can_hybrid_spec_ckpt = false;   // partial recurrent checkpoints available for hybrid rollback
+    // Loaded context's per-sequence output row limit (cp.n_outputs_max_per_seq; 0 = unknown/unbounded).
+    // Decide() clamps n_max to ctx_outputs_max_per_seq - 1 when > 0.
+    std::int32_t ctx_outputs_max_per_seq = 0;
 };
 
 struct SpecRequestContext {
@@ -312,10 +326,6 @@ struct SpecRequestContext {
     // OR-ed with config.deterministic.
     bool deterministic = false;
     SpecModelCaps caps;
-    // Loaded slot count (-np) and physical batch size (n_batch). When n_batch > 0,
-    // Decide() applies AdviseSpecSlots()'s v1.0.0 output-row bound (n_batch / n_slots - 1).
-    std::uint32_t n_slots = 1;
-    std::uint32_t n_batch = 0;
 };
 
 enum class SpecDecisionReason : std::uint8_t {
@@ -412,6 +422,11 @@ public:
     // When `probe_id` is non-zero, only cancels if it matches the currently active probe.
     void CancelProbe(std::string_view route, SpecTaskClass task, SpecStrategy mode, std::uint64_t probe_id = 0);
 
+    // Releases in-flight probe ownership when a probe request completes with zero drafted
+    // tokens (e.g. immediate EOS, max_tokens=1, stop sequence, media, or state_restored)
+    // while keeping the entry in kProbing so the next request can complete the probe.
+    void ReleaseProbe(std::string_view route, SpecTaskClass task, SpecStrategy mode, std::uint64_t probe_id = 0);
+
     // Read-only snapshot; zeroed (state kEnabled) when the entry does not exist.
     [[nodiscard]] SpecRouteStats Stats(std::string_view route, SpecTaskClass task, SpecStrategy mode) const;
 
@@ -428,6 +443,7 @@ private:
         std::uint64_t probe_accepted = 0;
         bool probe_in_flight = false;
         std::uint64_t active_probe_id = 0;
+        std::int64_t probe_started_ms = 0;
         std::uint64_t total_drafted = 0;
         std::uint64_t total_accepted = 0;
         std::uint32_t disable_count = 0;
@@ -452,6 +468,21 @@ private:
     std::uint64_t next_probe_id_ = 0;
 };
 
+// Completes one request against SpecController: observes draft counts when
+// draft_tokens > 0, cancels a failed/cancelled probe, or releases probe ownership
+// on zero-draft normal completion so probe_in_flight never leaks.
+void FinishSpecRequest(SpecController& controller, const SpecDecision& decision, std::string_view route,
+                       SpecTaskClass task, std::int32_t draft_tokens, std::int32_t draft_accepted_tokens,
+                       bool failed_or_cancelled);
+
+// Computes the numerically-stable softmax probability of `token` in `logits` (0.0 on invalid input).
+[[nodiscard]] double ComputeTopTokenProbability(std::span<const float> logits, Token token) noexcept;
+
+// Returns true when `p_min <= 0` or the softmax probability of `token` in `logits` is >= `p_min`.
+// Used by the MTP draft loop to stop drafting early when draft confidence falls below `p_min`
+// (matching llama.cpp v1.0.0 common/speculative.cpp:421, 871).
+[[nodiscard]] bool DraftTokenPassesPMin(std::span<const float> logits, Token token, double p_min) noexcept;
+
 // ---------------------------------------------------------------------------
 // Slots (-np) and draft length
 // ---------------------------------------------------------------------------
@@ -463,21 +494,17 @@ struct SpecSlotAdvice {
     bool reduced_draft = false;
 };
 
-// Slot (-np) and draft-length advice when speculation is on:
-//  * Hard limit from llama.cpp v1.0.0:
-//    - common/speculative.cpp:2903-2913 (common_speculative_get_output_limits)
-//      and tools/server/server-context.cpp:62-63 (server_output_limits) compute
-//      `per_seq = 1 + max(0, n_draft)` and `total = n_parallel * per_seq`,
-//      clamped to `n_batch`. Thus `n_draft <= n_batch / n_parallel - 1`.
-//    - common/speculative.cpp:2790, 2811 sizes draft context outputs to
-//      `n_parallel` (or `n_parallel * (n_max + 1)` for block drafters), and
-//      tools/server/server-context.cpp:1496 passes `n_parallel` to
-//      `common_speculative_init`. v1.0.0 does NOT hard-forbid `n_parallel > 1`,
-//      but large `-np` shrinks `n_batch / n_parallel` and divides shared KV.
-//  * Policy limit from SI (speculation_transition.hpp:570-580,
-//    ConcurrentSpecPolicy::max_concurrent_slots = 4): keep `-np` small (<= 4 by
-//    default) when speculation is on so verification cost does not regress.
-//    `max_spec_slots == 0` disables the policy cap.
+// Opt-in SI concurrent small-batch slot (-np) and per-slot draft-length sizing helper:
+//  * llama.cpp v1.0.0 (common/speculative.cpp:2903-2911, common_speculative_get_output_limits;
+//    tools/server/server-context.cpp:62-63, 1486-1496) computes
+//    `per_seq = min(n_batch, 1 + n_draft)` and `total = min(n_batch, n_parallel * per_seq)`.
+//    v1.0.0 clamps the aggregate total and does NOT require `n_draft <= n_batch / n_parallel - 1`
+//    for single-slot decode.
+//  * SI's opt-in concurrent small-batch policy (speculation_transition.hpp:570-580,
+//    ConcurrentSpecPolicy::max_concurrent_slots = 4) keeps `-np` small (<= 4 by default) when
+//    all slots speculate simultaneously in one verify batch, and bounds per-slot drafts to
+//    `n_batch / n_parallel - 1` when sharing a single `n_batch` across all `n_parallel` slots.
+//    `max_spec_slots == 0` disables the slot cap.
 // With n_max <= 0 only the "at least one slot" floor applies.
 // `n_batch == 0` means "unknown, do not clamp n_max".
 [[nodiscard]] SpecSlotAdvice AdviseSpecSlots(

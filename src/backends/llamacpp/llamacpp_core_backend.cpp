@@ -806,6 +806,7 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     }
     lo.spec_may_use_mtp = spec_cfg.MayUseMtp();
     lo.spec_max_route_draft = spec_cfg.MaxPlannedDraft();
+    lo.spec_mtp_route_draft = spec_cfg.MaxMtpRouteDraft();
     return Status::success();
 }
 
@@ -821,12 +822,11 @@ public:
     LlamaCppModel(ModelDescriptor desc, lc::LlamaCppBackend runtime, double load_ms, std::uint32_t slots,
                   std::shared_ptr<RuntimeState> runtime_state = nullptr, std::uint64_t runtime_model_id = 0,
                   std::shared_ptr<lc::SpecController> spec_controller = nullptr,
-                  lc::SpecModelCaps spec_caps = {}, std::uint32_t batch_size = 0)
+                  lc::SpecModelCaps spec_caps = {})
         : desc_(std::move(desc)),
           runtime_(std::move(runtime)),
           load_ns_(MsToNs(load_ms)),
           slots_(std::max<std::uint32_t>(1u, slots)),
-          batch_size_(batch_size),
           runtime_state_(std::move(runtime_state)),
           runtime_model_id_(runtime_model_id),
           spec_controller_(std::move(spec_controller)),
@@ -1210,8 +1210,6 @@ private:
             sctx.route = desc_.name;
             sctx.task = spec_task;
             sctx.caps = spec_caps_;
-            sctx.n_slots = slots_;
-            sctx.n_batch = batch_size_;
             spec_decision = spec_controller_->Decide(sctx);
             if (const auto st = lc::ToSpeculativeType(spec_decision.mode); st.has_value()) {
                 req.spec_override = *st;
@@ -1373,14 +1371,10 @@ private:
             }
         }
 
-        if (spec_controller_ && spec_controller_active_ && spec_decision.mode != lc::SpecStrategy::kNone) {
-            if (r.draft_tokens > 0) {
-                spec_controller_->Observe(desc_.name, spec_task, spec_decision.mode,
-                                          static_cast<std::uint32_t>(r.draft_tokens),
-                                          static_cast<std::uint32_t>(std::max<std::int32_t>(0, r.draft_accepted_tokens)));
-            } else if (spec_decision.is_probe && (!r.status.ok() || r.stop_reason == lc::StopReason::kCancelled)) {
-                spec_controller_->CancelProbe(desc_.name, spec_task, spec_decision.mode, spec_decision.probe_id);
-            }
+        if (spec_controller_ && spec_controller_active_) {
+            lc::FinishSpecRequest(*spec_controller_, spec_decision, desc_.name, spec_task, r.draft_tokens,
+                                  r.draft_accepted_tokens,
+                                  !r.status.ok() || r.stop_reason == lc::StopReason::kCancelled);
         }
 
         llamacpp_detail::PopulateGenerateStats(r, req.restore_tokens, load_ns_, stats);
@@ -1447,7 +1441,6 @@ private:
     lc::LlamaCppBackend runtime_;
     std::uint64_t load_ns_ = 0;
     std::uint32_t slots_ = 1;
-    std::uint32_t batch_size_ = 0;
     std::shared_ptr<RuntimeState> runtime_state_;
     std::uint64_t runtime_model_id_ = 0;
     std::shared_ptr<lc::SpecController> spec_controller_;
@@ -1622,9 +1615,10 @@ public:
         spec_caps.architecture = d.architecture;
         spec_caps.hybrid_rs_cap = spec_info.hybrid_rs_cap;
         spec_caps.can_hybrid_spec_ckpt = spec_info.can_hybrid_spec_ckpt;
+        spec_caps.ctx_outputs_max_per_seq = spec_info.ctx_outputs_max_per_seq;
         return std::shared_ptr<BackendModel>(std::make_shared<LlamaCppModel>(
             std::move(d), std::move(runtime), load_ms, loaded_slots, runtime_state_, model_id, spec_controller_,
-            spec_caps, lo.n_batch));
+            spec_caps));
     }
 
 private:

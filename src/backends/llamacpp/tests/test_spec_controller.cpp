@@ -154,9 +154,9 @@ TEST_CASE("spec controller: classifies SI GenerateRequest and ChatRequest direct
 }
 
 TEST_CASE("spec controller: policy overlay parsing") {
-    const SpecPolicyOverlay a = Parse("suffix,n_max=16,p_min=0.5");
-    CHECK(a.mode == SpecStrategy::kSuffix);
-    CHECK(a.n_max == 16);
+    const SpecPolicyOverlay a = Parse("draft-mtp,n_max=3,p_min=0.5");
+    CHECK(a.mode == SpecStrategy::kDraftMtp);
+    CHECK(a.n_max == 3);
     REQUIRE(a.p_min.has_value());
     CHECK(*a.p_min == doctest::Approx(0.5));
 
@@ -720,7 +720,7 @@ TEST_CASE("spec controller: tracked entries are bounded (LRU)") {
     CHECK(ctl.Stats(huge, T, M).total_drafted == 8);
 }
 
-TEST_CASE("spec controller: slot (-np) and draft advice from v1.0.0 output-row limits") {
+TEST_CASE("spec controller: opt-in concurrent small-batch slot (-np) and draft advice") {
     // Speculation off: nothing changes.
     SpecSlotAdvice a = AdviseSpecSlots(8, 0, 512, 4);
     CHECK(a.n_parallel == 8);
@@ -740,8 +740,9 @@ TEST_CASE("spec controller: slot (-np) and draft advice from v1.0.0 output-row l
     CHECK(a.n_parallel == 8);
     CHECK_FALSE(a.reduced_slots);
 
-    // llama.cpp v1.0.0 needs n_parallel * (1 + n_draft) output rows per decode, bounded by n_batch
-    // (common_speculative_get_output_limits). 4 slots * (1 + 16) = 68 > 64 rows: n_max drops to 15.
+    // Opt-in SI concurrent small-batch sizing: when all n_parallel slots share one n_batch verify pass,
+    // n_parallel * (1 + n_draft) <= n_batch gives n_draft <= n_batch / n_parallel - 1.
+    // 4 slots * (1 + 16) = 68 > 64 rows: n_max drops to 15.
     a = AdviseSpecSlots(4, 16, 64, 4);
     CHECK(a.n_parallel == 4);
     CHECK(a.n_max == 15);
@@ -792,19 +793,18 @@ TEST_CASE("spec controller: route MTP hint, max planned draft, and ModelParamsFo
     CHECK(LlamaCppBackend::ModelParamsFor(lo).load_mtp == LlamaCppBackend::HasMtpBuildSupport());
 }
 
-TEST_CASE("spec controller: Decide enforces v1.0.0 batch output-row bound via AdviseSpecSlots") {
+TEST_CASE("spec controller: Decide clamps draft length to real ctx_outputs_max_per_seq") {
     FakeClock clk;
     SpecController ctl(BaseConfig(SpecStrategy::kSuffix, 16), clk.fn());
 
     SpecRequestContext c = Ctx("r", SpecTaskClass::kCode);
-    c.n_slots = 4;
-    c.n_batch = 64;  // 4 * (1 + 15) = 64 => clamps 16 down to 15
+    c.caps.ctx_outputs_max_per_seq = 16;  // 16 output rows per seq => at most 15 draft tokens
     SpecDecision d = ctl.Decide(c);
     CHECK(d.mode == SpecStrategy::kSuffix);
     CHECK(d.n_max == 15);
     CHECK(d.reason == SpecDecisionReason::kConfigured);
 
-    c.n_batch = 4;  // 4 / 4 - 1 = 0 => cannot fit any draft token per slot
+    c.caps.ctx_outputs_max_per_seq = 1;  // only the target token fits
     d = ctl.Decide(c);
     CHECK(d.mode == SpecStrategy::kNone);
     CHECK(d.n_max == 0);
@@ -864,4 +864,187 @@ TEST_CASE("spec controller: NgramModTable Configure updates per-request draft bo
     table.Configure(8, 8);
     CHECK(table.n_min() == 8);
     CHECK(table.n_max() == 8);
+}
+
+TEST_CASE("spec controller: intake #1 zero-draft probe completion and timeout never leak probe ownership") {
+    FakeClock clk;
+    auto cfg = BaseConfig(SpecStrategy::kSuffix, 8);
+    cfg.acceptance.probe_timeout_ms = 5000;
+    SpecController ctl(cfg, clk.fn());
+    const auto ctx = Ctx("r", SpecTaskClass::kChat);
+    const auto T = SpecTaskClass::kChat;
+    const auto M = SpecStrategy::kSuffix;
+
+    // 1. Disable route, advance past backoff, start probe.
+    ctl.Observe("r", T, M, 16, 0);
+    clk.now_ms += 1000;
+    const SpecDecision p1 = ctl.Decide(ctx);
+    REQUIRE(p1.is_probe);
+    REQUIRE(p1.probe_id > 0);
+
+    // 2. Probe request succeeds with 0 drafted tokens (immediate EOS, max_tokens=1, media, etc.):
+    //    FinishSpecRequest must release ownership so the very next Decide() can probe immediately.
+    FinishSpecRequest(ctl, p1, "r", T, /*draft_tokens=*/0, /*draft_accepted_tokens=*/0, /*failed_or_cancelled=*/false);
+    const SpecDecision p2 = ctl.Decide(ctx);
+    CHECK(p2.mode == SpecStrategy::kSuffix);
+    CHECK(p2.is_probe);
+    CHECK(p2.probe_id > p1.probe_id);
+    CHECK(ctl.Stats("r", T, M).probe_count == 1);  // same probe, not a new backoff cycle
+
+    // 3. Even if a caller never calls FinishSpecRequest at all, probe_timeout_ms reclaims ownership.
+    clk.now_ms += 4999;
+    CHECK(ctl.Decide(ctx).reason == SpecDecisionReason::kAcceptanceDisabled);
+    clk.now_ms += 1;  // now_ms - probe_started_ms == 5000 >= probe_timeout_ms
+    const SpecDecision p3 = ctl.Decide(ctx);
+    CHECK(p3.mode == SpecStrategy::kSuffix);
+    CHECK(p3.is_probe);
+    CHECK(p3.probe_id > p2.probe_id);
+
+    // 4. Probe succeeds with full acceptance and re-enables speculation.
+    FinishSpecRequest(ctl, p3, "r", T, /*draft_tokens=*/16, /*draft_accepted_tokens=*/16, /*failed_or_cancelled=*/false);
+    CHECK(ctl.Stats("r", T, M).state == SpecAcceptanceState::kEnabled);
+    CHECK(ctl.Decide(ctx).mode == SpecStrategy::kSuffix);
+}
+
+TEST_CASE("spec controller: intake #2 MakeContextParams n_rs_seq unchanged without rules, scales only on MTP rules") {
+#if defined(SONDER_LLAMACPP_HAS_N_RS_SEQ)
+    // spec_type=auto with spec_draft_max=0 and no route rules must keep n_rs_seq == kDefaultMtpDraftMax (3),
+    // NOT min(kDefaultNgramModDraftMax, 8) == 8.
+    {
+        LoadOptions lo;
+        lo.spec_type = "auto";
+        lo.spec_draft_max = 0;
+        lo.spec_may_use_mtp = true;
+        lo.spec_max_route_draft = kDefaultNgramModDraftMax;
+        lo.spec_mtp_route_draft = 0;
+        CHECK(LlamaCppBackend::ContextParamsFor(lo).n_rs_seq == static_cast<std::uint32_t>(kDefaultMtpDraftMax));
+    }
+    // spec_type=draft-mtp with spec_draft_max=0 and no route rules => n_rs_seq == 3.
+    {
+        LoadOptions lo;
+        lo.spec_type = "draft-mtp";
+        lo.spec_draft_max = 0;
+        lo.spec_may_use_mtp = true;
+        CHECK(LlamaCppBackend::ContextParamsFor(lo).n_rs_seq == static_cast<std::uint32_t>(kDefaultMtpDraftMax));
+    }
+    // spec_type=none with no route rules => n_rs_seq == 0.
+    {
+        LoadOptions lo;
+        lo.spec_type = "none";
+        CHECK(LlamaCppBackend::ContextParamsFor(lo).n_rs_seq == 0u);
+    }
+    // Route-level MTP rule (n_max=5) alongside a large ngram-mod rule (n_max=64) sizes n_rs_seq from MTP (5), not 64.
+    {
+        si::LlamaCppBackendOptions bo;
+        bo.spec_type = "none";
+        bo.spec_route_rules = {"code=ngram-mod,n_max=64", "chat=draft-mtp,n_max=5"};
+        SpecControllerConfig cfg;
+        std::string err;
+        REQUIRE(BuildSpecControllerConfig(bo, cfg, err));
+        CHECK(cfg.MayUseMtp());
+        CHECK(cfg.MaxMtpRouteDraft() == 5);
+
+        LoadOptions lo;
+        lo.spec_type = "none";
+        lo.spec_may_use_mtp = cfg.MayUseMtp();
+        lo.spec_max_route_draft = cfg.MaxPlannedDraft();
+        lo.spec_mtp_route_draft = cfg.MaxMtpRouteDraft();
+        CHECK(LlamaCppBackend::ContextParamsFor(lo).n_rs_seq == 5u);
+    }
+    // Base spec_type=draft-mtp (spec_draft_max=0) + non-MTP route rule (ngram-mod, n_max=64)
+    // must keep n_rs_seq == kDefaultMtpDraftMax (3), NOT inflate to 64.
+    {
+        si::LlamaCppBackendOptions bo;
+        bo.spec_type = "draft-mtp";
+        bo.spec_draft_max = 0;
+        bo.spec_route_rules = {"code=ngram-mod,n_max=64"};
+        SpecControllerConfig cfg;
+        std::string err;
+        REQUIRE(BuildSpecControllerConfig(bo, cfg, err));
+        CHECK(cfg.MayUseMtp());
+        CHECK(cfg.MaxPlannedDraft() == 64);
+        CHECK(cfg.MaxMtpRouteDraft() == 0);
+
+        LoadOptions lo;
+        lo.spec_type = "draft-mtp";
+        lo.spec_draft_max = 0;
+        lo.spec_may_use_mtp = cfg.MayUseMtp();
+        lo.spec_max_route_draft = cfg.MaxPlannedDraft();
+        lo.spec_mtp_route_draft = cfg.MaxMtpRouteDraft();
+        CHECK(LlamaCppBackend::ContextParamsFor(lo).n_rs_seq == static_cast<std::uint32_t>(kDefaultMtpDraftMax));
+    }
+#endif
+}
+
+TEST_CASE("spec controller: intake #3 MakeContextParams and Decide do not divide n_batch by n_slots") {
+#if defined(SONDER_LLAMACPP_HAS_N_OUTPUTS_MAX)
+    // Existing config: n_slots=16, n_batch=512, ngram-mod (draft 64).
+    // v1.0.0 common_speculative_get_output_limits gives per_seq = min(512, 65) = 65 and total = min(512, 16*65) = 512.
+    LoadOptions lo;
+    lo.n_slots = 16;
+    lo.n_batch = 512;
+    lo.spec_type = "ngram-mod";
+    const ContextParamsSummary cs = LlamaCppBackend::ContextParamsFor(lo);
+    CHECK(cs.n_outputs_max_per_seq == 65u);
+    CHECK(cs.n_outputs_max == 512u);
+#endif
+
+    // Decide clamps n_max only against the real per-seq output cap (ctx_outputs_max_per_seq - 1),
+    // NOT n_batch / n_slots - 1.
+    FakeClock clk;
+    SpecController ctl(BaseConfig(SpecStrategy::kNgramMod, 64), clk.fn());
+    SpecRequestContext c = Ctx("r", SpecTaskClass::kCode);
+    c.caps.ctx_outputs_max_per_seq = 65;
+    SpecDecision d = ctl.Decide(c);
+    CHECK(d.mode == SpecStrategy::kNgramMod);
+    CHECK(d.n_max == 64);
+
+    // When the real context per-seq cap is smaller (e.g. 9 rows -> max 8 draft tokens), Decide clamps to 8.
+    c.caps.ctx_outputs_max_per_seq = 9;
+    d = ctl.Decide(c);
+    CHECK(d.mode == SpecStrategy::kNgramMod);
+    CHECK(d.n_max == 8);
+
+    // When per-seq cap is 1 (only the target token fits), speculation is disabled cleanly.
+    c.caps.ctx_outputs_max_per_seq = 1;
+    d = ctl.Decide(c);
+    CHECK(d.mode == SpecStrategy::kNone);
+    CHECK(d.reason == SpecDecisionReason::kBatchOutputLimit);
+}
+
+TEST_CASE("spec controller: intake #4 p_min rejected for non-model strategies and enforced on draft logits") {
+    // 1. Validate() and ParseSpecPolicyOverlay() reject p_min > 0 on strategies that cannot apply it.
+    {
+        auto cfg = BaseConfig(SpecStrategy::kSuffix, 16);
+        cfg.base.p_min = 0.5;
+        CHECK_FALSE(cfg.Validate().empty());
+    }
+    {
+        SpecPolicyOverlay o;
+        std::string err;
+        CHECK_FALSE(ParseSpecPolicyOverlay("ngram-mod,n_max=16,p_min=0.4", o, err));
+        CHECK_FALSE(err.empty());
+        CHECK_FALSE(ParseSpecPolicyOverlay("suffix,p_min=0.1", o, err));
+        CHECK(ParseSpecPolicyOverlay("suffix,n_max=16,p_min=0", o, err));
+        CHECK(ParseSpecPolicyOverlay("draft-mtp,n_max=3,p_min=0.6", o, err));
+        CHECK(ParseSpecPolicyOverlay("draft-model,n_max=4,p_min=0.7", o, err));
+    }
+    // 2. Softmax probability & p_min early-stop gate used by MtpDraft.
+    // Logits {2.0, 0.0, 0.0}: p(0) = e^2 / (e^2 + 2) ~= 0.786986
+    const float confident_logits[3] = {2.0F, 0.0F, 0.0F};
+    CHECK(ComputeTopTokenProbability(confident_logits, 0) == doctest::Approx(0.786986).epsilon(1e-4));
+    CHECK(DraftTokenPassesPMin(confident_logits, 0, 0.0));
+    CHECK(DraftTokenPassesPMin(confident_logits, 0, 0.75));
+    CHECK_FALSE(DraftTokenPassesPMin(confident_logits, 0, 0.85));  // stops draft early when p < p_min
+
+    // Uniform logits {1.0, 1.0, 1.0, 1.0}: p(0) = 0.25
+    const float flat_logits[4] = {1.0F, 1.0F, 1.0F, 1.0F};
+    CHECK(ComputeTopTokenProbability(flat_logits, 0) == doctest::Approx(0.25));
+    CHECK(DraftTokenPassesPMin(flat_logits, 0, 0.25));
+    CHECK_FALSE(DraftTokenPassesPMin(flat_logits, 0, 0.26));
+
+    // Invalid token index or empty logits fails closed when p_min > 0.
+    CHECK_FALSE(DraftTokenPassesPMin(flat_logits, -1, 0.1));
+    CHECK_FALSE(DraftTokenPassesPMin(flat_logits, 4, 0.1));
+    CHECK_FALSE(DraftTokenPassesPMin({}, 0, 0.1));
 }

@@ -222,6 +222,7 @@ struct LoadOptions {
     // even when base spec_type is "none" or another strategy.
     bool spec_may_use_mtp = false;
     std::int32_t spec_max_route_draft = 0;
+    std::int32_t spec_mtp_route_draft = 0;
     // Verification policy for speculative decoding (TargetMatch default vs
     // opt-in StochasticRejection when a stochastic proposer supplies real q).
     SpeculativeVerificationMode spec_verification_mode = SpeculativeVerificationMode::TargetMatch;
@@ -300,6 +301,9 @@ struct ContextParamsSummary {
     bool op_offload = false;
     bool swa_full = true;
     std::uint64_t moe_cache_size = 0;
+    std::uint32_t n_rs_seq = 0;
+    std::uint32_t n_outputs_max_per_seq = 0;
+    std::uint32_t n_outputs_max = 0;
 };
 
 struct SamplingParams {
@@ -525,6 +529,7 @@ struct SpeculativeLoadInfo {
     bool l2_cache_enabled = false;
     std::int32_t hybrid_rs_cap = 0;
     bool can_hybrid_spec_ckpt = false;
+    std::int32_t ctx_outputs_max_per_seq = 0;
 };
 
 enum class PoolingType {

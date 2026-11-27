@@ -277,6 +277,10 @@ bool ParseSpecPolicyOverlay(std::string_view text, SpecPolicyOverlay& out, std::
         if (comma == std::string_view::npos) break;
         rest.remove_prefix(comma + 1);
     }
+    if (result.mode && !IsModelBasedSpecStrategy(*result.mode) && result.p_min && *result.p_min > 0.0) {
+        error = "p_min > 0 is only supported for model-based strategies (draft-model, draft-mtp)";
+        return false;
+    }
     out = result;
     return true;
 }
@@ -391,13 +395,23 @@ bool BuildSpecControllerConfig(const sonder::inference::LlamaCppBackendOptions& 
 
 std::string SpecControllerConfig::Validate() const {
     if (auto e = CheckOverlay({base.mode, base.n_max, base.p_min}, "base"); !e.empty()) return e;
+    if (!auto_base && !IsModelBasedSpecStrategy(base.mode) && base.p_min > 0.0) {
+        return "base: p_min > 0 is only supported for model-based strategies (draft-model, draft-mtp)";
+    }
+    const auto check_overlay_pmin = [](const SpecPolicyOverlay& o, SpecStrategy inherited_mode, bool inherited_auto,
+                                       const std::string& where) -> std::string {
+        const SpecStrategy eff_mode = o.mode.value_or(inherited_mode);
+        const bool eff_auto = !o.mode.has_value() && inherited_auto;
+        if (o.p_min && *o.p_min > 0.0 && !eff_auto && !IsModelBasedSpecStrategy(eff_mode)) {
+            return where + ": p_min > 0 is only supported for model-based strategies (draft-model, draft-mtp)";
+        }
+        return {};
+    };
     for (std::size_t i = 0; i < class_rules.size(); ++i) {
         if (class_rules[i]) {
-            if (auto e = CheckOverlay(*class_rules[i],
-                                      std::string("class ") + std::string(ToString(static_cast<SpecTaskClass>(i))));
-                !e.empty()) {
-                return e;
-            }
+            const std::string where = std::string("class ") + std::string(ToString(static_cast<SpecTaskClass>(i)));
+            if (auto e = CheckOverlay(*class_rules[i], where); !e.empty()) return e;
+            if (auto e = check_overlay_pmin(*class_rules[i], base.mode, auto_base, where); !e.empty()) return e;
         }
     }
     for (const auto& [route, rules] : routes) {
@@ -406,10 +420,25 @@ std::string SpecControllerConfig::Validate() const {
         }
         if (rules.any) {
             if (auto e = CheckOverlay(*rules.any, "route " + route); !e.empty()) return e;
+            if (auto e = check_overlay_pmin(*rules.any, base.mode, auto_base, "route " + route); !e.empty()) return e;
         }
         for (std::size_t i = 0; i < rules.by_class.size(); ++i) {
             if (rules.by_class[i]) {
-                if (auto e = CheckOverlay(*rules.by_class[i], "route " + route); !e.empty()) return e;
+                const std::string where = "route " + route;
+                if (auto e = CheckOverlay(*rules.by_class[i], where); !e.empty()) return e;
+                SpecStrategy inherited = base.mode;
+                bool inherited_auto = auto_base;
+                if (class_rules[i] && class_rules[i]->mode) {
+                    inherited = *class_rules[i]->mode;
+                    inherited_auto = false;
+                }
+                if (rules.any && rules.any->mode) {
+                    inherited = *rules.any->mode;
+                    inherited_auto = false;
+                }
+                if (auto e = check_overlay_pmin(*rules.by_class[i], inherited, inherited_auto, where); !e.empty()) {
+                    return e;
+                }
             }
         }
     }
@@ -426,6 +455,7 @@ std::string SpecControllerConfig::Validate() const {
     if (!std::isfinite(a.backoff_factor) || a.backoff_factor < 1.0 || a.backoff_factor > 16.0) {
         return "acceptance.backoff_factor must be in [1, 16]";
     }
+    if (a.probe_timeout_ms < 1) return "acceptance.probe_timeout_ms must be >= 1";
     if (max_tracked_entries < 1 || max_tracked_entries > 65536) return "max_tracked_entries must be in [1, 65536]";
     if (max_spec_slots > kMaxSlots) return "max_spec_slots must be in [0, " + std::to_string(kMaxSlots) + "]";
     return {};
@@ -501,6 +531,27 @@ std::int32_t SpecControllerConfig::MaxPlannedDraft() const noexcept {
     return best;
 }
 
+std::int32_t SpecControllerConfig::MaxMtpRouteDraft() const noexcept {
+    if (deterministic) return 0;
+    std::int32_t best = 0;
+    const auto consider = [&](std::string_view route, SpecTaskClass task) {
+        bool mode_from_rule = false;
+        const SpecPolicy p = Resolve(route, task, mode_from_rule);
+        if (mode_from_rule && p.mode == SpecStrategy::kDraftMtp) {
+            best = std::max(best, p.n_max);
+        }
+    };
+    for (std::size_t i = 0; i < kSpecTaskClassCount; ++i) {
+        const auto tc = static_cast<SpecTaskClass>(i);
+        consider({}, tc);
+        for (const auto& [route, rules] : routes) {
+            (void)rules;
+            consider(route, tc);
+        }
+    }
+    return best;
+}
+
 // --- bridge to speculation_transition.hpp & suffix_matcher.hpp -------------
 
 SlotSpecCapability BuildSlotSpecCapability(const SpecDecision& decision, const SpecModelCaps& caps,
@@ -537,6 +588,7 @@ SpecController::SpecController(SpecControllerConfig config, SpecClock clock)
     a.reprobe_max_ms = std::max(a.reprobe_max_ms, a.reprobe_initial_ms);
     if (!std::isfinite(a.backoff_factor) || a.backoff_factor < 1.0) a.backoff_factor = 1.0;
     a.backoff_factor = std::min(a.backoff_factor, 16.0);
+    a.probe_timeout_ms = std::max<std::int64_t>(a.probe_timeout_ms, 1);
     config_.max_tracked_entries = std::clamp<std::size_t>(config_.max_tracked_entries, 1, 65536);
     if (!clock_) {
         clock_ = []() {
@@ -586,6 +638,7 @@ void SpecController::EnterDisabledLocked(Entry& e, std::int64_t backoff_ms) {
     e.probe_accepted = 0;
     e.probe_in_flight = false;
     e.active_probe_id = 0;
+    e.probe_started_ms = 0;
 }
 
 SpecDecision SpecController::Decide(const SpecRequestContext& ctx) {
@@ -600,7 +653,7 @@ SpecDecision SpecController::Decide(const SpecRequestContext& ctx) {
 
     SpecDecision d;
     d.configured_mode = policy.mode;
-    d.p_min = policy.p_min;
+    d.p_min = IsModelBasedSpecStrategy(policy.mode) ? policy.p_min : 0.0;
     if (policy.mode == SpecStrategy::kNone) {
         d.reason = SpecDecisionReason::kConfiguredNone;
         d.p_min = 0.0;
@@ -635,13 +688,12 @@ SpecDecision SpecController::Decide(const SpecRequestContext& ctx) {
     }
 
     std::int32_t effective_n_max = guard.effective_draft_max;
-    if (ctx.n_batch > 0) {
-        const SpecSlotAdvice slot_advice =
-            AdviseSpecSlots(ctx.n_slots, effective_n_max, ctx.n_batch, /*max_spec_slots=*/0);
-        if (slot_advice.n_max <= 0) {
+    if (ctx.caps.ctx_outputs_max_per_seq > 0) {
+        const std::int32_t max_from_ctx = ctx.caps.ctx_outputs_max_per_seq - 1;
+        if (max_from_ctx <= 0) {
             return off(SpecDecisionReason::kBatchOutputLimit);
         }
-        effective_n_max = slot_advice.n_max;
+        effective_n_max = std::min(effective_n_max, max_from_ctx);
     }
 
     d.mode = policy.mode;
@@ -655,8 +707,9 @@ SpecDecision SpecController::Decide(const SpecRequestContext& ctx) {
     e.last_used = ++tick_;
     switch (e.state) {
         case SpecAcceptanceState::kEnabled: break;
-        case SpecAcceptanceState::kDisabled:
-            if (Now() < e.retry_at_ms) {
+        case SpecAcceptanceState::kDisabled: {
+            const std::int64_t now = Now();
+            if (now < e.retry_at_ms) {
                 return off(SpecDecisionReason::kAcceptanceDisabled);
             }
             e.state = SpecAcceptanceState::kProbing;
@@ -664,24 +717,34 @@ SpecDecision SpecController::Decide(const SpecRequestContext& ctx) {
             e.probe_accepted = 0;
             e.probe_in_flight = true;
             e.active_probe_id = ++next_probe_id_;
+            e.probe_started_ms = now;
             ++e.probe_count;
             d.is_probe = true;
             d.probe_id = e.active_probe_id;
             d.reason = SpecDecisionReason::kProbe;
             break;
-        case SpecAcceptanceState::kProbing:
+        }
+        case SpecAcceptanceState::kProbing: {
+            const std::int64_t now = Now();
             if (e.probe_in_flight) {
-                // Single-probe ownership: concurrent requests wait while one probe is in flight.
-                return off(SpecDecisionReason::kAcceptanceDisabled);
+                // Safety-net timeout: reclaim stale probe ownership if a caller never reported back.
+                if (SaturatingSubNonNeg(now, e.probe_started_ms) < config_.acceptance.probe_timeout_ms) {
+                    return off(SpecDecisionReason::kAcceptanceDisabled);
+                }
+                e.probe_in_flight = false;
+                e.active_probe_id = 0;
+                e.probe_started_ms = 0;
             }
-            // Previous probe request completed with partial evidence (< probe_drafted_tokens):
-            // grant ownership to the next request without incrementing probe_count again.
+            // Previous probe request completed with partial/zero evidence (< probe_drafted_tokens)
+            // or timed out: grant ownership to this request without incrementing probe_count again.
             e.probe_in_flight = true;
             e.active_probe_id = ++next_probe_id_;
+            e.probe_started_ms = now;
             d.is_probe = true;
             d.probe_id = e.active_probe_id;
             d.reason = SpecDecisionReason::kProbe;
             break;
+        }
     }
     return d;
 }
@@ -725,6 +788,7 @@ void SpecController::Observe(std::string_view route, SpecTaskClass task, SpecStr
             e.probe_accepted += accepted;
             e.probe_in_flight = false;
             e.active_probe_id = 0;
+            e.probe_started_ms = 0;
             if (e.probe_drafted < a.probe_drafted_tokens) return;
             const double rate = static_cast<double>(e.probe_accepted) / static_cast<double>(e.probe_drafted);
             if (rate >= a.reenable_at_least) {
@@ -763,6 +827,70 @@ void SpecController::CancelProbe(std::string_view route, SpecTaskClass task, Spe
     const std::int64_t keep_backoff =
         e.backoff_ms > 0 ? std::min(e.backoff_ms, config_.acceptance.reprobe_max_ms) : config_.acceptance.reprobe_initial_ms;
     EnterDisabledLocked(e, keep_backoff);
+}
+
+void SpecController::ReleaseProbe(std::string_view route, SpecTaskClass task, SpecStrategy mode,
+                                  std::uint64_t probe_id) {
+    if (mode == SpecStrategy::kNone) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = entries_.find(MakeKey(route, task, mode));
+    if (it == entries_.end()) return;
+    Entry& e = it->second;
+    if (e.state != SpecAcceptanceState::kProbing || !e.probe_in_flight) return;
+    if (probe_id != 0 && probe_id != e.active_probe_id) return;
+    e.last_used = ++tick_;
+    e.probe_in_flight = false;
+    e.active_probe_id = 0;
+    e.probe_started_ms = 0;
+}
+
+void FinishSpecRequest(SpecController& controller, const SpecDecision& decision, std::string_view route,
+                       SpecTaskClass task, std::int32_t draft_tokens, std::int32_t draft_accepted_tokens,
+                       bool failed_or_cancelled) {
+    if (decision.mode == SpecStrategy::kNone) return;
+    if (draft_tokens > 0) {
+        controller.Observe(route, task, decision.mode, static_cast<std::uint32_t>(draft_tokens),
+                           static_cast<std::uint32_t>(std::max<std::int32_t>(0, draft_accepted_tokens)));
+    } else if (decision.is_probe) {
+        if (failed_or_cancelled) {
+            controller.CancelProbe(route, task, decision.mode, decision.probe_id);
+        } else {
+            controller.ReleaseProbe(route, task, decision.mode, decision.probe_id);
+        }
+    }
+}
+
+double ComputeTopTokenProbability(std::span<const float> logits, Token token) noexcept {
+    if (logits.empty() || token < 0 || static_cast<std::size_t>(token) >= logits.size()) {
+        return 0.0;
+    }
+    const double target = static_cast<double>(logits[static_cast<std::size_t>(token)]);
+    if (!std::isfinite(target)) return 0.0;
+
+    double max_logit = -std::numeric_limits<double>::infinity();
+    for (float v : logits) {
+        const double dv = static_cast<double>(v);
+        if (std::isfinite(dv) && dv > max_logit) {
+            max_logit = dv;
+        }
+    }
+    if (!std::isfinite(max_logit)) return 0.0;
+
+    double sum_exp = 0.0;
+    for (float v : logits) {
+        const double dv = static_cast<double>(v);
+        if (std::isfinite(dv)) {
+            sum_exp += std::exp(dv - max_logit);
+        }
+    }
+    if (!(sum_exp > 0.0) || !std::isfinite(sum_exp)) return 0.0;
+    const double p = std::exp(target - max_logit) / sum_exp;
+    return std::isfinite(p) ? std::clamp(p, 0.0, 1.0) : 0.0;
+}
+
+bool DraftTokenPassesPMin(std::span<const float> logits, Token token, double p_min) noexcept {
+    if (!std::isfinite(p_min) || p_min <= 0.0) return true;
+    return ComputeTopTokenProbability(logits, token) >= p_min;
 }
 
 SpecRouteStats SpecController::Stats(std::string_view route, SpecTaskClass task, SpecStrategy mode) const {
