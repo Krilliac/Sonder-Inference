@@ -595,11 +595,15 @@ std::size_t TryStateSeqSetDataExt(llama_context* ctx, const std::uint8_t* src, s
 // sampling (checking only the 1 sampled token first and only masking the full
 // vocabulary on the rare rejection case).
 Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n_vocab, int32_t n_ctx,
-                    SamplerPtr& out, SamplerPtr& grammar_out) {
+                    SamplerPtr& out, SamplerPtr& grammar_out, bool already_validated = false) {
     out.reset();
     grammar_out.reset();
-    if (Status s = ValidateSamplingRequestGuards(p, n_vocab, n_ctx); !s.ok()) return s;
-    return RunGuarded(ErrorCode::kDecodeFailed, "sampler_init", [&]() -> Status {
+    if (!already_validated) {
+        if (Status s = ValidateSamplingRequestGuards(p, n_vocab); !s.ok()) return s;
+    }
+    Status status = RunGuarded(
+        ErrorCode::kDecodeFailed, "sampler_init",
+        [&]() -> Status {
     SamplerPtr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
     if (!chain) {
         return Status::Error(ErrorCode::kDecodeFailed, "failed to initialize llama sampler chain");
@@ -634,7 +638,7 @@ Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n
                                                /*add_special=*/false, /*parse_special=*/true);
         if (n != 1) {
             return Status::Error(ErrorCode::kInvalidArgument,
-                                 "preserved token does not map to exactly one token id: " + text);
+                                 "preserved token does not map to exactly one token id");
         }
     }
     if (!p.grammar.empty()) {
@@ -648,12 +652,16 @@ Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n
                 gram = llama_sampler_init_grammar_lazy_patterns(
                     vocab, p.grammar.c_str(), "root", patterns.data(), patterns.size(), p.trigger_tokens.data(),
                     p.trigger_tokens.size());
+            } catch (const std::bad_alloc&) {
+                throw;
             } catch (...) {
                 gram = nullptr;
             }
         } else {
             try {
                 gram = llama_sampler_init_grammar(vocab, p.grammar.c_str(), "root");
+            } catch (const std::bad_alloc&) {
+                throw;
             } catch (...) {
                 gram = nullptr;
             }
@@ -673,6 +681,9 @@ Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n
                 [&]() {
                     try {
                         grammar_out.reset(llama_sampler_init_grammar(vocab, p.grammar.c_str(), "root"));
+                    } catch (const std::bad_alloc&) {
+                        grammar_out.reset();
+                        throw;
                     } catch (...) {
                         grammar_out.reset();
                     }
@@ -694,7 +705,7 @@ Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n
         out = std::move(chain);
         return Status::Ok();
     }
-    if (p.top_k > 0) llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(p.top_k));
+    if (p.top_k > 0) llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(ClampTopK(p.top_k, n_vocab)));
     if (p.typical_p < 1.0F) llama_sampler_chain_add(chain.get(), llama_sampler_init_typical(p.typical_p, 1));
     if (p.top_p < 1.0F) llama_sampler_chain_add(chain.get(), llama_sampler_init_top_p(p.top_p, 1));
     if (p.min_p > 0.0F) llama_sampler_chain_add(chain.get(), llama_sampler_init_min_p(p.min_p, 1));
@@ -702,7 +713,13 @@ Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n
     llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(p.seed));
     out = std::move(chain);
     return Status::Ok();
-    });
+        },
+        ErrorCode::kLoadFailed);
+    if (!status.ok()) {
+        out.reset();
+        grammar_out.reset();
+    }
+    return status;
 }
 
 }  // namespace
@@ -2037,13 +2054,11 @@ struct LlamaCppBackend::Impl {
                 llama_sampler_chain_add(s.get(), llama_sampler_init_greedy());
                 mtp_samplers[i] = std::move(s);
 #if defined(SONDER_LLAMACPP_HAS_SET_SAMPLER)
-                llama_sampler* bchain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(bchain, llama_sampler_init_greedy());
-                if (!TrySetSampler(ctx_dft, static_cast<llama_seq_id>(i), bchain)) {
-                    llama_sampler_free(bchain);
-                    bchain = nullptr;
+                SamplerPtr bchain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                llama_sampler_chain_add(bchain.get(), llama_sampler_init_greedy());
+                if (TrySetSampler(ctx_dft, static_cast<llama_seq_id>(i), bchain.get())) {
+                    mtp_backend_chains[i] = bchain.release();
                 }
-                mtp_backend_chains[i] = bchain;
 #endif
             } catch (...) {
                 ReleaseMtp();
@@ -2883,7 +2898,6 @@ Status LlamaCppBackend::ProbeGrammarMask(const SamplingParams& params, std::span
                                          std::vector<std::uint8_t>& allowed) const {
     allowed.clear();
     if (!IsLoaded()) return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
-    if (Status v = Validate(params); !v.ok()) return v;
     const int32_t n_vocab = llama_vocab_n_tokens(impl_->vocab);
     if (Status v = ValidateTokenIds(accepted, n_vocab, "accepted"); !v.ok()) return v;
     SamplerPtr chain;
@@ -3006,19 +3020,22 @@ Status LlamaCppBackend::FormatChat(std::string_view chat_template, const std::ve
     if (total > static_cast<std::size_t>(INT32_MAX / 4)) {
         return Status::Error(ErrorCode::kInvalidArgument, "chat too long");
     }
-    return RunGuarded(ErrorCode::kInvalidArgument, "llama_chat_apply_template", [&]() -> Status {
-        std::vector<char> buf(total * 2 + 256);
-        int32_t n = llama_chat_apply_template(tmpl.c_str(), chat.data(), chat.size(), add_assistant, buf.data(),
+    return RunGuarded(
+        ErrorCode::kInvalidArgument, "llama_chat_apply_template",
+        [&]() -> Status {
+            std::vector<char> buf(total * 2 + 256);
+            int32_t n = llama_chat_apply_template(tmpl.c_str(), chat.data(), chat.size(), add_assistant, buf.data(),
+                                                  static_cast<int32_t>(buf.size()));
+            if (n > static_cast<int32_t>(buf.size())) {
+                buf.resize(static_cast<std::size_t>(n));
+                n = llama_chat_apply_template(tmpl.c_str(), chat.data(), chat.size(), add_assistant, buf.data(),
                                               static_cast<int32_t>(buf.size()));
-        if (n > static_cast<int32_t>(buf.size())) {
-            buf.resize(static_cast<std::size_t>(n));
-            n = llama_chat_apply_template(tmpl.c_str(), chat.data(), chat.size(), add_assistant, buf.data(),
-                                          static_cast<int32_t>(buf.size()));
-        }
-        if (n < 0) return Status::Error(ErrorCode::kInvalidArgument, "chat template not supported by llama.cpp");
-        out.assign(buf.data(), static_cast<std::size_t>(n));
-        return Status::Ok();
-    });
+            }
+            if (n < 0) return Status::Error(ErrorCode::kInvalidArgument, "chat template not supported by llama.cpp");
+            out.assign(buf.data(), static_cast<std::size_t>(n));
+            return Status::Ok();
+        },
+        ErrorCode::kTokenizeFailed);
 }
 
 void LlamaCppBackend::SetTelemetrySink(TelemetrySink sink) { impl_->telemetry = std::move(sink); }
@@ -3041,10 +3058,6 @@ Status LlamaCppBackend::CaptureSequenceState(std::vector<std::uint8_t>& out_byte
     if (!IsLoaded()) return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
     if (impl_->ctx == nullptr) return Status::Error(ErrorCode::kNotLoaded, "model loaded vocab-only; no context");
 
-    if (Status s = ValidateSeqId(0, std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(impl_->slots.size())));
-        !s.ok()) {
-        return s;
-    }
     return RunGuarded(ErrorCode::kDecodeFailed, "llama_state_seq_get_data", [&]() -> Status {
         const std::size_t state_size = llama_state_seq_get_size(impl_->ctx, 0);
         if (state_size == 0) {
@@ -3079,10 +3092,6 @@ Status LlamaCppBackend::RestoreSequenceState(std::span<const std::uint8_t> bytes
     }
     if (!IsLoaded()) return Status::Error(ErrorCode::kNotLoaded, "no model loaded");
     if (impl_->ctx == nullptr) return Status::Error(ErrorCode::kNotLoaded, "model loaded vocab-only; no context");
-    if (Status s = ValidateSeqId(0, std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(impl_->slots.size())));
-        !s.ok()) {
-        return s;
-    }
     return RunGuarded(ErrorCode::kDecodeFailed, "llama_state_seq_set_data", [&]() -> Status {
         const std::size_t read = llama_state_seq_set_data(impl_->ctx, bytes.data(), bytes.size(), 0);
         if (read == 0 || read != bytes.size()) {
@@ -3769,9 +3778,7 @@ GenerateResult LlamaCppBackend::Generate(const GenerateRequest& request, const T
 
     const int32_t n_vocab = llama_vocab_n_tokens(impl_->vocab);
     if (Status s = ValidatePromptTokens(request.prompt, n_vocab); !s.ok()) return fail(s.code, s.message);
-    if (Status s = ValidateSamplingRequestGuards(request.sampling, n_vocab,
-                                                 static_cast<int32_t>(Impl::EffectiveCtxSeq(impl_->ctx)));
-        !s.ok()) {
+    if (Status s = ValidateSamplingRequestGuards(request.sampling, n_vocab); !s.ok()) {
         return fail(s.code, s.message);
     }
 
@@ -3839,7 +3846,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
     SamplerPtr sampler;
     SamplerPtr grammar_sampler;
     if (Status s = BuildSampler(request.sampling, vocab, n_vocab, static_cast<int32_t>(n_ctx), sampler,
-                                grammar_sampler);
+                                grammar_sampler, /*already_validated=*/true);
         !s.ok()) {
         return fail(s.code, s.message);
     }
@@ -4311,16 +4318,16 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                 step_end = hybrid_ckpt_offset;
             }
             const auto n = static_cast<int32_t>(step_end - off);
+            if (Status s = ValidateBatchBounds(n, batch_cap, static_cast<int32_t>(n_ubatch),
+                                               /*require_ubatch_fit=*/false);
+                !s.ok()) {
+                return fail(s.code, s.message);
+            }
             BatchClear(batch);
             for (int32_t j = 0; j < n; ++j) {
                 const bool is_last_prompt_tok = (off + j + 1 == n_prompt);
                 BatchAdd(batch, request.prompt[static_cast<std::size_t>(off + j)],
                          static_cast<llama_pos>(cur_pos + j), slot_id, is_last_prompt_tok);
-            }
-            if (Status s = ValidateBatchBounds(batch.n_tokens, batch_cap, static_cast<int32_t>(n_ubatch),
-                                               /*require_ubatch_fit=*/false);
-                !s.ok()) {
-                return fail(s.code, s.message);
             }
             Status decode_err;
             const int32_t rc = TryDecode(ctx, batch, &decode_err);
@@ -5492,7 +5499,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             req.sampling.seed == 0xFFFFFFFFU ? std::random_device{}() : static_cast<std::uint64_t>(req.sampling.seed);
         s->verify_rng.seed(verify_seed ^ 0x517CC1B727220A95ULL);
         if (Status st = BuildSampler(req.sampling, vocab, n_vocab, static_cast<int32_t>(n_ctx), s->sampler,
-                                     s->grammar_sampler);
+                                     s->grammar_sampler, /*already_validated=*/true);
             !st.ok()) {
             s->result.status = std::move(st);
             finish_slot(*s, StopReason::kError);

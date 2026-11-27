@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <new>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -45,19 +47,23 @@ inline constexpr std::size_t kMaxErrorMessageBytes = 256u;
 [[nodiscard]] Status ValidateLogitBias(const std::vector<std::pair<Token, float>>& logit_bias,
                                        std::int32_t n_vocab);
 
-// Validates top_k against `n_vocab` and `kMaxBackendProbeCandidates` when enabled (> 0).
-// Prevents GGML_ASSERT(a->ne[0] >= k) in ggml_top_k (ggml/src/ggml.c:5374) via
-// llama_sampler_top_k_backend_apply (src/llama-sampler.cpp:1493) and probe (:648).
+// Validates top_k against `kMaxBackendProbeCandidates` (128*1024) when enabled (> 0)
+// and checks `n_vocab > 0`. Values in `(n_vocab, kMaxBackendProbeCandidates]` are
+// valid and clamped to `n_vocab` via `ClampTopK` at sampler init to match upstream
+// CPU top-k clamping (src/llama-sampler.cpp:331) while preventing GGML_ASSERT(a->ne[0] >= k)
+// in ggml_top_k (ggml/src/ggml.c:5374) via llama_sampler_backend_support (:648) and :1493.
 [[nodiscard]] Status ValidateTopK(std::int32_t top_k, std::int32_t n_vocab);
 
-// Validates GBNF grammar size/NUL, lazy-grammar triggers (regex syntax, non-empty,
+// Clamps an enabled `top_k` (> 0) to `std::min(top_k, n_vocab)` for `llama_sampler_init_top_k`.
+[[nodiscard]] std::int32_t ClampTopK(std::int32_t top_k, std::int32_t n_vocab) noexcept;
+
+// Validates GBNF grammar size/NUL, lazy-grammar triggers (non-empty/NUL patterns,
 // trigger_tokens in `[0, n_vocab)`), grammar_prefill preconditions, and preserved_tokens.
 [[nodiscard]] Status ValidateGrammarInputs(const SamplingParams& params, std::int32_t n_vocab);
 
-// Runs all request-time sampling guards that require `n_vocab` / `n_ctx`
-// (logit_bias token bounds, top_k bounds, repeat_last_n cap, top_logprobs, grammar inputs).
-[[nodiscard]] Status ValidateSamplingRequestGuards(const SamplingParams& params, std::int32_t n_vocab,
-                                                   std::int32_t n_ctx);
+// Runs all request-time sampling guards that require `n_vocab`
+// (logit_bias token bounds, top_k probe ceiling, repeat_last_n cap, top_logprobs, grammar inputs).
+[[nodiscard]] Status ValidateSamplingRequestGuards(const SamplingParams& params, std::int32_t n_vocab);
 
 // Validates sequence id in `[0, n_seq_max)` with `1 <= n_seq_max <= kLlamaMaxSeq`.
 // Prevents GGML_ASSERT(seq_id >= 0 && seq_id < seq_to_stream.size()) in
@@ -105,10 +111,15 @@ inline constexpr std::size_t kMaxErrorMessageBytes = 256u;
                                        const std::exception* ex = nullptr) noexcept;
 
 // Narrow exception barrier for calling potentially-throwing llama.cpp / ggml / mtmd code.
+// Optional `oom_code` overrides `error_code` specifically for `std::bad_alloc` so OOM
+// is never misclassified as an invalid-argument or decode error.
 template <typename Fn>
-[[nodiscard]] Status RunGuarded(ErrorCode error_code, std::string_view stage, Fn&& fn) noexcept {
+[[nodiscard]] Status RunGuarded(ErrorCode error_code, std::string_view stage, Fn&& fn,
+                                std::optional<ErrorCode> oom_code = std::nullopt) noexcept {
     try {
         return fn();
+    } catch (const std::bad_alloc& ex) {
+        return ExceptionToStatus(oom_code.value_or(error_code), stage, &ex);
     } catch (const std::exception& ex) {
         return ExceptionToStatus(error_code, stage, &ex);
     } catch (...) {

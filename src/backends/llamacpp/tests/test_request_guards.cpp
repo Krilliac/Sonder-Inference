@@ -62,10 +62,18 @@ TEST_CASE("request guards: top_k bounds guard ggml_top_k against vocab and backe
     CHECK(ValidateTopK(32000, 32000).ok());
     CHECK(ValidateTopK(kMaxBackendProbeCandidates, 151936).ok());
 
-    // top_k > n_vocab reaches GGML_ASSERT(a->ne[0] >= k) at ggml/src/ggml.c:5374.
-    CHECK(ValidateTopK(32001, 32000).code == ErrorCode::kInvalidArgument);
+    // top_k > n_vocab (up to kMaxBackendProbeCandidates) is accepted and clamped at sampler init.
+    CHECK(ValidateTopK(32001, 32000).ok());
+    CHECK(ValidateTopK(32000 + 1000, 32000).ok());
+    CHECK(ClampTopK(0, 32000) == 0);
+    CHECK(ClampTopK(-1, 32000) == -1);
+    CHECK(ClampTopK(40, 32000) == 40);
+    CHECK(ClampTopK(32001, 32000) == 32000);
+    CHECK(ClampTopK(32000 + 1000, 32000) == 32000);
+    CHECK(ClampTopK(kMaxBackendProbeCandidates, 151936) == kMaxBackendProbeCandidates);
     // top_k > 128*1024 reaches GGML_ASSERT in llama_sampler_backend_support probe (src/llama-sampler.cpp:648).
     CHECK(ValidateTopK(kMaxBackendProbeCandidates + 1, 151936).code == ErrorCode::kInvalidArgument);
+    CHECK(ValidateTopK(kMaxBackendProbeCandidates + 1, 32000).code == ErrorCode::kInvalidArgument);
     CHECK(ValidateTopK(10, 0).code == ErrorCode::kInvalidArgument);
 }
 
@@ -73,35 +81,44 @@ TEST_CASE("request guards: sampling request guards enforce top_k, repeat_last_n,
     SamplingParams p;
     p.temperature = 0.8F;
     p.top_k = 40;
-    CHECK(ValidateSamplingRequestGuards(p, 32000, 4096).ok());
+    CHECK(ValidateSamplingRequestGuards(p, 32000).ok());
 
     // Greedy (temperature <= 0) does not attach top_k, so default top_k=40 on tiny vocab stays valid.
     SamplingParams greedy;
     greedy.temperature = 0.0F;
     greedy.top_k = 40;
-    CHECK(ValidateSamplingRequestGuards(greedy, 16, 512).ok());
+    CHECK(ValidateSamplingRequestGuards(greedy, 16).ok());
 
-    // Stochastic with top_k > n_vocab is rejected.
+    // Stochastic with top_k > n_vocab (within backend probe ceiling) is accepted and clamped.
+    SamplingParams clamped_topk = p;
+    clamped_topk.top_k = 32000 + 1000;
+    CHECK(ValidateSamplingRequestGuards(clamped_topk, 32000).ok());
+    CHECK(ClampTopK(clamped_topk.top_k, 32000) == 32000);
+    clamped_topk.top_k = 50000;
+    CHECK(ValidateSamplingRequestGuards(clamped_topk, 32000).ok());
+    CHECK(ClampTopK(clamped_topk.top_k, 32000) == 32000);
+
+    // Stochastic with top_k > kMaxBackendProbeCandidates is rejected.
     SamplingParams bad_topk = p;
-    bad_topk.top_k = 50000;
-    CHECK(ValidateSamplingRequestGuards(bad_topk, 32000, 4096).code == ErrorCode::kInvalidArgument);
+    bad_topk.top_k = kMaxBackendProbeCandidates + 1;
+    CHECK(ValidateSamplingRequestGuards(bad_topk, 32000).code == ErrorCode::kInvalidArgument);
 
     // Huge repeat_last_n cannot force multi-GB ring_buffer allocation.
     SamplingParams huge_window = p;
     huge_window.repeat_penalty = 1.1F;
     huge_window.repeat_last_n = kMaxRepeatLastN + 1;
-    CHECK(ValidateSamplingRequestGuards(huge_window, 32000, 4096).code == ErrorCode::kInvalidArgument);
+    CHECK(ValidateSamplingRequestGuards(huge_window, 32000).code == ErrorCode::kInvalidArgument);
 
     // top_logprobs bounds.
     SamplingParams bad_lp = p;
     bad_lp.compute_logprobs = true;
     bad_lp.top_logprobs = kMaxTopLogprobs + 1;
-    CHECK(ValidateSamplingRequestGuards(bad_lp, 32000, 4096).code == ErrorCode::kInvalidArgument);
+    CHECK(ValidateSamplingRequestGuards(bad_lp, 32000).code == ErrorCode::kInvalidArgument);
 
     // Out-of-range logit_bias token.
     SamplingParams bad_bias = p;
     bad_bias.logit_bias = {{32000, -1.0F}};
-    CHECK(ValidateSamplingRequestGuards(bad_bias, 32000, 4096).code == ErrorCode::kInvalidArgument);
+    CHECK(ValidateSamplingRequestGuards(bad_bias, 32000).code == ErrorCode::kInvalidArgument);
 }
 
 TEST_CASE("request guards: grammar and lazy-grammar trigger inputs are validated") {
@@ -138,18 +155,18 @@ TEST_CASE("request guards: grammar and lazy-grammar trigger inputs are validated
     bad_trig_tok.trigger_tokens = {42};
     CHECK(ValidateGrammarInputs(bad_trig_tok, 32000).ok());
 
-    // Empty or invalid regex in trigger_patterns rejected without echoing the pattern.
+    // Empty or NUL-containing trigger_patterns rejected.
     SamplingParams empty_pat = p;
     empty_pat.grammar_lazy = true;
     empty_pat.trigger_patterns = {""};
     CHECK(ValidateGrammarInputs(empty_pat, 32000).code == ErrorCode::kInvalidArgument);
 
-    SamplingParams bad_re = p;
-    bad_re.grammar_lazy = true;
-    bad_re.trigger_patterns = {"([SECRET_PROMPT_MARKER"};
-    const Status re_st = ValidateGrammarInputs(bad_re, 32000);
-    CHECK(re_st.code == ErrorCode::kInvalidArgument);
-    CHECK(re_st.message.find("SECRET_PROMPT_MARKER") == std::string::npos);
+    SamplingParams nul_pat = p;
+    nul_pat.grammar_lazy = true;
+    std::string pat_with_nul = "ab";
+    pat_with_nul[1] = '\0';
+    nul_pat.trigger_patterns = {pat_with_nul};
+    CHECK(ValidateGrammarInputs(nul_pat, 32000).code == ErrorCode::kInvalidArgument);
 
     // Preserved token empty or containing NUL rejected.
     SamplingParams bad_pres = p;
@@ -273,12 +290,18 @@ TEST_CASE("request guards: RunGuarded and FormatBoundedExceptionMessage bound me
     CHECK(rt.message.find("TOP_SECRET_USER_PROMPT") == std::string::npos);
     CHECK(rt.message.find("llama_grammar_accept") != std::string::npos);
 
-    const Status oom = RunGuarded(ErrorCode::kDecodeFailed, "llama_decode", [&]() -> Status {
-        throw std::bad_alloc();
-    });
-    CHECK(oom.code == ErrorCode::kDecodeFailed);
+    const Status oom = RunGuarded(
+        ErrorCode::kInvalidArgument, "llama_chat_apply_template", [&]() -> Status { throw std::bad_alloc(); },
+        ErrorCode::kTokenizeFailed);
+    CHECK(oom.code == ErrorCode::kTokenizeFailed);
     CHECK(oom.message.size() <= kMaxErrorMessageBytes);
     CHECK(oom.message.find("out of memory") != std::string::npos);
+
+    const Status sampler_oom = RunGuarded(
+        ErrorCode::kDecodeFailed, "sampler_init", [&]() -> Status { throw std::bad_alloc(); }, ErrorCode::kLoadFailed);
+    CHECK(sampler_oom.code == ErrorCode::kLoadFailed);
+    CHECK(sampler_oom.message.size() <= kMaxErrorMessageBytes);
+    CHECK(sampler_oom.message.find("out of memory") != std::string::npos);
 
     const Status rx = RunGuarded(ErrorCode::kInvalidArgument, "grammar_init", [&]() -> Status {
         throw std::regex_error(std::regex_constants::error_paren);
@@ -333,10 +356,16 @@ TEST_CASE("request guards: ProbeGrammarMask blocks EOG abort, OOB tokens, OOB lo
     bad_bias.logit_bias = {{n_vocab, 1.0F}};
     CHECK(be.ProbeGrammarMask(bad_bias, {}, mask).code == ErrorCode::kInvalidArgument);
 
-    // Out-of-range top_k with stochastic sampling rejected before ggml_top_k.
+    // top_k = n_vocab + 1000 (within kMaxBackendProbeCandidates) is accepted and clamped at sampler init.
+    SamplingParams clamped_topk = gram;
+    clamped_topk.temperature = 0.8F;
+    clamped_topk.top_k = n_vocab + 1000;
+    CHECK(be.ProbeGrammarMask(clamped_topk, {}, mask).ok());
+
+    // top_k > kMaxBackendProbeCandidates is rejected before backend probe.
     SamplingParams bad_topk = gram;
     bad_topk.temperature = 0.8F;
-    bad_topk.top_k = n_vocab + 1;
+    bad_topk.top_k = kMaxBackendProbeCandidates + 1;
     CHECK(be.ProbeGrammarMask(bad_topk, {}, mask).code == ErrorCode::kInvalidArgument);
 
     // Out-of-range lazy trigger token rejected.
@@ -344,6 +373,21 @@ TEST_CASE("request guards: ProbeGrammarMask blocks EOG abort, OOB tokens, OOB lo
     bad_trig.grammar_lazy = true;
     bad_trig.trigger_tokens = {n_vocab};
     CHECK(be.ProbeGrammarMask(bad_trig, {}, mask).code == ErrorCode::kInvalidArgument);
+
+    // Invalid lazy trigger regex rejected without echoing the pattern.
+    SamplingParams bad_re = gram;
+    bad_re.grammar_lazy = true;
+    bad_re.trigger_patterns = {"([SECRET_PROMPT_MARKER"};
+    const Status re_st = be.ProbeGrammarMask(bad_re, {}, mask);
+    CHECK(re_st.code == ErrorCode::kInvalidArgument);
+    CHECK(re_st.message.find("SECRET_PROMPT_MARKER") == std::string::npos);
+
+    // Preserved token mapping failure does not echo the token text.
+    SamplingParams bad_pres = gram;
+    bad_pres.preserved_tokens = {"MULTI_TOKEN_SECRET_VALUE"};
+    const Status pres_st = be.ProbeGrammarMask(bad_pres, {}, mask);
+    CHECK(pres_st.code == ErrorCode::kInvalidArgument);
+    CHECK(pres_st.message.find("MULTI_TOKEN_SECRET_VALUE") == std::string::npos);
 
     be.Unload();
 }

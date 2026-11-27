@@ -82,17 +82,19 @@ Status ValidateTopK(std::int32_t top_k, std::int32_t n_vocab) {
     if (top_k <= 0) {
         return Status::Ok();
     }
-    if (top_k > n_vocab) {
-        return Status::Error(ErrorCode::kInvalidArgument,
-                             "top_k (" + std::to_string(top_k) + ") exceeds vocabulary size (" +
-                                 std::to_string(n_vocab) + ")");
-    }
     if (top_k > kMaxBackendProbeCandidates) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "top_k (" + std::to_string(top_k) + ") exceeds backend sampler limit (" +
                                  std::to_string(kMaxBackendProbeCandidates) + ")");
     }
     return Status::Ok();
+}
+
+std::int32_t ClampTopK(std::int32_t top_k, std::int32_t n_vocab) noexcept {
+    if (top_k <= 0 || n_vocab <= 0) {
+        return top_k;
+    }
+    return std::min(top_k, n_vocab);
 }
 
 Status ValidateGrammarInputs(const SamplingParams& params, std::int32_t n_vocab) {
@@ -125,14 +127,6 @@ Status ValidateGrammarInputs(const SamplingParams& params, std::int32_t n_vocab)
                 return Status::Error(ErrorCode::kInvalidArgument,
                                      "lazy grammar trigger pattern contains embedded NUL byte");
             }
-            try {
-                const std::regex compiled(pat);
-                (void)compiled;
-            } catch (const std::exception& ex) {
-                return ExceptionToStatus(ErrorCode::kInvalidArgument, "lazy_grammar_trigger_pattern", &ex);
-            } catch (...) {
-                return ExceptionToStatus(ErrorCode::kInvalidArgument, "lazy_grammar_trigger_pattern", nullptr);
-            }
         }
     }
     for (const std::string& text : params.preserved_tokens) {
@@ -146,8 +140,7 @@ Status ValidateGrammarInputs(const SamplingParams& params, std::int32_t n_vocab)
     return Status::Ok();
 }
 
-Status ValidateSamplingRequestGuards(const SamplingParams& params, std::int32_t n_vocab, std::int32_t n_ctx) {
-    (void)n_ctx;
+Status ValidateSamplingRequestGuards(const SamplingParams& params, std::int32_t n_vocab) {
     if (Status s = Validate(params); !s.ok()) {
         return s;
     }
