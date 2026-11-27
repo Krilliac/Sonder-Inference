@@ -17,6 +17,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bindings/python/src'))
 import sonder_inference as si  # noqa: E402
+from telemetry_streams import check_event_streams  # noqa: E402
 
 
 def main() -> int:
@@ -117,10 +118,7 @@ def main() -> int:
                     assert event['producer'].get('synthetic') is True
                 assert all('text' not in event['attributes'] for event in events
                            if event['event_type'] == 'inference.token.generated')
-                sequences = [event['sequence'] for event in events]
-                assert sequences == list(range(len(events)))
-                assert len({event['producer']['instance_id'] for event in events}) == 1
-                assert len({event['event_id'] for event in events}) == len(events)
+                check_event_streams(events)
                 if args.fixture_dir and cycle == 0:
                     args.fixture_dir.mkdir(parents=True, exist_ok=True)
                     (args.fixture_dir / f'parents-{workers}-capture-off.jsonl').write_text(raw)
