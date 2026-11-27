@@ -54,6 +54,11 @@ std::string build_generate_body(const std::string& model, const GenerateRequest&
 
 enum class StreamKind { generate, chat };
 
+// Redacts secrets in place. Applied to upstream error text BEFORE it is
+// bounded for a message, so a secret that straddles the cut is still found
+// whole. Empty = no redaction. Called only on error paths.
+using TextScrubber = std::function<void(std::string&)>;
+
 struct StreamEvent {
     std::string_view content;   // "response" (generate) or "message.content" (chat)
     std::string_view thinking;  // "thinking" / "message.thinking"
@@ -78,12 +83,13 @@ struct StreamSummary {
 
 // Incremental NDJSON decoder; bytes may be split at any boundary. Not
 // thread-safe (one decoder per response). The callback's string_views are
-// valid only during the call.
+// valid only during the call. `scrub` redacts an {"error": ...} line's text
+// before it is bounded into error().
 class StreamDecoder {
 public:
     using EventCallback = std::function<bool(const StreamEvent&)>;
 
-    StreamDecoder(StreamKind kind, EventCallback on_event, std::size_t max_output_bytes);
+    StreamDecoder(StreamKind kind, EventCallback on_event, std::size_t max_output_bytes, TextScrubber scrub = {});
 
     // False when the callback asked to stop or the stream is invalid.
     bool feed(std::string_view bytes);
@@ -101,6 +107,7 @@ private:
 
     StreamKind kind_;
     EventCallback on_event_;
+    TextScrubber scrub_;
     std::size_t max_output_bytes_;
     std::size_t output_bytes_ = 0;
     std::uint32_t next_tool_call_index_ = 0;
@@ -124,7 +131,8 @@ struct TagEntry {
 Result<std::vector<TagEntry>> parse_tags(std::string_view body);
 
 // Maps a non-2xx response to a Status. The message carries the upstream
-// {"error": ...} text (bounded); callers scrub it for the API key.
-Status http_status_error(int status, std::string_view body);
+// {"error": ...} text (or the raw body), passed through `scrub` first and
+// then bounded to 512 bytes.
+Status http_status_error(int status, std::string_view body, const TextScrubber& scrub = {});
 
 }  // namespace sonder::inference::ollama_cloud

@@ -43,7 +43,9 @@ public:
     [[nodiscard]] bool empty() const noexcept { return value_.empty(); }
     // "Bearer <key>". The caller owns the copy and should secure_wipe() it.
     [[nodiscard]] std::string bearer_header_value() const;
-    // Replaces every occurrence of the key in `text` with "[redacted]".
+    // Replaces every occurrence of the key in `text`, raw or in its JSON
+    // string-escaped form, with "[redacted]". Apply it to the whole text
+    // before cutting it: a partial key is not recognised.
     void scrub(std::string& text) const;
     [[nodiscard]] Status scrub(const Status& status) const;
 

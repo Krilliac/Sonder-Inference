@@ -59,7 +59,8 @@ struct OllamaCloudHttpRequest {
     std::chrono::milliseconds total_timeout{900000};
     // Maximum silence between body bytes once the response head arrived (0 = off).
     std::chrono::milliseconds idle_timeout{0};
-    // Extra PEM CA bundle; empty = system trust store. Verification stays on.
+    // PEM CA bundle that REPLACES the system trust store (it does not add to
+    // it); empty = system trust store. Verification stays on.
     std::string ca_bundle_path;
 };
 
@@ -92,6 +93,9 @@ struct OllamaCloudOptions {
     std::chrono::milliseconds connect_timeout{10000};
     std::chrono::milliseconds request_timeout{900000};
     std::chrono::milliseconds idle_timeout{120000};  // 0 disables
+    // PEM CA bundle used INSTEAD of the system trust store (net::TlsOptions);
+    // a bundle that lacks ollama.com's roots makes https://ollama.com fail
+    // verification. Empty (the default) = system trust store.
     std::string ca_bundle_path;
     // Also deliver thinking text to token callbacks when the caller did not
     // ask for separate reasoning (same meaning as the ollama backend option).

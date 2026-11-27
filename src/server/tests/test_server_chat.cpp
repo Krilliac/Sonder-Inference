@@ -525,15 +525,22 @@ TEST_CASE("chat: X-Sonder-Local-Only reaches the backend request") {
 
 #if defined(SONDER_HAS_OLLAMA_CLOUD_BACKEND)
 TEST_CASE("chat: ollama_cloud refuses a local-only request over HTTP without calling the cloud") {
-    // Scripted stand-in for https://ollama.com; counts chat calls.
+    // Scripted stand-in for https://ollama.com; counts chat and generate calls.
     struct CloudStub final : si::OllamaCloudTransport {
         std::atomic<int> chats{0};
+        std::atomic<int> generates{0};
         si::Status send(const si::OllamaCloudHttpRequest& request, const std::function<void(int)>& on_status,
                         const std::function<bool(std::string_view)>& on_body,
                         const si::CancellationToken&) override {
             on_status(200);
             if (request.target == "/api/tags") {
                 on_body(R"({"models":[{"name":"gpt-oss:120b"}]})");
+            } else if (request.target == "/api/generate") {
+                ++generates;
+                on_body(R"({"response":"from the cloud","done":false})"
+                        "\n"
+                        R"({"response":"","done":true,"done_reason":"stop"})"
+                        "\n");
             } else {
                 ++chats;
                 on_body(R"({"message":{"content":"from the cloud"},"done":false})"
@@ -565,6 +572,19 @@ TEST_CASE("chat: ollama_cloud refuses a local-only request over HTTP without cal
     const Reply ok = post(f.port, "/v1/chat/completions", chat_body());
     REQUIRE_MESSAGE(ok.status == 200, ok.body);
     CHECK(ok.body.find("from the cloud") != std::string::npos);
+    CHECK(stub->chats.load() == 1);
+
+    // /v1/completions forwards the flag to GenerateRequest::local_only too.
+    const std::string completion = R"({"model":"gpt-oss:120b","prompt":"hi","max_tokens":4})";
+    const Reply refused_completion = post(f.port, "/v1/completions", completion, {{"X-Sonder-Local-Only", "true"}});
+    CHECK(refused_completion.status == 400);
+    CHECK(refused_completion.body.find("local-only") != std::string::npos);
+    CHECK(refused_completion.body.find("sk-FAKE") == std::string::npos);
+    CHECK(stub->generates.load() == 0);
+    const Reply ok_completion = post(f.port, "/v1/completions", completion);
+    REQUIRE_MESSAGE(ok_completion.status == 200, ok_completion.body);
+    CHECK(ok_completion.body.find("from the cloud") != std::string::npos);
+    CHECK(stub->generates.load() == 1);
     CHECK(stub->chats.load() == 1);
 }
 #endif

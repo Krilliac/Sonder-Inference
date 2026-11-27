@@ -1340,6 +1340,12 @@ TEST_CASE("serve_main: ollama_cloud config is strict, never takes an inline key,
         R"({"api_key_env": "OLLAMA_API_KEY", "models": ["m"], "insecure_skip_verify": true})",
         R"({"api_key_env": "OLLAMA_API_KEY", "models": ["m"], "connect_timeout_ms": 0})",
         R"({"api_key_env": "OLLAMA_API_KEY", "models": [")" + inline_key + "\"]",  // malformed JSON
+        // base_url is checked before anything logs it; messages never quote it.
+        R"({"base_url": "https://)" + inline_key + R"(@ollama.com", "api_key_env": "OLLAMA_API_KEY", "models": ["m"]})",
+        R"({"base_url": "https://user:)" + inline_key + R"(@ollama.com/x", "api_key_env": "OLLAMA_API_KEY", "models": ["m"]})",
+        R"({"base_url": "http://ollama.com/)" + inline_key + R"(", "api_key_env": "OLLAMA_API_KEY", "models": ["m"]})",
+        R"({"base_url": "https://ollama.com/?t=)" + inline_key + R"(", "api_key_env": "OLLAMA_API_KEY", "models": ["m"]})",
+        R"({"base_url": "https://ollama.com/ )" + inline_key + R"(", "api_key_env": "OLLAMA_API_KEY", "models": ["m"]})",
     };
     for (std::size_t i = 0; i < bad_documents.size(); ++i) {
         CAPTURE(i);
@@ -1349,6 +1355,11 @@ TEST_CASE("serve_main: ollama_cloud config is strict, never takes an inline key,
         const auto st = si::load_ollama_cloud_config(bad.string(), s);
         CHECK_FALSE(st.ok());
         CHECK(st.message().find(inline_key) == std::string::npos);
+        // Through the CLI as well: the remote-provider warning must not run first.
+        det::ServeCliConfig rejected;
+        std::string cli_err;
+        CHECK(build_cli({"--backend", "ollama_cloud", "--ollama-cloud-config", bad.string()}, rejected, cli_err) == 2);
+        CHECK(cli_err.find(inline_key) == std::string::npos);
         std::error_code ec;
         fs::remove(bad, ec);
     }

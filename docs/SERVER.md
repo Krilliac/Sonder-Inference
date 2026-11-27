@@ -921,7 +921,7 @@ Correlation request headers (all optional; values must match
 | `X-Sonder-Workload` | One of the 7 workload classes; default `interactive_user`. |
 | `X-Sonder-Priority` | Integer from -16 to 16 (existing scheduler priority and integer telemetry; admission class `interactive`), or `interactive`, `subagent`, or `background` (class selection). Header wins over body `priority`; no hint defaults to numeric `0` and class `interactive`. |
 | `X-Sonder-Deadline-Ms` | Positive integer up to `INT32_MAX`, measured from connection arrival; a queued request past it returns 504. |
-| `X-Sonder-Local-Only` | `1`/`true` or `0`/`false` (case-insensitive). When true the request must stay on this host: a remote provider (`ollama_cloud`) refuses it before any network I/O with 400 `invalid_request` ("... is local-only"). Local backends ignore it. Applies to chat, completions and responses. |
+| `X-Sonder-Local-Only` | `1`/`true` or `0`/`false` (case-insensitive). When true, the `ollama_cloud` backend refuses the request before any network I/O with 400 `invalid_request` ("... is local-only"). Only `ollama_cloud` enforces it: every other backend ignores the flag, including `ollama` with `--ollama-allow-remote` and `llamaserver` in external mode pointed at a remote upstream, which still send the prompt off-host. Applies to chat, completions and responses. |
 
 The envelope `request_id` is always Inference's own id (`req-…`), also
 returned as `sonder.request_id`, in the completion id and in

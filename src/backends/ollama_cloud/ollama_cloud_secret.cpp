@@ -44,6 +44,14 @@ std::optional<std::string> process_env(const char* name) {
 #endif
 }
 
+void replace_all(std::string& text, const std::string& needle) {
+    std::size_t pos = 0;
+    while ((pos = text.find(needle, pos)) != std::string::npos) {
+        text.replace(pos, needle.size(), kRedacted);
+        pos += std::char_traits<char>::length(kRedacted);
+    }
+}
+
 }  // namespace
 
 void secure_wipe(std::string& text) noexcept {
@@ -135,11 +143,22 @@ void ApiKey::scrub(std::string& text) const {
     if (value_.empty()) {
         return;
     }
-    std::size_t pos = 0;
-    while ((pos = text.find(value_, pos)) != std::string::npos) {
-        text.replace(pos, value_.size(), kRedacted);
-        pos += std::char_traits<char>::length(kRedacted);
+    // A non-string JSON error value reaches a message through json dump(),
+    // which escapes '"' and backslash (the only escaped bytes in a printable-ASCII
+    // key). Redact that form first, then the raw key.
+    if (value_.find_first_of("\"\\") != std::string::npos) {
+        std::string escaped;
+        escaped.reserve(value_.size() * 2);  // no reallocation, so no unwiped copy
+        for (const char c : value_) {
+            if (c == '"' || c == '\\') {
+                escaped.push_back('\\');
+            }
+            escaped.push_back(c);
+        }
+        replace_all(text, escaped);
+        secure_wipe(escaped);
     }
+    replace_all(text, value_);
 }
 
 Status ApiKey::scrub(const Status& status) const {

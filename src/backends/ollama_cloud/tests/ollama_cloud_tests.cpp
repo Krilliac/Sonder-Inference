@@ -515,6 +515,97 @@ TEST_CASE("secrets: the key never appears in errors, telemetry or config dumps")
     CHECK_FALSE(contains_key(be->description()));
 }
 
+TEST_CASE("secrets: a key echoed across the 512-byte error cut leaves no prefix behind") {
+    // The key starts 12 bytes before the cut, so a cut-then-redact order
+    // would leak "sk-FAKE-test" (12 bytes of the key) into the message.
+    const std::string key(kFakeKey);
+    const std::string prefix = key.substr(0, 12);
+    const std::string detail = std::string(500, 'x') + key + " trailing text";
+    REQUIRE(detail.size() > 512u);
+    const auto leaks = [&](const std::string& message) {
+        return message.find(prefix) != std::string::npos || contains_key(message);
+    };
+
+    auto t = fake_with_tags();
+    auto be = make_ollama_cloud_backend(options_with(t)).value();
+    auto model = load(be);
+
+    // HTTP error path, JSON {"error": "..."} body.
+    t->route("/api/chat", Route{401, {R"({"error":")" + detail + R"("})"}, {}, false});
+    auto http_json = model->chat(user_chat("x"), {}, {});
+    REQUIRE_FALSE(http_json.ok());
+    CHECK_FALSE(leaks(http_json.status().message()));
+    CHECK(http_json.status().message().find("[redacted]") != std::string::npos);
+
+    // HTTP error path, raw (non-JSON) body, on the generate endpoint.
+    t->route("/api/generate", Route{500, {detail}, {}, false});
+    GenerateRequest gen;
+    gen.prompt = "x";
+    gen.sampling = SamplingConfig::greedy(4);
+    auto http_raw = model->generate(gen, {}, {});
+    REQUIRE_FALSE(http_raw.ok());
+    CHECK_FALSE(leaks(http_raw.status().message()));
+    CHECK(http_raw.status().message().find("[redacted]") != std::string::npos);
+
+    // Mid-stream {"error": ...} line after a 200 status.
+    t->route("/api/chat", Route{200,
+                                {"{\"message\":{\"content\":\"a\"},\"done\":false}\n",
+                                 R"({"error":")" + detail + "\"}\n"},
+                                {},
+                                false});
+    auto mid = model->chat(user_chat("x"), {}, {});
+    REQUIRE_FALSE(mid.ok());
+    CHECK(mid.status().code() == ErrorCode::backend_error);
+    CHECK_FALSE(leaks(mid.status().message()));
+    CHECK(mid.status().message().find("[redacted]") != std::string::npos);
+
+    // Buffered GET path (/api/tags behind list_models).
+    t->route("/api/tags", Route{403, {R"({"error":")" + detail + R"("})"}, {}, false});
+    auto tags = be->list_models();
+    REQUIRE_FALSE(tags.ok());
+    CHECK_FALSE(leaks(tags.status().message()));
+    CHECK(tags.status().message().find("[redacted]") != std::string::npos);
+}
+
+TEST_CASE("secrets: a non-string error value re-serialised with JSON escapes is redacted") {
+    // Printable ASCII, so ApiKey accepts it; '"' and '\' are escaped by dump().
+    const std::string key = R"(sk-FAKE"quote\back-0123456789)";
+    const std::string escaped = R"(sk-FAKE\"quote\\back-0123456789)";
+    auto t = fake_with_tags();
+    auto o = options_with(t);
+    o.env_lookup = [key](const char* name) -> std::optional<std::string> {
+        if (std::string(name) == "SONDER_TEST_OLLAMA_CLOUD_KEY") return key;
+        return std::nullopt;
+    };
+    auto be = make_ollama_cloud_backend(o).value();
+    auto model = load(be);
+    // {"error": {"detail": "<key>"}}: the JSON text carries the escaped form.
+    const std::string body = R"({"error":{"detail":")" + escaped + R"("}})";
+    const auto leaks = [&](const std::string& message) {
+        return message.find(key) != std::string::npos || message.find(escaped) != std::string::npos ||
+               message.find("quote") != std::string::npos;
+    };
+
+    t->route("/api/chat", Route{400, {body}, {}, false});
+    auto http = model->chat(user_chat("x"), {}, {});
+    REQUIRE_FALSE(http.ok());
+    CHECK_FALSE(leaks(http.status().message()));
+    CHECK(http.status().message().find("[redacted]") != std::string::npos);
+
+    t->route("/api/chat", Route{200, {body + "\n"}, {}, false});
+    auto mid = model->chat(user_chat("x"), {}, {});
+    REQUIRE_FALSE(mid.ok());
+    CHECK_FALSE(leaks(mid.status().message()));
+    CHECK(mid.status().message().find("[redacted]") != std::string::npos);
+
+    // Direct: raw and escaped occurrences in one text.
+    auto direct = ollama_cloud::ApiKey::from_value(std::string(key), "test");
+    REQUIRE(direct.ok());
+    std::string text = "a " + key + " b " + escaped + " c";
+    direct.value().scrub(text);
+    CHECK(text == "a [redacted] b [redacted] c");
+}
+
 TEST_CASE("secrets: end to end through the engine, no telemetry line carries the key") {
     auto t = fake_with_tags();
     t->route("/api/chat", Route{200, {kChatStream}, {}, false});

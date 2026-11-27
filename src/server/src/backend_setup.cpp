@@ -3,6 +3,7 @@
 #include "config_text.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
@@ -472,6 +473,29 @@ Status load_ollama_cloud_config(const std::string& path, BackendSetup& destinati
         return {};
     };
     if (auto st = string_field("base_url", setup.ollama_cloud_base_url); !st.ok()) return st;
+    if (!setup.ollama_cloud_base_url.empty()) {
+        // Checked here, before serve logs the URL, so a secret in userinfo is
+        // never printed. Messages never quote the URL. make_ollama_cloud_backend
+        // still runs the full validation (host, port, path).
+        const std::string& url = setup.ollama_cloud_base_url;
+        constexpr std::string_view scheme = "https://";
+        const bool https = url.size() >= scheme.size() &&
+                           std::equal(scheme.begin(), scheme.end(), url.begin(), [](char want, char got) {
+                               return want == static_cast<char>(std::tolower(static_cast<unsigned char>(got)));
+                           });
+        if (!https)
+            return Status(ErrorCode::invalid_argument, "ollama_cloud config: 'base_url' must start with https://");
+        if (!std::all_of(url.begin(), url.end(), [](unsigned char c) { return c >= 0x21 && c <= 0x7e; }))
+            return Status(ErrorCode::invalid_argument,
+                          "ollama_cloud config: 'base_url' contains control, whitespace or non-ASCII characters");
+        const std::string_view rest = std::string_view(url).substr(scheme.size());
+        if (rest.substr(0, rest.find('/')).find('@') != std::string_view::npos)
+            return Status(ErrorCode::invalid_argument,
+                          "ollama_cloud config: 'base_url' must not contain userinfo (user@host)");
+        if (rest.find_first_of("?#") != std::string_view::npos)
+            return Status(ErrorCode::invalid_argument,
+                          "ollama_cloud config: 'base_url' must not contain a query or fragment");
+    }
     if (auto st = string_field("api_key_env", setup.ollama_cloud_api_key_env); !st.ok()) return st;
     if (auto st = string_field("api_key_file", setup.ollama_cloud_api_key_file); !st.ok()) return st;
     if (auto st = string_field("ca_bundle_path", setup.ollama_cloud_ca_bundle_path); !st.ok()) return st;

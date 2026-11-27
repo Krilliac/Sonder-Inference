@@ -237,8 +237,9 @@ std::string build_generate_body(const std::string& model, const GenerateRequest&
 // ---------------------------------------------------------------------------
 // StreamDecoder
 
-StreamDecoder::StreamDecoder(StreamKind kind, EventCallback on_event, std::size_t max_output_bytes)
-    : kind_(kind), on_event_(std::move(on_event)), max_output_bytes_(max_output_bytes) {}
+StreamDecoder::StreamDecoder(StreamKind kind, EventCallback on_event, std::size_t max_output_bytes,
+                             TextScrubber scrub)
+    : kind_(kind), on_event_(std::move(on_event)), scrub_(std::move(scrub)), max_output_bytes_(max_output_bytes) {}
 
 bool StreamDecoder::feed(std::string_view bytes) {
     if (!error_.ok() || stopped_by_callback_) {
@@ -292,7 +293,10 @@ bool StreamDecoder::on_line(std::string_view line) {
     }
     const json::Value& j = parsed.value();
     if (const json::Value* e = j.find("error"); e != nullptr && !e->is_null()) {
-        const std::string text = e->is_string() ? e->as_string() : e->dump();
+        std::string text = e->is_string() ? e->as_string() : e->dump();
+        if (scrub_) {
+            scrub_(text);  // whole text first: a key across the cut must not leave a prefix
+        }
         error_ = Status(ErrorCode::backend_error, "ollama_cloud: " + bounded(text, 512));
         return false;
     }
@@ -429,7 +433,7 @@ Result<std::vector<TagEntry>> parse_tags(std::string_view body) {
     return out;
 }
 
-Status http_status_error(int status, std::string_view body) {
+Status http_status_error(int status, std::string_view body, const TextScrubber& scrub) {
     std::string detail;
     if (auto parsed = json::parse(body); parsed.ok()) {
         if (const json::Value* e = parsed.value().find("error"); e != nullptr) {
@@ -437,6 +441,9 @@ Status http_status_error(int status, std::string_view body) {
         }
     } else {
         detail = std::string(body);
+    }
+    if (scrub) {
+        scrub(detail);  // whole detail first: a key across the cut must not leave a prefix
     }
     detail = bounded(detail, 512);
     std::string text = "ollama_cloud HTTP " + std::to_string(status) + (detail.empty() ? "" : ": " + detail);

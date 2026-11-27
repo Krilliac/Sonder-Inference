@@ -57,7 +57,7 @@ API in general, and not tried here because tests make no network calls):
 | `connect_timeout_ms` | 1..600000, default 10000. |
 | `request_timeout_ms` | Whole-request cap, 1..86400000, default 900000. |
 | `idle_timeout_ms` | Longest silence between body bytes once the response head arrived, 0..86400000 (0 = off), default 120000. |
-| `ca_bundle_path` | Optional extra PEM trust anchors. Verification stays on. |
+| `ca_bundle_path` | Optional PEM CA bundle that replaces the system trust store; it does not add to it. A bundle that lacks the roots for the configured host (for `https://ollama.com`, its public CA chain) makes every request fail verification. Leave it unset for `ollama.com`. Verification stays on. |
 
 Exactly one of `api_key_env` and `api_key_file` is required. Unknown fields
 are rejected. An inline `api_key` (or `key`, `token`) field is refused, so the
@@ -83,7 +83,10 @@ add a pluggable `transport` for tests.
   header) make the provider fail the request with `invalid_argument` before any
   network I/O. Over HTTP that is 400 `invalid_request`: "the backend refused the
   request: ollama_cloud: model 'X' runs on Ollama Cloud (remote) and the request
-  is local-only (X-Sonder-Local-Only)". Local backends ignore the flag.
+  is local-only (X-Sonder-Local-Only)". Only `ollama_cloud` enforces the
+  flag; the other backends ignore it, including the retiring `ollama`
+  (`--ollama-allow-remote`) and external-mode `llamaserver` backends, which
+  can still send a prompt off-host.
 - **Refused features** (no network call): `response_format` other than `text`
   (cloud models have no structured outputs), GBNF grammars, image inputs,
   `logit_bias`, `typical_p`. Thinking: `ThinkingOptions::enable_thinking` maps
@@ -116,9 +119,11 @@ uses Ollama Cloud needs a TLS-enabled configure.
   they are released. Copies inside the HTTP client's internal request buffer are
   not covered by that.
 - Every error that leaves the provider (HTTP error bodies, mid-stream
-  `{"error": ...}` lines, transport errors) is scrubbed: any occurrence of the
-  key becomes `[redacted]`. Telemetry carries error codes only, never upstream
-  messages.
+  `{"error": ...}` lines, transport errors) is scrubbed: any complete
+  occurrence of the key, raw or JSON-escaped, becomes `[redacted]`. Upstream
+  text is scrubbed whole before it is cut to 512 bytes for the message, so a
+  key that straddles the cut leaves no prefix behind. Telemetry carries error
+  codes only, never upstream messages.
 - `redacted_config()` and `runtime_status().diagnostics` show the key source
   (`env` + variable name, or `file` + path), never the key.
 - Tests cover these paths with an obvious fake key, including the full engine
@@ -128,8 +133,11 @@ uses Ollama Cloud needs a TLS-enabled configure.
 ## Telemetry
 
 The backend registers as `ollama_cloud` with `remote_process`, `streaming` and
-`tool_calling`. Each request queues one `backend.remote.request` event (drained
-by the engine's runtime sampler onto the bus, with `backend` added):
+`tool_calling`. Each request that is sent, and each local-only refusal, queues
+one `backend.remote.request` event (drained by the engine's runtime sampler
+onto the bus, with `backend` added). The other refusals (`response_format`,
+grammar, images, `logit_bias`, `typical_p`, invalid messages) return before
+any record is written and queue no event:
 
 | Attribute | Value |
 | --- | --- |

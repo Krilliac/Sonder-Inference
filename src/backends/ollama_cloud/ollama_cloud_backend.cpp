@@ -184,7 +184,7 @@ public:
             return Status(ErrorCode::protocol_error, "ollama_cloud: response body exceeds 16 MiB");
         }
         if (status < 200 || status >= 300) {
-            return key_.scrub(ollama_cloud::http_status_error(status, body));
+            return key_.scrub(ollama_cloud::http_status_error(status, body, scrubber()));
         }
         return body;
     }
@@ -202,6 +202,12 @@ public:
     }
 
     [[nodiscard]] Status scrub(const Status& st) const { return key_.scrub(st); }
+    // Redacts the key in upstream text before the protocol layer bounds it.
+    // Captures `this`: use only while this CloudState is alive (callers hold
+    // the shared_ptr for the duration of the request).
+    [[nodiscard]] ollama_cloud::TextScrubber scrubber() const {
+        return [this](std::string& text) { key_.scrub(text); };
+    }
 
     void record(const RequestRecord& r) {
         requests_.fetch_add(1, std::memory_order_relaxed);
@@ -433,7 +439,7 @@ private:
                 }
                 return !stopped_by_callback;
             },
-            state_->options().max_stream_output_bytes);
+            state_->options().max_stream_output_bytes, state_->scrubber());
 
         int http_status = 0;
         std::string error_body;
@@ -460,7 +466,8 @@ private:
             return finish(st);
         }
         if (http_status < 200 || http_status >= 300) {
-            return finish(state_->scrub(ollama_cloud::http_status_error(http_status, error_body)));
+            return finish(
+                state_->scrub(ollama_cloud::http_status_error(http_status, error_body, state_->scrubber())));
         }
         if (Status fin = decoder.finish(); !fin.ok()) {
             return finish(state_->scrub(fin));
