@@ -115,7 +115,7 @@ cmake --build --preset msvc-release
 ```
 
 `SONDER_WITH_LLAMA_CPP` is OFF by default (`CMakeLists.txt:36`). With it
-ON, llama.cpp is fetched at tag `b11195` and built as a library only
+ON, llama.cpp is fetched at tag `v1.0.0` and built as a library only
 (`src/backends/llamacpp/CMakeLists.txt:~26-31,62-67`). The CPU backend is always
 included. Accelerators are turned on with llama.cpp's own cache variables,
 passed on the same command line (`src/backends/llamacpp/CMakeLists.txt:~34-36`):
@@ -130,7 +130,7 @@ exact one, so the binary runs on other computers; CI uses it
 (`.github/workflows/ci.yml:158`). Leave it ON only for a binary that never
 leaves this machine. The SDK installation, supported compilers and
 architecture overrides are llama.cpp's to document:
-[llama.cpp build guide at the pinned tag](https://github.com/ggml-org/llama.cpp/blob/b11195/docs/build.md)
+[llama.cpp build guide at the pinned tag](https://github.com/ggml-org/llama.cpp/blob/v1.0.0/docs/build.md)
 (CUDA and Vulkan sections). Those GPU recipes were not built for this guide.
 
 How you know the GPU build worked: serve with `--device gpu:0` (below). A

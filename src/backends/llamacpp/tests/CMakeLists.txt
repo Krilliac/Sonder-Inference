@@ -13,12 +13,15 @@ sonder_add_module_tests(llamacpp
     test_llamacpp_chat.cpp
     test_llamacpp_frontier.cpp
     test_llamacpp_speculative_verifier.cpp
+    test_slot_store.cpp
+    test_request_guards.cpp
 )
 if(TARGET sonder_llamacpp_tests)
     target_link_libraries(sonder_llamacpp_tests PRIVATE sonder_backend_llamacpp)
     target_include_directories(sonder_llamacpp_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
     target_compile_definitions(sonder_llamacpp_tests PRIVATE
-        SONDER_LLAMACPP_VOCAB_DIR="${SONDER_LLAMACPP_VOCAB_DIR}")
+        SONDER_LLAMACPP_VOCAB_DIR="${SONDER_LLAMACPP_VOCAB_DIR}"
+        SONDER_EXPECTED_LLAMACPP_TAG="${SONDER_LLAMACPP_RESOLVED_TAG}")
 endif()
 
 add_executable(sonder_llamacpp_integration test_llamacpp_integration.cpp)

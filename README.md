@@ -12,29 +12,46 @@ to backends. It ships a command-line tool, `sonder-infer`, that includes a
 local HTTP server, and ctypes-based Python bindings.
 
 Version 0.1.0 (`CMakeLists.txt`). Design notes and plans are in
-[docs/](docs/README.md); the status of each planned item is in
-[docs/ROADMAP.md](docs/ROADMAP.md).
+[docs/](docs/README.md); the general milestone status is in
+[docs/ROADMAP.md](docs/ROADMAP.md), and the plan to consolidate local
+inference onto the native in-process `llama.cpp` backend is in
+[docs/ROADMAP_SI_ONLY.md](docs/ROADMAP_SI_ONLY.md).
 
 ## Capabilities
 
-- **Core API**: `Engine`, `Device` (CPU inventory), `Model`, `Session`,
-  `Backend` with capability advertisement, `SamplingConfig` validation and
-  cooperative cancellation. Public C++ headers are in
+- **Core API**: `Engine`, `Device` and GPU inventory (CPU plus DXGI, NVML and
+  sysfs GPU discovery, with ROCm ordinal mapping and UMA detection), `Model`,
+  `Session`, `Backend` with capability advertisement, `SamplingConfig`
+  validation and cooperative cancellation. Public C++ headers are in
   [`include/sonder/inference/`](include/sonder/inference/).
 - **C ABI**: [`include/sonder_inference.h`](include/sonder_inference.h),
   `SONDER_ABI_VERSION` 1.
-- **Backends**:
+- **Backends** ([src/backends/README.md](src/backends/README.md)):
+  - `llamacpp` (**target and only long-term local engine**): direct,
+    in-process llama.cpp/GGML backend, built with `SONDER_WITH_LLAMA_CPP=ON`
+    ([src/backends/llamacpp](src/backends/llamacpp/README.md),
+    [docs/GPU_SUPPORT.md](docs/GPU_SUPPORT.md),
+    [docs/integration/llamacpp.md](docs/integration/llamacpp.md)). Planned to
+    move to a single vendored, pinned `ggml`/`llama.cpp` tree with SI's own
+    patch series ([docs/ROADMAP_SI_ONLY.md](docs/ROADMAP_SI_ONLY.md)).
+  - **Ollama Cloud** (**in progress, not yet merged on `main`**): opt-in
+    direct HTTPS provider for Ollama Cloud models with no local Ollama daemon
+    (RET-02 in [docs/ROADMAP_SI_ONLY.md](docs/ROADMAP_SI_ONLY.md)).
+  - `ollama` (**deprecated, scheduled for removal**): HTTP adapter for an
+    Ollama server, with streaming and cancellation
+    ([src/backends/ollama](src/backends/ollama/README.md)).
+  - `llamaserver` (**deprecated, scheduled for removal**): supervised external
+    `llama-server`, or an existing compatible HTTP upstream; no llama.cpp
+    linkage ([docs/integration/llama-server.md](docs/integration/llama-server.md)).
   - `mock`: deterministic synthetic output for tests; performs no inference.
   - `remote-mock`: the same synthetic engine in a supervised `sonder-infer worker`
     process over private local IPC ([ARCH-01](docs/design/ARCH-01-multiprocess.md));
     the first slice of native engine process isolation, without GPU requirements.
-  - `ollama`: adapter for an Ollama server over HTTP, with streaming and
-    cancellation ([src/backends/ollama](src/backends/ollama/README.md)).
-  - `llamacpp`: direct llama.cpp/GGML backend, built only with
-    `SONDER_WITH_LLAMA_CPP=ON` ([docs/integration/llamacpp.md](docs/integration/llamacpp.md)).
-  - `llamaserver`: supervised external llama-server, or an existing compatible
-    HTTP upstream; no llama.cpp linkage
-    ([docs/integration/llama-server.md](docs/integration/llama-server.md)).
+
+  `ollama` and `llamaserver` are deprecated because Sonder Inference must own
+  scheduling, memory, and telemetry end to end; piggy-backed external servers
+  obscure memory ownership and hide execution internals from the Sonder
+  Observatory.
 - **Scheduler** ([src/scheduler](src/scheduler/README.md)): priority queue,
   continuous batching, chunked prefill, admission and preemption policy.
 - **KV cache manager** ([src/cache](src/cache/README.md)): logical block
@@ -46,13 +63,16 @@ Version 0.1.0 (`CMakeLists.txt`). Design notes and plans are in
 - **Telemetry**: JSONL events in the `sonder.observatory.event/1` envelope
   through a bounded, non-blocking queue ([docs/TELEMETRY.md](docs/TELEMETRY.md)).
 - **HTTP server** (`sonder-infer serve`): HTTP/1.1 API under `/v1` with health,
-  model listing, backend identity, an OpenAI-compatible
-  `POST /v1/chat/completions` subset, and live telemetry over SSE and NDJSON
+  model listing, node/placement planning, backend identity,
+  `POST /v1/chat/completions`, `/v1/completions`, `/v1/responses`,
+  `/v1/messages`, `/v1/embeddings`, `/v1/rerank`, `/v1/score`,
+  `/v1/tokenize`/`/v1/detokenize`, and live telemetry over SSE and NDJSON
   ([docs/SERVER.md](docs/SERVER.md)).
 - **Benchmark harness**: `sonder-infer bench` and the standalone `sonder-bench`
   ([bench/README.md](bench/README.md)).
-- **Optional TLS** for the internal HTTP client (outbound connections to
-  Ollama), off by default ([docs/integration/tls.md](docs/integration/tls.md)).
+- **Optional TLS** for the internal HTTP client (outbound `https://`
+  connections, including remote upstreams today and the upcoming Ollama Cloud
+  provider), off by default ([docs/integration/tls.md](docs/integration/tls.md)).
 
 ## Requirements
 
@@ -78,6 +98,12 @@ Configure, build and test presets are defined in
 | `msvc-debug`, `msvc-release` | Windows (MSVC) | Debug, RelWithDebInfo |
 | `linux-debug`, `linux-release` | non-Windows (GCC/Clang) | Debug, RelWithDebInfo |
 | `ci-windows`, `ci-linux` | as above | RelWithDebInfo, warnings as errors |
+
+Opt-in direct `llamacpp` CPU and GPU presets (`windows-cuda-blackwell`,
+`windows-cuda-rtx`, `windows-rocm-xt`, `windows-vulkan-xt`, `linux-llamacpp`,
+`linux-cuda-blackwell`, `linux-cuda-rtx`, `linux-rocm-xt`, `linux-vulkan-xt`)
+are also defined in [CMakePresets.json](CMakePresets.json); see
+[docs/GPU_SUPPORT.md](docs/GPU_SUPPORT.md).
 
 Linux (as in CI):
 
@@ -108,7 +134,7 @@ powershell -NoProfile -File scripts\build.ps1 -Preset msvc-debug -Test
 | `SONDER_BUILD_TESTS` | ON when top-level | Build the test suites |
 | `SONDER_BUILD_CLI` | ON when top-level | Build `sonder-infer` |
 | `SONDER_WARNINGS_AS_ERRORS` | OFF | Warnings as errors (ON in `ci-*` presets) |
-| `SONDER_WITH_LLAMA_CPP` | OFF | Fetch llama.cpp at pinned tag `b11195` and build the `llamacpp` backend; accelerators through `GGML_*` options |
+| `SONDER_WITH_LLAMA_CPP` | OFF | Fetch llama.cpp at pinned tag `v1.0.0` and build the `llamacpp` backend; accelerators through `GGML_*` options |
 | `SONDER_WITH_TLS` | OFF | Enable `https://` in the internal HTTP client |
 | `SONDER_TLS_BACKEND` | `auto` | `auto` (Schannel on Windows, OpenSSL elsewhere), `openssl` or `schannel` |
 | `SONDER_BUILD_FUZZERS` | OFF | Build the libFuzzer targets in `fuzz/` (Clang) |
@@ -161,7 +187,12 @@ $B/sonder-infer generate --backend mock --model mock:tiny \
 $B/sonder-infer chat --backend mock --model mock:tiny \
     --messages tests/fixtures/chat_messages.json
 
-# Local Ollama (default http://127.0.0.1:11434, or SONDER_OLLAMA_URL / OLLAMA_HOST)
+# Native in-process llama.cpp (target local engine; requires SONDER_WITH_LLAMA_CPP=ON)
+$B/sonder-infer generate --backend llamacpp --model <path/to/file.gguf> \
+    --prompt "Say hi"
+
+# Local Ollama (deprecated, scheduled for removal; default http://127.0.0.1:11434,
+# or SONDER_OLLAMA_URL / OLLAMA_HOST)
 $B/sonder-infer models --backend ollama
 $B/sonder-infer generate --backend ollama --model <pulled-model> --prompt "Say hi"
 
@@ -180,10 +211,15 @@ session. Exit codes: 0 success, 1 runtime or backend failure, 2 usage error,
 ```bash
 $B/sonder-infer serve --backend mock --port 11437
 curl -fsS http://127.0.0.1:11437/v1/sonder/health
+
+# Native in-process llama.cpp (requires SONDER_WITH_LLAMA_CPP=ON)
+$B/sonder-infer serve --backend llamacpp --model-dir <gguf-dir> --model <file.gguf> --port 11437
 ```
 
-To serve an existing llama-server upstream instead, use the `llamaserver`
-backend (`--llamaserver-url` or `--llamaserver-config`); setup steps are in
+For local GGUF serving, the target path is `--backend llamacpp` (in-process,
+built with `SONDER_WITH_LLAMA_CPP=ON`). The external `llamaserver` backend
+(`--llamaserver-url` or `--llamaserver-config`) remains available during
+migration but is deprecated and scheduled for removal; setup steps are in
 [docs/SETUP.md](docs/SETUP.md).
 
 Routes, options, limits and the Observatory connection are documented in
@@ -300,8 +336,8 @@ SONDER_INFERENCE_LIB_DIR=../../build-shared python -m pytest -v
 CI workflows:
 
 - [`ci.yml`](.github/workflows/ci.yml): Linux and Windows build and tests, CLI
-  smoke checks, TLS lanes (OpenSSL on Linux; Schannel on Windows,
-  non-blocking) and an optional llama.cpp build on Windows.
+  smoke checks, TLS lanes (OpenSSL on Linux; Schannel on Windows) and an
+  optional non-blocking llama.cpp build on Windows.
 - [`python.yml`](.github/workflows/python.yml): shared library on Linux and
   Windows, pytest on Python 3.10 to 3.13.
 - [`hardening.yml`](.github/workflows/hardening.yml): ASan+UBSan and TSan
