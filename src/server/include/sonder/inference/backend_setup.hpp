@@ -23,7 +23,7 @@
 namespace sonder::inference {
 
 struct BackendSetup {
-    std::string backend;  // "mock", "ollama", "llamacpp" or "llamaserver"
+    std::string backend;  // "mock", "ollama", "ollama_cloud", "llamacpp" or "llamaserver"
     // Ollama base URL; empty uses the backend default (http://127.0.0.1:11434).
     std::string ollama_url;
     // Allow a non-loopback Ollama host. Remote hosts also need https://, which
@@ -199,6 +199,25 @@ struct BackendSetup {
         std::uint32_t probe_draft_n = 1;
         std::uint64_t min_draft_tokens_per_sample = 4;
     } llamaserver_adaptive_speculation;
+
+    // Ollama Cloud provider ("ollama_cloud"), loaded from the strict JSON of
+    // load_ollama_cloud_config() (docs/integration/ollama-cloud.md). Mirrors
+    // are kept here so config loading does not need the optional backend
+    // header. The API key itself is never stored here, only where it lives.
+    std::string ollama_cloud_config;     // path of the loaded file
+    std::string ollama_cloud_base_url;   // empty = https://ollama.com
+    std::string ollama_cloud_api_key_env;   // variable NAME, e.g. OLLAMA_API_KEY
+    std::string ollama_cloud_api_key_file;  // path of a file holding only the key
+    std::vector<std::string> ollama_cloud_models;  // the cloud allowlist
+    std::uint64_t ollama_cloud_connect_timeout_ms = 10000;
+    std::uint64_t ollama_cloud_request_timeout_ms = 900000;
+    std::uint64_t ollama_cloud_idle_timeout_ms = 120000;
+    std::string ollama_cloud_ca_bundle_path;
+    // "allow_custom_endpoint": a base_url other than https://ollama.com (port
+    // 443) is refused unless this is true; the key is sent to that host.
+    bool ollama_cloud_allow_custom_endpoint = false;
+    // "max_response_bytes": raw bytes per response, 1..64 MiB (default 64 MiB).
+    std::uint64_t ollama_cloud_max_response_bytes = std::uint64_t{64} << 20;
 };
 
 // Values taken from the environment when the matching option is absent:
@@ -228,6 +247,15 @@ Result<std::pair<std::string, std::string>> parse_tensor_override(std::string_vi
 // Loads the strict llamaserver JSON object into setup. Unknown keys and
 // malformed types are rejected before any executable is started.
 Status load_llamaserver_config(const std::string& path, BackendSetup& setup);
+
+// Loads the strict ollama_cloud JSON object (base_url, allow_custom_endpoint,
+// api_key_env | api_key_file, models, connect/request/idle_timeout_ms,
+// max_response_bytes, ca_bundle_path) into setup. Unknown keys are rejected;
+// an inline "api_key" is refused with a pointer to api_key_env /
+// api_key_file. A base_url off the Ollama Cloud origin needs
+// "allow_custom_endpoint": true. Messages never contain key material and
+// never quote base_url.
+Status load_ollama_cloud_config(const std::string& path, BackendSetup& setup);
 
 // Pattern for MoE expert weights (llama.cpp's --cpu-moe); `--moe-experts cpu`
 // adds "<this>=cpu" ahead of any explicit --tensor-override.

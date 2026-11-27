@@ -5,6 +5,7 @@
 #include "tool_call_parser.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <limits>
 #include <string_view>
@@ -1111,7 +1112,8 @@ std::optional<WorkloadClass> parse_workload(std::string_view name) noexcept {
 }
 
 std::variant<Correlation, ApiError> parse_correlation(const RequestHead& head) {
-    for (const auto* name : {"x-sonder-priority", "x-sonder-deadline-ms", "x-sonder-no-capture"}) {
+    for (const auto* name :
+         {"x-sonder-priority", "x-sonder-deadline-ms", "x-sonder-no-capture", "x-sonder-local-only"}) {
         std::size_t count = 0;
         for (const auto& field : head.headers) if (field.first == name) ++count;
         if (count > 1) return bad("invalid_correlation_header", std::string(name) + " must occur once", name);
@@ -1187,6 +1189,18 @@ std::variant<Correlation, ApiError> parse_correlation(const RequestHead& head) {
                        "X-Sonder-No-Capture");
         }
         c.no_text_capture = *parsed;
+    }
+    if (const std::string* l = head.header("x-sonder-local-only")) {
+        std::string v = *l;
+        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        if (v == "1" || v == "true") {
+            c.local_only = true;
+        } else if (v == "0" || v == "false") {
+            c.local_only = false;
+        } else {
+            return bad("invalid_correlation_header", "X-Sonder-Local-Only must be 1, true, 0 or false",
+                       "X-Sonder-Local-Only");
+        }
     }
     return c;
 }

@@ -306,7 +306,8 @@ The preflight (`OPTIONS`) answers 204 with
 `Access-Control-Allow-Headers: Accept, Authorization, Cache-Control,
 Content-Type, Last-Event-ID, X-Sonder-Run-Id, X-Sonder-Parent-Request-Id,
 X-Sonder-Agent-Id, X-Sonder-Task-Id, X-Sonder-Workload, X-Sonder-Priority,
-X-Sonder-Deadline-Ms, X-Sonder-Reasoning-Budget, X-Sonder-No-Capture`
+X-Sonder-Deadline-Ms, X-Sonder-Reasoning-Budget, X-Sonder-No-Capture,
+X-Sonder-Local-Only`
 and `Access-Control-Max-Age: 600` (plus
 `Access-Control-Allow-Private-Network: true` when the browser asks for it).
 
@@ -925,6 +926,7 @@ Correlation request headers (all optional; values must match
 | `X-Sonder-Priority` | Integer from -16 to 16 (existing scheduler priority and integer telemetry; admission class `interactive`), or `interactive`, `subagent`, or `background` (class selection). Header wins over body `priority`; no hint defaults to numeric `0` and class `interactive`. |
 | `X-Sonder-Deadline-Ms` | Positive integer up to `INT32_MAX`, measured from connection arrival; a queued request past it returns 504. |
 | `X-Sonder-No-Capture` | `1` or `true` forces the telemetry [text capture policy](TELEMETRY.md#text-capture-policy) to `off` for this request (no output text, no prompt text in its events); `0` or `false` is a no-op. It can never enable capture. Anything else, or a repeated header, is 400 `invalid_correlation_header`. |
+| `X-Sonder-Local-Only` | `1`/`true` or `0`/`false` (case-insensitive). When true and the backend is `ollama_cloud`, the server refuses the request with 400 `invalid_request` ("... is local-only", param `X-Sonder-Local-Only`) before it resolves or loads the model, so no network I/O happens even with `--lazy-models` or after an idle eviction. Only `ollama_cloud` enforces it: every other backend ignores the flag, including `ollama` with `--ollama-allow-remote` and `llamaserver` in external mode pointed at a remote upstream, which still send the prompt off-host. Applies to chat, messages, completions, responses, embeddings, rerank, score, tokenize and detokenize. |
 
 The envelope `request_id` is always Inference's own id (`req-…`), also
 returned as `sonder.request_id`, in the completion id and in

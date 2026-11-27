@@ -25,7 +25,7 @@ namespace sonder::inference::server::detail {
 const char* const kServeUsage = R"(sonder-infer serve - local HTTP API and live telemetry (docs/SERVER.md)
 
 Usage:
-  sonder-infer serve --backend mock|remote-mock|ollama|llamacpp|llamaserver [--model ID]... [options]
+  sonder-infer serve --backend mock|remote-mock|ollama|ollama_cloud|llamacpp|llamaserver [--model ID]... [options]
 
 Server:
   --host HOST             listen address (default 127.0.0.1; non-loopback needs --token-file)
@@ -48,7 +48,8 @@ Server:
   --log-format text|json  access log and diagnostics on stderr (default text)
 
 Backend:
-  --backend NAME          mock / remote-mock (synthetic, tests only), ollama, llamacpp,
+  --backend NAME          mock / remote-mock (synthetic, tests only), ollama,
+                          ollama_cloud (Ollama's hosted models over HTTPS), llamacpp,
                           llamaserver (external llama-server or OpenAI upstream)
                           (env SONDER_INFER_BACKEND). remote-mock launches a private
                           worker subprocess using this sonder-infer executable.
@@ -58,6 +59,11 @@ Backend:
   --ollama-url URL        Ollama base URL (env SONDER_OLLAMA_URL, then OLLAMA_HOST)
   --ollama-allow-remote   allow a non-loopback Ollama host (needs https, i.e. a
                           SONDER_WITH_TLS=ON build)
+  --ollama-cloud-config PATH
+                          ollama_cloud JSON (base_url, api_key_env or api_key_file,
+                          models allowlist, timeouts); required by --backend
+                          ollama_cloud, whose --model defaults to the allowlist.
+                          Needs a SONDER_WITH_TLS=ON build
   --model-dir DIR         llama.cpp: directory with *.gguf files (repeatable)
   --device ID             device to load models on (llama.cpp: gpu:0 offloads to
                           the GPU; default cpu)
@@ -168,6 +174,7 @@ const std::vector<std::pair<std::string, Kind>>& spec() {
         {"host", Kind::value},                   {"port", Kind::value},
         {"backend", Kind::value},                {"model", Kind::repeat},
         {"ollama-url", Kind::value},             {"ollama-allow-remote", Kind::flag},
+        {"ollama-cloud-config", Kind::value},
         {"model-dir", Kind::repeat},             {"token-file", Kind::value},
         {"cors-origin", Kind::repeat},           {"no-default-cors", Kind::flag},
         {"telemetry-level", Kind::value},        {"telemetry-buffer", Kind::value},
@@ -412,7 +419,7 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     }
     o.backend.backend = primary ? primary->backend : a.get("backend").value_or(env.backend.value_or(""));
     if (o.backend.backend.empty()) {
-        return usage_error("--backend is required (mock, remote-mock, ollama, llamacpp or llamaserver; or set SONDER_INFER_BACKEND)");
+        return usage_error("--backend is required (mock, remote-mock, ollama, ollama_cloud, llamacpp or llamaserver; or set SONDER_INFER_BACKEND)");
     }
     if (!active_profiles.empty()) {
         o.models.clear();
@@ -431,6 +438,18 @@ int build_serve_options(const ParsedServeArgs& a, const std::shared_ptr<LockedLo
     o.backend.ollama_allow_remote = a.flags.count("ollama-allow-remote") != 0;
     if (auto path = a.get("llamaserver-config")) {
         if (auto st = load_llamaserver_config(*path, o.backend); !st.ok()) return usage_error(st.message());
+    }
+    if (auto path = a.get("ollama-cloud-config")) {
+        if (o.backend.backend != "ollama_cloud") return usage_error("--ollama-cloud-config requires --backend ollama_cloud");
+        if (auto st = load_ollama_cloud_config(*path, o.backend); !st.ok()) return usage_error(st.message());
+        if (o.models.empty()) o.models = o.backend.ollama_cloud_models;
+        // Security-relevant, like --ollama-allow-remote in the other commands.
+        log->line("sonder-infer serve: warning: --backend ollama_cloud sends prompts to a remote provider (" +
+                  (o.backend.ollama_cloud_base_url.empty() ? std::string("https://ollama.com")
+                                                           : o.backend.ollama_cloud_base_url) +
+                  "); X-Sonder-Local-Only requests are refused");
+    } else if (o.backend.backend == "ollama_cloud") {
+        return usage_error("--backend ollama_cloud requires --ollama-cloud-config PATH");
     }
     if (auto v = a.get("llamaserver-mode")) o.backend.llamaserver_mode = *v;
     if (auto v = a.get("llamaserver-url")) o.backend.llamaserver_url = *v;

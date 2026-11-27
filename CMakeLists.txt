@@ -121,6 +121,7 @@ set(SONDER_MODULE_DIRS
     src/sampling
     src/backends/llamacpp
     src/backends/ollama
+    src/backends/ollama_cloud
     src/backends/llamaserver
     src/artifacts
     src/models

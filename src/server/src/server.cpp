@@ -277,6 +277,33 @@ struct Server::Impl {
                               "; nothing was executed, the request is safe to send elsewhere");
     }
 
+    // X-Sonder-Local-Only against a remote provider (ollama_cloud): refused
+    // here, before residency resolution, because acquiring a model that is
+    // not resident (lazy residency, or evicted) loads it, and a remote model
+    // load is itself authenticated network I/O. Nothing is sent.
+    bool refuse_local_only_remote(Exchange& ex, const Correlation& corr) {
+        if (!corr.local_only) {
+            return false;
+        }
+        std::string name;
+        {
+            std::lock_guard<std::mutex> lock(engine_mu);
+            if (!backend) {
+                return false;
+            }
+            name = backend->name();
+        }
+        if (name != kRemoteProviderBackend) {
+            return false;
+        }
+        write_error(ex, make_error(400, "invalid_request",
+                                   "backend '" + name +
+                                       "' is a remote provider and the request is local-only (X-Sonder-Local-Only); "
+                                       "nothing was sent to the provider",
+                                   "X-Sonder-Local-Only"));
+        return true;
+    }
+
     bool require_ready(Exchange& ex) {
         const State s = state.load();
         if (s == State::ready) {
@@ -457,6 +484,9 @@ struct Server::Impl {
             fail_inference_request(ex, "chat", not_ready_error(s), corr, job.priority_class, job.model, job.model);
             return;
         }
+        if (refuse_local_only_remote(ex, corr)) {
+            return;
+        }
         const auto served_id = residency->resolve(job.model);
         if (!served_id) {
             fail_inference_request(
@@ -619,6 +649,9 @@ struct Server::Impl {
             fail_inference_request(ex, "chat", not_ready_error(s), corr, job.priority_class, job.model, job.model);
             return;
         }
+        if (refuse_local_only_remote(ex, corr)) {
+            return;
+        }
         const auto served_id = residency->resolve(job.model);
         if (!served_id) {
             fail_inference_request(
@@ -777,6 +810,9 @@ struct Server::Impl {
             fail_inference_request(ex, "generate", not_ready_error(s), corr, job.priority_class, job.model, job.model);
             return;
         }
+        if (refuse_local_only_remote(ex, corr)) {
+            return;
+        }
         const auto served_id = residency->resolve(job.model);
         if (!served_id) {
             fail_inference_request(
@@ -911,6 +947,9 @@ struct Server::Impl {
             fail_inference_request(ex, "embed", not_ready_error(s), corr, job.priority_class, job.model, job.model);
             return;
         }
+        if (refuse_local_only_remote(ex, corr)) {
+            return;
+        }
         const auto served_id = residency->resolve(job.model);
         if (!served_id) {
             fail_inference_request(
@@ -1017,6 +1056,9 @@ struct Server::Impl {
         const RerankJob job = std::move(std::get<RerankJob>(job_v));
         if (const State s = state.load(); s != State::ready) {
             fail_inference_request(ex, "rerank", not_ready_error(s), corr, job.priority_class, job.model, job.model);
+            return;
+        }
+        if (refuse_local_only_remote(ex, corr)) {
             return;
         }
         const auto served_id = residency->resolve(job.model);
@@ -1127,6 +1169,9 @@ struct Server::Impl {
             fail_inference_request(ex, "score", not_ready_error(s), corr, job.priority_class, job.model, job.model);
             return;
         }
+        if (refuse_local_only_remote(ex, corr)) {
+            return;
+        }
         const auto served_id = residency->resolve(job.model);
         if (!served_id) {
             fail_inference_request(
@@ -1202,7 +1247,13 @@ struct Server::Impl {
         execute_score(exchange, job, corr, pin.id(), pin.backend(), session);
     }
 
-    void handle_tokenize(Exchange& ex, const std::string& body) {
+    void handle_tokenize(Exchange& ex, const RequestHead& head, const std::string& body) {
+        auto corr_v = parse_correlation(head);
+        if (auto* e = std::get_if<ApiError>(&corr_v)) {
+            write_error(ex, *e);
+            return;
+        }
+        const Correlation corr = std::get<Correlation>(corr_v);
         std::variant<TokenizeJob, ApiError> job_v = make_error(500, "internal_error", "uninitialized");
         {
             const auto parse_timeout = std::min(opts.read_timeout, std::chrono::milliseconds(2000));
@@ -1224,6 +1275,9 @@ struct Server::Impl {
         }
         const TokenizeJob job = std::move(std::get<TokenizeJob>(job_v));
         if (!require_ready(ex)) {
+            return;
+        }
+        if (refuse_local_only_remote(ex, corr)) {
             return;
         }
         const auto served_id = residency->resolve(job.model);
@@ -1262,7 +1316,13 @@ struct Server::Impl {
                                 {"sonder", std::move(meta)}});
     }
 
-    void handle_detokenize(Exchange& ex, const std::string& body) {
+    void handle_detokenize(Exchange& ex, const RequestHead& head, const std::string& body) {
+        auto corr_v = parse_correlation(head);
+        if (auto* e = std::get_if<ApiError>(&corr_v)) {
+            write_error(ex, *e);
+            return;
+        }
+        const Correlation corr = std::get<Correlation>(corr_v);
         std::variant<DetokenizeJob, ApiError> job_v = make_error(500, "internal_error", "uninitialized");
         {
             const auto parse_timeout = std::min(opts.read_timeout, std::chrono::milliseconds(2000));
@@ -1284,6 +1344,9 @@ struct Server::Impl {
         }
         const DetokenizeJob job = std::move(std::get<DetokenizeJob>(job_v));
         if (!require_ready(ex)) {
+            return;
+        }
+        if (refuse_local_only_remote(ex, corr)) {
             return;
         }
         const auto served_id = residency->resolve(job.model);
@@ -1448,8 +1511,8 @@ struct Server::Impl {
             case Route::embeddings: handle_embeddings(ex, head, checked.body); break;
             case Route::rerank: handle_rerank(ex, head, checked.body); break;
             case Route::score: handle_score(ex, head, checked.body); break;
-            case Route::tokenize: handle_tokenize(ex, checked.body); break;
-            case Route::detokenize: handle_detokenize(ex, checked.body); break;
+            case Route::tokenize: handle_tokenize(ex, head, checked.body); break;
+            case Route::detokenize: handle_detokenize(ex, head, checked.body); break;
             case Route::discovery:
                 write_json(ex, 200, build_discovery_document(opts, *hub, instance_id, node_id, synthetic));
                 break;

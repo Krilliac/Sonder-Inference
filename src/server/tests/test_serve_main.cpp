@@ -1451,3 +1451,168 @@ TEST_CASE("serve_main: --startup-smoke-test flag parses, enforces backend/profil
     fs::remove(g_path, ec);
     fs::remove(profiles, ec);
 }
+
+TEST_CASE("serve_main: ollama_cloud config is strict, never takes an inline key, and seeds the model list") {
+    const auto key_file = temp_path("cloud.key");
+    std::ofstream(key_file, std::ios::binary) << "sk-FAKE-serve-test-key\n";
+    const auto config = temp_path("cloud.json");
+    {
+        std::ofstream out(config, std::ios::binary);
+        out << R"({"base_url": "https://ollama.com", "api_key_file": )" << json::Value(key_file.string()).dump()
+            << R"(, "models": ["gpt-oss:120b", "qwen3-coder:480b"], "request_timeout_ms": 120000,
+                 "idle_timeout_ms": 0})";
+    }
+    si::BackendSetup setup;
+    REQUIRE(si::load_ollama_cloud_config(config.string(), setup).ok());
+    CHECK(setup.ollama_cloud_base_url == "https://ollama.com");
+    CHECK(setup.ollama_cloud_api_key_file == key_file.string());
+    CHECK(setup.ollama_cloud_api_key_env.empty());
+    REQUIRE(setup.ollama_cloud_models.size() == 2u);
+    CHECK(setup.ollama_cloud_request_timeout_ms == 120000u);
+    CHECK(setup.ollama_cloud_idle_timeout_ms == 0u);
+    CHECK(setup.ollama_cloud_connect_timeout_ms == 10000u);
+
+    det::ServeCliConfig cfg;
+    std::string err;
+    CHECK(build_cli({"--backend", "ollama_cloud", "--ollama-cloud-config", config.string()}, cfg, err) == 0);
+    CHECK(cfg.options.backend.backend == "ollama_cloud");
+    CHECK(err.find("remote provider (https://ollama.com)") != std::string::npos);
+    CHECK(err.find("sk-FAKE") == std::string::npos);
+    REQUIRE(cfg.options.models.size() == 2u);
+    CHECK(cfg.options.models[0] == "gpt-oss:120b");
+    det::ServeCliConfig only_one;
+    CHECK(build_cli({"--backend", "ollama_cloud", "--ollama-cloud-config", config.string(), "--model",
+                     "qwen3-coder:480b"},
+                    only_one, err) == 0);
+    CHECK(only_one.options.models == std::vector<std::string>{"qwen3-coder:480b"});
+    det::ServeCliConfig missing;
+    CHECK(build_cli({"--backend", "ollama_cloud", "--model", "gpt-oss:120b"}, missing, err) == 2);
+    CHECK(err.find("--ollama-cloud-config") != std::string::npos);
+    det::ServeCliConfig wrong_backend;
+    CHECK(build_cli({"--backend", "mock", "--ollama-cloud-config", config.string()}, wrong_backend, err) == 2);
+#if defined(SONDER_HAS_OLLAMA_CLOUD_BACKEND)
+    auto made = si::make_backend(cfg.options.backend);
+    REQUIRE_MESSAGE(made.ok(), made.status().to_string());
+    CHECK(made.value()->name() == "ollama_cloud");
+    CHECK(made.value()->description().find("sk-FAKE") == std::string::npos);
+#endif
+
+    const std::string inline_key = "sk-FAKE-inline-do-not-echo";
+    const std::vector<std::string> bad_documents = {
+        R"({"api_key": ")" + inline_key + R"(", "models": ["m"]})",
+        R"({"api_key_env": "OLLAMA_API_KEY", "api_key_file": "k", "models": ["m"]})",
+        R"({"models": ["m"]})",
+        R"({"api_key_env": "OLLAMA_API_KEY", "models": []})",
+        R"({"api_key_env": "OLLAMA_API_KEY", "models": ["m"], "insecure_skip_verify": true})",
+        R"({"api_key_env": "OLLAMA_API_KEY", "models": ["m"], "connect_timeout_ms": 0})",
+        R"({"api_key_env": "OLLAMA_API_KEY", "models": [")" + inline_key + "\"]",  // malformed JSON
+        // base_url is checked before anything logs it; messages never quote it.
+        R"({"base_url": "https://)" + inline_key + R"(@ollama.com", "api_key_env": "OLLAMA_API_KEY", "models": ["m"]})",
+        R"({"base_url": "https://user:)" + inline_key + R"(@ollama.com/x", "api_key_env": "OLLAMA_API_KEY", "models": ["m"]})",
+        R"({"base_url": "http://ollama.com/)" + inline_key + R"(", "api_key_env": "OLLAMA_API_KEY", "models": ["m"]})",
+        R"({"base_url": "https://ollama.com/?t=)" + inline_key + R"(", "api_key_env": "OLLAMA_API_KEY", "models": ["m"]})",
+        R"({"base_url": "https://ollama.com/ )" + inline_key + R"(", "api_key_env": "OLLAMA_API_KEY", "models": ["m"]})",
+    };
+    for (std::size_t i = 0; i < bad_documents.size(); ++i) {
+        CAPTURE(i);
+        const auto bad = temp_path("bad-cloud-" + std::to_string(i) + ".json");
+        std::ofstream(bad, std::ios::binary) << bad_documents[i];
+        si::BackendSetup s;
+        const auto st = si::load_ollama_cloud_config(bad.string(), s);
+        CHECK_FALSE(st.ok());
+        CHECK(st.message().find(inline_key) == std::string::npos);
+        // Through the CLI as well: the remote-provider warning must not run first.
+        det::ServeCliConfig rejected;
+        std::string cli_err;
+        CHECK(build_cli({"--backend", "ollama_cloud", "--ollama-cloud-config", bad.string()}, rejected, cli_err) == 2);
+        CHECK(cli_err.find(inline_key) == std::string::npos);
+        std::error_code ec;
+        fs::remove(bad, ec);
+    }
+    std::error_code ec;
+    fs::remove(config, ec);
+    fs::remove(key_file, ec);
+}
+
+TEST_CASE("serve_main: ollama_cloud base_url off the Ollama Cloud origin needs allow_custom_endpoint") {
+    const std::string marker = "attacker-marker";
+    const auto write = [](const std::string& name, const std::string& text) {
+        const auto p = temp_path(name);
+        std::ofstream(p, std::ios::binary) << text;
+        return p;
+    };
+    const std::string tail = R"(, "api_key_env": "OLLAMA_API_KEY", "models": ["gpt-oss:120b"]})";
+    // Canonical origin spellings load without the opt-in.
+    for (const std::string& url : {std::string("https://ollama.com"), std::string("https://OLLAMA.com:443/"),
+                                  std::string("https://ollama.com/")}) {
+        CAPTURE(url);
+        const auto p = write("cloud-canonical.json", R"({"base_url": ")" + url + "\"" + tail);
+        si::BackendSetup s;
+        const auto st = si::load_ollama_cloud_config(p.string(), s);
+        CHECK_MESSAGE(st.ok(), st.to_string());
+        CHECK_FALSE(s.ollama_cloud_allow_custom_endpoint);
+        std::error_code ec;
+        fs::remove(p, ec);
+    }
+    const std::vector<std::string> foreign = {"https://" + marker + ".example", "https://ollama.com:8443",
+                                              "https://ollama.com." + marker, "https://api.ollama.com"};
+    for (const std::string& url : foreign) {
+        CAPTURE(url);
+        const auto refused = write("cloud-custom.json", R"({"base_url": ")" + url + "\"" + tail);
+        si::BackendSetup s;
+        const auto st = si::load_ollama_cloud_config(refused.string(), s);
+        REQUIRE_FALSE(st.ok());
+        CHECK(st.message().find("allow_custom_endpoint") != std::string::npos);
+        CHECK(st.message().find(marker) == std::string::npos);
+        CHECK(st.message().find("8443") == std::string::npos);
+        // The CLI fails before the remote-provider warning prints the URL.
+        det::ServeCliConfig cfg;
+        std::string err;
+        CHECK(build_cli({"--backend", "ollama_cloud", "--ollama-cloud-config", refused.string()}, cfg, err) == 2);
+        CHECK(err.find(marker) == std::string::npos);
+
+        const auto allowed =
+            write("cloud-custom-ok.json", R"({"base_url": ")" + url + R"(", "allow_custom_endpoint": true)" + tail);
+        si::BackendSetup a;
+        const auto ok = si::load_ollama_cloud_config(allowed.string(), a);
+        CHECK_MESSAGE(ok.ok(), ok.to_string());
+        CHECK(a.ollama_cloud_allow_custom_endpoint);
+#if defined(SONDER_HAS_OLLAMA_CLOUD_BACKEND)
+        // make_backend forwards the opt-in; without it the backend refuses too.
+        a.backend = "ollama_cloud";
+        auto made = si::make_backend(a);
+        if (!made.ok()) {
+            // Only the key lookup may fail here (OLLAMA_API_KEY unset), never the endpoint.
+            CHECK(made.status().message().find("allow_custom_endpoint") == std::string::npos);
+        }
+        a.ollama_cloud_allow_custom_endpoint = false;
+        auto refused_backend = si::make_backend(a);
+        REQUIRE_FALSE(refused_backend.ok());
+        CHECK(refused_backend.status().message().find("allow_custom_endpoint") != std::string::npos);
+        CHECK(refused_backend.status().message().find(marker) == std::string::npos);
+#endif
+        std::error_code ec;
+        fs::remove(refused, ec);
+        fs::remove(allowed, ec);
+    }
+    // Strict types and bounds for the new fields.
+    for (const std::string& extra :
+         {std::string(R"("allow_custom_endpoint": "yes")"), std::string(R"("allow_custom_endpoint": 1)"),
+          std::string(R"("max_response_bytes": 0)"), std::string(R"("max_response_bytes": 67108865)"),
+          std::string(R"("max_response_bytes": "1")")}) {
+        CAPTURE(extra);
+        const auto p = write("cloud-bad-field.json", "{" + extra + tail);
+        si::BackendSetup s;
+        CHECK_FALSE(si::load_ollama_cloud_config(p.string(), s).ok());
+        std::error_code ec;
+        fs::remove(p, ec);
+    }
+    const auto lower = write("cloud-cap.json", R"({"max_response_bytes": 1048576)" + tail);
+    si::BackendSetup s;
+    REQUIRE(si::load_ollama_cloud_config(lower.string(), s).ok());
+    CHECK(s.ollama_cloud_max_response_bytes == 1048576u);
+    si::BackendSetup d;
+    CHECK(d.ollama_cloud_max_response_bytes == (std::uint64_t{64} << 20));
+    std::error_code ec;
+    fs::remove(lower, ec);
+}

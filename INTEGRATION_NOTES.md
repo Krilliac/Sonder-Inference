@@ -641,6 +641,38 @@ Not done / not verified:
 - `--request-timeout` is exact over the body; a server trickling header bytes
   can overrun it by up to one per-operation wait.
 
+## `claude/ret-02-ollama-cloud`: Ollama Cloud provider (module `src/backends/ollama_cloud`)
+
+Reference: `docs/integration/ollama-cloud.md`. Changes outside the module:
+
+1. Root `CMakeLists.txt`: `src/backends/ollama_cloud` added to
+   `SONDER_MODULE_DIRS` (one line).
+2. Core, additive only: `GenerateRequest::local_only` and
+   `ChatRequest::local_only` (`include/sonder/inference/backend.hpp`),
+   `RequestOptions::local_only` (`include/sonder/inference/session.hpp`),
+   forwarded in `src/sessions/session.cpp` (generate and native chat paths).
+   Default `false`, so every existing caller and backend is unchanged.
+3. Server: `X-Sonder-Local-Only` correlation header (`Correlation::local_only`,
+   `parse_correlation`), copied into `RequestOptions` for chat, completions and
+   responses; added to the CORS allow-headers list. `BackendSetup` gains the
+   `ollama_cloud_*` mirrors and `load_ollama_cloud_config()`;
+   `make_backend()` / `available_backend_names()` know `ollama_cloud`;
+   `sonder-infer serve --ollama-cloud-config PATH`; identity reports an honest
+   null for `ollama_cloud`. Security-review follow-up: the server refuses
+   `X-Sonder-Local-Only` against `ollama_cloud` before residency
+   (`refuse_local_only_remote` in `server.cpp`, `kRemoteProviderBackend` in
+   `server_policy.hpp`) for chat, messages, completions, responses,
+   embeddings, rerank and score; the config gains `allow_custom_endpoint`
+   and `max_response_bytes`.
+4. `src/net/http_client.*` (security-review follow-up, additive):
+   `HttpRequest::max_response_bytes` (0 = no cap, the default, so other
+   callers are unchanged) caps every received byte; the serialized request
+   head is reserved once, built without temporaries and wiped after sending
+   and on every exit path.
+5. Not done here: the C ABI and `sonder-infer` subcommands other than `serve`
+   do not expose `ollama_cloud` or `local_only` yet; the default presets keep
+   `SONDER_WITH_TLS=OFF`, so a deployment needs a TLS-enabled configure.
+
 ## `claude/ret-04-model-store` (module `src/models`)
 
 Read-only reader that serves an existing Ollama model library in place (manifests-v2 and legacy

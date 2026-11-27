@@ -34,9 +34,11 @@ inference onto the native in-process `llama.cpp` backend is in
     [docs/integration/llamacpp.md](docs/integration/llamacpp.md)). Planned to
     move to a single vendored, pinned `ggml`/`llama.cpp` tree with SI's own
     patch series ([docs/ROADMAP_SI_ONLY.md](docs/ROADMAP_SI_ONLY.md)).
-  - **Ollama Cloud** (**in progress, not yet merged on `main`**): opt-in
-    direct HTTPS provider for Ollama Cloud models with no local Ollama daemon
-    (RET-02 in [docs/ROADMAP_SI_ONLY.md](docs/ROADMAP_SI_ONLY.md)).
+  - `ollama_cloud`: Ollama's hosted cloud models straight over HTTPS
+    (`https://ollama.com`, bearer API key from an env var or token file), no
+    local daemon; opt-in per model, refuses `X-Sonder-Local-Only` requests;
+    needs a `SONDER_WITH_TLS=ON` build
+    ([docs/integration/ollama-cloud.md](docs/integration/ollama-cloud.md)).
   - `ollama` (**deprecated, scheduled for removal**): HTTP adapter for an
     Ollama server, with streaming and cancellation
     ([src/backends/ollama](src/backends/ollama/README.md)).

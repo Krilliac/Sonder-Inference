@@ -189,12 +189,17 @@ struct Correlation {
     // X-Sonder-No-Capture: forces the telemetry text-capture policy to off
     // for this request; it can never enable capture.
     bool no_text_capture = false;
+    // X-Sonder-Local-Only: with the ollama_cloud backend the server refuses
+    // the request before residency (no model load, no network I/O) and the
+    // backend refuses it again; other backends ignore it.
+    bool local_only = false;
 };
 
 // X-Sonder-Run-Id, -Parent-Request-Id, -Agent-Id, -Task-Id, -Workload,
 // -Priority. X-Sonder-Priority accepts the legacy integer -16..16 (retained
 // in Correlation::priority and mapped to interactive admission) or the
-// additive class names interactive, subagent and background. Invalid values:
+// additive class names interactive, subagent and background.
+// X-Sonder-Local-Only accepts 1/true or 0/false (case-insensitive). Invalid values:
 // 400 invalid_correlation_header naming the header.
 std::variant<Correlation, ApiError> parse_correlation(const RequestHead& head);
 std::optional<WorkloadClass> parse_workload(std::string_view name) noexcept;

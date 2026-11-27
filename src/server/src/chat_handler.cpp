@@ -202,6 +202,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     ro.request_id = make_id("req");
     ro.parent_request_id = corr.parent_request_id;
     ro.no_text_capture = corr.no_text_capture;
+    ro.local_only = corr.local_only;
     ro.session_key = chat_session_key(job, corr);
     ro.thinking = job.thinking;
     // Both protocols ask the backend to split reasoning from visible text.
@@ -746,6 +747,7 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
     ro.request_id = make_id("req");
     ro.parent_request_id = corr.parent_request_id;
     ro.no_text_capture = corr.no_text_capture;
+    ro.local_only = corr.local_only;
     if (job.session_key) {
         ro.session_key = *job.session_key;
     } else {

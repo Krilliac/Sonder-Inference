@@ -329,6 +329,9 @@ struct RequestOptions {
     std::optional<std::chrono::milliseconds> suspend_checkpoint_ttl = std::nullopt;
     // Allow cost-aware spill-to-checkpoint when selectively preempted under pressure.
     bool allow_preempt_spill = false;
+    // The caller requires on-premises execution; forwarded as
+    // GenerateRequest/ChatRequest::local_only, so remote providers refuse it.
+    bool local_only = false;
     // Optional stateful grammar matcher hooks (for ExactResume state snapshot/restore
     // and Branch reset on token_logits backends).
     std::optional<GrammarMatcherHooks> grammar_hooks = std::nullopt;
