@@ -807,25 +807,8 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     if (lc::Status s = lc::ValidatePlacementOptions(lo); !s.ok()) {
         return ToStatus(s);
     }
-    if (!o.lora_aliases.empty()) {
-        std::vector<std::string> seen_aliases;
-        seen_aliases.reserve(o.lora_aliases.size());
-        for (const auto& opt_alias : o.lora_aliases) {
-            lc::LoraAliasEntry entry;
-            entry.alias = opt_alias.alias;
-            entry.base_model = opt_alias.base_model;
-            entry.adapters.reserve(opt_alias.adapters.size());
-            for (const auto& a : opt_alias.adapters) {
-                entry.adapters.push_back(lc::LoraAdapterSpec{a.path, a.scale});
-            }
-            if (lc::Status s = lc::ValidateLoraAliasSyntax(entry); !s.ok()) {
-                return ToStatus(s);
-            }
-            if (std::find(seen_aliases.begin(), seen_aliases.end(), entry.alias) != seen_aliases.end()) {
-                return Status(ErrorCode::invalid_argument, "duplicate LoRA alias: " + entry.alias);
-            }
-            seen_aliases.push_back(entry.alias);
-        }
+    if (lc::Status s = lc::ValidateLoraAliasOptions(o.lora_aliases); !s.ok()) {
+        return ToStatus(s);
     }
     return ToStatus(lc::ValidateContextOptions(lo));
 }
@@ -1527,27 +1510,10 @@ public:
         if (options.model.empty()) return Status(ErrorCode::invalid_argument, "model path is empty");
         std::optional<lc::LoraAliasEntry> matched_alias;
         std::vector<std::string> effective_lora_roots;
-        for (const auto& alias_opt : options_.lora_aliases) {
-            if (alias_opt.alias == options.model) {
-                effective_lora_roots = options_.lora_roots.empty() ? options_.model_dirs : options_.lora_roots;
-                lc::LoraRegistry temp_reg(effective_lora_roots);
-                lc::LoraAliasEntry candidate;
-                candidate.alias = alias_opt.alias;
-                candidate.base_model = alias_opt.base_model;
-                candidate.adapters.reserve(alias_opt.adapters.size());
-                for (const auto& a : alias_opt.adapters) {
-                    candidate.adapters.push_back(lc::LoraAdapterSpec{a.path, a.scale});
-                }
-                if (lc::Status reg_s = temp_reg.RegisterAlias(candidate); !reg_s.ok()) {
-                    return ToStatus(reg_s);
-                }
-                lc::LoraAliasEntry resolved_alias;
-                if (lc::Status res_s = temp_reg.ResolveAlias(alias_opt.alias, resolved_alias); !res_s.ok()) {
-                    return ToStatus(res_s);
-                }
-                matched_alias = std::move(resolved_alias);
-                break;
-            }
+        if (lc::Status s = lc::ResolveConfiguredLoraAlias(options.model, options_.lora_aliases, options_.lora_roots,
+                                                          options_.model_dirs, matched_alias, effective_lora_roots);
+            !s.ok()) {
+            return ToStatus(s);
         }
         const std::string path = Resolve(matched_alias ? matched_alias->base_model : options.model);
 

@@ -438,6 +438,62 @@ Status ValidateLoraAliasSyntax(const LoraAliasEntry& entry) {
     return Status::Ok();
 }
 
+Status ValidateLoraAliasOptions(std::span<const sonder::inference::LlamaCppLoraAliasOption> aliases) {
+    if (aliases.empty()) return Status::Ok();
+    std::unordered_set<std::string> seen_aliases;
+    seen_aliases.reserve(aliases.size());
+    for (const auto& opt_alias : aliases) {
+        LoraAliasEntry entry;
+        entry.alias = opt_alias.alias;
+        entry.base_model = opt_alias.base_model;
+        entry.adapters.reserve(opt_alias.adapters.size());
+        for (const auto& a : opt_alias.adapters) {
+            entry.adapters.push_back(LoraAdapterSpec{a.path, a.scale});
+        }
+        if (Status s = ValidateLoraAliasSyntax(entry); !s.ok()) {
+            return s;
+        }
+        if (!seen_aliases.insert(entry.alias).second) {
+            return Status::Error(ErrorCode::kInvalidArgument, "duplicate LoRA alias: " + entry.alias);
+        }
+    }
+    return Status::Ok();
+}
+
+Status ResolveConfiguredLoraAlias(std::string_view requested_model,
+                                  std::span<const sonder::inference::LlamaCppLoraAliasOption> aliases,
+                                  const std::vector<std::string>& lora_roots,
+                                  const std::vector<std::string>& model_dirs,
+                                  std::optional<LoraAliasEntry>& matched_out,
+                                  std::vector<std::string>& effective_roots_out) {
+    matched_out.reset();
+    effective_roots_out.clear();
+    for (const auto& alias_opt : aliases) {
+        if (alias_opt.alias != requested_model) continue;
+        effective_roots_out = lora_roots.empty() ? model_dirs : lora_roots;
+        LoraRegistry temp_reg(effective_roots_out);
+        LoraAliasEntry candidate;
+        candidate.alias = alias_opt.alias;
+        candidate.base_model = alias_opt.base_model;
+        candidate.adapters.reserve(alias_opt.adapters.size());
+        for (const auto& a : alias_opt.adapters) {
+            candidate.adapters.push_back(LoraAdapterSpec{a.path, a.scale});
+        }
+        if (Status reg_s = temp_reg.RegisterAlias(candidate); !reg_s.ok()) {
+            effective_roots_out.clear();
+            return reg_s;
+        }
+        LoraAliasEntry resolved_alias;
+        if (Status res_s = temp_reg.ResolveAlias(alias_opt.alias, resolved_alias); !res_s.ok()) {
+            effective_roots_out.clear();
+            return res_s;
+        }
+        matched_out = std::move(resolved_alias);
+        return Status::Ok();
+    }
+    return Status::Ok();
+}
+
 // ---- LoraRegistry ----
 
 LoraRegistry::LoraRegistry(std::vector<std::string> model_roots) : model_roots_(std::move(model_roots)) {}
@@ -806,13 +862,14 @@ ScopedLoraApplication::~ScopedLoraApplication() {
 namespace {
 
 struct BackendHookEntry {
+    const LlamaCppBackend* owner = nullptr;
     void* impl = nullptr;
     const LlamaCppBackendLoraHooks* hooks = nullptr;
 };
 
 struct BackendHookRegistry {
     std::mutex mu;
-    std::unordered_map<const LlamaCppBackend*, BackendHookEntry> map;
+    std::vector<BackendHookEntry> entries;
 };
 
 BackendHookRegistry& GetBackendHookRegistry() noexcept {
@@ -824,8 +881,10 @@ BackendHookEntry LookupBackendHook(const LlamaCppBackend* owner) noexcept {
     if (owner == nullptr) return {};
     auto& reg = GetBackendHookRegistry();
     std::lock_guard<std::mutex> lock(reg.mu);
-    const auto it = reg.map.find(owner);
-    return it == reg.map.end() ? BackendHookEntry{} : it->second;
+    for (const BackendHookEntry& e : reg.entries) {
+        if (e.owner == owner) return e;
+    }
+    return {};
 }
 
 std::string ReadModelMetaStr(const llama_model* model, const char* key) {
@@ -909,17 +968,13 @@ public:
 
         const int64_t alpha_id = gguf_find_key(gctx, "adapter.lora.alpha");
         if (alpha_id >= 0) {
-            const gguf_type t = gguf_get_kv_type(gctx, alpha_id);
-            if (t == GGUF_TYPE_FLOAT32) {
+            if (gguf_get_kv_type(gctx, alpha_id) == GGUF_TYPE_FLOAT32) {
                 out.alpha = gguf_get_val_f32(gctx, alpha_id);
-            } else if (t == GGUF_TYPE_FLOAT64) {
-                out.alpha = static_cast<float>(gguf_get_val_f64(gctx, alpha_id));
-            } else if (t == GGUF_TYPE_UINT32) {
-                out.alpha = static_cast<float>(gguf_get_val_u32(gctx, alpha_id));
-            } else if (t == GGUF_TYPE_INT32) {
-                out.alpha = static_cast<float>(gguf_get_val_i32(gctx, alpha_id));
             } else {
-                // Present with a non-numeric GGUF type: mark invalid so compatibility fails closed.
+                // Upstream llama.cpp v1.0.0 reads adapter.lora.alpha with gguf_get_val_f32
+                // (src/llama-adapter.cpp:199-201, 221), whose GGML_ASSERT aborts on any
+                // non-FLOAT32 type (ggml/src/gguf.cpp:196). Mark invalid so compatibility
+                // fails closed before llama_adapter_lora_init.
                 out.alpha = std::numeric_limits<float>::quiet_NaN();
             }
         }
@@ -1043,18 +1098,52 @@ LoraAdapterManager* EnsureLoraManager(const BackendHookEntry& entry, const std::
 }  // namespace
 
 void RegisterLlamaCppBackendForLora(const LlamaCppBackend* owner, void* impl,
-                                    const LlamaCppBackendLoraHooks* hooks) noexcept {
+                                    const LlamaCppBackendLoraHooks* hooks) {
     if (owner == nullptr || impl == nullptr || hooks == nullptr) return;
     auto& reg = GetBackendHookRegistry();
     std::lock_guard<std::mutex> lock(reg.mu);
-    reg.map[owner] = BackendHookEntry{impl, hooks};
+    for (BackendHookEntry& e : reg.entries) {
+        if (e.owner == owner) {
+            e.impl = impl;
+            e.hooks = hooks;
+            return;
+        }
+    }
+    reg.entries.push_back(BackendHookEntry{owner, impl, hooks});
+}
+
+void TransferLlamaCppBackendForLora(const LlamaCppBackend* from, const LlamaCppBackend* to) noexcept {
+    if (from == nullptr || to == nullptr || from == to) return;
+    auto& reg = GetBackendHookRegistry();
+    std::lock_guard<std::mutex> lock(reg.mu);
+    // Remove any existing slot owned by `to` in-place (zero allocation).
+    for (std::size_t i = 0; i < reg.entries.size(); ++i) {
+        if (reg.entries[i].owner == to) {
+            reg.entries[i] = reg.entries.back();
+            reg.entries.pop_back();
+            break;
+        }
+    }
+    // Rebind `from`'s existing slot to `to` in-place (zero allocation).
+    for (BackendHookEntry& e : reg.entries) {
+        if (e.owner == from) {
+            e.owner = to;
+            return;
+        }
+    }
 }
 
 void UnregisterLlamaCppBackendForLora(const LlamaCppBackend* owner) noexcept {
     if (owner == nullptr) return;
     auto& reg = GetBackendHookRegistry();
     std::lock_guard<std::mutex> lock(reg.mu);
-    reg.map.erase(owner);
+    for (std::size_t i = 0; i < reg.entries.size(); ++i) {
+        if (reg.entries[i].owner == owner) {
+            reg.entries[i] = reg.entries.back();
+            reg.entries.pop_back();
+            return;
+        }
+    }
 }
 
 Status ApplyLoraAdapters(LlamaCppBackend& backend, const std::vector<LoraAdapterSpec>& adapters,

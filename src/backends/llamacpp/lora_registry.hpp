@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
+#include "sonder/inference/backends/llamacpp.hpp"
 
 namespace sonder::backends::llamacpp {
 
@@ -128,6 +129,20 @@ public:
 // Validates alias entry syntax and scale/path-traversal rules without disk I/O.
 [[nodiscard]] Status ValidateLoraAliasSyntax(const LoraAliasEntry& entry);
 
+// Pure startup validator for LlamaCppBackendOptions::lora_aliases (checks
+// syntax, scales, lexical path rules, and duplicate alias names without disk I/O).
+[[nodiscard]] Status ValidateLoraAliasOptions(
+    std::span<const sonder::inference::LlamaCppLoraAliasOption> aliases);
+
+// Resolves `requested_model` against configured `aliases`. If matched,
+// validates adapter paths against `lora_roots` (falling back to `model_dirs`
+// when empty) and populates `matched_out` and `effective_roots_out`. When
+// `requested_model` is not a configured alias, clears `matched_out` and returns Ok.
+[[nodiscard]] Status ResolveConfiguredLoraAlias(
+    std::string_view requested_model, std::span<const sonder::inference::LlamaCppLoraAliasOption> aliases,
+    const std::vector<std::string>& lora_roots, const std::vector<std::string>& model_dirs,
+    std::optional<LoraAliasEntry>& matched_out, std::vector<std::string>& effective_roots_out);
+
 // ---- Registry: alias -> (base_model, adapters + scales) ----
 
 class LoraRegistry {
@@ -153,6 +168,16 @@ private:
 };
 
 // ---- Adapter lifecycle manager bound to one loaded model/context ----
+//
+// Concurrency and context scope:
+//   - ApplyAdapters, ApplyAlias, ClearActive, UnloadAdapter, UnloadAll, and
+//     ScopedLoraApplication mutate the backend's single shared generation
+//     llama_context (`ctx`). They MUST only be called while the continuous-
+//     batching worker (`n_slots > 1`) is stopped (e.g., at model load/unload
+//     or under exclusive quiescence with no concurrent decode in flight).
+//   - Auxiliary isolated contexts (`embed_ctx`, `rank_ctx`, and speculative
+//     MTP `ctx_dft`) do not receive LoRA adapters and always run on the base
+//     model weights without adapters attached.
 
 class LoraAdapterManager {
 public:
@@ -200,6 +225,9 @@ private:
 
 // RAII guard for per-request LoRA overrides: applies `adapters` (or clears
 // adapters when empty) and restores the previous active set on destruction.
+// Operates on the single shared generation context (`ctx`) and must only be
+// used while the batch worker is stopped (no concurrent decode in flight);
+// embed/rank/draft contexts run without the adapter.
 class ScopedLoraApplication {
 public:
     ScopedLoraApplication(LoraAdapterManager& manager, const std::vector<LoraAdapterSpec>& adapters,
@@ -228,10 +256,17 @@ struct LlamaCppBackendLoraHooks {
     std::unique_ptr<LoraAdapterManager>& (*lora_manager_slot)(void* impl) noexcept = nullptr;
 };
 
+// Registers a newly constructed LlamaCppBackend instance for LoRA hooks (called
+// from the non-noexcept constructor). Transfer/Unregister mutate the existing
+// table slot in place without allocating so move/destroy paths stay noexcept.
 void RegisterLlamaCppBackendForLora(const LlamaCppBackend* owner, void* impl,
-                                    const LlamaCppBackendLoraHooks* hooks) noexcept;
+                                    const LlamaCppBackendLoraHooks* hooks);
+void TransferLlamaCppBackendForLora(const LlamaCppBackend* from, const LlamaCppBackend* to) noexcept;
 void UnregisterLlamaCppBackendForLora(const LlamaCppBackend* owner) noexcept;
 
+// Context-mutating LoRA hooks act on the backend's single shared generation
+// context (`ctx`) and must only be called while the batch worker is stopped.
+// Auxiliary embed, rank, and speculative draft contexts run without LoRA adapters.
 Status ApplyLoraAdapters(LlamaCppBackend& backend, const std::vector<LoraAdapterSpec>& adapters,
                          const std::vector<std::string>& model_roots);
 Status ApplyLoraAlias(LlamaCppBackend& backend, const LoraRegistry& registry, std::string_view alias);

@@ -15,6 +15,13 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
+#include "gguf.h"
 #include "lora_registry.hpp"
 #include "sonder/inference/backends/llamacpp.hpp"
 
@@ -39,8 +46,13 @@ public:
         static std::atomic<std::uint64_t> counter{0};
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
         const std::uint64_t id = counter.fetch_add(1, std::memory_order_relaxed);
+#if defined(_WIN32)
+        const int pid = _getpid();
+#else
+        const int pid = static_cast<int>(getpid());
+#endif
         root_ = fs::temp_directory_path() /
-                ("sonder_lora_test_" + std::to_string(stamp) + "_" + std::to_string(id));
+                ("sonder_lora_test_" + std::to_string(pid) + "_" + std::to_string(stamp) + "_" + std::to_string(id));
         fs::create_directories(root_);
     }
     ~TempDir() {
@@ -595,15 +607,70 @@ TEST_CASE("lora: core backend options validation, capability advertisement, and 
     CHECK(ActiveLoraAdapters(raw_be).empty());
 
     // Vocab-only load with bundled non-adapter GGUF exercises real GGUF metadata check refusal
-    // and verifies move-constructed LlamaCppBackend preserves LoRA hook registration cleanly.
+    // and verifies move-constructed and move-assigned LlamaCppBackend preserve LoRA hooks cleanly.
     LoadOptions lo;
     lo.model_path = std::string(SONDER_LLAMACPP_VOCAB_DIR) + "/ggml-vocab-llama-spm.gguf";
     lo.vocab_only = true;
     REQUIRE(raw_be.Load(lo).ok());
     LlamaCppBackend moved_be(std::move(raw_be));
+    LlamaCppBackend assigned_be;
+    assigned_be = std::move(moved_be);
     const Status non_adapter_st =
-        ApplyLoraAdapters(moved_be, {{"ggml-vocab-llama-spm.gguf", 1.0F}}, {SONDER_LLAMACPP_VOCAB_DIR});
+        ApplyLoraAdapters(assigned_be, {{"ggml-vocab-llama-spm.gguf", 1.0F}}, {SONDER_LLAMACPP_VOCAB_DIR});
     CHECK_FALSE(non_adapter_st.ok());
     CHECK(non_adapter_st.code == ErrorCode::kInvalidArgument);
-    moved_be.Unload();
+    assigned_be.Unload();
+}
+
+TEST_CASE("lora: non-F32 adapter.lora.alpha GGUF is refused before llama_adapter_lora_init") {
+    TempDir tmp;
+    const fs::path root = tmp.path() / "models";
+    fs::create_directories(root);
+
+    auto write_alpha_gguf = [&](const std::string& filename, auto&& set_alpha) -> fs::path {
+        const fs::path out = root / filename;
+        gguf_context* gctx = gguf_init_empty();
+        REQUIRE(gctx != nullptr);
+        gguf_set_val_str(gctx, "general.type", "adapter");
+        gguf_set_val_str(gctx, "adapter.type", "lora");
+        gguf_set_val_str(gctx, "general.architecture", "llama");
+        set_alpha(gctx);
+        const std::string out_utf8 = PathToUtf8(out);
+        const bool written = gguf_write_to_file(gctx, out_utf8.c_str(), /*only_meta=*/true);
+        gguf_free(gctx);
+        REQUIRE(written);
+        return out;
+    };
+
+    const fs::path u32_path =
+        write_alpha_gguf("alpha_u32.gguf", [](gguf_context* g) { gguf_set_val_u32(g, "adapter.lora.alpha", 16u); });
+    const fs::path i32_path =
+        write_alpha_gguf("alpha_i32.gguf", [](gguf_context* g) { gguf_set_val_i32(g, "adapter.lora.alpha", 16); });
+    const fs::path f64_path =
+        write_alpha_gguf("alpha_f64.gguf", [](gguf_context* g) { gguf_set_val_f64(g, "adapter.lora.alpha", 16.0); });
+    const fs::path str_path =
+        write_alpha_gguf("alpha_str.gguf", [](gguf_context* g) { gguf_set_val_str(g, "adapter.lora.alpha", "16.0"); });
+    const fs::path f32_path =
+        write_alpha_gguf("alpha_f32.gguf", [](gguf_context* g) { gguf_set_val_f32(g, "adapter.lora.alpha", 16.0f); });
+
+    LlamaCppBackend be;
+    LoadOptions lo;
+    lo.model_path = std::string(SONDER_LLAMACPP_VOCAB_DIR) + "/ggml-vocab-llama-spm.gguf";
+    lo.vocab_only = true;
+    REQUIRE(be.Load(lo).ok());
+
+    const std::vector<std::string> roots = {PathToUtf8(root)};
+    for (const fs::path& p : {u32_path, i32_path, f64_path, str_path}) {
+        CAPTURE(PathToUtf8(p));
+        const Status st = ApplyLoraAdapters(be, {{PathToUtf8(p), 1.0F}}, roots);
+        CHECK(st.code == ErrorCode::kInvalidArgument);
+        CHECK(st.message.find("alpha") != std::string::npos);
+    }
+
+    // Valid GGUF_TYPE_FLOAT32 alpha passes compatibility check (on vocab-only load
+    // with no context, ApplyLoraAdapters reaches the no-context kNotLoaded check).
+    const Status f32_st = ApplyLoraAdapters(be, {{PathToUtf8(f32_path), 1.0F}}, roots);
+    CHECK(f32_st.code == ErrorCode::kNotLoaded);
+
+    be.Unload();
 }

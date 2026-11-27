@@ -2296,20 +2296,22 @@ LlamaCppBackend::~LlamaCppBackend() {
     UnregisterLlamaCppBackendForLora(this);
 }
 LlamaCppBackend::LlamaCppBackend(LlamaCppBackend&& other) noexcept : impl_(std::move(other.impl_)) {
-    UnregisterLlamaCppBackendForLora(&other);
     if (impl_) {
         impl_->owner.store(this, std::memory_order_release);
-        RegisterLlamaCppBackendForLora(this, impl_.get(), Impl::LoraHooks());
+        TransferLlamaCppBackendForLora(&other, this);
+    } else {
+        UnregisterLlamaCppBackendForLora(&other);
     }
 }
 LlamaCppBackend& LlamaCppBackend::operator=(LlamaCppBackend&& other) noexcept {
     if (this != &other) {
-        UnregisterLlamaCppBackendForLora(&other);
         UnregisterLlamaCppBackendForLora(this);
         impl_ = std::move(other.impl_);
         if (impl_) {
             impl_->owner.store(this, std::memory_order_release);
-            RegisterLlamaCppBackendForLora(this, impl_.get(), Impl::LoraHooks());
+            TransferLlamaCppBackendForLora(&other, this);
+        } else {
+            UnregisterLlamaCppBackendForLora(&other);
         }
     }
     return *this;
