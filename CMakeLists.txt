@@ -102,9 +102,11 @@ endif()
 if(SONDER_BUILD_TESTS)
     enable_testing()
     include(SonderDoctest)
-    # Test-only seams in src/common/safe_file.* (a weak-identity switch and a directory-entry
-    # counter). Compiled in only when the test suite is built; a library built with
-    # -DSONDER_BUILD_TESTS=OFF contains neither.
+    # Test-only seams in src/common/safe_file.* and src/models (a weak-identity switch, a
+    # directory-entry counter, a hash-slot hook). They live in the library's own sources, so they
+    # are compiled in whenever the test suite is built (SONDER_BUILD_TESTS defaults to ON for a
+    # top-level build, release and CI presets included); a library built with
+    # -DSONDER_BUILD_TESTS=OFF contains none of them. Store contents cannot reach them.
     target_compile_definitions(sonder_inference PUBLIC SONDER_INFERENCE_TEST_HOOKS=1)
 endif()
 

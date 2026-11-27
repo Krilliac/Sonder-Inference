@@ -62,8 +62,16 @@ or stale cache must never decide whether a model is served.
 
 ## Unsupported entries
 
-A record has `status` `ready` or `unsupported`; an unsupported record keeps everything that
-was parsed and carries `reason` + `detail`. Precedence: the first reason found wins.
+A record has `status` `ready`, `unsupported` or `incomplete`; an unsupported record keeps everything
+that was parsed and carries `reason` + `detail`. Precedence: the first reason found wins.
+`incomplete` is a record whose small layers (config, params, template, system, messages) were
+omitted because the scan's or the registry's retained-content budget was spent
+(`text_omitted`): those layers were opened and size-checked but neither read nor hashed, and
+the classification (a cloud stub, a safetensors config) is provisional, so it is never `ready`
+(`ModelRecord::ready()` is false, the JSON `status` is `"incomplete"`, the CLI table says
+`incomplete`). `resolve()` of the name reads everything and answers `ready` or `unsupported`;
+the registry never serves an incomplete record without doing that. A consumer treats any
+`status` other than `ready` as not servable (schema `/2` gained the value; it is additive).
 
 | `reason` | Meaning |
 | --- | --- |
@@ -77,7 +85,7 @@ was parsed and carries `reason` + `detail`. Precedence: the first reason found w
 | `unsafe_path` | a manifest, a directory on its path, `blobs/` or a blob is a symlink, junction or other reparse point, is not a regular disk file, or (manifests and small layers) has more than one hard link. |
 | `digest_mismatch` | a small layer, or a weight that was hashed (see the policy below), does not hash to its digest. |
 | `blob_busy` | (Windows) a weight blob is open for writing by another process, so it cannot be opened with writers denied to hash or serve it. Transient: the registry checks again on the next lookup. |
-| `hash_limit` | the weights were not hashed to the end: a blob is larger than `StoreOptions::max_weight_file_bytes` (default 1 TiB), the distinct weight blobs of the resolve add up to more than `max_resolve_weight_bytes` (default 2 TiB; refused before anything is opened or hashed), or hashing ran past `weight_hash_timeout` (default 3 hours per resolve) or was cancelled (`weight_hash_cancel`, or `ResolveOptions::cancel` of that call). Transient: nothing is remembered and the next lookup tries again. |
+| `hash_limit` | the weights were not hashed to the end: a blob is larger than `StoreOptions::max_weight_file_bytes` (default 1 TiB), the distinct weight blobs of the resolve add up to more than `max_resolve_weight_bytes` (default 2 TiB; refused before anything is opened or hashed), or hashing ran past `weight_hash_timeout` (default 3 hours per resolve) or was cancelled (`weight_hash_cancel`, or `ResolveOptions::cancel` of that call), or one `scan()` under `always` already hashed (or was about to pass) its total of `max_resolve_weight_bytes` / `weight_hash_timeout`, or checking the weights threw. Transient: nothing is remembered and the next lookup tries again. |
 | `no_compatible_manifest` | manifest list without a `llamacpp`/`ggml` GGUF child. |
 | `manifest_invalid` | unreadable/oversized/not JSON/not an object, a repeated JSON key, a size that is not a non-negative integer (`24.9`, `-1`, `"24"`), a digest that is not exactly `sha256:<64 hex>` (the `sha256-` spelling is only a blob file name), more than 64 content layers or 64 list children, small layers over 4 MiB each or 16 MiB together, declared sizes that overflow 64 bits, a list child whose blob does not match its digest. |
 
@@ -178,13 +186,23 @@ the bytes were hashed in this call, through a handle that denies writers on Wind
   than `max_weight_file_bytes` (default 1 TiB) is not hashed. (3) All the hashing of one resolve
   (and of one `verify_blobs()` call) has one deadline, `weight_hash_timeout`, default 3 hours
   (`kDefaultWeightHashTimeout`: 2 TiB at the portable SHA-256's slow end, about 90 minutes per TiB),
-  counted from when it starts to hash and including the wait for a hash slot or for another
-  thread's hash; zero removes it (a service should keep a finite value). A hash also stops when
+  counted from the start of that resolve's weight verification (so `on_weight_hash` callbacks and
+  file opens count) and including the wait for a hash slot or for another thread's hash; zero
+  removes it (a service should keep a finite value). A hash also stops when
   the store-wide `weight_hash_cancel` is cancelled (a shutdown switch: never resettable, the
   options are copied at `open()`) or when the `ResolveOptions::cancel` given to that one
   `resolve()` / `resolve_for_load()` is, which also ends the wait for a slot or for another
-  thread's hash and affects nothing else (test "a per-call cancel stops one resolve and leaves
-  the store usable"). Whichever limit is hit, the entry is `hash_limit`, a transient failure:
+  thread's hash and affects nothing else (tests "a per-call cancel stops one resolve and leaves
+  the store usable" and, with the slot holders stopped by a test hook so no timing is involved,
+  "a per-call cancel also ends the wait for a hash slot"). `scan()`, `add_ollama_dir()` and
+  `refresh()` take a `ResolveOptions` too, and under `always` (the only policy that hashes in a
+  scan) one scan of one store shares ONE total: the declared weights of all its records together
+  may add up to `max_resolve_weight_bytes`, its hashing may take `weight_hash_timeout` from the
+  start of the scan, and the call's cancel ends it; a record past the total is `hash_limit` and
+  the scan goes on. An exception while one record's weights are checked (a failed allocation, a
+  throwing `on_weight_hash`) makes that record `hash_limit` (transient) instead of ending the
+  scan (tests "a scan under always shares one weight total, ..." and "an exception while one
+  record's weights are checked ..."). Whichever limit is hit, the entry is `hash_limit`, a transient failure:
   nothing is remembered, a registry never reuses it, and threads waiting for that hash are
   released to try for themselves (test "weight hashing is bounded by file size, time and
   cancellation"). `verify_blobs()` applies `max_weight_file_bytes`, the deadline and
@@ -235,25 +253,47 @@ the bytes were hashed in this call, through a handle that denies writers on Wind
   Retained content (`ScanLimits::max_retained_text_bytes`, default 64 MiB): the small layers
   (config, params, template, system, messages) one scan keeps, all records together. Each
   layer's declared size is charged before it is read; once the next one would not fit, the scan
-  reads no more of them, notes it, and sets `ModelRecord::text_omitted` on the records concerned.
-  Those layers are opened, stamped and checked for size and link count (one that cannot be opened,
-  or has the wrong size, makes the record unsupported, as reading it would) but not read or
-  hashed, so the config, params and text fields of such a record, and what is classified from
-  them, are empty or provisional. `resolve()` reads everything, `OllamaStore::revalidate()`
-  returns false for a `text_omitted` record, and the registry never serves a cached
-  `text_omitted` record without resolving it again. What a record keeps of a layer is also
-  capped per field: a config string 1 KiB (cut), a config array 32 entries of 256 bytes, params
-  unmodelled options ("extras") 64 entries and 64 KiB in all, `runner` / `format` / a layer's
-  `from` 256 bytes; anything over is cut or skipped with a warning (test "config strings and
-  arrays and params extras are capped per field"). The registry counts all of it (template,
-  system, messages, config strings and arrays, `params.stop`, `params.extra`, runner, format,
-  parent) in one running total over the scan records of all its stores plus its live results,
-  and strips what would not fit (`text_omitted`). `add_ollama_dir()` and `refresh()` hand each
-  store's scan what is left of that one allowance and retain each store's records before the
-  next store is read, so N stores never hold N budgets (test "refresh and add_ollama_dir share
-  one retained-content allowance across stores"). Not counted, because each is bounded per record
-  by a constant (about 100 KiB together): names, paths, the blob list, source stamps, `detail`
-  and warnings; so a library of `max_models` records holds at most about that much more.
+  reads no more of them, notes it, and sets `ModelRecord::text_omitted` on the records concerned,
+  whose status is then `incomplete`, not `ready` (see "Unsupported entries"). Those layers are
+  opened, stamped and checked for size and link count (one that cannot be opened, or has the
+  wrong size, makes the record unsupported, as reading it would) but not read or hashed, so the
+  config, params and text fields of such a record, and what is classified from them, are empty
+  or provisional. `resolve()` reads everything, `OllamaStore::revalidate()` returns false for a
+  `text_omitted` record, and the registry never serves a cached `text_omitted` record without
+  resolving it again. What a record keeps of a layer is also capped per field: a config string
+  1 KiB (cut), a config array 32 entries of 256 bytes, params unmodelled options ("extras")
+  64 entries and 64 KiB in all, and `runner` / `format` / a layer's `from`, `mediaType`, `name`
+  and `digest` 256 bytes; anything over is cut or skipped with a warning (tests "config strings
+  and arrays and params extras are capped per field" and "a huge manifest mediaType is cut ...").
+  A cut always builds a fresh allocation of the cut size, never `resize()` on the large string,
+  and the registry counts strings by capacity, so a string cannot hide a large buffer behind a
+  short size (the same test checks `capacity()`).
+  **What is charged.** The registry counts everything a cached record holds that a manifest or a
+  layer can make large: template, system, messages, config strings and arrays, `params.stop`,
+  `params.extra`, runner, format, parent, warnings, `detail` past 256 bytes, the blob list (each
+  blob's `mediaType`, digest, `from` and path), the shard, projector, adapter and draft paths and
+  the source stamps (vectors by capacity after a shrink). Not charged is the per-record base that
+  cannot be dropped without dropping the entry: its name, manifest path, store root, model path
+  and a `detail` of at most 256 bytes, a few hundred bytes to about 2 KiB per record and at most
+  `max_models` records per store. A record that does not fit what is left is stripped
+  (`text_omitted`, status `incomplete`: text, config, params, warnings, blob strings dropped) and,
+  if even that does not fit, collapsed to its base (also the blob list, other paths and source
+  stamps dropped); `resolve()` always returns the whole record to the caller (test "the registry
+  charges warnings, blobs, paths and sources, and strips them under a small budget").
+  **One allowance, one scan at a time.** The registry's `add_ollama_dir()` and `refresh()` run one
+  at a time (a scan mutex apart from the one `list()` and `resolve()` use, so those are not
+  stalled). Each record is retained as soon as it is built: the registry first drops that name's
+  old record (refresh), reserves the declared bytes of its small layers out of what is neither
+  retained nor already reserved, builds it, and retains it, so old and new content of a name
+  never add up and the sum of retained and reserved bytes never passes the budget, however many
+  stores there are (`ModelRegistry::retained_bytes_peak()` is the high-water mark; test
+  "concurrent refresh, add and resolve never hold more than max_retained_text_bytes", and
+  "refresh and add_ollama_dir share one retained-content allowance across stores"). A name an
+  earlier store produced is not built again. Working memory while one record is being built (its
+  layers as read, up to 16 MiB, and their parse trees) is transient, one record at a time, and not
+  retained. Cost: while a refresh runs, a name's record is briefly absent from `list()` between
+  its drop and its replacement (`resolve()` then reads the store), and a refresh of a registry
+  that is full keeps its own order: earlier names get the room first.
   A scan that runs out of memory for one entry reports that entry as unsupported
   (`manifest_invalid`, never reused) and goes on. Tests "config and params layers are charged to
   max_retained_text_bytes before they are read" and "a scan keeps template, system and messages
@@ -311,8 +351,10 @@ Known limits (the remaining post-check windows):
   keep their text under `max_retained_text_bytes` follows the scan's name order.
 - **One resolve can still read up to 16 MiB of text** (the per-manifest small-layer cap) while it
   runs; the retained-text budget bounds what scans and the registry keep, not a single call.
-- **Hash limits are per resolve, not per caller.** `weight_hash_timeout` is one deadline for all
-  the hashing of one resolve, and `max_resolve_weight_bytes` caps its declared weights, but
+- **Hash limits are per resolve (or per store scan), not per caller.** `weight_hash_timeout` is one
+  deadline for all the hashing of one resolve (or of one scan of one store, under `always`),
+  and `max_resolve_weight_bytes` caps its declared weights (a scan counts the declared size of
+  every record's distinct weights, shared files included), but
   threads that retry after a `hash_limit` start a new resolve with a new deadline; a service
   should rate-limit them. Request-level admission for an HTTP path is not here; the store is not
   wired to the server.
@@ -342,7 +384,20 @@ the `sonder.inference.model_store/2` document (`source`, `models[]` with `files`
 `params`, `template`, `system`, `gguf`, `weights_verified`, `weight_check`, `text_omitted`,
 `warnings`, and `verification` when `--verify` ran). Schema `/2` (PR 135 round 4) replaced `/1`:
 `weights_verified` now means `weight_check == "hashed_now"` (hashed in this call), and
-`weight_check` and `text_omitted` were added.
+`weight_check` and `text_omitted` were added; `status` may also be `"incomplete"` (see above).
+
+## Test hooks
+
+`SONDER_INFERENCE_TEST_HOOKS` is defined, PUBLIC, on `sonder_inference` whenever
+`SONDER_BUILD_TESTS` is ON, and that option defaults to ON for a top-level build, so every preset
+(release and CI included) compiles the hooks into the library; only a build with
+`-DSONDER_BUILD_TESTS=OFF` (a consumer that adds Sonder as a subproject gets that default)
+leaves them out. They are a process-wide weak-identity switch and a directory-entry counter
+(`src/common/safe_file.hpp`) and `set_hash_slot_hook_for_testing()`, which runs a callback on
+the hashing thread after it took a hash slot. They are not reachable from store contents,
+manifests or any data a reader processes, only from code linked into the process that calls
+them, and they are not gated per test target because they live in the library's own sources;
+a library that must not carry them is built with tests off.
 Exit status: 0 ok, 1 failure (directory unreadable, name not found, verification failed),
 2 usage error. Entries that cannot be served are listed, not errors.
 

@@ -210,6 +210,7 @@ int models_main(const std::vector<std::string>& args, std::ostream& out, std::os
     }
 
     std::size_t ready = 0;
+    std::size_t incomplete = 0;
     std::size_t shared_entries = 0;
     std::uint64_t ready_bytes = 0;
     std::map<std::string, std::string> weight_owner;  // weight blob digest -> first ready entry that references it
@@ -249,6 +250,10 @@ int models_main(const std::vector<std::string>& args, std::ostream& out, std::os
             for (const auto& p : r.adapter_paths) out << "    adapter: " << path_text(p) << "\n";
             for (const auto& p : r.draft_paths) out << "    draft: " << path_text(p) << "\n";
             if (!shares_with.empty()) out << "    note: same weights file as " << shares_with << "\n";
+        } else if (r.status == EntryStatus::incomplete) {
+            ++incomplete;
+            out << "incomplete   (some small layers were not read: ScanLimits::max_retained_text_bytes was spent; "
+                   "resolve reads them)\n";
         } else {
             out << "unsupported  (" << to_string(r.reason) << ") " << r.detail << "\n";
         }
@@ -268,7 +273,9 @@ int models_main(const std::vector<std::string>& args, std::ostream& out, std::os
     out << scan.records.size() << " entries: " << ready << " ready (" << human_bytes(ready_bytes)
         << " of distinct weight files referenced in place";
     if (shared_entries != 0) out << "; " << shared_entries << " entries share a weights file with an earlier one";
-    out << "), " << (scan.records.size() - ready) << " unsupported\n";
+    out << "), " << (scan.records.size() - ready - incomplete) << " unsupported";
+    if (incomplete != 0) out << ", " << incomplete << " incomplete";
+    out << "\n";
     if (!o.verify) {
         out << "digests not verified (pass --verify to hash the blobs; it reads every byte)\n";
     }

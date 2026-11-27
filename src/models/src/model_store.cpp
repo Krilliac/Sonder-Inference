@@ -106,9 +106,30 @@ struct StoreAnchor {
 // What a scan may still keep of the small layers (ScanLimits::max_retained_text_bytes): each
 // layer's declared size is charged before the layer is read. Once one did not fit, `reached` is
 // set and no later layer is read. One budget may be carried through several scans.
+//
+// A ModelRegistry also uses it to hand the scan its own accounting: `reserve` replaces `left`
+// (it grants a declared size out of what the registry has not yet retained or reserved),
+// `wants` is asked per entry (by name key) before the entry is built and may drop the old
+// record of that name first, and `accept` takes each finished record, so the registry keeps
+// each one before the next is built. All three are called on the scanning thread.
 struct RetainBudget {
     std::uint64_t left = 0;
     bool reached = false;
+    std::function<bool(std::uint64_t)> reserve;
+    std::uint64_t reserved = 0;  // granted through `reserve` for the record being built
+    std::function<bool(const std::string&)> wants;
+    std::function<void(ModelRecord&&)> accept;
+
+    bool take(std::uint64_t size) {
+        if (reserve) {
+            if (!reserve(size)) return false;
+            reserved += size;
+            return true;
+        }
+        if (size > left) return false;
+        left -= size;
+        return true;
+    }
 };
 
 namespace store_text {
@@ -240,12 +261,13 @@ std::string lower(std::string_view s) {
 
 // `s` cut to at most `max` bytes, backed up to a UTF-8 boundary (parsed JSON strings are valid
 // UTF-8, so the cut never leaves half a sequence).
-std::string clip_utf8(std::string s, std::size_t max) {
-    if (s.size() <= max) return s;
+// Always a fresh allocation of the clipped size: resize() would keep the original (possibly
+// multi-megabyte) buffer alive behind the short string.
+std::string clip_utf8(std::string_view s, std::size_t max) {
+    if (s.size() <= max) return std::string(s);
     std::size_t n = max;
     while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0u) == 0x80u) --n;
-    s.resize(n);
-    return s;
+    return std::string(s.data(), n);
 }
 
 // What a parsed JSON value costs to keep: its node, its text and its children. Recursion is
@@ -614,15 +636,15 @@ bool parse_layer(const json::Value& v, LayerInfo& l, std::string& error) {
             error = "layer mediaType is not a string";
             return false;
         }
-        l.media_type = m->as_string();
+        l.media_type = clip_utf8(m->as_string(), kMaxManifestFieldBytes);
     }
     if (const auto* d = v.find("digest")) {
         if (!d->is_string()) {
             error = "layer digest is not a string";
             return false;
         }
-        l.raw_digest = d->as_string();
-        if (auto hex = manifest_digest_hex(l.raw_digest)) l.hex = *hex;
+        if (auto hex = manifest_digest_hex(d->as_string())) l.hex = *hex;
+        l.raw_digest = clip_utf8(d->as_string(), kMaxManifestFieldBytes);
     }
     if (const auto* s = v.find("size")) {
         if (!json_size(*s, l.size)) {
@@ -632,7 +654,7 @@ bool parse_layer(const json::Value& v, LayerInfo& l, std::string& error) {
         l.has_size = true;
     }
     if (const auto* f = v.find("from"); f && f->is_string()) l.from = clip_utf8(f->as_string(), kMaxManifestFieldBytes);
-    if (const auto* n = v.find("name"); n && n->is_string()) l.name = n->as_string();
+    if (const auto* n = v.find("name"); n && n->is_string()) l.name = clip_utf8(n->as_string(), kMaxManifestFieldBytes);
     return true;
 }
 
@@ -824,7 +846,7 @@ void parse_config(const json::Value& doc, ModelRecord& r) {
         if (v.size() > kMaxConfigStringBytes) {
             warn(r, std::string("config '") + key + "' is longer than " + std::to_string(kMaxConfigStringBytes) +
                         " bytes; truncated");
-            v = clip_utf8(std::move(v), kMaxConfigStringBytes);
+            v = clip_utf8(v, kMaxConfigStringBytes);
         }
         return v;
     };
@@ -1414,10 +1436,7 @@ ModelRecord build_record(const std::shared_ptr<const StoreAnchor>& anchor, const
     // the per-layer cap is let through: reader.small() rejects it without reading it.
     auto admit_text = [&](BlobRef& blob, const std::string& hex, std::uint64_t size, const char* what) {
         if (text_budget == nullptr || size > kMaxTextLayerBytes) return true;
-        if (!text_budget->reached && size <= text_budget->left) {
-            text_budget->left -= size;
-            return true;
-        }
+        if (!text_budget->reached && text_budget->take(size)) return true;
         text_budget->reached = true;
         r.text_omitted = true;
         reader.stat_omitted(blob, hex, size, what);
@@ -1575,6 +1594,8 @@ ModelRecord build_record(const std::shared_ptr<const StoreAnchor>& anchor, const
             if (r.status != EntryStatus::ready) break;
         }
     }
+    // Layers that were not read leave the classification provisional: never `ready`.
+    if (r.text_omitted && r.status == EntryStatus::ready) r.status = EntryStatus::incomplete;
     return r;
 }
 
@@ -1971,6 +1992,29 @@ private:
     std::chrono::steady_clock::time_point start_;
 };
 
+// What one scan() of one store may hash in all (StoreOptions::max_resolve_weight_bytes and
+// weight_hash_timeout, reused as the scan's total): the declared weights of every record it
+// hashes are charged here, and its clock started with the scan.
+struct ScanHashLimits {
+    ScanHashLimits(std::uint64_t bytes, std::chrono::milliseconds limit) : bytes_left(bytes), clock(limit) {}
+    std::uint64_t bytes_left;
+    HashClock clock;
+};
+
+#if defined(SONDER_INFERENCE_TEST_HOOKS)
+std::mutex g_slot_hook_mutex;
+std::function<void()> g_slot_hook;
+
+void run_slot_hook() {
+    std::function<void()> hook;
+    {
+        const std::lock_guard<std::mutex> lock(g_slot_hook_mutex);
+        hook = g_slot_hook;
+    }
+    if (hook) hook();
+}
+#endif
+
 // Ends a single-flight hash exactly once: complete() publishes the digest; leaving the scope
 // without it (an error, a hash limit, an exception) wakes the waiters with a failure.
 class FlightGuard {
@@ -2017,10 +2061,12 @@ WeightCheck weaker(WeightCheck a, WeightCheck b) { return static_cast<int>(a) < 
 // `keep`, the handles are moved into it for a loader; on any failure it is left empty.
 void verify_weights_for_use(const StoreAnchor& a, ModelRecord& r, WeightVerification policy, const StoreOptions& opt,
                             const CancellationToken& call_cancel, OllamaStore::DigestCache* cache,
-                            VerifiedWeights* keep) {
+                            VerifiedWeights* keep, ScanHashLimits* scan_limits = nullptr) {
     r.weight_check = WeightCheck::unchecked;
     if (keep != nullptr) VerifiedWeightsAccess::clear(*keep);
-    if (!r.ready()) return;
+    // An `incomplete` record (omitted small layers) still has weights to check; an unsupported
+    // one does not.
+    if (r.status == EntryStatus::unsupported) return;
     const bool hash = policy != WeightVerification::off && !in_weight_callback();
     if (!hash && keep == nullptr) return;
     if (hash) {
@@ -2043,6 +2089,18 @@ void verify_weights_for_use(const StoreAnchor& a, ModelRecord& r, WeightVerifica
             if (!first_rel.empty()) note_failed(r, first_rel);
             return;
         }
+        // A scan hashes many records: their weights together draw on one total (and one clock).
+        if (scan_limits != nullptr && total > 0) {
+            if (total > scan_limits->bytes_left) {
+                mark(r, UnsupportedReason::hash_limit,
+                     "the scan's weights would pass StoreOptions::max_resolve_weight_bytes (" +
+                         std::to_string(opt.max_resolve_weight_bytes) + ") in all; this record's " +
+                         std::to_string(total) + " bytes are not hashed or served");
+                if (!first_rel.empty()) note_failed(r, first_rel);
+                return;
+            }
+            scan_limits->bytes_left -= total;
+        }
     }
     const bool use_cache = policy == WeightVerification::first_use && cache != nullptr;
     // One time limit for the whole call, from here: hashing several files, waiting for a slot
@@ -2050,7 +2108,7 @@ void verify_weights_for_use(const StoreAnchor& a, ModelRecord& r, WeightVerifica
     const HashClock clock(hash ? opt.weight_hash_timeout : std::chrono::milliseconds(0));
     auto cancel_or_time = [&]() {
         if (call_cancel.cancelled() || opt.weight_hash_cancel.cancelled()) return HashStop::cancel;
-        if (clock.expired()) return HashStop::time;
+        if (clock.expired() || (scan_limits != nullptr && scan_limits->clock.expired())) return HashStop::time;
         return HashStop::none;
     };
     std::vector<char> buf;
@@ -2176,6 +2234,9 @@ void verify_weights_for_use(const StoreAnchor& a, ModelRecord& r, WeightVerifica
                         return;
                     }
                     if (buf.empty()) buf.resize(kHashBufferBytes);
+#if defined(SONDER_INFERENCE_TEST_HOOKS)
+                    run_slot_hook();
+#endif
                     read_ok = hash_handle(h, buf, got, bytes, err, [&] {
                         if (bytes > opt.max_weight_file_bytes) {
                             stop = HashStop::size;
@@ -2363,7 +2424,14 @@ const char* to_string(UnsupportedReason reason) noexcept {
     return "none";
 }
 
-const char* to_string(EntryStatus status) noexcept { return status == EntryStatus::ready ? "ready" : "unsupported"; }
+const char* to_string(EntryStatus status) noexcept {
+    switch (status) {
+        case EntryStatus::ready: return "ready";
+        case EntryStatus::incomplete: return "incomplete";
+        case EntryStatus::unsupported: break;
+    }
+    return "unsupported";
+}
 
 const char* to_string(BlobRole role) noexcept {
     switch (role) {
@@ -2522,29 +2590,73 @@ ModelRecord build_record_guarded(const std::shared_ptr<const StoreAnchor>& ancho
     }
 }
 
-}  // namespace
-
-ScanResult OllamaStore::scan() const {
-    RetainBudget budget{options_.limits.max_retained_text_bytes, false};
-    return scan_impl(budget);
+// verify_weights_for_use() for one record of a scan: an exception (std::bad_alloc from the hash
+// buffer, a throwing on_weight_hash callback, ...) makes that record unsupported and transient
+// (never reused) instead of ending the scan.
+void verify_weights_guarded(const StoreAnchor& a, ModelRecord& rec, const StoreOptions& opt,
+                            const CancellationToken& cancel, OllamaStore::DigestCache* cache, ScanHashLimits* limits) {
+    auto fail = [&](const char* what) {
+        rec.weight_check = WeightCheck::unchecked;
+        mark(rec, UnsupportedReason::hash_limit, std::string("the weights could not be checked: ") + printable(what));
+        for (const auto& b : rec.blobs) {
+            if (is_weight_role(b.role)) {
+                note_failed(rec, blob_rel(b.digest.substr(7)));
+                return;
+            }
+        }
+        if (!rec.sources.empty()) note_failed(rec, rec.sources.front().rel);
+    };
+    try {
+        verify_weights_for_use(a, rec, WeightVerification::always, opt, cancel, cache, nullptr, limits);
+    } catch (const std::exception& e) {
+        fail(e.what());
+    } catch (...) {
+        fail("unknown error");
+    }
 }
 
-ScanResult OllamaStore::scan_impl(RetainBudget& text_budget) const {
+}  // namespace
+
+#if defined(SONDER_INFERENCE_TEST_HOOKS)
+void set_hash_slot_hook_for_testing(std::function<void()> hook) {
+    const std::lock_guard<std::mutex> lock(g_slot_hook_mutex);
+    g_slot_hook = std::move(hook);
+}
+#endif
+
+ScanResult OllamaStore::scan(const ResolveOptions& call) const {
+    RetainBudget budget;
+    budget.left = options_.limits.max_retained_text_bytes;
+    return scan_impl(budget, call);
+}
+
+ScanResult OllamaStore::scan_impl(RetainBudget& text_budget, const ResolveOptions& call) const {
     std::map<std::string, Found> found;
     ScanResult result;
     WalkBudget budget(options_.limits);
     walk_tree(*anchor_, ManifestLayout::v2, found, result.notes, budget);
     walk_tree(*anchor_, ManifestLayout::legacy, found, result.notes, budget);
-    result.records.reserve(found.size());
-    for (auto& [key, f] : found) {
+    if (!text_budget.accept) result.records.reserve(found.size());
+    // Under `always` the whole scan shares one total of weight bytes and one clock (and the
+    // per-call cancel), however many records it hashes.
+    std::optional<ScanHashLimits> hash_limits;
+    if (options_.verify_weights == WeightVerification::always) {
+        hash_limits.emplace(options_.max_resolve_weight_bytes, options_.weight_hash_timeout);
+    }
+    for (auto& entry : found) {
+        Found& f = entry.second;
+        if (text_budget.wants && !text_budget.wants(f.name.key())) continue;
         ModelRecord rec = build_record_guarded(anchor_, f.name, f.rel, f.layout,
                                                read_manifest_guarded(*anchor_, f.rel, f.layout), &text_budget);
-        if (options_.verify_weights == WeightVerification::always) {
+        if (hash_limits) {
             // On an on_weight_hash thread this hashes nothing (the record stays unchecked).
-            verify_weights_for_use(*anchor_, rec, WeightVerification::always, options_, CancellationToken(), cache_.get(),
-                                   nullptr);
+            verify_weights_guarded(*anchor_, rec, options_, call.cancel, cache_.get(), &*hash_limits);
         }
-        result.records.push_back(std::move(rec));
+        if (text_budget.accept) {
+            text_budget.accept(std::move(rec));
+        } else {
+            result.records.push_back(std::move(rec));
+        }
     }
     if (text_budget.reached) {
         note(result.notes, "kept no more config, params, template, system or messages content after " +
@@ -2634,7 +2746,7 @@ bool OllamaStore::revalidate_impl(ModelRecord& record, WeightVerification policy
 }
 
 bool OllamaStore::unsupported_still_current(const ModelRecord& record) const {
-    if (record.ready() || record.anchor.get() != anchor_.get()) return false;
+    if (record.status != EntryStatus::unsupported || record.anchor.get() != anchor_.get()) return false;
     if (record.reason == UnsupportedReason::blob_busy) return false;  // ends when the writer closes the file
     // Every record read through read_manifest() names at least its manifest; one that names
     // nothing cannot show that its reason still holds.
@@ -2939,22 +3051,43 @@ namespace {
 
 using SharedRecord = std::shared_ptr<const ModelRecord>;
 
-// Everything a record keeps of attacker-controlled small-layer content, counted against
-// ScanLimits::max_retained_text_bytes: template, system, messages, config strings and arrays,
-// params stop entries and unmodelled options, runner, format and parent. What it leaves out is
-// bounded per record by a constant (names, paths, blob list, sources, detail, warnings).
+// Heap bytes behind a string: its capacity (a clipped or moved string can hold far more than its
+// size) when it does not fit the in-object buffer of any standard library (15 bytes or fewer
+// never allocates).
+std::uint64_t heap_bytes(const std::string& s) { return s.capacity() > 15 ? s.capacity() : 0; }
+std::uint64_t heap_bytes(const fs::path& p) { return p.native().capacity() * sizeof(fs::path::value_type); }
+
+// The part of a record's `detail` that is its base (see ScanLimits::max_retained_text_bytes).
+constexpr std::size_t kBaseDetailBytes = 256;
+
+std::uint64_t vec_bytes(const std::vector<std::string>& v) {
+    std::uint64_t n = v.capacity() * sizeof(std::string);
+    for (const auto& s : v) n += heap_bytes(s);
+    return n;
+}
+
+std::uint64_t vec_bytes(const std::vector<fs::path>& v) {
+    std::uint64_t n = v.capacity() * sizeof(fs::path);
+    for (const auto& p : v) n += heap_bytes(p);
+    return n;
+}
+
+// Everything a record keeps on the heap that a manifest or a layer can make large, counted
+// against ScanLimits::max_retained_text_bytes: template, system, messages, config strings and
+// arrays, params stop entries and unmodelled options, runner, format, parent, warnings, the part
+// of detail past 256 bytes, the blob list (with each blob's mediaType, digest, from and path),
+// the shard/projector/adapter/draft paths and the source stamps. Uncounted is the base: name,
+// manifest path, store root, model path and detail up to 256 bytes (see collapse_retained).
 std::uint64_t retained_bytes(const ModelRecord& r) {
     std::uint64_t n = 0;
-    auto add = [&](const std::string& s) { n += s.size(); };
-    auto add_all = [&](const std::vector<std::string>& v) {
-        for (const auto& s : v) n += s.size() + sizeof(std::string);
-    };
+    auto add = [&](const std::string& s) { n += heap_bytes(s); };
     if (r.template_text) add(*r.template_text);
     if (r.system_prompt) add(*r.system_prompt);
     if (r.messages_json) add(*r.messages_json);
     add(r.runner);
     add(r.format);
     add(r.parent);
+    if (r.detail.capacity() > kBaseDetailBytes) n += r.detail.capacity() - kBaseDetailBytes;
     const ModelConfig& c = r.config;
     add(c.model_format);
     add(c.model_family);
@@ -2965,134 +3098,264 @@ std::uint64_t retained_bytes(const ModelRecord& r) {
     add(c.requires_version);
     add(c.remote_host);
     add(c.remote_model);
-    add_all(c.model_families);
-    add_all(c.capabilities);
-    add_all(r.params.stop);
+    n += vec_bytes(c.model_families);
+    n += vec_bytes(c.capabilities);
+    n += vec_bytes(r.params.stop);
     for (const auto& [k, v] : r.params.extra) n += k.size() + json_cost(v);
+    n += vec_bytes(r.warnings);
+    n += r.blobs.capacity() * sizeof(BlobRef);
+    for (const auto& b : r.blobs) {
+        add(b.media_type);
+        add(b.digest);
+        add(b.from);
+        n += heap_bytes(b.path);
+    }
+    n += vec_bytes(r.shard_paths);
+    n += vec_bytes(r.projector_paths);
+    n += vec_bytes(r.adapter_paths);
+    n += vec_bytes(r.draft_paths);
+    n += r.sources.capacity() * sizeof(SourceStamp);
+    for (const auto& src : r.sources) add(src.rel);
     return n;
 }
 
-// Drops everything retained_bytes() counts (the numbers and the status stay) and flags the
-// record text_omitted: what was dropped was neither kept nor will be served from a cache.
+// Gives back the unused capacity of the record's vectors, so what retained_bytes() counts is
+// what is held (vectors grown by push_back keep up to twice their size).
+void shrink_vectors(ModelRecord& r) {
+    r.blobs.shrink_to_fit();
+    r.sources.shrink_to_fit();
+    r.warnings.shrink_to_fit();
+    r.shard_paths.shrink_to_fit();
+    r.projector_paths.shrink_to_fit();
+    r.adapter_paths.shrink_to_fit();
+    r.draft_paths.shrink_to_fit();
+    r.config.model_families.shrink_to_fit();
+    r.config.capabilities.shrink_to_fit();
+    r.params.stop.shrink_to_fit();
+}
+
+template <class T>
+void release(T& v) {
+    T().swap(v);  // frees the allocation (clear() would keep it)
+}
+
+// Drops the content of the small layers and the manifest strings (the numbers and the status
+// stay) and flags the record text_omitted (status `incomplete` when it was ready): what was
+// dropped was neither kept nor will be served from a cache. Every string is released, not
+// cleared, so no capacity stays behind.
 void strip_retained(ModelRecord& r) {
     r.template_text.reset();
     r.system_prompt.reset();
     r.messages_json.reset();
-    r.runner.clear();
-    r.format.clear();
-    r.parent.clear();
+    release(r.runner);
+    release(r.format);
+    release(r.parent);
     ModelConfig empty;
     empty.context_length = r.config.context_length;
     empty.embedding_length = r.config.embedding_length;
     r.config = std::move(empty);
-    r.params.stop.clear();
+    release(r.params.stop);
     r.params.extra = json::Object();
+    release(r.warnings);
+    for (auto& b : r.blobs) {
+        release(b.media_type);
+        release(b.from);
+    }
     r.text_omitted = true;
+    if (r.status == EntryStatus::ready) r.status = EntryStatus::incomplete;
 }
 
-// `rec` as the registry keeps it: whole while what it retains fits in what is left of `budget`
-// after `used` (which it is then added to), otherwise stripped (strip_retained: text_omitted,
-// so a resolve() of the name reads the store again instead of serving it).
-SharedRecord retain(ModelRecord rec, std::uint64_t& used, std::uint64_t budget) {
-    const std::uint64_t t = retained_bytes(rec);
-    if (t > 0 && (used > budget || t > budget - used)) {
-        strip_retained(rec);
-    } else {
-        used += t;
+// strip_retained(), and the rest of what is counted: the blob list, the paths other than the
+// model's, the source stamps and all but 256 bytes of detail. What is left is the base. Such a
+// record is listed (name, status, reason) and resolve() reads the entry again; it is never served.
+void collapse_retained(ModelRecord& r) {
+    strip_retained(r);
+    release(r.blobs);
+    release(r.shard_paths);
+    release(r.projector_paths);
+    release(r.adapter_paths);
+    release(r.draft_paths);
+    release(r.sources);
+    if (r.detail.size() > kBaseDetailBytes) {
+        r.detail = clip_utf8(r.detail, kBaseDetailBytes);
+    } else if (r.detail.capacity() > kBaseDetailBytes) {
+        r.detail = std::string(r.detail.data(), r.detail.size());
     }
-    return std::make_shared<const ModelRecord>(std::move(rec));
 }
 
 std::uint64_t sub_sat(std::uint64_t a, std::uint64_t b) { return a > b ? a - b : 0; }
 
+// `rec` as the registry keeps it: whole while what it retains fits in what is left of `budget`
+// after `used` (which it is then added to); otherwise stripped (strip_retained), and when even
+// that does not fit, collapsed to its base. A stripped or collapsed record has text_omitted set
+// (and is `incomplete` unless unsupported), so a resolve() of the name reads the store again
+// instead of serving it. `used` therefore never passes `budget` through this function.
+SharedRecord retain(ModelRecord rec, std::uint64_t& used, std::uint64_t budget) {
+    shrink_vectors(rec);
+    const std::uint64_t room = sub_sat(budget, used);
+    std::uint64_t t = retained_bytes(rec);
+    if (t > room) {
+        strip_retained(rec);
+        shrink_vectors(rec);
+        t = retained_bytes(rec);
+        if (t > room) {
+            collapse_retained(rec);
+            t = retained_bytes(rec);
+        }
+    }
+    used += t;
+    return std::make_shared<const ModelRecord>(std::move(rec));
+}
+
 }  // namespace
 
-Status ModelRegistry::add_ollama_dir(fs::path models_dir) {
+std::uint64_t ModelRegistry::retained_bytes_now() const {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return retained_bytes_ + inflight_;
+}
+
+std::uint64_t ModelRegistry::retained_bytes_peak() const {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return peak_;
+}
+
+Status ModelRegistry::add_ollama_dir(fs::path models_dir, const ResolveOptions& call) {
+    // A callback may be running inside this thread's own scan, which holds scan_mutex_.
+    if (in_weight_callback()) return reentrant_call("ModelRegistry::add_ollama_dir");
     auto store = OllamaStore::open(std::move(models_dir), options_);
     if (!store.ok()) return store.status();
+    const std::lock_guard<std::mutex> scan_lock(scan_mutex_);  // one scan at a time
     // The same directory: compared by the identity of the pinned root handles, not by path.
-    auto registered = [&] {
-        for (const auto& s : stores_) {
-            if (s.anchor_->id.same_file(store.value().anchor_->id)) return true;
-        }
-        return false;
-    };
-    const std::uint64_t budget = options_.limits.max_retained_text_bytes;
-    RetainBudget allowance;
+    // (stores_ only changes under scan_mutex_, which is held.)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (registered()) return Status::success();
-        allowance.left = sub_sat(budget, retained_bytes_);
+        const std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& s : stores_) {
+            if (s.anchor_->id.same_file(store.value().anchor_->id)) return Status::success();
+        }
     }
-    // The scan (directory walk, config/params reads, GGUF headers) runs without the lock so
-    // concurrent resolve()/list() calls are not stalled behind it. It keeps what is left of the
-    // registry's allowance, no more.
-    auto scanned = store.value().scan_impl(allowance);
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (registered()) return Status::success();  // another thread added the same directory meanwhile
+    const std::uint64_t budget = options_.limits.max_retained_text_bytes;
+    // The scan (directory walk, config/params reads, GGUF headers) runs without mutex_ so
+    // concurrent resolve()/list() calls are not stalled behind it. Each record is retained as
+    // soon as it is built, within what the registry has not yet kept or reserved; the records
+    // are published together with the store, so nothing resolves to a store that is not yet in
+    // stores_. A name another store already holds is not built (earlier stores win).
+    std::vector<SharedRecord> fresh;
+    RetainBudget ctx;
+    ctx.reserve = [&](std::uint64_t size) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (size > sub_sat(budget, retained_bytes_ + inflight_)) return false;
+        inflight_ += size;
+        peak_ = std::max(peak_, retained_bytes_ + inflight_);
+        return true;
+    };
+    ctx.wants = [&](const std::string& key) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return std::none_of(records_.begin(), records_.end(),
+                            [&](const SharedRecord& e) { return e->name.key() == key; });
+    };
+    ctx.accept = [&](ModelRecord&& rec) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        inflight_ = sub_sat(inflight_, ctx.reserved);
+        ctx.reserved = 0;
+        std::uint64_t used = retained_bytes_ + inflight_;
+        const std::uint64_t before = used;
+        fresh.push_back(retain(std::move(rec), used, budget));
+        retained_bytes_ += used - before;
+        peak_ = std::max(peak_, retained_bytes_ + inflight_);
+    };
+    try {
+        (void)store.value().scan_impl(ctx, call);
+    } catch (...) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        inflight_ = 0;
+        for (const auto& rec : fresh) retained_bytes_ = sub_sat(retained_bytes_, retained_bytes(*rec));
+        throw;
+    }
+    const std::lock_guard<std::mutex> lock(mutex_);
+    inflight_ = 0;
     stores_.push_back(store.value());
-    std::uint64_t used = retained_bytes_;
-    for (auto& rec : scanned.records) {
-        const std::string key = rec.name.key();
-        const bool dup = std::any_of(records_.begin(), records_.end(),
-                                     [&](const SharedRecord& e) { return e->name.key() == key; });
-        if (!dup) records_.push_back(retain(std::move(rec), used, budget));
-    }
-    retained_bytes_ = used;
+    for (auto& rec : fresh) records_.push_back(std::move(rec));
     return Status::success();
 }
 
-void ModelRegistry::refresh() {
+void ModelRegistry::refresh(const ResolveOptions& call) {
+    if (in_weight_callback()) return;  // see add_ollama_dir()
+    const std::lock_guard<std::mutex> scan_lock(scan_mutex_);  // one scan at a time
     const std::uint64_t budget = options_.limits.max_retained_text_bytes;
     std::vector<OllamaStore> stores;
+    // The records held when the refresh began. The weak pointers keep their storage allocated, so
+    // a new record can never be given an address that is in `old`.
+    std::set<const ModelRecord*> old;
+    std::vector<std::weak_ptr<const ModelRecord>> old_guard;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        stores = stores_;  // every record held now belongs to one of these: all are rescanned
+        const std::lock_guard<std::mutex> lock(mutex_);
+        stores = stores_;  // stores_ only changes under scan_mutex_, which is held: all are rescanned
+        for (const auto& rec : records_) {
+            old.insert(rec.get());
+            old_guard.push_back(rec);
+        }
+        // Cached live results are dropped by a refresh anyway; they would only take budget now.
+        for (const auto& e : live_) retained_bytes_ = sub_sat(retained_bytes_, retained_bytes(*e.second));
+        live_.clear();
     }
-    // One allowance for the whole refresh: each store's scan keeps only what is left of it, and
-    // its records are retained (stripped when they do not fit) before the next store is read, so
-    // what is held never grows past the budget however many stores there are.
-    RetainBudget allowance{budget, false};
-    std::uint64_t used = 0;
-    std::vector<SharedRecord> fresh;
+    // One allowance for the whole refresh, kept in the registry's own counters: before a record is
+    // rebuilt its old version is dropped (wants), what its layers declare is reserved (reserve),
+    // and it is retained at once (accept), so old and new content never add up past the budget,
+    // however many stores there are. A name an earlier store already produced is not built again.
     std::set<std::string> seen;
-    for (const auto& store : stores) {
-        ScanResult scanned = store.scan_impl(allowance);  // no lock held: this reads the disk
-        for (auto& rec : scanned.records) {
-            if (seen.insert(rec.name.key()).second) fresh.push_back(retain(std::move(rec), used, budget));
+    RetainBudget ctx;
+    ctx.reserve = [&](std::uint64_t size) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (size > sub_sat(budget, retained_bytes_ + inflight_)) return false;
+        inflight_ += size;
+        peak_ = std::max(peak_, retained_bytes_ + inflight_);
+        return true;
+    };
+    ctx.wants = [&](const std::string& key) {
+        if (!seen.insert(key).second) return false;
+        const std::lock_guard<std::mutex> lock(mutex_);
+        for (auto it = records_.begin(); it != records_.end();) {
+            if ((*it)->name.key() == key) {
+                retained_bytes_ = sub_sat(retained_bytes_, retained_bytes(**it));
+                it = records_.erase(it);
+            } else {
+                ++it;
+            }
         }
-    }
-    std::lock_guard<std::mutex> lock(mutex_);
-    // A store that add_ollama_dir() registered while this scan ran is not in `stores`: keep the
-    // records its own scan put in records_ (it is later in stores_, so it ranks after these).
-    // They are kept as they are and counted first; the rescanned records share what is left
-    // of the text budget.
-    std::vector<SharedRecord> kept;
-    std::uint64_t kept_used = 0;
-    for (auto& rec : records_) {
-        const bool rescanned = std::any_of(stores.begin(), stores.end(),
-                                           [&](const OllamaStore& st) { return st.anchor_.get() == rec->anchor.get(); });
-        if (!rescanned && seen.insert(rec->name.key()).second) {
-            kept_used += retained_bytes(*rec);
-            kept.push_back(std::move(rec));
+        return true;
+    };
+    ctx.accept = [&](ModelRecord&& rec) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        inflight_ = sub_sat(inflight_, ctx.reserved);
+        ctx.reserved = 0;
+        std::uint64_t used = retained_bytes_ + inflight_;
+        const std::uint64_t before = used;
+        records_.push_back(retain(std::move(rec), used, budget));
+        retained_bytes_ += used - before;
+        peak_ = std::max(peak_, retained_bytes_ + inflight_);
+    };
+    auto finish = [&] {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        inflight_ = 0;
+        // Whatever is left of the old records (names no store has any more) goes now.
+        for (auto it = records_.begin(); it != records_.end();) {
+            if (old.count(it->get()) != 0) {
+                retained_bytes_ = sub_sat(retained_bytes_, retained_bytes(**it));
+                it = records_.erase(it);
+            } else {
+                ++it;
+            }
         }
+        for (const auto& e : live_) retained_bytes_ = sub_sat(retained_bytes_, retained_bytes(*e.second));
+        live_.clear();
+    };
+    try {
+        for (const auto& store : stores) (void)store.scan_impl(ctx, call);  // no lock held: this reads the disk
+    } catch (...) {
+        finish();
+        throw;
     }
-    // The records kept above were not counted while the stores were scanned; fit the rescanned
-    // ones around them (only a store added during the scan can make this change anything).
-    std::uint64_t fresh_used = 0;
-    for (const auto& rec : fresh) fresh_used += retained_bytes(*rec);
-    if (kept_used > 0 && kept_used + fresh_used > budget) {
-        std::uint64_t fit = kept_used;
-        for (auto& rec : fresh) rec = retain(ModelRecord(*rec), fit, budget);
-        fresh_used = fit - kept_used;
-    }
-    std::vector<SharedRecord> next;
-    next.reserve(fresh.size() + kept.size());
-    for (auto& rec : fresh) next.push_back(std::move(rec));
-    for (auto& rec : kept) next.push_back(std::move(rec));
-    records_ = std::move(next);
-    live_.clear();
-    retained_bytes_ = kept_used + fresh_used;
+    finish();
 }
 
 std::vector<std::shared_ptr<const ModelRecord>> ModelRegistry::list() const {
@@ -3160,9 +3423,13 @@ Result<ModelRecord> ModelRegistry::resolve_impl(std::string_view name, WeightVer
         if (replace_scan) {
             for (auto& e : records_) {
                 if (e->name.key() == key) {
-                    std::uint64_t used = sub_sat(retained_bytes_, retained_bytes(*e));
+                    // What a running scan has reserved counts as held too.
+                    const std::uint64_t old_t = retained_bytes(*e);
+                    std::uint64_t used = sub_sat(retained_bytes_, old_t) + inflight_;
+                    const std::uint64_t before = used;
                     e = retain(rec, used, budget);
-                    retained_bytes_ = used;
+                    retained_bytes_ = sub_sat(retained_bytes_, old_t) + (used - before);
+                    peak_ = std::max(peak_, retained_bytes_ + inflight_);
                     return;
                 }
             }
@@ -3173,9 +3440,11 @@ Result<ModelRecord> ModelRegistry::resolve_impl(std::string_view name, WeightVer
             for (const auto& e : live_) retained_bytes_ = sub_sat(retained_bytes_, retained_bytes(*e.second));
             live_.clear();
         }
-        std::uint64_t used = retained_bytes_;
+        std::uint64_t used = retained_bytes_ + inflight_;
+        const std::uint64_t before = used;
         live_.emplace(key, retain(rec, used, budget));
-        retained_bytes_ = used;
+        retained_bytes_ += used - before;
+        peak_ = std::max(peak_, retained_bytes_ + inflight_);
     };
     if (cached) {
         for (const auto& store : stores) {

@@ -59,6 +59,8 @@ namespace sonder::inference::models {
 inline constexpr const char* kOllamaDefaultHost = "registry.ollama.ai";
 inline constexpr const char* kOllamaDefaultNamespace = "library";
 inline constexpr const char* kOllamaDefaultTag = "latest";
+// Schema /2: `status` is "ready", "unsupported" or "incomplete" (a record whose small layers were
+// omitted: not servable, see EntryStatus); treat anything but "ready" as not ready.
 inline constexpr const char* kStoreJsonSchema = "sonder.inference.model_store/2";
 // "https://" + host (350) + "/" + namespace (80) + "/" + model (80) + ":" + tag (80).
 inline constexpr std::size_t kMaxOllamaNameBytes = 8 + 350 + 1 + 80 + 1 + 80 + 1 + 80;
@@ -91,7 +93,14 @@ struct OllamaName {
 // zero-width, line separator) and invalid UTF-8 byte escaped as \xNN.
 Result<OllamaName> parse_ollama_name(std::string_view text);
 
-enum class EntryStatus { ready, unsupported };
+// ready        everything the record needs was read and checked (see ModelRecord).
+// unsupported  cannot be served; `reason` and `detail` say why.
+// incomplete   would be served as far as it was read, but some of its small layers (config, params,
+//              template, system, messages) were omitted (ModelRecord::text_omitted: a scan's or
+//              registry's retained-content budget was spent): their bytes were neither read nor
+//              hashed and the classification is provisional, so it is NOT ready. resolve() of the
+//              name reads everything and gives ready or unsupported.
+enum class EntryStatus { ready, unsupported, incomplete };
 
 enum class UnsupportedReason {
     none,
@@ -113,7 +122,8 @@ enum class UnsupportedReason {
                               // StoreOptions::max_weight_file_bytes, the weights of the resolve add up
                               // to more than max_resolve_weight_bytes, or hashing ran past
                               // weight_hash_timeout or was cancelled (StoreOptions::weight_hash_cancel
-                              // or ResolveOptions::cancel) (transient: the record is never reused, the
+                              // or ResolveOptions::cancel), or the total of one scan() was spent
+                              // (transient: the record is never reused, the
                               // next resolve tries again)
 };
 const char* to_string(UnsupportedReason reason) noexcept;
@@ -265,11 +275,15 @@ struct ScanLimits {
     // neither read nor checked: only opened, stamped and size-checked) and a note says so.
     // resolve() reads them in full. What is kept from a layer is also capped per field (a config
     // string 1 KiB, a config array 32 entries of 256 bytes, params extras 64 entries and 64 KiB,
-    // runner/format/parent 256 bytes), and the registry counts all of it (retained_bytes) against
-    // this limit. A ModelRegistry shares one allowance of this size across every store it scans
-    // (refresh() carries what is left from store to store) and across the records it caches from
-    // resolve(). Not counted, because each is bounded per record by a constant (about 100 KiB
-    // together): names, paths, the blob list, source stamps, detail and warnings.
+    // runner/format/parent and a layer's mediaType/name 256 bytes), and the registry counts
+    // everything else a cached record holds too (strings by capacity, vectors by size: warnings,
+    // blob list, paths, source stamps; see model-store.md "Retained content") against this limit.
+    // A ModelRegistry shares one allowance of this size across every store it scans and across
+    // the records it caches from resolve(); a refresh or add reserves what the record it builds
+    // keeps and drops that record's old content first, so what is held (the registry's
+    // retained_bytes_peak()) never exceeds it. The one thing not charged is the per-record base
+    // that cannot be dropped without dropping the entry: its name, manifest path, store root,
+    // model path and a detail text of at most 256 bytes.
     std::uint64_t max_retained_text_bytes = 64ull << 20;
 };
 
@@ -287,9 +301,13 @@ struct StoreOptions {
     // waits for it. When several threads need the same unchanged file under first_use, each
     // may call it, but only one of them then hashes the file; the others wait for that hash
     // (never for a callback) and reuse its digest. It may wait for other threads that use
-    // any store or registry. On the callback's own thread, though, every OllamaStore /
+    // any store or registry, with one exception: a callback that runs inside a registry's
+    // add_ollama_dir() or refresh() (verify_weights == always) must not wait for another
+    // thread's add_ollama_dir() or refresh() of that same registry, since those run one at a
+    // time (resolve() and list() of it are fine). On the callback's own thread, though, every OllamaStore /
     // ModelRegistry resolve(), resolve_for_load() and ModelRegistry::resolve fails at once
-    // with ErrorCode::invalid_state, revalidate() returns false, and scan() hashes nothing
+    // with ErrorCode::invalid_state, ModelRegistry::add_ollama_dir() fails the same way,
+    // refresh() and revalidate() do nothing / return false, and scan() hashes nothing
     // (a direct call would hash, and so call back, again). It may run on several threads at
     // once. May be empty. An exception it throws propagates out of the resolve that called it.
     std::function<void(const BlobRef&)> on_weight_hash;
@@ -304,10 +322,16 @@ struct StoreOptions {
     //                             this much (default 2 TiB); more fails before anything is
     //                             opened, hashed or called back (a resolve that would hash).
     //   weight_hash_timeout       the time all hashing of ONE resolve (and one verify_blobs()
-    //                             call) may take, counted from when it starts to hash and
-    //                             including the wait for a hash slot or for another thread's
-    //                             hash (default 3 hours, kDefaultWeightHashTimeout; zero: no time
-    //                             limit, not recommended for a service).
+    //                             call) may take, counted from the start of that resolve's weight
+    //                             verification (so on_weight_hash callbacks and file opens count
+    //                             too) and including the wait for a hash slot or for another
+    //                             thread's hash (default 3 hours, kDefaultWeightHashTimeout; zero:
+    //                             no time limit, not recommended for a service).
+    //   scan() / add_ollama_dir() / refresh() under WeightVerification::always hash too. One scan
+    //                             of one store shares ONE total: the declared weights of all its
+    //                             records together may add up to max_resolve_weight_bytes, and its
+    //                             hashing may take weight_hash_timeout (from the start of the scan).
+    //                             A record that would pass either is hash_limit; the scan goes on.
     //   weight_hash_cancel        STORE-WIDE and never resettable (the options are copied at
     //                             open()): once cancelled, every later hash on this store fails.
     //                             It is the shutdown switch. To cancel one resolve, pass
@@ -319,17 +343,20 @@ struct StoreOptions {
     ScanLimits limits;
 };
 
-// Per-call options for resolve() and resolve_for_load().
+// Per-call options for resolve(), resolve_for_load(), scan(), ModelRegistry::add_ollama_dir() and
+// ModelRegistry::refresh().
 struct ResolveOptions {
     // Cancels this call only: its hashing stops (also while it waits for a hash slot or for
     // another thread's hash of the same file) and the record fails with
-    // UnsupportedReason::hash_limit (transient). Nothing else on the store is affected; a later
+    // UnsupportedReason::hash_limit (transient). For a scan, add or refresh it ends the weight
+    // hashing of the records not yet checked (WeightVerification::always; a scan that does not
+    // hash is unaffected). Nothing else on the store is affected; a later
     // call without a cancelled token hashes normally. Default: never cancelled.
     CancellationToken cancel;
 };
 
 struct StoreAnchor;    // the store root opened by OllamaStore::open() (model_store.cpp)
-struct RetainBudget;   // what a scan may still keep of the small layers (model_store.cpp)
+struct RetainBudget;   // what a scan may still keep, and where it hands records (model_store.cpp)
 
 // Everything known about one store entry. A `ready` record has every blob
 // present as a regular file inside the store, sized as declared; every small
@@ -372,7 +399,8 @@ struct ModelRecord {
     std::optional<std::string> messages_json;  // image.messages, validated JSON text
     // A scan reached ScanLimits::max_retained_text_bytes before one of this record's small
     // layers (config, params, template, system, messages), or a registry stripped what it was
-    // keeping of the record to stay within it: the omitted layers were neither read nor checked
+    // keeping of the record to stay within it (its status is then `incomplete`, never `ready`,
+    // unless it is `unsupported`): the omitted layers were neither read nor checked
     // (their blobs are only opened, stamped and size-checked; one that cannot be opened makes
     // the record unsupported), so config, params and text fields, and anything classified from
     // them (cloud stub, safetensors config), are provisional or empty. resolve() of the name
@@ -489,8 +517,10 @@ public:
     [[nodiscard]] const StoreOptions& options() const noexcept { return options_; }
 
     // Loads every manifest. A broken entry becomes an `unsupported` record; the scan
-    // itself does not fail.
-    [[nodiscard]] ScanResult scan() const;
+    // itself does not fail. Under verify_weights == always it also hashes every record's weights
+    // (the StoreOptions limits apply to the scan as a whole; `call` can cancel it); an exception
+    // while checking one record's weights makes that record unsupported and the scan goes on.
+    [[nodiscard]] ScanResult scan(const ResolveOptions& call = {}) const;
 
     // Resolves "name[:tag]" the way Ollama's resolveManifestPath does: manifests-v2 first,
     // then the legacy tree (also under the alternate public host). Returns not_found when
@@ -529,9 +559,10 @@ public:
 private:
     friend class ModelRegistry;
     OllamaStore(std::filesystem::path root, std::shared_ptr<const StoreAnchor> anchor, StoreOptions options);
-    // scan() with an allowance shared with other scans (ModelRegistry): the small layers it keeps
-    // are charged to `budget`, which it leaves with what is still unspent.
-    [[nodiscard]] ScanResult scan_impl(RetainBudget& budget) const;
+    // scan() with an allowance shared with other scans, and a way to hand records over one at a
+    // time (ModelRegistry): see RetainBudget in model_store.cpp. With a sink the records go to
+    // it and the returned ScanResult carries only the notes.
+    [[nodiscard]] ScanResult scan_impl(RetainBudget& budget, const ResolveOptions& call) const;
     [[nodiscard]] Result<ModelRecord> resolve_impl(std::string_view name, WeightVerification policy,
                                                    VerifiedWeights* keep, const CancellationToken& cancel) const;
     [[nodiscard]] bool revalidate_impl(ModelRecord& record, WeightVerification policy, VerifiedWeights* keep,
@@ -614,12 +645,23 @@ public:
 
     // Adds a store and scans it. A directory already registered (same root directory
     // identity, whatever path names it) is ignored. Earlier stores win when two stores hold
-    // the same name.
-    Status add_ollama_dir(std::filesystem::path models_dir);
+    // the same name. Scans (this and refresh()) run one at a time; list() and resolve() are not
+    // held up by them. `call` can cancel the weight hashing of a scan under verify_weights ==
+    // always.
+    Status add_ollama_dir(std::filesystem::path models_dir, const ResolveOptions& call = {});
 
-    // Rescans every store (directory walk plus small reads; no hashing). A store added by
-    // another thread while it runs keeps the records its own scan produced.
-    void refresh();
+    // Rescans every store (directory walk plus small reads; hashing only under verify_weights ==
+    // always). Records are replaced one at a time: before a record is rebuilt the registry drops
+    // its old content, so old and new never add up past max_retained_text_bytes (a concurrent
+    // list() may briefly not show the record being rebuilt, and resolve() then reads the store).
+    // Records of names no longer found are dropped at the end.
+    void refresh(const ResolveOptions& call = {});
+
+    // Diagnostics: bytes of retained content held now (cached records plus what a running scan
+    // has reserved) and the most that was ever held at one moment. Never above
+    // StoreOptions::limits.max_retained_text_bytes.
+    [[nodiscard]] std::uint64_t retained_bytes_now() const;
+    [[nodiscard]] std::uint64_t retained_bytes_peak() const;
 
     // The scanned records, shared with the registry (read-only, not copied; a refresh() or a
     // resolve() that replaces an entry swaps the registry's pointer, never the record).
@@ -647,16 +689,32 @@ private:
     [[nodiscard]] Result<ModelRecord> resolve_impl(std::string_view name, WeightVerification policy,
                                                    VerifiedWeights* keep, const CancellationToken& cancel) const;
     StoreOptions options_;
+    // Held for the whole of add_ollama_dir() and refresh(): one scan at a time. Taken before
+    // mutex_, never while holding it; list() and resolve() never take it.
+    std::mutex scan_mutex_;
     mutable std::mutex mutex_;
-    // Bytes of retained small-layer content (config strings and arrays, params, template, system,
-    // messages, runner/format/parent) held by records_ and live_, kept within
-    // options_.limits.max_retained_text_bytes. A running total, updated wherever a record enters,
-    // leaves or is replaced in records_ or live_. Guarded by mutex_.
+    // Bytes of retained content (everything a record holds except its base; see
+    // ScanLimits::max_retained_text_bytes) in records_ and live_, which together with inflight_
+    // stays within options_.limits.max_retained_text_bytes. A running total, updated wherever a
+    // record enters, leaves or is replaced in records_ or live_. Guarded by mutex_.
     mutable std::uint64_t retained_bytes_ = 0;
+    // Declared bytes of small layers a running scan was granted for the record it is building
+    // (not yet in retained_bytes_). Guarded by mutex_.
+    mutable std::uint64_t inflight_ = 0;
+    // The largest retained_bytes_ + inflight_ seen. Guarded by mutex_.
+    mutable std::uint64_t peak_ = 0;
     std::vector<OllamaStore> stores_;
     mutable std::vector<std::shared_ptr<const ModelRecord>> records_;
     mutable std::map<std::string, std::shared_ptr<const ModelRecord>> live_;
 };
+
+#if defined(SONDER_INFERENCE_TEST_HOOKS)
+// Test seam (process-wide; present in any library built with SONDER_BUILD_TESTS, see
+// docs/integration/model-store.md "Test hooks"): `hook` runs on the hashing thread right after it
+// took a hash slot and before it reads the file, so a test can hold slots deterministically. An
+// empty function removes it. Store contents cannot reach it.
+void set_hash_slot_hook_for_testing(std::function<void()> hook);
+#endif
 
 // `sonder-infer models import-ollama` (docs/integration/model-store.md). Returns the
 // process exit code: 0 ok, 1 failure (store unreadable, name not found, verification

@@ -11,9 +11,11 @@
 // Ownership: OwnedFileHandle owns one OS handle (HANDLE / fd) and is move-only. Every
 // function here is reentrant and holds no global state. The two test aids
 // (set_weak_identity_for_testing, a process-wide flag, and dir_entries_visited_on_this_thread,
-// a per-thread counter) exist only in a build that defines SONDER_INFERENCE_TEST_HOOKS (CMake
-// sets it for SONDER_BUILD_TESTS builds, never otherwise), so a production library has
-// neither the flag nor a way to set it. An anchor handle may be shared by
+// a per-thread counter) exist only in a build that defines SONDER_INFERENCE_TEST_HOOKS. CMake
+// defines it (PUBLIC, on the library) whenever SONDER_BUILD_TESTS is ON, which is the default of
+// a top-level build, release and CI presets included; a build with -DSONDER_BUILD_TESTS=OFF has
+// neither the flag nor a way to set it. Nothing a reader processes (manifests, blobs) can reach
+// them; only code in the same process can. An anchor handle may be shared by
 // any number of threads at once (it is only ever used as the starting directory of a
 // relative open, never read through); a file handle is used by one thread at a time
 // (reads advance its file position).

@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -15,8 +16,11 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -2274,10 +2278,11 @@ TEST_CASE("model store: an on_weight_hash callback that calls back into the stor
     s.put_v2("ollama.com", "library", "a", "latest", s.manifest(cfg, {s.blob(kModel, fake_gguf(1, 1, 64, 'a'))}));
     s.put_v2("ollama.com", "library", "b", "latest", s.manifest(cfg, {s.blob(kModel, fake_gguf(1, 1, 64, 'b'))}));
     const m::OllamaStore* self = nullptr;
-    const m::ModelRegistry* registry = nullptr;
+    m::ModelRegistry* registry = nullptr;
     std::optional<m::ModelRecord> earlier;
     std::atomic<bool> armed{false};
     si::ErrorCode same = si::ErrorCode::ok, other = si::ErrorCode::ok, via_registry = si::ErrorCode::ok;
+    si::ErrorCode via_add = si::ErrorCode::ok;
     bool revalidated = true;
     m::StoreOptions opt;  // first_use: the outer resolve calls back before it claims the hash of "a"
     opt.on_weight_hash = [&](const m::BlobRef&) {
@@ -2290,6 +2295,9 @@ TEST_CASE("model store: an on_weight_hash callback that calls back into the stor
         other = r2.ok() ? si::ErrorCode::ok : r2.status().code();
         auto r3 = registry->resolve("b");
         via_registry = r3.ok() ? si::ErrorCode::ok : r3.status().code();
+        // add and refresh would wait for the scan mutex a registry scan on this thread may hold.
+        via_add = registry->add_ollama_dir(s.tmp.path).code();
+        registry->refresh();
         revalidated = self->revalidate(*earlier);
     };
     auto store = m::OllamaStore::open(s.tmp.path, opt);
@@ -2319,6 +2327,7 @@ TEST_CASE("model store: an on_weight_hash callback that calls back into the stor
     CHECK(same == si::ErrorCode::invalid_state);
     CHECK(other == si::ErrorCode::invalid_state);
     CHECK(via_registry == si::ErrorCode::invalid_state);
+    CHECK(via_add == si::ErrorCode::invalid_state);
     CHECK_FALSE(revalidated);
     // Outside the callback everything works as before ("b" was hashed before the worker started).
     CHECK(store.value().resolve("b").value().weight_check == m::WeightCheck::cached_identity);
@@ -2354,7 +2363,7 @@ TEST_CASE("model store: open reports a directory it cannot open as an I/O error,
     CHECK(file.status().message().find("not a directory") != std::string::npos);
 }
 
-TEST_CASE("model store: refresh() keeps a store that add_ollama_dir() registered while it ran") {
+TEST_CASE("model store: an add_ollama_dir() that starts during a refresh() waits for it, and both stores are kept") {
     Store first;
     const auto cfg1 = first.config_blob(R"({"model_format":"gguf"})");
     first.put_v2("ollama.com", "library", "one", "latest", first.manifest(cfg1, {first.blob(kModel, fake_gguf(1, 1, 32))}));
@@ -2367,19 +2376,20 @@ TEST_CASE("model store: refresh() keeps a store that add_ollama_dir() registered
     si::Status added;
     m::StoreOptions opt;
     opt.verify_weights = m::WeightVerification::always;  // so refresh()'s scan hashes and calls back
+    std::thread adder;
     opt.on_weight_hash = [&](const m::BlobRef&) {
         if (!armed.exchange(false)) return;
-        // refresh() is between its snapshot of the stores and its write: another thread adds one.
-        // Waiting here for a thread that uses the registry is within the on_weight_hash contract:
-        // the callback's thread holds no hash slot or single-flight claim while it runs.
-        std::thread adder([&] { added = registry->add_ollama_dir(second.tmp.path); });
-        adder.join();
+        // refresh() is in the middle of its scan: another thread starts an add. Scans run one at
+        // a time, so it waits for the refresh (the callback must not wait for it, see
+        // StoreOptions::on_weight_hash).
+        adder = std::thread([&] { added = registry->add_ollama_dir(second.tmp.path); });
     };
     m::ModelRegistry reg(opt);
     registry = &reg;
     REQUIRE(reg.add_ollama_dir(first.tmp.path).ok());
     armed = true;
     reg.refresh();
+    adder.join();
     REQUIRE(added.ok());
     const auto listed = reg.list();
     auto has = [&](const std::string& display) {
@@ -2564,7 +2574,8 @@ TEST_CASE("model store: a scan keeps template, system and messages text only wit
     std::vector<std::string> omitted_names;
     std::uint64_t text = 0;
     for (const auto& r : scan.records) {
-        CHECK(r.ready());
+        CHECK(r.ready() == !r.text_omitted);  // an omitted layer is never "ready"
+        CHECK(r.status != m::EntryStatus::unsupported);
         if (r.template_text) {
             ++kept;
             text += r.template_text->size();
@@ -2891,7 +2902,8 @@ TEST_CASE("model store: config and params layers are charged to max_retained_tex
     int kept = 0, omitted = 0;
     std::uint64_t total = 0;
     for (const auto& r : scan.records) {
-        CHECK(r.ready());
+        CHECK(r.ready() == !r.text_omitted);
+        CHECK(r.status != m::EntryStatus::unsupported);
         total += visible_retained(r);
         if (r.text_omitted) {
             ++omitted;
@@ -2946,10 +2958,19 @@ TEST_CASE("model store: refresh and add_ollama_dir share one retained-content al
     fill(a, "a", false);
     fill(b, "b", false);
     fill(c, "c", true);
+    // What the registry holds for one whole store (three records: config 23 + template 1000 each,
+    // plus the blob list, paths and source stamps it also counts).
+    auto held_for = [](Store& st) {
+        m::ModelRegistry probe;
+        REQUIRE(probe.add_ollama_dir(st.tmp.path).ok());
+        return probe.retained_bytes_now();
+    };
+    const std::uint64_t held_a = held_for(a);
+    const std::uint64_t held_b = held_for(b);
     m::StoreOptions opt;
-    // Per record: config 23 + template 1000. All of store a (3069), the first of b (1023) and
-    // the config of b1 fit; then the allowance is spent for every later layer of every store.
-    opt.limits.max_retained_text_bytes = 4500;
+    // All of store a, the first of b and the config of b1 fit; then less than a template is left,
+    // so the allowance is spent for every later layer of every store.
+    opt.limits.max_retained_text_bytes = held_a + held_b / 3 + 400;
     m::ModelRegistry reg(opt);
     REQUIRE(reg.add_ollama_dir(a.tmp.path).ok());
     REQUIRE(reg.add_ollama_dir(b.tmp.path).ok());
@@ -2975,13 +2996,15 @@ TEST_CASE("model store: refresh and add_ollama_dir share one retained-content al
             const auto* r = find_shared(list, std::string(name) + ":latest");
             REQUIRE(r != nullptr);
             INFO(name << ": " << m::to_string(r->reason) << " " << r->detail);
-            CHECK(r->ready());
+            CHECK(r->status == m::EntryStatus::incomplete);  // never `ready`
             CHECK(r->text_omitted);
             CHECK_FALSE(r->template_text.has_value());
         }
     };
+    CHECK(reg.retained_bytes_now() <= opt.limits.max_retained_text_bytes);
     check_registry("after add_ollama_dir x3");
     reg.refresh();
+    CHECK(reg.retained_bytes_peak() <= opt.limits.max_retained_text_bytes);
     check_registry("after refresh");
 }
 
@@ -3086,51 +3109,75 @@ TEST_CASE("model store: a per-call cancel stops one resolve and leaves the store
     CHECK(fine.value().ready());
 }
 
+#if defined(SONDER_INFERENCE_TEST_HOOKS)
 TEST_CASE("model store: a per-call cancel also ends the wait for a hash slot") {
     Store s;
     const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
     for (int i = 0; i < 3; ++i) {
         s.put_v2("ollama.com", "library", "h" + std::to_string(i), "latest",
-                 s.manifest(cfg, {s.blob(kModel, fake_gguf(1, 1, 24u << 20, static_cast<char>('a' + i)))}));
+                 s.manifest(cfg, {s.blob(kModel, fake_gguf(1, 1, 4096, static_cast<char>('a' + i)))}));
     }
-    auto store = m::OllamaStore::open(s.tmp.path);
+    // `always` goes from the (absent) callback straight to the slot wait: nothing else looks at the
+    // per-call cancel first, so only the wait itself can end this resolve.
+    m::StoreOptions opt;
+    opt.verify_weights = m::WeightVerification::always;
+    auto store = m::OllamaStore::open(s.tmp.path, opt);
     REQUIRE(store.ok());
-    si::CancellationSource hold, wait;
-    m::ResolveOptions hold_call, wait_call;
-    hold_call.cancel = hold.token();
-    wait_call.cancel = wait.token();
+
+    // The two slot holders stop inside the hash (right after taking their slot) until the test
+    // lets them go; no timing is involved.
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    bool released = false;
+    std::atomic<int> holding{0};
+    auto release_holders = [&] {
+        {
+            const std::lock_guard<std::mutex> lock(gate_mutex);
+            released = true;
+        }
+        gate_cv.notify_all();
+    };
+    struct HookReset {
+        ~HookReset() { m::set_hash_slot_hook_for_testing({}); }
+    } hook_reset;
+    m::set_hash_slot_hook_for_testing([&] {
+        ++holding;
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        gate_cv.wait(lock, [&] { return released; });
+    });
+
     std::vector<std::thread> holders;
     for (int i = 0; i < 2; ++i) {
-        holders.emplace_back([&, i] { (void)store.value().resolve("h" + std::to_string(i), hold_call); });
+        holders.emplace_back([&, i] { (void)store.value().resolve("h" + std::to_string(i)); });
     }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    while (store.value().weight_hashes_running() < m::kMaxConcurrentWeightHashes &&
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (holding.load() < static_cast<int>(m::kMaxConcurrentWeightHashes) &&
            std::chrono::steady_clock::now() < deadline) {
         std::this_thread::yield();
     }
-    std::optional<m::UnsupportedReason> waiter_reason;
-    bool both_held = false;
-    if (store.value().weight_hashes_running() == m::kMaxConcurrentWeightHashes) {
-        std::thread waiter([&] {
-            auto r = store.value().resolve("h2", wait_call);  // no slot is free: it waits
-            if (r.ok()) waiter_reason = r.value().reason;
-        });
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        wait.cancel();
-        waiter.join();
-        // Both holders still hashing when the waiter returned: it was cancelled while waiting.
-        both_held = store.value().weight_hashes_running() == m::kMaxConcurrentWeightHashes;
-    }
-    hold.cancel();  // end the long hashes (also the case that they never reached two slots)
+    const bool both_held = holding.load() == static_cast<int>(m::kMaxConcurrentWeightHashes);
+    CHECK(both_held);
+    if (both_held) CHECK(store.value().weight_hashes_running() == m::kMaxConcurrentWeightHashes);
+
+    si::CancellationSource wait;
+    m::ResolveOptions wait_call;
+    wait_call.cancel = wait.token();
+    // Every slot is taken and stays taken: this resolve can only wait for one.
+    auto waiter = std::async(std::launch::async, [&] { return store.value().resolve("h2", wait_call); });
+    wait.cancel();
+    const bool ended = waiter.wait_for(std::chrono::seconds(30)) == std::future_status::ready;
+    CHECK(ended);  // false when the slot wait ignores the per-call cancel: it would wait for a holder
+    CHECK(holding.load() <= static_cast<int>(m::kMaxConcurrentWeightHashes));  // it never got a slot
+    release_holders();
     for (auto& t : holders) t.join();
-    if (both_held) {
-        REQUIRE(waiter_reason.has_value());
-        CHECK(*waiter_reason == m::UnsupportedReason::hash_limit);
-    } else {
-        MESSAGE("the holders finished before the waiter was cancelled; the slot wait was not exercised");
-    }
+    auto r = waiter.get();
+    REQUIRE(r.ok());
+    CHECK_FALSE(r.value().ready());
+    CHECK(r.value().reason == m::UnsupportedReason::hash_limit);
+    CHECK(r.value().detail.find("ResolveOptions::cancel") != std::string::npos);
     CHECK(store.value().weight_hashes_running() == 0);
 }
+#endif
 
 TEST_CASE("model store: a text_omitted record is never revalidated, and an omitted layer that cannot be opened is not ready") {
     Store s;
@@ -3152,7 +3199,8 @@ TEST_CASE("model store: a text_omitted record is never revalidated, and an omitt
     REQUIRE((m0 != nullptr && m1 != nullptr && m2 != nullptr));
     CHECK(m0->ready());
     CHECK_FALSE(m0->text_omitted);
-    CHECK(m2->ready());
+    CHECK(m2->status == m::EntryStatus::incomplete);
+    CHECK_FALSE(m2->ready());
     CHECK(m2->text_omitted);
     CHECK_FALSE(m1->ready());  // not "ready" for a model resolve() refuses
     CHECK(m1->text_omitted);
@@ -3220,4 +3268,292 @@ TEST_CASE("model store: verify_blobs applies max_weight_file_bytes, the timeout 
         REQUIRE(r.ok());
         CHECK(m::verify_blobs(r.value(), weights).ok());
     }
+}
+
+// ---------------------------------------------------------------------------
+// PR 135 round 6: everything retained is charged, incomplete records, one scan at a time
+// ---------------------------------------------------------------------------
+namespace {
+
+// A heap string cut from a large one must not keep the large allocation (capacity, not size,
+// is what stays in memory).
+constexpr std::size_t kCapSlack = 32;  // allocator rounding (MSVC rounds capacity up to 16 bytes)
+
+}  // namespace
+
+TEST_CASE("model store: a huge manifest mediaType is cut, and a cut string holds no more than its cap") {
+    Store s;
+    auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    cfg.media_type = std::string(kConfigType) + std::string(3u << 20, 'm');  // a 3 MiB mediaType on the config layer
+    const auto weights = s.blob(kModel, fake_gguf(1, 1, 64));
+    s.put_v2("ollama.com", "library", "wide", "latest", s.manifest(cfg, {weights}));
+    // A 3 MiB config string, cut to 1 KiB: the copy must be a fresh 1 KiB allocation.
+    const auto cfg2 = s.config_blob("{\"model_format\":\"gguf\",\"model_family\":\"" + std::string(3u << 20, 'f') + "\"}");
+    s.put_v2("ollama.com", "library", "fam", "latest", s.manifest(cfg2, {s.blob(kModel, fake_gguf(1, 1, 64, 'b'))}));
+
+    auto check_record = [](const m::ModelRecord& r) {
+        for (const auto& b : r.blobs) {
+            CHECK(b.media_type.size() <= 256);
+            CHECK(b.media_type.capacity() <= 256 + kCapSlack);
+            CHECK(b.from.capacity() <= 256 + kCapSlack);
+        }
+    };
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    const auto scan = store.value().scan();
+    const m::ModelRecord* wide = find(scan, "wide:latest");
+    const m::ModelRecord* fam = find(scan, "fam:latest");
+    REQUIRE((wide != nullptr && fam != nullptr));
+    REQUIRE_FALSE(wide->blobs.empty());
+    CHECK(wide->blobs.front().role == m::BlobRole::config);
+    check_record(*wide);
+    CHECK(fam->config.model_family.size() == 1024);
+    CHECK(fam->config.model_family.capacity() <= 1024 + kCapSlack);
+    auto resolved = store.value().resolve("fam");
+    REQUIRE(resolved.ok());
+    CHECK(resolved.value().config.model_family.capacity() <= 1024 + kCapSlack);
+
+    // The registry keeps the cut copy, and counts what the record holds: warnings, the blob list,
+    // paths and source stamps as well as the text.
+    m::StoreOptions opt;
+    opt.limits.max_retained_text_bytes = 1u << 20;
+    m::ModelRegistry reg(opt);
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    for (const auto& r : reg.list()) check_record(*r);
+    const auto held = reg.retained_bytes_now();
+    CHECK(held > 0);
+    CHECK(held <= opt.limits.max_retained_text_bytes);
+}
+
+TEST_CASE("model store: the registry charges warnings, blobs, paths and sources, and strips them under a small budget") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    std::vector<Layer> layers{s.blob(kModel, fake_gguf(1, 1, 64))};
+    for (int i = 0; i < 40; ++i) {  // each unknown layer type gives a warning that quotes its mediaType
+        Layer l = Store::absent("application/x-unknown-" + std::string(100, 'a') + std::to_string(i), std::to_string(i));
+        layers.push_back(l);
+    }
+    s.put_v2("ollama.com", "library", "noisy", "latest", s.manifest(cfg, layers));
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    const auto scan = store.value().scan();
+    const m::ModelRecord* noisy = find(scan, "noisy:latest");
+    REQUIRE(noisy != nullptr);
+    std::uint64_t warning_bytes = 0;
+    for (const auto& w : noisy->warnings) warning_bytes += w.size();
+    REQUIRE(warning_bytes > 4000);
+
+    m::StoreOptions roomy;
+    m::ModelRegistry big(roomy);
+    REQUIRE(big.add_ollama_dir(s.tmp.path).ok());
+    CHECK(big.retained_bytes_now() >= warning_bytes);  // warnings are charged
+
+    m::StoreOptions tiny;
+    tiny.limits.max_retained_text_bytes = 2000;  // less than the warnings alone
+    m::ModelRegistry small(tiny);
+    REQUIRE(small.add_ollama_dir(s.tmp.path).ok());
+    CHECK(small.retained_bytes_now() <= tiny.limits.max_retained_text_bytes);
+    const auto list = small.list();
+    REQUIRE(list.size() == 1);
+    CHECK(list[0]->warnings.empty());  // dropped, not kept past the budget
+    CHECK(list[0]->text_omitted);
+    CHECK_FALSE(list[0]->ready());
+    auto full = small.resolve("noisy");  // resolve reads the store again and gives the whole record
+    REQUIRE(full.ok());
+    CHECK(full.value().ready());
+    CHECK_FALSE(full.value().warnings.empty());
+    CHECK(small.retained_bytes_now() <= tiny.limits.max_retained_text_bytes);
+}
+
+TEST_CASE("model store: a record with omitted small layers is never reported ready") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto tmpl = s.blob(kTemplate, std::string(1000, 't'));
+    for (int i = 0; i < 4; ++i) {
+        s.put_v2("ollama.com", "library", "m" + std::to_string(i), "latest",
+                 s.manifest(cfg, {s.blob(kModel, fake_gguf(1, 1, 64, static_cast<char>('a' + i))), tmpl}));
+    }
+    m::StoreOptions opt;
+    opt.limits.max_retained_text_bytes = 1100;  // one template, then the budget is spent
+    auto store = m::OllamaStore::open(s.tmp.path, opt);
+    REQUIRE(store.ok());
+    auto check_not_ready_when_omitted = [](const m::ModelRecord& r) {
+        if (r.text_omitted) {
+            CHECK_FALSE(r.ready());
+            CHECK(r.status == m::EntryStatus::incomplete);
+            CHECK(std::string(m::to_string(r.status)) == "incomplete");
+            CHECK(m::to_json(r).find("status")->as_string() == "incomplete");
+        } else {
+            CHECK(r.ready());
+        }
+    };
+    const auto scan = store.value().scan();
+    REQUIRE(scan.records.size() == 4);
+    int omitted = 0;
+    for (const auto& r : scan.records) {
+        check_not_ready_when_omitted(r);
+        if (r.text_omitted) ++omitted;
+    }
+    CHECK(omitted == 3);
+    CHECK(m::to_json(scan, store.value().root()).dump().find("\"status\":\"incomplete\"") != std::string::npos);
+
+    m::ModelRegistry reg(opt);
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    for (const auto& r : reg.list()) check_not_ready_when_omitted(*r);
+    reg.refresh();
+    for (const auto& r : reg.list()) check_not_ready_when_omitted(*r);
+    // resolve() reads the whole entry, so the name is served: ready, nothing omitted.
+    for (int i = 0; i < 4; ++i) {
+        auto r = reg.resolve("m" + std::to_string(i));
+        REQUIRE(r.ok());
+        CHECK(r.value().ready());
+        CHECK_FALSE(r.value().text_omitted);
+        CHECK(r.value().template_text.has_value());
+    }
+}
+
+TEST_CASE("model store: concurrent refresh, add and resolve never hold more than max_retained_text_bytes") {
+    constexpr int kStores = 3;
+    constexpr int kPerStore = 8;
+    std::vector<std::unique_ptr<Store>> stores;
+    for (int si_ = 0; si_ < kStores; ++si_) {
+        auto st = std::make_unique<Store>();
+        const auto cfg = st->config_blob(R"({"model_format":"gguf"})");
+        for (int i = 0; i < kPerStore; ++i) {
+            const auto tmpl = st->blob(kTemplate, std::string(2000, static_cast<char>('a' + si_)) + std::to_string(i));
+            st->put_v2("ollama.com", "library", "s" + std::to_string(si_) + "m" + std::to_string(i), "latest",
+                       st->manifest(cfg, {st->blob(kModel, fake_gguf(1, 1, 64, static_cast<char>('a' + i))), tmpl}));
+        }
+        stores.push_back(std::move(st));
+    }
+    m::StoreOptions opt;
+    opt.limits.max_retained_text_bytes = 30000;  // about a third of what the 24 records would keep
+    m::ModelRegistry reg(opt);
+    REQUIRE(reg.add_ollama_dir(stores[0]->tmp.path).ok());
+    REQUIRE(reg.add_ollama_dir(stores[1]->tmp.path).ok());
+    // The registry is full: a refresh that kept the old records while it built new ones would hold
+    // about twice the budget, and an add that read the same stale numbers a third time.
+    CHECK(reg.retained_bytes_now() <= opt.limits.max_retained_text_bytes);
+
+    std::atomic<int> failures{0};
+    std::atomic<bool> stop{false};
+    std::thread adder([&] {
+        if (!reg.add_ollama_dir(stores[2]->tmp.path).ok()) ++failures;
+    });
+    std::thread refresher([&] {
+        for (int i = 0; i < 6; ++i) reg.refresh();
+    });
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 2; ++t) {
+        readers.emplace_back([&, t] {
+            for (int i = 0; i < 60; ++i) {
+                auto r = reg.resolve("s" + std::to_string((i + t) % 2) + "m" + std::to_string(i % kPerStore));
+                if (!r.ok() || !r.value().ready() || r.value().text_omitted || !r.value().template_text) ++failures;
+            }
+        });
+    }
+    std::thread lister([&] {
+        while (!stop.load()) {
+            for (const auto& r : reg.list()) {
+                if (r->text_omitted && r->ready()) ++failures;
+            }
+            if (reg.retained_bytes_now() > opt.limits.max_retained_text_bytes) ++failures;
+        }
+    });
+    adder.join();
+    refresher.join();
+    for (auto& t : readers) t.join();
+    stop = true;
+    lister.join();
+    CHECK(failures.load() == 0);
+    CHECK(reg.retained_bytes_peak() <= opt.limits.max_retained_text_bytes);
+    CHECK(reg.retained_bytes_now() <= opt.limits.max_retained_text_bytes);
+    reg.refresh();
+    CHECK(reg.list().size() == static_cast<std::size_t>(kStores * kPerStore));
+    CHECK(reg.retained_bytes_peak() <= opt.limits.max_retained_text_bytes);
+    CHECK(reg.retained_bytes_now() > 0);
+}
+
+TEST_CASE("model store: a scan under always shares one weight total, honours a per-call cancel and survives an exception") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    for (int i = 0; i < 3; ++i) {
+        s.put_v2("ollama.com", "library", "m" + std::to_string(i), "latest",
+                 s.manifest(cfg, {s.blob(kModel, fake_gguf(1, 1, 1u << 20, static_cast<char>('a' + i)))}));
+    }
+    m::StoreOptions opt;
+    opt.verify_weights = m::WeightVerification::always;
+    opt.max_resolve_weight_bytes = (5u << 20) / 2;  // 2.5 MiB: two of the three 1 MiB weights, one resolve alone
+    {
+        auto store = m::OllamaStore::open(s.tmp.path, opt);
+        REQUIRE(store.ok());
+        const auto scan = store.value().scan();
+        REQUIRE(scan.records.size() == 3);
+        int hashed = 0, limited = 0;
+        for (const auto& r : scan.records) {
+            if (r.ready() && r.weight_check == m::WeightCheck::hashed_now) ++hashed;
+            if (!r.ready() && r.reason == m::UnsupportedReason::hash_limit) {
+                ++limited;
+                CHECK(r.detail.find("scan") != std::string::npos);
+                CHECK(has_failed_source(r));
+            }
+        }
+        CHECK(hashed == 2);
+        CHECK(limited == 1);
+        CHECK(store.value().resolve("m2").value().ready());  // one resolve is within its own limit
+
+        // A cancelled call ends the hashing of the whole scan; the next one is unaffected.
+        si::CancellationSource source;
+        source.cancel();
+        m::ResolveOptions call;
+        call.cancel = source.token();
+        for (const auto& r : store.value().scan(call).records) {
+            CHECK_FALSE(r.ready());
+            CHECK(r.reason == m::UnsupportedReason::hash_limit);
+            // Either the cancel or (for the record that would pass the scan's total) that total.
+            CHECK((r.detail.find("cancel") != std::string::npos || r.detail.find("scan") != std::string::npos));
+        }
+        m::ModelRegistry reg(opt);
+        REQUIRE(reg.add_ollama_dir(s.tmp.path, call).ok());
+        for (const auto& r : reg.list()) CHECK(r->reason == m::UnsupportedReason::hash_limit);
+        reg.refresh(call);
+        for (const auto& r : reg.list()) CHECK(r->reason == m::UnsupportedReason::hash_limit);
+        reg.refresh();
+        int ready = 0;
+        for (const auto& r : reg.list()) ready += r->ready() ? 1 : 0;
+        CHECK(ready == 2);
+    }
+}
+
+TEST_CASE("model store: an exception while one record's weights are checked makes that record unsupported, not the scan fail") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    for (int i = 0; i < 3; ++i) {
+        s.put_v2("ollama.com", "library", "m" + std::to_string(i), "latest",
+                 s.manifest(cfg, {s.blob(kModel, fake_gguf(1, 1, 4096, static_cast<char>('a' + i)))}));
+    }
+    const std::string bad_digest = "sha256:" + si::detail::sha256_hex(fake_gguf(1, 1, 4096, 'b'));
+    m::StoreOptions opt;
+    opt.verify_weights = m::WeightVerification::always;
+    opt.on_weight_hash = [bad_digest](const m::BlobRef& b) {
+        if (b.digest == bad_digest) throw std::runtime_error("callback failed");
+    };
+    auto store = m::OllamaStore::open(s.tmp.path, opt);
+    REQUIRE(store.ok());
+    m::ScanResult scan;
+    REQUIRE_NOTHROW(scan = store.value().scan());
+    REQUIRE(scan.records.size() == 3);
+    const m::ModelRecord* bad = find(scan, "m1:latest");
+    REQUIRE(bad != nullptr);
+    CHECK_FALSE(bad->ready());
+    CHECK(bad->reason == m::UnsupportedReason::hash_limit);
+    CHECK(bad->detail.find("could not be checked") != std::string::npos);
+    CHECK(has_failed_source(*bad));
+    for (const char* name : {"m0:latest", "m2:latest"}) {
+        const m::ModelRecord* good = find(scan, name);
+        REQUIRE(good != nullptr);
+        CHECK(good->ready());
+        CHECK(good->weight_check == m::WeightCheck::hashed_now);
+    }
+    CHECK(store.value().weight_hashes_running() == 0);
 }
