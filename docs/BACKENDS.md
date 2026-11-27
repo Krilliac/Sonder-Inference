@@ -43,28 +43,22 @@ Target coverage:
 - **NVIDIA RTX (`86;89;120`)**: Ampere (RTX 30-series, `sm_86`), Ada Lovelace (RTX 40-series, `sm_89`), and Blackwell (RTX 50-series, `sm_120`). `GGML_CUDA_FA_ALL_QUANTS=ON` compiles Flash Attention kernels for quantized KV cache types (`q8_0`, `q5_0`, `q5_1`, `q4_0`, `q4_1`, `iq4_nl`).
 - **AMD Radeon RX XT & Ryzen APU**: RDNA 2 (`gfx1030`), RDNA 3 discrete (`gfx1100`, `gfx1101`, `gfx1102`), RDNA 3 Ryzen APU UMA (`gfx1103`, e.g. Radeon 780M/890M), and RDNA 4 (`gfx1200`, `gfx1201`). On Linux, `linux-rocm-xt` targets ROCm/HIP directly (`ROCm0`); on Windows (and on Linux hosts without ROCm), `windows-vulkan-xt` / `linux-vulkan-xt` use Vulkan (`Vulkan0`).
 
-### Upstream llama.cpp pin and Ternary / PrismML overrides
+### Single pinned llama.cpp engine and SI patch series
 
-`src/backends/llamacpp/CMakeLists.txt` defaults to the tag pinned in `cmake/llamacpp-pin.json`, currently **`v1.0.0`** (commit `b1b770d`), with a verified SHA-256 (recorded in [LICENSE_REVIEW.md](LICENSE_REVIEW.md)) so default and CI builds stay deterministic. The previous pin was `b11195`; `v1.0.0` contains mainline `b11556`. To run newer low-bit or Hadamard-ternary GGUF formats with direct `llamacpp`, override the source tree at configure time without editing the default pin:
+`src/backends/llamacpp/CMakeLists.txt` builds only the single archive pinned in `cmake/llamacpp-pin.json` (**`v1.0.0`**, commit `b1b770d`), verified by SHA-256 (recorded in [LICENSE_REVIEW.md](LICENSE_REVIEW.md)), and applies SI's hash-manifested patch series from `third_party/ggml-patches/` via `cmake/ApplyGgmlPatches.cmake`. Separate `llama.cpp` forks (including `PrismML-Eng/llama.cpp`), standalone `llama-server` / Prism router / `local-fast` binaries, multi-track pins, and unverified local checkout overrides (`FETCHCONTENT_SOURCE_DIR_LLAMACPP`, `SONDER_LLAMACPP_SOURCE_DIR`) are retired and refused at configure time.
+
+For offline or air-gapped builds, pass a local path to the pinned tarball:
 
 ```sh
-# Local checkout (offline builds, newer mainline, or PrismML fork):
-cmake --preset windows-cuda-rtx -DFETCHCONTENT_SOURCE_DIR_LLAMACPP=/path/to/llama.cpp
-
-# Or override the fetched tarball tag + matching SHA-256 together (fails closed on mismatch):
-cmake --preset linux-cuda-rtx \
-  -DSONDER_LLAMACPP_TAG=b11556 \
-  -DSONDER_LLAMACPP_SHA256=<sha256-of-b11556-tarball>
+cmake --preset windows-cuda-rtx -DSONDER_LLAMACPP_URL=/path/to/llama.cpp-v1.0.0.tar.gz
 ```
 
-Format-to-runtime matrix:
-- **Pinned `v1.0.0` (default)**: standard GGUF K-quants, I-quants, `MXFP4` (type 39), ternary `TQ1_0`/`TQ2_0` (types 34–35), and the mainline `>= b11556` types below (`ggml.h` at the pin defines types 40–43; the previous `b11195` pin defined 40–42 but not `F8_E4M3`).
-- **Mainline `ggml-org/llama.cpp >= b11556`**: adds stock `NVFP4` (Blackwell FP4, type 40), `Q1_0` (1-bit Bonsai-1, type 41), `Q2_0` (2-bit ternary, type 42), and `F8_E4M3` (FP8, type 43).
-- **`PrismML-Eng/llama.cpp` (`prism` branch)**: adds Hadamard-transformed Bonsai-2 ternary formats (`PQ2_0` type 142, `PTQ1_0` type 143, `PQ2_0M` KV-only type 145) and `prism.hadamard.*` GGUF metadata handling.
+Format coverage on SI's pinned `v1.0.0` engine:
+- **Native in `v1.0.0`**: standard GGUF K-quants and I-quants, `MXFP4` (type 39), ternary `TQ1_0`/`TQ2_0` (types 34–35), `NVFP4` (Blackwell FP4, type 40), `Q1_0` (1-bit Bonsai-1, type 41), `Q2_0` (2-bit ternary, group 64, type 42), `F8_E4M3` (FP8, type 43), plus the full `prism.hadamard.*` loader and CPU/CUDA/Vulkan FWHT kernels.
+- **Lossless re-blocking for `PQ2_0` (type 142)**: group-128 `PQ2_0` Bonsai-2 checkpoints convert bit-for-bit losslessly to stock group-64 `Q2_0` (type 42) via `sonder::backends::llamacpp::ReblockPq2ToQ2Gguf` (`src/backends/llamacpp/pq2_reblock.hpp`), preserving all `prism.hadamard.*` metadata for native `llamacpp` execution.
+- **Private `PTQ1_0` (143) / `PQ2_0M` (145)**: recognized by Sonder's GGUF header parser (`gguf_header.cpp`) for fit estimation and refused fail-closed unless an approved SI patch in `third_party/ggml-patches/` adds support.
 
-**RPC server at this pin.** Sonder does not build or start the ggml RPC server (`GGML_RPC` stays off). `v1.0.0` predates upstream `b12658` ("rpc : typed request helpers and a single validation step on the server", #32651), which first ships in `v1.1.0`. Any `rpc-server` built from this tree (for example for `llama-server --rpc`) must stay on a private link until the pin moves to `v1.1.0` or later.
-
-The `llamaserver` backend can also spawn or attach to an external mainline `>= b11556` or PrismML `llama-server` binary while keeping the core build independent of llama.cpp. Sonder's GGUF header inspection recognizes all of these block layouts for fit estimation, but model execution requires a runtime build whose GGML implementation supports the file's tensor types.
+**RPC server at this pin.** Sonder does not build or start the ggml RPC server (`GGML_RPC` stays off). `v1.0.0` predates upstream `b12658` ("rpc : typed request helpers and a single validation step on the server", #32651), which first ships in `v1.1.0`. Any `rpc-server` built from this tree must stay on a private link until the pin moves to `v1.1.0` or later.
 
 ## Optional specialized backends
 
@@ -153,7 +147,7 @@ Native code is justified when:
 | --- | --- | --- |
 | `mock` | implemented; **tests only**, performs no inference | tokenization, streaming, deterministic; token_logits when `MockBackendOptions::token_logits` |
 | `ollama` | implemented; loopback HTTP, streaming, cancellable | streaming, remote_process |
-| `llamacpp` | implemented, optional (`SONDER_WITH_LLAMA_CPP=ON`, pinned `v1.0.0` default (`cmake/llamacpp-pin.json`), overridable via `FETCHCONTENT_SOURCE_DIR_LLAMACPP`); CPU by default, GPU presets for CUDA RTX / ROCm XT / Vulkan XT; supports tensor overrides, KV quantization, and multi-GPU placement (`devices`, `main_gpu`, `split_mode`, `tensor_split`, `use_mlock`) | tokenization, streaming, batched_prefill, deterministic |
+| `llamacpp` | implemented, optional (`SONDER_WITH_LLAMA_CPP=ON`, single pinned `v1.0.0` archive in `cmake/llamacpp-pin.json` + `third_party/ggml-patches/`, offline mirror via `SONDER_LLAMACPP_URL`); CPU by default, GPU presets for CUDA RTX / ROCm XT / Vulkan XT; supports tensor overrides, KV quantization, lossless `PQ2_0 -> Q2_0` re-blocking, and multi-GPU placement (`devices`, `main_gpu`, `split_mode`, `tensor_split`, `use_mlock`) | tokenization, streaming, batched_prefill, deterministic |
 | `llamaserver` | implemented, always built (`src/backends/llamaserver`); no llama.cpp linked. Attach to a running llama-server or any OpenAI-compatible upstream (default `http://127.0.0.1:8080`), or spawn and supervise a llama-server child. `"native_completion": false` selects generic OpenAI mode. Status 2026-11-20. See [integration/llama-server.md](integration/llama-server.md) | streaming, remote_process; plus speculative_decode and prefix_reuse in native mode (not generic OpenAI mode); structured_output when a grammar is configured |
 
 The interface lives in `include/sonder/inference/backend.hpp`. Capabilities

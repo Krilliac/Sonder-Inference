@@ -11,25 +11,19 @@
 #                            sonder_inference (sonder/inference/backends/llamacpp.hpp)
 #   SONDER_HAS_LLAMACPP_BACKEND=1 on sonder_inference
 #
-# llama.cpp is pulled with FetchContent at the tag pinned in
-# cmake/llamacpp-pin.json (SONDER_LLAMACPP_TRACK selects the entry). The record
-# in docs/LICENSE_REVIEW.md must match: `python -I scripts/llamacpp_pin.py check`.
+# llama.cpp is pulled with FetchContent at the single archive pinned in
+# cmake/llamacpp-pin.json and patched from third_party/ggml-patches/ via
+# cmake/ApplyGgmlPatches.cmake. Separate llama.cpp forks, multi-track pins, and
+# unverified local source-tree overrides are retired. The record in
+# docs/LICENSE_REVIEW.md must match: `python -I scripts/llamacpp_pin.py check`.
 #
-# Building against a local checkout (offline builds, newer mainline, or forks):
-#   -DFETCHCONTENT_SOURCE_DIR_LLAMACPP=/path/to/llama.cpp
-# Specifically:
-#   - Mainline ggml-org/llama.cpp >= b11556: adds stock Q2_0 (2-bit ternary),
-#     Q1_0 (1-bit Bonsai-1), NVFP4 (Blackwell FP4), and F8_E4M3 (FP8).
-#   - PrismML-Eng/llama.cpp (prism branch): adds Hadamard-transformed Bonsai-2
-#     ternary formats (PQ2_0, PTQ1_0, PQ2_0M) and prism.hadamard.* support.
+# Offline / CI cached archive builds pass a local mirror path of the pinned
+# archive via `-DSONDER_LLAMACPP_URL=/path/to/llama.cpp-v1.0.0.tar.gz`;
+# FetchContent still verifies the manifest SHA-256 and applies all patches.
 #
-# To override the fetched tarball tag instead of using a local checkout, pass
-# SONDER_LLAMACPP_TAG and the matching, different SONDER_LLAMACPP_SHA256 (and
-# optionally SONDER_LLAMACPP_URL) together; configure fails when the tag differs
-# but the SHA-256 does not, and SHA-256 verification fails closed on mismatch.
-#
-# Opt-in GPU presets live in CMakePresets.json: windows-cuda-rtx,
-# windows-vulkan-xt, linux-cuda-rtx, linux-rocm-xt, and linux-vulkan-xt.
+# Opt-in GPU presets live in CMakePresets.json: windows-cuda-blackwell,
+# windows-cuda-rtx, windows-rocm-xt, windows-vulkan-xt, linux-llamacpp,
+# linux-cuda-blackwell, linux-cuda-rtx, linux-rocm-xt, and linux-vulkan-xt.
 
 if(NOT SONDER_WITH_LLAMA_CPP)
     return()
@@ -45,40 +39,47 @@ if(GGML_RPC)
         "GGML_RPC=ON is refused for the in-process llamacpp backend: the RPC client must run in an "
         "isolated worker process. Use the llamaserver backend's rpc_worker (docs/integration/rpc-worker.md).")
 endif()
-# Pin it off in the cache as well, so a fork (FETCHCONTENT_SOURCE_DIR_LLAMACPP)
-# whose ggml declares GGML_RPC with a default of ON cannot turn it back on:
-# option() leaves an existing cache entry alone.
+# Pin it off in the cache as well, so a pre-populated CMakeCache.txt cannot
+# turn GGML_RPC back on: option() leaves an existing cache entry alone.
 set(GGML_RPC OFF CACHE BOOL "ggml: use RPC (refused for the in-process llamacpp backend)" FORCE)
 
 include(FetchContent)
 
 # --- pin resolution begin (extracted by scripts/test_llamacpp_pin.py) ---
-# Pin manifest: cmake/llamacpp-pin.json holds one entry per track (tag, peeled
-# commit, URL, SHA-256). It is the single source of truth; CI, the docs check
-# (scripts/llamacpp_pin.py check) and the test expectations all read it.
+# Pin manifest: cmake/llamacpp-pin.json holds the single pinned mainline archive
+# (tag, peeled commit, URL, SHA-256) plus SI's third_party/ggml-patches/ series.
+# Separate forks and local checkout overrides are refused fail-closed.
+if(NOT SONDER_LLAMACPP_REPO_ROOT)
+    get_filename_component(SONDER_LLAMACPP_REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+endif()
 set(SONDER_LLAMACPP_TRACK "mainline" CACHE STRING
-    "llama.cpp pin track from cmake/llamacpp-pin.json (the manifest has only mainline)")
+    "Single llama.cpp engine track (only 'mainline' is permitted; forks are retired)")
 set_property(CACHE SONDER_LLAMACPP_TRACK PROPERTY STRINGS mainline)
-set(SONDER_LLAMACPP_PIN_FILE "${CMAKE_CURRENT_LIST_DIR}/../../../cmake/llamacpp-pin.json" CACHE FILEPATH
-    "Pin manifest to read (override for experiments only)")
+if(NOT SONDER_LLAMACPP_TRACK STREQUAL "" AND NOT SONDER_LLAMACPP_TRACK STREQUAL "mainline")
+    message(FATAL_ERROR "SONDER_LLAMACPP_TRACK='${SONDER_LLAMACPP_TRACK}' is refused: Sonder Inference builds only "
+                        "the single pinned 'mainline' engine plus third_party/ggml-patches/ (separate forks are retired).")
+endif()
+set(SONDER_LLAMACPP_TRACK "mainline")
 
-# Override-only variables: empty means "use the manifest value". Manifest values
-# are never stored in the cache, so a manifest bump reaches existing build dirs.
-set(SONDER_LLAMACPP_TAG "" CACHE STRING
-    "Override llama.cpp tag (must be paired with a different SONDER_LLAMACPP_SHA256)")
+if(SONDER_LLAMACPP_SOURCE_DIR OR FETCHCONTENT_SOURCE_DIR_LLAMACPP)
+    message(FATAL_ERROR "Local llama.cpp checkout overrides (SONDER_LLAMACPP_SOURCE_DIR / "
+                        "FETCHCONTENT_SOURCE_DIR_LLAMACPP) are retired: Sonder Inference compiles only the "
+                        "SHA-pinned archive in cmake/llamacpp-pin.json with third_party/ggml-patches/. "
+                        "For offline builds pass -DSONDER_LLAMACPP_URL=/path/to/pinned-archive.tar.gz.")
+endif()
+
+set(SONDER_LLAMACPP_PIN_FILE "${SONDER_LLAMACPP_REPO_ROOT}/cmake/llamacpp-pin.json" CACHE FILEPATH
+    "Pin manifest to read (override for tests only)")
 set(SONDER_LLAMACPP_URL "" CACHE STRING
-    "Override llama.cpp source archive URL (default: manifest URL with the tag substituted)")
-set(SONDER_LLAMACPP_SHA256 "" CACHE STRING
-    "Override expected SHA-256 of the llama.cpp source archive")
-# Manifest values applied by the last configure of this build directory: SHA-256,
-# tag and the archive URL derived from them.
-# (INTERNAL cache entries imply FORCE, so they are only written at the end and
-# copied into locals here.)
+    "Optional local file or mirror URL for the pinned llama.cpp archive (must still match manifest SHA-256)")
+# Legacy cache entries retained only so existing build dirs migrate cleanly;
+# any explicit value differing from the manifest fails closed below.
+set(SONDER_LLAMACPP_TAG "" CACHE STRING "Retired (must be empty or match manifest tag)")
+set(SONDER_LLAMACPP_SHA256 "" CACHE STRING "Retired (must be empty or match manifest SHA-256)")
+
 set(_sonder_llamacpp_applied_sha256 "${SONDER_LLAMACPP_APPLIED_SHA256}")
 set(_sonder_llamacpp_applied_tag    "${SONDER_LLAMACPP_APPLIED_TAG}")
 set(_sonder_llamacpp_applied_url    "${SONDER_LLAMACPP_APPLIED_URL}")
-# Values that earlier revisions of this file stored in the cache as the defaults
-# (b11195); a cached value equal to one of these was never an override.
 set(_sonder_llamacpp_legacy_sha256
     "d9818b7786c8a3b063bac7eb7dc8710e275638f1e288e206720c9e22e7ca216a")
 set(_sonder_llamacpp_legacy_tag "b11195")
@@ -90,23 +91,55 @@ if(NOT EXISTS "${SONDER_LLAMACPP_PIN_FILE}")
 endif()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${SONDER_LLAMACPP_PIN_FILE}")
 file(READ "${SONDER_LLAMACPP_PIN_FILE}" _sonder_llamacpp_pin_json)
+string(JSON _sonder_llamacpp_tracks_len ERROR_VARIABLE _sonder_llamacpp_err
+       LENGTH "${_sonder_llamacpp_pin_json}" tracks)
+if(_sonder_llamacpp_err OR NOT _sonder_llamacpp_tracks_len EQUAL 1)
+    message(FATAL_ERROR "${SONDER_LLAMACPP_PIN_FILE}: tracks must contain only 'mainline'")
+endif()
 string(JSON _sonder_llamacpp_entry ERROR_VARIABLE _sonder_llamacpp_err
-       GET "${_sonder_llamacpp_pin_json}" tracks "${SONDER_LLAMACPP_TRACK}")
+       GET "${_sonder_llamacpp_pin_json}" tracks mainline)
 if(_sonder_llamacpp_err)
-    message(FATAL_ERROR "SONDER_LLAMACPP_TRACK='${SONDER_LLAMACPP_TRACK}' is not a track in "
-                        "${SONDER_LLAMACPP_PIN_FILE}: ${_sonder_llamacpp_err}")
+    message(FATAL_ERROR "tracks.mainline missing in ${SONDER_LLAMACPP_PIN_FILE}: ${_sonder_llamacpp_err}")
 endif()
 string(JSON _sonder_llamacpp_m_tag    GET "${_sonder_llamacpp_entry}" tag)
 string(JSON _sonder_llamacpp_m_url    GET "${_sonder_llamacpp_entry}" url)
 string(JSON _sonder_llamacpp_m_sha256 GET "${_sonder_llamacpp_entry}" sha256)
-# expected_features: SONDER_LLAMACPP_* defines that header detection must produce
-# for this track's tarball (checked after detection, see "expected features").
+
+# Register configure dependencies on the SI patch directory and listed patch files.
+set(_sonder_llamacpp_patch_dir_rel "third_party/ggml-patches")
+string(JSON _sonder_llamacpp_pd_val ERROR_VARIABLE _sonder_llamacpp_pd_err
+       GET "${_sonder_llamacpp_entry}" patch_dir)
+if(NOT _sonder_llamacpp_pd_err)
+    set(_sonder_llamacpp_patch_dir_rel "${_sonder_llamacpp_pd_val}")
+endif()
+set(SONDER_LLAMACPP_PATCH_DIR "${SONDER_LLAMACPP_REPO_ROOT}/${_sonder_llamacpp_patch_dir_rel}")
+if(IS_DIRECTORY "${SONDER_LLAMACPP_PATCH_DIR}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${SONDER_LLAMACPP_PATCH_DIR}")
+endif()
+string(JSON _sonder_llamacpp_patches_type ERROR_VARIABLE _sonder_llamacpp_p_err
+       TYPE "${_sonder_llamacpp_entry}" patches)
+if(NOT _sonder_llamacpp_p_err)
+    if(NOT _sonder_llamacpp_patches_type STREQUAL "ARRAY")
+        message(FATAL_ERROR "${SONDER_LLAMACPP_PIN_FILE}: tracks.mainline.patches must be an array")
+    endif()
+    string(JSON _sonder_llamacpp_patches_len LENGTH "${_sonder_llamacpp_entry}" patches)
+    if(_sonder_llamacpp_patches_len GREATER 0)
+        math(EXPR _sonder_llamacpp_p_last "${_sonder_llamacpp_patches_len} - 1")
+        foreach(_sonder_llamacpp_pi RANGE ${_sonder_llamacpp_p_last})
+            string(JSON _sonder_llamacpp_p_file GET "${_sonder_llamacpp_entry}" patches ${_sonder_llamacpp_pi} file)
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                         "${SONDER_LLAMACPP_PATCH_DIR}/${_sonder_llamacpp_p_file}")
+        endforeach()
+    endif()
+endif()
+
+# expected_features: SONDER_LLAMACPP_* defines that header detection must produce.
 set(SONDER_LLAMACPP_EXPECTED_FEATURES "")
 string(JSON _sonder_llamacpp_ef_type ERROR_VARIABLE _sonder_llamacpp_err
        TYPE "${_sonder_llamacpp_entry}" expected_features)
 if(NOT _sonder_llamacpp_err)
     if(NOT _sonder_llamacpp_ef_type STREQUAL "ARRAY")
-        message(FATAL_ERROR "${SONDER_LLAMACPP_PIN_FILE}: tracks.${SONDER_LLAMACPP_TRACK}."
+        message(FATAL_ERROR "${SONDER_LLAMACPP_PIN_FILE}: tracks.mainline."
                             "expected_features must be an array (got ${_sonder_llamacpp_ef_type})")
     endif()
     string(JSON _sonder_llamacpp_ef_len LENGTH "${_sonder_llamacpp_entry}" expected_features)
@@ -124,10 +157,7 @@ if(NOT _sonder_llamacpp_err)
     endif()
 endif()
 
-# Stale-cache handling. A cached value equal to what an earlier configure applied
-# from the manifest (or to a legacy default) was a default, not an override, and
-# moves to the manifest. Each variable is judged on its own: an explicit TAG or
-# URL override survives a SHA-256 that happens to equal the manifest value.
+# Stale-cache migration for existing build directories upgrading from older pins.
 if(SONDER_LLAMACPP_SHA256 AND
    (SONDER_LLAMACPP_SHA256 STREQUAL _sonder_llamacpp_applied_sha256
     OR SONDER_LLAMACPP_SHA256 IN_LIST _sonder_llamacpp_legacy_sha256))
@@ -149,26 +179,19 @@ if(SONDER_LLAMACPP_URL AND
     set(SONDER_LLAMACPP_URL "" CACHE STRING "" FORCE)
 endif()
 
+# Refuse any explicit tag or SHA-256 override differing from the manifest.
+if(SONDER_LLAMACPP_TAG AND NOT SONDER_LLAMACPP_TAG STREQUAL _sonder_llamacpp_m_tag)
+    message(FATAL_ERROR "SONDER_LLAMACPP_TAG=${SONDER_LLAMACPP_TAG} is refused: Sonder Inference builds only "
+                        "manifest tag ${_sonder_llamacpp_m_tag} from ${SONDER_LLAMACPP_PIN_FILE}.")
+endif()
+if(SONDER_LLAMACPP_SHA256 AND NOT SONDER_LLAMACPP_SHA256 STREQUAL _sonder_llamacpp_m_sha256)
+    message(FATAL_ERROR "SONDER_LLAMACPP_SHA256=${SONDER_LLAMACPP_SHA256} is refused: archive SHA-256 must match "
+                        "manifest ${_sonder_llamacpp_m_sha256} in ${SONDER_LLAMACPP_PIN_FILE}.")
+endif()
+
 set(SONDER_LLAMACPP_RESOLVED_TAG    "${_sonder_llamacpp_m_tag}")
 set(SONDER_LLAMACPP_RESOLVED_URL    "${_sonder_llamacpp_m_url}")
 set(SONDER_LLAMACPP_RESOLVED_SHA256 "${_sonder_llamacpp_m_sha256}")
-if(SONDER_LLAMACPP_TAG AND NOT SONDER_LLAMACPP_TAG STREQUAL _sonder_llamacpp_m_tag)
-    if(NOT SONDER_LLAMACPP_SHA256 OR SONDER_LLAMACPP_SHA256 STREQUAL _sonder_llamacpp_m_sha256)
-        message(FATAL_ERROR "SONDER_LLAMACPP_TAG=${SONDER_LLAMACPP_TAG} differs from the manifest tag "
-                            "${_sonder_llamacpp_m_tag}, so SONDER_LLAMACPP_SHA256 must be set to the "
-                            "new tarball's SHA-256 (it is unset or still the manifest value).")
-    endif()
-    set(SONDER_LLAMACPP_RESOLVED_TAG "${SONDER_LLAMACPP_TAG}")
-    string(REPLACE "${_sonder_llamacpp_m_tag}" "${SONDER_LLAMACPP_TAG}"
-           SONDER_LLAMACPP_RESOLVED_URL "${_sonder_llamacpp_m_url}")
-endif()
-if(SONDER_LLAMACPP_SHA256)
-    if(NOT SONDER_LLAMACPP_SHA256 STREQUAL _sonder_llamacpp_m_sha256)
-        message(WARNING "llama.cpp pin override: SONDER_LLAMACPP_SHA256=${SONDER_LLAMACPP_SHA256} "
-                        "replaces the manifest value ${_sonder_llamacpp_m_sha256}")
-    endif()
-    set(SONDER_LLAMACPP_RESOLVED_SHA256 "${SONDER_LLAMACPP_SHA256}")
-endif()
 if(SONDER_LLAMACPP_URL)
     set(SONDER_LLAMACPP_RESOLVED_URL "${SONDER_LLAMACPP_URL}")
 endif()
@@ -211,13 +234,23 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
     cmake_policy(SET CMP0135 NEW)
 endif()
 
-# Optional local llama.cpp source tree override (offline builds, newer mainline,
-# or forks such as PrismML-Eng/llama.cpp). Mirrors into FetchContent's standard
-# override variable when that variable is not already set.
-set(SONDER_LLAMACPP_SOURCE_DIR "" CACHE PATH
-    "Optional local llama.cpp source directory (sets FETCHCONTENT_SOURCE_DIR_LLAMACPP if unset)")
-if(SONDER_LLAMACPP_SOURCE_DIR AND NOT FETCHCONTENT_SOURCE_DIR_LLAMACPP)
-    set(FETCHCONTENT_SOURCE_DIR_LLAMACPP "${SONDER_LLAMACPP_SOURCE_DIR}")
+set(_sonder_apply_patches_script "${SONDER_LLAMACPP_REPO_ROOT}/cmake/ApplyGgmlPatches.cmake")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_sonder_apply_patches_script}")
+
+# If _deps/llamacpp-src already exists from an earlier configure, verify and apply
+# any newly added patches before FetchContent evaluates llama.cpp's CMakeLists.txt.
+if(EXISTS "${CMAKE_BINARY_DIR}/_deps/llamacpp-src/CMakeLists.txt")
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}"
+                "-DSONDER_LLAMACPP_PIN_FILE=${SONDER_LLAMACPP_PIN_FILE}"
+                "-DSONDER_LLAMACPP_REPO_ROOT=${SONDER_LLAMACPP_REPO_ROOT}"
+                "-DSONDER_LLAMACPP_SOURCE_DIR_TO_PATCH=${CMAKE_BINARY_DIR}/_deps/llamacpp-src"
+                -P "${_sonder_apply_patches_script}"
+        RESULT_VARIABLE _sonder_pre_patch_rc
+    )
+    if(NOT _sonder_pre_patch_rc EQUAL 0)
+        message(FATAL_ERROR "Failed to verify/apply ggml-patches on existing _deps/llamacpp-src")
+    endif()
 endif()
 
 # CMake >= 3.28: only the llama.cpp targets we link are built by default.
@@ -228,6 +261,10 @@ endif()
 FetchContent_Declare(llamacpp
     URL      "${SONDER_LLAMACPP_RESOLVED_URL}"
     URL_HASH "SHA256=${SONDER_LLAMACPP_RESOLVED_SHA256}"
+    PATCH_COMMAND "${CMAKE_COMMAND}"
+                  "-DSONDER_LLAMACPP_PIN_FILE=${SONDER_LLAMACPP_PIN_FILE}"
+                  "-DSONDER_LLAMACPP_REPO_ROOT=${SONDER_LLAMACPP_REPO_ROOT}"
+                  -P "${_sonder_apply_patches_script}"
     ${SONDER_LLAMACPP_FETCH_EXTRA}
 )
 FetchContent_MakeAvailable(llamacpp)
@@ -250,9 +287,8 @@ foreach(sonder_llamacpp_upstream_target IN ITEMS llama)
     endif()
 endforeach()
 
-# Feature auto-detection against the resolved llama.cpp / ggml headers so the
-# pinned mainline tag, older trees (b11195) and newer/forked trees (e.g. PrismML-Eng/llama.cpp)
-# build cleanly without breaking older APIs.
+# Feature auto-detection against the resolved llama.cpp / ggml headers on the
+# pinned mainline archive + SI's third_party/ggml-patches/ series.
 set(SONDER_LLAMACPP_FEATURE_DEFS "")
 set(SONDER_LLAMACPP_PRIVATE_INCLUDES "")
 set(_sonder_llama_h "${llamacpp_SOURCE_DIR}/include/llama.h")
@@ -419,31 +455,22 @@ endif()
 # --- expected features begin (extracted by scripts/test_llamacpp_pin.py) ---
 # A header-detection regression (an upstream rename, or a detection bug like the
 # NextN move from llama-ext.h to llama.h) would otherwise turn a feature off
-# silently, and the tests that follow the macros would still pass. When the
-# source is the manifest tarball itself (manifest SHA-256, no local source dir),
-# every define the track lists in expected_features must have been detected.
+# silently, and the tests that follow the macros would still pass. Every define
+# listed in expected_features must be detected on the pinned archive.
 if(SONDER_LLAMACPP_EXPECTED_FEATURES)
-    if(FETCHCONTENT_SOURCE_DIR_LLAMACPP)
-        message(STATUS "llama.cpp expected_features not enforced: local source dir "
-                       "${FETCHCONTENT_SOURCE_DIR_LLAMACPP}")
-    elseif(NOT SONDER_LLAMACPP_RESOLVED_SHA256 STREQUAL _sonder_llamacpp_m_sha256)
-        message(STATUS "llama.cpp expected_features not enforced: SHA-256 override "
-                       "${SONDER_LLAMACPP_RESOLVED_SHA256}")
-    else()
-        set(_sonder_llamacpp_missing_features "")
-        foreach(_sonder_llamacpp_ef_name IN LISTS SONDER_LLAMACPP_EXPECTED_FEATURES)
-            if(NOT "${_sonder_llamacpp_ef_name}=1" IN_LIST SONDER_LLAMACPP_FEATURE_DEFS)
-                list(APPEND _sonder_llamacpp_missing_features "${_sonder_llamacpp_ef_name}")
-            endif()
-        endforeach()
-        if(_sonder_llamacpp_missing_features)
-            message(FATAL_ERROR "llama.cpp ${SONDER_LLAMACPP_RESOLVED_TAG} (track "
-                                "${SONDER_LLAMACPP_TRACK}): header detection did not produce "
-                                "${_sonder_llamacpp_missing_features}, which "
-                                "${SONDER_LLAMACPP_PIN_FILE} lists in expected_features.")
+    set(_sonder_llamacpp_missing_features "")
+    foreach(_sonder_llamacpp_ef_name IN LISTS SONDER_LLAMACPP_EXPECTED_FEATURES)
+        if(NOT "${_sonder_llamacpp_ef_name}=1" IN_LIST SONDER_LLAMACPP_FEATURE_DEFS)
+            list(APPEND _sonder_llamacpp_missing_features "${_sonder_llamacpp_ef_name}")
         endif()
-        message(STATUS "llama.cpp expected_features present: ${SONDER_LLAMACPP_EXPECTED_FEATURES}")
+    endforeach()
+    if(_sonder_llamacpp_missing_features)
+        message(FATAL_ERROR "llama.cpp ${SONDER_LLAMACPP_RESOLVED_TAG} (track "
+                            "${SONDER_LLAMACPP_TRACK}): header detection did not produce "
+                            "${_sonder_llamacpp_missing_features}, which "
+                            "${SONDER_LLAMACPP_PIN_FILE} lists in expected_features.")
     endif()
+    message(STATUS "llama.cpp expected_features present: ${SONDER_LLAMACPP_EXPECTED_FEATURES}")
 endif()
 # --- expected features end ---
 
@@ -451,6 +478,7 @@ add_library(sonder_backend_llamacpp STATIC
     gguf_compat.cpp
     llamacpp_backend.cpp
     llamacpp_util.cpp
+    pq2_reblock.cpp
     slot_store.cpp
     request_guards.cpp
 )

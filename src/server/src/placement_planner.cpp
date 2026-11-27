@@ -1011,19 +1011,25 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
     if (min_ctx > target_ctx) min_ctx = target_ctx;
     profile.ctx_size = target_ctx;
 
-    // ------------------------------------- 2. PrismML & speculative detection
-    if (model.has_prism_private_tensors || model.prism_hadamard) {
+    // ------------------------------------- 2. Ternary Hadamard & private-tensor detection
+    if (model.has_prism_private_tensors) {
         plan.requires_prism_runtime = true;
         std::string warn =
-            "model uses PrismML Hadamard / private ternary tensors (PQ2_0/PTQ1_0";
+            "model uses private ternary tensors (PQ2_0/PTQ1_0";
         if (!model.prism_hadamard_transform.empty()) {
             warn += ", transform=" + model.prism_hadamard_transform;
         }
         if (model.prism_hadamard_block_size > 0) {
             warn += ", block_size=" + std::to_string(model.prism_hadamard_block_size);
         }
-        warn += "); requires PrismML's Hadamard-capable llama-server (stock llama-server cannot load it)";
+        warn += "); re-block PQ2_0 to stock Q2_0 (group 64) for Sonder Inference native llamacpp, "
+                "or build with a matching third_party/ggml-patches kernel patch";
         plan.warnings.push_back(std::move(warn));
+    } else if (model.prism_hadamard) {
+        plan.requires_prism_runtime = false;
+        plan.reasons.emplace_back(
+            "detected Hadamard-folded stock ternary metadata (prism.hadamard.*), "
+            "supported natively by pinned llama.cpp v1.0.0 FWHT");
     }
     if (model.has_mxfp4_tensors) {
         plan.reasons.emplace_back("detected block-scaled MXFP4 weight tensors (4.25 bpw, 17 B / 32 elems)");

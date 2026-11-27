@@ -1,4 +1,6 @@
-"""Tests for scripts/llamacpp_pin.py (run: python -I -m unittest scripts.test_llamacpp_pin)."""
+"""Tests for scripts/llamacpp_pin.py, CMake single-engine pin resolution,
+configure-time third_party/ggml-patches/ verification, and fork-override retirement
+(run: python -I -m unittest scripts.test_llamacpp_pin)."""
 from __future__ import annotations
 
 import hashlib
@@ -58,11 +60,31 @@ def make_raw_tarball(path: Path, entries: list[tuple[str, bytes | None]]) -> Non
                 tf.addfile(ti, io.BytesIO(data))
 
 
-def write_manifest(path: Path, commit: str, sha256: str, tag: str = "bTEST") -> None:
+def write_manifest(
+    path: Path,
+    commit: str,
+    sha256: str,
+    tag: str = "bTEST",
+    patch_dir: str | None = None,
+    patches: object = None,
+    extra_tracks: dict | None = None,
+) -> None:
+    entry: dict[str, object] = {
+        "tag": tag,
+        "commit": commit,
+        "sha256": sha256,
+        "url": "https://example.invalid/x.tar.gz",
+    }
+    if patch_dir is not None:
+        entry["patch_dir"] = patch_dir
+    if patches is not None:
+        entry["patches"] = patches
+    tracks: dict[str, object] = {"mainline": entry}
+    if extra_tracks:
+        tracks.update(extra_tracks)
     path.write_text(json.dumps({
         "schema": 1, "default_track": "mainline",
-        "tracks": {"mainline": {"tag": tag, "commit": commit, "sha256": sha256,
-                                "url": "https://example.invalid/x.tar.gz"}},
+        "tracks": tracks,
     }), encoding="utf-8")
 
 
@@ -88,14 +110,23 @@ class VerifyTests(unittest.TestCase):
         self.git_dir = self.repo / ".git"
         self.tarball = self.tmp / "src.tar.gz"
         make_tarball(self.tarball, FILES)
+        self.patch_dir = self.tmp / "third_party" / "ggml-patches"
+        self.patch_dir.mkdir(parents=True)
         self.manifest = self.tmp / "pin.json"
         self._write_manifest()
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def _write_manifest(self) -> None:
-        write_manifest(self.manifest, self.commit, pin.sha256_file(self.tarball))
+    def _write_manifest(self, patches: object = None, extra_tracks: dict | None = None) -> None:
+        write_manifest(
+            self.manifest,
+            self.commit,
+            pin.sha256_file(self.tarball),
+            patch_dir="third_party/ggml-patches",
+            patches=[] if patches is None else patches,
+            extra_tracks=extra_tracks,
+        )
 
     def run_verify(self) -> int:
         err = io.StringIO()
@@ -103,7 +134,8 @@ class VerifyTests(unittest.TestCase):
         sys.stderr, sys.stdout = err, io.StringIO()
         try:
             return pin.main(["verify", "--tarball", str(self.tarball), "--git-dir", str(self.git_dir),
-                             "--commit", self.commit, "--manifest", str(self.manifest)])
+                             "--commit", self.commit, "--manifest", str(self.manifest),
+                             "--root", str(self.tmp)])
         finally:
             sys.stderr, sys.stdout = old
 
@@ -116,11 +148,11 @@ class VerifyTests(unittest.TestCase):
         data[0] ^= 0x01
         files["src/a.c"] = bytes(data)
         make_tarball(self.tarball, files)
-        self._write_manifest()  # SHA-256 matches the tampered tarball: tree check must catch it
+        self._write_manifest()
         self.assertEqual(self.run_verify(), 1)
 
     def test_wrong_manifest_sha_fails(self) -> None:
-        write_manifest(self.manifest, self.commit, "0" * 64)
+        write_manifest(self.manifest, self.commit, "0" * 64, patch_dir="third_party/ggml-patches", patches=[])
         self.assertEqual(self.run_verify(), 1)
 
     def test_missing_file_fails(self) -> None:
@@ -148,8 +180,7 @@ class VerifyTests(unittest.TestCase):
         return [(f"{top}/", None)] + [(f"{top}/{n}", d) for n, d in FILES.items()]
 
     def test_top_level_file_fails(self) -> None:
-        make_raw_tarball(self.tarball, self._genuine() + [("README.md", b"evil" + bytes([10])
-        )])
+        make_raw_tarball(self.tarball, self._genuine() + [("README.md", b"evil\n")])
         self._write_manifest()
         self.assertEqual(self.run_verify(), 1)
 
@@ -173,29 +204,88 @@ class VerifyTests(unittest.TestCase):
         self.assertEqual(self.run_verify(), 0)
 
     def test_commit_must_match_manifest(self) -> None:
-        write_manifest(self.manifest, "1" * 40, pin.sha256_file(self.tarball))
+        write_manifest(self.manifest, "1" * 40, pin.sha256_file(self.tarball),
+                       patch_dir="third_party/ggml-patches", patches=[])
         self.assertEqual(self.run_verify(), 1)
 
     def test_unknown_commit_is_usage_error(self) -> None:
         bad = "2" * 40
-        write_manifest(self.manifest, bad, pin.sha256_file(self.tarball))
+        write_manifest(self.manifest, bad, pin.sha256_file(self.tarball),
+                       patch_dir="third_party/ggml-patches", patches=[])
         self.commit = bad
         self.assertEqual(self.run_verify(), 2)
 
+    def test_extra_fork_track_in_manifest_is_rejected(self) -> None:
+        self._write_manifest(extra_tracks={
+            "prism": {"tag": "prism-b12232", "commit": self.commit,
+                      "sha256": pin.sha256_file(self.tarball), "url": "https://example.invalid/p.tar.gz"}
+        })
+        self.assertNotEqual(self.run_verify(), 0)
+
+    def test_valid_patch_series_applies_to_verified_tree(self) -> None:
+        patch_bytes = (
+            b"diff --git a/src/a.c b/src/a.c\n"
+            b"--- a/src/a.c\n"
+            b"+++ b/src/a.c\n"
+            b"@@ -1 +1 @@\n"
+            b"-int a(void) { return 1; }\n"
+            b"+int a(void) { return 42; }\n"
+        )
+        pfile = self.patch_dir / "0001-answer.patch"
+        pfile.write_bytes(patch_bytes)
+        self._write_manifest(patches=[{
+            "file": "0001-answer.patch",
+            "sha256": hashlib.sha256(patch_bytes).hexdigest(),
+            "summary": "Update return value in src/a.c",
+            "upstream": "sonder-owned",
+        }])
+        self.assertEqual(self.run_verify(), 0)
+
+    def test_conflicting_patch_fails_verify(self) -> None:
+        bad_patch = (
+            b"diff --git a/src/a.c b/src/a.c\n"
+            b"--- a/src/a.c\n"
+            b"+++ b/src/a.c\n"
+            b"@@ -1 +1 @@\n"
+            b"-int a(void) { return 999; }\n"
+            b"+int a(void) { return 42; }\n"
+        )
+        (self.patch_dir / "0001-conflict.patch").write_bytes(bad_patch)
+        self._write_manifest(patches=[{
+            "file": "0001-conflict.patch",
+            "sha256": hashlib.sha256(bad_patch).hexdigest(),
+            "summary": "Conflicting hunk",
+            "upstream": "sonder-owned",
+        }])
+        self.assertEqual(self.run_verify(), 1)
+
+    def test_unlisted_patch_on_disk_fails_verify(self) -> None:
+        (self.patch_dir / "0001-stray.patch").write_bytes(b"--- a/src/a.c\n+++ b/src/a.c\n")
+        self._write_manifest(patches=[])
+        self.assertEqual(self.run_verify(), 1)
+
 
 CMAKE_FILE = REPO_ROOT / "src" / "backends" / "llamacpp" / "CMakeLists.txt"
+APPLY_SCRIPT = REPO_ROOT / "cmake" / "ApplyGgmlPatches.cmake"
 PIN_BEGIN = "# --- pin resolution begin"
 PIN_END = "# --- pin resolution end ---"
 MIRROR = "file:///D:/mirror/bA.tar.gz"
 SHA_A, SHA_B = "a" * 64, "b" * 64
 
 
-def pin_manifest(path: Path, tag: str, sha: str) -> None:
+def pin_manifest(path: Path, tag: str, sha: str, patch_dir: str = "third_party/ggml-patches",
+                 patches: object = None, extra_tracks: dict | None = None) -> None:
+    tracks: dict[str, object] = {"mainline": {
+        "tag": tag, "commit": "c" * 40, "sha256": sha,
+        "url": f"https://example.invalid/archive/{tag}.tar.gz",
+        "patch_dir": patch_dir,
+        "patches": [] if patches is None else patches,
+    }}
+    if extra_tracks:
+        tracks.update(extra_tracks)
     path.write_text(json.dumps({
         "schema": 1, "default_track": "mainline",
-        "tracks": {"mainline": {
-            "tag": tag, "commit": "c" * 40, "sha256": sha,
-            "url": f"https://example.invalid/archive/{tag}.tar.gz"}},
+        "tracks": tracks,
     }), encoding="utf-8")
 
 
@@ -215,9 +305,11 @@ class CMakePinResolutionTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
+        (self.tmp / "third_party" / "ggml-patches").mkdir(parents=True)
         (self.tmp / "src").mkdir()
         (self.tmp / "src" / "CMakeLists.txt").write_text(
             "cmake_minimum_required(VERSION 3.20)\nproject(pin_mini LANGUAGES NONE)\n"
+            f'set(SONDER_LLAMACPP_REPO_ROOT "{self.tmp.as_posix()}")\n'
             "set(SONDER_WITH_LLAMA_CPP ON)\n" + self.block, encoding="utf-8")
         self.manifest = self.tmp / "pin.json"
         self.build = self.tmp / "build"
@@ -225,11 +317,14 @@ class CMakePinResolutionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def configure(self, *defs: str) -> tuple[str, str, str]:
-        r = subprocess.run(
+    def run_cmake(self, *defs: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
             ["cmake", "-S", str(self.tmp / "src"), "-B", str(self.build),
              f"-DSONDER_LLAMACPP_PIN_FILE={self.manifest.as_posix()}", *defs],
             capture_output=True, text=True, timeout=120)
+
+    def configure(self, *defs: str) -> tuple[str, str, str]:
+        r = self.run_cmake(*defs)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         m = re.search(r"llama\.cpp pin: track=\S+ tag=(\S+) url=(\S+) sha256=(\S+)", r.stdout)
         self.assertIsNotNone(m, r.stdout)
@@ -243,14 +338,12 @@ class CMakePinResolutionTests(unittest.TestCase):
         pin_manifest(self.manifest, "bA", SHA_A)
         self.assertEqual(self.configure(f"-DSONDER_LLAMACPP_URL={MIRROR}", f"-DSONDER_LLAMACPP_SHA256={SHA_A}"),
                          ("bA", MIRROR, SHA_A))
-        # Reconfigure in the same build directory (URL is now only in the cache).
         self.assertEqual(self.configure(), ("bA", MIRROR, SHA_A))
 
     def test_stale_applied_values_move_to_new_manifest(self) -> None:
         pin_manifest(self.manifest, "bA", SHA_A)
         self.configure()
         pin_manifest(self.manifest, "bB", SHA_B)
-        # What an old configure left in the cache: its tag, derived URL and SHA.
         self.assertEqual(
             self.configure("-DSONDER_LLAMACPP_TAG=bA",
                            "-DSONDER_LLAMACPP_URL=https://example.invalid/archive/bA.tar.gz",
@@ -263,19 +356,145 @@ class CMakePinResolutionTests(unittest.TestCase):
         pin_manifest(self.manifest, "bB", SHA_B)
         self.assertEqual(self.configure(), ("bB", MIRROR, SHA_B))
 
+    def test_fork_track_and_source_dir_overrides_are_refused(self) -> None:
+        pin_manifest(self.manifest, "bA", SHA_A)
+        for bad_arg in (
+            "-DSONDER_LLAMACPP_TRACK=prism",
+            f"-DFETCHCONTENT_SOURCE_DIR_LLAMACPP={self.tmp.as_posix()}",
+            f"-DSONDER_LLAMACPP_SOURCE_DIR={self.tmp.as_posix()}",
+            "-DSONDER_LLAMACPP_TAG=prism-b12232",
+            f"-DSONDER_LLAMACPP_SHA256={SHA_B}",
+        ):
+            with self.subTest(bad_arg=bad_arg):
+                shutil.rmtree(self.build, ignore_errors=True)
+                r = self.run_cmake(bad_arg)
+                self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+
+
+class CMakeApplyPatchesTests(unittest.TestCase):
+    """Verify configure-time cmake/ApplyGgmlPatches.cmake behavior and hostile-input defenses."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if shutil.which("cmake") is None or shutil.which("git") is None:
+            raise unittest.SkipTest("cmake or git not available")
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.src = self.tmp / "llamacpp-src"
+        self.src.mkdir()
+        (self.src / "src").mkdir()
+        (self.src / "src" / "a.c").write_bytes(b"int a(void) { return 1; }\n")
+        self.patch_dir = self.tmp / "third_party" / "ggml-patches"
+        self.patch_dir.mkdir(parents=True)
+        self.manifest = self.tmp / "pin.json"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def run_apply(self) -> subprocess.CompletedProcess:
+        self.assertTrue(APPLY_SCRIPT.is_file(), f"missing {APPLY_SCRIPT}")
+        return subprocess.run(
+            ["cmake",
+             f"-DSONDER_LLAMACPP_PIN_FILE={self.manifest.as_posix()}",
+             f"-DSONDER_LLAMACPP_REPO_ROOT={self.tmp.as_posix()}",
+             f"-DSONDER_LLAMACPP_SOURCE_DIR_TO_PATCH={self.src.as_posix()}",
+             "-P", str(APPLY_SCRIPT)],
+            capture_output=True, text=True, timeout=60)
+
+    def test_empty_patch_series_passes_and_leaves_tree_untouched(self) -> None:
+        pin_manifest(self.manifest, "v1.0.0", SHA_A, patches=[])
+        r = self.run_apply()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((self.src / "src" / "a.c").read_bytes(), b"int a(void) { return 1; }\n")
+
+    def test_valid_ordered_patches_apply_idempotently(self) -> None:
+        p1 = (
+            b"diff --git a/src/a.c b/src/a.c\n"
+            b"--- a/src/a.c\n"
+            b"+++ b/src/a.c\n"
+            b"@@ -1 +1 @@\n"
+            b"-int a(void) { return 1; }\n"
+            b"+int a(void) { return 2; }\n"
+        )
+        p2 = (
+            b"diff --git a/src/a.c b/src/a.c\n"
+            b"--- a/src/a.c\n"
+            b"+++ b/src/a.c\n"
+            b"@@ -1 +1 @@\n"
+            b"-int a(void) { return 2; }\n"
+            b"+int a(void) { return 3; }\n"
+        )
+        (self.patch_dir / "0001-first.patch").write_bytes(p1)
+        (self.patch_dir / "0002-second.patch").write_bytes(p2)
+        pin_manifest(self.manifest, "v1.0.0", SHA_A, patches=[
+            {"file": "0001-first.patch", "sha256": hashlib.sha256(p1).hexdigest(),
+             "summary": "step 1", "upstream": "sonder-owned"},
+            {"file": "0002-second.patch", "sha256": hashlib.sha256(p2).hexdigest(),
+             "summary": "step 2", "upstream": "sonder-owned"},
+        ])
+        r1 = self.run_apply()
+        self.assertEqual(r1.returncode, 0, r1.stdout + r1.stderr)
+        self.assertEqual((self.src / "src" / "a.c").read_bytes(), b"int a(void) { return 3; }\n")
+        # Second configure in the same tree is idempotent.
+        r2 = self.run_apply()
+        self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
+        self.assertEqual((self.src / "src" / "a.c").read_bytes(), b"int a(void) { return 3; }\n")
+
+    def test_hostile_and_tampered_patches_fail_closed(self) -> None:
+        valid_patch = (
+            b"diff --git a/src/a.c b/src/a.c\n"
+            b"--- a/src/a.c\n"
+            b"+++ b/src/a.c\n"
+            b"@@ -1 +1 @@\n"
+            b"-int a(void) { return 1; }\n"
+            b"+int a(void) { return 9; }\n"
+        )
+        # Wrong SHA-256
+        (self.patch_dir / "0001-badsha.patch").write_bytes(valid_patch)
+        pin_manifest(self.manifest, "v1.0.0", SHA_A, patches=[
+            {"file": "0001-badsha.patch", "sha256": "0" * 64, "summary": "s", "upstream": "u"},
+        ])
+        self.assertNotEqual(self.run_apply().returncode, 0)
+        (self.patch_dir / "0001-badsha.patch").unlink()
+
+        # Unlisted .patch file on disk
+        (self.patch_dir / "0001-unlisted.patch").write_bytes(valid_patch)
+        pin_manifest(self.manifest, "v1.0.0", SHA_A, patches=[])
+        self.assertNotEqual(self.run_apply().returncode, 0)
+        (self.patch_dir / "0001-unlisted.patch").unlink()
+
+        # Path traversal & .git hook & symlink mode 120000
+        hostile_payloads = [
+            b"diff --git a/../escape.c b/../escape.c\n--- a/../escape.c\n+++ b/../escape.c\n@@ -0,0 +1 @@\n+x\n",
+            b"diff --git a/.git/hooks/post-checkout b/.git/hooks/post-checkout\n--- /dev/null\n+++ b/.git/hooks/post-checkout\n@@ -0,0 +1 @@\n+evil\n",
+            b"diff --git a/link b/link\nnew file mode 120000\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+/etc/passwd\n",
+        ]
+        for idx, payload in enumerate(hostile_payloads, 1):
+            fname = f"000{idx}-hostile.patch"
+            p = self.patch_dir / fname
+            p.write_bytes(payload)
+            pin_manifest(self.manifest, "v1.0.0", SHA_A, patches=[
+                {"file": fname, "sha256": hashlib.sha256(payload).hexdigest(),
+                 "summary": "hostile", "upstream": "sonder-owned"},
+            ])
+            self.assertNotEqual(self.run_apply().returncode, 0)
+            p.unlink()
+
 
 FEATURES_BEGIN = "# --- expected features begin"
 FEATURES_END = "# --- expected features end ---"
 MTP = "SONDER_LLAMACPP_HAS_MTP"
 F8 = "SONDER_LLAMACPP_HAS_GGML_F8_E4M3"
-# Defines the real pin must keep detecting (MTP was silently lost once when the
-# NextN API moved from src/llama-ext.h to llama.h).
+Q2 = "SONDER_LLAMACPP_HAS_GGML_Q2_0"
 REQUIRED_DEFAULT_FEATURES = (
     MTP,
     "SONDER_LLAMACPP_HAS_NEXTN_LAYER_OFFSET",
     "SONDER_LLAMACPP_HAS_CTX_OTHER",
     "SONDER_LLAMACPP_HAS_MOE_CACHE_SIZE",
     F8,
+    Q2,
 )
 
 
@@ -285,6 +504,8 @@ def features_manifest(path: Path, features: object, sha: str = SHA_A) -> None:
         "tracks": {"mainline": {
             "tag": "bA", "commit": "c" * 40, "sha256": sha,
             "url": "https://example.invalid/archive/bA.tar.gz",
+            "patch_dir": "third_party/ggml-patches",
+            "patches": [],
             "expected_features": features}},
     }), encoding="utf-8")
 
@@ -307,9 +528,11 @@ class CMakeExpectedFeaturesTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
+        (self.tmp / "third_party" / "ggml-patches").mkdir(parents=True)
         (self.tmp / "src").mkdir()
         (self.tmp / "src" / "CMakeLists.txt").write_text(
             "cmake_minimum_required(VERSION 3.20)\nproject(features_mini LANGUAGES NONE)\n"
+            f'set(SONDER_LLAMACPP_REPO_ROOT "{self.tmp.as_posix()}")\n'
             "set(SONDER_WITH_LLAMA_CPP ON)\n" + self.pin_block
             + 'set(SONDER_LLAMACPP_FEATURE_DEFS "${TEST_FEATURE_DEFS}")\n'
             + self.features_block, encoding="utf-8")
@@ -351,18 +574,6 @@ class CMakeExpectedFeaturesTests(unittest.TestCase):
         r = self.configure([])
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
-    def test_sha_override_is_not_enforced(self) -> None:
-        features_manifest(self.manifest, [MTP])
-        r = self.configure([], "-DSONDER_LLAMACPP_TAG=bB", f"-DSONDER_LLAMACPP_SHA256={SHA_B}")
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("not enforced: SHA-256 override", r.stdout)
-
-    def test_local_source_dir_is_not_enforced(self) -> None:
-        features_manifest(self.manifest, [MTP])
-        r = self.configure([], f"-DFETCHCONTENT_SOURCE_DIR_LLAMACPP={self.tmp.as_posix()}")
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("not enforced: local source dir", r.stdout)
-
     def test_malformed_entries_fail_configure(self) -> None:
         for bad in (["HAS_MTP"], ["SONDER_LLAMACPP_HAS_MTP=1"], "SONDER_LLAMACPP_HAS_MTP"):
             with self.subTest(bad=bad):
@@ -371,10 +582,12 @@ class CMakeExpectedFeaturesTests(unittest.TestCase):
                 r = self.configure([MTP])
                 self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
 
-    def test_default_manifest_requires_mtp_and_friends(self) -> None:
+    def test_default_manifest_requires_mtp_q2_and_patch_series_metadata(self) -> None:
         _, entry = pin.load_entry(pin.DEFAULT_MANIFEST, None)
         for name in REQUIRED_DEFAULT_FEATURES:
             self.assertIn(name, entry.get("expected_features", []))
+        self.assertEqual(entry.get("patch_dir"), "third_party/ggml-patches")
+        self.assertEqual(entry.get("patches"), [])
 
 
 class HashTests(unittest.TestCase):
@@ -414,31 +627,39 @@ class CheckTests(unittest.TestCase):
         finally:
             sys.stderr, sys.stdout = old
 
-    def test_repo_docs_agree_with_manifest(self) -> None:
+    def test_repo_docs_and_patch_dir_agree_with_manifest(self) -> None:
         self.assertEqual(self.run_check(), 0)
 
-    def test_manifest_has_mainline_track(self) -> None:
+    def test_manifest_has_only_mainline_track(self) -> None:
+        raw = json.loads(pin.DEFAULT_MANIFEST.read_text(encoding="utf-8"))
+        self.assertEqual(list(raw.get("tracks", {}).keys()), ["mainline"])
         track, entry = pin.load_entry(pin.DEFAULT_MANIFEST, None)
         self.assertEqual(track, "mainline")
         self.assertRegex(entry["tag"], r"^(b\d+|v\d+\.\d+\.\d+)$")
+
+    def test_non_mainline_track_arg_is_rejected(self) -> None:
+        self.assertNotEqual(self.run_check("--track", "prism"), 0)
 
     def test_changed_manifest_tag_is_detected(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             m = Path(d) / "pin.json"
             _, entry = pin.load_entry(pin.DEFAULT_MANIFEST, None)
-            write_manifest(m, entry["commit"], entry["sha256"], tag="b99999")
+            write_manifest(m, entry["commit"], entry["sha256"], tag="b99999",
+                           patch_dir="third_party/ggml-patches", patches=[])
             self.assertEqual(self.run_check("--manifest", str(m)), 1)
 
     def test_changed_manifest_release_tag_is_detected(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             m = Path(d) / "pin.json"
             _, entry = pin.load_entry(pin.DEFAULT_MANIFEST, None)
-            write_manifest(m, entry["commit"], entry["sha256"], tag="v9.9.9")
+            write_manifest(m, entry["commit"], entry["sha256"], tag="v9.9.9",
+                           patch_dir="third_party/ggml-patches", patches=[])
             self.assertEqual(self.run_check("--manifest", str(m)), 1)
 
     @staticmethod
     def _docs_root(d: Path, license_review: str, integration: str) -> Path:
         (d / "docs" / "integration").mkdir(parents=True)
+        (d / "third_party" / "ggml-patches").mkdir(parents=True)
         (d / "docs" / "LICENSE_REVIEW.md").write_text(license_review, encoding="utf-8")
         (d / "docs" / "integration" / "llamacpp.md").write_text(integration, encoding="utf-8")
         return d
@@ -446,7 +667,8 @@ class CheckTests(unittest.TestCase):
     def test_release_tags_count_only_in_llamacpp_scope(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             m = Path(d) / "pin.json"
-            write_manifest(m, "a" * 40, "b" * 64, tag="v1.0.0")
+            write_manifest(m, "a" * 40, "b" * 64, tag="v1.0.0",
+                           patch_dir="third_party/ggml-patches", patches=[])
             root = self._docs_root(
                 Path(d) / "ok",
                 "## Other\n- cpp-httplib v0.58.0\n"
@@ -458,7 +680,8 @@ class CheckTests(unittest.TestCase):
     def test_stale_release_tag_in_llamacpp_section_is_detected(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             m = Path(d) / "pin.json"
-            write_manifest(m, "a" * 40, "b" * 64, tag="v1.0.0")
+            write_manifest(m, "a" * 40, "b" * 64, tag="v1.0.0",
+                           patch_dir="third_party/ggml-patches", patches=[])
             root = self._docs_root(
                 Path(d) / "rel",
                 "### llama.cpp / GGML\n- revision/tag: `v0.9.0`\n",
@@ -468,7 +691,8 @@ class CheckTests(unittest.TestCase):
     def test_stale_build_tag_under_release_manifest_is_detected(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             m = Path(d) / "pin.json"
-            write_manifest(m, "a" * 40, "b" * 64, tag="v1.0.0")
+            write_manifest(m, "a" * 40, "b" * 64, tag="v1.0.0",
+                           patch_dir="third_party/ggml-patches", patches=[])
             root = self._docs_root(
                 Path(d) / "build",
                 "### llama.cpp / GGML\n- revision/tag: `v1.0.0`\n",
@@ -479,8 +703,53 @@ class CheckTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             m = Path(d) / "pin.json"
             _, entry = pin.load_entry(pin.DEFAULT_MANIFEST, None)
-            write_manifest(m, entry["commit"], "f" * 64, tag=entry["tag"])
+            write_manifest(m, entry["commit"], "f" * 64, tag=entry["tag"],
+                           patch_dir="third_party/ggml-patches", patches=[])
             self.assertEqual(self.run_check("--manifest", str(m)), 1)
+
+    def test_patch_manifest_errors_fail_check(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = self._docs_root(
+                Path(d) / "p",
+                "### llama.cpp / GGML\n- revision/tag: `v1.0.0`\n",
+                "llama.cpp is pinned at `v1.0.0`.\n")
+            pdir = root / "third_party" / "ggml-patches"
+            good = b"diff --git a/x.c b/x.c\n--- a/x.c\n+++ b/x.c\n@@ -1 +1 @@\n-a\n+b\n"
+            (pdir / "0002-second.patch").write_bytes(good)
+            (pdir / "0001-first.patch").write_bytes(good)
+
+            m = Path(d) / "pin.json"
+            # Out-of-order patch numbers fail.
+            write_manifest(m, "a" * 40, "b" * 64, tag="v1.0.0",
+                           patch_dir="third_party/ggml-patches",
+                           patches=[
+                               {"file": "0002-second.patch", "sha256": hashlib.sha256(good).hexdigest(),
+                                "summary": "2", "upstream": "u"},
+                               {"file": "0001-first.patch", "sha256": hashlib.sha256(good).hexdigest(),
+                                "summary": "1", "upstream": "u"},
+                           ])
+            self.assertEqual(self.run_check("--manifest", str(m), "--root", str(root)), 1)
+
+            # In-order passes.
+            write_manifest(m, "a" * 40, "b" * 64, tag="v1.0.0",
+                           patch_dir="third_party/ggml-patches",
+                           patches=[
+                               {"file": "0001-first.patch", "sha256": hashlib.sha256(good).hexdigest(),
+                                "summary": "1", "upstream": "u"},
+                               {"file": "0002-second.patch", "sha256": hashlib.sha256(good).hexdigest(),
+                                "summary": "2", "upstream": "u"},
+                           ])
+            self.assertEqual(self.run_check("--manifest", str(m), "--root", str(root)), 0)
+
+
+class BuildWrapperForkRetirementTests(unittest.TestCase):
+    def test_build_scripts_retire_local_fork_source_dir_flags(self) -> None:
+        ps1 = (REPO_ROOT / "scripts" / "build.ps1").read_text(encoding="utf-8")
+        sh = (REPO_ROOT / "scripts" / "build.sh").read_text(encoding="utf-8")
+        self.assertNotIn("FETCHCONTENT_SOURCE_DIR_LLAMACPP=", ps1)
+        self.assertNotIn("FETCHCONTENT_SOURCE_DIR_LLAMACPP=", sh)
+        self.assertNotIn("PrismML-Eng", ps1)
+        self.assertNotIn("PrismML-Eng", sh)
 
 
 if __name__ == "__main__":

@@ -253,7 +253,7 @@ json::Array profile_catalog(const std::vector<LaunchProfile>& profiles,
             auto info = read_gguf_model_info(eff.model);  // header only
             if (info.ok()) {
                 info_prism_hadamard = info->prism_hadamard;
-                info_requires_prism_runtime = info->has_prism_private_tensors || info->prism_hadamard;
+                info_requires_prism_runtime = info->has_prism_private_tensors;
                 VramEstimateInputs in{};
                 in.mmproj_bytes = file_bytes(eff.mmproj);
                 in.draft_model_bytes = eff.speculative ? file_bytes(eff.speculative->draft_model) : 0;

@@ -324,24 +324,52 @@ TEST_CASE("ternary GGUF: prism.hadamard metadata and large sign_values arrays pa
     CHECK(parsed2->prism_hadamard_transform == "walsh");
     CHECK(parsed2->prism_hadamard_block_size == 1024u);
 
-    // Estimator emits a PrismML runtime diagnostic note and propagates flags.
+    // Estimator emits an SI-native re-block / ggml-patches note on private tensor types
+    // and never recommends the retired external PrismML llama-server binary.
     const si::LaunchProfile p = parse_single(
-        R"({"name":"bonsai-2","backend":"llamaserver","model":"b2.gguf","ctx_size":4096,"parallel":1,"n_gpu_layers":-1})");
+        R"({"name":"bonsai-2","backend":"llamacpp","model":"b2.gguf","ctx_size":4096,"parallel":1,"n_gpu_layers":-1})");
     const si::VramEstimate est = si::estimate_vram(info, p);
     CHECK(est.prism_hadamard);
     CHECK(est.requires_prism_runtime);
-    bool prism_noted = false;
+    bool private_noted = false;
     for (const auto& note : est.notes) {
-        prism_noted = prism_noted || (contains(note, "PrismML Hadamard-capable runtime") && contains(note, "PQ2_0/PTQ1_0") &&
-                                      contains(note, "fwht") && contains(note, "4096"));
+        CHECK_FALSE(contains(note, "llama-server"));
+        private_noted = private_noted ||
+                        (contains(note, "PQ2_0/PTQ1_0") && contains(note, "Q2_0") &&
+                         contains(note, "fwht") && contains(note, "4096"));
     }
-    CHECK(prism_noted);
+    CHECK(private_noted);
 
     const json::Object meta = si::launch_profile_metadata(p, est, 16000);
     REQUIRE(meta.find("prism_hadamard") != nullptr);
     CHECK(meta.find("prism_hadamard")->as_bool());
     REQUIRE(meta.find("requires_prism_runtime") != nullptr);
     CHECK(meta.find("requires_prism_runtime")->as_bool());
+
+    // Stock Q2_0 (type 42) + prism.hadamard.* runs natively on pinned llama.cpp v1.0.0:
+    // prism_hadamard stays true, while requires_prism_runtime is false.
+    TernaryGgufWriter w_q2;
+    w_q2.kv_str("general.architecture", "qwen35");
+    w_q2.kv_u32("qwen35.block_count", 1);
+    w_q2.kv_u32("qwen35.embedding_length", 128);
+    w_q2.kv_u32("qwen35.context_length", 8192);
+    w_q2.kv_u32("qwen35.attention.head_count", 4);
+    w_q2.kv_u32("qwen35.attention.head_count_kv", 2);
+    w_q2.kv_str("prism.hadamard.transform", "normalized-sylvester-walsh-hadamard");
+    w_q2.kv_u32("prism.hadamard.block_size", 1024);
+    w_q2.tensor("blk.0.ffn_gate.weight", {128, 32}, 42);  // stock Q2_0 (group 64)
+    const auto parsed_q2 = si::parse_gguf_model_info(w_q2.finish(1, 8));
+    REQUIRE_MESSAGE(parsed_q2.ok(), parsed_q2.status().message());
+    CHECK(parsed_q2->prism_hadamard);
+    CHECK_FALSE(parsed_q2->has_prism_private_tensors);
+    const si::VramEstimate est_q2 = si::estimate_vram(parsed_q2.value(), p);
+    CHECK(est_q2.prism_hadamard);
+    CHECK_FALSE(est_q2.requires_prism_runtime);
+    const json::Object meta_q2 = si::launch_profile_metadata(p, est_q2, 16000);
+    REQUIRE(meta_q2.find("prism_hadamard") != nullptr);
+    CHECK(meta_q2.find("prism_hadamard")->as_bool());
+    REQUIRE(meta_q2.find("requires_prism_runtime") != nullptr);
+    CHECK_FALSE(meta_q2.find("requires_prism_runtime")->as_bool());
 }
 
 // ---------------------------------------- LaunchProfile new typed fields & argv
