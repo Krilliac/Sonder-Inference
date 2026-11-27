@@ -104,6 +104,10 @@ struct LlamaCppBackendOptions {
     SpeculativeVerificationMode spec_verification_mode = SpeculativeVerificationMode::TargetMatch;
     // Bounded L2 host-RAM prefix state cache budget in MiB (0 = disabled, max 65536).
     std::uint32_t cache_ram_mib = 0;
+    // Context checkpoint spacing in tokens (normal / dense for hybrid & recurrent models) and per-slot cap.
+    std::uint32_t checkpoint_spacing_tokens = 2048;
+    std::uint32_t checkpoint_dense_spacing_tokens = 1024;
+    std::uint32_t checkpoint_max_per_slot = 8;
     // Dynamic GPU cache in MiB for host-resident MoE experts (0 = disabled, max 262144).
     std::uint32_t moe_cache_mib = 0;
     // Unused/rejected by the direct llamacpp backend (no execution consumer):

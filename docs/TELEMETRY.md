@@ -456,6 +456,27 @@ How to read them:
 - **Queue bound.** At most 64 discrete events wait between drains; the newest overflow is dropped
   (the first `kv.pool.configured` survives). Usage is coalesced and never dropped.
 
+### Native prefix checkpoints (llama.cpp backend)
+
+The native `llama.cpp` wrapper exposes prefix-checkpoint activity via
+`TelemetryKind::kPrefixCheckpoint` on `LlamaCppBackend::SetTelemetrySink` (only
+formatted and emitted when a sink is installed) and as a lock-free counter
+snapshot via `LlamaCppBackend::GetPrefixCheckpointStats()` (structured
+`prefix_checkpoint.*` field names from `StatsToFields`).
+
+| Field | Value |
+| --- | --- |
+| `kind` | `TelemetryKind::kPrefixCheckpoint` |
+| `tokens` | checkpoint token position captured or restored (`0` on `miss`) |
+| `elapsed_ms` | `0.0` on `captured`; restore duration in ms on `hit_slot`, `hit_host`, `hit_host_l2`, or `miss` |
+| `detail` | `<event> slot_hits=<u64> host_hits=<u64> misses=<u64> captured=<u64> restored_tokens=<u64> host_entries=<u64> host_bytes=<u64> host_evictions=<u64>` |
+
+`<event>` is one of: `captured` (partial checkpoint saved to slot), `hit_slot`
+(restored from the slot's checkpoint list), `hit_host` (restored from the
+bounded host-RAM LRU tier during slot rollback), `hit_host_l2` (restored from
+the host-RAM tier on top of an evicted L2 radix snapshot), or `miss` (no usable
+checkpoint found or restore failed).
+
 ## Typical order for one scheduled request
 
 `request.queued` → `scheduler.enqueued` → `request.started` →

@@ -567,6 +567,7 @@ add_library(sonder_backend_llamacpp STATIC
     llguidance_sampler.cpp
     embeddings.cpp
     kv_telemetry.cpp
+    prefix_checkpoints.cpp
     slot_store.cpp
     request_guards.cpp
 )
