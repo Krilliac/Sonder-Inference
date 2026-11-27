@@ -13,6 +13,8 @@ sonder_add_module_tests(llamacpp
     test_llamacpp_chat.cpp
     test_llamacpp_frontier.cpp
     test_llamacpp_speculative_verifier.cpp
+    test_json_schema_normalize.cpp
+    test_llguidance_sampler.cpp
 )
 if(TARGET sonder_llamacpp_tests)
     target_link_libraries(sonder_llamacpp_tests PRIVATE sonder_backend_llamacpp)

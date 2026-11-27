@@ -33,6 +33,8 @@
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include "sonder/inference/backends/llamacpp.hpp"
 #include "sonder/inference/json.hpp"
+#include "json_schema_normalize.hpp"
+#include "llguidance_sampler.hpp"
 #include "llamacpp_internal.hpp"
 
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
@@ -1054,6 +1056,16 @@ public:
                               " exceeds the loaded llama.cpp context (" + std::to_string(desc_.context_length) +
                               "); reload with a larger context_length");
         }
+        // Optional llguidance JSON-Schema path (SONDER_WITH_LLGUIDANCE). Computed before any
+        // chat-template fallback so template-less models never drop the schema constraint onto
+        // BackendModel::chat() -> generate(). With the option OFF, llg_schema stays empty.
+        std::string llg_schema;
+        if (lc::LlguidanceAvailable()) {
+            auto llg = llamacpp_detail::LlguidanceSchemaForResponseFormat(request.response_format_type,
+                                                                          request.response_format_schema);
+            if (!llg.ok()) return llg.status();
+            llg_schema = std::move(llg.value());
+        }
         const bool concurrent_batch = (slots_ > 1u);
         std::shared_lock<std::shared_mutex> shared_guard;
         std::unique_lock<std::shared_mutex> exclusive_guard;
@@ -1072,12 +1084,29 @@ public:
             });
         if (!plan.status.ok()) {
             if (plan.template_unsupported) {
-                if (shared_guard.owns_lock()) shared_guard.unlock();
-                if (exclusive_guard.owns_lock()) exclusive_guard.unlock();
                 if (!plan.media_blobs.empty()) {
+                    if (shared_guard.owns_lock()) shared_guard.unlock();
+                    if (exclusive_guard.owns_lock()) exclusive_guard.unlock();
                     return Status(ErrorCode::invalid_argument,
                                   "multimodal chat requires a model with a chat template");
                 }
+                if (!llg_schema.empty()) {
+                    std::vector<lc::Token> fallback_tokens;
+                    const std::string prompt = format_chat_prompt(request.messages);
+                    if (lc::Status s = runtime_.Tokenize(prompt, /*add_special=*/true, fallback_tokens,
+                                                         /*parse_special=*/false);
+                        !s.ok()) {
+                        return ToStatus(s);
+                    }
+                    return run_tokens(std::move(fallback_tokens), request.sampling, cancel, on_chunk,
+                                      request.session_key, request.grammar, /*separate_reasoning=*/false,
+                                      /*checkpoint=*/nullptr, {}, {}, {}, request.priority_class,
+                                      request.target_ttft_ms, request.target_itl_ms,
+                                      request.enable_stage_profiling, {}, nullptr, nullptr, 0, false,
+                                      /*start_in_thinking=*/false, std::move(llg_schema));
+                }
+                if (shared_guard.owns_lock()) shared_guard.unlock();
+                if (exclusive_guard.owns_lock()) exclusive_guard.unlock();
                 return BackendModel::chat(request, cancel, on_chunk);
             }
             return plan.status;
@@ -1095,7 +1124,8 @@ public:
                           std::move(plan.media_blobs), {}, std::move(plan.media_prompt_parts),
                           request.priority_class, request.target_ttft_ms, request.target_itl_ms,
                           request.enable_stage_profiling, {}, nullptr, nullptr, 0, false,
-                          request.separate_reasoning && llamacpp_detail::PromptEndsInsideThink(plan.segments));
+                          request.separate_reasoning && llamacpp_detail::PromptEndsInsideThink(plan.segments),
+                          std::move(llg_schema));
     }
 
     [[nodiscard]] bool has_native_chat() const override { return native_chat_; }
@@ -1172,7 +1202,7 @@ private:
                                      SuspendedExecutionState* suspended_state = nullptr,
                                      const ExecutionResumeState* execution_resume = nullptr,
                                      int priority_rank = 0, bool allow_preempt_spill = false,
-                                     bool start_in_thinking = false) {
+                                     bool start_in_thinking = false, std::string llguidance_json_schema = {}) {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
 
         lc::GenerateRequest req;
@@ -1181,6 +1211,7 @@ private:
         req.max_new_tokens = sampling.max_tokens;
         req.sampling = ToLlamaSampling(sampling);
         req.sampling.grammar = std::string(grammar);
+        req.sampling.llguidance_json_schema = std::move(llguidance_json_schema);
         req.session_key = std::string(session_key);
         req.media_blobs = std::move(media_blobs);
         req.media_prompt_text = std::move(media_prompt_text);

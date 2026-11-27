@@ -321,6 +321,10 @@ struct SamplingParams {
     // request fails with kInvalidArgument. This deliberately diverges from llama-server, which
     // silently skips such texts. Resolved once per request.
     std::vector<std::string> preserved_tokens;
+    // JSON Schema text (normalised by the caller) enforced through llguidance instead of `grammar`.
+    // Needs a build with SONDER_WITH_LLGUIDANCE=ON: otherwise the request fails with
+    // kInvalidArgument rather than running unconstrained. Cannot be combined with grammar_lazy.
+    std::string llguidance_json_schema;
     bool compute_logprobs = false;     // compute exact log-softmax logprob for each emitted token
     std::int32_t top_logprobs = 0;     // number of top alternative logprobs (0..kMaxTopLogprobs)
 };
