@@ -52,7 +52,9 @@ DEFAULT_TIMING_DEFINITION: dict[str, str] = {
     "committed_output_tokens": "target-verified output tokens emitted to the client (usage.completion_tokens / timings.predicted_n)",
     "proposed_draft_tokens": "speculative draft tokens proposed before verification (timings.draft_n; null/unknown when unreported)",
     "cold_vs_warm_rule": "explicit cache_state/cold flag, else turn/repeat index (1=cold, >=2=warm), else reported cached tokens (>0=warm, 0=cold, null=unclassified)",
-    "percentiles": "linear interpolation (numpy default linear method) over ok requests; ITL pooled across token gaps of ok requests",
+    "output_tps_per_user": "client-observed per-request decode rate (committed_output_tokens - 1) / (e2e_s - ttft_s); headline AgentX metric is P90 across ok requests",
+    "realized_prefix_hit_rate": "token-weighted sum(cached_tokens) / sum(prompt_tokens) over ok requests reporting usage.prompt_tokens_details.cached_tokens or usage.sonder.timings.cache_n (null when unreported)",
+    "percentiles": "linear interpolation (numpy default linear method) over ok requests (p50/p90/p95/p99); ITL pooled across token gaps of ok requests",
 }
 
 

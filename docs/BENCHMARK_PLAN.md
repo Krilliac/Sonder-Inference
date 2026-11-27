@@ -333,3 +333,149 @@ header bytes can overrun it. A request that outlasts it is a failed request
 (`deadline_exceeded`) and so counts
 against `error_rate` like any other. Keep the raw JSONL with the result; small
 reviewed snapshots may go in `bench/results/`.
+
+## AgentX coding-agent trace benchmark (AGX-01)
+
+Modeled on SemiAnalysis InferenceX AgentX to evaluate Sonder Inference's
+serving stack (prefix caching, L2 `RadixPrefixCache`, continuous batching
+slots, KV quantization, and speculative decoding) on traffic shaped like real
+coding-agent sessions rather than single-turn prompts.
+
+### Headline metric and reporting
+
+- **Headline metric:** **P90 per-user output tok/s**
+  (`output_tps_per_user.p90` in `bench/http/httpbench/metrics.py`), defined as
+  the 90th percentile of client-observed per-request decode rate
+  `(committed_output_tokens - 1) / (e2e_s - ttft_s)` across `ok` requests.
+- **Percentiles:** `summarize()` reports `p50`, `p90`, `p95`, and `p99`
+  (linear interpolation) across TTFT, ITL, e2e, and `output_tps_per_user` (plus
+  `output_tps_by_session` when requests carry a `session_id`).
+- **Realized prefix-hit rate:** token-weighted
+  `sum(cached_tokens) / sum(prompt_tokens)` over `ok` requests reporting
+  `usage.prompt_tokens_details.cached_tokens`, `usage.sonder.timings.cache_n`
+  (both emitted by `src/server/src/openai.cpp` `usage_json()`), or
+  `timings.cache_n`. Unreported cache counts remain `null` (`unknown`), never
+  `0`.
+
+### Trace-replay workload (`semianalysisai/cc-traces-weka-062126`)
+
+[`bench/http/httpbench/agentx.py`](../bench/http/httpbench/agentx.py) replays
+local JSON/JSONL traces in the Weka schema of the public Hugging Face dataset
+`semianalysisai/cc-traces-weka-062126` (which ships a single `traces.jsonl`
+file containing the with-subagents corpus). The loader streams `traces.jsonl`
+line by line and fits or discards each trace immediately so multi-gigabyte
+corpora do not retain unused `hash_ids` in memory. The harness never downloads
+datasets automatically; operators fetch the corpus locally for live runs, and
+unit tests run offline against the small checked-in fixture
+[`bench/http/fixtures/agentx_synthetic_traces.jsonl`](../bench/http/fixtures/agentx_synthetic_traces.jsonl).
+
+Replay properties preserved:
+
+- **Input length & growing shared prefix:** each 64-token KV-block `hash_id`
+  maps deterministically (keyed by per-user `session_salt`) to synthetic text,
+  so later turns and descendant subagents share byte-identical prefix blocks
+  while distinct concurrent users are cache-busted from one another.
+- **Request types and zero-output turns:** both `type: "s"` (streaming) and
+  `type: "n"` (non-streaming) rows are replayed as main-agent turns (optional
+  `ttft` fields are parsed and preserved). Real traces contain `out: 0` turns;
+  because SI's `/v1/chat/completions` requires `max_tokens >= 1`
+  (`src/server/src/openai.cpp`), those requests send `max_tokens: 1` and record
+  `target_output_tokens: 0`, `effective_output_tokens: 1`, and
+  `output_tokens_clamped: true`.
+- **Subagent branches:** consecutive `type: "subagent"` blocks spawn
+  concurrently as child branches (carrying `"priority": "subagent"`) and join
+  before the parent agent's next main turn.
+- **Idle gaps:** inter-turn think/idle gaps are preserved and capped at **10 s**
+  (`--idle-gap-cap 10`).
+- **Context cap (`--max-context-length`, default `32768`) and `--trace-fit {scale,drop}` (default `scale`):**
+  the median trace request in `cc-traces-weka-062126` is ~142K tokens (most
+  real traces exceed 32K after turn 1).
+  - `--trace-fit scale` (**default**): proportionally shrinks each oversized
+    trace's `in`/`out` lengths and stride-subsamples its `hash_ids` so peak
+    `in + max(1, out) <= max_context_length` while preserving turn/subagent
+    topology and prefix-share ratios, enabling real traces to run on a 16 GB
+    GPU at 32K. The JSON and Markdown summaries record `trace_fit`, each
+    trace's `scale_factor`, and `original_peak_tokens -> scaled_peak_tokens`.
+  - `--trace-fit drop`: skips whole traces whose peak exceeds
+    `--max-context-length` and lists them in `skipped_traces`, matching
+    AIPerf's exact-length `--max-context-length` filter.
+- **Concurrency sweep:** defaults to concurrency **1, 2, 4, and 8**
+  (`--concurrency-levels 1,2,4,8`).
+
+Example live-server invocation (pending live server bring-up):
+
+```bash
+python bench/http/bench_http.py run \
+    --base-url http://127.0.0.1:11437/v1 \
+    --trace-file /path/to/cc-traces-weka-062126/traces.jsonl \
+    --max-context-length 32768 \
+    --trace-fit scale \
+    --concurrency-levels 1,2,4,8 \
+    --label agentx-baseline
+```
+
+### NVIDIA AIPerf `agentx` (`inferencex-agentx-mvp`) compatibility finding
+
+Reviewed against NVIDIA's documentation at
+`docs.nvidia.com/aiperf/tutorials/datasets-inputs/inference-x-agent-x-mvp-benchmark`
+and SI's server implementation (`src/server/src/openai.cpp`,
+`src/server/src/chat_handler.cpp`,
+`src/server/include/sonder/inference/server.hpp`), without adding any AIPerf
+dependency:
+
+- **Verdict:** **Partially compatible — AIPerf can target SI's
+  `POST /v1/chat/completions` and collect streaming/usage metrics, but SI does
+  not enforce AIPerf's locked `ignore_eos: true` invariant today.**
+- **What works out of the box:**
+  - `--endpoint-type chat --streaming` posts to `/v1/chat/completions` with
+    `stream: true` and `stream_options.include_usage: true`
+    (`server_policy.cpp`, `openai.cpp:464-481`).
+  - `--use-server-token-count` consumes `usage.prompt_tokens`,
+    `usage.completion_tokens`, and `usage.prompt_tokens_details.cached_tokens`,
+    all emitted by `usage_json()` (`openai.cpp:1218-1241`) on the final SSE
+    chunk (`chat_handler.cpp:598-600`).
+  - `ServerOptions::max_body_bytes` defaults to 4 MiB
+    (`src/server/include/sonder/inference/server.hpp`), enough for 32K–128K
+    token chat payloads (raise `--max-body-bytes` if testing near-1M contexts).
+  - `parse_chat_request_with_mode()` ignores unknown top-level JSON keys
+    instead of rejecting them, so `--extra-inputs ignore_eos:true` returns HTTP
+    200 rather than HTTP 400.
+- **Gaps blocking strict `inferencex-agentx-mvp` parity:**
+  1. **`ignore_eos: true` is silently ignored:** AIPerf's
+     `--scenario inferencex-agentx-mvp` locks `--extra-inputs ignore_eos:true`
+     so every turn generates up to its recorded trace `out` length rather than
+     terminating early on EOS. SI's `SamplingConfig` and `read_sampling()`
+     (`openai.cpp:241-344`) have no `ignore_eos` knob, so early EOS stops will
+     shorten outputs and skew throughput versus `submission_valid: true`
+     InferenceX runs until `ignore_eos` is plumbed into `SamplingConfig` and
+     the native `llamacpp` backend.
+  2. **Explicit HF `--tokenizer` required:** AIPerf needs a Hugging Face
+     tokenizer to synthesize prompts from Weka `hash_ids` blocks. Because SI
+     serves local GGUF model IDs rather than HF repo IDs, operators must pass
+     `--tokenizer <matching-hf-repo-or-local-dir>` explicitly even with
+     `--use-server-token-count`.
+  3. **Context cap override:** Pass `--max-context-length 32768` on 16 GB GPUs
+     (AIPerf examples default to `128000`).
+- **Recommendation:** Use `bench/http/bench_http.py` (`agentx_trace`) as the
+  zero-dependency harness for SI A/B runs now; if external AIPerf
+  `inferencex-agentx-mvp` cross-validation is desired later, first add
+  `ignore_eos` support to `SamplingConfig`, `openai.cpp`, and `llamacpp`.
+
+### Live-server A/B matrix (run when inference services are up)
+
+Run each axis as a same-session **ABBA** block per the [Evidence rules](#evidence-rules)
+above, holding model GGUF SHA-256, `--context-length 32768`,
+`--max-context-length 32768`, `--concurrency-levels 1,2,4,8`, temperature `0`,
+and trace file identical across A and B. Compare arms with
+`python bench/http/bench_http.py compare A.json B.json` and record a
+correctness line beside every speed row.
+
+| Axis | Arm A (baseline) | Arm B (candidate) | `sonder-infer serve --backend llamacpp` flags | Primary metrics to compare |
+| --- | --- | --- | --- | --- |
+| Speculative decoding (`spec_type`) | `none` | `suffix` and `ngram` (also `ngram-mod`) | `--spec-type none` vs `--spec-type suffix` / `--spec-type ngram` | P90 per-user output tok/s (`c1..c8`), ITL p50/p90, draft acceptance, committed vs proposed draft tokens |
+| KV-cache quant + Flash Attention (`kv_cache_type_k`/`_v`) | `f16` / `f16` (`flash_attn=on`) | `q8_0` / `q8_0` (`flash_attn=on`, required for quantized V) | `--cache-type-k f16 --cache-type-v f16 --flash-attn on` vs `--cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on` | P90 per-user output tok/s, TTFT p50/p90, peak dedicated/shared VRAM (spill check), correctness parity |
+| Concurrent KV slots (`n_slots` / `--slots`) | `1` slot | `4` slots | `--slots 1` vs `--slots 4` | P90 per-user output tok/s at `c2`/`c4`/`c8`, aggregate output tok/s, makespan, TTFT p90 under concurrency |
+| L2 host-RAM `RadixPrefixCache` (`cache_ram_mib`) | off (`0`) | on (`8192` MiB, subject to host commit headroom) | `--cache-ram-mib 0` vs `--cache-ram-mib 8192` | Realized prefix-hit rate (`c2`/`c4`/`c8`), TTFT p50/p90 on warm turns/subagents, host private bytes |
+
+*Status:* Live A/B runs are blocked while inference services are intentionally
+down; only offline fixture tests have been executed.
