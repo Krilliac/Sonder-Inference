@@ -173,8 +173,9 @@ struct Correlation {
     // Explicit numeric zero also keeps the workload's legacy scheduler rank.
     bool numeric_priority = false;
     std::optional<std::int64_t> reasoning_budget_tokens = std::nullopt;
-    // X-Sonder-Local-Only: only the ollama_cloud backend enforces it (it
-    // refuses the request before any network I/O); other backends ignore it.
+    // X-Sonder-Local-Only: with the ollama_cloud backend the server refuses
+    // the request before residency (no model load, no network I/O) and the
+    // backend refuses it again; other backends ignore it.
     bool local_only = false;
 };
 

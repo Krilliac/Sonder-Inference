@@ -6,6 +6,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -700,3 +701,191 @@ TEST_CASE("chat: streaming deltas keep backend order, reasoning chunks before co
     const std::vector<std::string> expected{"r:r1", "r:r2", "c:c1", "c:c2"};
     CHECK(order == expected);
 }
+
+#if defined(SONDER_HAS_OLLAMA_CLOUD_BACKEND)
+namespace {
+
+// Scripted stand-in for https://ollama.com that counts every call it gets.
+struct CountingCloudStub final : si::OllamaCloudTransport {
+    std::atomic<int> calls{0};
+    std::atomic<int> tags_status{200};
+    std::atomic<int> chat_status{200};
+    std::string error_body;  // set before the server starts; read-only afterwards
+    si::Status send(const si::OllamaCloudHttpRequest& request, const std::function<void(int)>& on_status,
+                    const std::function<bool(std::string_view)>& on_body, const si::CancellationToken&) override {
+        ++calls;
+        if (request.target == "/api/tags") {
+            on_status(tags_status.load());
+            if (tags_status.load() != 200) {
+                on_body(error_body);
+            } else {
+                on_body(R"({"models":[{"name":"gpt-oss:120b"}]})");
+            }
+        } else if (chat_status.load() != 200) {
+            on_status(chat_status.load());
+            on_body(error_body);
+        } else {
+            on_status(200);
+            on_body(R"({"message":{"content":"from the cloud"},"done":false})"
+                    "\n"
+                    R"({"message":{"content":""},"done":true,"done_reason":"stop"})"
+                    "\n");
+        }
+        return si::Status::success();
+    }
+};
+
+// Delegates to a real ollama_cloud backend but answers probe() locally, so
+// the server's periodic reachability probe does not add transport calls and
+// the stub's count is exactly the model loads and requests.
+struct NoProbeBackend final : si::Backend {
+    std::shared_ptr<si::Backend> inner;
+    explicit NoProbeBackend(std::shared_ptr<si::Backend> b) : inner(std::move(b)) {}
+    std::string name() const override { return inner->name(); }
+    std::string description() const override { return inner->description(); }
+    si::BackendCapabilities capabilities() const override { return inner->capabilities(); }
+    si::Result<std::string> probe() override { return std::string("probe answered locally"); }
+    si::Result<std::vector<si::ModelDescriptor>> list_models() override { return inner->list_models(); }
+    si::Result<std::shared_ptr<si::BackendModel>> load_model(const si::ModelLoadOptions& o) override {
+        return inner->load_model(o);
+    }
+    std::optional<si::BackendRuntimeStatus> runtime_status() const override { return inner->runtime_status(); }
+};
+
+std::shared_ptr<si::Backend> cloud_backend(const std::shared_ptr<CountingCloudStub>& stub, const std::string& key) {
+    si::OllamaCloudOptions co;
+    co.api_key_env = "SONDER_TEST_CLOUD_KEY";
+    co.env_lookup = [key](const char*) -> std::optional<std::string> { return key; };
+    co.models = {"gpt-oss:120b"};
+    co.transport = stub;
+    auto made = si::make_ollama_cloud_backend(co);
+    REQUIRE_MESSAGE(made.ok(), made.status().to_string());
+    return std::make_shared<NoProbeBackend>(made.value());
+}
+
+std::string b64(std::string_view in) {
+    static constexpr char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    std::size_t i = 0;
+    for (; i + 2 < in.size(); i += 3) {
+        const unsigned v = (static_cast<unsigned char>(in[i]) << 16) | (static_cast<unsigned char>(in[i + 1]) << 8) |
+                           static_cast<unsigned char>(in[i + 2]);
+        out += kAlphabet[(v >> 18) & 63];
+        out += kAlphabet[(v >> 12) & 63];
+        out += kAlphabet[(v >> 6) & 63];
+        out += kAlphabet[v & 63];
+    }
+    if (i + 1 == in.size()) {
+        const unsigned v = static_cast<unsigned char>(in[i]) << 16;
+        out += kAlphabet[(v >> 18) & 63];
+        out += kAlphabet[(v >> 12) & 63];
+        out += "==";
+    } else if (i + 2 == in.size()) {
+        const unsigned v = (static_cast<unsigned char>(in[i]) << 16) | (static_cast<unsigned char>(in[i + 1]) << 8);
+        out += kAlphabet[(v >> 18) & 63];
+        out += kAlphabet[(v >> 12) & 63];
+        out += kAlphabet[(v >> 6) & 63];
+        out += '=';
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("chat: a local-only request against ollama_cloud makes no network call, even with lazy models") {
+    auto stub = std::make_shared<CountingCloudStub>();
+    auto options = Fixture::defaults();
+    options.models = {"gpt-oss:120b"};
+    options.backend.backend.clear();
+    options.backend_instance = cloud_backend(stub, "sk-FAKE-lazy-test");
+    options.lazy_models = true;  // nothing resident: a request would load the model (GET /api/tags)
+    Fixture f(options);
+    const int before = stub->calls.load();
+
+    struct Probe {
+        const char* target;
+        std::string body;
+    };
+    const std::vector<Probe> probes = {
+        {"/v1/chat/completions", chat_body()},
+        {"/v1/completions", R"({"model":"gpt-oss:120b","prompt":"hi","max_tokens":4})"},
+        {"/v1/responses", R"({"model":"gpt-oss:120b","input":"hi"})"},
+        {"/v1/messages", R"({"model":"gpt-oss:120b","max_tokens":8,"messages":[{"role":"user","content":"hi"}]})"},
+        {"/v1/embeddings", R"({"model":"gpt-oss:120b","input":"hi"})"},
+    };
+    for (const auto& p : probes) {
+        CAPTURE(p.target);
+        const Reply r = post(f.port, p.target, p.body, {{"X-Sonder-Local-Only", "true"}});
+        CHECK(r.status == 400);
+        CHECK(r.body.find("local-only") != std::string::npos);
+        CHECK(stub->calls.load() == before);
+    }
+
+    // Without the header the same request loads the model and reaches the cloud.
+    const Reply ok = post(f.port, "/v1/chat/completions", chat_body());
+    REQUIRE_MESSAGE(ok.status == 200, ok.body);
+    CHECK(ok.body.find("from the cloud") != std::string::npos);
+    CHECK(stub->calls.load() > before);
+}
+
+TEST_CASE("chat: ollama_cloud error bodies reach neither the client, the log nor telemetry") {
+    const std::string key = "sk-FAKE-http-error-body-0123456789";
+    const std::string encoded = b64(key);
+    const std::string partial = key.substr(0, 16);
+    const auto leaks = [&](const std::string& text) {
+        return text.find(key) != std::string::npos || text.find(encoded) != std::string::npos ||
+               text.find(partial) != std::string::npos || text.find("UPSTREAM-DETAIL") != std::string::npos;
+    };
+    auto log_mu = std::make_shared<std::mutex>();
+    auto log_lines = std::make_shared<std::vector<std::string>>();
+    const auto capture_log = [log_mu, log_lines](const std::string& line) {
+        std::lock_guard<std::mutex> lock(*log_mu);
+        log_lines->push_back(line);
+    };
+    {
+        auto stub = std::make_shared<CountingCloudStub>();
+        stub->error_body = R"({"error":")" + encoded + " UPSTREAM-DETAIL " + partial + R"("})";
+        auto options = Fixture::defaults();
+        options.models = {"gpt-oss:120b"};
+        options.backend.backend.clear();
+        options.backend_instance = cloud_backend(stub, key);
+        options.log = capture_log;
+        Fixture f(options);
+        for (const int status : {401, 403, 429, 500}) {
+            CAPTURE(status);
+            stub->chat_status.store(status);
+            const Reply r = post(f.port, "/v1/chat/completions", chat_body());
+            CHECK(r.status >= 400);
+            CHECK_FALSE(leaks(r.body));
+            CHECK(r.body.find("HTTP " + std::to_string(status)) != std::string::npos);
+            const Reply streamed = post(f.port, "/v1/chat/completions", chat_body(R"(,"stream":true)"));
+            CHECK_FALSE(leaks(streamed.body));
+        }
+        for (const auto& line : f.events->lines()) {
+            CHECK_FALSE(leaks(line));
+        }
+    }
+    {
+        // Startup: the initial model load fails on GET /api/tags.
+        auto stub = std::make_shared<CountingCloudStub>();
+        stub->error_body = R"({"error":")" + encoded + " UPSTREAM-DETAIL " + partial + R"("})";
+        stub->tags_status.store(401);
+        auto options = Fixture::defaults();
+        options.models = {"gpt-oss:120b"};
+        options.backend.backend.clear();
+        options.backend_instance = cloud_backend(stub, key);
+        options.log = capture_log;
+        srv::Server server(std::move(options));
+        const si::Status st = server.start();
+        REQUIRE_FALSE(st.ok());
+        CHECK_FALSE(leaks(st.message()));
+        CHECK(st.message().find("auth failed") != std::string::npos);
+        server.stop();
+    }
+    std::lock_guard<std::mutex> lock(*log_mu);
+    CHECK_FALSE(log_lines->empty());
+    for (const auto& line : *log_lines) {
+        CHECK_FALSE(leaks(line));
+    }
+}
+#endif

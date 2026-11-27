@@ -658,7 +658,17 @@ Reference: `docs/integration/ollama-cloud.md`. Changes outside the module:
    `ollama_cloud_*` mirrors and `load_ollama_cloud_config()`;
    `make_backend()` / `available_backend_names()` know `ollama_cloud`;
    `sonder-infer serve --ollama-cloud-config PATH`; identity reports an honest
-   null for `ollama_cloud`.
-4. Not done here: the C ABI and `sonder-infer` subcommands other than `serve`
+   null for `ollama_cloud`. Security-review follow-up: the server refuses
+   `X-Sonder-Local-Only` against `ollama_cloud` before residency
+   (`refuse_local_only_remote` in `server.cpp`, `kRemoteProviderBackend` in
+   `server_policy.hpp`) for chat, messages, completions, responses,
+   embeddings, rerank and score; the config gains `allow_custom_endpoint`
+   and `max_response_bytes`.
+4. `src/net/http_client.*` (security-review follow-up, additive):
+   `HttpRequest::max_response_bytes` (0 = no cap, the default, so other
+   callers are unchanged) caps every received byte; the serialized request
+   head is reserved once, built without temporaries and wiped after sending
+   and on every exit path.
+5. Not done here: the C ABI and `sonder-infer` subcommands other than `serve`
    do not expose `ollama_cloud` or `local_only` yet; the default presets keep
    `SONDER_WITH_TLS=OFF`, so a deployment needs a TLS-enabled configure.

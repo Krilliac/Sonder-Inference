@@ -198,6 +198,11 @@ struct BackendSetup {
     std::uint64_t ollama_cloud_request_timeout_ms = 900000;
     std::uint64_t ollama_cloud_idle_timeout_ms = 120000;
     std::string ollama_cloud_ca_bundle_path;
+    // "allow_custom_endpoint": a base_url other than https://ollama.com (port
+    // 443) is refused unless this is true; the key is sent to that host.
+    bool ollama_cloud_allow_custom_endpoint = false;
+    // "max_response_bytes": raw bytes per response, 1..64 MiB (default 64 MiB).
+    std::uint64_t ollama_cloud_max_response_bytes = std::uint64_t{64} << 20;
 };
 
 // Values taken from the environment when the matching option is absent:
@@ -228,10 +233,13 @@ Result<std::pair<std::string, std::string>> parse_tensor_override(std::string_vi
 // malformed types are rejected before any executable is started.
 Status load_llamaserver_config(const std::string& path, BackendSetup& setup);
 
-// Loads the strict ollama_cloud JSON object (base_url, api_key_env |
-// api_key_file, models, connect/request/idle_timeout_ms, ca_bundle_path) into
-// setup. Unknown keys are rejected; an inline "api_key" is refused with a
-// pointer to api_key_env / api_key_file. Messages never contain key material.
+// Loads the strict ollama_cloud JSON object (base_url, allow_custom_endpoint,
+// api_key_env | api_key_file, models, connect/request/idle_timeout_ms,
+// max_response_bytes, ca_bundle_path) into setup. Unknown keys are rejected;
+// an inline "api_key" is refused with a pointer to api_key_env /
+// api_key_file. A base_url off the Ollama Cloud origin needs
+// "allow_custom_endpoint": true. Messages never contain key material and
+// never quote base_url.
 Status load_ollama_cloud_config(const std::string& path, BackendSetup& setup);
 
 // Pattern for MoE expert weights (llama.cpp's --cpu-moe); `--moe-experts cpu`

@@ -50,14 +50,16 @@ API in general, and not tried here because tests make no network calls):
 
 | Field | Meaning |
 | --- | --- |
-| `base_url` | Optional, default `https://ollama.com`. Must be `https://`; an optional port and path prefix are kept (`/api/...` is appended, so do not end it with `/api`). No userinfo or query. |
+| `base_url` | Optional, default `https://ollama.com`. Must be `https://`; an optional port and path prefix are kept (`/api/...` is appended, so do not end it with `/api`). No userinfo or query. Without `allow_custom_endpoint` only the Ollama Cloud origin is accepted (see Endpoint). |
+| `allow_custom_endpoint` | Optional, default `false`. `true` accepts a `base_url` on any other host or port. **The API key is sent to that host on every request.** |
 | `api_key_env` | NAME of an environment variable holding the key (`OLLAMA_API_KEY` is Ollama's own convention). |
 | `api_key_file` | Path of a file holding only the key; surrounding whitespace is trimmed. Restrict its permissions yourself; the provider does not check ACLs. |
 | `models` | Required, non-empty: the cloud allowlist (see Policy). |
 | `connect_timeout_ms` | 1..600000, default 10000. |
 | `request_timeout_ms` | Whole-request cap, 1..86400000, default 900000. |
-| `idle_timeout_ms` | Longest silence between body bytes once the response head arrived, 0..86400000 (0 = off), default 120000. |
-| `ca_bundle_path` | Optional PEM CA bundle that replaces the system trust store; it does not add to it. A bundle that lacks the roots for the configured host (for `https://ollama.com`, its public CA chain) makes every request fail verification. Leave it unset for `ollama.com`. Verification stays on. |
+| `idle_timeout_ms` | Longest silence between received bytes, 0..86400000 (0 = off), default 120000. It also bounds the wait for the response head: a request that gets no body byte within this time fails. |
+| `max_response_bytes` | Cap on the raw bytes of one response (status line, headers, chunk framing, trailers and body, counted as received whether or not they carry output), 1..67108864, default 67108864 (64 MiB). It cannot be disabled; exceeding it fails the request with `protocol_error`. |
+| `ca_bundle_path` | Optional PEM CA bundle that **replaces** the system trust store; it does not add to it. A bundle that lacks the roots for the configured host (for `https://ollama.com`, its public CA chain) makes every request fail verification. Leave it unset for `ollama.com`. Verification stays on. It never changes where the key goes: the host is always the one `base_url` names, and the endpoint check below applies unchanged. Whoever controls a CA in the bundle can, with control of the network path, impersonate that host, so only list CAs you trust with the key. |
 
 Exactly one of `api_key_env` and `api_key_file` is required. Unknown fields
 are rejected. An inline `api_key` (or `key`, `token`) field is refused, so the
@@ -70,6 +72,41 @@ C++ hosts build the backend with `make_ollama_cloud_backend(OllamaCloudOptions)`
 (`sonder/inference/backends/ollama_cloud.hpp`); the options mirror the JSON and
 add a pluggable `transport` for tests.
 
+## Endpoint
+
+The provider sends the API key in the `Authorization` header of every request
+to the host that `base_url` names, so that host is trusted with the key.
+
+- By default only the Ollama Cloud origin is accepted: host `ollama.com`
+  (ASCII case-insensitive; no subdomain, no trailing dot) on port 443, any
+  path. Anything else (another host, an IP literal, `ollama.com:8443`,
+  `api.ollama.com`, `ollama.com.example`) fails at config load and again in
+  `make_ollama_cloud_backend` with `invalid_argument` and a fixed message that
+  names `allow_custom_endpoint` and does not quote the URL. The check runs
+  before the key is read and before `serve` logs the URL.
+- `"allow_custom_endpoint": true` (`OllamaCloudOptions::allow_custom_endpoint`)
+  accepts any other `https://` host. It means "the key is sent to this host";
+  use it only for a host you trust with the key (a gateway you run, say).
+- `ca_bundle_path` cannot widen this: it only changes which CAs are trusted
+  for the configured host.
+
+## Trust model
+
+The configured provider is trusted with its own credential. It receives the
+key on every request, so a provider that wanted the key already has it; the
+provider is **not** filtered for echoing it back. Content, reasoning and tool
+calls from a successful response reach the client and text-capture telemetry
+unmodified, and there is no output filter for the key (a provider that echoes
+it in a completion would show it to the local client). That is why the
+endpoint is restricted (Endpoint above): the key can only be sent to, and so
+only be echoed by, the Ollama Cloud origin unless an operator opts in to a
+host of their choosing. A third party on the network path is excluded by
+mandatory TLS verification (chain and host name; no insecure mode, no pin-only
+mode, no SNI override), so it can neither read the key nor inject responses.
+
+What the provider says on error is a different matter: error text is never
+needed for the result, so none of it is passed on (Secrets below).
+
 ## Policy
 
 - **Opt-in.** A model is a cloud model only when it is listed in `models`.
@@ -77,16 +114,22 @@ add a pluggable `transport` for tests.
   configured as a cloud model"), even when the cloud offers it; a listed model
   the cloud does not offer fails with `not_found`. `list_models()` returns the
   allowlisted models present in `GET /api/tags`, with `resident = false`.
-- **Local-only requests are refused.** `GenerateRequest::local_only` and
-  `ChatRequest::local_only` (set from `RequestOptions::local_only`, which
-  `sonder-infer serve` sets from the `X-Sonder-Local-Only: 1|true` request
-  header) make the provider fail the request with `invalid_argument` before any
-  network I/O. Over HTTP that is 400 `invalid_request`: "the backend refused the
-  request: ollama_cloud: model 'X' runs on Ollama Cloud (remote) and the request
-  is local-only (X-Sonder-Local-Only)". Only `ollama_cloud` enforces the
-  flag; the other backends ignore it, including the retiring `ollama`
-  (`--ollama-allow-remote`) and external-mode `llamaserver` backends, which
-  can still send a prompt off-host.
+- **Local-only requests are refused.** `sonder-infer serve` refuses a request
+  carrying `X-Sonder-Local-Only: 1|true` against the `ollama_cloud` backend
+  before it resolves or acquires the model: loading a model that is not
+  resident (`--lazy-models`, or after an idle eviction) is itself an
+  authenticated `GET /api/tags`, so the refusal must come first. That covers
+  `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/completions`,
+  `/v1/embeddings`, `/v1/rerank` and `/v1/score`: 400 `invalid_request`
+  (param `X-Sonder-Local-Only`), "backend 'ollama_cloud' is a remote provider
+  and the request is local-only (X-Sonder-Local-Only); nothing was sent to the
+  provider". No network call is made. The provider itself refuses
+  `GenerateRequest::local_only` / `ChatRequest::local_only` (set from
+  `RequestOptions::local_only`) with `invalid_argument` before any network
+  I/O as a second layer, for C++ hosts that call it directly. Only
+  `ollama_cloud` enforces the flag; the other backends ignore it, including
+  the retiring `ollama` (`--ollama-allow-remote`) and external-mode
+  `llamaserver` backends, which can still send a prompt off-host.
 - **Refused features** (no network call): `response_format` other than `text`
   (cloud models have no structured outputs), GBNF grammars, image inputs,
   `logit_bias`, `typical_p`. Thinking: `ThinkingOptions::enable_thinking` maps
@@ -114,16 +157,30 @@ uses Ollama Cloud needs a TLS-enabled configure.
 
 - The key is read once, when the backend is built. Error messages name the
   variable or the file path, never the value.
-- It is sent only as the `Authorization` header to the configured host. The
-  provider's copies (the stored key, the header value) are overwritten when
-  they are released. Copies inside the HTTP client's internal request buffer are
-  not covered by that.
-- Every error that leaves the provider (HTTP error bodies, mid-stream
-  `{"error": ...}` lines, transport errors) is scrubbed: any complete
-  occurrence of the key, raw or JSON-escaped, becomes `[redacted]`. Upstream
-  text is scrubbed whole before it is cut to 512 bytes for the message, so a
-  key that straddles the cut leaves no prefix behind. Telemetry carries error
-  codes only, never upstream messages.
+- It is sent only as the `Authorization` header to the configured host (see
+  Endpoint). The provider's copies (the stored key, the header values handed
+  to the transport) are overwritten when they are released, also when the
+  transport throws. The HTTP client sizes its serialized request head once
+  (no reallocation leaves a copy in freed memory), appends header values in
+  place and overwrites the head right after sending it and on every other
+  exit path.
+- **Remote error text is never passed on.** A non-2xx response body is not
+  read at all (the connection is closed at the first body byte), and a
+  mid-stream `{"error": ...}` line is not copied. Errors carry fixed local
+  text instead: `ollama_cloud: HTTP <status> (<category>)`, with category
+  `auth failed; check the configured API key` (401, 403), `rate limited`
+  (429), `model not found` (404), `request rejected` (400 and other 4xx),
+  `server error` (5xx) or `bad response` (anything else), and
+  `ollama_cloud: the provider reported an error mid-stream (server error)`.
+  So a key the provider echoes in an error, whole, partial or in any encoding
+  (base64, URL or HTML escaping), reaches no client response, log line,
+  telemetry event or startup error. Error codes are unchanged (401/403/429/
+  502-504 `unavailable`, 404 `not_found`, 400 `invalid_argument`, others
+  `backend_error`).
+- As a second layer, the remaining local text (transport and TLS errors)
+  still goes through the key scrubber: any complete occurrence of the key,
+  raw or JSON-escaped, becomes `[redacted]`. Telemetry carries error codes
+  only.
 - `redacted_config()` and `runtime_status().diagnostics` show the key source
   (`env` + variable name, or `file` + path), never the key.
 - Tests cover these paths with an obvious fake key, including the full engine
@@ -161,10 +218,15 @@ and local-only refusal counters.
 
 `sonder_ollama_cloud_tests` (CTest `sonder.ollama_cloud.*`) uses a scripted
 in-process transport; nothing touches the network. Server-side coverage:
-`serve_main: ollama_cloud config ...` (config loader and CLI),
-`openai: correlation headers` (header parsing) and
+`serve_main: ollama_cloud config ...` and `serve_main: ollama_cloud base_url
+off the Ollama Cloud origin ...` (config loader, endpoint opt-in and CLI),
+`openai: correlation headers` (header parsing),
 `chat: X-Sonder-Local-Only reaches the backend request` (HTTP to backend
-plumbing).
+plumbing), `chat: a local-only request against ollama_cloud makes no network
+call, even with lazy models` and `chat: ollama_cloud error bodies reach
+neither the client, the log nor telemetry`. The wire-byte cap is covered in
+`http_client: max_response_bytes caps every received byte ...`
+(`tests/test_http_client.cpp`).
 
 ## Limits and open items
 
@@ -178,3 +240,26 @@ plumbing).
   are needed for that (opt-in, like the other live checks).
 - Rate-limit (429) responses map to `unavailable` (HTTP 503 from serve) without
   retry; `Retry-After` from the cloud is not forwarded.
+- Bounds on provider data: 4 MiB per NDJSON line, 65,536 JSON values per
+  line, 16 MiB and 262,144 JSON values for `GET /api/tags`, the cumulative
+  output cap (`max_stream_output_bytes`, 32 MiB) and the raw response cap
+  (`max_response_bytes`, 64 MiB). For TLS the raw count is the decrypted HTTP
+  byte stream (TLS record overhead is not counted).
+- Known limits:
+  - Name resolution is a blocking `getaddrinfo` before the connect deadline
+    applies (`src/net/http_client.cpp`, `connect_to`); there is no bounded
+    or cancellable resolver in `src/net`, so an unresponsive resolver can
+    hold a request (or startup) past `connect_timeout_ms` and ignore
+    cancellation until the OS resolver gives up.
+  - The key lives in ordinary process memory for the backend's lifetime
+    (one stored copy, plus short-lived header copies that are overwritten).
+    It is not in locked or dump-excluded memory, and TLS libraries keep
+    their own buffers of the encrypted request that are not wiped here, so a
+    full memory dump of the process can contain it.
+  - A response that stays alive with bytes that are not content (for
+    example a newline every minute) is bounded by `request_timeout_ms` and
+    `max_response_bytes`, not by `idle_timeout_ms`.
+  - `probe()`, `list_models()` and `load_model()` take no cancellation token
+    (the `Backend` interface has none), so `GET /api/tags` is bounded by its
+    timeouts (at most 60 s total, plus `idle_timeout_ms`) rather than
+    cancellable.

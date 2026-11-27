@@ -442,7 +442,7 @@ Status load_ollama_cloud_config(const std::string& path, BackendSetup& destinati
     if (in.bad()) return Status(ErrorCode::io_error, "cannot read ollama_cloud config");
     if (in.gcount() > 256 * 1024) return Status(ErrorCode::invalid_argument, "ollama_cloud config exceeds 256 KiB");
     text.resize(static_cast<std::size_t>(in.gcount()));
-    auto parsed = json::parse(text);
+    auto parsed = json::parse(text, json::ParseLimits{64, 1u << 16});
     if (!parsed.ok()) {
         // No parser detail: it could quote file content, and a misplaced key
         // might be in there.
@@ -450,9 +450,9 @@ Status load_ollama_cloud_config(const std::string& path, BackendSetup& destinati
     }
     if (!parsed.value().is_object()) return Status(ErrorCode::invalid_argument, "ollama_cloud config must be a JSON object");
     const auto& object = parsed.value().as_object();
-    static constexpr std::string_view known[] = {"base_url", "api_key_env", "api_key_file", "models",
-                                                 "connect_timeout_ms", "request_timeout_ms", "idle_timeout_ms",
-                                                 "ca_bundle_path"};
+    static constexpr std::string_view known[] = {"base_url", "allow_custom_endpoint", "api_key_env", "api_key_file",
+                                                 "models", "connect_timeout_ms", "request_timeout_ms",
+                                                 "idle_timeout_ms", "max_response_bytes", "ca_bundle_path"};
     for (const auto& member : object) {
         if (member.first == "api_key" || member.first == "key" || member.first == "token") {
             return Status(ErrorCode::invalid_argument,
@@ -496,6 +496,29 @@ Status load_ollama_cloud_config(const std::string& path, BackendSetup& destinati
             return Status(ErrorCode::invalid_argument,
                           "ollama_cloud config: 'base_url' must not contain a query or fragment");
     }
+    if (const auto* v = object.find("allow_custom_endpoint")) {
+        if (!v->is_bool())
+            return Status(ErrorCode::invalid_argument, "ollama_cloud config: 'allow_custom_endpoint' must be true or false");
+        setup.ollama_cloud_allow_custom_endpoint = v->as_bool();
+    }
+    if (!setup.ollama_cloud_base_url.empty() && !setup.ollama_cloud_allow_custom_endpoint) {
+        // The key goes to whatever host base_url names. Only the Ollama Cloud
+        // origin is accepted without the explicit opt-in. Checked before serve
+        // logs the URL; the message does not quote it.
+        // Authority = text between "https://" and the first '/', compared
+        // ASCII case-insensitively; userinfo, query and fragment are already
+        // refused above. make_ollama_cloud_backend checks the parsed host and
+        // port again.
+        const std::string_view rest = std::string_view(setup.ollama_cloud_base_url).substr(8);
+        std::string authority(rest.substr(0, rest.find('/')));
+        std::transform(authority.begin(), authority.end(), authority.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (authority != "ollama.com" && authority != "ollama.com:443")
+            return Status(ErrorCode::invalid_argument,
+                          "ollama_cloud config: 'base_url' is not the Ollama Cloud origin (https://ollama.com, port "
+                          "443); the API key would be sent to another host. Set \"allow_custom_endpoint\": true to "
+                          "accept that host");
+    }
     if (auto st = string_field("api_key_env", setup.ollama_cloud_api_key_env); !st.ok()) return st;
     if (auto st = string_field("api_key_file", setup.ollama_cloud_api_key_file); !st.ok()) return st;
     if (auto st = string_field("ca_bundle_path", setup.ollama_cloud_ca_bundle_path); !st.ok()) return st;
@@ -520,7 +543,8 @@ Status load_ollama_cloud_config(const std::string& path, BackendSetup& destinati
     };
     const Bound bounds[] = {{"connect_timeout_ms", &setup.ollama_cloud_connect_timeout_ms, 1, 600000},
                             {"request_timeout_ms", &setup.ollama_cloud_request_timeout_ms, 1, 86400000},
-                            {"idle_timeout_ms", &setup.ollama_cloud_idle_timeout_ms, 0, 86400000}};
+                            {"idle_timeout_ms", &setup.ollama_cloud_idle_timeout_ms, 0, 86400000},
+                            {"max_response_bytes", &setup.ollama_cloud_max_response_bytes, 1, std::uint64_t{64} << 20}};
     for (const Bound& b : bounds) {
         if (const auto* v = object.find(b.key)) {
             if (!v->is_integer() || v->as_int(-1) < 0 || v->as_uint() < b.lo || v->as_uint() > b.hi)
@@ -587,6 +611,8 @@ Result<std::shared_ptr<Backend>> make_backend(const BackendSetup& setup) {
         co.request_timeout = std::chrono::milliseconds(setup.ollama_cloud_request_timeout_ms);
         co.idle_timeout = std::chrono::milliseconds(setup.ollama_cloud_idle_timeout_ms);
         co.ca_bundle_path = setup.ollama_cloud_ca_bundle_path;
+        co.allow_custom_endpoint = setup.ollama_cloud_allow_custom_endpoint;
+        co.max_response_bytes = static_cast<std::size_t>(setup.ollama_cloud_max_response_bytes);
         return make_ollama_cloud_backend(std::move(co));
 #else
         return Status(ErrorCode::unsupported,

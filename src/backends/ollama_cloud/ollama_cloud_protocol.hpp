@@ -25,8 +25,11 @@ namespace sonder::inference::ollama_cloud {
 inline constexpr std::size_t kMaxNdjsonLineBytes = 4u << 20;
 // Bound on a buffered (non-streaming) response body such as /api/tags.
 inline constexpr std::size_t kMaxBufferedBodyBytes = 16u << 20;
-// Bound on an error response body kept for the error message.
-inline constexpr std::size_t kMaxErrorBodyBytes = 8192;
+// JSON value-node caps (json::ParseLimits::max_values) for provider data:
+// one NDJSON line, and one /api/tags document. Without them a line or body
+// within its byte cap could still expand into millions of nodes.
+inline constexpr std::size_t kMaxNdjsonLineValues = std::size_t{1} << 16;
+inline constexpr std::size_t kMaxTagsValues = std::size_t{1} << 18;
 
 struct BaseUrl {
     std::string host;
@@ -38,6 +41,10 @@ struct BaseUrl {
 // path; no userinfo, query or fragment. Host and path validation is the
 // internal HTTP client's (net::parse_url). Works in builds without TLS.
 Result<BaseUrl> parse_base_url(std::string_view text);
+// True when `base` is the Ollama Cloud origin: host "ollama.com" (compared
+// ASCII case-insensitively; a trailing dot or any subdomain does not match)
+// on port 443. Any path is allowed: it does not change who gets the key.
+bool is_canonical_origin(const BaseUrl& base) noexcept;
 // base path + api path ("/" + "/api/chat" -> "/api/chat").
 std::string join_target(const std::string& base_path, std::string_view api_path);
 
@@ -53,11 +60,6 @@ std::string build_chat_body(const std::string& model, const ChatRequest& request
 std::string build_generate_body(const std::string& model, const GenerateRequest& request);
 
 enum class StreamKind { generate, chat };
-
-// Redacts secrets in place. Applied to upstream error text BEFORE it is
-// bounded for a message, so a secret that straddles the cut is still found
-// whole. Empty = no redaction. Called only on error paths.
-using TextScrubber = std::function<void(std::string&)>;
 
 struct StreamEvent {
     std::string_view content;   // "response" (generate) or "message.content" (chat)
@@ -83,19 +85,19 @@ struct StreamSummary {
 
 // Incremental NDJSON decoder; bytes may be split at any boundary. Not
 // thread-safe (one decoder per response). The callback's string_views are
-// valid only during the call. `scrub` redacts an {"error": ...} line's text
-// before it is bounded into error().
+// valid only during the call. An {"error": ...} line becomes a fixed local
+// message: the provider's text is never copied into error().
 class StreamDecoder {
 public:
     using EventCallback = std::function<bool(const StreamEvent&)>;
 
-    StreamDecoder(StreamKind kind, EventCallback on_event, std::size_t max_output_bytes, TextScrubber scrub = {});
+    StreamDecoder(StreamKind kind, EventCallback on_event, std::size_t max_output_bytes);
 
     // False when the callback asked to stop or the stream is invalid.
     bool feed(std::string_view bytes);
     // Flushes a trailing unterminated line. Errors: backend_error (an
-    // {"error": ...} line, also mid-stream), protocol_error (malformed JSON,
-    // oversized line or output, or no "done" line).
+    // {"error": ...} line, also mid-stream; fixed text), protocol_error
+    // (malformed JSON, oversized line or output, or no "done" line).
     Status finish();
 
     [[nodiscard]] const StreamSummary& summary() const noexcept { return summary_; }
@@ -107,7 +109,6 @@ private:
 
     StreamKind kind_;
     EventCallback on_event_;
-    TextScrubber scrub_;
     std::size_t max_output_bytes_;
     std::size_t output_bytes_ = 0;
     std::uint32_t next_tool_call_index_ = 0;
@@ -130,9 +131,11 @@ struct TagEntry {
 // name are skipped. Errors: protocol_error.
 Result<std::vector<TagEntry>> parse_tags(std::string_view body);
 
-// Maps a non-2xx response to a Status. The message carries the upstream
-// {"error": ...} text (or the raw body), passed through `scrub` first and
-// then bounded to 512 bytes.
-Status http_status_error(int status, std::string_view body, const TextScrubber& scrub = {});
+// Maps a non-2xx status to a Status with fixed local text: "ollama_cloud:
+// HTTP <status> (<category>)", category one of auth failed, rate limited,
+// model not found, request rejected, server error or bad response. The
+// response body is deliberately not an input: provider text (which could
+// echo the key in any encoding) never reaches a message, log or client.
+Status http_status_error(int status);
 
 }  // namespace sonder::inference::ollama_cloud

@@ -64,6 +64,14 @@ public:
         std::unique_lock<std::mutex> lock(mu_);
         cv_.wait_for(lock, std::chrono::seconds(5), [this] { return blocked_; });
     }
+    // Every send() call, routed or not.
+    std::size_t calls() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return requests_.size();
+    }
+    // Body chunks the most recent send() handed to on_body (the chunk that
+    // made on_body return false included).
+    std::size_t last_delivered() const { return last_delivered_.load(); }
 
     Status send(const OllamaCloudHttpRequest& request, const std::function<void(int)>& on_status,
                 const std::function<bool(std::string_view)>& on_body, const CancellationToken& cancel) override {
@@ -81,8 +89,10 @@ public:
             return r.error;
         }
         if (on_status) on_status(r.status);
+        last_delivered_.store(0);
         for (const auto& c : r.chunks) {
             if (cancel.cancelled()) return Status(ErrorCode::cancelled, "fake transport: cancelled");
+            last_delivered_.fetch_add(1);
             if (!on_body(c)) return Status::success();
         }
         if (r.block_after_chunks) {
@@ -109,6 +119,7 @@ private:
     bool blocked_ = false;
     std::map<std::string, Route> routes_;
     std::vector<OllamaCloudHttpRequest> requests_;
+    std::atomic<std::size_t> last_delivered_{0};
 };
 
 OllamaCloudOptions options_with(const std::shared_ptr<FakeTransport>& t) {
@@ -160,6 +171,33 @@ std::string header(const OllamaCloudHttpRequest& r, const std::string& name) {
 }
 
 bool contains_key(std::string_view text) { return text.find(kFakeKey) != std::string_view::npos; }
+
+std::string base64(std::string_view in) {
+    static constexpr char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    std::size_t i = 0;
+    for (; i + 2 < in.size(); i += 3) {
+        const unsigned v = (static_cast<unsigned char>(in[i]) << 16) | (static_cast<unsigned char>(in[i + 1]) << 8) |
+                           static_cast<unsigned char>(in[i + 2]);
+        out += kAlphabet[(v >> 18) & 63];
+        out += kAlphabet[(v >> 12) & 63];
+        out += kAlphabet[(v >> 6) & 63];
+        out += kAlphabet[v & 63];
+    }
+    if (i + 1 == in.size()) {
+        const unsigned v = static_cast<unsigned char>(in[i]) << 16;
+        out += kAlphabet[(v >> 18) & 63];
+        out += kAlphabet[(v >> 12) & 63];
+        out += "==";
+    } else if (i + 2 == in.size()) {
+        const unsigned v = (static_cast<unsigned char>(in[i]) << 16) | (static_cast<unsigned char>(in[i + 1]) << 8);
+        out += kAlphabet[(v >> 18) & 63];
+        out += kAlphabet[(v >> 12) & 63];
+        out += kAlphabet[(v >> 6) & 63];
+        out += '=';
+    }
+    return out;
+}
 
 fs::path temp_file(const std::string& name, const std::string& content) {
     const fs::path p = fs::temp_directory_path() / ("sonder-ollama-cloud-" + name);
@@ -242,6 +280,7 @@ TEST_CASE("key file: trimmed, sent as a bearer token to the configured host") {
     o.env_lookup = nullptr;
     o.api_key_file = path.string();
     o.base_url = "https://cloud.example.test:8443/base";
+    o.allow_custom_endpoint = true;  // the key goes to this host
     t->route("/base/api/tags", Route{200, {kTagsBody}, {}, false});
     auto be = make_ollama_cloud_backend(o);
     std::error_code ec;
@@ -481,7 +520,9 @@ TEST_CASE("secrets: the key never appears in errors, telemetry or config dumps")
     auto a = model->chat(user_chat("x"), {}, {});
     REQUIRE_FALSE(a.ok());
     CHECK_FALSE(contains_key(a.status().message()));
-    CHECK(a.status().message().find("[redacted]") != std::string::npos);
+    // The body is not quoted at all: a fixed category stands in for it.
+    CHECK(a.status().message().find("auth failed") != std::string::npos);
+    CHECK(a.status().message().find("invalid key") == std::string::npos);
     // ... mid-stream ...
     t->route("/api/chat", Route{200, {R"({"error":")" + echo + "\"}\n"}, {}, false});
     auto b = model->chat(user_chat("x"), {}, {});
@@ -497,6 +538,8 @@ TEST_CASE("secrets: the key never appears in errors, telemetry or config dumps")
     auto d = model->chat(user_chat("x"), {}, {});
     REQUIRE_FALSE(d.ok());
     CHECK_FALSE(contains_key(d.status().message()));
+    // Local transport text is still scrubbed (second layer).
+    CHECK(d.status().message().find("[redacted]") != std::string::npos);
     t->route("/api/tags", Route{403, {echo}, {}, false});
     auto e = be->list_models();
     REQUIRE_FALSE(e.ok());
@@ -535,7 +578,8 @@ TEST_CASE("secrets: a key echoed across the 512-byte error cut leaves no prefix 
     auto http_json = model->chat(user_chat("x"), {}, {});
     REQUIRE_FALSE(http_json.ok());
     CHECK_FALSE(leaks(http_json.status().message()));
-    CHECK(http_json.status().message().find("[redacted]") != std::string::npos);
+    CHECK(http_json.status().message().find("HTTP 401") != std::string::npos);
+    CHECK(http_json.status().message().find("xxxxxxxx") == std::string::npos);
 
     // HTTP error path, raw (non-JSON) body, on the generate endpoint.
     t->route("/api/generate", Route{500, {detail}, {}, false});
@@ -545,7 +589,8 @@ TEST_CASE("secrets: a key echoed across the 512-byte error cut leaves no prefix 
     auto http_raw = model->generate(gen, {}, {});
     REQUIRE_FALSE(http_raw.ok());
     CHECK_FALSE(leaks(http_raw.status().message()));
-    CHECK(http_raw.status().message().find("[redacted]") != std::string::npos);
+    CHECK(http_raw.status().message().find("HTTP 500") != std::string::npos);
+    CHECK(http_raw.status().message().find("xxxxxxxx") == std::string::npos);
 
     // Mid-stream {"error": ...} line after a 200 status.
     t->route("/api/chat", Route{200,
@@ -557,14 +602,14 @@ TEST_CASE("secrets: a key echoed across the 512-byte error cut leaves no prefix 
     REQUIRE_FALSE(mid.ok());
     CHECK(mid.status().code() == ErrorCode::backend_error);
     CHECK_FALSE(leaks(mid.status().message()));
-    CHECK(mid.status().message().find("[redacted]") != std::string::npos);
+    CHECK(mid.status().message().find("xxxxxxxx") == std::string::npos);
 
     // Buffered GET path (/api/tags behind list_models).
     t->route("/api/tags", Route{403, {R"({"error":")" + detail + R"("})"}, {}, false});
     auto tags = be->list_models();
     REQUIRE_FALSE(tags.ok());
     CHECK_FALSE(leaks(tags.status().message()));
-    CHECK(tags.status().message().find("[redacted]") != std::string::npos);
+    CHECK(tags.status().message().find("HTTP 403") != std::string::npos);
 }
 
 TEST_CASE("secrets: a non-string error value re-serialised with JSON escapes is redacted") {
@@ -590,13 +635,13 @@ TEST_CASE("secrets: a non-string error value re-serialised with JSON escapes is 
     auto http = model->chat(user_chat("x"), {}, {});
     REQUIRE_FALSE(http.ok());
     CHECK_FALSE(leaks(http.status().message()));
-    CHECK(http.status().message().find("[redacted]") != std::string::npos);
+    CHECK(http.status().message().find("HTTP 400") != std::string::npos);
 
     t->route("/api/chat", Route{200, {body + "\n"}, {}, false});
     auto mid = model->chat(user_chat("x"), {}, {});
     REQUIRE_FALSE(mid.ok());
     CHECK_FALSE(leaks(mid.status().message()));
-    CHECK(mid.status().message().find("[redacted]") != std::string::npos);
+    CHECK(mid.status().message().find("detail") == std::string::npos);
 
     // Direct: raw and escaped occurrences in one text.
     auto direct = ollama_cloud::ApiKey::from_value(std::string(key), "test");
@@ -737,5 +782,242 @@ TEST_CASE("protocol: decoder bounds and tags parsing") {
     CHECK(tags->size() == 3u);
     CHECK_FALSE(ollama_cloud::parse_tags("[]").ok());
     CHECK(ollama_cloud::parse_tags("{}").value().empty());
-    CHECK(ollama_cloud::http_status_error(404, "{\"error\":\"model not found\"}").code() == ErrorCode::not_found);
+    CHECK(ollama_cloud::http_status_error(404).code() == ErrorCode::not_found);
+    CHECK(ollama_cloud::http_status_error(404).message() == "ollama_cloud: HTTP 404 (model not found)");
+}
+
+TEST_CASE("endpoint: only the Ollama Cloud origin gets the key unless allow_custom_endpoint is set") {
+    for (const char* url : {"https://ollama.com", "https://ollama.com/", "HTTPS://OLLAMA.COM", "https://Ollama.com:443",
+                            "https://ollama.com:443/"}) {
+        CAPTURE(url);
+        auto t = fake_with_tags();
+        auto o = options_with(t);
+        o.base_url = url;
+        auto be = make_ollama_cloud_backend(o);
+        REQUIRE_MESSAGE(be.ok(), be.status().to_string());
+        REQUIRE(be.value()->probe().ok());
+        REQUIRE(t->requests().size() == 1u);
+        CHECK(t->requests()[0].host == "ollama.com");
+        CHECK(t->requests()[0].port == 443);
+    }
+    const std::string marker = "attacker-marker";
+    const std::vector<std::string> foreign = {"https://" + marker + ".example",
+                                              "https://ollama.com:8443",
+                                              "https://ollama.com." + marker,
+                                              "https://api.ollama.com",
+                                              "https://ollama.com.",
+                                              "https://" + marker + ".example/ollama.com",
+                                              "https://127.0.0.1",
+                                              "https://[::1]"};
+    for (const std::string& url : foreign) {
+        CAPTURE(url);
+        auto t = fake_with_tags();
+        auto o = options_with(t);
+        o.base_url = url;
+        auto refused = make_ollama_cloud_backend(o);
+        REQUIRE_FALSE(refused.ok());
+        CHECK(refused.status().code() == ErrorCode::invalid_argument);
+        CHECK(refused.status().message().find("allow_custom_endpoint") != std::string::npos);
+        // Fixed text: the URL is never quoted back.
+        CHECK(refused.status().message().find(marker) == std::string::npos);
+        CHECK(refused.status().message().find("8443") == std::string::npos);
+        CHECK(t->calls() == 0u);
+
+        o.allow_custom_endpoint = true;
+        auto allowed = make_ollama_cloud_backend(o);
+        CHECK_MESSAGE(allowed.ok(), allowed.status().to_string());
+    }
+    // The opt-in is visible in the redacted config.
+    auto o = options_with(fake_with_tags());
+    const json::Value* flag = redacted_config(o).find("allow_custom_endpoint");
+    REQUIRE(flag != nullptr);
+    CHECK_FALSE(flag->as_bool());
+}
+
+TEST_CASE("errors: remote error bodies never reach messages or telemetry, even base64 or partial keys") {
+    const std::string key(kFakeKey);
+    const std::string b64 = base64(key);
+    const std::string partial = key.substr(0, 20);  // "sk-FAKE-test-key-012"
+    REQUIRE(b64.find(key) == std::string::npos);
+    const auto leaks = [&](const std::string& text) {
+        return text.find(b64) != std::string::npos || text.find(partial) != std::string::npos ||
+               text.find("UPSTREAM-DETAIL") != std::string::npos || contains_key(text);
+    };
+    auto t = fake_with_tags();
+    auto be = make_ollama_cloud_backend(options_with(t)).value();
+    auto model = load(be);
+
+    struct Case {
+        int status;
+        std::string body;
+        ErrorCode code;
+        const char* category;
+    };
+    const std::vector<Case> cases = {
+        {401, R"({"error":")" + b64 + R"("})", ErrorCode::unavailable, "auth failed"},
+        {401, b64, ErrorCode::unavailable, "auth failed"},
+        {403, R"({"error":"UPSTREAM-DETAIL )" + partial + R"("})", ErrorCode::unavailable, "auth failed"},
+        {429, "UPSTREAM-DETAIL " + partial, ErrorCode::unavailable, "rate limited"},
+        {404, R"({"error":"model 'UPSTREAM-DETAIL' not found"})", ErrorCode::not_found, "model not found"},
+        {500, R"({"error":")" + b64 + R"("})", ErrorCode::backend_error, "server error"},
+        {503, partial, ErrorCode::unavailable, "server error"},
+        {400, R"({"error":"UPSTREAM-DETAIL bad option"})", ErrorCode::invalid_argument, "request rejected"},
+        {302, "UPSTREAM-DETAIL", ErrorCode::backend_error, "bad response"},
+    };
+    for (const auto& c : cases) {
+        CAPTURE(c.status);
+        CAPTURE(c.body);
+        t->route("/api/chat", Route{c.status, {c.body}, {}, false});
+        auto r = model->chat(user_chat("x"), {}, {});
+        REQUIRE_FALSE(r.ok());
+        CHECK(r.status().code() == c.code);
+        CHECK_FALSE(leaks(r.status().message()));
+        CHECK(r.status().message().find("HTTP " + std::to_string(c.status)) != std::string::npos);
+        CHECK(r.status().message().find(c.category) != std::string::npos);
+    }
+    // The model-list / probe / load path (buffered GET) maps the same way.
+    t->route("/api/tags", Route{401, {R"({"error":")" + b64 + R"("})"}, {}, false});
+    ModelLoadOptions lo;
+    lo.model = "gpt-oss:120b";
+    std::vector<Status> tag_errors;
+    tag_errors.push_back(be->list_models().status());
+    tag_errors.push_back(be->probe().status());
+    tag_errors.push_back(be->load_model(lo).status());
+    for (const Status& st : tag_errors) {
+        REQUIRE_FALSE(st.ok());
+        CHECK_FALSE(leaks(st.message()));
+        CHECK(st.message().find("auth failed") != std::string::npos);
+    }
+    // Mid-stream {"error": ...} after a 200: a fixed category, no upstream text.
+    const std::vector<std::string> details = {b64, partial, "UPSTREAM-DETAIL"};
+    for (const std::string& detail : details) {
+        CAPTURE(detail);
+        t->route("/api/chat", Route{200,
+                                    {"{\"message\":{\"content\":\"a\"},\"done\":false}\n",
+                                     R"({"error":")" + detail + "\"}\n"},
+                                    {},
+                                    false});
+        auto mid = model->chat(user_chat("x"), {}, {});
+        REQUIRE_FALSE(mid.ok());
+        CHECK(mid.status().code() == ErrorCode::backend_error);
+        CHECK_FALSE(leaks(mid.status().message()));
+        CHECK(mid.status().message().find("mid-stream") != std::string::npos);
+    }
+    auto status = be->runtime_status();
+    REQUIRE(status.has_value());
+    for (const auto& [type, attrs] : status->take_events()) {
+        CHECK_FALSE(leaks(json::Value(attrs).dump()));
+    }
+    CHECK_FALSE(leaks(json::Value(*status->diagnostics).dump()));
+}
+
+TEST_CASE("bounds: a non-2xx body is not read past its cap, and the raw response cap cannot be disabled") {
+    auto t = fake_with_tags();
+    auto o = options_with(t);
+    CHECK(o.max_response_bytes == kOllamaCloudMaxResponseBytes);
+    CHECK(kOllamaCloudMaxResponseBytes == (std::size_t{64} << 20));
+    auto be = make_ollama_cloud_backend(o).value();
+    auto model = load(be);
+
+    // A huge 500 body: reading stops at the 8 KiB error cap (or sooner).
+    t->route("/api/chat", Route{500, std::vector<std::string>(100, std::string(1024, 'e')), {}, false});
+    auto r = model->chat(user_chat("x"), {}, {});
+    REQUIRE_FALSE(r.ok());
+    CHECK(t->last_delivered() <= 9u);
+    t->route("/api/tags", Route{500, std::vector<std::string>(100, std::string(1024, 'e')), {}, false});
+    CHECK_FALSE(be->list_models().ok());
+    CHECK(t->last_delivered() <= 9u);
+
+    // The cap counts raw bytes, not emitted output: lines with no output
+    // fields still count, and the stream stops once the cap is passed.
+    auto small = options_with(t);
+    small.max_response_bytes = std::size_t{256} << 10;
+    t->route("/api/tags", Route{200, {kTagsBody}, {}, false});
+    auto capped = make_ollama_cloud_backend(small).value();
+    auto capped_model = load(capped);
+    const std::string padding_line = "{\"done\":false,\"padding\":\"" + std::string(16u << 10, 'p') + "\"}\n";
+    t->route("/api/chat", Route{200, std::vector<std::string>(64, padding_line), {}, false});
+    auto over = capped_model->chat(user_chat("x"), {}, {});
+    REQUIRE_FALSE(over.ok());
+    CHECK(over.status().code() == ErrorCode::protocol_error);
+    CHECK(over.status().message().find("response exceeds") != std::string::npos);
+    CHECK(t->last_delivered() < 64u);
+    // The transport is told the cap too, so the real client enforces it on the wire.
+    const auto reqs = t->requests();
+    REQUIRE_FALSE(reqs.empty());
+    CHECK(reqs.back().max_response_bytes == (std::size_t{256} << 10));
+
+    // Not disableable, and not raisable past the ceiling.
+    auto zero = options_with(t);
+    zero.max_response_bytes = 0;
+    CHECK(make_ollama_cloud_backend(zero).status().code() == ErrorCode::invalid_argument);
+    auto huge = options_with(t);
+    huge.max_response_bytes = kOllamaCloudMaxResponseBytes + 1;
+    CHECK(make_ollama_cloud_backend(huge).status().code() == ErrorCode::invalid_argument);
+}
+
+TEST_CASE("bounds: JSON value-count caps on provider lines and /api/tags, timeouts, CA bundle and endpoint") {
+    // A 4 MiB-class NDJSON line made of tiny values (no output fields) is
+    // refused by the value cap, not parsed into millions of nodes.
+    std::string pad = "{\"pad\":[";
+    for (int i = 0; i < 200000; ++i) pad += i ? ",0" : "0";
+    pad += "],\"done\":false}\n";
+    REQUIRE(pad.size() < ollama_cloud::kMaxNdjsonLineBytes);
+    ollama_cloud::StreamDecoder dec(ollama_cloud::StreamKind::chat, {}, 0);
+    CHECK_FALSE(dec.feed(pad));
+    CHECK(dec.finish().code() == ErrorCode::protocol_error);
+
+    std::string bomb = "{\"models\":[";
+    for (int i = 0; i < 400000; ++i) bomb += i ? ",{}" : "{}";
+    bomb += "]}";
+    REQUIRE(bomb.size() < ollama_cloud::kMaxBufferedBodyBytes);
+    CHECK(ollama_cloud::parse_tags(bomb).status().code() == ErrorCode::protocol_error);
+    // A realistic list still parses.
+    std::string many = "{\"models\":[";
+    for (int i = 0; i < 2000; ++i) {
+        many += (i ? "," : "") + std::string(R"({"name":"m)") + std::to_string(i) +
+                R"(","size":1,"details":{"format":"gguf","family":"f","parameter_size":"1B","quantization_level":"Q4"}})";
+    }
+    many += "]}";
+    auto parsed = ollama_cloud::parse_tags(many);
+    REQUIRE_MESSAGE(parsed.ok(), parsed.status().to_string());
+    CHECK(parsed->size() == 2000u);
+
+    // GET /api/tags carries the idle bound (it used to pass 0 = unbounded).
+    auto t = fake_with_tags();
+    auto be = make_ollama_cloud_backend(options_with(t)).value();
+    REQUIRE(be->probe().ok());
+    REQUIRE_FALSE(t->requests().empty());
+    CHECK(t->requests().back().idle_timeout == std::chrono::milliseconds(120000));
+
+    // Timeouts are bounded for direct C++ callers too (no deadline overflow).
+    auto big_connect = options_with(t);
+    big_connect.connect_timeout = std::chrono::milliseconds(600001);
+    CHECK(make_ollama_cloud_backend(big_connect).status().code() == ErrorCode::invalid_argument);
+    auto big_request = options_with(t);
+    big_request.request_timeout = std::chrono::hours(24 * 365 * 1000);
+    CHECK(make_ollama_cloud_backend(big_request).status().code() == ErrorCode::invalid_argument);
+    auto big_idle = options_with(t);
+    big_idle.idle_timeout = std::chrono::milliseconds(86400001);
+    CHECK(make_ollama_cloud_backend(big_idle).status().code() == ErrorCode::invalid_argument);
+    auto max_ok = options_with(t);
+    max_ok.connect_timeout = std::chrono::milliseconds(600000);
+    max_ok.request_timeout = std::chrono::milliseconds(86400000);
+    max_ok.idle_timeout = std::chrono::milliseconds(86400000);
+    CHECK(make_ollama_cloud_backend(max_ok).ok());
+
+    // A CA bundle never widens where the key goes: the endpoint check is the same.
+    auto ca = options_with(t);
+    ca.base_url = "https://attacker-marker.example";
+    ca.ca_bundle_path = "custom-ca.pem";
+    auto refused = make_ollama_cloud_backend(ca);
+    REQUIRE_FALSE(refused.ok());
+    CHECK(refused.status().message().find("allow_custom_endpoint") != std::string::npos);
+    auto canonical_ca = options_with(t);
+    canonical_ca.ca_bundle_path = "custom-ca.pem";
+    auto with_ca = make_ollama_cloud_backend(canonical_ca);
+    REQUIRE(with_ca.ok());
+    REQUIRE(with_ca.value()->probe().ok());
+    CHECK(t->requests().back().host == "ollama.com");
+    CHECK(t->requests().back().ca_bundle_path == "custom-ca.pem");
 }

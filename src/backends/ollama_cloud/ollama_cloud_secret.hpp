@@ -17,7 +17,8 @@ using EnvLookup = std::function<std::optional<std::string>(const char* name)>;
 
 // Overwrites the string's bytes (through a volatile pointer, so the stores
 // are not elided) and clears it. Best effort: copies made elsewhere, e.g.
-// inside the HTTP client's request buffer, are not covered.
+// inside the TLS library's record buffers, are not covered (the HTTP
+// client wipes its own serialized request head).
 void secure_wipe(std::string& text) noexcept;
 
 // Move-only owner of the key. Not thread-safe to mutate; const use (header

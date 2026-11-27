@@ -278,6 +278,33 @@ struct Server::Impl {
         return backend && backend->capabilities().has(cap);
     }
 
+    // X-Sonder-Local-Only against a remote provider (ollama_cloud): refused
+    // here, before residency resolution, because acquiring a model that is
+    // not resident (lazy residency, or evicted) loads it, and a remote model
+    // load is itself authenticated network I/O. Nothing is sent.
+    bool refuse_local_only_remote(Exchange& ex, const Correlation& corr) {
+        if (!corr.local_only) {
+            return false;
+        }
+        std::string name;
+        {
+            std::lock_guard<std::mutex> lock(engine_mu);
+            if (!backend) {
+                return false;
+            }
+            name = backend->name();
+        }
+        if (name != kRemoteProviderBackend) {
+            return false;
+        }
+        write_error(ex, make_error(400, "invalid_request",
+                                   "backend '" + name +
+                                       "' is a remote provider and the request is local-only (X-Sonder-Local-Only); "
+                                       "nothing was sent to the provider",
+                                   "X-Sonder-Local-Only"));
+        return true;
+    }
+
     bool require_ready(Exchange& ex) {
         const State s = state.load();
         if (s == State::ready) {
@@ -432,6 +459,9 @@ struct Server::Impl {
         if (!require_ready(ex)) {
             return;
         }
+        if (refuse_local_only_remote(ex, corr)) {
+            return;
+        }
         const auto served_id = residency->resolve(job.model);
         if (!served_id) {
             write_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
@@ -572,6 +602,9 @@ struct Server::Impl {
         if (!require_ready(ex)) {
             return;
         }
+        if (refuse_local_only_remote(ex, corr)) {
+            return;
+        }
         const auto served_id = residency->resolve(job.model);
         if (!served_id) {
             write_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
@@ -707,6 +740,9 @@ struct Server::Impl {
         if (!require_ready(ex)) {
             return;
         }
+        if (refuse_local_only_remote(ex, corr)) {
+            return;
+        }
         const auto served_id = residency->resolve(job.model);
         if (!served_id) {
             write_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
@@ -820,6 +856,9 @@ struct Server::Impl {
         if (!require_ready(ex)) {
             return;
         }
+        if (refuse_local_only_remote(ex, corr)) {
+            return;
+        }
         const auto served_id = residency->resolve(job.model);
         if (!served_id) {
             write_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
@@ -912,6 +951,9 @@ struct Server::Impl {
         if (!require_ready(ex)) {
             return;
         }
+        if (refuse_local_only_remote(ex, corr)) {
+            return;
+        }
         const auto served_id = residency->resolve(job.model);
         if (!served_id) {
             write_error(ex, make_error(404, "model_not_found", "model '" + job.model + "' is not served", "model"));
@@ -1002,6 +1044,9 @@ struct Server::Impl {
         }
         const ScoreJob job = std::move(std::get<ScoreJob>(job_v));
         if (!require_ready(ex)) {
+            return;
+        }
+        if (refuse_local_only_remote(ex, corr)) {
             return;
         }
         const auto served_id = residency->resolve(job.model);

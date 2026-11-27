@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "net/http_client.hpp"
+#include "sonder/inference/backends/ollama_cloud.hpp"
 
 namespace sonder::inference::ollama_cloud {
 
@@ -47,17 +48,6 @@ bool starts_with_ci(std::string_view text, std::string_view prefix) {
     return true;
 }
 
-std::string bounded(std::string_view text, std::size_t max) {
-    std::string t(text.substr(0, std::min(text.size(), max)));
-    while (!t.empty() && (t.back() == '\n' || t.back() == '\r' || t.back() == ' ' || t.back() == '\t')) {
-        t.pop_back();
-    }
-    if (text.size() > max) {
-        t += "...";
-    }
-    return t;
-}
-
 }  // namespace
 
 Result<BaseUrl> parse_base_url(std::string_view text) {
@@ -87,6 +77,14 @@ Result<BaseUrl> parse_base_url(std::string_view text) {
     out.port = explicit_port ? parsed.value().port : static_cast<std::uint16_t>(443);
     out.path = parsed.value().path.empty() ? std::string("/") : parsed.value().path;
     return out;
+}
+
+bool is_canonical_origin(const BaseUrl& base) noexcept {
+    constexpr std::string_view kHost = kOllamaCloudCanonicalHost;
+    if (base.port != kOllamaCloudCanonicalPort || base.host.size() != kHost.size()) {
+        return false;
+    }
+    return starts_with_ci(base.host, kHost);
 }
 
 std::string join_target(const std::string& base_path, std::string_view api_path) {
@@ -237,9 +235,8 @@ std::string build_generate_body(const std::string& model, const GenerateRequest&
 // ---------------------------------------------------------------------------
 // StreamDecoder
 
-StreamDecoder::StreamDecoder(StreamKind kind, EventCallback on_event, std::size_t max_output_bytes,
-                             TextScrubber scrub)
-    : kind_(kind), on_event_(std::move(on_event)), scrub_(std::move(scrub)), max_output_bytes_(max_output_bytes) {}
+StreamDecoder::StreamDecoder(StreamKind kind, EventCallback on_event, std::size_t max_output_bytes)
+    : kind_(kind), on_event_(std::move(on_event)), max_output_bytes_(max_output_bytes) {}
 
 bool StreamDecoder::feed(std::string_view bytes) {
     if (!error_.ok() || stopped_by_callback_) {
@@ -286,18 +283,15 @@ bool StreamDecoder::on_line(std::string_view line) {
     if (line.empty()) {
         return true;
     }
-    auto parsed = json::parse(line);
+    auto parsed = json::parse(line, json::ParseLimits{128, kMaxNdjsonLineValues});
     if (!parsed.ok() || !parsed.value().is_object()) {
         error_ = Status(ErrorCode::protocol_error, "ollama_cloud: malformed NDJSON line");
         return false;
     }
     const json::Value& j = parsed.value();
     if (const json::Value* e = j.find("error"); e != nullptr && !e->is_null()) {
-        std::string text = e->is_string() ? e->as_string() : e->dump();
-        if (scrub_) {
-            scrub_(text);  // whole text first: a key across the cut must not leave a prefix
-        }
-        error_ = Status(ErrorCode::backend_error, "ollama_cloud: " + bounded(text, 512));
+        // Fixed text only: the provider's error string is never copied out.
+        error_ = Status(ErrorCode::backend_error, "ollama_cloud: the provider reported an error mid-stream (server error)");
         return false;
     }
     StreamEvent ev;
@@ -397,7 +391,7 @@ Status StreamDecoder::finish() {
 // ---------------------------------------------------------------------------
 
 Result<std::vector<TagEntry>> parse_tags(std::string_view body) {
-    auto parsed = json::parse(body);
+    auto parsed = json::parse(body, json::ParseLimits{128, kMaxTagsValues});
     if (!parsed.ok() || !parsed.value().is_object()) {
         return Status(ErrorCode::protocol_error, "ollama_cloud: /api/tags did not return a JSON object");
     }
@@ -433,33 +427,26 @@ Result<std::vector<TagEntry>> parse_tags(std::string_view body) {
     return out;
 }
 
-Status http_status_error(int status, std::string_view body, const TextScrubber& scrub) {
-    std::string detail;
-    if (auto parsed = json::parse(body); parsed.ok()) {
-        if (const json::Value* e = parsed.value().find("error"); e != nullptr) {
-            detail = e->is_string() ? e->as_string() : e->dump();
-        }
-    } else {
-        detail = std::string(body);
-    }
-    if (scrub) {
-        scrub(detail);  // whole detail first: a key across the cut must not leave a prefix
-    }
-    detail = bounded(detail, 512);
-    std::string text = "ollama_cloud HTTP " + std::to_string(status) + (detail.empty() ? "" : ": " + detail);
+Status http_status_error(int status) {
+    const std::string prefix = "ollama_cloud: HTTP " + std::to_string(status) + " (";
     switch (status) {
-        case 400: return {ErrorCode::invalid_argument, std::move(text)};
-        case 404: return {ErrorCode::not_found, std::move(text)};
+        case 400: return {ErrorCode::invalid_argument, prefix + "request rejected)"};
         case 401:
-        case 403:
-            return {ErrorCode::unavailable, std::move(text) + " (check the configured API key)"};
-        case 429:
-            return {ErrorCode::unavailable, std::move(text) + " (rate limited)"};
+        case 403: return {ErrorCode::unavailable, prefix + "auth failed; check the configured API key)"};
+        case 404: return {ErrorCode::not_found, prefix + "model not found)"};
+        case 429: return {ErrorCode::unavailable, prefix + "rate limited)"};
         case 502:
         case 503:
-        case 504: return {ErrorCode::unavailable, std::move(text)};
-        default: return {ErrorCode::backend_error, std::move(text)};
+        case 504: return {ErrorCode::unavailable, prefix + "server error)"};
+        default: break;
     }
+    if (status >= 500 && status <= 599) {
+        return {ErrorCode::backend_error, prefix + "server error)"};
+    }
+    if (status >= 400 && status <= 499) {
+        return {ErrorCode::backend_error, prefix + "request rejected)"};
+    }
+    return {ErrorCode::backend_error, prefix + "bad response)"};
 }
 
 }  // namespace sonder::inference::ollama_cloud

@@ -89,8 +89,22 @@ public:
             r.tls.pinned_cert_path.clear();
             r.tls.server_name.clear();
             r.headers = request.headers;
+            r.max_response_bytes = request.max_response_bytes;
             r.on_status = on_status;
-            auto res = net::http_request(r, on_body, cancel);
+            // idle_timeout also bounds the wait for the response head (the
+            // client arms idle_timeout only after the head): with no body
+            // byte at all within that time the request fails. Counted on
+            // this thread only (the client polls the counter after reads).
+            std::uint64_t body_bytes = 0;
+            const std::function<bool(std::string_view)> counted = [&](std::string_view data) {
+                body_bytes += data.size();
+                return on_body(data);
+            };
+            if (request.idle_timeout.count() > 0) {
+                r.first_progress_timeout = request.idle_timeout;
+                r.progress_counter = [&body_bytes] { return body_bytes; };
+            }
+            auto res = net::http_request(r, counted, cancel);
             for (auto& header : r.headers) {
                 ollama_cloud::secure_wipe(header.second);
             }
@@ -138,7 +152,10 @@ public:
     }
 
     // One HTTPS exchange. The Authorization header is built here and wiped
-    // after the call; the returned status is scrubbed of the key.
+    // after the call (also when the transport throws); the returned status is
+    // scrubbed of the key. Every body byte counts against max_response_bytes:
+    // the real transport also enforces the cap on the raw wire bytes, this
+    // count covers any transport.
     Status send(const std::string& method, std::string_view api_path, std::string body,
                 const std::function<void(int)>& on_status, const std::function<bool(std::string_view)>& on_body,
                 const CancellationToken& cancel, std::chrono::milliseconds total_timeout,
@@ -153,15 +170,38 @@ public:
         req.total_timeout = total_timeout;
         req.idle_timeout = idle_timeout;
         req.ca_bundle_path = options_.ca_bundle_path;
+        req.max_response_bytes = options_.max_response_bytes;
+        struct HeaderWipe {
+            OllamaCloudHttpRequest& r;
+            ~HeaderWipe() {
+                for (auto& header : r.headers) {
+                    ollama_cloud::secure_wipe(header.second);
+                }
+            }
+        } wipe{req};
         req.headers.emplace_back("Authorization", key_.bearer_header_value());
-        Status st = transport_->send(req, on_status, on_body, cancel);
-        for (auto& header : req.headers) {
-            ollama_cloud::secure_wipe(header.second);
+        std::size_t received = 0;
+        bool over_cap = false;
+        const std::size_t cap = options_.max_response_bytes;
+        const std::function<bool(std::string_view)> counted = [&](std::string_view data) {
+            if (data.size() > cap - received) {
+                over_cap = true;
+                return false;
+            }
+            received += data.size();
+            return on_body(data);
+        };
+        Status st = transport_->send(req, on_status, counted, cancel);
+        if (over_cap) {
+            return Status(ErrorCode::protocol_error,
+                          "ollama_cloud: response exceeds the " + std::to_string(cap) + "-byte limit");
         }
         return key_.scrub(st);
     }
 
-    // GET with a buffered, bounded body. Non-2xx maps through http_status_error.
+    // GET with a buffered, bounded body. A non-2xx status maps through
+    // http_status_error and its body is not read at all (the connection is
+    // closed): the provider's text is never used.
     Result<std::string> get_buffered(std::string_view api_path) const {
         int status = 0;
         std::string body;
@@ -169,6 +209,9 @@ public:
         Status st = send(
             "GET", api_path, {}, [&status](int s) { status = s; },
             [&](std::string_view data) {
+                if (status < 200 || status >= 300) {
+                    return false;
+                }
                 if (body.size() + data.size() > ollama_cloud::kMaxBufferedBodyBytes) {
                     overflow = true;
                     return false;
@@ -176,15 +219,15 @@ public:
                 body.append(data);
                 return true;
             },
-            {}, std::min(options_.request_timeout, std::chrono::milliseconds(60000)), std::chrono::milliseconds(0));
+            {}, std::min(options_.request_timeout, std::chrono::milliseconds(60000)), options_.idle_timeout);
         if (!st.ok()) {
             return st;
         }
+        if (status < 200 || status >= 300) {
+            return ollama_cloud::http_status_error(status);
+        }
         if (overflow) {
             return Status(ErrorCode::protocol_error, "ollama_cloud: response body exceeds 16 MiB");
-        }
-        if (status < 200 || status >= 300) {
-            return key_.scrub(ollama_cloud::http_status_error(status, body, scrubber()));
         }
         return body;
     }
@@ -202,12 +245,6 @@ public:
     }
 
     [[nodiscard]] Status scrub(const Status& st) const { return key_.scrub(st); }
-    // Redacts the key in upstream text before the protocol layer bounds it.
-    // Captures `this`: use only while this CloudState is alive (callers hold
-    // the shared_ptr for the duration of the request).
-    [[nodiscard]] ollama_cloud::TextScrubber scrubber() const {
-        return [this](std::string& text) { key_.scrub(text); };
-    }
 
     void record(const RequestRecord& r) {
         requests_.fetch_add(1, std::memory_order_relaxed);
@@ -439,10 +476,9 @@ private:
                 }
                 return !stopped_by_callback;
             },
-            state_->options().max_stream_output_bytes, state_->scrubber());
+            state_->options().max_stream_output_bytes);
 
         int http_status = 0;
-        std::string error_body;
         Status st = state_->send(
             "POST", endpoint, std::move(body), [&http_status](int s) { http_status = s; },
             [&](std::string_view data) {
@@ -450,10 +486,9 @@ private:
                     rec.ttfb_ms = ms_since(start);
                 }
                 if (http_status < 200 || http_status >= 300) {
-                    if (error_body.size() < ollama_cloud::kMaxErrorBodyBytes) {
-                        error_body.append(data.substr(0, ollama_cloud::kMaxErrorBodyBytes - error_body.size()));
-                    }
-                    return true;
+                    // The error body is never read or kept: stop here and
+                    // let the transport close the connection.
+                    return false;
                 }
                 return decoder.feed(data);
             },
@@ -466,8 +501,7 @@ private:
             return finish(st);
         }
         if (http_status < 200 || http_status >= 300) {
-            return finish(
-                state_->scrub(ollama_cloud::http_status_error(http_status, error_body, state_->scrubber())));
+            return finish(ollama_cloud::http_status_error(http_status));
         }
         if (Status fin = decoder.finish(); !fin.ok()) {
             return finish(state_->scrub(fin));
@@ -620,6 +654,8 @@ json::Object redacted_config(const OllamaCloudOptions& options) {
                      {"connect_timeout_ms", static_cast<std::int64_t>(options.connect_timeout.count())},
                      {"request_timeout_ms", static_cast<std::int64_t>(options.request_timeout.count())},
                      {"idle_timeout_ms", static_cast<std::int64_t>(options.idle_timeout.count())},
+                     {"allow_custom_endpoint", options.allow_custom_endpoint},
+                     {"max_response_bytes", static_cast<std::uint64_t>(options.max_response_bytes)},
                      {"tls_verify", true}};
     if (!options.ca_bundle_path.empty()) {
         out.set("ca_bundle_path", options.ca_bundle_path);
@@ -631,6 +667,19 @@ Result<std::shared_ptr<Backend>> make_ollama_cloud_backend(OllamaCloudOptions op
     auto base = ollama_cloud::parse_base_url(options.base_url);
     if (!base.ok()) {
         return base.status();
+    }
+    if (ollama_cloud::is_canonical_origin(base.value())) {
+        base.value().host = kOllamaCloudCanonicalHost;  // one spelling for SNI, Host and telemetry
+    } else if (!options.allow_custom_endpoint) {
+        // Fixed text: the URL is not quoted (it is configuration, and may
+        // carry something its author did not mean to print).
+        return Status(ErrorCode::invalid_argument,
+                      "ollama_cloud: base_url is not the Ollama Cloud origin (https://ollama.com, port 443); the "
+                      "API key would be sent to another host. Set allow_custom_endpoint to accept that host");
+    }
+    if (options.max_response_bytes == 0 || options.max_response_bytes > kOllamaCloudMaxResponseBytes) {
+        return Status(ErrorCode::invalid_argument,
+                      "ollama_cloud: max_response_bytes must be 1.." + std::to_string(kOllamaCloudMaxResponseBytes));
     }
     const bool has_env = !options.api_key_env.empty();
     const bool has_file = !options.api_key_file.empty();
@@ -648,10 +697,13 @@ Result<std::shared_ptr<Backend>> make_ollama_cloud_backend(OllamaCloudOptions op
             return Status(ErrorCode::invalid_argument, "ollama_cloud: duplicate model '" + m + "'");
         }
     }
-    if (options.connect_timeout.count() <= 0 || options.request_timeout.count() <= 0 ||
-        options.idle_timeout.count() < 0) {
+    // Same bounds as the serve config, so deadline arithmetic cannot overflow.
+    if (options.connect_timeout.count() <= 0 || options.connect_timeout.count() > 600000 ||
+        options.request_timeout.count() <= 0 || options.request_timeout.count() > 86400000 ||
+        options.idle_timeout.count() < 0 || options.idle_timeout.count() > 86400000) {
         return Status(ErrorCode::invalid_argument,
-                      "ollama_cloud: connect_timeout and request_timeout must be positive, idle_timeout >= 0");
+                      "ollama_cloud: connect_timeout must be 1..600000 ms, request_timeout 1..86400000 ms and "
+                      "idle_timeout 0..86400000 ms");
     }
     auto key = has_env ? ApiKey::from_env(options.api_key_env, options.env_lookup)
                        : ApiKey::from_file(options.api_key_file);
