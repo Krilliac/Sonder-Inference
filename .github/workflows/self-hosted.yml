@@ -21,6 +21,13 @@ concurrency:
 permissions:
   contents: read
 
+# These runners share the owner's workstation (31 GB RAM, with WSL capped at about
+# 15 GB) with its interactive work and local builds. An uncapped Ninja build
+# (nproc + 2 = 26 jobs) thrashed the WSL VM on 2026-11-27, so parallelism is capped.
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: "4"
+  CTEST_PARALLEL_LEVEL: "4"
+
 jobs:
   windows:
     name: self-hosted windows
