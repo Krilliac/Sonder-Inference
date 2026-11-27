@@ -145,7 +145,7 @@ When `SONDER_WITH_LLAMA_CPP=ON` and `GGML_CUDA=ON`, `src/backends/llamacpp/CMake
        -P cmake/SonderCudaCheck.cmake
      ```
 
-     Pass `-DREQUIRE_FP4_MMA=OFF` when inspecting an individual translation unit that does not instantiate FP4 MMQ kernels.
+     Pass `-DREQUIRE_FP4_MMA=OFF` when inspecting an individual translation unit that does not instantiate FP4 MMQ kernels. When `SONDER_BUILD_TESTS=ON` and `CMAKE_CUDA_ARCHITECTURES` includes a real Blackwell target (`120a` or `120f`), `src/backends/llamacpp/tests/CMakeLists.txt` also registers this check automatically in CTest as `sonder.llamacpp.cuda_blackwell_sass` against `ggml-cuda`.
 
 ### VRAM Discovery and Process Telemetry
 

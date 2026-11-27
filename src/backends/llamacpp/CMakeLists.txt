@@ -28,8 +28,10 @@
 # optionally SONDER_LLAMACPP_URL) together; configure fails when the tag differs
 # but the SHA-256 does not, and SHA-256 verification fails closed on mismatch.
 #
-# Opt-in GPU presets live in CMakePresets.json: windows-cuda-rtx,
-# windows-vulkan-xt, linux-cuda-rtx, linux-rocm-xt, and linux-vulkan-xt.
+# Opt-in GPU presets live in CMakePresets.json: windows-cuda-blackwell,
+# windows-cuda-blackwell-120f, windows-cuda-rtx, windows-rocm-xt,
+# windows-vulkan-xt, linux-cuda-blackwell, linux-cuda-blackwell-120f,
+# linux-cuda-rtx, linux-rocm-xt, and linux-vulkan-xt.
 
 if(NOT SONDER_WITH_LLAMA_CPP)
     return()

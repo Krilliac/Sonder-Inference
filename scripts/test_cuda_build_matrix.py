@@ -137,6 +137,7 @@ class CMakeCudaCheckConfigureTests(unittest.TestCase):
             "cmake_minimum_required(VERSION 3.21)\n"
             "project(cuda_check_unit LANGUAGES NONE)\n"
             f'list(APPEND CMAKE_MODULE_PATH "{(REPO_ROOT / "cmake").as_posix()}")\n'
+            'option(SONDER_CUDA_CHECK_TEST_MODE "test mode" ON)\n'
             "include(SonderCudaCheck)\n"
             "sonder_check_cuda_config()\n"
             'message(STATUS "GRAPHS_AFTER=${GGML_CUDA_GRAPHS}")\n',
@@ -188,6 +189,57 @@ class CMakeCudaCheckConfigureTests(unittest.TestCase):
         )
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("GGML_CUDA_GRAPHS is OFF", r.stderr)
+
+    def test_cmake_false_architectures_and_test_seam_isolation(self) -> None:
+        tk135 = _write_mock_toolkit(self.tmp / "tk135", 13, 10, 0, 0, "13.10.0.0")
+        for false_val in ("OFF", "FALSE", "NO"):
+            with self.subTest(false_val=false_val):
+                r_off = self.configure(
+                    f"-DSONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT={tk135.as_posix()}",
+                    "-DSONDER_CUDA_CHECK_MOCK_VERSION=13.5.0",
+                    f"-DCMAKE_CUDA_ARCHITECTURES={false_val}",
+                )
+                self.assertEqual(r_off.returncode, 0, r_off.stdout + r_off.stderr)
+
+        # Without SONDER_CUDA_CHECK_TEST_MODE=ON, mock seams must fail closed.
+        r_no_mode = self.configure(
+            "-DSONDER_CUDA_CHECK_TEST_MODE=OFF",
+            f"-DSONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT={tk135.as_posix()}",
+            "-DSONDER_CUDA_CHECK_MOCK_VERSION=13.5.0",
+            "-DCMAKE_CUDA_ARCHITECTURES=120a",
+        )
+        self.assertNotEqual(r_no_mode.returncode, 0)
+        self.assertIn("SONDER_CUDA_CHECK_TEST_MODE", " ".join(r_no_mode.stderr.split()))
+
+        # Real SonderInference project name must reject mock seams even with TEST_MODE=ON.
+        prod_src = self.tmp / "prod_src"
+        prod_src.mkdir()
+        (prod_src / "CMakeLists.txt").write_text(
+            "cmake_minimum_required(VERSION 3.21)\n"
+            "project(SonderInference LANGUAGES NONE)\n"
+            f'list(APPEND CMAKE_MODULE_PATH "{(REPO_ROOT / "cmake").as_posix()}")\n'
+            "include(SonderCudaCheck)\n"
+            "sonder_check_cuda_config()\n",
+            encoding="utf-8",
+        )
+        r_prod = subprocess.run(
+            [
+                self.cmake,
+                "-S",
+                str(prod_src),
+                "-B",
+                str(self.tmp / "b_prod"),
+                "-DSONDER_CUDA_CHECK_TEST_MODE=ON",
+                f"-DSONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT={tk135.as_posix()}",
+                "-DSONDER_CUDA_CHECK_MOCK_VERSION=13.5.0",
+                "-DCMAKE_CUDA_ARCHITECTURES=120a",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertNotEqual(r_prod.returncode, 0)
+        self.assertIn("test-only seam", " ".join(r_prod.stderr.split()))
 
     def test_cub_10445_cublas_13_6_0_is_refused_in_header_and_version_json(self) -> None:
         tk_hdr = _write_mock_toolkit(self.tmp / "tk_hdr", 13, 6, 0, 2, "13.6.0.2")

@@ -1,24 +1,36 @@
 # Sonder Inference - CUDA build matrix configure checks and SASS verifier (MAIN-03).
 #
-# Two modes in one module:
+# Modes:
 #
 #   1. Project configure mode:
 #        include(SonderCudaCheck)
 #        sonder_check_cuda_config()
 #      Validates when GGML_CUDA=ON (before FetchContent_MakeAvailable(llamacpp)):
-#        - CUDA Toolkit >= 13.4 (13.5 preferred; override with -DSONDER_ALLOW_LEGACY_CUDA=ON,
-#          subject to hard compiler/ISA floors >= 12.8 for 120a and >= 12.9 for 120f, and
-#          rejecting SM < 75 removed in CUDA 13.0).
-#        - CMAKE_CUDA_ARCHITECTURES requires architecture- or family-specific Blackwell
-#          targets (120a or 120f) so block-scaled FP4 MMA (.kind::mxf4 / .kind::mxf4nvf4)
-#          assembles; bare 120/121 targets are refused.
+#        - CUDA Toolkit >= 13.4 (13.5 preferred; cuBLAS cc 12.x NVFP4 + BIAS epilogue fix
+#          CUB-10222 and the cublasLtMatmulAlgoGetHeuristic CUDA-graph-capture fix landed in
+#          13.4; override with -DSONDER_ALLOW_LEGACY_CUDA=ON, subject to hard compiler/ISA
+#          floors >= 12.8 for 120a, >= 12.9 for 120f, and SM >= 75 on CUDA >= 13.0).
+#        - CMAKE_CUDA_ARCHITECTURES requires explicit architecture- or family-specific
+#          Blackwell targets (120a or 120f). Bare 120/121 targets are deliberately refused up
+#          front before enable_language(CUDA) (sitting on top of upstream ggml-cuda's interim
+#          post-language 12X -> 12Xa rewrite) so builds explicitly choose non-portable 120a
+#          cubins vs sm_12x family-portable 120f cubins. CMake false constants (OFF/FALSE/NO)
+#          are accepted to allow disabling automatic -gencode flags.
 #        - CMake version compatibility for 'f' family-specific targets (CMake < 3.31.8 and
 #          4.0.0..4.0.1 reject the 'f' suffix in CMakeCUDAArchitecturesValidate.cmake).
 #        - NVIDIA bug CUB-10445 guard: refuses cuBLAS 13.6.0 (CUDA 13.3 Update 1; fixed in
 #          cuBLAS patch 13.6.1 and CUDA >= 13.4) via both cublas_api.h and toolkit version.json.
 #        - GGML_CUDA_GRAPHS defaults to ON when unset and warns if explicitly disabled.
+#      Test-only seams (SONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT, SONDER_CUDA_CHECK_CMAKE_VERSION)
+#      require SONDER_CUDA_CHECK_TEST_MODE=ON and are always refused when PROJECT_NAME is
+#      SonderInference.
 #
-#   2. Script mode (-P) for post-build native SASS verification:
+#   2. Optional CTest SASS gate registration:
+#        sonder_register_cuda_sass_test(ggml-cuda)
+#      Registers `sonder.llamacpp.cuda_blackwell_sass` when CMAKE_CUDA_ARCHITECTURES contains
+#      a real Blackwell target (120a / 120f, excluding -virtual).
+#
+#   3. Script mode (-P) for post-build native SASS verification:
 #        cmake -DSONDER_CUDA_VERIFY_SASS=ON -DTARGET_BINARY=<cubin|obj|lib|exe> \
 #              [-DCUOBJDUMP_EXECUTABLE=<path>] [-DREQUIRE_FP4_MMA=ON|OFF] \
 #              -P cmake/SonderCudaCheck.cmake
@@ -114,6 +126,23 @@ option(SONDER_ALLOW_LEGACY_CUDA
     OFF)
 
 function(sonder_check_cuda_config)
+    # 0. Guard test-only seams so production SonderInference configures can never bypass checks.
+    set(_has_mock_seam OFF)
+    if((DEFINED SONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT AND NOT "${SONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT}" STREQUAL "")
+       OR (DEFINED SONDER_CUDA_CHECK_CMAKE_VERSION AND NOT "${SONDER_CUDA_CHECK_CMAKE_VERSION}" STREQUAL ""))
+        set(_has_mock_seam ON)
+    endif()
+    if(PROJECT_NAME STREQUAL "SonderInference" AND (SONDER_CUDA_CHECK_TEST_MODE OR _has_mock_seam))
+        message(FATAL_ERROR
+            "Sonder CUDA check: test-only seam (SONDER_CUDA_CHECK_TEST_MODE / MOCK_TOOLKIT_ROOT / "
+            "CMAKE_VERSION) cannot be used when configuring SonderInference.")
+    endif()
+    if(_has_mock_seam AND NOT SONDER_CUDA_CHECK_TEST_MODE)
+        message(FATAL_ERROR
+            "Sonder CUDA check: SONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT and "
+            "SONDER_CUDA_CHECK_CMAKE_VERSION require SONDER_CUDA_CHECK_TEST_MODE=ON.")
+    endif()
+
     # 1. Default GGML_CUDA_GRAPHS=ON when unset; warn if explicitly disabled.
     if(NOT DEFINED GGML_CUDA_GRAPHS AND NOT DEFINED CACHE{GGML_CUDA_GRAPHS})
         set(GGML_CUDA_GRAPHS ON CACHE BOOL "ggml: use CUDA graphs (llama.cpp only)" FORCE)
@@ -146,64 +175,72 @@ function(sonder_check_cuda_config)
                 "Sonder CUDA check: CMAKE_CUDA_ARCHITECTURES must not be empty when set.")
         endif()
 
-        set(_arch_count 0)
-        foreach(_raw_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
-            if("${_raw_arch}" STREQUAL "")
-                continue()
-            endif()
-            math(EXPR _arch_count "${_arch_count} + 1")
-            string(STRIP "${_raw_arch}" _arch)
-            if("${_arch}" STREQUAL "" OR NOT "${_arch}" STREQUAL "${_raw_arch}")
-                message(FATAL_ERROR
-                    "Sonder CUDA check: invalid CUDA architecture '${_raw_arch}' in CMAKE_CUDA_ARCHITECTURES.")
-            endif()
-
-            if(_arch MATCHES "^(native|all|all-major)$")
-                set(_has_special_arch ON)
-                set(_special_name "${_arch}")
-            elseif(_arch MATCHES "^([1-9][0-9]*)(a|f)?(-real|-virtual)?$")
-                set(_sm_num "${CMAKE_MATCH_1}")
-                set(_sm_sfx "${CMAKE_MATCH_2}")
-                if(_sm_num LESS 50 OR _sm_num GREATER 999)
+        string(TOUPPER "${CMAKE_CUDA_ARCHITECTURES}" _archs_upper)
+        if(_archs_upper MATCHES "^(OFF|FALSE|NO|N|IGNORE|NOTFOUND|.*-NOTFOUND)$")
+            # Documented CMake false constants disable CMake's automatic -gencode flags.
+        else()
+            set(_arch_count 0)
+            foreach(_raw_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+                if("${_raw_arch}" STREQUAL "")
+                    continue()
+                endif()
+                math(EXPR _arch_count "${_arch_count} + 1")
+                string(STRIP "${_raw_arch}" _arch)
+                if("${_arch}" STREQUAL "" OR NOT "${_arch}" STREQUAL "${_raw_arch}")
                     message(FATAL_ERROR
-                        "Sonder CUDA check: out-of-range CUDA architecture '${_arch}' (expected SM 50..999).")
+                        "Sonder CUDA check: invalid CUDA architecture '${_raw_arch}' in CMAKE_CUDA_ARCHITECTURES.")
                 endif()
-                list(APPEND _numeric_sms "${_sm_num}")
 
-                if(_sm_num GREATER_EQUAL 120 AND _sm_num LESS 130)
-                    if("${_sm_sfx}" STREQUAL "")
+                if(_arch MATCHES "^(native|all|all-major)$")
+                    set(_has_special_arch ON)
+                    set(_special_name "${_arch}")
+                elseif(_arch MATCHES "^([1-9][0-9]*)(a|f)?(-real|-virtual)?$")
+                    set(_sm_num "${CMAKE_MATCH_1}")
+                    set(_sm_sfx "${CMAKE_MATCH_2}")
+                    if(_sm_num LESS 50 OR _sm_num GREATER 999)
                         message(FATAL_ERROR
-                            "Sonder CUDA check: CMAKE_CUDA_ARCHITECTURES contains bare Blackwell target '${_arch}'. "
-                            "Block-scaled FP4 MMA (.kind::mxf4 / .kind::mxf4nvf4) fails to assemble on plain "
-                            "sm_${_sm_num}; use architecture-specific '${_sm_num}a' (non-portable cubin) or "
-                            "family-specific '${_sm_num}f' (requires nvcc >= 12.9 and CMake >= 3.31.8 or >= 4.0.2).")
+                            "Sonder CUDA check: out-of-range CUDA architecture '${_arch}' (expected SM 50..999).")
                     endif()
-                    set(_has_blackwell_arch ON)
-                endif()
+                    list(APPEND _numeric_sms "${_sm_num}")
 
-                if("${_sm_sfx}" STREQUAL "a")
-                    set(_has_arch_a ON)
-                elseif("${_sm_sfx}" STREQUAL "f")
-                    set(_has_arch_f ON)
+                    if(_sm_num GREATER_EQUAL 120 AND _sm_num LESS 130)
+                        if("${_sm_sfx}" STREQUAL "")
+                            message(FATAL_ERROR
+                                "Sonder CUDA check: CMAKE_CUDA_ARCHITECTURES contains bare Blackwell target '${_arch}'. "
+                                "Block-scaled FP4 MMA (.kind::mxf4 / .kind::mxf4nvf4) fails raw ptxas assembly on plain "
+                                "sm_${_sm_num}, and Sonder requires an explicit choice before enable_language(CUDA): "
+                                "use architecture-specific '${_sm_num}a' (non-portable cubin) or family-specific "
+                                "'${_sm_num}f' (requires nvcc >= 12.9 and CMake >= 3.31.8 or >= 4.0.2).")
+                        endif()
+                        set(_has_blackwell_arch ON)
+                    endif()
+
+                    if("${_sm_sfx}" STREQUAL "a")
+                        set(_has_arch_a ON)
+                    elseif("${_sm_sfx}" STREQUAL "f")
+                        set(_has_arch_f ON)
+                    endif()
+                else()
+                    message(FATAL_ERROR
+                        "Sonder CUDA check: invalid CUDA architecture '${_arch}' in CMAKE_CUDA_ARCHITECTURES.")
                 endif()
-            else()
+            endforeach()
+
+            if(_arch_count EQUAL 0)
                 message(FATAL_ERROR
-                    "Sonder CUDA check: invalid CUDA architecture '${_arch}' in CMAKE_CUDA_ARCHITECTURES.")
+                    "Sonder CUDA check: CMAKE_CUDA_ARCHITECTURES must not be empty when set.")
             endif()
-        endforeach()
-
-        if(_arch_count EQUAL 0)
-            message(FATAL_ERROR
-                "Sonder CUDA check: CMAKE_CUDA_ARCHITECTURES must not be empty when set.")
-        endif()
-        if(_has_special_arch AND _arch_count GREATER 1)
-            message(FATAL_ERROR
-                "Sonder CUDA check: special target '${_special_name}' cannot be combined with explicit "
-                "architectures in CMAKE_CUDA_ARCHITECTURES='${CMAKE_CUDA_ARCHITECTURES}'.")
+            if(_has_special_arch AND _arch_count GREATER 1)
+                message(FATAL_ERROR
+                    "Sonder CUDA check: special target '${_special_name}' cannot be combined with explicit "
+                    "architectures in CMAKE_CUDA_ARCHITECTURES='${CMAKE_CUDA_ARCHITECTURES}'.")
+            endif()
         endif()
 
         set(_eff_cmake_ver "${CMAKE_VERSION}")
-        if(DEFINED SONDER_CUDA_CHECK_CMAKE_VERSION AND NOT "${SONDER_CUDA_CHECK_CMAKE_VERSION}" STREQUAL "")
+        if(SONDER_CUDA_CHECK_TEST_MODE
+           AND DEFINED SONDER_CUDA_CHECK_CMAKE_VERSION
+           AND NOT "${SONDER_CUDA_CHECK_CMAKE_VERSION}" STREQUAL "")
             if(NOT "${SONDER_CUDA_CHECK_CMAKE_VERSION}" MATCHES "^[0-9]+\\.[0-9]+(\\.[0-9]+)?")
                 message(FATAL_ERROR
                     "Sonder CUDA check: malformed SONDER_CUDA_CHECK_CMAKE_VERSION='${SONDER_CUDA_CHECK_CMAKE_VERSION}'.")
@@ -223,13 +260,15 @@ function(sonder_check_cuda_config)
         endif()
     endif()
 
-    # 3. Discover CUDA Toolkit (supports mock toolkit root seam for offline tests).
+    # 3. Discover CUDA Toolkit (supports mock toolkit root seam in test mode only).
     set(_cuda_found OFF)
     set(_cuda_version "")
     set(_cuda_inc_dirs "")
     set(_cuda_root "")
 
-    if(DEFINED SONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT AND NOT "${SONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT}" STREQUAL "")
+    if(SONDER_CUDA_CHECK_TEST_MODE
+       AND DEFINED SONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT
+       AND NOT "${SONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT}" STREQUAL "")
         if("${SONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT}" MATCHES "\\.\\.")
             message(FATAL_ERROR
                 "Sonder CUDA check: unsafe SONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT='${SONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT}'.")
@@ -294,7 +333,8 @@ function(sonder_check_cuda_config)
         if(NOT SONDER_ALLOW_LEGACY_CUDA)
             message(FATAL_ERROR
                 "Sonder CUDA check: CUDA Toolkit ${_cuda_version} is older than required 13.4 "
-                "(13.5 preferred; cc 12.x cuBLAS BIAS-epilogue and CUDA-graph-capture fixes landed in 13.4). "
+                "(13.5 preferred; cuBLAS cc 12.x NVFP4 + BIAS epilogue fix CUB-10222 and the "
+                "cublasLtMatmulAlgoGetHeuristic CUDA-graph-capture fix landed in 13.4). "
                 "Upgrade the CUDA Toolkit, or pass -DSONDER_ALLOW_LEGACY_CUDA=ON on legacy hosts.")
         else()
             message(WARNING
@@ -401,4 +441,49 @@ function(sonder_check_cuda_config)
         "Sonder CUDA check: CUDA=${_cuda_version} (${_pref_note}) "
         "cuBLAS=${_cublas_full} (CUB-10445 clean) "
         "archs=${CMAKE_CUDA_ARCHITECTURES} graphs=${_eff_graphs}")
+endfunction()
+
+function(sonder_register_cuda_sass_test target_name)
+    if(NOT TARGET "${target_name}")
+        return()
+    endif()
+    set(_has_real_blackwell OFF)
+    if(DEFINED CMAKE_CUDA_ARCHITECTURES OR DEFINED CACHE{CMAKE_CUDA_ARCHITECTURES})
+        string(TOUPPER "${CMAKE_CUDA_ARCHITECTURES}" _archs_u)
+        if(NOT _archs_u MATCHES "^(OFF|FALSE|NO|N|IGNORE|NOTFOUND|.*-NOTFOUND)$")
+            foreach(_tok IN LISTS CMAKE_CUDA_ARCHITECTURES)
+                if(_tok MATCHES "^12[0-9][af](-real)?$")
+                    set(_has_real_blackwell ON)
+                endif()
+            endforeach()
+        endif()
+    endif()
+    if(NOT _has_real_blackwell)
+        return()
+    endif()
+
+    set(_extra_defs "")
+    if(DEFINED CUOBJDUMP_EXECUTABLE AND NOT "${CUOBJDUMP_EXECUTABLE}" STREQUAL "")
+        list(APPEND _extra_defs "-DCUOBJDUMP_EXECUTABLE=${CUOBJDUMP_EXECUTABLE}")
+    else()
+        set(_cuobj_hints "")
+        if(DEFINED CUDAToolkit_BIN_DIR AND EXISTS "${CUDAToolkit_BIN_DIR}")
+            list(APPEND _cuobj_hints "${CUDAToolkit_BIN_DIR}")
+        endif()
+        if(DEFINED ENV{CUDA_PATH} AND NOT "$ENV{CUDA_PATH}" STREQUAL "")
+            list(APPEND _cuobj_hints "$ENV{CUDA_PATH}/bin")
+        endif()
+        find_program(_sonder_sass_cuobj NAMES cuobjdump HINTS ${_cuobj_hints})
+        if(_sonder_sass_cuobj)
+            list(APPEND _extra_defs "-DCUOBJDUMP_EXECUTABLE=${_sonder_sass_cuobj}")
+        endif()
+    endif()
+
+    add_test(NAME sonder.llamacpp.cuda_blackwell_sass
+        COMMAND "${CMAKE_COMMAND}"
+            -DSONDER_CUDA_VERIFY_SASS=ON
+            "-DTARGET_BINARY=$<TARGET_FILE:${target_name}>"
+            ${_extra_defs}
+            -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SonderCudaCheck.cmake")
+    set_tests_properties(sonder.llamacpp.cuda_blackwell_sass PROPERTIES TIMEOUT 180)
 endfunction()

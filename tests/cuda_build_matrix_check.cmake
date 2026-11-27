@@ -172,6 +172,7 @@ file(WRITE "${mini_src}/CMakeLists.txt"
     "cmake_minimum_required(VERSION 3.21)\n"
     "project(sonder_cuda_check_mini LANGUAGES NONE)\n"
     "list(APPEND CMAKE_MODULE_PATH \"${SOURCE_DIR}/cmake\")\n"
+    "option(SONDER_CUDA_CHECK_TEST_MODE \"test mode\" ON)\n"
     "include(SonderCudaCheck)\n"
     "sonder_check_cuda_config()\n"
     "message(STATUS \"MINI_GRAPHS=\${GGML_CUDA_GRAPHS}\")\n")
@@ -246,6 +247,32 @@ expect_configure(ON "SONDER_ALLOW_LEGACY_CUDA=ON"
     "-DSONDER_ALLOW_LEGACY_CUDA=ON"
     "-DCMAKE_CUDA_ARCHITECTURES=120a")
 
+# CMake false constants (OFF / FALSE) disable automatic -gencode flags and must pass.
+expect_configure(ON "archs=OFF"
+    "-DSONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT=${tk_135}"
+    "-DSONDER_CUDA_CHECK_MOCK_VERSION=13.5.0"
+    "-DCMAKE_CUDA_ARCHITECTURES=OFF")
+
+expect_configure(ON "archs=FALSE"
+    "-DSONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT=${tk_135}"
+    "-DSONDER_CUDA_CHECK_MOCK_VERSION=13.5.0"
+    "-DCMAKE_CUDA_ARCHITECTURES=FALSE")
+
+# GGML_CUDA_GRAPHS=OFF emits an explicit warning.
+expect_configure(ON "MINI_GRAPHS=OFF.*GGML_CUDA_GRAPHS is OFF"
+    "-DSONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT=${tk_135}"
+    "-DSONDER_CUDA_CHECK_MOCK_VERSION=13.5.0"
+    "-DCMAKE_CUDA_ARCHITECTURES=120a"
+    "-DGGML_CUDA_GRAPHS=OFF")
+
+# cublas_api.h vs version.json version mismatch emits a warning when neither is 13.6.0.
+set(tk_vj_mismatch "${WORK_DIR}/tk_vj_mismatch")
+write_mock_toolkit("${tk_vj_mismatch}" 13 7 0 27 "13.8.0.0")
+expect_configure(ON "cublas_api\\.h reports 13\\.7\\.0\\.27 while .* reports libcublas 13\\.8\\.0\\.0"
+    "-DSONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT=${tk_vj_mismatch}"
+    "-DSONDER_CUDA_CHECK_MOCK_VERSION=13.4.1"
+    "-DCMAKE_CUDA_ARCHITECTURES=120a")
+
 # Negative cases:
 expect_configure(OFF "older than required 13\\.4"
     "-DSONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT=${tk_133_patched}"
@@ -307,6 +334,52 @@ expect_configure(OFF "invalid CUDA architecture"
     "-DSONDER_CUDA_CHECK_MOCK_VERSION=13.5.0"
     "-DCMAKE_CUDA_ARCHITECTURES=-1")
 
+expect_configure(OFF "removed in CUDA 13"
+    "-DSONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT=${tk_135}"
+    "-DSONDER_CUDA_CHECK_MOCK_VERSION=13.5.0"
+    "-DCMAKE_CUDA_ARCHITECTURES=61")
+
+expect_configure(OFF ">= 12\\.8"
+    "-DSONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT=${tk_134}"
+    "-DSONDER_CUDA_CHECK_MOCK_VERSION=12.7.0"
+    "-DSONDER_ALLOW_LEGACY_CUDA=ON"
+    "-DCMAKE_CUDA_ARCHITECTURES=120a")
+
+expect_configure(OFF "cannot be combined"
+    "-DSONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT=${tk_135}"
+    "-DSONDER_CUDA_CHECK_MOCK_VERSION=13.5.0"
+    "-DCMAKE_CUDA_ARCHITECTURES=native\\;120a")
+
+# Test seams must fail closed without SONDER_CUDA_CHECK_TEST_MODE=ON, and must
+# always fail closed when PROJECT_NAME is SonderInference.
+expect_configure(OFF "SONDER_CUDA_CHECK_TEST_MODE"
+    "-DSONDER_CUDA_CHECK_TEST_MODE=OFF"
+    "-DSONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT=${tk_135}"
+    "-DSONDER_CUDA_CHECK_MOCK_VERSION=13.5.0"
+    "-DCMAKE_CUDA_ARCHITECTURES=120a")
+
+set(prod_src "${WORK_DIR}/prod_src")
+file(MAKE_DIRECTORY "${prod_src}")
+file(WRITE "${prod_src}/CMakeLists.txt"
+    "cmake_minimum_required(VERSION 3.21)\n"
+    "project(SonderInference LANGUAGES NONE)\n"
+    "list(APPEND CMAKE_MODULE_PATH \"${SOURCE_DIR}/cmake\")\n"
+    "include(SonderCudaCheck)\n"
+    "sonder_check_cuda_config()\n")
+execute_process(
+    COMMAND "${CMAKE_COMMAND}" -S "${prod_src}" -B "${WORK_DIR}/b_prod_seam"
+        "-DSONDER_CUDA_CHECK_TEST_MODE=ON"
+        "-DSONDER_CUDA_CHECK_MOCK_TOOLKIT_ROOT=${tk_135}"
+        "-DSONDER_CUDA_CHECK_MOCK_VERSION=13.5.0"
+        "-DCMAKE_CUDA_ARCHITECTURES=120a"
+    RESULT_VARIABLE prod_seam_rc
+    OUTPUT_VARIABLE prod_seam_out
+    ERROR_VARIABLE prod_seam_err
+    TIMEOUT 60)
+if(prod_seam_rc EQUAL 0 OR NOT "${prod_seam_out}\n${prod_seam_err}" MATCHES "test-only seam")
+    message(FATAL_ERROR "SonderInference project failed to reject test seam:\n${prod_seam_out}\n${prod_seam_err}")
+endif()
+
 # ---------------------------------------------------------------------------
 # 3. Verify src/backends/llamacpp/CMakeLists.txt invokes sonder_check_cuda_config()
 #    before FetchContent_MakeAvailable(llamacpp)
@@ -332,6 +405,7 @@ file(WRITE "${hook_src}/CMakeLists.txt"
     "cmake_minimum_required(VERSION 3.21)\n"
     "project(sonder_llamacpp_hook_mini LANGUAGES NONE)\n"
     "list(APPEND CMAKE_MODULE_PATH \"${SOURCE_DIR}/cmake\")\n"
+    "set(SONDER_CUDA_CHECK_TEST_MODE ON)\n"
     "set(SONDER_WITH_LLAMA_CPP ON)\n"
     "set(GGML_CUDA ON)\n"
     "${llamacpp_prefix}\n")
@@ -420,5 +494,56 @@ expect_sass(ON "REQUIRE_FP4_MMA=OFF"
     "-DTARGET_BINARY=${fake_bin}" "-DCUOBJDUMP_EXECUTABLE=${cuobj_no_omma}" "-DREQUIRE_FP4_MMA=OFF")
 expect_sass(OFF "TARGET_BINARY"
     "-DTARGET_BINARY=${WORK_DIR}/does_not_exist.cubin" "-DCUOBJDUMP_EXECUTABLE=${cuobj_120a}")
+
+# ---------------------------------------------------------------------------
+# 5. Automatic CTest SASS registration (sonder_register_cuda_sass_test)
+# ---------------------------------------------------------------------------
+set(llamacpp_tests_cmake "${SOURCE_DIR}/src/backends/llamacpp/tests/CMakeLists.txt")
+file(READ "${llamacpp_tests_cmake}" llamacpp_tests_text)
+string(FIND "${llamacpp_tests_text}" "sonder_register_cuda_sass_test(ggml-cuda)" idx_sass_reg)
+if(idx_sass_reg EQUAL -1)
+    message(FATAL_ERROR "src/backends/llamacpp/tests/CMakeLists.txt must call sonder_register_cuda_sass_test(ggml-cuda)")
+endif()
+
+set(sass_reg_src "${WORK_DIR}/sass_reg_src")
+file(MAKE_DIRECTORY "${sass_reg_src}")
+file(WRITE "${sass_reg_src}/CMakeLists.txt"
+    "cmake_minimum_required(VERSION 3.21)\n"
+    "project(sass_reg_mini LANGUAGES NONE)\n"
+    "enable_testing()\n"
+    "list(APPEND CMAKE_MODULE_PATH \"${SOURCE_DIR}/cmake\")\n"
+    "include(SonderCudaCheck)\n"
+    "add_library(ggml-cuda STATIC IMPORTED)\n"
+    "set_target_properties(ggml-cuda PROPERTIES IMPORTED_LOCATION \"${fake_bin}\")\n"
+    "sonder_register_cuda_sass_test(ggml-cuda)\n")
+
+execute_process(
+    COMMAND "${CMAKE_COMMAND}" -S "${sass_reg_src}" -B "${WORK_DIR}/b_sass_reg_on"
+        "-DCMAKE_CUDA_ARCHITECTURES=86;89;120a"
+        "-DCUOBJDUMP_EXECUTABLE=${cuobj_120a}"
+    RESULT_VARIABLE sr_on_rc OUTPUT_VARIABLE sr_on_out ERROR_VARIABLE sr_on_err TIMEOUT 60)
+if(NOT sr_on_rc EQUAL 0)
+    message(FATAL_ERROR "sass_reg_mini (120a) configure failed:\n${sr_on_out}\n${sr_on_err}")
+endif()
+execute_process(
+    COMMAND "${CMAKE_CTEST_COMMAND}" --test-dir "${WORK_DIR}/b_sass_reg_on" -R "^sonder\\.llamacpp\\.cuda_blackwell_sass$" -V
+    RESULT_VARIABLE sr_run_rc OUTPUT_VARIABLE sr_run_out ERROR_VARIABLE sr_run_err TIMEOUT 60)
+if(NOT sr_run_rc EQUAL 0 OR NOT "${sr_run_out}" MATCHES "native Blackwell SASS verified")
+    message(FATAL_ERROR "registered sonder.llamacpp.cuda_blackwell_sass test did not run/pass:\n${sr_run_out}\n${sr_run_err}")
+endif()
+
+execute_process(
+    COMMAND "${CMAKE_COMMAND}" -S "${sass_reg_src}" -B "${WORK_DIR}/b_sass_reg_off"
+        "-DCMAKE_CUDA_ARCHITECTURES=86;89"
+    RESULT_VARIABLE sr_off_rc OUTPUT_VARIABLE sr_off_out ERROR_VARIABLE sr_off_err TIMEOUT 60)
+if(NOT sr_off_rc EQUAL 0)
+    message(FATAL_ERROR "sass_reg_mini (86;89) configure failed:\n${sr_off_out}\n${sr_off_err}")
+endif()
+execute_process(
+    COMMAND "${CMAKE_CTEST_COMMAND}" --test-dir "${WORK_DIR}/b_sass_reg_off" -N
+    RESULT_VARIABLE sr_list_rc OUTPUT_VARIABLE sr_list_out ERROR_VARIABLE sr_list_err TIMEOUT 60)
+if("${sr_list_out}" MATCHES "cuda_blackwell_sass")
+    message(FATAL_ERROR "sonder.llamacpp.cuda_blackwell_sass should not register without a real Blackwell target:\n${sr_list_out}")
+endif()
 
 message(STATUS "cuda_build_matrix_check: ok")
