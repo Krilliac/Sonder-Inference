@@ -460,6 +460,7 @@ endif()
 # Core adapter: sonder::inference::Backend implementation compiled into the
 # core library, which links the wrapper.
 sonder_module_sources(${CMAKE_CURRENT_SOURCE_DIR}/llamacpp_core_backend.cpp)
+sonder_module_sources(${CMAKE_CURRENT_SOURCE_DIR}/tool_grammar_preflight.cpp)
 sonder_module_include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 sonder_module_define(SONDER_HAS_LLAMACPP_BACKEND)
 target_link_libraries(sonder_inference PRIVATE sonder_backend_llamacpp)

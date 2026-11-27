@@ -30,10 +30,12 @@
 #endif
 
 #include "common/diag_log.hpp"
+#include "common/sha256.hpp"
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include "sonder/inference/backends/llamacpp.hpp"
 #include "sonder/inference/json.hpp"
 #include "llamacpp_internal.hpp"
+#include "tool_grammar_preflight.hpp"
 
 #if defined(SONDER_HAS_LLAMASERVER_BACKEND)
 #  include "backends/llamaserver/gpu_memory.hpp"
@@ -814,7 +816,9 @@ public:
           load_ns_(MsToNs(load_ms)),
           slots_(std::max<std::uint32_t>(1u, slots)),
           runtime_state_(std::move(runtime_state)),
-          runtime_model_id_(runtime_model_id) {
+          runtime_model_id_(runtime_model_id),
+          chat_template_id_(detail::sha256_hex(runtime_.ChatTemplate())),
+          tool_grammar_preflight_(llamacpp_detail::MakeLlamaCppToolGrammarCompiler(runtime_)) {
         // The chat template is fixed once the model is loaded, so decide here
         // rather than under mutex_, which is held for a whole generation.
         std::string ignored;
@@ -1053,6 +1057,13 @@ public:
                           "num_ctx " + std::to_string(request.sampling.num_ctx) +
                               " exceeds the loaded llama.cpp context (" + std::to_string(desc_.context_length) +
                               "); reload with a larger context_length");
+        }
+        if (!request.tools.empty() &&
+            !(request.tool_choice.has_value() && request.tool_choice->mode == ToolChoiceMode::none)) {
+            const auto preflight = tool_grammar_preflight_.Preflight(chat_template_id_, request.tools);
+            if (!preflight.ok) {
+                return preflight.to_status();
+            }
         }
         const bool concurrent_batch = (slots_ > 1u);
         std::shared_lock<std::shared_mutex> shared_guard;
@@ -1390,6 +1401,8 @@ private:
     std::uint32_t slots_ = 1;
     std::shared_ptr<RuntimeState> runtime_state_;
     std::uint64_t runtime_model_id_ = 0;
+    std::string chat_template_id_;
+    llamacpp_detail::ToolGrammarPreflight tool_grammar_preflight_;
     bool native_chat_ = false;  // set in the constructor, read-only afterwards
     mutable std::shared_mutex mutex_;
 };
