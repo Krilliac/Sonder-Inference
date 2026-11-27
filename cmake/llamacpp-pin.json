@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "default_track": "mainline",
+  "tracks": {
+    "mainline": {
+      "repository": "https://github.com/ggml-org/llama.cpp",
+      "tag": "v1.0.0",
+      "commit": "b1b770d90d94cad9e9ea5b993bdbc383a522fb28",
+      "url": "https://github.com/ggml-org/llama.cpp/archive/refs/tags/v1.0.0.tar.gz",
+      "sha256": "3f5f750e36326aea4d65c7623e7d597a33e395d65f4d76e5e0532171f252532b",
+      "expected_features": [
+        "SONDER_LLAMACPP_HAS_MTP",
+        "SONDER_LLAMACPP_HAS_NEXTN_LAYER_OFFSET",
+        "SONDER_LLAMACPP_HAS_CTX_OTHER",
+        "SONDER_LLAMACPP_HAS_MOE_CACHE_SIZE",
+        "SONDER_LLAMACPP_HAS_GGML_F8_E4M3"
+      ]
+    }
+  }
+}
