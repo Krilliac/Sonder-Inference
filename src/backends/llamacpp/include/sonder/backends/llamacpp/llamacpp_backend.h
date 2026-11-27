@@ -321,6 +321,10 @@ struct SamplingParams {
     // request fails with kInvalidArgument. This deliberately diverges from llama-server, which
     // silently skips such texts. Resolved once per request.
     std::vector<std::string> preserved_tokens;
+    // Tokens pre-accepted into a non-lazy grammar before generation (for example the generation
+    // prompt already present in the prompt). Requires a non-lazy grammar. If the grammar rejects
+    // one, it is rebuilt once without the prefill and a warning is logged.
+    std::vector<Token> grammar_prefill;
     bool compute_logprobs = false;     // compute exact log-softmax logprob for each emitted token
     std::int32_t top_logprobs = 0;     // number of top alternative logprobs (0..kMaxTopLogprobs)
 };
