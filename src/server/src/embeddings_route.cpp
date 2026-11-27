@@ -1,4 +1,4 @@
-﻿#include "embeddings_route.hpp"
+#include "embeddings_route.hpp"
 
 #include <algorithm>
 #include <cstdint>
