@@ -559,6 +559,10 @@ Status validate_options(const ServerOptions& o) {
     if (o.capture_text && o.token.empty()) {
         return Status(ErrorCode::invalid_argument, "--capture-text exports generated text and requires --token-file");
     }
+    if (o.text_capture != TextCapturePolicy::off && o.token.empty()) {
+        return Status(ErrorCode::invalid_argument, std::string("--text-capture ") + to_string(o.text_capture) +
+                                                       " exports telemetry text and requires --token-file");
+    }
     const std::string backend_name = o.backend_instance ? o.backend_instance->name() : o.backend.backend;
     if (!o.backend_instance) {
         const std::vector<std::string> names = available_backend_names();

@@ -49,6 +49,7 @@ add_library(sonder_inference
     src/engine/sampling_config.cpp
     src/devices/device.cpp
     src/telemetry/telemetry.cpp
+    src/telemetry/text_capture.cpp
     src/sessions/session.cpp
     src/engine/engine.cpp
     src/engine/request_runtime.cpp
@@ -58,6 +59,13 @@ add_library(sonder_inference
     src/net/http_client.cpp
 )
 add_library(sonder::inference ALIAS sonder_inference)
+# Handle-anchored no-follow file opens (src/common/safe_file.hpp), shared by the weight
+# manifests (src/artifacts) and the Ollama model store (src/models).
+if(WIN32)
+    target_sources(sonder_inference PRIVATE src/common/safe_file_win32.cpp)
+else()
+    target_sources(sonder_inference PRIVATE src/common/safe_file_posix.cpp)
+endif()
 
 target_include_directories(sonder_inference
     PUBLIC  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
@@ -76,7 +84,8 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(sonder_inference PUBLIC Threads::Threads)
 if(WIN32)
-    target_link_libraries(sonder_inference PRIVATE ws2_32 advapi32)
+    # ntdll: NtCreateFile for handle-relative opens (src/common/safe_file_win32.cpp).
+    target_link_libraries(sonder_inference PRIVATE ws2_32 advapi32 ntdll)
     target_compile_definitions(sonder_inference PRIVATE _WIN32_WINNT=0x0A00)
 elseif(UNIX AND NOT APPLE)
     target_link_libraries(sonder_inference PRIVATE ${CMAKE_DL_LIBS})
@@ -94,6 +103,12 @@ endif()
 if(SONDER_BUILD_TESTS)
     enable_testing()
     include(SonderDoctest)
+    # Test-only seams in src/common/safe_file.* and src/models (a weak-identity switch, a
+    # directory-entry counter, a hash-slot hook). They live in the library's own sources, so they
+    # are compiled in whenever the test suite is built (SONDER_BUILD_TESTS defaults to ON for a
+    # top-level build, release and CI presets included); a library built with
+    # -DSONDER_BUILD_TESTS=OFF contains none of them. Store contents cannot reach them.
+    target_compile_definitions(sonder_inference PUBLIC SONDER_INFERENCE_TEST_HOOKS=1)
 endif()
 
 # Optional modules, each owned by its own work stream (docs/MODULES.md).
@@ -108,6 +123,8 @@ set(SONDER_MODULE_DIRS
     src/backends/ollama
     src/backends/llamaserver
     src/artifacts
+    src/models
+    src/worker
     src/server
     bench)
 foreach(module_dir IN LISTS SONDER_MODULE_DIRS)
