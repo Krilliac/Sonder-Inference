@@ -2658,10 +2658,15 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
             ckpt_cfg.cache_ram_mb = options.cache_ram_mib;
             impl_->checkpoint_config = SanitizeConfig(ckpt_cfg);
             const bool runtime_stateful = llama_model_is_hybrid(model) || llama_model_is_recurrent(model);
+#if defined(SONDER_LLAMACPP_HAS_SWA_FULL)
+            const bool swa_full_active = cp.swa_full;
+#else
+            const bool swa_full_active = false;
+#endif
             impl_->checkpoint_mode = ClassifyCheckpointMode(
-                {}, model_n_swa > 0,
+                {}, model_n_swa > 0 && !swa_full_active,
                 runtime_stateful || (impl_->architecture != sonder::inference::ModelArchitecture::attention_only),
-                impl_->checkpoint_config);
+                impl_->checkpoint_config, swa_full_active);
             const HostCacheBudgetSplit host_budget =
                 SplitHostCacheBudget(impl_->checkpoint_config.cache_ram_mb, impl_->checkpoint_mode);
             impl_->checkpoint_host_tier.Configure(host_budget.checkpoint_bytes,

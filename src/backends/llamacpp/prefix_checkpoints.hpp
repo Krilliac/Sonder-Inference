@@ -103,10 +103,14 @@ struct PrefixCheckpointConfig {
 
 // `runtime_stateful` is the answer of `llama_model_is_hybrid(model) ||
 // llama_model_is_recurrent(model)` when the caller has a loaded model; it wins
-// over metadata when set. `sliding_window` is true for SWA models.
+// over metadata when set. `sliding_window` is true for SWA models; `swa_full`
+// is true when the context retains full-context SWA KV (`cp.swa_full = true`,
+// e.g. `SwaKvMode::Full`), in which case `llama_memory_seq_rm` rolls SWA back
+// directly without checkpoints (matching llama.cpp v1.0.0
+// `tools/server/server-context.cpp:1439,4425-4428`).
 [[nodiscard]] CheckpointMode ClassifyCheckpointMode(const sonder::inference::ModelMetadata& metadata,
                                                     bool sliding_window, std::optional<bool> runtime_stateful,
-                                                    const PrefixCheckpointConfig& cfg);
+                                                    const PrefixCheckpointConfig& cfg, bool swa_full = false);
 
 [[nodiscard]] std::uint32_t SpacingFor(CheckpointMode mode, const PrefixCheckpointConfig& cfg) noexcept;
 

@@ -113,14 +113,15 @@ sonder::inference::ModelArchitecture DetectCheckpointArchitecture(const sonder::
 }
 
 CheckpointMode ClassifyCheckpointMode(const sonder::inference::ModelMetadata& metadata, bool sliding_window,
-                                      std::optional<bool> runtime_stateful, const PrefixCheckpointConfig& cfg) {
+                                      std::optional<bool> runtime_stateful, const PrefixCheckpointConfig& cfg,
+                                      bool swa_full) {
     if (!cfg.enabled) return CheckpointMode::kOff;
     const bool stateful =
         runtime_stateful.has_value()
             ? *runtime_stateful
             : DetectCheckpointArchitecture(metadata) != sonder::inference::ModelArchitecture::attention_only;
     if (stateful) return CheckpointMode::kDense;
-    if (sliding_window || cfg.force_attention_only) return CheckpointMode::kSparse;
+    if ((sliding_window && !swa_full) || cfg.force_attention_only) return CheckpointMode::kSparse;
     return CheckpointMode::kOff;
 }
 

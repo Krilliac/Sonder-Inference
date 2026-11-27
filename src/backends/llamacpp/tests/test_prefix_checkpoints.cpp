@@ -174,6 +174,47 @@ TEST_CASE("prefix checkpoints: mode selection") {
     CHECK(ToString(CheckpointMode::kOff) == "off");
 }
 
+TEST_CASE("prefix checkpoints: SWA model with swa_full gives kOff and keeps full radix budget") {
+    const auto cfg = BaseConfig();
+    const ModelMetadata gemma_swa{{"general.architecture", "gemma3"}, {"gemma3.attention.sliding_window", "1024"}};
+    const ModelMetadata hybrid{{"general.architecture", "qwen35"}};
+
+    // Default SwaKvMode::Full (`swa_full = true`): llama_memory_seq_rm rolls
+    // SWA back directly, so checkpoints are kOff and 100% of cache_ram_mb stays
+    // in the L2 radix cache.
+    const CheckpointMode full_mode = ClassifyCheckpointMode(gemma_swa, /*sliding_window=*/true, std::nullopt, cfg,
+                                                            /*swa_full=*/true);
+    CHECK(full_mode == CheckpointMode::kOff);
+    CHECK(SpacingFor(full_mode, cfg) == 0u);
+    CHECK(PlanCheckpointPositions(0, 8192, full_mode, cfg).empty());
+    const HostCacheBudgetSplit full_budget = SplitHostCacheBudget(1024, full_mode);
+    CHECK(full_budget.checkpoint_bytes == 0u);
+    CHECK(full_budget.radix_bytes == (std::size_t{1024} << 20));
+
+    // Compact SWA (`swa_full = false`): keeps kSparse checkpoints and splits
+    // host budget.
+    const CheckpointMode compact_mode = ClassifyCheckpointMode(gemma_swa, /*sliding_window=*/true, std::nullopt, cfg,
+                                                               /*swa_full=*/false);
+    CHECK(compact_mode == CheckpointMode::kSparse);
+    CHECK(SpacingFor(compact_mode, cfg) == 2048u);
+    CHECK_FALSE(PlanCheckpointPositions(0, 8192, compact_mode, cfg).empty());
+    const HostCacheBudgetSplit compact_budget = SplitHostCacheBudget(1024, compact_mode);
+    CHECK(compact_budget.checkpoint_bytes == (std::size_t{128} << 20));
+    CHECK(compact_budget.radix_bytes == (std::size_t{896} << 20));
+
+    // Hybrid/recurrent models still get kDense even when swa_full is true.
+    CHECK(ClassifyCheckpointMode(hybrid, /*sliding_window=*/true, std::nullopt, cfg, /*swa_full=*/true) ==
+          CheckpointMode::kDense);
+    CHECK(ClassifyCheckpointMode(gemma_swa, /*sliding_window=*/true, /*runtime_stateful=*/true, cfg,
+                                 /*swa_full=*/true) == CheckpointMode::kDense);
+
+    // Explicit force_attention_only still enables kSparse even when swa_full is true.
+    auto forced = cfg;
+    forced.force_attention_only = true;
+    CHECK(ClassifyCheckpointMode(gemma_swa, /*sliding_window=*/true, std::nullopt, forced, /*swa_full=*/true) ==
+          CheckpointMode::kSparse);
+}
+
 // ---------------------------------------------------------------------------
 // Placement
 // ---------------------------------------------------------------------------
