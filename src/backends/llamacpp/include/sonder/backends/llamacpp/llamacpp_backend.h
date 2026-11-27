@@ -393,6 +393,10 @@ struct SamplingParams {
     // request fails with kInvalidArgument. This deliberately diverges from llama-server, which
     // silently skips such texts. Resolved once per request.
     std::vector<std::string> preserved_tokens;
+    // JSON Schema text (normalised by the caller) enforced through llguidance instead of `grammar`.
+    // Needs a build with SONDER_WITH_LLGUIDANCE=ON: otherwise the request fails with
+    // kInvalidArgument rather than running unconstrained. Cannot be combined with grammar_lazy.
+    std::string llguidance_json_schema;
     // Tokens pre-accepted into a non-lazy grammar before generation (for example the generation
     // prompt already present in the prompt). Requires a non-lazy grammar. If the grammar rejects
     // one (out of range, or masked by the grammar, which includes end-of-generation tokens), it is

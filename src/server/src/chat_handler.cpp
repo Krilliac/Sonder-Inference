@@ -16,6 +16,10 @@
 #include "reasoning_budget.hpp"
 #include "test_hooks.hpp"
 #include "tool_call_parser.hpp"
+#ifdef SONDER_LLAMACPP_HAS_LLGUIDANCE
+#include "json_schema_normalize.hpp"
+#include "llguidance_sampler.hpp"
+#endif
 
 namespace sonder::inference::server::detail {
 
@@ -54,6 +58,60 @@ std::string bounded_model_label(std::string_view text) {
     return sanitize_bounded_evidence_string(text, kMaxEvidenceStringBytes);
 }
 
+#ifdef SONDER_LLAMACPP_HAS_LLGUIDANCE
+bool backend_uses_llguidance_json_schema(const ChatJob& job, bool backend_supports_structured_output,
+                                         std::string_view backend_name) noexcept {
+    return backend_supports_structured_output && backend_name == "llamacpp" &&
+           sonder::backends::llamacpp::LlguidanceAvailable() &&
+           job.response_format_type.has_value() && *job.response_format_type == "json_schema";
+}
+
+std::optional<ApiError> prepare_llguidance_chat_schema(ChatJob& job, bool backend_native_tools,
+                                                       const StructuredGrammarEngine& engine) {
+    const bool tool_choice_none = job.tool_choice && job.tool_choice->mode == ToolChoiceMode::none;
+    if (!job.tools.empty() && !tool_choice_none && !backend_native_tools) {
+        if (Status st = validate_strict_tool_schemas(job.tools, job.tool_choice, engine); !st.ok()) {
+            return make_error(400, st.code() == ErrorCode::unsupported ? "unsupported_parameter" : "invalid_request",
+                              st.message(), "tools");
+        }
+    }
+    std::string normalized;
+    if (job.pending_response_schema) {
+        if (!job.pending_response_schema->is_object()) {
+            return make_error(400, "invalid_request",
+                              "invalid response_format: invalid response_format.json_schema.schema: schema must be a JSON object",
+                              "response_format.json_schema.schema");
+        }
+        auto norm = llamacpp_detail::NormalizeJsonSchema(*job.pending_response_schema);
+        if (!norm.ok()) {
+            return make_error(400, "invalid_request", "invalid response_format: " + norm.status().message(),
+                              "response_format.json_schema.schema");
+        }
+        normalized = norm.value().dump();
+        job.pending_response_schema = std::move(norm).value();
+    } else if (job.response_format_schema) {
+        auto norm = llamacpp_detail::NormalizeJsonSchemaText(*job.response_format_schema);
+        if (!norm.ok()) {
+            return make_error(400, "invalid_request", "invalid response_format: " + norm.status().message(),
+                              "response_format.json_schema.schema");
+        }
+        if (norm.value().empty() || norm.value().front() != '{') {
+            return make_error(400, "invalid_request",
+                              "invalid response_format: invalid response_format.json_schema.schema: schema must be a JSON object",
+                              "response_format.json_schema.schema");
+        }
+        normalized = std::move(norm).value();
+    } else {
+        return make_error(400, "invalid_request",
+                          "invalid response_format: invalid response_format.json_schema.schema: schema is missing",
+                          "response_format.json_schema.schema");
+    }
+    job.compiled_grammar.reset();
+    job.grammar.clear();
+    job.response_format_schema = std::move(normalized);
+    return std::nullopt;
+}
+#endif
 }  // namespace
 
 void emit_pre_execution_failure(TelemetryBus& bus, TelemetryContext ctx, std::string_view kind,
@@ -97,6 +155,11 @@ std::optional<ApiError> prepare_chat_grammar(
     bool backend_supports_structured_output, bool backend_native_tools,
     std::string_view backend_name, CompiledGrammarCache* cache,
     const StructuredGrammarEngine& engine) {
+#ifdef SONDER_LLAMACPP_HAS_LLGUIDANCE
+    if (backend_uses_llguidance_json_schema(job, backend_supports_structured_output, backend_name)) {
+        return prepare_llguidance_chat_schema(job, backend_native_tools, engine);
+    }
+#endif
     auto resolved = resolve_structured_grammar(
         "response_format.json_schema.schema", job.grammar, job.response_format_type,
         job.pending_response_schema, job.response_format_schema, job.tools, job.tool_choice,
@@ -151,7 +214,17 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     ro.requested_model = job.model;
     std::shared_ptr<const CompiledGrammar> compiled_grammar = job.compiled_grammar;
     std::string fallback_grammar = job.grammar;
-    if (!compiled_grammar && grammar_cache != nullptr &&
+#ifdef SONDER_LLAMACPP_HAS_LLGUIDANCE
+    const bool llg_candidate = backend_uses_llguidance_json_schema(job, backend_supports_structured_output, backend);
+    const bool session_has_native_chat =
+        session && session->model() && session->model()->backend_model().has_native_chat();
+    const bool native_llg = llg_candidate && session_has_native_chat;
+    const bool llg_needs_gbnf_fallback = llg_candidate && !session_has_native_chat && fallback_grammar.empty();
+#else
+    constexpr bool native_llg = false;
+    constexpr bool llg_needs_gbnf_fallback = false;
+#endif
+    if (!native_llg && !compiled_grammar && (grammar_cache != nullptr || llg_needs_gbnf_fallback) &&
         (job.response_format_type.has_value() || (!job.tools.empty() && job.tool_choice))) {
         const std::string fallback_tok =
             tokenizer_identity.empty() ? build_tokenizer_identity_key(backend, model) : std::string(tokenizer_identity);

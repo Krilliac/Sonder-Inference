@@ -116,6 +116,42 @@ No license conclusions from the initial broad web sweep are considered authorita
   than written independently, its exact repository, revision, and license must
   be verified and recorded here before adoption.
 
+### llguidance (optional, `SONDER_WITH_LLGUIDANCE=ON`)
+- repository: https://github.com/guidance-ai/llguidance
+- revision/tag: v1.0.1, commit `d795912fedc7d393de740177ea9ea761e7905774` (`parser/Cargo.toml` and
+  `toktrie/Cargo.toml` both read `version = "1.0.1"`); the same commit llama.cpp `v1.0.0` pins in
+  `common/CMakeLists.txt` for `LLAMA_LLGUIDANCE`. Pinned in `src/backends/llamacpp/CMakeLists.txt`
+  (`SONDER_LLGUIDANCE_GIT_TAG`); configure warns if the llama.cpp tree in use pins a different commit
+- evaluated: 2026-11-26, against that exact commit: `LICENSE` ("MIT License, Copyright (c)
+  Microsoft Corporation."), `license = "MIT"` in `parser/Cargo.toml` (crate `llguidance`) and
+  `toktrie/Cargo.toml`, and `cargo metadata` of the crates one `cargo build --release --package
+  llguidance` compiles on x86_64-pc-windows-msvc
+- license: MIT. Its Rust dependency closure is 48 crates (including `llguidance` and `toktrie`
+  themselves), every one permissively licensed. By SPDX expression: 32 `MIT OR Apache-2.0`,
+  7 `MIT` (`llguidance`, `toktrie`, `derivre`, `referencing`, `fluent-uri`, `strum`,
+  `strum_macros`), 2 `Zlib OR Apache-2.0 OR MIT`, 2 `Apache-2.0 OR MIT`, and one each of `MIT-0`
+  (borrow-or-share), `Unlicense OR MIT` (memchr),
+  `Apache-2.0 OR BSL-1.0` (ryu), `(MIT OR Apache-2.0) AND Unicode-3.0` (unicode-ident) and
+  `BSD-2-Clause OR Apache-2.0 OR MIT` (zerocopy). The full list with versions comes from the
+  `cargo metadata` command above (check it again whenever the pin moves)
+- intended use: constrained decoding for `response_format: {type: json_schema}` in the native
+  llama.cpp backend (`llguidance_sampler.cpp` adapts llama.cpp's `common/llguidance.cpp`, MIT, to this
+  repository's sampler contract). The default build does not use it
+- linkage/process boundary: in-process static link of `llguidance.lib` / `libllguidance.a`, built by
+  `cargo build --release --package llguidance` from a `git clone` at the pinned commit, only with
+  `SONDER_WITH_LLGUIDANCE=ON` (requires `cargo` and `git`; configure fails with a clear message when
+  either is missing and the option is ON). No llguidance code is copied into this repository other
+  than the adapted sampler glue
+- notices required: include the llguidance MIT license text and Microsoft copyright notice, plus the
+  notices of the crates above, in any binary distribution built with the option ON. Not yet added to
+  `NOTICE`; do that before shipping such a binary
+- security/maintenance notes: the build downloads source from github.com and crates from crates.io at
+  build time (the commit hash pins llguidance, but not the crate versions: `cargo build` uses the
+  `Cargo.lock` committed at that commit); it is therefore opt-in and unsuitable for offline builds
+  without a prepared cargo vendor/cache. Schemas are normalised (`additionalProperties: false`) and
+  bounded (`json_schema_normalize.hpp`) before llguidance sees them
+- approved: pending: not yet reviewed by Nate; the option stays OFF by default until then
+
 ### cpp-httplib
 - repository: https://github.com/yhirose/cpp-httplib
 - revision/tag: v0.58.0 (single `httplib.h`, SHA-256 `aa14e7e7bd2703694e0a6b6855af3b8c406102ab1fc56ac905fe33619b31faa5`)

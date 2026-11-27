@@ -33,6 +33,7 @@
 #include "grammar_retry.hpp"
 #include "embed_batch_planner.hpp"
 #include "gguf_compat.hpp"
+#include "llguidance_sampler.hpp"
 #include "lora_registry.hpp"
 #include "prefix_coalescer.hpp"
 #include "radix_cache.hpp"
@@ -651,7 +652,18 @@ Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n
                                  "preserved token does not map to exactly one token id");
         }
     }
-    if (!p.grammar.empty()) {
+    if (!p.llguidance_json_schema.empty()) {
+        if (p.grammar_lazy) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "llguidance_json_schema cannot be combined with a lazy grammar");
+        }
+        std::string llg_error;
+        llama_sampler* llg = MakeLlguidanceJsonSchemaSampler(vocab, p.llguidance_json_schema, llg_error);
+        if (llg == nullptr) {
+            return Status::Error(ErrorCode::kInvalidArgument, "llguidance: " + llg_error);
+        }
+        grammar_out.reset(llg);
+    } else if (!p.grammar.empty()) {
         llama_sampler* gram = nullptr;
         if (p.grammar_lazy) {
             std::vector<const char*> patterns;

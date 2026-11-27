@@ -15,6 +15,8 @@ sonder_add_module_tests(llamacpp
     test_llamacpp_frontier.cpp
     test_llamacpp_speculative_verifier.cpp
     test_lora_registry.cpp
+    test_json_schema_normalize.cpp
+    test_llguidance_sampler.cpp
     test_slot_store.cpp
     test_tool_grammar_preflight.cpp
     test_device_health.cpp
