@@ -851,6 +851,13 @@ struct TokenLogprobInfo {
                                                           bool has_probs, Token chosen_token, std::int32_t top_k,
                                                           bool collect_candidates = true);
 
+// Extracts post-sampling telemetry probability and top-K alternatives directly
+// from a dense vocab-indexed probability vector (index == token id) in O(K)
+// memory without copying the full vocabulary into scratch storage.
+[[nodiscard]] SampledProbInfo ComputePostSamplingProbInfoFromDenseProbs(std::span<const double> probs,
+                                                                        Token chosen_token, std::int32_t top_k,
+                                                                        bool collect_candidates = true);
+
 // Validates multimodal media payloads against kMaxMediaImages (8) and
 // kMaxMediaBlobBytes (16 MiB per image), rejecting empty blobs.
 [[nodiscard]] Status ValidateMediaBlobs(const std::vector<std::vector<std::uint8_t>>& media_blobs);

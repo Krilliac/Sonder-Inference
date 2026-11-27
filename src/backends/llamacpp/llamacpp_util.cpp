@@ -807,6 +807,58 @@ SampledProbInfo ComputePostSamplingProbInfo(std::span<const CandidateLogitProb> 
     return out;
 }
 
+SampledProbInfo ComputePostSamplingProbInfoFromDenseProbs(std::span<const double> probs, Token chosen_token,
+                                                          std::int32_t top_k, bool collect_candidates) {
+    SampledProbInfo out;
+    if (probs.empty() || chosen_token < 0 || static_cast<std::size_t>(chosen_token) >= probs.size() || top_k <= 0) {
+        return out;
+    }
+    const double chosen_raw = probs[static_cast<std::size_t>(chosen_token)];
+    if (!std::isfinite(chosen_raw) || chosen_raw < 0.0) {
+        return out;
+    }
+    out.valid = true;
+    out.probability = std::clamp(static_cast<float>(chosen_raw), 0.0F, 1.0F);
+    out.post_sampling = true;
+    if (!collect_candidates) {
+        return out;
+    }
+    const std::size_t k = std::min<std::size_t>(static_cast<std::size_t>(std::min(top_k, kMaxTopLogprobs)), probs.size());
+    out.candidates.reserve(k);
+    for (std::size_t v = 0; v < probs.size(); ++v) {
+        const double raw = probs[v];
+        if (!std::isfinite(raw) || raw <= 0.0) {
+            continue;
+        }
+        const float p = std::clamp(static_cast<float>(raw), 0.0F, 1.0F);
+        if (p <= 0.0F) {
+            continue;
+        }
+        const Token tok = static_cast<Token>(v);
+        if (out.candidates.size() < k) {
+            out.candidates.emplace_back(tok, p);
+            std::size_t j = out.candidates.size() - 1;
+            while (j > 0 && (out.candidates[j].second > out.candidates[j - 1].second ||
+                             (out.candidates[j].second == out.candidates[j - 1].second &&
+                              out.candidates[j].first < out.candidates[j - 1].first))) {
+                std::swap(out.candidates[j], out.candidates[j - 1]);
+                --j;
+            }
+        } else if (p > out.candidates.back().second ||
+                   (p == out.candidates.back().second && tok < out.candidates.back().first)) {
+            out.candidates.back() = {tok, p};
+            std::size_t j = k - 1;
+            while (j > 0 && (out.candidates[j].second > out.candidates[j - 1].second ||
+                             (out.candidates[j].second == out.candidates[j - 1].second &&
+                              out.candidates[j].first < out.candidates[j - 1].first))) {
+                std::swap(out.candidates[j], out.candidates[j - 1]);
+                --j;
+            }
+        }
+    }
+    return out;
+}
+
 Status ValidateMediaBlobs(const std::vector<std::vector<std::uint8_t>>& media_blobs) {
     if (media_blobs.size() > kMaxMediaImages) {
         return Status::Error(ErrorCode::kInvalidArgument,

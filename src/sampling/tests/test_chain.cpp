@@ -308,6 +308,21 @@ TEST_CASE("top_candidates returns bounded post-sampling distribution in canonica
     CHECK(inf_res.ok());
     const auto inf_top = chain.top_candidates(5);
     CHECK_EQ(inf_top.size(), std::size_t{2});
+
+    // Large vocab with mostly banned (-inf) tail: stops cleanly at the viable prefix.
+    std::vector<float> sparse(512, -kInf);
+    sparse[100] = 3.0f;
+    sparse[42] = 1.0f;
+    SamplerConfig sc_sparse = plain(9);
+    sc_sparse.greedy = true;
+    auto sparse_chain = build_chain(sc_sparse);
+    const auto sparse_res = sparse_chain.sample(sparse);
+    CHECK(sparse_res.ok());
+    CHECK_EQ(sparse_res.token, 100);
+    const auto sparse_top = sparse_chain.top_candidates(10);
+    CHECK_EQ(sparse_top.size(), std::size_t{2});
+    CHECK_EQ(sparse_top[0].id, 100);
+    CHECK_EQ(sparse_top[1].id, 42);
     CHECK_EQ(inf_top[0].id, 1);
     CHECK_EQ(inf_top[1].id, 2);
     CHECK_NEAR(inf_top[0].p, 0.5, 1e-6);

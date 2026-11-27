@@ -544,6 +544,26 @@ TEST_CASE("llamacpp frontier: BuildPreSamplingProbInfo and ComputePostSamplingPr
     CHECK(post_greedy_no_cands.probability == doctest::Approx(post_greedy.probability).epsilon(1e-5));
     CHECK(post_greedy_no_cands.candidates.empty());
 
+    // 5. ComputePostSamplingProbInfoFromDenseProbs (zero-copy dense-vector path for StochasticRejection).
+    const std::vector<double> dense{0.0, 0.25, 0.50, 0.25, -0.1, std::numeric_limits<double>::quiet_NaN()};
+    const SampledProbInfo dense_top =
+        ComputePostSamplingProbInfoFromDenseProbs(dense, /*chosen_token=*/3, /*top_k=*/2, /*collect_candidates=*/true);
+    REQUIRE(dense_top.valid);
+    CHECK(dense_top.post_sampling);
+    CHECK(dense_top.probability == doctest::Approx(0.25F));
+    REQUIRE(dense_top.candidates.size() == 2u);
+    CHECK(dense_top.candidates[0].first == 2);
+    CHECK(dense_top.candidates[1].first == 1);  // tie between 1 and 3 broken by smaller id 1
+    const SampledProbInfo dense_scalar =
+        ComputePostSamplingProbInfoFromDenseProbs(dense, /*chosen_token=*/3, /*top_k=*/2, /*collect_candidates=*/false);
+    REQUIRE(dense_scalar.valid);
+    CHECK(dense_scalar.probability == doctest::Approx(0.25F));
+    CHECK(dense_scalar.candidates.empty());
+    CHECK_FALSE(ComputePostSamplingProbInfoFromDenseProbs(dense, -1, 2).valid);
+    CHECK_FALSE(ComputePostSamplingProbInfoFromDenseProbs(dense, 99, 2).valid);
+    CHECK_FALSE(ComputePostSamplingProbInfoFromDenseProbs(dense, 4, 2).valid);
+    CHECK_FALSE(ComputePostSamplingProbInfoFromDenseProbs(dense, 5, 2).valid);
+
     // Validate rejects out-of-range telemetry_top_k.
     SamplingParams sp;
     sp.telemetry_top_k = -1;

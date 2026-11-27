@@ -859,4 +859,65 @@ TEST_CASE("VIS-03: native llamacpp emits token probabilities and inference.sampl
         CHECK(cands[0].find("attributes")->find("probability_basis")->as_string() == "post_sampling");
         CHECK(cands[0].find("attributes")->find("candidates")->as_array().size() == 3u);
     }
+
+    SUBCASE("speculative TargetMatch path emits post_sampling probabilities and respects stride/cap") {
+        // Repeated token-1 prompt gives ngram matcher an immediate match so TargetMatch
+        // verification runs on real speculative draft batches (single-slot and multi-slot).
+        for (std::uint32_t n_slots : {1u, 2u}) {
+            LlamaCppBackend be;
+            LoadOptions lo;
+            lo.model_path = PathToUtf8(gguf_path);
+            lo.n_ctx = 64;
+            lo.n_batch = 32;
+            lo.n_gpu_layers = 0;
+            lo.n_slots = n_slots;
+            lo.spec_type = "ngram";
+            lo.spec_draft_max = 4;
+            REQUIRE_MESSAGE(be.Load(lo).ok(), "speculative load failed");
+
+            GenerateRequest req;
+            req.prompt = {1, 1, 1, 1, 1, 1, 1, 1};
+            req.max_new_tokens = 6;
+            req.sampling.temperature = 0.0F;
+            req.sampling.logit_bias = {
+                {0, -std::numeric_limits<float>::infinity()}, {1, 2.0F}, {2, 1.0F}, {3, 0.0F}};
+            req.sampling.telemetry_top_k = 3;
+            req.sampling.telemetry_candidates_stride = 2;
+            req.sampling.telemetry_candidates_max_events = 2;
+
+            std::vector<TokenEvent> events;
+            const GenerateResult r = be.Generate(req, [&](const TokenEvent& ev) {
+                if (ev.token >= 0) events.push_back(ev);
+                return true;
+            });
+            REQUIRE_MESSAGE(r.status.ok(), r.status.message);
+            CHECK(r.draft_tokens > 0);
+            CHECK(r.draft_accepted_tokens > 0);
+            REQUIRE(events.size() == 6u);
+            std::size_t non_empty_cands = 0;
+            for (const TokenEvent& ev : events) {
+                CHECK(ev.token == 1);
+                CHECK(ev.has_sampled_probability);
+                CHECK(ev.sampled_probability_post_sampling);
+                CHECK(ev.sampled_probability == doctest::Approx(p1).epsilon(1e-4));
+                if (!ev.sampled_candidates.empty()) {
+                    ++non_empty_cands;
+                    REQUIRE(ev.sampled_candidates.size() == 3u);
+                    CHECK(ev.sampled_candidates[0].first == 1);
+                    CHECK(ev.sampled_candidates[0].second == doctest::Approx(p1).epsilon(1e-4));
+                    CHECK(ev.sampled_candidates[1].first == 2);
+                    CHECK(ev.sampled_candidates[2].first == 3);
+                }
+            }
+            // Stride 2 over 6 tokens -> ordinals 0, 2, 4 eligible, capped at 2 events (ordinals 0 and 2).
+            CHECK(non_empty_cands == 2u);
+            CHECK(events[0].sampled_candidates.size() == 3u);
+            CHECK(events[1].sampled_candidates.empty());
+            CHECK(events[2].sampled_candidates.size() == 3u);
+            CHECK(events[3].sampled_candidates.empty());
+            CHECK(events[4].sampled_candidates.empty());
+            CHECK(events[5].sampled_candidates.empty());
+            be.Unload();
+        }
+    }
 }

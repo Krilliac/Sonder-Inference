@@ -1702,9 +1702,15 @@ struct LlamaCppBackend::Impl {
     // `batch_idx` (applying grammar mask + all non-terminal sampler stages in
     // `sampler`, without invoking the terminal dist/greedy selector). Used
     // only when opt-in `StochasticRejection` activates with real proposal probs.
+    // When `sp.temperature <= 0` and `out_greedy_telemetry` is provided, also
+    // populates post-processor softmax telemetry (matching non-speculative greedy
+    // semantics instead of the one-hot verification target).
     bool ExtractPostProcessorTargetProbs(int32_t batch_idx, const SamplingParams& sp, llama_sampler* sampler,
                                          llama_sampler* grammar_sampler, int32_t n_vocab,
-                                         std::vector<double>& out_probs) {
+                                         std::vector<double>& out_probs,
+                                         SampledProbInfo* out_greedy_telemetry = nullptr,
+                                         bool want_telemetry_candidates = false) {
+        if (out_greedy_telemetry != nullptr) *out_greedy_telemetry = {};
         if (ctx == nullptr || sampler == nullptr || n_vocab <= 0) {
             return false;
         }
@@ -1747,6 +1753,16 @@ struct LlamaCppBackend::Impl {
             }
             if (best_id < 0) return false;
             out_probs[static_cast<std::size_t>(best_id)] = 1.0;
+            if (out_greedy_telemetry != nullptr && sp.telemetry_top_k > 0) {
+                telemetry_candidates_scratch.resize(cur_p.size);
+                for (std::size_t i = 0; i < cur_p.size; ++i) {
+                    telemetry_candidates_scratch[i] =
+                        CandidateLogitProb{cur_p.data[i].id, cur_p.data[i].logit, cur_p.data[i].p};
+                }
+                *out_greedy_telemetry = ComputePostSamplingProbInfo(
+                    telemetry_candidates_scratch, /*has_probs=*/false, best_id, sp.telemetry_top_k,
+                    want_telemetry_candidates);
+            }
             return true;
         }
 
@@ -1812,7 +1828,10 @@ struct LlamaCppBackend::Impl {
             spec_verifier.set_mode(SpeculativeVerificationMode::StochasticRejection);
             bool grammar_accept_failed = false;
             std::size_t last_target_pos = std::numeric_limits<std::size_t>::max();
-            std::vector<double> last_target_p;
+            // Non-owning pointer to verify_sequence_lazy's p_scratch_ buffer (kept intact
+            // between get_target_dist(pos) and on_commit(pos)), avoiding a full-vocab copy.
+            const std::vector<double>* last_target_p = nullptr;
+            SampledProbInfo last_greedy_prob{};
             const sonder::inference::SpeculativeSequenceResult seq = spec_verifier.verify_sequence_lazy(
                 draft_tokens, /*has_proposal_dists=*/true,
                 [&](std::size_t pos, std::vector<double>& out_p) -> bool {
@@ -1822,11 +1841,18 @@ struct LlamaCppBackend::Impl {
                     if (grammar_accept_failed) {
                         return false;
                     }
-                    const bool ok = ExtractPostProcessorTargetProbs(static_cast<int32_t>(pos), sp, sampler,
-                                                                    grammar_sampler, n_vocab, out_p);
+                    const bool want_cands = ShouldCollectTelemetryCandidates(sp, proj_ordinal, proj_emitted);
+                    const bool capture_greedy_tel = !sp.compute_logprobs && sp.telemetry_top_k > 0 && sp.temperature <= 0.0F;
+                    const bool ok = ExtractPostProcessorTargetProbs(
+                        static_cast<int32_t>(pos), sp, sampler, grammar_sampler, n_vocab, out_p,
+                        capture_greedy_tel ? &last_greedy_prob : nullptr, want_cands);
                     if (ok && !sp.compute_logprobs && sp.telemetry_top_k > 0) {
                         last_target_pos = pos;
-                        last_target_p = out_p;
+                        last_target_p = &out_p;
+                    } else {
+                        last_target_pos = std::numeric_limits<std::size_t>::max();
+                        last_target_p = nullptr;
+                        last_greedy_prob = {};
                     }
                     return ok;
                 },
@@ -1848,25 +1874,13 @@ struct LlamaCppBackend::Impl {
                             logits != nullptr) {
                             PopulateTelemetryFromPreSampling(logits, n_vocab, committed_tok, sp, lp, want_cands);
                         }
-                    } else if (sp.telemetry_top_k > 0 && pos == last_target_pos && !last_target_p.empty()) {
-                        if (!want_cands && committed_tok >= 0 &&
-                            static_cast<std::size_t>(committed_tok) < last_target_p.size()) {
-                            const double p = last_target_p[static_cast<std::size_t>(committed_tok)];
-                            if (std::isfinite(p) && p >= 0.0) {
-                                lp.sampled_prob.valid = true;
-                                lp.sampled_prob.probability =
-                                    static_cast<float>(std::clamp(p, 0.0, 1.0));
-                                lp.sampled_prob.post_sampling = true;
-                            }
-                        } else {
-                            telemetry_candidates_scratch.resize(last_target_p.size());
-                            for (std::size_t v = 0; v < last_target_p.size(); ++v) {
-                                telemetry_candidates_scratch[v] = CandidateLogitProb{
-                                    static_cast<Token>(v), 0.0F, static_cast<float>(last_target_p[v])};
-                            }
-                            lp.sampled_prob = ComputePostSamplingProbInfo(
-                                telemetry_candidates_scratch, /*has_probs=*/true, committed_tok, sp.telemetry_top_k,
-                                want_cands);
+                    } else if (sp.telemetry_top_k > 0 && pos == last_target_pos) {
+                        if (sp.temperature <= 0.0F && last_greedy_prob.valid) {
+                            lp.sampled_prob = std::move(last_greedy_prob);
+                            last_greedy_prob = {};
+                        } else if (last_target_p != nullptr && !last_target_p->empty()) {
+                            lp.sampled_prob = ComputePostSamplingProbInfoFromDenseProbs(
+                                *last_target_p, committed_tok, sp.telemetry_top_k, want_cands);
                         }
                     }
                     if (lp.sampled_prob.valid) {
@@ -4613,7 +4627,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
     if (request.max_new_tokens == 0) return finish(StopReason::kMaxTokens);
     if (cancelled()) return finish(StopReason::kCancelled);
 
-    auto emit_token = [&](Token tok, const TokenLogprobInfo& lp, bool& keep_going) -> Status {
+    auto emit_token = [&](Token tok, TokenLogprobInfo&& lp, bool& keep_going) -> Status {
         std::string piece;
         if (Status s = owner.load(std::memory_order_acquire)->TokenToPiece(tok, piece); !s.ok()) return s;
         TokenEvent ev;
@@ -4623,13 +4637,13 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         if (lp.valid) {
             ev.has_logprob = true;
             ev.logprob = lp.logprob;
-            ev.top_logprobs = lp.top_logprobs;
+            ev.top_logprobs = std::move(lp.top_logprobs);
         }
         if (lp.sampled_prob.valid) {
             ev.has_sampled_probability = true;
             ev.sampled_probability = lp.sampled_prob.probability;
             ev.sampled_probability_post_sampling = lp.sampled_prob.post_sampling;
-            ev.sampled_candidates = lp.sampled_prob.candidates;
+            ev.sampled_candidates = std::move(lp.sampled_prob.candidates);
             if (!ev.text.empty()) {
                 ++telemetry_token_ordinal;
                 if (!ev.sampled_candidates.empty()) ++telemetry_candidates_emitted;
@@ -4652,7 +4666,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
     if (llama_vocab_is_eog(vocab, cur_tok)) return finish(StopReason::kEndOfGeneration);
     {
         bool keep_going = true;
-        if (Status s = emit_token(cur_tok, first_lp, keep_going); !s.ok()) {
+        if (Status s = emit_token(cur_tok, std::move(first_lp), keep_going); !s.ok()) {
             result.status = s;
             return finish(StopReason::kError);
         }
@@ -4940,7 +4954,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
             if (llama_vocab_is_eog(vocab, next_tok)) return finish(StopReason::kEndOfGeneration);
 
             bool keep_going = true;
-            if (Status s = emit_token(next_tok, step_lp, keep_going); !s.ok()) {
+            if (Status s = emit_token(next_tok, std::move(step_lp), keep_going); !s.ok()) {
                 result.status = s;
                 return finish(StopReason::kError);
             }
@@ -5074,7 +5088,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                 return finish(StopReason::kEndOfGeneration);
             }
             bool keep_going = true;
-            if (Status s = emit_token(tok, accepted_lps[m], keep_going); !s.ok()) {
+            if (Status s = emit_token(tok, std::move(accepted_lps[m]), keep_going); !s.ok()) {
                 (void)rollback_rejected(new_pos, committed_drafts);
                 result.status = s;
                 return finish(StopReason::kError);
@@ -5499,7 +5513,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 #endif
     };
 
-    auto emit_slot_token = [&](ActiveBatchSlot& s, Token tok, const TokenLogprobInfo& lp, bool& keep_going) -> Status {
+    auto emit_slot_token = [&](ActiveBatchSlot& s, Token tok, TokenLogprobInfo&& lp, bool& keep_going) -> Status {
         std::string piece;
         if (Status st = owner.load(std::memory_order_acquire)->TokenToPiece(tok, piece); !st.ok()) return st;
         TokenEvent ev;
@@ -5509,13 +5523,13 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         if (lp.valid) {
             ev.has_logprob = true;
             ev.logprob = lp.logprob;
-            ev.top_logprobs = lp.top_logprobs;
+            ev.top_logprobs = std::move(lp.top_logprobs);
         }
         if (lp.sampled_prob.valid) {
             ev.has_sampled_probability = true;
             ev.sampled_probability = lp.sampled_prob.probability;
             ev.sampled_probability_post_sampling = lp.sampled_prob.post_sampling;
-            ev.sampled_candidates = lp.sampled_prob.candidates;
+            ev.sampled_candidates = std::move(lp.sampled_prob.candidates);
             if (!ev.text.empty()) {
                 ++s.telemetry_token_ordinal;
                 if (!ev.sampled_candidates.empty()) ++s.telemetry_candidates_emitted;
@@ -6308,7 +6322,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                         continue;
                     }
                     bool keep_going = true;
-                    if (Status st = emit_slot_token(s, first_tok, first_lp, keep_going); !st.ok()) {
+                    if (Status st = emit_slot_token(s, first_tok, std::move(first_lp), keep_going); !st.ok()) {
                         s.result.status = std::move(st);
                         finish_slot(s, StopReason::kError);
                         active.clear();
@@ -6653,7 +6667,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     continue;
                 }
                 bool keep_going = true;
-                if (Status st = emit_slot_token(s, next_tok, step_lp, keep_going); !st.ok()) {
+                if (Status st = emit_slot_token(s, next_tok, std::move(step_lp), keep_going); !st.ok()) {
                     s.result.status = std::move(st);
                     finish_slot(s, StopReason::kError);
                     active.clear();
@@ -6793,7 +6807,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     break;
                 }
                 bool keep_going = true;
-                if (Status st = emit_slot_token(s, tok, accepted_lps[m], keep_going); !st.ok()) {
+                if (Status st = emit_slot_token(s, tok, std::move(accepted_lps[m]), keep_going); !st.ok()) {
                     (void)rollback_rejected(new_pos, committed_drafts);
                     s.result.status = std::move(st);
                     finish_slot(s, StopReason::kError);
@@ -7240,7 +7254,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                                 break;
                             }
                             bool keep_going = true;
-                            if (Status st = emit_slot_token(*s, tok, s->accepted_lps[m], keep_going); !st.ok()) {
+                            if (Status st = emit_slot_token(*s, tok, std::move(s->accepted_lps[m]), keep_going); !st.ok()) {
                                 (void)rollback_slot_tail(committed_drafts);
                                 s->result.status = std::move(st);
                                 finish_slot(*s, StopReason::kError);
@@ -7684,7 +7698,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                         continue;
                     }
                     bool keep_going = true;
-                    if (Status st = emit_slot_token(*s, first_tok, outcomes[idx].lp, keep_going); !st.ok()) {
+                    if (Status st = emit_slot_token(*s, first_tok, std::move(outcomes[idx].lp), keep_going); !st.ok()) {
                         s->result.status = std::move(st);
                         finish_slot(*s, StopReason::kError);
                         continue;
@@ -7728,7 +7742,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     continue;
                 }
                 bool keep_going = true;
-                if (Status st = emit_slot_token(*s, next_tok, outcomes[idx].lp, keep_going); !st.ok()) {
+                if (Status st = emit_slot_token(*s, next_tok, std::move(outcomes[idx].lp), keep_going); !st.ok()) {
                     s->result.status = std::move(st);
                     finish_slot(*s, StopReason::kError);
                     continue;

@@ -189,8 +189,13 @@ std::vector<TokenData> SamplerChain::top_candidates(std::size_t max_k) const {
         if (out.size() >= max_k) {
             break;
         }
-        if (t.id < 0 || t.logit == kNegInf || !std::isfinite(t.p) || t.p <= 0.0f) {
+        if (t.id < 0) {
             continue;
+        }
+        // cur_.data is canonically sorted (logit desc, p non-increasing), so
+        // the first non-viable entry ends the viable prefix.
+        if (t.logit == kNegInf || !std::isfinite(t.p) || t.p <= 0.0f) {
+            break;
         }
         TokenData entry = t;
         if (entry.p > 1.0f) {
