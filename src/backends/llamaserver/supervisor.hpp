@@ -138,6 +138,11 @@ class Supervisor {
     void observe(Process &child);
     void begin_child();
     Status wait_ready(Process &child, std::uint16_t port);
+    bool health_ok(std::uint16_t port, std::chrono::milliseconds budget);
+    // Monitor thread. True when a device fault was logged and a second signal
+    // (child gone, or /health failing) agrees.
+    bool device_fault_confirmed(Process &child, std::uint16_t port);
+    void note_unconfirmed_fault();
     Result<std::uint16_t> settle_after_deadline(std::unique_lock<std::mutex> &lock,
                                                 const CancellationToken &cancel,
                                                 std::chrono::steady_clock::time_point deadline);
@@ -146,6 +151,13 @@ class Supervisor {
     void monitor_attached();
     bool sample_child(net::HttpRequest endpoint);
     void publish_diagnostics();
+    // Monitor thread. Reads whatever the child still wrote to its log, then
+    // reports whether a fatal accelerator fault was seen for this child.
+    bool drain_device_fault();
+    // Monitor thread. Terminal: marks the device unhealthy (diagnostics.device,
+    // a backend.device_unhealthy event), so nothing is scheduled on it and the
+    // child is not relaunched into the same broken device.
+    void fail_device_unhealthy();
     [[nodiscard]] std::chrono::steady_clock::time_point metrics_now() const;
     void fail(Status status);
     enum class ResidencyAction { none, restart, refuse };
