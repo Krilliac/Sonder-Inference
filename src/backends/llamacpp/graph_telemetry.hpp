@@ -33,7 +33,7 @@ namespace sonder::backends::llamacpp {
 inline constexpr std::size_t kMaxTrackedLayers = 256;
 inline constexpr std::size_t kMaxTrackedOps = 128;
 inline constexpr std::size_t kMaxTrackedDevices = 16;
-inline constexpr std::size_t kMaxDeviceNameBytes = 32;
+inline constexpr std::size_t kMaxGraphDeviceNameBytes = 32;
 inline constexpr std::size_t kDefaultMaxOpsPerEval = 64;
 inline constexpr std::size_t kDefaultMaxLayersPerEval = kMaxTrackedLayers;
 
@@ -155,7 +155,7 @@ public:
 private:
     struct DeviceSlot {
         const char* name_ptr = nullptr;
-        char name_buf[kMaxDeviceNameBytes]{};
+        char name_buf[kMaxGraphDeviceNameBytes]{};
         std::uint64_t node_count = 0;
         std::uint64_t duration_ns = 0;
     };

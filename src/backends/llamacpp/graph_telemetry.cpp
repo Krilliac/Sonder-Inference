@@ -153,7 +153,7 @@ std::int8_t GraphTelemetryAggregator::FindOrAddDevice(const char* device_name) n
     const char* effective = (device_name != nullptr && device_name[0] != '\0') ? device_name : "unknown";
     for (std::size_t i = 0; i < device_count_; ++i) {
         if (devices_[i].name_ptr == effective ||
-            EqualsCStringPrefix(devices_[i].name_buf, effective, kMaxDeviceNameBytes - 1)) {
+            EqualsCStringPrefix(devices_[i].name_buf, effective, kMaxGraphDeviceNameBytes - 1)) {
             return static_cast<std::int8_t>(i);
         }
     }
@@ -163,7 +163,7 @@ std::int8_t GraphTelemetryAggregator::FindOrAddDevice(const char* device_name) n
     }
     const std::size_t idx = device_count_++;
     devices_[idx].name_ptr = effective;
-    CopyCStringBounded(devices_[idx].name_buf, kMaxDeviceNameBytes, effective);
+    CopyCStringBounded(devices_[idx].name_buf, kMaxGraphDeviceNameBytes, effective);
     devices_[idx].node_count = 0;
     devices_[idx].duration_ns = 0;
     return static_cast<std::int8_t>(idx);
