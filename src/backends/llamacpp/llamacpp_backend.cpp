@@ -1516,14 +1516,25 @@ struct LlamaCppBackend::Impl {
         return true;
     }
 
+    [[nodiscard]] static bool ShouldCollectTelemetryCandidates(const SamplingParams& sp, std::uint64_t ordinal,
+                                                               std::uint32_t emitted) noexcept {
+        if (sp.telemetry_top_k <= 0) return false;
+        if (sp.telemetry_candidates_max_events > 0u && emitted >= sp.telemetry_candidates_max_events) {
+            return false;
+        }
+        const std::uint32_t stride = sp.telemetry_candidates_stride == 0u ? 1u : sp.telemetry_candidates_stride;
+        return (ordinal % static_cast<std::uint64_t>(stride)) == 0u;
+    }
+
     void PopulateTelemetryFromPreSampling(const float* logits, int32_t n_vocab, Token tok, const SamplingParams& sp,
-                                          TokenLogprobInfo& out) {
+                                          TokenLogprobInfo& out, bool want_candidates = true) {
         if (logits == nullptr || tok == LLAMA_TOKEN_NULL) return;
-        const std::int32_t req_k = std::max(sp.top_logprobs, sp.telemetry_top_k);
+        const std::int32_t telemetry_k = want_candidates ? sp.telemetry_top_k : 0;
+        const std::int32_t req_k = std::max(sp.top_logprobs, telemetry_k);
         TokenLogprobInfo full =
             ComputeTokenLogprobs(std::span<const float>(logits, static_cast<std::size_t>(n_vocab)), tok, req_k);
         if (sp.telemetry_top_k > 0) {
-            full.sampled_prob = BuildPreSamplingProbInfo(full, tok, sp.telemetry_top_k);
+            full.sampled_prob = BuildPreSamplingProbInfo(full, tok, sp.telemetry_top_k, want_candidates);
         }
         const std::size_t caller_k = sp.top_logprobs > 0 ? static_cast<std::size_t>(sp.top_logprobs) : 0u;
         if (full.top_logprobs.size() > caller_k) {
@@ -1533,8 +1544,22 @@ struct LlamaCppBackend::Impl {
     }
 
     void PopulateTelemetryFromCandidates(const llama_token_data_array& cur_p, bool has_probs, Token tok,
-                                         std::int32_t telemetry_top_k, TokenLogprobInfo& out) {
+                                         std::int32_t telemetry_top_k, TokenLogprobInfo& out,
+                                         bool want_candidates = true) {
         if (telemetry_top_k <= 0 || tok == LLAMA_TOKEN_NULL || cur_p.data == nullptr || cur_p.size == 0) {
+            return;
+        }
+        // O(1) fast path when the dist sampler already normalized probabilities
+        // and this token is stride-skipped or past token_candidates_max_events.
+        if (has_probs && !want_candidates && cur_p.selected >= 0 &&
+            static_cast<std::size_t>(cur_p.selected) < cur_p.size && cur_p.data[cur_p.selected].id == tok) {
+            const float p = cur_p.data[cur_p.selected].p;
+            if (std::isfinite(p) && p >= 0.0F) {
+                out.sampled_prob.valid = true;
+                out.sampled_prob.probability = std::clamp(p, 0.0F, 1.0F);
+                out.sampled_prob.post_sampling = true;
+                out.sampled_prob.candidates.clear();
+            }
             return;
         }
         telemetry_candidates_scratch.resize(cur_p.size);
@@ -1542,7 +1567,8 @@ struct LlamaCppBackend::Impl {
             telemetry_candidates_scratch[i] =
                 CandidateLogitProb{cur_p.data[i].id, cur_p.data[i].logit, cur_p.data[i].p};
         }
-        out.sampled_prob = ComputePostSamplingProbInfo(telemetry_candidates_scratch, has_probs, tok, telemetry_top_k);
+        out.sampled_prob = ComputePostSamplingProbInfo(telemetry_candidates_scratch, has_probs, tok, telemetry_top_k,
+                                                       want_candidates);
     }
 
     // Samples one token at `batch_idx` using GPU backend sampling when active,
@@ -1551,7 +1577,7 @@ struct LlamaCppBackend::Impl {
     // and/or post-sampling telemetry probabilities.
     Token SampleTokenAt(int32_t batch_idx, const SamplingParams& sp, llama_sampler* sampler,
                         llama_sampler* grammar_sampler, bool gpu_sampled, int32_t n_vocab,
-                        TokenLogprobInfo* out_logprob) {
+                        TokenLogprobInfo* out_logprob, bool want_telemetry_candidates = true) {
         if (out_logprob != nullptr) *out_logprob = {};
         const bool want_telemetry = !sp.compute_logprobs && sp.telemetry_top_k > 0 && out_logprob != nullptr;
         Token tok = LLAMA_TOKEN_NULL;
@@ -1582,14 +1608,14 @@ struct LlamaCppBackend::Impl {
                     tok = cur_p.data[cur_p.selected].id;
                     if (!TryAcceptSampler(sampler, tok)) return LLAMA_TOKEN_NULL;
                     PopulateTelemetryFromCandidates(cur_p, /*has_probs=*/sp.temperature > 0.0F, tok,
-                                                    sp.telemetry_top_k, *out_logprob);
+                                                    sp.telemetry_top_k, *out_logprob, want_telemetry_candidates);
                     return tok;
                 }
             }
             tok = TrySampleToken(sampler, ctx, batch_idx);
             if (tok != LLAMA_TOKEN_NULL && sp.compute_logprobs && out_logprob != nullptr) {
                 if (const float* logits = llama_get_logits_ith(ctx, batch_idx); logits != nullptr) {
-                    PopulateTelemetryFromPreSampling(logits, n_vocab, tok, sp, *out_logprob);
+                    PopulateTelemetryFromPreSampling(logits, n_vocab, tok, sp, *out_logprob, want_telemetry_candidates);
                 }
             }
             return tok;
@@ -1639,10 +1665,10 @@ struct LlamaCppBackend::Impl {
             if (!TryAcceptGrammar(grammar_sampler, tok)) return LLAMA_TOKEN_NULL;
             if (!TryAcceptSampler(sampler, tok)) return LLAMA_TOKEN_NULL;
             if (sp.compute_logprobs && out_logprob != nullptr) {
-                PopulateTelemetryFromPreSampling(logits, n_vocab, tok, sp, *out_logprob);
+                PopulateTelemetryFromPreSampling(logits, n_vocab, tok, sp, *out_logprob, want_telemetry_candidates);
             } else if (want_telemetry) {
                 PopulateTelemetryFromCandidates(cur_p_step1, /*has_probs=*/sp.temperature > 0.0F, tok,
-                                                sp.telemetry_top_k, *out_logprob);
+                                                sp.telemetry_top_k, *out_logprob, want_telemetry_candidates);
             }
             return tok;
         }
@@ -1664,10 +1690,10 @@ struct LlamaCppBackend::Impl {
         if (!TryAcceptGrammar(grammar_sampler, tok)) return LLAMA_TOKEN_NULL;
         if (!TryAcceptSampler(sampler, tok)) return LLAMA_TOKEN_NULL;
         if (sp.compute_logprobs && out_logprob != nullptr) {
-            PopulateTelemetryFromPreSampling(logits, n_vocab, tok, sp, *out_logprob);
+            PopulateTelemetryFromPreSampling(logits, n_vocab, tok, sp, *out_logprob, want_telemetry_candidates);
         } else if (want_telemetry) {
             PopulateTelemetryFromCandidates(cur_p, /*has_probs=*/sp.temperature > 0.0F, tok, sp.telemetry_top_k,
-                                            *out_logprob);
+                                            *out_logprob, want_telemetry_candidates);
         }
         return tok;
     }
@@ -1766,7 +1792,8 @@ struct LlamaCppBackend::Impl {
                                 llama_sampler* sampler, llama_sampler* grammar_sampler, bool gpu_sampled,
                                 int32_t n_vocab, std::mt19937_64& verify_rng, std::vector<Token>& accepted_tokens,
                                 std::vector<TokenLogprobInfo>& accepted_lps, std::size_t& n_accepted,
-                                GenerateResult& result) {
+                                GenerateResult& result, std::uint64_t telemetry_token_ordinal = 0,
+                                std::uint32_t telemetry_candidates_emitted = 0) {
         const std::size_t k = draft_tokens.size();
         accepted_tokens.clear();
         accepted_lps.clear();
@@ -1778,6 +1805,8 @@ struct LlamaCppBackend::Impl {
         const SpeculativeVerificationMode step_mode = sonder::inference::resolve_speculative_verification_mode(
             requested_spec_verification_mode, !proposal_dists.empty() && k > 0u);
         result.spec_verifier_mode = step_mode;
+        std::uint64_t proj_ordinal = telemetry_token_ordinal;
+        std::uint32_t proj_emitted = telemetry_candidates_emitted;
 
         if (step_mode == SpeculativeVerificationMode::StochasticRejection) {
             spec_verifier.set_mode(SpeculativeVerificationMode::StochasticRejection);
@@ -1812,20 +1841,37 @@ struct LlamaCppBackend::Impl {
                     if (!TryAcceptSampler(sampler, committed_tok)) {
                         grammar_accept_failed = true;
                     }
+                    const bool want_cands = ShouldCollectTelemetryCandidates(sp, proj_ordinal, proj_emitted);
                     TokenLogprobInfo lp;
                     if (sp.compute_logprobs) {
                         if (const float* logits = llama_get_logits_ith(ctx, static_cast<int32_t>(pos));
                             logits != nullptr) {
-                            PopulateTelemetryFromPreSampling(logits, n_vocab, committed_tok, sp, lp);
+                            PopulateTelemetryFromPreSampling(logits, n_vocab, committed_tok, sp, lp, want_cands);
                         }
                     } else if (sp.telemetry_top_k > 0 && pos == last_target_pos && !last_target_p.empty()) {
-                        telemetry_candidates_scratch.resize(last_target_p.size());
-                        for (std::size_t v = 0; v < last_target_p.size(); ++v) {
-                            telemetry_candidates_scratch[v] =
-                                CandidateLogitProb{static_cast<Token>(v), 0.0F, static_cast<float>(last_target_p[v])};
+                        if (!want_cands && committed_tok >= 0 &&
+                            static_cast<std::size_t>(committed_tok) < last_target_p.size()) {
+                            const double p = last_target_p[static_cast<std::size_t>(committed_tok)];
+                            if (std::isfinite(p) && p >= 0.0) {
+                                lp.sampled_prob.valid = true;
+                                lp.sampled_prob.probability =
+                                    static_cast<float>(std::clamp(p, 0.0, 1.0));
+                                lp.sampled_prob.post_sampling = true;
+                            }
+                        } else {
+                            telemetry_candidates_scratch.resize(last_target_p.size());
+                            for (std::size_t v = 0; v < last_target_p.size(); ++v) {
+                                telemetry_candidates_scratch[v] = CandidateLogitProb{
+                                    static_cast<Token>(v), 0.0F, static_cast<float>(last_target_p[v])};
+                            }
+                            lp.sampled_prob = ComputePostSamplingProbInfo(
+                                telemetry_candidates_scratch, /*has_probs=*/true, committed_tok, sp.telemetry_top_k,
+                                want_cands);
                         }
-                        lp.sampled_prob = ComputePostSamplingProbInfo(telemetry_candidates_scratch, /*has_probs=*/true,
-                                                                      committed_tok, sp.telemetry_top_k);
+                    }
+                    if (lp.sampled_prob.valid) {
+                        ++proj_ordinal;
+                        if (!lp.sampled_prob.candidates.empty()) ++proj_emitted;
                     }
                     accepted_lps.push_back(std::move(lp));
                 },
@@ -1848,11 +1894,16 @@ struct LlamaCppBackend::Impl {
         const bool collect_lp = sp.compute_logprobs || sp.telemetry_top_k > 0;
         const auto verify_start = Clock::now();
         for (std::size_t j = 0; j < k; ++j) {
+            const bool want_cands = ShouldCollectTelemetryCandidates(sp, proj_ordinal, proj_emitted);
             TokenLogprobInfo lp;
             const Token sampled = SampleTokenAt(static_cast<int32_t>(j), sp, sampler, grammar_sampler, gpu_sampled,
-                                                n_vocab, collect_lp ? &lp : nullptr);
+                                                n_vocab, collect_lp ? &lp : nullptr, want_cands);
             if (sampled == LLAMA_TOKEN_NULL) {
                 return false;
+            }
+            if (lp.sampled_prob.valid) {
+                ++proj_ordinal;
+                if (!lp.sampled_prob.candidates.empty()) ++proj_emitted;
             }
             accepted_tokens.push_back(sampled);
             accepted_lps.push_back(std::move(lp));
@@ -1864,9 +1915,10 @@ struct LlamaCppBackend::Impl {
         }
         bool sampled_bonus = false;
         if (n_accepted == k) {
+            const bool want_cands = ShouldCollectTelemetryCandidates(sp, proj_ordinal, proj_emitted);
             TokenLogprobInfo bonus_lp;
             const Token bonus = SampleTokenAt(static_cast<int32_t>(k), sp, sampler, grammar_sampler, gpu_sampled,
-                                              n_vocab, collect_lp ? &bonus_lp : nullptr);
+                                              n_vocab, collect_lp ? &bonus_lp : nullptr, want_cands);
             if (bonus == LLAMA_TOKEN_NULL) {
                 return false;
             }
@@ -4300,11 +4352,16 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         }
     } clear_target_sampler{ctx, slot_id, target_gpu_sampled};
 #endif
+    result.backend_sampling_active = target_gpu_sampled;
+    std::uint64_t telemetry_token_ordinal = 0;
+    std::uint32_t telemetry_candidates_emitted = 0;
 
     auto sample_target = [&](int32_t idx, TokenLogprobInfo* out_lp = nullptr) -> Token {
         const Clock::time_point t_samp = stage_prof ? Clock::now() : Clock::time_point{};
+        const bool want_cands = ShouldCollectTelemetryCandidates(request.sampling, telemetry_token_ordinal,
+                                                                 telemetry_candidates_emitted);
         const Token tok = SampleTokenAt(idx, request.sampling, sampler.get(), grammar_sampler.get(), target_gpu_sampled,
-                                        n_vocab, out_lp);
+                                        n_vocab, out_lp, want_cands);
         if (stage_prof) {
             add_stage_ms(result.stage_timings.sampling_ms, MsSince(t_samp));
         }
@@ -4573,6 +4630,10 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
             ev.sampled_probability = lp.sampled_prob.probability;
             ev.sampled_probability_post_sampling = lp.sampled_prob.post_sampling;
             ev.sampled_candidates = lp.sampled_prob.candidates;
+            if (!ev.text.empty()) {
+                ++telemetry_token_ordinal;
+                if (!ev.sampled_candidates.empty()) ++telemetry_candidates_emitted;
+            }
         }
         ++result.generated_tokens;
         keep_going = on_token ? on_token(ev) : true;
@@ -4916,7 +4977,8 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         // not in the b11195 pin). The batch worker's per-slot verification behaves the same way.
         const bool sample_deadlock = !VerifySpeculativeBatch(
             draft_tokens, no_proposal_dists, request.sampling, sampler.get(), grammar_sampler.get(),
-            target_gpu_sampled, n_vocab, verify_rng, accepted_tokens, accepted_lps, n_accepted, result);
+            target_gpu_sampled, n_vocab, verify_rng, accepted_tokens, accepted_lps, n_accepted, result,
+            telemetry_token_ordinal, telemetry_candidates_emitted);
         if (stage_prof) {
             add_stage_ms(result.stage_timings.sampling_ms, MsSince(spec_samp_start));
         }
@@ -5092,6 +5154,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
         bool ngram_short_enabled = false;
         bool spec_initialized = false;
         bool target_gpu_sampled = false;
+        std::uint64_t telemetry_token_ordinal = 0;
+        std::uint32_t telemetry_candidates_emitted = 0;
         bool want_hybrid_prefix_ckpt = false;
         int64_t hybrid_ckpt_offset = -1;
         int32_t effective_draft_max = 0;
@@ -5452,6 +5516,10 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             ev.sampled_probability = lp.sampled_prob.probability;
             ev.sampled_probability_post_sampling = lp.sampled_prob.post_sampling;
             ev.sampled_candidates = lp.sampled_prob.candidates;
+            if (!ev.text.empty()) {
+                ++s.telemetry_token_ordinal;
+                if (!ev.sampled_candidates.empty()) ++s.telemetry_candidates_emitted;
+            }
         }
         ++s.result.generated_tokens;
         keep_going = (s.task->on_token != nullptr && *s.task->on_token) ? (*s.task->on_token)(ev) : true;
@@ -5609,6 +5677,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             s->target_gpu_sampled = TrySetSampler(ctx, s->slot_id, s->sampler.get());
         }
 #endif
+        s->result.backend_sampling_active = s->target_gpu_sampled;
 
         std::size_t lcp = options.prefix_cache ? sel.matched_prefix : 0u;
         const int64_t kv_len_raw = llama_memory_seq_pos_max(mem, s->slot_id) + 1;
@@ -6219,10 +6288,13 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     }
                     const auto first_start = Clock::now();
                     TokenLogprobInfo first_lp;
+                    const bool first_want_cands = ShouldCollectTelemetryCandidates(
+                        req.sampling, s.telemetry_token_ordinal, s.telemetry_candidates_emitted);
                     const Token first_tok = SampleTokenAt(
                         batch.n_tokens - 1, req.sampling, s.sampler.get(), s.grammar_sampler.get(),
                         s.target_gpu_sampled, n_vocab,
-                        (req.sampling.compute_logprobs || req.sampling.telemetry_top_k > 0) ? &first_lp : nullptr);
+                        (req.sampling.compute_logprobs || req.sampling.telemetry_top_k > 0) ? &first_lp : nullptr,
+                        first_want_cands);
                     if (first_tok == LLAMA_TOKEN_NULL) {
                         s.result.status =
                             Status::Error(ErrorCode::kDecodeFailed, "sampler produced no valid token (grammar deadlock)");
@@ -6559,9 +6631,12 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 
                 TokenLogprobInfo step_lp;
                 const Clock::time_point samp_start = slot_stage_prof ? Clock::now() : Clock::time_point{};
+                const bool step_want_cands = ShouldCollectTelemetryCandidates(
+                    req.sampling, s.telemetry_token_ordinal, s.telemetry_candidates_emitted);
                 const Token next_tok = SampleTokenAt(
                     0, req.sampling, s.sampler.get(), s.grammar_sampler.get(), s.target_gpu_sampled, n_vocab,
-                    (req.sampling.compute_logprobs || req.sampling.telemetry_top_k > 0) ? &step_lp : nullptr);
+                    (req.sampling.compute_logprobs || req.sampling.telemetry_top_k > 0) ? &step_lp : nullptr,
+                    step_want_cands);
                 if (slot_stage_prof) {
                     add_stage_ms(s.result.stage_timings.sampling_ms, MsSince(samp_start));
                 }
@@ -6617,7 +6692,8 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             const Clock::time_point spec_samp_start = slot_stage_prof ? Clock::now() : Clock::time_point{};
             const bool sample_deadlock = !VerifySpeculativeBatch(
                 draft_tokens, no_proposal_dists, req.sampling, s.sampler.get(), s.grammar_sampler.get(),
-                s.target_gpu_sampled, n_vocab, s.verify_rng, accepted_tokens, accepted_lps, n_accepted, s.result);
+                s.target_gpu_sampled, n_vocab, s.verify_rng, accepted_tokens, accepted_lps, n_accepted, s.result,
+                s.telemetry_token_ordinal, s.telemetry_candidates_emitted);
             if (slot_stage_prof) {
                 add_stage_ms(s.result.stage_timings.sampling_ms, MsSince(spec_samp_start));
             }
@@ -7000,15 +7076,23 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                         s->step_sample_deadlock = false;
 
                         const bool collect_slot_lp = req.sampling.compute_logprobs || req.sampling.telemetry_top_k > 0;
+                        std::uint64_t slot_proj_ord = s->telemetry_token_ordinal;
+                        std::uint32_t slot_proj_emitted = s->telemetry_candidates_emitted;
                         for (std::size_t j = 0; j < k_i; ++j) {
+                            const bool want_cands =
+                                ShouldCollectTelemetryCandidates(req.sampling, slot_proj_ord, slot_proj_emitted);
                             TokenLogprobInfo lp;
                             const Token sampled = SampleTokenAt(
                                 s->batch_start_idx + static_cast<int32_t>(j), req.sampling, s->sampler.get(),
                                 s->grammar_sampler.get(), s->target_gpu_sampled, n_vocab,
-                                collect_slot_lp ? &lp : nullptr);
+                                collect_slot_lp ? &lp : nullptr, want_cands);
                             if (sampled == LLAMA_TOKEN_NULL) {
                                 s->step_sample_deadlock = true;
                                 break;
+                            }
+                            if (lp.sampled_prob.valid) {
+                                ++slot_proj_ord;
+                                if (!lp.sampled_prob.candidates.empty()) ++slot_proj_emitted;
                             }
                             s->accepted_tokens.push_back(sampled);
                             s->accepted_lps.push_back(std::move(lp));
@@ -7020,11 +7104,13 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                         }
                         bool sampled_bonus = false;
                         if (!s->step_sample_deadlock && s->step_n_accepted == k_i) {
+                            const bool want_cands =
+                                ShouldCollectTelemetryCandidates(req.sampling, slot_proj_ord, slot_proj_emitted);
                             TokenLogprobInfo bonus_lp;
                             const Token bonus = SampleTokenAt(
                                 s->batch_start_idx + static_cast<int32_t>(k_i), req.sampling, s->sampler.get(),
                                 s->grammar_sampler.get(), s->target_gpu_sampled, n_vocab,
-                                collect_slot_lp ? &bonus_lp : nullptr);
+                                collect_slot_lp ? &bonus_lp : nullptr, want_cands);
                             if (bonus == LLAMA_TOKEN_NULL) {
                                 s->step_sample_deadlock = true;
                             } else {
@@ -7523,9 +7609,12 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             if (s != nullptr && s->task != nullptr && s->batch_logit_idx >= 0) {
                 out.has_sample = true;
                 const auto& slot_sp = s->task->req->sampling;
+                const bool slot_want_cands = ShouldCollectTelemetryCandidates(
+                    slot_sp, s->telemetry_token_ordinal, s->telemetry_candidates_emitted);
                 out.tok = SampleTokenAt(s->batch_logit_idx, slot_sp, s->sampler.get(),
                                         s->grammar_sampler.get(), s->target_gpu_sampled, n_vocab,
-                                        (slot_sp.compute_logprobs || slot_sp.telemetry_top_k > 0) ? &out.lp : nullptr);
+                                        (slot_sp.compute_logprobs || slot_sp.telemetry_top_k > 0) ? &out.lp : nullptr,
+                                        slot_want_cands);
             }
             outcomes.push_back(std::move(out));
         }

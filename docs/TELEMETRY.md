@@ -312,27 +312,36 @@ events are recorded (a sink is attached and the level is `standard` or `deep`)
 and `TelemetryOptions::token_probability_top_k` (default 5, clamped to 10) is
 not 0:
 
-- **Sonder's sampler (`token_logits` backends).** `SamplerChain` always emits
+- **Sonder's sampler (`token_logits` backends).** `Session` emits
   `inference.token.generated` with `unit: "token"`, `token_id`, `probability`,
   and `probability_basis: "post_sampling"`, and emits
-  `inference.sampling.candidates` from its post-sampling candidate distribution
-  (`SamplerChain::top_candidates`, bounded by `token_probability_top_k`,
-  `token_candidates_stride`, and `token_candidates_max_events`). Setting
-  `token_probability_top_k` to 0 disables `inference.sampling.candidates` while
-  keeping per-token `probability` on `inference.token.generated`.
+  `inference.sampling.candidates` from `SamplerChain::top_candidates()`
+  (bounded by `token_probability_top_k`, `token_candidates_stride`, and
+  `token_candidates_max_events`). Setting `token_probability_top_k` to 0
+  disables `inference.sampling.candidates` while keeping per-token
+  `probability` on `inference.token.generated`.
 
 #### Backend-sampled token probabilities
 
-- **Native `llamacpp` backend.** When `token_probability_top_k > 0` and the
-  caller did not request logprobs, `LlamaCppBackend` reads the post-sampling
-  distribution (`probability_basis: "post_sampling"`) directly from its
-  in-process llama.cpp sampler chain (without populating caller
+- **Native `llamacpp` backend (opt-in probe).** To preserve GPU backend
+  sampling (`llama_set_sampler`) on the default serving path, the native
+  `llamacpp` post-sampling probe is **opt-in**: it activates when
+  `token_probability_top_k > 0` and either
+  `TelemetryOptions::native_token_probabilities` is `true` or the telemetry
+  level is `deep` (e.g. `sonder-infer serve --telemetry-level deep`). When
+  enabled and the caller did not request logprobs, `LlamaCppBackend` reads the
+  post-sampling distribution (`probability_basis: "post_sampling"`) directly
+  from its in-process llama.cpp sampler chain (without populating caller
   `TokenChunk::logprob` / `top_logprobs` or `GenerationResult::logprobs`). When
-  the caller requested `sampling.logprobs`, telemetry reuses the pre-sampling
-  log-softmax (`probability_basis: "pre_sampling"`) without altering the
-  caller's `top_logprobs`. Setting `token_probability_top_k = 0` or level
-  `metrics`/`off` turns off the probe and preserves GPU backend sampling
-  (`llama_set_sampler`).
+  the caller explicitly requested `sampling.logprobs`, telemetry always reuses
+  the pre-sampling log-softmax (`probability_basis: "pre_sampling"`) at
+  `standard` or `deep` without altering the caller's `top_logprobs`. Stride
+  (`token_candidates_stride`), per-request cap (`token_candidates_max_events`),
+  and text-capture (`capture_text`) are forwarded to the backend so skipped or
+  capped tokens avoid candidate extraction and `TokenToPiece` detokenization.
+  With default `TelemetryOptions` (`standard`, `native_token_probabilities = false`)
+  and no caller `logprobs`, the probe stays off and GPU backend sampling
+  (`llama_set_sampler`) remains active.
 - **Legacy `llamaserver` probe (deprecated).** Against llama.cpp
   (`native_completion`, the default) a request whose caller did not ask for
   logprobs gets `"n_probs": K` and `"post_sampling_probs": true` (native
@@ -353,9 +362,11 @@ not 0:
   authoritative counts still come from `request.completed`.
 - **Cost.** Post-sampling probabilities reuse the sampler's candidate list;
   pre-sampling ones (the caller's logprobs) cost a pass over the vocabulary per
-  token. On native `llamacpp`, enabling the probe (`token_probability_top_k > 0`
-  at `standard`/`deep`) keeps logits readable on CPU instead of binding GPU
-  backend sampling (`llama_set_sampler`).
+  token. On native `llamacpp`, opting in to the probe
+  (`native_token_probabilities = true` or `TelemetryLevel::deep`) keeps logits
+  readable on CPU instead of binding GPU backend sampling (`llama_set_sampler`),
+  while skipping candidate sorting and `TokenToPiece` work on stride-skipped or
+  capped tokens and when `capture_text` is off.
 
 | Event | Level | Attributes |
 | --- | --- | --- |

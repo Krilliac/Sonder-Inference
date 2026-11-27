@@ -522,6 +522,28 @@ TEST_CASE("llamacpp frontier: BuildPreSamplingProbInfo and ComputePostSamplingPr
     CHECK(post_inf.candidates[1].first == 4);
     CHECK(post_inf.probability == doctest::Approx(0.5F));
 
+    // 4. collect_candidates == false returns scalar probability with empty candidates (stride/cap fast path).
+    const SampledProbInfo pre_no_cands =
+        BuildPreSamplingProbInfo(lp, /*chosen_token=*/2, /*top_k=*/2, /*collect_candidates=*/false);
+    REQUIRE(pre_no_cands.valid);
+    CHECK_FALSE(pre_no_cands.post_sampling);
+    CHECK(pre_no_cands.probability == doctest::Approx(pre.probability).epsilon(1e-5));
+    CHECK(pre_no_cands.candidates.empty());
+
+    const SampledProbInfo post_dist_no_cands =
+        ComputePostSamplingProbInfo(dist_cands, /*has_probs=*/true, /*chosen_token=*/3, 2, /*collect_candidates=*/false);
+    REQUIRE(post_dist_no_cands.valid);
+    CHECK(post_dist_no_cands.post_sampling);
+    CHECK(post_dist_no_cands.probability == doctest::Approx(0.25F));
+    CHECK(post_dist_no_cands.candidates.empty());
+
+    const SampledProbInfo post_greedy_no_cands = ComputePostSamplingProbInfo(
+        greedy_cands, /*has_probs=*/false, /*chosen_token=*/1, 5, /*collect_candidates=*/false);
+    REQUIRE(post_greedy_no_cands.valid);
+    CHECK(post_greedy_no_cands.post_sampling);
+    CHECK(post_greedy_no_cands.probability == doctest::Approx(post_greedy.probability).epsilon(1e-5));
+    CHECK(post_greedy_no_cands.candidates.empty());
+
     // Validate rejects out-of-range telemetry_top_k.
     SamplingParams sp;
     sp.telemetry_top_k = -1;

@@ -308,16 +308,26 @@ struct TelemetryOptions {
     // pipe) must not hang the process: on expiry the writer is detached and
     // shutdown() returns false. Zero or negative means do not wait at all.
     std::chrono::milliseconds shutdown_timeout{5000};
-    // Backend-sampled token probabilities (llamaserver against llama.cpp),
-    // used only when `standard` events are recorded. top_k is how many
-    // alternatives the backend asks its upstream for per sampled token,
-    // clamped to [0, kMaxTelemetryTopK = 10]; 0 turns the probe off (no
-    // probability on backend chunks, no inference.sampling.candidates).
+    // Token probability and top-alternatives telemetry (`inference.sampling.candidates`),
+    // used only when `standard` (or `deep`) events are recorded. `top_k` bounds
+    // the number of alternatives recorded per sampled token (Sonder's sampler
+    // chain, opt-in native `llamacpp`, and legacy `llamaserver`), clamped to
+    // [0, kMaxTelemetryTopK = 10]; 0 disables candidate emission (and turns off
+    // backend probability probes).
     int token_probability_top_k = 5;
-    // inference.sampling.candidates volume bounds, per request: emit for
+    // Opt-in for the native in-process `llamacpp` post-sampling probability
+    // probe at `TelemetryLevel::standard`. Off by default so normal server
+    // requests keep GPU backend sampling (`llama_set_sampler`) without reading
+    // full-vocab logits on the CPU. Setting this true (or using
+    // `TelemetryLevel::deep`) enables the native probe; caller-requested
+    // `sampling.logprobs` always reuses pre-sampling probabilities at
+    // `standard`+. Sonder's own sampler (`token_logits`) and legacy
+    // `llamaserver` are unaffected.
+    bool native_token_probabilities = false;
+    // `inference.sampling.candidates` volume bounds, per request: emit for
     // every `stride`-th probability-bearing token (0 is read as 1), and at
-    // most `max_events` events (0 = no cap). The upstream still computes the
-    // probabilities for every token of the request; these bound the stream.
+    // most `max_events` events (0 = no cap). Forwarded to native `llamacpp` so
+    // candidate extraction is skipped on strided or capped tokens.
     std::uint32_t token_candidates_stride = 1;
     std::uint32_t token_candidates_max_events = 256;
 };

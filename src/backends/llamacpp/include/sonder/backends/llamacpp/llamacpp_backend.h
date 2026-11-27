@@ -335,8 +335,12 @@ struct SamplingParams {
     std::int32_t top_logprobs = 0;     // number of top alternative logprobs (0..kMaxTopLogprobs)
     // Telemetry-only probability probe (0..kMaxTopLogprobs; 0 = off). Computes
     // sampled token probability + top-K alternatives for TokenEvent without
-    // populating caller logprobs unless compute_logprobs is true.
+    // populating caller logprobs unless compute_logprobs is true. Stride and
+    // max_events let the backend skip candidate extraction on strided or capped
+    // tokens while still reporting the sampled token's scalar probability.
     std::int32_t telemetry_top_k = 0;
+    std::uint32_t telemetry_candidates_stride = 1;      // 0 treated as 1
+    std::uint32_t telemetry_candidates_max_events = 0;  // 0 = uncapped
 };
 
 [[nodiscard]] Status Validate(const SamplingParams& params);
@@ -516,6 +520,10 @@ struct GenerateResult {
 
     // Opt-in stage timing breakdown (enabled == false unless requested).
     GenerateStageTimings stage_timings{};
+
+    // True when llama.cpp backend sampling (`llama_set_sampler`) was bound for
+    // this request's target sampler chain.
+    bool backend_sampling_active = false;
 
     [[nodiscard]] double decode_tokens_per_second() const noexcept;
     [[nodiscard]] double prefill_tokens_per_second() const noexcept;
@@ -829,15 +837,19 @@ struct TokenLogprobInfo {
 
 // Converts exact pre-sampling log-softmax info into telemetry SampledProbInfo
 // (post_sampling = false), keeping at most `top_k` entries sorted by
-// probability descending then token id ascending.
+// probability descending then token id ascending. When `collect_candidates` is
+// false, populates only the sampled token's scalar probability.
 [[nodiscard]] SampledProbInfo BuildPreSamplingProbInfo(const TokenLogprobInfo& lp, Token chosen_token,
-                                                       std::int32_t top_k);
+                                                       std::int32_t top_k, bool collect_candidates = true);
 
 // Extracts post-sampling telemetry probability and top-K alternatives from
 // surviving sampler candidates (post_sampling = true). When `has_probs` is
 // true, reads `c.p`; otherwise runs numerically stable softmax over `c.logit`.
+// When `collect_candidates` is false, populates only the sampled token's
+// scalar probability without collecting or sorting top-K alternatives.
 [[nodiscard]] SampledProbInfo ComputePostSamplingProbInfo(std::span<const CandidateLogitProb> candidates,
-                                                          bool has_probs, Token chosen_token, std::int32_t top_k);
+                                                          bool has_probs, Token chosen_token, std::int32_t top_k,
+                                                          bool collect_candidates = true);
 
 // Validates multimodal media payloads against kMaxMediaImages (8) and
 // kMaxMediaBlobBytes (16 MiB per image), rejecting empty blobs.

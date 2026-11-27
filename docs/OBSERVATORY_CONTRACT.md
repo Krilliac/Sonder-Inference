@@ -97,8 +97,9 @@ Emitted today:
   `scheduler.prefill.chunk/completed`, `scheduler.batch.formed/completed`,
   and `scheduler.configured`.
 - Sampling: `sampling.configured`, `sampling.failed`, and
-  `inference.sampling.candidates` (Sonder's sampler chain, native `llamacpp`,
-  and legacy `llamaserver`).
+  `inference.sampling.candidates` (Sonder's sampler chain, native `llamacpp`
+  when opted in via `native_token_probabilities` / `TelemetryLevel::deep` or
+  caller `logprobs`, and legacy `llamaserver`).
   `inference.token.generated` carries `unit: "token"` with `probability` and
   `probability_basis` for Sonder-sampled tokens and for native `llamacpp` /
   `llamaserver` tokens whose probability was reported.

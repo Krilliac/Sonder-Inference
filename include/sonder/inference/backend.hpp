@@ -230,13 +230,18 @@ struct GenerateRequest {
     // Allow cost-aware spill-to-checkpoint when selectively preempted under pressure.
     bool allow_preempt_spill = false;
     // Telemetry-only probability probe, [0, kMaxTelemetryTopK]; 0 = off. Set
-    // by the session when token telemetry is recorded. A backend that samples
-    // upstream and can report probabilities (llamaserver against llama.cpp)
-    // asks for the sampled token's probability and this many alternatives and
-    // reports them in TokenChunk::sampled_probability. The caller-visible
-    // TokenChunk::logprob / top_logprobs stay exactly as sampling.logprobs
-    // asked. Other backends ignore it.
+    // by the session when token telemetry is recorded (for native in-process
+    // backends only when `TelemetryOptions::native_token_probabilities` is set,
+    // level is `deep`, or `sampling.logprobs` is requested). Backends that
+    // support it report the sampled token's probability and up to this many
+    // alternatives in TokenChunk::sampled_probability while leaving caller-
+    // visible TokenChunk::logprob / top_logprobs strictly as sampling.logprobs
+    // asked. Stride, cap, and capture_text let in-process backends skip
+    // candidate extraction and detokenization when not emitted.
     std::int32_t telemetry_top_k = 0;
+    std::uint32_t telemetry_candidates_stride = 1;
+    std::uint32_t telemetry_candidates_max_events = 0;  // 0 = uncapped
+    bool telemetry_capture_text = false;
 };
 
 // Bounded batch limits for embedding, reranking, and pair-scoring requests.
@@ -572,8 +577,11 @@ struct ChatRequest {
     // Opt-in per-request stage timing hooks (false by default: zero extra clocks).
     bool enable_stage_profiling = false;
     // Telemetry-only probability probe; same contract as
-    // GenerateRequest::telemetry_top_k.
+    // GenerateRequest::telemetry_*.
     std::int32_t telemetry_top_k = 0;
+    std::uint32_t telemetry_candidates_stride = 1;
+    std::uint32_t telemetry_candidates_max_events = 0;  // 0 = uncapped
+    bool telemetry_capture_text = false;
 };
 
 // True for "system", "user", "assistant" and "tool".

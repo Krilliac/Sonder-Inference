@@ -2312,12 +2312,14 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
 
     const bool emit_tokens = bus.enabled(TelemetryLevel::standard);
     const bool capture_text = bus.options().capture_text;
-    // Telemetry probability probe for backend-sampled tokens (llamaserver),
-    // only while token events are recorded. The candidates bounds count the
-    // probability-bearing tokens of this request.
+    // Token-probability / candidates bounds. Sonder's own sampler (`token_logits`)
+    // and remote backends (`llamaserver`) use `telemetry_top_k` whenever
+    // standard token telemetry is enabled. Native in-process backends
+    // (`llamacpp`) opt in via `native_token_probabilities`, `TelemetryLevel::deep`,
+    // or caller-requested `sampling.logprobs`, preserving GPU backend sampling
+    // (`llama_set_sampler`) on the default server path.
     const std::int32_t telemetry_top_k =
         emit_tokens ? std::clamp<int>(bus.options().token_probability_top_k, 0, kMaxTelemetryTopK) : 0;
-    request.telemetry_top_k = telemetry_top_k;
     const std::uint64_t candidates_stride = std::max<std::uint32_t>(1u, bus.options().token_candidates_stride);
     const std::uint32_t candidates_cap = bus.options().token_candidates_max_events;
     std::uint64_t probability_tokens = 0;
@@ -2328,6 +2330,15 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     session_stages.enabled = stage_profiling;
     BackendModel& backend_model = model_->backend_model();
     const auto backend = engine_.find_backend(model_->backend_name());
+    const bool is_remote_backend = backend && backend->capabilities().has(Capability::remote_process);
+    const bool backend_probe_allowed =
+        is_remote_backend || sampling.logprobs || bus.options().native_token_probabilities ||
+        bus.options().level == TelemetryLevel::deep;
+    const std::int32_t backend_telemetry_top_k = backend_probe_allowed ? telemetry_top_k : 0;
+    request.telemetry_top_k = backend_telemetry_top_k;
+    request.telemetry_candidates_stride = static_cast<std::uint32_t>(candidates_stride);
+    request.telemetry_candidates_max_events = candidates_cap;
+    request.telemetry_capture_text = capture_text;
     const bool has_media = (messages != nullptr) && has_chat_media(*messages);
     // Chat with a backend-native template bypasses the generic prompt (and
     // therefore Sonder's token-level sampler, which works on that prompt).
@@ -2954,7 +2965,10 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                 chat_request.target_ttft_ms = request_options.target_ttft_ms;
                 chat_request.target_itl_ms = request_options.target_itl_ms;
                 chat_request.enable_stage_profiling = stage_profiling;
-                chat_request.telemetry_top_k = telemetry_top_k;
+                chat_request.telemetry_top_k = backend_telemetry_top_k;
+                chat_request.telemetry_candidates_stride = static_cast<std::uint32_t>(candidates_stride);
+                chat_request.telemetry_candidates_max_events = candidates_cap;
+                chat_request.telemetry_capture_text = capture_text;
                 generated = backend_model.chat(chat_request, token, on_backend_chunk);
             } else {
                 generated = backend_model.generate(request, token, on_backend_chunk);

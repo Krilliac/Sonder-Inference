@@ -536,6 +536,115 @@ TEST_CASE("gguf_compat: end-to-end llama.cpp v1.0.0 full load succeeds on 3-elem
     CHECK(ReadAllBytes(bad_path) == bytes_before);
 }
 
+TEST_CASE("VIS-03: default TelemetryOptions keeps native llamacpp probe off to preserve backend sampling") {
+    namespace si = sonder::inference;
+    TempDir dir;
+    const std::filesystem::path gguf_path =
+        WriteLoadableQwen35Gguf(dir, "tiny-vis03-default-off.gguf", {11, 11, 10, 0});
+
+    auto sink = std::make_shared<si::MemoryTelemetrySink>();
+    si::EngineOptions eo;
+    // Default TelemetryOptions: TelemetryLevel::standard, no opt-in native probe.
+    eo.telemetry_sinks.push_back(sink);
+    eo.sample_devices_on_start = false;
+    eo.sample_gpu_devices = false;
+    eo.device_sample_interval = std::chrono::milliseconds(0);
+    eo.scheduling.enabled = false;
+    si::Engine engine(std::move(eo));
+    si::LlamaCppBackendOptions bo;
+    bo.context_length = 64;
+    bo.batch_size = 32;
+    bo.gpu_layers = 0;
+    REQUIRE(engine.register_backend(si::make_llamacpp_backend(bo)).ok());
+    auto model = engine.load_model(si::kLlamaCppBackendName, si::ModelLoadOptions{PathToUtf8(gguf_path), "cpu:0"});
+    REQUIRE_MESSAGE(model.ok(), model.status().to_string());
+    auto sess = engine.create_session(model.value(), {});
+    REQUIRE(sess.ok());
+    si::SamplingConfig sc = si::SamplingConfig::greedy(3);
+    sc.logit_bias = {{0, -std::numeric_limits<float>::infinity()}, {1, 2.0f}, {2, 1.0f}, {3, 0.0f}};
+    auto res = sess.value()->generate("a", {}, sc);
+    REQUIRE_MESSAGE(res.ok(), res.status().to_string());
+    engine.telemetry().flush();
+
+    std::size_t token_events = 0;
+    std::size_t candidate_events = 0;
+    for (const auto& line : sink->lines()) {
+        auto parsed = si::json::parse(line);
+        REQUIRE(parsed.ok());
+        const auto type = parsed->find("event_type")->as_string();
+        if (type == "inference.token.generated") {
+            ++token_events;
+            const auto& attrs = *parsed->find("attributes");
+            CHECK(attrs.find("unit")->as_string() == "chunk");
+            CHECK(attrs.find("probability") == nullptr);
+        } else if (type == "inference.sampling.candidates") {
+            ++candidate_events;
+        }
+    }
+    CHECK(token_events == 3u);
+    CHECK(candidate_events == 0u);
+
+    // Direct LlamaCppBackend check: telemetry_top_k == 0 keeps backend sampling active
+    // (llama_set_sampler), while telemetry_top_k > 0 disables it and honors backend-side
+    // stride and cap so skipped/capped tokens do not build candidate lists.
+    LlamaCppBackend be;
+    LoadOptions lo;
+    lo.model_path = PathToUtf8(gguf_path);
+    lo.n_ctx = 64;
+    lo.n_batch = 32;
+    lo.n_gpu_layers = 0;
+    lo.n_slots = 1;
+    REQUIRE_MESSAGE(be.Load(lo).ok(), "direct load failed");
+    {
+        GenerateRequest req;
+        req.prompt = {1};
+        req.max_new_tokens = 3;
+        req.sampling.temperature = 0.0F;
+        req.sampling.logit_bias = {{0, -std::numeric_limits<float>::infinity()}, {1, 2.0F}, {2, 1.0F}};
+        req.sampling.telemetry_top_k = 0;
+        const GenerateResult r = be.Generate(req, {});
+        REQUIRE_MESSAGE(r.status.ok(), r.status.message);
+        CHECK(r.generated_tokens == 3);
+#if defined(SONDER_LLAMACPP_HAS_SET_SAMPLER)
+        CHECK(r.backend_sampling_active);
+#endif
+    }
+    {
+        GenerateRequest req;
+        req.prompt = {1};
+        req.max_new_tokens = 4;
+        req.sampling.temperature = 1.0F;
+        req.sampling.top_k = 2;
+        req.sampling.top_p = 1.0F;
+        req.sampling.min_p = 0.0F;
+        req.sampling.repeat_penalty = 1.0F;
+        req.sampling.seed = 7;
+        req.sampling.logit_bias = {{0, -std::numeric_limits<float>::infinity()}, {1, 2.0F}, {2, 1.0F}, {3, 0.0F}};
+        req.sampling.telemetry_top_k = 4;
+        req.sampling.telemetry_candidates_stride = 2;
+        req.sampling.telemetry_candidates_max_events = 1;
+        std::vector<std::size_t> cand_counts;
+        std::vector<bool> has_probs;
+        const GenerateResult r = be.Generate(req, [&](const TokenEvent& ev) {
+            if (ev.token >= 0) {
+                has_probs.push_back(ev.has_sampled_probability);
+                cand_counts.push_back(ev.sampled_candidates.size());
+            }
+            return true;
+        });
+        REQUIRE_MESSAGE(r.status.ok(), r.status.message);
+        CHECK_FALSE(r.backend_sampling_active);
+        REQUIRE(has_probs.size() == 4u);
+        for (bool hp : has_probs) CHECK(hp);
+        // Token 0 collected candidates; tokens 1..3 skipped candidates at backend (cap=1, stride=2).
+        CHECK(cand_counts[0] == 2u);
+        CHECK(cand_counts[1] == 0u);
+        CHECK(cand_counts[2] == 0u);
+        CHECK(cand_counts[3] == 0u);
+    }
+    be.Unload();
+}
+
 TEST_CASE("VIS-03: native llamacpp emits token probabilities and inference.sampling.candidates") {
     namespace si = sonder::inference;
     TempDir dir;
@@ -597,11 +706,13 @@ TEST_CASE("VIS-03: native llamacpp emits token probabilities and inference.sampl
     const double p2 = std::exp(1.0) / z_post;
     const double p3 = std::exp(0.0) / z_post;
 
-    SUBCASE("default standard telemetry emits post_sampling probabilities and candidates without leaking logprobs") {
+    SUBCASE("opt-in native_token_probabilities emits post_sampling probabilities and candidates without leaking logprobs") {
+        si::TelemetryOptions t;
+        t.native_token_probabilities = true;
         si::SamplingConfig sc = si::SamplingConfig::greedy(3);
         sc.logit_bias = {{0, -std::numeric_limits<float>::infinity()}, {1, 2.0f}, {2, 1.0f}, {3, 0.0f}};
         unsigned caller_lp_chunks = 0;
-        auto [res, events] = run_native(si::TelemetryOptions{}, sc, 1u, [&](const si::TokenChunk& c) {
+        auto [res, events] = run_native(t, sc, 1u, [&](const si::TokenChunk& c) {
             if (c.logprob.has_value() || !c.top_logprobs.empty()) ++caller_lp_chunks;
         });
         CHECK(res.text == "aaa");
@@ -641,8 +752,23 @@ TEST_CASE("VIS-03: native llamacpp emits token probabilities and inference.sampl
         }
     }
 
+    SUBCASE("TelemetryLevel::deep enables native llamacpp probe automatically") {
+        si::TelemetryOptions t;
+        t.level = si::TelemetryLevel::deep;
+        si::SamplingConfig sc = si::SamplingConfig::greedy(2);
+        sc.logit_bias = {{0, -std::numeric_limits<float>::infinity()}, {1, 2.0f}, {2, 1.0f}};
+        auto [res, events] = run_native(t, sc, 1u);
+        const auto tokens = filter_events(events, "inference.token.generated");
+        const auto cands = filter_events(events, "inference.sampling.candidates");
+        REQUIRE(tokens.size() == 2u);
+        REQUIRE(cands.size() == 2u);
+        CHECK(tokens[0].find("attributes")->find("unit")->as_string() == "token");
+        CHECK(cands[0].find("attributes")->find("probability_basis")->as_string() == "post_sampling");
+    }
+
     SUBCASE("stochastic sampling with top_k, stride, cap, and capture_text opt-in") {
         si::TelemetryOptions t;
+        t.native_token_probabilities = true;
         t.token_probability_top_k = 4;
         t.token_candidates_stride = 2;
         t.token_candidates_max_events = 1;
@@ -701,6 +827,7 @@ TEST_CASE("VIS-03: native llamacpp emits token probabilities and inference.sampl
         sc.logit_bias = {{0, -std::numeric_limits<float>::infinity()}, {1, 2.0f}};
         {
             si::TelemetryOptions t;
+            t.native_token_probabilities = true;
             t.token_probability_top_k = 0;
             auto [res, events] = run_native(t, sc, 1u);
             const auto tokens = filter_events(events, "inference.token.generated");
@@ -713,6 +840,7 @@ TEST_CASE("VIS-03: native llamacpp emits token probabilities and inference.sampl
         }
         {
             si::TelemetryOptions t;
+            t.native_token_probabilities = true;
             t.level = si::TelemetryLevel::metrics;
             auto [res, events] = run_native(t, sc, 1u);
             CHECK(filter_events(events, "inference.token.generated").empty());
@@ -720,10 +848,12 @@ TEST_CASE("VIS-03: native llamacpp emits token probabilities and inference.sampl
         }
     }
 
-    SUBCASE("multi-slot batch worker emits post_sampling candidates") {
+    SUBCASE("multi-slot batch worker emits post_sampling candidates when opted in") {
+        si::TelemetryOptions t;
+        t.native_token_probabilities = true;
         si::SamplingConfig sc = si::SamplingConfig::greedy(2);
         sc.logit_bias = {{0, -std::numeric_limits<float>::infinity()}, {1, 2.0f}, {2, 1.0f}, {3, 0.0f}};
-        auto [res, events] = run_native(si::TelemetryOptions{}, sc, /*slots=*/2u);
+        auto [res, events] = run_native(t, sc, /*slots=*/2u);
         const auto cands = filter_events(events, "inference.sampling.candidates");
         REQUIRE(cands.size() == 2u);
         CHECK(cands[0].find("attributes")->find("probability_basis")->as_string() == "post_sampling");
