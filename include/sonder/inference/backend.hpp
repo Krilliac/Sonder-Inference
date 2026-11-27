@@ -206,7 +206,7 @@ struct ModelLoadOptions {
     // The model only runs on these devices when device_id is gpu:* or empty
     // (a cpu:* id offloads no layers, so the default "cpu:0" ignores the list);
     // the server sets gpu:0 for it. Ignored by backends without named devices.
-    std::vector<std::string> devices;
+    std::vector<std::string> devices{};
 };
 
 struct GenerateRequest {
