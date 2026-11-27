@@ -818,6 +818,10 @@ struct LlamaCppBackend::Impl {
     uint32_t rank_seq_max = 0;
     bool rank_batch_allocated = false;
 
+    // Decode-aware auxiliary execution gate and resolved device domain (NAT-12).
+    std::shared_ptr<DecodeAwareAuxGate> aux_gate;
+    std::string aux_domain = "cpu";
+
     // Optional libmtmd multimodal projector context (`mmproj_path`).
 #if defined(SONDER_LLAMACPP_HAS_MTMD)
     mtmd_context* mtmd_ctx = nullptr;
@@ -1175,6 +1179,8 @@ struct LlamaCppBackend::Impl {
         suffix_matcher.reset();
         step_cost_estimator.Reset();
         batch_planner_config = BatchPlannerConfig{};
+        aux_gate.reset();
+        aux_domain = "cpu";
     }
 
 #if defined(SONDER_LLAMACPP_HAS_STATE_SEQ_EXT)
@@ -2012,6 +2018,9 @@ struct LlamaCppBackend::Impl {
         cp_dft.ctx_other = ctx;
 #endif
         try {
+            const StreamPriority dft_prio =
+                EffectiveMainStreamPriority(opts.workload_role, opts.main_stream_priority);
+            ScopedGgmlCudaStreamPriority cuda_prio_guard(dft_prio);
             ctx_dft = llama_init_from_model(model, cp_dft);
         } catch (...) {
             ctx_dft = nullptr;
@@ -2606,6 +2615,15 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
     impl_->vocab = llama_model_get_vocab(model);
     impl_->options = options;
     impl_->architecture = ReadModelArchitecture(model);
+    impl_->aux_domain = ResolveAuxExecutionDomain(options.n_gpu_layers, options.main_gpu, options.devices);
+    if (options.shared_aux_gate != nullptr) {
+        impl_->aux_gate = options.shared_aux_gate;
+    } else {
+        impl_->aux_gate = DefaultProcessAuxGate();
+        if (options.workload_role == WorkloadRole::kMainDecode) {
+            (void)impl_->aux_gate->Reconfigure(options.aux_gate);
+        }
+    }
 
     if (!options.vocab_only) {
         std::uint64_t model_n_swa = 0;
@@ -2622,7 +2640,10 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
         llama_context_params cp = MakeContextParams(options, swa_qualified);
         cp.abort_callback = &Impl::AbortCallback;
         cp.abort_callback_data = impl_.get();
+        const StreamPriority main_ctx_prio =
+            EffectiveMainStreamPriority(options.workload_role, options.main_stream_priority);
         if (Status s = RunGuarded(ErrorCode::kLoadFailed, "llama_init_from_model", [&] {
+                ScopedGgmlCudaStreamPriority cuda_prio_guard(main_ctx_prio);
                 impl_->ctx = llama_init_from_model(model, cp);
                 return Status::Ok();
             });
@@ -3063,6 +3084,14 @@ PrefixCoalescerStats LlamaCppBackend::GetPrefixCoalescerStats() const noexcept {
     return out;
 }
 
+std::shared_ptr<DecodeAwareAuxGate> LlamaCppBackend::GetAuxGate() const noexcept {
+    return (impl_ && IsLoaded()) ? impl_->aux_gate : nullptr;
+}
+
+std::string LlamaCppBackend::GetAuxExecutionDomain() const {
+    return (impl_ && IsLoaded()) ? impl_->aux_domain : std::string{};
+}
+
 Status LlamaCppBackend::CaptureSequenceState(std::vector<std::uint8_t>& out_bytes, std::size_t max_bytes) {
     out_bytes.clear();
     if (max_bytes == 0) return Status::Error(ErrorCode::kInvalidArgument, "max_bytes must be > 0");
@@ -3322,9 +3351,20 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
     configured_seqs = 1u;
 #endif
 
+    const bool aux_gate_enabled = impl_->options.aux_gate.enabled && impl_->aux_gate != nullptr;
+    const std::uint32_t active_tok_cap = std::max<std::uint32_t>(1u, impl_->options.aux_gate.active_slice_max_tokens);
+    const std::uint32_t active_seq_cap =
+        std::clamp<std::uint32_t>(impl_->options.aux_gate.active_slice_max_sequences, 1u, kMaxEmbedSequences);
+    uint32_t effective_budget = configured_budget;
+    uint32_t effective_seqs = configured_seqs;
+    if (aux_gate_enabled && impl_->aux_gate->IsDecodeActive(impl_->aux_domain)) {
+        effective_budget = std::min<uint32_t>(effective_budget, active_tok_cap);
+        effective_seqs = std::min<uint32_t>(effective_seqs, active_seq_cap);
+    }
+
     EmbedBatchPlanConfig plan_cfg;
-    plan_cfg.max_batch_tokens = std::max<std::size_t>(1u, static_cast<std::size_t>(configured_budget));
-    plan_cfg.max_sequences_per_batch = static_cast<std::size_t>(configured_seqs);
+    plan_cfg.max_batch_tokens = std::max<std::size_t>(1u, static_cast<std::size_t>(effective_budget));
+    plan_cfg.max_sequences_per_batch = static_cast<std::size_t>(effective_seqs);
     plan_cfg.max_single_input_tokens = static_cast<std::size_t>(base_ctx);
     plan_cfg.allow_oversized_single_batch = true;
 
@@ -3336,19 +3376,21 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
 
     // Lazily allocate an isolated multi-sequence embedding context sized to
     // the planned batch budget so Embed() never disturbs live KV prefix caches
-    // or MTP/backend-sampler graphs.
+    // or MTP/backend-sampler graphs. Align n_batch/n_ubatch to an exact multiple
+    // of want_seqs so llama.cpp v1.0.0's graph_reserve(n_tokens, n_seqs, n_outputs)
+    // never rounds n_tokens past n_outputs on MEAN pooling.
     const enum llama_pooling_type requested_pooling =
         options.pooling == PoolingType::kUnspecified
             ? (llama_model_has_encoder(impl_->model) ? LLAMA_POOLING_TYPE_UNSPECIFIED : LLAMA_POOLING_TYPE_MEAN)
             : ToLlamaPooling(options.pooling);
-    const uint32_t aligned_need =
-        static_cast<uint32_t>(((plan.max_batch_tokens_used + 255u) / 256u) * 256u);
-    const uint32_t want_ctx = std::max<uint32_t>(256u, aligned_need);
     const uint32_t want_seqs = static_cast<uint32_t>(std::max<std::size_t>(1u, plan.max_batch_sequences_used));
+    const uint32_t min_batch = std::max<uint32_t>(256u, static_cast<uint32_t>(plan.max_batch_tokens_used));
+    const uint32_t batch_aligned = ((min_batch + want_seqs - 1u) / want_seqs) * want_seqs;
+    const uint32_t want_ctx = ((batch_aligned + 255u) / 256u) * 256u;
     const bool need_recreate = impl_->embed_ctx == nullptr ||
                                llama_n_ctx(impl_->embed_ctx) < want_ctx ||
                                impl_->embed_seq_max < want_seqs ||
-                               impl_->embed_batch_cap < static_cast<int32_t>(want_ctx) ||
+                               impl_->embed_batch_cap < static_cast<int32_t>(batch_aligned) ||
                                impl_->embed_pooling_requested != requested_pooling;
     if (need_recreate && impl_->embed_ctx != nullptr) {
         if (impl_->embed_batch_allocated) {
@@ -3364,10 +3406,8 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
     if (impl_->embed_ctx == nullptr) {
         llama_context_params cp_emb = llama_context_default_params();
         cp_emb.n_ctx = want_ctx;
-        // Keep n_batch == n_ubatch == want_ctx so non-causal encoder models and
-        // multi-sequence batches evaluate in a single forward pass.
-        cp_emb.n_batch = want_ctx;
-        cp_emb.n_ubatch = want_ctx;
+        cp_emb.n_batch = batch_aligned;
+        cp_emb.n_ubatch = batch_aligned;
         cp_emb.n_seq_max = want_seqs;
         cp_emb.embeddings = true;
         cp_emb.pooling_type = requested_pooling;
@@ -3393,6 +3433,7 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
         cp_emb.abort_callback = &Impl::AbortCallback;
         cp_emb.abort_callback_data = impl_.get();
         if (Status s = RunGuarded(ErrorCode::kDecodeFailed, "llama_init_from_model", [&] {
+                ScopedGgmlCudaStreamPriority cuda_prio_guard(impl_->options.aux_stream_priority);
                 impl_->embed_ctx = llama_init_from_model(impl_->model, cp_emb);
                 return Status::Ok();
             });
@@ -3434,84 +3475,113 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
     const auto start = Clock::now();
     std::int64_t total_prompt_tokens = 0;
     Status batch_error = Status::Ok();
-    std::size_t batches_executed = 0;
+    std::size_t plan_batches_executed = 0;
+    std::size_t slices_executed = 0;
+    std::size_t gated_slices = 0;
+    std::int64_t gate_wait_ns = 0;
 
     const EmbedBatchExecStatus exec_status = ExecuteEmbedBatchPlan<std::vector<float>>(
         plan, cancelled,
         [&](const PlannedEmbedBatch& planned_batch, std::vector<std::vector<float>>& batch_out) -> bool {
-            if (planned_batch.total_tokens > static_cast<std::size_t>(INT32_MAX)) {
-                batch_error = Status::Error(ErrorCode::kContextOverflow, "embedding batch exceeds INT32_MAX");
-                return false;
-            }
-            if (Status s = ValidateBatchBounds(static_cast<int32_t>(planned_batch.total_tokens),
-                                               static_cast<int32_t>(n_batch), n_ubatch, /*require_ubatch_fit=*/true);
-                !s.ok()) {
-                batch_error = std::move(s);
-                return false;
-            }
-            if (llama_memory_t emem = llama_get_memory(ectx); emem != nullptr) {
-                llama_memory_clear(emem, true);
-            }
-            BatchClear(impl_->embed_batch);
-            std::vector<int32_t> last_tok_idx;
-            last_tok_idx.reserve(planned_batch.items.size());
-            for (const EmbedBatchItem& item : planned_batch.items) {
-                if (Status s = ValidateSeqId(static_cast<int32_t>(item.seq_id), impl_->embed_seq_max); !s.ok()) {
+            const bool slice_now = aux_gate_enabled && impl_->aux_gate->IsDecodeActive(impl_->aux_domain);
+            const std::vector<PlannedEmbedBatch> slices =
+                slice_now ? SubslicePlannedBatch(planned_batch, active_tok_cap, active_seq_cap)
+                          : std::vector<PlannedEmbedBatch>{planned_batch};
+            batch_out.reserve(planned_batch.items.size());
+
+            for (const PlannedEmbedBatch& slice : slices) {
+                if (slice.total_tokens > static_cast<std::size_t>(INT32_MAX)) {
+                    batch_error = Status::Error(ErrorCode::kContextOverflow, "embedding batch exceeds INT32_MAX");
+                    return false;
+                }
+                if (Status s = ValidateBatchBounds(static_cast<int32_t>(slice.total_tokens),
+                                                   static_cast<int32_t>(n_batch), n_ubatch, /*require_ubatch_fit=*/true);
+                    !s.ok()) {
                     batch_error = std::move(s);
                     return false;
                 }
-                const auto& seq = inputs[item.original_index];
-                const std::size_t n_tok = seq.size();
-                for (std::size_t t = 0; t < n_tok; ++t) {
-                    const bool want_out = (pooling != LLAMA_POOLING_TYPE_NONE) || (t + 1 == n_tok);
-                    BatchAdd(impl_->embed_batch, seq[t], static_cast<llama_pos>(t),
-                             static_cast<llama_seq_id>(item.seq_id), want_out);
-                }
-                last_tok_idx.push_back(impl_->embed_batch.n_tokens - 1);
-            }
-            const int32_t rc = encoder_only ? TryEncode(ectx, impl_->embed_batch, &batch_error)
-                                            : TryDecode(ectx, impl_->embed_batch, &batch_error);
-            if (rc != 0) {
-                if (!cancelled() && batch_error.ok()) {
-                    batch_error = Status::Error(ErrorCode::kDecodeFailed,
-                                                "llama embedding pass failed (rc=" + std::to_string(rc) + ")");
-                }
-                return false;
-            }
 
-            batch_out.reserve(planned_batch.items.size());
-            for (std::size_t k = 0; k < planned_batch.items.size(); ++k) {
-                const EmbedBatchItem& item = planned_batch.items[k];
-                const float* raw = nullptr;
-                if (pooling != LLAMA_POOLING_TYPE_NONE) {
-                    raw = llama_get_embeddings_seq(ectx, static_cast<llama_seq_id>(item.seq_id));
+                DecodeAwareAuxGate::AuxSliceScope gate_scope;
+                if (aux_gate_enabled) {
+                    gate_scope = impl_->aux_gate->AcquireAuxSlice(impl_->aux_domain, cancelled);
+                    if (!gate_scope.acquired()) {
+                        return false;
+                    }
+                    gate_wait_ns += gate_scope.wait_ns();
+                    if (gate_scope.gated()) ++gated_slices;
                 }
-                if (raw == nullptr) {
-                    raw = llama_get_embeddings_ith(ectx, last_tok_idx[k]);
+
+                std::vector<int32_t> last_tok_idx;
+                last_tok_idx.reserve(slice.items.size());
+                int32_t rc = 0;
+                {
+                    ScopedGgmlCudaStreamPriority cuda_prio_guard(impl_->options.aux_stream_priority);
+                    if (llama_memory_t emem = llama_get_memory(ectx); emem != nullptr) {
+                        llama_memory_clear(emem, true);
+                    }
+                    BatchClear(impl_->embed_batch);
+                    for (const EmbedBatchItem& item : slice.items) {
+                        if (Status s = ValidateSeqId(static_cast<int32_t>(item.seq_id), impl_->embed_seq_max);
+                            !s.ok()) {
+                            batch_error = std::move(s);
+                            return false;
+                        }
+                        const auto& seq = inputs[item.original_index];
+                        const std::size_t n_tok = seq.size();
+                        for (std::size_t t = 0; t < n_tok; ++t) {
+                            const bool want_out = (pooling != LLAMA_POOLING_TYPE_NONE) || (t + 1 == n_tok);
+                            BatchAdd(impl_->embed_batch, seq[t], static_cast<llama_pos>(t),
+                                     static_cast<llama_seq_id>(item.seq_id), want_out);
+                        }
+                        last_tok_idx.push_back(impl_->embed_batch.n_tokens - 1);
+                    }
+                    rc = encoder_only ? TryEncode(ectx, impl_->embed_batch, &batch_error)
+                                      : TryDecode(ectx, impl_->embed_batch, &batch_error);
                 }
-                if (raw == nullptr && planned_batch.items.size() == 1u) {
-                    raw = llama_get_embeddings(ectx);
-                }
-                if (raw == nullptr) {
-                    batch_error = Status::Error(ErrorCode::kDecodeFailed, "llama.cpp returned null embeddings");
+                gate_scope.Release();
+
+                if (rc != 0) {
+                    if (!cancelled() && batch_error.ok()) {
+                        batch_error = Status::Error(ErrorCode::kDecodeFailed,
+                                                    "llama embedding pass failed (rc=" + std::to_string(rc) + ")");
+                    }
                     return false;
                 }
-                std::vector<float> vec(raw, raw + static_cast<std::size_t>(n_embd));
-                if (options.normalize) {
-                    double sq_sum = 0.0;
-                    for (float v : vec) sq_sum += static_cast<double>(v) * static_cast<double>(v);
-                    const double norm = std::sqrt(sq_sum);
-                    if (norm > 0.0) {
-                        const auto inv = static_cast<float>(1.0 / norm);
-                        for (float& v : vec) v *= inv;
+
+                for (std::size_t k = 0; k < slice.items.size(); ++k) {
+                    const EmbedBatchItem& item = slice.items[k];
+                    const float* raw = nullptr;
+                    if (pooling != LLAMA_POOLING_TYPE_NONE) {
+                        raw = llama_get_embeddings_seq(ectx, static_cast<llama_seq_id>(item.seq_id));
                     }
+                    if (raw == nullptr) {
+                        raw = llama_get_embeddings_ith(ectx, last_tok_idx[k]);
+                    }
+                    if (raw == nullptr && slice.items.size() == 1u) {
+                        raw = llama_get_embeddings(ectx);
+                    }
+                    if (raw == nullptr) {
+                        batch_error = Status::Error(ErrorCode::kDecodeFailed, "llama.cpp returned null embeddings");
+                        return false;
+                    }
+                    std::vector<float> vec(raw, raw + static_cast<std::size_t>(n_embd));
+                    if (options.normalize) {
+                        double sq_sum = 0.0;
+                        for (float v : vec) sq_sum += static_cast<double>(v) * static_cast<double>(v);
+                        const double norm = std::sqrt(sq_sum);
+                        if (norm > 0.0) {
+                            const auto inv = static_cast<float>(1.0 / norm);
+                            for (float& v : vec) v *= inv;
+                        }
+                    }
+                    batch_out.push_back(std::move(vec));
+                    total_prompt_tokens += static_cast<std::int64_t>(item.token_count);
                 }
-                batch_out.push_back(std::move(vec));
-                total_prompt_tokens += static_cast<std::int64_t>(item.token_count);
+                ++slices_executed;
             }
             return true;
         },
-        out.embeddings, &batches_executed);
+        out.embeddings, &plan_batches_executed);
 
     if (exec_status == EmbedBatchExecStatus::kCancelled) {
         out = {};
@@ -3528,7 +3598,9 @@ Status LlamaCppBackend::Embed(const std::vector<std::vector<Token>>& inputs, con
     out.eval_ms = MsSince(start);
     out.dimensions = static_cast<std::size_t>(n_embd);
     out.pooling = FromLlamaPooling(pooling);
-    out.batches_executed = batches_executed;
+    out.batches_executed = slices_executed;
+    out.gated_slices = gated_slices;
+    out.gate_wait_ms = static_cast<double>(gate_wait_ns) / 1e6;
     return Status::Ok();
 }
 
@@ -3573,9 +3645,20 @@ Status LlamaCppBackend::ScorePairs(const std::vector<std::vector<Token>>& pairs,
     configured_seqs = 1u;
 #endif
 
+    const bool aux_gate_enabled = impl_->options.aux_gate.enabled && impl_->aux_gate != nullptr;
+    const std::uint32_t active_tok_cap = std::max<std::uint32_t>(1u, impl_->options.aux_gate.active_slice_max_tokens);
+    const std::uint32_t active_seq_cap =
+        std::clamp<std::uint32_t>(impl_->options.aux_gate.active_slice_max_sequences, 1u, kMaxEmbedSequences);
+    uint32_t effective_budget = configured_budget;
+    uint32_t effective_seqs = configured_seqs;
+    if (aux_gate_enabled && impl_->aux_gate->IsDecodeActive(impl_->aux_domain)) {
+        effective_budget = std::min<uint32_t>(effective_budget, active_tok_cap);
+        effective_seqs = std::min<uint32_t>(effective_seqs, active_seq_cap);
+    }
+
     EmbedBatchPlanConfig plan_cfg;
-    plan_cfg.max_batch_tokens = std::max<std::size_t>(1u, static_cast<std::size_t>(configured_budget));
-    plan_cfg.max_sequences_per_batch = static_cast<std::size_t>(configured_seqs);
+    plan_cfg.max_batch_tokens = std::max<std::size_t>(1u, static_cast<std::size_t>(effective_budget));
+    plan_cfg.max_sequences_per_batch = static_cast<std::size_t>(effective_seqs);
     plan_cfg.max_single_input_tokens = static_cast<std::size_t>(base_ctx);
     plan_cfg.allow_oversized_single_batch = true;
 
@@ -3585,14 +3668,14 @@ Status LlamaCppBackend::ScorePairs(const std::vector<std::vector<Token>>& pairs,
                              plan.error);
     }
 
-    const uint32_t aligned_need =
-        static_cast<uint32_t>(((plan.max_batch_tokens_used + 255u) / 256u) * 256u);
-    const uint32_t want_ctx = std::max<uint32_t>(256u, aligned_need);
     const uint32_t want_seqs = static_cast<uint32_t>(std::max<std::size_t>(1u, plan.max_batch_sequences_used));
+    const uint32_t min_batch = std::max<uint32_t>(256u, static_cast<uint32_t>(plan.max_batch_tokens_used));
+    const uint32_t batch_aligned = ((min_batch + want_seqs - 1u) / want_seqs) * want_seqs;
+    const uint32_t want_ctx = ((batch_aligned + 255u) / 256u) * 256u;
     const bool need_recreate = impl_->rank_ctx == nullptr ||
                                llama_n_ctx(impl_->rank_ctx) < want_ctx ||
                                impl_->rank_seq_max < want_seqs ||
-                               impl_->rank_batch_cap < static_cast<int32_t>(want_ctx);
+                               impl_->rank_batch_cap < static_cast<int32_t>(batch_aligned);
     if (need_recreate && impl_->rank_ctx != nullptr) {
         if (impl_->rank_batch_allocated) {
             llama_batch_free(impl_->rank_batch);
@@ -3607,8 +3690,8 @@ Status LlamaCppBackend::ScorePairs(const std::vector<std::vector<Token>>& pairs,
     if (impl_->rank_ctx == nullptr) {
         llama_context_params cp_rank = llama_context_default_params();
         cp_rank.n_ctx = want_ctx;
-        cp_rank.n_batch = want_ctx;
-        cp_rank.n_ubatch = want_ctx;
+        cp_rank.n_batch = batch_aligned;
+        cp_rank.n_ubatch = batch_aligned;
         cp_rank.n_seq_max = want_seqs;
         cp_rank.embeddings = true;
         cp_rank.pooling_type = LLAMA_POOLING_TYPE_RANK;
@@ -3634,6 +3717,7 @@ Status LlamaCppBackend::ScorePairs(const std::vector<std::vector<Token>>& pairs,
         cp_rank.abort_callback = &Impl::AbortCallback;
         cp_rank.abort_callback_data = impl_.get();
         if (Status s = RunGuarded(ErrorCode::kDecodeFailed, "llama_init_from_model", [&] {
+                ScopedGgmlCudaStreamPriority cuda_prio_guard(impl_->options.aux_stream_priority);
                 impl_->rank_ctx = llama_init_from_model(impl_->model, cp_rank);
                 return Status::Ok();
             });
@@ -3673,71 +3757,101 @@ Status LlamaCppBackend::ScorePairs(const std::vector<std::vector<Token>>& pairs,
     const auto start = Clock::now();
     std::int64_t total_prompt_tokens = 0;
     Status batch_error = Status::Ok();
-    std::size_t batches_executed = 0;
+    std::size_t plan_batches_executed = 0;
+    std::size_t slices_executed = 0;
+    std::size_t gated_slices = 0;
+    std::int64_t gate_wait_ns = 0;
 
     const EmbedBatchExecStatus exec_status = ExecuteEmbedBatchPlan<double>(
         plan, cancelled,
         [&](const PlannedEmbedBatch& planned_batch, std::vector<double>& batch_out) -> bool {
-            if (planned_batch.total_tokens > static_cast<std::size_t>(INT32_MAX)) {
-                batch_error = Status::Error(ErrorCode::kContextOverflow, "rerank batch exceeds INT32_MAX");
-                return false;
-            }
-            if (Status s = ValidateBatchBounds(static_cast<int32_t>(planned_batch.total_tokens),
-                                               static_cast<int32_t>(n_batch), n_ubatch, /*require_ubatch_fit=*/true);
-                !s.ok()) {
-                batch_error = std::move(s);
-                return false;
-            }
-            if (llama_memory_t rmem = llama_get_memory(rctx); rmem != nullptr) {
-                llama_memory_clear(rmem, true);
-            }
-            BatchClear(impl_->rank_batch);
-            std::vector<int32_t> last_tok_idx;
-            last_tok_idx.reserve(planned_batch.items.size());
-            for (const EmbedBatchItem& item : planned_batch.items) {
-                if (Status s = ValidateSeqId(static_cast<int32_t>(item.seq_id), impl_->rank_seq_max); !s.ok()) {
+            const bool slice_now = aux_gate_enabled && impl_->aux_gate->IsDecodeActive(impl_->aux_domain);
+            const std::vector<PlannedEmbedBatch> slices =
+                slice_now ? SubslicePlannedBatch(planned_batch, active_tok_cap, active_seq_cap)
+                          : std::vector<PlannedEmbedBatch>{planned_batch};
+            batch_out.reserve(planned_batch.items.size());
+
+            for (const PlannedEmbedBatch& slice : slices) {
+                if (slice.total_tokens > static_cast<std::size_t>(INT32_MAX)) {
+                    batch_error = Status::Error(ErrorCode::kContextOverflow, "rerank batch exceeds INT32_MAX");
+                    return false;
+                }
+                if (Status s = ValidateBatchBounds(static_cast<int32_t>(slice.total_tokens),
+                                                   static_cast<int32_t>(n_batch), n_ubatch, /*require_ubatch_fit=*/true);
+                    !s.ok()) {
                     batch_error = std::move(s);
                     return false;
                 }
-                const auto& seq = pairs[item.original_index];
-                for (std::size_t t = 0; t < seq.size(); ++t) {
-                    BatchAdd(impl_->rank_batch, seq[t], static_cast<llama_pos>(t),
-                             static_cast<llama_seq_id>(item.seq_id), /*logits=*/true);
-                }
-                last_tok_idx.push_back(impl_->rank_batch.n_tokens - 1);
-            }
-            const int32_t rc = encoder_only ? TryEncode(rctx, impl_->rank_batch, &batch_error)
-                                            : TryDecode(rctx, impl_->rank_batch, &batch_error);
-            if (rc != 0) {
-                if (!cancelled() && batch_error.ok()) {
-                    batch_error = Status::Error(ErrorCode::kDecodeFailed,
-                                                "llama reranking pass failed (rc=" + std::to_string(rc) + ")");
-                }
-                return false;
-            }
 
-            batch_out.reserve(planned_batch.items.size());
-            for (std::size_t k = 0; k < planned_batch.items.size(); ++k) {
-                const EmbedBatchItem& item = planned_batch.items[k];
-                const float* raw = llama_get_embeddings_seq(rctx, static_cast<llama_seq_id>(item.seq_id));
-                if (raw == nullptr) {
-                    raw = llama_get_embeddings_ith(rctx, last_tok_idx[k]);
+                DecodeAwareAuxGate::AuxSliceScope gate_scope;
+                if (aux_gate_enabled) {
+                    gate_scope = impl_->aux_gate->AcquireAuxSlice(impl_->aux_domain, cancelled);
+                    if (!gate_scope.acquired()) {
+                        return false;
+                    }
+                    gate_wait_ns += gate_scope.wait_ns();
+                    if (gate_scope.gated()) ++gated_slices;
                 }
-                if (raw == nullptr) {
-                    batch_error = Status::Error(ErrorCode::kDecodeFailed, "llama.cpp returned null rerank score");
+
+                std::vector<int32_t> last_tok_idx;
+                last_tok_idx.reserve(slice.items.size());
+                int32_t rc = 0;
+                {
+                    ScopedGgmlCudaStreamPriority cuda_prio_guard(impl_->options.aux_stream_priority);
+                    if (llama_memory_t rmem = llama_get_memory(rctx); rmem != nullptr) {
+                        llama_memory_clear(rmem, true);
+                    }
+                    BatchClear(impl_->rank_batch);
+                    for (const EmbedBatchItem& item : slice.items) {
+                        if (Status s = ValidateSeqId(static_cast<int32_t>(item.seq_id), impl_->rank_seq_max);
+                            !s.ok()) {
+                            batch_error = std::move(s);
+                            return false;
+                        }
+                        const auto& seq = pairs[item.original_index];
+                        for (std::size_t t = 0; t < seq.size(); ++t) {
+                            BatchAdd(impl_->rank_batch, seq[t], static_cast<llama_pos>(t),
+                                     static_cast<llama_seq_id>(item.seq_id), /*logits=*/true);
+                        }
+                        last_tok_idx.push_back(impl_->rank_batch.n_tokens - 1);
+                    }
+                    rc = encoder_only ? TryEncode(rctx, impl_->rank_batch, &batch_error)
+                                      : TryDecode(rctx, impl_->rank_batch, &batch_error);
+                }
+                gate_scope.Release();
+
+                if (rc != 0) {
+                    if (!cancelled() && batch_error.ok()) {
+                        batch_error = Status::Error(ErrorCode::kDecodeFailed,
+                                                    "llama reranking pass failed (rc=" + std::to_string(rc) + ")");
+                    }
                     return false;
                 }
-                const double score = static_cast<double>(raw[0]);
-                if (!std::isfinite(score)) {
-                    batch_error = Status::Error(ErrorCode::kDecodeFailed, "llama.cpp returned non-finite rerank score");
-                    return false;
+
+                for (std::size_t k = 0; k < slice.items.size(); ++k) {
+                    const EmbedBatchItem& item = slice.items[k];
+                    const float* raw = llama_get_embeddings_seq(rctx, static_cast<llama_seq_id>(item.seq_id));
+                    if (raw == nullptr) {
+                        raw = llama_get_embeddings_ith(rctx, last_tok_idx[k]);
+                    }
+                    if (raw == nullptr) {
+                        batch_error = Status::Error(ErrorCode::kDecodeFailed, "llama.cpp returned null rerank score");
+                        return false;
+                    }
+                    const double score = static_cast<double>(raw[0]);
+                    if (!std::isfinite(score)) {
+                        batch_error =
+                            Status::Error(ErrorCode::kDecodeFailed, "llama.cpp returned non-finite rerank score");
+                        return false;
+                    }
+                    batch_out.push_back(score);
+                    total_prompt_tokens += static_cast<std::int64_t>(item.token_count);
                 }
-                batch_out.push_back(score);
-                total_prompt_tokens += static_cast<std::int64_t>(item.token_count);
+                ++slices_executed;
             }
             return true;
         },
-        out.scores, &batches_executed);
+        out.scores, &plan_batches_executed);
 
     if (exec_status == EmbedBatchExecStatus::kCancelled) {
         out = {};
@@ -3752,7 +3866,9 @@ Status LlamaCppBackend::ScorePairs(const std::vector<std::vector<Token>>& pairs,
     out.prompt_tokens = static_cast<std::int32_t>(
         std::min<std::int64_t>(total_prompt_tokens, static_cast<std::int64_t>(INT32_MAX)));
     out.eval_ms = MsSince(start);
-    out.batches_executed = batches_executed;
+    out.batches_executed = slices_executed;
+    out.gated_slices = gated_slices;
+    out.gate_wait_ms = static_cast<double>(gate_wait_ns) / 1e6;
     return Status::Ok();
 }
 
@@ -4275,6 +4391,15 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
     };
 
     // ---- Prefill ----
+    const bool is_aux_workload = (options.workload_role == WorkloadRole::kAuxiliary);
+    const bool gate_active = (aux_gate != nullptr && options.aux_gate.enabled);
+    const StreamPriority exec_stream_prio =
+        EffectiveMainStreamPriority(options.workload_role, options.main_stream_priority);
+    DecodeAwareAuxGate::DecodeSessionScope aux_session_guard;
+    if (!is_aux_workload && gate_active) {
+        aux_session_guard = aux_gate->EnterDecodeSession(aux_domain);
+    }
+
     const auto n_batch = static_cast<int64_t>(std::max<int32_t>(1, batch_cap));
     const auto n_ubatch = static_cast<int64_t>(std::max<uint32_t>(1, llama_n_ubatch(ctx)));
     const int64_t prefill_chunk = use_mtp ? std::min(n_batch, n_ubatch) : n_batch;
@@ -4297,9 +4422,29 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
     if (has_media) {
 #if defined(SONDER_LLAMACPP_HAS_MTMD)
         int32_t mm_prompt_tokens = 0;
-        if (Status s = EvaluateMultimodalPrompt(request, slot_id, static_cast<int32_t>(n_batch), n_ctx, cur_pos,
-                                                mm_prompt_tokens);
-            !s.ok()) {
+        DecodeAwareAuxGate::DecodeStepScope mm_step_guard;
+        DecodeAwareAuxGate::AuxSliceScope mm_slice_guard;
+        if (gate_active) {
+            if (is_aux_workload) {
+                mm_slice_guard = aux_gate->AcquireAuxSlice(aux_domain, cancelled);
+                if (!mm_slice_guard.acquired()) {
+                    result.stop_reason = StopReason::kCancelled;
+                    result.prefill_ms = MsSince(prefill_start);
+                    return result;
+                }
+            } else {
+                mm_step_guard = aux_gate->EnterDecodeStep(aux_domain);
+            }
+        }
+        Status mm_status = Status::Ok();
+        {
+            ScopedGgmlCudaStreamPriority cuda_prio_guard(exec_stream_prio);
+            mm_status = EvaluateMultimodalPrompt(request, slot_id, static_cast<int32_t>(n_batch), n_ctx, cur_pos,
+                                                 mm_prompt_tokens);
+        }
+        mm_step_guard.Release();
+        mm_slice_guard.Release();
+        if (Status s = std::move(mm_status); !s.ok()) {
             invalidate_slot();
             if (cancelled()) {
                 result.stop_reason = StopReason::kCancelled;
@@ -4321,7 +4466,13 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                 result.prefill_ms = MsSince(prefill_start);
                 return result;
             }
-            int64_t step_end = std::min(n_prompt, off + prefill_chunk);
+            int64_t effective_prefill_chunk = prefill_chunk;
+            if (is_aux_workload && gate_active && aux_gate->IsDecodeActive(aux_domain)) {
+                effective_prefill_chunk = std::min<int64_t>(
+                    effective_prefill_chunk,
+                    std::max<int64_t>(1, static_cast<int64_t>(options.aux_gate.active_slice_max_tokens)));
+            }
+            int64_t step_end = std::min(n_prompt, off + effective_prefill_chunk);
             if (capture_offset > off && step_end > capture_offset) {
                 step_end = capture_offset;
             }
@@ -4340,8 +4491,34 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                 BatchAdd(batch, request.prompt[static_cast<std::size_t>(off + j)],
                          static_cast<llama_pos>(cur_pos + j), slot_id, is_last_prompt_tok);
             }
+            DecodeAwareAuxGate::DecodeStepScope prefill_step_guard;
+            DecodeAwareAuxGate::AuxSliceScope prefill_slice_guard;
+            if (gate_active) {
+                if (is_aux_workload) {
+                    prefill_slice_guard = aux_gate->AcquireAuxSlice(aux_domain, cancelled);
+                    if (!prefill_slice_guard.acquired()) {
+                        result.stop_reason = StopReason::kCancelled;
+                        result.prefill_ms = MsSince(prefill_start);
+                        return result;
+                    }
+                } else {
+                    prefill_step_guard = aux_gate->EnterDecodeStep(aux_domain);
+                }
+            }
             Status decode_err;
-            const int32_t rc = TryDecode(ctx, batch, &decode_err);
+            int32_t rc = 0;
+            bool mtp_prefill_ok = true;
+            {
+                ScopedGgmlCudaStreamPriority cuda_prio_guard(exec_stream_prio);
+                rc = TryDecode(ctx, batch, &decode_err);
+#if defined(SONDER_LLAMACPP_HAS_MTP)
+                if (rc == 0 && use_mtp && !MtpProcessPrefill(batch, slot_id)) {
+                    mtp_prefill_ok = false;
+                }
+#endif
+            }
+            prefill_step_guard.Release();
+            prefill_slice_guard.Release();
             if (rc == 2) {
                 if (!llama_memory_seq_rm(mem, slot_id, static_cast<llama_pos>(cur_pos), -1)) {
                     invalidate_slot();
@@ -4358,8 +4535,7 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                 return fail(ErrorCode::kDecodeFailed,
                             "llama_decode failed during prefill (rc=" + std::to_string(rc) + ")");
             }
-#if defined(SONDER_LLAMACPP_HAS_MTP)
-            if (use_mtp && !MtpProcessPrefill(batch, slot_id)) {
+            if (!mtp_prefill_ok) {
                 invalidate_slot();
                 if (cancelled()) {
                     result.stop_reason = StopReason::kCancelled;
@@ -4368,7 +4544,6 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
                 }
                 return fail(ErrorCode::kDecodeFailed, "MTP draft context prefill sync failed");
             }
-#endif
             if (slot_idx < slots.size()) {
                 auto& stoks = slots[slot_idx].tokens;
                 stoks.insert(stoks.end(), request.prompt.begin() + off, request.prompt.begin() + step_end);
@@ -4601,6 +4776,20 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
             static_cast<int64_t>(request.max_new_tokens) - static_cast<int64_t>(result.generated_tokens);
         const int64_t max_k = std::min<int64_t>({rem_gen - 1, n_ctx - pos - 1, n_batch - 1, n_ubatch - 1});
 
+        DecodeAwareAuxGate::DecodeStepScope step_gpu_guard;
+        DecodeAwareAuxGate::AuxSliceScope step_aux_guard;
+        if (gate_active) {
+            if (is_aux_workload) {
+                step_aux_guard = aux_gate->AcquireAuxSlice(aux_domain, cancelled);
+                if (!step_aux_guard.acquired()) {
+                    return finish(StopReason::kCancelled);
+                }
+            } else {
+                step_gpu_guard = aux_gate->EnterDecodeStep(aux_domain);
+            }
+        }
+        std::optional<ScopedGgmlCudaStreamPriority> step_prio_guard(std::in_place, exec_stream_prio);
+
         draft_tokens.clear();
         bool step_used_suffix = false;
         const bool spec_enabled_step = use_mtp || use_suffix || use_ngram_mod || use_ngram_short;
@@ -4739,6 +4928,9 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
             (stage_prof && !draft_tokens.empty()) ? Clock::now() : Clock::time_point{};
         Status decode_err;
         const int32_t rc = TryDecode(ctx, batch, &decode_err);
+        step_prio_guard.reset();
+        step_gpu_guard.Release();
+        step_aux_guard.Release();
         if (stage_prof && !draft_tokens.empty()) {
             add_stage_ms(result.stage_timings.verify_ms, MsSince(verify_start));
         }
@@ -5918,10 +6110,17 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
     PendingRequest* inflight_admit = nullptr;
     std::size_t inflight_admit_slot = slots.size();
 
+    const bool is_aux_workload = (options.workload_role == WorkloadRole::kAuxiliary);
+    const bool gate_active = (aux_gate != nullptr && options.aux_gate.enabled);
+    const StreamPriority exec_stream_prio =
+        EffectiveMainStreamPriority(options.workload_role, options.main_stream_priority);
+    DecodeAwareAuxGate::DecodeSessionScope worker_decode_session;
+
     try {
     while (true) {
         // 0. Drain all active slots cleanly if StopBatchWorker() requested shutdown.
         if (worker_stop.load(std::memory_order_acquire)) {
+            worker_decode_session.Release();
             for (auto& sp : active) {
                 if (sp && sp->task != nullptr) {
                     finish_slot(*sp, StopReason::kCancelled);
@@ -5935,6 +6134,7 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
 
         // 1. Sleep cleanly when no active requests are in flight.
         if (active.empty()) {
+            worker_decode_session.Release();
             std::unique_lock<std::mutex> qlock(queue_mu);
             worker_cv.wait(qlock, [&] { return worker_stop.load(std::memory_order_acquire) || !pending_queue.empty(); });
             if (worker_stop.load(std::memory_order_acquire)) {
@@ -6021,10 +6221,14 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             }
         }
         if (active.empty()) {
+            worker_decode_session.Release();
             if (worker_stop.load(std::memory_order_acquire) && pending_count.load(std::memory_order_acquire) == 0) {
                 break;
             }
             continue;
+        }
+        if (!is_aux_workload && gate_active && !worker_decode_session.active()) {
+            worker_decode_session = aux_gate->EnterDecodeSession(aux_domain);
         }
 
         // 4. Case A: Zero-overhead single-request fast path when exactly 1
@@ -6042,7 +6246,13 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             if (s.phase == BatchSlotPhase::kPrefill) {
                 const auto n_prompt = static_cast<int64_t>(req.prompt.size());
                 const auto off = static_cast<int64_t>(s.prefill_offset);
-                int64_t step_end = std::min<int64_t>(n_prompt, off + static_cast<int64_t>(step_token_budget));
+                int64_t prefill_cap = static_cast<int64_t>(step_token_budget);
+                if (is_aux_workload && gate_active && aux_gate->IsDecodeActive(aux_domain)) {
+                    prefill_cap = std::min<int64_t>(
+                        prefill_cap,
+                        std::max<int64_t>(1, static_cast<int64_t>(options.aux_gate.active_slice_max_tokens)));
+                }
+                int64_t step_end = std::min<int64_t>(n_prompt, off + prefill_cap);
                 if (s.hybrid_ckpt_offset > off && step_end > s.hybrid_ckpt_offset) {
                     step_end = s.hybrid_ckpt_offset;
                 }
@@ -6053,14 +6263,35 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     BatchAdd(batch, req.prompt[static_cast<std::size_t>(off + j)],
                              static_cast<llama_pos>(s.pos + j), s.slot_id, is_last);
                 }
+                DecodeAwareAuxGate::DecodeStepScope fast_prefill_step_guard;
+                DecodeAwareAuxGate::AuxSliceScope fast_prefill_slice_guard;
+                if (gate_active) {
+                    if (is_aux_workload) {
+                        fast_prefill_slice_guard = aux_gate->AcquireAuxSlice(aux_domain, batch_abort_fn);
+                        if (!fast_prefill_slice_guard.acquired()) {
+                            batch_abort_fn = nullptr;
+                            finish_slot(s, StopReason::kCancelled);
+                            active.clear();
+                            continue;
+                        }
+                    } else {
+                        fast_prefill_step_guard = aux_gate->EnterDecodeStep(aux_domain);
+                    }
+                }
                 auto decode_start = Clock::now();
                 Status decode_err;
-                int32_t rc = TryDecode(ctx, batch, &decode_err);
-                while (rc == 1 && evict_one_idle_slot()) {
-                    abort_requested.store(false, std::memory_order_relaxed);
-                    decode_start = Clock::now();
+                int32_t rc = 0;
+                {
+                    ScopedGgmlCudaStreamPriority cuda_prio_guard(exec_stream_prio);
                     rc = TryDecode(ctx, batch, &decode_err);
+                    while (rc == 1 && evict_one_idle_slot()) {
+                        abort_requested.store(false, std::memory_order_relaxed);
+                        decode_start = Clock::now();
+                        rc = TryDecode(ctx, batch, &decode_err);
+                    }
                 }
+                fast_prefill_step_guard.Release();
+                fast_prefill_slice_guard.Release();
                 const double prefill_decode_ms = MsSince(decode_start);
                 batch_abort_fn = nullptr;
                 active_cancel = nullptr;
@@ -6263,6 +6494,23 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             const Clock::time_point draft_start =
                 (slot_stage_prof && slot_spec_active && max_k > 0) ? Clock::now() : Clock::time_point{};
 
+            DecodeAwareAuxGate::DecodeStepScope fast_dec_step_guard;
+            DecodeAwareAuxGate::AuxSliceScope fast_dec_slice_guard;
+            if (gate_active) {
+                if (is_aux_workload) {
+                    fast_dec_slice_guard = aux_gate->AcquireAuxSlice(aux_domain, batch_abort_fn);
+                    if (!fast_dec_slice_guard.acquired()) {
+                        batch_abort_fn = nullptr;
+                        finish_slot(s, StopReason::kCancelled);
+                        active.clear();
+                        continue;
+                    }
+                } else {
+                    fast_dec_step_guard = aux_gate->EnterDecodeStep(aux_domain);
+                }
+            }
+            std::optional<ScopedGgmlCudaStreamPriority> fast_dec_prio_guard(std::in_place, exec_stream_prio);
+
             if (max_k > 0) {
 #if defined(SONDER_LLAMACPP_HAS_MTP)
                 if (s.mtp_enabled) {
@@ -6405,6 +6653,9 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                 decode_start = Clock::now();
                 rc = TryDecode(ctx, batch, &decode_err);
             }
+            fast_dec_prio_guard.reset();
+            fast_dec_step_guard.Release();
+            fast_dec_slice_guard.Release();
             const double decode_call_ms = MsSince(decode_start);
             if (slot_stage_prof && !draft_tokens.empty()) {
                 add_stage_ms(s.result.stage_timings.verify_ms, decode_call_ms);
@@ -6846,15 +7097,30 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
                     return true;
                 };
 
+                DecodeAwareAuxGate::DecodeStepScope conc_step_guard;
+                DecodeAwareAuxGate::AuxSliceScope conc_slice_guard;
+                if (gate_active) {
+                    if (is_aux_workload) {
+                        conc_slice_guard = aux_gate->AcquireAuxSlice(aux_domain, batch_abort_fn);
+                    } else {
+                        conc_step_guard = aux_gate->EnterDecodeStep(aux_domain);
+                    }
+                }
                 const auto step_start = Clock::now();
                 auto decode_start = step_start;
                 Status decode_err;
-                int32_t rc = TryDecode(ctx, batch, &decode_err);
-                while (rc == 1 && evict_one_idle_slot()) {
-                    abort_requested.store(false, std::memory_order_relaxed);
-                    decode_start = Clock::now();
+                int32_t rc = 2;
+                if (!is_aux_workload || !gate_active || conc_slice_guard.acquired()) {
+                    ScopedGgmlCudaStreamPriority cuda_prio_guard(exec_stream_prio);
                     rc = TryDecode(ctx, batch, &decode_err);
+                    while (rc == 1 && evict_one_idle_slot()) {
+                        abort_requested.store(false, std::memory_order_relaxed);
+                        decode_start = Clock::now();
+                        rc = TryDecode(ctx, batch, &decode_err);
+                    }
                 }
+                conc_step_guard.Release();
+                conc_slice_guard.Release();
                 const double decode_call_ms = MsSince(decode_start);
                 batch_abort_fn = nullptr;
 
@@ -7286,10 +7552,22 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             return true;
         };
 
+        DecodeAwareAuxGate::DecodeStepScope batch_step_guard;
+        DecodeAwareAuxGate::AuxSliceScope batch_slice_guard;
+        if (gate_active) {
+            if (is_aux_workload) {
+                batch_slice_guard = aux_gate->AcquireAuxSlice(aux_domain, batch_abort_fn);
+            } else {
+                batch_step_guard = aux_gate->EnterDecodeStep(aux_domain);
+            }
+        }
+        std::optional<ScopedGgmlCudaStreamPriority> batch_prio_guard(std::in_place, exec_stream_prio);
         const auto step_start = Clock::now();
         auto decode_start = step_start;
         Status decode_err;
-        int32_t rc = TryDecode(ctx, batch, &decode_err);
+        int32_t rc = (!is_aux_workload || !gate_active || batch_slice_guard.acquired())
+                         ? TryDecode(ctx, batch, &decode_err)
+                         : 2;
 
         // Under unified KV (`kv_unified=true`), idle prefix-cached slots share
         // the same n_ctx pool; evict LRU idle slots before retrying on rc==1.
@@ -7382,6 +7660,9 @@ void LlamaCppBackend::Impl::BatchWorkerLoop() {
             decode_start = Clock::now();
             rc = TryDecode(ctx, batch, &decode_err);
         }
+        batch_prio_guard.reset();
+        batch_step_guard.Release();
+        batch_slice_guard.Release();
         const double decode_call_ms = MsSince(decode_start);
         batch_abort_fn = nullptr;
 

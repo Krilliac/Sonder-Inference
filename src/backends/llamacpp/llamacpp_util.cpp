@@ -449,6 +449,21 @@ Status ValidateContextOptions(const LoadOptions& options) {
                              "embed_max_sequences (" + std::to_string(options.embed_max_sequences) +
                                  ") must be <= " + std::to_string(kMaxEmbedSequences));
     }
+    if (ToString(options.workload_role) == "unknown") {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "unknown workload_role (expected main_decode or auxiliary)");
+    }
+    if (ToString(options.main_stream_priority) == "unknown") {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "unknown main_stream_priority (expected default, high or low)");
+    }
+    if (ToString(options.aux_stream_priority) == "unknown") {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "unknown aux_stream_priority (expected default, high or low)");
+    }
+    if (Status s = ValidateAuxGateConfig(options.aux_gate); !s.ok()) {
+        return s;
+    }
     // n_batch == 0 keeps its own, older error in Load().
     if (options.n_batch > 0 && options.n_ubatch > options.n_batch) {
         return Status::Error(ErrorCode::kInvalidArgument,

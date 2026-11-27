@@ -250,6 +250,20 @@ foreach(sonder_llamacpp_upstream_target IN ITEMS llama)
     endif()
 endforeach()
 
+# Thread-scoped CUDA stream priority state shared by sonder_backend_llamacpp and
+# ggml-cuda (placed downstream of both static archives in link order).
+add_library(sonder_cuda_prio_state STATIC sonder_cuda_prio_state.cpp)
+target_compile_features(sonder_cuda_prio_state PRIVATE cxx_std_17)
+set_target_properties(sonder_cuda_prio_state PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(COMMAND sonder_set_warnings)
+    sonder_set_warnings(sonder_cuda_prio_state)
+endif()
+if(TARGET ggml-cuda AND NOT GGML_HIP AND NOT GGML_MUSA)
+    target_compile_options(ggml-cuda PRIVATE
+        "$<$<COMPILE_LANGUAGE:CUDA>:--pre-include=${CMAKE_CURRENT_SOURCE_DIR}/sonder_ggml_cuda_stream_priority.cuh>")
+    target_link_libraries(ggml-cuda PRIVATE sonder_cuda_prio_state)
+endif()
+
 # Feature auto-detection against the resolved llama.cpp / ggml headers so the
 # pinned mainline tag, older trees (b11195) and newer/forked trees (e.g. PrismML-Eng/llama.cpp)
 # build cleanly without breaking older APIs.
@@ -448,6 +462,7 @@ endif()
 # --- expected features end ---
 
 add_library(sonder_backend_llamacpp STATIC
+    aux_stream_gate.cpp
     gguf_compat.cpp
     llamacpp_backend.cpp
     llamacpp_util.cpp
@@ -462,7 +477,7 @@ target_include_directories(sonder_backend_llamacpp
 )
 target_compile_features(sonder_backend_llamacpp PUBLIC cxx_std_20)
 # llama.h stays private: nothing outside this directory sees llama.cpp types.
-target_link_libraries(sonder_backend_llamacpp PRIVATE llama ggml ${SONDER_LLAMACPP_EXTRA_LIBS})
+target_link_libraries(sonder_backend_llamacpp PRIVATE llama ggml ${SONDER_LLAMACPP_EXTRA_LIBS} sonder_cuda_prio_state)
 target_compile_definitions(sonder_backend_llamacpp
     PUBLIC  ${SONDER_LLAMACPP_FEATURE_DEFS}
     PRIVATE SONDER_LLAMACPP_TAG_STRING="${SONDER_LLAMACPP_RESOLVED_TAG}"
