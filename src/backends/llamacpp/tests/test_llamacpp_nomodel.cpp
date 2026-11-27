@@ -24,7 +24,7 @@ using namespace sonder::backends::llamacpp;
 #endif
 
 TEST_CASE("llamacpp wrapper: pinned version and CPU device") {
-    CHECK(LlamaCppBackend::UpstreamVersion() == "b11195");
+    CHECK(LlamaCppBackend::UpstreamVersion() == SONDER_EXPECTED_LLAMACPP_TAG);
     const auto devices = LlamaCppBackend::EnumerateDevices();
     bool has_cpu = false;
     for (const auto& d : devices) has_cpu = has_cpu || d.kind == DeviceKind::kCpu;

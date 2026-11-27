@@ -84,7 +84,7 @@ engine.register_backend(sonder::inference::make_llamacpp_backend());
   the core Backend adapter (stop sequences, cancellation) and Engine + Session
   with Observatory telemetry.
 
-Verified on Linux against main `0c0b054` (preset `ci-linux`, GCC, Ninja,
+Historical record from the previous pin (not re-run at the current pin). Verified on Linux against main `0c0b054` (preset `ci-linux`, GCC, Ninja,
 `SONDER_WARNINGS_AS_ERRORS=ON`, `GGML_NATIVE=OFF`, root guard removed
 locally): full suite 108 tests, 107 passed + `sonder.llamacpp.integration`
 skipped (16 llamacpp unit cases among them). Sources also compile warning-free
@@ -100,25 +100,37 @@ Known noise: when a request is cancelled mid-`llama_decode`, llama.cpp logs
 `llama_decode: failed to decode, ret = 2` at error level. That is the expected
 abort path. Set `SONDER_LLAMACPP_VERBOSE=1` to see llama.cpp's info logs.
 
-Offline builds: `-DFETCHCONTENT_SOURCE_DIR_LLAMACPP=/path/to/llama.cpp-b11195`.
+Offline builds: `-DFETCHCONTENT_SOURCE_DIR_LLAMACPP=/path/to/llama.cpp-v1.0.0` (any checkout of
+the pinned commit).
+
+The pin lives in `cmake/llamacpp-pin.json` (one entry per track; select with
+`-DSONDER_LLAMACPP_TRACK=mainline`). `SONDER_LLAMACPP_TAG`, `_URL` and `_SHA256` are
+override-only (empty by default): a tag override needs a different SHA-256 or configure
+fails, and a cached SHA-256 that equals the last applied or a legacy default moves to the
+manifest value with a STATUS line. `python -I scripts/llamacpp_pin.py verify --tarball T
+--git-dir G --commit C` compares every tarball file against the git tree.
 
 ## 4. Entry for docs/LICENSE_REVIEW.md
 
 ```markdown
 ### llama.cpp / GGML
 - repository: https://github.com/ggml-org/llama.cpp (ggml vendored in-tree under `ggml/`)
-- revision/tag: `b11195` (commit `d834d44e643681f7b046a22d357335f6f4ff6107`); fetched by
+- revision/tag: `v1.0.0` (commit `b1b770d90d94cad9e9ea5b993bdbc383a522fb28`); fetched by
   CMake FetchContent from the GitHub tag tarball, SHA-256
-  `d9818b7786c8a3b063bac7eb7dc8710e275638f1e288e206720c9e22e7ca216a`
-- evaluated: 2026-09-26
-- license: MIT ("Copyright (c) 2023-2026 The ggml authors"), top-level `LICENSE` at that tag;
-  ggml has no separate license file in-tree (covered by the same MIT license)
+  `3f5f750e36326aea4d65c7623e7d597a33e395d65f4d76e5e0532171f252532b`
+- pin manifest: `cmake/llamacpp-pin.json` is the single source of the tag, commit and SHA-256 above;
+  `python -I scripts/llamacpp_pin.py check` fails when this entry disagrees with it
+- evaluated: 2026-09-26 (first pin); re-checked 2026-11-26 for the move to this tag
+- license: MIT ("Copyright (c) 2023-2026 The ggml authors"), top-level `LICENSE` at that tag
+  (byte-identical to the first pin's); ggml has no separate license file in-tree (covered by
+  the same MIT license)
 - intended use: first native execution backend (`src/backends/llamacpp`), optional,
   `SONDER_WITH_LLAMA_CPP=OFF` by default
 - linkage/process boundary: in-process static linking of `llama` and `ggml` (+ ggml-cpu)
   libraries built from source; no llama.cpp code copied into this repository
 - subdependencies: only the `llama`, `ggml`, `ggml-base` and `ggml-cpu` archives are built
-  and linked (`llama` links only `ggml`). llama.cpp's `vendor/` (nlohmann/json MIT,
+  and linked (`llama` links `ggml` and the platform thread library). llama.cpp's `vendor/`
+  (nlohmann/json MIT,
   miniaudio, stb, sheredom, hash libs; cpp-httplib skipped) is configured but not
   compiled into or linked with those archives, with
   `LLAMA_BUILD_COMMON/TOOLS/SERVER/EXAMPLES/TESTS=OFF` and `LLAMA_OPENSSL=OFF`. ggml uses the toolchain's OpenMP
@@ -131,7 +143,11 @@ Offline builds: `-DFETCHCONTENT_SOURCE_DIR_LLAMACPP=/path/to/llama.cpp-b11195`.
   supplied at runtime via `SONDER_TEST_GGUF` and carry their own licenses (the tinyllamas
   stories models used for local verification come from karpathy/llama2.c, MIT)
 - security/maintenance notes: fast-moving upstream (tagged builds several times a day); pin is
-  bumped deliberately by changing tag + SHA-256 together in `src/backends/llamacpp/CMakeLists.txt`.
+  bumped deliberately by changing tag, commit, URL and SHA-256 together in `cmake/llamacpp-pin.json`
+  and verifying the tarball with `python -I scripts/llamacpp_pin.py verify`.
+  The ggml RPC server is not built here (`GGML_RPC` off); this tag predates upstream's
+  server-side RPC request validation (see docs/BACKENDS.md), so any separately built
+  `rpc-server` from it stays on a private link.
   GGUF files are untrusted input parsed by llama.cpp; load only trusted model files.
   GitHub tag tarballs are pinned by hash; if GitHub regenerates an archive the hash check fails
   closed (update hash after verifying the tag commit)
@@ -148,5 +164,8 @@ Offline builds: `-DFETCHCONTENT_SOURCE_DIR_LLAMACPP=/path/to/llama.cpp-b11195`.
   (approved 2026-09-26).
 - CI: optional job `llamacpp-windows` (windows-latest, MSVC,
   `SONDER_WITH_LLAMA_CPP=ON`, `GGML_NATIVE=OFF`, `continue-on-error`), with the
-  pinned source tarball cached and passed via `FETCHCONTENT_SOURCE_DIR_LLAMACPP`.
+  pinned source tarball cached and passed as a plain local path through
+  `SONDER_LLAMACPP_URL`, so FetchContent re-checks the manifest SHA-256. (A
+  `file:///D:/...` URL fails on Windows: CMake's verify step looks for
+  `/D:/...`.)
   The default ubuntu/windows jobs keep the option OFF.
