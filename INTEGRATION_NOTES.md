@@ -640,3 +640,147 @@ Not done / not verified:
   design decision (some faults are legitimately invisible to the driver).
 - `--request-timeout` is exact over the body; a server trickling header bytes
   can overrun it by up to one per-operation wait.
+
+## `claude/ret-04-model-store` (module `src/models`)
+
+Read-only reader that serves an existing Ollama model library in place (manifests-v2 and legacy
+trees, manifest lists, params/template/system records, unsupported-entry reasons, opt-in digest
+verification), the `ModelRegistry` lookup and `sonder-infer models import-ollama`. Reference:
+`docs/integration/model-store.md`.
+
+Changes outside the module, for the integrator:
+
+1. Root `CMakeLists.txt`: `src/models` added to `SONDER_MODULE_DIRS` (one line). The module needs
+   only core code (`json`, `common/sha256`, `common/safe_file`) and defines `SONDER_HAS_MODEL_STORE`.
+   Security review follow-up (PR 135): the root file also adds `src/common/safe_file_win32.cpp` /
+   `safe_file_posix.cpp` to the core library (one `if(WIN32)` block), and (round 2) links `ntdll`
+   on Windows for `NtCreateFile` (handle-relative opens).
+2. `src/cli/sonder_infer_commands.hpp`: the `models` spec gains the `models import-ollama` usage
+   line, a note and an example. `tools/sonder-infer/main.cpp`: `models import-ollama` dispatches
+   to `models::models_main` behind `SONDER_HAS_MODEL_STORE` (before the generic `models` command,
+   so `models --backend ...` is unchanged); without the module it prints an error and exits 2.
+3. `tests/CMakeLists.txt`: six `sonder.cli.models_import_ollama_*` tests that run the real
+   `sonder-infer` binary against `tests/fixtures/model_store_empty` (an empty `manifests-v2/`), so
+   the executable dispatch, `--json`, `--help`, the exit codes and a drive-shaped host name
+   (`c:5000/ns/model:tag`) are covered end to end; gated on `SONDER_HAS_MODEL_STORE`.
+4. `docs/MODULES.md` (module row) and `docs/CLI.md` (`models` row).
+5. `src/common/safe_file.hpp` + `safe_file_{win32,posix}.cpp` (new, core): the handle-anchored
+   no-follow opens (`OwnedFileHandle`, `open_anchored_regular`, `open_single_regular`,
+   `is_link_like`) moved out of `src/artifacts/src/weight_manifest_io_{win32,posix}.cpp`, plus a
+   check that rejects empty/`.`/`..`/NUL (and on Windows `:`/`\`) segments before opening.
+   Round 2 of the review made every traversal start from an open directory handle:
+   `open_anchor_dir` (follows a link at the root once), `open_anchored_file(anchor, rel, ShareMode,
+   ...)` (Windows: `NtCreateFile` relative to the previous handle with `FILE_OPEN_REPARSE_POINT`;
+   POSIX: `openat` + `O_NOFOLLOW`; `ShareMode::deny_writers` opens without `FILE_SHARE_WRITE`/
+   `FILE_SHARE_DELETE` on Windows), `probe_anchored_dir`, `visit_anchored_dir` (handle-based,
+   streamed enumeration with an entry cap; round 3 replaced `list_anchored_dir`, which returned a
+   vector of every entry), `read_anchored_leaf_symlink` (POSIX: `readlinkat` + `lstat` only, the
+   target is never resolved), `query_identity` (Windows: 128-bit `FILE_ID_INFO` id and 64-bit
+   volume serial; the 64-bit fallback only for an unsupported class, marked
+   `FileIdentity::weak_id`, which round 4 carries into the store's `FileStamp::weak_id` so such a
+   file is hashed on every `first_use` resolve and never looked up in or added to the remembered
+   digests), `read_some` and `OwnedFileHandle::release`. Round 3 also opens directories without
+   `FILE_DIRECTORY_FILE` (the attributes are checked on the handle). Round 4 adds two test aids:
+   `set_weak_identity_for_testing` (one atomic flag that marks every identity weak) and
+   `dir_entries_visited_on_this_thread` (a thread-local count of the entries `visit_anchored_dir`
+   handed to a callback). Round 5 compiles both only when `SONDER_INFERENCE_TEST_HOOKS` is defined
+   (the root `CMakeLists.txt` defines it, publicly, exactly when `SONDER_BUILD_TESTS` is on), so a
+   library built with `-DSONDER_BUILD_TESTS=OFF` has neither the flag nor a way to set it; the two
+   tests that use them are guarded the same way. `open_anchored_regular(path, ...)` keeps its
+   signature (it pins the path, then opens relative to it), so `src/artifacts` is unchanged apart
+   from now using the relative opens; the `sonder.artifacts.*` tests cover it. `src/artifacts`
+   keeps only `hash_open_handle`; `weight_manifest_io.hpp` re-exports the shared names with
+   using-declarations.
+6. `include/sonder/inference/json.hpp` / `src/common/json.cpp`: `ParseLimits::reject_duplicate_keys`
+   (default `false`, so every existing caller behaves as before); the model store parses manifests
+   with it. Test: `tests/test_json.cpp` "ParseLimits reject_duplicate_keys ...".
+
+Integration hook (not wired in this lane): the native llamacpp backend should call
+`ModelRegistry::add_ollama_dir(default_ollama_models_dir())` once and, when a model name is not an
+existing file path, `resolve_for_load(name)` (never `resolve` for loading). It must load only from
+the returned `VerifiedWeights` handles (`weights.files()[i].native_handle`, matched to the record's
+model, shard, projector, adapter and draft layers by `find(digest)`; `draft_paths`: first = draft
+model, rest = its shards), keep that object alive while the model is mapped, and never reopen
+`model_path` or any other record path. By default `resolve_for_load` hashes every weight through
+those handles (`weights.verified()`); the loader should refuse to load when `verified()` is false
+unless the operator chose `first_use` or `off`. `verified()` means "hashed through this handle in
+this call", not that the bytes are immutable from then on: POSIX cannot deny writers, and Windows
+cannot revoke a writable mapping made before the open, so the loader security review must treat it
+as a past hash. Use `params`, `template_text` and `system_prompt` as request defaults (a record
+with `text_omitted` did not keep them; `resolve_for_load` never returns one). `resolve_for_load`
+takes no registry lock while it reads the disk, a miss streams only the directories on the name's
+path (at most `ScanLimits::max_scan_entries` entries in all), and `StoreOptions::on_weight_hash`
+runs while its thread holds no hash slot or single-flight claim: it may wait for other threads
+that use the registry, but on its own thread every store and registry entry point fails at once
+(`invalid_state`). Hashing is bounded by default (round 5): `max_weight_file_bytes` 1 TiB per file,
+`max_resolve_weight_bytes` 2 TiB of declared weights per resolve (refused before any hashing),
+and `weight_hash_timeout` 3 hours for all the hashing of one resolve or one `verify_blobs()` call
+(`kDefaultWeightHashTimeout`; zero disables it). `StoreOptions::weight_hash_cancel` is store-wide
+and never resettable (a shutdown switch); `ResolveOptions::cancel`, an optional last argument of
+`resolve()` / `resolve_for_load()` on the store and the registry, cancels one call, including its
+wait for a hash slot. A service should still choose its own timeout and rate-limit callers that
+retry after `hash_limit`. `text_omitted` now also covers config and params (round 5: every small
+layer a scan keeps is charged to `ScanLimits::max_retained_text_bytes`, one allowance shared by
+all the stores of a registry, with per-field caps on what a record keeps); `revalidate()` returns
+false for such a record. The JSON document is `sonder.inference.model_store/2` (round 4:
+`weight_check` and `text_omitted` added, `weights_verified` means hashed in this call).
+
+Round 7 (PR 135, scoped final round): fixed `verify_blobs()` reporting success for a record whose
+blob inventory was dropped (it now refuses `text_omitted` / `incomplete` / blob-less records:
+`VerifyReport::inventory_complete == false`, `refusal` set, nothing hashed; `VerifyReport::ok()` is
+false for an empty report; `models import-ollama --verify` reports such an entry FAILED and exits
+1, it does not re-resolve it); stripped config strings are released by swap (libstdc++ kept their
+buffers), a record that does not fit the budget even collapsed is not retained at all (null from
+`retain`), and the collapsed base detail is clipped to a length whose capacity cannot pass the
+256-byte base; `refresh()` identifies its old records by control block (`std::owner_less`), not by
+address; the deadline and cancel are re-checked right after `on_weight_hash` returns, before a
+remembered digest is accepted.
+
+Public API of the module after rounds 5 to 7 (`sonder/inference/model_store.hpp`):
+
+- `OllamaStore::scan(const ResolveOptions& call = {})`, `resolve(name, call)`,
+  `resolve_for_load(name, policy, call)`; `ResolveOptions::cancel` cancels one call.
+- `ModelRegistry::add_ollama_dir(path, const ResolveOptions& = {}) -> Status` and
+  `refresh(const ResolveOptions& = {})`: one scan at a time (an internal scan mutex), one shared
+  retained-content allowance (`StoreOptions::limits.max_retained_text_bytes`) over every store
+  and every cached record; both are refused with `invalid_state` / do nothing on an
+  `on_weight_hash` thread.
+- `ModelRegistry::retained_bytes_now()` / `retained_bytes_peak()`: the registry-owned retained
+  bytes (diagnostic counters, see the follow-ups below for what they do not cover).
+- `EntryStatus::{ready, unsupported, incomplete}`: `incomplete` is a record whose small layers
+  were not all kept (`text_omitted`); `ModelRecord::ready()` is true only for `ready`; JSON
+  `status` is `"incomplete"` for it.
+- `VerifyReport::{blobs, inventory_complete, refusal, ok()}`.
+
+Known follow-ups (out of scope for round 7, one line each):
+
+- Lifetime-tracked budget leases: records still held by resolvers or `list()` snapshots after a
+  refresh erases them are not charged, so the peak is a counter of registry-owned bytes, not a hard
+  memory bound.
+- Base fields are not charged: name, manifest path, store root, model path; nor is the
+  `params.extra` / `json::Object` member-vector or key capacity (`json_cost` counts by size).
+- `RetainBudget::reached` is sticky for the whole refresh, so one early overflow omits all later layers.
+- Under `always`, a name can be missing from `list()` for as long as its hash takes during a refresh.
+- An exception mid-refresh erases the old records of stores not yet rescanned.
+- `add_ollama_dir` waits on `scan_mutex_` with no bound or cancel.
+- `add_ollama_dir`'s duplicate check ignores `live_`, so a later store can shadow a live-resolved earlier one.
+- Incomplete records are hashed during an `always` scan.
+- Test hooks are present (and cost a global mutex per hashed file) in every tests-ON build.
+- Two tests are weaker than their names: add-during-refresh overlap, and peak measured by its own counter.
+- The refresh generation test cannot force address reuse; the control-block identity is argued in a comment only.
+
+Open items:
+
+- No model was loaded and no inference service was started; loadability of `runner: ggml` entries
+  by llama.cpp is unverified.
+- No persistence for registered stores; digest references and the `@digest` name suffix are not
+  resolved (see the doc's open-items list).
+- llama.cpp opens model files by path itself, so the hook above needs a handle- or memory-based
+  load path in the loader lane before it can be wired. POSIX has no deny-write, so a writer can
+  still change a blob after it was hashed there; on Windows a held blob blocks `ollama rm` and
+  re-pulls of it (doc "Trust and verification", "Known limits").
+- The case-insensitive directory lookup (`locate_ci`) only finds anything on case-sensitive file
+  systems. Its entry bound is tested everywhere (a miss walks it on any file system); its
+  differently cased matches run only where the test directory is case-sensitive (Linux, or a
+  Windows directory with per-directory case sensitivity enabled).
+- The real-store totals in the doc were measured before the CLI counted shared blobs once.

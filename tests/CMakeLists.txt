@@ -100,6 +100,10 @@ if(SONDER_BUILD_CLI)
     if("SONDER_HAS_BENCH=1" IN_LIST sonder_defs)
         set(sonder_cli_has_bench ON)
     endif()
+    set(sonder_cli_has_model_store OFF)
+    if("SONDER_HAS_MODEL_STORE=1" IN_LIST sonder_defs)
+        set(sonder_cli_has_model_store ON)
+    endif()
 
     # Patterns must not contain an unbalanced '[' (CMake list syntax); use '.'.
     # sonder_cli_test(<name> RC <code> COMMAND <exe> <args>... [ENV VAR=value...]
@@ -403,6 +407,25 @@ grep -q 'outcome=cancelled' \"$2\" || { echo 'no outcome=cancelled stats line'; 
     else()
         sonder_cli_test(serve_not_built RC 2 STDERR_REGEX "does not include the server module"
             COMMAND ${infer} serve --backend mock)
+    endif()
+
+    # --- models import-ollama through the real sonder-infer binary (src/models) ---
+    # The module's own doctest calls models_main directly; these prove the executable dispatches to it.
+    if(sonder_cli_has_model_store)
+        set(model_store_empty "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/model_store_empty")
+        sonder_cli_test(models_import_ollama_lists RC 0 STDOUT_REGEX "0 entries: 0 ready"
+            COMMAND ${infer} models import-ollama ${model_store_empty})
+        sonder_cli_test(models_import_ollama_json RC 0 STDOUT_JSON STDOUT_REGEX "sonder.inference.model_store/2"
+            COMMAND ${infer} models import-ollama ${model_store_empty} --json)
+        sonder_cli_test(models_import_ollama_help RC 0 STDOUT_REGEX "usage: sonder-infer models import-ollama"
+            COMMAND ${infer} models import-ollama --help)
+        sonder_cli_test(models_import_ollama_unknown_name RC 1 STDERR_REGEX "not in"
+            COMMAND ${infer} models import-ollama ${model_store_empty} --name ghost:1)
+        # A port host with a drive-letter shape must not reach outside the store (review RET-04 blocking 1).
+        sonder_cli_test(models_import_ollama_drive_host_not_found RC 1 STDERR_REGEX "not in"
+            COMMAND ${infer} models import-ollama ${model_store_empty} --name c:5000/ns/model:tag)
+        sonder_cli_test(models_import_ollama_bad_option RC 2 STDERR_REGEX "bogus"
+            COMMAND ${infer} models import-ollama ${model_store_empty} --bogus)
     endif()
 
     # --- sonder-bench -------------------------------------------------------

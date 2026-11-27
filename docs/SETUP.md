@@ -19,13 +19,14 @@ errors, shutdown), [llama-server backend](integration/llama-server.md),
 
 `sonder-infer serve` needs one `--backend` (or the environment variable
 `SONDER_INFER_BACKEND`). Without it, `serve` stops with exit code 2 and
-`error: --backend is required (mock, ollama, llamacpp or llamaserver; or set
-SONDER_INFER_BACKEND)` (`src/server/src/serve_main.cpp:654-657`, run
-2026-11-20).
+`error: --backend is required (mock, remote-mock, ollama, llamacpp or llamaserver; or set
+SONDER_INFER_BACKEND)` (current source: `src/server/src/serve_options.cpp`;
+backend list updated for ARCH-01 on 2026-11-26).
 
 | Backend | Needs | Where inference runs | Pick it when |
 | --- | --- | --- | --- |
 | `mock` | nothing; in every build | nowhere: synthetic output | Checking the install, a proxy, tokens or a client. Never for quality or speed. |
+| `remote-mock` | worker module; Windows or Linux | synthetic output in a supervised `sonder-infer worker` | Checking private IPC, isolation and recovery without a GPU. See [ARCH-01](design/ARCH-01-multiprocess.md). |
 | `ollama` | an Ollama server; in the normal build | in Ollama, local by default | You already run Ollama on this machine. A remote Ollama needs a TLS build and has hard limits (see [Remote Ollama](#remote-ollama-from-sonder-inference)). |
 | `llamacpp` | a build with `-DSONDER_WITH_LLAMA_CPP=ON`; GGUF files | inside the `sonder-infer` process | One process with no second server, CPU or GPU, and you accept building llama.cpp. |
 | `llamaserver` | an external `llama-server`, or any OpenAI-style server | in that server (attach) or a child process Sonder starts (spawn) | You want llama.cpp features without compiling it into `sonder-infer`, launch profiles, or an upstream that is remote or not llama.cpp. |
@@ -711,7 +712,7 @@ were reproduced on 2026-11-20; the others are quoted from the code.
 
 | Message or response | Cause | Fix |
 | --- | --- | --- |
-| `--backend is required (mock, ollama, llamacpp or llamaserver; or set SONDER_INFER_BACKEND)` (run) | No backend given | Pass `--backend` or set the variable. |
+| `--backend is required (mock, remote-mock, ollama, llamacpp or llamaserver; or set SONDER_INFER_BACKEND)` | No backend given | Pass `--backend` or set the variable. |
 | `--model is required for backend ollama` (run) | Backend needs a model | Add `--model` or `SONDER_INFER_MODEL`. |
 | `this build does not include the llamacpp backend (configure with SONDER_WITH_LLAMA_CPP=ON)` | Binary lacks llama.cpp | Rebuild with the option, or use `llamaserver`. |
 | `--host <addr> is not a loopback address; a non-loopback bind requires --token-file` (run) | Non-loopback bind without a token | Add `--token-file`. |
