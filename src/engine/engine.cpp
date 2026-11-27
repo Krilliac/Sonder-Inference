@@ -7,6 +7,9 @@
 #include "engine/request_runtime.hpp"
 #include "sonder/inference/backends.hpp"
 
+// Defined in the generated build_commit.cpp (cmake/SonderBuildInfo.cmake).
+const char* sonder_build_commit_string();
+
 namespace sonder::inference {
 
 namespace {
@@ -22,12 +25,9 @@ std::uint64_t saturating_add(std::uint64_t a, std::uint64_t b) noexcept {
 #ifndef SONDER_INFERENCE_VERSION
 #define SONDER_INFERENCE_VERSION "0.0.0"
 #endif
-#ifndef SONDER_INFERENCE_GIT_COMMIT
-#define SONDER_INFERENCE_GIT_COMMIT "unknown"
-#endif
 
 const char* version_string() noexcept { return SONDER_INFERENCE_VERSION; }
-const char* build_commit() noexcept { return SONDER_INFERENCE_GIT_COMMIT; }
+const char* build_commit() noexcept { return ::sonder_build_commit_string(); }
 
 const char* to_string(SchedulerMode mode) noexcept {
     switch (mode) {

@@ -110,8 +110,8 @@ Gate: measurable win on agent fan-out/long-context workloads without interactive
 ## Phase 4 — heterogeneous nodes
 
 - [x] node capability inventory (`sonder-infer node [--json]` and `GET /v1/sonder/node`, schema `sonder.inference.node/1`, reporting host memory, CPU, GPUs, backends, residency, profiles, and feature capabilities; advertised in `/.well-known/sonder-telemetry`)
-- [ ] whole-request placement
-- [ ] remote workers
+- [ ] whole-request placement (Runtime-owned: the Runtime places requests across N SI endpoints and SI is a worker; see ADR-021 and `docs/integration/federation-worker-contract.md`)
+- [ ] remote workers (deferred; SI-to-SI workers are not planned, `DeviceKind::remote` is reserved for the RPC capacity tier)
 - [ ] transfer-cost model
 - [ ] remote cache movement where justified
 - [ ] background workload offload

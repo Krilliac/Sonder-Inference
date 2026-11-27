@@ -281,6 +281,16 @@ target_compile_definitions(sonder_backend_llamacpp
 if(COMMAND sonder_set_warnings)
     sonder_set_warnings(sonder_backend_llamacpp)
 endif()
+# llama.cpp reports grammar violations by throwing std::runtime_error through its extern "C" API
+# (llama_sampler_accept / llama_sampler_apply). Under MSVC /EHsc the compiler assumes extern "C"
+# functions never throw, can drop our try/catch around those calls and the exception then hits a
+# noexcept frame (std::terminate). /EHs (without the "c") keeps the catch. Scoped to this target.
+if(MSVC)
+    # /EHsc arrives from both CMAKE_CXX_FLAGS and sonder_set_warnings. Each /EH letter is independent
+    # and the last instance wins, so appending /EHc- turns off only the "c" (keeping "s"). This also
+    # applies to clang-cl, whose driver parses the letters the same way.
+    target_compile_options(sonder_backend_llamacpp PRIVATE /EHs /EHc-)
+endif()
 
 # Core adapter: sonder::inference::Backend implementation compiled into the
 # core library, which links the wrapper.

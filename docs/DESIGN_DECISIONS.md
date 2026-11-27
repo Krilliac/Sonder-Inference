@@ -303,3 +303,17 @@ validation and copy ownership without changing native session/run ownership,
 request IDs, telemetry schema or scheduling. The scheduling/request metadata
 and telemetry callback roadmap umbrella remains incomplete. See
 [integration/cabi-request-parent.md](integration/cabi-request-parent.md).
+
+## ADR-021 — Runtime-owned whole-request federation; SI is a worker — 2026-11-26
+
+**Decision:** Sonder Runtime places whole requests across N Sonder-Inference
+endpoints. SI stays a worker: it exposes health, node and identity and
+reports clearly whether a failed request executed, but does not route, forward
+or retry. SI-to-SI remote workers are deferred. `DeviceKind::remote`
+(`include/sonder/inference/device.hpp`) is reserved for the RPC capacity tier
+(POOL-21).
+
+**Reason:** one owner for placement and retry avoids duplicate or looping
+retries and keeps SI's boundary with the Runtime (ADR-020) unchanged. The
+fields and status/code pairs the router may rely on are listed in
+[integration/federation-worker-contract.md](integration/federation-worker-contract.md).
