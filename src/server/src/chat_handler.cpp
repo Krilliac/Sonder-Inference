@@ -985,7 +985,10 @@ void execute_embeddings(ChatExchange& ex, const EmbedJob& job, const Correlation
     embed_req.normalize = job.normalize;
     embed_req.dimensions = job.dimensions;
     embed_req.pooling_type = job.pooling_type;
-    embed_req.encoding_format = job.encoding_format;
+    // Backends always return float vectors; build_embeddings_response() owns
+    // base64 wire encoding so upstream backends (e.g. llamaserver) never receive
+    // a wire format their response parser does not decode.
+    embed_req.encoding_format = "float";
     auto result = session->embed(embed_req, ro);
     end_request();
 

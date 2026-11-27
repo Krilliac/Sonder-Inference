@@ -32,6 +32,7 @@ struct FakeEmbedEngine final : si::Backend {
         std::vector<si::EmbedRequest> seen;
         std::vector<std::vector<float>> vectors{{0.0f, 0.5f, 3.0f}, {1.0f, -2.5f, 0.25f}};
         std::uint64_t prompt_tokens = 7;
+        bool reject_non_float = false;
     };
     struct Model final : si::BackendModel {
         si::ModelDescriptor desc;
@@ -49,6 +50,9 @@ struct FakeEmbedEngine final : si::Backend {
         si::Result<si::EmbedResult> embed(const si::EmbedRequest& request, const si::CancellationToken&) override {
             std::lock_guard<std::mutex> lock(state->mu);
             state->seen.push_back(request);
+            if (state->reject_non_float && !request.encoding_format.empty() && request.encoding_format != "float") {
+                return si::Status(si::ErrorCode::protocol_error, "missing embedding vector");
+            }
             si::EmbedResult r;
             const std::size_t n = request.inputs.size() + request.token_inputs.size();
             for (std::size_t i = 0; i < n; ++i) r.embeddings.push_back(state->vectors[i % state->vectors.size()]);
@@ -386,7 +390,8 @@ TEST_CASE("http /v1/embeddings: token arrays reach the engine as token ids, base
         REQUIRE(seen.token_inputs.size() == 2u);
         CHECK(seen.token_inputs[0] == std::vector<si::TokenId>{101, 2023, 102});
         CHECK(seen.token_inputs[1] == std::vector<si::TokenId>{101, 102});
-        CHECK(seen.encoding_format == "base64");
+        // Server owns base64 wire encoding; the backend must always be asked for float.
+        CHECK(seen.encoding_format == "float");
     }
     const auto doc = r.json();
     const auto& data = doc.find("data")->as_array();
@@ -395,6 +400,27 @@ TEST_CASE("http /v1/embeddings: token arrays reach the engine as token ids, base
     CHECK(data[0].find("embedding")->as_string() == "AAAAAAAAAD8AAEBA");
     CHECK(floats_from_le_bytes(decode_b64(data[1].find("embedding")->as_string())) ==
           std::vector<float>{1.0f, -2.5f, 0.25f});
+    CHECK(doc.find("sonder")->find("encoding_format")->as_string() == "base64");
+}
+
+TEST_CASE("http /v1/embeddings: base64 wire format is encoded by server and never forwarded to backend") {
+    // Models float-only backends such as llamaserver whose response parser expects float arrays.
+    auto fake = std::make_shared<FakeEmbedEngine>();
+    fake->state->reject_non_float = true;
+    Fixture f(fake_engine_options(fake));
+    const Reply r = post(f.port, "/v1/embeddings",
+                         R"({"model":"fake-embed:test","input":"hello","encoding_format":"base64"})");
+    REQUIRE_MESSAGE(r.status == 200, r.body);
+    {
+        std::lock_guard<std::mutex> lock(fake->state->mu);
+        REQUIRE(fake->state->seen.size() == 1u);
+        CHECK(fake->state->seen[0].encoding_format == "float");
+    }
+    const auto doc = r.json();
+    const auto& data = doc.find("data")->as_array();
+    REQUIRE(data.size() == 1u);
+    REQUIRE(data[0].find("embedding")->is_string());
+    CHECK(data[0].find("embedding")->as_string() == "AAAAAAAAAD8AAEBA");
     CHECK(doc.find("sonder")->find("encoding_format")->as_string() == "base64");
 }
 
