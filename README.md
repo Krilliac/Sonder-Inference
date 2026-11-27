@@ -25,6 +25,9 @@ Version 0.1.0 (`CMakeLists.txt`). Design notes and plans are in
   `SONDER_ABI_VERSION` 1.
 - **Backends**:
   - `mock`: deterministic synthetic output for tests; performs no inference.
+  - `remote-mock`: the same synthetic engine in a supervised `sonder-infer worker`
+    process over private local IPC ([ARCH-01](docs/design/ARCH-01-multiprocess.md));
+    the first slice of native engine process isolation, without GPU requirements.
   - `ollama`: adapter for an Ollama server over HTTP, with streaming and
     cancellation ([src/backends/ollama](src/backends/ollama/README.md)).
   - `llamacpp`: direct llama.cpp/GGML backend, built only with
