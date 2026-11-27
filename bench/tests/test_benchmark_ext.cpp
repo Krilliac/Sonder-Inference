@@ -311,7 +311,11 @@ TEST_CASE("markdown summary and result files") {
 
     const std::string stem = bench::default_result_stem(doc);
     CHECK(stem.find("-mock-mock_tiny-md") != std::string::npos);
-    const auto dir = std::filesystem::temp_directory_path() / "sonder_bench_ext_test";
+    // Unique per run: several worktrees run ctest at once, and a shared fixed
+    // directory let one process remove_all() another's results mid-test.
+    const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("sonder_bench_ext_test-" + std::to_string(unique));
     std::filesystem::remove_all(dir);
     std::string jp, mp;
     REQUIRE(bench::write_results(doc, dir.string(), stem, &jp, &mp).ok());

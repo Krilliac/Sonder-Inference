@@ -34,7 +34,7 @@ const std::vector<std::string>& default_origins();
 inline constexpr const char* kAllowHeaders =
     "Accept, Authorization, Cache-Control, Content-Type, Last-Event-ID, X-Sonder-Run-Id, "
     "X-Sonder-Parent-Request-Id, X-Sonder-Agent-Id, X-Sonder-Task-Id, X-Sonder-Workload, X-Sonder-Priority, "
-    "X-Sonder-Deadline-Ms, X-Sonder-Reasoning-Budget";
+    "X-Sonder-Deadline-Ms, X-Sonder-Reasoning-Budget, X-Sonder-No-Capture";
 inline constexpr const char* kExposeHeaders = "X-Sonder-Inference-Api, X-Sonder-Request-Id, Retry-After";
 
 enum class State { starting, ready, draining, stopped };
