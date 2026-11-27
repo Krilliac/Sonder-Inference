@@ -242,6 +242,8 @@ then returns `cancelled`.
 On SIGINT or SIGTERM (or `request_shutdown()`):
 
 1. Health reports 503 `draining`; new chat requests get 503 `not_ready`.
+   A multi-endpoint router reads this as "nothing executed"; see
+   [integration/federation-worker-contract.md](integration/federation-worker-contract.md).
 2. The listener closes; idle connections that have not sent a request close.
 3. In-flight requests get `--shutdown-grace-ms`, then are cancelled (a
    streaming client then sees `finish_reason: "cancelled"`).
