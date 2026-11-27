@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "batch_scheduler.hpp"
+#include "grammar_retry.hpp"
 #include "embed_batch_planner.hpp"
 #include "kv_telemetry.hpp"
 #include "prefix_coalescer.hpp"
@@ -476,6 +477,20 @@ bool TryApplyGrammar(llama_sampler* grammar, llama_token_data_array* cur_p) noex
     }
 }
 
+// Accepts one grammar_prefill token. llama_grammar_accept_impl aborts the process (GGML_ABORT, not
+// catchable) when handed an end-of-generation token while the grammar stack is non-empty, so the
+// token is first applied to a single-candidate array exactly as SampleTokenAt does and accepted
+// only if the grammar leaves its logit finite. Out-of-range ids and EOG tokens the grammar masks
+// are rejected, which makes the caller rebuild the grammar without prefill.
+bool TryAcceptPrefillToken(llama_sampler* grammar, llama_token tok, int32_t n_vocab) noexcept {
+    if (tok < 0 || tok >= n_vocab) return false;
+    llama_token_data single{tok, 1.0F, 0.0F};
+    llama_token_data_array single_arr{&single, 1, -1, false};
+    if (!TryApplyGrammar(grammar, &single_arr)) return false;
+    if (!std::isfinite(single.logit)) return false;
+    return TryAcceptGrammar(grammar, tok);
+}
+
 // Order follows llama.cpp's common sampler: logit bias, penalties, then selector
 // (greedy or top-k/typical/top-p/min-p/temp/dist). An optional GBNF grammar is
 // returned separately so Generate() can apply fast grammar-based rejection
@@ -501,6 +516,9 @@ Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n
     if (penalties && last_n > 0) {
         llama_sampler_chain_add(chain.get(), llama_sampler_init_penalties(n_vocab, last_n, p.repeat_penalty,
                                                                           p.frequency_penalty, p.presence_penalty));
+    }
+    if (!p.grammar_prefill.empty() && (p.grammar.empty() || p.grammar_lazy)) {
+        return Status::Error(ErrorCode::kInvalidArgument, "grammar_prefill requires a non-lazy grammar");
     }
     if (p.grammar_lazy && (p.grammar.empty() || (p.trigger_patterns.empty() && p.trigger_tokens.empty()))) {
         return Status::Error(ErrorCode::kInvalidArgument,
@@ -542,6 +560,26 @@ Status BuildSampler(const SamplingParams& p, const llama_vocab* vocab, int32_t n
                                                 : "invalid GBNF grammar");
         }
         grammar_out.reset(gram);
+        if (!p.grammar_prefill.empty()) {
+            // Pre-accept the prefill tokens; on a rejected token rebuild the grammar once without
+            // prefill (a failed accept leaves the grammar with no stacks, so it cannot be reused).
+            const auto outcome = sonder::backends::llamacpp::PrefillGrammarWithRetry(
+                std::span<const std::int32_t>(p.grammar_prefill.data(), p.grammar_prefill.size()),
+                [&](std::int32_t t) { return TryAcceptPrefillToken(grammar_out.get(), t, n_vocab); },
+                [&]() {
+                    grammar_out.reset(llama_sampler_init_grammar(vocab, p.grammar.c_str(), "root"));
+                    return grammar_out != nullptr;
+                },
+                [](std::string_view m) {
+                    const std::string line = "sonder-llamacpp: " + std::string(m) + "\n";
+                    RouteLog(LogLevel::kWarn, line.c_str());
+                });
+            if (outcome == sonder::backends::llamacpp::GrammarRetryOutcome::kFailed) {
+                grammar_out.reset();
+                return Status::Error(ErrorCode::kInvalidArgument,
+                                     "grammar prefill failed and the grammar could not be rebuilt");
+            }
+        }
     }
     if (p.temperature <= 0.0F) {
         llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());
@@ -4660,6 +4698,13 @@ GenerateResult LlamaCppBackend::Impl::GenerateSingleLocked(const GenerateRequest
         std::size_t n_accepted = 0;
         const std::span<const std::vector<double>> no_proposal_dists{};
         const Clock::time_point spec_samp_start = stage_prof ? Clock::now() : Clock::time_point{};
+        // No grammar retry here: with the built-in proposers (TargetMatch) a speculative step
+        // samples position j from the same logits and sampler state a plain step would use, and a
+        // grammar failure (lazy-trigger replay that throws in llama_grammar_accept_impl) is a
+        // deterministic function of the token sequence. Restoring a snapshot and re-sampling
+        // reproduces the same token and the same failure, so the step fails the request. The real
+        // fix is upstream ggml-org/llama.cpp#32934 (transactional trigger activation, unmerged,
+        // not in the b11195 pin). The batch worker's per-slot verification behaves the same way.
         const bool sample_deadlock = !VerifySpeculativeBatch(
             draft_tokens, no_proposal_dists, request.sampling, sampler.get(), grammar_sampler.get(),
             target_gpu_sampled, n_vocab, verify_rng, accepted_tokens, accepted_lps, n_accepted, result);

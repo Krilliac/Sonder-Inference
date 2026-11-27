@@ -33,7 +33,7 @@ request metadata and a telemetry callback remain future SDK additions.
 
 Native tests exercise C11 calls, prefix versioning, owned ID copies, engine/model
 retention, generate/chat correlation, privacy and bounds. Python tests qualify
-generate/chat/stream envelopes, global sequence/event-ID uniqueness, private
+generate/chat/stream envelopes, per-stream sequence continuity and event-ID uniqueness, private
 text exclusion, defaults, invalid inputs, and older-library fallback.
 
 ```sh

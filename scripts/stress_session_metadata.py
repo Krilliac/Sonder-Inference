@@ -17,6 +17,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bindings/python/src'))
 import sonder_inference as si  # noqa: E402
+from telemetry_streams import check_event_streams  # noqa: E402
 
 
 def main() -> int:
@@ -90,9 +91,7 @@ def main() -> int:
                     assert event['producer'].get('synthetic') is True
                 assert all('text' not in event['attributes'] for event in events
                            if event['event_type'] == 'inference.token.generated')
-                sequences = [event['sequence'] for event in events]
-                assert sequences == sorted(set(sequences))
-                assert len({event['event_id'] for event in events}) == len(events)
+                check_event_streams(events, contiguous=False)
                 requests += len(queued)
                 events_total += len(events)
                 synthetic_events += len(correlated)

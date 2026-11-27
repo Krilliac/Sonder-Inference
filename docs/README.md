@@ -27,6 +27,7 @@
 - [Observatory contract](OBSERVATORY_CONTRACT.md)
 - [Design decisions](DESIGN_DECISIONS.md)
 - [Roadmap](ROADMAP.md)
+- [SI-only inference roadmap](ROADMAP_SI_ONLY.md)
 - [Upstream license review process](LICENSE_REVIEW.md)
 
 - [Scaffold status](SCAFFOLD.md) (historical)
