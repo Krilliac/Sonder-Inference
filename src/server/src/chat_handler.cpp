@@ -91,6 +91,7 @@ void execute_chat(ChatExchange& ex, const ChatJob& job, const Correlation& corr,
     RequestOptions ro;
     ro.request_id = make_id("req");
     ro.parent_request_id = corr.parent_request_id;
+    ro.no_text_capture = corr.no_text_capture;
     ro.session_key = chat_session_key(job, corr);
     ro.thinking = job.thinking;
     // Both protocols ask the backend to split reasoning from visible text.
@@ -617,6 +618,7 @@ void execute_completion(ChatExchange& ex, const CompletionJob& job, const Correl
     RequestOptions ro;
     ro.request_id = make_id("req");
     ro.parent_request_id = corr.parent_request_id;
+    ro.no_text_capture = corr.no_text_capture;
     if (job.session_key) {
         ro.session_key = *job.session_key;
     } else {
@@ -871,6 +873,7 @@ void execute_embeddings(ChatExchange& ex, const EmbedJob& job, const Correlation
     RequestOptions ro;
     ro.request_id = make_id("req");
     ro.parent_request_id = corr.parent_request_id;
+    ro.no_text_capture = corr.no_text_capture;
     ro.priority_class = priority;
     ro.preserve_numeric_priority = corr.numeric_priority;
     if (deadline_ms) ro.deadline = deadline;
@@ -1028,6 +1031,7 @@ void execute_rerank(ChatExchange& ex, const RerankJob& job, const Correlation& c
     RequestOptions ro;
     ro.request_id = make_id("req");
     ro.parent_request_id = corr.parent_request_id;
+    ro.no_text_capture = corr.no_text_capture;
     ro.priority_class = priority;
     ro.preserve_numeric_priority = corr.numeric_priority;
     if (deadline_ms) ro.deadline = deadline;
@@ -1200,6 +1204,7 @@ void execute_score(ChatExchange& ex, const ScoreJob& job, const Correlation& cor
     RequestOptions ro;
     ro.request_id = make_id("req");
     ro.parent_request_id = corr.parent_request_id;
+    ro.no_text_capture = corr.no_text_capture;
     ro.priority_class = priority;
     ro.preserve_numeric_priority = corr.numeric_priority;
     if (deadline_ms) ro.deadline = deadline;

@@ -115,7 +115,8 @@ itself.
 | `--telemetry-level off\|metrics\|standard\|deep` | `standard` | |
 | `--telemetry-buffer N` | `8192` | Retained events for resume, per sequence stream (1 to 1048576): the main stream and the periodic `*.sample` stream each keep this many, so samples never evict lifecycle events and the reverse. Each retained window is contiguous. The default per-subscriber queue holds a whole replay (`2 x N`). |
 | `--telemetry PATH` | none | Also write JSONL to `PATH` (`-` for stderr). |
-| `--capture-text` | off | Include generated text in token events. Requires `--token-file`. |
+| `--capture-text` | off | Include generated text in token events (same as `--text-capture on`). Requires `--token-file`. |
+| `--text-capture off\|on\|full` | `off` | Telemetry [text capture policy](TELEMETRY.md#text-capture-policy): `on` adds generated text to token events, `full` also the prompt to `request.started`. Environment default `SONDER_INFER_TEXT_CAPTURE`; the flag wins; an invalid value is a usage error. `on` and `full` require `--token-file`, and the startup log warns plainly. `--capture-text` with `--text-capture off` is a usage error. |
 | `--max-connections N` | `64` | A warning is printed when it plus 32 exceeds the open-file limit (`ulimit -n`). |
 | `--max-body-bytes N` | `4194304` | |
 | `--shutdown-grace-ms N` | `5000` | |
@@ -283,8 +284,10 @@ reverse proxy (also [SETUP.md](SETUP.md)).
   explicit `--cors-origin` or a configured token. An `Origin` that is present
   and not allowed gets 403 `forbidden_origin` (without CORS headers).
   Requests without `Origin` are unaffected.
-- Telemetry is content-free unless `--capture-text` is set, which requires a
-  token and is announced as `text_capture: "on"` in discovery.
+- Telemetry is content-free unless `--text-capture on|full` (or the legacy
+  `--capture-text`) is set, which requires a token and is announced as
+  `text_capture: "on"` or `"full"` in discovery. A request opts out with
+  `X-Sonder-No-Capture: 1`.
 - Nothing secret is logged: the access log omits bodies and header values.
 
 ## Common behaviour
@@ -303,7 +306,7 @@ The preflight (`OPTIONS`) answers 204 with
 `Access-Control-Allow-Headers: Accept, Authorization, Cache-Control,
 Content-Type, Last-Event-ID, X-Sonder-Run-Id, X-Sonder-Parent-Request-Id,
 X-Sonder-Agent-Id, X-Sonder-Task-Id, X-Sonder-Workload, X-Sonder-Priority,
-X-Sonder-Deadline-Ms, X-Sonder-Reasoning-Budget`
+X-Sonder-Deadline-Ms, X-Sonder-Reasoning-Budget, X-Sonder-No-Capture`
 and `Access-Control-Max-Age: 600` (plus
 `Access-Control-Allow-Private-Network: true` when the browser asks for it).
 
@@ -921,6 +924,7 @@ Correlation request headers (all optional; values must match
 | `X-Sonder-Workload` | One of the 7 workload classes; default `interactive_user`. |
 | `X-Sonder-Priority` | Integer from -16 to 16 (existing scheduler priority and integer telemetry; admission class `interactive`), or `interactive`, `subagent`, or `background` (class selection). Header wins over body `priority`; no hint defaults to numeric `0` and class `interactive`. |
 | `X-Sonder-Deadline-Ms` | Positive integer up to `INT32_MAX`, measured from connection arrival; a queued request past it returns 504. |
+| `X-Sonder-No-Capture` | `1` or `true` forces the telemetry [text capture policy](TELEMETRY.md#text-capture-policy) to `off` for this request (no output text, no prompt text in its events); `0` or `false` is a no-op. It can never enable capture. Anything else, or a repeated header, is 400 `invalid_correlation_header`. |
 
 The envelope `request_id` is always Inference's own id (`req-…`), also
 returned as `sonder.request_id`, in the completion id and in
@@ -1228,7 +1232,7 @@ These follow the contract review, which overrides the contract where they
 conflict:
 
 - Default CORS origins apply to read-only GET routes only; POST needs an
-  explicit `--cors-origin` or a token. `--capture-text` requires a token.
+  explicit `--cors-origin` or a token. `--capture-text` and `--text-capture on|full` require a token.
 - Per-subscriber losses are reported per subscriber (`: dropped <n>`, sequence
   gaps, `subscriber_dropped_events`), not as `telemetry.dropped` on the shared
   stream.

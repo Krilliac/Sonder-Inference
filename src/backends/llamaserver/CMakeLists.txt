@@ -14,6 +14,7 @@ sonder_module_sources(
     process.cpp
     process_options.cpp
     prefix_warmup.cpp
+    rpc_worker.cpp
     slot_affinity.cpp
     supervisor.cpp
     supervisor_host_memory.cpp

@@ -186,6 +186,9 @@ struct Correlation {
     // Explicit numeric zero also keeps the workload's legacy scheduler rank.
     bool numeric_priority = false;
     std::optional<std::int64_t> reasoning_budget_tokens = std::nullopt;
+    // X-Sonder-No-Capture: forces the telemetry text-capture policy to off
+    // for this request; it can never enable capture.
+    bool no_text_capture = false;
 };
 
 // X-Sonder-Run-Id, -Parent-Request-Id, -Agent-Id, -Task-Id, -Workload,
