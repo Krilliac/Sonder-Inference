@@ -3557,3 +3557,175 @@ TEST_CASE("model store: an exception while one record's weights are checked make
     }
     CHECK(store.value().weight_hashes_running() == 0);
 }
+
+TEST_CASE("model store: verify_blobs refuses a collapsed, stripped or incomplete record and an empty report is never ok") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto tmpl = s.blob(kTemplate, std::string(1000, 't'));
+    s.put_v2("ollama.com", "library", "m0", "latest", s.manifest(cfg, {s.blob(kModel, fake_gguf(1, 1, 64, 'a')), tmpl}));
+
+    const m::VerifyReport empty;
+    CHECK_FALSE(empty.ok());  // all_of over nothing is not a verification
+
+    // No budget at all: the registry keeps the record collapsed to its base (no blob list).
+    m::StoreOptions none;
+    none.limits.max_retained_text_bytes = 0;
+    m::ModelRegistry reg(none);
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    const auto list = reg.list();
+    REQUIRE(list.size() == 1);
+    REQUIRE(list[0]->text_omitted);
+    REQUIRE(list[0]->blobs.empty());  // collapsed: the premise of the test
+    const m::VerifyReport collapsed = m::verify_blobs(*list[0]);
+    CHECK_FALSE(collapsed.ok());
+    CHECK_FALSE(collapsed.inventory_complete);
+    CHECK_FALSE(collapsed.refusal.empty());
+    CHECK(collapsed.blobs.empty());  // nothing was hashed, nothing was claimed ok
+
+    // A scan over its budget leaves incomplete records that still list their blobs: also refused.
+    m::StoreOptions opt;
+    opt.limits.max_retained_text_bytes = 1100;
+    Store s2;
+    const auto cfg2 = s2.config_blob(R"({"model_format":"gguf"})");
+    const auto tmpl2 = s2.blob(kTemplate, std::string(1000, 't'));
+    for (int i = 0; i < 3; ++i) {
+        s2.put_v2("ollama.com", "library", "m" + std::to_string(i), "latest",
+                  s2.manifest(cfg2, {s2.blob(kModel, fake_gguf(1, 1, 64, static_cast<char>('a' + i))), tmpl2}));
+    }
+    auto store = m::OllamaStore::open(s2.tmp.path, opt);
+    REQUIRE(store.ok());
+    const auto scan = store.value().scan();
+    int refused = 0;
+    for (const auto& r : scan.records) {
+        const m::VerifyReport rep = m::verify_blobs(r);
+        if (r.status == m::EntryStatus::incomplete) {
+            REQUIRE_FALSE(r.blobs.empty());
+            CHECK_FALSE(rep.ok());
+            CHECK_FALSE(rep.inventory_complete);
+            ++refused;
+        } else {
+            CHECK(rep.ok());
+        }
+    }
+    CHECK(refused >= 1);
+    // The whole record, read again, verifies.
+    auto whole = reg.resolve("m0");
+    REQUIRE(whole.ok());
+    CHECK(m::verify_blobs(whole.value()).ok());
+}
+
+TEST_CASE("model store: import-ollama --verify reports an incomplete entry and exits 1") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto tmpl = s.blob(kTemplate, std::string(4u << 20, 't'));  // one 4 MiB file (the per-layer cap), kept per record
+    constexpr int kModels = 20;  // 80 MiB of templates against the default 64 MiB budget
+    for (int i = 0; i < kModels; ++i) {
+        s.put_v2("ollama.com", "library", "m" + std::to_string(i), "latest",
+                 s.manifest(cfg, {s.blob(kModel, fake_gguf(1, 1, 64, static_cast<char>('a' + i))), tmpl}));
+    }
+    std::ostringstream out, err;
+    const int rc = m::models_main({"import-ollama", s.tmp.path.string(), "--verify", "--weights-only"}, out, err);
+    CHECK(out.str().find("incomplete") != std::string::npos);
+    CHECK(out.str().find("not verified") != std::string::npos);
+    CHECK(rc == 1);
+}
+
+TEST_CASE("model store: stripping a record releases its config strings and the budget is never passed") {
+    Store s;
+    std::string cfg_json = "{\"model_format\":\"" + std::string(900, 'f') + "\"";
+    for (const char* key : {"model_family", "model_type", "file_type", "renderer", "parser", "requires", "remote_host",
+                            "remote_model"}) {
+        cfg_json += std::string(",\"") + key + "\":\"" + std::string(900, 'x') + "\"";
+    }
+    cfg_json += "}";
+    const auto cfg = s.config_blob(cfg_json);
+    s.put_v2("ollama.com", "library", "wide", "latest", s.manifest(cfg, {s.blob(kModel, fake_gguf(1, 1, 64, 'a'))}));
+
+    m::StoreOptions roomy;
+    m::ModelRegistry big(roomy);
+    REQUIRE(big.add_ollama_dir(s.tmp.path).ok());
+    const std::uint64_t whole = big.retained_bytes_now();
+    REQUIRE(whole > 8000);  // the nine long strings are held and charged
+
+    m::StoreOptions tight;
+    tight.limits.max_retained_text_bytes = 9400;  // the config layer's declared size fits; the whole record does not
+    m::ModelRegistry reg(tight);
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    const auto list = reg.list();
+    REQUIRE(list.size() == 1);
+    const m::ModelRecord& r = *list[0];
+    REQUIRE(r.text_omitted);
+    const m::ModelConfig& c = r.config;
+    // Released, not merely emptied: no string keeps a heap buffer (15 is the in-object capacity
+    // of libstdc++ and MSVC), whichever library moved or assigned it.
+    for (const std::string* str : {&c.model_format, &c.model_family, &c.parameter_size, &c.quantization, &c.renderer,
+                                   &c.parser, &c.requires_version, &c.remote_host, &c.remote_model}) {
+        CHECK(str->empty());
+        CHECK(str->capacity() <= 15);
+    }
+    CHECK(c.model_families.capacity() == 0);
+    CHECK(c.capabilities.capacity() == 0);
+    CHECK(reg.retained_bytes_now() <= tight.limits.max_retained_text_bytes);
+    CHECK(reg.retained_bytes_peak() <= tight.limits.max_retained_text_bytes);
+}
+
+TEST_CASE("model store: a record collapsed under no budget at all keeps retained_bytes_peak within it") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    // A malformed digest makes the record unsupported, with a detail longer than the 256-byte base.
+    Layer bad;
+    bad.media_type = "application/x-" + std::string(200, 'm');
+    bad.digest = "sha256:" + std::string(200, 'z');
+    bad.size = 1;
+    s.put_v2("ollama.com", "library", "longdetail", "latest",
+             s.manifest(cfg, {s.blob(kModel, fake_gguf(1, 1, 64, 'a')), bad}));
+    m::StoreOptions roomy;
+    m::ModelRegistry big(roomy);
+    REQUIRE(big.add_ollama_dir(s.tmp.path).ok());
+    REQUIRE(big.list().size() == 1);
+    REQUIRE(big.list()[0]->detail.size() > 256);  // the premise: a base detail to clip
+
+    m::StoreOptions none;
+    none.limits.max_retained_text_bytes = 0;
+    m::ModelRegistry reg(none);
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    reg.refresh();
+    CHECK(reg.retained_bytes_now() == 0);
+    CHECK(reg.retained_bytes_peak() == 0);
+    for (const auto& r : reg.list()) CHECK(r->detail.capacity() <= 256);
+}
+
+TEST_CASE("model store: a digest another thread published during on_weight_hash is not accepted past the deadline") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    s.put_v2("ollama.com", "library", "late", "latest", s.manifest(cfg, {s.blob(kModel, fake_gguf(1, 1, 4096, 'q'))}));
+    std::atomic<int> calls{0};
+    std::atomic<bool> other_done{false};
+    m::StoreOptions opt;
+    opt.verify_weights = m::WeightVerification::first_use;
+    opt.weight_hash_timeout = std::chrono::milliseconds(100);
+    opt.on_weight_hash = [&](const m::BlobRef&) {
+        if (calls.fetch_add(1) != 0) return;  // the second thread returns at once
+        // The first thread's callback outlasts the other thread's whole resolve and then the deadline.
+        const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (!other_done.load() && std::chrono::steady_clock::now() < give_up) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    };
+    auto store = m::OllamaStore::open(s.tmp.path, opt);
+    REQUIRE(store.ok());
+    std::optional<si::Result<m::ModelRecord>> first;
+    std::thread a([&] { first.emplace(store.value().resolve("late")); });
+    while (calls.load() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));  // a is inside its callback
+    auto second = store.value().resolve("late");
+    other_done = true;
+    a.join();
+    REQUIRE(second.ok());
+    CHECK(second.value().ready());
+    CHECK(second.value().weight_check == m::WeightCheck::hashed_now);
+    REQUIRE(first.has_value());
+    REQUIRE(first->ok());
+    CHECK_FALSE(first->value().ready());  // a digest found after the deadline is not accepted
+    CHECK(first->value().reason == m::UnsupportedReason::hash_limit);
+}

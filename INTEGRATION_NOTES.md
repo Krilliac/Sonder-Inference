@@ -725,6 +725,50 @@ all the stores of a registry, with per-field caps on what a record keeps); `reva
 false for such a record. The JSON document is `sonder.inference.model_store/2` (round 4:
 `weight_check` and `text_omitted` added, `weights_verified` means hashed in this call).
 
+Round 7 (PR 135, scoped final round): fixed `verify_blobs()` reporting success for a record whose
+blob inventory was dropped (it now refuses `text_omitted` / `incomplete` / blob-less records:
+`VerifyReport::inventory_complete == false`, `refusal` set, nothing hashed; `VerifyReport::ok()` is
+false for an empty report; `models import-ollama --verify` reports such an entry FAILED and exits
+1, it does not re-resolve it); stripped config strings are released by swap (libstdc++ kept their
+buffers), a record that does not fit the budget even collapsed is not retained at all (null from
+`retain`), and the collapsed base detail is clipped to a length whose capacity cannot pass the
+256-byte base; `refresh()` identifies its old records by control block (`std::owner_less`), not by
+address; the deadline and cancel are re-checked right after `on_weight_hash` returns, before a
+remembered digest is accepted.
+
+Public API of the module after rounds 5 to 7 (`sonder/inference/model_store.hpp`):
+
+- `OllamaStore::scan(const ResolveOptions& call = {})`, `resolve(name, call)`,
+  `resolve_for_load(name, policy, call)`; `ResolveOptions::cancel` cancels one call.
+- `ModelRegistry::add_ollama_dir(path, const ResolveOptions& = {}) -> Status` and
+  `refresh(const ResolveOptions& = {})`: one scan at a time (an internal scan mutex), one shared
+  retained-content allowance (`StoreOptions::limits.max_retained_text_bytes`) over every store
+  and every cached record; both are refused with `invalid_state` / do nothing on an
+  `on_weight_hash` thread.
+- `ModelRegistry::retained_bytes_now()` / `retained_bytes_peak()`: the registry-owned retained
+  bytes (diagnostic counters, see the follow-ups below for what they do not cover).
+- `EntryStatus::{ready, unsupported, incomplete}`: `incomplete` is a record whose small layers
+  were not all kept (`text_omitted`); `ModelRecord::ready()` is true only for `ready`; JSON
+  `status` is `"incomplete"` for it.
+- `VerifyReport::{blobs, inventory_complete, refusal, ok()}`.
+
+Known follow-ups (out of scope for round 7, one line each):
+
+- Lifetime-tracked budget leases: records still held by resolvers or `list()` snapshots after a
+  refresh erases them are not charged, so the peak is a counter of registry-owned bytes, not a hard
+  memory bound.
+- Base fields are not charged: name, manifest path, store root, model path; nor is the
+  `params.extra` / `json::Object` member-vector or key capacity (`json_cost` counts by size).
+- `RetainBudget::reached` is sticky for the whole refresh, so one early overflow omits all later layers.
+- Under `always`, a name can be missing from `list()` for as long as its hash takes during a refresh.
+- An exception mid-refresh erases the old records of stores not yet rescanned.
+- `add_ollama_dir` waits on `scan_mutex_` with no bound or cancel.
+- `add_ollama_dir`'s duplicate check ignores `live_`, so a later store can shadow a live-resolved earlier one.
+- Incomplete records are hashed during an `always` scan.
+- Test hooks are present (and cost a global mutex per hashed file) in every tests-ON build.
+- Two tests are weaker than their names: add-during-refresh overlap, and peak measured by its own counter.
+- The refresh generation test cannot force address reuse; the control-block identity is argued in a comment only.
+
 Open items:
 
 - No model was loaded and no inference service was started; loadability of `runner: ggml` entries

@@ -32,7 +32,8 @@ const char* kUsage =
     "\n"
     "  --name NAME      only this model (name[:tag], namespace/name:tag; default tag latest)\n"
     "  --verify         also re-hash the blobs of every ready model and compare with the manifest\n"
-    "                   digest. Opt-in: reads every byte (minutes for multi-GB files); progress on stderr\n"
+    "                   digest. An incomplete entry cannot be verified: reported FAILED (exit 1).\n"
+    "                   Opt-in: reads every byte (minutes for multi-GB files); progress on stderr\n"
     "  --weights-only   with --verify, hash only model/projector/adapter/draft blobs\n"
     "  --json           print the sonder.inference.model_store/2 document instead of the table\n"
     "\n"
@@ -178,7 +179,10 @@ int models_main(const std::vector<std::string>& args, std::ostream& out, std::os
     if (o.verify) {
         for (std::size_t i = 0; i < scan.records.size(); ++i) {
             const ModelRecord& rec = scan.records[i];
-            if (!rec.ready()) continue;
+            // An unsupported entry has nothing to hash. An incomplete one (layers dropped by
+            // ScanLimits::max_retained_text_bytes) is passed on: verify_blobs() refuses it, so
+            // it is reported as FAILED (exit 1), never skipped and never counted as verified.
+            if (rec.status != EntryStatus::ready && rec.status != EntryStatus::incomplete) continue;
             VerifyOptions vo;
             vo.weights_only = o.weights_only;
             vo.on_blob_start = [&](const BlobRef& b) {
@@ -202,8 +206,10 @@ int models_main(const std::vector<std::string>& args, std::ostream& out, std::os
                                                 {"verdict", verdict_label(b.verdict)},
                                                 {"detail", b.detail}});
             }
-            models[i].object().set("verification",
-                                   json::Object{{"ok", reports[i]->ok()}, {"blobs", std::move(blobs)}});
+            models[i].object().set("verification", json::Object{{"ok", reports[i]->ok()},
+                                                                {"inventory_complete", reports[i]->inventory_complete},
+                                                                {"refusal", reports[i]->refusal},
+                                                                {"blobs", std::move(blobs)}});
         }
         out << doc.dump() << "\n";
         return verify_failed ? kExitFailure : kExitOk;
@@ -261,6 +267,7 @@ int models_main(const std::vector<std::string>& args, std::ostream& out, std::os
         if (reports[i]) {
             out << "    verify: " << (reports[i]->ok() ? "ok" : "FAILED") << " (" << reports[i]->blobs.size()
                 << " blobs)\n";
+            if (!reports[i]->inventory_complete) out << "      not verified: " << reports[i]->refusal << '\n';
             for (const auto& b : reports[i]->blobs) {
                 if (b.verdict != BlobVerdict::ok) {
                     out << "      " << to_string(b.blob.role) << " " << b.blob.digest << ": "

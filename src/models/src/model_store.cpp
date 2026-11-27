@@ -1979,7 +1979,8 @@ private:
 // Why a hash stopped before the end of the file.
 enum class HashStop { none, size, time, cancel };
 
-// The time limit of one resolve (or one verify_blobs call): started when it begins to hash.
+// The time limit of one resolve (or one verify_blobs call): it starts when the HashClock is
+// constructed, at the start of the call (before any callback, wait or hash).
 struct HashClock {
     HashClock(std::chrono::milliseconds limit) : limit_(limit), start_(std::chrono::steady_clock::now()) {}
     [[nodiscard]] bool expired() const {
@@ -2202,6 +2203,12 @@ void verify_weights_for_use(const StoreAnchor& a, ModelRecord& r, WeightVerifica
                         return;
                     }
                     if (found.hex) {
+                        // A callback (or a wait) may have run past the deadline or a cancel while
+                        // another thread finished this hash: a late digest is not accepted.
+                        if (stopped()) {
+                            report_stop();
+                            return;
+                        }
                         // The remembered digest is for `stamp`; it applies to this handle only if the
                         // identity read from it now, after the lookup, is still exactly that.
                         sf::FileIdentity now;
@@ -2218,9 +2225,17 @@ void verify_weights_for_use(const StoreAnchor& a, ModelRecord& r, WeightVerifica
                         break;
                     }
                     announce();  // free and unclaimed: call back, then look again and claim
+                    if (stopped()) {  // the callback may have run past the deadline
+                        report_stop();
+                        return;
+                    }
                 }
             } else {
                 announce();
+                if (stopped()) {  // the callback may have run past the deadline
+                    report_stop();
+                    return;
+                }
             }
             if (!actual) {
                 FlightGuard guard(use_cache ? cache : nullptr, stamp, std::move(flight));
@@ -2789,11 +2804,23 @@ const VerifiedWeights::File* VerifiedWeights::find(std::string_view digest) cons
 // Verification
 // ---------------------------------------------------------------------------
 bool VerifyReport::ok() const {
+    if (!inventory_complete || blobs.empty()) return false;
     return std::all_of(blobs.begin(), blobs.end(), [](const BlobVerification& b) { return b.verdict == BlobVerdict::ok; });
 }
 
 VerifyReport verify_blobs(const ModelRecord& record, const VerifyOptions& options) {
     VerifyReport report;
+    // A record whose layers or blob list were dropped (strip_retained / collapse_retained, or a
+    // scan over its budget) cannot say what to hash: refuse it instead of reporting an empty
+    // success.
+    if (record.text_omitted || record.status == EntryStatus::incomplete || record.blobs.empty()) {
+        report.inventory_complete = false;
+        report.refusal = record.blobs.empty() && !record.text_omitted && record.status != EntryStatus::incomplete
+                             ? "the record has no blobs to verify"
+                             : "the record is incomplete (its layers or blob list were not kept); resolve the name "
+                               "again and verify that record";
+        return report;
+    }
     // The record's pinned root; a hand-built record without one opens store_root once here.
     std::shared_ptr<const StoreAnchor> root = record.anchor;
     if (!root) {
@@ -3150,10 +3177,21 @@ void strip_retained(ModelRecord& r) {
     release(r.runner);
     release(r.format);
     release(r.parent);
-    ModelConfig empty;
-    empty.context_length = r.config.context_length;
-    empty.embedding_length = r.config.embedding_length;
-    r.config = std::move(empty);
+    // Each field is swapped with a fresh empty one: moving an empty ModelConfig over this one
+    // would, on libstdc++, keep the destination's heap buffers (an SSO source is copied in), and
+    // retained_bytes() counts capacity. context_length and embedding_length stay.
+    ModelConfig& c = r.config;
+    release(c.model_format);
+    release(c.model_family);
+    release(c.model_families);
+    release(c.parameter_size);
+    release(c.quantization);
+    release(c.renderer);
+    release(c.parser);
+    release(c.requires_version);
+    release(c.remote_host);
+    release(c.remote_model);
+    release(c.capabilities);
     release(r.params.stop);
     r.params.extra = json::Object();
     release(r.warnings);
@@ -3176,10 +3214,12 @@ void collapse_retained(ModelRecord& r) {
     release(r.adapter_paths);
     release(r.draft_paths);
     release(r.sources);
-    if (r.detail.size() > kBaseDetailBytes) {
-        r.detail = clip_utf8(r.detail, kBaseDetailBytes);
-    } else if (r.detail.capacity() > kBaseDetailBytes) {
-        r.detail = std::string(r.detail.data(), r.detail.size());
+    // The base detail is rebuilt (swapped in, never assigned: assignment can keep the old
+    // buffer) at a length whose capacity cannot pass kBaseDetailBytes on any library (MSVC rounds
+    // a capacity up to 16 bytes, less one), so retained_bytes() charges nothing for it.
+    if (r.detail.capacity() > kBaseDetailBytes) {
+        std::string base = clip_utf8(r.detail, kBaseDetailBytes - 16);
+        r.detail.swap(base);
     }
 }
 
@@ -3189,7 +3229,9 @@ std::uint64_t sub_sat(std::uint64_t a, std::uint64_t b) { return a > b ? a - b :
 // after `used` (which it is then added to); otherwise stripped (strip_retained), and when even
 // that does not fit, collapsed to its base. A stripped or collapsed record has text_omitted set
 // (and is `incomplete` unless unsupported), so a resolve() of the name reads the store again
-// instead of serving it. `used` therefore never passes `budget` through this function.
+// instead of serving it. `used` never passes `budget` through this function: when even the
+// collapsed record would not fit in what is left, it is not retained at all (null is returned and
+// `used` is unchanged); a resolve() of its name still reads the store.
 SharedRecord retain(ModelRecord rec, std::uint64_t& used, std::uint64_t budget) {
     shrink_vectors(rec);
     const std::uint64_t room = sub_sat(budget, used);
@@ -3201,6 +3243,7 @@ SharedRecord retain(ModelRecord rec, std::uint64_t& used, std::uint64_t budget) 
         if (t > room) {
             collapse_retained(rec);
             t = retained_bytes(rec);
+            if (t > room) return nullptr;
         }
     }
     used += t;
@@ -3259,7 +3302,7 @@ Status ModelRegistry::add_ollama_dir(fs::path models_dir, const ResolveOptions& 
         ctx.reserved = 0;
         std::uint64_t used = retained_bytes_ + inflight_;
         const std::uint64_t before = used;
-        fresh.push_back(retain(std::move(rec), used, budget));
+        if (SharedRecord kept = retain(std::move(rec), used, budget)) fresh.push_back(std::move(kept));
         retained_bytes_ += used - before;
         peak_ = std::max(peak_, retained_bytes_ + inflight_);
     };
@@ -3283,16 +3326,15 @@ void ModelRegistry::refresh(const ResolveOptions& call) {
     const std::lock_guard<std::mutex> scan_lock(scan_mutex_);  // one scan at a time
     const std::uint64_t budget = options_.limits.max_retained_text_bytes;
     std::vector<OllamaStore> stores;
-    // The records held when the refresh began. The weak pointers keep their storage allocated, so
-    // a new record can never be given an address that is in `old`.
-    std::set<const ModelRecord*> old;
-    std::vector<std::weak_ptr<const ModelRecord>> old_guard;
+    // The records held when the refresh began, identified by their control blocks (owner_less):
+    // the weak pointers keep each control block allocated for the whole refresh, so no record
+    // created later can share one with an entry of `old`, whatever address its object gets.
+    std::set<std::weak_ptr<const ModelRecord>, std::owner_less<>> old;
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         stores = stores_;  // stores_ only changes under scan_mutex_, which is held: all are rescanned
         for (const auto& rec : records_) {
-            old.insert(rec.get());
-            old_guard.push_back(rec);
+            old.insert(rec);
         }
         // Cached live results are dropped by a refresh anyway; they would only take budget now.
         for (const auto& e : live_) retained_bytes_ = sub_sat(retained_bytes_, retained_bytes(*e.second));
@@ -3330,7 +3372,7 @@ void ModelRegistry::refresh(const ResolveOptions& call) {
         ctx.reserved = 0;
         std::uint64_t used = retained_bytes_ + inflight_;
         const std::uint64_t before = used;
-        records_.push_back(retain(std::move(rec), used, budget));
+        if (SharedRecord kept = retain(std::move(rec), used, budget)) records_.push_back(std::move(kept));
         retained_bytes_ += used - before;
         peak_ = std::max(peak_, retained_bytes_ + inflight_);
     };
@@ -3339,7 +3381,7 @@ void ModelRegistry::refresh(const ResolveOptions& call) {
         inflight_ = 0;
         // Whatever is left of the old records (names no store has any more) goes now.
         for (auto it = records_.begin(); it != records_.end();) {
-            if (old.count(it->get()) != 0) {
+            if (old.find(*it) != old.end()) {
                 retained_bytes_ = sub_sat(retained_bytes_, retained_bytes(**it));
                 it = records_.erase(it);
             } else {
@@ -3427,7 +3469,9 @@ Result<ModelRecord> ModelRegistry::resolve_impl(std::string_view name, WeightVer
                     const std::uint64_t old_t = retained_bytes(*e);
                     std::uint64_t used = sub_sat(retained_bytes_, old_t) + inflight_;
                     const std::uint64_t before = used;
-                    e = retain(rec, used, budget);
+                    SharedRecord kept = retain(rec, used, budget);
+                    if (!kept) return;  // does not fit even collapsed: the old record stays, as charged
+                    e = std::move(kept);
                     retained_bytes_ = sub_sat(retained_bytes_, old_t) + (used - before);
                     peak_ = std::max(peak_, retained_bytes_ + inflight_);
                     return;
@@ -3442,7 +3486,7 @@ Result<ModelRecord> ModelRegistry::resolve_impl(std::string_view name, WeightVer
         }
         std::uint64_t used = retained_bytes_ + inflight_;
         const std::uint64_t before = used;
-        live_.emplace(key, retain(rec, used, budget));
+        if (SharedRecord kept = retain(rec, used, budget)) live_.emplace(key, std::move(kept));
         retained_bytes_ += used - before;
         peak_ = std::max(peak_, retained_bytes_ + inflight_);
     };

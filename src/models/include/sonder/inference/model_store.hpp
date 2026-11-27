@@ -600,6 +600,13 @@ struct VerifyOptions {
 
 struct VerifyReport {
     std::vector<BlobVerification> blobs;
+    // False when verify_blobs() refused the record: a text_omitted or `incomplete` one (or one
+    // whose blob list was dropped) does not carry its whole blob inventory, so nothing is hashed
+    // and `refusal` says why.
+    bool inventory_complete = true;
+    std::string refusal;
+    // True only when the inventory was complete, at least one blob was checked, and every
+    // checked blob is BlobVerdict::ok. An empty report is never ok.
     [[nodiscard]] bool ok() const;
 };
 
@@ -614,7 +621,9 @@ struct VerifyReport {
 // max_weight_file_bytes is not hashed (io_error), the whole call may hash for at most
 // weight_hash_timeout (io_error for the blob it stops in and for every later one; the wait
 // for a hash slot counts), and weight_hash_cancel cancels like VerifyOptions::cancel. A record
-// without an anchor uses the defaults.
+// without an anchor uses the defaults. A record that is text_omitted, `incomplete` or has no
+// blobs is refused (VerifyReport::inventory_complete false, ok() false, nothing hashed): resolve
+// the name again (ModelRegistry::resolve / OllamaStore::resolve) and verify that record.
 VerifyReport verify_blobs(const ModelRecord& record, const VerifyOptions& options = {});
 
 // Stable JSON for a record / a scan (schema kStoreJsonSchema).
