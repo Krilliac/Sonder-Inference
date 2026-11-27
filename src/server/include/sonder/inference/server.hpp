@@ -144,6 +144,10 @@ struct ServerOptions {
     std::size_t max_subscribers = 8;          // concurrent telemetry streams
     std::size_t subscriber_queue = 0;         // per-subscriber queue; 0 = telemetry_buffer
     bool capture_text = false;                // requires `token`
+    // Declared telemetry text-capture policy (--text-capture / env
+    // SONDER_INFER_TEXT_CAPTURE); `capture_text` is the legacy spelling of
+    // `on`. Anything but `off` requires `token`.
+    TextCapturePolicy text_capture = TextCapturePolicy::off;
     std::vector<std::shared_ptr<TelemetrySink>> extra_sinks;
 
     // Access log and diagnostics (one line per request; never bodies or

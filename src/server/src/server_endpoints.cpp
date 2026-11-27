@@ -911,7 +911,7 @@ json::Object build_discovery_document(const ServerOptions& opts, const LiveTelem
         {"auth", json::Object{{"required", !opts.token.empty()}, {"schemes", json::Array{"bearer"}}}},
         {"clock", json::Object{{"mono_ns", "host-monotonic"}}},
         {"sampling_level", to_string(opts.telemetry_level)},
-        {"text_capture", opts.capture_text ? "on" : "off"},
+        {"text_capture", to_string(combine_text_capture(opts.text_capture, opts.capture_text))},
         {"links", json::Object{{"health", "/v1/sonder/health"},
                                {"identity", "/v1/sonder/identity"},
                                {"models", "/v1/models"},

@@ -129,7 +129,7 @@ Engine::Engine(EngineOptions options)
                          {"platform", host_platform()},
                          {"device_count", devices_.size()},
                          {"gpu_device_count", initial_gpus.size()},
-                         {"text_capture", options_.telemetry.capture_text ? "on" : "off"}};
+                         {"text_capture", to_string(resolved_text_capture(options_.telemetry))}};
     if (options_.server) {
         started.set("server", json::Object{{"host", options_.server->host},
                                            {"port", options_.server->port},

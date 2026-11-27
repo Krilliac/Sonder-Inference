@@ -126,7 +126,7 @@ regressions, bounded concurrent controls, timing comparisons and remaining limit
 
 | Event | Level | Attributes |
 | --- | --- | --- |
-| `engine.started` | metrics | `version` str, `commit` str, `platform` str, `device_count` int, `text_capture` str (`on` / `off`); optional `server` obj `{host` str, `port` int, `api_version` int`}` when the engine is hosted by `sonder-infer serve` (`EngineOptions::server`) |
+| `engine.started` | metrics | `version` str, `commit` str, `platform` str, `device_count` int, `text_capture` str (`off` / `on` / `full`); optional `server` obj `{host` str, `port` int, `api_version` int`}` when the engine is hosted by `sonder-infer serve` (`EngineOptions::server`) |
 | `engine.stopped` | metrics | none |
 | `scheduler.configured` | metrics | emitted once at engine start when scheduling is active: `mode` str (`automatic`, `gate`, `account`), `kv_block_size_tokens` int, `kv_num_blocks` int, `prefix_caching` bool, `max_running_sequences` int, `max_step_sequences` int, `max_step_tokens` int, `prefill_chunk_tokens` int, `admission_watermark_blocks` int, `max_requeue_count` int, `step_stall_timeout_ms` int |
 | `device.memory.sample` | metrics | at start (`sample_devices_on_start`) and every `EngineOptions::device_sample_interval` (default 10 s, 0 disables): `kind` str, `name` str, `logical_cores` int, `total_bytes` int, `available_bytes` int; optional `used_bytes` int. Host memory only; per-process VRAM of a spawned llama-server is `backend.gpu_memory.sample` |
@@ -234,10 +234,10 @@ GPU and warning events. The pending queue remains bounded and counts drops.
 
 | Event | Level | Attributes |
 | --- | --- | --- |
-| `session.created` | metrics | `model`, `backend` str; `priority` int; `workload` str (see below); `text_capture` str (`on` / `off`); `sampling` obj |
+| `session.created` | metrics | `model`, `backend` str; `priority` int; `workload` str (see below); `text_capture` str (`off` / `on` / `full`); `sampling` obj |
 | `session.closed` | metrics | `requests` int |
 | `request.queued` | metrics | `kind` str (`generate` from `Session::generate`, `chat` from `Session::chat`), `priority` int (legacy scheduler rank, preserved), `priority_class` str (`interactive`, `subagent`, `background`), `workload` str, `prompt_bytes` int (for chat: the generic formatted prompt); `chat` adds `messages` int |
-| `request.started` | metrics | `kind` str, `sampling` obj, `scheduled` bool, `sampler` str (`sonder` or `backend`); when scheduled, `scheduler_mode` str (`gate`: per-chunk grants; `account`: admission and prompt accounting only); `chat` adds `chat_template` str (`native`: the backend's chat API or model template received the messages; `generic`: `format_chat_prompt()`) |
+| `request.started` | metrics | `kind` str, `sampling` obj, `scheduled` bool, `sampler` str (`sonder` or `backend`); when scheduled, `scheduler_mode` str (`gate`: per-chunk grants; `account`: admission and prompt accounting only); `chat` adds `chat_template` str (`native`: the backend's chat API or model template received the messages; `generic`: `format_chat_prompt()`); optional `prompt` str and `prompt_truncated` bool (policy `full` only), optional `text_capture_opt_out` true ([text capture policy](#text-capture-policy)) |
 | `request.completed` / `request.cancelled` / `request.failed` | metrics | `outcome`, `stop_reason` str; `prompt_tokens`, `completion_tokens`, `chunks` int; `token_counts_from_backend` bool; `ttft_ms`, `total_ms` num; `scheduled` bool; `sampler` str. For hosted requests: additive `priority_class` str and `admission` obj with `priority` str and `queue_ms` num. When scheduled: the existing `queue_ms`, `preemptions`, `accounted_prompt_tokens`, and `reused_prompt_tokens` remain. Backend request attributes are optional and additive: `backend_cached_tokens`, `backend_draft_tokens`, `backend_draft_accepted_tokens`, `backend_draft_acceptance_ratio`, and `backend_predicted_tokens_per_second`. `cancelled` optionally adds `cancel_latency_ms` num. `failed` adds `error_code`, `error` str, and `scheduler_rejected` bool (true) when the scheduler refused the request before any backend work |
 
 Hosted request admission fields are additive: the historical numeric
@@ -280,7 +280,7 @@ optional.
 | Event | Level | Attributes |
 | --- | --- | --- |
 | `inference.decode.started` | metrics | `ttft_ms` num (at the first streamed chunk) |
-| `inference.token.generated` | standard | one per delivered chunk: `index` int, `bytes` int, `elapsed_ms` num, `unit` str. `unit: "token"` (Sonder sampler) means exactly one token and adds `count` int (= 1), `token_id` int, `probability` num. `unit: "chunk"` (backend-sampled stream) means the token count per chunk is unknown; use `request.completed.completion_tokens`. Optional `text` str (only with `capture_text`) |
+| `inference.token.generated` | standard | one per delivered chunk: `index` int, `bytes` int, `elapsed_ms` num, `unit` str. `unit: "token"` (Sonder sampler) means exactly one token and adds `count` int (= 1), `token_id` int, `probability` num. `unit: "chunk"` (backend-sampled stream) means the token count per chunk is unknown; use `request.completed.completion_tokens`. Optional `text` str (only when the [text capture policy](#text-capture-policy) is `on` or `full` for the request) |
 | `inference.prefill.completed` | metrics | once per completed request, emitted at request end: `prompt_tokens` int, `token_counts_from_backend` bool, `ttft_ms` num; optional `backend_prompt_eval_ms` num (backend-reported), `reused_prompt_tokens` int (scheduled requests) |
 | `inference.decode.completed` | metrics | once per completed request: `completion_tokens` int, `chunks` int, `decode_wall_ms` num; optional `backend_eval_ms`, `backend_tokens_per_sec`, `backend_prompt_eval_ms` num |
 
@@ -359,6 +359,47 @@ Additive within `/1`: `producer.role` and `producer.synthetic`;
 request `admission.priority`, request `admission.queue_ms`, and the server
 health `queued_by_class` gauge. Discovery
 advertises this vocabulary as `vocabularies: {"sonder.inference.events": 1}`.
+
+## Text capture policy
+
+Telemetry never carries prompt or generated text unless the operator opts in.
+The declared policy has three values:
+
+| Policy | Output text (`inference.token.generated.text`) | Prompt text (`request.started.prompt`) |
+| --- | --- | --- |
+| `off` (default) | no | no |
+| `on` | yes | no |
+| `full` | yes | yes |
+
+- **Declared** as `text_capture` (`off` / `on` / `full`) in `engine.started`,
+  `session.created` and the discovery document (`GET
+  /.well-known/sonder-telemetry`, next to `sampling_level`). Consumers must
+  treat an unknown value as `on`.
+- **Set** with `EngineOptions::telemetry.text_capture` (embedding hosts), or for
+  `sonder-infer serve` with `--text-capture off|on|full` or the environment
+  default `SONDER_INFER_TEXT_CAPTURE` (the flag wins; an invalid value is a
+  usage error, never silently `off` or `on`). The older boolean
+  `capture_text` / `--capture-text` still means `on`; the more permissive of
+  the two applies, and `--capture-text` with `--text-capture off` is refused.
+  `on` and `full` require `--token-file`.
+- **Announced**: when the policy is not `off`, `sonder-infer serve` logs a
+  warning at startup (`text capture is ON ...` / `text capture is FULL ...`).
+- **Per-request opt-out**: the `X-Sonder-No-Capture: 1` request header (also
+  `true`) forces `off` for that request: no `text` on its token events and no
+  `prompt` on its `request.started`. A request can only lower the policy,
+  never raise it. `0` / `false` are no-ops; any other value, or a repeated
+  header, is 400 `invalid_correlation_header`. When capture would otherwise
+  have been on, that request's `request.started` carries
+  `text_capture_opt_out: true` so a consumer can tell "suppressed" from
+  "never captured". `RequestOptions::no_text_capture` is the library
+  equivalent.
+- **Bounds**: `prompt` holds at most 64 KiB (cut on a UTF-8 boundary);
+  `prompt_truncated` says whether it was cut. For chat requests the prompt is
+  the flattened conversation text.
+- **Not in this tree yet**: `inference.sampling.candidates` is not emitted in
+  this codebase today, and `src/sessions` has no local-only or sensitive
+  request flag today. Both are left out here; if either is added later, it must
+  honor `TextCapturePolicy` and force `off` for sensitive requests.
 
 ## Observatory change requests (Observatory `docs/telemetry-schema.md` @ f5e3ff5)
 

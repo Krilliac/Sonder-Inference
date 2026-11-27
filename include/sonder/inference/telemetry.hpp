@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "sonder/inference/json.hpp"
+#include "sonder/inference/text_capture.hpp"
 
 namespace sonder::inference {
 
@@ -261,6 +262,10 @@ struct TelemetryOptions {
     // Include generated text in token events. Off by default: raw text capture
     // is independent from structural events per the Observatory contract.
     bool capture_text = false;
+    // Declared text-capture policy (docs/TELEMETRY.md "Text capture policy").
+    // `capture_text = true` is the legacy spelling of `on`; the more
+    // permissive of the two applies (see resolved_text_capture()).
+    TextCapturePolicy text_capture = TextCapturePolicy::off;
     // Opt-in per-request stage timing hooks (Doc 2 #25). Off by default so
     // unprofiled runs incur zero extra stage clock reads or timing events.
     bool enable_stage_profiling = false;
@@ -285,6 +290,12 @@ struct TelemetryOptions {
     // shutdown() returns false. Zero or negative means do not wait at all.
     std::chrono::milliseconds shutdown_timeout{5000};
 };
+
+// The engine-wide text-capture policy: `text_capture`, raised to `on` by the
+// legacy `capture_text` flag.
+[[nodiscard]] constexpr TextCapturePolicy resolved_text_capture(const TelemetryOptions& options) noexcept {
+    return combine_text_capture(options.text_capture, options.capture_text);
+}
 
 class TelemetryBus {
 public:

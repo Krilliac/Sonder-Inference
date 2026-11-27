@@ -566,7 +566,7 @@ Session::Session(Engine& engine, std::shared_ptr<Model> model, SessionOptions op
                                           {"backend", model_->backend_name()},
                                           {"priority", options_.priority},
                                           {"workload", to_string(options_.workload)},
-                                          {"text_capture", engine_.telemetry().options().capture_text ? "on" : "off"},
+                                          {"text_capture", to_string(resolved_text_capture(engine_.telemetry().options()))},
                                           {"sampling", sampling_json(options_.sampling)}},
                              TelemetryLevel::metrics);
 }
@@ -2296,7 +2296,10 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     }
 
     const bool emit_tokens = bus.enabled(TelemetryLevel::standard);
-    const bool capture_text = bus.options().capture_text;
+    const TextCapturePolicy configured_text_policy = resolved_text_capture(bus.options());
+    const TextCapturePolicy text_policy =
+        apply_request_opt_out(configured_text_policy, request_options.no_text_capture);
+    const bool capture_text = captures_output_text(text_policy);
     const bool stage_profiling = request_options.enable_stage_profiling || bus.stage_profiling_enabled();
     request.enable_stage_profiling = stage_profiling;
     StageTimings session_stages;
@@ -2495,6 +2498,13 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         }
         if (messages != nullptr) {
             started.set("chat_template", native_chat ? "native" : "generic");
+        }
+        if (captures_prompt_text(text_policy)) {
+            const std::string_view shown = truncate_utf8(effective_prompt, kMaxCapturedPromptBytes);
+            started.set("prompt", std::string(shown));
+            started.set("prompt_truncated", shown.size() < effective_prompt.size());
+        } else if (configured_text_policy != TextCapturePolicy::off && request_options.no_text_capture) {
+            started.set("text_capture_opt_out", true);
         }
         bus.emit("request.started", ctx,
                  with_parent(with_admission(std::move(started), request_options.admission_queue_ms)),
