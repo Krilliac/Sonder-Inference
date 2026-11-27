@@ -31,13 +31,15 @@ hash-verified patch series from this directory at configure time via
    - Every patched kernel or model loader behavior must be accompanied by a
      deterministic C++ unit or numeric parity test under `src/backends/llamacpp/tests/`.
 4. **Licensing (`docs/LICENSE_REVIEW.md`):** upstream `llama.cpp`/`ggml` files
-   remain MIT (`NOTICE`). Do not copy unreviewed third-party fork code into this
-   directory without verifying its exact revision and license and recording
-   owner approval in `docs/LICENSE_REVIEW.md`.
+   remain MIT (`NOTICE`). Choosing the license of SI's patch series (before
+   populating non-empty `.patch` files here) and any git subtree vendoring
+   require a review and explicit owner approval recorded in
+   `docs/LICENSE_REVIEW.md`. Do not copy third-party fork code without
+   verifying its exact revision and license and recording owner approval there.
 
 ## Current series
 
 Empty (`"patches": []`). Stock `v1.0.0` already includes `GGML_TYPE_Q2_0`
 (group 64), `GGML_TYPE_Q1_0`, `GGML_TYPE_NVFP4`, `GGML_TYPE_F8_E4M3`, the
 `prism.hadamard.*` loader, and CPU/CUDA/Vulkan FWHT kernels; `PQ2_0` (group 128)
-checkpoints convert losslessly to stock `Q2_0` via `pq2_reblock`.
+checkpoints convert losslessly to stock `Q2_0` via `sonder-infer reblock-pq2`.
