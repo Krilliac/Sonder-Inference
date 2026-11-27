@@ -1094,7 +1094,8 @@ public:
                           request.grammar, request.separate_reasoning, /*checkpoint=*/nullptr,
                           std::move(plan.media_blobs), {}, std::move(plan.media_prompt_parts),
                           request.priority_class, request.target_ttft_ms, request.target_itl_ms,
-                          request.enable_stage_profiling);
+                          request.enable_stage_profiling, {}, nullptr, nullptr, 0, false,
+                          request.separate_reasoning && llamacpp_detail::PromptEndsInsideThink(plan.segments));
     }
 
     [[nodiscard]] bool has_native_chat() const override { return native_chat_; }
@@ -1170,7 +1171,8 @@ private:
                                      const SuspendSafePointCallback& on_safe_point = {},
                                      SuspendedExecutionState* suspended_state = nullptr,
                                      const ExecutionResumeState* execution_resume = nullptr,
-                                     int priority_rank = 0, bool allow_preempt_spill = false) {
+                                     int priority_rank = 0, bool allow_preempt_spill = false,
+                                     bool start_in_thinking = false) {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
 
         lc::GenerateRequest req;
@@ -1252,7 +1254,7 @@ private:
         if (execution_resume != nullptr && !execution_resume->stop_filter_pending.empty()) {
             stop.RestoreState(execution_resume->stop_filter_pending, execution_resume->stop_filter_stopped);
         }
-        ThinkingStreamSplitter thinking_splitter;
+        ThinkingStreamSplitter thinking_splitter(start_in_thinking);
         bool callback_stopped = false;
 
         auto deliver_split = [&](std::string_view text_part, std::string_view reasoning_part,
