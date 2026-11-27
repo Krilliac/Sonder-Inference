@@ -67,6 +67,29 @@ void check_envelope(const json::Value& e) {
     CHECK(e.find("attributes")->is_object());
 }
 
+// The stream identity contract: `sequence` is contiguous from 0 within each
+// sequence stream of a producer instance (producer.stream absent = the main
+// stream, "samples" = the periodic-sample stream), and event_id is
+// "<instance_id>-<sequence>" (main) or "<instance_id>-s<sequence>" (samples).
+// Feed events in emission order.
+struct StreamSequences {
+    std::int64_t next[2] = {0, 0};
+    void check(const json::Value& e) {
+        const json::Value* producer = e.find("producer");
+        REQUIRE(producer);
+        const json::Value* named = producer->find("stream");
+        const bool samples = named != nullptr && named->is_string() && named->as_string() == "samples";
+        CHECK_MESSAGE((named == nullptr || samples), "only the samples stream is named");
+        const std::string type = e.find("event_type")->as_string();
+        const bool sample_type = type.size() > 7 && type.compare(type.size() - 7, 7, ".sample") == 0;
+        CHECK_MESSAGE(samples == sample_type, type);
+        const std::int64_t seq = e.find("sequence")->as_int();
+        CHECK_MESSAGE(seq == next[samples ? 1 : 0]++, type);
+        CHECK(e.find("event_id")->as_string() ==
+              producer->find("instance_id")->as_string() + (samples ? "-s" : "-") + std::to_string(seq));
+    }
+};
+
 // Blocks inside write() until released, so the bus queue can fill up.
 class GateSink final : public TelemetrySink {
 public:
@@ -112,11 +135,11 @@ TEST_CASE("every emitted event matches the Observatory envelope") {
     session->close();
     const auto events = h.events();
     REQUIRE(events.size() > 10);
-    std::int64_t expected_seq = 0;
+    StreamSequences streams;
     std::set<std::string> ids;
     for (const auto& e : events) {
         check_envelope(e);
-        CHECK(e.find("sequence")->as_int() == expected_seq++);
+        streams.check(e);
         ids.insert(e.find("event_id")->as_string());
     }
     CHECK(ids.size() == events.size());
@@ -269,11 +292,12 @@ TEST_CASE("Observatory requests: stream identity, run grouping, capture policy, 
     session->close();
     const std::string engine_id = h.engine->engine_id();
     const std::string instance = h.engine->telemetry().instance_id();
+    StreamSequences streams;
     for (const auto& e : h.events()) {
         const auto* producer = e.find("producer");
         REQUIRE(producer->find("instance_id"));
         CHECK(producer->find("instance_id")->as_string() == instance);
-        CHECK(e.find("event_id")->as_string() == instance + "-" + std::to_string(e.find("sequence")->as_int()));
+        streams.check(e);
         const std::string type = e.find("event_type")->as_string();
         // Every engine, session and request event carries the engine id as run_id.
         REQUIRE(e.find("run_id")->is_string());
@@ -421,20 +445,104 @@ TEST_CASE("sinks receive each envelope's sequence through write_event") {
         for (int i = 0; i < 20; ++i) {
             bus.emit("test.event", ctx_s(), json::Object{{"i", i}});
         }
+        // A samples-stream event reaches write(), never write_event(), so a
+        // sink indexed by sequence never sees two number spaces mixed.
+        bus.emit("x.sample", ctx_s(), json::Object{});
+        bus.emit("test.event", ctx_s(), json::Object{{"i", 20}});
         bus.flush();
     }
     std::lock_guard<std::mutex> lock(sink->mutex);
-    REQUIRE(sink->pairs.size() == 20);
+    REQUIRE(sink->pairs.size() == 21);
     for (std::size_t i = 0; i < sink->pairs.size(); ++i) {
         CHECK(sink->pairs[i].first == i);
         CHECK(sink->pairs[i].second == i);
     }
-    CHECK(sink->plain_writes == 0);
+    CHECK(sink->plain_writes == 1);
     // The default write_event forwards to write().
     MemoryTelemetrySink memory;
     memory.write_event(7, "{\"a\":1}");
     REQUIRE(memory.lines().size() == 1);
     CHECK(memory.lines()[0] == "{\"a\":1}");
+}
+
+namespace {
+class StreamSink final : public TelemetrySink {
+public:
+    void write(std::string_view) override { ++plain_writes; }
+    void write_stream_event(TelemetryStream stream, std::uint64_t sequence, std::string_view line) override {
+        seen.push_back({stream, sequence, std::string(line)});
+    }
+    struct Seen {
+        TelemetryStream stream;
+        std::uint64_t sequence;
+        std::string line;
+    };
+    std::vector<Seen> seen;  // written by the writer thread; read after flush()
+    int plain_writes = 0;
+};
+}  // namespace
+
+TEST_CASE("the two sequence streams count independently and sinks can see the stream") {
+    CHECK(telemetry_stream_of("device.memory.sample") == TelemetryStream::samples);
+    CHECK(telemetry_stream_of("backend.metrics.sample") == TelemetryStream::samples);
+    CHECK(telemetry_stream_of("x.sample") == TelemetryStream::samples);
+    CHECK(telemetry_stream_of(".sample") == TelemetryStream::main);
+    CHECK(telemetry_stream_of("sample") == TelemetryStream::main);
+    CHECK(telemetry_stream_of("request.sampled") == TelemetryStream::main);
+    CHECK(telemetry_stream_of("telemetry.dropped") == TelemetryStream::main);
+    CHECK(telemetry_stream_of("") == TelemetryStream::main);
+
+    auto memory = std::make_shared<MemoryTelemetrySink>();
+    auto stream_sink = std::make_shared<StreamSink>();
+    std::string instance;
+    {
+        TelemetryBus bus;
+        instance = bus.instance_id();
+        bus.add_sink(memory);
+        bus.add_sink(stream_sink);
+        for (const char* type : {"test.event", "x.sample", "test.event", "x.sample", "x.sample", "test.event"}) {
+            REQUIRE(bus.emit(type, ctx_s(), json::Object{}));
+        }
+        bus.flush();
+    }
+    const auto lines = memory->lines();
+    // The memory sink is not stream-aware: it gets every event through write().
+    REQUIRE(lines.size() == 6);
+    StreamSequences streams;
+    std::vector<std::string> ids;
+    for (const auto& line : lines) {
+        auto parsed = json::parse(line);
+        REQUIRE(parsed.ok());
+        check_envelope(parsed.value());
+        streams.check(parsed.value());
+        ids.push_back(parsed.value().find("event_id")->as_string());
+    }
+    CHECK(ids == std::vector<std::string>{instance + "-0", instance + "-s0", instance + "-1", instance + "-s1",
+                                          instance + "-s2", instance + "-2"});
+    CHECK(streams.next[0] == 3);
+    CHECK(streams.next[1] == 3);
+    // A sample envelope names its stream; a main envelope has no such field.
+    CHECK(json::parse(lines[1]).value().find("producer")->find("stream")->as_string() == "samples");
+    CHECK(json::parse(lines[0]).value().find("producer")->find("stream") == nullptr);
+    // A stream-aware sink gets the stream and the per-stream number, and write() is not used.
+    REQUIRE(stream_sink->seen.size() == 6);
+    CHECK(stream_sink->plain_writes == 0);
+    const std::vector<std::pair<TelemetryStream, std::uint64_t>> expected{
+        {TelemetryStream::main, 0},    {TelemetryStream::samples, 0}, {TelemetryStream::main, 1},
+        {TelemetryStream::samples, 1}, {TelemetryStream::samples, 2}, {TelemetryStream::main, 2}};
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        CHECK(stream_sink->seen[i].stream == expected[i].first);
+        CHECK(stream_sink->seen[i].sequence == expected[i].second);
+        CHECK(stream_sink->seen[i].line == lines[i]);
+    }
+    // make_envelope follows the event type.
+    TelemetryBus plain;
+    const json::Object sample_env = plain.make_envelope("x.sample", ctx_s(), json::Object{}, 4);
+    CHECK(sample_env.find("event_id")->as_string() == plain.instance_id() + "-s4");
+    CHECK(sample_env.find("producer")->find("stream")->as_string() == "samples");
+    const json::Object main_env = plain.make_envelope("x.y", ctx_s(), json::Object{}, 4);
+    CHECK(main_env.find("event_id")->as_string() == plain.instance_id() + "-4");
+    CHECK(main_env.find("producer")->find("stream") == nullptr);
 }
 
 TEST_CASE("an engine running the mock backend never labels its events synthetic:false") {
@@ -525,14 +633,14 @@ TEST_CASE("a mixed engine labels only known mock backend model and session work"
         REQUIRE(engine.unload_model(model.value()->instance_id()).ok());
     }
     engine.telemetry().flush();
-    std::int64_t next = 0;
+    StreamSequences streams;
     std::set<std::string> event_ids;
     for (const auto& line : sink->lines()) {
         CHECK(line.find("private provenance canary") == std::string::npos);
         auto parsed = json::parse(line);
         REQUIRE(parsed.ok());
         const auto& event = parsed.value();
-        CHECK(event.find("sequence")->as_int() == next++);
+        streams.check(event);
         CHECK(event_ids.insert(event.find("event_id")->as_string()).second);
         const auto type = event.find("event_type")->as_string();
         const auto sid = event.find("session_id")->as_string();
@@ -675,11 +783,11 @@ TelemetryOptions synthetic_sink_options() {
 }
 
 void check_sink_sequences(const std::vector<std::string>& lines, const std::string& instance) {
+    StreamSequences streams;
     for (std::size_t i = 0; i < lines.size(); ++i) {
         auto value = json::parse(lines[i]);
         REQUIRE(value.ok());
-        CHECK(value.value().find("sequence")->as_int() == static_cast<std::int64_t>(i));
-        CHECK(value.value().find("event_id")->as_string() == instance + "-" + std::to_string(i));
+        streams.check(value.value());
         CHECK(value.value().find("producer")->find("instance_id")->as_string() == instance);
         CHECK(value.value().find("producer")->find("synthetic")->as_bool());
     }

@@ -5,6 +5,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -400,22 +401,23 @@ TEST_CASE("hub: ring, fan-out, per-subscriber drops and resume") {
         r.last_event_id = "tel-abc-3";
         auto s = hub.subscribe(r);
         REQUIRE(s.subscription);
-        CHECK(s.gap_comment.empty());
-        CHECK(sequences(s.subscription->next(std::chrono::milliseconds(0), nullptr)) ==
-              std::vector<std::uint64_t>{4, 5});
+        const auto batch = s.subscription->next(std::chrono::milliseconds(0), nullptr);
+        CHECK(batch.gaps.empty());
+        CHECK(sequences(batch) == std::vector<std::uint64_t>{4, 5});
         hub.unsubscribe(s.subscription);
     }
-    // Same instance, older than the window: gap comment then the whole window
-    // (queue of 3 keeps the newest three and counts one drop).
+    // Same instance, older than the window: the whole window. The queue of 3
+    // keeps the newest three and counts one drop; the event the gap notice was
+    // attached to is the one evicted, so the drop count covers the notice.
     {
         ResumeRequest r;
         r.last_event_id = "tel-abc-0";
         auto s = hub.subscribe(r);
         REQUIRE(s.subscription);
-        CHECK(s.gap_comment == ": resume-gap 1-1");
         const auto batch = s.subscription->next(std::chrono::milliseconds(0), nullptr);
         CHECK(sequences(batch) == std::vector<std::uint64_t>{3, 4, 5});
         CHECK(batch.dropped == 1);
+        CHECK(batch.gaps.empty());
         hub.unsubscribe(s.subscription);
     }
     // Unknown instance (producer restarted) and malformed ids: whole window.
@@ -424,8 +426,9 @@ TEST_CASE("hub: ring, fan-out, per-subscriber drops and resume") {
         r.last_event_id = id;
         auto s = hub.subscribe(r);
         REQUIRE(s.subscription);
-        CHECK(s.gap_comment.empty());
-        CHECK(s.subscription->next(std::chrono::milliseconds(0), nullptr).events.size() == 3);
+        const auto whole = s.subscription->next(std::chrono::milliseconds(0), nullptr);
+        CHECK(whole.gaps.empty());
+        CHECK(whole.events.size() == 3);
         hub.unsubscribe(s.subscription);
     }
     // Caught up: nothing replayed. since=now: live only.
@@ -463,6 +466,317 @@ TEST_CASE("hub: recovers the sequence when fed through write()") {
     hub.write("not json");
     CHECK(hub.stats().retained == 1);
     CHECK(hub.stats().next_sequence == 42);
+}
+
+TEST_CASE("hub: write() routes on producer.stream") {
+    LiveTelemetryHub hub(8, 1, 0, 4);
+    hub.write(R"({"sequence":5,"event_type":"x.sample","producer":{"stream":"samples"}})");
+    CHECK(hub.stats().retained == 0);
+    CHECK(hub.stats().sample_retained == 1);
+    CHECK(hub.stats().sample_next_sequence == 6);
+    // Any other name, an absent field and a null field stay on the main stream.
+    hub.write(R"({"sequence":7,"producer":{"stream":"other"}})");
+    hub.write(R"({"sequence":8,"producer":{}})");
+    hub.write(R"({"sequence":9,"producer":{"stream":null}})");
+    hub.write(R"({"sequence":10})");
+    CHECK(hub.stats().retained == 4);
+    CHECK(hub.stats().next_sequence == 11);
+    CHECK(hub.stats().sample_retained == 1);
+}
+
+namespace {
+
+constexpr TelemetryStream kMain = TelemetryStream::main;
+constexpr TelemetryStream kSamples = TelemetryStream::samples;
+
+// A minimal envelope with the fields the contract reads (instance tel-abc).
+std::string hub_env(TelemetryStream stream, std::uint64_t seq) {
+    const bool samples = stream == kSamples;
+    return std::string("{\"event_id\":\"tel-abc-") + (samples ? "s" : "") + std::to_string(seq) +
+           "\",\"sequence\":" + std::to_string(seq) + ",\"event_type\":\"" + (samples ? "x.sample" : "x.event") +
+           "\",\"producer\":{\"instance_id\":\"tel-abc\"" + (samples ? ",\"stream\":\"samples\"" : "") + "}}";
+}
+
+void hub_emit(LiveTelemetryHub& hub, TelemetryStream stream, std::uint64_t seq) {
+    hub.write_stream_event(stream, seq, hub_env(stream, seq));
+}
+
+using StreamSeq = std::pair<TelemetryStream, std::uint64_t>;
+
+std::vector<StreamSeq> stream_seqs(const Subscription::Batch& batch) {
+    std::vector<StreamSeq> out;
+    for (const auto& e : batch.events) out.emplace_back(e->stream, e->sequence);
+    return out;
+}
+
+std::vector<StreamSeq> expected_range(TelemetryStream stream, std::uint64_t first, std::uint64_t last) {
+    std::vector<StreamSeq> out;
+    for (std::uint64_t i = first; i <= last; ++i) out.emplace_back(stream, i);
+    return out;
+}
+
+Subscription::Batch replay_of(LiveTelemetryHub& hub, const std::optional<std::string>& cursor, bool since_now = false) {
+    ResumeRequest r;
+    r.last_event_id = cursor;
+    r.since_now = since_now;
+    auto s = hub.subscribe(r);
+    REQUIRE(s.subscription);
+    auto batch = s.subscription->next(std::chrono::milliseconds(0), nullptr);
+    hub.unsubscribe(s.subscription);
+    return batch;
+}
+
+using server_test::sse_sequence_failures;
+
+// Main 0,1; samples 0..1001 (window of 4 keeps 998..1001); main 2.
+void flood(LiveTelemetryHub& hub) {
+    hub_emit(hub, kMain, 0);
+    hub_emit(hub, kMain, 1);
+    for (std::uint64_t i = 0; i < 1002; ++i) hub_emit(hub, kSamples, i);
+    hub_emit(hub, kMain, 2);
+}
+
+std::vector<StreamSeq> flood_replay_order() {
+    std::vector<StreamSeq> expected{{kMain, 0}, {kMain, 1}};
+    for (std::uint64_t i = 998; i < 1002; ++i) expected.emplace_back(kSamples, i);
+    expected.emplace_back(kMain, 2);
+    return expected;
+}
+
+std::string replace_first(std::string text, const std::string& from, const std::string& to) {
+    const std::size_t at = text.find(from);
+    REQUIRE(at != std::string::npos);
+    text.replace(at, from.size(), to);
+    return text;
+}
+
+}  // namespace
+
+TEST_CASE("hub: a sample flood leaves a contiguous main window and a contiguous sample window") {
+    LiveTelemetryHub hub(8, 2, 0, 4);
+    hub.set_instance_id("tel-abc");
+    flood(hub);
+    const HubStats st = hub.stats();
+    CHECK(st.retained == 3);
+    CHECK(st.oldest_sequence == std::optional<std::uint64_t>(0));
+    CHECK(st.next_sequence == 3);
+    CHECK(st.capacity == 8);
+    CHECK(st.sample_retained == 4);
+    CHECK(st.sample_oldest_sequence == std::optional<std::uint64_t>(998));
+    CHECK(st.sample_next_sequence == 1002);
+    CHECK(st.sample_capacity == 4);
+
+    // A fresh subscriber gets both windows in arrival order, no notices, and
+    // the default queue (8 + 4) holds the whole replay.
+    const auto batch = replay_of(hub, std::nullopt);
+    CHECK(stream_seqs(batch) == flood_replay_order());
+    CHECK(batch.gaps.empty());
+    CHECK(batch.dropped == 0);
+}
+
+TEST_CASE("hub: main events do not evict samples") {
+    LiveTelemetryHub hub(8, 2, 0, 4);
+    hub.set_instance_id("tel-abc");
+    for (std::uint64_t i = 0; i < 3; ++i) hub_emit(hub, kSamples, i);
+    for (std::uint64_t i = 0; i < 100; ++i) hub_emit(hub, kMain, i);
+    const HubStats st = hub.stats();
+    CHECK(st.retained == 8);
+    CHECK(st.oldest_sequence == std::optional<std::uint64_t>(92));
+    CHECK(st.sample_retained == 3);
+    CHECK(st.sample_oldest_sequence == std::optional<std::uint64_t>(0));
+    const auto batch = replay_of(hub, std::nullopt);
+    auto expected = expected_range(kSamples, 0, 2);
+    const auto mains = expected_range(kMain, 92, 99);
+    expected.insert(expected.end(), mains.begin(), mains.end());
+    CHECK(stream_seqs(batch) == expected);
+    CHECK(batch.gaps.empty());
+}
+
+TEST_CASE("hub: the resume cursor has one member per stream") {
+    LiveTelemetryHub hub(8, 2, 0, 4);
+    hub.set_instance_id("tel-abc");
+    flood(hub);
+    // Arrival order of what is newer than the cursor: samples 1000, 1001, main 2.
+    const std::vector<StreamSeq> newer{{kSamples, 1000}, {kSamples, 1001}, {kMain, 2}};
+    for (const char* cursor : {"tel-abc-1,tel-abc-s999", "tel-abc-s999,tel-abc-1", " tel-abc-s999 ,\ttel-abc-1 "}) {
+        CAPTURE(cursor);
+        const auto batch = replay_of(hub, std::string(cursor));
+        CHECK(stream_seqs(batch) == newer);
+        CHECK(batch.gaps.empty());
+    }
+    // One member: the other stream replays its whole window.
+    {
+        const auto batch = replay_of(hub, std::string("tel-abc-1"));
+        std::vector<StreamSeq> expected = expected_range(kSamples, 998, 1001);
+        expected.emplace_back(kMain, 2);
+        CHECK(stream_seqs(batch) == expected);
+        CHECK(batch.gaps.empty());
+    }
+    {
+        const auto batch = replay_of(hub, std::string("tel-abc-s1001"));
+        CHECK(stream_seqs(batch) == std::vector<StreamSeq>{{kMain, 0}, {kMain, 1}, {kMain, 2}});
+    }
+    // Another instance, malformed members and an empty cursor are ignored.
+    for (const char* cursor : {"tel-zzz-1", "tel-abc-sx", "tel-abc-s", "", "tel-abc-", "tel-abc-s-1", "garbage",
+                               "tel-zzz-1,tel-abc-sx"}) {
+        CAPTURE(cursor);
+        const auto batch = replay_of(hub, std::string(cursor));
+        CHECK(stream_seqs(batch) == flood_replay_order());
+        CHECK(batch.gaps.empty());
+    }
+    // A repeated stream keeps the larger member; members past the fourth are ignored.
+    CHECK(stream_seqs(replay_of(hub, std::string("tel-abc-0,tel-abc-1,tel-abc-s999"))) == newer);
+    CHECK(stream_seqs(replay_of(hub, std::string("tel-zzz-1,tel-zzz-2,tel-zzz-3,tel-zzz-4,tel-abc-1,tel-abc-s999"))) ==
+          flood_replay_order());
+    // Caught up on both streams: nothing replayed.
+    CHECK(replay_of(hub, std::string("tel-abc-2,tel-abc-s1001")).events.empty());
+}
+
+TEST_CASE("hub: a cursor older than one window announces that stream only") {
+    LiveTelemetryHub hub(8, 2, 0, 4);
+    hub.set_instance_id("tel-abc");
+    flood(hub);
+    const auto batch = replay_of(hub, std::string("tel-abc-s5"));
+    // The main stream has no cursor, so it replays whole without a notice.
+    CHECK(stream_seqs(batch) == flood_replay_order());
+    REQUIRE(batch.gaps.size() == 1);
+    CHECK(batch.gaps[0].gap.stream == kSamples);
+    CHECK(batch.gaps[0].gap.from == 6);
+    CHECK(batch.gaps[0].gap.to == 997);
+    CHECK(batch.gaps[0].before == 2);  // the first sample event
+    CHECK(batch.events[batch.gaps[0].before]->stream == kSamples);
+    CHECK(batch.events[batch.gaps[0].before]->sequence == 998);
+}
+
+TEST_CASE("hub: since=now replays nothing and the default queue holds a full replay") {
+    LiveTelemetryHub hub(8, 2, 0, 4);
+    hub.set_instance_id("tel-abc");
+    flood(hub);
+    CHECK(replay_of(hub, std::nullopt, true).events.empty());
+    CHECK(replay_of(hub, std::string("tel-abc-0"), true).events.empty());
+
+    ResumeRequest live;
+    live.since_now = true;
+    auto s = hub.subscribe(live);
+    REQUIRE(s.subscription);
+    // 12 = 8 + 4 events fit; the 13th evicts the oldest.
+    for (std::uint64_t i = 0; i < 8; ++i) hub_emit(hub, kMain, 3 + i);
+    for (std::uint64_t i = 0; i < 4; ++i) hub_emit(hub, kSamples, 1002 + i);
+    hub_emit(hub, kMain, 11);
+    const auto batch = s.subscription->next(std::chrono::milliseconds(0), nullptr);
+    CHECK(batch.events.size() == 12);
+    CHECK(batch.dropped == 1);
+    hub.unsubscribe(s.subscription);
+}
+
+TEST_CASE("hub: gap notices are dropped with the event they were attached to") {
+    LiveTelemetryHub hub(8, 2, 3, 4);  // queue of 3
+    hub.set_instance_id("tel-abc");
+    for (std::uint64_t i = 0; i < 20; ++i) hub_emit(hub, kMain, i);  // keeps 12..19
+    const auto batch = replay_of(hub, std::string("tel-abc-2"));
+    // 8 events replayed into a queue of 3: the first event carried the notice and was evicted.
+    CHECK(batch.events.size() == 3);
+    CHECK(batch.dropped == 5);
+    CHECK(batch.gaps.empty());
+}
+
+TEST_CASE("sse framing: a fresh flood replay has no notices and per-stream contiguity") {
+    LiveTelemetryHub hub(8, 2, 0, 4);
+    hub.set_instance_id("tel-abc");
+    flood(hub);
+    const auto batch = replay_of(hub, std::nullopt);
+    const std::string text = format_sse_batch("tel-abc", batch);
+    CHECK(text.find("resume-gap") == std::string::npos);
+    CHECK(text.find("id: tel-abc-0\ndata: ") != std::string::npos);
+    CHECK(text.find("id: tel-abc-s998\ndata: ") != std::string::npos);
+    CHECK(text.find("id: tel-abc-s0\n") == std::string::npos);
+    CHECK(sse_sequence_failures(text, "tel-abc", {}).empty());
+}
+
+TEST_CASE("sse framing: each notice sits directly before the first event of its stream") {
+    LiveTelemetryHub hub(8, 2, 0, 4);
+    hub.set_instance_id("tel-abc");
+    for (std::uint64_t i = 0; i < 20; ++i) {
+        hub_emit(hub, kMain, i);  // keeps 12..19
+        if (i < 10) hub_emit(hub, kSamples, i);  // keeps 6..9
+    }
+    const auto batch = replay_of(hub, std::string("tel-abc-2,tel-abc-s1"));
+    REQUIRE(batch.gaps.size() == 2);
+    const std::string text = format_sse_batch("tel-abc", batch);
+    const std::string samples_notice = ": resume-gap s2-s5\n\nid: tel-abc-s6\ndata: ";
+    const std::string main_notice = ": resume-gap 3-11\n\nid: tel-abc-12\ndata: ";
+    CHECK(text.find(samples_notice) != std::string::npos);
+    CHECK(text.find(main_notice) != std::string::npos);
+    std::size_t notices = 0;
+    for (std::size_t at = text.find("resume-gap"); at != std::string::npos; at = text.find("resume-gap", at + 1)) ++notices;
+    CHECK(notices == 2);
+    const std::array<std::optional<std::uint64_t>, 2> seed{2, 1};
+    CHECK(sse_sequence_failures(text, "tel-abc", seed).empty());
+
+    // Negative controls: the helper must notice each defect.
+    const std::string no_notices =
+        replace_first(replace_first(text, ": resume-gap s2-s5\n\n", ""), ": resume-gap 3-11\n\n", "");
+    CHECK_FALSE(sse_sequence_failures(no_notices, "tel-abc", seed).empty());
+    // Wrong form for the samples hole.
+    CHECK_FALSE(sse_sequence_failures(replace_first(text, ": resume-gap s2-s5", ": resume-gap 2-5"), "tel-abc", seed).empty());
+    CHECK_FALSE(sse_sequence_failures(replace_first(text, ": resume-gap s2-s5", ": resume-gap s2-5"), "tel-abc", seed).empty());
+    // Both notices moved ahead of every event (the earlier defect).
+    {
+        std::string events_only = replace_first(replace_first(text, ": resume-gap s2-s5\n\n", ""), ": resume-gap 3-11\n\n", "");
+        const std::string front = ": resume-gap 3-11\n\n: resume-gap s2-s5\n\n";
+        CHECK_FALSE(sse_sequence_failures(front + events_only, "tel-abc", seed).empty());
+    }
+    // A notice after the event it should precede.
+    {
+        const std::string moved = replace_first(text, samples_notice, "id: tel-abc-s6\ndata: ");
+        const std::size_t after = moved.find("\n\n", moved.find("id: tel-abc-s6\n")) + 2;
+        std::string out = moved;
+        out.insert(after, ": resume-gap s2-s5\n\n");
+        CHECK_FALSE(sse_sequence_failures(out, "tel-abc", seed).empty());
+    }
+}
+
+TEST_CASE("sse framing: a dropped count comes first and ids carry the stream form") {
+    Subscription::Batch batch;
+    batch.dropped = 3;
+    batch.events.push_back(std::make_shared<const HubEvent>(HubEvent{kSamples, 4, 0, hub_env(kSamples, 4)}));
+    batch.events.push_back(std::make_shared<const HubEvent>(HubEvent{kMain, 9, 1, hub_env(kMain, 9)}));
+    const std::string text = format_sse_batch("tel-abc", batch);
+    CHECK(text.rfind(": dropped 3\n\nid: tel-abc-s4\ndata: ", 0) == 0);
+    CHECK(text.find("\n\nid: tel-abc-9\ndata: ") != std::string::npos);
+    // `dropped` excuses a hole on either stream.
+    CHECK(sse_sequence_failures(text, "tel-abc", {std::optional<std::uint64_t>(1), std::optional<std::uint64_t>(1)}).empty());
+    batch.dropped = 0;
+    CHECK_FALSE(sse_sequence_failures(format_sse_batch("tel-abc", batch), "tel-abc",
+                                      {std::optional<std::uint64_t>(1), std::optional<std::uint64_t>(1)})
+                    .empty());
+}
+
+TEST_CASE("ndjson framing: one envelope per line, contiguous per stream, nothing else") {
+    LiveTelemetryHub hub(8, 2, 0, 4);
+    hub.set_instance_id("tel-abc");
+    flood(hub);
+    const auto batch = replay_of(hub, std::nullopt);
+    const std::string text = format_ndjson_batch(batch);
+    std::array<std::optional<std::uint64_t>, 2> last;
+    std::size_t lines = 0;
+    std::size_t at = 0;
+    while (at < text.size()) {
+        const std::size_t end = text.find('\n', at);
+        REQUIRE(end != std::string::npos);
+        const std::string line = text.substr(at, end - at);
+        at = end + 1;
+        auto parsed = json::parse(line);
+        REQUIRE(parsed.ok());
+        const json::Value* named = parsed.value().find("producer")->find("stream");
+        const std::size_t k = (named != nullptr && named->is_string() && named->as_string() == "samples") ? 1 : 0;
+        const auto seq = static_cast<std::uint64_t>(parsed.value().find("sequence")->as_int());
+        if (last[k]) CHECK(seq == *last[k] + 1);
+        last[k] = seq;
+        ++lines;
+    }
+    CHECK(lines == batch.events.size());
+    CHECK(lines == 7);
 }
 
 TEST_CASE("backend setup: env defaults and factory") {
