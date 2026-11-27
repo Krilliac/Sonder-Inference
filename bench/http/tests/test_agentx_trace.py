@@ -699,4 +699,3 @@ def test_hostile_metrics_and_cli_trace_inputs(tmp_path):
     finally:
         srv.shutdown()
         srv.server_close()
-
