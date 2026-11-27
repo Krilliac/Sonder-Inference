@@ -68,28 +68,37 @@
     {
       "name": "windows-cuda-rtx",
       "displayName": "Windows CUDA (NVIDIA RTX Ampere/Ada/Blackwell)",
-      "description": "Direct llama.cpp with CUDA for RTX 30/40/50-series (sm_86, sm_89, sm_120), CUDA Graphs, and all quantized Flash Attention kernels.",
+      "description": "Direct llama.cpp with CUDA >= 13.4 (13.5 preferred) for RTX 30/40/50-series (sm_86, sm_89, sm_120a), CUDA Graphs, and all quantized Flash Attention kernels.",
       "inherits": "msvc-release",
       "cacheVariables": {
         "SONDER_WITH_LLAMA_CPP": "ON",
         "GGML_CUDA": "ON",
-        "CMAKE_CUDA_ARCHITECTURES": "86;89;120",
+        "CMAKE_CUDA_ARCHITECTURES": "86;89;120a",
         "GGML_CUDA_FA_ALL_QUANTS": "ON",
         "GGML_CUDA_GRAPHS": "ON"
       }
     },
     {
       "name": "windows-cuda-blackwell",
-      "displayName": "Windows CUDA Blackwell (NVIDIA RTX 50-series sm_120, Release)",
-      "description": "Direct llama.cpp Release build tuned for NVIDIA Blackwell (sm_120, e.g. RTX 5070 Ti / 5080 / 5090) with CUDA Graphs and all quantized Flash Attention kernels.",
+      "displayName": "Windows CUDA Blackwell (NVIDIA RTX 50-series sm_120a, Release)",
+      "description": "Direct llama.cpp Release build tuned for NVIDIA Blackwell (non-portable sm_120a cubins for native NVFP4/MXFP4 block-scaled MMA, e.g. RTX 5070 Ti / 5080 / 5090; CUDA >= 13.4, 13.5 preferred) with CUDA Graphs and all quantized Flash Attention kernels.",
       "inherits": "msvc-release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "SONDER_WITH_LLAMA_CPP": "ON",
         "GGML_CUDA": "ON",
-        "CMAKE_CUDA_ARCHITECTURES": "120",
+        "CMAKE_CUDA_ARCHITECTURES": "120a",
         "GGML_CUDA_FA_ALL_QUANTS": "ON",
         "GGML_CUDA_GRAPHS": "ON"
+      }
+    },
+    {
+      "name": "windows-cuda-blackwell-120f",
+      "displayName": "Windows CUDA Blackwell Family (NVIDIA sm_120f, Release)",
+      "description": "Direct llama.cpp Release build using family-specific sm_120f (portable across sm_12x; requires nvcc >= 12.9, CUDA >= 13.4, and CMake >= 3.31.8 or >= 4.0.2) with CUDA Graphs and all quantized Flash Attention kernels.",
+      "inherits": "windows-cuda-blackwell",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "120f"
       }
     },
     {
@@ -135,28 +144,37 @@
     {
       "name": "linux-cuda-rtx",
       "displayName": "Linux CUDA (NVIDIA RTX Ampere/Ada/Blackwell)",
-      "description": "Direct llama.cpp with CUDA for RTX 30/40/50-series (sm_86, sm_89, sm_120), CUDA Graphs, and all quantized Flash Attention kernels.",
+      "description": "Direct llama.cpp with CUDA >= 13.4 (13.5 preferred) for RTX 30/40/50-series (sm_86, sm_89, sm_120a), CUDA Graphs, and all quantized Flash Attention kernels.",
       "inherits": "linux-release",
       "cacheVariables": {
         "SONDER_WITH_LLAMA_CPP": "ON",
         "GGML_CUDA": "ON",
-        "CMAKE_CUDA_ARCHITECTURES": "86;89;120",
+        "CMAKE_CUDA_ARCHITECTURES": "86;89;120a",
         "GGML_CUDA_FA_ALL_QUANTS": "ON",
         "GGML_CUDA_GRAPHS": "ON"
       }
     },
     {
       "name": "linux-cuda-blackwell",
-      "displayName": "Linux CUDA Blackwell (NVIDIA RTX 50-series sm_120, Release)",
-      "description": "Direct llama.cpp Release build tuned for NVIDIA Blackwell (sm_120, e.g. RTX 5070 Ti / 5080 / 5090) with CUDA Graphs and all quantized Flash Attention kernels.",
+      "displayName": "Linux CUDA Blackwell (NVIDIA RTX 50-series sm_120a, Release)",
+      "description": "Direct llama.cpp Release build tuned for NVIDIA Blackwell (non-portable sm_120a cubins for native NVFP4/MXFP4 block-scaled MMA, e.g. RTX 5070 Ti / 5080 / 5090; CUDA >= 13.4, 13.5 preferred) with CUDA Graphs and all quantized Flash Attention kernels.",
       "inherits": "linux-release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "SONDER_WITH_LLAMA_CPP": "ON",
         "GGML_CUDA": "ON",
-        "CMAKE_CUDA_ARCHITECTURES": "120",
+        "CMAKE_CUDA_ARCHITECTURES": "120a",
         "GGML_CUDA_FA_ALL_QUANTS": "ON",
         "GGML_CUDA_GRAPHS": "ON"
+      }
+    },
+    {
+      "name": "linux-cuda-blackwell-120f",
+      "displayName": "Linux CUDA Blackwell Family (NVIDIA sm_120f, Release)",
+      "description": "Direct llama.cpp Release build using family-specific sm_120f (portable across sm_12x; requires nvcc >= 12.9, CUDA >= 13.4, and CMake >= 3.31.8 or >= 4.0.2) with CUDA Graphs and all quantized Flash Attention kernels.",
+      "inherits": "linux-cuda-blackwell",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "120f"
       }
     },
     {
@@ -192,11 +210,13 @@
     { "name": "ci-linux", "configurePreset": "ci-linux" },
     { "name": "windows-cuda-rtx", "configurePreset": "windows-cuda-rtx" },
     { "name": "windows-cuda-blackwell", "configurePreset": "windows-cuda-blackwell" },
+    { "name": "windows-cuda-blackwell-120f", "configurePreset": "windows-cuda-blackwell-120f" },
     { "name": "windows-rocm-xt", "configurePreset": "windows-rocm-xt" },
     { "name": "windows-vulkan-xt", "configurePreset": "windows-vulkan-xt" },
     { "name": "linux-llamacpp", "configurePreset": "linux-llamacpp" },
     { "name": "linux-cuda-rtx", "configurePreset": "linux-cuda-rtx" },
     { "name": "linux-cuda-blackwell", "configurePreset": "linux-cuda-blackwell" },
+    { "name": "linux-cuda-blackwell-120f", "configurePreset": "linux-cuda-blackwell-120f" },
     { "name": "linux-rocm-xt", "configurePreset": "linux-rocm-xt" },
     { "name": "linux-vulkan-xt", "configurePreset": "linux-vulkan-xt" }
   ],
@@ -209,11 +229,13 @@
     { "name": "ci-linux", "configurePreset": "ci-linux", "output": { "outputOnFailure": true } },
     { "name": "windows-cuda-rtx", "configurePreset": "windows-cuda-rtx", "output": { "outputOnFailure": true } },
     { "name": "windows-cuda-blackwell", "configurePreset": "windows-cuda-blackwell", "output": { "outputOnFailure": true } },
+    { "name": "windows-cuda-blackwell-120f", "configurePreset": "windows-cuda-blackwell-120f", "output": { "outputOnFailure": true } },
     { "name": "windows-rocm-xt", "configurePreset": "windows-rocm-xt", "output": { "outputOnFailure": true } },
     { "name": "windows-vulkan-xt", "configurePreset": "windows-vulkan-xt", "output": { "outputOnFailure": true } },
     { "name": "linux-llamacpp", "configurePreset": "linux-llamacpp", "output": { "outputOnFailure": true } },
     { "name": "linux-cuda-rtx", "configurePreset": "linux-cuda-rtx", "output": { "outputOnFailure": true } },
     { "name": "linux-cuda-blackwell", "configurePreset": "linux-cuda-blackwell", "output": { "outputOnFailure": true } },
+    { "name": "linux-cuda-blackwell-120f", "configurePreset": "linux-cuda-blackwell-120f", "output": { "outputOnFailure": true } },
     { "name": "linux-rocm-xt", "configurePreset": "linux-rocm-xt", "output": { "outputOnFailure": true } },
     { "name": "linux-vulkan-xt", "configurePreset": "linux-vulkan-xt", "output": { "outputOnFailure": true } }
   ]

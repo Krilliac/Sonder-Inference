@@ -50,6 +50,11 @@ endif()
 # option() leaves an existing cache entry alone.
 set(GGML_RPC OFF CACHE BOOL "ggml: use RPC (refused for the in-process llamacpp backend)" FORCE)
 
+if(GGML_CUDA)
+    include(SonderCudaCheck)
+    sonder_check_cuda_config()
+endif()
+
 include(FetchContent)
 
 # --- pin resolution begin (extracted by scripts/test_llamacpp_pin.py) ---
