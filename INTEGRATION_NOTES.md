@@ -816,3 +816,23 @@ Open items:
   differently cased matches run only where the test directory is case-sensitive (Linux, or a
   Windows directory with per-directory case sensitivity enabled).
 - The real-store totals in the doc were measured before the CLI counted shared blobs once.
+
+## RET-07 PR-2: native benchmark default (2026-11-26)
+
+The standalone benchmark now defaults to `llamacpp`, accepts a GGUF path
+through `--model`, and forwards native context/thread/GPU-layer settings.
+Ollama and llama-server compatibility options remain. Two weight-free CLI
+unit cases cover defaults, options, and validation. An opt-in CTest smoke
+case exercises the executable and checks real results; it reports Skipped
+without native support or `SONDER_TEST_GGUF`.
+
+Authorized changes outside `bench/`: remove the obsolete Prism comparison
+script and update `docs/CLI.md`, `docs/BENCHMARK_PLAN.md`, and
+`docs/integration/ollama-bench.md` to match native usage and remove the retired
+baseline link. No direct CMake/CI references to the retired files existed.
+The Bonsai corpus is unchanged. No commit or push was performed.
+
+Validation: built and tested with `scripts/build.ps1 -Preset msvc-debug
+-Test` on the integration host. A run with native support enabled against a
+real GGUF (`SONDER_TEST_GGUF`) has not been done; the smoke case reports
+Skipped without it.
