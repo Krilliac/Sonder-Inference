@@ -1022,8 +1022,9 @@ PlacementPlan plan_model_placement(const GgufModelInfo& model, const std::vector
         if (model.prism_hadamard_block_size > 0) {
             warn += ", block_size=" + std::to_string(model.prism_hadamard_block_size);
         }
-        warn += "); re-block PQ2_0 to stock Q2_0 (group 64) for Sonder Inference native llamacpp, "
-                "or build with a matching third_party/ggml-patches kernel patch";
+        warn += "); re-block PQ2_0 to stock Q2_0 (group 64) with 'sonder-infer reblock-pq2 --input <in.gguf> "
+                "--output <out.gguf>' for Sonder Inference native llamacpp, or build with a matching "
+                "third_party/ggml-patches kernel patch";
         plan.warnings.push_back(std::move(warn));
     } else if (model.prism_hadamard) {
         plan.requires_prism_runtime = false;

@@ -36,6 +36,11 @@ if(TARGET sonder_core_tests)
     target_include_directories(sonder_core_tests PRIVATE
         "${PROJECT_SOURCE_DIR}/src/backends/llamacpp"
         "${PROJECT_SOURCE_DIR}/src/backends/llamacpp/include")
+    if(SONDER_BUILD_CLI AND TARGET sonder-infer)
+        target_compile_definitions(sonder_core_tests PRIVATE
+            SONDER_TEST_INFER_EXE="$<TARGET_FILE:sonder-infer>")
+        add_dependencies(sonder_core_tests sonder-infer)
+    endif()
 endif()
 
 if(WIN32 AND TARGET sonder_core_tests)
@@ -196,7 +201,7 @@ if(SONDER_BUILD_CLI)
     sonder_cli_test(unknown_command RC 2 STDERR_REGEX "unknown command 'genrate' \\(did you mean 'generate'\\?\\)"
         COMMAND ${infer} genrate)
     sonder_cli_test(help_unknown_command RC 2 STDERR_REGEX "unknown command 'nope'" COMMAND ${infer} help nope)
-    set(help_commands version devices backends models generate chat bench help)
+    set(help_commands version devices backends models generate chat bench reblock-pq2 help)
     if(sonder_cli_has_server)
         list(APPEND help_commands serve)
     endif()
@@ -261,6 +266,14 @@ if(SONDER_BUILD_CLI)
     # --- Runtime failures (exit 1) -----------------------------------------
     sonder_cli_test(model_not_found RC 1 STDERR_REGEX "not_found"
         COMMAND ${infer} generate --backend mock --model notmock --prompt hi)
+    sonder_cli_test(reblock_pq2_missing_input RC 2 STDERR_REGEX "error: reblock-pq2: --input is required"
+        COMMAND ${infer} reblock-pq2)
+    sonder_cli_test(reblock_pq2_missing_output RC 2 STDERR_REGEX "error: reblock-pq2: --output is required"
+        COMMAND ${infer} reblock-pq2 --input in.gguf)
+    sonder_cli_test(reblock_pq2_inspect_output_conflict RC 2 STDERR_REGEX "--output cannot be combined with --inspect"
+        COMMAND ${infer} reblock-pq2 --input in.gguf --output out.gguf --inspect)
+    sonder_cli_test(reblock_pq2_not_found RC 1 STDERR_REGEX "error: reblock-pq2: not_found"
+        COMMAND ${infer} reblock-pq2 --input "${CMAKE_CURRENT_BINARY_DIR}/absent-pq2.gguf" --inspect)
     sonder_cli_test(telemetry_unwritable RC 1 STDERR_REGEX "cannot open --telemetry"
         COMMAND ${infer} generate ${mock} --prompt hi
                 --telemetry "${CMAKE_CURRENT_BINARY_DIR}/no-such-dir/sub/t.jsonl")

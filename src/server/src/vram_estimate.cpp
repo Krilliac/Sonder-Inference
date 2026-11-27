@@ -338,8 +338,9 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
         if (m.prism_hadamard_block_size > 0) {
             note += ", block_size=" + std::to_string(m.prism_hadamard_block_size);
         }
-        note += "); re-block PQ2_0 to stock Q2_0 (group 64) for native Sonder Inference llamacpp, "
-                "or apply a matching third_party/ggml-patches kernel patch";
+        note += "); re-block PQ2_0 to stock Q2_0 (group 64) with 'sonder-infer reblock-pq2 --input <in.gguf> "
+                "--output <out.gguf>' for native Sonder Inference llamacpp, or apply a matching "
+                "third_party/ggml-patches kernel patch";
         e.notes.push_back(std::move(note));
     }
     if (!p.tensor_split.empty() && e.total_bytes > 0) {

@@ -52,7 +52,7 @@ Sonder Inference builds a single SHA-pinned `llama.cpp` `v1.0.0` engine (`cmake/
 
 - `gguf_header.cpp` records `prism_hadamard = true`, captures `prism_hadamard_transform` and `prism_hadamard_block_size`, and streams past large sign arrays without bloating `GgufModelInfo::metadata`.
 - Pinned `llama.cpp` `v1.0.0` natively executes `prism.hadamard.*` (v1 and v2, including `tied_output`) and FWHT on CPU, CUDA, and Vulkan for stock `Q2_0` (type `42`, group 64) and `Q1_0` (type `41`) GGUFs. For those stock files, `prism_hadamard` is `true` and `requires_prism_runtime` is `false`.
-- When a GGUF contains private tensor IDs (`PQ2_0` `142`, `PTQ1_0` `143`, `PQ2_0M` `145`, i.e. `has_prism_private_tensors == true`), `VramEstimate`, `PlacementPlan`, and `/v1/models` (`sonder.profile`) set `"requires_prism_runtime": true` and advise re-blocking `PQ2_0` losslessly to stock `Q2_0` (`ReblockPq2ToQ2Gguf` in `src/backends/llamacpp/pq2_reblock.hpp`) or applying a verified SI patch under `third_party/ggml-patches/`.
+- When a GGUF contains private tensor IDs (`PQ2_0` `142`, `PTQ1_0` `143`, `PQ2_0M` `145`, i.e. `has_prism_private_tensors == true`), `VramEstimate`, `PlacementPlan`, and `/v1/models` (`sonder.profile`) set `"requires_prism_runtime": true` and advise re-blocking `PQ2_0` losslessly to stock `Q2_0` with `sonder-infer reblock-pq2 --input <in.gguf> --output <out.gguf>` (`include/sonder/inference/pq2_reblock.hpp`) or applying a verified SI patch under `third_party/ggml-patches/`.
 
 Build the native `llamacpp` GPU presets directly against the pinned archive (or pass a local mirror tarball via `-DSONDER_LLAMACPP_URL` for offline builds):
 

@@ -336,6 +336,7 @@ TEST_CASE("ternary GGUF: prism.hadamard metadata and large sign_values arrays pa
         CHECK_FALSE(contains(note, "llama-server"));
         private_noted = private_noted ||
                         (contains(note, "PQ2_0/PTQ1_0") && contains(note, "Q2_0") &&
+                         contains(note, "sonder-infer reblock-pq2") &&
                          contains(note, "fwht") && contains(note, "4096"));
     }
     CHECK(private_noted);

@@ -569,7 +569,7 @@ TEST_CASE("pq2_reblock: hostile and unsupported GGUFs fail closed without partia
         CHECK(InspectPq2Gguf(trunc_path, insp).code == ErrorCode::kInvalidArgument);
     }
 
-    // 7. NaN FP16 scale inside a PQ2_0 tensor is rejected during re-blocking and leaves no output file.
+        // 7. NaN FP16 scale inside a PQ2_0 tensor is rejected during re-blocking and leaves no output file.
     {
         RawGgufBuilder g;
         g.kv_str("general.architecture", "llama");
@@ -578,5 +578,20 @@ TEST_CASE("pq2_reblock: hostile and unsupported GGUFs fail closed without partia
         WriteBytes(nan_gguf, g.build());
         CHECK(ReblockPq2ToQ2Gguf(nan_gguf, out_path).code == ErrorCode::kInvalidArgument);
         CHECK_FALSE(std::filesystem::exists(out_path));
+
+        // 8. Non-ASCII UTF-8 paths do not throw std::system_error on Windows, and overwriting an
+        //    existing destination is atomic (a failed re-block leaves the existing destination intact).
+        const std::filesystem::path utf8_in = tmp.path() / std::filesystem::path(u8"bonsai-\u65E5\u672C\u8A9E-in.gguf");
+        const std::filesystem::path utf8_out = tmp.path() / std::filesystem::path(u8"bonsai-\u65E5\u672C\u8A9E-out.gguf");
+        WriteBytes(utf8_in, BuildSyntheticBonsaiPq2Gguf());
+        WriteBytes(utf8_out, {0xAAu, 0xBBu});
+        // Failed conversion onto utf8_out must preserve {0xAA, 0xBB}.
+        CHECK(ReblockPq2ToQ2Gguf(nan_gguf, utf8_out).code == ErrorCode::kInvalidArgument);
+        CHECK(ReadBytes(utf8_out) == std::vector<std::uint8_t>{0xAAu, 0xBBu});
+        // Valid conversion onto existing utf8_out atomically replaces it and passes verification.
+        Pq2ReblockReport utf8_rep;
+        const Status utf8_st = ReblockPq2ToQ2Gguf(utf8_in, utf8_out, &utf8_rep);
+        REQUIRE_MESSAGE(utf8_st.ok(), utf8_st.message);
+        REQUIRE_MESSAGE(VerifyPq2ToQ2Gguf(utf8_in, utf8_out).ok(), "non-ASCII re-blocked GGUF must verify");
     }
 }

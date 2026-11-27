@@ -368,6 +368,28 @@ inline const CommandSpec& weights_command() {
     return spec;
 }
 
+inline const CommandSpec& reblock_pq2_command() {
+    using namespace commands_detail;
+    static const CommandSpec spec{
+        "reblock-pq2",
+        "losslessly re-block a PQ2_0 (group 128) GGUF to stock Q2_0 (group 64) and verify parity",
+        {"reblock-pq2 --input GGUF --output GGUF [--json]",
+         "reblock-pq2 --input GGUF --inspect [--json]"},
+        {{"Re-block",
+          {{"input", OptionKind::value, "GGUF", "source GGUF path containing PQ2_0 (type 142) tensors (required)"},
+           {"output", OptionKind::value, "GGUF", "destination stock Q2_0 (type 42) GGUF path (required unless --inspect)"},
+           {"inspect", OptionKind::flag, "", "inspect GGUF tensor counts and byte sizes only (writes no output)"}}},
+         output_json()},
+        {"Splits each 34-byte PQ2_0 block (group 128) into two 18-byte stock Q2_0 blocks\n"
+         "(group 64), preserves prism.hadamard.* metadata and non-PQ2_0 tensors, writes via an\n"
+         "exclusive sibling temp file, atomically replaces --output, and runs bit-exact float32\n"
+         "dequantized parity verification before exiting 0.",
+         kExitNote},
+        {"reblock-pq2 --input Bonsai-2-9B-PQ2_0.gguf --output Bonsai-2-9B-Q2_0.gguf",
+         "reblock-pq2 --input Bonsai-2-9B-PQ2_0.gguf --inspect --json"}};
+    return spec;
+}
+
 inline const CommandSpec& worker_command() {
     static const CommandSpec spec{
         "worker", "private engine subprocess managed by serve (no network listener)",
@@ -394,10 +416,10 @@ inline const CommandSpec& help_command() {
 // All commands, in display order.
 inline const std::vector<const CommandSpec*>& all_commands() {
     static const std::vector<const CommandSpec*> list{
-        &generate_command(), &chat_command(),     &serve_command(),   &bench_command(),
-        &models_command(),   &backends_command(), &devices_command(), &node_command(),
-        &plan_command(),     &version_command(),  &tune_command(),    &weights_command(),
-        &worker_command(),   &help_command()};
+        &generate_command(),    &chat_command(),     &serve_command(),   &bench_command(),
+        &models_command(),      &backends_command(), &devices_command(), &node_command(),
+        &plan_command(),        &version_command(),  &tune_command(),    &weights_command(),
+        &reblock_pq2_command(), &worker_command(),   &help_command()};
     return list;
 }
 

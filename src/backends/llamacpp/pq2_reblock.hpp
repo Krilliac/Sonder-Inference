@@ -74,11 +74,11 @@ struct Pq2ReblockReport {
                                        std::size_t n_elements,
                                        std::vector<std::uint8_t>& out_q2_bytes);
 
-// Header-and-bounds inspection of a GGUF v2/v3 file. Rejects truncated files,
-// oversized metadata/tensor counts, non-monotonic or overlapping tensor
-// regions, unsupported private tensor types (PTQ1_0=143, PQ1_0=144, PQ2_0M=145),
-// and legacy group-128-as-type-42 layouts whose byte spans do not match group-64
-// Q2_0 sizing.
+// Header-and-bounds inspection of a GGUF v2/v3 file. Rejects symlinks,
+// truncated files, oversized metadata/tensor counts, non-monotonic or
+// overlapping tensor regions, unsupported private tensor types (PTQ1_0=143,
+// PQ1_0=144, PQ2_0M=145), and legacy group-128-as-type-42 files whose smaller
+// payload byte spans truncate the expected group-64 Q2_0 payload bounds.
 [[nodiscard]] Status InspectPq2Gguf(const std::filesystem::path& path,
                                     Pq2GgufInspection& out_inspection);
 

@@ -45,6 +45,7 @@ add_library(sonder_inference
     src/common/json.cpp
     src/common/log_queue.cpp
     src/common/diag_log.cpp
+    src/common/pq2_reblock.cpp
     src/common/sha256.cpp
     src/engine/sampling_config.cpp
     src/devices/device.cpp

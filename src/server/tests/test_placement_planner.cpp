@@ -260,6 +260,7 @@ TEST_CASE("placement planner: Ternary Bonsai-2-27B on RTX 5070 Ti fits on GPU wi
     CHECK(plan.estimate.requires_prism_runtime);
     CHECK(any_contains(plan.warnings, "PQ2_0/PTQ1_0"));
     CHECK(any_contains(plan.warnings, "Q2_0"));
+    CHECK(any_contains(plan.warnings, "sonder-infer reblock-pq2"));
     CHECK_FALSE(any_contains(plan.warnings, "stock llama-server"));
     CHECK_FALSE(plan.reasons.empty());
 
