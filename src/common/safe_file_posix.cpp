@@ -8,6 +8,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
+#include <functional>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -55,6 +56,7 @@ void fill_identity(const struct stat& st, FileIdentity& out) {
     out.volume = static_cast<std::uint64_t>(st.st_dev);
     out.file_id = static_cast<std::uint64_t>(st.st_ino);
     out.file_id_high = 0;
+    out.weak_id = false;
     out.size = st.st_size < 0 ? 0u : static_cast<std::uint64_t>(st.st_size);
     out.link_count = static_cast<std::uint64_t>(st.st_nlink);
 #if defined(__APPLE__)
@@ -215,9 +217,9 @@ OpenOutcome probe_anchored_dir(const OwnedFileHandle& anchor, std::string_view r
     return open_dirs(to_fd(anchor.native_value()), segs, segs.size(), dir, dfd, err_msg);
 }
 
-OpenOutcome list_anchored_dir(const OwnedFileHandle& anchor, std::string_view rel, std::vector<DirEntry>& out,
-                              std::string& err_msg) {
-    out.clear();
+OpenOutcome visit_anchored_dir(const OwnedFileHandle& anchor, std::string_view rel, std::size_t max_entries,
+                               const std::function<bool(DirEntry&)>& visit, bool& truncated, std::string& err_msg) {
+    truncated = false;
     if (!anchor.valid()) {
         err_msg = "store root is not open";
         return OpenOutcome::io_error;
@@ -236,21 +238,29 @@ OpenOutcome list_anchored_dir(const OwnedFileHandle& anchor, std::string_view re
         return OpenOutcome::io_error;
     }
     (void)dir.release();
+    struct Closer {
+        DIR* stream;
+        ~Closer() { ::closedir(stream); }
+    } closer{d};
     const int list_fd = dirfd(d);  // unqualified: a macro on some BSD libcs
-    OpenOutcome result = OpenOutcome::ok;
+    std::size_t visited = 0;
     while (true) {
         errno = 0;
         const struct dirent* ent = ::readdir(d);
         if (ent == nullptr) {
             if (errno != 0) {
                 err_msg = std::strerror(errno);
-                result = OpenOutcome::io_error;
-                out.clear();
+                return OpenOutcome::io_error;
             }
-            break;
+            return OpenOutcome::ok;
         }
         const std::string_view name(ent->d_name);
         if (name == "." || name == "..") continue;
+        if (visited == max_entries) {  // one entry more than the caller allows: stop reading
+            truncated = true;
+            return OpenOutcome::ok;
+        }
+        ++visited;
         DirEntry e;
         e.name.assign(name);
         struct stat st {};
@@ -265,10 +275,8 @@ OpenOutcome list_anchored_dir(const OwnedFileHandle& anchor, std::string_view re
         } else {
             e.kind = DirEntryKind::other;
         }
-        out.push_back(std::move(e));
+        if (!visit(e)) return OpenOutcome::ok;
     }
-    ::closedir(d);
-    return result;
 }
 
 OpenOutcome open_single_regular(const fs::path& file, OwnedFileHandle& out_handle, std::uint64_t& out_size,

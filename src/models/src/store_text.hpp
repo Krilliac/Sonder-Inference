@@ -14,8 +14,9 @@ namespace sonder::inference::models::store_text {
 // cut by `max`), and the bytes of well-formed sequences for C1 controls (U+0080-U+009F),
 // Arabic letter mark, zero-width and bidi marks (U+200B-U+200F, U+202A-U+202E,
 // U+2060-U+2069), line/paragraph separators (U+2028, U+2029), BOM (U+FEFF) and interlinear
-// annotation controls (U+FFF9-U+FFFB). A backslash becomes \. Reads at most `max` input
-// bytes and appends "..." when it cut. Reentrant; allocates the output only.
+// annotation controls (U+FFF9-U+FFFB). A backslash is doubled (\\), so input text cannot
+// forge an escape. Reads at most `max` input bytes and appends "..." when it cut.
+// Reentrant; allocates the output only.
 std::string printable(std::string_view s, std::size_t max);
 
 }  // namespace sonder::inference::models::store_text

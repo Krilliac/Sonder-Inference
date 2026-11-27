@@ -672,10 +672,13 @@ Changes outside the module, for the integrator:
    `open_anchor_dir` (follows a link at the root once), `open_anchored_file(anchor, rel, ShareMode,
    ...)` (Windows: `NtCreateFile` relative to the previous handle with `FILE_OPEN_REPARSE_POINT`;
    POSIX: `openat` + `O_NOFOLLOW`; `ShareMode::deny_writers` opens without `FILE_SHARE_WRITE`/
-   `FILE_SHARE_DELETE` on Windows), `probe_anchored_dir`, `list_anchored_dir` (handle-based
-   enumeration), `read_anchored_leaf_symlink` (POSIX: `readlinkat` + `lstat` only, the target is
-   never resolved), `query_identity` (Windows: 128-bit `FILE_ID_INFO` id and 64-bit volume serial),
-   `read_some` and `OwnedFileHandle::release`. `open_anchored_regular(path, ...)` keeps its
+   `FILE_SHARE_DELETE` on Windows), `probe_anchored_dir`, `visit_anchored_dir` (handle-based,
+   streamed enumeration with an entry cap; round 3 replaced `list_anchored_dir`, which returned a
+   vector of every entry), `read_anchored_leaf_symlink` (POSIX: `readlinkat` + `lstat` only, the
+   target is never resolved), `query_identity` (Windows: 128-bit `FILE_ID_INFO` id and 64-bit
+   volume serial; the 64-bit fallback only for an unsupported class, marked
+   `FileIdentity::weak_id`), `read_some` and `OwnedFileHandle::release`. Round 3 also opens
+   directories without `FILE_DIRECTORY_FILE` (the attributes are checked on the handle). `open_anchored_regular(path, ...)` keeps its
    signature (it pins the path, then opens relative to it), so `src/artifacts` is unchanged apart
    from now using the relative opens; the `sonder.artifacts.*` tests cover it. `src/artifacts`
    keeps only `hash_open_handle`; `weight_manifest_io.hpp` re-exports the shared names with
@@ -685,11 +688,17 @@ Changes outside the module, for the integrator:
    with it. Test: `tests/test_json.cpp` "ParseLimits reject_duplicate_keys ...".
 
 Integration hook (not wired in this lane): the native llamacpp backend should call
-`ModelRegistry::add_ollama_dir(default_ollama_models_dir())` once and `resolve(name)` when a model
-name is not an existing file path, then load `model_path` (plus `shard_paths`, `projector_paths`,
-`adapter_paths`, and `draft_paths`: first = draft model, rest = its shards) in place and use
-`params`, `template_text` and `system_prompt` as request defaults. `resolve` takes no registry
-lock while it reads the disk and a miss lists only the directories on the name's path.
+`ModelRegistry::add_ollama_dir(default_ollama_models_dir())` once and, when a model name is not an
+existing file path, `resolve_for_load(name)` (never `resolve` for loading). It must load only from
+the returned `VerifiedWeights` handles (`weights.files()[i].native_handle`, matched to the record's
+model, shard, projector, adapter and draft layers by `find(digest)`; `draft_paths`: first = draft
+model, rest = its shards), keep that object alive while the model is mapped, and never reopen
+`model_path` or any other record path. By default `resolve_for_load` hashes every weight through
+those handles (`weights.verified()`); the loader should refuse to load when `verified()` is false
+unless the operator chose `first_use` or `off`. Use `params`, `template_text` and `system_prompt`
+as request defaults. `resolve_for_load` takes no registry lock while it reads the disk, a miss
+streams only the directories on the name's path, and `StoreOptions::on_weight_hash` must not call
+back into the registry.
 
 Open items:
 
@@ -697,10 +706,10 @@ Open items:
   by llama.cpp is unverified.
 - No persistence for registered stores; digest references and the `@digest` name suffix are not
   resolved (see the doc's open-items list).
-- The loader lane must load from `resolve_for_load`'s `VerifiedWeights` handles, not from the
-  record paths (llama.cpp opens paths itself, so that needs a handle- or memory-based load path).
-  POSIX has no deny-write, so a writer can still change a blob after it was hashed there (doc
-  "Trust and verification", "Known limits").
+- llama.cpp opens model files by path itself, so the hook above needs a handle- or memory-based
+  load path in the loader lane before it can be wired. POSIX has no deny-write, so a writer can
+  still change a blob after it was hashed there; on Windows a held blob blocks `ollama rm` and
+  re-pulls of it (doc "Trust and verification", "Known limits").
 - The case-insensitive directory lookup (`locate_ci`) is only reachable on case-sensitive file
   systems, so on Windows it is covered by CI on Linux, not by the local run.
 - The real-store totals in the doc were measured before the CLI counted shared blobs once.

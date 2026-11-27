@@ -6,9 +6,11 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -1140,7 +1142,7 @@ TEST_CASE("model store: a manifest leaf symlink is followed only into a matching
     CHECK(ok.value().ready());
     // The link itself is a source, so retargeting it makes a cached record stale.
     bool has_link_source = false;
-    for (const auto& src : ok.value().sources) has_link_source = has_link_source || src.link;
+    for (const auto& src : ok.value().sources) has_link_source = has_link_source || src.kind == m::SourceKind::link;
     CHECK(has_link_source);
     auto scan = store.value().scan();
     REQUIRE(find(scan, "linked:latest") != nullptr);
@@ -1440,20 +1442,25 @@ TEST_CASE("model store: weight verification policy first_use caches by file iden
     CHECK(hashed == 0);
     REQUIRE(find(scan, "good:latest") != nullptr);
     CHECK(find(scan, "good:latest")->ready());
-    CHECK_FALSE(find(scan, "good:latest")->weights_verified);
+    CHECK_FALSE(find(scan, "good:latest")->weights_verified());
+    CHECK(find(scan, "good:latest")->weight_check == m::WeightCheck::unchecked);
 
     auto r1 = store.value().resolve("good");
     REQUIRE(r1.ok());
     CHECK(r1.value().ready());
-    CHECK(r1.value().weights_verified);
+    CHECK(r1.value().weights_verified());
+    CHECK(r1.value().weight_check == m::WeightCheck::hashed_now);
     CHECK(hashed == 1);
     auto r2 = store.value().resolve("good");
     REQUIRE(r2.ok());
-    CHECK(r2.value().weights_verified);
+    CHECK(r2.value().ready());
+    // A remembered digest is not a hash of the current bytes: never reported as verified.
+    CHECK(r2.value().weight_check == m::WeightCheck::cached_identity);
+    CHECK_FALSE(r2.value().weights_verified());
     CHECK(hashed == 1);  // cached: same file id, size, write and change time
     // A copy of the store shares the cache.
     const m::OllamaStore copy = store.value();
-    CHECK(copy.resolve("good").value().weights_verified);
+    CHECK(copy.resolve("good").value().weight_check == m::WeightCheck::cached_identity);
     CHECK(hashed == 1);
 
     // A mismatch is cached too, so a corrupt multi-GB file is not re-read on every request.
@@ -1469,7 +1476,7 @@ TEST_CASE("model store: weight verification policy first_use caches by file iden
     REQUIRE(r3.ok());
     CHECK(hashed == 3);
     CHECK(r3.value().reason == m::UnsupportedReason::digest_mismatch);
-    CHECK_FALSE(r3.value().weights_verified);
+    CHECK_FALSE(r3.value().weights_verified());
 
     // revalidate(): a record from before the change is stale.
     CHECK_FALSE(store.value().revalidate(r1.value()));
@@ -1494,12 +1501,12 @@ TEST_CASE("model store: weight verification policies always and off") {
     always.on_weight_hash = [&](const m::BlobRef&) { ++hashed; };
     auto a = m::OllamaStore::open(s.tmp.path, always);
     REQUIRE(a.ok());
-    CHECK(a.value().resolve("good").value().weights_verified);
-    CHECK(a.value().resolve("good").value().weights_verified);
+    CHECK(a.value().resolve("good").value().weights_verified());
+    CHECK(a.value().resolve("good").value().weights_verified());
     CHECK(hashed == 2);  // nothing cached
     auto scan = a.value().scan();
     CHECK(hashed == 4);  // the scan hashes both entries
-    CHECK(find(scan, "good:latest")->weights_verified);
+    CHECK(find(scan, "good:latest")->weights_verified());
     CHECK(find(scan, "bad:latest")->reason == m::UnsupportedReason::digest_mismatch);
 
     m::StoreOptions off;
@@ -1510,7 +1517,8 @@ TEST_CASE("model store: weight verification policies always and off") {
     auto unverified = o.value().resolve("bad");
     REQUIRE(unverified.ok());
     CHECK(unverified.value().ready());  // size and header only, by request
-    CHECK_FALSE(unverified.value().weights_verified);
+    CHECK_FALSE(unverified.value().weights_verified());
+    CHECK(unverified.value().weight_check == m::WeightCheck::unchecked);
     CHECK(hashed == 4);
 
     m::ModelRegistry reg(off);
@@ -1538,7 +1546,7 @@ TEST_CASE("model store: a hard-linked weight blob is served only after its diges
     auto r = store.value().resolve("split");
     REQUIRE(r.ok());
     CHECK(r.value().ready());
-    CHECK(r.value().weights_verified);
+    CHECK(r.value().weights_verified());
     CHECK(any_contains(r.value().warnings, "hard links"));
 }
 
@@ -1707,59 +1715,88 @@ TEST_CASE("model store: concurrent first uses of one weight file share one hash"
     constexpr int kThreads = 8;
     std::atomic<int> waiting{0};
     std::atomic<bool> go{false};
-    std::vector<int> verified(kThreads, 0);
+    std::vector<int> checked(kThreads, 0);  // 2 hashed_now, 1 cached_identity, 0 anything else
     std::vector<std::thread> threads;
     for (int i = 0; i < kThreads; ++i) {
         threads.emplace_back([&, i] {
             ++waiting;
             while (!go.load()) std::this_thread::yield();
             auto r = store.value().resolve("big");
-            verified[static_cast<std::size_t>(i)] = r.ok() && r.value().ready() && r.value().weights_verified ? 1 : 0;
+            int c = 0;
+            if (r.ok() && r.value().ready()) {
+                if (r.value().weight_check == m::WeightCheck::hashed_now) c = 2;
+                if (r.value().weight_check == m::WeightCheck::cached_identity) c = 1;
+            }
+            checked[static_cast<std::size_t>(i)] = c;
         });
     }
     while (waiting.load() < kThreads) std::this_thread::yield();
     go = true;
     for (auto& t : threads) t.join();
     CHECK(hashed.load() == 1);
-    for (int v : verified) CHECK(v == 1);
+    int hashed_now = 0;
+    for (int c : checked) {
+        CHECK(c != 0);
+        if (c == 2) ++hashed_now;
+    }
+    CHECK(hashed_now == 1);  // only the thread that read the bytes says it hashed them
 }
 
 TEST_CASE("model store: weight hashes run at most kMaxConcurrentWeightHashes at a time per store") {
     Store s;
     const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
     constexpr int kModels = 6;
-    for (int i = 0; i < kModels; ++i) {
+    for (int i = 0; i < kModels; ++i) {  // 8 MiB each, so every hash lasts long enough to be seen
         s.put_v2("ollama.com", "library", "m" + std::to_string(i), "latest",
-                 s.manifest(cfg, {s.blob(kModel, fake_gguf(1, 1, 64, static_cast<char>('a' + i)))}));
+                 s.manifest(cfg, {s.blob(kModel, fake_gguf(1, 1, 8u << 20, static_cast<char>('a' + i)))}));
     }
-    std::atomic<int> hashed{0}, current{0}, peak{0};
+    std::atomic<int> hashed{0}, in_callback{0}, callback_peak{0};
     m::StoreOptions opt;
+    // Holds every resolving thread here until all have arrived, so all of them reach the hash
+    // slots at once (the callback runs before a slot is taken).
+    std::atomic<int> arrived{0};
     opt.on_weight_hash = [&](const m::BlobRef&) {
         ++hashed;
-        const int now = ++current;
-        int seen = peak.load();
-        while (now > seen && !peak.compare_exchange_weak(seen, now)) {
+        const int now = ++in_callback;
+        int seen = callback_peak.load();
+        while (now > seen && !callback_peak.compare_exchange_weak(seen, now)) {
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        --current;
+        ++arrived;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (arrived.load() < kModels && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        --in_callback;
     };
     auto store = m::OllamaStore::open(s.tmp.path, opt);
     REQUIRE(store.ok());
-    std::atomic<bool> go{false};
+    std::atomic<bool> go{false}, finished{false};
+    std::atomic<std::size_t> slot_peak{0};
+    std::thread monitor([&] {  // samples the slots in use until every resolve returned
+        while (!finished.load()) {
+            const std::size_t now = store.value().weight_hashes_running();
+            std::size_t seen = slot_peak.load();
+            while (now > seen && !slot_peak.compare_exchange_weak(seen, now)) {
+            }
+            std::this_thread::yield();
+        }
+    });
     std::vector<int> ok(kModels, 0);
     std::vector<std::thread> threads;
     for (int i = 0; i < kModels; ++i) {
         threads.emplace_back([&, i] {
             while (!go.load()) std::this_thread::yield();
             auto r = store.value().resolve("m" + std::to_string(i));
-            ok[static_cast<std::size_t>(i)] = r.ok() && r.value().weights_verified ? 1 : 0;
+            ok[static_cast<std::size_t>(i)] = r.ok() && r.value().weights_verified() ? 1 : 0;
         });
     }
     go = true;
     for (auto& t : threads) t.join();
+    finished = true;
+    monitor.join();
     CHECK(hashed.load() == kModels);
-    CHECK(peak.load() >= 1);
-    CHECK(peak.load() <= static_cast<int>(m::kMaxConcurrentWeightHashes));
+    CHECK(callback_peak.load() == kModels);  // every thread wanted a slot at the same time
+    CHECK(slot_peak.load() >= 1);
+    CHECK(slot_peak.load() <= m::kMaxConcurrentWeightHashes);
+    CHECK(store.value().weight_hashes_running() == 0);
     for (int v : ok) CHECK(v == 1);
 }
 
@@ -1793,7 +1830,7 @@ TEST_CASE("model store: a registry entry that was briefly corrupt is served agai
     bump_mtime(s.blob_file(model), 10);
     auto repaired = reg.resolve("flaky");
     REQUIRE(repaired.ok());
-    CHECK(repaired.value().weights_verified);
+    CHECK(repaired.value().weights_verified());
 }
 
 TEST_CASE("model store: a registry entry with a missing blob is served once the blob arrives") {
@@ -1903,7 +1940,7 @@ TEST_CASE("model store: a weight blob held open for writing is not hashed or ser
         REQUIRE(r.ok());
         CHECK_FALSE(r.value().ready());
         CHECK(r.value().reason == m::UnsupportedReason::blob_busy);
-        CHECK_FALSE(r.value().weights_verified);
+        CHECK_FALSE(r.value().weights_verified());
         auto via = reg.resolve("held");
         CHECK_FALSE(via.ok());
         CHECK(via.status().message().find("blob_busy") != std::string::npos);
@@ -1911,7 +1948,7 @@ TEST_CASE("model store: a weight blob held open for writing is not hashed or ser
     }
     auto released = reg.resolve("held");  // a transient reason is re-checked, not cached
     REQUIRE(released.ok());
-    CHECK(released.value().weights_verified);
+    CHECK(released.value().weights_verified());
     CHECK(hashed == 1);
 }
 #endif
@@ -1931,9 +1968,10 @@ TEST_CASE("model store: resolve_for_load hands the loader the verified, open wei
         auto lm = store.value().resolve_for_load("load");
         REQUIRE(lm.ok());
         REQUIRE(lm.value().record.ready());
-        CHECK(lm.value().record.weights_verified);
+        CHECK(lm.value().record.weights_verified());
         const m::VerifiedWeights& w = lm.value().weights;
         CHECK(w.verified());
+        CHECK(w.check() == m::WeightCheck::hashed_now);
         REQUIRE(w.files().size() == 2);  // one handle per distinct digest
         const auto* f = w.find(model.digest);
         REQUIRE(f != nullptr);
@@ -1971,10 +2009,11 @@ TEST_CASE("model store: resolve_for_load hands the loader the verified, open wei
     off.verify_weights = m::WeightVerification::off;
     auto o = m::OllamaStore::open(s.tmp.path, off);
     REQUIRE(o.ok());
-    auto unhashed = o.value().resolve_for_load("load");
+    auto unhashed = o.value().resolve_for_load("load", m::WeightVerification::off);  // asked for explicitly
     REQUIRE(unhashed.ok());
     CHECK(unhashed.value().weights.files().size() == 2);
     CHECK_FALSE(unhashed.value().weights.verified());
+    CHECK(unhashed.value().weights.check() == m::WeightCheck::unchecked);
 
     m::ModelRegistry reg;
     REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
@@ -1995,8 +2034,8 @@ TEST_CASE("model store: first_use hashes again when a weight's hard-link count c
     opt.on_weight_hash = [&](const m::BlobRef&) { ++hashed; };
     auto store = m::OllamaStore::open(s.tmp.path, opt);
     REQUIRE(store.ok());
-    REQUIRE(store.value().resolve("linked").value().weights_verified);
-    REQUIRE(store.value().resolve("linked").value().weights_verified);
+    REQUIRE(store.value().resolve("linked").value().weights_verified());
+    REQUIRE(store.value().resolve("linked").value().weight_check == m::WeightCheck::cached_identity);
     CHECK(hashed == 1);
 #if defined(_WIN32)
     // Reads or sets FILE_BASIC_INFO (all four times) the way any holder of FILE_WRITE_ATTRIBUTES can.
@@ -2027,9 +2066,345 @@ TEST_CASE("model store: first_use hashes again when a weight's hard-link count c
 #endif
     auto again = store.value().resolve("linked");
     REQUIRE(again.ok());
-    CHECK(again.value().weights_verified);
+    CHECK(again.value().weights_verified());
     CHECK(hashed == 2);
 }
+
+// ---------------------------------------------------------------------------
+// Security review of PR 135, round 3: WeightCheck, unsupported records that carry their
+// sources, bounded enumeration, re-entrant callbacks, open() errors, registry refresh.
+// ---------------------------------------------------------------------------
+TEST_CASE("model store: a first_use hit says cached_identity and resolve_for_load hashes through its handles by default") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(3, 1, 256, 'c'));
+    s.put_v2("ollama.com", "library", "m", "latest", s.manifest(cfg, {model}));
+    int hashed = 0;
+    m::StoreOptions opt;  // first_use, the default
+    opt.on_weight_hash = [&](const m::BlobRef&) { ++hashed; };
+    auto store = m::OllamaStore::open(s.tmp.path, opt);
+    REQUIRE(store.ok());
+
+    auto first = store.value().resolve("m");
+    REQUIRE(first.ok());
+    REQUIRE(first.value().ready());
+    CHECK(first.value().weight_check == m::WeightCheck::hashed_now);
+    CHECK(hashed == 1);
+
+    // first_use asked for explicitly: the remembered digest is reused, the bytes are not read
+    // again, and nothing calls them verified.
+    auto hit = store.value().resolve_for_load("m", m::WeightVerification::first_use);
+    REQUIRE(hit.ok());
+    REQUIRE(hit.value().record.ready());
+    CHECK(hashed == 1);
+    CHECK(hit.value().record.weight_check == m::WeightCheck::cached_identity);
+    CHECK_FALSE(hit.value().record.weights_verified());
+    CHECK(hit.value().weights.check() == m::WeightCheck::cached_identity);
+    CHECK_FALSE(hit.value().weights.verified());
+    REQUIRE(hit.value().weights.files().size() == 1);
+    CHECK(hit.value().weights.files()[0].check == m::WeightCheck::cached_identity);
+    const std::string doc = m::to_json(hit.value().record).dump();
+    CHECK(doc.find("\"weight_check\":\"cached_identity\"") != std::string::npos);
+    CHECK(doc.find("\"weights_verified\":false") != std::string::npos);
+
+    // The default: hashed again, through the very handles it returns.
+    auto load = store.value().resolve_for_load("m");
+    REQUIRE(load.ok());
+    REQUIRE(load.value().record.ready());
+    CHECK(hashed == 2);
+    CHECK(load.value().record.weight_check == m::WeightCheck::hashed_now);
+    CHECK(load.value().weights.verified());
+    REQUIRE(load.value().weights.files().size() == 1);
+    CHECK(load.value().weights.files()[0].check == m::WeightCheck::hashed_now);
+    CHECK(read_native(load.value().weights.files()[0].native_handle, 1024) == fake_gguf(3, 1, 256, 'c'));
+
+    // The registry has the same defaults.
+    m::ModelRegistry reg(opt);
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    REQUIRE(reg.resolve("m").ok());
+    CHECK(hashed == 3);  // its own store, its own remembered digests
+    auto reg_hit = reg.resolve("m");
+    REQUIRE(reg_hit.ok());
+    CHECK(reg_hit.value().weight_check == m::WeightCheck::cached_identity);
+    CHECK(hashed == 3);
+    auto reg_load = reg.resolve_for_load("m");
+    REQUIRE(reg_load.ok());
+    CHECK(hashed == 4);
+    CHECK(reg_load.value().weights.verified());
+    auto reg_cached = reg.resolve_for_load("m", m::WeightVerification::first_use);
+    REQUIRE(reg_cached.ok());
+    CHECK(hashed == 4);
+    CHECK_FALSE(reg_cached.value().weights.verified());
+    CHECK(reg_cached.value().weights.check() == m::WeightCheck::cached_identity);
+}
+
+namespace {
+
+std::string list_manifest(const std::vector<std::string>& children) {
+    std::string out = std::string("{\"schemaVersion\":2,\"mediaType\":\"") + kListType + "\",\"manifests\":[";
+    for (std::size_t i = 0; i < children.size(); ++i) out += (i ? "," : "") + children[i];
+    return out + "]}";
+}
+
+std::string child_ref(const std::string& hex) {
+    return std::string("{\"mediaType\":\"") + kManifestType + "\",\"digest\":\"sha256:" + hex +
+           "\",\"runner\":\"llamacpp\",\"format\":\"gguf\"}";
+}
+
+}  // namespace
+
+TEST_CASE("model store: a registry entry whose manifest-list child is missing is served once the child arrives") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(9, 1, 64));
+    const std::string child = s.manifest(cfg, {model});
+    const std::string child_hex = si::detail::sha256_hex(child);
+    s.put_v2("ollama.com", "library", "listed", "latest", list_manifest({child_ref(child_hex)}));
+    m::ModelRegistry reg;
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    for (int i = 0; i < 2; ++i) {
+        auto miss = reg.resolve("listed");
+        CHECK_FALSE(miss.ok());
+        CHECK(miss.status().message().find("missing_blob") != std::string::npos);
+    }
+    write_file(s.tmp.path / "blobs" / ("sha256-" + child_hex), child);  // the pull finished
+    auto now = reg.resolve("listed");
+    REQUIRE(now.ok());
+    REQUIRE(now.value().gguf.has_value());
+    CHECK(now.value().gguf->tensor_count == 9);
+}
+
+TEST_CASE("model store: a registry entry whose manifest-list child is corrupt is served once it is repaired") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(8, 1, 64));
+    const std::string child = s.manifest(cfg, {model});
+    const std::string child_hex = si::detail::sha256_hex(child);
+    const fs::path child_file = s.tmp.path / "blobs" / ("sha256-" + child_hex);
+    std::string broken = child;
+    broken[broken.size() / 2] = broken[broken.size() / 2] == 'x' ? 'y' : 'x';  // same size, other bytes
+    write_file(child_file, broken);
+    s.put_v2("ollama.com", "library", "listed", "latest", list_manifest({child_ref(child_hex)}));
+    m::ModelRegistry reg;
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    for (int i = 0; i < 2; ++i) {
+        auto bad = reg.resolve("listed");
+        CHECK_FALSE(bad.ok());
+        CHECK(bad.status().message().find("manifest_invalid") != std::string::npos);
+    }
+    write_file(child_file, child);  // repaired
+    bump_mtime(child_file, 5);
+    auto now = reg.resolve("listed");
+    REQUIRE(now.ok());
+    REQUIRE(now.value().gguf.has_value());
+    CHECK(now.value().gguf->tensor_count == 8);
+}
+
+TEST_CASE("model store: a registry entry whose manifest is hard-linked is served once the extra link is removed") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    s.put_v2("ollama.com", "library", "linked", "latest", s.manifest(cfg, {s.blob(kModel, fake_gguf(6, 1, 64))}));
+    const fs::path manifest = s.tmp.path / "manifests-v2" / "ollama.com" / "library" / "linked" / "latest";
+    const fs::path extra = s.tmp.path / "elsewhere";
+    std::error_code ec;
+    fs::create_hard_link(manifest, extra, ec);
+    REQUIRE_MESSAGE(!ec, "hard link creation failed: " << ec.message());
+    m::ModelRegistry reg;
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    for (int i = 0; i < 2; ++i) {
+        auto bad = reg.resolve("linked");
+        CHECK_FALSE(bad.ok());
+        CHECK(bad.status().message().find("hard links") != std::string::npos);
+    }
+    fs::remove(extra);
+    auto now = reg.resolve("linked");
+    REQUIRE(now.ok());
+    REQUIRE(now.value().gguf.has_value());
+    CHECK(now.value().gguf->tensor_count == 6);
+}
+
+TEST_CASE("model store: a scan stops at the ScanLimits caps and says so") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(1, 1, 16));
+    constexpr int kModels = 6;
+    for (int i = 0; i < kModels; ++i) s.put_v2("ollama.com", "library", "m" + std::to_string(i), "latest", s.manifest(cfg, {model}));
+
+    auto plain = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(plain.ok());
+    const auto all = plain.value().scan();
+    CHECK(all.records.size() == static_cast<std::size_t>(kModels));
+    CHECK_FALSE(any_contains(all.notes, "ScanLimits"));
+
+    m::StoreOptions per_dir;  // "library" holds six model directories
+    per_dir.limits.max_dir_entries = 4;
+    auto a = m::OllamaStore::open(s.tmp.path, per_dir);
+    REQUIRE(a.ok());
+    const auto cut = a.value().scan();
+    CHECK(cut.records.size() == 4);
+    CHECK(any_contains(cut.notes, "ScanLimits::max_dir_entries"));
+    CHECK(a.value().resolve("m5").ok());  // a lookup by exact name does not enumerate
+
+    m::StoreOptions models;
+    models.limits.max_models = 2;
+    auto b = m::OllamaStore::open(s.tmp.path, models);
+    REQUIRE(b.ok());
+    const auto two = b.value().scan();
+    CHECK(two.records.size() == 2);
+    CHECK(any_contains(two.notes, "ScanLimits::max_models"));
+
+    m::StoreOptions total;  // manifests-v2 (1) + ollama.com (1) + library (6) = 8: no model dir is listed
+    total.limits.max_scan_entries = 8;
+    auto c = m::OllamaStore::open(s.tmp.path, total);
+    REQUIRE(c.ok());
+    const auto none = c.value().scan();
+    CHECK(none.records.empty());
+    CHECK(any_contains(none.notes, "ScanLimits::max_scan_entries"));
+}
+
+TEST_CASE("model store: an on_weight_hash callback that calls back into the store fails fast instead of deadlocking") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    s.put_v2("ollama.com", "library", "a", "latest", s.manifest(cfg, {s.blob(kModel, fake_gguf(1, 1, 64, 'a'))}));
+    s.put_v2("ollama.com", "library", "b", "latest", s.manifest(cfg, {s.blob(kModel, fake_gguf(1, 1, 64, 'b'))}));
+    const m::OllamaStore* self = nullptr;
+    const m::ModelRegistry* registry = nullptr;
+    std::optional<m::ModelRecord> earlier;
+    std::atomic<bool> armed{false};
+    si::ErrorCode same = si::ErrorCode::ok, other = si::ErrorCode::ok, via_registry = si::ErrorCode::ok;
+    bool revalidated = true;
+    m::StoreOptions opt;  // first_use: the outer resolve owns the single-flight hash of "a" while this runs
+    opt.on_weight_hash = [&](const m::BlobRef&) {
+        if (!armed.exchange(false)) return;
+        // The identity this very thread is about to hash (it would wait for its own flight),
+        // another one, the registry, revalidate.
+        auto r1 = self->resolve("a");
+        same = r1.ok() ? si::ErrorCode::ok : r1.status().code();
+        auto r2 = self->resolve_for_load("b");
+        other = r2.ok() ? si::ErrorCode::ok : r2.status().code();
+        auto r3 = registry->resolve("b");
+        via_registry = r3.ok() ? si::ErrorCode::ok : r3.status().code();
+        revalidated = self->revalidate(*earlier);
+    };
+    auto store = m::OllamaStore::open(s.tmp.path, opt);
+    REQUIRE(store.ok());
+    self = &store.value();
+    m::ModelRegistry reg(opt);
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    registry = &reg;
+    earlier = store.value().resolve("b").value();
+    REQUIRE(earlier->ready());
+
+    // Guard: a deadlocked resolve never returns; end the process instead of hanging the suite.
+    std::promise<bool> done;
+    auto finished = done.get_future();
+    std::thread worker([&] {
+        armed = true;
+        auto r = store.value().resolve("a");
+        done.set_value(r.ok() && r.value().ready() && r.value().weights_verified());
+    });
+    if (finished.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
+        std::fprintf(stderr, "on_weight_hash re-entry deadlocked: resolve() did not return within 30 s\n");
+        std::fflush(stderr);
+        std::_Exit(3);  // the blocked worker references this frame, so it can be neither joined nor left
+    }
+    worker.join();
+    CHECK(finished.get());  // the outer hash completed normally
+    CHECK(same == si::ErrorCode::invalid_state);
+    CHECK(other == si::ErrorCode::invalid_state);
+    CHECK(via_registry == si::ErrorCode::invalid_state);
+    CHECK_FALSE(revalidated);
+    // Outside the callback everything works as before ("b" was hashed before the worker started).
+    CHECK(store.value().resolve("b").value().weight_check == m::WeightCheck::cached_identity);
+    CHECK(store.value().resolve_for_load("b").value().weights.verified());
+    CHECK(reg.resolve("b").ok());
+}
+
+TEST_CASE("model store: open reports a directory it cannot open as an I/O error, not as a missing one") {
+    TempDir t;
+#if defined(_WIN32)
+    auto bad = m::OllamaStore::open(t.path / "a<b");  // CreateFileW: ERROR_INVALID_NAME
+    REQUIRE_FALSE(bad.ok());
+    CHECK(bad.status().code() == si::ErrorCode::io_error);
+    CHECK(bad.status().message().find("cannot be opened") != std::string::npos);
+#else
+    if (::geteuid() == 0) {
+        MESSAGE("running as root, which bypasses directory permissions; the access-denied case is not exercised");
+    } else {
+        fs::create_directories(t.path / "locked" / "manifests-v2");
+        fs::permissions(t.path / "locked", fs::perms::none);
+        auto denied = m::OllamaStore::open(t.path / "locked");
+        fs::permissions(t.path / "locked", fs::perms::owner_all);
+        REQUIRE_FALSE(denied.ok());
+        CHECK(denied.status().code() == si::ErrorCode::io_error);
+        CHECK(denied.status().message().find("cannot be opened") != std::string::npos);
+    }
+#endif
+    auto missing = m::OllamaStore::open(t.path / "nope");
+    CHECK(missing.status().code() == si::ErrorCode::not_found);
+    write_file(t.path / "file", "x");
+    auto file = m::OllamaStore::open(t.path / "file");
+    CHECK(file.status().code() == si::ErrorCode::not_found);
+    CHECK(file.status().message().find("not a directory") != std::string::npos);
+}
+
+TEST_CASE("model store: refresh() keeps a store that add_ollama_dir() registered while it ran") {
+    Store first;
+    const auto cfg1 = first.config_blob(R"({"model_format":"gguf"})");
+    first.put_v2("ollama.com", "library", "one", "latest", first.manifest(cfg1, {first.blob(kModel, fake_gguf(1, 1, 32))}));
+    Store second;
+    const auto cfg2 = second.config_blob(R"({"model_format":"gguf"})");
+    second.put_v2("ollama.com", "library", "two", "latest",
+                  second.manifest(cfg2, {second.blob(kModel, fake_gguf(2, 1, 32))}));
+    m::ModelRegistry* registry = nullptr;
+    std::atomic<bool> armed{false};
+    si::Status added;
+    m::StoreOptions opt;
+    opt.verify_weights = m::WeightVerification::always;  // so refresh()'s scan hashes and calls back
+    opt.on_weight_hash = [&](const m::BlobRef&) {
+        if (!armed.exchange(false)) return;
+        // refresh() is between its snapshot of the stores and its write: another thread adds one.
+        std::thread adder([&] { added = registry->add_ollama_dir(second.tmp.path); });
+        adder.join();
+    };
+    m::ModelRegistry reg(opt);
+    registry = &reg;
+    REQUIRE(reg.add_ollama_dir(first.tmp.path).ok());
+    armed = true;
+    reg.refresh();
+    REQUIRE(added.ok());
+    const auto listed = reg.list();
+    auto has = [&](const std::string& display) {
+        return std::any_of(listed.begin(), listed.end(), [&](const m::ModelRecord& r) { return r.name.display() == display; });
+    };
+    CHECK(has("one:latest"));
+    CHECK(has("two:latest"));
+}
+
+#if defined(_WIN32)
+TEST_CASE("model store: verify_blobs refuses a blob another process holds open for writing") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(1, 1, 64));
+    s.put_v2("ollama.com", "library", "held", "latest", s.manifest(cfg, {model}));
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    auto r = store.value().resolve("held");
+    REQUIRE(r.ok());
+    REQUIRE(r.value().ready());
+    {
+        std::ofstream writer(s.blob_file(model), std::ios::binary | std::ios::app);
+        REQUIRE(writer.is_open());
+        m::VerifyOptions weights;
+        weights.weights_only = true;
+        const auto report = m::verify_blobs(r.value(), weights);
+        REQUIRE(report.blobs.size() == 1);
+        CHECK(report.blobs[0].verdict == m::BlobVerdict::io_error);
+        CHECK(report.blobs[0].detail.find("open for writing") != std::string::npos);
+    }
+    CHECK(m::verify_blobs(r.value()).ok());  // released
+}
+#endif
 
 #if !defined(_WIN32)
 TEST_CASE("model store: POSIX manifest links are accepted only as the exact relative blob path under manifests-v2") {

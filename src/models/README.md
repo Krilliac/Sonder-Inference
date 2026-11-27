@@ -12,8 +12,8 @@ manifest lists), resolves `name[:tag]` to GGUF/projector/adapter paths plus para
 template and system records, reports unsupported entries (cloud stubs, safetensors,
 missing or truncated blobs), pins the store root and opens every file relative to it
 without following links, hashes small layers on every read and weights on first use, hands
-a loader the verified open weight handles (`resolve_for_load`), and exposes `ModelRegistry`
-for the native backend plus `sonder-infer models import-ollama`.
+a loader the open weight handles it hashed them through (`resolve_for_load`), and
+exposes `ModelRegistry` for the native backend plus `sonder-infer models import-ollama`.
 Reference: [model store](../../docs/integration/model-store.md). The native backend does
 not use it yet.
 

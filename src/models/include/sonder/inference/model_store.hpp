@@ -17,9 +17,11 @@
 // (config, template, system, params, messages) must not be hard-linked; their
 // declared size and SHA-256 are checked on every read. Weight blobs are size-
 // and header-checked on every read and fully hashed per StoreOptions (default:
-// on first use, cached by file identity). A loader that must load exactly the
-// verified bytes takes the open handles from resolve_for_load() (VerifiedWeights)
-// and maps those; see docs/integration/model-store.md "Trust and verification".
+// on first use, then remembered by file identity; WeightCheck tells a hash made
+// in this call from a remembered one). A loader that must load exactly the
+// hashed bytes takes the open handles from resolve_for_load() (VerifiedWeights),
+// which by default hashes through those very handles, and maps them; see
+// docs/integration/model-store.md "Trust and verification".
 //
 // Cost model: a scan walks the manifest directories, reads and hashes the small
 // files, and reads the first 24 bytes of each GGUF-class blob. Under the default
@@ -125,15 +127,26 @@ struct FileStamp {
     std::uint64_t link_count = 0;
     std::int64_t write_time = 0;
     std::int64_t change_time = 0;
+    // Windows: the file system does not report FileIdInfo, so `file_id` is the 64-bit index,
+    // which can collide; such a file is never matched against remembered digests.
+    bool weak_id = false;
     friend bool operator==(const FileStamp&, const FileStamp&) = default;
 };
 
+// What a record knows about one file it was built from (or tried to be).
+enum class SourceKind {
+    file,    // opened: `stamp` is its identity; unchanged while it still opens with that identity
+    link,    // (POSIX) the manifest symlink itself, stamped with its own lstat
+    absent,  // was not there (a missing manifest-list child); unchanged while still absent
+    failed,  // could not be opened or read (refused, I/O error, busy, changed mid-read): the record
+             // is never reused, it is always read again
+};
+
 // A file a record was built from, relative to the store root ('/'-separated).
-// `link` marks the manifest symlink itself (POSIX), stamped with its own lstat.
 struct SourceStamp {
     std::string rel;
-    FileStamp stamp;
-    bool link = false;
+    FileStamp stamp;  // set for `file` and `link` only
+    SourceKind kind = SourceKind::file;
 };
 
 struct BlobRef {
@@ -193,31 +206,62 @@ enum class ManifestLayout { v2, legacy };
 const char* to_string(ManifestLayout layout) noexcept;
 
 // When a weight blob (model, projector, adapter, draft) is fully hashed against its digest.
-//   always     on every resolve() and every scan(); nothing is cached.
-//   first_use  on resolve() (the loader path); a match or mismatch is cached by the file's
-//              identity (volume + 128-bit file id, size, link count, write and change time),
-//              so an unchanged file is hashed once per OllamaStore and a changed one again.
-//              On a cache hit the identity is read again from the same open handle after the
-//              lookup; any difference is a miss. Concurrent first uses of one file share a
-//              single hash (the others wait for it). scan() does not hash. Between checks the
-//              cache trusts metadata: on Windows a writer who restores the size and both
-//              times is not seen until the next real hash (use `always` there).
+//   always     on every resolve() and every scan(); nothing is remembered.
+//   first_use  on resolve(); the digest found (match or mismatch) is remembered per store by
+//              the file's identity (volume + 128-bit file id, size, link count, write and
+//              change time), so an unchanged file is hashed once per OllamaStore and a changed
+//              one again. A later resolve() that finds the remembered digest does not read the
+//              bytes: its record says WeightCheck::cached_identity, not hashed_now. On such a hit
+//              the identity is read again from the same open handle after the lookup; any
+//              difference (or a failed query) fails the record at once. Concurrent first uses
+//              of one file share a single hash (the others wait for it). scan() does not hash.
+//              Files with a weak (64-bit fallback) id are always hashed.
 //   off        never; only the size and the GGUF header are checked. Not suitable for a
 //              library that untrusted local writers can modify.
-// Small layers are always hashed, whatever this says. Every weight hash reads through a
-// handle that (Windows) denies writers for as long as it is open, and at most
-// kMaxConcurrentWeightHashes run at once per store (copies share the limit).
+// Small layers are always hashed, whatever this says. Every weight hash, and every hash
+// verify_blobs() makes, reads through a handle that (Windows) denies writers for as long as it
+// is open, and at most kMaxConcurrentWeightHashes of them run at once per opened store root
+// (copies of the store and its records share the limit).
 enum class WeightVerification { always, first_use, off };
 const char* to_string(WeightVerification policy) noexcept;
 
+// How the weight bytes of a record (or of one VerifiedWeights file) were checked against their
+// digests. Only hashed_now means "these bytes were hashed": read in this call, through a
+// handle that denies writers on Windows, and found to match.
+enum class WeightCheck {
+    unchecked,        // not hashed: WeightVerification::off, a scan() under first_use, or not ready
+    cached_identity,  // first_use: a digest remembered for an identical file identity was reused; the
+                      // bytes were hashed at an earlier check, not in this call (on Windows a writer
+                      // can rewrite a file and restore its times, see Known limits in the doc)
+    hashed_now,       // hashed in this call through the open handle and matched
+};
+const char* to_string(WeightCheck check) noexcept;
+
 inline constexpr std::size_t kMaxConcurrentWeightHashes = 2;
+
+// Bounds on directory enumeration: a store anyone can write to may hold any number of
+// entries. Applied while entries are read, before anything is kept; a scan that reaches one
+// says so in ScanResult::notes. A name lookup that misses (the case-insensitive fallback)
+// reads at most max_scan_entries entries and stops at the first match.
+struct ScanLimits {
+    std::size_t max_dir_entries = 4096;    // entries read from any one directory
+    std::size_t max_scan_entries = 65536;  // entries read by one scan() or lookup, all directories
+    std::size_t max_models = 1024;         // manifests one scan() reads
+};
 
 struct StoreOptions {
     WeightVerification verify_weights = WeightVerification::first_use;
     // Called just before a weight blob is hashed (a multi-GB file takes minutes), e.g. for a
-    // progress line, on the thread that does the hash: when several threads need the same
-    // file only one hashes it. It may run on two resolving threads at once. May be empty.
+    // progress line, on the thread that will hash it: when several threads need the same file
+    // only one hashes it, and the others wait for that hash while this runs. It runs before
+    // the thread takes one of the store's hash slots, so it holds none. It must not call back
+    // into a store or registry, directly or by waiting for another thread that does: on the
+    // callback's own thread every OllamaStore / ModelRegistry resolve(), resolve_for_load()
+    // and ModelRegistry::resolve fails at once with ErrorCode::invalid_state, revalidate()
+    // returns false, and scan() hashes nothing. It may run on several threads at once. May be
+    // empty. An exception it throws propagates out of the resolve that hashed.
     std::function<void(const BlobRef&)> on_weight_hash;
+    ScanLimits limits;
 };
 
 struct StoreAnchor;  // the store root opened by OllamaStore::open() (model_store.cpp)
@@ -225,7 +269,7 @@ struct StoreAnchor;  // the store root opened by OllamaStore::open() (model_stor
 // Everything known about one store entry. A `ready` record has every blob
 // present as a regular file inside the store, sized as declared; every small
 // layer matched its digest; every weight starts with a supported GGUF header
-// and, when `weights_verified`, matched its digest. An `unsupported` record
+// and matched its digest as `weight_check` says. An `unsupported` record
 // explains why and still carries whatever was parsed. `detail` and `warnings`
 // quote untrusted manifest text bounded and control-escaped, and name no
 // absolute path.
@@ -266,14 +310,15 @@ struct ModelRecord {
     std::uint64_t weights_bytes = 0;     // declared size of model + shard + projector + adapter + draft layers
     std::uint64_t referenced_bytes = 0;  // declared size of every layer plus the config
     std::vector<BlobRef> blobs;          // every referenced blob (config first), for verification
-    // "Matched at check time": every weight blob, opened when this record was produced (or
-    // revalidated), hashed to its digest through that handle, or the verified cache held a
-    // match for the identity read from that handle. It says nothing about the file after the
-    // handle was closed; only VerifiedWeights carries the handles. False under
-    // WeightVerification::off and for records from scan() under first_use.
-    bool weights_verified = false;
-    // The manifest (and its symlink, a manifest-list child) this record was read from;
-    // blobs carry their own stamps. OllamaStore::revalidate() compares them.
+    // How the weights were checked when this record was produced (or revalidated): the weakest
+    // of its weight files. It says nothing about a file once its handle was closed; only
+    // VerifiedWeights carries the handles.
+    WeightCheck weight_check = WeightCheck::unchecked;
+    // True only when every weight was hashed in that call and matched (WeightCheck::hashed_now).
+    [[nodiscard]] bool weights_verified() const noexcept { return weight_check == WeightCheck::hashed_now; }
+    // The manifest (its symlink, manifest-list children, absent ones too) this record was read
+    // from, plus any file that failed transiently; blobs carry their own stamps.
+    // OllamaStore::revalidate() and the registry's reuse of unsupported records compare them.
     std::vector<SourceStamp> sources;
     // The store root this record was read through (shared, read-only); verify_blobs() and
     // revalidate() open files relative to it, never through store_root's path again.
@@ -287,7 +332,8 @@ struct ModelRecord {
 struct ScanResult {
     std::vector<ModelRecord> records;  // sorted by name key; v2 entries win over legacy duplicates
     std::vector<std::string> notes;    // store-relative paths skipped during the walk (invalid names,
-                                       // links, special files), control-escaped; at most 256
+                                       // links, special files, ScanLimits reached), control-escaped;
+                                       // at most 256
 };
 
 // The weight files of one resolved model, held open for a loader. Move-only; owns the OS
@@ -296,22 +342,24 @@ struct ScanResult {
 // The loader must map or read exactly these handles, never reopen model_path & co. While
 // this object lives, on Windows every handle denies writers (no other process can write,
 // truncate, rename or delete the file), so the bytes mapped through it are the bytes that
-// were hashed when `verified()` is true. The remaining post-check windows (see
+// were hashed when `verified()` is true (every file WeightCheck::hashed_now: hashed through
+// this very handle in the call that returned it). The remaining post-check windows (see
 // docs/integration/model-store.md "Trust and verification"):
 //   - POSIX has no mandatory deny-write: a process that may write the blob can still change
 //     its bytes after the hash, including while pages are being mapped in;
 //   - Windows: a writable section mapped before this open (its writer's handle already
 //     closed) and raw volume access by an administrator are not blocked;
-//   - first_use cache hits: the hash ran at an earlier check; a write between that check
-//     and this open that kept the size and restored the timestamps (possible on Windows)
-//     is not seen; `always` re-hashes through these very handles.
+//   - WeightCheck::cached_identity (only when the caller asked resolve_for_load for
+//     first_use): the hash ran at an earlier check; a write between that check and this open
+//     that kept the size and restored the timestamps (possible on Windows) is not seen.
 // File positions are unspecified (the hash read to the end): use mapping or positioned
 // reads. Not thread-safe for concurrent mutation; const access from any thread.
 class VerifiedWeights {
 public:
     struct File {
-        BlobRef blob;                    // the first layer that referenced this digest
-        std::intptr_t native_handle = 0; // HANDLE / fd owned by this object; do not close it
+        BlobRef blob;                                // the first layer that referenced this digest
+        std::intptr_t native_handle = 0;             // HANDLE / fd owned by this object; do not close it
+        WeightCheck check = WeightCheck::unchecked;  // how this file's bytes were checked
     };
 
     VerifiedWeights() noexcept;
@@ -325,16 +373,18 @@ public:
     [[nodiscard]] const std::vector<File>& files() const noexcept { return files_; }
     [[nodiscard]] const File* find(std::string_view digest) const noexcept;
     [[nodiscard]] bool empty() const noexcept { return files_.empty(); }
-    // True when every file hashed to its digest through its handle (or matched the verified
-    // cache for the identity read from that handle); false under WeightVerification::off.
-    [[nodiscard]] bool verified() const noexcept { return verified_; }
+    // The weakest check among the files (unchecked when empty).
+    [[nodiscard]] WeightCheck check() const noexcept { return check_; }
+    // True only when every file was hashed through its handle in the call that returned this
+    // object and matched its digest (check() == WeightCheck::hashed_now).
+    [[nodiscard]] bool verified() const noexcept { return check_ == WeightCheck::hashed_now; }
 
 private:
     friend struct VerifiedWeightsAccess;  // model_store.cpp
     struct Handles;
     std::vector<File> files_;
     std::unique_ptr<Handles> handles_;
-    bool verified_ = false;
+    WeightCheck check_ = WeightCheck::unchecked;
 };
 
 // A record plus the open weight handles it was checked through (resolve_for_load).
@@ -351,9 +401,10 @@ class OllamaStore {
 public:
     // Opens the root directory once and keeps it open; every later open is relative to
     // that handle, so retargeting a link at `models_dir` afterwards does not move the store.
-    // Fails with not_found when `models_dir` is not a directory and with
-    // invalid_argument when it holds neither manifests-v2/ nor manifests/. The
-    // messages do not repeat the path (the caller knows it).
+    // Fails with not_found when `models_dir` does not exist or is not a directory, io_error
+    // when it cannot be opened (access denied, an invalid name, a device error; the message
+    // carries the OS error), and invalid_argument when it holds neither manifests-v2/ nor
+    // manifests/. The messages do not repeat the path (the caller knows it).
     static Result<OllamaStore> open(std::filesystem::path models_dir, StoreOptions options = {});
 
     // The absolute path given to open(): for display and record paths only.
@@ -367,35 +418,48 @@ public:
     // Resolves "name[:tag]" the way Ollama's resolveManifestPath does: manifests-v2 first,
     // then the legacy tree (also under the alternate public host). Returns not_found when
     // no manifest exists; an unsupported entry is returned as a record, not an error.
-    // Weights are verified per options().verify_weights; their handles are then closed.
+    // Weights are checked per options().verify_weights (record.weight_check says how); their
+    // handles are then closed.
     [[nodiscard]] Result<ModelRecord> resolve(std::string_view name) const;
 
-    // resolve(), keeping the weight handles the verification read through (opened with
-    // writers denied on Windows, also under WeightVerification::off, where they are not
-    // hashed). The loader hook: map `weights`, not the record's paths.
-    [[nodiscard]] Result<LoadableModel> resolve_for_load(std::string_view name) const;
+    // resolve(), keeping the weight handles (opened with writers denied on Windows) for a
+    // loader. `policy` defaults to `always`: every weight is hashed through the very handle
+    // returned, whatever options().verify_weights says, so weights.verified() means these
+    // bytes. Pass first_use explicitly to accept a remembered digest (cached_identity) and skip
+    // the hash, or off to skip hashing (unchecked). The loader hook: map `weights`, never the
+    // record's paths.
+    [[nodiscard]] Result<LoadableModel> resolve_for_load(std::string_view name,
+                                                         WeightVerification policy = WeightVerification::always) const;
 
     // Re-checks a record this store produced before it is used again: every file it was
-    // read from (sources and blob stamps) must be unchanged, then the weights are verified
+    // read from (sources and blob stamps) must be unchanged, then the weights are checked
     // per options().verify_weights. Returns false when something changed or disappeared
-    // (resolve again), or when the record came from another store; on true `record` is
-    // current, though it may now be unsupported (digest_mismatch, blob_busy).
+    // (resolve again), when the record came from another OllamaStore (even one opened on the
+    // same directory: records are tied to the root handle that read them), or when called
+    // from on_weight_hash; on true `record` is current, though it may now be unsupported
+    // (digest_mismatch, blob_busy).
     [[nodiscard]] bool revalidate(ModelRecord& record) const;
 
-    struct VerifiedCache;  // defined in model_store.cpp
+    // Diagnostics: weight hashes (and verify_blobs() hashes of this store's records) running
+    // right now on this store's root; never more than kMaxConcurrentWeightHashes.
+    [[nodiscard]] std::size_t weight_hashes_running() const noexcept;
+
+    struct DigestCache;  // defined in model_store.cpp
 
 private:
     friend class ModelRegistry;
     OllamaStore(std::filesystem::path root, std::shared_ptr<const StoreAnchor> anchor, StoreOptions options);
-    [[nodiscard]] Result<ModelRecord> resolve_impl(std::string_view name, VerifiedWeights* keep) const;
-    [[nodiscard]] bool revalidate_impl(ModelRecord& record, VerifiedWeights* keep) const;
-    // For a cached unsupported record: true while every file it was read from is unchanged
-    // and every blob it could not open is still absent (so its reason still holds).
+    [[nodiscard]] Result<ModelRecord> resolve_impl(std::string_view name, WeightVerification policy,
+                                                   VerifiedWeights* keep) const;
+    [[nodiscard]] bool revalidate_impl(ModelRecord& record, WeightVerification policy, VerifiedWeights* keep) const;
+    // For a cached unsupported record: true while every file it was read from is unchanged,
+    // every blob it could not open is still absent and nothing failed transiently (so its
+    // reason still holds).
     [[nodiscard]] bool unsupported_still_current(const ModelRecord& record) const;
     std::filesystem::path root_;
     std::shared_ptr<const StoreAnchor> anchor_;
     StoreOptions options_;
-    std::shared_ptr<VerifiedCache> cache_;
+    std::shared_ptr<DigestCache> cache_;
 };
 
 // Opt-in content verification: re-hashes blobs and compares with their digest.
@@ -427,8 +491,10 @@ struct VerifyReport {
 // Streams each distinct blob (by digest) through SHA-256 from a no-follow handle
 // opened relative to record.anchor (the store root pinned by OllamaStore::open; a
 // record without one, built by hand, opens record.store_root once for the call), one
-// 1 MiB buffer per call. Stops after the first cancelled blob. Does not modify the
-// record or the store.
+// 1 MiB buffer per call. Each handle denies writers on Windows (a blob another process
+// has open for writing is reported io_error, "open for writing"), and each hash takes one
+// of the root's kMaxConcurrentWeightHashes slots (after on_blob_start returns). Stops after
+// the first cancelled blob. Does not modify the record or the store.
 VerifyReport verify_blobs(const ModelRecord& record, const VerifyOptions& options = {});
 
 // Stable JSON for a record / a scan (schema kStoreJsonSchema).
@@ -443,7 +509,7 @@ std::filesystem::path default_ollama_models_dir();
 // llamacpp backend will use to load a model by name (docs/integration/model-store.md).
 // A cached ready record is never returned without OllamaStore::revalidate(), a cached
 // unsupported one only while its reason still holds (see resolve()), and weights are
-// verified per the StoreOptions given at construction:
+// checked per the StoreOptions given at construction (resolve_for_load: `always` by default):
 //
 //   ModelRegistry reg; reg.add_ollama_dir(dir);
 //   auto m = reg.resolve_for_load("qwen3.5:4b");   // ready records only
@@ -457,11 +523,13 @@ public:
     ModelRegistry(const ModelRegistry&) = delete;
     ModelRegistry& operator=(const ModelRegistry&) = delete;
 
-    // Adds a store (duplicates by path are ignored) and scans it. Earlier stores win
-    // when two stores hold the same name.
+    // Adds a store and scans it. A directory already registered (same root directory
+    // identity, whatever path names it) is ignored. Earlier stores win when two stores hold
+    // the same name.
     Status add_ollama_dir(std::filesystem::path models_dir);
 
-    // Rescans every store (directory walk plus small reads; no hashing).
+    // Rescans every store (directory walk plus small reads; no hashing). A store added by
+    // another thread while it runs keeps the records its own scan produced.
     void refresh();
 
     [[nodiscard]] std::vector<ModelRecord> list() const;
@@ -478,11 +546,14 @@ public:
     // repaired, finished downloading or stopped being written is served without refresh().
     [[nodiscard]] Result<ModelRecord> resolve(std::string_view name) const;
 
-    // resolve(), plus the open weight handles (OllamaStore::resolve_for_load). Ready only.
-    [[nodiscard]] Result<LoadableModel> resolve_for_load(std::string_view name) const;
+    // resolve(), plus the open weight handles (OllamaStore::resolve_for_load; `policy`
+    // defaults to `always`, whatever the registry's StoreOptions say). Ready only.
+    [[nodiscard]] Result<LoadableModel> resolve_for_load(std::string_view name,
+                                                         WeightVerification policy = WeightVerification::always) const;
 
 private:
-    [[nodiscard]] Result<ModelRecord> resolve_impl(std::string_view name, VerifiedWeights* keep) const;
+    [[nodiscard]] Result<ModelRecord> resolve_impl(std::string_view name, WeightVerification policy,
+                                                   VerifiedWeights* keep) const;
     StoreOptions options_;
     mutable std::mutex mutex_;
     std::vector<OllamaStore> stores_;

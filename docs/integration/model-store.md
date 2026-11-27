@@ -82,13 +82,15 @@ was parsed and carries `reason` + `detail`. Precedence: the first reason found w
 
 A ready record means: every blob it needs is a regular file inside the store with the declared
 size, every small layer matched its SHA-256, and every weight starts with a supported GGUF header;
-`weights_verified` says whether the weights were hashed too. It does **not** mean the file loads
-(see "Open items / UNVERIFIED").
+`weight_check` says how the weights were checked against their digests (`hashed_now`,
+`cached_identity` or `unchecked`; `weights_verified()` is true only for `hashed_now`). It does
+**not** mean the file loads (see "Open items / UNVERIFIED").
 
 ## Trust and verification
 
 The threat model is a library another local user or process may be able to write to. What the
-reader enforces (security reviews of PR 135, two rounds):
+reader enforces (security reviews of PR 135, three rounds). "Verified" below means only this:
+the bytes were hashed in this call, through a handle that denies writers on Windows, and matched.
 
 - **The root is pinned.** `OllamaStore::open` opens the store root once and keeps that directory
   handle (shared by copies of the store and by every record read through it, `ModelRecord::anchor`).
@@ -107,8 +109,11 @@ reader enforces (security reviews of PR 135, two rounds):
   hash and content all come from that one handle with a bounded read (cap + 1 bytes), so a file
   swapped or grown between check and read is caught. Directories are listed from their own handles
   too (Windows `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)`, POSIX `fdopendir` on a
-  private descriptor with `fstatat(AT_SYMLINK_NOFOLLOW)` per entry); directory links under
-  `manifests*/` are skipped with a note, and `blobs/` itself must be a real directory.
+  private descriptor with `fstatat(AT_SYMLINK_NOFOLLOW)` per entry), streamed one entry at a time
+  into a fixed buffer; directory links under `manifests*/` are skipped with a note, and `blobs/`
+  itself must be a real directory. Windows opens each directory with `FILE_OPEN_REPARSE_POINT` but
+  without `FILE_DIRECTORY_FILE` (Microsoft does not list the two as compatible) and checks the
+  directory and reparse attributes on the handle it got.
 - **Manifest symlinks (POSIX only, `manifests-v2/` only).** Ollama writes each v2 name as a relative
   symlink to `blobs/sha256-<manifest hex>` except on Windows (`manifest/manifest.go`
   `WriteManifest`). Such a leaf is read with `readlinkat` and never followed, opened or `stat`ed
@@ -129,47 +134,70 @@ reader enforces (security reviews of PR 135, two rounds):
   against the declared size and SHA-256 on every read; a mismatch makes the entry unsupported,
   never a silently dropped prompt.
 - **Weights.** Size (from the handle) and the GGUF header are checked on every read. The full
-  SHA-256 follows `StoreOptions::verify_weights`, and every weight hash reads through a handle that
-  on Windows is opened without `FILE_SHARE_WRITE`/`FILE_SHARE_DELETE`: while it is open no other
-  process can write, truncate, rename or delete the file, and while another process holds it open
-  for writing the open is refused and the entry is reported `blob_busy` (transient; it is not hashed
-  or served until the writer closes it).
-  - `first_use` (default): `OllamaStore::resolve` and `ModelRegistry::resolve` hash each weight
-    once; the result (match or mismatch) is cached per store by the file's identity (volume serial +
-    128-bit `FILE_ID_INFO` file id on Windows, `st_dev`/`st_ino` on POSIX, size, hard-link count,
-    last-write and change time), so an unchanged file is not re-read and a changed one is. On a
-    cache hit the identity is read again from the same open handle after the lookup, and any
-    difference is a miss. Concurrent first uses of one identity share a single hash: one thread
-    hashes, the others wait for its result (and retry if it failed). `scan()`/`list()` do not hash
-    (`weights_verified` is false there).
-  - `always`: every resolve and every scan hashes, nothing is cached.
-  - `off`: never (the CLI listing uses this; `--verify` still hashes on request). Not suitable for
-    a library that untrusted local writers can modify.
-  At most `kMaxConcurrentWeightHashes` (2) weight hashes run at once per store (copies share the
-  limit); no hash runs while a cache or registry lock is held. `on_weight_hash` is called before
-  each hash, on the thread that does it (a multi-GB file takes minutes).
-- **What `weights_verified` means: matched at check time.** Every weight blob, opened while the
-  record was produced or revalidated, hashed to its digest through that handle (or the cache held a
-  match for the identity read from that handle). It says nothing about the file once that handle
-  is closed. A loader that must load exactly the verified bytes uses
-  `OllamaStore::resolve_for_load` / `ModelRegistry::resolve_for_load`, which return the same open
-  handles in a move-only `VerifiedWeights` (one per distinct weight digest, `find(digest)`), and
-  maps or reads those handles; it must not reopen `model_path` & co. On Windows the handles deny
-  writers for as long as the `VerifiedWeights` lives.
+  SHA-256 follows the weight policy, and every weight hash reads through a handle that on Windows
+  is opened without `FILE_SHARE_WRITE`/`FILE_SHARE_DELETE`: while it is open no other process can
+  write, truncate, rename or delete the file, and while another process holds it open for writing
+  the open is refused and the entry is reported `blob_busy` (transient; it is not hashed or served
+  until the writer closes it).
+  - `first_use` (default for `resolve()` and the registry's `resolve()`): each weight is hashed
+    once; the digest found (match or mismatch) is remembered per store by the file's identity
+    (volume serial + 128-bit `FILE_ID_INFO` file id on Windows, `st_dev`/`st_ino` on POSIX, size,
+    hard-link count, last-write and change time), so an unchanged file is not re-read and a changed
+    one is. A remembered digest is not a hash of the current bytes: such a record says
+    `WeightCheck::cached_identity`, never `hashed_now`, and `weights_verified()` is false for it.
+    On such a hit the identity is read again from the same open handle after the lookup; a
+    difference or a failed query fails the entry at once (transient), it is not hashed instead.
+    Concurrent first uses of one identity share a single hash: one thread hashes (its record says
+    `hashed_now`), the others wait for its result (`cached_identity`) and retry if it failed. A file
+    whose identity is weak (the 64-bit fallback below) is always hashed. `scan()`/`list()` do not
+    hash (`unchecked`).
+  - `always`: every resolve and every scan hashes (`hashed_now`), nothing is remembered.
+  - `off`: never (`unchecked`; the CLI listing uses this, `--verify` still hashes on request). Not
+    suitable for a library that untrusted local writers can modify.
+  At most `kMaxConcurrentWeightHashes` (2) hashes run at once per opened root: the weight checks and
+  `verify_blobs()` of records read through it share the slots (copies of the store share them
+  too). Only the hash read loop runs inside a slot; no hash runs while a cache or registry lock is
+  held. `on_weight_hash` runs before each weight hash, on the thread that will hash, holding no
+  slot (it does hold the single flight, so others needing the same file wait for it). It must not
+  call back into a store or registry, directly or by waiting for a thread that does: on its own
+  thread every `resolve()`, `resolve_for_load()` and registry `resolve()` fails at once with
+  `invalid_state`, `revalidate()` returns false and `scan()` hashes nothing (test "an
+  on_weight_hash callback that calls back into the store fails fast instead of deadlocking").
+- **What `hashed_now` and `VerifiedWeights` mean.** `hashed_now`: every weight blob, opened while
+  the record was produced or revalidated, hashed to its digest through that handle in that call.
+  It says nothing about the file once that handle is closed. A loader that must load exactly the
+  hashed bytes uses `OllamaStore::resolve_for_load` / `ModelRegistry::resolve_for_load`, which
+  return those same open handles in a move-only `VerifiedWeights` (one per distinct weight digest,
+  `find(digest)`, each with its own `check`), and maps or reads those handles; it must not reopen
+  `model_path` & co. `resolve_for_load` hashes every weight through the returned handles by
+  default (`always`, whatever the store's policy); `verified()` is true only when every file is
+  `hashed_now`. A caller that passes `first_use` explicitly accepts `cached_identity`. On Windows
+  the handles deny writers for as long as the `VerifiedWeights` lives.
 - **Cached records are revalidated.** `ModelRegistry::resolve` passes every cached ready record
   (from the scan or from an earlier live lookup) through `OllamaStore::revalidate`: each source
   file and blob must still have the identity it had when it was read; otherwise the name is
-  resolved again. A cached unsupported record (from the scan, or a scan entry that a later resolve
-  found broken) is returned again only while every file it was read from has the same identity and
-  every blob it could not open is still absent (`blob_busy` is never reused); otherwise the name is
-  resolved again, so a repaired blob, a finished pull or a released writer is served without
-  `refresh()`, and an unchanged corrupt multi-GB blob is not re-hashed on every request. Successful
-  live lookups are cached (at most 1024; `refresh()` drops them).
+  resolved again. Every record carries the files it was built from, also when it failed: the
+  manifest's stamp once it opened (so a hard link removed, a file shrunk or rewritten is seen), the
+  manifest symlink's own stamp, every manifest-list child (its stamp, or `absent` when it was not
+  there), and a `failed` marker for anything that could not be opened or read (an I/O error, a busy
+  blob, a change mid-read, a refused open). A cached unsupported record (from the scan, or a scan
+  entry that a later resolve found broken) is returned again only while every stamped file is
+  unchanged, every absent one and every blob it could not open is still absent, and nothing
+  failed; otherwise the name is resolved again. So a repaired blob or list child, a finished pull,
+  a removed hard link or a released writer is served without `refresh()`, and an unchanged corrupt
+  multi-GB blob is not re-hashed on every request. Successful live lookups are cached (at most
+  1024; `refresh()` drops them). `refresh()` keeps the records of a store that `add_ollama_dir()`
+  registered while it ran.
 - **Bounds.** Manifests and list children 4 MiB, 64 content layers, 64 list children, small layers
   4 MiB each and 16 MiB per manifest, each digest validated once per manifest, `params.stop` at most
   64 entries of at most 1024 bytes (a later params layer replaces `stop`, as Ollama's map decode
   does), byte totals added with overflow checks, at most 64 warnings and 256 scan notes, and a name
   longer than the longest valid one (`kMaxOllamaNameBytes`, 601 bytes) is refused before it is split.
+  Directory enumeration (`StoreOptions::limits`, `ScanLimits`): at most 4096 entries are read from
+  any one directory, 65536 per scan or lookup in total, and 1024 manifests per scan; the caps are
+  applied while entries are read, before anything is kept, and a scan that reaches one says so in
+  its notes. The case-insensitive lookup streams the directories on the name's path, keeps no
+  entries, and stops at the first match.
 - **Names.** Besides Ollama's part rules, a part (the host included) may not end in `.` and may not
   be a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM0-9`, `LPT0-9`, with or without an
   extension or port), on every platform; Win32 would otherwise open `coder` for `coder.`. Directory
@@ -179,7 +207,7 @@ reader enforces (security reviews of PR 135, two rounds):
   128 bytes through one sanitizer (`src/models/src/store_text.hpp`): C0 controls, DEL, every byte that
   is not part of well-formed UTF-8 (raw `0x80`-`0xFF`, overlongs, surrogates, cut sequences) and the
   bytes of C1 controls, bidi/zero-width marks, line and paragraph separators, BOM and interlinear
-  annotation controls are escaped as `\xNN`. Messages never name the store's absolute path (notes
+  annotation controls are escaped as `\xNN`, and a backslash is doubled. Messages never name the store's absolute path (notes
   are store-relative; `not_found` says "is not in the store"), and never include a cloud stub's
   `remote_host` (the JSON document strips URL credentials from it). The CLI table prints paths and
   config fields through the same sanitizer; nothing it prints is meant to become an HTTP response.
@@ -193,24 +221,45 @@ Known limits (the remaining post-check windows):
   the window between the hash and the mapping.
 - **Windows deny-write does not cover** a writable section that another process mapped before the
   open (and kept after closing its handle) or raw volume access by an administrator.
-- **The identity cache trusts metadata between checks.** Under `first_use`, a writer who rewrites a
+- **Remembered digests trust metadata between checks.** Under `first_use`, a writer who rewrites a
   blob in place with the same size and link count and restores `LastWriteTime` and `ChangeTime`
   (Windows lets anyone with `FILE_WRITE_ATTRIBUTES` set both) is not seen until the next real hash;
   a rewrite within the file system's timestamp granularity looks unchanged too. On POSIX `st_ctime`
-  cannot be set back by a user. Use `always` where that matters.
+  cannot be set back by a user. Such a record says `cached_identity`, never `hashed_now`, and
+  `resolve_for_load` does not take that path unless asked to (`first_use`). Use `always` where it
+  matters.
 - **Record paths are not pinned.** `model_path`, `shard_paths` and the other paths name files under
   the root path given to `open()`; reopening them (instead of using `VerifiedWeights`) gets whatever
   is there by then, including another tree if the root link was retargeted.
-- **File systems without `FileIdInfo`** (where `GetFileInformationByHandleEx(FileIdInfo)` fails)
-  fall back to the 64-bit `BY_HANDLE_FILE_INFORMATION` index for identity.
+- **File systems that do not implement `FileIdInfo`** (`GetFileInformationByHandleEx(FileIdInfo)`
+  fails with `ERROR_INVALID_PARAMETER`, `ERROR_INVALID_FUNCTION` or `ERROR_NOT_SUPPORTED`) fall back
+  to the 64-bit `BY_HANDLE_FILE_INFORMATION` index, and the identity is marked weak
+  (`FileStamp::weak_id`): such a file is never matched against a remembered digest, it is hashed
+  every time. Any other `FileIdInfo` failure fails the open. Which error a given file system
+  returns has not been tested here (NTFS implements the class).
+- **Writers are blocked while a blob is held (Windows).** A hash, a `verify_blobs()` read or a live
+  `VerifiedWeights` keeps the blob open without `FILE_SHARE_WRITE`/`FILE_SHARE_DELETE`, so for that
+  time `ollama rm`, a prune or a re-pull that rewrites or deletes that blob fails with a sharing
+  violation on Ollama's side. A loader that keeps `VerifiedWeights` for the life of a loaded model
+  keeps those blobs from being removed for that long.
+- **Records belong to the store that read them.** `revalidate()` refuses a record from another
+  `OllamaStore`, even one opened on the same directory (records are tied to the root handle that
+  read them); the registry only revalidates records against the store that produced them.
+- **Enumeration caps hide entries.** A directory over `max_dir_entries` is read only partly (which
+  entries depends on the file system's order), and a store over the per-scan caps is listed only
+  partly; the notes say so, and `resolve()` of an exact name does not enumerate. The memory a scan
+  keeps is bounded by `max_models` records of at most 16 MiB of small-layer text each, which is
+  still large; a per-scan text budget is not implemented.
 - Hash cancellation and request-level admission (rate limiting) for an HTTP path are not here; the
   store is not wired to the server.
 
 ## Full digest report (opt-in)
 
 `verify_blobs(record, options)` streams each distinct blob (by digest) through SHA-256 from a
-no-follow handle opened relative to the record's pinned root (one 1 MiB buffer per call), checks the file did not change while it
-was hashed, and compares with the digest; `weights_only` skips the small layers; a
+no-follow handle opened relative to the record's pinned root (one 1 MiB buffer per call; on
+Windows the handle denies writers, so a blob another process has open for writing is reported
+`io_error`, and each hash takes one of the root's hash slots), checks the file did not change while
+it was hashed, and compares with the digest; `weights_only` skips the small layers; a
 `CancellationToken` stops it and `on_blob_start` lets a caller show progress. Verdicts: `ok`,
 `mismatch`, `missing`, `unsafe` (a link or not a regular file; not read), `io_error`, `cancelled`.
 Ollama checks a blob's digest when it pulls it but does not re-check it when it loads a model, so a
@@ -238,7 +287,8 @@ thread-safe and holds one or more stores (first registered wins):
 ```cpp
 sonder::inference::models::ModelRegistry registry;
 registry.add_ollama_dir(dir);                          // pins the root, scans; no hashing
-auto m = registry.resolve_for_load("qwen3.5:4b");      // ready records only
+auto m = registry.resolve_for_load("qwen3.5:4b");      // ready records only; hashes through the
+                                                       // returned handles (m.value().weights.verified())
 // m.value().weights.files()[i].native_handle (HANDLE / fd)        -> map THESE handles; never
 //                                                                    reopen record.model_path
 // m.value().record.model_path / shard_paths / projector_paths    -> which file is which (display)
@@ -250,8 +300,10 @@ auto m = registry.resolve_for_load("qwen3.5:4b");      // ready records only
 (entry exists but cannot be served; the message names the reason). A miss in the cached scan falls
 back to a live lookup, so a model pulled after the last `refresh()` is still found. Every cached
 ready record is revalidated against the disk before it is returned, a cached unsupported one only
-while its reason still holds, and weights are hashed on first use (`ModelRegistry(StoreOptions)`
-chooses the policy; see "Trust and verification"). `VerifiedWeights` owns its handles (move-only,
+while its reason still holds. `resolve` checks weights per the registry's policy (default
+`first_use`, `ModelRegistry(StoreOptions)` chooses); `resolve_for_load` hashes them through the
+handles it returns unless the caller passes another policy (see "Trust and verification").
+`VerifiedWeights` owns its handles (move-only,
 closed on destruction; on Windows they keep writers out for as long as it lives), so the loader
 keeps it alive for as long as the model is mapped. File positions are unspecified after the hash:
 map the handles or use positioned reads. Nothing in `src/backends` includes this header yet; the

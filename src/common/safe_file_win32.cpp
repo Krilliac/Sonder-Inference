@@ -5,12 +5,16 @@
 // Win32 has no "open relative to a directory handle". Each name passed to it is a single
 // component that was already refused when it holds '\\', ':', NUL or is "."/"..", so the NT
 // parser cannot leave the directory handle it starts from; FILE_OPEN_REPARSE_POINT opens a
-// reparse point as itself, and the attribute check then refuses it.
+// reparse point as itself, and the attribute check then refuses it. Directories are opened
+// without FILE_DIRECTORY_FILE: Microsoft's NtCreateFile documentation does not list
+// FILE_OPEN_REPARSE_POINT among the options compatible with it, so "is a directory" and "is not
+// a reparse point" are checked on the attributes of the handle that was actually opened.
 #include "common/safe_file.hpp"
 
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <utility>
 
@@ -128,9 +132,16 @@ std::int64_t filetime_ticks(const FILETIME& ft) {
                                      static_cast<std::uint64_t>(ft.dwLowDateTime));
 }
 
-// Identity from the handle: the 128-bit FILE_ID_INFO id and 64-bit volume serial (falls back to
-// the 64-bit BY_HANDLE_FILE_INFORMATION index on a file system that does not report
-// FileIdInfo), size, link count, last-write and change time. `attrs` receives the attributes.
+// GetFileInformationByHandleEx(FileIdInfo) errors that mean "this file system does not
+// implement the class", as opposed to a transient, permission or device failure.
+bool file_id_info_unsupported(DWORD err) {
+    return err == ERROR_INVALID_PARAMETER || err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED;
+}
+
+// Identity from the handle: the 128-bit FILE_ID_INFO id and 64-bit volume serial, size, link
+// count, last-write and change time. Only when the file system reports FileIdInfo as unsupported
+// is the 64-bit BY_HANDLE_FILE_INFORMATION index used (out.weak_id = true); any other FileIdInfo
+// failure fails the query (fail closed). `attrs` receives the attributes.
 bool fill_identity(HANDLE h, FileIdentity& out, DWORD& attrs, std::string& err_msg) {
     BY_HANDLE_FILE_INFORMATION info{};
     if (!::GetFileInformationByHandle(h, &info)) {
@@ -148,11 +159,18 @@ bool fill_identity(HANDLE h, FileIdentity& out, DWORD& attrs, std::string& err_m
         out.volume = id_info.VolumeSerialNumber;
         std::memcpy(&out.file_id, id_info.FileId.Identifier, 8);
         std::memcpy(&out.file_id_high, id_info.FileId.Identifier + 8, 8);
+        out.weak_id = false;
     } else {
+        const DWORD err = ::GetLastError();
+        if (!file_id_info_unsupported(err)) {
+            err_msg = "cannot read the file id: " + win32_err_string(err);
+            return false;
+        }
         out.volume = info.dwVolumeSerialNumber;
         out.file_id =
             (static_cast<std::uint64_t>(info.nFileIndexHigh) << 32) | static_cast<std::uint64_t>(info.nFileIndexLow);
         out.file_id_high = 0;
+        out.weak_id = true;
     }
     out.size = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | static_cast<std::uint64_t>(info.nFileSizeLow);
     out.link_count = info.nNumberOfLinks;
@@ -211,8 +229,10 @@ OpenOutcome open_dirs(HANDLE anchor, const std::vector<std::wstring>& segs, std:
         ACCESS_MASK access = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
         if (list_last && i + 1 == count) access |= FILE_LIST_DIRECTORY;
         OwnedFileHandle child;
-        const NTSTATUS st = nt_open(parent, segs[i], access, kShareAll,
-                                    FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT, child);
+        // No FILE_DIRECTORY_FILE (see the file comment): the attribute check below refuses a
+        // non-directory and a reparse point on the handle that was actually opened.
+        const NTSTATUS st =
+            nt_open(parent, segs[i], access, kShareAll, FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT, child);
         if (!NT_SUCCESS(st)) return map_open_status(st, nullptr, err_msg);
         const HANDLE raw = to_handle(child.native_value());
         BY_HANDLE_FILE_INFORMATION info{};
@@ -371,9 +391,9 @@ OpenOutcome probe_anchored_dir(const OwnedFileHandle& anchor, std::string_view r
     return open_dirs(to_handle(anchor.native_value()), segs, segs.size(), false, dir, expected_nt, err_msg);
 }
 
-OpenOutcome list_anchored_dir(const OwnedFileHandle& anchor, std::string_view rel, std::vector<DirEntry>& out,
-                              std::string& err_msg) {
-    out.clear();
+OpenOutcome visit_anchored_dir(const OwnedFileHandle& anchor, std::string_view rel, std::size_t max_entries,
+                               const std::function<bool(DirEntry&)>& visit, bool& truncated, std::string& err_msg) {
+    truncated = false;
     if (!anchor.valid()) {
         err_msg = "store root is not open";
         return OpenOutcome::io_error;
@@ -387,23 +407,23 @@ OpenOutcome list_anchored_dir(const OwnedFileHandle& anchor, std::string_view re
 
     // FILE_ID_BOTH_DIR_INFO records are 8-byte aligned inside the buffer; each one is copied out
     // with memcpy (fixed part, then FileNameLength bytes), bounds-checked against the buffer.
+    // The buffer belongs to this call, so `visit` may list another directory meanwhile.
     std::vector<std::uint64_t> storage(kListBufferBytes / sizeof(std::uint64_t));
     const auto* base = reinterpret_cast<const unsigned char*>(storage.data());
     constexpr std::size_t kNameOffset = offsetof(FILE_ID_BOTH_DIR_INFO, FileName);
     const HANDLE raw = to_handle(dir.native_value());
+    std::size_t visited = 0;
     while (true) {
         if (!::GetFileInformationByHandleEx(raw, FileIdBothDirectoryInfo, storage.data(),
                                             static_cast<DWORD>(kListBufferBytes))) {
             const DWORD err = ::GetLastError();
             if (err == ERROR_NO_MORE_FILES) break;
-            out.clear();
             err_msg = win32_err_string(err);
             return OpenOutcome::io_error;
         }
         std::size_t off = 0;
         while (true) {
             if (off + kNameOffset > kListBufferBytes) {
-                out.clear();
                 err_msg = "malformed directory listing";
                 return OpenOutcome::io_error;
             }
@@ -411,13 +431,17 @@ OpenOutcome list_anchored_dir(const OwnedFileHandle& anchor, std::string_view re
             std::memcpy(&info, base + off, kNameOffset);
             const std::size_t name_bytes = info.FileNameLength;
             if (off + kNameOffset + name_bytes > kListBufferBytes || name_bytes % sizeof(wchar_t) != 0) {
-                out.clear();
                 err_msg = "malformed directory listing";
                 return OpenOutcome::io_error;
             }
             std::wstring wname(name_bytes / sizeof(wchar_t), L'\0');
             if (name_bytes != 0) std::memcpy(wname.data(), base + off + kNameOffset, name_bytes);
             if (wname != L"." && wname != L"..") {
+                if (visited == max_entries) {  // one entry more than the caller allows: stop reading
+                    truncated = true;
+                    return OpenOutcome::ok;
+                }
+                ++visited;
                 DirEntry e;
                 e.name_ok = wide_to_utf8(wname, e.name);
                 if (!e.name_ok) e.name.clear();
@@ -428,7 +452,7 @@ OpenOutcome list_anchored_dir(const OwnedFileHandle& anchor, std::string_view re
                 } else {
                     e.kind = DirEntryKind::file;
                 }
-                out.push_back(std::move(e));
+                if (!visit(e)) return OpenOutcome::ok;
             }
             if (info.NextEntryOffset == 0) break;
             off += info.NextEntryOffset;

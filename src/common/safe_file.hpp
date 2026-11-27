@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -57,7 +58,11 @@ private:
 // FILE_WRITE_ATTRIBUTES on the file can set ChangeTime (and LastWriteTime) to any value
 // with SetFileInformationByHandle(FileBasicInfo), so equal times prove nothing against a
 // writer who restores them. The file id is the 128-bit FILE_ID_INFO id on Windows (unique
-// on ReFS, where the 64-bit BY_HANDLE_FILE_INFORMATION index is not).
+// on ReFS, where the 64-bit BY_HANDLE_FILE_INFORMATION index is not). Only when the file
+// system reports FileIdInfo as unsupported (ERROR_INVALID_PARAMETER, ERROR_INVALID_FUNCTION,
+// ERROR_NOT_SUPPORTED) is the 64-bit index used instead, and `weak_id` is then set: such an
+// identity may collide with another file's, so callers must not key a security cache on it.
+// Any other FileIdInfo failure fails the query.
 struct FileIdentity {
     std::uint64_t volume = 0;        // Windows FILE_ID_INFO::VolumeSerialNumber; POSIX st_dev
     std::uint64_t file_id = 0;       // low 64 bits of the Windows FILE_ID_128; POSIX st_ino
@@ -66,6 +71,7 @@ struct FileIdentity {
     std::uint64_t link_count = 0;
     std::int64_t write_time = 0;
     std::int64_t change_time = 0;
+    bool weak_id = false;  // Windows: the 64-bit fallback index (see above); always false on POSIX
 
     [[nodiscard]] bool same_file(const FileIdentity& o) const noexcept {
         return volume == o.volume && file_id == o.file_id && file_id_high == o.file_id_high;
@@ -121,13 +127,18 @@ struct DirEntry {
     DirEntryKind kind = DirEntryKind::other;
 };
 
-// Lists the directory `rel` (non-empty) relative to `anchor` from a handle opened as above
-// (Windows: GetFileInformationByHandleEx(FileIdBothDirectoryInfo) on that handle; POSIX:
-// fdopendir on a private descriptor). Kinds come from the entry itself, never from following
-// it: reparse points (Windows) and symlinks (POSIX, fstatat AT_SYMLINK_NOFOLLOW) are `link`.
-// "." and ".." are omitted. On failure `out` is left empty.
-OpenOutcome list_anchored_dir(const OwnedFileHandle& anchor, std::string_view rel, std::vector<DirEntry>& out,
-                              std::string& err_msg);
+// Streams the entries of the directory `rel` (non-empty) relative to `anchor` from a handle
+// opened as above (Windows: GetFileInformationByHandleEx(FileIdBothDirectoryInfo) on that
+// handle, one fixed 64 KiB buffer; POSIX: fdopendir on a private descriptor), calling
+// `visit` once per entry; nothing is accumulated here. Kinds come from the entry itself,
+// never from following it: reparse points (Windows) and symlinks (POSIX, fstatat
+// AT_SYMLINK_NOFOLLOW) are `link`. "." and ".." are omitted. At most `max_entries` entries
+// are passed to `visit`; when the directory holds more, `truncated` is set and the rest are
+// not read. `visit` returns false to stop early (not a truncation). The directory handle stays
+// open while `visit` runs (it may list a subdirectory itself). On an error part-way through,
+// the entries already visited stay visited and io_error is returned.
+OpenOutcome visit_anchored_dir(const OwnedFileHandle& anchor, std::string_view rel, std::size_t max_entries,
+                               const std::function<bool(DirEntry&)>& visit, bool& truncated, std::string& err_msg);
 
 // Opens a single regular file without following symlinks or reparse points.
 OpenOutcome open_single_regular(const std::filesystem::path& file, OwnedFileHandle& out_handle,
